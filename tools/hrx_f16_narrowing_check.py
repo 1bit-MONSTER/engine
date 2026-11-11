@@ -100,6 +100,10 @@ def classify(path, lines):
 FRAGMENT_F16 = re.compile(r'(%[A-Za-z0-9_]+)\s*=\s*vector\.fragment<init>[^\n]*vector<(\d+)xf16>')
 LOOP_F16 = re.compile(r'scf\.for[^\n]*->\s*\(vector<\d+>xf16|scf\.for[^\n]*\((%[A-Za-z0-9_]+)\s*=\s*%[A-Za-z0-9_]+\s*:\s*vector<(\d+)xf16>')
 MUL = re.compile(r'vector\.mulf\s+(%[A-Za-z0-9_]+)\s*,\s*(%[A-Za-z0-9_]+)')
+# The update is not always a scalar mulf: a WMMA/contract accumulation is a template.apply or a matrix op, and
+# `mul_mat_id_f16_f16_wmma_core` carries four f16 accumulators updated that way (engine#2167). A mulf-only scan
+# reported them as `none` even with a wide enough window.
+WMMA = re.compile(r'template\.apply<@[^>]*wmma[^>]*>|vector\.(fma|contract|dot|outerproduct)\b|wmma\.(mma|load|store)')
 ADD = re.compile(r'vector\.addf\s+(%[A-Za-z0-9_]+)\s*,\s*(%[A-Za-z0-9_]+)')
 
 
@@ -112,7 +116,7 @@ WINDOW = 250
 
 
 def scan(path, lines):
-    """-> list of (lineno, accname, width, kind) where kind in {mul, add, none}"""
+    """-> list of (lineno, accname, width, kind, update_instruction)"""
     out = []
     for i, line in enumerate(lines):
         m = FRAGMENT_F16.search(line)
@@ -121,12 +125,23 @@ def scan(path, lines):
         acc, width = m.group(1), int(m.group(2))
         # the updates are the float ops that follow, until the loop closes (a bounded window is enough for a report)
         window = lines[i:i + WINDOW]
-        kind = 'none'
-        if any(MUL.search(l) for l in window):
-            kind = 'mul'
-        elif any(ADD.search(l) for l in window):
-            kind = 'add'
-        out.append((i + 1, acc, width, kind))
+        kind, upd = 'none', ''
+        for l in window:
+            m = WMMA.search(l)
+            if m:
+                kind, upd = 'mul', m.group(0)[:44]
+                break
+            if MUL.search(l):
+                kind, upd = 'mul', 'vector.mulf'
+                break
+        if kind == 'none':
+            for l in window:
+                if ADD.search(l):
+                    kind, upd = 'add', 'vector.addf'
+                    break
+        # engine#2167 asked WHICH instruction updates the accumulator, and the answer is not always a mulf -- a
+        # WMMA/contract accumulate is a template.apply, so reporting only "mul" hides which one to fix.
+        out.append((i + 1, acc, width, kind, upd))
     return out
 
 
@@ -192,6 +207,10 @@ def self_test():
     mul_acc = ["  %init = vector.fragment<init> %zero shape [%m, %n] : vector<16xf16>",
                "    %next = vector.mulf %block_acc, %k : vector<16xf16>"]
     chk('mul', scan('x', mul_acc)[0][3], 'class 3: a mul-updated f16 accumulator (the #2186 item-1 shape)')
+    chk('vector.mulf', scan('x', mul_acc)[0][4], 'class 3: the update instruction is named, not just classified')
+    wmma_acc = ["  %init = vector.fragment<init> %zero shape [%m, %n] : vector<8xf16>",
+                "    %next = template.apply<@ggml.some_wmma_core>(%block_acc) : (vector<8xf16>) -> (vector<8xf16>)"]
+    chk('mul', scan('x', wmma_acc)[0][3], 'class 3: a WMMA/contract update is a multiply (engine#2167)')
     add_acc = ["  %init = vector.fragment<init> %zero shape [%m, %n] : vector<16xf16>",
                "    %next = vector.addf %block_acc, %k : vector<16xf16>"]
     chk('add', scan('x', add_acc)[0][3], 'class 3: an add-only f16 accumulator is reported separately')
@@ -219,8 +238,8 @@ def main(argv):
                 inputs.append(f"{p.relative_to(root)}:{ln}  {operand}")
             elif how == 'publish':
                 pubs.append(f"{p.relative_to(root)}:{ln}  {operand}")
-        for ln, acc, width, kind in scan(p, lines):
-            accs.append((kind, f"{p.relative_to(root)}:{ln}  {acc}  vector<{width}xf16>"))
+        for ln, acc, width, kind, upd in scan(p, lines):
+            accs.append((kind, f"{p.relative_to(root)}:{ln}  {acc}  vector<{width}xf16>  [{upd or '-'}]"))
     for r in inputs:
         print(f"INPUT        {r}")
     for r in pubs:

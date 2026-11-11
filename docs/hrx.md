@@ -300,9 +300,31 @@ Measured on gfx1151 (2026-11-10):
   the dense inputs of Qwen3-0.6B, Qwen3-4B, ZAYA1-8B and flint. Cases at those two values are in the
   suite, so the shift has a test on each side.
 
-Still open under #1962: two prefill kernels that re-quantise the activations into 8-bit blocks
-(Q5_K and Q6_K weights at 512 tokens) keep a per-block term in half precision and still return NaN
-above 65504. And the limit is moved, not removed: an activation above 4.19e6 would overflow again.
+The prefill kernels followed at pin `7a1f2b81c`. The two small-batch Q6_K kernels were already done
+(llama.cpp #288). The Q4_K and Q6_K prefill kernels read a half-precision copy of the activations;
+that copy is now stored at 2^-6 and the sums are scaled back (llama.cpp #298). The Q5_K/IQ4_XS
+prefill kernel reads the activations as 8-bit blocks, each with a scale and a scaled sum in half
+precision. The scale fits up to 8.3e6; the scaled sum is about as large as the largest activation in
+the block, so it was the term that overflowed. The kernel now rebuilds a sum that is not finite from
+the 8-bit values it already holds, and uses a finite one as stored (llama.cpp #292).
+
+Measured on gfx1151 (2026-11-11, fork `7a1f2b81c`, full build):
+
+- `test-backend-ops -o MUL_MAT` with a resident weight (2048 x 4096), Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0
+  and Q4_0 at 1 to 512 tokens, with activation spikes of 3.0, 9.3e4 and 2e6: 180 of 180 pass (run at
+  llama.cpp #298's head). Before #292 and #298, Q5_K at 512 tokens and Q4_K and Q6_K at 256 and 512
+  tokens returned NaN at 9.3e4. The whole op is 617 of 617; `MUL_MAT_ID` is 845 of 845.
+- Perplexity on wikitext-2 (`-c 512 -b 512`, 16 chunks): Qwen3-4B-Q4_K_M 17.1836 (17.1864 before
+  #298), Qwen3-4B-IQ4_XS 17.6304 (the same before and after #292).
+- Prefill rate on Qwen3-4B-Q4_K_M across #298, eight alternating runs on a loaded box: 2683 against
+  2735 tok/s (ratio 0.98, pairs between 0.88 and 1.14). No regression shown; a cost of 2 to 3 % is
+  not excluded.
+
+Still open under #1962: the final projection of the draft head (a shortlist kernel) narrows its
+activations too and has no test that reaches it. The other kernels that read the 8-bit blocks (the
+fused SwiGLU, the routed kernels and the low-token Q4 paths) use the stored sum as it is and are not
+measured above 65504. And the limits are moved, not removed: 4.19e6 for the half-precision copies,
+8.3e6 for the 8-bit blocks.
 
 ### Fixed: Qwen3-VL on `HRX0`: it decodes again, and its rotation runs on the device ([engine#1467](https://github.com/1bit-MONSTER/engine/issues/1467))
 
@@ -891,6 +913,9 @@ The matmuls cost the same at any context; the attention kernel is the part that 
 What the numbers are and are not: each is the wall time from launch to device-idle with one dispatch in flight, so it holds
 one wake-up of the waiting thread and the run is slower than a normal one (the same command: pp512 2,977 -> 2,500 tok/s,
 tg16 67 -> 36, pp8192 1,191 -> 1,167). Use it to rank kernels and to see what grows with the context, not as a rate.
+Decode is slowed much more than prefill, so compare shares inside one program and never between programs. A dispatch that
+was launched and never finished (a ticket that ran out, a cut trace) is listed under the tables and is not in them. A build
+with extra kernel directories shows those kernels as numeric ids; name them with a second `--manifests DIR`.
 
 ### Measuring on `HRX0`: what makes a number citable
 

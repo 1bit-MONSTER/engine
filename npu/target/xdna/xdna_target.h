@@ -189,6 +189,13 @@ public:
     void   drop_wide();
     bool   adopt_wide(int rows);
     int    wide_rows() const { return wide_rows_; }
+    // The NARROW family: the same roles built for fewer than 16 rows per launch, for decode steps and other
+    // launches of 1..narrow_rows() rows. Same rules as the wide family (all roles or none, one sealed hw_context);
+    // a launch of more rows keeps the 16-row family.
+    I8Ctx* make_ctx_narrow(int role);
+    bool   adopt_narrow(int rows);
+    void   drop_narrow();
+    int    narrow_rows() const { return narrow_rows_; }
     // The context a launch of `rows` rows on `role` would use: the M=16 twin when one was adopted and
     // the row count fits, otherwise the M=128 one. The forward needs this where it launches a GEMM
     // itself (the LM head) instead of going through gemv().
@@ -232,6 +239,8 @@ private:
     std::unique_ptr<I8Ctx> ctx16_[Q4NX_MAX_DESIGNS];
     std::unique_ptr<I8Ctx> ctxw_[Q4NX_MAX_DESIGNS];   // the wide pb16i/t2s family (engine#1990)
     int wide_rows_ = 0;                               // 0 = no wide family
+    std::unique_ptr<I8Ctx> ctxn_[Q4NX_MAX_DESIGNS];   // the narrow pb16i/t2s family (decode)
+    int narrow_rows_ = 0;                             // 0 = no narrow family
     std::unique_ptr<I8Ctx> ctx_head_;
     bool m16_ = false;
     bool m16_check_ = false;

@@ -45,6 +45,7 @@ in an `add_test` (engine#1596) without raising the drift it measures.
 
     tools/ci/ci_targets_check.py --check [--root .]
     tools/ci/ci_targets_check.py --self-test
+    tools/ci/ci_targets_check.py --where ROW[,ROW...]    where each ctest row is registered (file:line)
 """
 import argparse
 import glob
@@ -344,6 +345,35 @@ def satisfied(guard, defines, defaults):
     return ok, guard
 
 
+def family_files(root, cmake_text):
+    """[(relpath, text)] for every cmake file CMakeLists.txt actually include()s, in include order.
+
+    engine#2129 follow-up (a release verifier grepped CMakeLists.txt for two ctest rows and found zero,
+    because both live in `cmake/tests-*.cmake`): the paths were discarded here, so nothing could answer
+    *where* a row is registered and a CMakeLists-only grep looked like proof of absence. Keeping the path
+    costs nothing and makes that question answerable from the same reader -- the #2012 lesson (a checker
+    whose coverage did not follow the refactor) applied to the human verifying a release.
+    """
+    out = []
+    seen = set()
+    for gvar, pattern in GLOB.findall(cmake_text):
+        loop_vars = [v for v, g in FOREACH_LISTS.findall(cmake_text) if g == gvar]
+        if not loop_vars or loop_vars[0] not in INCLUDE_VAR.findall(cmake_text):
+            continue
+        pat = pattern.replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
+        for path in sorted(glob.glob(os.path.join(root, pat))):
+            if os.path.isfile(path) and os.path.realpath(path) not in seen:
+                seen.add(os.path.realpath(path))
+                out.append((os.path.relpath(path, root), open(path, encoding="utf-8").read()))
+    for m in INCLUDE.finditer(cmake_text):
+        rel = m.group(1).replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
+        path = os.path.join(root, rel)
+        if os.path.isfile(path) and os.path.realpath(path) not in seen:
+            seen.add(os.path.realpath(path))
+            out.append((rel, open(path, encoding="utf-8").read()))
+    return out
+
+
 def family_text(root, cmake_text):
     """The text of every cmake file CMakeLists.txt actually include()s, in include order.
 
@@ -352,29 +382,12 @@ def family_text(root, cmake_text):
     pulled in under a guard is counted as if it were unconditional. Following include() is the only reading
     that matches what CMake configures; the guard on the include is left to cmake_targets(), which already
     tracks a guard stack across the text this returns.
+
+    One implementation of the walk: `family_files()` holds it, because a caller that only wants the text
+    loses the path and then cannot say where a row lives.
     """
-    out = []
-    seen = set()
-    # a glob the include loop iterates: every file matching it is configured, so every one is read
-    for gvar, pattern in GLOB.findall(cmake_text):
-        # the loop variable differs from the glob variable: `foreach(v IN LISTS GLOBVAR) include(${v})`
-        loop_vars = [v for v, g in FOREACH_LISTS.findall(cmake_text) if g == gvar]
-        if not loop_vars or loop_vars[0] not in INCLUDE_VAR.findall(cmake_text):
-            continue
-        pat = pattern.replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
-        for path in sorted(glob.glob(os.path.join(root, pat))):
-            if os.path.isfile(path) and os.path.realpath(path) not in seen:
-                seen.add(os.path.realpath(path))
-                out.append(open(path, encoding="utf-8").read())
-    for m in INCLUDE.finditer(cmake_text):
-        rel = m.group(1).replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
-        path = os.path.join(root, rel)
-        # engine#1979: a file both named by a literal include() and matched by the glob is configured once
-        # (CMakeLists.txt skips it in the glob loop), so it is read once.
-        if os.path.isfile(path) and os.path.realpath(path) not in seen:
-            seen.add(os.path.realpath(path))
-            out.append(open(path, encoding="utf-8").read())
-    return "\n".join(out)
+    return "\n".join(text for _, text in family_files(root, cmake_text))
+
 
 
 def check(root):
@@ -517,6 +530,45 @@ if(ONEBIT_NPU)
     add_executable(hidden_test hidden.cpp)
 endif()
 """
+
+
+
+
+def where_rows(root, cmake_path, wanted):
+    """[(row, site, line)] for each wanted row name, searched in CMakeLists.txt then every included file.
+
+    engine#2129 follow-up: a release verifier grepped `CMakeLists.txt` for `submodule_pin` and `tmp_path`,
+    got 0, and nearly raised a false alarm against its own list - both are registered in `cmake/tests-*.cmake`,
+    which #1983's glob include()s. A CMakeLists-only grep is the wrong instrument for a family file, so this
+    answers the question with the same reader that follows the globs and includes.
+    """
+    files = [(os.path.relpath(cmake_path, root), open(cmake_path, encoding="utf-8").read())]
+    files += family_files(root, files[0][1])
+    hits = []
+    for rel, text in files:
+        for i, line in enumerate(continued_lines(text), 1):
+            m = ROW.match(line)
+            if m and m.group(1) in wanted and (m.group(1), rel, i) not in hits:
+                hits.append((m.group(1), rel, i))
+    return hits
+
+
+ROW = re.compile(r'^\s*(?:add_test|add_python_test)\s*\(\s*(?:NAME\s+)?(\w+)')
+
+
+def where_rows_self_test(tmp):
+    """engine#2129 follow-up: the answer must come from the family files too, not only CMakeLists.txt."""
+    import pathlib as _p
+    root = _p.Path(tmp)
+    (root / "cmake").mkdir(parents=True, exist_ok=True)
+    (root / "CMakeLists.txt").write_text(
+        'file(GLOB V CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tests-*.cmake)\n'
+        'list(SORT V)\n'
+        'foreach(v IN LISTS V)\n    include(${v})\nendforeach()\n'
+        'add_python_test(plain_row x.py)\n', encoding="utf-8")
+    (root / "cmake" / "tests-family.cmake").write_text(
+        'add_python_test(globbed_row y.py)\n', encoding="utf-8")
+    return where_rows(str(root), str(root / "CMakeLists.txt"), ["plain_row", "globbed_row", "absent_row"])
 
 
 def self_test():
@@ -707,6 +759,24 @@ add_test(NAME family_suite COMMAND family_test)
     case("a plain target list passes",
          SELF_CI.replace("hidden_test ", ""), SELF_CMAKE, 0)
 
+    # engine#2129 follow-up: --where must find a row in a glob-included family file, not only in
+    # CMakeLists.txt -- that is the reading a release verifier needs and the one a bare grep gets wrong.
+    with tempfile.TemporaryDirectory() as td:
+        hits = where_rows_self_test(td)
+        got = {(row, rel) for row, rel, _ in hits}
+        if ("plain_row", "CMakeLists.txt") not in got:
+            print("  FAIL --where does not find a row registered in CMakeLists.txt"); fails += 1
+        else:
+            print("  ok    --where finds a row registered in CMakeLists.txt")
+        if not any(row == "globbed_row" and rel.startswith("cmake") for row, rel in got):
+            print("  FAIL --where does not find a row registered in a GLOB-included family file"); fails += 1
+        else:
+            print("  ok    --where finds a row registered in a GLOB-included family file")
+        if any(row == "absent_row" for row, _ in got):
+            print("  FAIL --where reports a row that is registered nowhere"); fails += 1
+        else:
+            print("  ok    --where reports an unregistered row as absent")
+
     print(f"ci_targets_check --self-test: {fails} failure(s)")
     return 1 if fails else 0
 
@@ -715,10 +785,22 @@ def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--where", metavar="ROWS", help="print where each ctest row is registered (file:line)")
     ap.add_argument("--root", default=".")
     a = ap.parse_args(argv[1:])
     if a.self_test:
         return self_test()
+    if a.where:
+        wanted = [w.strip() for w in a.where.split(",") if w.strip()]
+        root = os.path.abspath(a.root)
+        hits = where_rows(root, os.path.join(root, "CMakeLists.txt"), wanted)
+        found = {row for row, _, _ in hits}
+        for row, rel, line in hits:
+            print(f"{row}\t{rel}:{line}")
+        for row in wanted:
+            if row not in found:
+                print(f"{row}\tNOT REGISTERED (searched CMakeLists.txt and every file it include()s or globs)")
+        return 0 if found else 1
     if a.check:
         return check(a.root)
     ap.print_help()

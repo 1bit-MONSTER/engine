@@ -275,6 +275,15 @@ tools/npu_serve_smoke.py --self-test        # the judging on the shape of each f
 tools/npu_serve_smoke.py --judge <dir>      # judge a finished run's serve.log and reply_*.json again
 ```
 
+It also prints one `load` line: the box's 1-minute load average as the run found it (kept in `load.json`, so
+`--judge` reports the run's load and not today's). The fast route keeps about 1.5 CPU cores of host work per token and
+`npu-hold` serialises the device, not the CPU. Measured on the shipped binary (#2106): 86-94 tok/s at 16, 32, 96 and
+128 answer tokens on a quiet box, and 51-89 tok/s while a 10-job build ran beside it, on the same route with the same
+answers. So the floor is not a function of answer length, and when the route and the content pass and only the timing
+fails, the line says a busy box is the likely cause and to re-run on a quiet one. It never turns a FAIL into a PASS:
+a starved box is something the release run should notice.
+
+
 The two route texts are what the serve prints today (`on the private route dx`, `per-op forward`);
 `--fast-route` and `--slow-route` change them when the serve's wording does, and a log that names
 neither is a failure, not a pass. It prints one line per assertion and `RESULT: PASS` or `RESULT: FAIL` (exit 0 or 1). It takes no device
@@ -289,8 +298,40 @@ Measured on strixhalo, 2026-11-11, Qwen3-0.6B, one ticket each:
 | a build of main without the private route, model-generic directory | per-op | `FAIL`: `route`, `rate` (median 1.9 tok/s) and `first-token` (1,063 ms) fail; `content` passes |
 
 The second row is the point: its three answers were fine, and only the other three assertions say
-the release would have shipped the slow route. The check is not wired into `scripts/hw-gate.sh` or the
-release script yet; it is the instrument, and the release lane decides where it runs.
+the release would have shipped the slow route.
+
+**In the gate: the `npuserve` phase.** `scripts/hw-gate.sh --phases npuserve` runs the check under the
+same NPU claim as the `npu` phase and adds its row to the summary, with the four assertion lines as the
+detail:
+
+```sh
+HW_GATE_NPU_SERVE_BIN=/path/to/1bit HW_GATE_NPU_SERVE_MODEL=/path/to/Qwen3-0.6B scripts/hw-gate.sh --phases npuserve
+```
+
+The three numbers that decide the rate assertion are all passed by the phase, so none is a default
+hidden in another file: `HW_GATE_NPU_SERVE_FLOOR` (tok/s, default **30**), `HW_GATE_NPU_SERVE_MAX_TOKENS`
+(answer length, default 96) and `HW_GATE_NPU_SERVE_REPLIES` (requests, default 5; the rate is their
+median). `HW_GATE_NPU_SERVE_PORT` sets the port. The row is `PASS` only when the tool exits 0 **and**
+printed `RESULT: PASS`, so a truncated log cannot pass, and it always carries the measured median rate
+and first-token time.
+
+The gate's floor is 30, not the demo's 60, because the box is shared. On the fast route the release
+candidate's single replies have been measured between 48.8 and 101 tok/s depending on load; the slow
+route is 1.9. A floor of 30 is fifteen times above the failure it guards against and under every fast
+reply seen, so "slow machine" does not read as "slow route". The `route` assertion does not depend on
+load at all. When the phase is named, a `FAIL` fails the gate like any other phase: it is blocking,
+with no retry built in; a failed row shows which assertions failed and the numbers, so a rate-only
+failure with `route ok` is recognisable as load and can be re-run.
+
+If the NPU ticket ends while a request hangs, the ticket's TERM reaches the smoke script (a `flock` sits
+between them), and the script stops the serve before it exits; the serve is also started so that the
+kernel TERMs it if the script dies any other way. A `1bit serve` left holding the NPU after its ticket
+is the failure this prevents.
+Like `npu`, the phase is not in the default phases and skips when there is no NPU or the two settings
+are absent; the release procedure has to name it and set them for it to gate anything. It has not been
+added to the release script. `tests/hw_gate_npuserve_test.sh` drives the phase end to end against a
+stand-in serve (fast, slow, a floor it misses, dead at start, unconfigured, no NPU, and the ticket's
+kill sequence arriving mid-request) with no device.
 
 ## Measured
 

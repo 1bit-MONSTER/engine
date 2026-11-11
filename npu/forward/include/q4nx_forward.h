@@ -96,6 +96,16 @@ public:
     // noncausal_full_attention, so a caller can check the served pack against its own declaration
     // (app/forward_serve.cpp, engine#796).
     bool noncausal() const { return noncausal_attn_; }
+    // engine#2102: what the decode family turned out to be, so a caller can say it out loud. `decode_roles()` is the number of
+    // roles that got an M=16 kernel, `design_roles()` the number of roles the model has. 0 of N is the state that serves at a
+    // fraction of the fused route's rate while printing nothing an operator would notice at the ready line: every decode step
+    // then runs prefill-width launches. The values are recorded where the family is opened (open_decode_family_local), not
+    // inferred later, because the derived designs are not kept per role.
+    int decode_roles() const { return decode_roles_; }
+    // The host-GEMM arm loads no decode family, so it reports no roles rather than "0 of N" (engine#2102).
+    int design_roles() const { return host_gemm_ ? 0 : ndesigns_; }
+    bool decode_disabled() const { return decode_disabled_; }   // NPU_DECODE_M16=0
+    bool decode_image() const { return pb16i_; }                // a ternary (pb16i/t2s) container's decode family
     const char* last_error() const { return err_.c_str(); }
 
     // Clear the KV cache (start a new sequence).
@@ -234,8 +244,8 @@ private:
     // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
     // logits there instead of only the last row's.  Null on every other path, so nothing else changes.
     std::vector<float>* batch_all_out_ = nullptr;
-    // engine#803 A2b step one: the decode-family block as its own method, body unchanged, so the move into
-    // XdnaTarget::open_decode_family() is a copy rather than surgery inside init_impl.
+    // engine#803 A2b: the model's half of the decode family (design names, summary lines, the wide and narrow
+    // sealed families); the per-role ELF resolution and context creation is XdnaTarget::open_decode_family().
     bool open_decode_family_local(bool want_m16, xrt::device* dev, const std::string& mdir,
                                   const std::string& dir);
 
@@ -332,6 +342,8 @@ private:
     // kernels for fused gate/up, five when gate and up are split.
     Q4nxDesignGeom designs_[Q4NX_MAX_DESIGNS];
     int ndesigns_ = 0;
+    bool decode_disabled_ = false;   // engine#2102: NPU_DECODE_M16=0 turned the family off
+    int decode_roles_ = 0;   // engine#2102: roles with an M=16 decode kernel, as open_decode_family_local() found them
     // M=16 decode twins of the same roles (empty/skipped where no ELF or no legal geometry).  The geometry
     // stays here because the model needs it (max_batch_rows, the layer loop's row count); the contexts
     // themselves live in the target.
@@ -645,6 +657,21 @@ private:
     bool gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                          std::vector<float>& out);
     bool load_gdn_layer(int l);
+
+    // ── LFM2 gated short-convolution layers ──────────────────────────────
+    // A layer that carries shortconv.* tensors has no attention: in_proj (H -> 3H, the QKVLIN design, weight
+    // key 0) and out_proj (H -> H, the O design, key 1, the slot an attention layer's o_proj has) run on the
+    // device, and everything between them is lfm2_shortconv.h on the host. The only state is the last L-1
+    // values of B*X per channel, kept in conv_state_[l] so snapshot/restore/reset cover it with no new code.
+    bool shortconv_ = false;                       // the model has at least one such layer
+    int sc_taps_ = 0;                              // L, from shortconv.conv.weight's own shape
+    std::vector<uint8_t> sc_layer_;                // [NL] 1 = conv layer
+    std::vector<std::vector<float>> sc_w_;         // [NL][H * L] the depthwise taps, bf16-decoded once
+    std::vector<std::vector<float>> sc_rows_;      // [NL][rows * H] B*X of a verify batch's rows (see begin_verify)
+    bool is_conv_layer(int l) const { return shortconv_ && l >= 0 && l < (int)sc_layer_.size() && sc_layer_[(size_t)l]; }
+    bool conv_layer(int l, const std::vector<float>& xn, std::vector<float>& out);
+    bool conv_layer_batch(int l, const std::vector<float>& xn, int M, std::vector<float>& out);
+    void conv_apply_rows(int rows);                // re-apply the first `rows` recorded rows after a restore
     std::string err_;
     std::string backend_ = "uninitialised";
     bool ready_ = false;

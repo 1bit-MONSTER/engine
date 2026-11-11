@@ -547,7 +547,7 @@ long proc_kb(const char* key) {
 
 // Writing 5 to clear_refs resets VmHWM, so the next run's peak is the run's own.
 bool reset_peak() {
-    FILE* f = std::fopen("/proc/self/clear_refs", "w");
+    FILE* f = std::fopen("/proc/self/clear_refs", "w");  // file-create-ok: a /proc pseudo-file, never created
     if (!f) return false;
     const bool ok = std::fputc('5', f) != EOF;
     std::fclose(f);

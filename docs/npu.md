@@ -550,7 +550,9 @@ may name a second sealed ELF with the same instances built for more rows: `q4nx_
 `q4nx_pb16i_sealed_wide_elf`) in `config.json`, a file in the kernels directory beside the 16-row one, and
 `q4nx_sealed_wide_rows` for its row count (default 32, allowed 17..128). No pack ships one yet, so nothing
 changes for an existing pack. `NPU_WIDE_SEALED_ELF=<file>` overrides the pack's file, `NPU_WIDE_SEALED_ELF=0`
-switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count.
+switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count. `tools/npu_plan.py` copies
+the two keys into `plan.json` as `prefill.sealed_elf` and `prefill.sealed_rows`, and a loaded plan wins over
+`config.json` (`docs/npu-plan.md`).
 
 When the wide ELF loads for every role that has a 16-row kernel, the chunk width becomes its row count and a
 launch of more than 16 rows takes the wide kernel; decode steps and chunks of up to 16 rows stay on the
@@ -583,7 +585,8 @@ takes it (a decode step, or a verify pass of a few rows); anything wider keeps t
 are the wide family's: all roles or none, one hw_context, shared weight images, and a file that is missing
 or does not load is logged (`[forward] narrow family NOT adopted (...)`) while decode stays on the 16-row
 kernels. `narrow_family_complete` and `narrow_takes` in `batch_width.h` are pinned by
-`tests/npu_pack_test.cpp`. No pack ships a narrow ELF yet.
+`tests/npu_pack_test.cpp`. No pack ships a narrow ELF yet. `plan.json` carries it as `decode.narrow_elf` and
+`decode.narrow_rows` (`docs/npu-plan.md`).
 
 Measured with a 4-row set, one binary, arms 16-row / 4-row / 16-row / 4-row, three prompts generating 49
 tokens each (`(tokens - 1) / (wall - wall of a 1-token request)`), two `npu-hold` tickets:

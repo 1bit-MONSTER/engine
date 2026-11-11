@@ -88,7 +88,7 @@ So the Gumiho row is *"fails as published, because our verifier is the wrong sha
 quality (its published numbers are the best in its class: 2.97× mean over Eagle-2's 2.74× on vicuna-7B). Running it would
 mean implementing a tree verifier first, which is its own project.
 
-## DFlash draft packages on the NPU route: **the container is in forms we already read; the forward is what is missing** (engine#1780)
+## DFlash draft packages on the NPU route: **the container is in forms we already read; the forward exists as a host reference, not yet on the device** (engine#1780)
 
 FastFlowLM 1.0.12 ships speculative decode as two-package tags: a small DFlash draft beside the main model's package.
 A draft package is `config.json` (`model_type: dflash`) plus one Q4NX container. `tools/dflash_draft_info.py <dir>`
@@ -136,7 +136,35 @@ Two facts about the container that the loader depends on, both measured on the B
 `dflash_draft_test` builds a synthetic package (every projection encoded tile by tile from a formula and compared at
 every element, the fusion matrix checked for row-major order, sixteen refusals each matched on its message) and needs
 no model; given a package directory (`-DONEBIT_DFLASH_DRAFT=<dir>` or `ONEBIT_TEST_DFLASH_DRAFT`) it also loads and
-decodes the real one. The loader is not wired into `forward-serve` yet: there is no forward for it to feed.
+decodes the real one. The loader is not wired into `forward-serve` yet.
+
+### The forward, as a host reference (`npu/dflash_forward.h`)
+
+`decode_draft(load_draft(dir))` turns a package into f32 weights (about 1.3 GB for the Bolt draft) and
+`draft_forward(weights, taps, ctx, noise, block)` runs one draft pass on the host:
+
+| step | what is computed |
+|---|---|
+| context | one row per context position: the target's hidden states at `target_layer_ids`, concatenated, through `fc` and then `hidden_norm`. The same rows are used by every layer. |
+| block | the target's embeddings of `[last token, mask, mask, ...]`, `block_size` rows. Only these rows change from layer to layer. |
+| each layer | `input_norm` on the block rows; queries from the block rows; keys and values from the context rows followed by the block rows; `q_norm` / `k_norm` per head; rotary positions (context first, then the block, consecutive); every block row sees every key, so the block is not causal; then the gated MLP. |
+| output | the final `norm` of the block rows. The target's own head turns each row into scores. |
+
+The draft has no embedding table and no head of its own: both are the target's.
+
+This is a reference to compare a device route against, not a fast path (plain loops, one thread: a pass of 2 context
+and 8 block rows over the Bolt draft takes seconds). **It has not been run against a target model's hidden states
+yet**, so nothing here says the draft's proposals are accepted; that needs the target pack's layer taps, which is the
+next step of engine#1780. What `dflash_forward_test` establishes:
+
+- two cases worked out by hand in the test (one block row alone; one context row plus one block row, with a different
+  gain on every norm that touches the attention), matched to 1e-5;
+- the structure, on a small random model: the output does not depend on where the positions start, a later block row
+  changes an earlier one, the context's scale does not matter, a window of one position equals each row on its own,
+  and a query head reads the key/value head of its group;
+- seven refusals, each matched on its message;
+- with a package directory (`-DONEBIT_DFLASH_DRAFT=<dir>` or `ONEBIT_TEST_DFLASH_DRAFT`), the real draft decodes and
+  one pass over a made-up context is finite and position-independent.
 
 ## PARD-2's repos are weights-only — borrow the target's tokenizer
 

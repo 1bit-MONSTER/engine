@@ -69,10 +69,26 @@ typedef struct {
     int on;                        /* config declared rope_type "dynamic" with usable numbers */
     double factor;                 /* 1.0 on Hunyuan-0.5B -- a factor of 1 is a no-op until pos > original */
     double original_max_position;  /* 262144 on Hunyuan-0.5B */
+    /* engine#1889: Hunyuan's own form of "dynamic". Its rope_scaling block also carries `alpha` (1000.0 on every
+     * Hunyuan/HY-MT 1.9 pack), and when alpha is set the model's rotary embedding does not move the base with the
+     * position at all: it uses the FIXED base
+     *
+     *     base = theta * alpha ^ (dim / (dim - 2))
+     *
+     * (HunYuanDenseV1RotaryEmbedding, "DynamicNTKAlphaRotary"). Measured against the pack rather than taken from the
+     * reference: Hunyuan-7B's model.onnx.data holds the graph's cos_cache/sin_cache (FP16 [32768, 64]), and they match
+     * base 10000 * 1000^(128/126) = 11,158,840 to 0.00024 at positions 1, 2, 7, 50 and 300, where plain theta 10000 is
+     * off by up to 1.99. Reading the block as factor-only made it a no-op, i.e. every position rotated by the wrong
+     * angle. 0 = the block has no alpha, and the factor rule above applies. */
+    double alpha;
 } Q4nxRopeDynamic;
 
 static inline double q4nx_rope_dynamic_base(double theta, const Q4nxRopeDynamic* d, double pos, int dim) {
     if (!d || !d->on) return theta;
+    if (d->alpha > 0.0) {                                       /* the alpha form: one fixed base, every position */
+        if (dim <= 2) return theta;
+        return theta * pow(d->alpha, (double)dim / (double)(dim - 2));
+    }
     if (!(d->factor > 0.0) || !(d->original_max_position > 0.0) || dim <= 2) return theta;
     if (!(pos >= d->original_max_position)) return theta;      /* inside the window: plain rope, bit for bit */
     const double scaled = d->factor * pos / d->original_max_position - (d->factor - 1.0);

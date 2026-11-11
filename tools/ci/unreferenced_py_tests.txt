@@ -24,8 +24,8 @@
 # A SET baseline, not an allow-list: `tools/ci/tests_referenced_check.py` FAILS when a name appears here that is not in
 # the tree's current set, and REPORTS a line whose file is registered now, so this can only shrink.
 #
-# The number is 1 (was 2: moe_expert_chunks_accum_test.py is portable and passing, so it is registered rather than
-# baselined -- engine#2018), and getting it right took a correction worth recording: the first version of the rule scanned
+# The number is 0. Both original entries were portable tests with no runner, not tests that cannot run here, so both are
+# registered (moe_expert_chunks_accum_test.py, then hyperloom_benchmark_test.py -- engine#2018), and getting it right took a correction worth recording: the first version of the rule scanned
 # `RUNNERS`, which contains one FILE (CMakeLists.txt) and two directories, and tested `is_dir()` on all three -- so every
 # `add_python_test(...)` registration in CMakeLists.txt was invisible and 35 of 42 tests looked unregistered. The arm
 # "a cleared baseline entry is reported" caught it: registering a test in CMakeLists.txt did not clear its line. The true
@@ -33,4 +33,3 @@
 #
 # Each line is a real test whose runner was never added; the fix per file is one `add_python_test(...)`.
 #
-tests/hyperloom_benchmark_test.py

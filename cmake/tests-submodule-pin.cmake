@@ -25,3 +25,8 @@
 # check's business); `--require-initialised` is the release-gate form, where a missing checkout is a failure too.
 add_python_test(submodule_pin_check ${CMAKE_SOURCE_DIR}/tools/ci/submodule_pin_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(submodule_pin_check_self ${CMAKE_SOURCE_DIR}/tools/ci/submodule_pin_check.py --self-test)
+
+# engine#2129: the release preflight's use of the check -- a build tree whose submodules are not the pinned commits
+# BLOCKS the run, and "no checkout to compare" only WARNs so a fresh clone can still build. The function is cut out of
+# scripts/weekly.sh and run against stub checkers: no submodules, no network, no build.
+add_test(NAME weekly_submodule_preflight COMMAND ${CMAKE_SOURCE_DIR}/tests/weekly_submodule_preflight_test.sh)

@@ -81,6 +81,21 @@ bool spm_prepends_meta(const nlohmann::json& n) {
     return false;
 }
 
+// True when the normalizer rewrites every space to the metaspace symbol and does NOT prepend one: a
+// {Replace " " -> "\u2581"} step, bare or inside a Sequence, with no Prepend beside it. Gemma4's tokenizer.json is
+// this shape (BPE with merges, this normalizer, a decoder that turns the symbol back into a space). After that
+// normalizer there is no space left for the pre_tokenizer to split on, so a run of text is one word, merged by rank.
+bool replaces_space_with_meta(const nlohmann::json& n) {
+    if (!n.is_object()) return false;
+    if (n.value("type", "") == "Replace" && n.contains("pattern") && n["pattern"].is_object() &&
+        n["pattern"].value("String", "") == " ")
+        return n.value("content", "") == "\xE2\x96\x81";
+    if (n.contains("normalizers"))
+        for (const auto& sub : n["normalizers"])
+            if (replaces_space_with_meta(sub)) return true;
+    return false;
+}
+
 // The pattern from tokenizer.json's pre_tokenizer (a Split with a Regex), if any.
 std::string split_pattern(const nlohmann::json& pre) {
     if (!pre.is_object()) return "";
@@ -226,8 +241,16 @@ Tokenizer::Tokenizer(const std::string& path) {
         // is" -- engine#1189. Measured on that pack's own vocabulary, greedy longest-match is not a
         // substitute for the merges either (it disagrees with the reference on 6 of 20 strings), so
         // a vocabulary that keeps its merges is merged by rank -- see spm_merged().
-        spm_ = has_meta && (merges.empty() || (root.contains("normalizer") && spm_prepends_meta(root["normalizer"])));
+        const bool prepends = root.contains("normalizer") && spm_prepends_meta(root["normalizer"]);
+        // A vocabulary with merges whose normalizer only rewrites spaces (no Prepend): the same pieces and the same
+        // rank merge, without the dummy prefix. It used to fall to the byte-level path, which split on spaces and
+        // byte-mapped them: a Gemma4 prompt came out as 31 ids where the reference gives 21, and a reply came back
+        // with the metaspace symbols still in it.
+        const bool replaces = !prepends && !merges.empty() && root.contains("normalizer") &&
+                              replaces_space_with_meta(root["normalizer"]);
+        spm_ = has_meta && (merges.empty() || prepends || replaces);
         spm_merges_ = spm_ && !merges.empty();
+        spm_no_prefix_ = spm_ && replaces;
         if (spm_) {
             for (const auto& [text, id] : vocab_) {
                 if (text.size() == 6 && text.compare(0, 3, "<0x") == 0 && text[5] == '>') {
@@ -317,7 +340,7 @@ std::vector<int> Tokenizer::spm_merged(const std::string& text) const {
     static const char kMeta[] = "\xE2\x96\x81";
     std::string s;
     s.reserve(text.size() + 3);
-    s += kMeta;
+    if (!spm_no_prefix_) s += kMeta;
     for (char c : text) {
         if (c == ' ') s += kMeta;
         else s += c;
@@ -440,7 +463,7 @@ std::string Tokenizer::decode(const std::vector<int>& ids, bool strip_dummy_pref
         // Without this every decoded string came back with a leading space
         // (MiniCPM4: "The capital of France is" -> " The capital of France is"),
         // which is visible in 1bit serve's output.
-        if (strip_dummy_prefix && !out.empty() && out[0] == ' ') out.erase(0, 1);
+        if (strip_dummy_prefix && !spm_no_prefix_ && !out.empty() && out[0] == ' ') out.erase(0, 1);
         return out;
     }
     std::string out;

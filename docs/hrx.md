@@ -111,6 +111,13 @@ fails a pin that leaves a gate model's node off HRX.
   the mirror's commit `44ee5710d19f`, and the merge of AMD's rebased line is post-release work. It was added for AMD's 2026-11-09 rebase (engine#1945): taking that pin is a merge of
   149 conflicted files (538 hunks) into `1bit/hrx-vulkan-patched`, measured against the last AMD commit our
   line took.
+- **Which branch is the mirror.** [`config/llama-mirror-branch.config`](../config/llama-mirror-branch.config)
+  names it; with no name there it is `1bit/hrx-vulkan`. The file exists because no branch of the fork is ever
+  force-moved (owner, 2026-11-10): when AMD rewrites its line, AMD's new line is pushed to a new branch named for
+  the day, merged into `1bit/hrx-vulkan-patched` by an ordinary reviewed PR on the fork, and then named in this
+  file, while the old mirror stays where it was. That needs no workflow edit. A name that is not a plain branch
+  name, or that is our own line, is refused. `scripts/bump-hrx-sync.sh mirror-branch` prints the branch a run
+  would use.
 - **The hold.** While [`config/hrx-system-hold.config`](../config/hrx-system-hold.config)
   names a commit, the run does not merge AMD's hrx-system, keeps `third_party/hrx-system`
   where it is, and takes only AMD's llama.cpp changes outside the HRX backend paths

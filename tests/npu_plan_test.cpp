@@ -213,6 +213,21 @@ void test_valid() {
           "the pb16i family is read with its sealed ELF");
     check(pp.decode_dirs.size() == 2 && pp.decode_dirs[0].under_model, "a model-relative decode dir is kept");
 
+    // The search list a target is configured with: the plan's entries, each under the directory it names, in the
+    // plan's order (engine#1984 review: nothing resolved them, so a plan naming any place but the built-in three
+    // lost its decode twins without an error).
+    {
+        const std::vector<std::string> got = pp.resolved_decode_dirs("/m", "/k");
+        check(got.size() == 2 && got[0] == "/m/kernels-m16" && got[1] == "/k/.",
+              "decode dirs resolve under the model dir or the kernel dir, in the plan's order");
+        auto seq = base_plan();
+        seq["decode"]["dirs"] = nlohmann::json::array({nlohmann::json{{"root", "model"}, {"path", "kernels-m16-seq"}}});
+        const std::vector<std::string> only = Plan::load(write_plan("seq", seq)).resolved_decode_dirs("/m", "/k");
+        check(only.size() == 1 && only[0] == "/m/kernels-m16-seq",
+              "a plan naming one directory outside the built-in places resolves to exactly that directory");
+        check(Plan().resolved_decode_dirs("/m", "/k").empty(), "a plan that is not loaded resolves to no directories");
+    }
+
     // attention.mode is optional and defaults to causal, so a plan written before the field loads and
     // still means what it meant then.
     check(p.attention_mode == "causal" && !p.noncausal(), "a plan with no attention block is causal");

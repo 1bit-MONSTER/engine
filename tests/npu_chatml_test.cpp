@@ -126,6 +126,34 @@ int main(int argc, char** argv) {
     check(!without.encode(chatml(msgs, true)).empty(),
           "the refusal is not about whether the prompt tokenizes at all -- it does, into the wrong ids");
 
+    // pin_probe_messages (engine#1785): what the route renders to find the end of the system turn
+    {
+        using onebit::npu::pin_probe_messages;
+        const nlohmann::json req = nlohmann::json::parse(
+            R"([{"role":"system","content":"Be brief."},{"role":"user","content":"What is item 3?"}])");
+        const nlohmann::json probe = pin_probe_messages(req);
+        check(probe.size() == 2 && probe[0] == req[0] && probe[1]["role"] == "user",
+              "the probe is the system message and one user message (a template may refuse to render without one)");
+        check(probe[1]["content"] != req[1]["content"], "whose text is not the question");
+        // the two renderings agree through the user turn's opening and part at the first character of its text
+        const std::string full = chatml(req, true), lead = chatml(probe, true);
+        size_t same = 0;
+        while (same < full.size() && same < lead.size() && full[same] == lead[same]) ++same;
+        const std::string expect = "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n";
+        check(full.compare(0, same, expect) == 0 && same == expect.size(),
+              "the common prefix of the two ChatML renderings is the system turn plus the user turn's opening");
+        const nlohmann::json two = nlohmann::json::parse(
+            R"([{"role":"system","content":"A"},{"role":"system","content":"B"},{"role":"user","content":"q"},{"role":"system","content":"late"}])");
+        check(pin_probe_messages(two).size() == 3, "every LEADING system message is kept, a later one is not");
+        check(pin_probe_messages(nlohmann::json::parse(R"([{"role":"user","content":"q"}])")).empty(),
+              "a request that does not open with a system message has no probe");
+        check(pin_probe_messages(nlohmann::json::parse(R"([{"role":7},{"content":"x"}])")).empty() &&
+                  pin_probe_messages(nlohmann::json::parse("{}")).empty(),
+              "malformed messages give no probe instead of throwing");
+        const nlohmann::ordered_json oreq = nlohmann::ordered_json::parse(R"([{"role":"system","content":"S"},{"role":"user","content":"q"}])");
+        check(pin_probe_messages(oreq).size() == 2, "the same for the ordered JSON the template path uses");
+    }
+
     if (failures == 0) std::printf("npu_chatml: ok\n");
     return failures == 0 ? 0 : 1;
 }

@@ -37,6 +37,7 @@
 // What they share is the part before the first difference, so that part gets a slot of its own:
 //   pin_point(prev, ids)  how many leading tokens this request shares with the previous one, when that
 //                         is worth a slot and no slot covers it already
+//   pin_at(ids, n)        the same decision for a point the caller knows already (the end of the system turn)
 //   pin(prefix, bytes)    keep the state at that point.  One pinned slot at a time; the budget's eviction
 //                         and a longer prompt's replacement both leave it alone, a new pin() replaces it.
 // The rule reads token ids only, so it needs no knowledge of the template or of what a system prompt is.
@@ -186,14 +187,25 @@ public:
     size_t pin_point(const std::vector<int>& prev, const std::vector<int>& ids) const {
         if (!enabled()) return 0;
         const size_t shared = shared_prefix_len(prev, ids);
-        if (shared == prev.size() || shared == ids.size()) return 0;
+        if (shared == prev.size()) return 0;
+        return pin_at(ids, shared);
+    }
+
+    // The same decision for a point the caller already knows: `n` leading tokens of `ids` that every request of
+    // this kind will share -- the end of the system turn, which a chat route can find on the FIRST request by
+    // rendering the system messages alone, instead of waiting for a second request to compare with.  Returns `n`
+    // when the state there is worth pinning, else 0: 0 when `n` is the whole prompt or more (nothing follows it,
+    // so insert() keeps it), when it adds fewer than prefix-min-gain tokens over the slot that already covers
+    // this request (the pin itself, on every request after the one that made it), and when the cache is off.
+    size_t pin_at(const std::vector<int>& ids, size_t n) const {
+        if (!enabled() || n == 0 || n >= ids.size()) return 0;
         size_t covered = 0;  // the longest live slot that is a prefix of this request
         for (const PrefixSlot& s : slots_) {
             if (!s.live || s.ids.size() > ids.size() || s.ids.size() <= covered) continue;
             if (std::equal(s.ids.begin(), s.ids.end(), ids.begin())) covered = s.ids.size();
         }
-        if (shared <= covered || shared - covered < size_t(opt_.min_gain)) return 0;
-        return shared;
+        if (n <= covered || n - covered < size_t(opt_.min_gain)) return 0;
+        return n;
     }
 
     // Keep `prefix` (the first pin_point() tokens of a request) as the pinned slot.  Returns the slot the

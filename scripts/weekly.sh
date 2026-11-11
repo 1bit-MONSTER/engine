@@ -635,6 +635,29 @@ stage_release() {
     say "released $tag"
 }
 
+# The systemd row of the runner preflight (engine#1504): $1 is scripts/ci-runner-health.sh. Returns 1 only when a runner
+# unit is not accepting jobs NOW (its exit 1): the checks after the release would queue for ever. Its exit 3 - every
+# runner up, but a restart policy that would leave one down after the next OOM kill - is a WARNING and the release goes
+# on (owner 2026-11-11): the policy is a box configuration change the owner applies (docs/ci-runners.md "The two
+# drop-ins"), every heavy build already runs under scripts/mem-guard.sh --term, which ends the build (exit 143) before
+# the kernel's OOM killer reaches the runner, and a release that cannot start does not make the unit any safer.
+# A function of its own so tests/weekly_runner_preflight_test.sh can run it against a stub.
+preflight_runner_units() {
+    local health=$1 health_out health_rc=0
+    [ -x "$health" ] || return 0
+    health_out=$("$health" 2>&1) || health_rc=$?
+    case "$health_rc" in
+        0) printf '%s\n' "$health_out" | grep -c '^PASS' | xargs -r -I{} echo "preflight: runner units: {} PASS in systemd's view" ;;
+        2) say "preflight: no actions.runner.* units on this host: systemd has nothing to inspect" ;;
+        3) printf '%s\n' "$health_out" | sed 's/^/preflight: /'
+           echo "preflight: WARNING, not blocking: every runner unit is accepting jobs, but a restart policy would leave one down after the next OOM kill (scripts/ci-runner-health.sh exit 3; the WARN lines above name the unit and the setting, docs/ci-runners.md \"The two drop-ins\" has the fix)" ;;
+        *) printf '%s\n' "$health_out" | sed 's/^/preflight: /'
+           echo "preflight: a runner unit is not accepting jobs, so the checks after this release would queue for ever (scripts/ci-runner-health.sh exit $health_rc; the FAIL lines above say which; WEEKLY_SKIP_RUNNER_CHECK=1 to release anyway)"
+           return 1 ;;
+    esac
+    return 0
+}
+
 # --- preflight ----------------------------------------------------------------------------
 # What the stages need from the machine, checked before the first one runs, so that a missing
 # tool stops the run at the start rather than after an hour of build (2026-10-19 rehearsal).
@@ -686,6 +709,7 @@ preflight() {
     #   scripts/ci-runner-health.sh  - systemd's view (#1546): Result=oom-kill, a restart window, a unit that is not
     #                                  active. Says WHY, and fires the moment a unit dies. Exit 2 = no such units on
     #                                  this host, i.e. a fresh box, which is a note rather than a failure.
+    #                                  Exit 3 = all up but a restart policy is short: a warning (preflight_runner_units).
     # WEEKLY_SKIP_RUNNER_CHECK=1 is the release-during-an-outage escape, and it skips BOTH: a flag that skipped only
     # one of them would be useless in exactly the outage it exists for, because both fail for the same dead runner.
     if [ "${WEEKLY_SKIP_RUNNER_CHECK:-0}" != 1 ]; then
@@ -697,20 +721,7 @@ preflight() {
             echo "preflight: a self-hosted runner is not online, so the checks after this release would queue for ever (WEEKLY_SKIP_RUNNER_CHECK=1 to release anyway)"
             bad=1
         fi
-        if [ -x "$(cd "$(dirname "$0")" && pwd)/ci-runner-health.sh" ]; then
-            if health_out=$("$(cd "$(dirname "$0")" && pwd)/ci-runner-health.sh" 2>&1); then
-                printf '%s\n' "$health_out" | grep -c '^PASS' | xargs -r -I{} echo "preflight: runner units: {} PASS in systemd's view"
-            else
-                health_rc=$?
-                if [ "$health_rc" = 2 ]; then
-                    say "preflight: no actions.runner.* units on this host: systemd has nothing to inspect"
-                else
-                    printf '%s\n' "$health_out" | sed 's/^/preflight: /'
-                    echo "preflight: a runner unit is not accepting jobs (scripts/ci-runner-health.sh): $health_rc"
-                    bad=1
-                fi
-            fi
-        fi
+        preflight_runner_units "$(cd "$(dirname "$0")" && pwd)/ci-runner-health.sh" || bad=1
     else
         # a skip that says nothing is the failure mode these rows exist for: a release log where the runner checks
         # silently did not run reads exactly like one where they passed.

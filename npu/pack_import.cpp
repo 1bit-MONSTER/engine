@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <memory>
 #include <functional>
@@ -32,6 +33,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace onebit::npu::pack_import {
 namespace {
@@ -496,6 +498,11 @@ const uint8_t* at(const Fconst& f, int64_t off, int64_t len) {
 // field, the readout and the note all have to agree on it: three copies of 0.99 is how they drifted apart before.
 constexpr double kTieCorr = 0.99;
 
+// engine#1503: tied AND not mis-scaled. Correlation alone passes a head that is a scaled copy of the embedding -- two
+// packs on this box report corr 0.9915/0.9961 with rel_err 0.095/0.136 and serve garbage, while the pack that serves
+// correctly reports rel_err 0.000000. One predicate, so the four sites that set selfcheck_tied cannot drift apart.
+
+
 // Every entry was measured by diffing the 1.9 pack against the 1.8 pack of the SAME model: the bundle's tile shape and
 // its rotation are not derivable from the pack, and neither is `prefix`. It was tempting to read the extra bytes as
 // Qwen3's per-head QK norm gains, but Llama-3.2-1B -- which has no QK norms at all -- carries the same +4,352 at hidden
@@ -782,12 +789,8 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
     }
     out.insert(out.end(), fc.map + tail_off, fc.map + fc.size);
     unmap_file(fc.map, fc.size);
-    {
-        std::ofstream os(work, std::ios::binary | std::ios::trunc);
-        if (!os) throw std::runtime_error(work + ": cannot write the canonical copy of the 1.9 .fconst");
-        os.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
-        if (!os) throw std::runtime_error(work + ": short write of the canonical copy of the 1.9 .fconst");
-    }
+    // engine#1985: never in place. The path is shared by every import of this pack on the box, see write_canonical_copy().
+    write_canonical_copy(work, out.data(), out.size());
     return work;
 }
 
@@ -1904,6 +1907,7 @@ Q4nxContainer read_q4nx_container(const std::string& path) {
         out.why = path + ": header is not a JSON object";
         return out;
     }
+    if (j.contains("__metadata__") && j["__metadata__"].is_object()) out.meta = j["__metadata__"];
     for (auto it = j.begin(); it != j.end(); ++it) {
         if (it.key() == "__metadata__") continue;
         if (!it.value().is_object()) {
@@ -3313,6 +3317,62 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
            "neither is being preferred";
 }
 
+// engine#1786 (item F1): the container genre's geometry, from the container's own `dims` block and then config.json.
+// The order is authority, not preference: `dims` is the pack's own statement about itself, config.json is a file beside
+// it that a vendor converter wrote. When the two disagree the container's statement wins and `source` says so -- the
+// census measured 13 packs carrying `dims` and 29 of 29 carrying config.json, so a silent disagreement is possible and
+// a reader has to be able to see which one answered.
+ContainerGeometry container_geometry(const json& meta, const json& config) {
+    ContainerGeometry g;
+    const json& d = (meta.is_object() && meta.contains("dims") && meta["dims"].is_object()) ? meta["dims"] : json();
+    const json& cfg = config.is_object() ? config : json();
+    bool used_dims = false, used_cfg = false;
+
+    // an integer from dims first, then config.json; records which one answered
+    const auto iv = [&](const char* key, int& dst) -> bool {
+        if (d.is_object() && d.contains(key) && d[key].is_number_integer()) { dst = d[key].get<int>(); used_dims = true; return true; }
+        if (cfg.is_object() && cfg.contains(key) && cfg[key].is_number_integer()) { dst = cfg[key].get<int>(); used_cfg = true; return true; }
+        return false;
+    };
+    const auto fv = [&](const char* key, float& dst) -> bool {
+        if (d.is_object() && d.contains(key) && d[key].is_number()) { dst = d[key].get<float>(); used_dims = true; return true; }
+        if (cfg.is_object() && cfg.contains(key) && cfg[key].is_number()) { dst = cfg[key].get<float>(); used_cfg = true; return true; }
+        return false;
+    };
+    const auto sv = [&](const char* key, std::string& dst) -> bool {
+        if (d.is_object() && d.contains(key) && d[key].is_string()) { dst = d[key].get<std::string>(); used_dims = true; return true; }
+        if (cfg.is_object() && cfg.contains(key) && cfg[key].is_string()) { dst = cfg[key].get<std::string>(); used_cfg = true; return true; }
+        return false;
+    };
+
+    if (!iv("hidden_size", g.dims.hidden)) g.missing.push_back("hidden_size");
+    if (!iv("num_hidden_layers", g.dims.layers)) g.missing.push_back("num_hidden_layers");
+    if (!iv("num_attention_heads", g.dims.heads)) g.missing.push_back("num_attention_heads");
+    if (!iv("num_key_value_heads", g.dims.kv_heads)) g.missing.push_back("num_key_value_heads");
+    if (!iv("vocab_size", g.dims.vocab)) g.missing.push_back("vocab_size");
+    if (!iv("intermediate_size", g.dims.intermediate)) g.missing.push_back("intermediate_size");
+    if (!iv("head_dim", g.dims.head_dim)) {
+        // derived, and said to be derived: hidden/heads is only head_dim when the pack does not state one, and it is
+        // wrong for every architecture whose q projection is not square (GQA with an explicit head_dim is common).
+        if (g.dims.hidden > 0 && g.dims.heads > 0) {
+            g.dims.head_dim = g.dims.hidden / g.dims.heads;
+            g.inferred.push_back("head_dim");
+        } else {
+            g.missing.push_back("head_dim");
+        }
+    }
+    if (!fv("rope_theta", g.dims.rope_theta)) g.missing.push_back("rope_theta");
+    sv("model_type", g.dims.model_type);  // not load-bearing for the arithmetic; absent is not missing
+
+    g.source = used_dims ? "dims" : (used_cfg ? "config.json" : "");
+    return g;
+}
+
+int64_t head_stored_rows(int64_t vocab, bool from_fconst_tail) {
+    if (!from_fconst_tail || vocab <= 0) return vocab;
+    return (vocab + kTileRows - 1) / kTileRows * kTileRows;
+}
+
 std::string qk_norm_refusal(bool declared, bool found) {
     if (declared && !found)
         return "this pack declares use_qk_norm and its per-head q/k gains are not where the block layout says "
@@ -3339,11 +3399,33 @@ Plan plan(const std::string& pack_dir) {
             p.container_tensors = int64_t(c.tensors.size());
             p.container_payload_bytes = c.payload_bytes;
             for (const auto& t : c.tensors) p.container_dtypes[t.dtype]++;
+            // slice 2: the geometry, and the name of the source that answered. config.json is read through the ordinary
+            // loader so this genre and every other one agree about what config.json means (text_config lift, top-level
+            // wins) -- the container's own `dims` still takes precedence in container_geometry().
+            std::string cfg_source;
+            const json cfg = load_geometry(pack_dir, &cfg_source);
+            const ContainerGeometry g = container_geometry(c.meta, cfg);
+            p.dims = g.dims;
+            p.container_geometry_source = g.source;
+            p.container_geometry_missing = g.missing;
+            p.container_geometry_inferred = g.inferred;
+            std::string geom = g.source.empty()
+                ? "the container declares no `dims` and no config.json answered, so its geometry is not known here"
+                : "geometry from " + g.source;
+            if (!g.inferred.empty()) {
+                geom += " (";
+                for (size_t i = 0; i < g.inferred.size(); ++i) geom += (i ? ", " : "") + g.inferred[i];
+                geom += " inferred)";
+            }
+            if (!g.missing.empty()) {
+                geom += "; no source states ";
+                for (size_t i = 0; i < g.missing.size(); ++i) geom += (i ? ", " : "") + g.missing[i];
+            }
             p.container_note = c.why.empty()
                 ? "the pack is a safetensors container (model.q4nx): " + std::to_string(c.tensors.size()) +
-                      " tensors, " + std::to_string(c.payload_bytes) + " B of payload, no graph. Reading it as a"
-                      " weights source needs the container-genre plan (engine#1786, item F1); until then this pack is"
-                      " recognised and reported, not importable."
+                      " tensors, " + std::to_string(c.payload_bytes) + " B of payload, no graph; " + geom +
+                      ". Reading it as a weights source needs the container-genre plan (engine#1786, item F1); until"
+                      " then this pack is recognised and reported, not importable."
                 : "model.q4nx is present but unreadable: " + c.why;
             return p;
         }
@@ -4939,6 +5021,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // `tied` is false there while the head plainly reproduces its embedding, and the readout used to call those
             // packs untied while the container it wrote said tied. Same threshold the container's own decision uses.
             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
+
+            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
             const Q4 swap = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K),
                                                mm.block, /*swap_nibbles*/ true, false);
             const Q4 nozp = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), nullptr, int(mm.N), int(mm.K),
@@ -5026,6 +5110,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 }
                 r.selfcheck_reference = true;
                 r.selfcheck_tied = c32 > kTieCorr;
+
+                r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
                 double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
                 const int nsh = std::min(2048, int(V) - 1);
                 for (int rr = 0; rr < nsh; ++rr)
@@ -5239,6 +5325,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                         r.lmhead_corr = corr(q, embed_tbl, q.N);
                         r.selfcheck_reference = true;
                         r.selfcheck_tied = r.lmhead_corr > kTieCorr;
+
+                        r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
                         double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
                         const int nsh = std::min(2048, q.N - 1);
                         for (int rr = 0; rr < nsh; ++rr)
@@ -5278,7 +5366,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 // (Hunyuan-0.5B: 120,818 rows = 1,887.8 tiles, so the tail holds 1,888 and the last one is partly
                 // padding). The rows past V are dropped before the tensor is written, so the container's head has
                 // exactly V rows.
-                const int64_t rows = (V + kTileRows - 1) / kTileRows;
+                const int64_t rows = head_stored_rows(V, true) / kTileRows;
                 // The envelope is the same `64 + 2*hidden` the layer blocks open with (eps, padding, the norm), not a
                 // constant: 1,856 is only its qwen2.5-0.5B value. Qwen3-1.7B's tail is 4,160 + 2,374 x 73,984 to the
                 // byte, which the constant would have missed by 2,304.
@@ -5351,6 +5439,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                             r.lmhead_corr = corr(q, embed_tbl, q.N);
                             r.selfcheck_reference = true;
                             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
+
+                            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
                             // The control this path can actually run: the same tiles and the same decoder, with each
                             // head row matched against the NEXT embedding row. If a misaligned head still correlated,
                             // the number above would be measuring the vocabulary's mean brightness rather than the
@@ -5948,6 +6038,20 @@ int run(int argc, char** argv) {
     }
 
     const Report r = import_pack(dir, out, Options{allow, layout});
+    // engine#1503: a head that correlates but is mis-scaled imports cleanly and answers nonsense on the device (two
+    // packs measured: rel_err 0.095 and 0.136 against 0.000000 on the pack that serves). `--allow-incomplete` is not an
+    // override here: that flag means "write the tensors I could not represent", and this is "the tensors I wrote do not
+    // decode", which no amount of writing fixes.
+    if (r.selfcheck_scaled) {
+        std::fprintf(stderr,
+                     "1bit npu-pack: refusing to import %s: the head correlates with the pack's own embedding (%.6f) but "
+                     "its relative error is %.6f, which is a scaled or partially decoded head rather than a rounding "
+                     "difference (the threshold is %.3f). A pack in this state imports cleanly and answers garbage on "
+                     "the device; --allow-incomplete does not override this. The partial output this run already\n"
+                     "wrote under %s is not servable -- delete it before retrying.\n",
+                     dir.c_str(), r.lmhead_corr, r.lmhead_rel, kSelfcheckRelMax, out.c_str());
+        return 3;
+    }
     if (!r.refused.empty() && !allow) {
         std::fprintf(stderr,
                      "1bit npu-pack: refusing to import %s: %zu of the pack's tensors cannot be "
@@ -6081,6 +6185,47 @@ int run(int argc, char** argv) {
 }
 
 
+// engine#1985: the temporary name a canonical copy is written under before it is renamed onto `work`. Same directory
+// (rename is only atomic inside one filesystem). The name starts with the scratch stem `1bit-fconst19`, so the age rule
+// of evict_stale_canonical_copies() removes one a killed run left behind, and continues with `tmp-`, so it can never
+// match a pack's `1bit-fconst19v<n>-...` prefix: another import's sweep must not delete a copy that is being written.
+std::string canonical_copy_temp_name(const std::string& work) {
+    static std::atomic<unsigned> serial{0};
+    const fs::path p(work);
+    const std::string base = "1bit-fconst19tmp-" + std::to_string(static_cast<long>(::getpid())) + "-" +
+                             std::to_string(serial.fetch_add(1)) + "-" + p.filename().string();
+    return (p.parent_path() / base).string();
+}
+
+// engine#1985: write the canonical copy under a private name and rename it onto `work`. The copy used to be written in
+// place with O_TRUNC, at a path every import of the same pack shares, and reuse is decided by length -- so a second
+// import that started while the first was still writing saw a short file, truncated it and began again, and the first
+// then read its own copy while it was being refilled. Measured on Qwen3-1.7B with three imports 0.15 s apart: 4 of 24
+// runs read "0 in-block offsets", refused all 280 attention tensors and exited 0, on a pack a lone import reads with 0
+// gaps. With a rename a reader finds no copy or a complete one, and two writers each install the same bytes.
+void write_canonical_copy(const std::string& work, const uint8_t* data, size_t len) {
+    const std::string tmp = canonical_copy_temp_name(work);
+    {
+        std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+        if (!os) throw std::runtime_error(tmp + ": cannot write the canonical copy of the 1.9 .fconst");
+        os.write(reinterpret_cast<const char*>(data), std::streamsize(len));
+        os.flush();
+        if (!os) {
+            os.close();
+            std::error_code rm;
+            fs::remove(tmp, rm);
+            throw std::runtime_error(tmp + ": short write of the canonical copy of the 1.9 .fconst");
+        }
+    }
+    std::error_code ec;
+    fs::rename(tmp, work, ec);
+    if (ec) {
+        std::error_code rm;
+        fs::remove(tmp, rm);
+        throw std::runtime_error(work + ": cannot move the canonical copy of the 1.9 .fconst into place (" + ec.message() + ")");
+    }
+}
+
 // Public (engine#1662): see the declaration in pack_import.h. Lives outside the anonymous namespace because the test
 // calls it directly with crafted files, so the decision that guards a ~291 MB rewrite is pinned without a 1.9 pack.
 bool canonical_copy_reusable(const std::string& work, int64_t expected_len) {
@@ -6160,5 +6305,9 @@ void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::
     }
 }
 
+// engine#1503: the tied-head rule, defined here so it is the namespace-scope function the header declares (a file-local
+// copy is ambiguous with it at every call site). Correlated AND not a scaled copy of the embedding -- the two states this
+// box measures are rel_err 0.000000 (serves) and 0.095/0.136 (imports cleanly, answers garbage).
+bool selfcheck_head_ok(double corr, double rel) { return corr > kTieCorr && rel <= kSelfcheckRelMax; }
 
 }  // namespace onebit::npu::pack_import

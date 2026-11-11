@@ -36,6 +36,8 @@
 #include "forward_serve.h"
 
 #include "../npu/forward/include/file_create.h"   // dumps are created 0600, never through a symlink
+#include "npu_decode_note.h"
+
 #include "../npu/forward/include/q4nx_forward.h"
 #include "../npu/target/xdna/xdna_target.h"  // XdnaTarget::kName for --npu-target
 #include "npu_device_lock.h"
@@ -48,6 +50,7 @@
 #include "npu_prompt_ids.h"
 #include "npu_sampling.h"
 #include "npu_stop_tokens.h"
+#include "stream_bridge.h"
 #include "npu_systemone.h"
 #include "tokenizer.h"
 #include "../npu/decision.h"  // the d3 readout head (npu/decision.h, issue #653)
@@ -194,7 +197,10 @@ int json_int(const std::string& path, const char* key, int def) {
     return def;
 }
 
-void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Response& res, bool chat) {
+// `bridge` is where a streamed reply's frames go as they are produced (handle_generate below runs this on its own
+// thread for a streaming request); null means the caller wants the whole response in `res`.
+void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib::Response& res, bool chat,
+                          npu::StreamBridge* bridge) {
     // One id per response, taken before any step: the dumps of two prompts in one serve must not share names.
     const int dump_req = e.dump_logits.empty() ? 0 : ++e.dump_seq;
     json body;
@@ -213,6 +219,12 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     // from `ids`.  Do not log `prompt` as the request's text without handling this case first.
     std::vector<int> prompt_ids;
     bool prompt_is_ids = false;
+    // --prefix-pin: the leading system messages and a probe user message (npu::pin_probe_messages), rendered.  Whatever
+    // of that the full prompt starts with is the part every question under this system prompt shares, so it can be pinned on
+    // the FIRST request (PrefixCache::pin_at) -- comparing with the previous request only finds it on the second,
+    // and can run a few tokens into the question when two questions open with the same words.  Empty = the
+    // request has no system message, or the route is not pinning.
+    std::string system_prompt;
     try {
         if (chat) {
             if (!e.chat_ok) throw std::runtime_error(e.chat_refusal);
@@ -229,8 +241,25 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 extra["enable_thinking"] = npu::thinking_from_body(body);
                 prompt = npu::render_chat_template(e.tmpl, ordered.at("messages"), /*add_generation_prompt=*/true,
                                                    extra, e.bos_text, e.eos_text);
+                if (e.prefix_pin) {
+                    // A template that cannot render the probe is no reason to refuse the request: it only means
+                    // there is no early pin, and the log says so.
+                    try {
+                        const nlohmann::ordered_json probe = npu::pin_probe_messages(ordered.at("messages"));
+                        if (!probe.empty())
+                            system_prompt = npu::render_chat_template(e.tmpl, probe, /*add_generation_prompt=*/false, extra,
+                                                                      e.bos_text, e.eos_text);
+                    } catch (const std::exception& ex) {
+                        system_prompt.clear();
+                        std::fprintf(stderr, "[prefix] no early pin: the template did not render the system turn (%s)\n", ex.what());
+                    }
+                }
             } else {
                 prompt = npu::chatml(body.at("messages"), npu::thinking_from_body(body));
+                if (e.prefix_pin) {
+                    const json probe = npu::pin_probe_messages(body.at("messages"));
+                    if (!probe.empty()) system_prompt = npu::chatml(probe, npu::thinking_from_body(body));
+                }
             }
         } else {
             prompt_is_ids = npu::prompt_ids_from_body(body, e.tok->size(), prompt_ids);
@@ -288,7 +317,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     // Returns the finish_reason the request earned: "stop" for an end-of-sequence token,
     // a stop sequence or a grammar that allows nothing more, "length" when the token
     // budget ran out.
-    auto run = [&e, &req, prompt, prompt_ids, prompt_is_ids, max_tokens, chat, &opts, gram, &stats, dump_req](
+    auto run = [&e, &req, prompt, system_prompt, prompt_ids, prompt_is_ids, max_tokens, chat, &opts, gram, &stats, dump_req, bridge](
                    const std::function<bool(const std::string&, const std::vector<Emitted>&)>& on_text) {
         std::string finish = "stop";
         // The tokenizer is const and keeps no per-call state, so it runs before the lock.  A caller
@@ -355,7 +384,16 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         int pin_cut = -1;
         size_t pin_tokens = 0;
         if (e.prefix_pin && e.prefix && e.prefix->enabled()) {
-            pin_tokens = e.prefix->pin_point(e.prev_ids, ids);
+            // The end of the system turn first: it is known on the first request and it is the right place.  Only
+            // a request with no system message falls back to what it shares with the previous request.
+            if (!system_prompt.empty()) {
+                std::vector<int> lead = e.tok->encode(system_prompt);
+                if (chat && e.add_bos && e.bos_id >= 0 && (lead.empty() || lead.front() != e.bos_id))
+                    lead.insert(lead.begin(), e.bos_id);
+                pin_tokens = e.prefix->pin_at(ids, npu::shared_prefix_len(lead, ids));
+            } else {
+                pin_tokens = e.prefix->pin_point(e.prev_ids, ids);
+            }
             if (pin_tokens > 0 && int(pin_tokens) - 1 >= resume) pin_cut = int(pin_tokens) - 1;
         }
         {
@@ -486,7 +524,8 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         bool stopped_at_eos = false, stopped_at_stop = false;
         int produced = 0;
         for (int n = 0; n < limit; n++) {
-            if (req.is_connection_closed()) break;  // the client is gone: free the NPU
+            // the client is gone: free the NPU (the bridge knows first when a write to it failed)
+            if (req.is_connection_closed() || (bridge && bridge->cancelled())) break;
             if (gram) refresh_allowed();
             // Raw distribution for a reference comparison: sample_token() takes logits by const
             // reference and the copy below happens before it runs, so what lands on disk is what
@@ -499,7 +538,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     std::fclose(f);
                 }
             }
-            const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr);
+            const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr, e.tok->size());
             // -1: the grammar allows no token here, so the answer ends where it is.  An end token is
             // in the mask only where the grammar can stop (refresh_allowed), so a constrained reply
             // that completes reports "stop" instead of padding to the budget (engine#1182).
@@ -589,6 +628,9 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     // markup whatever the container is (app/npu_tool_grammar.h), so that reply is split as qwen3.  Every
     // other reply is in the container's own markup.
     const npu::AnswerFamily family = opts.tool_grammar ? npu::AnswerFamily::qwen3 : e.answer_family;
+    // A template whose generation prompt already opens the reasoning block leaves the answer inside it
+    // (npu::prompt_opens_reasoning).  Only a rendered chat prompt can: an ids prompt and /v1/completions are raw.
+    const bool starts_in_reasoning = chat && !prompt_is_ids && npu::prompt_opens_reasoning(prompt, family);
     auto wrap = [&](const std::string& content, const std::string& finish, const std::vector<Emitted>& lps) {
         json out;
         out["id"] = id;
@@ -599,7 +641,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             // (issue #652 item 3) one shared parser splits what the model wrote into OpenAI's three
             // parts; a reply that is only tool calls says content: null.
             const npu::ParsedAnswer ans =
-                npu::parse_answer(content, family, opts.tools_sent);
+                npu::parse_answer(content, family, opts.tools_sent, starts_in_reasoning);
             json message{{"role", "assistant"}};
             message["content"] = ans.content_null ? json(nullptr) : json(ans.content);
             if (!ans.reasoning.empty()) message["reasoning_content"] = ans.reasoning;
@@ -620,7 +662,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 std::vector<std::string> texts;
                 texts.reserve(lps.size());
                 for (const auto& x : lps) texts.push_back(x.text);
-                const std::vector<char> keep = npu::content_mask(texts, family, opts.tools_sent);
+                const std::vector<char> keep = npu::content_mask(texts, family, opts.tools_sent, starts_in_reasoning);
                 std::vector<Emitted> content_lps;
                 for (size_t i = 0; i < lps.size(); i++)
                     if (i < keep.size() && keep[i]) content_lps.push_back(lps[i]);
@@ -658,10 +700,16 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             chunk_tpl["object"] = "chat.completion.chunk";
             chunk_tpl["created"] = created;
             chunk_tpl["model"] = e.id;
+            // With a bridge, each frame leaves as soon as it exists (the connection thread is already writing them);
+            // without one they are collected and sent when the handler returns, as this route always did.
             auto chunks = std::make_shared<std::vector<std::string>>();
+            auto send = [&](std::string frame) {
+                if (bridge) bridge->push(std::move(frame));
+                else chunks->push_back(std::move(frame));
+            };
             // The same splitter as the non-streamed path, fed piece by piece, so a streamed reply
             // and a non-streamed one cannot disagree about what is reasoning and what is content.
-            npu::AnswerStream stream(family, opts.tools_sent);
+            npu::AnswerStream stream(family, opts.tools_sent, starts_in_reasoning);
             auto emit_pieces = [&](const std::string& t, const std::vector<Emitted>& lp) {
                 std::vector<std::pair<bool, std::string>> pieces;
                 stream.feed(t, pieces);
@@ -676,7 +724,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     // carries no entries.
                     if (!is_reasoning && opts.sample.logprobs && !lp.empty())
                         chunk["choices"][0]["logprobs"] = logprobs_json(lp);
-                    chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+                    send("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
                 }
                 return true;
             };
@@ -688,7 +736,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     json chunk = chunk_tpl;
                     json delta = is_reasoning ? json{{"reasoning_content", text}} : json{{"content", text}};
                     chunk["choices"] = json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}});
-                    chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+                    send("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
                 }
                 if (!stream.calls().empty()) {
                     // The calls arrive whole, in one chunk: OpenAI streams argument fragments, and a
@@ -704,7 +752,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     json delta{{"tool_calls", calls}};
                     if (!chunk_tpl.contains("object") || chunk_tpl["object"].is_null()) chunk["object"] = "chat.completion.chunk";
                     chunk["choices"] = json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", "tool_calls"}}});
-                    chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+                    send("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
                 }
                 // OpenAI's stream ends with one choice that carries an empty delta and the reason the
                 // generation ended; without it a streaming client cannot tell a `length` cut from a
@@ -716,7 +764,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     chunk["choices"] = json::array({{{"index", 0},
                                                      {"delta", json::object()},
                                                      {"finish_reason", finish}}});
-                    chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+                    send("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
                 }
             }
             {
@@ -724,7 +772,11 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 tail["choices"] = json::array();
                 tail["usage"] = usage_json(stats);
             tail["timings"] = timings_json(stats);
-                chunks->push_back("data: " + tail.dump() + "\n\n");
+                send("data: " + tail.dump() + "\n\n");
+            }
+            if (bridge) {
+                bridge->push("data: [DONE]\n\n");
+                return;
             }
             auto cursor = std::make_shared<size_t>(0);
             res.set_chunked_content_provider("text/event-stream",
@@ -751,6 +803,73 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         res.status = 500;
         res.set_content(json{{"error", {{"message", ex.what()}}}}.dump(), "application/json");
     }
+}
+
+// The route's entry.  A request that does not ask for a stream is answered in place.  One that does is generated on
+// its own thread, so its frames can be written while later tokens are still being produced (app/stream_bridge.h):
+// this thread waits for the first frame or the end, and only then decides between an ordinary response -- the 400s
+// and 500s a request can earn before it has produced anything keep their status codes -- and a stream.
+void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Response& res, bool chat) {
+    // A non-causal decision pack has no decode to run (npu::decision_only_refusal): say so before any work.
+    if (e.fwd && e.fwd->noncausal()) {
+        res.status = 400;
+        res.set_content(npu::decision_only_refusal(e.id, e.head != nullptr).dump(), "application/json");
+        return;
+    }
+    bool wants_stream = false;
+    try {
+        const json body = json::parse(req.body);
+        wants_stream = body.is_object() && body.contains("stream") && body["stream"].is_boolean() && body["stream"].get<bool>();
+    } catch (const std::exception&) {
+        // not JSON: the implementation answers that itself, without a stream
+    }
+    if (!wants_stream) {
+        handle_generate_impl(e, req, res, chat, nullptr);
+        return;
+    }
+    auto bridge = std::make_shared<npu::StreamBridge>();
+    auto early = std::make_shared<httplib::Response>();   // what the generation answers when it never starts a stream
+    // `req` outlives this handler: httplib keeps it until the response, content provider included, has been written,
+    // and the releaser below joins the thread before that.
+    auto worker = std::make_shared<std::thread>([&e, &req, chat, bridge, early]() {
+        try {
+            handle_generate_impl(e, req, *early, chat, bridge.get());
+        } catch (const std::exception& ex) {
+            early->status = 500;
+            early->set_content(json{{"error", {{"message", ex.what()}}}}.dump(), "application/json");
+        } catch (...) {
+            early->status = 500;
+            early->set_content(R"({"error":{"message":"generation failed"}})", "application/json");
+        }
+        // A failure after the stream began cannot change the status any more: say so in the stream and end it.
+        // One that came before any frame pushes nothing, so the handler below still answers it as an ordinary error.
+        if (early->status >= 400 && bridge->started()) bridge->push("data: " + early->body + "\n\ndata: [DONE]\n\n");
+        bridge->finish();
+    });
+    if (!bridge->wait_first()) {
+        worker->join();
+        res.status = early->status > 0 ? early->status : 500;
+        res.set_content(early->body, early->has_header("Content-Type") ? early->get_header_value("Content-Type")
+                                                                        : std::string("application/json"));
+        return;
+    }
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [bridge](size_t, httplib::DataSink& sink) {
+            std::string frame;
+            while (bridge->next(frame)) {
+                if (!sink.write(frame.data(), frame.size())) {
+                    bridge->cancel();   // the client went away: the generation stops at its next token
+                    return false;
+                }
+            }
+            sink.done();
+            return true;
+        },
+        [bridge, worker](bool) {
+            bridge->cancel();
+            if (worker->joinable()) worker->join();
+        });
 }
 
 // The per-question input limit of the decision route: the text path's own 32,768 tokens, or the
@@ -866,6 +985,10 @@ int run_forward_ids(const std::string& model_dir, const std::string& kernels, co
     if (ids.empty()) throw std::runtime_error("--ids: no token ids");
     const std::string model = model_dir + "/model.q4nx";
     if (!std::filesystem::exists(model)) throw std::runtime_error(model + " does not exist");
+    // The tokenizer's size bounds the printed ids (engine#2017); a container without tokenizer.json keeps the whole row.
+    int tok_vocab = 0;
+    if (const std::string tj = model_dir + "/tokenizer.json"; std::filesystem::exists(tj))
+        tok_vocab = npu::Tokenizer(tj).size();
     // Same device discipline as forward-serve: host-GEMM runs take no lock (engine#1353 -- a host-GEMM run that held it
     // for 4 h 52 m stopped two lanes' device work), a run that opens the device takes the exclusive one.
     int lock_fd = -1;
@@ -896,10 +1019,8 @@ int run_forward_ids(const std::string& model_dir, const std::string& kernels, co
                                      " floats for " + std::to_string(m) + " rows)");
         const int nv = int(all.size() / size_t(m));
         for (int r = 0; r < m; ++r) {
-            const float* row = all.data() + size_t(r) * size_t(nv);
-            int best = 0;
-            for (int v = 1; v < nv; ++v)
-                if (row[v] > row[best]) best = v;
+            // Bounded by the tokenizer like the served route (engine#2017): an id past it is a padding position.
+            const int best = npu::argmax_token(all.data() + size_t(r) * size_t(nv), size_t(nv), tok_vocab);
             std::printf("%d\n", best);   // token ids out, in row order: the id the model chooses at that row
         }
         done += m;
@@ -979,6 +1100,7 @@ int run_forward_serve(int argc, char** argv) {
     e.bos_id  = json_int(cfg, "bos_token_id", -1);
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;
     e.eos = npu::eos_token_ids_from_config(cfg);
+    const size_t eos_from_config = e.eos.size();
     e.endoftext = e.tok->token_id("<|endoftext|>");
     // q4nx_config_int finds the key at any depth (a text_config's too).
     e.max_context = q4nx_config_int(cfg.c_str(), "max_position_embeddings", 0);
@@ -1033,6 +1155,20 @@ int run_forward_serve(int argc, char** argv) {
             "prompt as token ids (#938) and render the model's own template" +
             (specials.empty() ? std::string() : " (model specials: " + specials + ")");
         std::fprintf(stderr, "1bit forward-serve: chat route disabled: %s\n", e.chat_refusal.c_str());
+    }
+    // What ends a generation is more than config.json's eos_token_id (npu::stop_token_ids): the tokenizer's own
+    // eos_token, and, when this route closes its prompt turns with ChatML's marker, that marker.  Decided here,
+    // after the template, because whether the route renders ChatML is known only now.
+    {
+        const bool chatml_route = !can_render && e.chat_ok;
+        e.eos = npu::stop_token_ids(npu::read_json_or_null(cfg), npu::read_json_or_null(dir + "/tokenizer_config.json"),
+                                    chatml_route ? std::string("<|im_end|>") : std::string(),
+                                    [&](const std::string& text) { return e.tok->token_id(text); });
+        std::string named;
+        for (size_t i = 0; i < e.eos.size(); i++)
+            named += std::string(i ? ", " : "") + std::to_string(e.eos[i]) + " " + e.tok->decode(e.eos[i]) +
+                     (i < eos_from_config ? "" : " (tokenizer / chat turn end)");
+        std::fprintf(stderr, "1bit forward-serve: stops on %s\n", named.empty() ? "<|endoftext|> only" : named.c_str());
     }
     // The template variables `{{ bos_token }}`/`{{ eos_token }}` render: the strings the tokenizer
     // actually has (a null bos_token in tokenizer_config.json is "", and the engine's -1 is the same
@@ -1232,6 +1368,13 @@ int run_forward_serve(int argc, char** argv) {
     // The target that is actually serving, so a log says which one answered rather than leaving it to the build.
     std::fprintf(stderr, " [npu-target=%s]", npu_target.c_str());
     std::fprintf(stderr, "\n");
+    // engine#2102: the machine line `[forward] decode family: …` stays byte-for-byte (gates grep it). This is the sentence
+    // an operator needs at the ready line's level when it says 0 of N -- the route that answers correctly and 50x slower.
+    {
+        const std::string note = onebit::npu::decode_family_note(e.fwd->decode_roles(), e.fwd->design_roles(), kernels,
+                                                                 e.fwd->decode_disabled(), e.fwd->decode_image());
+        if (!note.empty()) std::fprintf(stderr, "%s\n", note.c_str());
+    }
 
     while (true) std::this_thread::sleep_for(std::chrono::seconds(3600));
     return 0;

@@ -142,8 +142,11 @@ inline AnswerFamily answer_family_of_template(const std::string& template_text) 
 // (is_reasoning, text) pieces; finish() flushes what the holdback still held and reports the calls.
 class AnswerStream {
 public:
-    AnswerStream(AnswerFamily family, bool tools_sent)
-        : fam_(family), tags_(answer_detail::tags_of(family)), tools_sent_(tools_sent) {}
+    // `starts_in_reasoning`: the PROMPT already opened the reasoning block (prompt_opens_reasoning below), so the
+    // answer begins inside it and the first thing to look for is the closing tag.
+    AnswerStream(AnswerFamily family, bool tools_sent, bool starts_in_reasoning = false)
+        : fam_(family), tags_(answer_detail::tags_of(family)), tools_sent_(tools_sent),
+          mode_(starts_in_reasoning ? Mode::reasoning : Mode::content) {}
 
     void feed(const std::string& chunk, std::vector<std::pair<bool, std::string>>& out) {
         buf_ += chunk;
@@ -177,8 +180,22 @@ public:
 private:
     enum class Mode { content, reasoning, call };
 
-    void emit(std::vector<std::pair<bool, std::string>>& out, bool is_reasoning, const std::string& text) {
-        if (text.empty()) return;
+    // Whitespace around a reasoning block is the model's layout, not part of either text: `<think>\n...\n</think>\n\n`
+    // then the answer.  Left in, the answer to "one word" comes back as "\n\nParis", and a model that thinks nothing
+    // (`<think>\n\n</think>`) sends a reasoning chunk that is two newlines.  So the whitespace that LEADS the reasoning
+    // is dropped, and so is the whitespace that leads the content when that content follows a reasoning block --
+    // the rule app/think_split.h has always applied on the in-process route ("whitespace around the block is
+    // dropped"), so the two routes return the same strings.  Content with no reasoning before it is not touched.
+    void emit(std::vector<std::pair<bool, std::string>>& out, bool is_reasoning, const std::string& raw) {
+        if (raw.empty()) return;
+        std::string text = raw;
+        bool& trim = is_reasoning ? trim_reasoning_ : trim_content_;
+        if (trim) {
+            const size_t b = text.find_first_not_of(" \t\r\n");
+            if (b == std::string::npos) return;   // all whitespace so far: nothing to send yet
+            text.erase(0, b);
+            trim = false;
+        }
         if (is_reasoning) {
             reasoning_ += text;
             saw_reasoning_ = true;
@@ -218,6 +235,8 @@ private:
                 }
                 if (starts(tags_.think_close)) {
                     flush_plain();
+                    // what follows a block is separated from it by layout whitespace -- unless content came first
+                    if (mode_ == Mode::reasoning && !saw_text_) trim_content_ = true;
                     mode_ = Mode::content;
                     i += std::string(tags_.think_close).size();
                     continue;
@@ -374,14 +393,32 @@ private:
     std::vector<ToolCall> calls_;
     bool saw_reasoning_ = false;
     bool saw_text_ = false;
+    bool trim_reasoning_ = true;   // until the reasoning's first non-whitespace character
+    bool trim_content_ = false;    // set when a reasoning block closes before any content; cleared by the first text
 };
+
+// Does the rendered prompt leave the model INSIDE a reasoning block?  Some templates end their generation prompt
+// with the opening tag itself -- Qwen3.5's ends `<|im_start|>assistant\n<think>\n` when thinking is on -- so the
+// model never writes that tag: its answer starts with the reasoning and the first tag in it is the closing one.
+// A splitter that waits to see the block opened then files the whole reasoning under `content` and drops the
+// closing tag it never saw opened, so nothing in the reply marks where the answer starts (measured on FastFlowLM's
+// Qwen3.5-2B-NPU2, engine#1786).  True when the prompt, less trailing whitespace,
+// ends with the family's opening tag.  A prompt that opens and closes the block (thinking off:
+// `<think>\n\n</think>\n\n`) does not end with it, and neither does one that never mentions it.
+inline bool prompt_opens_reasoning(const std::string& prompt, AnswerFamily family) {
+    const std::string open = answer_detail::tags_of(family).think_open;
+    size_t end = prompt.size();
+    while (end > 0 && (prompt[end - 1] == ' ' || prompt[end - 1] == '\n' || prompt[end - 1] == '\r' || prompt[end - 1] == '\t')) --end;
+    return !open.empty() && end >= open.size() && prompt.compare(end - open.size(), open.size(), open) == 0;
+}
 
 // Which of `pieces` (one generated token's text each, in order) belong to `content` -- not to
 // reasoning and not to call markup.  Callers that report a per-token value use this so reasoning and
 // call markup get no entry (issue #651 item 3).  A token that straddles a boundary ("</think>The")
 // counts as content: its text did reach the caller.
-inline std::vector<char> content_mask(const std::vector<std::string>& pieces, AnswerFamily family, bool tools_sent) {
-    AnswerStream s(family, tools_sent);
+inline std::vector<char> content_mask(const std::vector<std::string>& pieces, AnswerFamily family, bool tools_sent,
+                                      bool starts_in_reasoning = false) {
+    AnswerStream s(family, tools_sent, starts_in_reasoning);
     std::vector<char> mask;
     mask.reserve(pieces.size());
     std::vector<std::pair<bool, std::string>> out;
@@ -406,8 +443,9 @@ inline std::vector<char> content_mask(const std::vector<std::string>& pieces, An
 }
 
 // The whole answer at once: the same splitter, so the two paths cannot disagree.
-inline ParsedAnswer parse_answer(const std::string& text, AnswerFamily family, bool tools_sent) {
-    AnswerStream s(family, tools_sent);
+inline ParsedAnswer parse_answer(const std::string& text, AnswerFamily family, bool tools_sent,
+                                 bool starts_in_reasoning = false) {
+    AnswerStream s(family, tools_sent, starts_in_reasoning);
     std::vector<std::pair<bool, std::string>> pieces;
     s.feed(text, pieces);
     s.finish(pieces);

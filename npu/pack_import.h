@@ -96,6 +96,14 @@ struct QkGainOffsets {
 QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes);
 std::string qk_norm_refusal(bool declared, bool found);
 
+// How many rows a head read from the .fconst tail occupies in the container. The pack stores the head in whole 64-row
+// tiles, so a vocabulary that is not a multiple of 64 is carried with the pack's own padding rows (Hunyuan: 120,818 ->
+// 120,832) while `vocab_size` and the plan's tensor shape stay the vocabulary. A head that is a graph initializer is
+// stored as it is: on main nothing pads it, and one whose row count is not a multiple of 32 is refused by the tile
+// writer ("q4_1 tiles need N % 32 == 0"). If graph-head padding lands (engine#1992 was closed unmerged), its quantum
+// belongs here. This is the number a container's lm_head tile count follows from.
+int64_t head_stored_rows(int64_t vocab, bool from_fconst_tail);
+
 // Why a pack's two layout witnesses cannot be reconciled, or "" when they can (engine#1985).
 //
 // `vote_hdrs` is the number of in-block headers the epsilon-anchor vote recorded (0 when it could not win); `declared_qk`
@@ -222,6 +230,12 @@ struct Plan {
     int64_t container_payload_bytes = 0;
     std::map<std::string, int64_t> container_dtypes;
     std::string container_note;   // what the container genre still needs, empty for a non-container pack
+    // engine#1786 (item F1), slice 2: WHERE the container's geometry came from, and what it could not reach.
+    // A bare number in `dims` cannot say whether the pack declared it or a file beside it did, and those two are free to
+    // disagree (13 of the 29 packs measured carry a `dims` block; all 29 carry config.json). Empty for a non-container pack.
+    std::string container_geometry_source;          // "dims", "config.json", or empty when neither answered
+    std::vector<std::string> container_geometry_missing;   // fields no source could fill, by name
+    std::vector<std::string> container_geometry_inferred;  // fields derived from another field, by name
     int64_t graph_matmuls = -1;      // MatMulNBits nodes in the main graph
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)
@@ -289,9 +303,29 @@ struct Q4nxContainer {
     int64_t header_bytes = 0;
     int64_t payload_bytes = 0;
     std::vector<Q4nxTensor> tensors;   // in header order
+    // The safetensors `__metadata__` object, kept because it is where this genre states its own geometry (engine#1786).
+    // Three quarters of the packs measured on this box carry a `dims` block with hidden/intermediate/layers/heads/vocab;
+    // two carry no metadata at all (`d3-edge`, `d3-flash`), which is why the reader keeps it as data and does not
+    // interpret it here.
+    nlohmann::json meta;
     std::string why;                        // non-empty when the container could not be read; tensors is then empty
 };
 Q4nxContainer read_q4nx_container(const std::string& path);
+
+// engine#1786 (item F1): the container genre's geometry, from the two places a pack can state it, in order of
+// authority -- the container's own `dims` block, then config.json. `source` names which one answered, so a plan can
+// never present a declared number and a file's number as the same kind of fact; `missing` names the fields neither
+// could fill, and `inferred` the ones derived from other fields (head_dim from hidden/heads).
+//
+// Pure: no file is opened, so the three genres the census measured -- 13 self-describing, 14 gguf-converted, 2 with
+// no metadata at all -- can all be pinned without a pack, which is the point of extracting it from `plan()`.
+struct ContainerGeometry {
+    Dims dims;
+    std::string source;                 // "dims", "config.json", or empty when neither answered
+    std::vector<std::string> missing;   // fields no source could fill, by name
+    std::vector<std::string> inferred;  // fields derived from another field, by name
+};
+ContainerGeometry container_geometry(const nlohmann::json& meta, const nlohmann::json& config);
 
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
@@ -302,6 +336,16 @@ Plan plan(const std::string& pack_dir);
 // out of canonical_token_fconst() so the decision has a test that needs no 1.9 pack: a truncated copy, a missing file
 // and a directory on the scratch path must all come back false.
 bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
+
+// engine#1985: how the canonical copy reaches `work`. It is written under canonical_copy_temp_name(work) -- a private name
+// in the same directory -- and renamed into place, so a concurrent import of the same pack finds no copy or a complete one,
+// never one that is being written. Writing in place let a second import truncate the file the first was about to read.
+// Throws std::runtime_error when the copy cannot be written or moved; the temporary file is removed on either failure.
+// Exposed so the rule has an arm that needs no pack (threads writing one path while a reader checks every complete-length
+// file it finds), and so the temporary name's two properties are pinned: a pack's sweep prefix never matches it, and the
+// age rule does.
+std::string canonical_copy_temp_name(const std::string& work);
+void write_canonical_copy(const std::string& work, const uint8_t* data, size_t len);
 
 // Removes the canonical Token .fconst copies in `dir` that nothing will reuse (engine#1770). Reuse writes a new copy when the
 // source changes rather than overwriting, so without this the scratch directory grows one multi-hundred-MB file per change; on
@@ -406,6 +450,11 @@ struct Report {
     // check; an untied pack's head and embedding are separate matrices by construction, and the same number is
     // meaningless -- reported as such rather than left looking like a failed import.
     bool selfcheck_tied = false;
+    // engine#1503: tied, correlated -- but MIS-SCALED. Correlation alone passes a head that is a scaled copy of the
+    // embedding: two packs measured on this box report corr 0.9915/0.9961 with rel_err 0.095/0.136 and serve garbage
+    // ("myself" forever), while the pack that serves correctly reports rel_err 0.000000. A pack in this state imports
+    // cleanly and answers nonsense, so it is refused rather than reported.
+    bool selfcheck_scaled = false;
     double lmhead_corr = 0, lmhead_rel = 0, ctrl_corr_nibble = 0, ctrl_corr_nozp = 0;
     // The tail (.fconst) path has no MatMulNBits bytes to mis-decode, so its control is an ALIGNMENT one: the same
     // tiles, the same decoder, rows matched against the neighbouring embedding row. A correct decode correlates ~1
@@ -735,6 +784,12 @@ bool fconst_scratch_ready(const std::string& dir);
 // real table must never contain: two rows for one geometry with different shapes.
 const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
                                               std::string* why);
+
+// engine#1503: the tied-head rule, as ONE predicate so the four call sites cannot drift: the head must reproduce the
+// embedding (corr) AND not be a scaled copy of it (rel_err). The constant is the measured gap between the two states --
+// 0.000000 for the pack that serves, 0.095/0.136 for the two that do not -- so 0.02 sits far from both.
+inline constexpr double kSelfcheckRelMax = 0.02;
+bool selfcheck_head_ok(double corr, double rel);
 
 int64_t attn_tile_bytes(int64_t k);
 // Pearson correlation between a quantised head and a bf16 embedding table (engine#1690; the self-check's own statistic,

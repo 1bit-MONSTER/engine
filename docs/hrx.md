@@ -98,6 +98,18 @@ fails a pin that leaves a gate model's node off HRX.
     `ggml/src/ggml-hrx` keep our side; a conflict anywhere else fails the run and names the files;
   - merges AMD's hrx-system pin into our `1bit/main` the same way;
   - opens a PR here moving the submodules, listing the llama.cpp commits new to the engine.
+- **The mirror hold.** A rewrite of AMD's line that the rules above cannot merge leaves the daily run with
+  nothing to do but fail, every day, until somebody does the merge by hand. While
+  [`config/llama-mirror-hold.config`](../config/llama-mirror-hold.config) names the mirror's commit, the run
+  instead reports the hold in its summary (`mirror 1bit/hrx-vulkan HELD at …; AMD's pin is …, on a line that
+  does not contain it`), moves nothing and succeeds; the engine's pin still follows our own line. The hold
+  describes one state and fails the run when that state ends, so it cannot be forgotten: **stale** when the
+  mirror is no longer the named commit, **unneeded** when AMD's pin contains the named commit again (an ordinary
+  sync would work). `scripts/bump-hrx-sync.sh llama-hold <repo> <mirror> <pin>` prints the decision alone
+  (`none`, `held`, `stale`, `unneeded`). The file ships naming no commit, so it holds nothing; naming one is
+  the owner's decision. It was added for AMD's 2026-11-09 rebase (engine#1945): taking that pin is a merge of
+  149 conflicted files (538 hunks) into `1bit/hrx-vulkan-patched`, measured against the last AMD commit our
+  line took.
 - **The hold.** While [`config/hrx-system-hold.config`](../config/hrx-system-hold.config)
   names a commit, the run does not merge AMD's hrx-system, keeps `third_party/hrx-system`
   where it is, and takes only AMD's llama.cpp changes outside the HRX backend paths
@@ -300,9 +312,31 @@ Measured on gfx1151 (2026-11-10):
   the dense inputs of Qwen3-0.6B, Qwen3-4B, ZAYA1-8B and flint. Cases at those two values are in the
   suite, so the shift has a test on each side.
 
-Still open under #1962: two prefill kernels that re-quantise the activations into 8-bit blocks
-(Q5_K and Q6_K weights at 512 tokens) keep a per-block term in half precision and still return NaN
-above 65504. And the limit is moved, not removed: an activation above 4.19e6 would overflow again.
+The prefill kernels followed at pin `7a1f2b81c`. The two small-batch Q6_K kernels were already done
+(llama.cpp #288). The Q4_K and Q6_K prefill kernels read a half-precision copy of the activations;
+that copy is now stored at 2^-6 and the sums are scaled back (llama.cpp #298). The Q5_K/IQ4_XS
+prefill kernel reads the activations as 8-bit blocks, each with a scale and a scaled sum in half
+precision. The scale fits up to 8.3e6; the scaled sum is about as large as the largest activation in
+the block, so it was the term that overflowed. The kernel now rebuilds a sum that is not finite from
+the 8-bit values it already holds, and uses a finite one as stored (llama.cpp #292).
+
+Measured on gfx1151 (2026-11-11, fork `7a1f2b81c`, full build):
+
+- `test-backend-ops -o MUL_MAT` with a resident weight (2048 x 4096), Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0
+  and Q4_0 at 1 to 512 tokens, with activation spikes of 3.0, 9.3e4 and 2e6: 180 of 180 pass (run at
+  llama.cpp #298's head). Before #292 and #298, Q5_K at 512 tokens and Q4_K and Q6_K at 256 and 512
+  tokens returned NaN at 9.3e4. The whole op is 617 of 617; `MUL_MAT_ID` is 845 of 845.
+- Perplexity on wikitext-2 (`-c 512 -b 512`, 16 chunks): Qwen3-4B-Q4_K_M 17.1836 (17.1864 before
+  #298), Qwen3-4B-IQ4_XS 17.6304 (the same before and after #292).
+- Prefill rate on Qwen3-4B-Q4_K_M across #298, eight alternating runs on a loaded box: 2683 against
+  2735 tok/s (ratio 0.98, pairs between 0.88 and 1.14). No regression shown; a cost of 2 to 3 % is
+  not excluded.
+
+Still open under #1962: the final projection of the draft head (a shortlist kernel) narrows its
+activations too and has no test that reaches it. The other kernels that read the 8-bit blocks (the
+fused SwiGLU, the routed kernels and the low-token Q4 paths) use the stored sum as it is and are not
+measured above 65504. And the limits are moved, not removed: 4.19e6 for the half-precision copies,
+8.3e6 for the 8-bit blocks.
 
 ### Fixed: Qwen3-VL on `HRX0`: it decodes again, and its rotation runs on the device ([engine#1467](https://github.com/1bit-MONSTER/engine/issues/1467))
 
@@ -835,6 +869,65 @@ host while their packed copies are device-resident; it would need the packed sid
 repacked-prefill kernel ([llama.cpp #250](https://github.com/1bit-MONSTER/llama.cpp/pull/250),
 `GGML_HRX_Q6K_PACKED_PREFILL`) stays **opt-in** for the same reason: it is numerically free and speed-neutral, so it buys nothing
 on its own.
+
+**Measuring the duplicate on your own build.** `tools/hrx_gtt_split.py` splits one process's GTT into the loader's copy and HRX's
+packed second copy, using only lines llama.cpp and HRX already print plus the process's own fdinfo. It needs no root and no
+tracefs. Inside your ticket:
+
+```
+gpu-hold -l <lane> -t 5 -- tools/hrx_gtt_split.py run --out split-4b -- \
+    llama-cli -m Qwen3-4B-Q4_K_M.gguf -ngl 99 -fit off -c 256 -n 16 --temp 0 -no-cnv -p "The capital of France is"
+tools/hrx_gtt_split.py parse split-4b/split.log --samples split-4b/gtt.txt     # again, from the files it left
+```
+
+`run` adds `-v`, sets `GGML_HRX_HOST_WEIGHT_TRACE=1`, and samples `drm-total-gtt` with each DRM client counted once. On the
+#1351 pin (llama.cpp `40f58efe1`, the same command):
+
+| part | Qwen3-4B Q4_K_M | Qwen3.8-27B UD-Q4_K_XL |
+|---|---:|---:|
+| loader's model buffer (HRX) | 2,375.9 MiB | 15,718.5 MiB |
+| HRX's packed copies | **795.8 MiB** (38 weights) | **2,631.3 MiB** (66 weights) |
+| KV + recurrent state | 36.0 | 165.6 |
+| compute + output buffers | 43.2 | 72.1 |
+| not attributed | 674.1 | 1,909.5 |
+| process peak GTT | 3,925 | 20,497 |
+| share of the loader's copy resident twice | 33.5 % | 16.7 % |
+
+The packed copies are the duplicate. HRX builds one for each weight that a kernel reads in a re-laid-out form; prefill above
+a token threshold still reads the loader's copy. "Not attributed" is mostly runtime module memory and copy staging (the
+staging buffer is capped at 64 MiB since [llama.cpp #266](https://github.com/1bit-MONSTER/llama.cpp/pull/266)). It is not
+weights. This replaces the `bo_trace.py` reproduction in the issue body, which was never committed.
+
+**Which kernel a graph's time is in.** `tools/hrx_dispatch_profile.py` gives the time per HRX dispatch, summed per kernel,
+on any HRX build (it needs no rebuild). The backend's serial mode (`GGML_HRX_DEBUG_SERIAL_EXECUTION=1`) waits for the device
+after every dispatch and prints a line at launch and at completion; the tool sets the switch, time-stamps those lines and
+names the kernels from the pinned fork's manifests. Inside your ticket:
+
+```
+gpu-hold -l <lane> -t 10 -- tools/hrx_dispatch_profile.py run --log prof.log --json prof.json -- \
+    llama-bench -m Qwen3-4B-Q4_K_M.gguf -ngl 99 -p 8192 -n 16 -r 1
+tools/hrx_dispatch_profile.py parse prof.log --top 20        # again, from the trace it kept
+```
+
+It prints one table per command program (a graph shape: prefill batch, decode step). Measured on the pin `2293f95ea`,
+Qwen3-4B Q4_K_M, the prefill program of a 512-token prompt against the most frequent prefill program of an 8,192-token
+prompt (12 of its 16 batches of 512), one run each, 2026-11-11:
+
+| kernel | 512-token prompt, ms each | share | 8,192-token prompt, ms each | share |
+|---|---:|---:|---:|---:|
+| `ggml_flash_attention_f32_f16_wmma` | 0.371 | 7.5% | 2.150 | 49.3% |
+| `ggml_mul_mat_swiglu_q4_k_f16_wmma_prefill_wave32` | 1.714 | 33.6% | 1.728 | 19.3% |
+| `ggml_mul_mat_q4_k_f16_wmma_prefill_wave32` | 0.425 | 34.2% | 0.393 | 18.0% |
+| `ggml_mul_mat_q6_k_f16_wmma_prefill_wave32` | 0.635 | 12.4% | 0.632 | 7.0% |
+
+The matmuls cost the same at any context; the attention kernel is the part that grows.
+
+What the numbers are and are not: each is the wall time from launch to device-idle with one dispatch in flight, so it holds
+one wake-up of the waiting thread and the run is slower than a normal one (the same command: pp512 2,977 -> 2,500 tok/s,
+tg16 67 -> 36, pp8192 1,191 -> 1,167). Use it to rank kernels and to see what grows with the context, not as a rate.
+Decode is slowed much more than prefill, so compare shares inside one program and never between programs. A dispatch that
+was launched and never finished (a ticket that ran out, a cut trace) is listed under the tables and is not in them. A build
+with extra kernel directories shows those kernels as numeric ids; name them with a second `--manifests DIR`.
 
 ### Measuring on `HRX0`: what makes a number citable
 

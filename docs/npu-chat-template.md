@@ -198,6 +198,22 @@ Both give the client the same OpenAI shape: `reasoning_content`, `content`, and 
 is a JSON string. A Gemma call body that is not well formed (a string that never closes, a key with no value,
 an unclosed object or array, an empty value) is not a call: the markup is returned in `content` unchanged.
 
+**A reasoning block the prompt opened.** Some templates end their generation prompt with the opening tag itself:
+Qwen3.5's ends `<|im_start|>assistant\n<think>\n` when thinking is on. The model then never writes that tag; its
+answer starts with the reasoning and the first tag in it is the closing one. `forward-serve` checks whether the
+rendered prompt, less trailing whitespace, ends with the family's opening tag (`npu::prompt_opens_reasoning`), and
+if so splits the answer as starting inside the block. Before engine#1786's row on FastFlowLM's `Qwen3.5-2B-NPU2`
+it did not: the whole reasoning came back in `content`, `reasoning_content` was empty, and the closing tag was
+dropped, so nothing in the reply marked where the answer began. With thinking off the same template opens and
+closes the block in the prompt, and the answer is content from its first token.
+
+**Whitespace around the block is layout.** A model writes `<think>\n…\n</think>\n\n` and then its answer. The
+whitespace that leads the reasoning is not returned, and neither is the whitespace that leads the content when the
+content follows a reasoning block, so "answer with one word" comes back as `Paris`, not `\n\nParis`, and a model
+that thinks nothing (`<think>\n\n</think>`) sends no reasoning chunk at all. Whitespace inside either text is
+kept, and content with no reasoning before it is returned exactly as written. This is the rule `app/think_split.h`
+applies on the in-process route, so both routes return the same strings.
+
 One exception: `tool_choice: "required"` or a named function installs a grammar that constrains the reply to
 the `qwen3` call markup for every container (`app/npu_tool_grammar.h`), so that reply is split as `qwen3`.
 A grammar in Gemma's own call syntax is not written yet.

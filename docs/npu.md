@@ -1505,6 +1505,28 @@ the decode, the tiling against `tests/golden/oga_pack_tiles.bin` — written by
 the attention tile against `tests/golden/oga_attn_tile.bin`, and, against a real pack, the refusal
 list, the tile round trip, the self-check numbers and that the container opens with `npu::Model`.
 
+### The tied-head self-check
+
+On a tied pack, the pack's own embedding is an independent reference for the decoded 4-bit head. The import compares the two and refuses a head that is scaled or only partly decoded. A pack in that state imports cleanly and answers garbage on the device, so `--allow-incomplete` does not override this refusal. The check has four parts. A head passes when all of them hold:
+
+- **correlation** above 0.99;
+- **best-fit scale** within 5 % of 1. This is the least-squares `a` in `embedding ≈ a · head`, so a scaled copy shows up here directly;
+- **RMS ratio** `rms(head) / rms(embedding)` within 5 % of 1;
+- **relative error** no more than 1.5× the embedding's own **4-bit noise floor**, or 0.02 if that is larger. The floor is what quantizing the embedding at the head's block size (asymmetric 4-bit, min/max per block) costs.
+
+The relative error on its own cannot separate a scaled head from a correct 4-bit head whose embedding is kept at higher precision: both score about 0.09. Measured (engine#1503):
+
+| pack | rel | best-fit scale | RMS ratio | noise floor | result |
+|---|---|---|---|---|---|
+| `Qwen2-1.5B_rai_1.9.0_npu` (block-32 tail head) | 0.094316 | 0.994173 | 1.001808 | 0.083865 | imports; on the NPU (`kernels-1536-2048-b8`, greedy) it answers "The capital of France is Paris." and "12 times 12 is 144." |
+| `SmolLM2-135M` rai_1.7.1 hybrid | 0.103587 | 0.992172 | 1.003540 | 0.097113 | imports |
+| `Qwen2.5-0.5B` rai_1.9.0 | 0.000700 | 0.999993 | 1.000006 | 0.006941 | imports |
+| `gemma-2-2b-awq-…-hybrid` | 0.094874 | 0.992235 | 1.003849 | 0.088985 | head passes, but refused by `model_type` (below) |
+
+A relative error near 0 means the embedding *is* the dequantized head (as on `Qwen-2.5_1.5B_Instruct` 1.9). It does not mean that only such packs are correct. The earlier rule (relative error ≤ 0.02, with nothing else checked) refused the first two packs above.
+
+**`model_type: gemma2` is refused by name.** The two gemma-2-2b hybrid packs answer garbage on this route (`myſelf…`), but their head is a correct 4-bit head, so the cause is somewhere else and has not been found. The import refuses them with that reason, rather than letting them import cleanly.
+
 ### Cross-check against the official converter
 
 ROCm's **FLM_Q4NX_Converter** (`convert.py`) is the official gguf → Q4NX converter, and since
@@ -1883,7 +1905,7 @@ engine#587 measured the route on it):
 | `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
 | `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
 | `gemma3` | `FastFlowLM/medgemma-1.5-4b-it-NPU2` | hrx | not served |
-| `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2` | hrx | not served |
+| `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2`, `FastFlowLM/LFM2.5-1.2B-NPU2` | hrx, npu | `LFM2.5-1.2B-NPU2` **served and measured** on the per-op route ("FastFlowLM's own containers" below); `LFM2-1.2B-NPU2` serves too (one paired ticket, same section); `LFM2-2.6B-NPU2` was not run |
 | `gpt-oss` | `FastFlowLM/GPT-OSS-20B-NPU2`, `FastFlowLM/GPT-OSS-Safeguard-20b-NPU2` | hrx | not served |
 | `hy_v3` | `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | hrx | not served; the first table above records this one |
 
@@ -1938,6 +1960,8 @@ does on a geometry that has a sealed set: `Qwen3-1.7B-NPU2` is 3.0 tok/s here an
 | `Llama-3.2-3B-NPU2` | `llama` | identical, `Paris.` | 1.7 to 1.8 tok/s |
 | `Phi4-mini-Instruct-NPU2` | `phi3` | identical, `Paris`, once the turn end is read from the template (below) | 1.4 to 1.5 tok/s |
 | `Qwen3-VL-4B-Instruct-NPU2`, text tower only | `qwen3` | identical, `Paris` | 1.4 to 1.5 tok/s |
+| `LFM2.5-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | identical, `Paris`; against FastFlowLM's runtime below | 3.5 to 4.6 tok/s |
+| `LFM2-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | `Paris`; one request per prompt, against FastFlowLM's runtime below | 3.7 tok/s |
 
 `D3-Nano-NPU2` is a decision pack: it loads on the `Qwen3.5-2B` kernel set, its readout converts with
 `tools/safetensors_to_q4nx.py decision`, and `/v1/systemone` returned three identical answers to the documented
@@ -1950,18 +1974,61 @@ a stream that was sent after the generation had ended; reasoning that the templa
 decision-only pack. "What ends an answer" and [npu-chat-template.md](npu-chat-template.md) describe the rules
 that came out of them.
 
-**Refused by name at load: the `lfm2` packs.** `LFM2.5-1.2B-NPU2` has all four dense kernel shapes on the box
-and its container loads, but ten of its sixteen layers are gated short convolutions (`model.layers.N.shortconv.*`),
-which the loader reads and the forward does not run. The serve exits at load with `forward init failed:
-model.q4nx has 10 gated short-convolution layer(s) of 16 (the first is model.layers.0.shortconv.*, LFM2's hybrid),
-a layer kind this forward does not implement …`. Before that refusal existed it ran those layers as attention,
-failed its warm-up with a size error that named neither the layer nor the kind, and announced itself ready.
+**The `lfm2` packs: a hybrid, and a second kind of weight tile.** Ten of `LFM2.5-1.2B-NPU2`'s sixteen layers
+have no attention: they are gated short convolutions (`model.layers.N.shortconv.*`). The forward runs them
+(engine#1786): `in_proj` (hidden to three times hidden, the fused-projection kernel at `K2048_N6144`) and `out_proj`
+(the attention output kernel) on the array, and between them the gate and a three-tap causal depthwise convolution
+on the host, whose only state is the last two positions of one product per channel. Which layers are convolutions
+and how long the kernel is are read from the container's own tensors, not from `full_attn_idxs` or `conv_L_cache`.
+The kernel directory is the `Llama-3.2-1B` set's four shapes plus that one `QKV_K2048_N6144` pair.
+
+Two things in these packs were read wrong before, and neither is about convolutions. Their 4-bit weights are a
+**symmetric** kind of the 5,120-byte tile (FastFlowLM's list calls the pack `Q4_0` where the others are `Q4_1`):
+the same byte layout with every zero-point stored as 0, a scale that carries a sign, and a two's-complement code.
+Nothing in the container names the kind (the name is in FastFlowLM's model list, which is not part of a pack), so
+the decoder reads it from the weights: a tile is symmetric when its 256 zero-points are all zero **and** some scale
+is negative, a tensor is one kind (tiles that decide nothing follow their tensor), and a tensor holding both kinds
+is refused. A zero offset alone decides nothing: an asymmetric tile may have one, and the engine's own converter
+test writes such a tile. Of 1,889,236 tiles in the other packs on the box none has an all-zero zero-point block or
+a negative scale; of 285,696 in the two LFM2 packs every one has both.
+Read as the usual kind, each LFM2 projection correlated -0.39 with the same tensor of the upstream
+GGUF, and the serve answered in fluent-looking fragments of unrelated words; read as symmetric, 0.99, and the
+pack's quantised `lm_head` sits within one step of its own bf16 embedding (mean 0.24 of a step). And the
+attention layers carry per-head `q_norm`/`k_norm`, which the `lfm2` model type did not switch on: with only the
+tiles fixed, "What is the capital of France? Answer with one word." was answered `France`.
+
+Measured on `LFM2.5-1.2B-NPU2` on 2026-11-11, same array, same `model.q4nx` (sha256 `b341d42021e617a5…`), five
+greedy prompts of up to 40 tokens, FastFlowLM 1.0.12's runtime first and this route second in one ticket:
+three answers byte-identical (`Paris`; the count from one to ten; a German sentence), two not. One leaves
+FastFlowLM's text after 181 characters, the other at its first token (`Here's…` here, `Certainly!…` there). At
+both points this route's choice is not a near-tie: the first token is `Here` -0.64 against `Certain` -1.26 on the
+array and -0.66 against -1.23 with host float GEMMs on the same weights, and the upstream GGUF on the CPU opens
+with `Here's` too. FastFlowLM's own `logprobs` for that token are `Certain` -0.81, `Here` -1.06, `S` -1.81: the
+same candidates, the first two in the other order, on a 0.25 grid; its answer was the same three times running.
+So the two runtimes agree on the model and differ in arithmetic, and which of them a reader should call right is
+not something this row decides. Also on this pack: batched prefill equals token-by-token on every chunk checked
+(`NPU_BATCH_CHECK=1`, chunks of 1 to 26 rows, all `MATCH`); a request answered from a restored prefix (351 of 352
+prompt tokens cached, conv state included) returns the bytes it returns with the prefix cache off; and decode was
+4.6 tok/s at load 3 to 4 and 3.5 to 3.7 at load 8 to 10, against FastFlowLM's 48 to 83 tok/s on the same replies,
+the gap "Per-op route" above describes.
+
+`LFM2-1.2B-NPU2` (sha256 `2755ab40cd927e3c…`) went through the same paired ticket on the same kernel directory,
+at the merged head of that change: two of five answers byte-identical (`Paris`; the count from one to ten), three
+that share 21, 58 and 53 characters with FastFlowLM's and then continue differently, each a fluent answer to the
+question (a Fibonacci function that returns `0` for `n <= 0` where theirs returns a message). Decode 3.7 tok/s
+against 42 to 47. Its logprobs at the three points were not taken, and it was asked each prompt once, so this row
+does not carry the three-identical-answers condition.
+
+`LFM2.5-1.2B-Thinking-NPU2` loads on the same directory too: its template is read from the pack's
+`chat_template.jinja`, the reasoning is split out, and at 96 tokens every one of the five replies was still
+reasoning, so there is no answer text to compare and no row; the reasoning differs from FastFlowLM's from its
+first words.
 
 Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
 containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry
 has no kernel set on the box. Of the 57 `*-NPU2` repos with a readable geometry on 2026-11-11, 19 had all four
-dense kernel shapes already built in the blocked family; the families the forward may not model at all (`lfm2`,
-`hunyuan_v1_dense`, the multimodal towers) are a separate question from the shapes.
+dense kernel shapes already built in the blocked family; the families the forward may not model at all
+(`hunyuan_v1_dense`, the multimodal towers) are a separate question from the shapes.
 
 ### Sealed kernel sets: the manifest is what says a set is ours
 

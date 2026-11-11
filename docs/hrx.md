@@ -361,10 +361,28 @@ fixed; 0 after), and with activations to 1.18e5 and logits to 2.3e5. A schedulin
 device pins the group count at widths 256, 2560 and 4096. Not run on Flash-Next itself. In about 50 runs one
 refined logit came back wrong once and did not recur ([engine#2150](https://github.com/1bit-MONSTER/engine/issues/2150)).
 
-Not measured, tracked in [engine#2127](https://github.com/1bit-MONSTER/engine/issues/2127): the
-routed gate/up kernels narrow their input the same way (that input is a norm output), and the other
-kernels that read the 8-bit blocks use the stored sum as it is. And the limits are moved, not
-removed: 4.19e6 for the half-precision copies and the draft-head logits, 8.3e6 for the 8-bit blocks.
+The routed gate/up kernels followed at pin `2b7960bae` ([engine#2127](https://github.com/1bit-MONSTER/engine/issues/2127),
+llama.cpp #309). The fused routed gate/up SwiGLU loads its input in four projection kernels (Q4_K,
+Q5_K, Q6_K and the generic one), and each narrowed it to half precision unscaled. That input is a norm
+output, far below 65504 on every model measured, so no model run showed it; a test did. The four
+kernels now narrow at 2^-6 and the SwiGLU body scales the gate and up sums back by 2^6 before the
+activation.
+
+Measured on gfx1151 (2026-11-11): the routed feed-forward graph with one input set to 1e5 and that
+input's gate/up weights zero, so the device's own result without the spike is the reference: 2048 of
+2048 outputs non-finite before, 0 after and equal to the reference; the same case at 6e4 passes before
+and after (Q4_K; Q6_K passes with the fix). `test-hrx-ops` 254 of 254, `MUL_MAT_ID` 845 of 845 (run at
+llama.cpp #309's head).
+
+A routed model across the whole bump, pin `204493d40` against `2b7960bae` (Qwen3-Coder-30B-A3B Q4_K_M, the public
+backend built from each commit, 2026-11-11): perplexity on wikitext-2 (`-c 512 -b 512`, 8 chunks) 9.6693 against
+9.6681; `llama-bench -p 512 -n 32 -r 3`, alternated, prefill 1,437.1 and 1,532.6 tok/s against 1,616.9 and 1,605.7,
+decode 78.7 and 79.0 against 78.6 and 79.8. At `2b7960bae`: `test-hrx-ops` 256 of 256, `hrx-backend-test` host 69 of 69.
+
+Still open under #2127, not measured: the fused body publishes the gated product in half precision
+unscaled, and the other kernels that read the 8-bit blocks use the stored sum as it is. And the limits
+are moved, not removed: 4.19e6 for the half-precision copies and the draft-head logits, 8.3e6 for the
+8-bit blocks.
 
 ### Fixed: Qwen3-VL on `HRX0`: it decodes again, and its rotation runs on the device ([engine#1467](https://github.com/1bit-MONSTER/engine/issues/1467))
 
@@ -915,10 +933,39 @@ Every pair agrees on the top-1 token at every position (100.000 %). Speed is unc
 alternated, gives pp1024 2,764.6 tok/s (upload) and 2,767.7 / 2,765.4 tok/s (#304), and tg64 71.5 against 72.1 / 72.3 tok/s. A fresh
 process pays a one-time copy at its first prompt instead of at load time.
 
-**What remains of the duplicate** ([engine#2137](https://github.com/1bit-MONSTER/engine/issues/2137)): prefill reads q4_k and
-q6_k weights in their stored layout, while decode reads HRX's layout, so after a long prompt HRX holds a device copy in each
-layout. The second row shows it: 647 device copies, 4,400.6 MiB, for a 2,375.9 MiB model. `GGML_HRX_Q6K_PACKED_PREFILL=1` does
-not change that row. A short-prompt server, or one that has not yet seen a long prompt, holds one copy per weight.
+**What remains of the duplicate, and the two switches that remove it** ([engine#2137](https://github.com/1bit-MONSTER/engine/issues/2137)).
+The second row is 647 device copies, 4,400.6 MiB, for a 2,375.9 MiB model. Counted per weight (`GGML_HRX_HOST_WEIGHT_TRACE=2` prints
+one line per device copy, since pin `2b7960bae`), the extra copies have two causes:
+
+- **Q4_K, 1,656.6 MiB.** Decode and the 256-aligned prefill kernel already share HRX's packed layout. A batch that is not a multiple
+  of 256 tokens (almost every prompt's last batch) runs on the generic kernels, which read the stored layout, and that brings in a
+  second copy of 214 of the 216 Q4_K weights.
+- **Q6_K, 368.1 MiB.** Prefill reads Q6_K in the stored layout at every batch size; decode reads the packed layout.
+
+A prompt made only of 512-token batches, a short prompt, or decode alone holds one copy per weight.
+
+`GGML_HRX_Q4K_PACKED_TAIL=1` (llama.cpp #308) makes the generic kernels read Q4_K in the packed layout, and
+`GGML_HRX_Q6K_PACKED_ROWS=1` (llama.cpp #310) makes Q6_K prefill read the packed rows decode reads, at every batch size. Both are
+opt-in; the stored path is the default. Measured on Qwen3-4B Q4_K_M with both on, against both off (one binary, fork `ccf14f9c9`):
+
+| | off | on |
+|---|---:|---:|
+| device copies, `-p 100` | 2,375.9 MiB | 2,375.9 MiB |
+| device copies, `-p 1700` | 4,032.5 MiB | 2,375.9 MiB |
+| device copies, `-p 1700 -n 16` | 4,400.6 MiB | **2,375.9 MiB** |
+| perplexity, wikitext-2, 12 chunks, batches of 300 / 384 / 512 | 19.2890 / 18.1680 / 16.9054 | the same |
+| `llama-bench -p 300`, two alternated pairs | 1,135.8, 1,117.6 tok/s | 1,238.6, 1,279.5 tok/s |
+| `llama-bench -p 1700` | 2,211.7, 1,901.1 tok/s | 2,319.6, 2,307.0 tok/s |
+| `test-backend-ops -o MUL_MAT` on `HRX0` | 641 of 641 | 641 of 641 |
+
+They are not the default yet because that is one model: there is no dense 27B row and no routed-expert row, the 6-to-16-token Q6_K
+kernel reads a third layout that neither switch covers, and the switches only save memory with the file mapping. With
+`GGML_HRX_MODEL_BUFFER_COPY=1` the stored layout is the loader's buffer and costs nothing extra, so they add packed copies there.
+
+`GGML_HRX_Q6K_PACKED_PREFILL=1`, the older switch, never saved a copy: its dispatch bound the stored layout. Off its kernel's wide
+tile (tokens not a multiple of 256, or outputs not a multiple of 128) it also read past the weight: a Q6_K matmul at 128 tokens with
+the switch on ended in `HRX buffer download failed` and a bus error. Since pin `2b7960bae` the switch only selects that kernel on the
+wide tile, where it reads the rows it is bound to (llama.cpp #310). Use `GGML_HRX_Q6K_PACKED_ROWS=1` instead.
 
 The paragraphs below describe the upload path, which `GGML_HRX_MODEL_BUFFER_COPY=1` and `--no-mmap` still use.
 

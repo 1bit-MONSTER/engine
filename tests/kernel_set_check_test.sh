@@ -2,6 +2,18 @@
 # Copyright 2026 bong-water-water-bong
 # SPDX-License-Identifier: Apache-2.0
 #
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 # tests/kernel_set_check_test.sh -- scripts/kernel-set-check.sh against fixture sets (engine#2106). No device, no private
 # repository, no real kernel bytes: every fixture is a byte string with a readable head and a manifest that describes it.
 
@@ -178,6 +190,46 @@ mk_pack "$tmp/pack-none" config unused 1
 "$script" --pack "$tmp/pack-none" "$tmp/named/1024x3072x16x8" > "$tmp/out17" 2>&1
 check $(has "$tmp/out17" "names no wide/narrow set (16-row set only)" && echo ok || echo fail) \
       "a pack naming nothing: said explicitly, not silently"
+
+# 10. a manifest lists more than kernels: every shipped one lists layout.json. Only .elf/.bin entries have a form, so a
+#     correct plain-ELF set that lists its layout.json is one form, not two.
+mk_set "$tmp/set-layout/1024x3072x16x8" 1024x3072x16x8 3 elf
+python3 - "$tmp/set-layout/1024x3072x16x8" <<'PYL'
+import hashlib, json, os, sys
+root = sys.argv[1]
+body = b'{"layers": 3}\n'
+open(os.path.join(root, "layout.json"), "wb").write(body)
+path = os.path.join(root, "manifest.json")
+manifest = json.load(open(path))
+manifest["files"].append({"path": "layout.json", "size": len(body), "sha256": hashlib.sha256(body).hexdigest()})
+json.dump(manifest, open(path, "w"))
+PYL
+"$script" "$tmp/set-layout/1024x3072x16x8" > "$tmp/out18" 2>&1
+check $([ $? -eq 0 ] && echo ok || echo fail) "a plain-ELF set that lists its layout.json: rc 0"
+check $(has "$tmp/out18" "3 file(s) in plain ELF form" && ! has "$tmp/out18" "MIXED FORMS" && echo ok || echo fail) \
+      "... three kernels in one form, the JSON not counted"
+# ... and the listed JSON is still held to its size and sha256 like any other entry
+printf 'x' >> "$tmp/set-layout/1024x3072x16x8/layout.json"
+"$script" "$tmp/set-layout/1024x3072x16x8" > "$tmp/out19" 2>&1
+check $([ $? -eq 1 ] && has "$tmp/out19" "layout.json: manifest says" && echo ok || echo fail) \
+      "... but a listed layout.json that changed is still caught: rc 1"
+
+# 11. a layer directory with a suffix after its number (layer1_100np/) is still layer-indexed, not "other"
+mkdir -p "$tmp/n-suffix/1024x3072x16x8"
+python3 - "$tmp/n-suffix/1024x3072x16x8" <<'PYS'
+import hashlib, json, os, sys
+root, files = sys.argv[1], []
+for rel in ("layer1_100/layer1.elf", "layer1_101np/layer1.elf", "layer2_102np/layer2.elf"):
+    full = os.path.join(root, rel); os.makedirs(os.path.dirname(full), exist_ok=True)
+    body = b"\x7fELF" + rel.encode()
+    open(full, "wb").write(body)
+    files.append({"path": rel, "size": len(body), "sha256": hashlib.sha256(body).hexdigest()})
+json.dump({"format": 1, "set": "1024x3072x16x8", "files": files}, open(os.path.join(root, "manifest.json"), "w"))
+PYS
+"$script" "$tmp/n-suffix/1024x3072x16x8" > "$tmp/out20" 2>&1
+check $([ $? -eq 0 ] && echo ok || echo fail) "layer directories with a suffix: rc 0"
+check $(has "$tmp/out20" "3 layer-indexed" && ! has "$tmp/out20" "other" && echo ok || echo fail) \
+      "... all three counted as layer-indexed, none as other"
 
 if [ "$fails" -ne 0 ]; then
     printf 'kernel_set_check: %d failure(s)\n' "$fails"

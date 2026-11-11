@@ -103,6 +103,10 @@ for entry in files:
                 digest.update(block)
         if digest.hexdigest() != entry["sha256"]:
             problems.append(f"{rel}: sha256 differs from the manifest")
+    # Only kernels have a form. A manifest also lists what travels with them (every shipped one lists layout.json), and a
+    # JSON file is neither a plain ELF nor a sealed one: counting it would call a correct plain-ELF set mixed.
+    if not rel.endswith((".elf", ".bin")):
+        continue
     with open(full, "rb") as handle:
         head = handle.read(4)
     forms.setdefault("elf" if head == b"\x7fELF" else "sealed", []).append(rel)
@@ -126,8 +130,9 @@ for rel, kind in (("elf", "plain ELF"), ("sealed", "sealed/opaque")):
 # role-named ELF (`full_i8_QKV_K1024_N4096.elf`) while a set built before the private repo's protection change carries
 # per-layer files (`layer1_2081/layer1.elf`). engine#2106 measured exactly that refusal, and it is visible from the names
 # alone -- no plan, no device, and no copy of the forward's naming rule (which is why this classifies rather than predicts).
+# A layer directory may carry a lower-case suffix after its number (`layer1_2081np/`); it is still layer-indexed.
 role_named = sum(1 for rel in listed if re.search(r"(^|/)full_i8_[A-Za-z0-9_]+_K\d+", rel))
-layer_indexed = sum(1 for rel in listed if re.search(r"(^|/)layer\d+_\d+/", rel))
+layer_indexed = sum(1 for rel in listed if re.search(r"(^|/)layer\d+_\d+[a-z]*/", rel))
 other_named = len(listed) - role_named - layer_indexed
 if listed:
     kinds = [n for n, c in (("role-named full_i8_*.elf", role_named), ("layer-indexed layerN_M/…", layer_indexed),

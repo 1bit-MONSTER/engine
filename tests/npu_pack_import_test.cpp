@@ -44,6 +44,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <thread>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -836,6 +838,102 @@ void test_external_import_success(const std::string& root) {
 // "<tensor>.qweight.empty: no data", which reports a placeholder as though the bytes were absent rather than elsewhere.
 // Crafted, so this needs no 1.9 pack: a graph with one resolvable tensor, one MatMulNBits whose qweight input is a
 // `.empty` placeholder with no sibling, and a model.bin next to it.
+// engine#1985: the canonical copy lives at a path every import of the same pack shares, and it used to be written in place.
+// A second import that started mid-write saw a short file, truncated it and wrote again, and the first then read its own
+// copy while it was being refilled: Qwen3-1.7B came back with 280 refused tensors and exit 0 in 4 of 24 runs of three
+// imports 0.15 s apart. The arms: the bytes arrive and no temporary file stays; a failed write leaves nothing; the
+// temporary name is out of reach of another import's prefix sweep and inside the age sweep; and the race itself, with
+// threads doing what an import does (reuse the copy if it is complete, else write it, then read it).
+void test_write_canonical_copy() {
+    const fs::path dir = fs::temp_directory_path() / ("1bit-atomic-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    const std::string prefix = "1bit-fconst19v1-7-2048-16-28-";
+    const std::string name = prefix + "957724736-1234.fconst";
+    const std::string work = (dir / name).string();
+    const size_t n = size_t(4) << 20;
+    std::vector<uint8_t> body(n);
+    for (size_t i = 0; i < n; ++i) body[i] = uint8_t((i * 2654435761u) >> 24) | 1;   // never 0: a refilled hole reads as 0
+    auto same = [&](const std::string& f) {
+        std::ifstream is(f, std::ios::binary);
+        if (!is) return false;
+        std::vector<uint8_t> got(n + 1);
+        is.read(reinterpret_cast<char*>(got.data()), std::streamsize(got.size()));
+        return size_t(is.gcount()) == n && std::memcmp(got.data(), body.data(), n) == 0;
+    };
+    auto entries = [&] {
+        int k = 0;
+        for (const auto& e : fs::directory_iterator(dir)) { (void)e; ++k; }
+        return k;
+    };
+
+    pi::write_canonical_copy(work, body.data(), n);
+    check(same(work), "atomic copy: the bytes written are the bytes at the path");
+    check(entries() == 1, "atomic copy: no temporary file is left beside the copy");
+    std::vector<uint8_t> other(body);
+    other[n / 2] ^= 0xff;
+    pi::write_canonical_copy(work, other.data(), n);
+    check(!same(work) && entries() == 1, "atomic copy: a second write replaces the copy, again leaving one file");
+    pi::write_canonical_copy(work, body.data(), n);
+
+    bool threw = false;
+    try {
+        pi::write_canonical_copy((dir / "no-such-dir" / name).string(), body.data(), n);
+    } catch (const std::runtime_error&) { threw = true; }
+    check(threw && entries() == 1, "atomic copy: a copy that cannot be written throws and leaves nothing behind");
+
+    // the temporary name: beside the copy, not the copy, unique per call, invisible to the prefix sweep, visible to the age sweep
+    const std::string t1 = pi::canonical_copy_temp_name(work), t2 = pi::canonical_copy_temp_name(work);
+    const std::string b1 = fs::path(t1).filename().string();
+    check(fs::path(t1).parent_path() == fs::path(work).parent_path(), "atomic copy: the temporary file is in the copy's directory");
+    check(t1 != work && t1 != t2, "atomic copy: the temporary name is not the copy's and is new on every call");
+    check(b1.compare(0, prefix.size(), prefix) != 0 && b1.compare(0, 13, "1bit-fconst19") == 0,
+          "atomic copy: the temporary name starts with the scratch stem and not with the pack's prefix");
+    { std::ofstream o(t1, std::ios::binary); o << "being written"; }
+    pi::evict_stale_canonical_copies(dir.string(), name, prefix, std::string(), 3600);
+    check(fs::exists(t1) && fs::exists(work), "atomic copy: another import's sweep does not remove a copy that is being written");
+    fs::last_write_time(t1, fs::file_time_type::clock::now() - std::chrono::hours(2));
+    pi::evict_stale_canonical_copies(dir.string(), name, prefix, std::string(), 3600);
+    check(!fs::exists(t1) && fs::exists(work), "atomic copy: a temporary file a killed run left is removed by the age rule");
+
+    // the race: every thread is an import. It reuses a complete-length copy or writes one, then reads the path, as
+    // canonical_token_fconst()'s caller does. One thread also removes the copy now and then, so the cycle restarts.
+    fs::remove(work, ec);
+    std::atomic<int> bad{0}, read_ok{0}, wrote{0};
+    auto importer = [&](int id) {
+        for (int r = 0; r < 24; ++r) {
+            if (!pi::canonical_copy_reusable(work, int64_t(n))) {
+                try { pi::write_canonical_copy(work, body.data(), n); ++wrote; } catch (const std::runtime_error&) { ++bad; }
+            }
+            std::error_code e2;
+            // An open that fails is the remover having been there, not a bad copy; a copy that OPENS must be whole.
+            if (std::ifstream(work, std::ios::binary).good()) {
+                std::ifstream is(work, std::ios::binary);
+                std::vector<uint8_t> got(n + 1);
+                if (is) {
+                    is.read(reinterpret_cast<char*>(got.data()), std::streamsize(got.size()));
+                    if (size_t(is.gcount()) == n && std::memcmp(got.data(), body.data(), n) == 0) ++read_ok;
+                    else ++bad;
+                }
+            }
+            if (id == 0 && r % 4 == 3) fs::remove(work, e2);
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int i = 0; i < 6; ++i) pool.emplace_back(importer, i);
+    for (auto& t : pool) t.join();
+    check(bad.load() == 0, "atomic copy: no import ever reads a copy another import is still writing (engine#1985)");
+    check(read_ok.load() > 0 && wrote.load() > 1, "atomic copy: the race arm really wrote more than once and read copies back");
+    int leftover = 0;
+    for (const auto& e : fs::directory_iterator(dir))
+        if (e.path().filename().string() != name) ++leftover;
+    check(leftover == 0, "atomic copy: the race leaves no temporary files");
+    fs::remove_all(dir, ec);
+    std::printf("  atomic canonical copy: 11 arms (bytes, replace, failed write, temporary name x4, %d racing writes / %d reads, no leftovers)\n",
+                wrote.load(), read_ok.load());
+}
+
 // engine#1662: the ~291 MB canonical Token .fconst rewrite is skipped when the copy on the scratch path already holds
 // exactly the bytes this run would write. The decision is a length test against a length that is a function of the source
 // alone, so what can go wrong is the test being too willing -- a truncated copy from an interrupted run, a leftover
@@ -2909,10 +3007,13 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
               "pack: 64 columns per gate|up unit and per down_proj group");
 
     int norms = 0, attn_planned = 0, mlp_planned = 0, lm_tiles_planned = 0;
+    bool head_in_tail = false;
     for (const auto& t : p.tensors) {
         if (t.name.find("layernorm") != std::string::npos || t.name == "model.norm.weight") ++norms;
-        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.compare(0, 9, "lm_head.w") == 0)
+        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.compare(0, 9, "lm_head.w") == 0) {
             lm_tiles_planned = int((t.shape[0] / 32) * ((t.shape[1] + 255) / 256));
+            head_in_tail = t.source == "fconst:tail";
+        }
         if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find("self_attn") != std::string::npos) ++attn_planned;
         if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find(".mlp.") != std::string::npos) ++mlp_planned;
     }
@@ -3045,8 +3146,12 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     // the container must open with the engine's own loader
     onebit::npu::Model m(out);
     const auto& head = m.tensor("lm_head.weight");
-    check(head.shape.at(0) == int64_t((head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256)),
-          "pack: lm_head tile count matches the container");
+    // A head read from the .fconst tail keeps the pack's padding to whole 64-row tiles (Hunyuan: 120,818 rows are stored
+    // as 120,832), so the container's count follows the stored rows; the plan's shape stays the vocabulary.
+    const int64_t stored_rows = pi::head_stored_rows(head_rows, head_in_tail);
+    check(head.shape.at(0) == (stored_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256),
+          "pack: lm_head tile count matches the container (" + std::to_string(head.shape.at(0)) + " tiles for " +
+              std::to_string(stored_rows) + " stored rows)");
     check(m.tensor("model.layers.0.input_layernorm.weight").shape.at(0) == p.dims.hidden,
           "pack: a layer norm is `hidden` bf16 values, whatever the hidden size");
     check(m.tensor("model.norm.weight").shape.at(0) == int64_t(p.dims.hidden),
@@ -4765,6 +4870,133 @@ void test_embedding_f32_component(const std::string& root) {
     fs::remove_all(b);
 }
 
+// engine#1786 (item F1): the container genre's geometry, pinned as a pure function over the three header shapes the
+// census measured on this box -- no pack, no device, no file, which is what makes the two genres with no config.json
+// (`d3-edge`, `d3-flash`) pinnable at all.
+void test_container_geometry() {
+    using nlohmann::json;
+    // 1. self-describing: `dims` answers everything, and config.json must NOT be preferred over it.
+    {
+        json meta = {{"dims", {{"hidden_size", 576}, {"intermediate_size", 1536}, {"num_hidden_layers", 30},
+                               {"num_attention_heads", 9}, {"num_key_value_heads", 3}, {"vocab_size", 49152},
+                               {"head_dim", 64}, {"rope_theta", 10000.0}, {"model_type", "llama"}}}};
+        json cfg = {{"hidden_size", 1024}};   // a deliberate disagreement: the container's own statement wins
+        const auto g = pi::container_geometry(meta, cfg);
+        check(g.source == "dims", "self-describing: source is dims");
+        check(g.dims.hidden == 576, "self-describing: hidden comes from dims, not config.json");
+        check(g.dims.layers == 30 && g.dims.heads == 9 && g.dims.kv_heads == 3 && g.dims.vocab == 49152,
+              "self-describing: every field dims states is taken");
+        check(g.dims.head_dim == 64, "self-describing: a stated head_dim is used as stated");
+        check(g.missing.empty(), "self-describing: nothing is missing");
+        check(g.inferred.empty(), "self-describing: nothing is inferred");
+    }
+    // 2. gguf-converted: no dims, so config.json answers and the source says so.
+    {
+        json meta = {{"converter", "tools/gguf_to_q4nx.py"}, {"format", "q4nx"}, {"source", "x.gguf"}};
+        json cfg = {{"hidden_size", 1024}, {"num_hidden_layers", 28}, {"num_attention_heads", 16},
+                    {"num_key_value_heads", 8}, {"vocab_size", 151936}, {"intermediate_size", 3072},
+                    {"head_dim", 64}, {"rope_theta", 1000000.0}};
+        const auto g = pi::container_geometry(meta, cfg);
+        check(g.source == "config.json", "gguf-converted: source is config.json");
+        check(g.dims.hidden == 1024 && g.dims.vocab == 151936, "gguf-converted: config.json supplies the geometry");
+        check(g.missing.empty(), "gguf-converted: nothing is missing when config.json is complete");
+    }
+    // 3. silent: neither answers, so every field is named missing rather than left as a zero that reads like a value.
+    {
+        const auto g = pi::container_geometry(json::object(), json());
+        check(g.source.empty(), "silent: no source is claimed");
+        // eight, and named: the first run of this arm asserted seven and failed in CI -- rope_theta is a required
+        // field of the arithmetic (it is the RoPE base the forward needs), so the count was wrong and the function
+        // was right. Asserted by name now, so the next field added to Dims fails this arm instead of shrinking it.
+        const std::vector<std::string> want = {"hidden_size",         "num_hidden_layers",   "num_attention_heads",
+                                               "num_key_value_heads", "vocab_size",         "intermediate_size",
+                                               "head_dim",            "rope_theta"};
+        check(g.missing.size() == want.size(), "silent: every required field is named missing");
+        bool all_named = true;
+        for (const auto& w : want)
+            all_named = all_named && std::find(g.missing.begin(), g.missing.end(), w) != g.missing.end();
+        check(all_named, "silent: the missing list names each required field");
+        check(g.dims.hidden == 0 && g.dims.layers == 0, "silent: no field is invented");
+    }
+    // 4. head_dim absent but derivable: reported as INFERRED, not as declared.
+    {
+        json meta = {{"dims", {{"hidden_size", 2048}, {"intermediate_size", 6144}, {"num_hidden_layers", 28},
+                               {"num_attention_heads", 16}, {"num_key_value_heads", 8}, {"vocab_size", 151936},
+                               {"rope_theta", 1000000.0}}}};
+        const auto g = pi::container_geometry(meta, json());
+        check(g.dims.head_dim == 128, "inferred: head_dim is hidden/heads");
+        check(g.inferred.size() == 1 && g.inferred[0] == "head_dim", "inferred: the inference is named");
+        check(g.missing.size() == 0, "inferred: an inferred field is not also missing");
+    }
+}
+
+// engine#1786 (item F1), slice 2: `plan()` reports WHERE a container's geometry came from. The three genres the census
+// measured are the three cases: `dims` answers (and beats a disagreeing config.json), config.json answers when there is
+// no `dims`, and neither answering is reported as unknown rather than as a zero geometry.
+void test_container_plan(const std::string& root) {
+    namespace fs = std::filesystem;
+    // Under ctest `root` is the source tree's tests/golden, so these three directories are removed on every way out:
+    // the arm is new, and leaving fixtures behind is the defect #2024 fixes for its neighbour -- not repeating it here.
+    struct Cleanup {
+        fs::path base;
+        ~Cleanup() {
+            for (const char* n : {"cg-dims", "cg-cfg", "cg-silent"}) {
+                std::error_code e;
+                fs::remove_all(base / n, e);
+            }
+        }
+    } cleanup{fs::path(root)};
+    const auto write_pack = [&](const std::string& name, const std::string& meta_json, const std::string& config) {
+        const fs::path dir = fs::path(root) / name;
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        std::string hdr = "{";
+        if (!meta_json.empty()) hdr += "\"__metadata__\":" + meta_json + ",";
+        hdr += "\"model.embed_tokens.weight\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[0,16]}}";
+        std::string out(8, '\0');
+        const int64_t n = int64_t(hdr.size());
+        for (int i = 0; i < 8; ++i) out[size_t(i)] = char((n >> (8 * i)) & 0xFF);
+        out += hdr;
+        out.append(16, '\x22');
+        std::ofstream(dir / "model.q4nx", std::ios::binary).write(out.data(), std::streamsize(out.size()));
+        if (!config.empty()) std::ofstream(dir / "config.json") << config;
+        return dir.string();
+    };
+    const std::string dims = "{\"dims\":{\"hidden_size\":576,\"intermediate_size\":1536,\"num_hidden_layers\":30,"
+                             "\"num_attention_heads\":9,\"num_key_value_heads\":3,\"vocab_size\":49152,"
+                             "\"head_dim\":64,\"rope_theta\":10000.0,\"model_type\":\"llama\"}}";
+
+    // 1. self-describing, and a config.json that disagrees: the container's own statement wins and is named.
+    {
+        const auto pl = pi::plan(write_pack("cg-dims", dims, "{\"hidden_size\": 1024}"));
+        check(pl.container_geometry_source == "dims", "plan: a self-describing container reports source=dims");
+        check(pl.dims.hidden == 576, "plan: dims.hidden comes from the container, not the disagreeing config.json");
+        check(pl.dims.layers == 30 && pl.dims.vocab == 49152, "plan: the container's geometry reaches the plan");
+        check(pl.container_geometry_missing.empty(), "plan: nothing is reported missing for a complete container");
+        check(pl.container_note.find("geometry from dims") != std::string::npos,
+              "plan: the note says which source answered");
+    }
+    // 2. gguf-converted: no dims, so config.json answers -- and the source says so.
+    {
+        const auto pl = pi::plan(write_pack("cg-cfg", "{\"converter\":\"tools/gguf_to_q4nx.py\"}",
+                                           "{\"hidden_size\":1024,\"num_hidden_layers\":28,"
+                                           "\"num_attention_heads\":16,\"num_key_value_heads\":8,"
+                                           "\"vocab_size\":151936,\"intermediate_size\":3072,"
+                                           "\"head_dim\":64,\"rope_theta\":1000000.0}"));
+        check(pl.container_geometry_source == "config.json", "plan: a converted container reports source=config.json");
+        check(pl.dims.hidden == 1024 && pl.dims.layers == 28, "plan: config.json supplies the geometry");
+    }
+    // 3. silent: neither answers, so the plan says the geometry is unknown instead of reporting zeros as facts.
+    {
+        const auto pl = pi::plan(write_pack("cg-silent", "", ""));
+        check(pl.container_geometry_source.empty(), "plan: the silent genre claims no source");
+        check(pl.container_geometry_missing.size() == 8, "plan: every required field is reported missing, by name");
+        check(pl.container_note.find("geometry is not known here") != std::string::npos,
+              "plan: the note says the geometry is unknown rather than printing a zero geometry");
+    }
+}
+
 // engine#1786 (item F1): an NPU2 model source is a safetensors container, and this is the reader that decides whether
 // a pack is that genre. The failure that matters is the silent one -- a wrong header length yields an empty inventory,
 // which reads as "a pack with no tensors" rather than "a malformed header" -- so each arm asserts the reason, not just
@@ -5391,6 +5623,17 @@ void test_q4_writer_code_range() {
 // engine#1889: the arithmetic that claims the per-head QK gains out of the 640 B Hunyuan-7B carries between its last qkv
 // tile and o_proj. A wrong offset there reads tile bytes as bf16 and mis-rotates every pack of the family, so both the
 // right shape (2 * (64 + head_dim*2) = 640 at head_dim 128) and the neighbours that must NOT be taken for it are driven.
+// The rows a tail head occupies in the container: the pack's own padding to whole 64-row tiles stays. The pack leg's
+// tile-count check used the vocabulary, so it failed on every pack whose vocabulary is not a multiple of 64 although
+// the import was right (Hunyuan-1.8B: 15,104 tiles written, 15,100 expected).
+void test_head_stored_rows() {
+    check(pi::head_stored_rows(120818, true) == 120832, "head rows: Hunyuan's 120,818 are stored as 120,832");
+    check(pi::head_stored_rows(151936, true) == 151936, "head rows: a multiple of 64 is stored as it is");
+    check(pi::head_stored_rows(49152 + 32, true) == 49152 + 64, "head rows: a multiple of 32 that is not one of 64 is padded");
+    check(pi::head_stored_rows(120818, false) == 120818, "head rows: a graph head is not padded");
+    check(pi::head_stored_rows(0, true) == 0, "head rows: no vocabulary, no rows");
+}
+
 void test_qk_gain_offsets() {
     const pi::QkGainOffsets o = pi::qk_gain_offsets(1000, 128, 640);
     // engine#1934: block 0 is Q. Hunyuan-7B's own model.onnx carries both gains as FP16 initializers, and q_norm is the
@@ -5453,6 +5696,7 @@ int main(int argc, char** argv) {
     test_encode_tile_code_range();
     test_q4_writer_code_range();
     test_qk_norm_refusal();
+    test_head_stored_rows();
     test_qk_gain_offsets();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
@@ -5474,6 +5718,7 @@ int main(int argc, char** argv) {
     test_external_container_names();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
     test_external_import_success(golden_dir.empty() ? "." : golden_dir);
+        test_write_canonical_copy();
         test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
         test_sweep_fconst_scratch_dirs();
         test_sweep_is_wired(golden_dir.empty() ? "." : golden_dir);
@@ -5490,6 +5735,8 @@ int main(int argc, char** argv) {
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
+        test_container_geometry();
+        test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);
         test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);

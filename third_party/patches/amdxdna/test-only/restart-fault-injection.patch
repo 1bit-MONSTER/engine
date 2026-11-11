@@ -1,0 +1,87 @@
+From: bong-water-water-bong <bong-water-water-bong@1bit.gg>
+Subject: [PATCH TEST ONLY] accel/amdxdna: fail a context restart on request
+
+TEST ONLY. Not part of the carried series, never built into a package or an
+image: it sits in test-only/ so that nothing that takes the numbered patches
+picks it up.
+
+aie2_hwctx_restart() fails only when firmware refuses one of its four
+messages, which cannot be arranged from user space, so what the driver does
+with a context whose restart failed (engine#1750, patches 0010 and 0013)
+could not be measured on the array. Two module parameters make the next
+restarts fail on purpose:
+
+  restart_inject_step   0 = off
+                        1 = fail before the firmware context is created
+                            (as if aie2_create_context() had failed)
+                        2 = fail after it was created
+                            (as if aie2_map_host_buf() had failed)
+  restart_inject_count  how many restarts to fail; each one takes one
+
+Each injected failure logs "TEST ONLY: injecting a restart failure for
+<ctx> at step <n>" at error level, followed by the driver's own lines for a
+failed restart. Applies on top of 0001-0013.
+---
+diff --git a/drivers/accel/amdxdna/aie2_ctx.c b/drivers/accel/amdxdna/aie2_ctx.c
+index 100a07d..55d99a7 100644
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -34,6 +34,36 @@ uint tdr_timeout_ms = 2000;
+ module_param(tdr_timeout_ms, uint, 0400);
+ MODULE_PARM_DESC(tdr_timeout_ms, "TDR (Timeout Detection and Recovery) timeout in milliseconds (0 = disable)");
+ 
++/*
++ * TEST ONLY (engine#1750), never part of a shipped module: make the next
++ * context restarts fail on purpose, so the failed-restart path can be
++ * measured with one provoked TDR instead of waiting for firmware to
++ * refuse a restart by itself.
++ *
++ * restart_inject_step: 0 = off; 1 = fail before the firmware context is
++ * created (as if aie2_create_context() had failed); 2 = fail after it was
++ * created (as if aie2_map_host_buf() had failed).
++ * restart_inject_count: how many restarts to fail; each injected failure
++ * takes one, and at 0 the injection is off again.
++ */
++static uint restart_inject_step;
++module_param(restart_inject_step, uint, 0600);
++MODULE_PARM_DESC(restart_inject_step, "TEST ONLY: fail a context restart (1 = before create, 2 = after create)");
++static uint restart_inject_count;
++module_param(restart_inject_count, uint, 0600);
++MODULE_PARM_DESC(restart_inject_count, "TEST ONLY: number of context restarts restart_inject_step still fails");
++
++static bool aie2_restart_inject(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx, uint step)
++{
++	if (READ_ONCE(restart_inject_step) != step || !READ_ONCE(restart_inject_count))
++		return false;
++
++	WRITE_ONCE(restart_inject_count, READ_ONCE(restart_inject_count) - 1);
++	XDNA_ERR(xdna, "TEST ONLY: injecting a restart failure for %s at step %u (%u left)",
++		 hwctx->name, step, READ_ONCE(restart_inject_count));
++	return true;
++}
++
+ struct aie2_ctx_health {
+ 	struct amdxdna_ctx_health header;
+ 	u32 txn_op_idx;
+@@ -174,6 +204,12 @@ int aie2_hwctx_restart(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx)
+ 		goto out;
+ 	}
+ 
++	if (aie2_restart_inject(xdna, hwctx, 1)) {
++		ret = -EIO;
++		XDNA_ERR(xdna, "Create hwctx failed, ret %d", ret);
++		goto out;
++	}
++
+ 	ret = aie2_create_context(xdna->dev_handle, hwctx);
+ 	if (ret) {
+ 		XDNA_ERR(xdna, "Create hwctx failed, ret %d", ret);
+@@ -183,6 +219,8 @@ int aie2_hwctx_restart(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx)
+ 	ret = aie2_map_host_buf(xdna->dev_handle, hwctx->fw_ctx_id,
+ 				amdxdna_obj_dma_addr(heap),
+ 				heap->mem.size);
++	if (!ret && aie2_restart_inject(xdna, hwctx, 2))
++		ret = -EIO;
+ 	if (ret) {
+ 		XDNA_ERR(xdna, "Map host buf failed, ret %d", ret);
+ 		goto out;

@@ -178,6 +178,24 @@ public:
     std::unique_ptr<I8Ctx>& head_ctx_ref();
     void   note_m16_made(bool any) { m16_ = m16_ || any; }
     void   drop_ctx16(int role);
+    // engine#1990: a pb16i/t2s set's WIDE family -- the same roles built for more than 16 rows per launch, one
+    // sealed hw_context like the decode family. A launch of more than 16 rows takes it; decode and short chunks
+    // keep the 16-row family (a wide launch costs more than a 16-row one whatever it carries, so one row must
+    // never run on it). adopt_wide() takes the family only if EVERY role that has a decode context has a wide
+    // one of exactly `rows` rows (batch_width.h: wide_family_complete); otherwise it drops every wide context
+    // and answers false. max_rows() is the chunk width, and a chunk has to be launchable on all of its roles.
+    I8Ctx* make_ctx_wide(int role);
+    I8Ctx* ctx_wide(int role) const;
+    void   drop_wide();
+    bool   adopt_wide(int rows);
+    int    wide_rows() const { return wide_rows_; }
+    // The NARROW family: the same roles built for fewer than 16 rows per launch, for decode steps and other
+    // launches of 1..narrow_rows() rows. Same rules as the wide family (all roles or none, one sealed hw_context);
+    // a launch of more rows keeps the 16-row family.
+    I8Ctx* make_ctx_narrow(int role);
+    bool   adopt_narrow(int rows);
+    void   drop_narrow();
+    int    narrow_rows() const { return narrow_rows_; }
     // The context a launch of `rows` rows on `role` would use: the M=16 twin when one was adopted and
     // the row count fits, otherwise the M=128 one. The forward needs this where it launches a GEMM
     // itself (the LM head) instead of going through gemv().
@@ -219,6 +237,10 @@ private:
     std::unique_ptr<I8Ctx> ctx_[Q4NX_MAX_DESIGNS];
     Q4nxDesignGeom designs16_[Q4NX_MAX_DESIGNS];
     std::unique_ptr<I8Ctx> ctx16_[Q4NX_MAX_DESIGNS];
+    std::unique_ptr<I8Ctx> ctxw_[Q4NX_MAX_DESIGNS];   // the wide pb16i/t2s family (engine#1990)
+    int wide_rows_ = 0;                               // 0 = no wide family
+    std::unique_ptr<I8Ctx> ctxn_[Q4NX_MAX_DESIGNS];   // the narrow pb16i/t2s family (decode)
+    int narrow_rows_ = 0;                             // 0 = no narrow family
     std::unique_ptr<I8Ctx> ctx_head_;
     bool m16_ = false;
     bool m16_check_ = false;

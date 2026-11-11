@@ -299,6 +299,22 @@ void Pack::open(const std::string& container_path, const std::string& config_jso
         fail("config.json states the text model's hidden_size " + std::to_string(c["hidden_size"].get<int64_t>()) +
              " but the merger projects to " + std::to_string(geom_.out_hidden) + ": this tower is not this text model's");
 
+    {
+        // top level first (the model's own config key), then the vision_config spelling; both present must agree
+        int top = -1, inner = -1;
+        const bool have_top = c.contains("insert_layer_id") && c["insert_layer_id"].is_number_integer();
+        if (have_top) top = int(c["insert_layer_id"].get<int64_t>());
+        const bool have_inner = vc.contains("MINICPM_V_INSERT_LAYER_ID") && vc["MINICPM_V_INSERT_LAYER_ID"].is_number_integer();
+        if (have_inner) inner = int(vc["MINICPM_V_INSERT_LAYER_ID"].get<int64_t>());
+        if (have_top && have_inner && top != inner)
+            fail("config.json states insert_layer_id " + std::to_string(top) + " and MINICPM_V_INSERT_LAYER_ID " +
+                 std::to_string(inner) + ": one tower, two merge points");
+        if (have_top || have_inner) geom_.insert_layer = have_top ? top : inner;
+        if ((have_top || have_inner) && (geom_.insert_layer < 0 || geom_.insert_layer >= geom_.layers))
+            fail("config.json states insert_layer_id " + std::to_string(geom_.insert_layer) + " but the container holds " +
+                 std::to_string(geom_.layers) + " blocks");
+    }
+
     // An MLP's stated width against its tensors. `stems` are the MLPs that share the width (every block, or the
     // vit_merger alone): fc1 is [width, in] with a [width] bias, fc2 is [out, width].
     const auto zero_from = [&](const std::string& name, int64_t rows, int64_t cols, int64_t from, bool by_row) {
@@ -382,7 +398,7 @@ int print_info(const std::string& pack_dir) {
     std::printf("positions         %d (a %d x %d grid; image %d)\n", g.pos_rows, g.grid, g.grid, g.grid * g.patch);
     std::printf("blocks            %d at width %d, %d heads x %d, MLP %d (%d stored)\n", g.layers, g.hidden, g.heads, g.head_dim,
                 g.model_intermediate, g.intermediate);
-    std::printf("vit_merger        attention at %d, MLP %d -> %d (%d stored) -> %d\n", g.hidden, g.merge_hidden,
+    std::printf("vit_merger        after block %d; attention at %d, MLP %d -> %d (%d stored) -> %d\n", g.insert_layer, g.hidden, g.merge_hidden,
                 g.model_vit_merger_intermediate, g.vit_merger_intermediate, g.hidden);
     std::printf("merger            %d -> %d -> %d (the text model's hidden size)\n", g.merge_hidden, g.merge_hidden, g.out_hidden);
     for (const char* k : {"source_file", "source_sha256", "source_dtype", "converter"})

@@ -117,6 +117,25 @@ done
 
 lspci -vv 2>/dev/null | awk '/USB controller/{p=1} p{print} p&&/^$/{p=0}' > "$out/lspci-usb.txt"
 lsusb -t > "$out/lsusb-tree.txt" 2>&1
+
+# engine#823: a port with "connect" is only evidence if the reader can tell WHAT is on it. This box carries a JetKVM
+# ("USB Emulation Device": HID + audio + mass storage in one composite) and a device whose descriptors read
+# `MID-SSS`/`PID-KKK` -- both look like a plugged drive to a port count, and neither answers this issue. So record the
+# identity of every connected port, from sysfs, next to the port state: a real drive the owner plugs in is then
+# distinguishable by its own idVendor:idProduct and product string rather than by trust.
+: > "$out/connected-ids.txt"
+while read -r bus port; do
+    dev="/sys/bus/usb/devices/${bus}-${port}"
+    [ -d "$dev" ] || continue
+    vid=$(cat "$dev/idVendor" 2>/dev/null); pid=$(cat "$dev/idProduct" 2>/dev/null)
+    prod=$(cat "$dev/product" 2>/dev/null); man=$(cat "$dev/manufacturer" 2>/dev/null)
+    spd=$(cat "$dev/speed" 2>/dev/null)
+    printf 'bus %s port %s: %s:%s  product=%s  manufacturer=%s  speed=%sMbps\n' \
+        "$bus" "$port" "${vid:-????}" "${pid:-????}" "${prod:-?}" "${man:-?}" "${spd:-?}" >> "$out/connected-ids.txt"
+done <<EOF
+$(awk '/^== bus/{b=$3} /port [0-9]+:.*connect/{p=$2; sub(":","",p); print b, p}' "$out/ports.txt")
+EOF
+[ -s "$out/connected-ids.txt" ] || echo "(no port reports connect)" > "$out/connected-ids.txt"
 dmesg > "$out/dmesg-full.txt" 2>&1
 grep -iE 'xhci|usb|acpi.*(usb|UCSI)|pcieport|AER' "$out/dmesg-full.txt" > "$out/dmesg-filtered.txt" 2>&1
 
@@ -136,6 +155,9 @@ done
     awake=$(grep -c 'power_state=D0' "$out/controllers.txt" 2>/dev/null)
     total=$(wc -l < "$out/controllers.txt")
     echo "   $awake of $total in D0"
+    echo
+    echo "== what is on each connected port (a plugged drive must be identifiable here, engine#823)"
+    sed 's/^/   /' "$out/connected-ids.txt"
     echo
     echo "== ports seen with a device attached (connect), per bus"
     awk '/^== bus/{b=$3} /port [0-9]+:.*connect/{c[b]++} END{for (k in c) printf "   bus %s: %s port(s) with connect\n", k, c[k]}' "$out/ports.txt"

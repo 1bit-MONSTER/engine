@@ -299,12 +299,30 @@ detail:
 HW_GATE_NPU_SERVE_BIN=/path/to/1bit HW_GATE_NPU_SERVE_MODEL=/path/to/Qwen3-0.6B scripts/hw-gate.sh --phases npuserve
 ```
 
-`HW_GATE_NPU_SERVE_FLOOR` sets the tok/s floor (default 60) and `HW_GATE_NPU_SERVE_PORT` the port. The
-row is `PASS` only when the tool exits 0 **and** printed `RESULT: PASS`, so a truncated log cannot pass.
+The three numbers that decide the rate assertion are all passed by the phase, so none is a default
+hidden in another file: `HW_GATE_NPU_SERVE_FLOOR` (tok/s, default **30**), `HW_GATE_NPU_SERVE_MAX_TOKENS`
+(answer length, default 96) and `HW_GATE_NPU_SERVE_REPLIES` (requests, default 5; the rate is their
+median). `HW_GATE_NPU_SERVE_PORT` sets the port. The row is `PASS` only when the tool exits 0 **and**
+printed `RESULT: PASS`, so a truncated log cannot pass, and it always carries the measured median rate
+and first-token time.
+
+The gate's floor is 30, not the demo's 60, because the box is shared. On the fast route the release
+candidate's single replies have been measured between 48.8 and 101 tok/s depending on load; the slow
+route is 1.9. A floor of 30 is fifteen times above the failure it guards against and under every fast
+reply seen, so "slow machine" does not read as "slow route". The `route` assertion does not depend on
+load at all. When the phase is named, a `FAIL` fails the gate like any other phase: it is blocking,
+with no retry built in; a failed row shows which assertions failed and the numbers, so a rate-only
+failure with `route ok` is recognisable as load and can be re-run.
+
+If the NPU ticket ends while a request hangs, the ticket's TERM reaches the smoke script (a `flock` sits
+between them), and the script stops the serve before it exits; the serve is also started so that the
+kernel TERMs it if the script dies any other way. A `1bit serve` left holding the NPU after its ticket
+is the failure this prevents.
 Like `npu`, the phase is not in the default phases and skips when there is no NPU or the two settings
 are absent; the release procedure has to name it and set them for it to gate anything. It has not been
 added to the release script. `tests/hw_gate_npuserve_test.sh` drives the phase end to end against a
-stand-in serve (fast, slow, a floor it misses, dead at start, unconfigured, no NPU) with no device.
+stand-in serve (fast, slow, a floor it misses, dead at start, unconfigured, no NPU, and the ticket's
+kill sequence arriving mid-request) with no device.
 
 ## Measured
 

@@ -667,8 +667,14 @@ fi
 # shipped binary whose serve quietly takes the slow per-op route: that serve still answers, at about 2 tok/s where the
 # fast route gives 80 to 100 (engine#2102, #2106). tools/npu_serve_smoke.py asserts the route's own log line, the decode
 # floor, the first token and a non-empty answer. Set HW_GATE_NPU_SERVE_BIN to the 1bit under test and
-# HW_GATE_NPU_SERVE_MODEL to the small model directory; HW_GATE_NPU_SERVE_FLOOR is the tok/s floor (default 60).
-# It runs under the same NPU claim as the npu phase and, like it, is not in the default phases.
+# HW_GATE_NPU_SERVE_MODEL to the small model directory. The three numbers that decide the rate assertion are all
+# passed from here, so none of them is a default in another file: HW_GATE_NPU_SERVE_FLOOR (tok/s, default 30),
+# HW_GATE_NPU_SERVE_MAX_TOKENS (answer length, default 96) and HW_GATE_NPU_SERVE_REPLIES (requests, default 5; the
+# rate is their median). The floor is 30 and not the demo's 60 because this box is shared: single replies of the
+# release candidate on the fast route have been measured from 48.8 to 101 tok/s under load, and the slow route is
+# 1.9, so 30 is 15 times above the failure it guards against and below every fast reply seen. The route assertion
+# does not depend on load at all. It runs under the same NPU claim as the npu phase and, like it, is not in the
+# default phases; when it is named, a FAIL fails the gate like any other phase.
 if has npuserve; then
   t0=$(date +%s)
   smoke=$(cd "$(dirname "$0")/.." && pwd)/tools/npu_serve_smoke.py
@@ -684,7 +690,8 @@ if has npuserve; then
         hold_args=("$NPU_HOLD" -l hw-gate-npuserve -t "${HW_GATE_NPU_HOLD_MINUTES:-20}" -w "$LOCK_WAIT" --)
     fi
     "${hold_args[@]}" flock -w "$LOCK_WAIT" -E 75 "$LOCK" python3 "$smoke" --bin "$HW_GATE_NPU_SERVE_BIN" \
-        --model "$HW_GATE_NPU_SERVE_MODEL" --out "$OUT/npuserve" --floor "${HW_GATE_NPU_SERVE_FLOOR:-60}" \
+        --model "$HW_GATE_NPU_SERVE_MODEL" --out "$OUT/npuserve" --floor "${HW_GATE_NPU_SERVE_FLOOR:-30}" \
+        --max-tokens "${HW_GATE_NPU_SERVE_MAX_TOKENS:-96}" --replies "${HW_GATE_NPU_SERVE_REPLIES:-5}" \
         ${HW_GATE_NPU_SERVE_PORT:+--port "$HW_GATE_NPU_SERVE_PORT"} > "$log" 2>&1
     rc=$?
     st=FAIL

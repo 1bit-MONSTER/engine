@@ -2505,8 +2505,15 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
         if (!kcache_[l].empty() && kcache_[l].size() > keep) kcache_[l].resize(keep);
         if (!vcache_[l].empty() && vcache_[l].size() > keep) vcache_[l].resize(keep);
     }
-    for (size_t l = 0; l < conv_state_.size(); l++) conv_state_[l] = snap_conv_[l];
-    for (size_t l = 0; l < rec_state_.size(); l++) rec_state_[l] = snap_rec_[l];
+    // A full accept keeps the state the batch's own recurrence left: that is the state the restore + replay would
+    // rebuild (NPU_REPLAY_CHECK holds the two equal), so the restore and the replay are skipped. On the served 27B
+    // they are 11 ms + 7 ms per row, 67 ms of an 8-row round. NPU_COMMIT_FULL_REPLAY=1 keeps them, for an A/B.
+    static const bool always_replay = std::getenv("NPU_COMMIT_FULL_REPLAY") != nullptr;
+    const bool keep_batch_state = accepted == verify_rows_ && accepted > 0 && !always_replay && !replay_check;
+    if (!keep_batch_state) {
+        for (size_t l = 0; l < conv_state_.size(); l++) conv_state_[l] = snap_conv_[l];
+        for (size_t l = 0; l < rec_state_.size(); l++) rec_state_[l] = snap_rec_[l];
+    }
     // The accepted prefix is the only thing a drafter may advance over: drop the rejected rows' hidden here, so
     // that last_hidden_rows() is exactly `accepted` rows starting at verify_pos_.  Leaving all verify_rows_ made
     // the draft loop's own size check fail, and it skipped the drafter advance without a word.
@@ -2516,8 +2523,8 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
     }
     const auto cv_t1 = std::chrono::steady_clock::now();
     verify_open_ = false;                        // the replay below must not re-record
-    if (accepted > 0 && shortconv_) conv_apply_rows(accepted);
-    if (accepted > 0 && !gdn_apply_rows(0, accepted)) return false;
+    if (!keep_batch_state && accepted > 0 && shortconv_) conv_apply_rows(accepted);
+    if (!keep_batch_state && accepted > 0 && !gdn_apply_rows(0, accepted)) return false;
     if (cv_prof) {
         const auto cv_t2 = std::chrono::steady_clock::now();
         const double restore = std::chrono::duration<double, std::milli>(cv_t1 - cv_t0).count();

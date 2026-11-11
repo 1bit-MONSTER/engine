@@ -1981,6 +1981,15 @@ endif()
     # A DFlash draft scored against its target, both on the host (engine#1780): the target's tapped hidden states
     # into the draft's reference forward, proposals checked against the target's greedy tokens. A tool, not a ctest:
     # it needs two packages and minutes of host time.
+    # A DFlash 2 draft against the served 27B (engine#1781): acceptance in stages, and the speculative loop end to end
+    # (draft -> one batched verify pass -> commit). A tool, not a ctest: target pack, draft package and the device.
+    add_executable(dflash2_probe tools/dflash2_probe.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp)
+    target_include_directories(dflash2_probe PRIVATE npu npu/forward/include)
+    target_link_libraries(dflash2_probe PRIVATE onebit_npu_forward onebit_npu)
+    find_package(OpenMP COMPONENTS CXX QUIET)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(dflash2_probe PRIVATE OpenMP::OpenMP_CXX)
+    endif()
     add_executable(dflash_acceptance tools/dflash_acceptance.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp)
     target_include_directories(dflash_acceptance PRIVATE npu npu/forward/include)
     target_link_libraries(dflash_acceptance PRIVATE onebit_npu_forward onebit_npu)

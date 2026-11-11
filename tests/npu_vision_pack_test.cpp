@@ -378,6 +378,22 @@ void test_refusals() {
     refused("config: another patch size", with("PATCH_SIZE", 4), {"PATCH_SIZE 4"});
     refused("config: an image the position table does not cover", with("IMAGE_SIZE", 12), {"IMAGE_SIZE 12", "4 x 4"});
     refused("config: another position count", with("VISION_NUM_POSITION_EMBEDDINGS", 25), {"NUM_POSITION_EMBEDDINGS 25", "16 rows"});
+    // the vit_merger's place: read from the config, refused when it is not a block or is stated twice differently
+    {
+        json c = config_of(s);
+        c["insert_layer_id"] = 1;
+        try {
+            const vis::Pack p(kPath, c.dump());
+            check(p.geometry().insert_layer == 1, "config: insert_layer_id is read");
+        } catch (const std::exception& e) {
+            check(false, std::string("a config with insert_layer_id loads (threw: ") + e.what() + ")");
+        }
+        c["insert_layer_id"] = 2;
+        refused("config: a merge point past the last block", c.dump(), {"insert_layer_id 2", "2 blocks"});
+        c["insert_layer_id"] = 0;
+        c["vision_config"]["MINICPM_V_INSERT_LAYER_ID"] = 1;
+        refused("config: two merge points", c.dump(), {"insert_layer_id 0", "MINICPM_V_INSERT_LAYER_ID 1"});
+    }
     {
         json c = config_of(s);
         c["hidden_size"] = 12;
@@ -425,6 +441,7 @@ void test_published_pack(const std::string& dir) {
         check(g.model_intermediate == 4304 && g.model_vit_merger_intermediate == 17216,
               "published pack: the model's MLP widths are 4304 and 17216, the rest verified zero in all 27 blocks");
         check(g.merge_hidden == 4608, "published pack: mergers at 4 x 1152");
+        check(g.insert_layer == 6, "published pack: the vit_merger runs after block 6");
         check(p.notes().size() == 2, "published pack: both padded widths are noted");
         // The 1B pack's container names its source; the 35B-A3B's carries no __metadata__ at all. Both are accepted,
         // and a source hash that is present has to look like one.

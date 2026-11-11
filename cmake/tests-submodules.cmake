@@ -11,3 +11,8 @@
 #
 #     scripts/check-submodules.sh --root .
 add_test(NAME submodules_self COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check-submodules.sh --self-test)
+
+# The release preflight's use of it (engine#2129): a build tree that is not the pinned tree BLOCKS, and "no checkout to
+# compare against" only WARNs, so a fresh clone can still build. The function is cut out of scripts/weekly.sh and run
+# against stub checkers -- no submodules, no network, no build.
+add_test(NAME weekly_submodule_preflight COMMAND ${CMAKE_SOURCE_DIR}/tests/weekly_submodule_preflight_test.sh)

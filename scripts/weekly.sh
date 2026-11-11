@@ -658,6 +658,29 @@ preflight_runner_units() {
     return 0
 }
 
+# The submodule row of the preflight (engine#2129). The bumps and build stages build the tree in front of them, and
+# "the pin is healthy" -- which CI checks, on the repository -- is not "the checkout is the pin", which is what a build
+# reads. Measured 2026-11-11 while triaging #2129: 7 of 7 submodules on this box disagreed with the commit the tree pins,
+# llama.cpp by 301 uncommitted files. Exit 1 is a checkout that disagrees and stops the run: the build would not be of the
+# pinned sources. Exit 3 is submodules not checked out at all (a fresh clone) and only WARNS -- a fresh box must still be
+# able to build, and the warning says the check inspected nothing rather than implying it passed (the exit-3 discipline of
+# engine#2094). Exit 2 (no .gitmodules) cannot happen on this repository and warning is right for it too.
+# A function of its own so tests/weekly_submodule_preflight_test.sh can run it against a stub.
+preflight_submodules() {
+    local check=$1 src=$2 out rc=0
+    [ -x "$check" ] || return 0
+    out=$("$check" --root "$src" 2>&1) || rc=$?
+    case "$rc" in
+        0) printf '%s\n' "$out" | grep -v '^ok ' | sed 's/^/preflight: /' ;;
+        2|3) printf '%s\n' "$out" | sed 's/^/preflight: /'
+             echo "preflight: WARNING, not blocking: no checkout to compare against the pin, so the build follows the tree rather than this check (scripts/check-submodules.sh exit $rc; git submodule update --init fills it)" ;;
+        *) printf '%s\n' "$out" | sed 's/^/preflight: /'
+           echo "preflight: the tree in front of this build is not the pinned tree, so the build would not be of the pinned sources (scripts/check-submodules.sh exit $rc; the lines above name the submodule and both commits)"
+           return 1 ;;
+    esac
+    return 0
+}
+
 # --- preflight ----------------------------------------------------------------------------
 # What the stages need from the machine, checked before the first one runs, so that a missing
 # tool stops the run at the start rather than after an hour of build (2026-10-19 rehearsal).
@@ -677,7 +700,9 @@ preflight() {
                              2> "$LOGS/hrx-toolchain.log"); then :; else
                            echo "preflight: cannot fetch the pinned HRX toolchain (config/hrx-toolchain.config): see $LOGS/hrx-toolchain.log"; bad=1
                        fi ;;
-                esac ;;
+                esac
+                # engine#2129: this stage builds the tree in front of it, so the tree has to be the pinned tree
+                preflight_submodules "$(cd "$(dirname "$0")" && pwd)/check-submodules.sh" "$SRC" || bad=1 ;;
             package)
                 # scripts/package-linux.sh rewrites RPATHs with patchelf
                 command -v patchelf > /dev/null ||

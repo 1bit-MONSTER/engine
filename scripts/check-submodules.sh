@@ -38,8 +38,9 @@
 # name, which is the same defect with a smaller diff. It is reported per submodule with its count so a reader can tell a
 # stray file from a reset (`git -C <path> checkout -- . && git -C <path> clean -fd`).
 #
-# Exit: 0 when every checkout is its pin and clean; 1 on any disagreement; 2 when there is nothing to inspect (no
-# .gitmodules, or git missing) -- an unchecked tree is the state this exists to end.
+# Exit: 0 when every checkout is its pin and clean; 1 when a CHECKOUT exists and disagrees with the pin (the defect);
+# 3 when submodules are not checked out at all -- a fresh clone is not a defect and must not stop a build, but it is also
+# not a pass, which is why it is not 0; 2 when there is nothing to inspect at all (no .gitmodules, or git missing).
 set -uo pipefail
 
 root=.
@@ -49,7 +50,7 @@ while [ $# -gt 0 ]; do
         --root) root=${2:?--root needs a directory}; shift 2 ;;
         --root=*) root=${1#*=}; shift ;;
         --self-test) self=1; shift ;;
-        -h|--help) sed -n '16,36p' "$0"; exit 0 ;;
+        -h|--help) sed -n '/^# check-submodules.sh /,/^set -uo/p' "$0" | sed '$d'; exit 0 ;;
         *) echo "check-submodules.sh: unknown option $1" >&2; exit 2 ;;
     esac
 done
@@ -90,6 +91,15 @@ if [ "$self" = 1 ]; then
     printf '%s' "$out" | grep -q 'clean' && ok "and it says the worktree differs from its HEAD" \
         || bad "the dirty message does not explain itself: $out"
 
+    # A fresh clone: submodule registered in .gitmodules and in the tree, but not checked out. That is not a defect, and
+    # it must not read as one -- a build on a fresh box has to be able to proceed.
+    rm -rf "$tmp/fresh" && mkdir -p "$tmp/fresh"
+    ( cd "$tmp/repo" && git clone -q --no-local . "$tmp/fresh" ) >/dev/null 2>&1
+    ( cd "$tmp/repo/third_party/sub" && git checkout -q . && git clean -qfd ) >/dev/null 2>&1
+    out=$(bash "$0" --root "$tmp/fresh" 2>&1)
+    [ $? = 3 ] && ok "an unchecked-out submodule is exit 3 (cannot tell), not 1 and not 0" \
+        || bad "an unchecked-out submodule should exit 3: $out"
+
     # No .gitmodules: cannot tell, not "clean".
     mkdir -p "$tmp/plain" && git init -q "$tmp/plain"
     bash "$0" --root "$tmp/plain" >/dev/null 2>&1
@@ -104,6 +114,7 @@ command -v git >/dev/null || { echo "check-submodules: no git on PATH" >&2; exit
 [ -f "$root/.gitmodules" ] || { echo "check-submodules: no .gitmodules under $root -- nothing to inspect, which is not a pass" >&2; exit 2; }
 
 bad=0
+missing=0
 while read -r _key path; do
     [ -n "${path:-}" ] || continue
     pin=$(git -C "$root" ls-tree HEAD -- "$path" 2>/dev/null | awk '{print $3}')
@@ -112,9 +123,16 @@ while read -r _key path; do
         bad=$((bad + 1)); continue
     fi
     head=$(git -C "$root/$path" rev-parse HEAD 2>/dev/null)
+    # `git -C` in an unchecked-out submodule dir is not an error: it walks UP and reports the PARENT's HEAD, so a fresh
+    # clone looked like a checkout at the wrong commit. The path must be its own repository root to be a checkout at all.
+    toplevel=$(git -C "$root/$path" rev-parse --show-toplevel 2>/dev/null)
+    if [ -n "$head" ] && [ -n "$toplevel" ] && \
+       [ "$(cd "$root/$path" 2>/dev/null && pwd -P)" != "$(cd "$toplevel" 2>/dev/null && pwd -P)" ]; then
+        head=
+    fi
     if [ -z "$head" ]; then
-        echo "::error::check-submodules: $path is not checked out (the tree pins ${pin:0:9}); a build would not find its sources"
-        bad=$((bad + 1)); continue
+        echo "::warning::check-submodules: $path is not checked out (the tree pins ${pin:0:9}); a build would not find its sources"
+        missing=$((missing + 1)); continue
     fi
     if [ "${pin:0:9}" != "${head:0:9}" ]; then
         echo "::error::check-submodules: $path is not the pin: tree ${pin:0:9}, checkout ${head:0:9} -- the build would read sources the pin does not name"
@@ -128,6 +146,10 @@ while read -r _key path; do
     printf 'ok   %-28s %s\n' "$path" "${pin:0:9}"
 done < <(git -C "$root" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null)
 
-[ "$bad" = 0 ] && { echo "check-submodules: every checkout is its pin and clean"; exit 0; }
+if [ "$bad" = 0 ]; then
+    if [ "$missing" = 0 ]; then echo "check-submodules: every checkout is its pin and clean"; exit 0; fi
+    echo "check-submodules: $missing submodule(s) are not checked out, so nothing was inspected for them (a clone gets here; run git submodule update --init)"
+    exit 3
+fi
 echo "check-submodules: $bad submodule(s) are not what the tree pins"
 exit 1

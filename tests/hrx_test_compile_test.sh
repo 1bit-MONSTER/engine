@@ -27,6 +27,14 @@ set -uo pipefail
 S=${1:?usage: hrx_test_compile_test.sh <path-to-hrx-test-compile.sh>}
 [ -x "$S" ] || { echo "not executable: $S"; exit 1; }
 command -v cmake >/dev/null 2>&1 || { echo "skip: no cmake (exit 77)"; exit 77; }
+
+# The stub trees need a real C and C++ compiler, and they must be found the way this box names them: CI configures the
+# engine build with gcc-16/g++-16 and may have no plain `cc`/`c++` on PATH at all, which is how this test failed its
+# first CI run while passing locally. CMake honours CC/CXX on a first configure, so the arms hand it what exists.
+pick() { for c in "$@"; do command -v "$c" >/dev/null 2>&1 && { command -v "$c"; return 0; }; done; return 1; }
+CC=$(pick "${CC:-}" cc gcc gcc-16 gcc-15 gcc-14) || { echo "skip: no C compiler (exit 77)"; exit 77; }
+CXX=$(pick "${CXX:-}" c++ g++ g++-16 g++-15 g++-14) || { echo "skip: no C++ compiler (exit 77)"; exit 77; }
+export CC CXX
 work=$(mktemp -d "${TMPDIR:-/tmp}/hrxtc.XXXXXX")   # scratch, removed below
 trap 'rm -rf "$work"' EXIT
 fail=0
@@ -55,8 +63,18 @@ EOF
 
 # 1. Compiles cleanly -> 0.
 mktree "$work/good" 'int main(void) { return 0; }'
-"$S" "$work/good" --build-dir "$work/b-good" >/dev/null 2>&1
-[ $? = 0 ] && ok "a tree whose HRX test compiles exits 0" || bad "a tree whose HRX test compiles exits 0"
+# On failure, print what the gate itself said: an arm that reports only "exits 0" fails the first CI run with no cause,
+# which is what happened here (the real reason was a missing compiler, and the arm said nothing about it).
+run_arm() {  # run_arm <label> <expected-rc> <args...>
+    local label=$1 want=$2; shift 2
+    local out rc
+    out=$("$S" "$@" 2>&1); rc=$?
+    if [ "$rc" = "$want" ]; then ok "$label"; else
+        bad "$label (got $rc, wanted $want)"
+        printf '%s\n' "$out" | tail -6 | sed 's/^/       | /'
+    fi
+}
+run_arm "a tree whose HRX test compiles exits 0" 0 "$work/good" --build-dir "$work/b-good"
 
 # 2. The #262 shape: an error in the test source -> non-zero, and the error text is surfaced.
 mktree "$work/bad" 'int main(void) { const int x = "not an int"; return x; }'
@@ -68,7 +86,10 @@ out=$("$S" "$work/bad" --build-dir "$work/b-bad" 2>&1); rc=$?
 # 3. No HRX targets at all -> 77, never 0. This is the arm that keeps the gate from being vacuous.
 mktree "$work/nohrx" 'int main(void) { return 0; }' no
 out=$("$S" "$work/nohrx" --build-dir "$work/b-nohrx" 2>&1); rc=$?
-[ "$rc" = 77 ] && ok "a tree without HRX targets exits 77 (skip, not pass)" || bad "a tree without HRX targets exits 77 (got $rc)"
+if [ "$rc" = 77 ]; then ok "a tree without HRX targets exits 77 (skip, not pass)"; else
+    bad "a tree without HRX targets exits 77 (got $rc)"
+    printf '%s\n' "$out" | tail -6 | sed 's/^/       | /'
+fi
 [[ $out == *"SKIP, not PASS"* ]] && ok "and says so in those words" || bad "and says so in those words"
 
 # 4. Usage contract.

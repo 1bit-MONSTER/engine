@@ -981,19 +981,28 @@ at every prompt shape measured (3, 8, 12, 40, 100 and 1,700 tokens, with and wit
 sizes: 8.9 % at 8 tokens, 5.3 % at 12 and 6.9 % at 16 (interleaved, quiet box), which is 2 to 3 ms on a short prompt. Perplexity
 at a 12-token batch is 59.0414 before and 59.0417 after. An uploaded weight keeps the i8 kernel.
 
-**Decode is not affected by the default.** Default against both switches at `0`, alternated in one ticket at pin `0494dfa28`:
+**Speed against the previous behaviour.** At pin `4107043c1` (clean build, `build_commit 4107043`), the defaults against all
+three switches off (`GGML_HRX_Q4K_PACKED_TAIL=0 GGML_HRX_Q6K_PACKED_ROWS=0 GGML_HRX_PREFILL_FOLLOWS_DECODE=0`, the previous
+behaviour), order default / off / off / default in one ticket, box load 4 to 7:
 
-| `llama-bench` | both switches `0` | default |
+| tok/s | all three off | defaults |
 |---|---|---|
-| Qwen3.8-27B UD-Q4_K_XL, `-p 0 -n 48 -r 3`, four arms each | 11.21, 11.89, 11.91, 11.86 tok/s | 11.92, 11.91, 11.91, 11.91 tok/s |
-| Qwen3.8-27B UD-Q4_K_XL, `-p 1700`, warm arms | 318.8, 303.2 tok/s | 318.5, 316.3 tok/s |
-| Qwen3-4B Q4_K_M, `-p 1700 -n 48 -r 2`, two arms each: decode | 74.83, 76.12 tok/s | 74.39, 74.47 tok/s |
-| Qwen3-4B Q4_K_M, the same runs: prefill | 2,338.6, 2,351.4 tok/s | 2,416.9, 2,370.9 tok/s |
+| Qwen3.8-27B, `llama-bench -p 1700 -n 48 -r 2`, prefill | 251.1, 311.9 | 321.3, 308.4 |
+| Qwen3.8-27B, the same, decode | 10.66, 7.37 | 9.29 ± 3.24, 10.84 |
+| Qwen3.8-27B, `llama-completion -c 4096 -n 48`, 1,282-word prompt: prompt | 248.6, 296.5 | 263.2, 254.6 |
+| Qwen3.8-27B, the same: decode | 10.54, 6.20 | 10.13, 7.57 |
+| Qwen3-4B Q4_K_M, `llama-bench`, prefill | 1,540.5, 1,725.0 | 1,711.1, 2,299.9 |
+| Qwen3-4B Q4_K_M, `llama-bench`, decode | 43.96, 72.58 | 45.10, 73.31 |
+| Qwen3-4B Q4_K_M, `llama-completion`: prompt | 1,473.2, 1,692.1 | 1,664.9, 2,139.5 |
+| Qwen3-4B Q4_K_M, `llama-completion`: decode | 49.32, 49.62 | 40.41, 49.99 |
 
-On the 27B the two are the same to 0.5 %. On the 4B decode reads 1.4 % lower with the default in these four runs, which is the
-size of the spread between the two control runs. A 27B decode figure taken right after a 1,700-token prefill varies between runs
-(8.1 to 11.8 tok/s with the default, 7.6 to 11.5 with the switches at `0`), so compare decode with `-p 0`.
-`GGML_HRX_Q4K_PACKED_TAIL=0 GGML_HRX_Q6K_PACKED_ROWS=0` restores the previous behaviour.
+The generated text is identical between the arms on each model. The two runs of one arm differ by up to 40 % here (27B decode
+7.4 against 10.7 with the switches off), more than any difference between the arms, so this table shows no regression and does
+not measure a gain. An earlier decode-only window on the 27B (`-p 0 -n 48 -r 3`, eight alternated arms, before #320) was steadier:
+11.21 to 11.91 tok/s with both packed-layout switches at `0` and 11.91 to 11.92 with the default. `llama-bench` runs its prompt
+test before any decode in the process, so its prefill row does not include #320's effect, which needs a stored copy made by
+decode first; the `llama-completion` rows do (they decode a warm-up token first).
+`GGML_HRX_Q4K_PACKED_TAIL=0 GGML_HRX_Q6K_PACKED_ROWS=0 GGML_HRX_PREFILL_FOLLOWS_DECODE=0` restores the previous behaviour.
 
 **A dense mixed-quant 27B shares most of its copies too since pin `4107043c1`** (llama.cpp #320). On Qwen3.8-27B UD-Q4_K_XL the
 one-token decode goes through the kquant kernels, which read the stored (GGUF) layout, while some prefill kernels read the packed

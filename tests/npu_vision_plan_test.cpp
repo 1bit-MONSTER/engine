@@ -65,6 +65,17 @@ const Row kRows[] = {
     {600, 800, {392, 504, 2, 2, 784, 1008, 392, 504}},
     {8000, 8000, {448, 448, 3, 3, 1344, 1344, 448, 448}},
     {14, 8000, {56, 10304, 0, 0, 0, 0, 0, 0}},
+    // sizes that are not multiples of anything: resized, never refused, never cropped
+    {385, 384, {448, 448, 0, 0, 0, 0, 0, 0}},
+    {447, 449, {448, 448, 0, 0, 0, 0, 0, 0}},
+    {449, 449, {448, 448, 2, 1, 672, 616, 336, 616}},
+    {1, 2, {336, 616, 0, 0, 0, 0, 0, 0}},
+    // the largest sizes the plan accepts. The strips are the reference's answers too, absurd as they are (a 56-pixel
+    // wide piece 458,752 pixels tall): the plan is arithmetic, and it is the caller that bounds total_rows().
+    {1048576, 1048576, {448, 448, 3, 3, 1344, 1344, 448, 448}},
+    {1, 1048576, {56, 56, 1, 7, 56, 1048600, 56, 149800}},
+    {1048576, 1, {458752, 56, 7, 1, 1213632, 56, 173376, 56}},
+    {1048576, 3, {264880, 56, 9, 1, 794808, 56, 88312, 56}},
 };
 const uint64_t kReferenceHash = 0x8480087394bf204fULL;  // the walk below, by the reference
 const int kReferenceMaxRows = 716;                      // the most text rows any of the 3,481 plans gives
@@ -96,7 +107,7 @@ int main() {
 
     uint64_t h = 0xcbf29ce484222325ULL;
     int max_rows = 0, pairs = 0;
-    bool shapes_ok = true;
+    bool shapes_ok = true, tiles_ok = true;
     for (int height : kSizes)
         for (int width : kSizes) {
             const vis::ImagePlan p = vis::plan_image(height, width);
@@ -113,19 +124,23 @@ int main() {
             };
             shapes_ok = shapes_ok && ok(p.source) && (p.slice_rows == 0 || ok(p.slice)) && p.slice_rows * p.slice_cols <= 9 &&
                         p.pieces() == 1 + p.slice_rows * p.slice_cols;
+            // nothing is cropped or padded: the slices tile the refine size exactly, with no remainder on either axis
+            tiles_ok = tiles_ok && p.refine_height == p.slice.height * p.slice_rows && p.refine_width == p.slice.width * p.slice_cols;
         }
     std::printf("  %d image sizes: hash 0x%016llx (reference 0x%016llx), most text rows %d\n", pairs, (unsigned long long)h,
                 (unsigned long long)kReferenceHash, max_rows);
     check(h == kReferenceHash, "all 3,481 plans are the reference's (one hash over every number)");
     check(max_rows == kReferenceMaxRows, "the largest plan gives the reference's row count");
     check(shapes_ok, "every piece of every plan is a multiple of 4 patches in both extents, and at most 9 slices");
+    check(tiles_ok, "the slices of every plan tile its refine size exactly: no remainder to crop or pad");
 
     {
         const vis::ImagePlan p = vis::plan_image(1080, 1920);
         check(p.pieces() == 9 && p.source.rows == 6 * 11 && p.slice.rows == 64 && p.total_rows() == 66 + 8 * 64,
               "1080 x 1920: one 24 x 44 source (66 rows) and eight 32 x 32 slices (64 rows each), 578 rows");
     }
-    for (const auto& [hh, ww] : std::vector<std::pair<int, int>>{{0, 100}, {100, 0}, {-1, 5}, {1 << 21, 10}}) {
+    // one past the largest size on each axis, and the non-sizes
+    for (const auto& [hh, ww] : std::vector<std::pair<int, int>>{{0, 100}, {100, 0}, {-1, 5}, {1 << 21, 10}, {(1 << 20) + 1, 448}, {448, (1 << 20) + 1}}) {
         std::string why;
         try { vis::plan_image(hh, ww); } catch (const std::exception& e) { why = e.what(); }
         check(why.find("cannot be planned") != std::string::npos, std::to_string(hh) + " x " + std::to_string(ww) + " is refused");

@@ -1559,12 +1559,18 @@ resize. Every piece is a multiple of 56 pixels (4 patches) in both extents, beca
 (heights first.) So one 448-pixel slice is 64 rows, not the 1,225 that 980 / 14 / 2 squared suggests: the
 position table is 70 × 70, but no piece the processor produces is that large unless the image is a very
 long strip. The plan is checked against the reference's own answers for 3,481 image sizes in
-`tests/npu_vision_plan_test.cpp`.
+`tests/npu_vision_plan_test.cpp`. Nothing is cropped or padded and no size is refused for not being a
+multiple of anything: every image is resized whole (385 × 384 becomes 448 × 448, so the aspect ratio moves
+a little, as it does in the model's own processor), and the slices tile the refine size exactly. The plan
+does not bound its result: a 1,048,576 × 1 strip gives the reference's answer, a piece 458,752 pixels
+tall, and it is the caller that decides how many rows to accept. `plan_image()` reads no file and touches
+no pixel, which is what lets it be checked anywhere; keep it that way.
 
 **From bytes to the tower's input (`npu/vision_image.h`).** `vision::preprocess(rgb, height, width, plan)`
 resizes an RGB byte image to the plan's whole view and, when it is sliced, to the refine size, cuts the
-slices, and returns each piece as `(3, height, width)` float32 with value `(byte − 127.5) / 127.5`: the
-whole view first, then the slices row by row. The resize is bicubic with antialiasing on bytes and
+slices, and returns each piece as `(3, height, width)` float32 with value `(byte − 127.5) / 127.5`
+(rescale by 1/255, then mean 0.5 and std 0.5, the same for each channel; R, G, B order in and out; byte
+0 is exactly −1 and byte 255 exactly +1): the whole view first, then the slices row by row. The resize is bicubic with antialiasing on bytes and
 reproduces `torch.nn.functional.interpolate(uint8, mode="bicubic", antialias=True)` (torch 2.13) bit
 for bit: the a = −0.5 cubic stretched by the scale when shrinking, integer weights at the largest
 precision that still fits int16 (PIL's fixed 22 bits differs by one in about 1 % of bytes), width

@@ -17,7 +17,8 @@
 //
 // plan_image() (vision_plan.h) says which sizes; this does the pixels. The pieces come out in the order the reference
 // processor feeds the tower: the whole view first, then the slices row by row. Each is (3, height, width) float32,
-// value (byte - 127.5) / 127.5, i.e. rescale by 1/255 then mean 0.5 and std 0.5 (preprocessor_config.json).
+// value (byte - 127.5) / 127.5, i.e. rescale by 1/255 then mean 0.5 and std 0.5 (preprocessor_config.json), the same
+// for all three channels. Input and planes are in R, G, B order: byte 0 is exactly -1, byte 255 exactly +1.
 //
 // The resize is bicubic with antialiasing on BYTES, and it is torch's, bit for bit: torch.nn.functional.interpolate(
 // uint8, mode="bicubic", antialias=True) at torch 2.13. That is integer arithmetic, so it can be exact, and three things

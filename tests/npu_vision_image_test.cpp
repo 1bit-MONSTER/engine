@@ -141,6 +141,31 @@ int main() {
             check(lo >= -1.0f && hi <= 1.0f && lo < -0.9f && hi > 0.9f, "values span [-1, 1]");
         }
     }
+    // The constants, on bytes whose answer is known without a reference: an image that is one colour, (0, 255, 128) in
+    // R, G, B order. Channel order, the 0..255 -> [-1, 1] range and the mean/std all show here: a swapped channel
+    // moves the planes, a 0..1 range leaves every value near -1, and a 1/128 divisor misses +1.
+    {
+        std::vector<uint8_t> in(size_t(60) * 90 * 3);
+        for (size_t i = 0; i < in.size(); i += 3) { in[i] = 0; in[i + 1] = 255; in[i + 2] = 128; }
+        const std::vector<uint8_t> big = vis::resize_bicubic_u8(in.data(), 60, 90, 448, 672);
+        bool flat = true;
+        for (size_t i = 0; i < big.size(); i += 3) flat = flat && big[i] == 0 && big[i + 1] == 255 && big[i + 2] == 128;
+        check(flat, "a one-colour image is the same colour after the resize, every byte");
+        const vis::ImagePlan plan = vis::plan_image(60, 90);
+        const std::vector<vis::Piece> pieces = vis::preprocess(in.data(), 60, 90, plan);
+        bool r = !pieces.empty(), g = r, b = r;
+        if (!pieces.empty()) {
+            const size_t plane = pieces[0].pixels.size() / 3;
+            for (size_t i = 0; i < plane; ++i) {
+                r = r && pieces[0].pixels[i] == -1.0f;
+                g = g && pieces[0].pixels[plane + i] == 1.0f;
+                b = b && pieces[0].pixels[2 * plane + i] == (128.0f - 127.5f) / 127.5f;
+            }
+        }
+        check(r, "plane 0 is red: byte 0 is exactly -1");
+        check(g, "plane 1 is green: byte 255 is exactly +1");
+        check(b, "plane 2 is blue: byte 128 is 0.5 / 127.5");
+    }
     // a small image: scaled up to one 448 x 448 view, no slices
     {
         const std::vector<uint8_t> in = image(100, 100);

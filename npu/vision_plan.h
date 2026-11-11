@@ -29,6 +29,15 @@
 //   - an image that is not sliced is scaled UP to the resolution; one that is sliced has its whole view scaled down only.
 // (The per-slice size, refine / grid, is an exact division: the refine size was just rounded to a multiple of the grid.)
 // tests/npu_vision_plan_test.cpp holds that implementation's answers for 3,481 image sizes.
+//
+// Two properties a caller may rely on, both tested:
+//   - NOTHING IS CROPPED OR PADDED. No image size is refused for not being a multiple of anything: every size is
+//     resized, whole, to sizes that are multiples of 4 patches, and the slices tile the refine size with no remainder.
+//     The aspect ratio therefore moves a little (385 x 384 becomes 448 x 448); that is the model's own behaviour.
+//   - this header touches no file, no pixel and no platform: sizes in, sizes out. Keep it that way; it is what lets the
+//     plan be checked anywhere.
+// It does not bound the result. A very long strip gives the reference's answer, which can be a piece hundreds of
+// thousands of pixels long: the caller decides how many rows (total_rows()) it will accept.
 #pragma once
 
 #include <cmath>

@@ -202,8 +202,22 @@ def main():
     # below stands in for a box that exposes nothing.
     box = bench.box_conditions()
     assert box["tctl_c"] is None or 20.0 < box["tctl_c"] < 120.0, box
-    assert box["gtt_used_gib"] is not None and box["gtt_total_gib"] is not None, box
-    assert 0.0 <= box["gtt_used_gib"] <= box["gtt_total_gib"], box
+    # The GTT counters exist only where amdgpu does. On such a box every one must come back a number; CI's build job
+    # runs in a GPU-less container (engine#2018: this is why the test had no ctest row), where they must be null.
+    if (bench.GPU_SYSFS / "mem_info_gtt_used").exists():
+        assert box["gtt_used_gib"] is not None and box["gtt_total_gib"] is not None, box
+        assert 0.0 <= box["gtt_used_gib"] <= box["gtt_total_gib"], box
+    else:
+        assert box["gtt_used_gib"] is None and box["gtt_total_gib"] is None, box
+    # ...and the GPU-less branch runs everywhere, not only in CI: a root with no counters is a null, never a zero.
+    real_sysfs = bench.GPU_SYSFS
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench.GPU_SYSFS = pathlib.Path(tmp)
+            nogpu = bench.box_conditions()
+            assert nogpu["gtt_used_gib"] is None and nogpu["gtt_total_gib"] is None, nogpu
+    finally:
+        bench.GPU_SYSFS = real_sysfs
     assert box["mem_available_gib"] is not None and box["mem_available_gib"] > 0, box
     # The hwmon channel is found by label, not by a hardcoded index: the k10temp Tctl has come back as
     # hwmon2 and as hwmon4 across six reboots in three days. A root with no Tctl label yields null.

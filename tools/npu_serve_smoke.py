@@ -26,9 +26,11 @@ the fallback fails, as ~/briefs/DEMO-SMOKE.md specified them:
 
   npu-hold -l npu-smoke -t 10 -- tools/npu_serve_smoke.py --bin <1bit> --model <model dir> [--out <dir>]
 
-It starts the serve, waits for it, sends three prompts with thinking off, stops the serve, and prints one line per
-assertion and `RESULT: PASS` or `RESULT: FAIL` (exit 0 / 1). It takes no device ticket itself: run it under npu-hold,
-so the serve ends with the ticket. Logs go to --out (default ~/.cache/1bit/npu-serve-smoke), never to /tmp.
+It starts the serve, waits for it, sends --replies requests (default 3) with thinking off, stops the serve, and prints
+one line per assertion and `RESULT: PASS` or `RESULT: FAIL` (exit 0 / 1). It takes no device ticket itself: run it
+under npu-hold. The serve ends with this script however the script ends: a TERM, HUP or INT stops the serve first
+(exit 128 + signal), and the kernel TERMs the serve if the script is killed outright. Logs go to --out (default
+~/.cache/1bit/npu-serve-smoke), never to /tmp.
 
   tools/npu_serve_smoke.py --self-test       the judging on recorded shapes of each failure; no device, no binary
   tools/npu_serve_smoke.py --judge <dir>     judge a finished run's serve.log and reply_*.json again
@@ -125,14 +127,33 @@ def report(verdicts):
     return 0 if ok else 1
 
 
+def die_with_parent():
+    """In the serve's process, before exec: ask the kernel to TERM it if this script dies, however it dies."""
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+    if os.getppid() == 1:   # the script was already gone when this ran
+        os._exit(1)
+
+
 def run(args):
+    # A ticket that ends TERMs this script, not the serve (the serve is this script's child, and in the gate a flock
+    # sits between the ticket and the script). Python's default action for SIGTERM ends the process without running
+    # `finally`, which is the only code that stops the serve -- so a hung run would leave `1bit serve` holding the NPU
+    # after its ticket (review of #2125). The handlers turn the signal into SystemExit, which unwinds through it.
+    def stop(signum, _frame):
+        sys.exit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, stop)
     out = os.path.expanduser(args.out)
     os.makedirs(out, exist_ok=True)
     log_path = os.path.join(out, "serve.log")
     cmd = [args.bin, "serve", "-m", args.model, "--device", "npu", "--host", "127.0.0.1", "-p", str(args.port)]
     replies = []
     with open(log_path, "wb") as log:
-        serve = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+        serve = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, preexec_fn=die_with_parent)
         try:
             deadline = time.time() + args.ready_seconds
             ready = False
@@ -145,7 +166,8 @@ def run(args):
                 except OSError:
                     time.sleep(0.5)
             if ready:
-                for i, prompt in enumerate(PROMPTS):
+                for i in range(args.replies):
+                    prompt = PROMPTS[i % len(PROMPTS)]
                     body = json.dumps({"model": "m", "max_tokens": args.max_tokens, "temperature": 0,
                                        "chat_template_kwargs": {"enable_thinking": False},
                                        "messages": [{"role": "user", "content": prompt}]}).encode()
@@ -186,6 +208,107 @@ def rejudge(args):
             replies.append(json.load(f))
         i += 1
     return report(judge(log_text, replies, args.floor, args.first_token_ms, args.fast_route, args.slow_route))
+
+
+FAKE_SERVE = r'''#!/usr/bin/env python3
+# A stand-in for `1bit serve`, written by npu_serve_smoke.py --self-test: it prints a route line, answers /health and
+# /v1/chat/completions with the timings FAKE_TPS gives, and exits on SIGTERM. FAKE_MODE=dead exits before listening.
+import http.server, json, os, signal, sys
+port = int(sys.argv[sys.argv.index("-p") + 1])
+mode, tps = os.environ.get("FAKE_MODE", "fast"), float(os.environ.get("FAKE_TPS", "90"))
+if mode == "dead":
+    print("1bit serve: cannot open the device", flush=True); sys.exit(3)
+print("1bit unified: on the private route dx: dense Qwen3 on the dx kernels" if mode in ("fast", "stall") else
+      "1bit serve: a model-generic container: serving it through the per-op forward", flush=True)
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _send(self, obj):
+        b = json.dumps(obj).encode(); self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_GET(self): self._send({"status": "ok"})
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if mode == "stall":
+            open(os.environ["FAKE_MARK"] + ".asked", "w").write("asked")
+            import time; time.sleep(600)
+        self._send({"choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Paris."}}],
+                    "timings": {"prompt_ms": 200.0 if mode == "fast" else 1100.0, "predicted_ms": 1000.0 * 8 / tps, "predicted_per_second": tps},
+                    "usage": {"completion_tokens": 8}})
+srv = http.server.HTTPServer(("127.0.0.1", port), H)
+def bye(*a):
+    if os.environ.get("FAKE_MARK"): open(os.environ["FAKE_MARK"], "w").write("terminated")
+    os._exit(0)
+signal.signal(signal.SIGTERM, bye)
+srv.serve_forever()
+'''
+
+
+def self_test_run(fails):
+    """run() end to end against the stand-in: it starts the serve, waits, asks, stops it, and returns the verdict."""
+    import contextlib
+    import io
+    import shutil
+    import socket
+    import tempfile
+    d = tempfile.mkdtemp(prefix="npu_serve_smoke_selftest.", dir=os.getcwd())   # the working directory, not /tmp
+    try:
+        fake = os.path.join(d, "fake1bit")
+        with open(fake, "w") as f:
+            f.write(FAKE_SERVE)
+        os.chmod(fake, 0o700)
+        for mode, tps, want_exit, want_line in (("fast", "90", 0, "RESULT: PASS"), ("slow", "1.9", 1, "route        FAIL"),
+                                                ("dead", "90", 1, "it never became ready")):
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            mark = os.path.join(d, "mark." + mode)
+            os.environ.update(FAKE_MODE=mode, FAKE_TPS=tps, FAKE_MARK=mark)
+            args = argparse.Namespace(bin=fake, model="model-dir", out=os.path.join(d, mode), port=port, floor=60.0, first_token_ms=600.0,
+                                      fast_route=FAST_ROUTE, slow_route=SLOW_ROUTE, max_tokens=8, ready_seconds=5 if mode == "dead" else 30,
+                                      request_seconds=30, replies=3)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run(args)
+            text = buf.getvalue()
+            if rc != want_exit or want_line not in text:
+                fails.append("run() against a %s stand-in: exit %d, output %r" % (mode, rc, text[-300:]))
+            if mode != "dead" and not os.path.exists(mark):
+                fails.append("run() against a %s stand-in left the serve running (no SIGTERM seen)" % mode)
+            if mode == "fast" and not os.path.exists(os.path.join(d, mode, "reply_2.json")):
+                fails.append("run() did not keep the three replies")
+        # The ticket-ends case: this script is TERMed while a request hangs. The serve must be stopped too, and the
+        # script must exit 128 + SIGTERM. Run as a real process, because the signal's default action is the bug.
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        mark = os.path.join(d, "mark.stall")
+        env = dict(os.environ, FAKE_MODE="stall", FAKE_TPS="90", FAKE_MARK=mark)
+        tool = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--bin", fake, "--model", "model-dir", "--out",
+                                 os.path.join(d, "stall"), "--port", str(port), "--request-seconds", "300"],
+                                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 30
+        while time.time() < deadline and not os.path.exists(mark + ".asked"):
+            time.sleep(0.1)
+        if not os.path.exists(mark + ".asked"):
+            fails.append("the stalling stand-in was never asked (the run did not reach its first request)")
+        tool.send_signal(signal.SIGTERM)
+        try:
+            rc = tool.wait(timeout=40)
+        except subprocess.TimeoutExpired:
+            tool.kill()
+            rc = None
+        if rc != 128 + signal.SIGTERM:
+            fails.append("a TERMed run exits %r, want %d" % (rc, 128 + signal.SIGTERM))
+        deadline = time.time() + 10
+        while time.time() < deadline and not os.path.exists(mark):
+            time.sleep(0.1)
+        if not os.path.exists(mark):
+            fails.append("a TERMed run left the serve running: the stand-in never saw its SIGTERM")
+    finally:
+        for k in ("FAKE_MODE", "FAKE_TPS", "FAKE_MARK"):
+            os.environ.pop(k, None)
+        subprocess.run(["pkill", "-f", fake], check=False)   # nothing of this test's may outlive it, whatever failed
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def self_test():
@@ -245,9 +368,11 @@ def self_test():
     if not degenerate("//////") or degenerate("391") or degenerate("aa") or not degenerate("a a a a"):
         fails.append("degenerate(): wrong on a fixture")
 
+    self_test_run(fails)
     for f in fails:
         print("FAIL " + f)
-    print("npu_serve_smoke self-test: %d case(s) failed" % len(fails) if fails else "npu_serve_smoke self-test: 16 cases ok")
+    print("npu_serve_smoke self-test: %d case(s) failed" % len(fails) if fails
+          else "npu_serve_smoke self-test: 16 judging cases, 3 runs against a stand-in serve and a TERM mid-request ok")
     return 1 if fails else 0
 
 
@@ -255,6 +380,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--judge", metavar="DIR")
+    p.add_argument("--write-stand-in", metavar="PATH", help="write the self-test's stand-in serve to PATH (for testing a caller)")
     p.add_argument("--bin")
     p.add_argument("--model")
     p.add_argument("--out", default="~/.cache/1bit/npu-serve-smoke")
@@ -264,9 +390,15 @@ def main():
     p.add_argument("--fast-route", default=FAST_ROUTE, help="the text the serve log prints on the fast route")
     p.add_argument("--slow-route", default=SLOW_ROUTE, help="the text the serve log prints on the slow route")
     p.add_argument("--max-tokens", type=int, default=96)
+    p.add_argument("--replies", type=int, default=3, help="how many requests to send (the three prompts, repeated); the rate is their median")
     p.add_argument("--ready-seconds", type=int, default=120)
     p.add_argument("--request-seconds", type=int, default=120)
     a = p.parse_args()
+    if a.write_stand_in:
+        with open(a.write_stand_in, "w") as f:
+            f.write(FAKE_SERVE)
+        os.chmod(a.write_stand_in, 0o700)
+        return 0
     if a.self_test:
         return self_test()
     if a.judge:

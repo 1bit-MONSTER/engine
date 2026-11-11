@@ -61,6 +61,31 @@ inline std::string chatml(const nlohmann::json& messages, bool thinking = true) 
     return p;
 }
 
+// The messages a chat route renders to find where a request's system turn ends (--prefix-pin, engine#1785): the
+// request's leading system messages, then one user message whose text no question starts with.  The rendering of
+// these and the rendering of the real request agree up to the first token of the user's text and differ there, so
+// their common prefix is the part every question under this system prompt shares.
+//
+// The user message is there because a template may refuse to render without one.  Measured: the Qwen3.5 template
+// rendered alone on its system message throws, and the early pin was silently not made on that container.
+//
+// Empty array when the request does not open with a system message: there is nothing to pin early.
+template <typename Json>
+Json pin_probe_messages(const Json& messages) {
+    Json lead = Json::array();
+    if (!messages.is_array()) return lead;
+    for (const auto& m : messages) {
+        if (!m.is_object() || !m.contains("role") || !m["role"].is_string() || m["role"].template get<std::string>() != "system") break;
+        lead.push_back(m);
+    }
+    if (lead.empty()) return lead;
+    Json probe = Json::object();
+    probe["role"] = "user";
+    probe["content"] = "\xC2\xA4\xC2\xA4 pin probe \xC2\xA4\xC2\xA4";
+    lead.push_back(probe);
+    return lead;
+}
+
 // Whether the container's tokenizer can represent the prompt above.  `chatml()` is rendered for
 // every container (#832), and a tokenizer without the anchors spells `<|im_start|>` as ordinary
 // pieces, so the model is prompted with text its own template never produces (#963: on

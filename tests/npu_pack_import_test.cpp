@@ -44,6 +44,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <thread>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -836,6 +838,102 @@ void test_external_import_success(const std::string& root) {
 // "<tensor>.qweight.empty: no data", which reports a placeholder as though the bytes were absent rather than elsewhere.
 // Crafted, so this needs no 1.9 pack: a graph with one resolvable tensor, one MatMulNBits whose qweight input is a
 // `.empty` placeholder with no sibling, and a model.bin next to it.
+// engine#1985: the canonical copy lives at a path every import of the same pack shares, and it used to be written in place.
+// A second import that started mid-write saw a short file, truncated it and wrote again, and the first then read its own
+// copy while it was being refilled: Qwen3-1.7B came back with 280 refused tensors and exit 0 in 4 of 24 runs of three
+// imports 0.15 s apart. The arms: the bytes arrive and no temporary file stays; a failed write leaves nothing; the
+// temporary name is out of reach of another import's prefix sweep and inside the age sweep; and the race itself, with
+// threads doing what an import does (reuse the copy if it is complete, else write it, then read it).
+void test_write_canonical_copy() {
+    const fs::path dir = fs::temp_directory_path() / ("1bit-atomic-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    const std::string prefix = "1bit-fconst19v1-7-2048-16-28-";
+    const std::string name = prefix + "957724736-1234.fconst";
+    const std::string work = (dir / name).string();
+    const size_t n = size_t(4) << 20;
+    std::vector<uint8_t> body(n);
+    for (size_t i = 0; i < n; ++i) body[i] = uint8_t((i * 2654435761u) >> 24) | 1;   // never 0: a refilled hole reads as 0
+    auto same = [&](const std::string& f) {
+        std::ifstream is(f, std::ios::binary);
+        if (!is) return false;
+        std::vector<uint8_t> got(n + 1);
+        is.read(reinterpret_cast<char*>(got.data()), std::streamsize(got.size()));
+        return size_t(is.gcount()) == n && std::memcmp(got.data(), body.data(), n) == 0;
+    };
+    auto entries = [&] {
+        int k = 0;
+        for (const auto& e : fs::directory_iterator(dir)) { (void)e; ++k; }
+        return k;
+    };
+
+    pi::write_canonical_copy(work, body.data(), n);
+    check(same(work), "atomic copy: the bytes written are the bytes at the path");
+    check(entries() == 1, "atomic copy: no temporary file is left beside the copy");
+    std::vector<uint8_t> other(body);
+    other[n / 2] ^= 0xff;
+    pi::write_canonical_copy(work, other.data(), n);
+    check(!same(work) && entries() == 1, "atomic copy: a second write replaces the copy, again leaving one file");
+    pi::write_canonical_copy(work, body.data(), n);
+
+    bool threw = false;
+    try {
+        pi::write_canonical_copy((dir / "no-such-dir" / name).string(), body.data(), n);
+    } catch (const std::runtime_error&) { threw = true; }
+    check(threw && entries() == 1, "atomic copy: a copy that cannot be written throws and leaves nothing behind");
+
+    // the temporary name: beside the copy, not the copy, unique per call, invisible to the prefix sweep, visible to the age sweep
+    const std::string t1 = pi::canonical_copy_temp_name(work), t2 = pi::canonical_copy_temp_name(work);
+    const std::string b1 = fs::path(t1).filename().string();
+    check(fs::path(t1).parent_path() == fs::path(work).parent_path(), "atomic copy: the temporary file is in the copy's directory");
+    check(t1 != work && t1 != t2, "atomic copy: the temporary name is not the copy's and is new on every call");
+    check(b1.compare(0, prefix.size(), prefix) != 0 && b1.compare(0, 13, "1bit-fconst19") == 0,
+          "atomic copy: the temporary name starts with the scratch stem and not with the pack's prefix");
+    { std::ofstream o(t1, std::ios::binary); o << "being written"; }
+    pi::evict_stale_canonical_copies(dir.string(), name, prefix, std::string(), 3600);
+    check(fs::exists(t1) && fs::exists(work), "atomic copy: another import's sweep does not remove a copy that is being written");
+    fs::last_write_time(t1, fs::file_time_type::clock::now() - std::chrono::hours(2));
+    pi::evict_stale_canonical_copies(dir.string(), name, prefix, std::string(), 3600);
+    check(!fs::exists(t1) && fs::exists(work), "atomic copy: a temporary file a killed run left is removed by the age rule");
+
+    // the race: every thread is an import. It reuses a complete-length copy or writes one, then reads the path, as
+    // canonical_token_fconst()'s caller does. One thread also removes the copy now and then, so the cycle restarts.
+    fs::remove(work, ec);
+    std::atomic<int> bad{0}, read_ok{0}, wrote{0};
+    auto importer = [&](int id) {
+        for (int r = 0; r < 24; ++r) {
+            if (!pi::canonical_copy_reusable(work, int64_t(n))) {
+                try { pi::write_canonical_copy(work, body.data(), n); ++wrote; } catch (const std::runtime_error&) { ++bad; }
+            }
+            std::error_code e2;
+            // An open that fails is the remover having been there, not a bad copy; a copy that OPENS must be whole.
+            if (std::ifstream(work, std::ios::binary).good()) {
+                std::ifstream is(work, std::ios::binary);
+                std::vector<uint8_t> got(n + 1);
+                if (is) {
+                    is.read(reinterpret_cast<char*>(got.data()), std::streamsize(got.size()));
+                    if (size_t(is.gcount()) == n && std::memcmp(got.data(), body.data(), n) == 0) ++read_ok;
+                    else ++bad;
+                }
+            }
+            if (id == 0 && r % 4 == 3) fs::remove(work, e2);
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int i = 0; i < 6; ++i) pool.emplace_back(importer, i);
+    for (auto& t : pool) t.join();
+    check(bad.load() == 0, "atomic copy: no import ever reads a copy another import is still writing (engine#1985)");
+    check(read_ok.load() > 0 && wrote.load() > 1, "atomic copy: the race arm really wrote more than once and read copies back");
+    int leftover = 0;
+    for (const auto& e : fs::directory_iterator(dir))
+        if (e.path().filename().string() != name) ++leftover;
+    check(leftover == 0, "atomic copy: the race leaves no temporary files");
+    fs::remove_all(dir, ec);
+    std::printf("  atomic canonical copy: 11 arms (bytes, replace, failed write, temporary name x4, %d racing writes / %d reads, no leftovers)\n",
+                wrote.load(), read_ok.load());
+}
+
 // engine#1662: the ~291 MB canonical Token .fconst rewrite is skipped when the copy on the scratch path already holds
 // exactly the bytes this run would write. The decision is a length test against a length that is a function of the source
 // alone, so what can go wrong is the test being too willing -- a truncated copy from an interrupted run, a leftover
@@ -4825,6 +4923,73 @@ void test_container_geometry() {
     }
 }
 
+// engine#1786 (item F1), slice 2: `plan()` reports WHERE a container's geometry came from. The three genres the census
+// measured are the three cases: `dims` answers (and beats a disagreeing config.json), config.json answers when there is
+// no `dims`, and neither answering is reported as unknown rather than as a zero geometry.
+void test_container_plan(const std::string& root) {
+    namespace fs = std::filesystem;
+    // Under ctest `root` is the source tree's tests/golden, so these three directories are removed on every way out:
+    // the arm is new, and leaving fixtures behind is the defect #2024 fixes for its neighbour -- not repeating it here.
+    struct Cleanup {
+        fs::path base;
+        ~Cleanup() {
+            for (const char* n : {"cg-dims", "cg-cfg", "cg-silent"}) {
+                std::error_code e;
+                fs::remove_all(base / n, e);
+            }
+        }
+    } cleanup{fs::path(root)};
+    const auto write_pack = [&](const std::string& name, const std::string& meta_json, const std::string& config) {
+        const fs::path dir = fs::path(root) / name;
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        std::string hdr = "{";
+        if (!meta_json.empty()) hdr += "\"__metadata__\":" + meta_json + ",";
+        hdr += "\"model.embed_tokens.weight\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[0,16]}}";
+        std::string out(8, '\0');
+        const int64_t n = int64_t(hdr.size());
+        for (int i = 0; i < 8; ++i) out[size_t(i)] = char((n >> (8 * i)) & 0xFF);
+        out += hdr;
+        out.append(16, '\x22');
+        std::ofstream(dir / "model.q4nx", std::ios::binary).write(out.data(), std::streamsize(out.size()));
+        if (!config.empty()) std::ofstream(dir / "config.json") << config;
+        return dir.string();
+    };
+    const std::string dims = "{\"dims\":{\"hidden_size\":576,\"intermediate_size\":1536,\"num_hidden_layers\":30,"
+                             "\"num_attention_heads\":9,\"num_key_value_heads\":3,\"vocab_size\":49152,"
+                             "\"head_dim\":64,\"rope_theta\":10000.0,\"model_type\":\"llama\"}}";
+
+    // 1. self-describing, and a config.json that disagrees: the container's own statement wins and is named.
+    {
+        const auto pl = pi::plan(write_pack("cg-dims", dims, "{\"hidden_size\": 1024}"));
+        check(pl.container_geometry_source == "dims", "plan: a self-describing container reports source=dims");
+        check(pl.dims.hidden == 576, "plan: dims.hidden comes from the container, not the disagreeing config.json");
+        check(pl.dims.layers == 30 && pl.dims.vocab == 49152, "plan: the container's geometry reaches the plan");
+        check(pl.container_geometry_missing.empty(), "plan: nothing is reported missing for a complete container");
+        check(pl.container_note.find("geometry from dims") != std::string::npos,
+              "plan: the note says which source answered");
+    }
+    // 2. gguf-converted: no dims, so config.json answers -- and the source says so.
+    {
+        const auto pl = pi::plan(write_pack("cg-cfg", "{\"converter\":\"tools/gguf_to_q4nx.py\"}",
+                                           "{\"hidden_size\":1024,\"num_hidden_layers\":28,"
+                                           "\"num_attention_heads\":16,\"num_key_value_heads\":8,"
+                                           "\"vocab_size\":151936,\"intermediate_size\":3072,"
+                                           "\"head_dim\":64,\"rope_theta\":1000000.0}"));
+        check(pl.container_geometry_source == "config.json", "plan: a converted container reports source=config.json");
+        check(pl.dims.hidden == 1024 && pl.dims.layers == 28, "plan: config.json supplies the geometry");
+    }
+    // 3. silent: neither answers, so the plan says the geometry is unknown instead of reporting zeros as facts.
+    {
+        const auto pl = pi::plan(write_pack("cg-silent", "", ""));
+        check(pl.container_geometry_source.empty(), "plan: the silent genre claims no source");
+        check(pl.container_geometry_missing.size() == 8, "plan: every required field is reported missing, by name");
+        check(pl.container_note.find("geometry is not known here") != std::string::npos,
+              "plan: the note says the geometry is unknown rather than printing a zero geometry");
+    }
+}
+
 // engine#1786 (item F1): an NPU2 model source is a safetensors container, and this is the reader that decides whether
 // a pack is that genre. The failure that matters is the silent one -- a wrong header length yields an empty inventory,
 // which reads as "a pack with no tensors" rather than "a malformed header" -- so each arm asserts the reason, not just
@@ -5623,6 +5788,7 @@ int main(int argc, char** argv) {
     test_external_container_names();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
     test_external_import_success(golden_dir.empty() ? "." : golden_dir);
+        test_write_canonical_copy();
         test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
         test_sweep_fconst_scratch_dirs();
         test_sweep_is_wired(golden_dir.empty() ? "." : golden_dir);
@@ -5640,6 +5806,7 @@ int main(int argc, char** argv) {
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
+        test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);
         test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);

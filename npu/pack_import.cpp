@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <memory>
 #include <functional>
@@ -32,6 +33,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace onebit::npu::pack_import {
 namespace {
@@ -782,12 +784,8 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
     }
     out.insert(out.end(), fc.map + tail_off, fc.map + fc.size);
     unmap_file(fc.map, fc.size);
-    {
-        std::ofstream os(work, std::ios::binary | std::ios::trunc);
-        if (!os) throw std::runtime_error(work + ": cannot write the canonical copy of the 1.9 .fconst");
-        os.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
-        if (!os) throw std::runtime_error(work + ": short write of the canonical copy of the 1.9 .fconst");
-    }
+    // engine#1985: never in place. The path is shared by every import of this pack on the box, see write_canonical_copy().
+    write_canonical_copy(work, out.data(), out.size());
     return work;
 }
 
@@ -3415,6 +3413,14 @@ ContainerGeometry container_geometry(const json& meta, const json& config) {
     return g;
 }
 
+AttnFirstTiles attn_first_tiles(int n_kv, int n_q, bool q_first) {
+    AttnFirstTiles f;
+    f.k = q_first ? n_q : 0;
+    f.q = q_first ? 0 : n_kv;
+    f.v = n_kv + n_q;
+    return f;
+}
+
 std::string qk_norm_refusal(bool declared, bool found) {
     if (declared && !found)
         return "this pack declares use_qk_norm and its per-head q/k gains are not where the block layout says "
@@ -3441,11 +3447,33 @@ Plan plan(const std::string& pack_dir) {
             p.container_tensors = int64_t(c.tensors.size());
             p.container_payload_bytes = c.payload_bytes;
             for (const auto& t : c.tensors) p.container_dtypes[t.dtype]++;
+            // slice 2: the geometry, and the name of the source that answered. config.json is read through the ordinary
+            // loader so this genre and every other one agree about what config.json means (text_config lift, top-level
+            // wins) -- the container's own `dims` still takes precedence in container_geometry().
+            std::string cfg_source;
+            const json cfg = load_geometry(pack_dir, &cfg_source);
+            const ContainerGeometry g = container_geometry(c.meta, cfg);
+            p.dims = g.dims;
+            p.container_geometry_source = g.source;
+            p.container_geometry_missing = g.missing;
+            p.container_geometry_inferred = g.inferred;
+            std::string geom = g.source.empty()
+                ? "the container declares no `dims` and no config.json answered, so its geometry is not known here"
+                : "geometry from " + g.source;
+            if (!g.inferred.empty()) {
+                geom += " (";
+                for (size_t i = 0; i < g.inferred.size(); ++i) geom += (i ? ", " : "") + g.inferred[i];
+                geom += " inferred)";
+            }
+            if (!g.missing.empty()) {
+                geom += "; no source states ";
+                for (size_t i = 0; i < g.missing.size(); ++i) geom += (i ? ", " : "") + g.missing[i];
+            }
             p.container_note = c.why.empty()
                 ? "the pack is a safetensors container (model.q4nx): " + std::to_string(c.tensors.size()) +
-                      " tensors, " + std::to_string(c.payload_bytes) + " B of payload, no graph. Reading it as a"
-                      " weights source needs the container-genre plan (engine#1786, item F1); until then this pack is"
-                      " recognised and reported, not importable."
+                      " tensors, " + std::to_string(c.payload_bytes) + " B of payload, no graph; " + geom +
+                      ". Reading it as a weights source needs the container-genre plan (engine#1786, item F1); until"
+                      " then this pack is recognised and reported, not importable."
                 : "model.q4nx is present but unreadable: " + c.why;
             return p;
         }
@@ -6241,6 +6269,47 @@ int run(int argc, char** argv) {
     return 0;
 }
 
+
+// engine#1985: the temporary name a canonical copy is written under before it is renamed onto `work`. Same directory
+// (rename is only atomic inside one filesystem). The name starts with the scratch stem `1bit-fconst19`, so the age rule
+// of evict_stale_canonical_copies() removes one a killed run left behind, and continues with `tmp-`, so it can never
+// match a pack's `1bit-fconst19v<n>-...` prefix: another import's sweep must not delete a copy that is being written.
+std::string canonical_copy_temp_name(const std::string& work) {
+    static std::atomic<unsigned> serial{0};
+    const fs::path p(work);
+    const std::string base = "1bit-fconst19tmp-" + std::to_string(static_cast<long>(::getpid())) + "-" +
+                             std::to_string(serial.fetch_add(1)) + "-" + p.filename().string();
+    return (p.parent_path() / base).string();
+}
+
+// engine#1985: write the canonical copy under a private name and rename it onto `work`. The copy used to be written in
+// place with O_TRUNC, at a path every import of the same pack shares, and reuse is decided by length -- so a second
+// import that started while the first was still writing saw a short file, truncated it and began again, and the first
+// then read its own copy while it was being refilled. Measured on Qwen3-1.7B with three imports 0.15 s apart: 4 of 24
+// runs read "0 in-block offsets", refused all 280 attention tensors and exited 0, on a pack a lone import reads with 0
+// gaps. With a rename a reader finds no copy or a complete one, and two writers each install the same bytes.
+void write_canonical_copy(const std::string& work, const uint8_t* data, size_t len) {
+    const std::string tmp = canonical_copy_temp_name(work);
+    {
+        std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+        if (!os) throw std::runtime_error(tmp + ": cannot write the canonical copy of the 1.9 .fconst");
+        os.write(reinterpret_cast<const char*>(data), std::streamsize(len));
+        os.flush();
+        if (!os) {
+            os.close();
+            std::error_code rm;
+            fs::remove(tmp, rm);
+            throw std::runtime_error(tmp + ": short write of the canonical copy of the 1.9 .fconst");
+        }
+    }
+    std::error_code ec;
+    fs::rename(tmp, work, ec);
+    if (ec) {
+        std::error_code rm;
+        fs::remove(tmp, rm);
+        throw std::runtime_error(work + ": cannot move the canonical copy of the 1.9 .fconst into place (" + ec.message() + ")");
+    }
+}
 
 // Public (engine#1662): see the declaration in pack_import.h. Lives outside the anonymous namespace because the test
 // calls it directly with crafted files, so the decision that guards a ~291 MB rewrite is pinned without a 1.9 pack.

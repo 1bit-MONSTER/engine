@@ -1075,3 +1075,15 @@ which are retried on every run; and the `!! FLM` lines. Those keep the 2026-11-0
 and `smolvla` as above, and `!! NPU FLM` is engine #588. This run's issue window also includes the `gpt-oss`
 (`GPT-OSS-20B`, `GPT-OSS-Safeguard-20b`) and `lfm2` (`LFM2-1.2B`, `LFM2-2.6B`) Q4NX packs. Their mapping is HRX-only
 too, so they belong to #588, not to a registry edit.
+
+## 2026-11-10: `DeepseekV4FlashSuperExpertForCausalLM` — reviewed, and recorded here
+
+Found by the check this page's contract implies and `tests/census_watch_test.py` now enforces: every class in
+`registry/significant.json` has to be cited here, and this one was added there (engine#1922) without a row, so it was
+the single undocumented entry out of 37.
+
+* `DeepseekV4FlashSuperExpertForCausalLM` (`model_type` `deepseek_v4_flash_superexpert`) — DeepSeek V4.1 Flash
+  SuperExpert, **published as remote code and with AW-SECD-compressed weights** (8.5 GB, claimed 0.962 retention);
+  MLA-style geometry (`kv_lora_rank` 512, `q_lora_rank` 1536, `qk_rope_head_dim` 64, `v_head_dim` 128, 32 heads /
+  16 KV, IM 4096). **Not an alias of `deepseek_v41`**: nothing at the pin decodes AW-SECD weights, so mapping it to
+  that architecture would name a backend that cannot read the file. Reported, not alerted (`"watch": "report"`).

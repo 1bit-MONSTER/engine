@@ -35,7 +35,7 @@
 //     "model":   {"hidden": 1024, "layers": 28, "arch": "qwen3"},
 //     "container": {"layout": "rm"|"b8"|"pb16i"|"t2s", "chunk_kind": "mode0|mode1|mode2|pb16i", "pb16i": false},
 //     "fusion":  {"gate_up": "fused"|"split"},
-//     "prefill": {"M": 128},
+//     "prefill": {"M": 128},                       (+ optional "sealed_elf", "sealed_rows": a wide family)
 //     "decode":  {"M": 16, "enabled": true, "sealed_elf": "",
 //                 "dirs": [{"root": "model", "path": "kernels-m16"},
 //                          {"root": "kernels", "path": "m16"},
@@ -205,7 +205,26 @@ struct Plan {
     // relative directory under it ("." = that directory itself).
     struct DecodeDir { bool under_model = false; std::string path; };
     std::vector<DecodeDir> decode_dirs;
+    // decode_dirs as the paths to search, in the plan's order: each entry under the model directory or the
+    // kernel directory it names. Empty when the plan names none (or is not loaded), which is the caller's cue
+    // to fall back to its built-in places. One function, because the projections' decode twins and the lm-head's
+    // have to be looked for in the same list (engine#910), and the list was once built in a block that a move
+    // took away, leaving every caller on the built-in places with no error (engine#1984 review).
+    std::vector<std::string> resolved_decode_dirs(const std::string& model_dir, const std::string& kernels_dir) const {
+        std::vector<std::string> out;
+        if (!loaded()) return out;
+        for (const DecodeDir& d : decode_dirs) out.push_back((d.under_model ? model_dir : kernels_dir) + "/" + d.path);
+        return out;
+    }
     std::string sealed_elf;                // pb16i: one sealed ELF, per-role instance names
+    // engine#1990: an optional wide prefill family -- a second sealed ELF with the same instances built for
+    // `sealed_wide_rows` rows per launch. Empty = none; the decode family then also runs prefill chunks.
+    std::string sealed_wide_elf;
+    int sealed_wide_rows = 0;
+    // engine#2073: an optional narrow decode family -- the same instances built for FEWER rows, taken by launches
+    // of 1..`sealed_narrow_rows` rows (a decode step carries one). Empty = none.
+    std::string sealed_narrow_elf;
+    int sealed_narrow_rows = 0;
     struct { bool enabled = false; int K = 0, N = 0; } moe_batched_gu;
     std::vector<LayerPlan> layer_plans;
 
@@ -306,7 +325,13 @@ struct Plan {
                 throw PlanError("plan: " + path + " fusion.gate_up \"" + gu +
                                 "\" is not fused or split");
         }
-        if (j.contains("prefill")) p.prefill_m = positive_or_zero(obj(j, "prefill", path), "M", path);
+        if (j.contains("prefill")) {
+            const auto& pf = obj(j, "prefill", path);
+            p.prefill_m = positive_or_zero(pf, "M", path);
+            // Optional: plans written before the wide family existed load and mean what they meant.
+            p.sealed_wide_elf = pf.value("sealed_elf", "");
+            if (pf.contains("sealed_rows")) p.sealed_wide_rows = positive_or_zero(pf, "sealed_rows", path);
+        }
         // Optional and defaulted on purpose: a plan written before this field existed must load and
         // mean exactly what it meant then (causal), so this is not a format bump.
         if (j.contains("attention")) {
@@ -518,6 +543,8 @@ struct Plan {
             p.decode_m = positive_or_zero(d, "M", path);
             p.decode_enabled = d.value("enabled", true);
             p.sealed_elf = d.value("sealed_elf", "");
+            p.sealed_narrow_elf = d.value("narrow_elf", "");
+            if (d.contains("narrow_rows")) p.sealed_narrow_rows = positive_or_zero(d, "narrow_rows", path);
             if (d.contains("dirs")) {
                 if (!d.at("dirs").is_array()) throw PlanError("plan: " + path + " decode.dirs must be an array");
                 for (const auto& one : d.at("dirs")) {
@@ -587,6 +614,36 @@ struct Plan {
                             "the decode roles run)");
         if (!p.pb16i && !p.sealed_elf.empty())
             throw PlanError("plan: " + path + " names decode.sealed_elf but container.pb16i is false");
+        // The wide family is the decode family's instances at another width, so it cannot exist without it, and
+        // its row count must be one a chunk can have: more than the 16 rows of the decode family, at most 128.
+        if (!p.sealed_wide_elf.empty()) {
+            if (p.sealed_elf.empty())
+                throw PlanError("plan: " + path + " names prefill.sealed_elf but decode.sealed_elf is empty (the "
+                                "wide family is the sealed decode set built for more rows)");
+            if (p.sealed_wide_elf.find('/') != std::string::npos || p.sealed_wide_elf.find("..") != std::string::npos)
+                throw PlanError("plan: " + path + " prefill.sealed_elf \"" + p.sealed_wide_elf +
+                                "\" must be a bare file name in the kernels directory");
+            if (p.sealed_wide_rows < 17 || p.sealed_wide_rows > 128)
+                throw PlanError("plan: " + path + " prefill.sealed_rows is " + std::to_string(p.sealed_wide_rows) +
+                                " but a wide family holds 17..128 rows");
+        } else if (p.sealed_wide_rows != 0) {
+            throw PlanError("plan: " + path + " states prefill.sealed_rows without prefill.sealed_elf");
+        }
+        // The narrow family: the same three conditions, with the row bound on the other side of 16.
+        if (!p.sealed_narrow_elf.empty()) {
+            if (p.sealed_elf.empty())
+                throw PlanError("plan: " + path + " names decode.narrow_elf but decode.sealed_elf is empty (the "
+                                "narrow family is the sealed decode set built for fewer rows)");
+            if (p.sealed_narrow_elf.find('/') != std::string::npos ||
+                p.sealed_narrow_elf.find("..") != std::string::npos)
+                throw PlanError("plan: " + path + " decode.narrow_elf \"" + p.sealed_narrow_elf +
+                                "\" must be a bare file name in the kernels directory");
+            if (p.sealed_narrow_rows < 1 || p.sealed_narrow_rows > 15)
+                throw PlanError("plan: " + path + " decode.narrow_rows is " + std::to_string(p.sealed_narrow_rows) +
+                                " but a narrow family holds 1..15 rows");
+        } else if (p.sealed_narrow_rows != 0) {
+            throw PlanError("plan: " + path + " states decode.narrow_rows without decode.narrow_elf");
+        }
         if (p.tag == "_b8" && p.layout != "b8")
             throw PlanError("plan: " + path + " kernels.tag is _b8 but container.layout is " + p.layout);
         if ((p.tag == "_t2s" || p.tag == "_t2s2") && p.layout != "t2s")

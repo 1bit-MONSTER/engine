@@ -124,6 +124,22 @@ int main(void) {
           "a substring match is quoted by name, so the container is refused instead of served");
     check(s.hybrid_layers == 4, "all four refused kinds count as hybrid, as any non-full layer does");
 
+    /* 6. LFM2 (Lfm2ForCausalLM): no layer_types at all (its hybrid is in full_attn_idxs and in the container's
+     * own tensors), q/k norms on its attention layers, and an epsilon spelled norm_eps. Served with qk_norm off
+     * and eps at the default it answered "France" to a question whose answer is "Paris". */
+    write_config(dir, "{\"architectures\": [\"Lfm2ForCausalLM\"], \"model_type\": \"lfm2\", \"num_hidden_layers\": 16, "
+                      "\"full_attn_idxs\": [2, 5, 8, 10, 12, 14], \"norm_eps\": 1e-05, \"block_norm_eps\": 1e-05, "
+                      "\"conv_L_cache\": 3, \"rope_theta\": 1000000.0}", cfg, sizeof cfg);
+    q4nx_semantics_from_config(cfg, dir, &s);
+    check(s.qk_norm == 1, "lfm2: per-head q/k RMSNorm is on");
+    check(s.eps > 0.9e-5f && s.eps < 1.1e-5f, "lfm2: epsilon is read from norm_eps when there is no rms_norm_eps");
+    check(s.n_layer_types == 0 && s.unknown_layer_type[0] == '\0', "lfm2: no layer_types, so nothing is refused here");
+    check(s.rmsnorm_offset == 0, "lfm2: plain x/rms * w norms");
+    write_config(dir, "{\"model_type\": \"llama\", \"num_hidden_layers\": 2, \"rms_norm_eps\": 1e-06, \"norm_eps\": 1e-05}", cfg, sizeof cfg);
+    q4nx_semantics_from_config(cfg, dir, &s);
+    check(s.qk_norm == 0, "llama: still no q/k norm");
+    check(s.eps > 0.9e-6f && s.eps < 1.1e-6f, "rms_norm_eps wins over norm_eps when a config has both");
+
     unlink(cfg);
     rmdir(dir);
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "passed", failures, failures == 1 ? "" : "s");

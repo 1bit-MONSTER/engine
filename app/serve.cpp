@@ -1151,7 +1151,16 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             // the experts stay file-backed: without these, llama.cpp copies every one into RAM
             // (a pinned host buffer, or a CPU repack), which is what streaming avoids
             // (per_layer_token_embd: Qwen3.8-Flash-Next's 26.8 GiB table, only ever row-gathered)
-            argv.insert(argv.end(), {"-ot", "exps=CPU,per_layer_token_embd=CPU", "--no-host", "--no-repack", "--load-mode", "mmap"});
+            argv.insert(argv.end(), {"-ot", "exps=CPU,per_layer_token_embd=CPU", "--no-host", "--no-repack"});
+            // engine#1668: `-lm none` is +17.5 % prefill at -1.6 % decode for ~604 MiB more GTT (docs/bench.md),
+            // and prefill is what a served model pays for TTFT -- but this site hard-coded `--load-mode mmap`,
+            // and an explicit flag beats the child's own LLAMA_ARG_LOAD_MODE, so the measured lever could not be
+            // selected in a server at all. Default unchanged (mmap when the operator has not asked for something
+            // else); setting LLAMA_ARG_LOAD_MODE=none in the environment now reaches the child, with the GTT cost
+            // that implies documented beside the measurement.
+            if (std::getenv("LLAMA_ARG_LOAD_MODE") == nullptr) {
+                argv.insert(argv.end(), {"--load-mode", "mmap"});
+            }
 #endif
         }
         if (device == "hrx") {
@@ -3171,11 +3180,12 @@ void usage(FILE* out) {
                  "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
                  "                  [--npu-streams N]   with --device npu: this serve is one of N sharing the NPU\n"
+                 "                  (default 1, the device exclusive; docs/npu.md)\n"
                  "                  [--prefix-slots N] [--prefix-cache-mb N] [--prefix-min-gain N]   the prompt prefix cache\n"
                  "                  (docs/npu.md; 0 slots turns it off). Unset keeps the forward's defaults: 8 / 4096 / 128\n"
                  "                  [--prefix-pin]   keep the part a request shares with the previous one (one system prompt, many questions)\n"
                  "                  [--flash]   with --device npu: the single-turn profile, --ctx-size 1024 plus --prefix-pin\n"
-                 "                  (default 1, the device exclusive; docs/npu.md)\n"
+                 "                  (a system turn shorter than --prefix-min-gain, 128 by default, is not pinned)\n"
                  "                  [--load-queue-ms N]   a load refused because another client holds the NPU array\n"
                  "                  waits at most N ms for it to free before the driver is called dead\n"
                  "                  (default 45000; 0 refuses at once; docs/npu.md)\n"

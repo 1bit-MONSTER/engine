@@ -113,8 +113,8 @@ numbers a demo HUD reads; every one was measured by serve or reported by the bac
   `args`. Linux only.
 - Laya's zero-shot answer to a new question is a starting point, not a measured router: the base
   checkpoints are near chance on decision types they were not tuned for (Laya's own README). The game
-  table's accuracy is measured below, and a fine-tune on the game's own logged decisions is the plan for
-  raising it (engine #1313).
+  table's accuracy is measured below, and a head-only fine-tune on the game's own logged decisions
+  (`tools/laya_finetune/`, below) raises its confidence on them (engine #1313).
 
 ## Measuring and fine-tuning the router
 
@@ -173,8 +173,51 @@ Measured on this box (`typed-decisions/`, the 20 game steps of the measurement b
 | a torch copy of the head over the dump | reproduces the engine's probabilities within 2.4e-7 (logits 1.3e-6) on all 40 |
 | option order | mean \|p(reflex) in one order - the other\| 0.065 (max 0.171); 1 of 20 decisions flips with the order |
 
+### Fine-tuning the head (`tools/laya_finetune/`)
+
+```sh
+# 1. labelled cases -> the head's input, every option order (see the join above for labels)
+1bit route --laya-models table.json --laya-model DIR --dump-encoder train.jsonl --out dump-train/ --rotate
+1bit route --laya-models table.json --laya-model DIR --dump-encoder dev.jsonl   --out dump-dev/   --rotate
+# 2. head-only fine-tune on the CPU (torch + numpy): the encoder is frozen, its output is in the dump
+tools/laya_finetune/train_head.py --model DIR --train dump-train --dev dump-dev --out NEW_DIR [--epochs 4] [--lr 2e-5]
+# 3. before / after on held-out cases, by the path serve takes, and the same numbers from the per-case files
+1bit route --laya-models table.json --laya-model DIR     --eval test.jsonl --per-case before.jsonl
+1bit route --laya-models table.json --laya-model NEW_DIR --eval test.jsonl --per-case after.jsonl
+tools/laya_finetune/metrics.py before.jsonl after.jsonl
+```
+
+`train_head.py` trains `type_emb`, the two head layers and `scorer` (`head.py` is the head of `laya/scorer.cpp` in
+torch) on Laya's proper reward (log score + 0.5 spherical score), class-weighted, with early stopping on dev log loss.
+It then refits the `choice:k` temperature on dev, and keeps the checkpoint's own temperature when the refit lands on
+the grid's edge: a separable dev set says nothing about how sure to be. `NEW_DIR` is a copy of `DIR` with only the head
+tensors' bytes replaced (same names, dtypes, shapes and offsets), the temperature in `rl_agent_config.json`, and
+`finetune.json` (data, seed, epochs, dev before and after, command line). It refuses to overwrite an existing `NEW_DIR`.
+Serve takes it unchanged: `--laya-model NEW_DIR`.
+
+Measured on the game (engine #1313, the private `laya-plays` harness): labels are the step kind each logged decision
+was made for. Episodes were held out whole: `test` = the hand-labelled steps, `test2` and `test3` = later episodes
+the fine-tune never saw.
+
+| set | rows | correct, base / fine-tuned | log loss, base / fine-tuned |
+|---|---|---|---|
+| test | 39 | 33 / 33 | 0.543 / 1.395 |
+| test2 | 110 | 107 / 106 | 0.478 / 0.294 |
+| test3 | 56 | 55 / 55 | 0.475 / 0.188 |
+
+The fine-tune keeps accuracy and makes the router much surer on the game's own steps (log loss 0.48 -> 0.19-0.29). On the
+hand-written `test` set it is overconfident on its misses, so read the table row by row, not as one number. A
+second label tried in the harness, "plan" for a reflex step whose game action failed, taught the head nothing: 0 of 10
+held-out failed-reflex rows moved to plan, because those failures come from the plan and are not visible in the
+reflex step's own state. That label needs a planner's view of the same state, not the reflex prompt.
+
 ## Tests
 
+`tests/laya_finetune_test.py` (ctest `laya_finetune`, no checkpoint; skips without torch): `train_head.py` on a
+synthetic checkpoint (the head's real tensor names at d 32) and a dump whose label sits on the right option's marker
+row. Dev log loss must fall and accuracy must not; every non-head byte of the new `model.safetensors` must be
+identical, the head must change, the temperature must land in its bucket, an existing `--out` must be refused; and
+`metrics.py` must agree with a hand-computed `--per-case` file.
 `tests/laya_models_test.cpp` (ctest `laya_models`, no checkpoint): parsing, the question, the pick and
 its fallback, aliases, shared backends, the size gate, the refusals, and the shipped game table.
 `tests/laya_eval_test.cpp` (ctest `laya_eval`, no checkpoint): the eval's arithmetic on hand-computed cases.

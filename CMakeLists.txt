@@ -1614,6 +1614,11 @@ add_test(NAME batch_check_compare COMMAND batch_check_compare_test)
 # engine#1780: the DFlash draft block's acceptance arithmetic -- tokens = accepted + bonus, the break-even rule, and the
 # published OGA-route counts as known answers. Header-only and host-only: no container, no device, no NPU runtime, so it
 # runs wherever this file is built. Registered at top level with the same hook as the row above, for the same reason.
+# engine#1780: where a tapped layer's rows go (npu/forward/include/layer_taps.h), header-only, no model.
+add_executable(layer_taps_test tests/layer_taps_test.cpp)
+target_include_directories(layer_taps_test PRIVATE npu/forward/include)
+add_test(NAME layer_taps COMMAND layer_taps_test)
+add_dependencies(onebit layer_taps_test)
 add_executable(dflash_accept_test tests/dflash_accept_test.cpp)
 target_include_directories(dflash_accept_test PRIVATE npu/forward/include)
 add_test(NAME dflash_accept COMMAND dflash_accept_test)
@@ -1922,6 +1927,13 @@ endif()
     target_link_libraries(gdn_batch_order_test PRIVATE onebit_npu_forward)
     add_dependencies(npu_sampling_test gdn_batch_order_test)
     add_test(NAME gdn_batch_order COMMAND gdn_batch_order_test)
+    # engine#1780: set_layer_taps() on a real container -- the last layer's tap is the forward's own residual, bit for
+    # bit, in the batched pass and in step(). Host-GEMM, no device; skips (77) unless ONEBIT_TEST_Q4NX names a model.
+    add_executable(layer_taps_model_test tests/layer_taps_model_test.cpp)
+    target_include_directories(layer_taps_model_test PRIVATE npu/forward/include)
+    target_link_libraries(layer_taps_model_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test layer_taps_model_test)
+    add_test(NAME layer_taps_model COMMAND layer_taps_model_test)
     # engine#1905: the NPU_BATCH_CHECK oracle restores the prefix it replays from instead of resetting it, so a chunk
     # at start_pos > 0 is compared (and then run) from the state the batched pass continues. Host-GEMM, no device;
     # skips (77) unless ONEBIT_TEST_Q4NX names a container. This is the dev-box row (the private runtime, a real
@@ -1952,6 +1964,7 @@ endif()
     endif()
     set_tests_properties(mtp_batch_all PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(gdn_batch_order PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(layer_taps_model PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(batch_check_state PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source

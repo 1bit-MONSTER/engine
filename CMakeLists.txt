@@ -1860,6 +1860,9 @@ endif()
     # same sources against the runtime stub (engine#1946) cannot drift from this one.
     onebit_npu_forward_library(onebit_npu_forward onebit_npu_rt)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
+    # engine#2111: the usage object's pure function, its own TU so tests/serve_usage_test.cpp can link it without
+    # dragging in npu/rt.h (see cmake/tests-serve-usage.cmake).
+    target_sources(onebit PRIVATE app/serve_usage.cpp)
     # app/embed_serve.cpp's device path includes npu/embed/embed_npu.h (engine#1311): the embedding route's
     # ternary linears on the array, through the same int8 GEMM the forward links.
     target_include_directories(onebit PRIVATE ${CMAKE_SOURCE_DIR}/npu/embed ${CMAKE_SOURCE_DIR}/app

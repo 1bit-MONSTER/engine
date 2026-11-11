@@ -221,6 +221,14 @@ public:
     // The post-final-norm hidden of EVERY row of the last batched pass (M x H, row-major): a speculative drafter
     // has to advance its own stream over the rows that were actually accepted, and those are exactly these.
     const std::vector<float>& last_hidden_rows() const { return last_hidden_rows_; }
+    // engine#1780: the residual stream after the listed layers, for a draft that reads the target's hidden states
+    // (a DFlash draft's target_layer_ids). `layers` must be ascending and inside the model; every pass then appends
+    // one row per position to *sink, [taps * H] wide, the listed layers side by side in the order given -- the
+    // layout dflash_forward.h's `taps` argument takes. Layer l's row is the stream as layer l + 1 receives it (after
+    // layer l's own closing scale). Works for step() and for the batched passes. An empty list or a null sink turns
+    // it off; the sink must outlive the passes. Returns false, changing nothing, on a list that is not usable.
+    bool set_layer_taps(const std::vector<int>& layers, std::vector<float>* sink);
+    int layer_count() const { return c_.NL; }   // layers of the loaded model; 0 before init
     // One row of the embedding table (what a token means to the model): the MTP drafter's `pre_fc_norm_embedding`
     // input.  It reads the same table the forward uses, so the drafter cannot drift from the model's embeddings.
     void embed_row(int token, std::vector<float>& out) const {
@@ -240,6 +248,10 @@ private:
     bool load_norms();
     std::vector<float> last_hidden_;  // last_hidden(): the post-final-norm state of the last position
     std::vector<float> last_residual_;  // and one norm earlier: the raw residual of the last position
+    std::vector<int>    tap_layers_;           // engine#1780: set_layer_taps()
+    std::vector<float>* tap_sink_ = nullptr;
+    size_t              tap_base_ = 0;         // where the current pass's rows start in *tap_sink_
+    void tap_layer(int layer, const float* X, int M);
     std::vector<float> last_hidden_rows_;  // [M][H] normed hidden of the last batched pass
     // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
     // logits there instead of only the last row's.  Null on every other path, so nothing else changes.

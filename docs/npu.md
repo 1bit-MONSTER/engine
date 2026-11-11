@@ -2667,6 +2667,12 @@ can fail a run.
 variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
 looking for a code path that skips the dump.
 
+A caller inside the process that needs the same stream as data, not files, uses
+`Q4nxNpuForward::set_layer_taps(layers, &sink)` (engine#1780): every pass then appends one row per position to the
+sink, `taps x H` wide, the listed layers side by side. It works for `step()` and for the batched passes, and it is what
+a DFlash draft's `target_layer_ids` are read with (docs/amd-drafters.md). Layer `l`'s block is the stream after layer
+`l`, the same point `layer_<ll>.f32` records; `layer_taps_model_test` holds the two to each other bit for bit.
+
 The files these dumps write (`NPU_INFER_DUMP_DIR`'s `layer_<ll>.f32`, `NPU_I8_GS_DUMP`'s weight-scale pairs) are
 created owner-only (0600) and never through a symlink at the final path component, whatever the umask, and a dump file
 an older build left at 0666 is narrowed to 0600 when it is rewritten; the head-image cache's files are at most 0644. Both go through `npu/forward/include/file_create.h`, so no write site uses `fopen(…, "w")`,

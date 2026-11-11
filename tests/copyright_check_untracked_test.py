@@ -121,6 +121,25 @@ with tempfile.TemporaryDirectory() as repo:
     check("the file's own description" in got, "and the file's own header text is kept", got)
     rc = run(repo, "--check")
     check(rc.returncode == 0, "and --check is green after the repair", rc.stdout + rc.stderr)
+    # engine#2175 review: a script's short header sits BEHIND its `#!`. The first version of strip_short_header()
+    # looked at line 1 only, so the stub was not found, the block went in after the shebang, and the file ended up
+    # with two notices -- the same defect one file type over.
+    with open(os.path.join(repo, "short.sh"), "w") as f:
+        f.write("#!/usr/bin/env bash\n" + NOTICE.splitlines()[0] + "\n" + NOTICE.splitlines()[1]
+                + "\n# short.sh -- a script\necho hi\n")
+    git(repo, "add", "short.sh")
+    rc = run(repo, "--fix")
+    check(rc.returncode == 0, "--fix repairs a short header behind a shebang", rc.stdout + rc.stderr)
+    got = open(os.path.join(repo, "short.sh")).read()
+    check(got.startswith("#!/usr/bin/env bash\n"),
+          "the shebang stays on line 1", got.splitlines()[0])
+    check(got.count("SPDX-License-Identifier") == 1,
+          "and exactly one SPDX line in the script too", f"{got.count('SPDX-License-Identifier')} found")
+    check("short.sh -- a script" in got, "and the script's own comment survives", got)
+    rc = run(repo, "--check")
+    check(rc.returncode == 0, "and --check is green for the script", rc.stdout + rc.stderr)
+    os.unlink(os.path.join(repo, "short.sh"))
+    git(repo, "add", "-A", "short.sh")
     os.unlink(os.path.join(repo, "short.h"))
     git(repo, "add", "-A", "short.h")
 

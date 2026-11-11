@@ -276,12 +276,14 @@ def strip_short_header(text):
     returns the text unchanged and the caller's behaviour is what it was.
     """
     lines = text.splitlines(keepends=True)
-    if len(lines) >= 2 and NOTICE[0] in lines[0] and NOTICE[1] in lines[1]:
-        rest = lines[2:]
-        # keep a `#!` line in front of the header if there is one
+    # A script's short header starts on line 2, behind its `#!`: without this, the stub is not found, the block
+    # is prepended after the shebang, and the file ends up with two notices again (measured: short.sh).
+    at = 1 if lines and lines[0].startswith("#!") else 0
+    if len(lines) >= at + 2 and NOTICE[0] in lines[at] and NOTICE[1] in lines[at + 1]:
+        head, rest = lines[:at], lines[at + 2:]
         if rest and rest[0].strip() == "" and len(rest) > 1:
             rest = rest[1:]
-        return "".join(rest)
+        return "".join(head + rest)
     return text
 
 

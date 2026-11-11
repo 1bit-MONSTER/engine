@@ -75,7 +75,31 @@ inline int chunk_rows(int narrow, int wide) { return wide > narrow ? wide : narr
 // launch past `wide` rows is never routed here (the caller refuses it by name).
 inline bool wide_takes(int rows, int narrow, int wide) { return wide > narrow && rows > narrow && rows <= wide; }
 
-// Which file is the wide sealed ELF, if any?  The environment wins over the pack so a set can be tried, or switched
+// --- a narrow family for decode (engine: decode device wait) -----------------------------------------------------
+//
+// The mirror of the wide family: the same roles built for FEWER rows than the 16-row family, for the launches
+// that carry only a few rows (a decode step carries one). Complete means every role with a 16-row kernel has a
+// narrow kernel of exactly `narrow` rows, and `narrow` is below every 16-row width; a role without one would
+// silently stay on its 16-row kernel, which is safe but is not what the log would claim, so it is all or none.
+inline bool narrow_family_complete(const int* base_widths, const int* narrow_widths, int n, int narrow) {
+    if (!base_widths || !narrow_widths || n <= 0 || narrow <= 0) return false;
+    int roles = 0;
+    for (int i = 0; i < n; ++i) {
+        if (base_widths[i] <= 0) {
+            if (narrow_widths[i] > 0) return false;
+            continue;
+        }
+        if (narrow_widths[i] != narrow || narrow >= base_widths[i]) return false;
+        ++roles;
+    }
+    return roles > 0;
+}
+
+// Does a launch of `rows` rows go to the narrow family?  Only when it fits: 1..narrow rows. One row more and the
+// launch would write past the narrow kernel's activation buffer, so the bound is the kernel's own row count.
+inline bool narrow_takes(int rows, int narrow) { return narrow > 0 && rows >= 1 && rows <= narrow; }
+
+// Which file is the wide sealed ELF, if any?  (The narrow family's file is chosen by the same rule.)  The environment wins over the pack so a set can be tried, or switched
 // off, without editing a pack: `env` "0" means no wide family even when the pack names one, any other non-empty
 // value is the path as given. Otherwise the pack's name is used: as given when absolute, else inside `kernels_dir`
 // (where the 16-row sealed ELF lives). Empty answer = no wide family. `env` may be null.

@@ -52,8 +52,9 @@ HOSTW = re.compile(r"hrx host weights: .*?resident=([0-9.]+) MiB allocs=(\d+)")
 
 
 def is_gtt_buft(name):
-    """HRX0, HRX0_HOST, HRX1 ... are GTT on this APU; CPU / CPU_Mapped / CPU_REPACK are not."""
-    return name.startswith("HRX")
+    """HRX0, HRX0_HOST, HRX1 ... are GTT on this APU; CPU / CPU_Mapped / CPU_REPACK are not, and neither is HRX0_Mapped:
+    since llama.cpp#304 that is the loader's file mapping wrapped as host memory, with no device allocation."""
+    return name.startswith("HRX") and not name.endswith("_Mapped")
 
 
 def parse(text):
@@ -242,6 +243,10 @@ def self_test():
     check("trace off: packed is unknown, not zero", s["packed"], None)
     check("trace off: the report says why", NO_TRACE in report(s, 3925.0), True)
     check("not a -v log: the report says so", "warning: no `model buffer size` line" in report(parse("hello\n"), 1.0), True)
+
+    s = parse(FIXTURE_4B.replace("HRX0 model buffer", "HRX0_Mapped model buffer"))
+    check("HRX0_Mapped (llama.cpp#304) is host memory, not GTT", (s["model_gtt"], round(s["model_host"], 2)), (0.0, 2680.19))
+    check("no loader copy in GTT: no duplicate line", "duplicate:" in report(s, 3225.3), False)
 
     s = parse(FIXTURE_4B + "0.00.378.790 I load_tensors:         HRX0 model buffer size =   100.00 MiB\n")
     check("a split buffer type is summed", s["model_gtt"], 2475.91)

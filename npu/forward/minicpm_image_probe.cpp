@@ -20,13 +20,16 @@
 //             -> the text model: step_batch_embeds() with the tower's rows where the placeholders are, then greedy decode.
 //
 //   minicpm_image_probe <pack dir> <kernels dir> (--image file.ppm | --solid R,G,B [--size HxW] | --halves R,G,B:R,G,B | --none)
-//                       --prompt "question" [--decode N] [--expect-ids ids.i32]
+//                       --prompt "question" [--decode N] [--expect-ids ids.i32] [--dump dir] [--chunk N] [--rows-argmax]
 //
 // A probe, not a route: the tower runs on the CPU (about half a minute for one 448 x 448 view on one thread), the image is
 // a binary PPM or a generated colour so that no image decoder is involved, and the prompt is the one the pack's own chat
 // template renders for a single user turn with one image and thinking off, written out here rather than rendered:
 //     <|im_start|>user\n<image_id>0</image_id>[image]\n{question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
 // --expect-ids compares the token ids built here with a file of int32 ids (the reference processor's), and says so.
+// --dump writes what the text model is about to be given (ids.i32, positions.i32, pooled.f32), --chunk N sends the
+// prompt in calls of at most N rows as the served route does, and --rows-argmax prints the model's next-token choice at
+// every row of a text-only prompt. The three exist to bisect a wrong answer against a reference run.
 // The text model opens the device unless NPU_INFER_HOST_GEMM is set, so on the device this runs inside npu-hold.
 #include "q4nx_forward.h"
 
@@ -90,14 +93,14 @@ static bool read_ppm(const std::string& path, std::vector<uint8_t>& rgb, int& h,
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr, "usage: %s <pack dir> <kernels dir> (--image f.ppm | --solid R,G,B [--size HxW] | --halves R,G,B:R,G,B | "
-                             "--none) --prompt \"question\" [--decode N] [--expect-ids ids.i32]\n", argv[0]);
+                             "--none) --prompt \"question\" [--decode N] [--expect-ids ids.i32] [--dump dir] [--chunk N] [--rows-argmax]\n", argv[0]);
         return 2;
     }
     const std::string pack_dir = argv[1], kernels = argv[2];
-    std::string image_path, prompt, expect_ids;
-    bool none = false, have_solid = false, have_halves = false;
+    std::string image_path, prompt, expect_ids, dump_dir;
+    bool none = false, have_solid = false, have_halves = false, rows_argmax = false;
     uint8_t solid[3] = {0, 0, 0}, left[3] = {0, 0, 0}, right[3] = {0, 0, 0};
-    int height = 448, width = 448, decode = 8;
+    int height = 448, width = 448, decode = 8, chunk = 0;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const auto value = [&]() -> std::string {
@@ -116,8 +119,12 @@ int main(int argc, char** argv) {
         else if (a == "--prompt") prompt = value();
         else if (a == "--decode") decode = std::atoi(value().c_str());
         else if (a == "--expect-ids") expect_ids = value();
+        else if (a == "--dump") dump_dir = value();
+        else if (a == "--chunk") chunk = std::atoi(value().c_str());
+        else if (a == "--rows-argmax") rows_argmax = true;
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
+    if (chunk < 0) { std::fprintf(stderr, "--chunk wants a row count (0: one call)\n"); return 2; }
     if (prompt.empty() || decode < 1 || decode > 512 || int(none) + int(have_solid) + int(have_halves) + int(!image_path.empty()) != 1) {
         std::fprintf(stderr, "give --prompt and exactly one of --image, --solid, --halves, --none\n");
         return 2;
@@ -201,6 +208,25 @@ int main(int argc, char** argv) {
             std::printf("prompt ids vs %s: %s (%zu here, %zu there)\n", expect_ids.c_str(), same ? "IDENTICAL" : "DIFFERENT", ids.size(), want.size());
         }
 
+        // --dump <dir>: what the text model is about to be given, in hybrid_prompt_probe's file forms, so a wrong answer
+        // can be bisected against a reference that writes the same files (ids.i32, positions.i32 as t|h|w, pooled.f32).
+        if (!dump_dir.empty()) {
+            const auto put = [&](const char* name, const void* data, size_t bytes) {
+                std::ofstream f(dump_dir + "/" + name, std::ios::binary);
+                f.write(static_cast<const char*>(data), std::streamsize(bytes));
+                if (!f) throw std::runtime_error("cannot write " + dump_dir + "/" + name);
+            };
+            std::vector<int32_t> i32(ids.begin(), ids.end());
+            put("ids.i32", i32.data(), i32.size() * 4);
+            std::vector<int32_t> pl;
+            pl.insert(pl.end(), pos.t.begin(), pos.t.end());
+            pl.insert(pl.end(), pos.h.begin(), pos.h.end());
+            pl.insert(pl.end(), pos.w.begin(), pos.w.end());
+            put("positions.i32", pl.data(), pl.size() * 4);
+            put("pooled.f32", rows.data(), rows.size() * sizeof(float));
+            std::printf("dumped %zu ids, 3 x %zu positions and %zu row values to %s\n", ids.size(), ids.size(), rows.size(), dump_dir.c_str());
+        }
+
         // ── the text model ──
         Q4nxNpuForward f;
         std::unique_ptr<xrt::device> dev;
@@ -240,9 +266,44 @@ int main(int argc, char** argv) {
         Q4nxNpuForward::HybridInputs in;
         in.position_ids = &planes;
         std::vector<float> logits;
+        // --rows-argmax (text-only prompts): the model's own next-token choice at every prompt row, from one teacher-forced
+        // pass over the prompt's ids. Compared row by row with a reference run of the same ids, it says whether a wrong
+        // answer is one bad position or a uniform error in the layers; that is how engine#2149 was found (65 % agreement,
+        // flat across positions). Images are refused: step_batch_all() takes token ids, not rows.
+        if (rows_argmax && !none) throw std::runtime_error("--rows-argmax needs --none: the per-row pass takes token ids");
+        if (rows_argmax) {
+            std::vector<float> all;
+            f.reset();
+            if (!f.step_batch_all(ids, 0, all)) throw std::runtime_error(std::string("step_batch_all: ") + f.last_error());
+            const size_t V = all.size() / size_t(n);
+            std::printf("rows-argmax:");
+            for (int r = 0; r < n; ++r) {
+                const float* row = all.data() + size_t(r) * V;
+                size_t b = 0;
+                for (size_t i = 1; i < V; ++i) if (row[i] > row[b]) b = i;
+                std::printf(" %zu", b);
+            }
+            std::printf("\n");
+        }
         f.reset();
         const auto t4 = now();
-        if (!f.step_batch_embeds(embeds, 0, logits, in)) throw std::runtime_error(std::string("prefill: ") + f.last_error());
+        // The prompt goes in as chunks of at most `chunk` rows, as the served route sends a prefill (--chunk N; 0 sends
+        // it as one call). Each call gets its own rows' embeddings and planes and starts at its cache slot.
+        if (chunk <= 0) {
+            if (!f.step_batch_embeds(embeds, 0, logits, in)) throw std::runtime_error(std::string("prefill: ") + f.last_error());
+        } else {
+            for (int off = 0; off < n; off += chunk) {
+                const int take = off + chunk < n ? chunk : n - off;
+                const std::vector<float> part(embeds.begin() + long(size_t(off) * H), embeds.begin() + long(size_t(off + take) * H));
+                std::vector<int> pl;
+                pl.insert(pl.end(), pos.t.begin() + off, pos.t.begin() + off + take);
+                pl.insert(pl.end(), pos.h.begin() + off, pos.h.begin() + off + take);
+                pl.insert(pl.end(), pos.w.begin() + off, pos.w.begin() + off + take);
+                Q4nxNpuForward::HybridInputs ci;
+                ci.position_ids = &pl;
+                if (!f.step_batch_embeds(part, off, logits, ci)) throw std::runtime_error(std::string("prefill: ") + f.last_error());
+            }
+        }
         const auto t5 = now();
         const auto argmax = [](const std::vector<float>& v) {
             int b = 0;

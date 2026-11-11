@@ -76,6 +76,7 @@
 
 namespace onebit {
 
+
 namespace {
 
 // A prompt that leaves no room for an answer inside the context (the model's, or --ctx-size).
@@ -239,12 +240,13 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 // template that serializes its input (a tools block through `tojson`) renders the
                 // request's key order into the prompt, so it has to be the caller's order, not ours.
                 const nlohmann::ordered_json ordered = nlohmann::ordered_json::parse(req.body);
-                nlohmann::ordered_json extra = nlohmann::ordered_json::object();
-                if (ordered.contains("chat_template_kwargs") && ordered["chat_template_kwargs"].is_object())
-                    extra = ordered["chat_template_kwargs"];
-                extra["enable_thinking"] = npu::thinking_from_body(body);
-                prompt = npu::render_chat_template(e.tmpl, ordered.at("messages"), /*add_generation_prompt=*/true,
-                                                   extra, e.bos_text, e.eos_text);
+                // The functions the request offers go the same way (npu::request_template_vars): the
+                // template is where a model learns what it may call.
+                const nlohmann::ordered_json extra = npu::request_template_vars(ordered, npu::thinking_from_body(body));
+                // An earlier call's arguments arrive as a JSON string; the template is written against the
+                // object (npu::messages_for_template).
+                prompt = npu::render_chat_template(e.tmpl, npu::messages_for_template(ordered.at("messages")),
+                                                   /*add_generation_prompt=*/true, extra, e.bos_text, e.eos_text);
                 if (e.prefix_pin) {
                     // A template that cannot render the probe is no reason to refuse the request: it only means
                     // there is no early pin, and the log says so.
@@ -604,20 +606,19 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
 
     // OpenAI's usage object plus the two fields issue #650 reports: how many prompt tokens came
     // from a saved prefix, and what the cache decided (which slot, and why).
+    // engine#2111: the usage object is `onebit::usage_json_text()` now (app/forward_serve.h) - a pure function, so
+    // the rule "reasoning_tokens appears iff the route could count it" has known answers without an NPU
+    // (tests/serve_usage_test.cpp). The JSON stays here, where the rest of the reply is built.
     auto usage_json = [](const CallStats& st) {
-        json u{{"prompt_tokens", st.prompt_tokens},
-               {"completion_tokens", st.completion_tokens},
-               {"total_tokens", st.prompt_tokens + st.completion_tokens},
-               {"prompt_tokens_details", {{"cached_tokens", st.prefix.cached_tokens}}},
-               {"flm_prefix_cache", {{"slot", st.prefix.slot},
-                                     {"cached_tokens", st.prefix.cached_tokens},
-                                     {"reason", st.prefix.reason},
-                                     {"pinned", st.prefix.pinned}}}};
-        // engine#2111: OpenAI's field for "how much of the budget went into reasoning". With content "" and
-        // finish_reason "length", reasoning_tokens == completion_tokens is the sentence that says the budget ran out
-        // inside a thinking block, rather than that the model said nothing. Additive: absent where nothing was split.
-        if (st.reasoning_tokens >= 0) u["completion_tokens_details"] = {{"reasoning_tokens", st.reasoning_tokens}};
-        return u;
+        UsageCounters u;
+        u.prompt_tokens = st.prompt_tokens;
+        u.completion_tokens = st.completion_tokens;
+        u.cached_tokens = st.prefix.cached_tokens;
+        u.prefix_slot = st.prefix.slot;
+        u.prefix_reason = st.prefix.reason;
+        u.prefix_pinned = st.prefix.pinned;
+        u.reasoning_tokens = st.reasoning_tokens;
+        return json::parse(usage_json_text(u));
     };
 
     // OpenAI's logprobs.content entry: the token's text, its log-probability, and the most likely

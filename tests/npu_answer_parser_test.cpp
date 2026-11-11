@@ -97,6 +97,52 @@ int main() {
         check(contains(a.content, "to emit a call."), "without tools, the rest of the text is kept");
     }
 
+    // The function/parameter call form (engine#1788): Qwen3.5's template and MiniCPM-V 4.7's teach
+    //     <tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>
+    // and the reply below is what MiniCPM-V 4.7 1B wrote on the NPU.  It used to come back as content.
+    {
+        const auto a = parse_answer(
+            "I need to get the current weather for Paris, so I will call the get_weather function.\n\n<tool_call>\n"
+            "<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+            AnswerFamily::qwen3, true);
+        check(a.calls.size() == 1 && a.calls[0].name == "get_weather", "function form: one call, named");
+        check(a.calls.size() == 1 && a.calls[0].arguments == "{\"city\":\"Paris\"}", "function form: a bare value is a string argument");
+        check(!contains(a.content, "<tool_call>") && !contains(a.content, "<function="), "function form: the markup leaves content");
+        check(contains(a.content, "I will call the get_weather function"), "function form: the prose before it stays");
+    }
+    {
+        const auto a = parse_answer(
+            "<tool_call>\n<function=book>\n<parameter=nights>\n3\n</parameter>\n<parameter=guests>\n[\"a\", \"b\"]\n</parameter>\n"
+            "<parameter=note>\nline one\nline two\n</parameter>\n<parameter=when>\n2026-11-11\n</parameter>\n</function>\n</tool_call>",
+            AnswerFamily::qwen3, true);
+        check(a.calls.size() == 1 &&
+                  a.calls[0].arguments == "{\"nights\":3,\"guests\":[\"a\",\"b\"],\"note\":\"line one\\nline two\",\"when\":\"2026-11-11\"}",
+              "function form: JSON values are values, text is a string (a date is not a number), in the model's order");
+        check(a.content_null, "function form: a call-only reply has null content");
+    }
+    {
+        const auto a = parse_answer("<tool_call>\n<function=ping>\n</function>\n</tool_call>", AnswerFamily::qwen3, true);
+        check(a.calls.size() == 1 && a.calls[0].name == "ping" && a.calls[0].arguments == "{}", "function form: no parameters is {}");
+    }
+    {
+        // Malformed: a parameter that never closes, and text between parameters.  Neither is a call.
+        const auto a = parse_answer("<tool_call><function=f><parameter=x>1</function></tool_call>", AnswerFamily::qwen3, true);
+        check(a.calls.empty() && contains(a.content, "<function=f>"), "function form: an unclosed parameter goes back to content");
+        const auto b = parse_answer("<tool_call><function=f>stray<parameter=x>1</parameter></function></tool_call>", AnswerFamily::qwen3, true);
+        check(b.calls.empty() && contains(b.content, "stray"), "function form: text between parameters goes back to content");
+    }
+    {
+        // Streaming: the same reply in three-byte pieces gives the same call and no markup in the deltas.
+        const std::string text = "ok <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        onebit::npu::AnswerStream st(AnswerFamily::qwen3, true);
+        std::vector<std::pair<bool, std::string>> out;
+        for (size_t at = 0; at < text.size(); at += 3) st.feed(text.substr(at, 3), out);
+        st.finish(out);
+        std::string deltas;
+        for (const auto& d : out) deltas += d.second;
+        check(st.calls().size() == 1 && st.calls()[0].arguments == "{\"city\":\"Paris\"}", "function form: streamed in pieces, the same call");
+        check(!contains(deltas, "function"), "function form: streamed, no markup in the deltas");
+    }
     // 5. Malformed call body: never dropped, goes back into content with its markup.
     {
         const auto a = parse_answer("x<tool_call>not json at all</tool_call>", AnswerFamily::qwen3, true);

@@ -407,10 +407,16 @@ OnnxModel parse_onnx(const std::string& path) {
             continue;
         }
         if (!w) { kept.push_back(mm); continue; }   // names nothing this graph declares: not this genre's business
+        // Two spellings of the placeholder: 1.9 names it `<w>.empty` beside `<w>.packed`; the 1.8 hybrid line names the
+        // node's own `<w>` as the `[0]` placeholder beside `<w>.packed` (Llama-3.2-1B-Instruct_rai_1.8.0_hybrid: all 162
+        // `.MatMulNBits.*` initializers dims [0] and no data, the weights in model.bin). Missing the second spelling kept
+        // the node as a real weight, so `info` reported every projection importable and `import` died on
+        // `...MatMulNBits.bias: no data` (engine#1503).
         std::string packed = w->name;
         if (packed.size() >= 6 && packed.compare(packed.size() - 6, 6, ".empty") == 0)
             packed.replace(packed.size() - 6, 6, ".packed");
-        else { kept.push_back(mm); continue; }
+        else
+            packed += ".packed";
         const OnnxTensor* pw = find_init(packed);
         // No sibling at all: not this genre's pack. Keep the node exactly as it was -- it still names its `*.empty`
         // initializer and the reader below decides what that means. Dropping it here would be a decision made by an
@@ -2265,6 +2271,30 @@ bool external_container_tensors(const std::string& role, int nh, int nkv, int hd
     return false;
 }
 
+// engine#1990: q4_1 tiles hold 32-row multiples, and a pack's vocabulary need not be one. CodeLlama's is 32,016, which
+// refused the whole import with "q4_1 tiles need N % 32 == 0" -- a head the grid cannot hold, not a head that is wrong.
+// Where the pack pads its own head (the .fconst tail carries ceil(V/64)*64 rows: Hunyuan-0.5B has 120,832 for 120,818)
+// nothing here fires; where it does not, pad with rows that decode to zero, and leave `vocab_size` at the vocabulary's
+// own number so the padding is never addressed. codes 0 with SCALE 1 and zero 0 decode to exactly 0.0 -- and scale 1,
+// not 0: a zero scale is not a zero weight to a reader, it is a malformed parameter block (the forward's dequant refuses
+// it, which is how the first version of this padding was caught: "lm_head dequant failed").
+void pad_rows_to_tile_quantum(Q4& q, int vocab) {
+    if (q.N <= 0 || q.K <= 0 || q.block <= 0 || q.K % q.block) return;
+    if (q.N % q4nx::kRows == 0) return;
+    const int padded = (q.N + q4nx::kRows - 1) / q4nx::kRows * q4nx::kRows;
+    const size_t gpr = size_t(q.K / q.block);   // groups per row
+    for (int r = q.N; r < padded; r++) {
+        q.codes.insert(q.codes.end(), size_t(q.K), 0);
+        q.scale.insert(q.scale.end(), gpr, 1.0f);   // 1.0, not 0: code 0 * 1 + 0 = 0.0, and a 0 scale is malformed
+        q.zero.insert(q.zero.end(), gpr, 0.0f);
+    }
+    std::fprintf(stderr,
+                 "note: the head is %d rows for a vocabulary of %d (padded from %lld to the 32-row tile quantum); "
+                 "vocab_size stays %d in the container\n",
+                 padded, vocab, (long long)q.N, vocab);
+    q.N = padded;
+}
+
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact) {
     // A PASS-THROUGH since the signed-int4 fix: `decode_external_tile` produces the container's own convention directly
     // (code = c_signed + 8, zero = (-8 - z_signed) * scale), so converting `zero` again applies the mapping TWICE --
@@ -3622,7 +3652,12 @@ Plan plan(const std::string& pack_dir) {
             pack_dir + ": " + onnx.weightless_example +
             ", and the pack carries no Token .fconst either (no dd_metastate_Llm_Token_*.fconst): these weights are "
             "genuinely absent from the pack's external data, so this pack cannot be imported -- not a tile-layout or "
-            "block-size problem");
+            "block-size problem" +
+            // The 1.8 hybrid line keeps them in a `model.bin` beside the graph (1.3 GB on Llama-3.2-1B-Instruct), a
+            // container this importer does not read; saying where they are is what tells a reader which work is missing.
+            std::string(fs::exists(pack_dir + "/model.bin")
+                            ? ". This pack's weights are in its model.bin, which this importer does not read (engine#1503)"
+                            : ""));
     const bool no_fconst = tok_path.empty();
     // The 1.9 external-data genre (phi-4: 201 `MatMulNBitsBf` ops whose bytes are `*.qweight.packed` siblings in
     // `eager-mm.onnx.data`) must NOT ride the graph-weights path below, which was written for the 1.3/1.6/1.7.1 line's
@@ -4563,6 +4598,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             "tile decoder does not apply (engine#1503)");
     Report r;
     r.out_dir = out_dir;
+    r.model_type = p.dims.model_type;
     r.refused = p.refused();
     if (!r.refused.empty() && !opt.allow_incomplete) return r;  // refuse by name, write nothing
 
@@ -5048,6 +5084,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         uint64_t qw_need = 0;   // N * K/block * block/2
         if (!mul_ok(groups_n, uint64_t(mm.block) / 2, qw_need)) throw std::runtime_error("lm_head: qweight length overflows");
         Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
+        pad_rows_to_tile_quantum(q, int(V));
         // no qzeros tensor -> the implicit zero point (engine#1503: Qwen3-VL-4B's spelling, three-input nodes)
         if (!have_zp) implicit_zp_zero(q, mm.bits);
 
@@ -5072,24 +5109,15 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                          mm.weight.c_str(), q.N, q.K, mm.block, int(V), int(H), (int)head_geometry);
         if (tied || head_geometry) r.selfcheck_reference = true;
         if (tied || head_geometry) {
-            double sum_abs = 0, sum_ref = 0;
-            for (int n = 0; n < q.N; ++n)
-                for (int k = 0; k < q.K; ++k) {
-                    const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
-                    const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
-                    double e;
-                    e = embed_at(embed_tbl, int(n), k);
-                    sum_abs += std::fabs(x - e);
-                    sum_ref += std::fabs(e);
-                }
-            r.lmhead_rel = sum_abs / sum_ref;
+            r.head_fit = fit_head(q, embed_tbl, q.N, mm.block);
+            r.lmhead_rel = r.head_fit.rel;
             r.lmhead_corr = corr(q, embed_tbl, q.N);
             // The diagnostic follows the NUMBER, not the pack's declaration: a genre-A pack ships no config.json, so
             // `tied` is false there while the head plainly reproduces its embedding, and the readout used to call those
             // packs untied while the container it wrote said tied. Same threshold the container's own decision uses.
             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
 
-            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
+            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.head_fit);
             const Q4 swap = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K),
                                                mm.block, /*swap_nibbles*/ true, false);
             const Q4 nozp = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), nullptr, int(mm.N), int(mm.K),
@@ -5163,22 +5191,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                  : " (untied: layout checked, values not verified)");
             if (embed_tbl.ok()) {
                 r.lmhead_corr = c32;
-                {
-                    double sum_abs = 0, sum_ref = 0;
-                    for (int n = 0; n < int(V); ++n)
-                        for (int k = 0; k < q.K; ++k) {
-                            const size_t gg = size_t(n) * (q.K / 32) + size_t(k) / 32;
-                            const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[gg] + q.zero[gg];
-                            const double e = embed_at(embed_tbl, n, k);
-                            sum_abs += std::fabs(x - e);
-                            sum_ref += std::fabs(e);
-                        }
-                    if (sum_ref > 0) r.lmhead_rel = sum_abs / sum_ref;
-                }
+                r.head_fit = fit_head(q, embed_tbl, int(V), 32);
+                r.lmhead_rel = r.head_fit.rel;
                 r.selfcheck_reference = true;
                 r.selfcheck_tied = c32 > kTieCorr;
 
-                r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
+                r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.head_fit);
                 double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
                 const int nsh = std::min(2048, int(V) - 1);
                 for (int rr = 0; rr < nsh; ++rr)
@@ -5492,22 +5510,13 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                         // q.N may exceed V by the pack's tile padding (Hunyuan-0.5B: 120,832 rows for 120,818),
                         // so the reference is compared over the vocabulary's own rows.
                         if (q.N >= int(V) && q.K == int(H)) {
-                            double sum_abs = 0, sum_ref = 0;
-                            for (int n = 0; n < int(V); ++n)
-                                for (int k = 0; k < q.K; ++k) {
-                                    const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
-                                    const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
-                                    const double e =
-                                        embed_at(embed_tbl, int(n), k);
-                                    sum_abs += std::fabs(x - e);
-                                    sum_ref += std::fabs(e);
-                                }
-                            r.lmhead_rel = sum_abs / sum_ref;
+                            r.head_fit = fit_head(q, embed_tbl, int(V), q.block > 0 ? q.block : 128);
+                            r.lmhead_rel = r.head_fit.rel;
                             r.lmhead_corr = corr(q, embed_tbl, q.N);
                             r.selfcheck_reference = true;
                             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
 
-                            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
+                            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.head_fit);
                             // The control this path can actually run: the same tiles and the same decoder, with each
                             // head row matched against the NEXT embedding row. If a misaligned head still correlated,
                             // the number above would be measuring the vocabulary's mean brightness rather than the
@@ -6151,14 +6160,26 @@ int run(int argc, char** argv) {
     // packs measured: rel_err 0.095 and 0.136 against 0.000000 on the pack that serves). `--allow-incomplete` is not an
     // override here: that flag means "write the tensors I could not represent", and this is "the tensors I wrote do not
     // decode", which no amount of writing fixes.
+    // engine#1503: an architecture this route is measured to answer garbage on, whatever its head scores. The head fit
+    // above stopped refusing gemma-2-2b AWQ (its head is a correct 4-bit head), so the refusal that #2101 made for the
+    // wrong reason is kept here for the right one, by name, until the cause is found.
+    if (const char* why = known_bad_architecture(r.model_type)) {
+        std::fprintf(stderr, "1bit npu-pack: refusing to import %s: model_type %s -- %s. The partial output this run "
+                             "already wrote under %s is not servable -- delete it.\n",
+                     dir.c_str(), r.model_type.c_str(), why, out.c_str());
+        return 3;
+    }
     if (r.selfcheck_scaled) {
         std::fprintf(stderr,
                      "1bit npu-pack: refusing to import %s: the head correlates with the pack's own embedding (%.6f) but "
-                     "its relative error is %.6f, which is a scaled or partially decoded head rather than a rounding "
-                     "difference (the threshold is %.3f). A pack in this state imports cleanly and answers garbage on "
+                     "it is a scaled or partially decoded head rather than a correct 4-bit one: relative error %.6f "
+                     "(allowed %.6f = max(%.3f, %.1f x the embedding's own 4-bit noise floor %.6f)), best-fit scale %.6f "
+                     "and rms ratio %.6f (allowed 1 +- %.2f). A pack in this state imports cleanly and answers garbage on "
                      "the device; --allow-incomplete does not override this. The partial output this run already\n"
                      "wrote under %s is not servable -- delete it before retrying.\n",
-                     dir.c_str(), r.lmhead_corr, r.lmhead_rel, kSelfcheckRelMax, out.c_str());
+                     dir.c_str(), r.lmhead_corr, r.lmhead_rel,
+                     std::max(kSelfcheckRelMax, kHeadFloorFactor * r.head_fit.floor), kSelfcheckRelMax, kHeadFloorFactor,
+                     r.head_fit.floor, r.head_fit.scale, r.head_fit.rms_ratio, kHeadScaleTol, out.c_str());
         return 3;
     }
     if (!r.refused.empty() && !allow) {
@@ -6175,6 +6196,10 @@ int run(int argc, char** argv) {
         std::printf("  self-check: the head reproduces the pack's own embedding (as imported, bf16)  corr %.6f  rel_err %.6f\n"
                     "              (tied: this correlation is the check, and it passed)\n",
                     r.lmhead_corr, r.lmhead_rel);
+        if (r.head_fit.floor > 0)
+            std::printf("  head fit:   best-fit scale %.6f, rms ratio %.6f, embedding's own 4-bit noise floor %.6f "
+                        "(rel_err is %.2fx of it): a 4-bit head, not a scaled one\n",
+                        r.head_fit.scale, r.head_fit.rms_ratio, r.head_fit.floor, r.lmhead_rel / r.head_fit.floor);
         if (r.ctrl_corr_rowshift >= 0)
             std::printf("  controls:   row-shifted corr %.4f (must fail)\n", r.ctrl_corr_rowshift);
         else
@@ -6418,5 +6443,51 @@ void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::
 // copy is ambiguous with it at every call site). Correlated AND not a scaled copy of the embedding -- the two states this
 // box measures are rel_err 0.000000 (serves) and 0.095/0.136 (imports cleanly, answers garbage).
 bool selfcheck_head_ok(double corr, double rel) { return corr > kTieCorr && rel <= kSelfcheckRelMax; }
+
+const char* known_bad_architecture(const std::string& model_type) {
+    if (model_type == "gemma2")
+        return "gemma-2-2b hybrid packs import cleanly and answer garbage on this route (`myselfGetBytes...`, two packs, "
+               "measured for #2101), and their head is a correct 4-bit head (best-fit scale 0.992, rel 1.07x its 4-bit "
+               "noise floor), so the fault is elsewhere and not yet found (engine#1503)";
+    return nullptr;
+}
+
+bool selfcheck_head_ok(double corr, const HeadFit& f) {
+    return corr > kTieCorr && std::fabs(f.scale - 1.0) <= kHeadScaleTol && std::fabs(f.rms_ratio - 1.0) <= kHeadScaleTol &&
+           f.rel <= std::max(kSelfcheckRelMax, kHeadFloorFactor * f.floor);
+}
+
+HeadFit fit_head(const Q4& q, const EmbedTable& embed, int rows, int block) {
+    HeadFit f;
+    rows = std::min(rows, q.N);
+    if (block <= 0 || q.K % block) block = 32;
+    double sum_abs = 0, sum_ref = 0, sxe = 0, sxx = 0, see = 0, floor_abs = 0;
+    std::vector<double> e(size_t(q.K));
+    for (int n = 0; n < rows; ++n) {
+        for (int k = 0; k < q.K; ++k) e[size_t(k)] = embed_at(embed, n, k);
+        for (int k = 0; k < q.K; ++k) {
+            const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
+            const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
+            sum_abs += std::fabs(x - e[size_t(k)]);
+            sum_ref += std::fabs(e[size_t(k)]);
+            sxe += x * e[size_t(k)];
+            sxx += x * x;
+            see += e[size_t(k)] * e[size_t(k)];
+        }
+        for (int g0 = 0; g0 < q.K; g0 += block) {
+            double lo = e[size_t(g0)], hi = lo;
+            for (int k = g0; k < g0 + block; ++k) { lo = std::min(lo, e[size_t(k)]); hi = std::max(hi, e[size_t(k)]); }
+            const double sc = (hi - lo) / 15.0;
+            for (int k = g0; k < g0 + block; ++k) {
+                const double c = sc > 0 ? std::min(15.0, std::max(0.0, std::round((e[size_t(k)] - lo) / sc))) : 0.0;
+                floor_abs += std::fabs(c * sc + lo - e[size_t(k)]);
+            }
+        }
+    }
+    if (sum_ref > 0) { f.rel = sum_abs / sum_ref; f.floor = floor_abs / sum_ref; }
+    if (sxx > 0) f.scale = sxe / sxx;
+    if (see > 0) f.rms_ratio = std::sqrt(sxx / see);
+    return f;
+}
 
 }  // namespace onebit::npu::pack_import

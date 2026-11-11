@@ -371,6 +371,15 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.
+# engine#1990: the padded-head row arithmetic, driven on the shape that broke it (CodeLlama-7b's I8 [16016, 6144] for a
+# 32,032-row head at kpad 4,096). It is header-only (`npu/forward/include/pad_head_rows.h`) precisely so it can live HERE:
+# an earlier version linked `onebit_npu_forward`, which exists only under `if(ONEBIT_NPU)`, so CI -- which configures
+# without the NPU runtime -- never built or ran the arm. `add_dependencies(onebit ...)` keeps it in the build CI runs.
+add_executable(npu_pad_head_rows_test tests/npu_pad_head_rows_test.cpp)
+target_include_directories(npu_pad_head_rows_test PRIVATE npu/forward/include)
+add_dependencies(onebit npu_pad_head_rows_test)
+add_test(NAME npu_pad_head_rows COMMAND npu_pad_head_rows_test)
+
 # engine#1934: reading ONE tensor out of a safetensors shard needs `data_offsets` measured from 8 + header_len, not
 # from byte 8. Getting that wrong returns a *different* tensor of the same size that still looks finite, and it cost
 # two false conclusions about a pack in one night. `--self-test` drives the rule on a synthetic shard (no network):
@@ -391,6 +400,9 @@ add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-
 add_python_test(laya_head_finetune ${CMAKE_SOURCE_DIR}/tools/laya_head_finetune.py --self-test)
 # engine#856: one HRX process's GTT split into the loader's copy and HRX's packed second copy, from its own -v log.
 add_python_test(hrx_gtt_split_self ${CMAKE_SOURCE_DIR}/tools/hrx_gtt_split.py --self-test)
+# engine#2143: GGML_HRX_LOG_DISPATCH stays a logging switch - read only in the two static void dispatch log functions
+# of the pinned fork (skips the tree check, not its self-test, when the submodule is not checked out).
+add_python_test(hrx_log_dispatch_neutral ${CMAKE_SOURCE_DIR}/tests/hrx_log_dispatch_neutral_test.py)
 # engine#679: time per HRX dispatch from the backend's serial trace (the id hash and the per-kernel sums).
 add_python_test(hrx_dispatch_profile_self ${CMAKE_SOURCE_DIR}/tools/hrx_dispatch_profile.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
@@ -456,6 +468,13 @@ endif()
 add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
 add_test(NAME think_split COMMAND think_split_test)
+# engine#2135: what enable_thinking can mean for a pack, read off its own chat template (app/think_template.h).
+add_executable(think_template_test tests/think_template_test.cpp)
+target_include_directories(think_template_test PRIVATE app)
+add_test(NAME think_template COMMAND think_template_test)
+# ci.yml's build list is not ours to edit without `workflow` scope, so the test reaches CI as a build dependency of a
+# target it already builds (tools/ci/ci_targets_check.py follows this edge).
+add_dependencies(onebit think_template_test)
 # Host / Origin checks every engine HTTP server applies (app/http_guard.h); header only, runs in CI.
 # engine#1779 (F10 fault 2): the degenerate-repetition predicate at the context limit. Header only, no device.
 add_executable(serve_degenerate_test tests/serve_degenerate_test.cpp)
@@ -488,6 +507,26 @@ add_test(NAME pack_initializer_shape COMMAND pack_initializer_shape_test)
 add_dependencies(onebit pack_initializer_shape_test)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
+# The speculative round's bookkeeping (app/spec_decode.h, engine#1781): a drafter's proposals against the verifier's
+# per-row logits, with the acceptance rule from npu/mtp/spec_accept.h (#1958, merged). Header-only and pure -- the
+# uniforms come from the caller, so every arm is a hand-computed value and there is no model, device or RNG here.
+# `add_dependencies(onebit ...)` because a target ci.yml never builds is the failure that check exists to catch.
+add_executable(spec_decode_test tests/spec_decode_test.cpp)
+# ${CMAKE_SOURCE_DIR} as well as app/, because app/spec_decode.h includes "npu/mtp/spec_accept.h" by its repo-relative
+# path -- which is how every other consumer of that header spells it. Without the root on this target's path the build
+# fails with "npu/mtp/spec_accept.h: No such file or directory", measured on CI run 42935896650 (the risk the PR body
+# named, so it cost one run rather than a review).
+target_include_directories(spec_decode_test PRIVATE app ${CMAKE_SOURCE_DIR})
+add_test(NAME spec_decode COMMAND spec_decode_test)
+add_dependencies(onebit spec_decode_test)
+# The reader for a tools/moe_placement.py table (app/moe_placement.h, engine#1702): a consumer that splits experts across
+# devices adopts a table only if it was written for this model -- schema, group count, every routed layer, every expert
+# id exactly once -- and only on the held-out share, never the in-sample one. Header only, no device, no model.
+add_executable(moe_placement_test tests/moe_placement_test.cpp)
+target_include_directories(moe_placement_test PRIVATE app)
+target_link_libraries(moe_placement_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME moe_placement_reader COMMAND moe_placement_test)
+add_dependencies(onebit moe_placement_test)
 # The NPU route's bounded load retry (app/npu_load_retry.h, engine #1010, docs/npu.md "When a load follows an evict"):
 # a load started right after an evict can hit the previous backend's hardware context still being torn down, which used
 # to be fatal on the first attempt. Header only, no device, no model.
@@ -1333,6 +1372,13 @@ target_link_libraries(dflash_draft_test PRIVATE onebit_npu)
 add_dependencies(onebit dflash_draft_test)
 set(ONEBIT_DFLASH_DRAFT "" CACHE PATH "A DFlash draft package directory for dflash_draft_test's real-package arm")
 add_test(NAME dflash_draft COMMAND dflash_draft_test ${ONEBIT_DFLASH_DRAFT})
+# The draft's forward as a host reference (engine#1780): hand-computed cases and structure properties; the real
+# package arm runs when ONEBIT_DFLASH_DRAFT names one.
+add_executable(dflash_forward_test tests/dflash_forward_test.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp npu/forward/src/q4nx_dequant.c)
+target_include_directories(dflash_forward_test PRIVATE npu npu/forward/include)
+target_link_libraries(dflash_forward_test PRIVATE onebit_npu)
+add_dependencies(onebit dflash_forward_test)
+add_test(NAME dflash_forward COMMAND dflash_forward_test ${ONEBIT_DFLASH_DRAFT})
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
@@ -1365,6 +1411,12 @@ add_executable(ffn_cache_policy_test tests/ffn_cache_policy_test.cpp)
 target_include_directories(ffn_cache_policy_test PRIVATE npu/forward/include)
 add_test(NAME ffn_cache_policy COMMAND ffn_cache_policy_test)
 add_dependencies(onebit ffn_cache_policy_test)
+# LFM2's gated short convolution as host arithmetic (npu/forward/include/lfm2_shortconv.h, engine#1786): the batched
+# form must equal the token-by-token form bit for bit. Header-only, no model, no device.
+add_executable(lfm2_shortconv_test tests/lfm2_shortconv_test.cpp)
+target_include_directories(lfm2_shortconv_test PRIVATE npu/forward/include)
+add_test(NAME lfm2_shortconv COMMAND lfm2_shortconv_test)
+add_dependencies(onebit lfm2_shortconv_test)
 
 # The device weight layout contract (q4nx_weight_layout): pure index math, no device
 # and no runtime.  CI builds an explicit target list, so the check compiles itself with
@@ -1835,6 +1887,9 @@ endif()
     # same sources against the runtime stub (engine#1946) cannot drift from this one.
     onebit_npu_forward_library(onebit_npu_forward onebit_npu_rt)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
+    # engine#2111: the usage object's pure function, its own TU so tests/serve_usage_test.cpp can link it without
+    # dragging in npu/rt.h (see cmake/tests-serve-usage.cmake).
+    target_sources(onebit PRIVATE app/serve_usage.cpp)
     # app/embed_serve.cpp's device path includes npu/embed/embed_npu.h (engine#1311): the embedding route's
     # ternary linears on the array, through the same int8 GEMM the forward links.
     target_include_directories(onebit PRIVATE ${CMAKE_SOURCE_DIR}/npu/embed ${CMAKE_SOURCE_DIR}/app
@@ -1915,6 +1970,17 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test>)
     set_tests_properties(batch_check_state PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # The same test on an LFM2-shaped hybrid the script fabricates (conv, attention, conv): the only container with
+    # short-convolution layers CI loads through the forward (engine#1786).
+    add_test(NAME batch_check_state_lfm2
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> lfm2)
+    set_tests_properties(batch_check_state_lfm2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # A fabricated qwen3_5 hybrid (a linear-attention layer, then attention): load only, see the script's header.
+    add_test(NAME batch_check_state_qwen35_load
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> qwen3_5)
+    set_tests_properties(batch_check_state_qwen35_load PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 
 # Private NPU routes (docs/npu.md, "Private routes"): closed-source add-ons in a checkout of

@@ -1467,6 +1467,28 @@ the decode, the tiling against `tests/golden/oga_pack_tiles.bin` — written by
 the attention tile against `tests/golden/oga_attn_tile.bin`, and, against a real pack, the refusal
 list, the tile round trip, the self-check numbers and that the container opens with `npu::Model`.
 
+### The tied-head self-check
+
+On a tied pack, the pack's own embedding is an independent reference for the decoded 4-bit head. The import compares the two and refuses a head that is scaled or only partly decoded. A pack in that state imports cleanly and answers garbage on the device, so `--allow-incomplete` does not override this refusal. The check has four parts. A head passes when all of them hold:
+
+- **correlation** above 0.99;
+- **best-fit scale** within 5 % of 1. This is the least-squares `a` in `embedding ≈ a · head`, so a scaled copy shows up here directly;
+- **RMS ratio** `rms(head) / rms(embedding)` within 5 % of 1;
+- **relative error** no more than 1.5× the embedding's own **4-bit noise floor**, or 0.02 if that is larger. The floor is what quantizing the embedding at the head's block size (asymmetric 4-bit, min/max per block) costs.
+
+The relative error on its own cannot separate a scaled head from a correct 4-bit head whose embedding is kept at higher precision: both score about 0.09. Measured (engine#1503):
+
+| pack | rel | best-fit scale | RMS ratio | noise floor | result |
+|---|---|---|---|---|---|
+| `Qwen2-1.5B_rai_1.9.0_npu` (block-32 tail head) | 0.094316 | 0.994173 | 1.001808 | 0.083865 | imports; on the NPU (`kernels-1536-2048-b8`, greedy) it answers "The capital of France is Paris." and "12 times 12 is 144." |
+| `SmolLM2-135M` rai_1.7.1 hybrid | 0.103587 | 0.992172 | 1.003540 | 0.097113 | imports |
+| `Qwen2.5-0.5B` rai_1.9.0 | 0.000700 | 0.999993 | 1.000006 | 0.006941 | imports |
+| `gemma-2-2b-awq-…-hybrid` | 0.094874 | 0.992235 | 1.003849 | 0.088985 | head passes, but refused by `model_type` (below) |
+
+A relative error near 0 means the embedding *is* the dequantized head (as on `Qwen-2.5_1.5B_Instruct` 1.9). It does not mean that only such packs are correct. The earlier rule (relative error ≤ 0.02, with nothing else checked) refused the first two packs above.
+
+**`model_type: gemma2` is refused by name.** The two gemma-2-2b hybrid packs answer garbage on this route (`myſelf…`), but their head is a correct 4-bit head, so the cause is somewhere else and has not been found. The import refuses them with that reason, rather than letting them import cleanly.
+
 ### Cross-check against the official converter
 
 ROCm's **FLM_Q4NX_Converter** (`convert.py`) is the official gguf → Q4NX converter, and since

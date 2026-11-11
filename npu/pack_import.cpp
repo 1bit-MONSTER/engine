@@ -4520,6 +4520,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             "tile decoder does not apply (engine#1503)");
     Report r;
     r.out_dir = out_dir;
+    r.model_type = p.dims.model_type;
     r.refused = p.refused();
     if (!r.refused.empty() && !opt.allow_incomplete) return r;  // refuse by name, write nothing
 
@@ -5030,24 +5031,15 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                          mm.weight.c_str(), q.N, q.K, mm.block, int(V), int(H), (int)head_geometry);
         if (tied || head_geometry) r.selfcheck_reference = true;
         if (tied || head_geometry) {
-            double sum_abs = 0, sum_ref = 0;
-            for (int n = 0; n < q.N; ++n)
-                for (int k = 0; k < q.K; ++k) {
-                    const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
-                    const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
-                    double e;
-                    e = embed_at(embed_tbl, int(n), k);
-                    sum_abs += std::fabs(x - e);
-                    sum_ref += std::fabs(e);
-                }
-            r.lmhead_rel = sum_abs / sum_ref;
+            r.head_fit = fit_head(q, embed_tbl, q.N, mm.block);
+            r.lmhead_rel = r.head_fit.rel;
             r.lmhead_corr = corr(q, embed_tbl, q.N);
             // The diagnostic follows the NUMBER, not the pack's declaration: a genre-A pack ships no config.json, so
             // `tied` is false there while the head plainly reproduces its embedding, and the readout used to call those
             // packs untied while the container it wrote said tied. Same threshold the container's own decision uses.
             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
 
-            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
+            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.head_fit);
             const Q4 swap = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K),
                                                mm.block, /*swap_nibbles*/ true, false);
             const Q4 nozp = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), nullptr, int(mm.N), int(mm.K),
@@ -5121,22 +5113,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                  : " (untied: layout checked, values not verified)");
             if (embed_tbl.ok()) {
                 r.lmhead_corr = c32;
-                {
-                    double sum_abs = 0, sum_ref = 0;
-                    for (int n = 0; n < int(V); ++n)
-                        for (int k = 0; k < q.K; ++k) {
-                            const size_t gg = size_t(n) * (q.K / 32) + size_t(k) / 32;
-                            const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[gg] + q.zero[gg];
-                            const double e = embed_at(embed_tbl, n, k);
-                            sum_abs += std::fabs(x - e);
-                            sum_ref += std::fabs(e);
-                        }
-                    if (sum_ref > 0) r.lmhead_rel = sum_abs / sum_ref;
-                }
+                r.head_fit = fit_head(q, embed_tbl, int(V), 32);
+                r.lmhead_rel = r.head_fit.rel;
                 r.selfcheck_reference = true;
                 r.selfcheck_tied = c32 > kTieCorr;
 
-                r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
+                r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.head_fit);
                 double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
                 const int nsh = std::min(2048, int(V) - 1);
                 for (int rr = 0; rr < nsh; ++rr)
@@ -5450,22 +5432,13 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                         // q.N may exceed V by the pack's tile padding (Hunyuan-0.5B: 120,832 rows for 120,818),
                         // so the reference is compared over the vocabulary's own rows.
                         if (q.N >= int(V) && q.K == int(H)) {
-                            double sum_abs = 0, sum_ref = 0;
-                            for (int n = 0; n < int(V); ++n)
-                                for (int k = 0; k < q.K; ++k) {
-                                    const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
-                                    const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
-                                    const double e =
-                                        embed_at(embed_tbl, int(n), k);
-                                    sum_abs += std::fabs(x - e);
-                                    sum_ref += std::fabs(e);
-                                }
-                            r.lmhead_rel = sum_abs / sum_ref;
+                            r.head_fit = fit_head(q, embed_tbl, int(V), q.block > 0 ? q.block : 128);
+                            r.lmhead_rel = r.head_fit.rel;
                             r.lmhead_corr = corr(q, embed_tbl, q.N);
                             r.selfcheck_reference = true;
                             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
 
-                            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
+                            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.head_fit);
                             // The control this path can actually run: the same tiles and the same decoder, with each
                             // head row matched against the NEXT embedding row. If a misaligned head still correlated,
                             // the number above would be measuring the vocabulary's mean brightness rather than the
@@ -6067,14 +6040,26 @@ int run(int argc, char** argv) {
     // packs measured: rel_err 0.095 and 0.136 against 0.000000 on the pack that serves). `--allow-incomplete` is not an
     // override here: that flag means "write the tensors I could not represent", and this is "the tensors I wrote do not
     // decode", which no amount of writing fixes.
+    // engine#1503: an architecture this route is measured to answer garbage on, whatever its head scores. The head fit
+    // above stopped refusing gemma-2-2b AWQ (its head is a correct 4-bit head), so the refusal that #2101 made for the
+    // wrong reason is kept here for the right one, by name, until the cause is found.
+    if (const char* why = known_bad_architecture(r.model_type)) {
+        std::fprintf(stderr, "1bit npu-pack: refusing to import %s: model_type %s -- %s. The partial output this run "
+                             "already wrote under %s is not servable -- delete it.\n",
+                     dir.c_str(), r.model_type.c_str(), why, out.c_str());
+        return 3;
+    }
     if (r.selfcheck_scaled) {
         std::fprintf(stderr,
                      "1bit npu-pack: refusing to import %s: the head correlates with the pack's own embedding (%.6f) but "
-                     "its relative error is %.6f, which is a scaled or partially decoded head rather than a rounding "
-                     "difference (the threshold is %.3f). A pack in this state imports cleanly and answers garbage on "
+                     "it is a scaled or partially decoded head rather than a correct 4-bit one: relative error %.6f "
+                     "(allowed %.6f = max(%.3f, %.1f x the embedding's own 4-bit noise floor %.6f)), best-fit scale %.6f "
+                     "and rms ratio %.6f (allowed 1 +- %.2f). A pack in this state imports cleanly and answers garbage on "
                      "the device; --allow-incomplete does not override this. The partial output this run already\n"
                      "wrote under %s is not servable -- delete it before retrying.\n",
-                     dir.c_str(), r.lmhead_corr, r.lmhead_rel, kSelfcheckRelMax, out.c_str());
+                     dir.c_str(), r.lmhead_corr, r.lmhead_rel,
+                     std::max(kSelfcheckRelMax, kHeadFloorFactor * r.head_fit.floor), kSelfcheckRelMax, kHeadFloorFactor,
+                     r.head_fit.floor, r.head_fit.scale, r.head_fit.rms_ratio, kHeadScaleTol, out.c_str());
         return 3;
     }
     if (!r.refused.empty() && !allow) {
@@ -6091,6 +6076,10 @@ int run(int argc, char** argv) {
         std::printf("  self-check: the head reproduces the pack's own embedding (as imported, bf16)  corr %.6f  rel_err %.6f\n"
                     "              (tied: this correlation is the check, and it passed)\n",
                     r.lmhead_corr, r.lmhead_rel);
+        if (r.head_fit.floor > 0)
+            std::printf("  head fit:   best-fit scale %.6f, rms ratio %.6f, embedding's own 4-bit noise floor %.6f "
+                        "(rel_err is %.2fx of it): a 4-bit head, not a scaled one\n",
+                        r.head_fit.scale, r.head_fit.rms_ratio, r.head_fit.floor, r.lmhead_rel / r.head_fit.floor);
         if (r.ctrl_corr_rowshift >= 0)
             std::printf("  controls:   row-shifted corr %.4f (must fail)\n", r.ctrl_corr_rowshift);
         else
@@ -6334,5 +6323,51 @@ void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::
 // copy is ambiguous with it at every call site). Correlated AND not a scaled copy of the embedding -- the two states this
 // box measures are rel_err 0.000000 (serves) and 0.095/0.136 (imports cleanly, answers garbage).
 bool selfcheck_head_ok(double corr, double rel) { return corr > kTieCorr && rel <= kSelfcheckRelMax; }
+
+const char* known_bad_architecture(const std::string& model_type) {
+    if (model_type == "gemma2")
+        return "gemma-2-2b hybrid packs import cleanly and answer garbage on this route (`myselfGetBytes...`, two packs, "
+               "measured for #2101), and their head is a correct 4-bit head (best-fit scale 0.992, rel 1.07x its 4-bit "
+               "noise floor), so the fault is elsewhere and not yet found (engine#1503)";
+    return nullptr;
+}
+
+bool selfcheck_head_ok(double corr, const HeadFit& f) {
+    return corr > kTieCorr && std::fabs(f.scale - 1.0) <= kHeadScaleTol && std::fabs(f.rms_ratio - 1.0) <= kHeadScaleTol &&
+           f.rel <= std::max(kSelfcheckRelMax, kHeadFloorFactor * f.floor);
+}
+
+HeadFit fit_head(const Q4& q, const EmbedTable& embed, int rows, int block) {
+    HeadFit f;
+    rows = std::min(rows, q.N);
+    if (block <= 0 || q.K % block) block = 32;
+    double sum_abs = 0, sum_ref = 0, sxe = 0, sxx = 0, see = 0, floor_abs = 0;
+    std::vector<double> e(size_t(q.K));
+    for (int n = 0; n < rows; ++n) {
+        for (int k = 0; k < q.K; ++k) e[size_t(k)] = embed_at(embed, n, k);
+        for (int k = 0; k < q.K; ++k) {
+            const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
+            const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
+            sum_abs += std::fabs(x - e[size_t(k)]);
+            sum_ref += std::fabs(e[size_t(k)]);
+            sxe += x * e[size_t(k)];
+            sxx += x * x;
+            see += e[size_t(k)] * e[size_t(k)];
+        }
+        for (int g0 = 0; g0 < q.K; g0 += block) {
+            double lo = e[size_t(g0)], hi = lo;
+            for (int k = g0; k < g0 + block; ++k) { lo = std::min(lo, e[size_t(k)]); hi = std::max(hi, e[size_t(k)]); }
+            const double sc = (hi - lo) / 15.0;
+            for (int k = g0; k < g0 + block; ++k) {
+                const double c = sc > 0 ? std::min(15.0, std::max(0.0, std::round((e[size_t(k)] - lo) / sc))) : 0.0;
+                floor_abs += std::fabs(c * sc + lo - e[size_t(k)]);
+            }
+        }
+    }
+    if (sum_ref > 0) { f.rel = sum_abs / sum_ref; f.floor = floor_abs / sum_ref; }
+    if (sxx > 0) f.scale = sxe / sxx;
+    if (see > 0) f.rms_ratio = std::sqrt(sxx / see);
+    return f;
+}
 
 }  // namespace onebit::npu::pack_import

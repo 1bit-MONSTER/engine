@@ -152,7 +152,12 @@ path untouched.
 
 `scripts/npu-window11.sh` is the gate the plan change was validated with: three fixed greedy prompts plus
 the prof table, compared between a run with the plan and one without. `--compare` refuses to run without
-`--tol PCT` or `--control C1.log C2.log`; `--self-test` checks that policy.
+`--tol PCT` or `--control C1.log C2.log`; `--self-test` checks that policy. The prof rows of the two
+runs must be the same set of (phase, role, M), with one declared exception: a run with the decode lm head on
+the host (`NPU_HEAD_HOST`, [npu.md](npu.md)) prints `dec HEAD M=1` where a device-head run prints
+`dec HEAD M=16`. When that pair is the whole difference the comparison passes, prints both head rows and
+which side each is on, and scores every shared row as usual; any other missing or added row still fails
+(engine#1785).
 
 Tests: `tests/npu_plan_test.cpp` (ctest `npu_plan`) pins the loader and the refusals;
 `tests/npu_plan_generate_test.py` (ctest `npu_plan_generate`) runs the generator and `--check` on a

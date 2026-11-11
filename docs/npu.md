@@ -1554,6 +1554,15 @@ kernels (dense Qwen3: 0.6B, 1.7B and 4B):
 In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
 The model directory holds the weights only; the kernels ship inside the package.
 
+**Streaming.** With `"stream": true` the route sends each piece of the answer as it is produced. The first frame
+leaves once the prompt has been processed and the first visible piece exists (a thinking model's opening markup is
+held until it can be classified, so that is a token or two after the prompt is done), and the rest follow about
+one per token. Before engine#1785 every frame was sent after the generation had ended, so a client's time to first
+token was the whole request. A request that fails before producing anything (a prompt over the context, a
+malformed field) still gets its own status code, not a 200 stream; one that fails later reports the error as a
+last `data:` frame. A client that disconnects stops the generation at the next token, which frees the device for
+the next request. The streamed reply and the non-streamed one are the same text.
+
 ### FastFlowLM's NPU2 drops: the families the route does not serve
 
 The daily census-watch (engine#588) prints one line per new or changed repo in FastFlowLM's HF
@@ -1874,6 +1883,14 @@ an end-of-sequence token, a stop sequence, a grammar that allows nothing more, o
 ended itself once its grammar had reached an accepting state — the route puts the container's end tokens into the
 mask exactly there, so a complete JSON object reports `stop` instead of padding with whitespace to `max_tokens`
 (engine#1182).
+
+Every pick is bounded by the tokenizer, not only the constrained one. The head is `vocab_size` wide, and
+`vocab_size` may exceed the tokenizer's ids: Qwen3's 151,936 against 151,669 (measured on Qwen3-0.6B's
+`config.json` and `tokenizer.json`). The ids in between are padding positions with no text, so a token drawn
+there emits nothing and never ends the reply. `sample_token()` and `1bit npu-run`'s per-row argmax
+(`argmax_token()`) therefore consider only ids below the tokenizer's size (`token_bound()` in
+`app/npu_sampling.h`, engine#2017), with or without a grammar. A container with no `tokenizer.json` keeps the
+whole row.
 
 The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of
 `third_party/llama.cpp/src/llama-sampler.cpp` (top_k, then top_p, then temperature, then the
@@ -2510,7 +2527,11 @@ sampled two ways), and `--batchcheck` takes the verify batch's M-curve.
 (`identical=N differing=0`). Both passes continue the same prefix: the oracle snapshots the first `start_pos`
 positions before the replay and restores them afterwards (engine#1905). So a chunk after the first, or the serve
 path's split-off last token, is compared from the state the batched pass really continues, and the flag leaves the
-run's own output unchanged. `tests/batch_check_state_test.cpp` pins both properties.
+run's own output unchanged. `tests/batch_check_state_test.cpp` pins both properties, and it runs in CI (engine#1946):
+a configure without the NPU lane builds the same forward sources against the public runtime stub
+(`onnx/ep/npu_runtime_ci_stub.cpp`, whose device calls throw; the host-GEMM forward makes none), and
+`tests/batch_check_state_ci.py` runs the test on a two-layer qwen3 container it writes and packs itself. With the
+NPU lane on, the row is the dev-box one and takes a real container from `ONEBIT_TEST_Q4NX`.
 
 `tools/mtp_depth_pool.py` pools those tickets. It refuses a pool it cannot read (a repeated tail, a cell scored twice, a
 short read, a mixed budget, a mixed window identity) and, since the tau=0.6 window, it also says when a depth is too

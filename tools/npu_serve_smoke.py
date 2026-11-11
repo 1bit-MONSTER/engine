@@ -230,7 +230,7 @@ def self_test_run(fails):
         fake = os.path.join(d, "fake1bit")
         with open(fake, "w") as f:
             f.write(FAKE_SERVE)
-        os.chmod(fake, 0o755)
+        os.chmod(fake, 0o700)
         for mode, tps, want_exit, want_line in (("fast", "90", 0, "RESULT: PASS"), ("slow", "1.9", 1, "route        FAIL"),
                                                 ("dead", "90", 1, "it never became ready")):
             with socket.socket() as s:
@@ -342,7 +342,7 @@ def main():
     if a.write_stand_in:
         with open(a.write_stand_in, "w") as f:
             f.write(FAKE_SERVE)
-        os.chmod(a.write_stand_in, 0o755)
+        os.chmod(a.write_stand_in, 0o700)
         return 0
     if a.self_test:
         return self_test()

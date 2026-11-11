@@ -389,6 +389,9 @@ add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
 # writes: a fast-route serve passes the gate, a slow-route one fails it while its answers are fine, a dead one fails,
 # and an unconfigured or NPU-less host skips. No device, no 1bit binary, and the fleet's queues are not touched.
 add_test(NAME hw_gate_npuserve COMMAND ${CMAKE_SOURCE_DIR}/tests/hw_gate_npuserve_test.sh)
+# Both start a loopback serve on a port picked by binding port 0 and releasing it, so they take the lock every
+# loopback-server test takes (tests/route_port_lock_test.py): two of them racing for one freed port is a flaky failure.
+set_tests_properties(hw_gate_npuserve npu_serve_smoke_self PROPERTIES RESOURCE_LOCK route_ports)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
 # engine #1504: the release preflight blocks on a runner unit that is down and only warns on a short restart policy.
 # The real scripts/ci-runner-health.sh and weekly.sh's preflight_runner_units() against a stub systemctl; no systemd.

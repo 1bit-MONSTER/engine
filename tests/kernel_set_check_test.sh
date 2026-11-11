@@ -108,6 +108,41 @@ check $([ $? -eq 1 ] && echo ok || echo fail) "two sets, one bad: rc 1"
 check $(has "$tmp/out10" "OK   " && has "$tmp/out10" "MIXED FORMS" && echo ok || echo fail) \
       "... both are reported, the good one included"
 
+
+# 8. the naming scheme, which is the other half of a binary/set mismatch (engine#2106): a current-main plan asks for
+#    role-named full_i8_*.elf, a pre-change set carries layerN_M/layer1.elf, and a set with both is refused
+mk_named() {  # mk_named <dir> <set> <role-count> <layer-count>
+    mkdir -p "$1"; python3 - "$1" "$2" "$3" "$4" <<'PY2'
+import hashlib, json, os, sys
+root, name, nrole, nlayer = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+files = []
+def put(rel):
+    full = os.path.join(root, rel); os.makedirs(os.path.dirname(full) or root, exist_ok=True)
+    body = b"\x7fELF" + rel.encode()
+    open(full, "wb").write(body)
+    files.append({"path": rel, "size": len(body), "sha256": hashlib.sha256(body).hexdigest()})
+for i in range(nrole):
+    put(f"full_i8_QKV_K1024_N{4096 + i}.elf")
+for i in range(nlayer):
+    put(f"layer1_{100 + i}/layer1.elf")
+json.dump({"format": 1, "set": name, "files": files}, open(os.path.join(root, "manifest.json"), "w"))
+PY2
+}
+mk_named "$tmp/n-role/1024x3072x16x8" 1024x3072x16x8 2 0
+"$script" "$tmp/n-role/1024x3072x16x8" > "$tmp/out11" 2>&1
+check $([ $? -eq 0 ] && echo ok || echo fail) "role-named set: rc 0"
+check $(has "$tmp/out11" "2 role-named full_i8_*.elf" && echo ok || echo fail) "... and the naming is named"
+
+mk_named "$tmp/n-layer/1024x3072x16x8" 1024x3072x16x8 0 3
+"$script" "$tmp/n-layer/1024x3072x16x8" > "$tmp/out12" 2>&1
+check $([ $? -eq 0 ] && echo ok || echo fail) "layer-indexed set: rc 0 on its own"
+check $(has "$tmp/out12" "3 layer-indexed" && echo ok || echo fail) "... and the naming is named"
+
+mk_named "$tmp/n-mixed/1024x3072x16x8" 1024x3072x16x8 1 2
+"$script" "$tmp/n-mixed/1024x3072x16x8" > "$tmp/out13" 2>&1
+check $([ $? -eq 1 ] && echo ok || echo fail) "a set with BOTH naming schemes: rc 1"
+check $(has "$tmp/out13" "MIXED NAMING" && echo ok || echo fail) "... and the reason is named"
+
 if [ "$fails" -ne 0 ]; then
     printf 'kernel_set_check: %d failure(s)\n' "$fails"
     exit 1

@@ -333,11 +333,31 @@ Measured on gfx1151 (2026-11-11, fork `7a1f2b81c`, full build):
   2735 tok/s (ratio 0.98, pairs between 0.88 and 1.14). No regression shown; a cost of 2 to 3 % is
   not excluded.
 
-Still open under #1962: the final projection of the draft head (a shortlist kernel) narrows its
-activations too and has no test that reaches it. The other kernels that read the 8-bit blocks (the
-fused SwiGLU, the routed kernels and the low-token Q4 paths) use the stored sum as it is and are not
-measured above 65504. And the limits are moved, not removed: 4.19e6 for the half-precision copies,
-8.3e6 for the 8-bit blocks.
+The last path was the draft head's logits step, on main since pin `204493d40` (llama.cpp #303). A Q6_K
+projection onto a vocabulary of at least 65,536 at one token, downstream of the draft (MTP) head's
+concat projection, runs as a shortlist: a coarse scan, the 128 best candidates, and an exact refine
+of those. Qwen3.8-Flash-Next with its MTP companion has that shape, and no test had ever reached
+it. The first ones found two faults:
+
+- The scan read group ids that were never written. The matcher asked for 96 activation groups at
+  every width; only `width / 32` exist, so below a width of 3072 the rest of the id buffer was used
+  as it was found. At width 256 that was a device memory fault on ordinary data; at Flash-Next's
+  2560 it was 16 stray indices on every draft-head logits step. The request is now capped at the
+  number of groups.
+- The refine kernel narrowed the activation to half precision unscaled, so one activation above
+  65504 made every refined logit `inf`. It now carries the activation and the logit at 2^-6.
+
+Measured on gfx1151 (2026-11-11): the new `test-hrx-ops` cases (width 256, 65,536 outputs) went
+from a device fault to passing on ordinary data (128 refined candidates, NMSE 6.5e-7 against the
+CPU), with one activation at 1.06e5 (128 of 128 refined logits `inf` with only the first fault
+fixed; 0 after), and with activations to 1.18e5 and logits to 2.3e5. A scheduling test without a
+device pins the group count at widths 256, 2560 and 4096. Not run on Flash-Next itself. In about 50 runs one
+refined logit came back wrong once and did not recur ([engine#2150](https://github.com/1bit-MONSTER/engine/issues/2150)).
+
+Not measured, tracked in [engine#2127](https://github.com/1bit-MONSTER/engine/issues/2127): the
+routed gate/up kernels narrow their input the same way (that input is a norm output), and the other
+kernels that read the 8-bit blocks use the stored sum as it is. And the limits are moved, not
+removed: 4.19e6 for the half-precision copies and the draft-head logits, 8.3e6 for the 8-bit blocks.
 
 ### Fixed: Qwen3-VL on `HRX0`: it decodes again, and its rotation runs on the device ([engine#1467](https://github.com/1bit-MONSTER/engine/issues/1467))
 

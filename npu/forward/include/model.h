@@ -158,6 +158,22 @@ static inline int model_tensor_name_alt(const char* name, char* out, size_t cap)
     memcpy(out + tl, rest, rl + 1);
     return 1;
 }
+// How many of the first `n_layers` layers are gated short-convolution layers (LFM2's hybrid: a layer is one iff it
+// carries shortconv.in_proj, see LayerWeights), and, through `first`, the index of the first of them (-1 if none).
+// The loader reads those tensors; whether anything RUNS them is the forward's business, and a forward that does not
+// must refuse the pack by name instead of running a convolution layer as attention (engine#1786: FastFlowLM's
+// LFM2.5-1.2B-NPU2 loaded, failed its warm-up with "MLP dequant : data_size 0 ...", and was announced as ready).
+static inline int model_shortconv_layers(const ModelWeights* mw, int n_layers, int* first) {
+    int count = 0;
+    if (first) *first = -1;
+    if (!mw || !mw->layers) return 0;
+    for (int l = 0; l < n_layers; l++) {
+        if (mw->layers[l].shortconv_in_proj_weight.shape[0] == 0) continue;
+        if (count == 0 && first) *first = l;
+        count++;
+    }
+    return count;
+}
 void model_print_info(ModelWeights* mw);
 int model_find_tensor(const char* name, ModelWeights* mw);
 

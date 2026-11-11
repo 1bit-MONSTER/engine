@@ -289,8 +289,22 @@ Measured on strixhalo, 2026-11-11, Qwen3-0.6B, one ticket each:
 | a build of main without the private route, model-generic directory | per-op | `FAIL`: `route`, `rate` (median 1.9 tok/s) and `first-token` (1,063 ms) fail; `content` passes |
 
 The second row is the point: its three answers were fine, and only the other three assertions say
-the release would have shipped the slow route. The check is not wired into `scripts/hw-gate.sh` or the
-release script yet; it is the instrument, and the release lane decides where it runs.
+the release would have shipped the slow route.
+
+**In the gate: the `npuserve` phase.** `scripts/hw-gate.sh --phases npuserve` runs the check under the
+same NPU claim as the `npu` phase and adds its row to the summary, with the four assertion lines as the
+detail:
+
+```sh
+HW_GATE_NPU_SERVE_BIN=/path/to/1bit HW_GATE_NPU_SERVE_MODEL=/path/to/Qwen3-0.6B scripts/hw-gate.sh --phases npuserve
+```
+
+`HW_GATE_NPU_SERVE_FLOOR` sets the tok/s floor (default 60) and `HW_GATE_NPU_SERVE_PORT` the port. The
+row is `PASS` only when the tool exits 0 **and** printed `RESULT: PASS`, so a truncated log cannot pass.
+Like `npu`, the phase is not in the default phases and skips when there is no NPU or the two settings
+are absent; the release procedure has to name it and set them for it to gate anything. It has not been
+added to the release script. `tests/hw_gate_npuserve_test.sh` drives the phase end to end against a
+stand-in serve (fast, slow, a floor it misses, dead at start, unconfigured, no NPU) with no device.
 
 ## Measured
 

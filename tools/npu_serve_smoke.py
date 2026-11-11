@@ -188,6 +188,75 @@ def rejudge(args):
     return report(judge(log_text, replies, args.floor, args.first_token_ms, args.fast_route, args.slow_route))
 
 
+FAKE_SERVE = r'''#!/usr/bin/env python3
+# A stand-in for `1bit serve`, written by npu_serve_smoke.py --self-test: it prints a route line, answers /health and
+# /v1/chat/completions with the timings FAKE_TPS gives, and exits on SIGTERM. FAKE_MODE=dead exits before listening.
+import http.server, json, os, signal, sys
+port = int(sys.argv[sys.argv.index("-p") + 1])
+mode, tps = os.environ.get("FAKE_MODE", "fast"), float(os.environ.get("FAKE_TPS", "90"))
+if mode == "dead":
+    print("1bit serve: cannot open the device", flush=True); sys.exit(3)
+print("1bit unified: on the private route dx: dense Qwen3 on the dx kernels" if mode == "fast" else
+      "1bit serve: a model-generic container: serving it through the per-op forward", flush=True)
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _send(self, obj):
+        b = json.dumps(obj).encode(); self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_GET(self): self._send({"status": "ok"})
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self._send({"choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Paris."}}],
+                    "timings": {"prompt_ms": 200.0 if mode == "fast" else 1100.0, "predicted_ms": 1000.0 * 8 / tps, "predicted_per_second": tps},
+                    "usage": {"completion_tokens": 8}})
+srv = http.server.HTTPServer(("127.0.0.1", port), H)
+def bye(*a):
+    if os.environ.get("FAKE_MARK"): open(os.environ["FAKE_MARK"], "w").write("terminated")
+    os._exit(0)
+signal.signal(signal.SIGTERM, bye)
+srv.serve_forever()
+'''
+
+
+def self_test_run(fails):
+    """run() end to end against the stand-in: it starts the serve, waits, asks, stops it, and returns the verdict."""
+    import contextlib
+    import io
+    import shutil
+    import socket
+    import tempfile
+    d = tempfile.mkdtemp(prefix="npu_serve_smoke_selftest.", dir=os.getcwd())   # the working directory, not /tmp
+    try:
+        fake = os.path.join(d, "fake1bit")
+        with open(fake, "w") as f:
+            f.write(FAKE_SERVE)
+        os.chmod(fake, 0o755)
+        for mode, tps, want_exit, want_line in (("fast", "90", 0, "RESULT: PASS"), ("slow", "1.9", 1, "route        FAIL"),
+                                                ("dead", "90", 1, "it never became ready")):
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            mark = os.path.join(d, "mark." + mode)
+            os.environ.update(FAKE_MODE=mode, FAKE_TPS=tps, FAKE_MARK=mark)
+            args = argparse.Namespace(bin=fake, model="model-dir", out=os.path.join(d, mode), port=port, floor=60.0, first_token_ms=600.0,
+                                      fast_route=FAST_ROUTE, slow_route=SLOW_ROUTE, max_tokens=8, ready_seconds=5 if mode == "dead" else 30,
+                                      request_seconds=30)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run(args)
+            text = buf.getvalue()
+            if rc != want_exit or want_line not in text:
+                fails.append("run() against a %s stand-in: exit %d, output %r" % (mode, rc, text[-300:]))
+            if mode != "dead" and not os.path.exists(mark):
+                fails.append("run() against a %s stand-in left the serve running (no SIGTERM seen)" % mode)
+            if mode == "fast" and not os.path.exists(os.path.join(d, mode, "reply_2.json")):
+                fails.append("run() did not keep the three replies")
+    finally:
+        for k in ("FAKE_MODE", "FAKE_TPS", "FAKE_MARK"):
+            os.environ.pop(k, None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def self_test():
     fails = []
 
@@ -245,9 +314,11 @@ def self_test():
     if not degenerate("//////") or degenerate("391") or degenerate("aa") or not degenerate("a a a a"):
         fails.append("degenerate(): wrong on a fixture")
 
+    self_test_run(fails)
     for f in fails:
         print("FAIL " + f)
-    print("npu_serve_smoke self-test: %d case(s) failed" % len(fails) if fails else "npu_serve_smoke self-test: 16 cases ok")
+    print("npu_serve_smoke self-test: %d case(s) failed" % len(fails) if fails
+          else "npu_serve_smoke self-test: 16 judging cases and 3 runs against a stand-in serve ok")
     return 1 if fails else 0
 
 
@@ -255,6 +326,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--judge", metavar="DIR")
+    p.add_argument("--write-stand-in", metavar="PATH", help="write the self-test's stand-in serve to PATH (for testing a caller)")
     p.add_argument("--bin")
     p.add_argument("--model")
     p.add_argument("--out", default="~/.cache/1bit/npu-serve-smoke")
@@ -267,6 +339,11 @@ def main():
     p.add_argument("--ready-seconds", type=int, default=120)
     p.add_argument("--request-seconds", type=int, default=120)
     a = p.parse_args()
+    if a.write_stand_in:
+        with open(a.write_stand_in, "w") as f:
+            f.write(FAKE_SERVE)
+        os.chmod(a.write_stand_in, 0o755)
+        return 0
     if a.self_test:
         return self_test()
     if a.judge:

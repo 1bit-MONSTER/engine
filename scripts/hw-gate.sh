@@ -35,6 +35,9 @@
 #           a 64-position greedy build, the prompt prefill, run-to-run reproducibility and a
 #           tok/s floor (HW_GATE_NPU_FLOOR). Auto-skips with no NPU or no checker configured; not
 #           in the default phases (add it with --phases npu).
+#   npuserve  the shipped binary's `1bit serve --device npu` on a small model: the fast route's own log line, a
+#           decode floor, the first token and a non-empty answer (tools/npu_serve_smoke.py; engine#2106, #2102).
+#           Auto-skips with no NPU or no HW_GATE_NPU_SERVE_BIN / HW_GATE_NPU_SERVE_MODEL; not in the default phases.
 #   placement  every graph the server scheduled for a gate model (load, warmup, the kat prompts,
 #           the needle) is all on HRX: ggml-hrx's placement report (GGML_HRX_REPORT=2, engine #390)
 #           names no node off HRX, as `1bit serve` now requires by default (docs/serve.md)
@@ -656,6 +659,40 @@ if has npu; then
     if ! [[ "$tps" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then st=FAIL; slow=" (no tok/s reported: the speed floor cannot be checked)"
     elif awk -v t="$tps" -v f="$floor" 'BEGIN{exit !(t+0 < f+0)}'; then st=FAIL; slow=" (below the ${floor} tok/s floor)"; fi
     result npu $st $(( $(date +%s) - t0 )) "oracle=${oracle:-?} greedy64=${greedy:-?} prefill=${prefill:-?} reproducible=${repro:-?}${tps:+ tok/s=$tps}$slow"
+  fi
+fi
+
+# ---- npuserve (the shipped binary's `serve --device npu`: on the fast route, at speed, with an answer) ----
+# The npu phase above checks the engine through a private checker and never starts `1bit serve`, so it cannot see a
+# shipped binary whose serve quietly takes the slow per-op route: that serve still answers, at about 2 tok/s where the
+# fast route gives 80 to 100 (engine#2102, #2106). tools/npu_serve_smoke.py asserts the route's own log line, the decode
+# floor, the first token and a non-empty answer. Set HW_GATE_NPU_SERVE_BIN to the 1bit under test and
+# HW_GATE_NPU_SERVE_MODEL to the small model directory; HW_GATE_NPU_SERVE_FLOOR is the tok/s floor (default 60).
+# It runs under the same NPU claim as the npu phase and, like it, is not in the default phases.
+if has npuserve; then
+  t0=$(date +%s)
+  smoke=$(cd "$(dirname "$0")/.." && pwd)/tools/npu_serve_smoke.py
+  if [ ! -e "${HW_GATE_NPU_DEV:-/dev/accel/accel0}" ]; then
+    result npuserve SKIP 0 "no NPU (/dev/accel/accel0) on this host"
+  elif [ -z "${HW_GATE_NPU_SERVE_BIN:-}" ] || [ -z "${HW_GATE_NPU_SERVE_MODEL:-}" ]; then
+    result npuserve SKIP 0 "no serve under test configured (HW_GATE_NPU_SERVE_BIN and HW_GATE_NPU_SERVE_MODEL)"
+  else
+    cool
+    log=$OUT/npuserve.log
+    hold_args=()
+    if [ "${HW_GATE_NPU_HOLD:-1}" != 0 ] && [ -n "$NPU_HOLD" ] && ! token_held_by_ancestor "$NPU_TOKEN"; then
+        hold_args=("$NPU_HOLD" -l hw-gate-npuserve -t "${HW_GATE_NPU_HOLD_MINUTES:-20}" -w "$LOCK_WAIT" --)
+    fi
+    "${hold_args[@]}" flock -w "$LOCK_WAIT" -E 75 "$LOCK" python3 "$smoke" --bin "$HW_GATE_NPU_SERVE_BIN" \
+        --model "$HW_GATE_NPU_SERVE_MODEL" --out "$OUT/npuserve" --floor "${HW_GATE_NPU_SERVE_FLOOR:-60}" \
+        ${HW_GATE_NPU_SERVE_PORT:+--port "$HW_GATE_NPU_SERVE_PORT"} > "$log" 2>&1
+    rc=$?
+    st=FAIL
+    # the tool's own verdict line AND its exit status: a pass needs both, so a truncated log cannot pass
+    [ "$rc" = 0 ] && grep -q '^RESULT: PASS$' "$log" && st=PASS
+    [ "$rc" = 75 ] && infra=1
+    detail=$(grep -E '^(route|rate|first-token|content|serve) ' "$log" | sed -E 's/ +/ /g' | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+    result npuserve $st $(( $(date +%s) - t0 )) "${detail:-no assertion lines in the log (exit $rc)}"
   fi
 fi
 

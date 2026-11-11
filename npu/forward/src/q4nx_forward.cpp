@@ -24,6 +24,7 @@
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
 #include "q4nx_forward.h"
+#include "weight_keys.h"     // the per-layer weight-cache keys, held distinct at compile time
 #include "pad_head_rows.h"   // engine#1990: the padded-head row rule, header-only for its arm
 #include "batch_width.h"
 #include "ffn_cache_policy.h"
@@ -5324,8 +5325,10 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
                 const Q4nxDesignGeom* g = &designs_[i_pg];
                 Q4nxProjections p{};
                 p.ple = inp_gate_[l].data();
-                if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble plegate"; return false; }
-                npu_gemm(i_pg, x.data(), g->K, g->N, B_.data(), pg, 0, nullptr, g->real_k);
+                // The layer's own weight-cache keys (weight_keys.h): 0 and 1 are this layer's QKV and O, and a gate
+                // launched under key 0 ran with the QKV image on the device -- the host arms have no such cache.
+                if (!weight_cached(onebit::npu::kWkeyPleGate) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble plegate"; return false; }
+                npu_gemm(i_pg, x.data(), g->K, g->N, B_.data(), pg, onebit::npu::kWkeyPleGate, "ple_gate", g->real_k);
             }
             const int gelu = (sem_.mlp_act == Q4NX_ACT_GELU);
             for (int i = 0; i < ple_dim_; i++) {
@@ -5343,8 +5346,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
                 const Q4nxDesignGeom* g = &designs_[i_pp];
                 Q4nxProjections p{};
                 p.ple = ple_proj_[l].data();
-                if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble pleproj"; return false; }
-                npu_gemm(i_pp, pg.data(), g->K, g->N, B_.data(), pp, 1, nullptr, g->real_k);
+                if (!weight_cached(onebit::npu::kWkeyPleProj) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble pleproj"; return false; }
+                npu_gemm(i_pp, pg.data(), g->K, g->N, B_.data(), pp, onebit::npu::kWkeyPleProj, "ple_proj", g->real_k);
             }
             rmsnorm(pp.data(), post_ln_[l].data(), H, xn.data());
             for (int k = 0; k < H; k++) x[k] += xn[k];

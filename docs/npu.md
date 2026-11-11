@@ -2712,6 +2712,14 @@ can fail a run.
 variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
 looking for a code path that skips the dump.
 
+**A projection that is right on the host and wrong on the device: check its weight-cache key.** The device target
+keeps one packed weight image per (layer, key), and the host arms do not use that cache. Two projections of one layer
+under one key therefore launch with the same weights on the NPU only: a Gemma4 pack answered correctly in host-GEMM
+mode and returned noise on the device, with every kernel bit-exact, because its per-layer input gate and projection
+used the attention projections' keys (engine#2213). `NPU_INFER_DUMP_OPS=1` on both sides showed it in one token: the
+op lines agree up to the first projection that shares a key. A layer's keys are named in
+`npu/forward/include/weight_keys.h` and held distinct at compile time; a new projection takes a new name there.
+
 The files these dumps write (`NPU_INFER_DUMP_DIR`'s `layer_<ll>.f32`, `NPU_I8_GS_DUMP`'s weight-scale pairs) are
 created owner-only (0600) and never through a symlink at the final path component, whatever the umask, and a dump file
 an older build left at 0666 is narrowed to 0600 when it is rewritten; the head-image cache's files are at most 0644. Both go through `npu/forward/include/file_create.h`, so no write site uses `fopen(…, "w")`,

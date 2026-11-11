@@ -1593,6 +1593,12 @@ add_test(NAME batch_check_compare COMMAND batch_check_compare_test)
 # engine#1780: the DFlash draft block's acceptance arithmetic -- tokens = accepted + bonus, the break-even rule, and the
 # published OGA-route counts as known answers. Header-only and host-only: no container, no device, no NPU runtime, so it
 # runs wherever this file is built. Registered at top level with the same hook as the row above, for the same reason.
+# The per-layer weight-cache keys are distinct (npu/forward/include/weight_keys.h): two projections of one layer
+# under one key launch with the same weights on the device. Header-only, no model.
+add_executable(weight_keys_test tests/weight_keys_test.cpp)
+target_include_directories(weight_keys_test PRIVATE npu/forward/include)
+add_test(NAME weight_keys COMMAND weight_keys_test)
+add_dependencies(onebit weight_keys_test)
 add_executable(dflash_accept_test tests/dflash_accept_test.cpp)
 target_include_directories(dflash_accept_test PRIVATE npu/forward/include)
 add_test(NAME dflash_accept COMMAND dflash_accept_test)

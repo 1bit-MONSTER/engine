@@ -53,6 +53,13 @@ git -C "$tmp" commit -qm base
 
 # captured into a variable, never piped: `gate | grep -q` would make grep close the pipe early and, with pipefail,
 # report the gate's SIGPIPE instead of its verdict
+NOTICE_BLOCK=$(python3 - "$tmp/copyright.py" <<'PYN'
+import sys
+src = open(sys.argv[1]).read()
+notice = src.split('NOTICE = """')[1].split('""".split')[0]
+print("".join("# " + l + "\n" if l.strip() else "#\n" for l in notice.splitlines()), end="")
+PYN
+)
 gate() { ( cd "$tmp" && python3 copyright.py --check 2>&1 ); }
 gate_has() { case "$(gate)" in *"$1"*) return 0;; *) return 1;; esac; }
 
@@ -149,6 +156,18 @@ check "--fix on a two-liner leaves a file that its own --check accepts" \
 check "...and exactly one SPDX line is left in the window" \
       "[ \$(head -20 \"$tmp/twoliner.py\" | grep -c 'SPDX-License-Identifier') -eq 1 ]" \
       "window: $(head -20 "$tmp/twoliner.py" | grep -c 'SPDX-License-Identifier') SPDX line(s)"
+
+# 3. the block pasted twice: --fix must leave ONE notice. This is #2192's second shape -- `--fix` printed `repaired:` and
+# left the copy in place, so the file it had just written still failed the very check that sent it there.
+printf '%s%s\nx = 1\n' "$NOTICE_BLOCK" "$NOTICE_BLOCK" > "$tmp/doubled.py"
+git -C "$tmp" add doubled.py
+( cd "$tmp" && python3 copyright.py --fix >/dev/null 2>&1 )
+check "--fix on a doubled block leaves a file that its own --check accepts" \
+      "! ( cd \"$tmp\" && python3 copyright.py --check 2>&1 | grep -q duplicated )" \
+      "$( cd "$tmp" && python3 copyright.py --check 2>&1 )"
+check "...and exactly one SPDX line survives the repair" \
+      "[ \$(grep -c 'SPDX-License-Identifier' \"$tmp/doubled.py\") -eq 1 ]" \
+      "$(grep -c 'SPDX-License-Identifier' "$tmp/doubled.py") SPDX line(s)"
 
 echo "$([ $fail -eq 0 ] && echo PASS || echo FAIL)"
 exit $((fail))

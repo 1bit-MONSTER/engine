@@ -251,8 +251,13 @@ def repair_notice(text, block):
     and it needed its own path because it is neither "notice missing" (has_notice() is true, so --fix skipped
     the file) nor "duplicate canonical pair" (duplicated_notice() only reported it, even under --fix). Dropping
     the copyright line and the SPDX line directly beneath it keeps a near-miss pair from leaving an orphan.
+
+    It also keeps the FIRST canonical notice and drops later copies of the same line, which is the doubled-block shape:
+    --fix used to answer `repaired:` for that state while `--check` went on reporting the duplicate, i.e. the one mode
+    that could fix it claimed to and did not.
     """
     out, drop_next_spdx = [], False
+    seen_canonical = set()
     for line in text.splitlines(keepends=True):
         if near_miss_holder(line):
             drop_next_spdx = True
@@ -261,6 +266,15 @@ def repair_notice(text, block):
             drop_next_spdx = False
             continue
         drop_next_spdx = False
+        # A SECOND canonical notice is the same defect as a near-miss beside the first: the block pasted twice. `--check`
+        # has always reported it (`duplicated_notice`); `--fix` used to print "repaired" and leave the copy in place, so the
+        # file it had just written still failed the very check that sent it there. The first occurrence is kept and later
+        # ones dropped, which is what "delete the second copy" means.
+        if canonical_notice_line(line):
+            key = re.sub(r"^\W+", "", line).strip()
+            if key in seen_canonical:
+                continue
+            seen_canonical.add(key)
         out.append(line)
     repaired = "".join(out)
     return repaired if has_notice(repaired) else add_notice(repaired, block)

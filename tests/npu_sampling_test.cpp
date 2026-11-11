@@ -529,6 +529,39 @@ void test_prefix_pin() {
         check(PrefixCache(off).pin_point(q1, q2) == 0, "an off cache pins nothing");
         check(PrefixCache(off).pin(q1, 10) == -1, "and refuses a pin");
     }
+    {   // pin_at: the end of the system turn is known on the FIRST request, so the second one is already warm
+        PrefixCache c(o);
+        check(c.pin_at(q1, 900) == 900, "the first request under a 900-token system prompt pins its 900 tokens");
+        check(c.pin_point({}, q1) == 0, "where comparing with a previous request has nothing to offer yet");
+        std::string why;
+        const int pin = c.pin(std::vector<int>(q1.begin(), q1.begin() + 900), 2000, &why);
+        c.insert(q1, 1000);
+        const auto d = c.lookup(q2);
+        check(pin >= 0 && d.slot == pin && d.cached_tokens == 900 && d.pinned,
+              "so the SECOND question resumes from the pin: 900 of its 930 tokens");
+        check(c.pin_at(q2, 900) == 0 && c.pin_at(q3, 900) == 0, "and later requests do not pin the same point again");
+        // what is not worth a pin, or is not one
+        check(c.pin_at(q1, 0) == 0, "no system turn, no pin");
+        check(c.pin_at(q1, q1.size()) == 0 && c.pin_at(q1, q1.size() + 5) == 0, "a point at or past the end of the prompt is insert()'s");
+        PrefixCache fresh(o);
+        check(fresh.pin_at(q1, 127) == 0 && fresh.pin_at(q1, 128) == 128, "a system turn shorter than prefix-min-gain is not pinned");
+        PrefixOptions off = o;
+        off.slots = 0;
+        check(PrefixCache(off).pin_at(q1, 900) == 0, "an off cache pins nothing");
+        // a pin that ran into the question (two questions opening alike) does not cover a question that opens
+        // differently, and the system turn's own end then replaces it
+        PrefixCache over(o);
+        std::vector<int> a1 = prompt(900, 5000, 40), a2 = prompt(900, 5000, 40), b1 = prompt(900, 8000, 40);
+        a2[905] = 4242;                                            // same first five question tokens, then different
+        const size_t ran_over = over.pin_point(a1, a2);
+        check(ran_over == 905, "comparing two alike-opening questions pins five tokens into the question");
+        over.pin(std::vector<int>(a2.begin(), a2.begin() + long(ran_over)), 2000);
+        check(over.lookup(b1).cached_tokens == 0, "which a differently opening question cannot use");
+        check(over.pin_at(b1, 900) == 900, "the system turn's end is still worth pinning for it");
+        const int repin = over.pin(std::vector<int>(b1.begin(), b1.begin() + 900), 2000);
+        check(repin >= 0 && over.lookup(b1).cached_tokens == 900 && over.lookup(a1).cached_tokens == 900,
+              "and once pinned there, every question under that system prompt resumes from it");
+    }
     {   // the pin outlives what evicts and replaces everything else
         PrefixOptions b = o;
         b.slots = 4;  // one more than the three snapshots the budget holds, so a slot is always free

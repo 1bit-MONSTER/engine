@@ -200,6 +200,7 @@ add_test(NAME serve_hangup COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_hangup_test.s
 # engine#1945: scripts/bump-hrx-sync.sh tells AMD's own commit from a line AMD rebased apart from a commit that
 # is not AMD's. Local git repositories only: no network, no GPU.
 add_test(NAME bump_hrx_sync COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_sync_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-sync.sh)
+add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
 add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $<TARGET_FILE:onebit>)
@@ -432,6 +433,13 @@ add_test(NAME serve_watchdog COMMAND serve_watchdog_test)
 # engine#1781: the comparator behind NPU_BATCH_CHECK -- pure arithmetic over two float arrays, so it runs with no model,
 # no device and no runtime. It is a header, so the test includes it directly and needs no link libraries.
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
+# The shape rule for a 1.8 external-data initializer (npu/pack_initializer_shape.h, engine#1503's graph-initializer
+# reader). Those packs zero every `dims`, so a byte length has to become a shape -- and a shape inferred wrongly imports
+# cleanly and serves garbage, so the refusals are the arms worth pinning. Header-only, no parser, no pack, no device.
+add_executable(pack_initializer_shape_test tests/pack_initializer_shape_test.cpp)
+target_include_directories(pack_initializer_shape_test PRIVATE npu)
+add_test(NAME pack_initializer_shape COMMAND pack_initializer_shape_test)
+add_dependencies(onebit pack_initializer_shape_test)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 # The NPU route's bounded load retry (app/npu_load_retry.h, engine #1010, docs/npu.md "When a load follows an evict"):

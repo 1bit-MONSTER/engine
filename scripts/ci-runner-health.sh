@@ -34,6 +34,32 @@
 # (no such units on this host, so a silent pass would be the defect).
 set -uo pipefail
 
+# <restart> <oompolicy> <memorymax> -> one verdict line. The state checks above answer "is it alive", which is what the
+# issue named; this answers "will it come back", which is what actually kept both runners dead for 3h45m (engine#1504).
+# A unit with Restart=no/OOMPolicy=stop PASSes every state check right up to the OOM kill that ends it for good, so the
+# configuration has to be read, not inferred from ActiveState. Expected values are docs/ci-runners.md's, and the reason
+# for each is one line there (runsvc.sh exits 0 after a kill, so on-failure never fires; OOMPolicy=stop lets an OOM kill
+# of a JOB stop the RUNNER).
+policy_verdict() {
+    _rst=${1:-} _oom=${2:-} _mmax=${3:-}
+    if [ -z "$_rst" ]; then
+        printf 'FAIL no restart policy could be read for this runner, so whether it would come back after an OOM kill is unknown'
+        return 0
+    fi
+    _bad=""
+    # always, not on-failure: runsvc.sh reports success when it is killed, so on-failure never fires.
+    [ "$_rst" = always ] || _bad="$_bad Restart=$_rst(want always);"
+    [ "${_oom:-}" = continue ] || _bad="$_bad OOMPolicy=${_oom:-?}(want continue);"
+    # an infinite ceiling means the cgroup never hits its own limit, so the box's OOM killer chooses - and the bench runner
+    # is the unit whose jobs are memory-heavy by definition.
+    [ -n "${_mmax:-}" ] && [ "$_mmax" != infinity ] || _bad="$_bad MemoryMax=${_mmax:-?}(want a ceiling);"
+    if [ -n "$_bad" ]; then
+        printf 'FAIL the restart policy cannot restart this runner after an OOM kill:%s one OOM kill and the unit stops for good, while jobs read as pending' "$_bad"
+        return 0
+    fi
+    printf 'PASS Restart=always, OOMPolicy=continue, MemoryMax=%s - an OOM kill costs a job, not the runner' "$_mmax"
+}
+
 # <state> <substate> <result> <nrestarts> -> one verdict line
 runner_verdict() {
     _st=${1:-} _sub=${2:-} _res=${3:-} _nr=${4:-}
@@ -75,7 +101,15 @@ self_test() {
     else printf 'FAIL the restart window should be named in the message\n'; rc=1; fi
     # a restart policy that works shows NRestarts>0 and result success - which is a PASS with the count visible
     chk PASS "$(runner_verdict active running success 3)"
-    [ "$rc" = 0 ] && echo "ci-runner-health self-test: ok (9 cases)" || echo "ci-runner-health self-test: FAIL"
+    # engine#1504: the state checks cannot see a unit that is one OOM kill away from being gone for good, which is why the
+    # bench runner PASSed this script while carrying Restart=no/OOMPolicy=stop.
+    chk PASS "$(policy_verdict always continue 51539607552)"
+    chk FAIL "$(policy_verdict no stop infinity)"          # the live strixhalo-bench unit on 2026-11-11
+    chk FAIL "$(policy_verdict on-failure continue 51539607552)"   # on-failure never fires: runsvc.sh exits 0
+    chk FAIL "$(policy_verdict always stop 51539607552)"    # an OOM kill of a JOB stops the RUNNER
+    chk FAIL "$(policy_verdict always continue infinity)"   # no cgroup ceiling: the box's OOM killer chooses
+    chk FAIL "$(policy_verdict '' '' '')"                   # nothing readable is not a pass
+    [ "$rc" = 0 ] && echo "ci-runner-health self-test: ok (15 cases)" || echo "ci-runner-health self-test: FAIL"
     return $rc
 }
 
@@ -93,15 +127,24 @@ fi
 
 rc=0
 for u in "${units[@]}"; do
-    line=$("$SC" show "$u" -p ActiveState -p SubState -p Result -p NRestarts 2>/dev/null)
+    line=$("$SC" show "$u" -p ActiveState -p SubState -p Result -p NRestarts -p Restart -p OOMPolicy -p MemoryMax 2>/dev/null)
     st=$(printf '%s\n' "$line" | sed -n 's/^ActiveState=//p')
     sub=$(printf '%s\n' "$line" | sed -n 's/^SubState=//p')
     res=$(printf '%s\n' "$line" | sed -n 's/^Result=//p')
     nr=$(printf '%s\n' "$line" | sed -n 's/^NRestarts=//p')
+    rst=$(printf '%s\n' "$line" | sed -n 's/^Restart=//p')
+    oom=$(printf '%s\n' "$line" | sed -n 's/^OOMPolicy=//p')
+    mmax=$(printf '%s\n' "$line" | sed -n 's/^MemoryMax=//p')
     v=$(runner_verdict "$st" "$sub" "$res" "$nr")
     case "$v" in
         PASS*) printf 'PASS %-52s %s\n' "$u" "${v#PASS }" ;;
         *)     printf 'FAIL %-52s %s\n' "$u" "${v#FAIL }"; rc=1 ;;
+    esac
+    # engine#1504: alive now is not the same as after the next OOM kill, so the policy is its own line.
+    p=$(policy_verdict "$rst" "$oom" "$mmax")
+    case "$p" in
+        PASS*) printf 'PASS %-52s %s\n' "" "${p#PASS }" ;;
+        *)     printf 'FAIL %-52s %s\n' "" "${p#FAIL }"; rc=1 ;;
     esac
 done
 exit "$rc"

@@ -3432,6 +3432,19 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
         {"gate_proj",     "gate_proj"},      {"gate_proj",     "ffn_gate"},
         {"up_proj",       "up_proj"},        {"up_proj",       "ffn_up"},
         {"down_proj",     "down_proj"},      {"down_proj",     "ffn_down"},
+        // engine#1788 acceptance (F1 slice 3a gap): the MoE families MiniCPM-V 4.7 names, mapped to the roles the NPU
+        // forward ALREADY reads -- npu/forward/include/model.h carries up_exps_weight / gate_exps_weight /
+        // down_exps_weight / share_{up,gate,down}_exps_weight / moe_router_weight / shared_expert_gate_weight with
+        // those exact container names in their comments. So this is translation to an existing vocabulary, not a new
+        // one. The `share_*` spellings come first because `share_gate_exps_proj` contains `gate_exps_proj`.
+        {"share_gate_exps",   "share_gate_exps_proj"},
+        {"share_up_exps",     "share_up_exps_proj"},
+        {"share_down_exps",   "share_down_exps_proj"},
+        {"gate_exps",         "gate_exps_proj"},
+        {"up_exps",           "up_exps_proj"},
+        {"down_exps",         "down_exps_proj"},
+        {"moe_router",        "moe_router"},
+        {"shared_expert_gate","shared_expert_gate"},
         {"input_norm",    "input_layernorm"},{"input_norm",    "attn_norm"},      {"input_norm", "attention_norm"},
         {"post_norm",     "post_attention_layernorm"},          {"post_norm",    "ffn_norm"},
         {"final_norm",    "final_layernorm"},
@@ -3458,7 +3471,11 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
                 matched = true;
                 break;
             }
-            if (!matched && n.find("norm.weight") != std::string::npos && n.find("layers.") == std::string::npos)
+            // "never inside a layer" has to be spelled positively enough to survive the container's own naming:
+            // MiniCPM-V 4.7 spells its blocks `model.layer.N.` (singular), so a guard against "layers." alone filed
+            // 30 per-layer linear_attn.ssm_norm tensors as final_norm -- ahead of the kSsm loop below (engine#1788).
+            if (!matched && n.find("norm.weight") != std::string::npos && n.find("layers.") == std::string::npos &&
+                n.find("layer.") == std::string::npos)
                 role = "final_norm";   // `model.norm.weight`: the top-level norm, never inside a layer
             if (!matched && role.empty()) {
                 for (const char* s : kSsm)

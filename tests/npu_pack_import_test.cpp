@@ -5094,6 +5094,50 @@ void test_container_plan(const std::string& root) {
 // pack that classifies completely, the alternate spellings that must classify the same way, and the two residues (SSM
 // and MTP) which must be RECOGNISED rather than reported as unknown, since `unassigned` is only useful if it means
 // "nothing knows this".
+// engine#1788 acceptance, in the shape of a unit arm: the MoE vocabulary and the singular `layer.` spelling that the
+// MiniCPM-V 4.7 container uses. Measured on the real 736-name pack, this pair of rules takes
+// "733 names -> 413 named, 320 unassigned" to "733 names -> 733 named, 0 unassigned"; the names here are a
+// representative subset so the arm runs without a 700-line fixture.
+void test_container_roles_moe_and_singular_layer() {
+    const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
+    const auto roles = [&](std::initializer_list<const char*> names) {
+        std::vector<pi::Q4nxTensor> v;
+        for (const char* n : names) v.push_back(t(n));
+        return pi::container_roles(v);
+    };
+
+    // 1. the eight MoE families, spelled as the container spells them
+    {
+        const auto r = roles({"model.layer.0.moe_router.weight",
+                              "model.layer.0.shared_expert_gate.weight",
+                              "model.layer.0.mlp.gate_exps_proj.weight",
+                              "model.layer.0.mlp.up_exps_proj.weight",
+                              "model.layer.0.mlp.down_exps_proj.weight",
+                              "model.layer.0.mlp.share_gate_exps_proj.weight",
+                              "model.layer.0.mlp.share_up_exps_proj.weight",
+                              "model.layer.0.mlp.share_down_exps_proj.weight"});
+        check(r.unassigned.empty(), "35b: the MoE families are named, not unassigned");
+        check(r.role_of.at("model.layer.0.moe_router.weight") == "moe_router", "35b: moe_router");
+        check(r.role_of.at("model.layer.0.shared_expert_gate.weight") == "shared_expert_gate",
+              "35b: shared_expert_gate is its own role, not a projection");
+        check(r.role_of.at("model.layer.0.mlp.gate_exps_proj.weight") == "gate_exps", "35b: gate_exps_proj");
+        check(r.role_of.at("model.layer.0.mlp.share_gate_exps_proj.weight") == "share_gate_exps",
+              "35b: share_gate_exps_proj is the shared expert, not the routed gate");
+        check(r.counts.at("gate_exps") == 1 && r.counts.at("share_gate_exps") == 1,
+              "35b: the shared spelling does not also count as the routed one");
+    }
+
+    // 2. a per-layer norm under the singular block spelling stays a layer norm: it must NOT become final_norm
+    {
+        const auto r = roles({"model.norm.weight", "model.layer.0.linear_attn.ssm_norm.weight",
+                              "model.layer.0.input_layernorm.weight"});
+        check(r.role_of.at("model.norm.weight") == "final_norm", "35b: the top-level norm is final_norm");
+        check(r.counts.at("final_norm") == 1, "35b: exactly one final_norm, even with `model.layer.N.` blocks");
+        check(r.role_of.at("model.layer.0.linear_attn.ssm_norm.weight") == "ssm",
+              "35b: a per-layer ssm_norm is ssm, which is what kSsm says it is");
+    }
+}
+
 void test_container_roles() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6134,6 +6178,7 @@ int main(int argc, char** argv) {
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
         test_container_roles();
+        test_container_roles_moe_and_singular_layer();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);

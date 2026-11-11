@@ -201,6 +201,7 @@ add_test(NAME serve_hangup COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_hangup_test.s
 # is not AMD's. Local git repositories only: no network, no GPU.
 add_test(NAME bump_hrx_sync COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_sync_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-sync.sh)
 add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
+add_python_test(pr_check_verdict_self ${CMAKE_SOURCE_DIR}/tools/pr_check_verdict.py --self-test)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
 add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $<TARGET_FILE:onebit>)

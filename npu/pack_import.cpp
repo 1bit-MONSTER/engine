@@ -3382,6 +3382,23 @@ WideQAttnSection wide_q_attn_section(int64_t attn_off, int64_t payload, int64_t 
     return s;
 }
 
+bool apply_wide_q_section(Plan& p, const WideQAttnSection& wq, int64_t n_kv, int64_t n_q, int q_out, int64_t hidden) {
+    if (int64_t(q_out) == hidden || !wq.ok) return false;
+    p.attn_tiles = n_kv * 2 + n_q;
+    p.o_off = wq.o_off;
+    p.o_k = q_out;
+    // engine#1889: the gap IS the per-head gains when it has their shape; 0,0 otherwise.
+    p.qnorm_off = wq.q_norm;
+    p.knorm_off = wq.k_norm;
+    if (wq.k_norm) p.qk_gap_off = wq.o_off - wq.gap;
+    // The Hunyuan block's first payload is q, k, v here too (see attn_q_first). Measured on Hunyuan-0.5B-Instruct
+    // against the public checkpoint: read as k, q, v, the container's k_proj is q_proj's first 1,024 rows and its q_proj
+    // is q's last 1,024 rows followed by k (per-tensor correlation 0.01 for both in three layers); read as q, k, v all
+    // three correlate above 0.95.
+    if (wq.k_norm) p.attn_q_first = true;
+    return true;
+}
+
 std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
     if (!declared_qk || vote_hdrs != 1) return std::string();
     return "the epsilon-anchor vote recorded ONE in-block header, and this pack declares use_qk_norm, whose per-head q/k "
@@ -3895,20 +3912,8 @@ Plan plan(const std::string& pack_dir) {
                     const WideQAttnSection wq = wide_q_attn_section(attn_off, payload, int64_t(n_kv * 2 + n_q), tile_bytes,
                                                                     o_tiles_h, tile_o, int64_t(d.head_dim));
                     const int64_t gap_c = wq.gap;
-                    if (!handled && q_out != H && wq.ok) {
+                    if (!handled && apply_wide_q_section(p, wq, n_kv, n_q, q_out, H)) {
                         handled = true;
-                        p.attn_tiles = n_kv * 2 + n_q;
-                        p.o_off = wq.o_off;
-                        p.o_k = int(q_out);
-                        // engine#1889: the gap IS the per-head gains when it has their shape; 0,0 otherwise.
-                        p.qnorm_off = wq.q_norm;
-                        p.knorm_off = wq.k_norm;
-                        if (wq.k_norm) p.qk_gap_off = wq.o_off - wq.gap;
-                        // The Hunyuan block's first payload is q, k, v here too (see attn_q_first). Measured on
-                        // Hunyuan-0.5B-Instruct against the public checkpoint: read as k, q, v, the container's k_proj
-                        // is q_proj's first 1,024 rows and its q_proj is q's last 1,024 rows followed by k (per-tensor
-                        // correlation 0.01 for both in three layers); read as q, k, v all three correlate above 0.95.
-                        if (wq.k_norm) p.attn_q_first = true;
                         // NOT p.attn_note: that field is the refusal channel -- a non-empty value there refuses the
                         // attention biases by name (it means "why this section could not be read"). This is the
                         // opposite: the section WAS read this way. Reported on stderr once instead.

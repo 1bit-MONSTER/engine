@@ -5849,6 +5849,30 @@ void test_attn_first_tiles() {
     check(small.k == 0 && small.q == 2 && small.v == 16, "attn order: the Qwen2.5-0.5B run (2/14/2) is unchanged");
     pi::Plan p;
     check(!p.attn_q_first, "attn order: a plan is k,q,v unless the block measured otherwise");
+
+    // Review of engine#2063: the line that makes the wide-q container right is the tile ORDER, and nothing guarded it.
+    // Hunyuan-0.5B's own section (hidden 1024, q_out 2048: 32 q, 16 k and 16 v tiles of 64 rows), with its gains in the gap.
+    const pi::WideQAttnSection wq = pi::wide_q_attn_section(2112, 3691136, 64, 39168, 16, 73984, 128);
+    pi::Plan w;
+    check(pi::apply_wide_q_section(w, wq, 16, 32, 2048, 1024), "wide-q plan: Hunyuan-0.5B's section is taken");
+    check(w.attn_q_first, "wide-q plan: a wide-q block with its gains in the gap is q,k,v (engine#1889, review of #2063)");
+    const pi::AttnFirstTiles wt = pi::attn_first_tiles(int(16), int(32), w.attn_q_first);
+    check(wt.q == 0 && wt.k == 32 && wt.v == 48,
+          "wide-q plan: q at tile 0, k at 32, v at 48 -- the rows the checkpoint matches (q 0-31, k 32-47, v 48-63)");
+    check(w.attn_tiles == 64 && w.o_k == 2048 && w.o_off == wq.o_off && w.qnorm_off == 2508928 && w.knorm_off == 2509248,
+          "wide-q plan: 64 q/k/v tiles, o_proj at K=q_out after the gap, both gains named");
+    // the same shape without gains in the gap: the section is still read, the order is not claimed
+    const pi::WideQAttnSection wz = pi::wide_q_attn_section(2112, 3691136 - 640, 64, 39168, 16, 73984, 128);
+    pi::Plan z;
+    check(pi::apply_wide_q_section(z, wz, 16, 32, 2048, 1024) && !z.attn_q_first && z.knorm_off == 0,
+          "wide-q plan: no gains in the gap, so no q,k,v claim (k,q,v stays the default)");
+    // q no wider than hidden is not this branch: the plan is left as it was
+    pi::Plan n;
+    check(!pi::apply_wide_q_section(n, wq, 16, 32, 1024, 1024) && !n.attn_q_first && n.attn_tiles == 0,
+          "wide-q plan: q_out == hidden is not the wide-q branch, and the plan is untouched");
+    pi::Plan bad;
+    check(!pi::apply_wide_q_section(bad, pi::WideQAttnSection{}, 16, 32, 2048, 1024) && !bad.attn_q_first,
+          "wide-q plan: a section that was not read is not applied");
 }
 
 // engine#1503: the tied-head rule as ONE predicate -- correlated AND not mis-scaled. Two packs on this box correlate

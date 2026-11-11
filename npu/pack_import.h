@@ -365,6 +365,12 @@ ContainerGeometry container_geometry(const nlohmann::json& meta, const nlohmann:
 
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
+// engine#1889 (review of #2063): plan()'s wide-q branch (q_out != hidden), as one function so its effect on the plan is
+// testable without a fabricated 1.9 pack. When the section was read (`wq.ok`) and q is wider than hidden, it places the
+// q/k/v run, o_proj and the gains, and sets attn_q_first when the gap held the gains: that block is the Hunyuan writer's,
+// whose first payload is q, k, v (read as k, q, v, the container's k_proj was q_proj's first rows, correlation 0.01).
+// Returns false and leaves `p` untouched otherwise.
+bool apply_wide_q_section(Plan& p, const WideQAttnSection& wq, int64_t n_kv, int64_t n_q, int q_out, int64_t hidden);
 Plan plan(const std::string& pack_dir);
 
 // Whether the canonical Token .fconst already on the scratch path holds exactly the bytes this run would write,

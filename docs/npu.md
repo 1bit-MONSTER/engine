@@ -469,6 +469,32 @@ first build of that target for reading the tile grid k-outer instead of n-outer 
 paragraphs up — which is the reason it exists: the target was self-consistent, bit-exact against its
 own scalar reference, and decoding a different matrix than the container meant.
 
+
+**The decode head can run on the host (engine#1785), `NPU_HEAD_HOST=1`.** A decode step sends one row
+through every tile of the int8 head, and a launch costs the same weight pass for one row as for a full
+batch, so those launches are the most expensive use of the device in a token. With `NPU_HEAD_HOST=1` the
+single-row head is computed on the host instead, from the same image the device reads (the resident weight
+buffer's host mapping, no second copy), with the device path's own activation quantiser and the same
+epilogue. The sums are int32, so the logits are the device head's bit for bit, not an approximation of
+them. `NPU_HEAD_HOST_THREADS` sets the threads the tiles are split over (default 4, at most 16). It applies
+to the int8 tiled head only: the ternary (`pb16i`) head, the gemv head and batched head rows (prefill,
+verify) stay on the device. Off by default.
+
+Measured on the NPU with FastFlowLM's `Qwen3.5-2B-NPU2` container (vocabulary 248,320, width 2,048, 21
+head tiles), same binary, device head and host head interleaved, 24 greedy tokens per request, on a busy
+box (load 6 to 23):
+
+| | device head | host head, 4 threads |
+|---|---|---|
+| head time per decode token (the head's own timer), 5 serves each | 52, 51, 78, 57, 59 ms | 9.5, 15, 18, 8.3, 17 ms |
+| logits dumps identical to the first device serve | 240 of 240 | 336 of 336 |
+| decode, first run, the two requests before the box got busier | 339, 338 ms/token | 286, 289 ms/token |
+
+The head's time is what this changes and it is consistent across serves. The whole-token rate on that box
+moved more between serves of the same mode than between the modes (the layer launches read 2.2 to 3.3 ms
+each in both), so beyond the two quiet requests in the last row no tokens-per-second gain is claimed, and
+that is why the switch is off by default. The layers are the other four fifths of a token and are untouched.
+
 ### The t2s stream (what the XDNA decode kernel reads)
 
 t2 is the container format: the decoder's byte order, for any consumer. The device does not want that

@@ -54,6 +54,8 @@
 #include "q4nx_dequant.h"
 #include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
 #include "q4nx_semantics.h"
+#include "quant_i8.h"
+#include "q4nx_host_head.h"
 #include "q4nx_pack.h"
 #include "q4nx_head_image.h"   // the lm-head tile cache (engine#1716)
 
@@ -5969,6 +5971,99 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             std::chrono::steady_clock::now() - hh0).count();
         xd_->add_hadamard_cost(had_ms, 1);
         head_got.assign((size_t)T, 0.0f);
+    }
+    // ---- the int8 head on the host (engine#1785), NPU_HEAD_HOST=1 ---------------------------------------
+    // A decode step is ONE row, and a launch costs the same weight pass for one row as for 128, so the
+    // head's launches are the most expensive way to use the device: 21 launches, 65 ms of each token on a
+    // 248,320 x 2,048 head, against a few ms for the same sums on the host. Nothing is approximated: the
+    // activation codes come from the device path's own quantiser (q4nx_quant_i8::row, the amax/127 scale
+    // below), the weight codes are read from the very image the device reads (the resident BO's host
+    // mapping), the sums are int32, and the epilogue is the loop below's, term for term. The tiles are
+    // independent, so they are split over a few threads (NPU_HEAD_HOST_THREADS, default 4, at most 16).
+    // A tile the kernel refuses (a geometry with no image) sends the whole head to the device as before.
+    // NPU_HEAD_HOST=alt is the measuring form: calls alternate host, device, host, ... in ONE serve, and each
+    // call logs the previous one's head time and the time from its end to this call (the layers of the token in
+    // between). Two serves on a shared box differ by more than the head costs; adjacent tokens of one serve do not.
+    static const int head_host_mode = [] {
+        const char* e = getenv("NPU_HEAD_HOST");
+        if (!e) return 0;
+        if (e[0] == '1' && e[1] == 0) return 1;
+        return std::strcmp(e, "alt") == 0 ? 2 : 0;
+    }();
+    static long head_calls = 0;
+    const bool head_host = head_host_mode == 1 || (head_host_mode == 2 && (head_calls % 2) == 0);
+    struct HeadAb {
+        bool on, host;
+        std::chrono::steady_clock::time_point t0;
+        ~HeadAb() {
+            if (!on) return;
+            static std::chrono::steady_clock::time_point prev_end{};
+            const auto t1 = std::chrono::steady_clock::now();
+            const double gap = prev_end.time_since_epoch().count()
+                                   ? std::chrono::duration<double, std::milli>(t0 - prev_end).count() : -1.0;
+            fprintf(stderr, "[head-ab] call=%ld head=%s head_ms=%.2f layers_before_ms=%.2f\n", head_calls, host ? "host" : "device",
+                    std::chrono::duration<double, std::milli>(t1 - t0).count(), gap);
+            prev_end = t1;
+            head_calls++;
+        }
+    } head_ab{head_host_mode == 2, head_host, std::chrono::steady_clock::now()};
+    if (head_host && head_packed && !head_pb16i && !lctx.gemv && H <= (int)lctx.KD && T <= (int)lctx.ND) {
+        const auto hh0 = std::chrono::steady_clock::now();
+        float amax = 0.0f;
+        for (int k = 0; k < H; k++) { float a = std::fabs(hs[(size_t)k]); if (a > amax) amax = a; }
+        const float as = amax > 0 ? amax / 127.0f : 1.0f;
+        std::vector<int8_t> a8((size_t)H);
+        q4nx_quant_i8::row(hs.data(), H, 1.0f / as, a8.data());
+        std::vector<const int8_t*> images((size_t)ntiles, nullptr);
+        bool mapped = true;
+        for (int t = 0; t < ntiles; t++) {
+            images[(size_t)t] = (const int8_t*)lm_head_packed_[(size_t)t].bo->map();
+            mapped = mapped && images[(size_t)t] != nullptr;
+        }
+        static const int head_threads = [] {
+            const char* e = getenv("NPU_HEAD_HOST_THREADS");
+            const int n = e ? atoi(e) : 4;
+            return n < 1 ? 1 : (n > 16 ? 16 : n);
+        }();
+        const int nthreads = std::min(head_threads, ntiles);
+        std::vector<char> tile_ok((size_t)ntiles, 0);
+        const bool blocked = lctx.blocked_b;
+        const int KD = (int)lctx.KD, ND = (int)lctx.ND;
+        auto work = [&](int w) {
+            std::vector<int32_t> acc((size_t)T);
+            for (int t = w; t < ntiles; t += nthreads) {
+                const int n0 = t * T, n1 = std::min(NV, n0 + T);
+                if (!q4nx_host_head::tile(images[(size_t)t], KD, ND, blocked, a8.data(), H, n1 - n0, acc.data())) continue;
+                const std::vector<float>& gs = lm_head_packed_[(size_t)t].scales;
+                for (int n = n0; n < n1; n++) {
+                    float v = (float)acc[(size_t)(n - n0)] * as * gs[(size_t)(n - n0)];
+                    if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                    logits[(size_t)n] = v;
+                }
+                tile_ok[(size_t)t] = 1;
+            }
+        };
+        bool all = mapped;
+        if (mapped) {
+            std::vector<std::thread> pool;
+            for (int w = 1; w < nthreads; w++) pool.emplace_back(work, w);
+            work(0);
+            for (auto& th : pool) th.join();
+            for (int t = 0; t < ntiles; t++) all = all && tile_ok[(size_t)t];
+        }
+        if (all) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hh0).count();
+            static bool said = false;
+            if (!said) {
+                said = true;
+                fprintf(stderr, "  [forward] lm head: on the host (NPU_HEAD_HOST=%s), %d tile(s), %d thread(s), first pass %.1f ms\n",
+                        head_host_mode == 2 ? "alt" : "1", ntiles, nthreads, ms);
+            }
+            if (xd_->profiling()) xd_->note_head(1, ms, 0.0, 0.0, 0.0);
+            if (ph) { g_ph.h_pack += ms; g_ph.h_total = ph_ms(hp0); g_in_head = false; }
+            return true;
+        }
+        fprintf(stderr, "  [forward] lm head: NPU_HEAD_HOST is set but the image cannot be read on the host; using the device\n");
     }
     for (int t = 0; t < ntiles; t++) {
         const int n0 = t * T, n1 = std::min(NV, n0 + T);

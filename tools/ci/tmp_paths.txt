@@ -62,4 +62,3 @@ tools/spec_decode_speedup.sh	/tmp/specdec-$label.acc
 tools/spec_decode_speedup.sh	/tmp/specdec-$label.log
 tools/spec_decode_speedup.sh	/tmp/specdec-B.log
 tools/spec_decode_speedup.sh	/tmp/specdec-{lab}.acc
-tools/xhci_boot_capture.sh	/tmp/xhci-capture-$stamp

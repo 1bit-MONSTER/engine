@@ -1419,6 +1419,26 @@ graph: `model.onnx` carries `attn.q_norm.layernorm.weight` and `attn.k_norm.laye
 FP16 `[128]` initializers, and on Hunyuan-7B-Instruct their bf16 rounding is the first and the
 second block bit for bit in 32 of 32 layers. `qk_gain_offsets()` holds that arithmetic.
 
+The same gap exists when q_proj is wider than hidden. Hunyuan-0.5B-Instruct (hidden 1024, 16 heads
+of 128, so q_proj has 2,048 rows) has `[64 q/k/v tiles at K=1024][640 B][16 o_proj tiles at
+K=2048]`, and its graph's gains are in that gap in the same order in 24 of 24 layers (q_norm at
+block offset 2,508,928, k_norm 320 B later). `wide_q_attn_section()` holds that division and names
+the gains; before it did, this pack was refused as declaring gains the layout did not hold.
+
+Where the gains are, by layout, in one place: a 4-header block keeps them in their own two sections,
+k first (Qwen3, above); a 2-header block keeps them in the 640 B gap between q/k/v and o_proj, q
+first, whether o_proj's K is hidden (Hunyuan-7B, Hy-MT2-1.8B) or q_proj's width (Hunyuan-0.5B). A
+pack that declares `use_qk_norm` and has them in none of these is refused (`qk_norm_refusal()`).
+The gap's offsets are block arithmetic, one number for every layer, so the import checks each
+layer's bytes to be `[64 B zeros][finite gain][64 B zeros][finite gain]` (`qk_gap_block_why()`)
+and refuses a layer that is not, by name, instead of writing whatever is there.
+
+Hunyuan-0.5B's first payload is in the order q, k, v, like Hunyuan-7B's (`Plan::attn_q_first`).
+Checked against `tencent/Hunyuan-0.5B-Instruct` on the host: read as k, q, v, q_proj and k_proj
+correlate 0.01 with the checkpoint in layers 0, 11 and 23; read as q, k, v they correlate 0.96 to
+0.99, and in chat format the container picks the checkpoint's next token at 39 of 42 positions
+(mean KL 0.030 nats).
+
 **Every tile read is its own check.** Before anything is written, each tile is decoded and
 re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That
 one comparison holds every field, index and nibble order at once, and it is why a tile whose

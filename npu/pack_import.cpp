@@ -3340,12 +3340,63 @@ QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_b
     return o;
 }
 
-AttnFirstTiles attn_first_tiles(int n_kv, int n_q, bool q_first) {
-    AttnFirstTiles f;
-    f.k = q_first ? n_q : 0;
-    f.q = q_first ? 0 : n_kv;
-    f.v = n_kv + n_q;
-    return f;
+std::string qk_gap_block_why(const uint8_t* gap, int64_t head_dim) {
+    const int64_t per_head = head_dim * 2;
+    for (int b = 0; b < 2; ++b) {
+        const uint8_t* blk = gap + int64_t(b) * (kNormOff + per_head);
+        const char* nm = b == 0 ? "q_norm" : "k_norm";
+        for (int64_t i = 0; i < kNormOff; ++i)
+            if (blk[i])
+                return std::string("the 64 B before ") + nm + " are not zero (byte " + std::to_string(i) + " is " +
+                       std::to_string(int(blk[i])) + "), so this is not the [header][gain] pair";
+        bool any = false;
+        for (int64_t i = 0; i < head_dim; ++i) {
+            const uint16_t v = uint16_t(blk[kNormOff + 2 * i]) | uint16_t(uint16_t(blk[kNormOff + 2 * i + 1]) << 8);
+            if ((v & 0x7F80) == 0x7F80)
+                return std::string(nm) + " element " + std::to_string(i) + " is not finite (bf16 bits " +
+                       std::to_string(int(v)) + "), so these bytes are not a gain";
+            any = any || (v & 0x7FFF) != 0;
+        }
+        if (!any) return std::string(nm) + " is all zero, so these bytes are not a gain";
+    }
+    return std::string();
+}
+
+WideQAttnSection wide_q_attn_section(int64_t attn_off, int64_t payload, int64_t qkv_tiles, int64_t tile_bytes,
+                                     int64_t o_tiles, int64_t o_tile_bytes, int64_t head_dim) {
+    WideQAttnSection s;
+    if (payload <= 0 || qkv_tiles <= 0 || tile_bytes <= 0 || o_tiles <= 0 || o_tile_bytes <= 0) return s;
+    const int64_t qkv_bytes = qkv_tiles * tile_bytes;
+    s.gap = payload - qkv_bytes - o_tiles * o_tile_bytes;
+    // The ceiling is a derived bound, not a measurement: two bf16 [head_dim] gains plus 256 B of headers and padding
+    // (768 at head_dim 128, 512 at 64). Only the offsets below are measured.
+    if (s.gap < 0 || s.gap > int64_t(2) * head_dim * 2 + 256) return s;
+    s.ok = true;
+    s.o_off = attn_off + qkv_bytes + s.gap;
+    // Measured on Hunyuan-0.5B-Instruct_rai_1.9.0_npu against the q_norm/k_norm FP16 initializers of its own model.onnx:
+    // rounded to bf16, q_norm is at block offset 2,508,928 and k_norm 320 B later in 24 of 24 layers, each behind 64
+    // zero bytes -- the same [header][q][header][k] gap as Hunyuan-7B's, at attn_off + 64 tiles.
+    const QkGainOffsets g = qk_gain_offsets(attn_off + qkv_bytes, head_dim, s.gap);
+    s.q_norm = g.q_norm;
+    s.k_norm = g.k_norm;
+    return s;
+}
+
+bool apply_wide_q_section(Plan& p, const WideQAttnSection& wq, int64_t n_kv, int64_t n_q, int q_out, int64_t hidden) {
+    if (int64_t(q_out) == hidden || !wq.ok) return false;
+    p.attn_tiles = n_kv * 2 + n_q;
+    p.o_off = wq.o_off;
+    p.o_k = q_out;
+    // engine#1889: the gap IS the per-head gains when it has their shape; 0,0 otherwise.
+    p.qnorm_off = wq.q_norm;
+    p.knorm_off = wq.k_norm;
+    if (wq.k_norm) p.qk_gap_off = wq.o_off - wq.gap;
+    // The Hunyuan block's first payload is q, k, v here too (see attn_q_first). Measured on Hunyuan-0.5B-Instruct
+    // against the public checkpoint: read as k, q, v, the container's k_proj is q_proj's first 1,024 rows and its q_proj
+    // is q's last 1,024 rows followed by k (per-tensor correlation 0.01 for both in three layers); read as q, k, v all
+    // three correlate above 0.95.
+    if (wq.k_norm) p.attn_q_first = true;
+    return true;
 }
 
 std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
@@ -3404,6 +3455,14 @@ ContainerGeometry container_geometry(const json& meta, const json& config) {
 
     g.source = used_dims ? "dims" : (used_cfg ? "config.json" : "");
     return g;
+}
+
+AttnFirstTiles attn_first_tiles(int n_kv, int n_q, bool q_first) {
+    AttnFirstTiles f;
+    f.k = q_first ? n_q : 0;
+    f.q = q_first ? 0 : n_kv;
+    f.v = n_kv + n_q;
+    return f;
 }
 
 int64_t head_stored_rows(int64_t vocab, bool from_fconst_tail) {
@@ -3786,7 +3845,7 @@ Plan plan(const std::string& pack_dir) {
                 const int64_t n_kv = kv_out / 64, n_q = q_out / 64;
                 auto refuse = [&](const std::string& s) {
                     p.attn_note = s;
-                    p.knorm_off = p.qnorm_off = p.o_off = 0;  // an unread section is not a half-read one
+                    p.knorm_off = p.qnorm_off = p.o_off = p.qk_gap_off = 0;  // an unread section is not a half-read one
                     p.o_k = 0;
                 };
                 if (g.hdr.size() == 1) {
@@ -3829,6 +3888,7 @@ Plan plan(const std::string& pack_dir) {
                                 qk_gain_offsets(attn_off + p.attn_tiles * tile_bytes, int64_t(d.head_dim), rem);
                             p.knorm_off = qkg.k_norm;
                             p.qnorm_off = qkg.q_norm;
+                            if (qkg.k_norm) p.qk_gap_off = attn_off + p.attn_tiles * tile_bytes;
                             static bool said2 = false;
                             if (!said2) {
                                 said2 = true;
@@ -3849,15 +3909,11 @@ Plan plan(const std::string& pack_dir) {
                         }
                     }
                     const int64_t o_tiles_h = H / kTileRows;
-                    const int64_t qkv_bytes_c = int64_t(n_kv * 2 + n_q) * tile_bytes;
-                    const int64_t o_bytes_c = o_tiles_h * tile_o;
-                    const int64_t gap_c = payload - qkv_bytes_c - o_bytes_c;
-                    const int64_t norm_ceiling = int64_t(2) * int64_t(d.head_dim) * 2 + 256;
-                    if (!handled && payload > 0 && q_out != H && o_tiles_h > 0 && gap_c >= 0 && gap_c <= norm_ceiling) {
+                    const WideQAttnSection wq = wide_q_attn_section(attn_off, payload, int64_t(n_kv * 2 + n_q), tile_bytes,
+                                                                    o_tiles_h, tile_o, int64_t(d.head_dim));
+                    const int64_t gap_c = wq.gap;
+                    if (!handled && apply_wide_q_section(p, wq, n_kv, n_q, q_out, H)) {
                         handled = true;
-                        p.attn_tiles = n_kv * 2 + n_q;
-                        p.o_off = attn_off + qkv_bytes_c + gap_c;
-                        p.o_k = int(q_out);
                         // NOT p.attn_note: that field is the refusal channel -- a non-empty value there refuses the
                         // attention biases by name (it means "why this section could not be read"). This is the
                         // opposite: the section WAS read this way. Reported on stderr once instead.
@@ -5651,7 +5707,16 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     }
                     // per-head QK norms (Qwen3 and later): plain bf16 [head_dim] gains that the
                     // container already carries for families that have them.
-                    if (p.knorm_off)
+                    // The gap families: the offsets are one number for every layer, so each layer's bytes are checked
+                    // to be the [header][gain] pair before a gain is written; a layer that differs is refused by name.
+                    std::string gap_why;
+                    if (p.qk_gap_off)
+                        gap_why = qk_gap_block_why(
+                            at(fc, block + p.qk_gap_off, 2 * (kNormOff + int64_t(p.dims.head_dim) * 2)),
+                            int64_t(p.dims.head_dim));
+                    if (!gap_why.empty())
+                        late.push_back("model.layers." + std::to_string(L) + ".self_attn.q_norm.weight: " + gap_why);
+                    else if (p.knorm_off)
                         for (const auto& [off, nm] : {std::pair<int64_t, const char*>{p.knorm_off, "k_norm"},
                                                       std::pair<int64_t, const char*>{p.qnorm_off, "q_norm"}}) {
                             const int64_t n = p.dims.head_dim;

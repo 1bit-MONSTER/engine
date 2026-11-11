@@ -96,6 +96,26 @@ struct QkGainOffsets {
 QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes);
 std::string qk_norm_refusal(bool declared, bool found);
 
+// The one-header attention section of a pack whose q_proj is WIDER than hidden (Hunyuan-0.5B: hidden 1024, 16 heads x
+// head_dim 128, so q_out = 2048): [q,k,v tiles at K=hidden][gap][o_proj tiles at K=q_out]. `payload` is the bytes from
+// `attn_off` to the block's header. `ok` is false when the remainder is not a norms-sized gap (negative, or larger than
+// two gains plus 256 B), which is a layout this reader has not measured. When the gap has the gains' shape
+// (qk_gain_offsets()), `q_norm`/`k_norm` are their offsets; otherwise both are 0 and the section is still read
+// (engine#1889: this branch placed o_proj and never named the gains, so a pack that declares use_qk_norm was refused
+// with "gains are not where the block layout says" although they sit in the gap it had just computed).
+struct WideQAttnSection {
+    bool ok = false;
+    int64_t gap = 0, o_off = 0, q_norm = 0, k_norm = 0;
+};
+// Why one block's gap is NOT `[64 B zeros][bf16 [head_dim] gain][64 B zeros][bf16 [head_dim] gain]`, or "" when it is.
+// `gap` points at 2 * (64 + head_dim*2) bytes. The offsets come from the block arithmetic, which is the same number
+// for every layer; this is the per-layer witness that the bytes there are gains: both headers all zero, and each gain
+// finite and not all zero. A gain window displaced by a section (320 B at head_dim 128) lands on a header or on tile
+// bytes and fails one of these. The import refuses the layer by name on a non-empty answer (review of engine#2063).
+std::string qk_gap_block_why(const uint8_t* gap, int64_t head_dim);
+WideQAttnSection wide_q_attn_section(int64_t attn_off, int64_t payload, int64_t qkv_tiles, int64_t tile_bytes,
+                                     int64_t o_tiles, int64_t o_tile_bytes, int64_t head_dim);
+
 // How many rows a head read from the .fconst tail occupies in the container. The pack stores the head in whole 64-row
 // tiles, so a vocabulary that is not a multiple of 64 is carried with the pack's own padding rows (Hunyuan: 120,818 ->
 // 120,832) while `vocab_size` and the plan's tensor shape stay the vocabulary. A head that is a graph initializer is
@@ -225,6 +245,9 @@ struct Plan {
     // none. Identified and verified byte-exact against the public Qwen3-1.7B/4B checkpoints (0 of 128
     // values differ on either pack, and the swap differs on 127-128 of 128).
     int64_t knorm_off = 0, qnorm_off = 0;
+    // Where the 2-header families' gap `[64 B zeros][q_norm][64 B zeros][k_norm]` starts in the block, 0 when the gains
+    // are not in that form. The import checks the form in EVERY layer (qk_gap_block_why()) before it writes a gain.
+    int64_t qk_gap_off = 0;
     // The order of the three projections in the block's first payload. Every family measured before Hunyuan writes
     // k, q, v (identified on Qwen2.5-0.5B by the tiles' bias subvolumes). The Hunyuan block -- q/k/v at K=hidden, the
     // packed per-head gains, o_proj -- writes q, k, v (engine#1889): with k,q,v the container's k_proj was q_proj's
@@ -342,6 +365,12 @@ ContainerGeometry container_geometry(const nlohmann::json& meta, const nlohmann:
 
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
+// engine#1889 (review of #2063): plan()'s wide-q branch (q_out != hidden), as one function so its effect on the plan is
+// testable without a fabricated 1.9 pack. When the section was read (`wq.ok`) and q is wider than hidden, it places the
+// q/k/v run, o_proj and the gains, and sets attn_q_first when the gap held the gains: that block is the Hunyuan writer's,
+// whose first payload is q, k, v (read as k, q, v, the container's k_proj was q_proj's first rows, correlation 0.01).
+// Returns false and leaves `p` untouched otherwise.
+bool apply_wide_q_section(Plan& p, const WideQAttnSection& wq, int64_t n_kv, int64_t n_q, int q_out, int64_t hidden);
 Plan plan(const std::string& pack_dir);
 
 // Whether the canonical Token .fconst already on the scratch path holds exactly the bytes this run would write,

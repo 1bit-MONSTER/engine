@@ -490,10 +490,22 @@ box (load 6 to 23):
 | logits dumps identical to the first device serve | 240 of 240 | 336 of 336 |
 | decode, first run, the two requests before the box got busier | 339, 338 ms/token | 286, 289 ms/token |
 
-The head's time is what this changes and it is consistent across serves. The whole-token rate on that box
-moved more between serves of the same mode than between the modes (the layer launches read 2.2 to 3.3 ms
-each in both), so beyond the two quiet requests in the last row no tokens-per-second gain is claimed, and
-that is why the switch is off by default. The layers are the other four fifths of a token and are untouched.
+Serves of the same mode on that box differed by more than the head costs (the layer launches read 2.2 to
+3.3 ms each in both modes), so the rate is taken inside one serve instead. `NPU_HEAD_HOST=alt` alternates
+host and device head on successive decode tokens and logs each call (`[head-ab] call=… head=host|device
+head_ms=… layers_before_ms=…`). One serve, 100 tokens, load 15, logits again byte-identical to the device
+serve (96 of 96):
+
+| median over 50 tokens each | device head | host head |
+|---|---|---|
+| the head | 76.4 ms | 8.7 ms |
+| the layers of the token that follows it | 309.9 ms | 325.0 ms |
+| head plus following layers | 386 ms (2.6 tok/s) | 334 ms (3.0 tok/s) |
+
+So the host head takes 68 ms off the head and the next token's layers give 15 ms of it back, a net 52 ms
+(13 %) per token on this model. It stays off by default because it changes the profile table's row set (one
+`HEAD` row at M=1 in place of the M=16 launches), and `scripts/npu-window11.sh --compare` requires the two
+binaries it compares to print the same rows. The layers are the other four fifths of a token and are untouched.
 
 ### The t2s stream (what the XDNA decode kernel reads)
 

@@ -5807,10 +5807,32 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     // mapping), the sums are int32, and the epilogue is the loop below's, term for term. The tiles are
     // independent, so they are split over a few threads (NPU_HEAD_HOST_THREADS, default 4, at most 16).
     // A tile the kernel refuses (a geometry with no image) sends the whole head to the device as before.
-    static const bool head_host = [] {
+    // NPU_HEAD_HOST=alt is the measuring form: calls alternate host, device, host, ... in ONE serve, and each
+    // call logs the previous one's head time and the time from its end to this call (the layers of the token in
+    // between). Two serves on a shared box differ by more than the head costs; adjacent tokens of one serve do not.
+    static const int head_host_mode = [] {
         const char* e = getenv("NPU_HEAD_HOST");
-        return e && e[0] == '1' && e[1] == 0;
+        if (!e) return 0;
+        if (e[0] == '1' && e[1] == 0) return 1;
+        return std::strcmp(e, "alt") == 0 ? 2 : 0;
     }();
+    static long head_calls = 0;
+    const bool head_host = head_host_mode == 1 || (head_host_mode == 2 && (head_calls % 2) == 0);
+    struct HeadAb {
+        bool on, host;
+        std::chrono::steady_clock::time_point t0;
+        ~HeadAb() {
+            if (!on) return;
+            static std::chrono::steady_clock::time_point prev_end{};
+            const auto t1 = std::chrono::steady_clock::now();
+            const double gap = prev_end.time_since_epoch().count()
+                                   ? std::chrono::duration<double, std::milli>(t0 - prev_end).count() : -1.0;
+            fprintf(stderr, "[head-ab] call=%ld head=%s head_ms=%.2f layers_before_ms=%.2f\n", head_calls, host ? "host" : "device",
+                    std::chrono::duration<double, std::milli>(t1 - t0).count(), gap);
+            prev_end = t1;
+            head_calls++;
+        }
+    } head_ab{head_host_mode == 2, head_host, std::chrono::steady_clock::now()};
     if (head_host && head_packed && !head_pb16i && !lctx.gemv && H <= (int)lctx.KD && T <= (int)lctx.ND) {
         const auto hh0 = std::chrono::steady_clock::now();
         float amax = 0.0f;
@@ -5860,14 +5882,14 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             static bool said = false;
             if (!said) {
                 said = true;
-                fprintf(stderr, "  [forward] lm head: on the host (NPU_HEAD_HOST=1), %d tile(s), %d thread(s), first pass %.1f ms\n",
-                        ntiles, nthreads, ms);
+                fprintf(stderr, "  [forward] lm head: on the host (NPU_HEAD_HOST=%s), %d tile(s), %d thread(s), first pass %.1f ms\n",
+                        head_host_mode == 2 ? "alt" : "1", ntiles, nthreads, ms);
             }
             if (xd_->profiling()) xd_->note_head(1, ms, 0.0, 0.0, 0.0);
             if (ph) { g_ph.h_pack += ms; g_ph.h_total = ph_ms(hp0); g_in_head = false; }
             return true;
         }
-        fprintf(stderr, "  [forward] lm head: NPU_HEAD_HOST=1 but the image cannot be read on the host; using the device\n");
+        fprintf(stderr, "  [forward] lm head: NPU_HEAD_HOST is set but the image cannot be read on the host; using the device\n");
     }
     for (int t = 0; t < ntiles; t++) {
         const int n0 = t * T, n1 = std::min(NV, n0 + T);

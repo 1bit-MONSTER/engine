@@ -5138,6 +5138,72 @@ void test_container_roles_moe_and_singular_layer() {
     }
 }
 
+// engine#1786 item F1 slice 3b / engine#1788: the acceptance a container-genre plan is judged by, on the fields slice 3b
+// now fills. `plan()` must say how many of a container's names it can place, and the number has to be all of them -- a
+// pack whose MoE vocabulary or block spelling the classifier does not know is NOT importable, and the plan states that
+// instead of leaving it to a caller with a scratch harness. Measured on the real packs: MiniCPM-V 35B-A3B 733/733, 1B 357/357.
+static void write_container(const std::string& path, const std::vector<std::string>& names) {
+    json hdr = json::object();
+    size_t off = 0;
+    for (const auto& n : names) {
+        hdr[n] = {{"dtype", "F32"}, {"shape", {1}}, {"data_offsets", {off, off + 4}}};
+        off += 4;
+    }
+    std::string h = hdr.dump();
+    while (h.size() % 8) h.push_back(' ');
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    const uint64_t hlen = uint64_t(h.size());
+    f.write(reinterpret_cast<const char*>(&hlen), 8);
+    f.write(h.data(), std::streamsize(h.size()));
+    std::vector<float> zeros(names.size(), 0.0f);
+    f.write(reinterpret_cast<const char*>(zeros.data()), std::streamsize(zeros.size() * sizeof(float)));
+}
+
+void test_container_plan_reports_roles() {
+    const auto dir_for = [](const std::string& tag) {
+        fs::path d = fs::temp_directory_path() / ("plan-roles-" + tag + "-" + std::to_string(::getpid()));
+        fs::remove_all(d);
+        fs::create_directories(d);
+        put_file((d / "config.json").string(),
+                 "{\"hidden_size\": 64, \"num_hidden_layers\": 2, \"num_attention_heads\": 4,"
+                 " \"num_key_value_heads\": 2, \"vocab_size\": 128, \"intermediate_size\": 128,"
+                 " \"model_type\": \"qwen3\", \"architectures\": [\"Qwen3ForCausalLM\"]}");
+        put_file((d / "tokenizer.json").string(), "{}");
+        return d;
+    };
+    const std::vector<std::string> known = {
+        "model.embed_tokens.weight",
+        "model.layer.0.input_layernorm.weight",
+        "model.layer.0.self_attn.q_proj.weight",
+        "model.layer.0.self_attn.k_proj.weight",
+        "model.layer.0.self_attn.v_proj.weight",
+        "model.layer.0.self_attn.o_proj.weight",
+        "model.layer.0.moe_router.weight",
+        "model.layer.0.mlp.gate_exps_proj.weight",
+        "model.layer.0.mlp.share_up_exps_proj.weight",
+        "model.norm.weight"};
+    {
+        const fs::path d = dir_for("known");
+        write_container((d / "model.q4nx").string(), known);
+        const pi::Plan p = pi::plan(d.string());
+        check(p.container_tensors == int64_t(known.size()), "plan: the container's tensor count reaches the plan");
+        check(p.container_roles_unassigned.empty(), "plan: every name of a container it accepts is placed (the F1 acceptance)");
+        check(int64_t(p.container_role_counts.size()) > 0, "plan: the role counts reach the plan");
+        fs::remove_all(d);
+    }
+    {
+        const fs::path d = dir_for("unknown");
+        std::vector<std::string> with_unknown = known;
+        with_unknown.push_back("model.layer.0.mystery_proj.weight");
+        write_container((d / "model.q4nx").string(), with_unknown);
+        const pi::Plan p = pi::plan(d.string());
+        check(p.container_roles_unassigned.size() == 1 &&
+                  p.container_roles_unassigned.front() == "model.layer.0.mystery_proj.weight",
+              "plan: a name nothing knows is listed as unassigned, by name");
+        fs::remove_all(d);
+    }
+}
+
 void test_container_roles() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6178,6 +6244,7 @@ int main(int argc, char** argv) {
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
         test_container_roles();
+        test_container_plan_reports_roles();
         test_container_roles_moe_and_singular_layer();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);

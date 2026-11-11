@@ -3306,6 +3306,20 @@ std::string Plan::manifest() const {
         c["tensors"] = container_tensors;
         c["payload_bytes"] = container_payload_bytes;
         c["dtypes"] = container_dtypes;
+        // engine#1786 item F1 slice 3b fills the two fields on the plan; this is what makes them readable from `info`
+        // without a caller linking the plan struct. `named` is derived so it cannot disagree with the list.
+        const int64_t unnamed = int64_t(container_roles_unassigned.size());
+        c["roles"] = {{"named", container_tensors - unnamed},
+                      {"unassigned", unnamed},
+                      {"counts", container_role_counts}};
+        if (!container_roles_unassigned.empty()) c["roles"]["unassigned_names"] = container_roles_unassigned;
+        if (container_vision_tensors >= 0)
+            c["vision"] = {{"tensors", container_vision_tensors},
+                           {"payload_bytes", container_vision_payload_bytes},
+                           {"roles_named", container_vision_roles_named},
+                           {"role_counts", container_vision_role_counts},
+                           {"note", "a second container (vision_weight.q4nx); it has its own reader "
+                                    "(npu/vision_pack.cpp), so this row reports what is there rather than planning it"}};
         c["note"] = container_note;
         j["container"] = c;
     }
@@ -3616,6 +3630,21 @@ Plan plan(const std::string& pack_dir) {
             if (!g.missing.empty()) {
                 geom += "; no source states ";
                 for (size_t i = 0; i < g.missing.size(); ++i) geom += (i ? ", " : "") + g.missing[i];
+            }
+            // engine#1788: the vision tower is a SECOND container with its own reader (npu/vision_pack.cpp), so this
+            // reports what is there for a human reading `info` rather than planning it. 347 tensors of a 1080-tensor
+            // pack were invisible here, which is how a pack looks importable when half of it has never been looked at.
+            {
+                std::error_code ecv;
+                const std::string vision_path = pack_dir + "/vision_weight.q4nx";
+                if (fs::exists(vision_path, ecv)) {
+                    const Q4nxContainer v = read_q4nx_container(vision_path);
+                    const ContainerRoles vr = container_roles(v.tensors);
+                    p.container_vision_tensors = int64_t(v.tensors.size());
+                    p.container_vision_payload_bytes = v.payload_bytes;
+                    p.container_vision_roles_named = int64_t(vr.role_of.size());
+                    for (const auto& kv : vr.counts) p.container_vision_role_counts[kv.first] = int64_t(kv.second);
+                }
             }
             p.container_note = c.why.empty()
                 ? "the pack is a safetensors container (model.q4nx): " + std::to_string(c.tensors.size()) +

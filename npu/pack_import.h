@@ -266,6 +266,14 @@ struct Plan {
     int64_t container_payload_bytes = 0;
     std::map<std::string, int64_t> container_dtypes;
     std::string container_note;   // what the container genre still needs, empty for a non-container pack
+    // engine#1788: MiniCPM-V's vision tower is a SECOND container beside model.q4nx (vision_weight.q4nx, 1.14 GB /
+    // 347 tensors on the 35B). Reported, not interpreted: the vision tower has its own reader (npu/vision_pack.cpp),
+    // so this is for a human reading `info`, not for a plan -- and 347 tensors absent from it is how a pack looks
+    // importable when half of it has never been looked at. -1 when the pack has no such file.
+    int64_t container_vision_tensors = -1;
+    int64_t container_vision_payload_bytes = 0;
+    int64_t container_vision_roles_named = -1;
+    std::map<std::string, int64_t> container_vision_role_counts;
     // engine#1786 (item F1), slice 2: WHERE the container's geometry came from, and what it could not reach.
     // A bare number in `dims` cannot say whether the pack declared it or a file beside it did, and those two are free to
     // disagree (13 of the 29 packs measured carry a `dims` block; all 29 carry config.json). Empty for a non-container pack.

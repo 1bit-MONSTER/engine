@@ -48,6 +48,8 @@ int main(int argc, char** argv) {
         {"an added token splits the run", "<bos>a b", {8, 1, 4}},
         {"two spaces are two symbols", "a  b", {1, 0, 4}},
         {"one letter", "b", {2}},
+        // every case decodes back to its text; this one has all three things a decode can lose at once
+        {"a leading space, two spaces and a newline survive the round trip", " a  b\na", {3, 0, 4, 6, 1}},
     };
     int fail = 0;
     for (const Case& c : cases) {

@@ -33,6 +33,7 @@
 #include <vector>
 
 #include <unistd.h>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -69,7 +70,7 @@ void write_st(const fs::path& path, const std::vector<std::pair<std::string, std
 }  // namespace
 
 int main() {
-    const fs::path root = fs::temp_directory_path() / ("laya_bounds_test." + std::to_string(::getpid()));
+    const fs::path root = ::onebit::test::tmp_root() / ("laya_bounds_test." + std::to_string(::getpid()));
     fs::remove_all(root);
     fs::create_directories(root);
     std::vector<float> out;

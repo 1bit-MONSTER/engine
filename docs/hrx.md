@@ -881,6 +881,9 @@ and hrx-system `7f4236924aad`, with one binary for both arms (`tools/hrx_gtt_spl
 | Qwen3.8-27B UD-Q4_K_XL, 5-token prompt, `-n 16` | 19,075.3 MiB | 17,231.3 MiB |
 
 The generated text is identical in every pair, and `llama-perplexity --kl-divergence` against the upload's logits gives a mean KLD of 0.000000.
+The number of device copies goes *up* while GTT goes down. With the upload, HRX copied only the 253 weights it reads in its own
+layout, and every other read went to the loader's buffer. With #304 every weight HRX runs gets a device copy: 398 on the short
+prompt. Those copies replace the 2,375.9 MiB loader buffer, so `GGML_HRX_MODEL_BUFFER_COPY=1` gives fewer device buffers and more GTT.
 Every pair agrees on the top-1 token at every position (100.000 %). Speed is unchanged in steady state: `llama-bench -p 1024 -n 64 -r 3`,
 alternated, gives pp1024 2,764.6 tok/s (upload) and 2,767.7 / 2,765.4 tok/s (#304), and tg64 71.5 against 72.1 / 72.3 tok/s. A fresh
 process pays a one-time copy at its first prompt instead of at load time.

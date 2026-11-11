@@ -20,6 +20,7 @@
 //
 //   (i)   a partially-accepted round: emitted = accepted ++ resample, counts exact
 //   (ii)  the chain stops at the FIRST rejection, so later drafts are never emitted
+//         (ii-b puts the rejection in the middle of three drafts, where a later draft exists to be wrongly emitted)
 //   (iii) a fully-accepted round emits all k and resamples nothing
 //   (iv)  q(x) == 0 rejects and resamples (the premise `x was drawn from q` is false) instead of dividing
 //   (v)   the no-drafter path is the caller's untouched branch -- asserted here as "decide() refuses with no drafts",
@@ -63,6 +64,19 @@ int main() {
               "(ii) one accepted then a rejection -> emitted = accepted ++ the resample");
         check(r.emitted[0] == 0 && r.emitted[1] >= 0 && r.emitted[1] < V,
               "(ii) emitted[0] is the accepted draft and emitted[1] is a valid resampled token");
+    }
+    // (ii-b) the rejection in the MIDDLE of three drafts. Arm (ii) rejects at its last draft, so nothing came after the
+    // rejection for a missing `break` to emit, and a decide() that kept going passed it (review of 030070e). Here the
+    // third draft would be accepted on its own row (p/q = 7); it must not be emitted, because it was conditioned on
+    // the second draft, which was not chosen.
+    {
+        const float P[3][4] = {{0.70f, 0.10f, 0.10f, 0.10f}, {0.10f, 0.70f, 0.10f, 0.10f}, {0.70f, 0.10f, 0.10f, 0.10f}};
+        const float Q[3][4] = {{0.10f, 0.70f, 0.10f, 0.10f}, {0.70f, 0.10f, 0.10f, 0.10f}, {0.10f, 0.70f, 0.10f, 0.10f}};
+        const std::vector<int> drafts{0, 0, 0};
+        const double ua[3] = {0.01, 0.99, 0.01}, ur[3] = {0.5, 0.5, 0.5};
+        const onebit::spec::SpecRound r = onebit::spec::decide(&P[0][0], &Q[0][0], V, drafts, ua, ur);
+        check(r.proposed == 3 && r.accepted == 1 && r.stopped_on_rejection && r.emitted.size() == 2,
+              "(ii-b) a rejection in the middle ends the round: one accepted, the resample, and nothing after it");
     }
     // (iii) three drafts at a row where p == q: min(1, p/q) == 1, so every u accepts and nothing is resampled.
     {

@@ -55,7 +55,9 @@ class DraftProvider {
 
 // One round's outcome. `emitted` is the accepted drafts in order, plus the resampled token when the chain stops on a
 // rejection -- never more than drafts.size() + 0: the resample *replaces* the rejected draft, so a round of k drafts
-// emits between 1 and k tokens.
+// emits between 1 and k tokens. When every draft is accepted the round emits exactly k and no more: the token after
+// them comes from the verifier's (k+1)-th row, which the CALLER samples (spec_accept_prefix's contract). A loop built
+// on this must not drop that sample -- it is one token per fully-accepted round.
 struct SpecRound {
     std::vector<int> emitted;
     int accepted = 0;

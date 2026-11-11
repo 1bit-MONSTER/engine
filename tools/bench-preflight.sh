@@ -169,6 +169,30 @@ esac
 GGML_HRX_LOG_DISPATCH=1 "$bench" -m "$model" -p "$tokens" -n 0 -ngl 99 --device HRX0 -r 3 -lm "$lm" \
     >/dev/null 2>"$log" &
 bench_pid=$!
+# The bench is a background child from here on, so nothing ends it when this script ends unless the script does: a
+# signalled preflight (a ticket that ends, Ctrl-C, an operator's kill) or a refusal below would otherwise leave it on the
+# GPU with no owner. Every way out goes through EXIT, and EXIT stops the bench and waits for it before the log goes.
+# TERM first, at most 5 s for the bench to go, then KILL, then reap: a bench that ignores TERM (wedged in the device) must
+# not hang this trap, because a ticket that then kills the shell leaves the same orphan. A child that has exited stays a
+# zombie until it is waited for and still answers `kill -0`, so "gone" is read from its state. bench_pid is emptied once
+# the bench is reaped, here or below, so a pid the system has handed to another process is never signalled.
+stop_bench() {
+    [ -n "${bench_pid:-}" ] || return 0
+    kill "$bench_pid" 2>/dev/null
+    local n=0
+    while [ "$n" -lt 50 ] && kill -0 "$bench_pid" 2>/dev/null &&
+          ! grep -q '^State:[[:space:]]*Z' "/proc/$bench_pid/status" 2>/dev/null; do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    kill -KILL "$bench_pid" 2>/dev/null
+    wait "$bench_pid" 2>/dev/null
+    bench_pid=
+}
+trap 'stop_bench; rm -f "$log"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # The mode is REQUESTED above and OBSERVED here (engine #1668): llama.cpp puts a model it mmaps in `/proc/<pid>/maps` and a
 # model it only reads is not there, so the run can be checked against the flag instead of trusted to honour it. A bench that
 # ignores `-lm` yields a number the header mislabels, which is the same defect as an unstated mode -- one variable measured,
@@ -182,6 +206,8 @@ while :; do
 done
 bench_rc=0
 wait "$bench_pid" || bench_rc=$?
+bench_was=$bench_pid          # for the messages below; the process is reaped, so the trap has nothing left to stop
+bench_pid=
 [ "$bench_rc" -eq 0 ] || fatal "the bench exited $bench_rc; see $log"
 # Only the modes whose mapping is unambiguous are asserted: `mmap`/`mmap+mlock` map, `none`/`dio` do not, and `mlock` alone is
 # not asserted because whether it maps depends on the loader -- a gate that guessed would fail a correct run. An OBSERVED
@@ -192,9 +218,9 @@ if [ "$mapped" = no ] && [ "$alive" -eq 0 ]; then
 else
     case "$lm:$mapped" in
         mmap:no|mmap+mlock:no)
-            fatal "the load mode is -lm $lm but the model is not in /proc/$bench_pid/maps; the run is not the measurement the header claims (engine #1668)" ;;
+            fatal "the load mode is -lm $lm but the model is not in /proc/$bench_was/maps; the run is not the measurement the header claims (engine #1668)" ;;
         none:yes|dio:yes)
-            fatal "the load mode is -lm $lm but the model IS in /proc/$bench_pid/maps; the run is not the measurement the header claims (engine #1668)" ;;
+            fatal "the load mode is -lm $lm but the model IS in /proc/$bench_was/maps; the run is not the measurement the header claims (engine #1668)" ;;
     esac
 fi
 

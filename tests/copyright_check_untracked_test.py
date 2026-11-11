@@ -95,6 +95,22 @@ with tempfile.TemporaryDirectory() as repo:
     rc = run(repo, "--check")
     check(rc.returncode == 0, "and the check is green afterwards", rc.stdout + rc.stderr)
 
+    # engine#2175: a SHORT header (Copyright + SPDX, no licence block) is not a "missing copyright notice".
+    # The message has to name the shape, or a reader hunts for a notice that is on line 1 -- measured on
+    # #2175/#2173 whose audio headers kept only the two lines while #2133 carried the full block.
+    short = NOTICE.splitlines()[:2]
+    with open(os.path.join(repo, "short.h"), "w") as f:
+        f.write("\n".join(short) + "\n// short.h -- the file's own description\n")
+    git(repo, "add", "short.h")
+    rc = run(repo, "--check")
+    check(rc.returncode != 0, "a SHORT header still fails (the licence block is required)", rc.stdout)
+    check("copyright + SPDX present but the licence block is not" in rc.stdout,
+          "and the failure names the SHAPE, not a missing notice", rc.stdout + rc.stderr)
+    check("missing copyright notice: short.h" not in rc.stdout,
+          "and does NOT claim the notice is missing", rc.stdout + rc.stderr)
+    git(repo, "rm", "-q", "--cached", "short.h")
+    os.unlink(os.path.join(repo, "short.h"))
+
     # an ignored file is not source: it must not need a notice. The .gitignore itself is source (the
     # repo's own carries the notice and is tracked), so it gets one here too.
     with open(os.path.join(repo, ".gitignore"), "w") as f:

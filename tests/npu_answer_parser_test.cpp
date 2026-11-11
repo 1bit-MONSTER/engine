@@ -129,6 +129,98 @@ int main() {
               "the qwen3 family's reasoning tags are the ones this test feeds");
     }
 
+    // A reasoning block the PROMPT opened (engine#1786, FastFlowLM's Qwen3.5-2B-NPU2): the template's generation prompt
+    // ends with `<think>`, so the answer starts inside the block and the only tag in it is the closing one.
+    {
+        const AnswerFamily Q = AnswerFamily::qwen3;
+        const std::string on = "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        const std::string off = "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        const std::string plain = "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n";
+        check(prompt_opens_reasoning(on, Q), "a prompt that ends with <think> leaves the model inside the block");
+        check(!prompt_opens_reasoning(off, Q), "one that opens AND closes it (thinking off) does not");
+        check(!prompt_opens_reasoning(plain, Q) && !prompt_opens_reasoning("", Q) && !prompt_opens_reasoning("\n \n", Q),
+              "nor does one that never mentions it, or an empty one");
+        check(!prompt_opens_reasoning("tell me what <think> means<|im_end|>\n<|im_start|>assistant\n", Q),
+              "the tag earlier in the prompt is not the prompt's end");
+        check(!prompt_opens_reasoning(on, AnswerFamily::gemma4), "the tag is the family's own: <think> opens nothing for gemma4");
+
+        const std::string reply = "Thinking Process:\n1. The capital of France is Paris.\n</think>\n\nParis";
+        const auto before = parse_answer(reply, Q, false);   // what the route did: the fault, as an assertion
+        check(before.reasoning.empty() && contains(before.content, "Thinking Process") && !contains(before.content, "</think>") &&
+                  contains(before.content, "Paris"),
+              "without the flag the reasoning is filed under content, with the closing tag dropped, so nothing marks where the answer starts (the measured fault)");
+        const auto a = parse_answer(reply, Q, false, /*starts_in_reasoning=*/true);
+        check(a.reasoning == "Thinking Process:\n1. The capital of France is Paris.\n", "with it the reasoning is the reasoning");
+        check(a.content == "Paris" && !contains(a.content, "think"), "and the content is the answer, with no tag and no layout newlines in it");
+
+        // an answer cut off inside the block: all reasoning, nothing invented as content
+        const auto cut = parse_answer("Thinking Process:\n1. Analyze", Q, false, true);
+        check(cut.reasoning == "Thinking Process:\n1. Analyze" && cut.content.empty(), "an answer cut inside the block is all reasoning");
+        // a call after the prompt-opened block still parses
+        const auto call = parse_answer("need the tool</think><tool_call>{\"name\":\"ping\",\"arguments\":{}}</tool_call>", Q, true, true);
+        check(call.reasoning == "need the tool" && call.calls.size() == 1 && call.calls[0].name == "ping" && call.content_null,
+              "a tool call after the prompt-opened block is still a call");
+        // the model re-opening the block itself is harmless
+        const auto twice = parse_answer("<think>again</think>ok", Q, false, true);
+        check(twice.content == "ok" && contains(twice.reasoning, "again"), "a model that writes the opening tag anyway still ends up split");
+
+        // streamed, split at awkward places, the pieces add up to the same thing
+        AnswerStream st(Q, false, true);
+        std::vector<std::pair<bool, std::string>> out;
+        for (const std::string& piece : {std::string("Thinking Pro"), std::string("cess:\n1. The capital of France is Paris.\n</th"),
+                                         std::string("ink>\n\nPar"), std::string("is")})
+            st.feed(piece, out);
+        st.finish(out);
+        check(st.reasoning() == a.reasoning && st.content() == a.content, "the streamed split equals the whole-answer split");
+        check(!out.empty() && out.front().first, "and its first piece is reasoning, so a client sees it as such from the first token");
+
+        // per-token mask: reasoning tokens get no logprob entry, content tokens do
+        const std::vector<std::string> toks = {"Thinking", " Process", "</think>", "\n\n", "Paris"};
+        const std::vector<char> m = content_mask(toks, Q, false, true);
+        check(m == std::vector<char>({0, 0, 0, 0, 1}), "the content mask starts at the answer, after the closing tag and its layout");
+        check(content_mask(toks, Q, false) == std::vector<char>({1, 1, 0, 1, 1}), "where without the flag the reasoning tokens counted as content");
+    }
+
+    // Whitespace around a reasoning block is layout (the rule app/think_split.h applies on the in-process route).
+    {
+        const AnswerFamily Q = AnswerFamily::qwen3;
+        const auto a = parse_answer("<think>\nthe capital is Paris\n</think>\n\nParis", Q, false);
+        check(a.reasoning == "the capital is Paris\n" && a.content == "Paris",
+              "the newline after <think> and the blank line after </think> are not part of either text");
+        const auto none = parse_answer("<think>\n\n</think>\n\nItem 3 is the 3D printer.", Q, false);
+        check(none.reasoning.empty() && none.content == "Item 3 is the 3D printer.",
+              "a model that thinks nothing sends no reasoning at all, and the answer starts at its first character");
+        const auto plain = parse_answer("\n  indented answer", Q, false);
+        check(plain.content == "\n  indented answer", "content with no reasoning before it is returned as written");
+        const auto mid = parse_answer("First.<think>x</think> Second.", Q, false);
+        check(mid.content == "First. Second.", "content that came before a block keeps the space that follows the block");
+        const auto inner = parse_answer("<think>a\n\n  b</think>one\n\n two", Q, false);
+        check(inner.reasoning == "a\n\n  b" && inner.content == "one\n\n two", "whitespace inside either text is kept");
+        const auto ws = parse_answer("<think>x</think>\n\n", Q, false);
+        check(ws.content.empty() && ws.reasoning == "x", "an answer that is only layout after the block is empty content");
+
+        // streamed: the layout arrives in its own pieces and none of them is sent
+        AnswerStream st(Q, false);
+        std::vector<std::pair<bool, std::string>> out;
+        for (const std::string& piece : {std::string("<think>"), std::string("\n"), std::string("\n"), std::string("</think>"),
+                                         std::string("\n\n"), std::string("Item"), std::string(" 3")})
+            st.feed(piece, out);
+        st.finish(out);
+        check(out.size() == 2 && !out[0].first && out[0].second == "Item" && out[1].second == " 3",
+              "streamed, an empty block and its layout produce no chunk; the first chunk is the answer's first word");
+
+        // the per-token mask agrees: layout tokens are not content tokens
+        const std::vector<char> m = content_mask({"<think>", "\n", "why", "</think>", "\n\n", "Paris", "\n"}, Q, false);
+        check(m == std::vector<char>({0, 0, 0, 0, 0, 1, 1}), "layout tokens after the block get no content entry; the answer's own do");
+
+        // a tool call straight after the block is unaffected
+        const auto call = parse_answer("<think>t</think>\n<tool_call>{\"name\":\"ping\",\"arguments\":{}}</tool_call>", Q, true);
+        check(call.calls.size() == 1 && call.content_null, "a call after the block and a newline is a call with null content");
+        // without tools the marker is text and is not eaten by the trim
+        const auto text = parse_answer("<think>t</think>\n<tool_call>x", Q, false);
+        check(text.content == "<tool_call>x", "the first text after the block is kept whole, whatever it starts with");
+    }
+
     std::printf("%s\n", failures ? "FAILED" : "all cases ok");
     return failures ? 1 : 0;
 }

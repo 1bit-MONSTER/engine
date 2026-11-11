@@ -234,6 +234,11 @@ private:
     // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
     // logits there instead of only the last row's.  Null on every other path, so nothing else changes.
     std::vector<float>* batch_all_out_ = nullptr;
+    // engine#803 A2b step one: the decode-family block as its own method, body unchanged, so the move into
+    // XdnaTarget::open_decode_family() is a copy rather than surgery inside init_impl.
+    bool open_decode_family_local(bool want_m16, xrt::device* dev, const std::string& mdir,
+                                  const std::string& dir);
+
     bool init_impl(xrt::device* dev, const char* model_path,
                    const std::string& artifact_dir);
     bool host_gemm_ = false;
@@ -243,7 +248,8 @@ private:
     // quantisation, a wrong 128-K group boundary, an int8 intermediate or a saturated accumulator.
     bool host_gemm_i8_ = false;
     // Weight codes + per-128-K multipliers for the integer host arm, quantised once per tensor (engine#1809).
-    struct HostI8Tensor { int groups = 0; int N = 0; std::vector<int8_t> codes; std::vector<float> d; };
+    // `blocked` is the layout `codes` was packed in: blocked only when K x N is whole tiles (engine#1994).
+    struct HostI8Tensor { int groups = 0; int N = 0; bool blocked = true; std::vector<int8_t> codes; std::vector<float> d; };
     // Keyed on (LAYER, wkey, K, N): `wkey` alone is a per-role slot that repeats in every layer and `Bmat` is the one
     // scratch buffer each layer is decoded into, so keying on it served layer 0's weights to every later layer
     // (engine#1830 review). Routed experts pass wkey < 0 and are never cached: their weights change per token.
@@ -277,12 +283,13 @@ private:
     bool attention(const std::vector<float>& qkv, int pos, const int* pos3, std::vector<float>& ctx,
                    int head_dim, int n_kv_heads, float theta, int rotary_dim,
                    bool proportional, int window, int kv_layer, bool append_kv,
-                   int kv_len = 0);
+                   int kv_len = 0, std::vector<float>* q_out = nullptr);
     bool mlp(const std::vector<float>& gu, std::vector<float>& h, int im);
     // The same elementwise gate*up on caller memory, so a batched pass can read its ACT row and write its HH
     // row where they already are instead of staging both through a vector (a copy on each side).
     bool mlp(const float* gu, float* h, int im);
-    float rmsnorm(const float* x, const float* w, int n, float* out) const;
+    // `tag` is the NPU_INFER_DUMP_OPS label (ops-dump.h); the per-head q/k norms pass their own.
+    float rmsnorm(const float* x, const float* w, int n, float* out, const char* tag = "rmsnorm") const;
     float rmsnorm_noweight(const float* x, int n, float* out) const;
     bool run_lm_head(const std::vector<float>& h, std::vector<float>& logits);
     // M rows of hidden state -> M x NV logits, row-major.  Same head, same packed tiles: the rows ride
@@ -362,6 +369,11 @@ private:
     // hw_contexts.  Config `q4nx_pb16i_sealed_elf` names it in the kernels dir; without
     // it the per-role `_pb16i.elf` files are used as before.
     std::string pb16i_sealed_;
+    std::string wide_sealed_;       // q4nx_<layout>_sealed_wide_elf: a wide prefill family (engine#1990)
+    int wide_sealed_rows_ = 32;    // q4nx_sealed_wide_rows
+    std::string narrow_sealed_;     // q4nx_<layout>_sealed_narrow_elf: a narrow decode family
+    int narrow_sealed_rows_ = 4;    // q4nx_sealed_narrow_rows
+    std::string sealed_dir_;        // the kernels dir the 16-row sealed ELF was found in
     // ---- the NPU target (engine#799 P4) ----
     // Everything that talks to a device lives behind this: the ELF contexts (M=128 prefill and the M=16
     // decode twin), the phase-selected launch, the packed-weight BO cache, the pb16i sidecar images, the

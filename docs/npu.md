@@ -68,6 +68,12 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
   npu/                   the model's NPU kernels
 ```
 
+**What ends an answer.** The serve stops on every id in `config.json`'s `eos_token_id` (one integer or a list), on
+`<|endoftext|>` when the tokenizer has it, on `tokenizer_config.json`'s `eos_token` when that file is beside the
+tokenizer, and, when the chat route falls back to ChatML, on `<|im_end|>`. The two files need not agree: FastFlowLM's
+`Qwen3.5-2B-NPU2` container names `<|endoftext|>` in the first and `<|im_end|>` in the second, and the model ends a
+chat turn with the second. The load prints the list (`forward-serve: stops on …`).
+
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the OpenAI-compatible API
 ([serve.md](serve.md)); inside Lemonade, that is what its `onebit` backend runs (`--onebit npu`).
 
@@ -262,6 +268,16 @@ cache (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`) and hands the loader tha
 device streams its 5,120-byte bf16 q4_1 while the container on disk stays exact. The repack is where
 the bf16 rounding reappears for the device, never in the container.
 
+**The cache is bounded, and the bound is least-recently-used (engine#1956).** After writing an
+entry, `1bit serve` removes the least-recently-used entries until the cache is within
+`ONEBIT_Q4NX_CACHE_MAX_GIB` (default 60; `0` or a negative number turns the sweep off). The entry
+just written and any entry used in the last ten minutes are never removed. "Used" means reused,
+not only written: a cache hit — a repacked GGUF found in the cache, or a device-form conversion
+reused at load — marks the entry's directory as used now, so a container imported once and served
+every day outlives a one-off imported yesterday. The value is read as a whole number of GiB: a
+number too large to be a byte count is the largest bound that is one (it does not wrap to a small
+one), and a value that is not a number gets the default rather than an unbounded cache.
+
 **The packed lm-head is cached beside it (engine#1716).** A model whose head runs as int8 tiles
 packs those tiles on the host — gather `kpad × T` weights per tile, quantise each column to int8
 with its own scale — and until this cache that happened on every serve. The image is a function
@@ -285,8 +301,11 @@ is replaced, with one stderr line saying why:
 The serve log line says what happened: `lm head: N packed weight tile(s) resident (…); H from the
 image cache, P packed (W written for the next serve) in S s`. `ONEBIT_HEAD_IMAGE_CACHE=0` turns
 the cache off (nothing is read or written). The files are `kd × nd` bytes plus `nd` scales per
-tile, so a head costs about `kpad × vocabulary` bytes on disk per kernel set; nothing prunes them,
-the same as the device-form copies next to them. Ternary (`pb16i`) heads and the gemv head do not
+tile, so a head costs about `kpad × vocabulary` bytes on disk per kernel set. The Q4NX cache sweep
+(`ONEBIT_Q4NX_CACHE_MAX_GIB`, above) counts `head-images/` as one entry of the cache and removes it
+whole when the cache is over its bound and that directory is the least recently written one. Its
+age is the last time a tile was written into it: a serve that only reads its tiles does not refresh
+it. Losing the directory costs the next serve one pack of its head, nothing else. Ternary (`pb16i`) heads and the gemv head do not
 use it: their image already is a file. Each writer builds the file under its own name
 (`<file>.tmp.<pid>`) and renames it into place, so two serves that start cold on the same pack both
 finish their write and a reader only ever sees a whole image. The behaviour is pinned host-side in
@@ -508,6 +527,78 @@ checks keep the contract honest without a device: `tests/npu_t2s_layout_test.cpp
 against the numbers the tool measured on a real image (gate/up: 50,135,040 B of pb16i → 23,674,880 B
 of stream), and `tests/q4nx_t2s_test.py` pins the code order byte for byte.
 
+**That single rounding costs one multiply per element, not one `ldexp()` (#1990).** A launch's result is
+`float32(S * 2^e_ref) * ascale` for every element, and `2^e_ref` depends only on the column. It was computed
+with a libm `ldexp()` call per element, after readback, where no launch phase column counted it: a 16-row
+prefill block on `bonsai2-27b-t2s2` is 416 launches of up to 16 x 17,408 elements, and that call was the
+block's largest host term. `q4nx_pb16i::dequant_rows()` computes the power once per column and multiplies.
+The value is the same, not close: a double times a normal power of two is exact while the product is a
+normal double, which holds for every exponent from -1022 to 960, and any column outside that range takes
+the per-element form as before. Measured in one `npu-hold` ticket, one binary, `NPU_DEQ_LDEXP=1` (the old
+form) against the default, 103 blocks per arm: the dequant term **137.4 -> 32.3 ms per block**, the block
+median **630.4 -> 515.0 ms** (25.4 -> 31.1 rows/s), and three 510-536-token prompts reached their first
+token at 24.4-25.1 tok/s before and **29.8-30.6 tok/s** after. That is the first pair of arms; the box
+slowed for both forms in the second pair (the old form measured 357 ms of dequant per block there), so the
+second pair is not quoted as a speedup. `NPU_DEQ_LDEXP=2` runs both forms and counts differing elements:
+0 of 568,483,840 on the device, and the greedy text is identical in all five arms.
+`tests/npu_pb16i_layout_test.cpp` holds the two forms to the same bits for one and two planes, the edges
+of the exponent range and exponents outside it. The `[bl]` line names the term as `deq`.
+
+**A sealed set may carry a wide family for prefill (#1990).** The served sealed sets are built for 16
+rows per launch, so a prefill chunk is 16 rows and a 536-token prompt is 34 blocks of 416 launches. A pack
+may name a second sealed ELF with the same instances built for more rows: `q4nx_t2s_sealed_wide_elf` (or
+`q4nx_pb16i_sealed_wide_elf`) in `config.json`, a file in the kernels directory beside the 16-row one, and
+`q4nx_sealed_wide_rows` for its row count (default 32, allowed 17..128). No pack ships one yet, so nothing
+changes for an existing pack. `NPU_WIDE_SEALED_ELF=<file>` overrides the pack's file, `NPU_WIDE_SEALED_ELF=0`
+switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count.
+
+When the wide ELF loads for every role that has a 16-row kernel, the chunk width becomes its row count and a
+launch of more than 16 rows takes the wide kernel; decode steps and chunks of up to 16 rows stay on the
+16-row family. It is all roles or none: the chunk width is one number for the pass, so a set missing one
+role is not adopted. A named file that is missing or does not load never stops the serve: the log says why
+(`[forward] wide family NOT adopted (...)`) and chunks stay at 16 rows. The weight images are shared, only
+the activation and result buffers differ. A launch that carries more rows than its kernel holds is refused
+by name. The rules (`wide_family_complete`, `chunk_rows`, `wide_takes`, `wide_elf_path` in
+`npu/forward/include/batch_width.h`) are pinned without a device by `tests/npu_pack_test.cpp`.
+
+Measured on `bonsai2-27b-t2s2` with a 32-row set, one `npu-hold` ticket per row of the table, one binary,
+arms off / on / off / on, three 510-536-token prompts per arm (`prompt_tokens / wall`, `max_tokens 1`):
+
+| how the wide set was named | first token, wide off | first token, wide on | 16-row block median | 32-row block median |
+|---|---|---|---|---|
+| `NPU_WIDE_SEALED_ELF` | 28.3-29.8, 30.5-30.8 tok/s | **35.6-35.9, 35.0-35.4 tok/s** | 534.2, 509.3 ms | 871.0, 881.5 ms |
+| the pack's `config.json` key | 28.7-28.9, 28.7-29.0 tok/s | **33.9-34.2, 34.2-34.4 tok/s** | 541.2, 541.4 ms | 914.0, 908.3 ms |
+
+Two 16-row blocks against one 32-row block is 30-31 rows/s against 35-37. The 8-token greedy text is
+identical with the family off and on, and `NPU_BATCH_CHECK=1` on the wide path reports MATCH on every chunk
+it checks (32-, 4- and 1-row) in both tickets. Only 32 rows has been measured.
+
+**...and a narrow family for decode (#2073).** A decode step on `bonsai2-27b-t2s2` is 416 launches, and
+device wait is 211 of its 302 ms: every launch runs a kernel built for 16 rows and carries one, and a
+launch's device time does not depend on how many of its rows are filled. So a pack may also name a sealed
+ELF built for FEWER rows: `q4nx_t2s_sealed_narrow_elf` (or `q4nx_pb16i_sealed_narrow_elf`) and
+`q4nx_sealed_narrow_rows` (default 4, allowed 1..15) in `config.json`; `NPU_NARROW_SEALED_ELF=<file>`
+overrides the file, `=0` switches it off, `NPU_NARROW_ROWS` overrides the rows. A launch of 1..rows rows
+takes it (a decode step, or a verify pass of a few rows); anything wider keeps the 16-row family. The rules
+are the wide family's: all roles or none, one hw_context, shared weight images, and a file that is missing
+or does not load is logged (`[forward] narrow family NOT adopted (...)`) while decode stays on the 16-row
+kernels. `narrow_family_complete` and `narrow_takes` in `batch_width.h` are pinned by
+`tests/npu_pack_test.cpp`. No pack ships a narrow ELF yet.
+
+Measured with a 4-row set, one binary, arms 16-row / 4-row / 16-row / 4-row, three prompts generating 49
+tokens each (`(tokens - 1) / (wall - wall of a 1-token request)`), two `npu-hold` tickets:
+
+| ticket, pair | decode, 16-row family | decode, 4-row family | device wait per step |
+|---|---|---|---|
+| first, pair 1 | 3.26-3.33 tok/s | **3.69-4.21 tok/s** | 210.1 -> 158.1 ms |
+| first, pair 2 (another lane loading the box) | 1.88-2.59 tok/s | 2.33-3.14 tok/s | 230.7 -> 208.1 ms |
+| second, pair 1 | 2.85-3.29 tok/s | **3.90-4.16 tok/s** | 234.7 -> 151.7 ms |
+| second, pair 2 | 2.15-3.32 tok/s | **4.05-4.19 tok/s** | 210.9 -> 150.9 ms |
+
+The step wall follows the wait: 286.0 -> 233.7 ms and 296.2 -> 225.9 ms in the quiet pairs. The 49-token
+greedy text of each prompt is identical in all eight arms, and `NPU_BATCH_CHECK=1` with the narrow family
+reports MATCH on every chunk it checks (1-, 4- and 6-row; the 6-row one runs on the 16-row family).
+
 **A t2s container wants a sealed set for the same reason a pb16i one does.** The layout is not what makes
 a phase change expensive: the **hw_context** is. Measured on this box in-loop on 2026-11-02, a t2s decode
 family shipped as eight per-role `_t2s2_m16` ELFs paid **+2.0-2.3 ms on every launch, in every role** — more
@@ -576,6 +667,41 @@ the call). `tests/gdn_batch_order_test` requires those check lines on any hybrid
 A request wall moves less than the block does and scatters more: the same four arms measured 20.2-21.7 tok/s before and
 21.6-23.1 after by TTFT, with one outlier in each direction (18.3 and 15.8) from other lanes' load. Quote the block
 medians for the effect and the TTFT range for what a caller sees.
+
+#### The attention rows of a block share one thread team (#1990)
+
+The next host term after the one above, same pack, same instruments. A batched pass called `attention()` once per row,
+and each call opened its own thread team over the heads: 16 rows on each of this model's 16 full-attention layers is
+256 teams per block. The rows of a layer now go through `q4nx_attn::rows_context()` (`npu/forward/include/attn_math.h`):
+every row's position-local half runs first (its q, and its k/v appended to the cache), then all (row, head) pairs are
+one statically scheduled loop in one team. A causal row reads only positions up to its own, so the later rows already
+being in the cache changes nothing it reads.
+
+Measured on `bonsai2-27b-t2s2` (2026-11-10, `npu-hold` tickets, one binary, `NPU_ATTN_ROWS=0` against the default,
+103 blocks per arm, `amdxdna` error count unchanged). **What it buys is the attention term and its behaviour under
+load, not a block-wall gain that can be resolved on a quiet box:**
+
+| ticket, arms in order | attention per block, mean (per-row -> one team) | block wall median |
+|---|---|---|
+| first: A B (quiet) | 31.2 -> **14.3 ms** | 675.7 -> 658.4 ms |
+| second: A B A B (quiet) | 24.5 -> **13.0**, 26.6 -> **13.1 ms** | 609.3 -> 613.1, 626.3 -> 601.9 ms |
+| first, later arms: B then A, another lane's load on the box | **16.0** vs 98.1 ms | 674.5 vs 834.4 ms |
+
+The attention term halves in every pair. The block wall does not follow it reliably: the first pair moved by 17 ms,
+the two pairs of the second ticket by +4 and -24 ms, which is the arm-to-arm scatter of this box (about 15 ms on a
+600 ms block) and not a measured 2-3 %. The first version of this section quoted the first pair as a 2.6 % gain; the
+second ticket is why it no longer does. Under load the picture is different and is one observation, not a repeat: the
+per-row arm measured 56.2 ms median attention with 36 of 103 blocks over 100 ms, while the one-team arm before it held
+13.6 ms with none.
+
+Nothing rounds differently: a (row, head) pair runs the same statements in the same order as before
+(`q4nx_attn::head_context()`, which `attention()` now calls too) and writes only its own floats. Greedy text is identical
+in every arm. `NPU_ATTN_CHECK=1` recomputes each row the per-row way and compares bit patterns, failing the pass on a
+difference (160 of 160 layer passes identical on the device); `tests/attn_math_test` holds `rows_context()` to the
+per-row form bit for bit on 1, 2, 5 and 12 threads, for causal, whole-prompt and sliding-window reads.
+
+The schedule is static on purpose. A first version used a dynamic schedule and measured a lower median (15-25 ms) but a
+worse mean than the per-row form, with 6 and 14 of 103 blocks over 100 ms in its two arms: the tail was the whole cost.
 
 #### Per-tile arithmetic ceiling, and where our GEMMs sit against it (AM027)
 
@@ -756,6 +882,36 @@ weights over the bound. The Q6_K tensors (half of `v_proj` and `down_proj`, and
 `lm_head` from the Q6_K embedding) requantize to cosine 0.9969 and relative RMS error
 0.079. Served on the NPU, the repacked model decoded 24/24 greedy tokens the same as a CPU
 reference of the repacked weights, with every step's logits at cosine 0.99995 or better.
+
+### What the GGUF converter refuses, and the qwen35 converter
+
+`tools/gguf_to_q4nx.py` converts qwen3, qwen3moe and qwen2. Two other inputs are refused before
+anything is written, with no output directory left behind (engine#2013):
+
+- **A GGUF of another architecture.** Every tensor kind without a Q4NX name is listed in one message,
+  with how many tensors of each there are. For `qwen35` the message points at the converter below.
+- **A tensor type the installed `gguf` package does not know.** The refusal gives the number;
+  143 is PTQ1_0, PrismML's ternary type, which `tools/ternary_to_q4_0.py` rewrites as Q4_0.
+
+`tools/qwen35_to_q4nx.py pack <model.gguf> <out dir> [--tokenizer <dir>]` packs a **qwen35** GGUF:
+layers of gated linear attention (GDN) with a full-attention layer every
+`qwen35.full_attention_interval`. It writes the names the forward looks up
+(`linear_attn.qkv_proj`, `self_attn.gate_proj`, `linear_attn.ssm_*`), reorders the 48 value heads
+from the stored order to the grouping the forward expects, and stores `ssm_alpha`/`ssm_beta` as Q8
+tiles padded to 64 rows. It reads the GGUF itself and needs only numpy. `verify <model.gguf>
+<out dir>` checks every tensor of a container against the GGUF, including the direction of the
+value-head reorder.
+
+Its input has to be a plain qwen35 GGUF in Q4_0 or Q4_1. It refuses, by name:
+
+- a file that still carries `prism.hadamard.*` keys: the weights are in a rotated basis, the tool
+  writes no sign table, and the container would load and answer wrongly;
+- PTQ1_0 tensors (ggml type 143).
+
+So a PrismML ternary GGUF needs two steps before this one: PTQ1_0 to Q4_0
+(`tools/ternary_to_q4_0.py`, which keeps the rotation) and the un-rotation, which is not in this
+tree. The 27B container on the dev box (`__metadata__.converter = qwen35_to_q4nx.py`) was made from
+an un-rotated Q4_0 GGUF.
 
 ### Routed expert stacks
 
@@ -1020,6 +1176,35 @@ Two facts about what the container holds, both reported, not hidden:
   scale 0, zero 0). That is 12.5 % more bytes than the pack; the true K is in the container's
   manifest and in `config.json`, and nothing reads a padding column as a weight.
 
+### Where a 1.9 pack's rewritten `.fconst` goes
+
+A Ryzen AI 1.9 pack's Token `.fconst` is rewritten into its 1.8 form before it is read. The copy is as large as the source
+(3.6 GB for an h4096 pack), so where it lands matters: on strixhalo `/tmp` is tmpfs, which means RAM. The importer tries these
+directories in order:
+
+1. `$ONEBIT_FCONST_SCRATCH`, if set;
+2. `$XDG_CACHE_HOME/1bit/fconst19`, or `~/.cache/1bit/fconst19` (on disk);
+3. `$TMPDIR`, then `/tmp`, then the current directory.
+
+The copy is a cache: it is reused while the source's size and mtime and the rules version match. On each write the importer
+sweeps the scratch directories. It removes other identities of the same pack and geometry, the pre-version name, and any
+`1bit-fconst19*` copy nobody has written for 6 hours. Without an override, **every** candidate directory is swept, not only the
+one being written, so copies older binaries left in `/tmp` get reclaimed (engine#1907). With `ONEBIT_FCONST_SCRATCH` set, only
+that directory is swept, and a run with an override never removes another lane's files. The current directory is the
+one candidate that is never swept unless the copy is being written there: it is only the last write fallback, and a
+working directory's files are not the importer's to clean. The 6 hours are what keep a concurrent run's copy alive in a
+shared directory, so the number stays above the longest import; it is not the knob for disk or tmpfs pressure. The test suite sets one per run and
+removes it at exit.
+
+The cache directory is shared: every import of the same pack on the box uses the same file name. The copy is therefore
+written under a temporary name beside it (`1bit-fconst19tmp-<pid>-<n>-<name>`) and renamed into place, so an import finds
+either no copy or a complete one (engine#1985). Before that the copy was written in place, and two imports of one pack
+started a fraction of a second apart could leave the first reading a file the second had just truncated. The result was a
+wrong layout reading with exit 0: `Qwen3-1.7B` reported 280 refused tensors, `qk_norm` false and 0 measured tiles in 4 of
+24 runs of three imports 0.15 s apart, and 0 of 144 with the rename. A temporary file left by a killed run is removed by
+the 6-hour rule above. A binary older than this change still writes in place, so a box where old and new binaries import
+the same pack at the same moment can still show it.
+
 ### Linking the kernel set the container will be served with
 
 A model directory carries its own NPU kernels in `npu/` (see "A model directory"), and for an imported
@@ -1183,6 +1368,69 @@ stored bytes equal the upstream checkpoint's `model.norm.weight` exactly. (The e
 "the tail envelope is `[eps][pad][448 f32]`, so the final norm's position is unknown" — was the
 last 1,856 bytes of the *file*, which in the Token_Token program are tile padding.)
 
+**A head the pack declares at `block_size 32` is not in that tile stream** (engine#1740). The three
+Ryzen AI 1.9 Qwen-1.5B packs quantise every layer at block 128 and `/lm_head/MatMul_Q4` at block 32,
+and their tail after the envelope is 64-row *units* instead: 2,560 zero bytes, then `2 x (K/32)`
+strips of 640 B. Strip `s` holds K block `s/2` for rows `32 x (s%2) .. +31` of the unit: 512 B of
+4-bit codes (low nibble first; position `p` is row `(p/256) x 8 + p%8`, column `(p/8) % 32`), 16 B
+of zero-point nibbles, 48 zero bytes, and 32 **signed** bf16 scales, one per row;
+`w = (code - zero_point) x scale`. After the last unit the file is zero to its end (110,208,000 B on
+the measured pack, which is why the block-128 arithmetic never landed there). `npu-pack import`
+reads it (`read_block32_head`), folds a negative scale into its codes so the container's scales are
+positive, and writes the same q4_1f tiles as any other head. The layout checks are part of the read
+— unit count `ceil(vocab/64)`, the zero fields, finite scales, zeros to the end of the file — and
+each failure is a refusal that says which. On a pack that declares tied embeddings the read head
+also has to correlate above 0.99 with `model.embed_tokens`; if it does not, the head is made from
+the embedding as before and `q4nx_head_note` says why the read was not taken. On an untied pack the
+layout checks are all there is, and the note says the values are not verified. Measured on
+`Qwen-2.5_1.5B_Instruct_rai_1.9.0_npu` (tied, 151,936 x 1,536, 2,374 units of 64,000 B): every scale
+equals `bf16(-m/8)` of its 32-column embedding block, `m` being the block's largest-magnitude
+weight, and the read head correlates 0.996 with the embedding.
+
+**A pack whose every MatMulNBits is `block_size 32` keeps its layers in those units too**
+(engine#1503). `SmolLM2-135M-Instruct_rai_1.9.0_npu` declares block 32 on all 151 ops, and its
+*raw* Token `.fconst` (the file as shipped, not the 1.8-form copy the block-128 path makes) is
+`layers` blocks of one fixed shape and then the tail. With `H` = hidden, `Nq` = heads x head_dim,
+`Nkv` = KV heads x head_dim, `IM` = intermediate, `unit(K) = 2,560 + 2 x (K/32) x 640` (the head's
+unit above) and `mlp_unit(K) = 4,864 + 2 x (K/32) x 1,216`:
+
+| section | bytes | holds |
+|---|---|---|
+| envelope | `64 + 2H` | bf16 `rms_norm_eps`, zeros to 64, `input_layernorm` bf16[H] |
+| q, k, v | `(Nq/64 + 2 x Nkv/64) x unit(H)` | `q_proj` [Nq][H], `k_proj` [Nkv][H], `v_proj` [Nkv][H] |
+| — | `4 x heads` | not a weight; skipped |
+| o | `(H/64) x unit(Nq)` | `o_proj` [H][Nq] |
+| envelope | `64 + 2H` | epsilon, zeros, `post_attention_layernorm` bf16[H] |
+| gate + up | `(IM/64) x mlp_unit(H)` | `gate_proj` and `up_proj`, [IM][H] each |
+| — | 64 | skipped, not interpreted (`01` then zeros on the measured pack) |
+| down | `(H/64) x unit(IM)` | `down_proj` [H][IM] |
+
+The tail is the same envelope with the final norm, then `ceil(vocab/64)` head units at K = `H`,
+then zeros. On SmolLM2-135M the block is 2,360,292 B (q at 1,216, k at 231,616, v at 308,416, o at
+385,252, the second envelope at 615,652, gate/up at 616,868, down at 1,784,292), the head is at
+70,809,976 and the file is exactly `30 x 2,360,292 + 1,216 + 768 x 25,600 = 90,470,776` B.
+
+The **gate/up unit** is the head's unit with 64 row *slots* per strip instead of 32 rows: 4,864
+zero bytes, then `2 x (K/32)` strips of 1,216 B. Strip `s` holds K block `s/2`; slots 0..31 are
+`gate_proj` rows `32 x (s%2) .. +31` of the unit and slots 32..63 are the same rows of `up_proj`.
+A strip is 1,024 B of 4-bit codes (low nibble first; position `p` is slot `(p/256) x 8 + p%8`,
+column `(p/8) % 32`), 32 B of zero-point nibbles, 32 zero bytes, and 64 signed bf16 scales. The
+code order was measured against the public checkpoint; that zero point and scale are indexed by
+slot is assumed by analogy with the 640-byte strip, and is tested by the imported container's
+gate/up still correlating with the checkpoint once they are applied.
+
+`npu-pack import` takes this path when every op the pack's `cache/*_meta.json` declares is block 32,
+at least one of them is a layer projection, and the pack has a Token `.fconst` (a pack that
+declares only its head at 32 is the case above). Nothing is located by search: the offsets are
+arithmetic on the geometry, and the file has to agree with them — at least
+`layers x stride + 64 + 2H + ceil(vocab/64) x unit(H)` bytes, the pack's epsilon and zeros at every
+envelope, zero unit headers and strip gaps, finite scales, zeros after the head — or the tensors
+are refused by name with the offset. The container gets the same tensors in the same q4_1f tiles as
+a block-128 import; this layout has no bias field, so no bias tensor is written. There is no
+decode->encode round trip on this path (no encoder for these units exists), so the import's
+`attention:` and `MLP:` round-trip lines are replaced by a `block 32:` line. Measured on one pack
+only, where `Nq == H`; `o_proj`'s K being `Nq` is the declared shape, not a measurement.
+
 The norms that *are* imported sit at the documented offsets, each confirmed by the epsilon that
 opens its layer block: **48/48 anchors found**. `tests/npu_pack_import_test` (registered as
 `npu_pack_import`, and as `npu_pack_import_oga` when `-DONEBIT_OGA_PACK=<dir>` is given) checks
@@ -1212,6 +1460,11 @@ differ because the two encodings are different, both exactly:
 | Q4_0 zero-point | in the min plane, `-8d` | min plane is **0** |
 | Q4_0 codes | unsigned `q` (0..15) | **signed** `q-8`, nibble = `q` xor 8 |
 | code order in a tile | `[row-half(2)][group(8)][col-in-group(32)][row-pair(8)]` (the 16-row split the kernel walks) | plain column major `[col(256)][row-pair(16)]` |
+
+`npu-pack`'s writers hold the container to that unsigned field: `tile_q4_1`, `tile_q4_1_f32` and the
+`.fconst` tile encoder all refuse a code above 15, naming where it is, rather than mask it into
+a different code one full range away (engine#1921). A signed code has to be converted before it
+reaches a writer, which is what the 1.9 decoder does.
 
 Measured, per tensor, against the GGUF as ground truth: **196/196 Q4_0 tensors exact (0.0 error)
 under each file's own decoder** — so both converters are correct — and **0/197 exact when one is
@@ -1265,6 +1518,174 @@ selections per layer touch nearly all 128 experts and stream ~18 GB. MoE prefill
 GPU route (`--moe-prefetch`, docs/serve.md); this is the thing that decides whether a kernel is
 right.
 
+### A pack's vision component (`vision_weight.q4nx`, engine#1788)
+
+FastFlowLM's MiniCPM-V 4.7 packs are two containers at the pack root: `model.q4nx` (the text model) and
+the file `config.json` names as `vision_model_weight`, `vision_weight.q4nx` (the vision tower). The
+second is the same container format holding a ViT: every tensor BF16, no tiles. `npu/vision_pack.h`
+reads it, and `1bit npu-pack vision <pack dir>` prints what it found:
+
+```
+$ 1bit npu-pack vision MiniCPM-V-4.7-1B-NPU2
+vision component  MiniCPM-V-4.7-1B-NPU2/vision_weight.q4nx
+tensors           347, all BF16, 1135109120 B of payload, 0 B unaccounted
+patch embed       14 x 14 pixels x 3 channels -> 1152
+positions         4900 (a 70 x 70 grid; image 980)
+blocks            27 at width 1152, 16 heads x 72, MLP 4304 (4608 stored)
+vit_merger        after block 6; attention at 1152, MLP 4608 -> 17216 (17280 stored) -> 1152
+merger            4608 -> 4608 -> 1024 (the text model's hidden size)
+source_file       mmproj-model-f16.gguf
+source_sha256     fb9cc047a3cdad5317fd8433a4aeda2d22f00f02ca4bd93b34ad84165b25a900
+note              config.json states MINICPM_V_VISION_MLP_INTERMEDIATE_SIZE 4304; model.visual.blocks.*.mlp.linear_fc1.weight has 4608 rows, the last 304 all zero: the container pads the model's width, and sizes come from the tensor
+note              config.json states MINICPM_V_VIT_MERGER_INTERMEDIATE_SIZE 17216; model.visual.vit_merger.mlp.linear_fc1.weight has 17280 rows, the last 64 all zero: the container pads the model's width, and sizes come from the tensor
+```
+
+What the reader settles is what a forward may rely on.
+
+- **Sizes come from the tensors.** The geometry is derived from the tensors' own shapes, and every
+  tensor must have the shape the others imply.
+- **The MLPs are stored padded.** The model's MLP widths are 4304 (blocks) and 17216 (`vit_merger`);
+  that is what `config.json` states and what the source GGUF's tensors are. The container stores them
+  4608 and 17280 wide, the next multiples of 128, with the extra `linear_fc1` rows, bias entries and
+  `linear_fc2` columns all zero. A loader that sized a buffer from the config would be 304 rows short
+  of what the file holds. The reader sizes from the tensor, verifies that everything past the stated
+  width is zero in every block, and carries the model's width beside the stored one
+  (`Geometry::model_intermediate`). If any value past the stated width is not zero it says so and
+  keeps the tensor's width; a config that states an MLP wider than its tensors is refused.
+- **Zero gaps.** A tensor the reader has no place for is a refusal, as is a missing one, a hole in the
+  block indices, a tensor that is not BF16, an extent that is not its shape's byte length, an extent
+  outside the payload, and two tensors on the same bytes. Each names the tensor.
+- **`config.json` is consulted for what the tensors cannot say** (the head count, the image size, the
+  unpadded MLP widths) and refused where the two cannot both be right: heads that do not multiply to
+  the width, an image size that is not the position grid times the patch, another width, block count
+  or position count, and a text `hidden_size` that is not what the merger projects to. That last one
+  is a tower paired with the wrong text model.
+
+**Checked against the source, bit for bit** (2026-11-10, both published packs). The 1B container's
+`__metadata__` names `mmproj-model-f16.gguf` and its SHA-256, which is the file of that name in
+`openbmb/MiniCPM-V-4.7-1B-gguf`. All 347 pack tensors were rebuilt from that GGUF and compared as
+BF16 bit patterns: 263 identical, 84 identical in the source's extent and `+0.0` in the padding, 0
+different. The pack's `attn.qkv` is the source's `attn_q`, `attn_k`, `attn_v` stacked in that order;
+`merger.norm` is the source's `v.post_ln`. Every F32 source tensor is exactly representable in BF16.
+The 35B-A3B container carries no `__metadata__`; the same comparison against
+`openbmb/MiniCPM-V-4.7-35B-A3B-gguf`'s `mmproj-model-f16.gguf` (SHA-256 `bff3b688…5d20f1`) gives the
+same 263 / 84 / 0, and against the 1B's source gives 0 of 347, so the two towers share a geometry and
+not a single tensor. One source tensor has no counterpart in either container: `v.tok_embd_sep`
+(`[4, hidden]`).
+
+Pinned by `tests/npu_vision_pack_test.cpp` on crafted containers; `ONEBIT_MINICPM_PACK=<pack dir>` adds
+the published pack's own numbers. The source comparison above was run by hand and is not a test in the
+tree.
+
+**The tower on the host (`npu/vision_tower.h`).** `vision::tower_forward(pack, pixels, gh, gw)` runs the
+tower in float32 on the CPU: normalised pixels for a `gh × gw` patch grid in, `(gh/4) × (gw/4)` rows at
+the text model's width out. It is a reference for whatever runs the tower on the NPU later, not a
+serving path; nothing calls it from a serve, and it does no image decoding, resizing or slicing. The
+order of operations is the transformers implementation's (`transformers.models.minicpmv4_7`):
+
+1. patch embedding (a Conv2d whose kernel is its stride), patches row-major;
+2. plus one learned position row per patch, picked **nearest** on the 70 × 70 table: row
+   `floor(y·70/gh)`, column `floor(x·70/gw)`. No interpolation and no rotary term;
+3. blocks 0–6: LayerNorm (eps 1e-6), full attention, MLP with the tanh GELU;
+4. the `vit_merger`, once, after block `insert_layer_id` (6): attention inside each 2 × 2 window only,
+   then per window an MLP over the four tokens side by side plus their mean. The grid halves;
+5. blocks 7–26 on the halved grid, then `merger.norm`;
+6. the merger: 2 × 2 groups again, `pre_norm`, `linear_fc1`, the exact (erf) GELU, `linear_fc2`.
+
+So both grid extents must be multiples of 4, and anything else is refused. The padded MLPs are read at
+the tensor's stride and the model's width.
+
+Measured against that implementation (transformers 5.22.2, torch 2.13 CPU, float32, eager attention)
+loaded with each pack's own weights, same input (`pixel(c, y, x) = sin(0.37c + 0.11y + 0.05x +
+0.003xy)`), 2026-11-10:
+
+| pack | grid | tower before the merger: max \|d\|, corr | output: max \|d\|, corr |
+|---|---|---|---|
+| 1B | 8 × 12 | 2.9e-5, 1.000000000 | 1.1e-6, 1.000000000 |
+| 1B | 16 × 20 | 1.1e-5, 1.000000000 | 2.4e-6, 1.000000000 |
+| 35B-A3B | 16 × 20 | 9.5e-6, 1.000000000 | 9.5e-7, 1.000000000 |
+
+The 16 × 20 grid took 5.5 s and 1.25 GB of memory for this code on one thread; a full 70 × 70 slice
+has 61 times the tokens and its attention grows with the square, which is why this is a reference.
+`tests/npu_vision_tower_test.cpp` carries a small tower with LCG weights and that implementation's
+output for it as goldens, so the arithmetic is checked in CI without a pack; with
+`ONEBIT_MINICPM_PACK` and `ONEBIT_MINICPM_ORACLE` set it repeats the comparison above. The reference
+run itself needs transformers and torch and is not in the tree.
+
+**Where an image goes before the tower (`npu/vision_plan.h`).** `vision::plan_image(height, width)` is
+the arithmetic of the model's image processor (transformers' `MiniCPMV4_6ImageProcessor`, which 4.7
+loads), with no pixel touched: the model looks at an image whole, resized to about 448 × 448 pixels,
+and, when the image is larger than that, again as a grid of up to 9 slices cut from a second, larger
+resize. Every piece is a multiple of 56 pixels (4 patches) in both extents, because the tower merges
+2 × 2 twice, and becomes `(height/56) × (width/56)` rows on the text side.
+
+| image | whole view | slices | text rows |
+|---|---|---|---|
+| 448 × 448 or smaller (scaled up) | 448 × 448 | none | 64 |
+| 480 × 640 | 392 × 504 | 1 × 2 of 560 × 392 | 63 + 2 × 70 |
+| 1080 × 1920 | 336 × 616 | 2 × 4 of 448 × 448 | 66 + 8 × 64 |
+| 3024 × 4032 | 392 × 504 | 3 × 3 of 392 × 504 | 63 + 9 × 63 |
+
+(heights first.) So one 448-pixel slice is 64 rows, not the 1,225 that 980 / 14 / 2 squared suggests: the
+position table is 70 × 70, but no piece the processor produces is that large unless the image is a very
+long strip. The plan is checked against the reference's own answers for 3,481 image sizes in
+`tests/npu_vision_plan_test.cpp`. Nothing is cropped or padded and no size is refused for not being a
+multiple of anything: every image is resized whole (385 × 384 becomes 448 × 448, so the aspect ratio moves
+a little, as it does in the model's own processor), and the slices tile the refine size exactly. The plan
+does not bound its result: a 1,048,576 × 1 strip gives the reference's answer, a piece 458,752 pixels
+tall, and it is the caller that decides how many rows to accept. `plan_image()` reads no file and touches
+no pixel, which is what lets it be checked anywhere; keep it that way.
+
+**From bytes to the tower's input (`npu/vision_image.h`).** `vision::preprocess(rgb, height, width, plan)`
+resizes an RGB byte image to the plan's whole view and, when it is sliced, to the refine size, cuts the
+slices, and returns each piece as `(3, height, width)` float32 with value `(byte − 127.5) / 127.5`
+(rescale by 1/255, then mean 0.5 and std 0.5, the same for each channel; R, G, B order in and out; byte
+0 is exactly −1 and byte 255 exactly +1): the whole view first, then the slices row by row. The resize is bicubic with antialiasing on bytes and
+reproduces `torch.nn.functional.interpolate(uint8, mode="bicubic", antialias=True)` (torch 2.13) bit
+for bit: the a = −0.5 cubic stretched by the scale when shrinking, integer weights at the largest
+precision that still fits int16 (PIL's fixed 22 bits differs by one in about 1 % of bytes), width
+first and then height. `tests/npu_vision_image_test.cpp` holds the reference's bytes for eleven
+resizes as hashes.
+
+End to end on the 1B pack, 2026-11-10: a 460 × 470 synthetic image through plan, resize, pieces and
+`tower_forward()`, against the reference's plan, torch's resize and the transformers tower on the same
+image:
+
+| piece | patches | rows | max \|d\| | corr |
+|---|---|---|---|---|
+| whole view 448 × 448 | 32 × 32 | 64 | 6.4e-6 | 1.000000000 |
+| slice 0, 616 × 336 | 44 × 24 | 66 | 7.5e-6 | 1.000000000 |
+| slice 1, 616 × 336 | 44 × 24 | 66 | 6.7e-6 | 1.000000000 |
+
+That run took 110 s on one thread, which is the host reference's cost and the reason it is not a
+serving path. Two things are not established: the reference side called torch's `interpolate`
+directly, on the understanding that this is what the processor's torchvision resize does for byte
+images on a CPU build with AVX2 (torchvision is not on this box, so that link is read, not run); and
+no real photograph or image decoder has been through it. The slice separators and placeholder rows on
+the text side are not written.
+
+**The text side of an image (`npu/vision_prompt.h`).** Two more pieces of arithmetic, on token ids only:
+
+- `vision::image_tokens(plan, markers)`: what replaces one `<|image_pad|>` in the rendered prompt.
+  `<image>`, one placeholder per row of the whole view, `</image>`, then each row of slices as
+  `<slice>` placeholders `</slice>` per slice, with one newline token between rows. The tower's rows go
+  into the placeholders in order. (`<image_id>k</image_id>` in front is ordinary text, left to the
+  caller.)
+- `vision::prompt_positions(ids, markers, grids)`: the three position planes (t, h, w) for a prompt that
+  contains images, the model's `mrope_mode: canvas`. Text counts 1, 2, 3 on all three planes. An image
+  is laid on a canvas whose origin is the next free position: the slices tile it, the whole view is
+  stretched over it, `<image>` sits one step before it and `</image>` on its far corner, and the text
+  after it resumes at `origin + max(canvas height, canvas width) + 1`. So an image moves the position
+  counter by its **side**, not by its row count: a 480 × 640 picture is 203 placeholder rows and
+  advances the position by 15.
+
+Both follow transformers' `MiniCPMV4_7Processor.replace_image_token` and
+`MiniCPMV4_7Model.get_rope_index`, and `tests/npu_vision_prompt_test.cpp` holds that code's answers for
+eight prompts (one to two images, with and without slices, touching, newline-separated, with id
+prefixes, and none) as hashes over every token id and position. Images only: video frames are not
+handled. Nothing feeds these planes or the tower's rows into the text forward yet; that is the route's
+work.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU
@@ -1276,6 +1697,15 @@ kernels (dense Qwen3: 0.6B, 1.7B and 4B):
 
 In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
 The model directory holds the weights only; the kernels ship inside the package.
+
+**Streaming.** With `"stream": true` the route sends each piece of the answer as it is produced. The first frame
+leaves once the prompt has been processed and the first visible piece exists (a thinking model's opening markup is
+held until it can be classified, so that is a token or two after the prompt is done), and the rest follow about
+one per token. Before engine#1785 every frame was sent after the generation had ended, so a client's time to first
+token was the whole request. A request that fails before producing anything (a prompt over the context, a
+malformed field) still gets its own status code, not a 200 stream; one that fails later reports the error as a
+last `data:` frame. A client that disconnects stops the generation at the next token, which frees the device for
+the next request. The streamed reply and the non-streamed one are the same text.
 
 ### FastFlowLM's NPU2 drops: the families the route does not serve
 
@@ -1460,15 +1890,80 @@ The slot table (`app/npu_prefix_cache.h`) has a slot kind for the part such requ
 | call | what it decides |
 |---|---|
 | `pin_point(prev, ids)` | how many leading tokens this request shares with the previous one. 0 when one prompt is a prefix of the other (a repeat or a continued conversation, which the ordinary slots already keep), when the shared part adds fewer than `--prefix-min-gain` tokens over a slot that already covers the request, or when the cache is off |
+| `pin_at(ids, n)` | the same decision for a point the caller already knows: `n` leading tokens every such request shares. 0 when `n` is the whole prompt, when a slot already covers it, or when it is under `--prefix-min-gain` |
 | `pin(prefix, bytes)` | keep the state at that point. One pinned slot at a time: a new pin replaces it; eviction for room and a longer prompt's replacement both leave it alone |
 | `lookup(ids)` | unchanged, and reports `pinned` when the hit is the pinned slot |
 
-It reads token ids only, so it does not depend on the template or on which message is the system prompt.
+The table itself reads token ids only, so it does not depend on the template. Where the pin goes is the caller's
+choice between two rules, below.
 
-**State of this, plainly:** the table and its tests are in; `forward-serve` does not call `pin_point()`/`pin()`
-yet, so no request is faster because of it today. The forward half is one more cut in the prefill loop (stop one
-token short of the pin point, `snapshot_state`, `pin`), and it needs a device run to be claimed.
+**`--prefix-pin`** (on `1bit serve --device npu` and on `forward-serve`; off by default) turns it on. The
+forward keeps the previous request's prompt ids, and when `pin_point()` is non-zero it stops the prefill one
+token short of that point, takes a snapshot and pins it, the same cut it already makes before the last token.
+The cost is one more launch on the request that makes the pin. Every decision is logged
+(`[prefix] pin slot=1 tokens=342 state_at=341 pinned`), and `usage.flm_prefix_cache.pinned` says when a hit
+came from the pinned slot.
 
+Measured 2026-11-10 on `bonsai2-t2s2-perrole876` with its `kernels-m16`, one `npu-hold`
+ticket, one server per arm, four requests: the same 14-rule system prompt, then three different questions and
+the second one again. 16 tokens generated, temperature 0.
+
+| request | cache off | default cache | `--prefix-pin` |
+|---|---|---|---|
+| 1 (question A) | cached 0, 58.6 s | cached 0 | cached 0, 59.5 s |
+| 2 (question B) | cached 0, 59.4 s | cached 0 | cached 0, 62.1 s (makes the pin: 342 tokens) |
+| 3 (question C) | cached 0, 61.5 s | cached 0 | **cached 341 of 355, pinned, 23.4 s** |
+| 4 (question B again) | cached 0, 60.0 s | not reached | cached 354 of 355 (the whole-prompt slot), 20.4 s |
+
+The generated text of all four requests is identical between the cache-off arm and the `--prefix-pin` arm.
+The default-cache arm's times are not in the table: the ticket ended during its third request, so only its
+three cache decisions (from the server log) are known. A request's time here is the whole HTTP call, prefill
+plus 16 generated tokens, not TTFT.
+
+**Pinned on the first request (engine#1785).** That run needed two requests to find the shared part, so the
+third was the first warm one, and when two questions opened with the same words the pin ran a few tokens into the
+question, which a question opening differently could not use. A chat request with a leading system message now
+gives the point directly: the route renders the leading system messages followed by a probe user message (the
+container's template, or ChatML) and pins where the full prompt stops agreeing with that, on the first request
+(`pin_at`). The probe user message is there because a template may refuse to render a system turn alone (the
+Qwen3.5 template does); if a template cannot render even that, the request has no early pin and the log says so
+(`[prefix] no early pin: …`). Only a request with no
+system message still uses the comparison with the previous request (`pin_point`). On FastFlowLM's
+`Qwen3.5-2B-NPU2` container under `--flash`, a 1,016-token prompt, time to first token (two server loads):
+
+| request | before | after |
+|---|---|---|
+| first question | 8.8 s | 10.6 / 11.1 s (busier box; makes the pin: 1,003 tokens) |
+| **second question** | 9.1–9.5 s (made the pin: 1,009 tokens) | **1.39 / 1.38 s** (1,002 of 1,017 cached) |
+| third question | 1.06 s | 1.40 / 1.35 s |
+
+The "before" column was taken with two other changes that make decode about a third faster on this model, the
+"after" column without them and at twice the box load, so compare the rows' shape (which request is the first warm
+one), not the third row's two figures.
+
+**`--flash`** (`1bit serve --device npu --flash`) is the single-turn profile as one word: `--ctx-size 1024`
+plus `--prefix-pin`. It refuses what contradicts it (`--ctx-size` other than 1024, `--prefix-slots 0`, a device
+other than `npu`) instead of quietly winning or losing.
+
+`--ctx-size N` now reaches this route. Before engine#1785's flash slice, `serve --ctx-size N` on a
+model-generic container was accepted and dropped at the hand-off to `forward-serve`, which kept the model's
+own `max_position_embeddings` (so the run in the table above was passed `--ctx-size 1024` and it had no effect;
+its prompts were about 355 tokens, so nothing in the table depends on it). The limit is prompt plus answer,
+it can lower the model's context and never raise it, and the load line says what is in force:
+`1bit forward-serve: context 1024 tokens (prompt plus answer)`.
+
+A request that does not fit is the client's error, so it is a 400 with the type the GGUF route's backend uses
+for the same refusal (it was a 500 with a bare message):
+
+```
+HTTP 400 {"error": {"message": "request (1597 tokens) exceeds the available context size (1024 tokens)",
+                    "type": "exceed_context_size_error", "n_prompt_tokens": 1597, "n_ctx": 1024}}
+```
+
+Measured 2026-11-10 with `--flash`, same pack and kernels, one `npu-hold` ticket, `max_tokens 8`: the
+1597-token request above refused in 0.02 s; then three questions under one system prompt: request 1
+`cached 0` (56.2 s), request 2 `cached 0` (48.9 s, makes the pin at 342 tokens), request 3
+`cached 341 of 355, pinned` (13.9 s). Whole HTTP calls, one run.
 
 ### Sampling and structured output
 
@@ -1556,6 +2051,14 @@ ended itself once its grammar had reached an accepting state — the route puts 
 mask exactly there, so a complete JSON object reports `stop` instead of padding with whitespace to `max_tokens`
 (engine#1182).
 
+Every pick is bounded by the tokenizer, not only the constrained one. The head is `vocab_size` wide, and
+`vocab_size` may exceed the tokenizer's ids: Qwen3's 151,936 against 151,669 (measured on Qwen3-0.6B's
+`config.json` and `tokenizer.json`). The ids in between are padding positions with no text, so a token drawn
+there emits nothing and never ends the reply. `sample_token()` and `1bit npu-run`'s per-row argmax
+(`argmax_token()`) therefore consider only ids below the tokenizer's size (`token_bound()` in
+`app/npu_sampling.h`, engine#2017), with or without a grammar. A container with no `tokenizer.json` keeps the
+whole row.
+
 The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of
 `third_party/llama.cpp/src/llama-sampler.cpp` (top_k, then top_p, then temperature, then the
 cumulative-sum draw that `common/sampling.cpp`'s chain ends with) over the raw logits this route
@@ -1603,6 +2106,11 @@ forward-serve` serves that too, from the same process and the same weights:
 |---|---|
 | `POST /v1/systemone` (alias `POST /v1/decisions`) | `{"state": …, "questions": {id: question}}` → `{"model", "answers": {id: answer}, "usage"}` |
 | `GET /v1/systemone/models` | the decision model this build serves: name, description, `max_input_tokens`, `modalities` |
+
+A pack that declares `attention_mode: noncausal_full_attention` (below) is a decision model and nothing else:
+it encodes a prompt in one pass and has no token-by-token decode. On such a pack `/v1/chat/completions` and
+`/v1/completions` answer **400** with `type: decision_model_error` and a message that names `/v1/systemone`
+(or says there is no decision head, when the serve loaded none), before any work is done.
 
 `questions` is an **object**, and its ids come back as the keys of `answers` in request order. Question
 types are `choice` (1–255 options), `noul` and `score` (2–10 ordered levels); a decision runs one backbone
@@ -1840,7 +2348,7 @@ none of which is a kernel fault. A family gated against f32 can therefore never 
 
 `NPU_INFER_HOST_GEMM=i8` is the reference that can. It builds each body GEMM's weight image with the engine's
 own packer (`q4nx_pack_B_int8_blocked()`: one multiplier per column, int8 codes, blocked microtile order), walks
-it with `q4nx_layout::blocked_index()`, quantises the activation row to int8 with `amax/127`, accumulates in
+it with `q4nx_layout::image_index()`, quantises the activation row to int8 with `amax/127`, accumulates in
 int32 and applies `d[n] * (ascale * acc)`. **Same packer, same image, same order** -- that is the whole point: a
 reference that re-quantises by a different rule computes a different model, and will disagree with a correct
 device (measured: per-128-K int4 codes answer `ikt` to a question four other packs answer correctly on).
@@ -1848,6 +2356,12 @@ device (measured: per-128-K int4 codes answer `ikt` to a question four other pac
 The LM head is included, in vocabulary blocks (a whole head image is H x V bytes, 622 MB at 150k vocabulary).
 Without it the body is exact and the head is not, and the residual shows up as `max|d| ~ 0.3` on logits that no
 amount of body-side agreement can remove.
+
+The images are unpadded (K x N bytes), and the blocked order only exists for whole 64 x 128 tiles, so a geometry
+that is not whole tiles is packed and read **row-major** instead: the same codes and scales, so the same int32
+sums. The common case is the head's last vocabulary block (phi-3-mini: `32064 % 8192 = 7488`, which is 58.5
+tiles). Before engine#1994 such a shape was forced blocked, so the packer wrote past the vector and the MAC read
+back whatever was there. `tests/npu_blocked_layout_test.cpp` pins the rule with guard bytes behind the image.
 
 **What it measures.** Run the device arm and the `=i8` arm on the same request with `--dump-logits`, then
 `scripts/families/compare-logits.py` (npu-kernels). On `kernels-h4096-b8` with Mistral-7B-Instruct-v0.2 1.9:
@@ -1968,6 +2482,37 @@ reaps or signals the holder -- killing another lane's live serve is the box-cras
 `tools/showcase-612-npu-streams.sh` measures with `MODEL` and `MODEL_B` (default Qwen3-0.6B and
 Qwen3-4B, whose kernel sets are on this box): each model solo, then both at once, three reps, every
 number stamped with the build that produced it.
+
+### Finding where a forward diverges: `NPU_INFER_DUMP_DIR` and `NPU_INFER_DUMP_OPS`
+
+Two diagnostic switches of the NPU forward. Both are off by default, neither changes a result, and neither
+can fail a run.
+
+| variable | what it writes | answers |
+|---|---|---|
+| `NPU_INFER_DUMP_DIR=<dir>` | `<dir>/layer_<ll>.f32` per layer: the residual stream after that layer, M x H little-endian f32, row-major. The directory must exist; a file that cannot be written is reported on stderr and the run goes on. | which **layer** two runs part at (per-layer cosine against a reference trace) |
+| `NPU_INFER_DUMP_OPS=1` | one stderr line per projection and per weighted RMSNorm: `[op] L<layer> <tag> rows=<M> \|x\| mean <m> absmax <a>` | which **op** inside the layer |
+
+`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process. When it is on, the forward prints
+`[ops-dump] NPU_INFER_DUMP_OPS is on: …` once at model load, before any request (engine#2028). A run that sets the
+variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
+looking for a code path that skips the dump.
+
+```
+  [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935
+  [op] L00 ffn_gate_up  rows=1 |x| mean 0.0258482 absmax 1.25728
+  [op] L00 ffn_down     rows=1 |x| mean 0.00315921 absmax 0.673885
+```
+
+- The tag is the one the projection's call site already passes (`attn_qkv`, `attn_output`, `ffn_gate_up`,
+  `ffn_down`, `ssm_out`, ...). Layer norms are `rmsnorm`; on a family with per-head q/k norms those print as
+  `q_norm` and `k_norm`, one line per head.
+- The numbers are over row 0 of the result (its first N values). A batched projection prints one line with
+  `rows=M`; a norm is called per row, so a batched pass prints one norm line per row.
+- A NaN or Inf is counted (`nonfinite 2/4096` at the end of the line) and left out of the mean and the maximum.
+- The same lines come out on the host arms (`NPU_INFER_HOST_GEMM=1` or `=i8`) and on the device arm, in the same
+  order and number, so the two logs of one prompt can be compared with `diff`. Start there: the first line whose
+  numbers differ names the op.
 
 ### When a load follows an evict
 
@@ -2154,7 +2699,11 @@ sampled two ways), and `--batchcheck` takes the verify batch's M-curve.
 (`identical=N differing=0`). Both passes continue the same prefix: the oracle snapshots the first `start_pos`
 positions before the replay and restores them afterwards (engine#1905). So a chunk after the first, or the serve
 path's split-off last token, is compared from the state the batched pass really continues, and the flag leaves the
-run's own output unchanged. `tests/batch_check_state_test.cpp` pins both properties.
+run's own output unchanged. `tests/batch_check_state_test.cpp` pins both properties, and it runs in CI (engine#1946):
+a configure without the NPU lane builds the same forward sources against the public runtime stub
+(`onnx/ep/npu_runtime_ci_stub.cpp`, whose device calls throw; the host-GEMM forward makes none), and
+`tests/batch_check_state_ci.py` runs the test on a two-layer qwen3 container it writes and packs itself. With the
+NPU lane on, the row is the dev-box one and takes a real container from `ONEBIT_TEST_Q4NX`.
 
 `tools/mtp_depth_pool.py` pools those tickets. It refuses a pool it cannot read (a repeated tail, a cell scored twice, a
 short read, a mixed budget, a mixed window identity) and, since the tau=0.6 window, it also says when a depth is too
@@ -2162,6 +2711,19 @@ short read, a mixed budget, a mixed window identity) and, since the tau=0.6 wind
 is worth more than the whole bar. Those depths keep their PASS/FAIL (the bar is the brief's criterion) but print
 `(thin: N live chain(s), one chain = X pp > the 2 pp bar)` and are counted out of the summary line, because a bare FAIL
 on 2 chains reads as a drafter regression when it is arithmetic.
+
+**Which drafts a sampler may keep** is a separate rule from how they are committed, and it lives in
+`npu/mtp/spec_accept.h` (engine#1781, gate 2). The loop above accepts a draft when it equals the base model's argmax,
+which is exact for greedy decode only. With a sampler the contract is that the output follows the **target's**
+distribution, and the rule that guarantees it is: accept a drafted token `x` (drawn from the drafter's distribution `q`)
+with probability `min(1, p(x)/q(x))`, and at the first rejection emit a token from `normalise(max(0, p - q))` and stop
+the chain. `p` and `q` are the final sampling distributions (after temperature, top-k, top-p), and an argmax drafter
+states a one-hot `q`. At temperature 0 both rows are one-hot and the rule reduces to the greedy contract, so that
+contract is its degenerate case. `tests/spec_accept_test.cpp` (ctest `spec_accept`) pins both: the temperature-0
+identity, and a deliberately wrong drafter (`p = [.45, .35, .20]`, `q = [.10, .80, .10]`) whose emitted tokens are
+within 0.0016 of `p` over 200,000 draws at an acceptance rate of 0.55, where the greedy rule on the same rows misses
+`p` by 0.55. The header is not called by a serve yet: wiring a speculative loop into `forward-serve` is the rest of
+#1781, and that loop must print its acceptance rate beside its tok/s.
 
 **The one thing that must be right**: the drafter attends over its own states, so its cache has to be the base
 model's *committed stream, row by row*. Feeding it only the current chain is silent — drafts get worse, the text

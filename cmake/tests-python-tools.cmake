@@ -25,6 +25,11 @@ add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_or
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
 add_python_test(ci_targets ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#2018: this one was in tools/ci/unreferenced_py_tests.txt as a baseline entry, and it should not have been: the
+# file is portable and passes (worst-case |sum| 11.18e6 inside int32 at K=11008, 4 arms), it just never had a runner. A
+# baseline records a test as never-run, which for a passing test is the wrong outcome -- so it is registered and the line
+# is removed, which is the shrink the baseline's own comment asks for.
+add_python_test(moe_expert_chunks_accum_test ${CMAKE_SOURCE_DIR}/tests/moe_expert_chunks_accum_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
 # `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and
 # tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.
@@ -42,3 +47,14 @@ add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_ag
 add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
 add_python_test(tool_selftest_spec_decode_acceptance ${CMAKE_SOURCE_DIR}/tools/spec_decode_acceptance.py --selftest)
 add_python_test(tool_selftest_whisper_encoder_baseline ${CMAKE_SOURCE_DIR}/tools/whisper_encoder_baseline.py --self-test)
+# engine#1780: the DFlash draft package's gate before a loader -- tile-grid sizes from the config, tile-header sanity and
+# the container's scalars against config.json, on a synthetic package with eight negative controls. Stdlib only.
+add_python_test(tool_selftest_dflash_draft_info ${CMAKE_SOURCE_DIR}/tools/dflash_draft_info.py --selftest)
+# engine#1750: what a TDR recovery did, counted from the kernel log (failed context restarts among them). The self-test
+# parses lines in the driver's own formats for three module generations. Stdlib only, no device.
+add_python_test(tool_selftest_amdxdna_tdr_report ${CMAKE_SOURCE_DIR}/tools/amdxdna_tdr_report.py --self-test)
+# engine#2013: the qwen35 (gated linear attention) GGUF -> Q4NX converter. Its own selftest (tile round-trips, the
+# value-head permutation), and a pack + verify of a small qwen35 GGUF the test writes itself, with the three inputs it
+# has to refuse. numpy only: no gguf package, no model, no device.
+add_python_test(tool_selftest_qwen35_to_q4nx ${CMAKE_SOURCE_DIR}/tools/qwen35_to_q4nx.py selftest)
+add_python_test(qwen35_to_q4nx ${CMAKE_SOURCE_DIR}/tests/qwen35_to_q4nx_test.py)

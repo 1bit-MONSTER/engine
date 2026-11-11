@@ -69,6 +69,13 @@ bytes rather than slack: three more ~306 MiB tensors become device-resident (3 �
 quote a prefill delta measured across it. `-lm none` is not a lever to ship on the strength of one measurement — it costs
 GTT on a box where GTT is the scarce resource, and the honest statement is the mechanism above, not the percentage.
 
+**How it is selected in a server (engine#1668).** The measurement above was taken with `llama-bench`/`llama-server` directly, and
+`1bit serve` hard-coded `--load-mode mmap` for its child, so the lever could not be reached where prefill actually costs
+time-to-first-token. It now passes that flag **only when the operator has not chosen a mode**: set `LLAMA_ARG_LOAD_MODE=none`
+(the child's own variable, so there is one mechanism rather than two) and the flag is omitted, letting the environment value
+ride. The default is unchanged, and the 604 MiB of GTT the `-lm none` row records is the price of asking — a per-model cost on
+a box where the pool budget is the scarce resource (engine#1711), which is why this is an override and not a new default.
+
 ## What is measured
 
 - **Prompt:** one long prompt (default: the first 8,000 characters of `docs/*.md`, about 1,800

@@ -41,3 +41,8 @@ pin-report.json
 # probe - a red that is the tree's, not the repository's (engine#1564). Ignoring them also stops run output being
 # committed by accident.
 .hrx123/logs/
+
+# npu_pack_import_test's container-genre fixtures (test_q4nx_container): written to <golden dir>/q4nx-container, and to
+# ./q4nx-container when the test runs with no golden dir -- so a run from the source root left them where `git add -A`
+# picks them up, and #1986 committed five of them (820 KB) and reddened the copyright gate. Run output, not source.
+q4nx-container/

@@ -295,7 +295,10 @@ int XdnaTarget::max_rows() const {
     if (pb16i_)
         for (int i = 0; i < n; i++)
             if (ctx16_[i]) { widths16[i] = ctx16_[i]->MD; any16 = true; }
-    if (any16) return onebit::npu::batch_width_min(widths16, n, 1);
+    if (any16) {
+        // engine#1990: with a wide family adopted for every role, a chunk may be as wide as that family.
+        return onebit::npu::chunk_rows(onebit::npu::batch_width_min(widths16, n, 1), wide_rows_);
+    }
     int widths[Q4NX_MAX_DESIGNS] = {0};
     bool any_ctx = false;
     for (int i = 0; i < n; i++)
@@ -315,6 +318,8 @@ int XdnaTarget::max_rows() const {
 int XdnaTarget::rows_for(int role, int want) const {
     if (role < 0 || role >= Q4NX_MAX_DESIGNS) return want;
     if (m16_ && want >= 1 && want <= 16 && ctx16_[role]) return ctx16_[role]->MD;
+    if (pb16i_ && ctxw_[role] && onebit::npu::wide_takes(want, Q4NX_DESIGN_M_DECODE, wide_rows_))
+        return ctxw_[role]->MD;   // engine#1990
     return ctx_[role] ? ctx_[role]->MD : want;
 }
 
@@ -338,6 +343,54 @@ I8Ctx* XdnaTarget::make_ctx16(int role, const Q4nxDesignGeom& geom) {
 I8Ctx* XdnaTarget::ctx16(int role) const {
     if (role < 0 || role >= Q4NX_MAX_DESIGNS) return nullptr;
     return ctx16_[role].get();
+}
+I8Ctx* XdnaTarget::make_ctx_wide(int role) {
+    if (role < 0 || role >= Q4NX_MAX_DESIGNS) return nullptr;
+    ctxw_[role] = std::make_unique<I8Ctx>();
+    return ctxw_[role].get();
+}
+I8Ctx* XdnaTarget::ctx_wide(int role) const {
+    if (role < 0 || role >= Q4NX_MAX_DESIGNS) return nullptr;
+    return ctxw_[role].get();
+}
+bool XdnaTarget::adopt_wide(int rows) {
+    int narrow[Q4NX_MAX_DESIGNS] = {0}, wide[Q4NX_MAX_DESIGNS] = {0};
+    for (int i = 0; i < Q4NX_MAX_DESIGNS; i++) {
+        if (ctx16_[i]) narrow[i] = ctx16_[i]->MD;
+        if (ctxw_[i]) wide[i] = ctxw_[i]->MD;
+    }
+    if (!pb16i_ || !onebit::npu::wide_family_complete(narrow, wide, Q4NX_MAX_DESIGNS, rows)) {
+        drop_wide();
+        return false;
+    }
+    wide_rows_ = rows;
+    return true;
+}
+I8Ctx* XdnaTarget::make_ctx_narrow(int role) {
+    if (role < 0 || role >= Q4NX_MAX_DESIGNS) return nullptr;
+    ctxn_[role] = std::make_unique<I8Ctx>();
+    return ctxn_[role].get();
+}
+bool XdnaTarget::adopt_narrow(int rows) {
+    int base[Q4NX_MAX_DESIGNS] = {0}, narrow[Q4NX_MAX_DESIGNS] = {0};
+    for (int i = 0; i < Q4NX_MAX_DESIGNS; i++) {
+        if (ctx16_[i]) base[i] = ctx16_[i]->MD;
+        if (ctxn_[i]) narrow[i] = ctxn_[i]->MD;
+    }
+    if (!pb16i_ || !onebit::npu::narrow_family_complete(base, narrow, Q4NX_MAX_DESIGNS, rows)) {
+        drop_narrow();
+        return false;
+    }
+    narrow_rows_ = rows;
+    return true;
+}
+void XdnaTarget::drop_narrow() {
+    for (auto& c : ctxn_) c.reset();
+    narrow_rows_ = 0;
+}
+void XdnaTarget::drop_wide() {
+    for (auto& c : ctxw_) c.reset();
+    wide_rows_ = 0;
 }
 void XdnaTarget::drop_ctx16(int role) {
     if (role >= 0 && role < Q4NX_MAX_DESIGNS) ctx16_[role].reset();
@@ -363,7 +416,9 @@ void XdnaTarget::note_head(int M, double dpk, double dql, double dwt, double drb
 int XdnaTarget::design_index(I8Ctx* c) const {
     if (!c) return -1;
     for (int i = 0; i < ndesigns_ && i < Q4NX_MAX_DESIGNS; i++)
-        if (ctx_[i].get() == c || (ctx16_[i] && ctx16_[i].get() == c)) return i;
+        if (ctx_[i].get() == c || (ctx16_[i] && ctx16_[i].get() == c) || (ctxw_[i] && ctxw_[i].get() == c) ||
+            (ctxn_[i] && ctxn_[i].get() == c))
+            return i;
     return -1;
 }
 
@@ -737,7 +792,12 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
     const float as = amax > 0.0f ? amax / 127.0f : 1.0f;
     // Phase-selected activation tile: a one-row call is decode, so it runs this
     // role's M=16 twin (one core row instead of 128 rows / 8 live tiles).
-    I8Ctx& kctx = *ctx_for(&ctx, 1, ar.decode_twin);
+    I8Ctx* kctx1 = ctx_for(&ctx, 1, ar.decode_twin);
+    // A decode step carries one row: with a narrow family it runs the kernel built for a few rows instead of 16.
+    if (pb16i_ && ar.role >= 0 && ar.role < Q4NX_MAX_DESIGNS && ctxn_[ar.role] &&
+        onebit::npu::narrow_takes(1, narrow_rows_))
+        kctx1 = ctxn_[ar.role].get();
+    I8Ctx& kctx = *kctx1;
     const bool prof = prof_;
     const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
@@ -1011,11 +1071,26 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     // Rows > 1 is prefill and keeps the M=128 kernel (one launch per chunk); a
     // single row here is a decode step and gets the M=16 twin, exactly like
     // npu_gemm().
-    I8Ctx& kctx = *ctx_for(&ctx, M, ar.decode_twin);
+    I8Ctx* kctxp = ctx_for(&ctx, M, ar.decode_twin);
+    // engine#1990: more rows than the 16-row family holds go to the wide family when the set has one. The weight
+    // BO, its e_ref and its mode are the launch's (layer, key) slot, not the context's, so both families read the
+    // same image; only the row count of the activation and result buffers differs.
+    if (pb16i_ && ar.role >= 0 && ar.role < Q4NX_MAX_DESIGNS && ctxw_[ar.role] &&
+        onebit::npu::wide_takes(M, Q4NX_DESIGN_M_DECODE, wide_rows_))
+        kctxp = ctxw_[ar.role].get();
+    else if (pb16i_ && ar.role >= 0 && ar.role < Q4NX_MAX_DESIGNS && ctxn_[ar.role] &&
+             onebit::npu::narrow_takes(M, narrow_rows_))
+        kctxp = ctxn_[ar.role].get();   // a short chunk (a verify pass of a few rows) fits the narrow kernel
+    I8Ctx& kctx = *kctxp;
     const bool prof = prof_;
     const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (pb16i_ && kctx.pb16i) {
         out.assign((size_t)M * (size_t)N, 0.0f);   // sized before every refusal path below
+        if (M > kctx.MD) {
+            // Never launch more rows than the kernel's buffers hold: that reads and writes past them (engine#1372).
+            err = "pb16i: " + std::to_string(M) + " rows on a " + std::to_string(kctx.MD) + "-row kernel";
+            return;
+        }
         if (!sc) { err = "pb16i: no sidecar tag for this projection"; return; }
         PackedWeight* slot = nullptr;
         if (weight_cache_ && wkey >= 0 && ar.layer >= 0 && ar.layer < n_layers_ && dev_) {
@@ -1080,8 +1155,13 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
         const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         kctx.readback();
         const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        out.assign((size_t)M * (size_t)N, 0.0f);
-        kctx.dequant_pb16i(out.data(), M, N, ascales.data(), slot->eref, kctx.pb16i_planes);
+        {
+            // `out` is already M x N (sized before the refusal paths above) and every element is written here, so it
+            // is not zero-filled a second time. Timed on its own: this runs after `tr`, so no launch phase column
+            // ever counted it, and the batched [lh] table had it under UNATTRIBUTED (engine#1990).
+            q4nx_lh::LhScope _t_deq(LH_DEQ_OUT);
+            kctx.dequant_pb16i(out.data(), M, N, ascales.data(), slot->eref, kctx.pb16i_planes);
+        }
         // The batched (prefill) twin of the trace above: a short prompt runs step_batch, so this
         // is the path a 1-token request actually takes.
         if (const char* tl = getenv("NPU_PB16I_TRACE")) {

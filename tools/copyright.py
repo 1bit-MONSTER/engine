@@ -229,6 +229,21 @@ def near_miss_holder(line):
     return n >= HOLDER_NEAR_MISS_PREFIX
 
 
+_CANON_LINES = {re.sub(r"^\W+", "", n).strip() for n in NOTICE}
+
+
+def canonical_notice_line(line):
+    """True when the line IS one of the canonical notice lines, spelled exactly.
+
+    engine#2129, met while fixing a new file's header: an SPDX two-liner without the licence block is "missing" to
+    has_notice(), so --fix prepends the block -- and the two-liner it just merged into that block stayed behind, so the
+    file --fix had just written failed --check with "duplicated inside the header window". near_miss_holder() cannot
+    cover it by construction: it returns False for an exact holder, because an exact holder next to the canonical block
+    is the *repaired* state. The block already contains both lines, so a copy inside the window is not a second claim.
+    """
+    return re.sub(r"^\W+", "", line).strip() in _CANON_LINES
+
+
 def repair_notice(text, block):
     """The file already HAS the canonical notice, plus a near-miss of our holder: delete the misspelling.
 
@@ -258,7 +273,7 @@ def add_notice(text, block):
     # block and leave the hand-written one in place, which is how a file ended up with two notices and a green
     # `--check` (engine#1606). Dual attribution with a different holder is untouched - only the window is read.
     head = lines[:NOTICE_WINDOW]
-    kept = [l for l in head if not near_miss_holder(l)]
+    kept = [l for l in head if not near_miss_holder(l) and not canonical_notice_line(l)]
     lines = kept + lines[NOTICE_WINDOW:]
     return "".join(lines[:insert_at]) + block + "".join(lines[insert_at:])
 

@@ -4990,6 +4990,65 @@ void test_container_plan(const std::string& root) {
     }
 }
 
+// engine#1786 (item F1), slice 3a: roles from names alone. The cases are the three the census measured -- a transformer
+// pack that classifies completely, the alternate spellings that must classify the same way, and the two residues (SSM
+// and MTP) which must be RECOGNISED rather than reported as unknown, since `unassigned` is only useful if it means
+// "nothing knows this".
+void test_container_roles() {
+    const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
+    const auto roles = [&](std::initializer_list<const char*> names) {
+        std::vector<pi::Q4nxTensor> v;
+        for (const char* n : names) v.push_back(t(n));
+        return pi::container_roles(v);
+    };
+
+    // 1. a transformer pack, HF spelling
+    {
+        const auto r = roles({"model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.weight",
+                              "model.layers.0.self_attn.k_proj.weight", "model.layers.0.self_attn.v_proj.weight",
+                              "model.layers.0.self_attn.o_proj.weight", "model.layers.0.mlp.gate_proj.weight",
+                              "model.layers.0.mlp.up_proj.weight", "model.layers.0.mlp.down_proj.weight",
+                              "model.layers.0.input_layernorm.weight", "model.layers.0.post_attention_layernorm.weight",
+                              "model.norm.weight", "lm_head.weight"});
+        check(r.unassigned.empty(), "roles: a transformer pack classifies completely");
+        check(r.counts.at("q_proj") == 1 && r.counts.at("down_proj") == 1, "roles: projections are named by role");
+        check(r.role_of.at("model.norm.weight") == "final_norm", "roles: the top-level norm is not a layer norm");
+        check(r.role_of.at("model.layers.0.input_layernorm.weight") == "input_norm",
+              "roles: a layer norm is the input norm, not the final one");
+    }
+    // 2. the alternate spellings must land on the same roles
+    {
+        const auto r = roles({"model.layers.0.self_attn.attn_q.weight", "model.layers.0.self_attn.wq.weight",
+                              "model.layers.0.mlp.ffn_gate.weight", "model.layers.0.mlp.ffn_down.weight"});
+        check(r.unassigned.empty(), "roles: alternate spellings classify");
+        check(r.role_of.at("model.layers.0.self_attn.attn_q.weight") == "q_proj", "roles: attn_q is q_proj");
+        check(r.role_of.at("model.layers.0.self_attn.wq.weight") == "q_proj", "roles: wq is q_proj");
+        check(r.role_of.at("model.layers.0.mlp.ffn_gate.weight") == "gate_proj", "roles: ffn_gate is gate_proj");
+    }
+    // 3. a bias belongs to its projection's role, and a qkv projection is not a q projection
+    {
+        const auto r = roles({"model.layers.0.self_attn.q_proj.bias", "model.layers.0.self_attn.qkv_proj.weight"});
+        check(r.role_of.at("model.layers.0.self_attn.q_proj.bias") == "q_proj", "roles: a bias keeps its projection's role");
+        check(r.role_of.at("model.layers.0.self_attn.qkv_proj.weight") == "qkv_proj",
+              "roles: qkv_proj is not classified as q_proj");
+    }
+    // 4. the two measured residues are recognised, not unknown
+    {
+        const auto r = roles({"model.layers.0.linear_attn.ssm_alpha_proj.weight",
+                              "model.layers.0.linear_attn.ssm_conv1d.weight", "model.mtp.fc.weight",
+                              "model.mtp.pre_fc_norm_hidden.weight"});
+        check(r.unassigned.empty(), "roles: the SSM and MTP families are recognised, not unassigned");
+        check(r.counts.at("ssm") == 2 && r.counts.at("mtp") == 2, "roles: each residue is counted under its own family");
+    }
+    // 5. something nothing knows is named, not guessed
+    {
+        const auto r = roles({"model.layers.0.mystery_block.weight"});
+        check(r.unassigned.size() == 1, "roles: an unknown tensor is listed");
+        check(r.unassigned[0] == "model.layers.0.mystery_block.weight", "roles: it is named, not summarised");
+        check(r.counts.empty(), "roles: and no role is invented for it");
+    }
+}
+
 // engine#1786 (item F1): an NPU2 model source is a safetensors container, and this is the reader that decides whether
 // a pack is that genre. The failure that matters is the silent one -- a wrong header length yields an empty inventory,
 // which reads as "a pack with no tensors" rather than "a malformed header" -- so each arm asserts the reason, not just
@@ -5717,6 +5776,7 @@ int main(int argc, char** argv) {
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
+        test_container_roles();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);

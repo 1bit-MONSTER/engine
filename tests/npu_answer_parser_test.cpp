@@ -221,6 +221,44 @@ int main() {
         check(text.content == "<tool_call>x", "the first text after the block is kept whole, whatever it starts with");
     }
 
+    // engine#2111: usage.completion_tokens_details.reasoning_tokens -- how much of the budget went into reasoning.
+    {
+        const AnswerFamily Q = AnswerFamily::qwen3;
+        // the issue's row: max_tokens 8, the template opened the block, and every token is still inside it
+        const std::vector<std::string> eight = {"Okay", ",", " the", " user", " asks", " about", " the", " capital"};
+        check(reasoning_token_count(eight, Q, false, true) == 8,
+              "an unclosed block that took the whole budget: every token is reasoning (content \"\", 8 of 8)");
+        const auto empty = parse_answer("Okay, the user asks about the capital", Q, false, true);
+        check(empty.content.empty() && empty.reasoning == "Okay, the user asks about the capital",
+              "... and that reply's content is empty while its reasoning carries the text");
+        // the model opens the block itself: both tags count with it, the layout and the answer do not
+        check(reasoning_token_count({"<think>", "\n", "why", "</think>", "\n\n", "Paris", "\n"}, Q, false) == 4,
+              "a closed block: <think>, its text, </think> are reasoning; the layout after it and the answer are not");
+        // a tag split across tokens counts with the block on both sides
+        check(reasoning_token_count({"<th", "ink>", "plan", "</th", "ink>", "Paris"}, Q, false) == 5,
+              "a tag split over two tokens is reasoning on both halves");
+        // a token that straddles the boundary reached content, as content_mask says
+        check(reasoning_token_count({"<think>", "plan", "</think>Paris"}, Q, false) == 2,
+              "a token carrying the closing tag and the first answer text is content");
+        // a block this splitter opens after the answer started: its opening tag counts with it
+        check(reasoning_token_count({"Hi.", "<think>", "x", "</think>", "Bye"}, Q, false) == 3,
+              "a block opened after content: <think>, x, </think> are reasoning; the prose around it is not");
+        // no reasoning at all
+        check(reasoning_token_count({"Par", "is", "."}, Q, false) == 0, "a reply with no block has 0 reasoning tokens");
+        check(reasoning_token_count({}, Q, false, true) == 0, "no tokens, no reasoning tokens");
+        // call markup is neither content nor reasoning, and is not counted as reasoning
+        check(reasoning_token_count({"<think>", "t", "</think>", "<tool_call>", "{\"name\":\"ping\",\"arguments\":{}}",
+                                     "</tool_call>"}, Q, true) == 3,
+              "a tool call after the block is not reasoning");
+        // the count agrees with the mask: a reasoning token never has a content entry
+        const std::vector<std::string> mixed = {"<think>", "a", "b", "</think>", "\n", "X", "Y"};
+        const std::vector<char> m = content_mask(mixed, Q, false);
+        int content_entries = 0;
+        for (char c : m) content_entries += c ? 1 : 0;
+        check(reasoning_token_count(mixed, Q, false) + content_entries <= int(mixed.size()),
+              "reasoning tokens and content entries never overlap");
+    }
+
     std::printf("%s\n", failures ? "FAILED" : "all cases ok");
     return failures ? 1 : 0;
 }

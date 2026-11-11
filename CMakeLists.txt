@@ -396,6 +396,13 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # resolves outside the payload, and a runtime set shipped without the aqlprofile agent libhsa opens. Each
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
+# engine#2106: the hardware gate's `npuserve` phase, end to end against the stand-in serve tools/npu_serve_smoke.py
+# writes: a fast-route serve passes the gate, a slow-route one fails it while its answers are fine, a dead one fails,
+# and an unconfigured or NPU-less host skips. No device, no 1bit binary, and the fleet's queues are not touched.
+add_test(NAME hw_gate_npuserve COMMAND ${CMAKE_SOURCE_DIR}/tests/hw_gate_npuserve_test.sh)
+# Both start a loopback serve on a port picked by binding port 0 and releasing it, so they take the lock every
+# loopback-server test takes (tests/route_port_lock_test.py): two of them racing for one freed port is a flaky failure.
+set_tests_properties(hw_gate_npuserve npu_serve_smoke_self PROPERTIES RESOURCE_LOCK route_ports)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
 # engine #1504: the release preflight blocks on a runner unit that is down and only warns on a short restart policy.
 # The real scripts/ci-runner-health.sh and weekly.sh's preflight_runner_units() against a stub systemctl; no systemd.
@@ -1782,6 +1789,12 @@ if(ONEBIT_NPU)
     target_include_directories(hybrid_prompt_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
         ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)
     target_link_libraries(hybrid_prompt_probe PRIVATE onebit_npu_forward onebit_npu_rt)
+    # engine#1788: one picture and one question through a MiniCPM-V 4.7 pack with every step the engine's own
+    # (plan, resize, host tower, prompt tokens, canvas positions, then step_batch_embeds on the text model).
+    add_executable(minicpm_image_probe npu/forward/minicpm_image_probe.cpp)
+    target_include_directories(minicpm_image_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
+        ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)
+    target_link_libraries(minicpm_image_probe PRIVATE onebit_npu onebit_npu_forward onebit_npu_rt)
     add_executable(mrope_planes_probe npu/forward/mrope_planes_probe.cpp)
     target_include_directories(mrope_planes_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
         ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)

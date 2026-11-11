@@ -1501,7 +1501,7 @@ tensors           347, all BF16, 1135109120 B of payload, 0 B unaccounted
 patch embed       14 x 14 pixels x 3 channels -> 1152
 positions         4900 (a 70 x 70 grid; image 980)
 blocks            27 at width 1152, 16 heads x 72, MLP 4304 (4608 stored)
-vit_merger        attention at 1152, MLP 4608 -> 17216 (17280 stored) -> 1152
+vit_merger        after block 6; attention at 1152, MLP 4608 -> 17216 (17280 stored) -> 1152
 merger            4608 -> 4608 -> 1024 (the text model's hidden size)
 source_file       mmproj-model-f16.gguf
 source_sha256     fb9cc047a3cdad5317fd8433a4aeda2d22f00f02ca4bd93b34ad84165b25a900
@@ -1509,8 +1509,7 @@ note              config.json states MINICPM_V_VISION_MLP_INTERMEDIATE_SIZE 4304
 note              config.json states MINICPM_V_VIT_MERGER_INTERMEDIATE_SIZE 17216; model.visual.vit_merger.mlp.linear_fc1.weight has 17280 rows, the last 64 all zero: the container pads the model's width, and sizes come from the tensor
 ```
 
-This is a reader, not a forward: nothing runs the tower yet. What it settles is what a forward may
-rely on.
+What the reader settles is what a forward may rely on.
 
 - **Sizes come from the tensors.** The geometry is derived from the tensors' own shapes, and every
   tensor must have the shape the others imply.
@@ -1547,6 +1546,41 @@ Pinned by `tests/npu_vision_pack_test.cpp` on crafted containers; `ONEBIT_MINICP
 the published pack's own numbers. The source comparison above was run by hand and is not a test in the
 tree.
 
+**The tower on the host (`npu/vision_tower.h`).** `vision::tower_forward(pack, pixels, gh, gw)` runs the
+tower in float32 on the CPU: normalised pixels for a `gh × gw` patch grid in, `(gh/4) × (gw/4)` rows at
+the text model's width out. It is a reference for whatever runs the tower on the NPU later, not a
+serving path; nothing calls it from a serve, and it does no image decoding, resizing or slicing. The
+order of operations is the transformers implementation's (`transformers.models.minicpmv4_7`):
+
+1. patch embedding (a Conv2d whose kernel is its stride), patches row-major;
+2. plus one learned position row per patch, picked **nearest** on the 70 × 70 table: row
+   `floor(y·70/gh)`, column `floor(x·70/gw)`. No interpolation and no rotary term;
+3. blocks 0–6: LayerNorm (eps 1e-6), full attention, MLP with the tanh GELU;
+4. the `vit_merger`, once, after block `insert_layer_id` (6): attention inside each 2 × 2 window only,
+   then per window an MLP over the four tokens side by side plus their mean. The grid halves;
+5. blocks 7–26 on the halved grid, then `merger.norm`;
+6. the merger: 2 × 2 groups again, `pre_norm`, `linear_fc1`, the exact (erf) GELU, `linear_fc2`.
+
+So both grid extents must be multiples of 4, and anything else is refused. The padded MLPs are read at
+the tensor's stride and the model's width.
+
+Measured against that implementation (transformers 5.22.2, torch 2.13 CPU, float32, eager attention)
+loaded with each pack's own weights, same input (`pixel(c, y, x) = sin(0.37c + 0.11y + 0.05x +
+0.003xy)`), 2026-11-10:
+
+| pack | grid | tower before the merger: max \|d\|, corr | output: max \|d\|, corr |
+|---|---|---|---|
+| 1B | 8 × 12 | 2.9e-5, 1.000000000 | 1.1e-6, 1.000000000 |
+| 1B | 16 × 20 | 1.1e-5, 1.000000000 | 2.4e-6, 1.000000000 |
+| 35B-A3B | 16 × 20 | 9.5e-6, 1.000000000 | 9.5e-7, 1.000000000 |
+
+The 16 × 20 grid took 5.5 s and 1.25 GB of memory for this code on one thread; a full 70 × 70 slice
+has 61 times the tokens and its attention grows with the square, which is why this is a reference.
+`tests/npu_vision_tower_test.cpp` carries a small tower with LCG weights and that implementation's
+output for it as goldens, so the arithmetic is checked in CI without a pack; with
+`ONEBIT_MINICPM_PACK` and `ONEBIT_MINICPM_ORACLE` set it repeats the comparison above. The reference
+run itself needs transformers and torch and is not in the tree.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU
@@ -1558,6 +1592,15 @@ kernels (dense Qwen3: 0.6B, 1.7B and 4B):
 
 In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
 The model directory holds the weights only; the kernels ship inside the package.
+
+**Streaming.** With `"stream": true` the route sends each piece of the answer as it is produced. The first frame
+leaves once the prompt has been processed and the first visible piece exists (a thinking model's opening markup is
+held until it can be classified, so that is a token or two after the prompt is done), and the rest follow about
+one per token. Before engine#1785 every frame was sent after the generation had ended, so a client's time to first
+token was the whole request. A request that fails before producing anything (a prompt over the context, a
+malformed field) still gets its own status code, not a 200 stream; one that fails later reports the error as a
+last `data:` frame. A client that disconnects stops the generation at the next token, which frees the device for
+the next request. The streamed reply and the non-streamed one are the same text.
 
 ### FastFlowLM's NPU2 drops: the families the route does not serve
 

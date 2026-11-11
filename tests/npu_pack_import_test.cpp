@@ -4765,6 +4765,66 @@ void test_embedding_f32_component(const std::string& root) {
     fs::remove_all(b);
 }
 
+// engine#1786 (item F1): the container genre's geometry, pinned as a pure function over the three header shapes the
+// census measured on this box -- no pack, no device, no file, which is what makes the two genres with no config.json
+// (`d3-edge`, `d3-flash`) pinnable at all.
+void test_container_geometry() {
+    using nlohmann::json;
+    // 1. self-describing: `dims` answers everything, and config.json must NOT be preferred over it.
+    {
+        json meta = {{"dims", {{"hidden_size", 576}, {"intermediate_size", 1536}, {"num_hidden_layers", 30},
+                               {"num_attention_heads", 9}, {"num_key_value_heads", 3}, {"vocab_size", 49152},
+                               {"head_dim", 64}, {"rope_theta", 10000.0}, {"model_type", "llama"}}}};
+        json cfg = {{"hidden_size", 1024}};   // a deliberate disagreement: the container's own statement wins
+        const auto g = pi::container_geometry(meta, cfg);
+        check(g.source == "dims", "self-describing: source is dims");
+        check(g.dims.hidden == 576, "self-describing: hidden comes from dims, not config.json");
+        check(g.dims.layers == 30 && g.dims.heads == 9 && g.dims.kv_heads == 3 && g.dims.vocab == 49152,
+              "self-describing: every field dims states is taken");
+        check(g.dims.head_dim == 64, "self-describing: a stated head_dim is used as stated");
+        check(g.missing.empty(), "self-describing: nothing is missing");
+        check(g.inferred.empty(), "self-describing: nothing is inferred");
+    }
+    // 2. gguf-converted: no dims, so config.json answers and the source says so.
+    {
+        json meta = {{"converter", "tools/gguf_to_q4nx.py"}, {"format", "q4nx"}, {"source", "x.gguf"}};
+        json cfg = {{"hidden_size", 1024}, {"num_hidden_layers", 28}, {"num_attention_heads", 16},
+                    {"num_key_value_heads", 8}, {"vocab_size", 151936}, {"intermediate_size", 3072},
+                    {"head_dim", 64}, {"rope_theta", 1000000.0}};
+        const auto g = pi::container_geometry(meta, cfg);
+        check(g.source == "config.json", "gguf-converted: source is config.json");
+        check(g.dims.hidden == 1024 && g.dims.vocab == 151936, "gguf-converted: config.json supplies the geometry");
+        check(g.missing.empty(), "gguf-converted: nothing is missing when config.json is complete");
+    }
+    // 3. silent: neither answers, so every field is named missing rather than left as a zero that reads like a value.
+    {
+        const auto g = pi::container_geometry(json::object(), json());
+        check(g.source.empty(), "silent: no source is claimed");
+        // eight, and named: the first run of this arm asserted seven and failed in CI -- rope_theta is a required
+        // field of the arithmetic (it is the RoPE base the forward needs), so the count was wrong and the function
+        // was right. Asserted by name now, so the next field added to Dims fails this arm instead of shrinking it.
+        const std::vector<std::string> want = {"hidden_size",         "num_hidden_layers",   "num_attention_heads",
+                                               "num_key_value_heads", "vocab_size",         "intermediate_size",
+                                               "head_dim",            "rope_theta"};
+        check(g.missing.size() == want.size(), "silent: every required field is named missing");
+        bool all_named = true;
+        for (const auto& w : want)
+            all_named = all_named && std::find(g.missing.begin(), g.missing.end(), w) != g.missing.end();
+        check(all_named, "silent: the missing list names each required field");
+        check(g.dims.hidden == 0 && g.dims.layers == 0, "silent: no field is invented");
+    }
+    // 4. head_dim absent but derivable: reported as INFERRED, not as declared.
+    {
+        json meta = {{"dims", {{"hidden_size", 2048}, {"intermediate_size", 6144}, {"num_hidden_layers", 28},
+                               {"num_attention_heads", 16}, {"num_key_value_heads", 8}, {"vocab_size", 151936},
+                               {"rope_theta", 1000000.0}}}};
+        const auto g = pi::container_geometry(meta, json());
+        check(g.dims.head_dim == 128, "inferred: head_dim is hidden/heads");
+        check(g.inferred.size() == 1 && g.inferred[0] == "head_dim", "inferred: the inference is named");
+        check(g.missing.size() == 0, "inferred: an inferred field is not also missing");
+    }
+}
+
 // engine#1786 (item F1): an NPU2 model source is a safetensors container, and this is the reader that decides whether
 // a pack is that genre. The failure that matters is the silent one -- a wrong header length yields an empty inventory,
 // which reads as "a pack with no tensors" rather than "a malformed header" -- so each arm asserts the reason, not just
@@ -5579,6 +5639,7 @@ int main(int argc, char** argv) {
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
+        test_container_geometry();
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);
         test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);

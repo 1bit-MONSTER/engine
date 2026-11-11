@@ -692,7 +692,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp
+add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp
                             npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
@@ -1136,6 +1136,14 @@ target_link_libraries(npu_stop_tokens_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME npu_stop_tokens COMMAND npu_stop_tokens_test)
 add_dependencies(npu_sampling_test npu_stop_tokens_test)
 
+# The hand-off between the thread that generates a streamed reply and the one that writes it (app/stream_bridge.h,
+# engine#1785: the NPU route sent every frame after the generation ended). Two threads and a clock; no device.
+add_executable(stream_bridge_test tests/stream_bridge_test.cpp)
+target_include_directories(stream_bridge_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
+target_link_libraries(stream_bridge_test PRIVATE Threads::Threads)
+add_test(NAME stream_bridge COMMAND stream_bridge_test)
+add_dependencies(npu_sampling_test stream_bridge_test)
+
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.
 add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
@@ -1205,6 +1213,11 @@ add_executable(npu_vision_pack_test tests/npu_vision_pack_test.cpp)
 target_link_libraries(npu_vision_pack_test PRIVATE onebit_npu)
 add_test(NAME npu_vision_pack COMMAND npu_vision_pack_test)
 add_dependencies(onebit npu_vision_pack_test)
+# The host float32 tower against goldens from the transformers implementation (see the test's header).
+add_executable(npu_vision_tower_test tests/npu_vision_tower_test.cpp)
+target_link_libraries(npu_vision_tower_test PRIVATE onebit_npu)
+add_test(NAME npu_vision_tower COMMAND npu_vision_tower_test)
+add_dependencies(onebit npu_vision_tower_test)
 add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
 target_include_directories(npu_q4nx_test PRIVATE app)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
@@ -1227,6 +1240,16 @@ endif()
 # q4nx_pack.c is listed here rather than reached through onebit_npu: the integer host arm's checks
 # (engine#1808) call q4nx_host_gemm_i8*() directly, and those live in that file.
 add_executable(npu_pack_test tests/npu_pack_test.cpp npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
+# A DFlash draft package as a model source (engine#1780): config + container -> a checked model whose tensors decode
+# one at a time. The loader is compiled here and not into onebit_npu because it needs the q4_1 tile decoder, which
+# lives with the forward (npu/forward/src/q4nx_dequant.c); it moves there with the draft's forward. Synthetic package,
+# so no model, no device; a real package is an optional argument (-DONEBIT_DFLASH_DRAFT=<dir>).
+add_executable(dflash_draft_test tests/dflash_draft_test.cpp npu/dflash_draft.cpp npu/forward/src/q4nx_dequant.c)
+target_include_directories(dflash_draft_test PRIVATE npu npu/forward/include)
+target_link_libraries(dflash_draft_test PRIVATE onebit_npu)
+add_dependencies(onebit dflash_draft_test)
+set(ONEBIT_DFLASH_DRAFT "" CACHE PATH "A DFlash draft package directory for dflash_draft_test's real-package arm")
+add_test(NAME dflash_draft COMMAND dflash_draft_test ${ONEBIT_DFLASH_DRAFT})
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
@@ -1428,6 +1451,14 @@ add_dependencies(onebit npu_answer_parser_test)
 add_executable(batch_check_compare_test tests/batch_check_compare_test.cpp)
 target_include_directories(batch_check_compare_test PRIVATE npu/forward/include)
 add_test(NAME batch_check_compare COMMAND batch_check_compare_test)
+
+# engine#1780: the DFlash draft block's acceptance arithmetic -- tokens = accepted + bonus, the break-even rule, and the
+# published OGA-route counts as known answers. Header-only and host-only: no container, no device, no NPU runtime, so it
+# runs wherever this file is built. Registered at top level with the same hook as the row above, for the same reason.
+add_executable(dflash_accept_test tests/dflash_accept_test.cpp)
+target_include_directories(dflash_accept_test PRIVATE npu/forward/include)
+add_test(NAME dflash_accept COMMAND dflash_accept_test)
+add_dependencies(onebit dflash_accept_test)
 # direction B (tools/ci/ci_targets_check.py): a target ci.yml's --target list does not name is "never built", and ci.yml
 # is a workflow file no lane can patch. The documented hook is the one onebit_npu_forward_syntax uses.
 add_dependencies(onebit batch_check_compare_test)

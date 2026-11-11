@@ -1904,6 +1904,7 @@ Q4nxContainer read_q4nx_container(const std::string& path) {
         out.why = path + ": header is not a JSON object";
         return out;
     }
+    if (j.contains("__metadata__") && j["__metadata__"].is_object()) out.meta = j["__metadata__"];
     for (auto it = j.begin(); it != j.end(); ++it) {
         if (it.key() == "__metadata__") continue;
         if (!it.value().is_object()) {
@@ -3361,6 +3362,57 @@ AttnFirstTiles attn_first_tiles(int n_kv, int n_q, bool q_first) {
     f.q = q_first ? 0 : n_kv;
     f.v = n_kv + n_q;
     return f;
+}
+
+// engine#1786 (item F1): the container genre's geometry, from the container's own `dims` block and then config.json.
+// The order is authority, not preference: `dims` is the pack's own statement about itself, config.json is a file beside
+// it that a vendor converter wrote. When the two disagree the container's statement wins and `source` says so -- the
+// census measured 13 packs carrying `dims` and 29 of 29 carrying config.json, so a silent disagreement is possible and
+// a reader has to be able to see which one answered.
+ContainerGeometry container_geometry(const json& meta, const json& config) {
+    ContainerGeometry g;
+    const json& d = (meta.is_object() && meta.contains("dims") && meta["dims"].is_object()) ? meta["dims"] : json();
+    const json& cfg = config.is_object() ? config : json();
+    bool used_dims = false, used_cfg = false;
+
+    // an integer from dims first, then config.json; records which one answered
+    const auto iv = [&](const char* key, int& dst) -> bool {
+        if (d.is_object() && d.contains(key) && d[key].is_number_integer()) { dst = d[key].get<int>(); used_dims = true; return true; }
+        if (cfg.is_object() && cfg.contains(key) && cfg[key].is_number_integer()) { dst = cfg[key].get<int>(); used_cfg = true; return true; }
+        return false;
+    };
+    const auto fv = [&](const char* key, float& dst) -> bool {
+        if (d.is_object() && d.contains(key) && d[key].is_number()) { dst = d[key].get<float>(); used_dims = true; return true; }
+        if (cfg.is_object() && cfg.contains(key) && cfg[key].is_number()) { dst = cfg[key].get<float>(); used_cfg = true; return true; }
+        return false;
+    };
+    const auto sv = [&](const char* key, std::string& dst) -> bool {
+        if (d.is_object() && d.contains(key) && d[key].is_string()) { dst = d[key].get<std::string>(); used_dims = true; return true; }
+        if (cfg.is_object() && cfg.contains(key) && cfg[key].is_string()) { dst = cfg[key].get<std::string>(); used_cfg = true; return true; }
+        return false;
+    };
+
+    if (!iv("hidden_size", g.dims.hidden)) g.missing.push_back("hidden_size");
+    if (!iv("num_hidden_layers", g.dims.layers)) g.missing.push_back("num_hidden_layers");
+    if (!iv("num_attention_heads", g.dims.heads)) g.missing.push_back("num_attention_heads");
+    if (!iv("num_key_value_heads", g.dims.kv_heads)) g.missing.push_back("num_key_value_heads");
+    if (!iv("vocab_size", g.dims.vocab)) g.missing.push_back("vocab_size");
+    if (!iv("intermediate_size", g.dims.intermediate)) g.missing.push_back("intermediate_size");
+    if (!iv("head_dim", g.dims.head_dim)) {
+        // derived, and said to be derived: hidden/heads is only head_dim when the pack does not state one, and it is
+        // wrong for every architecture whose q projection is not square (GQA with an explicit head_dim is common).
+        if (g.dims.hidden > 0 && g.dims.heads > 0) {
+            g.dims.head_dim = g.dims.hidden / g.dims.heads;
+            g.inferred.push_back("head_dim");
+        } else {
+            g.missing.push_back("head_dim");
+        }
+    }
+    if (!fv("rope_theta", g.dims.rope_theta)) g.missing.push_back("rope_theta");
+    sv("model_type", g.dims.model_type);  // not load-bearing for the arithmetic; absent is not missing
+
+    g.source = used_dims ? "dims" : (used_cfg ? "config.json" : "");
+    return g;
 }
 
 std::string qk_norm_refusal(bool declared, bool found) {

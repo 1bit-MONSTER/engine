@@ -65,6 +65,10 @@ private:
     // normalised text instead of greedy longest-match, which is only right for a merge-less
     // vocabulary.
     bool spm_merges_ = false;
+    // engine#2215: whether the metaspace is prepended for the whole text. A normalizer that only
+    // REPLACES spaces ({Replace " " -> U+2581}, no Prepend) turns them into metaspace symbols without
+    // asking for a leading one, so the merged-BPE path must not add it.
+    bool spm_prepend_meta_ = true;
     size_t spm_max_piece_ = 0;
     std::unordered_map<uint8_t, int> byte_fallback_;         // byte -> <0xNN> id
     uint32_t byte_to_char_[256];

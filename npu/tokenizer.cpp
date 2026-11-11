@@ -81,6 +81,25 @@ bool spm_prepends_meta(const nlohmann::json& n) {
     return false;
 }
 
+// engine#2215: true when the normalizer REPLACES a space with the metaspace symbol without Prepend.
+// Gemma's tokenizer.json is exactly this: {"type":"Replace","pattern":{"String":" "},"content":"\u2581"},
+// with 514,906 merges. The pieces are merged by rank like spm_merged(), but the text must not gain a
+// LEADING metaspace -- the normalizer never asks for one -- so the prepend is what has to differ.
+bool spm_replaces_meta(const nlohmann::json& n) {
+    if (!n.is_object()) return false;
+    if (n.value("type", "") == "Replace") {
+        const bool space = n.contains("pattern") &&
+                           (n["pattern"].value("String", "") == " " ||
+                            n["pattern"].value("Regex", "") == " ");
+        const bool meta = n.value("content", "").find("\xE2\x96\x81") != std::string::npos;
+        if (space && meta) return true;
+    }
+    if (n.contains("normalizers"))
+        for (const auto& sub : n["normalizers"])
+            if (spm_replaces_meta(sub)) return true;
+    return false;
+}
+
 // The pattern from tokenizer.json's pre_tokenizer (a Split with a Regex), if any.
 std::string split_pattern(const nlohmann::json& pre) {
     if (!pre.is_object()) return "";
@@ -226,8 +245,12 @@ Tokenizer::Tokenizer(const std::string& path) {
         // is" -- engine#1189. Measured on that pack's own vocabulary, greedy longest-match is not a
         // substitute for the merges either (it disagrees with the reference on 6 of 20 strings), so
         // a vocabulary that keeps its merges is merged by rank -- see spm_merged().
-        spm_ = has_meta && (merges.empty() || (root.contains("normalizer") && spm_prepends_meta(root["normalizer"])));
+        const bool prepends = root.contains("normalizer") && spm_prepends_meta(root["normalizer"]);
+        const bool replaces = root.contains("normalizer") && spm_replaces_meta(root["normalizer"]);
+        spm_ = has_meta && (merges.empty() || prepends || replaces);
         spm_merges_ = spm_ && !merges.empty();
+        // a Replace-only normalizer asks for no leading metaspace; every other spm path adds one
+        spm_prepend_meta_ = prepends || merges.empty();
         if (spm_) {
             for (const auto& [text, id] : vocab_) {
                 if (text.size() == 6 && text.compare(0, 3, "<0x") == 0 && text[5] == '>') {
@@ -317,7 +340,7 @@ std::vector<int> Tokenizer::spm_merged(const std::string& text) const {
     static const char kMeta[] = "\xE2\x96\x81";
     std::string s;
     s.reserve(text.size() + 3);
-    s += kMeta;
+    if (spm_prepend_meta_) s += kMeta;
     for (char c : text) {
         if (c == ' ') s += kMeta;
         else s += c;
@@ -335,7 +358,7 @@ std::vector<int> Tokenizer::spm(const std::string& text) const {
     static const char kMeta[] = "\xE2\x96\x81";
     std::string s;
     s.reserve(text.size() + 3);
-    s += kMeta;
+    if (spm_prepend_meta_) s += kMeta;
     for (char c : text) {
         if (c == ' ') s += kMeta;
         else s += c;
@@ -440,7 +463,10 @@ std::string Tokenizer::decode(const std::vector<int>& ids, bool strip_dummy_pref
         // Without this every decoded string came back with a leading space
         // (MiniCPM4: "The capital of France is" -> " The capital of France is"),
         // which is visible in 1bit serve's output.
-        if (strip_dummy_prefix && !out.empty() && out[0] == ' ') out.erase(0, 1);
+        // engine#2215: only strip the dummy prefix when spm() synthesised one. With a Replace-only
+        // normalizer ({Replace " " -> U+2581}) there is no dummy prefix, so the first metaspace is a
+        // REAL space: stripping it turned `decode ["\u2581"]` into "" and a two-space lead into one.
+        if (strip_dummy_prefix && spm_prepend_meta_ && !out.empty() && out[0] == ' ') out.erase(0, 1);
         return out;
     }
     std::string out;

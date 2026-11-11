@@ -915,6 +915,25 @@ forward route, which reads the block from `config.json`: `rope_type: "llama3"`
 declared-but-unusable `llama3` block, and every other declared type, at `1bit serve` /
 `forward-serve` load time rather than at request time.
 
+**Hunyuan (`hunyuan_v1_dense`) differs from the other q/k-norm families in four places: three in
+the forward, which reads them from the model rather than from a family list where it can, and one in
+the importer**
+([engine#1889](https://github.com/1bit-MONSTER/engine/issues/1889)). Each was measured against
+`Hunyuan-7B-Instruct`'s own pack:
+
+| what | rule | where it comes from |
+|---|---|---|
+| whether q and k are normalised | `use_qk_norm` in `config.json` decides when the config states it; the `qwen3*`/`gemma*` table answers only for configs that do not | the config key. The table has no Hunyuan row, so its gains were loaded and never applied |
+| the RoPE base | `rope_scaling: {type: "dynamic", alpha: A}` is a **fixed** base `theta * A^(dim/(dim-2))` at every position (11,158,840 for theta 10000, alpha 1000, dim 128). Without `alpha` the block is the position-dependent NTK rule | the graph's `cos_cache`/`sin_cache` in `model.onnx.data` match that base to 0.00024; plain theta 10000 is off by up to 1.99. `1bit npu-pack import` tests this base against the pack's cache first and prints `note: RoPE base ... verified`; before, it warned that no plain theta explained the cache |
+| the order of norm and RoPE | RoPE first, then the per-head RMSNorm (Qwen3 and Gemma normalise first) | the graph: `q_proj -> RotaryEmbedding -> q_norm -> GroupQueryAttention` in every layer |
+| the order of the attention tiles in the pack (importer) | q tiles first, then k, then v. Every other family's block is k, q, v. `1bit npu-pack import` picks the order with the block shape that carries the packed q/k gains | measured: with k, q, v the imported model predicts 26 of 77 next tokens of a fixed text, with q, k, v 59 (the two projections were being read as each other) |
+
+A model whose config says q and k are normalised and whose container has no
+`self_attn.q_norm.weight` is refused at load: the gain would read as zeros and zero every head's q.
+That is the shape of a Hunyuan container imported before the importer carried the gains, so the
+answer is to re-import it. A Hunyuan container imported before the tile order was right has
+the gains and still answers filler words; re-import that one too.
+
 | GGUF type | To q4_1 | Error |
 |---|---|---|
 | Q4_0 | scale `d`, zero `-8d`, codes unchanged | bf16 rounding of scale and zero |
@@ -1903,7 +1922,7 @@ engine#587 measured the route on it):
 | `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx, npu | **served, and measured** (engine#587): the same `Qwen3.8-27B-NPU2` family runs on the NPU route — 0.2902 s/token (3.45 tok/s) and 19.55 tok/s of prefill on the sealed single-ELF ternary rung, 22.811 s to a first token with the weight load in it (`bench/npu-leaderboard/27b-t2s2-*-20261106.json`) — int8 Q4NX decodes at 63.1 s/token and takes 145.7 s to a first token (`bench/npu-leaderboard/27b-*.json`, 2026-10-27), a 5-token prefill chunk is 58.14 s, and the ternary sealed-ELF rung on the same container is 1.72 s/token with 3/3 text-identical output (engine#697, closed by #728). Quality on the same route: **GSM8K 97.5 % (39/40)** with greedy decoding, **6 of the 40 answers cut off by the 512-token budget and exactly 1 of those 6 also wrong** — so among answers that finished, 34/34 were right (`27b-gsm8k-20261107`); and the per-token cost at those answer lengths is 0.3857 s/token against 0.2902 on a 13-token prompt, i.e. it grows ~1.33x with context (`27b-decode-cot-20261107`). What a stock install still needs is a kernel set for the model's geometry — none ships in this repository — so the row read `not served` until the route itself was measured |
 | `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
 | `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
-| `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
+| `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx, npu | **served and measured** on the per-op route ("FastFlowLM's own containers" below) |
 | `gemma3` | `FastFlowLM/medgemma-1.5-4b-it-NPU2` | hrx | not served |
 | `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2`, `FastFlowLM/LFM2.5-1.2B-NPU2` | hrx, npu | `LFM2.5-1.2B-NPU2` **served and measured** on the per-op route ("FastFlowLM's own containers" below); `LFM2-1.2B-NPU2` serves too (one paired ticket, same section); `LFM2-2.6B-NPU2` was not run |
 | `gpt-oss` | `FastFlowLM/GPT-OSS-20B-NPU2`, `FastFlowLM/GPT-OSS-Safeguard-20b-NPU2` | hrx | not served |
@@ -1988,6 +2007,7 @@ does on a geometry that has a sealed set: `Qwen3-1.7B-NPU2` is 3.0 tok/s here an
 | `Llama-3.2-3B-NPU2` | `llama` | identical, `Paris.` | 1.7 to 1.8 tok/s |
 | `Phi4-mini-Instruct-NPU2` | `phi3` | identical, `Paris`, once the turn end is read from the template (below) | 1.4 to 1.5 tok/s |
 | `Qwen3-VL-4B-Instruct-NPU2`, text tower only | `qwen3` | identical, `Paris` | 1.4 to 1.5 tok/s |
+| `Hy-MT2-1.8B-NPU2` | `hunyuan_v1_dense` | identical, `Paris`; 4 of 5 translations byte-identical to FastFlowLM's runtime (below) | 2.3 to 2.8 tok/s |
 | `LFM2.5-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | identical, `Paris`; against FastFlowLM's runtime below | 3.5 to 4.6 tok/s |
 | `LFM2-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | `Paris`; one request per prompt, against FastFlowLM's runtime below | 3.7 tok/s |
 
@@ -2051,6 +2071,34 @@ does not carry the three-identical-answers condition.
 `chat_template.jinja`, the reasoning is split out, and at 96 tokens every one of the five replies was still
 reasoning, so there is no answer text to compare and no row; the reasoning differs from FastFlowLM's from its
 first words.
+
+**`Hy-MT2-1.8B-NPU2`: a third tile.** This pack's projections are stored 4,608 bytes to a tile where every
+other pack on the box uses 5,120, and no reader knew the size, so it was refused at the first dequant. The tile is
+256 bf16 scales (index `g*32 + r`) followed by 4,096 code bytes in column order (`c*16 + r/2`, even row in the low
+nibble), and a weight is the two's-complement nibble times its scale: the symmetric reading of the LFM2 packs with
+the zero-point block left out and the codes in the Q4K chunk's order. It was settled the same way, against the
+pack's own bf16 embedding (its `lm_head` is the quantised copy): mean 0.244 of a step, maximum 1.000, and the
+eleven other combinations of scale order, code order and code sign are 3 to 8 steps off. Here the size names the
+kind, so nothing is read off the data. The kernel directory is four shapes that were already built for other
+packs (`QKV K2048 N3072`, `O K2048 N2048`, `GU K2048 N12288`, `D K6144 N2048`); q/k norm and the template
+(`chat_template.jinja`) are read from the pack.
+
+Measured 2026-11-11, same `model.q4nx` (sha256 `a992683e04c2110e…`) for both runtimes, five translation requests
+(into German, French, Spanish, Chinese and English), FastFlowLM 1.0.12's runtime then this route in one ticket:
+
+| this route's code | byte-identical to FastFlowLM's answer |
+|---|---|
+| the tile reader alone, on the semantics `main` had for this family | 1 of 5 |
+| the tile reader with the family's RoPE base and q/k-norm order (engine#1889), which is this change | 4 of 5 |
+
+Reading the tiles made the pack serve; it did not make it this model. `hunyuan_v1_dense` was run at RoPE base 10000
+where the family's `rope_scaling.alpha` of 1000 makes it 10000 x 1000^(128/126), about 1.116e7, at every position,
+and q/k were normalised before RoPE where the family does it after. All five answers were correct translations
+either way, which is why fluency was no evidence: `Das Wetter ist heute schön. Wir werden zum Spazierengehen gehen.`
+on the wrong base, `Das Wetter ist heute schön, und wir gehen spazieren.` on the right one and from FastFlowLM. The
+one request still different is `Me gustaría una taza de café…` here against `Quisiera una taza de café…` there. At
+the same code three requests of the known-answer prompt returned `Paris` three times, and decode was 2.3 to 2.8
+tok/s (32 layers on the per-op route) against FastFlowLM's 50 to 53.
 
 Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
 containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry

@@ -395,6 +395,18 @@ struct ContainerRoles {
 };
 ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors);
 
+// engine#1786 (item F1) / engine#1788, slice 3c step 2: what each role fills in the forward, as a CHECK rather than a
+// mapping the writer can quietly get wrong. The role vocabulary is not a safe key on its own -- `gate_proj` and
+// `self_attn_gate_proj` are different tensors that one needle used to share, and a container can carry both -- so two
+// roles that name the same destination field are refused instead of being written in some order that happens to work.
+// Returns the forward's field name (npu/forward/include/model.h), or "" when the role is not a per-layer weight the
+// forward's loader reads: fused pairs (`qkv_proj`, `gate_up_proj`) are consumed by a fused path, `ssm`/`mtp`/`vision`
+// are their own containers or their own code, and `shared_expert_gate` is read only by the MoE block.
+const char* container_role_field(const std::string& role);
+// The destination fields claimed by more than one role in `counts` (each with the roles that claim it). Empty is the
+// only state a writer may start from.
+std::vector<std::string> container_role_field_conflicts(const std::map<std::string, int>& counts);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 // engine#1889 (review of #2063): plan()'s wide-q branch (q_out != hidden), as one function so its effect on the plan is

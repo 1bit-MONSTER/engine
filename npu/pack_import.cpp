@@ -3423,6 +3423,45 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
 // engine#1786 (item F1), slice 3a: roles from names. The rule is ordered -- the first match wins -- so `q_proj.bias`
 // classifies as a bias of q_proj rather than as an unknown tensor, and a name that matches nothing lands in `unassigned`
 // with its own name rather than being guessed from its shape.
+// engine#1788 / slice 3c step 2: the role -> forward-field table, and the refusal that makes it a check.
+const char* container_role_field(const std::string& role) {
+    static const std::pair<const char*, const char*> kMap[] = {
+        {"embed", "embed_table"},          {"lm_head", "lm_head_weight"},
+        {"input_norm", "input_layernorm_weight"}, {"post_norm", "post_attention_layernorm_weight"},
+        {"q_norm", "q_norm_weight"},       {"k_norm", "k_norm_weight"},
+        {"q_proj", "q_proj_weight"},       {"k_proj", "k_proj_weight"},
+        {"v_proj", "v_proj_weight"},       {"o_proj", "o_proj_weight"},
+        {"gate_proj", "gate_proj_weight"}, {"up_proj", "up_proj_weight"},
+        {"down_proj", "down_proj_weight"}, {"self_attn_gate_proj", "self_attn_gate_proj_weight"},
+        {"up_exps", "up_exps_weight"},     {"gate_exps", "gate_exps_weight"},
+        {"down_exps", "down_exps_weight"}, {"share_up_exps", "share_up_exps_weight"},
+        {"share_gate_exps", "share_gate_exps_weight"}, {"share_down_exps", "share_down_exps_weight"},
+        {"moe_router", "moe_router_weight"}, {"shared_expert_gate", "shared_expert_gate_weight"},
+        {"shortconv_in_proj", "shortconv_in_proj_weight"}, {"shortconv_conv", "shortconv_conv_weight"},
+        {"shortconv_out_proj", "shortconv_out_proj_weight"},
+    };
+    for (const auto& kv : kMap)
+        if (role == kv.first) return kv.second;
+    return "";
+}
+
+std::vector<std::string> container_role_field_conflicts(const std::map<std::string, int>& counts) {
+    std::map<std::string, std::vector<std::string>> by_field;
+    for (const auto& kv : counts) {
+        const char* f = container_role_field(kv.first);
+        if (f == nullptr || *f == '\0') continue;
+        by_field[f].push_back(kv.first);
+    }
+    std::vector<std::string> out;
+    for (const auto& kv : by_field)
+        if (kv.second.size() > 1) {
+            std::string s = std::string(kv.first) + " <- ";
+            for (size_t i = 0; i < kv.second.size(); ++i) s += (i ? ", " : "") + kv.second[i];
+            out.push_back(s);
+        }
+    return out;
+}
+
 ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
     struct Rule { const char* role; const char* needle; };
     // Longest/most specific spellings first: `qkv_proj` before `q_proj`, `gate_up_proj` before `gate_proj`.

@@ -5204,6 +5204,32 @@ void test_container_plan_reports_roles() {
     }
 }
 
+// engine#1788 / slice 3c step 2: the role -> forward-field check. The defect this exists for is that `gate_proj` and
+// `self_attn_gate_proj` are different tensors one needle used to share; the table must keep them apart, and no two roles
+// may ever name the same destination field.
+void test_container_role_fields() {
+    check(std::string(pi::container_role_field("gate_proj")) == "gate_proj_weight" &&
+              std::string(pi::container_role_field("self_attn_gate_proj")) == "self_attn_gate_proj_weight",
+          "role fields: the FFN gate and the attention gate are different fields");
+    check(pi::container_role_field("qkv_proj") == std::string(""),
+          "role fields: a fused pair is not one field (the writer must handle it, not guess)");
+    check(pi::container_role_field("ssm") == std::string("") && pi::container_role_field("no_such_role") == std::string(""),
+          "role fields: an unmapped role says so instead of defaulting");
+
+    // table integrity: every role the table knows, in one counts map, must produce no conflict. This is the arm that
+    // fails if someone later adds a second role pointing at a field that is already taken.
+    const std::vector<const char*> all = {
+        "embed", "lm_head", "input_norm", "post_norm", "q_norm", "k_norm", "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj", "self_attn_gate_proj", "up_exps", "gate_exps", "down_exps",
+        "share_up_exps", "share_gate_exps", "share_down_exps", "moe_router", "shared_expert_gate",
+        "shortconv_in_proj", "shortconv_conv", "shortconv_out_proj"};
+    std::map<std::string, int> counts;
+    for (const char* r : all) counts[r] = 1;
+    const std::vector<std::string> conflicts = pi::container_role_field_conflicts(counts);
+    check(conflicts.empty(), "role fields: no two roles claim the same destination field" +
+                                 (conflicts.empty() ? std::string() : " (" + conflicts.front() + ")"));
+}
+
 void test_container_roles() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6244,6 +6270,7 @@ int main(int argc, char** argv) {
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
         test_container_roles();
+        test_container_role_fields();
         test_container_plan_reports_roles();
         test_container_roles_moe_and_singular_layer();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);

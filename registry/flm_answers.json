@@ -1,0 +1,91 @@
+{
+ "about": "Recorded answers for FastFlowLM packs this engine does not serve, read by tools/census_watch.py (engine#2171). CI keeps no watcher state, so without this file every scheduled run re-alerted on families docs/npu.md had already answered. A pack whose declared architecture (or, for a repo with no config, whose id) is listed here prints `. NPU FLM` / `. FLM` with the issue that tracks it and does not alert. Hand-written: add an entry only with a row for it in docs/npu.md, and remove it when the family is served (tests/census_watch_test.py fails on an answer for a family the registry serves on the NPU route).",
+ "architectures": {
+  "MiniCPMV4_7ForConditionalGeneration": {
+   "answer": "not served: a vision-language pack whose class the pin does not register; serving it on the NPU route is engine#1788",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1788
+  },
+  "MiniCPMOcrForConditionalGeneration": {
+   "answer": "not served: an OCR/vision pack whose class the pin does not register; the route claims text decoders only",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "HYV3ForCausalLM": {
+   "answer": "not served: hy_v3 is mapped for hrx only; no hy_v3 model type or kernels in the NPU route",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "DFlashDraftModel": {
+   "answer": "not served: a draft head, not a decoder; running the DFlash drafts as NPU sources is engine#1780",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1780
+  },
+  "Gemma4ForConditionalGeneration": {
+   "answer": "not served: gemma4 is mapped for hrx only; no gemma4 model type or kernels in the NPU route",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "Gemma4UnifiedForConditionalGeneration": {
+   "answer": "not served: gemma4 is mapped for hrx only; no gemma4 model type or kernels in the NPU route",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "HunYuanDenseV1ForCausalLM": {
+   "answer": "not served: hunyuan-dense is mapped for hrx only",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "Gemma3ForCausalLM": {
+   "answer": "not served: gemma3 is mapped for hrx only (medgemma, translategemma and the Gemma3 text packs declare it)",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "gemma3_text": {
+   "answer": "not served: gemma3 is mapped for hrx only (medgemma, translategemma and the Gemma3 text packs declare it)",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "Lfm2ForCausalLM": {
+   "answer": "not served by the registry yet: lfm2 is mapped for hrx only; LFM2.5-1.2B on the per-op route is engine#2170, which adds no NPU_ARCHS entry",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "GptOssForCausalLM": {
+   "answer": "not served: gpt-oss is mapped for hrx only",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "Qwen3_5MoeForConditionalGeneration": {
+   "answer": "not served for this class: the route serves qwen3_5_moe through Qwen3_5MoeForCausalLM (GGUF on the NPU); the VLM wrapper class FastFlowLM declares is mapped for hrx only, and its own Q4NX pack is not measured on the route",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "Qwen2_5_VLForConditionalGeneration": {
+   "answer": "not served: qwen2vl is mapped for hrx only; the route serves the text-only qwen2 class",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "Phi3ForCausalLM": {
+   "answer": "not served: phi3 is mapped for hrx only",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "Gemma3TextModel": {
+   "answer": "not served: gemma-embedding (an embedding model, not a decoder) is mapped for hrx only",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1786
+  },
+  "WhisperForConditionalGeneration": {
+   "answer": "not served: a speech encoder-decoder the registry does not map; the Whisper encoder on our runtime is engine#1783",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1783
+  }
+ },
+ "repos": {
+  "FastFlowLM/smolvla-NPU2": {
+   "answer": "not a pack: a config-less VLA repo with no *.q4nx file, so there is no architecture to map and nothing for the route to load",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve"
+  }
+ }
+}

@@ -79,6 +79,16 @@ FastFlowLM org listing, in the ten newest release bodies, or in any asset name (
 FastFlowLM files, sizes, licenses and tags only — nothing about our NPU kernels or their
 speed.
 
+A gap that has been answered stays answered (engine#2171). CI keeps no state between runs, so
+every scheduled run sees the whole org as new, and each `!! NPU FLM` / `!! NEW FLM` family that
+docs/npu.md had already answered alerted again every day, re-filing the census issue as soon as
+the last one closed. `registry/flm_answers.json` is the machine-readable form of those answers:
+a pack whose declared architecture (or, for a config-less repo, whose id) has an entry prints
+`. NPU FLM` / `. FLM` with the issue that tracks it and does not alert. An answer only quiets a
+gap: once the registry serves the family on the NPU route the line is `+ FLM` again, and the
+test fails on a committed answer for a family that is no longer a gap, so a stale answer is
+removed rather than kept. A family with no entry still alerts on its first sighting.
+
 State (the model ids already classified) lives outside the checkout, at
 $CENSUS_WATCH_STATE (default ~/.1bit/census-watch-state.json), so a run never dirties
 the tree it reads. A model whose config is missing (a gated repo) is reported the first
@@ -118,6 +128,14 @@ GH_RELEASES = "https://api.github.com/repos/FastFlowLM/FastFlowLM/releases?per_p
 # fact, while "a new commit appeared" would be true on every run.
 SUPPORT_PINS_PATH = os.path.join(ROOT, "registry", "support_pins.json")
 GH_REPO_HEAD = "https://api.github.com/repos/{repo}/commits?per_page=1"
+# A pin may name the paths the NPU route depends on (`paths`). Then "moved" means a commit that
+# touches one of them, not any commit: vllm-project/semantic-router lands dozens of router-side
+# commits a day, so the whole-repo head moved on every run and re-filed the census issue daily
+# while the d3 contract it is pinned for stayed byte-identical (engine#2171). The last commit
+# touching a path is read at the pin and at the head; a difference is a move.
+GH_PATH_HEAD = "https://api.github.com/repos/{repo}/commits?sha={sha}&path={path}&per_page=1"
+# Recorded answers for FastFlowLM packs this engine does not serve (engine#2171).
+FLM_ANSWERS_PATH = os.path.join(ROOT, "registry", "flm_answers.json")
 HF_ORG_URL = "https://huggingface.co/api/models?author={org}&sort=createdAt&direction=-1&limit=100"
 GH_RELEASES_LIMIT = 20
 # Words that mean a release notes body or an asset name talks about the Q4NX container:
@@ -553,6 +571,46 @@ def reviewed_report_classes():
     return _REVIEWED_CACHE["v"]
 
 
+_ANSWERS_CACHE = {}
+
+
+def flm_answers(path=None):
+    """`registry/flm_answers.json` as {"architectures": {...}, "repos": {...}} (empty when absent)."""
+    path = path or FLM_ANSWERS_PATH
+    if path not in _ANSWERS_CACHE:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            data = {}
+        _ANSWERS_CACHE[path] = {"architectures": data.get("architectures") or {},
+                                "repos": data.get("repos") or {}}
+    return _ANSWERS_CACHE[path]
+
+
+def answer_for(repo, answers=None):
+    """The recorded answer for a repo that would alert, else None (engine#2171).
+
+    Only a gap can be answered: a repo the NPU route serves, or a derivative drop, gets None
+    whatever the file says, so an answer cannot hide a family that starts to load. The repo id
+    is looked up first (a config-less repo has no architecture to key on), then the
+    architecture the repo declares.
+    """
+    if not (npu_gap(repo) or class_unmapped(repo)):
+        return None
+    answers = answers if answers is not None else flm_answers()
+    hit = (answers.get("repos") or {}).get(repo["id"])
+    if hit is None and repo["architecture"]:
+        hit = (answers.get("architectures") or {}).get(repo["architecture"])
+    return hit
+
+
+def answer_note(answer):
+    """The short form printed on the line: the tracking issue, else the doc that records it."""
+    issue = answer.get("issue")
+    return f"answered: engine#{issue}" if issue else f"answered: {answer.get('doc') or 'registry/flm_answers.json'}"
+
+
 def class_unmapped(repo):
     """True when `registry/architectures.json` does not map the repo's architecture class."""
     return not repo["derivative"] and not repo["mapped"]
@@ -669,7 +727,7 @@ def gib(size):
     return f"{size / float(1024 ** 3):.2f} GiB"
 
 
-def flm_line(repo, reviewed=None):
+def flm_line(repo, reviewed=None, answers=None):
     """One repo, one line: files, license, base model, architecture, both mapping answers.
 
     `reviewed` is `reviewed_report_classes()`: a class recorded there as not-an-alias is printed as
@@ -699,8 +757,15 @@ def flm_line(repo, reviewed=None):
         parts.append("derivative drop (no config by design)")
     seen = (reviewed if reviewed is not None else reviewed_report_classes())
     decl = class_unmapped(repo) and repo["architecture"] in seen
-    marker = ("!! NPU FLM" if npu_gap(repo)
-              else (". FLM" if decl else ("!! NEW FLM" if unmapped(repo) else "+ FLM")))
+    answer = answer_for(repo, answers)
+    if answer is not None:
+        parts.append(answer_note(answer))
+    if npu_gap(repo):
+        marker = ". NPU FLM" if answer is not None else "!! NPU FLM"
+    elif decl or (answer is not None and unmapped(repo)):
+        marker = ". FLM"
+    else:
+        marker = "!! NEW FLM" if unmapped(repo) else "+ FLM"
     return f"{marker} {repo['id']}  ({repo['lastModified'][:10]})  " + "  ".join(parts)
 
 
@@ -711,19 +776,22 @@ def release_line(release):
             + f"assets {len(release['assets'])}")
 
 
-def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
-    """Print the FastFlowLM delta and return its exit code (1 on an unserved family)."""
+def report_flm(repos, releases, fresh_repos, fresh_releases, full=False, answers=None):
+    """Print the FastFlowLM delta and return its exit code (1 on an unserved, unanswered family)."""
     shown_repos = repos if full else fresh_repos
     shown_releases = releases if full else fresh_releases
     reviewed = reviewed_report_classes()
+    answers = answers if answers is not None else flm_answers()
+    answered = [repo["id"] for repo in shown_repos if answer_for(repo, answers) is not None]
     unmapped_repos = [repo["id"] for repo in shown_repos
-                      if class_unmapped(repo) and repo["architecture"] not in reviewed]
+                      if class_unmapped(repo) and repo["architecture"] not in reviewed
+                      and repo["id"] not in answered]
     # Split the two reasons in the summary: "map the class" and "give the NPU route this
     # family" are different pieces of work, and a Q4NX pack named for an HRX-only family
     # is the second one.
     gaps = {}
     for repo in shown_repos:
-        if npu_gap(repo):
+        if npu_gap(repo) and repo["id"] not in answered:
             family = repo["registry_gguf"] or repo["registry_class"] or repo["architecture"]
             gaps.setdefault(family, []).append(repo["id"])
     flagged = [r["tag"] for r in shown_releases if r["kernel_format"]]
@@ -731,7 +799,7 @@ def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
           f"{len(releases)} release(s) checked; {len(fresh_repos)} new/changed repo(s), "
           f"{len(fresh_releases)} new release(s)" + ("; full listing" if full else ""))
     for repo in shown_repos:
-        print("  " + flm_line(repo, reviewed))
+        print("  " + flm_line(repo, reviewed, answers))
     for release in shown_releases:
         print("  " + release_line(release))
     if not shown_repos and not shown_releases:
@@ -745,6 +813,9 @@ def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
               f"route does not serve: {detail}")
         print("     mapped for another backend only, so the census counts the family as covered: "
               "the NPU route (or a recorded decision that it will not serve it) is what is missing")
+    if answered:
+        print(f"  -> {len(answered)} pack(s) already answered in registry/flm_answers.json (listed, not "
+              "alerted; the issue on each line tracks the work)")
     if flagged:
         print(f"  -> release(s) {', '.join(flagged)} name the Q4NX container format "
               f"({', '.join(KERNEL_FORMAT_MARKERS)}): read the notes before the pinned "
@@ -752,7 +823,7 @@ def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
     return 1 if (unmapped_repos or gaps) else 0
 
 
-def watch_flm(archs, state, limit=FLM_LIMIT, full=False, fetch=None, detail=None):
+def watch_flm(archs, state, limit=FLM_LIMIT, full=False, fetch=None, detail=None, answers=None):
     """Sweep the org + releases, print the delta, remember it: (exit code, did it run?)"""
     try:
         repos = sweep_org(archs, limit, fetch)
@@ -763,7 +834,7 @@ def watch_flm(archs, state, limit=FLM_LIMIT, full=False, fetch=None, detail=None
     fresh_repos, fresh_releases = flm_deltas(state, repos, releases)
     for repo in (repos if full else fresh_repos):
         fill_sizes(repo, detail)
-    rc = report_flm(repos, releases, fresh_repos, fresh_releases, full)
+    rc = report_flm(repos, releases, fresh_repos, fresh_releases, full, answers)
     remember_flm(state, repos, releases)
     return rc, True
 
@@ -827,15 +898,27 @@ def sweep_support(pins, fetch=None):
     fetch = fetch or get_json
     heads = {}
     for repo, entry in sorted((pins.get("repos") or {}).items()):
+        entry = entry or {}
         commit = (fetch(GH_REPO_HEAD.format(repo=repo)) or [{}])[0] or {}
         sha = commit.get("sha") or ""
+        pinned = entry.get("commit") or ""
+        paths = list(entry.get("paths") or ())
+        moved_paths = []
+        if paths and sha and sha != pinned:
+            for path in paths:
+                at_pin = (fetch(GH_PATH_HEAD.format(repo=repo, sha=pinned, path=path)) or [{}])[0] or {}
+                at_head = (fetch(GH_PATH_HEAD.format(repo=repo, sha=sha, path=path)) or [{}])[0] or {}
+                if (at_pin.get("sha") or "") != (at_head.get("sha") or ""):
+                    moved_paths.append(path)
         heads[repo] = {
             "repo": repo,
             "commit": sha,
             "date": ((commit.get("commit") or {}).get("committer") or {}).get("date") or "",
-            "pinned": (entry or {}).get("commit") or "",
-            "reviewed": (entry or {}).get("reviewed") or "",
-            "moved": sha != ((entry or {}).get("commit") or ""),
+            "pinned": pinned,
+            "reviewed": entry.get("reviewed") or "",
+            "paths": paths,
+            "moved_paths": moved_paths,
+            "moved": (bool(moved_paths) if paths else sha != pinned),
         }
     sources = pins.get("d3_sources") or {}
     org, prefix = sources.get("org") or "", sources.get("prefix") or ""
@@ -855,7 +938,12 @@ def report_support(heads, new_d3, org="", prefix=""):
     for h in sorted(heads.values(), key=lambda x: x["repo"]):
         if h["moved"]:
             print(f"  !! SUPPORT MOVED {h['repo']}  head {h['commit'][:12]} ({h['date'][:10]})  "
-                  f"pinned {h['pinned'][:12]} reviewed {h['reviewed']}")
+                  f"pinned {h['pinned'][:12]} reviewed {h['reviewed']}"
+                  + (f"  watched paths changed: {', '.join(h['moved_paths'])}" if h.get("moved_paths") else ""))
+        elif h.get("paths") and h["commit"] != h["pinned"]:
+            print(f"  + SUPPORT PIN {h['repo']}  head {h['commit'][:12]} ({h['date'][:10]})  pinned "
+                  f"{h['pinned'][:12]} reviewed {h['reviewed']}: no commit since the pin touches the "
+                  f"{len(h['paths'])} watched path(s)")
         else:
             print(f"  + SUPPORT PIN {h['repo']}  {h['commit'][:12]} ({h['date'][:10]}) reviewed {h['reviewed']}")
     if moved:

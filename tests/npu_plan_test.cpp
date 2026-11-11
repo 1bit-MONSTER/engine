@@ -91,6 +91,95 @@ bool has(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+// engine#1990: prefill.sealed_elf / prefill.sealed_rows, the wide family.
+void test_wide_family() {
+    auto pb = base_plan();
+    pb["container"]["layout"] = "pb16i";
+    pb["container"]["chunk_kind"] = "pb16i";
+    pb["container"]["pb16i"] = true;
+    pb["kernels"]["tag"] = "_pb16i";
+    pb["decode"]["sealed_elf"] = "S16.elf";
+    const std::string base_refusal = refusal(write_plan("wide_base", pb));
+    check(base_refusal.empty(), "the pb16i base plan of the wide arms loads (" + base_refusal + ")");
+    const Plan none = Plan::load(write_plan("wide_none", pb));
+    check(none.sealed_wide_elf.empty() && none.sealed_wide_rows == 0, "no wide family unless the plan names one");
+
+    auto w = pb;
+    w["prefill"]["sealed_elf"] = "S32.elf";
+    w["prefill"]["sealed_rows"] = 32;
+    const Plan wp = Plan::load(write_plan("wide_ok", w));
+    check(wp.sealed_wide_elf == "S32.elf" && wp.sealed_wide_rows == 32 && wp.prefill_m == 128,
+          "prefill.sealed_elf and sealed_rows are read, prefill.M is untouched");
+
+    auto norows = pb;
+    norows["prefill"]["sealed_elf"] = "S32.elf";
+    check(has(refusal(write_plan("wide_norows", norows)), "17..128"), "a wide family without a row count is refused");
+    for (int bad : {16, 129}) {
+        auto b = w;
+        b["prefill"]["sealed_rows"] = bad;
+        check(has(refusal(write_plan("wide_rows", b)), "17..128"),
+              "sealed_rows " + std::to_string(bad) + " is refused");
+    }
+    auto b17 = w;
+    b17["prefill"]["sealed_rows"] = 17;
+    check(refusal(write_plan("wide_17", b17)).empty(), "sealed_rows 17 loads");
+    auto orphan = pb;
+    orphan["prefill"]["sealed_rows"] = 32;
+    check(has(refusal(write_plan("wide_orphan", orphan)), "without prefill.sealed_elf"),
+          "sealed_rows without sealed_elf is refused");
+    auto nodecode = base_plan();
+    nodecode["prefill"]["sealed_elf"] = "S32.elf";
+    nodecode["prefill"]["sealed_rows"] = 32;
+    check(has(refusal(write_plan("wide_nodecode", nodecode)), "decode.sealed_elf is empty"),
+          "a wide family without the sealed decode set is refused");
+    for (const char* name : {"sub/S32.elf", "../S32.elf", "/abs/S32.elf"}) {
+        auto b = w;
+        b["prefill"]["sealed_elf"] = name;
+        check(has(refusal(write_plan("wide_path", b)), "bare file name"), std::string("path ") + name + " is refused");
+    }
+}
+
+// engine#2073: decode.narrow_elf / decode.narrow_rows, the narrow family.
+void test_narrow_family() {
+    auto pb = base_plan();
+    pb["container"]["layout"] = "pb16i";
+    pb["container"]["chunk_kind"] = "pb16i";
+    pb["container"]["pb16i"] = true;
+    pb["kernels"]["tag"] = "_pb16i";
+    pb["decode"]["sealed_elf"] = "S16.elf";
+    const Plan none = Plan::load(write_plan("narrow_none", pb));
+    check(none.sealed_narrow_elf.empty() && none.sealed_narrow_rows == 0, "no narrow family unless the plan names one");
+    auto n = pb;
+    n["decode"]["narrow_elf"] = "S4.elf";
+    n["decode"]["narrow_rows"] = 4;
+    const Plan np = Plan::load(write_plan("narrow_ok", n));
+    check(np.sealed_narrow_elf == "S4.elf" && np.sealed_narrow_rows == 4 && np.sealed_elf == "S16.elf",
+          "decode.narrow_elf and narrow_rows are read beside the sealed set");
+    auto norows = pb;
+    norows["decode"]["narrow_elf"] = "S4.elf";
+    check(has(refusal(write_plan("narrow_norows", norows)), "1..15"), "a narrow family without a row count is refused");
+    auto b16 = n;
+    b16["decode"]["narrow_rows"] = 16;
+    check(has(refusal(write_plan("narrow_16", b16)), "1..15"), "narrow_rows 16 is refused");
+    for (int ok : {1, 15}) {
+        auto b = n;
+        b["decode"]["narrow_rows"] = ok;
+        check(refusal(write_plan("narrow_edge", b)).empty(), "narrow_rows " + std::to_string(ok) + " loads");
+    }
+    auto orphan = pb;
+    orphan["decode"]["narrow_rows"] = 4;
+    check(has(refusal(write_plan("narrow_orphan", orphan)), "without decode.narrow_elf"),
+          "narrow_rows without narrow_elf is refused");
+    auto nosealed = base_plan();
+    nosealed["decode"]["narrow_elf"] = "S4.elf";
+    nosealed["decode"]["narrow_rows"] = 4;
+    check(has(refusal(write_plan("narrow_nosealed", nosealed)), "decode.sealed_elf is empty"),
+          "a narrow family without the sealed decode set is refused");
+    auto path = n;
+    path["decode"]["narrow_elf"] = "sub/S4.elf";
+    check(has(refusal(write_plan("narrow_path", path)), "bare file name"), "a path as narrow_elf is refused");
+}
+
 void test_valid() {
     const std::string path = write_plan("valid", base_plan());
     const Plan p = Plan::load(path);
@@ -695,6 +784,8 @@ void test_drafter_and_state() {
 
 int main() {
     test_valid();
+    test_wide_family();
+    test_narrow_family();
     test_rope_and_inputs();
     test_drafter_and_state();
     test_kv();

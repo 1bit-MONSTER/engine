@@ -98,8 +98,10 @@ std::string qk_norm_refusal(bool declared, bool found);
 
 // How many rows a head read from the .fconst tail occupies in the container. The pack stores the head in whole 64-row
 // tiles, so a vocabulary that is not a multiple of 64 is carried with the pack's own padding rows (Hunyuan: 120,818 ->
-// 120,832) while `vocab_size` and the plan's tensor shape stay the vocabulary. A head that is a graph initializer does
-// not go through this (its own padding, to the 32-row tile quantum, is engine#1992's). This is the number a container's lm_head tile count follows from.
+// 120,832) while `vocab_size` and the plan's tensor shape stay the vocabulary. A head that is a graph initializer is
+// stored as it is: on main nothing pads it, and one whose row count is not a multiple of 32 is refused by the tile
+// writer ("q4_1 tiles need N % 32 == 0"). If graph-head padding lands (engine#1992 was closed unmerged), its quantum
+// belongs here. This is the number a container's lm_head tile count follows from.
 int64_t head_stored_rows(int64_t vocab, bool from_fconst_tail);
 
 // Why a pack's two layout witnesses cannot be reconciled, or "" when they can (engine#1985).
@@ -461,6 +463,11 @@ struct Report {
     // check; an untied pack's head and embedding are separate matrices by construction, and the same number is
     // meaningless -- reported as such rather than left looking like a failed import.
     bool selfcheck_tied = false;
+    // engine#1503: tied, correlated -- but MIS-SCALED. Correlation alone passes a head that is a scaled copy of the
+    // embedding: two packs measured on this box report corr 0.9915/0.9961 with rel_err 0.095/0.136 and serve garbage
+    // ("myself" forever), while the pack that serves correctly reports rel_err 0.000000. A pack in this state imports
+    // cleanly and answers nonsense, so it is refused rather than reported.
+    bool selfcheck_scaled = false;
     double lmhead_corr = 0, lmhead_rel = 0, ctrl_corr_nibble = 0, ctrl_corr_nozp = 0;
     // The tail (.fconst) path has no MatMulNBits bytes to mis-decode, so its control is an ALIGNMENT one: the same
     // tiles, the same decoder, rows matched against the neighbouring embedding row. A correct decode correlates ~1
@@ -790,6 +797,12 @@ bool fconst_scratch_ready(const std::string& dir);
 // real table must never contain: two rows for one geometry with different shapes.
 const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
                                               std::string* why);
+
+// engine#1503: the tied-head rule, as ONE predicate so the four call sites cannot drift: the head must reproduce the
+// embedding (corr) AND not be a scaled copy of it (rel_err). The constant is the measured gap between the two states --
+// 0.000000 for the pack that serves, 0.095/0.136 for the two that do not -- so 0.02 sits far from both.
+inline constexpr double kSelfcheckRelMax = 0.02;
+bool selfcheck_head_ok(double corr, double rel);
 
 int64_t attn_tile_bytes(int64_t k);
 // Pearson correlation between a quantised head and a bf16 embedding table (engine#1690; the self-check's own statistic,

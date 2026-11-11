@@ -550,7 +550,9 @@ may name a second sealed ELF with the same instances built for more rows: `q4nx_
 `q4nx_pb16i_sealed_wide_elf`) in `config.json`, a file in the kernels directory beside the 16-row one, and
 `q4nx_sealed_wide_rows` for its row count (default 32, allowed 17..128). No pack ships one yet, so nothing
 changes for an existing pack. `NPU_WIDE_SEALED_ELF=<file>` overrides the pack's file, `NPU_WIDE_SEALED_ELF=0`
-switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count.
+switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count. `tools/npu_plan.py` copies
+the two keys into `plan.json` as `prefill.sealed_elf` and `prefill.sealed_rows`, and a loaded plan wins over
+`config.json` (`docs/npu-plan.md`).
 
 When the wide ELF loads for every role that has a 16-row kernel, the chunk width becomes its row count and a
 launch of more than 16 rows takes the wide kernel; decode steps and chunks of up to 16 rows stay on the
@@ -583,7 +585,8 @@ takes it (a decode step, or a verify pass of a few rows); anything wider keeps t
 are the wide family's: all roles or none, one hw_context, shared weight images, and a file that is missing
 or does not load is logged (`[forward] narrow family NOT adopted (...)`) while decode stays on the 16-row
 kernels. `narrow_family_complete` and `narrow_takes` in `batch_width.h` are pinned by
-`tests/npu_pack_test.cpp`. No pack ships a narrow ELF yet.
+`tests/npu_pack_test.cpp`. No pack ships a narrow ELF yet. `plan.json` carries it as `decode.narrow_elf` and
+`decode.narrow_rows` (`docs/npu-plan.md`).
 
 Measured with a 4-row set, one binary, arms 16-row / 4-row / 16-row / 4-row, three prompts generating 49
 tokens each (`(tokens - 1) / (wall - wall of a 1-token request)`), two `npu-hold` tickets:
@@ -1861,12 +1864,15 @@ re-dequantised each layer's 17408-wide dense FFN tail on every token even after 
 packed on the device. `ffn_tail_cached()` (`npu/forward/src/q4nx_forward.cpp`) closes that: once a
 layer's packed gate/up/down BOs are resident, the f32 `wg_`/`wu_`/`wd_` buffers are no longer read,
 so the reload is skipped. It is on by default for a GDN model on the NPU route, when the packed
-weight cache is on, the run is not `NPU_INFER_HOST_GEMM`, and the tail is at least 256 MB per layer
-(the size guard; below that the reload is too small to be worth a behaviour change). `NPU_FFN_CACHE=0`
+weight cache is on, the run is not `NPU_INFER_HOST_GEMM`, and the tail is at least 128 MB per layer
+(the size guard, set just under the smallest tail measured; `npu/forward/include/ffn_cache_policy.h`). `NPU_FFN_CACHE=0`
 or `=1` forces it either way, and the resolved state is logged once as
 `[ffn] dense-tail cache on|off (default|NPU_FFN_CACHE; lin_kd=… IM=… H=…)`. On Qwen3.8-27B-NPU2 an
 interleaved 5-round A/B (`~/lb/587-cache-20261030`) measured an 8-token request at 104.5 s against
 117.4 s (**−11%**), CPU per token 22.9 s against 63.3 s (**−64%**), same text in every arm.
+On FastFlowLM's Qwen3.5-2B-NPU2 (IM 6144, H 2048, a 151 MB tail that the earlier 256 MB floor left out) an A B B A
+run in one ticket measured decode at 362–367 ms per token with the cache on (both arms) against 485–520 ms with
+it off in the quieter of the two off arms and 478–707 ms in the other, same text in all twelve runs (engine#1785).
 
 ### The prefix cache's snapshot: two kinds of plane
 
@@ -2125,6 +2131,11 @@ forward-serve` serves that too, from the same process and the same weights:
 |---|---|
 | `POST /v1/systemone` (alias `POST /v1/decisions`) | `{"state": …, "questions": {id: question}}` → `{"model", "answers": {id: answer}, "usage"}` |
 | `GET /v1/systemone/models` | the decision model this build serves: name, description, `max_input_tokens`, `modalities` |
+
+A pack that declares `attention_mode: noncausal_full_attention` (below) is a decision model and nothing else:
+it encodes a prompt in one pass and has no token-by-token decode. On such a pack `/v1/chat/completions` and
+`/v1/completions` answer **400** with `type: decision_model_error` and a message that names `/v1/systemone`
+(or says there is no decision head, when the serve loaded none), before any work is done.
 
 `questions` is an **object**, and its ids come back as the keys of `answers` in request order. Question
 types are `choice` (1–255 options), `noul` and `score` (2–10 ordered levels); a decision runs one backbone

@@ -34,6 +34,8 @@
 #          A mirror commit that is on no AMD branch fails the run and is named, as one of two
 #          things (off_branch_commits): AMD's own commit from a line AMD rebased and dropped, to be
 #          merged by hand, or a commit that is not AMD's, to be moved to our line.
+#        - the mirror is held (config/llama-mirror-hold.config names its commit): the run reports the hold and
+#          moves nothing. For a rewrite that cannot be merged by rule (engine#1945); see llama_hold_decision.
 #        - hrx-system is held (config/hrx-system-hold.config). AMD's ggml-hrx is written against
 #          AMD's hrx-system (e.g. #139 moved the kernel corpus to the `multiple_of` predicate that
 #          our held hrx-system cannot parse), so only AMD's changes OUTSIDE the HRX backend paths
@@ -48,6 +50,7 @@ set -euo pipefail
 cmd=${1:-}
 DRY_RUN=${DRY_RUN:-0}
 HOLD_FILE=${HOLD_FILE:-config/hrx-system-hold.config}
+LLAMA_HOLD_FILE=${LLAMA_HOLD_FILE:-config/llama-mirror-hold.config}
 ENGINE_DIR=$(pwd)
 # The HRX backend paths of the llama.cpp tree (what AMD's hrx-graph line adds on top of ggml).
 # tests/CMakeLists.txt belongs here: it is where the HRX test targets are registered, so it moves
@@ -83,6 +86,34 @@ export GIT_COMMITTER_NAME=hrx-bump GIT_COMMITTER_EMAIL=hrx-bump@users.noreply.gi
 hold_sha() {
   [ -f "$ENGINE_DIR/$HOLD_FILE" ] || return 0
   grep -v '^[[:space:]]*#' "$ENGINE_DIR/$HOLD_FILE" | grep -oE '^[0-9a-f]{40}' | head -n1 || true
+}
+
+# The commit 1bit/hrx-vulkan (our mirror of AMD's line) is held at, or empty. Same file shape as the hrx-system hold.
+llama_hold_sha() {
+  local f=$LLAMA_HOLD_FILE
+  case "$f" in /*) ;; *) f=$ENGINE_DIR/$f ;; esac   # relative to the engine checkout unless given whole
+  [ -f "$f" ] || return 0
+  grep -v '^[[:space:]]*#' "$f" | grep -oE '^[0-9a-f]{40}' | head -n1 || true
+}
+
+# What a mirror hold means for this run. Reads repo $1; $2 is the held commit (may be empty), $3 the mirror tip,
+# $4 AMD's pin. One word:
+#   none      no commit is held: the sync runs as usual
+#   held      the mirror is the held commit and AMD's pin does not descend from it: report it, move nothing
+#   stale     a commit is held but the mirror is somewhere else: somebody moved the mirror, the file is out of date
+#   unneeded  the mirror is the held commit and AMD's pin contains it: an ordinary fast-forward would work
+# 2026-11-10 (engine#1945): AMD re-committed its HRX series on a base 1777 upstream commits newer. Taking that
+# pin is a merge of about 150 conflicted files into our line, which is days of work for the lanes that own
+# those files, and until it is done the daily run can only fail. A failure that is known, sized and assigned
+# is not news; a hold says so in the run's summary and lets the run stay green for everything else it checks.
+# The hold is deliberately narrow: `stale` and `unneeded` both FAIL the run, so the file cannot outlive the
+# state it describes -- the day AMD's pin is reachable again, or the mirror moves, the run says to delete it.
+llama_hold_decision() {
+  local repo=$1 hold=$2 mirror=$3 pin=$4
+  if [ -z "$hold" ]; then echo none; return; fi
+  if [ "$hold" != "$mirror" ]; then echo stale; return; fi
+  if [ "$mirror" = "$pin" ] || git -C "$repo" merge-base --is-ancestor "$mirror" "$pin" 2>/dev/null; then echo unneeded; return; fi
+  echo held
 }
 
 # Why a mirror commit is on no AMD branch. Reads repo $1 (commits only are enough), whose refs/amd/*
@@ -127,6 +158,24 @@ sync_llama() {
   mirror=$(git rev-parse refs/remotes/fork/mirror)
   patched=$(git rev-parse refs/remotes/fork/patched)
   echo "AMD pin $pin, mirror 1bit/hrx-vulkan $mirror, our line 1bit/hrx-vulkan-patched $patched"
+
+  # 0. A mirror hold (config/llama-mirror-hold.config): the run reports it and moves nothing.
+  local lhold; lhold=$(llama_hold_sha)
+  case "$(llama_hold_decision . "$lhold" "$mirror" "$pin")" in
+    stale)
+      die "$LLAMA_HOLD_FILE holds 1bit/hrx-vulkan at ${lhold:0:12}, but the mirror is ${mirror:0:12}: the hold is out of date. Name the mirror's commit in it, or delete the commit line to let the sync run." ;;
+    unneeded)
+      die "$LLAMA_HOLD_FILE holds 1bit/hrx-vulkan at ${lhold:0:12}, and AMD's pin ${pin:0:12} contains that commit: an ordinary sync would work. Delete the commit line." ;;
+    held)
+      note "1bit/hrx-vulkan is held at ${mirror:0:12} by $LLAMA_HOLD_FILE: AMD's pin ${pin:0:12} does not descend from it (AMD rewrote its line). Nothing was moved; the merge is tracked where the hold file says."
+      summary "- llama.cpp: mirror \`1bit/hrx-vulkan\` HELD at \`${mirror:0:12}\` ($LLAMA_HOLD_FILE); AMD's pin is \`${pin:0:12}\`, on a line that does not contain it. Not merged."
+      output "rebased=$patched"
+      output "llama_held=1bit/hrx-vulkan HELD at \`${mirror:0:12}\` by \`$LLAMA_HOLD_FILE\` (AMD's pin is \`${pin:0:12}\`)."
+      output "patches<<EOF
+$(git log --format='- `%h` %s' "${OURS_LLAMA:-$patched}..$patched" 2>/dev/null || true)
+EOF"
+      return 0 ;;
+  esac
 
   # 1. The mirror. It holds AMD's commits only; ours live on 1bit/hrx-vulkan-patched.
   local rewritten=0
@@ -293,5 +342,7 @@ case "$cmd" in
   hrx) sync_hrx ;;
   # For tests/bump_hrx_sync_test.sh: the classification alone, on a local repository, no network.
   off-branch) off_branch_commits "${2:?repo}" "${3:?mirror}" "${4:?pin}" ;;
+  # The mirror-hold decision alone, on a local repository: llama-hold <repo> <mirror> <pin>, hold file from LLAMA_HOLD_FILE.
+  llama-hold) llama_hold_decision "${2:?repo}" "$(llama_hold_sha)" "${3:?mirror}" "${4:?pin}" ;;
   *) echo "usage: $0 llama|hrx" >&2; exit 2 ;;
 esac

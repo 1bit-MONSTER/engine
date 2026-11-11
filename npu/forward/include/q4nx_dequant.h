@@ -31,6 +31,17 @@
 //   and
 //       value[row][col] = code * scale[g][row] + zero_point[g][row]
 //
+//   A tile of that size comes in two kinds, and the tile itself says which. The one above is the asymmetric kind
+//   (FastFlowLM lists such packs as "Q4_1"): codes 0..15, scales >= 0, and a zero-point that is the group's
+//   minimum. The symmetric kind (listed as "Q4_0"; the LFM2 packs) has the SAME byte layout with every zero-point
+//   stored as 0, a scale that carries a sign, and the code as a two's-complement nibble:
+//       value[row][col] = (code >= 8 ? code - 16 : code) * scale[g][row]
+//   Nothing in the container names the kind, so it is read off the tile: all 256 zero-points zero means symmetric.
+//   Measured 2026-11-11 on every 5120-byte tile of the fifteen packs on the box: 1,889,236 asymmetric tiles, none
+//   with an all-zero zero-point block; 285,696 tiles in the two LFM2 packs, every one of them all-zero. Read as
+//   asymmetric, an LFM2 projection correlates -0.39 with the same tensor of the upstream GGUF; read as above, 0.99.
+//   (An asymmetric tile whose 256 group minima are all exactly 0 would be a matrix with no negative weight.)
+//
 // NOTE: this is NOT the layout asserted by the older tests/verify_i4_dequant.py
 // and tests/verify_q4nx_format.py (per-row 20-byte [scale][zp][16B nibbles]
 // groups with signed nibbles).  That layout drives the reconstruction to NaN
@@ -123,7 +134,10 @@ int q4nx_packed_grid(size_t nbytes, int rows, int cols, int* cb_out, int* rp_out
 int q4nx_dequant_tensor_packed(const uint8_t* data, size_t nbytes, int rows, int cols,
                                int rows_packed, int cols_packed, int chunk_bytes, float* out);
 
-/* Dequantize one 5120-byte tile into out[32][ld] (row-major, strided by ld). */
+/* 1 when the 5120-byte tile is the symmetric kind (every zero-point is +-0), 0 for the asymmetric kind. */
+int q4nx_tile_is_symmetric(const uint8_t* tile);
+
+/* Dequantize one 5120-byte tile, of either kind, into out[32][ld] (row-major, strided by ld). */
 void q4nx_dequant_tile(const uint8_t* tile, float* out, int ld);
 
 /* Dequantize a whole INT4 tensor of logical shape [rows, cols] whose packed

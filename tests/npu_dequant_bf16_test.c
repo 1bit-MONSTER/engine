@@ -192,7 +192,75 @@ static void tile_row_kind_arms(void) {
     printf("  tile-row kind: 3 kinds accepted, 4 tables the old rule took and the reader refuses are refused\n");
 }
 
+/* The two kinds of 5,120-byte tile. Same bytes for scales and codes; only the zero-point block differs, and that is
+ * what selects the reading: with a zero-point present the code is 0..15 and the value is code*scale + zero_point;
+ * with every zero-point 0 the code is a two's-complement nibble and the value is code*scale, scale carrying a sign. */
+static void tile_kinds(void) {
+    uint8_t* tile = (uint8_t*)calloc(1, Q4NX_TILE_BYTES);
+    float* out = (float*)malloc(sizeof(float) * Q4NX_TILE_ROWS * Q4NX_TILE_COLS);
+    if (!tile || !out) { check(0, "tile kinds: the buffers allocate"); free(tile); free(out); return; }
+    /* scales: exactly representable in bf16, negative on odd groups; codes: every nibble value appears */
+    for (int g = 0; g < Q4NX_GROUPS_PER_ROW; g++)
+        for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+            put_bf16(tile, (size_t)(g * Q4NX_TILE_ROWS + r), (g % 2 ? -1.0f : 1.0f) * 0.25f * (float)(1 + r % 4));
+    for (int i = 0; i < 4096; i++) tile[1024 + i] = (uint8_t)((i * 37 + 11) & 0xFF);
+    #define CODE_AT(r, c) ((((r) % 16) % 2 == 0) ? (tile[1024 + (((r) / 16) * 8 + (c) / 32) * 256 + 8 * ((c) % 32) + ((r) % 16) / 2] & 0xF) \
+                                                 : (tile[1024 + (((r) / 16) * 8 + (c) / 32) * 256 + 8 * ((c) % 32) + ((r) % 16) / 2] >> 4))
+    #define SCALE_AT(r, c) (((((c) / 32) % 2) ? -1.0f : 1.0f) * 0.25f * (float)(1 + (r) % 4))
+
+    check(q4nx_tile_is_symmetric(tile) == 1, "tile kinds: a zero-point block of zeros is the symmetric kind");
+    q4nx_dequant_tile(tile, out, Q4NX_TILE_COLS);
+    int bad = 0, saw_neg_code = 0;
+    for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+        for (int c = 0; c < Q4NX_TILE_COLS; c++) {
+            const int u = CODE_AT(r, c);
+            const int sgn = u >= 8 ? u - 16 : u;
+            if (u >= 8) saw_neg_code = 1;
+            if (out[r * Q4NX_TILE_COLS + c] != (float)sgn * SCALE_AT(r, c)) bad++;
+        }
+    check(saw_neg_code, "tile kinds: the fixture has codes of 8 and above, where the two readings differ");
+    check(bad == 0, "tile kinds: symmetric is (two's-complement nibble) * signed scale, every element");
+
+    /* negative zero is still zero: the kind does not flip on a sign bit */
+    tile[512 + 2 * 7 + 1] = 0x80;
+    check(q4nx_tile_is_symmetric(tile) == 1, "tile kinds: a -0.0 zero-point is still the symmetric kind");
+    tile[512 + 2 * 7 + 1] = 0;
+
+    /* one non-zero zero-point anywhere makes it the asymmetric kind, read as it always was */
+    put_bf16(tile + 512, (size_t)(3 * Q4NX_TILE_ROWS + 5), -0.5f);
+    check(q4nx_tile_is_symmetric(tile) == 0, "tile kinds: one non-zero zero-point makes the tile asymmetric");
+    q4nx_dequant_tile(tile, out, Q4NX_TILE_COLS);
+    bad = 0;
+    for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+        for (int c = 0; c < Q4NX_TILE_COLS; c++) {
+            const float z = (c / 32 == 3 && r == 5) ? -0.5f : 0.0f;
+            if (out[r * Q4NX_TILE_COLS + c] != (float)CODE_AT(r, c) * SCALE_AT(r, c) + z) bad++;
+        }
+    check(bad == 0, "tile kinds: asymmetric is (code 0..15) * scale + zero_point, every element, as before");
+
+    /* the whole-tensor and one-row readers go through the same tile decoder */
+    for (int i = 0; i < 512; i++) tile[512 + i] = 0;
+    float* row = (float*)malloc(sizeof(float) * Q4NX_TILE_COLS);
+    float* whole = (float*)malloc(sizeof(float) * Q4NX_TILE_ROWS * Q4NX_TILE_COLS);
+    if (row && whole) {
+        check(q4nx_dequant_tensor_chunked(tile, Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_TILE_BYTES, whole) == 0 &&
+                  q4nx_dequant_tile_row(tile, Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_TILE_BYTES, 9, row) == 0,
+              "tile kinds: the tensor and row readers accept a symmetric tile");
+        bad = 0;
+        for (int c = 0; c < Q4NX_TILE_COLS; c++) {
+            const int u = CODE_AT(9, c);
+            const float want = (float)(u >= 8 ? u - 16 : u) * SCALE_AT(9, c);
+            if (whole[9 * Q4NX_TILE_COLS + c] != want || row[c] != want) bad++;
+        }
+        check(bad == 0, "tile kinds: and both read it as the tile decoder does");
+    } else check(0, "tile kinds: the reader buffers allocate");
+    #undef CODE_AT
+    #undef SCALE_AT
+    free(row); free(whole); free(tile); free(out);
+}
+
 int main(void) {
+    tile_kinds();
     tile_row_kind_arms();
     chunked_row_arms();
     embed_row_arms();

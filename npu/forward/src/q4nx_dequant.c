@@ -29,10 +29,19 @@ static inline uint16_t le16(const uint8_t* p) {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
+int q4nx_tile_is_symmetric(const uint8_t* tile) {
+    const uint8_t* zp_b = tile + Q4NX_TILE_ROWS * Q4NX_GROUPS_PER_ROW * 2; /* +512 */
+    for (int i = 0; i < Q4NX_TILE_ROWS * Q4NX_GROUPS_PER_ROW; i++)
+        if ((le16(zp_b + 2 * i) & 0x7FFF) != 0) return 0;   /* +0.0 and -0.0 both count as zero */
+    return 1;
+}
+
 void q4nx_dequant_tile(const uint8_t* tile, float* out, int ld) {
     const uint8_t* sc_b = tile;
     const uint8_t* zp_b = tile + Q4NX_TILE_ROWS * Q4NX_GROUPS_PER_ROW * 2; /* +512  */
     const uint8_t* pk = tile + Q4NX_TILE_ROWS * Q4NX_GROUPS_PER_ROW * 4;   /* +1024 */
+    /* The symmetric kind (see the header): signed codes, signed scales, no offset. */
+    const int symmetric = q4nx_tile_is_symmetric(tile);
 
     for (int r = 0; r < Q4NX_TILE_ROWS; r++) {
         const int h = r / 16;
@@ -42,12 +51,17 @@ void q4nx_dequant_tile(const uint8_t* tile, float* out, int ld) {
             const int j = c % Q4NX_GROUP_SIZE;
             const int region = h * Q4NX_GROUPS_PER_ROW + g;
             const uint8_t byte = pk[region * 256 + 8 * j + rr / 2];
-            const int code = (rr % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+            int code = (rr % 2 == 0) ? (byte & 0xF) : (byte >> 4);
             /* scale/zero-point index is GROUP-MAJOR: i = g*32 + r */
             const int i = g * Q4NX_TILE_ROWS + r;
             const float s = bf16_to_f32(le16(sc_b + 2 * i));
-            const float z = bf16_to_f32(le16(zp_b + 2 * i));
-            out[(size_t)r * ld + c] = (float)code * s + z;
+            if (symmetric) {
+                if (code >= 8) code -= 16;   /* two's complement nibble */
+                out[(size_t)r * ld + c] = (float)code * s;
+            } else {
+                const float z = bf16_to_f32(le16(zp_b + 2 * i));
+                out[(size_t)r * ld + c] = (float)code * s + z;
+            }
         }
     }
 }

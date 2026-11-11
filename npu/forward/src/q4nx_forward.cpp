@@ -1530,7 +1530,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 // Both spellings count TILE-ROWS in shape[0] -- [rows, kpad_] and [tiles, tile bytes] -- so the number of
                 // 32-row blocks is shape[0] / per_block either way; only the row WIDTH in shape[1] differs. Exposed as a
                 // pure function because these numbers are what a test can drive without a container.
-                head_rows = padded_head_rows(ltd->shape[0], ltd->shape[1], kpad_, NV);
+                // The rule reads the whole shape: [tiles, tile bytes], [row tiles, column tiles, bytes] (FastFlowLM's
+                // own containers, engine#1788) and [rows, kpad_] each say where the row count is (pad_head_rows.h).
+                const int64_t head_shape[3] = {ltd->shape[0], ltd->shape[1], ltd->ndim >= 3 ? ltd->shape[2] : 0};
+                head_rows = padded_head_rows(head_shape, ltd->ndim, kpad_, NV);
             }
             std::vector<float> head_f32;
             float* head_out = lm_head_f_.data();
@@ -1550,8 +1553,6 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                              "  [forward] lm head: %d row(s) stored for a vocabulary of %d; the %d padding row(s) are "
                              "not read (engine#1990)\n", head_rows, NV, head_rows - NV);
             }
-            fprintf(stderr, "  [forward] separate lm_head.weight -> dequantized "
-                            "(%zu floats)\n", lm_head_f_.size());
             fprintf(stderr, "  [forward] separate lm_head.weight -> dequantized "
                             "(%zu floats)\n", lm_head_f_.size());
         }

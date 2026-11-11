@@ -167,7 +167,36 @@ case "$lm" in
     *) fatal "PREFLIGHT_LM='$lm' is not a llama-bench load mode (none|mmap|mlock|mmap+mlock|dio); the mode is part of the measurement, so it is not guessed (engine #1668)" ;;
 esac
 GGML_HRX_LOG_DISPATCH=1 "$bench" -m "$model" -p "$tokens" -n 0 -ngl 99 --device HRX0 -r 3 -lm "$lm" \
-    >/dev/null 2>"$log"
+    >/dev/null 2>"$log" &
+bench_pid=$!
+# The mode is REQUESTED above and OBSERVED here (engine #1668): llama.cpp puts a model it mmaps in `/proc/<pid>/maps` and a
+# model it only reads is not there, so the run can be checked against the flag instead of trusted to honour it. A bench that
+# ignores `-lm` yields a number the header mislabels, which is the same defect as an unstated mode -- one variable measured,
+# two reported.
+mapped=no; alive=0
+while :; do
+    grep -qF -- "$(basename "$model")" "/proc/$bench_pid/maps" 2>/dev/null && { mapped=yes; break; }
+    kill -0 "$bench_pid" 2>/dev/null || break
+    alive=$((alive + 1))
+    sleep 0.1
+done
+bench_rc=0
+wait "$bench_pid" || bench_rc=$?
+[ "$bench_rc" -eq 0 ] || fatal "the bench exited $bench_rc; see $log"
+# Only the modes whose mapping is unambiguous are asserted: `mmap`/`mmap+mlock` map, `none`/`dio` do not, and `mlock` alone is
+# not asserted because whether it maps depends on the loader -- a gate that guessed would fail a correct run. An OBSERVED
+# mapping is trusted on its own; an ABSENT one is only trusted when the process was seen alive after the sample, since a
+# bench that maps and exits between polls would otherwise be reported as a mismatch.
+if [ "$mapped" = no ] && [ "$alive" -eq 0 ]; then
+    printf '  WARN the bench finished before the load mode could be observed; -lm %s not checked\n' "$lm"
+else
+    case "$lm:$mapped" in
+        mmap:no|mmap+mlock:no)
+            fatal "the load mode is -lm $lm but the model is not in /proc/$bench_pid/maps; the run is not the measurement the header claims (engine #1668)" ;;
+        none:yes|dio:yes)
+            fatal "the load mode is -lm $lm but the model IS in /proc/$bench_pid/maps; the run is not the measurement the header claims (engine #1668)" ;;
+    esac
+fi
 
 lines=$(grep -c 'ggml_hrx dispatch:' "$log" || true)
 # A silent bench is the failure this flag exists to catch: an empty tally looks like "nothing declined"

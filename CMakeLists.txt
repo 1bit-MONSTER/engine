@@ -1360,6 +1360,13 @@ target_link_libraries(dflash_draft_test PRIVATE onebit_npu)
 add_dependencies(onebit dflash_draft_test)
 set(ONEBIT_DFLASH_DRAFT "" CACHE PATH "A DFlash draft package directory for dflash_draft_test's real-package arm")
 add_test(NAME dflash_draft COMMAND dflash_draft_test ${ONEBIT_DFLASH_DRAFT})
+# The draft's forward as a host reference (engine#1780): hand-computed cases and structure properties; the real
+# package arm runs when ONEBIT_DFLASH_DRAFT names one.
+add_executable(dflash_forward_test tests/dflash_forward_test.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp npu/forward/src/q4nx_dequant.c)
+target_include_directories(dflash_forward_test PRIVATE npu npu/forward/include)
+target_link_libraries(dflash_forward_test PRIVATE onebit_npu)
+add_dependencies(onebit dflash_forward_test)
+add_test(NAME dflash_forward COMMAND dflash_forward_test ${ONEBIT_DFLASH_DRAFT})
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
@@ -1860,6 +1867,9 @@ endif()
     # same sources against the runtime stub (engine#1946) cannot drift from this one.
     onebit_npu_forward_library(onebit_npu_forward onebit_npu_rt)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
+    # engine#2111: the usage object's pure function, its own TU so tests/serve_usage_test.cpp can link it without
+    # dragging in npu/rt.h (see cmake/tests-serve-usage.cmake).
+    target_sources(onebit PRIVATE app/serve_usage.cpp)
     # app/embed_serve.cpp's device path includes npu/embed/embed_npu.h (engine#1311): the embedding route's
     # ternary linears on the array, through the same int8 GEMM the forward links.
     target_include_directories(onebit PRIVATE ${CMAKE_SOURCE_DIR}/npu/embed ${CMAKE_SOURCE_DIR}/app

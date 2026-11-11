@@ -264,7 +264,6 @@ have been measured in three windows and answered differently every time.
   prefill drop noted below, and it is why a throughput row here is inseparable from *which quantizer built it*. **Measured here on 2026-11-08**: two arms
   that differ *only* in the adapter tensors' type (F16 ×26 vs Q6_K ×13 + Q8_0 ×13), benched back to back in one ticket and one window —
 
-
   | shape | F16 pairs | block-quantized pairs | cost |
   |---|---|---|---|
   | `pp8` | 114.19 tok/s | 14.03 tok/s | **8.1×** |
@@ -281,11 +280,13 @@ have been measured in three windows and answered differently every time.
   `input_size = 128` and HRX's block-format admission needs `>= 256` while the float predicate needs only `>= 4`. So the pair leaves the device for *any*
   block type, including the substitute — the same "the label is not evidence" rule this page applies to arm names, applied to the tensors inside them.
 
-> **It is not a behaviour-neutral instrument (engine#2143).** With this flag set, an 18,782-token request
-> *completes* where the same binary, model and request **fails** without it, and NaN-logit incidents went from 2
-> to 0; a plain 18.6k prefill measured **271.75 t/s** unset against **118.86 t/s** set. A 2.3x gap is not
-> "logging cost" — it is a different code path. So a rate taken with the flag is not comparable to one taken
-> without it, and an A/B that sets it on one arm only is not an A/B.
+  > **Set it in both arms of an A/B, and record box load beside any rate (engine#2143).** #2143 asked whether this
+  > flag changes behaviour: one 18,782-token request failed without it and completed with it, and one 18.6k prefill
+  > measured 271.75 t/s unset against 118.86 t/s set. At the engine's pin the flag only gates `fprintf` calls
+  > (`dispatch_log_match()` and `dispatch_log_requested_output()` in `dispatch-registry.cpp`): the readback check and
+  > its decline run in both arms, so the dispatches selected are the same either way. Each of those measurements is
+  > one run per arm, #1536 then failed in 4 of 6 runs, and box load moves a rate by about 2x here, so neither shows
+  > a flag effect. Setting it in both arms is right whichever way #2143 settles.
 
 - **A control on 2026-11-08 shows how far a single reading can be off, and it retire the A/B this page would need.** One file whose form cause 2
   did **not** touch (`Zamba-7B-v1` `Q6_K`) was re-benched on a current build: `pp512 211.16 (sd 170.84)`, `pp4096 47.14 (sd 12.73)`, `tg128 4.26

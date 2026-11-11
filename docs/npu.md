@@ -1753,6 +1753,31 @@ the missing q/k norm above was found:
   from one teacher-forced pass. Compared with a reference's per-row choices, a low agreement that is flat
   across positions is an error in the layers; a step at some row is an error at a position or a batch edge.
 
+**Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
+and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.
+A pack of the same architecture under another name got it wrong in silence. FastFlowLM's MiniCPM-V 4.7
+is `minicpmv4_7` around a `qwen3_5` text model, and every full-attention layer of its container ships
+`self_attn.q_norm` and `k_norm`; the forward ran those layers without the norm. The model still answered
+short prompts (`Paris`, `red`) and drifted on longer ones. Now a layer that carries both tensors turns the
+norm on, and the load says so:
+
+```
+[semantics] qk_norm=1  <- the container: layer 3 carries self_attn.q_norm and k_norm (config.json's model_type is not a family the table knows)
+```
+
+The rule never turns the norm off: a family the table knows keeps its answer. Measured on the 1B pack,
+host arm, against the model's original weights in transformers (2026-11-11):
+
+| | before | after | reference |
+|---|---|---|---|
+| a 149-token story, "what is the name of Maria's cat?" | `The question mentions that Maria buys` | `Pluto` | `Pluto` |
+| top-1 agreement with the reference over those 149 rows | 65.1 % | 75.2 % | |
+| rows where the forward's choice is outside the reference's top 10 | 6 | 0 | |
+| a sliced 448 × 896 image (red left, green top right, blue bottom right) | "three equal horizontal sections … white … red" | red left, green top right, blue bottom right | the same three regions |
+
+What is left of the disagreement (a quarter of the rows) is between a 4-bit container and the float
+weights; it has not been separated into quantisation and anything else.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU

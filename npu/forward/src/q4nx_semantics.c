@@ -540,6 +540,16 @@ void q4nx_semantics_layer_mix(const Q4nxSemantics* s, char* out, size_t out_sz) 
     snprintf(out, out_sz, "full=%d sliding=%d linear=%d other=%d", full, slid, lin, oth);
 }
 
+int q4nx_semantics_qk_norm_from_tensors(Q4nxSemantics* s, const unsigned char* has_q, const unsigned char* has_k, int layers) {
+    if (!s || !has_q || !has_k || layers <= 0 || s->qk_norm) return -1;
+    for (int l = 0; l < layers; l++)
+        if (has_q[l] && has_k[l]) {
+            s->qk_norm = 1;
+            return l;
+        }
+    return -1;
+}
+
 void q4nx_semantics_dump(const Q4nxSemantics* s) {
     if (!s) return;
     fprintf(stderr, "  [semantics] rmsnorm_offset=%d  <- %s\n", s->rmsnorm_offset,

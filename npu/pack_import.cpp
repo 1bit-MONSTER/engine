@@ -3443,6 +3443,12 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
         {"k_proj",        "k_proj"},         {"k_proj",        "attn_k"},         {"k_proj", "wk."},
         {"v_proj",        "v_proj"},         {"v_proj",        "attn_v"},         {"v_proj", "wv."},
         {"o_proj",        "o_proj"},         {"o_proj",        "attn_output"},    {"o_proj", "wo."},
+        // engine#1788: an ATTENTION output gate is not the FFN gate. MiniCPM-V 4.7 carries `attn_output_gate: true`,
+        // so every one of its 30 `self_attn.gate_proj.weight` tensors was filed under `gate_proj` -- the dense-MLP role
+        // -- and a consumer would have wired an attention gate into the FFN path. The forward already keeps them apart
+        // (model.h: `gate_proj_weight` vs `self_attn_gate_proj_weight`), so this uses its name and must precede the
+        // `gate_proj` needle.
+        {"self_attn_gate_proj", "self_attn.gate_proj"},
         {"gate_proj",     "gate_proj"},      {"gate_proj",     "ffn_gate"},
         {"up_proj",       "up_proj"},        {"up_proj",       "ffn_up"},
         {"down_proj",     "down_proj"},      {"down_proj",     "ffn_down"},

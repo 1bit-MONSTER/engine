@@ -1752,6 +1752,7 @@ the missing q/k norm above was found:
 - `--rows-argmax` (with `--none`) prints the model's own next-token choice at every row of a text prompt,
   from one teacher-forced pass. Compared with a reference's per-row choices, a low agreement that is flat
   across positions is an error in the layers; a step at some row is an error at a position or a batch edge.
+
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.
 A pack of the same architecture under another name got it wrong in silence. FastFlowLM's MiniCPM-V 4.7

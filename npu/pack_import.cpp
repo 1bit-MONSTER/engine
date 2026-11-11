@@ -3363,6 +3363,11 @@ ContainerGeometry container_geometry(const json& meta, const json& config) {
     return g;
 }
 
+int64_t head_stored_rows(int64_t vocab, bool from_fconst_tail) {
+    if (!from_fconst_tail || vocab <= 0) return vocab;
+    return (vocab + kTileRows - 1) / kTileRows * kTileRows;
+}
+
 std::string qk_norm_refusal(bool declared, bool found) {
     if (declared && !found)
         return "this pack declares use_qk_norm and its per-head q/k gains are not where the block layout says "
@@ -5350,7 +5355,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 // (Hunyuan-0.5B: 120,818 rows = 1,887.8 tiles, so the tail holds 1,888 and the last one is partly
                 // padding). The rows past V are dropped before the tensor is written, so the container's head has
                 // exactly V rows.
-                const int64_t rows = (V + kTileRows - 1) / kTileRows;
+                const int64_t rows = head_stored_rows(V, true) / kTileRows;
                 // The envelope is the same `64 + 2*hidden` the layer blocks open with (eps, padding, the norm), not a
                 // constant: 1,856 is only its qwen2.5-0.5B value. Qwen3-1.7B's tail is 4,160 + 2,374 x 73,984 to the
                 // byte, which the constant would have missed by 2,304.

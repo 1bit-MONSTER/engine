@@ -1,0 +1,12 @@
+# Tests that legitimately do not run in the CI configuration, one name per line with the reason.
+# Written by tools/ci/ctest_skips.py --write. A name here that stops skipping is reported, so the list
+# shrinks rather than rots (the shape of tools/ci/unreferenced_tests.txt, engine#1824).
+# A test whose BINARY is missing is never baselined here: that is a build-list mistake, not a fixture.
+
+amdxdna_restart   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+npu_import_contract   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+npu_repack_path   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+patch_sfs_atomic   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+serve_client_hangup_cpu   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+serve_context_limit_cpu   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+serve_embed_vectors_cpu   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)

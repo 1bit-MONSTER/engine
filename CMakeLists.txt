@@ -510,7 +510,8 @@ target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 add_executable(moe_placement_test tests/moe_placement_test.cpp)
 target_include_directories(moe_placement_test PRIVATE app)
 target_link_libraries(moe_placement_test PRIVATE nlohmann_json::nlohmann_json)
-add_test(NAME moe_placement_reader COMMAND moe_placement_test)
+add_test(NAME moe_placement_reader COMMAND moe_placement_test
+         ${CMAKE_SOURCE_DIR}/tests/fixtures/moe_placement/flash-next-decode.placement.json)
 add_dependencies(onebit moe_placement_test)
 # The NPU route's bounded load retry (app/npu_load_retry.h, engine #1010, docs/npu.md "When a load follows an evict"):
 # a load started right after an evict can hit the previous backend's hardware context still being torn down, which used

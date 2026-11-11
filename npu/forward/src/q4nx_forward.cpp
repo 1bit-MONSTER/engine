@@ -590,6 +590,7 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
                 designs16_[i].N, elf.c_str());
     }
     xd_->note_m16_made(made > 0);
+    decode_roles_ = made;   // engine#2102: the caller-facing count, beside the byte-for-byte log line below
     if (pb16i_ && made < ndesigns_ - 0) {
         fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
                 t2s_ ? "t2s" : "pb16i", made, ndesigns_);

@@ -35,6 +35,8 @@
 // resets it from position 0.
 #include "forward_serve.h"
 
+#include "npu_decode_note.h"
+
 #include "../npu/forward/include/q4nx_forward.h"
 #include "../npu/target/xdna/xdna_target.h"  // XdnaTarget::kName for --npu-target
 #include "npu_device_lock.h"
@@ -1359,6 +1361,12 @@ int run_forward_serve(int argc, char** argv) {
     // The target that is actually serving, so a log says which one answered rather than leaving it to the build.
     std::fprintf(stderr, " [npu-target=%s]", npu_target.c_str());
     std::fprintf(stderr, "\n");
+    // engine#2102: the machine line `[forward] decode family: …` stays byte-for-byte (gates grep it). This is the sentence
+    // an operator needs at the ready line's level when it says 0 of N -- the route that answers correctly and 50x slower.
+    {
+        const std::string note = onebit::npu::decode_family_note(e.fwd->decode_roles(), e.fwd->design_roles(), kernels);
+        if (!note.empty()) std::fprintf(stderr, "%s\n", note.c_str());
+    }
 
     while (true) std::this_thread::sleep_for(std::chrono::seconds(3600));
     return 0;

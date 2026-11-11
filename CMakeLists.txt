@@ -200,6 +200,12 @@ add_test(NAME serve_hangup COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_hangup_test.s
 # engine#1945: scripts/bump-hrx-sync.sh tells AMD's own commit from a line AMD rebased apart from a commit that
 # is not AMD's. Local git repositories only: no network, no GPU.
 add_test(NAME bump_hrx_sync COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_sync_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-sync.sh)
+# engine#2102: the sentence a serve owes an operator when no 16-row decode kernel was found (app/npu_decode_note.h). Pure:
+# the silent cases are the ones that matter, and they are arms.
+add_executable(npu_decode_note_test tests/npu_decode_note_test.cpp)
+target_include_directories(npu_decode_note_test PRIVATE app)
+add_test(NAME npu_decode_note COMMAND npu_decode_note_test)
+add_dependencies(onebit npu_decode_note_test)
 add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.

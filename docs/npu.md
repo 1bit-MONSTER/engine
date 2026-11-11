@@ -538,6 +538,35 @@ second pair is not quoted as a speedup. `NPU_DEQ_LDEXP=2` runs both forms and co
 `tests/npu_pb16i_layout_test.cpp` holds the two forms to the same bits for one and two planes, the edges
 of the exponent range and exponents outside it. The `[bl]` line names the term as `deq`.
 
+**A sealed set may carry a wide family for prefill (#1990).** The served sealed sets are built for 16
+rows per launch, so a prefill chunk is 16 rows and a 536-token prompt is 34 blocks of 416 launches. A pack
+may name a second sealed ELF with the same instances built for more rows: `q4nx_t2s_sealed_wide_elf` (or
+`q4nx_pb16i_sealed_wide_elf`) in `config.json`, a file in the kernels directory beside the 16-row one, and
+`q4nx_sealed_wide_rows` for its row count (default 32, allowed 17..128). No pack ships one yet, so nothing
+changes for an existing pack. `NPU_WIDE_SEALED_ELF=<file>` overrides the pack's file, `NPU_WIDE_SEALED_ELF=0`
+switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count.
+
+When the wide ELF loads for every role that has a 16-row kernel, the chunk width becomes its row count and a
+launch of more than 16 rows takes the wide kernel; decode steps and chunks of up to 16 rows stay on the
+16-row family. It is all roles or none: the chunk width is one number for the pass, so a set missing one
+role is not adopted. A named file that is missing or does not load never stops the serve: the log says why
+(`[forward] wide family NOT adopted (...)`) and chunks stay at 16 rows. The weight images are shared, only
+the activation and result buffers differ. A launch that carries more rows than its kernel holds is refused
+by name. The rules (`wide_family_complete`, `chunk_rows`, `wide_takes`, `wide_elf_path` in
+`npu/forward/include/batch_width.h`) are pinned without a device by `tests/npu_pack_test.cpp`.
+
+Measured on `bonsai2-27b-t2s2` with a 32-row set, one `npu-hold` ticket per row of the table, one binary,
+arms off / on / off / on, three 510-536-token prompts per arm (`prompt_tokens / wall`, `max_tokens 1`):
+
+| how the wide set was named | first token, wide off | first token, wide on | 16-row block median | 32-row block median |
+|---|---|---|---|---|
+| `NPU_WIDE_SEALED_ELF` | 28.3-29.8, 30.5-30.8 tok/s | **35.6-35.9, 35.0-35.4 tok/s** | 534.2, 509.3 ms | 871.0, 881.5 ms |
+| the pack's `config.json` key | 28.7-28.9, 28.7-29.0 tok/s | **33.9-34.2, 34.2-34.4 tok/s** | 541.2, 541.4 ms | 914.0, 908.3 ms |
+
+Two 16-row blocks against one 32-row block is 30-31 rows/s against 35-37. The 8-token greedy text is
+identical with the family off and on, and `NPU_BATCH_CHECK=1` on the wide path reports MATCH on every chunk
+it checks (32-, 4- and 1-row) in both tickets. Only 32 rows has been measured.
+
 **A t2s container wants a sealed set for the same reason a pb16i one does.** The layout is not what makes
 a phase change expensive: the **hw_context** is. Measured on this box in-loop on 2026-11-02, a t2s decode
 family shipped as eight per-role `_t2s2_m16` ELFs paid **+2.0-2.3 ms on every launch, in every role** — more

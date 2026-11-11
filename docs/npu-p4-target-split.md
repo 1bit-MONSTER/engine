@@ -236,7 +236,7 @@ What is still not wired, and stated as such: `gdn_step`/`attn_step` dispatch nee
 ## 4. Gate (unchanged from #803)
 
 1. `window11`: 3 greedy prompts, text identical to the current binary.
-2. Logits KLD **0** on 8 prompts (the same prompts the hw-gate uses), same model dir and kernel set.
+2. Logits KLD **0** on 8 prompts, same model dir and kernel set in both arms. (This line used to ask for the hw-gate's prompts; the row below was run on eight fixed completions and says so.)
 
    **Measured (2026-11-11, on the NPU, under `npu-hold` tickets).** Baseline: the binary at `540e1fd`
    (before the decode-family move), run twice as the control. Candidate: `main` at `d0fa51c` (with #2166).

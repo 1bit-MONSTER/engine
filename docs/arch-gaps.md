@@ -1093,6 +1093,7 @@ the single undocumented entry out of 37.
   16 KV, IM 4096). **Not an alias of `deepseek_v41`**: nothing at the pin decodes AW-SECD weights, so mapping it to
   that architecture would name a backend that cannot read the file. Reported, not alerted (`"watch": "report"`).
 
+<<<<<<< HEAD
 ## FLM 1.0.12's build on the box: one family root with nothing, three that are already somewhere (engine#1787)
 
 F9 of `TNPU-ALL` §9 asks for a row for *every family FastFlowLM's build serves and we do not*. The build is on the box,
@@ -1118,7 +1119,7 @@ restated 2026-11-11:
 |---|---|---|---|
 | `Translategemma-4B-Instruct-NPU2` | `translategemma` | nothing: `git grep -il translategemma` finds 0 files | everything. This is the one root with no trace. By its name it would be a `gemma3` arrival like `medgemma`; nobody has opened its config, so that is a guess and not a mapping |
 | `LFM2.5-1.2B-NPU2`, `LFM2.5-1.2B-Thinking-NPU2` | `lfm2.5` | the packs' own `config.json` says `Lfm2ForCausalLM` / `model_type: lfm2`, which the registry maps, so there is no "2.5 class" to add; `models/pins.json` pins the `LFM2.5-2.6B` and `LFM2.5-8B-A1B` GGUFs; and since engine#2170 both packs **serve on the NPU route** with measured rows in [npu.md](npu.md) ("FastFlowLM's own containers") | nothing in the registry. On the route: speed (per-op, about 4 tok/s against their 48 to 83), not coverage |
-| `Medgemma-4B-NPU2`, `Medgemma-1.5-4B-NPU2` | `medgemma` | a `gemma3` arrival, already routed: [npu.md](npu.md) has the row `gemma3` / `medgemma-1.5-4b-it-NPU2` / hrx / not served, and `tests/census_watch_test.py` pins that pack to `Gemma3ForCausalLM` | an NPU row. `Medgemma-4B-NPU2` is on the box; its geometry (H 2560, IM 10240) needs two kernel shapes that are not built (`GU K2560 N20480`, `D K10240 N2560`), so it is a kernel-set item, not a model-type one |
+| `Medgemma-4B-NPU2`, `Medgemma-1.5-4B-NPU2` | `medgemma` | a `gemma3` arrival, already routed: [npu.md](npu.md) has the row `gemma3` / `medgemma-1.5-4b-it-NPU2` / hrx / not served, and `tests/census_watch_test.py` pins that pack to `Gemma3ForCausalLM` | an NPU row. `Medgemma-4B-NPU2` is on the box. From its `config.json` (H 2560, 8 heads, 4 KV heads, head_dim 256, IM 10240) its four shapes are `QKV K2560 N4096`, `O K2048 N2560`, `GU K2560 N20480` and `D K10240 N2560`. In the unblocked kernel family the last three are built (for example `~/models/npu/qwen3-coder-kernels/`); in the blocked (`_b8`) family only `O` is. `QKV K2560 N4096` is built in neither, so it is one kernel shape away, not a model-type item (counted 2026-11-11 with `find ~ -name 'full_i8_<shape>*.elf'`, FastFlowLM's own files excluded) |
 | `Nanbeige4.1-3B-NPU2` | `nanbeige4.1` | mapped: `registry/architectures.json` has `NanbeigeForCausalLM` (gguf `nanbeige`), `registry/census.json` counts it, `registry/support_pins.json` lists its converter config, and `q4nx_semantics.h` and [tokenizers.md](tokenizers.md) name `Nanbeige4.1-3B` itself (11 files) | an NPU row. Nothing on [npu.md](npu.md) says whether it serves there, and it has not been tried |
 
 So: **one** family root with nothing (`translategemma`), and three that are mapped or served and owe a measured NPU row
@@ -1134,3 +1135,15 @@ went from listed to settled that way.
 
 The `!! NPU FLM` class above is where the owed rows belong. Its owning issue is engine#1786 (every `*-NPU2` source
 serves), which is open.
+=======
+## 2026-11-11: `OpensciForCausalLM` — reviewed remote code (engine#2171)
+
+* `OpensciForCausalLM` (`model_type` `opensci`, 121 models in the 2026-11-11 census) — the open-sci reference models
+  (for example `open-sci/open-sci-1.7b-nemotron-cc-1T-oh-dcft`: hidden 2048, 24 layers, 32 heads / 32 KV,
+  `qk_layernorm`, vocab 50304). **Published as remote code**: `config.json` carries an `auto_map` to its own
+  `configuration_opensci.OpensciConfig` and `modeling_opensci.OpensciForCausalLM`, so no pinned backend accepts the
+  class without that code. **Not an alias** of any supported family. Reported, not alerted (`"watch": "report"`).
+  The other spelling, `OpenSciForCausalLM` (7 models, same `model_type` and the same `auto_map`), is a separate exact
+  key: `census_watch.py` matches architecture classes exactly, so that spelling needs its own entry and is not covered
+  by this one.
+>>>>>>> origin/main

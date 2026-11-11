@@ -136,12 +136,26 @@ void q4nx_dequant_tile_q8(const uint8_t* t, float* out, int ld) {
     }
 }
 
+void q4nx_dequant_tile_q4s(const uint8_t* t, float* out, int ld) {
+    const uint8_t* sc_b = t;          /* [256] bf16, index g*32 + r */
+    const uint8_t* qs = t + 512;      /* [256][16], byte c*16 + r/2 */
+    for (int r = 0; r < Q4NX_TILE_ROWS; r++) {
+        for (int c = 0; c < Q4NX_TILE_COLS; c++) {
+            const int g = c / Q4NX_GROUP_SIZE;
+            const uint8_t byte = qs[c * 16 + r / 2];
+            int code = (r % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+            if (code >= 8) code -= 16;   /* two's complement nibble */
+            out[(size_t)r * ld + c] = (float)code * bf16_to_f32(le16(sc_b + 2 * (g * Q4NX_TILE_ROWS + r)));
+        }
+    }
+}
+
 int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
                                 int cols, int chunk_bytes, float* out) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
     if (chunk_bytes != Q4NX_TILE_BYTES && chunk_bytes != Q4NX_CHUNK_Q4K &&
-        chunk_bytes != Q4NX_CHUNK_Q8)
+        chunk_bytes != Q4NX_CHUNK_Q8 && chunk_bytes != Q4NX_CHUNK_Q4S)
         return -1;
     const int ntr = rows / Q4NX_TILE_ROWS, ntc = cols / Q4NX_TILE_COLS;
     if (nbytes < (size_t)ntr * (size_t)ntc * (size_t)chunk_bytes) return -1;
@@ -161,6 +175,8 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
                 q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
             else if (chunk_bytes == Q4NX_CHUNK_Q8)
                 q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+            else if (chunk_bytes == Q4NX_CHUNK_Q4S)
+                q4nx_dequant_tile_q4s(c, tmp, Q4NX_TILE_COLS);
             else
                 q4nx_dequant_tile_as(c, tmp, Q4NX_TILE_COLS, sym);
             for (int r = 0; r < Q4NX_TILE_ROWS; r++)
@@ -181,7 +197,7 @@ int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols
     if (r < 0 || r >= rows) return -1;
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
     if (chunk_bytes != Q4NX_TILE_BYTES && chunk_bytes != Q4NX_CHUNK_Q4K &&
-        chunk_bytes != Q4NX_CHUNK_Q8)
+        chunk_bytes != Q4NX_CHUNK_Q8 && chunk_bytes != Q4NX_CHUNK_Q4S)
         return -1;
     const int ntr = rows / Q4NX_TILE_ROWS, ntc = cols / Q4NX_TILE_COLS;
     if (nbytes < (size_t)ntr * (size_t)ntc * (size_t)chunk_bytes) return -1;
@@ -199,6 +215,8 @@ int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols
             q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
         else if (chunk_bytes == Q4NX_CHUNK_Q8)
             q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+        else if (chunk_bytes == Q4NX_CHUNK_Q4S)
+            q4nx_dequant_tile_q4s(c, tmp, Q4NX_TILE_COLS);
         else
             q4nx_dequant_tile_as(c, tmp, Q4NX_TILE_COLS, sym);
         memcpy(out + (size_t)tc * Q4NX_TILE_COLS, tmp + (size_t)rr * Q4NX_TILE_COLS,
@@ -210,8 +228,8 @@ int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols
 int q4nx_tile_row_kind(size_t nbytes, int rows, int cols) {
     if (rows <= 0 || cols <= 0 || rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return 0;
     const size_t tiles = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
-    const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
-    for (int i = 0; i < 3; i++)
+    const int kinds[4] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8, Q4NX_CHUNK_Q4S};
+    for (int i = 0; i < 4; i++)
         if (nbytes == tiles * (size_t)kinds[i]) return kinds[i];
     return 0;
 }
@@ -262,7 +280,7 @@ int q4nx_dequant_tensor_packed(const uint8_t* data, size_t nbytes, int rows, int
     if (rows_packed < rows || cols_packed < cols) return -1;
     if (rows_packed % Q4NX_TILE_ROWS || cols_packed % Q4NX_TILE_COLS) return -1;
     if (chunk_bytes != Q4NX_TILE_BYTES && chunk_bytes != Q4NX_CHUNK_Q4K &&
-        chunk_bytes != Q4NX_CHUNK_Q8)
+        chunk_bytes != Q4NX_CHUNK_Q8 && chunk_bytes != Q4NX_CHUNK_Q4S)
         return -1;
     if (rows_packed == rows && cols_packed == cols)
         return q4nx_dequant_tensor_chunked(data, nbytes, rows, cols, chunk_bytes, out);
@@ -285,6 +303,8 @@ int q4nx_dequant_tensor_packed(const uint8_t* data, size_t nbytes, int rows, int
                 q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
             else if (chunk_bytes == Q4NX_CHUNK_Q8)
                 q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+            else if (chunk_bytes == Q4NX_CHUNK_Q4S)
+                q4nx_dequant_tile_q4s(c, tmp, Q4NX_TILE_COLS);
             else
                 q4nx_dequant_tile_as(c, tmp, Q4NX_TILE_COLS, sym);
             for (int r = 0; r < Q4NX_TILE_ROWS; r++)

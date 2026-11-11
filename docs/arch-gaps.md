@@ -1043,8 +1043,8 @@ architecture), `MiniCPMOcrForConditionalGeneration` (own `minicpm-ocr` library),
 the `!! NPU FLM` families whose registry mapping is HRX-only (`hy_v3`, `dflash`, `gemma4`, `hunyuan-dense`, `gemma3`) —
 that last group is **not a registry edit**: the family has to be served on the NPU route. It used to be recorded here as
 engine #588, which is **closed** (2026-10-27) and was about *watching FLM's releases*, not about serving a family on the
-route — so this class currently has **no owning issue**, and an arrival that lands in it is recorded on this page and
-nowhere else. See the 2026-11-10 section below for the arrivals that are sitting in it.
+route. The issue that does own this class is engine#1786 (every `FastFlowLM/*-NPU2` source serves on `--device npu`,
+opened 2026-11-10). See the last section of this page for the arrivals that are sitting in it.
 
 ## Census run 2026-11-09 (`engine #1667`)
 
@@ -1076,8 +1076,8 @@ Left as they are, on purpose, under the policy above: the six `. REMOTE-CODE` cl
 `KimiK31SuperExpertForCausalLM`, `ThalamusReasoningQwen3_5ForConditionalGeneration`); the `? UNVERIFIABLE` gated repos,
 which are retried on every run; and the `!! FLM` lines. Those keep the 2026-11-08 reasons: `MiniCPMV4_7`, `MiniCPMOcr`
 and `smolvla` as above, and `!! NPU FLM` was recorded as engine #588 — which is **closed** (2026-10-27) and was
-about watching FLM's releases, not about serving a family on the NPU route, so that class now has no owning issue
-(corrected 2026-11-10; see the section at the end of this page). This run's issue window also includes the `gpt-oss`
+about watching FLM's releases, not about serving a family on the NPU route; the class is owned by engine#1786
+(corrected 2026-11-11; see the section at the end of this page). This run's issue window also includes the `gpt-oss`
 (`GPT-OSS-20B`, `GPT-OSS-Safeguard-20b`) and `lfm2` (`LFM2-1.2B`, `LFM2-2.6B`) Q4NX packs. Their mapping is HRX-only
 too, so they are the same class — a route to serve, not a registry edit.
 
@@ -1093,37 +1093,44 @@ the single undocumented entry out of 37.
   16 KV, IM 4096). **Not an alias of `deepseek_v41`**: nothing at the pin decodes AW-SECD weights, so mapping it to
   that architecture would name a backend that cannot read the file. Reported, not alerted (`"watch": "report"`).
 
-## FLM 1.0.12's HRX build: four family roots with no row (engine#1787, 2026-11-10)
+## FLM 1.0.12's build on the box: one family root with nothing, three that are already somewhere (engine#1787)
 
-F9 of `TNPU-ALL` §9 asks for a row for *every family FastFlowLM's HRX-targeted build serves and we do not*. The build is
-on the box, so the checklist was enumerated from it rather than from the release notes:
+F9 of `TNPU-ALL` §9 asks for a row for *every family FastFlowLM's build serves and we do not*. The build is on the box,
+so the checklist was enumerated from it rather than from the release notes:
 
 ```
 $ ls ~/flm-f9/xclbins | wc -l      -> 54     (per-family xclbin directories)
 $ ls ~/flm-f9/lib/*.so | wc -l     -> 34     (per-family shared objects)
 ```
 
+A word on the name: #1787 calls this "FLM 1.0.12's HRX build", and the section used to. What is counted here is a
+directory of **xclbins, every one named `*-NPU2`**: they are NPU artifacts. A reader looking for GPU families will not
+find them in this list.
+
 Mapping each of the 54 by **family root** (not by model name: `Gemma3-1B` normalises to `gemma31b`, which appears nowhere,
-and matching that way reported 53 of 54 as unknown) against `registry/*.json`, `docs/registry.md` and this page:
+and matching that way reported 53 of 54 as unknown) against `registry/*.json`, `docs/registry.md` and this page gave 48
+with a trace and 6 xclbins over 4 roots without one. **That second number was wrong** (review of engine#2065): the root
+was compared as a literal against class names and `model_type`s that do not contain it (`nanbeige4.1` against
+`NanbeigeForCausalLM`, `medgemma` against `gemma3`). Each of the four, searched on `main` case-insensitively and
+restated 2026-11-11:
 
-* **48** roots have a trace somewhere — spot-checked rather than assumed: `d3` → `D3LM` in `census.json`, `gemma3` →
-  `Gemma3ForCausalLM` in `architectures.json`, `qwen3.5` → `Qwen3_5ForConditionalGeneration`, `lfm2` → `Lfm2ForCausalLM`.
-* **6** xclbins over **4** family roots have **no trace at all**:
+| xclbin directory | family root | what `main` has | what is actually owed |
+|---|---|---|---|
+| `Translategemma-4B-Instruct-NPU2` | `translategemma` | nothing: `git grep -il translategemma` finds 0 files | everything. This is the one root with no trace. By its name it would be a `gemma3` arrival like `medgemma`; nobody has opened its config, so that is a guess and not a mapping |
+| `LFM2.5-1.2B-NPU2`, `LFM2.5-1.2B-Thinking-NPU2` | `lfm2.5` | the packs' own `config.json` says `Lfm2ForCausalLM` / `model_type: lfm2`, which the registry maps, so there is no "2.5 class" to add; `models/pins.json` pins the `LFM2.5-2.6B` and `LFM2.5-8B-A1B` GGUFs; and since engine#2170 both packs **serve on the NPU route** with measured rows in [npu.md](npu.md) ("FastFlowLM's own containers") | nothing in the registry. On the route: speed (per-op, about 4 tok/s against their 48 to 83), not coverage |
+| `Medgemma-4B-NPU2`, `Medgemma-1.5-4B-NPU2` | `medgemma` | a `gemma3` arrival, already routed: [npu.md](npu.md) has the row `gemma3` / `medgemma-1.5-4b-it-NPU2` / hrx / not served, and `tests/census_watch_test.py` pins that pack to `Gemma3ForCausalLM` | an NPU row. `Medgemma-4B-NPU2` is on the box; its geometry (H 2560, IM 10240) needs two kernel shapes that are not built (`GU K2560 N20480`, `D K10240 N2560`), so it is a kernel-set item, not a model-type one |
+| `Nanbeige4.1-3B-NPU2` | `nanbeige4.1` | mapped: `registry/architectures.json` has `NanbeigeForCausalLM` (gguf `nanbeige`), `registry/census.json` counts it, `registry/support_pins.json` lists its converter config, and `q4nx_semantics.h` and [tokenizers.md](tokenizers.md) name `Nanbeige4.1-3B` itself (11 files) | an NPU row. Nothing on [npu.md](npu.md) says whether it serves there, and it has not been tried |
 
-| xclbin (FLM 1.0.12 HRX) | family root | state |
-|---|---|---|
-| `LFM2.5-1.2B` | `lfm2.5` | no row, no registry entry. We map `Lfm2ForCausalLM`, and `registry/significant.json` already carries the note *"lfm2-shaped config, different tensors"*, so a 2.5 generation is exactly the arrival this page exists to catch |
-| `LFM2.5-1.2B-Thinking` | `lfm2.5` | as above |
-| `Medgemma-1.5-4B` | `medgemma` | no row, no registry entry |
-| `Medgemma-4B` | `medgemma` | as above |
-| `Nanbeige4.1-3B` | `nanbeige4.1` | no row, no registry entry |
-| `Translategemma-4B-Instruct` | `translategemma` | no row, no registry entry |
+So: **one** family root with nothing (`translategemma`), and three that are mapped or served and owe a measured NPU row
+or nothing at all. The count of 48 "with a trace" was spot-checked, not re-derived, and after this correction it should
+be read as "at least 51".
 
-**These rows are un-inspected, and say so on purpose.** Nothing above describes what any of the four families computes: the
-xclbin names are evidence that *their* build carries a compiled family for it, and that is all. §1's five conditions are
-what converts an entry from *listed* to *settled* — imports with zero gaps and serving on the device, a known-answer prompt
-under the model's own template with three identical answers, decode tok/s and TTFT under a ticket, and the kernel set and
-engine commit named. Writing an architecture description from a model name is the defect this week has been about; a row
-that is honest about being un-inspected is more useful than a plausible paragraph.
+**The rows that are still owed are un-inspected, and say so on purpose.** Nothing above describes what `translategemma`
+or `nanbeige4.1` computes: an xclbin name is evidence that *their* build carries a compiled family for it, and that is
+all. §1's five conditions are what converts an entry from *listed* to *settled* — imports with zero gaps and serving on
+the device, a known-answer prompt under the model's own template with three identical answers, decode tok/s and TTFT
+under a ticket, and the kernel set and engine commit named. The two `lfm2.5` packs are the example of an entry that
+went from listed to settled that way.
 
-The `!! NPU FLM` class above is where these belong once someone owns it. As of this run that class has no owning issue.
+The `!! NPU FLM` class above is where the owed rows belong. Its owning issue is engine#1786 (every `*-NPU2` source
+serves), which is open.

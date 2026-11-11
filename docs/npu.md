@@ -1902,6 +1902,7 @@ does on a geometry that has a sealed set: `Qwen3-1.7B-NPU2` is 3.0 tok/s here an
 | `Qwen3-VL-4B-Instruct-NPU2`, text tower only | `qwen3` | identical, `Paris` | 1.4 to 1.5 tok/s |
 | `LFM2.5-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | identical, `Paris`; against FastFlowLM's runtime below | 3.5 to 4.6 tok/s |
 | `LFM2-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | identical, `Paris`; against FastFlowLM's runtime below | 3.7 to 4.3 tok/s |
+| `LFM2.5-1.2B-Thinking-NPU2` | `lfm2`, hybrid, thinking | identical; `Paris` after 287 reasoning tokens, no clean stop (below) | 4.3 tok/s |
 
 `D3-Nano-NPU2` is a decision pack: it loads on the `Qwen3.5-2B` kernel set, its readout converts with
 `tools/safetensors_to_q4nx.py decision`, and `/v1/systemone` returned three identical answers to the documented
@@ -1960,10 +1961,12 @@ against 42 to 47. Its logprobs at the three points were not taken. A later ticke
 packs the known-answer prompt three times each: `Paris`, identical, with decode at 4.2 to 4.3 tok/s; those four
 figures are records in `bench/npu-leaderboard/`.
 
-`LFM2.5-1.2B-Thinking-NPU2` loads on the same directory too: its template is read from the pack's
-`chat_template.jinja`, the reasoning is split out, and at 96 tokens every one of the five replies was still
-reasoning, so there is no answer text to compare and no row; the reasoning differs from FastFlowLM's from its
-first words.
+`LFM2.5-1.2B-Thinking-NPU2` serves on the same directory too: its template is read from the pack's
+`chat_template.jinja` and the reasoning is split out. Asked the known-answer prompt three times with 320 tokens
+of room, it reasoned for 287 tokens and then answered, the three replies identical in reasoning and content, at
+4.3 tok/s. The content begins `Paris` and does not end there: it goes on (`\boxed{Paris}`, then a restatement)
+until the token limit, so the row has the answer and not a clean stop. At 96 tokens, in the paired ticket, every
+reply was still reasoning, and the reasoning differed from FastFlowLM's from its first words.
 
 Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
 containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry

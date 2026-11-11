@@ -1,0 +1,28 @@
+{
+  "id": "lfm25-12b-thinking-perop-decode-20261111",
+  "host": "strixhalo",
+  "model": "LFM2.5-1.2B-Thinking-NPU2",
+  "route": "npu",
+  "quant": "Q4NX symmetric 4-bit tiles (FastFlowLM's published container, listed as Q4_0), per-op int8 GEMM, blocked family",
+  "metric": {
+    "name": "decode",
+    "value": 4.3,
+    "unit": "tok/s"
+  },
+  "settings": {
+    "device": "accel0",
+    "engine": "1bit built at the code of main 1131acf0 (engine#2170)",
+    "container": "FastFlowLM/LFM2.5-1.2B-Thinking-NPU2 model.q4nx, sha256 b9c4bacba8ed7251…, served as published; the only edit is \"q4nx_weight_layout\": \"b8\" in a copy of config.json",
+    "kernels": "full_i8 blocked: QKV K2048 N3072, QKV K2048 N6144 (the conv layers' in_proj), O K2048 N2048, GU K2048 N16384, D K8192 N2048, each with its M=16 twin",
+    "ticket": "npu-hold -l cl-flm-lfm25tk-row, 234 s",
+    "sampling": "temperature 0, max_tokens 320, not streamed",
+    "prompt_tokens": "the pack's own template (chat_template.jinja) on 'What is the capital of France? Answer with one word.'",
+    "load1": "10.1 at start, 13.0 at end",
+    "known_answer": "3 requests returned the same message three times: 287 reasoning tokens split into reasoning_content, then content that begins 'Paris' and runs to the token limit (finish_reason length)"
+  },
+  "instrument": "usage.completion_tokens over the server's own predicted_ms, 320 tokens per request; three requests, 4.30, 4.25 and 4.37 tok/s, the median",
+  "repeats": 3,
+  "timestamp": "2026-11-11T14:14:56Z",
+  "source": "~/.cache/scratch-cl-flm/rows-25tk.log and out-rows-lfm25tk/ on strixhalo (row-serve.sh + think-row.py, lane cl-flm; engine#1786)",
+  "notes": "The thinking variant of the LFM2.5 hybrid. What would make this wrong as a row: the reply does not stop after its answer inside 320 tokens, and FastFlowLM's runtime was not run at this budget, so whether that is the model or this route is not established; at 96 tokens in a paired ticket the reasoning already differed from FastFlowLM's from its first words."
+}

@@ -4718,6 +4718,17 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // Census yes, writer no (see the note where graph_weights is decided): this genre's weights are 1-D external-data
     // blocks, and until the repacker exists an import would write a container nothing can read. Refused here rather
     // than in plan(), because `info` must keep reporting the genre it can now see.
+    // engine#1786 (item F1) / engine#1788: a container-genre pack has no `model.onnx` by design, so without a branch here
+    // the first byte fails with "cannot open <pack>/model.onnx" -- a missing-file message about a pack that has no graph
+    // at all. Refused by name, the same way the external-data genre below is, until the container-genre writer exists;
+    // `info` keeps reporting what the container holds, which is how the roles get to anyone building that writer.
+    if (p.container_tensors >= 0) {
+        throw std::runtime_error(
+            "this pack is a safetensors container (model.q4nx): " + std::to_string(p.container_tensors) +
+            " tensor(s), " + std::to_string(p.container_roles_unassigned.size()) +
+            " name(s) nothing knows; importing it needs the container-genre writer (engine#1786, item F1), which the "
+            "importer does not have yet. `1bit npu-pack info` reports what the container holds");
+    }
     if (p.graph_packed_siblings > 0) {
         // The genre has a writer now (engine#1503): decode -> convert -> split by role -> the same I8 tile chunks,
         // with its own function because import_pack is built around the .fconst envelope.

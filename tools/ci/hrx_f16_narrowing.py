@@ -71,6 +71,24 @@ def narrowing_bodies(corpus):
     return found
 
 
+# Every `fptrunc` narrows to something, so one whose type pair neither NARROW nor KNOWN_NON_F16 recognises is a
+# spelling this tool does not know yet. It fails rather than passing silently, the way the vector form did
+# (engine#2219): a new spelling is classified by extending one of the two patterns, never by omission.
+FPTRUNC = re.compile(r"\bfptrunc\b")
+KNOWN_NON_F16 = re.compile(r"\bbf16\b|xbf16>")
+
+
+def unclassified_truncations(corpus):
+    """`fptrunc` lines that are neither an f32 -> f16 narrowing nor a known non-f16 target, as (path:line, text)."""
+    out = []
+    for path in sorted(corpus.rglob("*.loom")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for number, line in enumerate(text.splitlines(), 1):
+            if FPTRUNC.search(line) and not NARROW.search(line) and not KNOWN_NON_F16.search(line):
+                out.append((f"{path.relative_to(corpus).as_posix()}:{number}", line.strip()))
+    return out
+
+
 def guarded(bodies, corpus):
     """Bodies that also carry a producer-side guard marker -- reported, never asserted."""
     out = set()
@@ -95,14 +113,19 @@ def check(root):
     found = narrowing_bodies(corpus)
     new, stale = drift(baseline, found)
     guard = guarded(found, corpus)
+    unknown = unclassified_truncations(corpus)
+    for where, text in unknown:
+        print(f"hrx_f16_narrowing: UNCLASSIFIED fptrunc at {where}: {text} -- its type pair matches neither the f16 "
+              f"patterns nor a known non-f16 target; extend NARROW or KNOWN_NON_F16 (engine#2219)")
     for rel in new:
         print(f"hrx_f16_narrowing: NEW narrowing body {rel} -- it narrows an f32 value to f16 and the "
               f"baseline does not name it; add the line and say what feeds it (engine#1962)")
     for rel in stale:
         print(f"hrx_f16_narrowing: {rel} is in the baseline but no longer narrows -- drop the line, the "
               f"list should shrink")
-    if new or stale:
-        print(f"hrx_f16_narrowing: FAIL ({len(new)} new, {len(stale)} stale of {len(baseline)})")
+    if new or stale or unknown:
+        print(f"hrx_f16_narrowing: FAIL ({len(new)} new, {len(stale)} stale of {len(baseline)}, "
+              f"{len(unknown)} unclassified fptrunc)")
         return 1
     print(f"hrx_f16_narrowing: {len(baseline)} narrowing body(ies), none new, none stale; "
           f"{len(guard)} of them carry a guard marker" +
@@ -154,6 +177,12 @@ def self_test():
         (corpus / "t.loom").write_text("  %t = scalar.truncf %v : f32\n  %u = vector.truncf %w : vector<4xf32>\n")
         new, _ = drift(baseline_paths((root / BASELINE).read_text()), narrowing_bodies(corpus))
         check_that("t.loom" not in new, "a truncf that stays in f32 is not a narrowing")
+        check_that(unclassified_truncations(corpus) == [],
+                   "an f16 and a bf16 fptrunc are both classified")
+        (corpus / "x.loom").write_text("  %h = vector.fptrunc %v : vector<[4]xf32> to vector<[4]xf16>\n")
+        check_that([w for w, _ in unclassified_truncations(corpus)] == ["x.loom:1"],
+                   "an fptrunc spelling the patterns do not know fails as unclassified, not silently")
+        (corpus / "x.loom").unlink()
         (corpus / "v.loom").unlink()
         (corpus / "w.loom").unlink()
         (corpus / "t.loom").unlink()

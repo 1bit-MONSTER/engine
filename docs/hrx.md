@@ -981,6 +981,20 @@ at every prompt shape measured (3, 8, 12, 40, 100 and 1,700 tokens, with and wit
 sizes: 8.9 % at 8 tokens, 5.3 % at 12 and 6.9 % at 16 (interleaved, quiet box), which is 2 to 3 ms on a short prompt. Perplexity
 at a 12-token batch is 59.0414 before and 59.0417 after. An uploaded weight keeps the i8 kernel.
 
+**Decode is not affected by the default.** Default against both switches at `0`, alternated in one ticket at pin `0494dfa28`:
+
+| `llama-bench` | both switches `0` | default |
+|---|---|---|
+| Qwen3.8-27B UD-Q4_K_XL, `-p 0 -n 48 -r 3`, four arms each | 11.21, 11.89, 11.91, 11.86 tok/s | 11.92, 11.91, 11.91, 11.91 tok/s |
+| Qwen3.8-27B UD-Q4_K_XL, `-p 1700`, warm arms | 318.8, 303.2 tok/s | 318.5, 316.3 tok/s |
+| Qwen3-4B Q4_K_M, `-p 1700 -n 48 -r 2`, two arms each: decode | 74.83, 76.12 tok/s | 74.39, 74.47 tok/s |
+| Qwen3-4B Q4_K_M, the same runs: prefill | 2,338.6, 2,351.4 tok/s | 2,416.9, 2,370.9 tok/s |
+
+On the 27B the two are the same to 0.5 %. On the 4B decode reads 1.4 % lower with the default in these four runs, which is the
+size of the spread between the two control runs. A 27B decode figure taken right after a 1,700-token prefill varies between runs
+(8.1 to 11.8 tok/s with the default, 7.6 to 11.5 with the switches at `0`), so compare decode with `-p 0`.
+`GGML_HRX_Q4K_PACKED_TAIL=0 GGML_HRX_Q6K_PACKED_ROWS=0` restores the previous behaviour.
+
 **A dense mixed-quant 27B still holds some weights twice.** Qwen3.8-27B UD-Q4_K_XL after a 1,700-token prompt and a reply: 920
 device copies, 18,205.2 MiB, with 70 weights in two layouts (2,486.7 MiB of duplicate; 88 weights and 2,621.5 MiB with both
 switches at `0`). On that model the one-token decode kernels read the stored layout by design and some prefill kernels read only

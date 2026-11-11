@@ -68,6 +68,14 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
   npu/                   the model's NPU kernels
 ```
 
+The NPU route reads `tokenizer.json` with its own reader (`npu/tokenizer.cpp`). Four vocabulary shapes are handled:
+byte-level BPE; SentencePiece pieces with no merges; SentencePiece pieces with merges and a normalizer that prepends
+the word-boundary symbol (Phi-3.5); and BPE with merges whose normalizer only rewrites spaces to that symbol and
+prepends none (the Gemma family, engine#2215). The last one is encoded by rank over the whole run with no prefix, and
+the symbol decodes back to a space. Before that shape was recognised a Gemma4 prompt encoded to 31 ids where the
+reference library gives 21, and replies kept the raw symbols. With `-DONEBIT_GEMMA_TOKENIZER=<tokenizer.json>` ctest
+`tokenizer_gemma4` holds the reader to the 17 reference cases kept for that file (2 of 17 before, 17 of 17 now).
+
 **What ends an answer.** The serve stops on every id in `config.json`'s `eos_token_id` (one integer or a list), on
 `<|endoftext|>` when the tokenizer has it, on `tokenizer_config.json`'s `eos_token` when that file is beside the
 tokenizer, and on the marker the chat route's prompts close an assistant turn with: `<|im_end|>` on the ChatML
@@ -1425,6 +1433,26 @@ one bf16 ulp in a few elements, so both look like a gain), so it was taken from 
 graph: `model.onnx` carries `attn.q_norm.layernorm.weight` and `attn.k_norm.layernorm.weight` as
 FP16 `[128]` initializers, and on Hunyuan-7B-Instruct their bf16 rounding is the first and the
 second block bit for bit in 32 of 32 layers. `qk_gain_offsets()` holds that arithmetic.
+
+The same gap exists when q_proj is wider than hidden. Hunyuan-0.5B-Instruct (hidden 1024, 16 heads
+of 128, so q_proj has 2,048 rows) has `[64 q/k/v tiles at K=1024][640 B][16 o_proj tiles at
+K=2048]`, and its graph's gains are in that gap in the same order in 24 of 24 layers (q_norm at
+block offset 2,508,928, k_norm 320 B later). `wide_q_attn_section()` holds that division and names
+the gains; before it did, this pack was refused as declaring gains the layout did not hold.
+
+Where the gains are, by layout, in one place: a 4-header block keeps them in their own two sections,
+k first (Qwen3, above); a 2-header block keeps them in the 640 B gap between q/k/v and o_proj, q
+first, whether o_proj's K is hidden (Hunyuan-7B, Hy-MT2-1.8B) or q_proj's width (Hunyuan-0.5B). A
+pack that declares `use_qk_norm` and has them in none of these is refused (`qk_norm_refusal()`).
+The gap's offsets are block arithmetic, one number for every layer, so the import checks each
+layer's bytes to be `[64 B zeros][finite gain][64 B zeros][finite gain]` (`qk_gap_block_why()`)
+and refuses a layer that is not, by name, instead of writing whatever is there.
+
+Hunyuan-0.5B's first payload is in the order q, k, v, like Hunyuan-7B's (`Plan::attn_q_first`).
+Checked against `tencent/Hunyuan-0.5B-Instruct` on the host: read as k, q, v, q_proj and k_proj
+correlate 0.01 with the checkpoint in layers 0, 11 and 23; read as q, k, v they correlate 0.96 to
+0.99, and in chat format the container picks the checkpoint's next token at 39 of 42 positions
+(mean KL 0.030 nats).
 
 **Every tile read is its own check.** Before anything is written, each tile is decoded and
 re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That
@@ -2867,6 +2895,20 @@ can fail a run.
 `[ops-dump] NPU_INFER_DUMP_OPS is on: …` once at model load, before any request (engine#2028). A run that sets the
 variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
 looking for a code path that skips the dump.
+
+**A projection that is right on the host and wrong on the device: check its weight-cache key.** The device target
+keeps one packed weight image per (layer, key), and the host arms do not use that cache. Two projections of one layer
+under one key therefore launch with the same weights on the NPU only: a Gemma4 pack answered correctly in host-GEMM
+mode and returned noise on the device, with every kernel bit-exact, because its per-layer input gate and projection
+used the attention projections' keys (engine#2213). `NPU_INFER_DUMP_OPS=1` on both sides showed it in one token: the
+op lines agree up to the first projection that shares a key. A layer's keys are named in
+`npu/forward/include/weight_keys.h` and held distinct at compile time; a new projection takes a new name there.
+
+A caller inside the process that needs the same stream as data, not files, uses
+`Q4nxNpuForward::set_layer_taps(layers, &sink)` (engine#1780): every pass then appends one row per position to the
+sink, `taps x H` wide, the listed layers side by side. It works for `step()` and for the batched passes, and it is what
+a DFlash draft's `target_layer_ids` are read with (docs/amd-drafters.md). Layer `l`'s block is the stream after layer
+`l`, the same point `layer_<ll>.f32` records; `layer_taps_model_test` holds the two to each other bit for bit.
 
 The files these dumps write (`NPU_INFER_DUMP_DIR`'s `layer_<ll>.f32`, `NPU_I8_GS_DUMP`'s weight-scale pairs) are
 created owner-only (0600) and never through a symlink at the final path component, whatever the umask, and a dump file

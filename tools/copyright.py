@@ -51,6 +51,9 @@ LINE_STYLES = [
       # engine#2018: the test-registration baseline of `tests/*_test.py`, same shape and the same reason -- data,
       "unreferenced_py_tests.txt",
             "hrx_f16_narrowing.txt",
+            # engine#2186: the accumulator baseline of `tools/ci/hrx_f16_narrowing.py --write`, same shape and the same
+            # reason -- data, `.txt` has no comment style of its own, and the notice is already at the top of the file.
+            "hrx_f16_accumulators.txt",
       # engine#2027: the `#`-comment baseline for hardcoded /tmp paths, same shape and the same reason --
       # data, `.txt` has no style, and the notice it wants is already at the top of the file.
       "tmp_paths.txt",
@@ -229,7 +232,12 @@ def near_miss_holder(line):
     return n >= HOLDER_NEAR_MISS_PREFIX
 
 
-_CANON_LINES = {re.sub(r"^\W+", "", n).strip() for n in NOTICE}
+# The licence block's own blank comment lines (`#`, `//`) reduce to "", so a set built from every NOTICE line held the
+# empty string, and canonical_notice_line() said yes to every blank or bare-comment line in a file. add_notice() then
+# deleted each one in the header window (the separator after the description, the blank lines between #include groups
+# and after `namespace {`), and repair_notice()'s doubled-block dedupe deleted every blank line after the first in the
+# whole file. Only lines with words in them can be a claim, so only those are canonical.
+_CANON_LINES = {k for k in (re.sub(r"^\W+", "", n).strip() for n in NOTICE) if k}
 
 
 def canonical_notice_line(line):
@@ -241,7 +249,8 @@ def canonical_notice_line(line):
     cover it by construction: it returns False for an exact holder, because an exact holder next to the canonical block
     is the *repaired* state. The block already contains both lines, so a copy inside the window is not a second claim.
     """
-    return re.sub(r"^\W+", "", line).strip() in _CANON_LINES
+    key = re.sub(r"^\W+", "", line).strip()
+    return bool(key) and key in _CANON_LINES
 
 
 def repair_notice(text, block):

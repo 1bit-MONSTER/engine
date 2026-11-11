@@ -69,6 +69,9 @@ struct Geometry {
     // and every row past it is zero in every block, else the tensors' own. A forward may stop at these; it must
     // still index the tensors at `intermediate` / `vit_merger_intermediate`.
     int model_intermediate = 0, model_vit_merger_intermediate = 0;
+    // The block after which the vit_merger runs: config.json's `insert_layer_id` (the reference's default, 6, when the
+    // config does not say). A value that is not a block of this tower is refused.
+    int insert_layer = 6;
 };
 
 class Pack {

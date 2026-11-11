@@ -110,6 +110,13 @@ int main(void) {
     check(strstr(q4nx_semantics_field(Q4NX_SEM_QK_NORM), "use_qk_norm") != NULL,
           "the startup line names use_qk_norm as the flag's source");
 
+    /* The missing-gain refusal is about attention layers. LFM2: q/k norm on, layer 0 a short-convolution layer with no
+     * attention and so no q_norm. Applied to every layer, the rule refused both LFM2 packs at load. */
+    check(q4nx_qk_gain_missing(1, 1, 0) == 1, "q/k norm on, an attention layer with no q gain: refused (the engine#1889 case)");
+    check(q4nx_qk_gain_missing(1, 1, 1) == 0, "q/k norm on, an attention layer with its gain: fine");
+    check(q4nx_qk_gain_missing(1, 0, 0) == 0, "q/k norm on, a layer with no attention and no gain: not a refusal (LFM2's conv layers)");
+    check(q4nx_qk_gain_missing(0, 1, 0) == 0, "q/k norm off: no gain is expected anywhere");
+
     char path[512];
     snprintf(path, sizeof path, "%s/config.json", dir);
     unlink(path);

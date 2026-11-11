@@ -262,6 +262,15 @@ int q4nx_rmsnorm_offset_from_norm(const float* w, int n);
  * off: a family the table knows keeps its answer whatever the tensors are. Exported so the rule is testable. */
 int q4nx_semantics_qk_norm_from_tensors(Q4nxSemantics* s, const unsigned char* has_q, const unsigned char* has_k, int layers);
 
+/* engine#1889's refusal, as a rule: with q/k norm on, a layer whose q gain is absent would normalise q to zero, so the
+ * container is refused. That is a statement about ATTENTION layers. A layer with no attention at all carries no
+ * q_norm because it has no q: ten of LFM2's sixteen layers are gated short convolutions, layer 0 among them, and the
+ * rule applied to every layer refused both LFM2 packs at load with "layer 0 has no self_attn.q_norm.weight".
+ * Returns 1 when layer l must be refused. Exported so the rule is testable with no model present. */
+static inline int q4nx_qk_gain_missing(int qk_norm, int layer_has_attention, int q_gain_present) {
+    return qk_norm && layer_has_attention && !q_gain_present;
+}
+
 /* attention.mode for one container, from the two places that can state it (engine#796).
 
  * A d3 pack declares the mask it was trained with in its own `decision_config.json`

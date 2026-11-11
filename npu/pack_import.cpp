@@ -407,10 +407,16 @@ OnnxModel parse_onnx(const std::string& path) {
             continue;
         }
         if (!w) { kept.push_back(mm); continue; }   // names nothing this graph declares: not this genre's business
+        // Two spellings of the placeholder: 1.9 names it `<w>.empty` beside `<w>.packed`; the 1.8 hybrid line names the
+        // node's own `<w>` as the `[0]` placeholder beside `<w>.packed` (Llama-3.2-1B-Instruct_rai_1.8.0_hybrid: all 162
+        // `.MatMulNBits.*` initializers dims [0] and no data, the weights in model.bin). Missing the second spelling kept
+        // the node as a real weight, so `info` reported every projection importable and `import` died on
+        // `...MatMulNBits.bias: no data` (engine#1503).
         std::string packed = w->name;
         if (packed.size() >= 6 && packed.compare(packed.size() - 6, 6, ".empty") == 0)
             packed.replace(packed.size() - 6, 6, ".packed");
-        else { kept.push_back(mm); continue; }
+        else
+            packed += ".packed";
         const OnnxTensor* pw = find_init(packed);
         // No sibling at all: not this genre's pack. Keep the node exactly as it was -- it still names its `*.empty`
         // initializer and the reader below decides what that means. Dropping it here would be a decision made by an
@@ -3596,7 +3602,12 @@ Plan plan(const std::string& pack_dir) {
             pack_dir + ": " + onnx.weightless_example +
             ", and the pack carries no Token .fconst either (no dd_metastate_Llm_Token_*.fconst): these weights are "
             "genuinely absent from the pack's external data, so this pack cannot be imported -- not a tile-layout or "
-            "block-size problem");
+            "block-size problem" +
+            // The 1.8 hybrid line keeps them in a `model.bin` beside the graph (1.3 GB on Llama-3.2-1B-Instruct), a
+            // container this importer does not read; saying where they are is what tells a reader which work is missing.
+            std::string(fs::exists(pack_dir + "/model.bin")
+                            ? ". This pack's weights are in its model.bin, which this importer does not read (engine#1503)"
+                            : ""));
     const bool no_fconst = tok_path.empty();
     // The 1.9 external-data genre (phi-4: 201 `MatMulNBitsBf` ops whose bytes are `*.qweight.packed` siblings in
     // `eager-mm.onnx.data`) must NOT ride the graph-weights path below, which was written for the 1.3/1.6/1.7.1 line's

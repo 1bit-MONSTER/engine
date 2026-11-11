@@ -1350,6 +1350,40 @@ void test_crafted_refusals(const std::string& root) {
     }
     check(!fs::exists(dir / "out3" / "model.qnx") && !fs::exists(dir / "out3" / "model.q4nx"),
           "crafted: nothing written for the empty .packed sibling");
+
+    // 4. engine#1503: the 1.8 hybrid spelling of the same thing. The node names `<w>` ITSELF as the [0] placeholder (no
+    // `.empty` suffix) beside an equally empty `<w>.packed`, and the weights are in a model.bin next to the graph
+    // (Llama-3.2-1B-Instruct_rai_1.8.0_hybrid: all 162 `.MatMulNBits.*` initializers are this shape). Before the fix the
+    // walker only knew the `.empty` spelling, kept the node as a real weight, `info` called every projection importable
+    // and `import` died much later on `...MatMulNBits.bias: no data`.
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {8, 8}, "model.onnx.data", 0, 256),
+                        pb::tensor("rai18_qweight", {0}, "", 0, 0),
+                        pb::tensor("rai18_qweight.packed", {0}, "", 0, 0),
+                        pb::tensor("rai18_scales", {0}, "", 0, 0),
+                        pb::tensor("rai18_zeros", {0}, "", 0, 0)},
+                       {pb::matmulnbits("mm", {"x", "rai18_qweight", "rai18_scales", "rai18_zeros"}, 64, 512, 4, 128)}));
+    put_file((dir / "model.bin").string(), std::string(64, '\0'));
+    try {
+        (void)pi::plan(dir.string());
+        check(false, "crafted 1.8: a [0] qweight with an empty .packed sibling was refused");
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        std::printf("  crafted 1.8 placeholder refusal: %s\n", what.c_str());
+        check(what.find("rai18_qweight (its rai18_qweight.packed sibling carries no data either)") != std::string::npos &&
+                  what.find("genuinely absent") != std::string::npos,
+              "crafted 1.8: plan() refuses by name, naming the placeholder and its sibling (" + what + ")");
+        check(what.find("weights are in its model.bin") != std::string::npos,
+              "crafted 1.8: and says where the weights are when a model.bin is there (" + what + ")");
+    }
+    fs::remove(dir / "model.bin");
+    try {
+        (void)pi::plan(dir.string());
+        check(false, "crafted 1.8 without model.bin: refused");
+    } catch (const std::exception& e) {
+        check(std::string(e.what()).find("model.bin") == std::string::npos,
+              "crafted 1.8: no model.bin, so the refusal does not claim one (" + std::string(e.what()) + ")");
+    }
     fs::remove_all(dir);
 }
 

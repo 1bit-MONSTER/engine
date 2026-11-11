@@ -172,6 +172,11 @@
    "model_type": "deepseek_v4_flash_superexpert",
    "family": "DeepSeek V4.1 Flash SuperExpert, published as remote code and with AW-SECD-compressed weights (8.5 GB, claimed 0.962 retention); MLA-style geometry (kv_lora_rank 512, q_lora_rank 1536, qk_rope_head_dim 64, v_head_dim 128, 32 heads / 16 KV, IM 4096). Not an alias of deepseek_v41: nothing at the pin decodes AW-SECD weights, so mapping it would name a backend that cannot read it",
    "watch": "report"
+  },
+  "OpensciForCausalLM": {
+   "model_type": "opensci",
+   "family": "OpenSci (1.7B 'nemotron-hq' recipe). A REMOTE-CODE class: its config carries an auto_map pointing at modeling_opensci.py / configuration_opensci.py, so the pinned backends cannot accept the architecture without that custom code. Not an alias of any supported family, and not mappable until the code is vendored or upstreamed.",
+   "watch": "report"
   }
  }
 }

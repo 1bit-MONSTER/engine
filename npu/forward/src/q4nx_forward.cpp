@@ -54,6 +54,8 @@
 #include "q4nx_dequant.h"
 #include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
 #include "q4nx_semantics.h"
+#include "quant_i8.h"
+#include "q4nx_host_head.h"
 #include "q4nx_pack.h"
 #include "q4nx_head_image.h"   // the lm-head tile cache (engine#1716)
 
@@ -187,7 +189,7 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
     const size_t n = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
     if (n == 0) return -1;
     const int cb = (int)(nbytes / n);
-    if (cb == Q4NX_TILE_BYTES || cb == Q4NX_CHUNK_Q4K || cb == Q4NX_CHUNK_Q8)
+    if (cb == Q4NX_TILE_BYTES || cb == Q4NX_CHUNK_Q4K || cb == Q4NX_CHUNK_Q8 || cb == Q4NX_CHUNK_Q4S)
         return q4nx_dequant_tensor_chunked((const uint8_t*)data, nbytes, rows, cols, cb, out);
     // The container may store this weight on a wider grid than the model's dimensions (engine#1097).
     // Read it on the container's grid and write only the model's [rows, cols], so buffers, row
@@ -202,9 +204,10 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
 // transformers' _compute_llama3_parameters applies.  `on == 0` unless the config names the type, so
 // every other architecture builds exactly the table it built before.  Keys are searched with their
 // quotes, which is what keeps "factor" from matching inside "high_freq_factor".
-// Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`. Hunyuan's
-// 1.9 packs declare factor 1.0 with a 262,144 window, i.e. a no-op until a prompt passes that window -- which is why
-// accepting it is safe rather than a guess: below the window the base IS theta, so the served bytes are plain rope.
+// Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`: below the
+// window the base IS theta, so a block with factor 1.0 serves plain rope. Hunyuan's 1.9 packs declare that AND
+// `alpha: 1000.0`, which is a different rule (a fixed base theta * alpha^(dim/(dim-2)), engine#1889): reading only
+// the factor made their block a no-op and rotated every position by the wrong angle.
 Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
     Q4nxRopeDynamic d{};
     std::ifstream f(cfg_path);
@@ -221,7 +224,10 @@ Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
     };
     d.factor = number("factor");
     d.original_max_position = number("max_position_embeddings");
-    d.on = (d.factor > 0.0 && d.original_max_position > 0.0) ? 1 : 0;
+    // engine#1889: `alpha` selects Hunyuan's fixed-base form (q4nx_rope.h). The key is searched with its quotes and its
+    // colon, so "lora_alpha" or an "alpha" inside a string value cannot be taken for it.
+    d.alpha = number("alpha");
+    d.on = ((d.factor > 0.0 && d.original_max_position > 0.0) || d.alpha > 0.0) ? 1 : 0;
     return d;
 }
 
@@ -1782,6 +1788,22 @@ bool Q4nxNpuForward::load_norms() {
         layer_attn_dims(l, hd_l, nkv_l);
         if (!read_bf16(&mw_->layers[l].input_layernorm_weight, in_norm_[l].data(), H)) return false;
         if (!read_bf16(&mw_->layers[l].post_attention_layernorm_weight, post_norm_[l].data(), H)) return false;
+        // engine#1889: the config says q and k are normalised and this layer has no gain to normalise with. read_bf16
+        // would hand back zeros for the absent tensor and rmsnorm(q, 0) is 0 for every head, so the layer would attend
+        // uniformly and answer fluent nonsense. A Hunyuan container imported before the importer claimed the gains is
+        // exactly this shape, so it is refused by name here instead.
+        // Only a layer with softmax attention has a q to normalise, so only such a layer can miss its gain. LFM2's
+        // short-convolution layers have no attention at all, and a qwen3_5 linear-attention (GDN) layer has no
+        // self_attn.q_norm either (18 of Qwen3.5-2B's 24 layers, layer 0 among them): the test is the one the step
+        // bodies use to send a layer to gdn_layer() or conv_layer() instead of the attention path.
+        const bool gdn_l = lin_kd_ > 0 && l < sem_.n_layer_types && sem_.layer_types[l] == Q4NX_LAYER_LINEAR;
+        if (q4nx_qk_gain_missing(sem_.qk_norm, !is_conv_layer(l) && !gdn_l, !absent(&mw_->layers[l].q_norm_weight))) {
+            err_ = "config.json says q and k are normalised per head (" +
+                   std::string(q4nx_semantics_field(Q4NX_SEM_QK_NORM)) + ") and layer " + std::to_string(l) +
+                   " has no self_attn.q_norm.weight: normalising with an absent gain zeroes q, so this container "
+                   "would answer wrong text (engine#1889); re-import the pack with a build that carries the gains";
+            return false;
+        }
         if (!read_bf16(&mw_->layers[l].q_norm_weight, q_norm_[l].data(), hd_l)) return false;
         // Qwen2.5-style attention biases (q/k/v projection biases); absent on the
         // bias-free families, so a miss is not an error.  Loaded BEFORE the k_norm
@@ -2041,12 +2063,22 @@ bool Q4nxNpuForward::load_layer(int l) {
     // copies of the big projections are never needed: skipping them here is the
     // difference between a first token that dequantises the whole 17.9 GB model and
     // one that opens 13.4 GB of images.  The norms and every small member still load.
+    // The four attention f32 buffers (wq_/wk_/wv_/wo_) are read only by q4nx_assemble_B(), which step() and
+    // step_batch() skip once this layer's packed QKV (key 0) and O (key 1) images are on the device -- the
+    // same argument as ffn_tail_cached() for the MLP and proj_cached for a GDN layer. A dense model never
+    // gets here on a cached layer (step()'s `dense_weights_cached`), but a hybrid one does on every token:
+    // its full-attention layers re-dequantised q, k, v and o each decode step, 17.5 ms of a 285 ms token on
+    // Qwen3.5-2B (6 of 24 layers), for buffers nothing read (engine#1785). BOTH keys must be cached:
+    // step_batch() guards its O assemble with the QKV key, so a half-cached layer still loads everything.
+    // NPU_ATTN_RELOAD=1 keeps the old per-token reload, for the A/B.
+    static const bool attn_reload = getenv("NPU_ATTN_RELOAD") != nullptr;
+    const bool attn_cached = !attn_reload && !host_gemm_ && xd_ && xd_->weight_cached(l, 0) && xd_->weight_cached(l, 1);
     if (is_conv_layer(l)) {
         // LFM2 conv layer: two projections where an attention layer has four. Same f32-until-packed rule.
         LhScope _t_p(LH_LOAD_PROJ);
         if (!deq(&lw->shortconv_in_proj_weight, wqkvlin_.data(), 3 * H, H)) return false;
         if (!deq(&lw->shortconv_out_proj_weight, woutlin_.data(), H, q4nx_pad_k(H))) return false;
-    } else if (!xd_->pb16i()) {
+    } else if (!xd_->pb16i() && !attn_cached) {
         if (!deq(&lw->q_proj_weight, wq_.data(),
                  NH * hd * (attn_gate_ ? 2 : 1), kpad_)) return false;   // q|gate rows
         if (!kv_shared) {
@@ -4825,7 +4857,11 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
 
     // per-head RMSNorm on q and k, only for architectures that have it.  A KV-shared
     // layer (Gemma4) computed no k at all, so its k is never normalized or used.
-    if (sem_.qk_norm) {
+    // engine#1889: WHERE it runs is per family. Qwen3 and Gemma normalise and then rotate; Hunyuan's graph rotates
+    // and then normalises (q_proj -> RotaryEmbedding -> q_norm -> attention), so for it the same code runs after the
+    // RoPE block below. The RMS itself is rotation-invariant; the per-dimension gain is not, so the order matters
+    // wherever a rotary pair's two gains differ.
+    auto qk_normalise = [&]() {
         std::vector<float> t(HD);
         for (int h = 0; h < NH; h++) {
             rmsnorm(&q[(size_t)h * HD], q_norm_[cur_layer_].data(), HD, t.data(), "q_norm");
@@ -4837,7 +4873,8 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
                 memcpy(&k[(size_t)h * HD], t.data(), sizeof(float) * HD);
             }
         }
-    }
+    };
+    if (sem_.qk_norm && !sem_.qk_norm_after_rope) qk_normalise();
     // Gemma4 normalises v with a SCALE-FREE RMSNorm (its v_norm has no weight).
     if (sem_.v_norm && append_kv) {
         std::vector<float> tv(HD);
@@ -4857,7 +4894,8 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         std::vector<float> cos_(half), sin_(half);
         // Dynamic NTK: the base moves with the position, so it is one pow per position rather than one per dim pair.
         // Below the model's original window this returns theta unchanged, which is what makes a short prompt
-        // bit-identical to the same model served without the scaling.
+        // bit-identical to the same model served without the scaling. A block with `alpha` (Hunyuan) is the fixed
+        // base theta * alpha^(dim/(dim-2)) at every position instead (engine#1889).
         // engine#1792 review: the exponent is HF's `dim / (dim - 2)` over the ROTARY width (`dim = int(head_dim *
         // partial_rotary_factor)`), which is `rot` here -- passing `HD` was wrong for any model that declares dynamic
         // scaling together with partial_rotary_factor < 1. Unreachable in today's catalog, so this is a correctness
@@ -4904,6 +4942,7 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         for (int h = 0; h < NH; h++) rot_half(&q[(size_t)h * HD]);
         for (int h = 0; h < NKV; h++) rot_half(&k[(size_t)h * HD]);
     }
+    if (sem_.qk_norm && sem_.qk_norm_after_rope) qk_normalise();
 
     // append to cache (a KV-shared layer reuses its owner's, which the owner has
     // already appended earlier in this same step).
@@ -5969,6 +6008,99 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             std::chrono::steady_clock::now() - hh0).count();
         xd_->add_hadamard_cost(had_ms, 1);
         head_got.assign((size_t)T, 0.0f);
+    }
+    // ---- the int8 head on the host (engine#1785), NPU_HEAD_HOST=1 ---------------------------------------
+    // A decode step is ONE row, and a launch costs the same weight pass for one row as for 128, so the
+    // head's launches are the most expensive way to use the device: 21 launches, 65 ms of each token on a
+    // 248,320 x 2,048 head, against a few ms for the same sums on the host. Nothing is approximated: the
+    // activation codes come from the device path's own quantiser (q4nx_quant_i8::row, the amax/127 scale
+    // below), the weight codes are read from the very image the device reads (the resident BO's host
+    // mapping), the sums are int32, and the epilogue is the loop below's, term for term. The tiles are
+    // independent, so they are split over a few threads (NPU_HEAD_HOST_THREADS, default 4, at most 16).
+    // A tile the kernel refuses (a geometry with no image) sends the whole head to the device as before.
+    // NPU_HEAD_HOST=alt is the measuring form: calls alternate host, device, host, ... in ONE serve, and each
+    // call logs the previous one's head time and the time from its end to this call (the layers of the token in
+    // between). Two serves on a shared box differ by more than the head costs; adjacent tokens of one serve do not.
+    static const int head_host_mode = [] {
+        const char* e = getenv("NPU_HEAD_HOST");
+        if (!e) return 0;
+        if (e[0] == '1' && e[1] == 0) return 1;
+        return std::strcmp(e, "alt") == 0 ? 2 : 0;
+    }();
+    static long head_calls = 0;
+    const bool head_host = head_host_mode == 1 || (head_host_mode == 2 && (head_calls % 2) == 0);
+    struct HeadAb {
+        bool on, host;
+        std::chrono::steady_clock::time_point t0;
+        ~HeadAb() {
+            if (!on) return;
+            static std::chrono::steady_clock::time_point prev_end{};
+            const auto t1 = std::chrono::steady_clock::now();
+            const double gap = prev_end.time_since_epoch().count()
+                                   ? std::chrono::duration<double, std::milli>(t0 - prev_end).count() : -1.0;
+            fprintf(stderr, "[head-ab] call=%ld head=%s head_ms=%.2f layers_before_ms=%.2f\n", head_calls, host ? "host" : "device",
+                    std::chrono::duration<double, std::milli>(t1 - t0).count(), gap);
+            prev_end = t1;
+            head_calls++;
+        }
+    } head_ab{head_host_mode == 2, head_host, std::chrono::steady_clock::now()};
+    if (head_host && head_packed && !head_pb16i && !lctx.gemv && H <= (int)lctx.KD && T <= (int)lctx.ND) {
+        const auto hh0 = std::chrono::steady_clock::now();
+        float amax = 0.0f;
+        for (int k = 0; k < H; k++) { float a = std::fabs(hs[(size_t)k]); if (a > amax) amax = a; }
+        const float as = amax > 0 ? amax / 127.0f : 1.0f;
+        std::vector<int8_t> a8((size_t)H);
+        q4nx_quant_i8::row(hs.data(), H, 1.0f / as, a8.data());
+        std::vector<const int8_t*> images((size_t)ntiles, nullptr);
+        bool mapped = true;
+        for (int t = 0; t < ntiles; t++) {
+            images[(size_t)t] = (const int8_t*)lm_head_packed_[(size_t)t].bo->map();
+            mapped = mapped && images[(size_t)t] != nullptr;
+        }
+        static const int head_threads = [] {
+            const char* e = getenv("NPU_HEAD_HOST_THREADS");
+            const int n = e ? atoi(e) : 4;
+            return n < 1 ? 1 : (n > 16 ? 16 : n);
+        }();
+        const int nthreads = std::min(head_threads, ntiles);
+        std::vector<char> tile_ok((size_t)ntiles, 0);
+        const bool blocked = lctx.blocked_b;
+        const int KD = (int)lctx.KD, ND = (int)lctx.ND;
+        auto work = [&](int w) {
+            std::vector<int32_t> acc((size_t)T);
+            for (int t = w; t < ntiles; t += nthreads) {
+                const int n0 = t * T, n1 = std::min(NV, n0 + T);
+                if (!q4nx_host_head::tile(images[(size_t)t], KD, ND, blocked, a8.data(), H, n1 - n0, acc.data())) continue;
+                const std::vector<float>& gs = lm_head_packed_[(size_t)t].scales;
+                for (int n = n0; n < n1; n++) {
+                    float v = (float)acc[(size_t)(n - n0)] * as * gs[(size_t)(n - n0)];
+                    if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                    logits[(size_t)n] = v;
+                }
+                tile_ok[(size_t)t] = 1;
+            }
+        };
+        bool all = mapped;
+        if (mapped) {
+            std::vector<std::thread> pool;
+            for (int w = 1; w < nthreads; w++) pool.emplace_back(work, w);
+            work(0);
+            for (auto& th : pool) th.join();
+            for (int t = 0; t < ntiles; t++) all = all && tile_ok[(size_t)t];
+        }
+        if (all) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hh0).count();
+            static bool said = false;
+            if (!said) {
+                said = true;
+                fprintf(stderr, "  [forward] lm head: on the host (NPU_HEAD_HOST=%s), %d tile(s), %d thread(s), first pass %.1f ms\n",
+                        head_host_mode == 2 ? "alt" : "1", ntiles, nthreads, ms);
+            }
+            if (xd_->profiling()) xd_->note_head(1, ms, 0.0, 0.0, 0.0);
+            if (ph) { g_ph.h_pack += ms; g_ph.h_total = ph_ms(hp0); g_in_head = false; }
+            return true;
+        }
+        fprintf(stderr, "  [forward] lm head: NPU_HEAD_HOST is set but the image cannot be read on the host; using the device\n");
     }
     for (int t = 0; t < ntiles; t++) {
         const int n0 = t * T, n1 = std::min(NV, n0 + T);

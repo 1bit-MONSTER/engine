@@ -1819,6 +1819,68 @@ route loads and a captured `--device npu` run stands behind it; the regenerated 
 GGUF-on-NPU forward), while every D3-* pack in this body declares the dense `qwen3_5` family, so
 the two are not the same answer and the registry keeps them apart.
 
+### FastFlowLM's own containers, served as published: measured rows (engine#1786)
+
+The tables above answer "does the registry map this family". This one answers a different question for the packs
+it lists: does FastFlowLM's own `model.q4nx`, with nothing converted, load and answer on `--device npu`. Each row
+is one `npu-hold` ticket on the dev box (2026-11-10/11), the pack's own chat template, temperature 0, and the
+question "What is the capital of France?" asked three times with thinking off unless noted; "identical" means
+the three replies were the same bytes. The answer is a sanity check, not a comparison with FastFlowLM's output.
+
+**Fused route** (the build shipped as `rc-2026-11-07`, which carries sealed sets for three dense Qwen3 geometries).
+Nothing is edited: `1bit serve -m <the pack directory as published> --device npu`, and the log says
+`on the private route dx … (…/npu/kernels/<set>)`.
+
+| pack | sealed set | ready | answer | decode on a 55 to 96 token reply |
+|---|---|---|---|---|
+| `Qwen3-0.6B-NPU2` | `1024x3072x16x8` | 2.4 s | identical, "The capital of France is Paris." | 64.0 tok/s |
+| `Qwen3-1.7B-NPU2` | `2048x6144x16x8` | 2.2 s | identical | 39.0 tok/s |
+| `Qwen3-4B-NPU2` | `2560x9728x32x8` | 12.4 s | identical | 9.4 tok/s |
+| `Qwen3-4B-Instruct-2507-NPU2` | `2560x9728x32x8` | 6.2 s | identical | 16.6 tok/s |
+| `Qwen3-4B-Thinking-2507-NPU2` | `2560x9728x32x8` | 5.1 s | with thinking on: `Paris`, reasoning split out | 16.2 tok/s |
+| `Qwen3-VL-4B-Instruct-NPU2`, text tower only | `2560x9728x32x8` | 2.8 s | with no `chat_template_kwargs`: `Paris` | 16.7 tok/s |
+
+The two `Qwen3-4B` rates were taken in different tickets at different box loads; the gap between them is not a
+model difference until a same-ticket pair says so. On the same array and the same `model.q4nx`, FastFlowLM 1.0.12's
+own runtime decoded `Qwen3-1.7B-NPU2` at 45.7 tok/s against 39.3 here, with time to first token level (0.59 s and
+0.57 s): one interleaved theirs, ours, ours, theirs ticket (engine#1787).
+
+On this route `enable_thinking: false` is wrong for two of the packs, because the route builds its own prompt and
+adds an empty think block whatever the pack's template says: `Qwen3-4B-Thinking-2507-NPU2` (a template that
+always thinks) returns its reasoning and a literal `</think>` as `content`, and `Qwen3-VL-4B-Instruct-NPU2` (a
+template with no thinking at all) answers with a refusal or an apology. Both are engine#2135, open.
+
+**Per-op route** (`forward-serve`). The pack needs a kernel set for its geometry in the blocked family, and one key
+in a copy of its `config.json`, `"q4nx_weight_layout": "b8"`; the container's bytes are untouched. Decode here is
+this route's speed, a small multiple of one token per second on these sizes (engine#2102), not what the array
+does on a geometry that has a sealed set: `Qwen3-1.7B-NPU2` is 3.0 tok/s here and 39.0 on the fused route.
+
+| pack | family | answer | decode |
+|---|---|---|---|
+| `Qwen3-1.7B-NPU2` | `qwen3` | identical, `Paris.` | 3.0 tok/s |
+| `Qwen3.5-2B-NPU2` (the `qwen3.5-flash:2b` tag) | `qwen3_5`, hybrid | identical, `Paris`; full row on engine#1785 | 2.7 to 3.4 tok/s |
+| `Llama-3.2-1B-NPU2` | `llama` | identical, `Paris`, stops on `<|eot_id|>` | 4.2 to 4.3 tok/s |
+| `Llama-3.2-3B-NPU2` | `llama` | identical, `Paris.` | 1.7 to 1.8 tok/s |
+| `Phi4-mini-Instruct-NPU2` | `phi3` | identical, `Paris`, once the turn end is read from the template (below) | 1.4 to 1.5 tok/s |
+| `Qwen3-VL-4B-Instruct-NPU2`, text tower only | `qwen3` | identical, `Paris` | 1.4 to 1.5 tok/s |
+
+`D3-Nano-NPU2` is a decision pack: it loads on the `Qwen3.5-2B` kernel set, its readout converts with
+`tools/safetensors_to_q4nx.py decision`, and `/v1/systemone` returned three identical answers to the documented
+example in about 1.1 s each. Its text routes answer 400 by design ("Decisions" below).
+
+Serving these packs as published is what found six engine faults, each fixed with the pack as its evidence:
+a turn-end marker named in `tokenizer_config.json` only (`Qwen3.5-2B`), or only in the template (`Phi4-mini`);
+a stream that was sent after the generation had ended; reasoning that the template's own generation prompt opens
+(`Qwen3.5-2B`); layout newlines returned around a reasoning block; and a 500 for a text request to a
+decision-only pack. "What ends an answer" and [npu-chat-template.md](npu-chat-template.md) describe the rules
+that came out of them.
+
+Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
+containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry
+has no kernel set on the box. Of the 57 `*-NPU2` repos with a readable geometry on 2026-11-11, 19 had all four
+dense kernel shapes already built in the blocked family; the families the forward may not model at all (`lfm2`,
+`hunyuan_v1_dense`, the multimodal towers) are a separate question from the shapes.
+
 ### Sealed kernel sets: the manifest is what says a set is ours
 
 A set ships as `<set>/layout.json`, `<set>/layer1_*/layer1.elf` (each `1BPKCRYP` ciphertext, opened

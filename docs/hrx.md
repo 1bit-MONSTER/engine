@@ -379,10 +379,37 @@ backend built from each commit, 2026-11-11): perplexity on wikitext-2 (`-c 512 -
 9.6681; `llama-bench -p 512 -n 32 -r 3`, alternated, prefill 1,437.1 and 1,532.6 tok/s against 1,616.9 and 1,605.7,
 decode 78.7 and 79.0 against 78.6 and 79.8. At `2b7960bae`: `test-hrx-ops` 256 of 256, `hrx-backend-test` host 69 of 69.
 
-Still open under #2127, not measured: the fused body publishes the gated product in half precision
-unscaled, and the other kernels that read the 8-bit blocks use the stored sum as it is. And the limits
-are moved, not removed: 4.19e6 for the half-precision copies and the draft-head logits, 8.3e6 for the
-8-bit blocks.
+The two faults left open under #2127 are fixed in the fork at `780d67524`, which the pin `4107043c1` contains
+([engine#2186](https://github.com/1bit-MONSTER/engine/issues/2186)):
+
+- **The gated product (llama.cpp #317).** The fused routed body published `silu(gate) * up` in half precision
+  unscaled, and the down projection and its reduction read that copy. It is now published at 2^-6 and the readers
+  scale it back by 2^6 after widening, the same pattern as the input above.
+- **The 8-bit blocks' stored sum (llama.cpp #319).** Each 32-value block stores its scale and its scaled sum in
+  half precision. The scale fits up to an activation of 8.3e6, the sum only while the block averages below 2047.
+  The one-token routed gate/up used the stored sum as it was; a sum that is not finite is now rebuilt from the
+  block's codes, and a finite one is used unchanged (the rule the Q5_K reader has had since #1962).
+
+Measured on gfx1151 (2026-11-11), device against a CPU graph on the same weights dequantised to f32, before = the
+same tree without the kernel change:
+
+| case | before | after |
+|---|---|---|
+| routed feed-forward, SwiGLU product up to 2.6e4 (`routed_moe.q4_K.large_product.300`) | 1315 of 2048 non-finite | 0, NMSE 9.8e-5 |
+| same, product up to 2.9e5 (`.1000`) | 2048 of 2048 non-finite | 0, NMSE 1.3e-4 |
+| one-token routed decode, block sum about 9.6e4 (`decode_routed_moe.q4_K.large_activation.3000`) | 2048 of 2048 non-finite | 0, NMSE 1.7e-3 |
+| same, block sum about 9.6e5 (`.30000`) | 2048 of 2048 non-finite | 0, NMSE 1.5e-3 |
+
+The in-range rows are unchanged: `large_product.1`, `.30`, `.100` give NMSE 1.5e-6, 2.3e-4 and 4.4e-4 in both
+arms, and `large_activation.1` and `.1000` the same 6.8e-3 and 4.0e-3 to every digit. Qwen3-Coder-30B-A3B Q4_K_M, perplexity on wikitext-2
+(`-c 512 -b 512`, 8 chunks) 9.6681 before #317 and 9.6654 after, with an identical dispatch plan (13,167 dispatches). `test-hrx-ops` on fork
+`0494dfa28` with #317 and #319 merged: 264 of 265 in two tickets; the one failure was the intermittent
+draft-head logit of [engine#2150](https://github.com/1bit-MONSTER/engine/issues/2150), which a warm repeat of the
+same 108 cases passed 23 of 23 times, as it did on `0494dfa28` alone. Fork `780d67524` also carries llama.cpp #318 (the
+weight-copy trace names the kernels that read each weight) and #314 (a test for #2150).
+
+The limits are moved, not removed: 4.19e6 for the half-precision copies and the draft-head logits, 8.3e6 for the
+8-bit blocks' scale.
 
 ### Fixed: Qwen3-VL on `HRX0`: it decodes again, and its rotation runs on the device ([engine#1467](https://github.com/1bit-MONSTER/engine/issues/1467))
 

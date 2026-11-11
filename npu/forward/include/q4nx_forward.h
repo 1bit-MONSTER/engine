@@ -234,6 +234,11 @@ private:
     // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
     // logits there instead of only the last row's.  Null on every other path, so nothing else changes.
     std::vector<float>* batch_all_out_ = nullptr;
+    // engine#803 A2b step one: the decode-family block as its own method, body unchanged, so the move into
+    // XdnaTarget::open_decode_family() is a copy rather than surgery inside init_impl.
+    bool open_decode_family_local(bool want_m16, xrt::device* dev, const std::string& mdir,
+                                  const std::string& dir);
+
     bool init_impl(xrt::device* dev, const char* model_path,
                    const std::string& artifact_dir);
     bool host_gemm_ = false;
@@ -278,7 +283,7 @@ private:
     bool attention(const std::vector<float>& qkv, int pos, const int* pos3, std::vector<float>& ctx,
                    int head_dim, int n_kv_heads, float theta, int rotary_dim,
                    bool proportional, int window, int kv_layer, bool append_kv,
-                   int kv_len = 0);
+                   int kv_len = 0, std::vector<float>* q_out = nullptr);
     bool mlp(const std::vector<float>& gu, std::vector<float>& h, int im);
     // The same elementwise gate*up on caller memory, so a batched pass can read its ACT row and write its HH
     // row where they already are instead of staging both through a vector (a copy on each side).
@@ -364,6 +369,9 @@ private:
     // hw_contexts.  Config `q4nx_pb16i_sealed_elf` names it in the kernels dir; without
     // it the per-role `_pb16i.elf` files are used as before.
     std::string pb16i_sealed_;
+    std::string wide_sealed_;       // q4nx_<layout>_sealed_wide_elf: a wide prefill family (engine#1990)
+    int wide_sealed_rows_ = 32;    // q4nx_sealed_wide_rows
+    std::string sealed_dir_;        // the kernels dir the 16-row sealed ELF was found in
     // ---- the NPU target (engine#799 P4) ----
     // Everything that talks to a device lives behind this: the ELF contexts (M=128 prefill and the M=16
     // decode twin), the phase-selected launch, the packed-weight BO cache, the pb16i sidecar images, the

@@ -304,6 +304,57 @@ Still open under #1962: two prefill kernels that re-quantise the activations int
 (Q5_K and Q6_K weights at 512 tokens) keep a per-block term in half precision and still return NaN
 above 65504. And the limit is moved, not removed: an activation above 4.19e6 would overflow again.
 
+### Fixed: Qwen3-VL on `HRX0`: it decodes again, and its rotation runs on the device ([engine#1467](https://github.com/1bit-MONSTER/engine/issues/1467))
+
+Two faults, both in the text model's graph rather than in the projector:
+
+- **A refused view (llama.cpp #283).** A deepstack model adds a slice of the wide input embedding to each of
+  its first layers, taken as a view of a view. With the first view's node in another split, the HRX graph
+  never holds the wide tensor, the slice could not alias its input, and the graph was refused at
+  `unsupported HRX node 20: VIEW`. So Qwen3-VL-2B could not decode even text, and every image request failed
+  with it. Such a view is external to the graph and a layout op writes nothing, so the scheduler now skips it.
+- **The rotation on the CPU (llama.cpp #286).** The model's rotation is the interleaved multi-section one
+  with sections that do not collapse to the plain rotation, so 56 `ROPE` nodes per text graph ran on the CPU
+  and cut the graph into 114 splits. The two generic rotation kernels gained a mode that reads the position
+  section each pair selects; the text graph is now 2 or 3 splits with `PAD` (and `GET_ROWS` on token
+  batches) left on the CPU.
+
+Measured at pin `50d28600a` on gfx1151 (2026-11-10, power mode `performance`, Qwen3VL-2B-Instruct Q4_K_M with
+`mmproj-Qwen3VL-2B-Instruct-F16`): `test-backend-ops -o ROPE -b HRX0` 166/166; 12 greedy text tokens
+byte-identical to the CPU backend; `llama-bench -p 512 -n 64 -r 3` at 6,481 and 6,532 tok/s prefill, 133.7
+and 135.5 tok/s decode (2,331 and 57.8 before the rotation moved). `llama-server` with the projector on
+`HRX0`: the first request for the 448x448 test image takes 2.99 s (`prompt_ms` 2,782 for 227 prompt tokens)
+against the 16.97 s this issue was filed on, and answers "A red rectangle and a green circle."
+
+The projector's own graph still runs 103 of 626 nodes on the CPU for an image of that size (its 2-D rotation,
+the attention score matmul and softmax, `IM2COL`, `UPSCALE`); with it offloaded, encoding the image is no
+faster than with `--no-mmproj-offload` (0.5 to 1.1 s against 0.4 to 0.6 s).
+
+### Fixed: prefill attention lost its rate at long context ([engine#1989](https://github.com/1bit-MONSTER/engine/issues/1989))
+
+The cost of prefill attention per key was measured at 0.0331 ms per KV token per 512-token graph on Qwen3-4B
+(over 0 to 7.7k keys) and 0.0522 over 0 to 24k. Timed alone on `HRX0`, the attention dispatch costs what its
+arithmetic costs up to about 8,192 keys; beyond that, and at particular key counts, it fell into a slower regime.
+The cause was not in the attention kernel's arithmetic. From 256 query tokens the dispatch copies V into a
+transposed buffer and walks it across channels, and two things about that step were slow at long key counts:
+
+- the buffer's rows were `2 x keys` bytes apart, which at key counts such as 16,384 and 32,768 puts every channel
+  of a key block on the same cache sets. A key count that is a multiple of 64 now gets a pitch of `keys + 32`;
+- one launch over 512 query tokens was slower per token than two over 256. From 4,096 keys the dispatch now runs
+  256-token launches over the one transposed buffer.
+
+The pitch is derived inside the attention kernel from its key count, so a new key count compiles no new kernel
+(llama.cpp #289 and #291; #289 alone made it a compile parameter and must not be pinned without #291).
+
+Measured at pin `2293f95ea` on gfx1151 (2026-11-10, power mode `performance`, Qwen3-4B Q4_K_M,
+`llama-bench -p 24576 -n 0 -b 512 -ub 512 -r 3`, old layout through `GGML_HRX_FA_VALUE_PITCH=0
+GGML_HRX_FA_QUERY_CHUNK=2048`, alternated): warm repetitions 813 to 822 tok/s before, 980 to 1,074 after;
+first, cold repetitions 701 to 711 before, 856 to 866 after. At 8,192 tokens 1,545 and 1,600 before, 1,766 and
+1,768 after; 2,048 and 512 tokens do not move. A cold run on a 9,230-token prompt takes the same time with either
+layout (8.80 s and 8.85 s) and gives the same text. `test-hrx-fa-transposed-value` compares the path with the CPU
+backend (8 cases). Why 256-token launches are faster than one 512-token launch at long key counts is measured,
+not explained.
+
 ### MoE decode and the kernel cache (llama.cpp #32, #33)
 
 - **MoE decode.** With one to four tokens, a `MUL_MAT_ID` (a MoE expert matmul) runs as a GEMV over
@@ -784,6 +835,34 @@ host while their packed copies are device-resident; it would need the packed sid
 repacked-prefill kernel ([llama.cpp #250](https://github.com/1bit-MONSTER/llama.cpp/pull/250),
 `GGML_HRX_Q6K_PACKED_PREFILL`) stays **opt-in** for the same reason: it is numerically free and speed-neutral, so it buys nothing
 on its own.
+
+**Measuring the duplicate on your own build.** `tools/hrx_gtt_split.py` splits one process's GTT into the loader's copy and HRX's
+packed second copy, using only lines llama.cpp and HRX already print plus the process's own fdinfo. It needs no root and no
+tracefs. Inside your ticket:
+
+```
+gpu-hold -l <lane> -t 5 -- tools/hrx_gtt_split.py run --out split-4b -- \
+    llama-cli -m Qwen3-4B-Q4_K_M.gguf -ngl 99 -fit off -c 256 -n 16 --temp 0 -no-cnv -p "The capital of France is"
+tools/hrx_gtt_split.py parse split-4b/split.log --samples split-4b/gtt.txt     # again, from the files it left
+```
+
+`run` adds `-v`, sets `GGML_HRX_HOST_WEIGHT_TRACE=1`, and samples `drm-total-gtt` with each DRM client counted once. On the
+#1351 pin (llama.cpp `40f58efe1`, the same command):
+
+| part | Qwen3-4B Q4_K_M | Qwen3.8-27B UD-Q4_K_XL |
+|---|---:|---:|
+| loader's model buffer (HRX) | 2,375.9 MiB | 15,718.5 MiB |
+| HRX's packed copies | **795.8 MiB** (38 weights) | **2,631.3 MiB** (66 weights) |
+| KV + recurrent state | 36.0 | 165.6 |
+| compute + output buffers | 43.2 | 72.1 |
+| not attributed | 674.1 | 1,909.5 |
+| process peak GTT | 3,925 | 20,497 |
+| share of the loader's copy resident twice | 33.5 % | 16.7 % |
+
+The packed copies are the duplicate. HRX builds one for each weight that a kernel reads in a re-laid-out form; prefill above
+a token threshold still reads the loader's copy. "Not attributed" is mostly runtime module memory and copy staging (the
+staging buffer is capped at 64 MiB since [llama.cpp #266](https://github.com/1bit-MONSTER/llama.cpp/pull/266)). It is not
+weights. This replaces the `bo_trace.py` reproduction in the issue body, which was never committed.
 
 ### Measuring on `HRX0`: what makes a number citable
 

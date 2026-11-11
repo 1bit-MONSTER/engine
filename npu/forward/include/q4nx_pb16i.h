@@ -152,6 +152,49 @@ inline int64_t sum_of(const int32_t* lo, const int32_t* hi, int mode) {
     return ((int64_t)*hi << 21) + (int64_t)*lo;
 }
 
+// A launch's whole result, dequantised: out[m][n] = scale_i64(S[m][n], e_ref[n]) * ascales[m], bit for bit.
+//
+// scale_i64() is one libm call per element, and a prefill block is 416 launches of up to 16 x 17408 elements, so
+// that call was a block's largest host term outside the device wait (engine#1990: 0.15-0.50 ms per 16-row launch,
+// measured on the host). 2^e_ref depends only on the column, so it is computed once per column here and each element
+// is a multiply. That is the same value, not an approximation: for a normal power of two p, (double)s * p is exact
+// whenever the product is a normal double, which holds for every nonzero s when e_ref is in [kExpLo, kExpHi]
+// (|s| < 2^63, so the product stays under 2^1023, and it is at least 2^-1022). ldexp() is exact under the same
+// condition, so both forms hand the same double to the one float rounding. Outside that range -- no container
+// has such a column, but the header does not get to assume it -- every element takes scale_i64() as before.
+//
+// `Cm` is the result as the kernel wrote it: per row, one int32 plane of ND values, or [lo | hi] when planes > 1.
+// `pow2` is caller-owned scratch so a launch does not allocate.
+constexpr int kExpLo = -1022, kExpHi = 960;
+inline void dequant_rows(float* out, const int32_t* Cm, int ND, int am, int an, const float* ascales,
+                         const int16_t* eref, int planes, std::vector<double>& pow2) {
+    const int row = planes > 1 ? 2 * ND : ND;
+    const int mode = planes > 1 ? 1 : 0;
+    bool table = true;
+    pow2.resize((size_t)(an > 0 ? an : 0));
+    for (int n = 0; n < an; n++) {
+        const int e = (int)eref[n];
+        if (e < kExpLo || e > kExpHi) { table = false; break; }
+        pow2[(size_t)n] = std::ldexp(1.0, e);
+    }
+    for (int m = 0; m < am; m++) {
+        const int32_t* lo = Cm + (size_t)m * (size_t)row;
+        const int32_t* hi = lo + ND;
+        const float asc = ascales[m];
+        float* o = out + (size_t)m * (size_t)an;
+        if (!table) {
+            for (int n = 0; n < an; n++) o[n] = scale_i64(sum_of(lo + n, hi + n, mode), eref[n]) * asc;
+        } else if (mode) {
+            const double* p = pow2.data();
+            for (int n = 0; n < an; n++)
+                o[n] = (float)((double)(((int64_t)hi[n] << 21) + (int64_t)lo[n]) * p[n]) * asc;
+        } else {
+            const double* p = pow2.data();
+            for (int n = 0; n < an; n++) o[n] = (float)((double)lo[n] * p[n]) * asc;
+        }
+    }
+}
+
 // The sidecar files a container's pb16i set is keyed on: blk_<layer>_<tag>_weight.
 inline std::string sidecar_stem(int layer, const char* tag) {
     return std::string("blk_") + std::to_string(layer) + "_" + tag + "_weight";

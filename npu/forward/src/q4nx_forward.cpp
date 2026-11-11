@@ -25,6 +25,7 @@
 // element-wise.
 #include "q4nx_forward.h"
 #include "pad_head_rows.h"   // engine#1990: the padded-head row rule, header-only for its arm
+#include "batch_width.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
@@ -427,6 +428,225 @@ bool Q4nxNpuForward::init_host(const char* model_path, const std::string& dir) {
     return init_impl(nullptr, model_path, dir);
 }
 
+// engine#803 A2b, step one: the decode family gets its own method with the body unchanged, exactly as the lm
+// head did before it moved behind XdnaTarget (open_head). That precedent is why this is a move and not a
+// rewrite: the next step is then a copy into the target rather than surgery inside init_impl, and the three
+// log lines below are copied byte-for-byte because gates grep them ("[pb16i-trace]", the decode-family
+// line, the pb16i refusal) -- "improving" a message here breaks a gate that reads it.
+bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, const std::string& mdir,
+                                             const std::string& dir) {
+    if (host_gemm_) return true;          // the host arm packs its own weights; no decode family is loaded
+    if (!want_m16) {
+        fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n", 0,
+                Q4NX_DESIGN_M_DECODE, ndesigns_, Q4NX_DESIGN_M_PREFILL, " (NPU_DECODE_M16=0: disabled)");
+        return true;
+    }
+    q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
+    // An integer-exact ternary container's decode family is its own kernel set, not the int8
+    // M=16 twins: same M=16 activation tile, but the image (and so the tap) is pb16i's or
+    // t2s's, the ELF name carries that suffix, and the geometry test is the image's
+    // (pb16i: K%256, N%1024; t2s: K%256, N%32) rather than the int8 twin's tiling.  A design
+    // that is ternary-only skips the derivation entirely: its own entry already IS the decode
+    // design.
+    if (pb16i_) {
+        const std::string ft = family_tag();
+        for (int i = 0; i < ndesigns_; i++) {
+            if (i == xd_->role_split_qhalf() || i == xd_->role_split_kv()) {
+                designs16_[i] = designs_[i];
+                continue;
+            }
+            // The wide fused full-attention QKV has no ternary kernel (its int64 half
+            // needs 448 columns per core); when the split designs exist that role is
+            // covered by them, so this design simply has no decode kernel.
+            const Q4nxDesign r16 = designs_[i].role;
+            if (xd_->role_split_qhalf() >= 0 && (r16 == Q4NX_DESIGN_QKV || r16 == Q4NX_DESIGN_QKV2)) {
+                designs16_[i].M = 0;
+                continue;
+            }
+            const bool geo_ok = t2s_ ? q4nx_t2s::fits(designs16_[i].K, designs16_[i].N)
+                                     : q4nx_pb16i::fits(designs16_[i].K, designs16_[i].N);
+            if (designs16_[i].M <= 0 || !geo_ok) {
+                // Say WHY, once per role.  A geometry the ternary tile cannot hold is not a
+                // missing artifact and not an error: the role keeps its M=128 kernel and the
+                // model is correct, only slower -- so the only symptom is a decode step that
+                // costs what a prefill step costs, with nothing in the log.  That is the same
+                // "nothing logs the decline" gap the HRX prefill N%16 note names for a
+                // different dispatcher, and it is cheap to close here.
+                if (designs16_[i].M > 0 && !geo_ok)
+                    fprintf(stderr,
+                            "  [forward] dec %-3s: no %s twin (K=%d N=%d does not fit the tile), "
+                            "staying on M=128\n",
+                            role_tag(designs16_[i].role), t2s_ ? "t2s" : "pb16i",
+                            designs16_[i].K, designs16_[i].N);
+                designs16_[i].M = 0;
+                continue;
+            }
+            // Build the new name in a copy: snprintf must not read and write the
+            // same buffer.
+            std::string n16(designs16_[i].elf_name);
+            n16.resize(n16.size() - 4);                  // drop ".elf"
+            if (n16.size() >= 4 && n16.compare(n16.size() - 4, 4, "_m16") == 0)
+                n16.resize(n16.size() - 4);              // and the m16 twin's suffix
+            n16 += ft;
+            // pb16i's decode family carries no `_m16` marker: M=16 is its only design and those
+            // files already exist under that name on every deployed container.  A t2s container's
+            // M=128 designs keep their int8 names (untagged), so its decode kernels are told
+            // apart by the marker the arena uses: full_i8_GU_K5120_N17408_t2s_m16.elf.
+            if (t2s_) n16 += "_m16";
+            n16 += ".elf";
+            snprintf(designs16_[i].elf_name, Q4NX_ELF_NAME_MAX, "%s", n16.c_str());
+        }
+    }
+    std::vector<std::string> m16dirs;
+    plan_decode_dirs_.clear();
+    if (plan_.loaded() && !plan_.decode_dirs.empty()) {
+        // The plan says which of the two given paths each candidate hangs off, so the runtime
+        // stops guessing which base a bare directory name meant.
+        for (const auto& d : plan_.decode_dirs)
+            plan_decode_dirs_.push_back((d.under_model ? mdir : dir) + "/" + d.path);
+        for (const auto& p : plan_decode_dirs_) m16dirs.push_back(p);
+    } else {
+        m16dirs.push_back(mdir + "/kernels-m16");
+        m16dirs.push_back(dir + "/m16");
+        m16dirs.push_back(dir);
+    }
+    int made = 0, skipped = 0;
+    for (int i = 0; i < ndesigns_; i++) {
+        if (designs16_[i].M <= 0) { skipped++; continue; }
+        std::string elf, kname = "main:seq";
+        if (pb16i_ && !pb16i_sealed_.empty()) {
+            // One ELF for every ternary phase: the file is the same for all roles and
+            // only the instance name differs, so I8Ctx reuses the one hw_context.
+            const char* inst = pb16i_instance(designs16_[i].role);
+            if (!inst) {
+                fprintf(stderr, "  [forward] pb16i: the sealed ELF has no instance for "
+                                "role %s; this role has no decode kernel\n",
+                        role_tag(designs16_[i].role));
+                designs16_[i].M = 0;
+                skipped++;
+                continue;
+            }
+            elf = dir + "/" + pb16i_sealed_;
+            sealed_dir_ = dir;
+            kname = inst;
+            if (!file_exists(elf)) {
+                err_ = plan_.loaded() ? ("plan " + plan_path_ + ": decode.sealed_elf \"" +
+                                         pb16i_sealed_ + "\" is not in " + dir + " (missing)")
+                                      : ("pb16i: missing sealed ELF " + elf);
+                return false;
+            }
+        } else {
+            for (const std::string& d : m16dirs) {
+                std::string cand = d + "/" + designs16_[i].elf_name;
+                if (file_exists(cand)) { elf = cand; break; }
+            }
+        }
+        if (elf.empty()) {
+            // A pb16i role without its image kernel must stop the load: it is not
+            // a slower path, it is a missing one (the int8 weights are not packed
+            // for these geometries under this layout).
+            if (pb16i_) {
+                err_ = plan_.loaded()
+                           ? std::string("plan ") + plan_path_ + ": decode role " +
+                                 role_tag(designs16_[i].role) + " needs \"" + designs16_[i].elf_name +
+                                 "\" (missing)"
+                           : std::string("pb16i: missing decode ELF ") + designs16_[i].elf_name;
+                return false;
+            }
+            skipped++;
+            continue;   // stay on M=128
+        }
+        I8Ctx* c16 = xd_->make_ctx16(i, designs16_[i]);
+        if (!c16) { err_ = "cannot create the decode context for role " + std::to_string(i); return false; }
+        c16->MD = designs16_[i].M;
+        c16->KD = designs16_[i].K;
+        c16->ND = designs16_[i].N;
+        c16->blocked_b = weight_layout_b8_;
+        c16->pb16i = pb16i_;
+        c16->t2s = t2s_;
+        // Which pb16i ELFs leave two int32 planes (the arena's ACC64 family: D, O and
+        // the full-attention q half).  This mirrors the ELF family contract rather
+        // than inferring it, and load/launch refuse a tensor that needs two planes on
+        // a one-plane ELF.
+        if (pb16i_) {
+            const Q4nxDesign r = designs16_[i].role;
+            c16->pb16i_planes =
+                (r == Q4NX_DESIGN_D || r == Q4NX_DESIGN_O || r == Q4NX_DESIGN_QKVFA_Q) ? 2 : 1;
+        }
+        if (!c16->init_elf(*dev, elf.c_str(), designs16_[i].M,
+                           designs16_[i].K, designs16_[i].N, 1, kname.c_str())) {
+            if (pb16i_) {
+                err_ = "pb16i: init_elf failed for " + elf;
+                return false;
+            }
+            fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "
+                            "this role keeps M=128\n", designs16_[i].elf_name);
+            xd_->drop_ctx16(i);
+            skipped++;
+            continue;
+        }
+        made++;
+        fprintf(stderr, "  [forward] %-7s M=%d K=%d N=%d  %s (decode)\n",
+                role_tag(designs_[i].role), designs16_[i].M, designs16_[i].K,
+                designs16_[i].N, elf.c_str());
+    }
+    xd_->note_m16_made(made > 0);
+    if (pb16i_ && made < ndesigns_ - 0) {
+        fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
+                t2s_ ? "t2s" : "pb16i", made, ndesigns_);
+    }
+    fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n",
+            made, Q4NX_DESIGN_M_DECODE, skipped, Q4NX_DESIGN_M_PREFILL,
+            want_m16 ? "" : " (NPU_DECODE_M16=0: disabled)");
+    // engine#1990: a wide prefill family for a sealed pb16i/t2s set: a second sealed ELF carrying the same
+    // instances built for more rows per launch (default 32), so a chunk of more than 16 rows runs one launch per
+    // role instead of two. The pack names it (config `q4nx_<layout>_sealed_wide_elf`, rows in
+    // `q4nx_sealed_wide_rows`); NPU_WIDE_SEALED_ELF overrides the file ("0" = off) and NPU_WIDE_ROWS the rows.
+    // All roles or none -- max_batch_rows() is the chunk width, so one role without a wide kernel would be
+    // launched past its buffers. A named file that is missing or does not load is logged and the pass stays at
+    // 16 rows: a pack must never stop serving over an optional speed-up.
+    const std::string wide_path =
+        onebit::npu::wide_elf_path(getenv("NPU_WIDE_SEALED_ELF"), wide_sealed_, sealed_dir_);
+    if (const char* wide_elf = wide_path.c_str();
+        !wide_path.empty() && pb16i_ && !pb16i_sealed_.empty() && made > 0) {
+        const char* wr = getenv("NPU_WIDE_ROWS");
+        const int rows = wr && *wr ? atoi(wr) : wide_sealed_rows_;
+        int wide = 0;
+        std::string why;
+        if (rows <= Q4NX_DESIGN_M_DECODE || rows > Q4NX_DESIGN_M_PREFILL) why = "NPU_WIDE_ROWS must be 17..128";
+        else if (!file_exists(wide_elf)) why = std::string("no such file: ") + wide_elf;
+        for (int i = 0; why.empty() && i < ndesigns_; i++) {
+            I8Ctx* c16 = xd_->ctx16(i);
+            if (!c16) continue;
+            const char* inst = pb16i_instance(designs16_[i].role);
+            I8Ctx* cw = inst ? xd_->make_ctx_wide(i) : nullptr;
+            if (!cw) { why = std::string("no wide context for role ") + role_tag(designs16_[i].role); break; }
+            cw->MD = rows;
+            cw->KD = c16->KD;
+            cw->ND = c16->ND;
+            cw->blocked_b = c16->blocked_b;
+            cw->pb16i = c16->pb16i;
+            cw->t2s = c16->t2s;
+            cw->pb16i_planes = c16->pb16i_planes;
+            if (!cw->init_elf(*dev, wide_elf, rows, c16->KD, c16->ND, 1, inst)) {
+                why = std::string("init_elf failed for instance ") + inst;
+                break;
+            }
+            wide++;
+        }
+        if (why.empty() && wide > 0 && !xd_->adopt_wide(rows)) why = "a role with a decode context has no wide one";
+        if (why.empty() && wide > 0) {
+            fprintf(stderr, "  [forward] wide family: %d role(s) at M=%d from %s (chunks of 17..%d rows)\n",
+                    wide, rows, wide_elf, rows);
+        } else {
+            xd_->drop_wide();
+            fprintf(stderr, "  [forward] wide family NOT adopted (%s); chunks stay at %d rows\n",
+                    why.empty() ? "no role has a decode context" : why.c_str(), Q4NX_DESIGN_M_DECODE);
+        }
+    }
+    return true;
+}
+
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir) {
     if (const char* hg = getenv("NPU_INFER_HOST_GEMM")) {
@@ -437,6 +657,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         // every row measured so far used.
         host_gemm_i8_ = (hg[0] == 'i' && hg[1] == '8');
     }
+    // engine#2028: say at load, before any request, that NPU_INFER_DUMP_OPS is armed (once per process). No line with
+    // the variable set means the binary predates the dump.
+    onebit::npu::ops_dump_announce();
     // The launch layer.  A1: everything below that touches a device talks to this, and the settings the
     // container declares (weight layout, pb16i image dir, Hadamard fold) are pushed into it as they are
     // parsed.  A2 turns this into NpuTarget::open(plan, kernels_dir).
@@ -512,6 +735,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             // pb16i ELF (which would read 4,608-B tiles out of 2,176-B images).
             pb16i_sealed_ = read_config_string(
                 cfg_path, t2s_ ? "\"q4nx_t2s_sealed_elf\"" : "\"q4nx_pb16i_sealed_elf\"", "");
+            // engine#1990: an optional second sealed ELF, the same instances built for more rows per launch.
+            wide_sealed_ = read_config_string(
+                cfg_path, t2s_ ? "\"q4nx_t2s_sealed_wide_elf\"" : "\"q4nx_pb16i_sealed_wide_elf\"", "");
+            wide_sealed_rows_ = q4nx_config_int(cfg_path.c_str(), "q4nx_sealed_wide_rows", 32);
             // A folded container also declares the fold: `q4nx_hadamard` names the sign table and
             // `q4nx_hadamard_block` the Hadamard block.  Without it the sidecar images would be
             // read in the stored (rotated) basis against un-rotated activations.
@@ -1256,164 +1483,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     xd_->set_m16_check(getenv("NPU_M16_CHECK") != nullptr);
     const char* m16_env = getenv("NPU_DECODE_M16");
     const bool want_m16 = !m16_env || atoi(m16_env) != 0;
-    if (want_m16 && !host_gemm_) {
-        q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
-        // An integer-exact ternary container's decode family is its own kernel set, not the int8
-        // M=16 twins: same M=16 activation tile, but the image (and so the tap) is pb16i's or
-        // t2s's, the ELF name carries that suffix, and the geometry test is the image's
-        // (pb16i: K%256, N%1024; t2s: K%256, N%32) rather than the int8 twin's tiling.  A design
-        // that is ternary-only skips the derivation entirely: its own entry already IS the decode
-        // design.
-        if (pb16i_) {
-            const std::string ft = family_tag();
-            for (int i = 0; i < ndesigns_; i++) {
-                if (i == xd_->role_split_qhalf() || i == xd_->role_split_kv()) {
-                    designs16_[i] = designs_[i];
-                    continue;
-                }
-                // The wide fused full-attention QKV has no ternary kernel (its int64 half
-                // needs 448 columns per core); when the split designs exist that role is
-                // covered by them, so this design simply has no decode kernel.
-                const Q4nxDesign r16 = designs_[i].role;
-                if (xd_->role_split_qhalf() >= 0 && (r16 == Q4NX_DESIGN_QKV || r16 == Q4NX_DESIGN_QKV2)) {
-                    designs16_[i].M = 0;
-                    continue;
-                }
-                const bool geo_ok = t2s_ ? q4nx_t2s::fits(designs16_[i].K, designs16_[i].N)
-                                         : q4nx_pb16i::fits(designs16_[i].K, designs16_[i].N);
-                if (designs16_[i].M <= 0 || !geo_ok) {
-                    // Say WHY, once per role.  A geometry the ternary tile cannot hold is not a
-                    // missing artifact and not an error: the role keeps its M=128 kernel and the
-                    // model is correct, only slower -- so the only symptom is a decode step that
-                    // costs what a prefill step costs, with nothing in the log.  That is the same
-                    // "nothing logs the decline" gap the HRX prefill N%16 note names for a
-                    // different dispatcher, and it is cheap to close here.
-                    if (designs16_[i].M > 0 && !geo_ok)
-                        fprintf(stderr,
-                                "  [forward] dec %-3s: no %s twin (K=%d N=%d does not fit the tile), "
-                                "staying on M=128\n",
-                                role_tag(designs16_[i].role), t2s_ ? "t2s" : "pb16i",
-                                designs16_[i].K, designs16_[i].N);
-                    designs16_[i].M = 0;
-                    continue;
-                }
-                // Build the new name in a copy: snprintf must not read and write the
-                // same buffer.
-                std::string n16(designs16_[i].elf_name);
-                n16.resize(n16.size() - 4);                  // drop ".elf"
-                if (n16.size() >= 4 && n16.compare(n16.size() - 4, 4, "_m16") == 0)
-                    n16.resize(n16.size() - 4);              // and the m16 twin's suffix
-                n16 += ft;
-                // pb16i's decode family carries no `_m16` marker: M=16 is its only design and those
-                // files already exist under that name on every deployed container.  A t2s container's
-                // M=128 designs keep their int8 names (untagged), so its decode kernels are told
-                // apart by the marker the arena uses: full_i8_GU_K5120_N17408_t2s_m16.elf.
-                if (t2s_) n16 += "_m16";
-                n16 += ".elf";
-                snprintf(designs16_[i].elf_name, Q4NX_ELF_NAME_MAX, "%s", n16.c_str());
-            }
-        }
-        std::vector<std::string> m16dirs;
-        plan_decode_dirs_.clear();
-        if (plan_.loaded() && !plan_.decode_dirs.empty()) {
-            // The plan says which of the two given paths each candidate hangs off, so the runtime
-            // stops guessing which base a bare directory name meant.
-            for (const auto& d : plan_.decode_dirs)
-                plan_decode_dirs_.push_back((d.under_model ? mdir : dir) + "/" + d.path);
-            for (const auto& p : plan_decode_dirs_) m16dirs.push_back(p);
-        } else {
-            m16dirs.push_back(mdir + "/kernels-m16");
-            m16dirs.push_back(dir + "/m16");
-            m16dirs.push_back(dir);
-        }
-        int made = 0, skipped = 0;
-        for (int i = 0; i < ndesigns_; i++) {
-            if (designs16_[i].M <= 0) { skipped++; continue; }
-            std::string elf, kname = "main:seq";
-            if (pb16i_ && !pb16i_sealed_.empty()) {
-                // One ELF for every ternary phase: the file is the same for all roles and
-                // only the instance name differs, so I8Ctx reuses the one hw_context.
-                const char* inst = pb16i_instance(designs16_[i].role);
-                if (!inst) {
-                    fprintf(stderr, "  [forward] pb16i: the sealed ELF has no instance for "
-                                    "role %s; this role has no decode kernel\n",
-                            role_tag(designs16_[i].role));
-                    designs16_[i].M = 0;
-                    skipped++;
-                    continue;
-                }
-                elf = dir + "/" + pb16i_sealed_;
-                kname = inst;
-                if (!file_exists(elf)) {
-                    err_ = plan_.loaded() ? ("plan " + plan_path_ + ": decode.sealed_elf \"" +
-                                             pb16i_sealed_ + "\" is not in " + dir + " (missing)")
-                                          : ("pb16i: missing sealed ELF " + elf);
-                    return false;
-                }
-            } else {
-                for (const std::string& d : m16dirs) {
-                    std::string cand = d + "/" + designs16_[i].elf_name;
-                    if (file_exists(cand)) { elf = cand; break; }
-                }
-            }
-            if (elf.empty()) {
-                // A pb16i role without its image kernel must stop the load: it is not
-                // a slower path, it is a missing one (the int8 weights are not packed
-                // for these geometries under this layout).
-                if (pb16i_) {
-                    err_ = plan_.loaded()
-                               ? std::string("plan ") + plan_path_ + ": decode role " +
-                                     role_tag(designs16_[i].role) + " needs \"" + designs16_[i].elf_name +
-                                     "\" (missing)"
-                               : std::string("pb16i: missing decode ELF ") + designs16_[i].elf_name;
-                    return false;
-                }
-                skipped++;
-                continue;   // stay on M=128
-            }
-            I8Ctx* c16 = xd_->make_ctx16(i, designs16_[i]);
-            if (!c16) { err_ = "cannot create the decode context for role " + std::to_string(i); return false; }
-            c16->MD = designs16_[i].M;
-            c16->KD = designs16_[i].K;
-            c16->ND = designs16_[i].N;
-            c16->blocked_b = weight_layout_b8_;
-            c16->pb16i = pb16i_;
-            c16->t2s = t2s_;
-            // Which pb16i ELFs leave two int32 planes (the arena's ACC64 family: D, O and
-            // the full-attention q half).  This mirrors the ELF family contract rather
-            // than inferring it, and load/launch refuse a tensor that needs two planes on
-            // a one-plane ELF.
-            if (pb16i_) {
-                const Q4nxDesign r = designs16_[i].role;
-                c16->pb16i_planes =
-                    (r == Q4NX_DESIGN_D || r == Q4NX_DESIGN_O || r == Q4NX_DESIGN_QKVFA_Q) ? 2 : 1;
-            }
-            if (!c16->init_elf(*dev, elf.c_str(), designs16_[i].M,
-                               designs16_[i].K, designs16_[i].N, 1, kname.c_str())) {
-                if (pb16i_) {
-                    err_ = "pb16i: init_elf failed for " + elf;
-                    return false;
-                }
-                fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "
-                                "this role keeps M=128\n", designs16_[i].elf_name);
-                xd_->drop_ctx16(i);
-                skipped++;
-                continue;
-            }
-            made++;
-            fprintf(stderr, "  [forward] %-7s M=%d K=%d N=%d  %s (decode)\n",
-                    role_tag(designs_[i].role), designs16_[i].M, designs16_[i].K,
-                    designs16_[i].N, elf.c_str());
-        }
-        xd_->note_m16_made(made > 0);
-        if (pb16i_ && made < ndesigns_ - 0) {
-            fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
-                    t2s_ ? "t2s" : "pb16i", made, ndesigns_);
-        }
-        fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n",
-                made, Q4NX_DESIGN_M_DECODE, skipped, Q4NX_DESIGN_M_PREFILL,
-                want_m16 ? "" : " (NPU_DECODE_M16=0: disabled)");
-    }
+    // engine#803 A2b (step one): the block moved verbatim into open_decode_family_local(); the call site keeps the
+    // guard so the "disabled" log line is still printed from one place.
+    if (!open_decode_family_local(want_m16, dev, mdir, dir)) return false;
 
     // The lm head's own context (pb16i ternary images, the int8 ladder, or the q4_1 gemv head).  Cut out
     // into its own method with its body unchanged, so the next step (moving it behind XdnaTarget, as the
@@ -2521,10 +2593,10 @@ struct BatchPhases {
         const double row = M > 0 ? (double)M : 1.0;
         std::fprintf(stderr,
                      "[bl] M=%2d gdn %7.1f ab %7.1f core %7.1f attn %6.1f mlp %6.1f rms %5.1f "
-                     "res %5.1f gemm %7.1f head %6.1f | per row: gdn %6.1f attn %5.1f "
+                     "res %5.1f gemm %7.1f head %6.1f deq %6.1f | per row: gdn %6.1f attn %5.1f "
                      "gemm %6.1f head %5.1f\n",
                      M, ms(LH_GDN), ms(LH_GDN_AB), ms(LH_GDN_CORE), ms(LH_ATTN), ms(LH_MLP),
-                     ms(LH_RMS), ms(LH_RES), gemm, ms(LH_HEAD_ROWS),
+                     ms(LH_RMS), ms(LH_RES), gemm, ms(LH_HEAD_ROWS), ms(LH_DEQ_OUT),
                      ms(LH_GDN) / row, ms(LH_ATTN) / row, gemm / row, ms(LH_HEAD_ROWS) / row);
     }
 };
@@ -3733,7 +3805,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             // One row of attention.  `append` is the K/V cache append, `kvlen` is how many cached
             // positions to read (0 = up to and including `pos`, i.e. causal), and `dst` receives the
             // context -- null when the pass only fills the cache (the noncausal first pass below).
-            auto row_attn = [&](int m, float* dst, bool append, int kvlen) -> bool {
+            auto row_attn = [&](int m, float* dst, bool append, int kvlen,
+                                std::vector<float>* q_keep = nullptr) -> bool {
                 {
                     CpScope _cp(CP_QKV);
                     qkv_row.assign(QKV.begin() + (size_t)m * g->N,
@@ -3768,9 +3841,10 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 }
                 if (!attention(*in, start_pos + m, pos3_ ? trio : nullptr, dst ? ctx_row : ctx_scratch,
                                l_hd, l_nkv, l_theta,
-                               l_rot, l_prop, l_win, l, append, kvlen)) {
+                               l_rot, l_prop, l_win, l, append, kvlen, q_keep)) {
                     err_ = "attention failed"; return false;
                 }
+                if (q_keep) return true;       // prepare only: q is in *q_keep, k/v are in the cache
                 if (!dst) return true;
                 if (gate_ptr)
                     for (int i = 0; i < nhd; i++)
@@ -3786,7 +3860,62 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             // hold all M rows before any of them attends -- a row's keys come from the same layer, and
             // the rows after it only exist once their projections ran.  The GDN layers keep their own
             // causal recurrence (the reference keeps it too), and a sliding layer stays causal.
-            if (noncausal_attn_ && l_full) {
+            // engine#1990: one thread team for the layer's M rows instead of one per row. Every row's
+            // position-local half runs first (q, and its k/v appended -- a causal row reads only positions up
+            // to its own, so the later rows already being in the cache changes nothing it reads), then all
+            // (row, head) pairs are one work-shared loop. NPU_ATTN_ROWS=0 keeps the per-row form for an A/B;
+            // NPU_ATTN_CHECK=1 recomputes every row that way and fails the pass on any differing bit.
+            static const bool attn_rows_on = [] {
+                const char* e = getenv("NPU_ATTN_ROWS");
+                return !(e && e[0] == '0');
+            }();
+            static const bool attn_check = [] {
+                const char* e = getenv("NPU_ATTN_CHECK");
+                return e && e[0] == '1';
+            }();
+            if (attn_rows_on && M > 1 && l_hd > 0 && c_.NH % l_nkv == 0) {
+                const bool whole = noncausal_attn_ && l_full;
+                const size_t qw = (size_t)nhd;
+                std::vector<float> qall((size_t)M * qw), qm;
+                std::vector<int> Tm((size_t)M), t0m((size_t)M);
+                for (int m = 0; m < M; m++) {
+                    if (!row_attn(m, nullptr, true, 0, &qm)) return false;
+                    if (qm.size() != qw) { err_ = "attention rows: q width"; return false; }
+                    memcpy(qall.data() + (size_t)m * qw, qm.data(), qw * sizeof(float));
+                    const int T = whole ? start_pos + M : start_pos + m + 1;
+                    Tm[(size_t)m] = T;
+                    t0m[(size_t)m] = (l_win > 0 && T > l_win) ? T - l_win : 0;
+                }
+                {
+                    LhScope _t_attn(LH_ATTN);
+                    const float scale = sem_.attn_scaling_one ? 1.0f : 1.0f / std::sqrt((float)l_hd);
+                    const int nt = ((long)M * (start_pos + M) * l_hd >= 8192) ? omp_heads_threads() : 1;
+                    q4nx_attn::rows_context(qall.data(), kcache_[l].data(), vcache_[l].data(), M, c_.NH, l_nkv,
+                                            l_hd, Tm.data(), t0m.data(), scale, CTX.data(), nt);
+                    if (attn_gate_)
+                        for (int m = 0; m < M; m++) {
+                            const float* gate = QKV.data() + (size_t)m * g->N + nhd;
+                            float* c = CTX.data() + (size_t)m * ctx_w;
+                            for (int i = 0; i < nhd; i++) c[i] *= 1.0f / (1.0f + expf(-gate[i]));
+                        }
+                }
+                if (attn_check) {
+                    std::vector<float> ref((size_t)ctx_w);
+                    size_t differing = 0;
+                    for (int m = 0; m < M; m++) {
+                        if (!row_attn(m, ref.data(), false, Tm[(size_t)m])) return false;
+                        const float* c = CTX.data() + (size_t)m * ctx_w;
+                        for (int i = 0; i < ctx_w; i++)
+                            if (memcmp(&c[i], &ref[(size_t)i], sizeof(float)) != 0) differing++;
+                    }
+                    fprintf(stderr, "[attncheck] l=%d M=%d start=%d one-team vs per-row: %zu values %s\n", l, M,
+                            start_pos, (size_t)M * ctx_w, differing ? "MISMATCH" : "identical");
+                    if (differing) {
+                        err_ = "attention rows: the one-team form differs from the per-row form";
+                        return false;
+                    }
+                }
+            } else if (noncausal_attn_ && l_full) {
                 for (int m = 0; m < M; m++)
                     if (!row_attn(m, nullptr, true, 0)) return false;
                 for (int m = 0; m < M; m++)
@@ -4521,7 +4650,7 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
                                std::vector<float>& ctx, int head_dim,
                                int n_kv_heads, float theta, int rotary_dim,
                                bool proportional, int window,
-                               int kv_layer, bool append_kv, int kv_len) {
+                               int kv_layer, bool append_kv, int kv_len, std::vector<float>* q_out) {
     const int NH = c_.NH;
     const int HD = head_dim;      /* per layer type (Gemma4: 256 or 512) */
     const int NKV = n_kv_heads;
@@ -4628,6 +4757,13 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         vcache_[kv_layer].insert(vcache_[kv_layer].end(), v.begin(), v.end());
     }
 
+    // engine#1990: a batched pass asks for the position-local half only -- the q this row attends with, and its
+    // k/v in the cache -- and runs the read for all of its rows in one thread team (q4nx_attn::rows_context).
+    if (q_out) {
+        q_out->swap(q);
+        return true;
+    }
+
     // kv_len > 0 is a noncausal read: attend over that many cached positions instead of only the ones
     // up to `pos`.  Everything above (rope, qk-norm, the cache append) is position-local and unchanged.
     const int T = kv_len > 0 ? kv_len : pos + 1;
@@ -4649,30 +4785,9 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     {
         std::vector<float> score(T);
 #pragma omp for schedule(static)
-        for (int h = 0; h < NH; h++) {
-            const int kh = h / gqa;
-            const float* qh = &q[(size_t)h * HD];
-            float mx = -1e30f;
-            for (int t = 0; t < T; t++) {
-                if (t < t0) { score[t] = -1e30f; continue; }
-                const float* kt = &kcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-                score[t] = q4nx_attn::dot(qh, kt, HD) * scale;
-                if (score[t] > mx) mx = score[t];
-            }
-            float sum = 0.0f;
-            for (int t = 0; t < T; t++) {
-                if (t < t0) { score[t] = 0.0f; continue; }
-                score[t] = std::exp(score[t] - mx);
-                sum += score[t];
-            }
-            const float inv = sum > 0 ? 1.0f / sum : 0.0f;
-            float* out = &ctx[(size_t)h * HD];
-            for (int t = t0; t < T; t++) {
-                const float p = score[t] * inv;
-                const float* vt = &vcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-                q4nx_attn::saxpy(p, vt, out, HD);
-            }
-        }
+        for (int h = 0; h < NH; h++)
+            q4nx_attn::head_context(&q[(size_t)h * HD], kcache_[kv_layer].data(), vcache_[kv_layer].data(), NKV,
+                                    h / gqa, HD, t0, T, scale, score.data(), &ctx[(size_t)h * HD]);
     }
     return true;
 }

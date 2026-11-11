@@ -34,6 +34,12 @@ static void uses(const std::vector<char>& image) {
     xrt::ext::kernel k(*ctx, std::string("kernel"));
     auto act = std::make_unique<xrt::ext::bo>(dev, size_t(4096));
     xrt::ext::bo e{dev, size_t(4096)};
+    // engine#753: the dma-buf import constructor. Declared in npu/npu_rt_api.h and defined by the private runtime,
+    // so a runtime that lacks it now fails to LINK this test rather than at the first hybrid call site. Never
+    // called on this path (`uses` exists for link coverage), so no device and no dma-buf is needed here; the
+    // executing arm is npu_dmabuf_import_test.
+    xrt::ext::bo imported(dev, /*dma_buf_fd=*/-1, size_t(4096), /*host=*/nullptr);
+    std::printf("%zu\n", imported.size());
     auto plain = std::make_unique<xrt::bo>(e);
     static_cast<char*>(act->map())[0] = 0;
     act->sync(XCL_BO_SYNC_BO_TO_DEVICE);

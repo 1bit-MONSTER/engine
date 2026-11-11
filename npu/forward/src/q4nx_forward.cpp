@@ -2041,12 +2041,22 @@ bool Q4nxNpuForward::load_layer(int l) {
     // copies of the big projections are never needed: skipping them here is the
     // difference between a first token that dequantises the whole 17.9 GB model and
     // one that opens 13.4 GB of images.  The norms and every small member still load.
+    // The four attention f32 buffers (wq_/wk_/wv_/wo_) are read only by q4nx_assemble_B(), which step() and
+    // step_batch() skip once this layer's packed QKV (key 0) and O (key 1) images are on the device -- the
+    // same argument as ffn_tail_cached() for the MLP and proj_cached for a GDN layer. A dense model never
+    // gets here on a cached layer (step()'s `dense_weights_cached`), but a hybrid one does on every token:
+    // its full-attention layers re-dequantised q, k, v and o each decode step, 17.5 ms of a 285 ms token on
+    // Qwen3.5-2B (6 of 24 layers), for buffers nothing read (engine#1785). BOTH keys must be cached:
+    // step_batch() guards its O assemble with the QKV key, so a half-cached layer still loads everything.
+    // NPU_ATTN_RELOAD=1 keeps the old per-token reload, for the A/B.
+    static const bool attn_reload = getenv("NPU_ATTN_RELOAD") != nullptr;
+    const bool attn_cached = !attn_reload && !host_gemm_ && xd_ && xd_->weight_cached(l, 0) && xd_->weight_cached(l, 1);
     if (is_conv_layer(l)) {
         // LFM2 conv layer: two projections where an attention layer has four. Same f32-until-packed rule.
         LhScope _t_p(LH_LOAD_PROJ);
         if (!deq(&lw->shortconv_in_proj_weight, wqkvlin_.data(), 3 * H, H)) return false;
         if (!deq(&lw->shortconv_out_proj_weight, woutlin_.data(), H, q4nx_pad_k(H))) return false;
-    } else if (!xd_->pb16i()) {
+    } else if (!xd_->pb16i() && !attn_cached) {
         if (!deq(&lw->q_proj_weight, wq_.data(),
                  NH * hd * (attn_gate_ ? 2 : 1), kpad_)) return false;   // q|gate rows
         if (!kv_shared) {

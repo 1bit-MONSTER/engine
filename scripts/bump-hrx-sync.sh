@@ -51,6 +51,7 @@ cmd=${1:-}
 DRY_RUN=${DRY_RUN:-0}
 HOLD_FILE=${HOLD_FILE:-config/hrx-system-hold.config}
 LLAMA_HOLD_FILE=${LLAMA_HOLD_FILE:-config/llama-mirror-hold.config}
+LLAMA_MIRROR_FILE=${LLAMA_MIRROR_FILE:-config/llama-mirror-branch.config}
 ENGINE_DIR=$(pwd)
 # The HRX backend paths of the llama.cpp tree (what AMD's hrx-graph line adds on top of ggml).
 # tests/CMakeLists.txt belongs here: it is where the HRX test targets are registered, so it moves
@@ -94,6 +95,26 @@ llama_hold_sha() {
   case "$f" in /*) ;; *) f=$ENGINE_DIR/$f ;; esac   # relative to the engine checkout unless given whole
   [ -f "$f" ] || return 0
   grep -v '^[[:space:]]*#' "$f" | grep -oE '^[0-9a-f]{40}' | head -n1 || true
+}
+
+# The branch of 1bit-MONSTER/llama.cpp that mirrors AMD's line: the first line of config/llama-mirror-branch.config
+# that is not a comment, or 1bit/hrx-vulkan when the file is absent or names nothing.
+# 2026-11-10 (engine#1945): AMD rebased its line, and the owner's rule is that no branch is ever force-moved. So the
+# old mirror stays where it is, AMD's new line goes to a NEW branch (1bit/hrx-vulkan-<date>), and this file is how the
+# sync is pointed at it -- the workflow file is not edited, and cannot be with the token this repository's lanes have.
+# A name that is not a plain branch name is refused: it ends up inside a refspec.
+llama_mirror_branch() {
+  local f=$LLAMA_MIRROR_FILE name=""
+  case "$f" in /*) ;; *) f=$ENGINE_DIR/$f ;; esac
+  if [ -f "$f" ]; then name=$(grep -v '^[[:space:]]*#' "$f" | grep -v '^[[:space:]]*$' | head -n1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true); fi
+  [ -n "$name" ] || name=1bit/hrx-vulkan
+  case "$name" in
+    */hrx-vulkan-patched|1bit/hrx-vulkan-patched) die "$LLAMA_MIRROR_FILE names $name, which is our own line, not a mirror of AMD's" ;;
+  esac
+  if ! [[ "$name" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$name" == *..* ]] || [[ "$name" == -* ]] || [[ "$name" == refs/* ]]; then
+    die "$LLAMA_MIRROR_FILE names '$name', which is not a plain branch name"
+  fi
+  echo "$name"
 }
 
 # What a mirror hold means for this run. Reads repo $1; $2 is the held commit (may be empty), $3 the mirror tip,
@@ -148,29 +169,30 @@ sync_llama() {
     warn "could not refresh 1bit-MONSTER/llama.cpp master: $(printf '%s' "$refresh" | head -n1); continuing with the HRX pin sync"
   fi
 
+  local mirror_branch; mirror_branch=$(llama_mirror_branch)
   rm -rf patched && git init -q patched && cd patched
   git remote add fork "$(remote_url 1bit-MONSTER/llama.cpp)"
   git remote add amd https://github.com/AMD-Ecosystem/llama.cpp.git
   git fetch -q --filter=blob:none amd "$AMD_LLAMA"
   git fetch -q --filter=blob:none fork \
-    "1bit/hrx-vulkan:refs/remotes/fork/mirror" "1bit/hrx-vulkan-patched:refs/remotes/fork/patched"
+    "$mirror_branch:refs/remotes/fork/mirror" "1bit/hrx-vulkan-patched:refs/remotes/fork/patched"
   local mirror patched pin=$AMD_LLAMA
   mirror=$(git rev-parse refs/remotes/fork/mirror)
   patched=$(git rev-parse refs/remotes/fork/patched)
-  echo "AMD pin $pin, mirror 1bit/hrx-vulkan $mirror, our line 1bit/hrx-vulkan-patched $patched"
+  echo "AMD pin $pin, mirror $mirror_branch $mirror, our line 1bit/hrx-vulkan-patched $patched"
 
   # 0. A mirror hold (config/llama-mirror-hold.config): the run reports it and moves nothing.
   local lhold; lhold=$(llama_hold_sha)
   case "$(llama_hold_decision . "$lhold" "$mirror" "$pin")" in
     stale)
-      die "$LLAMA_HOLD_FILE holds 1bit/hrx-vulkan at ${lhold:0:12}, but the mirror is ${mirror:0:12}: the hold is out of date. Name the mirror's commit in it, or delete the commit line to let the sync run." ;;
+      die "$LLAMA_HOLD_FILE holds $mirror_branch at ${lhold:0:12}, but the mirror is ${mirror:0:12}: the hold is out of date. Name the mirror's commit in it, or delete the commit line to let the sync run." ;;
     unneeded)
-      die "$LLAMA_HOLD_FILE holds 1bit/hrx-vulkan at ${lhold:0:12}, and AMD's pin ${pin:0:12} contains that commit: an ordinary sync would work. Delete the commit line." ;;
+      die "$LLAMA_HOLD_FILE holds $mirror_branch at ${lhold:0:12}, and AMD's pin ${pin:0:12} contains that commit: an ordinary sync would work. Delete the commit line." ;;
     held)
-      note "1bit/hrx-vulkan is held at ${mirror:0:12} by $LLAMA_HOLD_FILE: AMD's pin ${pin:0:12} does not descend from it (AMD rewrote its line). Nothing was moved; the merge is tracked where the hold file says."
-      summary "- llama.cpp: mirror \`1bit/hrx-vulkan\` HELD at \`${mirror:0:12}\` ($LLAMA_HOLD_FILE); AMD's pin is \`${pin:0:12}\`, on a line that does not contain it. Not merged."
+      note "$mirror_branch is held at ${mirror:0:12} by $LLAMA_HOLD_FILE: AMD's pin ${pin:0:12} does not descend from it (AMD rewrote its line). Nothing was moved; the merge is tracked where the hold file says."
+      summary "- llama.cpp: mirror \`$mirror_branch\` HELD at \`${mirror:0:12}\` ($LLAMA_HOLD_FILE); AMD's pin is \`${pin:0:12}\`, on a line that does not contain it. Not merged."
       output "rebased=$patched"
-      output "llama_held=1bit/hrx-vulkan HELD at \`${mirror:0:12}\` by \`$LLAMA_HOLD_FILE\` (AMD's pin is \`${pin:0:12}\`)."
+      output "llama_held=$mirror_branch HELD at \`${mirror:0:12}\` by \`$LLAMA_HOLD_FILE\` (AMD's pin is \`${pin:0:12}\`)."
       output "patches<<EOF
 $(git log --format='- `%h` %s' "${OURS_LLAMA:-$patched}..$patched" 2>/dev/null || true)
 EOF"
@@ -191,10 +213,10 @@ EOF"
     foreign=$(sed -n 's/^foreign //p' <<< "$off")
     rebased=$(sed -n 's/^rebased //p' <<< "$off")
     if [ -n "$foreign" ]; then
-      die "1bit/hrx-vulkan has commits that are on no branch of AMD-Ecosystem/llama.cpp and have no same-author, same-date, same-subject commit in AMD's pin; the mirror must hold AMD's commits only. Move these to 1bit/hrx-vulkan-patched by hand: $(tr '\n' ';' <<< "$foreign")"
+      die "$mirror_branch has commits that are on no branch of AMD-Ecosystem/llama.cpp and have no same-author, same-date, same-subject commit in AMD's pin; the mirror must hold AMD's commits only. Move these to 1bit/hrx-vulkan-patched by hand: $(tr '\n' ';' <<< "$foreign")"
     fi
     if [ -n "$rebased" ]; then
-      die "AMD rebased its line and dropped the old one: $(wc -l <<< "$rebased" | tr -d ' ') commit(s) of 1bit/hrx-vulkan are on no AMD branch, and each has a commit in AMD's pin ${pin:0:12} with the same author, author date and subject (old new subject: $(tr '\n' ';' <<< "$rebased")). They are AMD's commits, NOT ours: do not move them to 1bit/hrx-vulkan-patched. Merge AMD's pin into 1bit/hrx-vulkan-patched by hand, then move the mirror to the pin."
+      die "AMD rebased its line and dropped the old one: $(wc -l <<< "$rebased" | tr -d ' ') commit(s) of $mirror_branch are on no AMD branch, and each has a commit in AMD's pin ${pin:0:12} with the same author, author date and subject (old new subject: $(tr '\n' ';' <<< "$rebased")). They are AMD's commits, NOT ours: do not move them to 1bit/hrx-vulkan-patched. Merge AMD's pin into 1bit/hrx-vulkan-patched by hand, then move the mirror to the pin."
     fi
     # AMD rewrote history. Find the newest commit of the new pin whose tree equals a commit that
     # descends from the old mirror on some AMD branch (its pre-rewrite equivalent).
@@ -206,7 +228,7 @@ EOF"
       if [ -n "$equiv" ]; then squash=$c; break; fi
     done < <(git -C ../amdrefs log --format='%H %T' "$pin" --not "$mirror")
     if [ -z "$squash" ]; then
-      die "AMD's pin ${pin:0:12} does not contain 1bit/hrx-vulkan ${mirror:0:12} and no AMD commit after it has the same tree as any commit of the new pin; AMD rewrote its history in a way this job cannot map. Merge AMD's pin into 1bit/hrx-vulkan-patched by hand."
+      die "AMD's pin ${pin:0:12} does not contain $mirror_branch ${mirror:0:12} and no AMD commit after it has the same tree as any commit of the new pin; AMD rewrote its history in a way this job cannot map. Merge AMD's pin into 1bit/hrx-vulkan-patched by hand."
     fi
     git fetch -q --filter=blob:none amd "$equiv" 2>/dev/null || git fetch -q --filter=blob:none fork "$equiv"
     ident replace --graft "$squash" "$equiv"
@@ -290,9 +312,9 @@ parent here, so a later full merge still brings them in.")
     if [ "$rewritten" = 1 ]; then
       git tag -f "hrx-vulkan-${mirror:0:12}" "$mirror"
       push fork "refs/tags/hrx-vulkan-${mirror:0:12}"
-      push --force-with-lease="refs/heads/1bit/hrx-vulkan:$mirror" fork "$pin:refs/heads/1bit/hrx-vulkan"
+      push --force-with-lease="refs/heads/$mirror_branch:$mirror" fork "$pin:refs/heads/$mirror_branch"
     else
-      push fork "$pin:refs/heads/1bit/hrx-vulkan"
+      push fork "$pin:refs/heads/$mirror_branch"
     fi
   fi
   output "rebased=$rebased"
@@ -344,5 +366,7 @@ case "$cmd" in
   off-branch) off_branch_commits "${2:?repo}" "${3:?mirror}" "${4:?pin}" ;;
   # The mirror-hold decision alone, on a local repository: llama-hold <repo> <mirror> <pin>, hold file from LLAMA_HOLD_FILE.
   llama-hold) llama_hold_decision "${2:?repo}" "$(llama_hold_sha)" "${3:?mirror}" "${4:?pin}" ;;
+  # The mirror branch this run would use (config/llama-mirror-branch.config, or LLAMA_MIRROR_FILE).
+  mirror-branch) llama_mirror_branch ;;
   *) echo "usage: $0 llama|hrx" >&2; exit 2 ;;
 esac

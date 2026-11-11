@@ -133,5 +133,27 @@ else
   fail "config/llama-mirror-hold.config is in the tree"
 fi
 
+# ---- which branch is the mirror (config/llama-mirror-branch.config) -----------------------------------------
+mb=$work/mirror.config
+branch() { LLAMA_MIRROR_FILE=$mb bash "$script" mirror-branch 2>&1; }
+rm -f "$mb"
+expect "no file: the mirror is 1bit/hrx-vulkan, as it always was" "$(branch)" "1bit/hrx-vulkan"
+printf '# only comments\n\n#   1bit/hrx-vulkan-20261110\n' > "$mb"
+expect "a branch that is only mentioned in a comment changes nothing" "$(branch)" "1bit/hrx-vulkan"
+printf '# the dated mirror\n\n  1bit/hrx-vulkan-20261110  \n1bit/ignored-second-line\n' > "$mb"
+expect "the first line that is not a comment names the mirror, spaces around it ignored" "$(branch)" "1bit/hrx-vulkan-20261110"
+for bad in '1bit/hrx-vulkan-patched' 'refs/heads/1bit/x' '../x' '-x' 'a b' 'x;rm' 'x:y'; do
+  printf '%s\n' "$bad" > "$mb"
+  if out=$(branch); then fail "a mirror named '$bad' is refused (got: $out)"; else
+    case "$out" in *"$mb"*|*llama-mirror*|*mirror*) ok "a mirror named '$bad' is refused, naming the file" ;; *) fail "the refusal of '$bad' names the file (got: $out)" ;; esac
+  fi
+done
+shipped_mb=$(cd "$(dirname "$script")/.." && pwd)/config/llama-mirror-branch.config
+if [ -f "$shipped_mb" ]; then
+  expect "the shipped file names no branch, so the mirror is unchanged" "$(LLAMA_MIRROR_FILE=$shipped_mb bash "$script" mirror-branch)" "1bit/hrx-vulkan"
+else
+  fail "config/llama-mirror-branch.config is in the tree"
+fi
+
 if [ "$fails" -ne 0 ]; then echo "$fails check(s) failed"; exit 1; fi
 echo "bump_hrx_sync: ok"

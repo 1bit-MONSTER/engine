@@ -31,6 +31,8 @@
 # so two runs can be compared without trusting a human to eyeball two terminals.  The gate a change has to
 # pass is: 3/3 transcripts byte-identical, the prof table's rows (phase, role, M) identical, and no row's
 # ms/launch outside the tolerance.
+# One row difference is a declared mode and passes: `dec HEAD M=1` (the lm head on the host, NPU_HEAD_HOST)
+# against `dec HEAD M=16` (on the device), when that pair is the whole difference (engine#1785).
 #
 # The tolerance is NOT a constant: engine#834 measured the same binary against itself on this box and the rows
 # moved up to 7.7 %, so a 2 % assertion cannot be evaluated here at all.  `--compare` therefore refuses to run
@@ -229,8 +231,26 @@ if ha or hb:
               f"{sum(1 for t in ka if t.startswith('[qkv-dump]'))} qkv dumps)")
 
 rows_a, rows_b = set(pa), set(pb)
-if rows_a != rows_b:
-    print(f"FAIL prof rows differ: only in A {sorted(rows_a - rows_b)}, only in B {sorted(rows_b - rows_a)}")
+# The one row difference that is a declared mode and not a regression (engine#1785, #2191): the decode lm
+# head computed on the host (NPU_HEAD_HOST) prints `dec HEAD M=1`, one host pass per token, where the device
+# head prints `dec HEAD M=16`, one row per launch. The two rows time different things, so they are reported
+# side by side and not scored against each other; the logits are the same numbers either way, which the text
+# rows above already assert. It is accepted only when that pair is the WHOLE difference: any other row
+# missing or added still fails, and so does a log with both head rows or with neither.
+HEAD_DEV, HEAD_HOST = ("dec", "HEAD", "16"), ("dec", "HEAD", "1")
+only_a, only_b = rows_a - rows_b, rows_b - rows_a
+head_moved = None
+if (only_a, only_b) == ({HEAD_DEV}, {HEAD_HOST}):
+    head_moved = ("A", HEAD_DEV, pa, "B", HEAD_HOST, pb)
+elif (only_a, only_b) == ({HEAD_HOST}, {HEAD_DEV}):
+    head_moved = ("B", HEAD_DEV, pb, "A", HEAD_HOST, pa)
+if head_moved:
+    dev_side, dk, dp, host_side, hk, hp = head_moved
+    print(f"prof rows: {len(rows_a & rows_b)} identical (phase, role, M), plus the decode head: on the device in "
+          f"{dev_side} (HEAD M=16, {statistics.median(dp[dk]):.3f} ms per launch) and on the host in {host_side} "
+          f"(HEAD M=1, {statistics.median(hp[hk]):.3f} ms per token); reported, not scored against each other")
+elif rows_a != rows_b:
+    print(f"FAIL prof rows differ: only in A {sorted(only_a)}, only in B {sorted(only_b)}")
     fail = 1
 else:
     print(f"prof rows: {len(rows_a)} identical (phase, role, M)")
@@ -341,6 +361,27 @@ with open(pb, "w") as f:
 rc, out = run(pa, pb, "--tol", "10")
 check("statistic in force: median-of-ratios" in out and "median-of-ratios" in out,
       "two rounds per row: the paired statistic is named and printed", out)
+
+# The decode head on the host (engine#1785): `dec HEAD M=1` against `dec HEAD M=16` is the one accepted row
+# difference, in either order, and only when it is the whole difference.
+hd, hh = ("dec", "HEAD", "16"), ("dec", "HEAD", "1")
+dev = write("dev.log", {**base, hd: 3.100})
+host = write("host.log", {**base, hh: 9.000})
+rc, out = run(dev, host, "--tol", "10")
+check(rc == 0 and "on the device in A" in out and "on the host in B" in out and "not scored" in out,
+      "device head against host head passes and says which side is which", out)
+rc, out = run(host, dev, "--tol", "10")
+check(rc == 0 and "on the device in B" in out and "on the host in A" in out, "the same in the other order", out)
+rc, out = run(dev, write("host_slow.log", {keys[0]: 2.600, keys[1]: 5.000, hh: 9.000}), "--tol", "10")
+check(rc == 1 and "outside tolerance" in out, "a host-head log is still scored on every shared row", out)
+rc, out = run(dev, write("host_extra.log", {**base, hh: 9.000, ("dec", "Z", "16"): 1.0}), "--tol", "10")
+check(rc == 1 and "prof rows differ" in out, "a host-head log with another row added still fails", out)
+rc, out = run(dev, write("nohead.log", base), "--tol", "10")
+check(rc == 1 and "prof rows differ" in out, "a log with no head row at all still fails", out)
+rc, out = run(dev, write("both.log", {**base, hd: 3.100, hh: 9.000}), "--tol", "10")
+check(rc == 1 and "prof rows differ" in out, "a log with both head rows still fails", out)
+rc, out = run(dev, write("host8.log", {**base, ("dec", "HEAD", "8"): 9.000}), "--tol", "10")
+check(rc == 1 and "prof rows differ" in out, "a head row at any other M is not the host head", out)
 print()
 print("self-test: " + ("PASS" if not failures else "FAIL"))
 sys.exit(1 if failures else 0)

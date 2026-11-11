@@ -40,7 +40,6 @@ loom-libs/motifs/q6_k_f16.loom
 loom-libs/motifs/q8_0_f16.loom
 loom-libs/motifs/q8_1_f16.loom
 loom-libs/motifs/quantize_q8_1_x4.loom
-loom-libs/motifs/unary_f32_apply.loom
 loom-libs/ops/copy_f32.loom
 loom-libs/ops/flash_attention_decode_split_f32_f16_wmma.loom
 loom-libs/ops/flash_attention_f32_f16_wmma.loom

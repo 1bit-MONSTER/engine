@@ -24,8 +24,8 @@ worth anything if it cannot silently change underneath the person answering it.
 
 This is the ratchet:
 
-  * every .loom body that narrows f32 to f16 (scalar `f32 to f16`, vector `vector<NxF32> to vector<NxF16>`,
-    or `truncf`) is listed in
+  * every .loom body that narrows f32 to f16 (scalar `f32 to f16` or vector `vector<NxF32> to vector<NxF16>`)
+    is listed in
     tools/ci/hrx_f16_narrowing.txt, and a body that appears without a line, or a line whose body is gone,
     fails the check -- the two arms a ratchet needs (a list that can only grow cannot see a rename,
     engine#1728's lesson);
@@ -49,8 +49,10 @@ CORPUS = pathlib.Path("third_party/llama.cpp/ggml/src/ggml-hrx/kernel-corpus/ker
 BASELINE = pathlib.Path("tools/ci/hrx_f16_narrowing.txt")
 # The vector form is most of the corpus: `vector.fptrunc %x : vector<4xf32> to vector<4xf16>` contains neither
 # "f32 to f16" nor "truncf", and at llama.cpp 2b7960bae 132 of the 233 narrowing lines are written that way.
-# Matching the scalar spelling alone listed 25 bodies; the corpus has 51 (engine#2204's review).
-NARROW = re.compile(r"f32 to f16|vector<[0-9x]*f32>\s+to\s+vector<[0-9x]*f16>|truncf")
+# Matching the scalar spelling alone listed 25 bodies; the corpus has 51 (engine#2204's review). A bare `truncf` is
+# not a narrowing to f16: `scalar.truncf %v : f32` rounds within f32 (unary_f32_apply.loom), and every truncf that
+# does narrow names its f16 type, which the two patterns below already match (engine#2220's review).
+NARROW = re.compile(r"f32 to f16|vector<[0-9x]*f32>\s+to\s+vector<[0-9x]*f16>")
 GUARD = ("scale_log2", "prescale")
 
 
@@ -149,8 +151,12 @@ def self_test():
         new, _ = drift(baseline_paths((root / BASELINE).read_text()), narrowing_bodies(corpus))
         check_that(new == ["c.loom", "v.loom"],
                    "a vector<4xf32> to vector<4xf16> narrowing is found, and a bf16 one is not")
+        (corpus / "t.loom").write_text("  %t = scalar.truncf %v : f32\n  %u = vector.truncf %w : vector<4xf32>\n")
+        new, _ = drift(baseline_paths((root / BASELINE).read_text()), narrowing_bodies(corpus))
+        check_that("t.loom" not in new, "a truncf that stays in f32 is not a narrowing")
         (corpus / "v.loom").unlink()
         (corpus / "w.loom").unlink()
+        (corpus / "t.loom").unlink()
         (corpus / "c.loom").write_text("  %z = scalar.constant 0.0 : f32\n")
         (corpus / "a.loom").rename(corpus / "renamed.loom")
         new, stale = drift(baseline_paths((root / BASELINE).read_text()), narrowing_bodies(corpus))

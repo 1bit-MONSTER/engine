@@ -35,7 +35,17 @@ int main() {
         std::printf("FAIL a per-layer-input projection shares a key with an attention projection of the same layer\n");
         fail++;
     }
+    // The predicate is not a constant: a list with a repeat is reported, wherever the repeat sits.
+    const int dup_ends[] = {0, 1, 2, 0}, dup_mid[] = {0, 8, 8, 9}, one[] = {5};
+    if (wkeys_distinct(dup_ends, 4) || wkeys_distinct(dup_mid, 4)) {
+        std::printf("FAIL a list with a repeated key is called distinct\n");
+        fail++;
+    }
+    if (!wkeys_distinct(one, 1) || !wkeys_distinct(one, 0)) {
+        std::printf("FAIL a list of one key, or of none, is called not distinct\n");
+        fail++;
+    }
     if (fail) return 1;
-    std::printf("weight_keys: ok (%d keys, all distinct)\n", n);
+    std::printf("weight_keys: ok (%d keys, all distinct; a repeated key is reported)\n", n);
     return 0;
 }

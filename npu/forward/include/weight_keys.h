@@ -21,8 +21,13 @@
 // in host-GEMM mode and returned noise on the NPU, with every kernel bit-exact, because its per-layer input gate and
 // projection were launched under the attention projections' keys 0 and 1.
 //
-// The keys of step()'s dense layer are listed here and held pairwise distinct at compile time. The literals at the
-// older call sites (0..4, 10..13) are the same numbers; a new projection takes a new name here, not a number there.
+// The keys of step()'s dense layer are listed here and held pairwise distinct at compile time.
+//
+// Which call sites use the names today: only the two that were wrong, the Gemma4 gate and projection in step()
+// (kWkeyPleGate, kWkeyPleProj). The older call sites still pass literals -- 0..4 and 10..13 in step() and in the
+// batched body -- and the names above carry the same numbers, so the list describes them but does not yet bind
+// them. Moving those to the names is a mechanical follow-up. Until then the rule for a new projection is: take a
+// new name here, not a number there.
 
 #pragma once
 
@@ -45,12 +50,15 @@ enum : int {
 constexpr int kLayerWkeys[] = {kWkeyQkv, kWkeyO, kWkeyGateUp, kWkeyUp, kWkeyDown, kWkeyPleGate, kWkeyPleProj,
                                kWkeySplitQ0, kWkeySplitQ1, kWkeySplitK, kWkeySplitV};
 
-constexpr bool layer_wkeys_distinct() {
-    const int n = int(sizeof(kLayerWkeys) / sizeof(kLayerWkeys[0]));
+// The predicate on any list, so a test can hand it one that is NOT distinct and see it say so.
+constexpr bool wkeys_distinct(const int* keys, int n) {
     for (int i = 0; i < n; i++)
         for (int j = i + 1; j < n; j++)
-            if (kLayerWkeys[i] == kLayerWkeys[j]) return false;
+            if (keys[i] == keys[j]) return false;
     return true;
+}
+constexpr bool layer_wkeys_distinct() {
+    return wkeys_distinct(kLayerWkeys, int(sizeof(kLayerWkeys) / sizeof(kLayerWkeys[0])));
 }
 static_assert(layer_wkeys_distinct(), "two projections of one layer share a weight-cache key");
 

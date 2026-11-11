@@ -24,7 +24,8 @@ worth anything if it cannot silently change underneath the person answering it.
 
 This is the ratchet:
 
-  * every .loom body that narrows f32 to f16 (`f32 to f16` or `truncf`) is listed in
+  * every .loom body that narrows f32 to f16 (scalar `f32 to f16`, vector `vector<NxF32> to vector<NxF16>`,
+    or `truncf`) is listed in
     tools/ci/hrx_f16_narrowing.txt, and a body that appears without a line, or a line whose body is gone,
     fails the check -- the two arms a ratchet needs (a list that can only grow cannot see a rename,
     engine#1728's lesson);
@@ -41,11 +42,15 @@ usage: hrx_f16_narrowing.py --check [--root .]     rc 1 on drift, rc 77 without 
 """
 import argparse
 import pathlib
+import re
 import sys
 
 CORPUS = pathlib.Path("third_party/llama.cpp/ggml/src/ggml-hrx/kernel-corpus/kernels")
 BASELINE = pathlib.Path("tools/ci/hrx_f16_narrowing.txt")
-NARROW = ("f32 to f16", "truncf")
+# The vector form is most of the corpus: `vector.fptrunc %x : vector<4xf32> to vector<4xf16>` contains neither
+# "f32 to f16" nor "truncf", and at llama.cpp 2b7960bae 132 of the 233 narrowing lines are written that way.
+# Matching the scalar spelling alone listed 25 bodies; the corpus has 51 (engine#2204's review).
+NARROW = re.compile(r"f32 to f16|vector<[0-9x]*f32>\s+to\s+vector<[0-9x]*f16>|truncf")
 GUARD = ("scale_log2", "prescale")
 
 
@@ -59,7 +64,7 @@ def narrowing_bodies(corpus):
     found = set()
     for path in corpus.rglob("*.loom"):
         body = path.read_text(encoding="utf-8", errors="replace")
-        if any(marker in body for marker in NARROW):
+        if NARROW.search(body):
             found.add(path.relative_to(corpus).as_posix())
     return found
 
@@ -139,6 +144,13 @@ def self_test():
         (corpus / "c.loom").write_text("  %z = scalar.fptrunc %w : f32 to f16\n")
         new, stale = drift(baseline_paths((root / BASELINE).read_text()), narrowing_bodies(corpus))
         check_that(new == ["c.loom"] and not stale, "a new narrowing body is drift, and only it")
+        (corpus / "v.loom").write_text("  %h = vector.fptrunc %v : vector<4xf32> to vector<4xf16>\n")
+        (corpus / "w.loom").write_text("  %h = vector.fptrunc %v : vector<4xf32> to vector<4xbf16>\n")
+        new, _ = drift(baseline_paths((root / BASELINE).read_text()), narrowing_bodies(corpus))
+        check_that(new == ["c.loom", "v.loom"],
+                   "a vector<4xf32> to vector<4xf16> narrowing is found, and a bf16 one is not")
+        (corpus / "v.loom").unlink()
+        (corpus / "w.loom").unlink()
         (corpus / "c.loom").write_text("  %z = scalar.constant 0.0 : f32\n")
         (corpus / "a.loom").rename(corpus / "renamed.loom")
         new, stale = drift(baseline_paths((root / BASELINE).read_text()), narrowing_bodies(corpus))

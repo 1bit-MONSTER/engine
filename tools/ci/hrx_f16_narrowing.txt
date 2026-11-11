@@ -13,29 +13,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Targets whose add_test() names them and which CI never builds (engine#1595).
-#
-# engine#1962: the .loom bodies that narrow an f32 value to f16, at llama.cpp pin 7a1f2b81c.
+# engine#1962: the .loom bodies that narrow an f32 value to f16 (scalar or vector form), at llama.cpp pin 2b7960bae.
 # Paths are relative to third_party/llama.cpp/ggml/src/ggml-hrx/kernel-corpus/kernels. This is a
 # RATCHET, not a list of bugs: a body here may narrow a bounded value (a scale, a weight) and be
 # perfectly correct. What the list buys is that a NEW narrowing body cannot appear without someone
 # writing it down and saying what feeds it -- and that is the open question on engine#1962: which of
 # these are protected by a producer-side prescale cannot be answered by reading them.
+loom-libs/motifs/bf16_f16.loom
+loom-libs/motifs/dequant.loom
+loom-libs/motifs/dequant_1bit.loom
+loom-libs/motifs/dequant_prism.loom
+loom-libs/motifs/f32_f16.loom
+loom-libs/motifs/llm_attention_qkv_matmul_postops.loom
+loom-libs/motifs/mul_mat_f32_f32_wmma_core.loom
 loom-libs/motifs/mul_mat_id_f16_f16_wmma_core.loom
+loom-libs/motifs/mul_mat_id_f32_f32_wmma_core.loom
 loom-libs/motifs/mul_mat_id_q4k_f16_wmma_projection.loom
 loom-libs/motifs/mul_mat_id_q5k_f16_wmma_projection.loom
+loom-libs/motifs/mul_mat_id_q6k_f16_wmma_projection.loom
+loom-libs/motifs/mul_mat_id_swiglu_f16_f16_accumulate.loom
+loom-libs/motifs/mul_mat_id_swiglu_f16_f16_wmma_body.loom
+loom-libs/motifs/mul_mat_quantized_f16_prefill.loom
+loom-libs/motifs/publish_f32.loom
 loom-libs/motifs/q4_k_f16.loom
+loom-libs/motifs/q6_k_f16.loom
+loom-libs/motifs/q8_0_f16.loom
+loom-libs/motifs/q8_1_f16.loom
 loom-libs/motifs/quantize_q8_1_x4.loom
 loom-libs/motifs/unary_f32_apply.loom
+loom-libs/ops/copy_f32.loom
 loom-libs/ops/flash_attention_decode_split_f32_f16_wmma.loom
 loom-libs/ops/flash_attention_f32_f16_wmma.loom
 loom-libs/ops/gated_delta_net_f32_wmma.loom
+loom-libs/ops/llm_attention_k_matmul_rope_set_rows_decode_f32_f32.loom
 loom-libs/ops/llm_attention_v_matmul_set_rows_decode_f32_f32.loom
+loom-libs/ops/mul_mat_id_swiglu_f32_f32_wmma.loom
+loom-libs/ops/mul_mat_q6_k_packed_f16_wmma.loom
+loom-libs/ops/mul_mat_swiglu_f32_f32_wmma.loom
 loom-libs/ops/mul_mat_swiglu_symmetric_i4_wmma.loom
+loom-libs/ops/mul_mat_symmetric_i4_wmma.loom
 loom-libs/ops/mul_mat_symmetric_i8_wmma.loom
+loom-libs/ops/rmsnorm_binary_f32.loom
+loom-libs/ops/rope_set_rows_f32.loom
 loom-libs/ops/set_rows.loom
 loom-libs/ops/small_rows_f32.loom
+qwen_moe/ggml/linear_q6k_q8_1_x4.loom
 qwen_moe/ggml/quantize_q8_1_x4.loom
+qwen_moe/qwen3_moe/attention_postprocess_f32_f16.loom
 qwen_moe/qwen3_moe/attention_prepare_quantized.loom
 qwen_moe/qwen3_moe/dense_linear_quantized_f16_wmma.loom
 qwen_moe/qwen3_moe/flash_attention_decode_f32_f16_wmma.loom
@@ -43,6 +67,7 @@ qwen_moe/qwen3_moe/flash_attention_decode_q128_f32_f16_wmma.loom
 qwen_moe/qwen3_moe/flash_attention_decode_split_f32_f16_wmma.loom
 qwen_moe/qwen3_moe/flash_attention_decode_split_next_q8_test.loom
 qwen_moe/qwen3_moe/flash_attention_f32_f16_wmma.loom
+qwen_moe/qwen3_moe/routed_down_quantized_f16_wmma.loom
 qwen_moe/qwen3_moe/routed_down_weighted_reduce_next_rmsnorm_q8_1_x4.loom
 qwen_moe/qwen3_moe/routed_gate_up_swiglu_q4k.loom
 qwen_moe/qwen3_moe/routed_linear_q4k_f16_wmma.loom

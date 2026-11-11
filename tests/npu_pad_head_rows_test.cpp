@@ -112,6 +112,21 @@ int main() {
         const int r = rows2(500, 6144, 4096, 32016);
         check(r == 32016, "a grid smaller than NV falls back to NV rather than a short read", r, 32016);
     }
+    // The LOWER end of the bound, in each spelling (review of #2026 at 3a1b03a). The arm above is declined because 500 is
+    // not whole blocks, not because it is short: these three are whole 32-row grids, so only `rows >= NV` stands between
+    // them and a dequant of 1,024 rows for a vocabulary of 32,016. Deleting that comparison fails all three.
+    {
+        const int r = rows2(512, 6144, 4096, 32016);
+        check(r == 32016, "a whole-block tile grid short of the vocabulary is declined by the bound, not answered with 1,024", r, 32016);
+    }
+    {
+        const int r = rows3(32, 16, 6144, 4096, 32016);
+        check(r == 32016, "a 3-D grid short of the vocabulary is declined by the bound, not answered with 1,024", r, 32016);
+    }
+    {
+        const int r = rows2(1024, 4096, 4096, 32016);
+        check(r == 32016, "a row grid short of the vocabulary is declined by the bound, not answered with 1,024", r, 32016);
+    }
     // A partial block (shape[0] not a multiple of tiles-per-block) is not a grid this function can walk.
     {
         const int r = rows2(16001, 6144, 4096, 32016);

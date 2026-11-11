@@ -995,12 +995,24 @@ size of the spread between the two control runs. A 27B decode figure taken right
 (8.1 to 11.8 tok/s with the default, 7.6 to 11.5 with the switches at `0`), so compare decode with `-p 0`.
 `GGML_HRX_Q4K_PACKED_TAIL=0 GGML_HRX_Q6K_PACKED_ROWS=0` restores the previous behaviour.
 
-**A dense mixed-quant 27B still holds some weights twice.** Qwen3.8-27B UD-Q4_K_XL after a 1,700-token prompt and a reply: 920
-device copies, 18,205.2 MiB, with 70 weights in two layouts (2,486.7 MiB of duplicate; 88 weights and 2,621.5 MiB with both
-switches at `0`). On that model the one-token decode kernels read the stored layout by design and some prefill kernels read only
-the packed rows, so the two disagree on those 70. Making decode step aside for them was measured and does not help: the same 70
-duplicates, and decode 8.5 % slower. Removing them needs a kernel that reads the other layout
-([engine#2137](https://github.com/1bit-MONSTER/engine/issues/2137)). No routed-expert model has been measured.
+**A dense mixed-quant 27B shares most of its copies too since pin `4107043c1`** (llama.cpp #320). On Qwen3.8-27B UD-Q4_K_XL the
+one-token decode goes through the kquant kernels, which read the stored (GGUF) layout, while some prefill kernels read the packed
+rows, so after a long prompt 70 weights were held in both layouts (2,486.7 MiB of duplicate). HRX now records each stored copy
+it makes, and prefill keeps the stored layout for a weight that already has one: the Q6_K prefill kernel through its stored form,
+and the 256-aligned Q4_K prefill through the 8-bit-block kernel, which reads Q4_K stored as well. Measured with
+`llama-completion -c 4096 -n 32` and a 1,282-word prompt, `GGML_HRX_PREFILL_FOLLOWS_DECODE=0` against unset:
+
+| Qwen3.8-27B UD-Q4_K_XL | `=0` | default |
+|---|---:|---:|
+| device copies | 920, 18,205.2 MiB | 866, 16,181.4 MiB |
+| weights in two layouts | 70 (2,486.7 MiB duplicate) | 16 (462.9 MiB) |
+
+The generated text is identical, and prefill was not slower in the one interleaved window measured (prompt eval 263.5 and 317.1
+tok/s against 298.7 and 317.1). Qwen3-4B is unchanged (398 copies). What is left on the 27B, 15 Q4_K weights read by a prefill
+kernel that has only a packed form and one Q6_K weight, is tracked in
+[engine#2137](https://github.com/1bit-MONSTER/engine/issues/2137). Making decode step aside instead was measured and does not help:
+the same duplicates, and decode 8.5 % slower. flint UD-Q4_K_XL (routed experts) reads every weight stored and holds one copy per
+weight with or without the default.
 
 `GGML_HRX_Q6K_PACKED_PREFILL=1`, the older switch, never saved a copy: its dispatch bound the stored layout. Off its kernel's wide
 tile (tokens not a multiple of 256, or outputs not a multiple of 128) it also read past the weight: a Q6_K matmul at 128 tokens with

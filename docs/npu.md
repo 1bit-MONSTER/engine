@@ -470,15 +470,16 @@ paragraphs up — which is the reason it exists: the target was self-consistent,
 own scalar reference, and decoding a different matrix than the container meant.
 
 
-**The decode head can run on the host (engine#1785), `NPU_HEAD_HOST=1`.** A decode step sends one row
+**The decode head runs on the host (engine#1785); `NPU_HEAD_HOST=0` puts it back on the device.** A decode step sends one row
 through every tile of the int8 head, and a launch costs the same weight pass for one row as for a full
-batch, so those launches are the most expensive use of the device in a token. With `NPU_HEAD_HOST=1` the
-single-row head is computed on the host instead, from the same image the device reads (the resident weight
+batch, so those launches are the most expensive use of the device in a token. The
+single-row head is therefore computed on the host, from the same image the device reads (the resident weight
 buffer's host mapping, no second copy), with the device path's own activation quantiser and the same
 epilogue. The sums are int32, so the logits are the device head's bit for bit, not an approximation of
 them. `NPU_HEAD_HOST_THREADS` sets the threads the tiles are split over (default 4, at most 16). It applies
 to the int8 tiled head only: the ternary (`pb16i`) head, the gemv head and batched head rows (prefill,
-verify) stay on the device. Off by default.
+verify) stay on the device. The serve log says which it is: `lm head: on the host (default; NPU_HEAD_HOST=0 for the
+device), N tile(s), T thread(s)`. If the image cannot be read on the host the head goes to the device, with one line.
 
 Measured on the NPU with FastFlowLM's `Qwen3.5-2B-NPU2` container (vocabulary 248,320, width 2,048, 21
 head tiles), same binary, device head and host head interleaved, 24 greedy tokens per request, on a busy
@@ -503,9 +504,15 @@ serve (96 of 96):
 | head plus following layers | 386 ms (2.6 tok/s) | 334 ms (3.0 tok/s) |
 
 So the host head takes 68 ms off the head and the next token's layers give 15 ms of it back, a net 52 ms
-(13 %) per token on this model. It stays off by default because it changes the profile table's row set (one
-`HEAD` row at M=1 in place of the M=16 launches), and `scripts/npu-window11.sh --compare` requires the two
-binaries it compares to print the same rows. The layers are the other four fifths of a token and are untouched.
+(13 %) per token on this model. On `MiniCPM-V-4.7-1B-NPU2` (width 1,024, 35 head tiles) the same alternation, 100
+tokens at load 23, read 89.2 ms against 5.3 ms for the head and 320.4 against 321.2 ms for the following layers, so
+nothing is given back there: about 84 ms of a 410 ms token. Its 96 logits dumps are byte-identical to a device-only
+serve's.
+
+It is the default because the logits are the device's on both models and the gain is measured inside one serve on
+both. The profile table then has one `HEAD` row at M=1 in place of the M=16 launches;
+`scripts/npu-window11.sh --compare` accepts exactly that difference against a device-head run
+([npu-plan.md](npu-plan.md)). The layers are the other four fifths of a token and are untouched.
 
 ### The t2s stream (what the XDNA decode kernel reads)
 

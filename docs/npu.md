@@ -1741,6 +1741,18 @@ engine#1788. On the published packs the text model only loads once the padded-he
 engine#2026 is in: their head is stored 2 and 16 rows past the vocabulary, and without that rule the
 probe stops at `text model: lm_head dequant failed`.
 
+Three options exist to bisect a wrong answer against a reference run of the same prompt, and are how
+the missing q/k norm above was found:
+
+- `--dump <dir>` writes what the text model is about to be given, in `hybrid_prompt_probe`'s file forms:
+  `ids.i32`, `positions.i32` (the t, h and w planes one after another) and `pooled.f32` (the tower's rows).
+  If these match a reference pipeline's, the fault is past the inputs.
+- `--chunk N` sends the prompt in calls of at most N rows, as the served route sends a prefill; `0` (the
+  default) sends it in one call. Different answers at different N point at the batched body.
+- `--rows-argmax` (with `--none`) prints the model's own next-token choice at every row of a text prompt,
+  from one teacher-forced pass. Compared with a reference's per-row choices, a low agreement that is flat
+  across positions is an error in the layers; a step at some row is an error at a position or a batch edge.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU

@@ -199,6 +199,25 @@ static void wide_family_arms() {
     check(wide_elf_path("0", "W.elf", "/k").empty(), "wide elf: NPU_WIDE_SEALED_ELF=0 switches a pack's wide family off");
     check(wide_elf_path("0x.elf", "", "/k") == "0x.elf", "wide elf: only the exact value 0 means off");
     std::printf("  wide family: 21 arms (complete or not, chunk width, which launch takes it, which file)\n");
+    // The narrow (decode) family: the mirror rules.
+    using onebit::npu::narrow_family_complete;
+    using onebit::npu::narrow_takes;
+    const int n4[] = {4, 4, 0, 4};
+    check(narrow_family_complete(n16, n4, 4, 4), "narrow family: every decode role has a 4-row kernel -> complete");
+    const int nhole[] = {4, 0, 0, 4};
+    check(!narrow_family_complete(n16, nhole, 4, 4), "narrow family: one role without a narrow kernel -> not complete");
+    const int nmixed[] = {4, 8, 0, 4};
+    check(!narrow_family_complete(n16, nmixed, 4, 4), "narrow family: a role built for another row count -> not complete");
+    const int nextra[] = {4, 4, 4, 4};
+    check(!narrow_family_complete(n16, nextra, 4, 4), "narrow family: a kernel for a role with no decode one -> refused");
+    check(!narrow_family_complete(n16, n16, 4, 16), "narrow family: 'narrow' must be narrower than the decode family");
+    check(!narrow_family_complete(n16, w32, 4, 32), "narrow family: a wide set is not a narrow one");
+    check(!narrow_family_complete(nullptr, n4, 4, 4) && !narrow_family_complete(n16, n4, 0, 4) &&
+          !narrow_family_complete(n16, n4, 4, 0), "narrow family: null, empty and zero-row inputs are not complete");
+    check(narrow_takes(1, 4) && narrow_takes(4, 4), "narrow takes: 1 and 4 rows go to a 4-row kernel");
+    check(!narrow_takes(5, 4) && !narrow_takes(16, 4), "narrow takes: 5 rows never go to a 4-row kernel");
+    check(!narrow_takes(1, 0) && !narrow_takes(0, 4), "narrow takes: no family takes nothing, and 0 rows is not a launch");
+    std::printf("  narrow family: 10 arms (complete or not, which launch takes it)\n");
 }
 
 int main(int argc, char** argv) {

@@ -371,6 +371,8 @@ private:
     std::string pb16i_sealed_;
     std::string wide_sealed_;       // q4nx_<layout>_sealed_wide_elf: a wide prefill family (engine#1990)
     int wide_sealed_rows_ = 32;    // q4nx_sealed_wide_rows
+    std::string narrow_sealed_;     // q4nx_<layout>_sealed_narrow_elf: a narrow decode family
+    int narrow_sealed_rows_ = 4;    // q4nx_sealed_narrow_rows
     std::string sealed_dir_;        // the kernels dir the 16-row sealed ELF was found in
     // ---- the NPU target (engine#799 P4) ----
     // Everything that talks to a device lives behind this: the ELF contexts (M=128 prefill and the M=16

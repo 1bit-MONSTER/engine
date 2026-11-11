@@ -3007,10 +3007,13 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
               "pack: 64 columns per gate|up unit and per down_proj group");
 
     int norms = 0, attn_planned = 0, mlp_planned = 0, lm_tiles_planned = 0;
+    bool head_in_tail = false;
     for (const auto& t : p.tensors) {
         if (t.name.find("layernorm") != std::string::npos || t.name == "model.norm.weight") ++norms;
-        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.compare(0, 9, "lm_head.w") == 0)
+        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.compare(0, 9, "lm_head.w") == 0) {
             lm_tiles_planned = int((t.shape[0] / 32) * ((t.shape[1] + 255) / 256));
+            head_in_tail = t.source == "fconst:tail";
+        }
         if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find("self_attn") != std::string::npos) ++attn_planned;
         if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find(".mlp.") != std::string::npos) ++mlp_planned;
     }
@@ -3143,8 +3146,12 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     // the container must open with the engine's own loader
     onebit::npu::Model m(out);
     const auto& head = m.tensor("lm_head.weight");
-    check(head.shape.at(0) == int64_t((head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256)),
-          "pack: lm_head tile count matches the container");
+    // A head read from the .fconst tail keeps the pack's padding to whole 64-row tiles (Hunyuan: 120,818 rows are stored
+    // as 120,832), so the container's count follows the stored rows; the plan's shape stays the vocabulary.
+    const int64_t stored_rows = pi::head_stored_rows(head_rows, head_in_tail);
+    check(head.shape.at(0) == (stored_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256),
+          "pack: lm_head tile count matches the container (" + std::to_string(head.shape.at(0)) + " tiles for " +
+              std::to_string(stored_rows) + " stored rows)");
     check(m.tensor("model.layers.0.input_layernorm.weight").shape.at(0) == p.dims.hidden,
           "pack: a layer norm is `hidden` bf16 values, whatever the hidden size");
     check(m.tensor("model.norm.weight").shape.at(0) == int64_t(p.dims.hidden),
@@ -4923,6 +4930,73 @@ void test_container_geometry() {
     }
 }
 
+// engine#1786 (item F1), slice 2: `plan()` reports WHERE a container's geometry came from. The three genres the census
+// measured are the three cases: `dims` answers (and beats a disagreeing config.json), config.json answers when there is
+// no `dims`, and neither answering is reported as unknown rather than as a zero geometry.
+void test_container_plan(const std::string& root) {
+    namespace fs = std::filesystem;
+    // Under ctest `root` is the source tree's tests/golden, so these three directories are removed on every way out:
+    // the arm is new, and leaving fixtures behind is the defect #2024 fixes for its neighbour -- not repeating it here.
+    struct Cleanup {
+        fs::path base;
+        ~Cleanup() {
+            for (const char* n : {"cg-dims", "cg-cfg", "cg-silent"}) {
+                std::error_code e;
+                fs::remove_all(base / n, e);
+            }
+        }
+    } cleanup{fs::path(root)};
+    const auto write_pack = [&](const std::string& name, const std::string& meta_json, const std::string& config) {
+        const fs::path dir = fs::path(root) / name;
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        std::string hdr = "{";
+        if (!meta_json.empty()) hdr += "\"__metadata__\":" + meta_json + ",";
+        hdr += "\"model.embed_tokens.weight\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[0,16]}}";
+        std::string out(8, '\0');
+        const int64_t n = int64_t(hdr.size());
+        for (int i = 0; i < 8; ++i) out[size_t(i)] = char((n >> (8 * i)) & 0xFF);
+        out += hdr;
+        out.append(16, '\x22');
+        std::ofstream(dir / "model.q4nx", std::ios::binary).write(out.data(), std::streamsize(out.size()));
+        if (!config.empty()) std::ofstream(dir / "config.json") << config;
+        return dir.string();
+    };
+    const std::string dims = "{\"dims\":{\"hidden_size\":576,\"intermediate_size\":1536,\"num_hidden_layers\":30,"
+                             "\"num_attention_heads\":9,\"num_key_value_heads\":3,\"vocab_size\":49152,"
+                             "\"head_dim\":64,\"rope_theta\":10000.0,\"model_type\":\"llama\"}}";
+
+    // 1. self-describing, and a config.json that disagrees: the container's own statement wins and is named.
+    {
+        const auto pl = pi::plan(write_pack("cg-dims", dims, "{\"hidden_size\": 1024}"));
+        check(pl.container_geometry_source == "dims", "plan: a self-describing container reports source=dims");
+        check(pl.dims.hidden == 576, "plan: dims.hidden comes from the container, not the disagreeing config.json");
+        check(pl.dims.layers == 30 && pl.dims.vocab == 49152, "plan: the container's geometry reaches the plan");
+        check(pl.container_geometry_missing.empty(), "plan: nothing is reported missing for a complete container");
+        check(pl.container_note.find("geometry from dims") != std::string::npos,
+              "plan: the note says which source answered");
+    }
+    // 2. gguf-converted: no dims, so config.json answers -- and the source says so.
+    {
+        const auto pl = pi::plan(write_pack("cg-cfg", "{\"converter\":\"tools/gguf_to_q4nx.py\"}",
+                                           "{\"hidden_size\":1024,\"num_hidden_layers\":28,"
+                                           "\"num_attention_heads\":16,\"num_key_value_heads\":8,"
+                                           "\"vocab_size\":151936,\"intermediate_size\":3072,"
+                                           "\"head_dim\":64,\"rope_theta\":1000000.0}"));
+        check(pl.container_geometry_source == "config.json", "plan: a converted container reports source=config.json");
+        check(pl.dims.hidden == 1024 && pl.dims.layers == 28, "plan: config.json supplies the geometry");
+    }
+    // 3. silent: neither answers, so the plan says the geometry is unknown instead of reporting zeros as facts.
+    {
+        const auto pl = pi::plan(write_pack("cg-silent", "", ""));
+        check(pl.container_geometry_source.empty(), "plan: the silent genre claims no source");
+        check(pl.container_geometry_missing.size() == 8, "plan: every required field is reported missing, by name");
+        check(pl.container_note.find("geometry is not known here") != std::string::npos,
+              "plan: the note says the geometry is unknown rather than printing a zero geometry");
+    }
+}
+
 // engine#1786 (item F1): an NPU2 model source is a safetensors container, and this is the reader that decides whether
 // a pack is that genre. The failure that matters is the silent one -- a wrong header length yields an empty inventory,
 // which reads as "a pack with no tensors" rather than "a malformed header" -- so each arm asserts the reason, not just
@@ -5549,6 +5623,17 @@ void test_q4_writer_code_range() {
 // engine#1889: the arithmetic that claims the per-head QK gains out of the 640 B Hunyuan-7B carries between its last qkv
 // tile and o_proj. A wrong offset there reads tile bytes as bf16 and mis-rotates every pack of the family, so both the
 // right shape (2 * (64 + head_dim*2) = 640 at head_dim 128) and the neighbours that must NOT be taken for it are driven.
+// The rows a tail head occupies in the container: the pack's own padding to whole 64-row tiles stays. The pack leg's
+// tile-count check used the vocabulary, so it failed on every pack whose vocabulary is not a multiple of 64 although
+// the import was right (Hunyuan-1.8B: 15,104 tiles written, 15,100 expected).
+void test_head_stored_rows() {
+    check(pi::head_stored_rows(120818, true) == 120832, "head rows: Hunyuan's 120,818 are stored as 120,832");
+    check(pi::head_stored_rows(151936, true) == 151936, "head rows: a multiple of 64 is stored as it is");
+    check(pi::head_stored_rows(49152 + 32, true) == 49152 + 64, "head rows: a multiple of 32 that is not one of 64 is padded");
+    check(pi::head_stored_rows(120818, false) == 120818, "head rows: a graph head is not padded");
+    check(pi::head_stored_rows(0, true) == 0, "head rows: no vocabulary, no rows");
+}
+
 void test_qk_gain_offsets() {
     const pi::QkGainOffsets o = pi::qk_gain_offsets(1000, 128, 640);
     // engine#1934: block 0 is Q. Hunyuan-7B's own model.onnx carries both gains as FP16 initializers, and q_norm is the
@@ -5611,6 +5696,7 @@ int main(int argc, char** argv) {
     test_encode_tile_code_range();
     test_q4_writer_code_range();
     test_qk_norm_refusal();
+    test_head_stored_rows();
     test_qk_gain_offsets();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
@@ -5650,6 +5736,7 @@ int main(int argc, char** argv) {
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
+        test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);
         test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);

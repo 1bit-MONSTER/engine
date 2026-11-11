@@ -96,6 +96,14 @@ struct QkGainOffsets {
 QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes);
 std::string qk_norm_refusal(bool declared, bool found);
 
+// How many rows a head read from the .fconst tail occupies in the container. The pack stores the head in whole 64-row
+// tiles, so a vocabulary that is not a multiple of 64 is carried with the pack's own padding rows (Hunyuan: 120,818 ->
+// 120,832) while `vocab_size` and the plan's tensor shape stay the vocabulary. A head that is a graph initializer is
+// stored as it is: on main nothing pads it, and one whose row count is not a multiple of 32 is refused by the tile
+// writer ("q4_1 tiles need N % 32 == 0"). If graph-head padding lands (engine#1992 was closed unmerged), its quantum
+// belongs here. This is the number a container's lm_head tile count follows from.
+int64_t head_stored_rows(int64_t vocab, bool from_fconst_tail);
+
 // Why a pack's two layout witnesses cannot be reconciled, or "" when they can (engine#1985).
 //
 // `vote_hdrs` is the number of in-block headers the epsilon-anchor vote recorded (0 when it could not win); `declared_qk`
@@ -222,6 +230,12 @@ struct Plan {
     int64_t container_payload_bytes = 0;
     std::map<std::string, int64_t> container_dtypes;
     std::string container_note;   // what the container genre still needs, empty for a non-container pack
+    // engine#1786 (item F1), slice 2: WHERE the container's geometry came from, and what it could not reach.
+    // A bare number in `dims` cannot say whether the pack declared it or a file beside it did, and those two are free to
+    // disagree (13 of the 29 packs measured carry a `dims` block; all 29 carry config.json). Empty for a non-container pack.
+    std::string container_geometry_source;          // "dims", "config.json", or empty when neither answered
+    std::vector<std::string> container_geometry_missing;   // fields no source could fill, by name
+    std::vector<std::string> container_geometry_inferred;  // fields derived from another field, by name
     int64_t graph_matmuls = -1;      // MatMulNBits nodes in the main graph
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)

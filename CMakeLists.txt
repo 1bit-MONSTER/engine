@@ -306,6 +306,11 @@ add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_or
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
 add_python_test(ci_targets ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#2018: this one was in tools/ci/unreferenced_py_tests.txt as a baseline entry, and it should not have been: the
+# file is portable and passes (worst-case |sum| 11.18e6 inside int32 at K=11008, 4 arms), it just never had a runner. A
+# baseline records a test as never-run, which for a passing test is the wrong outcome -- so it is registered and the line
+# is removed, which is the shrink the baseline's own comment asks for.
+add_python_test(moe_expert_chunks_accum_test ${CMAKE_SOURCE_DIR}/tests/moe_expert_chunks_accum_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
 # `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and
 # tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.
@@ -356,6 +361,8 @@ add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-tes
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
 # engine#856: one HRX process's GTT split into the loader's copy and HRX's packed second copy, from its own -v log.
 add_python_test(hrx_gtt_split_self ${CMAKE_SOURCE_DIR}/tools/hrx_gtt_split.py --self-test)
+# engine#679: time per HRX dispatch from the backend's serial trace (the id hash and the per-kernel sums).
+add_python_test(hrx_dispatch_profile_self ${CMAKE_SOURCE_DIR}/tools/hrx_dispatch_profile.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The
@@ -367,6 +374,10 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
+# engine #1504: the release preflight blocks on a runner unit that is down and only warns on a short restart policy.
+# The real scripts/ci-runner-health.sh and weekly.sh's preflight_runner_units() against a stub systemctl; no systemd.
+add_test(NAME weekly_runner_preflight COMMAND ${CMAKE_SOURCE_DIR}/tests/weekly_runner_preflight_test.sh)
+add_test(NAME ci_runner_health_selftest COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/ci-runner-health.sh --self-test)
 # engine #1750: the carried amdxdna series applies in order to the pinned driver, and the context-restart code it
 # produces fails a context's jobs (and logs it) when the restart fails, instead of leaving them parked or running
 # them at close on a half-built firmware context. The driver's own functions in a user-space harness: no NPU, no
@@ -431,6 +442,13 @@ add_test(NAME serve_watchdog COMMAND serve_watchdog_test)
 # engine#1781: the comparator behind NPU_BATCH_CHECK -- pure arithmetic over two float arrays, so it runs with no model,
 # no device and no runtime. It is a header, so the test includes it directly and needs no link libraries.
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
+# The shape rule for a 1.8 external-data initializer (npu/pack_initializer_shape.h, engine#1503's graph-initializer
+# reader). Those packs zero every `dims`, so a byte length has to become a shape -- and a shape inferred wrongly imports
+# cleanly and serves garbage, so the refusals are the arms worth pinning. Header-only, no parser, no pack, no device.
+add_executable(pack_initializer_shape_test tests/pack_initializer_shape_test.cpp)
+target_include_directories(pack_initializer_shape_test PRIVATE npu)
+add_test(NAME pack_initializer_shape COMMAND pack_initializer_shape_test)
+add_dependencies(onebit pack_initializer_shape_test)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 # The NPU route's bounded load retry (app/npu_load_retry.h, engine #1010, docs/npu.md "When a load follows an evict"):
@@ -693,7 +711,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp
+add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp
                             npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
@@ -1219,6 +1237,21 @@ add_executable(npu_vision_tower_test tests/npu_vision_tower_test.cpp)
 target_link_libraries(npu_vision_tower_test PRIVATE onebit_npu)
 add_test(NAME npu_vision_tower COMMAND npu_vision_tower_test)
 add_dependencies(onebit npu_vision_tower_test)
+# The image plan (sizes, slice grid, text rows) against the reference image processor's answers for 3,481 sizes.
+add_executable(npu_vision_plan_test tests/npu_vision_plan_test.cpp)
+target_include_directories(npu_vision_plan_test PRIVATE npu)
+add_test(NAME npu_vision_plan COMMAND npu_vision_plan_test)
+add_dependencies(onebit npu_vision_plan_test)
+# The resize (bit for bit against torch's uint8 antialiased bicubic) and the pieces handed to the tower.
+add_executable(npu_vision_image_test tests/npu_vision_image_test.cpp)
+target_link_libraries(npu_vision_image_test PRIVATE onebit_npu)
+add_test(NAME npu_vision_image COMMAND npu_vision_image_test)
+add_dependencies(onebit npu_vision_image_test)
+# The text side of an image: its tokens and the canvas positions, against the reference model code's own answers.
+add_executable(npu_vision_prompt_test tests/npu_vision_prompt_test.cpp)
+target_include_directories(npu_vision_prompt_test PRIVATE npu)
+add_test(NAME npu_vision_prompt COMMAND npu_vision_prompt_test)
+add_dependencies(onebit npu_vision_prompt_test)
 add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
 target_include_directories(npu_q4nx_test PRIVATE app)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)

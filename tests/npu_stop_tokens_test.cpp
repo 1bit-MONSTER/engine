@@ -79,6 +79,48 @@ int main() {
               "unreadable config");
     std::remove(cfg.c_str());
 
+    // 6. the tokenizer's eos_token and the chat route's turn end (engine#1785, FastFlowLM's Qwen3.5-2B container):
+    //    config.json names <|endoftext|>, tokenizer_config.json names <|im_end|>, and the model ends its turn with
+    //    the second, which was served as text.
+    {
+        using onebit::npu::eos_token_text;
+        using onebit::npu::stop_token_ids;
+        const auto id_of = [](const std::string& t) {
+            if (t == "<|endoftext|>") return 248044;
+            if (t == "<|im_end|>") return 248046;
+            if (t == "<end_of_turn>") return 106;
+            return -1;
+        };
+        const json cfg = json::parse(R"({"eos_token_id": 248044})");
+        const json tok = json::parse(R"({"eos_token": "<|im_end|>"})");
+        check(eos_token_text(tok) == "<|im_end|>", "eos_token as a plain string");
+        check(eos_token_text(json::parse(R"({"eos_token": {"content": "<|im_end|>", "lstrip": false}})")) == "<|im_end|>",
+              "eos_token as an AddedToken object");
+        check(eos_token_text(json::parse(R"({"eos_token": null})")).empty() && eos_token_text(json::parse("{}")).empty() &&
+                  eos_token_text(json::parse(R"({"eos_token": 7})")).empty() && eos_token_text(json(nullptr)).empty(),
+              "a missing, null or non-text eos_token is no token");
+        check_ids(stop_token_ids(cfg, tok, "", id_of), {248044, 248046},
+                  "the tokenizer's eos_token is a stop id beside config.json's (the token that was served as text)");
+        check_ids(stop_token_ids(cfg, json(nullptr), "", id_of), {248044}, "with no tokenizer_config the list is config.json's, unchanged");
+        check_ids(stop_token_ids(cfg, json(nullptr), "<|im_end|>", id_of), {248044, 248046},
+                  "a route that closes its turns with <|im_end|> stops on it even when neither file names it");
+        check_ids(stop_token_ids(cfg, tok, "<|im_end|>", id_of), {248044, 248046}, "named twice, listed once");
+        check_ids(stop_token_ids(json::parse(R"({"eos_token_id": [248046, 248044]})"), tok, "<|im_end|>", id_of), {248046, 248044},
+                  "config.json's order is kept and nothing is repeated");
+        check_ids(stop_token_ids(cfg, json::parse(R"({"eos_token": "<|eot_id|>"})"), "<|nope|>", id_of), {248044},
+                  "a name the tokenizer does not have adds nothing");
+        check_ids(stop_token_ids(json::parse("{}"), json::parse(R"({"eos_token": "<end_of_turn>"})"), "", id_of), {106},
+                  "with no eos_token_id at all, the tokenizer's eos_token is the list");
+        check_ids(stop_token_ids(json(nullptr), json(nullptr), "", id_of), {}, "nothing readable, nothing added");
+        const std::string f = write_cfg("tokcfg", R"({"eos_token": "<|im_end|>"})");
+        check(eos_token_text(onebit::npu::read_json_or_null(f)) == "<|im_end|>", "read from a file");
+        check(onebit::npu::read_json_or_null("/tmp/npu_stop_tokens_does_not_exist.json").is_null(), "a missing file is null");
+        const std::string bad = write_cfg("badjson", "{ not json");
+        check(onebit::npu::read_json_or_null(bad).is_null(), "a malformed file is null");
+        std::remove(f.c_str());
+        std::remove(bad.c_str());
+    }
+
     if (failures == 0) std::printf("all stop-token checks passed\n");
     return failures == 0 ? 0 : 1;
 }

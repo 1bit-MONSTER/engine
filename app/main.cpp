@@ -43,6 +43,7 @@ int onebit_ort_run_main(int argc, char** argv);
 #endif
 #ifdef ONEBIT_NPU_HOST
 #include "pack_import.h"  // 1bit npu-pack: an OGA NPU pack -> a Q4NX model directory
+#include "vision_pack.h"  // 1bit npu-pack vision: a pack's vision component (engine#1788)
 #endif
 #ifdef ONEBIT_NPU
 #include "forward_serve.h"
@@ -94,6 +95,7 @@ void usage(FILE* out) {
 #endif
 #ifdef ONEBIT_NPU_HOST
                  "  npu-pack <info|import> <pack dir>  import a Ryzen AI OGA NPU pack (npu-pack --help)\n"
+                 "  npu-pack vision <pack dir>         read a pack's vision component (vision_weight.q4nx)\n"
 #endif
                  "  comfy <workflow.json>       run a ComfyUI workflow with ComfyUI.cpp (docs/comfyui.md)\n"
 #ifdef ONEBIT_LAYA
@@ -323,6 +325,18 @@ int main(int argc, char** argv) {
 #ifdef ONEBIT_NPU_HOST
     if (cmd == "npu-pack") {
         try {
+            // `npu-pack vision <pack dir>`: the vision component of a two-component pack (engine#1788), read by
+            // npu/vision_pack.h rather than the OGA importer, which knows nothing of it.
+            if (argc >= 3 && std::string(argv[2]) == "vision") {
+                if (argc != 4 || argv[3][0] == '-') {
+                    std::fprintf(stderr, "usage: 1bit npu-pack vision <pack dir>\n"
+                                         "  reads the pack's vision component (config.json's vision_model_weight, default\n"
+                                         "  vision_weight.q4nx): every tensor placed, the tower's geometry from the tensors'\n"
+                                         "  own shapes, and each config.json field the tensors overrule\n");
+                    return argc == 4 ? 0 : 2;
+                }
+                return onebit::npu::vision::print_info(argv[3]);
+            }
             return onebit::npu::pack_import::run(argc - 2, argv + 2);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "1bit npu-pack: %s\n", e.what());

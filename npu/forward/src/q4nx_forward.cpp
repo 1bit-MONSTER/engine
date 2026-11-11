@@ -25,8 +25,11 @@
 // element-wise.
 #include "q4nx_forward.h"
 #include "batch_split.h"          // one wide launch or several narrow ones, decided from measured costs
+#include "pad_head_rows.h"   // engine#1990: the padded-head row rule, header-only for its arm
 #include "batch_width.h"
+#include "ffn_cache_policy.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
+#include "file_create.h"         // dumps are created 0600, never through a symlink
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
 #include <fcntl.h>
@@ -439,6 +442,7 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
     if (!want_m16) {
         fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n", 0,
                 Q4NX_DESIGN_M_DECODE, ndesigns_, Q4NX_DESIGN_M_PREFILL, " (NPU_DECODE_M16=0: disabled)");
+        decode_disabled_ = true;   // engine#2102: turned off on purpose, which the ready line must not call missing
         return true;
     }
     q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
@@ -591,6 +595,7 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
                 designs16_[i].N, elf.c_str());
     }
     xd_->note_m16_made(made > 0);
+    decode_roles_ = made;   // engine#2102: the caller-facing count, beside the byte-for-byte log line below
     if (pb16i_ && made < ndesigns_ - 0) {
         fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
                 t2s_ ? "t2s" : "pb16i", made, ndesigns_);
@@ -848,6 +853,15 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // The plan is the runtime's copy of the sealed-ELF decision; when it names one it wins, so a plan
     // and a container cannot disagree about which file the decode roles run.
     if (plan_.loaded() && !plan_.sealed_elf.empty()) pb16i_sealed_ = plan_.sealed_elf;
+    // The plan is the pack's description when there is one, so its wide family wins over config.json's keys.
+    if (plan_.loaded() && !plan_.sealed_wide_elf.empty()) {
+        wide_sealed_ = plan_.sealed_wide_elf;
+        wide_sealed_rows_ = plan_.sealed_wide_rows;
+    }
+    if (plan_.loaded() && !plan_.sealed_narrow_elf.empty()) {
+        narrow_sealed_ = plan_.sealed_narrow_elf;
+        narrow_sealed_rows_ = plan_.sealed_narrow_rows;
+    }
     // Hand the layout family to the launch layer now that the plan (or the probes) has settled it.
     xd_->set_pb16i(pb16i_, pb16i_dir_, pb16i_sealed_);
     xd_->set_hadamard_block(had_block);
@@ -1536,10 +1550,46 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             lm_head_f_.assign((size_t)NV * (size_t)kpad_, 0.0f);
             lm_w_ = kpad_;
             const uint8_t* lp = (const uint8_t*)model_tensor_data(mw_, ltd);
-            if (!lp || dequant_any(lp, (size_t)ltd->data_size, NV, kpad_,
-                                   lm_head_f_.data()) != 0) {
+            /* engine#1990: the container's head may carry MORE rows than the vocabulary, for the same reason a padded
+             * column exists -- q4_1 tiles hold 32-row multiples and a pack's vocabulary need not be one (CodeLlama's is
+             * 32,016). The importer pads those rows; the reader must therefore dequantise on the tensor's own grid and
+             * keep only the vocabulary's rows. Asking for exactly NV rows is what failed here: 32,016 is not a multiple
+             * of the tile's 32 rows, so dequant_any() refused a head that was perfectly well formed.
+             *
+             * The extra rows decode to zero and are never sampled: the logits vector stays NV long. */
+            int head_rows = NV;
+            if (ltd->ndim >= 2 && kpad_ > 0 && kpad_ % Q4NX_TILE_COLS == 0) {
+                const int64_t per_block = kpad_ / Q4NX_TILE_COLS;   // tiles per 32-row block
+                // engine#1990: the tile COUNT is shape[0] when the tensor is stored as [tiles, tile bytes] -- which is
+                // what this container does (CodeLlama-7b: I8 [16016, 6144] for a 32,032-row head at kpad_ 4,096) -- and
+                // it is shape[0] / per_block when it is stored as a row grid. Gating on `shape[1] == kpad_` saw only the
+                // second form, so a padded head in the first form kept head_rows = NV and dequant_any() refused it:
+                // "lm_head dequant failed" on a head that is exactly what the importer was asked to write.
+                // Both spellings count TILE-ROWS in shape[0] -- [rows, kpad_] and [tiles, tile bytes] -- so the number of
+                // 32-row blocks is shape[0] / per_block either way; only the row WIDTH in shape[1] differs. Exposed as a
+                // pure function because these numbers are what a test can drive without a container.
+                // The rule reads the whole shape: [tiles, tile bytes], [row tiles, column tiles, bytes] (FastFlowLM's
+                // own containers, engine#1788) and [rows, kpad_] each say where the row count is (pad_head_rows.h).
+                const int64_t head_shape[3] = {ltd->shape[0], ltd->shape[1], ltd->ndim >= 3 ? ltd->shape[2] : 0};
+                head_rows = padded_head_rows(head_shape, ltd->ndim, kpad_, NV);
+            }
+            std::vector<float> head_f32;
+            float* head_out = lm_head_f_.data();
+            if (head_rows != NV) {
+                head_f32.assign((size_t)head_rows * (size_t)kpad_, 0.0f);
+                head_out = head_f32.data();
+            }
+            if (!lp || dequant_any(lp, (size_t)ltd->data_size, head_rows, kpad_, head_out) != 0) {
                 err_ = "lm_head dequant failed";
                 return false;
+            }
+            if (head_rows != NV) {
+                for (int r = 0; r < NV; r++)
+                    std::memcpy(&lm_head_f_[(size_t)r * (size_t)kpad_], &head_f32[(size_t)r * (size_t)kpad_],
+                                sizeof(float) * (size_t)kpad_);
+                std::fprintf(stderr,
+                             "  [forward] lm head: %d row(s) stored for a vocabulary of %d; the %d padding row(s) are "
+                             "not read (engine#1990)\n", head_rows, NV, head_rows - NV);
             }
             fprintf(stderr, "  [forward] separate lm_head.weight -> dequantized "
                             "(%zu floats)\n", lm_head_f_.size());
@@ -1813,15 +1863,11 @@ void Q4nxNpuForward::layer_attn_dims(int l, int& hd, int& nkv) const {
 // it -- a GDN model (lin_kd_ > 0, the one case step()'s `dense_weights_cached`
 // can never cover, since that guard stops at lin_kd_ == 0), packed weights
 // actually being cached, and a dense tail big enough for the per-token reload to
-// be material.  Qwen3.8-27B-NPU2 (IM 17408 x H 5120) clears it with 1.07 GB per
-// layer, and measured 117.4 -> 104.5 s wall and 63.3 -> 22.9 s CPU per token on
-// an 8-token request with identical text (~/lb/587-cache-20261030).
-// The floor is a size guard, not a second measurement: below it the reload is
-// small enough that the behaviour change is not worth taking unasked.
+// be material.  The size rule and the two measurements it rests on (Qwen3.8-27B
+// and, since engine#1785, Qwen3.5-2B) are in ffn_cache_policy.h.
 bool Q4nxNpuForward::ffn_cache_default() const {
     if (host_gemm_ || !xd_->weight_cache_on() || lin_kd_ <= 0) return false;
-    const double tail_bytes = 3.0 * (double)c_.IM * (double)c_.H * 4.0;   // wg_+wu_+wd_
-    return tail_bytes >= 256.0 * 1024.0 * 1024.0;
+    return onebit::npu::ffn_cache_worth_it(c_.IM, c_.H);
 }
 // ---- layer-loop host attribution ------------------------------------------
 // The `host=` residual of the [ph] line is layer time that is NOT any of the
@@ -2563,6 +2609,7 @@ bool Q4nxNpuForward::gdn_apply_rows(int from, int to) {
 // its array launches are M-independent (a pb16i ELF runs its 16 rows whatever M is), so the marginal cost of
 // a row is host-side and has to be named, not inferred.  Snapshots the same slots step() fills, prints the
 // delta of one step_batch() call when NPU_PHASE_PROF is set.  Measurement only: nothing here is read back.
+
 namespace {
 struct BatchPhases {
     const bool on = lh_on();
@@ -3277,7 +3324,7 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         static int n = 0;
         char path[4096];
         std::snprintf(path, sizeof path, "%s/arm_L%d_N%d_K%d_%03d.bin", gdir, cur_layer_, N, K, n++);
-        if (std::FILE* f = std::fopen(path, "wb")) {
+        if (std::FILE* f = onebit_fopen_private_wb(path)) {
             std::fwrite(t.d.data(), sizeof(float), std::min<size_t>((size_t)N, t.d.size()), f);
             std::fclose(f);
         }
@@ -3285,15 +3332,21 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
     std::vector<int8_t> a8((size_t)K);
     for (int m = 0; m < M; m++) {
         const float* a = A + (size_t)m * (size_t)a_k;
+        // engine#845's pad on THIS leg too (kept across the merge: main fixed the IMAGE side of the padded-geometry
+        // problem -- unpadded images, row-major when blocked does not fit -- but the activation read still ran past the
+        // row). A padded design has K > a_k: chatglm3-6b's IM is 13,696 and its D design is K = 13,824, so reading A[k]
+        // for k < K runs 128 floats into the next row, or past the buffer. Measured before this: cos 0.40 -> -0.003
+        // against the device while the f32 arm tracked it at 0.985-0.988; after, max|d| = 0 on all four steps.
+        const auto act = [a, a_k](int k) { return k < a_k ? a[(size_t)k] : 0.0f; };
         float amax = 0.0f;
         for (int k = 0; k < K; k++) {
-            const float v = std::fabs(a[k]);
+            const float v = std::fabs(act(k));
             if (std::isfinite(v) && v > amax) amax = v;
         }
         const float ascale = (amax >= 1e-12f) ? amax / 127.0f : 1.0f;
         const float tis = 1.0f / ascale;
         for (int k = 0; k < K; k++) {
-            float v = a[k];
+            float v = act(k);
             if (!std::isfinite(v)) v = 0.0f;
             int q = (int)std::round(v * tis);
             a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
@@ -5587,7 +5640,15 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         // q4nx_pack_B_int8_blocked(): one multiplier per column, int8 codes. Chunked by vocabulary block, because a
         // whole head image is H x V bytes (622 MB at this vocabulary).
         const float inv_es = (sem_.tie_embeddings && sem_.embed_scale > 0) ? 1.0f / sem_.embed_scale : 1.0f;
-        const int TB = 8192;   // vocabulary block; a tile's image is H x TB bytes
+        // engine#1990: the block width is an experiment knob, because the residual on CodeLlama is confined to exactly
+        // 16 logit positions starting at 16384 -- the start of a block -- and is identical at every step, i.e. a WEIGHT
+        // difference localised at a block boundary rather than an accumulation difference. NPU_I8_HEAD_TB moves the
+        // boundaries: if the wrong positions move with it, the chunking is the cause; if they stay at 16384, it is not.
+        static const int TB = [] {
+            const char* e = std::getenv("NPU_I8_HEAD_TB");
+            const int v = e ? std::atoi(e) : 8192;
+            return (v >= 1024 && v % 128 == 0) ? v : 8192;
+        }();
         if ((int)lm_head_i8_.size() != (NV + TB - 1) / TB) lm_head_i8_.assign((NV + TB - 1) / TB, HostI8Tensor());
         logits.assign((size_t)NV, 0.0f);
         std::vector<float> a8v((size_t)H);

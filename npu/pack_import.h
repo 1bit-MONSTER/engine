@@ -450,6 +450,11 @@ struct Report {
     // check; an untied pack's head and embedding are separate matrices by construction, and the same number is
     // meaningless -- reported as such rather than left looking like a failed import.
     bool selfcheck_tied = false;
+    // engine#1503: tied, correlated -- but MIS-SCALED. Correlation alone passes a head that is a scaled copy of the
+    // embedding: two packs measured on this box report corr 0.9915/0.9961 with rel_err 0.095/0.136 and serve garbage
+    // ("myself" forever), while the pack that serves correctly reports rel_err 0.000000. A pack in this state imports
+    // cleanly and answers nonsense, so it is refused rather than reported.
+    bool selfcheck_scaled = false;
     double lmhead_corr = 0, lmhead_rel = 0, ctrl_corr_nibble = 0, ctrl_corr_nozp = 0;
     // The tail (.fconst) path has no MatMulNBits bytes to mis-decode, so its control is an ALIGNMENT one: the same
     // tiles, the same decoder, rows matched against the neighbouring embedding row. A correct decode correlates ~1
@@ -649,6 +654,11 @@ constexpr bool kExtQuantsRowMajor = false;
 // measurably NOT the same weights: on a real phi-4 tile it reproduced the pack's codes on only 2,826 of 8,192
 // entries and moved weights by 2.5 % of the tensor's range (engine#1503). `m_inexact` reports how many group
 // offsets were not bf16-exact (86.3 % are, measured), because that rounding is the only loss this path has.
+// engine#1990: a head whose row count is not a multiple of the 32-row tile quantum (CodeLlama: 32,016 rows) cannot be
+// held by the q4_1 grid, so pad it with zero rows that decode to zero and leave the container's vocab_size alone. Exposed
+// because the property -- padding is invisible to the vocabulary -- is what a test can pin without a pack.
+void pad_rows_to_tile_quantum(Q4& q, int vocab);
+
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact = nullptr);
 
 // The container role a matmul plays, read off the graph's own tensor name: `...qkv_proj...` -> "QKV",
@@ -779,6 +789,12 @@ bool fconst_scratch_ready(const std::string& dir);
 // real table must never contain: two rows for one geometry with different shapes.
 const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
                                               std::string* why);
+
+// engine#1503: the tied-head rule, as ONE predicate so the four call sites cannot drift: the head must reproduce the
+// embedding (corr) AND not be a scaled copy of it (rel_err). The constant is the measured gap between the two states --
+// 0.000000 for the pack that serves, 0.095/0.136 for the two that do not -- so 0.02 sits far from both.
+inline constexpr double kSelfcheckRelMax = 0.02;
+bool selfcheck_head_ok(double corr, double rel);
 
 int64_t attn_tile_bytes(int64_t k);
 // Pearson correlation between a quantised head and a bf16 embedding table (engine#1690; the self-check's own statistic,

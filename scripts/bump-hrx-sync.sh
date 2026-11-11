@@ -169,10 +169,12 @@ sync_llama() {
     held)
       note "1bit/hrx-vulkan is held at ${mirror:0:12} by $LLAMA_HOLD_FILE: AMD's pin ${pin:0:12} does not descend from it (AMD rewrote its line). Nothing was moved; the merge is tracked where the hold file says."
       summary "- llama.cpp: mirror \`1bit/hrx-vulkan\` HELD at \`${mirror:0:12}\` ($LLAMA_HOLD_FILE); AMD's pin is \`${pin:0:12}\`, on a line that does not contain it. Not merged."
-      output "rebased=$patched"
+      # The engine's pin does not move while the mirror is held: `rebased` is what the workflow would pin, and
+      # naming the engine's own pin makes its last step say "nothing to move" (our line may be ahead of the pin;
+      # moving the pin along it is a reviewed PR of its own, not something a held run does).
+      output "rebased=${OURS_LLAMA:-$patched}"
       output "llama_held=1bit/hrx-vulkan HELD at \`${mirror:0:12}\` by \`$LLAMA_HOLD_FILE\` (AMD's pin is \`${pin:0:12}\`)."
       output "patches<<EOF
-$(git log --format='- `%h` %s' "${OURS_LLAMA:-$patched}..$patched" 2>/dev/null || true)
 EOF"
       return 0 ;;
   esac

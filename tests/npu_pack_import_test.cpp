@@ -33,6 +33,7 @@
 //    their biases, the MLP projections and the final norm -- and produces a container the engine's own
 //    Model can open.
 
+#include "../npu/forward/include/file_create.h"   // written files are 0600, never through a symlink
 #include "model.h"
 #include "pack.h"
 #include "pack_import.h"
@@ -1404,6 +1405,53 @@ void test_1671_plan_head_arm(const std::string& root) {
 }
 
 // ── 1. MatMulNBits: encode here, decode with the importer ────────────────────
+// engine#1990: a head whose row count is not a multiple of the 32-row tile quantum (CodeLlama's vocabulary is 32,016) is
+// padded with rows that decode to zero, and the container's vocab_size is NOT changed -- the padding is invisible to the
+// vocabulary. Both halves are pinned here because widening N without staying invisible is the failure that would show up
+// as two plausible extra tokens at the end of every distribution.
+void test_head_row_padding() {
+    const auto make = [](int N) {
+        pi::Q4 q;
+        q.N = N;
+        q.K = 128;      // two 64-column tiles
+        q.block = 32;   // four groups per row
+        q.codes.assign(size_t(N) * size_t(q.K), 1);          // non-zero, so padding is distinguishable
+        q.scale.assign(size_t(N) * size_t(q.K / q.block), 0.5f);   // 1.0 in the padded rows; see below
+        q.zero.assign(size_t(N) * size_t(q.K / q.block), 0.25f);
+        return q;
+    };
+    {
+        pi::Q4 q = make(32016);
+        pi::pad_rows_to_tile_quantum(q, 32016);
+        check(q.N == 32032 && q.N % 32 == 0, "head padding: 32,016 rows become 32,032 (the 32-row quantum)");
+        check(q.codes.size() == size_t(32032) * 128 && q.scale.size() == size_t(32032) * 4,
+              "head padding: codes and scales grow with the rows, one group's worth each");
+        bool zeros = true;
+        for (int r = 32016; r < q.N; r++) {
+            for (int k = 0; k < q.K; k++) zeros = zeros && q.codes[size_t(r) * 128 + size_t(k)] == 0;
+            for (int g = 0; g < 4; g++)
+                zeros = zeros && q.scale[size_t(r) * 4 + size_t(g)] == 1.0f && q.zero[size_t(r) * 4 + size_t(g)] == 0.0f;
+        }
+        check(zeros, "head padding: every padded row is code 0, scale 1, zero 0 -- which decodes to 0.0, not to a weight");
+        bool kept = true;
+        for (int r = 0; r < 32016; r++)
+            for (int k = 0; k < 128; k++) kept = kept && q.codes[size_t(r) * 128 + size_t(k)] == 1;
+        check(kept, "head padding: the vocabulary's own rows are untouched");
+    }
+    {   // an aligned vocabulary is left exactly as it was: no note, no growth
+        pi::Q4 q = make(32000);
+        const size_t before = q.codes.size();
+        pi::pad_rows_to_tile_quantum(q, 32000);
+        check(q.N == 32000 && q.codes.size() == before, "head padding: a 32-aligned vocabulary (32,000) is not touched");
+    }
+    {   // 16 rows of slack and 1 row of slack both round up to one tile boundary, not two
+        pi::Q4 a = make(32017), b = make(32031);
+        pi::pad_rows_to_tile_quantum(a, 32017);
+        pi::pad_rows_to_tile_quantum(b, 32031);
+        check(a.N == 32032 && b.N == 32032, "head padding: 32,017 and 32,031 both round to 32,032");
+    }
+}
+
 void test_matmulnbits() {
     const int N = 64, K = 256, B = 128;
     std::vector<uint8_t> qw(size_t(N) * (K / B) * (B / 2));
@@ -4617,7 +4665,7 @@ static void dump_real_component(const std::string& dir) {
     const int row = 1;                          // token id 1: a plain text token ORT embeds
     if ((row + 1) * H > v.size()) return;
     const std::string out = dir + "/eng_row.f32";
-    if (FILE* f = std::fopen(out.c_str(), "wb")) {
+    if (FILE* f = onebit_fopen_private_wb(out.c_str())) {
         std::fwrite(&v[size_t(row) * H], sizeof(float), H, f);
         std::fclose(f);
         double s = 0;
@@ -5683,7 +5731,23 @@ void test_header_witness_refusal() {
     std::printf("  header witness: 8 arms (one-header vote vs declaration refuses; 3/1-without-declaration/0 allowed)\n");
 }
 
+// engine#1503: the tied-head rule as ONE predicate -- correlated AND not mis-scaled. Two packs on this box correlate
+// (0.9915 / 0.9961) while being scaled copies of their own embedding (rel_err 0.1361 / 0.0949): they import cleanly and
+// serve garbage, where the pack that serves correctly reports rel_err 0.000000. Correlation alone cannot tell them apart,
+// which is why the correlation-only check passed both and cost two device tickets.
+static void selfcheck_head_rule_arms() {
+    check(pi::selfcheck_head_ok(0.996901, 0.000000), "head rule: the pack that serves correctly passes (corr .9969, rel 0)");
+    check(!pi::selfcheck_head_ok(0.991539, 0.136140), "head rule: a correlated but scaled head is refused (corr .9915, rel .1361)");
+    check(!pi::selfcheck_head_ok(0.996053, 0.094874), "head rule: the second measured pack is refused too (corr .9961, rel .0949)");
+    check(pi::selfcheck_head_ok(0.996053, 0.000000),
+          "head rule: correlated and unscaled passes -- the rule is not 'refuse everything'");
+    check(!pi::selfcheck_head_ok(0.50, 0.000000), "head rule: an uncorrelated head is still refused on correlation");
+    check(pi::selfcheck_head_ok(0.996053, pi::kSelfcheckRelMax), "head rule: exactly at the threshold passes (inclusive bound)");
+    std::printf("  head rule: 6 arms (two measured bad packs, the serving one, the unscaled control, no-corr, boundary)\n");
+}
+
 int main(int argc, char** argv) {
+    selfcheck_head_rule_arms();
     // engine#1907: every crafted 1.9 import writes a canonical copy into the scratch cache. Without this the suite left 0-byte
     // copies in the user's real ~/.cache/1bit/fconst19 and in /tmp on every run. Give the run its own directory, removed at exit.
     const fs::path run_scratch = ::onebit::test::tmp_root() / ("1bit-pack-test-scratch-" + std::to_string(::getpid()));
@@ -5725,7 +5789,8 @@ int main(int argc, char** argv) {
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);
-        test_matmulnbits();
+        test_head_row_padding();
+    test_matmulnbits();
         test_tiles(golden_dir);
         test_q4_1f();
         test_attn_tile(golden_dir);

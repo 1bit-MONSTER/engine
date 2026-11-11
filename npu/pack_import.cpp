@@ -498,6 +498,11 @@ const uint8_t* at(const Fconst& f, int64_t off, int64_t len) {
 // field, the readout and the note all have to agree on it: three copies of 0.99 is how they drifted apart before.
 constexpr double kTieCorr = 0.99;
 
+// engine#1503: tied AND not mis-scaled. Correlation alone passes a head that is a scaled copy of the embedding -- two
+// packs on this box report corr 0.9915/0.9961 with rel_err 0.095/0.136 and serve garbage, while the pack that serves
+// correctly reports rel_err 0.000000. One predicate, so the four sites that set selfcheck_tied cannot drift apart.
+
+
 // Every entry was measured by diffing the 1.9 pack against the 1.8 pack of the SAME model: the bundle's tile shape and
 // its rotation are not derivable from the pack, and neither is `prefix`. It was tempting to read the extra bytes as
 // Qwen3's per-head QK norm gains, but Llama-3.2-1B -- which has no QK norms at all -- carries the same +4,352 at hidden
@@ -2258,6 +2263,30 @@ bool external_container_tensors(const std::string& role, int nh, int nkv, int hd
     err = "external role \"" + role + "\" has no container tensor in this forward (a weight with nowhere to go is a "
           "refusal, not a silent drop)";
     return false;
+}
+
+// engine#1990: q4_1 tiles hold 32-row multiples, and a pack's vocabulary need not be one. CodeLlama's is 32,016, which
+// refused the whole import with "q4_1 tiles need N % 32 == 0" -- a head the grid cannot hold, not a head that is wrong.
+// Where the pack pads its own head (the .fconst tail carries ceil(V/64)*64 rows: Hunyuan-0.5B has 120,832 for 120,818)
+// nothing here fires; where it does not, pad with rows that decode to zero, and leave `vocab_size` at the vocabulary's
+// own number so the padding is never addressed. codes 0 with SCALE 1 and zero 0 decode to exactly 0.0 -- and scale 1,
+// not 0: a zero scale is not a zero weight to a reader, it is a malformed parameter block (the forward's dequant refuses
+// it, which is how the first version of this padding was caught: "lm_head dequant failed").
+void pad_rows_to_tile_quantum(Q4& q, int vocab) {
+    if (q.N <= 0 || q.K <= 0 || q.block <= 0 || q.K % q.block) return;
+    if (q.N % q4nx::kRows == 0) return;
+    const int padded = (q.N + q4nx::kRows - 1) / q4nx::kRows * q4nx::kRows;
+    const size_t gpr = size_t(q.K / q.block);   // groups per row
+    for (int r = q.N; r < padded; r++) {
+        q.codes.insert(q.codes.end(), size_t(q.K), 0);
+        q.scale.insert(q.scale.end(), gpr, 1.0f);   // 1.0, not 0: code 0 * 1 + 0 = 0.0, and a 0 scale is malformed
+        q.zero.insert(q.zero.end(), gpr, 0.0f);
+    }
+    std::fprintf(stderr,
+                 "note: the head is %d rows for a vocabulary of %d (padded from %lld to the 32-row tile quantum); "
+                 "vocab_size stays %d in the container\n",
+                 padded, vocab, (long long)q.N, vocab);
+    q.N = padded;
 }
 
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact) {
@@ -4976,6 +5005,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         uint64_t qw_need = 0;   // N * K/block * block/2
         if (!mul_ok(groups_n, uint64_t(mm.block) / 2, qw_need)) throw std::runtime_error("lm_head: qweight length overflows");
         Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
+        pad_rows_to_tile_quantum(q, int(V));
         // no qzeros tensor -> the implicit zero point (engine#1503: Qwen3-VL-4B's spelling, three-input nodes)
         if (!have_zp) implicit_zp_zero(q, mm.bits);
 
@@ -5016,6 +5046,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // `tied` is false there while the head plainly reproduces its embedding, and the readout used to call those
             // packs untied while the container it wrote said tied. Same threshold the container's own decision uses.
             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
+
+            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
             const Q4 swap = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K),
                                                mm.block, /*swap_nibbles*/ true, false);
             const Q4 nozp = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), nullptr, int(mm.N), int(mm.K),
@@ -5103,6 +5135,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 }
                 r.selfcheck_reference = true;
                 r.selfcheck_tied = c32 > kTieCorr;
+
+                r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
                 double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
                 const int nsh = std::min(2048, int(V) - 1);
                 for (int rr = 0; rr < nsh; ++rr)
@@ -5316,6 +5350,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                         r.lmhead_corr = corr(q, embed_tbl, q.N);
                         r.selfcheck_reference = true;
                         r.selfcheck_tied = r.lmhead_corr > kTieCorr;
+
+                        r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
                         double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
                         const int nsh = std::min(2048, q.N - 1);
                         for (int rr = 0; rr < nsh; ++rr)
@@ -5428,6 +5464,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                             r.lmhead_corr = corr(q, embed_tbl, q.N);
                             r.selfcheck_reference = true;
                             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
+
+                            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
                             // The control this path can actually run: the same tiles and the same decoder, with each
                             // head row matched against the NEXT embedding row. If a misaligned head still correlated,
                             // the number above would be measuring the vocabulary's mean brightness rather than the
@@ -6025,6 +6063,20 @@ int run(int argc, char** argv) {
     }
 
     const Report r = import_pack(dir, out, Options{allow, layout});
+    // engine#1503: a head that correlates but is mis-scaled imports cleanly and answers nonsense on the device (two
+    // packs measured: rel_err 0.095 and 0.136 against 0.000000 on the pack that serves). `--allow-incomplete` is not an
+    // override here: that flag means "write the tensors I could not represent", and this is "the tensors I wrote do not
+    // decode", which no amount of writing fixes.
+    if (r.selfcheck_scaled) {
+        std::fprintf(stderr,
+                     "1bit npu-pack: refusing to import %s: the head correlates with the pack's own embedding (%.6f) but "
+                     "its relative error is %.6f, which is a scaled or partially decoded head rather than a rounding "
+                     "difference (the threshold is %.3f). A pack in this state imports cleanly and answers garbage on "
+                     "the device; --allow-incomplete does not override this. The partial output this run already\n"
+                     "wrote under %s is not servable -- delete it before retrying.\n",
+                     dir.c_str(), r.lmhead_corr, r.lmhead_rel, kSelfcheckRelMax, out.c_str());
+        return 3;
+    }
     if (!r.refused.empty() && !allow) {
         std::fprintf(stderr,
                      "1bit npu-pack: refusing to import %s: %zu of the pack's tensors cannot be "
@@ -6278,5 +6330,9 @@ void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::
     }
 }
 
+// engine#1503: the tied-head rule, defined here so it is the namespace-scope function the header declares (a file-local
+// copy is ambiguous with it at every call site). Correlated AND not a scaled copy of the embedding -- the two states this
+// box measures are rel_err 0.000000 (serves) and 0.095/0.136 (imports cleanly, answers garbage).
+bool selfcheck_head_ok(double corr, double rel) { return corr > kTieCorr && rel <= kSelfcheckRelMax; }
 
 }  // namespace onebit::npu::pack_import

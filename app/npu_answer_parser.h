@@ -172,6 +172,9 @@ public:
     // The calls seen so far, in order.  A call needs tools_sent, per the issue's rule.
     const std::vector<ToolCall>& calls() const { return calls_; }
     bool saw_reasoning() const { return saw_reasoning_; }
+    // Inside a reasoning block right now (after the opening tag, before the closing one). reasoning_token_count()
+    // reads it before and after each token, so the tags themselves and held-back partial tags count with the block.
+    bool in_reasoning() const { return mode_ == Mode::reasoning; }
     bool saw_text() const { return saw_text_; }
 
     const std::string& reasoning() const { return reasoning_; }
@@ -180,8 +183,22 @@ public:
 private:
     enum class Mode { content, reasoning, call };
 
-    void emit(std::vector<std::pair<bool, std::string>>& out, bool is_reasoning, const std::string& text) {
-        if (text.empty()) return;
+    // Whitespace around a reasoning block is the model's layout, not part of either text: `<think>\n...\n</think>\n\n`
+    // then the answer.  Left in, the answer to "one word" comes back as "\n\nParis", and a model that thinks nothing
+    // (`<think>\n\n</think>`) sends a reasoning chunk that is two newlines.  So the whitespace that LEADS the reasoning
+    // is dropped, and so is the whitespace that leads the content when that content follows a reasoning block --
+    // the rule app/think_split.h has always applied on the in-process route ("whitespace around the block is
+    // dropped"), so the two routes return the same strings.  Content with no reasoning before it is not touched.
+    void emit(std::vector<std::pair<bool, std::string>>& out, bool is_reasoning, const std::string& raw) {
+        if (raw.empty()) return;
+        std::string text = raw;
+        bool& trim = is_reasoning ? trim_reasoning_ : trim_content_;
+        if (trim) {
+            const size_t b = text.find_first_not_of(" \t\r\n");
+            if (b == std::string::npos) return;   // all whitespace so far: nothing to send yet
+            text.erase(0, b);
+            trim = false;
+        }
         if (is_reasoning) {
             reasoning_ += text;
             saw_reasoning_ = true;
@@ -221,6 +238,8 @@ private:
                 }
                 if (starts(tags_.think_close)) {
                     flush_plain();
+                    // what follows a block is separated from it by layout whitespace -- unless content came first
+                    if (mode_ == Mode::reasoning && !saw_text_) trim_content_ = true;
                     mode_ = Mode::content;
                     i += std::string(tags_.think_close).size();
                     continue;
@@ -377,6 +396,8 @@ private:
     std::vector<ToolCall> calls_;
     bool saw_reasoning_ = false;
     bool saw_text_ = false;
+    bool trim_reasoning_ = true;   // until the reasoning's first non-whitespace character
+    bool trim_content_ = false;    // set when a reasoning block closes before any content; cleared by the first text
 };
 
 // Does the rendered prompt leave the model INSIDE a reasoning block?  Some templates end their generation prompt
@@ -422,6 +443,57 @@ inline std::vector<char> content_mask(const std::vector<std::string>& pieces, An
         if (!is_reasoning && !mask.empty() && !mask.back()) mask.back() = 1;
     }
     return mask;
+}
+
+// How many of `pieces` (one generated token's text each, in order) were reasoning: OpenAI's
+// usage.completion_tokens_details.reasoning_tokens (engine#2111). An empty `content` with finish_reason "length" reads
+// like "the model said nothing" when the whole budget went into a thinking block, and this is the number that says so.
+// A token is reasoning when none of its text reached `content` and the block was open before it, after it, or it put
+// text into the block: so the opening and closing tags, a partial tag the holdback keeps, and an unclosed block at the
+// end of the budget all count, while call markup and the whitespace after a closed block do not. A token that
+// straddles the boundary ("</think>The") is content, as content_mask() says. Same splitter, so the count, the split
+// and the logprob entries cannot disagree.
+inline int reasoning_token_count(const std::vector<std::string>& pieces, AnswerFamily family, bool tools_sent,
+                                 bool starts_in_reasoning = false) {
+    AnswerStream s(family, tools_sent, starts_in_reasoning);
+    std::vector<std::pair<bool, std::string>> out;
+    int n = 0;
+    bool last_counted = false;
+    // Tokens that produced nothing before anything was produced (leading whitespace, the first half of an opening tag
+    // the holdback keeps) belong to whatever comes next: to the block if the next token opens it, to nothing otherwise.
+    int pending = 0;
+    bool started = false;
+    for (const auto& piece : pieces) {
+        const bool before = s.in_reasoning();
+        out.clear();
+        s.feed(piece, out);
+        bool content = false, reasoning = false;
+        for (const auto& [is_reasoning, text] : out) {
+            (void)text;
+            (is_reasoning ? reasoning : content) = true;
+        }
+        last_counted = !content && (reasoning || before || s.in_reasoning());
+        if (last_counted) {
+            ++n;
+            if (!started) n += pending;
+            started = true;
+        } else if (content) {
+            started = true;
+        } else if (!started) {
+            ++pending;
+        }
+    }
+    // What the holdback still holds is flushed by finish(): if it is content, the last token's text reached `content`.
+    out.clear();
+    s.finish(out);
+    for (const auto& [is_reasoning, text] : out) {
+        (void)text;
+        if (!is_reasoning && last_counted) {
+            --n;
+            last_counted = false;
+        }
+    }
+    return n;
 }
 
 // The whole answer at once: the same splitter, so the two paths cannot disagree.

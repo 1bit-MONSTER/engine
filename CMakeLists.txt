@@ -507,6 +507,18 @@ add_test(NAME pack_initializer_shape COMMAND pack_initializer_shape_test)
 add_dependencies(onebit pack_initializer_shape_test)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
+# The speculative round's bookkeeping (app/spec_decode.h, engine#1781): a drafter's proposals against the verifier's
+# per-row logits, with the acceptance rule from npu/mtp/spec_accept.h (#1958, merged). Header-only and pure -- the
+# uniforms come from the caller, so every arm is a hand-computed value and there is no model, device or RNG here.
+# `add_dependencies(onebit ...)` because a target ci.yml never builds is the failure that check exists to catch.
+add_executable(spec_decode_test tests/spec_decode_test.cpp)
+# ${CMAKE_SOURCE_DIR} as well as app/, because app/spec_decode.h includes "npu/mtp/spec_accept.h" by its repo-relative
+# path -- which is how every other consumer of that header spells it. Without the root on this target's path the build
+# fails with "npu/mtp/spec_accept.h: No such file or directory", measured on CI run 42935896650 (the risk the PR body
+# named, so it cost one run rather than a review).
+target_include_directories(spec_decode_test PRIVATE app ${CMAKE_SOURCE_DIR})
+add_test(NAME spec_decode COMMAND spec_decode_test)
+add_dependencies(onebit spec_decode_test)
 # The reader for a tools/moe_placement.py table (app/moe_placement.h, engine#1702): a consumer that splits experts across
 # devices adopts a table only if it was written for this model -- schema, group count, every routed layer, every expert
 # id exactly once -- and only on the held-out share, never the in-sample one. Header only, no device, no model.

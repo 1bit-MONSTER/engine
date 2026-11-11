@@ -2194,6 +2194,19 @@ On FastFlowLM's Qwen3.5-2B-NPU2 (IM 6144, H 2048, a 151 MB tail that the earlier
 run in one ticket measured decode at 362–367 ms per token with the cache on (both arms) against 485–520 ms with
 it off in the quieter of the two off arms and 478–707 ms in the other, same text in all twelve runs (engine#1785).
 
+The full-attention layers of such a model had the same reload, for their own four buffers: `load_layer()`
+dequantised `q`, `k`, `v` and `o` into `wq_`/`wk_`/`wv_`/`wo_` on every decode token, and the only reader of
+those buffers (`q4nx_assemble_B`) is skipped once the layer's packed QKV and O images are on the device. The
+reload is now skipped when **both** images are resident (the batched path guards its O assemble with the QKV
+key, so a half-cached layer still loads everything) and the run is not `NPU_INFER_HOST_GEMM`.
+`NPU_ATTN_RELOAD=1` keeps the old per-token reload. On Qwen3.5-2B-NPU2 (6 full-attention layers of 24), an
+A B B A run in one ticket with `NPU_PHASE_PROF=1`, 46 decode tokens per arm, medians: `load_layer` 13.0 and
+11.6 ms per token with the reload against 0.04 and 0.03 ms without; the layer loop's host share 23.9 and 22.2
+ms against 10.6 and 11.1 ms; device wait unchanged (240.7 to 247.3 ms in all four). All 144 logits dumps of
+the other three arms are byte-identical to the first arm's, so this removes work and changes no value. The
+whole token moved from 347 and 345 ms to 332 and 341 ms, which on that box (load 20 to 27) is inside the
+spread between two arms of one mode; the host share is the number to read (engine#1785).
+
 ### The prefix cache's snapshot: two kinds of plane
 
 `snapshot_state`/`restore_state` (`npu/forward/include/q4nx_forward.h`) hand a prefill's state to the next

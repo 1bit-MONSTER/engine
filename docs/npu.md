@@ -1784,10 +1784,12 @@ The slot table (`app/npu_prefix_cache.h`) has a slot kind for the part such requ
 | call | what it decides |
 |---|---|
 | `pin_point(prev, ids)` | how many leading tokens this request shares with the previous one. 0 when one prompt is a prefix of the other (a repeat or a continued conversation, which the ordinary slots already keep), when the shared part adds fewer than `--prefix-min-gain` tokens over a slot that already covers the request, or when the cache is off |
+| `pin_at(ids, n)` | the same decision for a point the caller already knows: `n` leading tokens every such request shares. 0 when `n` is the whole prompt, when a slot already covers it, or when it is under `--prefix-min-gain` |
 | `pin(prefix, bytes)` | keep the state at that point. One pinned slot at a time: a new pin replaces it; eviction for room and a longer prompt's replacement both leave it alone |
 | `lookup(ids)` | unchanged, and reports `pinned` when the hit is the pinned slot |
 
-It reads token ids only, so it does not depend on the template or on which message is the system prompt.
+The table itself reads token ids only, so it does not depend on the template. Where the pin goes is the caller's
+choice between two rules, below.
 
 **`--prefix-pin`** (on `1bit serve --device npu` and on `forward-serve`; off by default) turns it on. The
 forward keeps the previous request's prompt ids, and when `pin_point()` is non-zero it stops the prefill one
@@ -1811,6 +1813,27 @@ The generated text of all four requests is identical between the cache-off arm a
 The default-cache arm's times are not in the table: the ticket ended during its third request, so only its
 three cache decisions (from the server log) are known. A request's time here is the whole HTTP call, prefill
 plus 16 generated tokens, not TTFT.
+
+**Pinned on the first request (engine#1785).** That run needed two requests to find the shared part, so the
+third was the first warm one, and when two questions opened with the same words the pin ran a few tokens into the
+question, which a question opening differently could not use. A chat request with a leading system message now
+gives the point directly: the route renders the leading system messages followed by a probe user message (the
+container's template, or ChatML) and pins where the full prompt stops agreeing with that, on the first request
+(`pin_at`). The probe user message is there because a template may refuse to render a system turn alone (the
+Qwen3.5 template does); if a template cannot render even that, the request has no early pin and the log says so
+(`[prefix] no early pin: …`). Only a request with no
+system message still uses the comparison with the previous request (`pin_point`). On FastFlowLM's
+`Qwen3.5-2B-NPU2` container under `--flash`, a 1,016-token prompt, time to first token (two server loads):
+
+| request | before | after |
+|---|---|---|
+| first question | 8.8 s | 10.6 / 11.1 s (busier box; makes the pin: 1,003 tokens) |
+| **second question** | 9.1–9.5 s (made the pin: 1,009 tokens) | **1.39 / 1.38 s** (1,002 of 1,017 cached) |
+| third question | 1.06 s | 1.40 / 1.35 s |
+
+The "before" column was taken with two other changes that make decode about a third faster on this model, the
+"after" column without them and at twice the box load, so compare the rows' shape (which request is the first warm
+one), not the third row's two figures.
 
 **`--flash`** (`1bit serve --device npu --flash`) is the single-turn profile as one word: `--ctx-size 1024`
 plus `--prefix-pin`. It refuses what contradicts it (`--ctx-size` other than 1024, `--prefix-slots 0`, a device

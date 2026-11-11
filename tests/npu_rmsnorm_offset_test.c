@@ -26,6 +26,7 @@
 // own xn (cos 1.000000) and rmsnorm(embed, 1 + w) reproduces the reference's (cos 0.999999), so this
 // one bit is the whole 0.6367-token-probability gap in engine#796's causal arm.
 #include "q4nx_semantics.h"
+#include "file_create.h"   /* fixture files are created owner-only and never through a symlink */
 
 #include <math.h>
 #include <stdio.h>
@@ -120,7 +121,7 @@ int main(void) {
         const unsigned char full[8] = {0, 0, 0, 1, 0, 0, 0, 1};   /* layers 3 and 7 carry the tensor */
         const unsigned char none[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         Q4nxSemantics sem;
-        FILE* f = fopen(path, "w");
+        FILE* f = onebit_fopen_private_wb(path);
         if (f) {
             fputs("{\"model_type\": \"minicpmv4_7\", \"architectures\": [\"MiniCPMV4_7ForConditionalGeneration\"], "
                   "\"hidden_size\": 1024, \"num_hidden_layers\": 8, \"hidden_act\": \"silu\"}", f);
@@ -144,7 +145,7 @@ int main(void) {
         check(q4nx_semantics_qk_norm_from_tensors(&sem, NULL, full, 8) == -1 && q4nx_semantics_qk_norm_from_tensors(NULL, full, full, 8) == -1 &&
                   q4nx_semantics_qk_norm_from_tensors(&sem, full, full, 0) == -1,
               "null or empty input changes nothing");
-        f = fopen(path, "w");
+        f = onebit_fopen_private_wb(path);
         if (f) {
             fputs("{\"model_type\": \"qwen3_5\", \"hidden_size\": 1024, \"num_hidden_layers\": 8}", f);
             fclose(f);

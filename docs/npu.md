@@ -2889,6 +2889,14 @@ can fail a run.
 variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
 looking for a code path that skips the dump.
 
+**A projection that is right on the host and wrong on the device: check its weight-cache key.** The device target
+keeps one packed weight image per (layer, key), and the host arms do not use that cache. Two projections of one layer
+under one key therefore launch with the same weights on the NPU only: a Gemma4 pack answered correctly in host-GEMM
+mode and returned noise on the device, with every kernel bit-exact, because its per-layer input gate and projection
+used the attention projections' keys (engine#2213). `NPU_INFER_DUMP_OPS=1` on both sides showed it in one token: the
+op lines agree up to the first projection that shares a key. A layer's keys are named in
+`npu/forward/include/weight_keys.h` and held distinct at compile time; a new projection takes a new name there.
+
 A caller inside the process that needs the same stream as data, not files, uses
 `Q4nxNpuForward::set_layer_taps(layers, &sink)` (engine#1780): every pass then appends one row per position to the
 sink, `taps x H` wide, the listed layers side by side. It works for `step()` and for the batched passes, and it is what

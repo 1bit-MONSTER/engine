@@ -27,6 +27,7 @@
 #include "batch_width.h"
 #include "ffn_cache_policy.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
+#include "file_create.h"         // dumps are created 0600, never through a symlink
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
 #include <fcntl.h>
@@ -3284,7 +3285,7 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         static int n = 0;
         char path[4096];
         std::snprintf(path, sizeof path, "%s/arm_L%d_N%d_K%d_%03d.bin", gdir, cur_layer_, N, K, n++);
-        if (std::FILE* f = std::fopen(path, "wb")) {
+        if (std::FILE* f = onebit_fopen_private_wb(path)) {
             std::fwrite(t.d.data(), sizeof(float), std::min<size_t>((size_t)N, t.d.size()), f);
             std::fclose(f);
         }

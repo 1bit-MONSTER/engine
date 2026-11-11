@@ -35,6 +35,7 @@
 // resets it from position 0.
 #include "forward_serve.h"
 
+#include "../npu/forward/include/file_create.h"   // dumps are created 0600, never through a symlink
 #include "npu_decode_note.h"
 
 #include "../npu/forward/include/q4nx_forward.h"
@@ -536,7 +537,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             if (!e.dump_logits.empty()) {
                 const std::string path = e.dump_logits + "/step_" + std::to_string(dump_req) + "_" +
                                           std::to_string(n) + ".bin";
-                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                if (std::FILE* f = onebit_fopen_private_wb(path.c_str())) {   // 0600, no symlink (file_create.h)
                     std::fwrite(logits.data(), sizeof(float), logits.size(), f);
                     std::fclose(f);
                 }
@@ -1175,9 +1176,27 @@ int run_forward_serve(int argc, char** argv) {
     // after the template, because whether the route renders ChatML is known only now.
     {
         const bool chatml_route = !can_render && e.chat_ok;
+        // The marker this route's prompts close an assistant turn with.  On the ChatML fallback it is <|im_end|>.
+        // With the container's own template it is read off the template: render a two-message exchange and take
+        // what follows the assistant's text (npu::turn_end_marker).  A template that cannot render that exchange
+        // contributes nothing, and the load line below shows what the serve stops on either way.
+        std::string turn_end = chatml_route ? std::string("<|im_end|>") : std::string();
+        if (can_render) {
+            static const char* const kProbe = "\xC2\xA4turn-end-probe\xC2\xA4";
+            try {
+                nlohmann::ordered_json exchange = nlohmann::ordered_json::array();
+                exchange.push_back({{"role", "user"}, {"content", "u"}});
+                exchange.push_back({{"role", "assistant"}, {"content", kProbe}});
+                const std::string rendered = npu::render_chat_template(e.tmpl, exchange, /*add_generation_prompt=*/false,
+                                                                       nlohmann::ordered_json::object(), e.bos_text, e.eos_text);
+                const size_t at = rendered.find(kProbe);
+                if (at != std::string::npos) turn_end = npu::turn_end_marker(rendered.substr(at + std::strlen(kProbe)));
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr, "1bit forward-serve: the template did not render a two-message exchange (%s); no turn-end marker from it\n", ex.what());
+            }
+        }
         e.eos = npu::stop_token_ids(npu::read_json_or_null(cfg), npu::read_json_or_null(dir + "/tokenizer_config.json"),
-                                    chatml_route ? std::string("<|im_end|>") : std::string(),
-                                    [&](const std::string& text) { return e.tok->token_id(text); });
+                                    turn_end, [&](const std::string& text) { return e.tok->token_id(text); });
         std::string named;
         for (size_t i = 0; i < e.eos.size(); i++)
             named += std::string(i ? ", " : "") + std::to_string(e.eos[i]) + " " + e.tok->decode(e.eos[i]) +

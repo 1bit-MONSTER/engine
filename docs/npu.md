@@ -1632,6 +1632,28 @@ images on a CPU build with AVX2 (torchvision is not on this box, so that link is
 no real photograph or image decoder has been through it. The slice separators and placeholder rows on
 the text side are not written.
 
+**The text side of an image (`npu/vision_prompt.h`).** Two more pieces of arithmetic, on token ids only:
+
+- `vision::image_tokens(plan, markers)`: what replaces one `<|image_pad|>` in the rendered prompt.
+  `<image>`, one placeholder per row of the whole view, `</image>`, then each row of slices as
+  `<slice>` placeholders `</slice>` per slice, with one newline token between rows. The tower's rows go
+  into the placeholders in order. (`<image_id>k</image_id>` in front is ordinary text, left to the
+  caller.)
+- `vision::prompt_positions(ids, markers, grids)`: the three position planes (t, h, w) for a prompt that
+  contains images, the model's `mrope_mode: canvas`. Text counts 1, 2, 3 on all three planes. An image
+  is laid on a canvas whose origin is the next free position: the slices tile it, the whole view is
+  stretched over it, `<image>` sits one step before it and `</image>` on its far corner, and the text
+  after it resumes at `origin + max(canvas height, canvas width) + 1`. So an image moves the position
+  counter by its **side**, not by its row count: a 480 × 640 picture is 203 placeholder rows and
+  advances the position by 15.
+
+Both follow transformers' `MiniCPMV4_7Processor.replace_image_token` and
+`MiniCPMV4_7Model.get_rope_index`, and `tests/npu_vision_prompt_test.cpp` holds that code's answers for
+eight prompts (one to two images, with and without slices, touching, newline-separated, with id
+prefixes, and none) as hashes over every token id and position. Images only: video frames are not
+handled. Nothing feeds these planes or the tower's rows into the text forward yet; that is the route's
+work.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU

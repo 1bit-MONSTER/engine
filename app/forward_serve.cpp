@@ -1088,6 +1088,7 @@ int run_forward_serve(int argc, char** argv) {
     e.bos_id  = json_int(cfg, "bos_token_id", -1);
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;
     e.eos = npu::eos_token_ids_from_config(cfg);
+    const size_t eos_from_config = e.eos.size();
     e.endoftext = e.tok->token_id("<|endoftext|>");
     // q4nx_config_int finds the key at any depth (a text_config's too).
     e.max_context = q4nx_config_int(cfg.c_str(), "max_position_embeddings", 0);
@@ -1142,6 +1143,20 @@ int run_forward_serve(int argc, char** argv) {
             "prompt as token ids (#938) and render the model's own template" +
             (specials.empty() ? std::string() : " (model specials: " + specials + ")");
         std::fprintf(stderr, "1bit forward-serve: chat route disabled: %s\n", e.chat_refusal.c_str());
+    }
+    // What ends a generation is more than config.json's eos_token_id (npu::stop_token_ids): the tokenizer's own
+    // eos_token, and, when this route closes its prompt turns with ChatML's marker, that marker.  Decided here,
+    // after the template, because whether the route renders ChatML is known only now.
+    {
+        const bool chatml_route = !can_render && e.chat_ok;
+        e.eos = npu::stop_token_ids(npu::read_json_or_null(cfg), npu::read_json_or_null(dir + "/tokenizer_config.json"),
+                                    chatml_route ? std::string("<|im_end|>") : std::string(),
+                                    [&](const std::string& text) { return e.tok->token_id(text); });
+        std::string named;
+        for (size_t i = 0; i < e.eos.size(); i++)
+            named += std::string(i ? ", " : "") + std::to_string(e.eos[i]) + " " + e.tok->decode(e.eos[i]) +
+                     (i < eos_from_config ? "" : " (tokenizer / chat turn end)");
+        std::fprintf(stderr, "1bit forward-serve: stops on %s\n", named.empty() ? "<|endoftext|> only" : named.c_str());
     }
     // The template variables `{{ bos_token }}`/`{{ eos_token }}` render: the strings the tokenizer
     // actually has (a null bos_token in tokenizer_config.json is "", and the engine's -1 is the same

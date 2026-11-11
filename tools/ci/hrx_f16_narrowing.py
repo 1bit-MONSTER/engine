@@ -24,7 +24,9 @@ worth anything if it cannot silently change underneath the person answering it.
 
 This is the ratchet:
 
-  * every .loom body that narrows f32 to f16 (`f32 to f16` or `truncf`) is listed in
+  * every .loom body that narrows f32 to f16 -- by the `fptrunc` op, the scalar `truncf` spelling, or an
+    `f32 to f16` type line, which covers both the scalar and the `vector<Nxf32> to vector<Nxf16>` forms -- is
+    listed in
     tools/ci/hrx_f16_narrowing.txt, and a body that appears without a line, or a line whose body is gone,
     fails the check -- the two arms a ratchet needs (a list that can only grow cannot see a rename,
     engine#1728's lesson);
@@ -45,7 +47,12 @@ import sys
 
 CORPUS = pathlib.Path("third_party/llama.cpp/ggml/src/ggml-hrx/kernel-corpus/kernels")
 BASELINE = pathlib.Path("tools/ci/hrx_f16_narrowing.txt")
-NARROW = ("f32 to f16", "truncf")
+# engine#2219: `truncf` and `f32 to f16` between them miss `vector.fptrunc %v : vector<4xf32> to vector<4xf16>`
+# -- the vector spelling contains neither `truncf` (it is `fptrunc`) nor `f32 to f16` (the types are wrapped in
+# `vector<Nx...>`). At pin 2b7960bae that form is 132 of the 233 fptrunc lines and 27 of the 52 narrowing bodies,
+# so the ratchet was listing 25 of 52 and reporting "none new, none stale". `fptrunc` is LLVM's narrowing op and
+# covers both spellings; the other markers stay because a hand-written or vendor file may use them without it.
+NARROW = ("fptrunc", "truncf", "f32 to f16")
 GUARD = ("scale_log2", "prescale")
 
 

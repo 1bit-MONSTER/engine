@@ -1916,6 +1916,34 @@ route loads and a captured `--device npu` run stands behind it; the regenerated 
 GGUF-on-NPU forward), while every D3-* pack in this body declares the dense `qwen3_5` family, so
 the two are not the same answer and the registry keeps them apart.
 
+The answers are also machine-readable, in `registry/flm_answers.json`, because CI keeps no watcher state: every scheduled
+run sees the whole org as new, and before that file each family answered above printed `!! NPU FLM` again and re-filed
+the census issue the day after it closed (engine#2171; the 2026-11-11 run alerted on 31 packs, every one already
+answered or tracked). A pack whose declared architecture is listed there prints `. NPU FLM` / `. FLM` with the issue
+that tracks it and does not alert; a family with no entry still alerts. The test fails on an entry for a family the
+registry serves on the NPU route, so a family that starts to load drops its answer. Keyed by the architecture each
+pack declares (a config with no `architectures` declares its `model_type`):
+
+| declared architecture | packs on 2026-11-11 | answer | tracked by |
+|---|---|---|---|
+| `MiniCPMV4_7ForConditionalGeneration` | MiniCPM-V-4.7-1B, MiniCPM-V-4.7-35B-A3B | not served: a VLM class the pin does not register | engine#1788 |
+| `MiniCPMOcrForConditionalGeneration` | MiniCPM-OCR-1.0 | not served: an OCR/vision pack; the route claims text decoders only | engine#1786 |
+| `HYV3ForCausalLM` | Hy-Memory-30B-A3B | not served: `hy_v3`, hrx only | engine#1786 |
+| `DFlashDraftModel` | Nemotron-3.5-Bolt-E4B-DFlash | not served: a draft head, not a decoder | engine#1780 |
+| `Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration` | Nemotron-3.5-Bolt-E4B, Gemma4-E4B-IT, Gemma4-E2B-IT, Gemma4-12B-IT | not served: `gemma4`, hrx only | engine#1786 |
+| `HunYuanDenseV1ForCausalLM` | Hy-MT2-1.8B | not served: `hunyuan-dense`, hrx only | engine#1786 |
+| `Gemma3ForCausalLM`, `gemma3_text` | Gemma3-270M, Gemma3-1B, Gemma3-4B, Gemma3-4B-Text, medgemma-4b-it, medgemma-1.5-4b-it, Translategemma-4B-Instruct | not served: `gemma3`, hrx only | engine#1786 |
+| `Lfm2ForCausalLM` | LFM2-1.2B, LFM2-2.6B, LFM2-1.2B-Tool, LFM2-2.6B-Transcript, LFM2.5-1.2B, LFM2.5-1.2B-Thinking | not in the registry's NPU set: `lfm2`, hrx only (LFM2.5-1.2B on the per-op route is engine#2170, which adds no `NPU_ARCHS` entry) | engine#1786 |
+| `GptOssForCausalLM` | GPT-OSS-20B, GPT-OSS-Safeguard-20b | not served: `gpt-oss`, hrx only | engine#1786 |
+| `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B | not served for this class: the route serves `qwen3_5_moe` through `Qwen3_5MoeForCausalLM` (GGUF on the NPU); the VLM wrapper class is hrx only, and FastFlowLM's own pack is not measured on the route | engine#1786 |
+| `Qwen2_5_VLForConditionalGeneration` | Qwen2.5-VL-3B-Instruct | not served: `qwen2vl`, hrx only (the route serves the text-only `qwen2` class) | engine#1786 |
+| `Phi3ForCausalLM` | Phi4-mini-Instruct | not served: `phi3`, hrx only | engine#1786 |
+| `Gemma3TextModel` | Embedding-Gemma-300M | not served: `gemma-embedding`, an embedding model, hrx only | engine#1786 |
+| `WhisperForConditionalGeneration` | Whisper-V3-Turbo | not served: a speech encoder-decoder the registry does not map | engine#1783 |
+
+`FastFlowLM/smolvla-NPU2` is answered by its repo id (`repos` in the same file): it has no config and no `*.q4nx`
+file, so there is no architecture to key on and nothing for the route to load.
+
 ### FastFlowLM's own containers, served as published: measured rows (engine#1786)
 
 The tables above answer "does the registry map this family". This one answers a different question for the packs

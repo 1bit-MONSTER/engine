@@ -109,10 +109,10 @@ llama_mirror_branch() {
   if [ -f "$f" ]; then name=$(grep -v '^[[:space:]]*#' "$f" | grep -v '^[[:space:]]*$' | head -n1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true); fi
   [ -n "$name" ] || name=1bit/hrx-vulkan
   case "$name" in
-    */hrx-vulkan-patched|1bit/hrx-vulkan-patched) die "$LLAMA_MIRROR_FILE names $name, which is our own line, not a mirror of AMD's" ;;
+    */hrx-vulkan-patched|1bit/hrx-vulkan-patched) die "$LLAMA_MIRROR_FILE names $name, which is our own line, not a mirror of AMD's" >&2 ;;
   esac
   if ! [[ "$name" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$name" == *..* ]] || [[ "$name" == -* ]] || [[ "$name" == refs/* ]]; then
-    die "$LLAMA_MIRROR_FILE names '$name', which is not a plain branch name"
+    die "$LLAMA_MIRROR_FILE names '$name', which is not a plain branch name" >&2
   fi
   echo "$name"
 }

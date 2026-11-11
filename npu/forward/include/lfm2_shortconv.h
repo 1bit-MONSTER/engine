@@ -82,6 +82,19 @@ inline bool shortconv_step(ShortConvState& st, const float* bcx, const float* ta
     return true;
 }
 
+// Advance the state by one position WITHOUT computing an output: `bx` is that position's B*X, H values. This is
+// what a rolled-back batch re-applies for the rows it keeps (the outputs were already produced; only the window
+// has to match the accepted prefix). Leaves exactly the state shortconv_step() leaves for the same token.
+inline bool shortconv_push(ShortConvState& st, const float* bx) {
+    if (!st.ready() || bx == nullptr) return false;
+    const int H = st.hidden, L = st.taps;
+    if (L > 1) {
+        if (L > 2) std::memmove(st.history.data(), st.history.data() + H, size_t(L - 2) * size_t(H) * sizeof(float));
+        std::memcpy(st.history.data() + size_t(L - 2) * size_t(H), bx, size_t(H) * sizeof(float));
+    }
+    return true;
+}
+
 // M tokens in order: `bcx` is [M][3H] row-major, `y` is [M][H]. Defined as M calls of shortconv_step(), in that
 // order, so there is nothing for it to disagree with.
 inline bool shortconv_rows(ShortConvState& st, const float* bcx, int rows, const float* taps, float* y) {

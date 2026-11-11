@@ -108,8 +108,21 @@ with tempfile.TemporaryDirectory() as repo:
           "and the failure names the SHAPE, not a missing notice", rc.stdout + rc.stderr)
     check("missing copyright notice: short.h" not in rc.stdout,
           "and does NOT claim the notice is missing", rc.stdout + rc.stderr)
-    git(repo, "rm", "-q", "--cached", "short.h")
+    # engine#2175: --fix must REPLACE the stub, not stack the block above it. Before this it left both, so the
+    # file came out with the Copyright/SPDX pair twice, the duplicate rule fired, and --check stayed red -- the
+    # tool's own remedy could not fix the shape it had just named.
+    rc = run(repo, "--fix")
+    check(rc.returncode == 0, "--fix repairs a short header", rc.stdout + rc.stderr)
+    got = open(os.path.join(repo, "short.h")).read()
+    check(got.count("SPDX-License-Identifier") == 1,
+          "and exactly one SPDX line survives the repair", f"{got.count('SPDX-License-Identifier')} found")
+    check("Licensed under the Apache License, Version 2.0" in got,
+          "and the full licence block is there", got[:200])
+    check("the file's own description" in got, "and the file's own header text is kept", got)
+    rc = run(repo, "--check")
+    check(rc.returncode == 0, "and --check is green after the repair", rc.stdout + rc.stderr)
     os.unlink(os.path.join(repo, "short.h"))
+    git(repo, "add", "-A", "short.h")
 
     # an ignored file is not source: it must not need a notice. The .gitignore itself is source (the
     # repo's own carries the notice and is tracked), so it gets one here too.

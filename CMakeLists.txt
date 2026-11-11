@@ -212,6 +212,16 @@ add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_re
 add_executable(audio_ops_test tests/audio_ops_test.cpp)
 target_include_directories(audio_ops_test PRIVATE npu/forward/include)
 add_test(NAME audio_ops COMMAND audio_ops_test)
+# engine#1783 (F8): the engine reads an audio pack's graph and runs the whole encoder + decoder on the host -- 447 + 786 nodes,
+# matched against onnxruntime. The reader keeps every node in graph order (the census walk keeps only the MatMul family).
+add_executable(onnx_graph_test tests/onnx_graph_test.cpp)
+target_link_libraries(onnx_graph_test PRIVATE onebit_npu)
+add_test(NAME onnx_graph COMMAND onnx_graph_test ${ONEBIT_AUDIO_ONNX})
+set_tests_properties(onnx_graph PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(audio_exec_test tests/audio_exec_test.cpp)
+target_link_libraries(audio_exec_test PRIVATE onebit_npu)
+add_test(NAME audio_exec COMMAND audio_exec_test ${ONEBIT_AUDIO_ONNX})
+set_tests_properties(audio_exec PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
 add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $<TARGET_FILE:onebit>)
@@ -754,7 +764,7 @@ if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp
-                            npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
+                            npu/audio_exec.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)

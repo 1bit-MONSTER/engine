@@ -3354,14 +3354,6 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
            "neither is being preferred";
 }
 
-AttnFirstTiles attn_first_tiles(int n_kv, int n_q, bool q_first) {
-    AttnFirstTiles f;
-    f.k = q_first ? n_q : 0;
-    f.q = q_first ? 0 : n_kv;
-    f.v = n_kv + n_q;
-    return f;
-}
-
 // engine#1786 (item F1): the container genre's geometry, from the container's own `dims` block and then config.json.
 // The order is authority, not preference: `dims` is the pack's own statement about itself, config.json is a file beside
 // it that a vendor converter wrote. When the two disagree the container's statement wins and `source` says so -- the

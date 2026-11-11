@@ -945,8 +945,8 @@ one line per device copy, since pin `2b7960bae`), the extra copies have two caus
 A prompt made only of 512-token batches, a short prompt, or decode alone holds one copy per weight.
 
 `GGML_HRX_Q4K_PACKED_TAIL=1` (llama.cpp #308) makes the generic kernels read Q4_K in the packed layout, and
-`GGML_HRX_Q6K_PACKED_ROWS=1` (llama.cpp #310) makes Q6_K prefill read the packed rows decode reads, at every batch size. Both are
-opt-in; the stored path is the default. Measured on Qwen3-4B Q4_K_M with both on, against both off (one binary, fork `ccf14f9c9`):
+`GGML_HRX_Q6K_PACKED_ROWS=1` (llama.cpp #310) makes Q6_K prefill read the packed rows decode reads, at every batch size. Measured on
+Qwen3-4B Q4_K_M with both on, against both off (one binary, fork `ccf14f9c9`):
 
 | | off | on |
 |---|---:|---:|
@@ -958,9 +958,21 @@ opt-in; the stored path is the default. Measured on Qwen3-4B Q4_K_M with both on
 | `llama-bench -p 1700` | 2,211.7, 1,901.1 tok/s | 2,319.6, 2,307.0 tok/s |
 | `test-backend-ops -o MUL_MAT` on `HRX0` | 641 of 641 | 641 of 641 |
 
-They are not the default yet because that is one model: there is no dense 27B row and no routed-expert row, the 6-to-16-token Q6_K
-kernel reads a third layout that neither switch covers, and the switches only save memory with the file mapping. With
-`GGML_HRX_MODEL_BUFFER_COPY=1` the stored layout is the loader's buffer and costs nothing extra, so they add packed copies there.
+**Since pin `caa2d4dde` the packed layout is the default for a weight in the file mapping** (llama.cpp #313). The switches only save
+memory where the stored layout costs a copy, and that is a property of each weight's buffer. So with neither switch set, a Q4_K or
+Q6_K weight in the file mapping is read in the packed rows, and a weight that was uploaded (`GGML_HRX_MODEL_BUFFER_COPY=1`, a
+host-weight limit, `--no-mmap`) keeps the stored layout, which is already on the device there. The switches now force the choice for
+every weight: `1` packed, `0` stored. Measured at `caa2d4dde`'s change on Qwen3-4B Q4_K_M, default against both switches at `0`,
+counting distinct (weight, layout) copies:
+
+| after | stored (`=0`) | default |
+|---|---:|---:|
+| a 1,700-token prompt and a 16-token reply | 647 copies, 4,400.6 MiB (249 weights in two layouts) | **398 copies, 2,375.9 MiB (none)** |
+| a 100-token prompt | 398 copies, 2,375.9 MiB | 398 copies, 2,375.9 MiB |
+
+Perplexity at a 300-token batch is 19.2890 in both arms. Prefill is not slower: 1,229 against 1,098 tok/s at 300 tokens and 2,040
+against 1,860 at 1,700 (back to back, not interleaved). Still one model: there is no dense 27B row and no routed-expert row, and the
+6-to-16-token Q6_K kernel reads a third layout that neither switch covers.
 
 `GGML_HRX_Q6K_PACKED_PREFILL=1`, the older switch, never saved a copy: its dispatch bound the stored layout. Off its kernel's wide
 tile (tokens not a multiple of 256, or outputs not a multiple of 128) it also read past the weight: a Q6_K matmul at 128 tokens with

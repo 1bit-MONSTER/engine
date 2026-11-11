@@ -68,6 +68,12 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
   npu/                   the model's NPU kernels
 ```
 
+**What ends an answer.** The serve stops on every id in `config.json`'s `eos_token_id` (one integer or a list), on
+`<|endoftext|>` when the tokenizer has it, on `tokenizer_config.json`'s `eos_token` when that file is beside the
+tokenizer, and, when the chat route falls back to ChatML, on `<|im_end|>`. The two files need not agree: FastFlowLM's
+`Qwen3.5-2B-NPU2` container names `<|endoftext|>` in the first and `<|im_end|>` in the second, and the model ends a
+chat turn with the second. The load prints the list (`forward-serve: stops on …`).
+
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the OpenAI-compatible API
 ([serve.md](serve.md)); inside Lemonade, that is what its `onebit` backend runs (`--onebit npu`).
 
@@ -1579,6 +1585,80 @@ has 61 times the tokens and its attention grows with the square, which is why th
 output for it as goldens, so the arithmetic is checked in CI without a pack; with
 `ONEBIT_MINICPM_PACK` and `ONEBIT_MINICPM_ORACLE` set it repeats the comparison above. The reference
 run itself needs transformers and torch and is not in the tree.
+
+**Where an image goes before the tower (`npu/vision_plan.h`).** `vision::plan_image(height, width)` is
+the arithmetic of the model's image processor (transformers' `MiniCPMV4_6ImageProcessor`, which 4.7
+loads), with no pixel touched: the model looks at an image whole, resized to about 448 × 448 pixels,
+and, when the image is larger than that, again as a grid of up to 9 slices cut from a second, larger
+resize. Every piece is a multiple of 56 pixels (4 patches) in both extents, because the tower merges
+2 × 2 twice, and becomes `(height/56) × (width/56)` rows on the text side.
+
+| image | whole view | slices | text rows |
+|---|---|---|---|
+| 448 × 448 or smaller (scaled up) | 448 × 448 | none | 64 |
+| 480 × 640 | 392 × 504 | 1 × 2 of 560 × 392 | 63 + 2 × 70 |
+| 1080 × 1920 | 336 × 616 | 2 × 4 of 448 × 448 | 66 + 8 × 64 |
+| 3024 × 4032 | 392 × 504 | 3 × 3 of 392 × 504 | 63 + 9 × 63 |
+
+(heights first.) So one 448-pixel slice is 64 rows, not the 1,225 that 980 / 14 / 2 squared suggests: the
+position table is 70 × 70, but no piece the processor produces is that large unless the image is a very
+long strip. The plan is checked against the reference's own answers for 3,481 image sizes in
+`tests/npu_vision_plan_test.cpp`. Nothing is cropped or padded and no size is refused for not being a
+multiple of anything: every image is resized whole (385 × 384 becomes 448 × 448, so the aspect ratio moves
+a little, as it does in the model's own processor), and the slices tile the refine size exactly. The plan
+does not bound its result: a 1,048,576 × 1 strip gives the reference's answer, a piece 458,752 pixels
+tall, and it is the caller that decides how many rows to accept. `plan_image()` reads no file and touches
+no pixel, which is what lets it be checked anywhere; keep it that way.
+
+**From bytes to the tower's input (`npu/vision_image.h`).** `vision::preprocess(rgb, height, width, plan)`
+resizes an RGB byte image to the plan's whole view and, when it is sliced, to the refine size, cuts the
+slices, and returns each piece as `(3, height, width)` float32 with value `(byte − 127.5) / 127.5`
+(rescale by 1/255, then mean 0.5 and std 0.5, the same for each channel; R, G, B order in and out; byte
+0 is exactly −1 and byte 255 exactly +1): the whole view first, then the slices row by row. The resize is bicubic with antialiasing on bytes and
+reproduces `torch.nn.functional.interpolate(uint8, mode="bicubic", antialias=True)` (torch 2.13) bit
+for bit: the a = −0.5 cubic stretched by the scale when shrinking, integer weights at the largest
+precision that still fits int16 (PIL's fixed 22 bits differs by one in about 1 % of bytes), width
+first and then height. `tests/npu_vision_image_test.cpp` holds the reference's bytes for eleven
+resizes as hashes.
+
+End to end on the 1B pack, 2026-11-10: a 460 × 470 synthetic image through plan, resize, pieces and
+`tower_forward()`, against the reference's plan, torch's resize and the transformers tower on the same
+image:
+
+| piece | patches | rows | max \|d\| | corr |
+|---|---|---|---|---|
+| whole view 448 × 448 | 32 × 32 | 64 | 6.4e-6 | 1.000000000 |
+| slice 0, 616 × 336 | 44 × 24 | 66 | 7.5e-6 | 1.000000000 |
+| slice 1, 616 × 336 | 44 × 24 | 66 | 6.7e-6 | 1.000000000 |
+
+That run took 110 s on one thread, which is the host reference's cost and the reason it is not a
+serving path. Two things are not established: the reference side called torch's `interpolate`
+directly, on the understanding that this is what the processor's torchvision resize does for byte
+images on a CPU build with AVX2 (torchvision is not on this box, so that link is read, not run); and
+no real photograph or image decoder has been through it. The slice separators and placeholder rows on
+the text side are not written.
+
+**The text side of an image (`npu/vision_prompt.h`).** Two more pieces of arithmetic, on token ids only:
+
+- `vision::image_tokens(plan, markers)`: what replaces one `<|image_pad|>` in the rendered prompt.
+  `<image>`, one placeholder per row of the whole view, `</image>`, then each row of slices as
+  `<slice>` placeholders `</slice>` per slice, with one newline token between rows. The tower's rows go
+  into the placeholders in order. (`<image_id>k</image_id>` in front is ordinary text, left to the
+  caller.)
+- `vision::prompt_positions(ids, markers, grids)`: the three position planes (t, h, w) for a prompt that
+  contains images, the model's `mrope_mode: canvas`. Text counts 1, 2, 3 on all three planes. An image
+  is laid on a canvas whose origin is the next free position: the slices tile it, the whole view is
+  stretched over it, `<image>` sits one step before it and `</image>` on its far corner, and the text
+  after it resumes at `origin + max(canvas height, canvas width) + 1`. So an image moves the position
+  counter by its **side**, not by its row count: a 480 × 640 picture is 203 placeholder rows and
+  advances the position by 15.
+
+Both follow transformers' `MiniCPMV4_7Processor.replace_image_token` and
+`MiniCPMV4_7Model.get_rope_index`, and `tests/npu_vision_prompt_test.cpp` holds that code's answers for
+eight prompts (one to two images, with and without slices, touching, newline-separated, with id
+prefixes, and none) as hashes over every token id and position. Images only: video frames are not
+handled. Nothing feeds these planes or the tower's rows into the text forward yet; that is the route's
+work.
 
 ## Serving
 

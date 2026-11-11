@@ -886,6 +886,37 @@ a token threshold still reads the loader's copy. "Not attributed" is mostly runt
 staging buffer is capped at 64 MiB since [llama.cpp #266](https://github.com/1bit-MONSTER/llama.cpp/pull/266)). It is not
 weights. This replaces the `bo_trace.py` reproduction in the issue body, which was never committed.
 
+**Which kernel a graph's time is in.** `tools/hrx_dispatch_profile.py` gives the time per HRX dispatch, summed per kernel,
+on any HRX build (it needs no rebuild). The backend's serial mode (`GGML_HRX_DEBUG_SERIAL_EXECUTION=1`) waits for the device
+after every dispatch and prints a line at launch and at completion; the tool sets the switch, time-stamps those lines and
+names the kernels from the pinned fork's manifests. Inside your ticket:
+
+```
+gpu-hold -l <lane> -t 10 -- tools/hrx_dispatch_profile.py run --log prof.log --json prof.json -- \
+    llama-bench -m Qwen3-4B-Q4_K_M.gguf -ngl 99 -p 8192 -n 16 -r 1
+tools/hrx_dispatch_profile.py parse prof.log --top 20        # again, from the trace it kept
+```
+
+It prints one table per command program (a graph shape: prefill batch, decode step). Measured on the pin `2293f95ea`,
+Qwen3-4B Q4_K_M, the prefill program of a 512-token prompt against the most frequent prefill program of an 8,192-token
+prompt (12 of its 16 batches of 512), one run each, 2026-11-11:
+
+| kernel | 512-token prompt, ms each | share | 8,192-token prompt, ms each | share |
+|---|---:|---:|---:|---:|
+| `ggml_flash_attention_f32_f16_wmma` | 0.371 | 7.5% | 2.150 | 49.3% |
+| `ggml_mul_mat_swiglu_q4_k_f16_wmma_prefill_wave32` | 1.714 | 33.6% | 1.728 | 19.3% |
+| `ggml_mul_mat_q4_k_f16_wmma_prefill_wave32` | 0.425 | 34.2% | 0.393 | 18.0% |
+| `ggml_mul_mat_q6_k_f16_wmma_prefill_wave32` | 0.635 | 12.4% | 0.632 | 7.0% |
+
+The matmuls cost the same at any context; the attention kernel is the part that grows.
+
+What the numbers are and are not: each is the wall time from launch to device-idle with one dispatch in flight, so it holds
+one wake-up of the waiting thread and the run is slower than a normal one (the same command: pp512 2,977 -> 2,500 tok/s,
+tg16 67 -> 36, pp8192 1,191 -> 1,167). Use it to rank kernels and to see what grows with the context, not as a rate.
+Decode is slowed much more than prefill, so compare shares inside one program and never between programs. A dispatch that
+was launched and never finished (a ticket that ran out, a cut trace) is listed under the tables and is not in them. A build
+with extra kernel directories shows those kernels as numeric ids; name them with a second `--manifests DIR`.
+
 ### Measuring on `HRX0`: what makes a number citable
 
 Numbers measured on this device swing far more between *runs* than between *files*, so the harness matters as much as the arm. Everything below is

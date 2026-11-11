@@ -2107,6 +2107,11 @@ forward-serve` serves that too, from the same process and the same weights:
 | `POST /v1/systemone` (alias `POST /v1/decisions`) | `{"state": …, "questions": {id: question}}` → `{"model", "answers": {id: answer}, "usage"}` |
 | `GET /v1/systemone/models` | the decision model this build serves: name, description, `max_input_tokens`, `modalities` |
 
+A pack that declares `attention_mode: noncausal_full_attention` (below) is a decision model and nothing else:
+it encodes a prompt in one pass and has no token-by-token decode. On such a pack `/v1/chat/completions` and
+`/v1/completions` answer **400** with `type: decision_model_error` and a message that names `/v1/systemone`
+(or says there is no decision head, when the serve loaded none), before any work is done.
+
 `questions` is an **object**, and its ids come back as the keys of `answers` in request order. Question
 types are `choice` (1–255 options), `noul` and `score` (2–10 ordered levels); a decision runs one backbone
 prefill per question, pools the **last position's hidden state after the final norm** (`pooling: last`),

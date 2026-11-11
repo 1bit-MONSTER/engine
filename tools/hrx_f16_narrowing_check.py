@@ -4,7 +4,10 @@
 # Why this exists: the same defect -- a value that exceeds the f16 range becoming inf and then NaN -- was found
 # five times by asking the question again by hand (engine #1539, #1962, #2127, #2186). A hand grep is what produced
 # a count of 25 when the answer was 52 ("vector.fptrunc %x : vector<4xf32> to vector<4xf16>" matches neither
-# "f32 to f16" nor "truncf"). The list has to be a query, and it has to cover all three shapes:
+# "f32 to f16" nor "truncf"). NOTE, from engine#2220: `truncf` is trunc()-toward-zero on f32, NOT a narrowing --
+# `unary_f32_apply.loom` has bare `truncf` lines whose target is `f32`, and a ratchet that counts them flags a file
+# that cannot narrow. This tool therefore matches `fptrunc` only. The list has to be a query, and it has to cover
+# all three shapes:
 #
 #   1. INPUT       a value loaded from an f32 view, truncated to f16, with no 2^-6 prescale
 #                  (hrx_f16_prescale_check.py's original class -- engine #1962/#2127)

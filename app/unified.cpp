@@ -28,6 +28,7 @@
 #include "unified.h"
 #include "npu_queue.h"
 #include "think_split.h"
+#include "think_template.h"  // engine#2135: what enable_thinking can mean, read off the pack's template
 
 #include "generate.h"
 #include "model.h"
@@ -47,6 +48,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -74,6 +76,7 @@ struct Engine {
     int max_context = npu::Lane::kMaxContext;
     float default_penalty = 1.1f;  // greedy 0.6B models loop without it
     bool open_think = false;       // the template opens "<think>\n" when thinking is on
+    ThinkTemplate think_tmpl;      // engine#2135: the pack's own chat_template, as far as thinking goes
     std::timed_mutex mu;  // timed: the wait for the device is bounded (engine#911)
     // How long a STREAMED request may wait for the device before it is told the device is busy (engine#1024).
     // The one-device lock below serialises generations, and an *unbounded, silent* wait is what made a
@@ -117,9 +120,39 @@ struct Engine {
 // The chat scaffold for the model families the lane serves. Hugging Face ships
 // the template as Jinja; ChatML is what Qwen2 and Qwen3 render it to for plain
 // text messages, with generation starting after "<|im_start|>assistant\n".
-// open_think: the template opens the think block itself when thinking is on (Qwen3.6's
-// does; Qwen3's leaves it to the model).
-std::string chatml(const json& messages, bool thinking = true, bool open_think = false) {
+// The pack's chat template, or "" when it has none this can read: tokenizer_config.json's `chat_template` (a string,
+// or a list of {name, template} where "default" wins), else chat_template.jinja. Only think_template_of() reads it;
+// "" makes that rule change nothing (engine#2135).
+std::string read_chat_template(const std::string& model_dir) {
+    try {
+        std::ifstream f(model_dir + "/tokenizer_config.json");
+        if (f) {
+            const json cfg = json::parse(f, nullptr, /*allow_exceptions=*/false);
+            if (cfg.is_object() && cfg.contains("chat_template")) {
+                const json& t = cfg["chat_template"];
+                if (t.is_string()) return t.get<std::string>();
+                if (t.is_array()) {
+                    std::string first;
+                    for (const auto& one : t) {
+                        if (!one.is_object() || !one.contains("template") || !one["template"].is_string()) continue;
+                        if (one.value("name", "") == "default") return one["template"].get<std::string>();
+                        if (first.empty()) first = one["template"].get<std::string>();
+                    }
+                    if (!first.empty()) return first;
+                }
+            }
+        }
+        std::ifstream j(model_dir + "/chat_template.jinja");
+        if (j) return std::string((std::istreambuf_iterator<char>(j)), std::istreambuf_iterator<char>());
+    } catch (const std::exception&) {
+    }
+    return {};
+}
+
+// `think`: what follows the assistant prefix (think_template.h decides it from the request and the pack's template):
+// an opened block (Qwen3.6's template opens one when thinking is on), the empty block Qwen3's template emits for
+// enable_thinking false, or nothing.
+std::string chatml(const json& messages, ThinkPrompt think = ThinkPrompt::none) {
     std::string p;
     for (const auto& m : messages) {
         std::string content;
@@ -133,10 +166,10 @@ std::string chatml(const json& messages, bool thinking = true, bool open_think =
         p += "<|im_start|>" + m.at("role").get<std::string>() + "\n" + content + "<|im_end|>\n";
     }
     p += "<|im_start|>assistant\n";
-    // chat_template_kwargs.enable_thinking = false: what Qwen3's own template
-    // emits, an empty think block, so the model answers directly.
-    if (!thinking) p += "<think>\n\n</think>\n\n";
-    else if (open_think) p += "<think>\n";
+    // chat_template_kwargs.enable_thinking = false on a template with the switch: what Qwen3's own template emits, an
+    // empty think block, so the model answers directly. On a template without it, think_plan() never asks for this.
+    if (think == ThinkPrompt::empty_block) p += "<think>\n\n</think>\n\n";
+    else if (think == ThinkPrompt::open) p += "<think>\n";
     return p;
 }
 
@@ -174,9 +207,12 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         bool thinking = true;
         if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
             thinking = body["chat_template_kwargs"].value("enable_thinking", true);
-        prompt = chat ? chatml(body.at("messages"), thinking, e.open_think) : body.at("prompt").get<std::string>();
-        split_reasoning = chat && thinking && body.value("reasoning_format", std::string("auto")) != "none";
-        think_opened = thinking && e.open_think;
+        // engine#2135: the prompt and the split follow the pack's template, not only the request's flag.
+        const ThinkPlan plan = think_plan(chat, thinking, body.value("reasoning_format", std::string("auto")) == "none",
+                                          e.open_think, e.think_tmpl);
+        prompt = chat ? chatml(body.at("messages"), plan.prompt) : body.at("prompt").get<std::string>();
+        split_reasoning = chat && plan.split;
+        think_opened = plan.start_inside;
     } catch (const std::exception& ex) {
         res.status = 400;
         res.set_content(json{{"error", {{"message", std::string("bad request: ") + ex.what()}}}}.dump(), "application/json");
@@ -534,6 +570,12 @@ int run_unified(int argc, char** argv) {
         e.max_context = e.priv->max_context();
         e.default_penalty = e.priv->default_repetition_penalty();
         e.open_think = e.priv->opens_think();
+        e.think_tmpl = think_template_of(read_chat_template(model_dir));
+        if (e.think_tmpl.known && !e.think_tmpl.has_switch)
+            std::fprintf(stderr, "1bit unified: the chat template has no enable_thinking switch%s; enable_thinking false %s\n",
+                         e.think_tmpl.opens_think ? " and opens <think> itself" : "",
+                         e.think_tmpl.opens_think ? "is served as thinking on" :
+                         e.think_tmpl.mentions_think ? "keeps the empty block" : "adds nothing to the prompt");
         std::fprintf(stderr, "1bit unified: on the private route %s%s%s\n", route.name.c_str(),
                      e.priv->describe().empty() ? "" : ": ", e.priv->describe().c_str());
     } else {

@@ -31,6 +31,34 @@
 //   and
 //       value[row][col] = code * scale[g][row] + zero_point[g][row]
 //
+//   A tile of that size comes in two kinds. The one above is the asymmetric kind (FastFlowLM lists such packs as
+//   "Q4_1"): codes 0..15 and a zero-point that is the group's offset. The symmetric kind (listed as "Q4_0"; the
+//   LFM2 packs) has the SAME byte layout with every zero-point stored as 0, a scale that carries a sign, and the
+//   code as a two's-complement nibble:
+//       value[row][col] = (code >= 8 ? code - 16 : code) * scale[g][row]
+//   Nothing in the container names the kind (no metadata, no config key; the name is in FastFlowLM's model list,
+//   which is not part of a pack), so it is read from the weights, with three rules:
+//     - a tile is SYMMETRIC on its own evidence only when all 256 zero-points are zero AND some scale is below
+//       zero. The sign is what an asymmetric tile with no offset does not have: a zero offset with positive scales
+//       is a legitimate asymmetric tile (weights 0..15 * scale; tests/npu_moe_container_test.cpp writes one), and it
+//       reads as it always did. A symmetric scale is max/-8 of its group, so it is negative whenever the group's
+//       largest weight is positive: about half of them, and never none of 256 in a real tile.
+//     - a TENSOR is one kind. The tensor-level readers look at all of its tiles first: any symmetric tile makes
+//       the tensor symmetric, and its undecided tiles (all zero-points zero, no negative scale: padding, mostly)
+//       follow it; a tensor with both a symmetric and an asymmetric tile is refused, by name, on stderr.
+//       The fused int8 packer (q4nx_pack_q4_1_tiles_to_int8) takes the kind the same way, over the whole tensor.
+//     - the one-row reader (q4nx_dequant_tile_row) takes it from the tiles of the row's own tile-row: it runs once
+//       per token on an embedding it exists to avoid paging in, so it does not scan the table.
+//     - q4nx_dequant_tile() on one tile, with no tensor around it, uses that tile's own evidence.
+//   Measured 2026-11-11 on every 5120-byte tile of the fifteen packs on the box: 1,889,236 tiles in the other
+//   packs, none with an all-zero zero-point block and none with a negative scale; 285,696 tiles in the two LFM2
+//   packs, every one with both. Read as asymmetric, an LFM2 projection correlates -0.39 with the same tensor of
+//   the upstream GGUF; read as above, 0.99.
+//   The same tie test that settled the asymmetric layout settles this reading: LFM2.5-1.2B's lm_head is the
+//   quantised copy of its own bf16 token_embd, and over the first 2048 rows |dequant - embedding| / |scale| has
+//   mean 0.243 and maximum 1.000 (0.48 % of elements above 0.5, all of them the clip of +8 steps to +7). The
+//   other two candidate readings, (code - 8) * scale and unsigned code * scale, are 8 and 7 steps off on average.
+//
 // NOTE: this is NOT the layout asserted by the older tests/verify_i4_dequant.py
 // and tests/verify_q4nx_format.py (per-row 20-byte [scale][zp][16B nibbles]
 // groups with signed nibbles).  That layout drives the reconstruction to NaN
@@ -123,8 +151,20 @@ int q4nx_packed_grid(size_t nbytes, int rows, int cols, int* cb_out, int* rp_out
 int q4nx_dequant_tensor_packed(const uint8_t* data, size_t nbytes, int rows, int cols,
                                int rows_packed, int cols_packed, int chunk_bytes, float* out);
 
-/* Dequantize one 5120-byte tile into out[32][ld] (row-major, strided by ld). */
+/* What one 5120-byte tile says about its kind (see the layout notes above). */
+#define Q4NX_TILE_ASYMMETRIC 0   /* a zero-point is present */
+#define Q4NX_TILE_SYMMETRIC  1   /* every zero-point is +-0 and some scale is below zero */
+#define Q4NX_TILE_UNDECIDED  2   /* every zero-point is +-0, no scale below zero: asymmetric unless its tensor says otherwise */
+int q4nx_tile_kind(const uint8_t* tile);
+
+/* The kind of `ntiles` 5120-byte tiles of ONE tensor, `stride` bytes apart: Q4NX_TILE_SYMMETRIC when any tile is
+ * symmetric and none asymmetric, Q4NX_TILE_ASYMMETRIC when none is symmetric, -1 when both occur. */
+int q4nx_tiles_kind(const uint8_t* data, size_t ntiles, size_t stride);
+
+/* Dequantize one 5120-byte tile into out[32][ld] (row-major, strided by ld), on the tile's own evidence. */
 void q4nx_dequant_tile(const uint8_t* tile, float* out, int ld);
+/* The same with the kind given by the caller, which knows the tensor the tile belongs to (symmetric != 0). */
+void q4nx_dequant_tile_as(const uint8_t* tile, float* out, int ld, int symmetric);
 
 /* Dequantize a whole INT4 tensor of logical shape [rows, cols] whose packed
  * bytes are a row-major grid of 32x256 tiles, or a PLAIN bf16 tensor of that

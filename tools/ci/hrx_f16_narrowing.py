@@ -41,11 +41,16 @@ usage: hrx_f16_narrowing.py --check [--root .]     rc 1 on drift, rc 77 without 
 """
 import argparse
 import pathlib
+import re
 import sys
 
 CORPUS = pathlib.Path("third_party/llama.cpp/ggml/src/ggml-hrx/kernel-corpus/kernels")
 BASELINE = pathlib.Path("tools/ci/hrx_f16_narrowing.txt")
-NARROW = ("f32 to f16", "truncf")
+# engine#2219: the marker set missed the vector form. `fptrunc` does not contain "truncf" (it ends in
+# "trunc"), and the vector spelling is `vector<4xf32> to vector<4xf16>`, which does not contain the scalar
+# phrase "f32 to f16" either -- so 132 of the 233 narrowing lines in the corpus were invisible and the
+# baseline listed 25 of the 52 narrowing bodies. The pattern is the TYPE PAIR, so it matches both spellings.
+NARROW = (re.compile(r"f32 to f16"), re.compile(r"f32>\s+to\s+vector<\d+xf16>"))
 GUARD = ("scale_log2", "prescale")
 
 
@@ -59,7 +64,7 @@ def narrowing_bodies(corpus):
     found = set()
     for path in corpus.rglob("*.loom"):
         body = path.read_text(encoding="utf-8", errors="replace")
-        if any(marker in body for marker in NARROW):
+        if any(marker.search(body) for marker in NARROW):
             found.add(path.relative_to(corpus).as_posix())
     return found
 
@@ -136,6 +141,16 @@ def self_test():
         (root / BASELINE).write_text("# comment\n# another\na.loom\n")
         check_that(not drift(baseline_paths((root / BASELINE).read_text()), narrowing_bodies(corpus))[0],
                    "an unchanged corpus has no drift")
+        # engine#2219: the vector spelling carries neither old marker -- `fptrunc` ends in "trunc", not
+        # "truncf", and `vector<4xf32> to vector<4xf16>` is not the scalar phrase "f32 to f16" -- so 132
+        # narrowing lines were invisible. It narrows, so it is listed and it drifts like any other body.
+        (corpus / "v.loom").write_text(
+            "  %h = vector.fptrunc %v : vector<4xf32> to vector<4xf16>\n")
+        check_that("v.loom" in narrowing_bodies(corpus),
+                   "the vector form `vector<Nxf32> to vector<Nxf16>` is a narrowing body")
+        new, stale = drift(baseline_paths((root / BASELINE).read_text()), narrowing_bodies(corpus))
+        check_that(new == ["v.loom"] and not stale, "the vector body drifts like any other body")
+        (corpus / "v.loom").unlink()
         (corpus / "c.loom").write_text("  %z = scalar.fptrunc %w : f32 to f16\n")
         new, stale = drift(baseline_paths((root / BASELINE).read_text()), narrowing_bodies(corpus))
         check_that(new == ["c.loom"] and not stale, "a new narrowing body is drift, and only it")

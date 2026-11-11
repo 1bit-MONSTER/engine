@@ -114,7 +114,8 @@ int main(void) {
      * attention and so no q_norm. Applied to every layer, the rule refused both LFM2 packs at load. */
     check(q4nx_qk_gain_missing(1, 1, 0) == 1, "q/k norm on, an attention layer with no q gain: refused (the engine#1889 case)");
     check(q4nx_qk_gain_missing(1, 1, 1) == 0, "q/k norm on, an attention layer with its gain: fine");
-    check(q4nx_qk_gain_missing(1, 0, 0) == 0, "q/k norm on, a layer with no attention and no gain: not a refusal (LFM2's conv layers)");
+    check(q4nx_qk_gain_missing(1, 0, 0) == 0, "q/k norm on, a layer with no softmax attention and no gain: not a refusal "
+                                              "(LFM2's conv layers, qwen3_5's linear-attention layers)");
     check(q4nx_qk_gain_missing(0, 1, 0) == 0, "q/k norm off: no gain is expected anywhere");
 
     char path[512];

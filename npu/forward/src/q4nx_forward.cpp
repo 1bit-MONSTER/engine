@@ -1790,8 +1790,12 @@ bool Q4nxNpuForward::load_norms() {
         // would hand back zeros for the absent tensor and rmsnorm(q, 0) is 0 for every head, so the layer would attend
         // uniformly and answer fluent nonsense. A Hunyuan container imported before the importer claimed the gains is
         // exactly this shape, so it is refused by name here instead.
-        // A layer with no attention (LFM2's short-convolution layers) has no q to normalise and so no gain to miss.
-        if (q4nx_qk_gain_missing(sem_.qk_norm, !is_conv_layer(l), !absent(&mw_->layers[l].q_norm_weight))) {
+        // Only a layer with softmax attention has a q to normalise, so only such a layer can miss its gain. LFM2's
+        // short-convolution layers have no attention at all, and a qwen3_5 linear-attention (GDN) layer has no
+        // self_attn.q_norm either (18 of Qwen3.5-2B's 24 layers, layer 0 among them): the test is the one the step
+        // bodies use to send a layer to gdn_layer() or conv_layer() instead of the attention path.
+        const bool gdn_l = lin_kd_ > 0 && l < sem_.n_layer_types && sem_.layer_types[l] == Q4NX_LAYER_LINEAR;
+        if (q4nx_qk_gain_missing(sem_.qk_norm, !is_conv_layer(l) && !gdn_l, !absent(&mw_->layers[l].q_norm_weight))) {
             err_ = "config.json says q and k are normalised per head (" +
                    std::string(q4nx_semantics_field(Q4NX_SEM_QK_NORM)) + ") and layer " + std::to_string(l) +
                    " has no self_attn.q_norm.weight: normalising with an absent gain zeroes q, so this container "

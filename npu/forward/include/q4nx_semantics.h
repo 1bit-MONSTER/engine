@@ -263,12 +263,13 @@ int q4nx_rmsnorm_offset_from_norm(const float* w, int n);
 int q4nx_semantics_qk_norm_from_tensors(Q4nxSemantics* s, const unsigned char* has_q, const unsigned char* has_k, int layers);
 
 /* engine#1889's refusal, as a rule: with q/k norm on, a layer whose q gain is absent would normalise q to zero, so the
- * container is refused. That is a statement about ATTENTION layers. A layer with no attention at all carries no
- * q_norm because it has no q: ten of LFM2's sixteen layers are gated short convolutions, layer 0 among them, and the
- * rule applied to every layer refused both LFM2 packs at load with "layer 0 has no self_attn.q_norm.weight".
+ * container is refused. That is a statement about layers with SOFTMAX ATTENTION. A layer of another kind carries no
+ * q_norm because it has no q to normalise: ten of LFM2's sixteen layers are gated short convolutions, and 18 of
+ * Qwen3.5-2B's 24 are linear-attention (GDN) layers, layer 0 in both. Applied to every layer the rule refused every
+ * LFM2 pack and every qwen3_5 hybrid at load with "layer 0 has no self_attn.q_norm.weight".
  * Returns 1 when layer l must be refused. Exported so the rule is testable with no model present. */
-static inline int q4nx_qk_gain_missing(int qk_norm, int layer_has_attention, int q_gain_present) {
-    return qk_norm && layer_has_attention && !q_gain_present;
+static inline int q4nx_qk_gain_missing(int qk_norm, int layer_has_softmax_attention, int q_gain_present) {
+    return qk_norm && layer_has_softmax_attention && !q_gain_present;
 }
 
 /* attention.mode for one container, from the two places that can state it (engine#796).

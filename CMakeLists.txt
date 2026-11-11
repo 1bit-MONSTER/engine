@@ -1964,6 +1964,11 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> lfm2)
     set_tests_properties(batch_check_state_lfm2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # A fabricated qwen3_5 hybrid (a linear-attention layer, then attention): load only, see the script's header.
+    add_test(NAME batch_check_state_qwen35_load
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> qwen3_5)
+    set_tests_properties(batch_check_state_qwen35_load PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 
 # Private NPU routes (docs/npu.md, "Private routes"): closed-source add-ons in a checkout of

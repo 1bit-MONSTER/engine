@@ -25,6 +25,7 @@
 // length is consistent with more than one shape, and names what it saw.
 #pragma once
 
+#include <climits>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -102,6 +103,65 @@ inline InitShape resolve_init_shape(const std::string& name, int64_t length, int
     s.d0 = found;
     s.d1 = elems / found;
     return s;
+}
+
+// ── the external_data reference itself ────────────────────────────────────────────────────────────────────────────────
+// Once the shape is decided, the bytes still have to be located. ONNX records that as repeated
+// `StringStringEntryProto { key, value }` on the tensor: `location` (the sibling file), `offset` and `length`. Parsing it
+// is where a reader most often goes quietly wrong, so it has its own refusal set: a missing `length` would otherwise be
+// read as "length 0", and a duplicated key that the protobuf allows would silently take the last one.
+struct ExternalRef {
+    bool ok = false;
+    std::string location;  // the sibling file to read; empty means "the model file's own .data sibling"
+    int64_t offset = 0;
+    int64_t length = 0;
+    std::string why;  // set on refusal
+};
+
+// `kv` is the flattened key/value list in the order the tensor carried it. Offsets are unsigned in the protobuf; a value
+// that does not parse as a non-negative integer, a duplicate key, or a length of zero is a refusal naming the key.
+inline ExternalRef resolve_external_ref(const std::vector<std::string>& kv) {
+    ExternalRef r;
+    if (kv.size() % 2 != 0) {
+        r.why = "an odd number of key/value strings (" + std::to_string(kv.size()) + ")";
+        return r;
+    }
+    bool have_off = false, have_len = false, have_loc = false;
+    for (std::size_t i = 0; i + 1 < kv.size(); i += 2) {
+        const std::string& k = kv[i];
+        const std::string& v = kv[i + 1];
+        auto to_i64 = [&](int64_t& out) {
+            if (v.empty()) return false;
+            int64_t acc = 0;
+            for (const char c : v) {
+                if (c < '0' || c > '9') return false;
+                if (acc > (INT64_MAX - (c - '0')) / 10) return false;
+                acc = acc * 10 + (c - '0');
+            }
+            out = acc;
+            return true;
+        };
+        if (k == "length") {
+            if (have_len) { r.why = "a duplicate \"length\""; return r; }
+            if (!to_i64(r.length) || r.length <= 0) { r.why = "a \"length\" that is not a positive integer (" + v + ")"; return r; }
+            have_len = true;
+        } else if (k == "offset") {
+            if (have_off) { r.why = "a duplicate \"offset\""; return r; }
+            if (!to_i64(r.offset)) { r.why = "an \"offset\" that is not a non-negative integer (" + v + ")"; return r; }
+            have_off = true;
+        } else if (k == "location") {
+            if (have_loc) { r.why = "a duplicate \"location\""; return r; }
+            r.location = v;
+            have_loc = true;
+        }
+        // any other key is not this reader's business and is ignored, as the protobuf allows
+    }
+    if (!have_len) {
+        r.why = "no \"length\" entry, which would otherwise be read as zero bytes";
+        return r;
+    }
+    r.ok = true;
+    return r;
 }
 
 }  // namespace onebit::npu

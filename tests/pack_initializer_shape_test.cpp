@@ -85,6 +85,40 @@ int main() {
         check(!a.ok && !b.ok, "(viii) a zero length or zero element size is refused, not divided by");
     }
 
-    if (failures == 0) std::printf("pack initializer shape: 8 arms pass\n");
+
+    // ── the external_data reference (the other half of reading a 1.8 initializer) ────────────────────────────────────
+    using onebit::npu::resolve_external_ref;
+    // (ix) the ordinary form: a location, an offset and a length.
+    {
+        const auto r = resolve_external_ref({"location", "model.onnx.data", "offset", "542113792", "length", "4096"});
+        check(r.ok && r.location == "model.onnx.data" && r.offset == 542113792 && r.length == 4096,
+              "(ix) location/offset/length resolve to the reference the tensor names");
+    }
+    // (x) a missing length is a refusal, because the default would otherwise be zero bytes read silently.
+    {
+        const auto r = resolve_external_ref({"location", "model.onnx.data", "offset", "0"});
+        check(!r.ok && r.why.find("no \"length\"") != std::string::npos,
+              "(x) no length entry is refused rather than read as zero");
+    }
+    // (xi) a duplicate key is refused: the protobuf allows it and taking the last would be a silent pick.
+    {
+        const auto r = resolve_external_ref({"offset", "0", "offset", "8", "length", "16"});
+        check(!r.ok && r.why.find("duplicate") != std::string::npos, "(xi) a duplicate offset is refused");
+    }
+    // (xii) a non-numeric or negative-looking value is refused, naming the key and the value.
+    {
+        const auto a = resolve_external_ref({"offset", "-8", "length", "16"});
+        const auto b = resolve_external_ref({"offset", "0", "length", "4x"});
+        check(!a.ok && a.why.find("offset") != std::string::npos && !b.ok && b.why.find("length") != std::string::npos,
+              "(xii) a signed offset and a non-numeric length are both refused, naming the key");
+    }
+    // (xiii) an odd key/value count is refused; unknown keys are ignored, as the protobuf permits.
+    {
+        const auto a = resolve_external_ref({"offset", "0", "length"});
+        const auto b = resolve_external_ref({"offset", "0", "length", "16", "checksum", "deadbeef"});
+        check(!a.ok && b.ok && b.length == 16, "(xiii) an odd list is refused and an unknown key is ignored");
+    }
+
+    if (failures == 0) std::printf("pack initializer shape: 13 arms pass\n");
     return failures ? 1 : 0;
 }

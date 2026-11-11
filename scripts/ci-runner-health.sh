@@ -30,7 +30,10 @@
 #   scripts/ci-runner-health.sh <unit> [...]    # named units, e.g. for a specific runner
 #   scripts/ci-runner-health.sh --self-test     # the verdict logic, with systemctl stubbed
 #
-# Exit: 0 when every runner is active/running with no failure result; 1 when any is not; 2 when there is nothing to inspect
+# Exit: 0 when every runner is active/running with no failure result AND its restart policy would survive the next OOM
+# kill; 1 when a runner is not accepting jobs (an outage now); 3 when ONLY a restart policy would leave it down after the
+# next OOM kill (a latent one -- engine#1504, and scripts/weekly.sh warns rather than blocks on it); 2 when there is
+# nothing to inspect
 # (no such units on this host, so a silent pass would be the defect).
 set -uo pipefail
 
@@ -125,7 +128,13 @@ if [ ${#units[@]} -eq 0 ]; then
     exit 2
 fi
 
-rc=0
+# engine#1504: a caller has to be able to tell the two kinds of failure apart.  A unit that is not accepting jobs is an
+# immediate outage -- every check that needs the box reads as pending for ever -- while a policy that would not survive the
+# next OOM kill is a latent one.  Exit 1 for the first, **3** for policy only, 0 for clean: scripts/weekly.sh blocks a
+# release on 1 and warns on 3, because switching the live units' directives is an owner action (#1504 item 2) and a
+# release that will not start until then is a worse failure than a loud warning.
+state_bad=0
+policy_bad=0
 for u in "${units[@]}"; do
     line=$("$SC" show "$u" -p ActiveState -p SubState -p Result -p NRestarts -p Restart -p OOMPolicy -p MemoryMax 2>/dev/null)
     st=$(printf '%s\n' "$line" | sed -n 's/^ActiveState=//p')
@@ -138,13 +147,15 @@ for u in "${units[@]}"; do
     v=$(runner_verdict "$st" "$sub" "$res" "$nr")
     case "$v" in
         PASS*) printf 'PASS %-52s %s\n' "$u" "${v#PASS }" ;;
-        *)     printf 'FAIL %-52s %s\n' "$u" "${v#FAIL }"; rc=1 ;;
+        *)     printf 'FAIL %-52s %s\n' "$u" "${v#FAIL }"; state_bad=1 ;;
     esac
     # engine#1504: alive now is not the same as after the next OOM kill, so the policy is its own line.
     p=$(policy_verdict "$rst" "$oom" "$mmax")
     case "$p" in
         PASS*) printf 'PASS %-52s %s\n' "" "${p#PASS }" ;;
-        *)     printf 'FAIL %-52s %s\n' "" "${p#FAIL }"; rc=1 ;;
+        *)     printf 'FAIL %-52s %s\n' "" "${p#FAIL }"; policy_bad=1 ;;
     esac
 done
-exit "$rc"
+if [ "$state_bad" = 1 ]; then exit 1; fi
+if [ "$policy_bad" = 1 ]; then exit 3; fi
+exit 0

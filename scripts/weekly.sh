@@ -704,6 +704,13 @@ preflight() {
                 health_rc=$?
                 if [ "$health_rc" = 2 ]; then
                     say "preflight: no actions.runner.* units on this host: systemd has nothing to inspect"
+                elif [ "$health_rc" = 3 ]; then
+                    # engine#1504: policy only.  Every runner is accepting jobs NOW; what fails is that the next OOM kill
+                    # would stop one for good.  Switching the live units' directives is #1504's open owner item on this
+                    # box, so a release that will not start until then is a worse failure than a loud warning.  The
+                    # split is ci-runner-health.sh's exit codes (1 = down now, 3 = policy only).
+                    printf '%s\n' "$health_out" | sed 's/^/preflight: /'
+                    echo "preflight: WARNING a runner would not come back after the next OOM kill (its restart policy) - not blocking this release, and #1504's owner item on this box"
                 else
                     printf '%s\n' "$health_out" | sed 's/^/preflight: /'
                     # Two kinds of FAIL reach here (engine#1504): a unit that is down NOW, and since #2082 a unit that is up

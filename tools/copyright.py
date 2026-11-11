@@ -50,6 +50,7 @@ LINE_STYLES = [
       "ctest_skips.txt",
       # engine#2018: the third test-registration baseline, same shape and the same reason -- data, `.txt` has no style.
       "unreferenced_py_tests.txt",
+            "hrx_f16_narrowing.txt",
       "21serial-console", "90onboard-limits", "Dockerfile", "*.Dockerfile",
       # cycle 17: Puppy's switch that skips its first-run Quick Setup is an empty marker file whose only content
       # is this notice - Puppy tests for its existence, so a comment is free

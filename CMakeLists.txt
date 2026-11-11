@@ -334,6 +334,13 @@ add_python_test(tests_referenced_self ${CMAKE_SOURCE_DIR}/tools/ci/tests_referen
 # Registered through add_python_test (engine#1864), so they run THROUGH the interpreter: my first version used the raw
 # `${Python3_EXECUTABLE}` form above the find_package and the repository's own ordering guard caught it by name --
 # tools/mtp_head_ref.py is the one of the five without an exec bit, and it became BAD_COMMAND under ctest.
+# engine#1962: the narrowing-body enumeration, as a ratchet. The corpus is a submodule, so the check
+# skips (rc 77) where third_party/llama.cpp is not checked out; the baseline file is in the engine tree,
+# so the recorded set is reviewable everywhere.
+add_python_test(tool_selftest_hrx_f16_narrowing ${CMAKE_SOURCE_DIR}/tools/ci/hrx_f16_narrowing.py --self-test)
+add_test(NAME hrx_f16_narrowing_check COMMAND ${Python3_EXECUTABLE}
+         ${CMAKE_SOURCE_DIR}/tools/ci/hrx_f16_narrowing.py --check --root ${CMAKE_SOURCE_DIR})
+set_tests_properties(hrx_f16_narrowing_check PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
 add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_agree.py --selftest)
 add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)

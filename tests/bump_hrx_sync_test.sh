@@ -124,11 +124,14 @@ expect "the commit line may carry a trailing note; a line that is not a commit i
 printf '%s\n' "${mirror:0:12}" > "$holdf"
 expect "a short hash is not a hold: forty hex digits or nothing" "$(hold "$mirror" "$pin")" "none"
 
-# The file shipped in the tree names no commit, so merging it holds nothing.
+# The file shipped in the tree: whatever it names must be one full commit hash or nothing, and what it means for a
+# run is decided by the same function as above (a hold on a commit the mirror has left is stale, and so on).
 shipped=$(cd "$(dirname "$script")/.." && pwd)/config/llama-mirror-hold.config
 if [ -f "$shipped" ]; then
-  expect "the shipped hold file holds nothing until a commit line is added" \
-    "$(LLAMA_HOLD_FILE=$shipped bash "$script" llama-hold "$repo" "$mirror" "$pin")" "none"
+  n=$(grep -v '^[[:space:]]*#' "$shipped" | grep -cE '^[0-9a-f]{40}' || true)
+  if [ "$n" -le 1 ]; then ok "the shipped hold file names at most one commit"; else fail "the shipped hold file names at most one commit (found $n)"; fi
+  junk=$(grep -v '^[[:space:]]*#' "$shipped" | grep -v '^[[:space:]]*$' | grep -vcE '^[0-9a-f]{40}([[:space:]].*)?$' || true)
+  expect "every line of the shipped hold file is a comment, blank, or a full commit hash" "$junk" "0"
 else
   fail "config/llama-mirror-hold.config is in the tree"
 fi

@@ -102,12 +102,13 @@ fails a pin that leaves a gate model's node off HRX.
   nothing to do but fail, every day, until somebody does the merge by hand. While
   [`config/llama-mirror-hold.config`](../config/llama-mirror-hold.config) names the mirror's commit, the run
   instead reports the hold in its summary (`mirror 1bit/hrx-vulkan HELD at …; AMD's pin is …, on a line that
-  does not contain it`), moves nothing and succeeds; the engine's pin still follows our own line. The hold
+  does not contain it`), moves nothing and succeeds. The engine's pin does not move in a held run either: moving
+  it along our own line is a reviewed PR of its own. The hold
   describes one state and fails the run when that state ends, so it cannot be forgotten: **stale** when the
   mirror is no longer the named commit, **unneeded** when AMD's pin contains the named commit again (an ordinary
   sync would work). `scripts/bump-hrx-sync.sh llama-hold <repo> <mirror> <pin>` prints the decision alone
-  (`none`, `held`, `stale`, `unneeded`). The file ships naming no commit, so it holds nothing; naming one is
-  the owner's decision. It was added for AMD's 2026-11-09 rebase (engine#1945): taking that pin is a merge of
+  (`none`, `held`, `stale`, `unneeded`). **Held since 2026-11-11** for the release (engine#1945): the file names
+  the mirror's commit `44ee5710d19f`, and the merge of AMD's rebased line is post-release work. It was added for AMD's 2026-11-09 rebase (engine#1945): taking that pin is a merge of
   149 conflicted files (538 hunks) into `1bit/hrx-vulkan-patched`, measured against the last AMD commit our
   line took.
 - **The hold.** While [`config/hrx-system-hold.config`](../config/hrx-system-hold.config)

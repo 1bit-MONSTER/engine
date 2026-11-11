@@ -35,6 +35,7 @@
 // resets it from position 0.
 #include "forward_serve.h"
 
+#include "../npu/forward/include/file_create.h"   // dumps are created 0600, never through a symlink
 #include "npu_decode_note.h"
 
 #include "../npu/forward/include/q4nx_forward.h"
@@ -536,7 +537,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             if (!e.dump_logits.empty()) {
                 const std::string path = e.dump_logits + "/step_" + std::to_string(dump_req) + "_" +
                                           std::to_string(n) + ".bin";
-                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                if (std::FILE* f = onebit_fopen_private_wb(path.c_str())) {   // 0600, no symlink (file_create.h)
                     std::fwrite(logits.data(), sizeof(float), logits.size(), f);
                     std::fclose(f);
                 }

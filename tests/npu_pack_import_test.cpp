@@ -33,6 +33,7 @@
 //    their biases, the MLP projections and the final norm -- and produces a container the engine's own
 //    Model can open.
 
+#include "../npu/forward/include/file_create.h"   // written files are 0600, never through a symlink
 #include "model.h"
 #include "pack.h"
 #include "pack_import.h"
@@ -4617,7 +4618,7 @@ static void dump_real_component(const std::string& dir) {
     const int row = 1;                          // token id 1: a plain text token ORT embeds
     if ((row + 1) * H > v.size()) return;
     const std::string out = dir + "/eng_row.f32";
-    if (FILE* f = std::fopen(out.c_str(), "wb")) {
+    if (FILE* f = onebit_fopen_private_wb(out.c_str())) {
         std::fwrite(&v[size_t(row) * H], sizeof(float), H, f);
         std::fclose(f);
         double s = 0;

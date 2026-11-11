@@ -31,12 +31,14 @@
 #include <cstring>
 #include <string>
 
+#include "file_create.h"   // the dump is created 0600, never through a symlink
+
 namespace onebit::npu {
 
 // Writes `count` floats to `path`. Returns false and fills `err` (path + strerror) when the file cannot be created, the
 // write is short, or the close fails. `err` is left untouched on success.
 inline bool write_residual_dump(const char * path, const float * data, size_t count, std::string * err) {
-    FILE * fp = std::fopen(path, "wb");
+    FILE * fp = onebit_fopen_private_wb(path);
     if (fp == nullptr) {
         if (err != nullptr) {
             *err = std::string(path) + ": " + std::strerror(errno);

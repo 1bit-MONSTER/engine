@@ -1767,6 +1767,12 @@ if(ONEBIT_NPU)
     target_include_directories(hybrid_prompt_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
         ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)
     target_link_libraries(hybrid_prompt_probe PRIVATE onebit_npu_forward onebit_npu_rt)
+    # engine#1788: one picture and one question through a MiniCPM-V 4.7 pack with every step the engine's own
+    # (plan, resize, host tower, prompt tokens, canvas positions, then step_batch_embeds on the text model).
+    add_executable(minicpm_image_probe npu/forward/minicpm_image_probe.cpp)
+    target_include_directories(minicpm_image_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
+        ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)
+    target_link_libraries(minicpm_image_probe PRIVATE onebit_npu onebit_npu_forward onebit_npu_rt)
     add_executable(mrope_planes_probe npu/forward/mrope_planes_probe.cpp)
     target_include_directories(mrope_planes_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
         ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)

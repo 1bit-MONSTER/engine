@@ -1708,6 +1708,25 @@ prefixes, and none) as hashes over every token id and position. Images only: vid
 handled. Nothing feeds these planes or the tower's rows into the text forward yet; that is the route's
 work.
 
+**One picture, one question, end to end (`minicpm_image_probe`).** A probe under `ONEBIT_NPU` that
+chains every step above with nothing from outside the engine:
+
+```
+minicpm_image_probe <pack dir> <kernels dir> (--image f.ppm | --solid R,G,B [--size HxW] | --halves R,G,B:R,G,B | --none)
+                    --prompt "question" [--decode N] [--expect-ids ids.i32]
+```
+
+RGB bytes → `plan_image` → `preprocess` → `tower_forward` on the CPU → `image_tokens` and
+`prompt_positions` → the text model's `step_batch_embeds()` with the tower's rows where the
+placeholders are, then a greedy decode. The image is a binary PPM or a generated colour, so no image
+decoder is involved, and the prompt is the one the pack's chat template renders for a single user turn
+with one image and thinking off, written out in the probe rather than rendered. The text model opens
+the device unless `NPU_INFER_HOST_GEMM` is set.
+
+It is a probe, not a route: `forward-serve` does not accept an image, and the tower's half minute to a
+minute per 448 × 448 view on one thread is the host reference's cost. The measured rows are in
+engine#1788.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU

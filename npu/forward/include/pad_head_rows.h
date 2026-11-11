@@ -45,7 +45,7 @@
 // tiles gives 64,064, which fails the bound and falls through to the row spelling (review of #2026 at 63a47be).
 // Anything the three spellings cannot place returns NV, and the caller's own dequant then refuses it by name.
 inline bool head_chunk_bytes(int64_t b) {
-    return b == Q4NX_TILE_BYTES || b == 6144 /* q4_1f, the imported-container tile */ || b == Q4NX_CHUNK_Q4K || b == Q4NX_CHUNK_Q8;
+    return b == Q4NX_TILE_BYTES || b == 6144 /* q4_1f, the imported-container tile */ || b == Q4NX_CHUNK_Q4K || b == Q4NX_CHUNK_Q8 || b == Q4NX_CHUNK_Q4S;
 }
 inline int padded_head_rows(const int64_t* shape, int ndim, int kpad, int NV) {
     if (!shape || kpad <= 0 || kpad % Q4NX_TILE_COLS != 0 || NV <= 0) return NV;

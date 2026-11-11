@@ -658,6 +658,30 @@ preflight_runner_units() {
     return 0
 }
 
+# The submodule row of the preflight (engine#2129). The bumps and build stages build the tree in front of them, and a
+# build compiles whatever the submodules' work trees hold: tools/ci/submodule_pin_check.py is the check for whether those
+# checkouts ARE the commits this tree pins. It already exists as a ctest row, and a ctest row runs in CI -- nothing ran it
+# before a build on the box, which is where the drift was measured (7 of 7 submodules off-pin). Exit 1 stops the run: the
+# build would not be of the pinned sources. Exit 2 (nothing to compare -- no submodules initialised) only WARNS, because a
+# fresh clone must still be able to build and the warning says the check inspected nothing rather than implying a pass.
+# --require-clean is deliberately NOT passed here: it fails on a dirty submodule work tree, and a deliberate local patch
+# is a real thing a box does; the check reports those with their counts either way.
+# A function of its own so tests/weekly_submodule_preflight_test.sh can run it against a stub.
+preflight_submodules() {
+    local check=$1 src=$2 out rc=0
+    [ -f "$check" ] || return 0
+    out=$(python3 "$check" --check --root "$src" 2>&1) || rc=$?
+    case "$rc" in
+        0) printf '%s\n' "$out" | grep -v 'at their pinned commit' | sed 's/^/preflight: /' ;;
+        2) printf '%s\n' "$out" | sed 's/^/preflight: /'
+           echo "preflight: WARNING, not blocking: no submodule checkout to compare against the pin, so this build follows whatever the work trees hold (tools/ci/submodule_pin_check.py exit 2; git submodule update --init fills it)" ;;
+        *) printf '%s\n' "$out" | sed 's/^/preflight: /'
+           echo "preflight: a submodule is not at the commit this tree pins, so the build would not be of the pinned sources (tools/ci/submodule_pin_check.py exit $rc; the line above names the submodule and what to do)"
+           return 1 ;;
+    esac
+    return 0
+}
+
 # --- preflight ----------------------------------------------------------------------------
 # What the stages need from the machine, checked before the first one runs, so that a missing
 # tool stops the run at the start rather than after an hour of build (2026-10-19 rehearsal).
@@ -677,7 +701,9 @@ preflight() {
                              2> "$LOGS/hrx-toolchain.log"); then :; else
                            echo "preflight: cannot fetch the pinned HRX toolchain (config/hrx-toolchain.config): see $LOGS/hrx-toolchain.log"; bad=1
                        fi ;;
-                esac ;;
+                esac
+                # engine#2129: this stage builds the tree in front of it, so the submodules have to BE the pinned tree
+                preflight_submodules "$SRC/tools/ci/submodule_pin_check.py" "$SRC" || bad=1 ;;
             package)
                 # scripts/package-linux.sh rewrites RPATHs with patchelf
                 command -v patchelf > /dev/null ||

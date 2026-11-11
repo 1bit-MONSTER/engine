@@ -462,6 +462,13 @@ const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std:
 // weights into the wrong projections while every anchor still lines up), and a row that a merge silently drops (the
 // h4096 row was lost twice that way, which un-measured a whole model class with nothing failing).
 const Fconst19Rule* fconst19_rules(int* count);
+// The preference order for the 1.9 canonical .fconst scratch copy (engine#1801): the explicit override, then the on-disk cache
+// directory, then the temp directory and the cwd. Exposed so a test can pin the order -- the bug that shipped once was a cache
+// directory that was never created, so every pack silently fell through to tmpfs.
+std::vector<std::string> fconst_scratch_dirs();
+// True when `dir` is, or can be made into, a directory the scratch copy may be written to. Exposed with the order above because the
+// bug #1801 shipped once was exactly this: the cache directory existed only in the comment.
+bool fconst_scratch_ready(const std::string& dir);
 // The same decision over an explicit table, so a test can hand it the one shape that decides correctness and that the
 // real table must never contain: two rows for one geometry with different shapes.
 const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,

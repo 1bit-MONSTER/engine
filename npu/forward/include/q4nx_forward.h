@@ -70,6 +70,10 @@ struct I8Ctx;
 
 // Q4nxForwardConfig now lives with the model that owns it: npu/model/npu_model.h (engine#803 A3).
 
+// engine#1740 W2: the rope_type "dynamic" reader, exposed so a host test can pin it against the exact block the
+// Hunyuan 1.9 packs carry ({"type": "dynamic", "factor": 1.0} with max_position_embeddings 262144) without a device.
+Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path);
+
 class Q4nxNpuForward {
 public:
     Q4nxNpuForward();
@@ -233,6 +237,15 @@ private:
     bool init_impl(xrt::device* dev, const char* model_path,
                    const std::string& artifact_dir);
     bool host_gemm_ = false;
+    // NPU_INFER_HOST_GEMM=i8 (engine#1808): the host arm accumulates int8 x int4 in EXACT int32, which is
+    // the only arm a kernel family can be bit-exact against -- f32 cannot match an int8 device by
+    // construction. It cannot see a wrong weight layout (the f32 arm covers that); it can see a wrong
+    // quantisation, a wrong 128-K group boundary, an int8 intermediate or a saturated accumulator.
+    bool host_gemm_i8_ = false;
+    // Weight codes + per-128-K multipliers for the integer host arm, quantised once per tensor (engine#1809).
+    struct HostI8Tensor { int groups = 0; int N = 0; std::vector<int8_t> codes; std::vector<float> d; };
+    std::map<int, HostI8Tensor> host_i8_cache_;
+    void host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat, int wkey, float* out);
     bool load_layer(int l);
     // `a_k` is the activation's REAL width per row (the design's real_k, i.e. the model's hidden or
     // intermediate size).  It is K whenever the model is already on the container's 256-column K

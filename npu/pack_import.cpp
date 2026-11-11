@@ -734,32 +734,11 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     // reboot: three of them from one afternoon's imports were 11.4 GB of tmpfs (measured 2026-11-10). So the order is:
     // an explicit override, then the on-disk cache directory, and only then the temp directory this used to prefer.
     std::vector<fs::path> dirs;
-    if (const char* scratch = std::getenv("ONEBIT_FCONST_SCRATCH"); scratch && *scratch)
-        dirs.emplace_back(scratch);
-    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
-        dirs.emplace_back(fs::path(xdg) / "1bit/fconst19");
-    else if (const char* home = std::getenv("HOME"); home && *home)
-        dirs.emplace_back(fs::path(home) / ".cache/1bit/fconst19");
-    try {
-        // Last resort only: on strixhalo /tmp is tmpfs, so this costs RAM equal to the pack's fconst.
-        dirs.push_back(fs::temp_directory_path());
-    } catch (const std::exception& e) {
-        std::fprintf(stderr,
-                     "1bit npu-pack: note: the temporary directory is unusable (%s), so the 1.9 pack's canonical copy "
-                     "goes elsewhere\n", e.what());
-    }
-    dirs.push_back(fs::path("/tmp"));
+    for (const auto& d : fconst_scratch_dirs()) dirs.emplace_back(d);
     dirs.push_back(fs::current_path());
     std::string work;
     for (const auto& d : dirs) {
-        std::error_code ec;
-        // The cache directory is ours to create: without this the new first choice never wins, because it does not exist on a
-        // fresh box and the loop walked straight past it to /tmp (caught by testing the default, not the override).
-        if (!fs::is_directory(d, ec) || ec) {
-            std::error_code made;
-            fs::create_directories(d, made);
-            if (made || !fs::is_directory(d)) continue;
-        }
+        if (!fconst_scratch_ready(d.string())) continue;
         const fs::path cand = d / name;
         // Writable in fact, not just in theory: the copy is written immediately after this.
         std::ofstream probe(cand, std::ios::binary | std::ios::app);
@@ -1189,6 +1168,22 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
                 ++from_text_config;
             }
         }
+        // `rope_theta` (and the rotary block's other keys) can be ONE LEVEL DEEPER still: Qwen3-VL-4B declares
+        // `text_config.rope_parameters = {mrope_interleaved: true, mrope_section: [24,20,20], rope_theta: 5000000,
+        // rope_type: default}` with no `rope_theta` anywhere else, so this reader fell back to its 10000 default and the
+        // importer warned that the pack's cos/sin caches "no plain theta explains (best 0.5918 at 3.2e+06, declared 10000)".
+        // Measured against the pack's own cos_cache (262144 x 64, external): **theta 5e6 reproduces row 1 to max|d|
+        // 0.000000**, 10000 is off by 0.088 and 3.2e6 by 0.005 -- so the caches are not unexplained at all, the theta was
+        // simply not read (engine#1503). Gaps only, never overriding, same rule as the lift above.
+        int from_rope_params = 0;
+        if (cfg.contains("rope_parameters") && cfg["rope_parameters"].is_object()) {
+            for (auto it = cfg["rope_parameters"].begin(); it != cfg["rope_parameters"].end(); ++it) {
+                if (cfg.contains(it.key()) || it.value().is_null()) continue;
+                cfg[it.key()] = it.value();
+                ++from_rope_params;
+            }
+        }
+        if (from_rope_params > 0 && source) *source += " + config.json rope_parameters";
         if (from_text_config > 0 && source) *source += " + config.json text_config";
         if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;
@@ -1380,6 +1375,66 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
     if (fused.size() != 1) return 0;
     return int(*fused.begin());
 }
+// engine#1740: a 1.9 pack's stride is KNOWN before the eps vote -- canonical_token_fconst() derives it from the 112-byte
+// per-head header to build its copy -- but `locate_fconst`'s epsilon-anchor vote can still lose when the payload is dense in
+// eps-SHAPED bytes (bf16 1e-6 followed by ten zeros is not rare in 4-bit weights). Measured on Qwen2-7B 1.9: the right stride
+// won only 52.6 % of lag-2 pairs, under the 66 % bar, so a 3.8 GB pack structurally identical to two measured ones was refused
+// with "the epsilon headers do not repeat with a single period" while its own header reported the stride exactly.
+// So ask the header first on the SOURCE file (the canonical copy has the 1.9 header removed by construction), and keep the eps
+// vote as the fallback for packs with no 1.9 header -- the 1.8 / R1-Distill line, where it works today.
+FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& pack_dir, const Dims& dims) {
+    FconstGeom g = locate_fconst(tok, dims.eps_bits);
+    const std::string src = find_token_fconst(pack_dir);
+    if (src.empty()) return g;
+    Fconst fc = open_fconst(src);
+    int64_t hdr_off = 0, stride9 = 0;
+    const bool is19 = fconst19_detect(fc, dims.heads, dims.layers, &hdr_off, &stride9);
+    unmap_file(fc.map, fc.size);
+    if (!is19) return g;                                  // no 1.9 header: the eps vote is the only witness, keep it
+    const int64_t stride8 = stride9 - int64_t(dims.heads) * 4;
+    if (stride8 <= 0) return g;
+    if (g.stride != 0 && g.stride != stride8) {
+        // Two witnesses that disagree: say so rather than pick. They cannot both be right, and a wrong stride reads weights
+        // from the wrong place instead of failing cleanly.
+        g.why = "the 1.9 header gives stride " + std::to_string(stride8) + " and the epsilon anchors give " +
+                std::to_string(g.stride) + "; refusing rather than choosing";
+        g.stride = 0;
+        return g;
+    }
+    g.stride = stride8;
+    g.why.clear();
+    // The second header offset (`h1`) is what tells the payload reader whether a block holds 2 eps headers or 4, so the eps
+    // vote failing must not leave it at 0: with the stride known, the anchors' offsets *within* a block repeat, and the mode
+    // of `pos mod stride` (excluding 0, the block start) is the second header. This is the same pool of anchors the vote
+    // could not win on, used for a question that does not need a dominance test -- 28 blocks each contribute their residue.
+    const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
+    if (!pos.empty()) {
+        std::map<int64_t, int> off;
+        for (const int64_t q : pos) {
+            const int64_t r = q % stride8;
+            if (r > 0 && r < stride8) ++off[r];
+        }
+        int best = 0;
+        int64_t best_off = 0;
+        for (const auto& [o, n] : off)
+            if (n > best) { best = n; best_off = o; }
+        if (best_off > 0) {
+            // Populate the same fields `locate_fconst` would have: `hdr` is the in-block header list and the reader
+            // classifies a pack as a 2-header (one inner anchor) or 4-header (three) block from its SIZE. Setting only
+            // h1 left `hdr` empty, so a pack whose anchors could not win the vote was classified as "1 epsilon header"
+            // and every attention projection refused while the MLP imported byte-exact -- measured on Qwen2-7B 1.9.
+            // The scan window is the first GiB (about 8 blocks of this geometry), so the right residue repeats ~8 times
+            // against 1-2 for a payload coincidence. Requiring `layers/2` was too strict and silently dropped the real one.
+            if (best >= 3) {                             // the residue repeats across blocks: a real section boundary
+                g.h1 = best_off;
+                g.hdr.assign(1, best_off);               // 2-header block: q/k/v/o in one payload (Qwen2/Llama)
+                g.period = 2;
+            }
+        }
+    }
+    return g;
+}
+
 std::string find_token_fconst_exported(const std::string& pack_dir) { return find_token_fconst(pack_dir); }
 
 // engine#1638: the geometry READ (not just its dims), so a test can assert where each number came from -- the
@@ -1796,6 +1851,45 @@ namespace {
 const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
                                    std::string* why);   // defined with the table, internal to this file
 }
+bool fconst_scratch_ready(const std::string& dir) {
+    // A candidate scratch directory is usable when it is (or can be made into) a directory. The cache directory is OURS to create:
+    // the version of engine#1801 that shipped first did not, so on a fresh box the loop walked straight past the new first choice
+    // and every pack fell through to tmpfs -- the bug this function exists to make testable.
+    std::error_code ec;
+    if (fs::is_directory(dir, ec) && !ec) return true;
+    std::error_code made;
+    fs::create_directories(dir, made);
+    return fs::is_directory(dir, ec) && !ec;
+}
+
+std::vector<std::string> fconst_scratch_dirs() {
+    // Where the canonical .fconst copy may live, in preference order. A function because the ORDER is the fix from engine#1801 and
+    // the reviewer's ask was a test that pins it: on strixhalo /tmp is tmpfs, so the first choice has to be disk, and a version of
+    // this that forgot to create the cache directory silently fell through to /tmp for every pack.
+    std::vector<std::string> dirs;
+    if (const char* scratch = std::getenv("ONEBIT_FCONST_SCRATCH"); scratch && *scratch)
+        dirs.push_back(scratch);
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+        dirs.push_back(std::string(xdg) + "/1bit/fconst19");
+    else if (const char* home = std::getenv("HOME"); home && *home)
+        dirs.push_back(std::string(home) + "/.cache/1bit/fconst19");
+    // engine#1818 review: `$TMPDIR` belongs BETWEEN the cache and the literal /tmp. It was dropped in this extraction, and on a
+    // lane that points TMPDIR at disk (which is what people do here precisely because /tmp is RAM) a pack whose cache directory
+    // is unusable then landed in tmpfs -- the outcome engine#1801 exists to prevent. temp_directory_path() throws when TMPDIR
+    // names a missing directory, hence the try and the note; it also returns /tmp when TMPDIR is unset, so the literal below is
+    // still the final disc-resort and not a duplicate.
+    try {
+        const fs::path tmp = fs::temp_directory_path();
+        if (!tmp.empty() && tmp != fs::path("/tmp")) dirs.push_back(tmp.string());
+    } catch (...) {
+        // The temporary directory is unusable (TMPDIR names something that is not there): go elsewhere.
+    }
+    // Last resorts only: on this box /tmp is tmpfs, so each of these costs RAM equal to the pack's .fconst.
+    dirs.push_back("/tmp");
+    dirs.push_back(".");
+    return dirs;
+}
+
 const Fconst19Rule* fconst19_rules(int* count) {
     if (count) *count = int(sizeof(kFconst19Rules) / sizeof(kFconst19Rules[0]));
     return kFconst19Rules;
@@ -2643,7 +2737,7 @@ Plan plan(const std::string& pack_dir) {
                                                                   "payload is not 64-row tiles of this shape";
             p.mlp_note = p.attn_note;
         } else {
-            const FconstGeom g = locate_fconst(tok, p.dims.eps_bits);
+            const FconstGeom g = locate_fconst_with_header(tok, pack_dir, p.dims);
             if (g.stride == 0) {
                 p.attn_note = "layer blocks not located: " + g.why;
                 p.mlp_note = p.attn_note;
@@ -3267,6 +3361,17 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     if (const std::string why = weight_layout_refusal(opt.weight_layout); !why.empty())
         throw std::runtime_error("--weight-layout: " + why);
     json c;
+    // engine#1794 review: the container's OWN config is what the forward reads (`q4nx_semantics.c:121` value_for_top,
+    // depth 1 only), and this writer started from an empty json -- so a mRoPE declaration that lives only at
+    // `text_config.rope_parameters` was dropped, and the pack would be served as plain RoPE with the right theta and the
+    // wrong axis layout (engine#1311: exact for a text-only prompt, ~0.29 rad off once image tokens are in it). The
+    // import_pack() writer starts from load_geometry() and already carries it; this one has to copy it.
+    {
+        std::string geom_src;
+        const json geom = load_geometry(pack_dir, &geom_src);
+        if (geom.value("mrope_interleaved", false)) c["mrope_interleaved"] = true;
+        if (geom.contains("mrope_section")) c["mrope_section"] = geom["mrope_section"];
+    }
     c["model_type"] = p.dims.model_type;
     c["hidden_size"] = p.dims.hidden;
     c["intermediate_size"] = p.dims.intermediate;
@@ -3562,12 +3667,20 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // The two spellings of a quantised projection (engine#1503): the 1.8/phi-4 form carries a qweight and a
             // scales sibling; Qwen3-VL-4B names them `<proj>.MatMul.weight_Q4` / `<proj>.MatMul.weight_scales` on a
             // three-input node with no qzeros (implicit zero point, applied below).
-            const OnnxTensor* qw = init_of(proj + ".MatMulNBits.qweight");
-            const OnnxTensor* sc = init_of(proj + ".MatMulNBits.scales");
+            // `proj` arrives from a plan source string (`graph:model.layers.N.attn.q_proj`, no trailing dot) as well as
+            // from a role name (`...q_proj.`, with one), so normalise before appending a suffix -- otherwise the
+            // three-input spelling is looked up as `...q_projMatMul.weight_Q4` and never found, which is how a pack could
+            // plan all 252 projections, write only its norms, and fail on the device with `MLP dequant : data_size 0`
+            // (engine#1503).
+            std::string pre = proj;
+            if (!pre.empty() && pre.back() != '.') pre += '.';
+            const OnnxTensor* qw = init_of(pre + "MatMulNBits.qweight");
+            const OnnxTensor* sc = init_of(pre + "MatMulNBits.scales");
             if (!qw || !sc) {
-                qw = init_of(proj + "MatMul.weight_Q4");
-                sc = init_of(proj + "MatMul.weight_scales");
+                qw = init_of(pre + "MatMul.weight_Q4");
+                sc = init_of(pre + "MatMul.weight_scales");
             }
+            if (!qw || !sc) return false;   // named, so the caller's refusal says which
             if (!qw || !sc || qw->dims.size() != 3 || sc->dims.empty()) return false;
             const int N = int(qw->dims[0]);
             const int block = int(qw->dims[2]) * 2;            // 64 B holds 128 four-bit codes
@@ -3597,7 +3710,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             const uint8_t* zp = zt ? bytes_of(*zt, z_need) : nullptr;
             uint64_t qw_need = 0;
             if (!mul_ok(groups_n, uint64_t(block) / 2, qw_need)) return false;
-            const Q4 q = decode_matmulnbits(bytes_of(*qw, qw_need), scales.data(), zp, N, K, block);
+            Q4 q = decode_matmulnbits(bytes_of(*qw, qw_need), scales.data(), zp, N, K, block);
+            // No qzeros tensor means the implicit zero point 2^(bits-1) -- the same rule the head path applies, and the
+            // one ONNX Runtime's MatMulNBits uses. Missing it here decoded every PROJECTION with zero point 0 while the
+            // head was decoded with 8, which is why the pack imported completely, served on the device, and answered
+            // gibberish on both the device and the host-GEMM path (engine#1503: "West什么呢ưởng中国联通nio…").
+            if (!zt) implicit_zp_zero(q, 4);
             // the row slice, re-tiled exactly as the whole tensor would be
             Q4 part;
             part.N = rows; part.K = K;
@@ -3805,7 +3923,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     {
         std::string path_why;
         const std::string path = materialise_token_fconst(pack_dir, p.dims);
-        const FconstGeom g = locate_fconst(path, p.dims.eps_bits);
+        const FconstGeom g = locate_fconst_with_header(path, pack_dir, p.dims);
         // refusals decided while reading the payload (a tile that does not survive its own round trip,
         // or an o_proj bias the container has nowhere to put); they land before anything is written
         std::vector<std::string> late;

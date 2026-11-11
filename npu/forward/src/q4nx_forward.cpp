@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include "batch_check_compare.h"
 #include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
@@ -196,7 +197,7 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
 // Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`. Hunyuan's
 // 1.9 packs declare factor 1.0 with a 262,144 window, i.e. a no-op until a prompt passes that window -- which is why
 // accepting it is safe rather than a guess: below the window the base IS theta, so the served bytes are plain rope.
-static Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
+Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
     Q4nxRopeDynamic d{};
     std::ifstream f(cfg_path);
     if (!f) return d;
@@ -424,7 +425,14 @@ bool Q4nxNpuForward::init_host(const char* model_path, const std::string& dir) {
 
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir) {
-    if (getenv("NPU_INFER_HOST_GEMM")) host_gemm_ = true;
+    if (const char* hg = getenv("NPU_INFER_HOST_GEMM")) {
+        host_gemm_ = true;
+        // engine#1808: "i8" selects the integer arm, whose int32 accumulation is the only thing a
+        // kernel family can be bit-exact against (an int8 device cannot match an f32 host by
+        // construction). Any other value keeps the f32 path, which is what every existing caller and
+        // every row measured so far used.
+        host_gemm_i8_ = (hg[0] == 'i' && hg[1] == '8');
+    }
     // The launch layer.  A1: everything below that touches a device talks to this, and the settings the
     // container declares (weight layout, pb16i image dir, Hadamard fold) are pushed into it as they are
     // parsed.  A2 turns this into NpuTarget::open(plan, kernels_dir).
@@ -3025,6 +3033,65 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
 // packed-weight BO cache, pb16i images, Hadamard fold.  What stays here is the model's own fallback, the
 // plain float GEMM of init_host() -- that is a property of the model, not of any NPU.
 // --------------------------------------------------------------------------
+// The integer host arm (engine#1808/#1809). Two decisions here, both measured:
+//  * the weight codes and their per-128-K multipliers are quantised ONCE per tensor (`wkey`) and cached --
+//    doing it per call made a 7B token ~7.5 G scalar operations and the arm never finished a token inside a
+//    9-minute ticket;
+//  * the inner sum is exact int32 with no float in it (q4nx_host_gemm_i8_grouped), so the comparison against
+//    the device is about accumulation and epilogue, not about a float both sides happen to share.
+void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat,
+                                  int wkey, float* out) {
+    const int G = 128, groups = (K + G - 1) / G;
+    auto it = host_i8_cache_.find(wkey);
+    if (it == host_i8_cache_.end()) {
+        HostI8Tensor t;
+        t.groups = groups; t.N = N;
+        t.codes.assign((size_t)K * (size_t)N, 0);
+        t.d.assign((size_t)groups * (size_t)N, 0.0f);
+        for (int g = 0; g < groups; g++) {
+            const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
+            for (int n = 0; n < N; n++) {
+                float amax = 0.0f;
+                for (int k = k0; k < k1; k++) {
+                    const float v = std::fabs(Bmat[(size_t)k * (size_t)N + (size_t)n]);
+                    if (std::isfinite(v) && v > amax) amax = v;
+                }
+                if (!(amax >= 1e-12f)) amax = 1.0f;
+                t.d[(size_t)g * (size_t)N + (size_t)n] = amax / 127.0f;
+                const float tis = 127.0f / amax;
+                for (int k = k0; k < k1; k++) {
+                    float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
+                    if (!std::isfinite(v)) v = 0.0f;
+                    int q = (int)std::round(v * tis);
+                    q = q > 7 ? 7 : (q < -8 ? -8 : q);
+                    t.codes[(size_t)k * (size_t)N + (size_t)n] = (int8_t)q;
+                }
+            }
+        }
+        it = host_i8_cache_.emplace(wkey, std::move(t)).first;
+    }
+    const HostI8Tensor& t = it->second;
+    std::vector<int8_t> a8((size_t)K);
+    for (int m = 0; m < M; m++) {
+        const float* a = A + (size_t)m * (size_t)a_k;
+        float amax = 0.0f;
+        for (int k = 0; k < K; k++) {
+            const float v = std::fabs(a[k]);
+            if (std::isfinite(v) && v > amax) amax = v;
+        }
+        const float ascale = (amax >= 1e-12f) ? amax / 127.0f : 1.0f;
+        const float tis = 1.0f / ascale;
+        for (int k = 0; k < K; k++) {
+            float v = a[k];
+            if (!std::isfinite(v)) v = 0.0f;
+            int q = (int)std::round(v * tis);
+            a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
+        }
+        q4nx_host_gemm_i8_grouped(a8.data(), K, t.codes.data(), t.d.data(), t.groups, N, ascale,
+                                  out + (size_t)m * (size_t)N);
+    }
+}
+
 void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const float* Bmat,
                               std::vector<float>& out, int wkey, const char* sc, int a_k) {
     if (host_gemm_) {
@@ -3033,6 +3100,10 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
         // unpadded A. (In review of this PR the split moved the pad into the target and left this
         // branch reading past the caller's buffer at a padded design.)
         out.assign((size_t)N, 0.0f);
+        if (host_gemm_i8_) {
+            host_gemm_i8(A, a_k, 1, K, N, Bmat, wkey, out.data());
+            return;
+        }
         q4nx_host_gemm_f32_padded(A, a_k, 1, K, N, Bmat, out.data());
         return;
     }
@@ -3052,6 +3123,10 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         // Same pad, and here it is also a stride: the rows form used to index A at `m * K` while the
         // caller's buffer is laid out at `m * a_k`, so every row past the first read the wrong row.
         out.assign((size_t)M * N, 0.0f);
+        if (host_gemm_i8_) {
+            host_gemm_i8(A, a_k, M, K, N, Bmat, wkey, out.data());
+            return;
+        }
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
         return;
     }
@@ -3264,16 +3339,25 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // device state -- localises a batched-vs-sequential divergence immediately.
     static const bool batch_check = getenv("NPU_BATCH_CHECK") != nullptr;
     int seq_argmax = -1;
+    // engine#1781: the old oracle compared ONE argmax at ONE position -- the last row's -- which is not the question a
+    // speculative decoder asks. Every drafted position's LOGITS matter (the accept rule consumes the target's
+    // probability at the drafted token), so the sequential rows are kept whole and compared row for row, bitwise.
+    // M x vocab floats: 4-7 MB on the models this runs, allocated only under the debug flag.
+    std::vector<float> seq_rows, bat_rows;
     // Not with injected rows: the oracle's own sequential pass runs step(tokens[m]) on the placeholder ids this
     // entry point supplies, so it would compare against a zero-token pass and report a divergence that is not
     // there. A debug tool that lies is worse than one that says "not applicable".
     if (batch_check && !inject_embeds_) {
         std::vector<float> seq;
-        for (int m = 0; m < M; m++)
+        if (c_.NV > 0) seq_rows.reserve((size_t)M * (size_t)c_.NV);
+        for (int m = 0; m < M; m++) {
             if (!step(tokens[m], start_pos + m, seq)) return false;
+            seq_rows.insert(seq_rows.end(), seq.begin(), seq.end());   // every row, not only the last
+            if (m == M - 1)
+                for (size_t i = 0; i < seq.size(); i++)
+                    if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
+        }
         reset();
-        for (size_t i = 0; i < seq.size(); i++)
-            if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
     }
 
     // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
@@ -3685,6 +3769,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             ok = run_lm_head_rows(norm_all, M, *batch_all_out_);
         }
         logits.assign(batch_all_out_->begin() + (size_t)(M - 1) * (size_t)c_.NV, batch_all_out_->end());
+        // engine#1781: keep the batched rows so the oracle can compare all of them, not just the last one's argmax.
+        if (batch_check) bat_rows.assign(batch_all_out_->begin(), batch_all_out_->end());
     } else {
         std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
         rmsnorm(last.data(), final_norm_.data(), H, fnorm.data());
@@ -3712,6 +3798,16 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (logits[i] > logits[(size_t)ba]) ba = (int)i;
         std::fprintf(stderr, "[batchcheck] M=%d start=%d seq_argmax=%d batch_argmax=%d %s\n",
                      M, start_pos, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
+        // engine#1781: and the comparison the gate actually asks for -- every row, bitwise.
+        if (!seq_rows.empty() && bat_rows.size() == seq_rows.size() && c_.NV > 0) {
+            onebit::npu::RowMismatch mm;
+            const int differing = onebit::npu::compare_rows_bitwise(seq_rows.data(), bat_rows.data(), M, c_.NV, &mm);
+            std::fprintf(stderr, "[batchcheck] rows M=%d identical=%d differing=%d", M, M - differing, differing);
+            if (differing > 0)
+                std::fprintf(stderr, " first row=%d index=%d seq=0x%08x bat=0x%08x%s", mm.row, mm.index,
+                             (unsigned)mm.seq_bits, (unsigned)mm.bat_bits, mm.nan_mismatch ? " (NaN)" : "");
+            std::fprintf(stderr, "\n");
+        }
     } else if (getenv("NPU_BATCH_DBG")) {
         std::fprintf(stderr, "[batch] M=%d start=%d batched (%d layers, two_widths=%d)\n",
                      M, start_pos, c_.NL, (int)two_widths);
@@ -4266,7 +4362,11 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         // Dynamic NTK: the base moves with the position, so it is one pow per position rather than one per dim pair.
         // Below the model's original window this returns theta unchanged, which is what makes a short prompt
         // bit-identical to the same model served without the scaling.
-        const double rope_theta = q4nx_rope_dynamic_base((double)theta, &rope_dynamic_, (double)pos, (int)HD);
+        // engine#1792 review: the exponent is HF's `dim / (dim - 2)` over the ROTARY width (`dim = int(head_dim *
+        // partial_rotary_factor)`), which is `rot` here -- passing `HD` was wrong for any model that declares dynamic
+        // scaling together with partial_rotary_factor < 1. Unreachable in today's catalog, so this is a correctness
+        // constant rather than a behaviour change for any pack that exists.
+        const double rope_theta = q4nx_rope_dynamic_base((double)theta, &rope_dynamic_, (double)pos, rot);
         for (int i = 0; i < half; i++) {
             double inv;
             if (proportional) {

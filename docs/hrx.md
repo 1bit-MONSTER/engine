@@ -864,7 +864,37 @@ length peak at 8.7 GiB instead of growing; greedy answers are identical, and lla
 is unchanged. A repeated prompt length right after a flush costs 1.75 s instead of 1.12 s, since its
 program is rebuilt.
 
-### Server memory: HRX reads the weights instead of mapping them ([engine#856](https://github.com/1bit-MONSTER/engine/issues/856), [engine#1339](https://github.com/1bit-MONSTER/engine/issues/1339))
+### Server memory: the weights stay in the file mapping, and HRX holds the device copy ([engine#856](https://github.com/1bit-MONSTER/engine/issues/856), [engine#1339](https://github.com/1bit-MONSTER/engine/issues/1339))
+
+**Since [llama.cpp #304](https://github.com/1bit-MONSTER/llama.cpp/pull/304) (engine#856).** With a model on HRX and the default
+`-lm mmap`, the loader no longer uploads the model into an `HRX0` device buffer. HRX reports `buffer_from_host_ptr`, so the loader
+wraps its file mapping as an `HRX0_Mapped` buffer. That buffer is host memory: no copy, no device allocation, and no import (the
+userptr import described below is not used). HRX makes its own device copy of each weight from those pages. The model's file pages
+stay in the page cache, which is file-backed and reclaimable. `GGML_HRX_MODEL_BUFFER_COPY=1`, or any
+`GGML_HRX_HOST_WEIGHT_LIMIT_MB`, brings back the upload described in the next paragraph. Measured at llama.cpp `204493d40` (#304 as merged)
+and hrx-system `7f4236924aad`, with one binary for both arms (`tools/hrx_gtt_split.py run`, peak `drm-total-gtt`):
+
+| shape | upload (`GGML_HRX_MODEL_BUFFER_COPY=1`) | #304 |
+|---|---:|---:|
+| Qwen3-4B Q4_K_M, 5-token prompt, `-n 64` | 5,665.3 MiB | **3,225.3 MiB** |
+| Qwen3-4B Q4_K_M, 1,282-word prompt, `-c 4096 -n 16` | 6,311.8 MiB | 6,055.8 MiB |
+| Qwen3.8-27B UD-Q4_K_XL, 5-token prompt, `-n 16` | 19,075.3 MiB | 17,231.3 MiB |
+
+The generated text is identical in every pair, and `llama-perplexity --kl-divergence` against the upload's logits gives a mean KLD of 0.000000.
+The number of device copies goes *up* while GTT goes down. With the upload, HRX copied only the 253 weights it reads in its own
+layout, and every other read went to the loader's buffer. With #304 every weight HRX runs gets a device copy: 398 on the short
+prompt. Those copies replace the 2,375.9 MiB loader buffer, so `GGML_HRX_MODEL_BUFFER_COPY=1` gives fewer device buffers and more GTT.
+Every pair agrees on the top-1 token at every position (100.000 %). Speed is unchanged in steady state: `llama-bench -p 1024 -n 64 -r 3`,
+alternated, gives pp1024 2,764.6 tok/s (upload) and 2,767.7 / 2,765.4 tok/s (#304), and tg64 71.5 against 72.1 / 72.3 tok/s. A fresh
+process pays a one-time copy at its first prompt instead of at load time.
+
+**What remains of the duplicate** ([engine#2137](https://github.com/1bit-MONSTER/engine/issues/2137)): prefill reads q4_k and
+q6_k weights in their stored layout, while decode reads HRX's layout, so after a long prompt HRX holds a device copy in each
+layout. The second row shows it: 647 device copies, 4,400.6 MiB, for a 2,375.9 MiB model. `GGML_HRX_Q6K_PACKED_PREFILL=1` does
+not change that row. A short-prompt server, or one that has not yet seen a long prompt, holds one copy per weight.
+
+The paragraphs below describe the upload path, which `GGML_HRX_MODEL_BUFFER_COPY=1` and `--no-mmap` still use.
+
 
 With a model on HRX (`-ngl` > 0), the loader reads the weights into their device buffers with `read()` and drops each weight's
 page-cache pages as soon as it is read ([llama.cpp #234](https://github.com/1bit-MONSTER/llama.cpp/pull/234)). A mapped load
@@ -875,8 +905,8 @@ of 14.3 s. Output and wikitext perplexity are unchanged. `--mlock` with mmap kee
 The earlier weight-mapping import ([llama.cpp #226](https://github.com/1bit-MONSTER/llama.cpp/pull/226), opt-in since
 [#231](https://github.com/1bit-MONSTER/llama.cpp/pull/231)) is gone, and `GGML_HRX_WEIGHT_HOST_PLACEMENT` does nothing.
 It registered the file mapping as a KFD userptr, which the kernel always write-faults, so it dirtied the file, changed
-its mtime, and never finished on large models while writeback kept invalidating it (engine#1339). HRX's repacked copy of the
-dense weights still sits next to the device buffer in GTT.
+its mtime, and never finished on large models while writeback kept invalidating it (engine#1339). On that path, HRX's repacked copy of the
+dense weights sits next to the device buffer in GTT.
 
 **What was tried to remove that duplicate, and why it does not work (2026-11-09).** The obvious route is to stop placing the
 native range on the device at all and let HRX repack on demand: `-ot '<pattern>=CPU'` does *not* put a weight in a plain CPU
@@ -1343,7 +1373,7 @@ in [hrx.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/
   bit-identically. Cost: pp512 -4.7% on Qwen3-0.6B, the rest within noise.
 - **Weights read, page cache dropped** ([llama.cpp #234](https://github.com/1bit-MONSTER/llama.cpp/pull/234)): with a model
   on HRX the loader reads the weights instead of mapping the file and drops their page cache; replaces the weight-mapping
-  import of #226/#231 ([section above](#server-memory-hrx-reads-the-weights-instead-of-mapping-them-engine856-engine1339)).
+  import of #226/#231 ([section above](#server-memory-the-weights-stay-in-the-file-mapping-and-hrx-holds-the-device-copy-engine856-engine1339)).
 - **A cap on the graph program cache** ([llama.cpp #63](https://github.com/1bit-MONSTER/llama.cpp/pull/63)):
   `GGML_HRX_GRAPH_PROGRAM_CACHE`, default 64 ([section above](#server-memory-the-graph-program-cache-cap-llamacpp-63)).
 - **Hadamard-rotated Q4_0 files** ([llama.cpp #58](https://github.com/1bit-MONSTER/llama.cpp/pull/58)):

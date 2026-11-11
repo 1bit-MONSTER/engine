@@ -119,10 +119,41 @@ def judge(log_text, replies, floor=60.0, first_token_ms=600.0, fast_route=FAST_R
     return out
 
 
-def report(verdicts):
+def load_note(verdicts, load1, ncpu):
+    """One line about the box, or None. Pure: verdicts and two numbers in, text out.
+
+    The fast route keeps about 1.5 CPU cores of host work per token, and npu-hold serialises the device, not the CPU.
+    Measured on the shipped binary (engine#2106): 86-94 tok/s on a quiet box at every answer length, 51-89 while a
+    10-job build ran beside it, on the same route with the same answers. So a run where the route and the content
+    pass and ONLY the timing fails is, more often than a regression, a busy box. This says so; it never changes the
+    result -- a starved box is something the release run should notice, not excuse.
+    """
+    if load1 is None:
+        return None
+    got = {v[0]: v[1] for v in verdicts}
+    timing_only = got.get("route") and got.get("content") and not (got.get("rate") and got.get("first-token"))
+    line = "1-minute load average %.1f on %d CPUs" % (load1, ncpu)
+    if timing_only:
+        line += ("; the route and the content passed and only the timing failed -- a busy box is the likely cause"
+                 " (the route needs about 1.5 cores per token). Re-run on a quiet box before reading this as a regression")
+    return line
+
+
+def box_load():
+    """(1-minute load average, CPU count), or (None, 0) where the platform has no load average."""
+    try:
+        return os.getloadavg()[0], os.cpu_count() or 1
+    except (OSError, AttributeError):
+        return None, 0
+
+
+def report(verdicts, load1=None, ncpu=0):
     ok = all(v[1] for v in verdicts)
     for name, good, detail in verdicts:
         print("%-12s %s  %s" % (name, "ok  " if good else "FAIL", detail))
+    note = load_note(verdicts, load1, ncpu)
+    if note:
+        print("%-12s %s  %s" % ("load", "info", note))
     print("RESULT: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -151,6 +182,10 @@ def run(args):
     os.makedirs(out, exist_ok=True)
     log_path = os.path.join(out, "serve.log")
     cmd = [args.bin, "serve", "-m", args.model, "--device", "npu", "--host", "127.0.0.1", "-p", str(args.port)]
+    load1, ncpu = box_load()   # before the serve starts: the box as the run found it, not the run's own load
+    if load1 is not None:
+        with open(os.path.join(out, "load.json"), "w") as f:
+            json.dump({"load1": load1, "ncpu": ncpu}, f)
     replies = []
     with open(log_path, "wb") as log:
         serve = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, preexec_fn=die_with_parent)
@@ -194,7 +229,7 @@ def run(args):
         log_text = f.read()
     if not replies:
         print("serve       FAIL  it never became ready within %d s (exit %s); see %s" % (args.ready_seconds, serve.returncode, log_path))
-    return report(judge(log_text, replies, args.floor, args.first_token_ms, args.fast_route, args.slow_route))
+    return report(judge(log_text, replies, args.floor, args.first_token_ms, args.fast_route, args.slow_route), load1, ncpu)
 
 
 def rejudge(args):
@@ -207,7 +242,14 @@ def rejudge(args):
         with open(os.path.join(d, "reply_%d.json" % i)) as f:
             replies.append(json.load(f))
         i += 1
-    return report(judge(log_text, replies, args.floor, args.first_token_ms, args.fast_route, args.slow_route))
+    load1, ncpu = None, 0   # the load the RUN recorded, if it did: judging again later must not read today's box
+    try:
+        with open(os.path.join(d, "load.json")) as f:
+            rec = json.load(f)
+        load1, ncpu = float(rec["load1"]), int(rec["ncpu"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return report(judge(log_text, replies, args.floor, args.first_token_ms, args.fast_route, args.slow_route), load1, ncpu)
 
 
 FAKE_SERVE = r'''#!/usr/bin/env python3
@@ -334,6 +376,30 @@ def self_test():
 
     # the measured demo row passes
     expect("the measured fast-route row", judge(fast_log, good), all_ok)
+    # the load line: always states the box, and names a busy box only when the timing ALONE failed
+    def note_is(name, verdicts, load1, want_hint, want_none=False):
+        n = load_note(verdicts, load1, 32)
+        if want_none:
+            if n is not None:
+                fails.append("%s: expected no load line, got %r" % (name, n))
+        elif n is None or ("busy box" in n) != want_hint or ("%.1f" % load1) not in n:
+            fails.append("%s: load line %r (hint wanted: %s)" % (name, n, want_hint))
+    busy = [reply("The capital of France is Paris.", 53.3, 433), reply("def fib(n): ...", 46.4, 446), reply("391", 50.0, 433)]
+    note_is("a pass states the load and blames nothing", judge(fast_log, good), 4.6, False)
+    note_is("the busy-box row (fast route, right answers, 50 tok/s)", judge(fast_log, busy), 21.0, True)
+    late = [reply("The capital of France is Paris.", 90.0, 900), reply("def fib(n): ...", 88.0, 950), reply("391", 91.0, 910)]
+    note_is("first token alone over the limit is a timing-only failure too", judge(fast_log, late), 18.0, True)
+    note_is("the slow route is never excused by load", judge(slow_log, busy), 21.0, False)
+    note_is("empty content is never excused by load",
+            judge(fast_log, [reply("", 50.0, 433, reasoning="Okay ...") for _ in range(3)]), 21.0, False)
+    note_is("no load average on the platform: no line", judge(fast_log, busy), None, False, want_none=True)
+    import contextlib
+    import io
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        rc = report(judge(fast_log, busy), 21.0, 32)
+    if rc != 1 or "RESULT: FAIL" not in printed.getvalue() or "load         info" not in printed.getvalue():
+        fails.append("a busy-box failure must still FAIL and print its load line: the note never changes the result")
     # engine#2102 as it was seen: the slow route answers correctly, at 1.9 tok/s. Three of four assertions catch it.
     slow = [reply("The capital of France is Paris.", 1.9, 4100), reply("def fib(n): ...", 1.87, 4200), reply("391", 1.9, 4000)]
     expect("the silent fallback", judge(slow_log, slow), {"route": False, "rate": False, "first-token": False, "content": True})

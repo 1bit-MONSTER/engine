@@ -289,9 +289,29 @@ struct Q4nxContainer {
     int64_t header_bytes = 0;
     int64_t payload_bytes = 0;
     std::vector<Q4nxTensor> tensors;   // in header order
+    // The safetensors `__metadata__` object, kept because it is where this genre states its own geometry (engine#1786).
+    // Three quarters of the packs measured on this box carry a `dims` block with hidden/intermediate/layers/heads/vocab;
+    // two carry no metadata at all (`d3-edge`, `d3-flash`), which is why the reader keeps it as data and does not
+    // interpret it here.
+    nlohmann::json meta;
     std::string why;                        // non-empty when the container could not be read; tensors is then empty
 };
 Q4nxContainer read_q4nx_container(const std::string& path);
+
+// engine#1786 (item F1): the container genre's geometry, from the two places a pack can state it, in order of
+// authority -- the container's own `dims` block, then config.json. `source` names which one answered, so a plan can
+// never present a declared number and a file's number as the same kind of fact; `missing` names the fields neither
+// could fill, and `inferred` the ones derived from other fields (head_dim from hidden/heads).
+//
+// Pure: no file is opened, so the three genres the census measured -- 13 self-describing, 14 gguf-converted, 2 with
+// no metadata at all -- can all be pinned without a pack, which is the point of extracting it from `plan()`.
+struct ContainerGeometry {
+    Dims dims;
+    std::string source;                 // "dims", "config.json", or empty when neither answered
+    std::vector<std::string> missing;   // fields no source could fill, by name
+    std::vector<std::string> inferred;  // fields derived from another field, by name
+};
+ContainerGeometry container_geometry(const nlohmann::json& meta, const nlohmann::json& config);
 
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.

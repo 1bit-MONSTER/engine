@@ -234,6 +234,11 @@ private:
     // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
     // logits there instead of only the last row's.  Null on every other path, so nothing else changes.
     std::vector<float>* batch_all_out_ = nullptr;
+    // engine#803 A2b step one: the decode-family block as its own method, body unchanged, so the move into
+    // XdnaTarget::open_decode_family() is a copy rather than surgery inside init_impl.
+    bool open_decode_family_local(bool want_m16, xrt::device* dev, const std::string& mdir,
+                                  const std::string& dir);
+
     bool init_impl(xrt::device* dev, const char* model_path,
                    const std::string& artifact_dir);
     bool host_gemm_ = false;

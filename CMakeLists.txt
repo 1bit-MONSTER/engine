@@ -278,6 +278,9 @@ add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.
 # device. Deliberately OUTSIDE if(ONEBIT_SERVE_TEST_GGUF): that row is device-gated, and the whole point is that the
 # classification is checked in every configure, including the ones that never load a model.
 add_test(NAME serve_context_limit_classify COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh --self-test)
+# engine#1785: `serve --flash` names two settings (--ctx-size 1024, --prefix-pin on --device npu) and refuses what
+# contradicts them. Every case ends in the option check, so the row needs no model, no device and no port.
+add_test(NAME serve_flash_refusals COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_flash_test.sh $<TARGET_FILE:onebit>)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
@@ -322,6 +325,9 @@ add_python_test(tool_selftest_whisper_encoder_baseline ${CMAKE_SOURCE_DIR}/tools
 # engine#1780: the DFlash draft package's gate before a loader -- tile-grid sizes from the config, tile-header sanity and
 # the container's scalars against config.json, on a synthetic package with eight negative controls. Stdlib only.
 add_python_test(tool_selftest_dflash_draft_info ${CMAKE_SOURCE_DIR}/tools/dflash_draft_info.py --selftest)
+# engine#1750: what a TDR recovery did, counted from the kernel log (failed context restarts among them). The self-test
+# parses lines in the driver's own formats for three module generations. Stdlib only, no device.
+add_python_test(tool_selftest_amdxdna_tdr_report ${CMAKE_SOURCE_DIR}/tools/amdxdna_tdr_report.py --self-test)
 # engine#2013: the qwen35 (gated linear attention) GGUF -> Q4NX converter. Its own selftest (tile round-trips, the
 # value-head permutation), and a pack + verify of a small qwen35 GGUF the test writes itself, with the three inputs it
 # has to refuse. numpy only: no gguf package, no model, no device.
@@ -347,6 +353,8 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # the same offset from the data section returns the tensor, from byte 8 it does not.
 add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-test)
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
+# engine#856: one HRX process's GTT split into the loader's copy and HRX's packed second copy, from its own -v log.
+add_python_test(hrx_gtt_split_self ${CMAKE_SOURCE_DIR}/tools/hrx_gtt_split.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The
@@ -684,7 +692,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp
+add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp
                             npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
@@ -1128,6 +1136,14 @@ target_link_libraries(npu_stop_tokens_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME npu_stop_tokens COMMAND npu_stop_tokens_test)
 add_dependencies(npu_sampling_test npu_stop_tokens_test)
 
+# The hand-off between the thread that generates a streamed reply and the one that writes it (app/stream_bridge.h,
+# engine#1785: the NPU route sent every frame after the generation ended). Two threads and a clock; no device.
+add_executable(stream_bridge_test tests/stream_bridge_test.cpp)
+target_include_directories(stream_bridge_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
+target_link_libraries(stream_bridge_test PRIVATE Threads::Threads)
+add_test(NAME stream_bridge COMMAND stream_bridge_test)
+add_dependencies(npu_sampling_test stream_bridge_test)
+
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.
 add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
@@ -1191,6 +1207,12 @@ if(ONEBIT_NPU_CAPTURED AND ONEBIT_NPU_PDI AND ONEBIT_NPU_GOLDEN)
 endif()
 
 # Q4NX chunk decoders against 1bit-MONSTER's verified decoders, on committed real tiles
+# engine#1788: the vision component reader (vision_weight.q4nx). Crafted containers for every refusal; the published
+# pack's own numbers when ONEBIT_MINICPM_PACK names a MiniCPM-V 4.7 pack directory.
+add_executable(npu_vision_pack_test tests/npu_vision_pack_test.cpp)
+target_link_libraries(npu_vision_pack_test PRIVATE onebit_npu)
+add_test(NAME npu_vision_pack COMMAND npu_vision_pack_test)
+add_dependencies(onebit npu_vision_pack_test)
 add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
 target_include_directories(npu_q4nx_test PRIVATE app)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
@@ -1503,6 +1525,52 @@ endif()  # ONEBIT_NPU_HOST
 # `llama-server` child (engine #1653 review). Device-free: it drives the helper against a synthetic wrapper.
 add_test(NAME serve_kill_tree COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_kill_tree_test.sh)
 
+# The NPU forward library: one source list and one link interface, built against a runtime target named by the
+# caller. if(ONEBIT_NPU) builds onebit_npu_forward against the private runtime; a configure without it (CI)
+# builds onebit_npu_forward_ci against onnx/ep/npu_runtime_ci_stub.cpp, whose device calls throw -- enough for
+# the host-GEMM forward (init_host), which never opens the device (engine#1946).
+option(ONEBIT_NPU_DEBUG_DUMPS "NPU forward: env-named debug dumps (developer builds)" OFF)
+function(onebit_npu_forward_library name runtime)
+    add_library(${name} STATIC
+        # gemm_q8_raw / gemm_f32: the int8 GEMM the ONNX EP's QDQ leg uses, and now the embedding route's
+        # ternary linears on the array (engine#1311). Its own probe checks the accumulators are exact.
+        npu/ort/onebit_npu_gemm.cpp
+        npu/forward/src/model.c
+        npu/forward/src/q4nx_dequant.c
+        npu/forward/src/q4nx_pack.c
+        # The production weight packer, extracted from I8Ctx so it can be tested without the device runtime (#1416).
+        npu/forward/src/q4nx_pack_blocked.cpp
+        # The lm-head image cache (engine#1716): the file format, and the load-or-pack a serve calls per head tile.
+        npu/forward/src/q4nx_head_image.c
+        npu/forward/src/q4nx_head_tile_cache.cpp
+        npu/forward/src/q4nx_semantics.c
+        npu/forward/src/q4nx_forward.cpp
+        # The NPU target interface and this box's target (engine#799 P4): the model keeps the maths, the
+        # target keeps the runtime, the kernels and the weight residency.
+        npu/target/xdna/xdna_target.cpp)
+    # The Q4NX pack and dequant loops carry `#pragma omp parallel for`; without the
+    # OpenMP flags those compile to serial code. Wire it in (both C and C++ sources)
+    # so they actually use the cores.
+    find_package(OpenMP)
+    if(OpenMP_C_FOUND AND OpenMP_CXX_FOUND)
+        target_link_libraries(${name} PUBLIC OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+    endif()
+    # NPU_INFER_DUMP_ATTN / _LN / _HEAD write debug dumps to a path taken from the environment;
+    # only debug builds carry them (ONEBIT_NPU_DEBUG_DUMPS)
+    if(ONEBIT_NPU_DEBUG_DUMPS)
+        target_compile_definitions(${name} PRIVATE NPU_INFER_DEBUG_DUMPS)
+    endif()
+    target_include_directories(${name} SYSTEM PUBLIC
+        npu/forward/include npu/forward/engine-src npu ${CMAKE_CURRENT_SOURCE_DIR})
+    # plan.json (npu/plan/plan.h, engine #799 P1) is read with nlohmann's parser, and the header is
+    # part of this library's interface, so the dependency is PUBLIC.
+    # engine#1185: the forward converts an imported q4nx-2 container to the device's 5,120-byte
+    # q4_1 form before model_load (npu/q4nx_device.cpp, onebit_npu), so the host layer is part of
+    # this library's link interface.
+    target_link_libraries(${name} PUBLIC onebit_npu ${runtime} nlohmann_json::nlohmann_json dl
+                                                  pthread m)
+endfunction()
+
 # The lane itself: needs the NPU runtime and an XDNA NPU to run.
 option(ONEBIT_NPU "Build the NPU lane (needs the private NPU runtime: ONEBIT_NPU_RT_LIB or ONEBIT_NPU_RT_DIR)" OFF)
 # The NPU code compiles against one runtime (npu/rt.h, docs/npu.md "The runtime"): our own runtime,
@@ -1581,6 +1649,13 @@ if(ONEBIT_NPU)
     add_executable(npu_rt_shim_test tests/npu_rt_shim_test.cpp)
     target_link_libraries(npu_rt_shim_test PRIVATE onebit_npu_lane)
     add_test(NAME npu_rt_shim COMMAND npu_rt_shim_test)
+    # engine#753: does the engine EXECUTE on a dma-buf it did not allocate? This one does open the device (it imports a udmabuf and
+    # hands the exporter's mapping to the runtime), so it takes the kernel ELF as an argument and SKIPS (77) without one -- a box
+    # with no ELF registers a skip rather than a red row, the same rule as the other device-dependent rows.
+    add_executable(npu_dmabuf_import_test tests/npu_dmabuf_import_test.cpp)
+    target_link_libraries(npu_dmabuf_import_test PRIVATE onebit_npu_lane)
+    add_test(NAME npu_dmabuf_import COMMAND npu_dmabuf_import_test "")
+    set_tests_properties(npu_dmabuf_import PROPERTIES SKIP_RETURN_CODE 77)
 
     # The model-generic forward (npu/forward): the GGUF-on-NPU serve route
     # (docs/npu.md, "Open"). q4nx_forward.cpp + its Q4NX dequant/pack/semantics
@@ -1621,45 +1696,9 @@ if(ONEBIT_NPU)
     endif()
 endif()
 
-    add_library(onebit_npu_forward STATIC
-        # gemm_q8_raw / gemm_f32: the int8 GEMM the ONNX EP's QDQ leg uses, and now the embedding route's
-        # ternary linears on the array (engine#1311). Its own probe checks the accumulators are exact.
-        npu/ort/onebit_npu_gemm.cpp
-        npu/forward/src/model.c
-        npu/forward/src/q4nx_dequant.c
-        npu/forward/src/q4nx_pack.c
-        # The production weight packer, extracted from I8Ctx so it can be tested without the device runtime (#1416).
-        npu/forward/src/q4nx_pack_blocked.cpp
-        # The lm-head image cache (engine#1716): the file format, and the load-or-pack a serve calls per head tile.
-        npu/forward/src/q4nx_head_image.c
-        npu/forward/src/q4nx_head_tile_cache.cpp
-        npu/forward/src/q4nx_semantics.c
-        npu/forward/src/q4nx_forward.cpp
-        # The NPU target interface and this box's target (engine#799 P4): the model keeps the maths, the
-        # target keeps the runtime, the kernels and the weight residency.
-        npu/target/xdna/xdna_target.cpp)
-    # The Q4NX pack and dequant loops carry `#pragma omp parallel for`; without the
-    # OpenMP flags those compile to serial code. Wire it in (both C and C++ sources)
-    # so they actually use the cores.
-    find_package(OpenMP)
-    if(OpenMP_C_FOUND AND OpenMP_CXX_FOUND)
-        target_link_libraries(onebit_npu_forward PUBLIC OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
-    endif()
-    # NPU_INFER_DUMP_ATTN / _LN / _HEAD write debug dumps to a path taken from the environment;
-    # only debug builds carry them
-    option(ONEBIT_NPU_DEBUG_DUMPS "NPU forward: env-named debug dumps (developer builds)" OFF)
-    if(ONEBIT_NPU_DEBUG_DUMPS)
-        target_compile_definitions(onebit_npu_forward PRIVATE NPU_INFER_DEBUG_DUMPS)
-    endif()
-    target_include_directories(onebit_npu_forward SYSTEM PUBLIC
-        npu/forward/include npu/forward/engine-src npu ${CMAKE_CURRENT_SOURCE_DIR})
-    # plan.json (npu/plan/plan.h, engine #799 P1) is read with nlohmann's parser, and the header is
-    # part of this library's interface, so the dependency is PUBLIC.
-    # engine#1185: the forward converts an imported q4nx-2 container to the device's 5,120-byte
-    # q4_1 form before model_load (npu/q4nx_device.cpp, onebit_npu), so the host layer is part of
-    # this library's link interface.
-    target_link_libraries(onebit_npu_forward PUBLIC onebit_npu onebit_npu_rt nlohmann_json::nlohmann_json dl
-                                                  pthread m)
+    # The library body is onebit_npu_forward_library() (defined above the runtime options), so the CI build of the
+    # same sources against the runtime stub (engine#1946) cannot drift from this one.
+    onebit_npu_forward_library(onebit_npu_forward onebit_npu_rt)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
     # app/embed_serve.cpp's device path includes npu/embed/embed_npu.h (engine#1311): the embedding route's
     # ternary linears on the array, through the same int8 GEMM the forward links.
@@ -1686,8 +1725,8 @@ endif()
     add_test(NAME gdn_batch_order COMMAND gdn_batch_order_test)
     # engine#1905: the NPU_BATCH_CHECK oracle restores the prefix it replays from instead of resetting it, so a chunk
     # at start_pos > 0 is compared (and then run) from the state the batched pass continues. Host-GEMM, no device;
-    # skips (77) unless ONEBIT_TEST_Q4NX names a container. It links onebit_npu_forward, so the row exists only where
-    # ONEBIT_NPU configures; ci.yml does not, so this is a dev-box test (ONEBIT_NPU=ON plus a container), not CI coverage.
+    # skips (77) unless ONEBIT_TEST_Q4NX names a container. This is the dev-box row (the private runtime, a real
+    # container); a configure without ONEBIT_NPU -- CI's -- registers the same test on a fabricated container below.
     add_executable(batch_check_state_test tests/batch_check_state_test.cpp)
     target_include_directories(batch_check_state_test PRIVATE npu/forward/include)
     target_link_libraries(batch_check_state_test PRIVATE onebit_npu_forward)
@@ -1718,6 +1757,29 @@ endif()
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source
     # check, outside this repository (docs/npu.md, "Checking the NPU").
+endif()
+
+# engine#1946: the batch-check state pin in CI. Under if(ONEBIT_NPU) above, batch_check_state_test is a dev-box row (the
+# private runtime, a container named by ONEBIT_TEST_Q4NX), so a regression of #1909 -- the oracle resetting the prefix it
+# replays from -- would land green. Here, in a configure WITHOUT the NPU lane (CI's), the same test is built from the same
+# forward sources linked against the public runtime stub (its device calls throw; the host-GEMM forward never makes one),
+# and tests/batch_check_state_ci.py runs it on a two-layer qwen3 container it writes and packs at test time
+# (tools/safetensors_to_q4nx.py): no device, no model on disk, under a second. Skips (77) without numpy.
+if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUND)
+    add_library(onebit_npu_rt_ci_stub STATIC onnx/ep/npu_runtime_ci_stub.cpp)
+    target_include_directories(onebit_npu_rt_ci_stub PUBLIC ${CMAKE_SOURCE_DIR}/npu)
+    target_compile_definitions(onebit_npu_rt_ci_stub PUBLIC ONEBIT_NPU_RUNTIME_OWN)
+    target_link_libraries(onebit_npu_rt_ci_stub PUBLIC Threads::Threads)
+    onebit_npu_forward_library(onebit_npu_forward_ci onebit_npu_rt_ci_stub)
+    add_executable(batch_check_state_test tests/batch_check_state_test.cpp)
+    target_link_libraries(batch_check_state_test PRIVATE onebit_npu_forward_ci)
+    # direction B (tools/ci/ci_targets_check.py): ci.yml's --target list is a workflow file no lane can patch; the
+    # documented hook is the one onebit_npu_forward_syntax uses.
+    add_dependencies(onebit batch_check_state_test)
+    add_test(NAME batch_check_state
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test>)
+    set_tests_properties(batch_check_state PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 
 # Private NPU routes (docs/npu.md, "Private routes"): closed-source add-ons in a checkout of

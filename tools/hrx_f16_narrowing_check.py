@@ -100,6 +100,14 @@ MUL = re.compile(r'vector\.mulf\s+(%[A-Za-z0-9_]+)\s*,\s*(%[A-Za-z0-9_]+)')
 ADD = re.compile(r'vector\.addf\s+(%[A-Za-z0-9_]+)\s*,\s*(%[A-Za-z0-9_]+)')
 
 
+# How far past an accumulator's initialisation to look for its update. 120 was too short, and the failure was silent
+# in the direction that matters: `mul_mat_id_f16_f16_wmma_core` carries four f16 accumulators whose update sits ~250
+# lines below the `vector.fragment<init>` (a long Q4_K/Q6 loop body), so they were reported as `none` -- the bucket a
+# reader skims past -- while engine#2167 is exactly about those four. Measured on that file: 120 -> ['none'] x4,
+# 250 -> ['mul'] x4. The report prints this number so nobody has to trust the window blindly.
+WINDOW = 250
+
+
 def scan(path, lines):
     """-> list of (lineno, accname, width, kind) where kind in {mul, add, none}"""
     out = []
@@ -109,7 +117,7 @@ def scan(path, lines):
             continue
         acc, width = m.group(1), int(m.group(2))
         # the updates are the float ops that follow, until the loop closes (a bounded window is enough for a report)
-        window = lines[i:i + 120]
+        window = lines[i:i + WINDOW]
         kind = 'none'
         if any(MUL.search(l) for l in window):
             kind = 'mul'
@@ -186,6 +194,9 @@ def self_test():
     chk('add', scan('x', add_acc)[0][3], 'class 3: an add-only f16 accumulator is reported separately')
     chk(0, len(scan('x', ["  %init = vector.fragment<init> %zero shape [%m, %n] : vector<16xf32>"])),
         'class 3 control: an f32 accumulator is not this defect')
+    far = ["  %init = vector.fragment<init> %zero shape [%m, %n] : vector<16xf16>"] + ["  // pad"] * 200 + \
+          ["    %next = vector.mulf %block_acc, %k : vector<16xf16>"]
+    chk('mul', scan('x', far)[0][3], 'class 3: an update 200 lines below the init is still found')
     print(f"self-test: {'ok' if rc == 0 else 'FAIL'}")
     return rc
 
@@ -218,7 +229,7 @@ def main(argv):
     print(f"class 1  inputs truncated without a prescale          : {len(inputs)}   (overflow above 65520)")
     print(f"class 2  computed values published to f16 unguarded   : {len(pubs)}   (overflow above 65520)")
     print(f"class 3  f16 accumulators updated by a multiply       : {sum(1 for k, _ in accs if k == 'mul')}   (overflow on |a*b| > 65504)")
-    print(f"         f16 accumulators add-only / no-op-window     : {sum(1 for k, _ in accs if k == 'add')} / {sum(1 for k, _ in accs if k == 'none')}")
+    print(f"         f16 accumulators add-only / no-op-window     : {sum(1 for k, _ in accs if k == 'add')} / {sum(1 for k, _ in accs if k == 'none')}   (window: {WINDOW} lines)")
     return 0
 
 

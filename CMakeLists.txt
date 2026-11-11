@@ -221,6 +221,11 @@ set_tests_properties(onnx_graph PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(audio_exec_test tests/audio_exec_test.cpp)
 target_link_libraries(audio_exec_test PRIVATE onebit_npu)
 add_test(NAME audio_exec COMMAND audio_exec_test ${ONEBIT_AUDIO_ONNX})
+# engine#1783 (F8): the log-mel front-end -- STFT, the slaney filterbank and Whisper's clamp scale, checked against the
+# reference extractor. The one part of the pipeline that is not in the pack: the encoder's graph starts at the mel window.
+add_executable(audio_mel_test tests/audio_mel_test.cpp)
+target_include_directories(audio_mel_test PRIVATE npu/forward/include)
+add_test(NAME audio_mel COMMAND audio_mel_test)
 set_tests_properties(audio_exec PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.

@@ -936,6 +936,22 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                std::to_string(mw_->config.num_layers) + " layers in model.q4nx";
         return false;
     }
+    // A layer kind nothing here implements is refused BY NAME (the same rule as an unknown layer_types entry below).
+    // LFM2 declares its hybrid through `full_attn_idxs`, not `layer_types`, so that check cannot see it: its ten
+    // gated short-convolution layers carry no self_attn.* tensors, and run as attention they fail in the first
+    // dequant with a size error that names neither the layer nor the kind.
+    {
+        int first_conv = -1;
+        const int n_conv = model_shortconv_layers(mw_, cfg.num_layers, &first_conv);
+        if (n_conv > 0) {
+            err_ = "model.q4nx has " + std::to_string(n_conv) + " gated short-convolution layer(s) of " +
+                   std::to_string(cfg.num_layers) + " (the first is model.layers." + std::to_string(first_conv) +
+                   ".shortconv.*, LFM2's hybrid), a layer kind this forward does not implement (it runs "
+                   "full_attention, sliding-window and linear/GDN layers), so serving it would run those layers as "
+                   "attention; file the kind you need instead of converting it";
+            return false;
+        }
+    }
 
     // forward dims mirror the config the weights were loaded with
     c_.H = cfg.hidden_size;

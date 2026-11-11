@@ -1875,6 +1875,13 @@ a stream that was sent after the generation had ended; reasoning that the templa
 decision-only pack. "What ends an answer" and [npu-chat-template.md](npu-chat-template.md) describe the rules
 that came out of them.
 
+**Refused by name at load: the `lfm2` packs.** `LFM2.5-1.2B-NPU2` has all four dense kernel shapes on the box
+and its container loads, but ten of its sixteen layers are gated short convolutions (`model.layers.N.shortconv.*`),
+which the loader reads and the forward does not run. The serve exits at load with `forward init failed:
+model.q4nx has 10 gated short-convolution layer(s) of 16 (the first is model.layers.0.shortconv.*, LFM2's hybrid),
+a layer kind this forward does not implement …`. Before that refusal existed it ran those layers as attention,
+failed its warm-up with a size error that named neither the layer nor the kind, and announced itself ready.
+
 Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
 containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry
 has no kernel set on the box. Of the 57 `*-NPU2` repos with a readable geometry on 2026-11-11, 19 had all four

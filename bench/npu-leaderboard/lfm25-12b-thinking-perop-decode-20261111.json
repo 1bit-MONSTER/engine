@@ -24,5 +24,5 @@
   "repeats": 3,
   "timestamp": "2026-11-11T14:14:56Z",
   "source": "~/.cache/scratch-cl-flm/rows-25tk.log and out-rows-lfm25tk/ on strixhalo (row-serve.sh + think-row.py, lane cl-flm; engine#1786)",
-  "notes": "The thinking variant of the LFM2.5 hybrid. What would make this wrong as a row: the reply does not stop after its answer inside 320 tokens, and FastFlowLM's runtime was not run at this budget, so whether that is the model or this route is not established; at 96 tokens in a paired ticket the reasoning already differed from FastFlowLM's from its first words."
+  "notes": "The thinking variant of the LFM2.5 hybrid. The reply does not stop after its answer inside 320 tokens. FastFlowLM 1.0.12's own runtime, same file, same prompt, same budget, one ticket later (two requests, identical): content empty, finish length, and 830 characters of reasoning that begin 'Okay derivative of the function f(x) = x^2 + 3x - 4. Find its vertex.' -- a different problem from the one asked -- at 65.5 tok/s. So on this pack the two runtimes do not produce comparable text, and this row is not a parity row: it says this route reasons about the question and reaches 'Paris'. What would make it wrong: one prompt."
 }

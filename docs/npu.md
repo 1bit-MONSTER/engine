@@ -1965,8 +1965,11 @@ figures are records in `bench/npu-leaderboard/`.
 `chat_template.jinja` and the reasoning is split out. Asked the known-answer prompt three times with 320 tokens
 of room, it reasoned for 287 tokens and then answered, the three replies identical in reasoning and content, at
 4.3 tok/s. The content begins `Paris` and does not end there: it goes on (`\boxed{Paris}`, then a restatement)
-until the token limit, so the row has the answer and not a clean stop. At 96 tokens, in the paired ticket, every
-reply was still reasoning, and the reasoning differed from FastFlowLM's from its first words.
+until the token limit, so the row has the answer and not a clean stop. FastFlowLM's own runtime, given the same
+file, prompt and budget, returned no content at all: 320 tokens of reasoning that begin `Okay derivative of the
+function f(x) = x^2 + 3x - 4. Find its vertex.`, a problem nobody asked, the same on both of two requests. So
+on this pack the two runtimes' texts are not comparable and the row is not a parity row; it records that this
+route reasons about the question that was asked.
 
 Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
 containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry

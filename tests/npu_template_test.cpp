@@ -121,6 +121,63 @@ int main(int argc, char** argv) {
         run_fixture(a);
     }
 
+    // The chat route's own variables (engine#1788): a request's `tools` reach the template, in the
+    // caller's key order, and an empty list is "none offered".  The route used to pass only
+    // chat_template_kwargs and enable_thinking, so a template's tools block never rendered.
+    {
+        onebit::npu::ChatTemplate t;
+        t.text = "{% if tools %}TOOLS {{ tools | tojson }} {% endif %}{% if enable_thinking %}think {% endif %}"
+                 "{{ k }}{{ messages[0].content }}";
+        t.source = "test";
+        const nlohmann::ordered_json body = nlohmann::ordered_json::parse(
+            R"({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"k":"K "},)"
+            R"("tools":[{"type":"function","function":{"name":"get_weather","description":"d","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}}]})");
+        try {
+            const nlohmann::ordered_json vars = onebit::npu::request_template_vars(body, true);
+            const std::string out = onebit::npu::render_chat_template(t, body.at("messages"), true, vars);
+            check(out.find("get_weather") != std::string::npos, "request tools: the template sees the request's tools");
+            const size_t z = out.find("zeta"), a = out.find("alpha");
+            check(z != std::string::npos && a != std::string::npos && z < a, "request tools: in the caller's key order");
+            check(out.find("think K hi") != std::string::npos, "request tools: kwargs and enable_thinking still arrive");
+            nlohmann::ordered_json none = body;
+            none["tools"] = nlohmann::ordered_json::array();
+            const std::string plain = onebit::npu::render_chat_template(
+                t, none.at("messages"), true, onebit::npu::request_template_vars(none, false));
+            check(plain == "K hi", "request tools: an empty list renders no tools block");
+        } catch (const std::exception& e) {
+            check(false, std::string("request tools: rendered (") + e.what() + ")");
+        }
+    }
+
+    // An earlier call in the conversation (engine#1788): the API's arguments string reaches the template
+    // as the object, so a template that walks it renders; the route used to answer 400 on the second turn.
+    {
+        onebit::npu::ChatTemplate t;
+        t.text = "{% for m in messages %}{% if m.tool_calls %}{% for c in m.tool_calls %}{{ c.function.name }}("
+                 "{% for k, v in c.function.arguments|items %}{{ k }}={{ v }};{% endfor %}){% endfor %}{% endif %}{% endfor %}";
+        t.source = "test";
+        const nlohmann::ordered_json msgs = nlohmann::ordered_json::parse(
+            R"([{"role":"user","content":"q"},{"role":"assistant","content":"","tool_calls":[{"id":"call_0","type":"function",)"
+            R"("function":{"name":"get_weather","arguments":"{\"zeta\":\"Paris\",\"alpha\":2}"}}]},)"
+            R"({"role":"tool","tool_call_id":"call_0","content":"17"}])");
+        bool raw_threw = false;
+        try {
+            (void)onebit::npu::render_chat_template(t, msgs, true);
+        } catch (const onebit::npu::TemplateError&) {
+            raw_threw = true;
+        }
+        check(raw_threw, "call arguments: as the API sends them (a string) this template cannot walk them");
+        try {
+            const std::string out = onebit::npu::render_chat_template(t, onebit::npu::messages_for_template(msgs), true);
+            check(out == "get_weather(zeta=Paris;alpha=2;)", "call arguments: the template walks the object, in the string's key order");
+        } catch (const std::exception& e) {
+            check(false, std::string("call arguments: rendered (") + e.what() + ")");
+        }
+        nlohmann::ordered_json odd = msgs;
+        odd[1]["tool_calls"][0]["function"]["arguments"] = "not json";
+        check(onebit::npu::messages_for_template(odd) == odd, "call arguments: a string that is not a JSON object is left as sent");
+    }
+
     // A container that declares no template is this layer's "no", not a ChatML render: the route decides
     // what to do about that (app/forward_serve.cpp: ChatML with anchors, else the #987 400).
     {

@@ -24,8 +24,10 @@
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
 #include "q4nx_forward.h"
+#include "pad_head_rows.h"   // engine#1990: the padded-head row rule, header-only for its arm
 #include "batch_width.h"
 #include "ffn_cache_policy.h"
+#include "lfm2_shortconv.h"          // LFM2 conv layers: the host part between the two projections
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
 #include "file_create.h"         // dumps are created 0600, never through a symlink
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
@@ -52,6 +54,8 @@
 #include "q4nx_dequant.h"
 #include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
 #include "q4nx_semantics.h"
+#include "quant_i8.h"
+#include "q4nx_host_head.h"
 #include "q4nx_pack.h"
 #include "q4nx_head_image.h"   // the lm-head tile cache (engine#1716)
 
@@ -433,14 +437,15 @@ bool Q4nxNpuForward::init_host(const char* model_path, const std::string& dir) {
     return init_impl(nullptr, model_path, dir);
 }
 
-// engine#803 A2b, step one: the decode family gets its own method with the body unchanged, exactly as the lm
-// head did before it moved behind XdnaTarget (open_head). That precedent is why this is a move and not a
-// rewrite: the next step is then a copy into the target rather than surgery inside init_impl, and the three
-// log lines below are copied byte-for-byte because gates grep them ("[pb16i-trace]", the decode-family
-// line, the pb16i refusal) -- "improving" a message here breaks a gate that reads it.
+// engine#803 A2b: the model's half of opening the decode family. It derives the decode designs and their ELF
+// names (the container's naming), hands the per-role ELF resolution and context creation to
+// XdnaTarget::open_decode_family(), prints the summary lines, and loads the wide and narrow sealed families on
+// top. The log lines here and in the target are byte-for-byte what they were, because gates grep them (the
+// decode-family line, the pb16i refusal) -- "improving" a message breaks a gate that reads it.
 bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, const std::string& mdir,
                                              const std::string& dir) {
     if (host_gemm_) return true;          // the host arm packs its own weights; no decode family is loaded
+    (void)mdir;   // the decode directories reach the target through Setup::decode_dirs, resolved in init_impl
     if (!want_m16) {
         fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n", 0,
                 Q4NX_DESIGN_M_DECODE, ndesigns_, Q4NX_DESIGN_M_PREFILL, " (NPU_DECODE_M16=0: disabled)");
@@ -503,100 +508,13 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
             snprintf(designs16_[i].elf_name, Q4NX_ELF_NAME_MAX, "%s", n16.c_str());
         }
     }
-    std::vector<std::string> m16dirs;
-    plan_decode_dirs_.clear();
-    if (plan_.loaded() && !plan_.decode_dirs.empty()) {
-        // The plan says which of the two given paths each candidate hangs off, so the runtime
-        // stops guessing which base a bare directory name meant.
-        for (const auto& d : plan_.decode_dirs)
-            plan_decode_dirs_.push_back((d.under_model ? mdir : dir) + "/" + d.path);
-        for (const auto& p : plan_decode_dirs_) m16dirs.push_back(p);
-    } else {
-        m16dirs.push_back(mdir + "/kernels-m16");
-        m16dirs.push_back(dir + "/m16");
-        m16dirs.push_back(dir);
-    }
+    // The per-role loop is the target's (engine#803 A2b): it resolves each role's `_m16` ELF under the decode
+    // directories the setup carried (the plan's, or the built-in three), or the sealed pb16i image, creates the
+    // context and configures it. What stays here is the container's naming -- the designs' ELF names above and
+    // which sidecar file the sealed ELF is -- the summary lines, and the wide and narrow families below.
     int made = 0, skipped = 0;
-    for (int i = 0; i < ndesigns_; i++) {
-        if (designs16_[i].M <= 0) { skipped++; continue; }
-        std::string elf, kname = "main:seq";
-        if (pb16i_ && !pb16i_sealed_.empty()) {
-            // One ELF for every ternary phase: the file is the same for all roles and
-            // only the instance name differs, so I8Ctx reuses the one hw_context.
-            const char* inst = pb16i_instance(designs16_[i].role);
-            if (!inst) {
-                fprintf(stderr, "  [forward] pb16i: the sealed ELF has no instance for "
-                                "role %s; this role has no decode kernel\n",
-                        role_tag(designs16_[i].role));
-                designs16_[i].M = 0;
-                skipped++;
-                continue;
-            }
-            elf = dir + "/" + pb16i_sealed_;
-            sealed_dir_ = dir;
-            kname = inst;
-            if (!file_exists(elf)) {
-                err_ = plan_.loaded() ? ("plan " + plan_path_ + ": decode.sealed_elf \"" +
-                                         pb16i_sealed_ + "\" is not in " + dir + " (missing)")
-                                      : ("pb16i: missing sealed ELF " + elf);
-                return false;
-            }
-        } else {
-            for (const std::string& d : m16dirs) {
-                std::string cand = d + "/" + designs16_[i].elf_name;
-                if (file_exists(cand)) { elf = cand; break; }
-            }
-        }
-        if (elf.empty()) {
-            // A pb16i role without its image kernel must stop the load: it is not
-            // a slower path, it is a missing one (the int8 weights are not packed
-            // for these geometries under this layout).
-            if (pb16i_) {
-                err_ = plan_.loaded()
-                           ? std::string("plan ") + plan_path_ + ": decode role " +
-                                 role_tag(designs16_[i].role) + " needs \"" + designs16_[i].elf_name +
-                                 "\" (missing)"
-                           : std::string("pb16i: missing decode ELF ") + designs16_[i].elf_name;
-                return false;
-            }
-            skipped++;
-            continue;   // stay on M=128
-        }
-        I8Ctx* c16 = xd_->make_ctx16(i, designs16_[i]);
-        if (!c16) { err_ = "cannot create the decode context for role " + std::to_string(i); return false; }
-        c16->MD = designs16_[i].M;
-        c16->KD = designs16_[i].K;
-        c16->ND = designs16_[i].N;
-        c16->blocked_b = weight_layout_b8_;
-        c16->pb16i = pb16i_;
-        c16->t2s = t2s_;
-        // Which pb16i ELFs leave two int32 planes (the arena's ACC64 family: D, O and
-        // the full-attention q half).  This mirrors the ELF family contract rather
-        // than inferring it, and load/launch refuse a tensor that needs two planes on
-        // a one-plane ELF.
-        if (pb16i_) {
-            const Q4nxDesign r = designs16_[i].role;
-            c16->pb16i_planes =
-                (r == Q4NX_DESIGN_D || r == Q4NX_DESIGN_O || r == Q4NX_DESIGN_QKVFA_Q) ? 2 : 1;
-        }
-        if (!c16->init_elf(*dev, elf.c_str(), designs16_[i].M,
-                           designs16_[i].K, designs16_[i].N, 1, kname.c_str())) {
-            if (pb16i_) {
-                err_ = "pb16i: init_elf failed for " + elf;
-                return false;
-            }
-            fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "
-                            "this role keeps M=128\n", designs16_[i].elf_name);
-            xd_->drop_ctx16(i);
-            skipped++;
-            continue;
-        }
-        made++;
-        fprintf(stderr, "  [forward] %-7s M=%d K=%d N=%d  %s (decode)\n",
-                role_tag(designs_[i].role), designs16_[i].M, designs16_[i].K,
-                designs16_[i].N, elf.c_str());
-    }
-    xd_->note_m16_made(made > 0);
+    if (pb16i_ && !pb16i_sealed_.empty()) sealed_dir_ = dir;   // where the wide/narrow sealed files are looked for
+    if (!xd_->open_decode_family(designs16_, ndesigns_, pb16i_sealed_, &made, &skipped, err_)) return false;
     decode_roles_ = made;   // engine#2102: the caller-facing count, beside the byte-for-byte log line below
     if (pb16i_ && made < ndesigns_ - 0) {
         fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
@@ -939,6 +857,60 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                std::to_string(mw_->config.num_layers) + " layers in model.q4nx";
         return false;
     }
+    // LFM2 declares its hybrid through `full_attn_idxs`, not `layer_types`, so the layer_types check below cannot see
+    // it: its gated short-convolution layers carry shortconv.* tensors and no self_attn.* at all. The container is
+    // the authority on which layers they are (model_shortconv_layers), and on the kernel length (the taps' own
+    // shape). What is refused, by name, is what the conv path does not cover: a kernel length that differs between
+    // layers or does not match the tensor's bytes, and the image layouts (pb16i/t2s), whose weights are sidecar
+    // images this path has no tags for.
+    {
+        int first_conv = -1;
+        const int n_conv = model_shortconv_layers(mw_, cfg.num_layers, &first_conv);
+        shortconv_ = n_conv > 0;
+        sc_layer_.assign((size_t)cfg.num_layers, 0);
+        sc_taps_ = 0;
+        if (shortconv_) {
+            if (pb16i_) {
+                err_ = "model.q4nx has gated short-convolution layers (LFM2's hybrid) and config.json declares an "
+                       "image weight layout (pb16i/t2s); the conv layers' projections have no image form here";
+                return false;
+            }
+            for (int l = 0; l < cfg.num_layers; l++) {
+                const LayerWeights* lw = &mw_->layers[l];
+                if (lw->shortconv_in_proj_weight.shape[0] == 0) continue;
+                sc_layer_[(size_t)l] = 1;
+                const TensorDesc* t = &lw->shortconv_conv_weight;
+                const int L = (int)t->shape[1];
+                const std::string where = "model.layers." + std::to_string(l) + ".shortconv";
+                if (lw->shortconv_out_proj_weight.shape[0] == 0 || t->shape[0] == 0) {
+                    err_ = where + " has in_proj but not conv.weight and out_proj.weight";
+                    return false;
+                }
+                if ((int)t->shape[0] != cfg.hidden_size || L < 1 || L > 64 ||
+                    (size_t)t->data_size != (size_t)cfg.hidden_size * (size_t)L * 2) {
+                    err_ = where + ".conv.weight is not bf16 [hidden_size][L] (shape " +
+                           std::to_string((long long)t->shape[0]) + " x " + std::to_string((long long)t->shape[1]) +
+                           ", " + std::to_string((unsigned long long)t->data_size) + " bytes, hidden_size " +
+                           std::to_string(cfg.hidden_size) + ")";
+                    return false;
+                }
+                if (sc_taps_ == 0) sc_taps_ = L;
+                else if (L != sc_taps_) {
+                    err_ = where + ".conv.weight has kernel length " + std::to_string(L) + " where layer " +
+                           std::to_string(first_conv) + " has " + std::to_string(sc_taps_) +
+                           "; one kernel length per model is what this forward runs";
+                    return false;
+                }
+            }
+            if (cfg.num_attention_heads * cfg.head_dim != cfg.hidden_size) {
+                err_ = "gated short-convolution layers need out_proj (hidden_size -> hidden_size) to be the attention "
+                       "output geometry, and num_attention_heads * head_dim is not hidden_size here";
+                return false;
+            }
+            fprintf(stderr, "  [forward] %d gated short-convolution layer(s) of %d, kernel length %d (LFM2 hybrid)\n",
+                    n_conv, cfg.num_layers, sc_taps_);
+        }
+    }
 
     // forward dims mirror the config the weights were loaded with
     c_.H = cfg.hidden_size;
@@ -1073,6 +1045,20 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             return false;
         }
         if (sem_.eps <= 0) sem_.eps = c_.eps;
+        // engine#1788: whether q and k are normalised per head is a fact about the container, not about its name
+        // (q4nx_semantics.h). A layer that carries both q_norm and k_norm turns it on for a model_type the table
+        // does not know; said out loud, because the dump below then prints 1 beside "<- model_type".
+        if (mw_ && mw_->config.num_layers > 0) {
+            std::vector<unsigned char> has_q(size_t(mw_->config.num_layers), 0), has_k(has_q);
+            for (int l = 0; l < mw_->config.num_layers; l++) {
+                has_q[size_t(l)] = mw_->layers[l].q_norm_weight.name[0] && mw_->layers[l].q_norm_weight.data_size > 0;
+                has_k[size_t(l)] = mw_->layers[l].k_norm_weight.name[0] && mw_->layers[l].k_norm_weight.data_size > 0;
+            }
+            const int by = q4nx_semantics_qk_norm_from_tensors(&sem_, has_q.data(), has_k.data(), mw_->config.num_layers);
+            if (by >= 0)
+                fprintf(stderr, "  [semantics] qk_norm=1  <- the container: layer %d carries self_attn.q_norm and k_norm "
+                                "(config.json's model_type is not a family the table knows)\n", by);
+        }
         q4nx_semantics_dump(&sem_);
         // A layer kind nothing implements is refused BY NAME, here beside the other precise refusals (engine#1087's
         // shape): q4nx_semantics maps an unrecognised layer_types entry to Q4NX_LAYER_OTHER and the attention path
@@ -1223,6 +1209,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     dims.qk_nope = qk_nope_; dims.dense_im = dense_im_;
     dims.H = c_.H; dims.NH = c_.NH; dims.NKV = c_.NKV; dims.HD = c_.HD;
     dims.IM = c_.IM;
+    dims.shortconv_n = shortconv_ ? 3 * c_.H : 0;   // LFM2 conv in_proj [B | C | X]
     // Activation tile of the PREFILL family.  It used to be the only family (a
     // bare 128 here decided the whole engine's M); decode now selects the M=16
     // twin instead -- see the m16 block after q4nx_derive_designs() and
@@ -1340,6 +1327,27 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         }
         conv_state_.assign(NL, std::vector<float>((size_t)CD * (size_t)(lin_ck_ - 1), 0.0f));
         rec_state_.assign(NL, std::vector<float>((size_t)lin_nvh_ * (size_t)lin_khd_ * (size_t)lin_vhd_, 0.0f));
+    }
+
+    // LFM2 conv layers: the two projections' f32 scratch (read only by assemble_B until the packed weight is on
+    // the device), the taps decoded once, and the per-layer state -- (L-1)*H floats on a conv layer, nothing on an
+    // attention layer -- in conv_state_, where snapshot/restore/reset already look.
+    if (shortconv_) {
+        if (lin_kd_ > 0) { err_ = "a model with both linear_attention and short-convolution layers is not implemented"; return false; }
+        wqkvlin_.resize((size_t)3 * (size_t)H * (size_t)H);
+        woutlin_.resize((size_t)H * (size_t)q4nx_pad_k(H));
+        sc_w_.assign((size_t)NL, std::vector<float>());
+        sc_rows_.assign((size_t)NL, std::vector<float>());
+        conv_state_.assign((size_t)NL, std::vector<float>());
+        for (int l = 0; l < NL; l++) {
+            if (!sc_layer_[(size_t)l]) continue;
+            const size_t n = (size_t)H * (size_t)sc_taps_;
+            const uint16_t* p = bf16_data(mw_, &mw_->layers[l].shortconv_conv_weight, n);
+            if (!p) { err_ = "model.layers." + std::to_string(l) + ".shortconv.conv.weight has no data"; return false; }
+            sc_w_[(size_t)l].resize(n);
+            for (size_t i = 0; i < n; i++) sc_w_[(size_t)l][i] = bf16_to_f32(p[i]);
+            conv_state_[(size_t)l].assign((size_t)(sc_taps_ - 1) * (size_t)H, 0.0f);
+        }
     }
 
     fprintf(stderr, "  [forward] derived %d designs (fused_gu=%d, H=%d NH=%d NKV=%d HD=%d IM=%d)\n",
@@ -1475,6 +1483,11 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         setup.pb16i_dir = pb16i_dir_;
         setup.head_pb16i_images =
             pb16i_ && !pb16i_dir_.empty() && file_exists(head_pb16i_stem(0) + image_ext());
+        // The plan's decode directories, resolved before the target is configured: the decode family and the
+        // lm-head both search setup.decode_dirs, so a list filled after this line reaches neither. (It used to be
+        // filled inside the M=16 block further down, after this point, so a plan's directories never reached the
+        // head lookup; with the decode loop on the target, nothing else would fill it at all.)
+        plan_decode_dirs_ = plan_.resolved_decode_dirs(mdir, dir);
         setup.decode_dirs = m16dirs_like_head(mdir, dir, plan_decode_dirs_);
         setup.hidden = c_.H;
         setup.vocab = c_.NV;
@@ -1523,8 +1536,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     xd_->set_m16_check(getenv("NPU_M16_CHECK") != nullptr);
     const char* m16_env = getenv("NPU_DECODE_M16");
     const bool want_m16 = !m16_env || atoi(m16_env) != 0;
-    // engine#803 A2b (step one): the block moved verbatim into open_decode_family_local(); the call site keeps the
-    // guard so the "disabled" log line is still printed from one place.
+    // engine#803 A2b: open_decode_family_local() names the decode designs and the target opens them; the call site
+    // keeps the guard so the "disabled" log line is still printed from one place.
     if (!open_decode_family_local(want_m16, dev, mdir, dir)) return false;
 
     // The lm head's own context (pb16i ternary images, the int8 ladder, or the q4_1 gemv head).  Cut out
@@ -1552,10 +1565,46 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             lm_head_f_.assign((size_t)NV * (size_t)kpad_, 0.0f);
             lm_w_ = kpad_;
             const uint8_t* lp = (const uint8_t*)model_tensor_data(mw_, ltd);
-            if (!lp || dequant_any(lp, (size_t)ltd->data_size, NV, kpad_,
-                                   lm_head_f_.data()) != 0) {
+            /* engine#1990: the container's head may carry MORE rows than the vocabulary, for the same reason a padded
+             * column exists -- q4_1 tiles hold 32-row multiples and a pack's vocabulary need not be one (CodeLlama's is
+             * 32,016). The importer pads those rows; the reader must therefore dequantise on the tensor's own grid and
+             * keep only the vocabulary's rows. Asking for exactly NV rows is what failed here: 32,016 is not a multiple
+             * of the tile's 32 rows, so dequant_any() refused a head that was perfectly well formed.
+             *
+             * The extra rows decode to zero and are never sampled: the logits vector stays NV long. */
+            int head_rows = NV;
+            if (ltd->ndim >= 2 && kpad_ > 0 && kpad_ % Q4NX_TILE_COLS == 0) {
+                const int64_t per_block = kpad_ / Q4NX_TILE_COLS;   // tiles per 32-row block
+                // engine#1990: the tile COUNT is shape[0] when the tensor is stored as [tiles, tile bytes] -- which is
+                // what this container does (CodeLlama-7b: I8 [16016, 6144] for a 32,032-row head at kpad_ 4,096) -- and
+                // it is shape[0] / per_block when it is stored as a row grid. Gating on `shape[1] == kpad_` saw only the
+                // second form, so a padded head in the first form kept head_rows = NV and dequant_any() refused it:
+                // "lm_head dequant failed" on a head that is exactly what the importer was asked to write.
+                // Both spellings count TILE-ROWS in shape[0] -- [rows, kpad_] and [tiles, tile bytes] -- so the number of
+                // 32-row blocks is shape[0] / per_block either way; only the row WIDTH in shape[1] differs. Exposed as a
+                // pure function because these numbers are what a test can drive without a container.
+                // The rule reads the whole shape: [tiles, tile bytes], [row tiles, column tiles, bytes] (FastFlowLM's
+                // own containers, engine#1788) and [rows, kpad_] each say where the row count is (pad_head_rows.h).
+                const int64_t head_shape[3] = {ltd->shape[0], ltd->shape[1], ltd->ndim >= 3 ? ltd->shape[2] : 0};
+                head_rows = padded_head_rows(head_shape, ltd->ndim, kpad_, NV);
+            }
+            std::vector<float> head_f32;
+            float* head_out = lm_head_f_.data();
+            if (head_rows != NV) {
+                head_f32.assign((size_t)head_rows * (size_t)kpad_, 0.0f);
+                head_out = head_f32.data();
+            }
+            if (!lp || dequant_any(lp, (size_t)ltd->data_size, head_rows, kpad_, head_out) != 0) {
                 err_ = "lm_head dequant failed";
                 return false;
+            }
+            if (head_rows != NV) {
+                for (int r = 0; r < NV; r++)
+                    std::memcpy(&lm_head_f_[(size_t)r * (size_t)kpad_], &head_f32[(size_t)r * (size_t)kpad_],
+                                sizeof(float) * (size_t)kpad_);
+                std::fprintf(stderr,
+                             "  [forward] lm head: %d row(s) stored for a vocabulary of %d; the %d padding row(s) are "
+                             "not read (engine#1990)\n", head_rows, NV, head_rows - NV);
             }
             fprintf(stderr, "  [forward] separate lm_head.weight -> dequantized "
                             "(%zu floats)\n", lm_head_f_.size());
@@ -2009,7 +2058,12 @@ bool Q4nxNpuForward::load_layer(int l) {
     // copies of the big projections are never needed: skipping them here is the
     // difference between a first token that dequantises the whole 17.9 GB model and
     // one that opens 13.4 GB of images.  The norms and every small member still load.
-    if (!xd_->pb16i()) {
+    if (is_conv_layer(l)) {
+        // LFM2 conv layer: two projections where an attention layer has four. Same f32-until-packed rule.
+        LhScope _t_p(LH_LOAD_PROJ);
+        if (!deq(&lw->shortconv_in_proj_weight, wqkvlin_.data(), 3 * H, H)) return false;
+        if (!deq(&lw->shortconv_out_proj_weight, woutlin_.data(), H, q4nx_pad_k(H))) return false;
+    } else if (!xd_->pb16i()) {
         if (!deq(&lw->q_proj_weight, wq_.data(),
                  NH * hd * (attn_gate_ ? 2 : 1), kpad_)) return false;   // q|gate rows
         if (!kv_shared) {
@@ -2405,6 +2459,7 @@ void Q4nxNpuForward::begin_verify(int rows, int start_pos) {
         for (size_t l = 0; l < rec_state_.size(); l++) snap_rec_[l] = rec_state_[l];
     row_in_.resize(rec_state_.size());
     for (auto& v : row_in_) v.assign((size_t)rows, GdnRowIn{});
+    for (auto& v : sc_rows_) v.clear();   // conv layers record their rows' B*X as the batch runs
 }
 
 // Keep the first `accepted` rows of the verify batch and drop the rest: restore the snapshot, then re-apply the
@@ -2443,6 +2498,7 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
     }
     const auto cv_t1 = std::chrono::steady_clock::now();
     verify_open_ = false;                        // the replay below must not re-record
+    if (accepted > 0 && shortconv_) conv_apply_rows(accepted);
     if (accepted > 0 && !gdn_apply_rows(0, accepted)) return false;
     if (cv_prof) {
         const auto cv_t2 = std::chrono::steady_clock::now();
@@ -2474,6 +2530,7 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
                      accepted, maxd, scale, ok_state ? "OK" : "MISMATCH");
     }
     for (auto& v : row_in_) v.clear();
+    for (auto& v : sc_rows_) v.clear();
     return true;
 }
 
@@ -2586,6 +2643,7 @@ bool Q4nxNpuForward::gdn_apply_rows(int from, int to) {
 // its array launches are M-independent (a pb16i ELF runs its 16 rows whatever M is), so the marginal cost of
 // a row is host-side and has to be named, not inferred.  Snapshots the same slots step() fills, prints the
 // delta of one step_batch() call when NPU_PHASE_PROF is set.  Measurement only: nothing here is read back.
+
 namespace {
 struct BatchPhases {
     const bool on = lh_on();
@@ -2921,6 +2979,107 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         npu_gemm_rows(i_o, CORE.data(), M, g->K, g->N, B_.data(), out, 6, "ssm_out", g->real_k);
     }
     return true;
+}
+
+// --------------------------------------------------------------------------
+// LFM2 gated short-convolution layers
+// --------------------------------------------------------------------------
+// One token: in_proj on the device, the gate + depthwise causal conv on the host (lfm2_shortconv.h, the one
+// definition decode, prefill and the tests share), out_proj on the device. The state is borrowed from
+// conv_state_[l] for the call and handed back, so there is one copy of it.
+bool Q4nxNpuForward::conv_layer(int l, const std::vector<float>& xn, std::vector<float>& out) {
+    const int H = c_.H;
+    const int i_in = idx_of(Q4NX_DESIGN_QKVLIN);
+    const int i_o = idx_of(Q4NX_DESIGN_O);
+    if (i_in < 0 || i_o < 0) { err_ = "short-convolution designs missing (QKV 3H / O)"; return false; }
+    std::vector<float> bcx;
+    {
+        const Q4nxDesignGeom* g = &designs_[i_in];
+        Q4nxProjections p{};
+        p.ple = wqkvlin_.data();
+        if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble conv in_proj"; return false; }
+        npu_gemm(i_in, xn.data(), g->K, g->N, B_.data(), bcx, 0, "conv_in", g->real_k);
+    }
+    if (bcx.size() < (size_t)3 * (size_t)H) { err_ = "conv in_proj returned fewer than 3*hidden values"; return false; }
+    const Q4nxDesignGeom* go = &designs_[i_o];
+    std::vector<float> y((size_t)std::max(H, go->K), 0.0f);
+    onebit::npu::ShortConvState st;
+    st.hidden = H; st.taps = sc_taps_;
+    st.history.swap(conv_state_[(size_t)l]);
+    const bool ok = onebit::npu::shortconv_step(st, bcx.data(), sc_w_[(size_t)l].data(), y.data());
+    st.history.swap(conv_state_[(size_t)l]);
+    if (!ok) { err_ = "short-convolution state of layer " + std::to_string(l) + " is not sized"; return false; }
+    if (onebit::npu::ops_dump_enabled()) onebit::npu::ops_dump("conv_core", l, 1, y.data(), H);
+    {
+        Q4nxProjections p{};
+        p.o = woutlin_.data();
+        if (!weight_cached(1) && q4nx_assemble_B(go, &p, B_.data()) != 0) { err_ = "assemble conv out_proj"; return false; }
+        npu_gemm(i_o, y.data(), go->K, go->N, B_.data(), out, 1, "conv_out", go->real_k);
+    }
+    return true;
+}
+
+// M tokens: each projection is one M-row launch, and between them the rows go through shortconv_step() in position
+// order -- the same calls conv_layer() makes -- so a batched prefill leaves exactly the state token-by-token decode
+// would. A verify batch also keeps each row's B*X, the only thing needed to re-apply an accepted prefix.
+bool Q4nxNpuForward::conv_layer_batch(int l, const std::vector<float>& xn, int M, std::vector<float>& out) {
+    const int H = c_.H;
+    const int i_in = idx_of(Q4NX_DESIGN_QKVLIN);
+    const int i_o = idx_of(Q4NX_DESIGN_O);
+    if (i_in < 0 || i_o < 0) { err_ = "short-convolution designs missing (QKV 3H / O)"; return false; }
+    std::vector<float> BCX;
+    const Q4nxDesignGeom* g = &designs_[i_in];
+    {
+        Q4nxProjections p{};
+        p.ple = wqkvlin_.data();
+        if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble conv in_proj"; return false; }
+        npu_gemm_rows(i_in, xn.data(), M, g->K, g->N, B_.data(), BCX, 0, "conv_in", g->real_k);
+    }
+    const size_t stride = (size_t)g->N;
+    if (stride < (size_t)3 * (size_t)H || BCX.size() < (size_t)M * stride) {
+        err_ = "conv in_proj returned fewer than rows * 3*hidden values";
+        return false;
+    }
+    const Q4nxDesignGeom* go = &designs_[i_o];
+    const size_t ystride = (size_t)std::max(H, go->K);
+    std::vector<float> Y((size_t)M * ystride, 0.0f);
+    std::vector<float>* rec = verify_open_ ? &sc_rows_[(size_t)l] : nullptr;
+    if (rec) rec->resize((size_t)M * (size_t)H);
+    onebit::npu::ShortConvState st;
+    st.hidden = H; st.taps = sc_taps_;
+    st.history.swap(conv_state_[(size_t)l]);
+    bool ok = true;
+    for (int m = 0; m < M && ok; m++) {
+        const float* row = BCX.data() + (size_t)m * stride;
+        if (rec) {
+            float* bx = rec->data() + (size_t)m * (size_t)H;
+            for (int h = 0; h < H; h++) bx[h] = row[h] * row[2 * H + h];
+        }
+        ok = onebit::npu::shortconv_step(st, row, sc_w_[(size_t)l].data(), Y.data() + (size_t)m * ystride);
+    }
+    st.history.swap(conv_state_[(size_t)l]);
+    if (!ok) { err_ = "short-convolution state of layer " + std::to_string(l) + " is not sized"; return false; }
+    {
+        Q4nxProjections p{};
+        p.o = woutlin_.data();
+        if (!weight_cached(1) && q4nx_assemble_B(go, &p, B_.data()) != 0) { err_ = "assemble conv out_proj"; return false; }
+        npu_gemm_rows(i_o, Y.data(), M, go->K, go->N, B_.data(), out, 1, "conv_out", go->real_k);
+    }
+    return true;
+}
+
+// After commit_verify_rows() has put the pre-batch state back: advance each conv layer over the accepted rows
+// only. No projection is recomputed; the window is B*X, and the batch kept it.
+void Q4nxNpuForward::conv_apply_rows(int rows) {
+    const int H = c_.H;
+    for (size_t l = 0; l < sc_rows_.size(); l++) {
+        if (!sc_layer_[l] || sc_rows_[l].size() < (size_t)rows * (size_t)H) continue;
+        onebit::npu::ShortConvState st;
+        st.hidden = H; st.taps = sc_taps_;
+        st.history.swap(conv_state_[l]);
+        for (int m = 0; m < rows; m++) onebit::npu::shortconv_push(st, sc_rows_[l].data() + (size_t)m * (size_t)H);
+        st.history.swap(conv_state_[l]);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -3308,15 +3467,21 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
     std::vector<int8_t> a8((size_t)K);
     for (int m = 0; m < M; m++) {
         const float* a = A + (size_t)m * (size_t)a_k;
+        // engine#845's pad on THIS leg too (kept across the merge: main fixed the IMAGE side of the padded-geometry
+        // problem -- unpadded images, row-major when blocked does not fit -- but the activation read still ran past the
+        // row). A padded design has K > a_k: chatglm3-6b's IM is 13,696 and its D design is K = 13,824, so reading A[k]
+        // for k < K runs 128 floats into the next row, or past the buffer. Measured before this: cos 0.40 -> -0.003
+        // against the device while the f32 arm tracked it at 0.985-0.988; after, max|d| = 0 on all four steps.
+        const auto act = [a, a_k](int k) { return k < a_k ? a[(size_t)k] : 0.0f; };
         float amax = 0.0f;
         for (int k = 0; k < K; k++) {
-            const float v = std::fabs(a[k]);
+            const float v = std::fabs(act(k));
             if (std::isfinite(v) && v > amax) amax = v;
         }
         const float ascale = (amax >= 1e-12f) ? amax / 127.0f : 1.0f;
         const float tis = 1.0f / ascale;
         for (int k = 0; k < K; k++) {
-            float v = a[k];
+            float v = act(k);
             if (!std::isfinite(v)) v = 0.0f;
             int q = (int)std::round(v * tis);
             a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
@@ -3727,7 +3892,9 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             rmsnorm(X.data() + (size_t)m * H, in_norm_[l].data(), H,
                     XN.data() + (size_t)m * H);
         O.assign((size_t)M * H, 0.0f);
-        if (lin_kd_ > 0 && lt == Q4NX_LAYER_LINEAR) {
+        if (is_conv_layer(l)) {
+            if (!conv_layer_batch(l, XN, M, O)) { if (err_.empty()) err_ = "conv batch failed"; return false; }
+        } else if (lin_kd_ > 0 && lt == Q4NX_LAYER_LINEAR) {
             if (!gdn_layer_batch(l, XN, M, O)) { err_ = "gdn batch failed"; return false; }
         } else {
             const Q4nxDesignGeom* g = &designs_[i_qkv_l];
@@ -4989,7 +5156,9 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
 
         // ---- attention ---- (or, for a GDN layer, gdn_layer below)
         rmsnorm(x.data(), in_norm_[l].data(), H, xn.data());
-        if (lin_kd_ > 0 && lt == Q4NX_LAYER_LINEAR) {
+        if (is_conv_layer(l)) {
+            if (!conv_layer(l, xn, o)) return false;
+        } else if (lin_kd_ > 0 && lt == Q4NX_LAYER_LINEAR) {
             LhScope _tlh(LH_GDN);
             if (!gdn_layer(l, xn, o)) return false;
         } else {
@@ -5535,7 +5704,15 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         // q4nx_pack_B_int8_blocked(): one multiplier per column, int8 codes. Chunked by vocabulary block, because a
         // whole head image is H x V bytes (622 MB at this vocabulary).
         const float inv_es = (sem_.tie_embeddings && sem_.embed_scale > 0) ? 1.0f / sem_.embed_scale : 1.0f;
-        const int TB = 8192;   // vocabulary block; a tile's image is H x TB bytes
+        // engine#1990: the block width is an experiment knob, because the residual on CodeLlama is confined to exactly
+        // 16 logit positions starting at 16384 -- the start of a block -- and is identical at every step, i.e. a WEIGHT
+        // difference localised at a block boundary rather than an accumulation difference. NPU_I8_HEAD_TB moves the
+        // boundaries: if the wrong positions move with it, the chunking is the cause; if they stay at 16384, it is not.
+        static const int TB = [] {
+            const char* e = std::getenv("NPU_I8_HEAD_TB");
+            const int v = e ? std::atoi(e) : 8192;
+            return (v >= 1024 && v % 128 == 0) ? v : 8192;
+        }();
         if ((int)lm_head_i8_.size() != (NV + TB - 1) / TB) lm_head_i8_.assign((NV + TB - 1) / TB, HostI8Tensor());
         logits.assign((size_t)NV, 0.0f);
         std::vector<float> a8v((size_t)H);
@@ -5816,6 +5993,99 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             std::chrono::steady_clock::now() - hh0).count();
         xd_->add_hadamard_cost(had_ms, 1);
         head_got.assign((size_t)T, 0.0f);
+    }
+    // ---- the int8 head on the host (engine#1785), NPU_HEAD_HOST=1 ---------------------------------------
+    // A decode step is ONE row, and a launch costs the same weight pass for one row as for 128, so the
+    // head's launches are the most expensive way to use the device: 21 launches, 65 ms of each token on a
+    // 248,320 x 2,048 head, against a few ms for the same sums on the host. Nothing is approximated: the
+    // activation codes come from the device path's own quantiser (q4nx_quant_i8::row, the amax/127 scale
+    // below), the weight codes are read from the very image the device reads (the resident BO's host
+    // mapping), the sums are int32, and the epilogue is the loop below's, term for term. The tiles are
+    // independent, so they are split over a few threads (NPU_HEAD_HOST_THREADS, default 4, at most 16).
+    // A tile the kernel refuses (a geometry with no image) sends the whole head to the device as before.
+    // NPU_HEAD_HOST=alt is the measuring form: calls alternate host, device, host, ... in ONE serve, and each
+    // call logs the previous one's head time and the time from its end to this call (the layers of the token in
+    // between). Two serves on a shared box differ by more than the head costs; adjacent tokens of one serve do not.
+    static const int head_host_mode = [] {
+        const char* e = getenv("NPU_HEAD_HOST");
+        if (!e) return 0;
+        if (e[0] == '1' && e[1] == 0) return 1;
+        return std::strcmp(e, "alt") == 0 ? 2 : 0;
+    }();
+    static long head_calls = 0;
+    const bool head_host = head_host_mode == 1 || (head_host_mode == 2 && (head_calls % 2) == 0);
+    struct HeadAb {
+        bool on, host;
+        std::chrono::steady_clock::time_point t0;
+        ~HeadAb() {
+            if (!on) return;
+            static std::chrono::steady_clock::time_point prev_end{};
+            const auto t1 = std::chrono::steady_clock::now();
+            const double gap = prev_end.time_since_epoch().count()
+                                   ? std::chrono::duration<double, std::milli>(t0 - prev_end).count() : -1.0;
+            fprintf(stderr, "[head-ab] call=%ld head=%s head_ms=%.2f layers_before_ms=%.2f\n", head_calls, host ? "host" : "device",
+                    std::chrono::duration<double, std::milli>(t1 - t0).count(), gap);
+            prev_end = t1;
+            head_calls++;
+        }
+    } head_ab{head_host_mode == 2, head_host, std::chrono::steady_clock::now()};
+    if (head_host && head_packed && !head_pb16i && !lctx.gemv && H <= (int)lctx.KD && T <= (int)lctx.ND) {
+        const auto hh0 = std::chrono::steady_clock::now();
+        float amax = 0.0f;
+        for (int k = 0; k < H; k++) { float a = std::fabs(hs[(size_t)k]); if (a > amax) amax = a; }
+        const float as = amax > 0 ? amax / 127.0f : 1.0f;
+        std::vector<int8_t> a8((size_t)H);
+        q4nx_quant_i8::row(hs.data(), H, 1.0f / as, a8.data());
+        std::vector<const int8_t*> images((size_t)ntiles, nullptr);
+        bool mapped = true;
+        for (int t = 0; t < ntiles; t++) {
+            images[(size_t)t] = (const int8_t*)lm_head_packed_[(size_t)t].bo->map();
+            mapped = mapped && images[(size_t)t] != nullptr;
+        }
+        static const int head_threads = [] {
+            const char* e = getenv("NPU_HEAD_HOST_THREADS");
+            const int n = e ? atoi(e) : 4;
+            return n < 1 ? 1 : (n > 16 ? 16 : n);
+        }();
+        const int nthreads = std::min(head_threads, ntiles);
+        std::vector<char> tile_ok((size_t)ntiles, 0);
+        const bool blocked = lctx.blocked_b;
+        const int KD = (int)lctx.KD, ND = (int)lctx.ND;
+        auto work = [&](int w) {
+            std::vector<int32_t> acc((size_t)T);
+            for (int t = w; t < ntiles; t += nthreads) {
+                const int n0 = t * T, n1 = std::min(NV, n0 + T);
+                if (!q4nx_host_head::tile(images[(size_t)t], KD, ND, blocked, a8.data(), H, n1 - n0, acc.data())) continue;
+                const std::vector<float>& gs = lm_head_packed_[(size_t)t].scales;
+                for (int n = n0; n < n1; n++) {
+                    float v = (float)acc[(size_t)(n - n0)] * as * gs[(size_t)(n - n0)];
+                    if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                    logits[(size_t)n] = v;
+                }
+                tile_ok[(size_t)t] = 1;
+            }
+        };
+        bool all = mapped;
+        if (mapped) {
+            std::vector<std::thread> pool;
+            for (int w = 1; w < nthreads; w++) pool.emplace_back(work, w);
+            work(0);
+            for (auto& th : pool) th.join();
+            for (int t = 0; t < ntiles; t++) all = all && tile_ok[(size_t)t];
+        }
+        if (all) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hh0).count();
+            static bool said = false;
+            if (!said) {
+                said = true;
+                fprintf(stderr, "  [forward] lm head: on the host (NPU_HEAD_HOST=%s), %d tile(s), %d thread(s), first pass %.1f ms\n",
+                        head_host_mode == 2 ? "alt" : "1", ntiles, nthreads, ms);
+            }
+            if (xd_->profiling()) xd_->note_head(1, ms, 0.0, 0.0, 0.0);
+            if (ph) { g_ph.h_pack += ms; g_ph.h_total = ph_ms(hp0); g_in_head = false; }
+            return true;
+        }
+        fprintf(stderr, "  [forward] lm head: NPU_HEAD_HOST is set but the image cannot be read on the host; using the device\n");
     }
     for (int t = 0; t < ntiles; t++) {
         const int n0 = t * T, n1 = std::min(NV, n0 + T);

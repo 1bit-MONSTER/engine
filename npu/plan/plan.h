@@ -205,6 +205,17 @@ struct Plan {
     // relative directory under it ("." = that directory itself).
     struct DecodeDir { bool under_model = false; std::string path; };
     std::vector<DecodeDir> decode_dirs;
+    // decode_dirs as the paths to search, in the plan's order: each entry under the model directory or the
+    // kernel directory it names. Empty when the plan names none (or is not loaded), which is the caller's cue
+    // to fall back to its built-in places. One function, because the projections' decode twins and the lm-head's
+    // have to be looked for in the same list (engine#910), and the list was once built in a block that a move
+    // took away, leaving every caller on the built-in places with no error (engine#1984 review).
+    std::vector<std::string> resolved_decode_dirs(const std::string& model_dir, const std::string& kernels_dir) const {
+        std::vector<std::string> out;
+        if (!loaded()) return out;
+        for (const DecodeDir& d : decode_dirs) out.push_back((d.under_model ? model_dir : kernels_dir) + "/" + d.path);
+        return out;
+    }
     std::string sealed_elf;                // pb16i: one sealed ELF, per-role instance names
     // engine#1990: an optional wide prefill family -- a second sealed ELF with the same instances built for
     // `sealed_wide_rows` rows per launch. Empty = none; the decode family then also runs prefill chunks.

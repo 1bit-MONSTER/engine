@@ -534,6 +534,14 @@ backends apply the model's own chat template. The NPU route emits what Qwen3's
 template does: an empty think block after the assistant prefix. For Qwen3.6-35B-A3B it
 also opens `<think>\n` when thinking is on, as that model's template does.
 
+On the fused NPU route that empty block is only sent when the pack's own `chat_template` has the
+switch (engine#2135). The route reads the template at load and says what it decided:
+a template that opens `<think>` itself and has no switch (FastFlowLM's
+`Qwen3-4B-Thinking-2507`) cannot turn thinking off, so the request is served as thinking on and
+the reasoning comes back as `reasoning_content`; a template with neither a switch nor a think
+block (`Qwen3-VL-4B-Instruct`) gets nothing added. The reply is split into `reasoning_content`
+whenever `reasoning_format` is not `none`, whatever `enable_thinking` says.
+
 For a `.gguf` the engine starts that server as a private child on a loopback
 port and forwards the OpenAI routes to it, streaming included. Replies carry
 the served model name. `auto` means HRX for GGUF: it met RFC #213's decode gates (docs/hrx.md), and

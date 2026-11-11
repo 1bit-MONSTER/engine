@@ -46,7 +46,12 @@ import sys
 # anchor is "not the tail of another path": `(?<![A-Za-z0-9_./-])` keeps `/var/tmp/x` out (the `a` before `tmp`
 # blocks it) and lets `/tmp/x` in whether it follows a space, `>`, `=`, a quote or nothing at all. A trailing quote
 # is included when present so the baseline names the literal as a reader finds it.
-LITERAL = re.compile(r"""(?<![A-Za-z0-9_./-])/tmp/[^"'\s;|)]*["']?""")
+# engine#2027 review: the directive this ratchet exists for says "never `/tmp` **or `/dev/shm`**", and a pattern that
+# guards one of the two reads as "the RAM paths are handled". `/dev/shm` is the same failure mode with a worse ceiling --
+# capped, always RAM, never reclaimable -- so it is one alternation, and the anchor is unchanged: the character before
+# the leading slash is what must not be part of another path, so `/var/dev/shm/x` stays out for the same reason
+# `/var/tmp/x` does. There are no `/dev/shm` sites on main today, so this lands as a pure guard with no baseline lines.
+LITERAL = re.compile(r"""(?<![A-Za-z0-9_./-])/(?:tmp|dev/shm)/[^"'\s;|)]*["']?""")
 
 # The paths this check owns. `npu/` and `app/` are where a dump lands; `tools/` and `scripts/` are where a
 # benchmark log lands. Everything else is out of scope on purpose: a test may use a temp dir (and pytest's
@@ -229,6 +234,17 @@ def self_test() -> int:
               "a bare /tmp path is a site (no quotes): the engine#2027 review's hole")
         check(all('"' not in s and "'" not in s for s in bare.get("tools/bare.sh", [])),
               "and the bare form is recorded without a quote it never had")
+
+        # engine#2027 review: `/dev/shm` is the other RAM path the directive names, so it is the same site rule -- and
+        # the anchor has to keep `/var/dev/shm` out for the same reason it keeps `/var/tmp` out.
+        (root / "npu" / "forward" / "shm.cpp").write_text(
+            'void h() { open("/dev/shm/buf.bin"); }\nconst char* o2 = "/var/dev/shm/not_ours.bin";\n',
+            encoding="utf-8",
+        )
+        shm = scan(root)
+        check(shm.get("npu/forward/shm.cpp") == ["/dev/shm/buf.bin"],
+              "a /dev/shm literal is a site too, and /var/dev/shm is not")
+        (root / "npu" / "forward" / "shm.cpp").unlink()
 
         # The ratchet: a new site fails, a stale baseline line fails, and an unchanged tree passes.
         write_baseline(root / "tools" / "ci" / "tmp_paths.txt", found)

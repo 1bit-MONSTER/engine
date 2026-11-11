@@ -284,6 +284,45 @@ static void oga_geometry(void) {
                       "fused: a non-q4_1 byte count returns -2 so the caller keeps the two-step path");
             printf("  fused chunks->int8: K=%d N=%d  %d codes and %d scales byte-identical to dequant->pack\n",
                    K, N, K * N, N);
+
+            /* THE SAME COMPARISON ON A SYMMETRIC TENSOR WITH AN UNDECIDED TILE (the LFM2 packs' tile kind). Three tiles
+             * are symmetric on their own evidence (zero-points 0, scales of both signs); tile 1 has every zero-point 0
+             * and every scale positive, which decides nothing on its own. The tensor is symmetric, so both paths must
+             * read tile 1 as two's-complement codes: decoded as a one-tile tensor it comes out unsigned, and the fused
+             * path did exactly that. */
+            for (size_t t = 0; t < ntr * ntc; t++) {
+                uint8_t* tile = tiles + t * 5120;
+                for (int i = 0; i < 256; i++) {
+                    const int neg = (t != 1) && (i % 3 == 0);
+                    tile[2 * i] = 0x00;
+                    tile[2 * i + 1] = neg ? 0xBE : 0x3E;        /* bf16 -0.125 / +0.125 */
+                    tile[512 + 2 * i] = 0; tile[512 + 2 * i + 1] = 0;
+                }
+                for (size_t i = 0; i < 4096; i++) tile[1024 + i] = (uint8_t)((i * 53 + t * 29 + 0xC8) & 0xFF);
+            }
+            check_int(q4nx_tile_kind(tiles + 5120), Q4NX_TILE_UNDECIDED, "fused, symmetric: tile 1 decides nothing on its own");
+            check_int(q4nx_tiles_kind(tiles, ntr * ntc, 5120), Q4NX_TILE_SYMMETRIC, "fused, symmetric: the tensor is symmetric");
+            check_int(q4nx_dequant_tensor_chunked(tiles, ntr * ntc * 5120, K, N, 5120, B), 0,
+                      "fused, symmetric: the reference path dequantises it");
+            int neg_in_tile1 = 0;
+            for (int r = 0; r < 32; r++)
+                for (int c = 256; c < 512; c++)
+                    if (B[(size_t)r * N + c] < 0) neg_in_tile1++;
+            check(neg_in_tile1 > 0, "fused, symmetric: the reference reads tile 1 with negative weights (signed codes, positive scales)");
+            q4nx_pack_B_int8(B, K, N, ref, ld, sc_ref);
+            check_int(q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120, K, N, fused, ld, sc_fused), 0,
+                      "fused, symmetric: the fused path accepts it");
+            bad_code = 0; bad_scale = 0;
+            for (int i = 0; i < K * N; i++) if (fused[i] != ref[i]) bad_code++;
+            for (int j = 0; j < N; j++) if (sc_fused[j] != sc_ref[j]) bad_scale++;
+            check_int(bad_code, 0, "fused, symmetric: every code is byte-identical to dequant -> pack, the undecided tile's included");
+            check_int(bad_scale, 0, "fused, symmetric: every column scale as well");
+            /* one zero-point in tile 3: a tensor with both kinds, refused by both paths */
+            tiles[3 * 5120 + 512 + 1] = 0x3F;
+            check_int(q4nx_dequant_tensor_chunked(tiles, ntr * ntc * 5120, K, N, 5120, B), -1,
+                      "fused, mixed: the reference path refuses a tensor with both kinds");
+            check_int(q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120, K, N, fused, ld, sc_fused), -1,
+                      "fused, mixed: and so does the fused path");
         }
         free(tiles); free(B); free(ref); free(fused); free(sc_ref); free(sc_fused);
     }
@@ -831,7 +870,43 @@ static void test_head_tile_cache(void) {
     free(codes); free(ref); free(scales); free(sref);
 }
 
+/* LFM2-1.2B: a hybrid whose conv layers need one more projection, in_proj (K=H, N=3*H). It is the fused-projection
+ * role at a new N and nothing else: no Z, the other four designs untouched, and off when the model has GDN layers. */
+static void shortconv_geometry(void) {
+    Q4nxModelDims d;
+    memset(&d, 0, sizeof d);
+    d.H = 2048; d.NH = 32; d.NKV = 8; d.HD = 64; d.IM = 8192;
+    d.fused_gu = 1; d.M = Q4NX_DESIGN_M_PREFILL;
+    Q4nxDesignGeom plain[Q4NX_MAX_DESIGNS], g[Q4NX_MAX_DESIGNS];
+    const int n0 = q4nx_derive_designs(&d, plain);
+    d.shortconv_n = 3 * d.H;
+    check_int(q4nx_num_designs(&d), n0 + 1, "short-convolution layers add exactly one design to the count");
+    const int n = q4nx_derive_designs(&d, g);
+    check_int(n, n0 + 1, "and exactly one to the derived table");
+    Q4nxDesignGeom* in = find(g, n, Q4NX_DESIGN_QKVLIN);
+    check(in != NULL, "it is the fused-projection role");
+    if (in) {
+        check_int(in->K, 2048, "in_proj K is the hidden size");
+        check_int(in->N, 6144, "in_proj N is 3 * hidden: [B | C | X]");
+        check(strcmp(in->elf_name, "full_i8_QKV_K2048_N6144.elf") == 0, "its artifact name is geometry-derived, like every other");
+    }
+    check(find(g, n, Q4NX_DESIGN_Z) == NULL, "no Z design: a conv layer has no gate projection");
+    int same = 1;
+    for (int i = 0; i < n0; i++)
+        if (g[i].role != plain[i].role || g[i].K != plain[i].K || g[i].N != plain[i].N ||
+            strcmp(g[i].elf_name, plain[i].elf_name) != 0) same = 0;
+    check(same, "the attention and feed-forward designs are the ones the same model derives without it");
+    Q4nxDesignGeom* o = find(g, n, Q4NX_DESIGN_O);
+    check(o && o->K == 2048 && o->N == 2048, "out_proj (H -> H) is the O design when NH*HD == H");
+    d.lin_kd = 1024; d.lin_vd = 2048;
+    Q4nxDesignGeom both[Q4NX_MAX_DESIGNS];
+    const int nb = q4nx_derive_designs(&d, both);
+    check_int(nb, n0 + 2, "with GDN dims set the GDN pair is derived and shortconv_n adds nothing");
+    check_int(q4nx_num_designs(&d), nb, "and the count agrees with the table");
+}
+
 int main(void) {
+    shortconv_geometry();
     test_head_image();
     test_head_tile_cache();
     oga_geometry();

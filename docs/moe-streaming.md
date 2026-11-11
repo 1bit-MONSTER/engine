@@ -755,6 +755,17 @@ tools/moe_placement.py other-prompt.tsv --score placement.json
 
 It refuses a file whose `schema` is not this one, and a table that lacks a layer the trace has.
 
+**Reading the table in the engine: `app/moe_placement.h`.** A consumer (a splitter that puts each layer's experts on two
+devices) loads the file with `onebit::moe::load_placement(path, {routed_layers, n_experts, groups})` and gets
+`group_of(layer, expert)`, or an error that names the check it failed. The checks are against what the caller is about to
+run, because a stale table is plausible: a table built for another model still places every expert of *its* model exactly
+once. So it refuses another `schema`; a `groups` that is not the run's device count; a routed layer that is missing, or a
+layer key the model does not route; a layer recorded for another `experts` count; an expert id outside `0..n_experts-1`,
+placed twice, or not placed at all; and a table whose `share_held_out` is absent or under the floor (15 % by default,
+`min_held_out` to change it). The gate is the held-out share, as the #1702 decision states it, so a file carrying only
+`share_in_sample` is refused rather than gated on the in-sample number. `ctest -R moe_placement_reader` runs one adopted
+table and one arm per refusal; nothing in the engine consumes the table yet, so an unused reader changes nothing either.
+
 `--self-test` pins the property that matters on synthetic traces with a known answer: a bridge pair that fires more often
 than any pair inside two clusters must not pull the clusters apart (the chain alone scores 37.5 % there, the refined plan
 62.5 % with the group sizes unchanged), a table built from the first half of a layer whose clusters then change must score

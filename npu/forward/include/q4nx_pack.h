@@ -246,6 +246,13 @@ typedef struct {
     int qk_nope;     /* per-head qk width excluding rope             */
     int dense_im;    /* leading dense layer's intermediate width     */
     int mla_kva_pad; /* KVA design N pad: ceil((kv_lora+rope_dim)/128)*128 */
+    /* LFM2's gated short-convolution layers: in_proj is one fused (K=H, N=3*H)
+     * projection [B | C | X] and out_proj is (K=H, N=H), which is the O design
+     * whenever NH*HD == H.  shortconv_n is in_proj's N; 0 means the model has no
+     * such layer.  It derives one QKVLIN design and nothing else (no Z), and is
+     * exclusive with lin_kd: a model has GDN layers or conv layers, not both.
+     * Appended last so positional initialisers keep their meaning. */
+    int shortconv_n;
 } Q4nxModelDims;
 
 /* No model-specific geometry constant lives here by design: every caller

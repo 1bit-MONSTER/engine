@@ -251,6 +251,17 @@ int q4nx_semantics_uses_ple(const Q4nxSemantics* s);
  * (1 + w) form, 0 for the plain w form. Exported so the rule is testable with no model present. */
 int q4nx_rmsnorm_offset_from_norm(const float* w, int n);
 
+/* Per-head q/k RMSNorm, decided by the container when config.json's name does not decide it (engine#1788).
+ * q4nx_semantics_from_config() turns qk_norm on for the families its table knows by model_type (qwen3*, gemma*). A
+ * pack of the same architecture under another name -- FastFlowLM's MiniCPM-V 4.7 is `minicpmv4_7` around a qwen3_5
+ * text model -- came out as "no q/k norm" while shipping self_attn.q_norm and k_norm in every full-attention layer;
+ * those layers then ran without the norm, and the model answered short prompts and drifted on long ones.
+ * `has_q[l]` / `has_k[l]` say whether layer l carries a non-empty q_norm / k_norm tensor. A layer carrying BOTH is the
+ * container saying it has the norm: qk_norm becomes 1 and that layer's index is returned. Returns -1, changing
+ * nothing, when qk_norm is already on, when no layer carries both, or on null/empty input. It never turns the norm
+ * off: a family the table knows keeps its answer whatever the tensors are. Exported so the rule is testable. */
+int q4nx_semantics_qk_norm_from_tensors(Q4nxSemantics* s, const unsigned char* has_q, const unsigned char* has_k, int layers);
+
 /* attention.mode for one container, from the two places that can state it (engine#796).
 
  * A d3 pack declares the mask it was trained with in its own `decision_config.json`

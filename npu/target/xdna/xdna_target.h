@@ -163,6 +163,10 @@ public:
     // forward and arrives through Setup, because deciding which sidecar file the head has is the container's
     // rule and not a target's.
     bool open_head(const Q4nxDesignGeom* designs, int n, std::string& err);
+    // engine#803 A2b: the M=16 decode family. `want_m16` is the NPU_DECODE_M16 guard, `dir` the kernels directory the
+    // pb16i sealed elf and the <kernels>/m16 candidate hang off, and `decode_dirs` the container's candidate list.
+    bool open_decode_family(const Q4nxDesignGeom* designs, int n, Q4nxDesignGeom* designs16, bool want_m16,
+                            const std::string& dir, const std::vector<std::string>& decode_dirs, std::string& err);
     // Whether open_head() found and opened the pb16i ternary head.  The model path reads this flag in four
     // places, so it stays the forward's; the target writes it.
     bool head_is_pb16i() const { return head_pb16i_; }

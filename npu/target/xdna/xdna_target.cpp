@@ -541,6 +541,173 @@ void XdnaTarget::prof_dump() {
     prof_head_ = ProfAcc{};
 }
 
+namespace {
+// Its own existence check: the forward's elf_exists() is file-local, and a move that needs it to be shared is a bigger
+// change than this one (engine#803 A2b). Same semantics: regular file, readable.
+bool elf_exists(const std::string& p) { std::error_code ec; return std::filesystem::is_regular_file(p, ec) && !ec; }
+}  // namespace
+
+// engine#803 A2b: the M=16 decode family, out of the forward. Body from open_decode_family_local(), with only what it
+// reads changed: the forward's members are the target's (setup_, dev_), and the arrays, the decode flag, the kernels
+// directory and the candidate directories arrive as parameters. Log strings unchanged -- [pb16i-trace] and the two
+// window11 gates grep them.
+bool XdnaTarget::open_decode_family(const Q4nxDesignGeom* designs, int n, Q4nxDesignGeom* designs16,
+                                    bool want_m16, const std::string& dir,
+                                    const std::vector<std::string>& decode_dirs, std::string& err) {
+    if (setup_.host_gemm) return true;          // the host arm packs its own weights; no decode family is loaded
+    if (!want_m16) {
+        fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n", 0,
+                Q4NX_DESIGN_M_DECODE, n, Q4NX_DESIGN_M_PREFILL, " (NPU_DECODE_M16=0: disabled)");
+        return true;
+    }
+    q4nx_derive_decode_designs(designs, n, designs16);
+    // An integer-exact ternary container's decode family is its own kernel set, not the int8
+    // M=16 twins: same M=16 activation tile, but the image (and so the tap) is pb16i's or
+    // t2s's, the ELF name carries that suffix, and the geometry test is the image's
+    // (pb16i: K%256, N%1024; t2s: K%256, N%32) rather than the int8 twin's tiling.  A design
+    // that is ternary-only skips the derivation entirely: its own entry already IS the decode
+    // design.
+    if (setup_.pb16i) {
+        const std::string ft = setup_.family;
+        for (int i = 0; i < n; i++) {
+            if (i == role_split_qhalf() || i == role_split_kv()) {
+                designs16[i] = designs[i];
+                continue;
+            }
+            // The wide fused full-attention QKV has no ternary kernel (its int64 half
+            // needs 448 columns per core); when the split designs exist that role is
+            // covered by them, so this design simply has no decode kernel.
+            const Q4nxDesign r16 = designs[i].role;
+            if (role_split_qhalf() >= 0 && (r16 == Q4NX_DESIGN_QKV || r16 == Q4NX_DESIGN_QKV2)) {
+                designs16[i].M = 0;
+                continue;
+            }
+            const bool geo_ok = setup_.t2s ? q4nx_t2s::fits(designs16[i].K, designs16[i].N)
+                                     : q4nx_pb16i::fits(designs16[i].K, designs16[i].N);
+            if (designs16[i].M <= 0 || !geo_ok) {
+                // Say WHY, once per role.  A geometry the ternary tile cannot hold is not a
+                // missing artifact and not an error: the role keeps its M=128 kernel and the
+                // model is correct, only slower -- so the only symptom is a decode step that
+                // costs what a prefill step costs, with nothing in the log.  That is the same
+                // "nothing logs the decline" gap the HRX prefill N%16 note names for a
+                // different dispatcher, and it is cheap to close here.
+                if (designs16[i].M > 0 && !geo_ok)
+                    fprintf(stderr,
+                            "  [forward] dec %-3s: no %s twin (K=%d N=%d does not fit the tile), "
+                            "staying on M=128\n",
+                            role_tag(designs16[i].role), setup_.t2s ? "t2s" : "pb16i",
+                            designs16[i].K, designs16[i].N);
+                designs16[i].M = 0;
+                continue;
+            }
+            // Build the new name in a copy: snprintf must not read and write the
+            // same buffer.
+            std::string n16(designs16[i].elf_name);
+            n16.resize(n16.size() - 4);                  // drop ".elf"
+            if (n16.size() >= 4 && n16.compare(n16.size() - 4, 4, "_m16") == 0)
+                n16.resize(n16.size() - 4);              // and the m16 twin's suffix
+            n16 += ft;
+            // pb16i's decode family carries no `_m16` marker: M=16 is its only design and those
+            // files already exist under that name on every deployed container.  A t2s container's
+            // M=128 designs keep their int8 names (untagged), so its decode kernels are told
+            // apart by the marker the arena uses: full_i8_GU_K5120_N17408_t2s_m16.elf.
+            if (setup_.t2s) n16 += "_m16";
+            n16 += ".elf";
+            snprintf(designs16[i].elf_name, Q4NX_ELF_NAME_MAX, "%s", n16.c_str());
+        }
+    }
+    // Candidate directories are the container's rule (plan_decode_dirs_) and stay in the forward; the target
+    // searches them (the division open_head established for the head's sidecar).
+    int made = 0, skipped = 0;
+    for (int i = 0; i < n; i++) {
+        if (designs16[i].M <= 0) { skipped++; continue; }
+        std::string elf, kname = "main:seq";
+        if (setup_.pb16i && !pb16i_sealed_.empty()) {
+            // One ELF for every ternary phase: the file is the same for all roles and
+            // only the instance name differs, so I8Ctx reuses the one hw_context.
+            const char* inst = q4nx_pb16i_instance(designs16[i].role);
+            if (!inst) {
+                fprintf(stderr, "  [forward] pb16i: the sealed ELF has no instance for "
+                                "role %s; this role has no decode kernel\n",
+                        role_tag(designs16[i].role));
+                designs16[i].M = 0;
+                skipped++;
+                continue;
+            }
+            elf = dir + "/" + pb16i_sealed_;
+            kname = inst;
+            if (!elf_exists(elf)) {
+                err = plan_.loaded() ? ("plan " + setup_.plan_path + ": decode.sealed_elf \"" +
+                                         pb16i_sealed_ + "\" is not in " + dir + " (missing)")
+                                      : ("pb16i: missing sealed ELF " + elf);
+                return false;
+            }
+        } else {
+            for (const std::string& d : decode_dirs) {
+                std::string cand = d + "/" + designs16[i].elf_name;
+                if (elf_exists(cand)) { elf = cand; break; }
+            }
+        }
+        if (elf.empty()) {
+            // A pb16i role without its image kernel must stop the load: it is not
+            // a slower path, it is a missing one (the int8 weights are not packed
+            // for these geometries under this layout).
+            if (setup_.pb16i) {
+                err = plan_.loaded()
+                           ? std::string("plan ") + setup_.plan_path + ": decode role " +
+                                 role_tag(designs16[i].role) + " needs \"" + designs16[i].elf_name +
+                                 "\" (missing)"
+                           : std::string("pb16i: missing decode ELF ") + designs16[i].elf_name;
+                return false;
+            }
+            skipped++;
+            continue;   // stay on M=128
+        }
+        I8Ctx* c16 = make_ctx16(i, designs16[i]);
+        if (!c16) { err = "cannot create the decode context for role " + std::to_string(i); return false; }
+        c16->MD = designs16[i].M;
+        c16->KD = designs16[i].K;
+        c16->ND = designs16[i].N;
+        c16->blocked_b = weight_layout_b8_;
+        c16->pb16i = setup_.pb16i;
+        c16->t2s = setup_.t2s;
+        // Which pb16i ELFs leave two int32 planes (the arena's ACC64 family: D, O and
+        // the full-attention q half).  This mirrors the ELF family contract rather
+        // than inferring it, and load/launch refuse a tensor that needs two planes on
+        // a one-plane ELF.
+        if (setup_.pb16i) {
+            const Q4nxDesign r = designs16[i].role;
+            c16->pb16i_planes =
+                (r == Q4NX_DESIGN_D || r == Q4NX_DESIGN_O || r == Q4NX_DESIGN_QKVFA_Q) ? 2 : 1;
+        }
+        if (!c16->init_elf(*dev_, elf.c_str(), designs16[i].M,
+                           designs16[i].K, designs16[i].N, 1, kname.c_str())) {
+            if (setup_.pb16i) {
+                err = "pb16i: init_elf failed for " + elf;
+                return false;
+            }
+            fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "
+                            "this role keeps M=128\n", designs16[i].elf_name);
+            drop_ctx16(i);
+            skipped++;
+            continue;
+        }
+        made++;
+        fprintf(stderr, "  [forward] %-7s M=%d K=%d N=%d  %s (decode)\n",
+                role_tag(designs[i].role), designs16[i].M, designs16[i].K,
+                designs16[i].N, elf.c_str());
+    }
+    note_m16_made(made > 0);
+    if (setup_.pb16i && made < n - 0) {
+        fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
+                setup_.t2s ? "t2s" : "pb16i", made, n);
+    }
+    fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n",
+            made, Q4NX_DESIGN_M_DECODE, skipped, Q4NX_DESIGN_M_PREFILL,
+            want_m16 ? "" : " (NPU_DECODE_M16=0: disabled)");
+    return true;
+}
+
 bool XdnaTarget::open_head(const Q4nxDesignGeom* designs, int n, std::string& err) {
     // run_lm_head packs int8 B tiles from the f32 head and launches them itself, so it
     // needs an int8 context with K=H.  Under pb16i every decode context is a pb16i one,

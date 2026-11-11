@@ -556,6 +556,17 @@ def where_rows(root, cmake_path, wanted):
 ROW = re.compile(r'^\s*(?:add_test|add_python_test)\s*\(\s*(?:NAME\s+)?(\w+)')
 
 
+def where_rc(hits, wanted):
+    """The exit status of --where: 0 only when EVERY requested row is registered somewhere.
+
+    A release verifier passes its whole gate list in one call (`--where a,b,c,d,e`), so one row that is registered
+    nowhere must fail the call. The first version returned 0 as soon as any row was found, so `--where
+    ci_targets,not_a_real_row` printed NOT REGISTERED and still exited 0 (review of engine#2160).
+    """
+    found = {row for row, _, _ in hits}
+    return 0 if wanted and all(row in found for row in wanted) else 1
+
+
 def where_rows_self_test(tmp):
     """engine#2129 follow-up: the answer must come from the family files too, not only CMakeLists.txt."""
     import pathlib as _p
@@ -776,6 +787,16 @@ add_test(NAME family_suite COMMAND family_test)
             print("  FAIL --where reports a row that is registered nowhere"); fails += 1
         else:
             print("  ok    --where reports an unregistered row as absent")
+        # The exit status: a gate list with one unregistered row must fail, not pass on the rows that were found.
+        for what, wanted, want in (
+                ("--where exits 1 when one row of a list is registered nowhere", ["plain_row", "absent_row"], 1),
+                ("--where exits 0 when every row of a list is registered", ["plain_row", "globbed_row"], 0),
+                ("--where exits 1 for a single unregistered row", ["absent_row"], 1)):
+            rc = where_rc(hits, wanted)
+            if rc != want:
+                print(f"  FAIL {what} (rc {rc})"); fails += 1
+            else:
+                print(f"  ok    {what}")
 
     print(f"ci_targets_check --self-test: {fails} failure(s)")
     return 1 if fails else 0
@@ -800,7 +821,7 @@ def main(argv):
         for row in wanted:
             if row not in found:
                 print(f"{row}\tNOT REGISTERED (searched CMakeLists.txt and every file it include()s or globs)")
-        return 0 if found else 1
+        return where_rc(hits, wanted)
     if a.check:
         return check(a.root)
     ap.print_help()

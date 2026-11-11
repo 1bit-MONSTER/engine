@@ -98,6 +98,18 @@ fails a pin that leaves a gate model's node off HRX.
     `ggml/src/ggml-hrx` keep our side; a conflict anywhere else fails the run and names the files;
   - merges AMD's hrx-system pin into our `1bit/main` the same way;
   - opens a PR here moving the submodules, listing the llama.cpp commits new to the engine.
+- **The mirror hold.** A rewrite of AMD's line that the rules above cannot merge leaves the daily run with
+  nothing to do but fail, every day, until somebody does the merge by hand. While
+  [`config/llama-mirror-hold.config`](../config/llama-mirror-hold.config) names the mirror's commit, the run
+  instead reports the hold in its summary (`mirror 1bit/hrx-vulkan HELD at …; AMD's pin is …, on a line that
+  does not contain it`), moves nothing and succeeds; the engine's pin still follows our own line. The hold
+  describes one state and fails the run when that state ends, so it cannot be forgotten: **stale** when the
+  mirror is no longer the named commit, **unneeded** when AMD's pin contains the named commit again (an ordinary
+  sync would work). `scripts/bump-hrx-sync.sh llama-hold <repo> <mirror> <pin>` prints the decision alone
+  (`none`, `held`, `stale`, `unneeded`). The file ships naming no commit, so it holds nothing; naming one is
+  the owner's decision. It was added for AMD's 2026-11-09 rebase (engine#1945): taking that pin is a merge of
+  149 conflicted files (538 hunks) into `1bit/hrx-vulkan-patched`, measured against the last AMD commit our
+  line took.
 - **The hold.** While [`config/hrx-system-hold.config`](../config/hrx-system-hold.config)
   names a commit, the run does not merge AMD's hrx-system, keeps `third_party/hrx-system`
   where it is, and takes only AMD's llama.cpp changes outside the HRX backend paths

@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <memory>
 #include <functional>
@@ -32,6 +33,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace onebit::npu::pack_import {
 namespace {
@@ -782,12 +784,8 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
     }
     out.insert(out.end(), fc.map + tail_off, fc.map + fc.size);
     unmap_file(fc.map, fc.size);
-    {
-        std::ofstream os(work, std::ios::binary | std::ios::trunc);
-        if (!os) throw std::runtime_error(work + ": cannot write the canonical copy of the 1.9 .fconst");
-        os.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
-        if (!os) throw std::runtime_error(work + ": short write of the canonical copy of the 1.9 .fconst");
-    }
+    // engine#1985: never in place. The path is shared by every import of this pack on the box, see write_canonical_copy().
+    write_canonical_copy(work, out.data(), out.size());
     return work;
 }
 
@@ -1904,6 +1902,7 @@ Q4nxContainer read_q4nx_container(const std::string& path) {
         out.why = path + ": header is not a JSON object";
         return out;
     }
+    if (j.contains("__metadata__") && j["__metadata__"].is_object()) out.meta = j["__metadata__"];
     for (auto it = j.begin(); it != j.end(); ++it) {
         if (it.key() == "__metadata__") continue;
         if (!it.value().is_object()) {
@@ -3311,6 +3310,57 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
     return "the epsilon-anchor vote recorded ONE in-block header, and this pack declares use_qk_norm, whose per-head q/k "
            "gains live in the two sections a 2-header block does not have (engine#1985). The two witnesses disagree and "
            "neither is being preferred";
+}
+
+// engine#1786 (item F1): the container genre's geometry, from the container's own `dims` block and then config.json.
+// The order is authority, not preference: `dims` is the pack's own statement about itself, config.json is a file beside
+// it that a vendor converter wrote. When the two disagree the container's statement wins and `source` says so -- the
+// census measured 13 packs carrying `dims` and 29 of 29 carrying config.json, so a silent disagreement is possible and
+// a reader has to be able to see which one answered.
+ContainerGeometry container_geometry(const json& meta, const json& config) {
+    ContainerGeometry g;
+    const json& d = (meta.is_object() && meta.contains("dims") && meta["dims"].is_object()) ? meta["dims"] : json();
+    const json& cfg = config.is_object() ? config : json();
+    bool used_dims = false, used_cfg = false;
+
+    // an integer from dims first, then config.json; records which one answered
+    const auto iv = [&](const char* key, int& dst) -> bool {
+        if (d.is_object() && d.contains(key) && d[key].is_number_integer()) { dst = d[key].get<int>(); used_dims = true; return true; }
+        if (cfg.is_object() && cfg.contains(key) && cfg[key].is_number_integer()) { dst = cfg[key].get<int>(); used_cfg = true; return true; }
+        return false;
+    };
+    const auto fv = [&](const char* key, float& dst) -> bool {
+        if (d.is_object() && d.contains(key) && d[key].is_number()) { dst = d[key].get<float>(); used_dims = true; return true; }
+        if (cfg.is_object() && cfg.contains(key) && cfg[key].is_number()) { dst = cfg[key].get<float>(); used_cfg = true; return true; }
+        return false;
+    };
+    const auto sv = [&](const char* key, std::string& dst) -> bool {
+        if (d.is_object() && d.contains(key) && d[key].is_string()) { dst = d[key].get<std::string>(); used_dims = true; return true; }
+        if (cfg.is_object() && cfg.contains(key) && cfg[key].is_string()) { dst = cfg[key].get<std::string>(); used_cfg = true; return true; }
+        return false;
+    };
+
+    if (!iv("hidden_size", g.dims.hidden)) g.missing.push_back("hidden_size");
+    if (!iv("num_hidden_layers", g.dims.layers)) g.missing.push_back("num_hidden_layers");
+    if (!iv("num_attention_heads", g.dims.heads)) g.missing.push_back("num_attention_heads");
+    if (!iv("num_key_value_heads", g.dims.kv_heads)) g.missing.push_back("num_key_value_heads");
+    if (!iv("vocab_size", g.dims.vocab)) g.missing.push_back("vocab_size");
+    if (!iv("intermediate_size", g.dims.intermediate)) g.missing.push_back("intermediate_size");
+    if (!iv("head_dim", g.dims.head_dim)) {
+        // derived, and said to be derived: hidden/heads is only head_dim when the pack does not state one, and it is
+        // wrong for every architecture whose q projection is not square (GQA with an explicit head_dim is common).
+        if (g.dims.hidden > 0 && g.dims.heads > 0) {
+            g.dims.head_dim = g.dims.hidden / g.dims.heads;
+            g.inferred.push_back("head_dim");
+        } else {
+            g.missing.push_back("head_dim");
+        }
+    }
+    if (!fv("rope_theta", g.dims.rope_theta)) g.missing.push_back("rope_theta");
+    sv("model_type", g.dims.model_type);  // not load-bearing for the arithmetic; absent is not missing
+
+    g.source = used_dims ? "dims" : (used_cfg ? "config.json" : "");
+    return g;
 }
 
 std::string qk_norm_refusal(bool declared, bool found) {
@@ -6080,6 +6130,47 @@ int run(int argc, char** argv) {
     return 0;
 }
 
+
+// engine#1985: the temporary name a canonical copy is written under before it is renamed onto `work`. Same directory
+// (rename is only atomic inside one filesystem). The name starts with the scratch stem `1bit-fconst19`, so the age rule
+// of evict_stale_canonical_copies() removes one a killed run left behind, and continues with `tmp-`, so it can never
+// match a pack's `1bit-fconst19v<n>-...` prefix: another import's sweep must not delete a copy that is being written.
+std::string canonical_copy_temp_name(const std::string& work) {
+    static std::atomic<unsigned> serial{0};
+    const fs::path p(work);
+    const std::string base = "1bit-fconst19tmp-" + std::to_string(static_cast<long>(::getpid())) + "-" +
+                             std::to_string(serial.fetch_add(1)) + "-" + p.filename().string();
+    return (p.parent_path() / base).string();
+}
+
+// engine#1985: write the canonical copy under a private name and rename it onto `work`. The copy used to be written in
+// place with O_TRUNC, at a path every import of the same pack shares, and reuse is decided by length -- so a second
+// import that started while the first was still writing saw a short file, truncated it and began again, and the first
+// then read its own copy while it was being refilled. Measured on Qwen3-1.7B with three imports 0.15 s apart: 4 of 24
+// runs read "0 in-block offsets", refused all 280 attention tensors and exited 0, on a pack a lone import reads with 0
+// gaps. With a rename a reader finds no copy or a complete one, and two writers each install the same bytes.
+void write_canonical_copy(const std::string& work, const uint8_t* data, size_t len) {
+    const std::string tmp = canonical_copy_temp_name(work);
+    {
+        std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+        if (!os) throw std::runtime_error(tmp + ": cannot write the canonical copy of the 1.9 .fconst");
+        os.write(reinterpret_cast<const char*>(data), std::streamsize(len));
+        os.flush();
+        if (!os) {
+            os.close();
+            std::error_code rm;
+            fs::remove(tmp, rm);
+            throw std::runtime_error(tmp + ": short write of the canonical copy of the 1.9 .fconst");
+        }
+    }
+    std::error_code ec;
+    fs::rename(tmp, work, ec);
+    if (ec) {
+        std::error_code rm;
+        fs::remove(tmp, rm);
+        throw std::runtime_error(work + ": cannot move the canonical copy of the 1.9 .fconst into place (" + ec.message() + ")");
+    }
+}
 
 // Public (engine#1662): see the declaration in pack_import.h. Lives outside the anonymous namespace because the test
 // calls it directly with crafted files, so the decision that guards a ~291 MB rewrite is pinned without a 1.9 pack.

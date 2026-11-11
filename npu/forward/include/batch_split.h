@@ -34,7 +34,10 @@ namespace npu {
 //
 //   narrow, wide          rows the two designs take (16 and 128); no split unless 2 <= narrow < wide
 //   narrow_ms, wide_ms    measured wall of one launch of each for this projection; 0 or less means "not measured
-//                         yet", and an unmeasured side keeps the one wide launch (which is how it gets measured)
+//                         yet", and an unmeasured side keeps the one wide launch (which is how it gets measured).
+//                         "Not measured" is not "absent": a projection with no narrow design never reaches this rule
+//                         (narrow < 2), while an unmeasured one reaches it and waits. wide_ms comes through
+//                         split_wide_cost() below, so one start-up launch is never taken for the launch's cost.
 //
 // The split must save at least a tenth of the wide launch, so two costs that are level do not make the route depend
 // on which one was measured in a noisier moment.
@@ -44,6 +47,26 @@ inline int batch_split_rows(int M, int narrow, int wide, double narrow_ms, doubl
     if (!(narrow_ms > 0.0) || !(wide_ms > 0.0)) return 0;
     const int launches = (M + narrow - 1) / narrow;
     return double(launches) * narrow_ms < 0.9 * wide_ms ? narrow : 0;
+}
+
+// The distance, in floats, between two rows of an activation batch handed to a GEMM. `a_k` is the activation's real
+// width when the design pads it up to K, and 0 when the design does not pad (it never sets real_k), so `a_k` itself
+// is not a stride: 0 would make every block of a walk read the first block's rows. Any value outside 1..K-1 means
+// "the rows are K apart".
+inline int row_stride(int a_k, int K) { return (a_k > 0 && a_k < K) ? a_k : K; }
+
+// How many wide launches of a projection must have been timed before their best wall counts as "measured".
+//
+// One is not enough: the first launch of a kernel carries one-off costs that are not the launch's. Measured on
+// bonsai2-27b-t2s2 with a 32-row sealed family: the first 32-row launch of a projection took 4.17 ms against 0.51 ms
+// for a 16-row one, so a rule that believed that single sample split every 32-row chunk into two 16-row launches --
+// on a family whose wide launch is in fact the cheaper one. With three samples the best is a launch, not a start-up.
+constexpr int kSplitWideSamples = 3;
+
+// The wide cost the rule may use: the best wall seen, once enough launches were timed, and 0 ("not measured") before.
+// An unmeasured side keeps the wide launch, so the next chunks add the missing samples.
+inline double split_wide_cost(double best_ms, int samples) {
+    return samples >= kSplitWideSamples ? best_ms : 0.0;
 }
 
 }  // namespace npu

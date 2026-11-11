@@ -289,9 +289,29 @@ struct Q4nxContainer {
     int64_t header_bytes = 0;
     int64_t payload_bytes = 0;
     std::vector<Q4nxTensor> tensors;   // in header order
+    // The safetensors `__metadata__` object, kept because it is where this genre states its own geometry (engine#1786).
+    // Three quarters of the packs measured on this box carry a `dims` block with hidden/intermediate/layers/heads/vocab;
+    // two carry no metadata at all (`d3-edge`, `d3-flash`), which is why the reader keeps it as data and does not
+    // interpret it here.
+    nlohmann::json meta;
     std::string why;                        // non-empty when the container could not be read; tensors is then empty
 };
 Q4nxContainer read_q4nx_container(const std::string& path);
+
+// engine#1786 (item F1): the container genre's geometry, from the two places a pack can state it, in order of
+// authority -- the container's own `dims` block, then config.json. `source` names which one answered, so a plan can
+// never present a declared number and a file's number as the same kind of fact; `missing` names the fields neither
+// could fill, and `inferred` the ones derived from other fields (head_dim from hidden/heads).
+//
+// Pure: no file is opened, so the three genres the census measured -- 13 self-describing, 14 gguf-converted, 2 with
+// no metadata at all -- can all be pinned without a pack, which is the point of extracting it from `plan()`.
+struct ContainerGeometry {
+    Dims dims;
+    std::string source;                 // "dims", "config.json", or empty when neither answered
+    std::vector<std::string> missing;   // fields no source could fill, by name
+    std::vector<std::string> inferred;  // fields derived from another field, by name
+};
+ContainerGeometry container_geometry(const nlohmann::json& meta, const nlohmann::json& config);
 
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
@@ -302,6 +322,16 @@ Plan plan(const std::string& pack_dir);
 // out of canonical_token_fconst() so the decision has a test that needs no 1.9 pack: a truncated copy, a missing file
 // and a directory on the scratch path must all come back false.
 bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
+
+// engine#1985: how the canonical copy reaches `work`. It is written under canonical_copy_temp_name(work) -- a private name
+// in the same directory -- and renamed into place, so a concurrent import of the same pack finds no copy or a complete one,
+// never one that is being written. Writing in place let a second import truncate the file the first was about to read.
+// Throws std::runtime_error when the copy cannot be written or moved; the temporary file is removed on either failure.
+// Exposed so the rule has an arm that needs no pack (threads writing one path while a reader checks every complete-length
+// file it finds), and so the temporary name's two properties are pinned: a pack's sweep prefix never matches it, and the
+// age rule does.
+std::string canonical_copy_temp_name(const std::string& work);
+void write_canonical_copy(const std::string& work, const uint8_t* data, size_t len);
 
 // Removes the canonical Token .fconst copies in `dir` that nothing will reuse (engine#1770). Reuse writes a new copy when the
 // source changes rather than overwriting, so without this the scratch directory grows one multi-hundred-MB file per change; on

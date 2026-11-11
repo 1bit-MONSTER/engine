@@ -25,6 +25,7 @@
 // element-wise.
 #include "q4nx_forward.h"
 #include "batch_split.h"          // one wide launch or several narrow ones, decided from measured costs
+#include "batch_width.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
@@ -427,6 +428,225 @@ bool Q4nxNpuForward::init_host(const char* model_path, const std::string& dir) {
     return init_impl(nullptr, model_path, dir);
 }
 
+// engine#803 A2b, step one: the decode family gets its own method with the body unchanged, exactly as the lm
+// head did before it moved behind XdnaTarget (open_head). That precedent is why this is a move and not a
+// rewrite: the next step is then a copy into the target rather than surgery inside init_impl, and the three
+// log lines below are copied byte-for-byte because gates grep them ("[pb16i-trace]", the decode-family
+// line, the pb16i refusal) -- "improving" a message here breaks a gate that reads it.
+bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, const std::string& mdir,
+                                             const std::string& dir) {
+    if (host_gemm_) return true;          // the host arm packs its own weights; no decode family is loaded
+    if (!want_m16) {
+        fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n", 0,
+                Q4NX_DESIGN_M_DECODE, ndesigns_, Q4NX_DESIGN_M_PREFILL, " (NPU_DECODE_M16=0: disabled)");
+        return true;
+    }
+    q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
+    // An integer-exact ternary container's decode family is its own kernel set, not the int8
+    // M=16 twins: same M=16 activation tile, but the image (and so the tap) is pb16i's or
+    // t2s's, the ELF name carries that suffix, and the geometry test is the image's
+    // (pb16i: K%256, N%1024; t2s: K%256, N%32) rather than the int8 twin's tiling.  A design
+    // that is ternary-only skips the derivation entirely: its own entry already IS the decode
+    // design.
+    if (pb16i_) {
+        const std::string ft = family_tag();
+        for (int i = 0; i < ndesigns_; i++) {
+            if (i == xd_->role_split_qhalf() || i == xd_->role_split_kv()) {
+                designs16_[i] = designs_[i];
+                continue;
+            }
+            // The wide fused full-attention QKV has no ternary kernel (its int64 half
+            // needs 448 columns per core); when the split designs exist that role is
+            // covered by them, so this design simply has no decode kernel.
+            const Q4nxDesign r16 = designs_[i].role;
+            if (xd_->role_split_qhalf() >= 0 && (r16 == Q4NX_DESIGN_QKV || r16 == Q4NX_DESIGN_QKV2)) {
+                designs16_[i].M = 0;
+                continue;
+            }
+            const bool geo_ok = t2s_ ? q4nx_t2s::fits(designs16_[i].K, designs16_[i].N)
+                                     : q4nx_pb16i::fits(designs16_[i].K, designs16_[i].N);
+            if (designs16_[i].M <= 0 || !geo_ok) {
+                // Say WHY, once per role.  A geometry the ternary tile cannot hold is not a
+                // missing artifact and not an error: the role keeps its M=128 kernel and the
+                // model is correct, only slower -- so the only symptom is a decode step that
+                // costs what a prefill step costs, with nothing in the log.  That is the same
+                // "nothing logs the decline" gap the HRX prefill N%16 note names for a
+                // different dispatcher, and it is cheap to close here.
+                if (designs16_[i].M > 0 && !geo_ok)
+                    fprintf(stderr,
+                            "  [forward] dec %-3s: no %s twin (K=%d N=%d does not fit the tile), "
+                            "staying on M=128\n",
+                            role_tag(designs16_[i].role), t2s_ ? "t2s" : "pb16i",
+                            designs16_[i].K, designs16_[i].N);
+                designs16_[i].M = 0;
+                continue;
+            }
+            // Build the new name in a copy: snprintf must not read and write the
+            // same buffer.
+            std::string n16(designs16_[i].elf_name);
+            n16.resize(n16.size() - 4);                  // drop ".elf"
+            if (n16.size() >= 4 && n16.compare(n16.size() - 4, 4, "_m16") == 0)
+                n16.resize(n16.size() - 4);              // and the m16 twin's suffix
+            n16 += ft;
+            // pb16i's decode family carries no `_m16` marker: M=16 is its only design and those
+            // files already exist under that name on every deployed container.  A t2s container's
+            // M=128 designs keep their int8 names (untagged), so its decode kernels are told
+            // apart by the marker the arena uses: full_i8_GU_K5120_N17408_t2s_m16.elf.
+            if (t2s_) n16 += "_m16";
+            n16 += ".elf";
+            snprintf(designs16_[i].elf_name, Q4NX_ELF_NAME_MAX, "%s", n16.c_str());
+        }
+    }
+    std::vector<std::string> m16dirs;
+    plan_decode_dirs_.clear();
+    if (plan_.loaded() && !plan_.decode_dirs.empty()) {
+        // The plan says which of the two given paths each candidate hangs off, so the runtime
+        // stops guessing which base a bare directory name meant.
+        for (const auto& d : plan_.decode_dirs)
+            plan_decode_dirs_.push_back((d.under_model ? mdir : dir) + "/" + d.path);
+        for (const auto& p : plan_decode_dirs_) m16dirs.push_back(p);
+    } else {
+        m16dirs.push_back(mdir + "/kernels-m16");
+        m16dirs.push_back(dir + "/m16");
+        m16dirs.push_back(dir);
+    }
+    int made = 0, skipped = 0;
+    for (int i = 0; i < ndesigns_; i++) {
+        if (designs16_[i].M <= 0) { skipped++; continue; }
+        std::string elf, kname = "main:seq";
+        if (pb16i_ && !pb16i_sealed_.empty()) {
+            // One ELF for every ternary phase: the file is the same for all roles and
+            // only the instance name differs, so I8Ctx reuses the one hw_context.
+            const char* inst = pb16i_instance(designs16_[i].role);
+            if (!inst) {
+                fprintf(stderr, "  [forward] pb16i: the sealed ELF has no instance for "
+                                "role %s; this role has no decode kernel\n",
+                        role_tag(designs16_[i].role));
+                designs16_[i].M = 0;
+                skipped++;
+                continue;
+            }
+            elf = dir + "/" + pb16i_sealed_;
+            sealed_dir_ = dir;
+            kname = inst;
+            if (!file_exists(elf)) {
+                err_ = plan_.loaded() ? ("plan " + plan_path_ + ": decode.sealed_elf \"" +
+                                         pb16i_sealed_ + "\" is not in " + dir + " (missing)")
+                                      : ("pb16i: missing sealed ELF " + elf);
+                return false;
+            }
+        } else {
+            for (const std::string& d : m16dirs) {
+                std::string cand = d + "/" + designs16_[i].elf_name;
+                if (file_exists(cand)) { elf = cand; break; }
+            }
+        }
+        if (elf.empty()) {
+            // A pb16i role without its image kernel must stop the load: it is not
+            // a slower path, it is a missing one (the int8 weights are not packed
+            // for these geometries under this layout).
+            if (pb16i_) {
+                err_ = plan_.loaded()
+                           ? std::string("plan ") + plan_path_ + ": decode role " +
+                                 role_tag(designs16_[i].role) + " needs \"" + designs16_[i].elf_name +
+                                 "\" (missing)"
+                           : std::string("pb16i: missing decode ELF ") + designs16_[i].elf_name;
+                return false;
+            }
+            skipped++;
+            continue;   // stay on M=128
+        }
+        I8Ctx* c16 = xd_->make_ctx16(i, designs16_[i]);
+        if (!c16) { err_ = "cannot create the decode context for role " + std::to_string(i); return false; }
+        c16->MD = designs16_[i].M;
+        c16->KD = designs16_[i].K;
+        c16->ND = designs16_[i].N;
+        c16->blocked_b = weight_layout_b8_;
+        c16->pb16i = pb16i_;
+        c16->t2s = t2s_;
+        // Which pb16i ELFs leave two int32 planes (the arena's ACC64 family: D, O and
+        // the full-attention q half).  This mirrors the ELF family contract rather
+        // than inferring it, and load/launch refuse a tensor that needs two planes on
+        // a one-plane ELF.
+        if (pb16i_) {
+            const Q4nxDesign r = designs16_[i].role;
+            c16->pb16i_planes =
+                (r == Q4NX_DESIGN_D || r == Q4NX_DESIGN_O || r == Q4NX_DESIGN_QKVFA_Q) ? 2 : 1;
+        }
+        if (!c16->init_elf(*dev, elf.c_str(), designs16_[i].M,
+                           designs16_[i].K, designs16_[i].N, 1, kname.c_str())) {
+            if (pb16i_) {
+                err_ = "pb16i: init_elf failed for " + elf;
+                return false;
+            }
+            fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "
+                            "this role keeps M=128\n", designs16_[i].elf_name);
+            xd_->drop_ctx16(i);
+            skipped++;
+            continue;
+        }
+        made++;
+        fprintf(stderr, "  [forward] %-7s M=%d K=%d N=%d  %s (decode)\n",
+                role_tag(designs_[i].role), designs16_[i].M, designs16_[i].K,
+                designs16_[i].N, elf.c_str());
+    }
+    xd_->note_m16_made(made > 0);
+    if (pb16i_ && made < ndesigns_ - 0) {
+        fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
+                t2s_ ? "t2s" : "pb16i", made, ndesigns_);
+    }
+    fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n",
+            made, Q4NX_DESIGN_M_DECODE, skipped, Q4NX_DESIGN_M_PREFILL,
+            want_m16 ? "" : " (NPU_DECODE_M16=0: disabled)");
+    // engine#1990: a wide prefill family for a sealed pb16i/t2s set: a second sealed ELF carrying the same
+    // instances built for more rows per launch (default 32), so a chunk of more than 16 rows runs one launch per
+    // role instead of two. The pack names it (config `q4nx_<layout>_sealed_wide_elf`, rows in
+    // `q4nx_sealed_wide_rows`); NPU_WIDE_SEALED_ELF overrides the file ("0" = off) and NPU_WIDE_ROWS the rows.
+    // All roles or none -- max_batch_rows() is the chunk width, so one role without a wide kernel would be
+    // launched past its buffers. A named file that is missing or does not load is logged and the pass stays at
+    // 16 rows: a pack must never stop serving over an optional speed-up.
+    const std::string wide_path =
+        onebit::npu::wide_elf_path(getenv("NPU_WIDE_SEALED_ELF"), wide_sealed_, sealed_dir_);
+    if (const char* wide_elf = wide_path.c_str();
+        !wide_path.empty() && pb16i_ && !pb16i_sealed_.empty() && made > 0) {
+        const char* wr = getenv("NPU_WIDE_ROWS");
+        const int rows = wr && *wr ? atoi(wr) : wide_sealed_rows_;
+        int wide = 0;
+        std::string why;
+        if (rows <= Q4NX_DESIGN_M_DECODE || rows > Q4NX_DESIGN_M_PREFILL) why = "NPU_WIDE_ROWS must be 17..128";
+        else if (!file_exists(wide_elf)) why = std::string("no such file: ") + wide_elf;
+        for (int i = 0; why.empty() && i < ndesigns_; i++) {
+            I8Ctx* c16 = xd_->ctx16(i);
+            if (!c16) continue;
+            const char* inst = pb16i_instance(designs16_[i].role);
+            I8Ctx* cw = inst ? xd_->make_ctx_wide(i) : nullptr;
+            if (!cw) { why = std::string("no wide context for role ") + role_tag(designs16_[i].role); break; }
+            cw->MD = rows;
+            cw->KD = c16->KD;
+            cw->ND = c16->ND;
+            cw->blocked_b = c16->blocked_b;
+            cw->pb16i = c16->pb16i;
+            cw->t2s = c16->t2s;
+            cw->pb16i_planes = c16->pb16i_planes;
+            if (!cw->init_elf(*dev, wide_elf, rows, c16->KD, c16->ND, 1, inst)) {
+                why = std::string("init_elf failed for instance ") + inst;
+                break;
+            }
+            wide++;
+        }
+        if (why.empty() && wide > 0 && !xd_->adopt_wide(rows)) why = "a role with a decode context has no wide one";
+        if (why.empty() && wide > 0) {
+            fprintf(stderr, "  [forward] wide family: %d role(s) at M=%d from %s (chunks of 17..%d rows)\n",
+                    wide, rows, wide_elf, rows);
+        } else {
+            xd_->drop_wide();
+            fprintf(stderr, "  [forward] wide family NOT adopted (%s); chunks stay at %d rows\n",
+                    why.empty() ? "no role has a decode context" : why.c_str(), Q4NX_DESIGN_M_DECODE);
+        }
+    }
+    return true;
+}
+
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir) {
     if (const char* hg = getenv("NPU_INFER_HOST_GEMM")) {
@@ -437,6 +657,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         // every row measured so far used.
         host_gemm_i8_ = (hg[0] == 'i' && hg[1] == '8');
     }
+    // engine#2028: say at load, before any request, that NPU_INFER_DUMP_OPS is armed (once per process). No line with
+    // the variable set means the binary predates the dump.
+    onebit::npu::ops_dump_announce();
     // The launch layer.  A1: everything below that touches a device talks to this, and the settings the
     // container declares (weight layout, pb16i image dir, Hadamard fold) are pushed into it as they are
     // parsed.  A2 turns this into NpuTarget::open(plan, kernels_dir).
@@ -512,6 +735,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             // pb16i ELF (which would read 4,608-B tiles out of 2,176-B images).
             pb16i_sealed_ = read_config_string(
                 cfg_path, t2s_ ? "\"q4nx_t2s_sealed_elf\"" : "\"q4nx_pb16i_sealed_elf\"", "");
+            // engine#1990: an optional second sealed ELF, the same instances built for more rows per launch.
+            wide_sealed_ = read_config_string(
+                cfg_path, t2s_ ? "\"q4nx_t2s_sealed_wide_elf\"" : "\"q4nx_pb16i_sealed_wide_elf\"", "");
+            wide_sealed_rows_ = q4nx_config_int(cfg_path.c_str(), "q4nx_sealed_wide_rows", 32);
             // A folded container also declares the fold: `q4nx_hadamard` names the sign table and
             // `q4nx_hadamard_block` the Hadamard block.  Without it the sidecar images would be
             // read in the stored (rotated) basis against un-rotated activations.
@@ -1256,164 +1483,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     xd_->set_m16_check(getenv("NPU_M16_CHECK") != nullptr);
     const char* m16_env = getenv("NPU_DECODE_M16");
     const bool want_m16 = !m16_env || atoi(m16_env) != 0;
-    if (want_m16 && !host_gemm_) {
-        q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
-        // An integer-exact ternary container's decode family is its own kernel set, not the int8
-        // M=16 twins: same M=16 activation tile, but the image (and so the tap) is pb16i's or
-        // t2s's, the ELF name carries that suffix, and the geometry test is the image's
-        // (pb16i: K%256, N%1024; t2s: K%256, N%32) rather than the int8 twin's tiling.  A design
-        // that is ternary-only skips the derivation entirely: its own entry already IS the decode
-        // design.
-        if (pb16i_) {
-            const std::string ft = family_tag();
-            for (int i = 0; i < ndesigns_; i++) {
-                if (i == xd_->role_split_qhalf() || i == xd_->role_split_kv()) {
-                    designs16_[i] = designs_[i];
-                    continue;
-                }
-                // The wide fused full-attention QKV has no ternary kernel (its int64 half
-                // needs 448 columns per core); when the split designs exist that role is
-                // covered by them, so this design simply has no decode kernel.
-                const Q4nxDesign r16 = designs_[i].role;
-                if (xd_->role_split_qhalf() >= 0 && (r16 == Q4NX_DESIGN_QKV || r16 == Q4NX_DESIGN_QKV2)) {
-                    designs16_[i].M = 0;
-                    continue;
-                }
-                const bool geo_ok = t2s_ ? q4nx_t2s::fits(designs16_[i].K, designs16_[i].N)
-                                         : q4nx_pb16i::fits(designs16_[i].K, designs16_[i].N);
-                if (designs16_[i].M <= 0 || !geo_ok) {
-                    // Say WHY, once per role.  A geometry the ternary tile cannot hold is not a
-                    // missing artifact and not an error: the role keeps its M=128 kernel and the
-                    // model is correct, only slower -- so the only symptom is a decode step that
-                    // costs what a prefill step costs, with nothing in the log.  That is the same
-                    // "nothing logs the decline" gap the HRX prefill N%16 note names for a
-                    // different dispatcher, and it is cheap to close here.
-                    if (designs16_[i].M > 0 && !geo_ok)
-                        fprintf(stderr,
-                                "  [forward] dec %-3s: no %s twin (K=%d N=%d does not fit the tile), "
-                                "staying on M=128\n",
-                                role_tag(designs16_[i].role), t2s_ ? "t2s" : "pb16i",
-                                designs16_[i].K, designs16_[i].N);
-                    designs16_[i].M = 0;
-                    continue;
-                }
-                // Build the new name in a copy: snprintf must not read and write the
-                // same buffer.
-                std::string n16(designs16_[i].elf_name);
-                n16.resize(n16.size() - 4);                  // drop ".elf"
-                if (n16.size() >= 4 && n16.compare(n16.size() - 4, 4, "_m16") == 0)
-                    n16.resize(n16.size() - 4);              // and the m16 twin's suffix
-                n16 += ft;
-                // pb16i's decode family carries no `_m16` marker: M=16 is its only design and those
-                // files already exist under that name on every deployed container.  A t2s container's
-                // M=128 designs keep their int8 names (untagged), so its decode kernels are told
-                // apart by the marker the arena uses: full_i8_GU_K5120_N17408_t2s_m16.elf.
-                if (t2s_) n16 += "_m16";
-                n16 += ".elf";
-                snprintf(designs16_[i].elf_name, Q4NX_ELF_NAME_MAX, "%s", n16.c_str());
-            }
-        }
-        std::vector<std::string> m16dirs;
-        plan_decode_dirs_.clear();
-        if (plan_.loaded() && !plan_.decode_dirs.empty()) {
-            // The plan says which of the two given paths each candidate hangs off, so the runtime
-            // stops guessing which base a bare directory name meant.
-            for (const auto& d : plan_.decode_dirs)
-                plan_decode_dirs_.push_back((d.under_model ? mdir : dir) + "/" + d.path);
-            for (const auto& p : plan_decode_dirs_) m16dirs.push_back(p);
-        } else {
-            m16dirs.push_back(mdir + "/kernels-m16");
-            m16dirs.push_back(dir + "/m16");
-            m16dirs.push_back(dir);
-        }
-        int made = 0, skipped = 0;
-        for (int i = 0; i < ndesigns_; i++) {
-            if (designs16_[i].M <= 0) { skipped++; continue; }
-            std::string elf, kname = "main:seq";
-            if (pb16i_ && !pb16i_sealed_.empty()) {
-                // One ELF for every ternary phase: the file is the same for all roles and
-                // only the instance name differs, so I8Ctx reuses the one hw_context.
-                const char* inst = pb16i_instance(designs16_[i].role);
-                if (!inst) {
-                    fprintf(stderr, "  [forward] pb16i: the sealed ELF has no instance for "
-                                    "role %s; this role has no decode kernel\n",
-                            role_tag(designs16_[i].role));
-                    designs16_[i].M = 0;
-                    skipped++;
-                    continue;
-                }
-                elf = dir + "/" + pb16i_sealed_;
-                kname = inst;
-                if (!file_exists(elf)) {
-                    err_ = plan_.loaded() ? ("plan " + plan_path_ + ": decode.sealed_elf \"" +
-                                             pb16i_sealed_ + "\" is not in " + dir + " (missing)")
-                                          : ("pb16i: missing sealed ELF " + elf);
-                    return false;
-                }
-            } else {
-                for (const std::string& d : m16dirs) {
-                    std::string cand = d + "/" + designs16_[i].elf_name;
-                    if (file_exists(cand)) { elf = cand; break; }
-                }
-            }
-            if (elf.empty()) {
-                // A pb16i role without its image kernel must stop the load: it is not
-                // a slower path, it is a missing one (the int8 weights are not packed
-                // for these geometries under this layout).
-                if (pb16i_) {
-                    err_ = plan_.loaded()
-                               ? std::string("plan ") + plan_path_ + ": decode role " +
-                                     role_tag(designs16_[i].role) + " needs \"" + designs16_[i].elf_name +
-                                     "\" (missing)"
-                               : std::string("pb16i: missing decode ELF ") + designs16_[i].elf_name;
-                    return false;
-                }
-                skipped++;
-                continue;   // stay on M=128
-            }
-            I8Ctx* c16 = xd_->make_ctx16(i, designs16_[i]);
-            if (!c16) { err_ = "cannot create the decode context for role " + std::to_string(i); return false; }
-            c16->MD = designs16_[i].M;
-            c16->KD = designs16_[i].K;
-            c16->ND = designs16_[i].N;
-            c16->blocked_b = weight_layout_b8_;
-            c16->pb16i = pb16i_;
-            c16->t2s = t2s_;
-            // Which pb16i ELFs leave two int32 planes (the arena's ACC64 family: D, O and
-            // the full-attention q half).  This mirrors the ELF family contract rather
-            // than inferring it, and load/launch refuse a tensor that needs two planes on
-            // a one-plane ELF.
-            if (pb16i_) {
-                const Q4nxDesign r = designs16_[i].role;
-                c16->pb16i_planes =
-                    (r == Q4NX_DESIGN_D || r == Q4NX_DESIGN_O || r == Q4NX_DESIGN_QKVFA_Q) ? 2 : 1;
-            }
-            if (!c16->init_elf(*dev, elf.c_str(), designs16_[i].M,
-                               designs16_[i].K, designs16_[i].N, 1, kname.c_str())) {
-                if (pb16i_) {
-                    err_ = "pb16i: init_elf failed for " + elf;
-                    return false;
-                }
-                fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "
-                                "this role keeps M=128\n", designs16_[i].elf_name);
-                xd_->drop_ctx16(i);
-                skipped++;
-                continue;
-            }
-            made++;
-            fprintf(stderr, "  [forward] %-7s M=%d K=%d N=%d  %s (decode)\n",
-                    role_tag(designs_[i].role), designs16_[i].M, designs16_[i].K,
-                    designs16_[i].N, elf.c_str());
-        }
-        xd_->note_m16_made(made > 0);
-        if (pb16i_ && made < ndesigns_ - 0) {
-            fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
-                    t2s_ ? "t2s" : "pb16i", made, ndesigns_);
-        }
-        fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n",
-                made, Q4NX_DESIGN_M_DECODE, skipped, Q4NX_DESIGN_M_PREFILL,
-                want_m16 ? "" : " (NPU_DECODE_M16=0: disabled)");
-    }
+    // engine#803 A2b (step one): the block moved verbatim into open_decode_family_local(); the call site keeps the
+    // guard so the "disabled" log line is still printed from one place.
+    if (!open_decode_family_local(want_m16, dev, mdir, dir)) return false;
 
     // The lm head's own context (pb16i ternary images, the int8 ladder, or the q4_1 gemv head).  Cut out
     // into its own method with its body unchanged, so the next step (moving it behind XdnaTarget, as the
@@ -3271,6 +3343,11 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     // choke point every batched projection goes through: the same launches in the same order, each within the
     // BO. Each row's result is independent of the others -- the row loops downstream (`row_attn`, the GDN
     // recurrence) never needed the whole prompt in one launch, only the GEMMs did.
+    // A's row stride. `a_k` is the activation's real width when the design pads it up to K, and 0 (or K) when it
+    // does not -- the designs that do not set real_k. So the stride is a_k only when it is a real, narrower width:
+    // the same rule the target applies (xdna_target.cpp: astride). Walking by `a_k` itself made every block after
+    // the first read block 0's rows on a design with real_k == 0 (engine#1959 follow-up, found on a t2s pack).
+    const int astride = onebit::npu::row_stride(a_k, K);
     const int blk = max_batch_rows();
     if (blk > 0 && M > blk) {
         // engine#1582: say the block width out loud, once. A log that reads "0 launches, 93 s host" cannot be told
@@ -3288,7 +3365,7 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
             const int rows = std::min(blk, M - b0);
             std::vector<float> part;
             // A's row stride is the caller's a_k, not the padded K (the same stride trap the host path documents).
-            npu_gemm_rows(role, A + (size_t)b0 * a_k, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
+            npu_gemm_rows(role, A + (size_t)b0 * (size_t)astride, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
             if (part.size() < (size_t)rows * N) {
                 if (err_.empty()) err_ = std::string("npu_gemm_rows: a blocked ") + sc + " launch returned short";
                 return;
@@ -3321,7 +3398,15 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     if (in_range && wkey >= 0 && split_mode_ != 0 && narrow >= 2 && wide > narrow && M > narrow && M <= wide) {
         // Forced mode stands in two costs that always split, so the route can be A/B'd and checked bit for bit.
         const double nms = split_mode_ == 1 ? 1.0 : split_narrow_ms_[role];
-        const double wms = split_mode_ == 1 ? 1e9 : split_wide_ms_[role];
+        // A pack that names a wide sealed family (engine#1990) has stated which side is cheaper, from a measurement
+        // made when the set was built; the costs timed here cannot overrule it, because a narrow launch is mostly
+        // timed carrying one row (a decode step) and its host share grows with the rows it carries. Measured on
+        // bonsai2-27b-t2s2: 0.50 ms per 16-row launch against 1.23 ms per 32-row launch looked like a saving and
+        // was not. So with a wide family the rule stands down unless it is forced (which is how the walk is tested).
+        const bool family = xd_ && xd_->wide_rows() > 0;
+        const double wms = split_mode_ == 1 ? 1e9
+                           : family ? 0.0
+                                    : onebit::npu::split_wide_cost(split_wide_ms_[role], split_wide_n_[role]);
         const int sb = onebit::npu::batch_split_rows(M, narrow, wide, nms, wms);
         if (sb > 0) {
             if (!split_said_) {
@@ -3341,7 +3426,7 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
             for (int b0 = 0; b0 < M && err_.empty(); b0 += sb) {
                 const int rows = std::min(sb, M - b0);
                 std::vector<float> part;
-                npu_gemm_rows(role, A + (size_t)b0 * a_k, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
+                npu_gemm_rows(role, A + (size_t)b0 * (size_t)astride, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
                 if (part.size() < (size_t)rows * N) {
                     if (err_.empty()) err_ = std::string("npu_gemm_rows: a split ") + (sc ? sc : "?") + " launch returned short";
                     return;
@@ -3373,10 +3458,11 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         if (M <= narrow) {
             // a running mean that follows the box's load: narrow launches happen on every decode step
             split_narrow_ms_[role] = split_narrow_ms_[role] > 0.0 ? 0.75 * split_narrow_ms_[role] + 0.25 * ms : ms;
-        } else if (!(split_wide_ms_[role] > 0.0) || ms < split_wide_ms_[role]) {
+        } else {
             // the BEST wide launch seen: once a chunk is split the wide design is not launched again, so a wide cost
-            // taken in a noisy moment must not be what keeps it out
-            split_wide_ms_[role] = ms;
+            // taken in a noisy moment must not be what keeps it out. Counted, because the first one is a start-up.
+            if (split_wide_n_[role] < 1 << 20) split_wide_n_[role]++;
+            if (!(split_wide_ms_[role] > 0.0) || ms < split_wide_ms_[role]) split_wide_ms_[role] = ms;
         }
     }
     op_line(sc, cur_layer_, M, out, N);

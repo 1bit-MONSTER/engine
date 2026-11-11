@@ -538,6 +538,35 @@ second pair is not quoted as a speedup. `NPU_DEQ_LDEXP=2` runs both forms and co
 `tests/npu_pb16i_layout_test.cpp` holds the two forms to the same bits for one and two planes, the edges
 of the exponent range and exponents outside it. The `[bl]` line names the term as `deq`.
 
+**A sealed set may carry a wide family for prefill (#1990).** The served sealed sets are built for 16
+rows per launch, so a prefill chunk is 16 rows and a 536-token prompt is 34 blocks of 416 launches. A pack
+may name a second sealed ELF with the same instances built for more rows: `q4nx_t2s_sealed_wide_elf` (or
+`q4nx_pb16i_sealed_wide_elf`) in `config.json`, a file in the kernels directory beside the 16-row one, and
+`q4nx_sealed_wide_rows` for its row count (default 32, allowed 17..128). No pack ships one yet, so nothing
+changes for an existing pack. `NPU_WIDE_SEALED_ELF=<file>` overrides the pack's file, `NPU_WIDE_SEALED_ELF=0`
+switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count.
+
+When the wide ELF loads for every role that has a 16-row kernel, the chunk width becomes its row count and a
+launch of more than 16 rows takes the wide kernel; decode steps and chunks of up to 16 rows stay on the
+16-row family. It is all roles or none: the chunk width is one number for the pass, so a set missing one
+role is not adopted. A named file that is missing or does not load never stops the serve: the log says why
+(`[forward] wide family NOT adopted (...)`) and chunks stay at 16 rows. The weight images are shared, only
+the activation and result buffers differ. A launch that carries more rows than its kernel holds is refused
+by name. The rules (`wide_family_complete`, `chunk_rows`, `wide_takes`, `wide_elf_path` in
+`npu/forward/include/batch_width.h`) are pinned without a device by `tests/npu_pack_test.cpp`.
+
+Measured on `bonsai2-27b-t2s2` with a 32-row set, one `npu-hold` ticket per row of the table, one binary,
+arms off / on / off / on, three 510-536-token prompts per arm (`prompt_tokens / wall`, `max_tokens 1`):
+
+| how the wide set was named | first token, wide off | first token, wide on | 16-row block median | 32-row block median |
+|---|---|---|---|---|
+| `NPU_WIDE_SEALED_ELF` | 28.3-29.8, 30.5-30.8 tok/s | **35.6-35.9, 35.0-35.4 tok/s** | 534.2, 509.3 ms | 871.0, 881.5 ms |
+| the pack's `config.json` key | 28.7-28.9, 28.7-29.0 tok/s | **33.9-34.2, 34.2-34.4 tok/s** | 541.2, 541.4 ms | 914.0, 908.3 ms |
+
+Two 16-row blocks against one 32-row block is 30-31 rows/s against 35-37. The 8-token greedy text is
+identical with the family off and on, and `NPU_BATCH_CHECK=1` on the wide path reports MATCH on every chunk
+it checks (32-, 4- and 1-row) in both tickets. Only 32 rows has been measured.
+
 **A t2s container wants a sealed set for the same reason a pb16i one does.** The layout is not what makes
 a phase change expensive: the **hw_context** is. Measured on this box in-loop on 2026-11-02, a t2s decode
 family shipped as eight per-role `_t2s2_m16` ELFs paid **+2.0-2.3 ms on every launch, in every role** — more
@@ -611,6 +640,30 @@ identical between the two arms, and the per-row bitwise oracle (`NPU_BATCH_CHECK
 family only (every t2s/pb16i container: `max_batch_rows()` is 16 there) never reaches the rule, and weights that are
 re-packed per launch (routed MoE experts) are never split. The serve says once what it did:
 `[batch] a 17-row chunk runs as 2 launch(es) of 16 rows instead of one 128-row launch: measured ...`.
+
+Two things this rule had wrong until it met a pack with a wide sealed family (#1990), both found on
+`bonsai2-27b-t2s2` with a 32-row set and both fixed here:
+
+- **A walked chunk stepped through its rows by the wrong distance.** The walk advanced the activation pointer by
+  `a_k`, the design's real width. A design that does not pad never sets it, so on such a design `a_k` is 0 and every
+  block after the first read the first block's rows. `NPU_BATCH_CHECK=1 npu-run` on 32 ids with the split forced
+  reported `rows M=32 identical=16 differing=16 first row=16`, twice, and `identical=32` with the split off; the serve
+  generated different text. The int8 pack above pads (`real_k` 3584 under K 4096), which is why its 17-row check
+  passed. The stride is now `row_stride(a_k, K)` (`batch_split.h`): `a_k` only when it is a real, narrower width, the
+  rule the target itself applies. The older block walk for chunks wider than the design had the same line and is
+  fixed with it. After the fix the same run reports `identical=32 differing=0` forced, default and off.
+- **One start-up launch was taken for the wide launch's cost.** The first 32-row launch of a projection measured
+  4.17 ms against 0.51 ms for a 16-row one, so the rule split every 32-row chunk of that projection, on a family whose
+  wide launch is the cheaper one. The wide cost now counts only after three launches were timed
+  (`kSplitWideSamples`, `split_wide_cost()`); until then that side is "not measured" and the wide launch is kept,
+  which is also what collects the samples.
+- **With a wide sealed family the rule stands down.** Even with three samples it split a few 32-row launches:
+  `measured 0.50 ms per 16-row launch against 1.23 ms per 32-row launch (attn_output)`. A narrow launch is mostly
+  timed carrying one row (a decode step), and its host share grows with the rows it carries, so that 0.50 ms is not
+  what a full 16-row launch costs. A pack that names a wide family has already stated which side is cheaper, so the
+  measured rule does not apply to it; `NPU_PREFILL_SPLIT=1` still forces the walk, which is how it is checked. The
+  rule keeps its job on the packs it was written for, where the wide design is the 128-row prefill kernel and the
+  gap is a factor of six.
 
 #### Where a prefill block's time goes now (measured), and why it is no longer the pack (#1416)
 
@@ -1175,6 +1228,15 @@ working directory's files are not the importer's to clean. The 6 hours are what 
 shared directory, so the number stays above the longest import; it is not the knob for disk or tmpfs pressure. The test suite sets one per run and
 removes it at exit.
 
+The cache directory is shared: every import of the same pack on the box uses the same file name. The copy is therefore
+written under a temporary name beside it (`1bit-fconst19tmp-<pid>-<n>-<name>`) and renamed into place, so an import finds
+either no copy or a complete one (engine#1985). Before that the copy was written in place, and two imports of one pack
+started a fraction of a second apart could leave the first reading a file the second had just truncated. The result was a
+wrong layout reading with exit 0: `Qwen3-1.7B` reported 280 refused tensors, `qk_norm` false and 0 measured tiles in 4 of
+24 runs of three imports 0.15 s apart, and 0 of 144 with the rename. A temporary file left by a killed run is removed by
+the 6-hour rule above. A binary older than this change still writes in place, so a box where old and new binaries import
+the same pack at the same moment can still show it.
+
 ### Linking the kernel set the container will be served with
 
 A model directory carries its own NPU kernels in `npu/` (see "A model directory"), and for an imported
@@ -1488,6 +1550,100 @@ selections per layer touch nearly all 128 experts and stream ~18 GB. MoE prefill
 GPU route (`--moe-prefetch`, docs/serve.md); this is the thing that decides whether a kernel is
 right.
 
+### A pack's vision component (`vision_weight.q4nx`, engine#1788)
+
+FastFlowLM's MiniCPM-V 4.7 packs are two containers at the pack root: `model.q4nx` (the text model) and
+the file `config.json` names as `vision_model_weight`, `vision_weight.q4nx` (the vision tower). The
+second is the same container format holding a ViT: every tensor BF16, no tiles. `npu/vision_pack.h`
+reads it, and `1bit npu-pack vision <pack dir>` prints what it found:
+
+```
+$ 1bit npu-pack vision MiniCPM-V-4.7-1B-NPU2
+vision component  MiniCPM-V-4.7-1B-NPU2/vision_weight.q4nx
+tensors           347, all BF16, 1135109120 B of payload, 0 B unaccounted
+patch embed       14 x 14 pixels x 3 channels -> 1152
+positions         4900 (a 70 x 70 grid; image 980)
+blocks            27 at width 1152, 16 heads x 72, MLP 4304 (4608 stored)
+vit_merger        after block 6; attention at 1152, MLP 4608 -> 17216 (17280 stored) -> 1152
+merger            4608 -> 4608 -> 1024 (the text model's hidden size)
+source_file       mmproj-model-f16.gguf
+source_sha256     fb9cc047a3cdad5317fd8433a4aeda2d22f00f02ca4bd93b34ad84165b25a900
+note              config.json states MINICPM_V_VISION_MLP_INTERMEDIATE_SIZE 4304; model.visual.blocks.*.mlp.linear_fc1.weight has 4608 rows, the last 304 all zero: the container pads the model's width, and sizes come from the tensor
+note              config.json states MINICPM_V_VIT_MERGER_INTERMEDIATE_SIZE 17216; model.visual.vit_merger.mlp.linear_fc1.weight has 17280 rows, the last 64 all zero: the container pads the model's width, and sizes come from the tensor
+```
+
+What the reader settles is what a forward may rely on.
+
+- **Sizes come from the tensors.** The geometry is derived from the tensors' own shapes, and every
+  tensor must have the shape the others imply.
+- **The MLPs are stored padded.** The model's MLP widths are 4304 (blocks) and 17216 (`vit_merger`);
+  that is what `config.json` states and what the source GGUF's tensors are. The container stores them
+  4608 and 17280 wide, the next multiples of 128, with the extra `linear_fc1` rows, bias entries and
+  `linear_fc2` columns all zero. A loader that sized a buffer from the config would be 304 rows short
+  of what the file holds. The reader sizes from the tensor, verifies that everything past the stated
+  width is zero in every block, and carries the model's width beside the stored one
+  (`Geometry::model_intermediate`). If any value past the stated width is not zero it says so and
+  keeps the tensor's width; a config that states an MLP wider than its tensors is refused.
+- **Zero gaps.** A tensor the reader has no place for is a refusal, as is a missing one, a hole in the
+  block indices, a tensor that is not BF16, an extent that is not its shape's byte length, an extent
+  outside the payload, and two tensors on the same bytes. Each names the tensor.
+- **`config.json` is consulted for what the tensors cannot say** (the head count, the image size, the
+  unpadded MLP widths) and refused where the two cannot both be right: heads that do not multiply to
+  the width, an image size that is not the position grid times the patch, another width, block count
+  or position count, and a text `hidden_size` that is not what the merger projects to. That last one
+  is a tower paired with the wrong text model.
+
+**Checked against the source, bit for bit** (2026-11-10, both published packs). The 1B container's
+`__metadata__` names `mmproj-model-f16.gguf` and its SHA-256, which is the file of that name in
+`openbmb/MiniCPM-V-4.7-1B-gguf`. All 347 pack tensors were rebuilt from that GGUF and compared as
+BF16 bit patterns: 263 identical, 84 identical in the source's extent and `+0.0` in the padding, 0
+different. The pack's `attn.qkv` is the source's `attn_q`, `attn_k`, `attn_v` stacked in that order;
+`merger.norm` is the source's `v.post_ln`. Every F32 source tensor is exactly representable in BF16.
+The 35B-A3B container carries no `__metadata__`; the same comparison against
+`openbmb/MiniCPM-V-4.7-35B-A3B-gguf`'s `mmproj-model-f16.gguf` (SHA-256 `bff3b688…5d20f1`) gives the
+same 263 / 84 / 0, and against the 1B's source gives 0 of 347, so the two towers share a geometry and
+not a single tensor. One source tensor has no counterpart in either container: `v.tok_embd_sep`
+(`[4, hidden]`).
+
+Pinned by `tests/npu_vision_pack_test.cpp` on crafted containers; `ONEBIT_MINICPM_PACK=<pack dir>` adds
+the published pack's own numbers. The source comparison above was run by hand and is not a test in the
+tree.
+
+**The tower on the host (`npu/vision_tower.h`).** `vision::tower_forward(pack, pixels, gh, gw)` runs the
+tower in float32 on the CPU: normalised pixels for a `gh × gw` patch grid in, `(gh/4) × (gw/4)` rows at
+the text model's width out. It is a reference for whatever runs the tower on the NPU later, not a
+serving path; nothing calls it from a serve, and it does no image decoding, resizing or slicing. The
+order of operations is the transformers implementation's (`transformers.models.minicpmv4_7`):
+
+1. patch embedding (a Conv2d whose kernel is its stride), patches row-major;
+2. plus one learned position row per patch, picked **nearest** on the 70 × 70 table: row
+   `floor(y·70/gh)`, column `floor(x·70/gw)`. No interpolation and no rotary term;
+3. blocks 0–6: LayerNorm (eps 1e-6), full attention, MLP with the tanh GELU;
+4. the `vit_merger`, once, after block `insert_layer_id` (6): attention inside each 2 × 2 window only,
+   then per window an MLP over the four tokens side by side plus their mean. The grid halves;
+5. blocks 7–26 on the halved grid, then `merger.norm`;
+6. the merger: 2 × 2 groups again, `pre_norm`, `linear_fc1`, the exact (erf) GELU, `linear_fc2`.
+
+So both grid extents must be multiples of 4, and anything else is refused. The padded MLPs are read at
+the tensor's stride and the model's width.
+
+Measured against that implementation (transformers 5.22.2, torch 2.13 CPU, float32, eager attention)
+loaded with each pack's own weights, same input (`pixel(c, y, x) = sin(0.37c + 0.11y + 0.05x +
+0.003xy)`), 2026-11-10:
+
+| pack | grid | tower before the merger: max \|d\|, corr | output: max \|d\|, corr |
+|---|---|---|---|
+| 1B | 8 × 12 | 2.9e-5, 1.000000000 | 1.1e-6, 1.000000000 |
+| 1B | 16 × 20 | 1.1e-5, 1.000000000 | 2.4e-6, 1.000000000 |
+| 35B-A3B | 16 × 20 | 9.5e-6, 1.000000000 | 9.5e-7, 1.000000000 |
+
+The 16 × 20 grid took 5.5 s and 1.25 GB of memory for this code on one thread; a full 70 × 70 slice
+has 61 times the tokens and its attention grows with the square, which is why this is a reference.
+`tests/npu_vision_tower_test.cpp` carries a small tower with LCG weights and that implementation's
+output for it as goldens, so the arithmetic is checked in CI without a pack; with
+`ONEBIT_MINICPM_PACK` and `ONEBIT_MINICPM_ORACLE` set it repeats the comparison above. The reference
+run itself needs transformers and torch and is not in the tree.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU
@@ -1499,6 +1655,15 @@ kernels (dense Qwen3: 0.6B, 1.7B and 4B):
 
 In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
 The model directory holds the weights only; the kernels ship inside the package.
+
+**Streaming.** With `"stream": true` the route sends each piece of the answer as it is produced. The first frame
+leaves once the prompt has been processed and the first visible piece exists (a thinking model's opening markup is
+held until it can be classified, so that is a token or two after the prompt is done), and the rest follow about
+one per token. Before engine#1785 every frame was sent after the generation had ended, so a client's time to first
+token was the whole request. A request that fails before producing anything (a prompt over the context, a
+malformed field) still gets its own status code, not a 200 stream; one that fails later reports the error as a
+last `data:` frame. A client that disconnects stops the generation at the next token, which frees the device for
+the next request. The streamed reply and the non-streamed one are the same text.
 
 ### FastFlowLM's NPU2 drops: the families the route does not serve
 
@@ -1820,6 +1985,14 @@ an end-of-sequence token, a stop sequence, a grammar that allows nothing more, o
 ended itself once its grammar had reached an accepting state — the route puts the container's end tokens into the
 mask exactly there, so a complete JSON object reports `stop` instead of padding with whitespace to `max_tokens`
 (engine#1182).
+
+Every pick is bounded by the tokenizer, not only the constrained one. The head is `vocab_size` wide, and
+`vocab_size` may exceed the tokenizer's ids: Qwen3's 151,936 against 151,669 (measured on Qwen3-0.6B's
+`config.json` and `tokenizer.json`). The ids in between are padding positions with no text, so a token drawn
+there emits nothing and never ends the reply. `sample_token()` and `1bit npu-run`'s per-row argmax
+(`argmax_token()`) therefore consider only ids below the tokenizer's size (`token_bound()` in
+`app/npu_sampling.h`, engine#2017), with or without a grammar. A container with no `tokenizer.json` keeps the
+whole row.
 
 The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of
 `third_party/llama.cpp/src/llama-sampler.cpp` (top_k, then top_p, then temperature, then the
@@ -2250,7 +2423,10 @@ can fail a run.
 | `NPU_INFER_DUMP_DIR=<dir>` | `<dir>/layer_<ll>.f32` per layer: the residual stream after that layer, M x H little-endian f32, row-major. The directory must exist; a file that cannot be written is reported on stderr and the run goes on. | which **layer** two runs part at (per-layer cosine against a reference trace) |
 | `NPU_INFER_DUMP_OPS=1` | one stderr line per projection and per weighted RMSNorm: `[op] L<layer> <tag> rows=<M> \|x\| mean <m> absmax <a>` | which **op** inside the layer |
 
-`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process.
+`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process. When it is on, the forward prints
+`[ops-dump] NPU_INFER_DUMP_OPS is on: …` once at model load, before any request (engine#2028). A run that sets the
+variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
+looking for a code path that skips the dump.
 
 ```
   [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935
@@ -2453,7 +2629,11 @@ sampled two ways), and `--batchcheck` takes the verify batch's M-curve.
 (`identical=N differing=0`). Both passes continue the same prefix: the oracle snapshots the first `start_pos`
 positions before the replay and restores them afterwards (engine#1905). So a chunk after the first, or the serve
 path's split-off last token, is compared from the state the batched pass really continues, and the flag leaves the
-run's own output unchanged. `tests/batch_check_state_test.cpp` pins both properties.
+run's own output unchanged. `tests/batch_check_state_test.cpp` pins both properties, and it runs in CI (engine#1946):
+a configure without the NPU lane builds the same forward sources against the public runtime stub
+(`onnx/ep/npu_runtime_ci_stub.cpp`, whose device calls throw; the host-GEMM forward makes none), and
+`tests/batch_check_state_ci.py` runs the test on a two-layer qwen3 container it writes and packs itself. With the
+NPU lane on, the row is the dev-box one and takes a real container from `ONEBIT_TEST_Q4NX`.
 
 `tools/mtp_depth_pool.py` pools those tickets. It refuses a pool it cannot read (a repeated tail, a cell scored twice, a
 short read, a mixed budget, a mixed window identity) and, since the tau=0.6 window, it also says when a depth is too

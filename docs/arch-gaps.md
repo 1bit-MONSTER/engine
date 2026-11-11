@@ -1087,3 +1087,28 @@ the single undocumented entry out of 37.
   MLA-style geometry (`kv_lora_rank` 512, `q_lora_rank` 1536, `qk_rope_head_dim` 64, `v_head_dim` 128, 32 heads /
   16 KV, IM 4096). **Not an alias of `deepseek_v41`**: nothing at the pin decodes AW-SECD weights, so mapping it to
   that architecture would name a backend that cannot read the file. Reported, not alerted (`"watch": "report"`).
+
+## `opensci` — OpenSci 1.7B ("nemotron-hq" recipe)
+
+* **Class / model_type**: `OpensciForCausalLM` / `opensci`; example
+  `open-sci/open-sci-ref-v0.01-1.7b-nemotron-hq-300B-4096` (one of an `open-sci/*` family of
+  0.13B/0.4B/1.3B/1.7B reference runs over different corpora).
+* **Shape**: **24 layers, H=2048, 32 heads / 32 KV heads (head_dim 64), IM 8192, vocab 50304,
+  max_position_embeddings 4096**, `tie_word_embeddings`, `qk_layernorm: true`, `rope_theta`
+  10000. Read from the model's own `config.json` on 2026-11-11, not inferred from the name.
+* **Why it is not mapped**: the config carries an `auto_map` —
+
+  ```
+  AutoConfig         -> configuration_opensci.OpensciConfig
+  AutoModelForCausalLM -> modeling_opensci.OpensciForCausalLM
+  ```
+
+  — i.e. the repo **ships its own modelling code**. A pinned backend cannot accept the
+  architecture without vendoring or upstreaming that code, so this is a port project, not an
+  alias of a supported family, and mapping it would name a backend that cannot read the weights.
+  Reviewed and deliberately not mapped (`"watch": "report"`, `registry/significant.json`).
+* **The census carries a second spelling**, `OpenSciForCausalLM` (7 models, against 121 for this
+  one). It is a different class string from a different uploader and **was not reviewed here**;
+  `tools/census_watch.py` matches architecture classes exactly by design (*"architectures.json is
+  keyed by the HF architecture class, which is the key"*), so it needs its own review with the
+  repo list from a census run — a case-fold would hide a real converter mismatch, not fix one.

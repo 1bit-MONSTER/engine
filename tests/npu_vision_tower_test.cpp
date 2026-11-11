@@ -203,6 +203,25 @@ void test_fixture(const std::string& cfg) {
         check(d < 2e-5, "fixture: every output value is the reference's within 2e-5");
         check(std::fabs(sum - kGoldenTowerSum) < 2e-3, "fixture: the tower before the merger sums to the reference's");
 
+        // Threads change the time and nothing else: forced onto 2, 5 and 16 threads with no size threshold (so even
+        // this small tower is split), every output and every tower value is the same BITS as on one thread.
+        {
+            vis::tower_threading(1);
+            std::vector<float> t1;
+            const std::vector<float> o1 = vis::tower_forward(p, px.data(), GH, GW, &t1);
+            bool same = o1 == out;
+            for (int nt : {2, 5, 16}) {
+                vis::tower_threading(nt, 0.0);
+                std::vector<float> tn;
+                const std::vector<float> on = vis::tower_forward(p, px.data(), GH, GW, &tn);
+                same = same && on.size() == o1.size() && tn.size() == t1.size() &&
+                       std::memcmp(on.data(), o1.data(), o1.size() * sizeof(float)) == 0 &&
+                       std::memcmp(tn.data(), t1.data(), t1.size() * sizeof(float)) == 0;
+            }
+            vis::tower_threading(0);
+            check(same, "fixture: 1, 2, 5 and 16 threads give bit-identical rows");
+        }
+
         // grids the two 2 x 2 merges cannot take
         for (const auto& [gh, gw] : std::vector<std::pair<int, int>>{{4, 6}, {2, 8}, {0, 8}, {4, -4}}) {
             std::string why;

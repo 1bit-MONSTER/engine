@@ -102,5 +102,39 @@ other=$(g rev-parse HEAD)
 expect "the same subject and author at another author date is foreign" "$(run "$other" "$pin" | head -n1)" \
   "foreign $(g rev-parse --short "$other") hrx: something new"
 
+# ---- the mirror hold (config/llama-mirror-hold.config): what a named commit means for a run -------------------
+holdf=$work/hold.config
+hold() { LLAMA_HOLD_FILE=$holdf bash "$script" llama-hold "$repo" "$1" "$2"; }
+# a pin that descends from the mirror: build one
+g checkout -q --detach "$mirror"
+commit "$amd" "$amd_mail" 2026-11-10T00:00:00Z 2026-11-10T00:00:00Z "hrx: one more on the old line"
+desc=$(g rev-parse HEAD)
+
+rm -f "$holdf"
+expect "no hold file: the sync runs as usual" "$(hold "$mirror" "$pin")" "none"
+printf '# a comment\n#   %s\n' "$mirror" > "$holdf"
+expect "a commit that is only mentioned in a comment holds nothing" "$(hold "$mirror" "$pin")" "none"
+printf '# held\n%s\n' "$mirror" > "$holdf"
+expect "the mirror is the held commit and AMD's pin is on a rewritten line: held" "$(hold "$mirror" "$pin")" "held"
+expect "the mirror has moved away from the held commit: the file is stale" "$(hold "$ours" "$pin")" "stale"
+expect "AMD's pin contains the held commit again: the hold is not needed" "$(hold "$mirror" "$desc")" "unneeded"
+expect "the pin IS the held commit: not needed either" "$(hold "$mirror" "$mirror")" "unneeded"
+printf 'not-a-sha\n%s extra words\n' "$mirror" > "$holdf"
+expect "the commit line may carry a trailing note; a line that is not a commit is ignored" "$(hold "$mirror" "$pin")" "held"
+printf '%s\n' "${mirror:0:12}" > "$holdf"
+expect "a short hash is not a hold: forty hex digits or nothing" "$(hold "$mirror" "$pin")" "none"
+
+# The file shipped in the tree: whatever it names must be one full commit hash or nothing, and what it means for a
+# run is decided by the same function as above (a hold on a commit the mirror has left is stale, and so on).
+shipped=$(cd "$(dirname "$script")/.." && pwd)/config/llama-mirror-hold.config
+if [ -f "$shipped" ]; then
+  n=$(grep -v '^[[:space:]]*#' "$shipped" | grep -cE '^[0-9a-f]{40}' || true)
+  if [ "$n" -le 1 ]; then ok "the shipped hold file names at most one commit"; else fail "the shipped hold file names at most one commit (found $n)"; fi
+  junk=$(grep -v '^[[:space:]]*#' "$shipped" | grep -v '^[[:space:]]*$' | grep -vcE '^[0-9a-f]{40}([[:space:]].*)?$' || true)
+  expect "every line of the shipped hold file is a comment, blank, or a full commit hash" "$junk" "0"
+else
+  fail "config/llama-mirror-hold.config is in the tree"
+fi
+
 if [ "$fails" -ne 0 ]; then echo "$fails check(s) failed"; exit 1; fi
 echo "bump_hrx_sync: ok"

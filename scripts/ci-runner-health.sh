@@ -29,9 +29,14 @@
 #   scripts/ci-runner-health.sh                 # every actions.runner.* unit
 #   scripts/ci-runner-health.sh <unit> [...]    # named units, e.g. for a specific runner
 #   scripts/ci-runner-health.sh --self-test     # the verdict logic, with systemctl stubbed
+#   scripts/ci-runner-health.sh --runs          # the RUN-CONCLUSION mix: a cancelled check is neither
 #
-# Exit: 0 when every runner is active/running with no failure result; 1 when any is not; 2 when there is nothing to inspect
-# (no such units on this host, so a silent pass would be the defect).
+# Exit: 0 when every runner is active/running with a restart policy that survives an OOM kill; 1 when a runner is not
+# accepting jobs NOW; 2 when there is nothing to inspect (no such units on this host, so a silent pass would be the defect);
+# 3 when every runner is accepting jobs but a restart policy would leave one down after the next OOM kill. 1 and 3 are
+# separate because they call for different things (engine#1504, owner 2026-11-11): a dead runner blocks a release, since
+# its checks would queue for ever, while a policy line is a box configuration change the owner applies
+# (docs/ci-runners.md "The two drop-ins"), so scripts/weekly.sh warns on 3 and goes on. The policy lines print as WARN.
 set -uo pipefail
 
 # <restart> <oompolicy> <memorymax> -> one verdict line. The state checks above answer "is it alive", which is what the
@@ -53,6 +58,13 @@ policy_verdict() {
     # an infinite ceiling means the cgroup never hits its own limit, so the box's OOM killer chooses - and the bench runner
     # is the unit whose jobs are memory-heavy by definition.
     [ -n "${_mmax:-}" ] && [ "$_mmax" != infinity ] || _bad="$_bad MemoryMax=${_mmax:-?}(want a ceiling);"
+    case "$_bad" in
+        "") ;;
+        *Restart=*|*OOMPolicy=*) ;;
+        # Restart and OOMPolicy are right and only the ceiling is missing: the unit does come back, so do not say it will not.
+        *) printf 'FAIL the runner would come back after an OOM kill, but its cgroup has no ceiling:%s the box-wide OOM killer picks the victim, not the limit of this unit' "$_bad"
+           return 0 ;;
+    esac
     if [ -n "$_bad" ]; then
         printf 'FAIL the restart policy cannot restart this runner after an OOM kill:%s one OOM kill and the unit stops for good, while jobs read as pending' "$_bad"
         return 0
@@ -83,6 +95,33 @@ runner_verdict() {
     esac
 }
 
+# engine#2077: a `cancelled` run is a THIRD state, and it is the one a merge gate silently reads as neither
+# green nor a verdict about the diff. Measured on 2026-11-11: `gh run list --workflow=pr-agent.yml --event
+# pull_request --limit 40` was 23 cancelled / 17 success, because `concurrency.cancel-in-progress: true` cancels a
+# minutes-long review whenever the next push arrives. So the count is a health number like any other: this
+# summarises a `conclusion` per line and fails when the cancelled share is too large to call the workflow healthy.
+#
+# The threshold is a knob, not a law: `--max-cancelled-pct` (default 25) is where a workflow stops being a signal
+# about the diff. 0 is legal and means "a cancelled run is already too many".
+runs_summary() {  # <max_pct> ; conclusions on stdin, one per line
+    awk -v maxpct="${1:-25}" '
+        { n++; c[$0]++ }
+        END {
+            if (n == 0) { print "FAIL no runs read - an empty list is not a pass"; exit 2 }
+            out = ""
+            for (k in c) out = out sprintf("%s=%d ", k, c[k])
+            canc = ("cancelled" in c) ? c["cancelled"] : 0
+            pct = 100.0 * canc / n
+            # verdict first: a caller (and the self-test) reads the conclusion from line 1, and the counts follow
+            if (pct > maxpct)
+                printf "FAIL %d of %d runs cancelled (%.0f%%, over %d%%) - a cancelled check is neither green nor a verdict about the diff; that is a throughput or concurrency defect, not a judgement\n", canc, n, pct, maxpct
+            else
+                printf "PASS %d of %d runs cancelled (%.0f%%, within %d%%)\n", canc, n, pct, maxpct
+            printf "%s\n", out
+            exit (pct > maxpct) ? 1 : 0
+        }'
+}
+
 self_test() {
     rc=0
     chk() {  # <want prefix> <got>
@@ -109,11 +148,58 @@ self_test() {
     chk FAIL "$(policy_verdict always stop 51539607552)"    # an OOM kill of a JOB stops the RUNNER
     chk FAIL "$(policy_verdict always continue infinity)"   # no cgroup ceiling: the box's OOM killer chooses
     chk FAIL "$(policy_verdict '' '' '')"                   # nothing readable is not a pass
-    [ "$rc" = 0 ] && echo "ci-runner-health self-test: ok (15 cases)" || echo "ci-runner-health self-test: FAIL"
+    # a missing ceiling alone must not be reported as "the unit stops for good" (the live strixhalo-engine unit, 2026-11-11)
+    case "$(policy_verdict always continue infinity)" in
+        *'would come back'*) printf 'ok   a missing ceiling alone says the runner comes back\n' ;;
+        *) printf 'FAIL a missing ceiling alone should not say the unit stops for good\n'; rc=1 ;;
+    esac
+    # engine#2077: the run-conclusion arms. A cancelled run must never read as a pass, and an empty list must not
+    # either - the same rule as the unit arms above (nothing readable is not a pass).
+    chkP() { case "$2" in "$1"*) printf 'ok   %s\n' "$(printf '%s' "$2" | cut -c1-78)" ;;
+                           *) printf 'FAIL want %s, got: %s\n' "$1" "$2"; rc=1 ;; esac; }
+    chkP PASS "$(printf 'success\nsuccess\nsuccess\nsuccess\ncancelled\n' | runs_summary 25)"
+    chkP FAIL "$(printf 'cancelled\ncancelled\ncancelled\nsuccess\n' | runs_summary 25)"
+    chkP FAIL "$(printf 'cancelled\n' | runs_summary 25)"                 # 100% cancelled: the #2077 shape
+    chkP FAIL "$(printf '' | runs_summary 25)"                             # no runs read is not a pass
+    chkP PASS "$(printf 'cancelled\nsuccess\nsuccess\nsuccess\nsuccess\n' | runs_summary 25)"
+    chkP FAIL "$(printf 'cancelled\nsuccess\nsuccess\nsuccess\nsuccess\n' | runs_summary 0)"
+    [ "$rc" = 0 ] && echo "ci-runner-health self-test: ok (22 cases)" || echo "ci-runner-health self-test: FAIL"
     return $rc
 }
 
 [ "${1:-}" = --self-test ] && { self_test; exit $?; }
+
+# engine#2077: `--runs [--workflow NAME] [--event EVENT] [--limit N] [--max-cancelled-pct P]` reads run conclusions, not units.
+# Read-only: `gh run list` and nothing else. Exit 2 when there is nothing readable, so a lane that cannot reach the
+# API cannot report a silent pass (the same rule as the unit path below).
+if [ "${1:-}" = --runs ]; then
+    shift
+    wf=; lim=40; maxpct=25; ev=
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --workflow) wf="${2:-}"; shift 2 ;;
+            --workflow=*) wf="${1#*=}"; shift ;;
+            --limit) lim="${2:-40}"; shift 2 ;;
+            --limit=*) lim="${1#*=}"; shift ;;
+            --max-cancelled-pct) maxpct="${2:-25}"; shift 2 ;;
+            --max-cancelled-pct=*) maxpct="${1#*=}"; shift ;;
+            # engine#2077: the EVENT filter changes the denominator. Without it `skipped` runs from non-PR events
+            # dilute the cancelled share (measured: 10/40 with all events, 23/40 on pull_request), so a caller
+            # comparing two numbers must say which population it counted.
+            --event) ev="${2:-}"; shift 2 ;;
+            --event=*) ev="${1#*=}"; shift ;;
+            *) echo "usage: $0 --runs [--workflow NAME] [--event EVENT] [--limit N] [--max-cancelled-pct P]" >&2; exit 2 ;;
+        esac
+    done
+    if ! command -v gh >/dev/null; then echo "FAIL no gh on PATH - cannot read run conclusions"; exit 2; fi
+    args=(run list --limit "$lim" --json conclusion,workflowName,event)
+    [ -n "$wf" ] && args+=(--workflow "$wf")
+    [ -n "$ev" ] && args+=(--event "$ev")
+    json=$(gh "${args[@]}" 2>/dev/null) || { echo "FAIL gh run list failed - cannot read run conclusions"; exit 2; }
+    printf '%s' "$json" | python3 -c 'import json,sys;[print(r.get("conclusion") or "running") for r in json.load(sys.stdin)]' 2>/dev/null \
+        | runs_summary "$maxpct"
+    exit $?
+fi
 
 SC=${SYSTEMCTL:-systemctl}
 units=("$@")
@@ -125,7 +211,7 @@ if [ ${#units[@]} -eq 0 ]; then
     exit 2
 fi
 
-rc=0
+rc=0 policy=0
 for u in "${units[@]}"; do
     line=$("$SC" show "$u" -p ActiveState -p SubState -p Result -p NRestarts -p Restart -p OOMPolicy -p MemoryMax 2>/dev/null)
     st=$(printf '%s\n' "$line" | sed -n 's/^ActiveState=//p')
@@ -144,7 +230,9 @@ for u in "${units[@]}"; do
     p=$(policy_verdict "$rst" "$oom" "$mmax")
     case "$p" in
         PASS*) printf 'PASS %-52s %s\n' "" "${p#PASS }" ;;
-        *)     printf 'FAIL %-52s %s\n' "" "${p#FAIL }"; rc=1 ;;
+        *)     printf 'WARN %-52s %s\n' "" "${p#FAIL }"; policy=1 ;;
     esac
 done
+# a runner that is down outranks a policy line: 1 if any unit is not accepting jobs, else 3 if only a policy is short.
+[ "$rc" = 0 ] && [ "$policy" = 1 ] && rc=3
 exit "$rc"

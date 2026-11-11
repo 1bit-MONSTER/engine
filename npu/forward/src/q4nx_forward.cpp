@@ -25,7 +25,9 @@
 // element-wise.
 #include "q4nx_forward.h"
 #include "batch_width.h"
+#include "ffn_cache_policy.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
+#include "file_create.h"         // dumps are created 0600, never through a symlink
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
 #include <fcntl.h>
@@ -438,6 +440,7 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
     if (!want_m16) {
         fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n", 0,
                 Q4NX_DESIGN_M_DECODE, ndesigns_, Q4NX_DESIGN_M_PREFILL, " (NPU_DECODE_M16=0: disabled)");
+        decode_disabled_ = true;   // engine#2102: turned off on purpose, which the ready line must not call missing
         return true;
     }
     q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
@@ -590,6 +593,7 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
                 designs16_[i].N, elf.c_str());
     }
     xd_->note_m16_made(made > 0);
+    decode_roles_ = made;   // engine#2102: the caller-facing count, beside the byte-for-byte log line below
     if (pb16i_ && made < ndesigns_ - 0) {
         fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
                 t2s_ ? "t2s" : "pb16i", made, ndesigns_);
@@ -847,6 +851,15 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // The plan is the runtime's copy of the sealed-ELF decision; when it names one it wins, so a plan
     // and a container cannot disagree about which file the decode roles run.
     if (plan_.loaded() && !plan_.sealed_elf.empty()) pb16i_sealed_ = plan_.sealed_elf;
+    // The plan is the pack's description when there is one, so its wide family wins over config.json's keys.
+    if (plan_.loaded() && !plan_.sealed_wide_elf.empty()) {
+        wide_sealed_ = plan_.sealed_wide_elf;
+        wide_sealed_rows_ = plan_.sealed_wide_rows;
+    }
+    if (plan_.loaded() && !plan_.sealed_narrow_elf.empty()) {
+        narrow_sealed_ = plan_.sealed_narrow_elf;
+        narrow_sealed_rows_ = plan_.sealed_narrow_rows;
+    }
     // Hand the layout family to the launch layer now that the plan (or the probes) has settled it.
     xd_->set_pb16i(pb16i_, pb16i_dir_, pb16i_sealed_);
     xd_->set_hadamard_block(had_block);
@@ -1812,15 +1825,11 @@ void Q4nxNpuForward::layer_attn_dims(int l, int& hd, int& nkv) const {
 // it -- a GDN model (lin_kd_ > 0, the one case step()'s `dense_weights_cached`
 // can never cover, since that guard stops at lin_kd_ == 0), packed weights
 // actually being cached, and a dense tail big enough for the per-token reload to
-// be material.  Qwen3.8-27B-NPU2 (IM 17408 x H 5120) clears it with 1.07 GB per
-// layer, and measured 117.4 -> 104.5 s wall and 63.3 -> 22.9 s CPU per token on
-// an 8-token request with identical text (~/lb/587-cache-20261030).
-// The floor is a size guard, not a second measurement: below it the reload is
-// small enough that the behaviour change is not worth taking unasked.
+// be material.  The size rule and the two measurements it rests on (Qwen3.8-27B
+// and, since engine#1785, Qwen3.5-2B) are in ffn_cache_policy.h.
 bool Q4nxNpuForward::ffn_cache_default() const {
     if (host_gemm_ || !xd_->weight_cache_on() || lin_kd_ <= 0) return false;
-    const double tail_bytes = 3.0 * (double)c_.IM * (double)c_.H * 4.0;   // wg_+wu_+wd_
-    return tail_bytes >= 256.0 * 1024.0 * 1024.0;
+    return onebit::npu::ffn_cache_worth_it(c_.IM, c_.H);
 }
 // ---- layer-loop host attribution ------------------------------------------
 // The `host=` residual of the [ph] line is layer time that is NOT any of the
@@ -3276,7 +3285,7 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         static int n = 0;
         char path[4096];
         std::snprintf(path, sizeof path, "%s/arm_L%d_N%d_K%d_%03d.bin", gdir, cur_layer_, N, K, n++);
-        if (std::FILE* f = std::fopen(path, "wb")) {
+        if (std::FILE* f = onebit_fopen_private_wb(path)) {
             std::fwrite(t.d.data(), sizeof(float), std::min<size_t>((size_t)N, t.d.size()), f);
             std::fclose(f);
         }

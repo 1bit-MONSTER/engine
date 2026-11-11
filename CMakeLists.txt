@@ -200,6 +200,12 @@ add_test(NAME serve_hangup COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_hangup_test.s
 # engine#1945: scripts/bump-hrx-sync.sh tells AMD's own commit from a line AMD rebased apart from a commit that
 # is not AMD's. Local git repositories only: no network, no GPU.
 add_test(NAME bump_hrx_sync COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_sync_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-sync.sh)
+# engine#2102: the sentence a serve owes an operator when no 16-row decode kernel was found (app/npu_decode_note.h). Pure:
+# the silent cases are the ones that matter, and they are arms.
+add_executable(npu_decode_note_test tests/npu_decode_note_test.cpp)
+target_include_directories(npu_decode_note_test PRIVATE app)
+add_test(NAME npu_decode_note COMMAND npu_decode_note_test)
+add_dependencies(onebit npu_decode_note_test)
 # engine#2106: a shipped kernel set's own consistency -- manifest vs bytes, one form or none, name vs directory. The
 # refusal this pre-empts ("differ in size") needed private-repo archaeology to diagnose; the symptom is checkable here.
 add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set_check_test.sh)
@@ -309,6 +315,11 @@ add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_or
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
 add_python_test(ci_targets ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#803 gate, second half: the comparator that turns two --dump-logits directories into the KLD verdict the
+# P4 gate asks for. No device and no model, so the gate is one command when a ticket is free; the self-test pins
+# the four cases a KLD implementation gets wrong (identical -> exactly 0, a shift is positive and directional, a
+# uniform shift stays 0, and an asymmetric file set is refused by name).
+add_python_test(logits_kld_self ${CMAKE_SOURCE_DIR}/tools/logits_kld.py --self-test)
 # engine#2018: this one was in tools/ci/unreferenced_py_tests.txt as a baseline entry, and it should not have been: the
 # file is portable and passes (worst-case |sum| 11.18e6 inside int32 at K=11008, 4 arms), it just never had a runner. A
 # baseline records a test as never-run, which for a passing test is the wrong outcome -- so it is registered and the line
@@ -326,6 +337,13 @@ add_python_test(tests_referenced_self ${CMAKE_SOURCE_DIR}/tools/ci/tests_referen
 # Registered through add_python_test (engine#1864), so they run THROUGH the interpreter: my first version used the raw
 # `${Python3_EXECUTABLE}` form above the find_package and the repository's own ordering guard caught it by name --
 # tools/mtp_head_ref.py is the one of the five without an exec bit, and it became BAD_COMMAND under ctest.
+# engine#1962: the narrowing-body enumeration, as a ratchet. The corpus is a submodule, so the check
+# skips (rc 77) where third_party/llama.cpp is not checked out; the baseline file is in the engine tree,
+# so the recorded set is reviewable everywhere.
+add_python_test(tool_selftest_hrx_f16_narrowing ${CMAKE_SOURCE_DIR}/tools/ci/hrx_f16_narrowing.py --self-test)
+add_test(NAME hrx_f16_narrowing_check COMMAND ${Python3_EXECUTABLE}
+         ${CMAKE_SOURCE_DIR}/tools/ci/hrx_f16_narrowing.py --check --root ${CMAKE_SOURCE_DIR})
+set_tests_properties(hrx_f16_narrowing_check PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
 add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_agree.py --selftest)
 add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
@@ -361,7 +379,19 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # two false conclusions about a pack in one night. `--self-test` drives the rule on a synthetic shard (no network):
 # the same offset from the data section returns the tensor, from byte 8 it does not.
 add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-test)
+# engine#1946: a test that returns 77 is green, and green-because-it-did-not-run is the failure this fleet keeps paying
+# for. `tools/ci/ctest_skips.py` reads a ctest log and reports every test that did not execute -- `***Skipped` (77) against
+# `tools/ci/ctest_skips.txt`, and `(Not Run)` (a missing binary) as a build-list mistake that can never be baselined.
+# Self-test only here: wiring it into ci.yml's Test step needs the log plus a `workflow`-scoped token (engine#1817).
+add_python_test(ctest_skips_self ${CMAKE_SOURCE_DIR}/tools/ci/ctest_skips.py --self-test)
+# engine#2106 / #2102: the release gate's NPU serve check asserts the fast route, a decode floor, the first token and a
+# non-empty answer, because a serve on the slow per-op route still answers. --self-test drives the judging on the shape
+# of each failure (the silent fallback at 1.9 tok/s, thinking left on, a degenerate reply); no device, no binary.
+add_python_test(npu_serve_smoke_self ${CMAKE_SOURCE_DIR}/tools/npu_serve_smoke.py --self-test)
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
+# engine#1313 item 3: the "after" of "before/after routing accuracy" -- a ridge head over --dump-encoder output, with the
+# table's own logits as the before arm. Self-test only, so it needs no dump and no model.
+add_python_test(laya_head_finetune ${CMAKE_SOURCE_DIR}/tools/laya_head_finetune.py --self-test)
 # engine#856: one HRX process's GTT split into the loader's copy and HRX's packed second copy, from its own -v log.
 add_python_test(hrx_gtt_split_self ${CMAKE_SOURCE_DIR}/tools/hrx_gtt_split.py --self-test)
 # engine#679: time per HRX dispatch from the backend's serial trace (the id hash and the per-kernel sums).
@@ -376,7 +406,18 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # resolves outside the payload, and a runtime set shipped without the aqlprofile agent libhsa opens. Each
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
+# engine#2106: the hardware gate's `npuserve` phase, end to end against the stand-in serve tools/npu_serve_smoke.py
+# writes: a fast-route serve passes the gate, a slow-route one fails it while its answers are fine, a dead one fails,
+# and an unconfigured or NPU-less host skips. No device, no 1bit binary, and the fleet's queues are not touched.
+add_test(NAME hw_gate_npuserve COMMAND ${CMAKE_SOURCE_DIR}/tests/hw_gate_npuserve_test.sh)
+# Both start a loopback serve on a port picked by binding port 0 and releasing it, so they take the lock every
+# loopback-server test takes (tests/route_port_lock_test.py): two of them racing for one freed port is a flaky failure.
+set_tests_properties(hw_gate_npuserve npu_serve_smoke_self PROPERTIES RESOURCE_LOCK route_ports)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
+# engine #1504: the release preflight blocks on a runner unit that is down and only warns on a short restart policy.
+# The real scripts/ci-runner-health.sh and weekly.sh's preflight_runner_units() against a stub systemctl; no systemd.
+add_test(NAME weekly_runner_preflight COMMAND ${CMAKE_SOURCE_DIR}/tests/weekly_runner_preflight_test.sh)
+add_test(NAME ci_runner_health_selftest COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/ci-runner-health.sh --self-test)
 # engine #1750: the carried amdxdna series applies in order to the pinned driver, and the context-restart code it
 # produces fails a context's jobs (and logs it) when the restart fails, instead of leaving them parked or running
 # them at close on a half-built firmware context. The driver's own functions in a user-space harness: no NPU, no
@@ -826,6 +867,12 @@ add_executable(laya_eval_test tests/laya_eval_test.cpp)
 target_link_libraries(laya_eval_test PRIVATE onebit_laya nlohmann_json::nlohmann_json)
 add_test(NAME laya_eval COMMAND laya_eval_test)
 add_dependencies(onebit laya_eval_test)
+# engine#1313 item 3: the head-only fine-tune over --dump-encoder dumps, on a synthetic checkpoint and dump (no model,
+# no device). It needs torch + numpy, which the engine build does not, so a box without them skips (77).
+add_python_test(laya_finetune ${CMAKE_SOURCE_DIR}/tests/laya_finetune_test.py)
+if(Python3_Interpreter_FOUND)
+    set_tests_properties(laya_finetune PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 # Crafted Laya checkpoints the reader and the scorer must refuse (written at run time); runs in CI.
 add_executable(laya_bounds_test tests/laya_bounds_test.cpp)
 target_link_libraries(laya_bounds_test PRIVATE onebit_laya nlohmann_json::nlohmann_json)
@@ -897,6 +944,12 @@ if(Python3_Interpreter_FOUND)
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/npu_decl_check.py --check --root ${CMAKE_SOURCE_DIR})
     add_test(NAME npu_decl_check_self
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/npu_decl_check.py --self-test)
+    # engine#2057: no fopen(..., "w"/"a") in the tree without a stated reason -- CodeQL's world-writable class, kept fixed
+    # by a check rather than by the next scan. Source text only: no build, no device.
+    add_test(NAME file_create_check
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/file_create_check.py --check --root ${CMAKE_SOURCE_DIR})
+    add_test(NAME file_create_check_self
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/file_create_check.py --self-test)
     # the new-model watcher's alert contract (offline: synthetic batches against the
     # committed registry, plus FastFlowLM's org listing and releases from the recorded
     # payloads under tests/fixtures/fflm/ — engine #588), so a regression cannot leave the
@@ -1296,10 +1349,25 @@ target_include_directories(npu_pack_test PRIVATE npu/forward/include ${CMAKE_SOU
 # NPU_INFER_DUMP_OPS (npu/forward/include/ops-dump.h, engine#1503): the on/off rule, the mean|x|/absmax arithmetic and
 # the line's text. Header-only, no device. `add_dependencies(onebit ...)` is what gets it built in CI, whose target
 # list is explicit (tools/ci/ci_targets_check.py).
+# npu/forward/include/file_create.h (engine#2057): the openers every dump and the head-image cache write through -- 0600 /
+# at most 0644 whatever the umask, an existing 0666 file narrowed, a symlink refused with ELOOP. Plain C, no model, no
+# device; the call sites only swapped fopen() for an opener, so without this arm a revert to fopen() passes every test.
+if(NOT WIN32)
+    add_executable(file_create_test tests/file_create_test.c)
+    target_include_directories(file_create_test PRIVATE npu/forward/include)
+    add_test(NAME file_create COMMAND file_create_test)
+    add_dependencies(onebit file_create_test)
+endif()
 add_executable(ops_dump_test tests/ops_dump_test.cpp)
 target_include_directories(ops_dump_test PRIVATE npu/forward/include)
 add_test(NAME ops_dump COMMAND ops_dump_test)
 add_dependencies(onebit ops_dump_test)
+# When the dense-tail cache is on by default (npu/forward/include/ffn_cache_policy.h): the size rule and the two
+# models it was measured on, one on each side of the old floor. Header-only, no device.
+add_executable(ffn_cache_policy_test tests/ffn_cache_policy_test.cpp)
+target_include_directories(ffn_cache_policy_test PRIVATE npu/forward/include)
+add_test(NAME ffn_cache_policy COMMAND ffn_cache_policy_test)
+add_dependencies(onebit ffn_cache_policy_test)
 
 # The device weight layout contract (q4nx_weight_layout): pure index math, no device
 # and no runtime.  CI builds an explicit target list, so the check compiles itself with
@@ -1731,6 +1799,12 @@ if(ONEBIT_NPU)
     target_include_directories(hybrid_prompt_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
         ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)
     target_link_libraries(hybrid_prompt_probe PRIVATE onebit_npu_forward onebit_npu_rt)
+    # engine#1788: one picture and one question through a MiniCPM-V 4.7 pack with every step the engine's own
+    # (plan, resize, host tower, prompt tokens, canvas positions, then step_batch_embeds on the text model).
+    add_executable(minicpm_image_probe npu/forward/minicpm_image_probe.cpp)
+    target_include_directories(minicpm_image_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
+        ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)
+    target_link_libraries(minicpm_image_probe PRIVATE onebit_npu onebit_npu_forward onebit_npu_rt)
     add_executable(mrope_planes_probe npu/forward/mrope_planes_probe.cpp)
     target_include_directories(mrope_planes_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
         ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)

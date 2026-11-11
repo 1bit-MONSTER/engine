@@ -239,12 +239,13 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 // template that serializes its input (a tools block through `tojson`) renders the
                 // request's key order into the prompt, so it has to be the caller's order, not ours.
                 const nlohmann::ordered_json ordered = nlohmann::ordered_json::parse(req.body);
-                nlohmann::ordered_json extra = nlohmann::ordered_json::object();
-                if (ordered.contains("chat_template_kwargs") && ordered["chat_template_kwargs"].is_object())
-                    extra = ordered["chat_template_kwargs"];
-                extra["enable_thinking"] = npu::thinking_from_body(body);
-                prompt = npu::render_chat_template(e.tmpl, ordered.at("messages"), /*add_generation_prompt=*/true,
-                                                   extra, e.bos_text, e.eos_text);
+                // The functions the request offers go the same way (npu::request_template_vars): the
+                // template is where a model learns what it may call.
+                const nlohmann::ordered_json extra = npu::request_template_vars(ordered, npu::thinking_from_body(body));
+                // An earlier call's arguments arrive as a JSON string; the template is written against the
+                // object (npu::messages_for_template).
+                prompt = npu::render_chat_template(e.tmpl, npu::messages_for_template(ordered.at("messages")),
+                                                   /*add_generation_prompt=*/true, extra, e.bos_text, e.eos_text);
                 if (e.prefix_pin) {
                     // A template that cannot render the probe is no reason to refuse the request: it only means
                     // there is no early pin, and the log says so.

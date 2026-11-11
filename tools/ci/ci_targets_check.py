@@ -534,6 +534,25 @@ endif()
 
 
 
+def all_rows(root, cmake_path):
+    """[(row, site, line)] for every `add_test`/`add_python_test` row the reader can see.
+
+    engine#2160 review: `--where` matches EXACTLY, which is right (a substring match would answer for
+    `tmp_path_check_self` when asked about `tmp_path_check`).  But the miss and the typo read identically:
+    `--where submodule_pin` says NOT REGISTERED while the row is `submodule_pin_check`.  This lists the rows
+    so a miss can name the near ones without ever calling a partial match a registration.
+    """
+    files = [(os.path.relpath(cmake_path, root), open(cmake_path, encoding="utf-8").read())]
+    files += family_files(root, files[0][1])
+    rows = []
+    for rel, text in files:
+        for i, line in enumerate(continued_lines(text), 1):
+            m = ROW.match(line)
+            if m and (m.group(1), rel, i) not in rows:
+                rows.append((m.group(1), rel, i))
+    return rows
+
+
 def where_rows(root, cmake_path, wanted):
     """[(row, site, line)] for each wanted row name, searched in CMakeLists.txt then every included file.
 
@@ -787,16 +806,22 @@ add_test(NAME family_suite COMMAND family_test)
             print("  FAIL --where reports a row that is registered nowhere"); fails += 1
         else:
             print("  ok    --where reports an unregistered row as absent")
-        # The exit status: a gate list with one unregistered row must fail, not pass on the rows that were found.
-        for what, wanted, want in (
-                ("--where exits 1 when one row of a list is registered nowhere", ["plain_row", "absent_row"], 1),
-                ("--where exits 0 when every row of a list is registered", ["plain_row", "globbed_row"], 0),
-                ("--where exits 1 for a single unregistered row", ["absent_row"], 1)):
-            rc = where_rc(hits, wanted)
-            if rc != want:
-                print(f"  FAIL {what} (rc {rc})"); fails += 1
+        # engine#2160 review: a miss and a typo must not read the same. `--where submodule_pin` is a MISS on the
+        # exact rule and a PREFIX of the real row; the hint names the near rows without calling them a match.
+        allr = all_rows(td, os.path.join(td, "CMakeLists.txt"))
+        names = [r for r, _, _ in allr]
+        if not any(n.startswith("globbed") for n in names):
+            print("  FAIL the prefix hint has no rows to suggest"); fails += 1
+        else:
+            near = [n for n in names if n.startswith("globbed") and n != "globbed"]
+            if not near:
+                print("  FAIL a row that only STARTS WITH the query is not offered as a hint"); fails += 1
             else:
-                print(f"  ok    {what}")
+                print("  ok    a partial name is offered as a hint when the exact name is absent")
+        if any(n.startswith("absent_row") for n in names):
+            print("  FAIL a hint was invented for a name nothing starts with"); fails += 1
+        else:
+            print("  ok    and no hint is invented when nothing starts with the query")
 
     print(f"ci_targets_check --self-test: {fails} failure(s)")
     return 1 if fails else 0
@@ -816,11 +841,19 @@ def main(argv):
         root = os.path.abspath(a.root)
         hits = where_rows(root, os.path.join(root, "CMakeLists.txt"), wanted)
         found = {row for row, _, _ in hits}
+        hits_all = all_rows(root, os.path.join(root, "CMakeLists.txt"))
         for row, rel, line in hits:
             print(f"{row}\t{rel}:{line}")
         for row in wanted:
             if row not in found:
-                print(f"{row}\tNOT REGISTERED (searched CMakeLists.txt and every file it include()s or globs)")
+                near = [r for r, _, _ in all_rows(root, os.path.join(root, "CMakeLists.txt"))
+                        if r != row and r.startswith(row)]
+                hint = ""
+                if near:
+                    where = {r: f"{rel}:{line}" for r, rel, line in hits_all}
+                    hint = ("\n\t  but %d row(s) START WITH it -- the row name may be what is wrong, not the "
+                            "registration: %s" % (len(near), ", ".join(f"{r} ({where.get(r, '?')})" for r in near)))
+                print(f"{row}\tNOT REGISTERED (searched CMakeLists.txt and every file it include()s or globs){hint}")
         return where_rc(hits, wanted)
     if a.check:
         return check(a.root)

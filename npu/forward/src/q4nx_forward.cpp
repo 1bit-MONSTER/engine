@@ -27,6 +27,7 @@
 #include "batch_width.h"
 #include "ffn_cache_policy.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
+#include "file_create.h"         // dumps are created 0600, never through a symlink
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
 #include <fcntl.h>
@@ -443,6 +444,7 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
     if (!want_m16) {
         fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n", 0,
                 Q4NX_DESIGN_M_DECODE, ndesigns_, Q4NX_DESIGN_M_PREFILL, " (NPU_DECODE_M16=0: disabled)");
+        decode_disabled_ = true;   // engine#2102: turned off on purpose, which the ready line must not call missing
         return true;
     }
     q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
@@ -595,6 +597,7 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
                 designs16_[i].N, elf.c_str());
     }
     xd_->note_m16_made(made > 0);
+    decode_roles_ = made;   // engine#2102: the caller-facing count, beside the byte-for-byte log line below
     if (pb16i_ && made < ndesigns_ - 0) {
         fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
                 t2s_ ? "t2s" : "pb16i", made, ndesigns_);
@@ -3297,7 +3300,7 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         static int n = 0;
         char path[4096];
         std::snprintf(path, sizeof path, "%s/arm_L%d_N%d_K%d_%03d.bin", gdir, cur_layer_, N, K, n++);
-        if (std::FILE* f = std::fopen(path, "wb")) {
+        if (std::FILE* f = onebit_fopen_private_wb(path)) {
             std::fwrite(t.d.data(), sizeof(float), std::min<size_t>((size_t)N, t.d.size()), f);
             std::fclose(f);
         }

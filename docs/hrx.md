@@ -102,12 +102,13 @@ fails a pin that leaves a gate model's node off HRX.
   nothing to do but fail, every day, until somebody does the merge by hand. While
   [`config/llama-mirror-hold.config`](../config/llama-mirror-hold.config) names the mirror's commit, the run
   instead reports the hold in its summary (`mirror 1bit/hrx-vulkan HELD at …; AMD's pin is …, on a line that
-  does not contain it`), moves nothing and succeeds; the engine's pin still follows our own line. The hold
+  does not contain it`), moves nothing and succeeds. The engine's pin does not move in a held run either: moving
+  it along our own line is a reviewed PR of its own. The hold
   describes one state and fails the run when that state ends, so it cannot be forgotten: **stale** when the
   mirror is no longer the named commit, **unneeded** when AMD's pin contains the named commit again (an ordinary
   sync would work). `scripts/bump-hrx-sync.sh llama-hold <repo> <mirror> <pin>` prints the decision alone
-  (`none`, `held`, `stale`, `unneeded`). The file ships naming no commit, so it holds nothing; naming one is
-  the owner's decision. It was added for AMD's 2026-11-09 rebase (engine#1945): taking that pin is a merge of
+  (`none`, `held`, `stale`, `unneeded`). **Held since 2026-11-11** for the release (engine#1945): the file names
+  the mirror's commit `44ee5710d19f`, and the merge of AMD's rebased line is post-release work. It was added for AMD's 2026-11-09 rebase (engine#1945): taking that pin is a merge of
   149 conflicted files (538 hunks) into `1bit/hrx-vulkan-patched`, measured against the last AMD commit our
   line took.
 - **The hold.** While [`config/hrx-system-hold.config`](../config/hrx-system-hold.config)
@@ -388,6 +389,38 @@ first, cold repetitions 701 to 711 before, 856 to 866 after. At 8,192 tokens 1,5
 layout (8.80 s and 8.85 s) and gives the same text. `test-hrx-fa-transposed-value` compares the path with the CPU
 backend (8 cases). Why 256-token launches are faster than one 512-token launch at long key counts is measured,
 not explained.
+
+### Fixed: a gated-delta-net layer behind a type cast failed the whole graph ([engine#1925](https://github.com/1bit-MONSTER/engine/issues/1925))
+
+On Qwen3.8-Flash-Next, a long prompt failed at the first 512-token batch past 2,048 tokens of context when the
+sparse attention path's mask chain ran on the device:
+
+```
+graph_compute: unsupported HRX node 160: L2_NORM output=f32[128,16,512,1]<-L2_NORM inputs=[f32[128,16,512,1]<-VIEW] consumers=[174:GATED_DELTA_NET]
+```
+
+The fused gated-delta-net dispatch did match that node. The fault was the order in which the graph was walked.
+The scheduler walks a graph in dependency order and takes the matmuls first, which is what puts a layer's gate
+and beta projections ahead of the `L2_NORM` its fused pattern starts from. A type cast is an in-place copy that
+names its own output as an input. The walk counted that as a dependency, so the copy waited for itself, the walk
+stopped there, and every node after it was taken in index order. In index order the `L2_NORM` comes before the
+projections, and the pattern was refused because it would have read a projection that had not run. The sparse
+path's mask chain contains such casts, so the failure needed both a long context and that chain on the device.
+
+The walk no longer counts a node's own output as a dependency (llama.cpp #302). The fused matcher also keeps a
+match when a node of its pattern that only renames storage was already passed.
+
+Measured on gfx1151 (2026-11-11, Flash-Next UD-IQ3_XXS, `-c 19456 -np 1`, one 18,782-token request, a build of
+the fork with only the two changed objects replaced): `unsupported HRX node` 1 before, 0 after; all 390 fused
+gated-delta-net roots accepted; the whole prefill runs. `tests/test-hrx-gdn-passed-alias.cpp` plans the layer
+behind a cast on the host and requires the same dispatches as without it. Qwen3.5-4B, which has the same layer
+type and no sparse path, gives the same tokens on the old and the new library (128 of 128 in three alternated pairs), uses the same 33
+dispatch registrations in the same order, and runs at the same rate (`llama-bench -p 512 -n 64 -r 5`, old, new,
+old, new: decode 57.4, 58.3, 58.1, 58.2 tok/s; prefill 3,516, 3,042, 3,109, 3,213).
+
+Not shown by this: that the answer at 18.8k is the same with the mask chain on the device as with it on the
+CPU. Three of the four long requests in these runs, on the old library and the new, ended in all-NaN logits on
+the first sampled token, which is [engine#1536](https://github.com/1bit-MONSTER/engine/issues/1536).
 
 ### MoE decode and the kernel cache (llama.cpp #32, #33)
 

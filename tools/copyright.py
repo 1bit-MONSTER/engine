@@ -44,12 +44,16 @@ LINE_STYLES = [
       # engine#1820: the other sweep's allow-list, same shape and the same reason -- `#`-comment data, `.txt` has no
       # style, and the header it wants is already at the top of the file.
       "unreferenced_tests.txt",
-      # engine#1946: the ctest skip baseline, the same shape and the same reason -- a '#'-comment data file whose header
-      # is the notice it would otherwise be asked for. (CI caught this on the PR: the tool refuses an unknown style rather
+      # engine#1946: the ctest skip baseline, the same shape and the same reason -- a '#'-comment data file whose
+      # is the notice it would otherwise be asked for. (CI caught this on the PR: the tool refuses an unknown sty
       # than passing it, which is the behaviour worth having.)
       "ctest_skips.txt",
-      # engine#2018: the third test-registration baseline, same shape and the same reason -- data, `.txt` has no style.
+      # engine#2018: the test-registration baseline of `tests/*_test.py`, same shape and the same reason -- data,
       "unreferenced_py_tests.txt",
+            "hrx_f16_narrowing.txt",
+      # engine#2027: the `#`-comment baseline for hardcoded /tmp paths, same shape and the same reason --
+      # data, `.txt` has no style, and the notice it wants is already at the top of the file.
+      "tmp_paths.txt",
       "21serial-console", "90onboard-limits", "Dockerfile", "*.Dockerfile",
       # cycle 17: Puppy's switch that skips its first-run Quick Setup is an empty marker file whose only content
       # is this notice - Puppy tests for its existence, so a comment is free

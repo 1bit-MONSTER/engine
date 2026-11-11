@@ -237,12 +237,27 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         return "data: " + c.dump() + "\n\n";
     };
 
-    auto usage = [](const npu::GenerateResult& r, size_t n_prompt, size_t n_cached) {
+    // engine#2111: a chat reply also says how many completion tokens were reasoning (OpenAI's
+    // completion_tokens_details.reasoning_tokens), so content "" with finish_reason "length" can be told apart from a
+    // model that said nothing: the budget ran out inside the thinking block. Counted over the generated ids (the end
+    // token excluded, as completion_tokens excludes it) with this route's own splitter; 0 when nothing is split.
+    auto usage = [&e, chat, split_reasoning, think_opened](const npu::GenerateResult& r, size_t n_prompt, size_t n_cached) {
         const size_t completion = r.tokens.size() - (r.stopped_at_eos ? 1 : 0);
-        return json{{"prompt_tokens", n_prompt},
-                    {"completion_tokens", completion},
-                    {"total_tokens", n_prompt + completion},
-                    {"prompt_tokens_details", {{"cached_tokens", n_cached}}}};
+        json u{{"prompt_tokens", n_prompt},
+               {"completion_tokens", completion},
+               {"total_tokens", n_prompt + completion},
+               {"prompt_tokens_details", {{"cached_tokens", n_cached}}}};
+        if (chat) {
+            int reasoning = 0;
+            if (split_reasoning) {
+                std::vector<std::string> pieces;
+                pieces.reserve(completion);
+                for (size_t i = 0; i < completion; ++i) pieces.push_back(e.tok->decode(r.tokens[i]));
+                reasoning = think_reasoning_tokens(pieces, think_opened);
+            }
+            u["completion_tokens_details"] = {{"reasoning_tokens", reasoning}};
+        }
+        return u;
     };
     auto timings = [](const npu::GenerateResult& r, const std::string& cache) {
         json t{{"prompt_ms", r.prefill_ms},

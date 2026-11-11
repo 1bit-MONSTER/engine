@@ -1725,7 +1725,9 @@ the device unless `NPU_INFER_HOST_GEMM` is set.
 
 It is a probe, not a route: `forward-serve` does not accept an image, and the tower's half minute to a
 minute per 448 × 448 view on one thread is the host reference's cost. The measured rows are in
-engine#1788.
+engine#1788. On the published packs the text model only loads once the padded-head rule of
+engine#2026 is in: their head is stored 2 and 16 rows past the vocabulary, and without that rule the
+probe stops at `text model: lm_head dequant failed`.
 
 ## Serving
 

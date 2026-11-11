@@ -62,8 +62,16 @@ typedef struct {
      * Source: model_type/architectures == qwen3_5*, resolved against the weights. */
     int rmsnorm_offset_probe;
     /* Per-head RMSNorm applied to q and k before RoPE.
-     * Source: presence of self_attn.q_norm.weight / k_norm.weight. */
+     * Source: config.json's `use_qk_norm` when the config states it (engine#1889: Hunyuan), else the
+     * model_type/architectures table (qwen3*, gemma*). The forward refuses a model whose flag is set and whose
+     * layers carry no self_attn.q_norm.weight, since normalising with an absent gain zeroes q. */
     int qk_norm;
+    /* The q/k RMSNorm runs AFTER RoPE instead of before it (engine#1889). Qwen3 and Gemma normalise, then rotate;
+     * Hunyuan rotates, then normalises. With a per-dimension gain the two orders differ wherever a rotary pair's two
+     * gains differ, so the order is part of the model. Source: model_type/architectures (hunyuan*) -- no config key
+     * states it; the evidence is the pack's own graph, where every layer is
+     * q_proj -> RotaryEmbedding -> q_norm (SimplifiedLayerNormalization) -> GroupQueryAttention. */
+    int qk_norm_after_rope;
     /* RoPE base.  Source: rope_theta. */
     float rope_theta;
     /* Channels actually rotated; 0 means the full head_dim.  Partial rotary
@@ -253,6 +261,16 @@ int q4nx_rmsnorm_offset_from_norm(const float* w, int n);
  * nothing, when qk_norm is already on, when no layer carries both, or on null/empty input. It never turns the norm
  * off: a family the table knows keeps its answer whatever the tensors are. Exported so the rule is testable. */
 int q4nx_semantics_qk_norm_from_tensors(Q4nxSemantics* s, const unsigned char* has_q, const unsigned char* has_k, int layers);
+
+/* engine#1889's refusal, as a rule: with q/k norm on, a layer whose q gain is absent would normalise q to zero, so the
+ * container is refused. That is a statement about layers with SOFTMAX ATTENTION. A layer of another kind carries no
+ * q_norm because it has no q to normalise: ten of LFM2's sixteen layers are gated short convolutions, and 18 of
+ * Qwen3.5-2B's 24 are linear-attention (GDN) layers, layer 0 in both. Applied to every layer the rule refused every
+ * LFM2 pack and every qwen3_5 hybrid at load with "layer 0 has no self_attn.q_norm.weight".
+ * Returns 1 when layer l must be refused. Exported so the rule is testable with no model present. */
+static inline int q4nx_qk_gain_missing(int qk_norm, int layer_has_softmax_attention, int q_gain_present) {
+    return qk_norm && layer_has_softmax_attention && !q_gain_present;
+}
 
 /* attention.mode for one container, from the two places that can state it (engine#796).
 

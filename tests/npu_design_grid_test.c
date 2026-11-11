@@ -905,10 +905,70 @@ static void shortconv_geometry(void) {
     check_int(q4nx_num_designs(&d), nb, "and the count agrees with the table");
 }
 
+/* engine#1999 / #2001 review, closed here: the head path on a geometry that is not a whole 128-column tile grid.
+ * `blocked_fits(128, 96)` is false, so the forward packs the head ROW-MAJOR and the key carries blocked = 0.
+ * `test_head_tile_cache()` loops blocked 0/1 over an ALIGNED 128x128, so neither of the two things that matter here is
+ * covered: (a) a key that claims the blocked layout for an unaligned geometry must be REFUSED -- blocked_index()
+ * addresses whole tiles, so serving one would read past the image or read foreign bytes -- and (b) a row-major image
+ * still caches: cold writes, warm hits, and the bytes are packB_into()'s. */
+static void test_head_tile_unaligned(void) {
+    const int k = 128, t = 96, kd = 128, nd = 96, nv = 90, ntiles = 1;   /* 96 columns: 3/4 of a tile */
+    char dir[] = "head_tile_unaligned.XXXXXX";
+    check(mkdtemp(dir) != NULL, "unaligned head: a scratch cache directory");
+    int8_t* codes = malloc((size_t)kd * nd);
+    int8_t* ref = malloc((size_t)kd * nd);
+    float* scales = malloc((size_t)nd * sizeof(float));
+    float* sref = malloc((size_t)nd * sizeof(float));
+    check(codes && ref && scales && sref, "unaligned head: the fixture allocates");
+    if (!codes || !ref || !scales || !sref) return;
+    HeadFixture fx = {nv, k, 0, 0};
+
+    /* (a) a blocked key on a geometry with no blocked layout is refused, by name, and writes nothing */
+    {
+        Q4nxHeadImageKey key = {(uint32_t)k, (uint32_t)t, 1, 0xa11a11a11ull};
+        Q4nxHeadTileResult r;
+        const int rc = q4nx_head_tile_image(dir, &key, 0, 0, nv, k, t, kd, nd, head_fixture_col, &fx, codes, scales, &r);
+        check(rc != 1, "unaligned head: a blocked key on a 128x96 geometry is REFUSED, not served");
+        check(strstr(r.why, "no blocked layout") != NULL, "... and the reason names the missing layout");
+        check(r.wrote == 0, "... and nothing was written for it");
+    }
+
+    /* (b) the row-major image caches: cold writes, warm hits, both byte-identical to a fresh pack */
+    {
+        Q4nxHeadImageKey key = {(uint32_t)k, (uint32_t)t, 0, 0xa11a11a11ull};
+        int cold_ok = 0, cold_same = 0, warm_hit = 0, warm_same = 0;
+        Q4nxHeadTileResult r;
+        for (int pass = 0; pass < 2; pass++) {
+            for (int tile = 0; tile < ntiles; tile++) {
+                const int n0 = tile * t, ncols = (nv - n0 < t) ? nv - n0 : t;
+                head_reference(&fx, n0, ncols, k, t, kd, nd, /*blocked=*/0, ref, sref);
+                memset(codes, 0x5a, (size_t)kd * nd);
+                const int rc = q4nx_head_tile_image(dir, &key, tile, n0, ncols, k, t, kd, nd, head_fixture_col, &fx, codes,
+                                                    scales, &r);
+                const int same = memcmp(codes, ref, (size_t)kd * nd) == 0 &&
+                                 memcmp(scales, sref, (size_t)t * sizeof(float)) == 0;
+                if (pass == 0) {
+                    cold_ok += rc == 1 && r.hit == 0 && r.wrote == 1 && r.refused == 0;
+                    cold_same += same;
+                } else {
+                    warm_hit += rc == 1 && r.hit == 1 && r.wrote == 0 && r.refused == 0 && r.sampled > 0;
+                    warm_same += same;
+                }
+            }
+        }
+        check_int(cold_ok, ntiles, "unaligned head: a first pass packs and writes the row-major tile");
+        check_int(cold_same, ntiles, "... and its bytes are packB_into()'s (codes and scales)");
+        check_int(warm_hit, ntiles, "unaligned head: a SECOND pass takes it from the cache");
+        check_int(warm_same, ntiles, "... byte-identical to a fresh pack, over a buffer that was not zero");
+    }
+    free(codes); free(ref); free(scales); free(sref);
+}
+
 int main(void) {
     shortconv_geometry();
     test_head_image();
     test_head_tile_cache();
+    test_head_tile_unaligned();
     oga_geometry();
     on_grid_geometry();
     activation_pad();

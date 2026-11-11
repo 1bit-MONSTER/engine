@@ -807,6 +807,12 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
 // this thread waits for the first frame or the end, and only then decides between an ordinary response -- the 400s
 // and 500s a request can earn before it has produced anything keep their status codes -- and a stream.
 void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Response& res, bool chat) {
+    // A non-causal decision pack has no decode to run (npu::decision_only_refusal): say so before any work.
+    if (e.fwd && e.fwd->noncausal()) {
+        res.status = 400;
+        res.set_content(npu::decision_only_refusal(e.id, e.head != nullptr).dump(), "application/json");
+        return;
+    }
     bool wants_stream = false;
     try {
         const json body = json::parse(req.body);

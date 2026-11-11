@@ -46,6 +46,9 @@
 //     - a TENSOR is one kind. The tensor-level readers look at all of its tiles first: any symmetric tile makes
 //       the tensor symmetric, and its undecided tiles (all zero-points zero, no negative scale: padding, mostly)
 //       follow it; a tensor with both a symmetric and an asymmetric tile is refused, by name, on stderr.
+//       The fused int8 packer (q4nx_pack_q4_1_tiles_to_int8) takes the kind the same way, over the whole tensor.
+//     - the one-row reader (q4nx_dequant_tile_row) takes it from the tiles of the row's own tile-row: it runs once
+//       per token on an embedding it exists to avoid paging in, so it does not scan the table.
 //     - q4nx_dequant_tile() on one tile, with no tensor around it, uses that tile's own evidence.
 //   Measured 2026-11-11 on every 5120-byte tile of the fifteen packs on the box: 1,889,236 tiles in the other
 //   packs, none with an all-zero zero-point block and none with a negative scale; 285,696 tiles in the two LFM2

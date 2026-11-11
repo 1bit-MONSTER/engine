@@ -284,6 +284,45 @@ static void oga_geometry(void) {
                       "fused: a non-q4_1 byte count returns -2 so the caller keeps the two-step path");
             printf("  fused chunks->int8: K=%d N=%d  %d codes and %d scales byte-identical to dequant->pack\n",
                    K, N, K * N, N);
+
+            /* THE SAME COMPARISON ON A SYMMETRIC TENSOR WITH AN UNDECIDED TILE (the LFM2 packs' tile kind). Three tiles
+             * are symmetric on their own evidence (zero-points 0, scales of both signs); tile 1 has every zero-point 0
+             * and every scale positive, which decides nothing on its own. The tensor is symmetric, so both paths must
+             * read tile 1 as two's-complement codes: decoded as a one-tile tensor it comes out unsigned, and the fused
+             * path did exactly that. */
+            for (size_t t = 0; t < ntr * ntc; t++) {
+                uint8_t* tile = tiles + t * 5120;
+                for (int i = 0; i < 256; i++) {
+                    const int neg = (t != 1) && (i % 3 == 0);
+                    tile[2 * i] = 0x00;
+                    tile[2 * i + 1] = neg ? 0xBE : 0x3E;        /* bf16 -0.125 / +0.125 */
+                    tile[512 + 2 * i] = 0; tile[512 + 2 * i + 1] = 0;
+                }
+                for (size_t i = 0; i < 4096; i++) tile[1024 + i] = (uint8_t)((i * 53 + t * 29 + 0xC8) & 0xFF);
+            }
+            check_int(q4nx_tile_kind(tiles + 5120), Q4NX_TILE_UNDECIDED, "fused, symmetric: tile 1 decides nothing on its own");
+            check_int(q4nx_tiles_kind(tiles, ntr * ntc, 5120), Q4NX_TILE_SYMMETRIC, "fused, symmetric: the tensor is symmetric");
+            check_int(q4nx_dequant_tensor_chunked(tiles, ntr * ntc * 5120, K, N, 5120, B), 0,
+                      "fused, symmetric: the reference path dequantises it");
+            int neg_in_tile1 = 0;
+            for (int r = 0; r < 32; r++)
+                for (int c = 256; c < 512; c++)
+                    if (B[(size_t)r * N + c] < 0) neg_in_tile1++;
+            check(neg_in_tile1 > 0, "fused, symmetric: the reference reads tile 1 with negative weights (signed codes, positive scales)");
+            q4nx_pack_B_int8(B, K, N, ref, ld, sc_ref);
+            check_int(q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120, K, N, fused, ld, sc_fused), 0,
+                      "fused, symmetric: the fused path accepts it");
+            bad_code = 0; bad_scale = 0;
+            for (int i = 0; i < K * N; i++) if (fused[i] != ref[i]) bad_code++;
+            for (int j = 0; j < N; j++) if (sc_fused[j] != sc_ref[j]) bad_scale++;
+            check_int(bad_code, 0, "fused, symmetric: every code is byte-identical to dequant -> pack, the undecided tile's included");
+            check_int(bad_scale, 0, "fused, symmetric: every column scale as well");
+            /* one zero-point in tile 3: a tensor with both kinds, refused by both paths */
+            tiles[3 * 5120 + 512 + 1] = 0x3F;
+            check_int(q4nx_dequant_tensor_chunked(tiles, ntr * ntc * 5120, K, N, 5120, B), -1,
+                      "fused, mixed: the reference path refuses a tensor with both kinds");
+            check_int(q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120, K, N, fused, ld, sc_fused), -1,
+                      "fused, mixed: and so does the fused path");
         }
         free(tiles); free(B); free(ref); free(fused); free(sc_ref); free(sc_fused);
     }

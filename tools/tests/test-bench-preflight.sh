@@ -167,5 +167,158 @@ else
     printf 'FAIL %-38s header does not name the load mode\n%s\n' "tally header states -lm" "$(cat "$tmp/lastout")"; fail=$((fail+1))
 fi
 
+# --dispatch must also OBSERVE the load mode, not only request it (engine #1668): llama.cpp puts a model it mmaps in
+# `/proc/<pid>/maps` and a model it only reads is not there. The bench below really maps or really reads the model and then
+# sleeps, so the observation has something to see; FAKE_BENCH_LM lets a case make the bench ignore `-lm`, which is the defect
+# the check exists for (a number the header mislabels).
+head -c 65536 /dev/urandom > "$tmp/models/big.gguf"      # non-empty: mmap of a zero-length file fails
+cat > "$tmp/mapbench" <<'PY'
+#!/usr/bin/env python3
+import mmap, os, signal, sys, time
+a = sys.argv[1:]
+lm = a[a.index('-lm') + 1] if '-lm' in a else 'mmap'
+model = a[a.index('-m') + 1]
+mode = os.environ.get('FAKE_BENCH_LM') or lm          # a case sets this to make the bench disagree with -lm
+time.sleep(float(os.environ.get('FAKE_BENCH_PRE') or 0))          # a load that takes a while: alive, nothing mapped yet
+handle = keep = None
+if os.environ.get('FAKE_BENCH_MAP_OTHER'):          # some other file of the same NAME is mapped the whole time
+    other = open(os.environ['FAKE_BENCH_MAP_OTHER'], 'rb')
+    keep_other = mmap.mmap(other.fileno(), 0, access=mmap.ACCESS_READ)
+if mode in ('mmap', 'mmap+mlock'):
+    handle = open(model, 'rb')
+    keep = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+else:
+    open(model, 'rb').read(4096)
+sys.stderr.write('ggml_hrx dispatch: common.mul_mat.q4_k_q8_1_x4_prefill\n')
+sys.stderr.write('| qwen3-4b | 2.30 GiB | 4B | HRX | 99 | 1 | pp512 | 3181.97 t/s |\n')
+sys.stderr.flush()
+if os.environ.get('FAKE_BENCH_IGNORE_TERM'):          # a bench wedged in the device does not answer SIGTERM
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if os.environ.get('FAKE_BENCH_PIDFILE'):          # a case reads this to see whether the bench outlived the preflight
+    open(os.environ['FAKE_BENCH_PIDFILE'], 'w').write(str(os.getpid()))
+time.sleep(float(os.environ.get('FAKE_BENCH_SLEEP') or 0.7))
+assert keep is None or len(keep) == 65536          # the mapping must outlive the sleep
+PY
+chmod +x "$tmp/mapbench"
+
+lm_case() {  # lm_case <want: ok|no> <name> <PREFLIGHT_LM> [FAKE_BENCH_LM]
+    local want=$1 name=$2 lm=$3 fake_lm=${4:-} root out rc got
+    root=$(fake 3600 0 60)
+    out=$(PREFLIGHT_LM=$lm FAKE_BENCH_LM=$fake_lm PREFLIGHT_MODEL=$tmp/models/big.gguf \
+          patched "$root" --dispatch "$tmp/mapbench" 512 2>&1); rc=$?
+    got=ok; [ $rc -ne 0 ] && got=no
+    if [ "$got" = "$want" ]; then
+        printf 'ok   %-38s rc=%d\n' "$name" "$rc"; pass=$((pass+1))
+    else
+        printf 'FAIL %-38s rc=%d want=%s\n%s\n' "$name" "$rc" "$want" "$out"; fail=$((fail+1))
+    fi
+    printf '%s' "$out" > "$tmp/lastlm"
+}
+
+lm_case ok "observed mmap agrees with -lm mmap"        mmap
+lm_case ok "observed read agrees with -lm none"        none
+lm_case no "-lm none that actually mmapped is refused"  none mmap
+lm_case no "-lm mmap that only read is refused"         mmap none
+# The refusal has to say what it saw, or the reader cannot tell a mapping mismatch from a bench that never started.
+if grep -q 'is not the measurement the header claims' "$tmp/lastlm"; then
+    printf 'ok   %-38s names the mismatch\n' "the refusal names its reason"; pass=$((pass+1))
+else
+    printf 'FAIL %-38s missing reason\n%s\n' "the refusal names its reason" "$(cat "$tmp/lastlm")"; fail=$((fail+1))
+fi
+
+# A bench that honours `-lm mmap` but is short must not be refused (the review of #1913 at 7b218e0, 5 of 5 before this):
+# it is alive and unmapped while it loads, then maps, dispatches and exits inside one poll interval, so no sample ever
+# holds the mapping. Absence counts only on samples taken while the bench was dispatching and still running; this run has
+# none, so the answer is the WARN and exit 0, every time.
+short_ok=0
+for try in 1 2 3 4 5; do
+    root=$(fake 3600 0 60)
+    out=$(PREFLIGHT_LM=mmap FAKE_BENCH_PRE=0.35 FAKE_BENCH_SLEEP=0 PREFLIGHT_MODEL=$tmp/models/big.gguf \
+          patched "$root" --dispatch "$tmp/mapbench" 512 2>&1) && short_ok=$((short_ok + 1))
+done
+if [ "$short_ok" -eq 5 ]; then
+    printf 'ok   %-38s 5 of 5 rc=0\n' "a short correct -lm mmap run passes"; pass=$((pass+1))
+else
+    printf 'FAIL %-38s %d of 5 rc=0\n%s\n' "a short correct -lm mmap run passes" "$short_ok" "$out"; fail=$((fail+1))
+fi
+# A bench that is gone before anything could be sampled says so instead of passing silently.
+root=$(fake 3600 0 60)
+out=$(PREFLIGHT_LM=mmap FAKE_BENCH_LM=none FAKE_BENCH_SLEEP=0 PREFLIGHT_MODEL=$tmp/models/big.gguf \
+      patched "$root" --dispatch "$tmp/mapbench" 512 2>&1); rc=$?
+if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q -- '-lm mmap not checked'; then
+    printf 'ok   %-38s rc=0 and WARN\n' "an unobserved run is a WARN"; pass=$((pass+1))
+else
+    printf 'FAIL %-38s rc=%d\n%s\n' "an unobserved run is a WARN" "$rc" "$out"; fail=$((fail+1))
+fi
+# The mapping is matched by the model's resolved path, not its file name. Another directory's big.gguf mapped by a bench
+# that only reads the model is not the model; a model named through a symlink is.
+mkdir -p "$tmp/elsewhere"; cp "$tmp/models/big.gguf" "$tmp/elsewhere/big.gguf"
+root=$(fake 3600 0 60)
+out=$(PREFLIGHT_LM=none FAKE_BENCH_MAP_OTHER=$tmp/elsewhere/big.gguf PREFLIGHT_MODEL=$tmp/models/big.gguf \
+      patched "$root" --dispatch "$tmp/mapbench" 512 2>&1); rc=$?
+if [ $rc -eq 0 ]; then
+    printf 'ok   %-38s rc=0\n' "a same-named file elsewhere is not it"; pass=$((pass+1))
+else
+    printf 'FAIL %-38s rc=%d\n%s\n' "a same-named file elsewhere is not it" "$rc" "$out"; fail=$((fail+1))
+fi
+ln -sf "$tmp/models/big.gguf" "$tmp/models/alias.gguf"
+root=$(fake 3600 0 60)
+out=$(PREFLIGHT_LM=mmap PREFLIGHT_MODEL=$tmp/models/alias.gguf \
+      patched "$root" --dispatch "$tmp/mapbench" 512 2>&1); rc=$?
+if [ $rc -eq 0 ] && ! printf '%s' "$out" | grep -q 'not checked'; then
+    printf 'ok   %-38s rc=0, observed\n' "a symlinked model is seen mapped"; pass=$((pass+1))
+else
+    printf 'FAIL %-38s rc=%d\n%s\n' "a symlinked model is seen mapped" "$rc" "$out"; fail=$((fail+1))
+fi
+
+# The bench runs in the background while the mode is observed, so the preflight has to take it down on every way out
+# (engine #1668, the review of the observation): a preflight that is signalled must not leave a bench behind on the GPU.
+# The fake bench sleeps 30 s; "gone" means its pid is no longer a live process shortly after the preflight has ended.
+gone() {  # gone <pid> -> 0 once the process has ended, 1 if it is still running after 3 s
+    local pid=$1 n=0
+    while kill -0 "$pid" 2>/dev/null && ! grep -q '^State:[[:space:]]*Z' "/proc/$pid/status" 2>/dev/null; do
+        n=$((n + 1)); [ "$n" -gt 30 ] && return 1
+        sleep 0.1
+    done
+    return 0
+}
+wait_pidfile() {  # wait_pidfile <file> -> prints the bench pid once the bench has written it (5 s at most)
+    local n=0
+    until [ -s "$1" ]; do n=$((n + 1)); [ "$n" -gt 50 ] && return 1; sleep 0.1; done
+    cat "$1"
+}
+orphan_case() {  # orphan_case <name> <signal> [ignore-term] -> signals the preflight while its bench runs, wants the bench gone
+    local name=$1 how=$2 ignore=${3:-} root pidfile pre bench started
+    root=$(fake 3600 0 60)
+    pidfile=$root/bench.pid
+    rm -f "$pidfile"          # fake() hands the same root to equal arguments, so an earlier case's pid would be read
+    patched "$root" >/dev/null 2>&1          # writes $root/run.sh; without --dispatch it stops after the gates
+    FAKE_BENCH_SLEEP=30 FAKE_BENCH_PIDFILE=$pidfile FAKE_BENCH_IGNORE_TERM=$ignore \
+        PREFLIGHT_MODEL=$tmp/models/big.gguf bash "$root/run.sh" --dispatch "$tmp/mapbench" 512 >/dev/null 2>&1 &
+    pre=$!
+    if ! bench=$(wait_pidfile "$pidfile"); then
+        printf 'FAIL %-38s the fake bench never started\n' "$name"; fail=$((fail+1))
+        kill "$pre" 2>/dev/null; return
+    fi
+    started=$SECONDS
+    kill -s "$how" "$pre" 2>/dev/null
+    wait "$pre" 2>/dev/null
+    # The bench sleeps 30 s. A preflight that only returns once the bench ends by itself has not stopped it, it has waited
+    # for it - which is what an unbounded wait on a bench that ignores TERM does.
+    if [ $((SECONDS - started)) -ge 15 ]; then
+        printf 'FAIL %-38s the preflight took %ds to return\n' "$name" "$((SECONDS - started))"; fail=$((fail+1))
+        kill -KILL "$bench" 2>/dev/null; return
+    fi
+    if gone "$bench"; then
+        printf 'ok   %-38s bench pid %s is gone\n' "$name" "$bench"; pass=$((pass+1))
+    else
+        printf 'FAIL %-38s bench pid %s is still running\n' "$name" "$bench"; fail=$((fail+1))
+        kill "$bench" 2>/dev/null
+    fi
+}
+orphan_case "SIGTERM to the preflight stops the bench" TERM
+orphan_case "SIGHUP to the preflight stops the bench"  HUP
+orphan_case "a bench that ignores TERM is killed"      TERM 1
+
 printf '\nbench-preflight test: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

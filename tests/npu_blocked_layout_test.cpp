@@ -33,6 +33,7 @@
 //   5. the row-major layout is unchanged (it must keep serving every container
 //      built before the blocked one).
 #include "q4nx_pack.h"
+#include "q4nx_host_head.h"
 #include "q4nx_weight_layout.h"
 
 #include <algorithm>
@@ -242,6 +243,46 @@ void test_unpadded_image(int K, int N, bool expect_blocked) {
                 forced_max + 1, img);
 }
 
+// The host lm-head tile (q4nx_host_head.h, engine#1785): its sums are the element-at-a-time sums over
+// image_index(), for both layouts, padded and ragged geometries, and activation codes at the int8 edges.
+// The reference below shares nothing with the kernel but the index contract this file already pins.
+void test_host_head_tile(int K, int N, int KD, int ND, bool blocked) {
+    std::vector<int8_t> img((size_t)KD * (size_t)ND);
+    uint32_t s = 0x1234567u + (uint32_t)(K * 31 + N);
+    for (auto& b : img) { s = s * 1664525u + 1013904223u; b = (int8_t)(int)((s >> 24) % 255) - 127; }
+    std::vector<int8_t> a((size_t)K);
+    for (auto& v : a) { s = s * 1664525u + 1013904223u; v = (int8_t)((int)((s >> 24) % 255) - 127); }
+    a[0] = 127; a[(size_t)K - 1] = -127;
+    if (K > 2) a[1] = 0;
+    std::vector<int32_t> want((size_t)N), got((size_t)N + 1, 0x5a5a5a5a);
+    for (int j = 0; j < N; j++) {
+        int64_t acc = 0;
+        for (int k = 0; k < K; k++)
+            acc += (int64_t)a[(size_t)k] * (int64_t)img[q4nx_layout::image_index((size_t)k, (size_t)j, KD, ND, blocked)];
+        want[(size_t)j] = (int32_t)acc;
+    }
+    const bool ok = q4nx_host_head::tile(img.data(), KD, ND, blocked, a.data(), K, N, got.data());
+    int bad = 0;
+    for (int j = 0; j < N; j++) bad += got[(size_t)j] != want[(size_t)j];
+    if (!ok || bad || got[(size_t)N] != 0x5a5a5a5a) {
+        std::printf("FAIL host head tile K=%d N=%d KD=%d ND=%d %s: ok=%d, %d of %d sums differ, guard %s\n", K, N, KD, ND,
+                    blocked ? "blocked" : "row-major", (int)ok, bad, N, got[(size_t)N] == 0x5a5a5a5a ? "kept" : "overwritten");
+        failures++;
+    }
+}
+
+void test_host_head_refusals() {
+    std::vector<int8_t> img(64 * 128, 1), a(64, 1);
+    std::vector<int32_t> out(128, 7);
+    const bool r1 = q4nx_host_head::tile(img.data(), 64, 128, true, a.data(), 65, 128, out.data());   // K > KD
+    const bool r2 = q4nx_host_head::tile(img.data(), 64, 128, true, a.data(), 64, 129, out.data());   // ncols > ND
+    const bool r3 = q4nx_host_head::tile(img.data(), 60, 128, true, a.data(), 60, 128, out.data());   // not whole tiles
+    if (r1 || r2 || r3 || out[0] != 7) {
+        std::printf("FAIL host head tile: a geometry with no image was not refused (%d %d %d) or out was written\n", (int)r1, (int)r2, (int)r3);
+        failures++;
+    }
+}
+
 int main() {
     for (Geom g : kGeoms) {
         test_bijection(g);
@@ -256,6 +297,12 @@ int main() {
     test_unpadded_image(2048, 8512, false);   // a body width of 66.5 tiles
     test_unpadded_image(100, 128, false);     // K not a whole number of 64-row tiles
     test_unpadded_image(4096, 2688, true);    // the measured head block (150144 % 8192 = 21 tiles): stays blocked
+    test_host_head_tile(2048, 7168, 2048, 7168, true);     // a whole blocked head tile
+    test_host_head_tile(2048, 4672, 2048, 7168, true);     // the last tile of a vocabulary: fewer columns than ND
+    test_host_head_tile(1000, 300, 1024, 384, true);       // padded K and N, ragged inside a microtile
+    test_host_head_tile(1024, 7168, 1024, 7168, false);    // row-major
+    test_host_head_tile(100, 77, 128, 130, false);         // row-major, padded and ragged
+    test_host_head_refusals();
     if (failures) {
         std::printf("npu_blocked_layout_test: %d failure(s)\n", failures);
         return 1;

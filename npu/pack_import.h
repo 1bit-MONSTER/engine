@@ -654,6 +654,11 @@ constexpr bool kExtQuantsRowMajor = false;
 // measurably NOT the same weights: on a real phi-4 tile it reproduced the pack's codes on only 2,826 of 8,192
 // entries and moved weights by 2.5 % of the tensor's range (engine#1503). `m_inexact` reports how many group
 // offsets were not bf16-exact (86.3 % are, measured), because that rounding is the only loss this path has.
+// engine#1990: a head whose row count is not a multiple of the 32-row tile quantum (CodeLlama: 32,016 rows) cannot be
+// held by the q4_1 grid, so pad it with zero rows that decode to zero and leave the container's vocab_size alone. Exposed
+// because the property -- padding is invisible to the vocabulary -- is what a test can pin without a pack.
+void pad_rows_to_tile_quantum(Q4& q, int vocab);
+
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact = nullptr);
 
 // The container role a matmul plays, read off the graph's own tensor name: `...qkv_proj...` -> "QKV",

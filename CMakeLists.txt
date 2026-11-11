@@ -371,6 +371,15 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.
+# engine#1990: the padded-head row arithmetic, driven on the shape that broke it (CodeLlama-7b's I8 [16016, 6144] for a
+# 32,032-row head at kpad 4,096). It is header-only (`npu/forward/include/pad_head_rows.h`) precisely so it can live HERE:
+# an earlier version linked `onebit_npu_forward`, which exists only under `if(ONEBIT_NPU)`, so CI -- which configures
+# without the NPU runtime -- never built or ran the arm. `add_dependencies(onebit ...)` keeps it in the build CI runs.
+add_executable(npu_pad_head_rows_test tests/npu_pad_head_rows_test.cpp)
+target_include_directories(npu_pad_head_rows_test PRIVATE npu/forward/include)
+add_dependencies(onebit npu_pad_head_rows_test)
+add_test(NAME npu_pad_head_rows COMMAND npu_pad_head_rows_test)
+
 # engine#1934: reading ONE tensor out of a safetensors shard needs `data_offsets` measured from 8 + header_len, not
 # from byte 8. Getting that wrong returns a *different* tensor of the same size that still looks finite, and it cost
 # two false conclusions about a pack in one night. `--self-test` drives the rule on a synthetic shard (no network):
@@ -495,6 +504,14 @@ add_test(NAME pack_initializer_shape COMMAND pack_initializer_shape_test)
 add_dependencies(onebit pack_initializer_shape_test)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
+# The reader for a tools/moe_placement.py table (app/moe_placement.h, engine#1702): a consumer that splits experts across
+# devices adopts a table only if it was written for this model -- schema, group count, every routed layer, every expert
+# id exactly once -- and only on the held-out share, never the in-sample one. Header only, no device, no model.
+add_executable(moe_placement_test tests/moe_placement_test.cpp)
+target_include_directories(moe_placement_test PRIVATE app)
+target_link_libraries(moe_placement_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME moe_placement_reader COMMAND moe_placement_test)
+add_dependencies(onebit moe_placement_test)
 # The NPU route's bounded load retry (app/npu_load_retry.h, engine #1010, docs/npu.md "When a load follows an evict"):
 # a load started right after an evict can hit the previous backend's hardware context still being torn down, which used
 # to be fatal on the first attempt. Header only, no device, no model.

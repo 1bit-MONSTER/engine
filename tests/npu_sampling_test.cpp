@@ -951,6 +951,54 @@ void test_gemma4_answer_parser() {
     }
 }
 
+// GPT-OSS's harmony markup (engine#1786). The first reply is the one FastFlowLM's GPT-OSS-20B-NPU2 gave on the NPU
+// (byte for byte, then the final message the 32-token budget cut off); the call forms are the pack's template's own
+// order and the order the model card shows, asserted on name and JSON arguments.
+void test_harmony_answer_parser() {
+    const auto H = AnswerFamily::harmony;
+    {
+        const std::string reply =
+            "<|channel|>analysis<|message|>The user asks: \"What is the capital of France? Answer with one word.\" "
+            "The answer is \"Paris\". So we answer \"Paris\".<|end|><|start|>assistant<|channel|>final<|message|>Paris";
+        const auto a = parse_answer(reply, H, false);
+        check(a.reasoning.rfind("The user asks:", 0) == 0 && a.reasoning.find("<|") == std::string::npos,
+              "harmony: the analysis channel is reasoning, with no header left in it");
+        check(a.content == "Paris", "harmony: the final channel is content, headers dropped");
+        // Streamed one byte at a time: the same split.
+        AnswerStream s(H, false);
+        std::vector<std::pair<bool, std::string>> out;
+        for (const char c : reply) s.feed(std::string(1, c), out);
+        s.finish(out);
+        check(s.reasoning() == a.reasoning && s.content() == "Paris", "harmony: byte-at-a-time stream agrees");
+    }
+    {
+        const auto a = parse_answer("<|channel|>analysis<|message|>think<|channel|>final<|message|>Done.", H, false);
+        check(a.reasoning == "think" && a.content == "Done.", "harmony: a final header without <|end|> ends reasoning");
+        const auto b = parse_answer("<|channel|>final<|message|>Only this.<|return|>", H, false);
+        check(b.reasoning.empty() && b.content == "Only this.", "harmony: no analysis, and a rendered stop token");
+    }
+    {
+        const std::string tmpl_form =
+            "<|channel|>analysis<|message|>Need weather.<|end|><|start|>assistant to=functions.get_weather"
+            "<|channel|>commentary json<|message|>{\"city\":\"Paris\"}<|call|>";
+        const auto a = parse_answer(tmpl_form, H, true);
+        check(a.calls.size() == 1 && a.calls[0].name == "get_weather" && a.calls[0].arguments == R"({"city":"Paris"})",
+              "harmony: the template's call order is a call");
+        check(a.reasoning == "Need weather." && a.content.empty() && a.content_null,
+              "harmony: a call-only reply has content: null");
+        const auto b = parse_answer(
+            "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"city\":\"Oslo\"}<|call|>", H, true);
+        check(b.calls.size() == 1 && b.calls[0].name == "get_weather" && b.calls[0].arguments == R"({"city":"Oslo"})",
+              "harmony: the card's call order is a call too");
+        const auto c = parse_answer(tmpl_form, H, false);
+        check(c.calls.empty() && c.content.find("to=functions.get_weather") != std::string::npos,
+              "harmony: without tools the call markup stays in content");
+        const std::string bad = "to=functions.f<|channel|>commentary json<|message|>{not json<|call|>";
+        const auto d = parse_answer(bad, H, true);
+        check(d.calls.empty() && d.content == bad, "harmony: arguments that are not JSON are back in content, whole");
+    }
+}
+
 // The family comes from the container's chat template. The Gemma 4 lines are the two literals the pack's own
 // chat_template carries (amd/gemma-4-e4b-it-mobius-int4_rai_1.9.0_npu: `<|tool_call>` x1, `<|channel>thought`
 // x1, `<tool_call>` x0, `<think>` x0), not a guess at them.
@@ -964,6 +1012,9 @@ void test_answer_family_of_template() {
           "a template that writes <|tool_call>call: is gemma4");
     check(answer_family_of_template("{{- '<|channel>thought\\n<channel|>' -}}") == AnswerFamily::gemma4,
           "a template with the thought channel and no tools is gemma4 too");
+    check(answer_family_of_template("{{- \"<|start|>assistant<|channel|>analysis<|message|>\" + message.thinking -}}") ==
+              AnswerFamily::harmony,
+          "a template that writes the analysis channel is harmony");
     check(answer_family_of_template("<|im_start|>user\n{{ content }}<|im_end|>") == AnswerFamily::qwen3,
           "a template with neither marker is qwen3");
 }
@@ -972,7 +1023,7 @@ void test_answer_family_of_template() {
 // every byte. The scanner once read tags through a 16-byte window, so a 17-byte tag read as text (engine#1779);
 // this arm fails for any family whose tags the scanner cannot match, including one added later.
 void test_every_family_tag_is_matched() {
-    for (const AnswerFamily f : {AnswerFamily::qwen3, AnswerFamily::gemma4}) {
+    for (const AnswerFamily f : {AnswerFamily::qwen3, AnswerFamily::gemma4, AnswerFamily::harmony}) {
         const auto t = onebit::npu::answer_detail::tags_of(f);
         const std::string name = onebit::npu::answer_detail::family_name(f);
         const std::string think = std::string(t.think_open) + "R" + t.think_close + "C";
@@ -1359,6 +1410,7 @@ int main() {
     test_answer_stream();
     test_tool_grammar();
     test_gemma4_answer_parser();
+    test_harmony_answer_parser();
     test_every_family_tag_is_matched();
     test_answer_family_of_template();
     test_tool_request_parsing();

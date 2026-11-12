@@ -1336,8 +1336,7 @@ int run_forward_serve(int argc, char** argv) {
                  e.tmpl.present() ? "" : " -- the chat route uses ChatML with anchors, else refuses");
     const bool can_render = e.tmpl.present() && npu::renderer_built();
     if (can_render) e.answer_family = npu::answer_family_of_template(e.tmpl.text);
-    std::fprintf(stderr, "1bit forward-serve: answer markup=%s\n",
-                 e.answer_family == npu::AnswerFamily::gemma4 ? "gemma4" : "qwen3");
+    std::fprintf(stderr, "1bit forward-serve: answer markup=%s\n", npu::answer_detail::family_name(e.answer_family));
     if (e.tmpl.present() && !npu::renderer_built())
         std::fprintf(stderr,
                      "1bit forward-serve: this build has no chat-template renderer (ONEBIT_JINJA=OFF), so the "

@@ -192,11 +192,18 @@ reads the answer markup from the template it renders and prints it at load:
 | the rendered template contains | markup | reasoning | a tool call |
 |---|---|---|---|
 | `<|tool_call>` or `<|channel>thought` | `gemma4` | `<|channel>thought … <channel|>` | `<|tool_call>call:NAME{key:value}<tool_call|>`, strings as `<|"|>…<|"|>` |
+| `<|channel|>analysis<|message|>` (GPT-OSS) | `harmony` | `<|channel|>analysis<|message|> … <|end|>`; `<|channel|>final<|message|>` heads the content | `to=functions.NAME<|channel|>commentary json<|message|>{…}<|call|>`, either header order |
 | neither, or no template (ChatML) | `qwen3` | `<think> … </think>` | `<tool_call>{"name": …, "arguments": {…}}</tool_call>`, or `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>` |
 
 Both give the client the same OpenAI shape: `reasoning_content`, `content`, and `tool_calls` whose `arguments`
 is a JSON string. A Gemma call body that is not well formed (a string that never closes, a key with no value,
 an unclosed object or array, an empty value) is not a call: the markup is returned in `content` unchanged.
+
+`harmony` drops the headers between messages (`<|start|>assistant`, `<|channel|>final<|message|>`, a commentary
+preamble's `<|channel|>commentary` and `<|message|>`) outside a call. Measured on the NPU with
+`GPT-OSS-20B-NPU2` before this markup existed: the reply was parsed as `qwen3`, so "What is the capital of
+France?" came back with `content` beginning `<|channel|>analysis<|message|>The user asks…` and no
+`reasoning_content`.
 
 **Tools go through the template (engine#1788).** A request's `tools` are a template variable, next to
 `chat_template_kwargs` and `enable_thinking` (`npu::request_template_vars`), in the caller's key order; an empty

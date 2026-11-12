@@ -19,6 +19,7 @@
 #include "moe_placement.h"
 
 #include <cstdio>
+#include <fstream>
 #include <functional>
 #include <string>
 
@@ -64,7 +65,40 @@ json with(const std::function<void(json&)>& edit) {
 
 }  // namespace
 
-int main() {
+// engine#1702: the WRITER's real output, read by the SHIPPED reader. Every other arm here builds its table by
+// hand, so nothing proved that a table the pipeline actually produces is one a consumer can adopt -- a schema typo
+// or a renamed key would leave both suites green and fail in the field. The table is Qwen3.8-Flash-Next at 2
+// groups (48 routed layers, 512 experts, held out 18.9%); the path comes from the command line so the test can
+// also be built standalone.
+void adopt_writer_table(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        check(false, "the writer's fixture table could not be opened: " + path);
+        return;
+    }
+    json t;
+    in >> t;
+    PlacementExpect w;
+    for (int layer = 0; layer < 48; ++layer) w.layers.push_back(layer);
+    w.n_experts = 512;
+    w.groups    = 2;
+    const Placement p = parse_placement(t, w);
+    check(p.layers.size() == 48 && p.groups == 2,
+          "the writer's own table is adopted by the reader: 48 routed layers, 512 experts, 2 groups");
+    check(p.share_held_out > 0.15 && p.share_held_out < 0.30,
+          "the fixture's held-out share is the one the writer reported (0.1892), and above the 15% gate");
+    check(p.held_out_steps == 5280, "the fixture carries the writer's held-out step count");
+    // Every expert of every layer must read back to a real group -- that is what a splitter does per token.
+    bool all_placed = true;
+    for (int layer = 0; layer < 48 && all_placed; ++layer)
+        for (int e = 0; e < 512; ++e) {
+            const int g = p.group_of(layer, e);
+            if (g < 0 || g > 1) { all_placed = false; break; }
+        }
+    check(all_placed, "every (layer, expert) of the writer's table reads back to group 0 or 1");
+}
+
+int main(int argc, char** argv) {
     {
         const Placement p = parse_placement(good(), want());
         check(p.groups == 2 && p.layers.size() == 2, "a table for this model is adopted: 2 groups, layers 1 and 3");
@@ -123,6 +157,11 @@ int main() {
                 "expert 8 is not placed");
     }
     refused("the caller names nothing", good(), PlacementExpect{}, "must name its routed layers");
+    if (argc > 1) {
+        adopt_writer_table(argv[1]);
+    } else {
+        std::printf("skip the writer's fixture table: no path given (CMake passes one)\n");
+    }
     std::printf("%s\n", fails ? "moe_placement_test: FAILED" : "moe_placement_test: ok");
     return fails ? 1 : 0;
 }

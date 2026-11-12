@@ -3607,6 +3607,13 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
     // and `model.mtp.*` is a draft head rather than a model.
     static const char* kSsm[] = {"linear_attn.", "ssm_alpha_proj", "ssm_beta_proj", "ssm_conv1d", "ssm_dt",
                                  "ssm_norm", "ssm_out_proj"};
+    // engine#1788: gemma3/gemma4/bolt carry five tensor families this engine's forward does NOT read -- sandwich norms
+    // (`pre_/post_feedforward_layernorm`), an input gate, a per-layer projection (and its `_prefill` sibling) and a layer
+    // output scale. Nothing here has a field in npu/forward/include/model.h, so they are RECOGNISED rather than mapped:
+    // `unassigned` has to keep meaning "nothing knows this", and these are known -- measured on gemma4-e2b (319 of 709)
+    // and bolt-e4b (382 of 849), which were the two packs the classifier could not finish.
+    static const char* kGemmaLocal[] = {"pre_feedforward_layernorm", "post_feedforward_layernorm", "inp_gate",
+                                        "layer_output_scale", "per_layer_projection"};
     static const char* kMtp[] = {"model.mtp."};
     ContainerRoles out;
     for (const auto& t : tensors) {
@@ -3633,6 +3640,10 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
             if (!matched && role.empty()) {
                 for (const char* s : kSsm)
                     if (n.find(s) != std::string::npos) { role = "ssm"; matched = true; break; }
+            }
+            if (!matched && role.empty()) {
+                for (const char* g : kGemmaLocal)
+                    if (n.find(g) != std::string::npos) { role = "gemma_local"; matched = true; break; }
             }
             if (!matched && role.empty()) {
                 for (const char* s : kMtp)

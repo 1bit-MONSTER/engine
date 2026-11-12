@@ -5326,6 +5326,32 @@ void test_container_write_plan() {
     check(pi::container_write_plan({}).items.empty(), "write plan: no tensors, no items");
 }
 
+// engine#1788: the gemma3/gemma4/bolt families this forward does NOT read are recognised, not left unassigned -- and the
+// rules that DO name a forward field still win, so a sandwich norm cannot shadow the input or post-attention norm.
+void test_container_roles_gemma_local() {
+    const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "BF16"; return x; };
+    const auto roles = [&](std::initializer_list<const char*> names) {
+        std::vector<pi::Q4nxTensor> v;
+        for (const char* n : names) v.push_back(t(n));
+        return pi::container_roles(v);
+    };
+    {
+        const auto r = roles({"model.layers.0.pre_feedforward_layernorm.weight",
+                              "model.layers.0.inp_gate.weight", "model.layers.0.inp_gate.weight_prefill",
+                              "model.layers.0.per_layer_projection.weight", "model.layers.0.layer_output_scale.weight"});
+        check(r.unassigned.empty(), "gemma local: the families this forward does not read are recognised");
+        check(r.counts.at("gemma_local") == 5, "gemma local: all five land on one role");
+    }
+    {
+        // the forward's own norms must still win: this is the shadowing the ordering could cause
+        const auto r = roles({"model.layers.0.post_attention_layernorm.weight",
+                              "model.layers.0.input_layernorm.weight"});
+        check(r.role_of.at("model.layers.0.post_attention_layernorm.weight") == "post_norm" &&
+                  r.role_of.at("model.layers.0.input_layernorm.weight") == "input_norm",
+              "gemma local: a norm the forward reads is not swallowed by the recogniser");
+    }
+}
+
 void test_container_roles() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6366,6 +6392,7 @@ int main(int argc, char** argv) {
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
         test_container_roles();
+        test_container_roles_gemma_local();
         test_container_write_plan();
         test_container_role_shapes();
         test_container_payload_rule();

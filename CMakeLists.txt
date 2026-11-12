@@ -206,6 +206,9 @@ add_executable(npu_decode_note_test tests/npu_decode_note_test.cpp)
 target_include_directories(npu_decode_note_test PRIVATE app)
 add_test(NAME npu_decode_note COMMAND npu_decode_note_test)
 add_dependencies(onebit npu_decode_note_test)
+# engine#2106: a shipped kernel set's own consistency -- manifest vs bytes, one form or none, name vs directory. The
+# refusal this pre-empts ("differ in size") needed private-repo archaeology to diagnose; the symptom is checkable here.
+add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set_check_test.sh)
 add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
@@ -1975,6 +1978,12 @@ endif()
     if(OpenMP_CXX_FOUND)
         target_link_libraries(gdn_row_bench PRIVATE OpenMP::OpenMP_CXX)
     endif()
+    # A DFlash draft scored against its target, both on the host (engine#1780): the target's tapped hidden states
+    # into the draft's reference forward, proposals checked against the target's greedy tokens. A tool, not a ctest:
+    # it needs two packages and minutes of host time.
+    add_executable(dflash_acceptance tools/dflash_acceptance.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp)
+    target_include_directories(dflash_acceptance PRIVATE npu npu/forward/include)
+    target_link_libraries(dflash_acceptance PRIVATE onebit_npu_forward onebit_npu)
     add_executable(mtp_acceptance tools/mtp_acceptance.cpp npu/mtp/mtp_head.cpp)
     target_include_directories(mtp_acceptance PRIVATE npu npu/forward/include)
     target_link_libraries(mtp_acceptance PRIVATE onebit_npu_forward)

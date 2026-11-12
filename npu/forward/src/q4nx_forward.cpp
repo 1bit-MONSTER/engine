@@ -5132,9 +5132,17 @@ bool Q4nxNpuForward::step_impl(int token, int pos, std::vector<float>& logits, i
         cur_layer_ = l;
         // Dense models: once this layer's projections are packed (after the
         // first token), the f32 weights are no longer read, so skip the per-token
-        // Q4NX dequant.  GDN/MLA/PLE load members used outside the GEMMs, so they
+        // Q4NX dequant.  GDN/MLA load members used outside the GEMMs, so they
         // keep loading every token.
-        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_dim_ == 0 && n_expert_ == 0 && weight_cached(0);
+        // A per-layer-embedding (Gemma4) model is dense in this sense too: its gate and projection are read once at
+        // init and are GEMM weights like the rest, so once THEIR images are packed as well nothing here reads the
+        // layer's f32 weights. It used to be excluded, and every token dequantised all 42 layers again: 3.5 s per
+        // token on an E4B with the device idle most of that time.
+        // NPU_PLE_RELOAD=1 keeps the per-token reload, for an A/B.
+        static const bool ple_reload = getenv("NPU_PLE_RELOAD") != nullptr;
+        const bool ple_cached = ple_dim_ == 0 || (!ple_reload && weight_cached(onebit::npu::kWkeyPleGate) &&
+                                                  weight_cached(onebit::npu::kWkeyPleProj));
+        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_cached && n_expert_ == 0 && weight_cached(0);
         {
             LhScope _tlh(LH_LOAD);
         if (!dense_weights_cached && !load_layer(l)) { if (err_.empty()) err_ = "dequant failed"; return false; }

@@ -3406,6 +3406,76 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
            "neither is being preferred";
 }
 
+// engine#1786 (item F1), slice 3a: roles from names. The rule is ordered -- the first match wins -- so `q_proj.bias`
+// classifies as a bias of q_proj rather than as an unknown tensor, and a name that matches nothing lands in `unassigned`
+// with its own name rather than being guessed from its shape.
+ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
+    struct Rule { const char* role; const char* needle; };
+    // Longest/most specific spellings first: `qkv_proj` before `q_proj`, `gate_up_proj` before `gate_proj`.
+    static const Rule kRules[] = {
+        {"embed",         "embed_tokens"},   {"embed",         "tok_embeddings"}, {"embed",  "word_embeddings"},
+        {"lm_head",       "lm_head"},        {"lm_head",       "output.weight"},
+        // engine#2097 review: `in_proj` alone is not attention -- LFM2's `shortconv.in_proj` is the short-convolution
+        // input projection and was counted as `qkv_proj` on a real pack. It has its own field in model.h
+        // (`shortconv_in_proj_weight`), so it gets its own role; the attention needle now requires `attn`.
+        {"shortconv_in_proj", "shortconv.in_proj"},
+        {"qkv_proj",      "qkv_proj"},       {"qkv_proj",      "attn_qkv"},       {"qkv_proj", "attn.in_proj"},
+        {"gate_up_proj",  "gate_up_proj"},   {"gate_up_proj",  "ffn_gate_up"},
+        // engine#2097 review: `attn_q` is a PREFIX of `attn_q_norm`, so with the projection rules first the two
+        // `*_norm` needles could never fire and every `attn_q_norm` was filed as `q_proj`. Norms come first.
+        {"q_norm",        "q_norm"},         {"q_norm",        "attn_q_norm"},
+        {"k_norm",        "k_norm"},         {"k_norm",        "attn_k_norm"},
+        {"q_proj",        "q_proj"},         {"q_proj",        "attn_q"},         {"q_proj", "wq."},
+        {"k_proj",        "k_proj"},         {"k_proj",        "attn_k"},         {"k_proj", "wk."},
+        {"v_proj",        "v_proj"},         {"v_proj",        "attn_v"},         {"v_proj", "wv."},
+        {"o_proj",        "o_proj"},         {"o_proj",        "attn_output"},    {"o_proj", "wo."},
+        {"gate_proj",     "gate_proj"},      {"gate_proj",     "ffn_gate"},
+        {"up_proj",       "up_proj"},        {"up_proj",       "ffn_up"},
+        {"down_proj",     "down_proj"},      {"down_proj",     "ffn_down"},
+        {"input_norm",    "input_layernorm"},{"input_norm",    "attn_norm"},      {"input_norm", "attention_norm"},
+        {"post_norm",     "post_attention_layernorm"},          {"post_norm",    "ffn_norm"},
+        {"final_norm",    "final_layernorm"},
+    };
+    // Recognised but not transformer roles: kept out of `unassigned` so that list means "nothing knows this", which is
+    // the only list worth reading. The SSM block is a forward question (its projections have no transformer analogue),
+    // and `model.mtp.*` is a draft head rather than a model.
+    static const char* kSsm[] = {"linear_attn.", "ssm_alpha_proj", "ssm_beta_proj", "ssm_conv1d", "ssm_dt",
+                                 "ssm_norm", "ssm_out_proj"};
+    static const char* kMtp[] = {"model.mtp."};
+    ContainerRoles out;
+    for (const auto& t : tensors) {
+        const std::string& n = t.name;
+        std::string role;
+        if (n.find("visual.") != std::string::npos || n.rfind("vision", 0) == 0 || n.rfind("vpm", 0) == 0)
+            role = "vision";
+        else if (n.find("audio.") != std::string::npos)
+            role = "audio";
+        if (role.empty()) {
+            bool matched = false;
+            for (const auto& r : kRules) {
+                if (n.find(r.needle) == std::string::npos) continue;
+                role = r.role;
+                matched = true;
+                break;
+            }
+            if (!matched && n.find("norm.weight") != std::string::npos && n.find("layers.") == std::string::npos)
+                role = "final_norm";   // `model.norm.weight`: the top-level norm, never inside a layer
+            if (!matched && role.empty()) {
+                for (const char* s : kSsm)
+                    if (n.find(s) != std::string::npos) { role = "ssm"; matched = true; break; }
+            }
+            if (!matched && role.empty()) {
+                for (const char* s : kMtp)
+                    if (n.find(s) != std::string::npos) { role = "mtp"; matched = true; break; }
+            }
+        }
+        if (role.empty()) { out.unassigned.push_back(n); continue; }
+        out.role_of[n] = role;
+        out.counts[role]++;
+    }
+    return out;
+}
+
 // engine#1786 (item F1): the container genre's geometry, from the container's own `dims` block and then config.json.
 // The order is authority, not preference: `dims` is the pack's own statement about itself, config.json is a file beside
 // it that a vendor converter wrote. When the two disagree the container's statement wins and `source` says so -- the

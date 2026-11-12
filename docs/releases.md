@@ -172,6 +172,7 @@ What ran on **c19** (Strix Halo and QEMU, 1 November) — every gate except the 
 | `sha256sum -c SHA256SUMS`, `sbverify`, module/kernel identity | 3/3 OK, signature OK, one module tree for the shipped kernel |
 | stick write | device readback `3c3c08c2…` **= the image**, `prepare-stick` 11/11 and `--check` exit 0, `/data` grown to the whole device |
 | no DwarfStar | **0** `ds4/` files and **0** `hipblaslt` references; the image's catalogue has no `ds4` recipe |
+| AXB35-02 rear USB-A and Type-C ports ([#823](https://github.com/1bit-MONSTER/engine/issues/823)) | on this board three of the four xHCI functions autosuspend to `D3cold`, so only the controller behind the front USB-A enumerates; the image ships `91-1bit-xhci-keepawake.rules` to keep the four awake, and **a device on a rear port has not yet been confirmed to enumerate on a 1bit-OS boot**. Check with `tools/xhci_keepawake_check.sh --require-awake` (read-only; verdict `all awake` is the only one a plug test is valid under), mechanism and per-boot captures in `docs/axb35-usb-ports.md` |
 
 **What did not run on c19: the hardware boot and the hardware install.** The only hardware evidence in this document is
 candidate **c18**'s — a different, earlier candidate (`rc-2026-10-31c`): live USB boot with Secure Boot on,

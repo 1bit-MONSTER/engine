@@ -6090,11 +6090,13 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     // NPU_HEAD_HOST=alt is the measuring form: calls alternate host, device, host, ... in ONE serve, and each
     // call logs the previous one's head time and the time from its end to this call (the layers of the token in
     // between). Two serves on a shared box differ by more than the head costs; adjacent tokens of one serve do not.
+    // On unless NPU_HEAD_HOST=0: measured on two models with byte-identical logits (docs/npu.md), and the window11
+    // row comparison accepts its `HEAD M=1` profile row. Any value other than 0 or alt reads as on.
     static const int head_host_mode = [] {
         const char* e = getenv("NPU_HEAD_HOST");
-        if (!e) return 0;
-        if (e[0] == '1' && e[1] == 0) return 1;
-        return std::strcmp(e, "alt") == 0 ? 2 : 0;
+        if (!e) return 1;
+        if (e[0] == '0' && e[1] == 0) return 0;
+        return std::strcmp(e, "alt") == 0 ? 2 : 1;
     }();
     static long head_calls = 0;
     const bool head_host = head_host_mode == 1 || (head_host_mode == 2 && (head_calls % 2) == 0);
@@ -6162,14 +6164,14 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             static bool said = false;
             if (!said) {
                 said = true;
-                fprintf(stderr, "  [forward] lm head: on the host (NPU_HEAD_HOST=%s), %d tile(s), %d thread(s), first pass %.1f ms\n",
-                        head_host_mode == 2 ? "alt" : "1", ntiles, nthreads, ms);
+                fprintf(stderr, "  [forward] lm head: on the host (%s), %d tile(s), %d thread(s), first pass %.1f ms\n",
+                        head_host_mode == 2 ? "NPU_HEAD_HOST=alt" : "default; NPU_HEAD_HOST=0 for the device", ntiles, nthreads, ms);
             }
             if (xd_->profiling()) xd_->note_head(1, ms, 0.0, 0.0, 0.0);
             if (ph) { g_ph.h_pack += ms; g_ph.h_total = ph_ms(hp0); g_in_head = false; }
             return true;
         }
-        fprintf(stderr, "  [forward] lm head: NPU_HEAD_HOST is set but the image cannot be read on the host; using the device\n");
+        fprintf(stderr, "  [forward] lm head: the image cannot be read on the host; using the device\n");
     }
     for (int t = 0; t < ntiles; t++) {
         const int n0 = t * T, n1 = std::min(NV, n0 + T);

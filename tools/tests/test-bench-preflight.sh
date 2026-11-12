@@ -320,5 +320,24 @@ orphan_case "SIGTERM to the preflight stops the bench" TERM
 orphan_case "SIGHUP to the preflight stops the bench"  HUP
 orphan_case "a bench that ignores TERM is killed"      TERM 1
 
+# --watch execs tools/bench-arm.sh, so what reaches the arm is only what --watch forwards: the floor AND the drop
+# (engine#2049's review: only --floor was forwarded, so the drop test never ran on the documented route). A stand-in
+# bench-arm.sh beside the patched script records its argv.
+watch_case() {  # watch_case <name> <needle> [env-assignment] -- preflight args...
+    local name=$1 needle=$2 envset=$3 root; shift 3
+    root=$(fake 3600 0 60)
+    printf '#!/bin/sh\nprintf "%%s " "$@" > "%s/arm-argv"\n' "$root" > "$root/bench-arm.sh"; chmod +x "$root/bench-arm.sh"
+    ( [ -z "$envset" ] || export "${envset?}"; patched "$root" "$@" ) >/dev/null 2>&1
+    if grep -q -- "$needle" "$root/arm-argv" 2>/dev/null; then
+        printf 'ok   %-38s argv has %s\n' "$name" "$needle"; pass=$((pass+1))
+    else
+        printf 'FAIL %-38s argv: %s\n' "$name" "$(cat "$root/arm-argv" 2>/dev/null)"; fail=$((fail+1))
+    fi
+}
+watch_case "--watch forwards --drop-gib"           "--drop-gib 5 "  ""                 --drop-gib 5 --watch -- true
+watch_case "--watch forwards BENCH_DROP_GIB"       "--drop-gib 7 "  BENCH_DROP_GIB=7   --watch -- true
+watch_case "--watch forwards the floor"            "--floor 20 "    ""                 --watch -- true
+watch_case "and the command after --"              "-- true "       ""                 --watch -- true
+
 printf '\nbench-preflight test: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

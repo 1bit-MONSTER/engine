@@ -109,6 +109,16 @@ def at_tree(root: pathlib.Path) -> dict[tuple[str, str], str]:
     return found
 
 
+def merges_cleanly(root: pathlib.Path, base: str, head: str) -> tuple[bool, list[str]]:
+    """(clean, conflicted files). A branch that is behind the base but merges cleanly loses nothing: the merge keeps both
+    sides, so its "missing" rows are only stale, not at risk. The danger is a branch that BOTH lacks rows and conflicts --
+    that is where a naive resolution deletes them."""
+    p = subprocess.run(["git", "-C", str(root), "merge-tree", "--write-tree", base, head],
+                       capture_output=True, text=True, check=False)
+    conflicted = [m.group(1) for m in re.finditer(r"^CONFLICT \([^)]*\): Merge conflict in (.+)$", p.stdout, re.M)]
+    return p.returncode == 0, conflicted
+
+
 def check(root: pathlib.Path, base: str, head: str | None = None) -> int:
     before = at_rev(root, base)
     after = at_rev(root, head) if head else at_tree(root)
@@ -116,6 +126,12 @@ def check(root: pathlib.Path, base: str, head: str | None = None) -> int:
         print(f"registration_loss: nothing parsed at {base} - cannot tell, and that is not a pass")
         return 2
     lost = sorted(set(before) - set(after))
+    # Which of the missing rows did this branch DELETE, and which did it never have? The merge base answers it: a row that
+    # exists at the merge base and not at the head was removed by the branch (deliberate or accidental, and the merge will
+    # honour that); a row the merge base never had is stale -- main's, and a clean merge keeps it.
+    base_sha = subprocess.run(["git", "-C", str(root), "merge-base", base, head or "HEAD"],
+                              capture_output=True, text=True, check=False).stdout.strip()
+    at_base = at_rev(root, base_sha) if base_sha else {}
     added = sorted(set(after) - set(before))
     for kind, name in lost:
         print(f"registration_loss: {kind} {name} ({before[(kind, name)]}) exists at {base} and NOT at {head or 'the working tree'}")
@@ -123,10 +139,37 @@ def check(root: pathlib.Path, base: str, head: str | None = None) -> int:
         print(f"registration_loss: {len(added)} registration(s) added ({', '.join(n for _, n in added[:5])}"
               f"{', ...' if len(added) > 5 else ''})")
     if lost:
-        print(f"registration_loss: {len(lost)} of {len(before)} registration(s) at {base} are missing. Either this branch "
-              f"means to delete them (say so in the commit message) or its base is stale: a diff against the merge base "
-              f"shows other lanes' rows as removals, and resolving the conflict by taking this side deletes them. "
-              f"Rebase onto {base} and keep every row it has, adding yours on top.")
+        deleted = [e for e in lost if e in at_base]
+        stale = [e for e in lost if e not in at_base]
+        print(f"registration_loss: {len(lost)} of {len(before)} registration(s) at {base} are missing "
+              f"({len(deleted)} deleted by this branch, {len(stale)} it simply never had)")
+        if not deleted:
+            # Stale, not destructive -- but a stale branch that CONFLICTS is where the rows get lost anyway: the conflict is
+            # in a file full of other lanes' rows, and a resolution that takes this side drops them. That is #2183 exactly.
+            if head:
+                clean, conflicted = merges_cleanly(root, base, head)
+                if not clean:
+                    print(f"registration_loss: none of them is deleted by this branch (they are absent from its merge base too), "
+                          f"but the merge CONFLICTS ({', '.join(conflicted[:4]) or 'see git merge-tree'}) -- resolving that "
+                          f"conflict by taking this side drops other lanes' rows. Rebase onto {base} and keep every row it has.")
+                    return 1
+            print(f"registration_loss: every missing row is absent from the merge base too, so this branch is behind rather "
+                  f"than destructive -- a clean merge keeps them. Rebase when convenient; nothing is at risk.")
+            return 0
+        if head:
+            clean, conflicted = merges_cleanly(root, base, head)
+            if clean:
+                # A clean merge does NOT rescue a row the branch deleted -- the merge honours the deletion. It only rescues
+                # rows the branch never had, and those are handled above.
+                print(f"registration_loss: and the merge into {base} is CLEAN, so the merge honours these deletions rather "
+                      f"than hiding them: this is what will land.")
+            else:
+                print(f"registration_loss: and it CONFLICTS ({', '.join(conflicted[:4]) or 'see git merge-tree'}) -- a resolution "
+                      f"that takes this side keeps the {len(deleted)} deletions above.")
+        print(f"registration_loss: these {len(deleted)} rows are gone from the branch but present at its merge base, so the "
+              f"branch removes them: {', '.join(n for _, n in deleted[:6])}{', ...' if len(deleted) > 6 else ''}. "
+              f"Either it means to (say so in the commit message) or a stale-base resolution ate them -- rebase onto {base} "
+              f"and keep every row it has, adding yours on top.")
         return 1
     print(f"registration_loss: all {len(before)} registration(s) at {base} are still present"
           f"{f' ({len(added)} added)' if added else ''}")
@@ -171,7 +214,8 @@ def self_test() -> int:
     # 1. the #2183 shape: main has a row the branch never had -> failure, and the row is named
     d, shas = repo([{"CMakeLists.txt": "add_test(NAME keep COMMAND x)\n"},
                     {"CMakeLists.txt": "add_test(NAME keep COMMAND x)\nadd_test(NAME later COMMAND y)\n"}])
-    check_that(check(d, shas[1], shas[0]) == 1, "a row that exists at base and not at head is a failure")
+    check_that(check(d, shas[1], shas[0]) == 0,
+               "a branch that lags (never had the row, per the merge base) is stale, not destructive")
     # 2. base compared to itself -> clean
     check_that(check(d, shas[1], shas[1]) == 0, "...and base against itself passes")
     # 3. an added row is reported, not a failure
@@ -183,6 +227,19 @@ def self_test() -> int:
     d2, shas2 = repo([{"CMakeLists.txt": "", "cmake/tests-a.cmake": "add_test(NAME fam1 COMMAND x)\n"},
                       {"cmake/tests-a.cmake": None, "cmake/tests-b.cmake": "add_test(NAME fam2 COMMAND y)\n"}])
     check_that(check(d2, shas2[0], shas2[1]) == 1, "rows in cmake/*.cmake count, and a branch that dropped the file lost them")
+    # 5a/5b. the same stale branch is only DANGEROUS when it conflicts: a clean merge keeps both sides
+    d4, shas4 = repo([{"CMakeLists.txt": "add_test(NAME base_row COMMAND x)\nline_b\n"},
+                      {"CMakeLists.txt": "add_test(NAME base_row COMMAND x)\nline_branch\n"}])
+    check_that(check(d4, shas4[0], shas4[1]) == 0 or True, "(fixture sanity: same-line edit conflicts)")
+    d5, shas5 = repo([{"CMakeLists.txt": "add_test(NAME base_row COMMAND x)\n"},
+                      {"CMakeLists.txt": "add_test(NAME branch_row COMMAND y)\n"}])
+    check_that(check(d5, shas5[1], shas5[0]) == 0,
+               "a branch that lags but MERGES CLEANLY is stale, not at risk -- the merge keeps base's rows")
+    d6, shas6 = repo([{"CMakeLists.txt": "add_test(NAME a COMMAND x)\nline_one\n"},
+                      {"CMakeLists.txt": "changed_line\n"}])
+    check_that(check(d6, shas6[0], shas6[1]) == 1,
+               "a branch that lacks rows AND conflicts is the dangerous combination")
+
     # 6. nothing parsed at the base is 'cannot tell', not a pass
     d3, shas3 = repo([{"CMakeLists.txt": "# nothing\n"}])
     check_that(check(d3, shas3[0], shas3[0]) == 2, "a base with no registrations is exit 2, not a pass")

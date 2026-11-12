@@ -59,8 +59,8 @@ Description=Evict the 1bit q4nx cache (engine#2263: nothing sweeps a box that ne
 
 [Service]
 Type=oneshot
-ExecStart=$1 q4nx-cache evict --max-gib $max_gib --min-age $min_age
-# The command is its own lock: two sweeps racing would fight over the same entries for no gain.
+ExecStart="$1" q4nx-cache evict --max-gib $max_gib --min-age $min_age
+# systemd will not start a second instance of this oneshot unit while one is active, so two sweeps cannot race.
 Nice=10
 EOF
 }
@@ -109,7 +109,7 @@ if [ "${self:-0}" = 1 ]; then
     bad() { printf 'FAIL %s\n' "$1"; fail=1; }
 
     s=$(service_unit /opt/1bit/1bit)
-    case "$s" in *"ExecStart=/opt/1bit/1bit q4nx-cache evict --max-gib 40 --min-age 86400"*)
+    case "$s" in *'ExecStart="/opt/1bit/1bit" q4nx-cache evict --max-gib 40 --min-age 86400'*)
         ok "the service carries the command and both bounds" ;;
         *) bad "the service ExecStart is wrong: $s" ;;
     esac
@@ -203,7 +203,10 @@ if [ "$dry" = 1 ]; then
         if verdict=$(systemd-analyze verify "$tmp/1bit-q4nx-cache.service" "$tmp/1bit-q4nx-cache.timer" 2>&1); then
             printf 'verify: systemd accepts both units\n'
         else
-            printf 'verify: FAILED\n%s\n' "$(printf '%s' "$verdict" | grep -v 'is not executable')"
+                        # systemd adds "is not executable" for any ExecStart it cannot stat -- true of a dry run against a
+            # placeholder, and also the exact message a space-riddled path produces. Filtering it out left the
+            # operator with a bare "FAILED" for the one failure this check exists to catch, so print it all.
+            printf 'verify: FAILED\n%s\n' "$verdict"
             printf 'dry run: nothing was changed, and nothing would be installed until this passes\n'
             exit 1
         fi

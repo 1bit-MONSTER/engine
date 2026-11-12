@@ -431,6 +431,19 @@ struct ImportPlan {
 };
 ImportPlan container_import_plan(const Q4nxContainer& container, const std::vector<std::string>& layer_types);
 
+// engine#1788, 3c: the I/O half -- copy each planned byte range out of the container's payload into one file per
+// destination slot, plus a manifest. It REFUSES to write when the container has tensors the plan could not place, unless
+// `allow_unplaced` is set: a pack that silently omits a fifth of the model is worse than no pack, and the caller is the
+// only one who can decide that an omission is intended.
+struct WriteLayoutResult {
+    bool ok = false;
+    int64_t files = 0;
+    int64_t bytes = 0;
+    std::string why;          // why it refused, or what failed, when ok is false
+};
+WriteLayoutResult container_write_layout(const std::string& payload_path, const ImportPlan& plan,
+                                         const std::string& out_dir, bool allow_unplaced);
+
 // engine#1788, slice 3c: the writer's per-TENSOR decision, which is what an import actually iterates. Reads the tensor's
 // own layer, takes that layer's declared type, and asks the table above for a destination. A tensor with no role and a
 // tensor with a role but no destination are counted apart, because the first is a vocabulary gap and the second is a

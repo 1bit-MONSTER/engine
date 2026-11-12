@@ -3482,6 +3482,38 @@ static std::string group_suffix_slot(const std::string& role, const std::string&
     return std::string();
 }
 
+WriteLayoutResult container_write_layout(const std::string& payload_path, const ImportPlan& plan,
+                                         const std::string& out_dir, bool allow_unplaced) {
+    WriteLayoutResult r;
+    if (!plan.unplaced.empty() && !allow_unplaced) {
+        r.why = std::to_string(plan.unplaced.size()) + " tensor(s) have no destination (e.g. " + plan.unplaced.front() +
+                "); refusing to write a partial pack";
+        return r;
+    }
+    std::ifstream in(payload_path, std::ios::binary);
+    if (!in) { r.why = "cannot open the payload: " + payload_path; return r; }
+    std::error_code ec;
+    std::filesystem::create_directories(out_dir, ec);
+    if (ec) { r.why = "cannot create " + out_dir + ": " + ec.message(); return r; }
+    for (const auto& item : plan.items) {
+        in.seekg(item.begin);
+        std::string bytes(size_t(item.end - item.begin), '\0');
+        if (!in.read(&bytes[0], std::streamsize(bytes.size()))) {
+            r.why = "short read at " + std::to_string(item.begin) + " for " + item.source;
+            return r;
+        }
+        const std::string path = out_dir + "/" + item.slot;
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) { r.why = "cannot write " + path; return r; }
+        out.write(bytes.data(), std::streamsize(bytes.size()));
+        if (!out) { r.why = "short write to " + path; return r; }
+        ++r.files;
+        r.bytes += int64_t(bytes.size());
+    }
+    r.ok = true;
+    return r;
+}
+
 ImportPlan container_import_plan(const Q4nxContainer& container, const std::vector<std::string>& layer_types) {
     ImportPlan out;
     out.payload_bytes = container.payload_bytes;

@@ -5432,6 +5432,54 @@ void test_container_import_plan() {
     check(okp.unplaced.empty() && okp.bytes == 24, "import: disjoint ranges out of order are fine");
 }
 
+// engine#1788, 3c: the I/O half. Writes real files to a scratch dir and reads them back -- the only way to know the byte
+// ranges are the right bytes.
+void test_container_write_layout() {
+    namespace fs = std::filesystem;
+    using pi::Q4nxTensor;
+    const std::string dir = (fs::temp_directory_path() / "onebit-write-layout-test").string();
+    fs::remove_all(dir); fs::create_directories(dir);
+    const std::string payload = dir + "/payload.bin";
+    { std::ofstream o(payload, std::ios::binary); for (int i = 0; i < 64; ++i) o.put(char('A' + (i % 26))); }
+
+    pi::Q4nxContainer c;
+    const auto t = [](const std::string& n, int64_t b, int64_t e) {
+        Q4nxTensor x; x.name = n; x.shape = {2, 2}; x.dtype = "I8"; x.begin = b; x.end = e; return x;
+    };
+    c.tensors = {t("model.embed_tokens.weight", 0, 8), t("model.layers.0.self_attn.q_proj.weight", 8, 24)};
+    c.payload_bytes = 64;
+    const pi::ImportPlan plan = pi::container_import_plan(c, {"full_attention"});
+
+    const std::string out = dir + "/out";
+    const pi::WriteLayoutResult w = pi::container_write_layout(payload, plan, out, false);
+    check(w.ok, "write: a complete plan writes");
+    check(w.files == 2, "write: one file per placed tensor");
+    check(w.bytes == 24, "write: and the bytes are the ranges, not the payload");
+    {
+        std::ifstream i1(out + "/model.embed_tokens.weight", std::ios::binary);
+        std::string s1((std::istreambuf_iterator<char>(i1)), std::istreambuf_iterator<char>());
+        check(s1 == "ABCDEFGH", "write: the embedding carries ITS bytes (0..8)");
+        std::ifstream i2(out + "/model.layers.0.self_attn.q_proj.weight", std::ios::binary);
+        std::string s2((std::istreambuf_iterator<char>(i2)), std::istreambuf_iterator<char>());
+        check(s2 == "IJKLMNOPQRSTUVWX", "write: the projection carries ITS bytes (8..24)");
+    }
+
+    // the refusal: an unplaced tensor means the pack would silently omit part of the model
+    pi::Q4nxContainer bad;
+    bad.tensors = {t("model.embed_tokens.weight", 0, 8), t("model.layers.0.mystery.weight", 8, 16)};
+    bad.payload_bytes = 64;
+    const pi::ImportPlan bp = pi::container_import_plan(bad, {});
+    const std::string out2 = dir + "/out2";
+    const pi::WriteLayoutResult w2 = pi::container_write_layout(payload, bp, out2, false);
+    check(!w2.ok, "write: an incomplete plan is refused");
+    check(w2.why.find("no destination") != std::string::npos, "write: and says why");
+    check(!fs::exists(out2 + "/model.embed_tokens.weight"), "write: and writes NOTHING, not a partial pack");
+    // ... unless the caller says the omission is intended
+    const pi::WriteLayoutResult w3 = pi::container_write_layout(payload, bp, out2, true);
+    check(w3.ok && w3.files == 1, "write: allow_unplaced writes the placed part and no more");
+    fs::remove_all(dir);
+}
+
 void test_container_placement() {
     using pi::Q4nxTensor;
     const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
@@ -6715,6 +6763,7 @@ int main(int argc, char** argv) {
         test_container_roles_gemma_local();
         test_container_roles_moe_and_singular_layer();
         test_container_placement();
+        test_container_write_layout();
         test_container_import_plan();
         test_scale_and_proj_norm_roles();
         test_role_tables_disagree_nowhere();

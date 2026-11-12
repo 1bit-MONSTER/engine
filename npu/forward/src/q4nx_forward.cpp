@@ -1112,6 +1112,19 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                    "position; file the kind you need instead of converting it";
             return false;
         }
+        // LFM3 names its gated short-convolution layers in layer_types ("conv"); LFM2 does not, and the container
+        // decides there (model_shortconv_layers, above).  When both speak they have to agree layer for layer: a
+        // "conv" entry the container has no conv tensors for would run as attention with no attention weights,
+        // and a conv layer listed as attention would be given a KV cache and the wrong RoPE.
+        for (int l = 0; l < sem_.n_layer_types && l < c_.NL; l++) {
+            const bool said_conv = sem_.layer_types[l] == Q4NX_LAYER_CONV;
+            if (said_conv == is_conv_layer(l) || (!said_conv && !shortconv_)) continue;
+            err_ = "config.json layer_types[" + std::to_string(l) + "] is \"" +
+                   (said_conv ? std::string("conv") : std::string("attention")) + "\" but model.q4nx " +
+                   (is_conv_layer(l) ? "holds" : "has no") + " model.layers." + std::to_string(l) +
+                   ".shortconv (conv) tensors for that layer";
+            return false;
+        }
         // Refuse rather than silently apply full-attention math to a model whose
         // config declares layer types (or RoPE variants) this forward lacks.
         // Refusal is now precise.  Only layers whose attention MATH we do not
@@ -1828,6 +1841,23 @@ bool Q4nxNpuForward::load_norms() {
         layer_attn_dims(l, hd_l, nkv_l);
         if (!read_bf16(&mw_->layers[l].input_layernorm_weight, in_norm_[l].data(), H)) return false;
         if (!read_bf16(&mw_->layers[l].post_attention_layernorm_weight, post_norm_[l].data(), H)) return false;
+        // LFM3: the per-head sigmoid output gate, self_attn.gate_proj [heads, hidden] in bf16, on every attention
+        // layer.  Missing, it would leave the context ungated, so a layer without one is refused by name.
+        if (sem_.attn_head_gate) {
+            if (l == 0) head_gate_.assign((size_t)NL, std::vector<float>());
+            const TensorDesc* gd = &mw_->layers[l].self_attn_gate_proj_weight;
+            if (!is_conv_layer(l)) {
+                if (absent(gd) || strcmp(gd->dtype, "BF16") != 0 || gd->ndim != 2 || gd->shape[0] != c_.NH ||
+                    gd->shape[1] != H) {
+                    err_ = "config.json's model_type gates each attention head (LFM3) and model.layers." +
+                           std::to_string(l) + ".self_attn.gate_proj.weight is not bf16 [num_attention_heads, "
+                           "hidden_size]";
+                    return false;
+                }
+                head_gate_[(size_t)l].resize((size_t)c_.NH * (size_t)H);
+                if (!read_bf16(gd, head_gate_[(size_t)l].data(), c_.NH * H)) return false;
+            }
+        }
         // engine#1889: the config says q and k are normalised and this layer has no gain to normalise with. read_bf16
         // would hand back zeros for the absent tensor and rmsnorm(q, 0) is 0 for every head, so the layer would attend
         // uniformly and answer fluent nonsense. A Hunyuan container imported before the importer claimed the gains is
@@ -1921,6 +1951,18 @@ bool Q4nxNpuForward::load_norms() {
         }
     }
     return true;
+}
+
+void Q4nxNpuForward::apply_head_gate(int l, const float* xn, float* ctx, int hd) const {
+    if (l < 0 || (size_t)l >= head_gate_.size() || head_gate_[(size_t)l].empty()) return;
+    const int H = c_.H;
+    const float* w = head_gate_[(size_t)l].data();
+    for (int h = 0; h < c_.NH; h++) {
+        double z = 0.0;
+        for (int k = 0; k < H; k++) z += (double)w[(size_t)h * H + k] * (double)xn[k];
+        const float g = 1.0f / (1.0f + std::exp(-(float)z));
+        for (int i = 0; i < hd; i++) ctx[(size_t)h * hd + i] *= g;
+    }
 }
 
 void Q4nxNpuForward::layer_attn_dims(int l, int& hd, int& nkv) const {
@@ -4316,6 +4358,8 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                 for (int m = 0; m < M; m++)
                     if (!row_attn(m, CTX.data() + (size_t)m * ctx_w, true, 0)) return false;
             }
+            for (int m = 0; m < M; m++)
+                apply_head_gate(l, XN.data() + (size_t)m * H, CTX.data() + (size_t)m * ctx_w, l_hd);
             const Q4nxDesignGeom* go = &designs_[i_o_l];
             Q4nxProjections po{};
             po.o = wo_.data();
@@ -5493,6 +5537,7 @@ bool Q4nxNpuForward::step_impl(int token, int pos, std::vector<float>& logits, i
             if (gate_ptr)
                 for (int i = 0; i < nhd; i++)
                     ctx[i] *= 1.0f / (1.0f + expf(-gate_ptr[i]));
+            apply_head_gate(l, xn.data(), ctx.data(), l_hd);
         }
         {
             const Q4nxDesignGeom* g = &designs_[i_o_l];

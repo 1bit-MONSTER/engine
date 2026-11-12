@@ -83,8 +83,15 @@ inline int argmax(const float* p, int n) {
 class RowSampler {
 public:
     virtual ~RowSampler() = default;
+    // -1 from pick() (or a refusal whose residual is -1) means nothing may follow: the run ends there, cleanly
+    // (Result::sampler_ended), as a grammar with no token left ends a plain reply.
     virtual int pick(const float* logits, int V) = 0;
     virtual SpecStep check(const float* logits, int V, int x) = 0;
+    // Called once per round, after the round's own token was emitted and before its drafts are checked. A sampler
+    // whose choices depend on the tokens before them (a grammar) checks draft i in the state after drafts 0..i-1
+    // and must start each round from the state the emitted tokens left; check() advancing that state past a kept
+    // draft is its own business.
+    virtual void begin_round() {}
 };
 
 // The bookkeeping of a drafter that keeps its own stream (the MTP layer attends over its own states, so its
@@ -272,6 +279,7 @@ struct Result {
     std::vector<int> tokens;
     Stats stats;
     bool ok = false;
+    bool sampler_ended = false;   // the sampler had no token to give (RowSampler::pick() == -1): a clean end
     std::string err;
 };
 
@@ -321,6 +329,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
         // The base model's own choice for the next position: always emitted, never speculative.
         const int t1 = pending >= 0 ? pending : smp ? smp->pick(logits.data(), V) : argmax(logits.data(), V);
         pending = -1;
+        if (t1 < 0 && smp) { r.sampler_ended = true; break; }
         if (t1 < 0) { r.err = "no logits"; return r; }
         const bool keep_going = emit(t1, logits.data());
         if (!keep_going) break;
@@ -376,6 +385,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
             for (int i = 0; i < nd && i < Stats::kMaxDepth; i++) r.stats.drafted_at[i]++;
             int a = 0;
             if (all.size() < (size_t)(nd + 1) * (size_t)W) { r.err = "verify batch: short logits"; return r; }
+            if (smp) smp->begin_round();
             while (a < nd && keeps(&all[(size_t)a * (size_t)W], d[(size_t)a])) a++;
             // nd <= left, so every accepted draft fits the budget; only the consumer can stop the prefix early.
             int take = 0;
@@ -455,6 +465,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
         // Draft i is accepted only if the model's own choice at that position is that token: draft 0 is
         // checked against the logits of the last step, draft i>0 against row i-1 of the batch.
         int a = 0;
+        if (smp) smp->begin_round();
         for (int i = 0; i < nd; i++) {
             const float* lg = (i == 0) ? logits.data() : &all[(size_t)(i - 1) * (size_t)W];
             if (!keeps(lg, d[(size_t)i])) break;

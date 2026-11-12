@@ -249,6 +249,15 @@ def main():
         write_tokenizer(out)
         prompts = [[40, 41, 42, 43, 40, 41, 42, 43, 40, 41], list(range(60, 90)), [7, 7, 7, 7, 7, 7], [200, 3, 200, 3, 200]]
         base = [{"prompt": p, "max_tokens": n, "temperature": 0} for p in prompts for n in (1, 5, 24)]
+        # Constrained (greedy): each draft is checked in the grammar state after the drafts before it, and the reply must
+        # be the plain server's. The first grammar forces "b" after "a" and "d" after "c", so on a prompt of those
+        # pairs the lookup's drafts are often the forced token and are kept.
+        ab = list(b"abcdabcdabcdab")
+        grammar = 'root ::= ("ab" | "cd" | "e")+'
+        constrained = [{"prompt": ab, "max_tokens": 24, "temperature": 0, "grammar": grammar},
+                       {"prompt": prompts[1], "max_tokens": 24, "temperature": 0,
+                        "response_format": {"type": "json_object"}}]
+        base += constrained
         # A sampled request (seeded, so both servers draw the same tokens) must stay on the plain loop.
         sampled = [{"prompt": prompts[1], "max_tokens": 16, "temperature": 0.8, "seed": 7}]
         # --spec-sample's own requests: sampled, seeded, one on a repeating prompt so the lookup has drafts to offer.
@@ -297,9 +306,11 @@ def main():
                         c = j["choices"][0]
                         replies[name].append((c["text"], c["finish_reason"], j["usage"]["completion_tokens"]))
                     if name == "sample":
+                        j = post(port, {"prompt": ab, "max_tokens": 24, "temperature": 0.9, "seed": 4, "grammar": grammar})
+                        replies["sample_grammar"] = j["choices"][0]["text"]
                         # Near-greedy: at temperature 0.001 the distribution is the argmax's to within e^-10 on these
                         # logits, so the draft check must refuse what greedy refuses and the text is plain greedy's.
-                        cold = [dict(b, temperature=0.001, seed=3) for b in base if b["max_tokens"] == 24]
+                        cold = [dict(b, temperature=0.001, seed=3) for b in base if b["max_tokens"] == 24 and b not in constrained]
                         replies["cold"] = []
                         for b in cold:
                             j = post(port, b)
@@ -323,7 +334,8 @@ def main():
                     continue   # with --spec-sample a sampled reply is a different draw; checked below
                 ok = a == c
                 fails += not ok
-                what = (f"prompt {prompts.index(b['prompt'])} max_tokens {b['max_tokens']}"
+                what = (f"prompt {prompts.index(b['prompt']) if b['prompt'] in prompts else 'ab'} max_tokens {b['max_tokens']}"
+                        + (" grammar" if "grammar" in b else " json_object" if "response_format" in b else "")
                         + (f" stop {b['stop']!r}" if "stop" in b else "")
                         + (f" temperature {b['temperature']}" if b["temperature"] else ""))
                 print(f"{'PASS' if ok else 'FAIL'}  {arm}: {what}: {c[2]} tokens, finish {c[1]}"
@@ -366,6 +378,24 @@ def main():
         ok = kept > 0
         fails += not ok
         print(f"{'PASS' if ok else 'FAIL'}  spec: the chat requests with logprobs kept {kept} drafts")
+        import re
+        g_lines = [l for l in logs["spec"].splitlines() if l.startswith("[spec] lookup grammar ")]
+        g_kept = sum(int(l.split(" drafts accepted")[0].split(", ")[-1].split(" of ")[0]) for l in g_lines)
+        ok = len(g_lines) == len(constrained) and g_kept > 0
+        fails += not ok
+        print(f"{'PASS' if ok else 'FAIL'}  spec: {len(g_lines)} of {len(constrained)} constrained requests took the "
+              f"speculative path and kept {g_kept} drafts")
+        sg = replies["sample_grammar"]
+        ok = bool(re.fullmatch(r"(ab|cd|e)+", sg)) and any(l.startswith("[spec] lookup grammar ")
+                                                            for l in logs["sample"].splitlines())
+        fails += not ok
+        print(f"{'PASS' if ok else 'FAIL'}  sample: a sampled constrained reply speculates and stays in its grammar ({sg!r})")
+        # Unset, --spec-fallback is the drafter's default: 2 tokens per round for the lookup, 3 for a draft model.
+        for arm, want in (("spec", 2), ("dflash", 3), ("sample", 2)):
+            line = f"speculative decode falls back to plain below {want} tokens per round (default)"
+            ok = line in logs[arm]
+            fails += not ok
+            print(f"{'PASS' if ok else 'FAIL'}  {arm}: unset --spec-fallback is the drafter's default ({want})")
         sc = replies["sample_chat_sampled"]
         ok = len(sc[2]) >= 2 and all(l <= 0 and len(x) == 3 and x[0][1] >= l for _, l, x in sc[2])
         fails += not ok
@@ -391,7 +421,7 @@ def main():
                   f"{greedy} greedy ones ({accepted} of {drafted} drafts accepted, {len(dry)} multi-token requests without a draft); the sampled one "
                   f"and the plain server never")
         greedy24 = [r for b, r in zip(cases, replies["plain"]) if not b["temperature"] and b["max_tokens"] == 24
-                    and "stop" not in b]
+                    and "stop" not in b and b not in constrained]
         for i, (a, c) in enumerate(zip(greedy24, replies["cold"])):
             ok = a == c
             fails += not ok

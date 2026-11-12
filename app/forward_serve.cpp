@@ -143,9 +143,12 @@ struct ForwardEngine {
     // KL-divergence comparison against another stack (engine#671 gate b) needs the distribution
     // itself.  Empty means off, which is the default: nothing is written unless asked.
     std::string dump_logits;
-    // --spec-lookup K (engine#1781): a greedy request without grammar decodes through mtp::run_from() with
+    // --spec-lookup K (engine#1781): a greedy request (grammar or not) decodes through mtp::run_from() with
     // the prompt-lookup drafter, up to K drafts verified per batch; 0 = off (the default). --spec-fallback X: stop
-    // drafting for the rest of a reply once its last 3 rounds averaged fewer than X tokens (0 = never).
+    // drafting for the rest of a reply once its last 3 rounds averaged fewer than X tokens (0 = never). Unset, it
+    // defaults to 2 with the lookup drafter and 3 with a draft model: below that a round costs more than the plain steps
+    // it replaces (served 27B, prose, A B A B: a draft that keeps 2.24 tokens per round ran 2.51 tok/s with no fallback
+    // against 3.88 with the default, which stops drafting after round 5).
     int spec_lookup = 0;
     double spec_fallback = 0.0;
     // --spec-sample: a sampled request (temperature > 0) takes the speculative path too, its drafts kept or refused by
@@ -516,20 +519,23 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // unconditionally allowed (engine#1182: the model drifts into them once the grammar leaves it
         // nothing to say, and they emit no text and never end the reply).
         const size_t vocab = size_t(e.tok->size());
-        auto refresh_allowed = [&]() {
-            allowed.assign(logits.size(), 0);
-            const npu::ByteMask first = gram->next_bytes(grammar_state);
+        // The mask in any grammar state: the plain loop's (refresh_allowed) and, for each draft of a speculative round,
+        // the state after the drafts before it (ServeConstraint below).
+        auto mask_for = [&](const npu::Grammar::State& st, std::vector<char>& out) {
+            out.assign(logits.size(), 0);
+            const npu::ByteMask first = gram->next_bytes(st);
             for (size_t i = 0; i < logits.size() && i < vocab; i++) {
                 const std::string& t = e.tok_text[i];
                 if (t.empty()) {
-                    allowed[i] = 1;  // a half-character byte fragment cannot leave the grammar
+                    out[i] = 1;  // a half-character byte fragment cannot leave the grammar
                 } else if (first.has(static_cast<unsigned char>(t[0]))) {
-                    npu::Grammar::State probe = grammar_state;
-                    allowed[i] = gram->feed(probe, t) ? 1 : 0;
+                    npu::Grammar::State probe = st;
+                    out[i] = gram->feed(probe, t) ? 1 : 0;
                 }
             }
-            npu::allow_end_tokens(allowed, grammar_state, end_ids);
+            npu::allow_end_tokens(out, st, end_ids);
         };
+        auto refresh_allowed = [&]() { mask_for(grammar_state, allowed); };
 
         std::string pending;  // decoded, not yet sent: a stop sequence may still match in it
         // Entries whose bytes are still held in `pending`, each with the bytes of its piece not yet
@@ -595,13 +601,14 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             return true;
         };
         // engine#1781: the speculative path, only where it cannot change a token. Greedy, so each token is the bounded
-        // argmax the verify rows check drafts against; no grammar (its mask is per token and per state); no logit dump
-        // (it writes one file per decode step). The text is then the plain loop's token for token -- what
+        // argmax the verify rows check drafts against; no logit dump (it writes one file per decode step). A grammar
+        // goes through the sampler: each draft is checked in the grammar state after the drafts before it, the token
+        // the round emits is the masked choice, and so a constrained greedy reply is still the plain loop's. The text is then the plain loop's token for token -- what
         // tests/serve_spec_lookup_test.py holds it to. Logprobs are reported from the row each token came from
         // (Options::on_token_row), the base's own logits at that position, as the plain loop reports them.
         // --spec-sample widens it to sampled requests, whose drafts are then judged by the distribution-keeping rule
         // instead (npu::SpecSampler): the reply follows the same distribution as the plain loop's, not its stream.
-        const bool spec = (e.spec_lookup > 0 || e.draft) && (opts.sample.greedy() || e.spec_sample) && !gram &&
+        const bool spec = (e.spec_lookup > 0 || e.draft) && (opts.sample.greedy() || e.spec_sample) &&
                           e.dump_logits.empty();
         if (spec) {
             struct ServeBase : npu::mtp::BaseModel {
@@ -649,14 +656,35 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                                                                    e.draft->cfg.block_size, e.draft->cfg.sliding_window);
             }
             npu::mtp::DraftHead& head = dflash ? static_cast<npu::mtp::DraftHead&>(*dflash) : lookup;
-            npu::SpecSampler sampler(opts.sample, rng);   // used for a sampled request (npu_spec_sampler.h)
+            // The grammar as a TokenConstraint: the committed state is grammar_state, which deliver() advances as
+            // tokens are emitted; a round starts from a copy of it and moves the copy past each kept draft.
+            struct ServeConstraint : npu::TokenConstraint {
+                const std::function<void(const npu::Grammar::State&, std::vector<char>&)> mask;
+                const npu::Grammar& g;
+                const npu::Grammar::State& committed;
+                const std::vector<std::string>& text;
+                npu::Grammar::State round;
+                ServeConstraint(std::function<void(const npu::Grammar::State&, std::vector<char>&)> m,
+                                const npu::Grammar& gr, const npu::Grammar::State& c, const std::vector<std::string>& t)
+                    : mask(std::move(m)), g(gr), committed(c), text(t) {}
+                void mask_committed(std::vector<char>& out) override { mask(committed, out); }
+                void begin_round() override { round = committed; }
+                void mask_round(std::vector<char>& out) override { mask(round, out); }
+                void advance_round(int t) override {
+                    if (t >= 0 && size_t(t) < text.size()) g.feed(round, text[size_t(t)]);
+                }
+            };
+            std::unique_ptr<ServeConstraint> constraint;
+            if (gram) constraint = std::make_unique<ServeConstraint>(mask_for, *gram, grammar_state, e.tok_text);
+            // Sampled or constrained requests choose through it (npu_spec_sampler.h); plain greedy ones need none.
+            npu::SpecSampler sampler(opts.sample, rng, constraint.get());
             npu::mtp::Options o;
             o.k = e.draft ? e.spec_draft_k : e.spec_lookup;
             o.max_tokens = limit;
             o.tau = 0.0f;
             o.fallback_below = e.spec_fallback;
             o.consume_last = false;   // the plain loop does not run the reply's last token either
-            o.sampler = opts.sample.greedy() ? nullptr : &sampler;
+            o.sampler = (opts.sample.greedy() && !gram) ? nullptr : &sampler;
             // Each token with the row it came from, so a request with logprobs reports them from the same row the
             // plain loop would have: the base's own logits at that position, at the head's full width.
             o.on_token_row = [&](int t, const float* row) {
@@ -665,8 +693,10 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             };
             const npu::mtp::Result r = npu::mtp::run_from(base, &head, int(ids.size()), logits, o);
             if (!r.ok) throw std::runtime_error("speculative decode: " + r.err);
+            // the grammar allowed no token: the answer ends where it is, as the plain loop's -1 does
+            if (r.sampler_ended) stopped_at_eos = true;
             std::fprintf(stderr, "[spec] %s%s %d tokens: %d rounds, %d of %d drafts accepted, %d plain steps%s\n",
-                         e.draft ? "dflash" : "lookup", o.sampler ? " sampled" : "", int(r.tokens.size()), r.stats.batches, r.stats.accepted, r.stats.drafted, r.stats.steps,
+                         e.draft ? "dflash" : "lookup", gram ? " grammar" : o.sampler ? " sampled" : "", int(r.tokens.size()), r.stats.batches, r.stats.accepted, r.stats.drafted, r.stats.steps,
                          r.stats.fell_back_at >= 0 ? (", fell back after round " + std::to_string(r.stats.fell_back_at)).c_str()
                                                    : "");
         }
@@ -1179,6 +1209,7 @@ int run_forward_serve(int argc, char** argv) {
     int ctx_size = 0;                // --ctx-size N: prompt plus answer, at most the model's own (0 = the model's)
     int spec_lookup = 0;             // --spec-lookup K (engine#1781): prompt-lookup drafts, K per verify batch
     double spec_fallback = 0.0;      // --spec-fallback X: stop drafting below X tokens per round
+    bool fallback_set = false;       // unset: the drafter's default (below)
     bool spec_sample = false;        // --spec-sample: sampled requests speculate too (distribution-keeping rule)
     std::string spec_draft;          // --spec-draft <dir>: a DFlash draft package as the drafter
     int spec_draft_k = 0;            // --spec-draft-k K: drafts per round (default: the package's block - 1)
@@ -1202,7 +1233,7 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--npu-target") npu_target = next();
         else if (a == "--dump-logits") dump_logits = next();
         else if (a == "--spec-lookup") spec_lookup = std::stoi(next());
-        else if (a == "--spec-fallback") spec_fallback = std::stod(next());
+        else if (a == "--spec-fallback") { spec_fallback = std::stod(next()); fallback_set = true; }
         else if (a == "--spec-sample") spec_sample = true;
         else if (a == "--spec-draft") spec_draft = next();
         else if (a == "--spec-draft-k") spec_draft_k = std::stoi(next());
@@ -1217,6 +1248,10 @@ int run_forward_serve(int argc, char** argv) {
         throw std::runtime_error("--spec-lookup takes 0..15 drafts per round (a verify batch holds at most 16 rows), not " +
                                  std::to_string(spec_lookup));
     if (!(spec_fallback >= 0.0)) throw std::runtime_error("--spec-fallback takes a number of tokens >= 0");
+    if (!fallback_set) spec_fallback = !spec_draft.empty() ? 3.0 : spec_lookup > 0 ? 2.0 : 0.0;
+    if (spec_lookup > 0 || !spec_draft.empty())
+        std::fprintf(stderr, "1bit forward-serve: speculative decode falls back to plain below %g tokens per round (%s)\n",
+                     spec_fallback, fallback_set ? "--spec-fallback" : "default");
     if (spec_sample && spec_lookup == 0 && spec_draft.empty())
         throw std::runtime_error("--spec-sample needs a drafter (--spec-lookup K or --spec-draft <dir>)");
     if (streams < 1 || streams > kNpuMaxStreams)

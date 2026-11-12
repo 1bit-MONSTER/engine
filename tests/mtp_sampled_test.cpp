@@ -34,7 +34,11 @@
 //       temperature, top_k and top_p: both round shapes against the exact product of sample_probs() rows;
 //   [9] a base whose rows are wider than its vocabulary (row_stride(), padding ids with the LARGEST logits, as a
 //       misaligned read would find them): greedy replies equal plain, and on_token_row hands every token the base's
-//       own full row for its position, greedy and sampled, both round shapes.
+//       own full row for its position, greedy and sampled, both round shapes;
+//   [10] under a constraint (a toy grammar: no token twice in a row, never 2 after 1), through forward-serve's sampler:
+//       greedy replies equal the constrained plain loop, every token obeys the rule, sampled replies follow the exact
+//       product of the masked rows (a sampler that checks every draft in the round's FIRST state is caught), and a
+//       constraint that allows nothing ends the run cleanly (Result::sampler_ended).
 #include "mtp/draft.h"
 #include "npu_spec_sampler.h"
 
@@ -293,6 +297,94 @@ int row_mismatches(int mode, bool sampled, uint64_t seed, int pad, std::vector<i
     return r.ok && (int)r.tokens.size() == 24 ? bad : 1000;
 }
 
+// [10]'s toy grammar. The committed state is the last emitted token (the test advances it from on_token_row); the
+// round's state is its copy, moved past kept drafts. `limit`: after that many committed tokens nothing is allowed.
+bool chain_ok(int last, int v) { return v != last && !(last == 1 && v == 2); }
+class ChainConstraint : public onebit::npu::TokenConstraint {
+public:
+    int committed = kPrompt, round = kPrompt, emitted = 0, limit = 1 << 30;
+    bool stale_round = false;   // the mutant: the round's state never moves past a kept draft
+    void mask_committed(std::vector<char>& m) override { fill(m, committed, emitted >= limit); }
+    void begin_round() override { round = committed; }
+    void mask_round(std::vector<char>& m) override { fill(m, round, emitted >= limit); }
+    void advance_round(int t) override {
+        if (!stale_round) round = t;
+    }
+
+private:
+    static void fill(std::vector<char>& m, int last, bool none) {
+        m.assign(V, 0);
+        for (int v = 0; v < V; v++) m[(size_t)v] = !none && chain_ok(last, v);
+    }
+};
+
+struct Constrained {
+    std::vector<int> tokens;
+    bool ok = false, ended = false, obeys = true;
+};
+Constrained run_constrained(int mode, const onebit::npu::SampleParams& sp, uint64_t seed, int len, bool stale = false,
+                            int limit = 1 << 30) {
+    ChainBase base;
+    std::mt19937_64 rng(seed);
+    ChainConstraint c;
+    c.stale_round = stale;
+    c.limit = limit;
+    onebit::npu::SpecSampler smp(sp, rng, &c);
+    SecondHead head(mode == 1);
+    Options o;
+    o.k = mode == 0 ? 0 : 3;
+    o.max_tokens = len;
+    o.tau = 0.0f;
+    o.sampler = &smp;
+    Constrained out;
+    o.on_token_row = [&](int t, const float*) {
+        if (!chain_ok(c.committed, t)) out.obeys = false;
+        c.committed = t;
+        c.emitted++;
+        return true;
+    };
+    std::vector<float> logits;
+    base.step(kPrompt, 0, logits);
+    Result r = onebit::npu::mtp::run_from(base, mode == 0 ? nullptr : &head, 1, logits, o);
+    out.tokens = r.tokens;
+    out.ok = r.ok;
+    out.ended = r.sampler_ended;
+    return out;
+}
+
+// TV of constrained 3-token replies against the exact product of the masked, renormalised rows (temperature 1).
+double constrained_tv(int mode, bool stale) {
+    onebit::npu::SampleParams sp;
+    sp.temperature = 1.0f;
+    auto row = [](int last) {
+        std::vector<float> p = softmax_row(last);
+        double z = 0;
+        for (int v = 0; v < V; v++) z += chain_ok(last, v) ? p[(size_t)v] : 0.0;
+        for (int v = 0; v < V; v++) p[(size_t)v] = chain_ok(last, v) ? float(p[(size_t)v] / z) : 0.0f;
+        return p;
+    };
+    std::map<int, int> hist;
+    for (int s = 0; s < kRuns; s++) {
+        const Constrained r = run_constrained(mode, sp, 0x7f4a7c159e3779b9ull * (uint64_t)(s + 1) + (uint64_t)mode, kReply, stale);
+        if (!r.ok || (int)r.tokens.size() != kReply) return 1.0;
+        hist[(r.tokens[0] * V + r.tokens[1]) * V + r.tokens[2]]++;
+    }
+    double tv = 0;
+    const std::vector<float> p0 = row(kPrompt);
+    for (int a = 0; a < V; a++) {
+        const std::vector<float> pa = row(a);
+        for (int b = 0; b < V; b++) {
+            const std::vector<float> pb = row(b);
+            for (int c = 0; c < V; c++) {
+                auto it = hist.find((a * V + b) * V + c);
+                const double f = it == hist.end() ? 0.0 : double(it->second) / kRuns;
+                tv += std::fabs(f - (double)p0[(size_t)a] * pa[(size_t)b] * pb[(size_t)c]);
+            }
+        }
+    }
+    return tv / 2;
+}
+
 // [7]: worst row's TV between the observed next-token frequencies after `prev` and softmax_row(prev), over every
 // consecutive pair (the prompt included) of `runs` replies of `len` tokens.
 double transition_tv(int mode, int k, int runs, int len) {
@@ -410,6 +502,33 @@ int main() {
             std::snprintf(what, sizeof what, "[9] %s: every token is handed its own full row (greedy %d, sampled %d off)",
                           names[mode], bad_g, bad_s);
             check(bad_g == 0 && bad_s == 0, what);
+        }
+    }
+
+    {   // [10]
+        onebit::npu::SampleParams greedy;
+        const Constrained plain = run_constrained(0, greedy, 1, 24);
+        check(plain.ok && plain.obeys && plain.tokens.size() == 24, "[10] the constrained plain loop obeys the rule");
+        for (int mode = 1; mode < 3; mode++) {
+            const Constrained g = run_constrained(mode, greedy, 1, 24);
+            char what[200];
+            std::snprintf(what, sizeof what, "[10] %s: a constrained greedy reply equals the constrained plain loop",
+                          names[mode]);
+            check(g.ok && g.tokens == plain.tokens, what);
+            onebit::npu::SampleParams t1;
+            t1.temperature = 1.0f;
+            bool obeys = true;
+            for (uint64_t sd = 1; sd <= 200; sd++) obeys = obeys && run_constrained(mode, t1, sd, 24).obeys;
+            std::snprintf(what, sizeof what, "[10] %s: 200 sampled 24-token replies obey the rule", names[mode]);
+            check(obeys, what);
+            const double tv = constrained_tv(mode, false), stale = constrained_tv(mode, true);
+            std::printf("  %-8s constrained tv %.4f (stale round state %.4f)\n", names[mode], tv, stale);
+            std::snprintf(what, sizeof what, "[10] %s: constrained sampled replies within TV %.2f of the masked product, "
+                          "and a stale round state is not", names[mode], kBound);
+            check(tv < kBound && stale > 2 * kBound, what);
+            const Constrained e = run_constrained(mode, t1, 3, 24, false, 5);
+            std::snprintf(what, sizeof what, "[10] %s: a constraint with nothing left ends the run after 5 tokens", names[mode]);
+            check(e.ok && e.ended && e.tokens.size() == 5, what);
         }
     }
 

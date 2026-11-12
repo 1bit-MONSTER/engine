@@ -3554,8 +3554,8 @@ fewer than `fallback_below` tokens on average, the run finishes with plain steps
 round). `tools/dflash2_probe loop` with `DFLASH2_MTP_RUN=1` drives the served 27B through exactly these pieces, with
 `DFlashHead` and the DFlash 2 selector as its pick hook, after the same batched prefill as its hand-written loop.
 
-**Serving it: `forward-serve --spec-lookup K`** (off by default; `--spec-fallback X` adds the fallback). A request that
-is greedy and has no grammar (on a server without `--dump-logits`) decodes through
+**Serving it: `forward-serve --spec-lookup K`** (off by default; `--spec-fallback X` sets the fallback, which defaults to 2 tokens per round with this drafter and 3 with `--spec-draft`, and `--spec-fallback 0` turns it off: on the served 27B a prose reply that keeps 2.24 tokens per DFlash round ran at 2.51 tok/s without one and 3.88 with the default, A B A B). A request that
+is greedy (on a server without `--dump-logits`) decodes through
 `mtp::run_from()` with the prompt-lookup drafter (`npu/mtp/prompt_lookup.h`). That drafter needs no model: it proposes
 the up to `K` tokens that followed the latest earlier occurrence of the stream's last one to three tokens. Every
 other request takes the plain loop. The rule is that speculation is used only where it cannot change a token: each
@@ -3585,7 +3585,28 @@ row. The test sends chat requests with `top_logprobs` 3 to every server, one of 
 keeps. Each speculative server reports the plain server's tokens, log-probabilities and alternatives exactly
 (difference 0 on the host forward).
 
-**`--spec-sample`** (with either drafter) takes sampled requests (temperature above 0, no grammar) onto
+A request with a grammar (`grammar`, or `response_format` json) takes the path too, its choices made through the
+sampler (`npu::SpecSampler` with a `TokenConstraint`):
+- the round's own token is chosen inside the mask of the grammar state the emitted tokens left;
+- draft `i` is checked inside the mask of that state advanced past drafts `0..i-1`. `RowSampler::begin_round()`
+  starts each round from the committed state, and a kept draft advances the round's copy;
+- greedy, a draft is kept iff it is the masked argmax, so a constrained greedy reply is the plain loop's token for
+  token;
+- sampled (with `--spec-sample`), the rule above runs on the masked distribution;
+- a state that allows no token ends the reply (`Result::sampler_ended`), as it does in the plain loop.
+
+`mtp_sampled [10]` holds this on a toy grammar:
+- greedy replies equal the constrained plain loop;
+- 200 sampled replies per round shape obey the rule;
+- sampled replies sit within TV 0.005-0.006 of the exact masked product, against 0.056 for a sampler that checks
+  every draft in the round's first state;
+- a constraint with nothing left ends the run cleanly.
+
+The serve test adds two greedy constrained requests to every server, a forced-alternation GBNF and a json_object.
+Both equal plain's, and the lookup keeps 11 of their drafts. A sampled constrained reply on the `--spec-sample` server
+stays inside its grammar.
+
+**`--spec-sample`** (with either drafter) takes sampled requests (temperature above 0, with or without a grammar) onto
 the same path. `Options::sampler` (`mtp::RowSampler`, `npu/mtp/draft.h`) turns the loop's choices into draws.
 `npu::SpecSampler` (`app/npu_spec_sampler.h`) is forward-serve's sampler:
 - `pick()` is the plain loop's `sample_token()`;

@@ -1034,6 +1034,61 @@ int main() {
               "one-pass with max_batch_rows() == 1: plain steps, no batch, the drafter still sees every row");
     }
 
+    // [18] run_from(): the loop after a caller's own prefill gives run()'s result; and the fallback stops drafting
+    //      after the window it is given, on both rounds, without changing the text.
+    {
+        Options o = base_opt;
+        o.k = 4;
+        ToyBase a(8), b(8);
+        OnePassHead ha(OnePassHead::kHalf, (int)P.size()), hb(OnePassHead::kHalf, (int)P.size());
+        const Result ra = onebit::npu::mtp::run(a, &ha, P, o);
+        std::vector<float> lg;
+        int pos = 0;
+        for (int t : P) b.step(t, pos++, lg);
+        const Result rb = onebit::npu::mtp::run_from(b, &hb, pos, lg, o);
+        check(ra.ok && rb.ok && same(ra.tokens, rb.tokens) && ra.stats.batches == rb.stats.batches &&
+                  a.consumed() == b.consumed(),
+              "run_from after the caller's prefill: run()'s tokens, batches and positions");
+        ToyBase c(8);
+        OnePassHead hc(OnePassHead::kHalf, 0);
+        check(!onebit::npu::mtp::run_from(c, &hc, 0, std::vector<float>(V, 0.0f), o).ok,
+              "run_from with no prefilled position is refused");
+
+        for (int one_pass : {1, 0}) {
+            ToyBase m(8);
+            OnePassHead og(OnePassHead::kGarbage, (int)P.size());
+            GarbageHead tg;
+            Options f = base_opt;
+            f.k = 4;
+            f.tau = 0.0f;
+            f.fallback_below = 2.0;
+            f.fallback_window = 3;
+            DraftHead* h = one_pass ? (DraftHead*)&og : (DraftHead*)&tg;
+            const Result r = onebit::npu::mtp::run(m, h, P, f);
+            char msg[200];
+            std::snprintf(msg, sizeof msg,
+                          "fallback (%s round): a head that never lands stops after 3 rounds (fell back at %d, %d batches), "
+                          "same text",
+                          one_pass ? "one-pass" : "two-pass", r.stats.fell_back_at, m.batches());
+            check(r.ok && same(r.tokens, ref.tokens) && r.stats.fell_back_at == 3 && m.batches() == 3 &&
+                      m.consumed() == (int)P.size() + WANT,
+                  msg);
+        }
+        ToyBase m(8);
+        OnePassHead op(OnePassHead::kPerfect, (int)P.size());
+        Options f = base_opt;
+        f.k = 4;
+        f.fallback_below = 2.0;
+        const Result r = onebit::npu::mtp::run(m, &op, P, f);
+        check(r.ok && same(r.tokens, ref.tokens) && r.stats.fell_back_at == -1,
+              "fallback: a head that lands every draft never falls back");
+        ToyBase eq(8);
+        OnePassHead oh(OnePassHead::kHalf, (int)P.size());   // every round emits exactly 2: at the bar, not under it
+        const Result re = onebit::npu::mtp::run(eq, &oh, P, f);
+        check(re.ok && same(re.tokens, ref.tokens) && re.stats.fell_back_at == -1,
+              "fallback: rounds of exactly 2 tokens against a bar of 2.0 keep drafting");
+    }
+
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);
     return fails ? 1 : 0;
 }

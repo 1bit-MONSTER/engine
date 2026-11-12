@@ -3413,6 +3413,14 @@ selector) are hooks. `tests/dflash_head_test.cpp` runs it through `mtp::run()` o
 way: the text equals plain decode's, the sink ends holding exactly the committed rows, and every draft equals
 `draft_forward()` over those rows, bit for bit.
 
+Two pieces for a caller that is not a test. `mtp::run_from()` starts the loop from a base that already ran its prompt
+(a batched prefill: the positions it holds and the logits after the last), where `run()` prefills one token at a time.
+And `Options::fallback_below` / `fallback_window` apply the speculation fallback (`SpecFallback`,
+`npu/forward/include/spec_greedy.h`) inside the loop, on either round: once the last `fallback_window` rounds emitted
+fewer than `fallback_below` tokens on average, the run finishes with plain steps (`Stats::fell_back_at` says after which
+round). `tools/dflash2_probe loop` with `DFLASH2_MTP_RUN=1` drives the served 27B through exactly these pieces, with
+`DFlashHead` and the DFlash 2 selector as its pick hook, after the same batched prefill as its hand-written loop.
+
 **What would change the answer**: a cheaper verify batch (the array wait is ~60 % of a batched pass — a kernel
 lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
 6 measured 0 %).

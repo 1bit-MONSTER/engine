@@ -36,6 +36,10 @@
 #       2 = usage/IO problem. Never 0 by accident: a machine where the rule does not apply says so.
 set -u
 
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- several of these ranges
+# had drifted past the end of their header and printed code to whoever asked for help (the same defect engine PR #2258 fixed in scripts/).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
 SYSFS=${SYSFS:-/sys}
 MODE=report
 
@@ -56,7 +60,7 @@ while [ $# -gt 0 ]; do
         --apply)         MODE=apply; shift;;
         --revert)        MODE=revert; shift;;
         --sysfs-root)    SYSFS=${2:?--sysfs-root needs a directory}; shift 2;;
-        -h|--help)       sed -n '17,40p' "$0"; exit 0;;
+        -h|--help)       usage; exit 0;;
         *) echo "xhci_keepawake_check: unknown argument '$1'" >&2; exit 2;;
     esac
 done

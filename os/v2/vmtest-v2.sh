@@ -29,7 +29,11 @@
 #
 # Prints VMTEST-V2 PASS or FAIL.
 set -uo pipefail
-[ $# -ge 2 ] || { sed -n '21,34p' "$0"; exit 2; }
+
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- several of these ranges
+# had drifted past the end of their header and printed code to whoever asked for help (the same defect engine PR #2258 fixed in scripts/).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+[ $# -ge 2 ] || { usage; exit 2; }
 rootfs=$(cd "$1" && pwd) seed=$(cd "$2" && pwd) key=${3:-}
 # an mmdebstrap rootfs is root-owned with root-only files: populating a filesystem image from it and
 # handing it to qemu needs root, so the whole test runs as root rather than half of it

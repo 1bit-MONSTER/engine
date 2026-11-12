@@ -303,7 +303,12 @@ the bf16 rounding reappears for the device, never in the container.
 
 **The cache is bounded, and the bound is least-recently-used (engine#1956).** After writing an
 entry, `1bit serve` removes the least-recently-used entries until the cache is within
-`ONEBIT_Q4NX_CACHE_MAX_GIB` (default 60; `0` or a negative number turns the sweep off). The entry
+`ONEBIT_Q4NX_CACHE_MAX_GIB` (default 60; `0` or a negative number turns the sweep off). The
+forward's device-form conversion (`npu/q4nx_device.cpp`) sweeps the same way after it writes a new
+entry (engine#2263), so a box that converts through the forward and never starts a serve stays
+within the bound too. The sweep itself is `npu/q4nx_cache_sweep.h`, shared by both writers and by
+`1bit q4nx-cache evict`. A box that writes nothing never sweeps; `1bit q4nx-cache evict` is the
+manual trigger for that case. The entry
 just written and any entry used in the last ten minutes are never removed. "Used" means reused,
 not only written: a cache hit — a repacked GGUF found in the cache, or a device-form conversion
 reused at load — marks the entry's directory as used now, so a container imported once and served

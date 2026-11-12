@@ -94,6 +94,10 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/laya_first_default.h
      "// generated from config/laya-first.json by CMakeLists.txt\n#pragma once\n"
      "static const char kDefaultLayaFirstJson[] = R\"ONEBITLAYAFIRST(${ONEBIT_LAYA_FIRST_JSON})ONEBITLAYAFIRST\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/laya-first.json)
+# engine#2263: the Q4NX cache's sweep, below both of its callers: `onebit` (serve start, `1bit q4nx-cache`) and onebit_npu
+# (npu/q4nx_device.cpp, the conversion that writes entries). Its own library so each binary links exactly one copy.
+add_library(onebit_q4nx_cache STATIC npu/q4nx_cache_sweep.cpp)
+target_include_directories(onebit_q4nx_cache PUBLIC ${CMAKE_SOURCE_DIR}/npu)
 add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/route_eval.cpp app/laya_checkpoint.cpp app/laya_first.cpp
                      app/embed_serve.cpp app/embed_model.cpp app/q4nx_cache.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
@@ -149,7 +153,7 @@ if(CMAKE_GENERATOR MATCHES "Makefiles")
         COMMAND ${CMAKE_COMMAND} -E false
         VERBATIM)
 endif()
-target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads onebit_q4nx_cache)
 
 # ── The chat-template renderer (engine #963, docs/npu-chat-template.md) ──────
 # The NPU chat route renders the container's own `chat_template` (app/npu_template.h) with the pinned
@@ -847,7 +851,7 @@ add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_
                             npu/audio_exec.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
-target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
+target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json onebit_q4nx_cache PRIVATE PkgConfig::PCRE2)
 
 # ── npu/forward's forward C++ compiles without the NPU runtime (engine #898) ───────────────
 # CI configures without ONEBIT_NPU, so npu/forward/src/q4nx_forward.cpp - where every A1 defect so
@@ -1264,6 +1268,7 @@ add_executable(embed_model_test tests/embed_model_test.cpp app/embed_model.cpp)
 # age window, and the disabled case). Listed explicitly like the other app/ units so the test needs no `onebit`.
 add_executable(q4nx_cache_test tests/q4nx_cache_test.cpp app/q4nx_cache.cpp)
 target_include_directories(q4nx_cache_test PRIVATE app)
+target_link_libraries(q4nx_cache_test PRIVATE onebit_q4nx_cache)
 add_test(NAME q4nx_cache COMMAND q4nx_cache_test)
 # engine#1956 review: an `add_test` whose target ci.yml never builds never runs in CI -- the documented route, no workflow edit.
 add_dependencies(onebit q4nx_cache_test)

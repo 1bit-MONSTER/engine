@@ -167,6 +167,21 @@ def has_notice(text):
     return NOTICE[0] in head and NOTICE[1] in head and "Licensed under the Apache License, Version 2.0" in head
 
 
+def short_notice(text):
+    """True when the header carries Copyright + SPDX but not the licence block.
+
+    engine#2175: `notice_block()` returns the 16-line form for a known style, so a header that keeps only
+    `// Copyright ...` and `// SPDX-License-Identifier: Apache-2.0` and then jumps to the file's own
+    description reads as MISSING -- and the message says "missing copyright notice", which sends the reader
+    looking for a notice that is on line 1. Measured on engine#2175 / #2173 (their audio headers) against
+    #2133 (the same work, full block): copyright present, SPDX present, "Licensed under the Apache License"
+    absent. Naming the shape is the difference between a 15-line paste and a hunt.
+    """
+    head = "\n".join(text.splitlines()[:NOTICE_WINDOW])
+    return (NOTICE[0] in head and NOTICE[1] in head
+            and "Licensed under the Apache License, Version 2.0" not in head)
+
+
 def duplicated_notice(text):
     """True when the Copyright + SPDX pair appears twice inside the header window.
 
@@ -367,7 +382,12 @@ def main():
     for path in unknown:
         print("no comment style known (add one to LINE_STYLES/BLOCK_STYLES or EXEMPT):", path)
     for path in missing:
-        print("missing copyright notice:", path)
+        # engine#2175: a short header is not a missing notice. Say which, so the fix is a paste rather than a
+        # search -- and keep the exit code the same (this is still a failure: the licence block is required).
+        if short_notice(open(path, encoding="utf-8", errors="replace").read()):
+            print("copyright + SPDX present but the licence block is not (paste the 16-line form):", path)
+        else:
+            print("missing copyright notice:", path)
     if missing or unknown or duplicated:
         print("run: python3 tools/copyright.py --fix", file=sys.stderr)
         return 1

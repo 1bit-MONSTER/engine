@@ -95,6 +95,54 @@ with tempfile.TemporaryDirectory() as repo:
     rc = run(repo, "--check")
     check(rc.returncode == 0, "and the check is green afterwards", rc.stdout + rc.stderr)
 
+    # engine#2175: a SHORT header (Copyright + SPDX, no licence block) is not a "missing copyright notice".
+    # The message has to name the shape, or a reader hunts for a notice that is on line 1 -- measured on
+    # #2175/#2173 whose audio headers kept only the two lines while #2133 carried the full block.
+    short = NOTICE.splitlines()[:2]
+    with open(os.path.join(repo, "short.h"), "w") as f:
+        f.write("\n".join(short) + "\n// short.h -- the file's own description\n")
+    git(repo, "add", "short.h")
+    rc = run(repo, "--check")
+    check(rc.returncode != 0, "a SHORT header still fails (the licence block is required)", rc.stdout)
+    check("copyright + SPDX present but the licence block is not" in rc.stdout,
+          "and the failure names the SHAPE, not a missing notice", rc.stdout + rc.stderr)
+    check("missing copyright notice: short.h" not in rc.stdout,
+          "and does NOT claim the notice is missing", rc.stdout + rc.stderr)
+    # engine#2175: --fix must REPLACE the stub, not stack the block above it. Before this it left both, so the
+    # file came out with the Copyright/SPDX pair twice, the duplicate rule fired, and --check stayed red -- the
+    # tool's own remedy could not fix the shape it had just named.
+    rc = run(repo, "--fix")
+    check(rc.returncode == 0, "--fix repairs a short header", rc.stdout + rc.stderr)
+    got = open(os.path.join(repo, "short.h")).read()
+    check(got.count("SPDX-License-Identifier") == 1,
+          "and exactly one SPDX line survives the repair", f"{got.count('SPDX-License-Identifier')} found")
+    check("Licensed under the Apache License, Version 2.0" in got,
+          "and the full licence block is there", got[:200])
+    check("the file's own description" in got, "and the file's own header text is kept", got)
+    rc = run(repo, "--check")
+    check(rc.returncode == 0, "and --check is green after the repair", rc.stdout + rc.stderr)
+    # engine#2175 review: a script's short header sits BEHIND its `#!`. The first version of strip_short_header()
+    # looked at line 1 only, so the stub was not found, the block went in after the shebang, and the file ended up
+    # with two notices -- the same defect one file type over.
+    with open(os.path.join(repo, "short.sh"), "w") as f:
+        f.write("#!/usr/bin/env bash\n" + NOTICE.splitlines()[0] + "\n" + NOTICE.splitlines()[1]
+                + "\n# short.sh -- a script\necho hi\n")
+    git(repo, "add", "short.sh")
+    rc = run(repo, "--fix")
+    check(rc.returncode == 0, "--fix repairs a short header behind a shebang", rc.stdout + rc.stderr)
+    got = open(os.path.join(repo, "short.sh")).read()
+    check(got.startswith("#!/usr/bin/env bash\n"),
+          "the shebang stays on line 1", got.splitlines()[0])
+    check(got.count("SPDX-License-Identifier") == 1,
+          "and exactly one SPDX line in the script too", f"{got.count('SPDX-License-Identifier')} found")
+    check("short.sh -- a script" in got, "and the script's own comment survives", got)
+    rc = run(repo, "--check")
+    check(rc.returncode == 0, "and --check is green for the script", rc.stdout + rc.stderr)
+    os.unlink(os.path.join(repo, "short.sh"))
+    git(repo, "add", "-A", "short.sh")
+    os.unlink(os.path.join(repo, "short.h"))
+    git(repo, "add", "-A", "short.h")
+
     # an ignored file is not source: it must not need a notice. The .gitignore itself is source (the
     # repo's own carries the notice and is tracked), so it gets one here too.
     with open(os.path.join(repo, ".gitignore"), "w") as f:

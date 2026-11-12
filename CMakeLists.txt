@@ -2036,6 +2036,15 @@ endif()
     # A DFlash draft scored against its target, both on the host (engine#1780): the target's tapped hidden states
     # into the draft's reference forward, proposals checked against the target's greedy tokens. A tool, not a ctest:
     # it needs two packages and minutes of host time.
+    # A DFlash 2 draft against the served 27B (engine#1781): acceptance in stages, and the speculative loop end to end
+    # (draft -> one batched verify pass -> commit). A tool, not a ctest: target pack, draft package and the device.
+    add_executable(dflash2_probe tools/dflash2_probe.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp)
+    target_include_directories(dflash2_probe PRIVATE npu npu/forward/include)
+    target_link_libraries(dflash2_probe PRIVATE onebit_npu_forward onebit_npu)
+    find_package(OpenMP COMPONENTS CXX QUIET)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(dflash2_probe PRIVATE OpenMP::OpenMP_CXX)
+    endif()
     add_executable(dflash_acceptance tools/dflash_acceptance.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp)
     target_include_directories(dflash_acceptance PRIVATE npu npu/forward/include)
     target_link_libraries(dflash_acceptance PRIVATE onebit_npu_forward onebit_npu)
@@ -2082,11 +2091,11 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> lfm2)
     set_tests_properties(batch_check_state_lfm2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
-    # A fabricated qwen3_5 hybrid (a linear-attention layer, then attention): load only, see the script's header.
-    add_test(NAME batch_check_state_qwen35_load
+    # A fabricated qwen3_5 hybrid (a linear-attention layer, then attention), off the kernel's N grid on purpose.
+    add_test(NAME batch_check_state_qwen35
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> qwen3_5)
-    set_tests_properties(batch_check_state_qwen35_load PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    set_tests_properties(batch_check_state_qwen35 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 
 # Private NPU routes (docs/npu.md, "Private routes"): closed-source add-ons in a checkout of

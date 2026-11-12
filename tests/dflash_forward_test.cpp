@@ -269,6 +269,27 @@ void properties() {
     }
 }
 
+// The context cache: grown in steps it gives exactly the pass draft_forward() gives, and a pass can follow every step.
+void cache_steps() {
+    const DraftWeights w = random_model(5);
+    Rng r{77};
+    const int ctx = 5, block = 3, H = 8;
+    const std::vector<float> taps = r.vec(size_t(ctx) * 16, 1.0f);
+    const std::vector<float> noise = r.vec(size_t(block) * size_t(H), 1.0f);
+    const std::vector<float> fused = fuse_context(w, taps.data(), ctx);
+    DraftKvCache c;
+    c.pos0 = 3;
+    cache_extend(w, c, fused.data(), 2);
+    const std::vector<float> two = draft_forward_cached(w, c, noise.data(), block);
+    check(max_diff(two, draft_forward(w, taps.data(), 2, noise.data(), block, 3)) == 0.0,
+          "cache: two rows, then a pass, is the pass over those two rows");
+    cache_extend(w, c, fused.data() + 2 * H, 1);
+    cache_extend(w, c, fused.data() + 3 * H, 2);
+    check(c.rows == ctx, "cache: rows add up");
+    check(max_diff(draft_forward_cached(w, c, noise.data(), block), draft_forward(w, taps.data(), ctx, noise.data(), block, 3)) == 0.0,
+          "cache: grown 2 + 1 + 2 rows, it gives exactly draft_forward's pass over all 5");
+}
+
 void refusals() {
     const DraftWeights w = random_model(3);
     const std::vector<float> noise(8, 0.5f);
@@ -327,10 +348,40 @@ void real_package(const std::string& dir) {
     }
 }
 
+// DFlash 2's two extra pieces, each against arithmetic written out here.
+void dflash2_pieces() {
+    {   // 3 rows of 4, groups of 2, a kernel of 2 offsets. base[offset][i], dyn[row][offset][group].
+        const float x[12] = {1, 2, 3, 4,   5, 6, 7, 8,   -1, 0, 2, -2};
+        const float base[8] = {1, 1, 1, 1,   0.5f, 0, -1, 2};          // offset 0: identity; offset 1: per element
+        const float dyn[12] = {0, 0,  9, 9,      1, -1,  0.5f, 0,      0, 2,  -1, 1};
+        // row 0: only offset 0 exists; (1 + 0) * x0                       (its offset-1 kernel, the 9s, has nothing to read)
+        // row 1: (1 + 1) * 5, (1 + 1) * 6, (1 - 1) * 7, (1 - 1) * 8  +  (0.5 + 0.5) * 1, (0 + 0.5) * 2, (-1 + 0) * 3, (2 + 0) * 4
+        // row 2: (1 + 0) * -1, (1 + 0) * 0, (1 + 2) * 2, (1 + 2) * -2 +  (0.5 - 1) * 5, (0 - 1) * 6, (-1 + 1) * 7, (2 + 1) * 8
+        const float want[12] = {1, 2, 3, 4,   10 + 1, 12 + 1, 0 - 3, 0 + 8,   -1 - 2.5f, 0 - 6, 6 + 0, -6 + 24};
+        const std::vector<float> got = draft_conv(x, 3, 4, 2, 2, base, dyn);
+        bool same = got.size() == 12;
+        for (int i = 0; i < 12 && same; i++) same = std::fabs(got[size_t(i)] - want[i]) < 1e-6;
+        check(same, "DFlash 2 convolution: three rows against the hand-computed ones (a row's own kernel, the row before, "
+                    "the group a value belongs to, nothing before the first row)");
+    }
+    {   // 3 candidates, rank 2. scores: 1.0 + (2*0.5*1 + -1*4*0) = 2.0;  1.5 + (2*0.5*-1 + -1*4*0.5) = -1.5;  0.2 + (2*0.5*2 + -1*4*-0.25) = 3.2
+        const float unary[3] = {1.0f, 1.5f, 0.2f}, prev[2] = {2.0f, -1.0f}, h[2] = {0.5f, 4.0f};
+        const float succ[6] = {1.0f, 0.0f,   -1.0f, 0.5f,   2.0f, -0.25f};
+        check(selector_pick(unary, 3, prev, h, succ, 2) == 2,
+              "selector: the pairwise term can lift the lowest-logit candidate over the highest");
+        const float flat[6] = {0, 0, 0, 0, 0, 0};
+        check(selector_pick(unary, 3, prev, h, flat, 2) == 1, "selector: with no pairwise term it is the plain argmax");
+        const float tie[3] = {1.0f, 1.0f, 1.0f};
+        check(selector_pick(tie, 3, prev, h, flat, 2) == 0, "selector: the first of equals is kept");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     hand_cases();
+    dflash2_pieces();
+    cache_steps();
     properties();
     refusals();
     const char* real = (argc > 1 && argv[1][0] != '\0') ? argv[1] : std::getenv("ONEBIT_TEST_DFLASH_DRAFT");

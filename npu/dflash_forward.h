@@ -44,20 +44,39 @@
 
 namespace onebit::npu::dflash {
 
+// DFlash 2 only: a grouped convolution over the block rows, applied before and after the attention and before and
+// after the MLP. The hidden vector is cut into groups of `group` values. A row's kernel is a fixed part (`base`) plus
+// a part computed from the row itself (`proj` of the row, one value per offset and group), and the output at row t
+// sums, over offset 0..kernel-1, (base + dynamic) * x[t - offset]; rows before the block count as zero. `prepare`
+// uses the first half of `base` and of the projection's output, `finish` the second half.
+struct DraftConv {
+    std::vector<float> base;   // [2][kernel][hidden]
+    std::vector<float> proj;   // row-major [2 * kernel * (hidden / group)][hidden]
+    bool present() const { return !base.empty(); }
+};
+
 struct DraftLayerWeights {
     std::vector<float> q, k, v, o, gate, up, down;                 // row-major [out][in]
     std::vector<float> input_norm, post_norm, q_norm, k_norm;      // gains
+    DraftConv attn_conv, mlp_conv;                                 // empty on a first-generation draft
 };
 
 // A draft decoded to f32. For the Bolt draft this is about 1.3 GB; the caller decides how long to keep it.
 struct DraftWeights {
     int hidden = 0, intermediate = 0, heads = 0, kv_heads = 0, head_dim = 0, taps = 0;
     float rms_eps = 0.0f, rope_theta = 0.0f;
+    int conv_kernel = 0, conv_group = 0;   // DFlash 2; 0 when the layers carry no convolution
     std::vector<float> fc;            // [hidden][taps * hidden]
     std::vector<float> hidden_norm;   // [hidden]
     std::vector<float> norm;          // [hidden]
     std::vector<DraftLayerWeights> layers;
 };
+
+// An optional place for the projections to run. When set, every matrix product of the draft forward is offered to
+// it first: W is the row-major [n_out][n_in] matrix the product would use (its address identifies the projection),
+// x is [rows][n_in], y is [rows][n_out]. Return false to have the host compute it instead. One hook per process.
+using GemmHook = bool (*)(const float* W, int n_out, int n_in, const float* x, int rows, float* y, void* user);
+void set_gemm_hook(GemmHook hook, void* user);
 
 // Decode every tensor of a loaded package. Throws std::runtime_error if a decoded tensor has the wrong size.
 DraftWeights decode_draft(const DraftModel& m);
@@ -74,5 +93,39 @@ void check_weights(const DraftWeights& w);
 // argument or a non-finite result.
 std::vector<float> draft_forward(const DraftWeights& w, const float* taps, int ctx, const float* noise, int block,
                                  long pos0 = 0, int window = 0);
+
+// One half of a DFlash 2 convolution, on its own so it can be held to a hand-computed case: `rows` rows of
+// `hidden`, `base` is [kernel][hidden] and `dyn` is [rows][kernel][hidden / group] (a row's own kernel, per offset
+// and group). out[t][i] = sum over offset < kernel, offset <= t of (base[offset][i] + dyn[t][offset][i / group]) *
+// x[t - offset][i]. Rows before the first count as zero.
+std::vector<float> draft_conv(const float* x, int rows, int hidden, int kernel, int group, const float* base,
+                              const float* dyn);
+
+// The DFlash 2 candidate selector's choice at one block row. `unary` holds the target head's logits of the `k`
+// candidates; `prev` is the predecessor codebook's row of the token picked for the row before (the last accepted
+// token for the first row), `h` the selector's projection of this row's hidden state, both `rank` wide; `succ` is
+// the successor codebook's rows of the candidates, [k][rank]. A candidate's score is
+// unary + sum_r prev[r] * h[r] * succ[r]; the highest wins and the first of equals is kept. Returns its index.
+int selector_pick(const float* unary, int k, const float* prev, const float* h, const float* succ, int rank);
+
+// The context's keys and values per layer, for a caller that drafts many blocks over one growing context: they depend
+// only on the fused context rows, so each row is projected, normalised and rotated once (at position pos0 + its
+// index) and reused by every later pass. draft_forward_fused() builds one for its own call.
+struct DraftKvCache {
+    long pos0 = 0;
+    int rows = 0;
+    std::vector<std::vector<float>> k, v;   // per layer, [rows][kv_heads * head_dim]
+};
+// Append `n` fused context rows ([n][hidden], from fuse_context()) to the cache.
+void cache_extend(const DraftWeights& w, DraftKvCache& c, const float* fused_rows, int n);
+// One pass over the cache's context rows (positions pos0 .. pos0 + rows - 1) and a block placed after them.
+std::vector<float> draft_forward_cached(const DraftWeights& w, const DraftKvCache& c, const float* noise, int block,
+                                        int window = 0);
+
+// The same pass in two steps, for a caller that drafts many blocks over one growing context: the context rows are
+// fused and normalised once ([ctx][hidden]) and handed to every pass that needs a prefix of them.
+std::vector<float> fuse_context(const DraftWeights& w, const float* taps, int ctx);
+std::vector<float> draft_forward_fused(const DraftWeights& w, const float* fused, int ctx, const float* noise, int block,
+                                       long pos0 = 0, int window = 0);
 
 }  // namespace onebit::npu::dflash

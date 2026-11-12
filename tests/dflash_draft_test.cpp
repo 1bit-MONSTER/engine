@@ -298,7 +298,7 @@ void test_synthetic(const fs::path& root) {
     refused(with("short", [&](std::vector<Entry>& t) { find(t, "model.layers.0.self_attn.k_proj.weight").bytes.resize(5120); }, cfg),
             "'model.layers.0.self_attn.k_proj.weight' holds 5120 B", "a projection with too few tiles");
     refused(with("extra", [&](std::vector<Entry>& t) { t.push_back({"model.selector.weight", "BF16", "[4]", std::string(8, '\0')}); }, cfg),
-            "'model.selector.weight' is not part of a DFlashDraftModel", "a tensor of another architecture");
+            "'model.selector.weight' is not part of this draft's architecture", "a tensor of another architecture");
     refused(with("dtype", [&](std::vector<Entry>& t) { find(t, "model.norm.weight").dtype = "F16"; }, cfg),
             "'model.norm.weight' is declared F16", "a gain under another dtype label");
     refused(with("plainfc", [&](std::vector<Entry>& t) { find(t, "model.fc.weight").shape = "[256,512]"; }, cfg),
@@ -308,7 +308,9 @@ void test_synthetic(const fs::path& root) {
     refused(with("taps", [&](std::vector<Entry>& t) { const int32_t v = 2; std::memcpy(find(t, "dflash.target_layer_ids").bytes.data() + 4, &v, 4); }, cfg),
             "'dflash.target_layer_ids[1]' is 2 and config.json says 3", "a container that disagrees on a target layer");
     refused(with("dflash2", none, replaced(cfg, "DFlashDraftModel", "DFlash2DraftModel")),
-            "architecture 'DFlash2DraftModel' is not read by this loader", "a DFlash2 package");
+            "no 'vocab_size'", "a first-generation config relabelled DFlash2 is read by the DFlash2 rules, and refused by name");
+    refused(with("dflash3", none, replaced(cfg, "DFlashDraftModel", "DFlash3DraftModel")),
+            "architecture 'DFlash3DraftModel' is not read by this loader", "an architecture this loader does not know");
     refused(with("type", none, replaced(cfg, "\"model_type\":\"dflash\"", "\"model_type\":\"qwen3\"")),
             "model_type is 'qwen3'", "a config that is not a draft's");
     refused(with("nokey", none, replaced(cfg, "\"head_dim\":64,", "")), "no 'head_dim'", "a config without head_dim");
@@ -423,6 +425,43 @@ void test_real(const std::string& dir) {
 
 }  // namespace
 
+// A DFlash 2 package (FastFlowLM/Qwen3.8-27B-DFlash2-NPU2 on this box): every tensor accounted for, one projection of
+// each kind decodes finite, and the selector's codebooks give a row each. Decoding the whole draft is 6 GB as f32, so
+// this reads one of each instead.
+void test_real2(const std::string& dir) {
+    DraftModel m;
+    try {
+        m = load_draft(dir);
+    } catch (const std::exception& e) {
+        check(false, std::string("the DFlash 2 package loads: ") + e.what());
+        return;
+    }
+    const DraftConfig& c = m.cfg;
+    check(c.generation == 2, "DFlash 2: the generation is read from the architecture");
+    check(m.tensors == 3 + 3 + 15 * c.layers, "DFlash 2: every tensor is accounted for (fc, 2 norms, 3 selector, 15 per layer)");
+    const auto finite = [](const std::vector<float>& v) {
+        for (float f : v)
+            if (!std::isfinite(f)) return false;
+        return !v.empty();
+    };
+    check(finite(decode_projection(m.layers[0].q)), "DFlash 2: a Q4_K projection decodes finite");
+    check(finite(decode_plain(m.layers[0].attn_conv_base)), "DFlash 2: a convolution base kernel decodes finite");
+    std::vector<float> row(size_t(c.selector_rank));
+    decode_row(m.selector_succ, int(c.mask_token_id), row.data());
+    check(finite(row), "DFlash 2: a codebook row decodes finite");
+    bool refused = false;
+    try {
+        decode_row(m.selector_succ, c.vocab, row.data());
+    } catch (const std::runtime_error&) {
+        refused = true;
+    }
+    check(refused, "DFlash 2: a codebook row past the vocabulary is refused");
+    std::printf("DFlash 2 package: %d tensors, %d layers, hidden %d, block %d, taps", m.tensors, c.layers, c.hidden, c.block_size);
+    for (int l : c.target_layer_ids) std::printf(" %d", l);
+    std::printf(", conv %d x groups of %d, selector rank %d top %d, vocab %d\n", c.conv_kernel, c.conv_group, c.selector_rank,
+                c.selector_top_k, c.vocab);
+}
+
 int main(int argc, char** argv) {
     const fs::path root = fs::temp_directory_path() / ("dflash-draft-test-" + std::to_string(::getpid()));
     fs::remove_all(root);
@@ -431,6 +470,9 @@ int main(int argc, char** argv) {
     const char* real = (argc > 1 && argv[1][0] != '\0') ? argv[1] : std::getenv("ONEBIT_TEST_DFLASH_DRAFT");
     if (real != nullptr && *real != '\0') test_real(real);
     else std::printf("SKIP the real package: pass its directory, or set ONEBIT_TEST_DFLASH_DRAFT\n");
+    const char* real2 = (argc > 2 && argv[2][0] != '\0') ? argv[2] : std::getenv("ONEBIT_TEST_DFLASH2_DRAFT");
+    if (real2 != nullptr && *real2 != '\0') test_real2(real2);
+    else std::printf("SKIP the DFlash 2 package: pass its directory second, or set ONEBIT_TEST_DFLASH2_DRAFT\n");
     if (g_failures == 0) std::printf("dflash_draft: ok (%d checks)\n", g_checks);
     return g_failures == 0 ? 0 : 1;
 }

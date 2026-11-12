@@ -205,6 +205,9 @@ def main():
     spec = importlib.util.spec_from_file_location("bcs", os.path.join(HERE, "batch_check_state_ci.py"))
     bcs = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bcs)
+    # The head is wider than the tokenizer (512 rows against 256 ids), as on Qwen3 (151,936 against 151,669): the verify
+    # batch's rows are the head's width while the loop reads them at the tokenizer's, and only a wider head shows that.
+    bcs.VOCAB = 512
     fails = 0
     with tempfile.TemporaryDirectory(prefix="serve_spec_lookup.", dir=bcs.tmp_root()) as tmp:
         src, out = os.path.join(tmp, "hf"), os.path.join(tmp, "q4nx")
@@ -218,10 +221,14 @@ def main():
         base = [{"prompt": p, "max_tokens": n, "temperature": 0} for p in prompts for n in (1, 5, 24)]
         # A sampled request (seeded, so both servers draw the same tokens) must stay on the plain loop.
         sampled = [{"prompt": prompts[1], "max_tokens": 16, "temperature": 0.8, "seed": 7}]
-        replies, logs, cases = {}, {}, []
+        # --spec-sample's own requests: sampled, seeded, one on a repeating prompt so the lookup has drafts to offer.
+        # Each is sent twice; the distribution itself is held by tests/mtp_sampled_test.cpp, this holds the wiring.
+        sample_cases = [sampled[0], {"prompt": prompts[0], "max_tokens": 24, "temperature": 0.8, "seed": 11}]
+        replies, logs, cases, sampled_replies = {}, {}, [], []
         draft = os.path.join(tmp, "draft")
         write_draft(draft)
-        for name, extra in (("plain", []), ("spec", ["--spec-lookup", "4"]), ("dflash", ["--spec-draft", draft])):
+        for name, extra in (("plain", []), ("spec", ["--spec-lookup", "4"]), ("dflash", ["--spec-draft", draft]),
+                            ("sample", ["--spec-lookup", "4", "--spec-sample"])):
             port = free_port()
             logp = os.path.join(tmp, name + ".log")
             with open(logp, "w") as log:
@@ -248,6 +255,19 @@ def main():
                         j = post(port, b)
                         c = j["choices"][0]
                         replies[name].append((c["text"], c["finish_reason"], j["usage"]["completion_tokens"]))
+                    if name == "sample":
+                        # Near-greedy: at temperature 0.001 the distribution is the argmax's to within e^-10 on these
+                        # logits, so the draft check must refuse what greedy refuses and the text is plain greedy's.
+                        cold = [dict(b, temperature=0.001, seed=3) for b in base if b["max_tokens"] == 24]
+                        replies["cold"] = []
+                        for b in cold:
+                            j = post(port, b)
+                            c = j["choices"][0]
+                            replies["cold"].append((c["text"], c["finish_reason"], j["usage"]["completion_tokens"]))
+                        for b in sample_cases + sample_cases:
+                            j = post(port, b)
+                            c = j["choices"][0]
+                            sampled_replies.append((c["text"], c["finish_reason"], j["usage"]["completion_tokens"]))
                 finally:
                     p.terminate()
                     try:
@@ -256,8 +276,10 @@ def main():
                         p.kill()
                         p.wait()
             logs[name] = open(logp).read()
-        for arm in ("spec", "dflash"):
+        for arm in ("spec", "dflash", "sample"):
             for b, a, c in zip(cases, replies["plain"], replies[arm]):
+                if arm == "sample" and b["temperature"]:
+                    continue   # with --spec-sample a sampled reply is a different draw; checked below
                 ok = a == c
                 fails += not ok
                 what = (f"prompt {prompts.index(b['prompt'])} max_tokens {b['max_tokens']}"
@@ -284,6 +306,26 @@ def main():
             print(f"{'PASS' if ok else 'FAIL'}  {arm}: the speculative path ({kind}) on {len(spec_lines)} requests, the "
                   f"{greedy} greedy ones ({accepted} of {drafted} drafts accepted, {len(dry)} multi-token requests without a draft); the sampled one "
                   f"and the plain server never")
+        greedy24 = [r for b, r in zip(cases, replies["plain"]) if not b["temperature"] and b["max_tokens"] == 24
+                    and "stop" not in b]
+        for i, (a, c) in enumerate(zip(greedy24, replies["cold"])):
+            ok = a == c
+            fails += not ok
+            print(f"{'PASS' if ok else 'FAIL'}  sample: prompt {i} at temperature 0.001 is plain greedy's reply"
+                  + ("" if ok else f" (plain {a!r}, sampled {c!r})"))
+        # --spec-sample: greedy requests above equal plain's; the sampled ones speculate, keep their budget, and are
+        # reproducible from their seed.
+        n = len(sample_cases)
+        lines = [l for l in logs["sample"].splitlines() if l.startswith("[spec] lookup sampled ")]
+        drafted = sum(int(l.split(" of ")[1].split()[0]) for l in lines)
+        accepted = sum(int(l.split(" drafts accepted")[0].split(", ")[-1].split(" of ")[0]) for l in lines)
+        same = sampled_replies[:n] == sampled_replies[n:]
+        full = all(r[2] == b["max_tokens"] or r[1] == "stop" for r, b in zip(sampled_replies, sample_cases + sample_cases))
+        want = 2 * n + sum(1 for b in cases if b["temperature"]) + len(replies["cold"])   # its sampled requests plus the shared sampled case
+        ok = len(lines) == want and drafted > 0 and same and full
+        fails += not ok
+        print(f"{'PASS' if ok else 'FAIL'}  sample: {len(lines)} of {want} sampled requests took the speculative path "
+              f"({accepted} of {drafted} drafts accepted), the same seed gave the same reply: {same}, budgets kept: {full}")
     print("ALL PASS" if not fails else f"FAILED {fails}")
     return 1 if fails else 0
 

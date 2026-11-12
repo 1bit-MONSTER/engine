@@ -49,6 +49,7 @@
 #include "npu_prefix_cache.h"
 #include "npu_prompt_ids.h"
 #include "npu_sampling.h"
+#include "npu_spec_sampler.h"
 #include "npu_stop_tokens.h"
 #include "stream_bridge.h"
 #include "npu_systemone.h"
@@ -146,6 +147,11 @@ struct ForwardEngine {
     // drafting for the rest of a reply once its last 3 rounds averaged fewer than X tokens (0 = never).
     int spec_lookup = 0;
     double spec_fallback = 0.0;
+    // --spec-sample: a sampled request (temperature > 0) takes the speculative path too, its drafts kept or refused by
+    // the rule that keeps the target's distribution (npu/mtp/spec_accept.h through mtp::RowSampler). Off by default: the
+    // reply then follows the same distribution but not the plain loop's random stream, so a seed gives a different
+    // reply than it does without the flag.
+    bool spec_sample = false;
     bool host_gemm = false;   // NPU_INFER_HOST_GEMM: the forward runs on the host, with no launch width of its own
     // --spec-draft <dir> (engine#1781): a DFlash draft package as the drafter instead of the prompt lookup, up to
     // spec_draft_k drafts a round. The forward writes the draft's tap layers into draft_taps on every pass; the sink
@@ -585,8 +591,10 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // argmax the verify rows check drafts against; no grammar (its mask is per token and per state); no logprobs
         // and no logit dump (both read the logits of every position, and a verify batch's rows are not kept). The text
         // is then the plain loop's token for token -- what tests/serve_spec_lookup_test.py holds it to.
-        const bool spec =
-            (e.spec_lookup > 0 || e.draft) && opts.sample.greedy() && !gram && !want_lp && e.dump_logits.empty();
+        // --spec-sample widens it to sampled requests, whose drafts are then judged by the distribution-keeping rule
+        // instead (ServeSampler below): the reply follows the same distribution as the plain loop's, not its stream.
+        const bool spec = (e.spec_lookup > 0 || e.draft) && (opts.sample.greedy() || e.spec_sample) && !gram &&
+                          !want_lp && e.dump_logits.empty();
         if (spec) {
             struct ServeBase : npu::mtp::BaseModel {
                 Q4nxNpuForward& f;
@@ -596,9 +604,20 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 int hidden_size() const override { return int(f.last_hidden().size()); }
                 int max_batch_rows() const override { return rows; }
                 bool step(int t, int p, std::vector<float>& l) override { return f.step(t, p, l); }
+                // The forward's rows are the head's width (M x NV); the loop indexes them at vocab(), the tokenizer's
+                // bound, which is narrower whenever the head carries padding ids (Qwen3: 151,936 against 151,669). So
+                // each row is cut to its first nv logits here, in place, before the loop reads row i at i * nv.
                 bool step_batch_all(const std::vector<int>& t, int s0, std::vector<float>& l) override {
                     f.begin_verify(int(t.size()), s0);
-                    return f.step_batch_all(t, s0, l);
+                    if (!f.step_batch_all(t, s0, l)) return false;
+                    const size_t m = t.size(), w = m ? l.size() / m : 0;
+                    if (w < size_t(nv) || w * m != l.size()) return false;
+                    if (w != size_t(nv)) {
+                        for (size_t i = 1; i < m; i++)
+                            std::copy_n(l.begin() + std::ptrdiff_t(i * w), nv, l.begin() + std::ptrdiff_t(i * size_t(nv)));
+                        l.resize(m * size_t(nv));
+                    }
+                    return true;
                 }
                 bool commit_verify(int a) override { return f.commit_verify_rows(a); }
                 const std::vector<float>& last_hidden() const override { return f.last_hidden(); }
@@ -630,20 +649,22 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                                                                    e.draft->cfg.block_size, e.draft->cfg.sliding_window);
             }
             npu::mtp::DraftHead& head = dflash ? static_cast<npu::mtp::DraftHead&>(*dflash) : lookup;
+            npu::SpecSampler sampler(opts.sample, rng);   // used for a sampled request (npu_spec_sampler.h)
             npu::mtp::Options o;
             o.k = e.draft ? e.spec_draft_k : e.spec_lookup;
             o.max_tokens = limit;
             o.tau = 0.0f;
             o.fallback_below = e.spec_fallback;
             o.consume_last = false;   // the plain loop does not run the reply's last token either
+            o.sampler = opts.sample.greedy() ? nullptr : &sampler;
             const npu::mtp::Result r = npu::mtp::run_from(
                 base, &head, int(ids.size()), logits, o, [&](int t) {
                     if (req.is_connection_closed() || (bridge && bridge->cancelled())) return false;
                     return deliver(t);
                 });
             if (!r.ok) throw std::runtime_error("speculative decode: " + r.err);
-            std::fprintf(stderr, "[spec] %s %d tokens: %d rounds, %d of %d drafts accepted, %d plain steps%s\n",
-                         e.draft ? "dflash" : "lookup", int(r.tokens.size()), r.stats.batches, r.stats.accepted, r.stats.drafted, r.stats.steps,
+            std::fprintf(stderr, "[spec] %s%s %d tokens: %d rounds, %d of %d drafts accepted, %d plain steps%s\n",
+                         e.draft ? "dflash" : "lookup", o.sampler ? " sampled" : "", int(r.tokens.size()), r.stats.batches, r.stats.accepted, r.stats.drafted, r.stats.steps,
                          r.stats.fell_back_at >= 0 ? (", fell back after round " + std::to_string(r.stats.fell_back_at)).c_str()
                                                    : "");
         }
@@ -1155,6 +1176,7 @@ int run_forward_serve(int argc, char** argv) {
     int ctx_size = 0;                // --ctx-size N: prompt plus answer, at most the model's own (0 = the model's)
     int spec_lookup = 0;             // --spec-lookup K (engine#1781): prompt-lookup drafts, K per verify batch
     double spec_fallback = 0.0;      // --spec-fallback X: stop drafting below X tokens per round
+    bool spec_sample = false;        // --spec-sample: sampled requests speculate too (distribution-keeping rule)
     std::string spec_draft;          // --spec-draft <dir>: a DFlash draft package as the drafter
     int spec_draft_k = 0;            // --spec-draft-k K: drafts per round (default: the package's block - 1)
     for (int i = 0; i < argc; i++) {
@@ -1178,12 +1200,13 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--dump-logits") dump_logits = next();
         else if (a == "--spec-lookup") spec_lookup = std::stoi(next());
         else if (a == "--spec-fallback") spec_fallback = std::stod(next());
+        else if (a == "--spec-sample") spec_sample = true;
         else if (a == "--spec-draft") spec_draft = next();
         else if (a == "--spec-draft-k") spec_draft_k = std::stoi(next());
         else throw std::runtime_error("unknown option " + a);
     }
     if (model.empty())
-        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N] [--npu-target xdna] [--dump-logits <dir>] [--spec-lookup K | --spec-draft <dir> [--spec-draft-k K]] [--spec-fallback X]");
+        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N] [--npu-target xdna] [--dump-logits <dir>] [--spec-lookup K | --spec-draft <dir> [--spec-draft-k K]] [--spec-fallback X] [--spec-sample]");
     if (!spec_draft.empty() && spec_lookup > 0)
         throw std::runtime_error("--spec-draft and --spec-lookup are two drafters; give one");
     if (spec_draft_k != 0 && spec_draft.empty()) throw std::runtime_error("--spec-draft-k needs --spec-draft");
@@ -1191,6 +1214,8 @@ int run_forward_serve(int argc, char** argv) {
         throw std::runtime_error("--spec-lookup takes 0..15 drafts per round (a verify batch holds at most 16 rows), not " +
                                  std::to_string(spec_lookup));
     if (!(spec_fallback >= 0.0)) throw std::runtime_error("--spec-fallback takes a number of tokens >= 0");
+    if (spec_sample && spec_lookup == 0 && spec_draft.empty())
+        throw std::runtime_error("--spec-sample needs a drafter (--spec-lookup K or --spec-draft <dir>)");
     if (streams < 1 || streams > kNpuMaxStreams)
         throw std::runtime_error("--npu-streams takes 1.." + std::to_string(kNpuMaxStreams) +
                                  " (the device's hwctx limit), not " + std::to_string(streams));
@@ -1212,6 +1237,7 @@ int run_forward_serve(int argc, char** argv) {
     e.id = alias.empty() ? std::filesystem::path(dir).filename().string() : alias;
     e.spec_lookup = spec_lookup;
     e.spec_fallback = spec_fallback;
+    e.spec_sample = spec_sample;
     if (!dump_logits.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(dump_logits, ec);

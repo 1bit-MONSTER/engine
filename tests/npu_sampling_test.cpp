@@ -179,6 +179,46 @@ void test_sampler() {
     check(sample(three, SampleParams(), 1, &mask) == 2, "greedy still honors the mask");
 }
 
+// sample_probs() is what sample_token() draws from (engine#1781: a speculative round checks drafts against it, so a
+// mismatch would bias a sampled reply): for each set of parameters the draw's frequencies over 200000 seeded draws
+// sit within 0.01 total variation of sample_probs(), every id it zeroes is never drawn, the row sums to 1, ids past
+// the tokenizer's bound get no entry, and greedy parameters give the argmax's one-hot.
+void test_sample_probs() {
+    const std::vector<float> lg = {1.0f, 2.5f, 0.3f, 2.4f, -1.0f, 0.9f, 1.7f, 0.0f, 2.0f, -0.5f, 3.0f, 2.9f};
+    struct Case { const char* name; float t; int k; float tp; };
+    const Case cases[] = {{"temperature 0.8", 0.8f, 0, 1.0f},
+                          {"temperature 1.3, top_k 4", 1.3f, 4, 1.0f},
+                          {"temperature 0.7, top_p 0.8", 0.7f, 0, 0.8f},
+                          {"temperature 1, top_k 6, top_p 0.9", 1.0f, 6, 0.9f}};
+    for (const Case& cs : cases) {
+        SampleParams p;
+        p.temperature = cs.t;
+        p.top_k = cs.k;
+        p.top_p = cs.tp;
+        const int bound = 10;   // the last two ids (the two largest logits but one) are padding
+        const std::vector<float> q = onebit::npu::sample_probs(lg.data(), lg.size(), p, bound);
+        double total = 0;
+        for (float v : q) total += v;
+        std::vector<double> f(lg.size(), 0.0);
+        std::mt19937_64 rng(1781);
+        const int N = 200000;
+        for (int i = 0; i < N; i++) f[size_t(sample_token(lg, p, rng, nullptr, bound))] += 1.0 / N;
+        double tv = 0;
+        bool zero_never = true;
+        for (size_t i = 0; i < q.size(); i++) {
+            tv += std::fabs(f[i] - q[i]);
+            if (q[i] == 0.0f && f[i] > 0.0) zero_never = false;
+        }
+        tv /= 2;
+        std::printf("    sample_probs %-36s tv %.4f\n", cs.name, tv);
+        check(q.size() == size_t(bound) && std::fabs(total - 1.0) < 1e-5,
+              std::string("sample_probs covers the bounded row and sums to 1: ") + cs.name);
+        check(tv < 0.01 && zero_never, std::string("sample_token draws what sample_probs says: ") + cs.name);
+    }
+    const std::vector<float> g = onebit::npu::sample_probs(lg.data(), lg.size(), SampleParams(), 10);
+    check(g.size() == 10 && g[1] == 1.0f, "sample_probs at greedy is the bounded argmax's one-hot");
+}
+
 // The draw has to match the distribution the logits define.  Temperature divides logits
 // and never probabilities: when the top_p stage wrote probabilities back over the logits,
 // the draw ran on exp(probability), which is flat to within e^-1, so a token llama.cpp
@@ -1261,6 +1301,7 @@ int main() {
     test_vocab_bound();
     test_sampler();
     test_sampler_distribution();
+    test_sample_probs();
     test_stop();
     test_json_grammar();
     test_gbnf();

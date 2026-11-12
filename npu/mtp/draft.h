@@ -59,6 +59,7 @@
 #include <vector>
 
 #include "../forward/include/spec_greedy.h"
+#include "spec_accept.h"
 
 namespace onebit::npu::mtp {
 
@@ -71,6 +72,20 @@ inline int argmax(const float* p, int n) {
         if (p[i] > p[best]) best = i;
     return best;
 }
+
+// How the loop turns the base's logits into tokens (engine#1781, gate 2). Without one (Options::sampler null) every
+// choice is the argmax and a draft is kept iff it is that argmax: greedy decode, the same tokens as run_plain(). With
+// one, the base's own token is pick()ed and each draft is check()ed against the row at its position. The drafters
+// this loop runs are deterministic (the drafter's q is one-hot at the token it proposes), so spec_accept.h's rule
+// reads: keep x with probability p(x); on the first refusal emit a draw from p with x removed, and that draw is the
+// round's last token. The emitted tokens then follow the sampler's distribution p at every position, as plain
+// sampling would, but not plain sampling's random stream: the same seed gives a different (equally distributed) reply.
+class RowSampler {
+public:
+    virtual ~RowSampler() = default;
+    virtual int pick(const float* logits, int V) = 0;
+    virtual SpecStep check(const float* logits, int V, int x) = 0;
+};
 
 // The bookkeeping of a drafter that keeps its own stream (the MTP layer attends over its own states, so its
 // cache must be the base model's committed stream, row by row).  There are only two numbers -- how many rows are
@@ -177,6 +192,9 @@ struct Options {
     // base holding every emitted token (what the tests and a caller that continues the stream want); false skips a
     // pass whose logits nobody reads, which is what forward-serve does at the end of a reply.
     bool consume_last = true;
+    // Null: greedy. Otherwise the sampler every choice and every draft check goes through (RowSampler above). The
+    // loop does not own it; it must outlive the run.
+    RowSampler* sampler = nullptr;
 };
 
 struct Stats {
@@ -274,10 +292,22 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
 
     std::vector<float> all;
     auto emit = [&](int t) { r.tokens.push_back(t); return !on_token || on_token(t); };
+    RowSampler* const smp = opt.sampler;
+    // A draft at row i is kept when it is the argmax there (greedy) or when the sampler's check keeps it; a refusal
+    // under a sampler leaves its residual draw in `pending`, which is the next position's token (it is a draw from
+    // that position's distribution already, so drawing again from the same row would be a second, biased, choice).
+    int pending = -1;
+    auto keeps = [&](const float* row, int x) {
+        if (!smp) return argmax(row, V) == x;
+        const SpecStep s = smp->check(row, V, x);
+        if (!s.accepted) pending = s.token;
+        return s.accepted;
+    };
 
     while ((int)r.tokens.size() < opt.max_tokens) {
         // The base model's own choice for the next position: always emitted, never speculative.
-        const int t1 = argmax(logits.data(), V);
+        const int t1 = pending >= 0 ? pending : smp ? smp->pick(logits.data(), V) : argmax(logits.data(), V);
+        pending = -1;
         if (t1 < 0) { r.err = "no logits"; return r; }
         const bool keep_going = emit(t1);
         if (!keep_going) break;
@@ -332,7 +362,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
             r.stats.drafted += nd;
             for (int i = 0; i < nd && i < Stats::kMaxDepth; i++) r.stats.drafted_at[i]++;
             int a = 0;
-            while (a < nd && argmax(&all[(size_t)a * (size_t)V], V) == d[(size_t)a]) a++;
+            while (a < nd && keeps(&all[(size_t)a * (size_t)V], d[(size_t)a])) a++;
             // nd <= left, so every accepted draft fits the budget; only the consumer can stop the prefix early.
             int take = 0;
             bool stopped = false;
@@ -412,7 +442,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
         int a = 0;
         for (int i = 0; i < nd; i++) {
             const float* lg = (i == 0) ? logits.data() : &all[(size_t)(i - 1) * (size_t)V];
-            if (argmax(lg, V) != d[(size_t)i]) break;
+            if (!keeps(lg, d[(size_t)i])) break;
             a++;
         }
         // Emit the accepted prefix, capped by the caller's budget (the accepted drafts are a prefix of

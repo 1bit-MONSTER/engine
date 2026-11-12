@@ -3479,10 +3479,41 @@ end. It fabricates a container, serves it host-GEMM twice (plain, then with `--s
 text, `finish_reason` and `completion_tokens` for:
 - every budget;
 - stop sequences cut from the plain replies, so they do end them;
-- a seeded sampled request, which must stay on the plain loop.
+- a seeded sampled request, which must stay on the plain loop (without `--spec-sample`, below).
 
 In host-GEMM mode the verify batch is 16 rows, the device's width. Host GEMMs have no width of their own, and the 1
 the forward reports there would leave no row for a draft. The device route has not been measured with it yet.
+
+The verify pass returns its rows at the head's width, which is wider than the tokenizer whenever the head carries
+padding ids (Qwen3: 151,936 against 151,669). The loop reads them at the tokenizer's bound, so the serve's base cuts
+each row to that bound before the loop sees it. The test's container has a 512-row head against its 256-id tokenizer
+for this reason: with uncut rows the speculative replies leave plain greedy within 24 tokens.
+
+**`--spec-sample`** (with either drafter) takes sampled requests (temperature above 0, no grammar, no logprobs) onto
+the same path. `Options::sampler` (`mtp::RowSampler`, `npu/mtp/draft.h`) turns the loop's choices into draws.
+`npu::SpecSampler` (`app/npu_spec_sampler.h`) is forward-serve's sampler:
+- `pick()` is the plain loop's `sample_token()`;
+- `check()` keeps a draft `x` with probability `p(x)`, where `p` is what `sample_token()` draws from under the same
+  temperature, top_k and top_p (`sample_probs()`, `app/npu_sampling.h`). Otherwise it emits a draw from `p` with `x`
+  removed, and that draw ends the round.
+
+This is `npu/mtp/spec_accept.h`'s rule for a drafter whose own distribution is one-hot at its proposal, which both
+drafters are. Each emitted token then follows `p` at its position, as in the plain loop. It does not follow the plain
+loop's random stream: the same seed gives the same reply again, but a different one than without the flag. That is why
+the flag is off by default.
+
+`tests/mtp_sampled_test.cpp` (ctest `mtp_sampled`) holds the distribution on a toy Markov chain. It runs 200,000
+seeded 3-token replies per arm and compares them with the exact product of the chain's conditionals; plain sampling is
+the control:
+- both round shapes land at TV 0.008-0.009 against the control's 0.009, and forward-serve's own sampler (temperature
+  0.8, top_k 4, top_p 0.9) at 0.006;
+- a sampler that keeps every draft lands at 0.92;
+- every transition of 24-token replies matches its row at k = 1 and 4, which catches a refusal carried into a later
+  round.
+
+`npu_sampling_test` holds `sample_probs()` to `sample_token()`'s own draws. The serve test adds a `--spec-sample`
+server: its greedy requests equal plain's; a seeded sampled request repeats itself; at temperature 0.001 a sampled
+reply is plain greedy's.
 
 **`forward-serve --spec-draft <dir>`** (`--spec-draft-k K`, default the package's block minus one) serves the same path
 with a DFlash draft package as the drafter, in place of the prompt lookup. At load the package is decoded once and

@@ -192,11 +192,47 @@ reads the answer markup from the template it renders and prints it at load:
 | the rendered template contains | markup | reasoning | a tool call |
 |---|---|---|---|
 | `<|tool_call>` or `<|channel>thought` | `gemma4` | `<|channel>thought … <channel|>` | `<|tool_call>call:NAME{key:value}<tool_call|>`, strings as `<|"|>…<|"|>` |
-| neither, or no template (ChatML) | `qwen3` | `<think> … </think>` | `<tool_call>{"name": …, "arguments": {…}}</tool_call>` |
+| neither, or no template (ChatML) | `qwen3` | `<think> … </think>` | `<tool_call>{"name": …, "arguments": {…}}</tool_call>`, or `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>` |
 
 Both give the client the same OpenAI shape: `reasoning_content`, `content`, and `tool_calls` whose `arguments`
 is a JSON string. A Gemma call body that is not well formed (a string that never closes, a key with no value,
 an unclosed object or array, an empty value) is not a call: the markup is returned in `content` unchanged.
+
+**Tools go through the template (engine#1788).** A request's `tools` are a template variable, next to
+`chat_template_kwargs` and `enable_thinking` (`npu::request_template_vars`), in the caller's key order; an empty
+list is left out. The template is the only place a model is told what it may call: before this the route kept
+`tools` for the grammar and the answer parser only, so MiniCPM-V 4.7's 292-token tools prompt was rendered as 25
+tokens and the model answered in prose. Two things follow from rendering the pack's own template:
+
+- The call form is the template's. Qwen3.5's and MiniCPM-V 4.7's teach `<function=NAME>` with one
+  `<parameter=KEY>` block per argument; the `qwen3` markup reads both that and the JSON object. A parameter's
+  value is a JSON value when it is an object, an array, a number, `true`, `false` or `null`, and the text itself
+  otherwise (the template writes strings bare), so a string argument whose text is such a literal (`17`) comes
+  back as the literal. A block that is neither form is returned in `content` unchanged.
+- An earlier call in `messages` carries `function.arguments` as a JSON string, as the API spells it. A template
+  is written against the object, so a string that parses to a JSON object is handed over as that object
+  (`npu::messages_for_template`); before this the second turn of a tool conversation was a 400 on a template
+  that walks the arguments.
+
+Measured on the NPU with `MiniCPM-V-4.7-1B-NPU2` (`get_weather(city)`, temperature 0): the first reply is
+`finish_reason: tool_calls` with `get_weather {"city":"Paris"}`; with the tool result appended the reply is "The
+weather in Paris is 17 degrees Celsius with light rain." and the prefix cache reuses 291 of the 376 prompt tokens.
+
+**A reasoning block the prompt opened.** Some templates end their generation prompt with the opening tag itself:
+Qwen3.5's ends `<|im_start|>assistant\n<think>\n` when thinking is on. The model then never writes that tag; its
+answer starts with the reasoning and the first tag in it is the closing one. `forward-serve` checks whether the
+rendered prompt, less trailing whitespace, ends with the family's opening tag (`npu::prompt_opens_reasoning`), and
+if so splits the answer as starting inside the block. Before engine#1786's row on FastFlowLM's `Qwen3.5-2B-NPU2`
+it did not: the whole reasoning came back in `content`, `reasoning_content` was empty, and the closing tag was
+dropped, so nothing in the reply marked where the answer began. With thinking off the same template opens and
+closes the block in the prompt, and the answer is content from its first token.
+
+**Whitespace around the block is layout.** A model writes `<think>\n…\n</think>\n\n` and then its answer. The
+whitespace that leads the reasoning is not returned, and neither is the whitespace that leads the content when the
+content follows a reasoning block, so "answer with one word" comes back as `Paris`, not `\n\nParis`, and a model
+that thinks nothing (`<think>\n\n</think>`) sends no reasoning chunk at all. Whitespace inside either text is
+kept, and content with no reasoning before it is returned exactly as written. This is the rule `app/think_split.h`
+applies on the in-process route, so both routes return the same strings.
 
 One exception: `tool_choice: "required"` or a named function installs a grammar that constrains the reply to
 the `qwen3` call markup for every container (`app/npu_tool_grammar.h`), so that reply is split as `qwen3`.

@@ -850,6 +850,10 @@ ModelWeights* model_load(const char* path, ModelConfig config) {
     }
     
     LOG_INFO("Found %d tensors in metadata", num_tensors);
+    {
+        const int renamed = model_alias_lfm_names(tensors, num_tensors);
+        if (renamed > 0) LOG_INFO("Renamed %d LFM tensor names to the canonical ones", renamed);
+    }
 
     // engine#1185: a container imported from an OGA pack stores its I8 weights as 6,144-byte q4_1f
     // chunks (fp32 scale/zero) instead of the 5,120-byte q4_1 the kernels here dequantise in-kernel.
@@ -1157,11 +1161,77 @@ void model_free(ModelWeights* mw) {
     free(mw);
 }
 
+// engine#1786 (item F1): the per-layer prefix, in the two spellings the NPU2 model sources use. `layers.` is this
+// forward's own spelling; `layer.` is what three of the fifty-eight containers carry (`model.layer.0.input_layernorm…`),
+// where every other tensor matches by name. Swapping one prefix is a spelling fallback, not a rename: it happens only
+// after an exact match has failed, so a container that carries both is unaffected.
+
+static int name_taken(const TensorDesc* t, int count, const char* name) {
+    for (int i = 0; i < count; i++)
+        if (strcmp(t[i].name, name) == 0) return 1;
+    return 0;
+}
+
+int model_alias_lfm_names(TensorDesc* t, int count) {
+    static const char* const kLayerAlias[][2] = {
+        {"conv.in_proj.weight", "shortconv.in_proj.weight"},
+        {"conv.conv.weight", "shortconv.conv.weight"},
+        {"conv.out_proj.weight", "shortconv.out_proj.weight"},
+        {"operator_norm.weight", "input_layernorm.weight"},
+        {"feed_forward.w1.weight", "mlp.gate_proj.weight"},
+        {"feed_forward.w3.weight", "mlp.up_proj.weight"},
+        {"feed_forward.w2.weight", "mlp.down_proj.weight"},
+        {"post_operator_norm.weight", "post_attention_layernorm.weight"},
+        {"post_ffn_norm.weight", "post_feedforward_layernorm.weight"},
+    };
+    if (!t || count <= 0) return 0;
+    int renamed = 0;
+    char want[sizeof(t[0].name)];
+    for (int i = 0; i < count; i++) {
+        int l = -1, off = 0;
+        if (sscanf(t[i].name, "model.layers.%d.%n", &l, &off) != 1 || off <= 0) {
+            if (strcmp(t[i].name, "model.embedding_norm.weight") == 0 &&
+                !name_taken(t, count, "model.norm.weight")) {
+                snprintf(t[i].name, sizeof(t[i].name), "%s", "model.norm.weight");
+                renamed++;
+            }
+            continue;
+        }
+        const char* suffix = t[i].name + off;
+        const char* to = NULL;
+        if (strcmp(suffix, "ffn_norm.weight") == 0) {
+            // decided from the layer's own tensors: the sandwich form also has post_operator_norm
+            char probe[sizeof(t[0].name)];
+            snprintf(probe, sizeof(probe), "model.layers.%d.post_operator_norm.weight", l);
+            const int sandwich = name_taken(t, count, probe);
+            snprintf(probe, sizeof(probe), "model.layers.%d.post_attention_layernorm.weight", l);
+            to = (sandwich || name_taken(t, count, probe)) ? "pre_feedforward_layernorm.weight"
+                                                            : "post_attention_layernorm.weight";
+        } else {
+            for (size_t a = 0; a < sizeof(kLayerAlias) / sizeof(kLayerAlias[0]); a++)
+                if (strcmp(suffix, kLayerAlias[a][0]) == 0) { to = kLayerAlias[a][1]; break; }
+        }
+        if (!to) continue;
+        snprintf(want, sizeof(want), "model.layers.%d.%s", l, to);
+        if (name_taken(t, count, want)) continue;
+        snprintf(t[i].name, sizeof(t[i].name), "%s", want);
+        renamed++;
+    }
+    return renamed;
+}
+
 TensorDesc* model_tensor_by_name(ModelWeights* mw, const char* name) {
     if (!mw || !mw->all_tensors || !name) return NULL;
     for (int i = 0; i < mw->all_count; i++) {
         const char* n = mw->all_tensors[i].name;
         if (n[0] && strcmp(n, name) == 0) return &mw->all_tensors[i];
+    }
+    // Exact match failed: try the other per-layer spelling before reporting absence (engine#1786).
+    char alt[512];
+    if (!model_tensor_name_alt(name, alt, sizeof(alt))) return NULL;
+    for (int i = 0; i < mw->all_count; i++) {
+        const char* n = mw->all_tensors[i].name;
+        if (n[0] && strcmp(n, alt) == 0) return &mw->all_tensors[i];
     }
     return NULL;
 }

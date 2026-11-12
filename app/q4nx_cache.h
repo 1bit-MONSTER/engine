@@ -44,3 +44,23 @@ Q4nxCacheSweep q4nx_cache_evict(const std::string& root, const std::string& keep
 
 // Directory bytes under `path` (0 when it does not exist).
 int64_t q4nx_dir_bytes(const std::string& path);
+
+// The byte bound for ONEBIT_Q4NX_CACHE_MAX_GIB's value (`text` may be null). Unset, empty or not a number gives the default
+// (`default_gib`); zero or negative gives 0, which q4nx_cache_evict() reads as "no sweep". The result never exceeds
+// INT64_MAX: the plain `gib << 30` this replaces overflowed from 2^33 GiB up, so a very large number written to mean "no
+// limit" could come out as a 1 GiB bound, and a typo ("sixty") silently turned the sweep off.
+int64_t q4nx_cache_bound_bytes(const char* text, int64_t default_gib = 60);
+
+// Mark `entry` (a directory in the cache) as used now. The sweep orders by the entry directory's mtime, which the filesystem
+// only moves when a file is created or removed inside it -- so without this the order is by CREATION, and a container
+// imported last week and served every day is evicted before yesterday's one-off. Call it on every cache hit. It also puts a
+// just-opened entry inside the sweep's age window, which is what makes "a serve may be reading it" true for a reused entry
+// and not only for a new one. Failure is ignored (a read-only cache still serves).
+void q4nx_cache_touch(const std::string& entry);
+
+// engine#1788 / disk pressure 11-12: the sweep as a COMMAND, because until now the only trigger was a serve starting
+// (`app/serve.cpp` calls q4nx_cache_evict() on its way up). With the NPU off nothing serves, so nothing sweeps and the
+// cache grows past its own bound -- measured at 72.5 G against the 60 GiB default on this box while / was at 149 G.
+// `1bit q4nx-cache evict [--root DIR] [--max-gib N] [--keep NAME] [--min-age S] [--dry-run]`.
+// Exit: 0 swept (or nothing to do), 1 nothing removed but over the bound (age window), 2 bad usage.
+int run_q4nx_cache(int argc, char** argv);

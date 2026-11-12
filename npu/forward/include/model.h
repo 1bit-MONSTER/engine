@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 #include "common.h"
 
 #ifdef __cplusplus
@@ -130,6 +131,58 @@ void* model_tensor_data(ModelWeights* mw, TensorDesc* desc);
 // Used for architecture-specific tensors the fixed fields do not cover.
 // (Distinct from the legacy model_find_tensor(name, mw), which returns an index.)
 TensorDesc* model_tensor_by_name(ModelWeights* mw, const char* name);
+
+// LFM3 packs (FastFlowLM/LFM3-1.7B-NPU2) keep the upstream Liquid names -- conv.*, operator_norm, ffn_norm,
+// feed_forward.w1/w2/w3, post_operator_norm, post_ffn_norm, embedding_norm -- where the LFM2 packs carry the
+// canonical ones (shortconv.*, input_layernorm, mlp.*, post_attention_layernorm, model.norm).  This renames each
+// to the canonical name, in place, and only where that name is not already taken.  ffn_norm is the norm in front
+// of the MLP, so it becomes pre_feedforward_layernorm in a layer that also has post_operator_norm (the sandwich
+// form, where post_attention_layernorm is the attention/conv output's norm) and post_attention_layernorm
+// otherwise.  Returns the number of tensors renamed.
+int model_alias_lfm_names(TensorDesc* tensors, int count);
+// engine#1786 (item F1): three FastFlowLM NPU2 model sources spell the per-layer prefix `model.layer.` (singular)
+// where this forward addresses `model.layers.`. Writes the OTHER spelling into `out` and returns 1 when `name` carries
+// either prefix, 0 when it does not. Only the leading prefix is swapped, once: a caller that wants a fallback retries
+// the lookup with this name AFTER an exact match has failed, so a container carrying both spellings still resolves
+// exactly first. Pure string work, exported so a test can pin it without a container.
+static inline int model_tensor_name_alt(const char* name, char* out, size_t cap) {
+    static const char kPlural[]   = "model.layers.";
+    static const char kSingular[] = "model.layer.";
+    const size_t nl = sizeof(kPlural) - 1, ns = sizeof(kSingular) - 1;
+    const char* to;
+    size_t fl;
+    if (!name || !out || cap == 0) return 0;
+    if (strncmp(name, kPlural, nl) == 0) {          /* model.layers. -> model.layer. */
+        to = kSingular; fl = nl;                    /* fl is the MATCHED prefix's length, not the target's */
+    } else if (strncmp(name, kSingular, ns) == 0) { /* model.layer.  -> model.layers. */
+        to = kPlural; fl = ns;
+    } else {
+        return 0;
+    }
+    const char* rest = name + fl;                   /* everything after the prefix, unchanged */
+    const size_t rl = strlen(rest);
+    const size_t tl = (to == kPlural) ? nl : ns;
+    if (tl + rl + 1 > cap) return 0;
+    memcpy(out, to, tl);
+    memcpy(out + tl, rest, rl + 1);
+    return 1;
+}
+// How many of the first `n_layers` layers are gated short-convolution layers (LFM2's hybrid: a layer is one iff it
+// carries shortconv.in_proj, see LayerWeights), and, through `first`, the index of the first of them (-1 if none).
+// The loader reads those tensors; whether anything RUNS them is the forward's business, and a forward that does not
+// must refuse the pack by name instead of running a convolution layer as attention (engine#1786: FastFlowLM's
+// LFM2.5-1.2B-NPU2 loaded, failed its warm-up with "MLP dequant : data_size 0 ...", and was announced as ready).
+static inline int model_shortconv_layers(const ModelWeights* mw, int n_layers, int* first) {
+    int count = 0;
+    if (first) *first = -1;
+    if (!mw || !mw->layers) return 0;
+    for (int l = 0; l < n_layers; l++) {
+        if (mw->layers[l].shortconv_in_proj_weight.shape[0] == 0) continue;
+        if (count == 0 && first) *first = l;
+        count++;
+    }
+    return count;
+}
 void model_print_info(ModelWeights* mw);
 int model_find_tensor(const char* name, ModelWeights* mw);
 

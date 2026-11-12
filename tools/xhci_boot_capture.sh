@@ -32,7 +32,9 @@
 # needs root and is therefore the one part that will say so if it cannot read.
 #
 # usage: tools/xhci_boot_capture.sh [outdir]
-#   default outdir: /data/xhci-capture-<YYYYmmdd-HHMMSS> when /data is writable, else /tmp/...
+#   default outdir: /data/xhci-capture-<YYYYmmdd-HHMMSS> when /data is writable, else
+#   ${XDG_CACHE_HOME:-$HOME/.cache}/1bit/captures. NEVER /tmp: on strixhalo /tmp is tmpfs,
+#   so a capture written there is RAM held until reboot (engine#2027's rule).
 # exit: 0 captured, 2 not root and sudo unavailable, 3 cannot write
 set -u
 
@@ -49,7 +51,13 @@ fi
 stamp=$(date +%Y%m%d-%H%M%S)
 out=${1:-}
 if [ -z "$out" ]; then
-    if [ -d /data ] && [ -w /data ]; then out=/data/xhci-capture-$stamp; else out=/tmp/xhci-capture-$stamp; fi
+    if [ -d /data ] && [ -w /data ]; then
+        out=/data/xhci-capture-$stamp
+    else
+        # engine#2027: NOT /tmp. On this box /tmp is tmpfs, so a capture there is RAM held until reboot;
+        # the cache directory is on disk and is where the fconst and q4nx caches already live.
+        out=${XDG_CACHE_HOME:-$HOME/.cache}/1bit/captures/xhci-$stamp
+    fi
 fi
 mkdir -p "$out" 2>/dev/null || { say "xhci_boot_capture: cannot write $out" >&2; exit 3; }
 
@@ -85,6 +93,49 @@ for d in /sys/bus/pci/drivers/xhci_hcd/0000:*; do
         "$(cat "$d/power_state" 2>/dev/null)" \
         "$(cat "$d/power/runtime_status" 2>/dev/null)" >> "$out/controllers.txt"
 done
+# The states above are a table; this is the sentence a reader needs from it. engine#823's 2026-11-10 audit found a
+# fourth controller reading `runtime_status=resuming` while the other three were `active`/`D0`, and that is a
+# DIFFERENT fault from a controller that was never woken: a resume that never completed cannot report a connect on
+# its port, so the next stick run would see "no device" for a reason the fix does not address. Recording the value
+# was never the gap (the loop above has always written it); saying which of the two it is, is.
+# A function, not an inline block, so the three classifications can be driven on a fixture without a device (the
+# same reason every other rule in this tree is header-only/function-shaped: the decision is what can be wrong).
+xhci_verdict_line() {  # <bdf> <control> <power_state> <runtime_status> -> one line on stdout
+    _bdf=$1 _ctl=$2 _pw=$3 _rt=$4
+    case "$_rt" in
+        resuming|suspending)
+            printf '   %s: runtime_status=%s - a transition that did not settle. This is NOT "the controller was never woken": a resume in progress cannot report a connect, so a plug test on this boot would read "no device" for the wrong reason. Re-run the capture after a settle; if it persists, the keep-awake write is landing during the transition (engine#823 audit).\n' "$_bdf" "$_rt"
+            return 2 ;;
+        suspended)
+            if [ "$_ctl" = auto ]; then
+                printf '   %s: suspended under control=auto - the keep-awake rule did NOT hold it. That IS the fix not applying, not a settle problem.\n' "$_bdf"
+                return 1
+            fi
+            printf '   %s: suspended under control=%s - held out of D0 deliberately (not a fault on its own).\n' "$_bdf" "$_ctl"
+            return 0 ;;
+        active|'')
+            return 0 ;;
+        *)
+            # An unrecognised state is NOT "settled": a state this tool cannot name is a state it cannot vouch for,
+            # which is the rule every check in this tree applies to an unreadable input (engine#1599/#2039).
+            printf '   %s: runtime_status=%s is not one of active/suspended/resuming - this tool cannot vouch for this controller, so it is counted UNKNOWN, not settled.\n' "$_bdf" "$_rt"
+            return 3 ;;
+    esac
+}
+
+{
+    echo "== verdict (engine#823's two faults, told apart):"
+    settled=0; notkept=0; stuck=0; unknown=0
+    while read -r _b _c _p _r; do
+        [ -n "$_b" ] || continue
+        xhci_verdict_line "$_b" "$_c" "$_p" "$_r"; _rc=$?
+        case "$_rc" in 2) stuck=$((stuck+1)) ;; 1) notkept=$((notkept+1)) ;; 3) unknown=$((unknown+1)) ;; *) settled=$((settled+1)) ;; esac
+    done < <(sed -n 's/^\([^ ]*\)  control=\([^ ]*\)  power_state=\([^ ]*\)  runtime_status=\(.*\)$/\1 \2 \3 \4/p' "$out/controllers.txt")
+    echo "   -> $settled settled, $notkept not kept awake, $stuck in a transition, $unknown unreadable"
+    [ "$((stuck + unknown))" -gt 0 ] && echo "   -> this boot CANNOT answer the plug question for those $((stuck + unknown)) controller(s); capture again after they settle, or read the state by hand."
+} > "$out/verdict.txt" 2>&1
+cat "$out/verdict.txt"
+
 # The rule's own subject, as the running system sees it (the image ships it; a non-1bit boot does not).
 {
     echo "== udev rule on this system:"
@@ -109,6 +160,25 @@ done
 
 lspci -vv 2>/dev/null | awk '/USB controller/{p=1} p{print} p&&/^$/{p=0}' > "$out/lspci-usb.txt"
 lsusb -t > "$out/lsusb-tree.txt" 2>&1
+
+# engine#823: a port with "connect" is only evidence if the reader can tell WHAT is on it. This box carries a JetKVM
+# ("USB Emulation Device": HID + audio + mass storage in one composite) and a device whose descriptors read
+# `MID-SSS`/`PID-KKK` -- both look like a plugged drive to a port count, and neither answers this issue. So record the
+# identity of every connected port, from sysfs, next to the port state: a real drive the owner plugs in is then
+# distinguishable by its own idVendor:idProduct and product string rather than by trust.
+: > "$out/connected-ids.txt"
+while read -r bus port; do
+    dev="/sys/bus/usb/devices/${bus}-${port}"
+    [ -d "$dev" ] || continue
+    vid=$(cat "$dev/idVendor" 2>/dev/null); pid=$(cat "$dev/idProduct" 2>/dev/null)
+    prod=$(cat "$dev/product" 2>/dev/null); man=$(cat "$dev/manufacturer" 2>/dev/null)
+    spd=$(cat "$dev/speed" 2>/dev/null)
+    printf 'bus %s port %s: %s:%s  product=%s  manufacturer=%s  speed=%sMbps\n' \
+        "$bus" "$port" "${vid:-????}" "${pid:-????}" "${prod:-?}" "${man:-?}" "${spd:-?}" >> "$out/connected-ids.txt"
+done <<EOF
+$(awk '/^== bus/{b=$3} /port [0-9]+:.*connect/{p=$2; sub(":","",p); print b, p}' "$out/ports.txt")
+EOF
+[ -s "$out/connected-ids.txt" ] || echo "(no port reports connect)" > "$out/connected-ids.txt"
 dmesg > "$out/dmesg-full.txt" 2>&1
 grep -iE 'xhci|usb|acpi.*(usb|UCSI)|pcieport|AER' "$out/dmesg-full.txt" > "$out/dmesg-filtered.txt" 2>&1
 
@@ -128,6 +198,9 @@ done
     awake=$(grep -c 'power_state=D0' "$out/controllers.txt" 2>/dev/null)
     total=$(wc -l < "$out/controllers.txt")
     echo "   $awake of $total in D0"
+    echo
+    echo "== what is on each connected port (a plugged drive must be identifiable here, engine#823)"
+    sed 's/^/   /' "$out/connected-ids.txt"
     echo
     echo "== ports seen with a device attached (connect), per bus"
     awk '/^== bus/{b=$3} /port [0-9]+:.*connect/{c[b]++} END{for (k in c) printf "   bus %s: %s port(s) with connect\n", k, c[k]}' "$out/ports.txt"

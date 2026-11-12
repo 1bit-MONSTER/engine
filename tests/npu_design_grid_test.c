@@ -284,6 +284,45 @@ static void oga_geometry(void) {
                       "fused: a non-q4_1 byte count returns -2 so the caller keeps the two-step path");
             printf("  fused chunks->int8: K=%d N=%d  %d codes and %d scales byte-identical to dequant->pack\n",
                    K, N, K * N, N);
+
+            /* THE SAME COMPARISON ON A SYMMETRIC TENSOR WITH AN UNDECIDED TILE (the LFM2 packs' tile kind). Three tiles
+             * are symmetric on their own evidence (zero-points 0, scales of both signs); tile 1 has every zero-point 0
+             * and every scale positive, which decides nothing on its own. The tensor is symmetric, so both paths must
+             * read tile 1 as two's-complement codes: decoded as a one-tile tensor it comes out unsigned, and the fused
+             * path did exactly that. */
+            for (size_t t = 0; t < ntr * ntc; t++) {
+                uint8_t* tile = tiles + t * 5120;
+                for (int i = 0; i < 256; i++) {
+                    const int neg = (t != 1) && (i % 3 == 0);
+                    tile[2 * i] = 0x00;
+                    tile[2 * i + 1] = neg ? 0xBE : 0x3E;        /* bf16 -0.125 / +0.125 */
+                    tile[512 + 2 * i] = 0; tile[512 + 2 * i + 1] = 0;
+                }
+                for (size_t i = 0; i < 4096; i++) tile[1024 + i] = (uint8_t)((i * 53 + t * 29 + 0xC8) & 0xFF);
+            }
+            check_int(q4nx_tile_kind(tiles + 5120), Q4NX_TILE_UNDECIDED, "fused, symmetric: tile 1 decides nothing on its own");
+            check_int(q4nx_tiles_kind(tiles, ntr * ntc, 5120), Q4NX_TILE_SYMMETRIC, "fused, symmetric: the tensor is symmetric");
+            check_int(q4nx_dequant_tensor_chunked(tiles, ntr * ntc * 5120, K, N, 5120, B), 0,
+                      "fused, symmetric: the reference path dequantises it");
+            int neg_in_tile1 = 0;
+            for (int r = 0; r < 32; r++)
+                for (int c = 256; c < 512; c++)
+                    if (B[(size_t)r * N + c] < 0) neg_in_tile1++;
+            check(neg_in_tile1 > 0, "fused, symmetric: the reference reads tile 1 with negative weights (signed codes, positive scales)");
+            q4nx_pack_B_int8(B, K, N, ref, ld, sc_ref);
+            check_int(q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120, K, N, fused, ld, sc_fused), 0,
+                      "fused, symmetric: the fused path accepts it");
+            bad_code = 0; bad_scale = 0;
+            for (int i = 0; i < K * N; i++) if (fused[i] != ref[i]) bad_code++;
+            for (int j = 0; j < N; j++) if (sc_fused[j] != sc_ref[j]) bad_scale++;
+            check_int(bad_code, 0, "fused, symmetric: every code is byte-identical to dequant -> pack, the undecided tile's included");
+            check_int(bad_scale, 0, "fused, symmetric: every column scale as well");
+            /* one zero-point in tile 3: a tensor with both kinds, refused by both paths */
+            tiles[3 * 5120 + 512 + 1] = 0x3F;
+            check_int(q4nx_dequant_tensor_chunked(tiles, ntr * ntc * 5120, K, N, 5120, B), -1,
+                      "fused, mixed: the reference path refuses a tensor with both kinds");
+            check_int(q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120, K, N, fused, ld, sc_fused), -1,
+                      "fused, mixed: and so does the fused path");
         }
         free(tiles); free(B); free(ref); free(fused); free(sc_ref); free(sc_fused);
     }
@@ -831,9 +870,105 @@ static void test_head_tile_cache(void) {
     free(codes); free(ref); free(scales); free(sref);
 }
 
+/* LFM2-1.2B: a hybrid whose conv layers need one more projection, in_proj (K=H, N=3*H). It is the fused-projection
+ * role at a new N and nothing else: no Z, the other four designs untouched, and off when the model has GDN layers. */
+static void shortconv_geometry(void) {
+    Q4nxModelDims d;
+    memset(&d, 0, sizeof d);
+    d.H = 2048; d.NH = 32; d.NKV = 8; d.HD = 64; d.IM = 8192;
+    d.fused_gu = 1; d.M = Q4NX_DESIGN_M_PREFILL;
+    Q4nxDesignGeom plain[Q4NX_MAX_DESIGNS], g[Q4NX_MAX_DESIGNS];
+    const int n0 = q4nx_derive_designs(&d, plain);
+    d.shortconv_n = 3 * d.H;
+    check_int(q4nx_num_designs(&d), n0 + 1, "short-convolution layers add exactly one design to the count");
+    const int n = q4nx_derive_designs(&d, g);
+    check_int(n, n0 + 1, "and exactly one to the derived table");
+    Q4nxDesignGeom* in = find(g, n, Q4NX_DESIGN_QKVLIN);
+    check(in != NULL, "it is the fused-projection role");
+    if (in) {
+        check_int(in->K, 2048, "in_proj K is the hidden size");
+        check_int(in->N, 6144, "in_proj N is 3 * hidden: [B | C | X]");
+        check(strcmp(in->elf_name, "full_i8_QKV_K2048_N6144.elf") == 0, "its artifact name is geometry-derived, like every other");
+    }
+    check(find(g, n, Q4NX_DESIGN_Z) == NULL, "no Z design: a conv layer has no gate projection");
+    int same = 1;
+    for (int i = 0; i < n0; i++)
+        if (g[i].role != plain[i].role || g[i].K != plain[i].K || g[i].N != plain[i].N ||
+            strcmp(g[i].elf_name, plain[i].elf_name) != 0) same = 0;
+    check(same, "the attention and feed-forward designs are the ones the same model derives without it");
+    Q4nxDesignGeom* o = find(g, n, Q4NX_DESIGN_O);
+    check(o && o->K == 2048 && o->N == 2048, "out_proj (H -> H) is the O design when NH*HD == H");
+    d.lin_kd = 1024; d.lin_vd = 2048;
+    Q4nxDesignGeom both[Q4NX_MAX_DESIGNS];
+    const int nb = q4nx_derive_designs(&d, both);
+    check_int(nb, n0 + 2, "with GDN dims set the GDN pair is derived and shortconv_n adds nothing");
+    check_int(q4nx_num_designs(&d), nb, "and the count agrees with the table");
+}
+
+/* engine#1999 / #2001 review, closed here: the head path on a geometry that is not a whole 128-column tile grid.
+ * `blocked_fits(128, 96)` is false, so the forward packs the head ROW-MAJOR and the key carries blocked = 0.
+ * `test_head_tile_cache()` loops blocked 0/1 over an ALIGNED 128x128, so neither of the two things that matter here is
+ * covered: (a) a key that claims the blocked layout for an unaligned geometry must be REFUSED -- blocked_index()
+ * addresses whole tiles, so serving one would read past the image or read foreign bytes -- and (b) a row-major image
+ * still caches: cold writes, warm hits, and the bytes are packB_into()'s. */
+static void test_head_tile_unaligned(void) {
+    const int k = 128, t = 96, kd = 128, nd = 96, nv = 90, ntiles = 1;   /* 96 columns: 3/4 of a tile */
+    char dir[] = "head_tile_unaligned.XXXXXX";
+    check(mkdtemp(dir) != NULL, "unaligned head: a scratch cache directory");
+    int8_t* codes = malloc((size_t)kd * nd);
+    int8_t* ref = malloc((size_t)kd * nd);
+    float* scales = malloc((size_t)nd * sizeof(float));
+    float* sref = malloc((size_t)nd * sizeof(float));
+    check(codes && ref && scales && sref, "unaligned head: the fixture allocates");
+    if (!codes || !ref || !scales || !sref) return;
+    HeadFixture fx = {nv, k, 0, 0};
+
+    /* (a) a blocked key on a geometry with no blocked layout is refused, by name, and writes nothing */
+    {
+        Q4nxHeadImageKey key = {(uint32_t)k, (uint32_t)t, 1, 0xa11a11a11ull};
+        Q4nxHeadTileResult r;
+        const int rc = q4nx_head_tile_image(dir, &key, 0, 0, nv, k, t, kd, nd, head_fixture_col, &fx, codes, scales, &r);
+        check(rc != 1, "unaligned head: a blocked key on a 128x96 geometry is REFUSED, not served");
+        check(strstr(r.why, "no blocked layout") != NULL, "... and the reason names the missing layout");
+        check(r.wrote == 0, "... and nothing was written for it");
+    }
+
+    /* (b) the row-major image caches: cold writes, warm hits, both byte-identical to a fresh pack */
+    {
+        Q4nxHeadImageKey key = {(uint32_t)k, (uint32_t)t, 0, 0xa11a11a11ull};
+        int cold_ok = 0, cold_same = 0, warm_hit = 0, warm_same = 0;
+        Q4nxHeadTileResult r;
+        for (int pass = 0; pass < 2; pass++) {
+            for (int tile = 0; tile < ntiles; tile++) {
+                const int n0 = tile * t, ncols = (nv - n0 < t) ? nv - n0 : t;
+                head_reference(&fx, n0, ncols, k, t, kd, nd, /*blocked=*/0, ref, sref);
+                memset(codes, 0x5a, (size_t)kd * nd);
+                const int rc = q4nx_head_tile_image(dir, &key, tile, n0, ncols, k, t, kd, nd, head_fixture_col, &fx, codes,
+                                                    scales, &r);
+                const int same = memcmp(codes, ref, (size_t)kd * nd) == 0 &&
+                                 memcmp(scales, sref, (size_t)t * sizeof(float)) == 0;
+                if (pass == 0) {
+                    cold_ok += rc == 1 && r.hit == 0 && r.wrote == 1 && r.refused == 0;
+                    cold_same += same;
+                } else {
+                    warm_hit += rc == 1 && r.hit == 1 && r.wrote == 0 && r.refused == 0 && r.sampled > 0;
+                    warm_same += same;
+                }
+            }
+        }
+        check_int(cold_ok, ntiles, "unaligned head: a first pass packs and writes the row-major tile");
+        check_int(cold_same, ntiles, "... and its bytes are packB_into()'s (codes and scales)");
+        check_int(warm_hit, ntiles, "unaligned head: a SECOND pass takes it from the cache");
+        check_int(warm_same, ntiles, "... byte-identical to a fresh pack, over a buffer that was not zero");
+    }
+    free(codes); free(ref); free(scales); free(sref);
+}
+
 int main(void) {
+    shortconv_geometry();
     test_head_image();
     test_head_tile_cache();
+    test_head_tile_unaligned();
     oga_geometry();
     on_grid_geometry();
     activation_pad();

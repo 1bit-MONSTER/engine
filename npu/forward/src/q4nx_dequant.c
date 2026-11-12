@@ -16,6 +16,7 @@
 // q4nx_dequant.c — see q4nx_dequant.h for the layout and its verification.
 #include "q4nx_dequant.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static inline float bf16_to_f32(uint16_t bf) {
@@ -29,7 +30,30 @@ static inline uint16_t le16(const uint8_t* p) {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-void q4nx_dequant_tile(const uint8_t* tile, float* out, int ld) {
+int q4nx_tile_kind(const uint8_t* tile) {
+    const uint8_t* sc_b = tile;
+    const uint8_t* zp_b = tile + Q4NX_TILE_ROWS * Q4NX_GROUPS_PER_ROW * 2; /* +512 */
+    for (int i = 0; i < Q4NX_TILE_ROWS * Q4NX_GROUPS_PER_ROW; i++)
+        if ((le16(zp_b + 2 * i) & 0x7FFF) != 0) return Q4NX_TILE_ASYMMETRIC;   /* +0.0 and -0.0 both count as zero */
+    for (int i = 0; i < Q4NX_TILE_ROWS * Q4NX_GROUPS_PER_ROW; i++) {
+        const uint16_t sc = le16(sc_b + 2 * i);
+        if ((sc & 0x8000) && (sc & 0x7FFF)) return Q4NX_TILE_SYMMETRIC;        /* a scale below zero */
+    }
+    return Q4NX_TILE_UNDECIDED;
+}
+
+int q4nx_tiles_kind(const uint8_t* data, size_t ntiles, size_t stride) {
+    int sym = 0, asym = 0;
+    for (size_t t = 0; t < ntiles && !(sym && asym); t++) {
+        const int k = q4nx_tile_kind(data + t * stride);
+        if (k == Q4NX_TILE_SYMMETRIC) sym = 1;
+        else if (k == Q4NX_TILE_ASYMMETRIC) asym = 1;
+    }
+    if (sym && asym) return -1;
+    return sym ? Q4NX_TILE_SYMMETRIC : Q4NX_TILE_ASYMMETRIC;
+}
+
+void q4nx_dequant_tile_as(const uint8_t* tile, float* out, int ld, int symmetric) {
     const uint8_t* sc_b = tile;
     const uint8_t* zp_b = tile + Q4NX_TILE_ROWS * Q4NX_GROUPS_PER_ROW * 2; /* +512  */
     const uint8_t* pk = tile + Q4NX_TILE_ROWS * Q4NX_GROUPS_PER_ROW * 4;   /* +1024 */
@@ -42,14 +66,35 @@ void q4nx_dequant_tile(const uint8_t* tile, float* out, int ld) {
             const int j = c % Q4NX_GROUP_SIZE;
             const int region = h * Q4NX_GROUPS_PER_ROW + g;
             const uint8_t byte = pk[region * 256 + 8 * j + rr / 2];
-            const int code = (rr % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+            int code = (rr % 2 == 0) ? (byte & 0xF) : (byte >> 4);
             /* scale/zero-point index is GROUP-MAJOR: i = g*32 + r */
             const int i = g * Q4NX_TILE_ROWS + r;
             const float s = bf16_to_f32(le16(sc_b + 2 * i));
-            const float z = bf16_to_f32(le16(zp_b + 2 * i));
-            out[(size_t)r * ld + c] = (float)code * s + z;
+            if (symmetric) {
+                if (code >= 8) code -= 16;   /* two's complement nibble */
+                out[(size_t)r * ld + c] = (float)code * s;
+            } else {
+                const float z = bf16_to_f32(le16(zp_b + 2 * i));
+                out[(size_t)r * ld + c] = (float)code * s + z;
+            }
         }
     }
+}
+
+void q4nx_dequant_tile(const uint8_t* tile, float* out, int ld) {
+    /* One tile with nothing around it: symmetric only on its own evidence, asymmetric otherwise. */
+    q4nx_dequant_tile_as(tile, out, ld, q4nx_tile_kind(tile) == Q4NX_TILE_SYMMETRIC);
+}
+
+/* The kind of a run of 5,120-byte tiles that belong to one tensor, for the tensor-level readers below: 1 symmetric,
+ * 0 asymmetric, or -1 with the refusal on stderr when the tensor holds tiles of both kinds. */
+static int tensor_kind_or_refuse(const uint8_t* data, size_t ntiles, size_t stride) {
+    const int k = q4nx_tiles_kind(data, ntiles, stride);
+    if (k < 0)
+        fprintf(stderr, "q4nx: a tensor of %zu 5120-byte tiles holds symmetric tiles (zero-points all 0, a scale below "
+                        "zero) and asymmetric ones (a zero-point present); one tensor is one kind, so it is refused\n",
+                ntiles);
+    return k < 0 ? -1 : (k == Q4NX_TILE_SYMMETRIC);
 }
 
 size_t q4nx_tensor_bytes(int rows, int cols) {
@@ -91,15 +136,81 @@ void q4nx_dequant_tile_q8(const uint8_t* t, float* out, int ld) {
     }
 }
 
+void q4nx_dequant_tile_q4s(const uint8_t* t, float* out, int ld) {
+    const uint8_t* sc_b = t;          /* [256] bf16, index g*32 + r */
+    const uint8_t* qs = t + 512;      /* [256][16], byte c*16 + r/2 */
+    for (int r = 0; r < Q4NX_TILE_ROWS; r++) {
+        for (int c = 0; c < Q4NX_TILE_COLS; c++) {
+            const int g = c / Q4NX_GROUP_SIZE;
+            const uint8_t byte = qs[c * 16 + r / 2];
+            int code = (r % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+            if (code >= 8) code -= 16;   /* two's complement nibble */
+            out[(size_t)r * ld + c] = (float)code * bf16_to_f32(le16(sc_b + 2 * (g * Q4NX_TILE_ROWS + r)));
+        }
+    }
+}
+
+void q4nx_dequant_chunk_q4h(const uint8_t* t, float* out, int ld, int symmetric) {
+    const uint8_t* sc_b = t;
+    const uint8_t* zp_b = t + 128;
+    const uint8_t* pk = t + 256;
+    for (int r = 0; r < Q4NX_Q4H_ROWS; r++) {
+        for (int c = 0; c < Q4NX_Q4H_COLS; c++) {
+            const int i = (c / Q4NX_GROUP_SIZE) * Q4NX_Q4H_ROWS + r;
+            const uint8_t byte = pk[c * 8 + r / 2];
+            int code = (r % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+            const float s = bf16_to_f32(le16(sc_b + 2 * i));
+            if (symmetric) {
+                if (code >= 8) code -= 16;
+                out[(size_t)r * ld + c] = (float)code * s;
+            } else {
+                out[(size_t)r * ld + c] = (float)code * s + bf16_to_f32(le16(zp_b + 2 * i));
+            }
+        }
+    }
+}
+
+int q4nx_dequant_tensor_q4h(const uint8_t* data, size_t nbytes, int rows, int k, int cols, float* out) {
+    if (!data || !out || rows <= 0 || k <= 0 || cols < k) return -1;
+    if (rows % Q4NX_Q4H_ROWS || k % Q4NX_Q4H_COLS) return -1;
+    const int ntr = rows / Q4NX_Q4H_ROWS, ntc = k / Q4NX_Q4H_COLS;
+    const size_t n = (size_t)ntr * (size_t)ntc;
+    if (nbytes != n * (size_t)Q4NX_CHUNK_Q4H) return -1;
+    /* One kind per tensor, the 5120-byte rule: symmetric when every zero-point is 0 and some scale is negative. */
+    int zero_zp = 1, neg = 0;
+    for (size_t i = 0; i < n && (zero_zp || !neg); i++) {
+        const uint8_t* c = data + i * Q4NX_CHUNK_Q4H;
+        for (int j = 0; j < 64; j++) {
+            if (le16(c + 128 + 2 * j) & 0x7fff) zero_zp = 0;
+            if (le16(c + 2 * j) & 0x8000) neg = 1;
+        }
+    }
+    const int sym = zero_zp && neg;
+    #pragma omp parallel for collapse(2) schedule(static) if(n >= 4)
+    for (int tr = 0; tr < ntr; tr++)
+        for (int tc = 0; tc < ntc; tc++)
+            q4nx_dequant_chunk_q4h(data + ((size_t)tr * ntc + tc) * Q4NX_CHUNK_Q4H,
+                                   out + (size_t)tr * Q4NX_Q4H_ROWS * cols + (size_t)tc * Q4NX_Q4H_COLS, cols, sym);
+    if (cols > k)
+        for (int r = 0; r < rows; r++)
+            memset(out + (size_t)r * cols + k, 0, (size_t)(cols - k) * sizeof(float));
+    return 0;
+}
+
 int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
                                 int cols, int chunk_bytes, float* out) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
     if (chunk_bytes != Q4NX_TILE_BYTES && chunk_bytes != Q4NX_CHUNK_Q4K &&
-        chunk_bytes != Q4NX_CHUNK_Q8)
+        chunk_bytes != Q4NX_CHUNK_Q8 && chunk_bytes != Q4NX_CHUNK_Q4S)
         return -1;
     const int ntr = rows / Q4NX_TILE_ROWS, ntc = cols / Q4NX_TILE_COLS;
     if (nbytes < (size_t)ntr * (size_t)ntc * (size_t)chunk_bytes) return -1;
+    int sym = 0;
+    if (chunk_bytes == Q4NX_TILE_BYTES) {
+        sym = tensor_kind_or_refuse(data, (size_t)ntr * (size_t)ntc, Q4NX_TILE_BYTES);
+        if (sym < 0) return -1;
+    }
     // Each tile writes a disjoint output region, so the tile grid parallelizes.
     // `tmp` is declared per-tile (inside the innermost body) so it is not shared.
     #pragma omp parallel for collapse(2) schedule(static) if(ntr * ntc >= 4)
@@ -111,8 +222,10 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
                 q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
             else if (chunk_bytes == Q4NX_CHUNK_Q8)
                 q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+            else if (chunk_bytes == Q4NX_CHUNK_Q4S)
+                q4nx_dequant_tile_q4s(c, tmp, Q4NX_TILE_COLS);
             else
-                q4nx_dequant_tile(c, tmp, Q4NX_TILE_COLS);
+                q4nx_dequant_tile_as(c, tmp, Q4NX_TILE_COLS, sym);
             for (int r = 0; r < Q4NX_TILE_ROWS; r++)
                 memcpy(out + (size_t)(tr * Q4NX_TILE_ROWS + r) * cols +
                            (size_t)tc * Q4NX_TILE_COLS,
@@ -131,20 +244,28 @@ int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols
     if (r < 0 || r >= rows) return -1;
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
     if (chunk_bytes != Q4NX_TILE_BYTES && chunk_bytes != Q4NX_CHUNK_Q4K &&
-        chunk_bytes != Q4NX_CHUNK_Q8)
+        chunk_bytes != Q4NX_CHUNK_Q8 && chunk_bytes != Q4NX_CHUNK_Q4S)
         return -1;
     const int ntr = rows / Q4NX_TILE_ROWS, ntc = cols / Q4NX_TILE_COLS;
     if (nbytes < (size_t)ntr * (size_t)ntc * (size_t)chunk_bytes) return -1;
     const int tr = r / Q4NX_TILE_ROWS, rr = r % Q4NX_TILE_ROWS;
     float tmp[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];
+    /* Per token, so the kind is taken from this tile-row's own tiles (ntc of them), not from the whole table. */
+    int sym = 0;
+    if (chunk_bytes == Q4NX_TILE_BYTES) {
+        sym = tensor_kind_or_refuse(data + (size_t)tr * (size_t)ntc * Q4NX_TILE_BYTES, (size_t)ntc, Q4NX_TILE_BYTES);
+        if (sym < 0) return -1;
+    }
     for (int tc = 0; tc < ntc; tc++) {
         const uint8_t* c = data + (size_t)(tr * ntc + tc) * (size_t)chunk_bytes;
         if (chunk_bytes == Q4NX_CHUNK_Q4K)
             q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
         else if (chunk_bytes == Q4NX_CHUNK_Q8)
             q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+        else if (chunk_bytes == Q4NX_CHUNK_Q4S)
+            q4nx_dequant_tile_q4s(c, tmp, Q4NX_TILE_COLS);
         else
-            q4nx_dequant_tile(c, tmp, Q4NX_TILE_COLS);
+            q4nx_dequant_tile_as(c, tmp, Q4NX_TILE_COLS, sym);
         memcpy(out + (size_t)tc * Q4NX_TILE_COLS, tmp + (size_t)rr * Q4NX_TILE_COLS,
                Q4NX_TILE_COLS * sizeof(float));
     }
@@ -154,8 +275,8 @@ int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols
 int q4nx_tile_row_kind(size_t nbytes, int rows, int cols) {
     if (rows <= 0 || cols <= 0 || rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return 0;
     const size_t tiles = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
-    const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
-    for (int i = 0; i < 3; i++)
+    const int kinds[4] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8, Q4NX_CHUNK_Q4S};
+    for (int i = 0; i < 4; i++)
         if (nbytes == tiles * (size_t)kinds[i]) return kinds[i];
     return 0;
 }
@@ -206,13 +327,18 @@ int q4nx_dequant_tensor_packed(const uint8_t* data, size_t nbytes, int rows, int
     if (rows_packed < rows || cols_packed < cols) return -1;
     if (rows_packed % Q4NX_TILE_ROWS || cols_packed % Q4NX_TILE_COLS) return -1;
     if (chunk_bytes != Q4NX_TILE_BYTES && chunk_bytes != Q4NX_CHUNK_Q4K &&
-        chunk_bytes != Q4NX_CHUNK_Q8)
+        chunk_bytes != Q4NX_CHUNK_Q8 && chunk_bytes != Q4NX_CHUNK_Q4S)
         return -1;
     if (rows_packed == rows && cols_packed == cols)
         return q4nx_dequant_tensor_chunked(data, nbytes, rows, cols, chunk_bytes, out);
     const int ntr = rows / Q4NX_TILE_ROWS, ntc = cols / Q4NX_TILE_COLS;
     const int ntr_p = rows_packed / Q4NX_TILE_ROWS, ntc_p = cols_packed / Q4NX_TILE_COLS;
     if (nbytes < (size_t)ntr_p * (size_t)ntc_p * (size_t)chunk_bytes) return -1;
+    int sym = 0;
+    if (chunk_bytes == Q4NX_TILE_BYTES) {
+        sym = tensor_kind_or_refuse(data, (size_t)ntr_p * (size_t)ntc_p, Q4NX_TILE_BYTES);
+        if (sym < 0) return -1;
+    }
     // Read geometry is the container's grid (ntc_p is the tile-row stride); write geometry is the
     // model's, so a caller's buffer and its row stride stay exactly what they were before.
     #pragma omp parallel for collapse(2) schedule(static) if(ntr * ntc >= 4)
@@ -224,8 +350,10 @@ int q4nx_dequant_tensor_packed(const uint8_t* data, size_t nbytes, int rows, int
                 q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
             else if (chunk_bytes == Q4NX_CHUNK_Q8)
                 q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+            else if (chunk_bytes == Q4NX_CHUNK_Q4S)
+                q4nx_dequant_tile_q4s(c, tmp, Q4NX_TILE_COLS);
             else
-                q4nx_dequant_tile(c, tmp, Q4NX_TILE_COLS);
+                q4nx_dequant_tile_as(c, tmp, Q4NX_TILE_COLS, sym);
             for (int r = 0; r < Q4NX_TILE_ROWS; r++)
                 memcpy(out + (size_t)(tr * Q4NX_TILE_ROWS + r) * cols +
                            (size_t)tc * Q4NX_TILE_COLS,
@@ -264,6 +392,8 @@ int q4nx_dequant_tensor(const uint8_t* data, size_t nbytes, int rows, int cols,
 
     const int ntr = rows / Q4NX_TILE_ROWS;
     const int ntc = cols / Q4NX_TILE_COLS;
+    const int sym = tensor_kind_or_refuse(data, (size_t)ntr * (size_t)ntc, Q4NX_TILE_BYTES);
+    if (sym < 0) return -1;
 
     #pragma omp parallel for collapse(2) schedule(static) if(ntr * ntc >= 4)
     for (int tr = 0; tr < ntr; tr++) {
@@ -271,7 +401,7 @@ int q4nx_dequant_tensor(const uint8_t* data, size_t nbytes, int rows, int cols,
             float tmp[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];
             const uint8_t* tile =
                 data + (size_t)(tr * ntc + tc) * (size_t)Q4NX_TILE_BYTES;
-            q4nx_dequant_tile(tile, tmp, Q4NX_TILE_COLS);
+            q4nx_dequant_tile_as(tile, tmp, Q4NX_TILE_COLS, sym);
             for (int r = 0; r < Q4NX_TILE_ROWS; r++) {
                 memcpy(out + (size_t)(tr * Q4NX_TILE_ROWS + r) * (size_t)cols +
                            (size_t)tc * Q4NX_TILE_COLS,

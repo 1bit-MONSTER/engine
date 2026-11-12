@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <string>
+#include <vector>
 
 namespace onebit {
 
@@ -72,5 +73,36 @@ private:
         if (!text.empty()) emit(in_think, text);
     }
 };
+
+// How many of `pieces` (one generated token's text each, in order) were reasoning, for usage.completion_tokens_details
+// .reasoning_tokens (engine#2111): the twin of npu::reasoning_token_count() over this route's splitter. A token is
+// reasoning when none of its text reached content and the block was open before it, after it, or it put text into
+// it -- so both tags, a held-back partial tag and an unclosed block at the end of the budget count.
+inline int think_reasoning_tokens(const std::vector<std::string>& pieces, bool opened) {
+    ThinkSplit s(opened);
+    int n = 0;
+    bool last_counted = false;
+    int pending = 0;          // leading tokens that produced nothing yet: they join the block if the next one opens it
+    bool started = false;
+    for (const auto& piece : pieces) {
+        const bool before = s.in_think;
+        bool content = false, reasoning = false;
+        s.feed(piece, [&](bool r, const std::string&) { (r ? reasoning : content) = true; });
+        last_counted = !content && (reasoning || before || s.in_think);
+        if (last_counted) {
+            ++n;
+            if (!started) n += pending;
+            started = true;
+        } else if (content) {
+            started = true;
+        } else if (!started) {
+            ++pending;
+        }
+    }
+    bool flushed_content = false;
+    s.flush([&](bool r, const std::string&) { if (!r) flushed_content = true; });
+    if (flushed_content && last_counted) --n;
+    return n;
+}
 
 }  // namespace onebit

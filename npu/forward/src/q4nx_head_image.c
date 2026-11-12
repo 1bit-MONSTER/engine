@@ -18,6 +18,7 @@
 // geometry and a hash, and a reader that cannot reproduce the hash refuses instead of returning bytes it cannot vouch for.
 
 #include "q4nx_head_image.h"
+#include "file_create.h"   /* the cache file is created 0644, never through a symlink */
 
 #include <stdio.h>
 #include <string.h>
@@ -82,7 +83,7 @@ int q4nx_head_image_write(const char *path, const int8_t *codes, const float *sc
     const int tn = snprintf(tmp, sizeof tmp, "%s.tmp", path);
 #endif
     if (tn <= 0 || (size_t)tn >= sizeof tmp) return 0;
-    FILE *f = fopen(tmp, "wb");
+    FILE *f = onebit_fopen_shared_wb(tmp);
     if (!f) return 0;
     int ok = fwrite(&h, sizeof h, 1, f) == 1 && fwrite(codes, (size_t)kd * (size_t)nd, 1, f) == 1 &&
              fwrite(scales, (size_t)nd * sizeof(float), 1, f) == 1;

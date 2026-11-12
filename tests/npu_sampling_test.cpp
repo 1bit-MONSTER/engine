@@ -49,6 +49,8 @@ using onebit::npu::logprobs_of;
 using onebit::npu::options_from_body;
 using onebit::npu::SampleParams;
 using onebit::npu::sample_token;
+using onebit::npu::argmax_token;
+using onebit::npu::token_bound;
 using onebit::npu::stop_holdback;
 
 int failures = 0;
@@ -500,10 +502,65 @@ void test_prefix_pin() {
         check(c.pin_point(prompt(100, 5000, 40), prompt(100, 6000, 40)) == 0,
               "100 shared tokens do not beat prefix-min-gain 128");
         check(c.pin_point(prompt(900, 5000, 40), prompt(0, 6000, 40)) == 0, "prompts that share nothing have no pin point");
+        {   // only the leading tokens count: the same 900 tokens at the end of both prompts are not a prefix
+            std::vector<int> a1 = prompt(0, 5000, 200), a2 = prompt(0, 6000, 200);
+            const std::vector<int> tail = prompt(900, 0, 0);
+            a1.insert(a1.end(), tail.begin(), tail.end());
+            a2.insert(a2.end(), tail.begin(), tail.end());
+            check(shared_prefix_len(a1, a2) == 0 && c.pin_point(a1, a2) == 0,
+                  "a shared ending under different openings is not a pin point");
+            a2[0] = a1[0];  // one shared leading token, then they part: still nothing worth a slot
+            check(shared_prefix_len(a1, a2) == 1 && c.pin_point(a1, a2) == 0,
+                  "and one shared leading token before that ending is not one either");
+        }
+        // the contract the forward relies on: a pin point is a real common prefix, never longer than either
+        for (int sys : {0, 1, 127, 128, 129, 500, 900}) {
+            for (int turn : {1, 40}) {
+                const std::vector<int> x = prompt(sys, 5000, turn), y = prompt(sys, 6000, turn + 7);
+                const size_t n = c.pin_point(x, y);
+                check(n <= x.size() && n <= y.size() && std::equal(x.begin(), x.begin() + long(n), y.begin()),
+                      "a pin point never reaches past the tokens both prompts start with");
+                check(n == (sys >= 128 ? size_t(sys) : 0u),
+                      "it is the whole shared opening when that is worth a slot, and 0 (no pin) when it is not");
+            }
+        }
         PrefixOptions off = o;
         off.slots = 0;
         check(PrefixCache(off).pin_point(q1, q2) == 0, "an off cache pins nothing");
         check(PrefixCache(off).pin(q1, 10) == -1, "and refuses a pin");
+    }
+    {   // pin_at: the end of the system turn is known on the FIRST request, so the second one is already warm
+        PrefixCache c(o);
+        check(c.pin_at(q1, 900) == 900, "the first request under a 900-token system prompt pins its 900 tokens");
+        check(c.pin_point({}, q1) == 0, "where comparing with a previous request has nothing to offer yet");
+        std::string why;
+        const int pin = c.pin(std::vector<int>(q1.begin(), q1.begin() + 900), 2000, &why);
+        c.insert(q1, 1000);
+        const auto d = c.lookup(q2);
+        check(pin >= 0 && d.slot == pin && d.cached_tokens == 900 && d.pinned,
+              "so the SECOND question resumes from the pin: 900 of its 930 tokens");
+        check(c.pin_at(q2, 900) == 0 && c.pin_at(q3, 900) == 0, "and later requests do not pin the same point again");
+        // what is not worth a pin, or is not one
+        check(c.pin_at(q1, 0) == 0, "no system turn, no pin");
+        check(c.pin_at(q1, q1.size()) == 0 && c.pin_at(q1, q1.size() + 5) == 0, "a point at or past the end of the prompt is insert()'s");
+        PrefixCache fresh(o);
+        check(fresh.pin_at(q1, 127) == 0 && fresh.pin_at(q1, 128) == 128, "a system turn shorter than prefix-min-gain is not pinned");
+        PrefixOptions off = o;
+        off.slots = 0;
+        check(PrefixCache(off).pin_at(q1, 900) == 0, "an off cache pins nothing");
+        // a pin that ran into the question (two questions opening alike) does not cover a question that opens
+        // differently, and the system turn's own end then replaces it
+        PrefixCache over(o);
+        std::vector<int> a1 = prompt(900, 5000, 40), a2 = prompt(900, 5000, 40), b1 = prompt(900, 8000, 40);
+        a2[905] = 4242;                                            // same first five question tokens, then different
+        const size_t ran_over = over.pin_point(a1, a2);
+        check(ran_over == 905, "comparing two alike-opening questions pins five tokens into the question");
+        over.pin(std::vector<int>(a2.begin(), a2.begin() + long(ran_over)), 2000);
+        check(over.lookup(b1).cached_tokens == 0, "which a differently opening question cannot use");
+        check(over.pin_at(b1, 900) == 900, "the system turn's end is still worth pinning for it");
+        const int repin = over.pin(std::vector<int>(b1.begin(), b1.begin() + 900), 2000);
+        check(repin >= 0 && over.lookup(b1).cached_tokens == 900 && over.lookup(a1).cached_tokens == 900,
+              "and once pinned there, every question under that system prompt resumes from it");
     }
     {   // the pin outlives what evicts and replaces everything else
         PrefixOptions b = o;
@@ -787,7 +844,8 @@ void test_gemma4_answer_parser() {
     }
     {
         const auto a = parse_answer("<|channel>thought\nlet me think<channel|>Done.", G, false);
-        check(a.reasoning == "\nlet me think", "gemma4: the thought channel is reasoning");
+        check(a.reasoning == "let me think" && a.content == "Done.",
+              "gemma4: the thought channel is reasoning, without the newline the template puts after the tag");
         check(a.content == "Done.", "gemma4: and the reply after it is content");
     }
     {
@@ -863,7 +921,8 @@ void test_answer_parser() {
     const auto F = AnswerFamily::qwen3;
     {   // reasoning, then content: the Qwen3 shape this route sees on every answer
         const auto a = parse_answer("<think>\nOkay, the user asked.", F, false);
-        check(a.reasoning == "\nOkay, the user asked.", "reasoning_content is the inside of <think>");
+        check(a.reasoning == "Okay, the user asked.",
+              "reasoning_content is the inside of <think>, without the newline the model puts after the tag");
         check(a.content.empty() && a.calls.empty(), "a reasoning-only answer has no content and no calls");
         check(!a.content_null, "content is empty string, not null, when there are no calls");
 
@@ -1170,7 +1229,36 @@ void test_request_parsing() {
 
 }  // namespace
 
+// engine#2017: the logits row is `vocab_size` wide, which may exceed the tokenizer (Qwen3-0.6B: 151,936 for 151,669
+// ids; the shape below is the issue's, 32,032 for 32,016). Ids past the tokenizer are padding positions: every real
+// logit negative and the padding at exactly 0.0 is the row where an unbounded argmax picks one (engine#1182).
+void test_vocab_bound() {
+    const int V = 32016, W = 32032;
+    std::vector<float> row(size_t(W), 0.0f);
+    for (int v = 0; v < V; v++) row[size_t(v)] = -1.0f - float(v % 97) * 0.01f;
+    row[123] = -0.5f;  // the real best
+    check(argmax_token(row.data(), size_t(W)) >= V, "control: an unbounded argmax lands on a padding id");
+    check(argmax_token(row.data(), size_t(W), V) == 123, "the bounded argmax picks the best real id");
+    check(sample(row, SampleParams(), 1) >= V, "control: unbounded greedy sample lands on a padding id");
+    std::mt19937_64 rng(1);
+    check(sample_token(row, SampleParams(), rng, nullptr, V) == 123, "bounded greedy sample picks the best real id");
+    SampleParams hot;
+    hot.temperature = 1.0f;
+    bool all_real = true;
+    for (uint64_t s = 0; s < 200; s++) {
+        std::mt19937_64 r(s);
+        if (sample_token(row, hot, r, nullptr, V) >= V) all_real = false;
+    }
+    check(all_real, "a bounded draw at temperature 1 never draws a padding id");
+    std::vector<char> mask(size_t(W), 1);
+    std::mt19937_64 r2(2);
+    check(sample_token(row, SampleParams(), r2, &mask, V) == 123, "the bound holds with a mask that allows padding");
+    check(token_bound(size_t(W), 0) == size_t(W), "no tokenizer keeps the whole row");
+    check(token_bound(size_t(V), W) == size_t(V), "a tokenizer larger than the row does not widen it");
+}
+
 int main() {
+    test_vocab_bound();
     test_sampler();
     test_sampler_distribution();
     test_stop();

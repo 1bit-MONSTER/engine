@@ -25,11 +25,19 @@
 #include <unistd.h>
 #include <fstream>
 #include <string>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace fs = std::filesystem;
 static int failures = 0;
 static void check(bool ok, const std::string& what) {
     if (!ok) { std::printf("FAIL %s\n", what.c_str()); ++failures; }
+}
+
+// argv for run_q4nx_cache(): the vector must outlive the call, so callers keep it named.
+static std::vector<char*> mkargv(std::vector<std::string>& a) {
+    std::vector<char*> v;
+    for (auto& s : a) v.push_back(const_cast<char*>(s.c_str()));
+    return v;
 }
 
 static void make_entry(const fs::path& root, const std::string& name, int mb, int age_minutes) {
@@ -44,7 +52,7 @@ static void make_entry(const fs::path& root, const std::string& name, int mb, in
 
 int main() {
     std::error_code ec;
-    const fs::path root = fs::temp_directory_path() / ("q4nx-cache-test-" + std::to_string(::getpid()));
+    const fs::path root = ::onebit::test::tmp_root() / ("q4nx-cache-test-" + std::to_string(::getpid()));
     fs::remove_all(root, ec);
 
     // (a) under the bound: nothing is removed
@@ -87,8 +95,74 @@ int main() {
     check(r.removed == 0 && fs::exists(root / "keepme-1") && fs::exists(root / "keepme-2"),
           "a non-positive bound disables the sweep");
 
+    // (f) a hit is a use: the older entry, touched, outlives a younger one nobody opened. Without the touch the order is
+    // by creation and the entry served every day goes first.
     fs::remove_all(root, ec);
-    std::printf("q4nx cache: %d arm(s) over the sweep (bound, LRU order, keep, age window, disabled)\n",
-                failures ? 0 : 12);
+    make_entry(root, "served-daily", 4, 7 * 24 * 60);
+    make_entry(root, "one-off", 4, 24 * 60);
+    q4nx_cache_touch((root / "served-daily").string());
+    r = q4nx_cache_evict(root.string(), "", 6LL << 20, /*min_age_seconds=*/0);
+    check(r.removed == 1, "one entry has to go (removed " + std::to_string(r.removed) + ")");
+    check(fs::exists(root / "served-daily"), "the entry that was just used survives");
+    check(!fs::exists(root / "one-off"), "and the unused one is the one removed");
+    // ... and a touched entry is inside the age window, so a serve that just opened it is covered like a new one
+    make_entry(root, "one-off", 4, 24 * 60);
+    make_entry(root, "opened-now", 4, 7 * 24 * 60);
+    fs::remove_all(root / "served-daily", ec);
+    q4nx_cache_touch((root / "opened-now").string());
+    r = q4nx_cache_evict(root.string(), "", 1LL << 20);
+    check(fs::exists(root / "opened-now") && !fs::exists(root / "one-off"),
+          "a touched entry is protected by the age window");
+    q4nx_cache_touch((root / "absent").string());
+    check(!fs::exists(root / "absent"), "touching a missing entry creates nothing");
+
+    // (g) the bound from ONEBIT_Q4NX_CACHE_MAX_GIB's text: never wraps, and a typo is not "unbounded"
+    const int64_t gib = 1LL << 30, top = (INT64_MAX >> 30) << 30;
+    check(q4nx_cache_bound_bytes(nullptr) == 60 * gib && q4nx_cache_bound_bytes("") == 60 * gib, "unset is the default");
+    check(q4nx_cache_bound_bytes("100") == 100 * gib, "a plain number is that many GiB");
+    check(q4nx_cache_bound_bytes("0") == 0 && q4nx_cache_bound_bytes("-5") == 0, "zero or negative disables the sweep");
+    check(q4nx_cache_bound_bytes("8589934592") == top, "2^33 GiB clamps instead of overflowing");
+    check(q4nx_cache_bound_bytes("17179869184") == top, "2^34 GiB is not a bound of 0");
+    check(q4nx_cache_bound_bytes("17179869185") == top, "2^34+1 GiB is not a bound of 1 GiB");
+    check(q4nx_cache_bound_bytes("99999999999999999999999") == top, "a number past long long clamps too");
+    check(q4nx_cache_bound_bytes("sixty") == 60 * gib, "a value that is not a number is the default, not unbounded");
+    check(q4nx_cache_bound_bytes("40G") == 40 * gib, "a number with a suffix keeps its number");
+    check(q4nx_cache_bound_bytes("7", 9) == 7 * gib && q4nx_cache_bound_bytes(nullptr, 9) == 9 * gib, "the default is the caller's");
+
+    // engine#1788 / disk pressure: the sweep as a COMMAND. Until now a serve start was the only trigger, so nothing
+    // swept while the NPU was off -- the cache sat at 70.9 GiB against its 60 GiB bound with / at 149 G.
+    {
+        const fs::path cr = root / "cli";
+        make_entry(cr, "big-a", 8, 500);
+        make_entry(cr, "big-b", 8, 400);
+        const std::string root_arg = "--root", root_val = cr.string();
+        {
+            // dry-run over the bound: reports and removes nothing
+            std::vector<std::string> a = {"evict", root_arg, root_val, "--max-gib", "0", "--dry-run"};
+            std::vector<char*> av = mkargv(a);
+            check(::run_q4nx_cache(int(av.size()), av.data()) == 0,
+                  "q4nx-cache evict: --max-gib 0 is 'sweep is off', exit 0");
+            check(fs::exists(cr / "big-a") && fs::exists(cr / "big-b"), "q4nx-cache evict: nothing removed with the sweep off");
+        }
+        {
+            // a real sweep with min-age 0 and a 0 GiB bound still cannot remove the `keep` entry
+            std::vector<std::string> a = {"evict", root_arg, root_val, "--max-mib", "6", "--min-age", "0",
+                                          "--keep", "big-a"};
+            std::vector<char*> av = mkargv(a);
+            ::run_q4nx_cache(int(av.size()), av.data());
+            check(fs::exists(cr / "big-a"), "q4nx-cache evict: the --keep entry is never removed");
+            check(!fs::exists(cr / "big-b"), "q4nx-cache evict: the least-recently-used entry goes first");
+        }
+        {
+            std::vector<std::string> a = {"evict", "--nonsense"};
+            std::vector<char*> av = mkargv(a);
+            check(::run_q4nx_cache(int(av.size()), av.data()) == 2,
+                  "q4nx-cache evict: an unknown argument is usage, exit 2");
+        }
+        fs::remove_all(cr, ec);
+    }
+    fs::remove_all(root, ec);
+    std::printf("q4nx cache: %d arm(s) over the sweep (bound, LRU order, keep, age window, disabled, touch on a hit, bound text)\n",
+                failures ? 0 : 26);
     return failures ? 1 : 0;
 }

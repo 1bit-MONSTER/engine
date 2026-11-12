@@ -150,6 +150,53 @@ void q4nx_dequant_tile_q4s(const uint8_t* t, float* out, int ld) {
     }
 }
 
+void q4nx_dequant_chunk_q4h(const uint8_t* t, float* out, int ld, int symmetric) {
+    const uint8_t* sc_b = t;
+    const uint8_t* zp_b = t + 128;
+    const uint8_t* pk = t + 256;
+    for (int r = 0; r < Q4NX_Q4H_ROWS; r++) {
+        for (int c = 0; c < Q4NX_Q4H_COLS; c++) {
+            const int i = (c / Q4NX_GROUP_SIZE) * Q4NX_Q4H_ROWS + r;
+            const uint8_t byte = pk[c * 8 + r / 2];
+            int code = (r % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+            const float s = bf16_to_f32(le16(sc_b + 2 * i));
+            if (symmetric) {
+                if (code >= 8) code -= 16;
+                out[(size_t)r * ld + c] = (float)code * s;
+            } else {
+                out[(size_t)r * ld + c] = (float)code * s + bf16_to_f32(le16(zp_b + 2 * i));
+            }
+        }
+    }
+}
+
+int q4nx_dequant_tensor_q4h(const uint8_t* data, size_t nbytes, int rows, int k, int cols, float* out) {
+    if (!data || !out || rows <= 0 || k <= 0 || cols < k) return -1;
+    if (rows % Q4NX_Q4H_ROWS || k % Q4NX_Q4H_COLS) return -1;
+    const int ntr = rows / Q4NX_Q4H_ROWS, ntc = k / Q4NX_Q4H_COLS;
+    const size_t n = (size_t)ntr * (size_t)ntc;
+    if (nbytes != n * (size_t)Q4NX_CHUNK_Q4H) return -1;
+    /* One kind per tensor, the 5120-byte rule: symmetric when every zero-point is 0 and some scale is negative. */
+    int zero_zp = 1, neg = 0;
+    for (size_t i = 0; i < n && (zero_zp || !neg); i++) {
+        const uint8_t* c = data + i * Q4NX_CHUNK_Q4H;
+        for (int j = 0; j < 64; j++) {
+            if (le16(c + 128 + 2 * j) & 0x7fff) zero_zp = 0;
+            if (le16(c + 2 * j) & 0x8000) neg = 1;
+        }
+    }
+    const int sym = zero_zp && neg;
+    #pragma omp parallel for collapse(2) schedule(static) if(n >= 4)
+    for (int tr = 0; tr < ntr; tr++)
+        for (int tc = 0; tc < ntc; tc++)
+            q4nx_dequant_chunk_q4h(data + ((size_t)tr * ntc + tc) * Q4NX_CHUNK_Q4H,
+                                   out + (size_t)tr * Q4NX_Q4H_ROWS * cols + (size_t)tc * Q4NX_Q4H_COLS, cols, sym);
+    if (cols > k)
+        for (int r = 0; r < rows; r++)
+            memset(out + (size_t)r * cols + k, 0, (size_t)(cols - k) * sizeof(float));
+    return 0;
+}
+
 int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
                                 int cols, int chunk_bytes, float* out) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;

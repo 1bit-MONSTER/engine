@@ -1986,8 +1986,17 @@ phenomenon called Rayleigh scattering", the same as the host forward with the BO
 On the device, with a locally built kernel set of the four shapes (`QKV K2560 N4096`, `O K2048 N2560`,
 `GU K2560 N20480`, `D K10240 N2560`) and their 16-row twins, in one `npu-hold` ticket, the known answer came back
 `Paris` three times, identical. That is not yet a leaderboard row: decode is 0.68 tok/s, and no kernel set for these
-shapes ships. Gemma3-270M-NPU2 still fails at load: its tiles are on an unpadded K = 640 grid that the decoder
-does not read yet.
+shapes ships.
+
+**Gemma3-270M-NPU2 and the 1,280-byte quarter tile.** This pack's hidden size, 640, is not a multiple of the
+5,120-byte tile's 256 columns. FastFlowLM stores every I8 tensor of it in a quarter tile instead: 16 rows x 128
+columns, with scales and zero-points at `g*16 + r` and codes at `c*8 + r/2` (`Q4NX_CHUNK_Q4H`, `q4nx_dequant.h`).
+Both kinds cost 0.625 bytes a weight, so the byte count cannot tell them apart. The tensor's declared shape does:
+`[chunks, 1280]` against `[tiles, 5120]`, and the reader goes by it. The reading was settled against an independent
+GGUF of the same model (`v_proj` against its Q5_0 `attn_v`: correlation 0.9962; the 5,120-tile reading gives 0.09)
+and against the pack's own embedding (`lm_head`: 0.9963, at most 0.57 of a step off). On the host the pack answers
+the known-answer prompt `Paris` and explains Rayleigh scattering in coherent sentences. Before, it failed at load
+with `chunk 4266 B is not a kind`. No kernel set for its shapes was built or run (the NPU is off).
 
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.

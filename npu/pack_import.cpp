@@ -3581,10 +3581,19 @@ static const struct { const char* role; const char* slot; } kRoleSlots[] = {
     {"gate_proj",          "mlp.gate_proj.weight"},
     {"up_proj",            "mlp.up_proj.weight"},
     {"down_proj",          "mlp.down_proj.weight"},
-    {"gate_exps",          "mlp.experts.gate_proj.weight"},
-    {"up_exps",            "mlp.experts.up_proj.weight"},
-    {"down_exps",          "mlp.experts.down_proj.weight"},
+    {"gate_exps",          "mlp.gate_exps_proj.weight"},
+    {"up_exps",            "mlp.up_exps_proj.weight"},
+    {"down_exps",          "mlp.down_exps_proj.weight"},
     {"shortconv_in_proj",  "shortconv.in_proj.weight"},
+    // engine#1788, 3c: the MoE names are FORMAT-DEPENDENT, and moe_container.h documents both conventions. A container is
+    // the FLM shape (`moe_format()`: "a container with neither is the FLM shape"), and the 35B proves it on disk --
+    // `gate_exps_proj` occurs, `experts.gate_proj` does NOT. So the destinations below are FLM spellings; the
+    // EngineConverter spellings (mlp.experts.*, mlp.gate.weight, mlp.shared_expert.*) are a different pack format.
+    {"moe_router",         "moe_router.weight"},
+    {"share_gate_exps",    "mlp.share_gate_exps_proj.weight"},
+    {"share_up_exps",      "mlp.share_up_exps_proj.weight"},
+    {"share_down_exps",    "mlp.share_down_exps_proj.weight"},
+    {"shared_expert_gate", "mlp.share_router.weight"},
 };
 
 // The roles this slice does NOT place, each with the reason. A number here is honest; a guessed slot is not.
@@ -3593,11 +3602,6 @@ static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
     {"q_norm",              "the engine's normaliser slots are per-architecture; none is verified for this role yet"},
     {"k_norm",              "the engine's `k_norm` is a config field, not a verified weight slot (the q_norm case again)"},
     {"gate_up_proj",        "fused in some containers, two slots in the engine; needs a measured split"},
-    {"moe_router",          "the engine reads `mlp.router.bias`; the weight slot is not verified"},
-    {"share_gate_exps",     "the shared expert's gate slot differs per architecture; none is verified in npu/forward/src"},
-    {"share_up_exps",       "the shared expert's up slot; same open question as the gate"},
-    {"share_down_exps",     "the shared expert's down slot; same open question as the gate"},
-    {"shared_expert_gate",  "the shared-expert router gate; no slot with this name exists in the engine"},
     // Measured on the real containers (35B: 210 tensors): `ssm` is not one destination but FOUR -- dt.bias, conv1d, norm
     // and a, with four different shapes. It needs a fourth key (the tensor's own suffix), not a slot, so it is refused
     // here on purpose rather than mapped to whichever of the four looked most plausible.

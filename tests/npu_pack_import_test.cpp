@@ -5246,8 +5246,7 @@ void test_container_placement() {
         // pack. A role that reaches the "this table does not know" default, or a reason that is a bare placeholder, is a
         // hole -- and this arm is what makes removing a refusal entry fail in CI rather than print UNKNOWN on the box.
         pi::ContainerRoles roles_c;
-        for (const char* role : {"ssm", "gemma_local", "container_extra", "share_gate_exps", "share_up_exps",
-                                 "share_down_exps", "shared_expert_gate", "q_norm", "k_norm", "moe_router"})
+        for (const char* role : {"ssm", "gemma_local", "container_extra", "q_norm", "k_norm", "gate_up_proj"})
             roles_c.counts[role] = 1;
         const pi::RoleSlotReport slots_c = pi::container_role_slots(roles_c);
         for (const auto& kv : slots_c.why) {
@@ -6339,7 +6338,7 @@ static void test_container_role_slots() {
         r.counts["q_proj"] = 1; r.counts["gate_exps"] = 1; r.counts["input_norm"] = 1;
         const RoleSlotReport s = container_role_slots(r);
         check(s.slot_of.at("q_proj") == "self_attn.q_proj.weight", "slots: the attention query projection");
-        check(s.slot_of.at("gate_exps") == "mlp.experts.gate_proj.weight", "slots: the routed gate is the expert gate");
+        check(s.slot_of.at("gate_exps") == "mlp.gate_exps_proj.weight", "slots: the routed gate, in the CONTAINER (FLM) spelling");
         check(s.slot_of.at("input_norm") == "input_layernorm.weight", "slots: the pre-attention norm");
         check(s.no_slot.empty(), "slots: three placed roles leave nothing unexplained");
     }

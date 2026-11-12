@@ -262,8 +262,10 @@ inline TokenLogprob logprobs_of(const float* logits, size_t n, int chosen, int t
     for (size_t i = 0; i < k; i++) out.top.push_back({c[i].id, float(double(c[i].logit) - log_z)});
     return out;
 }
-inline TokenLogprob logprobs_of(const std::vector<float>& logits, int chosen, int top_n) {
-    return logprobs_of(logits.data(), logits.size(), chosen, top_n);
+// A whole row with the tokenizer's size, cut as sample_token() cuts it (token_bound: 0 means the row is the vocabulary).
+// The bound is not optional, so a caller holding a padded head's row cannot reach an unbounded form (engine#2272).
+inline TokenLogprob logprobs_of(const std::vector<float>& logits, int vocab, int chosen, int top_n) {
+    return logprobs_of(logits.data(), token_bound(logits.size(), vocab), chosen, top_n);
 }
 
 // The bytes a decoder must hold back before it can be sure no stop sequence straddles

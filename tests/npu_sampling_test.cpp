@@ -433,7 +433,7 @@ void test_logprobs() {
     // Two candidates, logits 0 and ln 2: probabilities 1/3 and 2/3.
     const double ln2 = std::log(2.0);
     const std::vector<float> logits = {0.0f, float(ln2)};
-    const auto lp = logprobs_of(logits, 1, 2);
+    const auto lp = logprobs_of(logits, 0, 1, 2);
     check(lp.id == 1, "logprobs report the id that was drawn");
     check(std::fabs(lp.logprob - float(std::log(2.0 / 3.0))) < 1e-6f,
           "the drawn token's log-probability is log 2/3");
@@ -443,12 +443,12 @@ void test_logprobs() {
     check(std::fabs(lp.top[1].logprob - float(std::log(1.0 / 3.0))) < 1e-6f, "the second entry carries log 1/3");
 
     // A flat vocabulary: every token is -log(N), and top_logprobs 0 asks for no alternatives.
-    const auto flat = logprobs_of(std::vector<float>(8, 1.5f), 3, 0);
+    const auto flat = logprobs_of(std::vector<float>(8, 1.5f), 0, 3, 0);
     check(std::fabs(flat.logprob - float(std::log(1.0 / 8.0))) < 1e-6f, "a flat vocabulary gives -log N");
     check(flat.top.empty(), "top_logprobs 0 reports no alternatives");
 
     // Ties go to the lower id, the rule the sampler draws by.
-    const auto tied = logprobs_of(std::vector<float>{1.0f, 1.0f, 1.0f}, 0, 2);
+    const auto tied = logprobs_of(std::vector<float>{1.0f, 1.0f, 1.0f}, 0, 0, 2);
     check(tied.top.size() == 2 && tied.top[0].id == 0 && tied.top[1].id == 1, "ties keep the lower id first");
 
     // engine#2272: a head WIDER than the tokenizer (Qwen3: 151,669 ids against 151,936 rows). The row carries logits for
@@ -468,24 +468,25 @@ void test_logprobs() {
         bool padding_in_top = false;
         for (const auto& e : bounded.top) padding_in_top = padding_in_top || e.id >= vocab;
         check(!padding_in_top, "...no padding id (3..5) appears in top_logprobs");
-        // The vector overload forwards with logits.size(), so it cannot bound: a caller that reaches for the convenient
-        // form replays engine#2272 exactly. Pinned here so the trap is visible in the tests rather than discovered again.
-        check(std::fabs(double(logprobs_of(padded, 1, 2).logprob) - double(unbounded.logprob)) < 1e-9,
-              "the vector overload is UNBOUNDED by construction -- callers with a padded head must pass the bound");
+        // The vector overload takes the bound as a required argument (no form of it can forget the cut).
+        const auto whole = logprobs_of(padded, vocab, 1, 2);
+        check(whole.logprob == bounded.logprob && whole.top.size() == 2 && whole.top[0].id == 1 &&
+                  whole.top[1].id == 0 && whole.top[0].logprob == bounded.top[0].logprob,
+              "the vector overload cuts at the vocabulary it is given, as the pointer form with token_bound does");
     }
 
     // More alternatives than the vocabulary reports what exists.
-    check(logprobs_of(logits, 1, 100).top.size() == 2, "top_n past the vocabulary reports all of it");
+    check(logprobs_of(logits, 0, 1, 100).top.size() == 2, "top_n past the vocabulary reports all of it");
 
     // The grammar mask can put the drawn token outside the top list, and it still carries its own
     // value: this is the "before penalties and constraints" convention, measured.
-    const auto masked = logprobs_of(std::vector<float>{5.0f, 0.0f}, 1, 1);
+    const auto masked = logprobs_of(std::vector<float>{5.0f, 0.0f}, 0, 1, 1);
     check(masked.top.size() == 1 && masked.top[0].id == 0, "top_logprobs is the raw distribution, mask-free");
     check(masked.logprob < masked.top[0].logprob, "a masked-in token reports its own, lower value");
 
     // Degenerate inputs are reported, never fatal.
-    check(logprobs_of({}, 0, 4).top.empty(), "an empty vocabulary reports nothing");
-    check(logprobs_of(logits, -1, 1).logprob == 0.0f, "an id outside the vocabulary reports zero");
+    check(logprobs_of(std::vector<float>{}, 0, 0, 4).top.empty(), "an empty vocabulary reports nothing");
+    check(logprobs_of(logits, 0, -1, 1).logprob == 0.0f, "an id outside the vocabulary reports zero");
 }
 
 void test_logprob_options() {

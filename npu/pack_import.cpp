@@ -3507,7 +3507,8 @@ PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
         // collision check found 733 tensors pointing at 26 names). The prefix is the CONTAINER's own spelling through
         // the layer digits, because model.c probes both -- "model.layers.%d.…" and "model.layer.%d.…" -- and MiniCPM
         // uses the singular. Using the source's own prefix keeps the two agree without this code choosing a dialect.
-        if (!row.slot.empty() && !row.layer.empty()) row.slot = layer_prefix + row.slot;
+        if (row.role == "weight_scale") row.slot = t.name;   // a scale companion goes to its OWN name
+        else if (!row.slot.empty() && !row.layer.empty()) row.slot = layer_prefix + row.slot;
         if (row.slot.empty()) {
             const auto why = table.why.find(row.role);
             row.why = why != table.why.end() ? why->second
@@ -3594,6 +3595,7 @@ static const struct { const char* role; const char* slot; } kRoleSlots[] = {
     {"up_exps",            "mlp.up_exps_proj.weight"},
     {"down_exps",          "mlp.down_exps_proj.weight"},
     {"shortconv_in_proj",  "shortconv.in_proj.weight"},
+    {"per_layer_proj_norm","model.per_layer_proj_norm.weight"},
     // engine#1788, 3c: I refused these two for two PRs on the strength of a grep that found only the rmsnorm debug LABEL
     // ("q_norm"), and called them config fields. They are weight slots, and model.c names them explicitly:
     //   "model.layer{s}.%d.self_attn.q_norm.weight"  /  "… .k_norm.weight"     (singular and plural both probed)
@@ -3740,6 +3742,11 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
             role = "vision";
         else if (n.find("audio.") != std::string::npos)
             role = "audio";
+        // engine#1788, 3c: FIRST, before any needle table -- a `.scale` companion must never be filed as the weight it
+        // accompanies, and the `embed` rule matches `model.embed_tokens.weight.scale` by substring. This is the same
+        // ordering defect as `attn_q` vs `attn_q_norm` (engine#2097): the general rule ran before the specific one.
+        else if (n.size() > 6 && n.compare(n.size() - 6, 6, ".scale") == 0)
+            role = "weight_scale";
         if (role.empty()) {
             bool matched = false;
             for (const auto& r : kRules) {
@@ -3751,6 +3758,13 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
             // "never inside a layer" has to be spelled positively enough to survive the container's own naming:
             // MiniCPM-V 4.7 spells its blocks `model.layer.N.` (singular), so a guard against "layers." alone filed
             // 30 per-layer linear_attn.ssm_norm tensors as final_norm -- ahead of the kSsm loop below (engine#1788).
+            // engine#1788, 3c: a `.scale` companion is NOT the weight it accompanies, and the engine reads it by its own
+            // name -- "model.embed_tokens.weight.scale" is a literal in npu/forward. Filed as `embed` it would be written
+            // over the embedding, or its scales where the embedding belongs, with no error. Matched first.
+            // and `per_layer_proj_norm` has its own top-level slot; it is not the model's final norm.
+            if (!matched && role.empty() && n.find("per_layer_proj_norm") != std::string::npos) {
+                role = "per_layer_proj_norm"; matched = true;
+            }
             if (!matched && n.find("norm.weight") != std::string::npos && n.find("layers.") == std::string::npos &&
                 n.find("layer.") == std::string::npos)
                 role = "final_norm";   // `model.norm.weight`: the top-level norm, never inside a layer

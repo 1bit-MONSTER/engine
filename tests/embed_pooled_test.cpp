@@ -18,6 +18,7 @@
 // Embedding-Gemma-300M-NPU2 layout) and holds the vector this writes to ONEBIT_TEST_EMBED_OUT to a numpy reference.
 // ONEBIT_TEST_IDS is the space-separated input. Exit 0 on a vector, 3 when the forward refused (its reason on
 // stdout, so the script can check a refusal it asked for), 77 when the container is not set.
+#include "file_create.h"
 #include "q4nx_forward.h"
 
 #include <cstdio>
@@ -49,7 +50,7 @@ int main() {
         std::printf("REFUSED: %s\n", fwd.last_error());
         return 3;
     }
-    FILE* f = std::fopen(out_path, "wb");
+    FILE* f = onebit_fopen_private_wb(out_path);   // 0600, no symlink follow (file_create.h)
     if (!f || std::fwrite(v.data(), sizeof(float), v.size(), f) != v.size()) {
         std::printf("FAIL: cannot write %s\n", out_path);
         return 1;

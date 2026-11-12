@@ -523,6 +523,7 @@ private:
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
     Q4nxRopeLlama3 rope_llama3_;     // rope_type "llama3" (Llama-3.1/3.2/3.3); on == 0 for everything else
+    Q4nxRopeYarn rope_yarn_{};       // rope_type "yarn" (GPT-OSS); on == 0 for everything else
     Q4nxRopeDynamic rope_dynamic_;   // rope_type "dynamic" (NTK base rule, engine#1740 W2); on == 0 elsewhere
     double rope_linear_factor_ = 0.0; // rope_type "linear" factor (Gemma3's full layers); 0 elsewhere
     // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 for
@@ -569,6 +570,15 @@ private:
 
     bool mla_attn(int l, const std::vector<float>& x, std::vector<float>& o, int pos);
     bool moe_mlp(int l, const std::vector<float>& xn, std::vector<float>& d);
+    // GPT-OSS (engine#1786): per layer the sinks [NH], the o bias [H], the router [E][H] + bias [E], the expert biases
+    // [E][IM] (gate, up) and [E][H] (down), and the experts themselves as the container's MX2560 tensor, read in
+    // place (q4nx_dequant.h). The MoE runs on the host, from the packed chunks.
+    std::vector<std::vector<float>> gpt_sinks_, gpt_obias_, gpt_router_, gpt_router_b_, gpt_gb_, gpt_ub_, gpt_db_;
+    std::vector<const TensorDesc*> gpt_exps_;
+    int gpt_ne_ = 0, gpt_topk_ = 0;
+    std::string cfg_path_;           // config.json of the loaded container (init_impl)
+    bool load_gptoss();
+    bool gptoss_moe(int l, const std::vector<float>& xn, std::vector<float>& d);
     bool dense_mlp(int l, const std::vector<float>& xn, std::vector<float>& d);
     bool mla_rope(std::vector<float>& q, int NH, int qh, int nope, std::vector<float>& kr, int pos);
     bool mla_expert(const uint8_t* pool, size_t per_expert, int e, int N, int K,

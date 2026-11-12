@@ -169,6 +169,17 @@ void q4nx_dequant_tile_q4k(const uint8_t* chunk, float* out, int ld);
  *   q[8192] i8  @[512,8704) byte k*32 + r
  *   value(r,k) = d[g*32+r] * q[k*32+r] */
 void q4nx_dequant_tile_q8(const uint8_t* chunk, float* out, int ld);
+/* The same 8704-byte Q8 chunk as FastFlowLM's 0.9.x packs write it (the Qwen3.5 packs on the hub, flm_version 0.9.45):
+ * the scales are as above, but the 8192 codes are two 16-row halves, each column-major -- byte h*4096 + c*16 + r%16
+ * for row r = 16h + r%16 -- where the 1.0.x writer stores one 32-row column-major block (byte c*32 + r). The size is
+ * the same, so the order is read from the codes (q4nx_q8_split16). Settled on Qwen3.5-0.8B-NPU2 against the BF16 GGUF
+ * of the same checkpoint: blk.0.ssm_alpha/ssm_beta corr 0.99998, blk.0.ssm_out 0.9993 (the 32-row reading: 0.01). */
+void q4nx_dequant_tile_q8_split16(const uint8_t* chunk, float* out, int ld);
+/* Which order a run of 8704-byte Q8 chunks is in: 1 for split16, 0 for the 32-row block. A symmetric Q8 group is
+ * scaled by its own absmax, so in the right order every (row, 32-column group) with a nonzero code holds a code of
+ * magnitude 127; the wrong order mixes rows and most groups miss it (0.50 to 0.77 measured). split16 is chosen only
+ * when it alone holds every group at 127; anything else keeps the 32-row reading this decoder always used. */
+int q4nx_q8_split16(const uint8_t* data, size_t ntiles, size_t stride);
 
 /* Dequantize a whole [rows, cols] tensor whose tiles are `chunk_bytes` each
  * (5120 = q4_1, 4736 = Q4_K, 8704 = Q8).  Picks the matching tile decoder and

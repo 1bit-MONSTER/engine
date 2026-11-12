@@ -53,6 +53,8 @@
 //     (k%32)*16 + r%16 with g = k/32                         (corr 0.9998; k*32 + r: 0.011)
 // dequant_tile implements the first. The 35B's q8 tensors are read by the private 35B route,
 // which implements the second. Do not run this decoder on a Q8 tensor of an unverified model.
+// The forward's decoder (npu/forward/src/q4nx_dequant.c) reads both and picks one per tensor
+// from the codes (q4nx_q8_split16: in the right layout every group's absmax code is 127).
 //
 // Checked bit for bit against 1bit-MONSTER's verified decoders (npu-infer/tools/
 // q4nx_dequant.py) on real Qwen3.5-4B and Qwen3-0.6B tiles: tests/npu_q4nx_test.cpp.

@@ -137,6 +137,48 @@ void q4nx_dequant_tile_q8(const uint8_t* t, float* out, int ld) {
     }
 }
 
+void q4nx_dequant_tile_q8_split16(const uint8_t* t, float* out, int ld) {
+    const uint8_t* d_b = t;                      /* [256] bf16, index g*32+r */
+    const int8_t* q = (const int8_t*)(t + 512);  /* byte (r/16)*4096 + k*16 + r%16 */
+    for (int r = 0; r < Q4NX_TILE_ROWS; r++) {
+        const int8_t* qh = q + (size_t)(r / 16) * 4096 + (r % 16);
+        for (int k = 0; k < Q4NX_TILE_COLS; k++) {
+            const int g = k / Q4NX_GROUP_SIZE;
+            const float d = bf16_to_f32(le16(d_b + 2 * (g * Q4NX_TILE_ROWS + r)));
+            out[(size_t)r * ld + k] = d * (float)qh[k * 16];
+        }
+    }
+}
+
+/* Groups (row, 32 columns) of one chunk that hold a nonzero code, and those of them that reach |127|, read in
+ * `split` order (0: byte c*32 + r, 1: byte (r/16)*4096 + c*16 + r%16). */
+static void q8_group_hits(const uint8_t* t, int split, long* nonzero, long* hits) {
+    const int8_t* q = (const int8_t*)(t + 512);
+    for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+        for (int g = 0; g < Q4NX_TILE_COLS / Q4NX_GROUP_SIZE; g++) {
+            int mx = 0;
+            for (int j = 0; j < Q4NX_GROUP_SIZE; j++) {
+                const int c = g * Q4NX_GROUP_SIZE + j;
+                const int v = split ? q[(size_t)(r / 16) * 4096 + (size_t)c * 16 + (r % 16)] : q[(size_t)c * 32 + r];
+                const int a = v < 0 ? -v : v;
+                if (a > mx) mx = a;
+            }
+            if (mx) { (*nonzero)++; if (mx >= 127) (*hits)++; }
+        }
+}
+
+int q4nx_q8_split16(const uint8_t* data, size_t ntiles, size_t stride) {
+    if (!data || ntiles == 0) return 0;
+    const size_t samples = ntiles < 64 ? ntiles : 64;   /* evenly spread; the order is one per tensor */
+    long nz[2] = {0, 0}, hit[2] = {0, 0};
+    for (size_t i = 0; i < samples; i++) {
+        const uint8_t* t = data + (i * ntiles / samples) * stride;
+        q8_group_hits(t, 0, &nz[0], &hit[0]);
+        q8_group_hits(t, 1, &nz[1], &hit[1]);
+    }
+    return nz[1] > 0 && hit[1] == nz[1] && hit[0] < nz[0];
+}
+
 void q4nx_dequant_tile_q4s(const uint8_t* t, float* out, int ld) {
     const uint8_t* sc_b = t;          /* [256] bf16, index g*32 + r */
     const uint8_t* qs = t + 512;      /* [256][16], byte c*16 + r/2 */
@@ -309,6 +351,7 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
         sym = tensor_kind_or_refuse(data, (size_t)ntr * (size_t)ntc, Q4NX_TILE_BYTES);
         if (sym < 0) return -1;
     }
+    const int q8s = chunk_bytes == Q4NX_CHUNK_Q8 && q4nx_q8_split16(data, (size_t)ntr * (size_t)ntc, Q4NX_CHUNK_Q8);
     // Each tile writes a disjoint output region, so the tile grid parallelizes.
     // `tmp` is declared per-tile (inside the innermost body) so it is not shared.
     #pragma omp parallel for collapse(2) schedule(static) if(ntr * ntc >= 4)
@@ -319,7 +362,7 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
             if (chunk_bytes == Q4NX_CHUNK_Q4K)
                 q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
             else if (chunk_bytes == Q4NX_CHUNK_Q8)
-                q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+                (q8s ? q4nx_dequant_tile_q8_split16 : q4nx_dequant_tile_q8)(c, tmp, Q4NX_TILE_COLS);
             else if (chunk_bytes == Q4NX_CHUNK_Q4S)
                 q4nx_dequant_tile_q4s(c, tmp, Q4NX_TILE_COLS);
             else
@@ -354,12 +397,15 @@ int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols
         sym = tensor_kind_or_refuse(data + (size_t)tr * (size_t)ntc * Q4NX_TILE_BYTES, (size_t)ntc, Q4NX_TILE_BYTES);
         if (sym < 0) return -1;
     }
+    /* Per token, so as with the 5120 kind above the order is read from this tile-row's own chunks. */
+    const int q8s = chunk_bytes == Q4NX_CHUNK_Q8 &&
+                    q4nx_q8_split16(data + (size_t)tr * (size_t)ntc * Q4NX_CHUNK_Q8, (size_t)ntc, Q4NX_CHUNK_Q8);
     for (int tc = 0; tc < ntc; tc++) {
         const uint8_t* c = data + (size_t)(tr * ntc + tc) * (size_t)chunk_bytes;
         if (chunk_bytes == Q4NX_CHUNK_Q4K)
             q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
         else if (chunk_bytes == Q4NX_CHUNK_Q8)
-            q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+            (q8s ? q4nx_dequant_tile_q8_split16 : q4nx_dequant_tile_q8)(c, tmp, Q4NX_TILE_COLS);
         else if (chunk_bytes == Q4NX_CHUNK_Q4S)
             q4nx_dequant_tile_q4s(c, tmp, Q4NX_TILE_COLS);
         else
@@ -437,6 +483,7 @@ int q4nx_dequant_tensor_packed(const uint8_t* data, size_t nbytes, int rows, int
         sym = tensor_kind_or_refuse(data, (size_t)ntr_p * (size_t)ntc_p, Q4NX_TILE_BYTES);
         if (sym < 0) return -1;
     }
+    const int q8s = chunk_bytes == Q4NX_CHUNK_Q8 && q4nx_q8_split16(data, (size_t)ntr_p * (size_t)ntc_p, Q4NX_CHUNK_Q8);
     // Read geometry is the container's grid (ntc_p is the tile-row stride); write geometry is the
     // model's, so a caller's buffer and its row stride stay exactly what they were before.
     #pragma omp parallel for collapse(2) schedule(static) if(ntr * ntc >= 4)
@@ -447,7 +494,7 @@ int q4nx_dequant_tensor_packed(const uint8_t* data, size_t nbytes, int rows, int
             if (chunk_bytes == Q4NX_CHUNK_Q4K)
                 q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
             else if (chunk_bytes == Q4NX_CHUNK_Q8)
-                q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+                (q8s ? q4nx_dequant_tile_q8_split16 : q4nx_dequant_tile_q8)(c, tmp, Q4NX_TILE_COLS);
             else if (chunk_bytes == Q4NX_CHUNK_Q4S)
                 q4nx_dequant_tile_q4s(c, tmp, Q4NX_TILE_COLS);
             else

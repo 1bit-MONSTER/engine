@@ -651,7 +651,9 @@ chained by `dispatch-ssm-conv-chunked.cpp`, `kSetRowsKernelMaxTokens` 2048 by
 **2.03x** `-ub 512` at pp4096 on the product path (205.05 vs 101.05 tok/s, same library, same
 quant, ctx 16384, `-fa on --cache-reuse 0`, 2026-11-05 16:06 and 17:11, `~/lb/supreme/raw/
 llamasrv-q31-prep/` and `...-ub512/`), so the cap was one of the limiters and not a detail. It is
-still not the whole gap.
+still not the whole gap. `1bit serve` now starts Flash-Next on HRX at `-ub 2048` through the
+`qwen4exp-hrx-ub2048` recipe ([recipes.md](recipes.md)); before it, the product ran the 512 arm of
+this pair, llama-server's default.
 
 That 2.03x is a **Flash-Next result at ctx 16384 with this quant**, not a general rule about chunk
 size — and on a different model the direction reverses. On the dense prefill path `-ub 512` is

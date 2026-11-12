@@ -626,6 +626,14 @@ if(TARGET OpenMP::OpenMP_CXX)
     target_link_libraries(mtp_draft_test PRIVATE OpenMP::OpenMP_CXX)
 endif()
 add_test(NAME mtp_draft COMMAND mtp_draft_test)
+# engine#1781 gate 2: mtp::run_from() under a sampler (RowSampler) -- the reply distribution of both round shapes
+# against the exact product of a toy chain's conditionals, plain sampling as the control, and forward-serve's own
+# sampler (app/npu_spec_sampler.h) with temperature, top_k and top_p.
+add_executable(mtp_sampled_test tests/mtp_sampled_test.cpp)
+target_include_directories(mtp_sampled_test PRIVATE npu app)
+target_link_libraries(mtp_sampled_test PRIVATE nlohmann_json::nlohmann_json)
+add_dependencies(onebit mtp_sampled_test)
+add_test(NAME mtp_sampled COMMAND mtp_sampled_test)
 # engine#1781: the prompt-lookup drafter (npu/mtp/prompt_lookup.h), by hand and through mtp::run() on a toy base.
 add_executable(prompt_lookup_test tests/prompt_lookup_test.cpp)
 target_include_directories(prompt_lookup_test PRIVATE npu)

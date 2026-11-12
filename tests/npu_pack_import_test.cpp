@@ -5177,6 +5177,37 @@ void test_container_role_layer_types() {
           "role+layer: a layer index past layer_types is counted as out of range");
 }
 
+// engine#1788, 3c: the writer iterates TENSORS, not roles, so the placement has to answer per tensor and use that
+// tensor's own layer type. The arm that matters is the pair: the same role lands in two different places on two layers.
+void test_container_placement() {
+    using pi::Q4nxTensor;
+    const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
+    const std::vector<Q4nxTensor> v = {
+        t("model.embed_tokens.weight"),
+        t("model.layers.0.self_attn.qkv_proj.weight"),   // layer 0 is linear attention
+        t("model.layers.1.self_attn.qkv_proj.weight"),   // layer 1 is full attention
+        t("model.layers.1.self_attn.q_proj.weight"),
+        t("model.layers.0.mlp.gate_up_proj.weight"),     // a role this slice still refuses
+        t("model.layers.1.unknown_thing.weight"),        // no role at all
+    };
+    const std::vector<std::string> lt = {"linear_attention", "full_attention"};
+    const pi::PlacementReport r = pi::container_placement(v, lt);
+
+    check(r.rows.size() == v.size(), "placement: a row per tensor, so nothing is silently skipped");
+    check(r.placed + r.unplaced + r.no_role == int64_t(v.size()),
+          "placement: placed + unplaced + no-role accounts for every tensor");
+    check(r.rows[0].slot == "model.embed_tokens.weight", "placement: a tensor with no layer still gets a slot");
+    check(r.rows[0].layer.empty() && r.rows[0].layer_type.empty(), "placement: and reports that it has no layer");
+    check(r.rows[1].slot == "linear_attn.qkv_proj.weight", "placement: the fused qkv on the LINEAR layer");
+    check(r.rows[2].slot.empty(), "placement: the same role on the FULL-attention layer has no destination");
+    check(r.rows[2].why.size() > 10, "placement: and says why");
+    check(r.rows[3].slot == "self_attn.q_proj.weight", "placement: the query projection is layer-type-independent");
+    check(r.rows[4].slot.empty() && r.rows[4].role == "gate_up_proj", "placement: gate_up_proj is still refused");
+    check(r.rows[5].slot.empty() && r.rows[5].role.empty(), "placement: a tensor with no role is counted apart");
+    check(r.no_role == 1, "placement: no_role counts the vocabulary gap, not the deliberate refusal");
+    check(r.unplaced == 2, "placement: unplaced counts the two decisions, not the vocabulary gap");
+}
+
 void test_container_roles_moe_and_singular_layer() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6232,6 +6263,71 @@ static void selfcheck_head_rule_arms() {
     std::printf("  head fit rule: 15 arms (two measured heads, scaled/rms/noisy/no-corr controls, fit_head at blocks 32 and 128, gemma2 by name)\n");
 }
 
+// engine#1788, slice 3c: the writer's destination side. The arm with teeth is the last one: a role the classifier can
+// emit must be EITHER placed or explained, so adding a recogniser without deciding its destination fails here rather
+// than in a pack that loads a tensor into the wrong slot.
+static void test_container_role_slots() {
+    using namespace onebit::npu::pack_import;
+    {
+        ContainerRoles r;
+        r.counts["q_proj"] = 1; r.counts["gate_exps"] = 1; r.counts["input_norm"] = 1;
+        const RoleSlotReport s = container_role_slots(r);
+        check(s.slot_of.at("q_proj") == "self_attn.q_proj.weight", "slots: the attention query projection");
+        check(s.slot_of.at("gate_exps") == "mlp.experts.gate_proj.weight", "slots: the routed gate is the expert gate");
+        check(s.slot_of.at("input_norm") == "input_layernorm.weight", "slots: the pre-attention norm");
+        check(s.no_slot.empty(), "slots: three placed roles leave nothing unexplained");
+    }
+    {
+        // the layer type decides exactly one destination, and it decides it the way the ENGINE does: the only fused-qkv
+        // slot npu/forward/src reads is the linear-attention one, so a full-attention qkv has no destination at all.
+        check(container_role_slot("qkv_proj", "linear_attention") == "linear_attn.qkv_proj.weight",
+              "slots: the fused qkv on a linear layer");
+        check(container_role_slot("qkv_proj", "full_attention").empty(),
+              "slots: a full-attention qkv has no engine slot, so it is not placed");
+        check(container_role_slot("q_proj", "full_attention") == "self_attn.q_proj.weight",
+              "slots: the layer type does not move a role it does not decide");
+        check(container_role_slot("qkv_proj", "sliding_attention").empty(),
+              "slots: sliding attention is not linear, so the fused qkv stays unplaced");
+        // the arm for the substring defect: a value that CONTAINS "linear" and is not linear attention must not match
+        check(container_role_slot("qkv_proj", "nonlinear_attention").empty(),
+              "slots: a layer type that merely contains 'linear' is not linear attention");
+        check(container_role_slot("qkv_proj", "linear_sliding_attention").empty(),
+              "slots: neither is a compound name containing it");
+    }
+    {
+        // no two roles may claim the same slot: a collision silently drops one of them
+        std::map<std::string, std::string> seen;
+        for (const auto& kv : container_role_slots(ContainerRoles{}).slot_of) {
+            check(!seen.count(kv.second), "slots: no two roles share a destination (" + kv.second + ")");
+            seen[kv.second] = kv.first;
+        }
+    }
+    {
+        // qkv_proj is the one role everybody gets wrong: its PREFIX is the layer type's, so this slice must refuse it
+        ContainerRoles r; r.counts["qkv_proj"] = 1;
+        const RoleSlotReport s = container_role_slots(r);
+        check(!s.slot_of.count("qkv_proj"), "slots: the fused qkv is not placed without the layer type");
+        check(s.why.count("qkv_proj") && s.why.at("qkv_proj").size() > 20, "slots: and the refusal says why");
+    }
+    {
+        // the classifier's whole vocabulary: every role either placed or explained, none unknown
+        static const char* kRoles[] = {"embed", "final_norm", "input_norm", "post_norm", "lm_head", "q_proj", "k_proj",
+            "v_proj", "o_proj", "q_norm", "k_norm", "self_attn_gate_proj", "gate_proj", "up_proj", "down_proj",
+            "gate_up_proj", "qkv_proj", "moe_router", "gate_exps", "up_exps", "down_exps", "share_gate_exps",
+            "share_up_exps", "share_down_exps", "shared_expert_gate", "shortconv_in_proj"};
+        ContainerRoles r;
+        for (const char* k : kRoles) r.counts[k] = 1;
+        const RoleSlotReport s = container_role_slots(r);
+        check(int64_t(s.placed.size() + s.no_slot.size()) == int64_t(sizeof(kRoles) / sizeof(kRoles[0])),
+              "slots: every role the classifier can emit is accounted for");
+        for (const auto& kv : s.why) {
+            check(kv.second.find("does not know") == std::string::npos,
+                  "slots: no role falls through the table (" + kv.first + ")");
+        }
+        check(s.placed.size() >= 17, "slots: at least the layer-type-independent ones are placed");
+    }
+}
+
 int main(int argc, char** argv) {
     selfcheck_head_rule_arms();
     // engine#1907: every crafted 1.9 import writes a canonical copy into the scratch cache. Without this the suite left 0-byte
@@ -6294,6 +6390,8 @@ int main(int argc, char** argv) {
         test_container_roles();
         test_container_roles_gemma_local();
         test_container_roles_moe_and_singular_layer();
+        test_container_placement();
+        test_container_role_slots();
         test_container_role_layer_types();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);

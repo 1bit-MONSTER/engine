@@ -34,15 +34,22 @@ from the file body, and they decide the work:
 on a tree nobody wants to disturb.
 
 usage: conflict_triage.py <repo> <theirs> [--base BASE] [--json]
+       conflict_triage.py --markers REF [--json]   classify the markers already committed in a tree
        conflict_triage.py --self-test
+
+The two halves answer different questions and both are needed on a long merge. `<theirs>` says what a merge *would*
+conflict on; `--markers REF` says what a tree that has already been merged still *carries*, which is the state a
+work-in-progress merge is in for hours and the state engine#327's draft reports (23 files, 92 hunks).
 exit:  0 no conflicts, 1 conflicts found, 2 usage or git error
 """
 import argparse
 import json
+import os
 import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 
 KINDS = ("content", "add/add", "mod/del", "rename")
 
@@ -194,6 +201,64 @@ def summarise(triaged):
     return total, per
 
 
+MARK = "<<<<<<<"
+
+
+def marker_rows(repo, ref):
+    """[(path, hunks)] for every path in `ref` whose blob carries conflict markers."""
+    out = git(repo, "grep", "-c", f"^{MARK}", ref, "--")
+    # `git grep -c` exits 1 with no output when nothing matches, which is the clean case rather than an error.
+    if out.returncode == 1 and not out.stdout.strip():
+        return []
+    if out.returncode != 0:
+        die(f"conflict_triage: git grep failed on {ref!r}: {out.stderr.strip()[:300]}")
+    rows = []
+    prefix = f"{ref}:"
+    for line in out.stdout.splitlines():
+        rest = line[len(prefix):] if line.startswith(prefix) else line
+        # the count is after the LAST colon: a path may not contain one, but splitting at the first colon took
+        # "<ref>" as the path and "<path>:<count>" as the number, which silently produced an empty list
+        path, _, count = rest.rpartition(":")
+        try:
+            rows.append((path, int(count)))
+        except ValueError:
+            continue
+    return sorted(rows)
+
+
+def area_of(path):
+    """The grouping a resolver works in: the directory two levels deep, which is where these trees divide."""
+    parts = path.split("/")
+    if parts[0] == "ggml" and len(parts) > 2:
+        return "/".join(parts[:3])
+    return "/".join(parts[:2]) if len(parts) > 1 else parts[0]
+
+
+def markers(repo, ref, as_json=False):
+    rows = marker_rows(repo, ref)
+    if not rows:
+        print(f"conflict_triage: no conflict markers in {ref}")
+        return 0
+    per_area = {}
+    for path, hunks in rows:
+        a = area_of(path)
+        f, h = per_area.get(a, (0, 0))
+        per_area[a] = (f + 1, h + hunks)
+    total = sum(h for _, h in rows)
+    if as_json:
+        print(json.dumps({"ref": ref, "total_files": len(rows), "total_hunks": total,
+                          "areas": {k: {"files": v[0], "hunks": v[1]} for k, v in sorted(per_area.items())},
+                          "rows": [{"path": p, "hunks": h} for p, h in rows]}, indent=2))
+        return 1
+    for path, hunks in rows:
+        print(f"{hunks:4d}  {path}")
+    print()
+    for a, (f, h) in sorted(per_area.items(), key=lambda kv: -kv[1][1]):
+        print(f"conflict_triage: {a:32} {f:3d} file(s) {h:4d} hunks")
+    print(f"conflict_triage: {len(rows)} file(s), {total} hunk(s) still carry markers in {ref}")
+    return 1
+
+
 def run(repo, theirs, base=None, as_json=False):
     result = merge_tree(repo, base, theirs)
     if not result["paths"]:
@@ -266,6 +331,24 @@ def self_test():
     # The exit codes are the contract: 2 for "I could not answer", 1 for "conflicts", 0 for "none". A bad ref used to
     # take the 1 path (SystemExit's default) or, before the refs were verified, the 0 path -- both worth an arm.
     check_that(_die_rc() == 2, "die() exits 2, not SystemExit's default 1 (which is 'conflicts found')")
+    # `--markers` parsing, both bugs found by running it on engine#327: `git grep -c` prefixes every line with the
+    # ref, and the count is after the LAST colon -- splitting at the first colon took "<ref>" as the path and
+    # "<path>:<count>" as the number, so every row was dropped and the mode reported a clean tree.
+    with tempfile.TemporaryDirectory() as repo:
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        with open(os.path.join(repo, "a.cpp"), "w") as f:
+            f.write("int a;\n<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n<<<<<<< ours\nz\n=======\nw\n>>>>>>> theirs\n")
+        with open(os.path.join(repo, "clean.cpp"), "w") as f:
+            f.write("int b;\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "m"], cwd=repo, check=True)
+        got = marker_rows(repo, "HEAD")
+        check_that(got == [("a.cpp", 2)], f"markers: a two-hunk file is reported with its count (got {got})")
+        check_that(area_of("ggml/src/ggml-hrx/runtime/x.cpp") == "ggml/src/ggml-hrx",
+                   "markers: the area is the directory a resolver works in")
+        check_that(area_of("src/models/qwen4exp.cpp") == "src/models", "markers: and for a src subdirectory")
     print(f"conflict_triage self-test: {'ok' if not failures else f'{failures} failure(s)'}")
     return 1 if failures else 0
 
@@ -276,12 +359,16 @@ def main():
     ap.add_argument("theirs", nargs="?")
     ap.add_argument("--base", default=None)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--markers", metavar="REF", default=None,
+                    help="classify the conflict markers already committed in REF")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if "--self-test-die" in sys.argv:
         die("conflict_triage: self-test of die()")
     if args.self_test:
         return self_test()
+    if args.markers:
+        return markers(args.repo or ".", args.markers, args.json)
     if not args.repo or not args.theirs:
         ap.print_help()
         return 2

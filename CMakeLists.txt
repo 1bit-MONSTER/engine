@@ -368,6 +368,9 @@ add_python_test(moe_expert_chunks_accum_test ${CMAKE_SOURCE_DIR}/tests/moe_exper
 # llama-bench (stdlib only: hashlib/importlib.util/json/pathlib/platform/sys) and passes on a plain interpreter, so it is a
 # test with no runner rather than a test that cannot run here. Registered, and the baseline is now empty: from here the
 # sweep is zero-tolerance instead of a record of known gaps.
+# engine#2138 slice: a merge's conflicts classified by kind, from git's index -- the conflicts a text search cannot
+# see (add/delete with no markers) are the ones a pin merge is mostly made of. Device-free, no checkout.
+add_python_test(conflict_triage_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_triage.py --self-test)
 add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
 # `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and

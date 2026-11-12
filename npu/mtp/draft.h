@@ -173,6 +173,10 @@ struct Options {
     // fallback_below <= 0 turns it off.
     double fallback_below = 0.0;
     int fallback_window = 3;
+    // When the budget ends on the base's own token, whether that token is still run through the base. true keeps the
+    // base holding every emitted token (what the tests and a caller that continues the stream want); false skips a
+    // pass whose logits nobody reads, which is what forward-serve does at the end of a reply.
+    bool consume_last = true;
 };
 
 struct Stats {
@@ -277,6 +281,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
         if (t1 < 0) { r.err = "no logits"; return r; }
         const bool keep_going = emit(t1);
         if (!keep_going) break;
+        if (!opt.consume_last && (int)r.tokens.size() >= opt.max_tokens) break;
 
         if (k <= 0 || fallback.off()) {     // plain decode (no drafter, k = 0, or the fallback stopped it)
             if (!base.step(t1, pos++, logits)) { r.err = "step failed"; return r; }
@@ -346,16 +351,16 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
             const std::vector<float>& rows = base.last_hidden_rows();
             const size_t h = (size_t)base.hidden_size();
             const size_t got = (h && rows.size() % h == 0) ? rows.size() / h : 0;
-            if (!rows.empty()) {
-                if (got != (size_t)(take + 1) && got != (size_t)(nd + 1)) {
-                    r.err = "drafter rows: base returned " + std::to_string(got) + " rows, want " +
-                            std::to_string(take + 1) + " (committed prefix) or " + std::to_string(nd + 1) + " (batch)";
-                    return r;
-                }
-                std::vector<int> kept{t1};
-                kept.insert(kept.end(), d.begin(), d.begin() + take);
-                head->commit_rows(kept, rows, take + 1);
+            if (!rows.empty() && got != (size_t)(take + 1) && got != (size_t)(nd + 1)) {
+                r.err = "drafter rows: base returned " + std::to_string(got) + " rows, want " +
+                        std::to_string(take + 1) + " (committed prefix) or " + std::to_string(nd + 1) + " (batch)";
+                return r;
             }
+            // Always, even when the base keeps no rows (`rows` is then empty): a drafter that reads only the tokens
+            // (the prompt-lookup head) follows the stream through these calls alone.
+            std::vector<int> kept{t1};
+            kept.insert(kept.end(), d.begin(), d.begin() + take);
+            head->commit_rows(kept, rows, take + 1);
             r.stats.ms_commit += lap(tp);
             logits.assign(all.begin() + (size_t)take * (size_t)V, all.begin() + (size_t)(take + 1) * (size_t)V);
             pos += take + 1;

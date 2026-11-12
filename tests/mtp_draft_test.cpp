@@ -1087,6 +1087,25 @@ int main() {
         const Result re = onebit::npu::mtp::run(eq, &oh, P, f);
         check(re.ok && same(re.tokens, ref.tokens) && re.stats.fell_back_at == -1,
               "fallback: rounds of exactly 2 tokens against a bar of 2.0 keep drafting");
+        // consume_last = false: a run whose budget ends on the base's own token does not pay the pass after it.
+        for (int kind : {0, 1}) {
+            ToyBase m1(8), m2(8);
+            OnePassHead h1((OnePassHead::Kind)kind, (int)P.size()), h2((OnePassHead::Kind)kind, (int)P.size());
+            Options c = base_opt;
+            c.k = 4;
+            const Result a1 = onebit::npu::mtp::run(m1, &h1, P, c);
+            c.consume_last = false;
+            const Result a2 = onebit::npu::mtp::run(m2, &h2, P, c);
+            const int passes1 = m1.steps() + m1.batches(), passes2 = m2.steps() + m2.batches();
+            char msg[200];
+            std::snprintf(msg, sizeof msg, "consume_last=false, %s head: same text, %d passes against %d, base at %d of %d",
+                          kind == 0 ? "perfect" : "garbage", passes2, passes1, m2.consumed(), m1.consumed());
+            // perfect at k=4 ends inside a batch (nothing to skip); garbage ends on the base's own token (one skipped)
+            const int skipped = kind == 0 ? 0 : 1;
+            check(a1.ok && a2.ok && same(a1.tokens, a2.tokens) && passes2 == passes1 - skipped &&
+                      m2.consumed() == m1.consumed() - skipped,
+                  msg);
+        }
     }
 
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);

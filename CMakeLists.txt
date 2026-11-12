@@ -594,6 +594,11 @@ if(TARGET OpenMP::OpenMP_CXX)
     target_link_libraries(mtp_draft_test PRIVATE OpenMP::OpenMP_CXX)
 endif()
 add_test(NAME mtp_draft COMMAND mtp_draft_test)
+# engine#1781: the prompt-lookup drafter (npu/mtp/prompt_lookup.h), by hand and through mtp::run() on a toy base.
+add_executable(prompt_lookup_test tests/prompt_lookup_test.cpp)
+target_include_directories(prompt_lookup_test PRIVATE npu)
+add_dependencies(onebit prompt_lookup_test)
+add_test(NAME prompt_lookup COMMAND prompt_lookup_test)
 # engine#1781 gate 2: the distribution-following acceptance rule (accept with min(1, p/q), resample the residual at the
 # first rejection), with the temperature-0 identity and a deliberately wrong drafter whose output must still follow p.
 # Header-only and device-free; pulled into CI through npu_sampling_test for the same reason as mtp_draft_test below.
@@ -2024,6 +2029,8 @@ endif()
     # same sources against the runtime stub (engine#1946) cannot drift from this one.
     onebit_npu_forward_library(onebit_npu_forward onebit_npu_rt)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
+    # engine#1781: forward-serve --spec-draft runs a DFlash draft package (npu/dflash_head.h) as its drafter.
+    target_sources(onebit PRIVATE npu/dflash_forward.cpp npu/dflash_draft.cpp)
     # engine#2111: the usage object's pure function, its own TU so tests/serve_usage_test.cpp can link it without
     # dragging in npu/rt.h (see cmake/tests-serve-usage.cmake).
     target_sources(onebit PRIVATE app/serve_usage.cpp)
@@ -2111,6 +2118,11 @@ endif()
     set_tests_properties(gdn_batch_order PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(layer_taps_model PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(commit_full_accept PROPERTIES SKIP_RETURN_CODE 77)
+    # engine#1781: forward-serve --spec-lookup gives the plain loop's replies, end to end, host-GEMM on a container the
+    # script fabricates (no device, no model on disk). forward-serve exists only in this build, so it is a dev-box row.
+    add_test(NAME serve_spec_lookup
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/serve_spec_lookup_test.py $<TARGET_FILE:onebit>)
+    set_tests_properties(serve_spec_lookup PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     set_tests_properties(batch_check_state PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source

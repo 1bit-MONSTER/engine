@@ -50,6 +50,35 @@ struct HeadHooks {
     std::function<int(const float* h, int prev)> pick;
 };
 
+// DFlash 2's candidate selector at one drafted row (the pick rule of a generation-2 package). `logits` is the target
+// head on the row `h`; the top `selector_top_k` ids below `bound` (the tokenizer's size; 0 = all) are the candidates,
+// each re-scored by selector_pick() with the pairwise term against `prev`. `hproj` is decode_plain(m.selector_hproj).
+// Returns -1 when the package has no selector or there are fewer candidates than it wants.
+inline int dflash2_select(const DraftModel& m, const std::vector<float>& hproj, const float* h, int prev,
+                          const std::vector<float>& logits, int bound = 0) {
+    const int k = m.cfg.selector_top_k, R = m.cfg.selector_rank, H = m.cfg.hidden;
+    const int n = (bound > 0 && size_t(bound) < logits.size()) ? bound : int(logits.size());
+    if (k <= 0 || R <= 0 || n < k || hproj.size() != size_t(R) * size_t(H)) return -1;
+    std::vector<int> idx(static_cast<size_t>(n));
+    for (int j = 0; j < n; j++) idx[size_t(j)] = j;
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) {
+        return logits[size_t(a)] > logits[size_t(b)] || (logits[size_t(a)] == logits[size_t(b)] && a < b);
+    });
+    std::vector<float> hp(static_cast<size_t>(R)), prow(static_cast<size_t>(R)), succ(static_cast<size_t>(k) * static_cast<size_t>(R)), unary(static_cast<size_t>(k));
+    for (int r = 0; r < R; r++) {
+        double acc = 0.0;
+        const float* wr = hproj.data() + size_t(r) * size_t(H);
+        for (int q = 0; q < H; q++) acc += double(wr[q]) * double(h[q]);
+        hp[size_t(r)] = float(acc);
+    }
+    decode_row(m.selector_pred, prev, prow.data());
+    for (int c = 0; c < k; c++) {
+        unary[size_t(c)] = logits[size_t(idx[size_t(c)])];
+        decode_row(m.selector_succ, idx[size_t(c)], succ.data() + size_t(c) * size_t(R));
+    }
+    return idx[size_t(selector_pick(unary.data(), k, prow.data(), hp.data(), succ.data(), R))];
+}
+
 class DFlashHead : public mtp::DraftHead {
 public:
     // `taps` is the forward's tap sink, one row of taps * hidden floats per position, starting at position 0.

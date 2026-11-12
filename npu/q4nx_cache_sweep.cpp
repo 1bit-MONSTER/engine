@@ -22,6 +22,11 @@
 #include <filesystem>
 #include <vector>
 
+#ifndef _WIN32
+#include <pwd.h>
+#include <unistd.h>
+#endif
+
 namespace fs = std::filesystem;
 
 std::string q4nx_cache_size_text(int64_t bytes) {
@@ -50,12 +55,57 @@ int64_t q4nx_dir_bytes(const std::string& path) {
     return total;
 }
 
+namespace {
+struct HeadGroup { std::string path; int64_t bytes = 0; fs::file_time_type mtime{}; std::vector<std::string> files; };
+
+// The key a head-image file belongs to: "headimg-<16 hex>" from "headimg-<16 hex>-t<tile>.q4hi" (or its ".tmp.<pid>" temp).
+// Any other name is its own key, so a file this sweep does not recognise is still counted and still evictable.
+std::string head_image_key(const std::string& name) {
+    static const std::string pre = "headimg-";
+    const size_t n = pre.size() + 16;
+    if (name.size() > n && name.compare(0, pre.size(), pre) == 0 && name[n] == '-') return name.substr(0, n);
+    return name;
+}
+
+// The groups of one head-images directory: bytes summed over a key's files, age = its newest file (a hit marks its tile used,
+// npu/forward/src/q4nx_head_tile_cache.cpp), so a key a serve is still loading from is inside the age window.
+std::vector<HeadGroup> head_image_groups(const fs::path& dir) {
+    std::vector<HeadGroup> out;
+    std::vector<std::string> keys;
+    std::error_code ec;
+    for (auto it = fs::directory_iterator(dir, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        std::error_code fec;
+        if (!it->is_regular_file(fec)) continue;
+        const int64_t b = int64_t(fs::file_size(it->path(), fec));
+        if (fec) continue;
+        const auto t = fs::last_write_time(it->path(), fec);
+        if (fec) continue;
+        const std::string key = head_image_key(it->path().filename().string());
+        size_t i = 0;
+        while (i < keys.size() && keys[i] != key) ++i;
+        if (i == keys.size()) {
+            keys.push_back(key);
+            HeadGroup g;
+            g.path = (dir / key).string();
+            g.mtime = t;
+            out.push_back(std::move(g));
+        }
+        HeadGroup& g = out[i];
+        g.bytes += b;
+        if (t > g.mtime) g.mtime = t;
+        g.files.push_back(it->path().string());
+    }
+    return out;
+}
+}  // namespace
+
 std::vector<Q4nxCacheCandidate> q4nx_cache_candidates(const std::string& root, const std::string& keep,
                                                       int64_t max_bytes, int64_t min_age_seconds) {
     std::vector<Q4nxCacheCandidate> out;
     std::error_code ec;
     if (max_bytes <= 0 || !fs::is_directory(root, ec)) return out;
-    struct Ent { std::string path; int64_t bytes; fs::file_time_type mtime; };
+    struct Ent { std::string path; int64_t bytes; fs::file_time_type mtime; std::vector<std::string> files; };
     std::vector<Ent> all;
     for (auto it = fs::directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
          !ec && it != fs::directory_iterator(); it.increment(ec)) {
@@ -63,6 +113,12 @@ std::vector<Q4nxCacheCandidate> q4nx_cache_candidates(const std::string& root, c
         e.path = it->path().string();
         std::error_code tec;
         if (!it->is_directory(tec)) continue;
+        if (it->path().filename() == kQ4nxHeadImagesDir) {
+            // engine#2263: one entry per head-image key, not one for the directory. As one entry the sweep could only
+            // keep every pack's head or remove all of them (16 G in 36 keys on strixhalo 11-12, most unread for a day).
+            for (auto& g : head_image_groups(it->path())) all.push_back({g.path, g.bytes, g.mtime, std::move(g.files)});
+            continue;
+        }
         e.bytes = q4nx_dir_bytes(e.path);
         if (!keep.empty() && (e.path == keep || fs::path(e.path).filename() == fs::path(keep).filename())) continue;
         e.mtime = fs::last_write_time(it->path(), tec);
@@ -80,7 +136,14 @@ std::vector<Q4nxCacheCandidate> q4nx_cache_candidates(const std::string& root, c
     for (const auto& e : all) after += e.bytes;
     for (Ent* e : cands) {
         if (after <= max_bytes) break;
-        out.push_back({fs::path(e->path).filename().string(), e->bytes});
+        // A head-image key is named by its path under the root ("head-images/headimg-<digest>"), a directory entry by
+        // its own name, so `--dry-run` and the sweep's line say which one it is.
+        Q4nxCacheCandidate c;
+        c.name = fs::path(e->path).lexically_relative(root).string();
+        if (c.name.empty() || c.name == ".") c.name = fs::path(e->path).filename().string();
+        c.bytes = e->bytes;
+        c.files = e->files;
+        out.push_back(std::move(c));
         after -= e->bytes;
     }
     return out;
@@ -95,8 +158,18 @@ Q4nxCacheSweep q4nx_cache_evict(const std::string& root, const std::string& keep
     const std::vector<Q4nxCacheCandidate> cands = q4nx_cache_candidates(root, keep, max_bytes, min_age_seconds);
     for (const auto& cand : cands) {
         std::error_code rec;
-        fs::remove_all(fs::path(root) / cand.name, rec);
-        if (rec) continue;
+        if (!cand.files.empty()) {
+            // A head-image key: its tile files (and any temp a crashed writer left under the same key), not the directory.
+            bool any = false;
+            for (const auto& f : cand.files) {
+                std::error_code fec;
+                if (fs::remove(f, fec)) any = true;
+            }
+            if (!any) continue;
+        } else {
+            fs::remove_all(fs::path(root) / cand.name, rec);
+            if (rec) continue;
+        }
         r.bytes_after -= cand.bytes;
         ++r.removed;
     }
@@ -129,4 +202,20 @@ int64_t q4nx_cache_bound_bytes(const char* text, int64_t default_gib) {
 void q4nx_cache_touch(const std::string& entry) {
     std::error_code ec;
     if (fs::is_directory(entry, ec)) fs::last_write_time(entry, fs::file_time_type::clock::now(), ec);
+}
+
+std::string q4nx_cache_default_root() {
+    if (const char* c = std::getenv("ONEBIT_Q4NX_CACHE"); c && *c) return c;
+    if (const char* h = std::getenv("HOME"); h && *h) return std::string(h) + "/.cache/1bit/q4nx";
+#ifndef _WIN32
+    if (const struct passwd* pw = ::getpwuid(::geteuid()); pw && pw->pw_dir && *pw->pw_dir)
+        return std::string(pw->pw_dir) + "/.cache/1bit/q4nx";
+#endif
+    return std::string();
+}
+
+Q4nxCacheSweep q4nx_cache_sweep_after_load() {
+    const std::string root = q4nx_cache_default_root();
+    if (root.empty()) return Q4nxCacheSweep{};
+    return q4nx_cache_evict(root, std::string(), q4nx_cache_bound_bytes(std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB")));
 }

@@ -34,6 +34,7 @@
 // Requests run one at a time: the forward holds one KV cache, and each request
 // resets it from position 0.
 #include "forward_serve.h"
+#include "q4nx_cache.h"   // engine#2263: the sweep after a forward load
 
 #include "../npu/forward/include/file_create.h"   // dumps are created 0600, never through a symlink
 #include "npu_decode_note.h"
@@ -1105,6 +1106,7 @@ int run_forward_ids(const std::string& model_dir, const std::string& kernels, co
     Q4nxNpuForward fwd;
     const bool ok = dev ? fwd.init(*dev, model.c_str(), kernels) : fwd.init_host(model.c_str(), kernels);
     if (!ok) throw std::runtime_error("forward init failed: " + std::string(fwd.last_error()));
+    q4nx_cache_sweep_after_load();   // engine#2263: the load wrote the device form and head images into the cache
     const int width = fwd.max_batch_rows();
     if (int(ids.size()) > width)
         std::fprintf(stderr, "1bit npu-run: %zu ids, so this runs in passes of %d rows (the kernel's width)\n", ids.size(),
@@ -1386,6 +1388,9 @@ int run_forward_serve(int argc, char** argv) {
         }
         throw std::runtime_error(why);
     }
+    // engine#2263: loading a pack writes into the Q4NX cache (the device-form copy, the head images) and, until this, only a
+    // GGUF repack swept it -- so a box that serves packs, or runs reviews through npu-run, grew it without bound.
+    q4nx_cache_sweep_after_load();
 
     // A d3 pack keeps its decision head next to model.q4nx (npu/decision.h). Both files present means
     // the decision routes come up beside the chat ones; a pack without them is a chat model, which is

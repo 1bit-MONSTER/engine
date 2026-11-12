@@ -32,7 +32,7 @@ int run_q4nx_cache(int argc, char** argv) {
                      "                              [--dry-run]\n"
                      "  Sweeps the container cache the way a serve does on start: least-recently-used first, never the\n"
                      "  entry named by --keep, never one written within --min-age seconds (a serve may be reading it).\n"
-                     "  --root defaults to ONEBIT_Q4NX_CACHE_DIR, then $XDG_CACHE_HOME/1bit/q4nx, then ~/.cache/1bit/q4nx.\n"
+                     "  --root defaults to ONEBIT_Q4NX_CACHE, then ~/.cache/1bit/q4nx: the directory serve and the forward write.\n"
                      "  --max-gib defaults to ONEBIT_Q4NX_CACHE_MAX_GIB(), then 60; 0 disables the sweep.\n"
                      "  --dry-run prints what it would remove and removes nothing.\n");
     };
@@ -55,14 +55,10 @@ int run_q4nx_cache(int argc, char** argv) {
         else { std::fprintf(stderr, "q4nx-cache: unknown argument %s\n", a.c_str()); usage(); return 2; }
     }
     if (root.empty()) {
-        const char* env = std::getenv("ONEBIT_Q4NX_CACHE_DIR");
-        if (env && *env) {
-            root = env;
-        } else {
-            const char* xdg = std::getenv("XDG_CACHE_HOME");
-            const char* home = std::getenv("HOME");
-            root = (xdg && *xdg) ? std::string(xdg) : std::string(home ? home : ".") + "/.cache";
-            root += "/1bit/q4nx";
+        root = q4nx_cache_default_root();
+        if (root.empty()) {
+            std::fprintf(stderr, "q4nx-cache: no home directory for the Q4NX cache: set HOME or ONEBIT_Q4NX_CACHE, or pass --root\n");
+            return 2;
         }
     }
     const int64_t max_bytes = (max_mib >= 0)   ? max_mib * (int64_t(1) << 20)

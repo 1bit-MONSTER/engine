@@ -306,9 +306,12 @@ entry, `1bit serve` removes the least-recently-used entries until the cache is w
 `ONEBIT_Q4NX_CACHE_MAX_GIB` (default 60; `0` or a negative number turns the sweep off). The
 forward's device-form conversion (`npu/q4nx_device.cpp`) sweeps the same way after it writes a new
 entry (engine#2263), so a box that converts through the forward and never starts a serve stays
-within the bound too. The sweep itself is `npu/q4nx_cache_sweep.h`, shared by both writers and by
-`1bit q4nx-cache evict`. A box that writes nothing never sweeps; `1bit q4nx-cache evict` is the
-manual trigger for that case. The entry
+within the bound too. A forward load (`1bit forward-serve`, `1bit npu-run` on a sealed set, the
+host-only route too) also sweeps once it has loaded, because a pack that needs no conversion still
+writes its head images (below) into the cache. The sweep itself is `npu/q4nx_cache_sweep.h`,
+shared by every writer and by `1bit q4nx-cache evict`, which without `--root` sweeps the directory
+every writer uses (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`). A box that writes nothing never
+sweeps; `1bit q4nx-cache evict` is the manual trigger for that case. The entry
 just written and any entry used in the last ten minutes are never removed. "Used" means reused,
 not only written: a cache hit — a repacked GGUF found in the cache, or a device-form conversion
 reused at load — marks the entry's directory as used now, so a container imported once and served
@@ -340,10 +343,11 @@ The serve log line says what happened: `lm head: N packed weight tile(s) residen
 image cache, P packed (W written for the next serve) in S s`. `ONEBIT_HEAD_IMAGE_CACHE=0` turns
 the cache off (nothing is read or written). The files are `kd × nd` bytes plus `nd` scales per
 tile, so a head costs about `kpad × vocabulary` bytes on disk per kernel set. The Q4NX cache sweep
-(`ONEBIT_Q4NX_CACHE_MAX_GIB`, above) counts `head-images/` as one entry of the cache and removes it
-whole when the cache is over its bound and that directory is the least recently written one. Its
-age is the last time a tile was written into it: a serve that only reads its tiles does not refresh
-it. Losing the directory costs the next serve one pack of its head, nothing else. Ternary (`pb16i`) heads and the gemv head do not
+(`ONEBIT_Q4NX_CACHE_MAX_GIB`, above) counts each key in `head-images/` (`headimg-<digest>`, all its
+tiles) as one entry of the cache (engine#2263; it used to count the directory as one entry, so the
+sweep could only keep every pack's head or remove all of them). A key's age is its newest tile, and
+a cache hit marks the tile it read as used, so a head served every day is not aged from the day it
+was packed. Losing a key costs the next serve of that pack one pack of its head, nothing else. Ternary (`pb16i`) heads and the gemv head do not
 use it: their image already is a file. Each writer builds the file under its own name
 (`<file>.tmp.<pid>`) and renames it into place, so two serves that start cold on the same pack both
 finish their write and a reader only ever sees a whole image. The behaviour is pinned host-side in

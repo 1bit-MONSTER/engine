@@ -33,6 +33,11 @@ from the file body, and they decide the work:
 `git merge-tree --write-tree` (git >= 2.38) reports all of it without a checkout, which is what makes this safe to run
 on a tree nobody wants to disturb.
 
+What arrives *after* the classification is a second question, with its own tool: `tools/ci/registration_loss_check.py` asks
+whether the branch still carries the registrations `main` has (`add_test(NAME`, `add_python_test(`, `add_executable(` out of
+`CMakeLists.txt` and `cmake/**/*.cmake`, at both revisions). A `CMakeLists.txt` conflict is exactly where a resolution that
+takes one side deletes other lanes' rows -- measured on engine#2183, whose 2 conflicts hid 48 missing registrations.
+
 usage: conflict_triage.py <repo> <theirs> [--base BASE] [--json]
        conflict_triage.py --markers REF [--json]   classify the markers already committed in a tree
        conflict_triage.py --self-test

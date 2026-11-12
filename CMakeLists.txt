@@ -414,6 +414,13 @@ add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tes
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the
 # check; the two permanent services are exempt by name. --self-test drives the decision, no device needed.
 add_python_test(device_holders ${CMAKE_SOURCE_DIR}/tools/device_holders.py --self-test)
+# engine#1911/#2018: a tools/*.py whose --selftest nothing runs is a comment, not a test. npu_pack_components.py
+# lists the components of a partitioned 1.9 pack (root text + sibling vision in either form) and its rule is pinned by
+# --selftest, which builds a synthetic layout: three components across both forms, a directory with no graph ignored,
+# an empty directory refused. Pure python, no pack on disk, no device, no network. Registered with add_python_test,
+# matching the migration this file has already made for device_holders: the helper satisfies engine#1864's ordering
+# rule by construction, so a future reorder cannot turn this row into BAD_COMMAND.
+add_python_test(npu_pack_components ${CMAKE_SOURCE_DIR}/tools/npu_pack_components.py --selftest)
 # engine #1668: the bench preflight must pin the load mode, because `-lm none` is +17.5 % prefill at -1.6 % decode for +604 MiB of
 # GTT. The script existed with a test that nothing ran; a test nobody runs is a comment, so the loader/flag assertions are registered
 # here (the test fakes the box, so it needs no device and no ticket).

@@ -3362,6 +3362,18 @@ to 6.9 %** — the head needs the hidden of the token it drafts past, which a on
 the hidden without lagging the cursor is worse: it accepts **0 of 92** while the mismatch counter stays at 0, i.e.
 a silently broken loop rather than a slow one.
 
+**The one-pass round, for a head that does not need that hidden** (engine#1781). The refutation above is about the
+MTP head. A DFlash draft drafts from the base's *committed* rows plus the last token's embedding, so it never needs the
+hidden after the token it drafts past. Such a head says so (`DraftHead::needs_last_hidden()` returns false), and
+`mtp::run()` then verifies `[t1, d1..dk]` as one batch of `k + 1` rows: row `i` checks draft `i + 1`, the round commits
+`t1` plus the accepted drafts, the drafter's `commit_rows()` gets those rows (`t1`'s first), and the next `t1` is the
+base's choice in the first row past them. `k` is held to `max_batch_rows() - 1`, because `t1` takes a row. The MTP head
+keeps the two-pass round (the default). `tests/mtp_draft_test.cpp` [17] pins it on the toy base: the text and the
+recurrent state are plain decode's for perfect, garbage and half-right heads at `k` = 1 to 12; a fully accepted chain
+takes one pass per `k + 1` tokens and no step (k = 7: 0.125 base passes per token against the two-pass round's 0.250);
+and every committed row reaches the drafter once, in order. This is what the "one pass (verify only)" rows of
+[docs/oga-drafter-path.md](oga-drafter-path.md) price.
+
 **What would change the answer**: a cheaper verify batch (the array wait is ~60 % of a batched pass — a kernel
 lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
 6 measured 0 %).

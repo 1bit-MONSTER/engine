@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // The Q4NX container cache (engine#1956): app/serve.cpp repacks a GGUF into `$ONEBIT_Q4NX_CACHE` (default
 // ~/.cache/1bit/q4nx) and reuses the result, and until this existed nothing ever removed an old entry. Measured on strixhalo
@@ -41,6 +42,17 @@ struct Q4nxCacheSweep {
 // the bound should see why in its log instead of re-importing into the same squeeze.
 Q4nxCacheSweep q4nx_cache_evict(const std::string& root, const std::string& keep, int64_t max_bytes,
                                int64_t min_age_seconds = 600);
+
+// engine#1788 follow-up, from USING the command: `--dry-run` reported totals only, so an operator could see "3 entries, 12 GiB"
+// but not WHICH entries -- which is the question before deleting another lane's imports. This is the same selection
+// q4nx_cache_evict() makes (LRU first, `keep` and the age window respected, stop at max_bytes), returned instead of applied,
+// so the two cannot drift: evict() is now this list plus a remove loop.
+struct Q4nxCacheCandidate {
+    std::string name;    // the entry directory's name, as it appears under the root
+    int64_t bytes = 0;
+};
+std::vector<Q4nxCacheCandidate> q4nx_cache_candidates(const std::string& root, const std::string& keep, int64_t max_bytes,
+                                                      int64_t min_age_seconds = 600);
 
 // Directory bytes under `path` (0 when it does not exist).
 int64_t q4nx_dir_bytes(const std::string& path);

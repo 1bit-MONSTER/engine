@@ -38,40 +38,54 @@ int64_t q4nx_dir_bytes(const std::string& path) {
     return total;
 }
 
-Q4nxCacheSweep q4nx_cache_evict(const std::string& root, const std::string& keep, int64_t max_bytes,
-                                int64_t min_age_seconds) {
-    Q4nxCacheSweep r;
+std::vector<Q4nxCacheCandidate> q4nx_cache_candidates(const std::string& root, const std::string& keep,
+                                                      int64_t max_bytes, int64_t min_age_seconds) {
+    std::vector<Q4nxCacheCandidate> out;
     std::error_code ec;
-    if (max_bytes <= 0 || !fs::is_directory(root, ec)) return r;
+    if (max_bytes <= 0 || !fs::is_directory(root, ec)) return out;
     struct Ent { std::string path; int64_t bytes; fs::file_time_type mtime; };
     std::vector<Ent> all;
     for (auto it = fs::directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
          !ec && it != fs::directory_iterator(); it.increment(ec)) {
-        std::error_code tec;
-        if (!it->is_directory(tec)) continue;
         Ent e;
         e.path = it->path().string();
-        if (!keep.empty() && (e.path == keep || fs::path(e.path).filename() == fs::path(keep).filename())) continue;  // never the new one
+        std::error_code tec;
+        if (!it->is_directory(tec)) continue;
         e.bytes = q4nx_dir_bytes(e.path);
+        if (!keep.empty() && (e.path == keep || fs::path(e.path).filename() == fs::path(keep).filename())) continue;
         e.mtime = fs::last_write_time(it->path(), tec);
         if (tec) continue;
-        r.bytes_before += e.bytes;
         all.push_back(std::move(e));
     }
-    if (all.empty()) return r;
-    r.bytes_after = r.bytes_before;
+    if (all.empty()) return out;
     const auto now = fs::file_time_type::clock::now();
     const auto min_age = std::chrono::seconds(min_age_seconds);
-    std::vector<Ent*> candidates;      // LRU first; the age window protects an entry a serve may be reading
+    std::vector<Ent*> cands;
     for (auto& e : all)
-        if (now - e.mtime > min_age) candidates.push_back(&e);
-    std::sort(candidates.begin(), candidates.end(), [](const Ent* a, const Ent* b) { return a->mtime < b->mtime; });
-    for (Ent* e : candidates) {
-        if (r.bytes_after <= max_bytes) break;
+        if (now - e.mtime > min_age) cands.push_back(&e);
+    std::sort(cands.begin(), cands.end(), [](const Ent* a, const Ent* b) { return a->mtime < b->mtime; });
+    int64_t after = 0;
+    for (const auto& e : all) after += e.bytes;
+    for (Ent* e : cands) {
+        if (after <= max_bytes) break;
+        out.push_back({fs::path(e->path).filename().string(), e->bytes});
+        after -= e->bytes;
+    }
+    return out;
+}
+
+Q4nxCacheSweep q4nx_cache_evict(const std::string& root, const std::string& keep, int64_t max_bytes,
+                                int64_t min_age_seconds) {
+    Q4nxCacheSweep r;
+    r.bytes_before = q4nx_dir_bytes(root);
+    r.bytes_after = r.bytes_before;
+    // One selection, shared with `--dry-run`: the list is what this function removes, in this order.
+    const std::vector<Q4nxCacheCandidate> cands = q4nx_cache_candidates(root, keep, max_bytes, min_age_seconds);
+    for (const auto& cand : cands) {
         std::error_code rec;
-        fs::remove_all(e->path, rec);
+        fs::remove_all(fs::path(root) / cand.name, rec);
         if (rec) continue;
-        r.bytes_after -= e->bytes;
+        r.bytes_after -= cand.bytes;
         ++r.removed;
     }
     if (r.removed > 0) {
@@ -154,18 +168,32 @@ int run_q4nx_cache(int argc, char** argv) {
         std::printf("q4nx-cache: %s is %.1f GiB, the sweep is off (bound 0)\n", root.c_str(), double(before) / (1 << 30));
         return 0;
     }
-    if (dry) {
-        std::printf("q4nx-cache: %s is %.1f GiB against a %.1f GiB bound; --dry-run removes nothing\n", root.c_str(),
-                    double(before) / (1 << 30), double(max_bytes) / (1 << 30));
-        return before > max_bytes ? 1 : 0;
-    }
-    const Q4nxCacheSweep s = q4nx_cache_evict(root, keep, max_bytes, min_age);
-    // A 6 MiB bound printed as "0.0 GiB" reads like "the sweep is off", which is a different state -- so small sizes
-    // are reported in MiB. This line is the whole output; it has to be unambiguous.
     const auto size = [](int64_t b, char* out, size_t n) {
         if (b >= (int64_t(1) << 30)) std::snprintf(out, n, "%.1f GiB", double(b) / (1 << 30));
         else std::snprintf(out, n, "%.1f MiB", double(b) / (1 << 20));
     };
+    if (dry) {
+        const std::vector<Q4nxCacheCandidate> would = q4nx_cache_candidates(root, keep, max_bytes, min_age);
+        int64_t would_free = 0;
+        for (const auto& c : would) would_free += c.bytes;
+        char b1[32], b2[32], b3[32];
+        size(before, b1, sizeof b1);
+        size(max_bytes, b2, sizeof b2);
+        size(would_free, b3, sizeof b3);
+        std::printf("q4nx-cache: %s is %s against a %s bound; --dry-run removes nothing\n", root.c_str(), b1, b2);
+        if (would.empty()) {
+            std::printf("q4nx-cache: nothing would be removed (bound met, or every entry is inside the %lld s age window)\n",
+                        (long long)min_age);
+            return before > max_bytes ? 1 : 0;
+        }
+        std::printf("q4nx-cache: would remove %zu entr%s, %s, oldest first:\n", would.size(),
+                    would.size() == 1 ? "y" : "ies", b3);
+        for (const auto& c : would) std::printf("  %8.1f MiB  %s\n", double(c.bytes) / (1 << 20), c.name.c_str());
+        return 1;   // over the bound: the dry run is telling you there IS work
+    }
+    const Q4nxCacheSweep s = q4nx_cache_evict(root, keep, max_bytes, min_age);
+    // A 6 MiB bound printed as "0.0 GiB" reads like "the sweep is off", which is a different state -- so small sizes
+    // are reported in MiB. This line is the whole output; it has to be unambiguous.
     char before_s[32], after_s[32], bound_s[32];
     size(s.bytes_before, before_s, sizeof before_s);
     size(s.bytes_after, after_s, sizeof after_s);

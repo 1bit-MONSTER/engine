@@ -161,8 +161,29 @@ int main() {
         }
         fs::remove_all(cr, ec);
     }
+    // engine#1788 follow-up, from USING the command: --dry-run now lists WHICH entries it would remove, and it lists them
+    // from the same selection the sweep applies, so the two cannot drift.
+    {
+        const fs::path cr = root / "cand";
+        make_entry(cr, "c-old", 2, 500);
+        make_entry(cr, "c-mid", 2, 400);
+        make_entry(cr, "c-new", 2, 300);
+        const int64_t bound = 3 * 1024 * 1024;   // 6 MiB of entries against a 3 MiB bound: two must go
+        const std::vector<Q4nxCacheCandidate> c1 = q4nx_cache_candidates(cr.string(), "", bound, 0);
+        check(c1.size() == 2, "q4nx-cache candidates: the list stops at the bound");
+        check(c1[0].name == "c-old" && c1[1].name == "c-mid", "q4nx-cache candidates: least-recently-used first");
+        check(c1[0].bytes == 2 * 1024 * 1024, "q4nx-cache candidates: each entry carries its size");
+        check(fs::exists(cr / "c-old") && fs::exists(cr / "c-mid") && fs::exists(cr / "c-new"),
+              "q4nx-cache candidates: nothing is removed by listing");
+        const std::vector<Q4nxCacheCandidate> c2 = q4nx_cache_candidates(cr.string(), "c-old", bound, 0);
+        // with c-old kept out of the total, 4 MiB remains against a 3 MiB bound: exactly one entry goes
+        check(c2.size() == 1 && c2[0].name == "c-mid", "q4nx-cache candidates: --keep is not a candidate");
+        check(q4nx_cache_candidates(cr.string(), "", bound, 100000).empty(),
+              "q4nx-cache candidates: the age window protects everything inside it");
+        fs::remove_all(cr, ec);
+    }
     fs::remove_all(root, ec);
     std::printf("q4nx cache: %d arm(s) over the sweep (bound, LRU order, keep, age window, disabled, touch on a hit, bound text)\n",
-                failures ? 0 : 26);
+                failures ? 0 : 32);
     return failures ? 1 : 0;
 }

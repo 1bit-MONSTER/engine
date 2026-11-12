@@ -124,7 +124,12 @@ def referenced(root, need):
 
 
 SELFTEST = re.compile(r"--self[-_]?test\b")
-RUNNERS = ("CMakeLists.txt", "cmake", ".github/workflows", "tests")
+RUNNERS = ("CMakeLists.txt", "cmake", ".github/workflows")
+# A tool's `--self-test` can also be run from a python test, so THAT gate reads one more directory. The python-test gate must
+# not: with "tests" in the shared tuple, `tests/lonely_test.py` mentioning its own name satisfied "some runner names it" and the
+# test registered itself (measured on a fixture -- the guard against a test naming itself lives in the other function's path
+# shape, not in this haystack). engine#1901's tools half and engine#2129's scripts half are unchanged.
+TOOL_RUNNERS = RUNNERS + ("tests",)
 
 
 def unregistered_selftest_tools(root):
@@ -144,7 +149,7 @@ def unregistered_selftest_tools(root):
     if not cand:
         return []
     runner_text = []
-    for sub in RUNNERS:
+    for sub in TOOL_RUNNERS:
         p = root / sub
         files = [p] if p.is_file() else (sorted(q for q in p.rglob("*") if q.is_file()) if p.is_dir() else [])
         for f in files:
@@ -308,6 +313,13 @@ def self_test():
     r = root_with({"tests/ci.sh": "#!/bin/sh\n", "CMakeLists.txt": "",
                    ".github/workflows/ci.yml": "run: bash tests/ci.sh\n"})
     cases.append(("a mention in a workflow counts", check(r), 0, None))
+
+    # 4b. a PYTHON test naming only itself is drift even though `tests/` is a run site for TOOL self-tests -- the two gates
+    # read different corpora on purpose (measured: sharing one tuple let tests/lonely_test.py register itself)
+    r = root_with({"tests/lonely_test.py": "import sys\n# usage: tests/lonely_test.py\nprint('--self-test')\n",
+                   "CMakeLists.txt": ""})
+    cases.append(("a python test that names only itself is still drift", check(r), 1, "lonely_test.py"))
+    cases_root["a python test that names only itself is still drift"] = r
 
     # 5. a test naming ONLY itself -> drift (the vacuous case)
     r = root_with({"tests/self.sh": "#!/bin/sh\n# usage: tests/self.sh\n", "CMakeLists.txt": ""})

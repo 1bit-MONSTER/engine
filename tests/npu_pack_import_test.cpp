@@ -5214,6 +5214,42 @@ static void test_container_placement_real(const std::string& dir, const std::vec
     check(unknown.empty(), std::string("placement: no role is unknown to the table in ") + dir + " (" + names + ")");
 }
 
+// REVIEW of #2291 named a hazard that review caught and code should catch: during one edit this file briefly held two
+// role->destination tables with the SAME keys and DIFFERENT values, and container_role_slot() would have returned
+// whichever came first. The observable invariant is that no role is both placed and refused -- asserted here once, over
+// the whole report, so a duplicated or contradictory entry fails without needing a real container.
+static void test_role_tables_disagree_nowhere() {
+    using namespace onebit::npu::pack_import;
+    ContainerRoles r;
+    for (const char* role : {"embed", "final_norm", "input_norm", "post_norm", "lm_head", "q_proj", "k_proj", "v_proj",
+                             "o_proj", "q_norm", "k_norm", "self_attn_gate_proj", "gate_proj", "up_proj", "down_proj",
+                             "gate_up_proj", "qkv_proj", "moe_router", "gate_exps", "up_exps", "down_exps",
+                             "share_gate_exps", "share_up_exps", "share_down_exps", "shared_expert_gate",
+                             "shortconv_in_proj", "ssm", "gemma_local", "container_extra"})
+        r.counts[role] = 1;
+    const RoleSlotReport s = container_role_slots(r);
+    for (const auto& kv : s.slot_of) {
+        check(!s.why.count(kv.first), "tables: " + kv.first + " is not both placed and refused");
+    }
+    check(s.placed.size() + s.no_slot.size() == r.counts.size(), "tables: every role is in exactly one bucket");
+    // the MoE destinations must be the CONTAINER spelling; the EngineConverter one is a different pack format
+    check(s.slot_of.count("gate_exps") && s.slot_of.at("gate_exps") == "mlp.gate_exps_proj.weight",
+          "tables: the routed gate is the FLM spelling, not mlp.experts.*");
+    check(s.slot_of.count("moe_router") && s.slot_of.at("moe_router") == "moe_router.weight",
+          "tables: the router is moe_router.weight, not mlp.gate.weight");
+    // two refusals are correct and both are about the SECOND KEY, not about a missing slot: qkv_proj needs the layer type,
+    // gate_up_proj needs a measured split. Anything else appearing here is a regression, so the set is pinned exactly.
+    // Five refusals, and the mix is the point: two are about the SECOND KEY (qkv_proj needs the layer type,
+    // gate_up_proj needs a measured split) and three are GROUP roles (ssm, gemma_local, container_extra) which have no
+    // single destination at role granularity even though their members are placed per tensor by suffix. Role-level
+    // refusal plus per-tensor placement are two different answers, and both are correct.
+    { std::string list; for (const auto& r : s.no_slot) list += r + " ";
+      check(s.no_slot.size() == 5, "tables: five roles are refused at role granularity (got: " + list + ")"); }
+    check(s.no_slot[0] == "container_extra" && s.no_slot[1] == "gate_up_proj" && s.no_slot[2] == "gemma_local" &&
+          s.no_slot[3] == "qkv_proj" && s.no_slot[4] == "ssm",
+          "tables: and they are exactly the pinned five, so a new refusal cannot slip in unnoticed");
+}
+
 void test_container_placement() {
     using pi::Q4nxTensor;
     const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
@@ -6456,6 +6492,7 @@ int main(int argc, char** argv) {
         test_container_roles_gemma_local();
         test_container_roles_moe_and_singular_layer();
         test_container_placement();
+        test_role_tables_disagree_nowhere();
         if (argc > 4) {
             std::vector<std::string> lt;
             std::string all = argv[4];

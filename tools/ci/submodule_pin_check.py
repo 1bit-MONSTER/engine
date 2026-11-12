@@ -33,8 +33,13 @@ not a build failure, but a difference that reads as a model bug.
          missing the source or using a system copy)             -> fail with --require-initialised
     'U'  merge conflicts in the submodule                       -> fail
 
+`git submodule status` cannot report one more state a build cares about: a submodule that IS at the pinned commit and
+has uncommitted changes in its own work tree. It prints ' ' for that, and a build compiles the uncommitted files. On
+2026-11-11 the same box that motivated this check had 301 such files in `third_party/llama.cpp`. Those are reported
+always, and --require-clean turns them into a failure.
+
 Usage:
-  tools/ci/submodule_pin_check.py --check [--root .] [--require-initialised]
+  tools/ci/submodule_pin_check.py --check [--root .] [--require-initialised] [--require-clean]
   tools/ci/submodule_pin_check.py --self-test
 """
 from __future__ import annotations
@@ -65,14 +70,30 @@ def parse_status(text: str) -> list[tuple[str, str, str, str]]:
     return rows
 
 
-def verdict(rows: list[tuple[str, str, str, str]], require_initialised: bool) -> tuple[int, list[str]]:
-    """(rc, messages). rc 0 pass, 1 a submodule is not at its pin, 2 nothing readable."""
+def verdict(rows: list[tuple[str, str, str, str]], require_initialised: bool,
+            dirty: dict[str, int] | None = None, require_clean: bool = False) -> tuple[int, list[str]]:
+    """(rc, messages). rc 0 pass, 1 a submodule is not at its pin, 2 nothing readable.
+
+    `dirty` maps a path to the number of paths its work tree has changed (git status --porcelain). A submodule at its
+    pin with a dirty work tree compiles code the pin does not name; it is always reported and fails only under
+    --require-clean, because a deliberate local patch is a real thing a box does and the fix for it (move the pin) is
+    not always the caller's to make."""
     if not rows:
         return 2, ["submodule_pin: no submodules reported - cannot tell, and that is not a pass"]
     out: list[str] = []
-    bad = unknown = uninit = 0
+    bad = unknown = uninit = dirty_at_pin = 0
     for flag, sha, path, describe in rows:
         if flag == " ":
+            n = (dirty or {}).get(path, 0)
+            if n:
+                dirty_at_pin += 1
+                out.append(
+                    f"submodule_pin: {path} is at the pinned {sha[:12]} but its work tree has {n} changed "
+                    f"path(s), so the build compiles code the pin does not name. Repair: git -C {path} stash, or "
+                    f"move the pin if the change is meant to stay (git add {path})"
+                )
+                if require_clean:
+                    bad += 1
             continue
         if flag == "?":
             unknown += 1
@@ -102,6 +123,8 @@ def verdict(rows: list[tuple[str, str, str, str]], require_initialised: bool) ->
         return 1, out
     if unknown and not (len(rows) - unknown):
         return 2, out
+    if dirty_at_pin and not require_clean:
+        out.append(f"submodule_pin: WARNING, not a failure: {dirty_at_pin} submodule(s) at their pin with a dirty work tree (--require-clean makes this an error)")
     out.append(
         f"submodule_pin: {len(rows) - bad - unknown - uninit} submodule(s) at their pinned commit"
         + (f", {uninit} not initialised" if uninit else "")
@@ -123,6 +146,28 @@ def run_git(root: pathlib.Path) -> tuple[str, int]:
     return p.stdout, 0
 
 
+def run_dirty(root: pathlib.Path, rows: list[tuple[str, str, str, str]]) -> dict[str, int]:
+    """{path: changed-path count} for the submodules that ARE at their pin.
+
+    Only those: a '+' or 'U' row already fails and its dirty count would be noise. `git status --porcelain` inside the
+    submodule is the only thing that reports this state - `git submodule status` prints ' ' for it.
+    """
+    out: dict[str, int] = {}
+    for flag, _sha, path, _describe in rows:
+        if flag != " ":
+            continue
+        try:
+            p = subprocess.run(["git", "-C", str(root / path), "status", "--porcelain"],
+                               capture_output=True, text=True, check=False)
+        except OSError:
+            continue
+        if p.returncode == 0:
+            n = len([l for l in p.stdout.splitlines() if l.strip()])
+            if n:
+                out[path] = n
+    return out
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     g = ap.add_mutually_exclusive_group(required=True)
@@ -134,6 +179,11 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="treat a submodule that is not checked out as a failure (a release build should use this)",
     )
+    ap.add_argument(
+        "--require-clean",
+        action="store_true",
+        help="treat a submodule that is at its pin with a dirty work tree as a failure (CI uses this)",
+    )
     args = ap.parse_args(argv)
 
     if args.self_test:
@@ -143,7 +193,9 @@ def main(argv: list[str]) -> int:
     if rc != 0:
         print(f"submodule_pin: cannot tell: {text}")
         return 2
-    rc, messages = verdict(parse_status(text), args.require_initialised)
+    rows = parse_status(text)
+    rc, messages = verdict(rows, args.require_initialised, run_dirty(pathlib.Path(args.root).resolve(), rows),
+                           args.require_clean)
     for m in messages:
         print(m)
     return rc
@@ -189,6 +241,18 @@ def self_test() -> int:
         any("not initialised" in m for m in verdict(parse_status(uninit), True)[1]),
         "... and so does the uninitialised one",
     )
+    # engine#2129, the half `git submodule status` cannot report: at the pin, dirty work tree
+    check(verdict(parse_status(at_pin), False, {"third_party/llama.cpp": 301})[0] == 0,
+          "at the pin with 301 dirty paths -> pass by default (a deliberate local patch is a real thing)")
+    check(any("301 changed" in m for m in verdict(parse_status(at_pin), False, {"third_party/llama.cpp": 301})[1]),
+          "... but it IS reported, with its count")
+    check(verdict(parse_status(at_pin), False, {"third_party/llama.cpp": 301}, True)[0] == 1,
+          "... and FAILS with --require-clean")
+    check(verdict(parse_status(at_pin), False, {}, True)[0] == 0,
+          "a clean submodule at its pin still passes with --require-clean")
+    check(not any("changed" in m for m in verdict(parse_status(ahead), False, {"third_party/llama.cpp": 5})[1]),
+          "a dirty '+' row is not double-counted (the commit is the failure there)")
+
     # one bad among several still fails: the check is not 'all lines' or 'the first line'
     check(verdict(parse_status(at_pin + ahead + at_pin), False)[0] == 1,
           "one '+' among three lines still fails")

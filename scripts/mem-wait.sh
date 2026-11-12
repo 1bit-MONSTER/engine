@@ -19,15 +19,17 @@
 # compile into an exhausted box is what turned one OOM into two on 2026-11-08 (engine#1504; both self-hosted
 # runners were OOM-killed 76 s after a restart, with 0 swap free). Each poll prints what the box looks like, so a
 # refusal says why. The floor is MemAvailable only: on this APU GTT is host RAM, and MemAvailable already counts it.
+# MEM_GUARD_MEMINFO names the file read instead of /proc/meminfo, and MEM_WAIT_POLL the seconds between polls
+# (default 60); both are for the tests.
 floor=${1:?usage: mem-wait.sh <min_available_gb> <max_wait_min>}; max=${2:?usage: mem-wait.sh <min_available_gb> <max_wait_min>}
-meminfo() { awk -v k="$1" '$1 == k":" {print int($2/1048576)}' /proc/meminfo; }
+meminfo() { awk -v k="$1" '$1 == k":" {print int($2/1048576)}' "${MEM_GUARD_MEMINFO:-/proc/meminfo}"; }
 for i in $(seq 0 "$max"); do
   avail=$(meminfo MemAvailable)
   line="MemAvailable ${avail} GB (floor ${floor} GB), swap free $(meminfo SwapFree) of $(meminfo SwapTotal) GB"
   if [ "$avail" -ge "$floor" ]; then echo "mem-wait: ok: $line"; exit 0; fi
   [ "$i" = "$max" ] && break
   echo "mem-wait: waiting ($((i + 1)) of $max min): $line"
-  sleep 60
+  sleep "${MEM_WAIT_POLL:-60}"
 done
 echo "mem-wait: REFUSED after ${max} min: $line. The box is short of memory, so this job did not start its build;" \
      "re-run it once memory frees (engine#1504)." >&2

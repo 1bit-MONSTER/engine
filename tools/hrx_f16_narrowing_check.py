@@ -38,7 +38,7 @@
 #
 # usage: hrx_f16_narrowing_check.py <corpus-root> [--self-test]
 # Exit: 0 always for a report (this is an inventory, not a gate); --self-test is the gate.
-import re, sys, pathlib
+import hashlib, re, sys, pathlib
 
 NARROW = re.compile(r'fptrunc\s+(%[A-Za-z0-9_]+)|fptrunc\s+%([A-Za-z0-9_]+)')
 DEF = re.compile(r'\s*(%[A-Za-z0-9_]+)\s*=\s*(.*)$')
@@ -169,28 +169,6 @@ def self_test():
         else:
             print(f"FAIL {what}: want {want}, got {got}")
             rc = 1
-    mul_acc = ["  %init = vector.fragment<init> %zero shape [%m, %n] : vector<16xf16>",
-               "    %next = vector.mulf %block_acc, %k : vector<16xf16>"]
-    chk('mul', scan('x', mul_acc)[0][3], 'a mul-updated f16 accumulator is flagged (the #2186 item-1 shape)')
-    add_acc = ["  %init = vector.fragment<init> %zero shape [%m, %n] : vector<16xf16>",
-               "    %next = vector.addf %block_acc, %k : vector<16xf16>"]
-    chk('add', scan('x', add_acc)[0][3], 'an add-only f16 accumulator is reported separately')
-    f32 = ["  %init = vector.fragment<init> %zero shape [%m, %n] : vector<16xf32>"]
-    chk(0, len(scan('x', f32)), 'an f32 accumulator is not this defect')
-    print(f"self-test: {'ok' if rc == 0 else 'FAIL'}")
-    return rc
-
-
-
-def self_test():
-    rc = 0
-    def chk(want, got, what):
-        nonlocal rc
-        if want == got:
-            print(f"ok   {what}")
-        else:
-            print(f"FAIL {what}: want {want}, got {got}")
-            rc = 1
 
     # class 1: an activation loaded from a f32 view and truncated with nothing in between
     raw = ["  %loaded = vector.load %v[%a] : view<8xf32> -> vector<4xf32>",
@@ -234,8 +212,31 @@ def self_test():
     far = ["  %init = vector.fragment<init> %zero shape [%m, %n] : vector<16xf16>"] + ["  // pad"] * 200 + \
           ["    %next = vector.mulf %block_acc, %k : vector<16xf16>"]
     chk('mul', scan('x', far)[0][3], 'class 3: an update 200 lines below the init is still found')
+    # The corpus is part of the result: same bytes -> same fingerprint, a changed file -> a different one.
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        r = pathlib.Path(d)
+        (r / 'a.loom').write_text('one\n'); (r / 'sub').mkdir(); (r / 'sub' / 'b.loom').write_text('two\n')
+        fp1 = fingerprint(r)
+        chk(True, fp1.endswith('(2 .loom file(s))'), 'the fingerprint counts the .loom files it read')
+        chk(fp1, fingerprint(r), 'the same corpus fingerprints the same way twice')
+        (r / 'sub' / 'b.loom').write_text('two changed\n')
+        chk(False, fp1 == fingerprint(r), 'a one-byte change to one file changes the fingerprint')
+        (r / 'a.loom').rename(r / 'sub' / 'a.loom')
+        chk(False, fp1 == fingerprint(r), 'a file moved to another path changes it too (the path is hashed)')
     print(f"self-test: {'ok' if rc == 0 else 'FAIL'}")
     return rc
+
+
+def fingerprint(root):
+    """sha256 over the corpus: sorted (relative path, file digest), so a moved file changes it too."""
+    h = hashlib.sha256()
+    n = 0
+    for p in sorted(root.rglob('*.loom')):
+        h.update(str(p.relative_to(root)).encode())
+        h.update(hashlib.sha256(p.read_bytes()).digest())
+        n += 1
+    return f"{h.hexdigest()[:16]} ({n} .loom file(s))"
 
 
 def main(argv):
@@ -245,6 +246,8 @@ def main(argv):
         print("usage: hrx_f16_narrowing_check.py <corpus-root>")
         return 2
     root = pathlib.Path(argv[1])
+    # The corpus is part of the result. Two runs that disagree are only comparable if the tree they
+    # read is named and fingerprinted, and "it found 9" is unattributable without both.
     inputs, pubs, accs = [], [], []
     for p in sorted(root.rglob('*.loom')):
         lines = p.read_text(errors='replace').splitlines()
@@ -255,6 +258,8 @@ def main(argv):
                 pubs.append(f"{p.relative_to(root)}:{ln}  {operand}")
         for ln, acc, width, kind, upd in scan(p, lines):
             accs.append((kind, f"{p.relative_to(root)}:{ln}  {acc}  vector<{width}xf16>  [{upd or '-'}]"))
+    print(f"CORPUS       {root.resolve()}")
+    print(f"FINGERPRINT  {fingerprint(root)}")
     for r in inputs:
         print(f"INPUT        {r}")
     for r in pubs:

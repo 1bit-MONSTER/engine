@@ -131,6 +131,15 @@ void* model_tensor_data(ModelWeights* mw, TensorDesc* desc);
 // Used for architecture-specific tensors the fixed fields do not cover.
 // (Distinct from the legacy model_find_tensor(name, mw), which returns an index.)
 TensorDesc* model_tensor_by_name(ModelWeights* mw, const char* name);
+
+// LFM3 packs (FastFlowLM/LFM3-1.7B-NPU2) keep the upstream Liquid names -- conv.*, operator_norm, ffn_norm,
+// feed_forward.w1/w2/w3, post_operator_norm, post_ffn_norm, embedding_norm -- where the LFM2 packs carry the
+// canonical ones (shortconv.*, input_layernorm, mlp.*, post_attention_layernorm, model.norm).  This renames each
+// to the canonical name, in place, and only where that name is not already taken.  ffn_norm is the norm in front
+// of the MLP, so it becomes pre_feedforward_layernorm in a layer that also has post_operator_norm (the sandwich
+// form, where post_attention_layernorm is the attention/conv output's norm) and post_attention_layernorm
+// otherwise.  Returns the number of tensors renamed.
+int model_alias_lfm_names(TensorDesc* tensors, int count);
 // engine#1786 (item F1): three FastFlowLM NPU2 model sources spell the per-layer prefix `model.layer.` (singular)
 // where this forward addresses `model.layers.`. Writes the OTHER spelling into `out` and returns 1 when `name` carries
 // either prefix, 0 when it does not. Only the leading prefix is swapped, once: a caller that wants a fallback retries

@@ -15,7 +15,7 @@
 # limitations under the License.
 """The batch-check state pin (tests/batch_check_state_test.cpp, engine#1905/#1946) on a container made here.
 
-usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|qwen3_5]        (needs numpy)
+usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|lfm3|qwen3_5]   (needs numpy)
 
 batch_check_state_test needs a Q4NX container, and CI has none, so on its own it skips (77) there and a regression of
 #1909 -- the NPU_BATCH_CHECK oracle resetting the prefix it replays from -- lands green. This writes a two-layer qwen3
@@ -32,6 +32,13 @@ the only place CI loads a container with conv layers through the forward. What i
 (on 2026-11-11 a rule added for Hunyuan, "q/k norm is on and this layer has no q_norm, refuse", refused every LFM2
 pack at layer 0, a conv layer with no attention, and the suite was green with that in it), and a batched prefill of
 the conv layers leaves the logits and the state a token-by-token run leaves, which is what the test binary compares.
+
+With `lfm3` it is an LFM3-shaped hybrid (engine#1786): conv, full attention, conv, sliding attention (window 2),
+written under the UPSTREAM Liquid names (conv.*, operator_norm, ffn_norm, feed_forward.w1/w2/w3, post_operator_norm,
+post_ffn_norm, embedding_norm) as FastFlowLM's LFM3-1.7B-NPU2 pack keeps them, with `layer_types` naming "conv",
+the zero-tail partial RoPE on the full layer, the sandwich norms, and a bf16 per-head output gate
+(self_attn.gate_proj [heads, hidden]). What it pins: model_load's renaming, the forward accepting "conv" in
+layer_types, and the batched prefill running the gate and the sandwich exactly as the token-by-token path does.
 
 With `qwen3_5` it is a qwen3_5 hybrid (engine#1889): a linear-attention (GDN) layer, then a full-attention layer with
 q/k norms, written under `language_model.*` so the packer takes its qwen3_5 path (renames, the conv1d transpose,
@@ -77,9 +84,10 @@ def write_safetensors(path, arrays):
 def make_model(d, np, family="qwen3"):
     rng = np.random.default_rng(1946)
     lfm2 = family == "lfm2"
+    lfm3 = family == "lfm3"
     q35 = family == "qwen3_5"
-    layers = 3 if lfm2 else LAYERS
-    conv_layers = (0, 2) if lfm2 else ()
+    layers = 3 if lfm2 else (4 if lfm3 else LAYERS)
+    conv_layers = (0, 2) if (lfm2 or lfm3) else ()
     gdn_layers = (0,) if q35 else ()
     # a qwen3_5 pack nests its language model under language_model.* and ties the head to the embedding
     top = "language_model." if q35 else "model."
@@ -93,7 +101,8 @@ def make_model(d, np, family="qwen3"):
     def norm(n):
         return (1.0 + 0.1 * rng.standard_normal(n)).astype(np.float32)
 
-    weights = {top + "embed_tokens.weight": w(VOCAB, H, sc=0.5), top + "norm.weight": norm(H)}
+    weights = {top + "embed_tokens.weight": w(VOCAB, H, sc=0.5),
+               top + ("embedding_norm.weight" if lfm3 else "norm.weight"): norm(H)}
     if not q35:
         weights["lm_head.weight"] = w(VOCAB, H, sc=0.2)
     for layer in range(layers):
@@ -112,6 +121,24 @@ def make_model(d, np, family="qwen3"):
                 p + "linear_attn.A_log": w(NVH, sc=0.3), p + "linear_attn.dt_bias": w(NVH, sc=0.3),
                 p + "mlp.gate_proj.weight": w(FFN, H), p + "mlp.up_proj.weight": w(FFN, H),
                 p + "mlp.down_proj.weight": w(H, FFN)})
+            continue
+        if lfm3:
+            # the upstream names, which model_load renames; the gate is 2 x 256, not a tile, so it stays bf16
+            weights.update({p + "operator_norm.weight": norm(H), p + "post_operator_norm.weight": norm(H),
+                            p + "ffn_norm.weight": norm(H), p + "post_ffn_norm.weight": norm(H),
+                            p + "feed_forward.w1.weight": w(FFN, H), p + "feed_forward.w3.weight": w(FFN, H),
+                            p + "feed_forward.w2.weight": w(H, FFN)})
+            if layer in conv_layers:
+                weights.update({p + "conv.in_proj.weight": w(3 * H, H), p + "conv.conv.weight": w(H, 3, sc=0.4),
+                                p + "conv.out_proj.weight": w(H, H)})
+            else:
+                weights.update({
+                    p + "self_attn.q_proj.weight": w(HEADS * HEAD_DIM, H),
+                    p + "self_attn.k_proj.weight": w(KV_HEADS * HEAD_DIM, H),
+                    p + "self_attn.v_proj.weight": w(KV_HEADS * HEAD_DIM, H),
+                    p + "self_attn.o_proj.weight": w(H, HEADS * HEAD_DIM),
+                    p + "self_attn.q_norm.weight": norm(HEAD_DIM), p + "self_attn.k_norm.weight": norm(HEAD_DIM),
+                    p + "self_attn.gate_proj.weight": w(HEADS, H, sc=0.3)})
             continue
         if layer in conv_layers:
             # in_proj is H -> 3H ([B | C | X]), the taps are [H][L] and stay bf16 (3 columns are not a tile), out_proj
@@ -148,6 +175,15 @@ def make_model(d, np, family="qwen3"):
         del cfg["rms_norm_eps"]
         cfg.update({"architectures": ["Lfm2ForCausalLM"], "model_type": "lfm2", "num_hidden_layers": layers,
                     "norm_eps": 1e-5, "conv_L_cache": 3, "full_attn_idxs": [1]})
+    if lfm3:
+        del cfg["rms_norm_eps"], cfg["rope_theta"]
+        cfg.update({"architectures": ["Lfm3ForCausalLM"], "model_type": "lfm3", "num_hidden_layers": layers,
+                    "norm_eps": 1e-5, "conv_L_cache": 3, "use_sandwich_norm": True, "sliding_window": 2,
+                    "layer_types": ["conv", "full_attention", "conv", "sliding_attention"],
+                    "rope_parameters": {
+                        "full_attention": {"partial_rotary_factor": 0.5, "rope_theta": 1000000.0,
+                                           "rope_type": "default"},
+                        "sliding_attention": {"rope_theta": 10000, "rope_type": "default"}}})
     with open(os.path.join(d, "config.json"), "w") as f:
         json.dump(cfg, f)
     with open(os.path.join(d, "tokenizer.json"), "w") as f:
@@ -174,7 +210,7 @@ def tmp_root():
 
 
 def main():
-    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "qwen3_5")):
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen3_5")):
         print(__doc__.strip().splitlines()[2])
         return 2
     family = sys.argv[2] if len(sys.argv) == 3 else "qwen3"

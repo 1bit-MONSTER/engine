@@ -1998,6 +1998,37 @@ and against the pack's own embedding (`lm_head`: 0.9963, at most 0.57 of a step 
 the known-answer prompt `Paris` and explains Rayleigh scattering in coherent sentences. Before, it failed at load
 with `chunk 4266 B is not a kind`. No kernel set for its shapes was built or run (the NPU is off).
 
+**LFM3-1.7B-NPU2: the forward reads LFM3 (engine#1786).** LiquidAI's LFM3 is LFM2's hybrid of gated short
+convolutions and attention, plus four rules from its `modeling_lfm3.py`. The forward now runs all four:
+
+- `layer_types` names the conv layers `"conv"`, beside `full_attention` and `sliding_attention`. Each `"conv"` entry
+  has to match a layer whose conv tensors are in the container, and a mismatch either way is refused by name.
+  `"conv"` is an exact match: `conv_attention` is still an unknown kind.
+- `use_sandwich_norm`: a norm on the conv or attention output before the residual add, and one on the MLP output.
+  It is the same pair the Gemma3 path runs (`extra_layer_norms` 2), and here the conv layers take it too.
+- A per-head output gate. Every attention layer has `self_attn.gate_proj` `[heads, hidden]` (bf16 in the pack), and
+  each head's context is multiplied by `sigmoid(gate_proj . x)` before `o_proj`, `x` being the block's normed input.
+- Zero-tail partial RoPE on the full layers. With `partial_rotary_factor` 0.5 the first 32 frequencies follow the
+  progression of the whole 128-channel head and the other 32 are zero, with `rotate_half` pairing across the whole
+  head. That is the rule Gemma4's "proportional" RoPE already had. The vendor GGUF writes the same rule as
+  `rope_freqs` (1 for 32 factors, 1e30 for the rest).
+
+The pack keeps the upstream tensor names (`conv.*`, `operator_norm`, `ffn_norm`, `feed_forward.w1/w2/w3`,
+`post_operator_norm`, `post_ffn_norm`, `embedding_norm`). `model_load` renames them to the canonical ones, and only
+where the canonical name is absent (`model_alias_lfm_names`, `model.h`). `ffn_norm` is the MLP input's norm, so it
+becomes `pre_feedforward_layernorm` in a sandwich layer and `post_attention_layernorm` otherwise.
+
+Checked on the host, 2026-11-12, against a numpy transcription of `modeling_lfm3.py`. Run on the bf16 checkpoint,
+the reference's last-position logits correlate 0.939 with ours. Run on the dequantized weights of the vendor's
+`LFM3-1.7B-QAD-Q4_0` GGUF, which this pack's I8 tensors come from, they correlate 0.9995, with the same top 10.
+The two references differ from each other by the same 0.94, so that gap is the quantization-aware weights, not the
+arithmetic. Each rule matters on this prompt: with the gate off the bf16 reference falls to 0.907 against ours,
+with the usual partial RoPE to 0.822 (and its top token changes), and without the sandwich to 0.134.
+`batch_check_state_test` on the pack: batched equals sequential, rel-L1 0. The known-answer prompt, with thinking
+off (the template's `<think></think>`), gives `Paris</think>Paris<|im_end|>`. The reference makes the same three
+choices: `</think>` after the first `Paris`, then `Paris` again. Asked why the sky is blue, it explains Rayleigh
+scattering in correct sentences (80 tokens, greedy). No kernel set for its shapes was built or run (the NPU is off).
+
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.
 A pack of the same architecture under another name got it wrong in silence. FastFlowLM's MiniCPM-V 4.7

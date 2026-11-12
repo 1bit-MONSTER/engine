@@ -50,6 +50,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -3704,6 +3705,37 @@ void test_import_fp32_params(const std::string& root) {
         const auto already = onebit::npu::q4nx::device_form(form.model, cache);
         check(!already.converted && already.dir == form.dir,
               "device form: a container already in the device form is returned unchanged");
+
+        // engine#2263: the conversion is a WRITER of the cache, so it sweeps it like serve start does. An older entry
+        // (2 GiB, sparse: no real disk) sits in the cache beyond the age window; a new conversion under a 1 GiB bound
+        // removes it, never the entry it just wrote, and with the bound at 0 (no sweep) leaves it alone.
+        {
+            const char* had = std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB");
+            const std::string saved = had ? had : "";
+            const fs::path older = fs::path(cache) / "older-q4nx1-0000000000000000";
+            fs::create_directories(older);
+            { std::ofstream(older / "model.q4nx", std::ios::binary); }
+            fs::resize_file(older / "model.q4nx", uintmax_t(2) << 30);
+            fs::last_write_time(older, fs::file_time_type::clock::now() - std::chrono::hours(2));
+
+            fs::remove_all(form.dir);
+            ::setenv("ONEBIT_Q4NX_CACHE_MAX_GIB", "0", 1);
+            const auto off = onebit::npu::q4nx::device_form(out + "/model.q4nx", cache);
+            check(off.converted && !off.reused && fs::exists(older / "model.q4nx"),
+                  "cache sweep control: with ONEBIT_Q4NX_CACHE_MAX_GIB=0 a new conversion removes nothing");
+
+            fs::remove_all(off.dir);
+            ::setenv("ONEBIT_Q4NX_CACHE_MAX_GIB", "1", 1);
+            const auto on = onebit::npu::q4nx::device_form(out + "/model.q4nx", cache);
+            check(on.converted && !on.reused && fs::exists(on.model),
+                  "cache sweep: the new conversion is written and kept");
+            check(!fs::exists(older),
+                  "cache sweep: a new conversion over a 1 GiB bound removes the older 2 GiB entry (engine#2263)");
+
+            if (had) ::setenv("ONEBIT_Q4NX_CACHE_MAX_GIB", saved.c_str(), 1);
+            else ::unsetenv("ONEBIT_Q4NX_CACHE_MAX_GIB");
+            fs::remove_all(older);
+        }
         std::printf("device form: %lld I8 tensor(s), %lld tile(s) repacked; %d q4_1f trigger(s) on "
                     "the imported container, 0 on the converted one, and the device tiles are the old "
                     "bf16 form's byte for byte\n",

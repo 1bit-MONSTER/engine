@@ -192,11 +192,21 @@ static bool valid_sidecar_dir(const std::string& d) {
 // (Q4NX_CHUNK_Q4W / Q8W), and a Q4W tensor's byte count would otherwise pass for a 4608-byte Q4S grid.
 static int64_t declared_row_bytes(const TensorDesc* d) {
     if (d && d->ndim == 3 && (d->shape[2] == Q4NX_CHUNK_Q4W || d->shape[2] == Q4NX_CHUNK_Q8W)) return d->shape[2];
+    // GPT-OSS's [RB, CB, S, 2560] (Q4NX_CHUNK_D2560): routed by the 4-D shape, read by dequant_desc below.
+    if (d && d->ndim == 4 && d->shape[3] == Q4NX_CHUNK_D2560 && !strcmp(d->dtype, "I8")) return Q4NX_CHUNK_D2560;
     return (d && d->ndim == 2) ? d->shape[1] : 0;
 }
 
-static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out, int64_t decl_row_bytes = 0) {
+static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out, const TensorDesc* desc = nullptr) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
+    const int64_t decl_row_bytes = declared_row_bytes(desc);
+    if (decl_row_bytes == Q4NX_CHUNK_D2560) {
+        // GPT-OSS: [RB, CB, S, 2560]; the container's K (CB*128) may be padded past the model's, and is read into
+        // the forward's width (cols) with the excess written 0.
+        const int RB = (int)desc->shape[0], CB = (int)desc->shape[1], S = (int)desc->shape[2];
+        const int k = std::min(cols, CB * Q4NX_D2560_COLS);
+        return q4nx_dequant_tensor_d2560((const uint8_t*)data, nbytes, RB, CB, S, rows, k, cols, out);
+    }
     if (decl_row_bytes == Q4NX_CHUNK_Q4H) {
         // Quarter tiles on the container's own K (Gemma3-270M: 640), read into the forward's padded width.
         if (rows % Q4NX_Q4H_ROWS) return -1;
@@ -1061,7 +1071,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             }
             if (!embed_tile_ && !embed_i8_) {   // no element-wise read: keep the whole-table buffer (unchanged path)
                 embed_f_.resize((size_t)NV * (size_t)kpad_);
-                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data(), declared_row_bytes(etd)) != 0) {
+                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data(), etd) != 0) {
                     err_ = std::string("embedding dtype ") + dt + " but dequant failed";
                     return false;
                 }
@@ -1693,7 +1703,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 head_f32.assign((size_t)head_rows * (size_t)kpad_, 0.0f);
                 head_out = head_f32.data();
             }
-            if (!lp || dequant_any(lp, (size_t)ltd->data_size, head_rows, kpad_, head_out, declared_row_bytes(ltd)) != 0) {
+            if (!lp || dequant_any(lp, (size_t)ltd->data_size, head_rows, kpad_, head_out, ltd) != 0) {
                 err_ = "lm_head dequant failed";
                 return false;
             }
@@ -2083,7 +2093,7 @@ bool Q4nxNpuForward::load_layer(int l) {
             if (!d) { fprintf(stderr, "  [mla] missing " ); snprintf(nm,sizeof(nm),fmt,l); fprintf(stderr,"%s\n", nm); return false; }
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), declared_row_bytes(d)) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) == 0;
         };
         // A bf16 tensor (norms, router) is stored raw, not in 5120-byte tiles, so
         // it bypasses dequant_any.
@@ -2165,7 +2175,7 @@ bool Q4nxNpuForward::load_layer(int l) {
     auto deq = [&](TensorDesc* d, float* out, int rows, int cols) -> bool {
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw) { err_ = std::string("MLP tensor ") + d->name + " has no data"; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, declared_row_bytes(d)) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, d) != 0) {
             // Name it: the bare "dequant failed" this used to leave cost an afternoon on engine#1097.
             const size_t tiles = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
             char why[256];
@@ -2278,7 +2288,7 @@ bool Q4nxNpuForward::load_layer(int l) {
             if (!d) return false;
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), declared_row_bytes(d)) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) == 0;
         };
         if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
         if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
@@ -2311,7 +2321,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         if (!d) { err_ = std::string("GDN: no tensor ") + nm; return false; }
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw) { err_ = std::string("GDN: no data ") + nm; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, declared_row_bytes(d)) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, d) != 0) {
             char m[64];
             snprintf(m, sizeof(m), " (rows=%d cols=%d bytes=%llu)", rows, cols,
                      (unsigned long long)d->data_size);
@@ -2388,7 +2398,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
     auto deqT = [&](TensorDesc* d, float* out, int rows, int cols) -> bool {
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw || d->data_size == 0) { err_ = std::string("GDN: missing MLP tensor ") + d->name; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, declared_row_bytes(d)) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, d) != 0) {
             err_ = std::string("GDN: MLP dequant ") + d->name;
             return false;
         }
@@ -2434,7 +2444,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
             if (!d) return false;
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), declared_row_bytes(d)) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) == 0;
         };
         if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
         if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }

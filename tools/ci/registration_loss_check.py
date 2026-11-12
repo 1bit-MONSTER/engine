@@ -34,6 +34,9 @@ It parses the registration shapes that make a test exist -- `add_test(NAME X`, `
 `CMakeLists.txt` and `cmake/**/*.cmake` at both revisions, and reports the ones the head does not have. Lost rows exit 1,
 because a row disappearing is either an intended deletion (say so in the commit) or the merge trap.
 
+The companion question is `tools/ci/conflict_triage.py`'s: that one classifies the conflicts by KIND (content, add/add,
+mod/del, rename); this one says what a resolution would LOSE. A `CMakeLists.txt` conflict is where both matter at once.
+
 usage: registration_loss_check.py --check --base REF [--head REF] [--root DIR]
        registration_loss_check.py --self-test
 """

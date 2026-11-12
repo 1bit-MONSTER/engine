@@ -311,6 +311,16 @@ every day outlives a one-off imported yesterday. The value is read as a whole nu
 number too large to be a byte count is the largest bound that is one (it does not wrap to a small
 one), and a value that is not a number gets the default rather than an unbounded cache.
 
+**A box that never serves never sweeps (engine#2263).** Both triggers — the write-time sweep and the manual
+`1bit q4nx-cache evict` — need the binary to run, so a review, CI or build box that holds the cache and never starts a
+serve keeps every entry it ever wrote. Measured on this box: **59 GiB in 12 h** with the command merged and nothing
+invoking it, which put free space 3 GiB under the 175 GiB build gate; one manual 24 h age cut took it to 24 GiB and it
+regrew. `scripts/install-q4nx-cache-timer.sh` installs the invoker as a `systemd --user` timer — hourly,
+`--max-gib 40 --min-age 86400`, opt-in, nothing outside `~/.config/systemd/user` — and refuses to install against a
+binary that predates the command (`1bit q4nx-cache` printing *unknown command*), because a timer naming a command the
+binary lacks fails hourly and silently. `--dry-run` prints the units and verifies them without changing anything;
+`--uninstall` removes them and leaves the cache alone.
+
 **The packed lm-head is cached beside it (engine#1716).** A model whose head runs as int8 tiles
 packs those tiles on the host — gather `kpad × T` weights per tile, quantise each column to int8
 with its own scale — and until this cache that happened on every serve. The image is a function

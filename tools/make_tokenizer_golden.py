@@ -43,6 +43,16 @@ CORPUS = [
     "a" * 300,
 ]
 
+USAGE = "usage: tools/make_tokenizer_golden.py <tokenizer.json> <out.json> [label]"
+if "-h" in sys.argv[1:2] or "--help" in sys.argv[1:2]:
+    # The script indexes argv directly, so --help used to arrive as tok_path and fail with
+    # IndexError (no args) or an open() on a file named "--help".
+    print(USAGE)
+    sys.exit(0)
+if len(sys.argv) < 3:
+    print(USAGE, file=sys.stderr)
+    sys.exit(2)
+
 tok_path, out = sys.argv[1], sys.argv[2]
 label = sys.argv[3] if len(sys.argv) > 3 else tok_path
 tok = tokenizers.Tokenizer.from_file(tok_path)

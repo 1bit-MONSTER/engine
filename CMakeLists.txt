@@ -2029,6 +2029,8 @@ endif()
     # same sources against the runtime stub (engine#1946) cannot drift from this one.
     onebit_npu_forward_library(onebit_npu_forward onebit_npu_rt)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
+    # engine#1781: forward-serve --spec-draft runs a DFlash draft package (npu/dflash_head.h) as its drafter.
+    target_sources(onebit PRIVATE npu/dflash_forward.cpp npu/dflash_draft.cpp)
     # engine#2111: the usage object's pure function, its own TU so tests/serve_usage_test.cpp can link it without
     # dragging in npu/rt.h (see cmake/tests-serve-usage.cmake).
     target_sources(onebit PRIVATE app/serve_usage.cpp)

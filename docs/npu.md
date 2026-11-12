@@ -3439,6 +3439,17 @@ text, `finish_reason` and `completion_tokens` for:
 In host-GEMM mode the verify batch is 16 rows, the device's width. Host GEMMs have no width of their own, and the 1
 the forward reports there would leave no row for a draft. The device route has not been measured with it yet.
 
+**`forward-serve --spec-draft <dir>`** (`--spec-draft-k K`, default the package's block minus one) serves the same path
+with a DFlash draft package as the drafter, in place of the prompt lookup. At load the package is decoded once and
+checked against the target, before `ready`: the widths must match, and its target layers must exist. The forward then
+writes those layers' hidden states into a tap sink on every pass. The sink is emptied when a request takes the engine,
+so its rows start at the request's first position. `DFlashHead` drafts from it, picking with the target's own head:
+DFlash 2's candidate selector when the package has one (`dflash2_select`, `npu/dflash_head.h`), else the bounded argmax.
+A request that resumed from a saved prefix has no rows for the positions it skipped, so its head refuses to draft and
+it decodes with plain steps: the same text, just no speedup. The same test serves a generation-1 package it writes
+(`tests/dflash_draft_test.cpp`'s synthetic layout, sized to the fabricated target). On it every greedy request of two
+or more tokens drafts, and every reply equals the plain server's.
+
 **What would change the answer**: a cheaper verify batch (the array wait is ~60 % of a batched pass — a kernel
 lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
 6 measured 0 %).

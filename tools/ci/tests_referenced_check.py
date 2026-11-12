@@ -124,7 +124,7 @@ def referenced(root, need):
 
 
 SELFTEST = re.compile(r"--self[-_]?test\b")
-RUNNERS = ("CMakeLists.txt", "cmake", ".github/workflows")
+RUNNERS = ("CMakeLists.txt", "cmake", ".github/workflows", "tests")
 
 
 def unregistered_selftest_tools(root):

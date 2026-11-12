@@ -60,7 +60,7 @@ def is_cli(path):
 
 
 def tree_state(root, cwd):
-    """A digest of the tree a tool could write into.
+    """A digest of the tree a tool could write into, and the untracked paths inside it.
 
     `git status` when the cwd is inside a work tree -- a tool writes relative to the cwd, not to the
     directory it lives in, so scanning `root` alone misses the exact defect this is for: the two
@@ -74,22 +74,44 @@ def tree_state(root, cwd):
         r = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=all'],
                            cwd=str(cwd), capture_output=True, text=True, timeout=30)
         if r.returncode == 0:
-            return 'git:' + hashlib.sha256(r.stdout.encode()).hexdigest()[:16]
+            untracked = {line[3:] for line in r.stdout.splitlines() if line.startswith('?? ')}
+            return 'git:' + hashlib.sha256(r.stdout.encode()).hexdigest()[:16], untracked
     except (OSError, subprocess.TimeoutExpired):
         pass
     h = hashlib.sha256()
     scan = pathlib.Path(cwd)
+    paths = set()
     for f in sorted(scan.rglob('*')):
         rel = str(f.relative_to(scan))
         if '.git' in rel.split('/'):
             continue
+        paths.add(rel)
         h.update(rel.encode())
         if f.is_file():
             try:
                 h.update(str(f.stat().st_size).encode())
             except OSError:
                 h.update(b'?')
-    return 'tree:' + h.hexdigest()[:16]
+    return 'tree:' + h.hexdigest()[:16], paths
+
+
+def remove_created(cwd, created):
+    """Delete what a misbehaving tool wrote, deepest first, and only inside the tree it was run in.
+
+    A checker that reports "this tool writes a file while answering --help" and then leaves that file in the
+    developer's tree is only half a check: the next `git status` blames them, and a second run reports the same
+    tool against a tree that is now dirty for a reason nobody chose.
+    """
+    scan = pathlib.Path(cwd)
+    for rel in sorted(created, key=lambda r: r.count('/'), reverse=True):
+        p = scan / rel
+        try:
+            if p.is_file() or p.is_symlink():
+                p.unlink()
+            elif p.is_dir():
+                p.rmdir()          # only succeeds when the tool's own contents are gone/empty
+        except OSError:
+            pass
 
 
 def tools_under(root):
@@ -152,10 +174,11 @@ def check(root):
     for f in tools_under(root):
         rel = f.relative_to(root)
         n += 1
-        before = tree_state(root, pathlib.Path.cwd())
+        before, before_paths = tree_state(root, pathlib.Path.cwd())
         state, detail = crashes(f, root)
-        after = tree_state(root, pathlib.Path.cwd())
+        after, after_paths = tree_state(root, pathlib.Path.cwd())
         if before != after:
+            remove_created(pathlib.Path.cwd(), after_paths - before_paths)
             # A tool that writes while answering `--help` is a defect whether or not it also printed
             # something: the file it wrote is named after an argument, and nothing will clean it up.
             bad.append((rel, f'wrote into the tree while answering --help '
@@ -238,10 +261,17 @@ def self_test():
         (root / 'writer.py').write_text(
             "import sys, pathlib\nif __name__ == '__main__':\n"
             "    pathlib.Path(sys.argv[1]).write_text('x')\n")
-        before = tree_state(root, root)
+        before, before_paths = tree_state(root, root)
         crashes(root / 'writer.py', root, cwd=root)
-        chk(False, before == tree_state(root, root),
+        after, after_paths = tree_state(root, root)
+        chk(False, before == after,
             'a tool that writes its argument while answering --help changes the tree digest')
+        # And the check undoes the write: the file the tool created is gone, and so is its digest change.
+        remove_created(root, after_paths - before_paths)
+        chk(False, (root / '--help').exists(),
+            'the file such a tool wrote is removed, so the tree is left as it was found')
+        chk(True, before == tree_state(root, root)[0],
+            'after the removal the tree digest is the one from before the run')
 
         chk('skip', crashes(root / 'dep.py', root)[0], 'a missing dependency is not asked, not a defect')
 

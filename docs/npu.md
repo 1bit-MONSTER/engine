@@ -3421,6 +3421,24 @@ fewer than `fallback_below` tokens on average, the run finishes with plain steps
 round). `tools/dflash2_probe loop` with `DFLASH2_MTP_RUN=1` drives the served 27B through exactly these pieces, with
 `DFlashHead` and the DFlash 2 selector as its pick hook, after the same batched prefill as its hand-written loop.
 
+**Serving it: `forward-serve --spec-lookup K`** (off by default; `--spec-fallback X` adds the fallback). A request that
+is greedy, has no grammar, and asks for no logprobs (and a server without `--dump-logits`) decodes through
+`mtp::run_from()` with the prompt-lookup drafter (`npu/mtp/prompt_lookup.h`). That drafter needs no model: it proposes
+the up to `K` tokens that followed the latest earlier occurrence of the stream's last one to three tokens. Every
+other request takes the plain loop. The rule is that speculation is used only where it cannot change a token: each
+token is still the tokenizer-bounded argmax, and both loops hand every token to the same code for end tokens, stop
+sequences and the stop hold-back. The reply's last token is not run through the model (`Options::consume_last =
+false`), as in the plain loop. The server logs one `[spec]` line per request (rounds, drafts accepted, plain steps).
+`tests/serve_spec_lookup_test.py` (ctest `serve_spec_lookup`, on a build with `ONEBIT_NPU`) holds it to that end to
+end. It fabricates a container, serves it host-GEMM twice (plain, then with `--spec-lookup 4`), and requires the same
+text, `finish_reason` and `completion_tokens` for:
+- every budget;
+- stop sequences cut from the plain replies, so they do end them;
+- a seeded sampled request, which must stay on the plain loop.
+
+In host-GEMM mode the verify batch is 16 rows, the device's width. Host GEMMs have no width of their own, and the 1
+the forward reports there would leave no row for a draft. The device route has not been measured with it yet.
+
 **What would change the answer**: a cheaper verify batch (the array wait is ~60 % of a batched pass — a kernel
 lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
 6 measured 0 %).

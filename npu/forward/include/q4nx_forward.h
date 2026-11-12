@@ -492,7 +492,10 @@ private:
     int deepstack_lo_ = -1, deepstack_hi_ = -1;
     // Which plane a rotary frequency belongs to under interleaved MRoPE.  The rule lives in q4nx_semantics.h as
     // q4nx_mrope_axis() so the C unit test can pin it without building a forward pass.
-    int mrope_plane(int freq) const { return q4nx_mrope_axis(freq, sem_.n_mrope_section, sem_.mrope_section); }
+    int mrope_plane(int freq) const {
+        return sem_.mrope_sectioned ? q4nx_mrope_axis_sectioned(freq, sem_.n_mrope_section, sem_.mrope_section)
+                                    : q4nx_mrope_axis(freq, sem_.n_mrope_section, sem_.mrope_section);
+    }
     // Some models store the embedding QUANTIZED (Gemma4-E2B/E4B: dtype I8), and
     // reading it as bf16 yields ~zero - which invalidated the whole forward and
     // the tied LM head (all-zero logits).  When the dtype is not BF16 the
@@ -647,6 +650,7 @@ private:
     // Layout and maths: docs/qwen35-4b-weight-format.md.
     int lin_kd_ = 0, lin_vd_ = 0;        // key_dim = nkh*khd, value_dim = nvh*vhd
     int attn_gate_ = 0;                   // qwen3_5 attn_output_gate
+    bool mrope_declared_ = false;         // rope_scaling type "mrope" (Qwen2-VL form), validated after semantics
     // LFM3's per-head output gate, [NH][H] per attention layer (empty for conv layers and other models):
     // ctx of head h *= sigmoid(head_gate_[l][h] . xn), xn the operator-normed layer input.
     std::vector<std::vector<float>> head_gate_;

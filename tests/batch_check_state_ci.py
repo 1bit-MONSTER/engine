@@ -15,7 +15,7 @@
 # limitations under the License.
 """The batch-check state pin (tests/batch_check_state_test.cpp, engine#1905/#1946) on a container made here.
 
-usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|lfm3|qwen3_5]   (needs numpy)
+usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|lfm3|qwen2|qwen2vl|qwen3_5] (needs numpy)
 
 batch_check_state_test needs a Q4NX container, and CI has none, so on its own it skips (77) there and a regression of
 #1909 -- the NPU_BATCH_CHECK oracle resetting the prefix it replays from -- lands green. This writes a two-layer qwen3
@@ -43,6 +43,14 @@ batched == sequential compares the forward with itself, so this arm also runs LF
 transcribed from modeling_lfm3.py) on the container's own weights, untiled, and compares the sequential logits:
 measured at engine#2254, corr 1.0000000 and max |d| 1.2e-05 of 7.63. A dead head gate (in both paths) gives corr 0.90
 and another argmax, the usual partial RoPE 0.98, no sandwich 0.38; every one of them passes batched == sequential.
+
+With `qwen2` it is a two-layer Qwen2 (engine#1786): q/k/v projection biases, no q/k norms, and a config.json with no
+`attention_bias` key, which is how every Qwen2 config is written. With the key absent the forward loaded the biases
+and never added them, so FastFlowLM's Qwen2.5-3B-Instruct-NPU2 answered noise. batched == sequential cannot see that
+(both paths skip the biases alike), so the arm also compares the sequential logits with a numpy Qwen2 forward on the
+container's own weights (qwen2_reference). `qwen2vl` is the same model declaring Qwen2.5-VL's rope_scaling
+{"type": "mrope", "mrope_section": [16, 24, 24]}: the forward refused that at load, and on a text-only prompt (all
+three position planes equal) it has to give exactly the plain-RoPE reference.
 
 With `qwen3_5` it is a qwen3_5 hybrid (engine#1889): a linear-attention (GDN) layer, then a full-attention layer with
 q/k norms, written under `language_model.*` so the packer takes its qwen3_5 path (renames, the conv1d transpose,
@@ -91,6 +99,7 @@ def make_model(d, np, family="qwen3"):
     rng = np.random.default_rng(1946)
     lfm2 = family == "lfm2"
     lfm3 = family == "lfm3"
+    qwen2 = family in ("qwen2", "qwen2vl")
     q35 = family == "qwen3_5"
     layers = 3 if lfm2 else (4 if lfm3 else LAYERS)
     conv_layers = (0, 2) if (lfm2 or lfm3) else ()
@@ -165,6 +174,12 @@ def make_model(d, np, family="qwen3"):
             p + "self_attn.q_norm.weight": norm(HEAD_DIM), p + "self_attn.k_norm.weight": norm(HEAD_DIM),
             p + "mlp.gate_proj.weight": w(FFN, H), p + "mlp.up_proj.weight": w(FFN, H),
             p + "mlp.down_proj.weight": w(H, FFN)})
+        if qwen2:
+            # Qwen2: biases on q/k/v (large enough to matter), no per-head q/k norms
+            del weights[p + "self_attn.q_norm.weight"], weights[p + "self_attn.k_norm.weight"]
+            weights.update({p + "self_attn.q_proj.bias": w(HEADS * HEAD_DIM, sc=0.5),
+                            p + "self_attn.k_proj.bias": w(KV_HEADS * HEAD_DIM, sc=0.5),
+                            p + "self_attn.v_proj.bias": w(KV_HEADS * HEAD_DIM, sc=0.5)})
     os.makedirs(d)
     write_safetensors(os.path.join(d, "model.safetensors"), weights)
     cfg = {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "hidden_size": H,
@@ -181,6 +196,10 @@ def make_model(d, np, family="qwen3"):
         del cfg["rms_norm_eps"]
         cfg.update({"architectures": ["Lfm2ForCausalLM"], "model_type": "lfm2", "num_hidden_layers": layers,
                     "norm_eps": 1e-5, "conv_L_cache": 3, "full_attn_idxs": [1]})
+    if qwen2:
+        cfg.update({"architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2"})   # and no attention_bias key
+        if family == "qwen2vl":
+            cfg["rope_scaling"] = {"type": "mrope", "mrope_section": [16, 24, 24]}   # 64 = HEAD_DIM / 2
     if lfm3:
         del cfg["rms_norm_eps"], cfg["rope_theta"]
         cfg.update({"architectures": ["Lfm3ForCausalLM"], "model_type": "lfm3", "num_hidden_layers": layers,
@@ -276,6 +295,59 @@ def lfm3_reference(q4nx_dir, np, ids, shapes):
     return rms(x, W("model.embedding_norm.weight"))[-1] @ W("lm_head.weight").T
 
 
+def qwen2_reference(q4nx_dir, np, ids, shapes):
+    """HF's Qwen2 forward (llama with q/k/v biases) on the container's own weights; the last position's logits."""
+    sys.path.insert(0, os.path.join(HERE, "..", "tools"))
+    from q4nx_pack import untile
+    with open(os.path.join(q4nx_dir, "config.json")) as f:
+        cfg = json.load(f)
+    with open(os.path.join(q4nx_dir, "model.q4nx"), "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        table = json.loads(f.read(n))
+        blob = f.read()
+
+    def W(name):
+        e = table[name]
+        lo, hi = e["data_offsets"]
+        if e["dtype"] == "BF16":
+            return (np.frombuffer(blob[lo:hi], dtype=np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(e["shape"])
+        if e["dtype"] == "F32":
+            return np.frombuffer(blob[lo:hi], dtype=np.float32).reshape(e["shape"])
+        rows, k = shapes[name]
+        return untile(np.frombuffer(blob[lo:hi], dtype=np.uint8).reshape(-1, 5120), rows, k)
+
+    nh, nkv, hd, eps, T = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"], cfg["rms_norm_eps"], len(ids)
+
+    def rms(x, w):
+        return w * (x / np.sqrt((x.astype(np.float64) ** 2).mean(-1, keepdims=True) + eps)).astype(np.float32)
+
+    def rope(x):
+        inv = 1.0 / cfg["rope_theta"] ** (np.arange(0, hd, 2) / hd)
+        fr = np.arange(T)[:, None] * inv[None, :]
+        c, sn = np.cos(np.concatenate([fr, fr], -1))[:, None], np.sin(np.concatenate([fr, fr], -1))[:, None]
+        x = x.astype(np.float64)
+        return (x * c + np.concatenate([-x[..., hd // 2:], x[..., :hd // 2]], -1) * sn).astype(np.float32)
+
+    x = W("model.embed_tokens.weight")[ids].astype(np.float32)
+    for layer in range(cfg["num_hidden_layers"]):
+        p = f"model.layers.{layer}."
+        xn = rms(x, W(p + "input_layernorm.weight"))
+        q = (xn @ W(p + "self_attn.q_proj.weight").T + W(p + "self_attn.q_proj.bias")).reshape(T, nh, hd)
+        k = (xn @ W(p + "self_attn.k_proj.weight").T + W(p + "self_attn.k_proj.bias")).reshape(T, nkv, hd)
+        v = (xn @ W(p + "self_attn.v_proj.weight").T + W(p + "self_attn.v_proj.bias")).reshape(T, nkv, hd)
+        q, k = rope(q), rope(k)
+        k, v = np.repeat(k, nh // nkv, 1), np.repeat(v, nh // nkv, 1)
+        sc = np.einsum("thd,shd->hts", q, k) / np.sqrt(hd)
+        sc = np.where(np.tril(np.ones((T, T), bool))[None], sc, -np.inf)
+        sc = np.exp(sc - sc.max(-1, keepdims=True))
+        ctx = np.einsum("hts,shd->thd", sc / sc.sum(-1, keepdims=True), v)
+        x = x + ctx.reshape(T, nh * hd) @ W(p + "self_attn.o_proj.weight").T
+        h = rms(x, W(p + "post_attention_layernorm.weight"))
+        a = h @ W(p + "mlp.gate_proj.weight").T
+        x = x + ((a / (1.0 + np.exp(-a))) * (h @ W(p + "mlp.up_proj.weight").T)) @ W(p + "mlp.down_proj.weight").T
+    return rms(x, W("model.norm.weight"))[-1] @ W("lm_head.weight").T
+
+
 def tmp_root():
     """tests/tmp_root.h's rule (engine#2029): scratch goes on disk, not in tmpfs. ONEBIT_TEST_TMP if set, else
     ~/.cache/scratch-tests/tmp, else the system temp directory."""
@@ -294,7 +366,7 @@ def tmp_root():
 
 
 def main():
-    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen3_5")):
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen2", "qwen2vl", "qwen3_5")):
         print(__doc__.strip().splitlines()[2])
         return 2
     family = sys.argv[2] if len(sys.argv) == 3 else "qwen3"
@@ -312,7 +384,7 @@ def main():
             return 1
         env = dict(os.environ, ONEBIT_TEST_Q4NX=out)
         logits_out = os.path.join(tmp, "sequential.f32")
-        if family == "lfm3":
+        if family in ("lfm3", "qwen2", "qwen2vl"):
             env["ONEBIT_TEST_LOGITS_OUT"] = logits_out
         env.pop("NPU_INFER_HOST_GEMM", None)   # init_host is host-GEMM already; nothing else should steer it
         r = subprocess.run([sys.argv[1]], env=env, capture_output=True, text=True, timeout=110)
@@ -325,13 +397,13 @@ def main():
             # arm, not a reason to skip it.
             print("FAIL  batch_check_state_test skipped on the fabricated container (init_host refused it)")
             return 1
-        if family == "lfm3" and r.returncode == 0:
+        if family in ("lfm3", "qwen2", "qwen2vl") and r.returncode == 0:
             ours = np.fromfile(logits_out, dtype=np.float32)[:VOCAB]
-            ref = lfm3_reference(out, np, [1, 2, 3, 4, 5, 6], shapes)
+            ref = (lfm3_reference if family == "lfm3" else qwen2_reference)(out, np, [1, 2, 3, 4, 5, 6], shapes)
             corr = float(np.corrcoef(ours, ref)[0, 1])
             ok = (corr >= LFM3_MIN_CORR and float(np.abs(ours - ref).max()) <= LFM3_MAX_DIFF * float(np.abs(ref).max())
                   and int(np.argmax(ours)) == int(np.argmax(ref)))
-            print(f"{'PASS' if ok else 'FAIL'}  sequential logits vs the modeling_lfm3 reference on the container's "
+            print(f"{'PASS' if ok else 'FAIL'}  sequential logits vs the {family} reference on the container's "
                   f"weights: corr {corr:.7f} (needs {LFM3_MIN_CORR}), max |d| {float(np.abs(ours - ref).max()):.3g} of "
                   f"{float(np.abs(ref).max()):.3g}, argmax {int(np.argmax(ours))} vs "
                   f"{int(np.argmax(ref))}")

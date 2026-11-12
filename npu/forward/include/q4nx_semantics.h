@@ -86,6 +86,10 @@ typedef struct {
     /* Linear biases on q/k/v/o and on the MLP projections.
      * Source: attention_bias / mlp_bias (presence of corresponding tensors). */
     int attention_bias;
+    /* 1 when config.json states attention_bias (true or false); 0 when the key is absent, which is Qwen2's case:
+     * its configs never state it and every layer carries q/k/v biases.  q4nx_semantics_attention_bias_from_tensors
+     * decides the absent case from the container. */
+    int attention_bias_stated;
     int mlp_bias;
     /* Multiplier applied to token embeddings before layer 0.
      * Source: model_type (gemma* uses sqrt(hidden_size)); else 1.0. */
@@ -112,6 +116,11 @@ typedef struct {
      * guess a layout for. */
     int mrope_section[3];
     int n_mrope_section;
+    /* Qwen2-VL / Qwen2.5-VL spell MRoPE as rope_scaling {"type": "mrope", "mrope_section": [16, 24, 24]}, and their
+     * sections are CONTIGUOUS runs of frequencies (transformers apply_multimodal_rotary_pos_emb: cos split by
+     * mrope_section * 2, chunk i taking plane i % 3), not Qwen3-VL's interleave.  1 for that form (mrope is 1 too).
+     * Source: rope_scaling.type / rope_type == "mrope". */
+    int mrope_sectioned;
     /* DEEPSTACK: which decoder layers take one of the vision tower's extra feature sets.  Read from
      * vision_config.deepstack_visual_indexes (Qwen3-VL: [5, 11, 17]); the consumer adds set s to the hidden state at
      * layer deepstack_layers[s].  Empty means the pack has none. */
@@ -252,6 +261,15 @@ static inline int q4nx_mrope_axis(int freq, int n_section, const int* section) {
     return 0;
 }
 
+/* The same question for the CONTIGUOUS layout (mrope_sectioned, Qwen2-VL / Qwen2.5-VL): frequencies
+ * [0, s0) are t, [s0, s0 + s1) are h, and [s0 + s1, s0 + s1 + s2) are w.  For [16, 24, 24]: 16 t, 24 h, 24 w. */
+static inline int q4nx_mrope_axis_sectioned(int freq, int n_section, const int* section) {
+    if (n_section < 3 || !section) return 0;
+    if (freq < section[0]) return 0;
+    if (freq < section[0] + section[1]) return 1;
+    return 2;
+}
+
 /* Human-readable one-line dump of every flag with its source field. */
 void q4nx_semantics_dump(const Q4nxSemantics* s);
 
@@ -278,6 +296,10 @@ int q4nx_rmsnorm_offset_from_norm(const float* w, int n);
  * nothing, when qk_norm is already on, when no layer carries both, or on null/empty input. It never turns the norm
  * off: a family the table knows keeps its answer whatever the tensors are. Exported so the rule is testable. */
 int q4nx_semantics_qk_norm_from_tensors(Q4nxSemantics* s, const unsigned char* has_q, const unsigned char* has_k, int layers);
+/* engine#1786: config.json did not state attention_bias and a layer carries a q, k or v projection bias -> the
+ * biases are applied (attention_bias = 1); returns that layer, else -1.  A config that states attention_bias=false
+ * while the container carries biases is a disagreement the caller refuses: returns -2. */
+int q4nx_semantics_attention_bias_from_tensors(Q4nxSemantics* s, const unsigned char* has_bias, int layers);
 
 /* engine#1889's refusal, as a rule: with q/k norm on, a layer whose q gain is absent would normalise q to zero, so the
  * container is refused. That is a statement about layers with SOFTMAX ATTENTION. A layer of another kind carries no

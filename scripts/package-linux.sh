@@ -29,7 +29,11 @@
 # unpacks it into the Lemonade + onebit package as 1bit/ (docs/releases.md).
 set -euo pipefail
 
-[ $# -ge 3 ] || { sed -n '16,27p' "$0"; exit 2; }
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
+[ $# -ge 3 ] || { usage; exit 2; }
 build=$(cd "$1" && pwd) out=$2 ver=$3
 src=$(cd "$(dirname "$0")/.." && pwd)
 name=1bit-$ver-linux-x86_64

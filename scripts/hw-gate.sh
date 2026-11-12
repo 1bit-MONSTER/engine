@@ -74,12 +74,22 @@
 # the gate.
 set -uo pipefail
 
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
 # -h/--help is answered before anything else, in particular before the GPU queue below: printing the
 # usage takes no hardware and must not claim the fleet's GPU token (measured: `hw-gate --help` queued on
 # ~/GPU-TOKEN and held it for a moment while another pass was running).
 case " $* " in
-  *" -h "*|*" --help "*) sed -n '16,66p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *" -h "*|*" --help "*) usage; exit 0 ;;
 esac
+
+# No arguments at all is a usage error, not a hardware run. With an empty "$*" the case above does not match, so the gate used
+# to walk straight into the GPU queue below: measured 2026-11-12, when an audit that ran every script's usage path took two
+# tickets (`gpu-hold[...] queued 'hw-gate pid ...'`) instead of printing help. It claimed and released within seconds, but a
+# usage path must take no hardware, and this one is now answered before the queue like -h/--help.
+[ $# -gt 0 ] || { usage; exit 2; }
 
 # Fair GPU queue (the protocol is written down in ~/amd-oss/GPU-TOKEN.md on the box): when the gpu-hold helper
 # is installed, the whole gate runs inside one claim on ~/GPU-TOKEN instead of racing for it with a noclobber

@@ -847,7 +847,11 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         char declared[64];
         q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
         const bool linear_ok = !std::strcmp(declared, "linear") && rope_linear_factor_ > 0.0;
-        if (!linear_ok &&
+        // Qwen2.5-VL's "mrope" is a position layout, not a frequency scaling: plain RoPE frequencies, each taking its
+        // position from the t, h or w plane. Accepted here and checked against its sections once the semantics are
+        // read (below), where a malformed block is refused.
+        mrope_declared_ = !std::strcmp(declared, "mrope");
+        if (!linear_ok && !mrope_declared_ &&
             !q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on)) {
             if (!std::strcmp(declared, "llama3"))
                 err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
@@ -1098,6 +1102,38 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             if (by >= 0)
                 fprintf(stderr, "  [semantics] qk_norm=1  <- the container: layer %d carries self_attn.q_norm and k_norm "
                                 "(config.json's model_type is not a family the table knows)\n", by);
+        }
+        // engine#1786: attention_bias the same way. Qwen2's config.json never states it and every layer carries q/k/v
+        // biases; with the key absent they were loaded and never added, so Qwen2.5-3B-Instruct-NPU2 answered noise.
+        if (mw_ && mw_->config.num_layers > 0) {
+            std::vector<unsigned char> has_b(size_t(mw_->config.num_layers), 0);
+            auto present = [](const TensorDesc& t) { return t.name[0] && t.data_size > 0; };
+            for (int l = 0; l < mw_->config.num_layers; l++)
+                has_b[size_t(l)] = present(mw_->layers[l].q_proj_bias) || present(mw_->layers[l].k_proj_bias) ||
+                                   present(mw_->layers[l].v_proj_bias);
+            const int by = q4nx_semantics_attention_bias_from_tensors(&sem_, has_b.data(), mw_->config.num_layers);
+            if (by == -2) {
+                err_ = "config.json says attention_bias is false and model.q4nx carries q/k/v projection biases; "
+                       "serving it either way would be a guess";
+                return false;
+            }
+            if (by >= 0)
+                fprintf(stderr, "  [semantics] attention_bias=1  <- the container: layer %d carries q/k/v projection "
+                                "biases (config.json does not state attention_bias)\n", by);
+        }
+        if (mrope_declared_) {
+            const int s3 = sem_.mrope_section[0] + sem_.mrope_section[1] + sem_.mrope_section[2];
+            const int rot = sem_.rotary_dim > 0 ? sem_.rotary_dim : c_.HD;
+            if (!sem_.mrope_sectioned || sem_.n_mrope_section != 3 || s3 != rot / 2) {
+                err_ = "config.json declares rope scaling \"mrope\" and its mrope_section (" +
+                       std::to_string(sem_.n_mrope_section) + " values, summing to " + std::to_string(s3) +
+                       ") does not cover the " + std::to_string(rot / 2) + " rotary frequencies; the (t, h, w) "
+                       "layout would be a guess";
+                return false;
+            }
+            fprintf(stderr, "  [semantics] mrope: contiguous sections t=%d h=%d w=%d (Qwen2-VL form)  <- "
+                            "rope_scaling.type \"mrope\"\n",
+                    sem_.mrope_section[0], sem_.mrope_section[1], sem_.mrope_section[2]);
         }
         q4nx_semantics_dump(&sem_);
         // A layer kind nothing implements is refused BY NAME, here beside the other precise refusals (engine#1087's

@@ -418,6 +418,11 @@ add_python_test(device_holders ${CMAKE_SOURCE_DIR}/tools/device_holders.py --sel
 # GTT. The script existed with a test that nothing ran; a test nobody runs is a comment, so the loader/flag assertions are registered
 # here (the test fakes the box, so it needs no device and no ticket).
 add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-bench-preflight.sh)
+# engine#572: an arm's memory trace. --drop-gib exists because a floor relative to a reading taken before the arm is
+# fragile -- other lanes move MemAvailable between the two -- while "fell by more than N GiB during this arm" is the
+# contamination itself. Same reason the test uses --drop-gib rather than a floor.
+add_test(NAME bench_arm_watch COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-bench-arm-watch.sh
+                                           ${CMAKE_SOURCE_DIR}/tools/bench-arm.sh)
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.

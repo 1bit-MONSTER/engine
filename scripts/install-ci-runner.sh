@@ -62,9 +62,12 @@
 #   --verify               only report the installed unit's state
 set -euo pipefail
 
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
 name=strixhalo-engine labels=pr-agent user=ghrunner groups=docker memory_max=48G
 token_file='' runner_dir='' runner_version='' env_file='' hold_state=/var/lib/1bit-fleet hold_group=fleethold owner_user=bcloud no_hold=0 migrate=0 dry=0 verify=0
-usage() { sed -n '16,48p' "$0"; }
 
 while [ $# -gt 0 ]; do
     case $1 in

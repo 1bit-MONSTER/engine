@@ -26,6 +26,10 @@
 #   there were no conflicts, which is the difference between "nothing conflicted" and "nobody looked".
 set -uo pipefail
 
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
 run="" step="" log="" attempt=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -33,7 +37,7 @@ while [ $# -gt 0 ]; do
         --step)    step=${2:?--step needs a name}; shift 2 ;;
         --log)     log=${2:?--log needs a path or -}; shift 2 ;;
         --attempt) attempt=${2:?--attempt needs a number}; shift 2 ;;
-        -h|--help) sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
         *) echo "bump-hrx-report: unknown argument: $1" >&2; exit 2 ;;
     esac
 done

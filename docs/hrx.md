@@ -379,10 +379,37 @@ backend built from each commit, 2026-11-11): perplexity on wikitext-2 (`-c 512 -
 9.6681; `llama-bench -p 512 -n 32 -r 3`, alternated, prefill 1,437.1 and 1,532.6 tok/s against 1,616.9 and 1,605.7,
 decode 78.7 and 79.0 against 78.6 and 79.8. At `2b7960bae`: `test-hrx-ops` 256 of 256, `hrx-backend-test` host 69 of 69.
 
-Still open under #2127, not measured: the fused body publishes the gated product in half precision
-unscaled, and the other kernels that read the 8-bit blocks use the stored sum as it is. And the limits
-are moved, not removed: 4.19e6 for the half-precision copies and the draft-head logits, 8.3e6 for the
-8-bit blocks.
+The two faults left open under #2127 are fixed in the fork at `780d67524`, which the pin `4107043c1` contains
+([engine#2186](https://github.com/1bit-MONSTER/engine/issues/2186)):
+
+- **The gated product (llama.cpp #317).** The fused routed body published `silu(gate) * up` in half precision
+  unscaled, and the down projection and its reduction read that copy. It is now published at 2^-6 and the readers
+  scale it back by 2^6 after widening, the same pattern as the input above.
+- **The 8-bit blocks' stored sum (llama.cpp #319).** Each 32-value block stores its scale and its scaled sum in
+  half precision. The scale fits up to an activation of 8.3e6, the sum only while the block averages below 2047.
+  The one-token routed gate/up used the stored sum as it was; a sum that is not finite is now rebuilt from the
+  block's codes, and a finite one is used unchanged (the rule the Q5_K reader has had since #1962).
+
+Measured on gfx1151 (2026-11-11), device against a CPU graph on the same weights dequantised to f32, before = the
+same tree without the kernel change:
+
+| case | before | after |
+|---|---|---|
+| routed feed-forward, SwiGLU product up to 2.6e4 (`routed_moe.q4_K.large_product.300`) | 1315 of 2048 non-finite | 0, NMSE 9.8e-5 |
+| same, product up to 2.9e5 (`.1000`) | 2048 of 2048 non-finite | 0, NMSE 1.3e-4 |
+| one-token routed decode, block sum about 9.6e4 (`decode_routed_moe.q4_K.large_activation.3000`) | 2048 of 2048 non-finite | 0, NMSE 1.7e-3 |
+| same, block sum about 9.6e5 (`.30000`) | 2048 of 2048 non-finite | 0, NMSE 1.5e-3 |
+
+The in-range rows are unchanged: `large_product.1`, `.30`, `.100` give NMSE 1.5e-6, 2.3e-4 and 4.4e-4 in both
+arms, and `large_activation.1` and `.1000` the same 6.8e-3 and 4.0e-3 to every digit. Qwen3-Coder-30B-A3B Q4_K_M, perplexity on wikitext-2
+(`-c 512 -b 512`, 8 chunks) 9.6681 before #317 and 9.6654 after, with an identical dispatch plan (13,167 dispatches). `test-hrx-ops` on fork
+`0494dfa28` with #317 and #319 merged: 264 of 265 in two tickets; the one failure was the intermittent
+draft-head logit of [engine#2150](https://github.com/1bit-MONSTER/engine/issues/2150), which a warm repeat of the
+same 108 cases passed 23 of 23 times, as it did on `0494dfa28` alone. Fork `780d67524` also carries llama.cpp #318 (the
+weight-copy trace names the kernels that read each weight) and #314 (a test for #2150).
+
+The limits are moved, not removed: 4.19e6 for the half-precision copies and the draft-head logits, 8.3e6 for the
+8-bit blocks' scale.
 
 ### Fixed: Qwen3-VL on `HRX0`: it decodes again, and its rotation runs on the device ([engine#1467](https://github.com/1bit-MONSTER/engine/issues/1467))
 
@@ -945,8 +972,8 @@ one line per device copy, since pin `2b7960bae`), the extra copies have two caus
 A prompt made only of 512-token batches, a short prompt, or decode alone holds one copy per weight.
 
 `GGML_HRX_Q4K_PACKED_TAIL=1` (llama.cpp #308) makes the generic kernels read Q4_K in the packed layout, and
-`GGML_HRX_Q6K_PACKED_ROWS=1` (llama.cpp #310) makes Q6_K prefill read the packed rows decode reads, at every batch size. Both are
-opt-in; the stored path is the default. Measured on Qwen3-4B Q4_K_M with both on, against both off (one binary, fork `ccf14f9c9`):
+`GGML_HRX_Q6K_PACKED_ROWS=1` (llama.cpp #310) makes Q6_K prefill read the packed rows decode reads, at every batch size. Measured on
+Qwen3-4B Q4_K_M with both on, against both off (one binary, fork `ccf14f9c9`):
 
 | | off | on |
 |---|---:|---:|
@@ -958,9 +985,70 @@ opt-in; the stored path is the default. Measured on Qwen3-4B Q4_K_M with both on
 | `llama-bench -p 1700` | 2,211.7, 1,901.1 tok/s | 2,319.6, 2,307.0 tok/s |
 | `test-backend-ops -o MUL_MAT` on `HRX0` | 641 of 641 | 641 of 641 |
 
-They are not the default yet because that is one model: there is no dense 27B row and no routed-expert row, the 6-to-16-token Q6_K
-kernel reads a third layout that neither switch covers, and the switches only save memory with the file mapping. With
-`GGML_HRX_MODEL_BUFFER_COPY=1` the stored layout is the loader's buffer and costs nothing extra, so they add packed copies there.
+**Since pin `caa2d4dde` the packed layout is the default for a weight in the file mapping** (llama.cpp #313). The switches only save
+memory where the stored layout costs a copy, and that is a property of each weight's buffer. So with neither switch set, a Q4_K or
+Q6_K weight in the file mapping is read in the packed rows, and a weight that was uploaded (`GGML_HRX_MODEL_BUFFER_COPY=1`, a
+host-weight limit, `--no-mmap`) keeps the stored layout, which is already on the device there. The switches now force the choice for
+every weight: `1` packed, `0` stored. Measured at `caa2d4dde`'s change on Qwen3-4B Q4_K_M, default against both switches at `0`,
+counting distinct (weight, layout) copies:
+
+| after | stored (`=0`) | default |
+|---|---:|---:|
+| a 1,700-token prompt and a 16-token reply | 647 copies, 4,400.6 MiB (249 weights in two layouts) | **398 copies, 2,375.9 MiB (none)** |
+| a 100-token prompt | 398 copies, 2,375.9 MiB | 398 copies, 2,375.9 MiB |
+
+Perplexity at a 300-token batch is 19.2890 in both arms. Prefill is not slower: 1,229 against 1,098 tok/s at 300 tokens and 2,040
+against 1,860 at 1,700 (back to back, not interleaved).
+
+**Since pin `0494dfa28` a short prompt and its reply share one copy as well** (llama.cpp #316). The Q6_K kernel for batches of 6 to
+16 tokens read the weight in an i8 layout of its own, so after a 12-token prompt and a reply 35 Q6_K weights were held twice:
+433 device copies, 2,856.2 MiB. For a weight whose layout is the packed rows, that batch size now goes to the tiled kernel, which
+reads the packed rows: 398 copies, 2,375.9 MiB, the model's own size. With that, Qwen3-4B Q4_K_M holds one device copy per weight
+at every prompt shape measured (3, 8, 12, 40, 100 and 1,700 tokens, with and without a reply). It costs prefill speed at those
+sizes: 8.9 % at 8 tokens, 5.3 % at 12 and 6.9 % at 16 (interleaved, quiet box), which is 2 to 3 ms on a short prompt. Perplexity
+at a 12-token batch is 59.0414 before and 59.0417 after. An uploaded weight keeps the i8 kernel.
+
+**Speed against the previous behaviour.** At pin `4107043c1` (clean build, `build_commit 4107043`), the defaults against all
+three switches off (`GGML_HRX_Q4K_PACKED_TAIL=0 GGML_HRX_Q6K_PACKED_ROWS=0 GGML_HRX_PREFILL_FOLLOWS_DECODE=0`, the previous
+behaviour), order default / off / off / default in one ticket, box load 4 to 7:
+
+| tok/s | all three off | defaults |
+|---|---|---|
+| Qwen3.8-27B, `llama-bench -p 1700 -n 48 -r 2`, prefill | 251.1, 311.9 | 321.3, 308.4 |
+| Qwen3.8-27B, the same, decode | 10.66, 7.37 | 9.29 ± 3.24, 10.84 |
+| Qwen3.8-27B, `llama-completion -c 4096 -n 48`, 1,282-word prompt: prompt | 248.6, 296.5 | 263.2, 254.6 |
+| Qwen3.8-27B, the same: decode | 10.54, 6.20 | 10.13, 7.57 |
+| Qwen3-4B Q4_K_M, `llama-bench`, prefill | 1,540.5, 1,725.0 | 1,711.1, 2,299.9 |
+| Qwen3-4B Q4_K_M, `llama-bench`, decode | 43.96, 72.58 | 45.10, 73.31 |
+| Qwen3-4B Q4_K_M, `llama-completion`: prompt | 1,473.2, 1,692.1 | 1,664.9, 2,139.5 |
+| Qwen3-4B Q4_K_M, `llama-completion`: decode | 49.32, 49.62 | 40.41, 49.99 |
+
+The generated text is identical between the arms on each model. The two runs of one arm differ by up to 40 % here (27B decode
+7.4 against 10.7 with the switches off), more than any difference between the arms, so this table shows no regression and does
+not measure a gain. An earlier decode-only window on the 27B (`-p 0 -n 48 -r 3`, eight alternated arms, before #320) was steadier:
+11.21 to 11.91 tok/s with both packed-layout switches at `0` and 11.91 to 11.92 with the default. `llama-bench` runs its prompt
+test before any decode in the process, so its prefill row does not include #320's effect, which needs a stored copy made by
+decode first; the `llama-completion` rows do (they decode a warm-up token first).
+`GGML_HRX_Q4K_PACKED_TAIL=0 GGML_HRX_Q6K_PACKED_ROWS=0 GGML_HRX_PREFILL_FOLLOWS_DECODE=0` restores the previous behaviour.
+
+**A dense mixed-quant 27B shares most of its copies too since pin `4107043c1`** (llama.cpp #320). On Qwen3.8-27B UD-Q4_K_XL the
+one-token decode goes through the kquant kernels, which read the stored (GGUF) layout, while some prefill kernels read the packed
+rows, so after a long prompt 70 weights were held in both layouts (2,486.7 MiB of duplicate). HRX now records each stored copy
+it makes, and prefill keeps the stored layout for a weight that already has one: the Q6_K prefill kernel through its stored form,
+and the 256-aligned Q4_K prefill through the 8-bit-block kernel, which reads Q4_K stored as well. Measured with
+`llama-completion -c 4096 -n 32` and a 1,282-word prompt, `GGML_HRX_PREFILL_FOLLOWS_DECODE=0` against unset:
+
+| Qwen3.8-27B UD-Q4_K_XL | `=0` | default |
+|---|---:|---:|
+| device copies | 920, 18,205.2 MiB | 866, 16,181.4 MiB |
+| weights in two layouts | 70 (2,486.7 MiB duplicate) | 16 (462.9 MiB) |
+
+The generated text is identical, and prefill was not slower in the one interleaved window measured (prompt eval 263.5 and 317.1
+tok/s against 298.7 and 317.1). Qwen3-4B is unchanged (398 copies). What is left on the 27B, 15 Q4_K weights read by a prefill
+kernel that has only a packed form and one Q6_K weight, is tracked in
+[engine#2137](https://github.com/1bit-MONSTER/engine/issues/2137). Making decode step aside instead was measured and does not help:
+the same duplicates, and decode 8.5 % slower. flint UD-Q4_K_XL (routed experts) reads every weight stored and holds one copy per
+weight with or without the default.
 
 `GGML_HRX_Q6K_PACKED_PREFILL=1`, the older switch, never saved a copy: its dispatch bound the stored layout. Off its kernel's wide
 tile (tokens not a multiple of 256, or outputs not a multiple of 128) it also read past the weight: a Q6_K matmul at 128 tokens with
@@ -1106,6 +1194,17 @@ load per arm).
 **3. A fallback is invisible in the dispatch histogram.** `GGML_HRX_LOG_DISPATCH=1` lists the registrations that **ran**; an op that never dispatched on
 the device leaves **no line at all**. Measured: two arms differing only in one tensor type's format had a **near-identical** registration set (one extra
 line, none missing) while `pp512` differed **5.4x** and `pp8` **8.1x**. So the histogram answers *"which kernel won"*, never *"did something fall back"*.
+
+**The flag gates logging, not arithmetic (engine#2143), so set it in both arms of any A/B.** The two pages that also teach
+this flag carry the same paragraph; this is the copy a reader here needs:
+
+> **Set it in both arms of an A/B, and record box load beside any rate (engine#2143).** #2143 asked whether this
+> flag changes behaviour: one 18,782-token request failed without it and completed with it, and one 18.6k prefill
+> measured 271.75 t/s unset against 118.86 t/s set. At the engine's pin the flag only gates `fprintf` calls
+> (`dispatch_log_match()` and `dispatch_log_requested_output()` in `dispatch-registry.cpp`): the readback check and
+> its decline run in both arms, so the dispatches selected are the same either way. Each of those measurements is
+> one run per arm, #1536 then failed in 4 of 6 runs, and box load moves a rate by about 2x here, so neither shows
+> a flag effect. Setting it in both arms is right whichever way #2143 settles.
 
 Use the right instrument for each question — three are needed and the histogram is only the first:
 

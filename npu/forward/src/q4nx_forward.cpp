@@ -24,6 +24,8 @@
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
 #include "q4nx_forward.h"
+#include "weight_keys.h"     // the per-layer weight-cache keys, held distinct at compile time
+#include "layer_taps.h"      // engine#1780: where a tapped layer's rows go in the sink
 #include "pad_head_rows.h"   // engine#1990: the padded-head row rule, header-only for its arm
 #include "batch_width.h"
 #include "ffn_cache_policy.h"
@@ -3613,6 +3615,37 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     op_line(sc, cur_layer_, M, out, N);
 }
 
+bool Q4nxNpuForward::set_layer_taps(const std::vector<int>& layers, std::vector<float>* sink) {
+    if (layers.empty() || !sink) {
+        tap_layers_.clear();
+        tap_sink_ = nullptr;
+        return true;
+    }
+    if (!onebit::npu::layer_taps_usable(layers.data(), int(layers.size()), c_.NL)) return false;
+    tap_layers_ = layers;
+    tap_sink_ = sink;
+    tap_base_ = sink->size();
+    return true;
+}
+
+// One tapped layer of one pass: M rows of H, written into the pass's rows of the sink at this layer's column block.
+void Q4nxNpuForward::tap_layer(int layer, const float* X, int M) {
+    const int T = int(tap_layers_.size());
+    const int j = onebit::npu::layer_tap_index(tap_layers_.data(), T, layer);
+    if (j < 0 || !tap_sink_ || M <= 0) return;
+    const size_t H = size_t(c_.H);
+    if (j == 0) {   // the first listed layer opens the pass's rows
+        tap_base_ = tap_sink_->size();
+        tap_sink_->resize(tap_base_ + size_t(M) * size_t(T) * H);
+    }
+    if (tap_sink_->size() != tap_base_ + size_t(M) * size_t(T) * H) {   // not the rows this pass opened with
+        tap_fault_ = true;
+        return;
+    }
+    for (int m = 0; m < M; m++)
+        onebit::npu::layer_tap_put(tap_sink_->data() + tap_base_, m, j, T, int(H), X + size_t(m) * H);
+}
+
 // The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
 // then the f32 signs those offsets index (the GGUF's prism.hadamard.sign_widths/sign_values).
 // The plain-text overload. It is declared in q4nx_forward.h and used by npu/forward/embeds_equiv_probe.cpp, but only the
@@ -3713,8 +3746,28 @@ bool Q4nxNpuForward::step_batch_all(const std::vector<int>& tokens, int start_po
     return ok;
 }
 
-bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
-                                std::vector<float>& logits) {
+// engine#1780: a pass that fails must not leave rows in the tap sink. The bodies below return false from many
+// places, so the rule is applied once, here, around each of them.
+bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos, std::vector<float>& logits) {
+    onebit::npu::LayerTapPass pass(tap_sink_);
+    tap_fault_ = false;
+    const bool ok = step_batch_impl(tokens, start_pos, logits);
+    if (tap_fault_ && tap_sink_)
+        std::fprintf(stderr, "  [taps] a batched pass at position %d changed its row count between tapped layers; "
+                             "its rows are dropped\n", start_pos);
+    pass.keep = ok && !tap_fault_;
+    return ok;
+}
+
+bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int cache_pos) {
+    onebit::npu::LayerTapPass pass(tap_sink_);
+    const bool ok = step_impl(token, pos, logits, cache_pos);
+    pass.keep = ok;
+    return ok;
+}
+
+bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_pos,
+                                     std::vector<float>& logits) {
     if (!ready_) { err_ = "not initialised"; return false; }
     // A noncausal pack reads the whole prompt at once, so a chunk that starts above 0 was already
     // encoded causally by an earlier call and cannot be repaired here.  Named, not silently causal.
@@ -3881,6 +3934,9 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
 
     std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row;
     for (int l = 0; l < c_.NL; l++) {
+        // engine#1780: the stream as this layer receives it is the previous layer's output. Taken here and not at
+        // the end of the body, because the body leaves through more than one `continue`.
+        if (l > 0 && tap_sink_) tap_layer(l - 1, X.data(), M);
         cur_layer_ = l;   // the layer index the per-layer helpers read
         const bool cached = weight_cached(0);
         const int lt0 = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
@@ -4278,6 +4334,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // residual here produced garbage logits (the M=1 self-check caught it).
     std::vector<float> fnorm(H);
     bool ok = true;
+    if (tap_sink_) tap_layer(c_.NL - 1, X.data(), M);
     last_residual_.assign(X.begin() + (size_t)(M - 1) * H, X.end());
     if (batch_all_out_) {
         // step_batch_all(): the verifier needs the model's own choice at every drafted position, so every
@@ -5014,7 +5071,7 @@ bool Q4nxNpuForward::mlp(const float* gu, float* h, int im) {
 // --------------------------------------------------------------------------
 // step
 // --------------------------------------------------------------------------
-bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int cache_pos) {
+bool Q4nxNpuForward::step_impl(int token, int pos, std::vector<float>& logits, int cache_pos) {
     if (!ready_) { err_ = "not initialised"; return false; }
     // Generation is causal by construction (one position at a time, keys only in the past), so a pack
     // whose full-attention layers read the whole prompt cannot be run this way.  Refused by name
@@ -5071,12 +5128,21 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
     if (ph) { g_ph.embed = ph_ms(tp_step); tp_lap = std::chrono::steady_clock::now(); }
 
     for (int l = 0; l < c_.NL; l++) {
+        if (l > 0 && tap_sink_) tap_layer(l - 1, x.data(), 1);   // engine#1780, as in the batched body
         cur_layer_ = l;
         // Dense models: once this layer's projections are packed (after the
         // first token), the f32 weights are no longer read, so skip the per-token
-        // Q4NX dequant.  GDN/MLA/PLE load members used outside the GEMMs, so they
+        // Q4NX dequant.  GDN/MLA load members used outside the GEMMs, so they
         // keep loading every token.
-        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_dim_ == 0 && n_expert_ == 0 && weight_cached(0);
+        // A per-layer-embedding (Gemma4) model is dense in this sense too: its gate and projection are read once at
+        // init and are GEMM weights like the rest, so once THEIR images are packed as well nothing here reads the
+        // layer's f32 weights. It used to be excluded, and every token dequantised all 42 layers again: 3.5 s per
+        // token on an E4B with the device idle most of that time.
+        // NPU_PLE_RELOAD=1 keeps the per-token reload, for an A/B.
+        static const bool ple_reload = getenv("NPU_PLE_RELOAD") != nullptr;
+        const bool ple_cached = ple_dim_ == 0 || (!ple_reload && weight_cached(onebit::npu::kWkeyPleGate) &&
+                                                  weight_cached(onebit::npu::kWkeyPleProj));
+        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_cached && n_expert_ == 0 && weight_cached(0);
         {
             LhScope _tlh(LH_LOAD);
         if (!dense_weights_cached && !load_layer(l)) { if (err_.empty()) err_ = "dequant failed"; return false; }
@@ -5363,8 +5429,10 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
                 const Q4nxDesignGeom* g = &designs_[i_pg];
                 Q4nxProjections p{};
                 p.ple = inp_gate_[l].data();
-                if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble plegate"; return false; }
-                npu_gemm(i_pg, x.data(), g->K, g->N, B_.data(), pg, 0, nullptr, g->real_k);
+                // The layer's own weight-cache keys (weight_keys.h): 0 and 1 are this layer's QKV and O, and a gate
+                // launched under key 0 ran with the QKV image on the device -- the host arms have no such cache.
+                if (!weight_cached(onebit::npu::kWkeyPleGate) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble plegate"; return false; }
+                npu_gemm(i_pg, x.data(), g->K, g->N, B_.data(), pg, onebit::npu::kWkeyPleGate, "ple_gate", g->real_k);
             }
             const int gelu = (sem_.mlp_act == Q4NX_ACT_GELU);
             for (int i = 0; i < ple_dim_; i++) {
@@ -5382,8 +5450,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
                 const Q4nxDesignGeom* g = &designs_[i_pp];
                 Q4nxProjections p{};
                 p.ple = ple_proj_[l].data();
-                if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble pleproj"; return false; }
-                npu_gemm(i_pp, pg.data(), g->K, g->N, B_.data(), pp, 1, nullptr, g->real_k);
+                if (!weight_cached(onebit::npu::kWkeyPleProj) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble pleproj"; return false; }
+                npu_gemm(i_pp, pg.data(), g->K, g->N, B_.data(), pp, onebit::npu::kWkeyPleProj, "ple_proj", g->real_k);
             }
             rmsnorm(pp.data(), post_ln_[l].data(), H, xn.data());
             for (int k = 0; k < H; k++) x[k] += xn[k];
@@ -5395,6 +5463,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
     }
     if (ph) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
 
+    if (tap_sink_) tap_layer(c_.NL - 1, x.data(), 1);
     last_residual_ = x;                        // one norm earlier, for a drafter that wants the residual
     rmsnorm(x.data(), final_norm_.data(), H, xn.data());
     last_hidden_ = xn;  // for last_hidden(): the post-final-norm state of this position
@@ -6021,11 +6090,13 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     // NPU_HEAD_HOST=alt is the measuring form: calls alternate host, device, host, ... in ONE serve, and each
     // call logs the previous one's head time and the time from its end to this call (the layers of the token in
     // between). Two serves on a shared box differ by more than the head costs; adjacent tokens of one serve do not.
+    // On unless NPU_HEAD_HOST=0: measured on two models with byte-identical logits (docs/npu.md), and the window11
+    // row comparison accepts its `HEAD M=1` profile row. Any value other than 0 or alt reads as on.
     static const int head_host_mode = [] {
         const char* e = getenv("NPU_HEAD_HOST");
-        if (!e) return 0;
-        if (e[0] == '1' && e[1] == 0) return 1;
-        return std::strcmp(e, "alt") == 0 ? 2 : 0;
+        if (!e) return 1;
+        if (e[0] == '0' && e[1] == 0) return 0;
+        return std::strcmp(e, "alt") == 0 ? 2 : 1;
     }();
     static long head_calls = 0;
     const bool head_host = head_host_mode == 1 || (head_host_mode == 2 && (head_calls % 2) == 0);
@@ -6093,14 +6164,14 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             static bool said = false;
             if (!said) {
                 said = true;
-                fprintf(stderr, "  [forward] lm head: on the host (NPU_HEAD_HOST=%s), %d tile(s), %d thread(s), first pass %.1f ms\n",
-                        head_host_mode == 2 ? "alt" : "1", ntiles, nthreads, ms);
+                fprintf(stderr, "  [forward] lm head: on the host (%s), %d tile(s), %d thread(s), first pass %.1f ms\n",
+                        head_host_mode == 2 ? "NPU_HEAD_HOST=alt" : "default; NPU_HEAD_HOST=0 for the device", ntiles, nthreads, ms);
             }
             if (xd_->profiling()) xd_->note_head(1, ms, 0.0, 0.0, 0.0);
             if (ph) { g_ph.h_pack += ms; g_ph.h_total = ph_ms(hp0); g_in_head = false; }
             return true;
         }
-        fprintf(stderr, "  [forward] lm head: NPU_HEAD_HOST is set but the image cannot be read on the host; using the device\n");
+        fprintf(stderr, "  [forward] lm head: the image cannot be read on the host; using the device\n");
     }
     for (int t = 0; t < ntiles; t++) {
         const int n0 = t * T, n1 = std::min(NV, n0 + T);

@@ -5079,6 +5079,84 @@ void test_container_plan(const std::string& root) {
     }
 }
 
+// engine#1786 (item F1), slice 3a: roles from names alone. The cases are the three the census measured -- a transformer
+// pack that classifies completely, the alternate spellings that must classify the same way, and the two residues (SSM
+// and MTP) which must be RECOGNISED rather than reported as unknown, since `unassigned` is only useful if it means
+// "nothing knows this".
+void test_container_roles() {
+    const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
+    const auto roles = [&](std::initializer_list<const char*> names) {
+        std::vector<pi::Q4nxTensor> v;
+        for (const char* n : names) v.push_back(t(n));
+        return pi::container_roles(v);
+    };
+
+    // 1. a transformer pack, HF spelling
+    {
+        const auto r = roles({"model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.weight",
+                              "model.layers.0.self_attn.k_proj.weight", "model.layers.0.self_attn.v_proj.weight",
+                              "model.layers.0.self_attn.o_proj.weight", "model.layers.0.mlp.gate_proj.weight",
+                              "model.layers.0.mlp.up_proj.weight", "model.layers.0.mlp.down_proj.weight",
+                              "model.layers.0.input_layernorm.weight", "model.layers.0.post_attention_layernorm.weight",
+                              "model.norm.weight", "lm_head.weight"});
+        check(r.unassigned.empty(), "roles: a transformer pack classifies completely");
+        check(r.counts.at("q_proj") == 1 && r.counts.at("down_proj") == 1, "roles: projections are named by role");
+        check(r.role_of.at("model.norm.weight") == "final_norm", "roles: the top-level norm is not a layer norm");
+        check(r.role_of.at("model.layers.0.input_layernorm.weight") == "input_norm",
+              "roles: a layer norm is the input norm, not the final one");
+    }
+    // 1b. engine#2097 review: the two cases the table got wrong, pinned so the order cannot regress.
+    // `attn_q` / `attn_k` are prefixes of `attn_q_norm` / `attn_k_norm`, so with the projection rules first both
+    // norm needles were dead and a per-head q/k norm was filed as a projection.
+    {
+        const auto r = roles({"blk.0.attn_q_norm.weight", "blk.0.attn_k_norm.weight",
+                              "blk.0.attn_q.weight", "blk.0.attn_k.weight"});
+        check(r.role_of.at("blk.0.attn_q_norm.weight") == "q_norm", "roles: attn_q_norm is a norm, not q_proj");
+        check(r.role_of.at("blk.0.attn_k_norm.weight") == "k_norm", "roles: attn_k_norm is a norm, not k_proj");
+        check(r.role_of.at("blk.0.attn_q.weight") == "q_proj" && r.role_of.at("blk.0.attn_k.weight") == "k_proj",
+              "roles: the un-suffixed spellings are still projections");
+    }
+    // 1c. `in_proj` is not unique to attention: LFM2's short-convolution input projection was counted as qkv_proj.
+    {
+        const auto r = roles({"model.layers.0.shortconv.in_proj.weight", "model.layers.0.attn.in_proj.weight"});
+        check(r.role_of.at("model.layers.0.shortconv.in_proj.weight") == "shortconv_in_proj",
+              "roles: shortconv.in_proj is the short-conv projection, not the attention qkv");
+        check(r.role_of.at("model.layers.0.attn.in_proj.weight") == "qkv_proj",
+              "roles: an attention in_proj is still the fused qkv");
+    }
+    // 2. the alternate spellings must land on the same roles
+    {
+        const auto r = roles({"model.layers.0.self_attn.attn_q.weight", "model.layers.0.self_attn.wq.weight",
+                              "model.layers.0.mlp.ffn_gate.weight", "model.layers.0.mlp.ffn_down.weight"});
+        check(r.unassigned.empty(), "roles: alternate spellings classify");
+        check(r.role_of.at("model.layers.0.self_attn.attn_q.weight") == "q_proj", "roles: attn_q is q_proj");
+        check(r.role_of.at("model.layers.0.self_attn.wq.weight") == "q_proj", "roles: wq is q_proj");
+        check(r.role_of.at("model.layers.0.mlp.ffn_gate.weight") == "gate_proj", "roles: ffn_gate is gate_proj");
+    }
+    // 3. a bias belongs to its projection's role, and a qkv projection is not a q projection
+    {
+        const auto r = roles({"model.layers.0.self_attn.q_proj.bias", "model.layers.0.self_attn.qkv_proj.weight"});
+        check(r.role_of.at("model.layers.0.self_attn.q_proj.bias") == "q_proj", "roles: a bias keeps its projection's role");
+        check(r.role_of.at("model.layers.0.self_attn.qkv_proj.weight") == "qkv_proj",
+              "roles: qkv_proj is not classified as q_proj");
+    }
+    // 4. the two measured residues are recognised, not unknown
+    {
+        const auto r = roles({"model.layers.0.linear_attn.ssm_alpha_proj.weight",
+                              "model.layers.0.linear_attn.ssm_conv1d.weight", "model.mtp.fc.weight",
+                              "model.mtp.pre_fc_norm_hidden.weight"});
+        check(r.unassigned.empty(), "roles: the SSM and MTP families are recognised, not unassigned");
+        check(r.counts.at("ssm") == 2 && r.counts.at("mtp") == 2, "roles: each residue is counted under its own family");
+    }
+    // 5. something nothing knows is named, not guessed
+    {
+        const auto r = roles({"model.layers.0.mystery_block.weight"});
+        check(r.unassigned.size() == 1, "roles: an unknown tensor is listed");
+        check(r.unassigned[0] == "model.layers.0.mystery_block.weight", "roles: it is named, not summarised");
+        check(r.counts.empty(), "roles: and no role is invented for it");
+    }
+}
+
 // engine#1786 (item F1): an NPU2 model source is a safetensors container, and this is the reader that decides whether
 // a pack is that genre. The failure that matters is the silent one -- a wrong header length yields an empty inventory,
 // which reads as "a pack with no tensors" rather than "a malformed header" -- so each arm asserts the reason, not just
@@ -5742,6 +5820,77 @@ void test_qk_gain_offsets() {
     check(n4.k_norm == 0 && n4.q_norm == 0, "qk gains: the byte count alone is not enough, head_dim has to agree");
 }
 
+// engine#1889, the pack whose q_proj is wider than hidden (Hunyuan-0.5B-Instruct: hidden 1024, q_out 2048). Its
+// one-header attention section is [64 q/k/v tiles at K=1024][640 B][16 o_proj tiles at K=2048]; the reader placed
+// o_proj and left the gains unnamed, so the pack was refused as "gains are not where the block layout says". The
+// numbers are the pack's own: payload 3,691,136 B from attn_off 2,112, tiles of 39,168 and 73,984 B, and the gains'
+// bytes found in the .fconst from the graph's initializers at 2,508,928 (q) and 2,509,248 (k) in every block.
+void test_wide_q_attn_section() {
+    const pi::WideQAttnSection s = pi::wide_q_attn_section(2112, 3691136, 64, 39168, 16, 73984, 128);
+    check(s.ok && s.gap == 640, "wide-q section: Hunyuan-0.5B's remainder is the 640 B gap");
+    check(s.o_off == 2112 + 64 * 39168 + 640, "wide-q section: o_proj starts after the gap");
+    check(s.q_norm == 2508928, "wide-q section: q_norm is named, where the graph's bytes are (engine#1889)");
+    check(s.k_norm == 2509248, "wide-q section: k_norm is named, 320 B after q_norm");
+    check(pi::qk_norm_refusal(true, s.k_norm != 0).empty(),
+          "wide-q section: a pack declaring use_qk_norm is therefore not refused for unlocated gains");
+    // a pack of the same shape with no gap (no per-head norms): read, and no gain is invented
+    const pi::WideQAttnSection z = pi::wide_q_attn_section(2112, 3691136 - 640, 64, 39168, 16, 73984, 128);
+    check(z.ok && z.gap == 0 && z.q_norm == 0 && z.k_norm == 0 && z.o_off == 2112 + 64 * 39168,
+          "wide-q section: no gap is read as no gains, o_proj directly after q/k/v");
+    // a norms-sized gap that is not the gains' shape: the section is read, the gains stay unnamed (so a pack that
+    // declares them is still refused rather than handed tile bytes)
+    const pi::WideQAttnSection odd = pi::wide_q_attn_section(2112, 3691136 - 128, 64, 39168, 16, 73984, 128);
+    check(odd.ok && odd.gap == 512 && odd.q_norm == 0 && odd.k_norm == 0,
+          "wide-q section: a 512 B gap is not the [header][gain] pair and names nothing");
+    check(!pi::qk_norm_refusal(true, odd.k_norm != 0).empty(), "wide-q section: and such a pack is still refused");
+    // not this layout at all: a tile too many, or a payload shorter than the tiles
+    check(!pi::wide_q_attn_section(2112, 3691136 + 39168, 64, 39168, 16, 73984, 128).ok,
+          "wide-q section: a remainder of a whole tile is not a norms gap");
+    check(!pi::wide_q_attn_section(2112, 3691136 - 641, 64, 39168, 16, 73984, 128).ok,
+          "wide-q section: a payload shorter than the tiles is refused");
+    check(!pi::wide_q_attn_section(2112, 0, 64, 39168, 16, 73984, 128).ok, "wide-q section: an empty payload is refused");
+    // the same layout with one more [header][gain] section (the gains displaced by 320 B): not a norms gap, so the
+    // caller falls through to the refusals it had before
+    check(!pi::wide_q_attn_section(2112, 3691136 + 320, 64, 39168, 16, 73984, 128).ok,
+          "wide-q section: a 960 B remainder is not this layout");
+    // the offsets are arithmetic on the arguments, not this pack's constants: another head_dim and tile count
+    const pi::WideQAttnSection h64 = pi::wide_q_attn_section(1000, 10 * 500 + 384 + 4 * 900, 10, 500, 4, 900, 64);
+    check(h64.ok && h64.gap == 384 && h64.q_norm == 1000 + 5000 + 64 && h64.k_norm == h64.q_norm + 128 + 64 &&
+              h64.o_off == 1000 + 5000 + 384,
+          "wide-q section: at head_dim 64 the gap is 384 B and every offset follows the arguments");
+}
+
+// Review of engine#2063: the gap's offsets are one number for every layer, so the import checks each layer's bytes to be
+// the [64 B zeros][gain][64 B zeros][gain] pair before writing a gain, and refuses the layer otherwise.
+void test_qk_gap_block_why() {
+    std::vector<uint8_t> gap(640, 0);
+    auto put = [&](size_t off, uint16_t v) { gap[off] = uint8_t(v & 0xFF); gap[off + 1] = uint8_t(v >> 8); };
+    for (int i = 0; i < 128; ++i) {
+        put(64 + 2 * size_t(i), 0x3F80);        // q_norm = 1.0
+        put(384 + 2 * size_t(i), 0x3FC0);       // k_norm = 1.5
+    }
+    check(pi::qk_gap_block_why(gap.data(), 128).empty(), "qk gap: two zero headers and two finite gains are the pair");
+    // the windows displaced by one section (320 B): q's window is then k's header + gain start, as a reader that
+    // placed the gains one section late would see it
+    std::vector<uint8_t> shifted(640, 0);
+    std::copy(gap.begin() + 320, gap.end(), shifted.begin());   // [hdr][k] then zeros where k should be
+    const std::string a = pi::qk_gap_block_why(shifted.data(), 128);
+    check(!a.empty() && a.find("k_norm is all zero") != std::string::npos,
+          "qk gap: a gain displaced by 320 B is refused, naming the gain that is not there");
+    std::vector<uint8_t> hdr = gap;
+    hdr[320 + 7] = 1;
+    const std::string b = pi::qk_gap_block_why(hdr.data(), 128);
+    check(b.find("before k_norm are not zero") != std::string::npos && b.find("byte 7") != std::string::npos,
+          "qk gap: a non-zero header byte is refused with its index");
+    std::vector<uint8_t> inf = gap;
+    inf[64 + 2 * 5] = 0x80; inf[64 + 2 * 5 + 1] = 0x7F;       // +inf in element 5 of q_norm
+    const std::string c = pi::qk_gap_block_why(inf.data(), 128);
+    check(c.find("q_norm element 5 is not finite") != std::string::npos, "qk gap: a non-finite gain is refused by element");
+    std::vector<uint8_t> tile(640);
+    for (size_t i = 0; i < tile.size(); ++i) tile[i] = uint8_t(17 * i + 3);   // tile-like bytes where the gap should be
+    check(!pi::qk_gap_block_why(tile.data(), 128).empty(), "qk gap: tile bytes are not the pair");
+}
+
 /* engine#1985: a REGRESSION, not a new bug -- `Qwen3-1.7B` imported with 0 gaps on yesterday's main and refused with 280
  * on today's, because #1838's early return trusted an epsilon-anchor vote that had recorded ONE in-block header on a block
  * that has three. The tell in the report is `qk_norm: true -> false`: a pack that declares per-head q/k gains keeps them in
@@ -5778,6 +5927,30 @@ void test_attn_first_tiles() {
     check(small.k == 0 && small.q == 2 && small.v == 16, "attn order: the Qwen2.5-0.5B run (2/14/2) is unchanged");
     pi::Plan p;
     check(!p.attn_q_first, "attn order: a plan is k,q,v unless the block measured otherwise");
+
+    // Review of engine#2063: the line that makes the wide-q container right is the tile ORDER, and nothing guarded it.
+    // Hunyuan-0.5B's own section (hidden 1024, q_out 2048: 32 q, 16 k and 16 v tiles of 64 rows), with its gains in the gap.
+    const pi::WideQAttnSection wq = pi::wide_q_attn_section(2112, 3691136, 64, 39168, 16, 73984, 128);
+    pi::Plan w;
+    check(pi::apply_wide_q_section(w, wq, 16, 32, 2048, 1024), "wide-q plan: Hunyuan-0.5B's section is taken");
+    check(w.attn_q_first, "wide-q plan: a wide-q block with its gains in the gap is q,k,v (engine#1889, review of #2063)");
+    const pi::AttnFirstTiles wt = pi::attn_first_tiles(int(16), int(32), w.attn_q_first);
+    check(wt.q == 0 && wt.k == 32 && wt.v == 48,
+          "wide-q plan: q at tile 0, k at 32, v at 48 -- the rows the checkpoint matches (q 0-31, k 32-47, v 48-63)");
+    check(w.attn_tiles == 64 && w.o_k == 2048 && w.o_off == wq.o_off && w.qnorm_off == 2508928 && w.knorm_off == 2509248,
+          "wide-q plan: 64 q/k/v tiles, o_proj at K=q_out after the gap, both gains named");
+    // the same shape without gains in the gap: the section is still read, the order is not claimed
+    const pi::WideQAttnSection wz = pi::wide_q_attn_section(2112, 3691136 - 640, 64, 39168, 16, 73984, 128);
+    pi::Plan z;
+    check(pi::apply_wide_q_section(z, wz, 16, 32, 2048, 1024) && !z.attn_q_first && z.knorm_off == 0,
+          "wide-q plan: no gains in the gap, so no q,k,v claim (k,q,v stays the default)");
+    // q no wider than hidden is not this branch: the plan is left as it was
+    pi::Plan n;
+    check(!pi::apply_wide_q_section(n, wq, 16, 32, 1024, 1024) && !n.attn_q_first && n.attn_tiles == 0,
+          "wide-q plan: q_out == hidden is not the wide-q branch, and the plan is untouched");
+    pi::Plan bad;
+    check(!pi::apply_wide_q_section(bad, pi::WideQAttnSection{}, 16, 32, 2048, 1024) && !bad.attn_q_first,
+          "wide-q plan: a section that was not read is not applied");
 }
 
 // engine#1503: the tied-head rule as ONE predicate -- correlated AND not mis-scaled. Two packs on this box correlate
@@ -5908,6 +6081,8 @@ int main(int argc, char** argv) {
     test_qk_norm_refusal();
     test_head_stored_rows();
     test_qk_gain_offsets();
+    test_wide_q_attn_section();
+    test_qk_gap_block_why();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -5947,6 +6122,7 @@ int main(int argc, char** argv) {
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
+        test_container_roles();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);

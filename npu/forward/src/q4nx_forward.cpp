@@ -234,6 +234,26 @@ Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
     return d;
 }
 
+// rope_type "linear": the factor of the config's rope_scaling block when that block declares "linear" with a factor
+// above zero, else 0 (no scaling; a "linear" block without a usable factor is still refused by the caller).
+static double read_rope_linear(const std::string& cfg_path) {
+    std::ifstream f(cfg_path);
+    if (!f) return 0.0;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    char type[64];
+    q4nx_rope_declared_type(t.c_str(), type, (int)sizeof type);
+    if (std::strcmp(type, "linear")) return 0.0;
+    const size_t rs = t.find("\"rope_scaling\"");
+    const size_t at = rs == std::string::npos ? rs : t.find("\"factor\"", rs);
+    // the key must sit inside the block: before the first closing brace after it (the block holds no objects)
+    if (at == std::string::npos || at > t.find('}', rs)) return 0.0;
+    const size_t colon = t.find(':', at);
+    if (colon == std::string::npos) return 0.0;
+    char* end = nullptr;
+    const double v = std::strtod(t.c_str() + colon + 1, &end);
+    return (end != t.c_str() + colon + 1 && v > 0.0) ? v : 0.0;
+}
+
 static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
     Q4nxRopeLlama3 s{};
     std::ifstream f(cfg_path);
@@ -803,6 +823,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
     rope_dynamic_ = read_rope_dynamic(cfg_path);     // rope_type "dynamic" (NTK by base, engine#1740 W2)
+    rope_linear_factor_ = read_rope_linear(cfg_path); // rope_type "linear" (Gemma3's full layers, engine#1786)
     {
         // A declared scaling this forward does not apply is refused BY NAME (engine#1087): serving it
         // would run plain rope, stay fluent and be wrong past the original window, with nothing in the
@@ -811,15 +832,17 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         char declared[64];
         q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
-        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on)) {
+        const bool linear_ok = !std::strcmp(declared, "linear") && rope_linear_factor_ > 0.0;
+        if (!linear_ok &&
+            !q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on)) {
             if (!std::strcmp(declared, "llama3"))
                 err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
                        "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
                        "scaling cannot be applied; serving it would run plain RoPE";
             else
                 err_ = std::string("config.json declares rope scaling \"") + declared +
-                       "\", which this forward does not implement (only llama3 and longrope short_factor "
-                       "are), so it would be served plain RoPE and reply wrongly past the model's "
+                       "\", which this forward does not implement (only llama3, linear with a factor and "
+                       "longrope short_factor are), so it would be served plain RoPE and reply wrongly past the model's "
                        "original window (engine#1048, #1087)";
             return false;
         }
@@ -1866,8 +1889,12 @@ bool Q4nxNpuForward::load_norms() {
                         pre_ff_norm_[l].data(), H)) return false;
                 if (!rd("model.layers.%d.post_feedforward_layernorm.weight",
                         post_ff_norm_[l].data(), H)) return false;
-                if (!rd("model.layers.%d.post_layernorm.weight", post_ln_[l].data(), H)) return false;
-                if (!rd("model.layers.%d.layer_output_scale.weight", &layer_scale_[l], 1)) return false;
+                // Gemma3 (extra_layer_norms 2) has the two feedforward norms only: no post-PLE norm and no
+                // layer scalar, so post_ln_ stays unused (ple_dim_ is 0) and layer_scale_ stays 1.
+                if (sem_.extra_layer_norms == 1) {
+                    if (!rd("model.layers.%d.post_layernorm.weight", post_ln_[l].data(), H)) return false;
+                    if (!rd("model.layers.%d.layer_output_scale.weight", &layer_scale_[l], 1)) return false;
+                }
             }
             if (ple_dim_ > 0) {
                 inp_gate_[l].assign((size_t)ple_dim_ * (size_t)H, 0.0f);
@@ -4232,7 +4259,9 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                 }
                 {
                     LhScope _t_attn(LH_ATTN);
-                    const float scale = sem_.attn_scaling_one ? 1.0f : 1.0f / std::sqrt((float)l_hd);
+                    const float scale = sem_.attn_scaling_one ? 1.0f
+                                        : 1.0f / std::sqrt(sem_.query_pre_attn_scalar > 0 ? sem_.query_pre_attn_scalar
+                                                                                         : (float)l_hd);
                     const int nt = ((long)M * (start_pos + M) * l_hd >= 8192) ? omp_heads_threads() : 1;
                     q4nx_attn::rows_context(qall.data(), kcache_[l].data(), vcache_[l].data(), M, c_.NH, l_nkv,
                                             l_hd, Tm.data(), t0m.data(), scale, CTX.data(), nt);
@@ -5081,6 +5110,10 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
                 // llama3 (Llama-3.1/3.2/3.3): the wavelength-band rule, on the FREQUENCY, so it costs
                 // nothing per token.  No-op unless the config declares rope_type "llama3".
                 inv = q4nx_rope_llama3_inv_freq(inv, &rope_llama3_);
+                // rope_type "linear": positions divided by the factor, i.e. the frequency is.  Gemma3 applies its
+                // block to the full layers only; its sliding layers have their own base (rope_local_base_freq) and
+                // no scaling.  A model without that split scales every layer, as HF does.
+                if (rope_linear_factor_ > 0.0 && (window == 0 || !sem_.rope_local_base)) inv /= rope_linear_factor_;
             }
             // Interleaved MRoPE: each rotary frequency rotates by its own axis's position (t, h or w). With the
             // three planes equal this is exactly `pos * inv`, which is why text-only prompts are bit-identical
@@ -5121,7 +5154,9 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     const int T = kv_len > 0 ? kv_len : pos + 1;
     // Gemma4 sets attention scaling to 1.0 (q/k carry an RMSNorm); everyone else
     // uses the usual 1/sqrt(head_dim).
-    const float scale = sem_.attn_scaling_one ? 1.0f : 1.0f / std::sqrt((float)HD);
+    // Gemma2/3 scale by query_pre_attn_scalar, which equals head_dim on most of the family but not all (Gemma3-27B).
+    const float scale = sem_.attn_scaling_one ? 1.0f
+                        : 1.0f / std::sqrt(sem_.query_pre_attn_scalar > 0 ? sem_.query_pre_attn_scalar : (float)HD);
     // Sliding-window attention: ignore positions older than the window.
     const int t0 = (window > 0 && T > window)
                        ? T - window : 0;

@@ -66,6 +66,13 @@ int main() {
         SpecFallback never(0.0, 3);
         check(!never.record(1) && !never.record(1) && !never.record(1), "below <= 0 turns the rule off");
     }
+    {
+        // The rule is "average BELOW the bar", strictly: a window that averages exactly the bar keeps speculating.
+        // 2, 2, 2 against 2.0 is exact in double arithmetic, so this pins the < against a <= without a rounding margin.
+        SpecFallback f(2.0, 3);
+        check(!f.record(2) && !f.record(2) && !f.record(2) && !f.off(), "2, 2, 2 against 2.0: exactly at the bar, stays on");
+        check(f.record(1), "then 2, 2, 1 (average 1.67): under the bar, falls back");
+    }
     if (g_fail) { std::printf("spec_greedy: %d of %d checks FAILED\n", g_fail, g_n); return 1; }
     std::printf("spec_greedy: ok (%d checks)\n", g_n);
     return 0;

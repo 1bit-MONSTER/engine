@@ -68,8 +68,9 @@ def offenders(text: str):
 # engine#1979: a registration file is INCLUDED from a CMakeLists, so whether its `${Python3_EXECUTABLE}` is bound depends on
 # where the `include()` sits, not on anything inside the file -- recursing into the `.cmake` file would check the wrong
 # thing. The rule for those is the include's position: an `include(<f>.cmake)` that pulls in `${Python3_EXECUTABLE}` or
-# `add_python_test(` must come after the first `find_package(Python3`.
-INCLUDE = re.compile(r"^\s*include\(\s*([^)\s]+)\s*\)", re.MULTILINE)
+# `add_python_test(` must come after the first `find_package(Python3`. The argument is the first word, so the
+# CMake-legal trailing keywords (`OPTIONAL`, `NO_POLICY_SCOPE`, `RESULT_VARIABLE <v>`) do not hide an include.
+INCLUDE = re.compile(r"^\s*include\(\s*([^)\s]+)[^)]*\)", re.MULTILINE)
 
 
 def include_offenders(root: pathlib.Path, cmake: pathlib.Path, text: str):
@@ -172,6 +173,10 @@ def self_test() -> int:
         (find + "# " + inc, [], "a commented-out include is not an include"),
         (inc, [1], "with no find_package the include is unbound"),
         (find + "include(${_registration_file})\n", [], "an include of a variable is outside the rule"),
+        ("include(cmake/reg.cmake OPTIONAL)\n" + find, [1], "an OPTIONAL include before the find_package is still an offender"),
+        ("include(cmake/reg.cmake RESULT_VARIABLE _r NO_POLICY_SCOPE)\n" + find, [1],
+         "an include with RESULT_VARIABLE and NO_POLICY_SCOPE before the find_package is still an offender"),
+        (find + "include(cmake/reg.cmake OPTIONAL)\n", [], "an OPTIONAL include after the find_package is not"),
     ]
     for text, want, why in inc_cases:
         got = include_offenders(inc_root, inc_root / "CMakeLists.txt", text)

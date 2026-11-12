@@ -714,6 +714,70 @@ An **M≥256 t2s family** is what removes the 8x launch overhead; it is private-
 family passes, and the acceptance row is: both Llama3-8B prefill shapes (`K=4096 N=14336`, `K=14336 N=4096`) at M = 256 / 1024 / 16384, ≥ 4 TFLOP/s,
 byte-exact logits against the current path on a fixed prompt set, `amdxdna` counter 0.
 
+#### A pack with both families: a 17-row chunk no longer pays for 128 rows (#1959)
+
+An imported int8 pack (the `b8` layout) carries a 16-row twin **and** a 128-row prefill design for each projection, and
+`max_batch_rows()` is 128 there. A chunk of up to 16 rows runs the twin; anything wider ran the wide design, which walks
+all 128 of its baked rows whatever the chunk holds. So one more prompt token cost 5.9 s: on
+`Qwen2.5-7B-Instruct_rai_1.9.0_npu`, a 16-row pass is 1073 ms and a 17-row pass was 6992 ms.
+
+`npu_gemm_rows()` now decides per projection, from the launch costs this process has measured, whether a chunk of
+17..128 rows runs as one wide launch or is walked at the twin's width (`npu/forward/include/batch_split.h`): it splits
+when `ceil(M/16) x narrow cost` is at least a tenth below the wide cost, and keeps the wide launch otherwise or while
+either side is unmeasured (the first wide launch of a projection is what measures it). The rule is measured, not a
+constant, because the ratio belongs to the kernel family: here a wide launch costs about six narrow ones, and on a
+family where it costs two the wide launch keeps every chunk above 32 rows.
+
+Same binary, `NPU_PREFILL_SPLIT=0` (the wide launch kept) against the default, fresh serve per arm, one ticket,
+two prompts per length; the pass wall is the serve's own `[bs] M=<rows> start=0` line:
+
+| batched rows | wide launch kept | default (measured split) | launches per pass |
+|---:|---:|---:|---|
+| 16 | 1077 / 1075 ms | 1137 / 1060 ms | 112 / 112 |
+| 17 | 6948 / 6956 ms | **2226 / 1938 ms** | 112 / 220 |
+| 24 | 6973 / 8124 ms | **1968 / 1955 ms** | 112 / 224 |
+| 48 | 7041 / 7084 ms | **3032 / 2892 ms** | 112 / 336 |
+| 96 | 7295 / 7309 ms | **5909 / 5874 ms** | 112 / 392 |
+| 112 | 7323 / 7437 ms | 6885 / 6872 ms | 112 / 328 |
+| 128 | 7421 / 7492 ms | 7430 / 7343 ms | 112 / 308 |
+
+A request of 18 prompt ids and 3 output tokens went from 10.0 s to 5.0-5.3 s. The first 17-row pass of a serve is the
+slower of its pair (2226 ms) because it contains the one wide launch per projection that takes the measurement. The
+launch counts are not multiples of one factor because the decision is per projection: at 112 and 128 rows only the
+projections whose wide launch costs more than eight or nine narrow ones are split.
+
+Nothing in the output moves. Every row of a batched GEMM is computed independently of the others, which is the
+property the block walk for chunks wider than the design already relies on: the greedy text of all 14 requests is
+identical between the two arms, and the per-row bitwise oracle (`NPU_BATCH_CHECK=1` on a 17-id `npu-run`) reports
+`rows M=17 identical=17 differing=0` with the split forced (`NPU_PREFILL_SPLIT=1`) and with it off. A pack with one
+family only (every t2s/pb16i container: `max_batch_rows()` is 16 there) never reaches the rule, and weights that are
+re-packed per launch (routed MoE experts) are never split. The serve says once what it did:
+`[batch] a 17-row chunk runs as 2 launch(es) of 16 rows instead of one 128-row launch: measured ...`.
+
+Two things this rule had wrong until it met a pack with a wide sealed family (#1990), both found on
+`bonsai2-27b-t2s2` with a 32-row set and both fixed here:
+
+- **A walked chunk stepped through its rows by the wrong distance.** The walk advanced the activation pointer by
+  `a_k`, the design's real width. A design that does not pad never sets it, so on such a design `a_k` is 0 and every
+  block after the first read the first block's rows. `NPU_BATCH_CHECK=1 npu-run` on 32 ids with the split forced
+  reported `rows M=32 identical=16 differing=16 first row=16`, twice, and `identical=32` with the split off; the serve
+  generated different text. The int8 pack above pads (`real_k` 3584 under K 4096), which is why its 17-row check
+  passed. The stride is now `row_stride(a_k, K)` (`batch_split.h`): `a_k` only when it is a real, narrower width, the
+  rule the target itself applies. The older block walk for chunks wider than the design had the same line and is
+  fixed with it. After the fix the same run reports `identical=32 differing=0` forced, default and off.
+- **One start-up launch was taken for the wide launch's cost.** The first 32-row launch of a projection measured
+  4.17 ms against 0.51 ms for a 16-row one, so the rule split every 32-row chunk of that projection, on a family whose
+  wide launch is the cheaper one. The wide cost now counts only after three launches were timed
+  (`kSplitWideSamples`, `split_wide_cost()`); until then that side is "not measured" and the wide launch is kept,
+  which is also what collects the samples.
+- **With a wide sealed family the rule stands down.** Even with three samples it split a few 32-row launches:
+  `measured 0.50 ms per 16-row launch against 1.23 ms per 32-row launch (attn_output)`. A narrow launch is mostly
+  timed carrying one row (a decode step), and its host share grows with the rows it carries, so that 0.50 ms is not
+  what a full 16-row launch costs. A pack that names a wide family has already stated which side is cheaper, so the
+  measured rule does not apply to it; `NPU_PREFILL_SPLIT=1` still forces the walk, which is how it is checked. The
+  rule keeps its job on the packs it was written for, where the wide design is the 128-row prefill kernel and the
+  gap is a factor of six.
+
 #### Where a prefill block's time goes now (measured), and why it is no longer the pack (#1416)
 
 #1416 was filed on a `[prof] pre` table whose `pack` column read 24 ms per launch against 1.3 ms of device wait. That

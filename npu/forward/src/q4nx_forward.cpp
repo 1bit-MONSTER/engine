@@ -24,6 +24,7 @@
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
 #include "q4nx_forward.h"
+#include "batch_split.h"          // one wide launch or several narrow ones, decided from measured costs
 #include "weight_keys.h"     // the per-layer weight-cache keys, held distinct at compile time
 #include "layer_taps.h"      // engine#1780: where a tapped layer's rows go in the sink
 #include "pad_head_rows.h"   // engine#1990: the padded-head row rule, header-only for its arm
@@ -3572,6 +3573,11 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     // choke point every batched projection goes through: the same launches in the same order, each within the
     // BO. Each row's result is independent of the others -- the row loops downstream (`row_attn`, the GDN
     // recurrence) never needed the whole prompt in one launch, only the GEMMs did.
+    // A's row stride. `a_k` is the activation's real width when the design pads it up to K, and 0 (or K) when it
+    // does not -- the designs that do not set real_k. So the stride is a_k only when it is a real, narrower width:
+    // the same rule the target applies (xdna_target.cpp: astride). Walking by `a_k` itself made every block after
+    // the first read block 0's rows on a design with real_k == 0 (engine#1959 follow-up, found on a t2s pack).
+    const int astride = onebit::npu::row_stride(a_k, K);
     const int blk = max_batch_rows();
     if (blk > 0 && M > blk) {
         // engine#1582: say the block width out loud, once. A log that reads "0 launches, 93 s host" cannot be told
@@ -3589,7 +3595,7 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
             const int rows = std::min(blk, M - b0);
             std::vector<float> part;
             // A's row stride is the caller's a_k, not the padded K (the same stride trap the host path documents).
-            npu_gemm_rows(role, A + (size_t)b0 * a_k, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
+            npu_gemm_rows(role, A + (size_t)b0 * (size_t)astride, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
             if (part.size() < (size_t)rows * N) {
                 if (err_.empty()) err_ = std::string("npu_gemm_rows: a blocked ") + sc + " launch returned short";
                 return;
@@ -3604,6 +3610,67 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         }
         return;
     }
+    // engine#1959: a chunk wider than the 16-row twin runs the wide (prefill) design, and that design walks all of
+    // its baked rows whatever the chunk holds -- a 17-row chunk pays for 128. Measured on an imported 7B pack: one
+    // 16-row pass 1073 ms, one 17-row pass 6992 ms. So when this projection has both designs and several narrow
+    // launches are measured cheaper than the one wide launch, the chunk is walked at the twin's width instead. Rows are
+    // independent, so the results are the same rows; only the launches differ. Which side wins is a property of the
+    // kernel family, so it is decided from this process's own two launch costs (batch_split.h), and an unmeasured side
+    // keeps the wide launch -- which is also how the wide cost gets measured. Uncached weights (wkey < 0, routed
+    // experts) are never split: each launch re-packs them, and that cost would be multiplied.
+    const bool   in_range = role >= 0 && role < Q4NX_MAX_DESIGNS;
+    const int    narrow = (xd_ && in_range && !decode_twin) ? xd_->rows_for(role, 1) : 0;
+    const int    wide = (xd_ && in_range && narrow > 0) ? xd_->rows_for(role, narrow + 1) : 0;
+    if (split_mode_ == -2) {
+        const char* e = getenv("NPU_PREFILL_SPLIT");
+        split_mode_ = !e ? -1 : (atoi(e) != 0 ? 1 : 0);
+    }
+    if (in_range && wkey >= 0 && split_mode_ != 0 && narrow >= 2 && wide > narrow && M > narrow && M <= wide) {
+        // Forced mode stands in two costs that always split, so the route can be A/B'd and checked bit for bit.
+        const double nms = split_mode_ == 1 ? 1.0 : split_narrow_ms_[role];
+        // A pack that names a wide sealed family (engine#1990) has stated which side is cheaper, from a measurement
+        // made when the set was built; the costs timed here cannot overrule it, because a narrow launch is mostly
+        // timed carrying one row (a decode step) and its host share grows with the rows it carries. Measured on
+        // bonsai2-27b-t2s2: 0.50 ms per 16-row launch against 1.23 ms per 32-row launch looked like a saving and
+        // was not. So with a wide family the rule stands down unless it is forced (which is how the walk is tested).
+        const bool family = xd_ && xd_->wide_rows() > 0;
+        const double wms = split_mode_ == 1 ? 1e9
+                           : family ? 0.0
+                                    : onebit::npu::split_wide_cost(split_wide_ms_[role], split_wide_n_[role]);
+        const int sb = onebit::npu::batch_split_rows(M, narrow, wide, nms, wms);
+        if (sb > 0) {
+            if (!split_said_) {
+                split_said_ = true;
+                if (split_mode_ == 1)
+                    std::fprintf(stderr, "  [batch] a %d-row chunk runs as %d launch(es) of %d rows instead of one %d-row "
+                                         "launch (NPU_PREFILL_SPLIT=1)\n", M, (M + sb - 1) / sb, sb, wide);
+                else
+                    std::fprintf(stderr, "  [batch] a %d-row chunk runs as %d launch(es) of %d rows instead of one %d-row "
+                                         "launch: measured %.2f ms per %d-row launch against %.2f ms per %d-row launch "
+                                         "(%s; NPU_PREFILL_SPLIT=0 keeps the wide launch)\n",
+                                 M, (M + sb - 1) / sb, sb, wide, nms, sb, wms, wide, sc ? sc : "?");
+            }
+            out.assign((size_t)M * N, 0.0f);
+            // NPU_INFER_DUMP_OPS: one projection, one line -- the same rule as the block walk above.
+            onebit::npu::OpsDumpMute ops_mute;
+            for (int b0 = 0; b0 < M && err_.empty(); b0 += sb) {
+                const int rows = std::min(sb, M - b0);
+                std::vector<float> part;
+                npu_gemm_rows(role, A + (size_t)b0 * (size_t)astride, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
+                if (part.size() < (size_t)rows * N) {
+                    if (err_.empty()) err_ = std::string("npu_gemm_rows: a split ") + (sc ? sc : "?") + " launch returned short";
+                    return;
+                }
+                std::copy(part.begin(), part.begin() + (size_t)rows * N, out.begin() + (size_t)b0 * N);
+            }
+            if (err_.empty() && onebit::npu::ops_dump_enabled() && onebit::npu::ops_dump_mute_depth() == 1) {
+                char line[192];
+                if (onebit::npu::ops_dump_line(line, sizeof line, sc, cur_layer_, M, out.data(), N) > 0)
+                    std::fputs(line, stderr);
+            }
+            return;
+        }
+    }
     npu::target::GemvArgs a;
     a.role = role; a.layer = cur_layer_; a.M = M; a.K = K; a.N = N;
     a.x = A; a.Bmat = Bmat; a.wkey = wkey; a.tag = sc;
@@ -3611,7 +3678,23 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     a.rows = true; a.decode_twin = decode_twin;
     a.tiles = &Q4nxNpuForward::gemv_tile_cb; a.tiles_self = this;
     std::string err;
+    // Time the launch only when its weights were already resident: a first touch packs or reads the weight image and
+    // would be recorded as the design's cost.
+    const bool timed = in_range && wkey >= 0 && narrow >= 2 && wide > narrow && weight_cached(wkey);
+    const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!xd_ || !xd_->gemv(a, out, err)) { err_ = err.empty() ? "npu_gemm_rows: no target" : err; return; }
+    if (timed) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (M <= narrow) {
+            // a running mean that follows the box's load: narrow launches happen on every decode step
+            split_narrow_ms_[role] = split_narrow_ms_[role] > 0.0 ? 0.75 * split_narrow_ms_[role] + 0.25 * ms : ms;
+        } else {
+            // the BEST wide launch seen: once a chunk is split the wide design is not launched again, so a wide cost
+            // taken in a noisy moment must not be what keeps it out. Counted, because the first one is a start-up.
+            if (split_wide_n_[role] < 1 << 20) split_wide_n_[role]++;
+            if (!(split_wide_ms_[role] > 0.0) || ms < split_wide_ms_[role]) split_wide_ms_[role] = ms;
+        }
+    }
     op_line(sc, cur_layer_, M, out, N);
 }
 

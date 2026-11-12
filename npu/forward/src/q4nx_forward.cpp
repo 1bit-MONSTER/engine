@@ -186,8 +186,22 @@ static bool valid_sidecar_dir(const std::string& d) {
 // and a 3-D [ntr, ntc, N] tensor both work.  (src/q4nx_dequant.c; the Q4_K/Q8
 // layouts are in docs/qwen35-4b-weight-format.md.)
 
-static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out) {
+// The row width a tensor declares, in bytes: 1280 names the quarter-tile kind (Q4NX_CHUNK_Q4H), which a byte count
+// cannot tell from the 5120-byte tile. 0 for a tensor that is not two-dimensional.
+static int64_t declared_row_bytes(const TensorDesc* d) {
+    return (d && d->ndim == 2) ? d->shape[1] : 0;
+}
+
+static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out, int64_t decl_row_bytes = 0) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
+    if (decl_row_bytes == Q4NX_CHUNK_Q4H) {
+        // Quarter tiles on the container's own K (Gemma3-270M: 640), read into the forward's padded width.
+        if (rows % Q4NX_Q4H_ROWS) return -1;
+        const size_t chunks = nbytes / Q4NX_CHUNK_Q4H, row_tiles = (size_t)(rows / Q4NX_Q4H_ROWS);
+        if (chunks % row_tiles) return -1;
+        return q4nx_dequant_tensor_q4h((const uint8_t*)data, nbytes, rows,
+                                       (int)(chunks / row_tiles) * Q4NX_Q4H_COLS, cols, out);
+    }
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
     const size_t n = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
     if (n == 0) return -1;
@@ -232,6 +246,26 @@ Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
     d.alpha = number("alpha");
     d.on = ((d.factor > 0.0 && d.original_max_position > 0.0) || d.alpha > 0.0) ? 1 : 0;
     return d;
+}
+
+// rope_type "linear": the factor of the config's rope_scaling block when that block declares "linear" with a factor
+// above zero, else 0 (no scaling; a "linear" block without a usable factor is still refused by the caller).
+static double read_rope_linear(const std::string& cfg_path) {
+    std::ifstream f(cfg_path);
+    if (!f) return 0.0;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    char type[64];
+    q4nx_rope_declared_type(t.c_str(), type, (int)sizeof type);
+    if (std::strcmp(type, "linear")) return 0.0;
+    const size_t rs = t.find("\"rope_scaling\"");
+    const size_t at = rs == std::string::npos ? rs : t.find("\"factor\"", rs);
+    // the key must sit inside the block: before the first closing brace after it (the block holds no objects)
+    if (at == std::string::npos || at > t.find('}', rs)) return 0.0;
+    const size_t colon = t.find(':', at);
+    if (colon == std::string::npos) return 0.0;
+    char* end = nullptr;
+    const double v = std::strtod(t.c_str() + colon + 1, &end);
+    return (end != t.c_str() + colon + 1 && v > 0.0) ? v : 0.0;
 }
 
 static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
@@ -803,6 +837,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
     rope_dynamic_ = read_rope_dynamic(cfg_path);     // rope_type "dynamic" (NTK by base, engine#1740 W2)
+    rope_linear_factor_ = read_rope_linear(cfg_path); // rope_type "linear" (Gemma3's full layers, engine#1786)
     {
         // A declared scaling this forward does not apply is refused BY NAME (engine#1087): serving it
         // would run plain rope, stay fluent and be wrong past the original window, with nothing in the
@@ -811,15 +846,17 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         char declared[64];
         q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
-        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on)) {
+        const bool linear_ok = !std::strcmp(declared, "linear") && rope_linear_factor_ > 0.0;
+        if (!linear_ok &&
+            !q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on)) {
             if (!std::strcmp(declared, "llama3"))
                 err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
                        "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
                        "scaling cannot be applied; serving it would run plain RoPE";
             else
                 err_ = std::string("config.json declares rope scaling \"") + declared +
-                       "\", which this forward does not implement (only llama3 and longrope short_factor "
-                       "are), so it would be served plain RoPE and reply wrongly past the model's "
+                       "\", which this forward does not implement (only llama3, linear with a factor and "
+                       "longrope short_factor are), so it would be served plain RoPE and reply wrongly past the model's "
                        "original window (engine#1048, #1087)";
             return false;
         }
@@ -1010,7 +1047,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             }
             if (!embed_tile_ && !embed_i8_) {   // no element-wise read: keep the whole-table buffer (unchanged path)
                 embed_f_.resize((size_t)NV * (size_t)kpad_);
-                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data()) != 0) {
+                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data(), declared_row_bytes(etd)) != 0) {
                     err_ = std::string("embedding dtype ") + dt + " but dequant failed";
                     return false;
                 }
@@ -1597,7 +1634,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 head_f32.assign((size_t)head_rows * (size_t)kpad_, 0.0f);
                 head_out = head_f32.data();
             }
-            if (!lp || dequant_any(lp, (size_t)ltd->data_size, head_rows, kpad_, head_out) != 0) {
+            if (!lp || dequant_any(lp, (size_t)ltd->data_size, head_rows, kpad_, head_out, declared_row_bytes(ltd)) != 0) {
                 err_ = "lm_head dequant failed";
                 return false;
             }
@@ -1866,8 +1903,12 @@ bool Q4nxNpuForward::load_norms() {
                         pre_ff_norm_[l].data(), H)) return false;
                 if (!rd("model.layers.%d.post_feedforward_layernorm.weight",
                         post_ff_norm_[l].data(), H)) return false;
-                if (!rd("model.layers.%d.post_layernorm.weight", post_ln_[l].data(), H)) return false;
-                if (!rd("model.layers.%d.layer_output_scale.weight", &layer_scale_[l], 1)) return false;
+                // Gemma3 (extra_layer_norms 2) has the two feedforward norms only: no post-PLE norm and no
+                // layer scalar, so post_ln_ stays unused (ple_dim_ is 0) and layer_scale_ stays 1.
+                if (sem_.extra_layer_norms == 1) {
+                    if (!rd("model.layers.%d.post_layernorm.weight", post_ln_[l].data(), H)) return false;
+                    if (!rd("model.layers.%d.layer_output_scale.weight", &layer_scale_[l], 1)) return false;
+                }
             }
             if (ple_dim_ > 0) {
                 inp_gate_[l].assign((size_t)ple_dim_ * (size_t)H, 0.0f);
@@ -1950,7 +1991,7 @@ bool Q4nxNpuForward::load_layer(int l) {
             if (!d) { fprintf(stderr, "  [mla] missing " ); snprintf(nm,sizeof(nm),fmt,l); fprintf(stderr,"%s\n", nm); return false; }
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), declared_row_bytes(d)) == 0;
         };
         // A bf16 tensor (norms, router) is stored raw, not in 5120-byte tiles, so
         // it bypasses dequant_any.
@@ -2032,7 +2073,7 @@ bool Q4nxNpuForward::load_layer(int l) {
     auto deq = [&](TensorDesc* d, float* out, int rows, int cols) -> bool {
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw) { err_ = std::string("MLP tensor ") + d->name + " has no data"; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, declared_row_bytes(d)) != 0) {
             // Name it: the bare "dequant failed" this used to leave cost an afternoon on engine#1097.
             const size_t tiles = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
             char why[256];
@@ -2135,7 +2176,7 @@ bool Q4nxNpuForward::load_layer(int l) {
             if (!d) return false;
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), declared_row_bytes(d)) == 0;
         };
         if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
         if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
@@ -2168,7 +2209,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         if (!d) { err_ = std::string("GDN: no tensor ") + nm; return false; }
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw) { err_ = std::string("GDN: no data ") + nm; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, declared_row_bytes(d)) != 0) {
             char m[64];
             snprintf(m, sizeof(m), " (rows=%d cols=%d bytes=%llu)", rows, cols,
                      (unsigned long long)d->data_size);
@@ -2245,7 +2286,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
     auto deqT = [&](TensorDesc* d, float* out, int rows, int cols) -> bool {
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw || d->data_size == 0) { err_ = std::string("GDN: missing MLP tensor ") + d->name; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, declared_row_bytes(d)) != 0) {
             err_ = std::string("GDN: MLP dequant ") + d->name;
             return false;
         }
@@ -2291,7 +2332,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
             if (!d) return false;
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), declared_row_bytes(d)) == 0;
         };
         if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
         if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
@@ -3909,8 +3950,11 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
     // recurrence), so lin_kd_ no longer disqualifies a model, and attn_output_gate
     // is handled in the attention block below. MLA, per-layer embeddings, Gemma4
     // and shared-KV stacks still fall back.
+    // Gemma3 (extra_layer_norms 2) is Gemma4's sandwich without PLE or KV sharing, so the batched body
+    // below runs it with the three extra norms; Gemma4 itself still falls back.
+    const bool sandwich = gemma4_layer_ && ple_dim_ == 0 && sem_.extra_layer_norms == 2;
     const bool simple_dense =
-        !mla_ && ple_dim_ == 0 && !gemma4_layer_ && kv_self;
+        !mla_ && ple_dim_ == 0 && (!gemma4_layer_ || sandwich) && kv_self;
     if (!simple_dense || getenv("NPU_NO_BATCH")) {
         if (inject_embeds_) {
             err_ = "step_batch_embeds: this model's batched body falls back to per-token step(), which needs "
@@ -4232,7 +4276,9 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                 }
                 {
                     LhScope _t_attn(LH_ATTN);
-                    const float scale = sem_.attn_scaling_one ? 1.0f : 1.0f / std::sqrt((float)l_hd);
+                    const float scale = sem_.attn_scaling_one ? 1.0f
+                                        : 1.0f / std::sqrt(sem_.query_pre_attn_scalar > 0 ? sem_.query_pre_attn_scalar
+                                                                                         : (float)l_hd);
                     const int nt = ((long)M * (start_pos + M) * l_hd >= 8192) ? omp_heads_threads() : 1;
                     q4nx_attn::rows_context(qall.data(), kcache_[l].data(), vcache_[l].data(), M, c_.NH, l_nkv,
                                             l_hd, Tm.data(), t0m.data(), scale, CTX.data(), nt);
@@ -4284,14 +4330,23 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
         {
             LhScope _t_res(LH_RES);
             const int nrow = q4nx_pad_n(H);
-            for (int m = 0; m < M; m++)
-                for (int k = 0; k < H; k++)
-                    X[(size_t)m * H + k] += O[(size_t)m * nrow + k] * residual_scale_;
+            if (sandwich) {
+                // as step(): the attention output is normalised (post_attention_layernorm) before the add
+                std::vector<float> on((size_t)H);
+                for (int m = 0; m < M; m++) {
+                    rmsnorm(O.data() + (size_t)m * nrow, post_norm_[l].data(), H, on.data());
+                    for (int k = 0; k < H; k++) X[(size_t)m * H + k] += on[(size_t)k];
+                }
+            } else {
+                for (int m = 0; m < M; m++)
+                    for (int k = 0; k < H; k++)
+                        X[(size_t)m * H + k] += O[(size_t)m * nrow + k] * residual_scale_;
+            }
         }
 
         // ---- MLP ----
         for (int m = 0; m < M; m++)
-            rmsnorm(X.data() + (size_t)m * H, post_norm_[l].data(), H,
+            rmsnorm(X.data() + (size_t)m * H, (sandwich ? pre_ff_norm_ : post_norm_)[l].data(), H,
                     XN.data() + (size_t)m * H);
         if (n_expert_ > 0) {
             // MoE FFN: the router/top-k pick different experts per row, so this
@@ -4380,9 +4435,18 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
         {
             LhScope _t_res(LH_RES);
             const int nrow = q4nx_pad_n(H);   // as above: the design's N, identity when H is on the grid
-            for (int m = 0; m < M; m++)
-                for (int k = 0; k < H; k++)
-                    X[(size_t)m * H + k] += D[(size_t)m * nrow + k] * residual_scale_;
+            if (sandwich) {
+                // post_feedforward_layernorm on the down projection, then the add (as step())
+                std::vector<float> dn((size_t)H);
+                for (int m = 0; m < M; m++) {
+                    rmsnorm(D.data() + (size_t)m * nrow, post_ff_norm_[l].data(), H, dn.data());
+                    for (int k = 0; k < H; k++) X[(size_t)m * H + k] += dn[(size_t)k];
+                }
+            } else {
+                for (int m = 0; m < M; m++)
+                    for (int k = 0; k < H; k++)
+                        X[(size_t)m * H + k] += D[(size_t)m * nrow + k] * residual_scale_;
+            }
         }
 
         // Same post-residual hidden-state dump as step() emits as [L], one row per
@@ -5081,6 +5145,10 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
                 // llama3 (Llama-3.1/3.2/3.3): the wavelength-band rule, on the FREQUENCY, so it costs
                 // nothing per token.  No-op unless the config declares rope_type "llama3".
                 inv = q4nx_rope_llama3_inv_freq(inv, &rope_llama3_);
+                // rope_type "linear": positions divided by the factor, i.e. the frequency is.  Gemma3 applies its
+                // block to the full layers only; its sliding layers have their own base (rope_local_base_freq) and
+                // no scaling.  A model without that split scales every layer, as HF does.
+                if (rope_linear_factor_ > 0.0 && (window == 0 || !sem_.rope_local_base)) inv /= rope_linear_factor_;
             }
             // Interleaved MRoPE: each rotary frequency rotates by its own axis's position (t, h or w). With the
             // three planes equal this is exactly `pos * inv`, which is why text-only prompts are bit-identical
@@ -5121,7 +5189,9 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     const int T = kv_len > 0 ? kv_len : pos + 1;
     // Gemma4 sets attention scaling to 1.0 (q/k carry an RMSNorm); everyone else
     // uses the usual 1/sqrt(head_dim).
-    const float scale = sem_.attn_scaling_one ? 1.0f : 1.0f / std::sqrt((float)HD);
+    // Gemma2/3 scale by query_pre_attn_scalar, which equals head_dim on most of the family but not all (Gemma3-27B).
+    const float scale = sem_.attn_scaling_one ? 1.0f
+                        : 1.0f / std::sqrt(sem_.query_pre_attn_scalar > 0 ? sem_.query_pre_attn_scalar : (float)HD);
     // Sliding-window attention: ignore positions older than the window.
     const int t0 = (window > 0 && T > window)
                        ? T - window : 0;

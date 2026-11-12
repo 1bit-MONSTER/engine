@@ -1949,6 +1949,55 @@ the missing q/k norm above was found:
   from one teacher-forced pass. Compared with a reference's per-row choices, a low agreement that is flat
   across positions is an error in the layers; a step at some row is an error at a position or a batch edge.
 
+**Gemma3 text decoders: the forward reads them (engine#1786).** FastFlowLM's `Medgemma-4B-NPU2` (`gemma3_text`, 34
+layers) now answers correctly through the per-op forward on the host (`NPU_INFER_HOST_GEMM=1`, no device). Before this
+change it was refused at load: `config.json declares rope scaling "linear", which this forward does not implement`.
+Five things were missing. All are read from the config or decided by the family:
+
+- `sliding_window_pattern`: the layer mix, when there is no `layer_types` list. Every 6th layer is full attention
+  (HF's `(i + 1) % 6`), so Medgemma has 5 full and 29 sliding layers. Before, all 34 ran as full attention.
+- `rope_local_base_freq`: the sliding layers' own RoPE base (10000, against 1e6 for the full layers). A sliding layer
+  with no base of its own now takes the model's base. Before, it took 0, which was the case for Gemma3-270M's
+  stated `layer_types`.
+- `rope_scaling` `{"rope_type": "linear", "factor": 8}`: the frequency is divided by the factor, on the full layers
+  only, because Gemma3's sliding layers rotate unscaled. A model without a local base scales every layer, as HF does.
+  A `linear` block with no usable factor is still refused.
+- `query_pre_attn_scalar`: the attention scale is `1/sqrt(query_pre_attn_scalar)`. It equals `head_dim` on Medgemma
+  but not on every Gemma3.
+- The sandwich norms: `post_attention_layernorm` on the attention output, plus `pre_feedforward_layernorm` and
+  `post_feedforward_layernorm` (`extra_layer_norms = 2`: Gemma4's set without its post-PLE norm and layer scalar).
+
+The norm form is the one non-obvious rule. HF's Gemma3 RMSNorm is `x/rms * (1 + w)`, but these containers store
+`w` with the 1 already added. Every norm kind of the Medgemma pack (input, post-attention, pre- and post-feedforward,
+q, final) equals llama.cpp's GGUF of the same model, whose converter adds the 1, to bf16 rounding. With the 1 added
+again, the known-answer prompt answered `*,,,,,,,`; with the plain form it answers `Paris`. So gemma3 takes the plain
+form, and gemma2 keeps `(1 + w)` (not measured here). `tests/q4nx_gemma3_semantics_test.c` pins each rule with
+Medgemma's own keys.
+
+A prefill runs batched (`step_batch`) with the same three extra norms; only Gemma4 still falls back to one
+`step()` per prompt token. `batch_check_state_test` on the Medgemma pack: batched equals sequential, rel-L1 0.
+
+The serve also needs the BOS. Medgemma's `config.json` states neither `bos_token_id` nor `add_bos_token`, and its
+`tokenizer_config.json` states both (`<bos>`, true), as HF reads them. forward-serve now takes what `config.json`
+does not state from `tokenizer_config.json`. Served without it, the reply to "Explain in three sentences why the sky
+is blue." was "The sky is blue because of the way the light is." With it, the reply is "The sky appears blue due to a
+phenomenon called Rayleigh scattering", the same as the host forward with the BOS.
+
+On the device, with a locally built kernel set of the four shapes (`QKV K2560 N4096`, `O K2048 N2560`,
+`GU K2560 N20480`, `D K10240 N2560`) and their 16-row twins, in one `npu-hold` ticket, the known answer came back
+`Paris` three times, identical. That is not yet a leaderboard row: decode is 0.68 tok/s, and no kernel set for these
+shapes ships.
+
+**Gemma3-270M-NPU2 and the 1,280-byte quarter tile.** This pack's hidden size, 640, is not a multiple of the
+5,120-byte tile's 256 columns. FastFlowLM stores every I8 tensor of it in a quarter tile instead: 16 rows x 128
+columns, with scales and zero-points at `g*16 + r` and codes at `c*8 + r/2` (`Q4NX_CHUNK_Q4H`, `q4nx_dequant.h`).
+Both kinds cost 0.625 bytes a weight, so the byte count cannot tell them apart. The tensor's declared shape does:
+`[chunks, 1280]` against `[tiles, 5120]`, and the reader goes by it. The reading was settled against an independent
+GGUF of the same model (`v_proj` against its Q5_0 `attn_v`: correlation 0.9962; the 5,120-tile reading gives 0.09)
+and against the pack's own embedding (`lm_head`: 0.9963, at most 0.57 of a step off). On the host the pack answers
+the known-answer prompt `Paris` and explains Rayleigh scattering in coherent sentences. Before, it failed at load
+with `chunk 4266 B is not a kind`. No kernel set for its shapes was built or run (the NPU is off).
+
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.
 A pack of the same architecture under another name got it wrong in silence. FastFlowLM's MiniCPM-V 4.7
@@ -2040,7 +2089,7 @@ engine#587 measured the route on it):
 | `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
 | `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
 | `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx, npu | **served and measured** on the per-op route ("FastFlowLM's own containers" below) |
-| `gemma3` | `FastFlowLM/medgemma-1.5-4b-it-NPU2` | hrx | not served |
+| `gemma3` | `FastFlowLM/medgemma-1.5-4b-it-NPU2` | hrx | not served on the device. The forward reads the family and answers on the host ("Gemma3 text decoders" above); one kernel shape, `QKV K2560 N4096`, is missing |
 | `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2`, `FastFlowLM/LFM2.5-1.2B-NPU2` | hrx, npu | `LFM2.5-1.2B-NPU2` **served and measured** on the per-op route ("FastFlowLM's own containers" below); `LFM2-1.2B-NPU2` serves too (one paired ticket, same section); `LFM2-2.6B-NPU2` was not run |
 | `gpt-oss` | `FastFlowLM/GPT-OSS-20B-NPU2`, `FastFlowLM/GPT-OSS-Safeguard-20b-NPU2` | hrx | not served |
 | `hy_v3` | `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | hrx | not served; the first table above records this one |
@@ -2068,7 +2117,7 @@ pack declares (a config with no `architectures` declares its `model_type`):
 | `DFlashDraftModel` | Nemotron-3.5-Bolt-E4B-DFlash | not served: a draft head, not a decoder | engine#1780 |
 | `Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration` | Nemotron-3.5-Bolt-E4B, Gemma4-E4B-IT, Gemma4-E2B-IT, Gemma4-12B-IT | not served: `gemma4`, hrx only | engine#1786 |
 | `HunYuanDenseV1ForCausalLM` | Hy-MT2-1.8B | not served: `hunyuan-dense`, hrx only | engine#1786 |
-| `Gemma3ForCausalLM`, `gemma3_text` | Gemma3-270M, Gemma3-1B, Gemma3-4B, Gemma3-4B-Text, medgemma-4b-it, medgemma-1.5-4b-it, Translategemma-4B-Instruct | not served: `gemma3`, hrx only | engine#1786 |
+| `Gemma3ForCausalLM`, `gemma3_text` | Gemma3-270M, Gemma3-1B, Gemma3-4B, Gemma3-4B-Text, medgemma-4b-it, medgemma-1.5-4b-it, Translategemma-4B-Instruct | not served: `gemma3`, hrx only (the per-op forward reads the family on the host; the device needs `QKV K2560 N4096`) | engine#1786 |
 | `Lfm2ForCausalLM` | LFM2-1.2B, LFM2-2.6B, LFM2-1.2B-Tool, LFM2-2.6B-Transcript, LFM2.5-1.2B, LFM2.5-1.2B-Thinking | not in the registry's NPU set: `lfm2`, hrx only (LFM2.5-1.2B on the per-op route is engine#2170, which adds no `NPU_ARCHS` entry) | engine#1786 |
 | `GptOssForCausalLM` | GPT-OSS-20B, GPT-OSS-Safeguard-20b | not served: `gpt-oss`, hrx only | engine#1786 |
 | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B | not served for this class: the route serves `qwen3_5_moe` through `Qwen3_5MoeForCausalLM` (GGUF on the NPU); the VLM wrapper class is hrx only, and FastFlowLM's own pack is not measured on the route | engine#1786 |

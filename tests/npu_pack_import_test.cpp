@@ -40,6 +40,7 @@
 #include "q4nx.h"
 #include "q4nx_device.h"
 
+#include <set>
 #include <nlohmann/json.hpp>
 
 #include <unistd.h>
@@ -5202,6 +5203,15 @@ static void test_container_placement_real(const std::string& dir, const std::vec
     }
     std::printf("\n");
     check(r.placed + r.unplaced + r.no_role == int64_t(c.tensors.size()), std::string("placement: accounts for every tensor in ") + dir);
+    // REVIEW of #2291: the result this PR exists for -- an empty unknown bucket on a real container -- was printed and
+    // never checked, so a removed refusal entry still exited 0. Now it fails where it happens, with the role named.
+    std::set<std::string> unknown;
+    for (const auto& row : r.rows)
+        if (!row.slot.empty() || row.role.empty()) continue;
+        else if (row.why.find("does not know") != std::string::npos) unknown.insert(row.role);
+    std::string names;
+    for (const auto& u : unknown) names += (names.empty() ? "" : ", ") + u;
+    check(unknown.empty(), std::string("placement: no role is unknown to the table in ") + dir + " (" + names + ")");
 }
 
 void test_container_placement() {
@@ -5231,6 +5241,23 @@ void test_container_placement() {
     check(r.rows[5].slot.empty() && r.rows[5].role.empty(), "placement: a tensor with no role is counted apart");
     check(r.no_role == 1, "placement: no_role counts the vocabulary gap, not the deliberate refusal");
     check(r.unplaced == 2, "placement: unplaced counts the two decisions, not the vocabulary gap");
+    {
+        // REVIEW of #2291: the containers' whole role vocabulary, no pack needed, because CI runs this binary with no
+        // pack. A role that reaches the "this table does not know" default, or a reason that is a bare placeholder, is a
+        // hole -- and this arm is what makes removing a refusal entry fail in CI rather than print UNKNOWN on the box.
+        pi::ContainerRoles roles_c;
+        for (const char* role : {"ssm", "gemma_local", "container_extra", "share_gate_exps", "share_up_exps",
+                                 "share_down_exps", "shared_expert_gate", "q_norm", "k_norm", "moe_router"})
+            roles_c.counts[role] = 1;
+        const pi::RoleSlotReport slots_c = pi::container_role_slots(roles_c);
+        for (const auto& kv : slots_c.why) {
+            check(kv.second.find("does not know") == std::string::npos,
+                  "slots: the table explains " + kv.first + " rather than defaulting it");
+            check(kv.second.rfind("same", 0) != 0 && kv.second != "same",
+                  "slots: and the reason for " + kv.first + " is a reason, not a placeholder");
+            check(kv.second.size() > 20, "slots: and it is long enough to be one (" + kv.first + ")");
+        }
+    }
     {
         // the group roles: the destination is the tensor's own suffix, and only the members the engine has a slot for move
         const std::vector<Q4nxTensor> g = {

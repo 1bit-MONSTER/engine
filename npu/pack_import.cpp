@@ -3574,7 +3574,7 @@ static const struct { const char* role; const char* slot; } kRoleSlots[] = {
 static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
     {"qkv_proj",            "the slot prefix is the LAYER TYPE's (`linear_attn.` or `self_attn.`), so it needs the second key"},
     {"q_norm",              "the engine's normaliser slots are per-architecture; none is verified for this role yet"},
-    {"k_norm",              "same: the engine's `k_norm` string is a config field, not a verified weight slot"},
+    {"k_norm",              "the engine's `k_norm` is a config field, not a verified weight slot (the q_norm case again)"},
     {"gate_up_proj",        "fused in some containers, two slots in the engine; needs a measured split"},
     {"moe_router",          "the engine reads `mlp.router.bias`; the weight slot is not verified"},
     {"share_gate_exps",     "the shared expert's gate slot differs per architecture; none is verified in npu/forward/src"},

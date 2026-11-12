@@ -3374,6 +3374,14 @@ takes one pass per `k + 1` tokens and no step (k = 7: 0.125 base passes per toke
 and every committed row reaches the drafter once, in order. This is what the "one pass (verify only)" rows of
 [docs/oga-drafter-path.md](oga-drafter-path.md) price.
 
+The DFlash draft is that head: `npu/dflash_head.h` (`DFlashHead`) drafts from the forward's tap sink
+(`set_layer_taps`), fused into a `DraftKvCache` as rows are committed, and trims the sink after each verify batch to the
+rows the round committed, because the forward writes a tap row for every position a pass runs, rejected drafts
+included. The target's embedding and the rule that turns a drafted row into a token (the head's argmax or a DFlash 2
+selector) are hooks. `tests/dflash_head_test.cpp` runs it through `mtp::run()` on a toy base that writes taps the same
+way: the text equals plain decode's, the sink ends holding exactly the committed rows, and every draft equals
+`draft_forward()` over those rows, bit for bit.
+
 **What would change the answer**: a cheaper verify batch (the array wait is ~60 % of a batched pass — a kernel
 lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
 6 measured 0 %).

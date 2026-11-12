@@ -1449,6 +1449,14 @@ target_include_directories(dflash_forward_test PRIVATE npu npu/forward/include)
 target_link_libraries(dflash_forward_test PRIVATE onebit_npu)
 add_dependencies(onebit dflash_forward_test)
 add_test(NAME dflash_forward COMMAND dflash_forward_test ${ONEBIT_DFLASH_DRAFT})
+# engine#1781: the DFlash draft as mtp::run()'s drafter (npu/dflash_head.h) on a toy base that writes a tap row per
+# position, rejected rows included: text equals plain decode, the sink keeps only committed rows, every draft equals
+# draft_forward() over them. Host only.
+add_executable(dflash_head_test tests/dflash_head_test.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp npu/forward/src/q4nx_dequant.c)
+target_include_directories(dflash_head_test PRIVATE npu npu/forward/include)
+target_link_libraries(dflash_head_test PRIVATE onebit_npu)
+add_dependencies(onebit dflash_head_test)
+add_test(NAME dflash_head COMMAND dflash_head_test)
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)

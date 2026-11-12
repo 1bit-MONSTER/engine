@@ -58,6 +58,8 @@
 #include <string>
 #include <vector>
 
+#include "../forward/include/spec_greedy.h"
+
 namespace onebit::npu::mtp {
 
 // Greedy choice with a deterministic tie-break (first maximum), so a draft that reproduces the model
@@ -166,6 +168,11 @@ struct Options {
     // draft is verified anyway (it is already in the batch), it just does not get followed by more of them.
     // tau <= 0 disables the gate.
     float tau = 0.6f;
+    // The fallback (SpecFallback, npu/forward/include/spec_greedy.h): once the last `fallback_window` rounds emitted
+    // fewer than `fallback_below` tokens on average, the run stops drafting and finishes with plain steps.
+    // fallback_below <= 0 turns it off.
+    double fallback_below = 0.0;
+    int fallback_window = 3;
 };
 
 struct Stats {
@@ -210,6 +217,8 @@ struct Stats {
     double ms_draft = 0.0;     // the head's chain: its matvecs and the lm head per draft
     double ms_commit = 0.0;    // commit_verify (snapshot restore + replay) and the drafter's row advance
     double phase_ms() const { return ms_step + ms_batch + ms_draft + ms_commit; }
+    // The iteration after which the fallback stopped drafting, or -1 when it never did.
+    int fell_back_at = -1;
 };
 
 // The live loop's side of the per-depth comparison, built in ONE place so the report sites and the tests cannot
@@ -236,14 +245,17 @@ struct Result {
     std::string err;
 };
 
-// Draft, verify, accept the longest prefix, roll back.  `on_token` returning false stops the loop.
-inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prompt, const Options& opt,
-                  const std::function<bool(int)>& on_token = {}) {
+// The loop from a base that has already run its prompt: `pos` is the number of positions it holds and `logits` the
+// choice after the last of them (what a batched prefill returns). run() below is this after a token-by-token prefill.
+// `on_token` returning false stops the loop.
+inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<float> logits, const Options& opt,
+                       const std::function<bool(int)>& on_token = {}) {
     Result r;
     const int V = base.vocab();
     if (V <= 0) { r.err = "no vocabulary"; return r; }
-    if (prompt.empty()) { r.err = "empty prompt"; return r; }
+    if (pos <= 0 || (int)logits.size() < V) { r.err = "no prefilled prompt"; return r; }
     const int k = head ? std::min(std::max(0, opt.k), base.max_batch_rows()) : 0;
+    onebit::npu::SpecFallback fallback(opt.fallback_below, opt.fallback_window);
 
     // Phase timing: always accumulated (steady_clock::now() is ~20 ns against a ~0.5 s pass), printed by the
     // caller when it wants the split.  Measurement only -- nothing here is read back into the loop's decisions.
@@ -256,11 +268,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
     };
     Clock::time_point tp = Clock::now();
 
-    std::vector<float> logits, all;
-    int pos = 0;
-    for (int t : prompt)
-        if (!base.step(t, pos++, logits)) { r.err = "prefill: step failed"; return r; }
-
+    std::vector<float> all;
     auto emit = [&](int t) { r.tokens.push_back(t); return !on_token || on_token(t); };
 
     while ((int)r.tokens.size() < opt.max_tokens) {
@@ -270,7 +278,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         const bool keep_going = emit(t1);
         if (!keep_going) break;
 
-        if (k <= 0) {                       // plain decode
+        if (k <= 0 || fallback.off()) {     // plain decode (no drafter, k = 0, or the fallback stopped it)
             if (!base.step(t1, pos++, logits)) { r.err = "step failed"; return r; }
             r.stats.steps++;
             r.stats.ms_step += lap(tp);
@@ -351,6 +359,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
             r.stats.ms_commit += lap(tp);
             logits.assign(all.begin() + (size_t)take * (size_t)V, all.begin() + (size_t)(take + 1) * (size_t)V);
             pos += take + 1;
+            if (fallback.record(take + 1) && r.stats.fell_back_at < 0) r.stats.fell_back_at = r.stats.iterations;
             if (stopped || (int)r.tokens.size() >= opt.max_tokens) break;
             continue;
         }
@@ -451,12 +460,25 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
             logits.assign(all.begin() + (size_t)(take - 1) * (size_t)V,
                           all.begin() + (size_t)take * (size_t)V);
         pos = have + take;
+        if (fallback.record(take + 1) && r.stats.fell_back_at < 0) r.stats.fell_back_at = r.stats.iterations;
         if (stopped || (int)r.tokens.size() >= opt.max_tokens) break;
     }
 
     r.stats.emitted = (int)r.tokens.size();
     r.ok = true;
     return r;
+}
+
+// Draft, verify, accept the longest prefix, roll back, after running `prompt` one token at a time.
+inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prompt, const Options& opt,
+                  const std::function<bool(int)>& on_token = {}) {
+    if (base.vocab() <= 0) { Result r; r.err = "no vocabulary"; return r; }
+    if (prompt.empty()) { Result r; r.err = "empty prompt"; return r; }
+    std::vector<float> logits;
+    int pos = 0;
+    for (int t : prompt)
+        if (!base.step(t, pos++, logits)) { Result r; r.err = "prefill: step failed"; return r; }
+    return run_from(base, head, pos, std::move(logits), opt, on_token);
 }
 
 // Plain greedy decode through the same interface, so the test (and a --mtp-k 0 run) can compare text.

@@ -189,6 +189,29 @@ def drift(baseline, found):
     return sorted(found - baseline), sorted(baseline - found)
 
 
+def count_drift(entries, counts, corpus):
+    """Per-body counts, three ways rather than two.
+
+    `counts` omits every file that carries no narrowing line, so "absent from counts" used to be treated as "nothing
+    to compare" and skipped -- which made the best outcome (a body that went to zero) the one thing this ratchet
+    could not see, and let a baseline line rot after its file was deleted. A file that is GONE has to lose its line;
+    a file that is PRESENT with no lines has shrunk to zero (engine#2244 review).
+    """
+    grew, shrank, lost = [], [], []
+    for rel, want in entries.items():
+        if want is None:
+            continue
+        if not (corpus / rel).is_file():
+            lost.append((rel, want))
+            continue
+        got = counts.get(rel, 0)
+        if got > want:
+            grew.append((rel, want, got))
+        elif got < want:
+            shrank.append((rel, want, got))
+    return grew, shrank, lost
+
+
 def check(root, corpus=None):
     corpus = pathlib.Path(corpus) if corpus else root / CORPUS
     if not corpus.is_dir() or not any(corpus.rglob("*.loom")):
@@ -203,14 +226,7 @@ def check(root, corpus=None):
     new, stale = drift(baseline, found)
     entries = baseline_entries(base_text)
     counts = narrowing_lines(corpus)
-    grew, shrank = [], []
-    for rel, want in entries.items():
-        if want is None or rel not in counts:
-            continue
-        if counts[rel] > want:
-            grew.append((rel, want, counts[rel]))
-        elif counts[rel] < want:
-            shrank.append((rel, want, counts[rel]))
+    grew, shrank, lost = count_drift(entries, counts, corpus)
     # engine#2186 item 1 / engine#2167: the accumulator class, which no truncation scan can see.
     acc_base_file = root / ACC_BASELINE
     if not acc_base_file.is_file():
@@ -222,14 +238,7 @@ def check(root, corpus=None):
     acc_new, acc_stale = drift(acc_baseline, acc_found)
     acc_entries = baseline_entries(acc_base_file.read_text(encoding="utf-8"))
     acc_counts = accumulator_counts(corpus)
-    acc_grew, acc_shrank = [], []
-    for rel, want in acc_entries.items():
-        if want is None or rel not in acc_counts:
-            continue
-        if acc_counts[rel] > want:
-            acc_grew.append((rel, want, acc_counts[rel]))
-        elif acc_counts[rel] < want:
-            acc_shrank.append((rel, want, acc_counts[rel]))
+    acc_grew, acc_shrank, acc_lost = count_drift(acc_entries, acc_counts, corpus)
     guard = guarded(found, corpus)
     unknown = unclassified_truncations(corpus)
     for where, text in unknown:
@@ -251,14 +260,23 @@ def check(root, corpus=None):
     for rel, want, got in grew:
         print(f"hrx_f16_narrowing: MORE narrowing LINES in {rel} ({want} -> {got}) -- the body is already listed, so "
               f"the body check alone would pass (engine#1962)")
+    for rel, want in lost:
+        print(f"hrx_f16_narrowing: {rel} is in the baseline with {want} narrowing line(s) but the file is gone from the "
+              f"corpus -- drop the line, the list should shrink")
     for rel, want, got in shrank:
-        print(f"hrx_f16_narrowing: {rel} narrows fewer lines than the baseline ({want} -> {got}) -- drop the count")
+        suffix = (f"-- that is the outcome this ratchet exists for, so record it: drop the line"
+                  if got == 0 else "-- drop the count")
+        print(f"hrx_f16_narrowing: {rel} narrows fewer lines than the baseline ({want} -> {got}) {suffix}")
     for rel, want, got in acc_grew:
         print(f"hrx_f16_narrowing: MORE f16 accumulators in {rel} ({want} -> {got}) -- a second accumulator inside a "
               f"known body (engine#2186, engine#2167)")
+    for rel, want in acc_lost:
+        print(f"hrx_f16_narrowing: {rel} is in the accumulator baseline with {want} accumulator(s) but the file is gone "
+              f"from the corpus -- drop the line")
     for rel, want, got in acc_shrank:
-        print(f"hrx_f16_narrowing: {rel} has fewer f16 accumulators ({want} -> {got}) -- drop the count")
-    if new or stale or unknown or acc_new or acc_stale or grew or shrank or acc_grew or acc_shrank:
+        suffix = "-- drop the line, the list should shrink" if got == 0 else "-- drop the count"
+        print(f"hrx_f16_narrowing: {rel} has fewer f16 accumulators ({want} -> {got}) {suffix}")
+    if new or stale or unknown or acc_new or acc_stale or grew or shrank or lost or acc_grew or acc_shrank or acc_lost:
         print(f"hrx_f16_narrowing: FAIL ({len(new)} new, {len(stale)} stale of {len(baseline)}, "
               f"{len(unknown)} unclassified fptrunc; {len(acc_new)} new, {len(acc_stale)} stale of "
               f"{len(acc_baseline)} accumulator(s))")
@@ -349,6 +367,22 @@ def self_test():
         empty = root / "empty"
         empty.mkdir()
         check_that(check(empty) == 77, "a missing corpus returns 77, not 0")
+        # engine#2244 review: the two cases "absent from counts" used to collapse into one `continue`. A body that
+        # went to ZERO narrowing lines is the outcome this ratchet exists for, and a body whose file was deleted
+        # must lose its baseline line instead of rotting quietly.
+        cdr = root / "cd"
+        cdr.mkdir()
+        (cdr / "clean.loom").write_text("  %x = scalar.constant 0.0 : f32\n")
+        (cdr / "still.loom").write_text("  %x = scalar.fptrunc %y : f32 to f16\n")
+        entries = {"clean.loom": 3, "still.loom": 1, "gone.loom": 2}
+        counts = narrowing_lines(cdr)
+        grew, shrank, lost = count_drift(entries, counts, cdr)
+        check_that(shrank == [("clean.loom", 3, 0)],
+                   "a body that drops to zero narrowing lines is reported as a shrink, not as silence")
+        check_that(lost == [("gone.loom", 2)],
+                   "a baseline body whose file is gone is reported stale, not skipped")
+        check_that(grew == [] and ("still.loom", 1, 1) not in shrank,
+                   "an unchanged body is neither growth nor shrink")
         # engine#2186 item 1 / engine#2167: the accumulator class. A mul-updated f16 fragment is found; an add-only one
         # is not; a WMMA/contract update counts as a multiply; and an update far below the init is still found -- the
         # last is the fixture that would have caught the 120-line window, which reported four real accumulators as

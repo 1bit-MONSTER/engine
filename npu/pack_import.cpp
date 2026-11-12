@@ -3482,6 +3482,32 @@ static std::string group_suffix_slot(const std::string& role, const std::string&
     return std::string();
 }
 
+ImportPlan container_import_plan(const Q4nxContainer& container, const std::vector<std::string>& layer_types) {
+    ImportPlan out;
+    out.payload_bytes = container.payload_bytes;
+    const PlacementReport rep = container_placement(container.tensors, layer_types);
+    std::map<std::string, const Q4nxTensor*> by_name;
+    for (const auto& t : container.tensors) by_name[t.name] = &t;
+    std::set<std::string> seen;
+    for (const auto& row : rep.rows) {
+        if (row.slot.empty()) {
+            out.unplaced.push_back((row.role.empty() ? std::string("(no role)") : row.role) + ": " + row.tensor);
+            continue;
+        }
+        if (!seen.insert(row.slot).second) {   // a second write would silently replace the first
+            out.unplaced.push_back(row.role + ": " + row.tensor + " (destination already taken)");
+            continue;
+        }
+        ImportItem item;
+        item.slot = row.slot; item.source = row.tensor; item.shape = row.shape; item.dtype = row.dtype;
+        const auto it = by_name.find(row.tensor);
+        if (it != by_name.end()) { item.begin = it->second->begin; item.end = it->second->end; }
+        out.bytes += item.end - item.begin;
+        out.items.push_back(item);
+    }
+    return out;
+}
+
 PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
                                   const std::vector<std::string>& layer_types) {
     PlacementReport out;

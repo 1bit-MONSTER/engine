@@ -411,6 +411,26 @@ RoleSlotReport container_role_slots(const ContainerRoles& roles);
 // not treat that as "unchanged", which is why this returns a string and the report above returns the reasons.
 std::string container_role_slot(const std::string& role, const std::string& layer_type);
 
+// engine#1788, 3c: the last pure step before bytes are written -- where each tensor's bytes go and which bytes they are.
+// Separated from the I/O so it can be tested without a filesystem, and so a caller can refuse a container BEFORE writing
+// anything into an output directory. `layer_types` comes from config.json beside the container (NOT from its safetensors
+// metadata: that is where the measured ones live, and reading meta instead silently refused every layer-typed role).
+struct ImportItem {
+    std::string slot;      // the engine slot the bytes are written to (layer-qualified)
+    std::string source;    // the container tensor they come from
+    int64_t begin = 0;     // data_offsets[0] within the payload
+    int64_t end = 0;
+    std::vector<int64_t> shape;
+    std::string dtype;
+};
+struct ImportPlan {
+    std::vector<ImportItem> items;        // placed tensors only; an empty slot is never written
+    std::vector<std::string> unplaced;    // "<role>: <tensor>" -- a refusal, not a silent skip
+    int64_t bytes = 0;                    // payload bytes the items carry
+    int64_t payload_bytes = 0;            // what the container says it has, so a writer can prove coverage
+};
+ImportPlan container_import_plan(const Q4nxContainer& container, const std::vector<std::string>& layer_types);
+
 // engine#1788, slice 3c: the writer's per-TENSOR decision, which is what an import actually iterates. Reads the tensor's
 // own layer, takes that layer's declared type, and asks the table above for a destination. A tensor with no role and a
 // tensor with a role but no destination are counted apart, because the first is a vocabulary gap and the second is a

@@ -209,6 +209,15 @@ add_dependencies(onebit npu_decode_note_test)
 # engine#2106: a shipped kernel set's own consistency -- manifest vs bytes, one form or none, name vs directory. The
 # refusal this pre-empts ("differ in size") needed private-repo archaeology to diagnose; the symptom is checkable here.
 add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set_check_test.sh)
+
+# engine#2186/#2244: two checks that were only ever run by hand. `tools/ci/dupdef_check.py` is the one
+# that found a shadowed `def self_test()` in tools/hrx_f16_narrowing_check.py -- the surviving copy
+# passed and the shadowed one's arms could never fail. Both take no build input, so a ctest row is the
+# route that needs no ci.yml line (the workflow is not editable from a lane).
+add_test(NAME dupdef_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --check
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME hrx_f16_narrowing_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/hrx_f16_narrowing_check.py --self-test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.

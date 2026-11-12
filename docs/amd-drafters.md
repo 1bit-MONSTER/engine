@@ -189,6 +189,23 @@ Measured with these pieces against the served 27B, in a local loop: on a code pr
 tok/s against 4.2 tok/s plain decoding; output identical to plain greedy decoding. The loop is not part of this change;
 the numbers are on engine#1781.
 
+### The speculative loop on the served 27B (`tools/dflash2_probe loop`)
+
+`dflash2_probe loop` runs the pair end to end. The target is `bonsai2-27b-t2s2` on the NPU. The draft's projections can
+run on the NPU through `set_gemm_hook()`; its attention, convolutions and selector stay on the host. Each round, the
+draft proposes 7 tokens, the target verifies the 8 rows in one `step_batch_all()` pass, and `commit_verify_rows()` keeps
+the accepted prefix. When every row is accepted, the commit keeps the batch's own recurrent state instead of restoring
+the snapshot and replaying the rows: `NPU_REPLAY_CHECK=1` holds the two equal, and `NPU_COMMIT_FULL_REPLAY=1` keeps the
+old path. Measured on engine#1781, with output identical to plain greedy decoding:
+
+| prompt | plain decode | the loop | tokens per round |
+|---|---|---|---|
+| a Python function | 4.24-4.27 tok/s | 7.5-7.8 tok/s | 6.86 |
+| prose (with the fallback to plain decoding) | 4.17-4.21 | 4.08-4.12 | 2.82-3.0 |
+
+A loop has to be compared with the serve's own batched prefill. The per-token prefill is not bit-identical on this route,
+and against it the loop's output parts after 23 tokens.
+
 ## PARD-2's repos are weights-only — borrow the target's tokenizer
 
 `amd/PARD2-*` ship **`README.md`, `config.json`, `model.safetensors`, `warp_model.bin`** and nothing else: **no tokenizer

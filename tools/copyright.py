@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+#
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 """Check or add the copyright and Apache-2.0 notice on every tracked file.
 
 usage: tools/copyright.py --check   # exit 1 and list files missing the notice
@@ -10,6 +26,7 @@ EXEMPT and skipped.
 """
 import argparse
 import fnmatch
+import os
 import re
 import subprocess
 import sys
@@ -329,8 +346,22 @@ def main():
     # notice (this happened: onnx/tests/ort_run_generic.sh passed --check and failed CI on the same
     # head). Ignored files stay out: a build artifact is not source.
     def listing(*args):
-        return subprocess.run(["git", "ls-files", *args], capture_output=True, text=True,
-                              check=True).stdout.split("\n")
+        # engine#2183: outside a repository `git ls-files` exits 128, and with `check=True` that
+        # surfaced as a bare Python traceback. Six pushes to that PR were made without the header
+        # fix the tool was asking for, and a traceback reads as "the tool is broken" rather than
+        # "run it from the repository root" -- which is the one thing the caller has to change.
+        try:
+            return subprocess.run(["git", "ls-files", *args], capture_output=True, text=True,
+                                  check=True).stdout.split("\n")
+        except FileNotFoundError:
+            sys.exit("copyright: git is not on PATH, so the file set cannot be listed")
+        except subprocess.CalledProcessError as e:
+            detail = (e.stderr or "").strip().splitlines()
+            sys.stderr.write(
+                "copyright: `git ls-files` failed (exit %d)%s\n"
+                "           run this from the root of the repository; the working directory is\n"
+                "           %s\n" % (e.returncode, (": " + detail[-1]) if detail else "", os.getcwd()))
+            raise SystemExit(2)
     tracked = set(filter(None, listing()))
     untracked = set(filter(None, listing("--others", "--exclude-standard")))
     files = sorted(tracked | untracked)

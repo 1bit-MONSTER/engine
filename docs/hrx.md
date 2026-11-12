@@ -359,7 +359,12 @@ from a device fault to passing on ordinary data (128 refined candidates, NMSE 6.
 CPU), with one activation at 1.06e5 (128 of 128 refined logits `inf` with only the first fault
 fixed; 0 after), and with activations to 1.18e5 and logits to 2.3e5. A scheduling test without a
 device pins the group count at widths 256, 2560 and 4096. Not run on Flash-Next itself. In about 50 runs one
-refined logit came back wrong once and did not recur ([engine#2150](https://github.com/1bit-MONSTER/engine/issues/2150)).
+refined logit came back wrong once ([engine#2150](https://github.com/1bit-MONSTER/engine/issues/2150)). That was a race,
+fixed at pin `7a96fa179` (llama.cpp #330): the refine kernel hands each exact logit to the workitem that publishes it
+through global memory, and the barrier between them fenced shared memory only, so a slot was now and then published
+before the store reached it and carried the coarse scan's score instead (1543.49, 64 times the coarse 24.12, where the
+exact logit is 29.15). The test `mul_mat.q6_k.token1_shortlist.repeat` recomputes the case 200 times in one process.
+Measured on gfx1151 (2026-11-12), 47,988 recomputes on each side: 318 wrong before, 0 after.
 
 The routed gate/up kernels followed at pin `2b7960bae` ([engine#2127](https://github.com/1bit-MONSTER/engine/issues/2127),
 llama.cpp #309). The fused routed gate/up SwiGLU loads its input in four projection kernels (Q4_K,

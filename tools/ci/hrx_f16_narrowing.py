@@ -83,9 +83,33 @@ NARROW = re.compile(r"f32 to f16|vector<[0-9x]*f32>\s+to\s+vector<[0-9x]*f16>")
 GUARD = ("scale_log2", "prescale")
 
 
+def baseline_entries(text):
+    """`path` or `path count` per line -> {path: count or None}. A path-only line is still accepted, so an older
+    baseline keeps working; a line with a count is the stronger form and is what `--write` emits."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        parts = line.split()
+        out[parts[0]] = int(parts[1]) if len(parts) > 1 else None
+    return out
+
+
 def baseline_paths(text):
-    return {line.strip() for line in text.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")}
+    return set(baseline_entries(text))
+
+
+def narrowing_lines(corpus):
+    """{path: number of lines that narrow f32 to f16}. The body list alone cannot see a new narrowing written inside a
+    body it already names -- 51 of the corpus's bodies are listed, so that is the common case, not the rare one."""
+    found = {}
+    for path in corpus.rglob("*.loom"):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        n = sum(1 for line in text.splitlines() if NARROW.search(line))
+        if n:
+            found[path.relative_to(corpus).as_posix()] = n
+    return found
 
 
 def narrowing_bodies(corpus):
@@ -114,6 +138,22 @@ def unclassified_truncations(corpus):
             if FPTRUNC.search(line) and not NARROW.search(line) and not KNOWN_NON_F16.search(line):
                 out.append((f"{path.relative_to(corpus).as_posix()}:{number}", line.strip()))
     return out
+
+
+def accumulator_counts(corpus):
+    """{path: number of mul-updated f16 fragment accumulators}; measured at the pin: 14 across 7 bodies."""
+    found = {}
+    for path in corpus.rglob("*.loom"):
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        n = 0
+        for i, line in enumerate(lines):
+            if not ACC_INIT.search(line):
+                continue
+            if any(ACC_MUL.search(later) for later in lines[i:i + ACC_WINDOW]):
+                n += 1
+        if n:
+            found[path.relative_to(corpus).as_posix()] = n
+    return found
 
 
 def accumulator_bodies(corpus):
@@ -161,6 +201,16 @@ def check(root, corpus=None):
     baseline = baseline_paths(base_text)
     found = narrowing_bodies(corpus)
     new, stale = drift(baseline, found)
+    entries = baseline_entries(base_text)
+    counts = narrowing_lines(corpus)
+    grew, shrank = [], []
+    for rel, want in entries.items():
+        if want is None or rel not in counts:
+            continue
+        if counts[rel] > want:
+            grew.append((rel, want, counts[rel]))
+        elif counts[rel] < want:
+            shrank.append((rel, want, counts[rel]))
     # engine#2186 item 1 / engine#2167: the accumulator class, which no truncation scan can see.
     acc_base_file = root / ACC_BASELINE
     if not acc_base_file.is_file():
@@ -170,6 +220,16 @@ def check(root, corpus=None):
     acc_baseline = baseline_paths(acc_base_file.read_text(encoding="utf-8"))
     acc_found = accumulator_bodies(corpus)
     acc_new, acc_stale = drift(acc_baseline, acc_found)
+    acc_entries = baseline_entries(acc_base_file.read_text(encoding="utf-8"))
+    acc_counts = accumulator_counts(corpus)
+    acc_grew, acc_shrank = [], []
+    for rel, want in acc_entries.items():
+        if want is None or rel not in acc_counts:
+            continue
+        if acc_counts[rel] > want:
+            acc_grew.append((rel, want, acc_counts[rel]))
+        elif acc_counts[rel] < want:
+            acc_shrank.append((rel, want, acc_counts[rel]))
     guard = guarded(found, corpus)
     unknown = unclassified_truncations(corpus)
     for where, text in unknown:
@@ -188,7 +248,17 @@ def check(root, corpus=None):
     for rel in acc_stale:
         print(f"hrx_f16_narrowing: {rel} is in the accumulator baseline but has no mul-updated f16 fragment -- drop "
               f"the line, the list should shrink")
-    if new or stale or unknown or acc_new or acc_stale:
+    for rel, want, got in grew:
+        print(f"hrx_f16_narrowing: MORE narrowing LINES in {rel} ({want} -> {got}) -- the body is already listed, so "
+              f"the body check alone would pass (engine#1962)")
+    for rel, want, got in shrank:
+        print(f"hrx_f16_narrowing: {rel} narrows fewer lines than the baseline ({want} -> {got}) -- drop the count")
+    for rel, want, got in acc_grew:
+        print(f"hrx_f16_narrowing: MORE f16 accumulators in {rel} ({want} -> {got}) -- a second accumulator inside a "
+              f"known body (engine#2186, engine#2167)")
+    for rel, want, got in acc_shrank:
+        print(f"hrx_f16_narrowing: {rel} has fewer f16 accumulators ({want} -> {got}) -- drop the count")
+    if new or stale or unknown or acc_new or acc_stale or grew or shrank or acc_grew or acc_shrank:
         print(f"hrx_f16_narrowing: FAIL ({len(new)} new, {len(stale)} stale of {len(baseline)}, "
               f"{len(unknown)} unclassified fptrunc; {len(acc_new)} new, {len(acc_stale)} stale of "
               f"{len(acc_baseline)} accumulator(s))")
@@ -207,9 +277,12 @@ def write(root, corpus=None):
         return 77
     head = "".join(line for line in (root / BASELINE).read_text(encoding="utf-8").splitlines(True)
                    if line.lstrip().startswith("#"))
-    bodies = sorted(narrowing_bodies(corpus))
-    (root / BASELINE).write_text(head + "\n".join(bodies) + "\n", encoding="utf-8")
-    accs = sorted(accumulator_bodies(corpus))
+    counts = narrowing_lines(corpus)
+    lines = [f"{rel}\t{n}" for rel, n in sorted(counts.items())]
+    (root / BASELINE).write_text(head + "\n".join(lines) + "\n", encoding="utf-8")
+    bodies = sorted(counts)
+    acc_counts = accumulator_counts(corpus)
+    accs = [f"{rel}\t{n}" for rel, n in sorted(acc_counts.items())]
     acc_head = "".join(line for line in (root / ACC_BASELINE).read_text(encoding="utf-8").splitlines(True)
                        if line.lstrip().startswith("#")) if (root / ACC_BASELINE).is_file() else ""
     (root / ACC_BASELINE).write_text(acc_head + "\n".join(accs) + "\n", encoding="utf-8")
@@ -312,6 +385,36 @@ def self_test():
         check_that(fp != corpus_fingerprint(c), "fingerprint: a one-byte edit changes it")
         (c / "a.loom").rename(c / "s" / "a.loom")
         check_that(fp != corpus_fingerprint(c), "fingerprint: a move changes it too (the path is hashed)")
+    with tempfile.TemporaryDirectory() as tmp:
+        root2 = pathlib.Path(tmp)
+        c2 = root2 / CORPUS
+        c2.mkdir(parents=True)
+        (c2 / "a.loom").write_text("  %x = scalar.fptrunc %y : f32 to f16\n")
+        check_that(narrowing_lines(c2) == {"a.loom": 1}, "the narrowing-line count of a listed body is counted")
+        (c2 / "a.loom").write_text("  %x = scalar.fptrunc %y : f32 to f16\n  %z = scalar.fptrunc %w : f32 to f16\n")
+        check_that(narrowing_lines(c2) == {"a.loom": 2},
+                   "a second narrowing INSIDE an already-listed body raises the count (the body check alone would pass)")
+        (root2 / BASELINE).parent.mkdir(parents=True, exist_ok=True)
+        (root2 / BASELINE).write_text("a.loom\t2\n")
+        check_that(baseline_entries((root2 / BASELINE).read_text()) == {"a.loom": 2},
+                   "a 'path count' baseline line parses to both")
+        (root2 / BASELINE).write_text("a.loom\n")
+        check_that(baseline_entries((root2 / BASELINE).read_text()) == {"a.loom": None},
+                   "a path-only line still parses, so an older baseline keeps working")
+        c2b = root2 / "acc2"
+        c2b.mkdir()
+        (c2b / "one.loom").write_text(
+            "  %init = vector.fragment<init> %z shape [%m, %n] : vector<8xf16>\n"
+            "    %next = vector.mulf %acc, %k : vector<8xf16>\n")
+        check_that(accumulator_counts(c2b) == {"one.loom": 1}, "an accumulator count of one is counted")
+        (c2b / "one.loom").write_text(
+            "  %init = vector.fragment<init> %z shape [%m, %n] : vector<8xf16>\n"
+            "    %next = vector.mulf %acc, %k : vector<8xf16>\n"
+            "  %init2 = vector.fragment<init> %z2 shape [%m, %n] : vector<16xf16>\n"
+            "    %next2 = vector.mulf %acc2, %k2 : vector<16xf16>\n")
+        check_that(accumulator_counts(c2b) == {"one.loom": 2},
+                   "a SECOND accumulator inside a listed body raises the count (the body check alone would pass)")
+
     print(f"hrx_f16_narrowing self-test: {'ok' if not failures else f'{failures} failure(s)'}")
     return 1 if failures else 0
 

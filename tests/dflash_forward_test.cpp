@@ -96,8 +96,11 @@ DraftWeights tiny_model() {
     w.hidden_norm = {0.5f, 3.0f};
     w.norm = {1.0f, 1.0f};
     DraftLayerWeights L;
-    L.q = L.k = L.o = L.down = identity(2);
-    L.v = {2.0f, 0.0f, 0.0f, 3.0f};
+    L.q = L.k = L.o = identity(2);
+    // v and down each have one entry off the diagonal, so a projection applied transposed gives another answer
+    // (review of #2174: with every matrix diagonal, W and W^T were the same thing).
+    L.v = {2.0f, 1.0f, 0.0f, 3.0f};        // v(x) = (2 x0 + x1, 3 x1)
+    L.down = {1.0f, 0.5f, 0.0f, 1.0f};     // down(m) = (m0 + 0.5 m1, m1)
     // gate and up differ, and gate drives its first output negative where up is positive, so silu(gate) * up and
     // silu(up) * gate are different numbers: which of the two is activated is part of the answer.
     L.gate = {-1.0f, 0.0f, 0.0f, 2.0f};
@@ -125,8 +128,10 @@ void tiny_tail(double x0, double x1, double a0, double a1, double& o0, double& o
     double y0 = x0 + a0, y1 = x1 + a1;          // residual (o_proj is the identity)
     double p0 = y0, p1 = y1;
     rms2(p0, p1);                                // post_norm
-    y0 += silu(-1.0 * p0) * (3.0 * p0);          // silu(gate(p)) * up(p); down is the identity
-    y1 += silu(2.0 * p1) * (0.5 * p1);
+    const double m0 = silu(-1.0 * p0) * (3.0 * p0);   // silu(gate(p)) * up(p)
+    const double m1 = silu(2.0 * p1) * (0.5 * p1);
+    y0 += m0 + 0.5 * m1;                         // down
+    y1 += m1;
     rms2(y0, y1);                                // the final norm
     o0 = y0; o1 = y1;
 }
@@ -138,7 +143,7 @@ void hand_cases() {
         double h0 = 3.0, h1 = 4.0;
         rmsg(h0, h1, 2.0, 0.5);                  // input_norm
         double e0, e1;
-        tiny_tail(3.0, 4.0, 2.0 * h0, 3.0 * h1, e0, e1);
+        tiny_tail(3.0, 4.0, 2.0 * h0 + h1, 3.0 * h1, e0, e1);
         const std::vector<float> out = draft_forward(w, nullptr, 0, noise, 1);
         check(out.size() == 2 && std::fabs(out[0] - e0) < 1e-5 && std::fabs(out[1] - e1) < 1e-5,
               "one row, no context: the output is the hand-computed one");
@@ -165,7 +170,7 @@ void hand_cases() {
         rot(khn0, khn1, 6.0, kh0, kh1);
         const double sc = (q0 * kc0 + q1 * kc1) / std::sqrt(2.0), sh = (q0 * kh0 + q1 * kh1) / std::sqrt(2.0);
         const double wc = std::exp(sc) / (std::exp(sc) + std::exp(sh)), wh = 1.0 - wc;
-        const double a0 = wc * 2.0 * c0 + wh * 2.0 * h0, a1 = wc * 3.0 * c1 + wh * 3.0 * h1;   // v = diag(2, 3)
+        const double a0 = wc * (2.0 * c0 + c1) + wh * (2.0 * h0 + h1), a1 = wc * 3.0 * c1 + wh * 3.0 * h1;   // v as above
         double e0, e1;
         tiny_tail(-2.0, 1.0, a0, a1, e0, e1);
         const std::vector<float> out = draft_forward(w, tap, 1, noise, 1, 5);

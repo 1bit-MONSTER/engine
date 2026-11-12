@@ -2921,6 +2921,14 @@ sink, `taps x H` wide, the listed layers side by side. It works for `step()` and
 a DFlash draft's `target_layer_ids` are read with (docs/amd-drafters.md). Layer `l`'s block is the stream after layer
 `l`, the same point `layer_<ll>.f32` records; `layer_taps_model_test` holds the two to each other bit for bit.
 
+**A Gemma4 (per-layer-embedding) pack no longer re-reads its layer weights every token.** `step()` skips the
+per-token Q4NX dequant once a dense layer's projections are packed on the device; a per-layer-embedding model was
+excluded from that, although its gate and projection are read once at init and are packed like the rest. Measured on
+`Nemotron-3.5-Bolt-E4B` (42 layers), one ticket, one binary, arms old / new / old / new (`NPU_PLE_RELOAD=1` is the old
+behaviour): 3377 and 3410 ms per step with the reload, 2486 and 1914 ms without, same reply in all four. What is left
+is the device: on this per-op int8 family a 16-row launch streams the whole weight image (`GU` 21.5 ms, `D` 13.6 ms,
+`QKV` 4.0 ms per launch), which is about 1.9 s per token over 42 layers.
+
 The files these dumps write (`NPU_INFER_DUMP_DIR`'s `layer_<ll>.f32`, `NPU_I8_GS_DUMP`'s weight-scale pairs) are
 created owner-only (0600) and never through a symlink at the final path component, whatever the umask, and a dump file
 an older build left at 0666 is narrowed to 0600 when it is rewritten; the head-image cache's files are at most 0644. Both go through `npu/forward/include/file_create.h`, so no write site uses `fopen(…, "w")`,

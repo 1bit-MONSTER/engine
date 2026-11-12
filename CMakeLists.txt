@@ -1978,6 +1978,12 @@ endif()
     if(OpenMP_CXX_FOUND)
         target_link_libraries(gdn_row_bench PRIVATE OpenMP::OpenMP_CXX)
     endif()
+    # A DFlash draft scored against its target, both on the host (engine#1780): the target's tapped hidden states
+    # into the draft's reference forward, proposals checked against the target's greedy tokens. A tool, not a ctest:
+    # it needs two packages and minutes of host time.
+    add_executable(dflash_acceptance tools/dflash_acceptance.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp)
+    target_include_directories(dflash_acceptance PRIVATE npu npu/forward/include)
+    target_link_libraries(dflash_acceptance PRIVATE onebit_npu_forward onebit_npu)
     add_executable(mtp_acceptance tools/mtp_acceptance.cpp npu/mtp/mtp_head.cpp)
     target_include_directories(mtp_acceptance PRIVATE npu npu/forward/include)
     target_link_libraries(mtp_acceptance PRIVATE onebit_npu_forward)

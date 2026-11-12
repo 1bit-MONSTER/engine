@@ -122,6 +122,21 @@ void q4nx_dequant_chunk_q4h(const uint8_t* chunk, float* out, int ld, int symmet
  * the tensor mixes the symmetric and asymmetric kinds. */
 int q4nx_dequant_tensor_q4h(const uint8_t* data, size_t nbytes, int rows, int k, int cols, float* out);
 
+/* The 16 x 256 "wide" chunks of FastFlowLM's Gemma4-12B-IT-NPU2 (engine#1786), declared [rows/16, K/256, bytes]:
+ *   bytes 0..255   128 bf16 scales, slot g*16 + r (g the 32-column group, r the row), symmetric (no zero-point)
+ *   Q4W (2304 B)   then 2048 B of 4-bit codes at byte c*8 + r/2, even row in the low nibble, two's complement
+ *   Q8W (4352 B)   then 4096 B of int8 codes at byte c*16 + r
+ * w[r][c] = code * scale[c/32][r].  The Q4W reading matches google's own QAT Q4_0 GGUF of the model at corr 0.9986
+ * (seven tensors over layers 0, 5 and 47); the Q8W head matches the pack's bf16 embedding at 1.00000.  A Q4W
+ * tensor's byte count equals a 4608-byte Q4S grid's, which is why the declared shape, not the size, picks it. */
+#define Q4NX_CHUNK_Q4W 2304
+#define Q4NX_CHUNK_Q8W 4352
+#define Q4NX_WIDE_ROWS 16
+#define Q4NX_WIDE_COLS 256
+void q4nx_dequant_chunk_wide(const uint8_t* chunk, int bits, float* out, int ld);
+/* Whole tensor: ntr x ntc chunks, row-major, into a rows x cols buffer (cols >= k; the pad columns are zeroed). */
+int q4nx_dequant_tensor_wide(const uint8_t* data, size_t nbytes, int chunk_bytes, int rows, int k, int cols, float* out);
+
 /* Q4_K chunk: 32 rows x 256 K, 4736 B.
  *   scales[8][32] uint8 @[0,256)    index g*32 + r
  *   mins  [8][32] uint8 @[256,512)  index g*32 + r

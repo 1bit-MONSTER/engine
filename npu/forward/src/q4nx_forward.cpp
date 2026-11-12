@@ -188,7 +188,10 @@ static bool valid_sidecar_dir(const std::string& d) {
 
 // The row width a tensor declares, in bytes: 1280 names the quarter-tile kind (Q4NX_CHUNK_Q4H), which a byte count
 // cannot tell from the 5120-byte tile. 0 for a tensor that is not two-dimensional.
+// A three-dimensional [rows/16, K/256, bytes] declares its chunk in the last dimension: 2304 and 4352 are the wide kinds
+// (Q4NX_CHUNK_Q4W / Q8W), and a Q4W tensor's byte count would otherwise pass for a 4608-byte Q4S grid.
 static int64_t declared_row_bytes(const TensorDesc* d) {
+    if (d && d->ndim == 3 && (d->shape[2] == Q4NX_CHUNK_Q4W || d->shape[2] == Q4NX_CHUNK_Q8W)) return d->shape[2];
     return (d && d->ndim == 2) ? d->shape[1] : 0;
 }
 
@@ -201,6 +204,13 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
         if (chunks % row_tiles) return -1;
         return q4nx_dequant_tensor_q4h((const uint8_t*)data, nbytes, rows,
                                        (int)(chunks / row_tiles) * Q4NX_Q4H_COLS, cols, out);
+    }
+    if (decl_row_bytes == Q4NX_CHUNK_Q4W || decl_row_bytes == Q4NX_CHUNK_Q8W) {
+        if (rows % Q4NX_WIDE_ROWS) return -1;
+        const size_t chunks = nbytes / (size_t)decl_row_bytes, row_tiles = (size_t)(rows / Q4NX_WIDE_ROWS);
+        if (chunks % row_tiles) return -1;
+        return q4nx_dequant_tensor_wide((const uint8_t*)data, nbytes, (int)decl_row_bytes, rows,
+                                        (int)(chunks / row_tiles) * Q4NX_WIDE_COLS, cols, out);
     }
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
     const size_t n = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
@@ -1941,9 +1951,10 @@ bool Q4nxNpuForward::load_norms() {
             auto rd = [&](const char* fmt, float* dst, int n) -> bool {
                 snprintf(nm, sizeof(nm), fmt, l);
                 TensorDesc* td = model_tensor_by_name(mw_, nm);
-                if (!td || n < 0) return false;
+                // named, not silent: init_host used to fail here with an empty error (Gemma4-12B-IT, engine#1786)
+                if (!td || n < 0) { err_ = std::string("model.q4nx has no ") + nm; return false; }
                 const uint16_t* p = bf16_data(mw_, td, (size_t)n);
-                if (!p) return false;
+                if (!p) { err_ = std::string(nm) + " is not bf16 of " + std::to_string(n) + " values"; return false; }
                 for (int i = 0; i < n; i++) dst[i] = bf16_to_f32(p[i]);
                 return true;
             };
@@ -1972,7 +1983,10 @@ bool Q4nxNpuForward::load_norms() {
                 // Gemma3 (extra_layer_norms 2) has the two feedforward norms only: no post-PLE norm and no
                 // layer scalar, so post_ln_ stays unused (ple_dim_ is 0) and layer_scale_ stays 1.
                 if (sem_.extra_layer_norms == 1) {
-                    if (!rd("model.layers.%d.post_layernorm.weight", post_ln_[l].data(), H)) return false;
+                    // post_layernorm is the per-layer-embedding block's norm (post_ln_ is read only there): a dense
+                    // Gemma4 (Gemma4-12B-IT, hidden_size_per_layer_input 0) has no PLE and no such tensor.
+                    if (ple_dim_ > 0 &&
+                        !rd("model.layers.%d.post_layernorm.weight", post_ln_[l].data(), H)) return false;
                     if (!rd("model.layers.%d.layer_output_scale.weight", &layer_scale_[l], 1)) return false;
                 }
             }
@@ -2205,7 +2219,17 @@ bool Q4nxNpuForward::load_layer(int l) {
                  NH * hd * (attn_gate_ ? 2 : 1), kpad_)) return false;   // q|gate rows
         if (!kv_shared) {
             if (!deq(&lw->k_proj_weight, wk_.data(), nkv * hd, kpad_)) return false;
-            if (!deq(&lw->v_proj_weight, wv_.data(), nkv * hd, kpad_)) return false;
+            const bool v_absent = lw->v_proj_weight.name[0] == '\0' || lw->v_proj_weight.data_size == 0;
+            if (v_absent && sem_.attention_k_eq_v) {
+                // attention_k_eq_v: v is the k projection (normalised scale-free in attention(), as Gemma4's v is)
+                std::copy(wk_.begin(), wk_.begin() + (ptrdiff_t)((size_t)nkv * hd * kpad_), wv_.begin());
+            } else if (v_absent) {
+                err_ = "model.layers." + std::to_string(l) + " has no self_attn.v_proj.weight and config.json does not "
+                       "declare attention_k_eq_v";
+                return false;
+            } else if (!deq(&lw->v_proj_weight, wv_.data(), nkv * hd, kpad_)) {
+                return false;
+            }
         }
         if (!deq(&lw->o_proj_weight, wo_.data(), H, q4nx_pad_k(NH * hd))) return false;
     }

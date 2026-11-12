@@ -581,6 +581,11 @@ add_test(NAME serve_watchdog COMMAND serve_watchdog_test)
 # app/npu_grammar.h, docs/npu.md "Sampling and structured output"); header only, no device.
 # engine#1781: the comparator behind NPU_BATCH_CHECK -- pure arithmetic over two float arrays, so it runs with no model,
 # no device and no runtime. It is a header, so the test includes it directly and needs no link libraries.
+# engine#1786: an unquantised BF16 matrix in either of FastFlowLM's two orientations (npu/forward/include/bf16_matrix.h).
+add_executable(bf16_matrix_test tests/bf16_matrix_test.cpp)
+target_include_directories(bf16_matrix_test PRIVATE npu/forward/include)
+add_test(NAME bf16_matrix COMMAND bf16_matrix_test)
+add_dependencies(onebit bf16_matrix_test)   # ci.yml builds onebit: this is how the arm reaches CI's ctest
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
 # The shape rule for a 1.8 external-data initializer (npu/pack_initializer_shape.h, engine#1503's graph-initializer
 # reader). Those packs zero every `dims`, so a byte length has to become a shape -- and a shape inferred wrongly imports
@@ -2245,6 +2250,12 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> hy_v3)
     set_tests_properties(batch_check_state_hy_v3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # The same hy_v3 with a `shared_expert_gate.weight` beside the router, as FastFlowLM's Qwen3.6-35B-A3B-NPU2 names its
+    # shared expert's sigmoid gate: the gate must be read and applied (engine#1786).
+    add_test(NAME batch_check_state_hy_v3_sgate
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> hy_v3_sgate)
+    set_tests_properties(batch_check_state_hy_v3_sgate PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # GPT-OSS (engine#1786): a container written in FastFlowLM's D2560/MX2560 form, sinks, o bias, yarn, the top-k
     # MoE with clamped SwiGLU, against a numpy GPT-OSS forward on the same bytes.
     add_test(NAME gptoss_forward

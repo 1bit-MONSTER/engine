@@ -75,6 +75,18 @@ for c in "${checks[@]}"; do
     out=$(python3 $c 2>&1); rc=$?
     last=$(printf '%s\n' "$out" | grep -v '^$' | tail -1)
     if [ $rc -eq 0 ]; then
+        # `submodule_pin_check --check` exits 0 having compared NOTHING when submodules are declared but
+        # none is checked out -- `0 submodule(s) at their pinned commit, N not initialised` -- which would
+        # print `ok` for a check that ran no comparison, the shape this script exists to stop. Matched on
+        # the tool's own summary rather than re-deriving the condition, because the tool is the thing that
+        # knows. Its OTHER "nothing to compare" case, `no submodules reported - cannot tell, and that is not
+        # a pass`, exits 2 and is left to fail: the tool already refuses to call that a pass.
+        # `--require-initialised` is where a release build turns this one into a failure.
+        case "$last" in
+            "submodule_pin: 0 submodule(s) at their pinned commit, "*)
+                printf 'skip  %-42s nothing compared: %s\n' "$name" "${last#submodule_pin: }"
+                skipped=$((skipped + 1)); continue ;;
+        esac
         printf 'ok    %-42s %s\n' "$name" "$last"
         ok=$((ok + 1))
     else

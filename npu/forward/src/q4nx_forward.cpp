@@ -2551,6 +2551,7 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
     // they are 11 ms + 7 ms per row, 67 ms of an 8-row round. NPU_COMMIT_FULL_REPLAY=1 keeps them, for an A/B.
     static const bool always_replay = std::getenv("NPU_COMMIT_FULL_REPLAY") != nullptr;
     const bool keep_batch_state = accepted == verify_rows_ && accepted > 0 && !always_replay && !replay_check;
+    if (keep_batch_state) full_accepts_kept_++;
     if (!keep_batch_state) {
         for (size_t l = 0; l < conv_state_.size(); l++) conv_state_[l] = snap_conv_[l];
         for (size_t l = 0; l < rec_state_.size(); l++) rec_state_[l] = snap_rec_[l];

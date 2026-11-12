@@ -204,6 +204,9 @@ public:
     // Public: a speculative driver outside this class begins a verify batch, then commits a prefix of it.
     void begin_verify(int rows, int start_pos);
     bool commit_verify_rows(int accepted);
+    // How many commits took the full-accept path (kept the batch's own state instead of restoring and replaying it).
+    // A test that compares the two paths reads it to know the path it meant to test is the one that ran.
+    long full_accepts_kept() const { return full_accepts_kept_; }
     bool gdn_apply_rows(int from, int to);      // recurrence-only replay of stored rows [from, to)
 
 
@@ -252,6 +255,7 @@ private:
     bool load_norms();
     std::vector<float> last_hidden_;  // last_hidden(): the post-final-norm state of the last position
     std::vector<float> last_residual_;  // and one norm earlier: the raw residual of the last position
+    long                full_accepts_kept_ = 0;   // commit_verify_rows(): see full_accepts_kept()
     std::vector<int>    tap_layers_;           // engine#1780: set_layer_taps()
     std::vector<float>* tap_sink_ = nullptr;
     size_t              tap_base_ = 0;         // where the current pass's rows start in *tap_sink_

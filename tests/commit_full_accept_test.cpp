@@ -61,6 +61,14 @@ int run_once(const char* dir, const char* out) {
         if (!any) { std::printf("SKIP: the model has no recurrent (GDN) state\n"); return 77; }
     }
     if (!fwd.step(10, pos, logits)) { std::printf("FAIL step after the commit: %s\n", fwd.last_error()); return 1; }
+    // The negative control: each run must have taken the path it was started for, or the comparison below would
+    // compare a path with itself and pass while testing nothing.
+    const bool replay = std::getenv("NPU_COMMIT_FULL_REPLAY") != nullptr;
+    if (fwd.full_accepts_kept() != (replay ? 0 : 1)) {
+        std::printf("FAIL the %s run took the other commit path (%ld full accept(s) kept)\n", replay ? "replay" : "kept",
+                    fwd.full_accepts_kept());
+        return 1;
+    }
     FILE* f = std::fopen(out, "wb");   // file-create-ok: the test's own scratch file beside its build, removed below
     if (!f) return 1;
     auto put = [&](const std::vector<std::vector<float>>& vv) {

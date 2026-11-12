@@ -76,6 +76,15 @@ def registrations(text: str) -> set[tuple[str, str]]:
     return out
 
 
+def readable(root: pathlib.Path, rev: str) -> bool:
+    """Is `rev` a commit this repository can read? Checked before anything is compared, because an unreadable revision used
+    to produce an empty tree and a confident "437 of 437 registrations are missing" -- a wrong answer in the loud direction,
+    which is worse than the cannot-tell it should have been."""
+    p = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
+                       capture_output=True, text=True, check=False)
+    return p.returncode == 0
+
+
 def files_at_rev(root: pathlib.Path, rev: str) -> list[str]:
     """The CMake files AS THEY EXIST AT THAT REVISION, not as they exist in the working tree.
 
@@ -123,6 +132,12 @@ def merges_cleanly(root: pathlib.Path, base: str, head: str) -> tuple[bool, list
 
 
 def check(root: pathlib.Path, base: str, head: str | None = None) -> int:
+    if not readable(root, base):
+        print(f"registration_loss: cannot read {base} - cannot tell, and that is not a pass")
+        return 2
+    if head and not readable(root, head):
+        print(f"registration_loss: cannot read {head} - cannot tell, and that is not a pass")
+        return 2
     before = at_rev(root, base)
     after = at_rev(root, head) if head else at_tree(root)
     if not before:
@@ -242,6 +257,11 @@ def self_test() -> int:
                       {"CMakeLists.txt": "changed_line\n"}])
     check_that(check(d6, shas6[0], shas6[1]) == 1,
                "a branch that lacks rows AND conflicts is the dangerous combination")
+
+    # 5c. an unreadable revision is 'cannot tell' -- it used to report every base row as missing, which is the loud direction
+    d7, shas7 = repo([{"CMakeLists.txt": "add_test(NAME a COMMAND x)\n"}])
+    check_that(check(d7, shas7[0], "no-such-rev") == 2, "an unreadable --head is exit 2, not 'everything is missing'")
+    check_that(check(d7, "no-such-rev", shas7[0]) == 2, "an unreadable --base is exit 2 too")
 
     # 6. nothing parsed at the base is 'cannot tell', not a pass
     d3, shas3 = repo([{"CMakeLists.txt": "# nothing\n"}])

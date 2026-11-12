@@ -3487,6 +3487,57 @@ RoleLayerReport container_role_layer_types(const std::vector<Q4nxTensor>& tensor
     return out;
 }
 
+// engine#1788, slice 3c: the roles a layer type does not change, and the engine slot each becomes. Every right-hand
+// side below is a literal that exists in npu/forward/src (grep the strings, do not infer them from HF names).
+static const struct { const char* role; const char* slot; } kRoleSlots[] = {
+    {"embed",              "model.embed_tokens.weight"},
+    {"final_norm",         "model.norm.weight"},
+    {"input_norm",         "input_layernorm.weight"},
+    {"post_norm",          "post_attention_layernorm.weight"},
+    {"lm_head",            "lm_head.weight"},
+    {"q_proj",             "self_attn.q_proj.weight"},
+    {"k_proj",             "self_attn.k_proj.weight"},
+    {"v_proj",             "self_attn.v_proj.weight"},
+    {"o_proj",             "self_attn.o_proj.weight"},
+    {"self_attn_gate_proj","self_attn.gate_proj.weight"},
+    {"gate_proj",          "mlp.gate_proj.weight"},
+    {"up_proj",            "mlp.up_proj.weight"},
+    {"down_proj",          "mlp.down_proj.weight"},
+    {"gate_exps",          "mlp.experts.gate_proj.weight"},
+    {"up_exps",            "mlp.experts.up_proj.weight"},
+    {"down_exps",          "mlp.experts.down_proj.weight"},
+    {"shortconv_in_proj",  "shortconv.in_proj.weight"},
+};
+
+// The roles this slice does NOT place, each with the reason. A number here is honest; a guessed slot is not.
+static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
+    {"qkv_proj",            "the slot prefix is the LAYER TYPE's (`linear_attn.` or `self_attn.`), so it needs the second key"},
+    {"q_norm",              "the engine's normaliser slots are per-architecture; none is verified for this role yet"},
+    {"k_norm",              "same: the engine's `k_norm` string is a config field, not a verified weight slot"},
+    {"gate_up_proj",        "fused in some containers, two slots in the engine; needs a measured split"},
+    {"moe_router",          "the engine reads `mlp.router.bias`; the weight slot is not verified"},
+    {"share_gate_exps",     "the shared expert's slots differ per architecture and none is verified"},
+    {"share_up_exps",       "same"},
+    {"share_down_exps",     "same"},
+    {"shared_expert_gate",  "same"},
+};
+
+RoleSlotReport container_role_slots(const ContainerRoles& roles) {
+    RoleSlotReport r;
+    for (const auto& kv : kRoleSlots) r.slot_of[kv.role] = kv.slot;
+    for (const auto& kv : kRoleNoSlot) r.why[kv.role] = kv.why;
+    // Every role the caller actually met must be either placed or explained: a role that is in neither is a hole in
+    // this table, and saying so is the point of the report.
+    for (const auto& c : roles.counts) {
+        if (r.slot_of.count(c.first)) r.placed.push_back(c.first);
+        else if (r.why.count(c.first)) r.no_slot.push_back(c.first);
+        else { r.no_slot.push_back(c.first); r.why[c.first] = "a role this table does not know: it needs a decision"; }
+    }
+    std::sort(r.placed.begin(), r.placed.end());
+    std::sort(r.no_slot.begin(), r.no_slot.end());
+    return r;
+}
+
 ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
     struct Rule { const char* role; const char* needle; };
     // Longest/most specific spellings first: `qkv_proj` before `q_proj`, `gate_up_proj` before `gate_proj`.

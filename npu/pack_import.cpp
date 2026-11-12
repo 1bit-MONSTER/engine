@@ -3507,9 +3507,28 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
         {"k_proj",        "k_proj"},         {"k_proj",        "attn_k"},         {"k_proj", "wk."},
         {"v_proj",        "v_proj"},         {"v_proj",        "attn_v"},         {"v_proj", "wv."},
         {"o_proj",        "o_proj"},         {"o_proj",        "attn_output"},    {"o_proj", "wo."},
+        // engine#1788: an ATTENTION output gate is not the FFN gate. MiniCPM-V 4.7 carries `attn_output_gate: true`,
+        // so every one of its 30 `self_attn.gate_proj.weight` tensors was filed under `gate_proj` -- the dense-MLP role
+        // -- and a consumer would have wired an attention gate into the FFN path. The forward already keeps them apart
+        // (model.h: `gate_proj_weight` vs `self_attn_gate_proj_weight`), so this uses its name and must precede the
+        // `gate_proj` needle.
+        {"self_attn_gate_proj", "self_attn.gate_proj"},
         {"gate_proj",     "gate_proj"},      {"gate_proj",     "ffn_gate"},
         {"up_proj",       "up_proj"},        {"up_proj",       "ffn_up"},
-        {"down_proj",     "down_proj"},      {"down_proj",     "ffn_down"},
+        {"down_proj",     "down_proj"},      {"down_proj",     "ffn_down"},        // engine#1788 acceptance (F1 slice 3a gap): the MoE families MiniCPM-V 4.7 names, mapped to the roles the NPU
+        // forward ALREADY reads -- npu/forward/include/model.h carries up_exps_weight / gate_exps_weight /
+        // down_exps_weight / share_{up,gate,down}_exps_weight / moe_router_weight / shared_expert_gate_weight with
+        // those exact container names in their comments. So this is translation to an existing vocabulary, not a new
+        // one. The `share_*` spellings come first because `share_gate_exps_proj` contains `gate_exps_proj`.
+        {"share_gate_exps",   "share_gate_exps_proj"},
+        {"share_up_exps",     "share_up_exps_proj"},
+        {"share_down_exps",   "share_down_exps_proj"},
+        {"gate_exps",         "gate_exps_proj"},
+        {"up_exps",           "up_exps_proj"},
+        {"down_exps",         "down_exps_proj"},
+        {"moe_router",        "moe_router"},
+        {"shared_expert_gate","shared_expert_gate"},
+
         {"input_norm",    "input_layernorm"},{"input_norm",    "attn_norm"},      {"input_norm", "attention_norm"},
         {"post_norm",     "post_attention_layernorm"},          {"post_norm",    "ffn_norm"},
         {"final_norm",    "final_layernorm"},
@@ -3519,6 +3538,24 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
     // and `model.mtp.*` is a draft head rather than a model.
     static const char* kSsm[] = {"linear_attn.", "ssm_alpha_proj", "ssm_beta_proj", "ssm_conv1d", "ssm_dt",
                                  "ssm_norm", "ssm_out_proj"};
+    // engine#1788: gemma3/gemma4/bolt carry five tensor families this engine's forward does NOT read -- sandwich norms
+    // (`pre_/post_feedforward_layernorm`), an input gate, a per-layer projection (and its `_prefill` sibling) and a layer
+    // output scale. Nothing here has a field in npu/forward/include/model.h, so they are RECOGNISED rather than mapped:
+    // `unassigned` has to keep meaning "nothing knows this", and these are known -- measured on gemma4-e2b (319 of 709)
+    // and bolt-e4b (382 of 849), which were the two packs the classifier could not finish.
+    // `post_layernorm` and `per_layer_model_proj` are here for a measured reason, not a guess: gemma4-e2b carries
+    // BOTH `post_attention_layernorm` (35, classified `post_norm`) and `post_layernorm` (35), so the second cannot be
+    // the forward's post-attention norm -- they are different tensors in the same model. gemma3-270m has no
+    // `post_layernorm` at all, which is why only gemma4/bolt were left with it.
+    static const char* kGemmaLocal[] = {"pre_feedforward_layernorm", "post_feedforward_layernorm", "inp_gate",
+                                        "layer_output_scale", "per_layer_projection", "post_layernorm",
+                                        "per_layer_model_proj"};
+    // engine#1788: the last three on gemma4/bolt are recognised for a different reason than the gemma ones, so they get
+    // their own role. `rope_freqs.weight` is a file the forward only FLAGS (`model_config.h`: has_rope_freqs_file), and
+    // `per_layer_token_embd` (with its `.scale` sibling) is the per-layer token embedding that our ONNX path reads as
+    // `embed_tokens_per_layer` (engine#1725) but the container path has no field for. Recognised, not mapped: neither
+    // has a field to fill, and calling them "unassigned" would say nothing knows them when the opposite is true.
+    static const char* kContainerExtras[] = {"rope_freqs", "per_layer_token_embd"};
     static const char* kMtp[] = {"model.mtp."};
     ContainerRoles out;
     for (const auto& t : tensors) {
@@ -3536,8 +3573,20 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
                 matched = true;
                 break;
             }
-            if (!matched && n.find("norm.weight") != std::string::npos && n.find("layers.") == std::string::npos)
+            // "never inside a layer" has to be spelled positively enough to survive the container's own naming:
+            // MiniCPM-V 4.7 spells its blocks `model.layer.N.` (singular), so a guard against "layers." alone filed
+            // 30 per-layer linear_attn.ssm_norm tensors as final_norm -- ahead of the kSsm loop below (engine#1788).
+            if (!matched && n.find("norm.weight") != std::string::npos && n.find("layers.") == std::string::npos &&
+                n.find("layer.") == std::string::npos)
                 role = "final_norm";   // `model.norm.weight`: the top-level norm, never inside a layer
+            if (!matched && role.empty()) {
+                for (const char* e : kContainerExtras)
+                    if (n.find(e) != std::string::npos) { role = "container_extra"; matched = true; break; }
+            }
+            if (!matched && role.empty()) {
+                for (const char* g : kGemmaLocal)
+                    if (n.find(g) != std::string::npos) { role = "gemma_local"; matched = true; break; }
+            }
             if (!matched && role.empty()) {
                 for (const char* s : kSsm)
                     if (n.find(s) != std::string::npos) { role = "ssm"; matched = true; break; }
@@ -4756,6 +4805,15 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // Census yes, writer no (see the note where graph_weights is decided): this genre's weights are 1-D external-data
     // blocks, and until the repacker exists an import would write a container nothing can read. Refused here rather
     // than in plan(), because `info` must keep reporting the genre it can now see.
+    // engine#1786 (item F1) / engine#1788: a container-genre pack has no `model.onnx` by design, so without a branch here
+    // the first byte fails with "cannot open <pack>/model.onnx" -- a missing-file message about a pack that has no graph
+    // at all. Refused by name, the same way the external-data genre below is, until the container-genre writer exists.
+    if (p.container_tensors >= 0) {
+        throw std::runtime_error(
+            "this pack is a safetensors container (model.q4nx): " + std::to_string(p.container_tensors) +
+            " tensor(s); importing it needs the container-genre writer (engine#1786, item F1), which the importer does "
+            "not have yet. `1bit npu-pack info` reports what the container holds");
+    }
     if (p.graph_packed_siblings > 0) {
         // The genre has a writer now (engine#1503): decode -> convert -> split by role -> the same I8 tile chunks,
         // with its own function because import_pack is built around the .fconst envelope.

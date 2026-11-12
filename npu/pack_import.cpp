@@ -3325,6 +3325,12 @@ std::string Plan::manifest() const {
         c["tensors"] = container_tensors;
         c["payload_bytes"] = container_payload_bytes;
         c["dtypes"] = container_dtypes;
+        if (container_role_layer_rows >= 0)
+            c["role_layer_types"] = {{"keys", container_role_layer_rows},
+                                     {"spans", container_role_layer_spans},
+                                     {"out_of_range", container_role_layer_out_of_range}};
+        if (!container_role_layer_span_names.empty())
+            c["role_layer_types"]["span_names"] = container_role_layer_span_names;
         c["note"] = container_note;
         j["container"] = c;
     }
@@ -3428,6 +3434,59 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
 // engine#1786 (item F1), slice 3a: roles from names. The rule is ordered -- the first match wins -- so `q_proj.bias`
 // classifies as a bias of q_proj rather than as an unknown tensor, and a name that matches nothing lands in `unassigned`
 // with its own name rather than being guessed from its shape.
+// engine#1788, slice 3c step 1: (role, layer type), the key the writer needs. See the header for the measurement.
+RoleLayerReport container_role_layer_types(const std::vector<Q4nxTensor>& tensors,
+                                           const std::vector<std::string>& layer_types) {
+    RoleLayerReport out;
+    const ContainerRoles roles = container_roles(tensors);
+    std::map<std::pair<std::string, std::string>, std::map<std::string, int64_t>> by_key;
+    std::map<std::string, std::string> role_of_stem;
+    std::set<std::string> seen_in_layer;
+    for (const auto& t : tensors) {
+        const auto it = roles.role_of.find(t.name);
+        if (it == roles.role_of.end()) continue;
+        std::string::size_type pos = t.name.find(".layers.");
+        std::string::size_type off = 8;
+        if (pos == std::string::npos) { pos = t.name.find(".layer."); off = 7; }
+        if (pos == std::string::npos) { out.no_layer.push_back(it->second + "  (" + t.name + ")"); continue; }
+        const std::string::size_type start = pos + off;
+        std::string::size_type end = start;
+        while (end < t.name.size() && t.name[end] >= '0' && t.name[end] <= '9') ++end;
+        if (end == start) continue;
+        const int64_t layer = std::atoll(t.name.substr(start, end - start).c_str());
+        if (layer < 0 || layer >= int64_t(layer_types.size())) { ++out.out_of_range; continue; }
+        std::string shape = "[";
+        for (size_t i = 0; i < t.shape.size(); ++i) shape += (i ? "," : "") + std::to_string(t.shape[i]);
+        shape += "] " + t.dtype;
+        // The key is the TENSOR STEM, not the role: `ssm` covers dt.bias, conv1d, norm and a, which are four different
+        // tensors with four shapes -- a span there is my role vocabulary being coarse, not an ambiguity. Two shapes for
+        // the SAME stem in ONE layer type is the case a third key would be needed for (gemma4: gate/up/down_proj are
+        // 2304 wide on 20 layers and 1152 on 15, and both kinds sit in both layer types).
+        std::string stem = t.name.substr(0, start) + "N" + t.name.substr(end);   // `model.layers.7.x` -> `model.layers.N.x`
+        by_key[{stem, layer_types[size_t(layer)]}][shape]++;
+        role_of_stem.emplace(stem, it->second);
+        seen_in_layer.insert(it->second);
+    }
+    for (const auto& kv : by_key) {
+        if (kv.second.size() > 1) {
+            out.spans.push_back(kv.first.first + " in " + kv.first.second + " appears in " +
+                                std::to_string(kv.second.size()) + " shapes");
+            continue;
+        }
+        int64_t n = 0;
+        for (const auto& sh : kv.second) n += sh.second;
+        out.rows.push_back({kv.first.first, role_of_stem[kv.first.first], kv.first.second, kv.second.begin()->first, n});
+    }
+    for (const auto& kv : roles.counts) {
+        if (seen_in_layer.count(kv.first)) continue;
+        bool already = false;
+        for (const auto& x : out.no_layer)
+            if (x.rfind(kv.first + "  ", 0) == 0) { already = true; break; }
+        if (!already) out.no_layer.push_back(kv.first + "  (no tensor inside a layer)");
+    }
+    return out;
+}
+
 ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
     struct Rule { const char* role; const char* needle; };
     // Longest/most specific spellings first: `qkv_proj` before `q_proj`, `gate_up_proj` before `gate_proj`.
@@ -3590,6 +3649,25 @@ Plan plan(const std::string& pack_dir) {
             // wins) -- the container's own `dims` still takes precedence in container_geometry().
             std::string cfg_source;
             const json cfg = load_geometry(pack_dir, &cfg_source);
+            // engine#1788, slice 3c: the (role, layer type) key, when the pack says what its layers are.
+            if (const Q4nxContainer& cc = c; true) {
+                std::vector<std::string> lt;
+                const json* src = cfg.contains("layer_types") ? &cfg : nullptr;
+                if (!src && cfg.contains("text_config") && cfg["text_config"].is_object() &&
+                    cfg["text_config"].contains("layer_types"))
+                    src = &cfg["text_config"];
+                if (src && (*src)["layer_types"].is_array())
+                    for (const auto& x : (*src)["layer_types"])
+                        if (x.is_string()) lt.push_back(x.get<std::string>());
+                if (!lt.empty()) {
+                    const RoleLayerReport rep = container_role_layer_types(cc.tensors, lt);
+                    p.container_role_layer_rows = int64_t(rep.rows.size());
+                    p.container_role_layer_spans = int64_t(rep.spans.size());
+                    p.container_role_layer_out_of_range = rep.out_of_range;
+                    // the pairs a third key would be needed for, named: this is the writer's remaining question, not a number
+                    for (size_t i = 0; i < rep.spans.size() && i < 8; ++i) p.container_role_layer_span_names.push_back(rep.spans[i]);
+                }
+            }
             const ContainerGeometry g = container_geometry(c.meta, cfg);
             p.dims = g.dims;
             p.container_geometry_source = g.source;

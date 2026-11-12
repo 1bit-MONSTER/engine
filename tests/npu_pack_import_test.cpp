@@ -5108,6 +5108,43 @@ void test_container_plan(const std::string& root) {
 // pack that classifies completely, the alternate spellings that must classify the same way, and the two residues (SSM
 // and MTP) which must be RECOGNISED rather than reported as unknown, since `unassigned` is only useful if it means
 // "nothing knows this".
+// engine#1788, slice 3c step 1: (role, layer type), the key the writer needs. Measured on gemma4-e2b (q_proj N=384 on all
+// 28 sliding layers, N=768 on all 7 full) and bolt-e4b ((640,5120) on 35 sliding, (1280,5120) on 7 full).
+void test_container_role_layer_types() {
+    const auto t = [](const std::string& n, std::vector<int64_t> shape, const char* dt = "I8") {
+        pi::Q4nxTensor x; x.name = n; x.dtype = dt; x.shape = std::move(shape); return x;
+    };
+    // 2 sliding layers + 1 full layer, q_proj with the sliding/full widths that the real packs show
+    const std::vector<std::string> lt = {"sliding_attention", "sliding_attention", "full_attention"};
+    const std::vector<pi::Q4nxTensor> v = {
+        t("model.layers.0.self_attn.q_proj.weight", {384, 8, 4736}),
+        t("model.layers.1.self_attn.q_proj.weight", {384, 8, 4736}),
+        t("model.layers.2.self_attn.q_proj.weight", {768, 8, 4736}),
+        t("model.embed_tokens.weight", {248144, 2048}, "BF16")};
+    const pi::RoleLayerReport r = pi::container_role_layer_types(v, lt);
+    check(r.spans.empty(), "role+layer: the two widths split by layer type, they do not span");
+    bool sliding = false, full = false;
+    for (const auto& row : r.rows)
+        if (row.stem == "model.layers.N.self_attn.q_proj.weight" && row.layer_type == "sliding_attention") {
+            sliding = row.count == 2 && row.shape == "[384,8,4736] I8";
+        } else if (row.stem == "model.layers.N.self_attn.q_proj.weight" && row.layer_type == "full_attention") {
+            full = row.count == 1 && row.shape == "[768,8,4736] I8";
+        }
+    check(sliding && full, "role+layer: one row per (role, layer type) with its shape and count");
+    check(!r.no_layer.empty(), "role+layer: a role outside any layer is reported, not dropped");
+
+    // a role carried in two shapes under ONE layer type is the case a third key would be needed for: reported, not resolved
+    const std::vector<pi::Q4nxTensor> two = {t("model.layers.0.self_attn.q_proj.weight", {384, 8, 4736}),
+                                             t("model.layers.1.self_attn.q_proj.weight", {512, 8, 4736})};
+    const pi::RoleLayerReport r2 = pi::container_role_layer_types(two, lt);
+    check(r2.spans.size() == 1 && r2.rows.empty(), "role+layer: two shapes in one layer type is a span, not a row");
+
+    // a pack whose layer count disagrees with its declared layer_types is counted, not silently clipped
+    const std::vector<pi::Q4nxTensor> oor = {t("model.layers.9.self_attn.q_proj.weight", {384, 8, 4736})};
+    check(pi::container_role_layer_types(oor, lt).out_of_range == 1,
+          "role+layer: a layer index past layer_types is counted as out of range");
+}
+
 void test_container_roles() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6149,6 +6186,7 @@ int main(int argc, char** argv) {
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
         test_container_roles();
+        test_container_role_layer_types();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);

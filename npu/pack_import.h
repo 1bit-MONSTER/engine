@@ -266,6 +266,11 @@ struct Plan {
     int64_t container_payload_bytes = 0;
     std::map<std::string, int64_t> container_dtypes;
     std::string container_note;   // what the container genre still needs, empty for a non-container pack
+    // engine#1788, slice 3c: the (role, layer type) key, when the pack declares layer_types. -1 when it does not.
+    int64_t container_role_layer_rows = -1;
+    int64_t container_role_layer_spans = -1;
+    int64_t container_role_layer_out_of_range = 0;
+    std::vector<std::string> container_role_layer_span_names;   // the pairs a third key would need, named
     // engine#1786 (item F1), slice 2: WHERE the container's geometry came from, and what it could not reach.
     // A bare number in `dims` cannot say whether the pack declared it or a file beside it did, and those two are free to
     // disagree (13 of the 29 packs measured carry a `dims` block; all 29 carry config.json). Empty for a non-container pack.
@@ -380,6 +385,27 @@ struct ContainerRoles {
     std::map<std::string, int> counts;            // role -> number of tensors
 };
 ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors);
+
+// engine#1788, slice 3c: a container's roles need a SECOND key, and the second key is the layer type.
+// Measured: gemma4-e2b's `q_proj` is N=384 on all 28 `sliding_attention` layers and N=768 on all 7 `full_attention` ones;
+// bolt-e4b's is (640,5120) on all 35 sliding and (1280,5120) on all 7 full. A perfect partition, structural in origin
+// (5 heads against 10 at head_dim 128). A writer keyed on role alone cannot express these packs; (role, layer type) can.
+// A pair that spans TWO shapes is reported in `spans` rather than resolved -- that would need a third key, not a guess.
+struct RoleLayerRow {
+    std::string stem;       // the tensor's name with the layer index elided: `model.layers.N.mlp.gate_proj.weight`
+    std::string role;       // that tensor's role, for a reader
+    std::string layer_type;
+    std::string shape;      // "[a,b,c] I8"
+    int64_t count = 0;
+};
+struct RoleLayerReport {
+    std::vector<RoleLayerRow> rows;      // the writer's key, one row per (role, layer type)
+    std::vector<std::string> spans;      // "<role> in <type> appears in N shapes" -- needs a third key
+    std::vector<std::string> no_layer;   // roles with no tensor inside a layer (an embedding, a head, a rope table)
+    int64_t out_of_range = 0;            // tensors whose layer index is outside layer_types
+};
+RoleLayerReport container_role_layer_types(const std::vector<Q4nxTensor>& tensors,
+                                           const std::vector<std::string>& layer_types);
 
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.

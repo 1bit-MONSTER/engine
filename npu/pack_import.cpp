@@ -3479,6 +3479,8 @@ PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
     for (const auto& t : tensors) {
         PlacementRow row;
         row.tensor = t.name;
+        row.shape = t.shape;
+        row.dtype = t.dtype;
         const auto it = roles.role_of.find(t.name);
         if (it == roles.role_of.end()) { row.why = "no role recognised"; ++out.no_role; out.rows.push_back(row); continue; }
         row.role = it->second;

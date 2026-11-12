@@ -416,6 +416,8 @@ struct PlacementRow {
     std::string role;
     std::string slot;         // "" when there is no destination
     std::string why;          // the reason, when slot is empty
+    std::vector<int64_t> shape;   // carried so a placement can be checked against the shape the engine documents
+    std::string dtype;
 };
 struct PlacementReport {
     std::vector<PlacementRow> rows;

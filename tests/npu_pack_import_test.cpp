@@ -5194,6 +5194,33 @@ static void test_container_placement_real(const std::string& dir, const std::vec
     for (const auto& kv : held_by_reason) std::printf("    held: %lld x %s\n", (long long)kv.second, kv.first.c_str());
     std::map<std::string, int64_t> roles_seen;
     for (const auto& row : r.rows) if (!row.role.empty()) roles_seen[row.role]++;
+    // REVIEW of #2291 direction: the engine documents a rank and a dtype per slot (model.h), and both are
+    // architecture-independent -- a router that is 3-D or an expert that is BF16 is wrong for every model.
+    {
+        std::map<std::string, std::string> seen;
+        for (const auto& row : r.rows) {
+            if (row.slot.empty() || seen.count(row.slot)) continue;
+            std::string sh = "[";
+            for (size_t i = 0; i < row.shape.size(); ++i) sh += (i ? "," : "") + std::to_string(row.shape[i]);
+            sh += "]";
+            seen[row.slot] = sh + " " + row.dtype;
+            std::printf("    slot %-42s %s %s\n", row.slot.c_str(), sh.c_str(), row.dtype.c_str());
+        }
+    }
+    // The rank and dtype are architecture-independent even though the extents are not: model.h documents the router as a
+    // 2-D BF16 tensor and the expert stacks as 3-D I8. A placement that reached the right NAME with the wrong shape would
+    // load a tensor the forward reads as something else, so these are asserted per placed row on the real container.
+    for (const auto& row : r.rows) {
+        if (row.slot.empty()) continue;
+        if (row.slot == "moe_router.weight") {
+            check(row.shape.size() == 2, "placement: the router is 2-D in " + dir);
+            check(row.dtype == "BF16", "placement: and BF16 in " + dir);
+        }
+        if (row.slot.find("exps_proj") != std::string::npos) {
+            check(row.shape.size() == 3, "placement: an expert stack is 3-D (" + row.slot + ") in " + dir);
+            check(row.dtype == "I8", "placement: and I8 (" + row.slot + ") in " + dir);
+        }
+    }
     std::printf("    roles:"); for (const auto& kv : roles_seen) std::printf(" %s=%lld", kv.first.c_str(), (long long)kv.second);
     std::printf("\n");
     std::printf("    UNKNOWN:");

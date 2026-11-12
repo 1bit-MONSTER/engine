@@ -3435,6 +3435,25 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
 // classifies as a bias of q_proj rather than as an unknown tensor, and a name that matches nothing lands in `unassigned`
 // with its own name rather than being guessed from its shape.
 // engine#1788, slice 3c step 1: (role, layer type), the key the writer needs. See the header for the measurement.
+// The two GROUP roles (ssm, gemma_local) carry several destinations each, and the destination is in the tensor's own
+// suffix. Two of gemma_local's seven stems have a slot in npu/forward/src -- the einsum-free `pre/post_feedforward_
+// layernorm` pair -- and the rest have none, so this table places exactly those two and leaves the others refused.
+static const struct { const char* role; const char* suffix; const char* slot; } kGroupSuffixSlots[] = {
+    {"gemma_local", "pre_feedforward_layernorm.weight",  "pre_feedforward_layernorm.weight"},
+    {"gemma_local", "post_feedforward_layernorm.weight", "post_feedforward_layernorm.weight"},
+};
+
+static std::string group_suffix_slot(const std::string& role, const std::string& tensor) {
+    for (const auto& kv : kGroupSuffixSlots) {
+        if (role != kv.role) continue;
+        const std::string suffix = kv.suffix;
+        if (tensor.size() >= suffix.size() &&
+            tensor.compare(tensor.size() - suffix.size(), suffix.size(), suffix) == 0)
+            return kv.slot;
+    }
+    return std::string();
+}
+
 PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
                                   const std::vector<std::string>& layer_types) {
     PlacementReport out;
@@ -3460,6 +3479,9 @@ PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
             }
         }
         row.slot = container_role_slot(row.role, row.layer_type);
+        // a group role carries its destination in the tensor's own suffix -- the fourth key, applied where the engine
+        // actually has a slot for one of the group's members
+        if (row.slot.empty() && !row.layer_type.empty()) row.slot = group_suffix_slot(row.role, t.name);
         if (row.slot.empty()) {
             const auto why = table.why.find(row.role);
             row.why = why != table.why.end() ? why->second

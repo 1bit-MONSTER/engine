@@ -5231,6 +5231,20 @@ void test_container_placement() {
     check(r.rows[5].slot.empty() && r.rows[5].role.empty(), "placement: a tensor with no role is counted apart");
     check(r.no_role == 1, "placement: no_role counts the vocabulary gap, not the deliberate refusal");
     check(r.unplaced == 2, "placement: unplaced counts the two decisions, not the vocabulary gap");
+    {
+        // the group roles: the destination is the tensor's own suffix, and only the members the engine has a slot for move
+        const std::vector<Q4nxTensor> g = {
+            t("model.layers.0.pre_feedforward_layernorm.weight"),
+            t("model.layers.0.post_feedforward_layernorm.weight"),
+            t("model.layers.0.inp_gate.weight"),
+        };
+        const pi::PlacementReport gr = pi::container_placement(g, lt);
+        check(gr.rows[0].role == "gemma_local", "placement: the gemma group is one role");
+        check(gr.rows[0].slot == "pre_feedforward_layernorm.weight", "placement: the suffix IS the destination (pre)");
+        check(gr.rows[1].slot == "post_feedforward_layernorm.weight", "placement: and for post");
+        check(gr.rows[2].slot.empty(), "placement: a member with no engine slot stays unplaced");
+        check(gr.placed == 2 && gr.unplaced == 1, "placement: two placed, one held, for the three members");
+    }
 }
 
 void test_container_roles_moe_and_singular_layer() {

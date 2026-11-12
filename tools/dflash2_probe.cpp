@@ -55,6 +55,7 @@
 #include "forward/include/q4nx_dequant.h"
 #include "pack_import.h"
 #include "q4nx_forward.h"
+#include "spec_greedy.h"     // the greedy round and the fallback rule
 #include "npu_engine_i8ctx_inc.h"   // I8Ctx: one int8 GEMM design from a full ELF
 
 namespace {
@@ -465,21 +466,16 @@ int loop(int argc, char** argv) {
     // rounds emitted fewer tokens than that on average stops speculating and finishes with plain greedy steps.
     const double fallback_below = getenv("DFLASH2_FALLBACK") ? std::atof(getenv("DFLASH2_FALLBACK")) : 0.0;
     const int fallback_after = getenv("DFLASH2_FALLBACK_ROUNDS") ? std::max(1, std::atoi(getenv("DFLASH2_FALLBACK_ROUNDS"))) : 3;
-    // The rule looks at the last DFLASH2_FALLBACK_ROUNDS rounds only, so a request whose first rounds happened to
-    // accept well does not keep speculating on that credit.
-    std::vector<int> recent;   // tokens emitted by each round, newest last
+    // The rule (spec_greedy.h) looks at the last DFLASH2_FALLBACK_ROUNDS rounds only, so a request whose first rounds
+    // happened to accept well does not keep speculating on that credit.
+    SpecFallback fallback(fallback_below, fallback_after);
     bool plain = false;
     long plain_steps = 0;
     while (int(out.size()) < want_tokens) {
-        if (!plain && fallback_below > 0.0 && int(recent.size()) >= fallback_after) {
-            double sum = 0.0;
-            for (size_t i = recent.size() - size_t(fallback_after); i < recent.size(); i++) sum += recent[i];
-            const double avg = sum / double(fallback_after);
-            if (avg < fallback_below) {
-                plain = true;
-                std::printf("loop: falling back to plain decoding after %ld rounds (last %d rounds: %.2f tokens per round, below %.2f)\n",
-                            rounds, fallback_after, avg, fallback_below);
-            }
+        if (!plain && fallback.off()) {
+            plain = true;
+            std::printf("loop: falling back to plain decoding after %ld rounds (last %d rounds below %.2f tokens per round)\n",
+                        rounds, fallback_after, fallback_below);
         }
         if (plain) {
             if (!fwd.step(cur, pos, logits)) die(std::string("step: ") + fwd.last_error());
@@ -536,15 +532,14 @@ int loop(int argc, char** argv) {
         fwd.begin_verify(int(vt.size()), pos);
         if (!fwd.step_batch_all(vt, pos, logits_all)) die(std::string("verify: ") + fwd.last_error());
         const size_t NV = logits_all.size() / vt.size();
-        int a = 0;
-        int next = -1;
-        for (int i = 0; i < int(vt.size()); i++) {
-            const float* lr = logits_all.data() + size_t(i) * NV;
-            const int g = int(std::max_element(lr, lr + NV) - lr);
-            if (i < per && g == drafts[size_t(i)]) { a++; continue; }
-            next = g;
-            break;
+        std::vector<int> choices(vt.size());
+        for (size_t i = 0; i < vt.size(); i++) {
+            const float* lr = logits_all.data() + i * NV;
+            choices[i] = int(std::max_element(lr, lr + NV) - lr);
         }
+        const GreedyRound gr = greedy_round(drafts.data(), per, choices.data(), int(choices.size()));
+        if (gr.accepted < 0) die("verify: the pass returned fewer rows than it was given");
+        const int a = gr.accepted, next = gr.next;
         if (!fwd.commit_verify_rows(a + 1)) die(std::string("commit: ") + fwd.last_error());
         taps.resize(tap_base + size_t(a + 1) * rowf);   // keep the rows of the committed positions only
         t_verify += now_s() - c0;
@@ -552,7 +547,7 @@ int loop(int argc, char** argv) {
         for (int i = 0; i < a; i++) out.push_back(drafts[size_t(i)]);
         out.push_back(next);
         rounds++;
-        recent.push_back(a + 1);
+        fallback.record(a + 1);
         accepted_total += a;
         hist[size_t(a)]++;
         // extend the fused context by the committed rows

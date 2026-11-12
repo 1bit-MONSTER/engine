@@ -3479,6 +3479,7 @@ PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
     for (const auto& t : tensors) {
         PlacementRow row;
         row.tensor = t.name;
+        std::string layer_prefix;
         row.shape = t.shape;
         row.dtype = t.dtype;
         const auto it = roles.role_of.find(t.name);
@@ -3494,6 +3495,7 @@ PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
             if (end > start) {
                 const int64_t layer = std::atoll(t.name.substr(start, end - start).c_str());
                 row.layer = std::to_string(layer);
+                layer_prefix = t.name.substr(0, end) + ".";
                 if (layer >= 0 && layer < int64_t(layer_types.size())) row.layer_type = layer_types[size_t(layer)];
             }
         }
@@ -3501,6 +3503,11 @@ PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
         // a group role carries its destination in the tensor's own suffix -- the fourth key, applied where the engine
         // actually has a slot for one of the group's members
         if (row.slot.empty() && !row.layer_type.empty()) row.slot = group_suffix_slot(row.role, t.name);
+        // engine#1788, 3c: a per-layer slot must be LAYER-QUALIFIED or every layer collides on one destination (the
+        // collision check found 733 tensors pointing at 26 names). The prefix is the CONTAINER's own spelling through
+        // the layer digits, because model.c probes both -- "model.layers.%d.…" and "model.layer.%d.…" -- and MiniCPM
+        // uses the singular. Using the source's own prefix keeps the two agree without this code choosing a dialect.
+        if (!row.slot.empty() && !row.layer.empty()) row.slot = layer_prefix + row.slot;
         if (row.slot.empty()) {
             const auto why = table.why.find(row.role);
             row.why = why != table.why.end() ? why->second

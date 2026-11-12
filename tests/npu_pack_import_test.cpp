@@ -5296,10 +5296,10 @@ void test_container_placement() {
           "placement: placed + unplaced + no-role accounts for every tensor");
     check(r.rows[0].slot == "model.embed_tokens.weight", "placement: a tensor with no layer still gets a slot");
     check(r.rows[0].layer.empty() && r.rows[0].layer_type.empty(), "placement: and reports that it has no layer");
-    check(r.rows[1].slot == "linear_attn.qkv_proj.weight", "placement: the fused qkv on the LINEAR layer");
+    check(r.rows[1].slot == "model.layers.0.linear_attn.qkv_proj.weight", "placement: the fused qkv on the LINEAR layer, layer-qualified");
     check(r.rows[2].slot.empty(), "placement: the same role on the FULL-attention layer has no destination");
     check(r.rows[2].why.size() > 10, "placement: and says why");
-    check(r.rows[3].slot == "self_attn.q_proj.weight", "placement: the query projection is layer-type-independent");
+    check(r.rows[3].slot == "model.layers.1.self_attn.q_proj.weight", "placement: the query projection is layer-type-independent, layer-qualified");
     check(r.rows[4].slot.empty() && r.rows[4].role == "gate_up_proj", "placement: gate_up_proj is still refused");
     check(r.rows[5].slot.empty() && r.rows[5].role.empty(), "placement: a tensor with no role is counted apart");
     check(r.no_role == 1, "placement: no_role counts the vocabulary gap, not the deliberate refusal");
@@ -5329,8 +5329,8 @@ void test_container_placement() {
         };
         const pi::PlacementReport gr = pi::container_placement(g, lt);
         check(gr.rows[0].role == "gemma_local", "placement: the gemma group is one role");
-        check(gr.rows[0].slot == "pre_feedforward_layernorm.weight", "placement: the suffix IS the destination (pre)");
-        check(gr.rows[1].slot == "post_feedforward_layernorm.weight", "placement: and for post");
+        check(gr.rows[0].slot == "model.layers.0.pre_feedforward_layernorm.weight", "placement: the suffix IS the destination (pre), layer-qualified");
+        check(gr.rows[1].slot == "model.layers.0.post_feedforward_layernorm.weight", "placement: and for post, layer-qualified");
         check(gr.rows[2].slot.empty(), "placement: a member with no engine slot stays unplaced");
         check(gr.placed == 2 && gr.unplaced == 1, "placement: two placed, one held, for the three members");
     }

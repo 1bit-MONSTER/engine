@@ -5197,6 +5197,20 @@ static void test_container_placement_real(const std::string& dir, const std::vec
     // REVIEW of #2291 direction: the engine documents a rank and a dtype per slot (model.h), and both are
     // architecture-independent -- a router that is 3-D or an expert that is BF16 is wrong for every model.
     {
+        // Two source tensors reaching one destination is silent data loss: the pack carries one, the forward reads the
+        // other. This check is what caught the placement being non-writable (733 tensors / 26 names) and then all three
+        // mapping classes: a `.scale` companion filed as its weight, per_layer_proj_norm filed as the final norm, and the
+        // 1B's `.bf16.` copies reaching the untagged slot.
+        std::map<std::string, int> per_slot;
+        for (const auto& row : r.rows) if (!row.slot.empty()) per_slot[row.slot]++;
+        std::vector<std::string> dup;
+        for (const auto& kv : per_slot) if (kv.second > 1) dup.push_back(kv.first);
+        std::string dl;
+        for (const auto& d : dup) dl += d + " ";
+        check(per_slot.size() == size_t(r.placed),
+              "placement: every placed tensor has its own destination in " + dir + " (" + dl + ")");
+    }
+    {
         std::map<std::string, std::string> seen;
         for (const auto& row : r.rows) {
             if (row.slot.empty() || seen.count(row.slot)) continue;
@@ -5309,7 +5323,7 @@ void test_container_placement() {
         // pack. A role that reaches the "this table does not know" default, or a reason that is a bare placeholder, is a
         // hole -- and this arm is what makes removing a refusal entry fail in CI rather than print UNKNOWN on the box.
         pi::ContainerRoles roles_c;
-        for (const char* role : {"ssm", "gemma_local", "container_extra", "gate_up_proj"})
+        for (const char* role : {"ssm", "gemma_local", "container_extra", "gate_up_proj", "dtype_variant"})
             roles_c.counts[role] = 1;
         const pi::RoleSlotReport slots_c = pi::container_role_slots(roles_c);
         for (const auto& kv : slots_c.why) {

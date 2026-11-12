@@ -3626,6 +3626,7 @@ static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
     {"gemma_local",         "a group: pre/post_feedforward_layernorm have engine slots, inp_gate / layer_output_scale / per_layer_projection / post_layernorm / per_layer_model_proj do not -- separating them needs the suffix key"},
     // Measured on gemma4/bolt. These ARE recognised and deliberately have no destination: `rope_freqs.weight` is a file the
     // forward only FLAGS (model_config.h: has_rope_freqs_file) and the per-layer embeddings have no slot of their own.
+    {"dtype_variant",       "a dtype-tagged (`.bf16.`) copy of a weight the container also ships untagged; the engine has no `.bf16.` literal, so this copy has no destination and must not reach the untagged slot"},
     {"container_extra",     "recognised so it is not a gap, and deliberately not written: a table the forward only flags (rope_freqs) or a per-layer embedding with no slot"},
 };
 
@@ -3747,6 +3748,11 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
         // ordering defect as `attn_q` vs `attn_q_norm` (engine#2097): the general rule ran before the specific one.
         else if (n.size() > 6 && n.compare(n.size() - 6, 6, ".scale") == 0)
             role = "weight_scale";
+        // engine#1788, 3c: a dtype-TAGGED companion (a `.bf16.` copy of a weight the engine also ships untagged). Same
+        // first-position rule as `.scale`, and the opposite outcome: the engine has no `.bf16.` literal at all, so this
+        // copy has no destination and must not reach the untagged slot -- which is what the 1B collision showed.
+        else if (n.find(".bf16.") != std::string::npos)
+            role = "dtype_variant";
         if (role.empty()) {
             bool matched = false;
             for (const auto& r : kRules) {

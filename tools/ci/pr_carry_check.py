@@ -26,6 +26,13 @@ carried file looks exactly like a file the PR wrote.
 Refs are things you already fetched (`git fetch origin pull/N/head:refs/pr/N`); this tool never
 touches the network and never writes the index, so it is safe to run in a worktree someone is
 using. Exit 0 when every changed path is the PR's own, 1 when it is not, 2 on a usage error.
+
+**The other half, so you do not have to hit both failures to find both tools.** This asks *"does the PR
+ADD files that are not its own?"*. The complement is *"does it REMOVE lines that base still has?"* --
+`tools/ci/registration_loss_check.py`, which is what to run when a branch reads MERGEABLE while quietly
+deleting another PR's registrations. A head can pass one and fail the other: a re-base that takes another
+lane's files fails this tool, and one that drops main's rows fails that one. Run both on a branch you did
+not write.
 """
 
 import argparse

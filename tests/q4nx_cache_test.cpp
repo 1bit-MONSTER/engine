@@ -182,8 +182,16 @@ int main() {
               "q4nx-cache candidates: the age window protects everything inside it");
         fs::remove_all(cr, ec);
     }
+    // engine#2263 review: the sweep's note and the CLI print sizes through one formatter, MiB below 1 GiB, so a small
+    // cache never reads "0.0 GiB" (which looks like the sweep being off).
+    check(q4nx_cache_size_text(int64_t(6) << 20) == "6.0 MiB", "size text: 6 MiB is MiB, not 0.0 GiB");
+    check(q4nx_cache_size_text(0) == "0.0 MiB", "size text: an empty cache is 0.0 MiB");
+    check(q4nx_cache_size_text((int64_t(1) << 30) - 1) == "1.0 GiB", "size text: just under 1 GiB is 1.0 GiB, not \"1024.0 MiB\"");
+    check(q4nx_cache_size_text(int64_t(1023) << 20) == "1023.0 MiB", "size text: a real 1023 MiB still reads MiB");
+    check(q4nx_cache_size_text(int64_t(60) << 30) == "60.0 GiB", "size text: 60 GiB is GiB");
     fs::remove_all(root, ec);
-    std::printf("q4nx cache: %d arm(s) over the sweep (bound, LRU order, keep, age window, disabled, touch on a hit, bound text)\n",
-                failures ? 0 : 32);
+    std::printf("q4nx cache: %d arm(s) over the sweep (bound, LRU order, keep, age window, disabled, touch on a hit, bound text, "
+                "size text)\n",
+                failures ? 0 : 36);
     return failures ? 1 : 0;
 }

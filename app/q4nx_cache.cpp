@@ -70,13 +70,10 @@ int run_q4nx_cache(int argc, char** argv) {
                                                : q4nx_cache_bound_bytes(std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB"));
     const int64_t before = q4nx_dir_bytes(root);
     if (max_bytes <= 0) {
-        std::printf("q4nx-cache: %s is %.1f GiB, the sweep is off (bound 0)\n", root.c_str(), double(before) / (1 << 30));
+        std::printf("q4nx-cache: %s is %s, the sweep is off (bound 0)\n", root.c_str(), q4nx_cache_size_text(before).c_str());
         return 0;
     }
-    const auto size = [](int64_t b, char* out, size_t n) {
-        if (b >= (int64_t(1) << 30)) std::snprintf(out, n, "%.1f GiB", double(b) / (1 << 30));
-        else std::snprintf(out, n, "%.1f MiB", double(b) / (1 << 20));
-    };
+    const auto size = [](int64_t b, char* out, size_t n) { std::snprintf(out, n, "%s", q4nx_cache_size_text(b).c_str()); };
     if (dry) {
         const std::vector<Q4nxCacheCandidate> would = q4nx_cache_candidates(root, keep, max_bytes, min_age);
         int64_t would_free = 0;

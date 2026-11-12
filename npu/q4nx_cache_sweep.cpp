@@ -24,6 +24,19 @@
 
 namespace fs = std::filesystem;
 
+std::string q4nx_cache_size_text(int64_t bytes) {
+    char out[32];
+    if (bytes >= (int64_t(1) << 30)) {
+        std::snprintf(out, sizeof out, "%.1f GiB", double(bytes) / (1 << 30));
+        return out;
+    }
+    std::snprintf(out, sizeof out, "%.1f MiB", double(bytes) / (1 << 20));
+    // Within half a MiB of a GiB the MiB reading rounds to "1024.0", which is a value in the unit it has just left -- the same
+    // kind of misleading exchange this formatter exists to stop. Print the GiB it is about to become.
+    if (std::string(out) == "1024.0 MiB") std::snprintf(out, sizeof out, "%.1f GiB", double(bytes) / (1 << 30));
+    return out;
+}
+
 int64_t q4nx_dir_bytes(const std::string& path) {
     std::error_code ec;
     if (!fs::is_directory(path, ec)) return 0;
@@ -90,10 +103,10 @@ Q4nxCacheSweep q4nx_cache_evict(const std::string& root, const std::string& keep
     if (r.removed > 0) {
         r.reported = true;
         std::fprintf(stderr,
-                     "note: q4nx cache: removed %d entr%s, %.1f GiB -> %.1f GiB (bound %.1f GiB, %s); entries younger than "
+                     "note: q4nx cache: removed %d entr%s, %s -> %s (bound %s, %s); entries younger than "
                      "%lld s and the one just written are kept (engine#1956)\n",
-                     r.removed, r.removed == 1 ? "y" : "ies", double(r.bytes_before) / (1 << 30),
-                     double(r.bytes_after) / (1 << 30), double(max_bytes) / (1 << 30), root.c_str(),
+                     r.removed, r.removed == 1 ? "y" : "ies", q4nx_cache_size_text(r.bytes_before).c_str(),
+                     q4nx_cache_size_text(r.bytes_after).c_str(), q4nx_cache_size_text(max_bytes).c_str(), root.c_str(),
                      (long long)min_age_seconds);
     }
     return r;

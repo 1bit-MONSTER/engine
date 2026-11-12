@@ -57,6 +57,11 @@ struct Q4nxCacheCandidate {
 std::vector<Q4nxCacheCandidate> q4nx_cache_candidates(const std::string& root, const std::string& keep, int64_t max_bytes,
                                                       int64_t min_age_seconds = 600);
 
+// A size as the cache's messages print it: GiB from 1 GiB up, MiB below. A small cache or bound printed as "0.0 GiB" reads
+// like "the sweep is off", which is a different state. The one formatter for the sweep's note (shared by every binary that
+// links this, and the only output a conversion-only box gets) and for `1bit q4nx-cache`, so the two cannot disagree.
+std::string q4nx_cache_size_text(int64_t bytes);
+
 // Directory bytes under `path` (0 when it does not exist).
 int64_t q4nx_dir_bytes(const std::string& path);
 

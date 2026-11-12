@@ -5177,6 +5177,37 @@ void test_container_role_layer_types() {
           "role+layer: a layer index past layer_types is counted as out of range");
 }
 
+// engine#1788, 3c: the writer iterates TENSORS, not roles, so the placement has to answer per tensor and use that
+// tensor's own layer type. The arm that matters is the pair: the same role lands in two different places on two layers.
+void test_container_placement() {
+    using pi::Q4nxTensor;
+    const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
+    const std::vector<Q4nxTensor> v = {
+        t("model.embed_tokens.weight"),
+        t("model.layers.0.self_attn.qkv_proj.weight"),   // layer 0 is linear attention
+        t("model.layers.1.self_attn.qkv_proj.weight"),   // layer 1 is full attention
+        t("model.layers.1.self_attn.q_proj.weight"),
+        t("model.layers.0.mlp.gate_up_proj.weight"),     // a role this slice still refuses
+        t("model.layers.1.unknown_thing.weight"),        // no role at all
+    };
+    const std::vector<std::string> lt = {"linear_attention", "full_attention"};
+    const pi::PlacementReport r = pi::container_placement(v, lt);
+
+    check(r.rows.size() == v.size(), "placement: a row per tensor, so nothing is silently skipped");
+    check(r.placed + r.unplaced + r.no_role == int64_t(v.size()),
+          "placement: placed + unplaced + no-role accounts for every tensor");
+    check(r.rows[0].slot == "model.embed_tokens.weight", "placement: a tensor with no layer still gets a slot");
+    check(r.rows[0].layer.empty() && r.rows[0].layer_type.empty(), "placement: and reports that it has no layer");
+    check(r.rows[1].slot == "linear_attn.qkv_proj.weight", "placement: the fused qkv on the LINEAR layer");
+    check(r.rows[2].slot.empty(), "placement: the same role on the FULL-attention layer has no destination");
+    check(r.rows[2].why.size() > 10, "placement: and says why");
+    check(r.rows[3].slot == "self_attn.q_proj.weight", "placement: the query projection is layer-type-independent");
+    check(r.rows[4].slot.empty() && r.rows[4].role == "gate_up_proj", "placement: gate_up_proj is still refused");
+    check(r.rows[5].slot.empty() && r.rows[5].role.empty(), "placement: a tensor with no role is counted apart");
+    check(r.no_role == 1, "placement: no_role counts the vocabulary gap, not the deliberate refusal");
+    check(r.unplaced == 2, "placement: unplaced counts the two decisions, not the vocabulary gap");
+}
+
 void test_container_roles_moe_and_singular_layer() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6359,6 +6390,7 @@ int main(int argc, char** argv) {
         test_container_roles();
         test_container_roles_gemma_local();
         test_container_roles_moe_and_singular_layer();
+        test_container_placement();
         test_container_role_slots();
         test_container_role_layer_types();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);

@@ -38,12 +38,11 @@ q/k norms, written under `language_model.*` so the packer takes its qwen3_5 path
 F32 `ssm_a` / `ssm_dt.bias`). The same rule, scoped to "not a conv layer", still refused every qwen3_5 hybrid: a GDN
 layer has no self_attn.q_norm either, and layer 0 of every such pack is one. The one test that loads a real
 Qwen3.5 pack skips when the pack is not on disk, which in CI is always, so that too was green.
-The qwen3_5 row is LOAD ONLY (ONEBIT_TEST_Q4NX_LOAD_ONLY=1), and that is a limit, not a choice of convenience: on this
-fabricated model the full comparison fails its last check (the batched last chunk's logits against the sequential
-reference: rel-L1 0.71, same argmax; 0.45 with two GDN layers and no attention layer; 0 with attention layers only),
-while FastFlowLM's real Qwen3.5-2B passes the same binary with rel-L1 0. The GDN path's own NPU_GDN_CHECK reports
-both of its internal comparisons identical on the fabricated model. Which of the fabrication and the batched path
-is at fault is not established; until it is, this row claims the load and nothing about the arithmetic.
+The fabricated geometry is deliberately OFF the kernel's N grid (the fused q|k|v is 768 wide and its design's N is
+1024; the gate projection is 256 and 512), which no shipped qwen3_5 pack is. That is what found the second defect
+this row pins: the batched GDN path read row m of a projection at m * (model width) while the projection returns its
+rows at the design's N, so a batched prefill of two or more tokens left other logits and another state than the
+token-by-token path (rel-L1 0.6 to 0.7 here, exact for one-row batches, exact on every real pack).
 """
 import json
 import os
@@ -193,8 +192,6 @@ def main():
             return 1
         env = dict(os.environ, ONEBIT_TEST_Q4NX=out)
         env.pop("NPU_INFER_HOST_GEMM", None)   # init_host is host-GEMM already; nothing else should steer it
-        if family == "qwen3_5":
-            env["ONEBIT_TEST_Q4NX_LOAD_ONLY"] = "1"
         r = subprocess.run([sys.argv[1]], env=env, capture_output=True, text=True, timeout=110)
         for line in (r.stdout + r.stderr).splitlines():
             if (line.startswith(("PASS", "FAIL", "SKIP", "ALL PASS", "FAILED", "[batchcheck]")) or

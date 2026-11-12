@@ -2722,6 +2722,17 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         }
         npu_gemm_rows(i_z, xn.data(), M, g->K, g->N, B_.data(), Z, 1, "attn_gate", g->real_k);
     }
+    // A projection's M rows come back at the DESIGN's N, which is the model's width rounded up to the kernel's N grid
+    // (512). Every qwen3_5 pack so far has 2*KD + VD and VD on that grid, so reading row m at m * CD and m * VD
+    // happened to be right; on a geometry that is off it (CD 768 pads to 1024), every row after the first was read
+    // from the wrong place, and a batched prefill of two or more tokens left other logits and another state than
+    // the token-by-token path (rel-L1 0.6 on a fabricated two-layer model; a one-row batch was exact).
+    const size_t qkv_stride = (size_t)designs_[i_qkv].N, z_stride = (size_t)designs_[i_z].N;
+    if (qkv_stride < (size_t)CD || z_stride < (size_t)VD || QKV.size() < (size_t)M * qkv_stride ||
+        Z.size() < (size_t)M * z_stride) {
+        err_ = "gdn batch: a projection returned fewer values than rows * its design's N";
+        return false;
+    }
 
     // NPU_QKV_DUMP=<layer>: a GDN layer's projections as the engine sees them (q, k, v and the
     // attn_gate/Z), rows 0 and 3, on both paths.  Layer 0 is the first divergent layer and its
@@ -2730,8 +2741,8 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     if (const char* dl = getenv("NPU_QKV_DUMP")) {
         if (l == atoi(dl)) {
             for (int m = 0; m < M; m += (m == 0 ? 3 : 1)) {
-                const float* r = QKV.data() + (size_t)m * CD;
-                const float* zr = Z.data() + (size_t)m * VD;
+                const float* r = QKV.data() + (size_t)m * qkv_stride;
+                const float* zr = Z.data() + (size_t)m * z_stride;
                 fprintf(stderr, "[qkv-dump] l=%d m=%d", l, m);
                 for (int i = 0; i < 8; i++) fprintf(stderr, " q%d=%.6g", i, (double)r[KD + i]);
                 for (int i = 0; i < 8; i++) fprintf(stderr, " k%d=%.6g", i, (double)r[2 * KD + i]);
@@ -2761,7 +2772,7 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     std::vector<float> co_dump;   // NPU_INFER_DUMP_LAYERS only: keeps `co` per row for the [GB] line
     if (dump_gb) co_dump.assign((size_t)M * CD, 0.0f);
     for (int m = 0; m < M; m++) {
-        const float* qkv = QKV.data() + (size_t)m * CD;
+        const float* qkv = QKV.data() + (size_t)m * qkv_stride;
         // depthwise causal conv1d (CK) + SiLU, state carried across positions
         float* st = conv_state_[l].data();
         for (int ch = 0; ch < CD; ch++) {
@@ -2816,7 +2827,7 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         const float* kh = &KLS[((size_t)m * NVH + hh) * KHD];
         const float* qh = &QLS[((size_t)m * NVH + hh) * KHD];
         const float* vh = &VVS[((size_t)m * NVH + hh) * VHD];
-        const float* zv = Z.data() + (size_t)m * VD + (size_t)hh * VHD;
+        const float* zv = Z.data() + (size_t)m * z_stride + (size_t)hh * VHD;
 #pragma omp simd
         for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
         // Loops EXCHANGED (kd outer, vd inner) so the inner loop walks sh and vh contiguously instead of
@@ -2978,9 +2989,9 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                 for (int i = 0; i < n; i++) { float a = fabsf(v[i]); sm += a; if (a > mx) mx = a; }
                 fprintf(stderr, "  [GB] m=%d %-5s %.6f %.4f\n", m, nm, sm / n, mx);
             };
-            d2("qkv", QKV.data() + (size_t)m * CD, CD);
+            d2("qkv", QKV.data() + (size_t)m * qkv_stride, CD);
             d2("co", co_dump.data() + (size_t)m * CD, CD);
-            d2("z", Z.data() + (size_t)m * VD, VD);
+            d2("z", Z.data() + (size_t)m * z_stride, VD);
             d2("a", AHS.data() + (size_t)m * NVH, NVH);
             d2("b", BHS.data() + (size_t)m * NVH, NVH);
             d2("core", CORE.data() + (size_t)m * VD, VD);

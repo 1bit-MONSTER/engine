@@ -90,13 +90,6 @@ int main() {
         std::printf("SKIP: init_host failed for %s (%s)\n", model.c_str(), fwd.last_error());
         return 77;
     }
-    // ONEBIT_TEST_Q4NX_LOAD_ONLY=1: stop here. The row is "this container loads through the forward" and nothing more;
-    // tests/batch_check_state_ci.py uses it for a fabricated family whose only claim is that the load is not refused.
-    if (const char* lo = std::getenv("ONEBIT_TEST_Q4NX_LOAD_ONLY"); lo && lo[0] == '1') {
-        std::printf("PASS  init_host accepted %s\n", model.c_str());
-        std::printf("ALL PASS (load only)\n");
-        return 0;
-    }
 
     // Values do not matter; the split does. Three chunks: [0,3), [3,5), [5,6) -- the last is the serve path's
     // split-off final token, which is a step_batch at start_pos > 0 on every request.

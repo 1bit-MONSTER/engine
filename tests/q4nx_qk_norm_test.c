@@ -118,6 +118,27 @@ int main(void) {
                                               "(LFM2's conv layers, qwen3_5's linear-attention layers)");
     check(q4nx_qk_gain_missing(0, 1, 0) == 0, "q/k norm off: no gain is expected anywhere");
 
+    /* engine#1786: attention_bias from the container, as qk_norm. Qwen2's config.json never states the key and every
+     * layer carries q/k/v biases; with the key absent they were loaded and never added (Qwen2.5-3B answered noise). */
+    {
+        const unsigned char none[3] = {0, 0, 0}, l1[3] = {0, 1, 1};
+        Q4nxSemantics b;
+        memset(&b, 0, sizeof b);
+        check(q4nx_semantics_attention_bias_from_tensors(&b, l1, 3) == 1 && b.attention_bias == 1,
+              "attention_bias absent from config.json, layer 1 carries biases: on, and layer 1 is named");
+        memset(&b, 0, sizeof b);
+        check(q4nx_semantics_attention_bias_from_tensors(&b, none, 3) == -1 && b.attention_bias == 0,
+              "absent, and no layer carries a bias: stays off");
+        memset(&b, 0, sizeof b);
+        b.attention_bias_stated = 1;
+        check(q4nx_semantics_attention_bias_from_tensors(&b, l1, 3) == -2 && b.attention_bias == 0,
+              "config.json says attention_bias=false and the container carries biases: a disagreement (-2, refused)");
+        memset(&b, 0, sizeof b);
+        b.attention_bias = b.attention_bias_stated = 1;
+        check(q4nx_semantics_attention_bias_from_tensors(&b, l1, 3) == -1 && b.attention_bias == 1,
+              "stated true: left as stated");
+    }
+
     char path[512];
     snprintf(path, sizeof path, "%s/config.json", dir);
     unlink(path);

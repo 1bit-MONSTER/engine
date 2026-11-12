@@ -2149,6 +2149,11 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> lfm3)
     set_tests_properties(batch_check_state_lfm3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # Qwen2 (engine#1786): q/k/v biases with no attention_bias key in config.json, against a numpy Qwen2 reference.
+    add_test(NAME batch_check_state_qwen2
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> qwen2)
+    set_tests_properties(batch_check_state_qwen2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # A fabricated qwen3_5 hybrid (a linear-attention layer, then attention), off the kernel's N grid on purpose.
     add_test(NAME batch_check_state_qwen35
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py

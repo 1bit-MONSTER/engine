@@ -478,7 +478,7 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
     /* biases: absent field means "no bias" for llama-family configs, but Phi
      * and Gemma configs omit it as well, so default to 0 and let phase 2's
      * tensor-level probe (bias tensors present?) override it. */
-    if (get_num(json, "attention_bias", &d)) s->attention_bias = d != 0;
+    if (get_num(json, "attention_bias", &d)) { s->attention_bias = d != 0; s->attention_bias_stated = 1; }
     if (get_num(json, "mlp_bias", &d)) s->mlp_bias = d != 0;
 
     /* embedding scale: gemma scales embeddings by sqrt(hidden_size) */
@@ -599,6 +599,17 @@ void q4nx_semantics_layer_mix(const Q4nxSemantics* s, char* out, size_t out_sz) 
         snprintf(out, out_sz, "full=%d sliding=%d linear=%d conv=%d other=%d", full, slid, lin, conv, oth);
     else
         snprintf(out, out_sz, "full=%d sliding=%d linear=%d other=%d", full, slid, lin, oth);
+}
+
+int q4nx_semantics_attention_bias_from_tensors(Q4nxSemantics* s, const unsigned char* has_bias, int layers) {
+    if (!s || !has_bias || layers <= 0 || s->attention_bias) return -1;
+    for (int l = 0; l < layers; l++)
+        if (has_bias[l]) {
+            if (s->attention_bias_stated) return -2;
+            s->attention_bias = 1;
+            return l;
+        }
+    return -1;
 }
 
 int q4nx_semantics_qk_norm_from_tensors(Q4nxSemantics* s, const unsigned char* has_q, const unsigned char* has_k, int layers) {

@@ -2029,6 +2029,18 @@ off (the template's `<think></think>`), gives `Paris</think>Paris<|im_end|>`. Th
 choices: `</think>` after the first `Paris`, then `Paris` again. Asked why the sky is blue, it explains Rayleigh
 scattering in correct sentences (80 tokens, greedy). No kernel set for its shapes was built or run (the NPU is off).
 
+**Qwen2's attention biases are read from the container (engine#1786).** The forward adds the q, k and v projection
+biases only when `attention_bias` is on. A config that states the key decides it. Qwen2's `config.json` never states
+it, though every Qwen2 layer has the three biases. With the key absent the forward loaded the biases and never added
+them, so FastFlowLM's `Qwen2.5-3B-Instruct-NPU2` answered the known-answer prompt with noise
+(`UNS  �leon�leon�ucz …`). The rule is now the one q/k normalisation follows: with the key absent, a layer that carries
+a q, k or v bias turns the biases on, and the startup line says so (`attention_bias=1  <- the container`). A config
+that says `attention_bias: false` while the container carries biases is refused by name rather than guessed.
+After: `Paris<|im_end|>` on the host. `batch_check_state_qwen2` fabricates a Qwen2 with biases and no key and
+compares the forward's logits with a numpy Qwen2 forward on the container's own weights: corr 1.0000000, max |d|
+6.6e-06 of 9.6. The binary without the fix fails it (corr 0.444, another argmax), and batched == sequential passed
+on that binary all the same.
+
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.
 A pack of the same architecture under another name got it wrong in silence. FastFlowLM's MiniCPM-V 4.7

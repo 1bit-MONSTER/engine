@@ -1099,6 +1099,24 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 fprintf(stderr, "  [semantics] qk_norm=1  <- the container: layer %d carries self_attn.q_norm and k_norm "
                                 "(config.json's model_type is not a family the table knows)\n", by);
         }
+        // engine#1786: attention_bias the same way. Qwen2's config.json never states it and every layer carries q/k/v
+        // biases; with the key absent they were loaded and never added, so Qwen2.5-3B-Instruct-NPU2 answered noise.
+        if (mw_ && mw_->config.num_layers > 0) {
+            std::vector<unsigned char> has_b(size_t(mw_->config.num_layers), 0);
+            auto present = [](const TensorDesc& t) { return t.name[0] && t.data_size > 0; };
+            for (int l = 0; l < mw_->config.num_layers; l++)
+                has_b[size_t(l)] = present(mw_->layers[l].q_proj_bias) || present(mw_->layers[l].k_proj_bias) ||
+                                   present(mw_->layers[l].v_proj_bias);
+            const int by = q4nx_semantics_attention_bias_from_tensors(&sem_, has_b.data(), mw_->config.num_layers);
+            if (by == -2) {
+                err_ = "config.json says attention_bias is false and model.q4nx carries q/k/v projection biases; "
+                       "serving it either way would be a guess";
+                return false;
+            }
+            if (by >= 0)
+                fprintf(stderr, "  [semantics] attention_bias=1  <- the container: layer %d carries q/k/v projection "
+                                "biases (config.json does not state attention_bias)\n", by);
+        }
         q4nx_semantics_dump(&sem_);
         // A layer kind nothing implements is refused BY NAME, here beside the other precise refusals (engine#1087's
         // shape): q4nx_semantics maps an unrecognised layer_types entry to Q4NX_LAYER_OTHER and the attention path

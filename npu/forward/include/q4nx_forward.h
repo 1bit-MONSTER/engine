@@ -492,7 +492,10 @@ private:
     int deepstack_lo_ = -1, deepstack_hi_ = -1;
     // Which plane a rotary frequency belongs to under interleaved MRoPE.  The rule lives in q4nx_semantics.h as
     // q4nx_mrope_axis() so the C unit test can pin it without building a forward pass.
-    int mrope_plane(int freq) const { return q4nx_mrope_axis(freq, sem_.n_mrope_section, sem_.mrope_section); }
+    int mrope_plane(int freq) const {
+        return sem_.mrope_sectioned ? q4nx_mrope_axis_sectioned(freq, sem_.n_mrope_section, sem_.mrope_section)
+                                    : q4nx_mrope_axis(freq, sem_.n_mrope_section, sem_.mrope_section);
+    }
     // Some models store the embedding QUANTIZED (Gemma4-E2B/E4B: dtype I8), and
     // reading it as bf16 yields ~zero - which invalidated the whole forward and
     // the tied LM head (all-zero logits).  When the dtype is not BF16 the
@@ -520,6 +523,7 @@ private:
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
     Q4nxRopeLlama3 rope_llama3_;     // rope_type "llama3" (Llama-3.1/3.2/3.3); on == 0 for everything else
+    Q4nxRopeYarn rope_yarn_{};       // rope_type "yarn" (GPT-OSS); on == 0 for everything else
     Q4nxRopeDynamic rope_dynamic_;   // rope_type "dynamic" (NTK base rule, engine#1740 W2); on == 0 elsewhere
     double rope_linear_factor_ = 0.0; // rope_type "linear" factor (Gemma3's full layers); 0 elsewhere
     // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 for
@@ -541,6 +545,7 @@ private:
     int mla_ = 0;
     int q_lora_ = 0, kv_lora_ = 0, rope_dim_ = 0, qk_nope_ = 0, v_head_ = 0;
     int n_expert_ = 0, top_k_ = 0, expert_im_ = 0, dense_im_ = 0;
+    bool moe_slice_nk_ = false;   // per-expert slices on an [N][K] grid despite FLM names (hy_v3)
     // Which MoE container convention this container uses, decided from its own tensors in
     // init_impl (moe_container.h): the engine converter's `mlp.experts.*` names with a plain
     // [N][K] per-expert tile grid, or the FLM-style `*_exps_proj` names whose writer transposes
@@ -566,6 +571,15 @@ private:
 
     bool mla_attn(int l, const std::vector<float>& x, std::vector<float>& o, int pos);
     bool moe_mlp(int l, const std::vector<float>& xn, std::vector<float>& d);
+    // GPT-OSS (engine#1786): per layer the sinks [NH], the o bias [H], the router [E][H] + bias [E], the expert biases
+    // [E][IM] (gate, up) and [E][H] (down), and the experts themselves as the container's MX2560 tensor, read in
+    // place (q4nx_dequant.h). The MoE runs on the host, from the packed chunks.
+    std::vector<std::vector<float>> gpt_sinks_, gpt_obias_, gpt_router_, gpt_router_b_, gpt_gb_, gpt_ub_, gpt_db_;
+    std::vector<const TensorDesc*> gpt_exps_;
+    int gpt_ne_ = 0, gpt_topk_ = 0;
+    std::string cfg_path_;           // config.json of the loaded container (init_impl)
+    bool load_gptoss();
+    bool gptoss_moe(int l, const std::vector<float>& xn, std::vector<float>& d);
     bool dense_mlp(int l, const std::vector<float>& xn, std::vector<float>& d);
     bool mla_rope(std::vector<float>& q, int NH, int qh, int nope, std::vector<float>& kr, int pos);
     bool mla_expert(const uint8_t* pool, size_t per_expert, int e, int N, int K,
@@ -647,6 +661,11 @@ private:
     // Layout and maths: docs/qwen35-4b-weight-format.md.
     int lin_kd_ = 0, lin_vd_ = 0;        // key_dim = nkh*khd, value_dim = nvh*vhd
     int attn_gate_ = 0;                   // qwen3_5 attn_output_gate
+    bool mrope_declared_ = false;         // rope_scaling type "mrope" (Qwen2-VL form), validated after semantics
+    // LFM3's per-head output gate, [NH][H] per attention layer (empty for conv layers and other models):
+    // ctx of head h *= sigmoid(head_gate_[l][h] . xn), xn the operator-normed layer input.
+    std::vector<std::vector<float>> head_gate_;
+    void apply_head_gate(int l, const float* xn, float* ctx, int hd) const;
     int lin_nkh_ = 0, lin_nvh_ = 0;      // head counts
     int lin_khd_ = 0, lin_vhd_ = 0;      // head dims
     int lin_ck_ = 4;                     // depthwise conv kernel

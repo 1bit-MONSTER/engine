@@ -122,6 +122,40 @@ void q4nx_dequant_chunk_q4h(const uint8_t* chunk, float* out, int ld, int symmet
  * the tensor mixes the symmetric and asymmetric kinds. */
 int q4nx_dequant_tensor_q4h(const uint8_t* data, size_t nbytes, int rows, int k, int cols, float* out);
 
+/* The 16 x 256 "wide" chunks of FastFlowLM's Gemma4-12B-IT-NPU2 (engine#1786), declared [rows/16, K/256, bytes]:
+ *   bytes 0..255   128 bf16 scales, slot g*16 + r (g the 32-column group, r the row), symmetric (no zero-point)
+ *   Q4W (2304 B)   then 2048 B of 4-bit codes at byte c*8 + r/2, even row in the low nibble, two's complement
+ *   Q8W (4352 B)   then 4096 B of int8 codes at byte c*16 + r
+ * w[r][c] = code * scale[c/32][r].  The Q4W reading matches google's own QAT Q4_0 GGUF of the model at corr 0.9986
+ * (seven tensors over layers 0, 5 and 47); the Q8W head matches the pack's bf16 embedding at 1.00000.  A Q4W
+ * tensor's byte count equals a 4608-byte Q4S grid's, which is why the declared shape, not the size, picks it. */
+#define Q4NX_CHUNK_Q4W 2304
+#define Q4NX_CHUNK_Q8W 4352
+#define Q4NX_WIDE_ROWS 16
+#define Q4NX_WIDE_COLS 256
+void q4nx_dequant_chunk_wide(const uint8_t* chunk, int bits, float* out, int ld);
+
+/* FastFlowLM's GPT-OSS-20B-NPU2 (engine#1786) stores its I8 tensors as [RB, CB, S, 2560] and its experts as U8
+ * [E, 69, CB, S, 2560]. One 2560-byte chunk is 32 rows x 128 columns, and tensor row rb*S*32 + s*32 + r.
+ *   D2560 (I8)  bytes 0..255 bf16 scales and 256..511 bf16 zero-points, both at slot g*32 + r (g the 32-column group);
+ *               then 4-bit codes 0..15 in two 16-row halves h = r/16, at byte 512 + h*1024 + c*8 + (r%16)/2, even row in
+ *               the low nibble; w = code * scale + zero.
+ *   MX2560 (U8) MXFP4: bytes 0..127 E8M0 exponents at g*32 + r (scale 2^(e-127)); E2M1 codes in the same order from
+ *               byte 512; bytes 128..511 are not part of the weight.
+ * Settled against ggml-org/gpt-oss-20b-GGUF: D2560 q/k/o/v and lm_head corr 0.995-0.997 against its Q8_0 (4-bit
+ * against 8-bit), MX2560 experts 1.0000 against its MXFP4 (a lossless repack). */
+#define Q4NX_CHUNK_D2560 2560
+#define Q4NX_D2560_ROWS 32
+#define Q4NX_D2560_COLS 128
+void q4nx_dequant_chunk_d2560(const uint8_t* chunk, float* out, int ld);
+void q4nx_dequant_chunk_mx2560(const uint8_t* chunk, float* out, int ld);
+/* [rb, cb, s] chunks (declared [RB, CB, S, 2560]) into rows x cols (rows <= RB*S*32, the first `rows` kept; cols >= the
+ * container's CB*128 or equal to it after clipping to `k` real columns: columns past k are written 0). */
+int q4nx_dequant_tensor_d2560(const uint8_t* data, size_t nbytes, int RB, int CB, int S, int rows, int k, int cols,
+                              float* out);
+/* Whole tensor: ntr x ntc chunks, row-major, into a rows x cols buffer (cols >= k; the pad columns are zeroed). */
+int q4nx_dequant_tensor_wide(const uint8_t* data, size_t nbytes, int chunk_bytes, int rows, int k, int cols, float* out);
+
 /* Q4_K chunk: 32 rows x 256 K, 4736 B.
  *   scales[8][32] uint8 @[0,256)    index g*32 + r
  *   mins  [8][32] uint8 @[256,512)  index g*32 + r

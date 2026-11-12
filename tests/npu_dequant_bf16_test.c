@@ -419,9 +419,149 @@ static void q4h_chunks(void) {
     free(out);
 }
 
+/* engine#1786: Gemma4-12B-IT-NPU2's 16 x 256 wide chunks (q4nx_dequant.h). Settled against google's QAT Q4_0 GGUF
+ * of the model (corr 0.9986) and the pack's own bf16 embedding (the Q8W head, 1.00000); this pins the reading. */
+static void wide_chunks(void) {
+    const int rows = 32, k = 512, cols = 768, ntc = k / Q4NX_WIDE_COLS;
+    const size_t n = (size_t)(rows / Q4NX_WIDE_ROWS) * (size_t)ntc;
+    for (int bits = 4; bits <= 8; bits += 4) {
+        const int cb = bits == 4 ? Q4NX_CHUNK_Q4W : Q4NX_CHUNK_Q8W, ncode = cb - 256;
+        uint8_t* t = (uint8_t*)calloc(n, (size_t)cb);
+        float* out = (float*)malloc(sizeof(float) * (size_t)rows * cols);
+        if (!t || !out) { check(0, "wide: the buffers allocate"); free(t); free(out); return; }
+        for (size_t ci = 0; ci < n; ci++) {
+            uint8_t* c = t + ci * (size_t)cb;
+            for (int i = 0; i < 128; i++)
+                put_bf16(c, (size_t)i, (i % 3 ? 0.125f : -0.25f) * (float)(1 + (int)((i + ci) % 5)));   /* signed scale */
+            for (int b = 0; b < ncode; b++) c[256 + b] = (uint8_t)((b * 13 + 5 * ci) & 0xff);
+        }
+        for (size_t i = 0; i < (size_t)rows * cols; i++) out[i] = 99.0f;
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb, cb, rows, k, cols, out) == 0,
+              bits == 4 ? "q4w: a 2 x 2 grid reads" : "q8w: a 2 x 2 grid reads");
+        int bad = 0, pad_bad = 0;
+        for (int r = 0; r < rows; r++)
+            for (int col = 0; col < cols; col++) {
+                const float got = out[(size_t)r * cols + col];
+                if (col >= k) { if (got != 0.0f) pad_bad++; continue; }
+                const int tr = r / 16, tc = col / 256, rr = r % 16, cc = col % 256;
+                const size_t ci = (size_t)tr * ntc + tc;
+                const int i = (cc / 32) * 16 + rr;
+                const float sc = (i % 3 ? 0.125f : -0.25f) * (float)(1 + (int)((i + ci) % 5));
+                int code;
+                if (bits == 4) {
+                    const uint8_t byte = (uint8_t)(((cc * 8 + rr / 2) * 13 + 5 * ci) & 0xff);
+                    const int v = (rr % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+                    code = v >= 8 ? v - 16 : v;
+                } else {
+                    code = (int8_t)(uint8_t)(((cc * 16 + rr) * 13 + 5 * ci) & 0xff);
+                }
+                if (got != (float)code * sc) bad++;
+            }
+        check(bad == 0, bits == 4 ? "q4w: code (two's complement, c*8 + r/2, even row low) * scale (g*16 + r), row-major grid"
+                                  : "q8w: int8 code (c*16 + r) * scale (g*16 + r), row-major grid");
+        check(pad_bad == 0, "wide: the columns past the container's K are written 0");
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb - 1, cb, rows, k, cols, out) == -1, "wide: one byte short is refused");
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb, cb, 24, k, cols, out) == -1, "wide: rows off the 16-row grid are refused");
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb, 4608, rows, k, cols, out) == -1, "wide: another chunk size is not a wide kind");
+        free(t);
+        free(out);
+    }
+    /* why the declared shape decides: a Q4W tensor is exactly as many bytes as a Q4S (4608) grid of the same size */
+    check((size_t)(4096 / 16) * (3840 / 256) * Q4NX_CHUNK_Q4W == (size_t)(4096 / 32) * (3840 / 256) * 4608,
+          "a 4096 x 3840 Q4W tensor has a 4608-byte Q4S grid's byte count, so only the declared shape tells them apart");
+}
+
+/* engine#1786: GPT-OSS-20B-NPU2's 2560-byte chunks (q4nx_dequant.h). Settled against ggml-org/gpt-oss-20b-GGUF
+ * (D2560 corr 0.995-0.997 against its Q8_0, MX2560 1.0000 against its MXFP4); this pins the reading. */
+static int d2560_code_at(const uint8_t* c, int r, int col) {
+    const uint8_t b = c[512 + (r / 16) * 1024 + col * 8 + (r % 16) / 2];
+    return (r & 1) ? (b >> 4) : (b & 15);
+}
+
+static void d2560_chunks(void) {
+    uint8_t c[Q4NX_CHUNK_D2560];
+    for (int i = 0; i < Q4NX_CHUNK_D2560; i++) c[i] = (uint8_t)((i * 29 + 7) & 0xff);
+    for (int i = 0; i < 128; i++) {
+        put_bf16(c, (size_t)i, 0.125f * (float)(1 + i % 9));               /* scale  at g*32 + r */
+        put_bf16(c + 256, (size_t)i, -0.5f * (float)(i % 4));               /* zero   at g*32 + r */
+    }
+    float out[32 * 128];
+    q4nx_dequant_chunk_d2560(c, out, 128);
+    int bad = 0;
+    for (int r = 0; r < 32; r++)
+        for (int col = 0; col < 128; col++) {
+            const int slot = (col / 32) * 32 + r;
+            if (out[r * 128 + col] != (float)d2560_code_at(c, r, col) * 0.125f * (float)(1 + slot % 9) - 0.5f * (float)(slot % 4)) bad++;
+        }
+    check(bad == 0, "d2560: code (two 16-row halves, h*1024 + c*8 + (r%16)/2) * scale + zero, both at g*32 + r");
+
+    uint8_t m[Q4NX_CHUNK_D2560];
+    static const float lut[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, -0.f, -.5f, -1, -1.5f, -2, -3, -4, -6};
+    for (int i = 0; i < Q4NX_CHUNK_D2560; i++) m[i] = (uint8_t)((i * 31 + 3) & 0xff);
+    for (int i = 0; i < 128; i++) m[i] = (uint8_t)(120 + i % 11);          /* E8M0 exponents at g*32 + r */
+    q4nx_dequant_chunk_mx2560(m, out, 128);
+    bad = 0;
+    for (int r = 0; r < 32; r++)
+        for (int col = 0; col < 128; col++) {
+            const int e = 120 + ((col / 32) * 32 + r) % 11;
+            float p = 1.0f;
+            for (int n = e - 127; n < 0; n++) p *= 0.5f;
+            for (int n = e - 127; n > 0; n--) p *= 2.0f;
+            if (out[r * 128 + col] != lut[d2560_code_at(m, r, col)] * p) bad++;
+        }
+    check(bad == 0, "mx2560: E2M1 code (same order) * 2^(e - 127), e at g*32 + r; bytes 128..511 unread");
+    /* the bias, against ggml's own reading of one value: e = 127 and code 2 (E2M1 1.0) is weight 1.0, which ggml
+     * writes as kvalues_fp4[2] = 2 times GGML_E8M0_TO_FP32_HALF(127) = 0.5 */
+    {
+        uint8_t one[Q4NX_CHUNK_D2560];
+        memset(one, 0, sizeof one);
+        one[0] = 127;                 /* row 0, group 0 */
+        one[512] = 2;                 /* row 0, column 0: low nibble 2 = E2M1 1.0 */
+        q4nx_dequant_chunk_mx2560(one, out, 128);
+        check(out[0] == 1.0f, "mx2560: E8M0 bias 127 (e = 127, E2M1 1.0 -> 1.0, as ggml's 2 * 2^(127-128))");
+    }
+
+    /* a [RB=2, CB=2, S=2, 2560] tensor: rows rb*S*32 + s*32 + r, columns cb*128 + c, clipped and padded */
+    const int RB = 2, CB = 2, S = 2, rows = 100, k = 200, cols = 256;
+    uint8_t* t = (uint8_t*)malloc((size_t)RB * CB * S * Q4NX_CHUNK_D2560);
+    float* o = (float*)malloc(sizeof(float) * rows * cols);
+    float* ref = (float*)malloc(sizeof(float) * 32 * 128);
+    if (!t || !o || !ref) { check(0, "d2560: buffers allocate"); free(t); free(o); free(ref); return; }
+    for (int ci = 0; ci < RB * CB * S; ci++) {
+        uint8_t* q = t + (size_t)ci * Q4NX_CHUNK_D2560;
+        memcpy(q, c, Q4NX_CHUNK_D2560);
+        put_bf16(q + 256, 0, (float)ci);                                    /* tag each chunk through one zero */
+    }
+    for (int i = 0; i < rows * cols; i++) o[i] = 99.0f;
+    check(q4nx_dequant_tensor_d2560(t, (size_t)RB * CB * S * Q4NX_CHUNK_D2560, RB, CB, S, rows, k, cols, o) == 0,
+          "d2560: a 2 x 2 x 2 tensor reads, clipped to 100 rows and 200 columns");
+    bad = 0;
+    int pad_bad = 0;
+    for (int row = 0; row < rows; row++) {
+        const int rb = row / (S * 32), s = (row / 32) % S, r = row % 32;
+        for (int col = 0; col < cols; col++) {
+            const float got = o[(size_t)row * cols + col];
+            if (col >= k) { if (got != 0.0f) pad_bad++; continue; }
+            const int cb = col / 128;
+            const uint8_t* q = t + (((size_t)rb * CB + cb) * S + s) * Q4NX_CHUNK_D2560;
+            q4nx_dequant_chunk_d2560(q, ref, 128);
+            if (got != ref[r * 128 + col % 128]) bad++;
+        }
+    }
+    check(bad == 0, "d2560: tensor row rb*S*32 + s*32 + r comes from chunk [rb][cb][s]");
+    check(pad_bad == 0, "d2560: columns past k are written 0");
+    check(q4nx_dequant_tensor_d2560(t, (size_t)RB * CB * S * Q4NX_CHUNK_D2560 - 1, RB, CB, S, rows, k, cols, o) == -1,
+          "d2560: one byte short is refused");
+    check(q4nx_dequant_tensor_d2560(t, (size_t)RB * CB * S * Q4NX_CHUNK_D2560, RB, CB, S, 129, k, cols, o) == -1,
+          "d2560: more rows than the grid holds is refused");
+    free(t); free(o); free(ref);
+}
+
 int main(void) {
     q4s_chunk();
     q4h_chunks();
+    wide_chunks();
+    d2560_chunks();
     tile_kinds();
     tile_kind_is_per_tensor();
     tile_row_kind_arms();

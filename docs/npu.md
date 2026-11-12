@@ -303,13 +303,31 @@ the bf16 rounding reappears for the device, never in the container.
 
 **The cache is bounded, and the bound is least-recently-used (engine#1956).** After writing an
 entry, `1bit serve` removes the least-recently-used entries until the cache is within
-`ONEBIT_Q4NX_CACHE_MAX_GIB` (default 60; `0` or a negative number turns the sweep off). The entry
+`ONEBIT_Q4NX_CACHE_MAX_GIB` (default 60; `0` or a negative number turns the sweep off). The
+forward's device-form conversion (`npu/q4nx_device.cpp`) sweeps the same way after it writes a new
+entry (engine#2263), so a box that converts through the forward and never starts a serve stays
+within the bound too. A forward load (`1bit forward-serve`, `1bit npu-run` on a sealed set, the
+host-only route too) also sweeps once it has loaded, because a pack that needs no conversion still
+writes its head images (below) into the cache. The sweep itself is `npu/q4nx_cache_sweep.h`,
+shared by every writer and by `1bit q4nx-cache evict`, which without `--root` sweeps the directory
+every writer uses (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`). A box that writes nothing never
+sweeps; `1bit q4nx-cache evict` is the manual trigger for that case. The entry
 just written and any entry used in the last ten minutes are never removed. "Used" means reused,
 not only written: a cache hit — a repacked GGUF found in the cache, or a device-form conversion
 reused at load — marks the entry's directory as used now, so a container imported once and served
 every day outlives a one-off imported yesterday. The value is read as a whole number of GiB: a
 number too large to be a byte count is the largest bound that is one (it does not wrap to a small
 one), and a value that is not a number gets the default rather than an unbounded cache.
+
+**A box that never serves never sweeps (engine#2263).** Both triggers — the write-time sweep and the manual
+`1bit q4nx-cache evict` — need the binary to run, so a review, CI or build box that holds the cache and never starts a
+serve keeps every entry it ever wrote. Measured on this box: **59 GiB in 12 h** with the command merged and nothing
+invoking it, which put free space 3 GiB under the 175 GiB build gate; one manual 24 h age cut took it to 24 GiB and it
+regrew. `scripts/install-q4nx-cache-timer.sh` installs the invoker as a `systemd --user` timer — hourly,
+`--max-gib 40 --min-age 86400`, opt-in, nothing outside `~/.config/systemd/user` — and refuses to install against a
+binary that predates the command (`1bit q4nx-cache` printing *unknown command*), because a timer naming a command the
+binary lacks fails hourly and silently. `--dry-run` prints the units and verifies them without changing anything;
+`--uninstall` removes them and leaves the cache alone.
 
 **The packed lm-head is cached beside it (engine#1716).** A model whose head runs as int8 tiles
 packs those tiles on the host — gather `kpad × T` weights per tile, quantise each column to int8
@@ -335,10 +353,11 @@ The serve log line says what happened: `lm head: N packed weight tile(s) residen
 image cache, P packed (W written for the next serve) in S s`. `ONEBIT_HEAD_IMAGE_CACHE=0` turns
 the cache off (nothing is read or written). The files are `kd × nd` bytes plus `nd` scales per
 tile, so a head costs about `kpad × vocabulary` bytes on disk per kernel set. The Q4NX cache sweep
-(`ONEBIT_Q4NX_CACHE_MAX_GIB`, above) counts `head-images/` as one entry of the cache and removes it
-whole when the cache is over its bound and that directory is the least recently written one. Its
-age is the last time a tile was written into it: a serve that only reads its tiles does not refresh
-it. Losing the directory costs the next serve one pack of its head, nothing else. Ternary (`pb16i`) heads and the gemv head do not
+(`ONEBIT_Q4NX_CACHE_MAX_GIB`, above) counts each key in `head-images/` (`headimg-<digest>`, all its
+tiles) as one entry of the cache (engine#2263; it used to count the directory as one entry, so the
+sweep could only keep every pack's head or remove all of them). A key's age is its newest tile, and
+a cache hit marks the tile it read as used, so a head served every day is not aged from the day it
+was packed. Losing a key costs the next serve of that pack one pack of its head, nothing else. Ternary (`pb16i`) heads and the gemv head do not
 use it: their image already is a file. Each writer builds the file under its own name
 (`<file>.tmp.<pid>`) and renames it into place, so two serves that start cold on the same pack both
 finish their write and a reader only ever sees a whole image. The behaviour is pinned host-side in
@@ -1998,6 +2017,151 @@ and against the pack's own embedding (`lm_head`: 0.9963, at most 0.57 of a step 
 the known-answer prompt `Paris` and explains Rayleigh scattering in coherent sentences. Before, it failed at load
 with `chunk 4266 B is not a kind`. No kernel set for its shapes was built or run (the NPU is off).
 
+**LFM3-1.7B-NPU2: the forward reads LFM3 (engine#1786).** LiquidAI's LFM3 is LFM2's hybrid of gated short
+convolutions and attention, plus four rules from its `modeling_lfm3.py`. The forward now runs all four:
+
+- `layer_types` names the conv layers `"conv"`, beside `full_attention` and `sliding_attention`. Each `"conv"` entry
+  has to match a layer whose conv tensors are in the container, and a mismatch either way is refused by name.
+  `"conv"` is an exact match: `conv_attention` is still an unknown kind.
+- `use_sandwich_norm`: a norm on the conv or attention output before the residual add, and one on the MLP output.
+  It is the same pair the Gemma3 path runs (`extra_layer_norms` 2), and here the conv layers take it too.
+- A per-head output gate. Every attention layer has `self_attn.gate_proj` `[heads, hidden]` (bf16 in the pack), and
+  each head's context is multiplied by `sigmoid(gate_proj . x)` before `o_proj`, `x` being the block's normed input.
+- Zero-tail partial RoPE on the full layers. With `partial_rotary_factor` 0.5 the first 32 frequencies follow the
+  progression of the whole 128-channel head and the other 32 are zero, with `rotate_half` pairing across the whole
+  head. That is the rule Gemma4's "proportional" RoPE already had. The vendor GGUF writes the same rule as
+  `rope_freqs` (1 for 32 factors, 1e30 for the rest).
+
+The pack keeps the upstream tensor names (`conv.*`, `operator_norm`, `ffn_norm`, `feed_forward.w1/w2/w3`,
+`post_operator_norm`, `post_ffn_norm`, `embedding_norm`). `model_load` renames them to the canonical ones, and only
+where the canonical name is absent (`model_alias_lfm_names`, `model.h`). `ffn_norm` is the MLP input's norm, so it
+becomes `pre_feedforward_layernorm` in a sandwich layer and `post_attention_layernorm` otherwise.
+
+Checked on the host, 2026-11-12, against a numpy transcription of `modeling_lfm3.py`. Run on the bf16 checkpoint,
+the reference's last-position logits correlate 0.939 with ours. Run on the dequantized weights of the vendor's
+`LFM3-1.7B-QAD-Q4_0` GGUF, which this pack's I8 tensors come from, they correlate 0.9995, with the same top 10.
+The two references differ from each other by the same 0.94, so that gap is the quantization-aware weights, not the
+arithmetic. Each rule matters on this prompt: with the gate off the bf16 reference falls to 0.907 against ours,
+with the usual partial RoPE to 0.822 (and its top token changes), and without the sandwich to 0.134.
+`batch_check_state_test` on the pack: batched equals sequential, rel-L1 0. The known-answer prompt, with thinking
+off (the template's `<think></think>`), gives `Paris</think>Paris<|im_end|>`. The reference makes the same three
+choices: `</think>` after the first `Paris`, then `Paris` again. Asked why the sky is blue, it explains Rayleigh
+scattering in correct sentences (80 tokens, greedy). No kernel set for its shapes was built or run (the NPU is off).
+
+**Qwen2's attention biases are read from the container (engine#1786).** The forward adds the q, k and v projection
+biases only when `attention_bias` is on. A config that states the key decides it. Qwen2's `config.json` never states
+it, though every Qwen2 layer has the three biases. With the key absent the forward loaded the biases and never added
+them, so FastFlowLM's `Qwen2.5-3B-Instruct-NPU2` answered the known-answer prompt with noise
+(`UNS  �leon�leon�ucz …`). The rule is now the one q/k normalisation follows: with the key absent, a layer that carries
+a q, k or v bias turns the biases on, and the startup line says so (`attention_bias=1  <- the container`). A config
+that says `attention_bias: false` while the container carries biases is refused by name rather than guessed.
+After: `Paris<|im_end|>` on the host. `batch_check_state_qwen2` fabricates a Qwen2 with biases and no key and
+compares the forward's logits with a numpy Qwen2 forward on the container's own weights: corr 1.0000000, max |d|
+6.6e-06 of 9.6. The binary without the fix fails it (corr 0.444, another argmax), and batched == sequential passed
+on that binary all the same.
+
+Qwen2.5-VL's text tower is the same Qwen2, and it was refused one step earlier. Its config declares
+`rope_scaling: {"type": "mrope", "mrope_section": [16, 24, 24]}`, and the forward read `"mrope"` as a frequency scaling
+it does not implement. It is a position layout instead: plain RoPE frequencies, each taking its position from the t,
+h or w plane. Qwen2-VL and Qwen2.5-VL lay the sections out CONTIGUOUSLY (transformers' `apply_multimodal_rotary_pos_emb`
+splits cos by `mrope_section * 2`): frequencies 0-15 are t, 16-39 h and 40-63 w. Qwen3-VL interleaves them
+instead. The forward now reads that form (`mrope_sectioned`, `q4nx_mrope_axis_sectioned`), and refuses a block whose
+three sections do not sum to the rotary half-width. On a text-only prompt the three planes are equal, so it is plain
+RoPE. `Qwen2.5-VL-3B-Instruct-NPU2`'s text tower now answers `Paris<|im_end|>` on the host; its vision tower is not
+loaded here. `batch_check_state_qwen2vl` is the Qwen2 above declaring that block: the same logits as the plain-RoPE
+reference (corr 1.0000000). With `"mrope"` refused again (main's behaviour) the arm fails.
+
+**Gemma4-12B-IT-NPU2: a dense Gemma4 and two new chunk kinds (engine#1786).** The text tower loads and answers on the
+host after three changes:
+
+- **The wide chunks.** Every I8 tensor is declared `[rows/16, K/256, bytes]`, with `bytes` either 2304 (`Q4NX_CHUNK_Q4W`)
+  or 4352 (`Q4NX_CHUNK_Q8W`, the tied head). A chunk is 16 rows x 256 columns. It starts with 128 bf16 scales at
+  `g*16 + r` (one per row and 32-column group, symmetric, no zero-point). Then come either 4-bit two's-complement
+  codes at `c*8 + r/2` (even row in the low nibble) or int8 codes at `c*16 + r`. The reading was settled against
+  independent weights: Google's own QAT Q4_0 GGUF of the model agrees at corr 0.9986 on seven tensors over layers 0,
+  5 and 47 (the 5% rel-rms is FastFlowLM's re-quantization, the same in each), and the Q8W head reproduces the
+  pack's bf16 embedding at 1.00000. A Q4W tensor has exactly the byte count of a 4608-byte Q4S grid, which is how it
+  was read before. Layer 0 then went non-finite at its first attention. The declared shape now picks the kind.
+- **`attention_k_eq_v`.** The global layers have no `v_proj`: their values are the k projection, taken before
+  `k_norm` and then given Gemma4's scale-free v norm. This is our llama.cpp fork's rule (`gemma4.cpp`:
+  `Vcur = wv ? wv x : Kcur`). The forward fills those v rows from k. A layer with no `v_proj` and no such key is
+  refused by name.
+- **No per-layer embedding.** `post_layernorm` belongs to the PLE block, so it is read only when the model has one.
+  Before, init failed on its absence with an empty error. Those lookups now name the missing tensor.
+
+On the host the known-answer prompt gives `<|channel>thought\n<channel|>Paris<turn|>`: the model writes the
+template's own empty-thought prefix, then answers. Gemma4-E2B, the PLE model, still answers `Paris`. No kernel set
+for the 12B's shapes was built or run (the NPU is off).
+
+**GPT-OSS-20B-NPU2: the forward reads gpt_oss, on the host (engine#1786).** FastFlowLM's pack stores the model in
+two chunk kinds this forward did not read, and the model adds five rules. All of them are now in the per-op forward,
+with the MoE run on the host:
+
+- **D2560** (I8 `[RB, CB, S, 2560]`, attention q/k/v/o and the head) and **MX2560** (U8 `[E, 69, CB, S, 2560]`, the
+  experts as MXFP4). One chunk is 32 rows x 128 columns: parameters at `g*32 + r`, then 4-bit codes in two 16-row
+  halves at `h*1024 + c*8 + (r%16)/2` (`q4nx_dequant.h`). D2560 is asymmetric (bf16 scale and zero-point). MX2560 is an
+  E8M0 exponent and an E2M1 code, with a weight of `E2M1 * 2^(e-127)`. Per expert, the 69 row-blocks are gate and up
+  alternating by 128 rows, then 23 of down. Against `ggml-org/gpt-oss-20b-GGUF`: D2560 corr 0.995-0.997 against its
+  Q8_0 (4-bit against 8-bit), MX2560 exact against its MXFP4 read through ggml's own rule (`kvalues_fp4`, the E2M1
+  table doubled, times `2^(e-128)`).
+- **Attention sinks**: one logit per head that joins the softmax and carries no value
+  (`q4nx_attn::head_context`'s `sink`; a null sink leaves every other model bit-identical). **o_proj bias.**
+- **YaRN** (`rope_type: "yarn"`, `Q4nxRopeYarn` in `q4nx_rope.h`): the frequency ramp of transformers'
+  `_compute_yarn_parameters` (`truncate: false` honoured) and the attention factor on cos and sin.
+- **The MoE** (`gptoss_moe`): top-k of the biased router logits, a softmax over those k (llama.cpp's
+  `SOFTMAX_WEIGHT`), and per expert ggml's `swiglu_oai` (`min(gate, 7) * sigmoid(1.702 * gate) * (clamp(up, -7, 7) + 1)`)
+  with the gate, up and down biases. The experts are read from the MXFP4 chunks in place, never expanded.
+- The sliding window on alternate layers was already read from `layer_types`.
+
+Checked on the host, 2026-11-12. A numpy GPT-OSS forward of the same weights (transcribed from our llama.cpp fork's
+`openai-moe.cpp`) puts `<|channel|>` first after `<|start|>assistant` (38.3 against 18.7 for the next token). The
+forward's logits match it at corr 1.000000, max |d| 6e-5 of 38.3. `gptoss_forward` (CI) writes a two-layer container
+in this format and holds the forward to the same reference on its bytes: corr 1.0000000. Removing any one rule fails
+it, while batched equals sequential passes every time: the sinks (0.61), the o bias (0.29), the MXFP4 bias (0.84),
+the SwiGLU clamp (0.92), the YaRN attention factor (0.994), the YaRN frequency rule (0.99989), and the top-k softmax
+(0.99967). A batched prefill of gpt_oss takes the per-token path. No kernel set for its shapes was built or run (the
+NPU is off).
+
+**Hy-Memory-30B-A3B-NPU2: hy_v3 runs on the existing MoE path (engine#1786).** Tencent's hy_v3 routes as DeepSeek-V3
+does (our llama.cpp fork's `src/models/hy-v3.cpp`): sigmoid router probabilities, the top 8 of 128 chosen on probability
+plus an expert bias, weighted by the unbiased probabilities normalised to sum 1 and scaled, one ungated shared expert,
+and a dense first layer. The forward already ran that routing. What it did not do was read the pack's way of saying
+it. Each of these, alone, made the reply ` of of of`:
+
+- **The config keys.** `moe_router_use_sigmoid` is the sigmoid (it was read as softmax), `router_scaling_factor` is the
+  weight scale, `first_k_dense_replace` is the leading dense count with the dense width from `intermediate_size`, and
+  `expert_hidden_dim` (768) is the expert width. `moe_intermediate_size` says 1536, but the experts and the shared
+  expert are `[768][2048]` in `tencent/Hy-Memory-30B-A3B` itself.
+- **The router** is stored `[H][E]`, the transpose of upstream's `[E][H]`, checked by a ranged read of the checkpoint.
+  A router of that shape is transposed at load. **The expert bias** is the F32 `moe_expert_bias`, equal to upstream's
+  `mlp.expert_bias`.
+- **The expert slices are `[N][K]`.** FastFlowLM's Qwen MoE packs transpose each expert, and the forward read every
+  `*_exps_proj` stack that way. This pack does not transpose: its gate stack is `[3072][8][4736]`, 24 x 8 tiles per
+  expert for 768 x 2048. The grid is now decided from the first MoE layer's own gate stack. Against upstream expert
+  0 of layer 1, `[N][K]` gives gate and down corr 0.9974, and the old reading gives 0.008. The same rule also fires
+  on `MiniCPM-V-4.7-35B-A3B-NPU2` (the only other container on the box it fires on). That reading is right there too:
+  its layer-0 expert 0 against `openbmb/MiniCPM-V-4.7-35B-A3B`'s own `gate_up_proj` gives corr 0.997 as `[N][K]` and
+  0.024 as `[K][N]`. That pack does not run on this forward either way ("MoE designs missing", engine#1788), so no
+  answer changes.
+- **A leading dense layer without MLA** gets the DG/DU/DD designs and `dense_mlp` the MLA path already had. A batched
+  prefill of such a model takes the per-token path.
+
+On the host the known-answer prompt (no-think template) answers `Paris` and `<eos>`. Against a numpy hy_v3 forward
+of the same weights, decoded through `q4nx_dequant.c`, the last position's logits match at corr 1.000000, max |d|
+3e-5 of 26.6, with the same top 5. `batch_check_state_hy_v3` fabricates a two-layer pack written this way and holds
+the forward to that reference: corr 1.0000000. Each of these mutants fails it:
+
+| mutant | corr |
+|---|---|
+| `[K][N]` slices | 0.59 |
+| no router transpose | 0.78 |
+| softmax gating | 0.9965 |
+| no scale | 0.94 |
+| bias ignored | 0.87 |
+| expert width from `moe_intermediate_size` | refused at the expert gate |
+
+No kernel set for its shapes was built or run (the NPU is off).
+
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.
 A pack of the same architecture under another name got it wrong in silence. FastFlowLM's MiniCPM-V 4.7
@@ -3361,6 +3525,63 @@ iteration instead of two) collapses the chain from **2.82 to 1.07** tokens/pass 
 to 6.9 %** — the head needs the hidden of the token it drafts past, which a one-pass loop cannot produce. Lagging
 the hidden without lagging the cursor is worse: it accepts **0 of 92** while the mismatch counter stays at 0, i.e.
 a silently broken loop rather than a slow one.
+
+**The one-pass round, for a head that does not need that hidden** (engine#1781). The refutation above is about the
+MTP head. A DFlash draft drafts from the base's *committed* rows plus the last token's embedding, so it never needs the
+hidden after the token it drafts past. Such a head says so (`DraftHead::needs_last_hidden()` returns false), and
+`mtp::run()` then verifies `[t1, d1..dk]` as one batch of `k + 1` rows: row `i` checks draft `i + 1`, the round commits
+`t1` plus the accepted drafts, the drafter's `commit_rows()` gets those rows (`t1`'s first), and the next `t1` is the
+base's choice in the first row past them. `k` is held to `max_batch_rows() - 1`, because `t1` takes a row. The MTP head
+keeps the two-pass round (the default). `tests/mtp_draft_test.cpp` [17] pins it on the toy base: the text and the
+recurrent state are plain decode's for perfect, garbage and half-right heads at `k` = 1 to 12; a fully accepted chain
+takes one pass per `k + 1` tokens and no step (k = 7: 0.125 base passes per token against the two-pass round's 0.250);
+and every committed row reaches the drafter once, in order. This is what the "one pass (verify only)" rows of
+[docs/oga-drafter-path.md](oga-drafter-path.md) price.
+
+The DFlash draft is that head: `npu/dflash_head.h` (`DFlashHead`) drafts from the forward's tap sink
+(`set_layer_taps`), fused into a `DraftKvCache` as rows are committed, and trims the sink after each verify batch to the
+rows the round committed, because the forward writes a tap row for every position a pass runs, rejected drafts
+included. The target's embedding and the rule that turns a drafted row into a token (the head's argmax or a DFlash 2
+selector) are hooks. `tests/dflash_head_test.cpp` runs it through `mtp::run()` on a toy base that writes taps the same
+way: the text equals plain decode's, the sink ends holding exactly the committed rows, and every draft equals
+`draft_forward()` over those rows, bit for bit.
+
+Two pieces for a caller that is not a test. `mtp::run_from()` starts the loop from a base that already ran its prompt
+(a batched prefill: the positions it holds and the logits after the last), where `run()` prefills one token at a time.
+And `Options::fallback_below` / `fallback_window` apply the speculation fallback (`SpecFallback`,
+`npu/forward/include/spec_greedy.h`) inside the loop, on either round: once the last `fallback_window` rounds emitted
+fewer than `fallback_below` tokens on average, the run finishes with plain steps (`Stats::fell_back_at` says after which
+round). `tools/dflash2_probe loop` with `DFLASH2_MTP_RUN=1` drives the served 27B through exactly these pieces, with
+`DFlashHead` and the DFlash 2 selector as its pick hook, after the same batched prefill as its hand-written loop.
+
+**Serving it: `forward-serve --spec-lookup K`** (off by default; `--spec-fallback X` adds the fallback). A request that
+is greedy, has no grammar, and asks for no logprobs (and a server without `--dump-logits`) decodes through
+`mtp::run_from()` with the prompt-lookup drafter (`npu/mtp/prompt_lookup.h`). That drafter needs no model: it proposes
+the up to `K` tokens that followed the latest earlier occurrence of the stream's last one to three tokens. Every
+other request takes the plain loop. The rule is that speculation is used only where it cannot change a token: each
+token is still the tokenizer-bounded argmax, and both loops hand every token to the same code for end tokens, stop
+sequences and the stop hold-back. The reply's last token is not run through the model (`Options::consume_last =
+false`), as in the plain loop. The server logs one `[spec]` line per request (rounds, drafts accepted, plain steps).
+`tests/serve_spec_lookup_test.py` (ctest `serve_spec_lookup`, on a build with `ONEBIT_NPU`) holds it to that end to
+end. It fabricates a container, serves it host-GEMM twice (plain, then with `--spec-lookup 4`), and requires the same
+text, `finish_reason` and `completion_tokens` for:
+- every budget;
+- stop sequences cut from the plain replies, so they do end them;
+- a seeded sampled request, which must stay on the plain loop.
+
+In host-GEMM mode the verify batch is 16 rows, the device's width. Host GEMMs have no width of their own, and the 1
+the forward reports there would leave no row for a draft. The device route has not been measured with it yet.
+
+**`forward-serve --spec-draft <dir>`** (`--spec-draft-k K`, default the package's block minus one) serves the same path
+with a DFlash draft package as the drafter, in place of the prompt lookup. At load the package is decoded once and
+checked against the target, before `ready`: the widths must match, and its target layers must exist. The forward then
+writes those layers' hidden states into a tap sink on every pass. The sink is emptied when a request takes the engine,
+so its rows start at the request's first position. `DFlashHead` drafts from it, picking with the target's own head:
+DFlash 2's candidate selector when the package has one (`dflash2_select`, `npu/dflash_head.h`), else the bounded argmax.
+A request that resumed from a saved prefix has no rows for the positions it skipped, so its head refuses to draft and
+it decodes with plain steps: the same text, just no speedup. The same test serves a generation-1 package it writes
+(`tests/dflash_draft_test.cpp`'s synthetic layout, sized to the fabricated target). On it every greedy request of two
+or more tokens drafts, and every reply equals the plain server's.
 
 **What would change the answer**: a cheaper verify batch (the array wait is ~60 % of a batched pass — a kernel
 lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth

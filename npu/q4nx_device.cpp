@@ -17,6 +17,7 @@
 #include "file_map.h"
 #include "model.h"
 #include "q4nx.h"
+#include "q4nx_cache_sweep.h"
 
 #include <nlohmann/json.hpp>
 
@@ -185,9 +186,9 @@ DeviceForm device_form(const std::string& model_path, const std::string& cache_d
         out.model = model;
         out.converted = true;
         out.reused = true;
-        // A reuse is a use. The cache's sweep (app/q4nx_cache.h) orders entries by this directory's mtime, which nothing
+        // A reuse is a use. The cache's sweep (q4nx_cache_sweep.h) orders entries by this directory's mtime, which nothing
         // else moves after the conversion is written; the stamp compares the SOURCE's mtime, so this does not disturb it.
-        fs::last_write_time(dir, fs::file_time_type::clock::now(), ec);
+        q4nx_cache_touch(dir);
         std::fprintf(stderr, "1bit q4nx: reusing the device-form conversion of %s at %s\n",
                      model_path.c_str(), dir.c_str());
         return out;
@@ -320,6 +321,11 @@ DeviceForm device_form(const std::string& model_path, const std::string& cache_d
         out.reused = true;
     } else {
         clean.armed = false;  // renamed into place: there is no temporary directory left
+        // engine#2263: this is a WRITER of the cache, so it bounds the cache like serve start does (app/serve.cpp). Before
+        // this only serve start and `1bit q4nx-cache evict` ever swept, so a box that converted through the forward route
+        // and never started a serve grew past the bound with no sweep at all. Same bound (ONEBIT_Q4NX_CACHE_MAX_GIB, 60 GiB
+        // by default, 0 = no sweep), same age window, and never the entry just written.
+        q4nx_cache_evict(root, dir, q4nx_cache_bound_bytes(std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB")));
     }
     out.dir = dir;
     out.model = model;

@@ -36,7 +36,11 @@
 # what the build scripts each list; preflight (at the end) checks the toolchain, hipcc, patchelf and the kernel image.
 set -euo pipefail
 
-[ $# -ge 1 ] || { sed -n '16,33p' "$0"; exit 2; }
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
+[ $# -ge 1 ] || { usage; exit 2; }
 W=$(mkdir -p "$1" && cd "$1" && pwd); shift
 STAGES=${*:-bumps build test package release}
 REPO=1bit-MONSTER/engine

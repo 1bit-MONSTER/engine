@@ -94,6 +94,10 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/laya_first_default.h
      "// generated from config/laya-first.json by CMakeLists.txt\n#pragma once\n"
      "static const char kDefaultLayaFirstJson[] = R\"ONEBITLAYAFIRST(${ONEBIT_LAYA_FIRST_JSON})ONEBITLAYAFIRST\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/laya-first.json)
+# engine#2263: the Q4NX cache's sweep, below both of its callers: `onebit` (serve start, `1bit q4nx-cache`) and onebit_npu
+# (npu/q4nx_device.cpp, the conversion that writes entries). Its own library so each binary links exactly one copy.
+add_library(onebit_q4nx_cache STATIC npu/q4nx_cache_sweep.cpp)
+target_include_directories(onebit_q4nx_cache PUBLIC ${CMAKE_SOURCE_DIR}/npu)
 add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/route_eval.cpp app/laya_checkpoint.cpp app/laya_first.cpp
                      app/embed_serve.cpp app/embed_model.cpp app/q4nx_cache.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
@@ -133,7 +137,23 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/hrx_archs.h
      "static const char* const kHrxGgufArchs[] = {\n${_onebit_archs}};\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/registry/architectures.json)
 set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
-target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+
+# engine#1993: `1bit` is the OUTPUT NAME, not a target -- the target is `onebit`. With the MAKEFILE generator (CMake's
+# default) the output file `1bit` in the build directory makes `--target 1bit` a satisfied FILE rule, so the command prints
+# nothing, exits 0 and builds nothing while a stale binary keeps its old timestamp: a typo that succeeds, which is the
+# failure this fleet pays for most. With Ninja the same command is not a trap: `1bit` there is the output-file rule of
+# `onebit`, so `--target 1bit` rebuilds and relinks the binary (measured, CMake 4.2.3: a touched source, rc 0, new mtime).
+# So this refusal is added ONLY for the Makefile generator, and it cannot be added for Ninja at all: a custom target with
+# that name is a second rule for an output `onebit` already produces, which ninja rejects outright ("multiple rules generate
+# 1bit") and Makefile absorbs as a phony. Deliberately not an alias: an alias that built `onebit` would keep the wrong name
+# in everyone's fingers and logs.
+if(CMAKE_GENERATOR MATCHES "Makefiles")
+    add_custom_target(1bit
+        COMMAND ${CMAKE_COMMAND} -E echo "error: the build target is onebit; 1bit is only its output file name. Nothing was built. Use: cmake --build <dir> --target onebit"
+        COMMAND ${CMAKE_COMMAND} -E false
+        VERBATIM)
+endif()
+target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads onebit_q4nx_cache)
 
 # ── The chat-template renderer (engine #963, docs/npu-chat-template.md) ──────
 # The NPU chat route renders the container's own `chat_template` (app/npu_template.h) with the pinned
@@ -218,6 +238,14 @@ add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set
 # at line 418 has run exactly that since #2204, so the row was a duplicate and is gone -- one script
 # gets one row.
 add_test(NAME dupdef_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --check
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# engine#2255: `--help` must not be a traceback. Five tools indexed sys.argv directly, so the flag
+# arrived as a filename -- one with IndexError, the others with `FileNotFoundError: '--help'`, and two
+# of those on `--help/dd_metastate_...`, which is what a path join with the flag looks like. Fixed; this
+# row keeps the next one from landing.
+add_test(NAME tool_help_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/tool_help_check.py --check --root tools
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME tool_help_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/tool_help_check.py --self-test
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
@@ -340,6 +368,9 @@ add_python_test(moe_expert_chunks_accum_test ${CMAKE_SOURCE_DIR}/tests/moe_exper
 # llama-bench (stdlib only: hashlib/importlib.util/json/pathlib/platform/sys) and passes on a plain interpreter, so it is a
 # test with no runner rather than a test that cannot run here. Registered, and the baseline is now empty: from here the
 # sweep is zero-tolerance instead of a record of known gaps.
+# engine#2138 slice: a merge's conflicts classified by kind, from git's index -- the conflicts a text search cannot
+# see (add/delete with no markers) are the ones a pin merge is mostly made of. Device-free, no checkout.
+add_python_test(conflict_triage_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_triage.py --self-test)
 add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
 # `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and
@@ -387,6 +418,11 @@ add_python_test(device_holders ${CMAKE_SOURCE_DIR}/tools/device_holders.py --sel
 # GTT. The script existed with a test that nothing ran; a test nobody runs is a comment, so the loader/flag assertions are registered
 # here (the test fakes the box, so it needs no device and no ticket).
 add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-bench-preflight.sh)
+# engine#572: an arm's memory trace. --drop-gib exists because a floor relative to a reading taken before the arm is
+# fragile -- other lanes move MemAvailable between the two -- while "fell by more than N GiB during this arm" is the
+# contamination itself. Same reason the test uses --drop-gib rather than a floor.
+add_test(NAME bench_arm_watch COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-bench-arm-watch.sh
+                                           ${CMAKE_SOURCE_DIR}/tools/bench-arm.sh)
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.
@@ -586,6 +622,11 @@ if(TARGET OpenMP::OpenMP_CXX)
     target_link_libraries(mtp_draft_test PRIVATE OpenMP::OpenMP_CXX)
 endif()
 add_test(NAME mtp_draft COMMAND mtp_draft_test)
+# engine#1781: the prompt-lookup drafter (npu/mtp/prompt_lookup.h), by hand and through mtp::run() on a toy base.
+add_executable(prompt_lookup_test tests/prompt_lookup_test.cpp)
+target_include_directories(prompt_lookup_test PRIVATE npu)
+add_dependencies(onebit prompt_lookup_test)
+add_test(NAME prompt_lookup COMMAND prompt_lookup_test)
 # engine#1781 gate 2: the distribution-following acceptance rule (accept with min(1, p/q), resample the residual at the
 # first rejection), with the temperature-0 identity and a deliberately wrong drafter whose output must still follow p.
 # Header-only and device-free; pulled into CI through npu_sampling_test for the same reason as mtp_draft_test below.
@@ -818,7 +859,7 @@ add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_
                             npu/audio_exec.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
-target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
+target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json onebit_q4nx_cache PRIVATE PkgConfig::PCRE2)
 
 # ── npu/forward's forward C++ compiles without the NPU runtime (engine #898) ───────────────
 # CI configures without ONEBIT_NPU, so npu/forward/src/q4nx_forward.cpp - where every A1 defect so
@@ -1235,6 +1276,7 @@ add_executable(embed_model_test tests/embed_model_test.cpp app/embed_model.cpp)
 # age window, and the disabled case). Listed explicitly like the other app/ units so the test needs no `onebit`.
 add_executable(q4nx_cache_test tests/q4nx_cache_test.cpp app/q4nx_cache.cpp)
 target_include_directories(q4nx_cache_test PRIVATE app)
+target_link_libraries(q4nx_cache_test PRIVATE onebit_q4nx_cache)
 add_test(NAME q4nx_cache COMMAND q4nx_cache_test)
 # engine#1956 review: an `add_test` whose target ci.yml never builds never runs in CI -- the documented route, no workflow edit.
 add_dependencies(onebit q4nx_cache_test)
@@ -1449,6 +1491,14 @@ target_include_directories(dflash_forward_test PRIVATE npu npu/forward/include)
 target_link_libraries(dflash_forward_test PRIVATE onebit_npu)
 add_dependencies(onebit dflash_forward_test)
 add_test(NAME dflash_forward COMMAND dflash_forward_test ${ONEBIT_DFLASH_DRAFT})
+# engine#1781: the DFlash draft as mtp::run()'s drafter (npu/dflash_head.h) on a toy base that writes a tap row per
+# position, rejected rows included: text equals plain decode, the sink keeps only committed rows, every draft equals
+# draft_forward() over them. Host only.
+add_executable(dflash_head_test tests/dflash_head_test.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp npu/forward/src/q4nx_dequant.c)
+target_include_directories(dflash_head_test PRIVATE npu npu/forward/include)
+target_link_libraries(dflash_head_test PRIVATE onebit_npu)
+add_dependencies(onebit dflash_head_test)
+add_test(NAME dflash_head COMMAND dflash_head_test)
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
@@ -1686,6 +1736,11 @@ add_executable(layer_taps_test tests/layer_taps_test.cpp)
 target_include_directories(layer_taps_test PRIVATE npu/forward/include)
 add_test(NAME layer_taps COMMAND layer_taps_test)
 add_dependencies(onebit layer_taps_test)
+# The greedy speculative round and its fallback rule (npu/forward/include/spec_greedy.h, engine#1781). Header-only.
+add_executable(spec_greedy_test tests/spec_greedy_test.cpp)
+target_include_directories(spec_greedy_test PRIVATE npu/forward/include)
+add_test(NAME spec_greedy COMMAND spec_greedy_test)
+add_dependencies(onebit spec_greedy_test)
 add_executable(dflash_accept_test tests/dflash_accept_test.cpp)
 target_include_directories(dflash_accept_test PRIVATE npu/forward/include)
 add_test(NAME dflash_accept COMMAND dflash_accept_test)
@@ -1748,6 +1803,14 @@ target_include_directories(q4nx_gemma3_semantics_test PRIVATE npu/forward/includ
 target_link_libraries(q4nx_gemma3_semantics_test PRIVATE m)
 add_test(NAME q4nx_gemma3_semantics COMMAND q4nx_gemma3_semantics_test)
 add_dependencies(npu_sampling_test q4nx_gemma3_semantics_test)
+# LFM3 (engine#1786): "conv" in layer_types, the sandwich, the per-head gate, the zero-tail RoPE, and model_load's
+# renaming of the upstream tensor names. Links the two C sources directly, no model and no device.
+add_executable(q4nx_lfm3_semantics_test tests/q4nx_lfm3_semantics_test.cpp npu/forward/src/model.c
+               npu/forward/src/q4nx_semantics.c)
+target_include_directories(q4nx_lfm3_semantics_test PRIVATE npu/forward/include)
+target_link_libraries(q4nx_lfm3_semantics_test PRIVATE m)
+add_test(NAME q4nx_lfm3_semantics COMMAND q4nx_lfm3_semantics_test)
+add_dependencies(npu_sampling_test q4nx_lfm3_semantics_test)
 add_dependencies(npu_sampling_test q4nx_qk_norm_test)
 add_executable(q4nx_layer_kinds_test tests/q4nx_layer_kinds_test.c npu/forward/src/q4nx_semantics.c)
 target_include_directories(q4nx_layer_kinds_test PRIVATE npu/forward/include)
@@ -1995,6 +2058,8 @@ endif()
     # same sources against the runtime stub (engine#1946) cannot drift from this one.
     onebit_npu_forward_library(onebit_npu_forward onebit_npu_rt)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
+    # engine#1781: forward-serve --spec-draft runs a DFlash draft package (npu/dflash_head.h) as its drafter.
+    target_sources(onebit PRIVATE npu/dflash_forward.cpp npu/dflash_draft.cpp)
     # engine#2111: the usage object's pure function, its own TU so tests/serve_usage_test.cpp can link it without
     # dragging in npu/rt.h (see cmake/tests-serve-usage.cmake).
     target_sources(onebit PRIVATE app/serve_usage.cpp)
@@ -2082,6 +2147,11 @@ endif()
     set_tests_properties(gdn_batch_order PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(layer_taps_model PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(commit_full_accept PROPERTIES SKIP_RETURN_CODE 77)
+    # engine#1781: forward-serve --spec-lookup gives the plain loop's replies, end to end, host-GEMM on a container the
+    # script fabricates (no device, no model on disk). forward-serve exists only in this build, so it is a dev-box row.
+    add_test(NAME serve_spec_lookup
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/serve_spec_lookup_test.py $<TARGET_FILE:onebit>)
+    set_tests_properties(serve_spec_lookup PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     set_tests_properties(batch_check_state PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source
@@ -2115,6 +2185,33 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> lfm2)
     set_tests_properties(batch_check_state_lfm2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # LFM3 (engine#1786): the upstream tensor names, "conv" in layer_types, sandwich norms and the per-head gate.
+    add_test(NAME batch_check_state_lfm3
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> lfm3)
+    set_tests_properties(batch_check_state_lfm3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # Qwen2 (engine#1786): q/k/v biases with no attention_bias key in config.json, against a numpy Qwen2 reference.
+    add_test(NAME batch_check_state_qwen2
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> qwen2)
+    set_tests_properties(batch_check_state_qwen2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # The same Qwen2 declaring Qwen2.5-VL's contiguous "mrope": accepted, and exact on a text-only prompt.
+    add_test(NAME batch_check_state_qwen2vl
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> qwen2vl)
+    set_tests_properties(batch_check_state_qwen2vl PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # Hy-Memory (hy_v3, engine#1786): sigmoid routing with a selection bias, router [H][E], a leading dense layer,
+    # [N][K] expert slices under FLM names, expert_hidden_dim, against a numpy hy_v3 reference.
+    add_test(NAME batch_check_state_hy_v3
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> hy_v3)
+    set_tests_properties(batch_check_state_hy_v3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # GPT-OSS (engine#1786): a container written in FastFlowLM's D2560/MX2560 form, sinks, o bias, yarn, the top-k
+    # MoE with clamped SwiGLU, against a numpy GPT-OSS forward on the same bytes.
+    add_test(NAME gptoss_forward
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/gptoss_forward_ci.py
+                     $<TARGET_FILE:batch_check_state_test>)
+    set_tests_properties(gptoss_forward PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     # A fabricated qwen3_5 hybrid (a linear-attention layer, then attention), off the kernel's N grid on purpose.
     add_test(NAME batch_check_state_qwen35
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py

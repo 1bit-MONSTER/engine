@@ -148,7 +148,7 @@ static void test_declared_type(void) {
         s.high_freq_factor = 4.0;
         s.low_freq_factor = 1.0;
         s.original_max_position = 8192.0;
-        const int got = q4nx_rope_type_supported(type, &s, cases[i].has_short, 0);
+        const int got = q4nx_rope_type_supported(type, &s, cases[i].has_short, 0, 0);
         char buf[192];
         snprintf(buf, sizeof buf, "declared type \"%s\" reads as \"%s\"", cases[i].type, type);
         check(!strcmp(type, cases[i].type), buf);
@@ -170,7 +170,7 @@ static void test_declared_type(void) {
         char type[64];
         q4nx_rope_declared_type(big, type, (int)sizeof type);
         check(!strcmp(type, "yarn"), "a type 1,000 bytes into the block is still read (fails closed)");
-        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0, 0) == 0,
+        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0, 0, 0) == 0,
               "... and is refused");
     }
     {
@@ -178,7 +178,7 @@ static void test_declared_type(void) {
         q4nx_rope_declared_type("{\"rope_scaling\": {\"factor\": 8.0}, "
                                 "\"quantization_config\": {\"type\": \"fp8\"}}", type, (int)sizeof type);
         check(type[0] == '\0', "a block with no type does not take a neighbour's type");
-        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0, 0) == 1, "... and is not refused");
+        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0, 0, 0) == 1, "... and is not refused");
         /* nested arrays/objects before the type, and a '}' inside a string, both keep the block open */
         q4nx_rope_declared_type("{\"rope_scaling\": {\"mrope_section\": [1, 2], \"rope_type\": \"yarn\"}}",
                                 type, (int)sizeof type);
@@ -194,7 +194,7 @@ static void test_declared_type(void) {
     char none[8];
     q4nx_rope_declared_type((const char*)0, none, (int)sizeof none);
     check(none[0] == '\0', "null config declares no type");
-    check(q4nx_rope_type_supported(none, (const Q4nxRopeLlama3*)0, 0, 0) == 1, "no type is supported");
+    check(q4nx_rope_type_supported(none, (const Q4nxRopeLlama3*)0, 0, 0, 0) == 1, "no type is supported");
     /* engine#1740 W2: the declared-type extraction must SEE Hunyuan's block, because everything downstream (the
      * reader, the predicate, the base rule) is gated on this string. A config that declares dynamic must report it,
      * and one that declares nothing must report nothing -- the second half is what keeps every other model on plain
@@ -213,11 +213,11 @@ static void test_declared_type(void) {
     /* engine#1740 W2: dynamic NTK. The support predicate accepts it ONLY when the numbers were read, and the base
      * rule is the plain theta until a position passes the model's own window -- which is the property that makes
      * accepting Hunyuan's factor-1.0 block safe rather than a guess. */
-    check(q4nx_rope_type_supported("dynamic", (const Q4nxRopeLlama3*)0, 0, 0) == 0,
+    check(q4nx_rope_type_supported("dynamic", (const Q4nxRopeLlama3*)0, 0, 0, 0) == 0,
           "dynamic NTK is refused when no numbers were read (a declared block must not be served as plain rope)");
-    check(q4nx_rope_type_supported("dynamic", (const Q4nxRopeLlama3*)0, 0, 1) == 1,
+    check(q4nx_rope_type_supported("dynamic", (const Q4nxRopeLlama3*)0, 0, 1, 0) == 1,
           "... and accepted when they were");
-    check(q4nx_rope_type_supported("yarn", (const Q4nxRopeLlama3*)0, 0, 1) == 0,
+    check(q4nx_rope_type_supported("yarn", (const Q4nxRopeLlama3*)0, 0, 1, 0) == 0,
           "... which does not open the door to the other types");
     {
         Q4nxRopeDynamic d = {1, 1.0, 262144.0};            /* Hunyuan-0.5B's own numbers */
@@ -362,6 +362,26 @@ int main(void) {
 
     test_declared_type();
 
-    if (failures == 0) printf("all llama3 rope checks passed\n");
+    /* engine#1786: yarn (GPT-OSS-20B: factor 32, original 4096, beta 32 / 1, truncate false, base 150000, dim 64).
+     * Accepted only with usable numbers; the per-pair rule against transformers' _compute_yarn_parameters, computed
+     * by hand for pairs 0 (pure extrapolation), 31 (pure interpolation) and one inside the ramp. */
+    check(q4nx_rope_type_supported("yarn", (const Q4nxRopeLlama3*)0, 0, 0, 1) == 1, "yarn with its numbers is applied");
+    check(q4nx_rope_type_supported("yarn", (const Q4nxRopeLlama3*)0, 0, 0, 0) == 0, "yarn without them is refused");
+    {
+        Q4nxRopeYarn y = {1, 32.0, 4096.0, 32.0, 1.0, 0.1 * log(32.0) + 1.0, 0};
+        const double base = 150000.0;
+        const double low = (64 * log(4096.0 / (32.0 * 2 * 3.14159265358979323846))) / (2 * log(base));
+        const double high = (64 * log(4096.0 / (1.0 * 2 * 3.14159265358979323846))) / (2 * log(base));
+        const double e0 = 1.0, e31 = 1.0 / pow(base, 62.0 / 64.0);
+        check(fabs(q4nx_rope_yarn_inv_freq(0, 64, base, &y) - e0) < 1e-15, "yarn pair 0 (below the ramp) keeps the plain frequency");
+        check(fabs(q4nx_rope_yarn_inv_freq(31, 64, base, &y) - e31 / 32.0) < 1e-18, "yarn pair 31 (past the ramp) is the plain one / factor");
+        const int i = 12;
+        const double ex = 1.0 / pow(base, 2.0 * i / 64.0), r = (i - low) / (high - low), ef = 1.0 - (r < 0 ? 0 : r > 1 ? 1 : r);
+        check(fabs(q4nx_rope_yarn_inv_freq(i, 64, base, &y) - ((ex / 32.0) * (1 - ef) + ex * ef)) < 1e-15,
+              "yarn pair 12 blends the two by the linear ramp (no floor/ceil with truncate false)");
+        check(low > 0 && low < 12 && high > 12 && high < 31, "... and pair 12 is inside GPT-OSS's ramp");
+    }
+
+    if (failures == 0) printf("all llama3 and yarn rope checks passed\n");
     return failures == 0 ? 0 : 1;
 }

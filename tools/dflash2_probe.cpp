@@ -50,11 +50,13 @@
 
 #include "dflash_draft.h"
 #include "dflash_forward.h"
+#include "dflash_head.h"     // DFLASH2_MTP_RUN: the same loop through mtp::run_from + DFlashHead
 #include "file_create.h"   // onebit_fopen_private_wb
 #include "file_map.h"
 #include "forward/include/q4nx_dequant.h"
 #include "pack_import.h"
 #include "q4nx_forward.h"
+#include "spec_greedy.h"     // the greedy round and the fallback rule
 #include "npu_engine_i8ctx_inc.h"   // I8Ctx: one int8 GEMM design from a full ELF
 
 namespace {
@@ -396,6 +398,63 @@ void dev_place(DevDraft& d, xrt::device& dev, const std::string& kdir, const std
     d.proj[W.data()] = std::move(p);
 }
 
+// DFLASH2_MTP_RUN=1: the loop after the same prefill, through the engine's own pieces -- mtp::run_from() with
+// DFlashHead as the drafter (npu/mtp/draft.h, npu/dflash_head.h) -- instead of the hand-written rounds below, so a
+// ticket can hold the production path against the reference loop and plain decode. DFLASH2_FALLBACK and
+// DFLASH2_FALLBACK_ROUNDS are the same rule, through Options::fallback_*.
+struct FwdBase : onebit::npu::mtp::BaseModel {
+    Q4nxNpuForward& f;
+    int nv, h;
+    FwdBase(Q4nxNpuForward& fw, int vocab, int hidden) : f(fw), nv(vocab), h(hidden) {}
+    int vocab() const override { return nv; }
+    int hidden_size() const override { return h; }
+    int max_batch_rows() const override { return f.max_batch_rows(); }
+    bool step(int t, int p, std::vector<float>& l) override { return f.step(t, p, l); }
+    bool step_batch_all(const std::vector<int>& t, int s, std::vector<float>& l) override {
+        f.begin_verify(int(t.size()), s);
+        return f.step_batch_all(t, s, l);
+    }
+    bool commit_verify(int a) override { return f.commit_verify_rows(a); }
+    const std::vector<float>& last_hidden() const override { return f.last_hidden(); }
+    const std::vector<float>& last_hidden_rows() const override { return f.last_hidden_rows(); }
+};
+
+template <class Select>
+int loop_mtp_run(Q4nxNpuForward& fwd, const DraftWeights& w, const DraftConfig& dc, std::vector<float>& taps,
+                 const std::vector<int>& prompt, const std::vector<float>& logits, const std::vector<int>& ref,
+                 int want_tokens, int per, double t_prefill, Select& select) {
+    const int P = int(prompt.size());
+    HeadHooks hooks;
+    hooks.embed = [&](int t, std::vector<float>& row) { fwd.embed_row(t, row); return !row.empty(); };
+    hooks.pick = [&](const float* h, int prev) { return select(h, prev); };
+    DFlashHead head(w, taps, hooks, int(dc.mask_token_id), dc.block_size, dc.sliding_window);
+    FwdBase base(fwd, int(logits.size()), dc.hidden);
+    onebit::npu::mtp::Options o;
+    o.k = per;
+    o.max_tokens = want_tokens;
+    o.tau = 0.0f;
+    o.fallback_below = getenv("DFLASH2_FALLBACK") ? std::atof(getenv("DFLASH2_FALLBACK")) : 0.0;
+    o.fallback_window = getenv("DFLASH2_FALLBACK_ROUNDS") ? std::max(1, std::atoi(getenv("DFLASH2_FALLBACK_ROUNDS"))) : 3;
+    const double t0 = now_s();
+    const onebit::npu::mtp::Result r = onebit::npu::mtp::run_from(base, &head, P, logits, o);
+    const double t_gen = now_s() - t0;
+    if (!r.ok) die("mtp_run: " + r.err + (head.error().empty() ? "" : " (" + head.error() + ")"));
+    const int n = int(r.tokens.size());
+    int same = 0;
+    if (!ref.empty())
+        while (same < n && P + same < int(ref.size()) && ref[size_t(P + same)] == r.tokens[size_t(same)]) same++;
+    std::printf("mtp_run: prefill %d tokens in %.2f s; %d tokens in %d rounds + %d steps, %.3f accepted per round, %.3f base passes per token%s\n",
+                P, t_prefill, n, r.stats.batches, r.stats.steps, r.stats.mean_accept_len(), r.stats.passes_per_token(),
+                r.stats.fell_back_at >= 0 ? (", fell back after round " + std::to_string(r.stats.fell_back_at)).c_str() : "");
+    std::printf("mtp_run: generation %.2f s = %.2f tok/s; draft %.0f ms, verify %.0f ms, commit %.0f ms, steps %.0f ms in all\n",
+                t_gen, double(n) / t_gen, r.stats.ms_draft, r.stats.ms_batch, r.stats.ms_commit, r.stats.ms_step);
+    if (!ref.empty()) std::printf("mtp_run: the first %d of %d tokens equal plain greedy decoding%s\n", same, n, same == n ? "" : " (then they part)");
+    std::printf("tokens:");
+    for (int i = 0; i < n; i++) std::printf(" %d", r.tokens[size_t(i)]);
+    std::printf("\n");
+    return 0;
+}
+
 int loop(int argc, char** argv) {
     if (argc != 8) die("loop <model dir> <kernel dir> <draft dir> <prompt-ids file> <tokens> <reference seq.i32 or ->");
     const std::string model = argv[2], kern = argv[3], ddir = argv[4];
@@ -458,6 +517,34 @@ int loop(int argc, char** argv) {
     std::vector<float> mask_emb;
     fwd.embed_row(int(dc.mask_token_id), mask_emb);
     double t_draft = 0, t_head = 0, t_verify = 0, t_fuse = 0;
+    // The selector: the target's head on one drafted row, then the pairwise re-score against the previous pick.
+    std::vector<float> prow(R), hp(R), succ(size_t(k) * R);
+    auto select = [&](const float* h, int prev) -> int {
+        std::vector<float> hv(h, h + H), lg;
+        double b0 = now_s();
+        if (!fwd.lm_head_logits(hv, lg)) die(std::string("head: ") + fwd.last_error());
+        t_head += now_s() - b0;
+        b0 = now_s();
+        std::vector<int> idx(lg.size());
+        for (size_t j = 0; j < idx.size(); j++) idx[j] = int(j);
+        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return lg[size_t(a)] > lg[size_t(b)]; });
+        for (size_t r = 0; r < R; r++) {
+            double acc = 0.0;
+            const float* wr = hproj.data() + r * H;
+            for (size_t q = 0; q < H; q++) acc += double(wr[q]) * double(h[q]);
+            hp[r] = float(acc);
+        }
+        decode_row(dm.selector_pred, prev, prow.data());
+        std::vector<float> unary(static_cast<size_t>(k));
+        for (int c = 0; c < k; c++) {
+            unary[size_t(c)] = lg[size_t(idx[size_t(c)])];
+            decode_row(dm.selector_succ, idx[size_t(c)], succ.data() + size_t(c) * R);
+        }
+        const int pick = idx[size_t(selector_pick(unary.data(), k, prow.data(), hp.data(), succ.data(), int(R)))];
+        t_draft += now_s() - b0;
+        return pick;
+    };
+    if (getenv("DFLASH2_MTP_RUN")) return loop_mtp_run(fwd, w, dc, taps, prompt, logits, ref, want_tokens, per, t_prefill, select);
     long rounds = 0, accepted_total = 0;
     std::vector<long> hist(size_t(block), 0);
     const double t_gen0 = now_s();
@@ -465,21 +552,16 @@ int loop(int argc, char** argv) {
     // rounds emitted fewer tokens than that on average stops speculating and finishes with plain greedy steps.
     const double fallback_below = getenv("DFLASH2_FALLBACK") ? std::atof(getenv("DFLASH2_FALLBACK")) : 0.0;
     const int fallback_after = getenv("DFLASH2_FALLBACK_ROUNDS") ? std::max(1, std::atoi(getenv("DFLASH2_FALLBACK_ROUNDS"))) : 3;
-    // The rule looks at the last DFLASH2_FALLBACK_ROUNDS rounds only, so a request whose first rounds happened to
-    // accept well does not keep speculating on that credit.
-    std::vector<int> recent;   // tokens emitted by each round, newest last
+    // The rule (spec_greedy.h) looks at the last DFLASH2_FALLBACK_ROUNDS rounds only, so a request whose first rounds
+    // happened to accept well does not keep speculating on that credit.
+    SpecFallback fallback(fallback_below, fallback_after);
     bool plain = false;
     long plain_steps = 0;
     while (int(out.size()) < want_tokens) {
-        if (!plain && fallback_below > 0.0 && int(recent.size()) >= fallback_after) {
-            double sum = 0.0;
-            for (size_t i = recent.size() - size_t(fallback_after); i < recent.size(); i++) sum += recent[i];
-            const double avg = sum / double(fallback_after);
-            if (avg < fallback_below) {
-                plain = true;
-                std::printf("loop: falling back to plain decoding after %ld rounds (last %d rounds: %.2f tokens per round, below %.2f)\n",
-                            rounds, fallback_after, avg, fallback_below);
-            }
+        if (!plain && fallback.off()) {
+            plain = true;
+            std::printf("loop: falling back to plain decoding after %ld rounds (last %d rounds below %.2f tokens per round)\n",
+                        rounds, fallback_after, fallback_below);
         }
         if (plain) {
             if (!fwd.step(cur, pos, logits)) die(std::string("step: ") + fwd.last_error());
@@ -500,33 +582,10 @@ int loop(int argc, char** argv) {
         // selector: the target's head on each drafted row, then the pairwise re-score against the previous pick
         std::vector<int> drafts;
         int prev = cur;
-        std::vector<float> prow(R), hp(R), succ(size_t(k) * R);
         for (int i = 1; i <= per; i++) {
-            const float* h = hrows.data() + size_t(i) * H;
-            std::vector<float> hv(h, h + H), lg;
-            double b0 = now_s();
-            if (!fwd.lm_head_logits(hv, lg)) die(std::string("head: ") + fwd.last_error());
-            t_head += now_s() - b0;
-            b0 = now_s();
-            std::vector<int> idx(lg.size());
-            for (size_t j = 0; j < idx.size(); j++) idx[j] = int(j);
-            std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return lg[size_t(a)] > lg[size_t(b)]; });
-            for (size_t r = 0; r < R; r++) {
-                double acc = 0.0;
-                const float* wr = hproj.data() + r * H;
-                for (size_t q = 0; q < H; q++) acc += double(wr[q]) * double(h[q]);
-                hp[r] = float(acc);
-            }
-            decode_row(dm.selector_pred, prev, prow.data());
-            std::vector<float> unary(static_cast<size_t>(k));
-            for (int c = 0; c < k; c++) {
-                unary[size_t(c)] = lg[size_t(idx[size_t(c)])];
-                decode_row(dm.selector_succ, idx[size_t(c)], succ.data() + size_t(c) * R);
-            }
-            const int pick = idx[size_t(selector_pick(unary.data(), k, prow.data(), hp.data(), succ.data(), int(R)))];
+            const int pick = select(hrows.data() + size_t(i) * H, prev);
             drafts.push_back(pick);
             prev = pick;
-            t_draft += now_s() - b0;
         }
         // verify: [cur, d1..d7] in one batched pass; row i predicts the token after position pos + i
         double c0 = now_s();
@@ -536,15 +595,14 @@ int loop(int argc, char** argv) {
         fwd.begin_verify(int(vt.size()), pos);
         if (!fwd.step_batch_all(vt, pos, logits_all)) die(std::string("verify: ") + fwd.last_error());
         const size_t NV = logits_all.size() / vt.size();
-        int a = 0;
-        int next = -1;
-        for (int i = 0; i < int(vt.size()); i++) {
-            const float* lr = logits_all.data() + size_t(i) * NV;
-            const int g = int(std::max_element(lr, lr + NV) - lr);
-            if (i < per && g == drafts[size_t(i)]) { a++; continue; }
-            next = g;
-            break;
+        std::vector<int> choices(vt.size());
+        for (size_t i = 0; i < vt.size(); i++) {
+            const float* lr = logits_all.data() + i * NV;
+            choices[i] = int(std::max_element(lr, lr + NV) - lr);
         }
+        const GreedyRound gr = greedy_round(drafts.data(), per, choices.data(), int(choices.size()));
+        if (gr.accepted < 0) die("verify: the pass returned fewer rows than it was given");
+        const int a = gr.accepted, next = gr.next;
         if (!fwd.commit_verify_rows(a + 1)) die(std::string("commit: ") + fwd.last_error());
         taps.resize(tap_base + size_t(a + 1) * rowf);   // keep the rows of the committed positions only
         t_verify += now_s() - c0;
@@ -552,7 +610,7 @@ int loop(int argc, char** argv) {
         for (int i = 0; i < a; i++) out.push_back(drafts[size_t(i)]);
         out.push_back(next);
         rounds++;
-        recent.push_back(a + 1);
+        fallback.record(a + 1);
         accepted_total += a;
         hist[size_t(a)]++;
         // extend the fused context by the committed rows

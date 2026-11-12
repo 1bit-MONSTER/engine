@@ -25,7 +25,11 @@
 # directory to seed the data partition with (so the VM needs no network for Lemonade's backends), and
 # [model.gguf] a small model for the chat row.
 set -euo pipefail
-[ $# -ge 3 ] || { sed -n '21,32p' "$0"; exit 2; }
+
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- several of these ranges
+# had drifted past the end of their header and printed code to whoever asked for help (the same defect engine PR #2258 fixed in scripts/).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+[ $# -ge 3 ] || { usage; exit 2; }
 w=$1 stage=$2 lemon=$3 backends=${4:-} model=${5:-$HOME/models/Qwen3-0.6B-Q4_K_M.gguf}
 here=$(cd "$(dirname "$0")" && pwd)
 version=v2026.43

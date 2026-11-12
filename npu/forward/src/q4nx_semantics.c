@@ -229,9 +229,11 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
 
     /* LFM2 / LFM2.5 (Lfm2ForCausalLM): its attention layers carry q_norm/k_norm, applied before RoPE */
     const int is_lfm2 = starts_with(model_type, "lfm2") || starts_with(arch, "Lfm2");
+    const int is_lfm3 = starts_with(model_type, "lfm3") || starts_with(arch, "Lfm3");
+    s->gpt_oss = (starts_with(model_type, "gpt_oss") || starts_with(arch, "GptOss")) ? 1 : 0;
 
     /* per-head q/k RMSNorm: qwen3*, gemma* and lfm2 have q_norm/k_norm; llama/phi do not */
-    s->qk_norm = (is_qwen3 || is_gemma || is_lfm2) ? 1 : 0;
+    s->qk_norm = (is_qwen3 || is_gemma || is_lfm2 || is_lfm3) ? 1 : 0;
     /* engine#1889: a config that STATES `use_qk_norm` decides it, whatever the name table says. The table is a list
      * of the families measured so far, so a family it has never heard of got 0 silently: Hunyuan-7B is
      * `hunyuan_v1_dense` / `HunYuanDenseV1ForCausalLM` with `use_qk_norm: true`, its container carries
@@ -309,6 +311,14 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
         const char* rs = value_for_top(json, "rope_scaling");
         double mr = 0;
         if (rs && *rs == '{' && get_num(rs, "mrope_interleaved", &mr) && mr != 0) s->mrope = 1;
+        /* Qwen2-VL / Qwen2.5-VL: the contiguous form, named by the block's type */
+        char rt[32] = {0};
+        if (rs && *rs == '{' && !s->mrope &&
+            ((get_str(rs, "type", rt, sizeof rt) && strcmp(rt, "mrope") == 0) ||
+             (get_str(rs, "rope_type", rt, sizeof rt) && strcmp(rt, "mrope") == 0))) {
+            s->mrope = 1;
+            s->mrope_sectioned = 1;
+        }
     }
     const char* rope_blk = value_for_top(json, "rope_parameters");
     if (rope_blk && *rope_blk == '{') {
@@ -393,6 +403,8 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
      * no num_global_key_value_heads the head count is the same for both types. */
     if (get_num(json, "global_head_dim", &d) && d > 0)
         s->global_head_dim = (int)d;
+    s->attention_k_eq_v = (strstr(json, "\"attention_k_eq_v\": true") != NULL ||
+                           strstr(json, "\"attention_k_eq_v\":true") != NULL) ? 1 : 0;
     if (get_num(json, "num_global_key_value_heads", &d) && d > 0)
         s->num_global_kv_heads = (int)d;
     const double full_hd = s->global_head_dim > 0 ? (double)s->global_head_dim : hd;
@@ -408,6 +420,13 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
     s->v_norm = is_gemma4 ? 1 : 0;
     s->proportional_rope = (is_gemma4 && s->per_layer_rope &&
                             strstr(json, "\"proportional\"") != NULL) ? 1 : 0;
+    /* LFM3's partial RoPE is the same rule under rope_type "default" (modeling_lfm3.py,
+     * compute_default_rope_parameters): the first partial*head_dim//2 frequencies follow the FULL head_dim's
+     * progression, the rest are zero, and rotate_half pairs across the whole head.  The usual partial form
+     * (pairs inside the first rotary_dim channels, frequencies over rotary_dim) differs from it at every
+     * rotated pair. */
+    if (is_lfm3) s->proportional_rope = 1;
+    s->attn_head_gate = is_lfm3 ? 1 : 0;
 
     /* LM head: tied to the token embedding (the common case) or a SEPARATE
      * lm_head.weight (Nanbeige4.1-3B sets tie_word_embeddings = false). */
@@ -441,6 +460,7 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
                 if (strcmp(nm, "full_attention") == 0) kind = Q4NX_LAYER_FULL;
                 else if (strcmp(nm, "sliding_attention") == 0) kind = Q4NX_LAYER_SLIDING;
                 else if (strcmp(nm, "linear_attention") == 0) kind = Q4NX_LAYER_LINEAR;
+                else if (strcmp(nm, "conv") == 0) kind = Q4NX_LAYER_CONV;
                 else if (!s->unknown_layer_type[0]) {
                     /* Remember the spelling: the forward refuses this container by name rather than serving an
                      * unimplemented layer kind as full attention (engine#1087's shape). */
@@ -469,7 +489,7 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
     /* biases: absent field means "no bias" for llama-family configs, but Phi
      * and Gemma configs omit it as well, so default to 0 and let phase 2's
      * tensor-level probe (bias tensors present?) override it. */
-    if (get_num(json, "attention_bias", &d)) s->attention_bias = d != 0;
+    if (get_num(json, "attention_bias", &d)) { s->attention_bias = d != 0; s->attention_bias_stated = 1; }
     if (get_num(json, "mlp_bias", &d)) s->mlp_bias = d != 0;
 
     /* embedding scale: gemma scales embeddings by sqrt(hidden_size) */
@@ -523,6 +543,9 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
         s->num_kv_shared_layers = (int)(d + 0.5);
     /* Gemma4 adds pre/post feedforward norms and a post-PLE norm. */
     s->extra_layer_norms = is_gemma4 ? 1 : (is_gemma3 ? 2 : 0);
+    if (is_lfm3)
+        s->extra_layer_norms = (strstr(json, "use_sandwich_norm\":false") != NULL ||
+                                strstr(json, "use_sandwich_norm\": false") != NULL) ? 0 : 2;
     /* `use_double_wide_mlp` is a JSON boolean, so read it as "present in text". */
     s->double_wide_mlp = (strstr(json, "use_double_wide_mlp\":true") != NULL ||
                           strstr(json, "use_double_wide_mlp\": true") != NULL) ? 1 : 0;
@@ -571,18 +594,33 @@ int q4nx_semantics_linear_layers(const Q4nxSemantics* s) {
 
 void q4nx_semantics_layer_mix(const Q4nxSemantics* s, char* out, size_t out_sz) {
     if (!out || out_sz == 0) return;
-    int full = 0, slid = 0, lin = 0, oth = 0;
+    int full = 0, slid = 0, lin = 0, conv = 0, oth = 0;
     const int n = s ? s->n_layer_types : 0;
     for (int i = 0; i < n; i++) {
         switch (s->layer_types[i]) {
             case Q4NX_LAYER_FULL:    full++; break;
             case Q4NX_LAYER_SLIDING: slid++; break;
             case Q4NX_LAYER_LINEAR:  lin++;  break;
+            case Q4NX_LAYER_CONV:    conv++; break;
             default:                 oth++;  break;
         }
     }
     if (n == 0) { snprintf(out, out_sz, "no layer_types (all full attention)"); return; }
-    snprintf(out, out_sz, "full=%d sliding=%d linear=%d other=%d", full, slid, lin, oth);
+    if (conv)
+        snprintf(out, out_sz, "full=%d sliding=%d linear=%d conv=%d other=%d", full, slid, lin, conv, oth);
+    else
+        snprintf(out, out_sz, "full=%d sliding=%d linear=%d other=%d", full, slid, lin, oth);
+}
+
+int q4nx_semantics_attention_bias_from_tensors(Q4nxSemantics* s, const unsigned char* has_bias, int layers) {
+    if (!s || !has_bias || layers <= 0 || s->attention_bias) return -1;
+    for (int l = 0; l < layers; l++)
+        if (has_bias[l]) {
+            if (s->attention_bias_stated) return -2;
+            s->attention_bias = 1;
+            return l;
+        }
+    return -1;
 }
 
 int q4nx_semantics_qk_norm_from_tensors(Q4nxSemantics* s, const unsigned char* has_q, const unsigned char* has_k, int layers) {
@@ -640,10 +678,10 @@ void q4nx_semantics_dump(const Q4nxSemantics* s) {
                 s->rotary_dim_sliding, s->rope_local_base ? ", rope_local_base_freq" : "",
                 s->rope_type_named, s->query_pre_attn_scalar);
         fprintf(stderr, "  [semantics] ple=%d (dim=%d vocab=%d) kv_shared_layers=%d "
-                        "extra_layer_norms=%d double_wide_mlp=%d\n",
+                        "extra_layer_norms=%d double_wide_mlp=%d attn_head_gate=%d\n",
                 q4nx_semantics_uses_ple(s), s->hidden_size_per_layer_input,
                 s->vocab_size_per_layer_input, s->num_kv_shared_layers,
-                s->extra_layer_norms, s->double_wide_mlp);
+                s->extra_layer_norms, s->double_wide_mlp, s->attn_head_gate);
     }
 }
 

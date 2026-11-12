@@ -36,6 +36,7 @@
 // Where it runs: in CI (engine#1946), built against the public runtime stub and run by tests/batch_check_state_ci.py
 // on a two-layer container that script fabricates; and on a dev box with ONEBIT_NPU=ON, on the container named by
 // ONEBIT_TEST_Q4NX.
+#include "file_create.h"
 #include "q4nx_forward.h"
 
 #include <cmath>
@@ -103,6 +104,17 @@ int main() {
             std::printf("FAIL  sequential step %zu failed: %s\n", m, fwd.last_error());
             return 1;
         }
+    }
+    // A caller that has its own reference forward of the container (tests/batch_check_state_ci.py lfm3) asks for the
+    // sequential logits: batched == sequential cannot see a rule both paths get wrong, a reference can.
+    if (const char* out = std::getenv("ONEBIT_TEST_LOGITS_OUT")) {
+        FILE* f = onebit_fopen_private_wb(out);   // 0600, never through a symlink (file_create.h)
+        if (!f || std::fwrite(ref.data(), sizeof(float), ref.size(), f) != ref.size()) {
+            std::printf("FAIL  cannot write the sequential logits to %s\n", out);
+            if (f) std::fclose(f);
+            return 1;
+        }
+        std::fclose(f);
     }
 
     fwd.reset();

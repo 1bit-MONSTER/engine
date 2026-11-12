@@ -123,6 +123,43 @@ int main(void) {
         check(q4nx_mrope_axis(1, 0, sec) == 0, "no mrope_section -> plain (t) axis");
     }
 
+    /* 6. Qwen2-VL / Qwen2.5-VL (engine#1786): rope_scaling {"type": "mrope", "mrope_section": [16, 24, 24]}, the
+     * CONTIGUOUS form. transformers' apply_multimodal_rotary_pos_emb splits cos by mrope_section * 2 and takes chunk
+     * k from plane k % 3, so frequency i is t below 16, h below 40 and w below 64. FastFlowLM's
+     * Qwen2.5-VL-3B-Instruct-NPU2 was refused at load ("mrope" was taken for a frequency scaling). */
+    write_config(dir,
+                 "{\"num_hidden_layers\": 2, \"hidden_size\": 2048, \"rope_theta\": 1000000.0,"
+                 " \"rope_scaling\": {\"type\": \"mrope\", \"mrope_section\": [16, 24, 24]}}",
+                 cfg, sizeof cfg);
+    q4nx_semantics_from_config(cfg, dir, &s);
+    check(s.mrope == 1 && s.mrope_sectioned == 1, "qwen2.5_vl rope_scaling.type mrope -> mrope=1, sectioned");
+    check(s.n_mrope_section == 3 && s.mrope_section[0] == 16 && s.mrope_section[1] == 24 && s.mrope_section[2] == 24,
+          "its sections are read: 16 / 24 / 24");
+    {
+        const int sec[3] = {16, 24, 24};
+        /* the reference's own construction, over the 64 frequencies of a 128-wide head */
+        int ref[64], k = 0, agree = 0;
+        const int split[6] = {16, 24, 24, 16, 24, 24};
+        for (int c = 0; c < 6 && k < 128; c++)
+            for (int j = 0; j < split[c]; j++, k++)
+                if (k < 64) ref[k] = c % 3;
+        for (int i = 0; i < 64; i++) agree += q4nx_mrope_axis_sectioned(i, 3, sec) == ref[i];
+        check(agree == 64, "contiguous axis = the reference's split of cos by mrope_section * 2, all 64 frequencies");
+        check(q4nx_mrope_axis_sectioned(15, 3, sec) == 0 && q4nx_mrope_axis_sectioned(16, 3, sec) == 1 &&
+                  q4nx_mrope_axis_sectioned(39, 3, sec) == 1 && q4nx_mrope_axis_sectioned(40, 3, sec) == 2,
+              "the run boundaries: 15 t, 16 h, 39 h, 40 w");
+        int differ = 0;
+        for (int i = 0; i < 64; i++) differ += q4nx_mrope_axis_sectioned(i, 3, sec) != q4nx_mrope_axis(i, 3, sec);
+        check(differ > 0, "and it is not the interleaved layout (the two disagree on some frequencies)");
+    }
+    /* the Qwen3-VL spelling is untouched by the new form */
+    write_config(dir,
+                 "{\"num_hidden_layers\": 2, \"rope_scaling\": {\"mrope_interleaved\": true,"
+                 " \"mrope_section\": [24, 20, 20], \"rope_type\": \"default\"}}",
+                 cfg, sizeof cfg);
+    q4nx_semantics_from_config(cfg, dir, &s);
+    check(s.mrope == 1 && s.mrope_sectioned == 0, "qwen3_vl stays interleaved (mrope_sectioned 0)");
+
     if (failures) { printf("q4nx_mrope: %d failure(s)\n", failures); return 1; }
     printf("q4nx_mrope: ok\n");
     return 0;

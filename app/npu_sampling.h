@@ -198,24 +198,32 @@ struct TokenLogprob {
 // is why this is computed from the untouched logits rather than inside the sampler's filtered
 // candidate set.  Top entries are the highest raw logits, with the sampler's tie rule (lower id
 // first), so the same seed and request always report the same list.
-inline TokenLogprob logprobs_of(const std::vector<float>& logits, int chosen, int top_n) {
+// `vocab` is the tokenizer's bound and MUST be passed whenever `logits` may be wider than it: a
+// padded head stores rows past the vocabulary (engine#2026 -- Qwen3: 151,936 rows against 151,669
+// ids), and those rows are not tokens. Normalising over them shifts every reported logprob by the
+// padding's mass, which is model-dependent rather than a constant, and invisible to any comparison
+// between two paths that share this helper (engine#2272). The bound also keeps padding ids out of
+// the `top_logprobs` list, where an id the tokenizer does not have would otherwise appear.
+inline TokenLogprob logprobs_of(const std::vector<float>& logits, int vocab, int chosen, int top_n) {
     TokenLogprob out;
     out.id = chosen;
     if (logits.empty()) return out;
+    const size_t n = token_bound(logits.size(), vocab);
+    if (n == 0) return out;
     // log-sum-exp in double: exp() of a float logit and then log() of the sum loses the tail that
     // top_logprobs is read for.
     float max_l = logits[0];
-    for (const float v : logits) max_l = std::max(max_l, v);
+    for (size_t i = 0; i < n; i++) max_l = std::max(max_l, logits[i]);
     if (!std::isfinite(max_l)) return out;  // a vocabulary of infinities reports nothing meaningful
     double sum = 0.0;
-    for (const float v : logits) sum += std::exp(double(v) - double(max_l));
+    for (size_t i = 0; i < n; i++) sum += std::exp(double(logits[i]) - double(max_l));
     const double log_z = double(max_l) + std::log(sum);
     if (!std::isfinite(log_z)) return out;
-    if (chosen >= 0 && size_t(chosen) < logits.size()) out.logprob = float(double(logits[size_t(chosen)]) - log_z);
+    if (chosen >= 0 && size_t(chosen) < n) out.logprob = float(double(logits[size_t(chosen)]) - log_z);
     if (top_n <= 0) return out;
     std::vector<Candidate> c;
-    c.reserve(logits.size());
-    for (size_t i = 0; i < logits.size(); i++) c.push_back({logits[i], int(i)});
+    c.reserve(n);
+    for (size_t i = 0; i < n; i++) c.push_back({logits[i], int(i)});
     auto better = [](const Candidate& a, const Candidate& b) {
         return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
     };
@@ -224,6 +232,12 @@ inline TokenLogprob logprobs_of(const std::vector<float>& logits, int chosen, in
     out.top.reserve(k);
     for (size_t i = 0; i < k; i++) out.top.push_back({c[i].id, float(double(c[i].logit) - log_z)});
     return out;
+}
+
+// For a row that is exactly the vocabulary (no padding ids). A padded row must use the overload
+// above with the tokenizer's bound; this form is what a test or a non-padded model wants.
+inline TokenLogprob logprobs_of(const std::vector<float>& logits, int chosen, int top_n) {
+    return logprobs_of(logits, int(logits.size()), chosen, top_n);
 }
 
 // The bytes a decoder must hold back before it can be sure no stop sequence straddles

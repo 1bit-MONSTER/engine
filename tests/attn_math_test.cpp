@@ -28,6 +28,7 @@
 #include "attn_math.h"
 
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -157,6 +158,49 @@ int main() {
 #else
         std::printf("rows: %d comparisons bit-identical to the per-row form (no OpenMP: all on one thread)\n", compared);
 #endif
+    }
+
+    // engine#1786: GPT-OSS's attention sink -- one logit per head that joins the softmax and carries no value. A null
+    // sink must leave every other model's head bit-identical; a sink must give the explicit softmax over [scores, s].
+    {
+        const int NKVs = 2, HDs = 64, T = 9, t0 = 2;
+        std::vector<float> q((size_t)HDs), kc((size_t)T * NKVs * HDs), vc(kc.size()), score((size_t)T);
+        for (auto& v : q) v = u(rng);
+        for (auto& v : kc) v = u(rng);
+        for (auto& v : vc) v = u(rng);
+        const float scale = 0.125f;
+        std::vector<float> a((size_t)HDs, 0.0f), b((size_t)HDs, 0.0f), c((size_t)HDs, 0.0f);
+        q4nx_attn::head_context(q.data(), kc.data(), vc.data(), NKVs, 1, HDs, t0, T, scale, score.data(), a.data());
+        q4nx_attn::head_context(q.data(), kc.data(), vc.data(), NKVs, 1, HDs, t0, T, scale, score.data(), b.data(), nullptr);
+        if (std::memcmp(a.data(), b.data(), sizeof(float) * HDs) != 0) {
+            std::printf("FAIL sink: a null sink changed a bit\n");
+            failures++;
+        }
+        const float sink = 0.7f;
+        q4nx_attn::head_context(q.data(), kc.data(), vc.data(), NKVs, 1, HDs, t0, T, scale, score.data(), c.data(), &sink);
+        double mx = sink, s[16], den = 0.0;
+        for (int t = t0; t < T; t++) {
+            double z = 0.0;
+            for (int i = 0; i < HDs; i++) z += (double)q[(size_t)i] * kc[((size_t)t * NKVs + 1) * HDs + i];
+            s[t] = z * scale;
+            mx = s[t] > mx ? s[t] : mx;
+        }
+        for (int t = t0; t < T; t++) den += std::exp(s[t] - mx);
+        den += std::exp(sink - mx);
+        double worst = 0.0;
+        for (int i = 0; i < HDs; i++) {
+            double ref = 0.0;
+            for (int t = t0; t < T; t++) ref += std::exp(s[t] - mx) / den * vc[((size_t)t * NKVs + 1) * HDs + i];
+            worst = std::max(worst, std::fabs(ref - (double)c[(size_t)i]));
+        }
+        double drop = 0.0;   // and the sink took some mass: the context is not the sinkless one
+        for (int i = 0; i < HDs; i++) drop = std::max(drop, (double)std::fabs(c[(size_t)i] - a[(size_t)i]));
+        if (worst > 1e-5 || drop < 1e-3) {
+            std::printf("FAIL sink: |ctx - softmax over [scores, sink]| = %.3g, change from no sink %.3g\n", worst, drop);
+            failures++;
+        } else {
+            std::printf("sink: ctx = softmax over [scores, sink] (max |d| %.2g); a null sink is bit-identical\n", worst);
+        }
     }
 
     if (failures) {

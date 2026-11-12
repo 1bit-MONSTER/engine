@@ -43,6 +43,10 @@
 # 1 when any did not, 2 on usage/setup error.
 set -uo pipefail
 
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- several of these ranges
+# had drifted past the end of their header and printed code to whoever asked for help (the same defect engine PR #2258 fixed in scripts/).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
 rounds=10
 url=${LEMONADE:-http://1bit-os.local:13305/api/v1}
 npu=${NPU_MODEL:-Qwen3-0.6B-NPU-1bit}
@@ -56,7 +60,7 @@ while [ $# -gt 0 ]; do
     --big) big=${2:?}; shift 2 ;;
     --dmesg) dmesg_file=${2:?}; shift 2 ;;
     --state) state=${2:?}; shift 2 ;;
-    -h | --help) sed -n '28,48p' "$0"; exit 0 ;;
+    -h | --help) usage; exit 0 ;;
     *[!0-9]*) echo "demo-seq-probe: unknown argument: $1" >&2; exit 2 ;;
     *) rounds=$1; shift ;;
     esac

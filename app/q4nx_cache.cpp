@@ -25,87 +25,6 @@
 
 namespace fs = std::filesystem;
 
-int64_t q4nx_dir_bytes(const std::string& path) {
-    std::error_code ec;
-    if (!fs::is_directory(path, ec)) return 0;
-    int64_t total = 0;
-    for (auto it = fs::recursive_directory_iterator(path, fs::directory_options::skip_permission_denied, ec);
-         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        std::error_code fec;
-        if (it->is_regular_file(fec)) total += int64_t(fs::file_size(it->path(), fec));
-        if (fec) continue;
-    }
-    return total;
-}
-
-Q4nxCacheSweep q4nx_cache_evict(const std::string& root, const std::string& keep, int64_t max_bytes,
-                                int64_t min_age_seconds) {
-    Q4nxCacheSweep r;
-    std::error_code ec;
-    if (max_bytes <= 0 || !fs::is_directory(root, ec)) return r;
-    struct Ent { std::string path; int64_t bytes; fs::file_time_type mtime; };
-    std::vector<Ent> all;
-    for (auto it = fs::directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
-         !ec && it != fs::directory_iterator(); it.increment(ec)) {
-        std::error_code tec;
-        if (!it->is_directory(tec)) continue;
-        Ent e;
-        e.path = it->path().string();
-        if (!keep.empty() && (e.path == keep || fs::path(e.path).filename() == fs::path(keep).filename())) continue;  // never the new one
-        e.bytes = q4nx_dir_bytes(e.path);
-        e.mtime = fs::last_write_time(it->path(), tec);
-        if (tec) continue;
-        r.bytes_before += e.bytes;
-        all.push_back(std::move(e));
-    }
-    if (all.empty()) return r;
-    r.bytes_after = r.bytes_before;
-    const auto now = fs::file_time_type::clock::now();
-    const auto min_age = std::chrono::seconds(min_age_seconds);
-    std::vector<Ent*> candidates;      // LRU first; the age window protects an entry a serve may be reading
-    for (auto& e : all)
-        if (now - e.mtime > min_age) candidates.push_back(&e);
-    std::sort(candidates.begin(), candidates.end(), [](const Ent* a, const Ent* b) { return a->mtime < b->mtime; });
-    for (Ent* e : candidates) {
-        if (r.bytes_after <= max_bytes) break;
-        std::error_code rec;
-        fs::remove_all(e->path, rec);
-        if (rec) continue;
-        r.bytes_after -= e->bytes;
-        ++r.removed;
-    }
-    if (r.removed > 0) {
-        r.reported = true;
-        std::fprintf(stderr,
-                     "note: q4nx cache: removed %d entr%s, %.1f GiB -> %.1f GiB (bound %.1f GiB, %s); entries younger than "
-                     "%lld s and the one just written are kept (engine#1956)\n",
-                     r.removed, r.removed == 1 ? "y" : "ies", double(r.bytes_before) / (1 << 30),
-                     double(r.bytes_after) / (1 << 30), double(max_bytes) / (1 << 30), root.c_str(),
-                     (long long)min_age_seconds);
-    }
-    return r;
-}
-
-int64_t q4nx_cache_bound_bytes(const char* text, int64_t default_gib) {
-    const int64_t max_gib = INT64_MAX >> 30;      // the largest GiB count whose byte count still fits
-    long long gib = default_gib;
-    if (text && *text) {
-        char* end = nullptr;
-        errno = 0;
-        const long long v = std::strtoll(text, &end, 10);
-        if (end != text) gib = v;                 // a number (ERANGE saturates, which the clamp below handles)
-    }
-    if (gib <= 0) return 0;
-    if (gib > max_gib) gib = max_gib;
-    return int64_t(gib) << 30;
-}
-
-void q4nx_cache_touch(const std::string& entry) {
-    std::error_code ec;
-    if (fs::is_directory(entry, ec)) fs::last_write_time(entry, fs::file_time_type::clock::now(), ec);
-}
-
-
 int run_q4nx_cache(int argc, char** argv) {
     const auto usage = [] {
         std::fprintf(stderr,
@@ -113,7 +32,7 @@ int run_q4nx_cache(int argc, char** argv) {
                      "                              [--dry-run]\n"
                      "  Sweeps the container cache the way a serve does on start: least-recently-used first, never the\n"
                      "  entry named by --keep, never one written within --min-age seconds (a serve may be reading it).\n"
-                     "  --root defaults to ONEBIT_Q4NX_CACHE_DIR, then $XDG_CACHE_HOME/1bit/q4nx, then ~/.cache/1bit/q4nx.\n"
+                     "  --root defaults to ONEBIT_Q4NX_CACHE, then ~/.cache/1bit/q4nx: the directory serve and the forward write.\n"
                      "  --max-gib defaults to ONEBIT_Q4NX_CACHE_MAX_GIB(), then 60; 0 disables the sweep.\n"
                      "  --dry-run prints what it would remove and removes nothing.\n");
     };
@@ -136,14 +55,10 @@ int run_q4nx_cache(int argc, char** argv) {
         else { std::fprintf(stderr, "q4nx-cache: unknown argument %s\n", a.c_str()); usage(); return 2; }
     }
     if (root.empty()) {
-        const char* env = std::getenv("ONEBIT_Q4NX_CACHE_DIR");
-        if (env && *env) {
-            root = env;
-        } else {
-            const char* xdg = std::getenv("XDG_CACHE_HOME");
-            const char* home = std::getenv("HOME");
-            root = (xdg && *xdg) ? std::string(xdg) : std::string(home ? home : ".") + "/.cache";
-            root += "/1bit/q4nx";
+        root = q4nx_cache_default_root();
+        if (root.empty()) {
+            std::fprintf(stderr, "q4nx-cache: no home directory for the Q4NX cache: set HOME or ONEBIT_Q4NX_CACHE, or pass --root\n");
+            return 2;
         }
     }
     const int64_t max_bytes = (max_mib >= 0)   ? max_mib * (int64_t(1) << 20)
@@ -151,21 +66,32 @@ int run_q4nx_cache(int argc, char** argv) {
                                                : q4nx_cache_bound_bytes(std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB"));
     const int64_t before = q4nx_dir_bytes(root);
     if (max_bytes <= 0) {
-        std::printf("q4nx-cache: %s is %.1f GiB, the sweep is off (bound 0)\n", root.c_str(), double(before) / (1 << 30));
+        std::printf("q4nx-cache: %s is %s, the sweep is off (bound 0)\n", root.c_str(), q4nx_cache_size_text(before).c_str());
         return 0;
     }
+    const auto size = [](int64_t b, char* out, size_t n) { std::snprintf(out, n, "%s", q4nx_cache_size_text(b).c_str()); };
     if (dry) {
-        std::printf("q4nx-cache: %s is %.1f GiB against a %.1f GiB bound; --dry-run removes nothing\n", root.c_str(),
-                    double(before) / (1 << 30), double(max_bytes) / (1 << 30));
-        return before > max_bytes ? 1 : 0;
+        const std::vector<Q4nxCacheCandidate> would = q4nx_cache_candidates(root, keep, max_bytes, min_age);
+        int64_t would_free = 0;
+        for (const auto& c : would) would_free += c.bytes;
+        char b1[32], b2[32], b3[32];
+        size(before, b1, sizeof b1);
+        size(max_bytes, b2, sizeof b2);
+        size(would_free, b3, sizeof b3);
+        std::printf("q4nx-cache: %s is %s against a %s bound; --dry-run removes nothing\n", root.c_str(), b1, b2);
+        if (would.empty()) {
+            std::printf("q4nx-cache: nothing would be removed (bound met, or every entry is inside the %lld s age window)\n",
+                        (long long)min_age);
+            return before > max_bytes ? 1 : 0;
+        }
+        std::printf("q4nx-cache: would remove %zu entr%s, %s, oldest first:\n", would.size(),
+                    would.size() == 1 ? "y" : "ies", b3);
+        for (const auto& c : would) std::printf("  %8.1f MiB  %s\n", double(c.bytes) / (1 << 20), c.name.c_str());
+        return 1;   // over the bound: the dry run is telling you there IS work
     }
     const Q4nxCacheSweep s = q4nx_cache_evict(root, keep, max_bytes, min_age);
     // A 6 MiB bound printed as "0.0 GiB" reads like "the sweep is off", which is a different state -- so small sizes
     // are reported in MiB. This line is the whole output; it has to be unambiguous.
-    const auto size = [](int64_t b, char* out, size_t n) {
-        if (b >= (int64_t(1) << 30)) std::snprintf(out, n, "%.1f GiB", double(b) / (1 << 30));
-        else std::snprintf(out, n, "%.1f MiB", double(b) / (1 << 20));
-    };
     char before_s[32], after_s[32], bound_s[32];
     size(s.bytes_before, before_s, sizeof before_s);
     size(s.bytes_after, after_s, sizeof after_s);

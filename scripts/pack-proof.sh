@@ -44,7 +44,11 @@
 # it supports, named once here so a release cannot quietly prove itself on something else.
 set -uo pipefail
 
-[ $# -eq 2 ] || { sed -n '16,43p' "$0"; exit 2; }
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
+[ $# -eq 2 ] || { usage; exit 2; }
 dir=$(cd "$1" && pwd) || exit 2
 # shellcheck source=scripts/pack-version.sh
 . "$(dirname "$0")/pack-version.sh"

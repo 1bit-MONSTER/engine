@@ -50,6 +50,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -3704,6 +3705,37 @@ void test_import_fp32_params(const std::string& root) {
         const auto already = onebit::npu::q4nx::device_form(form.model, cache);
         check(!already.converted && already.dir == form.dir,
               "device form: a container already in the device form is returned unchanged");
+
+        // engine#2263: the conversion is a WRITER of the cache, so it sweeps it like serve start does. An older entry
+        // (2 GiB, sparse: no real disk) sits in the cache beyond the age window; a new conversion under a 1 GiB bound
+        // removes it, never the entry it just wrote, and with the bound at 0 (no sweep) leaves it alone.
+        {
+            const char* had = std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB");
+            const std::string saved = had ? had : "";
+            const fs::path older = fs::path(cache) / "older-q4nx1-0000000000000000";
+            fs::create_directories(older);
+            { std::ofstream(older / "model.q4nx", std::ios::binary); }
+            fs::resize_file(older / "model.q4nx", uintmax_t(2) << 30);
+            fs::last_write_time(older, fs::file_time_type::clock::now() - std::chrono::hours(2));
+
+            fs::remove_all(form.dir);
+            ::setenv("ONEBIT_Q4NX_CACHE_MAX_GIB", "0", 1);
+            const auto off = onebit::npu::q4nx::device_form(out + "/model.q4nx", cache);
+            check(off.converted && !off.reused && fs::exists(older / "model.q4nx"),
+                  "cache sweep control: with ONEBIT_Q4NX_CACHE_MAX_GIB=0 a new conversion removes nothing");
+
+            fs::remove_all(off.dir);
+            ::setenv("ONEBIT_Q4NX_CACHE_MAX_GIB", "1", 1);
+            const auto on = onebit::npu::q4nx::device_form(out + "/model.q4nx", cache);
+            check(on.converted && !on.reused && fs::exists(on.model),
+                  "cache sweep: the new conversion is written and kept");
+            check(!fs::exists(older),
+                  "cache sweep: a new conversion over a 1 GiB bound removes the older 2 GiB entry (engine#2263)");
+
+            if (had) ::setenv("ONEBIT_Q4NX_CACHE_MAX_GIB", saved.c_str(), 1);
+            else ::unsetenv("ONEBIT_Q4NX_CACHE_MAX_GIB");
+            fs::remove_all(older);
+        }
         std::printf("device form: %lld I8 tensor(s), %lld tile(s) repacked; %d q4_1f trigger(s) on "
                     "the imported container, 0 on the converted one, and the device tiles are the old "
                     "bf16 form's byte for byte\n",
@@ -5108,6 +5140,117 @@ void test_container_plan(const std::string& root) {
 // pack that classifies completely, the alternate spellings that must classify the same way, and the two residues (SSM
 // and MTP) which must be RECOGNISED rather than reported as unknown, since `unassigned` is only useful if it means
 // "nothing knows this".
+// engine#1788, slice 3c step 1: (role, layer type), the key the writer needs. Measured on gemma4-e2b (q_proj N=384 on all
+// 28 sliding layers, N=768 on all 7 full) and bolt-e4b ((640,5120) on 35 sliding, (1280,5120) on 7 full).
+void test_container_role_layer_types() {
+    const auto t = [](const std::string& n, std::vector<int64_t> shape, const char* dt = "I8") {
+        pi::Q4nxTensor x; x.name = n; x.dtype = dt; x.shape = std::move(shape); return x;
+    };
+    // 2 sliding layers + 1 full layer, q_proj with the sliding/full widths that the real packs show
+    const std::vector<std::string> lt = {"sliding_attention", "sliding_attention", "full_attention"};
+    const std::vector<pi::Q4nxTensor> v = {
+        t("model.layers.0.self_attn.q_proj.weight", {384, 8, 4736}),
+        t("model.layers.1.self_attn.q_proj.weight", {384, 8, 4736}),
+        t("model.layers.2.self_attn.q_proj.weight", {768, 8, 4736}),
+        t("model.embed_tokens.weight", {248144, 2048}, "BF16")};
+    const pi::RoleLayerReport r = pi::container_role_layer_types(v, lt);
+    check(r.spans.empty(), "role+layer: the two widths split by layer type, they do not span");
+    bool sliding = false, full = false;
+    for (const auto& row : r.rows)
+        if (row.stem == "model.layers.N.self_attn.q_proj.weight" && row.layer_type == "sliding_attention") {
+            sliding = row.count == 2 && row.shape == "[384,8,4736] I8";
+        } else if (row.stem == "model.layers.N.self_attn.q_proj.weight" && row.layer_type == "full_attention") {
+            full = row.count == 1 && row.shape == "[768,8,4736] I8";
+        }
+    check(sliding && full, "role+layer: one row per (role, layer type) with its shape and count");
+    check(!r.no_layer.empty(), "role+layer: a role outside any layer is reported, not dropped");
+
+    // a role carried in two shapes under ONE layer type is the case a third key would be needed for: reported, not resolved
+    const std::vector<pi::Q4nxTensor> two = {t("model.layers.0.self_attn.q_proj.weight", {384, 8, 4736}),
+                                             t("model.layers.1.self_attn.q_proj.weight", {512, 8, 4736})};
+    const pi::RoleLayerReport r2 = pi::container_role_layer_types(two, lt);
+    check(r2.spans.size() == 1 && r2.rows.empty(), "role+layer: two shapes in one layer type is a span, not a row");
+
+    // a pack whose layer count disagrees with its declared layer_types is counted, not silently clipped
+    const std::vector<pi::Q4nxTensor> oor = {t("model.layers.9.self_attn.q_proj.weight", {384, 8, 4736})};
+    check(pi::container_role_layer_types(oor, lt).out_of_range == 1,
+          "role+layer: a layer index past layer_types is counted as out of range");
+}
+
+void test_container_roles_moe_and_singular_layer() {
+    const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
+    const auto roles = [&](std::initializer_list<const char*> names) {
+        std::vector<pi::Q4nxTensor> v;
+        for (const char* n : names) v.push_back(t(n));
+        return pi::container_roles(v);
+    };
+
+    // 1a. engine#2277 review: an ATTENTION output gate is not the FFN gate, and this is the arm that says so --
+    // without the `self_attn_gate_proj` rule (main's behaviour) the first of these is filed as `gate_proj` and the
+    // suite stayed green, which is what the review found.
+    {
+        const auto r = roles({"model.layer.0.self_attn.gate_proj.weight", "model.layer.0.mlp.gate_proj.weight"});
+        check(r.role_of.at("model.layer.0.self_attn.gate_proj.weight") == "self_attn_gate_proj",
+              "35b: an attention output gate is not the FFN gate");
+        check(r.role_of.at("model.layer.0.mlp.gate_proj.weight") == "gate_proj", "35b: the FFN gate is still gate_proj");
+        check(r.counts.at("gate_proj") == 1, "35b: the attention gate does not also count as gate_proj");
+    }
+    // 1. the eight MoE families, spelled as the container spells them
+    {
+        const auto r = roles({"model.layer.0.moe_router.weight",
+                              "model.layer.0.shared_expert_gate.weight",
+                              "model.layer.0.mlp.gate_exps_proj.weight",
+                              "model.layer.0.mlp.up_exps_proj.weight",
+                              "model.layer.0.mlp.down_exps_proj.weight",
+                              "model.layer.0.mlp.share_gate_exps_proj.weight",
+                              "model.layer.0.mlp.share_up_exps_proj.weight",
+                              "model.layer.0.mlp.share_down_exps_proj.weight"});
+        check(r.unassigned.empty(), "35b: the MoE families are named, not unassigned");
+        check(r.role_of.at("model.layer.0.moe_router.weight") == "moe_router", "35b: moe_router");
+        check(r.role_of.at("model.layer.0.shared_expert_gate.weight") == "shared_expert_gate",
+              "35b: shared_expert_gate is its own role, not a projection");
+        check(r.role_of.at("model.layer.0.mlp.gate_exps_proj.weight") == "gate_exps", "35b: gate_exps_proj");
+        check(r.role_of.at("model.layer.0.mlp.share_gate_exps_proj.weight") == "share_gate_exps",
+              "35b: share_gate_exps_proj is the shared expert, not the routed gate");
+        check(r.counts.at("gate_exps") == 1 && r.counts.at("share_gate_exps") == 1,
+              "35b: the shared spelling does not also count as the routed one");
+    }
+
+    // 2. a per-layer norm under the singular block spelling stays a layer norm: it must NOT become final_norm
+    {
+        const auto r = roles({"model.norm.weight", "model.layer.0.linear_attn.ssm_norm.weight",
+                              "model.layer.0.input_layernorm.weight"});
+        check(r.role_of.at("model.norm.weight") == "final_norm", "35b: the top-level norm is final_norm");
+        check(r.counts.at("final_norm") == 1, "35b: exactly one final_norm, even with `model.layer.N.` blocks");
+        check(r.role_of.at("model.layer.0.linear_attn.ssm_norm.weight") == "ssm",
+              "35b: a per-layer ssm_norm is ssm, which is what kSsm says it is");
+    }
+}
+
+void test_container_roles_gemma_local() {
+    const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "BF16"; return x; };
+    const auto roles = [&](std::initializer_list<const char*> names) {
+        std::vector<pi::Q4nxTensor> v;
+        for (const char* n : names) v.push_back(t(n));
+        return pi::container_roles(v);
+    };
+    {
+        const auto r = roles({"model.layers.0.pre_feedforward_layernorm.weight",
+                              "model.layers.0.inp_gate.weight", "model.layers.0.inp_gate.weight_prefill",
+                              "model.layers.0.per_layer_projection.weight", "model.layers.0.layer_output_scale.weight"});
+        check(r.unassigned.empty(), "gemma local: the families this forward does not read are recognised");
+        check(r.counts.at("gemma_local") == 5, "gemma local: all five land on one role");
+    }
+    {
+        // the forward's own norms must still win: this is the shadowing the ordering could cause
+        const auto r = roles({"model.layers.0.post_attention_layernorm.weight",
+                              "model.layers.0.input_layernorm.weight"});
+        check(r.role_of.at("model.layers.0.post_attention_layernorm.weight") == "post_norm" &&
+                  r.role_of.at("model.layers.0.input_layernorm.weight") == "input_norm",
+              "gemma local: a norm the forward reads is not swallowed by the recogniser");
+    }
+}
+
 void test_container_roles() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6149,6 +6292,9 @@ int main(int argc, char** argv) {
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
         test_container_roles();
+        test_container_roles_gemma_local();
+        test_container_roles_moe_and_singular_layer();
+        test_container_role_layer_types();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);

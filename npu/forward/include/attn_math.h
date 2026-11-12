@@ -113,8 +113,8 @@ inline void saxpy(float p, const float* x, float* y, int n) {
 // `score` is T floats of scratch; `out` (HD floats) must be zero on entry. This is the body attention() ran
 // inline before it was shared -- the same statements in the same order, so the result is the same bits.
 inline void head_context(const float* qh, const float* kc, const float* vc, int NKV, int kh, int HD,
-                         int t0, int T, float scale, float* score, float* out) {
-    float mx = -1e30f;
+                         int t0, int T, float scale, float* score, float* out, const float* sink = nullptr) {
+    float mx = sink ? *sink : -1e30f;   // GPT-OSS: a per-head logit that joins the softmax and carries no value
     for (int t = 0; t < T; t++) {
         if (t < t0) { score[t] = -1e30f; continue; }
         const float* kt = kc + ((size_t)t * NKV + kh) * HD;
@@ -127,6 +127,7 @@ inline void head_context(const float* qh, const float* kc, const float* vc, int 
         score[t] = std::exp(score[t] - mx);
         sum += score[t];
     }
+    if (sink) sum += std::exp(*sink - mx);
     const float inv = sum > 0 ? 1.0f / sum : 0.0f;
     for (int t = t0; t < T; t++) saxpy(score[t] * inv, vc + ((size_t)t * NKV + kh) * HD, out, HD);
 }

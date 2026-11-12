@@ -5177,6 +5177,80 @@ void test_container_role_layer_types() {
           "role+layer: a layer index past layer_types is counted as out of range");
 }
 
+void test_container_roles_moe_and_singular_layer() {
+    const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
+    const auto roles = [&](std::initializer_list<const char*> names) {
+        std::vector<pi::Q4nxTensor> v;
+        for (const char* n : names) v.push_back(t(n));
+        return pi::container_roles(v);
+    };
+
+    // 1a. engine#2277 review: an ATTENTION output gate is not the FFN gate, and this is the arm that says so --
+    // without the `self_attn_gate_proj` rule (main's behaviour) the first of these is filed as `gate_proj` and the
+    // suite stayed green, which is what the review found.
+    {
+        const auto r = roles({"model.layer.0.self_attn.gate_proj.weight", "model.layer.0.mlp.gate_proj.weight"});
+        check(r.role_of.at("model.layer.0.self_attn.gate_proj.weight") == "self_attn_gate_proj",
+              "35b: an attention output gate is not the FFN gate");
+        check(r.role_of.at("model.layer.0.mlp.gate_proj.weight") == "gate_proj", "35b: the FFN gate is still gate_proj");
+        check(r.counts.at("gate_proj") == 1, "35b: the attention gate does not also count as gate_proj");
+    }
+    // 1. the eight MoE families, spelled as the container spells them
+    {
+        const auto r = roles({"model.layer.0.moe_router.weight",
+                              "model.layer.0.shared_expert_gate.weight",
+                              "model.layer.0.mlp.gate_exps_proj.weight",
+                              "model.layer.0.mlp.up_exps_proj.weight",
+                              "model.layer.0.mlp.down_exps_proj.weight",
+                              "model.layer.0.mlp.share_gate_exps_proj.weight",
+                              "model.layer.0.mlp.share_up_exps_proj.weight",
+                              "model.layer.0.mlp.share_down_exps_proj.weight"});
+        check(r.unassigned.empty(), "35b: the MoE families are named, not unassigned");
+        check(r.role_of.at("model.layer.0.moe_router.weight") == "moe_router", "35b: moe_router");
+        check(r.role_of.at("model.layer.0.shared_expert_gate.weight") == "shared_expert_gate",
+              "35b: shared_expert_gate is its own role, not a projection");
+        check(r.role_of.at("model.layer.0.mlp.gate_exps_proj.weight") == "gate_exps", "35b: gate_exps_proj");
+        check(r.role_of.at("model.layer.0.mlp.share_gate_exps_proj.weight") == "share_gate_exps",
+              "35b: share_gate_exps_proj is the shared expert, not the routed gate");
+        check(r.counts.at("gate_exps") == 1 && r.counts.at("share_gate_exps") == 1,
+              "35b: the shared spelling does not also count as the routed one");
+    }
+
+    // 2. a per-layer norm under the singular block spelling stays a layer norm: it must NOT become final_norm
+    {
+        const auto r = roles({"model.norm.weight", "model.layer.0.linear_attn.ssm_norm.weight",
+                              "model.layer.0.input_layernorm.weight"});
+        check(r.role_of.at("model.norm.weight") == "final_norm", "35b: the top-level norm is final_norm");
+        check(r.counts.at("final_norm") == 1, "35b: exactly one final_norm, even with `model.layer.N.` blocks");
+        check(r.role_of.at("model.layer.0.linear_attn.ssm_norm.weight") == "ssm",
+              "35b: a per-layer ssm_norm is ssm, which is what kSsm says it is");
+    }
+}
+
+void test_container_roles_gemma_local() {
+    const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "BF16"; return x; };
+    const auto roles = [&](std::initializer_list<const char*> names) {
+        std::vector<pi::Q4nxTensor> v;
+        for (const char* n : names) v.push_back(t(n));
+        return pi::container_roles(v);
+    };
+    {
+        const auto r = roles({"model.layers.0.pre_feedforward_layernorm.weight",
+                              "model.layers.0.inp_gate.weight", "model.layers.0.inp_gate.weight_prefill",
+                              "model.layers.0.per_layer_projection.weight", "model.layers.0.layer_output_scale.weight"});
+        check(r.unassigned.empty(), "gemma local: the families this forward does not read are recognised");
+        check(r.counts.at("gemma_local") == 5, "gemma local: all five land on one role");
+    }
+    {
+        // the forward's own norms must still win: this is the shadowing the ordering could cause
+        const auto r = roles({"model.layers.0.post_attention_layernorm.weight",
+                              "model.layers.0.input_layernorm.weight"});
+        check(r.role_of.at("model.layers.0.post_attention_layernorm.weight") == "post_norm" &&
+                  r.role_of.at("model.layers.0.input_layernorm.weight") == "input_norm",
+              "gemma local: a norm the forward reads is not swallowed by the recogniser");
+    }
+}
+
 void test_container_roles() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6218,6 +6292,8 @@ int main(int argc, char** argv) {
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
         test_container_roles();
+        test_container_roles_gemma_local();
+        test_container_roles_moe_and_singular_layer();
         test_container_role_layer_types();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);

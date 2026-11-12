@@ -31,7 +31,10 @@
 //   [7] over 24-token replies (many rounds each, k = 1 and 4), every transition prev -> next follows the chain's row for prev,
 //       which a round that carries a stale refusal into a later round breaks;
 //   [8] forward-serve's own sampler (app/npu_spec_sampler.h, sample_token() and sample_probs() underneath) with
-//       temperature, top_k and top_p: both round shapes against the exact product of sample_probs() rows.
+//       temperature, top_k and top_p: both round shapes against the exact product of sample_probs() rows;
+//   [9] a base whose rows are wider than its vocabulary (row_stride(), padding ids with the LARGEST logits, as a
+//       misaligned read would find them): greedy replies equal plain, and on_token_row hands every token the base's
+//       own full row for its position, greedy and sampled, both round shapes.
 #include "mtp/draft.h"
 #include "npu_spec_sampler.h"
 
@@ -83,14 +86,16 @@ int second_best(int t) {
 
 class ChainBase : public BaseModel {
 public:
+    explicit ChainBase(int pad = 0) : pad_(pad) {}
     std::vector<int> held;   // tokens consumed, by position
     int vocab() const override { return V; }
+    int row_stride() const override { return V + pad_; }
     int hidden_size() const override { return 1; }
     int max_batch_rows() const override { return 8; }
     bool step(int token, int pos, std::vector<float>& logits) override {
         if (pos != (int)held.size()) return false;
         held.push_back(token);
-        logits.resize(V);
+        logits.assign((size_t)(V + pad_), kPad);
         for (int v = 0; v < V; v++) logits[(size_t)v] = logit(token, v);
         return true;
     }
@@ -101,6 +106,7 @@ public:
         for (int t : tokens) {
             held.push_back(t);
             for (int v = 0; v < V; v++) all.push_back(logit(t, v));
+            for (int v = 0; v < pad_; v++) all.push_back(kPad);
         }
         return true;
     }
@@ -110,7 +116,10 @@ public:
     }
     const std::vector<float>& last_hidden() const override { return h_; }
 
+    static constexpr float kPad = 50.0f;
+
 private:
+    int pad_;
     int start_ = 0;
     std::vector<float> h_{0.0f};
 };
@@ -259,6 +268,31 @@ double serve_sampler_tv(int mode, const onebit::npu::SampleParams& sp) {
     return tv / 2;
 }
 
+// [9]: run 24 tokens on a padded base; count tokens whose handed row is not the base's row after the previous token
+// (first V logits of that row, then `pad` padding values). Returns the tokens via `out`.
+int row_mismatches(int mode, bool sampled, uint64_t seed, int pad, std::vector<int>& out) {
+    ChainBase base(pad);
+    SoftmaxSampler smp(seed);
+    SecondHead head(mode == 1);
+    Options o;
+    o.k = mode == 0 ? 0 : 4;
+    o.max_tokens = 24;
+    o.tau = 0.0f;
+    o.sampler = sampled ? &smp : nullptr;
+    int bad = 0, prev = kPrompt;
+    o.on_token_row = [&](int t, const float* row) {
+        for (int v = 0; v < V; v++) if (row[v] != logit(prev, v)) { bad++; break; }
+        for (int v = 0; v < pad; v++) if (row[V + v] != ChainBase::kPad) { bad++; break; }
+        prev = t;
+        return true;
+    };
+    std::vector<float> logits;
+    base.step(kPrompt, 0, logits);
+    Result r = onebit::npu::mtp::run_from(base, mode == 0 ? nullptr : &head, 1, logits, o);
+    out = r.tokens;
+    return r.ok && (int)r.tokens.size() == 24 ? bad : 1000;
+}
+
 // [7]: worst row's TV between the observed next-token frequencies after `prev` and softmax_row(prev), over every
 // consecutive pair (the prompt included) of `runs` replies of `len` tokens.
 double transition_tv(int mode, int k, int runs, int len) {
@@ -360,6 +394,22 @@ int main() {
             std::snprintf(what, sizeof what, "[8] %s: forward-serve's sampler within TV %.2f of the exact product",
                           names[mode], kBound);
             check(tv < kBound, what);
+        }
+    }
+
+    {   // [9]
+        std::vector<int> plain, got;
+        row_mismatches(0, false, 1, 0, plain);
+        for (int mode = 1; mode < 3; mode++) {
+            const int bad_g = row_mismatches(mode, false, 1, 3, got);
+            char what[160];
+            std::snprintf(what, sizeof what, "[9] %s, rows 3 wider than the vocabulary: greedy reply equals plain", names[mode]);
+            check(got == plain && got.size() == 24, what);
+            int bad_s = 0;
+            for (uint64_t sd = 1; sd <= 50; sd++) bad_s += row_mismatches(mode, true, sd, 3, got);
+            std::snprintf(what, sizeof what, "[9] %s: every token is handed its own full row (greedy %d, sampled %d off)",
+                          names[mode], bad_g, bad_s);
+            check(bad_g == 0 && bad_s == 0, what);
         }
     }
 

@@ -3467,7 +3467,7 @@ round). `tools/dflash2_probe loop` with `DFLASH2_MTP_RUN=1` drives the served 27
 `DFlashHead` and the DFlash 2 selector as its pick hook, after the same batched prefill as its hand-written loop.
 
 **Serving it: `forward-serve --spec-lookup K`** (off by default; `--spec-fallback X` adds the fallback). A request that
-is greedy, has no grammar, and asks for no logprobs (and a server without `--dump-logits`) decodes through
+is greedy and has no grammar (on a server without `--dump-logits`) decodes through
 `mtp::run_from()` with the prompt-lookup drafter (`npu/mtp/prompt_lookup.h`). That drafter needs no model: it proposes
 the up to `K` tokens that followed the latest earlier occurrence of the stream's last one to three tokens. Every
 other request takes the plain loop. The rule is that speculation is used only where it cannot change a token: each
@@ -3485,11 +3485,19 @@ In host-GEMM mode the verify batch is 16 rows, the device's width. Host GEMMs ha
 the forward reports there would leave no row for a draft. The device route has not been measured with it yet.
 
 The verify pass returns its rows at the head's width, which is wider than the tokenizer whenever the head carries
-padding ids (Qwen3: 151,936 against 151,669). The loop reads them at the tokenizer's bound, so the serve's base cuts
-each row to that bound before the loop sees it. The test's container has a 512-row head against its 256-id tokenizer
-for this reason: with uncut rows the speculative replies leave plain greedy within 24 tokens.
+padding ids (Qwen3: 151,936 against 151,669). The loop chooses among the tokenizer's ids but steps through the batch
+by `BaseModel::row_stride()`, the head's width; stepping by the tokenizer's bound reads every row after the first
+misaligned. The test's container has a 512-row head against its 256-id tokenizer for this reason. With the wrong
+stride its speculative replies leave plain greedy within 24 tokens.
 
-**`--spec-sample`** (with either drafter) takes sampled requests (temperature above 0, no grammar, no logprobs) onto
+A request with logprobs takes the speculative path as well. `Options::on_token_row` hands every emitted token the
+row it was chosen from or checked against: the base's own logits at that position, at the head's full width. The
+serve reports the token's log-probability and its `top_logprobs` from that row, as the plain loop does from its step's
+row. The test sends chat requests with `top_logprobs` 3 to every server, one of them a prompt whose drafts the lookup
+keeps. Each speculative server reports the plain server's tokens, log-probabilities and alternatives exactly
+(difference 0 on the host forward).
+
+**`--spec-sample`** (with either drafter) takes sampled requests (temperature above 0, no grammar) onto
 the same path. `Options::sampler` (`mtp::RowSampler`, `npu/mtp/draft.h`) turns the loop's choices into draws.
 `npu::SpecSampler` (`app/npu_spec_sampler.h`) is forward-serve's sampler:
 - `pick()` is the plain loop's `sample_token()`;

@@ -59,7 +59,10 @@ def bytes_to_unicode():
 def write_tokenizer(d):
     m = bytes_to_unicode()
     vocab = {m[b]: b for b in range(256)}
-    tok = {"version": "1.0", "added_tokens": [],
+    # The two ChatML specials, so the chat route (the one that serves logprobs) takes requests on this container.
+    added = [{"id": 256 + i, "content": t, "single_word": False, "lstrip": False, "rstrip": False, "normalized": False,
+              "special": True} for i, t in enumerate(("<|im_start|>", "<|im_end|>"))]
+    tok = {"version": "1.0", "added_tokens": added,
            "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": True},
            "decoder": {"type": "ByteLevel"},
            "model": {"type": "BPE", "vocab": vocab, "merges": []}}
@@ -177,6 +180,33 @@ def post(port, body):
         return json.load(r)
 
 
+def post_chat(port, body):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return json.load(r)
+
+
+def lp_of(j):
+    """A chat reply's text, finish and logprobs as (token, logprob, [(token, logprob)...]) per entry."""
+    c = j["choices"][0]
+    ents = (c.get("logprobs") or {}).get("content") or []
+    return (c["message"]["content"], c["finish_reason"],
+            [(e["token"], e["logprob"], [(t["token"], t["logprob"]) for t in e["top_logprobs"]]) for e in ents])
+
+
+def lp_close(a, b, tol=1e-5):
+    """Same text, finish and tokens; every logprob within tol (the verify rows and the plain steps are one forward)."""
+    if a[0] != b[0] or a[1] != b[1] or len(a[2]) != len(b[2]):
+        return False, float("inf")
+    worst = 0.0
+    for (ta, la, xa), (tb, lb, xb) in zip(a[2], b[2]):
+        if ta != tb or [t for t, _ in xa] != [t for t, _ in xb]:
+            return False, float("inf")
+        worst = max([worst, abs(la - lb)] + [abs(p - q) for (_, p), (_, q) in zip(xa, xb)])
+    return worst <= tol, worst
+
+
 def start(binary, model, port, extra, log):
     env = dict(os.environ, NPU_INFER_HOST_GEMM="1", OMP_WAIT_POLICY="PASSIVE")
     p = subprocess.Popen([binary, "forward-serve", "-m", os.path.join(model, "model.q4nx"), "--kernels",
@@ -224,6 +254,12 @@ def main():
         # --spec-sample's own requests: sampled, seeded, one on a repeating prompt so the lookup has drafts to offer.
         # Each is sent twice; the distribution itself is held by tests/mtp_sampled_test.cpp, this holds the wiring.
         sample_cases = [sampled[0], {"prompt": prompts[0], "max_tokens": 24, "temperature": 0.8, "seed": 11}]
+        # Chat requests with logprobs (top 3): greedy, so every speculative server must report what plain reports.
+        chats = [{"messages": [{"role": "user", "content": q}], "max_tokens": 24, "temperature": 0, "logprobs": True,
+                  "top_logprobs": 3} for q in ("abcabcabcabc", "\x07" * 6)]
+        # (the second keeps drafts under the lookup: 7 of 13 when written, so accepted rows report logprobs too)
+        chat_sampled = {"messages": [{"role": "user", "content": "abcabcabcabc"}], "max_tokens": 24,
+                        "temperature": 0.8, "seed": 5, "logprobs": True, "top_logprobs": 3}
         replies, logs, cases, sampled_replies = {}, {}, [], []
         draft = os.path.join(tmp, "draft")
         write_draft(draft)
@@ -250,6 +286,9 @@ def main():
                                 stops.append({"prompt": b["prompt"], "max_tokens": 24, "temperature": 0,
                                               "stop": [t[at:at + 2]]})
                         cases = base + stops + sampled
+                    replies[name + "_chat"] = [lp_of(post_chat(port, b)) for b in chats]
+                    if name == "sample":
+                        replies["sample_chat_sampled"] = lp_of(post_chat(port, chat_sampled))
                     replies[name] = []
                     for b in cases:
                         j = post(port, b)
@@ -287,11 +326,30 @@ def main():
                         + (f" temperature {b['temperature']}" if b["temperature"] else ""))
                 print(f"{'PASS' if ok else 'FAIL'}  {arm}: {what}: {c[2]} tokens, finish {c[1]}"
                       + ("" if ok else f" (plain {a!r}, {arm} {c!r})"))
+        for arm in ("spec", "dflash", "sample"):
+            for i, (a, c) in enumerate(zip(replies["plain_chat"], replies[arm + "_chat"])):
+                ok, worst = lp_close(a, c)
+                ok = ok and len(a[2]) >= 2
+                fails += not ok
+                print(f"{'PASS' if ok else 'FAIL'}  {arm}: chat {i} with top_logprobs 3: {len(c[2])} entries equal plain's "
+                      f"(worst logprob difference {worst:.2e})" + ("" if ok else f" (plain {a!r}, {arm} {c!r})"))
+        # The chat requests are each server's first: their [spec] lines lead the log. Accepted drafts must be among them,
+        # or the rows that report a kept draft's logprobs were never exercised.
+        chat_lines = [l for l in logs["spec"].splitlines() if l.startswith("[spec] lookup ")][:len(chats)]
+        kept = sum(int(l.split(" drafts accepted")[0].split(", ")[-1].split(" of ")[0]) for l in chat_lines)
+        ok = kept > 0
+        fails += not ok
+        print(f"{'PASS' if ok else 'FAIL'}  spec: the chat requests with logprobs kept {kept} drafts")
+        sc = replies["sample_chat_sampled"]
+        ok = len(sc[2]) >= 2 and all(l <= 0 and len(x) == 3 and x[0][1] >= l for _, l, x in sc[2])
+        fails += not ok
+        print(f"{'PASS' if ok else 'FAIL'}  sample: a sampled chat request with logprobs reports {len(sc[2])} entries, each "
+              "a log-probability at most its row's best")
         n_stop = sum(1 for b, c in zip(cases, replies["spec"]) if "stop" in b and c[1] == "stop")
         ok = n_stop >= 2
         fails += not ok
         print(f"{'PASS' if ok else 'FAIL'}  {n_stop} stop-sequence requests ended on their stop sequence")
-        greedy = sum(1 for b in cases if not b["temperature"])
+        greedy = sum(1 for b in cases if not b["temperature"]) + len(chats)
         for arm, kind in (("spec", "lookup"), ("dflash", "dflash")):
             spec_lines = [l for l in logs[arm].splitlines() if l.startswith(f"[spec] {kind} ")]
             drafted = sum(int(l.split(" of ")[1].split()[0]) for l in spec_lines)
@@ -321,7 +379,7 @@ def main():
         accepted = sum(int(l.split(" drafts accepted")[0].split(", ")[-1].split(" of ")[0]) for l in lines)
         same = sampled_replies[:n] == sampled_replies[n:]
         full = all(r[2] == b["max_tokens"] or r[1] == "stop" for r, b in zip(sampled_replies, sample_cases + sample_cases))
-        want = 2 * n + sum(1 for b in cases if b["temperature"]) + len(replies["cold"])   # its sampled requests plus the shared sampled case
+        want = 2 * n + sum(1 for b in cases if b["temperature"]) + len(replies["cold"]) + 1   # + the sampled chat   # its sampled requests plus the shared sampled case
         ok = len(lines) == want and drafted > 0 and same and full
         fails += not ok
         print(f"{'PASS' if ok else 'FAIL'}  sample: {len(lines)} of {want} sampled requests took the speculative path "

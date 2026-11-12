@@ -112,6 +112,10 @@ public:
     // Rows one batched launch can hold (Q4nxNpuForward::max_batch_rows()); 0 = no batching available,
     // which turns the loop into plain decode.
     virtual int max_batch_rows() const = 0;
+    // Floats per logits row, when a row is wider than vocab(): a head with padding ids past the tokenizer (Qwen3:
+    // 151,936 rows against 151,669 ids) returns rows of its own width, while the loop chooses only among the first
+    // vocab() of each. Indexing the batch at vocab() instead reads every row after the first misaligned.
+    virtual int row_stride() const { return vocab(); }
 
     // One token at absolute position pos; fills logits (vocab()).
     virtual bool step(int token, int pos, std::vector<float>& logits) = 0;
@@ -195,6 +199,10 @@ struct Options {
     // Null: greedy. Otherwise the sampler every choice and every draft check goes through (RowSampler above). The
     // loop does not own it; it must outlive the run.
     RowSampler* sampler = nullptr;
+    // When set, called for every emitted token in place of run_from()'s on_token, with the logits row (row_stride()
+    // floats, the base's own row) the token was chosen from or checked against: what a caller that reports
+    // log-probabilities reads. The pointer is valid only during the call.
+    std::function<bool(int, const float*)> on_token_row;
 };
 
 struct Stats {
@@ -275,6 +283,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
     Result r;
     const int V = base.vocab();
     if (V <= 0) { r.err = "no vocabulary"; return r; }
+    const int W = std::max(V, base.row_stride());   // floats per row of the verify batch
     if (pos <= 0 || (int)logits.size() < V) { r.err = "no prefilled prompt"; return r; }
     const int k = head ? std::min(std::max(0, opt.k), base.max_batch_rows()) : 0;
     onebit::npu::SpecFallback fallback(opt.fallback_below, opt.fallback_window);
@@ -291,7 +300,11 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
     Clock::time_point tp = Clock::now();
 
     std::vector<float> all;
-    auto emit = [&](int t) { r.tokens.push_back(t); return !on_token || on_token(t); };
+    auto emit = [&](int t, const float* row) {
+        r.tokens.push_back(t);
+        if (opt.on_token_row) return opt.on_token_row(t, row);
+        return !on_token || on_token(t);
+    };
     RowSampler* const smp = opt.sampler;
     // A draft at row i is kept when it is the argmax there (greedy) or when the sampler's check keeps it; a refusal
     // under a sampler leaves its residual draw in `pending`, which is the next position's token (it is a draw from
@@ -309,7 +322,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
         const int t1 = pending >= 0 ? pending : smp ? smp->pick(logits.data(), V) : argmax(logits.data(), V);
         pending = -1;
         if (t1 < 0) { r.err = "no logits"; return r; }
-        const bool keep_going = emit(t1);
+        const bool keep_going = emit(t1, logits.data());
         if (!keep_going) break;
         if (!opt.consume_last && (int)r.tokens.size() >= opt.max_tokens) break;
 
@@ -362,12 +375,13 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
             r.stats.drafted += nd;
             for (int i = 0; i < nd && i < Stats::kMaxDepth; i++) r.stats.drafted_at[i]++;
             int a = 0;
-            while (a < nd && keeps(&all[(size_t)a * (size_t)V], d[(size_t)a])) a++;
+            if (all.size() < (size_t)(nd + 1) * (size_t)W) { r.err = "verify batch: short logits"; return r; }
+            while (a < nd && keeps(&all[(size_t)a * (size_t)W], d[(size_t)a])) a++;
             // nd <= left, so every accepted draft fits the budget; only the consumer can stop the prefix early.
             int take = 0;
             bool stopped = false;
             for (int i = 0; i < a; i++) {
-                const bool keep = emit(d[(size_t)i]);
+                const bool keep = emit(d[(size_t)i], &all[(size_t)i * (size_t)W]);
                 take = i + 1;
                 if (!keep) { stopped = true; break; }
             }
@@ -392,7 +406,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
             kept.insert(kept.end(), d.begin(), d.begin() + take);
             head->commit_rows(kept, rows, take + 1);
             r.stats.ms_commit += lap(tp);
-            logits.assign(all.begin() + (size_t)take * (size_t)V, all.begin() + (size_t)(take + 1) * (size_t)V);
+            logits.assign(all.begin() + (size_t)take * (size_t)W, all.begin() + (size_t)(take + 1) * (size_t)W);
             pos += take + 1;
             if (fallback.record(take + 1) && r.stats.fell_back_at < 0) r.stats.fell_back_at = r.stats.iterations;
             if (stopped || (int)r.tokens.size() >= opt.max_tokens) break;
@@ -430,6 +444,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
         }
 
         if (!base.step_batch_all(d, have, all)) { r.err = "verify batch failed"; return r; }
+        if (all.size() < (size_t)nd * (size_t)W) { r.err = "verify batch: short logits"; return r; }
         r.stats.ms_batch += lap(tp);
         r.stats.iterations++;
         r.stats.batches++;
@@ -441,7 +456,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
         // checked against the logits of the last step, draft i>0 against row i-1 of the batch.
         int a = 0;
         for (int i = 0; i < nd; i++) {
-            const float* lg = (i == 0) ? logits.data() : &all[(size_t)(i - 1) * (size_t)V];
+            const float* lg = (i == 0) ? logits.data() : &all[(size_t)(i - 1) * (size_t)W];
             if (!keeps(lg, d[(size_t)i])) break;
             a++;
         }
@@ -455,7 +470,7 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
             // EOS or on a client that went away): breaking only this prefix loop walked back out to the top of the
             // while, which then handed the consumer the base's own token again -- one delivery past its stop.
             // The refused token stays emitted and committed, exactly as a refusal on t1 at the top of the loop does.
-            const bool keep = emit(d[(size_t)i]);
+            const bool keep = emit(d[(size_t)i], i == 0 ? logits.data() : &all[(size_t)(i - 1) * (size_t)W]);
             take = i + 1;
             if (!keep) { stopped = true; break; }
         }
@@ -492,8 +507,8 @@ inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<fl
         }
         r.stats.ms_commit += lap(tp);
         if (take > 0)
-            logits.assign(all.begin() + (size_t)(take - 1) * (size_t)V,
-                          all.begin() + (size_t)take * (size_t)V);
+            logits.assign(all.begin() + (size_t)(take - 1) * (size_t)W,
+                          all.begin() + (size_t)take * (size_t)W);
         pos = have + take;
         if (fallback.record(take + 1) && r.stats.fell_back_at < 0) r.stats.fell_back_at = r.stats.iterations;
         if (stopped || (int)r.tokens.size() >= opt.max_tokens) break;

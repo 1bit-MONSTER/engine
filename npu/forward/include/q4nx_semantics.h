@@ -190,6 +190,10 @@ typedef struct {
      * both.  Sources: global_head_dim, num_global_key_value_heads. */
     int global_head_dim;
     int num_global_kv_heads;
+    /* Gemma4 attention_k_eq_v (Gemma4-12B-IT): a layer with no v_proj takes its values from the k projection, before
+     * k_norm (our llama.cpp fork's gemma4.cpp: `Vcur = wv ? wv x : Kcur`, then v's scale-free RMSNorm).  Source:
+     * attention_k_eq_v. */
+    int attention_k_eq_v;
     /* Gemma4 sets attention scaling to 1.0 (q/k carry a per-head RMSNorm),
      * normalises v with a SCALE-FREE RMSNorm, and uses "proportional" RoPE on
      * its full layers.  Sources: model_type/architectures, rope_type. */

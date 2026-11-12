@@ -419,9 +419,62 @@ static void q4h_chunks(void) {
     free(out);
 }
 
+/* engine#1786: Gemma4-12B-IT-NPU2's 16 x 256 wide chunks (q4nx_dequant.h). Settled against google's QAT Q4_0 GGUF
+ * of the model (corr 0.9986) and the pack's own bf16 embedding (the Q8W head, 1.00000); this pins the reading. */
+static void wide_chunks(void) {
+    const int rows = 32, k = 512, cols = 768, ntc = k / Q4NX_WIDE_COLS;
+    const size_t n = (size_t)(rows / Q4NX_WIDE_ROWS) * (size_t)ntc;
+    for (int bits = 4; bits <= 8; bits += 4) {
+        const int cb = bits == 4 ? Q4NX_CHUNK_Q4W : Q4NX_CHUNK_Q8W, ncode = cb - 256;
+        uint8_t* t = (uint8_t*)calloc(n, (size_t)cb);
+        float* out = (float*)malloc(sizeof(float) * (size_t)rows * cols);
+        if (!t || !out) { check(0, "wide: the buffers allocate"); free(t); free(out); return; }
+        for (size_t ci = 0; ci < n; ci++) {
+            uint8_t* c = t + ci * (size_t)cb;
+            for (int i = 0; i < 128; i++)
+                put_bf16(c, (size_t)i, (i % 3 ? 0.125f : -0.25f) * (float)(1 + (int)((i + ci) % 5)));   /* signed scale */
+            for (int b = 0; b < ncode; b++) c[256 + b] = (uint8_t)((b * 13 + 5 * ci) & 0xff);
+        }
+        for (size_t i = 0; i < (size_t)rows * cols; i++) out[i] = 99.0f;
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb, cb, rows, k, cols, out) == 0,
+              bits == 4 ? "q4w: a 2 x 2 grid reads" : "q8w: a 2 x 2 grid reads");
+        int bad = 0, pad_bad = 0;
+        for (int r = 0; r < rows; r++)
+            for (int col = 0; col < cols; col++) {
+                const float got = out[(size_t)r * cols + col];
+                if (col >= k) { if (got != 0.0f) pad_bad++; continue; }
+                const int tr = r / 16, tc = col / 256, rr = r % 16, cc = col % 256;
+                const size_t ci = (size_t)tr * ntc + tc;
+                const int i = (cc / 32) * 16 + rr;
+                const float sc = (i % 3 ? 0.125f : -0.25f) * (float)(1 + (int)((i + ci) % 5));
+                int code;
+                if (bits == 4) {
+                    const uint8_t byte = (uint8_t)(((cc * 8 + rr / 2) * 13 + 5 * ci) & 0xff);
+                    const int v = (rr % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+                    code = v >= 8 ? v - 16 : v;
+                } else {
+                    code = (int8_t)(uint8_t)(((cc * 16 + rr) * 13 + 5 * ci) & 0xff);
+                }
+                if (got != (float)code * sc) bad++;
+            }
+        check(bad == 0, bits == 4 ? "q4w: code (two's complement, c*8 + r/2, even row low) * scale (g*16 + r), row-major grid"
+                                  : "q8w: int8 code (c*16 + r) * scale (g*16 + r), row-major grid");
+        check(pad_bad == 0, "wide: the columns past the container's K are written 0");
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb - 1, cb, rows, k, cols, out) == -1, "wide: one byte short is refused");
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb, cb, 24, k, cols, out) == -1, "wide: rows off the 16-row grid are refused");
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb, 4608, rows, k, cols, out) == -1, "wide: another chunk size is not a wide kind");
+        free(t);
+        free(out);
+    }
+    /* why the declared shape decides: a Q4W tensor is exactly as many bytes as a Q4S (4608) grid of the same size */
+    check((size_t)(4096 / 16) * (3840 / 256) * Q4NX_CHUNK_Q4W == (size_t)(4096 / 32) * (3840 / 256) * 4608,
+          "a 4096 x 3840 Q4W tensor has a 4608-byte Q4S grid's byte count, so only the declared shape tells them apart");
+}
+
 int main(void) {
     q4s_chunk();
     q4h_chunks();
+    wide_chunks();
     tile_kinds();
     tile_kind_is_per_tensor();
     tile_row_kind_arms();

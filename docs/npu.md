@@ -2052,6 +2052,28 @@ RoPE. `Qwen2.5-VL-3B-Instruct-NPU2`'s text tower now answers `Paris<|im_end|>` o
 loaded here. `batch_check_state_qwen2vl` is the Qwen2 above declaring that block: the same logits as the plain-RoPE
 reference (corr 1.0000000). With `"mrope"` refused again (main's behaviour) the arm fails.
 
+**Gemma4-12B-IT-NPU2: a dense Gemma4 and two new chunk kinds (engine#1786).** The text tower loads and answers on the
+host after three changes:
+
+- **The wide chunks.** Every I8 tensor is declared `[rows/16, K/256, bytes]`, with `bytes` either 2304 (`Q4NX_CHUNK_Q4W`)
+  or 4352 (`Q4NX_CHUNK_Q8W`, the tied head). A chunk is 16 rows x 256 columns. It starts with 128 bf16 scales at
+  `g*16 + r` (one per row and 32-column group, symmetric, no zero-point). Then come either 4-bit two's-complement
+  codes at `c*8 + r/2` (even row in the low nibble) or int8 codes at `c*16 + r`. The reading was settled against
+  independent weights: Google's own QAT Q4_0 GGUF of the model agrees at corr 0.9986 on seven tensors over layers 0,
+  5 and 47 (the 5% rel-rms is FastFlowLM's re-quantization, the same in each), and the Q8W head reproduces the
+  pack's bf16 embedding at 1.00000. A Q4W tensor has exactly the byte count of a 4608-byte Q4S grid, which is how it
+  was read before. Layer 0 then went non-finite at its first attention. The declared shape now picks the kind.
+- **`attention_k_eq_v`.** The global layers have no `v_proj`: their values are the k projection, taken before
+  `k_norm` and then given Gemma4's scale-free v norm. This is our llama.cpp fork's rule (`gemma4.cpp`:
+  `Vcur = wv ? wv x : Kcur`). The forward fills those v rows from k. A layer with no `v_proj` and no such key is
+  refused by name.
+- **No per-layer embedding.** `post_layernorm` belongs to the PLE block, so it is read only when the model has one.
+  Before, init failed on its absence with an empty error. Those lookups now name the missing tensor.
+
+On the host the known-answer prompt gives `<|channel>thought\n<channel|>Paris<turn|>`: the model writes the
+template's own empty-thought prefix, then answers. Gemma4-E2B, the PLE model, still answers `Paris`. No kernel set
+for the 12B's shapes was built or run (the NPU is off).
+
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.
 A pack of the same architecture under another name got it wrong in silence. FastFlowLM's MiniCPM-V 4.7

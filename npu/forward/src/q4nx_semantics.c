@@ -402,6 +402,8 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
      * no num_global_key_value_heads the head count is the same for both types. */
     if (get_num(json, "global_head_dim", &d) && d > 0)
         s->global_head_dim = (int)d;
+    s->attention_k_eq_v = (strstr(json, "\"attention_k_eq_v\": true") != NULL ||
+                           strstr(json, "\"attention_k_eq_v\":true") != NULL) ? 1 : 0;
     if (get_num(json, "num_global_key_value_heads", &d) && d > 0)
         s->num_global_kv_heads = (int)d;
     const double full_hd = s->global_head_dim > 0 ? (double)s->global_head_dim : hd;

@@ -94,6 +94,17 @@ int main(void) {
         check(s.extra_layer_norms == 2 && s.rmsnorm_offset == 0, "gemma3_text_only is gemma3 too");
     }
 
+    /* Gemma4-12B-IT-NPU2 (engine#1786): a dense Gemma4. Its global layers have no v_proj, and attention_k_eq_v says
+     * their values are the k projection; no per-layer embedding, so no post_layernorm to read. */
+    if (sem_of(dir, "{\"model_type\": \"gemma4_unified\", \"num_hidden_layers\": 6, \"head_dim\": 256,"
+                    " \"global_head_dim\": 512, \"num_global_key_value_heads\": 1, \"attention_k_eq_v\": true,"
+                    " \"hidden_size_per_layer_input\": 0, \"sliding_window\": 1024}", &s) == 0)
+        check(s.attention_k_eq_v == 1 && s.extra_layer_norms == 1 && s.hidden_size_per_layer_input == 0 &&
+                  s.global_head_dim == 512 && s.num_global_kv_heads == 1,
+              "Gemma4-12B: attention_k_eq_v read, Gemma4 norms, no PLE, global head 512 x 1 kv head");
+    if (sem_of(dir, "{\"model_type\": \"gemma4_text\", \"num_hidden_layers\": 2}", &s) == 0)
+        check(s.attention_k_eq_v == 0, "a Gemma4 config without the key keeps its own v_proj");
+
     /* The neighbours keep what they had. */
     if (sem_of(dir, "{\"model_type\": \"gemma2\", \"hidden_size\": 2304}", &s) == 0)
         check(s.rmsnorm_offset == 1 && s.extra_layer_norms == 0, "gemma2 keeps (1 + w) and is not gemma3");

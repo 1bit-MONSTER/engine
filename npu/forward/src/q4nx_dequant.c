@@ -197,6 +197,41 @@ int q4nx_dequant_tensor_q4h(const uint8_t* data, size_t nbytes, int rows, int k,
     return 0;
 }
 
+void q4nx_dequant_chunk_wide(const uint8_t* chunk, int bits, float* out, int ld) {
+    float sc[Q4NX_WIDE_ROWS * 8];
+    for (int i = 0; i < Q4NX_WIDE_ROWS * 8; i++) sc[i] = bf16_to_f32(le16(chunk + 2 * i));
+    const uint8_t* codes = chunk + 256;
+    for (int r = 0; r < Q4NX_WIDE_ROWS; r++)
+        for (int c = 0; c < Q4NX_WIDE_COLS; c++) {
+            int q;
+            if (bits == 4) {
+                const uint8_t b = codes[c * 8 + r / 2];
+                const int v = (r & 1) ? (b >> 4) : (b & 15);
+                q = v >= 8 ? v - 16 : v;
+            } else {
+                q = (int8_t)codes[c * 16 + r];
+            }
+            out[(size_t)r * ld + c] = (float)q * sc[(c / 32) * Q4NX_WIDE_ROWS + r];
+        }
+}
+
+int q4nx_dequant_tensor_wide(const uint8_t* data, size_t nbytes, int chunk_bytes, int rows, int k, int cols, float* out) {
+    if (!data || !out || rows <= 0 || k <= 0 || cols < k) return -1;
+    const int bits = chunk_bytes == Q4NX_CHUNK_Q4W ? 4 : (chunk_bytes == Q4NX_CHUNK_Q8W ? 8 : 0);
+    if (!bits || rows % Q4NX_WIDE_ROWS || k % Q4NX_WIDE_COLS) return -1;
+    const int ntr = rows / Q4NX_WIDE_ROWS, ntc = k / Q4NX_WIDE_COLS;
+    if (nbytes != (size_t)ntr * (size_t)ntc * (size_t)chunk_bytes) return -1;
+    #pragma omp parallel for collapse(2) schedule(static) if((size_t)ntr * ntc >= 4)
+    for (int tr = 0; tr < ntr; tr++)
+        for (int tc = 0; tc < ntc; tc++)
+            q4nx_dequant_chunk_wide(data + ((size_t)tr * ntc + tc) * (size_t)chunk_bytes, bits,
+                                    out + (size_t)tr * Q4NX_WIDE_ROWS * cols + (size_t)tc * Q4NX_WIDE_COLS, cols);
+    if (cols > k)
+        for (int r = 0; r < rows; r++)
+            memset(out + (size_t)r * cols + k, 0, (size_t)(cols - k) * sizeof(float));
+    return 0;
+}
+
 int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
                                 int cols, int chunk_bytes, float* out) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;

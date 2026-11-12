@@ -180,23 +180,26 @@ inline int sample_token(const std::vector<float>& logits, const SampleParams& p,
 }
 
 // The distribution sample_token() draws from, as one probability per id of the bounded row: zero for every id that
-// top_k or top_p cut, w / total for the rest (sampling_weights). Greedy parameters give the one-hot of the argmax. No
-// mask: this is what a speculative round checks a draft against (npu/mtp/draft.h RowSampler, engine#1781), and that
-// round never runs under a grammar.
-inline std::vector<float> sample_probs(const float* logits, size_t width, const SampleParams& p, int vocab = 0) {
+// top_k or top_p cut, w / total for the rest (sampling_weights). Greedy parameters give the one-hot of the argmax.
+// `allowed` is sample_token()'s grammar mask, applied the same way; a mask with nothing set gives all zeros. This is
+// what a speculative round checks a draft against (app/npu_spec_sampler.h, engine#1781).
+inline std::vector<float> sample_probs(const float* logits, size_t width, const SampleParams& p, int vocab = 0,
+                                       const std::vector<char>* allowed = nullptr) {
     const size_t n = token_bound(width, vocab);
     std::vector<float> out(n, 0.0f);
-    if (n == 0) return out;
-    if (p.greedy()) {
-        size_t best = 0;
-        for (size_t i = 1; i < n; i++)
-            if (logits[i] > logits[best]) best = i;
-        out[best] = 1.0f;
-        return out;
-    }
     std::vector<Candidate> c;
     c.reserve(n);
-    for (size_t i = 0; i < n; i++) c.push_back({logits[i], int(i)});
+    for (size_t i = 0; i < n; i++)
+        if (!allowed || (*allowed)[i]) c.push_back({logits[i], int(i)});
+    if (c.empty()) return out;
+    if (p.greedy()) {
+        // sample_token()'s greedy pick: the highest logit, the lower id on a tie
+        const Candidate* best = &c[0];
+        for (const auto& x : c)
+            if (x.logit > best->logit) best = &x;
+        out[size_t(best->id)] = 1.0f;
+        return out;
+    }
     const double sum = sampling_weights(c, p);
     for (const auto& x : c) out[size_t(x.id)] = float(double(x.logit) / sum);
     return out;

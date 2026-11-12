@@ -304,29 +304,7 @@ def repair_notice(text, block):
     return repaired if has_notice(repaired) else add_notice(repaired, block)
 
 
-def strip_short_header(text):
-    """Drop a short header (Copyright + SPDX and nothing after it) so add_notice can put the block there.
-
-    engine#2175: `--fix` on a short header prepended the canonical block and LEFT the two stub lines, so the
-    file came out with the Copyright/SPDX pair twice, `duplicated_notice()` fired, and `--check` was still
-    red -- the tool's own suggested remedy could not fix the shape it told four branches about. The stub is
-    exactly the two lines `short_notice()` looks for; if the file's head does not match that shape, this
-    returns the text unchanged and the caller's behaviour is what it was.
-    """
-    lines = text.splitlines(keepends=True)
-    # A script's short header starts on line 2, behind its `#!`: without this, the stub is not found, the block
-    # is prepended after the shebang, and the file ends up with two notices again (measured: short.sh).
-    at = 1 if lines and lines[0].startswith("#!") else 0
-    if len(lines) >= at + 2 and NOTICE[0] in lines[at] and NOTICE[1] in lines[at + 1]:
-        head, rest = lines[:at], lines[at + 2:]
-        if rest and rest[0].strip() == "" and len(rest) > 1:
-            rest = rest[1:]
-        return "".join(head + rest)
-    return text
-
-
 def add_notice(text, block):
-    text = strip_short_header(text)
     lines = text.splitlines(keepends=True)
     insert_at = 1 if lines and lines[0].startswith("#!") else 0
     # A near-miss of this repo's holder is REPLACED, not stacked beside: `--fix` used to insert the canonical

@@ -5289,6 +5289,43 @@ void test_container_role_shapes() {
     check(pi::container_role_shapes({}).empty(), "role shapes: no tensors, no roles");
 }
 
+// engine#1788 / 3c step 5: the writer's mapping as a plan it can be wrong about. On the 35B: 19 fields mapped, 0
+// ambiguous, and `no_source` correctly lists only what a MoE model lacks by design (dense gate/up/down, shortconv).
+void test_container_write_plan() {
+    const auto t = [](const std::string& n, std::vector<int64_t> shape, const char* dt) {
+        pi::Q4nxTensor x; x.name = n; x.dtype = dt; x.shape = std::move(shape); return x;
+    };
+    {
+        const std::vector<pi::Q4nxTensor> v = {t("model.layers.0.moe_router.weight", {2048, 256}, "BF16"),
+                                               t("model.layers.1.moe_router.weight", {2048, 256}, "BF16")};
+        const pi::ContainerWritePlan p = pi::container_write_plan(v);
+        bool found = false;
+        for (const auto& it : p.items)
+            if (it.field == "moe_router_weight") {
+                found = true;
+                check(it.count == 2 && it.shape == "[2048,256] BF16", "write plan: a role carried per layer counts them");
+            }
+        check(found, "write plan: the router maps to its forward field");
+        check(p.ambiguous.empty(), "write plan: one shape is not ambiguous");
+    }
+    {
+        // a role in two shapes must be AMBIGUOUS, not silently one of them
+        const std::vector<pi::Q4nxTensor> v = {t("a.moe_router.weight", {2048, 256}, "BF16"),
+                                               t("b.moe_router.weight", {1024, 256}, "BF16")};
+        const pi::ContainerWritePlan p = pi::container_write_plan(v);
+        check(p.ambiguous.size() == 1, "write plan: two shapes for one role is reported as ambiguous");
+        for (const auto& it : p.items) check(it.field != "moe_router_weight", "write plan: an ambiguous role is not mapped");
+    }
+    {
+        // a fused pair is not one field, so it is neither an item nor 'missing'
+        const std::vector<pi::Q4nxTensor> v = {t("model.layers.0.attn_qkv.weight", {64, 8, 4736}, "I8")};
+        const pi::ContainerWritePlan p = pi::container_write_plan(v);
+        for (const auto& it : p.items) check(it.field != "qkv_proj", "write plan: a fused pair is not one destination field");
+        check(!p.no_source.empty(), "write plan: the fields this pack does not carry are listed separately");
+    }
+    check(pi::container_write_plan({}).items.empty(), "write plan: no tensors, no items");
+}
+
 void test_container_roles() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6329,6 +6366,7 @@ int main(int argc, char** argv) {
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
         test_container_roles();
+        test_container_write_plan();
         test_container_role_shapes();
         test_container_payload_rule();
         test_container_role_fields();

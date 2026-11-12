@@ -204,6 +204,18 @@ struct ContainerPayloadAnomaly {
     int64_t row_bytes = 0;
     int64_t implied_k = 0;
 };
+struct ContainerWriteItem {
+    std::string field;    // the forward field (npu/forward/include/model.h)
+    std::string source;   // ONE container tensor that fills it -- a representative, not the only one
+    std::string shape;    // its shape+dtype text, as reported by container_role_shapes()
+    int64_t count = 0;    // how many tensors carry this role (e.g. one per layer), so a writer does not read
+                          // `source` as "the only one"
+};
+struct ContainerWritePlan {
+    std::vector<ContainerWriteItem> items;
+    std::vector<std::string> ambiguous;   // "<field>: <role> appears in N shapes"
+    std::vector<std::string> no_source;    // fields the table knows whose role is absent from this pack
+};
 struct Planned {
     std::string name;     // Q4NX tensor name (model.layers.N.<...>.weight)
     std::string source;   // "model.onnx.data", "fconst:Llm_Token_Token", "fconst:Llm_Prefill", "config.json"
@@ -284,6 +296,7 @@ struct Plan {
     std::map<int64_t, int64_t> container_payload_rows;          // row_bytes -> how many I8 tensors use it
     // engine#1788, 3c: per role, the shapes the container carries -- the fact the writer's shape matching needs.
     std::map<std::string, std::map<std::string, int64_t>> container_role_shapes;
+    ContainerWritePlan container_write_plan;   // role -> forward field -> source tensor (slice 3c step 5)
     std::vector<ContainerPayloadAnomaly> container_payload_anomalies;
     // engine#1786 (item F1), slice 2: WHERE the container's geometry came from, and what it could not reach.
     // A bare number in `dims` cannot say whether the pack declared it or a file beside it did, and those two are free to
@@ -433,6 +446,11 @@ std::map<int64_t, int64_t> container_payload_rows(const std::vector<Q4nxTensor>&
 // positives on both packs on this box, the useful thing to hand it is the FACT: which shapes each role appears in.
 // A role with one shape is a mapping; a role with several is a decision the writer must make per shape.
 std::map<std::string, std::map<std::string, int64_t>> container_role_shapes(const std::vector<Q4nxTensor>& tensors);
+// engine#1788, slice 3c step 5: the writer's mapping, as a plan it can be wrong about. For every role that names a
+// forward field, which source tensor supplies it and in what shape; a role present in two shapes is AMBIGUOUS (the
+// writer must decide, not pick), and a field the table knows whose role is absent is listed separately rather than
+// called missing -- whether a model needs `up_proj` or `up_exps` is a per-model question, not a table one.
+ContainerWritePlan container_write_plan(const std::vector<Q4nxTensor>& tensors);
 std::vector<ContainerPayloadAnomaly> container_payload_anomalies(const std::vector<Q4nxTensor>& tensors);
 // The destination fields claimed by more than one role in `counts` (each with the roles that claim it). Empty is the
 // only state a writer may start from.

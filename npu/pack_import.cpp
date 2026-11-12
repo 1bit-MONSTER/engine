@@ -3315,6 +3315,17 @@ std::string Plan::manifest() const {
         if (!container_roles_unassigned.empty()) c["roles"]["unassigned_names"] = container_roles_unassigned;
         c["payload_rows"] = container_payload_rows;
         c["role_shapes"] = container_role_shapes;
+        {
+            json wp;
+            json items = json::object();
+            for (const auto& it : container_write_plan.items)
+                items[it.field] = {{"source", it.source}, {"of", it.count}, {"shape", it.shape}};
+            wp["items"] = items;
+            wp["count"] = container_write_plan.items.size();
+            if (!container_write_plan.ambiguous.empty()) wp["ambiguous"] = container_write_plan.ambiguous;
+            if (!container_write_plan.no_source.empty()) wp["no_source"] = container_write_plan.no_source;
+            c["write_plan"] = wp;
+        }
         if (!container_payload_anomalies.empty()) {
             json a = json::array();
             for (const auto& x : container_payload_anomalies)
@@ -3457,6 +3468,46 @@ std::map<int64_t, int64_t> container_payload_rows(const std::vector<Q4nxTensor>&
     std::map<int64_t, int64_t> out;
     for (const auto& t : tensors)
         if (t.dtype == "I8" && t.shape.size() == 3) out[t.shape[2]]++;
+    return out;
+}
+
+ContainerWritePlan container_write_plan(const std::vector<Q4nxTensor>& tensors) {
+    ContainerWritePlan out;
+    const ContainerRoles roles = container_roles(tensors);
+    // role -> the tensors that carry it
+    std::map<std::string, std::vector<const Q4nxTensor*>> by_role;
+    for (const auto& t : tensors) {
+        const auto it = roles.role_of.find(t.name);
+        if (it != roles.role_of.end()) by_role[it->second].push_back(&t);
+    }
+    const auto shape_text = [](const Q4nxTensor& t) {
+        std::string s = "[";
+        for (size_t i = 0; i < t.shape.size(); ++i) s += (i ? "," : "") + std::to_string(t.shape[i]);
+        return s + "] " + t.dtype;
+    };
+    // every field the table knows, in table order: does a role that names it have a source?
+    static const char* kRoles[] = {
+        "embed", "lm_head", "input_norm", "post_norm", "q_norm", "k_norm", "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj", "self_attn_gate_proj", "up_exps", "gate_exps", "down_exps",
+        "share_up_exps", "share_gate_exps", "share_down_exps", "moe_router", "shared_expert_gate",
+        "shortconv_in_proj", "shortconv_conv", "shortconv_out_proj"};
+    for (const char* role : kRoles) {
+        const auto it = by_role.find(role);
+        if (it == by_role.end()) {
+            out.no_source.push_back(std::string(container_role_field(role)) + " (role `" + role + "` absent)");
+            continue;
+        }
+        // distinct shapes for this role
+        std::map<std::string, const Q4nxTensor*> first;
+        for (const Q4nxTensor* t : it->second) first.emplace(shape_text(*t), t);
+        if (first.size() > 1) {
+            out.ambiguous.push_back(std::string(container_role_field(role)) + ": role `" + role + "` appears in " +
+                                    std::to_string(first.size()) + " shapes");
+            continue;
+        }
+        out.items.push_back({container_role_field(role), first.begin()->second->name, first.begin()->first,
+                             int64_t(it->second.size())});
+    }
     return out;
 }
 
@@ -3737,6 +3788,7 @@ Plan plan(const std::string& pack_dir) {
             // engine#1788, 3c: what the writer needs to know about the payload, as fact rather than judgement.
             p.container_payload_rows = container_payload_rows(c.tensors);
             p.container_role_shapes = container_role_shapes(c.tensors);
+            p.container_write_plan = container_write_plan(c.tensors);
             p.container_payload_anomalies = container_payload_anomalies(c.tensors);
             p.container_note = c.why.empty()
                 ? "the pack is a safetensors container (model.q4nx): " + std::to_string(c.tensors.size()) +

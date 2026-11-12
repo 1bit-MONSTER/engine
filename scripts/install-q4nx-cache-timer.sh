@@ -86,12 +86,17 @@ resolve_1bit() {
     printf ''
 }
 
+# Every flag that takes a value is checked for that value BEFORE `shift 2`. `shift 2` on a one-argument list does not shift
+# at all -- it fails and leaves $# unchanged -- so a value flag given last used to spin this loop at full CPU for ever
+# (measured: `timeout 5 script --dry-run --max-gib` exited 124, the timeout killing it).
+needs_value() { [ $# -ge 2 ] || die "$1 needs a value"; }
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --max-gib) max_gib=${2:-}; shift 2 ;;
-        --min-age) min_age=${2:-}; shift 2 ;;
-        --interval) interval=${2:-}; shift 2 ;;
-        --1bit) bin_arg=${2:-}; shift 2 ;;
+        --max-gib) needs_value "$@"; max_gib=$2; shift 2 ;;
+        --min-age) needs_value "$@"; min_age=$2; shift 2 ;;
+        --interval) needs_value "$@"; interval=$2; shift 2 ;;
+        --1bit) needs_value "$@"; bin_arg=$2; shift 2 ;;
         --dry-run) dry=1; shift ;;
         --uninstall) uninstall=1; shift ;;
         --self-test) self=1; shift ;;
@@ -140,6 +145,22 @@ if [ "${self:-0}" = 1 ]; then
     [ "$rc" != 0 ] && case "$out" in *"predates engine#2251"*) ok "a binary that predates the command is refused, and named" ;; *) bad "refused for the wrong reason: $out" ;; esac \
         || bad "a binary without q4nx-cache should be refused, got rc 0"
 
+    # a value flag given LAST must exit with a message rather than spin: `shift 2` on a one-argument list does not shift,
+    # so the loop used to run for ever (timeout 5 -> 124).
+    for flag in --max-gib --min-age --interval --1bit; do
+        out=$(timeout 5 bash "$0" --dry-run "$flag" 2>&1); rc=$?
+        case "$rc:$out" in
+            124:*) bad "$flag given last SPUN (timeout killed it) -- the shift-2 bug is back" ;;
+            0:*)   bad "$flag given last exited 0; it must refuse" ;;
+            *"$flag needs a value"*) ok "$flag given last refuses: needs a value (rc $rc)" ;;
+            *) bad "$flag given last refused for the wrong reason: $out" ;;
+        esac
+    done
+
+    # a relative --1bit is refused where the mistake is, not by systemd inside the unit
+    out=$(bash "$0" --dry-run --1bit relative/1bit 2>&1); rc=$?
+    case "$out" in *"wants an absolute path"*) ok "a relative --1bit is refused, naming the reason" ;; *) bad "relative --1bit: $out" ;; esac
+
     # the dry run writes nothing
     before=$(ls -A "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user" 2>/dev/null | grep -c 'q4nx' || true)
     bash "$0" --dry-run > /dev/null 2>&1
@@ -180,6 +201,13 @@ fi
 
 bin=$(resolve_1bit)
 [ -n "$bin" ] || die "no 1bit binary: not on PATH and not at /opt/1bit/1bit (pass --1bit PATH)"
+# A relative path reaches systemd as `ExecStart=build1336/1bit`, and systemd answers "Neither a valid executable name nor an
+# absolute path" -- a unit-file complaint about a flag. Say it here instead, on the line the mistake was made on, and BEFORE
+# the executability test so that a relative path gets this message rather than "is not executable".
+case "$bin" in
+    /*) ;;
+    *) die "--1bit wants an absolute path, got '$bin' (systemd requires an absolute ExecStart)" ;;
+esac
 [ -x "$bin" ] || die "$bin is not executable"
 
 # A timer whose ExecStart names a command the binary does not have fails hourly and silently. The command landed in

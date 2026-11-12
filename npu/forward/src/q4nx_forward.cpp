@@ -199,6 +199,18 @@ static int64_t declared_row_bytes(const TensorDesc* d) {
 
 static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out, const TensorDesc* desc = nullptr) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
+    // engine#1786: an unquantised projection (FastFlowLM's Embedding-Gemma-300M-NPU2 ships every weight as BF16
+    // [out, in]). Copied into the forward's grid, which may be padded past the declared shape (IM 1152 -> 1280): the
+    // pad rows and columns are zero, the layout every chunked reader below writes.
+    if (desc && desc->ndim == 2 && !strcmp(desc->dtype, "BF16")) {
+        const int64_t r0 = desc->shape[0], c0 = desc->shape[1];
+        if (r0 <= 0 || c0 <= 0 || r0 > rows || c0 > cols || nbytes < (size_t)r0 * (size_t)c0 * 2) return -1;
+        const uint16_t* w = (const uint16_t*)data;
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                out[(size_t)r * cols + c] = (r < r0 && c < c0) ? bf16_to_f32(w[(size_t)r * (size_t)c0 + (size_t)c]) : 0.0f;
+        return 0;
+    }
     const int64_t decl_row_bytes = declared_row_bytes(desc);
     if (decl_row_bytes == Q4NX_CHUNK_D2560) {
         // GPT-OSS: [RB, CB, S, 2560]; the container's K (CB*128) may be padded past the model's, and is read into
@@ -1141,6 +1153,14 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             return false;
         }
         if (sem_.eps <= 0) sem_.eps = c_.eps;
+        if (sem_.bidirectional) {
+            noncausal_attn_ = true;
+            bidir_sliding_ = true;
+            fprintf(stderr, "  [forward] use_bidirectional_attention: an encoder -- every layer, sliding ones included, "
+                            "reads the whole prompt in one pass at position 0 (up to %d tokens, half the %d-token "
+                            "window); it cannot generate\n", sem_.sliding_window > 0 ? sem_.sliding_window / 2 : 0,
+                    sem_.sliding_window);
+        }
         // engine#1788: whether q and k are normalised per head is a fact about the container, not about its name
         // (q4nx_semantics.h). A layer that carries both q_norm and k_norm turns it on for a model_type the table
         // does not know; said out loud, because the dump below then prints 1 beside "<- model_type".
@@ -1877,6 +1897,14 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // official 0.8B release is zero-centered; the hybrid 27B packs are plain gains). Resolve it from the
     // weight that was just loaded, and print the evidence so a surprising answer is visible rather than
     // buried. Every other model_type keeps the convention it already decided above.
+    if (sem_.gemma3_bf16_norm_probe && !sem_.rmsnorm_offset) {
+        const TensorDesc* q0 = model_tensor_by_name(mw_, "model.layers.0.self_attn.q_proj.weight");
+        if (q0 && !strcmp(q0->dtype, "BF16")) {
+            sem_.rmsnorm_offset = 1;
+            fprintf(stderr, "  [semantics] rmsnorm_offset=1  <- gemma3 with BF16 projections (an unconverted HF copy: its "
+                            "norms are HF's w, applied as 1 + w)\n");
+        }
+    }
     if (sem_.rmsnorm_offset_probe && !in_norm_.empty() && c_.H > 0) {
         const std::vector<float>& w0 = in_norm_[0];
         double sum = 0.0;
@@ -4377,6 +4405,66 @@ bool Q4nxNpuForward::step_batch_all(const std::vector<int>& tokens, int start_po
 
 // engine#1780: a pass that fails must not leave rows in the tap sink. The bodies below return false from many
 // places, so the rule is applied once, here, around each of them.
+bool Q4nxNpuForward::embed_pooled(const std::vector<int>& ids, std::vector<float>& out) {
+    out.clear();
+    if (!noncausal_attn_) {
+        err_ = "embed_pooled(): this model is causal (no use_bidirectional_attention, no noncausal plan); a sentence "
+               "embedding pools an encoder's rows";
+        return false;
+    }
+    if (ids.empty()) { err_ = "embed_pooled(): empty input"; return false; }
+    const int H = c_.H;
+    // The sentence-transformers head, as stored: dense_2 [D2, H] then dense_3 [D3, D2], both linear (identity
+    // activation). Read once, f32; a pack without them pools to H.
+    auto load_dense = [&](const char* name, int in_w, std::vector<float>& w, int& rows) -> bool {
+        if (!w.empty()) return true;
+        TensorDesc* d = model_tensor_by_name(mw_, name);
+        if (!d) { rows = 0; return true; }
+        if (d->ndim != 2 || d->shape[1] != in_w || strcmp(d->dtype, "BF16") != 0) {
+            err_ = std::string("embed_pooled(): ") + name + " is not a BF16 [out, " + std::to_string(in_w) + "] matrix";
+            return false;
+        }
+        rows = (int)d->shape[0];
+        const uint16_t* raw = (const uint16_t*)model_tensor_data(mw_, d);
+        if (!raw || (size_t)d->data_size < (size_t)rows * (size_t)in_w * 2) { err_ = std::string("embed_pooled(): ") + name + " is short"; return false; }
+        w.resize((size_t)rows * (size_t)in_w);
+        for (size_t i = 0; i < w.size(); i++) w[i] = bf16_to_f32(raw[i]);
+        return true;
+    };
+    if (!load_dense("dense_2.weight", H, dense2_, dense2_out_)) return false;
+    if (dense2_out_ > 0 && !load_dense("dense_3.weight", dense2_out_, dense3_, dense3_out_)) return false;
+    std::vector<float> unused;
+    hidden_only_ = true;
+    const bool ok = step_batch(ids, 0, unused);
+    hidden_only_ = false;
+    if (!ok) return false;
+    const int M = (int)ids.size();
+    if (last_hidden_rows_.size() != (size_t)M * (size_t)H) { err_ = "embed_pooled(): row count"; return false; }
+    std::vector<double> mean((size_t)H, 0.0);
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < H; k++) mean[(size_t)k] += last_hidden_rows_[(size_t)m * H + k];
+    std::vector<float> v((size_t)H);
+    for (int k = 0; k < H; k++) v[(size_t)k] = (float)(mean[(size_t)k] / M);
+    auto linear = [](const std::vector<float>& w, int rows, int in_w, const std::vector<float>& x) {
+        std::vector<float> y((size_t)rows);
+        for (int r = 0; r < rows; r++) {
+            double s = 0.0;
+            const float* wr = &w[(size_t)r * (size_t)in_w];
+            for (int k = 0; k < in_w; k++) s += (double)wr[k] * x[(size_t)k];
+            y[(size_t)r] = (float)s;
+        }
+        return y;
+    };
+    if (dense2_out_ > 0) v = linear(dense2_, dense2_out_, H, v);
+    if (dense3_out_ > 0) v = linear(dense3_, dense3_out_, dense2_out_, v);
+    double n2 = 0.0;
+    for (float x : v) n2 += (double)x * x;
+    const double inv = n2 > 0 ? 1.0 / std::sqrt(n2) : 0.0;
+    for (float& x : v) x = (float)(x * inv);
+    out = std::move(v);
+    return true;
+}
+
 bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos, std::vector<float>& logits) {
     onebit::npu::LayerTapPass pass(tap_sink_);
     tap_fault_ = false;
@@ -4409,6 +4497,14 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
     const int H = c_.H;
     const int M = (int)tokens.size();
     if (M <= 0) { err_ = "empty batch"; return false; }
+    // A bidirectional sliding layer was trained on a band around each position; reading the whole prompt is that
+    // band only while the prompt fits half the window, whichever side convention the band uses.
+    if (bidir_sliding_ && sem_.sliding_window > 0 && M > sem_.sliding_window / 2) {
+        err_ = "use_bidirectional_attention: a " + std::to_string(M) + "-token input is longer than half the " +
+               std::to_string(sem_.sliding_window) + "-token sliding window, where a sliding layer's band is no " +
+               "longer the whole prompt; send at most " + std::to_string(sem_.sliding_window / 2) + " tokens";
+        return false;
+    }
     for (int t : tokens)
         if (t < 0 || t >= c_.NV) { err_ = "token out of range"; return false; }
 
@@ -4751,7 +4847,7 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                 return e && e[0] == '1';
             }();
             if (attn_rows_on && M > 1 && l_hd > 0 && c_.NH % l_nkv == 0) {
-                const bool whole = noncausal_attn_ && l_full;
+                const bool whole = noncausal_attn_ && (l_full || bidir_sliding_);
                 const size_t qw = (size_t)nhd;
                 std::vector<float> qall((size_t)M * qw), qm;
                 std::vector<int> Tm((size_t)M), t0m((size_t)M);
@@ -4794,7 +4890,7 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                         return false;
                     }
                 }
-            } else if (noncausal_attn_ && l_full) {
+            } else if (noncausal_attn_ && (l_full || bidir_sliding_)) {
                 for (int m = 0; m < M; m++)
                     if (!row_attn(m, nullptr, true, 0)) return false;
                 for (int m = 0; m < M; m++)
@@ -5007,13 +5103,20 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
         logits.assign(batch_all_out_->begin() + (size_t)(M - 1) * (size_t)c_.NV, batch_all_out_->end());
         // engine#1781: keep the batched rows so the oracle can compare all of them, not just the last one's argmax.
         if (batch_check) bat_rows.assign(batch_all_out_->begin(), batch_all_out_->end());
+    } else if (hidden_only_) {
+        // embed_pooled(): an encoder has no next token, so the head is not run; every row is normed and kept.
+        last_hidden_rows_.assign((size_t)M * (size_t)H, 0.0f);
+        for (int m = 0; m < M; m++)
+            rmsnorm(&X[(size_t)m * H], final_norm_.data(), H, &last_hidden_rows_[(size_t)m * H]);
+        std::copy(last_hidden_rows_.begin() + (size_t)(M - 1) * H, last_hidden_rows_.end(), fnorm.begin());
+        logits.clear();
     } else {
         std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
         rmsnorm(last.data(), final_norm_.data(), H, fnorm.data());
         ok = run_lm_head(fnorm, logits);
     }
     last_hidden_ = fnorm;  // for last_hidden(): the same vector the head reads, last position only
-    if (getenv("NPU_INFER_DUMP_LAYERS")) {
+    if (getenv("NPU_INFER_DUMP_LAYERS") && !logits.empty()) {
         int best[5] = {-1, -1, -1, -1, -1};
         for (int i = 0; i < (int)logits.size(); i++) {
             for (int r = 0; r < 5; r++) {

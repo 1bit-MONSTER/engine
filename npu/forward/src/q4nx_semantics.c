@@ -226,6 +226,10 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
     /* qwen3_5 ships both conventions under the same model_type, so the forward resolves it from the
      * layer-0 input_layernorm weight it loads (a config-only answer would be a guess). */
     s->rmsnorm_offset_probe = (is_qwen35 && !is_gemma) ? 1 : 0;
+    /* engine#1786: a gemma3 pack whose projections are unquantised BF16 is a copy of the HF checkpoint, norms
+     * included (Embedding-Gemma-300M-NPU2: every norm equals unsloth/embeddinggemma-300m's to bf16 rounding), so it
+     * carries HF's raw w, not the converted 1 + w. The forward decides from layer 0's q_proj dtype. */
+    s->gemma3_bf16_norm_probe = is_gemma3 ? 1 : 0;
 
     /* LFM2 / LFM2.5 (Lfm2ForCausalLM): its attention layers carry q_norm/k_norm, applied before RoPE */
     const int is_lfm2 = starts_with(model_type, "lfm2") || starts_with(arch, "Lfm2");
@@ -432,6 +436,8 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
      * lm_head.weight (Nanbeige4.1-3B sets tie_word_embeddings = false). */
     s->tie_embeddings = 1;
     s->tie_stated = 0;
+    s->bidirectional = 0;
+    if (get_num(json, "use_bidirectional_attention", &d)) s->bidirectional = d != 0;
     if (get_num(json, "tie_word_embeddings", &d)) { s->tie_embeddings = d != 0; s->tie_stated = 1; }
 
     /* layer_types -> the per-layer attention kind the forward dispatches on */

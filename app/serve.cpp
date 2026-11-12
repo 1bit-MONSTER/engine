@@ -3402,7 +3402,7 @@ int run_serve(int argc, char** argv) {
         if (o.device == "npu") return serve_only("--device npu runs in serve's own process");
     }
 
-    if (embed_serve::container(o.model)) {
+    if (embed_serve::container(o.model) || (o.role == "embedding" && embed_serve::forward_encoder(o.model))) {
         // `--embedding -m <container> [--device npu|cpu]`: a 1-bit encoder container is served in-process by the
         // engine's own encoder, so it must be dispatched BEFORE the NPU-directory rules below (those are about
         // q4nx/forward-serve directories, which do not run on the host). app/embed_serve.h.

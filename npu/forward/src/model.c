@@ -854,6 +854,10 @@ ModelWeights* model_load(const char* path, ModelConfig config) {
         const int renamed = model_alias_lfm_names(tensors, num_tensors);
         if (renamed > 0) LOG_INFO("Renamed %d LFM tensor names to the canonical ones", renamed);
     }
+    {
+        const int renamed = model_alias_unprefixed_names(tensors, num_tensors);
+        if (renamed > 0) LOG_INFO("Prefixed %d unprefixed tensor names with model. (sentence-transformers layout)", renamed);
+    }
 
     // engine#1185: a container imported from an OGA pack stores its I8 weights as 6,144-byte q4_1f
     // chunks (fp32 scale/zero) instead of the 5,120-byte q4_1 the kernels here dequantise in-kernel.
@@ -1213,6 +1217,22 @@ int model_alias_lfm_names(TensorDesc* t, int count) {
         }
         if (!to) continue;
         snprintf(want, sizeof(want), "model.layers.%d.%s", l, to);
+        if (name_taken(t, count, want)) continue;
+        snprintf(t[i].name, sizeof(t[i].name), "%s", want);
+        renamed++;
+    }
+    return renamed;
+}
+
+int model_alias_unprefixed_names(TensorDesc* t, int count) {
+    if (!t || count <= 0) return 0;
+    int renamed = 0;
+    char want[sizeof(t[0].name)];
+    for (int i = 0; i < count; i++) {
+        const char* n = t[i].name;
+        const int layer = strncmp(n, "layers.", 7) == 0;
+        if (!layer && strcmp(n, "embed_tokens.weight") != 0 && strcmp(n, "norm.weight") != 0) continue;
+        if (snprintf(want, sizeof(want), "model.%s", n) >= (int)sizeof(want)) continue;
         if (name_taken(t, count, want)) continue;
         snprintf(t[i].name, sizeof(t[i].name), "%s", want);
         renamed++;

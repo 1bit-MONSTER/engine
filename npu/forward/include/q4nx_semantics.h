@@ -213,6 +213,13 @@ typedef struct {
      * model is untied (its lm_head.weight is not the embedding), so an absent key is not evidence of a tie: the
      * forward then decides from the container's own two tables (engine#1786). */
     int tie_stated;
+    /* `use_bidirectional_attention: true` (EmbeddingGemma, Gemma3TextModel): an encoder. Every layer, sliding ones
+     * included, attends both ways over the prompt; the forward encodes it in one batched pass at position 0 and
+     * cannot generate (engine#1786). */
+    int bidirectional;
+    /* gemma3: the norm convention follows the writer -- FastFlowLM's quantised packs store 1 + w, an unquantised
+     * (BF16-projection) copy of the HF checkpoint stores w. Resolved by the forward from layer 0's q_proj. */
+    int gemma3_bf16_norm_probe;
 } Q4nxSemantics;
 
 /* Identifier for each flag, for the auditable field mapping. */

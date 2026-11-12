@@ -224,6 +224,10 @@ public:
     // The post-final-norm hidden of EVERY row of the last batched pass (M x H, row-major): a speculative drafter
     // has to advance its own stream over the rows that were actually accepted, and those are exactly these.
     const std::vector<float>& last_hidden_rows() const { return last_hidden_rows_; }
+    // engine#1786: a bidirectional encoder's sentence embedding (EmbeddingGemma: Gemma3TextModel plus the
+    // sentence-transformers head). One batched pass over `ids` at position 0, the mean of the final-normed rows,
+    // then the pack's dense_2 and dense_3 when it carries them, then L2. Refused by name for a causal model.
+    bool embed_pooled(const std::vector<int>& ids, std::vector<float>& out);
     // engine#1780: the residual stream after the listed layers, for a draft that reads the target's hidden states
     // (a DFlash draft's target_layer_ids). `layers` must be ascending and inside the model; every pass then appends
     // one row per position to *sink, [taps * H] wide, the listed layers side by side in the order given -- the
@@ -434,6 +438,12 @@ private:
     // prompt-encoding forward (step_batch at start_pos 0) attends bidirectionally there and the GDN
     // layers keep their recurrence.  Off unless the plan says so, so a causal model is untouched.
     bool noncausal_attn_ = false;
+    // use_bidirectional_attention (an encoder): the sliding layers read the whole prompt too, which the band they
+    // were trained with equals only while the prompt fits half the window -- a longer one is refused by name.
+    bool bidir_sliding_ = false;
+    bool hidden_only_ = false;               // embed_pooled(): the batched pass stops after the final norm
+    std::vector<float> dense2_, dense3_;     // sentence-transformers head, f32, loaded on first use
+    int dense2_out_ = 0, dense3_out_ = 0;
     // engine#1959: measured wall of one batched launch per design, narrow (the 16-row twin) and wide (the prefill
     // design), for cached weights only. npu_gemm_rows() reads them to decide whether a 17..wide-row chunk runs as one
     // wide launch or as several narrow ones (batch_split.h). 0 = not measured yet. `split_mode_` is NPU_PREFILL_SPLIT:

@@ -29,6 +29,7 @@ Usage:
     tool_help_check.py --self-test
 """
 
+import ast
 import os
 import pathlib
 import subprocess
@@ -40,6 +41,23 @@ SKIP_DIR_NAMES = {'.git', 'build', 'node_modules', '__pycache__', 'third_party',
 TIMEOUT_S = 30
 
 
+def is_cli(path):
+    """A tool that has a `__main__` block and reads sys.argv. A pure module is not a CLI, so silence
+    on --help from one is not a defect -- and three of the six silent files under tools/ are exactly
+    that (tools/q4nx_pack.py, tools/q4nx_t2s.py, tools/laya_finetune/head.py have no entry point)."""
+    try:
+        tree = ast.parse(pathlib.Path(path).read_text(errors='replace'))
+    except (SyntaxError, OSError):
+        return False
+    has_main = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            src = ast.dump(node.test)
+            if '__name__' in src and '__main__' in src:
+                has_main = True
+    return has_main and 'sys.argv' in pathlib.Path(path).read_text(errors='replace')
+
+
 def tools_under(root):
     for f in sorted(pathlib.Path(root).rglob('*.py')):
         if any(part in SKIP_DIR_NAMES for part in f.parts):
@@ -49,16 +67,20 @@ def tools_under(root):
         yield f
 
 
-def crashes(path, root):
+def crashes(path, root, cwd=None):
     """(crashed, detail) for `python3 <path> --help`. A timeout is not a crash: it is a tool we cannot
     ask cheaply, and reporting it as broken would be a claim we did not measure."""
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
     # Absolute, because cwd is the scan root: a relative path would resolve to <root>/<path> and
     # python would exit 2 with "can't open file" and NO traceback, which this function would have
     # read as a clean run. That false pass is the defect this check exists to catch, in its own body.
+    cwd = pathlib.Path.cwd() if cwd is None else cwd
     script = pathlib.Path(path).resolve()
     try:
-        p = subprocess.run([sys.executable, str(script), '--help'], cwd=str(root), env=env,
+        # cwd is where the caller stands, not the scan root: these tools are documented to run from
+        # the repo root, and running them from tools/ changes their answer (check_pins.py's
+        # `git config -f .gitmodules` fails there and it looked unaskable rather than silent).
+        p = subprocess.run([sys.executable, str(script), '--help'], cwd=str(cwd), env=env,
                            capture_output=True, text=True, timeout=TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return ('skip', f'timed out after {TIMEOUT_S}s')
@@ -83,6 +105,11 @@ def crashes(path, root):
         if '--help' in last or "'-h'" in last:
             return ('fail', last[:120])
         return ('skip', 'cannot answer here: ' + last[:100])
+    if p.returncode == 0 and not (p.stdout or '').strip() and not err.strip():
+        # Asked a CLI for help and it said nothing, successfully. A crash at least tells you it broke;
+        # this tells you nothing at all and looks like a clean run -- the shape check_pins.py had
+        # (--help became a base ref, no diff, exit 0).
+        return ('silent', 'exited 0 and printed nothing')
     return ('clean', f'rc {p.returncode}')
 
 
@@ -92,6 +119,12 @@ def check(root):
         rel = f.relative_to(root)
         n += 1
         state, detail = crashes(f, root)
+        if state == 'silent':
+            if is_cli(f):
+                bad.append((rel, detail))
+            else:
+                skipped.append((rel, 'not a CLI (no __main__), so --help is not its question'))
+            continue
         if state == 'skip':
             skipped.append((rel, detail))
         elif state in ('fail', 'internal'):
@@ -149,6 +182,14 @@ def self_test():
         chk('fail', state,
             'a path relative to the invocation cwd, scanned with cwd=root, is still asked '
             '(with the bug it is INTERNAL: a different state, which fails this arm)')
+
+        (root / 'silentcli.py').write_text(
+            "import sys\nif __name__ == '__main__':\n    _ = sys.argv[1:]\n")
+        (root / 'module.py').write_text("print('imported, not run')\n")
+        chk('silent', crashes(root / 'silentcli.py', root)[0],
+            'a CLI that exits 0 on --help without printing is silent, not clean')
+        chk((True, False), (is_cli(root / 'silentcli.py'), is_cli(root / 'module.py')),
+            'a file with __main__ and sys.argv is a CLI; a plain module is not')
 
         (root / 'dep.py').write_text("import not_a_real_module_xyz\n")
         chk('skip', crashes(root / 'dep.py', root)[0], 'a missing dependency is not asked, not a defect')

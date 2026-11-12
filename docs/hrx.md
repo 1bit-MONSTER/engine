@@ -1064,6 +1064,23 @@ Before either, making decode step aside instead was measured and does not help:
 the same duplicates, and decode 8.5 % slower. flint UD-Q4_K_XL (routed experts) reads every weight stored and holds one copy per
 weight with or without the default.
 
+**Since pin `962507f8e` a short prompt holds no weight twice either** (llama.cpp #324, #325). At 6 to 8 tokens the few-token
+kernels took the batch and read the stored layout of weights that prefill reads in the packed rows, so a short prompt or a
+speculative verify batch of that size made a second copy. These weights now go to the packed kernels. A weight a GET_ROWS
+also reads (a tied embedding) can't be packed, so it stays on the few-token kernel. Qwen3-4B Q4_K_M, `llama-completion`, text
+identical per prompt:
+
+| prompt words | 1 | 3 | 5 | 6 | 8 | 10 | 14 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| device copies before | 398 | 398 | 398 | 611 | 611 | 398 | 398 |
+| device copies since | 398 | 398 | 398 | 398 | 398 | 398 | 398 |
+
+On the 27B a 6-word prompt goes from 898 copies to 850. It costs speed at those batch sizes: prompt eval at 6 tokens drops
+from about 202 to 136 tok/s, and at 8 from about 230 to 185. Speculative decode on Qwen3-4B with a Qwen3-0.6B draft drops
+19 % at a 6-token verify batch (55.5 to 45.2 tok/s) and 10 % at 8 (50.0 to 45.1). Single-token decode and batches of 9 or
+more tokens are unchanged. `GGML_HRX_Q4K_PACKED_TAIL=0 GGML_HRX_Q6K_PACKED_ROWS=0` (stored for every weight) brings the old
+rate back, along with the stored copies.
+
 `GGML_HRX_Q6K_PACKED_PREFILL=1`, the older switch, never saved a copy: its dispatch bound the stored layout. Off its kernel's wide
 tile (tokens not a multiple of 256, or outputs not a multiple of 128) it also read past the weight: a Q6_K matmul at 128 tokens with
 the switch on ended in `HRX buffer download failed` and a bus error. Since pin `2b7960bae` the switch only selects that kernel on the

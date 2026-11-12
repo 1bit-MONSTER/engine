@@ -41,6 +41,7 @@ usage: hrx_f16_narrowing.py --check [--root .]     rc 1 on drift, rc 77 without 
        hrx_f16_narrowing.py --write                rewrite the baseline from the corpus
 """
 import argparse
+import hashlib
 import pathlib
 import re
 import sys
@@ -57,6 +58,22 @@ ACC_MUL = re.compile(r"vector\.mulf|template\.apply<@[^>]*wmma[^>]*>|vector\.(fm
 # Measured (engine#2167): at 120 lines past the init, `mul_mat_id_f16_f16_wmma_core`'s four accumulators read as
 # unaffected, because their update sits ~250 lines below in a long Q4_K/Q6 loop body. 250 finds them.
 ACC_WINDOW = 250
+
+
+def corpus_fingerprint(corpus):
+    """sha256 over the corpus: sorted (relative path, bytes), so a moved file changes it too.
+
+    A narrowing count is only comparable to another run if the tree it read is identified. Two
+    checkouts of third_party/llama.cpp at different commits both answer "9 bodies" until one of them
+    does not, and without this the only way to tell is to read the submodule sha by hand.
+    """
+    h = hashlib.sha256()
+    n = 0
+    for f in sorted(corpus.rglob("*.loom")):
+        h.update(str(f.relative_to(corpus)).encode())
+        h.update(hashlib.sha256(f.read_bytes()).digest())
+        n += 1
+    return f"{h.hexdigest()[:16]} ({n} .loom file(s))"
 # The vector form is most of the corpus: `vector.fptrunc %x : vector<4xf32> to vector<4xf16>` contains neither
 # "f32 to f16" nor "truncf", and at llama.cpp 2b7960bae 132 of the 233 narrowing lines are written that way.
 # Matching the scalar spelling alone listed 25 bodies; the corpus has 51 (engine#2204's review). A bare `truncf` is
@@ -132,11 +149,14 @@ def drift(baseline, found):
     return sorted(found - baseline), sorted(baseline - found)
 
 
-def check(root):
-    corpus = root / CORPUS
+def check(root, corpus=None):
+    corpus = pathlib.Path(corpus) if corpus else root / CORPUS
     if not corpus.is_dir() or not any(corpus.rglob("*.loom")):
-        print(f"skip: no .loom corpus at {CORPUS} (check out third_party/llama.cpp)", file=sys.stderr)
+        print(f"skip: no .loom corpus at {corpus} (check out third_party/llama.cpp, or pass --corpus)", file=sys.stderr)
         return 77
+    # Printed before the verdict, not after it: a FAIL is when the identity of the tree matters most.
+    print(f"CORPUS       {corpus.resolve()}")
+    print(f"FINGERPRINT  {corpus_fingerprint(corpus)}")
     base_text = (root / BASELINE).read_text(encoding="utf-8")
     baseline = baseline_paths(base_text)
     found = narrowing_bodies(corpus)
@@ -180,10 +200,10 @@ def check(root):
     return 0
 
 
-def write(root):
-    corpus = root / CORPUS
+def write(root, corpus=None):
+    corpus = pathlib.Path(corpus) if corpus else root / CORPUS
     if not corpus.is_dir():
-        print(f"skip: no .loom corpus at {CORPUS}", file=sys.stderr)
+        print(f"skip: no .loom corpus at {corpus}", file=sys.stderr)
         return 77
     head = "".join(line for line in (root / BASELINE).read_text(encoding="utf-8").splitlines(True)
                    if line.lstrip().startswith("#"))
@@ -280,6 +300,18 @@ def self_test():
             "    %next = vector.mulf %acc, %k : vector<16xf16>\n")
         check_that("far.loom" in accumulator_bodies(accdir), "an update 200 lines below the init is found")
 
+    # The corpus identity: same bytes -> same fingerprint, an edit -> a different one, a move -> a
+    # different one (the relative path is hashed), and the count it reports.
+    with tempfile.TemporaryDirectory() as d:
+        c = pathlib.Path(d)
+        (c / "a.loom").write_text("one\n"); (c / "s").mkdir(); (c / "s" / "b.loom").write_text("two\n")
+        fp = corpus_fingerprint(c)
+        check_that(fp.endswith("(2 .loom file(s))"), "fingerprint: counts the .loom files it read")
+        check_that(fp == corpus_fingerprint(c), "fingerprint: the same corpus twice is the same value")
+        (c / "s" / "b.loom").write_text("two changed\n")
+        check_that(fp != corpus_fingerprint(c), "fingerprint: a one-byte edit changes it")
+        (c / "a.loom").rename(c / "s" / "a.loom")
+        check_that(fp != corpus_fingerprint(c), "fingerprint: a move changes it too (the path is hashed)")
     print(f"hrx_f16_narrowing self-test: {'ok' if not failures else f'{failures} failure(s)'}")
     return 1 if failures else 0
 
@@ -290,14 +322,27 @@ def main():
     ap.add_argument("--write", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--root", default=".")
+    ap.add_argument("--corpus", default=None,
+                    help="the .loom corpus to scan (default: the pinned llama.cpp checkout's kernel-corpus)")
     args = ap.parse_args()
     root = pathlib.Path(args.root).resolve()
+    corpus = pathlib.Path(args.corpus).resolve() if args.corpus else None
     if args.self_test:
         return self_test()
     if args.write:
-        return write(root)
+        # The baseline is a file in the tree it describes, so rewriting it from a corpus that lives
+        # somewhere else records a corpus this checkout does not have -- and the next --check then
+        # reports every one of its own bodies as "in the baseline but no longer narrows". Refused
+        # rather than warned, because the damage is a committed baseline that no longer describes
+        # this tree (found by doing exactly that with a two-line fixture corpus).
+        if corpus is not None and root not in corpus.parents and corpus != root:
+            print(f"hrx_f16_narrowing: refusing --write with --corpus {corpus} outside --root {root}: "
+                  f"the baseline is written into the root and would describe a corpus this tree does not have",
+                  file=sys.stderr)
+            return 2
+        return write(root, corpus)
     if args.check:
-        return check(root)
+        return check(root, corpus)
     ap.print_help()
     return 2
 

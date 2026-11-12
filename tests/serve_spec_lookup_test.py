@@ -263,8 +263,10 @@ def main():
         replies, logs, cases, sampled_replies = {}, {}, [], []
         draft = os.path.join(tmp, "draft")
         write_draft(draft)
-        for name, extra in (("plain", []), ("spec", ["--spec-lookup", "4"]), ("dflash", ["--spec-draft", draft]),
-                            ("sample", ["--spec-lookup", "4", "--spec-sample"])):
+        dump = os.path.join(tmp, "dump")
+        os.makedirs(dump)
+        for name, extra in (("plain", ["--dump-logits", dump]), ("spec", ["--spec-lookup", "4"]),
+                            ("dflash", ["--spec-draft", draft]), ("sample", ["--spec-lookup", "4", "--spec-sample"])):
             port = free_port()
             logp = os.path.join(tmp, name + ".log")
             with open(logp, "w") as log:
@@ -333,6 +335,30 @@ def main():
                 fails += not ok
                 print(f"{'PASS' if ok else 'FAIL'}  {arm}: chat {i} with top_logprobs 3: {len(c[2])} entries equal plain's "
                       f"(worst logprob difference {worst:.2e})" + ("" if ok else f" (plain {a!r}, {arm} {c!r})"))
+        # Plain's logprobs against an independent softmax over the tokenizer's 258 ids, from the rows plain dumped (its
+        # chat requests follow the base ones: step_<len(base) + 1>_* and the next). The arms above hold every speculative server to plain,
+        # so this holds them all; plain against the others cannot see a defect in the helper they share (engine#2272).
+        n_ids = 258
+        for i, a in enumerate(replies["plain_chat"]):
+            ok, worst, shift = len(a[2]) >= 2, 0.0, 0.0
+            for n, (_, lp, top) in enumerate(a[2]):
+                step = os.path.join(dump, f"step_{len(base) + i + 1}_{n}.bin")
+                row = np.fromfile(step, dtype=np.float32).astype(np.float64)
+                ok = ok and row.size == bcs.VOCAB and len(top) == 3   # the row is the head's width: padding in it
+                if not ok:
+                    break
+                ids = row[:n_ids]
+                ls = ids - (ids.max() + np.log(np.exp(ids - ids.max()).sum()))
+                best = sorted(range(n_ids), key=lambda t: (-ids[t], t))[:3]   # greedy's pick, then the tie rule
+                worst = max([worst, abs(lp - ls[best[0]])] + [abs(q - ls[t]) for (_, q), t in zip(top, best)])
+                wide = row[best[0]] - (row.max() + np.log(np.exp(row - row.max()).sum()))
+                shift = max(shift, abs(wide - ls[best[0]]))
+            # shift: what normalising over the head's width would have reported instead; it must be visible here
+            ok = ok and worst <= 1e-4 and shift > 1e-3
+            fails += not ok
+            print(f"{'PASS' if ok else 'FAIL'}  plain: chat {i}: {len(a[2])} logprobs and top_logprobs equal a softmax "
+                  f"over the {n_ids} tokenizer ids of the dumped {bcs.VOCAB}-wide rows (worst {worst:.1e}; the head's "
+                  f"width would shift them by up to {shift:.2e})")
         # The chat requests are each server's first: their [spec] lines lead the log. Accepted drafts must be among them,
         # or the rows that report a kept draft's logprobs were never exercised.
         chat_lines = [l for l in logs["spec"].splitlines() if l.startswith("[spec] lookup ")][:len(chats)]

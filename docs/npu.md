@@ -2590,7 +2590,7 @@ got before.
 | `top_k` | keep the `k` highest logits; `0` or absent keeps all of them |
 | `top_p` | nucleus sampling, `1` or absent keeps all of them (`min_keep` candidates always stay) |
 | `seed` | the same seed and the same request give the same text; absent or `-1` seeds from the clock |
-| `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them |
+| `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them; normalised over the tokenizer's ids only, so a head padded past the vocabulary (Qwen3: 151,936 rows against 151,669 ids) neither shifts them nor puts a padding id in `top_logprobs` (engine#2272) |
 | `top_logprobs` | `0`-`100` alternatives per token, highest raw logit first; needs `logprobs: true` |
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
 | `max_tokens` / `max_completion_tokens` | the reply's cap (`max_completion_tokens` wins); a value that is not a number is a 400 naming the field, and a fractional one is truncated |

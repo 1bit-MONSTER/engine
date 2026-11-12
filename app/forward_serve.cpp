@@ -564,9 +564,12 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             const std::string piece = e.tok->decode(next);
             pending += piece;
             // Raw distribution: sample_token() takes logits by const reference, so this is
-            // pre-top_k/top_p/temperature and the grammar mask cannot narrow it.
+            // pre-top_k/top_p/temperature and the grammar mask cannot narrow it.  Over the tokenizer's ids only, as
+            // sample_token() draws: a row is as wide as the head, which can be wider (Qwen3 151,936 against 151,669,
+            // engine#2272), and the padding would join the normaliser and could be named in top_logprobs.
             if (want_lp)
-                held.emplace_back(Emitted{piece, npu::logprobs_of(row ? row : logits.data(), logits.size(), next,
+                held.emplace_back(Emitted{piece, npu::logprobs_of(row ? row : logits.data(),
+                                                                  npu::token_bound(logits.size(), e.tok->size()), next,
                                                                   opts.sample.top_logprobs)},
                                   piece.size());
             stats.pieces.push_back(piece);   // engine#2111: reasoning_tokens is counted over these

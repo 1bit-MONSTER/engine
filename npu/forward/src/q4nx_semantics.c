@@ -431,7 +431,8 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
     /* LM head: tied to the token embedding (the common case) or a SEPARATE
      * lm_head.weight (Nanbeige4.1-3B sets tie_word_embeddings = false). */
     s->tie_embeddings = 1;
-    if (get_num(json, "tie_word_embeddings", &d)) s->tie_embeddings = d != 0;
+    s->tie_stated = 0;
+    if (get_num(json, "tie_word_embeddings", &d)) { s->tie_embeddings = d != 0; s->tie_stated = 1; }
 
     /* layer_types -> the per-layer attention kind the forward dispatches on */
     {

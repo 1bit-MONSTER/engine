@@ -2227,6 +2227,12 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> qwen2vl)
     set_tests_properties(batch_check_state_qwen2vl PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # The same Qwen2 with tie_word_embeddings removed from the container's config.json, as FastFlowLM's
+    # Qwen3.5-9B-NPU2 ships it: the separate lm_head must still be the head (engine#1786).
+    add_test(NAME batch_check_state_qwen2_untied
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> qwen2_untied)
+    set_tests_properties(batch_check_state_qwen2_untied PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # Hy-Memory (hy_v3, engine#1786): sigmoid routing with a selection bias, router [H][E], a leading dense layer,
     # [N][K] expert slices under FLM names, expert_hidden_dim, against a numpy hy_v3 reference.
     add_test(NAME batch_check_state_hy_v3

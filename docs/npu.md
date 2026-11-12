@@ -2451,6 +2451,17 @@ one request still different is `Me gustaría una taza de café…` here against 
 the same code three requests of the known-answer prompt returned `Paris` three times, and decode was 2.3 to 2.8
 tok/s (32 layers on the per-op route) against FastFlowLM's 50 to 53.
 
+**`Qwen3.5-9B-NPU2`: a head the config does not declare.** This pack's `config.json` has no
+`tie_word_embeddings` key, and the forward read an absent key as "tied", the usual default. So it took the logits
+off the embedding, although the pack ships a separate `lm_head.weight` and the model is untied (upstream states
+`false`). The answer was noise on the host and on the NPU, from weights that all decode correctly. When the key is
+absent and the container holds both tables, the forward now samples 16 rows of each and lets the weights decide.
+A tied head is the embedding's quantised copy (correlation near 1), and an untied one is unrelated. The load says
+which, for example `tie_word_embeddings not stated: lm_head.weight vs the embedding on 16 rows, corr 0.0142 ->
+untied (the separate head is used)`. A stated key is still obeyed. `batch_check_state_qwen2_untied` pins this: the
+Qwen2 container with the key removed must match the numpy reference that uses its `lm_head` (corr 1.0000000). With
+the check disabled it reads corr 0.03 and argmax 6 against 7.
+
 Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
 containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry
 has no kernel set on the box. Of the 57 `*-NPU2` repos with a readable geometry on 2026-11-11, 19 had all four

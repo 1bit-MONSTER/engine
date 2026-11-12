@@ -5185,6 +5185,16 @@ void test_container_roles_moe_and_singular_layer() {
         return pi::container_roles(v);
     };
 
+    // 1a. engine#2277 review: an ATTENTION output gate is not the FFN gate, and this is the arm that says so --
+    // without the `self_attn_gate_proj` rule (main's behaviour) the first of these is filed as `gate_proj` and the
+    // suite stayed green, which is what the review found.
+    {
+        const auto r = roles({"model.layer.0.self_attn.gate_proj.weight", "model.layer.0.mlp.gate_proj.weight"});
+        check(r.role_of.at("model.layer.0.self_attn.gate_proj.weight") == "self_attn_gate_proj",
+              "35b: an attention output gate is not the FFN gate");
+        check(r.role_of.at("model.layer.0.mlp.gate_proj.weight") == "gate_proj", "35b: the FFN gate is still gate_proj");
+        check(r.counts.at("gate_proj") == 1, "35b: the attention gate does not also count as gate_proj");
+    }
     // 1. the eight MoE families, spelled as the container spells them
     {
         const auto r = roles({"model.layer.0.moe_router.weight",

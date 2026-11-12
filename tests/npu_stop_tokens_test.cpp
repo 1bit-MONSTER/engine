@@ -152,6 +152,25 @@ int main() {
                   "a marker the tokenizer does not have as one token adds nothing");
     }
 
+    // engine#1786: the BOS a container's tokenizer_config.json states, for a config.json that states none
+    // (FastFlowLM's Medgemma-4B-NPU2: no bos_token_id, no add_bos_token in config.json).
+    {
+        using onebit::npu::add_bos_token_flag;
+        using onebit::npu::special_token_text;
+        const json med = json::parse(R"({"bos_token": "<bos>", "add_bos_token": true, "eos_token": "<eos>"})");
+        check(special_token_text(med, "bos_token") == "<bos>" && add_bos_token_flag(med) == 1,
+              "Medgemma's tokenizer_config.json: BOS <bos>, added");
+        check(special_token_text(json::parse(R"({"bos_token": {"content": "<s>", "lstrip": false}})"), "bos_token") == "<s>",
+              "bos_token in the object spelling");
+        check(add_bos_token_flag(json::parse(R"({"add_bos_token": false})")) == 0 &&
+                  add_bos_token_flag(json::parse(R"({"add_bos_token": 1})")) == 1,
+              "add_bos_token false and 1");
+        check(add_bos_token_flag(json::parse("{}")) == -1 && add_bos_token_flag(json::parse(R"({"add_bos_token": null})")) == -1 &&
+                  add_bos_token_flag(json(nullptr)) == -1 && special_token_text(json::parse(R"({"bos_token": null})"), "bos_token").empty(),
+              "an absent or null key says nothing");
+        check(onebit::npu::eos_token_text(med) == "<eos>", "eos_token_text is unchanged by the shared reader");
+    }
+
     if (failures == 0) std::printf("all stop-token checks passed\n");
     return failures == 0 ? 0 : 1;
 }

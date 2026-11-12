@@ -1974,11 +1974,20 @@ again, the known-answer prompt answered `*,,,,,,,`; with the plain form it answe
 form, and gemma2 keeps `(1 + w)` (not measured here). `tests/q4nx_gemma3_semantics_test.c` pins each rule with
 Medgemma's own keys.
 
-Not yet a device row: the pack's four shapes are `QKV K2560 N4096`, `O K2048 N2560`, `GU K2560 N20480` and
-`D K10240 N2560`, and `QKV K2560 N4096` is not built in any kernel family on the box (see
-[arch-gaps.md](arch-gaps.md)). Gemma3 layers also take the per-token path for a prefill (like Gemma4), so a
-prefill costs one `step()` per prompt token. Gemma3-270M-NPU2 still fails at load: its tiles are on an unpadded
-K = 640 grid that the decoder does not read yet.
+A prefill runs batched (`step_batch`) with the same three extra norms; only Gemma4 still falls back to one
+`step()` per prompt token. `batch_check_state_test` on the Medgemma pack: batched equals sequential, rel-L1 0.
+
+The serve also needs the BOS. Medgemma's `config.json` states neither `bos_token_id` nor `add_bos_token`, and its
+`tokenizer_config.json` states both (`<bos>`, true), as HF reads them. forward-serve now takes what `config.json`
+does not state from `tokenizer_config.json`. Served without it, the reply to "Explain in three sentences why the sky
+is blue." was "The sky is blue because of the way the light is." With it, the reply is "The sky appears blue due to a
+phenomenon called Rayleigh scattering", the same as the host forward with the BOS.
+
+On the device, with a locally built kernel set of the four shapes (`QKV K2560 N4096`, `O K2048 N2560`,
+`GU K2560 N20480`, `D K10240 N2560`) and their 16-row twins, in one `npu-hold` ticket, the known answer came back
+`Paris` three times, identical. That is not yet a leaderboard row: decode is 0.68 tok/s, and no kernel set for these
+shapes ships. Gemma3-270M-NPU2 still fails at load: its tiles are on an unpadded K = 640 grid that the decoder
+does not read yet.
 
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.

@@ -3936,8 +3936,11 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
     // recurrence), so lin_kd_ no longer disqualifies a model, and attn_output_gate
     // is handled in the attention block below. MLA, per-layer embeddings, Gemma4
     // and shared-KV stacks still fall back.
+    // Gemma3 (extra_layer_norms 2) is Gemma4's sandwich without PLE or KV sharing, so the batched body
+    // below runs it with the three extra norms; Gemma4 itself still falls back.
+    const bool sandwich = gemma4_layer_ && ple_dim_ == 0 && sem_.extra_layer_norms == 2;
     const bool simple_dense =
-        !mla_ && ple_dim_ == 0 && !gemma4_layer_ && kv_self;
+        !mla_ && ple_dim_ == 0 && (!gemma4_layer_ || sandwich) && kv_self;
     if (!simple_dense || getenv("NPU_NO_BATCH")) {
         if (inject_embeds_) {
             err_ = "step_batch_embeds: this model's batched body falls back to per-token step(), which needs "
@@ -4313,14 +4316,23 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
         {
             LhScope _t_res(LH_RES);
             const int nrow = q4nx_pad_n(H);
-            for (int m = 0; m < M; m++)
-                for (int k = 0; k < H; k++)
-                    X[(size_t)m * H + k] += O[(size_t)m * nrow + k] * residual_scale_;
+            if (sandwich) {
+                // as step(): the attention output is normalised (post_attention_layernorm) before the add
+                std::vector<float> on((size_t)H);
+                for (int m = 0; m < M; m++) {
+                    rmsnorm(O.data() + (size_t)m * nrow, post_norm_[l].data(), H, on.data());
+                    for (int k = 0; k < H; k++) X[(size_t)m * H + k] += on[(size_t)k];
+                }
+            } else {
+                for (int m = 0; m < M; m++)
+                    for (int k = 0; k < H; k++)
+                        X[(size_t)m * H + k] += O[(size_t)m * nrow + k] * residual_scale_;
+            }
         }
 
         // ---- MLP ----
         for (int m = 0; m < M; m++)
-            rmsnorm(X.data() + (size_t)m * H, post_norm_[l].data(), H,
+            rmsnorm(X.data() + (size_t)m * H, (sandwich ? pre_ff_norm_ : post_norm_)[l].data(), H,
                     XN.data() + (size_t)m * H);
         if (n_expert_ > 0) {
             // MoE FFN: the router/top-k pick different experts per row, so this
@@ -4409,9 +4421,18 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
         {
             LhScope _t_res(LH_RES);
             const int nrow = q4nx_pad_n(H);   // as above: the design's N, identity when H is on the grid
-            for (int m = 0; m < M; m++)
-                for (int k = 0; k < H; k++)
-                    X[(size_t)m * H + k] += D[(size_t)m * nrow + k] * residual_scale_;
+            if (sandwich) {
+                // post_feedforward_layernorm on the down projection, then the add (as step())
+                std::vector<float> dn((size_t)H);
+                for (int m = 0; m < M; m++) {
+                    rmsnorm(D.data() + (size_t)m * nrow, post_ff_norm_[l].data(), H, dn.data());
+                    for (int k = 0; k < H; k++) X[(size_t)m * H + k] += dn[(size_t)k];
+                }
+            } else {
+                for (int m = 0; m < M; m++)
+                    for (int k = 0; k < H; k++)
+                        X[(size_t)m * H + k] += D[(size_t)m * nrow + k] * residual_scale_;
+            }
         }
 
         // Same post-residual hidden-state dump as step() emits as [L], one row per

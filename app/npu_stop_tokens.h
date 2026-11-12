@@ -58,12 +58,29 @@ inline std::vector<int> eos_token_ids(const nlohmann::json& cfg) {
 
 /// tokenizer_config.json's `eos_token` as text: a plain string, or the AddedToken object form
 /// `{"content": "<|im_end|>", ...}`.  Empty when the key is absent, null or another shape.
-inline std::string eos_token_text(const nlohmann::json& tokenizer_config) {
-    if (!tokenizer_config.is_object() || !tokenizer_config.contains("eos_token")) return {};
-    const nlohmann::json& e = tokenizer_config["eos_token"];
+/// A special token's text from tokenizer_config.json, in either spelling HF writes ("<bos>" or {"content": "<bos>"}).
+inline std::string special_token_text(const nlohmann::json& tokenizer_config, const char* key) {
+    if (!tokenizer_config.is_object() || !tokenizer_config.contains(key)) return {};
+    const nlohmann::json& e = tokenizer_config[key];
     if (e.is_string()) return e.get<std::string>();
     if (e.is_object() && e.contains("content") && e["content"].is_string()) return e["content"].get<std::string>();
     return {};
+}
+
+inline std::string eos_token_text(const nlohmann::json& tokenizer_config) {
+    return special_token_text(tokenizer_config, "eos_token");
+}
+
+/// tokenizer_config.json's add_bos_token: 1 or 0 when it states a boolean (or integer), -1 when it says nothing.
+/// A container's config.json often omits bos_token_id and add_bos_token (FastFlowLM's Medgemma-4B-NPU2 has neither)
+/// while its tokenizer_config.json states both; HF's tokenizer then adds the BOS, and Gemma without it answers
+/// "The sky is blue because of the way the light is" where it should explain Rayleigh scattering (engine#1786).
+inline int add_bos_token_flag(const nlohmann::json& tokenizer_config) {
+    if (!tokenizer_config.is_object() || !tokenizer_config.contains("add_bos_token")) return -1;
+    const nlohmann::json& a = tokenizer_config["add_bos_token"];
+    if (a.is_boolean()) return a.get<bool>() ? 1 : 0;
+    if (a.is_number_integer()) return a.get<int>() != 0 ? 1 : 0;
+    return -1;
 }
 
 /// The marker a chat template closes an assistant turn with, read off the template's own output.  `after` is the

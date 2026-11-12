@@ -105,6 +105,43 @@ inline bool renderer_built() {
 #endif
 }
 
+// The template variables one chat request contributes, besides its messages: `chat_template_kwargs`
+// as sent, the functions the request offers (`tools`), and `enable_thinking`.  `tools` is here because
+// a template is the only place a model is told what it may call: a request whose tools never reach
+// the template is answered in prose (MiniCPM-V 4.7 rendered 25 tokens where its template, given the
+// same request, renders 292 -- engine#1788).  An empty or non-array `tools` is left out, so a
+// template's `{% if tools %}` reads it as "none offered".  `body` is the request as parsed in the
+// caller's key order (see render_chat_template below for why).
+inline nlohmann::ordered_json request_template_vars(const nlohmann::ordered_json& body, bool enable_thinking) {
+    nlohmann::ordered_json extra = nlohmann::ordered_json::object();
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+        extra = body["chat_template_kwargs"];
+    if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) extra["tools"] = body["tools"];
+    extra["enable_thinking"] = enable_thinking;
+    return extra;
+}
+
+// The request's messages as a template expects them.  The OpenAI API spells an earlier call's
+// `function.arguments` as a JSON *string*; a chat template is written against the object (transformers
+// hands it a dict): MiniCPM-V 4.7's walks `tool_call.arguments|items`, which does not exist for a string,
+// and Qwen3's `arguments | tojson` would quote the string a second time.  So a string that parses to a
+// JSON object becomes that object, in the string's own key order; anything else is left as sent.
+inline nlohmann::ordered_json messages_for_template(nlohmann::ordered_json messages) {
+    if (!messages.is_array()) return messages;
+    for (auto& m : messages) {
+        if (!m.is_object() || !m.contains("tool_calls") || !m["tool_calls"].is_array()) continue;
+        for (auto& call : m["tool_calls"]) {
+            if (!call.is_object() || !call.contains("function") || !call["function"].is_object()) continue;
+            auto& fn = call["function"];
+            if (!fn.contains("arguments") || !fn["arguments"].is_string()) continue;
+            nlohmann::ordered_json parsed =
+                nlohmann::ordered_json::parse(fn["arguments"].get<std::string>(), nullptr, /*allow_exceptions=*/false);
+            if (parsed.is_object()) fn["arguments"] = std::move(parsed);
+        }
+    }
+    return messages;
+}
+
 // Render `messages` with the container's template.
 //
 //   messages          the request's messages array, as the OpenAI API spells it

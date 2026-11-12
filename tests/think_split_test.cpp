@@ -39,6 +39,18 @@ int main(){
     check("no think", run(false,{"Par","is"}), "Paris", "");
     check("literal tag after content", run(false,{"use <think> tags"}), "use <think> tags", "");
     check("unfinished think", run(false,{"<think>still going"}), "", "still going");
+
+    // engine#2111: reasoning_tokens on this route, the same rule as npu::reasoning_token_count().
+    auto count = [](const char* name, int got, int want) {
+        const bool ok = got == want; fails += !ok;
+        std::printf("%s %s: reasoning_tokens=%d (want %d)\n", ok ? "PASS" : "FAIL", name, got, want);
+    };
+    count("budget spent in an opened block", onebit::think_reasoning_tokens({"Okay", ",", " the", " user"}, true), 4);
+    count("closed block then answer", onebit::think_reasoning_tokens({"<think>", "\n", "plan", "</think>", "\n\n", "Paris"}, false), 4);
+    count("tag split over tokens", onebit::think_reasoning_tokens({"<th", "ink>", "pl", "an</th", "ink>", "Paris"}, false), 5);
+    count("closing tag and answer in one token", onebit::think_reasoning_tokens({"<think>", "plan", "</think>Paris"}, false), 2);
+    count("no block", onebit::think_reasoning_tokens({"Par", "is"}, false), 0);
+    count("no tokens", onebit::think_reasoning_tokens({}, true), 0);
     return fails;
 }
 

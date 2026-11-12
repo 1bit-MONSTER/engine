@@ -42,12 +42,15 @@ typedef enum {
 
 /* Attention layer kinds, from layer_types.  FULL and SLIDING run the attention block, LINEAR runs the
  * GDN recurrence (lin_kd_/conv_state_); OTHER is anything else, which nothing implements - the forward
- * refuses a container whose layer_types contains one, by name (unknown_layer_type). */
+ * refuses a container whose layer_types contains one, by name (unknown_layer_type).  CONV is LFM3's
+ * spelling of LFM2's gated short convolution ("conv"); the forward runs it only where the container holds
+ * that layer's conv tensors, and refuses a mismatch either way. */
 typedef enum {
     Q4NX_LAYER_FULL = 0,
     Q4NX_LAYER_SLIDING,
     Q4NX_LAYER_LINEAR,
-    Q4NX_LAYER_OTHER
+    Q4NX_LAYER_OTHER,
+    Q4NX_LAYER_CONV
 } Q4nxLayerType;
 
 typedef struct {
@@ -62,8 +65,16 @@ typedef struct {
      * Source: model_type/architectures == qwen3_5*, resolved against the weights. */
     int rmsnorm_offset_probe;
     /* Per-head RMSNorm applied to q and k before RoPE.
-     * Source: presence of self_attn.q_norm.weight / k_norm.weight. */
+     * Source: config.json's `use_qk_norm` when the config states it (engine#1889: Hunyuan), else the
+     * model_type/architectures table (qwen3*, gemma*). The forward refuses a model whose flag is set and whose
+     * layers carry no self_attn.q_norm.weight, since normalising with an absent gain zeroes q. */
     int qk_norm;
+    /* The q/k RMSNorm runs AFTER RoPE instead of before it (engine#1889). Qwen3 and Gemma normalise, then rotate;
+     * Hunyuan rotates, then normalises. With a per-dimension gain the two orders differ wherever a rotary pair's two
+     * gains differ, so the order is part of the model. Source: model_type/architectures (hunyuan*) -- no config key
+     * states it; the evidence is the pack's own graph, where every layer is
+     * q_proj -> RotaryEmbedding -> q_norm (SimplifiedLayerNormalization) -> GroupQueryAttention. */
+    int qk_norm_after_rope;
     /* RoPE base.  Source: rope_theta. */
     float rope_theta;
     /* Channels actually rotated; 0 means the full head_dim.  Partial rotary
@@ -75,6 +86,10 @@ typedef struct {
     /* Linear biases on q/k/v/o and on the MLP projections.
      * Source: attention_bias / mlp_bias (presence of corresponding tensors). */
     int attention_bias;
+    /* 1 when config.json states attention_bias (true or false); 0 when the key is absent, which is Qwen2's case:
+     * its configs never state it and every layer carries q/k/v biases.  q4nx_semantics_attention_bias_from_tensors
+     * decides the absent case from the container. */
+    int attention_bias_stated;
     int mlp_bias;
     /* Multiplier applied to token embeddings before layer 0.
      * Source: model_type (gemma* uses sqrt(hidden_size)); else 1.0. */
@@ -101,6 +116,11 @@ typedef struct {
      * guess a layout for. */
     int mrope_section[3];
     int n_mrope_section;
+    /* Qwen2-VL / Qwen2.5-VL spell MRoPE as rope_scaling {"type": "mrope", "mrope_section": [16, 24, 24]}, and their
+     * sections are CONTIGUOUS runs of frequencies (transformers apply_multimodal_rotary_pos_emb: cos split by
+     * mrope_section * 2, chunk i taking plane i % 3), not Qwen3-VL's interleave.  1 for that form (mrope is 1 too).
+     * Source: rope_scaling.type / rope_type == "mrope". */
+    int mrope_sectioned;
     /* DEEPSTACK: which decoder layers take one of the vision tower's extra feature sets.  Read from
      * vision_config.deepstack_visual_indexes (Qwen3-VL: [5, 11, 17]); the consumer adds set s to the hidden state at
      * layer deepstack_layers[s].  Empty means the pack has none. */
@@ -144,8 +164,22 @@ typedef struct {
      * Source: num_kv_shared_layers. */
     int num_kv_shared_layers;
     /* Gemma4 adds pre/post feedforward norms and a post-PLE norm that the plain
-     * layer does not have.  Source: presence of those tensors / model_type. */
+     * layer does not have (1).  Gemma3 has the same sandwich around attention and
+     * MLP but no post-PLE norm and no layer scalar (2).  LFM3's use_sandwich_norm is the same pair of norms
+     * around both blocks (post_operator_norm, post_ffn_norm), so it is 2 as well.  Source: model_type, and
+     * use_sandwich_norm for lfm3 (default true, as configuration_lfm3.py). */
     int extra_layer_norms;
+    /* LFM3: every attention layer carries self_attn.gate_proj [heads, hidden] (bf16), and each head's
+     * context is multiplied by sigmoid(gate_proj . x) before o_proj, x being the operator-normed input.
+     * Source: model_type. */
+    int attn_head_gate;
+    /* Gemma3 states the sliding layers' RoPE base on its own, as
+     * `rope_local_base_freq`, and its `rope_scaling` applies to the full layers
+     * only.  1 when that key was read into rope_theta_sliding. */
+    int rope_local_base;
+    /* Gemma2/3: attention scores are scaled by 1/sqrt(query_pre_attn_scalar)
+     * instead of 1/sqrt(head_dim).  0 when absent.  Source: query_pre_attn_scalar. */
+    float query_pre_attn_scalar;
     /* Gemma4 use_double_wide_mlp: KV-shared layers run a 2*IM-wide MLP.
      * Source: use_double_wide_mlp. */
     int double_wide_mlp;
@@ -156,6 +190,13 @@ typedef struct {
      * both.  Sources: global_head_dim, num_global_key_value_heads. */
     int global_head_dim;
     int num_global_kv_heads;
+    /* Gemma4 attention_k_eq_v (Gemma4-12B-IT): a layer with no v_proj takes its values from the k projection, before
+     * k_norm (our llama.cpp fork's gemma4.cpp: `Vcur = wv ? wv x : Kcur`, then v's scale-free RMSNorm).  Source:
+     * attention_k_eq_v. */
+    int attention_k_eq_v;
+    /* GPT-OSS (model_type gpt_oss): attention sinks, an o_proj bias, and a top-k-of-E MoE of MXFP4 experts with
+     * biases and a clamped SwiGLU, run by Q4nxNpuForward::gptoss_moe.  Source: model_type. */
+    int gpt_oss;
     /* Gemma4 sets attention scaling to 1.0 (q/k carry a per-head RMSNorm),
      * normalises v with a SCALE-FREE RMSNorm, and uses "proportional" RoPE on
      * its full layers.  Sources: model_type/architectures, rope_type. */
@@ -227,6 +268,15 @@ static inline int q4nx_mrope_axis(int freq, int n_section, const int* section) {
     return 0;
 }
 
+/* The same question for the CONTIGUOUS layout (mrope_sectioned, Qwen2-VL / Qwen2.5-VL): frequencies
+ * [0, s0) are t, [s0, s0 + s1) are h, and [s0 + s1, s0 + s1 + s2) are w.  For [16, 24, 24]: 16 t, 24 h, 24 w. */
+static inline int q4nx_mrope_axis_sectioned(int freq, int n_section, const int* section) {
+    if (n_section < 3 || !section) return 0;
+    if (freq < section[0]) return 0;
+    if (freq < section[0] + section[1]) return 1;
+    return 2;
+}
+
 /* Human-readable one-line dump of every flag with its source field. */
 void q4nx_semantics_dump(const Q4nxSemantics* s);
 
@@ -242,6 +292,31 @@ int q4nx_semantics_uses_ple(const Q4nxSemantics* s);
  * carries negatives and a mean well below 1), a plain one stores gains around 1. Returns 1 for the
  * (1 + w) form, 0 for the plain w form. Exported so the rule is testable with no model present. */
 int q4nx_rmsnorm_offset_from_norm(const float* w, int n);
+
+/* Per-head q/k RMSNorm, decided by the container when config.json's name does not decide it (engine#1788).
+ * q4nx_semantics_from_config() turns qk_norm on for the families its table knows by model_type (qwen3*, gemma*). A
+ * pack of the same architecture under another name -- FastFlowLM's MiniCPM-V 4.7 is `minicpmv4_7` around a qwen3_5
+ * text model -- came out as "no q/k norm" while shipping self_attn.q_norm and k_norm in every full-attention layer;
+ * those layers then ran without the norm, and the model answered short prompts and drifted on long ones.
+ * `has_q[l]` / `has_k[l]` say whether layer l carries a non-empty q_norm / k_norm tensor. A layer carrying BOTH is the
+ * container saying it has the norm: qk_norm becomes 1 and that layer's index is returned. Returns -1, changing
+ * nothing, when qk_norm is already on, when no layer carries both, or on null/empty input. It never turns the norm
+ * off: a family the table knows keeps its answer whatever the tensors are. Exported so the rule is testable. */
+int q4nx_semantics_qk_norm_from_tensors(Q4nxSemantics* s, const unsigned char* has_q, const unsigned char* has_k, int layers);
+/* engine#1786: config.json did not state attention_bias and a layer carries a q, k or v projection bias -> the
+ * biases are applied (attention_bias = 1); returns that layer, else -1.  A config that states attention_bias=false
+ * while the container carries biases is a disagreement the caller refuses: returns -2. */
+int q4nx_semantics_attention_bias_from_tensors(Q4nxSemantics* s, const unsigned char* has_bias, int layers);
+
+/* engine#1889's refusal, as a rule: with q/k norm on, a layer whose q gain is absent would normalise q to zero, so the
+ * container is refused. That is a statement about layers with SOFTMAX ATTENTION. A layer of another kind carries no
+ * q_norm because it has no q to normalise: ten of LFM2's sixteen layers are gated short convolutions, and 18 of
+ * Qwen3.5-2B's 24 are linear-attention (GDN) layers, layer 0 in both. Applied to every layer the rule refused every
+ * LFM2 pack and every qwen3_5 hybrid at load with "layer 0 has no self_attn.q_norm.weight".
+ * Returns 1 when layer l must be refused. Exported so the rule is testable with no model present. */
+static inline int q4nx_qk_gain_missing(int qk_norm, int layer_has_softmax_attention, int q_gain_present) {
+    return qk_norm && layer_has_softmax_attention && !q_gain_present;
+}
 
 /* attention.mode for one container, from the two places that can state it (engine#796).
 

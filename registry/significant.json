@@ -167,6 +167,26 @@
    "model_type": "nanogpt-custom",
    "family": "nanoGPT-style one-offs (first seen: learner-subodh/Delivery-Rider-Assistant-SLM). 'GPT' is the class name nanoGPT's model.py exports, so this key covers any upload that saves nanoGPT's own state dict. Not an alias of GPT2LMHeadModel: the config uses nanoGPT's keys (n_embd 384, n_layer 6, n_head 8, block_size 256, bias, dropout) rather than GPT2Config's n_positions/n_ctx, the repo carries only a pickled pytorch_model.bin (no safetensors, no tokenizer files; the card names tiktoken gpt2), and nanoGPT stores nn.Linear weights where GPT-2's checkpoint stores Conv1D (transposed), so the gpt2 converter would read every projection the wrong way round. Nothing at the pin registers the class. Declined on 2026-11-09 under engine #1667; the census reports it as . REVIEWED. Remove this entry if a backend gains a nanoGPT import.",
    "watch": "report"
+  },
+  "DeepseekV4FlashSuperExpertForCausalLM": {
+   "model_type": "deepseek_v4_flash_superexpert",
+   "family": "DeepSeek V4.1 Flash SuperExpert, published as remote code and with AW-SECD-compressed weights (8.5 GB, claimed 0.962 retention); MLA-style geometry (kv_lora_rank 512, q_lora_rank 1536, qk_rope_head_dim 64, v_head_dim 128, 32 heads / 16 KV, IM 4096). Not an alias of deepseek_v41: nothing at the pin decodes AW-SECD weights, so mapping it would name a backend that cannot read it",
+   "watch": "report"
+  },
+  "OpensciForCausalLM": {
+   "model_type": "opensci",
+   "family": "OpenSci (1.7B 'nemotron-hq' recipe). A REMOTE-CODE class: its config carries an auto_map pointing at modeling_opensci.py / configuration_opensci.py, so the pinned backends cannot accept the architecture without that custom code. Not an alias of any supported family, and not mappable until the code is vendored or upstreamed.",
+   "watch": "report"
+  },
+  "BagelForConditionalGeneration": {
+   "model_type": "bagel",
+   "family": "BAGEL-style unified understand+generate model (first seen: benson123dc/tmp-4461ae1a1900, 4 models in the 2026-11-12 census). Composite config: llm_config Qwen2 (hidden 3584, 28 layers, 28 heads / 4 KV) with qk_norm, a SigLIP vit_config (27 layers, patch 14) and a VAE latent path (visual_gen true). Every LLM layer carries a second Mixture-of-Transformers copy (*_moe_gen q/k/v/o, MLP and norms) for the image-generation tokens. Not an alias of Qwen2ForCausalLM: the qwen2 graph has no q_norm/k_norm and no _moe_gen weights, so even an understanding-only text path needs its own converter.",
+   "watch": "report"
+  },
+  "OleanderForCausalLM": {
+   "model_type": "oleander",
+   "family": "Oleander-150M, a from-scratch training export (first seen: CyanMonkey/Test-Subject-3; its own config says step 2000 of 28820, 6.94 %). Hybrid 28 layers in a gdn2,gdn2,gdn2,gqa pattern, hidden 576, vocab 32770, F32. Ships no modelling code and no auto_map. Not an alias of the Qwen3.5 / Qwen3-Next linear-attention families despite the same layer_types: gdn2 layers carry per-q/k/v conv1d and low-rank f/g gate projections, every sublayer has attention-residual mixers (attn_res_*), and GQA layers a fused qg_proj and a value-residual v_mix; no pinned graph has those tensors.",
+   "watch": "report"
   }
  }
 }

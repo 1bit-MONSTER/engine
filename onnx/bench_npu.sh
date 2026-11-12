@@ -45,6 +45,10 @@
 #   PORT               serve port                                              (default 52625)
 set -uo pipefail
 
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- several of these ranges
+# had drifted past the end of their header and printed code to whoever asked for help (the same defect engine PR #2258 fixed in scripts/).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
 BIN="${ONEBIT_BIN:-$HOME/src/engine-laya-npu/build-npu/1bit}"
 MODEL="${ONEBIT_MODEL:-$HOME/.config/flm/models/Qwen3-0.6B-NPU2}"
 KERNELS="${ONEBIT_DX_KERNELS:-}"
@@ -60,7 +64,7 @@ while [ $# -gt 0 ]; do
         --kernels) KERNELS="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
         --lens|--gen|-w|--warmup|-r|--repeat|--mode|--endpoint) BENCH_ARGS+=("$1" "$2"); shift 2 ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
         *) echo "bench_npu.sh: unknown option $1" >&2; exit 2 ;;
     esac
 done

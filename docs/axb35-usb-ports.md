@@ -70,6 +70,51 @@ addressing something a newer kernel had already fixed. Forcing `power/control=on
 them `D3cold → D0` and their root hubs' ports appear in `/sys/bus/usb/devices`; `--revert` puts them back. So the mechanism works
 on this kernel; what has not happened is the plug.
 
+## The two halves of this issue have different fixes, and the rule covers one
+
+Measured on the board 2026-11-10, BIOS 1.10, a dev boot with the rule not installed:
+
+```
+0000:c5:00.4  0x1587  xhci_hcd     D3cold   <- rule matches
+0000:c7:00.0  0x1588  xhci_hcd     D0       <- rule matches
+0000:c7:00.3  0x1589  xhci_hcd     D3cold   <- rule matches
+0000:c7:00.4  0x158b  xhci_hcd     D3cold   <- rule matches
+0000:c7:00.5  0x158d  thunderbolt  D3cold   <- the rule does NOT match this
+0000:c7:00.6  0x158e  thunderbolt  D3cold   <- the rule does NOT match this
+```
+
+The **rear USB-A** ports hang off the four xHCI functions the rule matches. The **Type-C** ports hang off the two USB4 host routers
+(`0x158d`/`0x158e`), which the rule's device list does not contain, and which are in `D3cold` with the `thunderbolt` driver bound and
+four live IRQs. So:
+
+| half of engine#823 | what has to be awake | does the shipped rule cover it |
+|---|---|---|
+| rear USB-A | one of `0x1587/0x1588/0x1589/0x158b` | **yes** |
+| Type-C | `0x158d`/`0x158e` (USB4 host routers) | **no** |
+
+**A suspended USB4 host router with no partner attached is normal**, so this is not evidence that the routers are broken - it is evidence
+that **one plug test cannot test both halves**: a plug into a rear USB-A exercises the rule, a plug into Type-C exercises a path no change
+in this repository has touched. Record the router ids with the capture (`tools/xhci_boot_capture.sh` already records `power_state` per
+controller; the two `thunderbolt` functions are worth reading the same way) so a "Type-C still dead" result is read as "the router half is
+untested" rather than "the keepawake fix failed".
+
+## Two things a 2026-11-10 audit added, both read-only (sysfs and source; no root, no plug)
+
+`engine#823`'s thread carried the audit in full; the two facts that move the next attempt:
+
+- **`ec_su_axb35` carries no USB control, in source.** The driver binds on this box (`refcount 0`) and its register map is fans only
+  (`0x20/0x21/0x23/0x25` modes, `0x30/0x31/0x35…` tachometers). So "the EC path is not exposed to Linux" is narrower than it reads: the EC
+  driver exists, and nothing in it addresses a Type-C or port-power register. A software fix is therefore not a matter of loading the right
+  module, and a search for an EC-side switcher should start from `0x38` upwards, where nothing is known.
+- **One silent controller had a stale resume in that boot**: `0000:c5:00.4` read `runtime_status=resuming` with `power_state=D3cold` while the
+  other three xHCI functions were `active`/`D0`. A controller whose resume never completed cannot report a connect on its ports, so when a plug
+  test is next run, read `runtime_status` as well as `power_state` — a `resuming` that persists is a different fault from an autosuspended
+  controller, and the keep-awake write may be landing during a transition that never settles.
+
+Also worth knowing for the same next attempt: the three silent controllers have taken **exactly 0 interrupts** since boot while the awake one has
+taken **155,139**, and both USB4 host routers are up (`gen=4`, `authorized=1`, ~1.6k interrupts each) with no trained downstream link — so the
+USB4 side is alive at PCI level and the missing thing is below it.
+
 ## What is still owed
 
 One device into a rear USB-A or a Type-C port **on a 1bit-OS boot**, checked with `--require-awake` first. If a port is then still

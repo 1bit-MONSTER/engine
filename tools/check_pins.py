@@ -38,7 +38,12 @@ HRX_VALIDATED_PIN = "config/hrx-long-prompt-validated-pin.config"
 
 
 def git(*args):
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
+    r = subprocess.run(["git", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        # check=True turned a typo in the base ref into an uncaught CalledProcessError traceback.
+        # A one-line message and a non-zero exit is what a command-line check should do.
+        raise SystemExit(f"check_pins: `git {' '.join(args)}` failed: {r.stderr.strip().splitlines()[-1] if r.stderr.strip() else r.returncode}")
+    return r.stdout
 
 
 def hrx_validation_error(path, new, validated):
@@ -63,8 +68,16 @@ def compare(repo, old, new):
 
 
 def main():
+    # `--help` used to pass `len(sys.argv) == 2`, so it became a base ref, `git diff` returned nothing
+    # and the tool exited 0 having printed nothing: a check that answered a request for help with a
+    # silent success. It is the worst shape of the three found in this family -- a crash at least says
+    # it broke, and this says "all fine".
+    if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return 0
     if len(sys.argv) != 2:
-        sys.exit(__doc__)
+        print(__doc__, file=sys.stderr)
+        return 2
     base = sys.argv[1]
     cfg = git("config", "-f", ".gitmodules", "--get-regexp", r"submodule\..*\.(path|url)")
     subs = {}

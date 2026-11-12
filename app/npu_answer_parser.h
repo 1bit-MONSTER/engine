@@ -28,7 +28,8 @@
 //
 // Families: Qwen3's markup -- `<think>…</think>` for reasoning and
 // `<tool_call>{"name": …, "arguments": {…}}</tool_call>` for calls, which is what this route's ChatML
-// models emit -- and Gemma 4's (`<|channel>thought…<channel|>`, `<|tool_call>call:f{…}<tool_call|>`).
+// models emit -- Gemma 4's (`<|channel>thought…<channel|>`, `<|tool_call>call:f{…}<tool_call|>`) and GPT-OSS's
+// harmony (`<|channel|>analysis<|message|>…<|end|>`, `to=functions.f…<|message|>{…}<|call|>`).
 // answer_family_of_template() picks one from the container's own chat template.  AnswerFamily exists so
 // LFM2 can be added without another signature change.
 #pragma once
@@ -53,6 +54,12 @@ enum class AnswerFamily {
     // A call body is `call:NAME{key:value,...}` with string values escaped as <|"|>v<|"|> -- NOT JSON, which is
     // why a JSON-only reader fails on it (the vendor's response_schema ships the same two regexes this follows).
     gemma4,
+    // GPT-OSS's harmony format (engine#1786): the reply is a run of messages, each `<|channel|>NAME<|message|>TEXT`
+    // ended by <|end|>, the next headed by `<|start|>assistant`. The analysis channel is reasoning, final is content,
+    // and a call is `to=functions.NAME<|channel|>commentary json<|message|>ARGS<|call|>` (the template's own order;
+    // the model may also write `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>`). Measured on
+    // FastFlowLM's GPT-OSS-20B-NPU2: parsed as qwen3, every reply came back with the raw headers in content.
+    harmony,
 };
 
 // One tool call, in OpenAI's shape: function.arguments is a JSON *string*, so the parsed object is
@@ -83,6 +90,7 @@ inline const char* family_name(AnswerFamily f) {
     switch (f) {
         case AnswerFamily::qwen3: return "qwen3";
         case AnswerFamily::gemma4: return "gemma4";
+        case AnswerFamily::harmony: return "harmony";
     }
     return "?";
 }
@@ -103,14 +111,29 @@ inline FamilyTags tags_of(AnswerFamily f) {
             // The reasoning channel opens with <|channel> immediately followed by the literal word `thought`; the
             // template emits exactly `<|channel>thought\n…\n<channel|>`, so the pair is the tag.
             return FamilyTags{"<|channel>thought", "<channel|>", "<|tool_call>", "<tool_call|>"};
+        case AnswerFamily::harmony:
+            // <|end|> closes any message; after the analysis one that is the end of the reasoning. The call opens at
+            // the recipient (`to=functions.`), which both header orders contain, and closes at <|call|>.
+            return FamilyTags{"<|channel|>analysis<|message|>", "<|end|>", "to=functions.", "<|call|>"};
     }
     throw std::runtime_error(std::string("answer parser: unsupported family ") + family_name(f));
 }
 
+// Header markup that is neither reasoning, content nor a call: dropped where it appears outside a call body. Only
+// harmony has any -- the next message's `<|start|>assistant`, the final channel's header (whose text is content),
+// a commentary preamble's header, and the stop token should a detokenizer render it.
+inline std::vector<const char*> drop_tags_of(AnswerFamily f) {
+    if (f == AnswerFamily::harmony)
+        return {"<|start|>assistant", "<|channel|>final<|message|>", "<|channel|>commentary", "<|message|>",
+                "<|return|>"};
+    return {};
+}
+
 // How many trailing bytes of `buf` could still become a tag: the longest suffix that is a proper
 // prefix of one of the family's tags.  Those are held back until the next chunk decides them.
-inline size_t holdback(const std::string& buf, const FamilyTags& t) {
-    const char* tags[4] = {t.think_open, t.think_close, t.call_open, t.call_close};
+inline size_t holdback(const std::string& buf, const FamilyTags& t, const std::vector<const char*>& drops = {}) {
+    std::vector<const char*> tags = {t.think_open, t.think_close, t.call_open, t.call_close};
+    tags.insert(tags.end(), drops.begin(), drops.end());
     size_t hold = 0;
     for (const char* tag : tags) {
         const size_t n = std::string(tag).size();
@@ -119,6 +142,13 @@ inline size_t holdback(const std::string& buf, const FamilyTags& t) {
                 hold = std::max(hold, len);
                 break;
             }
+    }
+    // A whole tag that ends the buffer and reaches back past the held tail is that tag, not the start of another:
+    // `<|start|>assistant` ends in the `t` that opens `to=functions.`, and holding the `t` back split the tag, so
+    // neither half matched and the header went out as text (byte-at-a-time stream, harmony).
+    for (const char* tag : tags) {
+        const size_t n = std::char_traits<char>::length(tag);
+        if (n > hold && buf.size() >= n && buf.compare(buf.size() - n, n, tag) == 0) return 0;
     }
     return hold;
 }
@@ -131,6 +161,9 @@ inline size_t holdback(const std::string& buf, const FamilyTags& t) {
 // `<tool_call>` and neither of those.  No template, or one with neither marker, is qwen3 -- what every
 // container was parsed as before this function existed.
 inline AnswerFamily answer_family_of_template(const std::string& template_text) {
+    // GPT-OSS's template writes `<|channel|>analysis<|message|>` for a past turn's thinking (openai/gpt-oss-20b and
+    // FastFlowLM's GPT-OSS-20B-NPU2: five each); no other family's template carries `<|channel|>`.
+    if (template_text.find("<|channel|>analysis<|message|>") != std::string::npos) return AnswerFamily::harmony;
     const answer_detail::FamilyTags g = answer_detail::tags_of(AnswerFamily::gemma4);
     if (template_text.find(g.call_open) != std::string::npos ||
         template_text.find(g.think_open) != std::string::npos)
@@ -142,12 +175,16 @@ inline AnswerFamily answer_family_of_template(const std::string& template_text) 
 // (is_reasoning, text) pieces; finish() flushes what the holdback still held and reports the calls.
 class AnswerStream {
 public:
-    AnswerStream(AnswerFamily family, bool tools_sent)
-        : fam_(family), tags_(answer_detail::tags_of(family)), tools_sent_(tools_sent) {}
+    // `starts_in_reasoning`: the PROMPT already opened the reasoning block (prompt_opens_reasoning below), so the
+    // answer begins inside it and the first thing to look for is the closing tag.
+    AnswerStream(AnswerFamily family, bool tools_sent, bool starts_in_reasoning = false)
+        : fam_(family), tags_(answer_detail::tags_of(family)), drops_(answer_detail::drop_tags_of(family)),
+          tools_sent_(tools_sent),
+          mode_(starts_in_reasoning ? Mode::reasoning : Mode::content) {}
 
     void feed(const std::string& chunk, std::vector<std::pair<bool, std::string>>& out) {
         buf_ += chunk;
-        const size_t hold = answer_detail::holdback(buf_, tags_);
+        const size_t hold = answer_detail::holdback(buf_, tags_, drops_);
         const std::string safe = buf_.substr(0, buf_.size() - hold);
         buf_.erase(0, buf_.size() - hold);
         scan(safe, out);
@@ -169,6 +206,9 @@ public:
     // The calls seen so far, in order.  A call needs tools_sent, per the issue's rule.
     const std::vector<ToolCall>& calls() const { return calls_; }
     bool saw_reasoning() const { return saw_reasoning_; }
+    // Inside a reasoning block right now (after the opening tag, before the closing one). reasoning_token_count()
+    // reads it before and after each token, so the tags themselves and held-back partial tags count with the block.
+    bool in_reasoning() const { return mode_ == Mode::reasoning; }
     bool saw_text() const { return saw_text_; }
 
     const std::string& reasoning() const { return reasoning_; }
@@ -177,8 +217,22 @@ public:
 private:
     enum class Mode { content, reasoning, call };
 
-    void emit(std::vector<std::pair<bool, std::string>>& out, bool is_reasoning, const std::string& text) {
-        if (text.empty()) return;
+    // Whitespace around a reasoning block is the model's layout, not part of either text: `<think>\n...\n</think>\n\n`
+    // then the answer.  Left in, the answer to "one word" comes back as "\n\nParis", and a model that thinks nothing
+    // (`<think>\n\n</think>`) sends a reasoning chunk that is two newlines.  So the whitespace that LEADS the reasoning
+    // is dropped, and so is the whitespace that leads the content when that content follows a reasoning block --
+    // the rule app/think_split.h has always applied on the in-process route ("whitespace around the block is
+    // dropped"), so the two routes return the same strings.  Content with no reasoning before it is not touched.
+    void emit(std::vector<std::pair<bool, std::string>>& out, bool is_reasoning, const std::string& raw) {
+        if (raw.empty()) return;
+        std::string text = raw;
+        bool& trim = is_reasoning ? trim_reasoning_ : trim_content_;
+        if (trim) {
+            const size_t b = text.find_first_not_of(" \t\r\n");
+            if (b == std::string::npos) return;   // all whitespace so far: nothing to send yet
+            text.erase(0, b);
+            trim = false;
+        }
         if (is_reasoning) {
             reasoning_ += text;
             saw_reasoning_ = true;
@@ -202,7 +256,8 @@ private:
             plain.clear();
         };
         while (i < safe.size()) {
-            if (safe[i] == '<') {
+            // Every tag opens with '<' except harmony's recipient, `to=functions.`, so its own first byte is tested too.
+            if (safe[i] == '<' || safe[i] == tags_.call_open[0]) {
                 // Compared at the tag's own length, never through a fixed window: this read `safe.substr(i, 16)`
                 // once, and gemma4's thinking tag `<|channel>thought` is 17 bytes, so it could never match -- every
                 // tag as long as the window read as text (engine#1779). No width is left here to outgrow.
@@ -218,6 +273,8 @@ private:
                 }
                 if (starts(tags_.think_close)) {
                     flush_plain();
+                    // what follows a block is separated from it by layout whitespace -- unless content came first
+                    if (mode_ == Mode::reasoning && !saw_text_) trim_content_ = true;
                     mode_ = Mode::content;
                     i += std::string(tags_.think_close).size();
                     continue;
@@ -239,6 +296,23 @@ private:
                     i += std::string(tags_.call_close).size();
                     continue;
                 }
+                if (mode_ != Mode::call) {
+                    bool dropped = false;
+                    for (const char* d : drops_)
+                        if (starts(d)) {
+                            flush_plain();
+                            // The final channel follows the reasoning without an <|end|> when the model skips one:
+                            // its header ends the reasoning all the same.
+                            if (mode_ == Mode::reasoning) {
+                                if (!saw_text_) trim_content_ = true;
+                                mode_ = Mode::content;
+                            }
+                            i += std::char_traits<char>::length(d);
+                            dropped = true;
+                            break;
+                        }
+                    if (dropped) continue;
+                }
             }
             plain += safe[i++];
         }
@@ -247,6 +321,18 @@ private:
 
     void close_call(std::vector<std::pair<bool, std::string>>& out) {
         if (fam_ == AnswerFamily::gemma4 && close_gemma_call()) {
+            call_text_.clear();
+            mode_ = Mode::content;
+            return;
+        }
+        if (fam_ == AnswerFamily::harmony) {
+            if (!close_harmony_call())
+                emit(out, false, std::string(tags_.call_open) + call_text_ + tags_.call_close);
+            call_text_.clear();
+            mode_ = Mode::content;
+            return;
+        }
+        if (fam_ == AnswerFamily::qwen3 && close_function_call()) {
             call_text_.clear();
             mode_ = Mode::content;
             return;
@@ -345,6 +431,84 @@ private:
         return out;
     }
 
+    // The second call form a <tool_call> block carries (Qwen3.5's template, and MiniCPM-V 4.7's, teach it):
+    //     <function=NAME>
+    //     <parameter=KEY>
+    //     VALUE
+    //     </parameter>
+    //     </function>
+    // The template writes a string argument bare and everything else through `tojson`, so a value is read back
+    // the same way: an object, an array, a number, true/false/null are JSON; anything else is the string itself,
+    // less the one newline the form puts on each side.  False on any other shape (the caller then tries the JSON
+    // form and, failing that, puts the markup back into content).
+    // shortcut: without the request's schema a string argument whose text is a JSON literal ("17", "true") comes
+    // back as that literal; type by the tool's parameter schema here if a caller needs it kept a string.
+    // `NAME<|channel|>commentary json<|message|>ARGS` or `NAME <|constrain|>json<|message|>ARGS` (what follows
+    // `to=functions.`): the name runs to the first space or `<`, the arguments are the JSON after the last
+    // <|message|>. False on anything else, and the caller puts the markup back into content.
+    bool close_harmony_call() {
+        static const std::string msg = "<|message|>";
+        const size_t end = call_text_.find_first_of(" <");
+        const size_t m = call_text_.rfind(msg);
+        if (end == 0 || end == std::string::npos || m == std::string::npos || m < end) return false;
+        const std::string name = call_text_.substr(0, end);
+        for (const char c : name)
+            if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '.')) return false;
+        try {
+            const nlohmann::json j = nlohmann::json::parse(call_text_.substr(m + msg.size()));
+            if (!j.is_object()) return false;
+            ToolCall c;
+            c.id = "call_" + std::to_string(calls_.size());
+            c.name = name;
+            c.arguments = j.dump();
+            calls_.push_back(std::move(c));
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+
+    bool close_function_call() {
+        const std::string body = answer_detail::trim(call_text_);
+        static const std::string fopen_ = "<function=", fclose_ = "</function>", popen_ = "<parameter=", pclose_ = "</parameter>";
+        if (body.compare(0, fopen_.size(), fopen_) != 0) return false;
+        if (body.size() < fclose_.size() || body.compare(body.size() - fclose_.size(), fclose_.size(), fclose_) != 0) return false;
+        const size_t name_end = body.find('>', fopen_.size());
+        if (name_end == std::string::npos) return false;
+        ToolCall c;
+        c.id = "call_" + std::to_string(calls_.size());
+        c.name = answer_detail::trim(body.substr(fopen_.size(), name_end - fopen_.size()));
+        if (c.name.empty() || c.name.find('<') != std::string::npos) return false;
+        nlohmann::ordered_json args = nlohmann::ordered_json::object();
+        size_t i = name_end + 1;
+        const size_t end = body.size() - fclose_.size();
+        auto space = [&] { while (i < end && (body[i] == ' ' || body[i] == '\n' || body[i] == '\r' || body[i] == '\t')) ++i; };
+        for (space(); i < end; space()) {
+            if (body.compare(i, popen_.size(), popen_) != 0) return false;
+            const size_t key_end = body.find('>', i + popen_.size());
+            if (key_end == std::string::npos || key_end >= end) return false;
+            const std::string key = answer_detail::trim(body.substr(i + popen_.size(), key_end - i - popen_.size()));
+            const size_t close = body.find(pclose_, key_end + 1);
+            if (key.empty() || close == std::string::npos || close > end) return false;
+            std::string value = body.substr(key_end + 1, close - key_end - 1);
+            if (!value.empty() && value.front() == '\n') value.erase(0, 1);
+            if (!value.empty() && value.back() == '\n') value.pop_back();
+            const std::string t = answer_detail::trim(value);
+            nlohmann::ordered_json v = value;
+            const bool literal = !t.empty() && (t[0] == '{' || t[0] == '[' || t[0] == '-' || std::isdigit((unsigned char)t[0]) ||
+                                                t == "true" || t == "false" || t == "null");
+            if (literal) {
+                const nlohmann::ordered_json parsed = nlohmann::ordered_json::parse(t, nullptr, /*allow_exceptions=*/false);
+                if (!parsed.is_discarded() && !parsed.is_string()) v = parsed;
+            }
+            args[key] = std::move(v);
+            i = close + pclose_.size();
+        }
+        c.arguments = args.dump();
+        calls_.push_back(std::move(c));
+        return true;
+    }
+
     bool close_gemma_call() {
         const std::string body = answer_detail::trim(call_text_);
         if (body.compare(0, 5, "call:") != 0) return false;
@@ -365,6 +529,7 @@ private:
 
     AnswerFamily fam_;
     answer_detail::FamilyTags tags_;
+    std::vector<const char*> drops_;  // header markup dropped outside a call (harmony only)
     bool tools_sent_ = false;
     Mode mode_ = Mode::content;
     std::string buf_;        // held back: may still become a tag
@@ -374,14 +539,32 @@ private:
     std::vector<ToolCall> calls_;
     bool saw_reasoning_ = false;
     bool saw_text_ = false;
+    bool trim_reasoning_ = true;   // until the reasoning's first non-whitespace character
+    bool trim_content_ = false;    // set when a reasoning block closes before any content; cleared by the first text
 };
+
+// Does the rendered prompt leave the model INSIDE a reasoning block?  Some templates end their generation prompt
+// with the opening tag itself -- Qwen3.5's ends `<|im_start|>assistant\n<think>\n` when thinking is on -- so the
+// model never writes that tag: its answer starts with the reasoning and the first tag in it is the closing one.
+// A splitter that waits to see the block opened then files the whole reasoning under `content` and drops the
+// closing tag it never saw opened, so nothing in the reply marks where the answer starts (measured on FastFlowLM's
+// Qwen3.5-2B-NPU2, engine#1786).  True when the prompt, less trailing whitespace,
+// ends with the family's opening tag.  A prompt that opens and closes the block (thinking off:
+// `<think>\n\n</think>\n\n`) does not end with it, and neither does one that never mentions it.
+inline bool prompt_opens_reasoning(const std::string& prompt, AnswerFamily family) {
+    const std::string open = answer_detail::tags_of(family).think_open;
+    size_t end = prompt.size();
+    while (end > 0 && (prompt[end - 1] == ' ' || prompt[end - 1] == '\n' || prompt[end - 1] == '\r' || prompt[end - 1] == '\t')) --end;
+    return !open.empty() && end >= open.size() && prompt.compare(end - open.size(), open.size(), open) == 0;
+}
 
 // Which of `pieces` (one generated token's text each, in order) belong to `content` -- not to
 // reasoning and not to call markup.  Callers that report a per-token value use this so reasoning and
 // call markup get no entry (issue #651 item 3).  A token that straddles a boundary ("</think>The")
 // counts as content: its text did reach the caller.
-inline std::vector<char> content_mask(const std::vector<std::string>& pieces, AnswerFamily family, bool tools_sent) {
-    AnswerStream s(family, tools_sent);
+inline std::vector<char> content_mask(const std::vector<std::string>& pieces, AnswerFamily family, bool tools_sent,
+                                      bool starts_in_reasoning = false) {
+    AnswerStream s(family, tools_sent, starts_in_reasoning);
     std::vector<char> mask;
     mask.reserve(pieces.size());
     std::vector<std::pair<bool, std::string>> out;
@@ -405,9 +588,61 @@ inline std::vector<char> content_mask(const std::vector<std::string>& pieces, An
     return mask;
 }
 
+// How many of `pieces` (one generated token's text each, in order) were reasoning: OpenAI's
+// usage.completion_tokens_details.reasoning_tokens (engine#2111). An empty `content` with finish_reason "length" reads
+// like "the model said nothing" when the whole budget went into a thinking block, and this is the number that says so.
+// A token is reasoning when none of its text reached `content` and the block was open before it, after it, or it put
+// text into the block: so the opening and closing tags, a partial tag the holdback keeps, and an unclosed block at the
+// end of the budget all count, while call markup and the whitespace after a closed block do not. A token that
+// straddles the boundary ("</think>The") is content, as content_mask() says. Same splitter, so the count, the split
+// and the logprob entries cannot disagree.
+inline int reasoning_token_count(const std::vector<std::string>& pieces, AnswerFamily family, bool tools_sent,
+                                 bool starts_in_reasoning = false) {
+    AnswerStream s(family, tools_sent, starts_in_reasoning);
+    std::vector<std::pair<bool, std::string>> out;
+    int n = 0;
+    bool last_counted = false;
+    // Tokens that produced nothing before anything was produced (leading whitespace, the first half of an opening tag
+    // the holdback keeps) belong to whatever comes next: to the block if the next token opens it, to nothing otherwise.
+    int pending = 0;
+    bool started = false;
+    for (const auto& piece : pieces) {
+        const bool before = s.in_reasoning();
+        out.clear();
+        s.feed(piece, out);
+        bool content = false, reasoning = false;
+        for (const auto& [is_reasoning, text] : out) {
+            (void)text;
+            (is_reasoning ? reasoning : content) = true;
+        }
+        last_counted = !content && (reasoning || before || s.in_reasoning());
+        if (last_counted) {
+            ++n;
+            if (!started) n += pending;
+            started = true;
+        } else if (content) {
+            started = true;
+        } else if (!started) {
+            ++pending;
+        }
+    }
+    // What the holdback still holds is flushed by finish(): if it is content, the last token's text reached `content`.
+    out.clear();
+    s.finish(out);
+    for (const auto& [is_reasoning, text] : out) {
+        (void)text;
+        if (!is_reasoning && last_counted) {
+            --n;
+            last_counted = false;
+        }
+    }
+    return n;
+}
+
 // The whole answer at once: the same splitter, so the two paths cannot disagree.
-inline ParsedAnswer parse_answer(const std::string& text, AnswerFamily family, bool tools_sent) {
-    AnswerStream s(family, tools_sent);
+inline ParsedAnswer parse_answer(const std::string& text, AnswerFamily family, bool tools_sent,
+                                 bool starts_in_reasoning = false) {
+    AnswerStream s(family, tools_sent, starts_in_reasoning);
     std::vector<std::pair<bool, std::string>> pieces;
     s.feed(text, pieces);
     s.finish(pieces);

@@ -481,6 +481,11 @@ def refusal_selftest():
 
 
 def main(argv):
+    # --help is a request, not a path: without this it arrives as argv[1] and the tool
+    # opens a file literally named "--help" (FileNotFoundError) instead of saying anything.
+    if "-h" in argv or "--help" in argv:
+        print(__doc__ or "usage: see the header of this file")
+        return 0
     selftest = "--selftest" in argv
     paths = [a for a in argv if a != "--selftest"]
     if not paths:

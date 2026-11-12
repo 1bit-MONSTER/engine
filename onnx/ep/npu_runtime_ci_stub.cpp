@@ -20,8 +20,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// A link-time stand-in for the private NPU runtime, used ONLY by the CI check that compiles and links
-// npu/ort/onebit_npu_gemm.cpp (engine #874, the ONNX EP's ONEBIT_EP_NPU leg).
+// A link-time stand-in for the private NPU runtime, used ONLY by CI-configure targets: the check that compiles and
+// links npu/ort/onebit_npu_gemm.cpp (engine #874, the ONNX EP's ONEBIT_EP_NPU leg), and onebit_npu_forward_ci, the
+// host-GEMM forward that batch_check_state_test runs on in CI (engine#1946; init_host never opens the device).
 //
 // Why this file exists: that leg is built only when ONEBIT_EP_NPU=ON, which needs ONNX Runtime *and*
 // the private runtime (ONEBIT_NPU_RT_DIR, docs/npu.md), so CI compiled neither it nor anything it
@@ -35,7 +36,7 @@
 // would open, submit to or wait on the device throws, so a build that ever *ran* against it fails
 // immediately instead of silently doing nothing; the accessors that only describe a handle
 // (map/size/address/is_full_elf) return empty values, which is what an empty handle has.
-// It is never linked into libonebit_ep.so, `1bit`, or any probe.
+// It is never linked into libonebit_ep.so, `1bit`, or any probe, and a configure with ONEBIT_NPU never builds it.
 
 #include "npu_rt_api.h"
 

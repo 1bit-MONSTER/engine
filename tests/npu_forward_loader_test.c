@@ -84,6 +84,37 @@ int main(void) {
             model_free(m);
         }
     }
+    {   /* LFM2's hybrid: a layer with shortconv.in_proj is a convolution layer, and the count names the first */
+        const char* h =
+            "{\"model.layers.0.self_attn.q_proj.weight\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[0,8]},"
+            "\"model.layers.1.shortconv.in_proj.weight\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[8,16]},"
+            "\"model.layers.1.shortconv.conv.weight\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[16,24]},"
+            "\"model.layers.1.shortconv.out_proj.weight\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[24,32]},"
+            "\"model.layers.2.self_attn.q_proj.weight\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[32,40]},"
+            "\"model.layers.3.shortconv.in_proj.weight\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[40,48]},"
+            "\"model.norm.weight\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[48,56]}}";
+        ModelWeights* m = load(write_file("lfm2.q4nx", strlen(h), h, 56));
+        check(m != NULL, "a container with short-convolution layers loads (the loader reads them)");
+        if (m) {
+            int first = -2;
+            check(model_shortconv_layers(m, 4, &first) == 2 && first == 1,
+                  "two of its first four layers are convolution layers, and the first is layer 1");
+            check(model_shortconv_layers(m, 1, &first) == 0 && first == -1, "none among the layers before it");
+            check(model_shortconv_layers(m, 4, NULL) == 2, "the count does not need the index");
+            model_free(m);
+        }
+        const char* plain = "{\"model.layers.0.self_attn.q_proj.weight\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[0,8]}}";
+        ModelWeights* q = load(write_file("dense.q4nx", strlen(plain), plain, 8));
+        if (q) {
+            int first = -2;
+            check(model_shortconv_layers(q, 4, &first) == 0 && first == -1, "an attention-only container has none");
+            model_free(q);
+        } else {
+            check(0, "an attention-only container loads");
+        }
+        int first = -2;
+        check(model_shortconv_layers(NULL, 4, &first) == 0 && first == -1, "no model, none");
+    }
     {   /* shorter than the length prefix */
         char path[128];
         snprintf(path, sizeof path, "%s/short.q4nx", dir);
@@ -164,6 +195,26 @@ int main(void) {
                   "its I8 rows are one 5,120-byte tile wide");
             model_free(dm);
         }
+    }
+    /* engine#1786 (item F1): three of the fifty-eight NPU2 model sources spell the per-layer prefix
+     * `model.layer.` (singular) where this forward addresses `model.layers.`. model_tensor_by_name() retries the lookup
+     * with the other spelling AFTER an exact match has failed, and this helper is the whole of that rewrite -- so it
+     * must swap the leading prefix and nothing else: a global replace would corrupt a tensor that carries the same text
+     * further along, and a near-miss prefix must be left alone rather than "helpfully" matched. */
+    {
+        char alt[512];
+        check(model_tensor_name_alt("model.layers.0.input_layernorm.weight", alt, sizeof alt) == 1 &&
+                  strcmp(alt, "model.layer.0.input_layernorm.weight") == 0,
+              "ALT: model.layers. -> model.layer., the rest untouched");
+        check(model_tensor_name_alt("model.layer.0.input_layernorm.weight", alt, sizeof alt) == 1 &&
+                  strcmp(alt, "model.layers.0.input_layernorm.weight") == 0,
+              "ALT: and back, model.layer. -> model.layers.");
+        check(model_tensor_name_alt("lm_head.weight", alt, sizeof alt) == 0,
+              "ALT: a model-level tensor has no per-layer spelling to try");
+        check(model_tensor_name_alt("model.layersX.0.proj.weight", alt, sizeof alt) == 0,
+              "ALT: a near-miss prefix is not matched helpfully");
+        check(model_tensor_name_alt("model.layers.0.a.weight", alt, 16) == 0,
+              "ALT: a too-small buffer reports no alternative rather than truncating");
     }
     char cmd[96];
     snprintf(cmd, sizeof cmd, "rm -rf %s", dir);

@@ -1,0 +1,26 @@
+{
+  "id": "qwen3-17b-fused-decode-flm-pair-20261111",
+  "host": "strixhalo",
+  "model": "Qwen3-1.7B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX q4_1 tiles (FastFlowLM's published container, unmodified), sealed fused set 2048x6144x16x8",
+  "metric": {
+    "name": "decode",
+    "value": 39.25,
+    "unit": "tok/s"
+  },
+  "settings": {
+    "device": "accel0",
+    "engine": "1bit 80aceca152a909d5 (lemonade-onebit-rc-2026-11-07-c32)",
+    "container": "FastFlowLM/Qwen3-1.7B-NPU2 model.q4nx, sha256 b1c1fe9d6c4a6d0c…, the same file both runtimes loaded",
+    "ticket": "one npu-hold ticket, 38 s, arms in the order theirs, ours, ours, theirs",
+    "sampling": "greedy, streamed",
+    "reply": "63 streamed chunks per request",
+    "load1": "4.34 at start, 3.30 at end"
+  },
+  "instrument": "streamed chat completion, decode rate from the stream's own chunk times; 3 repeats in each of two arms, median of the six (range 39.20 to 39.32)",
+  "repeats": 6,
+  "timestamp": "2026-11-11T05:42:39Z",
+  "source": "~/lb/aval/clperf-f9-abba-20261111T054201Z/run.log on strixhalo (lane cl-perf's f9-npu-abba.sh, unmodified; engine#1787)",
+  "notes": "Side by side with FastFlowLM 1.0.12's own runtime on the same array and the same model.q4nx, same ticket, A B B A: theirs decoded at 45.57 tok/s (median of its six, range 45.08 to 45.93), ours at 39.25, so theirs is 1.16 times ours on this pack. This row is ours; theirs is quoted here because a row is one run of this engine. What would make it wrong: it is one ticket at load 3 to 4, one prompt, and the shipped c32 build rather than main."
+}

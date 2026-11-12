@@ -50,7 +50,11 @@
 # The produced file's path is the only thing on stdout.
 set -euo pipefail
 
-[ $# -eq 3 ] || { sed -n '16,52p' "$0"; exit 2; }
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
+[ $# -eq 3 ] || { usage; exit 2; }
 fmt=$1 root=$2 out=$3
 repo=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=scripts/pack-version.sh

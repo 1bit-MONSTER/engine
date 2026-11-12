@@ -121,11 +121,11 @@ static void embed_row_arms(void) {
 static void chunked_row_arms(void) {
     const int rows = 64, cols = 512;                  /* 2x2 tiles: several rows per tile, several tiles per row */
     const int ntc = cols / Q4NX_TILE_COLS;
-    const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
+    const int kinds[4] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8, Q4NX_CHUNK_Q4S};
     float* whole = malloc((size_t)rows * cols * sizeof(float));
     float* row = malloc((size_t)cols * sizeof(float));
     if (!whole || !row) { check(0, "chunked row: the arms allocate"); free(whole); free(row); return; }
-    for (int k = 0; k < 3; k++) {
+    for (int k = 0; k < 4; k++) {
         const int cb = kinds[k];
         const size_t nbytes = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)ntc * (size_t)cb;
         uint8_t* q = malloc(nbytes);
@@ -141,7 +141,8 @@ static void chunked_row_arms(void) {
         }
         check(bad == 0, cb == Q4NX_TILE_BYTES   ? "chunked row: every row matches the whole-table decode (5,120 B tiles)"
                      : cb == Q4NX_CHUNK_Q4K    ? "chunked row: every row matches the whole-table decode (Q4K chunks)"
-                                               : "chunked row: every row matches the whole-table decode (Q8 chunks)");
+                     : cb == Q4NX_CHUNK_Q8     ? "chunked row: every row matches the whole-table decode (Q8 chunks)"
+                                               : "chunked row: every row matches the whole-table decode (Q4S chunks, 4,608 B)");
         check(q4nx_dequant_tile_row(q, nbytes, rows, cols, cb, rows, row) == -1, "chunked row: row == rows is refused");
         check(q4nx_dequant_tile_row(q, nbytes, rows, cols, cb, -1, row) == -1, "chunked row: row -1 is refused");
         check(q4nx_dequant_tile_row(q, nbytes - 1, rows, cols, cb, 0, row) == -1,
@@ -152,7 +153,7 @@ static void chunked_row_arms(void) {
         free(q);
     }
     free(whole); free(row);
-    printf("  chunked row: 3 kinds x 64 rows bit-exact + 5 refusal arms\n");
+    printf("  chunked row: 4 kinds x 64 rows bit-exact + 5 refusal arms\n");
 }
 
 /* engine#1842: the forward picks the per-row path for a chunked embedding with q4nx_tile_row_kind(). It used to pick it
@@ -165,8 +166,8 @@ static int old_rule(size_t esz, int nv, int kpad) {
     return tiles > 0 && esz % tiles == 0;
 }
 static void tile_row_kind_arms(void) {
-    const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
-    for (int k = 0; k < 3; k++)
+    const int kinds[4] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8, Q4NX_CHUNK_Q4S};
+    for (int k = 0; k < 4; k++)
         check(q4nx_tile_row_kind((size_t)4 * (size_t)kinds[k], 64, 512) == kinds[k],
               "tile-row kind: each supported chunk kind on a 2x2 grid is accepted as itself");
     struct { size_t esz; int nv, kpad; const char* what; } bad[] = {
@@ -192,7 +193,377 @@ static void tile_row_kind_arms(void) {
     printf("  tile-row kind: 3 kinds accepted, 4 tables the old rule took and the reader refuses are refused\n");
 }
 
+/* The two kinds of 5,120-byte tile. Same bytes for scales and codes; only the zero-point block differs, and that is
+ * what selects the reading: with a zero-point present the code is 0..15 and the value is code*scale + zero_point;
+ * with every zero-point 0 the code is a two's-complement nibble and the value is code*scale, scale carrying a sign. */
+static void tile_kinds(void) {
+    uint8_t* tile = (uint8_t*)calloc(1, Q4NX_TILE_BYTES);
+    float* out = (float*)malloc(sizeof(float) * Q4NX_TILE_ROWS * Q4NX_TILE_COLS);
+    if (!tile || !out) { check(0, "tile kinds: the buffers allocate"); free(tile); free(out); return; }
+    /* scales: exactly representable in bf16, negative on odd groups; codes: every nibble value appears */
+    for (int g = 0; g < Q4NX_GROUPS_PER_ROW; g++)
+        for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+            put_bf16(tile, (size_t)(g * Q4NX_TILE_ROWS + r), (g % 2 ? -1.0f : 1.0f) * 0.25f * (float)(1 + r % 4));
+    for (int i = 0; i < 4096; i++) tile[1024 + i] = (uint8_t)((i * 37 + 11) & 0xFF);
+    #define CODE_AT(r, c) ((((r) % 16) % 2 == 0) ? (tile[1024 + (((r) / 16) * 8 + (c) / 32) * 256 + 8 * ((c) % 32) + ((r) % 16) / 2] & 0xF) \
+                                                 : (tile[1024 + (((r) / 16) * 8 + (c) / 32) * 256 + 8 * ((c) % 32) + ((r) % 16) / 2] >> 4))
+    #define SCALE_AT(r, c) (((((c) / 32) % 2) ? -1.0f : 1.0f) * 0.25f * (float)(1 + (r) % 4))
+
+    check(q4nx_tile_kind(tile) == Q4NX_TILE_SYMMETRIC, "tile kinds: zero-points all zero and a scale below zero is the symmetric kind");
+    q4nx_dequant_tile(tile, out, Q4NX_TILE_COLS);
+    int bad = 0, saw_neg_code = 0;
+    for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+        for (int c = 0; c < Q4NX_TILE_COLS; c++) {
+            const int u = CODE_AT(r, c);
+            const int sgn = u >= 8 ? u - 16 : u;
+            if (u >= 8) saw_neg_code = 1;
+            if (out[r * Q4NX_TILE_COLS + c] != (float)sgn * SCALE_AT(r, c)) bad++;
+        }
+    check(saw_neg_code, "tile kinds: the fixture has codes of 8 and above, where the two readings differ");
+    check(bad == 0, "tile kinds: symmetric is (two's-complement nibble) * signed scale, every element");
+
+    /* negative zero is still zero: the kind does not flip on a sign bit */
+    tile[512 + 2 * 7 + 1] = 0x80;
+    check(q4nx_tile_kind(tile) == Q4NX_TILE_SYMMETRIC, "tile kinds: a -0.0 zero-point is still the symmetric kind");
+    tile[512 + 2 * 7 + 1] = 0;
+
+    /* one non-zero zero-point anywhere makes it the asymmetric kind, read as it always was */
+    put_bf16(tile + 512, (size_t)(3 * Q4NX_TILE_ROWS + 5), -0.5f);
+    check(q4nx_tile_kind(tile) == Q4NX_TILE_ASYMMETRIC, "tile kinds: one non-zero zero-point makes the tile asymmetric");
+    q4nx_dequant_tile(tile, out, Q4NX_TILE_COLS);
+    bad = 0;
+    for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+        for (int c = 0; c < Q4NX_TILE_COLS; c++) {
+            const float z = (c / 32 == 3 && r == 5) ? -0.5f : 0.0f;
+            if (out[r * Q4NX_TILE_COLS + c] != (float)CODE_AT(r, c) * SCALE_AT(r, c) + z) bad++;
+        }
+    check(bad == 0, "tile kinds: asymmetric is (code 0..15) * scale + zero_point, every element, as before");
+
+    /* the whole-tensor and one-row readers go through the same tile decoder */
+    for (int i = 0; i < 512; i++) tile[512 + i] = 0;
+    float* row = (float*)malloc(sizeof(float) * Q4NX_TILE_COLS);
+    float* whole = (float*)malloc(sizeof(float) * Q4NX_TILE_ROWS * Q4NX_TILE_COLS);
+    if (row && whole) {
+        check(q4nx_dequant_tensor_chunked(tile, Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_TILE_BYTES, whole) == 0 &&
+                  q4nx_dequant_tile_row(tile, Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_TILE_BYTES, 9, row) == 0,
+              "tile kinds: the tensor and row readers accept a symmetric tile");
+        bad = 0;
+        for (int c = 0; c < Q4NX_TILE_COLS; c++) {
+            const int u = CODE_AT(9, c);
+            const float want = (float)(u >= 8 ? u - 16 : u) * SCALE_AT(9, c);
+            if (whole[9 * Q4NX_TILE_COLS + c] != want || row[c] != want) bad++;
+        }
+        check(bad == 0, "tile kinds: and both read it as the tile decoder does");
+    } else check(0, "tile kinds: the reader buffers allocate");
+    #undef CODE_AT
+    #undef SCALE_AT
+    free(row); free(whole); free(tile); free(out);
+}
+
+/* The kind is not decided from a zero offset alone. An asymmetric tile is allowed to have every zero-point 0 (weights
+ * that are exactly code * scale: tests/npu_moe_container_test.cpp builds its fixture that way, and a first version
+ * of this rule read its codes 8..15 as -8..-1). What marks the symmetric kind is the signed scale, and a tensor is
+ * one kind: its undecided tiles follow it, and a tensor with both kinds is refused. */
+static void tile_kind_is_per_tensor(void) {
+    enum { T = 4 };   /* four tiles: one tile-row of a [32][1024] tensor */
+    uint8_t* t = (uint8_t*)calloc(T, Q4NX_TILE_BYTES);
+    float* out = (float*)malloc(sizeof(float) * Q4NX_TILE_ROWS * Q4NX_TILE_COLS * T);
+    float* row = (float*)malloc(sizeof(float) * Q4NX_TILE_COLS * T);
+    if (!t || !out || !row) { check(0, "per tensor: the buffers allocate"); free(t); free(out); free(row); return; }
+    const int cols = Q4NX_TILE_COLS * T;
+    /* every tile: scale 1.0, zero-point 0, every byte of codes 0xF9 (low nibble 9, high nibble 15) */
+    for (int k = 0; k < T; k++) {
+        uint8_t* tile = t + (size_t)k * Q4NX_TILE_BYTES;
+        for (int i = 0; i < 256; i++) put_bf16(tile, (size_t)i, 1.0f);
+        memset(tile + 1024, 0xF9, 4096);
+    }
+    check(q4nx_tile_kind(t) == Q4NX_TILE_UNDECIDED, "per tensor: zero offsets with positive scales decide nothing");
+    check(q4nx_tiles_kind(t, T, Q4NX_TILE_BYTES) == Q4NX_TILE_ASYMMETRIC, "per tensor: a tensor of undecided tiles is asymmetric");
+    check(q4nx_dequant_tensor_chunked(t, (size_t)T * Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, cols, Q4NX_TILE_BYTES, out) == 0,
+          "per tensor: it decodes");
+    int bad = 0;
+    for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+        for (int c = 0; c < cols; c++)
+            if (out[r * cols + c] != ((r % 2) ? 15.0f : 9.0f)) bad++;
+    check(bad == 0, "per tensor: and reads codes 9 and 15 as 9 and 15, the asymmetric reading it always had");
+    q4nx_dequant_tile(t, out, Q4NX_TILE_COLS);
+    check(out[0] == 9.0f && out[Q4NX_TILE_COLS] == 15.0f, "per tensor: the one-tile decoder agrees");
+
+    /* give ONE tile a negative scale: that tile is symmetric, and the other three now follow their tensor */
+    put_bf16(t + 2 * (size_t)Q4NX_TILE_BYTES, 40, -1.0f);
+    check(q4nx_tile_kind(t + 2 * (size_t)Q4NX_TILE_BYTES) == Q4NX_TILE_SYMMETRIC, "per tensor: a negative scale makes a tile symmetric");
+    check(q4nx_tiles_kind(t, T, Q4NX_TILE_BYTES) == Q4NX_TILE_SYMMETRIC, "per tensor: one symmetric tile makes the tensor symmetric");
+    check(q4nx_dequant_tensor_chunked(t, (size_t)T * Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, cols, Q4NX_TILE_BYTES, out) == 0 &&
+              q4nx_dequant_tensor(t, (size_t)T * Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, cols, out + 0) == 0,
+          "per tensor: both whole-tensor readers decode it");
+    bad = 0;
+    for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+        for (int c = 0; c < cols; c++) {
+            float want = (r % 2) ? -1.0f : -7.0f;                     /* 15 -> -1, 9 -> -7 */
+            if (c / Q4NX_TILE_COLS == 2 && (c % Q4NX_TILE_COLS) / 32 == 1 && r == 8) want = -want;   /* index 40 = g 1, r 8 */
+            if (out[r * cols + c] != want) bad++;
+        }
+    check(bad == 0, "per tensor: every tile, the undecided ones included, reads as two's complement * scale");
+    check(q4nx_dequant_tile_row(t, (size_t)T * Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, cols, Q4NX_TILE_BYTES, 3, row) == 0 &&
+              row[0] == -1.0f && row[cols - 1] == -1.0f,
+          "per tensor: the one-row reader takes the kind from the row's tiles, undecided ones following");
+    /* the padded-grid reader: the model's tensor is the first tile only, the container's grid is all four, and the
+     * kind is the grid's -- tile 0 is undecided on its own and symmetric as part of this tensor */
+    check(q4nx_dequant_tensor_packed(t, (size_t)T * Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_TILE_ROWS, cols,
+                                     Q4NX_TILE_BYTES, out) == 0 && out[0] == -7.0f && out[Q4NX_TILE_COLS] == -1.0f,
+          "per tensor: the padded-grid reader decodes it, taking the kind from the container's grid");
+    q4nx_dequant_tile(t, out, Q4NX_TILE_COLS);
+    check(out[0] == 9.0f, "per tensor: an undecided tile decoded alone, with no tensor around it, stays asymmetric");
+
+    /* now an offset in another tile: one tensor, both kinds -> refused by every tensor-level reader */
+    put_bf16(t + 512, 3, 0.5f);
+    check(q4nx_tiles_kind(t, T, Q4NX_TILE_BYTES) == -1, "per tensor: a symmetric and an asymmetric tile in one tensor is neither kind");
+    check(q4nx_dequant_tensor_chunked(t, (size_t)T * Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, cols, Q4NX_TILE_BYTES, out) == -1,
+          "per tensor: the chunked reader refuses it");
+    check(q4nx_dequant_tensor(t, (size_t)T * Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, cols, out) == -1,
+          "per tensor: the whole-tensor reader refuses it");
+    check(q4nx_dequant_tile_row(t, (size_t)T * Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, cols, Q4NX_TILE_BYTES, 0, row) == -1,
+          "per tensor: the one-row reader refuses it");
+    check(q4nx_dequant_tensor_packed(t, (size_t)T * Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_TILE_ROWS, cols,
+                                     Q4NX_TILE_BYTES, out) == -1,
+          "per tensor: the padded-grid reader refuses it (the kind is the container grid's, not the model's)");
+    free(t); free(out); free(row);
+}
+
+/* The 4,608-byte symmetric chunk (Hy-MT2-1.8B-NPU2): 256 bf16 scales at g*32 + r, then 4,096 code bytes at
+ * c*16 + r/2 (even row = low nibble), value = two's-complement nibble * scale. The expected values below index the
+ * bytes from that description, not through the decoder; and each of the three ways the layout was NOT (the 5,120
+ * tile's code order, row-major scales, offset-binary codes) is shown to give a different table, so the fixture can
+ * tell them apart. */
+static void q4s_chunk(void) {
+    uint8_t* t = (uint8_t*)calloc(1, Q4NX_CHUNK_Q4S);
+    float* out = (float*)malloc(sizeof(float) * Q4NX_TILE_ROWS * Q4NX_TILE_COLS);
+    if (!t || !out) { check(0, "q4s: the buffers allocate"); free(t); free(out); return; }
+    for (int i = 0; i < 256; i++) put_bf16(t, (size_t)i, ((i % 5 == 0) ? -1.0f : 1.0f) * 0.125f * (float)(1 + i % 7));
+    for (int i = 0; i < 4096; i++) t[512 + i] = (uint8_t)((i * 113 + 29) & 0xFF);
+    #define Q4S_U(r, c) (((r) % 2 == 0) ? (t[512 + (c) * 16 + (r) / 2] & 0xF) : (t[512 + (c) * 16 + (r) / 2] >> 4))
+    #define Q4S_SC(i) ((((i) % 5 == 0) ? -1.0f : 1.0f) * 0.125f * (float)(1 + (i) % 7))
+    q4nx_dequant_tile_q4s(t, out, Q4NX_TILE_COLS);
+    int bad = 0, as_5120_order = 0, as_row_major = 0, as_offset = 0, neg = 0;
+    for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+        for (int c = 0; c < Q4NX_TILE_COLS; c++) {
+            const int g = c / 32, u = Q4S_U(r, c), sgn = u >= 8 ? u - 16 : u;
+            const float got = out[r * Q4NX_TILE_COLS + c];
+            if (u >= 8) neg = 1;
+            if (got != (float)sgn * Q4S_SC(g * 32 + r)) bad++;
+            /* the layouts it is not */
+            const uint8_t b5 = t[512 + ((r / 16) * 8 + g) * 256 + 8 * (c % 32) + (r % 16) / 2];
+            const int u5 = ((r % 16) % 2 == 0) ? (b5 & 0xF) : (b5 >> 4);
+            if (got != (float)(u5 >= 8 ? u5 - 16 : u5) * Q4S_SC(g * 32 + r)) as_5120_order++;
+            if (got != (float)sgn * Q4S_SC(r * 8 + g)) as_row_major++;
+            if (got != (float)(u - 8) * Q4S_SC(g * 32 + r)) as_offset++;
+        }
+    check(neg, "q4s: the fixture has codes of 8 and above");
+    check(bad == 0, "q4s: every element is (two's-complement nibble at c*16 + r/2) * (scale at g*32 + r)");
+    check(as_5120_order > 1000, "q4s: the 5,120 tile's code order would give a different table");
+    check(as_row_major > 1000, "q4s: row-major scales would give a different table");
+    check(as_offset > 1000, "q4s: offset-binary codes would give a different table");
+    float* whole = (float*)malloc(sizeof(float) * Q4NX_TILE_ROWS * Q4NX_TILE_COLS);
+    if (whole) {
+        check(q4nx_dequant_tensor_chunked(t, Q4NX_CHUNK_Q4S, Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_CHUNK_Q4S, whole) == 0 &&
+                  memcmp(whole, out, sizeof(float) * Q4NX_TILE_ROWS * Q4NX_TILE_COLS) == 0,
+              "q4s: the tensor reader takes the kind by its size and decodes the same values");
+        check(q4nx_dequant_tensor_chunked(t, Q4NX_CHUNK_Q4S - 1, Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_CHUNK_Q4S, whole) == -1,
+              "q4s: one byte short is refused");
+    } else check(0, "q4s: the reader buffer allocates");
+    check(q4nx_tile_row_kind((size_t)Q4NX_CHUNK_Q4S, 32, 256) == Q4NX_CHUNK_Q4S &&
+              q4nx_tile_row_kind((size_t)Q4NX_TILE_BYTES, 32, 256) == Q4NX_TILE_BYTES,
+          "q4s: 4,608 and 5,120 bytes per tile are told apart by size alone");
+    #undef Q4S_U
+    #undef Q4S_SC
+    free(whole); free(t); free(out);
+}
+
+/* The 1,280-byte quarter tile (Gemma3-270M-NPU2): 16 rows x 128 columns, scales and zero-points at g*16 + r, codes at
+ * c*8 + r/2. A [32 x 256] tensor of 2 x 2 chunks, read into a 384-wide buffer (the forward pads K to 256). */
+static void q4h_chunks(void) {
+    const int rows = 32, k = 256, cols = 384, ntc = k / Q4NX_Q4H_COLS;
+    const size_t n = (size_t)(rows / Q4NX_Q4H_ROWS) * (size_t)ntc;
+    uint8_t* t = (uint8_t*)calloc(n, Q4NX_CHUNK_Q4H);
+    float* out = (float*)malloc(sizeof(float) * (size_t)rows * cols);
+    if (!t || !out) { check(0, "q4h: the buffers allocate"); free(t); free(out); return; }
+    for (size_t ci = 0; ci < n; ci++) {
+        uint8_t* c = t + ci * Q4NX_CHUNK_Q4H;
+        for (int i = 0; i < 64; i++) {
+            put_bf16(c, (size_t)i, 0.25f * (float)(1 + (int)((i + ci) % 7)));          /* scale */
+            put_bf16(c + 128, (size_t)i, -1.0f * (float)(1 + (int)((i + 3 * ci) % 5)));  /* zero-point */
+        }
+        for (int b = 0; b < 1024; b++) c[256 + b] = (uint8_t)((b * 7 + 3 * ci) & 0xff);
+    }
+    for (size_t i = 0; i < (size_t)rows * cols; i++) out[i] = 99.0f;
+    check(q4nx_dequant_tensor_q4h(t, n * Q4NX_CHUNK_Q4H, rows, k, cols, out) == 0, "q4h: a 2 x 2 grid reads");
+    int bad = 0, pad_bad = 0;
+    for (int r = 0; r < rows; r++)
+        for (int col = 0; col < cols; col++) {
+            const float got = out[(size_t)r * cols + col];
+            if (col >= k) { if (got != 0.0f) pad_bad++; continue; }
+            const int tr = r / 16, tc = col / 128, rr = r % 16, cc = col % 128;
+            const size_t ci = (size_t)tr * ntc + tc;
+            const int i = (cc / 32) * 16 + rr;
+            const uint8_t byte = (uint8_t)(((cc * 8 + rr / 2) * 7 + 3 * ci) & 0xff);
+            const int code = (rr % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+            const float s = 0.25f * (float)(1 + (int)((i + ci) % 7)), z = -1.0f * (float)(1 + (int)((i + 3 * ci) % 5));
+            if (got != (float)code * s + z) bad++;
+        }
+    check(bad == 0, "q4h: every element is code (at c*8 + r/2) * scale + zero (at g*16 + r), grid row-major");
+    check(pad_bad == 0, "q4h: the columns past the container's K are written 0");
+    check(q4nx_dequant_tensor_q4h(t, n * Q4NX_CHUNK_Q4H - 1, rows, k, cols, out) == -1, "q4h: one byte short is refused");
+    check(q4nx_dequant_tensor_q4h(t, n * Q4NX_CHUNK_Q4H, rows, k, k - 128, out) == -1, "q4h: a buffer narrower than K is refused");
+    check(q4nx_dequant_tensor_q4h(t, n * Q4NX_CHUNK_Q4H, 24, k, cols, out) == -1, "q4h: rows off the 16-row grid are refused");
+    free(t);
+    free(out);
+}
+
+/* engine#1786: Gemma4-12B-IT-NPU2's 16 x 256 wide chunks (q4nx_dequant.h). Settled against google's QAT Q4_0 GGUF
+ * of the model (corr 0.9986) and the pack's own bf16 embedding (the Q8W head, 1.00000); this pins the reading. */
+static void wide_chunks(void) {
+    const int rows = 32, k = 512, cols = 768, ntc = k / Q4NX_WIDE_COLS;
+    const size_t n = (size_t)(rows / Q4NX_WIDE_ROWS) * (size_t)ntc;
+    for (int bits = 4; bits <= 8; bits += 4) {
+        const int cb = bits == 4 ? Q4NX_CHUNK_Q4W : Q4NX_CHUNK_Q8W, ncode = cb - 256;
+        uint8_t* t = (uint8_t*)calloc(n, (size_t)cb);
+        float* out = (float*)malloc(sizeof(float) * (size_t)rows * cols);
+        if (!t || !out) { check(0, "wide: the buffers allocate"); free(t); free(out); return; }
+        for (size_t ci = 0; ci < n; ci++) {
+            uint8_t* c = t + ci * (size_t)cb;
+            for (int i = 0; i < 128; i++)
+                put_bf16(c, (size_t)i, (i % 3 ? 0.125f : -0.25f) * (float)(1 + (int)((i + ci) % 5)));   /* signed scale */
+            for (int b = 0; b < ncode; b++) c[256 + b] = (uint8_t)((b * 13 + 5 * ci) & 0xff);
+        }
+        for (size_t i = 0; i < (size_t)rows * cols; i++) out[i] = 99.0f;
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb, cb, rows, k, cols, out) == 0,
+              bits == 4 ? "q4w: a 2 x 2 grid reads" : "q8w: a 2 x 2 grid reads");
+        int bad = 0, pad_bad = 0;
+        for (int r = 0; r < rows; r++)
+            for (int col = 0; col < cols; col++) {
+                const float got = out[(size_t)r * cols + col];
+                if (col >= k) { if (got != 0.0f) pad_bad++; continue; }
+                const int tr = r / 16, tc = col / 256, rr = r % 16, cc = col % 256;
+                const size_t ci = (size_t)tr * ntc + tc;
+                const int i = (cc / 32) * 16 + rr;
+                const float sc = (i % 3 ? 0.125f : -0.25f) * (float)(1 + (int)((i + ci) % 5));
+                int code;
+                if (bits == 4) {
+                    const uint8_t byte = (uint8_t)(((cc * 8 + rr / 2) * 13 + 5 * ci) & 0xff);
+                    const int v = (rr % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+                    code = v >= 8 ? v - 16 : v;
+                } else {
+                    code = (int8_t)(uint8_t)(((cc * 16 + rr) * 13 + 5 * ci) & 0xff);
+                }
+                if (got != (float)code * sc) bad++;
+            }
+        check(bad == 0, bits == 4 ? "q4w: code (two's complement, c*8 + r/2, even row low) * scale (g*16 + r), row-major grid"
+                                  : "q8w: int8 code (c*16 + r) * scale (g*16 + r), row-major grid");
+        check(pad_bad == 0, "wide: the columns past the container's K are written 0");
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb - 1, cb, rows, k, cols, out) == -1, "wide: one byte short is refused");
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb, cb, 24, k, cols, out) == -1, "wide: rows off the 16-row grid are refused");
+        check(q4nx_dequant_tensor_wide(t, n * (size_t)cb, 4608, rows, k, cols, out) == -1, "wide: another chunk size is not a wide kind");
+        free(t);
+        free(out);
+    }
+    /* why the declared shape decides: a Q4W tensor is exactly as many bytes as a Q4S (4608) grid of the same size */
+    check((size_t)(4096 / 16) * (3840 / 256) * Q4NX_CHUNK_Q4W == (size_t)(4096 / 32) * (3840 / 256) * 4608,
+          "a 4096 x 3840 Q4W tensor has a 4608-byte Q4S grid's byte count, so only the declared shape tells them apart");
+}
+
+/* engine#1786: GPT-OSS-20B-NPU2's 2560-byte chunks (q4nx_dequant.h). Settled against ggml-org/gpt-oss-20b-GGUF
+ * (D2560 corr 0.995-0.997 against its Q8_0, MX2560 1.0000 against its MXFP4); this pins the reading. */
+static int d2560_code_at(const uint8_t* c, int r, int col) {
+    const uint8_t b = c[512 + (r / 16) * 1024 + col * 8 + (r % 16) / 2];
+    return (r & 1) ? (b >> 4) : (b & 15);
+}
+
+static void d2560_chunks(void) {
+    uint8_t c[Q4NX_CHUNK_D2560];
+    for (int i = 0; i < Q4NX_CHUNK_D2560; i++) c[i] = (uint8_t)((i * 29 + 7) & 0xff);
+    for (int i = 0; i < 128; i++) {
+        put_bf16(c, (size_t)i, 0.125f * (float)(1 + i % 9));               /* scale  at g*32 + r */
+        put_bf16(c + 256, (size_t)i, -0.5f * (float)(i % 4));               /* zero   at g*32 + r */
+    }
+    float out[32 * 128];
+    q4nx_dequant_chunk_d2560(c, out, 128);
+    int bad = 0;
+    for (int r = 0; r < 32; r++)
+        for (int col = 0; col < 128; col++) {
+            const int slot = (col / 32) * 32 + r;
+            if (out[r * 128 + col] != (float)d2560_code_at(c, r, col) * 0.125f * (float)(1 + slot % 9) - 0.5f * (float)(slot % 4)) bad++;
+        }
+    check(bad == 0, "d2560: code (two 16-row halves, h*1024 + c*8 + (r%16)/2) * scale + zero, both at g*32 + r");
+
+    uint8_t m[Q4NX_CHUNK_D2560];
+    static const float lut[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, -0.f, -.5f, -1, -1.5f, -2, -3, -4, -6};
+    for (int i = 0; i < Q4NX_CHUNK_D2560; i++) m[i] = (uint8_t)((i * 31 + 3) & 0xff);
+    for (int i = 0; i < 128; i++) m[i] = (uint8_t)(120 + i % 11);          /* E8M0 exponents at g*32 + r */
+    q4nx_dequant_chunk_mx2560(m, out, 128);
+    bad = 0;
+    for (int r = 0; r < 32; r++)
+        for (int col = 0; col < 128; col++) {
+            const int e = 120 + ((col / 32) * 32 + r) % 11;
+            float p = 1.0f;
+            for (int n = e - 127; n < 0; n++) p *= 0.5f;
+            for (int n = e - 127; n > 0; n--) p *= 2.0f;
+            if (out[r * 128 + col] != lut[d2560_code_at(m, r, col)] * p) bad++;
+        }
+    check(bad == 0, "mx2560: E2M1 code (same order) * 2^(e - 127), e at g*32 + r; bytes 128..511 unread");
+    /* the bias, against ggml's own reading of one value: e = 127 and code 2 (E2M1 1.0) is weight 1.0, which ggml
+     * writes as kvalues_fp4[2] = 2 times GGML_E8M0_TO_FP32_HALF(127) = 0.5 */
+    {
+        uint8_t one[Q4NX_CHUNK_D2560];
+        memset(one, 0, sizeof one);
+        one[0] = 127;                 /* row 0, group 0 */
+        one[512] = 2;                 /* row 0, column 0: low nibble 2 = E2M1 1.0 */
+        q4nx_dequant_chunk_mx2560(one, out, 128);
+        check(out[0] == 1.0f, "mx2560: E8M0 bias 127 (e = 127, E2M1 1.0 -> 1.0, as ggml's 2 * 2^(127-128))");
+    }
+
+    /* a [RB=2, CB=2, S=2, 2560] tensor: rows rb*S*32 + s*32 + r, columns cb*128 + c, clipped and padded */
+    const int RB = 2, CB = 2, S = 2, rows = 100, k = 200, cols = 256;
+    uint8_t* t = (uint8_t*)malloc((size_t)RB * CB * S * Q4NX_CHUNK_D2560);
+    float* o = (float*)malloc(sizeof(float) * rows * cols);
+    float* ref = (float*)malloc(sizeof(float) * 32 * 128);
+    if (!t || !o || !ref) { check(0, "d2560: buffers allocate"); free(t); free(o); free(ref); return; }
+    for (int ci = 0; ci < RB * CB * S; ci++) {
+        uint8_t* q = t + (size_t)ci * Q4NX_CHUNK_D2560;
+        memcpy(q, c, Q4NX_CHUNK_D2560);
+        put_bf16(q + 256, 0, (float)ci);                                    /* tag each chunk through one zero */
+    }
+    for (int i = 0; i < rows * cols; i++) o[i] = 99.0f;
+    check(q4nx_dequant_tensor_d2560(t, (size_t)RB * CB * S * Q4NX_CHUNK_D2560, RB, CB, S, rows, k, cols, o) == 0,
+          "d2560: a 2 x 2 x 2 tensor reads, clipped to 100 rows and 200 columns");
+    bad = 0;
+    int pad_bad = 0;
+    for (int row = 0; row < rows; row++) {
+        const int rb = row / (S * 32), s = (row / 32) % S, r = row % 32;
+        for (int col = 0; col < cols; col++) {
+            const float got = o[(size_t)row * cols + col];
+            if (col >= k) { if (got != 0.0f) pad_bad++; continue; }
+            const int cb = col / 128;
+            const uint8_t* q = t + (((size_t)rb * CB + cb) * S + s) * Q4NX_CHUNK_D2560;
+            q4nx_dequant_chunk_d2560(q, ref, 128);
+            if (got != ref[r * 128 + col % 128]) bad++;
+        }
+    }
+    check(bad == 0, "d2560: tensor row rb*S*32 + s*32 + r comes from chunk [rb][cb][s]");
+    check(pad_bad == 0, "d2560: columns past k are written 0");
+    check(q4nx_dequant_tensor_d2560(t, (size_t)RB * CB * S * Q4NX_CHUNK_D2560 - 1, RB, CB, S, rows, k, cols, o) == -1,
+          "d2560: one byte short is refused");
+    check(q4nx_dequant_tensor_d2560(t, (size_t)RB * CB * S * Q4NX_CHUNK_D2560, RB, CB, S, 129, k, cols, o) == -1,
+          "d2560: more rows than the grid holds is refused");
+    free(t); free(o); free(ref);
+}
+
 int main(void) {
+    q4s_chunk();
+    q4h_chunks();
+    wide_chunks();
+    d2560_chunks();
+    tile_kinds();
+    tile_kind_is_per_tensor();
     tile_row_kind_arms();
     chunked_row_arms();
     embed_row_arms();

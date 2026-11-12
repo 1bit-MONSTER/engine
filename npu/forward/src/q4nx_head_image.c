@@ -18,9 +18,13 @@
 // geometry and a hash, and a reader that cannot reproduce the hash refuses instead of returning bytes it cannot vouch for.
 
 #include "q4nx_head_image.h"
+#include "file_create.h"   /* the cache file is created 0644, never through a symlink */
 
 #include <stdio.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 // "Q4HI" then the version as four ASCII digits, so a hexdump of the first eight bytes says what the file is.
 #define Q4NX_HEAD_IMAGE_MAGIC "Q4HI"
@@ -68,9 +72,18 @@ int q4nx_head_image_write(const char *path, const int8_t *codes, const float *sc
     h.hash = q4nx_head_image_hash(codes, scales, kd, nd);
     // Written beside the destination and renamed into place: a truncated image must never be readable as a valid one,
     // because the reader would then copy it into a weight BO and the model would answer wrongly with no message.
+    // The temp name carries the writer's pid: two serves that start cold on the same pack write the same image at the
+    // same time, and with one shared name the second open truncated the first writer's file under it and one of the two
+    // renames found nothing to rename. Each writer now renames its own complete file; the last rename wins, and both
+    // files are the same image.
     char tmp[4096];
-    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) <= 0) return 0;
-    FILE *f = fopen(tmp, "wb");
+#if !defined(_WIN32)
+    const int tn = snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
+#else
+    const int tn = snprintf(tmp, sizeof tmp, "%s.tmp", path);
+#endif
+    if (tn <= 0 || (size_t)tn >= sizeof tmp) return 0;
+    FILE *f = onebit_fopen_shared_wb(tmp);
     if (!f) return 0;
     int ok = fwrite(&h, sizeof h, 1, f) == 1 && fwrite(codes, (size_t)kd * (size_t)nd, 1, f) == 1 &&
              fwrite(scales, (size_t)nd * sizeof(float), 1, f) == 1;

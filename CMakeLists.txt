@@ -2192,6 +2192,12 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> qwen2vl)
     set_tests_properties(batch_check_state_qwen2vl PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # GPT-OSS (engine#1786): a container written in FastFlowLM's D2560/MX2560 form, sinks, o bias, yarn, the top-k
+    # MoE with clamped SwiGLU, against a numpy GPT-OSS forward on the same bytes.
+    add_test(NAME gptoss_forward
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/gptoss_forward_ci.py
+                     $<TARGET_FILE:batch_check_state_test>)
+    set_tests_properties(gptoss_forward PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     # A fabricated qwen3_5 hybrid (a linear-attention layer, then attention), off the kernel's N grid on purpose.
     add_test(NAME batch_check_state_qwen35
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py

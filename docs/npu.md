@@ -2079,6 +2079,35 @@ On the host the known-answer prompt gives `<|channel>thought\n<channel|>Paris<tu
 template's own empty-thought prefix, then answers. Gemma4-E2B, the PLE model, still answers `Paris`. No kernel set
 for the 12B's shapes was built or run (the NPU is off).
 
+**GPT-OSS-20B-NPU2: the forward reads gpt_oss, on the host (engine#1786).** FastFlowLM's pack stores the model in
+two chunk kinds this forward did not read, and the model adds five rules. All of them are now in the per-op forward,
+with the MoE run on the host:
+
+- **D2560** (I8 `[RB, CB, S, 2560]`, attention q/k/v/o and the head) and **MX2560** (U8 `[E, 69, CB, S, 2560]`, the
+  experts as MXFP4). One chunk is 32 rows x 128 columns: parameters at `g*32 + r`, then 4-bit codes in two 16-row
+  halves at `h*1024 + c*8 + (r%16)/2` (`q4nx_dequant.h`). D2560 is asymmetric (bf16 scale and zero-point). MX2560 is an
+  E8M0 exponent and an E2M1 code, with a weight of `E2M1 * 2^(e-127)`. Per expert, the 69 row-blocks are gate and up
+  alternating by 128 rows, then 23 of down. Against `ggml-org/gpt-oss-20b-GGUF`: D2560 corr 0.995-0.997 against its
+  Q8_0 (4-bit against 8-bit), MX2560 exact against its MXFP4 read through ggml's own rule (`kvalues_fp4`, the E2M1
+  table doubled, times `2^(e-128)`).
+- **Attention sinks**: one logit per head that joins the softmax and carries no value
+  (`q4nx_attn::head_context`'s `sink`; a null sink leaves every other model bit-identical). **o_proj bias.**
+- **YaRN** (`rope_type: "yarn"`, `Q4nxRopeYarn` in `q4nx_rope.h`): the frequency ramp of transformers'
+  `_compute_yarn_parameters` (`truncate: false` honoured) and the attention factor on cos and sin.
+- **The MoE** (`gptoss_moe`): top-k of the biased router logits, a softmax over those k (llama.cpp's
+  `SOFTMAX_WEIGHT`), and per expert ggml's `swiglu_oai` (`min(gate, 7) * sigmoid(1.702 * gate) * (clamp(up, -7, 7) + 1)`)
+  with the gate, up and down biases. The experts are read from the MXFP4 chunks in place, never expanded.
+- The sliding window on alternate layers was already read from `layer_types`.
+
+Checked on the host, 2026-11-12. A numpy GPT-OSS forward of the same weights (transcribed from our llama.cpp fork's
+`openai-moe.cpp`) puts `<|channel|>` first after `<|start|>assistant` (38.3 against 18.7 for the next token). The
+forward's logits match it at corr 1.000000, max |d| 6e-5 of 38.3. `gptoss_forward` (CI) writes a two-layer container
+in this format and holds the forward to the same reference on its bytes: corr 1.0000000. Removing any one rule fails
+it, while batched equals sequential passes every time: the sinks (0.61), the o bias (0.29), the MXFP4 bias (0.84),
+the SwiGLU clamp (0.92), the YaRN attention factor (0.994), the YaRN frequency rule (0.99989), and the top-k softmax
+(0.99967). A batched prefill of gpt_oss takes the per-token path. No kernel set for its shapes was built or run (the
+NPU is off).
+
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.
 A pack of the same architecture under another name got it wrong in silence. FastFlowLM's MiniCPM-V 4.7

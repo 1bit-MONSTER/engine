@@ -194,6 +194,9 @@ typedef struct {
      * k_norm (our llama.cpp fork's gemma4.cpp: `Vcur = wv ? wv x : Kcur`, then v's scale-free RMSNorm).  Source:
      * attention_k_eq_v. */
     int attention_k_eq_v;
+    /* GPT-OSS (model_type gpt_oss): attention sinks, an o_proj bias, and a top-k-of-E MoE of MXFP4 experts with
+     * biases and a clamped SwiGLU, run by Q4nxNpuForward::gptoss_moe.  Source: model_type. */
+    int gpt_oss;
     /* Gemma4 sets attention scaling to 1.0 (q/k carry a per-head RMSNorm),
      * normalises v with a SCALE-FREE RMSNorm, and uses "proportional" RoPE on
      * its full layers.  Sources: model_type/architectures, rope_type. */

@@ -47,12 +47,39 @@ import sys
 KINDS = ("content", "add/add", "mod/del", "rename")
 
 
+def die(message):
+    """Say it on stderr and exit 2 -- the documented code for a usage or git error.
+
+    `raise SystemExit("text")` exits **1**, which is this tool's "conflicts found" code, so a bad ref would have
+    been indistinguishable from a merge that needs work.
+    """
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
 def git(repo, *args, check=False):
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=check)
 
 
+def must_resolve(repo, ref):
+    """`ref^{commit}`, or exit 2 -- a ref git cannot resolve must never look like a clean merge.
+
+    `git merge-tree` returns 1 both for "conflicts found" and for "<ref> - not something we can merge", so the
+    return code cannot tell them apart. Measured on a throwaway repo: a typo'd ref printed "no conflicts" and
+    exited 0, which is the unreadable-is-not-zero defect inside this tool.
+    """
+    out = git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    if out.returncode != 0 or not out.stdout.strip():
+        die(f"conflict_triage: cannot resolve {ref!r} in {repo} (not a commit here)")
+    return out.stdout.strip()
+
+
 def merge_tree(repo, base, theirs):
     """The tree git would produce, its conflicted paths, and the messages that classify them."""
+    must_resolve(repo, "HEAD")
+    must_resolve(repo, theirs)
+    if base:
+        must_resolve(repo, base)
     args = ["merge-tree", "--write-tree", "--name-only"]
     if base:
         args.append(f"--merge-base={base}")
@@ -62,7 +89,11 @@ def merge_tree(repo, base, theirs):
     if out.returncode == 0:
         return {"tree": out.stdout.splitlines()[0].strip() if out.stdout.strip() else "", "paths": [], "info": ""}
     if out.returncode != 1:
-        raise SystemExit(f"conflict_triage: git merge-tree failed: {out.stderr.strip()[:400]}")
+        die(f"conflict_triage: git merge-tree failed: {out.stderr.strip()[:400]}")
+    # rc 1 is git's code for "conflicts" AND for a ref it could not merge; the refs are verified above, so a message
+    # here is something else refusing and must not be reported as a conflict-free merge.
+    if "not something we can merge" in (out.stdout + out.stderr):
+        die(f"conflict_triage: git could not merge the refs: {out.stderr.strip()[:300]}")
     lines = out.stdout.splitlines()
     tree = lines[0].strip() if lines else ""
     paths, info_start = [], None
@@ -183,6 +214,12 @@ def run(repo, theirs, base=None, as_json=False):
     return 1
 
 
+def _die_rc():
+    """The exit code `die()` produces, measured in a child process."""
+    out = subprocess.run([sys.executable, __file__, "--self-test-die"], capture_output=True, text=True)
+    return out.returncode
+
+
 def self_test():
     failures = 0
 
@@ -226,6 +263,9 @@ def self_test():
     triaged = rows(["ggml/src/CMakeLists.txt"],
                    "CONFLICT (content): Merge conflict in ggml/src/CMakeLists.txt", {})
     check_that(triaged[0][1] == "content", "a path whose message names it is never 'unmapped'")
+    # The exit codes are the contract: 2 for "I could not answer", 1 for "conflicts", 0 for "none". A bad ref used to
+    # take the 1 path (SystemExit's default) or, before the refs were verified, the 0 path -- both worth an arm.
+    check_that(_die_rc() == 2, "die() exits 2, not SystemExit's default 1 (which is 'conflicts found')")
     print(f"conflict_triage self-test: {'ok' if not failures else f'{failures} failure(s)'}")
     return 1 if failures else 0
 
@@ -238,6 +278,8 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
+    if "--self-test-die" in sys.argv:
+        die("conflict_triage: self-test of die()")
     if args.self_test:
         return self_test()
     if not args.repo or not args.theirs:

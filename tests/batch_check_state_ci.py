@@ -39,6 +39,10 @@ post_ffn_norm, embedding_norm) as FastFlowLM's LFM3-1.7B-NPU2 pack keeps them, w
 the zero-tail partial RoPE on the full layer, the sandwich norms, and a bf16 per-head output gate
 (self_attn.gate_proj [heads, hidden]). What it pins: model_load's renaming, the forward accepting "conv" in
 layer_types, and the batched prefill running the gate and the sandwich exactly as the token-by-token path does.
+batched == sequential compares the forward with itself, so this arm also runs LFM3's math in numpy (lfm3_reference,
+transcribed from modeling_lfm3.py) on the container's own weights, untiled, and compares the sequential logits:
+measured at engine#2254, corr 1.0000000 and max |d| 1.2e-05 of 7.63. A dead head gate (in both paths) gives corr 0.90
+and another argmax, the usual partial RoPE 0.98, no sandwich 0.38; every one of them passes batched == sequential.
 
 With `qwen3_5` it is a qwen3_5 hybrid (engine#1889): a linear-attention (GDN) layer, then a full-attention layer with
 q/k norms, written under `language_model.*` so the packer takes its qwen3_5 path (renames, the conv1d transpose,
@@ -62,6 +66,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "..", "tools", "safetensors_to_q4nx.py")
 
 H, HEADS, KV_HEADS, HEAD_DIM, FFN, VOCAB, LAYERS = 256, 2, 1, 128, 512, 256, 2
+LFM3_MIN_CORR = 0.99999      # measured at #2254: corr 1.0000000, max |d| 1.2e-05 of 7.63
+LFM3_MAX_DIFF = 1e-3         # of the reference's largest |logit|
 
 
 def write_safetensors(path, arrays):
@@ -190,6 +196,84 @@ def make_model(d, np, family="qwen3"):
         f.write("{}")
     with open(os.path.join(d, "tokenizer_config.json"), "w") as f:
         json.dump({"add_bos_token": False}, f)
+    return {name: a.shape for name, a in weights.items()}
+
+
+def lfm3_reference(q4nx_dir, np, ids, shapes):
+    """LFM3's forward (LiquidAI's modeling_lfm3.py, transcribed) on the weights the forward itself reads: the packed
+    container's tensors, the I8 ones untiled. Returns the last position's logits.
+
+    batched == sequential compares our forward with itself, so a rule both paths get wrong passes it (#2254 review:
+    with the head gate a no-op in step() and step_batch() alike, the arm still matched). This is the check that
+    can see the gate, the zero-tail RoPE, the sandwich and the conv layers."""
+    sys.path.insert(0, os.path.join(HERE, "..", "tools"))
+    from q4nx_pack import untile
+    with open(os.path.join(q4nx_dir, "config.json")) as f:
+        cfg = json.load(f)
+    with open(os.path.join(q4nx_dir, "model.q4nx"), "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        table = json.loads(f.read(n))
+        blob = f.read()
+
+    def W(name):
+        e = table[name]
+        lo, hi = e["data_offsets"]
+        if e["dtype"] == "BF16":
+            v = (np.frombuffer(blob[lo:hi], dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+            return v.reshape(e["shape"])
+        if e["dtype"] == "F32":
+            return np.frombuffer(blob[lo:hi], dtype=np.float32).reshape(e["shape"])
+        rows, k = shapes[name]          # an I8 entry's shape is its tile grid; the logical one is the source's
+        return untile(np.frombuffer(blob[lo:hi], dtype=np.uint8).reshape(-1, 5120), rows, k)
+
+    nh, nkv, hd, eps = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"], cfg["norm_eps"]
+    T, win, hsz = len(ids), cfg["sliding_window"], cfg["hidden_size"]
+
+    def rms(x, w):
+        return w * (x / np.sqrt((x.astype(np.float64) ** 2).mean(-1, keepdims=True) + eps)).astype(np.float32)
+
+    def rope(x, layer_type):
+        rp = cfg["rope_parameters"][layer_type]
+        angles = int(rp.get("partial_rotary_factor", 1.0) * hd) // 2
+        inv = 1.0 / rp["rope_theta"] ** (np.arange(0, 2 * angles, 2) / hd)
+        inv = np.concatenate([inv, np.zeros(hd // 2 - angles)])         # the zero tail
+        fr = np.arange(T)[:, None] * inv[None, :]
+        c, sn = np.cos(np.concatenate([fr, fr], -1))[:, None], np.sin(np.concatenate([fr, fr], -1))[:, None]
+        x = x.astype(np.float64)
+        return (x * c + np.concatenate([-x[..., hd // 2:], x[..., :hd // 2]], -1) * sn).astype(np.float32)
+
+    x = W("model.embed_tokens.weight")[ids].astype(np.float32)
+    for layer, lt in enumerate(cfg["layer_types"]):
+        p = f"model.layers.{layer}."
+        xn = rms(x, W(p + "operator_norm.weight"))
+        if lt == "conv":
+            bcx = xn @ W(p + "conv.in_proj.weight").T
+            b, c, v = bcx[:, :hsz], bcx[:, hsz:2 * hsz], bcx[:, 2 * hsz:]
+            taps = W(p + "conv.conv.weight")
+            L = taps.shape[1]
+            pad = np.concatenate([np.zeros((L - 1, hsz), np.float32), b * v], 0)
+            y = np.stack([(pad[t:t + L].T * taps).sum(-1) for t in range(T)])
+            y = (c * y) @ W(p + "conv.out_proj.weight").T
+        else:
+            q = rms((xn @ W(p + "self_attn.q_proj.weight").T).reshape(T, nh, hd), W(p + "self_attn.q_norm.weight"))
+            k = rms((xn @ W(p + "self_attn.k_proj.weight").T).reshape(T, nkv, hd), W(p + "self_attn.k_norm.weight"))
+            v = (xn @ W(p + "self_attn.v_proj.weight").T).reshape(T, nkv, hd)
+            q, k = rope(q, lt), rope(k, lt)
+            k, v = np.repeat(k, nh // nkv, 1), np.repeat(v, nh // nkv, 1)
+            sc = np.einsum("thd,shd->hts", q, k) / np.sqrt(hd)
+            mask = np.tril(np.ones((T, T), bool))
+            if lt == "sliding_attention":
+                mask &= (np.arange(T)[:, None] - np.arange(T)[None, :]) < win
+            sc = np.exp(np.where(mask[None], sc, -np.inf) - sc.max(-1, keepdims=True))
+            ctx = np.einsum("hts,shd->thd", sc / sc.sum(-1, keepdims=True), v)
+            gate = 1.0 / (1.0 + np.exp(-(xn @ W(p + "self_attn.gate_proj.weight").T)))
+            y = (ctx * gate[:, :, None]).reshape(T, nh * hd) @ W(p + "self_attn.o_proj.weight").T
+        x = x + rms(y, W(p + "post_operator_norm.weight"))
+        h = rms(x, W(p + "ffn_norm.weight"))
+        a = h @ W(p + "feed_forward.w1.weight").T
+        ff = ((a / (1.0 + np.exp(-a))) * (h @ W(p + "feed_forward.w3.weight").T)) @ W(p + "feed_forward.w2.weight").T
+        x = x + rms(ff, W(p + "post_ffn_norm.weight"))
+    return rms(x, W("model.embedding_norm.weight"))[-1] @ W("lm_head.weight").T
 
 
 def tmp_root():
@@ -221,12 +305,15 @@ def main():
         return 77
     with tempfile.TemporaryDirectory(prefix="batch_check_state_ci.", dir=tmp_root()) as tmp:
         src, out = os.path.join(tmp, "hf"), os.path.join(tmp, "q4nx")
-        make_model(src, np, family)
+        shapes = make_model(src, np, family)
         r = subprocess.run([sys.executable, TOOL, "pack", src, out], capture_output=True, text=True)
         if r.returncode != 0:
             print(f"FAIL  packing the fabricated container: {r.stderr[-600:]}")
             return 1
         env = dict(os.environ, ONEBIT_TEST_Q4NX=out)
+        logits_out = os.path.join(tmp, "sequential.f32")
+        if family == "lfm3":
+            env["ONEBIT_TEST_LOGITS_OUT"] = logits_out
         env.pop("NPU_INFER_HOST_GEMM", None)   # init_host is host-GEMM already; nothing else should steer it
         r = subprocess.run([sys.argv[1]], env=env, capture_output=True, text=True, timeout=110)
         for line in (r.stdout + r.stderr).splitlines():
@@ -238,6 +325,17 @@ def main():
             # arm, not a reason to skip it.
             print("FAIL  batch_check_state_test skipped on the fabricated container (init_host refused it)")
             return 1
+        if family == "lfm3" and r.returncode == 0:
+            ours = np.fromfile(logits_out, dtype=np.float32)[:VOCAB]
+            ref = lfm3_reference(out, np, [1, 2, 3, 4, 5, 6], shapes)
+            corr = float(np.corrcoef(ours, ref)[0, 1])
+            ok = (corr >= LFM3_MIN_CORR and float(np.abs(ours - ref).max()) <= LFM3_MAX_DIFF * float(np.abs(ref).max())
+                  and int(np.argmax(ours)) == int(np.argmax(ref)))
+            print(f"{'PASS' if ok else 'FAIL'}  sequential logits vs the modeling_lfm3 reference on the container's "
+                  f"weights: corr {corr:.7f} (needs {LFM3_MIN_CORR}), max |d| {float(np.abs(ours - ref).max()):.3g} of "
+                  f"{float(np.abs(ref).max()):.3g}, argmax {int(np.argmax(ours))} vs "
+                  f"{int(np.argmax(ref))}")
+            return 0 if ok else 1
         return r.returncode
 
 

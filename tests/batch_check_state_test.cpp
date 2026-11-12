@@ -104,6 +104,17 @@ int main() {
             return 1;
         }
     }
+    // A caller that has its own reference forward of the container (tests/batch_check_state_ci.py lfm3) asks for the
+    // sequential logits: batched == sequential cannot see a rule both paths get wrong, a reference can.
+    if (const char* out = std::getenv("ONEBIT_TEST_LOGITS_OUT")) {
+        FILE* f = std::fopen(out, "wb");
+        if (!f || std::fwrite(ref.data(), sizeof(float), ref.size(), f) != ref.size()) {
+            std::printf("FAIL  cannot write the sequential logits to %s\n", out);
+            if (f) std::fclose(f);
+            return 1;
+        }
+        std::fclose(f);
+    }
 
     fwd.reset();
     std::vector<float> logits;

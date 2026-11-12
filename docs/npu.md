@@ -2112,6 +2112,46 @@ the SwiGLU clamp (0.92), the YaRN attention factor (0.994), the YaRN frequency r
 (0.99967). A batched prefill of gpt_oss takes the per-token path. No kernel set for its shapes was built or run (the
 NPU is off).
 
+**Hy-Memory-30B-A3B-NPU2: hy_v3 runs on the existing MoE path (engine#1786).** Tencent's hy_v3 routes as DeepSeek-V3
+does (our llama.cpp fork's `src/models/hy-v3.cpp`): sigmoid router probabilities, the top 8 of 128 chosen on probability
+plus an expert bias, weighted by the unbiased probabilities normalised to sum 1 and scaled, one ungated shared expert,
+and a dense first layer. The forward already ran that routing. What it did not do was read the pack's way of saying
+it. Each of these, alone, made the reply ` of of of`:
+
+- **The config keys.** `moe_router_use_sigmoid` is the sigmoid (it was read as softmax), `router_scaling_factor` is the
+  weight scale, `first_k_dense_replace` is the leading dense count with the dense width from `intermediate_size`, and
+  `expert_hidden_dim` (768) is the expert width. `moe_intermediate_size` says 1536, but the experts and the shared
+  expert are `[768][2048]` in `tencent/Hy-Memory-30B-A3B` itself.
+- **The router** is stored `[H][E]`, the transpose of upstream's `[E][H]`, checked by a ranged read of the checkpoint.
+  A router of that shape is transposed at load. **The expert bias** is the F32 `moe_expert_bias`, equal to upstream's
+  `mlp.expert_bias`.
+- **The expert slices are `[N][K]`.** FastFlowLM's Qwen MoE packs transpose each expert, and the forward read every
+  `*_exps_proj` stack that way. This pack does not transpose: its gate stack is `[3072][8][4736]`, 24 x 8 tiles per
+  expert for 768 x 2048. The grid is now decided from the first MoE layer's own gate stack. Against upstream expert
+  0 of layer 1, `[N][K]` gives gate and down corr 0.9974, and the old reading gives 0.008. The same rule also fires
+  on `MiniCPM-V-4.7-35B-A3B-NPU2` (the only other container on the box it fires on). That reading is right there too:
+  its layer-0 expert 0 against `openbmb/MiniCPM-V-4.7-35B-A3B`'s own `gate_up_proj` gives corr 0.997 as `[N][K]` and
+  0.024 as `[K][N]`. That pack does not run on this forward either way ("MoE designs missing", engine#1788), so no
+  answer changes.
+- **A leading dense layer without MLA** gets the DG/DU/DD designs and `dense_mlp` the MLA path already had. A batched
+  prefill of such a model takes the per-token path.
+
+On the host the known-answer prompt (no-think template) answers `Paris` and `<eos>`. Against a numpy hy_v3 forward
+of the same weights, decoded through `q4nx_dequant.c`, the last position's logits match at corr 1.000000, max |d|
+3e-5 of 26.6, with the same top 5. `batch_check_state_hy_v3` fabricates a two-layer pack written this way and holds
+the forward to that reference: corr 1.0000000. Each of these mutants fails it:
+
+| mutant | corr |
+|---|---|
+| `[K][N]` slices | 0.59 |
+| no router transpose | 0.78 |
+| softmax gating | 0.9965 |
+| no scale | 0.94 |
+| bias ignored | 0.87 |
+| expert width from `moe_intermediate_size` | refused at the expert gate |
+
+No kernel set for its shapes was built or run (the NPU is off).
+
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.
 A pack of the same architecture under another name got it wrong in silence. FastFlowLM's MiniCPM-V 4.7

@@ -1315,11 +1315,48 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                            q4nx_config_int(cfg_path.c_str(), "num_experts_per_tok", 0));
         const int moe_im = q4nx_config_int(cfg_path.c_str(), "moe_intermediate_size", 0);
         expert_im_ = moe_im > 0 ? moe_im : c_.IM;
+        // hy_v3 states both: moe_intermediate_size 1536 and expert_hidden_dim 768, and its experts (and the shared
+        // expert) are [768][2048] in tencent/Hy-Memory-30B-A3B's own checkpoint, so expert_hidden_dim is the width.
+        const int ehd = q4nx_config_int(cfg_path.c_str(), "expert_hidden_dim", 0);
+        if (ehd > 0) expert_im_ = ehd;
         dense_im_ = q4nx_config_int(cfg_path.c_str(), "dense_intermediate_size", 0);
         leading_dense_ = q4nx_config_int(cfg_path.c_str(), "leading_dense_block_count", 0);
         expert_gating_sigmoid_ =
             q4nx_config_int(cfg_path.c_str(), "expert_gating_func", 1) == 2;  // 2 = sigmoid
         expert_w_scale_ = read_config_float(cfg_path, "\"expert_weights_scale\"", 1.0f);
+        // Hy-Memory (hy_v3, engine#1786) states the same DeepSeek-V3 routing under its own keys: the
+        // sigmoid as moe_router_use_sigmoid, the scale as router_scaling_factor, the leading dense block
+        // as first_k_dense_replace, and the dense FFN's width as intermediate_size. Our llama.cpp fork's
+        // hy-v3.cpp routes it as deepseek2 does (sigmoid probs, top-k on probs + expert bias, the
+        // unbiased probs sum-normalised and scaled), which is the path moe_mlp runs.
+        {
+            std::ifstream cf(cfg_path);
+            const std::string ct((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>());
+            if (ct.find("\"moe_router_use_sigmoid\": true") != std::string::npos ||
+                ct.find("\"moe_router_use_sigmoid\":true") != std::string::npos)
+                expert_gating_sigmoid_ = true;
+            if (ct.find("\"expert_weights_scale\"") == std::string::npos)
+                expert_w_scale_ = read_config_float(cfg_path, "\"router_scaling_factor\"", expert_w_scale_);
+            if (leading_dense_ == 0)
+                leading_dense_ = q4nx_config_int(cfg_path.c_str(), "first_k_dense_replace", 0);
+            if (leading_dense_ > 0 && dense_im_ == 0) dense_im_ = c_.IM;
+        }
+        // The per-expert tile grid, from the first MoE layer's own gate stack rather than the name convention:
+        // FLM-named Qwen MoE containers transpose each expert ([K][N] slices), Hy-Memory-30B-A3B's do not -- its
+        // gate stack is [E * N/32][K/256][chunk] = [3072][8][4736] for N = 768, K = 2048. Read the wrong way, every
+        // expert is a permutation and the model answers " of of of".
+        {
+            char gn[160];
+            snprintf(gn, sizeof gn, "model.layers.%d.mlp.gate_exps_proj.weight", leading_dense_ > 0 ? leading_dense_ : 0);
+            const TensorDesc* gt = model_tensor_by_name(mw_, gn);
+            if (gt && gt->ndim == 3 && n_expert_ > 0 && gt->shape[0] % n_expert_ == 0 &&
+                gt->shape[0] / n_expert_ * Q4NX_TILE_ROWS == expert_im_ &&
+                gt->shape[1] * Q4NX_TILE_COLS == q4nx_pad_k(c_.H) && expert_im_ != q4nx_pad_k(c_.H)) {
+                moe_slice_nk_ = true;
+                fprintf(stderr, "  [moe] per-expert slices are [N][K] (%s is [%lld][%lld][...])\n", gn,
+                        (long long)gt->shape[0], (long long)gt->shape[1]);
+            }
+        }
         if (top_k_ <= 0 || top_k_ > n_expert_ || expert_im_ <= 0) {
             fprintf(stderr, "  [moe] config incomplete (n_expert=%d top_k=%d im=%d)\n",
                     n_expert_, top_k_, expert_im_);
@@ -1382,8 +1419,28 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                  q4nx_pad_n(dims.IM), tag);
         dims.fused_gu = file_exists(gu) || !file_exists(g) ? 1 : 0;
     }
+    // A MoE with a leading dense layer and no MLA (hy_v3): the routed experts' G/U/D are at the expert width, and the
+    // dense layer gets its own DG/DU/DD at intermediate_size -- the arrangement the MLA path already uses.
+    const bool moe_lead_dense = n_expert_ > 0 && !mla_ && leading_dense_ > 0 && dense_im_ > 0;
+    if (moe_lead_dense) { dims.IM = expert_im_; dims.fused_gu = 0; }
     ndesigns_ = q4nx_derive_designs(&dims, designs_);
     if (ndesigns_ <= 0) { err_ = "design derivation failed"; return false; }
+    if (moe_lead_dense && ndesigns_ + 3 <= Q4NX_MAX_DESIGNS) {
+        const struct { Q4nxDesign role; int K, N; const char* tag; } dd[3] = {
+            {Q4NX_DESIGN_DG, c_.H, dense_im_, "DG"}, {Q4NX_DESIGN_DU, c_.H, dense_im_, "DU"},
+            {Q4NX_DESIGN_DD, dense_im_, c_.H, "DD"}};
+        for (const auto& x : dd) {
+            memset(&designs_[ndesigns_], 0, sizeof(designs_[ndesigns_]));
+            designs_[ndesigns_].M = dims.M; designs_[ndesigns_].K = q4nx_pad_k(x.K); designs_[ndesigns_].N = q4nx_pad_n(x.N);
+            designs_[ndesigns_].real_k = x.K; designs_[ndesigns_].real_n = x.N;
+            designs_[ndesigns_].role = x.role;
+            snprintf(designs_[ndesigns_].elf_name, Q4NX_ELF_NAME_MAX, "full_i8_%s_K%d_N%d.elf", x.tag,
+                     q4nx_pad_k(x.K), q4nx_pad_n(x.N));
+            ndesigns_++;
+        }
+        fprintf(stderr, "  [forward] MoE with %d leading dense layer(s): experts at IM %d, dense FFN at %d\n",
+                leading_dense_, expert_im_, dense_im_);
+    }
     // Batched expert gate/up (MoE): one GEMM per projection over ALL top-k experts
     // at once, instead of one per expert.  Derived here rather than in
     // q4nx_derive_designs because it depends on top_k, which the dims struct does
@@ -2433,7 +2490,26 @@ bool Q4nxNpuForward::load_layer(int l) {
         }
         if (!deq(&lw->o_proj_weight, wo_.data(), H, q4nx_pad_k(NH * hd))) return false;
     }
-    if (n_expert_ > 0) {
+    if (n_expert_ > 0 && !mla_ && l < leading_dense_) {
+        // the leading dense layer of a non-MLA MoE (hy_v3): dense_mlp's DG/DU/DD weights
+        char dn[160];
+        auto load_dense = [&](const char* fmt, std::vector<float>& v, int rows, int cols) -> bool {
+            snprintf(dn, sizeof dn, fmt, l);
+            TensorDesc* d = model_tensor_by_name(mw_, dn);
+            if (!d) { err_ = std::string("leading dense layer: model.q4nx has no ") + dn; return false; }
+            v.resize((size_t)rows * (size_t)cols);
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            if (!raw || dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) != 0) {
+                err_ = std::string("leading dense layer: cannot read ") + dn;
+                return false;
+            }
+            return true;
+        };
+        return load_dense("model.layers.%d.mlp.gate_proj.weight", dense_g_, dense_im_, H) &&
+               load_dense("model.layers.%d.mlp.up_proj.weight", dense_u_, dense_im_, H) &&
+               load_dense("model.layers.%d.mlp.down_proj.weight", dense_d_, H, dense_im_);
+    }
+    if (n_expert_ > 0 && l >= leading_dense_) {   // a leading dense layer (hy_v3's first_k_dense_replace) runs the dense FFN
         // Qwen MoE layer (qwen3moe / qwen35moe): a router + top-k routed experts
         // instead of a dense gate/up/down.  The router is bf16; its bias is OPTIONAL
         // (Qwen MoE has none, deepseek2 does).  The experts stay pooled -- one
@@ -2459,7 +2535,31 @@ bool Q4nxNpuForward::load_layer(int l) {
             return true;
         };
         if (!load_bf16_named(mn.router, moe_router_, n_expert_ * H)) { err_ = "moe router"; return false; }
-        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) moe_router_b_.clear();
+        {
+            // A router stored [H][E] (Hy-Memory-30B-A3B's moe_router.weight is upstream's [E][H] transposed,
+            // checked against tencent/Hy-Memory-30B-A3B) is read flat as [E][H] by moe_mlp: transpose it.
+            const TensorDesc* rd = td_named(mn.router);
+            if (rd && rd->ndim == 2 && rd->shape[0] == H && rd->shape[1] == n_expert_ && H != n_expert_) {
+                std::vector<float> t((size_t)n_expert_ * H);
+                for (int k = 0; k < H; k++)
+                    for (int e = 0; e < n_expert_; e++) t[(size_t)e * H + k] = moe_router_[(size_t)k * n_expert_ + e];
+                moe_router_.swap(t);
+            }
+        }
+        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) {
+            moe_router_b_.clear();
+            // hy_v3: the expert-selection bias is `moe_expert_bias`, F32 in FastFlowLM's pack (bf16 from our packer)
+            const TensorDesc* bd = td_named("moe_expert_bias");
+            const void* bp = bd ? model_tensor_data(mw_, const_cast<TensorDesc*>(bd)) : nullptr;
+            if (bp && !strcmp(bd->dtype, "F32") && (size_t)bd->data_size >= sizeof(float) * (size_t)n_expert_) {
+                const float* fp = (const float*)bp;
+                moe_router_b_.assign(fp, fp + n_expert_);
+            } else if (bp && !strcmp(bd->dtype, "BF16") && (size_t)bd->data_size >= 2 * (size_t)n_expert_) {
+                const uint16_t* hp = (const uint16_t*)bp;
+                moe_router_b_.resize((size_t)n_expert_);
+                for (int e = 0; e < n_expert_; e++) moe_router_b_[(size_t)e] = bf16_to_f32(hp[e]);
+            }
+        }
         auto pool = [&](const char* suffix, const uint8_t** p, size_t* bytes) -> bool {
             TensorDesc* d = td_named(suffix);
             if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
@@ -2616,7 +2716,31 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
             return true;
         };
         if (!load_bf16_named(mn.router, moe_router_, n_expert_ * H)) { err_ = "moe router"; return false; }
-        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) moe_router_b_.clear();
+        {
+            // A router stored [H][E] (Hy-Memory-30B-A3B's moe_router.weight is upstream's [E][H] transposed,
+            // checked against tencent/Hy-Memory-30B-A3B) is read flat as [E][H] by moe_mlp: transpose it.
+            const TensorDesc* rd = td_named(mn.router);
+            if (rd && rd->ndim == 2 && rd->shape[0] == H && rd->shape[1] == n_expert_ && H != n_expert_) {
+                std::vector<float> t((size_t)n_expert_ * H);
+                for (int k = 0; k < H; k++)
+                    for (int e = 0; e < n_expert_; e++) t[(size_t)e * H + k] = moe_router_[(size_t)k * n_expert_ + e];
+                moe_router_.swap(t);
+            }
+        }
+        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) {
+            moe_router_b_.clear();
+            // hy_v3: the expert-selection bias is `moe_expert_bias`, F32 in FastFlowLM's pack (bf16 from our packer)
+            const TensorDesc* bd = td_named("moe_expert_bias");
+            const void* bp = bd ? model_tensor_data(mw_, const_cast<TensorDesc*>(bd)) : nullptr;
+            if (bp && !strcmp(bd->dtype, "F32") && (size_t)bd->data_size >= sizeof(float) * (size_t)n_expert_) {
+                const float* fp = (const float*)bp;
+                moe_router_b_.assign(fp, fp + n_expert_);
+            } else if (bp && !strcmp(bd->dtype, "BF16") && (size_t)bd->data_size >= 2 * (size_t)n_expert_) {
+                const uint16_t* hp = (const uint16_t*)bp;
+                moe_router_b_.resize((size_t)n_expert_);
+                for (int e = 0; e < n_expert_; e++) moe_router_b_[(size_t)e] = bf16_to_f32(hp[e]);
+            }
+        }
         auto pool = [&](const char* suffix, const uint8_t** p, size_t* bytes) -> bool {
             TensorDesc* d = td_named(suffix);
             if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
@@ -4259,7 +4383,8 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
     const bool sandwich = gemma4_layer_ && ple_dim_ == 0 && sem_.extra_layer_norms == 2;
     // gpt_oss runs its MoE, sinks and o bias in step() only, so a batched prefill takes the per-token path
     const bool simple_dense =
-        !mla_ && ple_dim_ == 0 && (!gemma4_layer_ || sandwich) && kv_self && !sem_.gpt_oss;
+        !mla_ && ple_dim_ == 0 && (!gemma4_layer_ || sandwich) && kv_self && !sem_.gpt_oss &&
+        !(n_expert_ > 0 && leading_dense_ > 0);   // a leading dense layer of a non-MLA MoE runs in step() only
     if (!simple_dense || getenv("NPU_NO_BATCH")) {
         if (inject_embeds_) {
             err_ = "step_batch_embeds: this model's batched body falls back to per-token step(), which needs "
@@ -4655,7 +4780,7 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
         for (int m = 0; m < M; m++)
             rmsnorm(X.data() + (size_t)m * H, (sandwich ? pre_ff_norm_ : post_norm_)[l].data(), H,
                     XN.data() + (size_t)m * H);
-        if (n_expert_ > 0) {
+        if (n_expert_ > 0 && l >= leading_dense_) {   // a leading dense layer (hy_v3's first_k_dense_replace) runs the dense FFN
             // MoE FFN: the router/top-k pick different experts per row, so this
             // stays per-token (the attention GEMMs above are already batched).
             // Grouping rows by expert so each expert's weight read serves the
@@ -4984,6 +5109,7 @@ bool Q4nxNpuForward::mla_expert(const uint8_t* pool, size_t per_expert, int e,
     // 0.00855 on [K][N].
     int rows = K, cols = N;
     moe_slice_geometry(moe_format_, N, K, &rows, &cols);
+    if (moe_slice_nk_) { rows = N; cols = K; }   // the container's own grid says [N][K] (init_impl)
     if (dequant_any(pool + (size_t)e * per_expert, per_expert, rows, cols, out.data()) != 0)
         return false;
     return true;
@@ -5844,7 +5970,14 @@ bool Q4nxNpuForward::step_impl(int token, int pos, std::vector<float>& logits, i
             if (!nancheck("moe")) return false;
             continue;
         }
-        if (n_expert_ > 0) {
+        if (n_expert_ > 0 && !mla_ && l < leading_dense_) {
+            if (!dense_mlp(l, xn, d)) return false;
+            { LhScope _tlh(LH_RES);
+            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_; }
+            if (!nancheck("dense")) return false;
+            continue;
+        }
+        if (n_expert_ > 0 && l >= leading_dense_) {   // a leading dense layer (hy_v3's first_k_dense_replace) runs the dense FFN
             // Qwen MoE layer (qwen3moe / qwen35moe): the FFN is router -> top-k
             // experts, not a dense gate/up/down.  moe_mlp writes the whole FFN
             // delta into d.  (deepseek2/GLM MoE layers never reach here -- the MLA

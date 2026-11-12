@@ -451,6 +451,29 @@ void test_logprobs() {
     const auto tied = logprobs_of(std::vector<float>{1.0f, 1.0f, 1.0f}, 0, 2);
     check(tied.top.size() == 2 && tied.top[0].id == 0 && tied.top[1].id == 1, "ties keep the lower id first");
 
+    // engine#2272: a head WIDER than the tokenizer (Qwen3: 151,669 ids against 151,936 rows). The row carries logits for
+    // ids the vocabulary does not have; they must not join the normaliser, and they must not be nameable in `top`.
+    {
+        const std::vector<float> padded = {1.0f, 2.0f, 0.5f, /* padding: */ 9.0f, 9.0f, 9.0f};
+        const int vocab = 3;
+        const auto bounded = logprobs_of(padded.data(), token_bound(padded.size(), vocab), 1, 2);
+        const auto unbounded = logprobs_of(padded.data(), padded.size(), 1, 2);
+        const double m = 2.0, lz = m + std::log(std::exp(1.0 - m) + 1.0 + std::exp(0.5 - m));
+        check(std::fabs(double(bounded.logprob) - (2.0 - lz)) < 1e-6,
+              "a padded row's logprob is the softmax over the VOCABULARY, not over the padding");
+        check(std::fabs(double(unbounded.logprob) - double(bounded.logprob)) > 1e-3,
+              "...which differs from the unbounded computation, so this was visible, not cosmetic");
+        check(bounded.top.size() == 2 && bounded.top[0].id == 1 && bounded.top[1].id == 0,
+              "...and `top` names only real ids, in the sampler's tie order");
+        bool padding_in_top = false;
+        for (const auto& e : bounded.top) padding_in_top = padding_in_top || e.id >= vocab;
+        check(!padding_in_top, "...no padding id (3..5) appears in top_logprobs");
+        // The vector overload forwards with logits.size(), so it cannot bound: a caller that reaches for the convenient
+        // form replays engine#2272 exactly. Pinned here so the trap is visible in the tests rather than discovered again.
+        check(std::fabs(double(logprobs_of(padded, 1, 2).logprob) - double(unbounded.logprob)) < 1e-9,
+              "the vector overload is UNBOUNDED by construction -- callers with a padded head must pass the bound");
+    }
+
     // More alternatives than the vocabulary reports what exists.
     check(logprobs_of(logits, 1, 100).top.size() == 2, "top_n past the vocabulary reports all of it");
 

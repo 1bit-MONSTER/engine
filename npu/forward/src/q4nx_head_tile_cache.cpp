@@ -25,6 +25,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <vector>
 
 namespace {
@@ -139,6 +140,10 @@ extern "C" int q4nx_head_tile_image(const char* dir, const Q4nxHeadImageKey* key
         if (q4nx_head_image_read(path, codes, (int)image_bytes, scales, nd, &info, why, (int)sizeof why)) {
             if (sample_agrees(*key, n0, ncols, k, kd, nd, col, ctx, codes, scales, res)) {
                 res->hit = 1;
+                // engine#2263: a hit is a use. The Q4NX cache sweep ages a head-image key by its newest file, and a read
+                // does not move a file's mtime, so without this a pack served every day aged from the day it was packed.
+                std::error_code tec;
+                std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), tec);
                 return 1;
             }
             res->refused = 1;   // `why` was set by the sample

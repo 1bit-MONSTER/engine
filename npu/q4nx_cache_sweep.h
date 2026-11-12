@@ -51,9 +51,15 @@ Q4nxCacheSweep q4nx_cache_evict(const std::string& root, const std::string& keep
 // q4nx_cache_evict() makes (LRU first, `keep` and the age window respected, stop at max_bytes), returned instead of applied,
 // so the two cannot drift: evict() is now this list plus a remove loop.
 struct Q4nxCacheCandidate {
-    std::string name;    // the entry directory's name, as it appears under the root
+    std::string name;    // the entry's path under the root: a directory's name, or "head-images/headimg-<digest>" for a key
     int64_t bytes = 0;
+    std::vector<std::string> files;   // engine#2263: a head-image key's files (removed one by one); empty for a directory
 };
+
+// engine#2263: `<root>/head-images` holds the forward's lm-head images, one file per tile, for every pack and kernel set a
+// serve has loaded. The sweep treats each key ("headimg-<digest>", all its tiles) as an entry of its own, aged by its newest
+// file, instead of the directory as one entry it could only keep or remove whole.
+inline constexpr const char* kQ4nxHeadImagesDir = "head-images";
 std::vector<Q4nxCacheCandidate> q4nx_cache_candidates(const std::string& root, const std::string& keep, int64_t max_bytes,
                                                       int64_t min_age_seconds = 600);
 
@@ -77,3 +83,16 @@ int64_t q4nx_cache_bound_bytes(const char* text, int64_t default_gib = 60);
 // just-opened entry inside the sweep's age window, which is what makes "a serve may be reading it" true for a reused entry
 // and not only for a new one. Failure is ignored (a read-only cache still serves).
 void q4nx_cache_touch(const std::string& entry);
+
+// engine#2263: the cache root every writer uses (app/serve.cpp's repack, npu/q4nx_device.cpp's device form, the forward's
+// head images): $ONEBIT_Q4NX_CACHE, else ~/.cache/1bit/q4nx with the home from HOME or the user database. Empty when there
+// is no home. `1bit q4nx-cache evict` used to resolve ONEBIT_Q4NX_CACHE_DIR and $XDG_CACHE_HOME instead, which no writer
+// reads, so with either set it swept a directory nothing wrote to.
+std::string q4nx_cache_default_root();
+
+// engine#2263: the sweep a forward load runs (app/forward_serve.cpp). A pack that needs no conversion still writes its head
+// images into the cache, and device_form() sweeps only when it converts. Same bound (ONEBIT_Q4NX_CACHE_MAX_GIB) and age
+// window; nothing is kept by name, since a load marks what it uses (q4nx_cache_touch, the head-image hit) and the age
+// window protects it.
+Q4nxCacheSweep q4nx_cache_sweep_after_load();
+

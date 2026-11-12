@@ -145,7 +145,10 @@ struct ForwardEngine {
     std::string dump_logits;
     // --spec-lookup K (engine#1781): a greedy request (grammar or not) decodes through mtp::run_from() with
     // the prompt-lookup drafter, up to K drafts verified per batch; 0 = off (the default). --spec-fallback X: stop
-    // drafting for the rest of a reply once its last 3 rounds averaged fewer than X tokens (0 = never).
+    // drafting for the rest of a reply once its last 3 rounds averaged fewer than X tokens (0 = never). Unset, it
+    // defaults to 2 with the lookup drafter and 3 with a draft model: below that a round costs more than the plain steps
+    // it replaces (served 27B, prose, A B A B: a draft that keeps 2.24 tokens per round ran 2.51 tok/s with no fallback
+    // against 3.88 with the default, which stops drafting after round 5).
     int spec_lookup = 0;
     double spec_fallback = 0.0;
     // --spec-sample: a sampled request (temperature > 0) takes the speculative path too, its drafts kept or refused by
@@ -1206,6 +1209,7 @@ int run_forward_serve(int argc, char** argv) {
     int ctx_size = 0;                // --ctx-size N: prompt plus answer, at most the model's own (0 = the model's)
     int spec_lookup = 0;             // --spec-lookup K (engine#1781): prompt-lookup drafts, K per verify batch
     double spec_fallback = 0.0;      // --spec-fallback X: stop drafting below X tokens per round
+    bool fallback_set = false;       // unset: the drafter's default (below)
     bool spec_sample = false;        // --spec-sample: sampled requests speculate too (distribution-keeping rule)
     std::string spec_draft;          // --spec-draft <dir>: a DFlash draft package as the drafter
     int spec_draft_k = 0;            // --spec-draft-k K: drafts per round (default: the package's block - 1)
@@ -1229,7 +1233,7 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--npu-target") npu_target = next();
         else if (a == "--dump-logits") dump_logits = next();
         else if (a == "--spec-lookup") spec_lookup = std::stoi(next());
-        else if (a == "--spec-fallback") spec_fallback = std::stod(next());
+        else if (a == "--spec-fallback") { spec_fallback = std::stod(next()); fallback_set = true; }
         else if (a == "--spec-sample") spec_sample = true;
         else if (a == "--spec-draft") spec_draft = next();
         else if (a == "--spec-draft-k") spec_draft_k = std::stoi(next());
@@ -1244,6 +1248,10 @@ int run_forward_serve(int argc, char** argv) {
         throw std::runtime_error("--spec-lookup takes 0..15 drafts per round (a verify batch holds at most 16 rows), not " +
                                  std::to_string(spec_lookup));
     if (!(spec_fallback >= 0.0)) throw std::runtime_error("--spec-fallback takes a number of tokens >= 0");
+    if (!fallback_set) spec_fallback = !spec_draft.empty() ? 3.0 : spec_lookup > 0 ? 2.0 : 0.0;
+    if (spec_lookup > 0 || !spec_draft.empty())
+        std::fprintf(stderr, "1bit forward-serve: speculative decode falls back to plain below %g tokens per round (%s)\n",
+                     spec_fallback, fallback_set ? "--spec-fallback" : "default");
     if (spec_sample && spec_lookup == 0 && spec_draft.empty())
         throw std::runtime_error("--spec-sample needs a drafter (--spec-lookup K or --spec-draft <dir>)");
     if (streams < 1 || streams > kNpuMaxStreams)

@@ -3554,7 +3554,7 @@ fewer than `fallback_below` tokens on average, the run finishes with plain steps
 round). `tools/dflash2_probe loop` with `DFLASH2_MTP_RUN=1` drives the served 27B through exactly these pieces, with
 `DFlashHead` and the DFlash 2 selector as its pick hook, after the same batched prefill as its hand-written loop.
 
-**Serving it: `forward-serve --spec-lookup K`** (off by default; `--spec-fallback X` adds the fallback). A request that
+**Serving it: `forward-serve --spec-lookup K`** (off by default; `--spec-fallback X` sets the fallback, which defaults to 2 tokens per round with this drafter and 3 with `--spec-draft`, and `--spec-fallback 0` turns it off: on the served 27B a prose reply that keeps 2.24 tokens per DFlash round ran at 2.51 tok/s without one and 3.88 with the default, A B A B). A request that
 is greedy (on a server without `--dump-logits`) decodes through
 `mtp::run_from()` with the prompt-lookup drafter (`npu/mtp/prompt_lookup.h`). That drafter needs no model: it proposes
 the up to `K` tokens that followed the latest earlier occurrence of the stream's last one to three tokens. Every

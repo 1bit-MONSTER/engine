@@ -390,6 +390,12 @@ def main():
                                                             for l in logs["sample"].splitlines())
         fails += not ok
         print(f"{'PASS' if ok else 'FAIL'}  sample: a sampled constrained reply speculates and stays in its grammar ({sg!r})")
+        # Unset, --spec-fallback is the drafter's default: 2 tokens per round for the lookup, 3 for a draft model.
+        for arm, want in (("spec", 2), ("dflash", 3), ("sample", 2)):
+            line = f"speculative decode falls back to plain below {want} tokens per round (default)"
+            ok = line in logs[arm]
+            fails += not ok
+            print(f"{'PASS' if ok else 'FAIL'}  {arm}: unset --spec-fallback is the drafter's default ({want})")
         sc = replies["sample_chat_sampled"]
         ok = len(sc[2]) >= 2 and all(l <= 0 and len(x) == 3 and x[0][1] >= l for _, l, x in sc[2])
         fails += not ok

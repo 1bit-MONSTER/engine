@@ -3917,6 +3917,18 @@ Plan plan(const std::string& pack_dir) {
             p.container_geometry_source = g.source;
             p.container_geometry_missing = g.missing;
             p.container_geometry_inferred = g.inferred;
+            // slice 3b: the roles, so the note states what the pack carries rather than only its size.
+            const ContainerRoles roles = container_roles(c.tensors);
+            p.container_role_counts = roles.counts;
+            p.container_roles_unassigned = roles.unassigned;
+            std::string role_note;
+            if (roles.unassigned.empty()) {
+                role_note = "every tensor has a known role";
+            } else {
+                role_note = std::to_string(roles.unassigned.size()) + " of " +
+                            std::to_string(int64_t(c.tensors.size())) + " tensors have no known role (first: " +
+                            roles.unassigned.front() + ")";
+            }
             std::string geom = g.source.empty()
                 ? "the container declares no `dims` and no config.json answered, so its geometry is not known here"
                 : "geometry from " + g.source;
@@ -3932,6 +3944,7 @@ Plan plan(const std::string& pack_dir) {
             p.container_note = c.why.empty()
                 ? "the pack is a safetensors container (model.q4nx): " + std::to_string(c.tensors.size()) +
                       " tensors, " + std::to_string(c.payload_bytes) + " B of payload, no graph; " + geom +
+                      "; " + role_note +
                       ". Reading it as a weights source needs the container-genre plan (engine#1786, item F1); until"
                       " then this pack is recognised and reported, not importable."
                 : "model.q4nx is present but unreadable: " + c.why;

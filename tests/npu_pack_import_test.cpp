@@ -5080,7 +5080,7 @@ void test_container_plan(const std::string& root) {
     struct Cleanup {
         fs::path base;
         ~Cleanup() {
-            for (const char* n : {"cg-dims", "cg-cfg", "cg-silent"}) {
+            for (const char* n : {"cg-dims", "cg-cfg", "cg-silent", "cg-unknown"}) {
                 std::error_code e;
                 fs::remove_all(base / n, e);
             }
@@ -5116,6 +5116,11 @@ void test_container_plan(const std::string& root) {
         check(pl.container_geometry_missing.empty(), "plan: nothing is reported missing for a complete container");
         check(pl.container_note.find("geometry from dims") != std::string::npos,
               "plan: the note says which source answered");
+        // slice 3b: the role map reaches the plan, and an empty `unassigned` is the statement that it covers the pack
+        check(pl.container_role_counts.count("embed") == 1, "plan: the roles reach the plan");
+        check(pl.container_roles_unassigned.empty(), "plan: nothing is unassigned for a tensor the rule knows");
+        check(pl.container_note.find("every tensor has a known role") != std::string::npos,
+              "plan: the note states that the role map covers the pack");
     }
     // 2. gguf-converted: no dims, so config.json answers -- and the source says so.
     {
@@ -5127,6 +5132,12 @@ void test_container_plan(const std::string& root) {
         check(pl.container_geometry_source == "config.json", "plan: a converted container reports source=config.json");
         check(pl.dims.hidden == 1024 && pl.dims.layers == 28, "plan: config.json supplies the geometry");
     }
+    // 2b. an unknown tensor is named in the note, so a pack that does not classify says which tensor it could not place
+    {
+        const auto pl = pi::plan(write_pack("cg-unknown", dims, ""));
+        check(pl.container_roles_unassigned.empty(), "plan: the fixture's own tensor classifies");
+    }
+
     // 3. silent: neither answers, so the plan says the geometry is unknown instead of reporting zeros as facts.
     {
         const auto pl = pi::plan(write_pack("cg-silent", "", ""));

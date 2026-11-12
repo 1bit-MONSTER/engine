@@ -36,6 +36,7 @@
 // Where it runs: in CI (engine#1946), built against the public runtime stub and run by tests/batch_check_state_ci.py
 // on a two-layer container that script fabricates; and on a dev box with ONEBIT_NPU=ON, on the container named by
 // ONEBIT_TEST_Q4NX.
+#include "file_create.h"
 #include "q4nx_forward.h"
 
 #include <cmath>
@@ -90,13 +91,6 @@ int main() {
         std::printf("SKIP: init_host failed for %s (%s)\n", model.c_str(), fwd.last_error());
         return 77;
     }
-    // ONEBIT_TEST_Q4NX_LOAD_ONLY=1: stop here. The row is "this container loads through the forward" and nothing more;
-    // tests/batch_check_state_ci.py uses it for a fabricated family whose only claim is that the load is not refused.
-    if (const char* lo = std::getenv("ONEBIT_TEST_Q4NX_LOAD_ONLY"); lo && lo[0] == '1') {
-        std::printf("PASS  init_host accepted %s\n", model.c_str());
-        std::printf("ALL PASS (load only)\n");
-        return 0;
-    }
 
     // Values do not matter; the split does. Three chunks: [0,3), [3,5), [5,6) -- the last is the serve path's
     // split-off final token, which is a step_batch at start_pos > 0 on every request.
@@ -110,6 +104,17 @@ int main() {
             std::printf("FAIL  sequential step %zu failed: %s\n", m, fwd.last_error());
             return 1;
         }
+    }
+    // A caller that has its own reference forward of the container (tests/batch_check_state_ci.py lfm3) asks for the
+    // sequential logits: batched == sequential cannot see a rule both paths get wrong, a reference can.
+    if (const char* out = std::getenv("ONEBIT_TEST_LOGITS_OUT")) {
+        FILE* f = onebit_fopen_private_wb(out);   // 0600, never through a symlink (file_create.h)
+        if (!f || std::fwrite(ref.data(), sizeof(float), ref.size(), f) != ref.size()) {
+            std::printf("FAIL  cannot write the sequential logits to %s\n", out);
+            if (f) std::fclose(f);
+            return 1;
+        }
+        std::fclose(f);
     }
 
     fwd.reset();

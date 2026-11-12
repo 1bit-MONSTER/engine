@@ -363,6 +363,24 @@ struct ContainerGeometry {
 };
 ContainerGeometry container_geometry(const nlohmann::json& meta, const nlohmann::json& config);
 
+// engine#1786 (item F1), slice 3a: a container's ROLES, from tensor names alone -- the question a plan must answer
+// before it can map a tensor to a projection.
+//
+// Measured on this box (engine#1786 comment of 2026-11-11, headers only, 30 packs): **21 of 30 classify fully by name
+// alone**, and the entire residue is two families -- `model.layers.N.linear_attn.ssm_*` (the SSM-hybrid attention) and
+// `model.mtp.*` (MTP draft heads, which are not models). Both HF and the alternate spellings resolve (`q_proj` and
+// `attn_q`/`wq`), and so do the biases. So the rule below is a RULE, not a per-pack table -- which is why it is worth
+// having before the SSM forward exists.
+//
+// What a role does NOT establish: the byte layout of the tensor, or whether it is stored transposed. A name says which
+// projection; `graph_weights` (present on 13 of the packs) and the pack's own `dims` are what check the rest.
+struct ContainerRoles {
+    std::map<std::string, std::string> role_of;   // tensor name -> role
+    std::vector<std::string> unassigned;          // names no role matched, in header order
+    std::map<std::string, int> counts;            // role -> number of tensors
+};
+ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 // engine#1889 (review of #2063): plan()'s wide-q branch (q_out != hidden), as one function so its effect on the plan is
@@ -734,6 +752,13 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
                         bool row_major = kExtQuantsRowMajor);
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
                       int N, int K, int block, bool swap_nibbles = false, bool drop_zero = false);
+
+// The implicit zero point 2^(bits-1) for a MatMulNBits with no zeros tensor, and the bit width its SPELLING implies
+// (`weight_Q4` -> 4, `weight_Q8` -> 8, anything else -> the node's own value). Exposed because the pair is what can drift:
+// the projection path used to pass a hardcoded 4 while the head path passed the node's bits, so a future `weight_Q8`
+// spelling would have kept the lookup working and left the zero point at 8 instead of 128 (engine#1841).
+void implicit_zp_zero(Q4& q, int bits);
+int  zp_bits_for_spelling(const std::string& spelling, int node_bits);
 
 // One 64-row tile of the .fconst attention payload, as the pack stores it. Established byte-exactly
 // (amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md §7.13, §7.15): the tile is 2*(K/128)+2 subvolumes

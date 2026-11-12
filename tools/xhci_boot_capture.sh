@@ -93,6 +93,49 @@ for d in /sys/bus/pci/drivers/xhci_hcd/0000:*; do
         "$(cat "$d/power_state" 2>/dev/null)" \
         "$(cat "$d/power/runtime_status" 2>/dev/null)" >> "$out/controllers.txt"
 done
+# The states above are a table; this is the sentence a reader needs from it. engine#823's 2026-11-10 audit found a
+# fourth controller reading `runtime_status=resuming` while the other three were `active`/`D0`, and that is a
+# DIFFERENT fault from a controller that was never woken: a resume that never completed cannot report a connect on
+# its port, so the next stick run would see "no device" for a reason the fix does not address. Recording the value
+# was never the gap (the loop above has always written it); saying which of the two it is, is.
+# A function, not an inline block, so the three classifications can be driven on a fixture without a device (the
+# same reason every other rule in this tree is header-only/function-shaped: the decision is what can be wrong).
+xhci_verdict_line() {  # <bdf> <control> <power_state> <runtime_status> -> one line on stdout
+    _bdf=$1 _ctl=$2 _pw=$3 _rt=$4
+    case "$_rt" in
+        resuming|suspending)
+            printf '   %s: runtime_status=%s - a transition that did not settle. This is NOT "the controller was never woken": a resume in progress cannot report a connect, so a plug test on this boot would read "no device" for the wrong reason. Re-run the capture after a settle; if it persists, the keep-awake write is landing during the transition (engine#823 audit).\n' "$_bdf" "$_rt"
+            return 2 ;;
+        suspended)
+            if [ "$_ctl" = auto ]; then
+                printf '   %s: suspended under control=auto - the keep-awake rule did NOT hold it. That IS the fix not applying, not a settle problem.\n' "$_bdf"
+                return 1
+            fi
+            printf '   %s: suspended under control=%s - held out of D0 deliberately (not a fault on its own).\n' "$_bdf" "$_ctl"
+            return 0 ;;
+        active|'')
+            return 0 ;;
+        *)
+            # An unrecognised state is NOT "settled": a state this tool cannot name is a state it cannot vouch for,
+            # which is the rule every check in this tree applies to an unreadable input (engine#1599/#2039).
+            printf '   %s: runtime_status=%s is not one of active/suspended/resuming - this tool cannot vouch for this controller, so it is counted UNKNOWN, not settled.\n' "$_bdf" "$_rt"
+            return 3 ;;
+    esac
+}
+
+{
+    echo "== verdict (engine#823's two faults, told apart):"
+    settled=0; notkept=0; stuck=0; unknown=0
+    while read -r _b _c _p _r; do
+        [ -n "$_b" ] || continue
+        xhci_verdict_line "$_b" "$_c" "$_p" "$_r"; _rc=$?
+        case "$_rc" in 2) stuck=$((stuck+1)) ;; 1) notkept=$((notkept+1)) ;; 3) unknown=$((unknown+1)) ;; *) settled=$((settled+1)) ;; esac
+    done < <(sed -n 's/^\([^ ]*\)  control=\([^ ]*\)  power_state=\([^ ]*\)  runtime_status=\(.*\)$/\1 \2 \3 \4/p' "$out/controllers.txt")
+    echo "   -> $settled settled, $notkept not kept awake, $stuck in a transition, $unknown unreadable"
+    [ "$((stuck + unknown))" -gt 0 ] && echo "   -> this boot CANNOT answer the plug question for those $((stuck + unknown)) controller(s); capture again after they settle, or read the state by hand."
+} > "$out/verdict.txt" 2>&1
+cat "$out/verdict.txt"
+
 # The rule's own subject, as the running system sees it (the image ships it; a non-1bit boot does not).
 {
     echo "== udev rule on this system:"

@@ -96,8 +96,11 @@ DraftWeights tiny_model() {
     w.hidden_norm = {0.5f, 3.0f};
     w.norm = {1.0f, 1.0f};
     DraftLayerWeights L;
-    L.q = L.k = L.o = L.down = identity(2);
-    L.v = {2.0f, 0.0f, 0.0f, 3.0f};
+    L.q = L.k = L.o = identity(2);
+    // v and down each have one entry off the diagonal, so a projection applied transposed gives another answer
+    // (review of #2174: with every matrix diagonal, W and W^T were the same thing).
+    L.v = {2.0f, 1.0f, 0.0f, 3.0f};        // v(x) = (2 x0 + x1, 3 x1)
+    L.down = {1.0f, 0.5f, 0.0f, 1.0f};     // down(m) = (m0 + 0.5 m1, m1)
     // gate and up differ, and gate drives its first output negative where up is positive, so silu(gate) * up and
     // silu(up) * gate are different numbers: which of the two is activated is part of the answer.
     L.gate = {-1.0f, 0.0f, 0.0f, 2.0f};
@@ -125,8 +128,10 @@ void tiny_tail(double x0, double x1, double a0, double a1, double& o0, double& o
     double y0 = x0 + a0, y1 = x1 + a1;          // residual (o_proj is the identity)
     double p0 = y0, p1 = y1;
     rms2(p0, p1);                                // post_norm
-    y0 += silu(-1.0 * p0) * (3.0 * p0);          // silu(gate(p)) * up(p); down is the identity
-    y1 += silu(2.0 * p1) * (0.5 * p1);
+    const double m0 = silu(-1.0 * p0) * (3.0 * p0);   // silu(gate(p)) * up(p)
+    const double m1 = silu(2.0 * p1) * (0.5 * p1);
+    y0 += m0 + 0.5 * m1;                         // down
+    y1 += m1;
     rms2(y0, y1);                                // the final norm
     o0 = y0; o1 = y1;
 }
@@ -138,7 +143,7 @@ void hand_cases() {
         double h0 = 3.0, h1 = 4.0;
         rmsg(h0, h1, 2.0, 0.5);                  // input_norm
         double e0, e1;
-        tiny_tail(3.0, 4.0, 2.0 * h0, 3.0 * h1, e0, e1);
+        tiny_tail(3.0, 4.0, 2.0 * h0 + h1, 3.0 * h1, e0, e1);
         const std::vector<float> out = draft_forward(w, nullptr, 0, noise, 1);
         check(out.size() == 2 && std::fabs(out[0] - e0) < 1e-5 && std::fabs(out[1] - e1) < 1e-5,
               "one row, no context: the output is the hand-computed one");
@@ -165,7 +170,7 @@ void hand_cases() {
         rot(khn0, khn1, 6.0, kh0, kh1);
         const double sc = (q0 * kc0 + q1 * kc1) / std::sqrt(2.0), sh = (q0 * kh0 + q1 * kh1) / std::sqrt(2.0);
         const double wc = std::exp(sc) / (std::exp(sc) + std::exp(sh)), wh = 1.0 - wc;
-        const double a0 = wc * 2.0 * c0 + wh * 2.0 * h0, a1 = wc * 3.0 * c1 + wh * 3.0 * h1;   // v = diag(2, 3)
+        const double a0 = wc * (2.0 * c0 + c1) + wh * (2.0 * h0 + h1), a1 = wc * 3.0 * c1 + wh * 3.0 * h1;   // v as above
         double e0, e1;
         tiny_tail(-2.0, 1.0, a0, a1, e0, e1);
         const std::vector<float> out = draft_forward(w, tap, 1, noise, 1, 5);
@@ -264,6 +269,27 @@ void properties() {
     }
 }
 
+// The context cache: grown in steps it gives exactly the pass draft_forward() gives, and a pass can follow every step.
+void cache_steps() {
+    const DraftWeights w = random_model(5);
+    Rng r{77};
+    const int ctx = 5, block = 3, H = 8;
+    const std::vector<float> taps = r.vec(size_t(ctx) * 16, 1.0f);
+    const std::vector<float> noise = r.vec(size_t(block) * size_t(H), 1.0f);
+    const std::vector<float> fused = fuse_context(w, taps.data(), ctx);
+    DraftKvCache c;
+    c.pos0 = 3;
+    cache_extend(w, c, fused.data(), 2);
+    const std::vector<float> two = draft_forward_cached(w, c, noise.data(), block);
+    check(max_diff(two, draft_forward(w, taps.data(), 2, noise.data(), block, 3)) == 0.0,
+          "cache: two rows, then a pass, is the pass over those two rows");
+    cache_extend(w, c, fused.data() + 2 * H, 1);
+    cache_extend(w, c, fused.data() + 3 * H, 2);
+    check(c.rows == ctx, "cache: rows add up");
+    check(max_diff(draft_forward_cached(w, c, noise.data(), block), draft_forward(w, taps.data(), ctx, noise.data(), block, 3)) == 0.0,
+          "cache: grown 2 + 1 + 2 rows, it gives exactly draft_forward's pass over all 5");
+}
+
 void refusals() {
     const DraftWeights w = random_model(3);
     const std::vector<float> noise(8, 0.5f);
@@ -322,10 +348,40 @@ void real_package(const std::string& dir) {
     }
 }
 
+// DFlash 2's two extra pieces, each against arithmetic written out here.
+void dflash2_pieces() {
+    {   // 3 rows of 4, groups of 2, a kernel of 2 offsets. base[offset][i], dyn[row][offset][group].
+        const float x[12] = {1, 2, 3, 4,   5, 6, 7, 8,   -1, 0, 2, -2};
+        const float base[8] = {1, 1, 1, 1,   0.5f, 0, -1, 2};          // offset 0: identity; offset 1: per element
+        const float dyn[12] = {0, 0,  9, 9,      1, -1,  0.5f, 0,      0, 2,  -1, 1};
+        // row 0: only offset 0 exists; (1 + 0) * x0                       (its offset-1 kernel, the 9s, has nothing to read)
+        // row 1: (1 + 1) * 5, (1 + 1) * 6, (1 - 1) * 7, (1 - 1) * 8  +  (0.5 + 0.5) * 1, (0 + 0.5) * 2, (-1 + 0) * 3, (2 + 0) * 4
+        // row 2: (1 + 0) * -1, (1 + 0) * 0, (1 + 2) * 2, (1 + 2) * -2 +  (0.5 - 1) * 5, (0 - 1) * 6, (-1 + 1) * 7, (2 + 1) * 8
+        const float want[12] = {1, 2, 3, 4,   10 + 1, 12 + 1, 0 - 3, 0 + 8,   -1 - 2.5f, 0 - 6, 6 + 0, -6 + 24};
+        const std::vector<float> got = draft_conv(x, 3, 4, 2, 2, base, dyn);
+        bool same = got.size() == 12;
+        for (int i = 0; i < 12 && same; i++) same = std::fabs(got[size_t(i)] - want[i]) < 1e-6;
+        check(same, "DFlash 2 convolution: three rows against the hand-computed ones (a row's own kernel, the row before, "
+                    "the group a value belongs to, nothing before the first row)");
+    }
+    {   // 3 candidates, rank 2. scores: 1.0 + (2*0.5*1 + -1*4*0) = 2.0;  1.5 + (2*0.5*-1 + -1*4*0.5) = -1.5;  0.2 + (2*0.5*2 + -1*4*-0.25) = 3.2
+        const float unary[3] = {1.0f, 1.5f, 0.2f}, prev[2] = {2.0f, -1.0f}, h[2] = {0.5f, 4.0f};
+        const float succ[6] = {1.0f, 0.0f,   -1.0f, 0.5f,   2.0f, -0.25f};
+        check(selector_pick(unary, 3, prev, h, succ, 2) == 2,
+              "selector: the pairwise term can lift the lowest-logit candidate over the highest");
+        const float flat[6] = {0, 0, 0, 0, 0, 0};
+        check(selector_pick(unary, 3, prev, h, flat, 2) == 1, "selector: with no pairwise term it is the plain argmax");
+        const float tie[3] = {1.0f, 1.0f, 1.0f};
+        check(selector_pick(tie, 3, prev, h, flat, 2) == 0, "selector: the first of equals is kept");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     hand_cases();
+    dflash2_pieces();
+    cache_steps();
     properties();
     refusals();
     const char* real = (argc > 1 && argv[1][0] != '\0') ? argv[1] : std::getenv("ONEBIT_TEST_DFLASH_DRAFT");

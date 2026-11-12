@@ -204,6 +204,9 @@ public:
     // Public: a speculative driver outside this class begins a verify batch, then commits a prefix of it.
     void begin_verify(int rows, int start_pos);
     bool commit_verify_rows(int accepted);
+    // How many commits took the full-accept path (kept the batch's own state instead of restoring and replaying it).
+    // A test that compares the two paths reads it to know the path it meant to test is the one that ran.
+    long full_accepts_kept() const { return full_accepts_kept_; }
     bool gdn_apply_rows(int from, int to);      // recurrence-only replay of stored rows [from, to)
 
 
@@ -252,6 +255,7 @@ private:
     bool load_norms();
     std::vector<float> last_hidden_;  // last_hidden(): the post-final-norm state of the last position
     std::vector<float> last_residual_;  // and one norm earlier: the raw residual of the last position
+    long                full_accepts_kept_ = 0;   // commit_verify_rows(): see full_accepts_kept()
     std::vector<int>    tap_layers_;           // engine#1780: set_layer_taps()
     std::vector<float>* tap_sink_ = nullptr;
     size_t              tap_base_ = 0;         // where the current pass's rows start in *tap_sink_
@@ -430,6 +434,15 @@ private:
     // prompt-encoding forward (step_batch at start_pos 0) attends bidirectionally there and the GDN
     // layers keep their recurrence.  Off unless the plan says so, so a causal model is untouched.
     bool noncausal_attn_ = false;
+    // engine#1959: measured wall of one batched launch per design, narrow (the 16-row twin) and wide (the prefill
+    // design), for cached weights only. npu_gemm_rows() reads them to decide whether a 17..wide-row chunk runs as one
+    // wide launch or as several narrow ones (batch_split.h). 0 = not measured yet. `split_mode_` is NPU_PREFILL_SPLIT:
+    // -1 unset (decide from the measurements), 0 never split (the behaviour before), 1 split whenever a twin exists.
+    double split_narrow_ms_[Q4NX_MAX_DESIGNS] = {0};
+    double split_wide_ms_[Q4NX_MAX_DESIGNS] = {0};
+    int    split_wide_n_[Q4NX_MAX_DESIGNS] = {0};   // wide launches timed so far (batch_split.h: kSplitWideSamples)
+    int    split_mode_ = -2;      // -2 = environment not read yet
+    bool   split_said_ = false;
     // The refusal for a kernel a design needs but the directory does not have.  With a plan it names
     // the plan file and the role, so "which description asked for this" needs no log reading.
     std::string missing_kernel(const std::string& dir, const char* elf_name, Q4nxDesign role) const;
@@ -479,7 +492,10 @@ private:
     int deepstack_lo_ = -1, deepstack_hi_ = -1;
     // Which plane a rotary frequency belongs to under interleaved MRoPE.  The rule lives in q4nx_semantics.h as
     // q4nx_mrope_axis() so the C unit test can pin it without building a forward pass.
-    int mrope_plane(int freq) const { return q4nx_mrope_axis(freq, sem_.n_mrope_section, sem_.mrope_section); }
+    int mrope_plane(int freq) const {
+        return sem_.mrope_sectioned ? q4nx_mrope_axis_sectioned(freq, sem_.n_mrope_section, sem_.mrope_section)
+                                    : q4nx_mrope_axis(freq, sem_.n_mrope_section, sem_.mrope_section);
+    }
     // Some models store the embedding QUANTIZED (Gemma4-E2B/E4B: dtype I8), and
     // reading it as bf16 yields ~zero - which invalidated the whole forward and
     // the tied LM head (all-zero logits).  When the dtype is not BF16 the
@@ -508,6 +524,7 @@ private:
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
     Q4nxRopeLlama3 rope_llama3_;     // rope_type "llama3" (Llama-3.1/3.2/3.3); on == 0 for everything else
     Q4nxRopeDynamic rope_dynamic_;   // rope_type "dynamic" (NTK base rule, engine#1740 W2); on == 0 elsewhere
+    double rope_linear_factor_ = 0.0; // rope_type "linear" factor (Gemma3's full layers); 0 elsewhere
     // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 for
     // every other architecture.  MiniCPM4 scales the embedding by 12 and each
     // residual branch by scale_depth/sqrt(NL) (0.2475 for 32 layers); skipping
@@ -633,6 +650,11 @@ private:
     // Layout and maths: docs/qwen35-4b-weight-format.md.
     int lin_kd_ = 0, lin_vd_ = 0;        // key_dim = nkh*khd, value_dim = nvh*vhd
     int attn_gate_ = 0;                   // qwen3_5 attn_output_gate
+    bool mrope_declared_ = false;         // rope_scaling type "mrope" (Qwen2-VL form), validated after semantics
+    // LFM3's per-head output gate, [NH][H] per attention layer (empty for conv layers and other models):
+    // ctx of head h *= sigmoid(head_gate_[l][h] . xn), xn the operator-normed layer input.
+    std::vector<std::vector<float>> head_gate_;
+    void apply_head_gate(int l, const float* xn, float* ctx, int hd) const;
     int lin_nkh_ = 0, lin_nvh_ = 0;      // head counts
     int lin_khd_ = 0, lin_vhd_ = 0;      // head dims
     int lin_ck_ = 4;                     // depthwise conv kernel

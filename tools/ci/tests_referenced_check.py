@@ -128,9 +128,20 @@ RUNNERS = ("CMakeLists.txt", "cmake", ".github/workflows")
 
 
 def unregistered_selftest_tools(root):
-    """tools/**/*.py that declare a self-test and that no RUNNER names (engine#1901)."""
+    """tools/**/*.py and scripts/*.sh that declare a self-test and that no RUNNER names (engine#1901, engine#2129).
+
+    `scripts/*.sh` was outside this corpus until a self-test there was found with no row at all: `scripts/pkg-proof.sh
+    --self-test` passes on its own and no ctest row or workflow step ran it, so the arm was dead code that every gate
+    called green. A self-test is a claim about a script, and the claim needs a runner whichever directory the script is in.
+    """
     tools = root / "tools"
-    if not tools.is_dir():
+    scripts = root / "scripts"
+    cand = []
+    if tools.is_dir():
+        cand += [p for p in tools.rglob("*.py")]
+    if scripts.is_dir():
+        cand += [p for p in scripts.glob("*.sh")]
+    if not cand:
         return []
     runner_text = []
     for sub in RUNNERS:
@@ -142,7 +153,7 @@ def unregistered_selftest_tools(root):
             except OSError:
                 pass
     drift = []
-    for tool in sorted(tools.rglob("*.py")):
+    for tool in sorted(cand):
         try:
             src = tool.read_text(errors="replace")
         except OSError:
@@ -245,8 +256,13 @@ def check(root):
 
 
 def _selftest_tools(root):
-    tools = root / "tools"
-    return [p for p in tools.rglob("*.py") if SELFTEST.search(p.read_text(errors="replace"))] if tools.is_dir() else []
+    """Every file the corpus above covers that declares a self-test -- counted with the same two directories."""
+    out = []
+    for sub, pat in (("tools", "**/*.py"), ("scripts", "*.sh")):
+        d = root / sub
+        if d.is_dir():
+            out += [p for p in d.glob(pat) if SELFTEST.search(p.read_text(errors="replace"))]
+    return out
 
 
 def self_test():
@@ -263,9 +279,20 @@ def self_test():
             p.write_text(body)
         return d
 
+    cases_root = {}   # hoisted: the scripts/ arms below need it, and it used to be created after case 1
+    # 0a/0b. a self-test in scripts/ -- the corpus that was missing until one was found with no row (engine#2129)
+    # (a clean tests/ corpus is part of the fixture: without one the tool answers 2 "cannot tell" before it reaches this)
+    base = {"tests/ok.sh": "#!/bin/sh\n", "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n"}
+    r = root_with(dict(base, **{"scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n"}))
+    cases.append(("a scripts/*.sh self-test with no runner is drift", check(r), 1, "helper.sh"))
+    cases_root["a scripts/*.sh self-test with no runner is drift"] = r
+
+    r = root_with(dict(base, **{"scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
+                                 "cmake/tests-helper.cmake": "add_test(NAME helper_self COMMAND bash scripts/helper.sh --self-test)\n"}))
+    cases.append(("...and a registration in cmake/*.cmake clears it", check(r), 0, None))
+
     # 1. a test nobody mentions -> drift, and it is NAMED
     r = root_with({"tests/lonely.sh": "#!/bin/sh\n", "CMakeLists.txt": "# nothing here\n"})
-    cases_root = {}
     cases.append(("an unreferenced test is drift", check(r), 1, "lonely.sh")); cases_root["an unreferenced test is drift"] = r
 
     # 2. referenced from CMakeLists.txt -> clean

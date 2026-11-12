@@ -29,5 +29,10 @@ def m(path):
             "log_loss": round(ll, 4), "min_p_true": round(min(r["probabilities"][r["label"]] for r in rows), 4),
             "ms_p50": round(st.median(r["decision_ms"] for r in rows))}
 if __name__ == "__main__":
+    # `--help` arrives in sys.argv[1:] like any path, so it was opened literally and died with
+    # FileNotFoundError: '--help'. A metrics printer takes file paths; say so instead of crashing.
+    if not sys.argv[1:] or "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
+        print(__doc__ or "usage: metrics.py <results.json> [<results.json> ...]")
+        sys.exit(0 if sys.argv[1:] else 2)
     for p in sys.argv[1:]:
         print(p, m(p))

@@ -101,6 +101,27 @@ extern "C" {
 #define Q4NX_CHUNK_Q4S 4608
 void q4nx_dequant_tile_q4s(const uint8_t* chunk, float* out, int ld);
 
+/* The quarter tile (FastFlowLM's Gemma3-270M-NPU2, whose K = 640 is not on the 256-column grid): 16 rows x 128 columns
+ * in 1280 bytes, the 5120-byte tile's reading with one half and four groups:
+ *   scales      [64] bf16 @[0,128)     index g*16 + r
+ *   zero-points [64] bf16 @[128,256)   index g*16 + r
+ *   codes            @[256,1280)       byte c*8 + r/2, even row = low nibble
+ *   value[r][c] = code * scale + zero   (the symmetric kind: zero-points 0, signed scale, two's-complement code)
+ * A tensor of these declares its shape as [chunks, 1280], where the tiled kind declares [tiles, 5120]; both cost 0.625
+ * bytes a weight, so the byte count cannot tell them apart and the declared row width is what names the kind. The grid
+ * is (rows/16) x (K/128), row-major. Settled 2026-11-12 on that pack: v_proj against the Q5_0 attn_v of an
+ * independent GGUF of the same model, corr 0.9962 (the next reading 0.84, the 5120-tile reading 0.09); and lm_head
+ * against the pack's own bf16 embedding (which it stores x sqrt(H)), corr 0.9963, |dequant - embedding| / |scale|
+ * mean 0.235, max 0.567. */
+#define Q4NX_CHUNK_Q4H 1280
+#define Q4NX_Q4H_ROWS 16
+#define Q4NX_Q4H_COLS 128
+void q4nx_dequant_chunk_q4h(const uint8_t* chunk, float* out, int ld, int symmetric);
+/* A [rows, k] tensor of quarter tiles (k = the container's own K, a multiple of 128) read into `out` as [rows, cols]
+ * with cols >= k; columns k..cols-1 are written 0 (the forward's K pad). Returns 0, or -1 when the sizes disagree or
+ * the tensor mixes the symmetric and asymmetric kinds. */
+int q4nx_dequant_tensor_q4h(const uint8_t* data, size_t nbytes, int rows, int k, int cols, float* out);
+
 /* Q4_K chunk: 32 rows x 256 K, 4736 B.
  *   scales[8][32] uint8 @[0,256)    index g*32 + r
  *   mins  [8][32] uint8 @[256,512)  index g*32 + r

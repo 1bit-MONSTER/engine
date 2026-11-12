@@ -20,11 +20,14 @@
 # --term sends SIGTERM first and SIGKILL 10 s later. Use it when cmd is ~/lb/thermal-run.sh: a
 # SIGKILL'd thermal-run cannot run its trap, so its scope (ninja and every compiler under it) keeps
 # running and keeps the memory; on SIGTERM it kills the whole scope (engine#1504).
+# MEM_GUARD_MEMINFO names the file read instead of /proc/meminfo (the tests: "plenty, then starved" cannot be
+# produced on demand on a shared box).
+meminfo=${MEM_GUARD_MEMINFO:-/proc/meminfo}
 term=0; [ "$1" = --term ] && { term=1; shift; }
 floor=$1; shift
 "$@" & pid=$!
 while kill -0 $pid 2>/dev/null; do
-  avail=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo)
+  avail=$(awk '/MemAvailable/ {print int($2/1048576)}' "$meminfo")
   if [ "$avail" -lt "$floor" ]; then
     echo "GUARD: MemAvailable ${avail} GB < ${floor} GB, killing $pid" >&2
     if [ $term = 1 ]; then

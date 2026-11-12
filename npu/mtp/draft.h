@@ -58,6 +58,8 @@
 #include <string>
 #include <vector>
 
+#include "../forward/include/spec_greedy.h"
+
 namespace onebit::npu::mtp {
 
 // Greedy choice with a deterministic tie-break (first maximum), so a draft that reproduces the model
@@ -144,6 +146,12 @@ public:
     virtual int draft(const std::vector<float>& hidden, int last_token, int pos, int k,
                       std::vector<int>& out, std::vector<float>* conf = nullptr) = 0;
     virtual void reset() {}
+    // Whether draft() reads `hidden`, the base's state after `last_token`. true (the MTP head): the loop has to run
+    // `last_token` through the base first, so a round is two base passes (that step, then the verify batch).
+    // false (a DFlash draft, which drafts from the base's committed rows plus the last token's embedding): the loop
+    // verifies [last_token, d1..dk] as ONE batch of k + 1 rows, so a round is one base pass, and draft() is handed an
+    // empty `hidden`. engine#1781; docs/npu.md, "The draft loop, and whether to serve it".
+    virtual bool needs_last_hidden() const { return true; }
     // Called once per iteration with the rows that were committed: `hidden_rows` is M x hidden_size and holds the
     // base's post-norm hidden of each accepted position (row 0 = the first accepted draft).  A drafter keeps its
     // own stream (the MTP layer attends over its own states), so it advances here -- without this it would see
@@ -160,6 +168,11 @@ struct Options {
     // draft is verified anyway (it is already in the batch), it just does not get followed by more of them.
     // tau <= 0 disables the gate.
     float tau = 0.6f;
+    // The fallback (SpecFallback, npu/forward/include/spec_greedy.h): once the last `fallback_window` rounds emitted
+    // fewer than `fallback_below` tokens on average, the run stops drafting and finishes with plain steps.
+    // fallback_below <= 0 turns it off.
+    double fallback_below = 0.0;
+    int fallback_window = 3;
 };
 
 struct Stats {
@@ -204,6 +217,8 @@ struct Stats {
     double ms_draft = 0.0;     // the head's chain: its matvecs and the lm head per draft
     double ms_commit = 0.0;    // commit_verify (snapshot restore + replay) and the drafter's row advance
     double phase_ms() const { return ms_step + ms_batch + ms_draft + ms_commit; }
+    // The iteration after which the fallback stopped drafting, or -1 when it never did.
+    int fell_back_at = -1;
 };
 
 // The live loop's side of the per-depth comparison, built in ONE place so the report sites and the tests cannot
@@ -230,14 +245,17 @@ struct Result {
     std::string err;
 };
 
-// Draft, verify, accept the longest prefix, roll back.  `on_token` returning false stops the loop.
-inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prompt, const Options& opt,
-                  const std::function<bool(int)>& on_token = {}) {
+// The loop from a base that has already run its prompt: `pos` is the number of positions it holds and `logits` the
+// choice after the last of them (what a batched prefill returns). run() below is this after a token-by-token prefill.
+// `on_token` returning false stops the loop.
+inline Result run_from(BaseModel& base, DraftHead* head, int pos, std::vector<float> logits, const Options& opt,
+                       const std::function<bool(int)>& on_token = {}) {
     Result r;
     const int V = base.vocab();
     if (V <= 0) { r.err = "no vocabulary"; return r; }
-    if (prompt.empty()) { r.err = "empty prompt"; return r; }
+    if (pos <= 0 || (int)logits.size() < V) { r.err = "no prefilled prompt"; return r; }
     const int k = head ? std::min(std::max(0, opt.k), base.max_batch_rows()) : 0;
+    onebit::npu::SpecFallback fallback(opt.fallback_below, opt.fallback_window);
 
     // Phase timing: always accumulated (steady_clock::now() is ~20 ns against a ~0.5 s pass), printed by the
     // caller when it wants the split.  Measurement only -- nothing here is read back into the loop's decisions.
@@ -250,11 +268,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
     };
     Clock::time_point tp = Clock::now();
 
-    std::vector<float> logits, all;
-    int pos = 0;
-    for (int t : prompt)
-        if (!base.step(t, pos++, logits)) { r.err = "prefill: step failed"; return r; }
-
+    std::vector<float> all;
     auto emit = [&](int t) { r.tokens.push_back(t); return !on_token || on_token(t); };
 
     while ((int)r.tokens.size() < opt.max_tokens) {
@@ -264,10 +278,89 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         const bool keep_going = emit(t1);
         if (!keep_going) break;
 
-        if (k <= 0) {                       // plain decode
+        if (k <= 0 || fallback.off()) {     // plain decode (no drafter, k = 0, or the fallback stopped it)
             if (!base.step(t1, pos++, logits)) { r.err = "step failed"; return r; }
             r.stats.steps++;
             r.stats.ms_step += lap(tp);
+            continue;
+        }
+
+        if (!head->needs_last_hidden()) {
+            // The one-pass round: t1 is row 0 of the verify batch instead of a step of its own. Row i of the batch is
+            // the base's choice after position pos + i, so draft i is checked against row i, and the round commits t1
+            // plus the accepted drafts (take + 1 rows); the next round's t1 is the choice in row `take`.
+            const int left = opt.max_tokens - (int)r.tokens.size();   // tokens this run may still emit
+            const int room = std::min({k, base.max_batch_rows() - 1, left});
+            std::vector<int> d;
+            std::vector<float> conf;
+            int nd = 0;
+            if (room > 0) {
+                static const std::vector<float> no_hidden;
+                r.stats.chain_at.push_back(pos + 1);
+                nd = head->draft(no_hidden, t1, pos + 1, room, d, &conf);
+                r.stats.ms_draft += lap(tp);
+                nd = std::min(nd, std::min(room, (int)d.size()));
+            }
+            if (nd <= 0) {
+                // Nothing to verify (no proposal, or the budget is spent): consume t1 the plain way, so the base has
+                // run every token it was handed.
+                if (!base.step(t1, pos++, logits)) { r.err = "step failed"; return r; }
+                r.stats.steps++;
+                r.stats.ms_step += lap(tp);
+                if (head) head->commit_rows(std::vector<int>{t1}, base.last_hidden(), 1);
+                if ((int)r.tokens.size() >= opt.max_tokens) break;
+                continue;
+            }
+            d.resize((size_t)nd);
+            if (opt.tau > 0.0f && conf.size() == d.size()) {
+                for (int i = 0; i < nd; i++)
+                    if (conf[(size_t)i] < opt.tau) { nd = i + 1; break; }
+                d.resize((size_t)nd);
+            }
+            std::vector<int> batch{t1};
+            batch.insert(batch.end(), d.begin(), d.end());
+            if (!base.step_batch_all(batch, pos, all)) { r.err = "verify batch failed"; return r; }
+            r.stats.ms_batch += lap(tp);
+            r.stats.iterations++;
+            r.stats.batches++;
+            r.stats.rows_verified += nd;
+            r.stats.drafted += nd;
+            for (int i = 0; i < nd && i < Stats::kMaxDepth; i++) r.stats.drafted_at[i]++;
+            int a = 0;
+            while (a < nd && argmax(&all[(size_t)a * (size_t)V], V) == d[(size_t)a]) a++;
+            // nd <= left, so every accepted draft fits the budget; only the consumer can stop the prefix early.
+            int take = 0;
+            bool stopped = false;
+            for (int i = 0; i < a; i++) {
+                const bool keep = emit(d[(size_t)i]);
+                take = i + 1;
+                if (!keep) { stopped = true; break; }
+            }
+            r.stats.accepted += a;
+            r.stats.chain_drafts.push_back(d);
+            r.stats.chain_accepted.push_back(a);
+            for (int i = 0; i < a && i < Stats::kMaxDepth; i++) r.stats.accepted_at[i]++;
+            for (int i = 0; i <= a && i < nd && i < Stats::kMaxDepth; i++) r.stats.reached_at[i]++;
+            if (a == 0) r.stats.first_reject++;
+            if (!base.commit_verify(take + 1)) { r.err = "commit_verify refused"; return r; }
+            const std::vector<float>& rows = base.last_hidden_rows();
+            const size_t h = (size_t)base.hidden_size();
+            const size_t got = (h && rows.size() % h == 0) ? rows.size() / h : 0;
+            if (!rows.empty()) {
+                if (got != (size_t)(take + 1) && got != (size_t)(nd + 1)) {
+                    r.err = "drafter rows: base returned " + std::to_string(got) + " rows, want " +
+                            std::to_string(take + 1) + " (committed prefix) or " + std::to_string(nd + 1) + " (batch)";
+                    return r;
+                }
+                std::vector<int> kept{t1};
+                kept.insert(kept.end(), d.begin(), d.begin() + take);
+                head->commit_rows(kept, rows, take + 1);
+            }
+            r.stats.ms_commit += lap(tp);
+            logits.assign(all.begin() + (size_t)take * (size_t)V, all.begin() + (size_t)(take + 1) * (size_t)V);
+            pos += take + 1;
+            if (fallback.record(take + 1) && r.stats.fell_back_at < 0) r.stats.fell_back_at = r.stats.iterations;
+            if (stopped || (int)r.tokens.size() >= opt.max_tokens) break;
             continue;
         }
 
@@ -367,12 +460,25 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
             logits.assign(all.begin() + (size_t)(take - 1) * (size_t)V,
                           all.begin() + (size_t)take * (size_t)V);
         pos = have + take;
+        if (fallback.record(take + 1) && r.stats.fell_back_at < 0) r.stats.fell_back_at = r.stats.iterations;
         if (stopped || (int)r.tokens.size() >= opt.max_tokens) break;
     }
 
     r.stats.emitted = (int)r.tokens.size();
     r.ok = true;
     return r;
+}
+
+// Draft, verify, accept the longest prefix, roll back, after running `prompt` one token at a time.
+inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prompt, const Options& opt,
+                  const std::function<bool(int)>& on_token = {}) {
+    if (base.vocab() <= 0) { Result r; r.err = "no vocabulary"; return r; }
+    if (prompt.empty()) { Result r; r.err = "empty prompt"; return r; }
+    std::vector<float> logits;
+    int pos = 0;
+    for (int t : prompt)
+        if (!base.step(t, pos++, logits)) { Result r; r.err = "prefill: step failed"; return r; }
+    return run_from(base, head, pos, std::move(logits), opt, on_token);
 }
 
 // Plain greedy decode through the same interface, so the test (and a --mtp-k 0 run) can compare text.

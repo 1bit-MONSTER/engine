@@ -57,3 +57,10 @@ int64_t q4nx_cache_bound_bytes(const char* text, int64_t default_gib = 60);
 // just-opened entry inside the sweep's age window, which is what makes "a serve may be reading it" true for a reused entry
 // and not only for a new one. Failure is ignored (a read-only cache still serves).
 void q4nx_cache_touch(const std::string& entry);
+
+// engine#1788 / disk pressure 11-12: the sweep as a COMMAND, because until now the only trigger was a serve starting
+// (`app/serve.cpp` calls q4nx_cache_evict() on its way up). With the NPU off nothing serves, so nothing sweeps and the
+// cache grows past its own bound -- measured at 72.5 G against the 60 GiB default on this box while / was at 149 G.
+// `1bit q4nx-cache evict [--root DIR] [--max-gib N] [--keep NAME] [--min-age S] [--dry-run]`.
+// Exit: 0 swept (or nothing to do), 1 nothing removed but over the bound (age window), 2 bad usage.
+int run_q4nx_cache(int argc, char** argv);

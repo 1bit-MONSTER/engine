@@ -41,12 +41,39 @@ usage: hrx_f16_narrowing.py --check [--root .]     rc 1 on drift, rc 77 without 
        hrx_f16_narrowing.py --write                rewrite the baseline from the corpus
 """
 import argparse
+import hashlib
 import pathlib
 import re
 import sys
 
 CORPUS = pathlib.Path("third_party/llama.cpp/ggml/src/ggml-hrx/kernel-corpus/kernels")
 BASELINE = pathlib.Path("tools/ci/hrx_f16_narrowing.txt")
+# engine#2186 item 1 / engine#2167: a THIRD shape loses a value to half precision and no truncation scan can see it --
+# an f16 *accumulator* updated by a multiply. There is no `fptrunc` anywhere in it, because the accumulator already IS
+# f16, so the body list above is blind to it by construction. Same mechanism as that list: a committed set of the files
+# that have one, so a new one is drift.
+ACC_BASELINE = pathlib.Path("tools/ci/hrx_f16_accumulators.txt")
+ACC_INIT = re.compile(r"vector\.fragment<init>[^\n]*vector<(\d+)xf16>")
+ACC_MUL = re.compile(r"vector\.mulf|template\.apply<@[^>]*wmma[^>]*>|vector\.(fma|contract|dot|outerproduct)\b|wmma\.(mma|load|store)")
+# Measured (engine#2167): at 120 lines past the init, `mul_mat_id_f16_f16_wmma_core`'s four accumulators read as
+# unaffected, because their update sits ~250 lines below in a long Q4_K/Q6 loop body. 250 finds them.
+ACC_WINDOW = 250
+
+
+def corpus_fingerprint(corpus):
+    """sha256 over the corpus: sorted (relative path, bytes), so a moved file changes it too.
+
+    A narrowing count is only comparable to another run if the tree it read is identified. Two
+    checkouts of third_party/llama.cpp at different commits both answer "9 bodies" until one of them
+    does not, and without this the only way to tell is to read the submodule sha by hand.
+    """
+    h = hashlib.sha256()
+    n = 0
+    for f in sorted(corpus.rglob("*.loom")):
+        h.update(str(f.relative_to(corpus)).encode())
+        h.update(hashlib.sha256(f.read_bytes()).digest())
+        n += 1
+    return f"{h.hexdigest()[:16]} ({n} .loom file(s))"
 # The vector form is most of the corpus: `vector.fptrunc %x : vector<4xf32> to vector<4xf16>` contains neither
 # "f32 to f16" nor "truncf", and at llama.cpp 2b7960bae 132 of the 233 narrowing lines are written that way.
 # Matching the scalar spelling alone listed 25 bodies; the corpus has 51 (engine#2204's review). A bare `truncf` is
@@ -89,6 +116,25 @@ def unclassified_truncations(corpus):
     return out
 
 
+def accumulator_bodies(corpus):
+    """Every .loom with an f16 fragment accumulator updated by a multiply or a WMMA/contract accumulate.
+
+    The window matters more than the matcher: the update of `mul_mat_id_f16_f16_wmma_core`'s four `vector<8xf16>`
+    accumulators sits ~250 lines below their `vector.fragment<init>`, so a short window reports them as unaffected --
+    the bucket a reader skims past -- and engine#2167 is exactly about those four.
+    """
+    found = set()
+    for path in corpus.rglob("*.loom"):
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for i, line in enumerate(lines):
+            if not ACC_INIT.search(line):
+                continue
+            if any(ACC_MUL.search(later) for later in lines[i:i + ACC_WINDOW]):
+                found.add(path.relative_to(corpus).as_posix())
+                break
+    return found
+
+
 def guarded(bodies, corpus):
     """Bodies that also carry a producer-side guard marker -- reported, never asserted."""
     out = set()
@@ -103,15 +149,27 @@ def drift(baseline, found):
     return sorted(found - baseline), sorted(baseline - found)
 
 
-def check(root):
-    corpus = root / CORPUS
+def check(root, corpus=None):
+    corpus = pathlib.Path(corpus) if corpus else root / CORPUS
     if not corpus.is_dir() or not any(corpus.rglob("*.loom")):
-        print(f"skip: no .loom corpus at {CORPUS} (check out third_party/llama.cpp)", file=sys.stderr)
+        print(f"skip: no .loom corpus at {corpus} (check out third_party/llama.cpp, or pass --corpus)", file=sys.stderr)
         return 77
+    # Printed before the verdict, not after it: a FAIL is when the identity of the tree matters most.
+    print(f"CORPUS       {corpus.resolve()}")
+    print(f"FINGERPRINT  {corpus_fingerprint(corpus)}")
     base_text = (root / BASELINE).read_text(encoding="utf-8")
     baseline = baseline_paths(base_text)
     found = narrowing_bodies(corpus)
     new, stale = drift(baseline, found)
+    # engine#2186 item 1 / engine#2167: the accumulator class, which no truncation scan can see.
+    acc_base_file = root / ACC_BASELINE
+    if not acc_base_file.is_file():
+        print(f"hrx_f16_narrowing: {ACC_BASELINE} is missing -- run `--write` once to record the accumulators this "
+              f"corpus has (engine#2186)")
+        return 1
+    acc_baseline = baseline_paths(acc_base_file.read_text(encoding="utf-8"))
+    acc_found = accumulator_bodies(corpus)
+    acc_new, acc_stale = drift(acc_baseline, acc_found)
     guard = guarded(found, corpus)
     unknown = unclassified_truncations(corpus)
     for where, text in unknown:
@@ -123,26 +181,39 @@ def check(root):
     for rel in stale:
         print(f"hrx_f16_narrowing: {rel} is in the baseline but no longer narrows -- drop the line, the "
               f"list should shrink")
-    if new or stale or unknown:
+    for rel in acc_new:
+        print(f"hrx_f16_narrowing: NEW f16 accumulator {rel} -- an f16 fragment is updated by a multiply, so the sum "
+              f"overflows f16 long before any single input does and no fptrunc is involved; add the line and say what "
+              f"the accumulator holds (engine#2186, engine#2167)")
+    for rel in acc_stale:
+        print(f"hrx_f16_narrowing: {rel} is in the accumulator baseline but has no mul-updated f16 fragment -- drop "
+              f"the line, the list should shrink")
+    if new or stale or unknown or acc_new or acc_stale:
         print(f"hrx_f16_narrowing: FAIL ({len(new)} new, {len(stale)} stale of {len(baseline)}, "
-              f"{len(unknown)} unclassified fptrunc)")
+              f"{len(unknown)} unclassified fptrunc; {len(acc_new)} new, {len(acc_stale)} stale of "
+              f"{len(acc_baseline)} accumulator(s))")
         return 1
     print(f"hrx_f16_narrowing: {len(baseline)} narrowing body(ies), none new, none stale; "
-          f"{len(guard)} of them carry a guard marker" +
+          f"{len(acc_baseline)} f16 accumulator body(ies), none new, none stale; "
+          f"{len(guard)} of the narrowing bodies carry a guard marker" +
           (f" ({', '.join(sorted(guard))})" if guard else " (the guard sits on the producer, engine#1962)"))
     return 0
 
 
-def write(root):
-    corpus = root / CORPUS
+def write(root, corpus=None):
+    corpus = pathlib.Path(corpus) if corpus else root / CORPUS
     if not corpus.is_dir():
-        print(f"skip: no .loom corpus at {CORPUS}", file=sys.stderr)
+        print(f"skip: no .loom corpus at {corpus}", file=sys.stderr)
         return 77
     head = "".join(line for line in (root / BASELINE).read_text(encoding="utf-8").splitlines(True)
                    if line.lstrip().startswith("#"))
     bodies = sorted(narrowing_bodies(corpus))
     (root / BASELINE).write_text(head + "\n".join(bodies) + "\n", encoding="utf-8")
-    print(f"hrx_f16_narrowing: wrote {len(bodies)} body(ies) to {BASELINE}")
+    accs = sorted(accumulator_bodies(corpus))
+    acc_head = "".join(line for line in (root / ACC_BASELINE).read_text(encoding="utf-8").splitlines(True)
+                       if line.lstrip().startswith("#")) if (root / ACC_BASELINE).is_file() else ""
+    (root / ACC_BASELINE).write_text(acc_head + "\n".join(accs) + "\n", encoding="utf-8")
+    print(f"hrx_f16_narrowing: wrote {len(bodies)} body(ies) to {BASELINE} and {len(accs)} to {ACC_BASELINE}")
     return 0
 
 
@@ -205,7 +276,42 @@ def self_test():
         empty = root / "empty"
         empty.mkdir()
         check_that(check(empty) == 77, "a missing corpus returns 77, not 0")
+        # engine#2186 item 1 / engine#2167: the accumulator class. A mul-updated f16 fragment is found; an add-only one
+        # is not; a WMMA/contract update counts as a multiply; and an update far below the init is still found -- the
+        # last is the fixture that would have caught the 120-line window, which reported four real accumulators as
+        # unaffected.
+        accdir = root / "acc"
+        accdir.mkdir()
+        (accdir / "mul.loom").write_text(
+            "  %init = vector.fragment<init> %z shape [%m, %n] : vector<8xf16>\n"
+            "    %next = vector.mulf %acc, %k : vector<8xf16>\n")
+        check_that(accumulator_bodies(accdir) == {"mul.loom"}, "a mul-updated f16 accumulator is found")
+        (accdir / "add.loom").write_text(
+            "  %init = vector.fragment<init> %z shape [%m, %n] : vector<16xf16>\n"
+            "    %next = vector.addf %acc, %k : vector<16xf16>\n")
+        check_that("add.loom" not in accumulator_bodies(accdir), "an add-only f16 accumulator is not this class")
+        (accdir / "wmma.loom").write_text(
+            "  %init = vector.fragment<init> %z shape [%m, %n] : vector<16xf16>\n"
+            "    %next = template.apply<@ggml.some_wmma_core>(%acc) : (vector<16xf16>) -> (vector<16xf16>)\n")
+        check_that("wmma.loom" in accumulator_bodies(accdir), "a WMMA/contract update counts as a multiply (engine#2167)")
+        (accdir / "far.loom").write_text(
+            "  %init = vector.fragment<init> %z shape [%m, %n] : vector<16xf16>\n"
+            + "  // pad\n" * 200 +
+            "    %next = vector.mulf %acc, %k : vector<16xf16>\n")
+        check_that("far.loom" in accumulator_bodies(accdir), "an update 200 lines below the init is found")
 
+    # The corpus identity: same bytes -> same fingerprint, an edit -> a different one, a move -> a
+    # different one (the relative path is hashed), and the count it reports.
+    with tempfile.TemporaryDirectory() as d:
+        c = pathlib.Path(d)
+        (c / "a.loom").write_text("one\n"); (c / "s").mkdir(); (c / "s" / "b.loom").write_text("two\n")
+        fp = corpus_fingerprint(c)
+        check_that(fp.endswith("(2 .loom file(s))"), "fingerprint: counts the .loom files it read")
+        check_that(fp == corpus_fingerprint(c), "fingerprint: the same corpus twice is the same value")
+        (c / "s" / "b.loom").write_text("two changed\n")
+        check_that(fp != corpus_fingerprint(c), "fingerprint: a one-byte edit changes it")
+        (c / "a.loom").rename(c / "s" / "a.loom")
+        check_that(fp != corpus_fingerprint(c), "fingerprint: a move changes it too (the path is hashed)")
     print(f"hrx_f16_narrowing self-test: {'ok' if not failures else f'{failures} failure(s)'}")
     return 1 if failures else 0
 
@@ -216,14 +322,27 @@ def main():
     ap.add_argument("--write", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--root", default=".")
+    ap.add_argument("--corpus", default=None,
+                    help="the .loom corpus to scan (default: the pinned llama.cpp checkout's kernel-corpus)")
     args = ap.parse_args()
     root = pathlib.Path(args.root).resolve()
+    corpus = pathlib.Path(args.corpus).resolve() if args.corpus else None
     if args.self_test:
         return self_test()
     if args.write:
-        return write(root)
+        # The baseline is a file in the tree it describes, so rewriting it from a corpus that lives
+        # somewhere else records a corpus this checkout does not have -- and the next --check then
+        # reports every one of its own bodies as "in the baseline but no longer narrows". Refused
+        # rather than warned, because the damage is a committed baseline that no longer describes
+        # this tree (found by doing exactly that with a two-line fixture corpus).
+        if corpus is not None and root not in corpus.parents and corpus != root:
+            print(f"hrx_f16_narrowing: refusing --write with --corpus {corpus} outside --root {root}: "
+                  f"the baseline is written into the root and would describe a corpus this tree does not have",
+                  file=sys.stderr)
+            return 2
+        return write(root, corpus)
     if args.check:
-        return check(root)
+        return check(root, corpus)
     ap.print_help()
     return 2
 

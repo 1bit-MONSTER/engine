@@ -51,6 +51,9 @@ LINE_STYLES = [
       # engine#2018: the test-registration baseline of `tests/*_test.py`, same shape and the same reason -- data,
       "unreferenced_py_tests.txt",
             "hrx_f16_narrowing.txt",
+            # engine#2186: the accumulator baseline of `tools/ci/hrx_f16_narrowing.py --write`, same shape and the same
+            # reason -- data, `.txt` has no comment style of its own, and the notice is already at the top of the file.
+            "hrx_f16_accumulators.txt",
       # engine#2027: the `#`-comment baseline for hardcoded /tmp paths, same shape and the same reason --
       # data, `.txt` has no style, and the notice it wants is already at the top of the file.
       "tmp_paths.txt",
@@ -290,7 +293,7 @@ def repair_notice(text, block):
         # A SECOND canonical notice is the same defect as a near-miss beside the first: the block pasted twice. `--check`
         # has always reported it (`duplicated_notice`); `--fix` used to print "repaired" and leave the copy in place, so the
         # file it had just written still failed the very check that sent it there. The first occurrence is kept and later
-        # ones dropped, which is what "delete the second copy" means.
+        # ones dropped, which is what the report line now tells the reader --fix will do.
         if canonical_notice_line(line):
             key = re.sub(r"^\W+", "", line).strip()
             if key in seen_canonical:
@@ -397,7 +400,7 @@ def main():
             missing.append(path)
 
     for path in duplicated:
-        print("copyright notice duplicated inside the header window (delete the second copy):", path)
+        print("copyright notice duplicated inside the header window (--fix keeps the first copy and drops the rest):", path)
     for path in unknown:
         print("no comment style known (add one to LINE_STYLES/BLOCK_STYLES or EXEMPT):", path)
     for path in missing:

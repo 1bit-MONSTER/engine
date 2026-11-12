@@ -976,6 +976,31 @@ void test_canonical_copy_reusable() {
 // engine#1770: the canonical copy is scratch that used to only ever accumulate -- reuse writes a new file when the source
 // changes, so 699 files / 8.7 GiB of tmpfs (RAM) had built up on one box. The eviction rule is "same pack and geometry,
 // different source identity", and what can go wrong is deleting one of the neighbours that must survive, so each is an arm.
+// engine#1841 (second point): the implicit zero point's bit width must follow the SPELLING that matched, not a literal at
+// one call site and the node's attribute at the other. The arms below are the drift the issue described: `weight_Q4` must
+// give 4 bits (zero point 8) and a hypothetical `weight_Q8` must give 8 (zero point 128) -- the number that would have
+// stayed at 8, silently, if the literal were left in place.
+void test_implicit_zp_bits_follow_the_spelling() {
+    check(pi::zp_bits_for_spelling("model.layers.0.attn.q_proj.MatMul.weight_Q4", 4) == 4,
+          "zp bits: weight_Q4 declares 4 bits");
+    check(pi::zp_bits_for_spelling("model.layers.0.attn.q_proj.MatMul.weight_Q8", 4) == 8,
+          "zp bits: weight_Q8 overrides the path's 4 -- this is the arm a hardcoded literal fails");
+    check(pi::zp_bits_for_spelling("model.layers.0.mlp.down_proj.MatMulNBits.qweight", 3) == 3,
+          "zp bits: a spelling with no _Q<d> suffix falls back to the node's own value");
+    check(pi::zp_bits_for_spelling("weight_Q4", 8) == 4,
+          "zp bits: the suffix wins over a node value for a spelled tensor");
+    // and the effect on the tensor itself: the zero term moves by 2^(bits-1) * scale.
+    pi::Q4 q;
+    q.N = 1; q.K = 32; q.block = 128;
+    q.codes.assign(32, 0); q.scale.assign(1, 0.5f); q.zero.assign(1, 0.0f);
+    pi::implicit_zp_zero(q, 4);
+    check(std::fabs(q.zero[0] + 8.0f * 0.5f) < 1e-6f, "zp: 4 bits subtracts 8 * scale = 4.0");
+    q.zero.assign(1, 0.0f);
+    pi::implicit_zp_zero(q, 8);
+    check(std::fabs(q.zero[0] + 128.0f * 0.5f) < 1e-6f, "zp: 8 bits subtracts 128 * scale = 64.0");
+    std::printf("  implicit zero point: 6 arms (spelling -> bits x4, shift x2)\n");
+}
+
 void test_evict_stale_canonical_copies() {
     const fs::path dir = ::onebit::test::tmp_root() / ("1bit-evict-" + std::to_string(::getpid()));
     std::error_code ec;
@@ -5079,6 +5104,84 @@ void test_container_plan(const std::string& root) {
     }
 }
 
+// engine#1786 (item F1), slice 3a: roles from names alone. The cases are the three the census measured -- a transformer
+// pack that classifies completely, the alternate spellings that must classify the same way, and the two residues (SSM
+// and MTP) which must be RECOGNISED rather than reported as unknown, since `unassigned` is only useful if it means
+// "nothing knows this".
+void test_container_roles() {
+    const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
+    const auto roles = [&](std::initializer_list<const char*> names) {
+        std::vector<pi::Q4nxTensor> v;
+        for (const char* n : names) v.push_back(t(n));
+        return pi::container_roles(v);
+    };
+
+    // 1. a transformer pack, HF spelling
+    {
+        const auto r = roles({"model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.weight",
+                              "model.layers.0.self_attn.k_proj.weight", "model.layers.0.self_attn.v_proj.weight",
+                              "model.layers.0.self_attn.o_proj.weight", "model.layers.0.mlp.gate_proj.weight",
+                              "model.layers.0.mlp.up_proj.weight", "model.layers.0.mlp.down_proj.weight",
+                              "model.layers.0.input_layernorm.weight", "model.layers.0.post_attention_layernorm.weight",
+                              "model.norm.weight", "lm_head.weight"});
+        check(r.unassigned.empty(), "roles: a transformer pack classifies completely");
+        check(r.counts.at("q_proj") == 1 && r.counts.at("down_proj") == 1, "roles: projections are named by role");
+        check(r.role_of.at("model.norm.weight") == "final_norm", "roles: the top-level norm is not a layer norm");
+        check(r.role_of.at("model.layers.0.input_layernorm.weight") == "input_norm",
+              "roles: a layer norm is the input norm, not the final one");
+    }
+    // 1b. engine#2097 review: the two cases the table got wrong, pinned so the order cannot regress.
+    // `attn_q` / `attn_k` are prefixes of `attn_q_norm` / `attn_k_norm`, so with the projection rules first both
+    // norm needles were dead and a per-head q/k norm was filed as a projection.
+    {
+        const auto r = roles({"blk.0.attn_q_norm.weight", "blk.0.attn_k_norm.weight",
+                              "blk.0.attn_q.weight", "blk.0.attn_k.weight"});
+        check(r.role_of.at("blk.0.attn_q_norm.weight") == "q_norm", "roles: attn_q_norm is a norm, not q_proj");
+        check(r.role_of.at("blk.0.attn_k_norm.weight") == "k_norm", "roles: attn_k_norm is a norm, not k_proj");
+        check(r.role_of.at("blk.0.attn_q.weight") == "q_proj" && r.role_of.at("blk.0.attn_k.weight") == "k_proj",
+              "roles: the un-suffixed spellings are still projections");
+    }
+    // 1c. `in_proj` is not unique to attention: LFM2's short-convolution input projection was counted as qkv_proj.
+    {
+        const auto r = roles({"model.layers.0.shortconv.in_proj.weight", "model.layers.0.attn.in_proj.weight"});
+        check(r.role_of.at("model.layers.0.shortconv.in_proj.weight") == "shortconv_in_proj",
+              "roles: shortconv.in_proj is the short-conv projection, not the attention qkv");
+        check(r.role_of.at("model.layers.0.attn.in_proj.weight") == "qkv_proj",
+              "roles: an attention in_proj is still the fused qkv");
+    }
+    // 2. the alternate spellings must land on the same roles
+    {
+        const auto r = roles({"model.layers.0.self_attn.attn_q.weight", "model.layers.0.self_attn.wq.weight",
+                              "model.layers.0.mlp.ffn_gate.weight", "model.layers.0.mlp.ffn_down.weight"});
+        check(r.unassigned.empty(), "roles: alternate spellings classify");
+        check(r.role_of.at("model.layers.0.self_attn.attn_q.weight") == "q_proj", "roles: attn_q is q_proj");
+        check(r.role_of.at("model.layers.0.self_attn.wq.weight") == "q_proj", "roles: wq is q_proj");
+        check(r.role_of.at("model.layers.0.mlp.ffn_gate.weight") == "gate_proj", "roles: ffn_gate is gate_proj");
+    }
+    // 3. a bias belongs to its projection's role, and a qkv projection is not a q projection
+    {
+        const auto r = roles({"model.layers.0.self_attn.q_proj.bias", "model.layers.0.self_attn.qkv_proj.weight"});
+        check(r.role_of.at("model.layers.0.self_attn.q_proj.bias") == "q_proj", "roles: a bias keeps its projection's role");
+        check(r.role_of.at("model.layers.0.self_attn.qkv_proj.weight") == "qkv_proj",
+              "roles: qkv_proj is not classified as q_proj");
+    }
+    // 4. the two measured residues are recognised, not unknown
+    {
+        const auto r = roles({"model.layers.0.linear_attn.ssm_alpha_proj.weight",
+                              "model.layers.0.linear_attn.ssm_conv1d.weight", "model.mtp.fc.weight",
+                              "model.mtp.pre_fc_norm_hidden.weight"});
+        check(r.unassigned.empty(), "roles: the SSM and MTP families are recognised, not unassigned");
+        check(r.counts.at("ssm") == 2 && r.counts.at("mtp") == 2, "roles: each residue is counted under its own family");
+    }
+    // 5. something nothing knows is named, not guessed
+    {
+        const auto r = roles({"model.layers.0.mystery_block.weight"});
+        check(r.unassigned.size() == 1, "roles: an unknown tensor is listed");
+        check(r.unassigned[0] == "model.layers.0.mystery_block.weight", "roles: it is named, not summarised");
+        check(r.counts.empty(), "roles: and no role is invented for it");
+    }
+}
+
 // engine#1786 (item F1): an NPU2 model source is a safetensors container, and this is the reader that decides whether
 // a pack is that genre. The failure that matters is the silent one -- a wrong header length yields an empty inventory,
 // which reads as "a pack with no tensors" rather than "a malformed header" -- so each arm asserts the reason, not just
@@ -6027,6 +6130,7 @@ int main(int argc, char** argv) {
     test_external_import_success(golden_dir.empty() ? "." : golden_dir);
         test_write_canonical_copy();
         test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
+        test_implicit_zp_bits_follow_the_spelling();
         test_sweep_fconst_scratch_dirs();
         test_sweep_is_wired(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
@@ -6044,6 +6148,7 @@ int main(int argc, char** argv) {
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
+        test_container_roles();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);

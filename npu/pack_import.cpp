@@ -15,6 +15,8 @@
 
 #include "pack_import.h"
 
+#include "onnx_graph.h"
+
 #include "file_map.h"
 #include "pack.h"
 #include "q4nx.h"
@@ -85,6 +87,9 @@ std::vector<Field> pb(const uint8_t* p, size_t n) {
             }
             case 5:
                 if (size_t(end - p) < 4) throw std::runtime_error("protobuf: truncated fixed32");
+                // engine#1931: keep the four bytes in v. A float attribute (LayerNormalization's epsilon) is wire 5, and
+                // without this every such attribute reads as 0.0 -- indistinguishable from an absent one.
+                f.v = uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
                 p += 4;
                 break;
             default: throw std::runtime_error("protobuf: unsupported wire type " + std::to_string(f.wire));
@@ -2040,6 +2045,20 @@ void implicit_zp_zero(Q4& q, int bits) {
     for (size_t i = 0; i < q.zero.size(); ++i) q.zero[i] -= zp * q.scale[i];
 }
 
+// The bit width, taken from the SPELLING that matched (engine#1841, second point). The rule above used to be called with a
+// literal `4` on the projection path and with the node's own `bits` on the head path; nothing tied the literal to the name,
+// so a later spelling like `weight_Q8` would have kept the lookup working while leaving the zero point at 2^3 instead of 2^7
+// -- a wrong weight with no error anywhere. Deriving it from the suffix makes the two agree by construction, and an
+// unrecognised suffix falls back to the node's value (documented here) rather than to a silent 4.
+int zp_bits_for_spelling(const std::string& spelling, int node_bits) {
+    const auto pos = spelling.rfind("_Q");
+    if (pos != std::string::npos && pos + 2 < spelling.size()) {
+        const char d = spelling[pos + 2];
+        if (d >= '2' && d <= '8') return d - '0';
+    }
+    return node_bits;
+}
+
 // ── MatMulNBits → (codes, scale, zero) per 32-column group ───────────────────
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
                       int N, int K, int block, bool swap_nibbles, bool drop_zero) {
@@ -3404,6 +3423,76 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
     return "the epsilon-anchor vote recorded ONE in-block header, and this pack declares use_qk_norm, whose per-head q/k "
            "gains live in the two sections a 2-header block does not have (engine#1985). The two witnesses disagree and "
            "neither is being preferred";
+}
+
+// engine#1786 (item F1), slice 3a: roles from names. The rule is ordered -- the first match wins -- so `q_proj.bias`
+// classifies as a bias of q_proj rather than as an unknown tensor, and a name that matches nothing lands in `unassigned`
+// with its own name rather than being guessed from its shape.
+ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
+    struct Rule { const char* role; const char* needle; };
+    // Longest/most specific spellings first: `qkv_proj` before `q_proj`, `gate_up_proj` before `gate_proj`.
+    static const Rule kRules[] = {
+        {"embed",         "embed_tokens"},   {"embed",         "tok_embeddings"}, {"embed",  "word_embeddings"},
+        {"lm_head",       "lm_head"},        {"lm_head",       "output.weight"},
+        // engine#2097 review: `in_proj` alone is not attention -- LFM2's `shortconv.in_proj` is the short-convolution
+        // input projection and was counted as `qkv_proj` on a real pack. It has its own field in model.h
+        // (`shortconv_in_proj_weight`), so it gets its own role; the attention needle now requires `attn`.
+        {"shortconv_in_proj", "shortconv.in_proj"},
+        {"qkv_proj",      "qkv_proj"},       {"qkv_proj",      "attn_qkv"},       {"qkv_proj", "attn.in_proj"},
+        {"gate_up_proj",  "gate_up_proj"},   {"gate_up_proj",  "ffn_gate_up"},
+        // engine#2097 review: `attn_q` is a PREFIX of `attn_q_norm`, so with the projection rules first the two
+        // `*_norm` needles could never fire and every `attn_q_norm` was filed as `q_proj`. Norms come first.
+        {"q_norm",        "q_norm"},         {"q_norm",        "attn_q_norm"},
+        {"k_norm",        "k_norm"},         {"k_norm",        "attn_k_norm"},
+        {"q_proj",        "q_proj"},         {"q_proj",        "attn_q"},         {"q_proj", "wq."},
+        {"k_proj",        "k_proj"},         {"k_proj",        "attn_k"},         {"k_proj", "wk."},
+        {"v_proj",        "v_proj"},         {"v_proj",        "attn_v"},         {"v_proj", "wv."},
+        {"o_proj",        "o_proj"},         {"o_proj",        "attn_output"},    {"o_proj", "wo."},
+        {"gate_proj",     "gate_proj"},      {"gate_proj",     "ffn_gate"},
+        {"up_proj",       "up_proj"},        {"up_proj",       "ffn_up"},
+        {"down_proj",     "down_proj"},      {"down_proj",     "ffn_down"},
+        {"input_norm",    "input_layernorm"},{"input_norm",    "attn_norm"},      {"input_norm", "attention_norm"},
+        {"post_norm",     "post_attention_layernorm"},          {"post_norm",    "ffn_norm"},
+        {"final_norm",    "final_layernorm"},
+    };
+    // Recognised but not transformer roles: kept out of `unassigned` so that list means "nothing knows this", which is
+    // the only list worth reading. The SSM block is a forward question (its projections have no transformer analogue),
+    // and `model.mtp.*` is a draft head rather than a model.
+    static const char* kSsm[] = {"linear_attn.", "ssm_alpha_proj", "ssm_beta_proj", "ssm_conv1d", "ssm_dt",
+                                 "ssm_norm", "ssm_out_proj"};
+    static const char* kMtp[] = {"model.mtp."};
+    ContainerRoles out;
+    for (const auto& t : tensors) {
+        const std::string& n = t.name;
+        std::string role;
+        if (n.find("visual.") != std::string::npos || n.rfind("vision", 0) == 0 || n.rfind("vpm", 0) == 0)
+            role = "vision";
+        else if (n.find("audio.") != std::string::npos)
+            role = "audio";
+        if (role.empty()) {
+            bool matched = false;
+            for (const auto& r : kRules) {
+                if (n.find(r.needle) == std::string::npos) continue;
+                role = r.role;
+                matched = true;
+                break;
+            }
+            if (!matched && n.find("norm.weight") != std::string::npos && n.find("layers.") == std::string::npos)
+                role = "final_norm";   // `model.norm.weight`: the top-level norm, never inside a layer
+            if (!matched && role.empty()) {
+                for (const char* s : kSsm)
+                    if (n.find(s) != std::string::npos) { role = "ssm"; matched = true; break; }
+            }
+            if (!matched && role.empty()) {
+                for (const char* s : kMtp)
+                    if (n.find(s) != std::string::npos) { role = "mtp"; matched = true; break; }
+            }
+        }
+        if (role.empty()) { out.unassigned.push_back(n); continue; }
+        out.role_of[n] = role;
+        out.counts[role]++;
+    }
+    return out;
 }
 
 // engine#1786 (item F1): the container genre's geometry, from the container's own `dims` block and then config.json.
@@ -4949,7 +5038,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // one ONNX Runtime's MatMulNBits uses. Missing it here decoded every PROJECTION with zero point 0 while the
             // head was decoded with 8, which is why the pack imported completely, served on the device, and answered
             // gibberish on both the device and the host-GEMM path (engine#1503: "West什么呢ưởng中国联通nio…").
-            if (!zt) implicit_zp_zero(q, 4);
+            if (!zt) implicit_zp_zero(q, zp_bits_for_spelling(qw->name, 4));
             // the row slice, re-tiled exactly as the whole tensor would be
             Q4 part;
             part.N = rows; part.K = K;
@@ -5091,7 +5180,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
         pad_rows_to_tile_quantum(q, int(V));
         // no qzeros tensor -> the implicit zero point (engine#1503: Qwen3-VL-4B's spelling, three-input nodes)
-        if (!have_zp) implicit_zp_zero(q, mm.bits);
+        if (!have_zp) implicit_zp_zero(q, zp_bits_for_spelling(mm.weight, mm.bits));
 
         std::vector<uint8_t> tiled;
         long long pinexact = 0;
@@ -6448,6 +6537,88 @@ void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::
 // copy is ambiguous with it at every call site). Correlated AND not a scaled copy of the embedding -- the two states this
 // box measures are rel_err 0.000000 (serves) and 0.095/0.136 (imports cleanly, answers garbage).
 bool selfcheck_head_ok(double corr, double rel) { return corr > kTieCorr && rel <= kSelfcheckRelMax; }
+
+// engine#1931: a full graph reader, for packs that are plain f32 graphs (the Whisper encoder) rather than quantised LLM
+// packs. The census walk above keeps only the MatMul family by design; this one keeps every node in graph order, which ONNX
+// guarantees is topological, plus the initializer names -- so an executor can tell "a weight" from "a graph input", and a
+// pack that breaks the ordering is refused by name instead of producing plausible activations.
+OnnxGraphInfo parse_onnx_graph(const std::string& path) {
+    size_t size = 0;
+    std::string why;
+    const uint8_t* base = map_file(path, size, &why);
+    if (base == nullptr) throw std::runtime_error(path + ": " + why);
+    const auto model = pb(base, size);              // ModelProto
+    const auto* gfield = field1(model, 7);          // ModelProto.graph
+    if (gfield == nullptr) throw std::runtime_error(path + ": no ModelProto.graph (field 7)");
+    const auto g = pb(gfield->p, gfield->n);
+
+    OnnxGraphInfo out;
+    const size_t slash = path.find_last_of('/');
+    out.dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
+    for (const auto* f : fields(g, 11)) {           // graph.input
+        const auto vi = pb(f->p, f->n);
+        if (const auto* nm = field1(vi, 1)) out.inputs.push_back(pb_str(*nm));
+    }
+    for (const auto* f : fields(g, 12)) {           // graph.output
+        const auto vi = pb(f->p, f->n);
+        if (const auto* nm = field1(vi, 1)) out.outputs.push_back(pb_str(*nm));
+    }
+    for (const auto* f : fields(g, 5)) {            // graph.initializer
+        const auto t = pb(f->p, f->n);
+        const auto* nm = field1(t, 8);
+        if (nm == nullptr) continue;
+        out.initializers.push_back(pb_str(*nm));
+        OnnxInit ti;
+        ti.name = pb_str(*nm);
+        if (const auto* dt = field1(t, 2)) ti.dtype = int(dt->v);
+        for (const auto* d : fields(t, 1)) ti.dims.push_back(int64_t(d->v));
+        if (const auto* rd = field1(t, 9)) {
+            ti.raw = rd->p;
+            ti.raw_len = rd->n;
+        }
+        for (const auto* d : fields(t, 13)) {       // TensorProto.external_data: key/value string pairs
+            const auto kv = pb(d->p, d->n);
+            const auto* k = field1(kv, 1);
+            const auto* v = field1(kv, 2);
+            if (k == nullptr || v == nullptr) continue;
+            const std::string key = pb_str(*k), val = pb_str(*v);
+            if (key == "location") ti.location = val;
+            else if (key == "offset") ti.offset = std::stoull(val);
+            else if (key == "length") ti.length = std::stoull(val);
+        }
+        if (!ti.location.empty()) out.external.push_back(ti.name);
+        out.init_tensors.push_back(std::move(ti));
+    }
+    for (const auto* f : fields(g, 1)) {            // graph.node
+        const auto node = pb(f->p, f->n);
+        OnnxNodeInfo ni;
+        if (const auto* o = field1(node, 4)) ni.op = pb_str(*o);
+        if (const auto* nm = field1(node, 3)) ni.name = pb_str(*nm);
+        for (const auto* i : fields(node, 1)) ni.ins.push_back(pb_str(*i));
+        for (const auto* o : fields(node, 2)) ni.outs.push_back(pb_str(*o));
+        for (const auto* a : fields(node, 5)) {     // AttributeProto
+            const auto at = pb(a->p, a->n);
+            const auto* nm = field1(at, 1);
+            if (nm == nullptr) continue;
+            const std::string key = pb_str(*nm);
+            if (const auto* iv = field1(at, 3)) ni.attrs[key] = int64_t(iv->v);   // INT
+            if (const auto* fv = field1(at, 2)) {                                 // FLOAT (wire 5, see fields())
+                const uint32_t bits = uint32_t(fv->v);
+                float f32 = 0.0f;
+                std::memcpy(&f32, &bits, sizeof f32);
+                ni.attrs_float[key] = f32;
+            }
+            std::vector<int64_t> list;
+            for (const auto* iv : fields(at, 8)) list.push_back(int64_t(iv->v));  // INTS
+            if (!list.empty()) ni.attrs_list[key] = std::move(list);
+        }
+        out.nodes.push_back(std::move(ni));
+    }
+    // NOT unmapped: init_tensors[].raw points into this mapping, and the executor copies what it needs while it is alive.
+    // shortcut: the mapping is released when the process exits; a long-lived caller that parses many graphs should own the
+    // mapping itself, which is the refactor to make when a second consumer appears.
+    return out;
+}
 
 const char* known_bad_architecture(const std::string& model_type) {
     if (model_type == "gemma2")

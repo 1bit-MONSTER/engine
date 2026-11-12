@@ -166,6 +166,46 @@ next step of engine#1780. What `dflash_forward_test` establishes:
 - with a package directory (`-DONEBIT_DFLASH_DRAFT=<dir>` or `ONEBIT_TEST_DFLASH_DRAFT`), the real draft decodes and
   one pass over a made-up context is finite and position-independent.
 
+### DFlash 2 packages (engine#1781)
+
+`load_draft()` also reads `DFlash2DraftModel` packages (`FastFlowLM/Qwen3.8-27B-DFlash2-NPU2` is the one on this box),
+as generation 2 of the same loader. The config states the draft's interface under `dflash_config` and the rotation's base
+under `rope_parameters`. Every projection, the fusion matrix included, is a grid of 4736-byte Q4_K chunks rather than
+5120-byte q4_1 tiles. Each layer also carries two grouped convolutions, around the attention and around the MLP, and the
+package carries a candidate selector (a projection of the hidden state and two vocabulary-sized codebooks).
+`decode_draft()` fills the convolutions; the codebooks are read a row at a time with `decode_row()`, since each is
+254 MB as f32.
+
+The forward gains what generation 2 needs, each piece held to arithmetic written out in `dflash_forward_test`:
+
+| piece | what it computes |
+|---|---|
+| `draft_conv()` | one half of the grouped convolution: a row's output sums, over the kernel's offsets, (base kernel + the row's own kernel for its group) times the row that many places earlier |
+| `selector_pick()` | the selector's choice at one block row: among the target head's top candidates, the highest of logit + the pairwise term between the previous pick and the candidate |
+| `DraftKvCache`, `cache_extend()`, `draft_forward_cached()` | the context's keys and values per layer, computed once per context row and reused by every later pass; grown in steps it gives exactly the single-call pass |
+| `set_gemm_hook()` | an optional place for the draft's projections to run (the device route); unset, everything runs on the host |
+
+Measured with these pieces against the served 27B, in a local loop: on a code prompt, 6.86 tokens per round and 7.6-7.8
+tok/s against 4.2 tok/s plain decoding; output identical to plain greedy decoding. The loop is not part of this change;
+the numbers are on engine#1781.
+
+### The speculative loop on the served 27B (`tools/dflash2_probe loop`)
+
+`dflash2_probe loop` runs the pair end to end. The target is `bonsai2-27b-t2s2` on the NPU. The draft's projections can
+run on the NPU through `set_gemm_hook()`; its attention, convolutions and selector stay on the host. Each round, the
+draft proposes 7 tokens, the target verifies the 8 rows in one `step_batch_all()` pass, and `commit_verify_rows()` keeps
+the accepted prefix. When every row is accepted, the commit keeps the batch's own recurrent state instead of restoring
+the snapshot and replaying the rows: `NPU_REPLAY_CHECK=1` holds the two equal, and `NPU_COMMIT_FULL_REPLAY=1` keeps the
+old path. Measured on engine#1781, with output identical to plain greedy decoding:
+
+| prompt | plain decode | the loop | tokens per round |
+|---|---|---|---|
+| a Python function | 4.24-4.27 tok/s | 7.5-7.8 tok/s | 6.86 |
+| prose (with the fallback to plain decoding) | 4.17-4.21 | 4.08-4.12 | 2.82-3.0 |
+
+A loop has to be compared with the serve's own batched prefill. The per-token prefill is not bit-identical on this route,
+and against it the loop's output parts after 23 tokens.
+
 ## PARD-2's repos are weights-only — borrow the target's tokenizer
 
 `amd/PARD2-*` ship **`README.md`, `config.json`, `model.safetensors`, `warp_model.bin`** and nothing else: **no tokenizer

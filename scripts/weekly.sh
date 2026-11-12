@@ -36,7 +36,11 @@
 # what the build scripts each list; preflight (at the end) checks the toolchain, hipcc, patchelf and the kernel image.
 set -euo pipefail
 
-[ $# -ge 1 ] || { sed -n '16,33p' "$0"; exit 2; }
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
+[ $# -ge 1 ] || { usage; exit 2; }
 W=$(mkdir -p "$1" && cd "$1" && pwd); shift
 STAGES=${*:-bumps build test package release}
 REPO=1bit-MONSTER/engine
@@ -118,6 +122,11 @@ host_desc() {
 
 # --- build / test -------------------------------------------------------------------------
 build() {
+    # engine#2129: what this builds is $SRC, whose submodules `checkout` has just updated, and a build compiles whatever
+    # those work trees hold. This cannot live in preflight(): preflight runs before $SRC exists, so the check would find
+    # no file to run, skip, and report success -- a check that inspects nothing and says it passed. Here it is the tree
+    # that is about to be compiled, and the run stops before the first compile instead of after it.
+    preflight_submodules "$SRC/tools/ci/submodule_pin_check.py" "$SRC" || return 1
     # the private components compiled in (docs/releases.md, "Private components"): the NPU runtime
     # (into 1bit) and the HIP kernels (into the HRX llama.cpp), each a checkout at the commit its
     # config/*.config pins; the build stops here when one cannot be fetched at that commit
@@ -653,6 +662,33 @@ preflight_runner_units() {
            echo "preflight: WARNING, not blocking: every runner unit is accepting jobs, but a restart policy would leave one down after the next OOM kill (scripts/ci-runner-health.sh exit 3; the WARN lines above name the unit and the setting, docs/ci-runners.md \"The two drop-ins\" has the fix)" ;;
         *) printf '%s\n' "$health_out" | sed 's/^/preflight: /'
            echo "preflight: a runner unit is not accepting jobs, so the checks after this release would queue for ever (scripts/ci-runner-health.sh exit $health_rc; the FAIL lines above say which; WEEKLY_SKIP_RUNNER_CHECK=1 to release anyway)"
+           return 1 ;;
+    esac
+    return 0
+}
+
+# The submodule row of the build (engine#2129). It runs at the top of build(), not in preflight(): the tree to inspect is
+# $SRC, which `checkout` creates, and preflight runs before that. A
+# build compiles whatever the submodules' work trees hold: tools/ci/submodule_pin_check.py is the check for whether those
+# checkouts ARE the commits this tree pins. It already exists as a ctest row, and a ctest row runs in CI -- nothing ran it
+# before a build on the box, which is where the drift was measured (7 of 7 submodules off-pin). Exit 1 stops the run: the
+# build would not be of the pinned sources. Exit 2 (nothing to compare -- no submodules initialised) only WARNS, because a
+# fresh clone must still be able to build and the warning says the check inspected nothing rather than implying a pass.
+# --require-clean is deliberately NOT passed here: it fails on a dirty submodule work tree, and a deliberate local patch
+# is a real thing a box does; the check reports those with their counts either way.
+# A function of its own so tests/weekly_submodule_preflight_test.sh can run it against a stub.
+preflight_submodules() {
+    local check=$1 src=$2 out rc=0
+    # An older ref does not carry the tool. That is not a failure, but it is not a pass either: say that the tree was not
+    # inspected, because a silent 0 here is a check that reports success for doing nothing.
+    [ -f "$check" ] || { echo "preflight: WARNING, not blocking: $src has no tools/ci/submodule_pin_check.py (a ref older than engine#2129), so submodule drift is not checked for this build"; return 0; }
+    out=$(python3 "$check" --check --root "$src" 2>&1) || rc=$?
+    case "$rc" in
+        0) printf '%s\n' "$out" | grep -v 'at their pinned commit' | sed 's/^/preflight: /' ;;
+        2) printf '%s\n' "$out" | sed 's/^/preflight: /'
+           echo "preflight: WARNING, not blocking: no submodule checkout to compare against the pin, so this build follows whatever the work trees hold (tools/ci/submodule_pin_check.py exit 2; git submodule update --init fills it)" ;;
+        *) printf '%s\n' "$out" | sed 's/^/preflight: /'
+           echo "preflight: a submodule is not at the commit this tree pins, so the build would not be of the pinned sources (tools/ci/submodule_pin_check.py exit $rc; the line above names the submodule and what to do)"
            return 1 ;;
     esac
     return 0

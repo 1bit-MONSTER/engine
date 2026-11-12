@@ -108,22 +108,6 @@ pack_unresolved_needed() {
 # (a hardware-gate cache, a drop) carries that tree's RUNPATH and its build's missing parts: in the 2026-10-23
 # rc, `llama-perplexity` came from a hardware-gate build and pointed at that build's directory. Compares each
 # staged file with the same relative path under the build and reports what has no counterpart there.
-pack_require_provenance() {  # <stage> <build>
-    local stage=$1 build=$2 f rel bad=0
-    while IFS= read -r -d '' f; do
-        pack_is_elf "$f" || continue
-        rel=${f#"$stage"/}
-        if [ ! -f "$build/$rel" ]; then
-            echo "  $rel is not in the build being packaged"
-            bad=1
-        elif ! cmp -s "$f" "$build/$rel"; then
-            echo "  $rel differs from the build being packaged"
-            bad=1
-        fi
-    done < <(find "$stage" -type f -print0)
-    return $bad
-}
-
 # The programs `put` was asked for are the ones the release promises: if one of them cannot resolve, that is a
 # build problem (the tool came from another tree, or its implementation library was not built) and the package
 # has to fail rather than quietly lose the tool. Call once per directory group: pack_require_tools <stage>

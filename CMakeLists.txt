@@ -206,6 +206,28 @@ add_executable(npu_decode_note_test tests/npu_decode_note_test.cpp)
 target_include_directories(npu_decode_note_test PRIVATE app)
 add_test(NAME npu_decode_note COMMAND npu_decode_note_test)
 add_dependencies(onebit npu_decode_note_test)
+# engine#2106: a shipped kernel set's own consistency -- manifest vs bytes, one form or none, name vs directory. The
+# refusal this pre-empts ("differ in size") needed private-repo archaeology to diagnose; the symptom is checkable here.
+add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set_check_test.sh)
+
+# engine#2186/#2244: `tools/ci/dupdef_check.py`, a check that was only ever run by hand. It is the one
+# that found a shadowed `def self_test()` in tools/hrx_f16_narrowing_check.py -- the surviving copy
+# passed and the shadowed one's arms could never fail. It takes no build input, so a ctest row is the
+# route that needs no ci.yml line (the workflow is not editable from a lane).
+# engine#2246 also added a row for that file's --self-test; `add_python_test(hrx_f16_narrowing ...)`
+# at line 418 has run exactly that since #2204, so the row was a duplicate and is gone -- one script
+# gets one row.
+add_test(NAME dupdef_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --check
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# engine#2255: `--help` must not be a traceback. Five tools indexed sys.argv directly, so the flag
+# arrived as a filename -- one with IndexError, the others with `FileNotFoundError: '--help'`, and two
+# of those on `--help/dd_metastate_...`, which is what a path join with the flag looks like. Fixed; this
+# row keeps the next one from landing.
+add_test(NAME tool_help_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/tool_help_check.py --check --root tools
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME tool_help_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/tool_help_check.py --self-test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
@@ -432,6 +454,10 @@ add_test(NAME hw_gate_npuserve COMMAND ${CMAKE_SOURCE_DIR}/tests/hw_gate_npuserv
 # loopback-server test takes (tests/route_port_lock_test.py): two of them racing for one freed port is a flaky failure.
 set_tests_properties(hw_gate_npuserve npu_serve_smoke_self PROPERTIES RESOURCE_LOCK route_ports)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
+# engine #1504: the hardware gate's build does not start below its memory floor, a memory-guard stop is not
+# resumed like a thermal stop, and the stopped compile (or GPU step) is really gone. A fake root with a stub
+# cmake, a stub thermal-run and a fake meminfo: no GPU, no compiler, runs in CI.
+add_test(NAME hw_gate_mem COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_mem_test.sh ${CMAKE_SOURCE_DIR})
 # engine #1504: the release preflight blocks on a runner unit that is down and only warns on a short restart policy.
 # The real scripts/ci-runner-health.sh and weekly.sh's preflight_runner_units() against a stub systemctl; no systemd.
 add_test(NAME weekly_runner_preflight COMMAND ${CMAKE_SOURCE_DIR}/tests/weekly_runner_preflight_test.sh)
@@ -797,7 +823,7 @@ if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp
-                            npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
+                            npu/audio_exec.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
@@ -1353,6 +1379,27 @@ add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
 target_include_directories(npu_q4nx_test PRIVATE app)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
 add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4nx)
+# engine#1503 W4: the vision tower's position embedding -- bilinear with align_corners, then the merge-block reorder.
+# Listed explicitly like npu_pack_test above so the test needs no NPU library to build.
+add_executable(q4nx_vision_pos_test tests/q4nx_vision_pos_test.cpp npu/forward/src/q4nx_vision_pos.cpp)
+add_executable(q4nx_vision_rope_test tests/q4nx_vision_rope_test.cpp npu/forward/src/q4nx_vision_rope.cpp)
+# engine#1930: the block test calls `pos_embed` too (a block is rope AND position embedding), so it needs that source as
+# well -- without it the link fails with "undefined reference to q4nx_vision::pos_embed" and the build job dies before any
+# test runs.
+add_executable(q4nx_vision_block_test tests/q4nx_vision_block_test.cpp npu/forward/src/q4nx_vision_block.cpp npu/forward/src/q4nx_vision_pos.cpp npu/forward/src/q4nx_vision_rope.cpp)
+add_executable(q4nx_vision_tower_test tests/q4nx_vision_tower_test.cpp npu/forward/src/q4nx_vision_block.cpp npu/forward/src/q4nx_vision_pos.cpp npu/forward/src/q4nx_vision_rope.cpp)
+# engine#1930 review: three of these four targets are tests ci.yml never builds, so their `add_test` rows would never run in
+# CI -- `ci_targets_check` refuses that. `add_dependencies(onebit <target>)` is the tree's documented route (it needs no
+# `.github/workflows/` edit, so it also needs no `workflow` scope for the push), and the checker follows it.
+add_dependencies(onebit q4nx_vision_block_test q4nx_vision_pos_test q4nx_vision_rope_test q4nx_vision_tower_test)
+target_include_directories(q4nx_vision_tower_test PRIVATE npu/forward/include)
+add_test(NAME q4nx_vision_tower COMMAND q4nx_vision_tower_test)
+target_include_directories(q4nx_vision_block_test PRIVATE npu/forward/include)
+add_test(NAME q4nx_vision_block COMMAND q4nx_vision_block_test)
+target_include_directories(q4nx_vision_rope_test PRIVATE npu/forward/include)
+add_test(NAME q4nx_vision_rope COMMAND q4nx_vision_rope_test)
+target_include_directories(q4nx_vision_pos_test PRIVATE npu/forward/include)
+add_test(NAME q4nx_vision_pos COMMAND q4nx_vision_pos_test)
 add_executable(npu_pack_import_test tests/npu_pack_import_test.cpp)
 target_link_libraries(npu_pack_import_test PRIVATE onebit_npu)
 add_test(NAME npu_pack_import COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden)
@@ -1371,6 +1418,28 @@ endif()
 # q4nx_pack.c is listed here rather than reached through onebit_npu: the integer host arm's checks
 # (engine#1808) call q4nx_host_gemm_i8*() directly, and those live in that file.
 add_executable(npu_pack_test tests/npu_pack_test.cpp npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
+# The Whisper encoder front-end's four f32 host kernels: no container, no device, so it runs wherever this file is built
+# (the same reason #1830/#1863 put their arms in a binary CI already compiles). Values come from the encoder reference.
+add_executable(audio_ops_test tests/audio_ops_test.cpp)
+target_include_directories(audio_ops_test PRIVATE npu/forward/include)
+# The audio pack's graph, read through the engine: pins the topological-order assumption the executor needs and the op
+# census the host reference was written against. Skips (77) without a path.
+add_executable(onnx_graph_test tests/onnx_graph_test.cpp)
+target_link_libraries(onnx_graph_test PRIVATE onebit_npu)
+add_executable(whisper_transcribe tools/whisper_transcribe.cpp)
+target_include_directories(whisper_transcribe PRIVATE npu/forward/include)
+target_link_libraries(whisper_transcribe PRIVATE onebit_npu)
+add_executable(audio_mel_test tests/audio_mel_test.cpp)
+target_include_directories(audio_mel_test PRIVATE npu/forward/include)
+add_executable(audio_exec_test tests/audio_exec_test.cpp)
+target_link_libraries(audio_exec_test PRIVATE onebit_npu)
+# The executor's fork-join (npu/audio_parallel.h): MatMul bit-identical across ONEBIT_AUDIO_THREADS, and a throwing unit
+# is a caught exception rather than std::terminate. The graph is built in memory, so: no pack, no device.
+add_executable(audio_parallel_test tests/audio_parallel_test.cpp)
+target_link_libraries(audio_parallel_test PRIVATE onebit_npu Threads::Threads)
+# ci.yml's build list is not ours to edit without `workflow` scope, so these reach CI the way ops_dump_test does: as build
+# dependencies of a target it already builds (tools/ci/ci_targets_check.py follows this edge).
+add_dependencies(onebit audio_ops_test audio_mel_test onnx_graph_test audio_exec_test audio_parallel_test)
 # A DFlash draft package as a model source (engine#1780): config + container -> a checked model whose tensors decode
 # one at a time. The loader is compiled here and not into onebit_npu because it needs the q4_1 tile decoder, which
 # lives with the forward (npu/forward/src/q4nx_dequant.c); it moves there with the draft's forward. Synthetic package,
@@ -1388,6 +1457,14 @@ target_include_directories(dflash_forward_test PRIVATE npu npu/forward/include)
 target_link_libraries(dflash_forward_test PRIVATE onebit_npu)
 add_dependencies(onebit dflash_forward_test)
 add_test(NAME dflash_forward COMMAND dflash_forward_test ${ONEBIT_DFLASH_DRAFT})
+# engine#1781: the DFlash draft as mtp::run()'s drafter (npu/dflash_head.h) on a toy base that writes a tap row per
+# position, rejected rows included: text equals plain decode, the sink keeps only committed rows, every draft equals
+# draft_forward() over them. Host only.
+add_executable(dflash_head_test tests/dflash_head_test.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp npu/forward/src/q4nx_dequant.c)
+target_include_directories(dflash_head_test PRIVATE npu npu/forward/include)
+target_link_libraries(dflash_head_test PRIVATE onebit_npu)
+add_dependencies(onebit dflash_head_test)
+add_test(NAME dflash_head COMMAND dflash_head_test)
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
@@ -1614,11 +1691,22 @@ add_test(NAME batch_check_compare COMMAND batch_check_compare_test)
 # engine#1780: the DFlash draft block's acceptance arithmetic -- tokens = accepted + bonus, the break-even rule, and the
 # published OGA-route counts as known answers. Header-only and host-only: no container, no device, no NPU runtime, so it
 # runs wherever this file is built. Registered at top level with the same hook as the row above, for the same reason.
+# The per-layer weight-cache keys are distinct (npu/forward/include/weight_keys.h): two projections of one layer
+# under one key launch with the same weights on the device. Header-only, no model.
+add_executable(weight_keys_test tests/weight_keys_test.cpp)
+target_include_directories(weight_keys_test PRIVATE npu/forward/include)
+add_test(NAME weight_keys COMMAND weight_keys_test)
+add_dependencies(onebit weight_keys_test)
 # engine#1780: where a tapped layer's rows go (npu/forward/include/layer_taps.h), header-only, no model.
 add_executable(layer_taps_test tests/layer_taps_test.cpp)
 target_include_directories(layer_taps_test PRIVATE npu/forward/include)
 add_test(NAME layer_taps COMMAND layer_taps_test)
 add_dependencies(onebit layer_taps_test)
+# The greedy speculative round and its fallback rule (npu/forward/include/spec_greedy.h, engine#1781). Header-only.
+add_executable(spec_greedy_test tests/spec_greedy_test.cpp)
+target_include_directories(spec_greedy_test PRIVATE npu/forward/include)
+add_test(NAME spec_greedy COMMAND spec_greedy_test)
+add_dependencies(onebit spec_greedy_test)
 add_executable(dflash_accept_test tests/dflash_accept_test.cpp)
 target_include_directories(dflash_accept_test PRIVATE npu/forward/include)
 add_test(NAME dflash_accept COMMAND dflash_accept_test)
@@ -1676,6 +1764,19 @@ add_executable(q4nx_qk_norm_test tests/q4nx_qk_norm_test.c npu/forward/src/q4nx_
 target_include_directories(q4nx_qk_norm_test PRIVATE npu/forward/include)
 target_link_libraries(q4nx_qk_norm_test PRIVATE m)
 add_test(NAME q4nx_qk_norm COMMAND q4nx_qk_norm_test)
+add_executable(q4nx_gemma3_semantics_test tests/q4nx_gemma3_semantics_test.c npu/forward/src/q4nx_semantics.c)
+target_include_directories(q4nx_gemma3_semantics_test PRIVATE npu/forward/include)
+target_link_libraries(q4nx_gemma3_semantics_test PRIVATE m)
+add_test(NAME q4nx_gemma3_semantics COMMAND q4nx_gemma3_semantics_test)
+add_dependencies(npu_sampling_test q4nx_gemma3_semantics_test)
+# LFM3 (engine#1786): "conv" in layer_types, the sandwich, the per-head gate, the zero-tail RoPE, and model_load's
+# renaming of the upstream tensor names. Links the two C sources directly, no model and no device.
+add_executable(q4nx_lfm3_semantics_test tests/q4nx_lfm3_semantics_test.cpp npu/forward/src/model.c
+               npu/forward/src/q4nx_semantics.c)
+target_include_directories(q4nx_lfm3_semantics_test PRIVATE npu/forward/include)
+target_link_libraries(q4nx_lfm3_semantics_test PRIVATE m)
+add_test(NAME q4nx_lfm3_semantics COMMAND q4nx_lfm3_semantics_test)
+add_dependencies(npu_sampling_test q4nx_lfm3_semantics_test)
 add_dependencies(npu_sampling_test q4nx_qk_norm_test)
 add_executable(q4nx_layer_kinds_test tests/q4nx_layer_kinds_test.c npu/forward/src/q4nx_semantics.c)
 target_include_directories(q4nx_layer_kinds_test PRIVATE npu/forward/include)
@@ -1716,6 +1817,14 @@ endif()
 if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_BO_DUMP)
     add_test(NAME npu_pack_model COMMAND npu_pack_test ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_BO_DUMP})
 endif()
+add_test(NAME audio_ops COMMAND audio_ops_test)
+add_test(NAME audio_mel COMMAND audio_mel_test)
+set_tests_properties(audio_ops PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME onnx_graph COMMAND onnx_graph_test ${ONEBIT_AUDIO_ONNX})
+add_test(NAME audio_exec COMMAND audio_exec_test ${ONEBIT_AUDIO_ONNX})
+add_test(NAME audio_parallel COMMAND audio_parallel_test)
+set_tests_properties(audio_exec PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(onnx_graph PROPERTIES SKIP_RETURN_CODE 77)
 # The private NPU route registry (npu/private_route.h), without an add-on.
 add_executable(npu_private_route_test tests/npu_private_route_test.cpp)
 target_link_libraries(npu_private_route_test PRIVATE onebit_npu)
@@ -1948,6 +2057,13 @@ endif()
     target_link_libraries(layer_taps_model_test PRIVATE onebit_npu_forward)
     add_dependencies(npu_sampling_test layer_taps_model_test)
     add_test(NAME layer_taps_model COMMAND layer_taps_model_test)
+    # engine#1781: a fully accepted verify batch keeps its own state, and it equals the restore + replay path, bit for
+    # bit. Host-GEMM, no device; skips (77) unless ONEBIT_TEST_Q4NX names a causal model with GDN layers.
+    add_executable(commit_full_accept_test tests/commit_full_accept_test.cpp)
+    target_include_directories(commit_full_accept_test PRIVATE npu/forward/include)
+    target_link_libraries(commit_full_accept_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test commit_full_accept_test)
+    add_test(NAME commit_full_accept COMMAND commit_full_accept_test)
     # engine#1905: the NPU_BATCH_CHECK oracle restores the prefix it replays from instead of resetting it, so a chunk
     # at start_pos > 0 is compared (and then run) from the state the batched pass continues. Host-GEMM, no device;
     # skips (77) unless ONEBIT_TEST_Q4NX names a container. This is the dev-box row (the private runtime, a real
@@ -1969,6 +2085,21 @@ endif()
     if(OpenMP_CXX_FOUND)
         target_link_libraries(gdn_row_bench PRIVATE OpenMP::OpenMP_CXX)
     endif()
+    # A DFlash draft scored against its target, both on the host (engine#1780): the target's tapped hidden states
+    # into the draft's reference forward, proposals checked against the target's greedy tokens. A tool, not a ctest:
+    # it needs two packages and minutes of host time.
+    # A DFlash 2 draft against the served 27B (engine#1781): acceptance in stages, and the speculative loop end to end
+    # (draft -> one batched verify pass -> commit). A tool, not a ctest: target pack, draft package and the device.
+    add_executable(dflash2_probe tools/dflash2_probe.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp)
+    target_include_directories(dflash2_probe PRIVATE npu npu/forward/include)
+    target_link_libraries(dflash2_probe PRIVATE onebit_npu_forward onebit_npu)
+    find_package(OpenMP COMPONENTS CXX QUIET)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(dflash2_probe PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    add_executable(dflash_acceptance tools/dflash_acceptance.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp)
+    target_include_directories(dflash_acceptance PRIVATE npu npu/forward/include)
+    target_link_libraries(dflash_acceptance PRIVATE onebit_npu_forward onebit_npu)
     add_executable(mtp_acceptance tools/mtp_acceptance.cpp npu/mtp/mtp_head.cpp)
     target_include_directories(mtp_acceptance PRIVATE npu npu/forward/include)
     target_link_libraries(mtp_acceptance PRIVATE onebit_npu_forward)
@@ -1979,6 +2110,7 @@ endif()
     set_tests_properties(mtp_batch_all PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(gdn_batch_order PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(layer_taps_model PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(commit_full_accept PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(batch_check_state PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source
@@ -2012,11 +2144,26 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> lfm2)
     set_tests_properties(batch_check_state_lfm2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
-    # A fabricated qwen3_5 hybrid (a linear-attention layer, then attention): load only, see the script's header.
-    add_test(NAME batch_check_state_qwen35_load
+    # LFM3 (engine#1786): the upstream tensor names, "conv" in layer_types, sandwich norms and the per-head gate.
+    add_test(NAME batch_check_state_lfm3
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> lfm3)
+    set_tests_properties(batch_check_state_lfm3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # Qwen2 (engine#1786): q/k/v biases with no attention_bias key in config.json, against a numpy Qwen2 reference.
+    add_test(NAME batch_check_state_qwen2
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> qwen2)
+    set_tests_properties(batch_check_state_qwen2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # The same Qwen2 declaring Qwen2.5-VL's contiguous "mrope": accepted, and exact on a text-only prompt.
+    add_test(NAME batch_check_state_qwen2vl
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> qwen2vl)
+    set_tests_properties(batch_check_state_qwen2vl PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # A fabricated qwen3_5 hybrid (a linear-attention layer, then attention), off the kernel's N grid on purpose.
+    add_test(NAME batch_check_state_qwen35
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> qwen3_5)
-    set_tests_properties(batch_check_state_qwen35_load PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    set_tests_properties(batch_check_state_qwen35 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 
 # Private NPU routes (docs/npu.md, "Private routes"): closed-source add-ons in a checkout of

@@ -30,6 +30,7 @@ Usage:
 """
 
 import ast
+import hashlib
 import os
 import pathlib
 import subprocess
@@ -56,6 +57,39 @@ def is_cli(path):
             if '__name__' in src and '__main__' in src:
                 has_main = True
     return has_main and 'sys.argv' in pathlib.Path(path).read_text(errors='replace')
+
+
+def tree_state(root, cwd):
+    """A digest of the tree a tool could write into.
+
+    `git status` when the cwd is inside a work tree -- a tool writes relative to the cwd, not to the
+    directory it lives in, so scanning `root` alone misses the exact defect this is for: the two
+    `oga_*` tools wrote a file named `--help` (172 KB of JSON) into the repo ROOT and a directory
+    `--help/dd_metastate_...` beside it. git reports both as untracked, and it costs one process
+    instead of hashing every path.
+    """
+    try:
+        # git in the SAME directory the tool runs in -- a write lands relative to that cwd, and asking
+        # git from the checker's own cwd reports the wrong tree (the self-test arm caught this).
+        r = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=all'],
+                           cwd=str(cwd), capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return 'git:' + hashlib.sha256(r.stdout.encode()).hexdigest()[:16]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    h = hashlib.sha256()
+    scan = pathlib.Path(cwd)
+    for f in sorted(scan.rglob('*')):
+        rel = str(f.relative_to(scan))
+        if '.git' in rel.split('/'):
+            continue
+        h.update(rel.encode())
+        if f.is_file():
+            try:
+                h.update(str(f.stat().st_size).encode())
+            except OSError:
+                h.update(b'?')
+    return 'tree:' + h.hexdigest()[:16]
 
 
 def tools_under(root):
@@ -118,7 +152,15 @@ def check(root):
     for f in tools_under(root):
         rel = f.relative_to(root)
         n += 1
+        before = tree_state(root, pathlib.Path.cwd())
         state, detail = crashes(f, root)
+        after = tree_state(root, pathlib.Path.cwd())
+        if before != after:
+            # A tool that writes while answering `--help` is a defect whether or not it also printed
+            # something: the file it wrote is named after an argument, and nothing will clean it up.
+            bad.append((rel, f'wrote into the tree while answering --help '
+                             f'({before} -> {after})'))
+            continue
         if state == 'silent':
             if is_cli(f):
                 bad.append((rel, detail))
@@ -192,6 +234,15 @@ def self_test():
             'a file with __main__ and sys.argv is a CLI; a plain module is not')
 
         (root / 'dep.py').write_text("import not_a_real_module_xyz\n")
+        # The side-effect rule, in the shape that produced it: a tool whose argv[1] is an output path.
+        (root / 'writer.py').write_text(
+            "import sys, pathlib\nif __name__ == '__main__':\n"
+            "    pathlib.Path(sys.argv[1]).write_text('x')\n")
+        before = tree_state(root, root)
+        crashes(root / 'writer.py', root, cwd=root)
+        chk(False, before == tree_state(root, root),
+            'a tool that writes its argument while answering --help changes the tree digest')
+
         chk('skip', crashes(root / 'dep.py', root)[0], 'a missing dependency is not asked, not a defect')
 
         (root / 'other.py').write_text("open('data-that-is-not-here.bin').read()\n")

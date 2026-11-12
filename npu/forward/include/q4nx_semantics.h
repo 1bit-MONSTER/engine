@@ -116,6 +116,11 @@ typedef struct {
      * guess a layout for. */
     int mrope_section[3];
     int n_mrope_section;
+    /* Qwen2-VL / Qwen2.5-VL spell MRoPE as rope_scaling {"type": "mrope", "mrope_section": [16, 24, 24]}, and their
+     * sections are CONTIGUOUS runs of frequencies (transformers apply_multimodal_rotary_pos_emb: cos split by
+     * mrope_section * 2, chunk i taking plane i % 3), not Qwen3-VL's interleave.  1 for that form (mrope is 1 too).
+     * Source: rope_scaling.type / rope_type == "mrope". */
+    int mrope_sectioned;
     /* DEEPSTACK: which decoder layers take one of the vision tower's extra feature sets.  Read from
      * vision_config.deepstack_visual_indexes (Qwen3-VL: [5, 11, 17]); the consumer adds set s to the hidden state at
      * layer deepstack_layers[s].  Empty means the pack has none. */
@@ -254,6 +259,15 @@ static inline int q4nx_mrope_axis(int freq, int n_section, const int* section) {
     if (m == 1 && freq < 3 * section[1]) return 1;
     if (m == 2 && freq < 3 * section[2]) return 2;
     return 0;
+}
+
+/* The same question for the CONTIGUOUS layout (mrope_sectioned, Qwen2-VL / Qwen2.5-VL): frequencies
+ * [0, s0) are t, [s0, s0 + s1) are h, and [s0 + s1, s0 + s1 + s2) are w.  For [16, 24, 24]: 16 t, 24 h, 24 w. */
+static inline int q4nx_mrope_axis_sectioned(int freq, int n_section, const int* section) {
+    if (n_section < 3 || !section) return 0;
+    if (freq < section[0]) return 0;
+    if (freq < section[0] + section[1]) return 1;
+    return 2;
 }
 
 /* Human-readable one-line dump of every flag with its source field. */

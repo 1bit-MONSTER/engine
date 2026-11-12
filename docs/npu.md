@@ -2041,6 +2041,17 @@ compares the forward's logits with a numpy Qwen2 forward on the container's own 
 6.6e-06 of 9.6. The binary without the fix fails it (corr 0.444, another argmax), and batched == sequential passed
 on that binary all the same.
 
+Qwen2.5-VL's text tower is the same Qwen2, and it was refused one step earlier. Its config declares
+`rope_scaling: {"type": "mrope", "mrope_section": [16, 24, 24]}`, and the forward read `"mrope"` as a frequency scaling
+it does not implement. It is a position layout instead: plain RoPE frequencies, each taking its position from the t,
+h or w plane. Qwen2-VL and Qwen2.5-VL lay the sections out CONTIGUOUSLY (transformers' `apply_multimodal_rotary_pos_emb`
+splits cos by `mrope_section * 2`): frequencies 0-15 are t, 16-39 h and 40-63 w. Qwen3-VL interleaves them
+instead. The forward now reads that form (`mrope_sectioned`, `q4nx_mrope_axis_sectioned`), and refuses a block whose
+three sections do not sum to the rotary half-width. On a text-only prompt the three planes are equal, so it is plain
+RoPE. `Qwen2.5-VL-3B-Instruct-NPU2`'s text tower now answers `Paris<|im_end|>` on the host; its vision tower is not
+loaded here. `batch_check_state_qwen2vl` is the Qwen2 above declaring that block: the same logits as the plain-RoPE
+reference (corr 1.0000000). With `"mrope"` refused again (main's behaviour) the arm fails.
+
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.
 A pack of the same architecture under another name got it wrong in silence. FastFlowLM's MiniCPM-V 4.7

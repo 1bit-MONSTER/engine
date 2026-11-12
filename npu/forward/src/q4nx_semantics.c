@@ -310,6 +310,14 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
         const char* rs = value_for_top(json, "rope_scaling");
         double mr = 0;
         if (rs && *rs == '{' && get_num(rs, "mrope_interleaved", &mr) && mr != 0) s->mrope = 1;
+        /* Qwen2-VL / Qwen2.5-VL: the contiguous form, named by the block's type */
+        char rt[32] = {0};
+        if (rs && *rs == '{' && !s->mrope &&
+            ((get_str(rs, "type", rt, sizeof rt) && strcmp(rt, "mrope") == 0) ||
+             (get_str(rs, "rope_type", rt, sizeof rt) && strcmp(rt, "mrope") == 0))) {
+            s->mrope = 1;
+            s->mrope_sectioned = 1;
+        }
     }
     const char* rope_blk = value_for_top(json, "rope_parameters");
     if (rope_blk && *rope_blk == '{') {

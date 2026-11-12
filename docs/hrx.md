@@ -1044,9 +1044,23 @@ and the 256-aligned Q4_K prefill through the 8-bit-block kernel, which reads Q4_
 | weights in two layouts | 70 (2,486.7 MiB duplicate) | 16 (462.9 MiB) |
 
 The generated text is identical, and prefill was not slower in the one interleaved window measured (prompt eval 263.5 and 317.1
-tok/s against 298.7 and 317.1). Qwen3-4B is unchanged (398 copies). What is left on the 27B, 15 Q4_K weights read by a prefill
-kernel that has only a packed form and one Q6_K weight, is tracked in
-[engine#2137](https://github.com/1bit-MONSTER/engine/issues/2137). Making decode step aside instead was measured and does not help:
+tok/s against 298.7 and 317.1). Qwen3-4B is unchanged (398 copies).
+
+**Since pin `228e1f652` the 27B holds no weight twice** (llama.cpp #322). The last 16 were all read by the fused projection+conv
+prefill kernel: 15 Q4_K weights it reads only in the packed rows, and one Q6_K weight it bound stored while the rest of prefill reads
+it packed. For a Q4_K weight decode already holds stored, that kernel now steps aside (the projection runs on the stored 8-bit-block
+kernel and the conv runs separately), and it binds Q6_K in the packed rows where prefill reads that weight packed. Same
+`llama-completion` run with `-n 48`, default settings, fork head `5816f7b` against `a591023`:
+
+| Qwen3.8-27B UD-Q4_K_XL | before #322 | since #322 |
+|---|---:|---:|
+| device copies | 866, 16,181.4 MiB | 850, 15,718.5 MiB |
+| weights in two layouts | 16 (462.9 MiB) | 0 |
+
+The text is identical. Over six interleaved arms (trace off), prompt eval was 320.9, 308.4 and 306.2 tok/s before against 328.5,
+323.3 and 306.0 since, and decode 10.86 to 10.91 against 10.86 to 11.01: not slower, no gain claimed. `GGML_HRX_Q4K_PACKED_TAIL=1`
+(or `GGML_HRX_PREFILL_FOLLOWS_DECODE=0`) restores the fused kernel for Q4_K, `GGML_HRX_Q6K_PACKED_ROWS=0` the stored Q6_K binding.
+Before either, making decode step aside instead was measured and does not help:
 the same duplicates, and decode 8.5 % slower. flint UD-Q4_K_XL (routed experts) reads every weight stored and holds one copy per
 weight with or without the default.
 

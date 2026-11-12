@@ -282,6 +282,8 @@ struct Plan {
     // engine#1788, 3c: every I8 row whose implied K is none of the widths the geometry declares. Reported for the
     // writer's benefit -- a row that implies a K the model does not have is a re-tile, not a copy.
     std::map<int64_t, int64_t> container_payload_rows;          // row_bytes -> how many I8 tensors use it
+    // engine#1788, 3c: per role, the shapes the container carries -- the fact the writer's shape matching needs.
+    std::map<std::string, std::map<std::string, int64_t>> container_role_shapes;
     std::vector<ContainerPayloadAnomaly> container_payload_anomalies;
     // engine#1786 (item F1), slice 2: WHERE the container's geometry came from, and what it could not reach.
     // A bare number in `dims` cannot say whether the pack declared it or a file beside it did, and those two are free to
@@ -426,6 +428,11 @@ const char* container_role_field(const std::string& role);
 //   - `container_payload_anomalies`  only the rows that cannot be one of these at all (shorter than the 640-byte
 //                               overhead, or an odd remainder), with implied_k = -1.
 std::map<int64_t, int64_t> container_payload_rows(const std::vector<Q4nxTensor>& tensors);
+// engine#1788, slice 3c step 4: per role, the shapes a container actually carries. The writer's job is "for this
+// destination field, are the source shapes what that field holds?", and after the plausible-K attempt produced false
+// positives on both packs on this box, the useful thing to hand it is the FACT: which shapes each role appears in.
+// A role with one shape is a mapping; a role with several is a decision the writer must make per shape.
+std::map<std::string, std::map<std::string, int64_t>> container_role_shapes(const std::vector<Q4nxTensor>& tensors);
 std::vector<ContainerPayloadAnomaly> container_payload_anomalies(const std::vector<Q4nxTensor>& tensors);
 // The destination fields claimed by more than one role in `counts` (each with the roles that claim it). Empty is the
 // only state a writer may start from.

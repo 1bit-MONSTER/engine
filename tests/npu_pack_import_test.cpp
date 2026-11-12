@@ -5260,6 +5260,35 @@ void test_container_payload_rule() {
     }
 }
 
+// engine#1788 / 3c step 4: per role, the shapes a container carries. Measured on the 35B: every role has exactly ONE
+// shape (q_proj [256,8,4736] x10, qkv_proj [256,8,4736] x30, gate_exps [4096,8,4736] x40, moe_router [2048,256] BF16
+// x40, ...), which is what makes the writer a mapping rather than a per-shape decision. A role that appears in two
+// shapes must be visible as two, not averaged.
+void test_container_role_shapes() {
+    const auto t = [](const std::string& n, std::vector<int64_t> shape, const char* dt) {
+        pi::Q4nxTensor x; x.name = n; x.dtype = dt; x.shape = std::move(shape); return x;
+    };
+    {
+        const std::vector<pi::Q4nxTensor> v = {
+            t("model.layers.0.self_attn.q_proj.weight", {256, 8, 4736}, "I8"),
+            t("model.layers.1.self_attn.q_proj.weight", {256, 8, 4736}, "I8"),
+            t("model.layers.0.moe_router.weight", {2048, 256}, "BF16")};
+        const auto rs = pi::container_role_shapes(v);
+        check(rs.count("q_proj") && rs.at("q_proj").size() == 1 && rs.at("q_proj").begin()->second == 2,
+              "role shapes: two tensors of one role and one shape are one entry with a count");
+        check(rs.count("moe_router") && rs.at("moe_router").begin()->first == "[2048,256] BF16",
+              "role shapes: the shape text carries the dtype, so a BF16 table cannot be read as an I8 row");
+    }
+    {
+        // a role in two shapes must report both: that is the case the writer has to decide about
+        const std::vector<pi::Q4nxTensor> v = {
+            t("a.q_proj.weight", {256, 8, 4736}, "I8"), t("b.q_proj.weight", {128, 8, 4736}, "I8")};
+        const auto rs = pi::container_role_shapes(v);
+        check(rs.at("q_proj").size() == 2, "role shapes: a role carried in two shapes reports both, not an average");
+    }
+    check(pi::container_role_shapes({}).empty(), "role shapes: no tensors, no roles");
+}
+
 void test_container_roles() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6300,6 +6329,7 @@ int main(int argc, char** argv) {
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
         test_container_roles();
+        test_container_role_shapes();
         test_container_payload_rule();
         test_container_role_fields();
         test_container_plan_reports_roles();

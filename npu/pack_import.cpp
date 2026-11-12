@@ -3314,6 +3314,7 @@ std::string Plan::manifest() const {
                       {"counts", container_role_counts}};
         if (!container_roles_unassigned.empty()) c["roles"]["unassigned_names"] = container_roles_unassigned;
         c["payload_rows"] = container_payload_rows;
+        c["role_shapes"] = container_role_shapes;
         if (!container_payload_anomalies.empty()) {
             json a = json::array();
             for (const auto& x : container_payload_anomalies)
@@ -3456,6 +3457,24 @@ std::map<int64_t, int64_t> container_payload_rows(const std::vector<Q4nxTensor>&
     std::map<int64_t, int64_t> out;
     for (const auto& t : tensors)
         if (t.dtype == "I8" && t.shape.size() == 3) out[t.shape[2]]++;
+    return out;
+}
+
+std::map<std::string, std::map<std::string, int64_t>> container_role_shapes(const std::vector<Q4nxTensor>& tensors) {
+    std::map<std::string, std::map<std::string, int64_t>> out;
+    const ContainerRoles roles = container_roles(tensors);
+    std::map<std::string, std::map<std::string, int64_t>> by_name;
+    for (const auto& t : tensors) {
+        std::string s = "[";
+        for (size_t i = 0; i < t.shape.size(); ++i) s += (i ? "," : "") + std::to_string(t.shape[i]);
+        s += "]";
+        by_name[t.name][s + " " + t.dtype]++;
+    }
+    for (const auto& kv : roles.role_of) {
+        const auto it = by_name.find(kv.first);
+        if (it == by_name.end()) continue;
+        for (const auto& shape : it->second) out[kv.second][shape.first] += shape.second;
+    }
     return out;
 }
 
@@ -3717,6 +3736,7 @@ Plan plan(const std::string& pack_dir) {
             }
             // engine#1788, 3c: what the writer needs to know about the payload, as fact rather than judgement.
             p.container_payload_rows = container_payload_rows(c.tensors);
+            p.container_role_shapes = container_role_shapes(c.tensors);
             p.container_payload_anomalies = container_payload_anomalies(c.tensors);
             p.container_note = c.why.empty()
                 ? "the pack is a safetensors container (model.q4nx): " + std::to_string(c.tensors.size()) +

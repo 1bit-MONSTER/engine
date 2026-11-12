@@ -3435,6 +3435,45 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
 // classifies as a bias of q_proj rather than as an unknown tensor, and a name that matches nothing lands in `unassigned`
 // with its own name rather than being guessed from its shape.
 // engine#1788, slice 3c step 1: (role, layer type), the key the writer needs. See the header for the measurement.
+PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
+                                  const std::vector<std::string>& layer_types) {
+    PlacementReport out;
+    const ContainerRoles roles = container_roles(tensors);
+    const RoleSlotReport table = container_role_slots(roles);
+    for (const auto& t : tensors) {
+        PlacementRow row;
+        row.tensor = t.name;
+        const auto it = roles.role_of.find(t.name);
+        if (it == roles.role_of.end()) { row.why = "no role recognised"; ++out.no_role; out.rows.push_back(row); continue; }
+        row.role = it->second;
+        std::string::size_type pos = t.name.find(".layers.");
+        std::string::size_type off = 8;
+        if (pos == std::string::npos) { pos = t.name.find(".layer."); off = 7; }
+        if (pos != std::string::npos) {
+            const std::string::size_type start = pos + off;
+            std::string::size_type end = start;
+            while (end < t.name.size() && t.name[end] >= '0' && t.name[end] <= '9') ++end;
+            if (end > start) {
+                const int64_t layer = std::atoll(t.name.substr(start, end - start).c_str());
+                row.layer = std::to_string(layer);
+                if (layer >= 0 && layer < int64_t(layer_types.size())) row.layer_type = layer_types[size_t(layer)];
+            }
+        }
+        row.slot = container_role_slot(row.role, row.layer_type);
+        if (row.slot.empty()) {
+            const auto why = table.why.find(row.role);
+            row.why = why != table.why.end() ? why->second
+                      : "the layer type does not give this role a destination";
+            ++out.unplaced;
+        } else {
+            ++out.placed;
+            ++out.slot_counts[row.slot];
+        }
+        out.rows.push_back(row);
+    }
+    return out;
+}
+
 RoleLayerReport container_role_layer_types(const std::vector<Q4nxTensor>& tensors,
                                            const std::vector<std::string>& layer_types) {
     RoleLayerReport out;
@@ -3485,6 +3524,76 @@ RoleLayerReport container_role_layer_types(const std::vector<Q4nxTensor>& tensor
         if (!already) out.no_layer.push_back(kv.first + "  (no tensor inside a layer)");
     }
     return out;
+}
+
+// engine#1788, slice 3c: the roles a layer type does not change, and the engine slot each becomes. Every right-hand
+// side below is a literal that exists in npu/forward/src (grep the strings, do not infer them from HF names).
+static const struct { const char* role; const char* slot; } kRoleSlots[] = {
+    {"embed",              "model.embed_tokens.weight"},
+    {"final_norm",         "model.norm.weight"},
+    {"input_norm",         "input_layernorm.weight"},
+    {"post_norm",          "post_attention_layernorm.weight"},
+    {"lm_head",            "lm_head.weight"},
+    {"q_proj",             "self_attn.q_proj.weight"},
+    {"k_proj",             "self_attn.k_proj.weight"},
+    {"v_proj",             "self_attn.v_proj.weight"},
+    {"o_proj",             "self_attn.o_proj.weight"},
+    {"self_attn_gate_proj","self_attn.gate_proj.weight"},
+    {"gate_proj",          "mlp.gate_proj.weight"},
+    {"up_proj",            "mlp.up_proj.weight"},
+    {"down_proj",          "mlp.down_proj.weight"},
+    {"gate_exps",          "mlp.experts.gate_proj.weight"},
+    {"up_exps",            "mlp.experts.up_proj.weight"},
+    {"down_exps",          "mlp.experts.down_proj.weight"},
+    {"shortconv_in_proj",  "shortconv.in_proj.weight"},
+};
+
+// The roles this slice does NOT place, each with the reason. A number here is honest; a guessed slot is not.
+static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
+    {"qkv_proj",            "the slot prefix is the LAYER TYPE's (`linear_attn.` or `self_attn.`), so it needs the second key"},
+    {"q_norm",              "the engine's normaliser slots are per-architecture; none is verified for this role yet"},
+    {"k_norm",              "same: the engine's `k_norm` string is a config field, not a verified weight slot"},
+    {"gate_up_proj",        "fused in some containers, two slots in the engine; needs a measured split"},
+    {"moe_router",          "the engine reads `mlp.router.bias`; the weight slot is not verified"},
+    {"share_gate_exps",     "the shared expert's slots differ per architecture and none is verified"},
+    {"share_up_exps",       "same"},
+    {"share_down_exps",     "same"},
+    {"shared_expert_gate",  "same"},
+};
+
+// The layer types that are linear attention, as an EXACT set rather than a substring: the defect family this stack
+// exists to fix is substring matching where an identity was meant (#1840, #1841, #2277's needle order). A value that
+// merely contains "linear" is not linear attention, and a new family (gdn, mamba-style) must be added here on purpose.
+static const char* const kLinearAttentionLayerTypes[] = {"linear_attention"};
+
+static bool is_linear_attention(const std::string& layer_type) {
+    for (const char* t : kLinearAttentionLayerTypes) if (layer_type == t) return true;
+    return false;
+}
+
+std::string container_role_slot(const std::string& role, const std::string& layer_type) {
+    if (role == "qkv_proj") {
+        // The engine's only fused-qkv slot is the linear-attention one; `self_attn.qkv_proj` is not a name it reads.
+        return is_linear_attention(layer_type) ? "linear_attn.qkv_proj.weight" : std::string();
+    }
+    for (const auto& kv : kRoleSlots) if (role == kv.role) return kv.slot;
+    return std::string();
+}
+
+RoleSlotReport container_role_slots(const ContainerRoles& roles) {
+    RoleSlotReport r;
+    for (const auto& kv : kRoleSlots) r.slot_of[kv.role] = kv.slot;
+    for (const auto& kv : kRoleNoSlot) r.why[kv.role] = kv.why;
+    // Every role the caller actually met must be either placed or explained: a role that is in neither is a hole in
+    // this table, and saying so is the point of the report.
+    for (const auto& c : roles.counts) {
+        if (r.slot_of.count(c.first)) r.placed.push_back(c.first);
+        else if (r.why.count(c.first)) r.no_slot.push_back(c.first);
+        else { r.no_slot.push_back(c.first); r.why[c.first] = "a role this table does not know: it needs a decision"; }
+    }
+    std::sort(r.placed.begin(), r.placed.end());
+    std::sort(r.no_slot.begin(), r.no_slot.end());
+    return r;
 }
 
 ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {

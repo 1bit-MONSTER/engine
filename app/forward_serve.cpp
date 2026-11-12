@@ -50,6 +50,7 @@
 #include "npu_prefix_cache.h"
 #include "npu_prompt_ids.h"
 #include "npu_sampling.h"
+#include "npu_spec_sampler.h"
 #include "npu_stop_tokens.h"
 #include "stream_bridge.h"
 #include "npu_systemone.h"
@@ -142,11 +143,16 @@ struct ForwardEngine {
     // KL-divergence comparison against another stack (engine#671 gate b) needs the distribution
     // itself.  Empty means off, which is the default: nothing is written unless asked.
     std::string dump_logits;
-    // --spec-lookup K (engine#1781): a greedy request without grammar or logprobs decodes through mtp::run_from() with
+    // --spec-lookup K (engine#1781): a greedy request without grammar decodes through mtp::run_from() with
     // the prompt-lookup drafter, up to K drafts verified per batch; 0 = off (the default). --spec-fallback X: stop
     // drafting for the rest of a reply once its last 3 rounds averaged fewer than X tokens (0 = never).
     int spec_lookup = 0;
     double spec_fallback = 0.0;
+    // --spec-sample: a sampled request (temperature > 0) takes the speculative path too, its drafts kept or refused by
+    // the rule that keeps the target's distribution (npu/mtp/spec_accept.h through mtp::RowSampler). Off by default: the
+    // reply then follows the same distribution but not the plain loop's random stream, so a seed gives a different
+    // reply than it does without the flag.
+    bool spec_sample = false;
     bool host_gemm = false;   // NPU_INFER_HOST_GEMM: the forward runs on the host, with no launch width of its own
     // --spec-draft <dir> (engine#1781): a DFlash draft package as the drafter instead of the prompt lookup, up to
     // spec_draft_k drafts a round. The forward writes the draft's tap layers into draft_taps on every pass; the sink
@@ -551,16 +557,22 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // One chosen token through the reply: the end tokens, the grammar, the stop sequences and the hold-back that
         // keeps a partial stop match unsent. false = the reply ends here (an end token, a stop sequence, or a client
         // that stopped reading). The plain loop and the speculative one hand every token to this, in order.
-        auto deliver = [&](int next) -> bool {
+        // `row` is the logits row `next` was chosen from (the head's full width); null means `logits`.
+        auto deliver = [&](int next, const float* row = nullptr) -> bool {
             if (std::find(e.eos.begin(), e.eos.end(), next) != e.eos.end() ||
                 (e.endoftext >= 0 && next == e.endoftext)) { stopped_at_eos = true; return false; }
             if (gram) gram->feed(grammar_state, e.tok_text[next]);
             const std::string piece = e.tok->decode(next);
             pending += piece;
             // Raw distribution: sample_token() takes logits by const reference, so this is
-            // pre-top_k/top_p/temperature and the grammar mask cannot narrow it.
+            // pre-top_k/top_p/temperature and the grammar mask cannot narrow it.  Over the tokenizer's ids only, as
+            // sample_token() draws: a row is as wide as the head, which can be wider (Qwen3 151,936 against 151,669,
+            // engine#2272), and the padding would join the normaliser and could be named in top_logprobs.
             if (want_lp)
-                held.emplace_back(Emitted{piece, npu::logprobs_of(logits, e.tok->size(), next, opts.sample.top_logprobs)}, piece.size());
+                held.emplace_back(Emitted{piece, npu::logprobs_of(row ? row : logits.data(),
+                                                                  npu::token_bound(logits.size(), e.tok->size()), next,
+                                                                  opts.sample.top_logprobs)},
+                                  piece.size());
             stats.pieces.push_back(piece);   // engine#2111: reasoning_tokens is counted over these
             ++produced;
             const size_t stop_at = npu::find_stop(pending, opts.stop);
@@ -583,23 +595,29 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             return true;
         };
         // engine#1781: the speculative path, only where it cannot change a token. Greedy, so each token is the bounded
-        // argmax the verify rows check drafts against; no grammar (its mask is per token and per state); no logprobs
-        // and no logit dump (both read the logits of every position, and a verify batch's rows are not kept). The text
-        // is then the plain loop's token for token -- what tests/serve_spec_lookup_test.py holds it to.
-        const bool spec =
-            (e.spec_lookup > 0 || e.draft) && opts.sample.greedy() && !gram && !want_lp && e.dump_logits.empty();
+        // argmax the verify rows check drafts against; no grammar (its mask is per token and per state); no logit dump
+        // (it writes one file per decode step). The text is then the plain loop's token for token -- what
+        // tests/serve_spec_lookup_test.py holds it to. Logprobs are reported from the row each token came from
+        // (Options::on_token_row), the base's own logits at that position, as the plain loop reports them.
+        // --spec-sample widens it to sampled requests, whose drafts are then judged by the distribution-keeping rule
+        // instead (npu::SpecSampler): the reply follows the same distribution as the plain loop's, not its stream.
+        const bool spec = (e.spec_lookup > 0 || e.draft) && (opts.sample.greedy() || e.spec_sample) && !gram &&
+                          e.dump_logits.empty();
         if (spec) {
             struct ServeBase : npu::mtp::BaseModel {
                 Q4nxNpuForward& f;
-                int nv, rows;
-                ServeBase(Q4nxNpuForward& fw, int v, int r) : f(fw), nv(v), rows(r) {}
+                int nv, width, rows;
+                ServeBase(Q4nxNpuForward& fw, int v, int w, int r) : f(fw), nv(v), width(w), rows(r) {}
                 int vocab() const override { return nv; }
+                // The forward's rows are the head's width (M x NV), wider than vocab() (the tokenizer's bound)
+                // whenever the head carries padding ids (Qwen3: 151,936 against 151,669); the loop strides by this.
+                int row_stride() const override { return width; }
                 int hidden_size() const override { return int(f.last_hidden().size()); }
                 int max_batch_rows() const override { return rows; }
                 bool step(int t, int p, std::vector<float>& l) override { return f.step(t, p, l); }
                 bool step_batch_all(const std::vector<int>& t, int s0, std::vector<float>& l) override {
                     f.begin_verify(int(t.size()), s0);
-                    return f.step_batch_all(t, s0, l);
+                    return f.step_batch_all(t, s0, l) && l.size() == t.size() * size_t(width);
                 }
                 bool commit_verify(int a) override { return f.commit_verify_rows(a); }
                 const std::vector<float>& last_hidden() const override { return f.last_hidden(); }
@@ -607,7 +625,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             // The bound sample_token() applies: ids past the tokenizer are padding and never chosen (engine#2017).
             // The device verifies as many rows as its kernels are wide; host GEMMs have no width, and 1 (what the
             // forward reports there) would leave no row for a draft, so host mode verifies the device's 16.
-            ServeBase base(*e.fwd, int(npu::token_bound(logits.size(), e.tok->size())),
+            ServeBase base(*e.fwd, int(npu::token_bound(logits.size(), e.tok->size())), int(logits.size()),
                            e.host_gemm ? 16 : e.fwd->max_batch_rows());
             npu::mtp::PromptLookupHead lookup(ids);
             std::unique_ptr<npu::dflash::DFlashHead> dflash;
@@ -631,20 +649,24 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                                                                    e.draft->cfg.block_size, e.draft->cfg.sliding_window);
             }
             npu::mtp::DraftHead& head = dflash ? static_cast<npu::mtp::DraftHead&>(*dflash) : lookup;
+            npu::SpecSampler sampler(opts.sample, rng);   // used for a sampled request (npu_spec_sampler.h)
             npu::mtp::Options o;
             o.k = e.draft ? e.spec_draft_k : e.spec_lookup;
             o.max_tokens = limit;
             o.tau = 0.0f;
             o.fallback_below = e.spec_fallback;
             o.consume_last = false;   // the plain loop does not run the reply's last token either
-            const npu::mtp::Result r = npu::mtp::run_from(
-                base, &head, int(ids.size()), logits, o, [&](int t) {
-                    if (req.is_connection_closed() || (bridge && bridge->cancelled())) return false;
-                    return deliver(t);
-                });
+            o.sampler = opts.sample.greedy() ? nullptr : &sampler;
+            // Each token with the row it came from, so a request with logprobs reports them from the same row the
+            // plain loop would have: the base's own logits at that position, at the head's full width.
+            o.on_token_row = [&](int t, const float* row) {
+                if (req.is_connection_closed() || (bridge && bridge->cancelled())) return false;
+                return deliver(t, row);
+            };
+            const npu::mtp::Result r = npu::mtp::run_from(base, &head, int(ids.size()), logits, o);
             if (!r.ok) throw std::runtime_error("speculative decode: " + r.err);
-            std::fprintf(stderr, "[spec] %s %d tokens: %d rounds, %d of %d drafts accepted, %d plain steps%s\n",
-                         e.draft ? "dflash" : "lookup", int(r.tokens.size()), r.stats.batches, r.stats.accepted, r.stats.drafted, r.stats.steps,
+            std::fprintf(stderr, "[spec] %s%s %d tokens: %d rounds, %d of %d drafts accepted, %d plain steps%s\n",
+                         e.draft ? "dflash" : "lookup", o.sampler ? " sampled" : "", int(r.tokens.size()), r.stats.batches, r.stats.accepted, r.stats.drafted, r.stats.steps,
                          r.stats.fell_back_at >= 0 ? (", fell back after round " + std::to_string(r.stats.fell_back_at)).c_str()
                                                    : "");
         }
@@ -1157,6 +1179,7 @@ int run_forward_serve(int argc, char** argv) {
     int ctx_size = 0;                // --ctx-size N: prompt plus answer, at most the model's own (0 = the model's)
     int spec_lookup = 0;             // --spec-lookup K (engine#1781): prompt-lookup drafts, K per verify batch
     double spec_fallback = 0.0;      // --spec-fallback X: stop drafting below X tokens per round
+    bool spec_sample = false;        // --spec-sample: sampled requests speculate too (distribution-keeping rule)
     std::string spec_draft;          // --spec-draft <dir>: a DFlash draft package as the drafter
     int spec_draft_k = 0;            // --spec-draft-k K: drafts per round (default: the package's block - 1)
     for (int i = 0; i < argc; i++) {
@@ -1180,12 +1203,13 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--dump-logits") dump_logits = next();
         else if (a == "--spec-lookup") spec_lookup = std::stoi(next());
         else if (a == "--spec-fallback") spec_fallback = std::stod(next());
+        else if (a == "--spec-sample") spec_sample = true;
         else if (a == "--spec-draft") spec_draft = next();
         else if (a == "--spec-draft-k") spec_draft_k = std::stoi(next());
         else throw std::runtime_error("unknown option " + a);
     }
     if (model.empty())
-        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N] [--npu-target xdna] [--dump-logits <dir>] [--spec-lookup K | --spec-draft <dir> [--spec-draft-k K]] [--spec-fallback X]");
+        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N] [--npu-target xdna] [--dump-logits <dir>] [--spec-lookup K | --spec-draft <dir> [--spec-draft-k K]] [--spec-fallback X] [--spec-sample]");
     if (!spec_draft.empty() && spec_lookup > 0)
         throw std::runtime_error("--spec-draft and --spec-lookup are two drafters; give one");
     if (spec_draft_k != 0 && spec_draft.empty()) throw std::runtime_error("--spec-draft-k needs --spec-draft");
@@ -1193,6 +1217,8 @@ int run_forward_serve(int argc, char** argv) {
         throw std::runtime_error("--spec-lookup takes 0..15 drafts per round (a verify batch holds at most 16 rows), not " +
                                  std::to_string(spec_lookup));
     if (!(spec_fallback >= 0.0)) throw std::runtime_error("--spec-fallback takes a number of tokens >= 0");
+    if (spec_sample && spec_lookup == 0 && spec_draft.empty())
+        throw std::runtime_error("--spec-sample needs a drafter (--spec-lookup K or --spec-draft <dir>)");
     if (streams < 1 || streams > kNpuMaxStreams)
         throw std::runtime_error("--npu-streams takes 1.." + std::to_string(kNpuMaxStreams) +
                                  " (the device's hwctx limit), not " + std::to_string(streams));
@@ -1214,6 +1240,7 @@ int run_forward_serve(int argc, char** argv) {
     e.id = alias.empty() ? std::filesystem::path(dir).filename().string() : alias;
     e.spec_lookup = spec_lookup;
     e.spec_fallback = spec_fallback;
+    e.spec_sample = spec_sample;
     if (!dump_logits.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(dump_logits, ec);

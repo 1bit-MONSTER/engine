@@ -386,6 +386,45 @@ struct ContainerRoles {
 };
 ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors);
 
+// engine#1788, slice 3c, the writer's destination side. A role says WHAT a tensor is; the engine reads weights by SLOT
+// name (the string literals in npu/forward/src), so an import needs role -> slot. Only the roles whose destination does
+// not depend on the LAYER TYPE are placed here. The rest are named in `no_slot` with a reason instead of guessed:
+// a wrong slot does not fail loudly, it loads a tensor into a field the engine reads with another shape, and the
+// symptom is a wrong number rather than an error.
+struct RoleSlotReport {
+    std::map<std::string, std::string> slot_of;   // role -> engine slot; absent when this slice does not place it
+    std::vector<std::string> placed;              // placed roles, sorted
+    std::vector<std::string> no_slot;             // deliberately unplaced roles, sorted
+    std::map<std::string, std::string> why;       // role -> why it is not placed here
+};
+RoleSlotReport container_role_slots(const ContainerRoles& roles);
+
+// engine#1788, slice 3c: the one role whose destination the LAYER TYPE decides, and the reason it decides it. The engine
+// carries `linear_attn.qkv_proj.weight` and has NO `self_attn.qkv_proj` slot at all (grep the literals in npu/forward/src),
+// so the fused qkv has a destination on a linear layer and nowhere else. Empty string = no destination; the caller must
+// not treat that as "unchanged", which is why this returns a string and the report above returns the reasons.
+std::string container_role_slot(const std::string& role, const std::string& layer_type);
+
+// engine#1788, slice 3c: the writer's per-TENSOR decision, which is what an import actually iterates. Reads the tensor's
+// own layer, takes that layer's declared type, and asks the table above for a destination. A tensor with no role and a
+// tensor with a role but no destination are counted apart, because the first is a vocabulary gap and the second is a
+// decision that was made on purpose.
+struct PlacementRow {
+    std::string tensor;
+    std::string layer;        // "" when the tensor belongs to no layer (embed, final_norm, lm_head)
+    std::string layer_type;   // "" for the same reason
+    std::string role;
+    std::string slot;         // "" when there is no destination
+    std::string why;          // the reason, when slot is empty
+};
+struct PlacementReport {
+    std::vector<PlacementRow> rows;
+    std::map<std::string, int64_t> slot_counts;
+    int64_t placed = 0, unplaced = 0, no_role = 0;
+};
+PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
+                                    const std::vector<std::string>& layer_types);
+
 // engine#1788, slice 3c: a container's roles need a SECOND key, and the second key is the layer type.
 // Measured: gemma4-e2b's `q_proj` is N=384 on all 28 `sliding_attention` layers and N=768 on all 7 `full_attention` ones;
 // bolt-e4b's is (640,5120) on all 35 sliding and (1280,5120) on all 7 full. A perfect partition, structural in origin

@@ -2678,7 +2678,7 @@ got before.
 | `top_k` | keep the `k` highest logits; `0` or absent keeps all of them |
 | `top_p` | nucleus sampling, `1` or absent keeps all of them (`min_keep` candidates always stay) |
 | `seed` | the same seed and the same request give the same text; absent or `-1` seeds from the clock |
-| `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them |
+| `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them; normalised over the tokenizer's ids only, so a head padded past the vocabulary (Qwen3: 151,936 rows against 151,669 ids) neither shifts them nor puts a padding id in `top_logprobs` (engine#2272) |
 | `top_logprobs` | `0`-`100` alternatives per token, highest raw logit first; needs `logprobs: true` |
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
 | `max_tokens` / `max_completion_tokens` | the reply's cap (`max_completion_tokens` wins); a value that is not a number is a 400 naming the field, and a fractional one is truncated |
@@ -3555,7 +3555,7 @@ round). `tools/dflash2_probe loop` with `DFLASH2_MTP_RUN=1` drives the served 27
 `DFlashHead` and the DFlash 2 selector as its pick hook, after the same batched prefill as its hand-written loop.
 
 **Serving it: `forward-serve --spec-lookup K`** (off by default; `--spec-fallback X` adds the fallback). A request that
-is greedy, has no grammar, and asks for no logprobs (and a server without `--dump-logits`) decodes through
+is greedy and has no grammar (on a server without `--dump-logits`) decodes through
 `mtp::run_from()` with the prompt-lookup drafter (`npu/mtp/prompt_lookup.h`). That drafter needs no model: it proposes
 the up to `K` tokens that followed the latest earlier occurrence of the stream's last one to three tokens. Every
 other request takes the plain loop. The rule is that speculation is used only where it cannot change a token: each
@@ -3567,10 +3567,49 @@ end. It fabricates a container, serves it host-GEMM twice (plain, then with `--s
 text, `finish_reason` and `completion_tokens` for:
 - every budget;
 - stop sequences cut from the plain replies, so they do end them;
-- a seeded sampled request, which must stay on the plain loop.
+- a seeded sampled request, which must stay on the plain loop (without `--spec-sample`, below).
 
 In host-GEMM mode the verify batch is 16 rows, the device's width. Host GEMMs have no width of their own, and the 1
 the forward reports there would leave no row for a draft. The device route has not been measured with it yet.
+
+The verify pass returns its rows at the head's width, which is wider than the tokenizer whenever the head carries
+padding ids (Qwen3: 151,936 against 151,669). The loop chooses among the tokenizer's ids but steps through the batch
+by `BaseModel::row_stride()`, the head's width; stepping by the tokenizer's bound reads every row after the first
+misaligned. The test's container has a 512-row head against its 256-id tokenizer for this reason. With the wrong
+stride its speculative replies leave plain greedy within 24 tokens.
+
+A request with logprobs takes the speculative path as well. `Options::on_token_row` hands every emitted token the
+row it was chosen from or checked against: the base's own logits at that position, at the head's full width. The
+serve reports the token's log-probability and its `top_logprobs` from that row, as the plain loop does from its step's
+row. The test sends chat requests with `top_logprobs` 3 to every server, one of them a prompt whose drafts the lookup
+keeps. Each speculative server reports the plain server's tokens, log-probabilities and alternatives exactly
+(difference 0 on the host forward).
+
+**`--spec-sample`** (with either drafter) takes sampled requests (temperature above 0, no grammar) onto
+the same path. `Options::sampler` (`mtp::RowSampler`, `npu/mtp/draft.h`) turns the loop's choices into draws.
+`npu::SpecSampler` (`app/npu_spec_sampler.h`) is forward-serve's sampler:
+- `pick()` is the plain loop's `sample_token()`;
+- `check()` keeps a draft `x` with probability `p(x)`, where `p` is what `sample_token()` draws from under the same
+  temperature, top_k and top_p (`sample_probs()`, `app/npu_sampling.h`). Otherwise it emits a draw from `p` with `x`
+  removed, and that draw ends the round.
+
+This is `npu/mtp/spec_accept.h`'s rule for a drafter whose own distribution is one-hot at its proposal, which both
+drafters are. Each emitted token then follows `p` at its position, as in the plain loop. It does not follow the plain
+loop's random stream: the same seed gives the same reply again, but a different one than without the flag. That is why
+the flag is off by default.
+
+`tests/mtp_sampled_test.cpp` (ctest `mtp_sampled`) holds the distribution on a toy Markov chain. It runs 200,000
+seeded 3-token replies per arm and compares them with the exact product of the chain's conditionals; plain sampling is
+the control:
+- both round shapes land at TV 0.008-0.009 against the control's 0.009, and forward-serve's own sampler (temperature
+  0.8, top_k 4, top_p 0.9) at 0.006;
+- a sampler that keeps every draft lands at 0.92;
+- every transition of 24-token replies matches its row at k = 1 and 4, which catches a refusal carried into a later
+  round.
+
+`npu_sampling_test` holds `sample_probs()` to `sample_token()`'s own draws. The serve test adds a `--spec-sample`
+server: its greedy requests equal plain's; a seeded sampled request repeats itself; at temperature 0.001 a sampled
+reply is plain greedy's.
 
 **`forward-serve --spec-draft <dir>`** (`--spec-draft-k K`, default the package's block minus one) serves the same path
 with a DFlash draft package as the drafter, in place of the prompt lookup. At load the package is decoded once and

@@ -64,9 +64,10 @@ It adds each variable in `env` unless it is already set. Serve prints what it ad
 
 ## The built-in recipes
 
-Four. Three are on `hrx` for the `qwen35` architecture, from the 2026-10-24/25 HRX drafter measurements
-(the Bonsai one is narrowed to PrismML's ternary files by a metadata key, below); the fourth is an
-`hrx` + `qwen4exp` environment setting, and it is the only one that is not a llama-server flag:
+Five. Three are on `hrx` for the `qwen35` architecture, from the 2026-10-24/25 HRX drafter measurements
+(the Bonsai one is narrowed to PrismML's ternary files by a metadata key, below). Two are on `hrx` for
+`qwen4exp` (Qwen3.8-Flash-Next): an environment setting, the only recipe that is not a llama-server
+flag, and the prefill micro-batch:
 
 | id | matches | adds | measured |
 |---|---|---|---|
@@ -74,6 +75,7 @@ Four. Three are on `hrx` for the `qwen35` architecture, from the 2026-10-24/25 H
 | `bonsai-ternary-mtp-n2` | `hrx`, `qwen35`, drafter `mtp`, `prism.hadamard.version` present | `--spec-draft-n-max 2` | 40.4 / 38.3 / 30.4 / 34.7 tok/s (code / prose / short / translation) against 41.7 / 36.8 / 27.2 / 33.2 at 3 drafts: the ternary files accept 0.76 of 2-token drafts, so short answers and translation win at 2 and only code wants 3-4 |
 | `qwen35-mtp-max-3` | `hrx`, `qwen35`, drafter `mtp` | `--spec-draft-n-max 3` (what serve's `--mtp-max 3` passes) | 32.6 / 26.9 / 28.0 tok/s; acceptance falls to 0.17-0.60 past 7 drafts, so do not raise it |
 | `hrx-graph-program-cache-128` | `hrx`, `qwen4exp` | `GGML_HRX_GRAPH_PROGRAM_CACHE=128` | Flash-Next's decode graph needs 66 programs against a default limit of 64 (933 and 779 trims in two 40-minute 18.8k runs), and one program that is not resident costs 41 ms (44-1584 nodes, warm, flat in graph size): ~4 ms/step at the observed ~1 trim per 10 steps, ~41 ms/step if it were 1 per step. The tok/s row itself is not measured - the 76.33 GiB file needs the whole box |
+| `qwen4exp-hrx-ub2048` | `hrx`, `qwen4exp` | `-ub 2048` | product path pp4096 205.05 vs 101.05 tok/s at `-ub 512` (2.03x; UD-IQ4_XS, ctx 16384, one library), pp512 183.76 vs 133.38; `llama-bench` on UD-IQ3_XXS pp4096 548.94 vs 343.71 (1.60x), pp512 tied (703 vs 710). The routed expert GEMMs are 34 % of prefill device time and see about 10 rows per expert at 512 (10 of 512 experts per token). Scoped to `qwen4exp`: Qwen3-Coder-30B-A3B loses 12 % at pp512 with 2048, and dense models are fastest at 512 |
 
 Both carry their full `measured` line in `config/recipes.json`. Older recipes were measured on build
 RFC #213 stage 3 removed: `rotated-moe-ub1024` and `rocm-dflash-p-min-0.4` (the lean ROCm build). New

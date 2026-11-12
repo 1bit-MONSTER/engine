@@ -376,6 +376,9 @@ add_python_test(moe_expert_chunks_accum_test ${CMAKE_SOURCE_DIR}/tests/moe_exper
 # engine#2138 slice: a merge's conflicts classified by kind, from git's index -- the conflicts a text search cannot
 # see (add/delete with no markers) are the ones a pin merge is mostly made of. Device-free, no checkout.
 add_python_test(conflict_triage_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_triage.py --self-test)
+# reviews: a PR that carries another PR's files lands two merge decisions as one, and one whose work base
+# already has reads as a fresh duplicate. Both are invisible to a diffstat; this compares blobs. Device-free.
+add_python_test(pr_carry_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_carry_check.py --self-test)
 add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
 # `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and

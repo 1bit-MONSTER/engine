@@ -27,13 +27,17 @@
 # stdout, diagnostics on stderr, so callers can use it as a command substitution.
 set -euo pipefail
 
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
 root=$(cd "$(dirname "$0")/.." && pwd)
 me=fetch-rocm-sdk
 check=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) check=1; shift ;;
-        -h|--help) sed -n '16,26p' "$0"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
         --) shift; break ;;
         -*) echo "$me: unknown option $1" >&2; exit 2 ;;
         *) break ;;

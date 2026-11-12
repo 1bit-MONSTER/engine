@@ -27,7 +27,11 @@
 # /opt/rocm-therock come in from the host and the engine's HRX llama-server runs on HRX0.
 set -euo pipefail
 
-[ $# -ge 2 ] || { sed -n '16,27p' "$0"; exit 2; }
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
+[ $# -ge 2 ] || { usage; exit 2; }
 pkg=$(readlink -f "$1") model=$(readlink -f "$2") gpu=${3:-}
 name=1bit-u2604-check-$$
 runtime=${CONTAINER_RUNTIME:-docker}

@@ -58,6 +58,9 @@ ACC_MUL = re.compile(r"vector\.mulf|template\.apply<@[^>]*wmma[^>]*>|vector\.(fm
 # Measured (engine#2167): at 120 lines past the init, `mul_mat_id_f16_f16_wmma_core`'s four accumulators read as
 # unaffected, because their update sits ~250 lines below in a long Q4_K/Q6 loop body. 250 finds them.
 ACC_WINDOW = 250
+# A shrink fails the check, not only a grow: `shrank` is in the same failure set as `grew`. That is deliberate -- the
+# ratchet is a ratchet, so when a count goes DOWN, `--write` the smaller list in the same change and say why the count
+# moved. An improvement therefore cannot land without editing the baseline in front of a reviewer (engine#2244 review).
 
 
 def corpus_fingerprint(corpus):

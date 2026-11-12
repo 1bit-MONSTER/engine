@@ -399,6 +399,12 @@ struct RoleSlotReport {
 };
 RoleSlotReport container_role_slots(const ContainerRoles& roles);
 
+// engine#1788, slice 3c: the one role whose destination the LAYER TYPE decides, and the reason it decides it. The engine
+// carries `linear_attn.qkv_proj.weight` and has NO `self_attn.qkv_proj` slot at all (grep the literals in npu/forward/src),
+// so the fused qkv has a destination on a linear layer and nowhere else. Empty string = no destination; the caller must
+// not treat that as "unchanged", which is why this returns a string and the report above returns the reasons.
+std::string container_role_slot(const std::string& role, const std::string& layer_type);
+
 // engine#1788, slice 3c: a container's roles need a SECOND key, and the second key is the layer type.
 // Measured: gemma4-e2b's `q_proj` is N=384 on all 28 `sliding_attention` layers and N=768 on all 7 `full_attention` ones;
 // bolt-e4b's is (640,5120) on all 35 sliding and (1280,5120) on all 7 full. A perfect partition, structural in origin

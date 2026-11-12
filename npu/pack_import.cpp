@@ -3522,6 +3522,15 @@ static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
     {"shared_expert_gate",  "same"},
 };
 
+std::string container_role_slot(const std::string& role, const std::string& layer_type) {
+    if (role == "qkv_proj") {
+        // The engine's only fused-qkv slot is the linear-attention one; `self_attn.qkv_proj` is not a name it reads.
+        return layer_type.find("linear") != std::string::npos ? "linear_attn.qkv_proj.weight" : std::string();
+    }
+    for (const auto& kv : kRoleSlots) if (role == kv.role) return kv.slot;
+    return std::string();
+}
+
 RoleSlotReport container_role_slots(const ContainerRoles& roles) {
     RoleSlotReport r;
     for (const auto& kv : kRoleSlots) r.slot_of[kv.role] = kv.slot;

@@ -6247,6 +6247,18 @@ static void test_container_role_slots() {
         check(s.no_slot.empty(), "slots: three placed roles leave nothing unexplained");
     }
     {
+        // the layer type decides exactly one destination, and it decides it the way the ENGINE does: the only fused-qkv
+        // slot npu/forward/src reads is the linear-attention one, so a full-attention qkv has no destination at all.
+        check(container_role_slot("qkv_proj", "linear_attention") == "linear_attn.qkv_proj.weight",
+              "slots: the fused qkv on a linear layer");
+        check(container_role_slot("qkv_proj", "full_attention").empty(),
+              "slots: a full-attention qkv has no engine slot, so it is not placed");
+        check(container_role_slot("q_proj", "full_attention") == "self_attn.q_proj.weight",
+              "slots: the layer type does not move a role it does not decide");
+        check(container_role_slot("qkv_proj", "sliding_attention").empty(),
+              "slots: sliding attention is not linear, so the fused qkv stays unplaced");
+    }
+    {
         // no two roles may claim the same slot: a collision silently drops one of them
         std::map<std::string, std::string> seen;
         for (const auto& kv : container_role_slots(ContainerRoles{}).slot_of) {

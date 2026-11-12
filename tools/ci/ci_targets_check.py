@@ -214,6 +214,85 @@ def add_test_need(cmake_text):
     return need
 
 
+# A COMMAND token that names no declared target and is not an interpreter, a path or a generator
+# expression: the row is registered in ctest for a target nothing defines. Before this, `add_test_need`
+# intersected with the declared targets, so such a row was in NO set and the check could not see it --
+# an unguarded `add_test(NAME x COMMAND missing_target)` passed as "none new" (measured by planting one).
+INTERPRETERS = {
+    'bash', 'sh', 'python', 'python3', 'node', 'npm', 'perl', 'ruby', 'cmake', 'ctest', 'grep',
+    'echo', 'true', 'false', 'env', 'time', 'timeout', 'git', 'make', 'ninja', 'valgrind', 'sudo',
+}
+TARGETISH = re.compile(r'^[A-Za-z_][A-Za-z0-9_.+-]*$')
+
+
+def add_test_unknown_targets(cmake_text):
+    """{test name: [tokens]} for a row whose COMMAND names something target-shaped but not declared.
+
+    The complement of add_test_need: that one answers "which declared target does a test need", this
+    one answers "which test names a target that does not exist". A script test (`COMMAND bash x.sh`) is
+    excluded by the interpreter set, and a path, a flag or a generator expression by TARGETISH.
+    """
+    exes = {m.group(1) for m in (ADD_EXE.match(l) for l in cmake_text.splitlines()) if m}
+    libs = set()
+    for line in cmake_text.splitlines():
+        m = re.match(r'^\s*add_library\s*\(\s*([A-Za-z0-9_.+-]+)', line, re.IGNORECASE)
+        if m:
+            libs.add(m.group(1))
+    declared = exes | libs
+    out = {}
+    for lineno, block in add_test_blocks(cmake_text):
+        m = re.search(r"\bNAME\s+([A-Za-z0-9_.+-]+)", block)
+        test_name = m.group(1) if m else f"line {lineno}"
+        cm = re.search(r"\bCOMMAND\s+(.*)", block, re.DOTALL)
+        if not cm:
+            continue
+        cmd = cm.group(1)
+        # The first token is the program; if it is an interpreter or a path, this is a script test.
+        first = re.split(r"[\s()]+", cmd.strip())[0] if cmd.strip() else ''
+        if first.startswith('$<') or '/' in first or first in INTERPRETERS:
+            continue
+        # Only the FIRST token can be the target. Everything after it is an argument, and a bare
+        # argument (`lfm2` in `COMMAND ${Python3_EXECUTABLE} ... state_ci.py $<TARGET_FILE:...> lfm2`)
+        # is indistinguishable from a target without knowing the program -- which is the mistake the
+        # first version made, and it flagged five real rows in this tree.
+        if not TARGETISH.match(first) or first in INTERPRETERS:
+            continue
+        if first in declared:
+            continue
+        out.setdefault(test_name, []).append(first)
+    return out
+
+
+def _self_test_unknown_targets():
+    """Arms for the rule that a row must not name a target nothing defines."""
+    rc = 0
+
+    def chk(want, got, what):
+        nonlocal rc
+        if want == got:
+            print(f"ok   {what}")
+        else:
+            print(f"FAIL {what}: want {want}, got {got}")
+            rc = 1
+
+    chk({'broken': ['no_such_target']},
+        add_test_unknown_targets('add_test(NAME broken COMMAND no_such_target)'),
+        'a row whose COMMAND is an undeclared bare target is found')
+    chk({}, add_test_unknown_targets('add_executable(real t.cpp)\nadd_test(NAME ok COMMAND real)'),
+        'a declared target is not a finding')
+    chk({'s': ['nope']},
+        add_test_unknown_targets('add_test(NAME s COMMAND nope arg1 arg2)'),
+        'the FIRST token is the target; later bare words are arguments')
+    chk({'p': ['nope']},
+        add_test_unknown_targets('add_test(NAME p COMMAND nope ${CMAKE_SOURCE_DIR}/x.py lfm2)'),
+        'an argument after a real target name is not reported (the five false positives this rule had)')
+    chk({}, add_test_unknown_targets('add_test(NAME script COMMAND bash tools/x.sh arg)'),
+        'a script row names an interpreter, so it is not a target')
+    chk({}, add_test_unknown_targets("add_test(NAME gen COMMAND $<TARGET_FILE:thing>)"),
+        'a generator expression is not an undeclared target')
+    return rc
+
+
 def read_baseline(path):
     """The names already known to drift, or None when there is no baseline file (which fails closed)."""
     if not os.path.isfile(path):
@@ -469,6 +548,17 @@ def check(root):
         print(f"ci_targets_check: {len(by_design)} test(s) are declared only under guards ci.yml's configure turns "
               f"off, so CI never registers them by design ({', '.join(sorted(by_design)[:6])}"
               f"{', …' if len(by_design) > 6 else ''}) - not drift")
+    # A row whose COMMAND names a target nothing defines is not drift against the baseline: ctest would
+    # report it "Not Run" (or the build would fail) and no baseline entry can make that acceptable, so
+    # it fails on its own. engine#2268 shaped this: `add_test_need` intersected with the declared targets,
+    # so such a row was in NO set and the check answered "none new" for it.
+    unknown_target = add_test_unknown_targets(cmake_text)
+    if unknown_target:
+        for test_name, toks in sorted(unknown_target.items()):
+            print(f"ci_targets_check: test '{test_name}' runs a target nothing defines: "
+                  f"{', '.join(sorted(set(toks)))} -- ctest would report it Not Run")
+        return 1
+
     baseline = read_baseline(os.path.join(root, BASELINE))
     if baseline is None:
         # No baseline is not "nothing known": treating it as empty would let the first run of a run
@@ -823,6 +913,7 @@ add_test(NAME family_suite COMMAND family_test)
         else:
             print("  ok    and no hint is invented when nothing starts with the query")
 
+    fails += _self_test_unknown_targets()
     print(f"ci_targets_check --self-test: {fails} failure(s)")
     return 1 if fails else 0
 

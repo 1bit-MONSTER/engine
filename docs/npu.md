@@ -478,15 +478,16 @@ paragraphs up — which is the reason it exists: the target was self-consistent,
 own scalar reference, and decoding a different matrix than the container meant.
 
 
-**The decode head can run on the host (engine#1785), `NPU_HEAD_HOST=1`.** A decode step sends one row
+**The decode head runs on the host (engine#1785); `NPU_HEAD_HOST=0` puts it back on the device.** A decode step sends one row
 through every tile of the int8 head, and a launch costs the same weight pass for one row as for a full
-batch, so those launches are the most expensive use of the device in a token. With `NPU_HEAD_HOST=1` the
-single-row head is computed on the host instead, from the same image the device reads (the resident weight
+batch, so those launches are the most expensive use of the device in a token. The
+single-row head is therefore computed on the host, from the same image the device reads (the resident weight
 buffer's host mapping, no second copy), with the device path's own activation quantiser and the same
 epilogue. The sums are int32, so the logits are the device head's bit for bit, not an approximation of
 them. `NPU_HEAD_HOST_THREADS` sets the threads the tiles are split over (default 4, at most 16). It applies
 to the int8 tiled head only: the ternary (`pb16i`) head, the gemv head and batched head rows (prefill,
-verify) stay on the device. Off by default.
+verify) stay on the device. The serve log says which it is: `lm head: on the host (default; NPU_HEAD_HOST=0 for the
+device), N tile(s), T thread(s)`. If the image cannot be read on the host the head goes to the device, with one line.
 
 Measured on the NPU with FastFlowLM's `Qwen3.5-2B-NPU2` container (vocabulary 248,320, width 2,048, 21
 head tiles), same binary, device head and host head interleaved, 24 greedy tokens per request, on a busy
@@ -511,9 +512,15 @@ serve (96 of 96):
 | head plus following layers | 386 ms (2.6 tok/s) | 334 ms (3.0 tok/s) |
 
 So the host head takes 68 ms off the head and the next token's layers give 15 ms of it back, a net 52 ms
-(13 %) per token on this model. It stays off by default because it changes the profile table's row set (one
-`HEAD` row at M=1 in place of the M=16 launches), and `scripts/npu-window11.sh --compare` requires the two
-binaries it compares to print the same rows. The layers are the other four fifths of a token and are untouched.
+(13 %) per token on this model. On `MiniCPM-V-4.7-1B-NPU2` (width 1,024, 35 head tiles) the same alternation, 100
+tokens at load 23, read 89.2 ms against 5.3 ms for the head and 320.4 against 321.2 ms for the following layers, so
+nothing is given back there: about 84 ms of a 410 ms token. Its 96 logits dumps are byte-identical to a device-only
+serve's.
+
+It is the default because the logits are the device's on both models and the gain is measured inside one serve on
+both. The profile table then has one `HEAD` row at M=1 in place of the M=16 launches;
+`scripts/npu-window11.sh --compare` accepts exactly that difference against a device-head run
+([npu-plan.md](npu-plan.md)). The layers are the other four fifths of a token and are untouched.
 
 ### The t2s stream (what the XDNA decode kernel reads)
 
@@ -1259,6 +1266,24 @@ like a proprietary blob. `npu-pack info` resolves the sibling and reports it: `g
 stride the `.fconst` attention tile already carries (2,176 B subvolume = 32 rows × 68 B). The FFN width for this genre comes
 from the node's own `N`/`K` (`gate_proj`/`up_proj` → N, `down_proj` → K), because the weight is a 1-D byte blob with no
 shape to read it from (engine#1503).
+
+**The 1.8 hybrid line (`*_rai_1.8.0_hybrid`) is not importable, and that is a decision, not a gap still to be filled (engine#1503).** These packs pair a `model.onnx` with a `model.bin`: 1.3 GB on `Llama-3.2-1B-Instruct_rai_1.8.0_hybrid`, alongside a 542 MB `model.onnx.data` that holds only the embedding and the norms. In the graph, every `.MatMulNBits.*` initializer is a `[0]` placeholder with no bytes, and so is its `.packed` sibling (162 of 162 on that pack). The weights exist only in `model.bin`, a compiled container that the vendor's runtime reads. Writing a reader for it means decoding that container, which this engine does not do, so `npu-pack info` and `npu-pack import` refuse these packs by name before reading anything:
+
+```
+lm_head.MatMulNBits.qweight (its lm_head.MatMulNBits.qweight.packed sibling carries no data either), and the pack carries
+no Token .fconst either (...): these weights are genuinely absent from the pack's external data, so this pack cannot be
+imported -- not a tile-layout or block-size problem. This pack's weights are in its model.bin, which this importer does
+not read (engine#1503)
+```
+
+The same models ship in an earlier generation that this engine reads. Use that pack instead. The last column says what was measured on it (11-11):
+
+| 1.8 hybrid pack | instead | measured |
+|---|---|---|
+| `Llama-3.2-1B-Instruct_rai_1.8.0_hybrid` | the `rai_1.7.1` hybrid | imported and served on the NPU on 11-10, before the tied-head gate existed; not re-run since |
+| `SmolLM2-135M-Instruct_rai_1.8.0_hybrid` | the `rai_1.7.1` hybrid | `npu-pack import` rc 0 with the head-fit check (head 1.07× its 4-bit floor); the earlier rel ≤ 0.02 rule refused it at 0.104 |
+| `Qwen2.5-0.5B-Instruct_rai_1.8.0_hybrid` | the `rai_1.7.1` hybrid, or `rai_1.9.0_npu` | both `npu-pack import` rc 0 |
+| `Phi-3.5-mini-instruct_rai_1.8.0_hybrid` | the `rai_1.7.1` hybrid | `npu-pack info` rc 0 (plan clean); not imported here |
 
 **A pack can be the weights without the text.** AMD's `_rai_1.8.0_npu_4K` repos do publish the
 model's own `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, `merges.txt`,
@@ -2966,6 +2991,14 @@ A caller inside the process that needs the same stream as data, not files, uses
 sink, `taps x H` wide, the listed layers side by side. It works for `step()` and for the batched passes, and it is what
 a DFlash draft's `target_layer_ids` are read with (docs/amd-drafters.md). Layer `l`'s block is the stream after layer
 `l`, the same point `layer_<ll>.f32` records; `layer_taps_model_test` holds the two to each other bit for bit.
+
+**A Gemma4 (per-layer-embedding) pack no longer re-reads its layer weights every token.** `step()` skips the
+per-token Q4NX dequant once a dense layer's projections are packed on the device; a per-layer-embedding model was
+excluded from that, although its gate and projection are read once at init and are packed like the rest. Measured on
+`Nemotron-3.5-Bolt-E4B` (42 layers), one ticket, one binary, arms old / new / old / new (`NPU_PLE_RELOAD=1` is the old
+behaviour): 3377 and 3410 ms per step with the reload, 2486 and 1914 ms without, same reply in all four. What is left
+is the device: on this per-op int8 family a 16-row launch streams the whole weight image (`GU` 21.5 ms, `D` 13.6 ms,
+`QKV` 4.0 ms per launch), which is about 1.9 s per token over 42 layers.
 
 The files these dumps write (`NPU_INFER_DUMP_DIR`'s `layer_<ll>.f32`, `NPU_I8_GS_DUMP`'s weight-scale pairs) are
 created owner-only (0600) and never through a symlink at the final path component, whatever the umask, and a dump file

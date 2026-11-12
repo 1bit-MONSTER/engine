@@ -84,14 +84,28 @@ def verdict(rows: list[tuple[str, str, str, str]], require_initialised: bool,
     bad = unknown = uninit = dirty_at_pin = 0
     for flag, sha, path, describe in rows:
         if flag == " ":
-            n = (dirty or {}).get(path, 0)
+            n, ndel = (dirty or {}).get(path, (0, 0))
             if n:
                 dirty_at_pin += 1
-                out.append(
-                    f"submodule_pin: {path} is at the pinned {sha[:12]} but its work tree has {n} changed "
-                    f"path(s), so the build compiles code the pin does not name. Repair: git -C {path} stash, or "
-                    f"move the pin if the change is meant to stay (git add {path})"
-                )
+                # `checkout -- .` restores the work tree FROM THE INDEX, so it cannot bring back a deletion staged in the
+                # index (`D `) -- `checkout HEAD -- .` restores both columns, and for a pin checkout HEAD is the pin. Measured
+                # on a throwaway repo: after `checkout -- .` the `D ` row is still there; after `checkout HEAD -- .` the
+                # porcelain is empty.
+                if ndel == n:
+                    out.append(
+                        f"submodule_pin: {path} is at the pinned {sha[:12]} but {n} path(s) the pin names are MISSING "
+                        f"from its work tree, so the build compiles without them. "
+                        f"Repair: git -C {path} checkout HEAD -- ."
+                    )
+                else:
+                    # Mixed: say how many of the changes are deletions, because that is the state a repair half-does.
+                    out.append(
+                        f"submodule_pin: {path} is at the pinned {sha[:12]} but its work tree has {n} changed "
+                        f"path(s){', ' + str(ndel) + ' of them deletions the build compiles without' if ndel else ''}"
+                        f", so the build compiles code the pin does not name. Repair: git -C {path} stash, or "
+                        f"move the pin if the change is meant to stay (git add {path}); "
+                        f"`git -C {path} status` lists the rest"
+                    )
                 if require_clean:
                     bad += 1
             continue
@@ -146,13 +160,17 @@ def run_git(root: pathlib.Path) -> tuple[str, int]:
     return p.stdout, 0
 
 
-def run_dirty(root: pathlib.Path, rows: list[tuple[str, str, str, str]]) -> dict[str, int]:
-    """{path: changed-path count} for the submodules that ARE at their pin.
+def run_dirty(root: pathlib.Path, rows: list[tuple[str, str, str, str]]) -> dict[str, tuple[int, int]]:
+    """{path: (changed, deleted)} for the submodules that ARE at their pin.
 
     Only those: a '+' or 'U' row already fails and its dirty count would be noise. `git status --porcelain` inside the
     submodule is the only thing that reports this state - `git submodule status` prints ' ' for it.
+
+    Deletions are counted separately because the repair differs and the count alone cannot tell them apart: on 2026-11-12
+    all three dirty work trees on the box were 301/32/20 **deletions** (files the pin names, absent from disk, 64 of them
+    `.jinja` templates the renderer compiles), and the message then said `stash` - advice for a work tree somebody edited.
     """
-    out: dict[str, int] = {}
+    out: dict[str, tuple[int, int]] = {}
     for flag, _sha, path, _describe in rows:
         if flag != " ":
             continue
@@ -162,9 +180,11 @@ def run_dirty(root: pathlib.Path, rows: list[tuple[str, str, str, str]]) -> dict
         except OSError:
             continue
         if p.returncode == 0:
-            n = len([l for l in p.stdout.splitlines() if l.strip()])
-            if n:
-                out[path] = n
+            rows_changed = [l for l in p.stdout.splitlines() if l.strip()]
+            if rows_changed:
+                # porcelain v1 is `XY path`: X is the index, Y the work tree, so a deletion shows as `D ` or ` D`
+                deleted = len([l for l in rows_changed if "D" in l[:2]])
+                out[path] = (len(rows_changed), deleted)
     return out
 
 
@@ -242,20 +262,53 @@ def self_test() -> int:
         "... and so does the uninitialised one",
     )
     # engine#2129, the half `git submodule status` cannot report: at the pin, dirty work tree
-    check(verdict(parse_status(at_pin), False, {"third_party/llama.cpp": 301})[0] == 0,
+    # deletions-only is its own state with its own repair (2026-11-12: 301/32/20 deletions on the box, message said `stash`)
+    _del_msgs = verdict(parse_status(at_pin), False, {"third_party/llama.cpp": (301, 301)})[1]
+    check(any("MISSING" in m for m in _del_msgs),
+          "a work tree whose paths are all DELETED says so")
+    check(any("checkout HEAD -- ." in m for m in _del_msgs),
+          "...and names `checkout HEAD -- .`: bare `checkout -- .` restores from the index and cannot undo a STAGED deletion")
+    check(any("200" in m or "of them deletions" in m for m in
+              verdict(parse_status(at_pin), False, {"third_party/llama.cpp": (201, 200)})[1]),
+          "a mixed work tree names how many of its changes are deletions")
+    check(any("stash" in m for m in verdict(parse_status(at_pin), False, {"third_party/llama.cpp": (301, 200)})[1]),
+          "a mixed work tree keeps the stash/pin advice")
+    check(verdict(parse_status(at_pin), False, {"third_party/llama.cpp": (301, 301)})[0] == 0,
+          "...and deletions alone still do not fail without --require-clean")
+
+    check(verdict(parse_status(at_pin), False, {"third_party/llama.cpp": (301, 0)})[0] == 0,
           "at the pin with 301 dirty paths -> pass by default (a deliberate local patch is a real thing)")
-    check(any("301 changed" in m for m in verdict(parse_status(at_pin), False, {"third_party/llama.cpp": 301})[1]),
+    check(any("301 changed" in m for m in verdict(parse_status(at_pin), False, {"third_party/llama.cpp": (301, 0)})[1]),
           "... but it IS reported, with its count")
-    check(verdict(parse_status(at_pin), False, {"third_party/llama.cpp": 301}, True)[0] == 1,
+    check(verdict(parse_status(at_pin), False, {"third_party/llama.cpp": (301, 0)}, True)[0] == 1,
           "... and FAILS with --require-clean")
     check(verdict(parse_status(at_pin), False, {}, True)[0] == 0,
           "a clean submodule at its pin still passes with --require-clean")
-    check(not any("changed" in m for m in verdict(parse_status(ahead), False, {"third_party/llama.cpp": 5})[1]),
+    check(not any("changed" in m for m in verdict(parse_status(ahead), False, {"third_party/llama.cpp": (5, 0)})[1]),
           "a dirty '+' row is not double-counted (the commit is the failure there)")
 
     # one bad among several still fails: the check is not 'all lines' or 'the first line'
     check(verdict(parse_status(at_pin + ahead + at_pin), False)[0] == 1,
           "one '+' among three lines still fails")
+
+    # run_dirty() itself -- where the column logic lives -- against a real repo with one work-tree deletion (` D`) and one
+    # staged deletion (`D `). The arms above feed verdict() a dict, so without this the new logic is only covered by hand.
+    import tempfile as _tf
+    rd_root = pathlib.Path(_tf.mkdtemp())
+    sub = rd_root / "third_party" / "x"
+    sub.mkdir(parents=True)
+    def _git(*args):
+        return subprocess.run(["git", "-C", str(sub), *args], capture_output=True, text=True, check=False)
+    _git("init", "-q")
+    _git("config", "user.email", "t@t"); _git("config", "user.name", "t")
+    (sub / "a.txt").write_text("a\n"); (sub / "b.txt").write_text("b\n")
+    _git("add", "."); _git("commit", "-qm", "base")
+    _git("rm", "-q", "--cached", "b.txt"); (sub / "a.txt").unlink()
+    got = run_dirty(rd_root, [(" ", "0" * 40, "third_party/x", "")])
+    # 3 changed, 2 deleted: `git rm --cached b.txt` leaves the file untracked (`?? b.txt`), and an untracked path is also
+    # code the pin does not name -- so the count is right and the intent of the arm is the DELETION count, both columns.
+    check(got.get("third_party/x") == (3, 2),
+          f"run_dirty() counts both porcelain columns as deletions (got {got.get('third_party/x')})")
 
     print("submodule_pin self-test:", "ok" if bad == 0 else f"{bad} FAILED")
     return 0 if bad == 0 else 1

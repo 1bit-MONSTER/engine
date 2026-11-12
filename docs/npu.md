@@ -303,13 +303,31 @@ the bf16 rounding reappears for the device, never in the container.
 
 **The cache is bounded, and the bound is least-recently-used (engine#1956).** After writing an
 entry, `1bit serve` removes the least-recently-used entries until the cache is within
-`ONEBIT_Q4NX_CACHE_MAX_GIB` (default 60; `0` or a negative number turns the sweep off). The entry
+`ONEBIT_Q4NX_CACHE_MAX_GIB` (default 60; `0` or a negative number turns the sweep off). The
+forward's device-form conversion (`npu/q4nx_device.cpp`) sweeps the same way after it writes a new
+entry (engine#2263), so a box that converts through the forward and never starts a serve stays
+within the bound too. A forward load (`1bit forward-serve`, `1bit npu-run` on a sealed set, the
+host-only route too) also sweeps once it has loaded, because a pack that needs no conversion still
+writes its head images (below) into the cache. The sweep itself is `npu/q4nx_cache_sweep.h`,
+shared by every writer and by `1bit q4nx-cache evict`, which without `--root` sweeps the directory
+every writer uses (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`). A box that writes nothing never
+sweeps; `1bit q4nx-cache evict` is the manual trigger for that case. The entry
 just written and any entry used in the last ten minutes are never removed. "Used" means reused,
 not only written: a cache hit — a repacked GGUF found in the cache, or a device-form conversion
 reused at load — marks the entry's directory as used now, so a container imported once and served
 every day outlives a one-off imported yesterday. The value is read as a whole number of GiB: a
 number too large to be a byte count is the largest bound that is one (it does not wrap to a small
 one), and a value that is not a number gets the default rather than an unbounded cache.
+
+**A box that never serves never sweeps (engine#2263).** Both triggers — the write-time sweep and the manual
+`1bit q4nx-cache evict` — need the binary to run, so a review, CI or build box that holds the cache and never starts a
+serve keeps every entry it ever wrote. Measured on this box: **59 GiB in 12 h** with the command merged and nothing
+invoking it, which put free space 3 GiB under the 175 GiB build gate; one manual 24 h age cut took it to 24 GiB and it
+regrew. `scripts/install-q4nx-cache-timer.sh` installs the invoker as a `systemd --user` timer — hourly,
+`--max-gib 40 --min-age 86400`, opt-in, nothing outside `~/.config/systemd/user` — and refuses to install against a
+binary that predates the command (`1bit q4nx-cache` printing *unknown command*), because a timer naming a command the
+binary lacks fails hourly and silently. `--dry-run` prints the units and verifies them without changing anything;
+`--uninstall` removes them and leaves the cache alone.
 
 **The packed lm-head is cached beside it (engine#1716).** A model whose head runs as int8 tiles
 packs those tiles on the host — gather `kpad × T` weights per tile, quantise each column to int8
@@ -335,10 +353,11 @@ The serve log line says what happened: `lm head: N packed weight tile(s) residen
 image cache, P packed (W written for the next serve) in S s`. `ONEBIT_HEAD_IMAGE_CACHE=0` turns
 the cache off (nothing is read or written). The files are `kd × nd` bytes plus `nd` scales per
 tile, so a head costs about `kpad × vocabulary` bytes on disk per kernel set. The Q4NX cache sweep
-(`ONEBIT_Q4NX_CACHE_MAX_GIB`, above) counts `head-images/` as one entry of the cache and removes it
-whole when the cache is over its bound and that directory is the least recently written one. Its
-age is the last time a tile was written into it: a serve that only reads its tiles does not refresh
-it. Losing the directory costs the next serve one pack of its head, nothing else. Ternary (`pb16i`) heads and the gemv head do not
+(`ONEBIT_Q4NX_CACHE_MAX_GIB`, above) counts each key in `head-images/` (`headimg-<digest>`, all its
+tiles) as one entry of the cache (engine#2263; it used to count the directory as one entry, so the
+sweep could only keep every pack's head or remove all of them). A key's age is its newest tile, and
+a cache hit marks the tile it read as used, so a head served every day is not aged from the day it
+was packed. Losing a key costs the next serve of that pack one pack of its head, nothing else. Ternary (`pb16i`) heads and the gemv head do not
 use it: their image already is a file. Each writer builds the file under its own name
 (`<file>.tmp.<pid>`) and renames it into place, so two serves that start cold on the same pack both
 finish their write and a reader only ever sees a whole image. The behaviour is pinned host-side in
@@ -2073,6 +2092,75 @@ host after three changes:
 On the host the known-answer prompt gives `<|channel>thought\n<channel|>Paris<turn|>`: the model writes the
 template's own empty-thought prefix, then answers. Gemma4-E2B, the PLE model, still answers `Paris`. No kernel set
 for the 12B's shapes was built or run (the NPU is off).
+
+**GPT-OSS-20B-NPU2: the forward reads gpt_oss, on the host (engine#1786).** FastFlowLM's pack stores the model in
+two chunk kinds this forward did not read, and the model adds five rules. All of them are now in the per-op forward,
+with the MoE run on the host:
+
+- **D2560** (I8 `[RB, CB, S, 2560]`, attention q/k/v/o and the head) and **MX2560** (U8 `[E, 69, CB, S, 2560]`, the
+  experts as MXFP4). One chunk is 32 rows x 128 columns: parameters at `g*32 + r`, then 4-bit codes in two 16-row
+  halves at `h*1024 + c*8 + (r%16)/2` (`q4nx_dequant.h`). D2560 is asymmetric (bf16 scale and zero-point). MX2560 is an
+  E8M0 exponent and an E2M1 code, with a weight of `E2M1 * 2^(e-127)`. Per expert, the 69 row-blocks are gate and up
+  alternating by 128 rows, then 23 of down. Against `ggml-org/gpt-oss-20b-GGUF`: D2560 corr 0.995-0.997 against its
+  Q8_0 (4-bit against 8-bit), MX2560 exact against its MXFP4 read through ggml's own rule (`kvalues_fp4`, the E2M1
+  table doubled, times `2^(e-128)`).
+- **Attention sinks**: one logit per head that joins the softmax and carries no value
+  (`q4nx_attn::head_context`'s `sink`; a null sink leaves every other model bit-identical). **o_proj bias.**
+- **YaRN** (`rope_type: "yarn"`, `Q4nxRopeYarn` in `q4nx_rope.h`): the frequency ramp of transformers'
+  `_compute_yarn_parameters` (`truncate: false` honoured) and the attention factor on cos and sin.
+- **The MoE** (`gptoss_moe`): top-k of the biased router logits, a softmax over those k (llama.cpp's
+  `SOFTMAX_WEIGHT`), and per expert ggml's `swiglu_oai` (`min(gate, 7) * sigmoid(1.702 * gate) * (clamp(up, -7, 7) + 1)`)
+  with the gate, up and down biases. The experts are read from the MXFP4 chunks in place, never expanded.
+- The sliding window on alternate layers was already read from `layer_types`.
+
+Checked on the host, 2026-11-12. A numpy GPT-OSS forward of the same weights (transcribed from our llama.cpp fork's
+`openai-moe.cpp`) puts `<|channel|>` first after `<|start|>assistant` (38.3 against 18.7 for the next token). The
+forward's logits match it at corr 1.000000, max |d| 6e-5 of 38.3. `gptoss_forward` (CI) writes a two-layer container
+in this format and holds the forward to the same reference on its bytes: corr 1.0000000. Removing any one rule fails
+it, while batched equals sequential passes every time: the sinks (0.61), the o bias (0.29), the MXFP4 bias (0.84),
+the SwiGLU clamp (0.92), the YaRN attention factor (0.994), the YaRN frequency rule (0.99989), and the top-k softmax
+(0.99967). A batched prefill of gpt_oss takes the per-token path. No kernel set for its shapes was built or run (the
+NPU is off).
+
+**Hy-Memory-30B-A3B-NPU2: hy_v3 runs on the existing MoE path (engine#1786).** Tencent's hy_v3 routes as DeepSeek-V3
+does (our llama.cpp fork's `src/models/hy-v3.cpp`): sigmoid router probabilities, the top 8 of 128 chosen on probability
+plus an expert bias, weighted by the unbiased probabilities normalised to sum 1 and scaled, one ungated shared expert,
+and a dense first layer. The forward already ran that routing. What it did not do was read the pack's way of saying
+it. Each of these, alone, made the reply ` of of of`:
+
+- **The config keys.** `moe_router_use_sigmoid` is the sigmoid (it was read as softmax), `router_scaling_factor` is the
+  weight scale, `first_k_dense_replace` is the leading dense count with the dense width from `intermediate_size`, and
+  `expert_hidden_dim` (768) is the expert width. `moe_intermediate_size` says 1536, but the experts and the shared
+  expert are `[768][2048]` in `tencent/Hy-Memory-30B-A3B` itself.
+- **The router** is stored `[H][E]`, the transpose of upstream's `[E][H]`, checked by a ranged read of the checkpoint.
+  A router of that shape is transposed at load. **The expert bias** is the F32 `moe_expert_bias`, equal to upstream's
+  `mlp.expert_bias`.
+- **The expert slices are `[N][K]`.** FastFlowLM's Qwen MoE packs transpose each expert, and the forward read every
+  `*_exps_proj` stack that way. This pack does not transpose: its gate stack is `[3072][8][4736]`, 24 x 8 tiles per
+  expert for 768 x 2048. The grid is now decided from the first MoE layer's own gate stack. Against upstream expert
+  0 of layer 1, `[N][K]` gives gate and down corr 0.9974, and the old reading gives 0.008. The same rule also fires
+  on `MiniCPM-V-4.7-35B-A3B-NPU2` (the only other container on the box it fires on). That reading is right there too:
+  its layer-0 expert 0 against `openbmb/MiniCPM-V-4.7-35B-A3B`'s own `gate_up_proj` gives corr 0.997 as `[N][K]` and
+  0.024 as `[K][N]`. That pack does not run on this forward either way ("MoE designs missing", engine#1788), so no
+  answer changes.
+- **A leading dense layer without MLA** gets the DG/DU/DD designs and `dense_mlp` the MLA path already had. A batched
+  prefill of such a model takes the per-token path.
+
+On the host the known-answer prompt (no-think template) answers `Paris` and `<eos>`. Against a numpy hy_v3 forward
+of the same weights, decoded through `q4nx_dequant.c`, the last position's logits match at corr 1.000000, max |d|
+3e-5 of 26.6, with the same top 5. `batch_check_state_hy_v3` fabricates a two-layer pack written this way and holds
+the forward to that reference: corr 1.0000000. Each of these mutants fails it:
+
+| mutant | corr |
+|---|---|
+| `[K][N]` slices | 0.59 |
+| no router transpose | 0.78 |
+| softmax gating | 0.9965 |
+| no scale | 0.94 |
+| bias ignored | 0.87 |
+| expert width from `moe_intermediate_size` | refused at the expert gate |
+
+No kernel set for its shapes was built or run (the NPU is off).
 
 **Per-head q/k normalisation is read from the container (engine#1788).** Whether the forward normalises q
 and k per head used to be decided by `config.json`'s `model_type` alone: on for `qwen3*` and `gemma*`.

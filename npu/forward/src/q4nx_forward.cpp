@@ -192,11 +192,21 @@ static bool valid_sidecar_dir(const std::string& d) {
 // (Q4NX_CHUNK_Q4W / Q8W), and a Q4W tensor's byte count would otherwise pass for a 4608-byte Q4S grid.
 static int64_t declared_row_bytes(const TensorDesc* d) {
     if (d && d->ndim == 3 && (d->shape[2] == Q4NX_CHUNK_Q4W || d->shape[2] == Q4NX_CHUNK_Q8W)) return d->shape[2];
+    // GPT-OSS's [RB, CB, S, 2560] (Q4NX_CHUNK_D2560): routed by the 4-D shape, read by dequant_desc below.
+    if (d && d->ndim == 4 && d->shape[3] == Q4NX_CHUNK_D2560 && !strcmp(d->dtype, "I8")) return Q4NX_CHUNK_D2560;
     return (d && d->ndim == 2) ? d->shape[1] : 0;
 }
 
-static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out, int64_t decl_row_bytes = 0) {
+static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out, const TensorDesc* desc = nullptr) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
+    const int64_t decl_row_bytes = declared_row_bytes(desc);
+    if (decl_row_bytes == Q4NX_CHUNK_D2560) {
+        // GPT-OSS: [RB, CB, S, 2560]; the container's K (CB*128) may be padded past the model's, and is read into
+        // the forward's width (cols) with the excess written 0.
+        const int RB = (int)desc->shape[0], CB = (int)desc->shape[1], S = (int)desc->shape[2];
+        const int k = std::min(cols, CB * Q4NX_D2560_COLS);
+        return q4nx_dequant_tensor_d2560((const uint8_t*)data, nbytes, RB, CB, S, rows, k, cols, out);
+    }
     if (decl_row_bytes == Q4NX_CHUNK_Q4H) {
         // Quarter tiles on the container's own K (Gemma3-270M: 640), read into the forward's padded width.
         if (rows % Q4NX_Q4H_ROWS) return -1;
@@ -299,6 +309,35 @@ static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
     s.original_max_position = num("\"original_max_position_embeddings\"", 0.0);
     s.on = s.factor > 0.0 && s.original_max_position > 0.0 && s.high_freq_factor > s.low_freq_factor;
     return s;
+}
+
+static Q4nxRopeYarn read_rope_yarn(const std::string& cfg_path) {
+    Q4nxRopeYarn y{};
+    std::ifstream f(cfg_path);
+    if (!f) return y;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    char declared[32];
+    q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
+    if (std::strcmp(declared, "yarn")) return y;
+    auto num = [&t](const char* key, double def) -> double {
+        const char* p = strstr(t.c_str(), key);
+        if (!p) return def;
+        const char* c = strchr(p + strlen(key), ':');
+        if (!c) return def;
+        char* end = nullptr;
+        const double v = strtod(c + 1, &end);
+        return end == c + 1 ? def : v;
+    };
+    y.factor = num("\"factor\"", 0.0);
+    y.original_max_position = num("\"original_max_position_embeddings\"", 0.0);
+    y.beta_fast = num("\"beta_fast\"", 32.0);
+    y.beta_slow = num("\"beta_slow\"", 1.0);
+    y.attention_factor = num("\"attention_factor\"", 0.0);
+    if (!(y.attention_factor > 0.0) && y.factor > 1.0) y.attention_factor = 0.1 * std::log(y.factor) + 1.0;
+    if (!(y.attention_factor > 0.0)) y.attention_factor = 1.0;
+    y.truncate = !(strstr(t.c_str(), "\"truncate\": false") || strstr(t.c_str(), "\"truncate\":false"));
+    y.on = y.factor > 0.0 && y.original_max_position > 0.0;
+    return y;
 }
 
 // One top-level string field out of a small sidecar JSON (decision_config.json's `attention_mode`).
@@ -677,6 +716,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         mdir = slash == std::string::npos ? std::string(".") : mp.substr(0, slash);
         cfg_path = mdir + "/config.json";
     }
+    cfg_path_ = cfg_path;
 
     ModelConfig cfg = QWEN3_0_6B_CONFIG;
     // Device-side weight layout this container declares (see read_config_string).
@@ -846,6 +886,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
+    rope_yarn_ = read_rope_yarn(cfg_path);           // rope_type "yarn" (GPT-OSS, engine#1786)
     rope_dynamic_ = read_rope_dynamic(cfg_path);     // rope_type "dynamic" (NTK by base, engine#1740 W2)
     rope_linear_factor_ = read_rope_linear(cfg_path); // rope_type "linear" (Gemma3's full layers, engine#1786)
     {
@@ -862,7 +903,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         // read (below), where a malformed block is refused.
         mrope_declared_ = !std::strcmp(declared, "mrope");
         if (!linear_ok && !mrope_declared_ &&
-            !q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on)) {
+            !q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on,
+                                      rope_yarn_.on)) {
             if (!std::strcmp(declared, "llama3"))
                 err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
                        "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
@@ -1061,7 +1103,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             }
             if (!embed_tile_ && !embed_i8_) {   // no element-wise read: keep the whole-table buffer (unchanged path)
                 embed_f_.resize((size_t)NV * (size_t)kpad_);
-                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data(), declared_row_bytes(etd)) != 0) {
+                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data(), etd) != 0) {
                     err_ = std::string("embedding dtype ") + dt + " but dequant failed";
                     return false;
                 }
@@ -1273,11 +1315,48 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                            q4nx_config_int(cfg_path.c_str(), "num_experts_per_tok", 0));
         const int moe_im = q4nx_config_int(cfg_path.c_str(), "moe_intermediate_size", 0);
         expert_im_ = moe_im > 0 ? moe_im : c_.IM;
+        // hy_v3 states both: moe_intermediate_size 1536 and expert_hidden_dim 768, and its experts (and the shared
+        // expert) are [768][2048] in tencent/Hy-Memory-30B-A3B's own checkpoint, so expert_hidden_dim is the width.
+        const int ehd = q4nx_config_int(cfg_path.c_str(), "expert_hidden_dim", 0);
+        if (ehd > 0) expert_im_ = ehd;
         dense_im_ = q4nx_config_int(cfg_path.c_str(), "dense_intermediate_size", 0);
         leading_dense_ = q4nx_config_int(cfg_path.c_str(), "leading_dense_block_count", 0);
         expert_gating_sigmoid_ =
             q4nx_config_int(cfg_path.c_str(), "expert_gating_func", 1) == 2;  // 2 = sigmoid
         expert_w_scale_ = read_config_float(cfg_path, "\"expert_weights_scale\"", 1.0f);
+        // Hy-Memory (hy_v3, engine#1786) states the same DeepSeek-V3 routing under its own keys: the
+        // sigmoid as moe_router_use_sigmoid, the scale as router_scaling_factor, the leading dense block
+        // as first_k_dense_replace, and the dense FFN's width as intermediate_size. Our llama.cpp fork's
+        // hy-v3.cpp routes it as deepseek2 does (sigmoid probs, top-k on probs + expert bias, the
+        // unbiased probs sum-normalised and scaled), which is the path moe_mlp runs.
+        {
+            std::ifstream cf(cfg_path);
+            const std::string ct((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>());
+            if (ct.find("\"moe_router_use_sigmoid\": true") != std::string::npos ||
+                ct.find("\"moe_router_use_sigmoid\":true") != std::string::npos)
+                expert_gating_sigmoid_ = true;
+            if (ct.find("\"expert_weights_scale\"") == std::string::npos)
+                expert_w_scale_ = read_config_float(cfg_path, "\"router_scaling_factor\"", expert_w_scale_);
+            if (leading_dense_ == 0)
+                leading_dense_ = q4nx_config_int(cfg_path.c_str(), "first_k_dense_replace", 0);
+            if (leading_dense_ > 0 && dense_im_ == 0) dense_im_ = c_.IM;
+        }
+        // The per-expert tile grid, from the first MoE layer's own gate stack rather than the name convention:
+        // FLM-named Qwen MoE containers transpose each expert ([K][N] slices), Hy-Memory-30B-A3B's do not -- its
+        // gate stack is [E * N/32][K/256][chunk] = [3072][8][4736] for N = 768, K = 2048. Read the wrong way, every
+        // expert is a permutation and the model answers " of of of".
+        {
+            char gn[160];
+            snprintf(gn, sizeof gn, "model.layers.%d.mlp.gate_exps_proj.weight", leading_dense_ > 0 ? leading_dense_ : 0);
+            const TensorDesc* gt = model_tensor_by_name(mw_, gn);
+            if (gt && gt->ndim == 3 && n_expert_ > 0 && gt->shape[0] % n_expert_ == 0 &&
+                gt->shape[0] / n_expert_ * Q4NX_TILE_ROWS == expert_im_ &&
+                gt->shape[1] * Q4NX_TILE_COLS == q4nx_pad_k(c_.H) && expert_im_ != q4nx_pad_k(c_.H)) {
+                moe_slice_nk_ = true;
+                fprintf(stderr, "  [moe] per-expert slices are [N][K] (%s is [%lld][%lld][...])\n", gn,
+                        (long long)gt->shape[0], (long long)gt->shape[1]);
+            }
+        }
         if (top_k_ <= 0 || top_k_ > n_expert_ || expert_im_ <= 0) {
             fprintf(stderr, "  [moe] config incomplete (n_expert=%d top_k=%d im=%d)\n",
                     n_expert_, top_k_, expert_im_);
@@ -1340,8 +1419,28 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                  q4nx_pad_n(dims.IM), tag);
         dims.fused_gu = file_exists(gu) || !file_exists(g) ? 1 : 0;
     }
+    // A MoE with a leading dense layer and no MLA (hy_v3): the routed experts' G/U/D are at the expert width, and the
+    // dense layer gets its own DG/DU/DD at intermediate_size -- the arrangement the MLA path already uses.
+    const bool moe_lead_dense = n_expert_ > 0 && !mla_ && leading_dense_ > 0 && dense_im_ > 0;
+    if (moe_lead_dense) { dims.IM = expert_im_; dims.fused_gu = 0; }
     ndesigns_ = q4nx_derive_designs(&dims, designs_);
     if (ndesigns_ <= 0) { err_ = "design derivation failed"; return false; }
+    if (moe_lead_dense && ndesigns_ + 3 <= Q4NX_MAX_DESIGNS) {
+        const struct { Q4nxDesign role; int K, N; const char* tag; } dd[3] = {
+            {Q4NX_DESIGN_DG, c_.H, dense_im_, "DG"}, {Q4NX_DESIGN_DU, c_.H, dense_im_, "DU"},
+            {Q4NX_DESIGN_DD, dense_im_, c_.H, "DD"}};
+        for (const auto& x : dd) {
+            memset(&designs_[ndesigns_], 0, sizeof(designs_[ndesigns_]));
+            designs_[ndesigns_].M = dims.M; designs_[ndesigns_].K = q4nx_pad_k(x.K); designs_[ndesigns_].N = q4nx_pad_n(x.N);
+            designs_[ndesigns_].real_k = x.K; designs_[ndesigns_].real_n = x.N;
+            designs_[ndesigns_].role = x.role;
+            snprintf(designs_[ndesigns_].elf_name, Q4NX_ELF_NAME_MAX, "full_i8_%s_K%d_N%d.elf", x.tag,
+                     q4nx_pad_k(x.K), q4nx_pad_n(x.N));
+            ndesigns_++;
+        }
+        fprintf(stderr, "  [forward] MoE with %d leading dense layer(s): experts at IM %d, dense FFN at %d\n",
+                leading_dense_, expert_im_, dense_im_);
+    }
     // Batched expert gate/up (MoE): one GEMM per projection over ALL top-k experts
     // at once, instead of one per expert.  Derived here rather than in
     // q4nx_derive_designs because it depends on top_k, which the dims struct does
@@ -1693,7 +1792,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 head_f32.assign((size_t)head_rows * (size_t)kpad_, 0.0f);
                 head_out = head_f32.data();
             }
-            if (!lp || dequant_any(lp, (size_t)ltd->data_size, head_rows, kpad_, head_out, declared_row_bytes(ltd)) != 0) {
+            if (!lp || dequant_any(lp, (size_t)ltd->data_size, head_rows, kpad_, head_out, ltd) != 0) {
                 err_ = "lm_head dequant failed";
                 return false;
             }
@@ -1714,6 +1813,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // scalar) are only read when gemma4_layer_ is set, so loading them before the
     // config was parsed left those vectors empty and crashed the first step.
     if (!load_norms()) return false;
+    if (sem_.gpt_oss && !load_gptoss()) return false;
     // qwen3_5 declares one model_type for two RMSNorm conventions and this box carries one of each (the
     // official 0.8B release is zero-centered; the hybrid 27B packs are plain gains). Resolve it from the
     // weight that was just loaded, and print the evidence so a surprising answer is visible rather than
@@ -2003,6 +2103,163 @@ bool Q4nxNpuForward::load_norms() {
     return true;
 }
 
+bool Q4nxNpuForward::load_gptoss() {
+    const int NL = c_.NL, H = c_.H, NH = c_.NH, IM = c_.IM;
+    gpt_ne_ = q4nx_config_int(cfg_path_.c_str(), "num_local_experts", 0);
+    gpt_topk_ = q4nx_config_int(cfg_path_.c_str(), "num_experts_per_tok", 0);
+    if (gpt_ne_ <= 0 || gpt_topk_ <= 0 || gpt_topk_ > gpt_ne_) {
+        err_ = "gpt_oss: config.json needs num_local_experts and num_experts_per_tok (top-k <= experts)";
+        return false;
+    }
+    const int E = gpt_ne_;
+    for (auto* v : {&gpt_sinks_, &gpt_obias_, &gpt_router_, &gpt_router_b_, &gpt_gb_, &gpt_ub_, &gpt_db_})
+        v->assign((size_t)NL, std::vector<float>());
+    gpt_exps_.assign((size_t)NL, nullptr);
+    // a bf16 tensor's first `cols` of each of `rows` rows (the router is stored K-padded: [E][2944] for H 2880)
+    auto rd = [&](int l, const char* suffix, std::vector<float>& dst, int rows, int cols) -> bool {
+        char nm[160];
+        snprintf(nm, sizeof nm, "model.layers.%d.%s", l, suffix);
+        TensorDesc* td = model_tensor_by_name(mw_, nm);
+        if (!td || strcmp(td->dtype, "BF16")) { err_ = std::string("gpt_oss: model.q4nx has no bf16 ") + nm; return false; }
+        const int64_t stride = td->ndim >= 2 ? td->shape[td->ndim - 1] : td->shape[0];
+        if (stride < cols || (size_t)td->data_size < (size_t)rows * (size_t)stride * 2) {
+            err_ = std::string("gpt_oss: ") + nm + " is smaller than [" + std::to_string(rows) + "][" +
+                   std::to_string(cols) + "]";
+            return false;
+        }
+        const uint16_t* p = bf16_data(mw_, td, (size_t)rows * (size_t)stride);
+        if (!p) { err_ = std::string("gpt_oss: cannot read ") + nm; return false; }
+        dst.resize((size_t)rows * cols);
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++) dst[(size_t)r * cols + c] = bf16_to_f32(p[(size_t)r * stride + c]);
+        return true;
+    };
+    for (int l = 0; l < NL; l++) {
+        if (!rd(l, "self_attn.sinks.weight", gpt_sinks_[l], 1, NH)) return false;
+        if (!rd(l, "self_attn.o_proj.bias", gpt_obias_[l], 1, H)) return false;
+        if (!rd(l, "mlp.router.weight_prefill", gpt_router_[l], E, H)) return false;
+        if (!rd(l, "mlp.router.bias", gpt_router_b_[l], 1, E)) return false;
+        if (!rd(l, "mlp.experts.gate_proj_bias", gpt_gb_[l], E, IM)) return false;
+        if (!rd(l, "mlp.experts.up_proj_bias", gpt_ub_[l], E, IM)) return false;
+        if (!rd(l, "mlp.experts.down_proj_bias", gpt_db_[l], E, H)) return false;
+        char nm[160];
+        snprintf(nm, sizeof nm, "model.layers.%d.ffn_gate_up_down_exps.weight", l);
+        const TensorDesc* td = model_tensor_by_name(mw_, nm);
+        // [E, 3 * RB, CB, S, 2560]: per expert RB gate and RB up row-blocks alternating, then RB down row-blocks.
+        // TensorDesc keeps four dimensions, so the 2560 is checked through the byte count.
+        if (!td || td->ndim < 4 || td->shape[0] != E || td->shape[1] % 3 ||
+            (int64_t)(td->shape[1] / 3) * td->shape[3] * Q4NX_D2560_ROWS < std::max(IM, H) ||
+            td->shape[2] * Q4NX_D2560_COLS < std::max(IM, H) ||
+            (size_t)td->data_size != (size_t)E * td->shape[1] * td->shape[2] * td->shape[3] * Q4NX_CHUNK_D2560) {
+            err_ = std::string("gpt_oss: ") + nm + " is not an [experts, 3 x row-blocks, col-blocks, 4, 2560] MXFP4 tensor";
+            return false;
+        }
+        gpt_exps_[l] = td;
+    }
+    fprintf(stderr, "  [forward] gpt_oss: %d experts, top %d, MXFP4 experts read in place; sinks, o bias\n", E, gpt_topk_);
+    return true;
+}
+
+bool Q4nxNpuForward::gptoss_moe(int l, const std::vector<float>& xn, std::vector<float>& d) {
+    LhScope _tlh(LH_MLP);
+    const int H = c_.H, IM = c_.IM, E = gpt_ne_, K = gpt_topk_;
+    const TensorDesc* td = gpt_exps_[(size_t)l];
+    const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, const_cast<TensorDesc*>(td));
+    if (!raw) { err_ = "gpt_oss: expert tensor has no data"; return false; }
+    const int RB = (int)(td->shape[1] / 3), CB = (int)td->shape[2], S = (int)td->shape[3];
+    const size_t per_expert = (size_t)td->shape[1] * CB * S * Q4NX_CHUNK_D2560;
+    // router: top-k of the biased logits, then a softmax over those k (llama.cpp's SOFTMAX_WEIGHT)
+    std::vector<float> logit((size_t)E);
+    for (int e = 0; e < E; e++) {
+        double z = gpt_router_b_[(size_t)l][(size_t)e];
+        const float* w = &gpt_router_[(size_t)l][(size_t)e * H];
+        for (int k = 0; k < H; k++) z += (double)w[k] * xn[(size_t)k];
+        logit[(size_t)e] = (float)z;
+    }
+    std::vector<int> idx((size_t)E);
+    for (int e = 0; e < E; e++) idx[(size_t)e] = e;
+    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
+                      [&](int a, int b) { return logit[(size_t)a] > logit[(size_t)b] || (logit[(size_t)a] == logit[(size_t)b] && a < b); });
+    std::vector<float> wsel((size_t)K);
+    float mx = logit[(size_t)idx[0]], sum = 0.0f;
+    for (int j = 0; j < K; j++) { wsel[(size_t)j] = std::exp(logit[(size_t)idx[(size_t)j]] - mx); sum += wsel[(size_t)j]; }
+    for (int j = 0; j < K; j++) wsel[(size_t)j] /= sum;
+
+    d.assign((size_t)H, 0.0f);
+    std::vector<float> g((size_t)IM), u((size_t)IM), act((size_t)IM), dn((size_t)H);
+    // y[row] = sum over the row's 128-column chunks of chunk . x; rows of block `bi` are bi*128 + s*32 + r
+    auto matvec = [&](const uint8_t* ex, int b0, int nrows, const float* x, int xlen, float* y) {
+#pragma omp parallel num_threads(omp_heads_threads())
+        {
+            float tmp[Q4NX_D2560_ROWS * Q4NX_D2560_COLS];
+#pragma omp for schedule(static)
+            for (int rbs = 0; rbs < RB * S; rbs++) {
+                const int bi = rbs / S, s = rbs % S;
+                const int r0 = bi * 128 + s * Q4NX_D2560_ROWS;
+                if (r0 >= nrows) continue;
+                double acc[Q4NX_D2560_ROWS] = {0};
+                for (int cb = 0; cb < CB; cb++) {
+                    const int c0 = cb * Q4NX_D2560_COLS;
+                    if (c0 >= xlen) break;
+                    q4nx_dequant_chunk_mx2560(ex + (((size_t)(b0 + bi) * CB + cb) * S + s) * Q4NX_CHUNK_D2560, tmp,
+                                              Q4NX_D2560_COLS);
+                    const int cn = std::min(Q4NX_D2560_COLS, xlen - c0);
+                    for (int r = 0; r < Q4NX_D2560_ROWS; r++) {
+                        double z = 0.0;
+                        for (int c = 0; c < cn; c++) z += (double)tmp[r * Q4NX_D2560_COLS + c] * x[c0 + c];
+                        acc[r] += z;
+                    }
+                }
+                for (int r = 0; r < Q4NX_D2560_ROWS && r0 + r < nrows; r++) y[r0 + r] = (float)acc[r];
+            }
+        }
+    };
+    for (int j = 0; j < K; j++) {
+        const int e = idx[(size_t)j];
+        const uint8_t* ex = raw + (size_t)e * per_expert;
+        // gate and up alternate by 128-row block (gate 2i, up 2i+1): all 2*RB blocks in one pass, then split
+        {
+            std::vector<float> y((size_t)2 * RB * 128, 0.0f);
+            const int RB2 = 2 * RB;
+#pragma omp parallel num_threads(omp_heads_threads())
+            {
+                float tmp[Q4NX_D2560_ROWS * Q4NX_D2560_COLS];
+#pragma omp for schedule(static)
+                for (int rbs = 0; rbs < RB2 * S; rbs++) {
+                    const int bi = rbs / S, s = rbs % S;
+                    double acc[Q4NX_D2560_ROWS] = {0};
+                    for (int cb = 0; cb < CB; cb++) {
+                        const int c0 = cb * Q4NX_D2560_COLS;
+                        if (c0 >= H) break;
+                        q4nx_dequant_chunk_mx2560(ex + (((size_t)bi * CB + cb) * S + s) * Q4NX_CHUNK_D2560, tmp,
+                                                  Q4NX_D2560_COLS);
+                        const int cn = std::min(Q4NX_D2560_COLS, H - c0);
+                        for (int r = 0; r < Q4NX_D2560_ROWS; r++) {
+                            double z = 0.0;
+                            for (int c = 0; c < cn; c++) z += (double)tmp[r * Q4NX_D2560_COLS + c] * xn[(size_t)(c0 + c)];
+                            acc[r] += z;
+                        }
+                    }
+                    for (int r = 0; r < Q4NX_D2560_ROWS; r++) y[(size_t)bi * 128 + s * Q4NX_D2560_ROWS + r] = (float)acc[r];
+                }
+            }
+            for (int i = 0; i < IM; i++) {
+                const int blk = i / 128, off = i % 128;
+                g[(size_t)i] = y[(size_t)(2 * blk) * 128 + off] + gpt_gb_[(size_t)l][(size_t)e * IM + i];
+                u[(size_t)i] = y[(size_t)(2 * blk + 1) * 128 + off] + gpt_ub_[(size_t)l][(size_t)e * IM + i];
+            }
+        }
+        // ggml swiglu_oai: x = min(gate, 7), y = clamp(up, -7, 7), x * sigmoid(1.702 x) * (y + 1)
+        for (int i = 0; i < IM; i++) {
+            const float xg = std::min(g[(size_t)i], 7.0f), yu = std::max(-7.0f, std::min(u[(size_t)i], 7.0f));
+            act[(size_t)i] = xg / (1.0f + std::exp(-1.702f * xg)) * (yu + 1.0f);
+        }
+        matvec(ex, 2 * RB, H, act.data(), IM, dn.data());
+        for (int o = 0; o < H; o++) d[(size_t)o] += wsel[(size_t)j] * (dn[(size_t)o] + gpt_db_[(size_t)l][(size_t)e * H + o]);
+    }
+    return true;
+}
+
 void Q4nxNpuForward::apply_head_gate(int l, const float* xn, float* ctx, int hd) const {
     if (l < 0 || (size_t)l >= head_gate_.size() || head_gate_[(size_t)l].empty()) return;
     const int H = c_.H;
@@ -2083,7 +2340,7 @@ bool Q4nxNpuForward::load_layer(int l) {
             if (!d) { fprintf(stderr, "  [mla] missing " ); snprintf(nm,sizeof(nm),fmt,l); fprintf(stderr,"%s\n", nm); return false; }
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), declared_row_bytes(d)) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) == 0;
         };
         // A bf16 tensor (norms, router) is stored raw, not in 5120-byte tiles, so
         // it bypasses dequant_any.
@@ -2165,7 +2422,7 @@ bool Q4nxNpuForward::load_layer(int l) {
     auto deq = [&](TensorDesc* d, float* out, int rows, int cols) -> bool {
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw) { err_ = std::string("MLP tensor ") + d->name + " has no data"; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, declared_row_bytes(d)) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, d) != 0) {
             // Name it: the bare "dequant failed" this used to leave cost an afternoon on engine#1097.
             const size_t tiles = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
             char why[256];
@@ -2233,7 +2490,26 @@ bool Q4nxNpuForward::load_layer(int l) {
         }
         if (!deq(&lw->o_proj_weight, wo_.data(), H, q4nx_pad_k(NH * hd))) return false;
     }
-    if (n_expert_ > 0) {
+    if (n_expert_ > 0 && !mla_ && l < leading_dense_) {
+        // the leading dense layer of a non-MLA MoE (hy_v3): dense_mlp's DG/DU/DD weights
+        char dn[160];
+        auto load_dense = [&](const char* fmt, std::vector<float>& v, int rows, int cols) -> bool {
+            snprintf(dn, sizeof dn, fmt, l);
+            TensorDesc* d = model_tensor_by_name(mw_, dn);
+            if (!d) { err_ = std::string("leading dense layer: model.q4nx has no ") + dn; return false; }
+            v.resize((size_t)rows * (size_t)cols);
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            if (!raw || dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) != 0) {
+                err_ = std::string("leading dense layer: cannot read ") + dn;
+                return false;
+            }
+            return true;
+        };
+        return load_dense("model.layers.%d.mlp.gate_proj.weight", dense_g_, dense_im_, H) &&
+               load_dense("model.layers.%d.mlp.up_proj.weight", dense_u_, dense_im_, H) &&
+               load_dense("model.layers.%d.mlp.down_proj.weight", dense_d_, H, dense_im_);
+    }
+    if (n_expert_ > 0 && l >= leading_dense_) {   // a leading dense layer (hy_v3's first_k_dense_replace) runs the dense FFN
         // Qwen MoE layer (qwen3moe / qwen35moe): a router + top-k routed experts
         // instead of a dense gate/up/down.  The router is bf16; its bias is OPTIONAL
         // (Qwen MoE has none, deepseek2 does).  The experts stay pooled -- one
@@ -2259,7 +2535,31 @@ bool Q4nxNpuForward::load_layer(int l) {
             return true;
         };
         if (!load_bf16_named(mn.router, moe_router_, n_expert_ * H)) { err_ = "moe router"; return false; }
-        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) moe_router_b_.clear();
+        {
+            // A router stored [H][E] (Hy-Memory-30B-A3B's moe_router.weight is upstream's [E][H] transposed,
+            // checked against tencent/Hy-Memory-30B-A3B) is read flat as [E][H] by moe_mlp: transpose it.
+            const TensorDesc* rd = td_named(mn.router);
+            if (rd && rd->ndim == 2 && rd->shape[0] == H && rd->shape[1] == n_expert_ && H != n_expert_) {
+                std::vector<float> t((size_t)n_expert_ * H);
+                for (int k = 0; k < H; k++)
+                    for (int e = 0; e < n_expert_; e++) t[(size_t)e * H + k] = moe_router_[(size_t)k * n_expert_ + e];
+                moe_router_.swap(t);
+            }
+        }
+        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) {
+            moe_router_b_.clear();
+            // hy_v3: the expert-selection bias is `moe_expert_bias`, F32 in FastFlowLM's pack (bf16 from our packer)
+            const TensorDesc* bd = td_named("moe_expert_bias");
+            const void* bp = bd ? model_tensor_data(mw_, const_cast<TensorDesc*>(bd)) : nullptr;
+            if (bp && !strcmp(bd->dtype, "F32") && (size_t)bd->data_size >= sizeof(float) * (size_t)n_expert_) {
+                const float* fp = (const float*)bp;
+                moe_router_b_.assign(fp, fp + n_expert_);
+            } else if (bp && !strcmp(bd->dtype, "BF16") && (size_t)bd->data_size >= 2 * (size_t)n_expert_) {
+                const uint16_t* hp = (const uint16_t*)bp;
+                moe_router_b_.resize((size_t)n_expert_);
+                for (int e = 0; e < n_expert_; e++) moe_router_b_[(size_t)e] = bf16_to_f32(hp[e]);
+            }
+        }
         auto pool = [&](const char* suffix, const uint8_t** p, size_t* bytes) -> bool {
             TensorDesc* d = td_named(suffix);
             if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
@@ -2278,7 +2578,7 @@ bool Q4nxNpuForward::load_layer(int l) {
             if (!d) return false;
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), declared_row_bytes(d)) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) == 0;
         };
         if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
         if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
@@ -2286,6 +2586,7 @@ bool Q4nxNpuForward::load_layer(int l) {
         if (!load_bf16_named(mn.share_router, share_router_, H)) share_router_.clear();
         return true;
     }
+    if (sem_.gpt_oss) return true;   // gpt_oss: the MoE reads its MXFP4 experts in place (gptoss_moe)
     if (!xd_->pb16i() && !ffn_tail_cached()) {
         LhScope _t_f(LH_LOAD_FFN);
         if (!deq(&lw->gate_proj_weight, wg_.data(), im, kpad_)) return false;
@@ -2311,7 +2612,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         if (!d) { err_ = std::string("GDN: no tensor ") + nm; return false; }
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw) { err_ = std::string("GDN: no data ") + nm; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, declared_row_bytes(d)) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, d) != 0) {
             char m[64];
             snprintf(m, sizeof(m), " (rows=%d cols=%d bytes=%llu)", rows, cols,
                      (unsigned long long)d->data_size);
@@ -2388,7 +2689,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
     auto deqT = [&](TensorDesc* d, float* out, int rows, int cols) -> bool {
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw || d->data_size == 0) { err_ = std::string("GDN: missing MLP tensor ") + d->name; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, declared_row_bytes(d)) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, d) != 0) {
             err_ = std::string("GDN: MLP dequant ") + d->name;
             return false;
         }
@@ -2415,7 +2716,31 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
             return true;
         };
         if (!load_bf16_named(mn.router, moe_router_, n_expert_ * H)) { err_ = "moe router"; return false; }
-        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) moe_router_b_.clear();
+        {
+            // A router stored [H][E] (Hy-Memory-30B-A3B's moe_router.weight is upstream's [E][H] transposed,
+            // checked against tencent/Hy-Memory-30B-A3B) is read flat as [E][H] by moe_mlp: transpose it.
+            const TensorDesc* rd = td_named(mn.router);
+            if (rd && rd->ndim == 2 && rd->shape[0] == H && rd->shape[1] == n_expert_ && H != n_expert_) {
+                std::vector<float> t((size_t)n_expert_ * H);
+                for (int k = 0; k < H; k++)
+                    for (int e = 0; e < n_expert_; e++) t[(size_t)e * H + k] = moe_router_[(size_t)k * n_expert_ + e];
+                moe_router_.swap(t);
+            }
+        }
+        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) {
+            moe_router_b_.clear();
+            // hy_v3: the expert-selection bias is `moe_expert_bias`, F32 in FastFlowLM's pack (bf16 from our packer)
+            const TensorDesc* bd = td_named("moe_expert_bias");
+            const void* bp = bd ? model_tensor_data(mw_, const_cast<TensorDesc*>(bd)) : nullptr;
+            if (bp && !strcmp(bd->dtype, "F32") && (size_t)bd->data_size >= sizeof(float) * (size_t)n_expert_) {
+                const float* fp = (const float*)bp;
+                moe_router_b_.assign(fp, fp + n_expert_);
+            } else if (bp && !strcmp(bd->dtype, "BF16") && (size_t)bd->data_size >= 2 * (size_t)n_expert_) {
+                const uint16_t* hp = (const uint16_t*)bp;
+                moe_router_b_.resize((size_t)n_expert_);
+                for (int e = 0; e < n_expert_; e++) moe_router_b_[(size_t)e] = bf16_to_f32(hp[e]);
+            }
+        }
         auto pool = [&](const char* suffix, const uint8_t** p, size_t* bytes) -> bool {
             TensorDesc* d = td_named(suffix);
             if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
@@ -2434,7 +2759,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
             if (!d) return false;
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), declared_row_bytes(d)) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) == 0;
         };
         if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
         if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
@@ -4056,8 +4381,10 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
     // Gemma3 (extra_layer_norms 2) is Gemma4's sandwich without PLE or KV sharing, so the batched body
     // below runs it with the three extra norms; Gemma4 itself still falls back.
     const bool sandwich = gemma4_layer_ && ple_dim_ == 0 && sem_.extra_layer_norms == 2;
+    // gpt_oss runs its MoE, sinks and o bias in step() only, so a batched prefill takes the per-token path
     const bool simple_dense =
-        !mla_ && ple_dim_ == 0 && (!gemma4_layer_ || sandwich) && kv_self;
+        !mla_ && ple_dim_ == 0 && (!gemma4_layer_ || sandwich) && kv_self && !sem_.gpt_oss &&
+        !(n_expert_ > 0 && leading_dense_ > 0);   // a leading dense layer of a non-MLA MoE runs in step() only
     if (!simple_dense || getenv("NPU_NO_BATCH")) {
         if (inject_embeds_) {
             err_ = "step_batch_embeds: this model's batched body falls back to per-token step(), which needs "
@@ -4453,7 +4780,7 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
         for (int m = 0; m < M; m++)
             rmsnorm(X.data() + (size_t)m * H, (sandwich ? pre_ff_norm_ : post_norm_)[l].data(), H,
                     XN.data() + (size_t)m * H);
-        if (n_expert_ > 0) {
+        if (n_expert_ > 0 && l >= leading_dense_) {   // a leading dense layer (hy_v3's first_k_dense_replace) runs the dense FFN
             // MoE FFN: the router/top-k pick different experts per row, so this
             // stays per-token (the attention GEMMs above are already batched).
             // Grouping rows by expert so each expert's weight read serves the
@@ -4782,6 +5109,7 @@ bool Q4nxNpuForward::mla_expert(const uint8_t* pool, size_t per_expert, int e,
     // 0.00855 on [K][N].
     int rows = K, cols = N;
     moe_slice_geometry(moe_format_, N, K, &rows, &cols);
+    if (moe_slice_nk_) { rows = N; cols = K; }   // the container's own grid says [N][K] (init_impl)
     if (dequant_any(pool + (size_t)e * per_expert, per_expert, rows, cols, out.data()) != 0)
         return false;
     return true;
@@ -5233,6 +5561,9 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
             if (proportional) {
                 inv = 1.0 / std::pow(rope_theta, 2.0 * (double)i / (double)HD);
                 if (i >= rot / 2) inv = 0.0;
+            } else if (rope_yarn_.on) {
+                // YaRN (GPT-OSS): the pair's blend of the plain and the plain / factor frequency (q4nx_rope.h)
+                inv = q4nx_rope_yarn_inv_freq(i, rot, rope_theta, &rope_yarn_);
             } else {
                 inv = 1.0 / std::pow(rope_theta, (double)i / (double)half);
                 // LongRoPE (MiniCPM4): ggml's rope applies the factor as
@@ -5259,8 +5590,10 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
             // three planes equal this is exactly `pos * inv`, which is why text-only prompts are bit-identical
             // to plain RoPE (measured: 0 angle difference over positions 0..262143, engine#1311/TQVL).
             const double ang = (double)(pos3 ? pos3[mrope_plane(i)] : pos) * inv;
-            cos_[i] = (float)std::cos(ang);
-            sin_[i] = (float)std::sin(ang);
+            // YaRN scales cos and sin by its attention factor (q and k both, as transformers does); 1 otherwise
+            const double af = rope_yarn_.on ? rope_yarn_.attention_factor : 1.0;
+            cos_[i] = (float)(std::cos(ang) * af);
+            sin_[i] = (float)(std::sin(ang) * af);
         }
         auto rot_half = [&](float* x) {
             // pairs (i, i + half) inside the rotated block; the rest passes through
@@ -5314,7 +5647,8 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
 #pragma omp for schedule(static)
         for (int h = 0; h < NH; h++)
             q4nx_attn::head_context(&q[(size_t)h * HD], kcache_[kv_layer].data(), vcache_[kv_layer].data(), NKV,
-                                    h / gqa, HD, t0, T, scale, score.data(), &ctx[(size_t)h * HD]);
+                                    h / gqa, HD, t0, T, scale, score.data(), &ctx[(size_t)h * HD],
+                                    sem_.gpt_oss ? &gpt_sinks_[(size_t)kv_layer][(size_t)h] : nullptr);
     }
     return true;
 }
@@ -5606,6 +5940,8 @@ bool Q4nxNpuForward::step_impl(int token, int pos, std::vector<float>& logits, i
             if (!xd_->pb16i() && !weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
             npu_gemm(i_o_l, ctx.data(), g->K, g->N, B_.data(), o, 1,
                      l_full ? "attn_output" : "ssm_out", g->real_k);
+            if (sem_.gpt_oss)
+                for (int k = 0; k < H; k++) o[(size_t)k] += gpt_obias_[(size_t)l][(size_t)k];
         }
         }  // end non-GDN attention
         if (gemma4_layer_) {
@@ -5627,7 +5963,21 @@ bool Q4nxNpuForward::step_impl(int token, int pos, std::vector<float>& logits, i
         } else {
             rmsnorm(x.data(), post_norm_[l].data(), H, xn.data());
         }
-        if (n_expert_ > 0) {
+        if (sem_.gpt_oss) {
+            if (!gptoss_moe(l, xn, d)) return false;
+            { LhScope _tlh(LH_RES);
+            for (int k = 0; k < H; k++) x[k] += d[k]; }
+            if (!nancheck("moe")) return false;
+            continue;
+        }
+        if (n_expert_ > 0 && !mla_ && l < leading_dense_) {
+            if (!dense_mlp(l, xn, d)) return false;
+            { LhScope _tlh(LH_RES);
+            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_; }
+            if (!nancheck("dense")) return false;
+            continue;
+        }
+        if (n_expert_ > 0 && l >= leading_dense_) {   // a leading dense layer (hy_v3's first_k_dense_replace) runs the dense FFN
             // Qwen MoE layer (qwen3moe / qwen35moe): the FFN is router -> top-k
             // experts, not a dense gate/up/down.  moe_mlp writes the whole FFN
             // delta into d.  (deepseek2/GLM MoE layers never reach here -- the MLA

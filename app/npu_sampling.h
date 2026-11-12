@@ -232,9 +232,13 @@ struct TokenLogprob {
 // is why this is computed from the untouched logits rather than inside the sampler's filtered
 // candidate set.  Top entries are the highest raw logits, with the sampler's tie rule (lower id
 // first), so the same seed and request always report the same list.
-// The same over a row of `n` floats (the speculative loop hands its rows this way, engine#1781).  `n` is the
-// vocabulary: a caller whose row is a head wider than its tokenizer passes token_bound(width, vocab), the cut
-// sample_token() makes, or the padding joins the normaliser and can be named in `top` (engine#2272).
+// `n` is the tokenizer's bound and MUST be cut whenever the row may be wider than it: a padded head
+// stores rows past the vocabulary (engine#2026 -- Qwen3: 151,936 rows against 151,669 ids), and those
+// rows are not tokens. Normalising over them shifts every reported logprob by the padding's mass,
+// which is model-dependent rather than a constant, and invisible to any comparison between two paths
+// that share this helper (engine#2272). The bound also keeps padding ids out of `top`. A caller passes
+// token_bound(width, vocab), the cut sample_token() makes; the speculative loop hands its rows this way
+// (engine#1781).
 inline TokenLogprob logprobs_of(const float* logits, size_t n, int chosen, int top_n) {
     TokenLogprob out;
     out.id = chosen;

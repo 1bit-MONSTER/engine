@@ -177,6 +177,16 @@
    "model_type": "opensci",
    "family": "OpenSci (1.7B 'nemotron-hq' recipe). A REMOTE-CODE class: its config carries an auto_map pointing at modeling_opensci.py / configuration_opensci.py, so the pinned backends cannot accept the architecture without that custom code. Not an alias of any supported family, and not mappable until the code is vendored or upstreamed.",
    "watch": "report"
+  },
+  "BagelForConditionalGeneration": {
+   "model_type": "bagel",
+   "family": "BAGEL-style unified understand+generate model (first seen: benson123dc/tmp-4461ae1a1900, 4 models in the 2026-11-12 census). Composite config: llm_config Qwen2 (hidden 3584, 28 layers, 28 heads / 4 KV) with qk_norm, a SigLIP vit_config (27 layers, patch 14) and a VAE latent path (visual_gen true). Every LLM layer carries a second Mixture-of-Transformers copy (*_moe_gen q/k/v/o, MLP and norms) for the image-generation tokens. Not an alias of Qwen2ForCausalLM: the qwen2 graph has no q_norm/k_norm and no _moe_gen weights, so even an understanding-only text path needs its own converter.",
+   "watch": "report"
+  },
+  "OleanderForCausalLM": {
+   "model_type": "oleander",
+   "family": "Oleander-150M, a from-scratch training export (first seen: CyanMonkey/Test-Subject-3; its own config says step 2000 of 28820, 6.94 %). Hybrid 28 layers in a gdn2,gdn2,gdn2,gqa pattern, hidden 576, vocab 32770, F32. Ships no modelling code and no auto_map. Not an alias of the Qwen3.5 / Qwen3-Next linear-attention families despite the same layer_types: gdn2 layers carry per-q/k/v conv1d and low-rank f/g gate projections, every sublayer has attention-residual mixers (attn_res_*), and GQA layers a fused qg_proj and a value-residual v_mix; no pinned graph has those tensors.",
+   "watch": "report"
   }
  }
 }

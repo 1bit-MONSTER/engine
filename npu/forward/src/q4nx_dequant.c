@@ -17,6 +17,7 @@
 #include "q4nx_dequant.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static inline float bf16_to_f32(uint16_t bf) {
@@ -229,6 +230,68 @@ int q4nx_dequant_tensor_wide(const uint8_t* data, size_t nbytes, int chunk_bytes
     if (cols > k)
         for (int r = 0; r < rows; r++)
             memset(out + (size_t)r * cols + k, 0, (size_t)(cols - k) * sizeof(float));
+    return 0;
+}
+
+static const float kE2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                                -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+
+/* E8M0 (OCP MX): 2^(e - 127), exact (powers of two halve and double without rounding), with no libm.  ggml writes the
+ * same value as kvalues_fp4 (the E2M1 table doubled) * 2^(e - 128); reading the table undoubled with bias 128 halves
+ * every expert, which a comparison against a reader with the same slip cannot see. */
+static inline float e8m0_scale(uint8_t e) {
+    float p = 1.0f;
+    for (int n = (int)e - 127; n > 0; n--) p *= 2.0f;
+    for (int n = (int)e - 127; n < 0; n++) p *= 0.5f;
+    return p;
+}
+
+static inline int d2560_code(const uint8_t* codes, int r, int c) {
+    const uint8_t b = codes[(r / 16) * 1024 + c * 8 + (r % 16) / 2];
+    return (r & 1) ? (b >> 4) : (b & 15);
+}
+
+void q4nx_dequant_chunk_d2560(const uint8_t* chunk, float* out, int ld) {
+    const uint8_t* codes = chunk + 512;
+    for (int r = 0; r < Q4NX_D2560_ROWS; r++)
+        for (int c = 0; c < Q4NX_D2560_COLS; c++) {
+            const int slot = (c / 32) * Q4NX_D2560_ROWS + r;
+            const float s = bf16_to_f32(le16(chunk + 2 * slot)), z = bf16_to_f32(le16(chunk + 256 + 2 * slot));
+            out[(size_t)r * ld + c] = (float)d2560_code(codes, r, c) * s + z;
+        }
+}
+
+void q4nx_dequant_chunk_mx2560(const uint8_t* chunk, float* out, int ld) {
+    const uint8_t* codes = chunk + 512;
+    for (int r = 0; r < Q4NX_D2560_ROWS; r++)
+        for (int c = 0; c < Q4NX_D2560_COLS; c++) {
+            const float s = e8m0_scale(chunk[(c / 32) * Q4NX_D2560_ROWS + r]);
+            out[(size_t)r * ld + c] = kE2M1[d2560_code(codes, r, c)] * s;
+        }
+}
+
+int q4nx_dequant_tensor_d2560(const uint8_t* data, size_t nbytes, int RB, int CB, int S, int rows, int k, int cols,
+                              float* out) {
+    if (!data || !out || RB <= 0 || CB <= 0 || S <= 0 || rows <= 0 || k <= 0 || cols < k) return -1;
+    if (nbytes != (size_t)RB * CB * S * Q4NX_CHUNK_D2560) return -1;
+    const int full_rows = RB * S * Q4NX_D2560_ROWS, full_k = CB * Q4NX_D2560_COLS;
+    if (rows > full_rows || k > full_k) return -1;
+    float* tmp = (float*)malloc(sizeof(float) * Q4NX_D2560_ROWS * Q4NX_D2560_COLS * (size_t)CB);
+    if (!tmp) return -1;
+    for (int rb = 0; rb < RB; rb++)
+        for (int s = 0; s < S; s++) {
+            const int r0 = (rb * S + s) * Q4NX_D2560_ROWS;
+            if (r0 >= rows) break;
+            for (int cb = 0; cb < CB; cb++)
+                q4nx_dequant_chunk_d2560(data + (((size_t)rb * CB + cb) * S + s) * Q4NX_CHUNK_D2560,
+                                         tmp + (size_t)cb * Q4NX_D2560_COLS, full_k);
+            for (int r = 0; r < Q4NX_D2560_ROWS && r0 + r < rows; r++) {
+                float* dst = out + (size_t)(r0 + r) * cols;
+                memcpy(dst, tmp + (size_t)r * full_k, sizeof(float) * (size_t)k);
+                if (cols > k) memset(dst + k, 0, sizeof(float) * (size_t)(cols - k));
+            }
+        }
+    free(tmp);
     return 0;
 }
 

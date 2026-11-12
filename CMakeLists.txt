@@ -94,6 +94,10 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/laya_first_default.h
      "// generated from config/laya-first.json by CMakeLists.txt\n#pragma once\n"
      "static const char kDefaultLayaFirstJson[] = R\"ONEBITLAYAFIRST(${ONEBIT_LAYA_FIRST_JSON})ONEBITLAYAFIRST\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/laya-first.json)
+# engine#2263: the Q4NX cache's sweep, below both of its callers: `onebit` (serve start, `1bit q4nx-cache`) and onebit_npu
+# (npu/q4nx_device.cpp, the conversion that writes entries). Its own library so each binary links exactly one copy.
+add_library(onebit_q4nx_cache STATIC npu/q4nx_cache_sweep.cpp)
+target_include_directories(onebit_q4nx_cache PUBLIC ${CMAKE_SOURCE_DIR}/npu)
 add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/route_eval.cpp app/laya_checkpoint.cpp app/laya_first.cpp
                      app/embed_serve.cpp app/embed_model.cpp app/q4nx_cache.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
@@ -149,7 +153,7 @@ if(CMAKE_GENERATOR MATCHES "Makefiles")
         COMMAND ${CMAKE_COMMAND} -E false
         VERBATIM)
 endif()
-target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads onebit_q4nx_cache)
 
 # ── The chat-template renderer (engine #963, docs/npu-chat-template.md) ──────
 # The NPU chat route renders the container's own `chat_template` (app/npu_template.h) with the pinned
@@ -364,6 +368,9 @@ add_python_test(moe_expert_chunks_accum_test ${CMAKE_SOURCE_DIR}/tests/moe_exper
 # llama-bench (stdlib only: hashlib/importlib.util/json/pathlib/platform/sys) and passes on a plain interpreter, so it is a
 # test with no runner rather than a test that cannot run here. Registered, and the baseline is now empty: from here the
 # sweep is zero-tolerance instead of a record of known gaps.
+# engine#2138 slice: a merge's conflicts classified by kind, from git's index -- the conflicts a text search cannot
+# see (add/delete with no markers) are the ones a pin merge is mostly made of. Device-free, no checkout.
+add_python_test(conflict_triage_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_triage.py --self-test)
 add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
 # `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and
@@ -411,6 +418,11 @@ add_python_test(device_holders ${CMAKE_SOURCE_DIR}/tools/device_holders.py --sel
 # GTT. The script existed with a test that nothing ran; a test nobody runs is a comment, so the loader/flag assertions are registered
 # here (the test fakes the box, so it needs no device and no ticket).
 add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-bench-preflight.sh)
+# engine#572: an arm's memory trace. --drop-gib exists because a floor relative to a reading taken before the arm is
+# fragile -- other lanes move MemAvailable between the two -- while "fell by more than N GiB during this arm" is the
+# contamination itself. Same reason the test uses --drop-gib rather than a floor.
+add_test(NAME bench_arm_watch COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-bench-arm-watch.sh
+                                           ${CMAKE_SOURCE_DIR}/tools/bench-arm.sh)
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.
@@ -855,7 +867,7 @@ add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_
                             npu/audio_exec.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
-target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
+target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json onebit_q4nx_cache PRIVATE PkgConfig::PCRE2)
 
 # ── npu/forward's forward C++ compiles without the NPU runtime (engine #898) ───────────────
 # CI configures without ONEBIT_NPU, so npu/forward/src/q4nx_forward.cpp - where every A1 defect so
@@ -1272,6 +1284,7 @@ add_executable(embed_model_test tests/embed_model_test.cpp app/embed_model.cpp)
 # age window, and the disabled case). Listed explicitly like the other app/ units so the test needs no `onebit`.
 add_executable(q4nx_cache_test tests/q4nx_cache_test.cpp app/q4nx_cache.cpp)
 target_include_directories(q4nx_cache_test PRIVATE app)
+target_link_libraries(q4nx_cache_test PRIVATE onebit_q4nx_cache)
 add_test(NAME q4nx_cache COMMAND q4nx_cache_test)
 # engine#1956 review: an `add_test` whose target ci.yml never builds never runs in CI -- the documented route, no workflow edit.
 add_dependencies(onebit q4nx_cache_test)
@@ -2195,6 +2208,18 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> qwen2vl)
     set_tests_properties(batch_check_state_qwen2vl PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # Hy-Memory (hy_v3, engine#1786): sigmoid routing with a selection bias, router [H][E], a leading dense layer,
+    # [N][K] expert slices under FLM names, expert_hidden_dim, against a numpy hy_v3 reference.
+    add_test(NAME batch_check_state_hy_v3
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> hy_v3)
+    set_tests_properties(batch_check_state_hy_v3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # GPT-OSS (engine#1786): a container written in FastFlowLM's D2560/MX2560 form, sinks, o bias, yarn, the top-k
+    # MoE with clamped SwiGLU, against a numpy GPT-OSS forward on the same bytes.
+    add_test(NAME gptoss_forward
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/gptoss_forward_ci.py
+                     $<TARGET_FILE:batch_check_state_test>)
+    set_tests_properties(gptoss_forward PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     # A fabricated qwen3_5 hybrid (a linear-attention layer, then attention), off the kernel's N grid on purpose.
     add_test(NAME batch_check_state_qwen35
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py

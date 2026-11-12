@@ -24,6 +24,9 @@
 #   tools/bench-preflight.sh                    check the box; FATAL and exit 1 if a number would lie
 #   tools/bench-preflight.sh --strict           every warning becomes fatal
 #   tools/bench-preflight.sh --need-gtt GiB     also fatal if the die has less than GiB free GTT
+#   tools/bench-preflight.sh [--drop-gib N] --watch -- CMD...
+#                                               gate, then run CMD under tools/bench-arm.sh: memory start/min/end,
+#                                               FAIL if MemAvailable fell below the floor or by more than N GiB
 #   tools/bench-preflight.sh --dispatch B N     then one GGML_HRX_LOG_DISPATCH=1 pass of `B -p N` and
 #                                               the matcher each MUL_MAT took
 #
@@ -47,18 +50,22 @@ set -uo pipefail
 
 busy_pct=5
 busy_window=10
-ram_floor_gib=20
+ram_floor_gib=${BENCH_RAM_FLOOR_GIB:-20}
 uptime_floor=600
 
 die=/sys/class/drm/card0/device
 here=$(dirname "$0")
 strict=0
 need_gtt=0
+watch=0
+drop_gib=${BENCH_DROP_GIB:-0}
 
 while [ $# -gt 0 ]; do
     case $1 in
         --strict) strict=1; shift ;;
         --need-gtt) need_gtt=${2:?--need-gtt needs a GiB value}; shift 2 ;;
+        --drop-gib) drop_gib=${2:?--drop-gib needs a GiB value}; shift 2 ;;
+        --watch) watch=1; shift; [ "${1:-}" = "--" ] && shift; break ;;
         --dispatch) break ;;
         *) echo "bench-preflight: unknown option $1" >&2; exit 2 ;;
     esac
@@ -125,6 +132,20 @@ fi
 
 if [ -n "$warned" ] && [ "$strict" = 1 ]; then
     fatal "the box is usable but not clean, and --strict was asked for"
+fi
+
+# --watch: the start gate says nothing about the rest of the run. engine#572's second arm started at 85 GiB
+# available, another load arrived, MemAvailable fell to 1-3 GiB with swap full, and the arm timed out at 540 s
+# -- so the number that came back (a timeout) and the number that did not (the arm) were both produced on a box
+# nobody had described. Sample for the whole command and report start/min/end, so an arm is either clean or
+# visibly contaminated where its number is printed.
+if [ "$watch" = 1 ]; then
+    # engine#572: the start gate describes the wrong moment -- a mid-arm load can take MemAvailable from 85 GiB to
+    # 1-3 GiB and the arm times out, so the number is produced on a box nobody described. The sampler lives in its own
+    # tool so it can be tested on a busy box (this gate would refuse to reach it).
+    [ $# -gt 0 ] || { echo "bench-preflight: --watch needs a command after --" >&2; exit 2; }
+    # Both tests reach the arm: the floor, and the drop (--drop-gib N before --watch, or BENCH_DROP_GIB; 0 = off).
+    exec "$here/bench-arm.sh" --floor "$ram_floor_gib" --drop-gib "$drop_gib" -- "$@"
 fi
 
 printf 'bench-preflight: OK\n'

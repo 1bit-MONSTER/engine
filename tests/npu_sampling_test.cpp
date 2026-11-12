@@ -448,6 +448,25 @@ void test_logprobs() {
     check(flat.top.empty(), "top_logprobs 0 reports no alternatives");
 
     // Ties go to the lower id, the rule the sampler draws by.
+    // engine#2272: a padded head stores rows past the vocabulary (engine#2026), and those rows are
+    // not tokens. Normalising over them shifts every reported logprob by the padding's mass, and the
+    // padding is given the LARGEST logits here so the shift cannot be mistaken for rounding. The
+    // expected values are computed from the vocabulary-only softmax below, not through the helper.
+    {
+        const size_t vocab = 3, pad = 2;
+        std::vector<float> padded(vocab + pad, 50.0f);      // padding: the largest logits, as a head may store
+        padded[0] = 0.0f; padded[1] = 0.0f; padded[2] = 0.0f;
+        double z = 0.0;
+        for (size_t i = 0; i < vocab; i++) z += std::exp(double(padded[i]));
+        const double log_z = std::log(z);
+        const auto bounded = logprobs_of(padded, int(vocab), 1, 64);
+        check(std::fabs(bounded.logprob - float(-log_z)) < 1e-6f,
+              "a padded row: the logprob is the vocabulary-only softmax, not the padding's");
+        bool padding_reported = false;
+        for (const auto& t : bounded.top) padding_reported = padding_reported || t.id >= int(vocab);
+        check(!padding_reported, "a padded row: no id at or past the vocabulary appears in top_logprobs");
+    }
+
     const auto tied = logprobs_of(std::vector<float>{1.0f, 1.0f, 1.0f}, 0, 0, 2);
     check(tied.top.size() == 2 && tied.top[0].id == 0 && tied.top[1].id == 1, "ties keep the lower id first");
 

@@ -1104,6 +1104,29 @@ the single undocumented entry out of 37.
   key: `census_watch.py` matches architecture classes exactly, so that spelling needs its own entry and is not covered
   by this one.
 
+## 2026-11-12: `BagelForConditionalGeneration` and `OleanderForCausalLM` — reviewed, not aliases (engine#2280)
+
+The two `!! UNCOVERED` lines of the 2026-11-12 watcher run. Both were read from the repos' own `config.json` and
+safetensors headers, not from the class names. The run's `REMOTE-CODE MiamnusForCausalLM` line is informational (the
+watcher already classes it as remote code) and needs no entry.
+
+* `BagelForConditionalGeneration` (`model_type` `bagel`, 4 models, e.g. `benson123dc/tmp-4461ae1a1900`) — a
+  BAGEL-style unified understand-and-generate model. The config is composite: `llm_config` is Qwen2 (hidden 3584,
+  28 layers, 28 heads / 4 KV) **with `qk_norm`**, `vit_config` is SigLIP (27 layers, patch 14), and `visual_gen` adds
+  a VAE latent path. Every LLM layer carries a second Mixture-of-Transformers copy of its weights
+  (`self_attn.*_moe_gen`, `mlp_moe_gen`, `*_layernorm_moe_gen`) for the image-generation tokens. **Not an alias of
+  `Qwen2ForCausalLM`**: the `qwen2` graph has no `q_norm`/`k_norm`, so even an understanding-only text path needs its
+  own converter, and image generation is outside what any backend serves. Reported, not alerted (`"watch": "report"`).
+  The unrelated `jondurbin/bagel-*` fine-tunes are Mistral/Yi checkpoints under their base classes and are not this
+  class.
+* `OleanderForCausalLM` (`model_type` `oleander`, 1 model, `CyanMonkey/Test-Subject-3`) — "Oleander-150M", a
+  from-scratch training export (its config: step 2000 of 28820, 6.94 %), F32, with no modelling code and no
+  `auto_map`. It is a 28-layer hybrid in a `gdn2, gdn2, gdn2, gqa` pattern (hidden 576, vocab 32770) and writes the
+  same `layer_types` strings as Qwen3.5. **It is not an alias of Qwen3.5 / Qwen3-Next**, though: its `gdn2` layers
+  carry per-q/k/v `conv1d` and low-rank `f_proj`/`g_proj` gates, every sublayer has attention-residual mixers
+  (`attn_res_mixer`, `attn_res_mlp`, `res_out`), and the GQA layers have a fused `qg_proj` and a value-residual
+  `v_mix`. No pinned graph has those tensors. Reported, not alerted (`"watch": "report"`).
+
 ## FLM 1.0.12's build on the box: one family root with nothing, three that are already somewhere (engine#1787)
 
 F9 of `TNPU-ALL` §9 asks for a row for *every family FastFlowLM's build serves and we do not*. The build is on the box,

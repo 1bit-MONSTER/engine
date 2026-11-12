@@ -22,6 +22,8 @@
 #   - --no-recipes adds nothing, --recipes FILE replaces the built-in set (flags and environment),
 #   - a recipe can match on the model file's metadata keys (match.gguf_keys): a file that carries
 #     every listed key matches, the same architecture without it does not, and a non-list is refused,
+#   - the qwen4exp (Qwen3.8-Flash-Next) recipes are hrx-only: GGML_HRX_GRAPH_PROGRAM_CACHE=128 and -ub 2048 (engine #572),
+#     added once, and nothing for another architecture on hrx or for qwen4exp on cpu,
 #   - a malformed recipe file stops serve with the reason.
 #
 # usage: tests/recipes_route.sh path/to/1bit
@@ -112,6 +114,8 @@ run "$scratch/q4exp.gguf" "$scratch/q4exp.json"
 check "the qwen4exp graph-program-cache recipe is hrx-scoped: nothing on cpu" \
       '! grep -q "hrx-graph-program-cache-128" "$scratch/q4exp.json.log"'
 check "  and nothing is set for the other architectures" '[ "$(field "$scratch/moe.json" "r[\"env\"].get(\"GGML_HRX_GRAPH_PROGRAM_CACHE\")")" = None ]'
+check "the qwen4exp -ub 2048 recipe is hrx-scoped too: no -ub on cpu" \
+      '[ "$(after "$scratch/q4exp.json" -ub)" = None ] && ! grep -q "qwen4exp-hrx-ub2048" "$scratch/q4exp.json.log"'
 # The positive case needs the HRX runtime to resolve the device; the model itself never loads (the backend is a stub),
 # so skip rather than fail on a box without it.
 hsalib=${IREE_HAL_AMDGPU_LIBHSA_PATH:-/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1}
@@ -119,9 +123,12 @@ if [ -e "$hsalib" ]; then
     SERVE_DEVICE=hrx run "$scratch/q4exp.gguf" "$scratch/q4exp-hrx.json"
     check "  on hrx it sets GGML_HRX_GRAPH_PROGRAM_CACHE=128 and names the recipe" \
           '[ "$(field "$scratch/q4exp-hrx.json" "r[\"env\"].get(\"GGML_HRX_GRAPH_PROGRAM_CACHE\")")" = 128 ] && grep -q "recipe hrx-graph-program-cache-128" "$scratch/q4exp-hrx.json.log"'
+    check "  on hrx it adds -ub 2048 once and names the recipe (engine #572)" \
+          '[ "$(after "$scratch/q4exp-hrx.json" -ub)" = 2048 ] && [ "$(count "$scratch/q4exp-hrx.json" -ub)" = 1 ] && grep -q "recipe qwen4exp-hrx-ub2048: -ub 2048" "$scratch/q4exp-hrx.json.log"'
     SERVE_DEVICE=hrx run "$scratch/plainq35.gguf" "$scratch/q35-hrx.json"
     check "  and leaves another hrx architecture alone" \
           '[ "$(field "$scratch/q35-hrx.json" "r[\"env\"].get(\"GGML_HRX_GRAPH_PROGRAM_CACHE\")")" = None ]'
+    check "  nor gives another hrx architecture a micro-batch" '[ "$(after "$scratch/q35-hrx.json" -ub)" = None ]'
 else
     echo "skip  qwen4exp recipe on hrx (no HSA runtime at $hsalib)"
 fi

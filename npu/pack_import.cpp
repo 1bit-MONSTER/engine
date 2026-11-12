@@ -3325,6 +3325,12 @@ std::string Plan::manifest() const {
         c["tensors"] = container_tensors;
         c["payload_bytes"] = container_payload_bytes;
         c["dtypes"] = container_dtypes;
+        if (container_role_layer_rows >= 0)
+            c["role_layer_types"] = {{"keys", container_role_layer_rows},
+                                     {"spans", container_role_layer_spans},
+                                     {"out_of_range", container_role_layer_out_of_range}};
+        if (!container_role_layer_span_names.empty())
+            c["role_layer_types"]["span_names"] = container_role_layer_span_names;
         c["note"] = container_note;
         j["container"] = c;
     }
@@ -3428,6 +3434,168 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
 // engine#1786 (item F1), slice 3a: roles from names. The rule is ordered -- the first match wins -- so `q_proj.bias`
 // classifies as a bias of q_proj rather than as an unknown tensor, and a name that matches nothing lands in `unassigned`
 // with its own name rather than being guessed from its shape.
+// engine#1788, slice 3c step 1: (role, layer type), the key the writer needs. See the header for the measurement.
+PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
+                                  const std::vector<std::string>& layer_types) {
+    PlacementReport out;
+    const ContainerRoles roles = container_roles(tensors);
+    const RoleSlotReport table = container_role_slots(roles);
+    for (const auto& t : tensors) {
+        PlacementRow row;
+        row.tensor = t.name;
+        const auto it = roles.role_of.find(t.name);
+        if (it == roles.role_of.end()) { row.why = "no role recognised"; ++out.no_role; out.rows.push_back(row); continue; }
+        row.role = it->second;
+        std::string::size_type pos = t.name.find(".layers.");
+        std::string::size_type off = 8;
+        if (pos == std::string::npos) { pos = t.name.find(".layer."); off = 7; }
+        if (pos != std::string::npos) {
+            const std::string::size_type start = pos + off;
+            std::string::size_type end = start;
+            while (end < t.name.size() && t.name[end] >= '0' && t.name[end] <= '9') ++end;
+            if (end > start) {
+                const int64_t layer = std::atoll(t.name.substr(start, end - start).c_str());
+                row.layer = std::to_string(layer);
+                if (layer >= 0 && layer < int64_t(layer_types.size())) row.layer_type = layer_types[size_t(layer)];
+            }
+        }
+        row.slot = container_role_slot(row.role, row.layer_type);
+        if (row.slot.empty()) {
+            const auto why = table.why.find(row.role);
+            row.why = why != table.why.end() ? why->second
+                      : "the layer type does not give this role a destination";
+            ++out.unplaced;
+        } else {
+            ++out.placed;
+            ++out.slot_counts[row.slot];
+        }
+        out.rows.push_back(row);
+    }
+    return out;
+}
+
+RoleLayerReport container_role_layer_types(const std::vector<Q4nxTensor>& tensors,
+                                           const std::vector<std::string>& layer_types) {
+    RoleLayerReport out;
+    const ContainerRoles roles = container_roles(tensors);
+    std::map<std::pair<std::string, std::string>, std::map<std::string, int64_t>> by_key;
+    std::map<std::string, std::string> role_of_stem;
+    std::set<std::string> seen_in_layer;
+    for (const auto& t : tensors) {
+        const auto it = roles.role_of.find(t.name);
+        if (it == roles.role_of.end()) continue;
+        std::string::size_type pos = t.name.find(".layers.");
+        std::string::size_type off = 8;
+        if (pos == std::string::npos) { pos = t.name.find(".layer."); off = 7; }
+        if (pos == std::string::npos) { out.no_layer.push_back(it->second + "  (" + t.name + ")"); continue; }
+        const std::string::size_type start = pos + off;
+        std::string::size_type end = start;
+        while (end < t.name.size() && t.name[end] >= '0' && t.name[end] <= '9') ++end;
+        if (end == start) continue;
+        const int64_t layer = std::atoll(t.name.substr(start, end - start).c_str());
+        if (layer < 0 || layer >= int64_t(layer_types.size())) { ++out.out_of_range; continue; }
+        std::string shape = "[";
+        for (size_t i = 0; i < t.shape.size(); ++i) shape += (i ? "," : "") + std::to_string(t.shape[i]);
+        shape += "] " + t.dtype;
+        // The key is the TENSOR STEM, not the role: `ssm` covers dt.bias, conv1d, norm and a, which are four different
+        // tensors with four shapes -- a span there is my role vocabulary being coarse, not an ambiguity. Two shapes for
+        // the SAME stem in ONE layer type is the case a third key would be needed for (gemma4: gate/up/down_proj are
+        // 2304 wide on 20 layers and 1152 on 15, and both kinds sit in both layer types).
+        std::string stem = t.name.substr(0, start) + "N" + t.name.substr(end);   // `model.layers.7.x` -> `model.layers.N.x`
+        by_key[{stem, layer_types[size_t(layer)]}][shape]++;
+        role_of_stem.emplace(stem, it->second);
+        seen_in_layer.insert(it->second);
+    }
+    for (const auto& kv : by_key) {
+        if (kv.second.size() > 1) {
+            out.spans.push_back(kv.first.first + " in " + kv.first.second + " appears in " +
+                                std::to_string(kv.second.size()) + " shapes");
+            continue;
+        }
+        int64_t n = 0;
+        for (const auto& sh : kv.second) n += sh.second;
+        out.rows.push_back({kv.first.first, role_of_stem[kv.first.first], kv.first.second, kv.second.begin()->first, n});
+    }
+    for (const auto& kv : roles.counts) {
+        if (seen_in_layer.count(kv.first)) continue;
+        bool already = false;
+        for (const auto& x : out.no_layer)
+            if (x.rfind(kv.first + "  ", 0) == 0) { already = true; break; }
+        if (!already) out.no_layer.push_back(kv.first + "  (no tensor inside a layer)");
+    }
+    return out;
+}
+
+// engine#1788, slice 3c: the roles a layer type does not change, and the engine slot each becomes. Every right-hand
+// side below is a literal that exists in npu/forward/src (grep the strings, do not infer them from HF names).
+static const struct { const char* role; const char* slot; } kRoleSlots[] = {
+    {"embed",              "model.embed_tokens.weight"},
+    {"final_norm",         "model.norm.weight"},
+    {"input_norm",         "input_layernorm.weight"},
+    {"post_norm",          "post_attention_layernorm.weight"},
+    {"lm_head",            "lm_head.weight"},
+    {"q_proj",             "self_attn.q_proj.weight"},
+    {"k_proj",             "self_attn.k_proj.weight"},
+    {"v_proj",             "self_attn.v_proj.weight"},
+    {"o_proj",             "self_attn.o_proj.weight"},
+    {"self_attn_gate_proj","self_attn.gate_proj.weight"},
+    {"gate_proj",          "mlp.gate_proj.weight"},
+    {"up_proj",            "mlp.up_proj.weight"},
+    {"down_proj",          "mlp.down_proj.weight"},
+    {"gate_exps",          "mlp.experts.gate_proj.weight"},
+    {"up_exps",            "mlp.experts.up_proj.weight"},
+    {"down_exps",          "mlp.experts.down_proj.weight"},
+    {"shortconv_in_proj",  "shortconv.in_proj.weight"},
+};
+
+// The roles this slice does NOT place, each with the reason. A number here is honest; a guessed slot is not.
+static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
+    {"qkv_proj",            "the slot prefix is the LAYER TYPE's (`linear_attn.` or `self_attn.`), so it needs the second key"},
+    {"q_norm",              "the engine's normaliser slots are per-architecture; none is verified for this role yet"},
+    {"k_norm",              "same: the engine's `k_norm` string is a config field, not a verified weight slot"},
+    {"gate_up_proj",        "fused in some containers, two slots in the engine; needs a measured split"},
+    {"moe_router",          "the engine reads `mlp.router.bias`; the weight slot is not verified"},
+    {"share_gate_exps",     "the shared expert's slots differ per architecture and none is verified"},
+    {"share_up_exps",       "same"},
+    {"share_down_exps",     "same"},
+    {"shared_expert_gate",  "same"},
+};
+
+// The layer types that are linear attention, as an EXACT set rather than a substring: the defect family this stack
+// exists to fix is substring matching where an identity was meant (#1840, #1841, #2277's needle order). A value that
+// merely contains "linear" is not linear attention, and a new family (gdn, mamba-style) must be added here on purpose.
+static const char* const kLinearAttentionLayerTypes[] = {"linear_attention"};
+
+static bool is_linear_attention(const std::string& layer_type) {
+    for (const char* t : kLinearAttentionLayerTypes) if (layer_type == t) return true;
+    return false;
+}
+
+std::string container_role_slot(const std::string& role, const std::string& layer_type) {
+    if (role == "qkv_proj") {
+        // The engine's only fused-qkv slot is the linear-attention one; `self_attn.qkv_proj` is not a name it reads.
+        return is_linear_attention(layer_type) ? "linear_attn.qkv_proj.weight" : std::string();
+    }
+    for (const auto& kv : kRoleSlots) if (role == kv.role) return kv.slot;
+    return std::string();
+}
+
+RoleSlotReport container_role_slots(const ContainerRoles& roles) {
+    RoleSlotReport r;
+    for (const auto& kv : kRoleSlots) r.slot_of[kv.role] = kv.slot;
+    for (const auto& kv : kRoleNoSlot) r.why[kv.role] = kv.why;
+    // Every role the caller actually met must be either placed or explained: a role that is in neither is a hole in
+    // this table, and saying so is the point of the report.
+    for (const auto& c : roles.counts) {
+        if (r.slot_of.count(c.first)) r.placed.push_back(c.first);
+        else if (r.why.count(c.first)) r.no_slot.push_back(c.first);
+        else { r.no_slot.push_back(c.first); r.why[c.first] = "a role this table does not know: it needs a decision"; }
+    }
+    std::sort(r.placed.begin(), r.placed.end());
+    std::sort(r.no_slot.begin(), r.no_slot.end());
+    return r;
+}
+
 ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
     struct Rule { const char* role; const char* needle; };
     // Longest/most specific spellings first: `qkv_proj` before `q_proj`, `gate_up_proj` before `gate_proj`.
@@ -3448,9 +3616,28 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
         {"k_proj",        "k_proj"},         {"k_proj",        "attn_k"},         {"k_proj", "wk."},
         {"v_proj",        "v_proj"},         {"v_proj",        "attn_v"},         {"v_proj", "wv."},
         {"o_proj",        "o_proj"},         {"o_proj",        "attn_output"},    {"o_proj", "wo."},
+        // engine#1788: an ATTENTION output gate is not the FFN gate. MiniCPM-V 4.7 carries `attn_output_gate: true`,
+        // so every one of its 30 `self_attn.gate_proj.weight` tensors was filed under `gate_proj` -- the dense-MLP role
+        // -- and a consumer would have wired an attention gate into the FFN path. The forward already keeps them apart
+        // (model.h: `gate_proj_weight` vs `self_attn_gate_proj_weight`), so this uses its name and must precede the
+        // `gate_proj` needle.
+        {"self_attn_gate_proj", "self_attn.gate_proj"},
         {"gate_proj",     "gate_proj"},      {"gate_proj",     "ffn_gate"},
         {"up_proj",       "up_proj"},        {"up_proj",       "ffn_up"},
-        {"down_proj",     "down_proj"},      {"down_proj",     "ffn_down"},
+        {"down_proj",     "down_proj"},      {"down_proj",     "ffn_down"},        // engine#1788 acceptance (F1 slice 3a gap): the MoE families MiniCPM-V 4.7 names, mapped to the roles the NPU
+        // forward ALREADY reads -- npu/forward/include/model.h carries up_exps_weight / gate_exps_weight /
+        // down_exps_weight / share_{up,gate,down}_exps_weight / moe_router_weight / shared_expert_gate_weight with
+        // those exact container names in their comments. So this is translation to an existing vocabulary, not a new
+        // one. The `share_*` spellings come first because `share_gate_exps_proj` contains `gate_exps_proj`.
+        {"share_gate_exps",   "share_gate_exps_proj"},
+        {"share_up_exps",     "share_up_exps_proj"},
+        {"share_down_exps",   "share_down_exps_proj"},
+        {"gate_exps",         "gate_exps_proj"},
+        {"up_exps",           "up_exps_proj"},
+        {"down_exps",         "down_exps_proj"},
+        {"moe_router",        "moe_router"},
+        {"shared_expert_gate","shared_expert_gate"},
+
         {"input_norm",    "input_layernorm"},{"input_norm",    "attn_norm"},      {"input_norm", "attention_norm"},
         {"post_norm",     "post_attention_layernorm"},          {"post_norm",    "ffn_norm"},
         {"final_norm",    "final_layernorm"},
@@ -3460,6 +3647,24 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
     // and `model.mtp.*` is a draft head rather than a model.
     static const char* kSsm[] = {"linear_attn.", "ssm_alpha_proj", "ssm_beta_proj", "ssm_conv1d", "ssm_dt",
                                  "ssm_norm", "ssm_out_proj"};
+    // engine#1788: gemma3/gemma4/bolt carry five tensor families this engine's forward does NOT read -- sandwich norms
+    // (`pre_/post_feedforward_layernorm`), an input gate, a per-layer projection (and its `_prefill` sibling) and a layer
+    // output scale. Nothing here has a field in npu/forward/include/model.h, so they are RECOGNISED rather than mapped:
+    // `unassigned` has to keep meaning "nothing knows this", and these are known -- measured on gemma4-e2b (319 of 709)
+    // and bolt-e4b (382 of 849), which were the two packs the classifier could not finish.
+    // `post_layernorm` and `per_layer_model_proj` are here for a measured reason, not a guess: gemma4-e2b carries
+    // BOTH `post_attention_layernorm` (35, classified `post_norm`) and `post_layernorm` (35), so the second cannot be
+    // the forward's post-attention norm -- they are different tensors in the same model. gemma3-270m has no
+    // `post_layernorm` at all, which is why only gemma4/bolt were left with it.
+    static const char* kGemmaLocal[] = {"pre_feedforward_layernorm", "post_feedforward_layernorm", "inp_gate",
+                                        "layer_output_scale", "per_layer_projection", "post_layernorm",
+                                        "per_layer_model_proj"};
+    // engine#1788: the last three on gemma4/bolt are recognised for a different reason than the gemma ones, so they get
+    // their own role. `rope_freqs.weight` is a file the forward only FLAGS (`model_config.h`: has_rope_freqs_file), and
+    // `per_layer_token_embd` (with its `.scale` sibling) is the per-layer token embedding that our ONNX path reads as
+    // `embed_tokens_per_layer` (engine#1725) but the container path has no field for. Recognised, not mapped: neither
+    // has a field to fill, and calling them "unassigned" would say nothing knows them when the opposite is true.
+    static const char* kContainerExtras[] = {"rope_freqs", "per_layer_token_embd"};
     static const char* kMtp[] = {"model.mtp."};
     ContainerRoles out;
     for (const auto& t : tensors) {
@@ -3477,8 +3682,20 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
                 matched = true;
                 break;
             }
-            if (!matched && n.find("norm.weight") != std::string::npos && n.find("layers.") == std::string::npos)
+            // "never inside a layer" has to be spelled positively enough to survive the container's own naming:
+            // MiniCPM-V 4.7 spells its blocks `model.layer.N.` (singular), so a guard against "layers." alone filed
+            // 30 per-layer linear_attn.ssm_norm tensors as final_norm -- ahead of the kSsm loop below (engine#1788).
+            if (!matched && n.find("norm.weight") != std::string::npos && n.find("layers.") == std::string::npos &&
+                n.find("layer.") == std::string::npos)
                 role = "final_norm";   // `model.norm.weight`: the top-level norm, never inside a layer
+            if (!matched && role.empty()) {
+                for (const char* e : kContainerExtras)
+                    if (n.find(e) != std::string::npos) { role = "container_extra"; matched = true; break; }
+            }
+            if (!matched && role.empty()) {
+                for (const char* g : kGemmaLocal)
+                    if (n.find(g) != std::string::npos) { role = "gemma_local"; matched = true; break; }
+            }
             if (!matched && role.empty()) {
                 for (const char* s : kSsm)
                     if (n.find(s) != std::string::npos) { role = "ssm"; matched = true; break; }
@@ -3590,6 +3807,25 @@ Plan plan(const std::string& pack_dir) {
             // wins) -- the container's own `dims` still takes precedence in container_geometry().
             std::string cfg_source;
             const json cfg = load_geometry(pack_dir, &cfg_source);
+            // engine#1788, slice 3c: the (role, layer type) key, when the pack says what its layers are.
+            if (const Q4nxContainer& cc = c; true) {
+                std::vector<std::string> lt;
+                const json* src = cfg.contains("layer_types") ? &cfg : nullptr;
+                if (!src && cfg.contains("text_config") && cfg["text_config"].is_object() &&
+                    cfg["text_config"].contains("layer_types"))
+                    src = &cfg["text_config"];
+                if (src && (*src)["layer_types"].is_array())
+                    for (const auto& x : (*src)["layer_types"])
+                        if (x.is_string()) lt.push_back(x.get<std::string>());
+                if (!lt.empty()) {
+                    const RoleLayerReport rep = container_role_layer_types(cc.tensors, lt);
+                    p.container_role_layer_rows = int64_t(rep.rows.size());
+                    p.container_role_layer_spans = int64_t(rep.spans.size());
+                    p.container_role_layer_out_of_range = rep.out_of_range;
+                    // the pairs a third key would be needed for, named: this is the writer's remaining question, not a number
+                    for (size_t i = 0; i < rep.spans.size() && i < 8; ++i) p.container_role_layer_span_names.push_back(rep.spans[i]);
+                }
+            }
             const ContainerGeometry g = container_geometry(c.meta, cfg);
             p.dims = g.dims;
             p.container_geometry_source = g.source;
@@ -4678,6 +4914,15 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // Census yes, writer no (see the note where graph_weights is decided): this genre's weights are 1-D external-data
     // blocks, and until the repacker exists an import would write a container nothing can read. Refused here rather
     // than in plan(), because `info` must keep reporting the genre it can now see.
+    // engine#1786 (item F1) / engine#1788: a container-genre pack has no `model.onnx` by design, so without a branch here
+    // the first byte fails with "cannot open <pack>/model.onnx" -- a missing-file message about a pack that has no graph
+    // at all. Refused by name, the same way the external-data genre below is, until the container-genre writer exists.
+    if (p.container_tensors >= 0) {
+        throw std::runtime_error(
+            "this pack is a safetensors container (model.q4nx): " + std::to_string(p.container_tensors) +
+            " tensor(s); importing it needs the container-genre writer (engine#1786, item F1), which the importer does "
+            "not have yet. `1bit npu-pack info` reports what the container holds");
+    }
     if (p.graph_packed_siblings > 0) {
         // The genre has a writer now (engine#1503): decode -> convert -> split by role -> the same I8 tile chunks,
         // with its own function because import_pack is built around the .fconst envelope.

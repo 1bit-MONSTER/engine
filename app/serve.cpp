@@ -2952,14 +2952,11 @@ std::string command_text(const std::vector<std::string>& argv) {
 // be /tmp/.cache, which every local user can write; a cached directory there would be served
 // (weights, tokenizer, kernel directory) without knowing who made it. The home directory now
 // comes from the user database instead, and serve refuses rather than guess.
+// engine#2263: one resolution (app/q4nx_cache.h), shared with `1bit q4nx-cache evict`, so the command sweeps this directory.
 std::string q4nx_cache_root() {
-    if (const char* c = std::getenv("ONEBIT_Q4NX_CACHE"); c && *c) return c;
-    if (const char* h = std::getenv("HOME"); h && *h) return std::string(h) + "/.cache/1bit/q4nx";
-#ifndef _WIN32
-    if (const passwd* pw = ::getpwuid(::geteuid()); pw && pw->pw_dir && *pw->pw_dir)
-        return std::string(pw->pw_dir) + "/.cache/1bit/q4nx";
-#endif
-    throw std::runtime_error("no home directory for the Q4NX cache: set HOME or ONEBIT_Q4NX_CACHE");
+    std::string root = q4nx_cache_default_root();
+    if (root.empty()) throw std::runtime_error("no home directory for the Q4NX cache: set HOME or ONEBIT_Q4NX_CACHE");
+    return root;
 }
 
 // Repack a GGUF into a Q4NX model directory with the FLM_Q4NX_Converter

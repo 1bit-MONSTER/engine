@@ -230,6 +230,7 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
     /* LFM2 / LFM2.5 (Lfm2ForCausalLM): its attention layers carry q_norm/k_norm, applied before RoPE */
     const int is_lfm2 = starts_with(model_type, "lfm2") || starts_with(arch, "Lfm2");
     const int is_lfm3 = starts_with(model_type, "lfm3") || starts_with(arch, "Lfm3");
+    s->gpt_oss = (starts_with(model_type, "gpt_oss") || starts_with(arch, "GptOss")) ? 1 : 0;
 
     /* per-head q/k RMSNorm: qwen3*, gemma* and lfm2 have q_norm/k_norm; llama/phi do not */
     s->qk_norm = (is_qwen3 || is_gemma || is_lfm2 || is_lfm3) ? 1 : 0;

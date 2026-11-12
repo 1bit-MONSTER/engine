@@ -3555,10 +3555,21 @@ static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
     {"k_norm",              "same: the engine's `k_norm` string is a config field, not a verified weight slot"},
     {"gate_up_proj",        "fused in some containers, two slots in the engine; needs a measured split"},
     {"moe_router",          "the engine reads `mlp.router.bias`; the weight slot is not verified"},
-    {"share_gate_exps",     "the shared expert's slots differ per architecture and none is verified"},
-    {"share_up_exps",       "same"},
-    {"share_down_exps",     "same"},
-    {"shared_expert_gate",  "same"},
+    {"share_gate_exps",     "the shared expert's gate slot differs per architecture; none is verified in npu/forward/src"},
+    {"share_up_exps",       "the shared expert's up slot; same open question as the gate"},
+    {"share_down_exps",     "the shared expert's down slot; same open question as the gate"},
+    {"shared_expert_gate",  "the shared-expert router gate; no slot with this name exists in the engine"},
+    // Measured on the real containers (35B: 210 tensors): `ssm` is not one destination but FOUR -- dt.bias, conv1d, norm
+    // and a, with four different shapes. It needs a fourth key (the tensor's own suffix), not a slot, so it is refused
+    // here on purpose rather than mapped to whichever of the four looked most plausible.
+    {"ssm",                 "one role covering dt.bias, conv1d, norm and a -- four destinations with four shapes, so it needs the tensor's own suffix"},
+    // Measured on gemma3/gemma4/bolt. `gemma_local` is likewise a GROUP: pre/post_feedforward_layernorm (both of which DO
+    // have engine slots), inp_gate, layer_output_scale, per_layer_projection, post_layernorm and per_layer_model_proj.
+    // Refusing the group is honest; the three with slots need the suffix key to be told apart from the four without.
+    {"gemma_local",         "a group: pre/post_feedforward_layernorm have engine slots, inp_gate / layer_output_scale / per_layer_projection / post_layernorm / per_layer_model_proj do not -- separating them needs the suffix key"},
+    // Measured on gemma4/bolt. These ARE recognised and deliberately have no destination: `rope_freqs.weight` is a file the
+    // forward only FLAGS (model_config.h: has_rope_freqs_file) and the per-layer embeddings have no slot of their own.
+    {"container_extra",     "recognised so it is not a gap, and deliberately not written: a table the forward only flags (rope_freqs) or a per-layer embedding with no slot"},
 };
 
 // The layer types that are linear attention, as an EXACT set rather than a substring: the defect family this stack

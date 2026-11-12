@@ -5179,6 +5179,31 @@ void test_container_role_layer_types() {
 
 // engine#1788, 3c: the writer iterates TENSORS, not roles, so the placement has to answer per tensor and use that
 // tensor's own layer type. The arm that matters is the pair: the same role lands in two different places on two layers.
+// engine#1788, 3c: the same decision driven by a REAL container. The pack leg gates on model.onnx, so a container
+// (model.q4nx) could never reach the placement above; this reads the container with the shipped reader and reports the
+// three counts, so the numbers in a PR body are measured on the five containers rather than on the synthetic fixture.
+static void test_container_placement_real(const std::string& dir, const std::vector<std::string>& layer_types) {
+    using namespace onebit::npu::pack_import;
+    const Q4nxContainer c = read_q4nx_container(dir + "/model.q4nx");
+    const PlacementReport r = container_placement(c.tensors, layer_types);
+    std::printf("placement: %s -> put %lld, held %lld, unnamed %lld (of %zu tensors)\n", dir.c_str(),
+                (long long)r.placed, (long long)r.unplaced, (long long)r.no_role, c.tensors.size());
+    std::map<std::string, int64_t> held_by_reason;
+    for (const auto& row : r.rows) if (row.slot.empty()) held_by_reason[row.why]++;
+    for (const auto& kv : held_by_reason) std::printf("    held: %lld x %s\n", (long long)kv.second, kv.first.c_str());
+    std::map<std::string, int64_t> roles_seen;
+    for (const auto& row : r.rows) if (!row.role.empty()) roles_seen[row.role]++;
+    std::printf("    roles:"); for (const auto& kv : roles_seen) std::printf(" %s=%lld", kv.first.c_str(), (long long)kv.second);
+    std::printf("\n");
+    std::printf("    UNKNOWN:");
+    for (const auto& kv : held_by_reason) if (kv.first.find("does not know") != std::string::npos) {
+        for (const auto& row : r.rows) if (row.slot.empty() && row.why == kv.first && !row.role.empty()) {
+            std::printf(" %s", row.role.c_str()); break; }
+    }
+    std::printf("\n");
+    check(r.placed + r.unplaced + r.no_role == int64_t(c.tensors.size()), std::string("placement: accounts for every tensor in ") + dir);
+}
+
 void test_container_placement() {
     using pi::Q4nxTensor;
     const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
@@ -6391,6 +6416,14 @@ int main(int argc, char** argv) {
         test_container_roles_gemma_local();
         test_container_roles_moe_and_singular_layer();
         test_container_placement();
+        if (argc > 4) {
+            std::vector<std::string> lt;
+            std::string all = argv[4];
+            std::string cur;
+            for (char ch : all) { if (ch == ',') { lt.push_back(cur); cur.clear(); } else cur += ch; }
+            if (!cur.empty()) lt.push_back(cur);
+            test_container_placement_real(argv[3], lt);
+        }
         test_container_role_slots();
         test_container_role_layer_types();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);

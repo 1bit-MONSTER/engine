@@ -1044,11 +1044,42 @@ and the 256-aligned Q4_K prefill through the 8-bit-block kernel, which reads Q4_
 | weights in two layouts | 70 (2,486.7 MiB duplicate) | 16 (462.9 MiB) |
 
 The generated text is identical, and prefill was not slower in the one interleaved window measured (prompt eval 263.5 and 317.1
-tok/s against 298.7 and 317.1). Qwen3-4B is unchanged (398 copies). What is left on the 27B, 15 Q4_K weights read by a prefill
-kernel that has only a packed form and one Q6_K weight, is tracked in
-[engine#2137](https://github.com/1bit-MONSTER/engine/issues/2137). Making decode step aside instead was measured and does not help:
+tok/s against 298.7 and 317.1). Qwen3-4B is unchanged (398 copies).
+
+**Since pin `228e1f652` the 27B holds no weight twice** (llama.cpp #322). The last 16 were all read by the fused projection+conv
+prefill kernel: 15 Q4_K weights it reads only in the packed rows, and one Q6_K weight it bound stored while the rest of prefill reads
+it packed. For a Q4_K weight decode already holds stored, that kernel now steps aside (the projection runs on the stored 8-bit-block
+kernel and the conv runs separately), and it binds Q6_K in the packed rows where prefill reads that weight packed. Same
+`llama-completion` run with `-n 48`, default settings, fork head `5816f7b` against `a591023`:
+
+| Qwen3.8-27B UD-Q4_K_XL | before #322 | since #322 |
+|---|---:|---:|
+| device copies | 866, 16,181.4 MiB | 850, 15,718.5 MiB |
+| weights in two layouts | 16 (462.9 MiB) | 0 |
+
+The text is identical. Over six interleaved arms (trace off), prompt eval was 320.9, 308.4 and 306.2 tok/s before against 328.5,
+323.3 and 306.0 since, and decode 10.86 to 10.91 against 10.86 to 11.01: not slower, no gain claimed. `GGML_HRX_Q4K_PACKED_TAIL=1`
+(or `GGML_HRX_PREFILL_FOLLOWS_DECODE=0`) restores the fused kernel for Q4_K, `GGML_HRX_Q6K_PACKED_ROWS=0` the stored Q6_K binding.
+Before either, making decode step aside instead was measured and does not help:
 the same duplicates, and decode 8.5 % slower. flint UD-Q4_K_XL (routed experts) reads every weight stored and holds one copy per
 weight with or without the default.
+
+**Since pin `962507f8e` a short prompt holds no weight twice either** (llama.cpp #324, #325). At 6 to 8 tokens the few-token
+kernels took the batch and read the stored layout of weights that prefill reads in the packed rows, so a short prompt or a
+speculative verify batch of that size made a second copy. These weights now go to the packed kernels. A weight a GET_ROWS
+also reads (a tied embedding) can't be packed, so it stays on the few-token kernel. Qwen3-4B Q4_K_M, `llama-completion`, text
+identical per prompt:
+
+| prompt words | 1 | 3 | 5 | 6 | 8 | 10 | 14 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| device copies before | 398 | 398 | 398 | 611 | 611 | 398 | 398 |
+| device copies since | 398 | 398 | 398 | 398 | 398 | 398 | 398 |
+
+On the 27B a 6-word prompt goes from 898 copies to 850. It costs speed at those batch sizes: prompt eval at 6 tokens drops
+from about 202 to 136 tok/s, and at 8 from about 230 to 185. Speculative decode on Qwen3-4B with a Qwen3-0.6B draft drops
+19 % at a 6-token verify batch (55.5 to 45.2 tok/s) and 10 % at 8 (50.0 to 45.1). Single-token decode and batches of 9 or
+more tokens are unchanged. `GGML_HRX_Q4K_PACKED_TAIL=0 GGML_HRX_Q6K_PACKED_ROWS=0` (stored for every weight) brings the old
+rate back, along with the stored copies.
 
 `GGML_HRX_Q6K_PACKED_PREFILL=1`, the older switch, never saved a copy: its dispatch bound the stored layout. Off its kernel's wide
 tile (tokens not a multiple of 256, or outputs not a multiple of 128) it also read past the weight: a Q6_K matmul at 128 tokens with

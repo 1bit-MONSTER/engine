@@ -2126,7 +2126,8 @@ does on a geometry that has a sealed set: `Qwen3-1.7B-NPU2` is 3.0 tok/s here an
 | `Qwen3-VL-4B-Instruct-NPU2`, text tower only | `qwen3` | identical, `Paris` | 1.4 to 1.5 tok/s |
 | `Hy-MT2-1.8B-NPU2` | `hunyuan_v1_dense` | identical, `Paris`; 4 of 5 translations byte-identical to FastFlowLM's runtime (below) | 2.3 to 2.8 tok/s |
 | `LFM2.5-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | identical, `Paris`; against FastFlowLM's runtime below | 3.5 to 4.6 tok/s |
-| `LFM2-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | `Paris`; one request per prompt, against FastFlowLM's runtime below | 3.7 tok/s |
+| `LFM2-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | identical, `Paris`; against FastFlowLM's runtime below | 3.7 to 4.3 tok/s |
+| `LFM2.5-1.2B-Thinking-NPU2` | `lfm2`, hybrid, thinking | identical; `Paris` after 287 reasoning tokens, no clean stop (below) | 4.3 tok/s |
 
 `D3-Nano-NPU2` is a decision pack: it loads on the `Qwen3.5-2B` kernel set, its readout converts with
 `tools/safetensors_to_q4nx.py decision`, and `/v1/systemone` returned three identical answers to the documented
@@ -2181,13 +2182,19 @@ the gap "Per-op route" above describes.
 at the merged head of that change: two of five answers byte-identical (`Paris`; the count from one to ten), three
 that share 21, 58 and 53 characters with FastFlowLM's and then continue differently, each a fluent answer to the
 question (a Fibonacci function that returns `0` for `n <= 0` where theirs returns a message). Decode 3.7 tok/s
-against 42 to 47. Its logprobs at the three points were not taken, and it was asked each prompt once, so this row
-does not carry the three-identical-answers condition.
+against 42 to 47. Its logprobs at the three points were not taken. A later ticket at the merged code (main `1131acf0`) asked both
+packs the known-answer prompt three times each: `Paris`, identical, with decode at 4.2 to 4.3 tok/s; those four
+figures are records in `bench/npu-leaderboard/`.
 
-`LFM2.5-1.2B-Thinking-NPU2` loads on the same directory too: its template is read from the pack's
-`chat_template.jinja`, the reasoning is split out, and at 96 tokens every one of the five replies was still
-reasoning, so there is no answer text to compare and no row; the reasoning differs from FastFlowLM's from its
-first words.
+`LFM2.5-1.2B-Thinking-NPU2` serves on the same directory too: its template is read from the pack's
+`chat_template.jinja` and the reasoning is split out. Asked the known-answer prompt three times with 320 tokens
+of room, it reasoned for 287 tokens and then answered, the three replies identical in reasoning and content, at
+4.3 tok/s. The content begins `Paris` and does not end there: it goes on (`\boxed{Paris}`, then a restatement)
+until the token limit, so the row has the answer and not a clean stop. FastFlowLM's own runtime, given the same
+file, prompt and budget, returned no content at all: 320 tokens of reasoning that begin `Okay derivative of the
+function f(x) = x^2 + 3x - 4. Find its vertex.`, a problem nobody asked, the same on both of two requests. So
+on this pack the two runtimes' texts are not comparable and the row is not a parity row; it records that this
+route reasons about the question that was asked.
 
 **`Hy-MT2-1.8B-NPU2`: a third tile.** This pack's projections are stored 4,608 bytes to a tile where every
 other pack on the box uses 5,120, and no reader knew the size, so it was refused at the first dequant. The tile is

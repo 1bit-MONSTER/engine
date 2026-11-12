@@ -5286,6 +5286,31 @@ static void test_role_tables_disagree_nowhere() {
     // refusal plus per-tensor placement are two different answers, and both are correct.
     { std::string list; for (const auto& r : s.no_slot) list += r + " ";
       check(s.no_slot.size() == 5, "tables: five roles are refused at role granularity (got: " + list + ")"); }
+    // REVIEW of #2291, applied to myself: the real-container leg arms the table only where a pack is given, and CI runs
+    // with NO pack -- so before this, a wrong destination for any single role (o_proj, up_exps, ssm_conv1d …) was
+    // invisible in CI. Every layer-type-independent destination is pinned here, exactly.
+    {
+        const std::map<std::string, std::string> want = {
+            {"embed", "model.embed_tokens.weight"},        {"final_norm", "model.norm.weight"},
+            {"input_norm", "input_layernorm.weight"},      {"post_norm", "post_attention_layernorm.weight"},
+            {"lm_head", "lm_head.weight"},                 {"q_proj", "self_attn.q_proj.weight"},
+            {"k_proj", "self_attn.k_proj.weight"},         {"v_proj", "self_attn.v_proj.weight"},
+            {"o_proj", "self_attn.o_proj.weight"},         {"q_norm", "self_attn.q_norm.weight"},
+            {"k_norm", "self_attn.k_norm.weight"},         {"self_attn_gate_proj", "self_attn.gate_proj.weight"},
+            {"gate_proj", "mlp.gate_proj.weight"},         {"up_proj", "mlp.up_proj.weight"},
+            {"down_proj", "mlp.down_proj.weight"},         {"gate_exps", "mlp.gate_exps_proj.weight"},
+            {"up_exps", "mlp.up_exps_proj.weight"},        {"down_exps", "mlp.down_exps_proj.weight"},
+            {"shortconv_in_proj", "shortconv.in_proj.weight"}, {"per_layer_proj_norm", "model.per_layer_proj_norm.weight"},
+            {"moe_router", "moe_router.weight"},           {"share_gate_exps", "mlp.share_gate_exps_proj.weight"},
+            {"share_up_exps", "mlp.share_up_exps_proj.weight"}, {"share_down_exps", "mlp.share_down_exps_proj.weight"},
+            {"shared_expert_gate", "mlp.share_router.weight"},
+        };
+        for (const auto& kv : want) {
+            check(s.slot_of.count(kv.first) && s.slot_of.at(kv.first) == kv.second,
+                  "tables: " + kv.first + " -> " + kv.second + " (got: " +
+                      (s.slot_of.count(kv.first) ? s.slot_of.at(kv.first) : std::string("<absent>")) + ")");
+        }
+    }
     check(s.no_slot[0] == "container_extra" && s.no_slot[1] == "gate_up_proj" && s.no_slot[2] == "gemma_local" &&
           s.no_slot[3] == "qkv_proj" && s.no_slot[4] == "ssm",
           "tables: and they are exactly the pinned five, so a new refusal cannot slip in unnoticed");

@@ -3435,6 +3435,45 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
 // classifies as a bias of q_proj rather than as an unknown tensor, and a name that matches nothing lands in `unassigned`
 // with its own name rather than being guessed from its shape.
 // engine#1788, slice 3c step 1: (role, layer type), the key the writer needs. See the header for the measurement.
+PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
+                                  const std::vector<std::string>& layer_types) {
+    PlacementReport out;
+    const ContainerRoles roles = container_roles(tensors);
+    const RoleSlotReport table = container_role_slots(roles);
+    for (const auto& t : tensors) {
+        PlacementRow row;
+        row.tensor = t.name;
+        const auto it = roles.role_of.find(t.name);
+        if (it == roles.role_of.end()) { row.why = "no role recognised"; ++out.no_role; out.rows.push_back(row); continue; }
+        row.role = it->second;
+        std::string::size_type pos = t.name.find(".layers.");
+        std::string::size_type off = 8;
+        if (pos == std::string::npos) { pos = t.name.find(".layer."); off = 7; }
+        if (pos != std::string::npos) {
+            const std::string::size_type start = pos + off;
+            std::string::size_type end = start;
+            while (end < t.name.size() && t.name[end] >= '0' && t.name[end] <= '9') ++end;
+            if (end > start) {
+                const int64_t layer = std::atoll(t.name.substr(start, end - start).c_str());
+                row.layer = std::to_string(layer);
+                if (layer >= 0 && layer < int64_t(layer_types.size())) row.layer_type = layer_types[size_t(layer)];
+            }
+        }
+        row.slot = container_role_slot(row.role, row.layer_type);
+        if (row.slot.empty()) {
+            const auto why = table.why.find(row.role);
+            row.why = why != table.why.end() ? why->second
+                      : "the layer type does not give this role a destination";
+            ++out.unplaced;
+        } else {
+            ++out.placed;
+            ++out.slot_counts[row.slot];
+        }
+        out.rows.push_back(row);
+    }
+    return out;
+}
+
 RoleLayerReport container_role_layer_types(const std::vector<Q4nxTensor>& tensors,
                                            const std::vector<std::string>& layer_types) {
     RoleLayerReport out;

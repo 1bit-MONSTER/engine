@@ -3435,6 +3435,42 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
 // classifies as a bias of q_proj rather than as an unknown tensor, and a name that matches nothing lands in `unassigned`
 // with its own name rather than being guessed from its shape.
 // engine#1788, slice 3c step 1: (role, layer type), the key the writer needs. See the header for the measurement.
+// The two GROUP roles (ssm, gemma_local) carry several destinations each, and the destination is in the tensor's own
+// suffix. Two of gemma_local's seven stems have a slot in npu/forward/src -- the einsum-free `pre/post_feedforward_
+// layernorm` pair -- and the rest have none, so this table places exactly those two and leaves the others refused.
+// engine#1788, 3c: `ssm` is the other group, and unlike gemma_local the engine has a slot for EVERY member -- measured by
+// grepping npu/forward/src for the ssm family, whose literal names match the classifier's own needles one for one. This is
+// the 35B's largest bucket (210 tensors), so it is the placement's biggest single win.
+static const struct { const char* role; const char* needle; const char* slot; bool suffix_only; } kGroupSuffixSlots[] = {
+    {"gemma_local", "pre_feedforward_layernorm.weight",  "pre_feedforward_layernorm.weight",  true},
+    {"gemma_local", "post_feedforward_layernorm.weight", "post_feedforward_layernorm.weight", true},
+    {"ssm", "ssm_alpha_proj", "linear_attn.ssm_alpha_proj.weight", false},
+    {"ssm", "ssm_beta_proj",  "linear_attn.ssm_beta_proj.weight",  false},
+    {"ssm", "ssm_conv1d",     "linear_attn.ssm_conv1d.weight",     false},
+    {"ssm", "ssm_dt",         "linear_attn.ssm_dt.bias",           false},
+    {"ssm", "ssm_norm",       "linear_attn.ssm_norm.weight",       false},
+    {"ssm", "ssm_out_proj",   "linear_attn.ssm_out_proj.weight",   false},
+    // the `a` member has no `.weight` on either side, and its name is a PREFIX of `ssm_alpha_proj`, so it is matched as a
+    // suffix only -- a `find()` here would shadow alpha and beta, which is the substring defect in its exact form.
+    {"ssm", "ssm_a",  "linear_attn.ssm_a", true},
+    {"ssm", ".ssm.a", "linear_attn.ssm_a", true},
+};
+
+static std::string group_suffix_slot(const std::string& role, const std::string& tensor) {
+    for (const auto& kv : kGroupSuffixSlots) {
+        if (role != kv.role) continue;
+        const std::string suffix = kv.needle;
+        if (kv.suffix_only) {
+            if (tensor.size() >= suffix.size() &&
+                tensor.compare(tensor.size() - suffix.size(), suffix.size(), suffix) == 0)
+                return kv.slot;
+        } else if (tensor.find(suffix) != std::string::npos) {
+            return kv.slot;
+        }
+    }
+    return std::string();
+}
+
 PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
                                   const std::vector<std::string>& layer_types) {
     PlacementReport out;
@@ -3443,6 +3479,9 @@ PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
     for (const auto& t : tensors) {
         PlacementRow row;
         row.tensor = t.name;
+        std::string layer_prefix;
+        row.shape = t.shape;
+        row.dtype = t.dtype;
         const auto it = roles.role_of.find(t.name);
         if (it == roles.role_of.end()) { row.why = "no role recognised"; ++out.no_role; out.rows.push_back(row); continue; }
         row.role = it->second;
@@ -3456,10 +3495,20 @@ PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
             if (end > start) {
                 const int64_t layer = std::atoll(t.name.substr(start, end - start).c_str());
                 row.layer = std::to_string(layer);
+                layer_prefix = t.name.substr(0, end) + ".";
                 if (layer >= 0 && layer < int64_t(layer_types.size())) row.layer_type = layer_types[size_t(layer)];
             }
         }
         row.slot = container_role_slot(row.role, row.layer_type);
+        // a group role carries its destination in the tensor's own suffix -- the fourth key, applied where the engine
+        // actually has a slot for one of the group's members
+        if (row.slot.empty() && !row.layer_type.empty()) row.slot = group_suffix_slot(row.role, t.name);
+        // engine#1788, 3c: a per-layer slot must be LAYER-QUALIFIED or every layer collides on one destination (the
+        // collision check found 733 tensors pointing at 26 names). The prefix is the CONTAINER's own spelling through
+        // the layer digits, because model.c probes both -- "model.layers.%d.…" and "model.layer.%d.…" -- and MiniCPM
+        // uses the singular. Using the source's own prefix keeps the two agree without this code choosing a dialect.
+        if (row.role == "weight_scale") row.slot = t.name;   // a scale companion goes to its OWN name
+        else if (!row.slot.empty() && !row.layer.empty()) row.slot = layer_prefix + row.slot;
         if (row.slot.empty()) {
             const auto why = table.why.find(row.role);
             row.why = why != table.why.end() ? why->second
@@ -3542,23 +3591,43 @@ static const struct { const char* role; const char* slot; } kRoleSlots[] = {
     {"gate_proj",          "mlp.gate_proj.weight"},
     {"up_proj",            "mlp.up_proj.weight"},
     {"down_proj",          "mlp.down_proj.weight"},
-    {"gate_exps",          "mlp.experts.gate_proj.weight"},
-    {"up_exps",            "mlp.experts.up_proj.weight"},
-    {"down_exps",          "mlp.experts.down_proj.weight"},
+    {"gate_exps",          "mlp.gate_exps_proj.weight"},
+    {"up_exps",            "mlp.up_exps_proj.weight"},
+    {"down_exps",          "mlp.down_exps_proj.weight"},
     {"shortconv_in_proj",  "shortconv.in_proj.weight"},
+    {"per_layer_proj_norm","model.per_layer_proj_norm.weight"},
+    // engine#1788, 3c: I refused these two for two PRs on the strength of a grep that found only the rmsnorm debug LABEL
+    // ("q_norm"), and called them config fields. They are weight slots, and model.c names them explicitly:
+    //   "model.layer{s}.%d.self_attn.q_norm.weight"  /  "… .k_norm.weight"     (singular and plural both probed)
+    {"q_norm",             "self_attn.q_norm.weight"},
+    {"k_norm",             "self_attn.k_norm.weight"},
+    // engine#1788, 3c: the MoE names are FORMAT-DEPENDENT, and moe_container.h documents both conventions. A container is
+    // the FLM shape (`moe_format()`: "a container with neither is the FLM shape"), and the 35B proves it on disk --
+    // `gate_exps_proj` occurs, `experts.gate_proj` does NOT. So the destinations below are FLM spellings; the
+    // EngineConverter spellings (mlp.experts.*, mlp.gate.weight, mlp.shared_expert.*) are a different pack format.
+    {"moe_router",         "moe_router.weight"},
+    {"share_gate_exps",    "mlp.share_gate_exps_proj.weight"},
+    {"share_up_exps",      "mlp.share_up_exps_proj.weight"},
+    {"share_down_exps",    "mlp.share_down_exps_proj.weight"},
+    {"shared_expert_gate", "mlp.share_router.weight"},
 };
 
 // The roles this slice does NOT place, each with the reason. A number here is honest; a guessed slot is not.
 static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
     {"qkv_proj",            "the slot prefix is the LAYER TYPE's (`linear_attn.` or `self_attn.`), so it needs the second key"},
-    {"q_norm",              "the engine's normaliser slots are per-architecture; none is verified for this role yet"},
-    {"k_norm",              "same: the engine's `k_norm` string is a config field, not a verified weight slot"},
     {"gate_up_proj",        "fused in some containers, two slots in the engine; needs a measured split"},
-    {"moe_router",          "the engine reads `mlp.router.bias`; the weight slot is not verified"},
-    {"share_gate_exps",     "the shared expert's slots differ per architecture and none is verified"},
-    {"share_up_exps",       "same"},
-    {"share_down_exps",     "same"},
-    {"shared_expert_gate",  "same"},
+    // Measured on the real containers (35B: 210 tensors): `ssm` is not one destination but FOUR -- dt.bias, conv1d, norm
+    // and a, with four different shapes. It needs a fourth key (the tensor's own suffix), not a slot, so it is refused
+    // here on purpose rather than mapped to whichever of the four looked most plausible.
+    {"ssm",                 "the members this table does not match: the six that do map one for one onto linear_attn.ssm_* slots, so an unmatched one is a name not yet seen, not a destination that does not exist"},
+    // Measured on gemma3/gemma4/bolt. `gemma_local` is likewise a GROUP: pre/post_feedforward_layernorm (both of which DO
+    // have engine slots), inp_gate, layer_output_scale, per_layer_projection, post_layernorm and per_layer_model_proj.
+    // Refusing the group is honest; the three with slots need the suffix key to be told apart from the four without.
+    {"gemma_local",         "a group: pre/post_feedforward_layernorm have engine slots, inp_gate / layer_output_scale / per_layer_projection / post_layernorm / per_layer_model_proj do not -- separating them needs the suffix key"},
+    // Measured on gemma4/bolt. These ARE recognised and deliberately have no destination: `rope_freqs.weight` is a file the
+    // forward only FLAGS (model_config.h: has_rope_freqs_file) and the per-layer embeddings have no slot of their own.
+    {"dtype_variant",       "a dtype-tagged (`.bf16.`) copy of a weight the container also ships untagged; the engine has no `.bf16.` literal, so this copy has no destination and must not reach the untagged slot"},
+    {"container_extra",     "recognised so it is not a gap, and deliberately not written: a table the forward only flags (rope_freqs) or a per-layer embedding with no slot"},
 };
 
 // The layer types that are linear attention, as an EXACT set rather than a substring: the defect family this stack
@@ -3674,6 +3743,16 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
             role = "vision";
         else if (n.find("audio.") != std::string::npos)
             role = "audio";
+        // engine#1788, 3c: FIRST, before any needle table -- a `.scale` companion must never be filed as the weight it
+        // accompanies, and the `embed` rule matches `model.embed_tokens.weight.scale` by substring. This is the same
+        // ordering defect as `attn_q` vs `attn_q_norm` (engine#2097): the general rule ran before the specific one.
+        else if (n.size() > 6 && n.compare(n.size() - 6, 6, ".scale") == 0)
+            role = "weight_scale";
+        // engine#1788, 3c: a dtype-TAGGED companion (a `.bf16.` copy of a weight the engine also ships untagged). Same
+        // first-position rule as `.scale`, and the opposite outcome: the engine has no `.bf16.` literal at all, so this
+        // copy has no destination and must not reach the untagged slot -- which is what the 1B collision showed.
+        else if (n.find(".bf16.") != std::string::npos)
+            role = "dtype_variant";
         if (role.empty()) {
             bool matched = false;
             for (const auto& r : kRules) {
@@ -3685,6 +3764,13 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
             // "never inside a layer" has to be spelled positively enough to survive the container's own naming:
             // MiniCPM-V 4.7 spells its blocks `model.layer.N.` (singular), so a guard against "layers." alone filed
             // 30 per-layer linear_attn.ssm_norm tensors as final_norm -- ahead of the kSsm loop below (engine#1788).
+            // engine#1788, 3c: a `.scale` companion is NOT the weight it accompanies, and the engine reads it by its own
+            // name -- "model.embed_tokens.weight.scale" is a literal in npu/forward. Filed as `embed` it would be written
+            // over the embedding, or its scales where the embedding belongs, with no error. Matched first.
+            // and `per_layer_proj_norm` has its own top-level slot; it is not the model's final norm.
+            if (!matched && role.empty() && n.find("per_layer_proj_norm") != std::string::npos) {
+                role = "per_layer_proj_norm"; matched = true;
+            }
             if (!matched && n.find("norm.weight") != std::string::npos && n.find("layers.") == std::string::npos &&
                 n.find("layer.") == std::string::npos)
                 role = "final_norm";   // `model.norm.weight`: the top-level norm, never inside a layer

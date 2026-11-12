@@ -40,6 +40,7 @@
 #include "q4nx.h"
 #include "q4nx_device.h"
 
+#include <set>
 #include <nlohmann/json.hpp>
 
 #include <unistd.h>
@@ -5179,6 +5180,188 @@ void test_container_role_layer_types() {
 
 // engine#1788, 3c: the writer iterates TENSORS, not roles, so the placement has to answer per tensor and use that
 // tensor's own layer type. The arm that matters is the pair: the same role lands in two different places on two layers.
+// engine#1788, 3c: the same decision driven by a REAL container. The pack leg gates on model.onnx, so a container
+// (model.q4nx) could never reach the placement above; this reads the container with the shipped reader and reports the
+// three counts, so the numbers in a PR body are measured on the five containers rather than on the synthetic fixture.
+static void test_container_placement_real(const std::string& dir, const std::vector<std::string>& layer_types) {
+    using namespace onebit::npu::pack_import;
+    const Q4nxContainer c = read_q4nx_container(dir + "/model.q4nx");
+    const PlacementReport r = container_placement(c.tensors, layer_types);
+    std::printf("placement: %s -> put %lld, held %lld, unnamed %lld (of %zu tensors)\n", dir.c_str(),
+                (long long)r.placed, (long long)r.unplaced, (long long)r.no_role, c.tensors.size());
+    std::map<std::string, int64_t> held_by_reason;
+    for (const auto& row : r.rows) if (row.slot.empty()) held_by_reason[row.why]++;
+    for (const auto& kv : held_by_reason) std::printf("    held: %lld x %s\n", (long long)kv.second, kv.first.c_str());
+    std::map<std::string, int64_t> roles_seen;
+    for (const auto& row : r.rows) if (!row.role.empty()) roles_seen[row.role]++;
+    // REVIEW of #2291 direction: the engine documents a rank and a dtype per slot (model.h), and both are
+    // architecture-independent -- a router that is 3-D or an expert that is BF16 is wrong for every model.
+    {
+        // Two source tensors reaching one destination is silent data loss: the pack carries one, the forward reads the
+        // other. This check is what caught the placement being non-writable (733 tensors / 26 names) and then all three
+        // mapping classes: a `.scale` companion filed as its weight, per_layer_proj_norm filed as the final norm, and the
+        // 1B's `.bf16.` copies reaching the untagged slot.
+        std::map<std::string, int> per_slot;
+        for (const auto& row : r.rows) if (!row.slot.empty()) per_slot[row.slot]++;
+        std::vector<std::string> dup;
+        for (const auto& kv : per_slot) if (kv.second > 1) dup.push_back(kv.first);
+        std::string dl;
+        for (const auto& d : dup) dl += d + " ";
+        check(per_slot.size() == size_t(r.placed),
+              "placement: every placed tensor has its own destination in " + dir + " (" + dl + ")");
+    }
+    {
+        std::map<std::string, std::string> seen;
+        for (const auto& row : r.rows) {
+            if (row.slot.empty() || seen.count(row.slot)) continue;
+            std::string sh = "[";
+            for (size_t i = 0; i < row.shape.size(); ++i) sh += (i ? "," : "") + std::to_string(row.shape[i]);
+            sh += "]";
+            seen[row.slot] = sh + " " + row.dtype;
+            std::printf("    slot %-42s %s %s\n", row.slot.c_str(), sh.c_str(), row.dtype.c_str());
+        }
+    }
+    // The rank and dtype are architecture-independent even though the extents are not: model.h documents the router as a
+    // 2-D BF16 tensor and the expert stacks as 3-D I8. A placement that reached the right NAME with the wrong shape would
+    // load a tensor the forward reads as something else, so these are asserted per placed row on the real container.
+    for (const auto& row : r.rows) {
+        if (row.slot.empty()) continue;
+        if (row.slot == "moe_router.weight") {
+            check(row.shape.size() == 2, "placement: the router is 2-D in " + dir);
+            check(row.dtype == "BF16", "placement: and BF16 in " + dir);
+        }
+        if (row.slot.find("exps_proj") != std::string::npos) {
+            check(row.shape.size() == 3, "placement: an expert stack is 3-D (" + row.slot + ") in " + dir);
+            check(row.dtype == "I8", "placement: and I8 (" + row.slot + ") in " + dir);
+        }
+    }
+    std::printf("    roles:"); for (const auto& kv : roles_seen) std::printf(" %s=%lld", kv.first.c_str(), (long long)kv.second);
+    std::printf("\n");
+    std::printf("    UNKNOWN:");
+    for (const auto& kv : held_by_reason) if (kv.first.find("does not know") != std::string::npos) {
+        for (const auto& row : r.rows) if (row.slot.empty() && row.why == kv.first && !row.role.empty()) {
+            std::printf(" %s", row.role.c_str()); break; }
+    }
+    std::printf("\n");
+    check(r.placed + r.unplaced + r.no_role == int64_t(c.tensors.size()), std::string("placement: accounts for every tensor in ") + dir);
+    // REVIEW of #2291: the result this PR exists for -- an empty unknown bucket on a real container -- was printed and
+    // never checked, so a removed refusal entry still exited 0. Now it fails where it happens, with the role named.
+    std::set<std::string> unknown;
+    for (const auto& row : r.rows)
+        if (!row.slot.empty() || row.role.empty()) continue;
+        else if (row.why.find("does not know") != std::string::npos) unknown.insert(row.role);
+    std::string names;
+    for (const auto& u : unknown) names += (names.empty() ? "" : ", ") + u;
+    check(unknown.empty(), std::string("placement: no role is unknown to the table in ") + dir + " (" + names + ")");
+}
+
+// REVIEW of #2291 named a hazard that review caught and code should catch: during one edit this file briefly held two
+// role->destination tables with the SAME keys and DIFFERENT values, and container_role_slot() would have returned
+// whichever came first. The observable invariant is that no role is both placed and refused -- asserted here once, over
+// the whole report, so a duplicated or contradictory entry fails without needing a real container.
+static void test_role_tables_disagree_nowhere() {
+    using namespace onebit::npu::pack_import;
+    ContainerRoles r;
+    for (const char* role : {"embed", "final_norm", "input_norm", "post_norm", "lm_head", "q_proj", "k_proj", "v_proj",
+                             "o_proj", "q_norm", "k_norm", "self_attn_gate_proj", "gate_proj", "up_proj", "down_proj",
+                             "gate_up_proj", "qkv_proj", "moe_router", "gate_exps", "up_exps", "down_exps",
+                             "share_gate_exps", "share_up_exps", "share_down_exps", "shared_expert_gate",
+                             "shortconv_in_proj", "ssm", "gemma_local", "container_extra"})
+        r.counts[role] = 1;
+    const RoleSlotReport s = container_role_slots(r);
+    for (const auto& kv : s.slot_of) {
+        check(!s.why.count(kv.first), "tables: " + kv.first + " is not both placed and refused");
+    }
+    check(s.placed.size() + s.no_slot.size() == r.counts.size(), "tables: every role is in exactly one bucket");
+    // the MoE destinations must be the CONTAINER spelling; the EngineConverter one is a different pack format
+    check(s.slot_of.count("gate_exps") && s.slot_of.at("gate_exps") == "mlp.gate_exps_proj.weight",
+          "tables: the routed gate is the FLM spelling, not mlp.experts.*");
+    check(s.slot_of.count("moe_router") && s.slot_of.at("moe_router") == "moe_router.weight",
+          "tables: the router is moe_router.weight, not mlp.gate.weight");
+    // two refusals are correct and both are about the SECOND KEY, not about a missing slot: qkv_proj needs the layer type,
+    // gate_up_proj needs a measured split. Anything else appearing here is a regression, so the set is pinned exactly.
+    // Five refusals, and the mix is the point: two are about the SECOND KEY (qkv_proj needs the layer type,
+    // gate_up_proj needs a measured split) and three are GROUP roles (ssm, gemma_local, container_extra) which have no
+    // single destination at role granularity even though their members are placed per tensor by suffix. Role-level
+    // refusal plus per-tensor placement are two different answers, and both are correct.
+    { std::string list; for (const auto& r : s.no_slot) list += r + " ";
+      check(s.no_slot.size() == 5, "tables: five roles are refused at role granularity (got: " + list + ")"); }
+    // REVIEW of #2291, applied to myself: the real-container leg arms the table only where a pack is given, and CI runs
+    // with NO pack -- so before this, a wrong destination for any single role (o_proj, up_exps, ssm_conv1d …) was
+    // invisible in CI. Every layer-type-independent destination is pinned here, exactly.
+    {
+        const std::map<std::string, std::string> want = {
+            {"embed", "model.embed_tokens.weight"},        {"final_norm", "model.norm.weight"},
+            {"input_norm", "input_layernorm.weight"},      {"post_norm", "post_attention_layernorm.weight"},
+            {"lm_head", "lm_head.weight"},                 {"q_proj", "self_attn.q_proj.weight"},
+            {"k_proj", "self_attn.k_proj.weight"},         {"v_proj", "self_attn.v_proj.weight"},
+            {"o_proj", "self_attn.o_proj.weight"},         {"q_norm", "self_attn.q_norm.weight"},
+            {"k_norm", "self_attn.k_norm.weight"},         {"self_attn_gate_proj", "self_attn.gate_proj.weight"},
+            {"gate_proj", "mlp.gate_proj.weight"},         {"up_proj", "mlp.up_proj.weight"},
+            {"down_proj", "mlp.down_proj.weight"},         {"gate_exps", "mlp.gate_exps_proj.weight"},
+            {"up_exps", "mlp.up_exps_proj.weight"},        {"down_exps", "mlp.down_exps_proj.weight"},
+            {"shortconv_in_proj", "shortconv.in_proj.weight"}, {"per_layer_proj_norm", "model.per_layer_proj_norm.weight"},
+            {"moe_router", "moe_router.weight"},           {"share_gate_exps", "mlp.share_gate_exps_proj.weight"},
+            {"share_up_exps", "mlp.share_up_exps_proj.weight"}, {"share_down_exps", "mlp.share_down_exps_proj.weight"},
+            {"shared_expert_gate", "mlp.share_router.weight"},
+        };
+        for (const auto& kv : want) {
+            check(s.slot_of.count(kv.first) && s.slot_of.at(kv.first) == kv.second,
+                  "tables: " + kv.first + " -> " + kv.second + " (got: " +
+                      (s.slot_of.count(kv.first) ? s.slot_of.at(kv.first) : std::string("<absent>")) + ")");
+        }
+    }
+    check(s.no_slot[0] == "container_extra" && s.no_slot[1] == "gate_up_proj" && s.no_slot[2] == "gemma_local" &&
+          s.no_slot[3] == "qkv_proj" && s.no_slot[4] == "ssm",
+          "tables: and they are exactly the pinned five, so a new refusal cannot slip in unnoticed");
+}
+
+// REVIEW of #2291: the `.scale` branch and its ORDERING were both unarmed -- deleting the branch left every arm green,
+// even though its own comment says the cost is a pack that writes scales over the embedding with no error. These arms
+// fail if the branch is deleted AND if it is moved inside the needle loop, which is the refactor that would restore the
+// defect silently.
+static void test_scale_and_proj_norm_roles() {
+    using pi::Q4nxTensor;
+    const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "BF16"; return x; };
+
+    // 1. the classifier: a .scale companion is its own role, not the weight it accompanies
+    {
+        const std::vector<Q4nxTensor> v = {t("model.embed_tokens.weight"), t("model.embed_tokens.weight.scale")};
+        const pi::ContainerRoles r = pi::container_roles(v);
+        check(r.role_of.at("model.embed_tokens.weight") == "embed", "scale: the embedding is still the embedding");
+        check(r.role_of.at("model.embed_tokens.weight.scale") == "weight_scale",
+              "scale: the .scale companion is NOT filed as embed");
+    }
+    // 2. the destination: identity, and it is a literal the forward reads
+    {
+        const std::vector<Q4nxTensor> v = {t("model.embed_tokens.weight"), t("model.embed_tokens.weight.scale")};
+        const pi::PlacementReport p = pi::container_placement(v, {});
+        check(p.rows[1].slot == "model.embed_tokens.weight.scale",
+              "scale: its destination is its OWN name, which q4nx_forward reads");
+        check(p.rows[0].slot != p.rows[1].slot, "scale: and it does not collide with the embedding");
+    }
+    // 3. the ordering, as a negative: nothing ending .scale may be placed under a WEIGHT role's slot
+    {
+        const std::vector<Q4nxTensor> v = {t("model.layers.0.mlp.down_proj.weight"),
+                                           t("model.layers.0.mlp.down_proj.weight.scale")};
+        const pi::PlacementReport p = pi::container_placement(v, {"full_attention"});
+        check(p.rows[1].role == "weight_scale", "scale: a per-layer companion is weight_scale too");
+        check(p.rows[1].slot == "model.layers.0.mlp.down_proj.weight.scale",
+              "scale: identity, so it cannot land in the down_proj slot");
+        check(p.rows[0].slot == "model.layers.0.mlp.down_proj.weight", "scale: and the weight keeps its own slot");
+    }
+    // 4. per_layer_proj_norm is not the model's final norm (same class, one level simpler)
+    {
+        const std::vector<Q4nxTensor> v = {t("model.norm.weight"), t("model.per_layer_proj_norm.weight")};
+        const pi::ContainerRoles r = pi::container_roles(v);
+        check(r.role_of.at("model.norm.weight") == "final_norm", "proj_norm: model.norm is the final norm");
+        check(r.role_of.at("model.per_layer_proj_norm.weight") == "per_layer_proj_norm",
+              "proj_norm: per_layer_proj_norm is NOT the final norm");
+        const pi::PlacementReport p = pi::container_placement(v, {});
+        check(p.rows[1].slot == "model.per_layer_proj_norm.weight", "proj_norm: and it has its own top-level slot");
+    }
+}
+
 void test_container_placement() {
     using pi::Q4nxTensor;
     const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
@@ -5198,14 +5381,44 @@ void test_container_placement() {
           "placement: placed + unplaced + no-role accounts for every tensor");
     check(r.rows[0].slot == "model.embed_tokens.weight", "placement: a tensor with no layer still gets a slot");
     check(r.rows[0].layer.empty() && r.rows[0].layer_type.empty(), "placement: and reports that it has no layer");
-    check(r.rows[1].slot == "linear_attn.qkv_proj.weight", "placement: the fused qkv on the LINEAR layer");
+    check(r.rows[1].slot == "model.layers.0.linear_attn.qkv_proj.weight", "placement: the fused qkv on the LINEAR layer, layer-qualified");
     check(r.rows[2].slot.empty(), "placement: the same role on the FULL-attention layer has no destination");
     check(r.rows[2].why.size() > 10, "placement: and says why");
-    check(r.rows[3].slot == "self_attn.q_proj.weight", "placement: the query projection is layer-type-independent");
+    check(r.rows[3].slot == "model.layers.1.self_attn.q_proj.weight", "placement: the query projection is layer-type-independent, layer-qualified");
     check(r.rows[4].slot.empty() && r.rows[4].role == "gate_up_proj", "placement: gate_up_proj is still refused");
     check(r.rows[5].slot.empty() && r.rows[5].role.empty(), "placement: a tensor with no role is counted apart");
     check(r.no_role == 1, "placement: no_role counts the vocabulary gap, not the deliberate refusal");
     check(r.unplaced == 2, "placement: unplaced counts the two decisions, not the vocabulary gap");
+    {
+        // REVIEW of #2291: the containers' whole role vocabulary, no pack needed, because CI runs this binary with no
+        // pack. A role that reaches the "this table does not know" default, or a reason that is a bare placeholder, is a
+        // hole -- and this arm is what makes removing a refusal entry fail in CI rather than print UNKNOWN on the box.
+        pi::ContainerRoles roles_c;
+        for (const char* role : {"ssm", "gemma_local", "container_extra", "gate_up_proj", "dtype_variant"})
+            roles_c.counts[role] = 1;
+        const pi::RoleSlotReport slots_c = pi::container_role_slots(roles_c);
+        for (const auto& kv : slots_c.why) {
+            check(kv.second.find("does not know") == std::string::npos,
+                  "slots: the table explains " + kv.first + " rather than defaulting it");
+            check(kv.second.rfind("same", 0) != 0 && kv.second != "same",
+                  "slots: and the reason for " + kv.first + " is a reason, not a placeholder");
+            check(kv.second.size() > 20, "slots: and it is long enough to be one (" + kv.first + ")");
+        }
+    }
+    {
+        // the group roles: the destination is the tensor's own suffix, and only the members the engine has a slot for move
+        const std::vector<Q4nxTensor> g = {
+            t("model.layers.0.pre_feedforward_layernorm.weight"),
+            t("model.layers.0.post_feedforward_layernorm.weight"),
+            t("model.layers.0.inp_gate.weight"),
+        };
+        const pi::PlacementReport gr = pi::container_placement(g, lt);
+        check(gr.rows[0].role == "gemma_local", "placement: the gemma group is one role");
+        check(gr.rows[0].slot == "model.layers.0.pre_feedforward_layernorm.weight", "placement: the suffix IS the destination (pre), layer-qualified");
+        check(gr.rows[1].slot == "model.layers.0.post_feedforward_layernorm.weight", "placement: and for post, layer-qualified");
+        check(gr.rows[2].slot.empty(), "placement: a member with no engine slot stays unplaced");
+        check(gr.placed == 2 && gr.unplaced == 1, "placement: two placed, one held, for the three members");
+    }
 }
 
 void test_container_roles_moe_and_singular_layer() {
@@ -6273,7 +6486,7 @@ static void test_container_role_slots() {
         r.counts["q_proj"] = 1; r.counts["gate_exps"] = 1; r.counts["input_norm"] = 1;
         const RoleSlotReport s = container_role_slots(r);
         check(s.slot_of.at("q_proj") == "self_attn.q_proj.weight", "slots: the attention query projection");
-        check(s.slot_of.at("gate_exps") == "mlp.experts.gate_proj.weight", "slots: the routed gate is the expert gate");
+        check(s.slot_of.at("gate_exps") == "mlp.gate_exps_proj.weight", "slots: the routed gate, in the CONTAINER (FLM) spelling");
         check(s.slot_of.at("input_norm") == "input_layernorm.weight", "slots: the pre-attention norm");
         check(s.no_slot.empty(), "slots: three placed roles leave nothing unexplained");
     }
@@ -6391,6 +6604,16 @@ int main(int argc, char** argv) {
         test_container_roles_gemma_local();
         test_container_roles_moe_and_singular_layer();
         test_container_placement();
+        test_scale_and_proj_norm_roles();
+        test_role_tables_disagree_nowhere();
+        if (argc > 4) {
+            std::vector<std::string> lt;
+            std::string all = argv[4];
+            std::string cur;
+            for (char ch : all) { if (ch == ',') { lt.push_back(cur); cur.clear(); } else cur += ch; }
+            if (!cur.empty()) lt.push_back(cur);
+            test_container_placement_real(argv[3], lt);
+        }
         test_container_role_slots();
         test_container_role_layer_types();
         test_container_plan(golden_dir.empty() ? "." : golden_dir);

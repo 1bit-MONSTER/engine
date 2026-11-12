@@ -179,6 +179,46 @@ void test_sampler() {
     check(sample(three, SampleParams(), 1, &mask) == 2, "greedy still honors the mask");
 }
 
+// sample_probs() is what sample_token() draws from (engine#1781: a speculative round checks drafts against it, so a
+// mismatch would bias a sampled reply): for each set of parameters the draw's frequencies over 200000 seeded draws
+// sit within 0.01 total variation of sample_probs(), every id it zeroes is never drawn, the row sums to 1, ids past
+// the tokenizer's bound get no entry, and greedy parameters give the argmax's one-hot.
+void test_sample_probs() {
+    const std::vector<float> lg = {1.0f, 2.5f, 0.3f, 2.4f, -1.0f, 0.9f, 1.7f, 0.0f, 2.0f, -0.5f, 3.0f, 2.9f};
+    struct Case { const char* name; float t; int k; float tp; };
+    const Case cases[] = {{"temperature 0.8", 0.8f, 0, 1.0f},
+                          {"temperature 1.3, top_k 4", 1.3f, 4, 1.0f},
+                          {"temperature 0.7, top_p 0.8", 0.7f, 0, 0.8f},
+                          {"temperature 1, top_k 6, top_p 0.9", 1.0f, 6, 0.9f}};
+    for (const Case& cs : cases) {
+        SampleParams p;
+        p.temperature = cs.t;
+        p.top_k = cs.k;
+        p.top_p = cs.tp;
+        const int bound = 10;   // the last two ids (the two largest logits but one) are padding
+        const std::vector<float> q = onebit::npu::sample_probs(lg.data(), lg.size(), p, bound);
+        double total = 0;
+        for (float v : q) total += v;
+        std::vector<double> f(lg.size(), 0.0);
+        std::mt19937_64 rng(1781);
+        const int N = 200000;
+        for (int i = 0; i < N; i++) f[size_t(sample_token(lg, p, rng, nullptr, bound))] += 1.0 / N;
+        double tv = 0;
+        bool zero_never = true;
+        for (size_t i = 0; i < q.size(); i++) {
+            tv += std::fabs(f[i] - q[i]);
+            if (q[i] == 0.0f && f[i] > 0.0) zero_never = false;
+        }
+        tv /= 2;
+        std::printf("    sample_probs %-36s tv %.4f\n", cs.name, tv);
+        check(q.size() == size_t(bound) && std::fabs(total - 1.0) < 1e-5,
+              std::string("sample_probs covers the bounded row and sums to 1: ") + cs.name);
+        check(tv < 0.01 && zero_never, std::string("sample_token draws what sample_probs says: ") + cs.name);
+    }
+    const std::vector<float> g = onebit::npu::sample_probs(lg.data(), lg.size(), SampleParams(), 10);
+    check(g.size() == 10 && g[1] == 1.0f, "sample_probs at greedy is the bounded argmax's one-hot");
+}
+
 // The draw has to match the distribution the logits define.  Temperature divides logits
 // and never probabilities: when the top_p stage wrote probabilities back over the logits,
 // the draw ran on exp(probability), which is flat to within e^-1, so a token llama.cpp
@@ -393,7 +433,7 @@ void test_logprobs() {
     // Two candidates, logits 0 and ln 2: probabilities 1/3 and 2/3.
     const double ln2 = std::log(2.0);
     const std::vector<float> logits = {0.0f, float(ln2)};
-    const auto lp = logprobs_of(logits, 1, 2);
+    const auto lp = logprobs_of(logits, 0, 1, 2);
     check(lp.id == 1, "logprobs report the id that was drawn");
     check(std::fabs(lp.logprob - float(std::log(2.0 / 3.0))) < 1e-6f,
           "the drawn token's log-probability is log 2/3");
@@ -403,7 +443,7 @@ void test_logprobs() {
     check(std::fabs(lp.top[1].logprob - float(std::log(1.0 / 3.0))) < 1e-6f, "the second entry carries log 1/3");
 
     // A flat vocabulary: every token is -log(N), and top_logprobs 0 asks for no alternatives.
-    const auto flat = logprobs_of(std::vector<float>(8, 1.5f), 3, 0);
+    const auto flat = logprobs_of(std::vector<float>(8, 1.5f), 0, 3, 0);
     check(std::fabs(flat.logprob - float(std::log(1.0 / 8.0))) < 1e-6f, "a flat vocabulary gives -log N");
     check(flat.top.empty(), "top_logprobs 0 reports no alternatives");
 
@@ -427,21 +467,45 @@ void test_logprobs() {
         check(!padding_reported, "a padded row: no id at or past the vocabulary appears in top_logprobs");
     }
 
-    const auto tied = logprobs_of(std::vector<float>{1.0f, 1.0f, 1.0f}, 0, 2);
+    const auto tied = logprobs_of(std::vector<float>{1.0f, 1.0f, 1.0f}, 0, 0, 2);
     check(tied.top.size() == 2 && tied.top[0].id == 0 && tied.top[1].id == 1, "ties keep the lower id first");
 
+    // engine#2272: a head WIDER than the tokenizer (Qwen3: 151,669 ids against 151,936 rows). The row carries logits for
+    // ids the vocabulary does not have; they must not join the normaliser, and they must not be nameable in `top`.
+    {
+        const std::vector<float> padded = {1.0f, 2.0f, 0.5f, /* padding: */ 9.0f, 9.0f, 9.0f};
+        const int vocab = 3;
+        const auto bounded = logprobs_of(padded.data(), token_bound(padded.size(), vocab), 1, 2);
+        const auto unbounded = logprobs_of(padded.data(), padded.size(), 1, 2);
+        const double m = 2.0, lz = m + std::log(std::exp(1.0 - m) + 1.0 + std::exp(0.5 - m));
+        check(std::fabs(double(bounded.logprob) - (2.0 - lz)) < 1e-6,
+              "a padded row's logprob is the softmax over the VOCABULARY, not over the padding");
+        check(std::fabs(double(unbounded.logprob) - double(bounded.logprob)) > 1e-3,
+              "...which differs from the unbounded computation, so this was visible, not cosmetic");
+        check(bounded.top.size() == 2 && bounded.top[0].id == 1 && bounded.top[1].id == 0,
+              "...and `top` names only real ids, in the sampler's tie order");
+        bool padding_in_top = false;
+        for (const auto& e : bounded.top) padding_in_top = padding_in_top || e.id >= vocab;
+        check(!padding_in_top, "...no padding id (3..5) appears in top_logprobs");
+        // The vector overload takes the bound as a required argument (no form of it can forget the cut).
+        const auto whole = logprobs_of(padded, vocab, 1, 2);
+        check(whole.logprob == bounded.logprob && whole.top.size() == 2 && whole.top[0].id == 1 &&
+                  whole.top[1].id == 0 && whole.top[0].logprob == bounded.top[0].logprob,
+              "the vector overload cuts at the vocabulary it is given, as the pointer form with token_bound does");
+    }
+
     // More alternatives than the vocabulary reports what exists.
-    check(logprobs_of(logits, 1, 100).top.size() == 2, "top_n past the vocabulary reports all of it");
+    check(logprobs_of(logits, 0, 1, 100).top.size() == 2, "top_n past the vocabulary reports all of it");
 
     // The grammar mask can put the drawn token outside the top list, and it still carries its own
     // value: this is the "before penalties and constraints" convention, measured.
-    const auto masked = logprobs_of(std::vector<float>{5.0f, 0.0f}, 1, 1);
+    const auto masked = logprobs_of(std::vector<float>{5.0f, 0.0f}, 0, 1, 1);
     check(masked.top.size() == 1 && masked.top[0].id == 0, "top_logprobs is the raw distribution, mask-free");
     check(masked.logprob < masked.top[0].logprob, "a masked-in token reports its own, lower value");
 
     // Degenerate inputs are reported, never fatal.
-    check(logprobs_of({}, 0, 4).top.empty(), "an empty vocabulary reports nothing");
-    check(logprobs_of(logits, -1, 1).logprob == 0.0f, "an id outside the vocabulary reports zero");
+    check(logprobs_of(std::vector<float>{}, 0, 0, 4).top.empty(), "an empty vocabulary reports nothing");
+    check(logprobs_of(logits, 0, -1, 1).logprob == 0.0f, "an id outside the vocabulary reports zero");
 }
 
 void test_logprob_options() {
@@ -1280,6 +1344,7 @@ int main() {
     test_vocab_bound();
     test_sampler();
     test_sampler_distribution();
+    test_sample_probs();
     test_stop();
     test_json_grammar();
     test_gbnf();

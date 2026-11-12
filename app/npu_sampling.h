@@ -91,31 +91,13 @@ inline size_t token_bound(size_t width, int vocab) {
     return (vocab > 0 && size_t(vocab) < width) ? size_t(vocab) : width;
 }
 
-// Draw one token from `logits`.  `allowed`, when given, is a per-token mask (non-zero =
-// the grammar accepts the token); a mask with nothing set is refused with -1 and the
-// caller reports it rather than decoding an unconstrained token.  `vocab` is the
-// tokenizer's size (token_bound): ids at or past it are never drawn, with or without a mask.
-inline int sample_token(const std::vector<float>& logits, const SampleParams& p, std::mt19937_64& rng,
-                        const std::vector<char>* allowed = nullptr, int vocab = 0) {
-    const size_t n = token_bound(logits.size(), vocab);
-    std::vector<Candidate> c;
-    c.reserve(n);
-    for (size_t i = 0; i < n; i++) {
-        if (allowed && !(*allowed)[i]) continue;
-        c.push_back({logits[i], int(i)});
-    }
-    if (c.empty()) return -1;
-    // A higher logit wins; equal logits keep the lower id so the same seed always draws
-    // the same token.
+// What sample_token() draws from when it samples: `c` (the candidates it kept from the logits, a mask applied) is cut by
+// top_k and top_p and each survivor's `logit` is replaced by its weight exp((logit - max) / temperature); the total is
+// returned. A draw is the first candidate whose running weight reaches u * total. Not for greedy parameters.
+inline double sampling_weights(std::vector<Candidate>& c, const SampleParams& p) {
     auto better = [](const Candidate& a, const Candidate& b) {
         return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
     };
-
-    if (p.greedy()) {
-        // Exactly the argmax the route used before sampling existed.
-        return std::min_element(c.begin(), c.end(), better)->id;
-    }
-
     // top_k: keep the k highest logits (llama.cpp llama_sampler_top_k_impl).
     if (p.top_k > 0 && size_t(p.top_k) < c.size()) {
         std::partial_sort(c.begin(), c.begin() + p.top_k, c.end(), better);
@@ -158,6 +140,35 @@ inline int sample_token(const std::vector<float>& logits, const SampleParams& p,
         x.logit = float(std::exp(double(x.logit - max_l) / double(p.temperature)));
         sum += x.logit;
     }
+    return sum;
+}
+
+// Draw one token from `logits`.  `allowed`, when given, is a per-token mask (non-zero =
+// the grammar accepts the token); a mask with nothing set is refused with -1 and the
+// caller reports it rather than decoding an unconstrained token.  `vocab` is the
+// tokenizer's size (token_bound): ids at or past it are never drawn, with or without a mask.
+inline int sample_token(const std::vector<float>& logits, const SampleParams& p, std::mt19937_64& rng,
+                        const std::vector<char>* allowed = nullptr, int vocab = 0) {
+    const size_t n = token_bound(logits.size(), vocab);
+    std::vector<Candidate> c;
+    c.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        if (allowed && !(*allowed)[i]) continue;
+        c.push_back({logits[i], int(i)});
+    }
+    if (c.empty()) return -1;
+    // A higher logit wins; equal logits keep the lower id so the same seed always draws
+    // the same token.
+    auto better = [](const Candidate& a, const Candidate& b) {
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+    };
+
+    if (p.greedy()) {
+        // Exactly the argmax the route used before sampling existed.
+        return std::min_element(c.begin(), c.end(), better)->id;
+    }
+
+    const double sum = sampling_weights(c, p);
     std::uniform_real_distribution<double> dist(0.0, 1.0);
     const double target = sum * dist(rng);
     double run = 0.0;
@@ -166,6 +177,29 @@ inline int sample_token(const std::vector<float>& logits, const SampleParams& p,
         if (run >= target) return x.id;
     }
     return c.back().id;
+}
+
+// The distribution sample_token() draws from, as one probability per id of the bounded row: zero for every id that
+// top_k or top_p cut, w / total for the rest (sampling_weights). Greedy parameters give the one-hot of the argmax. No
+// mask: this is what a speculative round checks a draft against (npu/mtp/draft.h RowSampler, engine#1781), and that
+// round never runs under a grammar.
+inline std::vector<float> sample_probs(const float* logits, size_t width, const SampleParams& p, int vocab = 0) {
+    const size_t n = token_bound(width, vocab);
+    std::vector<float> out(n, 0.0f);
+    if (n == 0) return out;
+    if (p.greedy()) {
+        size_t best = 0;
+        for (size_t i = 1; i < n; i++)
+            if (logits[i] > logits[best]) best = i;
+        out[best] = 1.0f;
+        return out;
+    }
+    std::vector<Candidate> c;
+    c.reserve(n);
+    for (size_t i = 0; i < n; i++) c.push_back({logits[i], int(i)});
+    const double sum = sampling_weights(c, p);
+    for (const auto& x : c) out[size_t(x.id)] = float(double(x.logit) / sum);
+    return out;
 }
 
 // The greedy id of one logits row of `width` floats, bounded like sample_token(): a higher
@@ -198,18 +232,17 @@ struct TokenLogprob {
 // is why this is computed from the untouched logits rather than inside the sampler's filtered
 // candidate set.  Top entries are the highest raw logits, with the sampler's tie rule (lower id
 // first), so the same seed and request always report the same list.
-// `vocab` is the tokenizer's bound and MUST be passed whenever `logits` may be wider than it: a
-// padded head stores rows past the vocabulary (engine#2026 -- Qwen3: 151,936 rows against 151,669
-// ids), and those rows are not tokens. Normalising over them shifts every reported logprob by the
-// padding's mass, which is model-dependent rather than a constant, and invisible to any comparison
-// between two paths that share this helper (engine#2272). The bound also keeps padding ids out of
-// the `top_logprobs` list, where an id the tokenizer does not have would otherwise appear.
-inline TokenLogprob logprobs_of(const std::vector<float>& logits, int vocab, int chosen, int top_n) {
+// `n` is the tokenizer's bound and MUST be cut whenever the row may be wider than it: a padded head
+// stores rows past the vocabulary (engine#2026 -- Qwen3: 151,936 rows against 151,669 ids), and those
+// rows are not tokens. Normalising over them shifts every reported logprob by the padding's mass,
+// which is model-dependent rather than a constant, and invisible to any comparison between two paths
+// that share this helper (engine#2272). The bound also keeps padding ids out of `top`. A caller passes
+// token_bound(width, vocab), the cut sample_token() makes; the speculative loop hands its rows this way
+// (engine#1781).
+inline TokenLogprob logprobs_of(const float* logits, size_t n, int chosen, int top_n) {
     TokenLogprob out;
     out.id = chosen;
-    if (logits.empty()) return out;
-    const size_t n = token_bound(logits.size(), vocab);
-    if (n == 0) return out;
+    if (!logits || n == 0) return out;
     // log-sum-exp in double: exp() of a float logit and then log() of the sum loses the tail that
     // top_logprobs is read for.
     float max_l = logits[0];
@@ -233,11 +266,10 @@ inline TokenLogprob logprobs_of(const std::vector<float>& logits, int vocab, int
     for (size_t i = 0; i < k; i++) out.top.push_back({c[i].id, float(double(c[i].logit) - log_z)});
     return out;
 }
-
-// For a row that is exactly the vocabulary (no padding ids). A padded row must use the overload
-// above with the tokenizer's bound; this form is what a test or a non-padded model wants.
-inline TokenLogprob logprobs_of(const std::vector<float>& logits, int chosen, int top_n) {
-    return logprobs_of(logits, int(logits.size()), chosen, top_n);
+// A whole row with the tokenizer's size, cut as sample_token() cuts it (token_bound: 0 means the row is the vocabulary).
+// The bound is not optional, so a caller holding a padded head's row cannot reach an unbounded form (engine#2272).
+inline TokenLogprob logprobs_of(const std::vector<float>& logits, int vocab, int chosen, int top_n) {
+    return logprobs_of(logits.data(), token_bound(logits.size(), vocab), chosen, top_n);
 }
 
 // The bytes a decoder must hold back before it can be sure no stop sequence straddles

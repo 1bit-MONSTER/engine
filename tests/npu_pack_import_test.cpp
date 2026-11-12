@@ -5246,7 +5246,7 @@ void test_container_placement() {
         // pack. A role that reaches the "this table does not know" default, or a reason that is a bare placeholder, is a
         // hole -- and this arm is what makes removing a refusal entry fail in CI rather than print UNKNOWN on the box.
         pi::ContainerRoles roles_c;
-        for (const char* role : {"ssm", "gemma_local", "container_extra", "q_norm", "k_norm", "gate_up_proj"})
+        for (const char* role : {"ssm", "gemma_local", "container_extra", "gate_up_proj"})
             roles_c.counts[role] = 1;
         const pi::RoleSlotReport slots_c = pi::container_role_slots(roles_c);
         for (const auto& kv : slots_c.why) {

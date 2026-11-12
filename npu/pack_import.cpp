@@ -3585,6 +3585,11 @@ static const struct { const char* role; const char* slot; } kRoleSlots[] = {
     {"up_exps",            "mlp.up_exps_proj.weight"},
     {"down_exps",          "mlp.down_exps_proj.weight"},
     {"shortconv_in_proj",  "shortconv.in_proj.weight"},
+    // engine#1788, 3c: I refused these two for two PRs on the strength of a grep that found only the rmsnorm debug LABEL
+    // ("q_norm"), and called them config fields. They are weight slots, and model.c names them explicitly:
+    //   "model.layer{s}.%d.self_attn.q_norm.weight"  /  "… .k_norm.weight"     (singular and plural both probed)
+    {"q_norm",             "self_attn.q_norm.weight"},
+    {"k_norm",             "self_attn.k_norm.weight"},
     // engine#1788, 3c: the MoE names are FORMAT-DEPENDENT, and moe_container.h documents both conventions. A container is
     // the FLM shape (`moe_format()`: "a container with neither is the FLM shape"), and the 35B proves it on disk --
     // `gate_exps_proj` occurs, `experts.gate_proj` does NOT. So the destinations below are FLM spellings; the
@@ -3599,8 +3604,6 @@ static const struct { const char* role; const char* slot; } kRoleSlots[] = {
 // The roles this slice does NOT place, each with the reason. A number here is honest; a guessed slot is not.
 static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
     {"qkv_proj",            "the slot prefix is the LAYER TYPE's (`linear_attn.` or `self_attn.`), so it needs the second key"},
-    {"q_norm",              "the engine's normaliser slots are per-architecture; none is verified for this role yet"},
-    {"k_norm",              "the engine's `k_norm` is a config field, not a verified weight slot (the q_norm case again)"},
     {"gate_up_proj",        "fused in some containers, two slots in the engine; needs a measured split"},
     // Measured on the real containers (35B: 210 tensors): `ssm` is not one destination but FOUR -- dt.bias, conv1d, norm
     // and a, with four different shapes. It needs a fourth key (the tensor's own suffix), not a slot, so it is refused

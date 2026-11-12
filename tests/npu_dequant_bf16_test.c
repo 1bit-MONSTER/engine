@@ -505,11 +505,21 @@ static void d2560_chunks(void) {
         for (int col = 0; col < 128; col++) {
             const int e = 120 + ((col / 32) * 32 + r) % 11;
             float p = 1.0f;
-            for (int n = e - 128; n < 0; n++) p *= 0.5f;
-            for (int n = e - 128; n > 0; n--) p *= 2.0f;
+            for (int n = e - 127; n < 0; n++) p *= 0.5f;
+            for (int n = e - 127; n > 0; n--) p *= 2.0f;
             if (out[r * 128 + col] != lut[d2560_code_at(m, r, col)] * p) bad++;
         }
-    check(bad == 0, "mx2560: E2M1 code (same order) * 2^(e - 128), e at g*32 + r; bytes 128..511 unread");
+    check(bad == 0, "mx2560: E2M1 code (same order) * 2^(e - 127), e at g*32 + r; bytes 128..511 unread");
+    /* the bias, against ggml's own reading of one value: e = 127 and code 2 (E2M1 1.0) is weight 1.0, which ggml
+     * writes as kvalues_fp4[2] = 2 times GGML_E8M0_TO_FP32_HALF(127) = 0.5 */
+    {
+        uint8_t one[Q4NX_CHUNK_D2560];
+        memset(one, 0, sizeof one);
+        one[0] = 127;                 /* row 0, group 0 */
+        one[512] = 2;                 /* row 0, column 0: low nibble 2 = E2M1 1.0 */
+        q4nx_dequant_chunk_mx2560(one, out, 128);
+        check(out[0] == 1.0f, "mx2560: E8M0 bias 127 (e = 127, E2M1 1.0 -> 1.0, as ggml's 2 * 2^(127-128))");
+    }
 
     /* a [RB=2, CB=2, S=2, 2560] tensor: rows rb*S*32 + s*32 + r, columns cb*128 + c, clipped and padded */
     const int RB = 2, CB = 2, S = 2, rows = 100, k = 200, cols = 256;

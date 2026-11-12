@@ -236,11 +236,13 @@ int q4nx_dequant_tensor_wide(const uint8_t* data, size_t nbytes, int chunk_bytes
 static const float kE2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
                                 -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
-/* 2^(e - 128), exact (powers of two halve and double without rounding), with no libm */
+/* E8M0 (OCP MX): 2^(e - 127), exact (powers of two halve and double without rounding), with no libm.  ggml writes the
+ * same value as kvalues_fp4 (the E2M1 table doubled) * 2^(e - 128); reading the table undoubled with bias 128 halves
+ * every expert, which a comparison against a reader with the same slip cannot see. */
 static inline float e8m0_scale(uint8_t e) {
     float p = 1.0f;
-    for (int n = (int)e - 128; n > 0; n--) p *= 2.0f;
-    for (int n = (int)e - 128; n < 0; n++) p *= 0.5f;
+    for (int n = (int)e - 127; n > 0; n--) p *= 2.0f;
+    for (int n = (int)e - 127; n < 0; n++) p *= 0.5f;
     return p;
 }
 

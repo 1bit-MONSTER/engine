@@ -2012,6 +2012,13 @@ endif()
     target_link_libraries(layer_taps_model_test PRIVATE onebit_npu_forward)
     add_dependencies(npu_sampling_test layer_taps_model_test)
     add_test(NAME layer_taps_model COMMAND layer_taps_model_test)
+    # engine#1781: a fully accepted verify batch keeps its own state, and it equals the restore + replay path, bit for
+    # bit. Host-GEMM, no device; skips (77) unless ONEBIT_TEST_Q4NX names a causal model with GDN layers.
+    add_executable(commit_full_accept_test tests/commit_full_accept_test.cpp)
+    target_include_directories(commit_full_accept_test PRIVATE npu/forward/include)
+    target_link_libraries(commit_full_accept_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test commit_full_accept_test)
+    add_test(NAME commit_full_accept COMMAND commit_full_accept_test)
     # engine#1905: the NPU_BATCH_CHECK oracle restores the prefix it replays from instead of resetting it, so a chunk
     # at start_pos > 0 is compared (and then run) from the state the batched pass continues. Host-GEMM, no device;
     # skips (77) unless ONEBIT_TEST_Q4NX names a container. This is the dev-box row (the private runtime, a real
@@ -2058,6 +2065,7 @@ endif()
     set_tests_properties(mtp_batch_all PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(gdn_batch_order PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(layer_taps_model PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(commit_full_accept PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(batch_check_state PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source

@@ -48,7 +48,11 @@ recipe against the launch:
 | `gguf_keys` | every listed GGUF metadata key is present in the `-m` file (for example `prism.hadamard.version`, which PrismML's Hadamard-folded files carry and Qwen3.8 files do not) |
 
 A key that is left out matches anything. A matching recipe adds each flag in `args`, with the
-values after it, unless the backend's command line already has that flag. So whatever serve
+values after it, unless the backend's command line already has that flag. For `-ub` and `-b` it also
+skips the long form (`--ubatch-size`, `--batch-size`) and the environment variable llama-server reads
+for it (`LLAMA_ARG_UBATCH`, `LLAMA_ARG_BATCH`), because llama-server applies its environment first and
+its command line after: a recipe's `-ub` would otherwise replace the micro-batch a user set in the
+environment. So whatever serve
 sets itself, including from the command line (`--mtp-p-min`, `--mmproj`'s micro-batch), wins.
 It adds each variable in `env` unless it is already set. Serve prints what it added:
 
@@ -76,6 +80,11 @@ flag, and the prefill micro-batch:
 | `qwen35-mtp-max-3` | `hrx`, `qwen35`, drafter `mtp` | `--spec-draft-n-max 3` (what serve's `--mtp-max 3` passes) | 32.6 / 26.9 / 28.0 tok/s; acceptance falls to 0.17-0.60 past 7 drafts, so do not raise it |
 | `hrx-graph-program-cache-128` | `hrx`, `qwen4exp` | `GGML_HRX_GRAPH_PROGRAM_CACHE=128` | Flash-Next's decode graph needs 66 programs against a default limit of 64 (933 and 779 trims in two 40-minute 18.8k runs), and one program that is not resident costs 41 ms (44-1584 nodes, warm, flat in graph size): ~4 ms/step at the observed ~1 trim per 10 steps, ~41 ms/step if it were 1 per step. The tok/s row itself is not measured - the 76.33 GiB file needs the whole box |
 | `qwen4exp-hrx-ub2048` | `hrx`, `qwen4exp` | `-ub 2048` | product path pp4096 205.05 vs 101.05 tok/s at `-ub 512` (2.03x; UD-IQ4_XS, ctx 16384, one library), pp512 183.76 vs 133.38; `llama-bench` on UD-IQ3_XXS pp4096 548.94 vs 343.71 (1.60x), pp512 tied (703 vs 710). The routed expert GEMMs are 34 % of prefill device time and see about 10 rows per expert at 512 (10 of 512 experts per token). Scoped to `qwen4exp`: Qwen3-Coder-30B-A3B loses 12 % at pp512 with 2048, and dense models are fastest at 512 |
+
+llama.cpp caps the micro-batch at the batch (`n_ubatch = min(n_batch, n_ubatch)`), so
+`qwen4exp-hrx-ub2048` takes effect only at a batch of 2048 or more. That is llama-server's default,
+and serve sets no `-b` for a chat model; a `LLAMA_ARG_BATCH` below 2048 in the environment lowers it
+without a message.
 
 Both carry their full `measured` line in `config/recipes.json`. Older recipes were measured on build
 RFC #213 stage 3 removed: `rotated-moe-ub1024` and `rocm-dflash-p-min-0.4` (the lean ROCm build). New

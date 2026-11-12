@@ -37,6 +37,30 @@ bool is_flag(const std::string& t) {
     return t.size() > 1 && t[0] == '-' && !std::isdigit(static_cast<unsigned char>(t[1])) && t[1] != '.';
 }
 
+// The llama-server flags a recipe sets that have other spellings: the long form, and the environment
+// variable llama-server reads for it (common/arg.cpp). llama-server applies the environment first and its
+// command line after, so a recipe flag on the command line would replace a value the user set as
+// LLAMA_ARG_UBATCH (engine #572: serve has no -ub option of its own, so the environment is how a user picks it).
+struct FlagSpelling { const char* flag; const char* long_flag; const char* env; };
+constexpr FlagSpelling kFlagSpellings[] = {
+    {"-ub", "--ubatch-size", "LLAMA_ARG_UBATCH"},
+    {"-b", "--batch-size", "LLAMA_ARG_BATCH"},
+};
+
+bool env_has(const std::vector<std::string>& env, const std::string& name) {
+    return std::getenv(name.c_str()) != nullptr ||
+           std::any_of(env.begin(), env.end(), [&](const std::string& e) { return e.rfind(name + "=", 0) == 0; });
+}
+
+// True when the backend already has `flag`: on its command line in any spelling, or in the environment.
+bool flag_set(const std::string& flag, const std::vector<std::string>& argv, const std::vector<std::string>& env) {
+    auto on_argv = [&](const std::string& f) { return std::find(argv.begin(), argv.end(), f) != argv.end(); };
+    if (on_argv(flag)) return true;
+    for (const auto& s : kFlagSpellings)
+        if (flag == s.flag || flag == s.long_flag) return on_argv(s.flag) || on_argv(s.long_flag) || env_has(env, s.env);
+    return false;
+}
+
 std::vector<std::string> strings(const nlohmann::json& j, const char* key, const std::string& id) {
     if (!j.is_array()) throw std::runtime_error("recipe " + id + ": " + key + " is not a list");
     std::vector<std::string> out;
@@ -131,7 +155,7 @@ std::vector<std::string> Recipes::apply(const RecipeFacts& f, std::vector<std::s
         for (size_t i = 0; i < r.args.size();) {
             size_t j = i + 1;
             while (j < r.args.size() && !is_flag(r.args[j])) ++j;
-            if (std::find(argv.begin(), argv.end(), r.args[i]) == argv.end()) {
+            if (!flag_set(r.args[i], argv, env)) {
                 for (size_t k = i; k < j; ++k) {
                     argv.push_back(r.args[k]);
                     added += (added.empty() ? "" : " ") + r.args[k];
@@ -140,9 +164,7 @@ std::vector<std::string> Recipes::apply(const RecipeFacts& f, std::vector<std::s
             i = j;
         }
         for (const auto& [name, value] : r.env) {
-            const bool set = std::getenv(name.c_str()) != nullptr ||
-                             std::any_of(env.begin(), env.end(), [&](const std::string& e) { return e.rfind(name + "=", 0) == 0; });
-            if (set) continue;
+            if (env_has(env, name)) continue;
             env.push_back(name + "=" + value);
             added += (added.empty() ? "" : " ") + name + "=" + value;
         }

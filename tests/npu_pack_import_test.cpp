@@ -5291,6 +5291,52 @@ static void test_role_tables_disagree_nowhere() {
           "tables: and they are exactly the pinned five, so a new refusal cannot slip in unnoticed");
 }
 
+// REVIEW of #2291: the `.scale` branch and its ORDERING were both unarmed -- deleting the branch left every arm green,
+// even though its own comment says the cost is a pack that writes scales over the embedding with no error. These arms
+// fail if the branch is deleted AND if it is moved inside the needle loop, which is the refactor that would restore the
+// defect silently.
+static void test_scale_and_proj_norm_roles() {
+    using pi::Q4nxTensor;
+    const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "BF16"; return x; };
+
+    // 1. the classifier: a .scale companion is its own role, not the weight it accompanies
+    {
+        const std::vector<Q4nxTensor> v = {t("model.embed_tokens.weight"), t("model.embed_tokens.weight.scale")};
+        const pi::ContainerRoles r = pi::container_roles(v);
+        check(r.role_of.at("model.embed_tokens.weight") == "embed", "scale: the embedding is still the embedding");
+        check(r.role_of.at("model.embed_tokens.weight.scale") == "weight_scale",
+              "scale: the .scale companion is NOT filed as embed");
+    }
+    // 2. the destination: identity, and it is a literal the forward reads
+    {
+        const std::vector<Q4nxTensor> v = {t("model.embed_tokens.weight"), t("model.embed_tokens.weight.scale")};
+        const pi::PlacementReport p = pi::container_placement(v, {});
+        check(p.rows[1].slot == "model.embed_tokens.weight.scale",
+              "scale: its destination is its OWN name, which q4nx_forward reads");
+        check(p.rows[0].slot != p.rows[1].slot, "scale: and it does not collide with the embedding");
+    }
+    // 3. the ordering, as a negative: nothing ending .scale may be placed under a WEIGHT role's slot
+    {
+        const std::vector<Q4nxTensor> v = {t("model.layers.0.mlp.down_proj.weight"),
+                                           t("model.layers.0.mlp.down_proj.weight.scale")};
+        const pi::PlacementReport p = pi::container_placement(v, {"full_attention"});
+        check(p.rows[1].role == "weight_scale", "scale: a per-layer companion is weight_scale too");
+        check(p.rows[1].slot == "model.layers.0.mlp.down_proj.weight.scale",
+              "scale: identity, so it cannot land in the down_proj slot");
+        check(p.rows[0].slot == "model.layers.0.mlp.down_proj.weight", "scale: and the weight keeps its own slot");
+    }
+    // 4. per_layer_proj_norm is not the model's final norm (same class, one level simpler)
+    {
+        const std::vector<Q4nxTensor> v = {t("model.norm.weight"), t("model.per_layer_proj_norm.weight")};
+        const pi::ContainerRoles r = pi::container_roles(v);
+        check(r.role_of.at("model.norm.weight") == "final_norm", "proj_norm: model.norm is the final norm");
+        check(r.role_of.at("model.per_layer_proj_norm.weight") == "per_layer_proj_norm",
+              "proj_norm: per_layer_proj_norm is NOT the final norm");
+        const pi::PlacementReport p = pi::container_placement(v, {});
+        check(p.rows[1].slot == "model.per_layer_proj_norm.weight", "proj_norm: and it has its own top-level slot");
+    }
+}
+
 void test_container_placement() {
     using pi::Q4nxTensor;
     const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
@@ -6533,6 +6579,7 @@ int main(int argc, char** argv) {
         test_container_roles_gemma_local();
         test_container_roles_moe_and_singular_layer();
         test_container_placement();
+        test_scale_and_proj_norm_roles();
         test_role_tables_disagree_nowhere();
         if (argc > 4) {
             std::vector<std::string> lt;

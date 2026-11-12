@@ -3438,18 +3438,35 @@ std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
 // The two GROUP roles (ssm, gemma_local) carry several destinations each, and the destination is in the tensor's own
 // suffix. Two of gemma_local's seven stems have a slot in npu/forward/src -- the einsum-free `pre/post_feedforward_
 // layernorm` pair -- and the rest have none, so this table places exactly those two and leaves the others refused.
-static const struct { const char* role; const char* suffix; const char* slot; } kGroupSuffixSlots[] = {
-    {"gemma_local", "pre_feedforward_layernorm.weight",  "pre_feedforward_layernorm.weight"},
-    {"gemma_local", "post_feedforward_layernorm.weight", "post_feedforward_layernorm.weight"},
+// engine#1788, 3c: `ssm` is the other group, and unlike gemma_local the engine has a slot for EVERY member -- measured by
+// grepping npu/forward/src for the ssm family, whose literal names match the classifier's own needles one for one. This is
+// the 35B's largest bucket (210 tensors), so it is the placement's biggest single win.
+static const struct { const char* role; const char* needle; const char* slot; bool suffix_only; } kGroupSuffixSlots[] = {
+    {"gemma_local", "pre_feedforward_layernorm.weight",  "pre_feedforward_layernorm.weight",  true},
+    {"gemma_local", "post_feedforward_layernorm.weight", "post_feedforward_layernorm.weight", true},
+    {"ssm", "ssm_alpha_proj", "linear_attn.ssm_alpha_proj.weight", false},
+    {"ssm", "ssm_beta_proj",  "linear_attn.ssm_beta_proj.weight",  false},
+    {"ssm", "ssm_conv1d",     "linear_attn.ssm_conv1d.weight",     false},
+    {"ssm", "ssm_dt",         "linear_attn.ssm_dt.bias",           false},
+    {"ssm", "ssm_norm",       "linear_attn.ssm_norm.weight",       false},
+    {"ssm", "ssm_out_proj",   "linear_attn.ssm_out_proj.weight",   false},
+    // the `a` member has no `.weight` on either side, and its name is a PREFIX of `ssm_alpha_proj`, so it is matched as a
+    // suffix only -- a `find()` here would shadow alpha and beta, which is the substring defect in its exact form.
+    {"ssm", "ssm_a",  "linear_attn.ssm_a", true},
+    {"ssm", ".ssm.a", "linear_attn.ssm_a", true},
 };
 
 static std::string group_suffix_slot(const std::string& role, const std::string& tensor) {
     for (const auto& kv : kGroupSuffixSlots) {
         if (role != kv.role) continue;
-        const std::string suffix = kv.suffix;
-        if (tensor.size() >= suffix.size() &&
-            tensor.compare(tensor.size() - suffix.size(), suffix.size(), suffix) == 0)
+        const std::string suffix = kv.needle;
+        if (kv.suffix_only) {
+            if (tensor.size() >= suffix.size() &&
+                tensor.compare(tensor.size() - suffix.size(), suffix.size(), suffix) == 0)
+                return kv.slot;
+        } else if (tensor.find(suffix) != std::string::npos) {
             return kv.slot;
+        }
     }
     return std::string();
 }
@@ -3584,7 +3601,7 @@ static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
     // Measured on the real containers (35B: 210 tensors): `ssm` is not one destination but FOUR -- dt.bias, conv1d, norm
     // and a, with four different shapes. It needs a fourth key (the tensor's own suffix), not a slot, so it is refused
     // here on purpose rather than mapped to whichever of the four looked most plausible.
-    {"ssm",                 "one role covering dt.bias, conv1d, norm and a -- four destinations with four shapes, so it needs the tensor's own suffix"},
+    {"ssm",                 "the members this table does not match: the six that do map one for one onto linear_attn.ssm_* slots, so an unmatched one is a name not yet seen, not a destination that does not exist"},
     // Measured on gemma3/gemma4/bolt. `gemma_local` is likewise a GROUP: pre/post_feedforward_layernorm (both of which DO
     // have engine slots), inp_gate, layer_output_scale, per_layer_projection, post_layernorm and per_layer_model_proj.
     // Refusing the group is honest; the three with slots need the suffix key to be told apart from the four without.

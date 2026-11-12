@@ -440,21 +440,37 @@ size_t Q4nxNpuForward::StateSnapshot::bytes() const {
     return n;
 }
 
+// engine#1780: the floats one position adds to layer l's K (and V) cache. attention() appends n_kv_heads * head_dim
+// of the layer's own geometry, which on a model with two attention geometries (Gemma4: QKV2 on the full layers,
+// 2 x 512, against 2 x 256 on the sliding ones) is not NKV * HD on every layer. Every place that turns positions into
+// cache floats -- snapshot, restore, a verify's rollback, extend_context -- goes through this.
+std::vector<size_t> Q4nxNpuForward::kv_widths() const {
+    const size_t base = size_t(c_.NKV) * size_t(c_.HD);
+    std::vector<size_t> w((size_t)std::max(c_.NL, 0), base);
+    const int i_qkv2 = idx_of(Q4NX_DESIGN_QKV2);
+    if (i_qkv2 < 0 || designs_[i_qkv2].k_rows <= 0) return w;
+    for (int l = 0; l < c_.NL; l++) {
+        const int lt = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
+        if (lt != Q4NX_LAYER_SLIDING) w[(size_t)l] = (size_t)designs_[i_qkv2].k_rows;   // as step(): QKV2 on a full layer
+    }
+    return w;
+}
+
 bool Q4nxNpuForward::snapshot_state(int tokens, StateSnapshot& out) const {
     if (!ready_ || tokens <= 0) return false;
     const size_t per = size_t(c_.NKV) * size_t(c_.HD);
-    size_t held = 0;  // positions the KV caches hold (a layer that shares its KV holds none)
-    for (const auto& layer : kcache_) held = std::max(held, layer.size() / per);
+    const std::vector<size_t> widths = kv_widths();
+    // positions the KV caches hold, each plane counted in its own row width (a layer that shares its KV holds none)
+    const size_t held = q4nx_state::held_positions(kcache_, widths);
     if (size_t(tokens) > held) return false;
     out.tokens = tokens;
     out.per_pos = per;
-    const size_t want = size_t(tokens) * per;
     // KV is per position, so a snapshot of the first `tokens` positions keeps exactly that many; the GDN conv
     // window and recurrent state are fixed-size blocks updated per position, so they go in whole.  Cutting them
     // with `want` truncated them (23 % of the recurrent plane at 180 tokens) and made restore_state refuse the
     // snapshot -- the prefix cache's `slot has no usable state`, which cost a full re-prefill on every request.
-    q4nx_state::take_per_pos(kcache_, out.k, want);
-    q4nx_state::take_per_pos(vcache_, out.v, want);
+    q4nx_state::take_per_pos(kcache_, out.k, widths, size_t(tokens));
+    q4nx_state::take_per_pos(vcache_, out.v, widths, size_t(tokens));
     q4nx_state::take_whole(conv_state_, out.conv);
     q4nx_state::take_whole(rec_state_, out.rec);
     return true;
@@ -464,12 +480,12 @@ bool Q4nxNpuForward::restore_state(const StateSnapshot& in, int tokens) {
     if (!ready_ || tokens <= 0 || tokens > in.tokens) return false;
     const size_t per = size_t(c_.NKV) * size_t(c_.HD);
     if (in.per_pos != per) return false;
-    const size_t want = size_t(tokens) * per;
+    const std::vector<size_t> widths = kv_widths();
     // Same split as snapshot_state: KV is restored per position (a layer whose KV is shared carries none of its
     // own, so an empty plane leaves the destination empty rather than filling it with the owner's), and the GDN
     // planes are restored whole -- refusing a truncated one instead of installing it short.
-    if (!q4nx_state::give_per_pos(in.k, kcache_, want)) return false;
-    if (!q4nx_state::give_per_pos(in.v, vcache_, want)) return false;
+    if (!q4nx_state::give_per_pos(in.k, kcache_, widths, size_t(tokens))) return false;
+    if (!q4nx_state::give_per_pos(in.v, vcache_, widths, size_t(tokens))) return false;
     if (!q4nx_state::give_whole(in.conv, conv_state_)) return false;
     if (!q4nx_state::give_whole(in.rec, rec_state_)) return false;
     return true;
@@ -490,8 +506,9 @@ void Q4nxNpuForward::reset() {
 bool Q4nxNpuForward::extend_context(int n_tokens) {
     if (!ready_ || n_tokens <= 0) return false;
     if (kcache_.empty() || vcache_.empty()) return false;
-    const size_t per = (size_t)c_.NKV * (size_t)c_.HD;   // floats per layer per token
+    const std::vector<size_t> widths = kv_widths();   // floats per token, per layer (engine#1780)
     for (int l = 0; l < c_.NL; l++) {
+        const size_t per = widths[(size_t)l];
         kcache_[l].reserve(kcache_[l].size() + (size_t)n_tokens * per);
         vcache_[l].reserve(vcache_[l].size() + (size_t)n_tokens * per);
         kcache_[l].insert(kcache_[l].end(), (size_t)n_tokens * per, 0.0f);
@@ -2967,12 +2984,10 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
         expect_rec = rec_state_;
         expect_conv = conv_state_;
     }
-    const size_t per = (size_t)c_.NKV * (size_t)c_.HD;
-    const size_t keep = (size_t)(verify_pos_ + accepted) * per;
-    for (size_t l = 0; l < kcache_.size(); l++) {
-        if (!kcache_[l].empty() && kcache_[l].size() > keep) kcache_[l].resize(keep);
-        if (!vcache_[l].empty() && vcache_[l].size() > keep) vcache_[l].resize(keep);
-    }
+    // Each plane in its own row width (engine#1780): one width cut a two-geometry model's wide planes at half.
+    const std::vector<size_t> widths = kv_widths();
+    q4nx_state::keep_positions(kcache_, widths, (size_t)(verify_pos_ + accepted));
+    q4nx_state::keep_positions(vcache_, widths, (size_t)(verify_pos_ + accepted));
     // A full accept keeps the state the batch's own recurrence left: that is the state the restore + replay would
     // rebuild (NPU_REPLAY_CHECK holds the two equal), so the restore and the replay are skipped. On the served 27B
     // they are 11 ms + 7 ms per row, 67 ms of an 8-row round. NPU_COMMIT_FULL_REPLAY=1 keeps them, for an A/B.
@@ -4294,6 +4309,82 @@ bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int sta
     return step_batch(placeholder, start_pos, logits);
 }
 
+bool Q4nxNpuForward::gemma4_tail_rows(int l, int M, const std::vector<float>& ple_rows, std::vector<float>& X) {
+    const int H = c_.H;
+    if (ple_dim_ > 0) {
+        // x = x + post_per_layer_input_norm(per_layer_projection(act(per_layer_input_gate(x)) * per_layer_input[l]))
+        const int i_pg = idx_of(Q4NX_DESIGN_PLEGATE);
+        const int i_pp = idx_of(Q4NX_DESIGN_PLEPROJ);
+        if (i_pg < 0 || i_pp < 0) { err_ = "batch: the PLE gate/projection designs are missing"; return false; }
+        const Q4nxDesignGeom* gg = &designs_[i_pg];
+        const Q4nxDesignGeom* gp = &designs_[i_pp];
+        const size_t w = (size_t)c_.NL * (size_t)ple_dim_;
+        if (ple_rows.size() < (size_t)M * w) { err_ = "batch: per-layer inputs short"; return false; }
+        // The gate reads the residual stream; the activation rows go at the stride npu_gemm_rows walks.
+        const int sg = onebit::npu::row_stride(gg->real_k, gg->K);
+        if (sg < H) { err_ = "batch: the PLE gate's K is narrower than the hidden size"; return false; }
+        std::vector<float> a_g((size_t)M * (size_t)sg, 0.0f), pg, pp;
+        for (int m = 0; m < M; m++)
+            std::copy(X.begin() + (ptrdiff_t)((size_t)m * H), X.begin() + (ptrdiff_t)((size_t)(m + 1) * H),
+                      a_g.begin() + (ptrdiff_t)((size_t)m * sg));
+        {
+            Q4nxProjections p{};
+            p.ple = inp_gate_[l].data();
+            if (!weight_cached(onebit::npu::kWkeyPleGate) && q4nx_assemble_B(gg, &p, B_.data()) != 0) {
+                err_ = "assemble plegate"; return false;
+            }
+            npu_gemm_rows(i_pg, a_g.data(), M, gg->K, gg->N, B_.data(), pg, onebit::npu::kWkeyPleGate, "ple_gate",
+                          gg->real_k);
+        }
+        if (pg.size() < (size_t)M * (size_t)gg->N || !err_.empty()) {
+            if (err_.empty()) err_ = "batch: the PLE gate returned short";
+            return false;
+        }
+        const int sp = onebit::npu::row_stride(gp->real_k, gp->K);
+        if (sp < ple_dim_ || gg->N < ple_dim_) { err_ = "batch: the PLE widths do not fit the designs"; return false; }
+        std::vector<float> a_p((size_t)M * (size_t)sp, 0.0f);
+        const int gelu = (sem_.mlp_act == Q4NX_ACT_GELU);
+        for (int m = 0; m < M; m++) {
+            const float* g = pg.data() + (size_t)m * gg->N;
+            const float* in = ple_rows.data() + (size_t)m * w + (size_t)l * ple_dim_;
+            float* dst = a_p.data() + (size_t)m * sp;
+            for (int i = 0; i < ple_dim_; i++) {
+                float a;
+                if (gelu) {
+                    const float cc = 0.7978845608028654f;
+                    a = 0.5f * g[i] * (1.0f + std::tanh(cc * (g[i] + 0.044715f * g[i] * g[i] * g[i])));
+                } else {
+                    a = g[i] / (1.0f + std::exp(-g[i]));
+                }
+                dst[i] = a * in[i];
+            }
+        }
+        {
+            Q4nxProjections p{};
+            p.ple = ple_proj_[l].data();
+            if (!weight_cached(onebit::npu::kWkeyPleProj) && q4nx_assemble_B(gp, &p, B_.data()) != 0) {
+                err_ = "assemble pleproj"; return false;
+            }
+            npu_gemm_rows(i_pp, a_p.data(), M, gp->K, gp->N, B_.data(), pp, onebit::npu::kWkeyPleProj, "ple_proj",
+                          gp->real_k);
+        }
+        if (pp.size() < (size_t)M * (size_t)gp->N || gp->N < H || !err_.empty()) {
+            if (err_.empty()) err_ = "batch: the PLE projection returned short";
+            return false;
+        }
+        std::vector<float> xn((size_t)H);
+        for (int m = 0; m < M; m++) {
+            rmsnorm(pp.data() + (size_t)m * gp->N, post_ln_[l].data(), H, xn.data());
+            for (int k = 0; k < H; k++) X[(size_t)m * H + k] += xn[(size_t)k];
+        }
+    }
+    // layer_scalar (layer_output_scale) closes the layer.
+    const float ls = (l < (int)layer_scale_.size()) ? layer_scale_[l] : 1.0f;
+    if (ls != 1.0f)
+        for (size_t i = 0; i < (size_t)M * (size_t)H; i++) X[i] *= ls;
+    return true;
+}
+
 bool Q4nxNpuForward::step_batch_all(const std::vector<int>& tokens, int start_pos,
                                     std::vector<float>& logits_all) {
     // A noncausal pack's full-attention layers read the whole prompt, so in a batch every row attends to
@@ -4378,12 +4469,15 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
     // recurrence), so lin_kd_ no longer disqualifies a model, and attn_output_gate
     // is handled in the attention block below. MLA, per-layer embeddings, Gemma4
     // and shared-KV stacks still fall back.
-    // Gemma3 (extra_layer_norms 2) is Gemma4's sandwich without PLE or KV sharing, so the batched body
-    // below runs it with the three extra norms; Gemma4 itself still falls back.
-    const bool sandwich = gemma4_layer_ && ple_dim_ == 0 && sem_.extra_layer_norms == 2;
+    // Gemma3 (extra_layer_norms 2) is Gemma4's sandwich without PLE or KV sharing. engine#1780: Gemma4 itself runs
+    // here too -- its per-layer inputs are built per row, its PLE gate and projection are M-row GEMMs, a KV-shared
+    // layer reads (and does not append to) its owner's cache, which the owner filled for every row of this batch
+    // earlier in the same pass, and a shared layer's double-wide MLP uses the GU2/D2 designs, all as step() does. A
+    // verify of k drafted rows is then one weight stream instead of k.
+    const bool sandwich = gemma4_layer_;
     // gpt_oss runs its MoE, sinks and o bias in step() only, so a batched prefill takes the per-token path
     const bool simple_dense =
-        !mla_ && ple_dim_ == 0 && (!gemma4_layer_ || sandwich) && kv_self && !sem_.gpt_oss &&
+        !mla_ && (ple_dim_ == 0 || !inject_embeds_) && (kv_self || gemma4_layer_) && !sem_.gpt_oss &&
         !(n_expert_ > 0 && leading_dense_ > 0);   // a leading dense layer of a non-MLA MoE runs in step() only
     if (!simple_dense || getenv("NPU_NO_BATCH")) {
         if (inject_embeds_) {
@@ -4397,9 +4491,15 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                          "gate=%d kv_self=%d no_batch=%d\n",
                          M, mla_, lin_kd_, ple_dim_, (int)gemma4_layer_, n_expert_,
                          attn_gate_, (int)kv_self, (int)(getenv("NPU_NO_BATCH") != nullptr));
+        // step_batch_all() asks for every row: the per-token path owes it each step's logits, not only the last
+        // one's (it used to leave logits_all as it found it, so a verifier on a fallback model read no rows, or a
+        // previous batch's -- engine#1780, found by batch_check_state's verify arm on hy_v3 and gpt-oss).
         std::vector<float> one;
-        for (int m = 0; m < M; m++)
+        if (batch_all_out_) batch_all_out_->clear();
+        for (int m = 0; m < M; m++) {
             if (!step(tokens[m], start_pos + m, one)) return false;
+            if (batch_all_out_) batch_all_out_->insert(batch_all_out_->end(), one.begin(), one.end());
+        }
         logits = one;
         return true;
     }
@@ -4507,6 +4607,18 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                 X[size_t(r) * (size_t)H + k] += add[size_t(r - lo) * (size_t)H + k];
     };
 
+    // Gemma4: every row's per-layer inputs, [M][NL * ple_dim], built as step() builds one token's (engine#1780).
+    std::vector<float> ple_rows;
+    if (ple_dim_ > 0) {
+        const size_t w = (size_t)c_.NL * (size_t)ple_dim_;
+        ple_rows.resize((size_t)M * w);
+        for (int m = 0; m < M; m++) {
+            build_ple_inputs(tokens[m]);
+            if (ple_input_.size() < w) { err_ = "batch: per-layer inputs were not built"; return false; }
+            std::copy(ple_input_.begin(), ple_input_.begin() + (ptrdiff_t)w, ple_rows.begin() + (ptrdiff_t)((size_t)m * w));
+        }
+    }
+
     std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row;
     for (int l = 0; l < c_.NL; l++) {
         // engine#1780: the stream as this layer receives it is the previous layer's output. Taken here and not at
@@ -4519,7 +4631,11 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
         // norm) live outside the weight cache and are per layer, so load_gdn_layer
         // must run every time; it skips its own big deqs when the BOs are cached.
         const bool gdn_l = (lin_kd_ > 0 && lt0 == Q4NX_LAYER_LINEAR);
-        if ((gdn_l || !cached) && !load_layer(l)) {
+        // A Gemma4 layer's PLE gate and projection have their own weight keys; reload when either is missing, as
+        // step() does (its dense_weights_cached).
+        const bool ple_cached = ple_dim_ == 0 || (weight_cached(onebit::npu::kWkeyPleGate) &&
+                                                  weight_cached(onebit::npu::kWkeyPleProj));
+        if ((gdn_l || !cached || !ple_cached) && !load_layer(l)) {
             if (err_.empty()) err_ = "dequant failed";
             return false;
         }
@@ -4532,6 +4648,14 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
         const int l_win   = l_full ? 0 : sem_.sliding_window;
         const int i_qkv_l = (two_widths && l_full) ? i_qkv2 : i_qkv;
         const int i_o_l   = (two_widths && l_full) ? i_o2 : i_o;
+        // KV sharing (Gemma4), as step(): a shared layer reads its owner's cache and appends nothing. The owner ran
+        // earlier in this loop and appended every row of the batch, so a causal row still sees exactly its prefix.
+        const bool kv_shared = (l < (int)kv_owner_.size() && kv_owner_[l] != l);
+        const int kv_layer = (l < (int)kv_owner_.size()) ? kv_owner_[l] : l;
+        const bool wide = kv_shared && sem_.double_wide_mlp;
+        const int i_gu_l = wide ? idx_of(Q4NX_DESIGN_GU2) : i_gu;
+        const int i_d_l = wide ? idx_of(Q4NX_DESIGN_D2) : i_d;
+        const int im_l = wide ? 2 * im : im;
 
         // ---- attention ---- (a GDN layer goes through gdn_layer_batch instead) ----
         for (int m = 0; m < M; m++)
@@ -4546,6 +4670,7 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
             const Q4nxDesignGeom* g = &designs_[i_qkv_l];
             Q4nxProjections p{};
             p.q = wq_.data(); p.k = wk_.data(); p.v = wv_.data();
+            if (kv_shared) { p.k = wq_.data(); p.v = wq_.data(); }   // no k/v weights: that half is discarded (step())
             if (!xd_->pb16i() && !cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
                 err_ = "assemble qkv"; return false;
             }
@@ -4659,7 +4784,7 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                 }
                 if (!attention(*in, start_pos + m, pos3_ ? trio : nullptr, dst ? ctx_row : ctx_scratch,
                                l_hd, l_nkv, l_theta,
-                               l_rot, l_prop, l_win, l, append, kvlen, q_keep)) {
+                               l_rot, l_prop, l_win, kv_layer, append && !kv_shared, kvlen, q_keep)) {
                     err_ = "attention failed"; return false;
                 }
                 if (q_keep) return true;       // prepare only: q is in *q_keep, k/v are in the cache
@@ -4710,7 +4835,7 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                                         : 1.0f / std::sqrt(sem_.query_pre_attn_scalar > 0 ? sem_.query_pre_attn_scalar
                                                                                          : (float)l_hd);
                     const int nt = ((long)M * (start_pos + M) * l_hd >= 8192) ? omp_heads_threads() : 1;
-                    q4nx_attn::rows_context(qall.data(), kcache_[l].data(), vcache_[l].data(), M, c_.NH, l_nkv,
+                    q4nx_attn::rows_context(qall.data(), kcache_[kv_layer].data(), vcache_[kv_layer].data(), M, c_.NH, l_nkv,
                                             l_hd, Tm.data(), t0m.data(), scale, CTX.data(), nt);
                     if (attn_gate_)
                         for (int m = 0; m < M; m++) {
@@ -4804,16 +4929,20 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
         // design's N); the split branch packs its own buffer at the same width rather than at 2*im, so
         // there is one layout and one stride -- reading a real-width buffer at the design stride is
         // what the review of #885 caught (latent until a container has im % 256 != 0, then an OOB read).
-        const size_t act_w = (size_t)q4nx_pad_n(2 * im);
-        if (i_gu >= 0) {
-            const Q4nxDesignGeom* g = &designs_[i_gu];
+        const size_t act_w = (size_t)q4nx_pad_n(2 * im_l);
+        if (i_gu_l >= 0) {
+            const Q4nxDesignGeom* g = &designs_[i_gu_l];
             Q4nxProjections p{};
             p.gate = wg_.data(); p.up = wu_.data();
             if (!xd_->pb16i() && !cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
                 err_ = "assemble gu"; return false;
             }
-            npu_gemm_rows(i_gu, XN.data(), M, g->K, g->N, B_.data(), ACT, 2,
+            npu_gemm_rows(i_gu_l, XN.data(), M, g->K, g->N, B_.data(), ACT, 2,
                           "ffn_gate_up", g->real_k);
+            if ((size_t)g->N != act_w) { err_ = "batch: the gate/up design's N is not the padded 2 x intermediate"; return false; }
+        } else if (wide) {
+            err_ = "batch: a double-wide MLP layer has no fused GU2 design";
+            return false;
         } else if (i_g >= 0 && i_u >= 0) {
             std::vector<float> gv, uv, av((size_t)M * act_w, 0.0f);
             const Q4nxDesignGeom* gg = &designs_[i_g];
@@ -4843,25 +4972,25 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
             err_ = "no gate/up design";
             return false;
         }
-        HH.assign((size_t)M * (size_t)im, 0.0f);
+        HH.assign((size_t)M * (size_t)im_l, 0.0f);
         {
             // act_w is the stride both branches above leave ACT at; only the first 2*im columns of a
             // row are real (the rest is the kernel's zero column pad), so the elementwise gate*up reads
             // that row in place and writes HH's row in place: no staging copy on either side.  The two
             // copies this replaces were 12.75 MiB of a 15.38 MiB row (NPU_COPY_PROF=1, 2026-11-05).
             for (int m = 0; m < M; m++)
-                if (!mlp(ACT.data() + (size_t)m * act_w, HH.data() + (size_t)m * im, im)) {
+                if (!mlp(ACT.data() + (size_t)m * act_w, HH.data() + (size_t)m * im_l, im_l)) {
                     err_ = "mlp failed"; return false;
                 }
         }
         {
-            const Q4nxDesignGeom* g = &designs_[i_d];
+            const Q4nxDesignGeom* g = &designs_[i_d_l];
             Q4nxProjections p{};
             p.down = wd_.data();
             if (!xd_->pb16i() && !cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
                 err_ = "assemble d"; return false;
             }
-            npu_gemm_rows(i_d, HH.data(), M, g->K, g->N, B_.data(), D, 4,
+            npu_gemm_rows(i_d_l, HH.data(), M, g->K, g->N, B_.data(), D, 4,
                           "ffn_down", g->real_k);
         }
         {
@@ -4880,6 +5009,7 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                         X[(size_t)m * H + k] += D[(size_t)m * nrow + k] * residual_scale_;
             }
         }
+        if (sandwich && !gemma4_tail_rows(l, M, ple_rows, X)) return false;
 
         // Same post-residual hidden-state dump as step() emits as [L], one row per
         // position, so the two paths can be compared layer by layer.

@@ -1993,8 +1993,39 @@ again, the known-answer prompt answered `*,,,,,,,`; with the plain form it answe
 form, and gemma2 keeps `(1 + w)` (not measured here). `tests/q4nx_gemma3_semantics_test.c` pins each rule with
 Medgemma's own keys.
 
-A prefill runs batched (`step_batch`) with the same three extra norms; only Gemma4 still falls back to one
-`step()` per prompt token. `batch_check_state_test` on the Medgemma pack: batched equals sequential, rel-L1 0.
+A prefill runs batched (`step_batch`) with the same three extra norms. `batch_check_state_test` on the Medgemma
+pack: batched equals sequential, rel-L1 0.
+
+**Gemma4 runs batched too (engine#1780).** It used to fall back to one `step()` per row, so verifying k drafted
+tokens cost k weight streams, and a DFlash pair on a Gemma4 target could not beat plain decode. The batched body
+now does what `step()` does for each row:
+- it builds the row's per-layer inputs;
+- it runs the PLE gate and projection as M-row GEMMs, then the layer scalar;
+- on a KV-shared layer it reads the owner layer's cache and appends nothing (the owner already appended every row
+  of the batch earlier in the same pass);
+- a shared layer's double-wide MLP uses `GU2`/`D2`.
+
+A batch with injected embeddings is still refused on a PLE model, because the per-layer inputs need token ids.
+
+The KV cache's row width is now per layer, from `kv_widths()`. A model with two attention geometries holds more
+floats per position on its full layers: on Gemma4-E4B, 2 × 512 against 2 × 256 on the sliding layers. Snapshot,
+restore, a verify's rollback and `extend_context` used to count every layer at `NKV * HD`. That reported twice the
+positions and cut the full layers at half on a snapshot or a partial accept, which corrupts the prefix cache and
+any verify on such a model.
+
+`batch_check_state_test` on `Nemotron-3.5-Bolt-E4B` (host GEMM) checks all of this:
+- chunks [0,3), [3,5), [5,6): every chunk's argmax matches; the last chunk's logits equal the sequential ones
+  (rel-L1 0); the positions held are exact after each chunk;
+- a verify arm: a 4-row `step_batch_all` is bit-identical to 4 sequential steps (the oracle reports
+  `identical=4`); after `commit_verify_rows(2)` exactly 5 positions are held, and the next step equals a forward
+  that saw only those rows.
+
+Before the width fix, the first arm failed 4 of 4. With the old single width for the rollback, the verify arm fails.
+`q4nx_state_planes_test` holds the per-layer cut to Gemma4-E4B's 42-layer geometry.
+
+The verify arm also runs on the CI's fabricated containers. There it found that `step_batch_all()` on a model that
+still falls back to one `step()` per row (gpt-oss, a MoE with a leading dense layer) returned no per-row logits: the
+fallback filled only the last row and left `logits_all` as it found it. The fallback now appends every step's row.
 
 The serve also needs the BOS. Medgemma's `config.json` states neither `bos_token_id` nor `add_bos_token`, and its
 `tokenizer_config.json` states both (`<bos>`, true), as HF reads them. forward-serve now takes what `config.json`

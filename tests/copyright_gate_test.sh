@@ -180,5 +180,27 @@ check "...and exactly one SPDX line survives the repair" \
       "[ \$(grep -c 'SPDX-License-Identifier' \"$tmp/doubled.py\") -eq 1 ]" \
       "$(grep -c 'SPDX-License-Identifier' "$tmp/doubled.py") SPDX line(s)"
 
+# engine#2183: outside a repository `git ls-files` exits 128, and `check=True` turned that into a bare
+# Python traceback. Six pushes to one PR were made without the header the tool was asking for, because a
+# traceback reads as "the tool is broken" rather than "run it from the repository root". A directory that
+# is not inside any work tree must get a diagnostic naming the cause and the remedy, and its own exit code.
+#
+# The status is captured rather than piped: this file runs with `pipefail`, so `python3 ... | grep -q` fails
+# on the tool's own non-zero exit even when the pattern matches, and an arm written that way tests nothing.
+nogit=$(mktemp -d)
+cp "$root/tools/copyright.py" "$nogit/copyright.py"
+nogit_out=$( cd "$nogit" && python3 copyright.py --check 2>&1 )
+nogit_rc=$( cd "$nogit" && python3 copyright.py --check >/dev/null 2>&1; echo $? )
+check "outside any work tree: a diagnostic, not a traceback" \
+      "[ \$(printf %s \"\$nogit_out\" | grep -c Traceback) -eq 0 ]" \
+      "$(printf %s "$nogit_out" | tail -3)"
+check "...it names the remedy (the repository root)" \
+      "printf %s \"\$nogit_out\" | grep -q 'root of the repository'" \
+      "$nogit_out"
+check "...and exits 2, distinct from 1 (offenders found)" \
+      "[ \"\$nogit_rc\" -eq 2 ]" \
+      "exit $nogit_rc"
+rm -rf "$nogit"
+
 echo "$([ $fail -eq 0 ] && echo PASS || echo FAIL)"
 exit $((fail))

@@ -15,7 +15,7 @@
 # limitations under the License.
 """The batch-check state pin (tests/batch_check_state_test.cpp, engine#1905/#1946) on a container made here.
 
-usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|lfm3|qwen2|qwen3_5] (needs numpy)
+usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|lfm3|qwen2|qwen2vl|qwen3_5] (needs numpy)
 
 batch_check_state_test needs a Q4NX container, and CI has none, so on its own it skips (77) there and a regression of
 #1909 -- the NPU_BATCH_CHECK oracle resetting the prefix it replays from -- lands green. This writes a two-layer qwen3
@@ -48,7 +48,9 @@ With `qwen2` it is a two-layer Qwen2 (engine#1786): q/k/v projection biases, no 
 `attention_bias` key, which is how every Qwen2 config is written. With the key absent the forward loaded the biases
 and never added them, so FastFlowLM's Qwen2.5-3B-Instruct-NPU2 answered noise. batched == sequential cannot see that
 (both paths skip the biases alike), so the arm also compares the sequential logits with a numpy Qwen2 forward on the
-container's own weights (qwen2_reference). Measured at the fix: see QWEN2_* below.
+container's own weights (qwen2_reference). `qwen2vl` is the same model declaring Qwen2.5-VL's rope_scaling
+{"type": "mrope", "mrope_section": [16, 24, 24]}: the forward refused that at load, and on a text-only prompt (all
+three position planes equal) it has to give exactly the plain-RoPE reference.
 
 With `qwen3_5` it is a qwen3_5 hybrid (engine#1889): a linear-attention (GDN) layer, then a full-attention layer with
 q/k norms, written under `language_model.*` so the packer takes its qwen3_5 path (renames, the conv1d transpose,
@@ -97,7 +99,7 @@ def make_model(d, np, family="qwen3"):
     rng = np.random.default_rng(1946)
     lfm2 = family == "lfm2"
     lfm3 = family == "lfm3"
-    qwen2 = family == "qwen2"
+    qwen2 = family in ("qwen2", "qwen2vl")
     q35 = family == "qwen3_5"
     layers = 3 if lfm2 else (4 if lfm3 else LAYERS)
     conv_layers = (0, 2) if (lfm2 or lfm3) else ()
@@ -196,6 +198,8 @@ def make_model(d, np, family="qwen3"):
                     "norm_eps": 1e-5, "conv_L_cache": 3, "full_attn_idxs": [1]})
     if qwen2:
         cfg.update({"architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2"})   # and no attention_bias key
+        if family == "qwen2vl":
+            cfg["rope_scaling"] = {"type": "mrope", "mrope_section": [16, 24, 24]}   # 64 = HEAD_DIM / 2
     if lfm3:
         del cfg["rms_norm_eps"], cfg["rope_theta"]
         cfg.update({"architectures": ["Lfm3ForCausalLM"], "model_type": "lfm3", "num_hidden_layers": layers,
@@ -362,7 +366,7 @@ def tmp_root():
 
 
 def main():
-    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen2", "qwen3_5")):
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen2", "qwen2vl", "qwen3_5")):
         print(__doc__.strip().splitlines()[2])
         return 2
     family = sys.argv[2] if len(sys.argv) == 3 else "qwen3"
@@ -380,7 +384,7 @@ def main():
             return 1
         env = dict(os.environ, ONEBIT_TEST_Q4NX=out)
         logits_out = os.path.join(tmp, "sequential.f32")
-        if family in ("lfm3", "qwen2"):
+        if family in ("lfm3", "qwen2", "qwen2vl"):
             env["ONEBIT_TEST_LOGITS_OUT"] = logits_out
         env.pop("NPU_INFER_HOST_GEMM", None)   # init_host is host-GEMM already; nothing else should steer it
         r = subprocess.run([sys.argv[1]], env=env, capture_output=True, text=True, timeout=110)
@@ -393,7 +397,7 @@ def main():
             # arm, not a reason to skip it.
             print("FAIL  batch_check_state_test skipped on the fabricated container (init_host refused it)")
             return 1
-        if family in ("lfm3", "qwen2") and r.returncode == 0:
+        if family in ("lfm3", "qwen2", "qwen2vl") and r.returncode == 0:
             ours = np.fromfile(logits_out, dtype=np.float32)[:VOCAB]
             ref = (lfm3_reference if family == "lfm3" else qwen2_reference)(out, np, [1, 2, 3, 4, 5, 6], shapes)
             corr = float(np.corrcoef(ours, ref)[0, 1])

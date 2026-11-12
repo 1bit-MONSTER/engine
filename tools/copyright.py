@@ -44,6 +44,19 @@ LINE_STYLES = [
       # engine#1820: the other sweep's allow-list, same shape and the same reason -- `#`-comment data, `.txt` has no
       # style, and the header it wants is already at the top of the file.
       "unreferenced_tests.txt",
+      # engine#1946: the ctest skip baseline, the same shape and the same reason -- a '#'-comment data file whose
+      # is the notice it would otherwise be asked for. (CI caught this on the PR: the tool refuses an unknown sty
+      # than passing it, which is the behaviour worth having.)
+      "ctest_skips.txt",
+      # engine#2018: the test-registration baseline of `tests/*_test.py`, same shape and the same reason -- data,
+      "unreferenced_py_tests.txt",
+            "hrx_f16_narrowing.txt",
+            # engine#2186: the accumulator baseline of `tools/ci/hrx_f16_narrowing.py --write`, same shape and the same
+            # reason -- data, `.txt` has no comment style of its own, and the notice is already at the top of the file.
+            "hrx_f16_accumulators.txt",
+      # engine#2027: the `#`-comment baseline for hardcoded /tmp paths, same shape and the same reason --
+      # data, `.txt` has no style, and the notice it wants is already at the top of the file.
+      "tmp_paths.txt",
       "21serial-console", "90onboard-limits", "Dockerfile", "*.Dockerfile",
       # cycle 17: Puppy's switch that skips its first-run Quick Setup is an empty marker file whose only content
       # is this notice - Puppy tests for its existence, so a comment is free
@@ -219,6 +232,27 @@ def near_miss_holder(line):
     return n >= HOLDER_NEAR_MISS_PREFIX
 
 
+# The licence block's own blank comment lines (`#`, `//`) reduce to "", so a set built from every NOTICE line held the
+# empty string, and canonical_notice_line() said yes to every blank or bare-comment line in a file. add_notice() then
+# deleted each one in the header window (the separator after the description, the blank lines between #include groups
+# and after `namespace {`), and repair_notice()'s doubled-block dedupe deleted every blank line after the first in the
+# whole file. Only lines with words in them can be a claim, so only those are canonical.
+_CANON_LINES = {k for k in (re.sub(r"^\W+", "", n).strip() for n in NOTICE) if k}
+
+
+def canonical_notice_line(line):
+    """True when the line IS one of the canonical notice lines, spelled exactly.
+
+    engine#2129, met while fixing a new file's header: an SPDX two-liner without the licence block is "missing" to
+    has_notice(), so --fix prepends the block -- and the two-liner it just merged into that block stayed behind, so the
+    file --fix had just written failed --check with "duplicated inside the header window". near_miss_holder() cannot
+    cover it by construction: it returns False for an exact holder, because an exact holder next to the canonical block
+    is the *repaired* state. The block already contains both lines, so a copy inside the window is not a second claim.
+    """
+    key = re.sub(r"^\W+", "", line).strip()
+    return bool(key) and key in _CANON_LINES
+
+
 def repair_notice(text, block):
     """The file already HAS the canonical notice, plus a near-miss of our holder: delete the misspelling.
 
@@ -226,8 +260,13 @@ def repair_notice(text, block):
     and it needed its own path because it is neither "notice missing" (has_notice() is true, so --fix skipped
     the file) nor "duplicate canonical pair" (duplicated_notice() only reported it, even under --fix). Dropping
     the copyright line and the SPDX line directly beneath it keeps a near-miss pair from leaving an orphan.
+
+    It also keeps the FIRST canonical notice and drops later copies of the same line, which is the doubled-block shape:
+    --fix used to answer `repaired:` for that state while `--check` went on reporting the duplicate, i.e. the one mode
+    that could fix it claimed to and did not.
     """
     out, drop_next_spdx = [], False
+    seen_canonical = set()
     for line in text.splitlines(keepends=True):
         if near_miss_holder(line):
             drop_next_spdx = True
@@ -236,6 +275,15 @@ def repair_notice(text, block):
             drop_next_spdx = False
             continue
         drop_next_spdx = False
+        # A SECOND canonical notice is the same defect as a near-miss beside the first: the block pasted twice. `--check`
+        # has always reported it (`duplicated_notice`); `--fix` used to print "repaired" and leave the copy in place, so the
+        # file it had just written still failed the very check that sent it there. The first occurrence is kept and later
+        # ones dropped, which is what the report line now tells the reader --fix will do.
+        if canonical_notice_line(line):
+            key = re.sub(r"^\W+", "", line).strip()
+            if key in seen_canonical:
+                continue
+            seen_canonical.add(key)
         out.append(line)
     repaired = "".join(out)
     return repaired if has_notice(repaired) else add_notice(repaired, block)
@@ -248,7 +296,7 @@ def add_notice(text, block):
     # block and leave the hand-written one in place, which is how a file ended up with two notices and a green
     # `--check` (engine#1606). Dual attribution with a different holder is untouched - only the window is read.
     head = lines[:NOTICE_WINDOW]
-    kept = [l for l in head if not near_miss_holder(l)]
+    kept = [l for l in head if not near_miss_holder(l) and not canonical_notice_line(l)]
     lines = kept + lines[NOTICE_WINDOW:]
     return "".join(lines[:insert_at]) + block + "".join(lines[insert_at:])
 
@@ -315,7 +363,7 @@ def main():
             missing.append(path)
 
     for path in duplicated:
-        print("copyright notice duplicated inside the header window (delete the second copy):", path)
+        print("copyright notice duplicated inside the header window (--fix keeps the first copy and drops the rest):", path)
     for path in unknown:
         print("no comment style known (add one to LINE_STYLES/BLOCK_STYLES or EXEMPT):", path)
     for path in missing:

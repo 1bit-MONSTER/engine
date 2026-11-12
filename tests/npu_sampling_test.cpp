@@ -844,7 +844,8 @@ void test_gemma4_answer_parser() {
     }
     {
         const auto a = parse_answer("<|channel>thought\nlet me think<channel|>Done.", G, false);
-        check(a.reasoning == "\nlet me think", "gemma4: the thought channel is reasoning");
+        check(a.reasoning == "let me think" && a.content == "Done.",
+              "gemma4: the thought channel is reasoning, without the newline the template puts after the tag");
         check(a.content == "Done.", "gemma4: and the reply after it is content");
     }
     {
@@ -920,7 +921,8 @@ void test_answer_parser() {
     const auto F = AnswerFamily::qwen3;
     {   // reasoning, then content: the Qwen3 shape this route sees on every answer
         const auto a = parse_answer("<think>\nOkay, the user asked.", F, false);
-        check(a.reasoning == "\nOkay, the user asked.", "reasoning_content is the inside of <think>");
+        check(a.reasoning == "Okay, the user asked.",
+              "reasoning_content is the inside of <think>, without the newline the model puts after the tag");
         check(a.content.empty() && a.calls.empty(), "a reasoning-only answer has no content and no calls");
         check(!a.content_null, "content is empty string, not null, when there are no calls");
 

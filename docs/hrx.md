@@ -98,6 +98,26 @@ fails a pin that leaves a gate model's node off HRX.
     `ggml/src/ggml-hrx` keep our side; a conflict anywhere else fails the run and names the files;
   - merges AMD's hrx-system pin into our `1bit/main` the same way;
   - opens a PR here moving the submodules, listing the llama.cpp commits new to the engine.
+- **The mirror hold.** A rewrite of AMD's line that the rules above cannot merge leaves the daily run with
+  nothing to do but fail, every day, until somebody does the merge by hand. While
+  [`config/llama-mirror-hold.config`](../config/llama-mirror-hold.config) names the mirror's commit, the run
+  instead reports the hold in its summary (`mirror 1bit/hrx-vulkan HELD at …; AMD's pin is …, on a line that
+  does not contain it`), moves nothing and succeeds. The engine's pin does not move in a held run either: moving
+  it along our own line is a reviewed PR of its own. The hold
+  describes one state and fails the run when that state ends, so it cannot be forgotten: **stale** when the
+  mirror is no longer the named commit, **unneeded** when AMD's pin contains the named commit again (an ordinary
+  sync would work). `scripts/bump-hrx-sync.sh llama-hold <repo> <mirror> <pin>` prints the decision alone
+  (`none`, `held`, `stale`, `unneeded`). **Held since 2026-11-11** for the release (engine#1945): the file names
+  the mirror's commit `44ee5710d19f`, and the merge of AMD's rebased line is post-release work. It was added for AMD's 2026-11-09 rebase (engine#1945): taking that pin is a merge of
+  149 conflicted files (538 hunks) into `1bit/hrx-vulkan-patched`, measured against the last AMD commit our
+  line took.
+- **Which branch is the mirror.** [`config/llama-mirror-branch.config`](../config/llama-mirror-branch.config)
+  names it; with no name there it is `1bit/hrx-vulkan`. The file exists because no branch of the fork is ever
+  force-moved (owner, 2026-11-10): when AMD rewrites its line, AMD's new line is pushed to a new branch named for
+  the day, merged into `1bit/hrx-vulkan-patched` by an ordinary reviewed PR on the fork, and then named in this
+  file, while the old mirror stays where it was. That needs no workflow edit. A name that is not a plain branch
+  name, or that is our own line, is refused. `scripts/bump-hrx-sync.sh mirror-branch` prints the branch a run
+  would use.
 - **The hold.** While [`config/hrx-system-hold.config`](../config/hrx-system-hold.config)
   names a commit, the run does not merge AMD's hrx-system, keeps `third_party/hrx-system`
   where it is, and takes only AMD's llama.cpp changes outside the HRX backend paths
@@ -300,9 +320,96 @@ Measured on gfx1151 (2026-11-10):
   the dense inputs of Qwen3-0.6B, Qwen3-4B, ZAYA1-8B and flint. Cases at those two values are in the
   suite, so the shift has a test on each side.
 
-Still open under #1962: two prefill kernels that re-quantise the activations into 8-bit blocks
-(Q5_K and Q6_K weights at 512 tokens) keep a per-block term in half precision and still return NaN
-above 65504. And the limit is moved, not removed: an activation above 4.19e6 would overflow again.
+The prefill kernels followed at pin `7a1f2b81c`. The two small-batch Q6_K kernels were already done
+(llama.cpp #288). The Q4_K and Q6_K prefill kernels read a half-precision copy of the activations;
+that copy is now stored at 2^-6 and the sums are scaled back (llama.cpp #298). The Q5_K/IQ4_XS
+prefill kernel reads the activations as 8-bit blocks, each with a scale and a scaled sum in half
+precision. The scale fits up to 8.3e6; the scaled sum is about as large as the largest activation in
+the block, so it was the term that overflowed. The kernel now rebuilds a sum that is not finite from
+the 8-bit values it already holds, and uses a finite one as stored (llama.cpp #292).
+
+Measured on gfx1151 (2026-11-11, fork `7a1f2b81c`, full build):
+
+- `test-backend-ops -o MUL_MAT` with a resident weight (2048 x 4096), Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0
+  and Q4_0 at 1 to 512 tokens, with activation spikes of 3.0, 9.3e4 and 2e6: 180 of 180 pass (run at
+  llama.cpp #298's head). Before #292 and #298, Q5_K at 512 tokens and Q4_K and Q6_K at 256 and 512
+  tokens returned NaN at 9.3e4. The whole op is 617 of 617; `MUL_MAT_ID` is 845 of 845.
+- Perplexity on wikitext-2 (`-c 512 -b 512`, 16 chunks): Qwen3-4B-Q4_K_M 17.1836 (17.1864 before
+  #298), Qwen3-4B-IQ4_XS 17.6304 (the same before and after #292).
+- Prefill rate on Qwen3-4B-Q4_K_M across #298, eight alternating runs on a loaded box: 2683 against
+  2735 tok/s (ratio 0.98, pairs between 0.88 and 1.14). No regression shown; a cost of 2 to 3 % is
+  not excluded.
+
+The last path was the draft head's logits step, on main since pin `204493d40` (llama.cpp #303). A Q6_K
+projection onto a vocabulary of at least 65,536 at one token, downstream of the draft (MTP) head's
+concat projection, runs as a shortlist: a coarse scan, the 128 best candidates, and an exact refine
+of those. Qwen3.8-Flash-Next with its MTP companion has that shape, and no test had ever reached
+it. The first ones found two faults:
+
+- The scan read group ids that were never written. The matcher asked for 96 activation groups at
+  every width; only `width / 32` exist, so below a width of 3072 the rest of the id buffer was used
+  as it was found. At width 256 that was a device memory fault on ordinary data; at Flash-Next's
+  2560 it was 16 stray indices on every draft-head logits step. The request is now capped at the
+  number of groups.
+- The refine kernel narrowed the activation to half precision unscaled, so one activation above
+  65504 made every refined logit `inf`. It now carries the activation and the logit at 2^-6.
+
+Measured on gfx1151 (2026-11-11): the new `test-hrx-ops` cases (width 256, 65,536 outputs) went
+from a device fault to passing on ordinary data (128 refined candidates, NMSE 6.5e-7 against the
+CPU), with one activation at 1.06e5 (128 of 128 refined logits `inf` with only the first fault
+fixed; 0 after), and with activations to 1.18e5 and logits to 2.3e5. A scheduling test without a
+device pins the group count at widths 256, 2560 and 4096. Not run on Flash-Next itself. In about 50 runs one
+refined logit came back wrong once and did not recur ([engine#2150](https://github.com/1bit-MONSTER/engine/issues/2150)).
+
+The routed gate/up kernels followed at pin `2b7960bae` ([engine#2127](https://github.com/1bit-MONSTER/engine/issues/2127),
+llama.cpp #309). The fused routed gate/up SwiGLU loads its input in four projection kernels (Q4_K,
+Q5_K, Q6_K and the generic one), and each narrowed it to half precision unscaled. That input is a norm
+output, far below 65504 on every model measured, so no model run showed it; a test did. The four
+kernels now narrow at 2^-6 and the SwiGLU body scales the gate and up sums back by 2^6 before the
+activation.
+
+Measured on gfx1151 (2026-11-11): the routed feed-forward graph with one input set to 1e5 and that
+input's gate/up weights zero, so the device's own result without the spike is the reference: 2048 of
+2048 outputs non-finite before, 0 after and equal to the reference; the same case at 6e4 passes before
+and after (Q4_K; Q6_K passes with the fix). `test-hrx-ops` 254 of 254, `MUL_MAT_ID` 845 of 845 (run at
+llama.cpp #309's head).
+
+A routed model across the whole bump, pin `204493d40` against `2b7960bae` (Qwen3-Coder-30B-A3B Q4_K_M, the public
+backend built from each commit, 2026-11-11): perplexity on wikitext-2 (`-c 512 -b 512`, 8 chunks) 9.6693 against
+9.6681; `llama-bench -p 512 -n 32 -r 3`, alternated, prefill 1,437.1 and 1,532.6 tok/s against 1,616.9 and 1,605.7,
+decode 78.7 and 79.0 against 78.6 and 79.8. At `2b7960bae`: `test-hrx-ops` 256 of 256, `hrx-backend-test` host 69 of 69.
+
+The two faults left open under #2127 are fixed in the fork at `780d67524`, which the pin `4107043c1` contains
+([engine#2186](https://github.com/1bit-MONSTER/engine/issues/2186)):
+
+- **The gated product (llama.cpp #317).** The fused routed body published `silu(gate) * up` in half precision
+  unscaled, and the down projection and its reduction read that copy. It is now published at 2^-6 and the readers
+  scale it back by 2^6 after widening, the same pattern as the input above.
+- **The 8-bit blocks' stored sum (llama.cpp #319).** Each 32-value block stores its scale and its scaled sum in
+  half precision. The scale fits up to an activation of 8.3e6, the sum only while the block averages below 2047.
+  The one-token routed gate/up used the stored sum as it was; a sum that is not finite is now rebuilt from the
+  block's codes, and a finite one is used unchanged (the rule the Q5_K reader has had since #1962).
+
+Measured on gfx1151 (2026-11-11), device against a CPU graph on the same weights dequantised to f32, before = the
+same tree without the kernel change:
+
+| case | before | after |
+|---|---|---|
+| routed feed-forward, SwiGLU product up to 2.6e4 (`routed_moe.q4_K.large_product.300`) | 1315 of 2048 non-finite | 0, NMSE 9.8e-5 |
+| same, product up to 2.9e5 (`.1000`) | 2048 of 2048 non-finite | 0, NMSE 1.3e-4 |
+| one-token routed decode, block sum about 9.6e4 (`decode_routed_moe.q4_K.large_activation.3000`) | 2048 of 2048 non-finite | 0, NMSE 1.7e-3 |
+| same, block sum about 9.6e5 (`.30000`) | 2048 of 2048 non-finite | 0, NMSE 1.5e-3 |
+
+The in-range rows are unchanged: `large_product.1`, `.30`, `.100` give NMSE 1.5e-6, 2.3e-4 and 4.4e-4 in both
+arms, and `large_activation.1` and `.1000` the same 6.8e-3 and 4.0e-3 to every digit. Qwen3-Coder-30B-A3B Q4_K_M, perplexity on wikitext-2
+(`-c 512 -b 512`, 8 chunks) 9.6681 before #317 and 9.6654 after, with an identical dispatch plan (13,167 dispatches). `test-hrx-ops` on fork
+`0494dfa28` with #317 and #319 merged: 264 of 265 in two tickets; the one failure was the intermittent
+draft-head logit of [engine#2150](https://github.com/1bit-MONSTER/engine/issues/2150), which a warm repeat of the
+same 108 cases passed 23 of 23 times, as it did on `0494dfa28` alone. Fork `780d67524` also carries llama.cpp #318 (the
+weight-copy trace names the kernels that read each weight) and #314 (a test for #2150).
+
+The limits are moved, not removed: 4.19e6 for the half-precision copies and the draft-head logits, 8.3e6 for the
+8-bit blocks' scale.
 
 ### Fixed: Qwen3-VL on `HRX0`: it decodes again, and its rotation runs on the device ([engine#1467](https://github.com/1bit-MONSTER/engine/issues/1467))
 
@@ -354,6 +461,38 @@ first, cold repetitions 701 to 711 before, 856 to 866 after. At 8,192 tokens 1,5
 layout (8.80 s and 8.85 s) and gives the same text. `test-hrx-fa-transposed-value` compares the path with the CPU
 backend (8 cases). Why 256-token launches are faster than one 512-token launch at long key counts is measured,
 not explained.
+
+### Fixed: a gated-delta-net layer behind a type cast failed the whole graph ([engine#1925](https://github.com/1bit-MONSTER/engine/issues/1925))
+
+On Qwen3.8-Flash-Next, a long prompt failed at the first 512-token batch past 2,048 tokens of context when the
+sparse attention path's mask chain ran on the device:
+
+```
+graph_compute: unsupported HRX node 160: L2_NORM output=f32[128,16,512,1]<-L2_NORM inputs=[f32[128,16,512,1]<-VIEW] consumers=[174:GATED_DELTA_NET]
+```
+
+The fused gated-delta-net dispatch did match that node. The fault was the order in which the graph was walked.
+The scheduler walks a graph in dependency order and takes the matmuls first, which is what puts a layer's gate
+and beta projections ahead of the `L2_NORM` its fused pattern starts from. A type cast is an in-place copy that
+names its own output as an input. The walk counted that as a dependency, so the copy waited for itself, the walk
+stopped there, and every node after it was taken in index order. In index order the `L2_NORM` comes before the
+projections, and the pattern was refused because it would have read a projection that had not run. The sparse
+path's mask chain contains such casts, so the failure needed both a long context and that chain on the device.
+
+The walk no longer counts a node's own output as a dependency (llama.cpp #302). The fused matcher also keeps a
+match when a node of its pattern that only renames storage was already passed.
+
+Measured on gfx1151 (2026-11-11, Flash-Next UD-IQ3_XXS, `-c 19456 -np 1`, one 18,782-token request, a build of
+the fork with only the two changed objects replaced): `unsupported HRX node` 1 before, 0 after; all 390 fused
+gated-delta-net roots accepted; the whole prefill runs. `tests/test-hrx-gdn-passed-alias.cpp` plans the layer
+behind a cast on the host and requires the same dispatches as without it. Qwen3.5-4B, which has the same layer
+type and no sparse path, gives the same tokens on the old and the new library (128 of 128 in three alternated pairs), uses the same 33
+dispatch registrations in the same order, and runs at the same rate (`llama-bench -p 512 -n 64 -r 5`, old, new,
+old, new: decode 57.4, 58.3, 58.1, 58.2 tok/s; prefill 3,516, 3,042, 3,109, 3,213).
+
+Not shown by this: that the answer at 18.8k is the same with the mask chain on the device as with it on the
+CPU. Three of the four long requests in these runs, on the old library and the new, ended in all-NaN logits on
+the first sampled token, which is [engine#1536](https://github.com/1bit-MONSTER/engine/issues/1536).
 
 ### MoE decode and the kernel cache (llama.cpp #32, #33)
 
@@ -797,7 +936,127 @@ length peak at 8.7 GiB instead of growing; greedy answers are identical, and lla
 is unchanged. A repeated prompt length right after a flush costs 1.75 s instead of 1.12 s, since its
 program is rebuilt.
 
-### Server memory: HRX reads the weights instead of mapping them ([engine#856](https://github.com/1bit-MONSTER/engine/issues/856), [engine#1339](https://github.com/1bit-MONSTER/engine/issues/1339))
+### Server memory: the weights stay in the file mapping, and HRX holds the device copy ([engine#856](https://github.com/1bit-MONSTER/engine/issues/856), [engine#1339](https://github.com/1bit-MONSTER/engine/issues/1339))
+
+**Since [llama.cpp #304](https://github.com/1bit-MONSTER/llama.cpp/pull/304) (engine#856).** With a model on HRX and the default
+`-lm mmap`, the loader no longer uploads the model into an `HRX0` device buffer. HRX reports `buffer_from_host_ptr`, so the loader
+wraps its file mapping as an `HRX0_Mapped` buffer. That buffer is host memory: no copy, no device allocation, and no import (the
+userptr import described below is not used). HRX makes its own device copy of each weight from those pages. The model's file pages
+stay in the page cache, which is file-backed and reclaimable. `GGML_HRX_MODEL_BUFFER_COPY=1`, or any
+`GGML_HRX_HOST_WEIGHT_LIMIT_MB`, brings back the upload described in the next paragraph. Measured at llama.cpp `204493d40` (#304 as merged)
+and hrx-system `7f4236924aad`, with one binary for both arms (`tools/hrx_gtt_split.py run`, peak `drm-total-gtt`):
+
+| shape | upload (`GGML_HRX_MODEL_BUFFER_COPY=1`) | #304 |
+|---|---:|---:|
+| Qwen3-4B Q4_K_M, 5-token prompt, `-n 64` | 5,665.3 MiB | **3,225.3 MiB** |
+| Qwen3-4B Q4_K_M, 1,282-word prompt, `-c 4096 -n 16` | 6,311.8 MiB | 6,055.8 MiB |
+| Qwen3.8-27B UD-Q4_K_XL, 5-token prompt, `-n 16` | 19,075.3 MiB | 17,231.3 MiB |
+
+The generated text is identical in every pair, and `llama-perplexity --kl-divergence` against the upload's logits gives a mean KLD of 0.000000.
+The number of device copies goes *up* while GTT goes down. With the upload, HRX copied only the 253 weights it reads in its own
+layout, and every other read went to the loader's buffer. With #304 every weight HRX runs gets a device copy: 398 on the short
+prompt. Those copies replace the 2,375.9 MiB loader buffer, so `GGML_HRX_MODEL_BUFFER_COPY=1` gives fewer device buffers and more GTT.
+Every pair agrees on the top-1 token at every position (100.000 %). Speed is unchanged in steady state: `llama-bench -p 1024 -n 64 -r 3`,
+alternated, gives pp1024 2,764.6 tok/s (upload) and 2,767.7 / 2,765.4 tok/s (#304), and tg64 71.5 against 72.1 / 72.3 tok/s. A fresh
+process pays a one-time copy at its first prompt instead of at load time.
+
+**What remains of the duplicate, and the two switches that remove it** ([engine#2137](https://github.com/1bit-MONSTER/engine/issues/2137)).
+The second row is 647 device copies, 4,400.6 MiB, for a 2,375.9 MiB model. Counted per weight (`GGML_HRX_HOST_WEIGHT_TRACE=2` prints
+one line per device copy, since pin `2b7960bae`), the extra copies have two causes:
+
+- **Q4_K, 1,656.6 MiB.** Decode and the 256-aligned prefill kernel already share HRX's packed layout. A batch that is not a multiple
+  of 256 tokens (almost every prompt's last batch) runs on the generic kernels, which read the stored layout, and that brings in a
+  second copy of 214 of the 216 Q4_K weights.
+- **Q6_K, 368.1 MiB.** Prefill reads Q6_K in the stored layout at every batch size; decode reads the packed layout.
+
+A prompt made only of 512-token batches, a short prompt, or decode alone holds one copy per weight.
+
+`GGML_HRX_Q4K_PACKED_TAIL=1` (llama.cpp #308) makes the generic kernels read Q4_K in the packed layout, and
+`GGML_HRX_Q6K_PACKED_ROWS=1` (llama.cpp #310) makes Q6_K prefill read the packed rows decode reads, at every batch size. Measured on
+Qwen3-4B Q4_K_M with both on, against both off (one binary, fork `ccf14f9c9`):
+
+| | off | on |
+|---|---:|---:|
+| device copies, `-p 100` | 2,375.9 MiB | 2,375.9 MiB |
+| device copies, `-p 1700` | 4,032.5 MiB | 2,375.9 MiB |
+| device copies, `-p 1700 -n 16` | 4,400.6 MiB | **2,375.9 MiB** |
+| perplexity, wikitext-2, 12 chunks, batches of 300 / 384 / 512 | 19.2890 / 18.1680 / 16.9054 | the same |
+| `llama-bench -p 300`, two alternated pairs | 1,135.8, 1,117.6 tok/s | 1,238.6, 1,279.5 tok/s |
+| `llama-bench -p 1700` | 2,211.7, 1,901.1 tok/s | 2,319.6, 2,307.0 tok/s |
+| `test-backend-ops -o MUL_MAT` on `HRX0` | 641 of 641 | 641 of 641 |
+
+**Since pin `caa2d4dde` the packed layout is the default for a weight in the file mapping** (llama.cpp #313). The switches only save
+memory where the stored layout costs a copy, and that is a property of each weight's buffer. So with neither switch set, a Q4_K or
+Q6_K weight in the file mapping is read in the packed rows, and a weight that was uploaded (`GGML_HRX_MODEL_BUFFER_COPY=1`, a
+host-weight limit, `--no-mmap`) keeps the stored layout, which is already on the device there. The switches now force the choice for
+every weight: `1` packed, `0` stored. Measured at `caa2d4dde`'s change on Qwen3-4B Q4_K_M, default against both switches at `0`,
+counting distinct (weight, layout) copies:
+
+| after | stored (`=0`) | default |
+|---|---:|---:|
+| a 1,700-token prompt and a 16-token reply | 647 copies, 4,400.6 MiB (249 weights in two layouts) | **398 copies, 2,375.9 MiB (none)** |
+| a 100-token prompt | 398 copies, 2,375.9 MiB | 398 copies, 2,375.9 MiB |
+
+Perplexity at a 300-token batch is 19.2890 in both arms. Prefill is not slower: 1,229 against 1,098 tok/s at 300 tokens and 2,040
+against 1,860 at 1,700 (back to back, not interleaved).
+
+**Since pin `0494dfa28` a short prompt and its reply share one copy as well** (llama.cpp #316). The Q6_K kernel for batches of 6 to
+16 tokens read the weight in an i8 layout of its own, so after a 12-token prompt and a reply 35 Q6_K weights were held twice:
+433 device copies, 2,856.2 MiB. For a weight whose layout is the packed rows, that batch size now goes to the tiled kernel, which
+reads the packed rows: 398 copies, 2,375.9 MiB, the model's own size. With that, Qwen3-4B Q4_K_M holds one device copy per weight
+at every prompt shape measured (3, 8, 12, 40, 100 and 1,700 tokens, with and without a reply). It costs prefill speed at those
+sizes: 8.9 % at 8 tokens, 5.3 % at 12 and 6.9 % at 16 (interleaved, quiet box), which is 2 to 3 ms on a short prompt. Perplexity
+at a 12-token batch is 59.0414 before and 59.0417 after. An uploaded weight keeps the i8 kernel.
+
+**Speed against the previous behaviour.** At pin `4107043c1` (clean build, `build_commit 4107043`), the defaults against all
+three switches off (`GGML_HRX_Q4K_PACKED_TAIL=0 GGML_HRX_Q6K_PACKED_ROWS=0 GGML_HRX_PREFILL_FOLLOWS_DECODE=0`, the previous
+behaviour), order default / off / off / default in one ticket, box load 4 to 7:
+
+| tok/s | all three off | defaults |
+|---|---|---|
+| Qwen3.8-27B, `llama-bench -p 1700 -n 48 -r 2`, prefill | 251.1, 311.9 | 321.3, 308.4 |
+| Qwen3.8-27B, the same, decode | 10.66, 7.37 | 9.29 ± 3.24, 10.84 |
+| Qwen3.8-27B, `llama-completion -c 4096 -n 48`, 1,282-word prompt: prompt | 248.6, 296.5 | 263.2, 254.6 |
+| Qwen3.8-27B, the same: decode | 10.54, 6.20 | 10.13, 7.57 |
+| Qwen3-4B Q4_K_M, `llama-bench`, prefill | 1,540.5, 1,725.0 | 1,711.1, 2,299.9 |
+| Qwen3-4B Q4_K_M, `llama-bench`, decode | 43.96, 72.58 | 45.10, 73.31 |
+| Qwen3-4B Q4_K_M, `llama-completion`: prompt | 1,473.2, 1,692.1 | 1,664.9, 2,139.5 |
+| Qwen3-4B Q4_K_M, `llama-completion`: decode | 49.32, 49.62 | 40.41, 49.99 |
+
+The generated text is identical between the arms on each model. The two runs of one arm differ by up to 40 % here (27B decode
+7.4 against 10.7 with the switches off), more than any difference between the arms, so this table shows no regression and does
+not measure a gain. An earlier decode-only window on the 27B (`-p 0 -n 48 -r 3`, eight alternated arms, before #320) was steadier:
+11.21 to 11.91 tok/s with both packed-layout switches at `0` and 11.91 to 11.92 with the default. `llama-bench` runs its prompt
+test before any decode in the process, so its prefill row does not include #320's effect, which needs a stored copy made by
+decode first; the `llama-completion` rows do (they decode a warm-up token first).
+`GGML_HRX_Q4K_PACKED_TAIL=0 GGML_HRX_Q6K_PACKED_ROWS=0 GGML_HRX_PREFILL_FOLLOWS_DECODE=0` restores the previous behaviour.
+
+**A dense mixed-quant 27B shares most of its copies too since pin `4107043c1`** (llama.cpp #320). On Qwen3.8-27B UD-Q4_K_XL the
+one-token decode goes through the kquant kernels, which read the stored (GGUF) layout, while some prefill kernels read the packed
+rows, so after a long prompt 70 weights were held in both layouts (2,486.7 MiB of duplicate). HRX now records each stored copy
+it makes, and prefill keeps the stored layout for a weight that already has one: the Q6_K prefill kernel through its stored form,
+and the 256-aligned Q4_K prefill through the 8-bit-block kernel, which reads Q4_K stored as well. Measured with
+`llama-completion -c 4096 -n 32` and a 1,282-word prompt, `GGML_HRX_PREFILL_FOLLOWS_DECODE=0` against unset:
+
+| Qwen3.8-27B UD-Q4_K_XL | `=0` | default |
+|---|---:|---:|
+| device copies | 920, 18,205.2 MiB | 866, 16,181.4 MiB |
+| weights in two layouts | 70 (2,486.7 MiB duplicate) | 16 (462.9 MiB) |
+
+The generated text is identical, and prefill was not slower in the one interleaved window measured (prompt eval 263.5 and 317.1
+tok/s against 298.7 and 317.1). Qwen3-4B is unchanged (398 copies). What is left on the 27B, 15 Q4_K weights read by a prefill
+kernel that has only a packed form and one Q6_K weight, is tracked in
+[engine#2137](https://github.com/1bit-MONSTER/engine/issues/2137). Making decode step aside instead was measured and does not help:
+the same duplicates, and decode 8.5 % slower. flint UD-Q4_K_XL (routed experts) reads every weight stored and holds one copy per
+weight with or without the default.
+
+`GGML_HRX_Q6K_PACKED_PREFILL=1`, the older switch, never saved a copy: its dispatch bound the stored layout. Off its kernel's wide
+tile (tokens not a multiple of 256, or outputs not a multiple of 128) it also read past the weight: a Q6_K matmul at 128 tokens with
+the switch on ended in `HRX buffer download failed` and a bus error. Since pin `2b7960bae` the switch only selects that kernel on the
+wide tile, where it reads the rows it is bound to (llama.cpp #310). Use `GGML_HRX_Q6K_PACKED_ROWS=1` instead.
+
+The paragraphs below describe the upload path, which `GGML_HRX_MODEL_BUFFER_COPY=1` and `--no-mmap` still use.
+
 
 With a model on HRX (`-ngl` > 0), the loader reads the weights into their device buffers with `read()` and drops each weight's
 page-cache pages as soon as it is read ([llama.cpp #234](https://github.com/1bit-MONSTER/llama.cpp/pull/234)). A mapped load
@@ -808,8 +1067,8 @@ of 14.3 s. Output and wikitext perplexity are unchanged. `--mlock` with mmap kee
 The earlier weight-mapping import ([llama.cpp #226](https://github.com/1bit-MONSTER/llama.cpp/pull/226), opt-in since
 [#231](https://github.com/1bit-MONSTER/llama.cpp/pull/231)) is gone, and `GGML_HRX_WEIGHT_HOST_PLACEMENT` does nothing.
 It registered the file mapping as a KFD userptr, which the kernel always write-faults, so it dirtied the file, changed
-its mtime, and never finished on large models while writeback kept invalidating it (engine#1339). HRX's repacked copy of the
-dense weights still sits next to the device buffer in GTT.
+its mtime, and never finished on large models while writeback kept invalidating it (engine#1339). On that path, HRX's repacked copy of the
+dense weights sits next to the device buffer in GTT.
 
 **What was tried to remove that duplicate, and why it does not work (2026-11-09).** The obvious route is to stop placing the
 native range on the device at all and let HRX repack on demand: `-ot '<pattern>=CPU'` does *not* put a weight in a plain CPU
@@ -891,6 +1150,9 @@ The matmuls cost the same at any context; the attention kernel is the part that 
 What the numbers are and are not: each is the wall time from launch to device-idle with one dispatch in flight, so it holds
 one wake-up of the waiting thread and the run is slower than a normal one (the same command: pp512 2,977 -> 2,500 tok/s,
 tg16 67 -> 36, pp8192 1,191 -> 1,167). Use it to rank kernels and to see what grows with the context, not as a rate.
+Decode is slowed much more than prefill, so compare shares inside one program and never between programs. A dispatch that
+was launched and never finished (a ticket that ran out, a cut trace) is listed under the tables and is not in them. A build
+with extra kernel directories shows those kernels as numeric ids; name them with a second `--manifests DIR`.
 
 ### Measuring on `HRX0`: what makes a number citable
 
@@ -932,6 +1194,17 @@ load per arm).
 **3. A fallback is invisible in the dispatch histogram.** `GGML_HRX_LOG_DISPATCH=1` lists the registrations that **ran**; an op that never dispatched on
 the device leaves **no line at all**. Measured: two arms differing only in one tensor type's format had a **near-identical** registration set (one extra
 line, none missing) while `pp512` differed **5.4x** and `pp8` **8.1x**. So the histogram answers *"which kernel won"*, never *"did something fall back"*.
+
+**The flag gates logging, not arithmetic (engine#2143), so set it in both arms of any A/B.** The two pages that also teach
+this flag carry the same paragraph; this is the copy a reader here needs:
+
+> **Set it in both arms of an A/B, and record box load beside any rate (engine#2143).** #2143 asked whether this
+> flag changes behaviour: one 18,782-token request failed without it and completed with it, and one 18.6k prefill
+> measured 271.75 t/s unset against 118.86 t/s set. At the engine's pin the flag only gates `fprintf` calls
+> (`dispatch_log_match()` and `dispatch_log_requested_output()` in `dispatch-registry.cpp`): the readback check and
+> its decline run in both arms, so the dispatches selected are the same either way. Each of those measurements is
+> one run per arm, #1536 then failed in 4 of 6 runs, and box load moves a rate by about 2x here, so neither shows
+> a flag effect. Setting it in both arms is right whichever way #2143 settles.
 
 Use the right instrument for each question — three are needed and the histogram is only the first:
 
@@ -1273,7 +1546,7 @@ in [hrx.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/
   bit-identically. Cost: pp512 -4.7% on Qwen3-0.6B, the rest within noise.
 - **Weights read, page cache dropped** ([llama.cpp #234](https://github.com/1bit-MONSTER/llama.cpp/pull/234)): with a model
   on HRX the loader reads the weights instead of mapping the file and drops their page cache; replaces the weight-mapping
-  import of #226/#231 ([section above](#server-memory-hrx-reads-the-weights-instead-of-mapping-them-engine856-engine1339)).
+  import of #226/#231 ([section above](#server-memory-the-weights-stay-in-the-file-mapping-and-hrx-holds-the-device-copy-engine856-engine1339)).
 - **A cap on the graph program cache** ([llama.cpp #63](https://github.com/1bit-MONSTER/llama.cpp/pull/63)):
   `GGML_HRX_GRAPH_PROGRAM_CACHE`, default 64 ([section above](#server-memory-the-graph-program-cache-cap-llamacpp-63)).
 - **Hadamard-rotated Q4_0 files** ([llama.cpp #58](https://github.com/1bit-MONSTER/llama.cpp/pull/58)):

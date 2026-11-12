@@ -96,6 +96,34 @@ struct QkGainOffsets {
 QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes);
 std::string qk_norm_refusal(bool declared, bool found);
 
+// The one-header attention section of a pack whose q_proj is WIDER than hidden (Hunyuan-0.5B: hidden 1024, 16 heads x
+// head_dim 128, so q_out = 2048): [q,k,v tiles at K=hidden][gap][o_proj tiles at K=q_out]. `payload` is the bytes from
+// `attn_off` to the block's header. `ok` is false when the remainder is not a norms-sized gap (negative, or larger than
+// two gains plus 256 B), which is a layout this reader has not measured. When the gap has the gains' shape
+// (qk_gain_offsets()), `q_norm`/`k_norm` are their offsets; otherwise both are 0 and the section is still read
+// (engine#1889: this branch placed o_proj and never named the gains, so a pack that declares use_qk_norm was refused
+// with "gains are not where the block layout says" although they sit in the gap it had just computed).
+struct WideQAttnSection {
+    bool ok = false;
+    int64_t gap = 0, o_off = 0, q_norm = 0, k_norm = 0;
+};
+// Why one block's gap is NOT `[64 B zeros][bf16 [head_dim] gain][64 B zeros][bf16 [head_dim] gain]`, or "" when it is.
+// `gap` points at 2 * (64 + head_dim*2) bytes. The offsets come from the block arithmetic, which is the same number
+// for every layer; this is the per-layer witness that the bytes there are gains: both headers all zero, and each gain
+// finite and not all zero. A gain window displaced by a section (320 B at head_dim 128) lands on a header or on tile
+// bytes and fails one of these. The import refuses the layer by name on a non-empty answer (review of engine#2063).
+std::string qk_gap_block_why(const uint8_t* gap, int64_t head_dim);
+WideQAttnSection wide_q_attn_section(int64_t attn_off, int64_t payload, int64_t qkv_tiles, int64_t tile_bytes,
+                                     int64_t o_tiles, int64_t o_tile_bytes, int64_t head_dim);
+
+// How many rows a head read from the .fconst tail occupies in the container. The pack stores the head in whole 64-row
+// tiles, so a vocabulary that is not a multiple of 64 is carried with the pack's own padding rows (Hunyuan: 120,818 ->
+// 120,832) while `vocab_size` and the plan's tensor shape stay the vocabulary. A head that is a graph initializer is
+// stored as it is: on main nothing pads it, and one whose row count is not a multiple of 32 is refused by the tile
+// writer ("q4_1 tiles need N % 32 == 0"). If graph-head padding lands (engine#1992 was closed unmerged), its quantum
+// belongs here. This is the number a container's lm_head tile count follows from.
+int64_t head_stored_rows(int64_t vocab, bool from_fconst_tail);
+
 // Why a pack's two layout witnesses cannot be reconciled, or "" when they can (engine#1985).
 //
 // `vote_hdrs` is the number of in-block headers the epsilon-anchor vote recorded (0 when it could not win); `declared_qk`
@@ -108,6 +136,14 @@ std::string qk_norm_refusal(bool declared, bool found);
 // The reader refuses and names both, because picking either one silently is the defect. Exposed so the three cases can be
 // pinned without a 2.6 GB pack.
 std::string header_witness_refusal(int vote_hdrs, bool declared_qk);
+
+// The first tile of k_proj, q_proj and v_proj inside the attention payload, for n_kv k/v tiles and n_q q tiles
+// (64 rows each). `q_first` false is k, q, v; true is q, k, v (engine#1889, the Hunyuan block). v is last either way.
+// Split out so the order is pinned by a test instead of living in an initializer list.
+struct AttnFirstTiles {
+    int k = 0, q = 0, v = 0;
+};
+AttnFirstTiles attn_first_tiles(int n_kv, int n_q, bool q_first);
 
 // A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
 // GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
@@ -209,6 +245,14 @@ struct Plan {
     // none. Identified and verified byte-exact against the public Qwen3-1.7B/4B checkpoints (0 of 128
     // values differ on either pack, and the swap differs on 127-128 of 128).
     int64_t knorm_off = 0, qnorm_off = 0;
+    // Where the 2-header families' gap `[64 B zeros][q_norm][64 B zeros][k_norm]` starts in the block, 0 when the gains
+    // are not in that form. The import checks the form in EVERY layer (qk_gap_block_why()) before it writes a gain.
+    int64_t qk_gap_off = 0;
+    // The order of the three projections in the block's first payload. Every family measured before Hunyuan writes
+    // k, q, v (identified on Qwen2.5-0.5B by the tiles' bias subvolumes). The Hunyuan block -- q/k/v at K=hidden, the
+    // packed per-head gains, o_proj -- writes q, k, v (engine#1889): with k,q,v the container's k_proj was q_proj's
+    // first rows, and the model answered filler words; with q,k,v it answers. See attn_first_tiles().
+    bool attn_q_first = false;
     int64_t mlp_off = 0;  // the MLP section starts just past the block's post-attention norm
     // What the pack's *graph* carries, reported so `npu-pack info` can answer a pack's genre without a
     // third-party parser: the rai_1.3/1.6/1.7.1 line ships its 4-bit weights as ordinary ONNX initializers, while
@@ -345,6 +389,12 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors);
 
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
+// engine#1889 (review of #2063): plan()'s wide-q branch (q_out != hidden), as one function so its effect on the plan is
+// testable without a fabricated 1.9 pack. When the section was read (`wq.ok`) and q is wider than hidden, it places the
+// q/k/v run, o_proj and the gains, and sets attn_q_first when the gap held the gains: that block is the Hunyuan writer's,
+// whose first payload is q, k, v (read as k, q, v, the container's k_proj was q_proj's first rows, correlation 0.01).
+// Returns false and leaves `p` untouched otherwise.
+bool apply_wide_q_section(Plan& p, const WideQAttnSection& wq, int64_t n_kv, int64_t n_q, int q_out, int64_t hidden);
 Plan plan(const std::string& pack_dir);
 
 // Whether the canonical Token .fconst already on the scratch path holds exactly the bytes this run would write,
@@ -450,6 +500,10 @@ std::string weight_layout_refusal(const std::string& want);
 // broken container, so it is refused here, by name, before anything is written.
 std::string kernel_set_refusal(const std::vector<std::string>& file_names, const std::string& layout);
 
+// The tied-head fit (engine#1503); what each field means is stated at fit_head() below.
+struct HeadFit {
+    double rel = 0, scale = 1, rms_ratio = 1, floor = 0;
+};
 struct Report {
     std::string out_dir;
     int tensors = 0;
@@ -466,7 +520,14 @@ struct Report {
     // check; an untied pack's head and embedding are separate matrices by construction, and the same number is
     // meaningless -- reported as such rather than left looking like a failed import.
     bool selfcheck_tied = false;
+    // engine#1503: tied, correlated -- but MIS-SCALED. Correlation alone passes a head that is a scaled copy of the
+    // embedding: two packs measured on this box report corr 0.9915/0.9961 with rel_err 0.095/0.136 and serve garbage
+    // ("myself" forever), while the pack that serves correctly reports rel_err 0.000000. A pack in this state imports
+    // cleanly and answers nonsense, so it is refused rather than reported.
+    bool selfcheck_scaled = false;
     double lmhead_corr = 0, lmhead_rel = 0, ctrl_corr_nibble = 0, ctrl_corr_nozp = 0;
+    HeadFit head_fit;   // engine#1503: scale, rms ratio and the 4-bit noise floor beside lmhead_rel
+    std::string model_type;   // the pack's, so the CLI can refuse a known-bad architecture by name
     // The tail (.fconst) path has no MatMulNBits bytes to mis-decode, so its control is an ALIGNMENT one: the same
     // tiles, the same decoder, rows matched against the neighbouring embedding row. A correct decode correlates ~1
     // with the embedding; if a row-misaligned head still did, the check would be measuring nothing. -1 = not run.
@@ -665,6 +726,11 @@ constexpr bool kExtQuantsRowMajor = false;
 // measurably NOT the same weights: on a real phi-4 tile it reproduced the pack's codes on only 2,826 of 8,192
 // entries and moved weights by 2.5 % of the tensor's range (engine#1503). `m_inexact` reports how many group
 // offsets were not bf16-exact (86.3 % are, measured), because that rounding is the only loss this path has.
+// engine#1990: a head whose row count is not a multiple of the 32-row tile quantum (CodeLlama: 32,016 rows) cannot be
+// held by the q4_1 grid, so pad it with zero rows that decode to zero and leave the container's vocab_size alone. Exposed
+// because the property -- padding is invisible to the vocabulary -- is what a test can pin without a pack.
+void pad_rows_to_tile_quantum(Q4& q, int vocab);
+
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact = nullptr);
 
 // The container role a matmul plays, read off the graph's own tensor name: `...qkv_proj...` -> "QKV",
@@ -796,6 +862,20 @@ bool fconst_scratch_ready(const std::string& dir);
 const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
                                               std::string* why);
 
+// engine#1503: the tied-head rule, as ONE predicate so the four call sites cannot drift: the head must reproduce the
+// embedding (corr) AND not be a scaled copy of it (rel_err). The constant is the measured gap between the two states --
+// 0.000000 for the pack that serves, 0.095/0.136 for the two that do not -- so 0.02 sits far from both.
+inline constexpr double kSelfcheckRelMax = 0.02;
+bool selfcheck_head_ok(double corr, double rel);   // the same rule with no fit: scale 1, no noise floor
+// engine#1503: the rule on what it claims. A head passes when it correlates (kTieCorr), is NOT scaled (scale and
+// rms_ratio within kHeadScaleTol of 1), and its rel error is no worse than kHeadFloorFactor x the embedding's own 4-bit
+// noise floor at the head's block (and never refused below kSelfcheckRelMax, so a head that IS its embedding passes).
+inline constexpr double kHeadScaleTol = 0.05;
+inline constexpr double kHeadFloorFactor = 1.5;
+bool selfcheck_head_ok(double corr, const HeadFit& fit);
+// A model_type this route is MEASURED to serve garbage on, with the reason; nullptr for every other (engine#1503).
+const char* known_bad_architecture(const std::string& model_type);
+
 int64_t attn_tile_bytes(int64_t k);
 // Pearson correlation between a quantised head and a bf16 embedding table (engine#1690; the self-check's own statistic,
 // exported so a test can pin the buffer width it decodes).
@@ -814,6 +894,16 @@ struct EmbedTable {
 };
 // The only decode: bf16 or f16 per t.fmt. out-of-range rows still read (callers clamp), as before.
 double embed_at(const EmbedTable& t, int row, int k);
+
+// engine#1503: what the tied-head self-check measures, beyond the correlation. `rel` alone cannot tell a scaled head
+// from a correct 4-bit head whose embedding is kept at higher precision: both score ~0.09 (measured: Qwen2-1.5B 1.9,
+// tail head block 32, rel 0.094316; gemma-2-2b AWQ hybrid, rel 0.094874), while the pack 0.02 was calibrated on
+// scores 0 only because its embedding IS the dequantised head. So the fit also carries:
+//   scale     -- the least-squares a in e ~= a * head. A scaled copy shows it directly; the two above are 0.994 / 0.992.
+//   rms_ratio -- rms(head) / rms(embedding), the same question without the fit (1.0018 / 1.0038).
+//   floor     -- the rel error of the EMBEDDING quantised the way the head is (asymmetric 4-bit, min/max per `block`
+//                columns): what a correct head costs. The two above are 1.12x / 1.07x of theirs (0.083865 / 0.088985).
+HeadFit fit_head(const Q4& q, const EmbedTable& embed, int rows, int block);
 
 double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows);
 // Where a layer block's attention payload starts: the block's 64-byte header, then its

@@ -121,6 +121,37 @@ int main() {
         std::remove(bad.c_str());
     }
 
+    // 7. the turn end read off the template (engine#1786, FastFlowLM's Phi4-mini-Instruct-NPU2): neither file names
+    //    <|end|>, the template closes every turn with it, and the answer ran on past it.
+    {
+        using onebit::npu::turn_end_marker;
+        check(turn_end_marker("<|end|>") == "<|end|>", "Phi: the marker right after the assistant's text");
+        check(turn_end_marker("<|im_end|>\n") == "<|im_end|>", "ChatML: the marker, without the newline after it");
+        check(turn_end_marker("<|eot_id|>") == "<|eot_id|>" && turn_end_marker("<end_of_turn>\n") == "<end_of_turn>",
+              "Llama 3 and Gemma");
+        check(turn_end_marker("\n<|im_end|>\n<|im_start|>user") == "<|im_end|>", "whitespace before it is skipped, what follows is ignored");
+        check(turn_end_marker("").empty() && turn_end_marker("\n").empty() && turn_end_marker("  \n ").empty(),
+              "nothing, or only whitespace, after the turn: no marker");
+        check(turn_end_marker("Human: next").empty() && turn_end_marker("x<|end|>").empty(),
+              "plain text after the turn is not a stop, even with a marker later in it");
+        check(turn_end_marker("<").empty() && turn_end_marker("<>").empty() && turn_end_marker("<|end").empty() &&
+                  turn_end_marker("< not a token >").empty(),
+              "a lone bracket, an empty pair, an unclosed one and one with spaces in it are not markers");
+        // into the list: Phi's two files name only <|endoftext|>
+        const auto id_of = [](const std::string& t) {
+            if (t == "<|endoftext|>") return 199999;
+            if (t == "<|end|>") return 200020;
+            return -1;
+        };
+        const json cfg = json::parse(R"({"eos_token_id": 199999})");
+        const json tok = json::parse(R"({"eos_token": "<|endoftext|>"})");
+        check_ids(onebit::npu::stop_token_ids(cfg, tok, "", id_of), {199999}, "from the two files alone the serve stops on <|endoftext|> only (the fault)");
+        check_ids(onebit::npu::stop_token_ids(cfg, tok, turn_end_marker("<|end|>"), id_of), {199999, 200020},
+                  "with the template's turn end it also stops on <|end|>");
+        check_ids(onebit::npu::stop_token_ids(cfg, tok, turn_end_marker("<|eot|>"), id_of), {199999},
+                  "a marker the tokenizer does not have as one token adds nothing");
+    }
+
     if (failures == 0) std::printf("all stop-token checks passed\n");
     return failures == 0 ? 0 : 1;
 }

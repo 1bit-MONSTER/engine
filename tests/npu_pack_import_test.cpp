@@ -33,6 +33,7 @@
 //    their biases, the MLP projections and the final norm -- and produces a container the engine's own
 //    Model can open.
 
+#include "../npu/forward/include/file_create.h"   // written files are 0600, never through a symlink
 #include "model.h"
 #include "pack.h"
 #include "pack_import.h"
@@ -1349,6 +1350,40 @@ void test_crafted_refusals(const std::string& root) {
     }
     check(!fs::exists(dir / "out3" / "model.qnx") && !fs::exists(dir / "out3" / "model.q4nx"),
           "crafted: nothing written for the empty .packed sibling");
+
+    // 4. engine#1503: the 1.8 hybrid spelling of the same thing. The node names `<w>` ITSELF as the [0] placeholder (no
+    // `.empty` suffix) beside an equally empty `<w>.packed`, and the weights are in a model.bin next to the graph
+    // (Llama-3.2-1B-Instruct_rai_1.8.0_hybrid: all 162 `.MatMulNBits.*` initializers are this shape). Before the fix the
+    // walker only knew the `.empty` spelling, kept the node as a real weight, `info` called every projection importable
+    // and `import` died much later on `...MatMulNBits.bias: no data`.
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {8, 8}, "model.onnx.data", 0, 256),
+                        pb::tensor("rai18_qweight", {0}, "", 0, 0),
+                        pb::tensor("rai18_qweight.packed", {0}, "", 0, 0),
+                        pb::tensor("rai18_scales", {0}, "", 0, 0),
+                        pb::tensor("rai18_zeros", {0}, "", 0, 0)},
+                       {pb::matmulnbits("mm", {"x", "rai18_qweight", "rai18_scales", "rai18_zeros"}, 64, 512, 4, 128)}));
+    put_file((dir / "model.bin").string(), std::string(64, '\0'));
+    try {
+        (void)pi::plan(dir.string());
+        check(false, "crafted 1.8: a [0] qweight with an empty .packed sibling was refused");
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        std::printf("  crafted 1.8 placeholder refusal: %s\n", what.c_str());
+        check(what.find("rai18_qweight (its rai18_qweight.packed sibling carries no data either)") != std::string::npos &&
+                  what.find("genuinely absent") != std::string::npos,
+              "crafted 1.8: plan() refuses by name, naming the placeholder and its sibling (" + what + ")");
+        check(what.find("weights are in its model.bin") != std::string::npos,
+              "crafted 1.8: and says where the weights are when a model.bin is there (" + what + ")");
+    }
+    fs::remove(dir / "model.bin");
+    try {
+        (void)pi::plan(dir.string());
+        check(false, "crafted 1.8 without model.bin: refused");
+    } catch (const std::exception& e) {
+        check(std::string(e.what()).find("model.bin") == std::string::npos,
+              "crafted 1.8: no model.bin, so the refusal does not claim one (" + std::string(e.what()) + ")");
+    }
     fs::remove_all(dir);
 }
 
@@ -1404,6 +1439,53 @@ void test_1671_plan_head_arm(const std::string& root) {
 }
 
 // ── 1. MatMulNBits: encode here, decode with the importer ────────────────────
+// engine#1990: a head whose row count is not a multiple of the 32-row tile quantum (CodeLlama's vocabulary is 32,016) is
+// padded with rows that decode to zero, and the container's vocab_size is NOT changed -- the padding is invisible to the
+// vocabulary. Both halves are pinned here because widening N without staying invisible is the failure that would show up
+// as two plausible extra tokens at the end of every distribution.
+void test_head_row_padding() {
+    const auto make = [](int N) {
+        pi::Q4 q;
+        q.N = N;
+        q.K = 128;      // two 64-column tiles
+        q.block = 32;   // four groups per row
+        q.codes.assign(size_t(N) * size_t(q.K), 1);          // non-zero, so padding is distinguishable
+        q.scale.assign(size_t(N) * size_t(q.K / q.block), 0.5f);   // 1.0 in the padded rows; see below
+        q.zero.assign(size_t(N) * size_t(q.K / q.block), 0.25f);
+        return q;
+    };
+    {
+        pi::Q4 q = make(32016);
+        pi::pad_rows_to_tile_quantum(q, 32016);
+        check(q.N == 32032 && q.N % 32 == 0, "head padding: 32,016 rows become 32,032 (the 32-row quantum)");
+        check(q.codes.size() == size_t(32032) * 128 && q.scale.size() == size_t(32032) * 4,
+              "head padding: codes and scales grow with the rows, one group's worth each");
+        bool zeros = true;
+        for (int r = 32016; r < q.N; r++) {
+            for (int k = 0; k < q.K; k++) zeros = zeros && q.codes[size_t(r) * 128 + size_t(k)] == 0;
+            for (int g = 0; g < 4; g++)
+                zeros = zeros && q.scale[size_t(r) * 4 + size_t(g)] == 1.0f && q.zero[size_t(r) * 4 + size_t(g)] == 0.0f;
+        }
+        check(zeros, "head padding: every padded row is code 0, scale 1, zero 0 -- which decodes to 0.0, not to a weight");
+        bool kept = true;
+        for (int r = 0; r < 32016; r++)
+            for (int k = 0; k < 128; k++) kept = kept && q.codes[size_t(r) * 128 + size_t(k)] == 1;
+        check(kept, "head padding: the vocabulary's own rows are untouched");
+    }
+    {   // an aligned vocabulary is left exactly as it was: no note, no growth
+        pi::Q4 q = make(32000);
+        const size_t before = q.codes.size();
+        pi::pad_rows_to_tile_quantum(q, 32000);
+        check(q.N == 32000 && q.codes.size() == before, "head padding: a 32-aligned vocabulary (32,000) is not touched");
+    }
+    {   // 16 rows of slack and 1 row of slack both round up to one tile boundary, not two
+        pi::Q4 a = make(32017), b = make(32031);
+        pi::pad_rows_to_tile_quantum(a, 32017);
+        pi::pad_rows_to_tile_quantum(b, 32031);
+        check(a.N == 32032 && b.N == 32032, "head padding: 32,017 and 32,031 both round to 32,032");
+    }
+}
+
 void test_matmulnbits() {
     const int N = 64, K = 256, B = 128;
     std::vector<uint8_t> qw(size_t(N) * (K / B) * (B / 2));
@@ -3007,10 +3089,13 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
               "pack: 64 columns per gate|up unit and per down_proj group");
 
     int norms = 0, attn_planned = 0, mlp_planned = 0, lm_tiles_planned = 0;
+    bool head_in_tail = false;
     for (const auto& t : p.tensors) {
         if (t.name.find("layernorm") != std::string::npos || t.name == "model.norm.weight") ++norms;
-        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.compare(0, 9, "lm_head.w") == 0)
+        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.compare(0, 9, "lm_head.w") == 0) {
             lm_tiles_planned = int((t.shape[0] / 32) * ((t.shape[1] + 255) / 256));
+            head_in_tail = t.source == "fconst:tail";
+        }
         if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find("self_attn") != std::string::npos) ++attn_planned;
         if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find(".mlp.") != std::string::npos) ++mlp_planned;
     }
@@ -3143,8 +3228,12 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     // the container must open with the engine's own loader
     onebit::npu::Model m(out);
     const auto& head = m.tensor("lm_head.weight");
-    check(head.shape.at(0) == int64_t((head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256)),
-          "pack: lm_head tile count matches the container");
+    // A head read from the .fconst tail keeps the pack's padding to whole 64-row tiles (Hunyuan: 120,818 rows are stored
+    // as 120,832), so the container's count follows the stored rows; the plan's shape stays the vocabulary.
+    const int64_t stored_rows = pi::head_stored_rows(head_rows, head_in_tail);
+    check(head.shape.at(0) == (stored_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256),
+          "pack: lm_head tile count matches the container (" + std::to_string(head.shape.at(0)) + " tiles for " +
+              std::to_string(stored_rows) + " stored rows)");
     check(m.tensor("model.layers.0.input_layernorm.weight").shape.at(0) == p.dims.hidden,
           "pack: a layer norm is `hidden` bf16 values, whatever the hidden size");
     check(m.tensor("model.norm.weight").shape.at(0) == int64_t(p.dims.hidden),
@@ -4610,7 +4699,7 @@ static void dump_real_component(const std::string& dir) {
     const int row = 1;                          // token id 1: a plain text token ORT embeds
     if ((row + 1) * H > v.size()) return;
     const std::string out = dir + "/eng_row.f32";
-    if (FILE* f = std::fopen(out.c_str(), "wb")) {
+    if (FILE* f = onebit_fopen_private_wb(out.c_str())) {
         std::fwrite(&v[size_t(row) * H], sizeof(float), H, f);
         std::fclose(f);
         double s = 0;
@@ -5026,6 +5115,25 @@ void test_container_roles() {
         check(r.role_of.at("model.norm.weight") == "final_norm", "roles: the top-level norm is not a layer norm");
         check(r.role_of.at("model.layers.0.input_layernorm.weight") == "input_norm",
               "roles: a layer norm is the input norm, not the final one");
+    }
+    // 1b. engine#2097 review: the two cases the table got wrong, pinned so the order cannot regress.
+    // `attn_q` / `attn_k` are prefixes of `attn_q_norm` / `attn_k_norm`, so with the projection rules first both
+    // norm needles were dead and a per-head q/k norm was filed as a projection.
+    {
+        const auto r = roles({"blk.0.attn_q_norm.weight", "blk.0.attn_k_norm.weight",
+                              "blk.0.attn_q.weight", "blk.0.attn_k.weight"});
+        check(r.role_of.at("blk.0.attn_q_norm.weight") == "q_norm", "roles: attn_q_norm is a norm, not q_proj");
+        check(r.role_of.at("blk.0.attn_k_norm.weight") == "k_norm", "roles: attn_k_norm is a norm, not k_proj");
+        check(r.role_of.at("blk.0.attn_q.weight") == "q_proj" && r.role_of.at("blk.0.attn_k.weight") == "k_proj",
+              "roles: the un-suffixed spellings are still projections");
+    }
+    // 1c. `in_proj` is not unique to attention: LFM2's short-convolution input projection was counted as qkv_proj.
+    {
+        const auto r = roles({"model.layers.0.shortconv.in_proj.weight", "model.layers.0.attn.in_proj.weight"});
+        check(r.role_of.at("model.layers.0.shortconv.in_proj.weight") == "shortconv_in_proj",
+              "roles: shortconv.in_proj is the short-conv projection, not the attention qkv");
+        check(r.role_of.at("model.layers.0.attn.in_proj.weight") == "qkv_proj",
+              "roles: an attention in_proj is still the fused qkv");
     }
     // 2. the alternate spellings must land on the same roles
     {
@@ -5686,6 +5794,17 @@ void test_q4_writer_code_range() {
 // engine#1889: the arithmetic that claims the per-head QK gains out of the 640 B Hunyuan-7B carries between its last qkv
 // tile and o_proj. A wrong offset there reads tile bytes as bf16 and mis-rotates every pack of the family, so both the
 // right shape (2 * (64 + head_dim*2) = 640 at head_dim 128) and the neighbours that must NOT be taken for it are driven.
+// The rows a tail head occupies in the container: the pack's own padding to whole 64-row tiles stays. The pack leg's
+// tile-count check used the vocabulary, so it failed on every pack whose vocabulary is not a multiple of 64 although
+// the import was right (Hunyuan-1.8B: 15,104 tiles written, 15,100 expected).
+void test_head_stored_rows() {
+    check(pi::head_stored_rows(120818, true) == 120832, "head rows: Hunyuan's 120,818 are stored as 120,832");
+    check(pi::head_stored_rows(151936, true) == 151936, "head rows: a multiple of 64 is stored as it is");
+    check(pi::head_stored_rows(49152 + 32, true) == 49152 + 64, "head rows: a multiple of 32 that is not one of 64 is padded");
+    check(pi::head_stored_rows(120818, false) == 120818, "head rows: a graph head is not padded");
+    check(pi::head_stored_rows(0, true) == 0, "head rows: no vocabulary, no rows");
+}
+
 void test_qk_gain_offsets() {
     const pi::QkGainOffsets o = pi::qk_gain_offsets(1000, 128, 640);
     // engine#1934: block 0 is Q. Hunyuan-7B's own model.onnx carries both gains as FP16 initializers, and q_norm is the
@@ -5712,6 +5831,77 @@ void test_qk_gain_offsets() {
     check(n4.k_norm == 0 && n4.q_norm == 0, "qk gains: the byte count alone is not enough, head_dim has to agree");
 }
 
+// engine#1889, the pack whose q_proj is wider than hidden (Hunyuan-0.5B-Instruct: hidden 1024, q_out 2048). Its
+// one-header attention section is [64 q/k/v tiles at K=1024][640 B][16 o_proj tiles at K=2048]; the reader placed
+// o_proj and left the gains unnamed, so the pack was refused as "gains are not where the block layout says". The
+// numbers are the pack's own: payload 3,691,136 B from attn_off 2,112, tiles of 39,168 and 73,984 B, and the gains'
+// bytes found in the .fconst from the graph's initializers at 2,508,928 (q) and 2,509,248 (k) in every block.
+void test_wide_q_attn_section() {
+    const pi::WideQAttnSection s = pi::wide_q_attn_section(2112, 3691136, 64, 39168, 16, 73984, 128);
+    check(s.ok && s.gap == 640, "wide-q section: Hunyuan-0.5B's remainder is the 640 B gap");
+    check(s.o_off == 2112 + 64 * 39168 + 640, "wide-q section: o_proj starts after the gap");
+    check(s.q_norm == 2508928, "wide-q section: q_norm is named, where the graph's bytes are (engine#1889)");
+    check(s.k_norm == 2509248, "wide-q section: k_norm is named, 320 B after q_norm");
+    check(pi::qk_norm_refusal(true, s.k_norm != 0).empty(),
+          "wide-q section: a pack declaring use_qk_norm is therefore not refused for unlocated gains");
+    // a pack of the same shape with no gap (no per-head norms): read, and no gain is invented
+    const pi::WideQAttnSection z = pi::wide_q_attn_section(2112, 3691136 - 640, 64, 39168, 16, 73984, 128);
+    check(z.ok && z.gap == 0 && z.q_norm == 0 && z.k_norm == 0 && z.o_off == 2112 + 64 * 39168,
+          "wide-q section: no gap is read as no gains, o_proj directly after q/k/v");
+    // a norms-sized gap that is not the gains' shape: the section is read, the gains stay unnamed (so a pack that
+    // declares them is still refused rather than handed tile bytes)
+    const pi::WideQAttnSection odd = pi::wide_q_attn_section(2112, 3691136 - 128, 64, 39168, 16, 73984, 128);
+    check(odd.ok && odd.gap == 512 && odd.q_norm == 0 && odd.k_norm == 0,
+          "wide-q section: a 512 B gap is not the [header][gain] pair and names nothing");
+    check(!pi::qk_norm_refusal(true, odd.k_norm != 0).empty(), "wide-q section: and such a pack is still refused");
+    // not this layout at all: a tile too many, or a payload shorter than the tiles
+    check(!pi::wide_q_attn_section(2112, 3691136 + 39168, 64, 39168, 16, 73984, 128).ok,
+          "wide-q section: a remainder of a whole tile is not a norms gap");
+    check(!pi::wide_q_attn_section(2112, 3691136 - 641, 64, 39168, 16, 73984, 128).ok,
+          "wide-q section: a payload shorter than the tiles is refused");
+    check(!pi::wide_q_attn_section(2112, 0, 64, 39168, 16, 73984, 128).ok, "wide-q section: an empty payload is refused");
+    // the same layout with one more [header][gain] section (the gains displaced by 320 B): not a norms gap, so the
+    // caller falls through to the refusals it had before
+    check(!pi::wide_q_attn_section(2112, 3691136 + 320, 64, 39168, 16, 73984, 128).ok,
+          "wide-q section: a 960 B remainder is not this layout");
+    // the offsets are arithmetic on the arguments, not this pack's constants: another head_dim and tile count
+    const pi::WideQAttnSection h64 = pi::wide_q_attn_section(1000, 10 * 500 + 384 + 4 * 900, 10, 500, 4, 900, 64);
+    check(h64.ok && h64.gap == 384 && h64.q_norm == 1000 + 5000 + 64 && h64.k_norm == h64.q_norm + 128 + 64 &&
+              h64.o_off == 1000 + 5000 + 384,
+          "wide-q section: at head_dim 64 the gap is 384 B and every offset follows the arguments");
+}
+
+// Review of engine#2063: the gap's offsets are one number for every layer, so the import checks each layer's bytes to be
+// the [64 B zeros][gain][64 B zeros][gain] pair before writing a gain, and refuses the layer otherwise.
+void test_qk_gap_block_why() {
+    std::vector<uint8_t> gap(640, 0);
+    auto put = [&](size_t off, uint16_t v) { gap[off] = uint8_t(v & 0xFF); gap[off + 1] = uint8_t(v >> 8); };
+    for (int i = 0; i < 128; ++i) {
+        put(64 + 2 * size_t(i), 0x3F80);        // q_norm = 1.0
+        put(384 + 2 * size_t(i), 0x3FC0);       // k_norm = 1.5
+    }
+    check(pi::qk_gap_block_why(gap.data(), 128).empty(), "qk gap: two zero headers and two finite gains are the pair");
+    // the windows displaced by one section (320 B): q's window is then k's header + gain start, as a reader that
+    // placed the gains one section late would see it
+    std::vector<uint8_t> shifted(640, 0);
+    std::copy(gap.begin() + 320, gap.end(), shifted.begin());   // [hdr][k] then zeros where k should be
+    const std::string a = pi::qk_gap_block_why(shifted.data(), 128);
+    check(!a.empty() && a.find("k_norm is all zero") != std::string::npos,
+          "qk gap: a gain displaced by 320 B is refused, naming the gain that is not there");
+    std::vector<uint8_t> hdr = gap;
+    hdr[320 + 7] = 1;
+    const std::string b = pi::qk_gap_block_why(hdr.data(), 128);
+    check(b.find("before k_norm are not zero") != std::string::npos && b.find("byte 7") != std::string::npos,
+          "qk gap: a non-zero header byte is refused with its index");
+    std::vector<uint8_t> inf = gap;
+    inf[64 + 2 * 5] = 0x80; inf[64 + 2 * 5 + 1] = 0x7F;       // +inf in element 5 of q_norm
+    const std::string c = pi::qk_gap_block_why(inf.data(), 128);
+    check(c.find("q_norm element 5 is not finite") != std::string::npos, "qk gap: a non-finite gain is refused by element");
+    std::vector<uint8_t> tile(640);
+    for (size_t i = 0; i < tile.size(); ++i) tile[i] = uint8_t(17 * i + 3);   // tile-like bytes where the gap should be
+    check(!pi::qk_gap_block_why(tile.data(), 128).empty(), "qk gap: tile bytes are not the pair");
+}
+
 /* engine#1985: a REGRESSION, not a new bug -- `Qwen3-1.7B` imported with 0 gaps on yesterday's main and refused with 280
  * on today's, because #1838's early return trusted an epsilon-anchor vote that had recorded ONE in-block header on a block
  * that has three. The tell in the report is `qk_norm: true -> false`: a pack that declares per-head q/k gains keeps them in
@@ -5735,7 +5925,158 @@ void test_header_witness_refusal() {
     std::printf("  header witness: 8 arms (one-header vote vs declaration refuses; 3/1-without-declaration/0 allowed)\n");
 }
 
+// engine#1889: which tile each projection starts at inside the attention payload. Every family before Hunyuan is
+// k, q, v; the Hunyuan block is q, k, v, and reading it k, q, v handed the forward q_proj's first rows as k_proj
+// (byte-exact round trip, filler-word answers). Hunyuan-7B's own counts: 16 k/v tiles, 64 q tiles.
+void test_attn_first_tiles() {
+    const pi::AttnFirstTiles kqv = pi::attn_first_tiles(16, 64, false);
+    check(kqv.k == 0 && kqv.q == 16 && kqv.v == 80, "attn order: k,q,v puts k at tile 0, q at 16, v at 80");
+    const pi::AttnFirstTiles qkv = pi::attn_first_tiles(16, 64, true);
+    check(qkv.q == 0 && qkv.k == 64 && qkv.v == 80, "attn order: q,k,v puts q at tile 0, k at 64, v at 80 (engine#1889)");
+    check(qkv.k + 16 == qkv.v && kqv.q + 64 == kqv.v, "attn order: v follows the second run in both orders");
+    const pi::AttnFirstTiles small = pi::attn_first_tiles(2, 14, false);   // Qwen2.5-0.5B: k 2, q 14, v 2
+    check(small.k == 0 && small.q == 2 && small.v == 16, "attn order: the Qwen2.5-0.5B run (2/14/2) is unchanged");
+    pi::Plan p;
+    check(!p.attn_q_first, "attn order: a plan is k,q,v unless the block measured otherwise");
+
+    // Review of engine#2063: the line that makes the wide-q container right is the tile ORDER, and nothing guarded it.
+    // Hunyuan-0.5B's own section (hidden 1024, q_out 2048: 32 q, 16 k and 16 v tiles of 64 rows), with its gains in the gap.
+    const pi::WideQAttnSection wq = pi::wide_q_attn_section(2112, 3691136, 64, 39168, 16, 73984, 128);
+    pi::Plan w;
+    check(pi::apply_wide_q_section(w, wq, 16, 32, 2048, 1024), "wide-q plan: Hunyuan-0.5B's section is taken");
+    check(w.attn_q_first, "wide-q plan: a wide-q block with its gains in the gap is q,k,v (engine#1889, review of #2063)");
+    const pi::AttnFirstTiles wt = pi::attn_first_tiles(int(16), int(32), w.attn_q_first);
+    check(wt.q == 0 && wt.k == 32 && wt.v == 48,
+          "wide-q plan: q at tile 0, k at 32, v at 48 -- the rows the checkpoint matches (q 0-31, k 32-47, v 48-63)");
+    check(w.attn_tiles == 64 && w.o_k == 2048 && w.o_off == wq.o_off && w.qnorm_off == 2508928 && w.knorm_off == 2509248,
+          "wide-q plan: 64 q/k/v tiles, o_proj at K=q_out after the gap, both gains named");
+    // the same shape without gains in the gap: the section is still read, the order is not claimed
+    const pi::WideQAttnSection wz = pi::wide_q_attn_section(2112, 3691136 - 640, 64, 39168, 16, 73984, 128);
+    pi::Plan z;
+    check(pi::apply_wide_q_section(z, wz, 16, 32, 2048, 1024) && !z.attn_q_first && z.knorm_off == 0,
+          "wide-q plan: no gains in the gap, so no q,k,v claim (k,q,v stays the default)");
+    // q no wider than hidden is not this branch: the plan is left as it was
+    pi::Plan n;
+    check(!pi::apply_wide_q_section(n, wq, 16, 32, 1024, 1024) && !n.attn_q_first && n.attn_tiles == 0,
+          "wide-q plan: q_out == hidden is not the wide-q branch, and the plan is untouched");
+    pi::Plan bad;
+    check(!pi::apply_wide_q_section(bad, pi::WideQAttnSection{}, 16, 32, 2048, 1024) && !bad.attn_q_first,
+          "wide-q plan: a section that was not read is not applied");
+}
+
+// engine#1503: the tied-head rule as ONE predicate -- correlated AND not mis-scaled. Two packs on this box correlate
+// (0.9915 / 0.9961) while being scaled copies of their own embedding (rel_err 0.1361 / 0.0949): they import cleanly and
+// serve garbage, where the pack that serves correctly reports rel_err 0.000000. Correlation alone cannot tell them apart,
+// which is why the correlation-only check passed both and cost two device tickets.
+static void selfcheck_head_rule_arms() {
+    check(pi::selfcheck_head_ok(0.996901, 0.000000), "head rule: the pack that serves correctly passes (corr .9969, rel 0)");
+    check(!pi::selfcheck_head_ok(0.991539, 0.136140), "head rule: a correlated but scaled head is refused (corr .9915, rel .1361)");
+    check(!pi::selfcheck_head_ok(0.996053, 0.094874), "head rule: the second measured pack is refused too (corr .9961, rel .0949)");
+    check(pi::selfcheck_head_ok(0.996053, 0.000000),
+          "head rule: correlated and unscaled passes -- the rule is not 'refuse everything'");
+    check(!pi::selfcheck_head_ok(0.50, 0.000000), "head rule: an uncorrelated head is still refused on correlation");
+    check(pi::selfcheck_head_ok(0.996053, pi::kSelfcheckRelMax), "head rule: exactly at the threshold passes (inclusive bound)");
+    std::printf("  head rule: 6 arms (two measured bad packs, the serving one, the unscaled control, no-corr, boundary)\n");
+
+    // engine#1503: the rule on what it claims (scale, rms ratio, rel against the embedding's own 4-bit noise floor).
+    // Measured fits, from the import's own numbers:
+    const pi::HeadFit qwen2_15b{0.094316, 0.994173, 1.001808, 0.083865};   // Qwen2-1.5B 1.9, block-32 tail head
+    const pi::HeadFit gemma_awq{0.094874, 0.992235, 1.003849, 0.088985};   // gemma-2-2b AWQ hybrid, graph head
+    check(!pi::selfcheck_head_ok(0.995969, qwen2_15b.rel),
+          "fit rule: the rel-only rule refuses Qwen2-1.5B's head (the reason this rule exists)");
+    check(pi::selfcheck_head_ok(0.995969, qwen2_15b),
+          "fit rule: Qwen2-1.5B's head passes: scale .994, rms 1.002, rel 1.12x its 4-bit floor");
+    check(pi::selfcheck_head_ok(0.996053, gemma_awq),
+          "fit rule: gemma-2-2b AWQ's head passes too -- by these numbers its head is not what served garbage");
+    check(pi::selfcheck_head_ok(0.996901, pi::HeadFit{0.0, 1.0, 1.0, 0.08}),
+          "fit rule: a head that IS its embedding (rel 0) passes");
+    check(!pi::selfcheck_head_ok(0.996, pi::HeadFit{0.09, 0.5, 2.0, 0.08}), "fit rule: a head scaled by 2 is refused");
+    check(!pi::selfcheck_head_ok(0.996, pi::HeadFit{0.09, 0.94, 1.0, 0.08}), "fit rule: scale 0.94 (outside 5 %) is refused");
+    check(!pi::selfcheck_head_ok(0.996, pi::HeadFit{0.09, 1.0, 1.06, 0.08}), "fit rule: rms ratio 1.06 is refused");
+    check(!pi::selfcheck_head_ok(0.996, pi::HeadFit{0.13, 1.0, 1.0, 0.08}),
+          "fit rule: rel 1.6x the floor is refused (a partial decode is noisier than quantisation)");
+    check(pi::selfcheck_head_ok(0.996, pi::HeadFit{0.12, 1.0, 1.0, 0.08}), "fit rule: exactly 1.5x the floor passes");
+    check(!pi::selfcheck_head_ok(0.50, qwen2_15b), "fit rule: an uncorrelated head is still refused on correlation");
+
+    // fit_head itself, on a synthetic table: the head is the embedding quantised asymmetric 4-bit at block 32, the way
+    // a correct pack's head is, so the fit must read scale ~1 and rel == floor; the same head scaled by 0.5 must not.
+    const int N = 64, K = 128;
+    std::vector<uint8_t> emb(size_t(N) * K * 2);
+    std::vector<float> ef(size_t(N) * K);
+    uint32_t st = 12345;
+    for (size_t i = 0; i < ef.size(); ++i) {
+        st = st * 1664525u + 1013904223u;
+        float v = (float(st >> 8) / float(1u << 24) - 0.5f) * 0.2f;
+        uint32_t b;
+        std::memcpy(&b, &v, 4);
+        const uint16_t h = uint16_t(b >> 16);   // bf16: the top half, so ef[] holds exactly what the table says
+        b = uint32_t(h) << 16;
+        std::memcpy(&v, &b, 4);
+        ef[i] = v;
+        emb[2 * i] = uint8_t(h & 0xff);
+        emb[2 * i + 1] = uint8_t(h >> 8);
+    }
+    pi::EmbedTable et;
+    et.p = emb.data();
+    et.H = K;
+    pi::Q4 q;
+    q.N = N; q.K = K; q.block = 32;
+    q.codes.assign(size_t(N) * K, 0);
+    q.scale.assign(size_t(N) * (K / 32), 0.f);
+    q.zero.assign(size_t(N) * (K / 32), 0.f);
+    for (int n = 0; n < N; ++n)
+        for (int g = 0; g < K / 32; ++g) {
+            float lo = 1e30f, hi = -1e30f;
+            for (int k = 0; k < 32; ++k) { lo = std::min(lo, ef[size_t(n) * K + g * 32 + k]); hi = std::max(hi, ef[size_t(n) * K + g * 32 + k]); }
+            const float sc = (hi - lo) / 15.f;
+            q.scale[size_t(n) * (K / 32) + g] = sc;
+            q.zero[size_t(n) * (K / 32) + g] = lo;
+            for (int k = 0; k < 32; ++k)
+                q.codes[size_t(n) * K + g * 32 + k] =
+                    uint8_t(std::min(15.0, std::max(0.0, std::round((double(ef[size_t(n) * K + g * 32 + k]) - lo) / sc))));
+        }
+    const pi::HeadFit good = pi::fit_head(q, et, N, 32);
+    check(std::fabs(good.scale - 1) < 0.01 && std::fabs(good.rms_ratio - 1) < 0.01 && good.rel > 0 &&
+              std::fabs(good.rel - good.floor) < 1e-6 && pi::selfcheck_head_ok(0.999, good),
+          "fit_head: a correct 4-bit head reads scale ~1, rel == its floor, and passes (scale " +
+              std::to_string(good.scale) + " rel " + std::to_string(good.rel) + " floor " + std::to_string(good.floor) + ")");
+    // The floor follows the head's block (the block-128 tail head passes 128): the same table quantised at block 128
+    // must read rel == its block-128 floor, which is LARGER than the block-32 floor of the same table.
+    pi::Q4 q128 = q;
+    for (int n = 0; n < N; ++n)
+        for (int g = 0; g < K / 128; ++g) {
+            float lo = 1e30f, hi = -1e30f;
+            for (int k = 0; k < 128; ++k) { lo = std::min(lo, ef[size_t(n) * K + g * 128 + k]); hi = std::max(hi, ef[size_t(n) * K + g * 128 + k]); }
+            const float sc = (hi - lo) / 15.f;
+            for (int j = 0; j < 4; ++j) {   // a 128-block's scale and zero apply to its four 32-column groups
+                q128.scale[size_t(n) * (K / 32) + g * 4 + j] = sc;
+                q128.zero[size_t(n) * (K / 32) + g * 4 + j] = lo;
+            }
+            for (int k = 0; k < 128; ++k)
+                q128.codes[size_t(n) * K + g * 128 + k] =
+                    uint8_t(std::min(15.0, std::max(0.0, std::round((double(ef[size_t(n) * K + g * 128 + k]) - lo) / sc))));
+        }
+    const pi::HeadFit f128 = pi::fit_head(q128, et, N, 128);
+    check(std::fabs(f128.rel - f128.floor) < 1e-6 && f128.floor > good.floor && pi::selfcheck_head_ok(0.999, f128),
+          "fit_head: at block 128 the floor is the block-128 one (rel " + std::to_string(f128.rel) + " == floor " +
+              std::to_string(f128.floor) + " > block-32 floor " + std::to_string(good.floor) + ")");
+    pi::Q4 half = q;
+    for (auto& v : half.scale) v *= 0.5f;
+    for (auto& v : half.zero) v *= 0.5f;
+    const pi::HeadFit bad = pi::fit_head(half, et, N, 32);
+    check(std::fabs(bad.scale - 2) < 0.05 && !pi::selfcheck_head_ok(0.999, bad),
+          "fit_head: the same head at half scale reads scale ~2 and is refused (scale " + std::to_string(bad.scale) + ")");
+    check(pi::known_bad_architecture("gemma2") != nullptr &&
+              std::string(pi::known_bad_architecture("gemma2")).find("not yet found") != std::string::npos,
+          "known-bad: gemma2 stays refused, by name and with the reason (the head fit no longer refuses it)");
+    check(pi::known_bad_architecture("qwen2") == nullptr && pi::known_bad_architecture("llama") == nullptr &&
+              pi::known_bad_architecture("") == nullptr,
+          "known-bad: nothing else is on the list");
+    std::printf("  head fit rule: 15 arms (two measured heads, scaled/rms/noisy/no-corr controls, fit_head at blocks 32 and 128, gemma2 by name)\n");
+}
+
 int main(int argc, char** argv) {
+    selfcheck_head_rule_arms();
     // engine#1907: every crafted 1.9 import writes a canonical copy into the scratch cache. Without this the suite left 0-byte
     // copies in the user's real ~/.cache/1bit/fconst19 and in /tmp on every run. Give the run its own directory, removed at exit.
     const fs::path run_scratch = ::onebit::test::tmp_root() / ("1bit-pack-test-scratch-" + std::to_string(::getpid()));
@@ -5747,8 +6088,12 @@ int main(int argc, char** argv) {
     test_header_witness_refusal();
     test_encode_tile_code_range();
     test_q4_writer_code_range();
+    test_attn_first_tiles();
     test_qk_norm_refusal();
+    test_head_stored_rows();
     test_qk_gain_offsets();
+    test_wide_q_attn_section();
+    test_qk_gap_block_why();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -5776,7 +6121,8 @@ int main(int argc, char** argv) {
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);
-        test_matmulnbits();
+        test_head_row_padding();
+    test_matmulnbits();
         test_tiles(golden_dir);
         test_q4_1f();
         test_attn_tile(golden_dir);

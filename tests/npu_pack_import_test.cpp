@@ -6257,6 +6257,11 @@ static void test_container_role_slots() {
               "slots: the layer type does not move a role it does not decide");
         check(container_role_slot("qkv_proj", "sliding_attention").empty(),
               "slots: sliding attention is not linear, so the fused qkv stays unplaced");
+        // the arm for the substring defect: a value that CONTAINS "linear" and is not linear attention must not match
+        check(container_role_slot("qkv_proj", "nonlinear_attention").empty(),
+              "slots: a layer type that merely contains 'linear' is not linear attention");
+        check(container_role_slot("qkv_proj", "linear_sliding_attention").empty(),
+              "slots: neither is a compound name containing it");
     }
     {
         // no two roles may claim the same slot: a collision silently drops one of them

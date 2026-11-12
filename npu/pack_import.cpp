@@ -3522,10 +3522,20 @@ static const struct { const char* role; const char* why; } kRoleNoSlot[] = {
     {"shared_expert_gate",  "same"},
 };
 
+// The layer types that are linear attention, as an EXACT set rather than a substring: the defect family this stack
+// exists to fix is substring matching where an identity was meant (#1840, #1841, #2277's needle order). A value that
+// merely contains "linear" is not linear attention, and a new family (gdn, mamba-style) must be added here on purpose.
+static const char* const kLinearAttentionLayerTypes[] = {"linear_attention"};
+
+static bool is_linear_attention(const std::string& layer_type) {
+    for (const char* t : kLinearAttentionLayerTypes) if (layer_type == t) return true;
+    return false;
+}
+
 std::string container_role_slot(const std::string& role, const std::string& layer_type) {
     if (role == "qkv_proj") {
         // The engine's only fused-qkv slot is the linear-attention one; `self_attn.qkv_proj` is not a name it reads.
-        return layer_type.find("linear") != std::string::npos ? "linear_attn.qkv_proj.weight" : std::string();
+        return is_linear_attention(layer_type) ? "linear_attn.qkv_proj.weight" : std::string();
     }
     for (const auto& kv : kRoleSlots) if (role == kv.role) return kv.slot;
     return std::string();

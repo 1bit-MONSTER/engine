@@ -30,7 +30,11 @@
 # The repository goes in at /srv/1bit-apt and apt reads it as file://, so the signed-by chain is the
 # same one https would use: an unsigned or wrongly signed Release file fails the build here.
 set -euo pipefail
-[ $# -ge 2 ] || { sed -n '21,32p' "$0"; exit 2; }
+
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- several of these ranges
+# had drifted past the end of their header and printed code to whoever asked for help (the same defect engine PR #2258 fixed in scripts/).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+[ $# -ge 2 ] || { usage; exit 2; }
 repo=$(cd "$1" && pwd) rootfs=$2 sshkey=${3:-}
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/pin.txt"

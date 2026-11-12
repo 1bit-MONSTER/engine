@@ -144,6 +144,12 @@ public:
     virtual int draft(const std::vector<float>& hidden, int last_token, int pos, int k,
                       std::vector<int>& out, std::vector<float>* conf = nullptr) = 0;
     virtual void reset() {}
+    // Whether draft() reads `hidden`, the base's state after `last_token`. true (the MTP head): the loop has to run
+    // `last_token` through the base first, so a round is two base passes (that step, then the verify batch).
+    // false (a DFlash draft, which drafts from the base's committed rows plus the last token's embedding): the loop
+    // verifies [last_token, d1..dk] as ONE batch of k + 1 rows, so a round is one base pass, and draft() is handed an
+    // empty `hidden`. engine#1781; docs/npu.md, "The draft loop, and whether to serve it".
+    virtual bool needs_last_hidden() const { return true; }
     // Called once per iteration with the rows that were committed: `hidden_rows` is M x hidden_size and holds the
     // base's post-norm hidden of each accepted position (row 0 = the first accepted draft).  A drafter keeps its
     // own stream (the MTP layer attends over its own states), so it advances here -- without this it would see
@@ -268,6 +274,84 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
             if (!base.step(t1, pos++, logits)) { r.err = "step failed"; return r; }
             r.stats.steps++;
             r.stats.ms_step += lap(tp);
+            continue;
+        }
+
+        if (!head->needs_last_hidden()) {
+            // The one-pass round: t1 is row 0 of the verify batch instead of a step of its own. Row i of the batch is
+            // the base's choice after position pos + i, so draft i is checked against row i, and the round commits t1
+            // plus the accepted drafts (take + 1 rows); the next round's t1 is the choice in row `take`.
+            const int left = opt.max_tokens - (int)r.tokens.size();   // tokens this run may still emit
+            const int room = std::min({k, base.max_batch_rows() - 1, left});
+            std::vector<int> d;
+            std::vector<float> conf;
+            int nd = 0;
+            if (room > 0) {
+                static const std::vector<float> no_hidden;
+                r.stats.chain_at.push_back(pos + 1);
+                nd = head->draft(no_hidden, t1, pos + 1, room, d, &conf);
+                r.stats.ms_draft += lap(tp);
+                nd = std::min(nd, std::min(room, (int)d.size()));
+            }
+            if (nd <= 0) {
+                // Nothing to verify (no proposal, or the budget is spent): consume t1 the plain way, so the base has
+                // run every token it was handed.
+                if (!base.step(t1, pos++, logits)) { r.err = "step failed"; return r; }
+                r.stats.steps++;
+                r.stats.ms_step += lap(tp);
+                if (head) head->commit_rows(std::vector<int>{t1}, base.last_hidden(), 1);
+                if ((int)r.tokens.size() >= opt.max_tokens) break;
+                continue;
+            }
+            d.resize((size_t)nd);
+            if (opt.tau > 0.0f && conf.size() == d.size()) {
+                for (int i = 0; i < nd; i++)
+                    if (conf[(size_t)i] < opt.tau) { nd = i + 1; break; }
+                d.resize((size_t)nd);
+            }
+            std::vector<int> batch{t1};
+            batch.insert(batch.end(), d.begin(), d.end());
+            if (!base.step_batch_all(batch, pos, all)) { r.err = "verify batch failed"; return r; }
+            r.stats.ms_batch += lap(tp);
+            r.stats.iterations++;
+            r.stats.batches++;
+            r.stats.rows_verified += nd;
+            r.stats.drafted += nd;
+            for (int i = 0; i < nd && i < Stats::kMaxDepth; i++) r.stats.drafted_at[i]++;
+            int a = 0;
+            while (a < nd && argmax(&all[(size_t)a * (size_t)V], V) == d[(size_t)a]) a++;
+            // nd <= left, so every accepted draft fits the budget; only the consumer can stop the prefix early.
+            int take = 0;
+            bool stopped = false;
+            for (int i = 0; i < a; i++) {
+                const bool keep = emit(d[(size_t)i]);
+                take = i + 1;
+                if (!keep) { stopped = true; break; }
+            }
+            r.stats.accepted += a;
+            r.stats.chain_drafts.push_back(d);
+            r.stats.chain_accepted.push_back(a);
+            for (int i = 0; i < a && i < Stats::kMaxDepth; i++) r.stats.accepted_at[i]++;
+            for (int i = 0; i <= a && i < nd && i < Stats::kMaxDepth; i++) r.stats.reached_at[i]++;
+            if (a == 0) r.stats.first_reject++;
+            if (!base.commit_verify(take + 1)) { r.err = "commit_verify refused"; return r; }
+            const std::vector<float>& rows = base.last_hidden_rows();
+            const size_t h = (size_t)base.hidden_size();
+            const size_t got = (h && rows.size() % h == 0) ? rows.size() / h : 0;
+            if (!rows.empty()) {
+                if (got != (size_t)(take + 1) && got != (size_t)(nd + 1)) {
+                    r.err = "drafter rows: base returned " + std::to_string(got) + " rows, want " +
+                            std::to_string(take + 1) + " (committed prefix) or " + std::to_string(nd + 1) + " (batch)";
+                    return r;
+                }
+                std::vector<int> kept{t1};
+                kept.insert(kept.end(), d.begin(), d.begin() + take);
+                head->commit_rows(kept, rows, take + 1);
+            }
+            r.stats.ms_commit += lap(tp);
+            logits.assign(all.begin() + (size_t)take * (size_t)V, all.begin() + (size_t)(take + 1) * (size_t)V);
+            pos += take + 1;
+            if (stopped || (int)r.tokens.size() >= opt.max_tokens) break;
             continue;
         }
 

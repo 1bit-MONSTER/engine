@@ -225,6 +225,11 @@ add_test(NAME bump_hrx_sync COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_sync
 add_executable(npu_decode_note_test tests/npu_decode_note_test.cpp)
 target_include_directories(npu_decode_note_test PRIVATE app)
 add_test(NAME npu_decode_note COMMAND npu_decode_note_test)
+# engine#823: tools/xhci_boot_capture.sh's verdict function says of itself "A function, not an inline block, so the
+# three classifications can be driven on a fixture without a device" -- and was never driven. It takes no build input,
+# so a script row is the whole registration.
+add_test(NAME xhci_verdict_line COMMAND bash ${CMAKE_SOURCE_DIR}/tests/xhci_verdict_line_test.sh
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_dependencies(onebit npu_decode_note_test)
 # engine#2106: a shipped kernel set's own consistency -- manifest vs bytes, one form or none, name vs directory. The
 # refusal this pre-empts ("differ in size") needed private-repo archaeology to diagnose; the symptom is checkable here.

@@ -15,7 +15,7 @@
 # limitations under the License.
 """The batch-check state pin (tests/batch_check_state_test.cpp, engine#1905/#1946) on a container made here.
 
-usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|lfm3|qwen2|qwen2vl|qwen3_5|hy_v3] (needs numpy)
+usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|lfm3|qwen2|qwen2vl|qwen2_untied|qwen3_5|hy_v3] (needs numpy)
 
 batch_check_state_test needs a Q4NX container, and CI has none, so on its own it skips (77) there and a regression of
 #1909 -- the NPU_BATCH_CHECK oracle resetting the prefix it replays from -- lands green. This writes a two-layer qwen3
@@ -107,7 +107,7 @@ def make_model(d, np, family="qwen3"):
     rng = np.random.default_rng(1946)
     lfm2 = family == "lfm2"
     lfm3 = family == "lfm3"
-    qwen2 = family in ("qwen2", "qwen2vl")
+    qwen2 = family in ("qwen2", "qwen2vl", "qwen2_untied")
     q35 = family == "qwen3_5"
     layers = 3 if lfm2 else (4 if lfm3 else LAYERS)
     conv_layers = (0, 2) if (lfm2 or lfm3) else ()
@@ -501,7 +501,7 @@ def tmp_root():
 
 
 def main():
-    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen2", "qwen2vl", "qwen3_5", "hy_v3")):
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen2", "qwen2vl", "qwen2_untied", "qwen3_5", "hy_v3")):
         print(__doc__.strip().splitlines()[2])
         return 2
     family = sys.argv[2] if len(sys.argv) == 3 else "qwen3"
@@ -526,9 +526,18 @@ def main():
             redeclare_3d(out, {"model.layer.1.mlp.gate_exps_proj.weight": (c["E"] * c["EIM"] // 32, c["H"] // 256),
                                "model.layer.1.mlp.up_exps_proj.weight": (c["E"] * c["EIM"] // 32, c["H"] // 256),
                                "model.layer.1.mlp.down_exps_proj.weight": (c["E"] * c["H"] // 32, c["EIM"] // 256)})
+        if family == "qwen2_untied":
+            # FastFlowLM's Qwen3.5-9B-NPU2 states no tie_word_embeddings and ships a separate head (engine#1786): the
+            # forward must not take the absent key for a tie. Strip it from the container the forward reads.
+            cp = os.path.join(out, "config.json")
+            with open(cp) as f:
+                c = json.load(f)
+            c.pop("tie_word_embeddings", None)
+            with open(cp, "w") as f:
+                json.dump(c, f)
         env = dict(os.environ, ONEBIT_TEST_Q4NX=out)
         logits_out = os.path.join(tmp, "sequential.f32")
-        if family in ("lfm3", "qwen2", "qwen2vl", "hy_v3"):
+        if family in ("lfm3", "qwen2", "qwen2vl", "qwen2_untied", "hy_v3"):
             env["ONEBIT_TEST_LOGITS_OUT"] = logits_out
         env.pop("NPU_INFER_HOST_GEMM", None)   # init_host is host-GEMM already; nothing else should steer it
         r = subprocess.run([sys.argv[1]], env=env, capture_output=True, text=True, timeout=110)
@@ -541,7 +550,7 @@ def main():
             # arm, not a reason to skip it.
             print("FAIL  batch_check_state_test skipped on the fabricated container (init_host refused it)")
             return 1
-        if family in ("lfm3", "qwen2", "qwen2vl", "hy_v3") and r.returncode == 0:
+        if family in ("lfm3", "qwen2", "qwen2vl", "qwen2_untied", "hy_v3") and r.returncode == 0:
             ours = np.fromfile(logits_out, dtype=np.float32)[:VOCAB]
             ref = {"lfm3": lfm3_reference, "hy_v3": hyv3_reference}.get(family, qwen2_reference)(out, np, [1, 2, 3, 4, 5, 6], shapes)
             corr = float(np.corrcoef(ours, ref)[0, 1])

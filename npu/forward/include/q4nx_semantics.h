@@ -209,6 +209,10 @@ typedef struct {
      * logits from the embedding gives a completely different distribution
      * (corr 0.013 with the real head).  Source: tie_word_embeddings. */
     int tie_embeddings;
+    /* Whether config.json states tie_word_embeddings at all. FastFlowLM's Qwen3.5-9B-NPU2 omits it although the
+     * model is untied (its lm_head.weight is not the embedding), so an absent key is not evidence of a tie: the
+     * forward then decides from the container's own two tables (engine#1786). */
+    int tie_stated;
 } Q4nxSemantics;
 
 /* Identifier for each flag, for the auditable field mapping. */

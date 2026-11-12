@@ -42,12 +42,15 @@ typedef enum {
 
 /* Attention layer kinds, from layer_types.  FULL and SLIDING run the attention block, LINEAR runs the
  * GDN recurrence (lin_kd_/conv_state_); OTHER is anything else, which nothing implements - the forward
- * refuses a container whose layer_types contains one, by name (unknown_layer_type). */
+ * refuses a container whose layer_types contains one, by name (unknown_layer_type).  CONV is LFM3's
+ * spelling of LFM2's gated short convolution ("conv"); the forward runs it only where the container holds
+ * that layer's conv tensors, and refuses a mismatch either way. */
 typedef enum {
     Q4NX_LAYER_FULL = 0,
     Q4NX_LAYER_SLIDING,
     Q4NX_LAYER_LINEAR,
-    Q4NX_LAYER_OTHER
+    Q4NX_LAYER_OTHER,
+    Q4NX_LAYER_CONV
 } Q4nxLayerType;
 
 typedef struct {
@@ -153,8 +156,14 @@ typedef struct {
     int num_kv_shared_layers;
     /* Gemma4 adds pre/post feedforward norms and a post-PLE norm that the plain
      * layer does not have (1).  Gemma3 has the same sandwich around attention and
-     * MLP but no post-PLE norm and no layer scalar (2).  Source: model_type. */
+     * MLP but no post-PLE norm and no layer scalar (2).  LFM3's use_sandwich_norm is the same pair of norms
+     * around both blocks (post_operator_norm, post_ffn_norm), so it is 2 as well.  Source: model_type, and
+     * use_sandwich_norm for lfm3 (default true, as configuration_lfm3.py). */
     int extra_layer_norms;
+    /* LFM3: every attention layer carries self_attn.gate_proj [heads, hidden] (bf16), and each head's
+     * context is multiplied by sigmoid(gate_proj . x) before o_proj, x being the operator-normed input.
+     * Source: model_type. */
+    int attn_head_gate;
     /* Gemma3 states the sliding layers' RoPE base on its own, as
      * `rope_local_base_freq`, and its `rope_scaling` applies to the full layers
      * only.  1 when that key was read into rope_theta_sliding. */

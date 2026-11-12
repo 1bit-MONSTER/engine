@@ -1756,6 +1756,14 @@ target_include_directories(q4nx_gemma3_semantics_test PRIVATE npu/forward/includ
 target_link_libraries(q4nx_gemma3_semantics_test PRIVATE m)
 add_test(NAME q4nx_gemma3_semantics COMMAND q4nx_gemma3_semantics_test)
 add_dependencies(npu_sampling_test q4nx_gemma3_semantics_test)
+# LFM3 (engine#1786): "conv" in layer_types, the sandwich, the per-head gate, the zero-tail RoPE, and model_load's
+# renaming of the upstream tensor names. Links the two C sources directly, no model and no device.
+add_executable(q4nx_lfm3_semantics_test tests/q4nx_lfm3_semantics_test.cpp npu/forward/src/model.c
+               npu/forward/src/q4nx_semantics.c)
+target_include_directories(q4nx_lfm3_semantics_test PRIVATE npu/forward/include)
+target_link_libraries(q4nx_lfm3_semantics_test PRIVATE m)
+add_test(NAME q4nx_lfm3_semantics COMMAND q4nx_lfm3_semantics_test)
+add_dependencies(npu_sampling_test q4nx_lfm3_semantics_test)
 add_dependencies(npu_sampling_test q4nx_qk_norm_test)
 add_executable(q4nx_layer_kinds_test tests/q4nx_layer_kinds_test.c npu/forward/src/q4nx_semantics.c)
 target_include_directories(q4nx_layer_kinds_test PRIVATE npu/forward/include)
@@ -2123,6 +2131,11 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> lfm2)
     set_tests_properties(batch_check_state_lfm2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # LFM3 (engine#1786): the upstream tensor names, "conv" in layer_types, sandwich norms and the per-head gate.
+    add_test(NAME batch_check_state_lfm3
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> lfm3)
+    set_tests_properties(batch_check_state_lfm3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # A fabricated qwen3_5 hybrid (a linear-attention layer, then attention), off the kernel's N grid on purpose.
     add_test(NAME batch_check_state_qwen35
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py

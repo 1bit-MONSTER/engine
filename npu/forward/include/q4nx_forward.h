@@ -647,6 +647,10 @@ private:
     // Layout and maths: docs/qwen35-4b-weight-format.md.
     int lin_kd_ = 0, lin_vd_ = 0;        // key_dim = nkh*khd, value_dim = nvh*vhd
     int attn_gate_ = 0;                   // qwen3_5 attn_output_gate
+    // LFM3's per-head output gate, [NH][H] per attention layer (empty for conv layers and other models):
+    // ctx of head h *= sigmoid(head_gate_[l][h] . xn), xn the operator-normed layer input.
+    std::vector<std::vector<float>> head_gate_;
+    void apply_head_gate(int l, const float* xn, float* ctx, int hd) const;
     int lin_nkh_ = 0, lin_nvh_ = 0;      // head counts
     int lin_khd_ = 0, lin_vhd_ = 0;      // head dims
     int lin_ck_ = 4;                     // depthwise conv kernel

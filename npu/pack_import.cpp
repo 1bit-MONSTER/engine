@@ -15,6 +15,8 @@
 
 #include "pack_import.h"
 
+#include "onnx_graph.h"
+
 #include "file_map.h"
 #include "pack.h"
 #include "q4nx.h"
@@ -85,6 +87,9 @@ std::vector<Field> pb(const uint8_t* p, size_t n) {
             }
             case 5:
                 if (size_t(end - p) < 4) throw std::runtime_error("protobuf: truncated fixed32");
+                // engine#1931: keep the four bytes in v. A float attribute (LayerNormalization's epsilon) is wire 5, and
+                // without this every such attribute reads as 0.0 -- indistinguishable from an absent one.
+                f.v = uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
                 p += 4;
                 break;
             default: throw std::runtime_error("protobuf: unsupported wire type " + std::to_string(f.wire));
@@ -6518,6 +6523,88 @@ void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::
 // copy is ambiguous with it at every call site). Correlated AND not a scaled copy of the embedding -- the two states this
 // box measures are rel_err 0.000000 (serves) and 0.095/0.136 (imports cleanly, answers garbage).
 bool selfcheck_head_ok(double corr, double rel) { return corr > kTieCorr && rel <= kSelfcheckRelMax; }
+
+// engine#1931: a full graph reader, for packs that are plain f32 graphs (the Whisper encoder) rather than quantised LLM
+// packs. The census walk above keeps only the MatMul family by design; this one keeps every node in graph order, which ONNX
+// guarantees is topological, plus the initializer names -- so an executor can tell "a weight" from "a graph input", and a
+// pack that breaks the ordering is refused by name instead of producing plausible activations.
+OnnxGraphInfo parse_onnx_graph(const std::string& path) {
+    size_t size = 0;
+    std::string why;
+    const uint8_t* base = map_file(path, size, &why);
+    if (base == nullptr) throw std::runtime_error(path + ": " + why);
+    const auto model = pb(base, size);              // ModelProto
+    const auto* gfield = field1(model, 7);          // ModelProto.graph
+    if (gfield == nullptr) throw std::runtime_error(path + ": no ModelProto.graph (field 7)");
+    const auto g = pb(gfield->p, gfield->n);
+
+    OnnxGraphInfo out;
+    const size_t slash = path.find_last_of('/');
+    out.dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
+    for (const auto* f : fields(g, 11)) {           // graph.input
+        const auto vi = pb(f->p, f->n);
+        if (const auto* nm = field1(vi, 1)) out.inputs.push_back(pb_str(*nm));
+    }
+    for (const auto* f : fields(g, 12)) {           // graph.output
+        const auto vi = pb(f->p, f->n);
+        if (const auto* nm = field1(vi, 1)) out.outputs.push_back(pb_str(*nm));
+    }
+    for (const auto* f : fields(g, 5)) {            // graph.initializer
+        const auto t = pb(f->p, f->n);
+        const auto* nm = field1(t, 8);
+        if (nm == nullptr) continue;
+        out.initializers.push_back(pb_str(*nm));
+        OnnxInit ti;
+        ti.name = pb_str(*nm);
+        if (const auto* dt = field1(t, 2)) ti.dtype = int(dt->v);
+        for (const auto* d : fields(t, 1)) ti.dims.push_back(int64_t(d->v));
+        if (const auto* rd = field1(t, 9)) {
+            ti.raw = rd->p;
+            ti.raw_len = rd->n;
+        }
+        for (const auto* d : fields(t, 13)) {       // TensorProto.external_data: key/value string pairs
+            const auto kv = pb(d->p, d->n);
+            const auto* k = field1(kv, 1);
+            const auto* v = field1(kv, 2);
+            if (k == nullptr || v == nullptr) continue;
+            const std::string key = pb_str(*k), val = pb_str(*v);
+            if (key == "location") ti.location = val;
+            else if (key == "offset") ti.offset = std::stoull(val);
+            else if (key == "length") ti.length = std::stoull(val);
+        }
+        if (!ti.location.empty()) out.external.push_back(ti.name);
+        out.init_tensors.push_back(std::move(ti));
+    }
+    for (const auto* f : fields(g, 1)) {            // graph.node
+        const auto node = pb(f->p, f->n);
+        OnnxNodeInfo ni;
+        if (const auto* o = field1(node, 4)) ni.op = pb_str(*o);
+        if (const auto* nm = field1(node, 3)) ni.name = pb_str(*nm);
+        for (const auto* i : fields(node, 1)) ni.ins.push_back(pb_str(*i));
+        for (const auto* o : fields(node, 2)) ni.outs.push_back(pb_str(*o));
+        for (const auto* a : fields(node, 5)) {     // AttributeProto
+            const auto at = pb(a->p, a->n);
+            const auto* nm = field1(at, 1);
+            if (nm == nullptr) continue;
+            const std::string key = pb_str(*nm);
+            if (const auto* iv = field1(at, 3)) ni.attrs[key] = int64_t(iv->v);   // INT
+            if (const auto* fv = field1(at, 2)) {                                 // FLOAT (wire 5, see fields())
+                const uint32_t bits = uint32_t(fv->v);
+                float f32 = 0.0f;
+                std::memcpy(&f32, &bits, sizeof f32);
+                ni.attrs_float[key] = f32;
+            }
+            std::vector<int64_t> list;
+            for (const auto* iv : fields(at, 8)) list.push_back(int64_t(iv->v));  // INTS
+            if (!list.empty()) ni.attrs_list[key] = std::move(list);
+        }
+        out.nodes.push_back(std::move(ni));
+    }
+    // NOT unmapped: init_tensors[].raw points into this mapping, and the executor copies what it needs while it is alive.
+    // shortcut: the mapping is released when the process exits; a long-lived caller that parses many graphs should own the
+    // mapping itself, which is the refactor to make when a second consumer appears.
+    return out;
+}
 
 const char* known_bad_architecture(const std::string& model_type) {
     if (model_type == "gemma2")

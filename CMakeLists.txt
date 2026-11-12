@@ -804,7 +804,7 @@ if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp
-                            npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
+                            npu/audio_exec.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
@@ -1378,6 +1378,28 @@ endif()
 # q4nx_pack.c is listed here rather than reached through onebit_npu: the integer host arm's checks
 # (engine#1808) call q4nx_host_gemm_i8*() directly, and those live in that file.
 add_executable(npu_pack_test tests/npu_pack_test.cpp npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
+# The Whisper encoder front-end's four f32 host kernels: no container, no device, so it runs wherever this file is built
+# (the same reason #1830/#1863 put their arms in a binary CI already compiles). Values come from the encoder reference.
+add_executable(audio_ops_test tests/audio_ops_test.cpp)
+target_include_directories(audio_ops_test PRIVATE npu/forward/include)
+# The audio pack's graph, read through the engine: pins the topological-order assumption the executor needs and the op
+# census the host reference was written against. Skips (77) without a path.
+add_executable(onnx_graph_test tests/onnx_graph_test.cpp)
+target_link_libraries(onnx_graph_test PRIVATE onebit_npu)
+add_executable(whisper_transcribe tools/whisper_transcribe.cpp)
+target_include_directories(whisper_transcribe PRIVATE npu/forward/include)
+target_link_libraries(whisper_transcribe PRIVATE onebit_npu)
+add_executable(audio_mel_test tests/audio_mel_test.cpp)
+target_include_directories(audio_mel_test PRIVATE npu/forward/include)
+add_executable(audio_exec_test tests/audio_exec_test.cpp)
+target_link_libraries(audio_exec_test PRIVATE onebit_npu)
+# The executor's fork-join (npu/audio_parallel.h): MatMul bit-identical across ONEBIT_AUDIO_THREADS, and a throwing unit
+# is a caught exception rather than std::terminate. The graph is built in memory, so: no pack, no device.
+add_executable(audio_parallel_test tests/audio_parallel_test.cpp)
+target_link_libraries(audio_parallel_test PRIVATE onebit_npu Threads::Threads)
+# ci.yml's build list is not ours to edit without `workflow` scope, so these reach CI the way ops_dump_test does: as build
+# dependencies of a target it already builds (tools/ci/ci_targets_check.py follows this edge).
+add_dependencies(onebit audio_ops_test audio_mel_test onnx_graph_test audio_exec_test audio_parallel_test)
 # A DFlash draft package as a model source (engine#1780): config + container -> a checked model whose tensors decode
 # one at a time. The loader is compiled here and not into onebit_npu because it needs the q4_1 tile decoder, which
 # lives with the forward (npu/forward/src/q4nx_dequant.c); it moves there with the draft's forward. Synthetic package,
@@ -1729,6 +1751,14 @@ endif()
 if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_BO_DUMP)
     add_test(NAME npu_pack_model COMMAND npu_pack_test ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_BO_DUMP})
 endif()
+add_test(NAME audio_ops COMMAND audio_ops_test)
+add_test(NAME audio_mel COMMAND audio_mel_test)
+set_tests_properties(audio_ops PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME onnx_graph COMMAND onnx_graph_test ${ONEBIT_AUDIO_ONNX})
+add_test(NAME audio_exec COMMAND audio_exec_test ${ONEBIT_AUDIO_ONNX})
+add_test(NAME audio_parallel COMMAND audio_parallel_test)
+set_tests_properties(audio_exec PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(onnx_graph PROPERTIES SKIP_RETURN_CODE 77)
 # The private NPU route registry (npu/private_route.h), without an add-on.
 add_executable(npu_private_route_test tests/npu_private_route_test.cpp)
 target_link_libraries(npu_private_route_test PRIVATE onebit_npu)

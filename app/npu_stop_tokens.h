@@ -56,6 +56,90 @@ inline std::vector<int> eos_token_ids(const nlohmann::json& cfg) {
     return ids;
 }
 
+/// tokenizer_config.json's `eos_token` as text: a plain string, or the AddedToken object form
+/// `{"content": "<|im_end|>", ...}`.  Empty when the key is absent, null or another shape.
+inline std::string eos_token_text(const nlohmann::json& tokenizer_config) {
+    if (!tokenizer_config.is_object() || !tokenizer_config.contains("eos_token")) return {};
+    const nlohmann::json& e = tokenizer_config["eos_token"];
+    if (e.is_string()) return e.get<std::string>();
+    if (e.is_object() && e.contains("content") && e["content"].is_string()) return e["content"].get<std::string>();
+    return {};
+}
+
+/// The marker a chat template closes an assistant turn with, read off the template's own output.  `after` is the
+/// text a template rendered immediately after an assistant message's content; the marker is the `<...>` token it
+/// starts with (leading whitespace skipped), or empty when it starts with anything else.
+///
+/// Why this exists: a model ends its turn with whatever its template ends an assistant turn with, and neither
+/// config.json nor tokenizer_config.json has to name that token.  FastFlowLM's Phi4-mini-Instruct-NPU2 names
+/// <|endoftext|> in both, and its template closes every turn with <|end|> (200020); the upstream checkpoint
+/// lists it in generation_config.json, which the pack does not ship.  Served with only the two files' ids, the
+/// answer was "Paris<|end|><|assistant|>**Follow-up Question 1:** ..." until the token budget ran out
+/// (engine#1786).  The template is the one file every chat pack has, and it cannot disagree with itself.
+///
+///   "<|end|>"            -> "<|end|>"          (Phi)
+///   "<|im_end|>\n"       -> "<|im_end|>"       (ChatML)
+///   "<|eot_id|>"         -> "<|eot_id|>"       (Llama 3)
+///   "<end_of_turn>\n"    -> "<end_of_turn>"    (Gemma)
+///   "\n", "", "</s>x"... -> "" unless it starts with a whole <...> token: plain text after a turn is not a stop.
+inline std::string turn_end_marker(const std::string& after) {
+    size_t i = 0;
+    while (i < after.size() && (after[i] == ' ' || after[i] == '\n' || after[i] == '\r' || after[i] == '\t')) ++i;
+    if (i >= after.size() || after[i] != '<') return {};
+    const size_t close = after.find('>', i);
+    if (close == std::string::npos || close - i < 2) return {};
+    const std::string marker = after.substr(i, close - i + 1);
+    for (char c : marker)
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') return {};
+    return marker;
+}
+
+/// Every id that ends a generation on a container, in the order they were found and without repeats:
+///
+///   1. config.json's `eos_token_id` (one integer or a list): what eos_token_ids() reads;
+///   2. tokenizer_config.json's `eos_token`, looked up in the tokenizer.  The two files are written by
+///      different tools and need not agree.  FastFlowLM's Qwen3.5-2B container says `eos_token_id: 248044`
+///      (<|endoftext|>) in config.json and `eos_token: "<|im_end|>"` (248046) in tokenizer_config.json, and the
+///      model ends a chat turn with the second.  With only the first, the answer came back as
+///      "Item 3 is the 3D printer.<|im_end|>\n": the turn end served as text and one more token generated
+///      after it (engine#1785's row on that container);
+///   3. `chat_turn_end`, the marker the chat route's prompt closes an assistant turn with: ChatML's <|im_end|>
+///      on the fallback route, or turn_end_marker() of the container's own template when that is rendered.  A
+///      prompt whose turns end with that marker is answered by a turn that ends with it, whatever the two files
+///      say.  Pass an empty string when the route has no such marker.
+///
+/// `id_of` maps a token's text to its id, or a negative number when the tokenizer has no such token; a name it
+/// does not know adds nothing.
+template <typename IdOf>
+std::vector<int> stop_token_ids(const nlohmann::json& config, const nlohmann::json& tokenizer_config,
+                                const std::string& chat_turn_end, IdOf&& id_of) {
+    std::vector<int> ids = eos_token_ids(config);
+    const auto add = [&](const std::string& text) {
+        if (text.empty()) return;
+        const int id = id_of(text);
+        if (id < 0) return;
+        for (int have : ids)
+            if (have == id) return;
+        ids.push_back(id);
+    };
+    add(eos_token_text(tokenizer_config));
+    add(chat_turn_end);
+    return ids;
+}
+
+/// A JSON file, or null when it is missing or malformed: both stop-id sources are optional.
+inline nlohmann::json read_json_or_null(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return nullptr;
+    nlohmann::json j;
+    try {
+        f >> j;
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+    return j;
+}
+
 /// eos_token_ids() for a container's config.json.  Unreadable file -> empty.
 inline std::vector<int> eos_token_ids_from_config(const std::string& cfg_path) {
     std::ifstream f(cfg_path);

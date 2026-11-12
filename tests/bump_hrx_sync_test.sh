@@ -102,5 +102,73 @@ other=$(g rev-parse HEAD)
 expect "the same subject and author at another author date is foreign" "$(run "$other" "$pin" | head -n1)" \
   "foreign $(g rev-parse --short "$other") hrx: something new"
 
+# ---- the mirror hold (config/llama-mirror-hold.config): what a named commit means for a run -------------------
+holdf=$work/hold.config
+hold() { LLAMA_HOLD_FILE=$holdf bash "$script" llama-hold "$repo" "$1" "$2"; }
+# a pin that descends from the mirror: build one
+g checkout -q --detach "$mirror"
+commit "$amd" "$amd_mail" 2026-11-10T00:00:00Z 2026-11-10T00:00:00Z "hrx: one more on the old line"
+desc=$(g rev-parse HEAD)
+
+rm -f "$holdf"
+expect "no hold file: the sync runs as usual" "$(hold "$mirror" "$pin")" "none"
+printf '# a comment\n#   %s\n' "$mirror" > "$holdf"
+expect "a commit that is only mentioned in a comment holds nothing" "$(hold "$mirror" "$pin")" "none"
+printf '# held\n%s\n' "$mirror" > "$holdf"
+expect "the mirror is the held commit and AMD's pin is on a rewritten line: held" "$(hold "$mirror" "$pin")" "held"
+expect "the mirror has moved away from the held commit: the file is stale" "$(hold "$ours" "$pin")" "stale"
+expect "AMD's pin contains the held commit again: the hold is not needed" "$(hold "$mirror" "$desc")" "unneeded"
+expect "the pin IS the held commit: not needed either" "$(hold "$mirror" "$mirror")" "unneeded"
+printf 'not-a-sha\n%s extra words\n' "$mirror" > "$holdf"
+expect "the commit line may carry a trailing note; a line that is not a commit is ignored" "$(hold "$mirror" "$pin")" "held"
+printf '%s\n' "${mirror:0:12}" > "$holdf"
+expect "a short hash is not a hold: forty hex digits or nothing" "$(hold "$mirror" "$pin")" "none"
+
+# The file shipped in the tree: whatever it names must be one full commit hash or nothing, and what it means for a
+# run is decided by the same function as above (a hold on a commit the mirror has left is stale, and so on).
+shipped=$(cd "$(dirname "$script")/.." && pwd)/config/llama-mirror-hold.config
+if [ -f "$shipped" ]; then
+  n=$(grep -v '^[[:space:]]*#' "$shipped" | grep -cE '^[0-9a-f]{40}' || true)
+  if [ "$n" -le 1 ]; then ok "the shipped hold file names at most one commit"; else fail "the shipped hold file names at most one commit (found $n)"; fi
+  junk=$(grep -v '^[[:space:]]*#' "$shipped" | grep -v '^[[:space:]]*$' | grep -vcE '^[0-9a-f]{40}([[:space:]].*)?$' || true)
+  expect "every line of the shipped hold file is a comment, blank, or a full commit hash" "$junk" "0"
+else
+  fail "config/llama-mirror-hold.config is in the tree"
+fi
+
+# ---- which branch is the mirror (config/llama-mirror-branch.config) -----------------------------------------
+mb=$work/mirror.config
+branch() { LLAMA_MIRROR_FILE=$mb bash "$script" mirror-branch 2>&1; }
+rm -f "$mb"
+expect "no file: the mirror is 1bit/hrx-vulkan, as it always was" "$(branch)" "1bit/hrx-vulkan"
+printf '# only comments\n\n#   1bit/hrx-vulkan-20261110\n' > "$mb"
+expect "a branch that is only mentioned in a comment changes nothing" "$(branch)" "1bit/hrx-vulkan"
+printf '# the dated mirror\n\n  1bit/hrx-vulkan-20261110  \n1bit/ignored-second-line\n' > "$mb"
+expect "the first line that is not a comment names the mirror, spaces around it ignored" "$(branch)" "1bit/hrx-vulkan-20261110"
+for bad in '1bit/hrx-vulkan-patched' 'refs/heads/1bit/x' '../x' '-x' 'a b' 'x;rm' 'x:y'; do
+  printf '%s\n' "$bad" > "$mb"
+  if out=$(branch); then fail "a mirror named '$bad' is refused (got: $out)"; else
+    case "$out" in *"$mb"*|*llama-mirror*|*mirror*) ok "a mirror named '$bad' is refused, naming the file" ;; *) fail "the refusal of '$bad' names the file (got: $out)" ;; esac
+  fi
+done
+# The same refusal through the path the workflow runs: `llama` reads the name inside a command substitution, where a
+# message written to stdout is captured into the variable and never printed. The run must fail AND say why.
+printf 'x;rm\n' > "$mb"
+mkdir -p "$work/empty-scratch"
+if out=$(cd "$work/empty-scratch" && env -u GH_TOKEN -u GITHUB_TOKEN DRY_RUN=1 LLAMA_MIRROR_FILE=$mb AMD_LLAMA=$(printf "a%.0s" $(seq 40)) OURS_HRX=$(printf "b%.0s" $(seq 40)) bash "$script" llama 2>&1); then
+  fail "the llama sync with a mirror named 'x;rm' fails (it exited 0: $out)"
+else
+  case "$out" in
+    *"::error::"*"not a plain branch name"*) ok "the llama sync refuses a bad mirror name with its ::error:: line, not silently" ;;
+    *) fail "the llama sync's refusal of a bad mirror name is printed (got: '$out')" ;;
+  esac
+fi
+shipped_mb=$(cd "$(dirname "$script")/.." && pwd)/config/llama-mirror-branch.config
+if [ -f "$shipped_mb" ]; then
+  expect "the shipped file names no branch, so the mirror is unchanged" "$(LLAMA_MIRROR_FILE=$shipped_mb bash "$script" mirror-branch)" "1bit/hrx-vulkan"
+else
+  fail "config/llama-mirror-branch.config is in the tree"
+fi
+
 if [ "$fails" -ne 0 ]; then echo "$fails check(s) failed"; exit 1; fi
 echo "bump_hrx_sync: ok"

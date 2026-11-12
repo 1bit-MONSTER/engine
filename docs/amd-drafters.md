@@ -88,7 +88,7 @@ So the Gumiho row is *"fails as published, because our verifier is the wrong sha
 quality (its published numbers are the best in its class: 2.97× mean over Eagle-2's 2.74× on vicuna-7B). Running it would
 mean implementing a tree verifier first, which is its own project.
 
-## DFlash draft packages on the NPU route: **the container is in forms we already read; the forward is what is missing** (engine#1780)
+## DFlash draft packages on the NPU route: **the container is in forms we already read; the forward exists as a host reference, not yet on the device** (engine#1780)
 
 FastFlowLM 1.0.12 ships speculative decode as two-package tags: a small DFlash draft beside the main model's package.
 A draft package is `config.json` (`model_type: dflash`) plus one Q4NX container. `tools/dflash_draft_info.py <dir>`
@@ -115,6 +115,79 @@ disagrees with the stored tiles, a NaN scale, a plain half-float matrix of the s
 the config, or a tensor it cannot explain (the second draft family, `DFlash2DraftModel`, has selector and
 convolution tensors this tool does not know) each fail by name. `--selftest` runs those controls on a synthetic
 package (ctest `tool_selftest_dflash_draft_info`).
+
+### The loader (`npu/dflash_draft.h`)
+
+`onebit::npu::dflash::load_draft(dir)` is the C++ half of that gate: it reads the DFlash `config.json`, opens the
+container with the engine's own Q4NX reader, checks every tensor against the geometry the config gives, and returns
+a model whose tensors are views into the mapped file. Nothing is decoded at load (the Bolt draft's projections are
+327,680,000 weights, 1.3 GB as f32); `decode_projection()`, `decode_gain()` and `decode_fusion()` produce one tensor
+at a time, through the same q4_1 tile decoder the forward uses. It throws, naming the tensor or key, on a missing or
+mis-sized tensor, a dtype label it does not expect, a container scalar that disagrees with the config, a tensor it
+cannot explain, another architecture (`DFlash2DraftModel`), or a weight path that leaves the package.
+
+Two facts about the container that the loader depends on, both measured on the Bolt draft:
+
+| fact | evidence |
+|---|---|
+| `model.fc.weight` is **not** row-major. Its declared shape `[80, 12800, 32]` is the element order: 32-row blocks, column by column, the row inside the block last. | Magnitudes that share an input column correlate about five times more strongly than magnitudes that share an output row. Decoded in the declared order the four neighbour figures are consistent (next row 0.107, 32 rows on 0.106; next column 0.022, 32 columns on 0.021). Read as plain row-major they contradict each other (next row 0.019 but 32 rows on 0.107; next column 0.105 but 32 columns on 0.024). `dflash_draft_test` asserts the first and uses the second as its control. |
+| A norm gain may be negative. | Three post-attention norms each hold one gain just below zero (-0.0009 to -0.0024) among 2,560. As bf16 that is a gain crossing zero; as half-float the same element would be -0.8 among values of 1.3 to 2.4, which is one more reason the bf16 reading is the right one. |
+
+`dflash_draft_test` builds a synthetic package (every projection encoded tile by tile from a formula and compared at
+every element, the fusion matrix checked for row-major order, sixteen refusals each matched on its message) and needs
+no model; given a package directory (`-DONEBIT_DFLASH_DRAFT=<dir>` or `ONEBIT_TEST_DFLASH_DRAFT`) it also loads and
+decodes the real one. The loader is not wired into `forward-serve` yet.
+
+### The forward, as a host reference (`npu/dflash_forward.h`)
+
+`decode_draft(load_draft(dir))` turns a package into f32 weights (about 1.3 GB for the Bolt draft) and
+`draft_forward(weights, taps, ctx, noise, block)` runs one draft pass on the host:
+
+| step | what is computed |
+|---|---|
+| context | one row per context position: the target's hidden states at `target_layer_ids`, concatenated, through `fc` and then `hidden_norm`. The same rows are used by every layer. |
+| block | the target's embeddings of `[last token, mask, mask, ...]`, `block_size` rows. Only these rows change from layer to layer. |
+| each layer | `input_norm` on the block rows; queries from the block rows; keys and values from the context rows followed by the block rows; `q_norm` / `k_norm` per head; rotary positions (context first, then the block, consecutive); every block row sees every key, so the block is not causal; then the gated MLP. |
+| output | the final `norm` of the block rows. The target's own head turns each row into scores. |
+
+The draft has no embedding table and no head of its own: both are the target's.
+
+This is a reference to compare a device route against, not a fast path (plain loops, one thread: a pass of 2 context
+and 8 block rows over the Bolt draft takes seconds). **It has not been run against a target model's hidden states
+yet**, so nothing here says the draft's proposals are accepted; that needs the target pack's layer taps, which is the
+next step of engine#1780. What `dflash_forward_test` establishes:
+
+- two cases worked out by hand in the test (one block row alone; one context row plus one block row, with a different
+  gain on every norm that touches the attention), matched to 1e-5;
+- the structure, on a small random model: the output does not depend on where the positions start, a later block row
+  changes an earlier one, the context's scale does not matter, a window of one position equals each row on its own,
+  and a query head reads the key/value head of its group;
+- seven refusals, each matched on its message;
+- with a package directory (`-DONEBIT_DFLASH_DRAFT=<dir>` or `ONEBIT_TEST_DFLASH_DRAFT`), the real draft decodes and
+  one pass over a made-up context is finite and position-independent.
+
+### DFlash 2 packages (engine#1781)
+
+`load_draft()` also reads `DFlash2DraftModel` packages (`FastFlowLM/Qwen3.8-27B-DFlash2-NPU2` is the one on this box),
+as generation 2 of the same loader. The config states the draft's interface under `dflash_config` and the rotation's base
+under `rope_parameters`. Every projection, the fusion matrix included, is a grid of 4736-byte Q4_K chunks rather than
+5120-byte q4_1 tiles. Each layer also carries two grouped convolutions, around the attention and around the MLP, and the
+package carries a candidate selector (a projection of the hidden state and two vocabulary-sized codebooks).
+`decode_draft()` fills the convolutions; the codebooks are read a row at a time with `decode_row()`, since each is
+254 MB as f32.
+
+The forward gains what generation 2 needs, each piece held to arithmetic written out in `dflash_forward_test`:
+
+| piece | what it computes |
+|---|---|
+| `draft_conv()` | one half of the grouped convolution: a row's output sums, over the kernel's offsets, (base kernel + the row's own kernel for its group) times the row that many places earlier |
+| `selector_pick()` | the selector's choice at one block row: among the target head's top candidates, the highest of logit + the pairwise term between the previous pick and the candidate |
+| `DraftKvCache`, `cache_extend()`, `draft_forward_cached()` | the context's keys and values per layer, computed once per context row and reused by every later pass; grown in steps it gives exactly the single-call pass |
+| `set_gemm_hook()` | an optional place for the draft's projections to run (the device route); unset, everything runs on the host |
+
+Measured with these pieces against the served 27B, in a local loop: on a code prompt, 6.86 tokens per round and 7.6-7.8
+tok/s against 4.2 tok/s plain decoding; output identical to plain greedy decoding. The loop is not part of this change;
+the numbers are on engine#1781.
 
 ## PARD-2's repos are weights-only — borrow the target's tokenizer
 

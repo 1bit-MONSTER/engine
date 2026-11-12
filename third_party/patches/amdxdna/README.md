@@ -195,6 +195,60 @@ To load the pair (owner's call; strixhalo, 2026-11-06): the module built from th
 `7.4.0-rc1-1bit` reports `336751493A77C50DE0B50F7`, and the install has to sign it, `depmod`, and **`update-initramfs`** —
 the initramfs copy is what boots (2026-11-04: three reboots on the old module without that step).
 
+## Reading what a recovery did: `tools/amdxdna_tdr_report.py`
+
+The driver logs every step of a TDR recovery, and `tools/amdxdna_tdr_report.py` turns the kernel log into the counts
+per module load: timeouts detected, power-cycle recoveries, throttled recoveries, skipped contexts, **failed restarts**
+(context, error, the step that failed, and whether the module failed the parked jobs, i.e. carries `0013`), whether the
+array latched, and refused context creates by error. It reads `journalctl -k -b` or saved logs, opens no device, and
+`--fail-on-failed-restart` makes it a check.
+
+The record on strixhalo with the module the fleet runs (`F87D0BDF248067862F83BA3`, pin + `0001`-`0009`), one boot,
+2026-11-08 23:11 to 2026-11-10 17:40 AST, under the fleet's normal load:
+
+```
+$ python3 tools/amdxdna_tdr_report.py
+module load 1: driver 0.18.0 (2636 amdxdna lines)
+  timeouts detected        26
+  power-cycle recoveries   18
+  throttled                8
+  skipped contexts         4
+  failed restarts          0
+  latched (reload needed)  0
+  context creates refused  767 (ret -19 x767)
+```
+
+So in 18 real recoveries no context restart failed: the path `0010` and `0013` change (engine#1750) was not reached
+once. That says how often it happens here, not what firmware does when it does.
+
+## The test-only patch, and the run that would measure `0010`/`0013`
+
+`test-only/restart-fault-injection.patch` is **not part of the series**. It is outside the numbered files, so
+`scripts/mk-kernel-packages.sh` (which takes patches by number) and the series loop in `tests/amdxdna_restart_test.sh`
+never pick it up; that test checks both that it still applies on top of the series and that no numbered patch carries
+`TEST ONLY` code. It adds two module parameters that make `aie2_hwctx_restart()` fail on request, before or after the
+firmware context is created, because a real restart failure needs firmware to refuse a message and cannot be arranged
+from user space.
+
+Verified without the device: applies on `0001`-`0013`; the module compiles against `7.4.0-rc1-1bit`
+(`amdxdna.ko` 14,045,256 B, `srcversion 57DF58D0185B9D6E0397B6F`, 0 errors, 0 warnings; `modinfo` lists both
+parameters). **Never loaded.**
+
+The run, which needs a module load and is therefore the owner's:
+
+1. Build pin + `0001`-`0013` + the test-only patch (`make -C drivers/accel/amdxdna ARCH=x86`), load it on a box nobody
+   else is using the array on.
+2. Start one client that keeps a context open and submits (any `npu-hold` serve).
+3. `echo 1 > /sys/module/amdxdna/parameters/restart_inject_count`, then `echo 2 > .../restart_inject_step`
+   (2 = after the create, the case that left a half-built firmware context), and provoke one recovery (the kernel
+   lane's `tdr_test` hook, or a real timeout).
+4. `python3 tools/amdxdna_tdr_report.py`. Expected with `0013`: one failed restart, with
+   `firmware context taken away (teardown ret 0), N parked job(s) failed with -ENODEV`, and the client's pending
+   requests returning at once instead of at their own timeout. `teardown ret` is the answer to the question engine#1750
+   put first: whether firmware accepts a destroy for a context it has only half of. The array then latches (a failed
+   restart in a recovery latches `hw_dead` by design), so reload the shipping module afterwards.
+5. Repeat with `restart_inject_step` 1 (create failed: no firmware context to take away).
+
 ## What this directory deliberately does not carry
 
 The **0010 debugfs test hook** (`debugfs/accel/<pci fn>/tdr_test`, root-only, commands `recover` / `throttle` /

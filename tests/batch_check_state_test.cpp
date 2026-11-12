@@ -33,8 +33,9 @@
 //   [2] the last chunk's logits equal the sequential reference's at that position, bit for bit: in host-GEMM mode
 //       both sides are the same arithmetic in the same order, so any tolerance would only hide a one-row prefix leak.
 //
-// Where it runs: the row is registered under if(ONEBIT_NPU) (it links onebit_npu_forward) and ci.yml configures
-// without it, so it runs on a dev box with ONEBIT_NPU=ON and a container, not in CI.
+// Where it runs: in CI (engine#1946), built against the public runtime stub and run by tests/batch_check_state_ci.py
+// on a two-layer container that script fabricates; and on a dev box with ONEBIT_NPU=ON, on the container named by
+// ONEBIT_TEST_Q4NX.
 #include "q4nx_forward.h"
 
 #include <cmath>
@@ -88,6 +89,13 @@ int main() {
     if (!fwd.init_host(model.c_str(), std::string(dir) + "/kernels")) {
         std::printf("SKIP: init_host failed for %s (%s)\n", model.c_str(), fwd.last_error());
         return 77;
+    }
+    // ONEBIT_TEST_Q4NX_LOAD_ONLY=1: stop here. The row is "this container loads through the forward" and nothing more;
+    // tests/batch_check_state_ci.py uses it for a fabricated family whose only claim is that the load is not refused.
+    if (const char* lo = std::getenv("ONEBIT_TEST_Q4NX_LOAD_ONLY"); lo && lo[0] == '1') {
+        std::printf("PASS  init_host accepted %s\n", model.c_str());
+        std::printf("ALL PASS (load only)\n");
+        return 0;
     }
 
     // Values do not matter; the split does. Three chunks: [0,3), [3,5), [5,6) -- the last is the serve path's

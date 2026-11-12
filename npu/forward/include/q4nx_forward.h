@@ -96,6 +96,16 @@ public:
     // noncausal_full_attention, so a caller can check the served pack against its own declaration
     // (app/forward_serve.cpp, engine#796).
     bool noncausal() const { return noncausal_attn_; }
+    // engine#2102: what the decode family turned out to be, so a caller can say it out loud. `decode_roles()` is the number of
+    // roles that got an M=16 kernel, `design_roles()` the number of roles the model has. 0 of N is the state that serves at a
+    // fraction of the fused route's rate while printing nothing an operator would notice at the ready line: every decode step
+    // then runs prefill-width launches. The values are recorded where the family is opened (open_decode_family_local), not
+    // inferred later, because the derived designs are not kept per role.
+    int decode_roles() const { return decode_roles_; }
+    // The host-GEMM arm loads no decode family, so it reports no roles rather than "0 of N" (engine#2102).
+    int design_roles() const { return host_gemm_ ? 0 : ndesigns_; }
+    bool decode_disabled() const { return decode_disabled_; }   // NPU_DECODE_M16=0
+    bool decode_image() const { return pb16i_; }                // a ternary (pb16i/t2s) container's decode family
     const char* last_error() const { return err_.c_str(); }
 
     // Clear the KV cache (start a new sequence).
@@ -211,6 +221,18 @@ public:
     // The post-final-norm hidden of EVERY row of the last batched pass (M x H, row-major): a speculative drafter
     // has to advance its own stream over the rows that were actually accepted, and those are exactly these.
     const std::vector<float>& last_hidden_rows() const { return last_hidden_rows_; }
+    // engine#1780: the residual stream after the listed layers, for a draft that reads the target's hidden states
+    // (a DFlash draft's target_layer_ids). `layers` must be ascending and inside the model; every pass then appends
+    // one row per position to *sink, [taps * H] wide, the listed layers side by side in the order given -- the
+    // layout dflash_forward.h's `taps` argument takes. Layer l's row is the stream as layer l + 1 receives it (after
+    // layer l's own closing scale). Works for step() and for the batched passes. An empty list or a null sink turns
+    // it off; the sink must outlive the passes. Returns false, changing nothing, on a list that is not usable.
+    // A pass that returns false appends nothing: whatever it had written is taken back, so the sink only ever holds
+    // rows of passes that succeeded. A call refused earlier on the same forward does not affect later passes.
+    // Not for use under NPU_BATCH_CHECK: that oracle replays positions through step(), and the replays would be
+    // appended as if they were new positions.
+    bool set_layer_taps(const std::vector<int>& layers, std::vector<float>* sink);
+    int layer_count() const { return c_.NL; }   // layers of the loaded model; 0 before init
     // One row of the embedding table (what a token means to the model): the MTP drafter's `pre_fc_norm_embedding`
     // input.  It reads the same table the forward uses, so the drafter cannot drift from the model's embeddings.
     void embed_row(int token, std::vector<float>& out) const {
@@ -230,10 +252,24 @@ private:
     bool load_norms();
     std::vector<float> last_hidden_;  // last_hidden(): the post-final-norm state of the last position
     std::vector<float> last_residual_;  // and one norm earlier: the raw residual of the last position
+    std::vector<int>    tap_layers_;           // engine#1780: set_layer_taps()
+    std::vector<float>* tap_sink_ = nullptr;
+    size_t              tap_base_ = 0;         // where the current pass's rows start in *tap_sink_
+    bool                tap_fault_ = false;    // a tapped layer arrived with a different row count than the pass opened with
+    void tap_layer(int layer, const float* X, int M);
+    // The bodies of step() and step_batch(). The public functions wrap them so that a failed pass leaves the tap
+    // sink as it found it (layer_taps.h, LayerTapPass).
+    bool step_impl(int token, int pos, std::vector<float>& logits, int cache_pos);
+    bool step_batch_impl(const std::vector<int>& tokens, int start_pos, std::vector<float>& logits);
     std::vector<float> last_hidden_rows_;  // [M][H] normed hidden of the last batched pass
     // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
     // logits there instead of only the last row's.  Null on every other path, so nothing else changes.
     std::vector<float>* batch_all_out_ = nullptr;
+    // engine#803 A2b: the model's half of the decode family (design names, summary lines, the wide and narrow
+    // sealed families); the per-role ELF resolution and context creation is XdnaTarget::open_decode_family().
+    bool open_decode_family_local(bool want_m16, xrt::device* dev, const std::string& mdir,
+                                  const std::string& dir);
+
     bool init_impl(xrt::device* dev, const char* model_path,
                    const std::string& artifact_dir);
     bool host_gemm_ = false;
@@ -327,6 +363,8 @@ private:
     // kernels for fused gate/up, five when gate and up are split.
     Q4nxDesignGeom designs_[Q4NX_MAX_DESIGNS];
     int ndesigns_ = 0;
+    bool decode_disabled_ = false;   // engine#2102: NPU_DECODE_M16=0 turned the family off
+    int decode_roles_ = 0;   // engine#2102: roles with an M=16 decode kernel, as open_decode_family_local() found them
     // M=16 decode twins of the same roles (empty/skipped where no ELF or no legal geometry).  The geometry
     // stays here because the model needs it (max_batch_rows, the layer loop's row count); the contexts
     // themselves live in the target.
@@ -364,6 +402,11 @@ private:
     // hw_contexts.  Config `q4nx_pb16i_sealed_elf` names it in the kernels dir; without
     // it the per-role `_pb16i.elf` files are used as before.
     std::string pb16i_sealed_;
+    std::string wide_sealed_;       // q4nx_<layout>_sealed_wide_elf: a wide prefill family (engine#1990)
+    int wide_sealed_rows_ = 32;    // q4nx_sealed_wide_rows
+    std::string narrow_sealed_;     // q4nx_<layout>_sealed_narrow_elf: a narrow decode family
+    int narrow_sealed_rows_ = 4;    // q4nx_sealed_narrow_rows
+    std::string sealed_dir_;        // the kernels dir the 16-row sealed ELF was found in
     // ---- the NPU target (engine#799 P4) ----
     // Everything that talks to a device lives behind this: the ELF contexts (M=128 prefill and the M=16
     // decode twin), the phase-selected launch, the packed-weight BO cache, the pb16i sidecar images, the
@@ -387,6 +430,15 @@ private:
     // prompt-encoding forward (step_batch at start_pos 0) attends bidirectionally there and the GDN
     // layers keep their recurrence.  Off unless the plan says so, so a causal model is untouched.
     bool noncausal_attn_ = false;
+    // engine#1959: measured wall of one batched launch per design, narrow (the 16-row twin) and wide (the prefill
+    // design), for cached weights only. npu_gemm_rows() reads them to decide whether a 17..wide-row chunk runs as one
+    // wide launch or as several narrow ones (batch_split.h). 0 = not measured yet. `split_mode_` is NPU_PREFILL_SPLIT:
+    // -1 unset (decide from the measurements), 0 never split (the behaviour before), 1 split whenever a twin exists.
+    double split_narrow_ms_[Q4NX_MAX_DESIGNS] = {0};
+    double split_wide_ms_[Q4NX_MAX_DESIGNS] = {0};
+    int    split_wide_n_[Q4NX_MAX_DESIGNS] = {0};   // wide launches timed so far (batch_split.h: kSplitWideSamples)
+    int    split_mode_ = -2;      // -2 = environment not read yet
+    bool   split_said_ = false;
     // The refusal for a kernel a design needs but the directory does not have.  With a plan it names
     // the plan file and the role, so "which description asked for this" needs no log reading.
     std::string missing_kernel(const std::string& dir, const char* elf_name, Q4nxDesign role) const;
@@ -635,6 +687,21 @@ private:
     bool gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                          std::vector<float>& out);
     bool load_gdn_layer(int l);
+
+    // ── LFM2 gated short-convolution layers ──────────────────────────────
+    // A layer that carries shortconv.* tensors has no attention: in_proj (H -> 3H, the QKVLIN design, weight
+    // key 0) and out_proj (H -> H, the O design, key 1, the slot an attention layer's o_proj has) run on the
+    // device, and everything between them is lfm2_shortconv.h on the host. The only state is the last L-1
+    // values of B*X per channel, kept in conv_state_[l] so snapshot/restore/reset cover it with no new code.
+    bool shortconv_ = false;                       // the model has at least one such layer
+    int sc_taps_ = 0;                              // L, from shortconv.conv.weight's own shape
+    std::vector<uint8_t> sc_layer_;                // [NL] 1 = conv layer
+    std::vector<std::vector<float>> sc_w_;         // [NL][H * L] the depthwise taps, bf16-decoded once
+    std::vector<std::vector<float>> sc_rows_;      // [NL][rows * H] B*X of a verify batch's rows (see begin_verify)
+    bool is_conv_layer(int l) const { return shortconv_ && l >= 0 && l < (int)sc_layer_.size() && sc_layer_[(size_t)l]; }
+    bool conv_layer(int l, const std::vector<float>& xn, std::vector<float>& out);
+    bool conv_layer_batch(int l, const std::vector<float>& xn, int M, std::vector<float>& out);
+    void conv_apply_rows(int rows);                // re-apply the first `rows` recorded rows after a restore
     std::string err_;
     std::string backend_ = "uninitialised";
     bool ready_ = false;

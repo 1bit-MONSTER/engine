@@ -61,6 +61,9 @@ private:
     // still needs sentencepiece rules -- Phi-3.5, engine#1189), then encoded with sentencepiece
     // rules instead of byte-level BPE (which would emit one id per byte).
     bool spm_ = false;
+    // The normalizer rewrites spaces to the metaspace symbol but prepends none (Gemma4): no dummy prefix is added on
+    // encode and none is stripped on decode.
+    bool spm_no_prefix_ = false;
     // SentencePiece AND a merge list (Phi-3.5, engine#1189): pieces are merged by rank over the
     // normalised text instead of greedy longest-match, which is only right for a merge-less
     // vocabulary.

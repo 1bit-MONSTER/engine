@@ -38,7 +38,12 @@ jobs:
     runs-on: [self-hosted, pr-agent]
     # on the job, not the workflow: a comment that skips the job (a bot's, say) must not cancel a review
     concurrency:
-      group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}
+      # A comment and a push are different jobs on one serialised model runner: an `/ask` must not cancel the review of
+      # the PR it is asked about, and a `synchronize` must cancel the review of the head it replaced. Grouping by event
+      # name keeps push-cancels-push (right: a newer head makes the older review moot) without letting a busy thread
+      # starve it. Measured 2026-11-10: PR #2007's review ran 19:21:26 -> cancelled 19:30:31, and `issue_comment:
+      # [created]` puts every comment on the PR into this same group with `cancel-in-progress: true`.
+      group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
       cancel-in-progress: true
     timeout-minutes: 30
     # same-repo PRs, and comments by the owner, members or collaborators on a pull request

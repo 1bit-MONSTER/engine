@@ -1,0 +1,35 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# tests/*.sh that are deliberately NOT a ctest row, one basename per line, with the reason it must stay out.
+# `tools/ci/tests_referenced_check.py` fails when a test is referenced by nothing that can run it, and reports a
+# line here that is no longer needed so this list can shrink. The bar for an entry is the same one #1806 used:
+# a ctest row has to be ABLE TO FAIL. A script that always exits 0 is an operator measurement, not a test.
+#
+#
+# tests/*_test.py that no ctest row and no workflow step names, measured on main 2026-11-10 (engine#2018).
+#
+# A SET baseline, not an allow-list: `tools/ci/tests_referenced_check.py` FAILS when a name appears here that is not in
+# the tree's current set, and REPORTS a line whose file is registered now, so this can only shrink.
+#
+# The number is 0. Both original entries were portable tests with no runner, not tests that cannot run here, so both are
+# registered (moe_expert_chunks_accum_test.py, then hyperloom_benchmark_test.py -- engine#2018), and getting it right took a correction worth recording: the first version of the rule scanned
+# `RUNNERS`, which contains one FILE (CMakeLists.txt) and two directories, and tested `is_dir()` on all three -- so every
+# `add_python_test(...)` registration in CMakeLists.txt was invisible and 35 of 42 tests looked unregistered. The arm
+# "a cleared baseline entry is reported" caught it: registering a test in CMakeLists.txt did not clear its line. The true
+# figure was 2 of 42, which is a healthy tree; the rule is here to keep it that way rather than to record a backlog.
+#
+# Each line is a real test whose runner was never added; the fix per file is one `add_python_test(...)`.
+#

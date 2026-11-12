@@ -35,6 +35,9 @@
 #           a 64-position greedy build, the prompt prefill, run-to-run reproducibility and a
 #           tok/s floor (HW_GATE_NPU_FLOOR). Auto-skips with no NPU or no checker configured; not
 #           in the default phases (add it with --phases npu).
+#   npuserve  the shipped binary's `1bit serve --device npu` on a small model: the fast route's own log line, a
+#           decode floor, the first token and a non-empty answer (tools/npu_serve_smoke.py; engine#2106, #2102).
+#           Auto-skips with no NPU or no HW_GATE_NPU_SERVE_BIN / HW_GATE_NPU_SERVE_MODEL; not in the default phases.
 #   placement  every graph the server scheduled for a gate model (load, warmup, the kat prompts,
 #           the needle) is all on HRX: ggml-hrx's placement report (GGML_HRX_REPORT=2, engine #390)
 #           names no node off HRX, as `1bit serve` now requires by default (docs/serve.md)
@@ -126,6 +129,9 @@ token_held_by_ancestor() {
 }
 THERMAL=${HW_GATE_THERMAL:-$HOME/lb/thermal-run.sh}
 MEM_FLOOR=${HW_GATE_MEM_FLOOR:-12}
+# the build (engine#1504): do not start a compile below this much MemAvailable; wait this many minutes for it
+BUILD_MEM_FLOOR=${HW_GATE_BUILD_MEM_FLOOR:-24}
+BUILD_MEM_WAIT=${HW_GATE_BUILD_MEM_WAIT:-10}
 CODER_URL=${HW_GATE_CODER_URL:-http://127.0.0.1:8090}
 CODER_WAIT=${HW_GATE_CODER_WAIT:-900}
 TOKEN=${HW_GATE_TOKEN:-$HOME/GPU-TOKEN}
@@ -336,7 +342,9 @@ trap release_token EXIT
 trap 'exit 143' TERM INT HUP   # so a killed run (timeout, CI cancel) still releases it
 
 # run "$@" on the GPU: hold the GPU token, wait for coder-llm, run it under mem-guard + thermal-run
-# (no ~/npu.lock: engine#682, measured in engine#673)
+# (no ~/npu.lock: engine#682, measured in engine#673). The guard is --term: its default SIGKILL ends
+# thermal-run but not thermal-run's scope, so the step it "killed" kept running and kept its memory
+# (engine#1504; tests/hw_gate_mem_test.sh).
 gpu() {
   if ! take_token; then
     result gpu-token FAIL "$TOKEN_WAIT" "$TOKEN held by another job for ${TOKEN_WAIT}s: $(cat "$TOKEN" 2> /dev/null)"
@@ -350,11 +358,20 @@ gpu() {
   export HW_GATE_STAMP=$OUT/.stamp
   rm -f "$HW_GATE_STAMP"
   while :; do
-    "$0" --cool --mem "${GPU_MODEL:--}" "$ROOT/scripts/mem-guard.sh" "$MEM_FLOOR" "$THERMAL" "$@"
+    "$0" --cool --mem "${GPU_MODEL:--}" "$ROOT/scripts/mem-guard.sh" --term "$MEM_FLOOR" "$THERMAL" "$@"
     rc=$?
-    # 76: the memory pre-check said no; nothing is held, so other work can finish first
+    # 76: the memory pre-check said no, and the step holds nothing. The gate still holds the GPU token, though,
+    # and the jobs whose memory it is waiting for may be queued behind that token: so the token is given back
+    # for the wait and taken again before the next try (review of engine#1936). Under the gpu-hold wrapper the
+    # ticket is the wrapper's and cannot be given back from here; release_token is then a no-op.
     [ $rc = 76 ] && [ $tries -lt "${HW_GATE_MEM_RETRIES:-10}" ] || break
-    tries=$((tries + 1)); sleep 60
+    tries=$((tries + 1))
+    release_token
+    sleep "${HW_GATE_MEM_RETRY_SLEEP:-60}"
+    if ! take_token; then
+      result gpu-token FAIL "$TOKEN_WAIT" "$TOKEN held by another job for ${TOKEN_WAIT}s: $(cat "$TOKEN" 2> /dev/null)"
+      exit 2
+    fi
   done
   [ $rc = 76 ] && { note "::error::memory pre-check refused the step ${tries} times"; infra=1; }
   t1=$(date +%s)
@@ -429,7 +446,16 @@ if [ -z "$BIN" ]; then
     [ "$(cat "$build/.hip-flags" 2>/dev/null)" = "$hip_flags" ] || rm -f "$build/CMakeCache.txt"
     # the same configuration as cmake/hrx.cmake (llama_hrx), plus the two test tools
     : > "$OUT/build.log"
-    built=1
+    built=1 guarded=0
+    # Memory (engine#1504). On 2026-11-08 this job was handed to a just-restarted runner on a box with 0 swap
+    # free and both runners were OOM-killed 76 s later; the compile was the one step here with no memory check.
+    # So: no compile below BUILD_MEM_FLOOR GB MemAvailable (wait BUILD_MEM_WAIT min, then exit 2 with the
+    # reading), and the compile runs under mem-guard --term, which ends the whole thermal-run scope below
+    # MEM_FLOOR GB. A guard stop is not heat: the loop below does not resume it.
+    if ! "$ROOT/scripts/mem-wait.sh" "$BUILD_MEM_FLOOR" "$BUILD_MEM_WAIT" >> "$OUT/build.log" 2>&1; then
+      result build FAIL $(( $(date +%s) - t0 )) "not started: $(tail -n 1 "$OUT/build.log")"
+      exit 2
+    fi
     # thermal-run kills a build at 93 C (the box is shared); ninja resumes where it stopped
     for attempt in 1 2 3 4 5 6; do
       cool
@@ -441,7 +467,8 @@ if [ -z "$BIN" ]; then
           -DGGML_HRX_HIP_COMPILER="$TOOLCHAIN/bin/amdclang++" "-DGGML_HRX_HIP_FLAGS=$hip_flags" \
           -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF >> "$OUT/build.log" 2>&1 &&
           echo "$addon_pin" > "$build/.gpu-kernels-pin" && echo "$hip_flags" > "$build/.hip-flags"; }; } &&
-      "$THERMAL" cmake --build "$build" -j "$JOBS" --target "${targets[@]}" >> "$OUT/build.log" 2>&1 && { built=0; break; }
+      "$ROOT/scripts/mem-guard.sh" --term "$MEM_FLOOR" "$THERMAL" cmake --build "$build" -j "$JOBS" --target "${targets[@]}" >> "$OUT/build.log" 2>&1 && { built=0; break; }
+      grep -q "^GUARD:" <(tail -n 40 "$OUT/build.log") && { guarded=1; break; }   # out of memory, not heat
       grep -q "error:" <(tail -n 40 "$OUT/build.log") && break   # a compile error, not heat
       note "build stopped (attempt $attempt, Tctl $(tctl) C); resuming"
     done
@@ -455,6 +482,10 @@ if [ -z "$BIN" ]; then
       BUILT=1
       result build PASS $(( $(date +%s) - t0 )) "$build"
     else
+      if [ $guarded = 1 ]; then
+        result build FAIL $(( $(date +%s) - t0 )) "stopped by the memory guard: $(grep "^GUARD:" "$OUT/build.log" | tail -n 1); re-run once memory frees (engine#1504)"
+        exit 2
+      fi
       result build FAIL $(( $(date +%s) - t0 )) "see $OUT/build.log"
       # the compiler's error lines only, not its source excerpts: the job log is public and the
       # add-on's sources are not
@@ -656,6 +687,47 @@ if has npu; then
     if ! [[ "$tps" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then st=FAIL; slow=" (no tok/s reported: the speed floor cannot be checked)"
     elif awk -v t="$tps" -v f="$floor" 'BEGIN{exit !(t+0 < f+0)}'; then st=FAIL; slow=" (below the ${floor} tok/s floor)"; fi
     result npu $st $(( $(date +%s) - t0 )) "oracle=${oracle:-?} greedy64=${greedy:-?} prefill=${prefill:-?} reproducible=${repro:-?}${tps:+ tok/s=$tps}$slow"
+  fi
+fi
+
+# ---- npuserve (the shipped binary's `serve --device npu`: on the fast route, at speed, with an answer) ----
+# The npu phase above checks the engine through a private checker and never starts `1bit serve`, so it cannot see a
+# shipped binary whose serve quietly takes the slow per-op route: that serve still answers, at about 2 tok/s where the
+# fast route gives 80 to 100 (engine#2102, #2106). tools/npu_serve_smoke.py asserts the route's own log line, the decode
+# floor, the first token and a non-empty answer. Set HW_GATE_NPU_SERVE_BIN to the 1bit under test and
+# HW_GATE_NPU_SERVE_MODEL to the small model directory. The three numbers that decide the rate assertion are all
+# passed from here, so none of them is a default in another file: HW_GATE_NPU_SERVE_FLOOR (tok/s, default 30),
+# HW_GATE_NPU_SERVE_MAX_TOKENS (answer length, default 96) and HW_GATE_NPU_SERVE_REPLIES (requests, default 5; the
+# rate is their median). The floor is 30 and not the demo's 60 because this box is shared: single replies of the
+# release candidate on the fast route have been measured from 48.8 to 101 tok/s under load, and the slow route is
+# 1.9, so 30 is 15 times above the failure it guards against and below every fast reply seen. The route assertion
+# does not depend on load at all. It runs under the same NPU claim as the npu phase and, like it, is not in the
+# default phases; when it is named, a FAIL fails the gate like any other phase.
+if has npuserve; then
+  t0=$(date +%s)
+  smoke=$(cd "$(dirname "$0")/.." && pwd)/tools/npu_serve_smoke.py
+  if [ ! -e "${HW_GATE_NPU_DEV:-/dev/accel/accel0}" ]; then
+    result npuserve SKIP 0 "no NPU (/dev/accel/accel0) on this host"
+  elif [ -z "${HW_GATE_NPU_SERVE_BIN:-}" ] || [ -z "${HW_GATE_NPU_SERVE_MODEL:-}" ]; then
+    result npuserve SKIP 0 "no serve under test configured (HW_GATE_NPU_SERVE_BIN and HW_GATE_NPU_SERVE_MODEL)"
+  else
+    cool
+    log=$OUT/npuserve.log
+    hold_args=()
+    if [ "${HW_GATE_NPU_HOLD:-1}" != 0 ] && [ -n "$NPU_HOLD" ] && ! token_held_by_ancestor "$NPU_TOKEN"; then
+        hold_args=("$NPU_HOLD" -l hw-gate-npuserve -t "${HW_GATE_NPU_HOLD_MINUTES:-20}" -w "$LOCK_WAIT" --)
+    fi
+    "${hold_args[@]}" flock -w "$LOCK_WAIT" -E 75 "$LOCK" python3 "$smoke" --bin "$HW_GATE_NPU_SERVE_BIN" \
+        --model "$HW_GATE_NPU_SERVE_MODEL" --out "$OUT/npuserve" --floor "${HW_GATE_NPU_SERVE_FLOOR:-30}" \
+        --max-tokens "${HW_GATE_NPU_SERVE_MAX_TOKENS:-96}" --replies "${HW_GATE_NPU_SERVE_REPLIES:-5}" \
+        ${HW_GATE_NPU_SERVE_PORT:+--port "$HW_GATE_NPU_SERVE_PORT"} > "$log" 2>&1
+    rc=$?
+    st=FAIL
+    # the tool's own verdict line AND its exit status: a pass needs both, so a truncated log cannot pass
+    [ "$rc" = 0 ] && grep -q '^RESULT: PASS$' "$log" && st=PASS
+    [ "$rc" = 75 ] && infra=1
+    detail=$(grep -E '^(route|rate|first-token|content|serve) ' "$log" | sed -E 's/ +/ /g' | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+    result npuserve $st $(( $(date +%s) - t0 )) "${detail:-no assertion lines in the log (exit $rc)}"
   fi
 fi
 

@@ -27,6 +27,7 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <string>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace fs = std::filesystem;
 using onebit::npu::plan::Plan;
@@ -42,7 +43,7 @@ void check(bool ok, const std::string& what) {
 }
 
 std::string write_plan(const std::string& name, const nlohmann::json& body) {
-    const fs::path p = fs::temp_directory_path() / ("npu_plan_test_" + name + ".json");
+    const fs::path p = ::onebit::test::tmp_root() / ("npu_plan_test_" + name + ".json");
     std::ofstream f(p);
     f << body.dump(2) << "\n";
     f.close();
@@ -90,6 +91,95 @@ bool has(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+// engine#1990: prefill.sealed_elf / prefill.sealed_rows, the wide family.
+void test_wide_family() {
+    auto pb = base_plan();
+    pb["container"]["layout"] = "pb16i";
+    pb["container"]["chunk_kind"] = "pb16i";
+    pb["container"]["pb16i"] = true;
+    pb["kernels"]["tag"] = "_pb16i";
+    pb["decode"]["sealed_elf"] = "S16.elf";
+    const std::string base_refusal = refusal(write_plan("wide_base", pb));
+    check(base_refusal.empty(), "the pb16i base plan of the wide arms loads (" + base_refusal + ")");
+    const Plan none = Plan::load(write_plan("wide_none", pb));
+    check(none.sealed_wide_elf.empty() && none.sealed_wide_rows == 0, "no wide family unless the plan names one");
+
+    auto w = pb;
+    w["prefill"]["sealed_elf"] = "S32.elf";
+    w["prefill"]["sealed_rows"] = 32;
+    const Plan wp = Plan::load(write_plan("wide_ok", w));
+    check(wp.sealed_wide_elf == "S32.elf" && wp.sealed_wide_rows == 32 && wp.prefill_m == 128,
+          "prefill.sealed_elf and sealed_rows are read, prefill.M is untouched");
+
+    auto norows = pb;
+    norows["prefill"]["sealed_elf"] = "S32.elf";
+    check(has(refusal(write_plan("wide_norows", norows)), "17..128"), "a wide family without a row count is refused");
+    for (int bad : {16, 129}) {
+        auto b = w;
+        b["prefill"]["sealed_rows"] = bad;
+        check(has(refusal(write_plan("wide_rows", b)), "17..128"),
+              "sealed_rows " + std::to_string(bad) + " is refused");
+    }
+    auto b17 = w;
+    b17["prefill"]["sealed_rows"] = 17;
+    check(refusal(write_plan("wide_17", b17)).empty(), "sealed_rows 17 loads");
+    auto orphan = pb;
+    orphan["prefill"]["sealed_rows"] = 32;
+    check(has(refusal(write_plan("wide_orphan", orphan)), "without prefill.sealed_elf"),
+          "sealed_rows without sealed_elf is refused");
+    auto nodecode = base_plan();
+    nodecode["prefill"]["sealed_elf"] = "S32.elf";
+    nodecode["prefill"]["sealed_rows"] = 32;
+    check(has(refusal(write_plan("wide_nodecode", nodecode)), "decode.sealed_elf is empty"),
+          "a wide family without the sealed decode set is refused");
+    for (const char* name : {"sub/S32.elf", "../S32.elf", "/abs/S32.elf"}) {
+        auto b = w;
+        b["prefill"]["sealed_elf"] = name;
+        check(has(refusal(write_plan("wide_path", b)), "bare file name"), std::string("path ") + name + " is refused");
+    }
+}
+
+// engine#2073: decode.narrow_elf / decode.narrow_rows, the narrow family.
+void test_narrow_family() {
+    auto pb = base_plan();
+    pb["container"]["layout"] = "pb16i";
+    pb["container"]["chunk_kind"] = "pb16i";
+    pb["container"]["pb16i"] = true;
+    pb["kernels"]["tag"] = "_pb16i";
+    pb["decode"]["sealed_elf"] = "S16.elf";
+    const Plan none = Plan::load(write_plan("narrow_none", pb));
+    check(none.sealed_narrow_elf.empty() && none.sealed_narrow_rows == 0, "no narrow family unless the plan names one");
+    auto n = pb;
+    n["decode"]["narrow_elf"] = "S4.elf";
+    n["decode"]["narrow_rows"] = 4;
+    const Plan np = Plan::load(write_plan("narrow_ok", n));
+    check(np.sealed_narrow_elf == "S4.elf" && np.sealed_narrow_rows == 4 && np.sealed_elf == "S16.elf",
+          "decode.narrow_elf and narrow_rows are read beside the sealed set");
+    auto norows = pb;
+    norows["decode"]["narrow_elf"] = "S4.elf";
+    check(has(refusal(write_plan("narrow_norows", norows)), "1..15"), "a narrow family without a row count is refused");
+    auto b16 = n;
+    b16["decode"]["narrow_rows"] = 16;
+    check(has(refusal(write_plan("narrow_16", b16)), "1..15"), "narrow_rows 16 is refused");
+    for (int ok : {1, 15}) {
+        auto b = n;
+        b["decode"]["narrow_rows"] = ok;
+        check(refusal(write_plan("narrow_edge", b)).empty(), "narrow_rows " + std::to_string(ok) + " loads");
+    }
+    auto orphan = pb;
+    orphan["decode"]["narrow_rows"] = 4;
+    check(has(refusal(write_plan("narrow_orphan", orphan)), "without decode.narrow_elf"),
+          "narrow_rows without narrow_elf is refused");
+    auto nosealed = base_plan();
+    nosealed["decode"]["narrow_elf"] = "S4.elf";
+    nosealed["decode"]["narrow_rows"] = 4;
+    check(has(refusal(write_plan("narrow_nosealed", nosealed)), "decode.sealed_elf is empty"),
+          "a narrow family without the sealed decode set is refused");
+    auto path = n;
+    path["decode"]["narrow_elf"] = "sub/S4.elf";
+    check(has(refusal(write_plan("narrow_path", path)), "bare file name"), "a path as narrow_elf is refused");
+}
+
 void test_valid() {
     const std::string path = write_plan("valid", base_plan());
     const Plan p = Plan::load(path);
@@ -122,6 +212,21 @@ void test_valid() {
     check(pp.pb16i && pp.tag == "_pb16i" && pp.sealed_elf == "pb16i_sealed.elf",
           "the pb16i family is read with its sealed ELF");
     check(pp.decode_dirs.size() == 2 && pp.decode_dirs[0].under_model, "a model-relative decode dir is kept");
+
+    // The search list a target is configured with: the plan's entries, each under the directory it names, in the
+    // plan's order (engine#1984 review: nothing resolved them, so a plan naming any place but the built-in three
+    // lost its decode twins without an error).
+    {
+        const std::vector<std::string> got = pp.resolved_decode_dirs("/m", "/k");
+        check(got.size() == 2 && got[0] == "/m/kernels-m16" && got[1] == "/k/.",
+              "decode dirs resolve under the model dir or the kernel dir, in the plan's order");
+        auto seq = base_plan();
+        seq["decode"]["dirs"] = nlohmann::json::array({nlohmann::json{{"root", "model"}, {"path", "kernels-m16-seq"}}});
+        const std::vector<std::string> only = Plan::load(write_plan("seq", seq)).resolved_decode_dirs("/m", "/k");
+        check(only.size() == 1 && only[0] == "/m/kernels-m16-seq",
+              "a plan naming one directory outside the built-in places resolves to exactly that directory");
+        check(Plan().resolved_decode_dirs("/m", "/k").empty(), "a plan that is not loaded resolves to no directories");
+    }
 
     // attention.mode is optional and defaults to causal, so a plan written before the field loads and
     // still means what it meant then.
@@ -501,7 +606,7 @@ void test_artifacts() {
         return p;
     };
     const Plan p = Plan::load(write_plan("artifacts", with_designs()));
-    const fs::path root = fs::temp_directory_path() / "npu_plan_test_artifacts";
+    const fs::path root = ::onebit::test::tmp_root() / "npu_plan_test_artifacts";
     const fs::path kdir = root / "kernels";
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -694,6 +799,8 @@ void test_drafter_and_state() {
 
 int main() {
     test_valid();
+    test_wide_family();
+    test_narrow_family();
     test_rope_and_inputs();
     test_drafter_and_state();
     test_kv();

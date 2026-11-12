@@ -186,6 +186,7 @@ struct Options {
     int prefix_cache_mb = -1;   // --prefix-cache-mb N
     int prefix_min_gain = -1;   // --prefix-min-gain N: tokens a prompt must add to be worth keeping
     bool prefix_pin = false;    // --prefix-pin: keep the part single-turn requests share (docs/npu.md)
+    bool flash = false;         // --flash: the single-turn NPU profile = --ctx-size 1024 + --prefix-pin (engine#1785)
     std::string npu_target;  // --npu-target NAME: which NPU target serves the per-op route (empty = the build's default)
     std::string prefill_provider;        // --prefill-provider PATH (or ONEBIT_HYBRID_PREFILL): --device hybrid's prefill (docs/hybrid.md)
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
@@ -1150,7 +1151,16 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             // the experts stay file-backed: without these, llama.cpp copies every one into RAM
             // (a pinned host buffer, or a CPU repack), which is what streaming avoids
             // (per_layer_token_embd: Qwen3.8-Flash-Next's 26.8 GiB table, only ever row-gathered)
-            argv.insert(argv.end(), {"-ot", "exps=CPU,per_layer_token_embd=CPU", "--no-host", "--no-repack", "--load-mode", "mmap"});
+            argv.insert(argv.end(), {"-ot", "exps=CPU,per_layer_token_embd=CPU", "--no-host", "--no-repack"});
+            // engine#1668: `-lm none` is +17.5 % prefill at -1.6 % decode for ~604 MiB more GTT (docs/bench.md),
+            // and prefill is what a served model pays for TTFT -- but this site hard-coded `--load-mode mmap`,
+            // and an explicit flag beats the child's own LLAMA_ARG_LOAD_MODE, so the measured lever could not be
+            // selected in a server at all. Default unchanged (mmap when the operator has not asked for something
+            // else); setting LLAMA_ARG_LOAD_MODE=none in the environment now reaches the child, with the GTT cost
+            // that implies documented beside the measurement.
+            if (std::getenv("LLAMA_ARG_LOAD_MODE") == nullptr) {
+                argv.insert(argv.end(), {"--load-mode", "mmap"});
+            }
 #endif
         }
         if (device == "hrx") {
@@ -3170,10 +3180,12 @@ void usage(FILE* out) {
                  "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
                  "                  [--npu-streams N]   with --device npu: this serve is one of N sharing the NPU\n"
+                 "                  (default 1, the device exclusive; docs/npu.md)\n"
                  "                  [--prefix-slots N] [--prefix-cache-mb N] [--prefix-min-gain N]   the prompt prefix cache\n"
                  "                  (docs/npu.md; 0 slots turns it off). Unset keeps the forward's defaults: 8 / 4096 / 128\n"
                  "                  [--prefix-pin]   keep the part a request shares with the previous one (one system prompt, many questions)\n"
-                 "                  (default 1, the device exclusive; docs/npu.md)\n"
+                 "                  [--flash]   with --device npu: the single-turn profile, --ctx-size 1024 plus --prefix-pin\n"
+                 "                  (a system turn shorter than --prefix-min-gain, 128 by default, is not pinned)\n"
                  "                  [--load-queue-ms N]   a load refused because another client holds the NPU array\n"
                  "                  waits at most N ms for it to free before the driver is called dead\n"
                  "                  (default 45000; 0 refuses at once; docs/npu.md)\n"
@@ -3289,6 +3301,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--prefix-cache-mb") o.prefix_cache_mb = std::stoi(next());
         else if (a == "--prefix-min-gain") o.prefix_min_gain = std::stoi(next());
         else if (a == "--prefix-pin") o.prefix_pin = true;
+        else if (a == "--flash") o.flash = true;
         else if (a == "--npu-target") o.npu_target = next();
         else if (a == "--prefill-provider") o.prefill_provider = next();
         else if (a == "--laya-model") o.laya_model = next();
@@ -3324,6 +3337,16 @@ int run_serve(int argc, char** argv) {
         else if (a == "--lemonade-url") o.lemonade_url = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
+    }
+    // --flash is a name for two settings, so that the profile is one word and its parts stay visible: a 1024-token
+    // context and the pinned shared prefix. It refuses what contradicts it instead of quietly winning or losing.
+    if (o.flash) {
+        if (o.ctx_size != 0 && o.ctx_size != 1024)
+            throw std::runtime_error("--flash fixes the context at 1024 tokens; drop --ctx-size " + std::to_string(o.ctx_size));
+        if (o.prefix_slots == 0) throw std::runtime_error("--flash needs the prefix cache; drop --prefix-slots 0");
+        if (o.device != "npu") throw std::runtime_error("--flash is a profile of --device npu");
+        o.ctx_size = 1024;
+        o.prefix_pin = true;
     }
     if (!o.laya_models.empty()) {
 #if defined(ONEBIT_LAYA) && !defined(_WIN32)
@@ -3456,6 +3479,9 @@ int run_serve(int argc, char** argv) {
                 if (o.prefix_cache_mb >= 0) { fargs.push_back("--prefix-cache-mb"); fargs.push_back(std::to_string(o.prefix_cache_mb)); }
                 if (o.prefix_min_gain >= 0) { fargs.push_back("--prefix-min-gain"); fargs.push_back(std::to_string(o.prefix_min_gain)); }
                 if (o.prefix_pin) fargs.push_back("--prefix-pin");
+                // The context limit reaches this route too: it used to stop here, so `serve --ctx-size N` on a
+                // model-generic container was accepted and the forward kept the model's own limit.
+                if (o.ctx_size > 0) { fargs.push_back("--ctx-size"); fargs.push_back(std::to_string(o.ctx_size)); }
                 std::vector<char*> fav;
                 for (auto& a : fargs) fav.push_back(a.data());
                 return run_forward_serve(int(fav.size()), fav.data());

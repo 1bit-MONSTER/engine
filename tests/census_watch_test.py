@@ -46,7 +46,11 @@ ARCHS = {
     "EmptyForCausalLM": {"gguf": "empty", "backends": []},
 }
 SIG = {"Qwen3_5MVLAAbsorbedForCausalLM": {"model_type": "qwen3_5_text", "family": "Qwen3.5 MVLA"}}
-FLM_LINE_PREFIXES = ("  + FLM FastFlowLM/", "  !! NEW FLM ", "  !! NPU FLM ", "  . FLM ")
+FLM_LINE_PREFIXES = ("  + FLM FastFlowLM/", "  !! NEW FLM ", "  !! NPU FLM ", "  . FLM ", "  . NPU FLM ")
+# Sections 17-22 pin the alert rule itself, on a fixture org whose MiniCPM-V pack is answered in the
+# committed registry/flm_answers.json; they pass no answers so the rule is tested on an unanswered gap.
+# The answers file has its own section (27).
+NO_ANSWERS = {"architectures": {}, "repos": {}}
 
 failures = []
 
@@ -311,6 +315,16 @@ with open(os.path.join(ROOT, "docs", "arch-gaps.md")) as f:
 check("reviewed non-alias classes are documented",
       all(cls in gap_docs for cls in reviewed_gaps)
       and "not an alias" in gap_docs)
+# engine#2014 review: the list above is hand-written and names three classes, so it keeps covering those three
+# while the file it is about grows (37 entries today) -- a fourth, fifth and thirty-seventh class can be added
+# with no row in docs/arch-gaps.md and this file stays green. significant.json's own `about` says its classes
+# are documented there, so derive the list from the file: a missing row then fails here instead of resting on
+# three names that nobody will remember to extend. The floor stops the loop passing vacuously if the file were
+# ever loaded empty -- a check that iterates nothing must not report success.
+undocumented = sorted(cls for cls in sig if cls not in gap_docs)
+check(f"every one of the {len(sig)} reviewed classes is cited in docs/arch-gaps.md"
+      + (f" -- missing: {', '.join(undocumented)}" if undocumented else ""),
+      len(sig) >= 30 and not undocumented)
 
 # 14. A reviewed class marked `"watch": "report"` is listed but does not alert (engine#381).
 check("GrugMoeForCausalLM is reviewed as report-only",
@@ -504,7 +518,7 @@ _declined_rows = cw.sweep_org(live_archs, fetch=lambda url: fixture("org.json") 
 _buf = io.StringIO()
 with contextlib.redirect_stdout(_buf):
     cw.report_flm(_declined_rows, cw.sweep_releases(fetch=flm_fetch),
-                  [r for r in _declined_rows if r["id"] == "FastFlowLM/LFM3-1.7B-NPU2"], [])
+                  [r for r in _declined_rows if r["id"] == "FastFlowLM/LFM3-1.7B-NPU2"], [], answers=NO_ANSWERS)
 _declined_listing = _buf.getvalue()
 
 # 18. One line per repo, `!! NEW FLM` only for a family we cannot serve, and the exit code
@@ -512,7 +526,7 @@ _declined_listing = _buf.getvalue()
 state = flm_state()
 buf, err = io.StringIO(), io.StringIO()
 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
-    flm_rc, flm_ok = cw.watch_flm(live_archs, state, fetch=flm_fetch, detail=flm_detail)
+    flm_rc, flm_ok = cw.watch_flm(live_archs, state, fetch=flm_fetch, detail=flm_detail, answers=NO_ANSWERS)
 first = buf.getvalue()
 check("flm first run: both watches ran", flm_ok)
 check("flm first run: an unmapped family alerts (exit 1)", flm_rc == 1)
@@ -539,7 +553,7 @@ buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     gap_all = cw.sweep_org(live_archs, fetch=lambda url: fixture("org.json") + [HRX_ONLY_REPO])
     cw.report_flm(gap_all, cw.sweep_releases(fetch=flm_fetch),
-                  [r for r in gap_all if r["id"] == HRX_ONLY_REPO["id"]], [])
+                  [r for r in gap_all if r["id"] == HRX_ONLY_REPO["id"]], [], answers=NO_ANSWERS)
 gapfirst = buf.getvalue()
 check("flm report: an NPU pack for an HRX-only family is marked !! NPU FLM",
       "  !! NPU FLM FastFlowLM/Gemma3-12B-NPU2" in gapfirst)
@@ -556,7 +570,7 @@ check("flm report: the container-format release is flagged",
 # 19. The delta: the second run prints nothing, a moved repo prints one line.
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    quiet_rc, quiet_ok = cw.watch_flm(live_archs, state, fetch=flm_fetch, detail=flm_detail)
+    quiet_rc, quiet_ok = cw.watch_flm(live_archs, state, fetch=flm_fetch, detail=flm_detail, answers=NO_ANSWERS)
 second = buf.getvalue()
 check("flm delta: a second run is quiet and green",
       quiet_ok and quiet_rc == 0 and "nothing new since the last run" in second)
@@ -569,7 +583,7 @@ check("flm delta: only the moved repo is new", [r["id"] for r in fresh] == [gap_
 check("flm delta: known releases are not new", fresh_rel == [])
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    moved_rc = cw.report_flm(gap_repos2, cw.sweep_releases(fetch=flm_fetch), fresh, fresh_rel)
+    moved_rc = cw.report_flm(gap_repos2, cw.sweep_releases(fetch=flm_fetch), fresh, fresh_rel, answers=NO_ANSWERS)
 check("flm delta: a moved NPU-gap pack alerts (an HRX-only family with a Q4NX pack)",
       moved_rc == 1 and "  !! NPU FLM FastFlowLM/Gemma3-12B-NPU2" in buf.getvalue())
 # D3-Mini moving used to be that alert; it is the same move on a family the NPU route now serves,
@@ -581,14 +595,14 @@ fresh1, _ = cw.flm_deltas(state, moved_repos, cw.sweep_releases(fetch=flm_fetch)
 check("flm delta: the moved repo is reported", [r["id"] for r in fresh1] == [moved[0]["id"]])
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    served_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), fresh1, [])
+    served_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), fresh1, [], answers=NO_ANSWERS)
 check("flm delta: a moved NPU-served pack does not alert",
       "  !! NPU FLM FastFlowLM/D3-Mini-NPU2" not in buf.getvalue())
 served = cw.sweep_org(live_archs, fetch=lambda url: fixture("org.json"))
 fresh2 = [r for r in served if r["id"] == "FastFlowLM/Qwen3-8B-NPU2"]   # qwen3: served on the NPU
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    served_rc = cw.report_flm(served, cw.sweep_releases(fetch=flm_fetch), fresh2, [])
+    served_rc = cw.report_flm(served, cw.sweep_releases(fetch=flm_fetch), fresh2, [], answers=NO_ANSWERS)
 check("flm delta: a moved family the NPU route serves stays green",
       served_rc == 0 and buf.getvalue().count("  + FLM ") == 1
       and "!! NPU FLM" not in buf.getvalue())
@@ -596,7 +610,7 @@ check("flm delta: a moved family the NPU route serves stays green",
 # 20. `--full` prints every repo and release on demand.
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    full_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), [], [], full=True)
+    full_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), [], [], full=True, answers=NO_ANSWERS)
 full = buf.getvalue()
 check("flm --full: every repo listed", sum(full.count(p) for p in FLM_LINE_PREFIXES) == 5)
 check("flm --full: every release listed", full.count("  + FLM RELEASE ") == 3)
@@ -704,7 +718,7 @@ def fail_fetch(url):
 
 buf, err = io.StringIO(), io.StringIO()
 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
-    dead_rc, dead_ok = cw.watch_flm(live_archs, flm_state(), fetch=fail_fetch)
+    dead_rc, dead_ok = cw.watch_flm(live_archs, flm_state(), fetch=fail_fetch, answers=NO_ANSWERS)
 check("flm failure: reported as a failure, not as nothing new",
       dead_ok is False and dead_rc == 0 and "FLM WATCH FAILED" in err.getvalue())
 check("flm failure: combined exit code is 2, so the daily job notices",
@@ -948,6 +962,159 @@ check("engine#1922 entry states WHY (the compressed weights), not just that it i
       "AW-SECD" in sig.get(_DS, {}).get("family", ""))
 check("engine#1922 class stays out of the runtime registry", _DS not in archs)
 check("engine#1922 entry records its model_type", sig.get(_DS, {}).get("model_type") == "deepseek_v4_flash_superexpert")
+
+
+# 27. engine#2171: an answered gap stays answered. CI keeps no state, so every scheduled run sees the whole
+# FastFlowLM org as new; before registry/flm_answers.json each family docs/npu.md had already answered
+# printed `!! NPU FLM` / `!! NEW FLM` again and re-filed the census issue the day after it closed.
+# The rows are the 2026-11-11 run's alerting packs (run 43016580831: id and the architecture each declares).
+RUN_2171 = [
+    ("FastFlowLM/MiniCPM-V-4.7-1B-NPU2", "MiniCPMV4_7ForConditionalGeneration"),
+    ("FastFlowLM/Hy-Memory-30B-A3B-NPU2", "HYV3ForCausalLM"),
+    ("FastFlowLM/MiniCPM-OCR-1.0-NPU2", "MiniCPMOcrForConditionalGeneration"),
+    ("FastFlowLM/MiniCPM-V-4.7-35B-A3B-NPU2", "MiniCPMV4_7ForConditionalGeneration"),
+    ("FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2", "DFlashDraftModel"),
+    ("FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2", "Gemma4ForConditionalGeneration"),
+    ("FastFlowLM/Hy-MT2-1.8B-NPU2", "HunYuanDenseV1ForCausalLM"),
+    ("FastFlowLM/Gemma4-12B-IT-NPU2", "Gemma4UnifiedForConditionalGeneration"),
+    ("FastFlowLM/smolvla-NPU2", None),
+    ("FastFlowLM/medgemma-1.5-4b-it-NPU2", "gemma3_text"),
+    ("FastFlowLM/LFM2-2.6B-NPU2", "Lfm2ForCausalLM"),
+    ("FastFlowLM/LFM2-1.2B-NPU2", "Lfm2ForCausalLM"),
+    ("FastFlowLM/GPT-OSS-Safeguard-20b-NPU2", "GptOssForCausalLM"),
+    ("FastFlowLM/GPT-OSS-20B-NPU2", "GptOssForCausalLM"),
+    ("FastFlowLM/Gemma3-4B-NPU2", "gemma3_text"),
+    ("FastFlowLM/Gemma3-1B-NPU2", "Gemma3ForCausalLM"),
+    ("FastFlowLM/Gemma4-E4B-IT-NPU2", "Gemma4ForConditionalGeneration"),
+    ("FastFlowLM/Gemma4-E2B-IT-NPU2", "Gemma4ForConditionalGeneration"),
+    ("FastFlowLM/Qwen3.6-35B-A3B-NPU2", "Qwen3_5MoeForConditionalGeneration"),
+    ("FastFlowLM/medgemma-4b-it-NPU2", "gemma3_text"),
+    ("FastFlowLM/Translategemma-4B-Instruct-NPU2", "gemma3_text"),
+    ("FastFlowLM/Qwen2.5-VL-3B-Instruct-NPU2", "Qwen2_5_VLForConditionalGeneration"),
+    ("FastFlowLM/LFM2.5-1.2B-Thinking-NPU2", "Lfm2ForCausalLM"),
+    ("FastFlowLM/Phi4-mini-Instruct-NPU2", "Phi3ForCausalLM"),
+    ("FastFlowLM/LFM2-2.6B-Transcript-NPU2", "Lfm2ForCausalLM"),
+    ("FastFlowLM/LFM2.5-1.2B-NPU2", "Lfm2ForCausalLM"),
+    ("FastFlowLM/LFM2-1.2B-Tool-NPU2", "Lfm2ForCausalLM"),
+    ("FastFlowLM/Whisper-V3-Turbo-NPU2", "WhisperForConditionalGeneration"),
+    ("FastFlowLM/Embedding-Gemma-300M-NPU2", "Gemma3TextModel"),
+    ("FastFlowLM/Gemma3-270M-NPU2", "Gemma3ForCausalLM"),
+    ("FastFlowLM/Gemma3-4B-Text-NPU2", "gemma3_text"),
+]
+
+
+def run_row(rid, arch, q4nx=True):
+    rec = {"id": rid, "lastModified": "2026-11-11T00:00:00.000Z", "tags": [],
+           "siblings": ([{"rfilename": "model.q4nx"}] if q4nx else [{"rfilename": "README.md"}])}
+    if arch:
+        rec["config"] = ({"architectures": [arch]} if arch[0].isupper() else {"model_type": arch})
+    return cw.flm_repo(rec, live_archs)
+
+
+_rows2171 = [run_row(rid, arch, q4nx=(arch is not None)) for rid, arch in RUN_2171]
+for _answers, _tag in ((NO_ANSWERS, "before"), (None, "after")):
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        _rc = cw.report_flm(_rows2171, [], _rows2171, [], answers=_answers)
+    if _tag == "before":
+        _before_rc, _before = _rc, _buf.getvalue()
+    else:
+        _after_rc, _after = _rc, _buf.getvalue()
+check("engine#2171 before: the 2026-11-11 rows alert with no answers (the rule is unchanged)",
+      _before_rc == 1 and _before.count("  !! NPU FLM ") + _before.count("  !! NEW FLM ") == len(RUN_2171))
+check("engine#2171 after: every one of the 31 rows is answered, the run is quiet",
+      _after_rc == 0 and "  !! " not in _after
+      and _after.count("  . NPU FLM ") + _after.count("  . FLM ") == len(RUN_2171))
+check("engine#2171 after: each answered line names the issue that tracks it",
+      "FastFlowLM/MiniCPM-V-4.7-1B-NPU2" in _after and "answered: engine#1788" in _after
+      and "answered: engine#1783" in _after and "answered: engine#1786" in _after)
+check("engine#2171 after: the summary says how many were answered, not that a family is unserved",
+      "31 pack(s) already answered" in _after and "does not serve" not in _after)
+
+_fresh_family = run_row("FastFlowLM/Brandnew-3B-NPU2", "BrandnewForCausalLM")
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    _rc = cw.report_flm(_rows2171 + [_fresh_family], [], _rows2171 + [_fresh_family], [])
+check("engine#2171: a family with no answer still alerts beside the answered ones",
+      _rc == 1 and "  !! NEW FLM FastFlowLM/Brandnew-3B-NPU2" in _buf.getvalue())
+_served = run_row("FastFlowLM/Qwen3-8B-NPU2", "Qwen3ForCausalLM")
+_fake = {"architectures": {"Qwen3ForCausalLM": {"answer": "x", "issue": 1}}, "repos": {}}
+check("engine#2171: an answer cannot touch a family the NPU route serves",
+      cw.answer_for(_served, _fake) is None and cw.flm_line(_served, answers=_fake).startswith("+ FLM "))
+_deriv = cw.flm_repo({"id": "FastFlowLM/Qwen3-8B-gguf", "tags": ["gguf"], "siblings": []}, live_archs)
+check("engine#2171: a derivative drop is never answered (it is not a gap)",
+      cw.answer_for(_deriv, {"architectures": {}, "repos": {"FastFlowLM/Qwen3-8B-gguf": {"answer": "x"}}}) is None)
+
+# The committed file: every answer names its doc, is for a family that is still a gap, and has a row in docs/npu.md.
+_committed = json.load(open(os.path.join(ROOT, "registry", "flm_answers.json")))
+_npu_md = open(os.path.join(ROOT, "docs", "npu.md")).read()
+_arch_answers = _committed.get("architectures") or {}
+check("flm answers: the committed file parses and is not empty", len(_arch_answers) >= 10)
+check("flm answers: each entry says what the answer is and where it is recorded",
+      all(e.get("answer") and (e.get("doc") or "").startswith("docs/npu.md")
+          for e in list(_arch_answers.values()) + list((_committed.get("repos") or {}).values())))
+check("flm answers: a tracking issue is a number",
+      all(isinstance(e["issue"], int) for e in _arch_answers.values() if "issue" in e))
+_stale = [a for a in _arch_answers
+          if "npu" in ((live_archs.get(cw.resolve_family(a, live_archs) or "") or {}).get("backends") or [])]
+check(f"flm answers: no answer is for a family the registry serves on the NPU route (stale: {_stale})", not _stale)
+_undocumented = [a for a in list(_arch_answers) + list(_committed.get("repos") or {}) if f"`{a}`" not in _npu_md]
+check(f"flm answers: every answered architecture has a row in docs/npu.md (missing: {_undocumented})",
+      not _undocumented)
+
+# 21b. engine#2171: a pin that names its `paths` moves only when a commit touches one of them.
+# vllm-project/semantic-router lands dozens of router-side commits a day; the d3 contract it is pinned for
+# did not change between a9219240e and 15b4fb5ad, yet the whole-repo head alerted on every run.
+PATH_PINS = {"repos": {"vllm-project/semantic-router": {
+    "commit": "pin000", "reviewed": "2026-11-11", "why": "d3",
+    "paths": ["src/model-runtime/vllm_srun/families/vela3_d3", "config/schemas/systemone"]}}}
+
+
+def path_fetch(head="head99", touched=(), dead=()):
+    """Head `head`; the last commit touching each path is the same at pin and head unless the path is in `touched`.
+    A path in `dead` has no commit at all (the API answers [])."""
+    def fetch(url):
+        if "&path=" in url:
+            sha = url.split("sha=")[1].split("&")[0]
+            path = urllib.parse.unquote(url.split("path=")[1].split("&")[0])
+            if path in dead:
+                return []
+            return [{"sha": ("new-" + path) if (sha == head and path in touched) else ("old-" + path)}]
+        if "/commits" in url:
+            return [{"sha": head, "commit": {"committer": {"date": "2026-11-11T00:00:00Z"}}}]
+        return []
+    return fetch
+
+
+import urllib.parse  # noqa: E402
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    p_rc, p_ok = cw.watch_support(PATH_PINS, fetch=path_fetch())
+check("support paths: a head that moved without touching a watched path is green", p_ok and p_rc == 0)
+check("support paths: ...and the line says why it is green",
+      "no commit since the pin touches the 2 watched path(s)" in buf.getvalue()
+      and "!! SUPPORT MOVED" not in buf.getvalue())
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    p_rc, _ = cw.watch_support(PATH_PINS, fetch=path_fetch(touched=("config/schemas/systemone",)))
+check("support paths: a commit touching a watched path alerts and names the path",
+      p_rc == 1 and "!! SUPPORT MOVED vllm-project/semantic-router" in buf.getvalue()
+      and "watched paths changed: config/schemas/systemone" in buf.getvalue())
+with contextlib.redirect_stdout(io.StringIO()):
+    p_rc, _ = cw.watch_support(PATH_PINS, fetch=path_fetch(head="pin000"))
+check("support paths: a head equal to the pin is green", p_rc == 0)
+for _head in ("head99", "pin000"):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        p_rc, _ = cw.watch_support(PATH_PINS, fetch=path_fetch(head=_head, dead=("config/schemas/systemone",)))
+    check(f"support paths: a watched path with no commit at the pin alerts and names it (head {_head})",
+          p_rc == 1 and "!! SUPPORT MOVED vllm-project/semantic-router" in buf.getvalue()
+          and "no commit at the pin (fix `paths`): config/schemas/systemone" in buf.getvalue())
+check("support paths: a pin without `paths` still moves on any commit (the converter's rule is unchanged)",
+      cw.watch_support(PINS, fetch=support_fetch(router="zzz999"))[0] == 1)
+check("support paths: the committed router pin watches the d3 family and the System One contract",
+      any("vela3_d3" in x for x in committed["repos"]["vllm-project/semantic-router"].get("paths", []))
+      and any("systemone" in x for x in committed["repos"]["vllm-project/semantic-router"].get("paths", [])))
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

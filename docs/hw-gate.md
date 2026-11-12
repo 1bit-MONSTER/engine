@@ -72,7 +72,9 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
 - **Memory.** The box is shared, and on Strix Halo GTT is host RAM. Before it compiles, the job waits for 24 GB of
   `MemAvailable` (`scripts/mem-wait.sh`, polled once a minute for up to 15 minutes). If memory doesn't free up, the job
   fails with the reading, and a re-run is the fix. The compile itself runs under `scripts/mem-guard.sh --term 12`,
-  which stops the whole `thermal-run` scope if `MemAvailable` falls below 12 GB. On 2026-11-08 both self-hosted
+  which stops the whole `thermal-run` scope if `MemAvailable` falls below 12 GB. **Exit 143 in a build step is
+  that guard, not a compiler failure**: the step log has a `GUARD: MemAvailable N GB < 12 GB` line just above it, the
+  runner is still alive, and a re-run once memory frees is the fix. On 2026-11-08 both self-hosted
   runners were OOM-killed, the second time 76 s after a restart handed this job a compile (engine#1504).
 - **What it is not.** It is a compile and link check of the public plumbing only. It does not build the private HIP
   add-on (the gate builds that) and does not dispatch anything. Green means the pinned pair builds into the engine. It
@@ -212,11 +214,19 @@ Each of those steps:
   byte-exact, zero resets). The lock is what the **NPU phase** takes, below, because an NPU dispatch must
   not overlap another NPU dispatch.
 - **Heat.** It waits for Tctl to drop to 75 C, then runs under `~/lb/thermal-run.sh`, which freezes it at 78 C and kills it at 93 C.
-- **Memory.** It runs under `scripts/mem-guard.sh` (kills the step below 12 GB MemAvailable). Before a step starts, `tools/mem_budget.py` estimates it. A step that would take GTT to 95 GiB or more (the engine#315 fault zone), or past MemAvailable, is refused. The gate then waits for memory to free up and retries every minute, up to ten times.
+- **Memory.** It runs under `scripts/mem-guard.sh --term` (stops the step below 12 GB MemAvailable; `--term` because the guard's default SIGKILL ends `thermal-run` but leaves the step it started running, with its memory). Before a step starts, `tools/mem_budget.py` estimates it. A step that would take GTT to 95 GiB or more (the engine#315 fault zone), or past MemAvailable, is refused. The gate then waits for memory to free up and retries every minute, up to ten times (`HW_GATE_MEM_RETRIES`). It gives the GPU token back for each of those waits and takes it again before the next try, because the jobs holding the memory may be queued behind the token. Under the `gpu-hold` wrapper the ticket belongs to the wrapper and stays held.
 - **The PR-Agent model.** coder-llm (Vulkan, :8090) loses its device when long HRX dispatches starve it. The gate runs on `strixhalo-engine`, the runner that also runs the pr-agent jobs, and a runner takes one job at a time, so no review is generating during the gate. Before each step the gate also waits for coder-llm's slots to be idle. Afterwards it reports any new `ring ... timeout` in the kernel log.
 
 The build runs under thermal-run too, and resumes after a thermal kill. Build trees and ccache
 persist under `~/.cache/hw-gate`, so a PR that does not move the pins rebuilds in seconds.
+
+The build has its own memory check (engine#1504: on 2026-11-08 both self-hosted runners were OOM-killed 76 s
+after a restart handed them a compile). Before it compiles, the gate waits for 24 GB of `MemAvailable`
+(`scripts/mem-wait.sh`, polled once a minute for up to 10 minutes; `HW_GATE_BUILD_MEM_FLOOR`,
+`HW_GATE_BUILD_MEM_WAIT`). If memory does not free up, the build is not started and the gate exits 2 with the
+reading. The compile runs under `scripts/mem-guard.sh --term`, which stops the whole `thermal-run` scope
+below 12 GB (`HW_GATE_MEM_FLOOR`). A guard stop is exit 2 too and is not resumed: a re-run once memory frees
+is the fix. `tests/hw_gate_mem_test.sh` (ctest `hw_gate_mem`) checks all of it with a fake meminfo.
 
 ## Goldens: where they live
 
@@ -249,6 +259,87 @@ The settings are environment variables at the top of the script: `HW_GATE_STORE`
 `HW_GATE_LOCK`, `HW_GATE_OPS`, `HW_GATE_MEM_FLOOR` and the others. Logs and `summary.md` go to
 `$HW_GATE_OUT` (default `~/.cache/hw-gate/runs/<time>`). Exit code: 0 pass, 1 a check failed, 2
 the box could not run the gate (lock timeout, a model or base file missing, memory refused).
+
+## The NPU serve check (`tools/npu_serve_smoke.py`)
+
+The `npu` phase above checks the NPU engine through a private checker. It does not start `1bit serve`,
+so it cannot see what engine#2102 and #2106 are about: a shipped binary whose serve quietly takes the
+slow per-op route. That serve still answers, correctly, at about 2 tok/s where the fast route gives 80
+to 100, so a check that asks "did it answer" passes on the wrong route.
+
+`tools/npu_serve_smoke.py` starts the serve, sends three prompts with thinking off, stops the serve,
+and asserts the four things the fallback fails:
+
+| assertion | passes when |
+|---|---|
+| `route` | the serve log names the fast route and does not name the per-op forward |
+| `rate` | the median decode rate is at least `--floor` tok/s (default 60; the two routes are 45× apart) |
+| `first-token` | the median prompt time is at most `--first-token-ms` (default 600) |
+| `content` | every reply has non-empty content that is not one character repeated |
+
+```sh
+npu-hold -l npu-smoke -t 10 -- tools/npu_serve_smoke.py --bin <1bit> --model <model dir> [--out <dir>]
+tools/npu_serve_smoke.py --self-test        # the judging on the shape of each failure; no device, no binary
+tools/npu_serve_smoke.py --judge <dir>      # judge a finished run's serve.log and reply_*.json again
+```
+
+It also prints one `load` line: the box's 1-minute load average as the run found it (kept in `load.json`, so
+`--judge` reports the run's load and not today's). The fast route keeps about 1.5 CPU cores of host work per token and
+`npu-hold` serialises the device, not the CPU. Measured on the shipped binary (#2106): 86-94 tok/s at 16, 32, 96 and
+128 answer tokens on a quiet box, and 51-89 tok/s while a 10-job build ran beside it, on the same route with the same
+answers. So the floor is not a function of answer length, and when the route and the content pass and only the timing
+fails, the line says a busy box is the likely cause and to re-run on a quiet one. It never turns a FAIL into a PASS:
+a starved box is something the release run should notice.
+
+
+The two route texts are what the serve prints today (`on the private route dx`, `per-op forward`);
+`--fast-route` and `--slow-route` change them when the serve's wording does, and a log that names
+neither is a failure, not a pass. It prints one line per assertion and `RESULT: PASS` or `RESULT: FAIL` (exit 0 or 1). It takes no device
+ticket of its own: run it under `npu-hold`, and the serve ends with the script. Logs and replies go to
+`--out` (default `~/.cache/1bit/npu-serve-smoke`).
+
+Measured on strixhalo, 2026-11-11, Qwen3-0.6B, one ticket each:
+
+| binary | route taken | result |
+|---|---|---|
+| the 2026-11-07 release candidate, with the kernel set that ships beside it | fast | `PASS`: median 84.4 tok/s (98.4, 84.4, 82.1), first token 277 ms |
+| a build of main without the private route, model-generic directory | per-op | `FAIL`: `route`, `rate` (median 1.9 tok/s) and `first-token` (1,063 ms) fail; `content` passes |
+
+The second row is the point: its three answers were fine, and only the other three assertions say
+the release would have shipped the slow route.
+
+**In the gate: the `npuserve` phase.** `scripts/hw-gate.sh --phases npuserve` runs the check under the
+same NPU claim as the `npu` phase and adds its row to the summary, with the four assertion lines as the
+detail:
+
+```sh
+HW_GATE_NPU_SERVE_BIN=/path/to/1bit HW_GATE_NPU_SERVE_MODEL=/path/to/Qwen3-0.6B scripts/hw-gate.sh --phases npuserve
+```
+
+The three numbers that decide the rate assertion are all passed by the phase, so none is a default
+hidden in another file: `HW_GATE_NPU_SERVE_FLOOR` (tok/s, default **30**), `HW_GATE_NPU_SERVE_MAX_TOKENS`
+(answer length, default 96) and `HW_GATE_NPU_SERVE_REPLIES` (requests, default 5; the rate is their
+median). `HW_GATE_NPU_SERVE_PORT` sets the port. The row is `PASS` only when the tool exits 0 **and**
+printed `RESULT: PASS`, so a truncated log cannot pass, and it always carries the measured median rate
+and first-token time.
+
+The gate's floor is 30, not the demo's 60, because the box is shared. On the fast route the release
+candidate's single replies have been measured between 48.8 and 101 tok/s depending on load; the slow
+route is 1.9. A floor of 30 is fifteen times above the failure it guards against and under every fast
+reply seen, so "slow machine" does not read as "slow route". The `route` assertion does not depend on
+load at all. When the phase is named, a `FAIL` fails the gate like any other phase: it is blocking,
+with no retry built in; a failed row shows which assertions failed and the numbers, so a rate-only
+failure with `route ok` is recognisable as load and can be re-run.
+
+If the NPU ticket ends while a request hangs, the ticket's TERM reaches the smoke script (a `flock` sits
+between them), and the script stops the serve before it exits; the serve is also started so that the
+kernel TERMs it if the script dies any other way. A `1bit serve` left holding the NPU after its ticket
+is the failure this prevents.
+Like `npu`, the phase is not in the default phases and skips when there is no NPU or the two settings
+are absent; the release procedure has to name it and set them for it to gate anything. It has not been
+added to the release script. `tests/hw_gate_npuserve_test.sh` drives the phase end to end against a
+stand-in serve (fast, slow, a floor it misses, dead at start, unconfigured, no NPU, and the ticket's
+kill sequence arriving mid-request) with no device.
 
 ## Measured
 

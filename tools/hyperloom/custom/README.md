@@ -48,7 +48,7 @@ plus `hl_cli_login.py` and a `launch.sh` wrapper) is gone: upstream now knows th
   cmake -B ~/wt/hl-engine-build -G Ninja -S ~/wt/hl-engine -DCMAKE_BUILD_TYPE=Release \
       -DONEBIT_HRX=ON -DONEBIT_HRX_TOOLCHAIN=/opt/rocm-therock \
       -DONEBIT_HRX_LIBHSA=/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1
-  cmake --build ~/wt/hl-engine-build -j 4 --target 1bit llama-bench llama-perplexity llama-server
+  cmake --build ~/wt/hl-engine-build -j 4 --target onebit llama-bench llama-perplexity llama-server
   ```
 
   The build root is `HL_BUILD` (default `~/wt/hl-engine-build`): `1bit` sits at its top, and the

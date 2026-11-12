@@ -371,6 +371,20 @@ apart. Decoding tile (0, 0) of each lm_head and comparing with a GGUF of the sam
 gives correlation 0.9998 with the right layout and about 0.01 with the other. `npu/q4nx`
 decodes the first layout.
 
+The forward's decoder (`npu/forward/src/q4nx_dequant.c`) reads the layout from the codes
+themselves (`q4nx_q8_split16`, engine#1786). Each (row, 32-column group) of a symmetric Q8 tensor is
+scaled by its own absmax, so in the right layout every group that holds a nonzero code holds one
+of magnitude 127; read in the other layout the groups mix rows, and most miss it. Measured on 64
+chunks: 1.000 against 0.50-0.77 on Qwen3.5-0.8B-NPU2's `lm_head`, `ssm_alpha_proj` and
+`ssm_out_proj`, and the reverse on the local Qwen3.5-2B-NPU2. The second layout is chosen only
+when it alone holds every group at 127; otherwise the decoder keeps the first, as before. The
+hub's Qwen3.5 packs (`flm_version` 0.9.45: 0.8B, 2B, 4B, 9B) are in the second layout and also
+store `ssm_out_proj` as Q8. A FastFlowLM install rewrites a pack it fetches (the local 2B copy
+reports 1.0.3, stores `ssm_out_proj` as Q4_K and uses the first layout), so a row measured on
+`~/.config/flm/models` is not a row on the hub's files. Before this, Qwen3.5-0.8B-NPU2 from the
+hub answered "What is the capital of France?" with noise on the host and on the NPU. Its
+`blk.0.ssm_out` against the BF16 GGUF of the same checkpoint: corr 0.0054 before, 0.9993 after.
+
 `npu/q4nx.h` decodes all five (the two q4_1 parameter forms included), and repacks Q4_K into q4_1
 (exact apart from rounding `S * scale` and `M * min` to bf16), so code that reads q4_1 runs Q4_K
 weights unchanged. Q8 does

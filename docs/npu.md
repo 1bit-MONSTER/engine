@@ -2128,7 +2128,11 @@ it. Each of these, alone, made the reply ` of of of`:
 - **The expert slices are `[N][K]`.** FastFlowLM's Qwen MoE packs transpose each expert, and the forward read every
   `*_exps_proj` stack that way. This pack does not transpose: its gate stack is `[3072][8][4736]`, 24 x 8 tiles per
   expert for 768 x 2048. The grid is now decided from the first MoE layer's own gate stack. Against upstream expert
-  0 of layer 1, `[N][K]` gives gate and down corr 0.9974, and the old reading gives 0.008.
+  0 of layer 1, `[N][K]` gives gate and down corr 0.9974, and the old reading gives 0.008. The same rule also fires
+  on `MiniCPM-V-4.7-35B-A3B-NPU2` (the only other container on the box it fires on). That reading is right there too:
+  its layer-0 expert 0 against `openbmb/MiniCPM-V-4.7-35B-A3B`'s own `gate_up_proj` gives corr 0.997 as `[N][K]` and
+  0.024 as `[K][N]`. That pack does not run on this forward either way ("MoE designs missing", engine#1788), so no
+  answer changes.
 - **A leading dense layer without MLA** gets the DG/DU/DD designs and `dense_mlp` the MLA path already had. A batched
   prefill of such a model takes the per-token path.
 

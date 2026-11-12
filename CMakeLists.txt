@@ -219,6 +219,14 @@ add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set
 # gets one row.
 add_test(NAME dupdef_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --check
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# engine#2255: `--help` must not be a traceback. Five tools indexed sys.argv directly, so the flag
+# arrived as a filename -- one with IndexError, the others with `FileNotFoundError: '--help'`, and two
+# of those on `--help/dd_metastate_...`, which is what a path join with the flag looks like. Fixed; this
+# row keeps the next one from landing.
+add_test(NAME tool_help_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/tool_help_check.py --check --root tools
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME tool_help_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/tool_help_check.py --self-test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)

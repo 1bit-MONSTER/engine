@@ -197,7 +197,16 @@ if [ "$dry" = 1 ]; then
         tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
         service_unit "$bin" > "$tmp/1bit-q4nx-cache.service"
         timer_unit > "$tmp/1bit-q4nx-cache.timer"
-        if systemd-analyze verify "$tmp/1bit-q4nx-cache.service" "$tmp/1bit-q4nx-cache.timer" 2>&1 | grep -v 'is not executable' ; then :; fi
+        # The dry run's promise is that the units VERIFY, so say what systemd said. `is not executable` is dropped because a
+        # dry run against a not-yet-installed binary is the normal case; every other complaint is passed through and decides
+        # the exit code, because a unit systemd refuses would be installed and then never run.
+        if verdict=$(systemd-analyze verify "$tmp/1bit-q4nx-cache.service" "$tmp/1bit-q4nx-cache.timer" 2>&1); then
+            printf 'verify: systemd accepts both units\n'
+        else
+            printf 'verify: FAILED\n%s\n' "$(printf '%s' "$verdict" | grep -v 'is not executable')"
+            printf 'dry run: nothing was changed, and nothing would be installed until this passes\n'
+            exit 1
+        fi
         printf 'dry run: nothing was changed\n'
     fi
     exit 0

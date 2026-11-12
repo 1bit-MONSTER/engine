@@ -1,18 +1,6 @@
 // Copyright 2026 bong-water-water-bong
 // SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
 // onnx_graph_test.cpp -- the audio pack's graph, read through the engine and checked for the property the executor will
 // depend on: every node's inputs are graph inputs, initializers, or outputs of an *earlier* node. Skips (77) without
 // ONEBIT_TEST_WHISPER naming the encoder's .onnx.
@@ -24,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "audio_pack.h"
 #include "onnx_graph.h"
 
 namespace {
@@ -40,7 +29,20 @@ void check(bool cond, const std::string& what) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // A pack directory (the ctest row's form) or a graph path: the pack form is what a lane has, and it also proves the mel-bin
+    // count comes from the encoder's own Conv (engine#1783).
+    std::string from_pack;
     const char* path = (argc > 1) ? argv[1] : std::getenv("ONEBIT_TEST_WHISPER");
+    if (path != nullptr && *path != '\0' && std::string(path).find(".onnx") == std::string::npos) {
+        onebit::audio::AudioPack pack;
+        std::string why;
+        if (!onebit::audio::discover_audio_pack(path, &pack, &why)) {
+            std::printf("FAIL pack: %s\n", why.c_str());
+            return 1;
+        }
+        from_pack = pack.encoder;
+        path = from_pack.c_str();
+    }
     if (path == nullptr || *path == '\0') {
         std::printf("SKIP: pass the encoder .onnx, or set ONEBIT_TEST_WHISPER to it\n");
         return 77;

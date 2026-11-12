@@ -1,18 +1,6 @@
 // Copyright 2026 bong-water-water-bong
 // SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
 // audio_exec_test.cpp -- run an audio pack's encoder through the engine's own host executor and compare it against
 // onnxruntime, on an input both sides can build from a formula (no binary fixture in the repo).
 //
@@ -26,6 +14,7 @@
 #include <vector>
 
 #include "audio_exec.h"
+#include "audio_pack.h"
 #include "onnx_graph.h"
 
 namespace {
@@ -50,9 +39,26 @@ void expect_close(float got, double want, double tol, const std::string& what) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Two forms, like the tool: a pack directory (npu/audio_pack.h) or the two graph paths. The pack form is what the ctest row
+    // uses, so the container is exercised by the same run that checks the maths (engine#1783).
+    std::string pack_encoder, pack_decoder;
     const char* path = (argc > 1) ? argv[1] : std::getenv("ONEBIT_TEST_WHISPER");
+    const char* dpath_arg = (argc > 2) ? argv[2] : nullptr;
+    if (path != nullptr && *path != '\0' && std::string(path).find(".onnx") == std::string::npos) {
+        onebit::audio::AudioPack pack;
+        std::string why;
+        if (!onebit::audio::discover_audio_pack(path, &pack, &why)) {
+            std::printf("FAIL pack: %s\n", why.c_str());
+            return 1;
+        }
+        pack_encoder = pack.encoder;
+        pack_decoder = pack.decoder;
+        std::printf("pack: %s (mel bins %d from the %s)\n", path, pack.mel_bins, pack.mel_bins_source.c_str());
+        path = pack_encoder.c_str();
+        dpath_arg = pack_decoder.c_str();
+    }
     if (path == nullptr || *path == '\0') {
-        std::printf("SKIP: pass the encoder .onnx, or set ONEBIT_TEST_WHISPER to it\n");
+        std::printf("SKIP: pass a pack directory or the encoder .onnx, or set ONEBIT_TEST_WHISPER\n");
         return 77;
     }
     using namespace onebit::npu::pack_import;
@@ -127,7 +133,7 @@ int main(int argc, char** argv) {
     std::printf("audio exec: whole encoder on the host matches onnxruntime\n");
 
     // ---- the decoder, on the same pack: 128-position token window x, the encoder output xa ----------------------------
-    const char* dpath = (argc > 2) ? argv[2] : std::getenv("ONEBIT_TEST_WHISPER_DECODER");
+    const char* dpath = (dpath_arg != nullptr) ? dpath_arg : std::getenv("ONEBIT_TEST_WHISPER_DECODER");
     if (dpath == nullptr || *dpath == '\0') {
         std::printf("SKIP decoder: pass the decoder .onnx as the second argument\n");
         return 0;

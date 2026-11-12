@@ -1,21 +1,13 @@
 // Copyright 2026 bong-water-water-bong
 // SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
 // whisper_transcribe.cpp -- the whole host pipeline: wav -> log-mel -> encoder -> greedy decode -> token ids.
 //
+//     ./whisper_transcribe <pack dir> <file.wav> [expected-ids-csv ...]
 //     ./whisper_transcribe <encoder.onnx> <decoder.onnx> <file.wav> [expected-ids-csv ...]
+//
+// The pack form reads both graphs, and the mel-bin count, from the directory (npu/audio_pack.h): 80 bins for whisper-small and 128
+// for large-v3, and passing the wrong one produces a graph that runs and answers wrongly, so the count comes from the encoder.
 //
 // A tool rather than a test because one forward pass of each graph is ~26 s at these shapes and a sentence is 25 of them
 // (see PR #1931); `ctest` would time out for a reason that has nothing to do with correctness. The numbers it prints are
@@ -25,6 +17,7 @@
 // stricter check than comparing text (two ids can share a detokenisation, and neither can share an id).
 
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -33,6 +26,7 @@
 #include <vector>
 
 #include "audio_exec.h"
+#include "audio_pack.h"
 #include "audio_mel.h"
 #include "onnx_graph.h"
 
@@ -100,26 +94,120 @@ std::vector<float> read_wav_16k_mono(const char* path, std::string* why) {
 
 }  // namespace
 
+
+// The expected ids as a file (tests/data/whisper-jfk-ids.json), so a lane does not have to retype 25 numbers from a PR body. The
+// parser is deliberately narrow: it finds "greedy_ids" and reads the integers that follow, and refuses a file with none.
+static bool read_ids_file(const char* path, std::vector<std::string>* out, std::string* why) {
+    FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) {
+        *why = std::string("cannot open ") + path;
+        return false;
+    }
+    std::string text;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+    std::fclose(f);
+    const size_t key = text.find("\"greedy_ids\"");
+    if (key == std::string::npos) {
+        *why = std::string(path) + " has no \"greedy_ids\" list";
+        return false;
+    }
+    for (size_t i = key; i < text.size();) {
+        if (std::isdigit(static_cast<unsigned char>(text[i])) || (text[i] == '-' && i + 1 < text.size())) {
+            const size_t start = i;
+            ++i;
+            while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) ++i;
+            out->emplace_back(text, start, i - start);
+        } else {
+            ++i;
+        }
+    }
+    if (out->empty()) {
+        *why = std::string(path) + ": the greedy_ids list is empty";
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        std::fprintf(stderr, "usage: %s <encoder.onnx> <decoder.onnx> <file.wav> [expected-id ...]\n", argv[0]);
+    // ctest form: no arguments means "run the reference sentence from the environment", so the chain can be checked by CI or by
+    // a lane without remembering the 25 ids. Missing inputs skip with 77, the same convention as every other gated test here.
+    if (argc == 1) {
+        static std::vector<std::string> from_env;
+        const char* pack = std::getenv("ONEBIT_TEST_WHISPER_PACK");
+        const char* wav = std::getenv("ONEBIT_TEST_WHISPER_WAV");
+        const char* ids = std::getenv("ONEBIT_TEST_WHISPER_IDS");
+        const char* ids_file = std::getenv("ONEBIT_TEST_WHISPER_IDS_FILE");
+        if (pack == nullptr || wav == nullptr || (ids == nullptr && ids_file == nullptr)) {
+            std::printf("SKIP: set ONEBIT_TEST_WHISPER_PACK and _WAV, and either _IDS or _IDS_FILE "
+                        "(tests/data/whisper-jfk-ids.json)\n");
+            return 77;
+        }
+        from_env.push_back(argv[0]);
+        from_env.push_back(pack);
+        from_env.push_back(wav);
+        if (ids == nullptr) {
+            std::string ids_why;
+            if (!read_ids_file(ids_file, &from_env, &ids_why)) {
+                std::fprintf(stderr, "ids: %s\n", ids_why.c_str());
+                return 1;
+            }
+            ids = "";
+        }
+        for (size_t i = 0; ids != nullptr && i < std::strlen(ids);) {   // split on whitespace
+            while (i < std::strlen(ids) && std::isspace(static_cast<unsigned char>(ids[i]))) ++i;
+            const size_t start = i;
+            while (i < std::strlen(ids) && !std::isspace(static_cast<unsigned char>(ids[i]))) ++i;
+            if (i > start) from_env.emplace_back(ids + start, i - start);
+        }
+        std::vector<char*> argv_env;
+        for (auto& s : from_env) argv_env.push_back(const_cast<char*>(s.c_str()));
+        return main(static_cast<int>(argv_env.size()), argv_env.data());
+    }
+    if (argc < 3) {
+        std::fprintf(stderr,
+                     "usage: %s <pack dir> <file.wav> [expected-id ...]\n"
+                     "       %s <encoder.onnx> <decoder.onnx> <file.wav> [expected-id ...]\n"
+                     "  The pack form reads the graphs, and the mel-bin count, from the directory (engine#1783).\n",
+                     argv[0], argv[0]);
         return 2;
     }
     using namespace onebit::npu::pack_import;
+    std::string enc_path = (argc > 1) ? argv[1] : "";
+    std::string dec_path = (argc > 2) ? argv[2] : "";
 
     std::string why;
-    // The spans the last line reports, each named for what it contains and nothing else: wav (reading the file), mel
-    // (the log-mel front-end), load (parsing both graphs), encoder, decode. `wall` is their sum, from before the file
-    // is opened.
-    const auto t_begin = std::chrono::steady_clock::now();
-    std::vector<float> audio = read_wav_16k_mono(argv[3], &why);
+    // `1` means the two-graph form is in use and the wav is argv[3]; the pack form sets this to 2 after it discovers the graphs.
+    int audio_arg_index = 1;
+    onebit::audio::MelConfig cfg;
+    // The pack form is decided by the first argument: a directory (or anything without `.onnx`) is a pack, and it also carries the
+    // mel-bin count, which has to be known before the wav is turned into a spectrogram.
+    if (argc >= 3 && std::string(argv[1]).find(".onnx") == std::string::npos) audio_arg_index = 2;
+    if (audio_arg_index == 2) {
+        const std::string pack_dir = argv[1];
+        onebit::audio::AudioPack pack;
+        if (!onebit::audio::discover_audio_pack(pack_dir, &pack, &why)) {
+            std::fprintf(stderr, "pack: %s\n", why.c_str());
+            return 1;
+        }
+        if (!pack.concern.empty()) std::fprintf(stderr, "pack note: %s\n", pack.concern.c_str());
+        std::fprintf(stderr, "pack: %s (mel bins %d from the %s)\n", pack_dir.c_str(), pack.mel_bins,
+                     pack.mel_bins_source.c_str());
+        cfg.bins = pack.mel_bins;
+        cfg.sample_rate = pack.sample_rate;
+        cfg.n_fft = pack.n_fft;
+        cfg.hop = pack.hop;
+        cfg.frames = pack.frames;
+        enc_path = pack.encoder;
+        dec_path = pack.decoder;
+    }
+    const size_t want = size_t(cfg.sample_rate) * 30;
+    std::vector<float> audio = read_wav_16k_mono(argv[audio_arg_index], &why);
     if (audio.empty()) {
         std::fprintf(stderr, "wav: %s\n", why.c_str());
         return 1;
     }
-    // Whisper's window is a fixed 30 s: pad with silence, do not scale.
-    onebit::audio::MelConfig cfg;
-    const size_t want = size_t(cfg.sample_rate) * size_t(cfg.frames) * size_t(cfg.hop) / size_t(cfg.frames);
     audio.resize(std::max(audio.size(), want), 0.0f);
 
     const auto t_start = std::chrono::steady_clock::now();
@@ -131,13 +219,12 @@ int main(int argc, char** argv) {
     const auto t_mel = std::chrono::steady_clock::now();
     OnnxGraphInfo enc, dec;
     try {
-        enc = parse_onnx_graph(argv[1]);
-        dec = parse_onnx_graph(argv[2]);
+        enc = parse_onnx_graph(enc_path);
+        dec = parse_onnx_graph(dec_path);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "graph: %s\n", e.what());
         return 1;
     }
-    const auto t_load = std::chrono::steady_clock::now();
     AudioRunResult xa;
     if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why)) {
         std::fprintf(stderr, "encoder: %s\n", why.c_str());
@@ -175,24 +262,23 @@ int main(int argc, char** argv) {
     const auto secs = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
         return std::chrono::duration<double>(b - a).count();
     };
-    std::printf("time: wav %.3f s, mel %.3f s, load %.3f s, encoder %.3f s, decode %.3f s for %zu token(s) -> %.3f s/token, "
-                "wall %.3f s\n",
-                secs(t_begin, t_start), secs(t_start, t_mel), secs(t_mel, t_load), secs(t_load, t_enc), secs(t_enc, t_dec),
-                ids.size(), ids.empty() ? 0.0 : secs(t_enc, t_dec) / double(ids.size()), secs(t_begin, t_dec));
+    std::printf("time: mel+load %.3f s, encoder %.3f s, decode %.3f s for %zu token(s) -> %.3f s/token, wall %.3f s\n",
+                secs(t_start, t_mel), secs(t_mel, t_enc), secs(t_enc, t_dec), ids.size(),
+                ids.empty() ? 0.0 : secs(t_enc, t_dec) / double(ids.size()), secs(t_start, t_dec));
     std::printf("ids:");
     for (int64_t v : ids) std::printf(" %lld", (long long)v);
     std::printf("\n");
 
-    if (argc > 4) {
+    if (argc > audio_arg_index + 1) {
         int bad = 0;
-        const int n = argc - 4;
+        const int n = argc - (audio_arg_index + 1);
         if (int(ids.size()) != n) {
             std::printf("FAIL length: got %zu want %d\n", ids.size(), n);
             ++bad;
         } else {
             for (int i = 0; i < n; ++i)
-                if (ids[size_t(i)] != std::atoll(argv[4 + i])) {
-                    std::printf("FAIL id[%d]: got %lld want %s\n", i, (long long)ids[size_t(i)], argv[4 + i]);
+                if (ids[size_t(i)] != std::atoll(argv[audio_arg_index + 1 + i])) {
+                    std::printf("FAIL id[%d]: got %lld want %s\n", i, (long long)ids[size_t(i)], argv[audio_arg_index + 1 + i]);
                     ++bad;
                 }
         }

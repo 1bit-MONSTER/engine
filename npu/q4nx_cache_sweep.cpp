@@ -26,8 +26,14 @@ namespace fs = std::filesystem;
 
 std::string q4nx_cache_size_text(int64_t bytes) {
     char out[32];
-    if (bytes >= (int64_t(1) << 30)) std::snprintf(out, sizeof out, "%.1f GiB", double(bytes) / (1 << 30));
-    else std::snprintf(out, sizeof out, "%.1f MiB", double(bytes) / (1 << 20));
+    if (bytes >= (int64_t(1) << 30)) {
+        std::snprintf(out, sizeof out, "%.1f GiB", double(bytes) / (1 << 30));
+        return out;
+    }
+    std::snprintf(out, sizeof out, "%.1f MiB", double(bytes) / (1 << 20));
+    // Within half a MiB of a GiB the MiB reading rounds to "1024.0", which is a value in the unit it has just left -- the same
+    // kind of misleading exchange this formatter exists to stop. Print the GiB it is about to become.
+    if (std::string(out) == "1024.0 MiB") std::snprintf(out, sizeof out, "%.1f GiB", double(bytes) / (1 << 30));
     return out;
 }
 

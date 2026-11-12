@@ -545,6 +545,7 @@ private:
     int mla_ = 0;
     int q_lora_ = 0, kv_lora_ = 0, rope_dim_ = 0, qk_nope_ = 0, v_head_ = 0;
     int n_expert_ = 0, top_k_ = 0, expert_im_ = 0, dense_im_ = 0;
+    bool moe_slice_nk_ = false;   // per-expert slices on an [N][K] grid despite FLM names (hy_v3)
     // Which MoE container convention this container uses, decided from its own tensors in
     // init_impl (moe_container.h): the engine converter's `mlp.experts.*` names with a plain
     // [N][K] per-expert tile grid, or the FLM-style `*_exps_proj` names whose writer transposes

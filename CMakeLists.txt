@@ -2192,6 +2192,12 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> qwen2vl)
     set_tests_properties(batch_check_state_qwen2vl PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # Hy-Memory (hy_v3, engine#1786): sigmoid routing with a selection bias, router [H][E], a leading dense layer,
+    # [N][K] expert slices under FLM names, expert_hidden_dim, against a numpy hy_v3 reference.
+    add_test(NAME batch_check_state_hy_v3
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:batch_check_state_test> hy_v3)
+    set_tests_properties(batch_check_state_hy_v3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # GPT-OSS (engine#1786): a container written in FastFlowLM's D2560/MX2560 form, sinks, o bias, yarn, the top-k
     # MoE with clamped SwiGLU, against a numpy GPT-OSS forward on the same bytes.
     add_test(NAME gptoss_forward

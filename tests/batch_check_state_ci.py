@@ -15,7 +15,7 @@
 # limitations under the License.
 """The batch-check state pin (tests/batch_check_state_test.cpp, engine#1905/#1946) on a container made here.
 
-usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|lfm3|qwen2|qwen2vl|qwen3_5] (needs numpy)
+usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|lfm3|qwen2|qwen2vl|qwen3_5|hy_v3] (needs numpy)
 
 batch_check_state_test needs a Q4NX container, and CI has none, so on its own it skips (77) there and a regression of
 #1909 -- the NPU_BATCH_CHECK oracle resetting the prefix it replays from -- lands green. This writes a two-layer qwen3
@@ -51,6 +51,14 @@ and never added them, so FastFlowLM's Qwen2.5-3B-Instruct-NPU2 answered noise. b
 container's own weights (qwen2_reference). `qwen2vl` is the same model declaring Qwen2.5-VL's rope_scaling
 {"type": "mrope", "mrope_section": [16, 24, 24]}: the forward refused that at load, and on a text-only prompt (all
 three position planes equal) it has to give exactly the plain-RoPE reference.
+
+With `hy_v3` it is a two-layer Hy-Memory-shaped MoE (engine#1786), written the way FastFlowLM's Hy-Memory-30B-A3B-NPU2
+is: `model.layer.N.` names, a dense layer 0 (`first_k_dense_replace`), a sigmoid router stored [H][E] with an F32
+`moe_expert_bias`, `router_scaling_factor`, one ungated shared expert, and expert stacks `*_exps_proj` whose
+per-expert slices are on an [N][K] grid declared 3-D ([E*N/32][K/256][5120]). The expert width is
+`expert_hidden_dim` (512) while `moe_intermediate_size` says 1024, as the real pack does (its experts are [768][2048]
+upstream with moe_intermediate_size 1536). Held to hyv3_reference() on the container's own weights; the forward
+answered " of of of" on the real pack while any one of these was wrong, and batched == sequential cannot see it.
 
 With `qwen3_5` it is a qwen3_5 hybrid (engine#1889): a linear-attention (GDN) layer, then a full-attention layer with
 q/k norms, written under `language_model.*` so the packer takes its qwen3_5 path (renames, the conv1d transpose,
@@ -348,6 +356,133 @@ def qwen2_reference(q4nx_dir, np, ids, shapes):
     return rms(x, W("model.norm.weight"))[-1] @ W("lm_head.weight").T
 
 
+HY = dict(H=256, NH=2, NKV=1, HD=128, E=4, TOPK=2, EIM=512, DIM=768, SCALE=2.5)
+
+
+def make_hyv3(d, np):
+    """A two-layer hy_v3 in FastFlowLM's naming; returns (weights for the reference, names to re-declare 3-D)."""
+    rng = np.random.default_rng(1786)
+    c = HY
+    H, E, EIM = c["H"], c["E"], c["EIM"]
+    w = lambda *sh, sc=0.05: (rng.standard_normal(sh) * sc).astype(np.float32)
+    nrm = lambda n: (1.0 + 0.1 * rng.standard_normal(n)).astype(np.float32)
+    W = {"model.embed_tokens.weight": w(VOCAB, H, sc=0.5), "model.norm.weight": nrm(H), "lm_head.weight": w(VOCAB, H, sc=0.2)}
+    for l in range(2):
+        p = f"model.layer.{l}."
+        W.update({p + "input_layernorm.weight": nrm(H), p + "post_attention_layernorm.weight": nrm(H),
+                  p + "self_attn.q_proj.weight": w(c["NH"] * c["HD"], H), p + "self_attn.k_proj.weight": w(c["NKV"] * c["HD"], H),
+                  p + "self_attn.v_proj.weight": w(c["NKV"] * c["HD"], H), p + "self_attn.o_proj.weight": w(H, c["NH"] * c["HD"]),
+                  p + "self_attn.q_norm.weight": nrm(c["HD"]), p + "self_attn.k_norm.weight": nrm(c["HD"])})
+        if l == 0:
+            W.update({p + "mlp.gate_proj.weight": w(c["DIM"], H), p + "mlp.up_proj.weight": w(c["DIM"], H),
+                      p + "mlp.down_proj.weight": w(H, c["DIM"])})
+        else:
+            W.update({p + "moe_router.weight": w(H, E, sc=0.5),                         # [H][E], as the pack
+                      # large enough to change which experts are picked: the bias is a selection rule
+                      p + "moe_expert_bias": np.array([2.0, -2.0, 1.0, -1.0], np.float32)[:E],
+                      p + "mlp.gate_exps_proj.weight": w(E * EIM, H), p + "mlp.up_exps_proj.weight": w(E * EIM, H),
+                      p + "mlp.down_exps_proj.weight": w(E * H, EIM),                    # stacked [N][K] per expert
+                      p + "mlp.share_gate_exps_proj.weight": w(EIM, H), p + "mlp.share_up_exps_proj.weight": w(EIM, H),
+                      p + "mlp.share_down_exps_proj.weight": w(H, EIM)})
+    os.makedirs(d)
+    write_safetensors(os.path.join(d, "model.safetensors"), W)
+    cfg = {"architectures": ["HYV3ForCausalLM"], "model_type": "hy_v3", "hidden_size": H, "num_hidden_layers": 2,
+           "num_attention_heads": c["NH"], "num_key_value_heads": c["NKV"], "head_dim": c["HD"],
+           "intermediate_size": c["DIM"], "vocab_size": VOCAB, "rms_norm_eps": 1e-5, "max_position_embeddings": 64,
+           "rope_parameters": {"rope_theta": 1000000.0, "rope_type": "default"}, "tie_word_embeddings": False,
+           "num_experts": E, "num_experts_per_tok": c["TOPK"], "moe_intermediate_size": 2 * EIM,
+           "expert_hidden_dim": EIM, "first_k_dense_replace": 1, "moe_router_use_sigmoid": True,
+           "moe_router_enable_expert_bias": True, "router_scaling_factor": c["SCALE"], "route_norm": True,
+           "num_shared_experts": 1, "qk_norm": True, "hidden_act": "silu", "torch_dtype": "float32"}
+    with open(os.path.join(d, "config.json"), "w") as f:
+        json.dump(cfg, f)
+    with open(os.path.join(d, "tokenizer.json"), "w") as f:
+        f.write("{}")
+    with open(os.path.join(d, "tokenizer_config.json"), "w") as f:
+        json.dump({"add_bos_token": False}, f)
+    return W
+
+
+def redeclare_3d(q4nx_dir, names):
+    """The packer writes [tiles, 5120] row-major over the 32 x 256 grid; FastFlowLM declares an expert stack as
+    [rows/32][cols/256][5120]. Same bytes, so only the header changes (its length is kept by space padding)."""
+    path = os.path.join(q4nx_dir, "model.q4nx")
+    with open(path, "r+b") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+        for name, (rt, ct) in names.items():
+            assert hdr[name]["shape"][0] == rt * ct, (name, hdr[name]["shape"], rt, ct)
+            hdr[name]["shape"] = [rt, ct, hdr[name]["shape"][1]]
+        h = json.dumps(hdr, separators=(",", ":")).encode()
+        assert len(h) <= n, "re-declared header grew"
+        f.seek(8)
+        f.write(h + b" " * (n - len(h)))
+
+
+def hyv3_reference(q4nx_dir, np, ids, shapes):
+    sys.path.insert(0, os.path.join(HERE, "..", "tools"))
+    from q4nx_pack import untile
+    with open(os.path.join(q4nx_dir, "model.q4nx"), "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        table = json.loads(f.read(n))
+        blob = f.read()
+
+    def W(name):
+        e = table[name]
+        lo, hi = e["data_offsets"]
+        if e["dtype"] == "BF16":
+            return (np.frombuffer(blob[lo:hi], dtype=np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(e["shape"])
+        if e["dtype"] == "F32":
+            return np.frombuffer(blob[lo:hi], dtype=np.float32).reshape(shapes[name])
+        rows, k = shapes[name]
+        return untile(np.frombuffer(blob[lo:hi], dtype=np.uint8).reshape(-1, 5120), rows, k)
+
+    c = HY
+    H, NH, NKV, HD, E, EIM = c["H"], c["NH"], c["NKV"], c["HD"], c["E"], c["EIM"]
+    T, eps = len(ids), 1e-5
+
+    def rms(x, w):
+        return w * (x / np.sqrt((x.astype(np.float64) ** 2).mean(-1, keepdims=True) + eps)).astype(np.float32)
+    inv = 1.0 / 1000000.0 ** (np.arange(0, HD, 2) / HD)
+    fr = np.arange(T)[:, None] * inv[None, :]
+    cos, sin = np.cos(np.concatenate([fr, fr], -1))[:, None], np.sin(np.concatenate([fr, fr], -1))[:, None]
+
+    def rope(x):
+        x = x.astype(np.float64)
+        return (x * cos + np.concatenate([-x[..., HD // 2:], x[..., :HD // 2]], -1) * sin).astype(np.float32)
+    silu = lambda a: a / (1.0 + np.exp(-a))
+    x = W("model.embed_tokens.weight")[ids].astype(np.float32)
+    for l in range(2):
+        p = f"model.layer.{l}."
+        xn = rms(x, W(p + "input_layernorm.weight"))
+        q = rms((xn @ W(p + "self_attn.q_proj.weight").T).reshape(T, NH, HD), W(p + "self_attn.q_norm.weight"))
+        k = rms((xn @ W(p + "self_attn.k_proj.weight").T).reshape(T, NKV, HD), W(p + "self_attn.k_norm.weight"))
+        v = (xn @ W(p + "self_attn.v_proj.weight").T).reshape(T, NKV, HD)
+        q, k = rope(q), rope(k)
+        k, v = np.repeat(k, NH // NKV, 1), np.repeat(v, NH // NKV, 1)
+        sc = np.where(np.tril(np.ones((T, T), bool))[None], np.einsum("thd,shd->hts", q, k) / np.sqrt(HD), -np.inf)
+        sc = np.exp(sc - sc.max(-1, keepdims=True))
+        x = x + np.einsum("hts,shd->thd", sc / sc.sum(-1, keepdims=True), v).reshape(T, NH * HD) @ W(p + "self_attn.o_proj.weight").T
+        h = rms(x, W(p + "post_attention_layernorm.weight"))
+        if l == 0:
+            x = x + (silu(h @ W(p + "mlp.gate_proj.weight").T) * (h @ W(p + "mlp.up_proj.weight").T)) @ W(p + "mlp.down_proj.weight").T
+            continue
+        probs = 1.0 / (1.0 + np.exp(-(h @ W(p + "moe_router.weight"))))
+        bias = W(p + "moe_expert_bias")
+        G, U, D = W(p + "mlp.gate_exps_proj.weight"), W(p + "mlp.up_exps_proj.weight"), W(p + "mlp.down_exps_proj.weight")
+        out = np.zeros_like(x)
+        for t in range(T):
+            sel = np.argsort(-(probs[t] + bias))[:c["TOPK"]]
+            wts = probs[t, sel] / probs[t, sel].sum() * c["SCALE"]
+            for e, wt in zip(sel, wts):
+                g, u, dn = G[e * EIM:(e + 1) * EIM], U[e * EIM:(e + 1) * EIM], D[e * H:(e + 1) * H]
+                out[t] += wt * ((silu(h[t] @ g.T) * (h[t] @ u.T)) @ dn.T)
+        out += (silu(h @ W(p + "mlp.share_gate_exps_proj.weight").T) * (h @ W(p + "mlp.share_up_exps_proj.weight").T)) @ \
+            W(p + "mlp.share_down_exps_proj.weight").T
+        x = x + out
+    return rms(x, W("model.norm.weight"))[-1] @ W("lm_head.weight").T
+
+
 def tmp_root():
     """tests/tmp_root.h's rule (engine#2029): scratch goes on disk, not in tmpfs. ONEBIT_TEST_TMP if set, else
     ~/.cache/scratch-tests/tmp, else the system temp directory."""
@@ -366,7 +501,7 @@ def tmp_root():
 
 
 def main():
-    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen2", "qwen2vl", "qwen3_5")):
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen2", "qwen2vl", "qwen3_5", "hy_v3")):
         print(__doc__.strip().splitlines()[2])
         return 2
     family = sys.argv[2] if len(sys.argv) == 3 else "qwen3"
@@ -377,14 +512,23 @@ def main():
         return 77
     with tempfile.TemporaryDirectory(prefix="batch_check_state_ci.", dir=tmp_root()) as tmp:
         src, out = os.path.join(tmp, "hf"), os.path.join(tmp, "q4nx")
-        shapes = make_model(src, np, family)
+        if family == "hy_v3":
+            Whyv = make_hyv3(src, np)
+            shapes = {k: v.shape for k, v in Whyv.items()}
+        else:
+            shapes = make_model(src, np, family)
         r = subprocess.run([sys.executable, TOOL, "pack", src, out], capture_output=True, text=True)
         if r.returncode != 0:
             print(f"FAIL  packing the fabricated container: {r.stderr[-600:]}")
             return 1
+        if family == "hy_v3":
+            c = HY
+            redeclare_3d(out, {"model.layer.1.mlp.gate_exps_proj.weight": (c["E"] * c["EIM"] // 32, c["H"] // 256),
+                               "model.layer.1.mlp.up_exps_proj.weight": (c["E"] * c["EIM"] // 32, c["H"] // 256),
+                               "model.layer.1.mlp.down_exps_proj.weight": (c["E"] * c["H"] // 32, c["EIM"] // 256)})
         env = dict(os.environ, ONEBIT_TEST_Q4NX=out)
         logits_out = os.path.join(tmp, "sequential.f32")
-        if family in ("lfm3", "qwen2", "qwen2vl"):
+        if family in ("lfm3", "qwen2", "qwen2vl", "hy_v3"):
             env["ONEBIT_TEST_LOGITS_OUT"] = logits_out
         env.pop("NPU_INFER_HOST_GEMM", None)   # init_host is host-GEMM already; nothing else should steer it
         r = subprocess.run([sys.argv[1]], env=env, capture_output=True, text=True, timeout=110)
@@ -397,9 +541,9 @@ def main():
             # arm, not a reason to skip it.
             print("FAIL  batch_check_state_test skipped on the fabricated container (init_host refused it)")
             return 1
-        if family in ("lfm3", "qwen2", "qwen2vl") and r.returncode == 0:
+        if family in ("lfm3", "qwen2", "qwen2vl", "hy_v3") and r.returncode == 0:
             ours = np.fromfile(logits_out, dtype=np.float32)[:VOCAB]
-            ref = (lfm3_reference if family == "lfm3" else qwen2_reference)(out, np, [1, 2, 3, 4, 5, 6], shapes)
+            ref = {"lfm3": lfm3_reference, "hy_v3": hyv3_reference}.get(family, qwen2_reference)(out, np, [1, 2, 3, 4, 5, 6], shapes)
             corr = float(np.corrcoef(ours, ref)[0, 1])
             ok = (corr >= LFM3_MIN_CORR and float(np.abs(ours - ref).max()) <= LFM3_MAX_DIFF * float(np.abs(ref).max())
                   and int(np.argmax(ours)) == int(np.argmax(ref)))

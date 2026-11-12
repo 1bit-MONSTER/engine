@@ -435,6 +435,10 @@ add_test(NAME hw_gate_npuserve COMMAND ${CMAKE_SOURCE_DIR}/tests/hw_gate_npuserv
 # loopback-server test takes (tests/route_port_lock_test.py): two of them racing for one freed port is a flaky failure.
 set_tests_properties(hw_gate_npuserve npu_serve_smoke_self PROPERTIES RESOURCE_LOCK route_ports)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
+# engine #1504: the hardware gate's build does not start below its memory floor, a memory-guard stop is not
+# resumed like a thermal stop, and the stopped compile (or GPU step) is really gone. A fake root with a stub
+# cmake, a stub thermal-run and a fake meminfo: no GPU, no compiler, runs in CI.
+add_test(NAME hw_gate_mem COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_mem_test.sh ${CMAKE_SOURCE_DIR})
 # engine #1504: the release preflight blocks on a runner unit that is down and only warns on a short restart policy.
 # The real scripts/ci-runner-health.sh and weekly.sh's preflight_runner_units() against a stub systemctl; no systemd.
 add_test(NAME weekly_runner_preflight COMMAND ${CMAKE_SOURCE_DIR}/tests/weekly_runner_preflight_test.sh)

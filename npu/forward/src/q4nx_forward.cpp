@@ -1762,38 +1762,58 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // the logits off the embedding answered noise on the host and on the NPU. When the key is absent and the
     // container carries both tables, sample rows of each and let the weights say: a tied head is the embedding's
     // quantised copy (corr ~1), an untied one is unrelated (measured 0.00x on the 9B).
-    // With no embedding to compare against, embed_at() reads 0.0f, the variance is zero and the default stays.
+    // Every way this check can end prints one line: an un-taken measurement names the condition that stopped it and
+    // the default it keeps, so the assumption this replaces can never come back silently (review of #2309).
     if (!sem_.tie_stated && sem_.tie_embeddings) {
         TensorDesc* ltd = model_tensor_by_name(mw_, "lm_head.weight");
         TensorDesc* etd = &mw_->embed_tokens;
-        const bool both = ltd && ltd->data_size && etd->data_size && etd->name[0] != '\0' && strcmp(ltd->name, etd->name);
-        if (both && kpad_ > 0 && kpad_ % Q4NX_TILE_COLS == 0) {
+        char why[160] = "";
+        if (!ltd || !ltd->data_size)
+            snprintf(why, sizeof(why), "no separate lm_head.weight");
+        else if (!etd->data_size || etd->name[0] == '\0' || !strcmp(ltd->name, etd->name))
+            snprintf(why, sizeof(why), "lm_head.weight is the only table (it is also the embedding)");
+        else if (kpad_ <= 0 || kpad_ % Q4NX_TILE_COLS != 0)
+            snprintf(why, sizeof(why), "lm_head.weight present but kpad %d is not a multiple of %d", kpad_, Q4NX_TILE_COLS);
+        const int samples = 16;
+        double corr = 0.0;
+        bool measured = false;
+        if (!why[0]) {
             const int64_t head_shape[3] = {ltd->shape[0], ltd->ndim >= 2 ? ltd->shape[1] : 0, ltd->ndim >= 3 ? ltd->shape[2] : 0};
             const int head_rows = padded_head_rows(head_shape, ltd->ndim, kpad_, NV);
             const int cb = q4nx_tile_row_kind((size_t)ltd->data_size, head_rows, kpad_);
             const uint8_t* lp = (const uint8_t*)model_tensor_data(mw_, ltd);
-            if (cb != 0 && lp) {
+            if (cb == 0 || !lp)
+                snprintf(why, sizeof(why), "lm_head.weight (%llu bytes) has no row-readable chunk kind on a %d x %d grid",
+                         (unsigned long long)ltd->data_size, head_rows, kpad_);
+            else {
                 std::vector<float> row((size_t)kpad_);
                 double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, n = 0;
-                const int samples = 16;
-                for (int i = 0; i < samples; i++) {
+                for (int i = 0; i < samples && !why[0]; i++) {
                     const int r = (int)((int64_t)i * (NV - 1) / (samples - 1));
-                    if (q4nx_dequant_tile_row(lp, (size_t)ltd->data_size, head_rows, kpad_, cb, r, row.data()) != 0) { n = 0; break; }
+                    if (q4nx_dequant_tile_row(lp, (size_t)ltd->data_size, head_rows, kpad_, cb, r, row.data()) != 0) {
+                        snprintf(why, sizeof(why), "lm_head.weight row %d did not decode", r);
+                        break;
+                    }
                     for (int k = 0; k < H; k++) {
                         const double x = row[(size_t)k], y = embed_at(r, k);
                         sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; n += 1;
                     }
                 }
-                if (n > 0) {
+                if (!why[0]) {
                     const double cov = sxy - sx * sy / n, vx = sxx - sx * sx / n, vy = syy - sy * sy / n;
-                    const double corr = (vx > 0 && vy > 0) ? cov / std::sqrt(vx * vy) : 1.0;
-                    const bool untied = corr < 0.5;
-                    std::fprintf(stderr, "  [forward] tie_word_embeddings not stated: lm_head.weight vs the embedding on %d "
-                                         "rows, corr %.4f -> %s\n", samples, corr,
-                                 untied ? "untied (the separate head is used)" : "tied (the embedding is the head)");
-                    if (untied) sem_.tie_embeddings = 0;
+                    if (vx > 0 && vy > 0) { corr = cov / std::sqrt(vx * vy); measured = true; }
+                    else snprintf(why, sizeof(why), "corr n/a (zero variance: %s)", vy > 0 ? "lm_head rows" : "embedding rows");
                 }
             }
+        }
+        if (measured) {
+            const bool untied = corr < 0.5;
+            std::fprintf(stderr, "  [forward] tie_word_embeddings not stated: lm_head.weight vs the embedding on %d rows, "
+                                 "corr %.4f -> %s\n", samples, corr,
+                         untied ? "untied (the separate head is used)" : "tied (the embedding is the head)");
+            if (untied) sem_.tie_embeddings = 0;
+        } else {
+            std::fprintf(stderr, "  [forward] tie_word_embeddings not stated: %s, keeping tied\n", why);
         }
     }
     if (!sem_.tie_embeddings) {

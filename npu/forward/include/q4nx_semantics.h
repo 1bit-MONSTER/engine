@@ -86,6 +86,10 @@ typedef struct {
     /* Linear biases on q/k/v/o and on the MLP projections.
      * Source: attention_bias / mlp_bias (presence of corresponding tensors). */
     int attention_bias;
+    /* 1 when config.json states attention_bias (true or false); 0 when the key is absent, which is Qwen2's case:
+     * its configs never state it and every layer carries q/k/v biases.  q4nx_semantics_attention_bias_from_tensors
+     * decides the absent case from the container. */
+    int attention_bias_stated;
     int mlp_bias;
     /* Multiplier applied to token embeddings before layer 0.
      * Source: model_type (gemma* uses sqrt(hidden_size)); else 1.0. */
@@ -278,6 +282,10 @@ int q4nx_rmsnorm_offset_from_norm(const float* w, int n);
  * nothing, when qk_norm is already on, when no layer carries both, or on null/empty input. It never turns the norm
  * off: a family the table knows keeps its answer whatever the tensors are. Exported so the rule is testable. */
 int q4nx_semantics_qk_norm_from_tensors(Q4nxSemantics* s, const unsigned char* has_q, const unsigned char* has_k, int layers);
+/* engine#1786: config.json did not state attention_bias and a layer carries a q, k or v projection bias -> the
+ * biases are applied (attention_bias = 1); returns that layer, else -1.  A config that states attention_bias=false
+ * while the container carries biases is a disagreement the caller refuses: returns -2. */
+int q4nx_semantics_attention_bias_from_tensors(Q4nxSemantics* s, const unsigned char* has_bias, int layers);
 
 /* engine#1889's refusal, as a rule: with q/k norm on, a layer whose q gain is absent would normalise q to zero, so the
  * container is refused. That is a statement about layers with SOFTMAX ATTENTION. A layer of another kind carries no

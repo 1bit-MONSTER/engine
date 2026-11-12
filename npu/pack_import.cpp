@@ -3612,8 +3612,19 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
     // output scale. Nothing here has a field in npu/forward/include/model.h, so they are RECOGNISED rather than mapped:
     // `unassigned` has to keep meaning "nothing knows this", and these are known -- measured on gemma4-e2b (319 of 709)
     // and bolt-e4b (382 of 849), which were the two packs the classifier could not finish.
+    // `post_layernorm` and `per_layer_model_proj` are here for a measured reason, not a guess: gemma4-e2b carries
+    // BOTH `post_attention_layernorm` (35, classified `post_norm`) and `post_layernorm` (35), so the second cannot be
+    // the forward's post-attention norm -- they are different tensors in the same model. gemma3-270m has no
+    // `post_layernorm` at all, which is why only gemma4/bolt were left with it.
     static const char* kGemmaLocal[] = {"pre_feedforward_layernorm", "post_feedforward_layernorm", "inp_gate",
-                                        "layer_output_scale", "per_layer_projection"};
+                                        "layer_output_scale", "per_layer_projection", "post_layernorm",
+                                        "per_layer_model_proj"};
+    // engine#1788: the last three on gemma4/bolt are recognised for a different reason than the gemma ones, so they get
+    // their own role. `rope_freqs.weight` is a file the forward only FLAGS (`model_config.h`: has_rope_freqs_file), and
+    // `per_layer_token_embd` (with its `.scale` sibling) is the per-layer token embedding that our ONNX path reads as
+    // `embed_tokens_per_layer` (engine#1725) but the container path has no field for. Recognised, not mapped: neither
+    // has a field to fill, and calling them "unassigned" would say nothing knows them when the opposite is true.
+    static const char* kContainerExtras[] = {"rope_freqs", "per_layer_token_embd"};
     static const char* kMtp[] = {"model.mtp."};
     ContainerRoles out;
     for (const auto& t : tensors) {
@@ -3640,6 +3651,10 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
             if (!matched && role.empty()) {
                 for (const char* s : kSsm)
                     if (n.find(s) != std::string::npos) { role = "ssm"; matched = true; break; }
+            }
+            if (!matched && role.empty()) {
+                for (const char* e : kContainerExtras)
+                    if (n.find(e) != std::string::npos) { role = "container_extra"; matched = true; break; }
             }
             if (!matched && role.empty()) {
                 for (const char* g : kGemmaLocal)

@@ -559,7 +559,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             // Raw distribution: sample_token() takes logits by const reference, so this is
             // pre-top_k/top_p/temperature and the grammar mask cannot narrow it.
             if (want_lp)
-                held.emplace_back(Emitted{piece, npu::logprobs_of(logits, next, opts.sample.top_logprobs)}, piece.size());
+                held.emplace_back(Emitted{piece, npu::logprobs_of(logits, e.tok->size(), next, opts.sample.top_logprobs)}, piece.size());
             stats.pieces.push_back(piece);   // engine#2111: reasoning_tokens is counted over these
             ++produced;
             const size_t stop_at = npu::find_stop(pending, opts.stop);

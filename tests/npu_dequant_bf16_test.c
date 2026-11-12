@@ -379,8 +379,49 @@ static void q4s_chunk(void) {
     free(whole); free(t); free(out);
 }
 
+/* The 1,280-byte quarter tile (Gemma3-270M-NPU2): 16 rows x 128 columns, scales and zero-points at g*16 + r, codes at
+ * c*8 + r/2. A [32 x 256] tensor of 2 x 2 chunks, read into a 384-wide buffer (the forward pads K to 256). */
+static void q4h_chunks(void) {
+    const int rows = 32, k = 256, cols = 384, ntc = k / Q4NX_Q4H_COLS;
+    const size_t n = (size_t)(rows / Q4NX_Q4H_ROWS) * (size_t)ntc;
+    uint8_t* t = (uint8_t*)calloc(n, Q4NX_CHUNK_Q4H);
+    float* out = (float*)malloc(sizeof(float) * (size_t)rows * cols);
+    if (!t || !out) { check(0, "q4h: the buffers allocate"); free(t); free(out); return; }
+    for (size_t ci = 0; ci < n; ci++) {
+        uint8_t* c = t + ci * Q4NX_CHUNK_Q4H;
+        for (int i = 0; i < 64; i++) {
+            put_bf16(c, (size_t)i, 0.25f * (float)(1 + (int)((i + ci) % 7)));          /* scale */
+            put_bf16(c + 128, (size_t)i, -1.0f * (float)(1 + (int)((i + 3 * ci) % 5)));  /* zero-point */
+        }
+        for (int b = 0; b < 1024; b++) c[256 + b] = (uint8_t)((b * 7 + 3 * ci) & 0xff);
+    }
+    for (size_t i = 0; i < (size_t)rows * cols; i++) out[i] = 99.0f;
+    check(q4nx_dequant_tensor_q4h(t, n * Q4NX_CHUNK_Q4H, rows, k, cols, out) == 0, "q4h: a 2 x 2 grid reads");
+    int bad = 0, pad_bad = 0;
+    for (int r = 0; r < rows; r++)
+        for (int col = 0; col < cols; col++) {
+            const float got = out[(size_t)r * cols + col];
+            if (col >= k) { if (got != 0.0f) pad_bad++; continue; }
+            const int tr = r / 16, tc = col / 128, rr = r % 16, cc = col % 128;
+            const size_t ci = (size_t)tr * ntc + tc;
+            const int i = (cc / 32) * 16 + rr;
+            const uint8_t byte = (uint8_t)(((cc * 8 + rr / 2) * 7 + 3 * ci) & 0xff);
+            const int code = (rr % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+            const float s = 0.25f * (float)(1 + (int)((i + ci) % 7)), z = -1.0f * (float)(1 + (int)((i + 3 * ci) % 5));
+            if (got != (float)code * s + z) bad++;
+        }
+    check(bad == 0, "q4h: every element is code (at c*8 + r/2) * scale + zero (at g*16 + r), grid row-major");
+    check(pad_bad == 0, "q4h: the columns past the container's K are written 0");
+    check(q4nx_dequant_tensor_q4h(t, n * Q4NX_CHUNK_Q4H - 1, rows, k, cols, out) == -1, "q4h: one byte short is refused");
+    check(q4nx_dequant_tensor_q4h(t, n * Q4NX_CHUNK_Q4H, rows, k, k - 128, out) == -1, "q4h: a buffer narrower than K is refused");
+    check(q4nx_dequant_tensor_q4h(t, n * Q4NX_CHUNK_Q4H, 24, k, cols, out) == -1, "q4h: rows off the 16-row grid are refused");
+    free(t);
+    free(out);
+}
+
 int main(void) {
     q4s_chunk();
+    q4h_chunks();
     tile_kinds();
     tile_kind_is_per_tensor();
     tile_row_kind_arms();

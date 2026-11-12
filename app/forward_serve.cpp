@@ -1115,6 +1115,22 @@ int run_forward_serve(int argc, char** argv) {
     e.tok = std::make_unique<npu::Tokenizer>(tok_json);
     e.bos_id  = json_int(cfg, "bos_token_id", -1);
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;
+    // config.json is the first source; what it does not state, tokenizer_config.json does (the BOS text, looked up
+    // in the tokenizer, and add_bos_token). Without this a Gemma3 pack was served with no BOS at all.
+    if (e.bos_id < 0 || json_int(cfg, "add_bos_token", -1) < 0) {
+        const nlohmann::json tc = npu::read_json_or_null(dir + "/tokenizer_config.json");
+        if (e.bos_id < 0) {
+            const std::string b = npu::special_token_text(tc, "bos_token");
+            if (!b.empty()) e.bos_id = e.tok->token_id(b);
+        }
+        if (json_int(cfg, "add_bos_token", -1) < 0) {
+            const int a = npu::add_bos_token_flag(tc);
+            if (a >= 0) e.add_bos = a != 0;
+        }
+        if (e.bos_id >= 0 && e.add_bos)
+            std::fprintf(stderr, "1bit forward-serve: BOS %d from tokenizer_config.json (config.json does not state it)\n",
+                         e.bos_id);
+    }
     e.eos = npu::eos_token_ids_from_config(cfg);
     const size_t eos_from_config = e.eos.size();
     e.endoftext = e.tok->token_id("<|endoftext|>");

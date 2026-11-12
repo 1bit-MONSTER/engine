@@ -210,14 +210,16 @@ add_dependencies(onebit npu_decode_note_test)
 # refusal this pre-empts ("differ in size") needed private-repo archaeology to diagnose; the symptom is checkable here.
 add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set_check_test.sh)
 
-# engine#2186/#2244: two checks that were only ever run by hand. `tools/ci/dupdef_check.py` is the one
+# engine#2186/#2244: `tools/ci/dupdef_check.py`, a check that was only ever run by hand. It is the one
 # that found a shadowed `def self_test()` in tools/hrx_f16_narrowing_check.py -- the surviving copy
-# passed and the shadowed one's arms could never fail. Both take no build input, so a ctest row is the
+# passed and the shadowed one's arms could never fail. It takes no build input, so a ctest row is the
 # route that needs no ci.yml line (the workflow is not editable from a lane).
+# engine#2246 also added a row for that file's --self-test; `add_python_test(hrx_f16_narrowing ...)`
+# at line 418 has run exactly that since #2204, so the row was a duplicate and is gone -- one script
+# gets one row.
 add_test(NAME dupdef_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --check
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-add_test(NAME hrx_f16_narrowing_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/hrx_f16_narrowing_check.py --self-test
-         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
@@ -1447,6 +1449,14 @@ target_include_directories(dflash_forward_test PRIVATE npu npu/forward/include)
 target_link_libraries(dflash_forward_test PRIVATE onebit_npu)
 add_dependencies(onebit dflash_forward_test)
 add_test(NAME dflash_forward COMMAND dflash_forward_test ${ONEBIT_DFLASH_DRAFT})
+# engine#1781: the DFlash draft as mtp::run()'s drafter (npu/dflash_head.h) on a toy base that writes a tap row per
+# position, rejected rows included: text equals plain decode, the sink keeps only committed rows, every draft equals
+# draft_forward() over them. Host only.
+add_executable(dflash_head_test tests/dflash_head_test.cpp npu/dflash_forward.cpp npu/dflash_draft.cpp npu/forward/src/q4nx_dequant.c)
+target_include_directories(dflash_head_test PRIVATE npu npu/forward/include)
+target_link_libraries(dflash_head_test PRIVATE onebit_npu)
+add_dependencies(onebit dflash_head_test)
+add_test(NAME dflash_head COMMAND dflash_head_test)
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
@@ -1746,6 +1756,11 @@ add_executable(q4nx_qk_norm_test tests/q4nx_qk_norm_test.c npu/forward/src/q4nx_
 target_include_directories(q4nx_qk_norm_test PRIVATE npu/forward/include)
 target_link_libraries(q4nx_qk_norm_test PRIVATE m)
 add_test(NAME q4nx_qk_norm COMMAND q4nx_qk_norm_test)
+add_executable(q4nx_gemma3_semantics_test tests/q4nx_gemma3_semantics_test.c npu/forward/src/q4nx_semantics.c)
+target_include_directories(q4nx_gemma3_semantics_test PRIVATE npu/forward/include)
+target_link_libraries(q4nx_gemma3_semantics_test PRIVATE m)
+add_test(NAME q4nx_gemma3_semantics COMMAND q4nx_gemma3_semantics_test)
+add_dependencies(npu_sampling_test q4nx_gemma3_semantics_test)
 add_dependencies(npu_sampling_test q4nx_qk_norm_test)
 add_executable(q4nx_layer_kinds_test tests/q4nx_layer_kinds_test.c npu/forward/src/q4nx_semantics.c)
 target_include_directories(q4nx_layer_kinds_test PRIVATE npu/forward/include)

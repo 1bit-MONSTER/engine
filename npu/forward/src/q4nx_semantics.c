@@ -25,7 +25,7 @@
 #include <string.h>
 
 static const char* kFields[Q4NX_SEM_COUNT] = {
-    /* RMSNORM_OFFSET  */ "model_type/architectures (gemma* uses the 1+w form)",
+    /* RMSNORM_OFFSET  */ "model_type/architectures (gemma2 uses the 1+w form; gemma3 containers carry the 1)",
     /* QK_NORM         */ "use_qk_norm when stated, else model_type/architectures",
     /* ROPE_THETA      */ "rope_theta",
     /* ROTARY_DIM      */ "partial_rotary_factor * head_dim",
@@ -209,12 +209,20 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
      * initialised to ones, whereas gemma2/gemma3 do `x/rms * (1 + w)`. */
     const int is_gemma4 = strstr(model_type, "gemma4") != NULL ||
                           strstr(arch, "Gemma4") != NULL;
+    /* Gemma3 (gemma3, gemma3_text, FastFlowLM's gemma3_text_only): the sandwich norms, a local RoPE base for the sliding
+     * layers and the 5:1 sliding pattern.  gemma3n is another architecture (AltUp, laurel) and is not this. */
+    const int is_gemma3 = (starts_with(model_type, "gemma3") && !starts_with(model_type, "gemma3n")) ||
+                          (starts_with(arch, "Gemma3") && !starts_with(arch, "Gemma3n"));
     const int is_qwen3 = starts_with(model_type, "qwen3") || starts_with(arch, "Qwen3");
     const int is_phi = starts_with(model_type, "phi") || starts_with(arch, "Phi");
     const int is_qwen35 = starts_with(model_type, "qwen3_5") || starts_with(arch, "Qwen3_5");
 
-    /* RMSNorm convention: gemma2/gemma3 scale by (1 + w); gemma4 by w. */
-    s->rmsnorm_offset = (is_gemma && !is_gemma4) ? 1 : 0;
+    /* RMSNorm convention: gemma2 scales by (1 + w); gemma4 by w.  Gemma3 is (1 + w) in HF, but the containers this
+     * forward reads (FastFlowLM's gemma3 NPU2 packs) store the norm weights with the 1 already added, as llama.cpp's
+     * GGUF does: on Medgemma-4B-NPU2 every norm kind (input, post-attention, pre/post feedforward, q, final) equals
+     * the GGUF's to bf16 rounding, and adding 1 again answered the known-answer prompt "*,,,,,," where the plain
+     * form answers "Paris" (engine#1786). */
+    s->rmsnorm_offset = (is_gemma && !is_gemma4 && !is_gemma3) ? 1 : 0;
     /* qwen3_5 ships both conventions under the same model_type, so the forward resolves it from the
      * layer-0 input_layernorm weight it loads (a config-only answer would be a guess). */
     s->rmsnorm_offset_probe = (is_qwen35 && !is_gemma) ? 1 : 0;
@@ -366,6 +374,13 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
     } else if (get_num(json, "rope_theta", &d) && d > 0) {
         s->rope_theta = (float)d;
     }
+    /* Gemma3 gives the sliding layers their own base (10000 against the full layers' 1e6).  Without it a sliding
+     * layer was rotated with theta 0, i.e. no usable rotation at all (engine#1786). */
+    if (!s->per_layer_rope && get_num(json, "rope_local_base_freq", &d) && d > 0) {
+        s->rope_theta_sliding = (float)d;
+        s->rope_local_base = 1;
+    }
+    if (get_num(json, "query_pre_attn_scalar", &d) && d > 0) s->query_pre_attn_scalar = (float)d;
 
     /* partial rotary: top-level key, or nested in rope_parameters (scalar form),
      * or nested per layer type (Gemma4's full_attention.partial_rotary_factor). */
@@ -476,6 +491,24 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
     else
         s->sliding_window = 0;
 
+    /* Gemma3 configs that predate layer_types state the pattern instead: every `sliding_window_pattern`-th layer is
+     * full attention, the rest slide (HF: is_sliding = bool((layer_idx + 1) % sliding_window_pattern)). */
+    if (s->n_layer_types == 0 && s->sliding_window > 0 && get_num(json, "sliding_window_pattern", &d) && d >= 1) {
+        double nl = 0;
+        const int pat = (int)(d + 0.5);
+        if (get_num(json, "num_hidden_layers", &nl) && nl > 0 && nl <= Q4NX_MAX_LAYERS) {
+            int hybrid = 0;
+            for (int i = 0; i < (int)nl; i++) {
+                s->layer_types[i] = ((i + 1) % pat) ? Q4NX_LAYER_SLIDING : Q4NX_LAYER_FULL;
+                if (s->layer_types[i] != Q4NX_LAYER_FULL) hybrid++;
+            }
+            s->n_layer_types = (int)nl;
+            s->hybrid_layers = hybrid;
+        }
+    }
+    /* A sliding layer with no base of its own uses the model's (theta 0 is not a base). */
+    if (s->rope_theta_sliding <= 0) s->rope_theta_sliding = s->rope_theta;
+
     /* epsilon */
     if (get_num(json, "rms_norm_eps", &d) && d > 0) s->eps = (float)d;
     /* LFM2 spells it norm_eps (and has no rms_norm_eps at all) */
@@ -489,7 +522,7 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
     if (get_num(json, "num_kv_shared_layers", &d) && d > 0)
         s->num_kv_shared_layers = (int)(d + 0.5);
     /* Gemma4 adds pre/post feedforward norms and a post-PLE norm. */
-    s->extra_layer_norms = is_gemma4 ? 1 : 0;
+    s->extra_layer_norms = is_gemma4 ? 1 : (is_gemma3 ? 2 : 0);
     /* `use_double_wide_mlp` is a JSON boolean, so read it as "present in text". */
     s->double_wide_mlp = (strstr(json, "use_double_wide_mlp\":true") != NULL ||
                           strstr(json, "use_double_wide_mlp\": true") != NULL) ? 1 : 0;
@@ -602,9 +635,10 @@ void q4nx_semantics_dump(const Q4nxSemantics* s) {
         fprintf(stderr, "  [semantics] layer mix: %s  <- %s\n", mix,
                 q4nx_semantics_field(Q4NX_SEM_LAYER_TYPES));
         fprintf(stderr, "  [semantics] per-type rope: full(theta=%.6g rot=%d) "
-                        "sliding(theta=%.6g rot=%d)  rope_type_named=%d\n",
+                        "sliding(theta=%.6g rot=%d%s)  rope_type_named=%d  query_pre_attn_scalar=%.6g\n",
                 s->rope_theta, s->rotary_dim, s->rope_theta_sliding,
-                s->rotary_dim_sliding, s->rope_type_named);
+                s->rotary_dim_sliding, s->rope_local_base ? ", rope_local_base_freq" : "",
+                s->rope_type_named, s->query_pre_attn_scalar);
         fprintf(stderr, "  [semantics] ple=%d (dim=%d vocab=%d) kv_shared_layers=%d "
                         "extra_layer_norms=%d double_wide_mlp=%d\n",
                 q4nx_semantics_uses_ple(s), s->hidden_size_per_layer_input,

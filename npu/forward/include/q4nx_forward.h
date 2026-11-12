@@ -204,6 +204,9 @@ public:
     // Public: a speculative driver outside this class begins a verify batch, then commits a prefix of it.
     void begin_verify(int rows, int start_pos);
     bool commit_verify_rows(int accepted);
+    // How many commits took the full-accept path (kept the batch's own state instead of restoring and replaying it).
+    // A test that compares the two paths reads it to know the path it meant to test is the one that ran.
+    long full_accepts_kept() const { return full_accepts_kept_; }
     bool gdn_apply_rows(int from, int to);      // recurrence-only replay of stored rows [from, to)
 
 
@@ -252,6 +255,7 @@ private:
     bool load_norms();
     std::vector<float> last_hidden_;  // last_hidden(): the post-final-norm state of the last position
     std::vector<float> last_residual_;  // and one norm earlier: the raw residual of the last position
+    long                full_accepts_kept_ = 0;   // commit_verify_rows(): see full_accepts_kept()
     std::vector<int>    tap_layers_;           // engine#1780: set_layer_taps()
     std::vector<float>* tap_sink_ = nullptr;
     size_t              tap_base_ = 0;         // where the current pass's rows start in *tap_sink_
@@ -517,6 +521,7 @@ private:
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
     Q4nxRopeLlama3 rope_llama3_;     // rope_type "llama3" (Llama-3.1/3.2/3.3); on == 0 for everything else
     Q4nxRopeDynamic rope_dynamic_;   // rope_type "dynamic" (NTK base rule, engine#1740 W2); on == 0 elsewhere
+    double rope_linear_factor_ = 0.0; // rope_type "linear" factor (Gemma3's full layers); 0 elsewhere
     // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 for
     // every other architecture.  MiniCPM4 scales the embedding by 12 and each
     // residual branch by scale_depth/sqrt(NL) (0.2475 for 32 layers); skipping

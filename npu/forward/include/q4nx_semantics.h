@@ -152,8 +152,16 @@ typedef struct {
      * Source: num_kv_shared_layers. */
     int num_kv_shared_layers;
     /* Gemma4 adds pre/post feedforward norms and a post-PLE norm that the plain
-     * layer does not have.  Source: presence of those tensors / model_type. */
+     * layer does not have (1).  Gemma3 has the same sandwich around attention and
+     * MLP but no post-PLE norm and no layer scalar (2).  Source: model_type. */
     int extra_layer_norms;
+    /* Gemma3 states the sliding layers' RoPE base on its own, as
+     * `rope_local_base_freq`, and its `rope_scaling` applies to the full layers
+     * only.  1 when that key was read into rope_theta_sliding. */
+    int rope_local_base;
+    /* Gemma2/3: attention scores are scaled by 1/sqrt(query_pre_attn_scalar)
+     * instead of 1/sqrt(head_dim).  0 when absent.  Source: query_pre_attn_scalar. */
+    float query_pre_attn_scalar;
     /* Gemma4 use_double_wide_mlp: KV-shared layers run a 2*IM-wide MLP.
      * Source: use_double_wide_mlp. */
     int double_wide_mlp;

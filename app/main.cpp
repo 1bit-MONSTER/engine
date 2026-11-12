@@ -42,6 +42,7 @@ int onebit_ort_info_main(int argc, char** argv);
 int onebit_ort_run_main(int argc, char** argv);
 #endif
 #ifdef ONEBIT_NPU_HOST
+#include "q4nx_cache.h"
 #include "pack_import.h"  // 1bit npu-pack: an OGA NPU pack -> a Q4NX model directory
 #include "vision_pack.h"  // 1bit npu-pack vision: a pack's vision component (engine#1788)
 #endif
@@ -321,6 +322,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "1bit serve: %s\n", e.what());
             return 1;
         }
+    }
+    if (cmd == "q4nx-cache") {
+        // engine#1788 / disk pressure: the sweep as a command, because a serve start is otherwise the only trigger and
+        // nothing serves while the NPU is off. Deliberately outside every #ifdef -- host only, no device.
+        return ::run_q4nx_cache(argc - 2, argv + 2);
     }
 #ifdef ONEBIT_NPU_HOST
     if (cmd == "npu-pack") {

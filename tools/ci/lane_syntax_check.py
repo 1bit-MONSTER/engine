@@ -50,7 +50,9 @@ import os
 import re
 import sys
 
-ROOTS = ("app", "npu")
+# Every tree that holds a source added to a target inside `if(ONEBIT_NPU)`: measured from CMakeLists,
+# 124 such sources live outside app/ and npu/ (moe/, laya/, tools/, tests/).
+ROOTS = ("app", "npu", "moe", "laya", "tools", "tests")
 EXTS = (".cpp", ".cc", ".c", ".h", ".hpp")
 
 

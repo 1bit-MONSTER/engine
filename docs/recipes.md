@@ -52,7 +52,8 @@ values after it, unless the backend's command line already has that flag. For `-
 skips the long form (`--ubatch-size`, `--batch-size`) and the environment variable llama-server reads
 for it (`LLAMA_ARG_UBATCH`, `LLAMA_ARG_BATCH`), because llama-server applies its environment first and
 its command line after: a recipe's `-ub` would otherwise replace the micro-batch a user set in the
-environment. So whatever serve
+environment. Flags are compared the way llama-server's parser reads them, with `_` read as `-` in a
+`--` option, so `--ubatch_size` counts as `--ubatch-size`. So whatever serve
 sets itself, including from the command line (`--mtp-p-min`, `--mmproj`'s micro-batch), wins.
 It adds each variable in `env` unless it is already set. Serve prints what it added:
 

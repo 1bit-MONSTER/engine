@@ -41,6 +41,8 @@ bool is_flag(const std::string& t) {
 // variable llama-server reads for it (common/arg.cpp). llama-server applies the environment first and its
 // command line after, so a recipe flag on the command line would replace a value the user set as
 // LLAMA_ARG_UBATCH (engine #572: serve has no -ub option of its own, so the environment is how a user picks it).
+// These are the flags our recipes set that llama-server also reads from the environment (-ub today, -b one step
+// ahead); add a row when a recipe sets another one.
 struct FlagSpelling { const char* flag; const char* long_flag; const char* env; };
 constexpr FlagSpelling kFlagSpellings[] = {
     {"-ub", "--ubatch-size", "LLAMA_ARG_UBATCH"},
@@ -53,11 +55,21 @@ bool env_has(const std::vector<std::string>& env, const std::string& name) {
 }
 
 // True when the backend already has `flag`: on its command line in any spelling, or in the environment.
+// llama-server's parser turns '_' into '-' in a "--" option before it looks the option up (common/arg.cpp), so
+// --ubatch_size is --ubatch-size; compare in that form. A "--opt=value" token is rejected there, so it needs no case.
+std::string as_parsed(std::string a) {
+    if (a.rfind("--", 0) == 0) std::replace(a.begin(), a.end(), '_', '-');
+    return a;
+}
+
 bool flag_set(const std::string& flag, const std::vector<std::string>& argv, const std::vector<std::string>& env) {
-    auto on_argv = [&](const std::string& f) { return std::find(argv.begin(), argv.end(), f) != argv.end(); };
-    if (on_argv(flag)) return true;
+    auto on_argv = [&](const std::string& f) {
+        return std::any_of(argv.begin(), argv.end(), [&](const std::string& a) { return as_parsed(a) == f; });
+    };
+    const std::string want = as_parsed(flag);
+    if (on_argv(want)) return true;
     for (const auto& s : kFlagSpellings)
-        if (flag == s.flag || flag == s.long_flag) return on_argv(s.flag) || on_argv(s.long_flag) || env_has(env, s.env);
+        if (want == s.flag || want == s.long_flag) return on_argv(s.flag) || on_argv(s.long_flag) || env_has(env, s.env);
     return false;
 }
 

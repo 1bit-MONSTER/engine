@@ -72,6 +72,10 @@ def _truth(expr: str, defines):
     if m:
         inside = m.group(2) in defines
         return (not inside) if m.group(1) else inside
+    ident = re.fullmatch(r"([A-Za-z_]\w*)", e)
+    if ident:
+        # `#if defined(A) && A` -- the second `A` is a bare macro, resolvable the same way as the first.
+        return ident.group(1) in defines
     parts = re.split(r"\s*(&&|\|\|)\s*", e)
     if len(parts) == 1:
         return None
@@ -213,6 +217,8 @@ def self_test() -> int:
         ("char literal brace does not count", "int f(){ char c = '{'; }", True),
         ("an inactive #if 0 branch is skipped", "#if 0\nint broken(){\n#endif\nint f(){ return 0; }", True),
         ("the ONEBIT_NPU branch is the one counted", "#ifdef ONEBIT_NPU\nint f(){\n#endif\nint g(){ return 0; }", False),
+        ("a bare macro resolves like its defined() twin", "#if defined(ONEBIT_NPU) && ONEBIT_NPU\nint f(){\n#endif\nint g(){ return 0; }", False),
+        ("a bare macro that is NOT defined takes the other branch", "#if defined(ONEBIT_NOT_SET_HERE) && ONEBIT_NOT_SET_HERE\nint f(){\n#endif\nint g(){ return 0; }", True),
     ]
     failed = 0
     for name, src, ok in arms:

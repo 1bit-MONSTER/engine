@@ -26,7 +26,7 @@
 // This needs no device. The context is a bare I8Ctx with only its geometry set: its buffers were never allocated,
 // so any path that reaches a pack, a quantise or a readback dereferences null and crashes the test: the refusal
 // has to come first. That a call which fits still gets past it is the device rows' job (a fitting call needs real
-// buffers); the PR body carries those rows.
+// buffers): engine#2349's thread carries them (Bolt-E4B and the served 27B, byte-equal, no refusals).
 
 #include "target/xdna/xdna_target.h"
 #include "npu_engine_i8ctx_inc.h"   // I8Ctx

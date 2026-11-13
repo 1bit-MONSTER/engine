@@ -2513,6 +2513,22 @@ untied (the separate head is used)`. A stated key is still obeyed. `batch_check_
 Qwen2 container with the key removed must match the numpy reference that uses its `lm_head` (corr 1.0000000). With
 the check disabled it reads corr 0.03 and argmax 6 against 7.
 
+**`Qwen3.6-35B-A3B-NPU2`: two spellings of the same model.** This pack differs from the hub's Qwen3.5 dense packs
+in two places, and each made the reply noise on the host:
+- **`ssm_alpha_proj` / `ssm_beta_proj` are BF16 `[2048, 32]`**, i.e. `[in, out]`, like the pack's `[H][E]` router.
+  Against the GGUF of the same checkpoint (unsloth's Q8_0), read transposed they match at corr 0.99999; the GGUF
+  orders the 32 value heads interleaved. `npu/forward/include/bf16_matrix.h` reads a BF16 matrix whose declared shape
+  is exactly the transpose of the grid asked for that way, and a square one as `[out, in]`.
+- **The shared expert's sigmoid gate is `shared_expert_gate.weight`**, beside the router, where the FastFlowLM name
+  table had `mlp.share_router.weight`. The gate was never read, so the shared expert was added ungated in every layer.
+  The forward reads either name.
+
+With both fixes the host forward reasons ("Thinking Process: 1. **…"). The other tensor kinds decode against the GGUF:
+routed expert 0's gate 0.9958 and the shared gate 1.0000; `ssm_out` and the GDN `qkv` match per value head. Pinned by
+`bf16_matrix_test` (both orientations, the padded grid, the refusals) and `batch_check_state_hy_v3_sgate`: the hy_v3
+fixture with the gate tensor, against a reference that applies it. With the gate name missed, that arm reads corr
+0.989.
+
 Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
 containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry
 has no kernel set on the box. Of the 57 `*-NPU2` repos with a readable geometry on 2026-11-11, 19 had all four

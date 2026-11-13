@@ -28,6 +28,7 @@
 #include "weight_keys.h"     // the per-layer weight-cache keys, held distinct at compile time
 #include "layer_taps.h"      // engine#1780: where a tapped layer's rows go in the sink
 #include "pad_head_rows.h"   // engine#1990: the padded-head row rule, header-only for its arm
+#include "bf16_matrix.h"     // engine#1786: an unquantised BF16 matrix in either orientation
 #include "batch_width.h"
 #include "ffn_cache_policy.h"
 #include "lfm2_shortconv.h"          // LFM2 conv layers: the host part between the two projections
@@ -199,18 +200,10 @@ static int64_t declared_row_bytes(const TensorDesc* d) {
 
 static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out, const TensorDesc* desc = nullptr) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
-    // engine#1786: an unquantised projection (FastFlowLM's Embedding-Gemma-300M-NPU2 ships every weight as BF16
-    // [out, in]). Copied into the forward's grid, which may be padded past the declared shape (IM 1152 -> 1280): the
-    // pad rows and columns are zero, the layout every chunked reader below writes.
-    if (desc && desc->ndim == 2 && !strcmp(desc->dtype, "BF16")) {
-        const int64_t r0 = desc->shape[0], c0 = desc->shape[1];
-        if (r0 <= 0 || c0 <= 0 || r0 > rows || c0 > cols || nbytes < (size_t)r0 * (size_t)c0 * 2) return -1;
-        const uint16_t* w = (const uint16_t*)data;
-        for (int r = 0; r < rows; r++)
-            for (int c = 0; c < cols; c++)
-                out[(size_t)r * cols + c] = (r < r0 && c < c0) ? bf16_to_f32(w[(size_t)r * (size_t)c0 + (size_t)c]) : 0.0f;
-        return 0;
-    }
+    // engine#1786: an unquantised BF16 matrix, [out, in] (Embedding-Gemma's projections, into a grid that may be padded
+    // past the declared shape, pad zero) or [in, out] (Qwen3.6-35B-A3B's ssm_alpha/beta): bf16_matrix.h says which.
+    if (desc && desc->ndim == 2 && !strcmp(desc->dtype, "BF16"))
+        return q4nx_bf16_matrix_into((const uint16_t*)data, nbytes, desc->shape[0], desc->shape[1], rows, cols, out);
     const int64_t decl_row_bytes = declared_row_bytes(desc);
     if (decl_row_bytes == Q4NX_CHUNK_D2560) {
         // GPT-OSS: [RB, CB, S, 2560]; the container's K (CB*128) may be padded past the model's, and is read into
@@ -2678,7 +2671,12 @@ bool Q4nxNpuForward::load_layer(int l) {
         if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
         if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
         if (!load_share(mn.share_down, share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
-        if (!load_bf16_named(mn.share_router, share_router_, H)) share_router_.clear();
+        // The shared expert's sigmoid gate: `mlp.share_router.weight` in the FLM table, `shared_expert_gate.weight`
+        // (at the layer, beside the router) in FastFlowLM's Qwen3.6-35B-A3B-NPU2 -- missed, the shared expert was added
+        // ungated in every layer and the reply was noise (engine#1786).
+        if (!load_bf16_named(mn.share_router, share_router_, H) &&
+            !load_bf16_named("shared_expert_gate.weight", share_router_, H))
+            share_router_.clear();
         return true;
     }
     if (sem_.gpt_oss) return true;   // gpt_oss: the MoE reads its MXFP4 experts in place (gptoss_moe)
@@ -2859,7 +2857,12 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
         if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
         if (!load_share(mn.share_down, share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
-        if (!load_bf16_named(mn.share_router, share_router_, H)) share_router_.clear();
+        // The shared expert's sigmoid gate: `mlp.share_router.weight` in the FLM table, `shared_expert_gate.weight`
+        // (at the layer, beside the router) in FastFlowLM's Qwen3.6-35B-A3B-NPU2 -- missed, the shared expert was added
+        // ungated in every layer and the reply was noise (engine#1786).
+        if (!load_bf16_named(mn.share_router, share_router_, H) &&
+            !load_bf16_named("shared_expert_gate.weight", share_router_, H))
+            share_router_.clear();
         return true;
     }
     if (!ffn_tail_cached()) {

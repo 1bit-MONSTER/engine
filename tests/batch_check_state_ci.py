@@ -15,7 +15,7 @@
 # limitations under the License.
 """The batch-check state pin (tests/batch_check_state_test.cpp, engine#1905/#1946) on a container made here.
 
-usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|lfm3|qwen2|qwen2vl|qwen2_untied|qwen3_5|hy_v3] (needs numpy)
+usage: tests/batch_check_state_ci.py <batch_check_state_test binary> [lfm2|lfm3|qwen2|qwen2vl|qwen2_untied|qwen3_5|hy_v3|hy_v3_sgate] (needs numpy)
 
 batch_check_state_test needs a Q4NX container, and CI has none, so on its own it skips (77) there and a regression of
 #1909 -- the NPU_BATCH_CHECK oracle resetting the prefix it replays from -- lands green. This writes a two-layer qwen3
@@ -359,7 +359,7 @@ def qwen2_reference(q4nx_dir, np, ids, shapes):
 HY = dict(H=256, NH=2, NKV=1, HD=128, E=4, TOPK=2, EIM=512, DIM=768, SCALE=2.5)
 
 
-def make_hyv3(d, np):
+def make_hyv3(d, np, sgate=False):
     """A two-layer hy_v3 in FastFlowLM's naming; returns (weights for the reference, names to re-declare 3-D)."""
     rng = np.random.default_rng(1786)
     c = HY
@@ -384,6 +384,10 @@ def make_hyv3(d, np):
                       p + "mlp.down_exps_proj.weight": w(E * H, EIM),                    # stacked [N][K] per expert
                       p + "mlp.share_gate_exps_proj.weight": w(EIM, H), p + "mlp.share_up_exps_proj.weight": w(EIM, H),
                       p + "mlp.share_down_exps_proj.weight": w(H, EIM)})
+            if sgate:
+                # engine#1786: FastFlowLM's Qwen3.6-35B-A3B-NPU2 gates its shared expert with sigmoid(h . g), the vector
+                # stored as `shared_expert_gate.weight` beside the router; read under any other name, it was dropped
+                W[p + "shared_expert_gate.weight"] = w(H, sc=0.5)
     os.makedirs(d)
     write_safetensors(os.path.join(d, "model.safetensors"), W)
     cfg = {"architectures": ["HYV3ForCausalLM"], "model_type": "hy_v3", "hidden_size": H, "num_hidden_layers": 2,
@@ -477,8 +481,11 @@ def hyv3_reference(q4nx_dir, np, ids, shapes):
             for e, wt in zip(sel, wts):
                 g, u, dn = G[e * EIM:(e + 1) * EIM], U[e * EIM:(e + 1) * EIM], D[e * H:(e + 1) * H]
                 out[t] += wt * ((silu(h[t] @ g.T) * (h[t] @ u.T)) @ dn.T)
-        out += (silu(h @ W(p + "mlp.share_gate_exps_proj.weight").T) * (h @ W(p + "mlp.share_up_exps_proj.weight").T)) @ \
+        sh = (silu(h @ W(p + "mlp.share_gate_exps_proj.weight").T) * (h @ W(p + "mlp.share_up_exps_proj.weight").T)) @ \
             W(p + "mlp.share_down_exps_proj.weight").T
+        if p + "shared_expert_gate.weight" in table:
+            sh = sh * (1.0 / (1.0 + np.exp(-(h @ W(p + "shared_expert_gate.weight")))))[:, None]
+        out += sh
         x = x + out
     return rms(x, W("model.norm.weight"))[-1] @ W("lm_head.weight").T
 
@@ -501,7 +508,7 @@ def tmp_root():
 
 
 def main():
-    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen2", "qwen2vl", "qwen2_untied", "qwen3_5", "hy_v3")):
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen2", "qwen2vl", "qwen2_untied", "qwen3_5", "hy_v3", "hy_v3_sgate")):
         print(__doc__.strip().splitlines()[2])
         return 2
     family = sys.argv[2] if len(sys.argv) == 3 else "qwen3"
@@ -512,8 +519,8 @@ def main():
         return 77
     with tempfile.TemporaryDirectory(prefix="batch_check_state_ci.", dir=tmp_root()) as tmp:
         src, out = os.path.join(tmp, "hf"), os.path.join(tmp, "q4nx")
-        if family == "hy_v3":
-            Whyv = make_hyv3(src, np)
+        if family in ("hy_v3", "hy_v3_sgate"):
+            Whyv = make_hyv3(src, np, sgate=family == "hy_v3_sgate")
             shapes = {k: v.shape for k, v in Whyv.items()}
         else:
             shapes = make_model(src, np, family)
@@ -521,7 +528,7 @@ def main():
         if r.returncode != 0:
             print(f"FAIL  packing the fabricated container: {r.stderr[-600:]}")
             return 1
-        if family == "hy_v3":
+        if family in ("hy_v3", "hy_v3_sgate"):
             c = HY
             redeclare_3d(out, {"model.layer.1.mlp.gate_exps_proj.weight": (c["E"] * c["EIM"] // 32, c["H"] // 256),
                                "model.layer.1.mlp.up_exps_proj.weight": (c["E"] * c["EIM"] // 32, c["H"] // 256),
@@ -537,7 +544,7 @@ def main():
                 json.dump(c, f)
         env = dict(os.environ, ONEBIT_TEST_Q4NX=out)
         logits_out = os.path.join(tmp, "sequential.f32")
-        if family in ("lfm3", "qwen2", "qwen2vl", "qwen2_untied", "hy_v3"):
+        if family in ("lfm3", "qwen2", "qwen2vl", "qwen2_untied", "hy_v3", "hy_v3_sgate"):
             env["ONEBIT_TEST_LOGITS_OUT"] = logits_out
         env.pop("NPU_INFER_HOST_GEMM", None)   # init_host is host-GEMM already; nothing else should steer it
         r = subprocess.run([sys.argv[1]], env=env, capture_output=True, text=True, timeout=110)
@@ -550,9 +557,9 @@ def main():
             # arm, not a reason to skip it.
             print("FAIL  batch_check_state_test skipped on the fabricated container (init_host refused it)")
             return 1
-        if family in ("lfm3", "qwen2", "qwen2vl", "qwen2_untied", "hy_v3") and r.returncode == 0:
+        if family in ("lfm3", "qwen2", "qwen2vl", "qwen2_untied", "hy_v3", "hy_v3_sgate") and r.returncode == 0:
             ours = np.fromfile(logits_out, dtype=np.float32)[:VOCAB]
-            ref = {"lfm3": lfm3_reference, "hy_v3": hyv3_reference}.get(family, qwen2_reference)(out, np, [1, 2, 3, 4, 5, 6], shapes)
+            ref = {"lfm3": lfm3_reference, "hy_v3": hyv3_reference, "hy_v3_sgate": hyv3_reference}.get(family, qwen2_reference)(out, np, [1, 2, 3, 4, 5, 6], shapes)
             corr = float(np.corrcoef(ours, ref)[0, 1])
             ok = (corr >= LFM3_MIN_CORR and float(np.abs(ours - ref).max()) <= LFM3_MAX_DIFF * float(np.abs(ref).max())
                   and int(np.argmax(ours)) == int(np.argmax(ref)))

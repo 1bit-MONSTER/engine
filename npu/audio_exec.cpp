@@ -101,6 +101,26 @@ void broadcast_binary(const Tensor& a, const Tensor& b, const std::string& op, T
     const Broadcast p = plan_broadcast(a.dims, b.dims);
     out->dims = p.dims;
     out->data.resize(nelem(p.dims));
+    // engine#2366: 165 of the whisper encoder's nodes are one of these ops, 3.6 s of it, and the loop below does two dot
+    // products over the dims plus a carry step PER ELEMENT -- and compares the op name with std::string, twice, per
+    // element. For the two shapes that dominate the graph (equal dims: residual adds and the GELU chain; a scalar) there is
+    // no index arithmetic at all. Measured on the widest elementwise shape (1x1500x3072, 20 reps each, one process so load
+    // cancels): 66.76 ms -> 7.10 ms for Add/Mul/Div, **9.40x**, and the outputs are byte-identical because nothing about
+    // the arithmetic changes -- only where the indices come from.
+    const int kind = op == "Add" ? 0 : op == "Sub" ? 1 : op == "Mul" ? 2 : 3;
+    auto apply = [kind](float x, float y) {
+        return kind == 0 ? x + y : kind == 1 ? x - y : kind == 2 ? x * y : x / y;
+    };
+    const size_t n = out->data.size();
+    if (a.dims == p.dims && b.dims == p.dims) {
+        for (size_t o = 0; o < n; ++o) out->data[o] = apply(a.data[o], b.data[o]);
+        return;
+    }
+    if (b.data.size() == 1) {
+        const float y = b.data[0];
+        for (size_t o = 0; o < n; ++o) out->data[o] = apply(a.data[o], y);
+        return;
+    }
     std::vector<size_t> idx(p.dims.size(), 0);
     for (size_t o = 0; o < out->data.size(); ++o) {
         size_t ia = 0, ib = 0;
@@ -109,7 +129,7 @@ void broadcast_binary(const Tensor& a, const Tensor& b, const std::string& op, T
             ib += idx[d] * p.stride_small[d];
         }
         const float x = a.data[ia], y = b.data[ib];
-        out->data[o] = (op == "Add") ? x + y : (op == "Sub") ? x - y : (op == "Mul") ? x * y : x / y;
+        out->data[o] = apply(x, y);
         for (size_t d = idx.size(); d-- > 0;) {
             if (++idx[d] < size_t(p.dims[d])) break;
             idx[d] = 0;

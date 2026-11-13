@@ -55,6 +55,8 @@
 #include "stream_bridge.h"
 #include "npu_systemone.h"
 #include "tokenizer.h"
+#include "npu_image_request.h"   // engine#2324: a chat request's pictures
+#include "vision_pack.h"
 #include "../npu/decision.h"  // the d3 readout head (npu/decision.h, issue #653)
 #include "../npu/mtp/prompt_lookup.h"  // --spec-lookup: the speculative loop with a prompt-lookup drafter (#1781)
 #include "../npu/dflash_head.h"        // --spec-draft: the same loop with a DFlash draft package (#1781)
@@ -99,6 +101,9 @@ struct ForwardEngine {
     std::string id;
     int lock_fd = -1;  // app/npu_device_lock.h: the device lock, held for the process's life
     std::unique_ptr<npu::Tokenizer> tok;
+    // engine#2324: the pack's vision component (vision_weight.q4nx), when it has one: a chat request with pictures is
+    // served through it (npu/vision_request.h); without one such a request is a 400.
+    std::unique_ptr<npu::vision::Pack> vision;
     int  bos_id  = -1;     // config.json bos_token_id (the chat template may open with it)
     bool add_bos = false;  // config.json add_bos_token: the rendered chat prompt needs BOS
     std::unique_ptr<Q4nxNpuForward> fwd;
@@ -257,6 +262,8 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     // and can run a few tokens into the question when two questions open with the same words.  Empty = the
     // request has no system message, or the route is not pinning.
     std::string system_prompt;
+    // engine#2324: the request's pictures, decoded, in the order the template renders their pads.
+    auto images = std::make_shared<std::vector<npu::vision::RgbImage>>();
     try {
         if (chat) {
             if (!e.chat_ok) throw std::runtime_error(e.chat_refusal);
@@ -267,6 +274,8 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 // template that serializes its input (a tools block through `tojson`) renders the
                 // request's key order into the prompt, so it has to be the caller's order, not ours.
                 const nlohmann::ordered_json ordered = nlohmann::ordered_json::parse(req.body);
+                if (npu::request_images(ordered.at("messages"), *images) && !e.vision)
+                    throw std::runtime_error("this model has no vision component, so it takes no pictures");
                 // The functions the request offers go the same way (npu::request_template_vars): the
                 // template is where a model learns what it may call.
                 const nlohmann::ordered_json extra = npu::request_template_vars(ordered, npu::thinking_from_body(body));
@@ -306,6 +315,8 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                     }
                 }
             } else {
+                if (npu::request_images(body.at("messages"), *images))
+                    throw std::runtime_error("pictures need the pack's own chat template, and this build or pack has none");
                 prompt = npu::chatml(body.at("messages"), npu::thinking_from_body(body));
                 if (e.prefix_pin) {
                     const json probe = npu::pin_probe_messages(body.at("messages"));
@@ -368,7 +379,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     // Returns the finish_reason the request earned: "stop" for an end-of-sequence token,
     // a stop sequence or a grammar that allows nothing more, "length" when the token
     // budget ran out.
-    auto run = [&e, &req, prompt, system_prompt, prompt_ids, prompt_is_ids, max_tokens, chat, &opts, gram, &stats, dump_req, bridge](
+    auto run = [&e, &req, prompt, system_prompt, prompt_ids, prompt_is_ids, max_tokens, chat, &opts, gram, &stats, dump_req, bridge, images](
                    const std::function<bool(const std::string&, const std::vector<Emitted>&)>& on_text) {
         std::string finish = "stop";
         // The tokenizer is const and keeps no per-call state, so it runs before the lock.  A caller
@@ -384,6 +395,38 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         if (!prompt_is_ids && chat && e.add_bos && e.bos_id >= 0 && (ids.empty() || ids.front() != e.bos_id))
             ids.insert(ids.begin(), e.bos_id);
         if (ids.empty()) throw std::runtime_error("empty prompt");
+        // engine#2324: pictures. Each pad the template rendered becomes the picture's own tokens; the tower's rows go
+        // where its placeholders are and the embedding everywhere else (npu/vision_request.h). The prompt then runs
+        // through step_batch_embeds with three position planes, and decoding resumes at `img_next` on those planes
+        // while the cache slot keeps counting from the prompt's length. The tower runs here, before the lock.
+        const bool img = !images->empty();
+        npu::vision::ExpandedPrompt ex;
+        std::vector<float> img_embeds;   // n x H, the whole prompt's rows
+        std::vector<int> key_ids;        // what the prompt cache is keyed on: ids, with each picture's rows made its own
+        int img_next = 0;
+        if (img) {
+            std::string why;
+            // The tower is not run here: a prompt-cache hit that covers every image row does not need it.
+            if (!npu::vision::expand_images(*e.tok, *e.vision, ids, *images, ex, why, 4096, /*run_tower=*/false))
+                throw std::runtime_error("pictures: " + why);
+            ids = ex.ids;
+            img_next = ex.positions.next;
+            key_ids = ids;
+            size_t row = 0;
+            for (size_t i = 0; i < ids.size(); i++)
+                if (ids[i] == ex.image_pad) {
+                    // A key id no token has (negative), and a different one for a different picture: two pictures of one
+                    // size expand to identical ids, and an ids-only key would hand one picture's state to the other.
+                    // The key keeps 30 bits of the 64-bit FNV-1a hash. The row is mixed in the same way for every picture,
+                    // so two pictures share keys exactly when their hashes agree in those 30 bits: a false hit is one
+                    // 30-bit collision (about 1 in 1e9 per pair), acceptable for a cache key.
+                    key_ids[i] = -int(1 + ((ex.image_hash ^ (uint64_t(row) * 0x9E3779B97F4A7C15ull)) & 0x3FFFFFFF));
+                    ++row;
+                }
+            std::fprintf(stderr, "[image] %d picture(s): %zu prompt rows, %zu of them image rows; decoding resumes at position %d\n",
+                         ex.images, ids.size(), row, img_next);
+        }
+        const std::vector<int>& cache_ids = img ? key_ids : ids;
         stats.prompt_tokens = int(ids.size());
         // The KV cache grows with every position: the prompt and the answer together stay
         // inside the model's context.
@@ -407,7 +450,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // state, not logits, so that token is run again.
         int resume = 0;
         if (e.prefix && e.prefix->enabled()) {
-            const npu::PrefixDecision d = e.prefix->lookup(ids);
+            const npu::PrefixDecision d = e.prefix->lookup(cache_ids);
             stats.prefix = d;
             // One token short of both the slot and the prompt: the snapshot stops one token short (see the save
             // below), and the last token is run again for the logits the answer is drawn from.
@@ -428,6 +471,38 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             std::fprintf(stderr, "[prefix] slot=%d cached=%d of %zu reason=%s\n", stats.prefix.slot,
                          stats.prefix.cached_tokens, ids.size(), stats.prefix.reason.c_str());
         }
+        if (img) {
+            // Rows from `resume` on are what the prefill reads. The tower runs only when one of them is a picture's: a
+            // cache hit past every picture row answers without it (engine#2324, condition 8). Under the lock, as
+            // embed_row() reads through the forward's one-row cache.
+            bool need_tower = false;
+            for (size_t i = size_t(resume); i < ids.size() && !need_tower; i++) need_tower = ids[i] == ex.image_pad;
+            if (need_tower) {
+                std::string why;
+                if (!npu::vision::tower_rows(*e.vision, *images, ex, why)) throw std::runtime_error("pictures: " + why);
+            }
+            std::vector<float> one;
+            e.fwd->embed_row(ids[0], one);
+            const size_t H = one.size();
+            if (size_t(ex.width) != H)
+                throw std::runtime_error("pictures: the tower projects to " + std::to_string(ex.width) + " but the text model is " +
+                                         std::to_string(H) + " wide");
+            img_embeds.assign(ids.size() * H, 0.0f);   // rows before `resume` come from the cache and are never read
+            size_t row = 0;
+            for (size_t i = 0; i < ids.size(); i++) {
+                const bool pad = ids[i] == ex.image_pad;
+                if (i >= size_t(resume)) {
+                    if (pad) std::copy(ex.rows.begin() + long(row * H), ex.rows.begin() + long((row + 1) * H), img_embeds.begin() + long(i * H));
+                    else {
+                        e.fwd->embed_row(ids[i], one);
+                        std::copy(one.begin(), one.end(), img_embeds.begin() + long(i * H));
+                    }
+                }
+                row += pad;
+            }
+            std::fprintf(stderr, "[image] tower %s (prefill from row %d of %zu)\n", need_tower ? "run" : "not needed: the cache covers every picture row",
+                         resume, ids.size());
+        }
         // (engine#1785) Where this request should leave a pinned snapshot, as a position: the state is saved
         // one token short of the shared part for the same reason the whole-prompt snapshot below is saved one
         // token short of the prompt. -1 = no pin for this request. pin_point() is 0 when a slot (the pin
@@ -442,12 +517,29 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 std::vector<int> lead = e.tok->encode(system_prompt);
                 if (chat && e.add_bos && e.bos_id >= 0 && (lead.empty() || lead.front() != e.bos_id))
                     lead.insert(lead.begin(), e.bos_id);
-                pin_tokens = e.prefix->pin_at(ids, npu::shared_prefix_len(lead, ids));
+                pin_tokens = e.prefix->pin_at(cache_ids, npu::shared_prefix_len(lead, cache_ids));
             } else {
-                pin_tokens = e.prefix->pin_point(e.prev_ids, ids);
+                pin_tokens = e.prefix->pin_point(e.prev_ids, cache_ids);
             }
             if (pin_tokens > 0 && int(pin_tokens) - 1 >= resume) pin_cut = int(pin_tokens) - 1;
         }
+        // One prefill call over prompt rows [off, off + take): token ids, or (pictures) those rows' embeddings and planes.
+        auto prefill = [&](int off, int take) -> bool {
+            if (!img) {
+                const std::vector<int> part(ids.begin() + off, ids.begin() + off + take);
+                return e.fwd->step_batch(part, off, logits);
+            }
+            const size_t H = img_embeds.size() / ids.size();
+            const std::vector<float> rows(img_embeds.begin() + long(size_t(off) * H), img_embeds.begin() + long(size_t(off + take) * H));
+            std::vector<int> planes;
+            planes.reserve(size_t(3) * size_t(take));
+            planes.insert(planes.end(), ex.positions.t.begin() + off, ex.positions.t.begin() + off + take);
+            planes.insert(planes.end(), ex.positions.h.begin() + off, ex.positions.h.begin() + off + take);
+            planes.insert(planes.end(), ex.positions.w.begin() + off, ex.positions.w.begin() + off + take);
+            Q4nxNpuForward::HybridInputs in;
+            in.position_ids = &planes;
+            return e.fwd->step_batch_embeds(rows, off, logits, in);
+        };
         {
             const int chunk_max = std::max(1, e.fwd->max_batch_rows());
             const int n = int(ids.size());
@@ -457,7 +549,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                     Q4nxNpuForward::StateSnapshot snap;
                     if (e.fwd->snapshot_state(off, snap)) {
                         std::string why;
-                        const std::vector<int> shared(ids.begin(), ids.begin() + long(pin_tokens));
+                        const std::vector<int> shared(cache_ids.begin(), cache_ids.begin() + long(pin_tokens));
                         const int slot = e.prefix->pin(shared, snap.bytes(), &why);
                         if (slot >= 0 && size_t(slot) < e.prefix_state.size()) e.prefix_state[size_t(slot)] = std::move(snap);
                         std::fprintf(stderr, "[prefix] pin slot=%d tokens=%zu state_at=%d %s\n", slot, pin_tokens, off,
@@ -467,8 +559,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 } else if (pin_cut > off && off + take > pin_cut) {
                     // Stop this chunk at the pin position; the next pass saves the state there. One more launch.
                     take = pin_cut - off;
-                    const std::vector<int> head(ids.begin() + off, ids.begin() + off + take);
-                    if (!e.fwd->step_batch(head, off, logits))
+                    if (!prefill(off, take))
                         throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
                     off += take;
                     continue;
@@ -480,8 +571,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 // place, so a snapshot taken *after* the last token cannot be restored to just before it.
                 // Splitting the final chunk costs one launch.
                 if (off + take == n && take > 1) {
-                    const std::vector<int> head(ids.begin() + off, ids.begin() + off + take - 1);
-                    if (!e.fwd->step_batch(head, off, logits))
+                    if (!prefill(off, take - 1))
                         throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
                     off += take - 1;
                     continue;
@@ -490,7 +580,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                     Q4nxNpuForward::StateSnapshot snap;
                     if (e.fwd->snapshot_state(off, snap)) {
                         std::string why;
-                        const int slot = e.prefix->insert(ids, snap.bytes(), stats.prefix.slot, &why);
+                        const int slot = e.prefix->insert(cache_ids, snap.bytes(), stats.prefix.slot, &why);
                         if (slot >= 0 && size_t(slot) < e.prefix_state.size()) {
                             e.prefix_state[size_t(slot)] = std::move(snap);
                             std::fprintf(stderr, "[prefix] saved slot=%d tokens=%d bytes=%zu %s\n", slot, off,
@@ -498,13 +588,12 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                         }
                     }
                 }
-                const std::vector<int> chunk(ids.begin() + off, ids.begin() + off + take);
-                if (!e.fwd->step_batch(chunk, off, logits))
+                if (!prefill(off, take))
                     throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
                 off += take;
             }
         }
-        if (e.prefix_pin) e.prev_ids = ids;
+        if (e.prefix_pin) e.prev_ids = cache_ids;
 
         // Prompt processing ends here: every prompt token has been through the model and the first
         // token's distribution is in `logits`.
@@ -627,7 +716,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // --spec-sample widens it to sampled requests, whose drafts are then judged by the distribution-keeping rule
         // instead (npu::SpecSampler): the reply follows the same distribution as the plain loop's, not its stream.
         const bool spec = (e.spec_lookup > 0 || e.draft) && (opts.sample.greedy() || e.spec_sample) &&
-                          e.dump_logits.empty();
+                          e.dump_logits.empty() && !img;   // a picture's rotary positions are not the cache slots
         if (spec) {
             struct ServeBase : npu::mtp::BaseModel {
                 Q4nxNpuForward& f;
@@ -744,7 +833,8 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             // weight stream -- 8.7 s on the 27B -- spent on a result nobody reads.  At
             // max_tokens=1 that is half the request's latency.
             if (n + 1 >= limit) break;
-            if (!e.fwd->step(next, (int)ids.size() + n, logits))
+            if (!(img ? e.fwd->step(next, img_next + n, logits, (int)ids.size() + n)
+                      : e.fwd->step(next, (int)ids.size() + n, logits)))
                 throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
         }
         if (!stopped_at_stop) {
@@ -1303,6 +1393,18 @@ int run_forward_serve(int argc, char** argv) {
         std::fprintf(stderr, "1bit forward-serve: dumping raw logits to %s\n", dump_logits.c_str());
     }
     e.tok = std::make_unique<npu::Tokenizer>(tok_json);
+    // engine#2324: a pack that ships a vision component (MiniCPM-V 4.7: vision_weight.q4nx beside model.q4nx) takes
+    // pictures on the chat route. A component that does not read is said once and leaves the route text-only.
+    if (std::filesystem::exists(std::filesystem::path(dir) / "vision_weight.q4nx")) {
+        try {
+            e.vision = std::make_unique<npu::vision::Pack>(dir);
+            std::fprintf(stderr, "1bit forward-serve: vision component %s/vision_weight.q4nx: the chat route takes pictures "
+                                 "(data: URLs; the tower runs on the host)\n", dir.c_str());
+        } catch (const std::exception& ex) {
+            e.vision.reset();
+            std::fprintf(stderr, "1bit forward-serve: vision component not read (%s): pictures are refused\n", ex.what());
+        }
+    }
     e.bos_id  = json_int(cfg, "bos_token_id", -1);
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;
     // config.json is the first source; what it does not state, tokenizer_config.json does (the BOS text, looked up

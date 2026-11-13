@@ -85,7 +85,12 @@ set(HTTPLIB_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(httplib
     GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
     GIT_TAG fe332fa06bac76a1c6d402c08f414052999347da)  # v0.47.0
-FetchContent_MakeAvailable(json httplib)
+# engine#2324: images in a chat request arrive as PNG or JPEG bytes; stb_image decodes them (one header, public domain /
+# MIT). It has no CMakeLists, so it is only fetched; app/stb_image_impl.cpp compiles it with PNG, JPEG and PNM only.
+FetchContent_Declare(stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG 9600522de53973336fa033a289858a4354cbb04c)
+FetchContent_MakeAvailable(json httplib stb)
 
 # config/laya-first.json (the routing table, docs/laya-first.md §4) is compiled in like
 # config/recipes.json; `1bit laya-first --laya-first FILE` replaces it at run time.
@@ -908,7 +913,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp
+add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp npu/vision_request.cpp
                             npu/audio_exec.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
@@ -1469,6 +1474,12 @@ add_executable(npu_vision_image_test tests/npu_vision_image_test.cpp)
 target_link_libraries(npu_vision_image_test PRIVATE onebit_npu)
 add_test(NAME npu_vision_image COMMAND npu_vision_image_test)
 add_dependencies(onebit npu_vision_image_test)
+# engine#2324: a chat request's pictures (data URLs, PNG / JPEG / PPM) to RGB bytes, exactly.
+add_executable(npu_image_request_test tests/npu_image_request_test.cpp app/stb_image_impl.cpp)
+target_include_directories(npu_image_request_test PRIVATE app npu ${stb_SOURCE_DIR})
+target_link_libraries(npu_image_request_test PRIVATE onebit_npu nlohmann_json::nlohmann_json)
+add_test(NAME npu_image_request COMMAND npu_image_request_test)
+add_dependencies(onebit npu_image_request_test)
 # The text side of an image: its tokens and the canvas positions, against the reference model code's own answers.
 add_executable(npu_vision_prompt_test tests/npu_vision_prompt_test.cpp)
 target_include_directories(npu_vision_prompt_test PRIVATE npu)
@@ -2122,7 +2133,8 @@ endif()
     # The library body is onebit_npu_forward_library() (defined above the runtime options), so the CI build of the
     # same sources against the runtime stub (engine#1946) cannot drift from this one.
     onebit_npu_forward_library(onebit_npu_forward onebit_npu_rt)
-    target_sources(onebit PRIVATE app/forward_serve.cpp)
+    target_sources(onebit PRIVATE app/forward_serve.cpp app/stb_image_impl.cpp)   # engine#2324: stb_image for pictures
+    target_include_directories(onebit PRIVATE ${stb_SOURCE_DIR})
     # engine#1781: forward-serve --spec-draft runs a DFlash draft package (npu/dflash_head.h) as its drafter.
     target_sources(onebit PRIVATE npu/dflash_forward.cpp npu/dflash_draft.cpp)
     # engine#2111: the usage object's pure function, its own TU so tests/serve_usage_test.cpp can link it without

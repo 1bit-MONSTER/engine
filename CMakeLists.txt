@@ -617,6 +617,12 @@ add_executable(prof_acc_test tests/prof_acc_test.cpp)
 target_include_directories(prof_acc_test PRIVATE npu/target/xdna)
 add_test(NAME prof_acc COMMAND prof_acc_test)
 add_dependencies(onebit prof_acc_test)
+# engine#1783: a launch larger than the context it is routed to is refused, not run into its buffers
+# (npu/target/xdna/launch_fit.h). Header-only for the same reason as prof_acc_test.
+add_executable(launch_fit_test tests/launch_fit_test.cpp)
+target_include_directories(launch_fit_test PRIVATE npu/target/xdna)
+add_test(NAME launch_fit COMMAND launch_fit_test)
+add_dependencies(onebit launch_fit_test)
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
 # The shape rule for a 1.8 external-data initializer (npu/pack_initializer_shape.h, engine#1503's graph-initializer
 # reader). Those packs zero every `dims`, so a byte length has to become a shape -- and a shape inferred wrongly imports

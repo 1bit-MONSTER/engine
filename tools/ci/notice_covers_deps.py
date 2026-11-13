@@ -22,10 +22,14 @@ reads the two files that already exist rather than a registry someone has to rem
 
     notice_covers_deps.py [--check] [--root ROOT]
 
-Matches on the `GIT_REPOSITORY` URL, not on the dependency name: `FetchContent_Declare(stb ...)` is
-called `stb` in CMake and appears in NOTICE as `stb_image (nothings/stb ...)`, so the name is not the
-thing the two files share -- the URL is. Exit 0 when every dependency is covered, 1 when one is not,
-2 on a usage error.
+Two kinds of dependency are compiled in and both have to be named. A **FetchContent** one is matched on its
+`GIT_REPOSITORY` URL, not its name: `FetchContent_Declare(stb ...)` is `stb` in CMake and
+`stb_image (nothings/stb ...)` in NOTICE, so the URL is what the two files share. A **submodule** is matched
+on its `path` from `.gitmodules` (`third_party/llama.cpp`, the largest thing in the binary, is named that
+way). A submodule with no entry is the same defect and the one a reader is least likely to notice, because
+the code is already sitting under `third_party/`.
+
+Exit 0 when every dependency is covered, 1 when one is not, 2 on a usage error.
 """
 
 import argparse
@@ -65,6 +69,27 @@ def covered(url, notice):
     return short in notice
 
 
+def submodules(root):
+    """[(name, path)] from .gitmodules -- the second kind of compiled-in dependency."""
+    gm = root / ".gitmodules"
+    if not gm.is_file():
+        return []
+    out, name, path = [], "", ""
+    for line in gm.read_text(errors="replace").splitlines():
+        m = re.match(r'\[submodule "([^"]+)"\]', line.strip())
+        if m:
+            if name and path:
+                out.append((name, path))
+            name, path = m.group(1), ""
+            continue
+        kv = re.match(r"\s*path\s*=\s*(\S+)", line)
+        if kv:
+            path = kv.group(1)
+    if name and path:
+        out.append((name, path))
+    return out
+
+
 def check(root):
     root = pathlib.Path(root)
     cmake = root / "CMakeLists.txt"
@@ -85,8 +110,13 @@ def check(root):
     missing = [(n, u) for n, u in ds if not covered(u, notice)]
     for n, u in missing:
         print(f"notice_covers_deps: {n} ({u or 'no URL'}) is fetched and not named in NOTICE")
-    print(f"notice_covers_deps: {len(ds) - len(missing)} of {len(ds)} FetchContent dependency(ies) named in NOTICE")
-    return 1 if missing else 0
+    subs = submodules(root)
+    subs_missing = [(n, p) for n, p in subs if p not in notice]
+    for n, p in subs_missing:
+        print(f"notice_covers_deps: submodule {p} ({n}) is compiled in and not named in NOTICE")
+    print(f"notice_covers_deps: {len(ds) - len(missing)} of {len(ds)} FetchContent dependency(ies) and "
+          f"{len(subs) - len(subs_missing)} of {len(subs)} submodule(s) named in NOTICE")
+    return 1 if (missing or subs_missing) else 0
 
 
 def self_test():
@@ -125,6 +155,21 @@ def self_test():
         out2 = subprocess.run([sys.executable, __file__, "--check", "--root", tmp],
                               capture_output=True, text=True)
         chk(out2.returncode == 0, "and covering it makes the tree rc 0")
+        # the second kind: a submodule compiled in with no NOTICE entry
+        (pathlib.Path(tmp) / "CMakeLists.txt").write_text(cm)
+        (pathlib.Path(tmp) / ".gitmodules").write_text(
+            '[submodule "third_party/x"]\n\tpath = third_party/x\n\turl = https://example.com/x.git\n')
+        out4 = subprocess.run([sys.executable, __file__, "--check", "--root", tmp],
+                              capture_output=True, text=True)
+        chk(out4.returncode == 1, "a submodule with no NOTICE entry is rc 1")
+        chk("third_party/x" in out4.stdout, "and the message names the path")
+        (pathlib.Path(tmp) / "NOTICE").write_text(
+            notice + "stb_image (nothings/stb)\n  https://github.com/nothings/stb\n"
+            + "x (third_party/x; MIT)\n")
+        out5 = subprocess.run([sys.executable, __file__, "--check", "--root", tmp],
+                              capture_output=True, text=True)
+        chk(out5.returncode == 0, "and naming its path makes the tree rc 0")
+        (pathlib.Path(tmp) / ".gitmodules").unlink()
         (pathlib.Path(tmp) / "CMakeLists.txt").write_text("project(x)\n")
         out3 = subprocess.run([sys.executable, __file__, "--check", "--root", tmp],
                               capture_output=True, text=True)

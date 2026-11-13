@@ -57,11 +57,19 @@ gitlinks**, not `config/*.config` shas.
 Three commands are the evidence, and they are cheap enough to run before merge (a fetched private pin was 3.4 MB and 1.4 s):
 
 ```bash
-git ls-remote https://github.com/1bit-MONSTER/<repo>.git refs/heads/main     # the pinned sha IS the advertised tip
+git ls-remote https://github.com/1bit-MONSTER/<repo>.git refs/heads/main     # note the tip
+git fetch <repo> <tip> && git merge-base --is-ancestor <pinned> <tip>        # rc 0: the pin is still on the branch
 bash scripts/fetch-private.sh config/<the>.config ~/.cache/scratch-<lane>/pin # rc 0, HEAD == the pinned sha,
                                                                              # both require= paths present
 git -C ~/.cache/scratch-<lane>/pin diff --stat <the previous pin>..HEAD       # what the range actually contains
 ```
+
+**The first check is reachability, not equality, and the difference is the whole point.** A pin is *normally behind* the tip —
+`main` moves after the pin is taken — so "the pinned sha IS the advertised tip" flags almost every correct pin. Measured on the
+gpu-kernels bump merged on 2026-11-13: the tip was `b0ed206` and the *previous, healthy* pin was `eb0f3839`, two commits behind and
+still an ancestor, which `fetch-private.sh` checks out without complaint. What the check is *for* is a pin that no longer exists —
+a force-push — so the test is `merge-base --is-ancestor`, and a pin that equals the tip is worth a second look for the opposite
+reason (the branch moved after review).
 
 Run the first two **from the branch that changes the pin**: `fetch-private.sh` reads the config out of the *working tree*, so the
 same command in a checkout of an older commit fetches the older pin and returns **rc 0** — indistinguishable output, wrong answer.

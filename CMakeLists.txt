@@ -415,6 +415,15 @@ add_python_test(moe_expert_chunks_accum_test ${CMAKE_SOURCE_DIR}/tests/moe_exper
 # engine#2138 slice: a merge's conflicts classified by kind, from git's index -- the conflicts a text search cannot
 # see (add/delete with no markers) are the ones a pin merge is mostly made of. Device-free, no checkout.
 add_python_test(conflict_triage_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_triage.py --self-test)
+# engine#2335 review: a FetchContent dependency compiled into the app with no NOTICE entry. NOTICE is
+# maintained by hand and nothing compared it to CMakeLists, so `stb_image` was fetched, compiled and
+# shipped without a licence line until a reviewer noticed. Matched on the GIT_REPOSITORY URL: that is
+# what the two files share (`stb` in CMake is `stb_image (nothings/stb)` in NOTICE, so the name is not).
+add_python_test(notice_covers_deps_self ${CMAKE_SOURCE_DIR}/tools/ci/notice_covers_deps.py --self-test)
+# `--root` is explicit: add_python_test() sets no WORKING_DIRECTORY, so ctest runs this row in the BUILD
+# directory and a `--root .` default would look for CMakeLists.txt where there is none (review of #2344 --
+# the self-test passed next to a failing check, which is that diagnosis in one line).
+add_python_test(notice_covers_deps ${CMAKE_SOURCE_DIR}/tools/ci/notice_covers_deps.py --check --root ${CMAKE_SOURCE_DIR})
 # reviews: a PR that carries another PR's files lands two merge decisions as one, and one whose work base
 # already has reads as a fresh duplicate. Both are invisible to a diffstat; this compares blobs. Device-free.
 add_python_test(pr_carry_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_carry_check.py --self-test)
@@ -629,6 +638,12 @@ add_executable(prof_acc_test tests/prof_acc_test.cpp)
 target_include_directories(prof_acc_test PRIVATE npu/target/xdna)
 add_test(NAME prof_acc COMMAND prof_acc_test)
 add_dependencies(onebit prof_acc_test)
+# engine#1783: a launch larger than the context it is routed to is refused, not run into its buffers
+# (npu/target/xdna/launch_fit.h). Header-only for the same reason as prof_acc_test.
+add_executable(launch_fit_test tests/launch_fit_test.cpp)
+target_include_directories(launch_fit_test PRIVATE npu/target/xdna)
+add_test(NAME launch_fit COMMAND launch_fit_test)
+add_dependencies(onebit launch_fit_test)
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
 # The shape rule for a 1.8 external-data initializer (npu/pack_initializer_shape.h, engine#1503's graph-initializer
 # reader). Those packs zero every `dims`, so a byte length has to become a shape -- and a shape inferred wrongly imports

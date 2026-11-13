@@ -20,6 +20,7 @@
 //
 // docs/npu-p4-target-split.md records what moved in A1 and what A2 (plan-driven setup) still owes.
 #include "target/xdna/xdna_target.h"
+#include "target/xdna/launch_fit.h"   // engine#1783: refuse a launch its context cannot hold
 #include "batch_width.h"
 #include "file_create.h"   // dumps are created 0600, never through a symlink
 
@@ -919,6 +920,16 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
         onebit::npu::narrow_takes(1, narrow_rows_))
         kctx1 = ctxn_[ar.role].get();
     I8Ctx& kctx = *kctx1;
+    // engine#1783: a launch larger than the context it was routed to overruns its BOs; refuse it with the numbers.
+    // The gemv family's KD is the padded width and its launches are one row by construction, so it is not checked here.
+    if (!kctx.gemv) {
+        const std::string misfit = xdna_launch_misfit(1, K, N, kctx.MD, kctx.KD, kctx.ND);
+        if (!misfit.empty()) {
+            err = "role " + std::to_string(ar.role) + ": " + misfit;
+            out.assign((size_t)N, 0.0f);
+            return;
+        }
+    }
     const bool prof = prof_;
     const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     double fill_ms = 0.0;   // engine#1783: weight-cache fill time inside tp->tl, reported apart from `pack`
@@ -1208,6 +1219,16 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
              onebit::npu::narrow_takes(M, narrow_rows_))
         kctxp = ctxn_[ar.role].get();   // a short chunk (a verify pass of a few rows) fits the narrow kernel
     I8Ctx& kctx = *kctxp;
+    // engine#1783: the int8 batched body packs K x N into a KD x ND BO and M x K into an MD x KD one, and nothing
+    // compared them: a caller that routed GU and D to role 0 got SIGSEGV after both ELFs initialised. Refuse instead.
+    {
+        const std::string misfit = xdna_launch_misfit(M, K, N, kctx.MD, kctx.KD, kctx.ND);
+        if (!misfit.empty()) {
+            err = "role " + std::to_string(ar.role) + ": " + misfit;
+            out.assign((size_t)M * (size_t)N, 0.0f);
+            return;
+        }
+    }
     const bool prof = prof_;
     const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     double fill_ms = 0.0;   // engine#1783: weight-cache fill time inside tp->tl, reported apart from `pack`

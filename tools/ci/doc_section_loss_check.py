@@ -47,8 +47,13 @@ import sys
 HEADING = re.compile(r'^\s{0,3}(#{2,4})\s+(.*?)\s*#*\s*$')
 
 
-def headings_at(rev, root='.'):
+def headings_at(rev, root='.', spans=None):
     """{heading text} over every markdown file in the tree at `rev`.
+
+    When `spans` is a dict it is filled with {heading text: (first line, last line)} so a lost section can be
+    reported with its SIZE. Without that, "2 sections missing" reads as a corner case: on engine#2183 the two
+    headings covered 39 and 63 lines, and the other 592 deleted lines of that file belonged to sections whose
+    headings both ends of the hole still had.
 
     Read from the revision, not the working tree: a branch that *deleted* a document would otherwise have that
     document enumerated from disk and its sections counted as present.
@@ -61,10 +66,23 @@ def headings_at(rev, root='.'):
             continue
         txt = subprocess.run(['git', '-C', root, 'show', f'{rev}:{f}'],
                              capture_output=True, text=True).stdout
-        for line in txt.splitlines():
+        lines = txt.splitlines()
+        for i, line in enumerate(lines):
             m = HEADING.match(line)
-            if m:
-                out.setdefault(m.group(2).strip(), f)
+            if not m:
+                continue
+            text = m.group(2).strip()
+            if text not in out:
+                out[text] = f
+                if spans is not None:
+                    level = len(m.group(1))
+                    end = len(lines)
+                    for j in range(i + 1, len(lines)):
+                        nxt = HEADING.match(lines[j])
+                        if nxt and len(nxt.group(1)) <= level:
+                            end = j
+                            break
+                    spans[text] = (i + 1, end, level)
     return out
 
 
@@ -77,17 +95,24 @@ def check(root, base, head):
     if not mb:
         print(f'doc_section_loss: cannot find a merge base for {base} and {head} - cannot tell, and that is not a pass')
         return 2
-    b, h = headings_at(mb, root), headings_at(head, root)
+    spans = {}
+    b, h = headings_at(mb, root, spans), headings_at(head, root)
     base = mb[:12]
     if not b:
         print(f'doc_section_loss: cannot read any heading at {base} - cannot tell, and that is not a pass')
         return 2
     lost = sorted(set(b) - set(h))
     for t in lost:
-        print(f'doc_section_loss: "{t}" is in {b[t]} at {base} and nowhere at {head}')
+        first, last, level = spans.get(t, (0, 0, 0))
+        size = last - first + 1
+        print(f'doc_section_loss: "{t}" is in {b[t]} at {base} and nowhere at {head} '
+              f'(lines {first}-{last}, {size} line(s), {"#" * level})')
     if lost:
-        print(f'doc_section_loss: {len(lost)} of {len(b)} section(s) at {base} are missing at {head} '
+        total = sum((spans.get(t, (0, 0, 0))[1] - spans.get(t, (0, 0, 0))[0] + 1) for t in lost)
+        print(f'doc_section_loss: {len(lost)} of {len(b)} section(s) at {base} are missing at {head}, {total} line(s) '
               f'- either this branch means to delete them (say so in the commit) or a merge dropped them')
+        print('doc_section_loss: this counts SECTIONS, not content: a hole whose two ends kept their headings is '
+              'invisible here, so read `git diff --stat <merge-base>..HEAD -- <file>` too')
         return 1
     print(f'doc_section_loss: all {len(b)} section(s) at {base} are present at {head}')
     return 0
@@ -135,6 +160,13 @@ def self_test():
         chk(0, check(r, a, d2), 'a section whose LEVEL changed is an edit, not a loss')
 
         chk(2, check(r, 'does-not-exist', b), 'an unreadable base is rc 2, not a pass')
+
+        # The size of a lost section is the reason this reports at all: on engine#2183 the two headings covered 39
+        # and 63 lines, so "2 sections" undersold 104 lines. An arm pins the arithmetic, not just the count.
+        wider = repo({'d.md': '## Keep\n\n### Lost\n' + ('body\n' * 7) + '## Also\n'})
+        spans = {}
+        headings_at(wider, str(r), spans)
+        chk((3, 10, 3), spans.get('Lost'), 'a lost section reports its line span and level')
 
     print(f"doc_section_loss_check --self-test: {'ok' if rc == 0 else 'FAIL'}")
     return rc

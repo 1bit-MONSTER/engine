@@ -5550,6 +5550,34 @@ void test_container_write_pack() {
     fs::remove_all(dir);
 }
 
+// engine#1788, 3c residue: the two measurements a writer needs, armed against the tensors that produce them.
+void test_payload_rows_and_role_shapes() {
+    using pi::Q4nxTensor;
+    const auto t = [](const std::string& n, std::vector<int64_t> sh, const std::string& dt) {
+        Q4nxTensor x; x.name = n; x.shape = sh; x.dtype = dt; return x;
+    };
+    const std::vector<Q4nxTensor> v = {
+        t("model.layer.0.mlp.gate_exps_proj.weight", {4096, 8, 4736}, "I8"),
+        t("model.layer.1.mlp.gate_exps_proj.weight", {4096, 8, 4736}, "I8"),
+        t("lm_head.weight", {8704, 8, 8704}, "I8"),
+        t("model.embed_tokens.weight", {248144, 2048}, "BF16"),   // 2-D, so neither a tensor row nor a payload row
+    };
+    // REVIEW of #2304: the old `payload_rows` counted TENSORS. Both are emitted, and the two numbers must DIFFER.
+    const auto tb = pi::container_payload_tensors_of(v);
+    check(tb.size() == 2, "payload_tensors: two distinct widths");
+    check(tb.at(4736) == 2, "payload_tensors: the two gate_exps tensors share K=4736");
+    check(tb.count(2048) == 0, "payload_tensors: the 2-D BF16 embedding is not counted");
+    const auto rb = pi::container_payload_rows_of(v);
+    check(rb.at(4736) == 2 * 4096, "payload_rows: the rows at that width are 2 x 4096, not 2");
+    check(rb.at(8704) == 8704, "payload_rows: the lm_head is 8704 rows");
+    check(rb.at(4736) != tb.at(4736), "payload_rows: the two numbers differ, which is the point");
+
+    // role_shapes groups by ROLE and by exact shape+dtype text
+    const auto rs = pi::container_role_shapes_of(v);
+    check(rs.count("gate_exps") && rs.at("gate_exps").size() == 1, "role_shapes: the two gate_exps tensors are ONE shape");
+    check(rs.at("gate_exps").begin()->second == 2, "role_shapes: and it counts both");
+}
+
 void test_container_placement() {
     using pi::Q4nxTensor;
     const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
@@ -6833,6 +6861,7 @@ int main(int argc, char** argv) {
         test_container_roles_gemma_local();
         test_container_roles_moe_and_singular_layer();
         test_container_placement();
+        test_payload_rows_and_role_shapes();
         test_container_write_pack();
         test_container_write_layout();
         test_container_import_plan();

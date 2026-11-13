@@ -3508,10 +3508,10 @@ WritePackResult container_write_pack(const std::string& payload_path, const Impo
     json tensors = json::object();
     int64_t off = 0;
     for (const auto& item : plan.items) {
-        in.seekg(item.begin);
+        in.seekg(plan.payload_base + item.begin);
         std::string bytes(size_t(item.end - item.begin), '\0');
         if (!in.read(&bytes[0], std::streamsize(bytes.size()))) {
-            r.why = "short read at " + std::to_string(item.begin) + " for " + item.source; return r;
+            r.why = "short read at " + std::to_string(plan.payload_base + item.begin) + " for " + item.source; return r;
         }
         out.write(bytes.data(), std::streamsize(bytes.size()));
         if (!out) { r.why = "short write to " + r.payload; return r; }
@@ -3552,10 +3552,10 @@ WriteLayoutResult container_write_layout(const std::string& payload_path, const 
     std::filesystem::create_directories(out_dir, ec);
     if (ec) { r.why = "cannot create " + out_dir + ": " + ec.message(); return r; }
     for (const auto& item : plan.items) {
-        in.seekg(item.begin);
+        in.seekg(plan.payload_base + item.begin);
         std::string bytes(size_t(item.end - item.begin), '\0');
         if (!in.read(&bytes[0], std::streamsize(bytes.size()))) {
-            r.why = "short read at " + std::to_string(item.begin) + " for " + item.source;
+            r.why = "short read at " + std::to_string(plan.payload_base + item.begin) + " for " + item.source;
             return r;
         }
         const std::string path = out_dir + "/" + item.slot;
@@ -3592,6 +3592,11 @@ WriteLayoutResult container_write_layout(const std::string& payload_path, const 
 ImportPlan container_import_plan(const Q4nxContainer& container, const std::vector<std::string>& layer_types) {
     ImportPlan out;
     out.payload_bytes = container.payload_bytes;
+    // `header_bytes` is the JSON length alone; the file prefixes it with an 8-byte little-endian length, so the payload
+    // starts at 8 + header_bytes. Getting this by 8 wrong is what made the first end-to-end run write header bytes.
+    // ... and there is no prefix when the container declares no header at all (a bare payload has header_bytes 0), so the
+    // +8 only applies to a real safetensors-shaped container.
+    out.payload_base = container.header_bytes > 0 ? container.header_bytes + 8 : 0;
     const PlacementReport rep = container_placement(container.tensors, layer_types);
     std::map<std::string, const Q4nxTensor*> by_name;
     for (const auto& t : container.tensors) by_name[t.name] = &t;

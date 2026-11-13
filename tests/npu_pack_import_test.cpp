@@ -5505,6 +5505,27 @@ void test_container_write_pack() {
     const pi::ImportPlan plan = pi::container_import_plan(c, {"full_attention"});
 
     const std::string out = dir + "/pack";
+    // REVIEW of the first end-to-end run: the ranges are PAYLOAD-relative, so a container with a non-zero header must be
+    // read from payload_base. This arm only means anything if the payload has a header in front of it, which is why the
+    // fixture below prepends one -- the earlier arms could not have caught the bug because their base was 0.
+    const std::string with_hdr = dir + "/payload_with_header.bin";
+    { std::ofstream o(with_hdr, std::ios::binary); for (int i = 0; i < 24; ++i) o.put(char('0' + (i % 10))); }
+    { std::ofstream o(with_hdr, std::ios::binary | std::ios::app); for (int i = 0; i < 64; ++i) o.put(char('A' + (i % 26))); }
+    pi::Q4nxContainer hc;
+    hc.tensors = {t("model.embed_tokens.weight", 0, 8), t("model.layers.0.self_attn.q_proj.weight", 8, 24)};
+    hc.payload_bytes = 64;
+    hc.header_bytes = 16;   // the JSON length; the payload starts at 8 + this, after the length prefix
+    const pi::ImportPlan hplan = pi::container_import_plan(hc, {"full_attention"});
+    check(hplan.payload_base == 24, "pack: the plan carries where the payload starts (8 + the JSON length)");
+    const pi::WritePackResult hw = pi::container_write_pack(with_hdr, hplan, dir + "/pack_hdr", false);
+    check(hw.ok, "pack: a container with a header writes");
+    {
+        std::ifstream bi(dir + "/pack_hdr/model.q4nx", std::ios::binary);
+        const std::string blob((std::istreambuf_iterator<char>(bi)), std::istreambuf_iterator<char>());
+        check(blob == "ABCDEFGHIJKLMNOPQRSTUVWX",
+              "pack: and the bytes are the PAYLOAD's, not the header's (got: " + blob.substr(0, 12) + ")");
+    }
+
     const pi::WritePackResult w = pi::container_write_pack(payload, plan, out, false);
     check(w.ok, "pack: writes");
     check(w.tensors == 2 && w.bytes == 24, "pack: two tensors, 24 bytes");

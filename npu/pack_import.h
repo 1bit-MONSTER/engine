@@ -428,6 +428,10 @@ struct ImportPlan {
     std::vector<std::string> unplaced;    // "<role>: <tensor>" -- a refusal, not a silent skip
     int64_t bytes = 0;                    // payload bytes the items carry
     int64_t payload_bytes = 0;            // what the container says it has, so a writer can prove coverage
+    // engine#1788, 3c: where the payload STARTS in the container file. `Q4nxTensor::begin/end` are PAYLOAD-relative, so a
+    // writer that seeks to `begin` in the file reads the safetensors header instead of the tensor -- which is exactly what
+    // happened: the bytes came out right in total (1024+128) and wrong in content.
+    int64_t payload_base = 0;
 };
 ImportPlan container_import_plan(const Q4nxContainer& container, const std::vector<std::string>& layer_types);
 

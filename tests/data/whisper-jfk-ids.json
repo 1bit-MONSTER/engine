@@ -1,0 +1,31 @@
+{
+ "what": "the reference decode of jfk.wav through whisper-small (encoder_model.onnx + decoder_model.onnx)",
+ "source": "produced by tools/whisper_transcribe and checked against onnxruntime and the reference decode; see engine#1783",
+ "greedy_ids": [
+  400,
+  370,
+  452,
+  7177,
+  6280,
+  11,
+  1029,
+  406,
+  437,
+  428,
+  1941,
+  393,
+  360,
+  337,
+  291,
+  11,
+  1029,
+  437,
+  291,
+  393,
+  360,
+  337,
+  428,
+  1941,
+  13
+ ]
+}

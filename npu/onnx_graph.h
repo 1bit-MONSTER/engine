@@ -57,7 +57,11 @@ struct OnnxGraphInfo {
     std::string dir;                   // directory of the .onnx file, for resolving external_data
     std::vector<OnnxInit> init_tensors;
     std::vector<std::string> inputs;    // graph inputs, in declaration order
+    // The declared shape of each input, parallel to `inputs`. A decoder's token window lives here (whisper-small exports 128,
+    // large-v3 exports 448), and a reader that assumes one of them builds a mask the other cannot broadcast against.
+    std::vector<std::vector<int64_t>> input_dims;
     std::vector<std::string> outputs;   // graph outputs
+    std::vector<std::vector<int64_t>> output_dims;   // parallel to `outputs`; a decoder's vocabulary is the last of these
     std::vector<OnnxNodeInfo> nodes;    // graph order, which ONNX guarantees is topological
     std::vector<std::string> initializers;   // weight/bias names
     std::vector<std::string> external;       // initializers whose data is in a side file (location set)

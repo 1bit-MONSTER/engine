@@ -67,8 +67,21 @@ extern "C" {
  * groups still looped inside the ELF (so one launch per role stays the
  * contract).  Measured cost of an M=16 launch is ~0.34 ms against 3.4-4.9 ms
  * for the M=128 path. */
+// Overridable at build time, because a wider prefill tier turns out to be a KNOB and not a hardware floor (engine#1783,
+// measured on the Strix Halo array): M is rows x m, m is a generator parameter, and the four compute rows this part has are
+// unchanged by M. Emitting the encoder's shapes at M=1536 (rows=4, m=16) and building with -DQ4NX_DESIGN_M_PREFILL=1536 takes
+// whisper-small's projection GEMM from 2.05 s to 0.163 s per 30 s window -- 12x the rows for the same launch time:
+//   M=128 : QKV 4.468  O 4.351  GU 5.460  D 4.418 ms/launch
+//   M=1536: QKV 4.740  O 4.373  GU 4.662  D 4.588 ms/launch
+// What keeps an override safe: whatever a build sets here must equal the M the adopted ELFs were generated with, and the target
+// CHECKS that against the loaded ELFs' own MD rather than assuming it ("plan: prefill M=1536 but the adopted kernels run M=128",
+// observed before the guard existed). Absent -D, both constants are exactly what they were.
+#ifndef Q4NX_DESIGN_M_PREFILL
 #define Q4NX_DESIGN_M_PREFILL 128
+#endif
+#ifndef Q4NX_DESIGN_M_DECODE
 #define Q4NX_DESIGN_M_DECODE 16
+#endif
 
 typedef enum {
     Q4NX_DESIGN_QKV = 0,
@@ -299,10 +312,10 @@ const char* q4nx_design_log_tag(Q4nxDesign role);
 // side of the split: a duplicate would be two contracts that drift silently.
 const char* q4nx_pb16i_instance(Q4nxDesign role);
 
-// The same for a SEALED int8 b8 ELF (engine#2208): one hw_context for the decode roles of a b8 container whose
-// full-attention QKV is one fused role (QKV, with the output gate) and whose gate/up is one fused role (GU).
-// The split G and U roles have no instance: the sealed GU instance is the fused width, so they keep their own
-// kernels. NULL means the sealed ELF does not cover the role.
+/* The sealed aie-instance name for an int8 role (`main:qkvfa`, `main:o`, ...), or NULL for a role the sealed family does not
+ * carry. Declared here because `npu/target/xdna/xdna_target.cpp` calls it and this header is what it includes; without the
+ * declaration that translation unit only compiled because of how the libraries happened to be assembled (a standalone build of
+ * the same file, e.g. one that links the target without the forward, fails with "was not declared in this scope"). */
 const char* q4nx_i8_sealed_instance(Q4nxDesign role);
 
 /* Look up the entry for a role in a derived set; NULL if absent. */

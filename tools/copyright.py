@@ -71,6 +71,9 @@ LINE_STYLES = [
             # engine#2186: the accumulator baseline of `tools/ci/hrx_f16_narrowing.py --write`, same shape and the same
             # reason -- data, `.txt` has no comment style of its own, and the notice is already at the top of the file.
             "hrx_f16_accumulators.txt",
+            # engine#2244: the guard baseline of the same tool, same shape and the same reason -- data, `.txt`
+            # has no comment style of its own, and the notice is already at the top of the file.
+            "hrx_f16_guards.txt",
       # engine#2027: the `#`-comment baseline for hardcoded /tmp paths, same shape and the same reason --
       # data, `.txt` has no style, and the notice it wants is already at the top of the file.
       "tmp_paths.txt",

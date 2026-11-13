@@ -53,6 +53,11 @@ BASELINE = pathlib.Path("tools/ci/hrx_f16_narrowing.txt")
 # f16, so the body list above is blind to it by construction. Same mechanism as that list: a committed set of the files
 # that have one, so a new one is drift.
 ACC_BASELINE = pathlib.Path("tools/ci/hrx_f16_accumulators.txt")
+# engine#2244 review / engine#2127: WHICH bodies carry a producer-side guard marker. Reported-only until now, which is a
+# hole: a merge that takes the other side of a .loom conflict can revert a guard while the body and its line count stay
+# identical, so every count check passes and the fix is gone. llama.cpp#327 did exactly that to the four routed-expert
+# projections. A set, like the other two baselines, so a lost guard is named rather than counted.
+GUARD_BASELINE = pathlib.Path("tools/ci/hrx_f16_guards.txt")
 ACC_INIT = re.compile(r"vector\.fragment<init>[^\n]*vector<(\d+)xf16>")
 ACC_MUL = re.compile(r"vector\.mulf|vector\.mma\b|template\.apply<@[^>]*wmma[^>]*>|vector\.(fma|contract|dot|outerproduct)\b|wmma\.(mma|load|store)")
 # Measured (engine#2167): at 120 lines past the init, `mul_mat_id_f16_f16_wmma_core`'s four accumulators read as
@@ -243,6 +248,14 @@ def check(root, corpus=None):
     acc_counts = accumulator_counts(corpus)
     acc_grew, acc_shrank, acc_lost = count_drift(acc_entries, acc_counts, corpus)
     guard = guarded(found, corpus)
+    guard_file = root / GUARD_BASELINE
+    if not guard_file.is_file():
+        print(f"hrx_f16_narrowing: {GUARD_BASELINE} is missing -- run `--write` once to record which bodies carry a "
+              f"producer-side guard")
+        return 1
+    guard_baseline = baseline_paths(guard_file.read_text(encoding="utf-8"))
+    guard_lost = sorted(guard_baseline - guard)
+    guard_new = sorted(guard - guard_baseline)
     unknown = unclassified_truncations(corpus)
     for where, text in unknown:
         print(f"hrx_f16_narrowing: UNCLASSIFIED fptrunc at {where}: {text} -- its type pair matches neither the f16 "
@@ -279,7 +292,14 @@ def check(root, corpus=None):
     for rel, want, got in acc_shrank:
         suffix = "-- drop the line, the list should shrink" if got == 0 else "-- drop the count"
         print(f"hrx_f16_narrowing: {rel} has fewer f16 accumulators ({want} -> {got}) {suffix}")
-    if new or stale or unknown or acc_new or acc_stale or grew or shrank or lost or acc_grew or acc_shrank or acc_lost:
+    for rel in guard_lost:
+        print(f"hrx_f16_narrowing: {rel} NO LONGER carries a producer-side guard marker -- the body is still there and "
+              f"its line count is unchanged, so nothing else in this check notices; a merge that took the other side of "
+              f"a .loom conflict does exactly this (engine#2127, engine#2293, llama.cpp#327)")
+    for rel in guard_new:
+        print(f"hrx_f16_narrowing: {rel} now carries a guard marker -- add it to {GUARD_BASELINE}")
+    if (new or stale or unknown or acc_new or acc_stale or grew or shrank or lost or acc_grew or acc_shrank
+            or acc_lost or guard_lost or guard_new):
         print(f"hrx_f16_narrowing: FAIL ({len(new)} new, {len(stale)} stale of {len(baseline)}, "
               f"{len(unknown)} unclassified fptrunc; {len(acc_new)} new, {len(acc_stale)} stale of "
               f"{len(acc_baseline)} accumulator(s))")
@@ -307,7 +327,12 @@ def write(root, corpus=None):
     acc_head = "".join(line for line in (root / ACC_BASELINE).read_text(encoding="utf-8").splitlines(True)
                        if line.lstrip().startswith("#")) if (root / ACC_BASELINE).is_file() else ""
     (root / ACC_BASELINE).write_text(acc_head + "\n".join(accs) + "\n", encoding="utf-8")
-    print(f"hrx_f16_narrowing: wrote {len(bodies)} body(ies) to {BASELINE} and {len(accs)} to {ACC_BASELINE}")
+    guard_head = "".join(line for line in (root / GUARD_BASELINE).read_text(encoding="utf-8").splitlines(True)
+                         if line.lstrip().startswith("#")) if (root / GUARD_BASELINE).is_file() else ""
+    guards = sorted(guarded(counts, corpus))
+    (root / GUARD_BASELINE).write_text(guard_head + "\n".join(guards) + "\n", encoding="utf-8")
+    print(f"hrx_f16_narrowing: wrote {len(bodies)} body(ies) to {BASELINE}, {len(accs)} to {ACC_BASELINE} and "
+          f"{len(guards)} to {GUARD_BASELINE}")
     return 0
 
 
@@ -380,9 +405,19 @@ def self_test():
         (ck_corpus / "listed.loom").write_text("  %x = scalar.fptrunc %y : f32 to f16\n")
         (ck / BASELINE).write_text("# c\nlisted.loom 1\n")
         (ck / ACC_BASELINE).write_text("# c\n")
+        (ck / GUARD_BASELINE).write_text("# c\n")
         check_that(check(ck) == 0, "check(): a corpus that matches its baseline is rc 0")
         (ck_corpus / "listed.loom").write_text(
-            "  %x = scalar.fptrunc %y : f32 to f16\n  %z = scalar.fptrunc %w : f32 to f16\n")
+            "  %x = scalar.fptrunc %y : f32 to f16  # scale_log2\n  %z = scalar.fptrunc %w : f32 to f16\n")
+        check_that(guarded({"listed.loom"}, ck_corpus) == {"listed.loom"},
+                   "a producer-side marker puts the body in the guarded set")
+        (ck_corpus / "listed.loom").write_text("  %x = scalar.fptrunc %y : f32 to f16\n")
+        check_that(guarded({"listed.loom"}, ck_corpus) == set(),
+                   "REMOVING the marker drops it from the guarded set while the body and its line count stay identical")
+        # the body and its count now match the baseline exactly; only the guard is gone, so rc 1 can only come from it
+        (ck / GUARD_BASELINE).write_text("# c\nlisted.loom\n")
+        check_that(check(ck) == 1,
+                   "check(): a lost guard marker fails even though every body and line count matches")
         check_that(check(ck) == 1,
                    "check(): one extra narrowing LINE in a listed body is rc 1 -- the fail condition is armed")
         (ck_corpus / "listed.loom").write_text("  %x = scalar.constant 0.0 : f32\n")

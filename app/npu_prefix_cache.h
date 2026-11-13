@@ -41,6 +41,14 @@
 //   pin(prefix, bytes)    keep the state at that point.  One pinned slot at a time; the budget's eviction
 //                         and a longer prompt's replacement both leave it alone, a new pin() replaces it.
 // The rule reads token ids only, so it needs no knowledge of the template or of what a system prompt is.
+//
+// **That is safe only while every request is text (engine#2324).** Two requests whose tokens are the same are not the same
+// request once an image can be attached: the picture lives outside the ids, so `[system, <image_placeholder x 203>, question]`
+// matches this rule for *any* picture of the same size, and a hit would replay KV state built from a different image. The serve
+// route refuses image parts today (engine#2327) and the decoder exists without a caller (engine#2329), so nothing can reach the
+// cache with pixels yet -- but whoever wires the tower call must extend the key (a digest of the image ids or of the encoder's
+// pooled rows) *before* the first image-bearing request is allowed through. A key over ids alone is not a cache miss on an
+// image; it is a wrong answer that reports itself as a cache hit.
 #pragma once
 
 #include <algorithm>

@@ -209,6 +209,48 @@ void test_production_packer() {
     std::printf("  production packer: %zu codes, %d scales, blocked == bpos(rowmajor)\n", (size_t)K * N, N);
 }
 
+// engine#1783: the production packer's rounding is written so it vectorises (truncate, then step on the fraction), and
+// that has to be roundf's half-away-from-zero exactly. Columns whose amax is 127 make the scale exactly 1, so each value
+// below reaches the rounding unchanged: every k + 0.5 and k - 0.5 tie, the floats one ulp either side of a tie, the
+// +-127 clamp, and NaN / +-inf (zeroed). The row-major reference (q4nx_pack_B_int8, roundf) is the oracle.
+void test_packer_rounding_edges() {
+    const int K = 64, N = 128;
+    std::vector<float> vals;
+    for (int k = -127; k <= 126; ++k) {
+        const float tie = float(k) + 0.5f;
+        vals.push_back(tie);
+        vals.push_back(std::nextafter(tie, 0.0f));
+        vals.push_back(std::nextafter(tie, tie > 0 ? 1e9f : -1e9f));
+    }
+    for (float v : {0.0f, -0.0f, 0.49999997f, -0.49999997f, 127.0f, -127.0f, 126.99999f, -126.99999f, 1e-30f, -1e-30f})
+        vals.push_back(v);
+    vals.push_back(0.0f / 0.0f);
+    vals.push_back(1.0f / 0.0f);
+    vals.push_back(-1.0f / 0.0f);
+    std::vector<float> w((size_t)K * N, 0.0f);
+    for (int j = 0; j < N; ++j) w[(size_t)j] = (j % 2) ? 127.0f : -127.0f;   // row 0: amax 127 in every column
+    size_t at = 0;
+    for (int i = 1; i < K && at < vals.size(); ++i)
+        for (int j = 0; j < N && at < vals.size(); ++j) w[(size_t)i * N + (size_t)j] = vals[at++];
+    check(at == vals.size(), "packer rounding: every edge value placed");
+    std::vector<int8_t> rowmaj((size_t)K * N), blocked((size_t)K * N);
+    std::vector<float> sc_ref((size_t)N), sc_blk((size_t)N);
+    q4nx_pack_B_int8(w.data(), K, N, rowmaj.data(), N, sc_ref.data());
+    double ssum = 0;
+    check(q4nx_pack_B_int8_blocked(blocked.data(), w.data(), K, N, K, N, 1, sc_blk.data(), &ssum) == 0, "packer rounding: runs");
+    check(sc_blk == sc_ref, "packer rounding: scales equal the reference's");
+    size_t mismatched = 0, ties_up = 0;
+    for (int i = 0; i < K; ++i)
+        for (int j = 0; j < N; ++j) {
+            const int8_t got = blocked[q4nx_layout::blocked_index((size_t)i, (size_t)j, K, N)];
+            if (got != rowmaj[(size_t)i * N + (size_t)j]) mismatched++;
+            ties_up += w[(size_t)i * N + (size_t)j] == 2.5f && got == 3;
+        }
+    check(mismatched == 0, "packer rounding: every code equals roundf's, ties and neighbours included");
+    check(ties_up == 1, "packer rounding: 2.5 rounds away from zero (3), not to even");
+    std::printf("  packer rounding: %zu edge values, codes == roundf reference\n", vals.size());
+}
+
 // engine#1994: the integer host arm packs UNPADDED images (KD == K, ND == N) into K*N bytes. blocked_index() addresses
 // whole 64x128 tiles, so a geometry that is not whole tiles has to be packed and read row-major, or both the packer and
 // the MAC walk past the buffer. This pins the rule the arm uses -- blocked = blocked_fits(K, N), read through
@@ -291,6 +333,7 @@ int main() {
     }
     test_refusals();
     test_production_packer();
+    test_packer_rounding_edges();
     test_row_major_unchanged();
     test_pack_geometries();
     test_unpadded_image(3072, 7488, false);   // phi-3-mini's last vocabulary block (32064 % 8192)

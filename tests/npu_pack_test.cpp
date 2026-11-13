@@ -23,6 +23,8 @@
 #include "full_elf.h"
 #include "pack.h"
 #include "q4nx_pack.h"
+#include "batch_split.h"
+#include "batch_width.h"
 
 #include "golden/host_gemm_i8_fixture.h"
 
@@ -86,7 +88,142 @@ static void quant_int4_arms() {
     std::printf("  int4 pair: 11 arms (known codes, ladder, floor, NaN, round-trip)\n");
 }
 
+/* engine#1900: the batch width is the chunk width, and the activation BO holds exactly that many rows -- an OVER-wide
+ * answer reads past the BO (engine#1372, memory corruption rather than a slow path). The old code returned the first
+ * populated design's width, so a mixed set answered whichever role was index 0.
+ *
+ * These arms pin the RULE (minimise, skip empty slots, take a fallback), not a measurement: no pack on this box has been
+ * shown to adopt mixed widths, so nothing here claims the old answer was wrong on a real pack -- only that it would be
+ * the dangerous way round if one ever did. The sealed route's width is #1904's, read from the plan and measured on the
+ * device. */
+static void batch_width_arms() {
+    using onebit::npu::batch_width_min;
+    const int mixed[] = {16, 16, 128};
+    check(batch_width_min(mixed, 3, 1) == 16, "batch width: 16/16/128 answers 16, not the 128 at index 2");
+    const int wide_first[] = {128, 16, 16};
+    check(batch_width_min(wide_first, 3, 1) == 16,
+          "batch width: 128 at index 0 does not win (the old code returned the FIRST populated entry)");
+    const int slots[] = {0, 0, 16, 0};
+    check(batch_width_min(slots, 4, 1) == 16, "batch width: unloaded slots are skipped, not treated as a width");
+    const int none[] = {0, 0, 0};
+    check(batch_width_min(none, 3, 1) == 1, "batch width: no design at all falls back to 1 (a single-row launch)");
+    check(batch_width_min(none, 3, 16) == 16, "batch width: the fallback is the loaded design's own M when the caller has it");
+    check(batch_width_min(nullptr, 0, 128) == 128, "batch width: a null array reads as empty and takes the fallback");
+    check(batch_width_min(mixed, 0, 4) == 4, "batch width: an n of 0 reads nothing and takes the fallback");
+    std::printf("  batch width: 7 arms (min not first, empty slots, fallback)\n");
+}
+
+/* engine#1959: a 17-row chunk ran the 128-row design and paid for 128 rows (6992 ms against 1073 ms for 16 rows on an
+ * imported 7B pack). batch_split_rows() decides from the two MEASURED launch costs whether a chunk is walked at the
+ * twin's width. These arms pin the decision, including the direction that must not change anything: one family only,
+ * an unmeasured side, and a family where the wide launch is the cheaper one. */
+static void batch_split_arms() {
+    using onebit::npu::batch_split_rows;
+    const double n7b = 7.6, w7b = 56.3;   // per-launch device wait measured on the 7B b8 family (ms)
+    check(batch_split_rows(17, 16, 128, n7b, w7b) == 16, "batch split: 17 rows run as 2 narrow launches (15.2 ms against 56.3)");
+    check(batch_split_rows(96, 16, 128, n7b, w7b) == 16, "batch split: 96 rows run as 6 narrow launches (45.6 ms against 56.3)");
+    check(batch_split_rows(97, 16, 128, n7b, w7b) == 0,
+          "batch split: 97 rows stay one wide launch (7 x 7.6 = 53.2 is not a tenth below 56.3)");
+    check(batch_split_rows(128, 16, 128, n7b, w7b) == 0, "batch split: a full 128-row chunk stays one wide launch (60.8 > 56.3)");
+    check(batch_split_rows(16, 16, 128, n7b, w7b) == 0 && batch_split_rows(1, 16, 128, n7b, w7b) == 0,
+          "batch split: a chunk the twin already takes is not split");
+    check(batch_split_rows(129, 16, 128, n7b, w7b) == 0, "batch split: a chunk wider than the wide design is the block walk's, not this rule's");
+    check(batch_split_rows(17, 16, 128, 0.0, w7b) == 0 && batch_split_rows(17, 16, 128, n7b, 0.0) == 0,
+          "batch split: an unmeasured side keeps the wide launch (that launch is how it gets measured)");
+    check(batch_split_rows(17, 16, 16, n7b, w7b) == 0 && batch_split_rows(17, 128, 128, n7b, w7b) == 0 &&
+          batch_split_rows(17, 0, 128, n7b, w7b) == 0 && batch_split_rows(17, 1, 128, n7b, w7b) == 0,
+          "batch split: one family only (no twin, or twin == wide) never splits");
+    // a family whose wide launch costs twice a narrow one: the wide launch wins from 33 rows, and 17..32 is level
+    check(batch_split_rows(17, 16, 128, 0.59, 1.20) == 0, "batch split: 2 x 0.59 = 1.18 is not a tenth below 1.20, so 17 rows stay wide there");
+    check(batch_split_rows(40, 16, 128, 0.59, 1.20) == 0, "batch split: 40 rows stay wide on a family where wide = 2 x narrow");
+    check(batch_split_rows(17, 16, 128, 0.50, 1.20) == 16, "batch split: 2 x 0.50 = 1.00 is a tenth below 1.20, so it splits");
+    // The wide cost is believed only after kSplitWideSamples launches: the first launch of a kernel is a start-up.
+    using onebit::npu::kSplitWideSamples;
+    using onebit::npu::split_wide_cost;
+    check(split_wide_cost(4.17, 1) == 0.0 && split_wide_cost(4.17, kSplitWideSamples - 1) == 0.0,
+          "batch split: a wide cost from fewer than the required launches is 'not measured'");
+    check(split_wide_cost(0.87, kSplitWideSamples) == 0.87 && split_wide_cost(0.87, 100) == 0.87,
+          "batch split: the best wall counts once enough launches were timed");
+    // the case that was wrong on the device: a 32-row sealed family, first launch 4.17 ms, real launch 0.87 ms
+    check(batch_split_rows(32, 16, 32, 0.51, split_wide_cost(4.17, 1)) == 0,
+          "batch split: one start-up sample of 4.17 ms does not split a 32-row chunk");
+    check(batch_split_rows(32, 16, 32, 0.51, split_wide_cost(0.87, kSplitWideSamples)) == 0,
+          "batch split: 2 x 0.51 against a real 0.87 ms keeps the 32-row launch");
+    check(batch_split_rows(32, 16, 32, 0.51, 4.17) == 16,
+          "batch split: (the old behaviour, for the record) the raw start-up sample would have split it");
+    // The row stride of a walked chunk: a_k only when it is a real, narrower width.
+    using onebit::npu::row_stride;
+    check(row_stride(3584, 4096) == 3584, "row stride: a padded design steps by its real width");
+    check(row_stride(0, 5120) == 5120, "row stride: a design that never set real_k steps by K, not by 0");
+    check(row_stride(5120, 5120) == 5120 && row_stride(6000, 5120) == 5120 && row_stride(-1, 5120) == 5120,
+          "row stride: K, more than K and a negative width all mean K");
+    std::printf("  batch split: 19 arms (crossover, unmeasured, one family, a family where wide wins, start-up sample, row stride)\n");
+}
+
+/* engine#1990: a sealed set may carry a wide family beside the 16-row one. The rules that decide whether it is used,
+ * how wide a chunk is and which launches take it are pure, and wrong in the dangerous direction means more rows in a
+ * launch than a kernel's buffers hold. */
+static void wide_family_arms() {
+    using onebit::npu::chunk_rows;
+    using onebit::npu::wide_family_complete;
+    using onebit::npu::wide_takes;
+    const int n16[] = {16, 16, 0, 16};
+    const int w32[] = {32, 32, 0, 32};
+    check(wide_family_complete(n16, w32, 4, 32), "wide family: every decode role has a 32-row kernel -> complete");
+    const int hole[] = {32, 0, 0, 32};
+    check(!wide_family_complete(n16, hole, 4, 32), "wide family: one decode role without a wide kernel -> not complete");
+    const int mixed[] = {32, 64, 0, 32};
+    check(!wide_family_complete(n16, mixed, 4, 32), "wide family: a role built for another row count -> not complete");
+    const int extra[] = {32, 32, 32, 32};
+    check(!wide_family_complete(n16, extra, 4, 32), "wide family: a wide kernel for a role with no decode one -> refused");
+    const int w16[] = {16, 16, 0, 16};
+    check(!wide_family_complete(n16, w16, 4, 16), "wide family: 'wide' must be wider than the decode family");
+    const int none[] = {0, 0, 0, 0};
+    check(!wide_family_complete(none, none, 4, 32), "wide family: no role at all is not a family");
+    check(!wide_family_complete(nullptr, w32, 4, 32) && !wide_family_complete(n16, w32, 0, 32) &&
+          !wide_family_complete(n16, w32, 4, 0), "wide family: null, empty and zero-row inputs are not complete");
+    check(chunk_rows(16, 0) == 16, "chunk rows: no wide family keeps the decode width");
+    check(chunk_rows(16, 32) == 32, "chunk rows: an adopted wide family widens the chunk");
+    check(chunk_rows(16, 8) == 16, "chunk rows: a 'wide' value below the decode width never narrows the chunk");
+    check(!wide_takes(1, 16, 32) && !wide_takes(16, 16, 32), "wide takes: 1 and 16 rows stay on the decode family");
+    check(wide_takes(17, 16, 32) && wide_takes(32, 16, 32), "wide takes: 17 and 32 rows go to the wide family");
+    check(!wide_takes(33, 16, 32), "wide takes: 33 rows are not routed to a 32-row kernel");
+    check(!wide_takes(17, 16, 0) && !wide_takes(17, 16, 16), "wide takes: no family, or one no wider than decode, takes nothing");
+    using onebit::npu::wide_elf_path;
+    check(wide_elf_path(nullptr, "", "/k").empty() && wide_elf_path("", "", "/k").empty(),
+          "wide elf: neither the environment nor the pack names one -> none");
+    check(wide_elf_path(nullptr, "W.elf", "/k") == "/k/W.elf", "wide elf: the pack's name is looked up in the kernels dir");
+    check(wide_elf_path("", "W.elf", "/k") == "/k/W.elf", "wide elf: an empty variable is not an override");
+    check(wide_elf_path(nullptr, "/abs/W.elf", "/k") == "/abs/W.elf", "wide elf: an absolute pack name is used as given");
+    check(wide_elf_path("/e/X.elf", "W.elf", "/k") == "/e/X.elf", "wide elf: the environment wins over the pack");
+    check(wide_elf_path("0", "W.elf", "/k").empty(), "wide elf: NPU_WIDE_SEALED_ELF=0 switches a pack's wide family off");
+    check(wide_elf_path("0x.elf", "", "/k") == "0x.elf", "wide elf: only the exact value 0 means off");
+    std::printf("  wide family: 21 arms (complete or not, chunk width, which launch takes it, which file)\n");
+    // The narrow (decode) family: the mirror rules.
+    using onebit::npu::narrow_family_complete;
+    using onebit::npu::narrow_takes;
+    const int n4[] = {4, 4, 0, 4};
+    check(narrow_family_complete(n16, n4, 4, 4), "narrow family: every decode role has a 4-row kernel -> complete");
+    const int nhole[] = {4, 0, 0, 4};
+    check(!narrow_family_complete(n16, nhole, 4, 4), "narrow family: one role without a narrow kernel -> not complete");
+    const int nmixed[] = {4, 8, 0, 4};
+    check(!narrow_family_complete(n16, nmixed, 4, 4), "narrow family: a role built for another row count -> not complete");
+    const int nextra[] = {4, 4, 4, 4};
+    check(!narrow_family_complete(n16, nextra, 4, 4), "narrow family: a kernel for a role with no decode one -> refused");
+    check(!narrow_family_complete(n16, n16, 4, 16), "narrow family: 'narrow' must be narrower than the decode family");
+    check(!narrow_family_complete(n16, w32, 4, 32), "narrow family: a wide set is not a narrow one");
+    check(!narrow_family_complete(nullptr, n4, 4, 4) && !narrow_family_complete(n16, n4, 0, 4) &&
+          !narrow_family_complete(n16, n4, 4, 0), "narrow family: null, empty and zero-row inputs are not complete");
+    check(narrow_takes(1, 4) && narrow_takes(4, 4), "narrow takes: 1 and 4 rows go to a 4-row kernel");
+    check(!narrow_takes(5, 4) && !narrow_takes(16, 4), "narrow takes: 5 rows never go to a 4-row kernel");
+    check(!narrow_takes(1, 0) && !narrow_takes(0, 4), "narrow takes: no family takes nothing, and 0 rows is not a launch");
+    std::printf("  narrow family: 10 arms (complete or not, which launch takes it)\n");
+}
+
 int main(int argc, char** argv) {
+    batch_width_arms();
+    batch_split_arms();
+    wide_family_arms();
     quant_int4_arms();
     for (int G : {8, 9, 16}) {
         for (int n : {G, 3 * G}) {  // whole groups: a ragged tail is not a permutation

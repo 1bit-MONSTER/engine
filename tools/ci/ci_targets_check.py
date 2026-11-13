@@ -45,6 +45,7 @@ in an `add_test` (engine#1596) without raising the drift it measures.
 
     tools/ci/ci_targets_check.py --check [--root .]
     tools/ci/ci_targets_check.py --self-test
+    tools/ci/ci_targets_check.py --where ROW[,ROW...]    where each ctest row is registered (file:line)
 """
 import argparse
 import glob
@@ -65,7 +66,9 @@ INCLUDE = re.compile(r'^\s*include\(\s*"?([^\s")]+\.cmake)"?\s*\)', re.M)
 # shape engine#1696 landed. The include argument is a VARIABLE, so INCLUDE above cannot match it, and a
 # reader that only followed literal includes would stop seeing every registration at once - the count
 # would fall to zero and read as "the gap closed".
-GLOB = re.compile(r'file\s*\(\s*GLOB\s+(\w+)[^)]*?([^\s")]+/\*\.cmake)', re.IGNORECASE)
+# engine#1979: the pattern main uses is `cmake/tests-*.cmake` (a prefix before the star), not `<dir>/*.cmake`; a
+# reader that wanted the star right after the slash matched nothing there, and every such file went unread.
+GLOB = re.compile(r'file\s*\(\s*GLOB\s+(\w+)[^)]*?([^\s")]+/[^\s"/)]*\*[^\s"/)]*\.cmake)', re.IGNORECASE)
 INCLUDE_VAR = re.compile(r'include\(\s*\$\{(\w+)\}\s*\)')
 FOREACH_LISTS = re.compile(r'foreach\s*\(\s*(\w+)\s+IN\s+LISTS\s+(\w+)', re.IGNORECASE)
 DEFINE = re.compile(r"-D([A-Za-z0-9_]+)=([^\s\"]*)")
@@ -211,6 +214,85 @@ def add_test_need(cmake_text):
     return need
 
 
+# A COMMAND token that names no declared target and is not an interpreter, a path or a generator
+# expression: the row is registered in ctest for a target nothing defines. Before this, `add_test_need`
+# intersected with the declared targets, so such a row was in NO set and the check could not see it --
+# an unguarded `add_test(NAME x COMMAND missing_target)` passed as "none new" (measured by planting one).
+INTERPRETERS = {
+    'bash', 'sh', 'python', 'python3', 'node', 'npm', 'perl', 'ruby', 'cmake', 'ctest', 'grep',
+    'echo', 'true', 'false', 'env', 'time', 'timeout', 'git', 'make', 'ninja', 'valgrind', 'sudo',
+}
+TARGETISH = re.compile(r'^[A-Za-z_][A-Za-z0-9_.+-]*$')
+
+
+def add_test_unknown_targets(cmake_text):
+    """{test name: [tokens]} for a row whose COMMAND names something target-shaped but not declared.
+
+    The complement of add_test_need: that one answers "which declared target does a test need", this
+    one answers "which test names a target that does not exist". A script test (`COMMAND bash x.sh`) is
+    excluded by the interpreter set, and a path, a flag or a generator expression by TARGETISH.
+    """
+    exes = {m.group(1) for m in (ADD_EXE.match(l) for l in cmake_text.splitlines()) if m}
+    libs = set()
+    for line in cmake_text.splitlines():
+        m = re.match(r'^\s*add_library\s*\(\s*([A-Za-z0-9_.+-]+)', line, re.IGNORECASE)
+        if m:
+            libs.add(m.group(1))
+    declared = exes | libs
+    out = {}
+    for lineno, block in add_test_blocks(cmake_text):
+        m = re.search(r"\bNAME\s+([A-Za-z0-9_.+-]+)", block)
+        test_name = m.group(1) if m else f"line {lineno}"
+        cm = re.search(r"\bCOMMAND\s+(.*)", block, re.DOTALL)
+        if not cm:
+            continue
+        cmd = cm.group(1)
+        # The first token is the program; if it is an interpreter or a path, this is a script test.
+        first = re.split(r"[\s()]+", cmd.strip())[0] if cmd.strip() else ''
+        if first.startswith('$<') or '/' in first or first in INTERPRETERS:
+            continue
+        # Only the FIRST token can be the target. Everything after it is an argument, and a bare
+        # argument (`lfm2` in `COMMAND ${Python3_EXECUTABLE} ... state_ci.py $<TARGET_FILE:...> lfm2`)
+        # is indistinguishable from a target without knowing the program -- which is the mistake the
+        # first version made, and it flagged five real rows in this tree.
+        if not TARGETISH.match(first) or first in INTERPRETERS:
+            continue
+        if first in declared:
+            continue
+        out.setdefault(test_name, []).append(first)
+    return out
+
+
+def _self_test_unknown_targets():
+    """Arms for the rule that a row must not name a target nothing defines."""
+    rc = 0
+
+    def chk(want, got, what):
+        nonlocal rc
+        if want == got:
+            print(f"ok   {what}")
+        else:
+            print(f"FAIL {what}: want {want}, got {got}")
+            rc = 1
+
+    chk({'broken': ['no_such_target']},
+        add_test_unknown_targets('add_test(NAME broken COMMAND no_such_target)'),
+        'a row whose COMMAND is an undeclared bare target is found')
+    chk({}, add_test_unknown_targets('add_executable(real t.cpp)\nadd_test(NAME ok COMMAND real)'),
+        'a declared target is not a finding')
+    chk({'s': ['nope']},
+        add_test_unknown_targets('add_test(NAME s COMMAND nope arg1 arg2)'),
+        'the FIRST token is the target; later bare words are arguments')
+    chk({'p': ['nope']},
+        add_test_unknown_targets('add_test(NAME p COMMAND nope ${CMAKE_SOURCE_DIR}/x.py lfm2)'),
+        'an argument after a real target name is not reported (the five false positives this rule had)')
+    chk({}, add_test_unknown_targets('add_test(NAME script COMMAND bash tools/x.sh arg)'),
+        'a script row names an interpreter, so it is not a target')
+    chk({}, add_test_unknown_targets("add_test(NAME gen COMMAND $<TARGET_FILE:thing>)"),
+        'a generator expression is not an undeclared target')
+    return rc
+
+
 def read_baseline(path):
     """The names already known to drift, or None when there is no baseline file (which fails closed)."""
     if not os.path.isfile(path):
@@ -342,6 +424,35 @@ def satisfied(guard, defines, defaults):
     return ok, guard
 
 
+def family_files(root, cmake_text):
+    """[(relpath, text)] for every cmake file CMakeLists.txt actually include()s, in include order.
+
+    engine#2129 follow-up (a release verifier grepped CMakeLists.txt for two ctest rows and found zero,
+    because both live in `cmake/tests-*.cmake`): the paths were discarded here, so nothing could answer
+    *where* a row is registered and a CMakeLists-only grep looked like proof of absence. Keeping the path
+    costs nothing and makes that question answerable from the same reader -- the #2012 lesson (a checker
+    whose coverage did not follow the refactor) applied to the human verifying a release.
+    """
+    out = []
+    seen = set()
+    for gvar, pattern in GLOB.findall(cmake_text):
+        loop_vars = [v for v, g in FOREACH_LISTS.findall(cmake_text) if g == gvar]
+        if not loop_vars or loop_vars[0] not in INCLUDE_VAR.findall(cmake_text):
+            continue
+        pat = pattern.replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
+        for path in sorted(glob.glob(os.path.join(root, pat))):
+            if os.path.isfile(path) and os.path.realpath(path) not in seen:
+                seen.add(os.path.realpath(path))
+                out.append((os.path.relpath(path, root), open(path, encoding="utf-8").read()))
+    for m in INCLUDE.finditer(cmake_text):
+        rel = m.group(1).replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
+        path = os.path.join(root, rel)
+        if os.path.isfile(path) and os.path.realpath(path) not in seen:
+            seen.add(os.path.realpath(path))
+            out.append((rel, open(path, encoding="utf-8").read()))
+    return out
+
+
 def family_text(root, cmake_text):
     """The text of every cmake file CMakeLists.txt actually include()s, in include order.
 
@@ -350,24 +461,12 @@ def family_text(root, cmake_text):
     pulled in under a guard is counted as if it were unconditional. Following include() is the only reading
     that matches what CMake configures; the guard on the include is left to cmake_targets(), which already
     tracks a guard stack across the text this returns.
+
+    One implementation of the walk: `family_files()` holds it, because a caller that only wants the text
+    loses the path and then cannot say where a row lives.
     """
-    out = []
-    # a glob the include loop iterates: every file matching it is configured, so every one is read
-    for gvar, pattern in GLOB.findall(cmake_text):
-        # the loop variable differs from the glob variable: `foreach(v IN LISTS GLOBVAR) include(${v})`
-        loop_vars = [v for v, g in FOREACH_LISTS.findall(cmake_text) if g == gvar]
-        if not loop_vars or loop_vars[0] not in INCLUDE_VAR.findall(cmake_text):
-            continue
-        pat = pattern.replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
-        for path in sorted(glob.glob(os.path.join(root, pat))):
-            if os.path.isfile(path):
-                out.append(open(path, encoding="utf-8").read())
-    for m in INCLUDE.finditer(cmake_text):
-        rel = m.group(1).replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
-        path = os.path.join(root, rel)
-        if os.path.isfile(path):
-            out.append(open(path, encoding="utf-8").read())
-    return "\n".join(out)
+    return "\n".join(text for _, text in family_files(root, cmake_text))
+
 
 
 def check(root):
@@ -449,6 +548,17 @@ def check(root):
         print(f"ci_targets_check: {len(by_design)} test(s) are declared only under guards ci.yml's configure turns "
               f"off, so CI never registers them by design ({', '.join(sorted(by_design)[:6])}"
               f"{', …' if len(by_design) > 6 else ''}) - not drift")
+    # A row whose COMMAND names a target nothing defines is not drift against the baseline: ctest would
+    # report it "Not Run" (or the build would fail) and no baseline entry can make that acceptable, so
+    # it fails on its own. engine#2268 shaped this: `add_test_need` intersected with the declared targets,
+    # so such a row was in NO set and the check answered "none new" for it.
+    unknown_target = add_test_unknown_targets(cmake_text)
+    if unknown_target:
+        for test_name, toks in sorted(unknown_target.items()):
+            print(f"ci_targets_check: test '{test_name}' runs a target nothing defines: "
+                  f"{', '.join(sorted(set(toks)))} -- ctest would report it Not Run")
+        return 1
+
     baseline = read_baseline(os.path.join(root, BASELINE))
     if baseline is None:
         # No baseline is not "nothing known": treating it as empty would let the first run of a run
@@ -512,20 +622,89 @@ endif()
 """
 
 
+
+
+def all_rows(root, cmake_path):
+    """[(row, site, line)] for every `add_test`/`add_python_test` row the reader can see.
+
+    engine#2160 review: `--where` matches EXACTLY, which is right (a substring match would answer for
+    `tmp_path_check_self` when asked about `tmp_path_check`).  But the miss and the typo read identically:
+    `--where submodule_pin` says NOT REGISTERED while the row is `submodule_pin_check`.  This lists the rows
+    so a miss can name the near ones without ever calling a partial match a registration.
+    """
+    files = [(os.path.relpath(cmake_path, root), open(cmake_path, encoding="utf-8").read())]
+    files += family_files(root, files[0][1])
+    rows = []
+    for rel, text in files:
+        for i, line in enumerate(continued_lines(text), 1):
+            m = ROW.match(line)
+            if m and (m.group(1), rel, i) not in rows:
+                rows.append((m.group(1), rel, i))
+    return rows
+
+
+def where_rows(root, cmake_path, wanted):
+    """[(row, site, line)] for each wanted row name, searched in CMakeLists.txt then every included file.
+
+    engine#2129 follow-up: a release verifier grepped `CMakeLists.txt` for `submodule_pin` and `tmp_path`,
+    got 0, and nearly raised a false alarm against its own list - both are registered in `cmake/tests-*.cmake`,
+    which #1983's glob include()s. A CMakeLists-only grep is the wrong instrument for a family file, so this
+    answers the question with the same reader that follows the globs and includes.
+    """
+    files = [(os.path.relpath(cmake_path, root), open(cmake_path, encoding="utf-8").read())]
+    files += family_files(root, files[0][1])
+    hits = []
+    for rel, text in files:
+        for i, line in enumerate(continued_lines(text), 1):
+            m = ROW.match(line)
+            if m and m.group(1) in wanted and (m.group(1), rel, i) not in hits:
+                hits.append((m.group(1), rel, i))
+    return hits
+
+
+ROW = re.compile(r'^\s*(?:add_test|add_python_test)\s*\(\s*(?:NAME\s+)?(\w+)')
+
+
+def where_rc(hits, wanted):
+    """The exit status of --where: 0 only when EVERY requested row is registered somewhere.
+
+    A release verifier passes its whole gate list in one call (`--where a,b,c,d,e`), so one row that is registered
+    nowhere must fail the call. The first version returned 0 as soon as any row was found, so `--where
+    ci_targets,not_a_real_row` printed NOT REGISTERED and still exited 0 (review of engine#2160).
+    """
+    found = {row for row, _, _ in hits}
+    return 0 if wanted and all(row in found for row in wanted) else 1
+
+
+def where_rows_self_test(tmp):
+    """engine#2129 follow-up: the answer must come from the family files too, not only CMakeLists.txt."""
+    import pathlib as _p
+    root = _p.Path(tmp)
+    (root / "cmake").mkdir(parents=True, exist_ok=True)
+    (root / "CMakeLists.txt").write_text(
+        'file(GLOB V CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tests-*.cmake)\n'
+        'list(SORT V)\n'
+        'foreach(v IN LISTS V)\n    include(${v})\nendforeach()\n'
+        'add_python_test(plain_row x.py)\n', encoding="utf-8")
+    (root / "cmake" / "tests-family.cmake").write_text(
+        'add_python_test(globbed_row y.py)\n', encoding="utf-8")
+    return where_rows(str(root), str(root / "CMakeLists.txt"), ["plain_row", "globbed_row", "absent_row"])
+
+
 def self_test():
     import tempfile
     fails = 0
 
-    def case(what, ci, cmake, want, baseline="auto", family=None):
+    def case(what, ci, cmake, want, baseline="auto", family=None, family_rel="cmake/tests/zz_family.cmake"):
         nonlocal fails
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, ".github", "workflows"))
             open(os.path.join(d, CI), "w", encoding="utf-8").write(ci)
             open(os.path.join(d, CMAKE), "w", encoding="utf-8").write(cmake)
             if family is not None:
-                fam_dir = os.path.join(d, "cmake", "tests")
-                os.makedirs(fam_dir, exist_ok=True)
-                open(os.path.join(fam_dir, "zz_family.cmake"), "w", encoding="utf-8").write(family)
+                fam_path = os.path.join(d, family_rel)
+                os.makedirs(os.path.dirname(fam_path), exist_ok=True)
+                open(fam_path, "w", encoding="utf-8").write(family)
             if baseline == "auto":
                 # The direction-A fixtures below are not about direction B, so the baseline records
                 # whatever they drift - a direction-B case must then say what its baseline is.
@@ -600,6 +779,18 @@ endforeach()
     case("an add_test in a glob-included family file is still read",
          B_CI, GLOB_CMAKE, 1, baseline="",
          family="add_executable(glob_fam g.cpp)\nadd_test(NAME glob_suite COMMAND glob_fam)\n")
+    # engine#1979: the shape main has, a prefix before the star (`cmake/tests-*.cmake`). With the GLOB pattern that
+    # wanted `<dir>/*.cmake` this arm returned 0: the file was configured by CMake and read by nobody here.
+    PREFIX_GLOB_CMAKE = GLOB_CMAKE.replace("cmake/tests/*.cmake", "cmake/tests-*.cmake")
+    case("an add_test in a file included by a cmake/tests-*.cmake glob is still read",
+         B_CI, PREFIX_GLOB_CMAKE, 1, baseline="",
+         family="add_executable(glob_fam g.cpp)\nadd_test(NAME glob_suite COMMAND glob_fam)\n",
+         family_rel="cmake/tests-zz.cmake")
+    # ... and a file the glob does not match (one directory down) is not configured, so it is not read.
+    case("a file the cmake/tests-*.cmake glob does not match is not read",
+         B_CI, PREFIX_GLOB_CMAKE, 0, baseline="",
+         family="add_executable(glob_fam g.cpp)\nadd_test(NAME glob_suite COMMAND glob_fam)\n",
+         family_rel="cmake/tests-zz/inner.cmake")
     # ... and a baseline name nothing names any more is a FAILURE, not "progress": the two reasons a
     # count can fall are "now built" (good) and "no longer seen" (the reader narrowed).
     case("a baseline name no add_test names any more fails instead of reading as progress",
@@ -688,6 +879,41 @@ add_test(NAME family_suite COMMAND family_test)
     case("a plain target list passes",
          SELF_CI.replace("hidden_test ", ""), SELF_CMAKE, 0)
 
+    # engine#2129 follow-up: --where must find a row in a glob-included family file, not only in
+    # CMakeLists.txt -- that is the reading a release verifier needs and the one a bare grep gets wrong.
+    with tempfile.TemporaryDirectory() as td:
+        hits = where_rows_self_test(td)
+        got = {(row, rel) for row, rel, _ in hits}
+        if ("plain_row", "CMakeLists.txt") not in got:
+            print("  FAIL --where does not find a row registered in CMakeLists.txt"); fails += 1
+        else:
+            print("  ok    --where finds a row registered in CMakeLists.txt")
+        if not any(row == "globbed_row" and rel.startswith("cmake") for row, rel in got):
+            print("  FAIL --where does not find a row registered in a GLOB-included family file"); fails += 1
+        else:
+            print("  ok    --where finds a row registered in a GLOB-included family file")
+        if any(row == "absent_row" for row, _ in got):
+            print("  FAIL --where reports a row that is registered nowhere"); fails += 1
+        else:
+            print("  ok    --where reports an unregistered row as absent")
+        # engine#2160 review: a miss and a typo must not read the same. `--where submodule_pin` is a MISS on the
+        # exact rule and a PREFIX of the real row; the hint names the near rows without calling them a match.
+        allr = all_rows(td, os.path.join(td, "CMakeLists.txt"))
+        names = [r for r, _, _ in allr]
+        if not any(n.startswith("globbed") for n in names):
+            print("  FAIL the prefix hint has no rows to suggest"); fails += 1
+        else:
+            near = [n for n in names if n.startswith("globbed") and n != "globbed"]
+            if not near:
+                print("  FAIL a row that only STARTS WITH the query is not offered as a hint"); fails += 1
+            else:
+                print("  ok    a partial name is offered as a hint when the exact name is absent")
+        if any(n.startswith("absent_row") for n in names):
+            print("  FAIL a hint was invented for a name nothing starts with"); fails += 1
+        else:
+            print("  ok    and no hint is invented when nothing starts with the query")
+
+    fails += _self_test_unknown_targets()
     print(f"ci_targets_check --self-test: {fails} failure(s)")
     return 1 if fails else 0
 
@@ -696,10 +922,30 @@ def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--where", metavar="ROWS", help="print where each ctest row is registered (file:line)")
     ap.add_argument("--root", default=".")
     a = ap.parse_args(argv[1:])
     if a.self_test:
         return self_test()
+    if a.where:
+        wanted = [w.strip() for w in a.where.split(",") if w.strip()]
+        root = os.path.abspath(a.root)
+        hits = where_rows(root, os.path.join(root, "CMakeLists.txt"), wanted)
+        found = {row for row, _, _ in hits}
+        hits_all = all_rows(root, os.path.join(root, "CMakeLists.txt"))
+        for row, rel, line in hits:
+            print(f"{row}\t{rel}:{line}")
+        for row in wanted:
+            if row not in found:
+                near = [r for r, _, _ in all_rows(root, os.path.join(root, "CMakeLists.txt"))
+                        if r != row and r.startswith(row)]
+                hint = ""
+                if near:
+                    where = {r: f"{rel}:{line}" for r, rel, line in hits_all}
+                    hint = ("\n\t  but %d row(s) START WITH it -- the row name may be what is wrong, not the "
+                            "registration: %s" % (len(near), ", ".join(f"{r} ({where.get(r, '?')})" for r in near)))
+                print(f"{row}\tNOT REGISTERED (searched CMakeLists.txt and every file it include()s or globs){hint}")
+        return where_rc(hits, wanted)
     if a.check:
         return check(a.root)
     ap.print_help()

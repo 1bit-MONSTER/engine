@@ -80,6 +80,57 @@ inline bool give_whole(const std::vector<std::vector<float>>& src, std::vector<s
     return true;
 }
 
+// engine#1780: the same per-position cut where the layers' KV rows differ in width. A model with two attention
+// geometries (Gemma4: sliding layers 2 x 256 = 512 floats per position, full layers 2 x 512 = 1024) holds a different
+// number of floats per position in each plane, so one `want` cut the wide planes at half their positions -- the
+// snapshot kept the prefix's first half on those layers, and a restore then resumed from a cache that was short.
+// `per[l]` is plane l's floats per position; a plane past the end of `per` is cut at per.back().
+inline size_t per_of(const std::vector<size_t>& per, size_t l) {
+    return per.empty() ? 0 : (l < per.size() ? per[l] : per.back());
+}
+
+// The positions the planes hold: the longest plane, counted in its own row width (a shared-KV plane holds none).
+inline size_t held_positions(const std::vector<std::vector<float>>& src, const std::vector<size_t>& per) {
+    size_t held = 0;
+    for (size_t l = 0; l < src.size(); l++) {
+        const size_t w = per_of(per, l);
+        if (w) held = std::max(held, src[l].size() / w);
+    }
+    return held;
+}
+
+inline void take_per_pos(const std::vector<std::vector<float>>& src, std::vector<std::vector<float>>& dst,
+                         const std::vector<size_t>& per, size_t tokens) {
+    dst.resize(src.size());
+    for (size_t l = 0; l < src.size(); l++) {
+        const size_t n = std::min(tokens * per_of(per, l), src[l].size());
+        dst[l].assign(src[l].begin(), src[l].begin() + long(n));
+    }
+}
+
+inline bool give_per_pos(const std::vector<std::vector<float>>& src, std::vector<std::vector<float>>& dst,
+                         const std::vector<size_t>& per, size_t tokens) {
+    if (dst.size() < src.size()) return false;
+    for (size_t l = 0; l < src.size(); l++) {
+        if (src[l].empty()) {
+            dst[l].clear();
+            continue;
+        }
+        const size_t want = tokens * per_of(per, l);
+        if (src[l].size() < want) return false;
+        dst[l].assign(src[l].begin(), src[l].begin() + long(want));
+    }
+    return true;
+}
+
+// Keep the first `tokens` positions of every non-empty plane (a verify's rollback): planes are cut, never grown.
+inline void keep_positions(std::vector<std::vector<float>>& planes, const std::vector<size_t>& per, size_t tokens) {
+    for (size_t l = 0; l < planes.size(); l++) {
+        const size_t keep = tokens * per_of(per, l);
+        if (!planes[l].empty() && planes[l].size() > keep) planes[l].resize(keep);
+    }
+}
+
 }  // namespace q4nx_state
 
 #endif  // Q4NX_STATE_PLANES_H

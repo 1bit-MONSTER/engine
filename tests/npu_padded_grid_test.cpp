@@ -60,6 +60,61 @@ static std::vector<uint8_t> make_grid(int ntr, int ntc) {
     return g;
 }
 
+// engine#1786: the two code orders of the 8704-byte Q8 chunk (q4nx_dequant.h, q4nx_dequant_tile_q8_split16). A symmetric
+// Q8 group holds one code of magnitude 127 (its absmax), so each (row, 32-column group) here gets one +-127 and 31 codes
+// below it, with a bf16 scale of its own. The same values are written in each order: each must be detected as its own
+// order and decode to exactly the values written (bf16 scale x int8 code is exact in float).
+static uint16_t bf16_of(float f) { uint32_t u; std::memcpy(&u, &f, 4); return (uint16_t)(u >> 16); }
+static float f_of_bf16(uint16_t b) { const uint32_t u = (uint32_t)b << 16; float f; std::memcpy(&f, &u, 4); return f; }
+
+static void test_q8_split16() {
+    const int ntr = 2, ntc = 2, rows = ntr * Q4NX_TILE_ROWS, cols = ntc * Q4NX_TILE_COLS;
+    std::vector<float> want((size_t)rows * cols);
+    std::vector<uint8_t> old_order((size_t)ntr * ntc * Q4NX_CHUNK_Q8, 0), split((size_t)ntr * ntc * Q4NX_CHUNK_Q8, 0);
+    uint32_t seed = 1786;
+    auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    for (int tr = 0; tr < ntr; tr++)
+        for (int tc = 0; tc < ntc; tc++) {
+            uint8_t* to = &old_order[((size_t)tr * ntc + tc) * Q4NX_CHUNK_Q8];
+            uint8_t* ts = &split[((size_t)tr * ntc + tc) * Q4NX_CHUNK_Q8];
+            for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+                for (int g = 0; g < 8; g++) {
+                    const uint16_t d = bf16_of(0.001f * (float)(1 + rnd() % 50));
+                    std::memcpy(to + 2 * (g * Q4NX_TILE_ROWS + r), &d, 2);
+                    std::memcpy(ts + 2 * (g * Q4NX_TILE_ROWS + r), &d, 2);
+                    const int peak = (int)(rnd() % 32);
+                    for (int j = 0; j < 32; j++) {
+                        const int k = g * 32 + j;
+                        int code = j == peak ? ((rnd() & 1) ? 127 : -127) : (int)(rnd() % 253) - 126;
+                        to[512 + k * 32 + r] = (uint8_t)(int8_t)code;
+                        ts[512 + (r / 16) * 4096 + k * 16 + (r % 16)] = (uint8_t)(int8_t)code;
+                        want[(size_t)(tr * 32 + r) * cols + (size_t)tc * 256 + k] = f_of_bf16(d) * (float)code;
+                    }
+                }
+        }
+    check(q4nx_q8_split16(split.data(), (size_t)ntr * ntc, Q4NX_CHUNK_Q8) == 1, "q8: split16 codes are detected as split16");
+    check(q4nx_q8_split16(old_order.data(), (size_t)ntr * ntc, Q4NX_CHUNK_Q8) == 0,
+          "q8: 32-row codes are detected as the 32-row order");
+    std::vector<float> got((size_t)rows * cols);
+    check(q4nx_dequant_tensor_chunked(split.data(), split.size(), rows, cols, Q4NX_CHUNK_Q8, got.data()) == 0 && got == want,
+          "q8: a split16 tensor decodes to the values written");
+    check(q4nx_dequant_tensor_chunked(old_order.data(), old_order.size(), rows, cols, Q4NX_CHUNK_Q8, got.data()) == 0 &&
+              got == want,
+          "q8: a 32-row tensor still decodes to the values written");
+    // The per-token row path reads the same order from its tile-row's chunks.
+    std::vector<float> row(cols);
+    bool rows_ok = true;
+    for (int r : {0, 15, 16, 31, 32, 63}) {
+        rows_ok &= q4nx_dequant_tile_row(split.data(), split.size(), rows, cols, Q4NX_CHUNK_Q8, r, row.data()) == 0 &&
+                   std::memcmp(row.data(), &want[(size_t)r * cols], (size_t)cols * sizeof(float)) == 0;
+    }
+    check(rows_ok, "q8: the row path decodes split16 rows on both 16-row halves");
+    // A tile that reaches 127 in both orders (constant codes) is not evidence for split16: the 32-row reading stays.
+    std::vector<uint8_t> flat(Q4NX_CHUNK_Q8);
+    make_q8_tile(flat.data(), 127);
+    check(q4nx_q8_split16(flat.data(), 1, Q4NX_CHUNK_Q8) == 0, "q8: a tile that fits both orders keeps the 32-row order");
+}
+
 int main() {
     const int rows = 2 * Q4NX_TILE_ROWS;    // 64 rows  -> 2 tile-rows
     const int cols = 2 * Q4NX_TILE_COLS;    // 512 cols -> 2 tile-cols
@@ -128,6 +183,8 @@ int main() {
           "a grid smaller than the model's is refused");
     check(q4nx_packed_grid(7, 1536, 8960, &cb, &rp_g, &cp_g) == 0,
           "a size no chunk kind divides is refused");
+
+    test_q8_split16();
 
     if (failures) {
         std::printf("%d failure(s)\n", failures);

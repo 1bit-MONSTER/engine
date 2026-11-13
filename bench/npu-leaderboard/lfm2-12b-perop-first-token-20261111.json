@@ -1,0 +1,28 @@
+{
+  "id": "lfm2-12b-perop-first-token-20261111",
+  "host": "strixhalo",
+  "model": "LFM2-1.2B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX symmetric 4-bit tiles (FastFlowLM's published container, listed as Q4_0), per-op int8 GEMM, blocked family",
+  "metric": {
+    "name": "first token (warm)",
+    "value": 0.756,
+    "unit": "s"
+  },
+  "settings": {
+    "device": "accel0",
+    "engine": "1bit built at the code of main 1131acf0 (engine#2170)",
+    "container": "FastFlowLM/LFM2-1.2B-NPU2 model.q4nx, sha256 2755ab40cd927e3c…, served as published; the only edit is \"q4nx_weight_layout\": \"b8\" in a copy of config.json",
+    "kernels": "full_i8 blocked: QKV K2048 N3072, QKV K2048 N6144 (the conv layers' in_proj), O K2048 N2048, GU K2048 N16384, D K8192 N2048, each with its M=16 twin",
+    "ticket": "npu-hold -l cl-flm-lfm2-rows, both LFM2 packs in one 107 s ticket",
+    "sampling": "temperature 0, streamed, max_tokens 64",
+    "prompt_tokens": 20,
+    "load1": "17.5 at start, 14.7 at end",
+    "known_answer": "3 requests of 'What is the capital of France? Answer with one word.' returned 'Paris' three times, identical"
+  },
+  "instrument": "time from request to the first streamed chunk on a 20-token prompt; two requests, 0.747 and 0.764 s",
+  "repeats": 2,
+  "timestamp": "2026-11-11T13:32:47Z",
+  "source": "~/.cache/scratch-cl-flm/rows.log and out-rows-LFM2-1.2B-NPU2/ on strixhalo (row-serve.sh + row-probe.py, lane cl-flm; engine#1786)",
+  "notes": "Same ticket as lfm2-12b-perop-decode-20261111. Batched prefill, no prefix cache hit (a different prompt had been served before it). The server's own prompt_ms was 745 and 762 ms."
+}

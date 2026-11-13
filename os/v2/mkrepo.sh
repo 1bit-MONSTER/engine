@@ -21,7 +21,11 @@
 # Release file is produced unsigned and the script says so - useful for a local run, never for
 # publishing. The result is a directory of static files: publish it to 1bit.gg/apt as it is.
 set -euo pipefail
-[ $# -ge 2 ] || { sed -n '21,27p' "$0"; exit 2; }
+
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- several of these ranges
+# had drifted past the end of their header and printed code to whoever asked for help (the same defect engine PR #2258 fixed in scripts/).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+[ $# -ge 2 ] || { usage; exit 2; }
 debs=$1 repo=$2 gnupg=${3:-} keyid=${4:-}
 [ -d "$debs" ] || { echo "mkrepo: no $debs"; exit 2; }
 dist=$repo/dists/stable

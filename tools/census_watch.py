@@ -51,10 +51,10 @@ must never be printed as "nothing new" — but when an alert is also present the
 (1), since that is the code a human has to act on, and the failure is still printed as
 `!! FLM WATCH FAILED` for the log grep.
 
-A class whose models all load through custom modeling code (`auto_map` in the config, or a
-runtime library that is not Transformers, so Transformers itself has no implementation of
-it either) and that fewer than REMOTE_CODE_SPREAD uploaders publish is reported but does
-not alert: research one-offs like that arrive every day and are not something a backend
+A class whose models all load through custom modeling code (`auto_map` in the config, a
+runtime library that is not Transformers, or a repo with no library at all that ships its own
+`modeling_*.py`; in each case Transformers itself has no implementation of the class) and
+that fewer than REMOTE_CODE_SPREAD uploaders publish is reported but does not alert: research one-offs like that arrive every day and are not something a backend
 could map. Once REMOTE_CODE_SPREAD uploaders use it, or it is a reviewed class
 (registry/significant.json), it alerts like any other. The exception is a reviewed class
 whose entry says `"watch": "report"`: a research architecture reviewed as not an alias that
@@ -78,6 +78,16 @@ FastFlowLM org listing, in the ten newest release bodies, or in any asset name (
 2026-10-26), so a marker guessed from a repo name would be invention. The report names
 FastFlowLM files, sizes, licenses and tags only — nothing about our NPU kernels or their
 speed.
+
+A gap that has been answered stays answered (engine#2171). CI keeps no state between runs, so
+every scheduled run sees the whole org as new, and each `!! NPU FLM` / `!! NEW FLM` family that
+docs/npu.md had already answered alerted again every day, re-filing the census issue as soon as
+the last one closed. `registry/flm_answers.json` is the machine-readable form of those answers:
+a pack whose declared architecture (or, for a config-less repo, whose id) has an entry prints
+`. NPU FLM` / `. FLM` with the issue that tracks it and does not alert. An answer only quiets a
+gap: once the registry serves the family on the NPU route the line is `+ FLM` again, and the
+test fails on a committed answer for a family that is no longer a gap, so a stale answer is
+removed rather than kept. A family with no entry still alerts on its first sighting.
 
 State (the model ids already classified) lives outside the checkout, at
 $CENSUS_WATCH_STATE (default ~/.1bit/census-watch-state.json), so a run never dirties
@@ -118,6 +128,14 @@ GH_RELEASES = "https://api.github.com/repos/FastFlowLM/FastFlowLM/releases?per_p
 # fact, while "a new commit appeared" would be true on every run.
 SUPPORT_PINS_PATH = os.path.join(ROOT, "registry", "support_pins.json")
 GH_REPO_HEAD = "https://api.github.com/repos/{repo}/commits?per_page=1"
+# A pin may name the paths the NPU route depends on (`paths`). Then "moved" means a commit that
+# touches one of them, not any commit: vllm-project/semantic-router lands dozens of router-side
+# commits a day, so the whole-repo head moved on every run and re-filed the census issue daily
+# while the d3 contract it is pinned for stayed byte-identical (engine#2171). The last commit
+# touching a path is read at the pin and at the head; a difference is a move.
+GH_PATH_HEAD = "https://api.github.com/repos/{repo}/commits?sha={sha}&path={path}&per_page=1"
+# Recorded answers for FastFlowLM packs this engine does not serve (engine#2171).
+FLM_ANSWERS_PATH = os.path.join(ROOT, "registry", "flm_answers.json")
 HF_ORG_URL = "https://huggingface.co/api/models?author={org}&sort=createdAt&direction=-1&limit=100"
 GH_RELEASES_LIMIT = 20
 # Words that mean a release notes body or an asset name talks about the Q4NX container:
@@ -171,6 +189,13 @@ NON_TRANSFORMERS_LIBRARIES = frozenset((
     "pytorch", "onnx", "onnxruntime-genai", "mlx", "mlx-serve", "litert-lm", "llama.cpp",
     "mlc-llm", "tensorflow", "tf-keras", "keras", "jax", "flax", "openvino", "coreml",
 ))
+
+# A repo's own modeling code, by the name Transformers gives such files (`modeling_<name>.py`),
+# at the top level of the repo. engine#1922: Climb-Ai/Climb-1-Toki declares
+# `architectures: ["MicroLlamaForCausalLM"]` and `model_type: llama` with no `auto_map` and no
+# library, and ships `modeling_micro_llama.py`, where that class is a bare `torch.nn.Module`
+# with its own tensor names (`layers.0.attn.q_proj`, `token_embd`). It alerted as a new class.
+_OWN_MODELING = re.compile(r"^modeling_[A-Za-z0-9_]+\.py$")
 
 COVERED, UNCOVERED, UNVERIFIABLE, DERIVATIVE = "covered", "uncovered", "unverifiable", "derivative"
 
@@ -228,13 +253,21 @@ def is_remote_code(model):
 
     A raw checkpoint through a non-Transformers library carries an architecture class no
     backend can map (the library's own code runs it), exactly like an `auto_map` model.
-    A missing `library_name` is unknown, not custom, so it alerts.
+    A missing `library_name` is unknown, not custom, so it alerts - unless the repo ships its
+    own `modeling_*.py` and nothing calls it a Transformers model: then the class is whatever
+    that file defines, and without `auto_map` Transformers cannot even be told to load it.
+    The Hub puts `library_name: transformers` and the `transformers` tag on a repo it can
+    load with the library, so a new class Transformers really has keeps alerting.
     """
     cfg = model.get("config") or {}
     if cfg.get("auto_map"):
         return True
+    transformers = "transformers" in (model.get("tags") or [])
     if model.get("library_name") in NON_TRANSFORMERS_LIBRARIES:
-        return "transformers" not in (model.get("tags") or [])
+        return not transformers
+    if not model.get("library_name") and not transformers:
+        return any(_OWN_MODELING.match((sib or {}).get("rfilename") or "")
+                   for sib in model.get("siblings") or ())
     return False
 
 
@@ -242,6 +275,56 @@ def is_derivative(model):
     tags = model.get("tags") or []
     return (model.get("library_name") == "peft"
             or any(t in tags for t in DERIVATIVE_TAGS))
+
+
+def upstream_classes(text):
+    """The HF architectures a NEWER llama.cpp would map, from its `convert_hf_to_gguf.py`.
+
+    engine#1922: the digest says `!! UNCOVERED` for any class our registry does not carry, but the registry is GENERATED from the
+    pinned sources, so that label alone cannot tell "our pin is behind" from "nobody upstream knows this class either". The first
+    needs a pin bump (the registry regenerates for free); the second needs nothing from us. Both looked identical to every reader,
+    and settling one by hand took two commands against a raw.githubusercontent URL.
+
+    `text` is the converter's source; each `@Model.register("XForCausalLM")` names a class llama.cpp can convert. A class the
+    converter names but the registry lacks is pin-behind; anything else is upstream-only. Pure, so the classification is testable
+    without a network call -- which matters, because the wrong answer here sends a lane to bump a pin for nothing, or to ignore a
+    real gap.
+    """
+    out = set()
+    src = text or ""
+    for m in re.finditer(r"@Model\.register\(", src):
+        # Scan to the matching close paren rather than matching one quoted name: the converter registers SEVERAL classes
+        # per decorator (`@Model.register("AForCausalLM", "B")`), and a regex that takes only the first would label the
+        # second as upstream-only -- the wrong answer in the direction that tells a lane to ignore a real gap.
+        depth, i, end = 0, m.end() - 1, len(src)
+        while i < end:
+            if src[i] == "(":
+                depth += 1
+            elif src[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        for name in re.findall(r'"([A-Za-z0-9_]+)"', src[m.end():i]):
+            out.add(name)
+    return out
+
+
+def classify_uncovered(classes, upstream):
+    """Which uncovered classes a pin bump would fix, and which nobody has (engine#1922).
+
+    `upstream` is a set from upstream_classes(), or None when the fetch failed -- in which case every class is reported as
+    `unknown`, not guessed as either. A digest that cannot tell must say so rather than pick the flattering label.
+    """
+    verdict = {}
+    for cls in classes:
+        if upstream is None:
+            verdict[cls] = "unknown"
+        elif cls in upstream:
+            verdict[cls] = "pin-behind"
+        else:
+            verdict[cls] = "upstream"
+    return verdict
 
 
 def classify(models, archs, sig, previously_seen=()):
@@ -299,7 +382,9 @@ def sweep_newest(limit, seen, tag="text-generation", pages_guard=20, fetch=None)
     """
     fetch = fetch or hf_get_page
     fresh, batch_ids = [], set()
-    url = f"{API}?pipeline_tag={tag}&sort=createdAt&direction=-1&limit=100&config=true"
+    # full=true: the listing then carries each repo's file names (`siblings`), which is how
+    # is_remote_code() sees a repo's own modeling code; config=true alone leaves them out
+    url = f"{API}?pipeline_tag={tag}&sort=createdAt&direction=-1&limit=100&config=true&full=true"
     page = 0
     while url and len(fresh) < limit and page < pages_guard:
         batch, link = fetch(url)
@@ -353,6 +438,22 @@ def remember(state, res):
         for mid in res[group]:
             state["seen"][mid] = group
     return state
+
+
+UPSTREAM_CONVERTER_URL = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py"
+
+
+def get_text(url, tries=3):
+    """The raw body of `url`, or raises. Separate from get_json because the converter is Python source, not JSON."""
+    last = None
+    for _ in range(tries):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=request_headers()), timeout=30) as r:
+                return r.read().decode("utf-8", "replace")
+        except Exception as e:      # noqa: BLE001 - the caller decides; this helper only reports
+            last = e
+            time.sleep(1)
+    raise last
 
 
 def get_json(url, tries=3):
@@ -536,6 +637,46 @@ def reviewed_report_classes():
     return _REVIEWED_CACHE["v"]
 
 
+_ANSWERS_CACHE = {}
+
+
+def flm_answers(path=None):
+    """`registry/flm_answers.json` as {"architectures": {...}, "repos": {...}} (empty when absent)."""
+    path = path or FLM_ANSWERS_PATH
+    if path not in _ANSWERS_CACHE:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            data = {}
+        _ANSWERS_CACHE[path] = {"architectures": data.get("architectures") or {},
+                                "repos": data.get("repos") or {}}
+    return _ANSWERS_CACHE[path]
+
+
+def answer_for(repo, answers=None):
+    """The recorded answer for a repo that would alert, else None (engine#2171).
+
+    Only a gap can be answered: a repo the NPU route serves, or a derivative drop, gets None
+    whatever the file says, so an answer cannot hide a family that starts to load. The repo id
+    is looked up first (a config-less repo has no architecture to key on), then the
+    architecture the repo declares.
+    """
+    if not (npu_gap(repo) or class_unmapped(repo)):
+        return None
+    answers = answers if answers is not None else flm_answers()
+    hit = (answers.get("repos") or {}).get(repo["id"])
+    if hit is None and repo["architecture"]:
+        hit = (answers.get("architectures") or {}).get(repo["architecture"])
+    return hit
+
+
+def answer_note(answer):
+    """The short form printed on the line: the tracking issue, else the doc that records it."""
+    issue = answer.get("issue")
+    return f"answered: engine#{issue}" if issue else f"answered: {answer.get('doc') or 'registry/flm_answers.json'}"
+
+
 def class_unmapped(repo):
     """True when `registry/architectures.json` does not map the repo's architecture class."""
     return not repo["derivative"] and not repo["mapped"]
@@ -652,7 +793,7 @@ def gib(size):
     return f"{size / float(1024 ** 3):.2f} GiB"
 
 
-def flm_line(repo, reviewed=None):
+def flm_line(repo, reviewed=None, answers=None):
     """One repo, one line: files, license, base model, architecture, both mapping answers.
 
     `reviewed` is `reviewed_report_classes()`: a class recorded there as not-an-alias is printed as
@@ -682,8 +823,15 @@ def flm_line(repo, reviewed=None):
         parts.append("derivative drop (no config by design)")
     seen = (reviewed if reviewed is not None else reviewed_report_classes())
     decl = class_unmapped(repo) and repo["architecture"] in seen
-    marker = ("!! NPU FLM" if npu_gap(repo)
-              else (". FLM" if decl else ("!! NEW FLM" if unmapped(repo) else "+ FLM")))
+    answer = answer_for(repo, answers)
+    if answer is not None:
+        parts.append(answer_note(answer))
+    if npu_gap(repo):
+        marker = ". NPU FLM" if answer is not None else "!! NPU FLM"
+    elif decl or (answer is not None and unmapped(repo)):
+        marker = ". FLM"
+    else:
+        marker = "!! NEW FLM" if unmapped(repo) else "+ FLM"
     return f"{marker} {repo['id']}  ({repo['lastModified'][:10]})  " + "  ".join(parts)
 
 
@@ -694,19 +842,22 @@ def release_line(release):
             + f"assets {len(release['assets'])}")
 
 
-def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
-    """Print the FastFlowLM delta and return its exit code (1 on an unserved family)."""
+def report_flm(repos, releases, fresh_repos, fresh_releases, full=False, answers=None):
+    """Print the FastFlowLM delta and return its exit code (1 on an unserved, unanswered family)."""
     shown_repos = repos if full else fresh_repos
     shown_releases = releases if full else fresh_releases
     reviewed = reviewed_report_classes()
+    answers = answers if answers is not None else flm_answers()
+    answered = [repo["id"] for repo in shown_repos if answer_for(repo, answers) is not None]
     unmapped_repos = [repo["id"] for repo in shown_repos
-                      if class_unmapped(repo) and repo["architecture"] not in reviewed]
+                      if class_unmapped(repo) and repo["architecture"] not in reviewed
+                      and repo["id"] not in answered]
     # Split the two reasons in the summary: "map the class" and "give the NPU route this
     # family" are different pieces of work, and a Q4NX pack named for an HRX-only family
     # is the second one.
     gaps = {}
     for repo in shown_repos:
-        if npu_gap(repo):
+        if npu_gap(repo) and repo["id"] not in answered:
             family = repo["registry_gguf"] or repo["registry_class"] or repo["architecture"]
             gaps.setdefault(family, []).append(repo["id"])
     flagged = [r["tag"] for r in shown_releases if r["kernel_format"]]
@@ -714,7 +865,7 @@ def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
           f"{len(releases)} release(s) checked; {len(fresh_repos)} new/changed repo(s), "
           f"{len(fresh_releases)} new release(s)" + ("; full listing" if full else ""))
     for repo in shown_repos:
-        print("  " + flm_line(repo, reviewed))
+        print("  " + flm_line(repo, reviewed, answers))
     for release in shown_releases:
         print("  " + release_line(release))
     if not shown_repos and not shown_releases:
@@ -728,6 +879,9 @@ def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
               f"route does not serve: {detail}")
         print("     mapped for another backend only, so the census counts the family as covered: "
               "the NPU route (or a recorded decision that it will not serve it) is what is missing")
+    if answered:
+        print(f"  -> {len(answered)} pack(s) already answered in registry/flm_answers.json (listed, not "
+              "alerted; the issue on each line tracks the work)")
     if flagged:
         print(f"  -> release(s) {', '.join(flagged)} name the Q4NX container format "
               f"({', '.join(KERNEL_FORMAT_MARKERS)}): read the notes before the pinned "
@@ -735,7 +889,7 @@ def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
     return 1 if (unmapped_repos or gaps) else 0
 
 
-def watch_flm(archs, state, limit=FLM_LIMIT, full=False, fetch=None, detail=None):
+def watch_flm(archs, state, limit=FLM_LIMIT, full=False, fetch=None, detail=None, answers=None):
     """Sweep the org + releases, print the delta, remember it: (exit code, did it run?)"""
     try:
         repos = sweep_org(archs, limit, fetch)
@@ -746,7 +900,7 @@ def watch_flm(archs, state, limit=FLM_LIMIT, full=False, fetch=None, detail=None
     fresh_repos, fresh_releases = flm_deltas(state, repos, releases)
     for repo in (repos if full else fresh_repos):
         fill_sizes(repo, detail)
-    rc = report_flm(repos, releases, fresh_repos, fresh_releases, full)
+    rc = report_flm(repos, releases, fresh_repos, fresh_releases, full, answers)
     remember_flm(state, repos, releases)
     return rc, True
 
@@ -779,7 +933,7 @@ def report(models, res, previously_seen):
         elif cls in quiet:
             owners = len({i.split("/")[0] for i in ids})
             print(f"  . REMOTE-CODE {cls}: {len(ids)} model(s) from {owners} uploader(s), e.g. {ids[0]}")
-            print(f"     -> custom modeling code (auto_map, or a non-Transformers runtime); "
+            print(f"     -> custom modeling code (auto_map, a non-Transformers runtime, or the repo's own modeling_*.py); "
                   f"alerts once {REMOTE_CODE_SPREAD} uploaders use it")
         elif cls in res["significant"]:
             print(f"  !! UNCOVERED {cls} (reviewed, not an alias — docs/arch-gaps.md): "
@@ -788,8 +942,28 @@ def report(models, res, previously_seen):
                   f"accepting it, record why in registry/significant.json ('mapped_ok')")
         else:
             print(f"  !! UNCOVERED {cls} (new class): {len(ids)} model(s), e.g. {ids[0]}")
+            # engine#1922: the registry is GENERATED from the pinned sources, so "not in the registry" cannot by itself
+            # say whether a pin bump would fix this or whether nobody upstream has it. Say which, when it is knowable.
+            verdict = res.get("upstream_verdict", {}).get(cls, "unknown")
+            if verdict == "pin-behind":
+                print(f"     -> UPSTREAM HAS IT: llama.cpp's converter registers this class, our pin does not -- "
+                      f"a pin bump regenerates the registry")
+            elif verdict == "upstream":
+                print(f"     -> UPSTREAM DOES NOT HAVE IT: no llama.cpp converter maps this class, so there is nothing "
+                      f"to map here until one does")
+            else:
+                print(f"     -> could not tell whether upstream has it (converter unavailable); check before mapping")
             print(f"     -> map it in registry/architectures.json (a pinned backend's code "
                   f"must accept the architecture)")
+    # engine#1922: ask upstream ONCE whether it knows the uncovered classes, and only when there is something to ask about.
+    # A failed fetch is recorded as None so the report says "could not tell" rather than guessing either way.
+    if res["classes"]:
+        upstream = None
+        try:
+            upstream = upstream_classes(get_text(UPSTREAM_CONVERTER_URL))
+        except Exception:
+            upstream = None
+        res["upstream_verdict"] = classify_uncovered(res["classes"], upstream)
     # say whether a token was already sent: "gated repos need a token" is misleading advice on a
     # run that sent one and still got no config back
     hint = " (HF_TOKEN sent, still no config)" if hf_token() else ""
@@ -810,15 +984,34 @@ def sweep_support(pins, fetch=None):
     fetch = fetch or get_json
     heads = {}
     for repo, entry in sorted((pins.get("repos") or {}).items()):
+        entry = entry or {}
         commit = (fetch(GH_REPO_HEAD.format(repo=repo)) or [{}])[0] or {}
         sha = commit.get("sha") or ""
+        pinned = entry.get("commit") or ""
+        paths = list(entry.get("paths") or ())
+        moved_paths, dead_paths = [], []
+        if paths and sha:
+            for path in paths:
+                at_pin = (fetch(GH_PATH_HEAD.format(repo=repo, sha=pinned, path=path)) or [{}])[0] or {}
+                if not at_pin.get("sha"):
+                    # no commit at the pin touches it (a typo, or renamed before the pin): it could never move
+                    dead_paths.append(path)
+                    continue
+                if sha == pinned:
+                    continue
+                at_head = (fetch(GH_PATH_HEAD.format(repo=repo, sha=sha, path=path)) or [{}])[0] or {}
+                if at_pin["sha"] != (at_head.get("sha") or ""):
+                    moved_paths.append(path)
         heads[repo] = {
             "repo": repo,
             "commit": sha,
             "date": ((commit.get("commit") or {}).get("committer") or {}).get("date") or "",
-            "pinned": (entry or {}).get("commit") or "",
-            "reviewed": (entry or {}).get("reviewed") or "",
-            "moved": sha != ((entry or {}).get("commit") or ""),
+            "pinned": pinned,
+            "reviewed": entry.get("reviewed") or "",
+            "paths": paths,
+            "moved_paths": moved_paths,
+            "dead_paths": dead_paths,
+            "moved": (bool(moved_paths or dead_paths) if paths else sha != pinned),
         }
     sources = pins.get("d3_sources") or {}
     org, prefix = sources.get("org") or "", sources.get("prefix") or ""
@@ -838,7 +1031,14 @@ def report_support(heads, new_d3, org="", prefix=""):
     for h in sorted(heads.values(), key=lambda x: x["repo"]):
         if h["moved"]:
             print(f"  !! SUPPORT MOVED {h['repo']}  head {h['commit'][:12]} ({h['date'][:10]})  "
-                  f"pinned {h['pinned'][:12]} reviewed {h['reviewed']}")
+                  f"pinned {h['pinned'][:12]} reviewed {h['reviewed']}"
+                  + (f"  watched paths changed: {', '.join(h['moved_paths'])}" if h.get("moved_paths") else "")
+                  + (f"  watched paths with no commit at the pin (fix `paths`): {', '.join(h['dead_paths'])}"
+                     if h.get("dead_paths") else ""))
+        elif h.get("paths") and h["commit"] != h["pinned"]:
+            print(f"  + SUPPORT PIN {h['repo']}  head {h['commit'][:12]} ({h['date'][:10]})  pinned "
+                  f"{h['pinned'][:12]} reviewed {h['reviewed']}: no commit since the pin touches the "
+                  f"{len(h['paths'])} watched path(s)")
         else:
             print(f"  + SUPPORT PIN {h['repo']}  {h['commit'][:12]} ({h['date'][:10]}) reviewed {h['reviewed']}")
     if moved:

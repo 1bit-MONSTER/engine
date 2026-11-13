@@ -210,6 +210,34 @@ def decode_dirs(model_dir: str, kernels: str) -> list[dict]:
     return dirs
 
 
+
+def narrow_fields(cfg, layout):
+    """decode.narrow_elf / decode.narrow_rows when the container's config names a narrow family (engine#2073).
+
+    Written only when the pack has one, so every other pack's plan is byte-for-byte what it was.
+    """
+    if layout not in ("pb16i", "t2s"):
+        return {}
+    narrow = cfg.get("q4nx_t2s_sealed_narrow_elf" if layout == "t2s" else "q4nx_pb16i_sealed_narrow_elf", "")
+    if not narrow:
+        return {}
+    return {"narrow_elf": narrow, "narrow_rows": int(cfg.get("q4nx_sealed_narrow_rows", 4))}
+
+
+def prefill_block(cfg, layout):
+    """prefill.M, plus the wide sealed family when the container's config names one (engine#1990).
+
+    The two extra fields are written only when the pack has a wide family, so the plan of every pack
+    without one is byte-for-byte what it was.  Like decode.sealed_elf, each layout reads its own key.
+    """
+    block = {"M": 128}
+    if layout in ("pb16i", "t2s"):
+        wide = cfg.get("q4nx_t2s_sealed_wide_elf" if layout == "t2s" else "q4nx_pb16i_sealed_wide_elf", "")
+        if wide:
+            block["sealed_elf"] = wide
+            block["sealed_rows"] = int(cfg.get("q4nx_sealed_wide_rows", 32))
+    return block
+
 def tile_order_claim(model_dir: str) -> tuple[str, str]:
     """(the tile_order this plan may declare, a note to print) from the directory's repack stamp.
 
@@ -313,7 +341,7 @@ def generate(model_dir: str, kernels: str) -> dict:
             "pb16i": layout in ("pb16i", "t2s"),
         },
         "fusion": {"gate_up": "fused" if fused_gu else "split"},
-        "prefill": {"M": 128},
+        "prefill": prefill_block(cfg, layout),
         "decode": {
             "M": 16,
             "enabled": True,
@@ -322,8 +350,12 @@ def generate(model_dir: str, kernels: str) -> dict:
             # layout never borrows the other's image format).  A t2s decode family shipped as
             # per-role ELFs pays a hw_context switch on every launch -- measured 2026-11-02 at
             # +2.0-2.3 ms, more than the kernels themselves.
-            "sealed_elf": cfg.get("q4nx_t2s_sealed_elf" if layout == "t2s" else "q4nx_pb16i_sealed_elf", "")
-            if layout in ("pb16i", "t2s") else "",
+            # A b8 container's sealed int8 ELF has its own key too (engine#2208): an int8 ELF reads b8 tiles,
+            # not pb16i or t2s images.
+            "sealed_elf": cfg.get({"t2s": "q4nx_t2s_sealed_elf", "pb16i": "q4nx_pb16i_sealed_elf",
+                                   "b8": "q4nx_b8_sealed_elf"}[layout], "")
+            if layout in ("pb16i", "t2s", "b8") else "",
+            **narrow_fields(cfg, layout),
         },
         "kernels": {"tag": tag},
         "attention": {"mode": attention_mode(model_dir)},

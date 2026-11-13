@@ -124,6 +124,22 @@ inline nlohmann::json systemone_question_error(const std::string& kind, const st
                           {"message", message}};
 }
 
+// What a text route answers on a pack that cannot generate text.  A decision pack that declares
+// `attention_mode: noncausal_full_attention` encodes a whole prompt in one pass and reads an answer off the last
+// position; there is no token-by-token decode to run, so `/v1/chat/completions` and `/v1/completions` can never
+// succeed on it.  They used to try, and failed inside the forward with HTTP 500 and the forward's own wording
+// ("forward step failed: attention.mode noncausal_full_attention encodes a prompt in one batched pass, but this
+// call starts at position 23 ..."; measured on FastFlowLM's D3-Nano-NPU2, engine#1786).  That is the client's
+// request against the wrong route, so it is a 400 that names the right one.  `has_head` says whether the decision
+// route is actually up on this serve, because pointing a client at a route that answers 503 is no help.
+inline nlohmann::json decision_only_refusal(const std::string& model, bool has_head) {
+    const std::string where = has_head ? "send decisions to POST /v1/systemone"
+                                       : "and this serve has no decision head loaded, so it has no route for it";
+    return {{"error",
+             {{"message", model + " is a decision model (non-causal attention): it does not generate text; " + where},
+              {"type", "decision_model_error"}}}};
+}
+
 inline std::string systemone_length_message(size_t tokens, size_t limit) {
     return "the question prompt has " + std::to_string(tokens) + " tokens, over the maximum context length of " +
            std::to_string(limit) + " tokens; nothing was truncated";

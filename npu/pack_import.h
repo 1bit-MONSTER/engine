@@ -35,6 +35,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstring>
+#include <memory>
 #include <cstdint>
 #include <string>
 
@@ -86,16 +88,115 @@ struct Dims {
 // REFUSAL (importing without the gains is the silent-garbage path), found-and-not-declared is allowed only with the
 // measurement behind it (Qwen3 packs ship the sections without the key), and neither is the ordinary case. Exposed
 // so the three can be pinned without a 4 GB pack.
+// The gap is `[64 B zeros][q_norm bf16 [head_dim]][64 B zeros][k_norm bf16 [head_dim]]`: q first (engine#1934, measured
+// against the q_norm/k_norm initializers in Hunyuan-7B's own model.onnx).
 struct QkGainOffsets {
     int64_t k_norm = 0, q_norm = 0;  // 0,0 = the gap is not the gains' shape
 };
 QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes);
 std::string qk_norm_refusal(bool declared, bool found);
 
+// The one-header attention section of a pack whose q_proj is WIDER than hidden (Hunyuan-0.5B: hidden 1024, 16 heads x
+// head_dim 128, so q_out = 2048): [q,k,v tiles at K=hidden][gap][o_proj tiles at K=q_out]. `payload` is the bytes from
+// `attn_off` to the block's header. `ok` is false when the remainder is not a norms-sized gap (negative, or larger than
+// two gains plus 256 B), which is a layout this reader has not measured. When the gap has the gains' shape
+// (qk_gain_offsets()), `q_norm`/`k_norm` are their offsets; otherwise both are 0 and the section is still read
+// (engine#1889: this branch placed o_proj and never named the gains, so a pack that declares use_qk_norm was refused
+// with "gains are not where the block layout says" although they sit in the gap it had just computed).
+struct WideQAttnSection {
+    bool ok = false;
+    int64_t gap = 0, o_off = 0, q_norm = 0, k_norm = 0;
+};
+// Why one block's gap is NOT `[64 B zeros][bf16 [head_dim] gain][64 B zeros][bf16 [head_dim] gain]`, or "" when it is.
+// `gap` points at 2 * (64 + head_dim*2) bytes. The offsets come from the block arithmetic, which is the same number
+// for every layer; this is the per-layer witness that the bytes there are gains: both headers all zero, and each gain
+// finite and not all zero. A gain window displaced by a section (320 B at head_dim 128) lands on a header or on tile
+// bytes and fails one of these. The import refuses the layer by name on a non-empty answer (review of engine#2063).
+std::string qk_gap_block_why(const uint8_t* gap, int64_t head_dim);
+WideQAttnSection wide_q_attn_section(int64_t attn_off, int64_t payload, int64_t qkv_tiles, int64_t tile_bytes,
+                                     int64_t o_tiles, int64_t o_tile_bytes, int64_t head_dim);
+
+// How many rows a head read from the .fconst tail occupies in the container. The pack stores the head in whole 64-row
+// tiles, so a vocabulary that is not a multiple of 64 is carried with the pack's own padding rows (Hunyuan: 120,818 ->
+// 120,832) while `vocab_size` and the plan's tensor shape stay the vocabulary. A head that is a graph initializer is
+// stored as it is: on main nothing pads it, and one whose row count is not a multiple of 32 is refused by the tile
+// writer ("q4_1 tiles need N % 32 == 0"). If graph-head padding lands (engine#1992 was closed unmerged), its quantum
+// belongs here. This is the number a container's lm_head tile count follows from.
+int64_t head_stored_rows(int64_t vocab, bool from_fconst_tail);
+
+// Why a pack's two layout witnesses cannot be reconciled, or "" when they can (engine#1985).
+//
+// `vote_hdrs` is the number of in-block headers the epsilon-anchor vote recorded (0 when it could not win); `declared_qk`
+// is config.json's `use_qk_norm`. A pack that states per-head q/k gains keeps them in the two sections between q/k/v and
+// o_proj, which a 2-header block does not have -- so a ONE-header vote on such a pack is self-contradictory, and engine#1985
+// is what trusting it costs: `Qwen3-1.7B` read as a 2-header block, `qk_norm` flipped true -> false, and every attention
+// projection was refused (280 gaps) where yesterday's main imported the same pack with 0.
+//
+// Neither witness wins: the vote measured where anchors repeat, and the declaration states what the block must contain.
+// The reader refuses and names both, because picking either one silently is the defect. Exposed so the three cases can be
+// pinned without a 2.6 GB pack.
+std::string header_witness_refusal(int vote_hdrs, bool declared_qk);
+
+// The first tile of k_proj, q_proj and v_proj inside the attention payload, for n_kv k/v tiles and n_q q tiles
+// (64 rows each). `q_first` false is k, q, v; true is q, k, v (engine#1889, the Hunyuan block). v is last either way.
+// Split out so the order is pinned by a test instead of living in an initializer list.
+struct AttnFirstTiles {
+    int k = 0, q = 0, v = 0;
+};
+AttnFirstTiles attn_first_tiles(int n_kv, int n_q, bool q_first);
+
 // A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
 // GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
 // reason. Exposed so the dequantisation can be tested against known codes and scales instead of only on a 3 GB pack.
 std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why);
+
+// The per-layer half of a multi-component pack's embedding (engine#1725). gemma-4 components carry, beside the token
+// table, `embed_tokens_per_layer.weight` (262144 x 8960 on e2b = layers x head_dim) and a 256-wide projection norm;
+// the decoder consumes them as `per_layer_inputs`, so a container without them gives the decoder less than it asks for.
+// Read separately from the token table because they have different shapes and different consumers: the token table
+// becomes the head oracle, this becomes an input. Empty (with `why`) when the component has no per-layer table.
+struct EmbedPerLayer {
+    // [V][layers*P] f32, row-major (embed_tokens_per_layer.weight) -- NOT copied. It is 9.4 GiB on gemma-4-e2b, so the
+    // reader hands out a pointer into the component's mapped external data and the importer converts it a band at a
+    // time. `keep` owns whatever that pointer lives in (the mapping, or a copy of an inline initializer) and unmaps it
+    // when the last copy of this struct goes.
+    const uint8_t* table_f32 = nullptr;
+    std::shared_ptr<const void> keep;
+    std::vector<float> norm;    // [P]                       (per_layer_projection_norm.weight, shared by every layer)
+    // The CONTEXT projection: the component carries it quantised as
+    // `per_layer_model_projection.weight_t_Q4` [layers*P][H] plus scales and packed zero points. The loader wants it
+    // dequantised, one [P][H] matrix per layer (`model.per_layer_model_proj.weight_layer{l}`), so it is dequantised here
+    // -- without it the per-layer input is `16*table/sqrt(2)`, plausible and wrong at every layer (engine#1725).
+    std::vector<float> model_proj;   // [layers][P][H]
+    int64_t          V = 0, width = 0, P = 0, H = 0, NL = 0;
+    // `ok()` is what the reader guarantees: the table (bounds-checked against its data) and the projection norm.
+    // `complete()` additionally requires the context projection, which the PLE contract needs -- a component with
+    // `ok()` but not `complete()` imports the table and will be refused by the loader on
+    // `per_layer_model_proj.weight_layer0`, which is the honest place to refuse (the importer does not know whether the
+    // decoder declares per_layer_inputs).
+    bool ok() const {
+        return V > 0 && width > 0 && table_f32 != nullptr && (!norm.empty() ? norm.size() == size_t(P) : true);
+    }
+    bool complete() const { return ok() && P > 0 && H > 0 && NL > 0 && model_proj.size() == size_t(NL) * size_t(P) * size_t(H); }
+    // one value of the table, for tests and spot checks
+    float at(int64_t row, int64_t col) const {
+        float f;
+        std::memcpy(&f, table_f32 + (size_t(row) * size_t(width) + size_t(col)) * 4, 4);
+        return f;
+    }
+};
+// `hidden` is the decoder's hidden size (the context projection's K); it comes from the pack's geometry, not from
+// the component, which is why the caller passes it. Parses the component graph and maps its external data ONCE; the
+// table's bytes are not read.
+EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, int64_t hidden, std::string* why);
+
+// One band of the per-layer token table as BF16 (round to nearest even, the same `f32_to_bf16` every other tensor
+// gets), straight from the mapping `meta` holds: no graph parse, no file open, nothing allocated. The importer
+// streams the whole table through this in 32-row bands (573 KB at a time on gemma-4-e2b) while the container is
+// written, so the table is never held -- not as f32, not as BF16 (engine#1725).
+// Returns the rows written, or -1 with `why` set. `out` must hold `rows * width * 2` bytes.
+int64_t read_per_layer_table_band(const EmbedPerLayer& meta, int64_t first_row, int64_t rows, uint8_t* out,
+                                  std::string* why);
 
 // One tensor the pack describes, and where its values would come from.
 struct Planned {
@@ -118,6 +219,12 @@ struct Plan {
     // .fconst tile geometry assumes. Non-zero means the tail's head tiles cannot be walked (engine#1503): a tied pack
     // takes the head from its embedding instead, an untied one is refused by name.
     int64_t head_block = 0;
+    // engine#1503: every MatMulNBits the pack declares is block 32 and at least one of them is a layer projection, and
+    // the pack has a Token .fconst. Such a pack is read with the all-block-32 layout (Block32Layout below) from the
+    // raw .fconst; the block-128 walk and the canonical copy are not used. `block32_note` is why that file does not
+    // fit the layout (empty when it does), and is the refusal every .fconst tensor of the plan then carries.
+    bool block32_layers = false;
+    std::string block32_note;
     std::string pack;  // *_rai_1.8.0_npu_4K, from the directory name
     Dims dims;
     std::vector<Planned> tensors;
@@ -138,11 +245,44 @@ struct Plan {
     // none. Identified and verified byte-exact against the public Qwen3-1.7B/4B checkpoints (0 of 128
     // values differ on either pack, and the swap differs on 127-128 of 128).
     int64_t knorm_off = 0, qnorm_off = 0;
+    // Where the 2-header families' gap `[64 B zeros][q_norm][64 B zeros][k_norm]` starts in the block, 0 when the gains
+    // are not in that form. The import checks the form in EVERY layer (qk_gap_block_why()) before it writes a gain.
+    int64_t qk_gap_off = 0;
+    // The order of the three projections in the block's first payload. Every family measured before Hunyuan writes
+    // k, q, v (identified on Qwen2.5-0.5B by the tiles' bias subvolumes). The Hunyuan block -- q/k/v at K=hidden, the
+    // packed per-head gains, o_proj -- writes q, k, v (engine#1889): with k,q,v the container's k_proj was q_proj's
+    // first rows, and the model answered filler words; with q,k,v it answers. See attn_first_tiles().
+    bool attn_q_first = false;
     int64_t mlp_off = 0;  // the MLP section starts just past the block's post-attention norm
     // What the pack's *graph* carries, reported so `npu-pack info` can answer a pack's genre without a
     // third-party parser: the rai_1.3/1.6/1.7.1 line ships its 4-bit weights as ordinary ONNX initializers, while
     // 1.8 and R1-Distill ship placeholders and keep the weights in model.bin (pi-inferzo, 2026-11-08).
     // graph_matmuls < 0 means "no graph was read", which is why it is not just a count.
+    // engine#1786 (item F1): a FastFlowLM NPU2 model source is a safetensors container (`model.q4nx`) with no graph,
+    // so the two census fields above stay -1. `container_tensors` is -1 for every pack that is not that genre; when it
+    // is not, it is the container's tensor count and the dtype map says what the reader found. Reported rather than
+    // refused at the first byte, because "cannot open model.onnx" says nothing about a pack that has no graph by design.
+    int64_t container_tensors = -1;
+    int64_t container_payload_bytes = 0;
+    std::map<std::string, int64_t> container_dtypes;
+    std::string container_note;   // what the container genre still needs, empty for a non-container pack
+    // engine#1788, slice 3c: the (role, layer type) key, when the pack declares layer_types. -1 when it does not.
+    int64_t container_role_layer_rows = -1;
+    int64_t container_role_layer_spans = -1;
+    int64_t container_role_layer_out_of_range = 0;
+    std::vector<std::string> container_role_layer_span_names;   // the pairs a third key would need, named
+    // engine#1786 (item F1), slice 2: WHERE the container's geometry came from, and what it could not reach.
+    // A bare number in `dims` cannot say whether the pack declared it or a file beside it did, and those two are free to
+    // disagree (13 of the 29 packs measured carry a `dims` block; all 29 carry config.json). Empty for a non-container pack.
+    std::string container_geometry_source;          // "dims", "config.json", or empty when neither answered
+    std::vector<std::string> container_geometry_missing;   // fields no source could fill, by name
+    std::vector<std::string> container_geometry_inferred;  // fields derived from another field, by name
+    // engine#1786 (item F1), slice 3b: what the pack's names say it carries, and what nothing recognised. `unassigned`
+    // is the list that matters -- it means "nothing knows this tensor", so an empty one is the statement that the role
+    // map covers the pack. The SSM and MTP families are recognised (roles `ssm` / `mtp`), so a hybrid pack and a draft
+    // head do not masquerade as unknown tensors.
+    std::map<std::string, int> container_role_counts;
+    std::vector<std::string> container_roles_unassigned;
     int64_t graph_matmuls = -1;      // MatMulNBits nodes in the main graph
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)
@@ -153,6 +293,11 @@ struct Plan {
     int64_t graph_ryzenai_matmuls = 0;
     int64_t graph_packed_siblings = 0;
     int64_t graph_weightless_matmuls = 0;   // dropped: placeholder + packed sibling both byte-less (engine#1671)
+    // Of those, the ones outside the decode `If` branch: what plan() refuses on. The total above stays for `info`.
+    int64_t graph_weightless_matmuls_decode = 0;
+    // The `If` branch taken when input_ids has length 1, and how that was decided (read from the condition, or assumed).
+    std::string graph_decode_branch;
+    std::string graph_branch_note;
     // How many of the graph's 4-bit block-128 weights satisfy length == N x (K/128 + 1) x 68 (the per-row stride the
     // .fconst tile also carries): a measurement, so `info` can say "201 of 201" or "3 of 7" instead of guessing.
     int64_t graph_stride_ok = 0, graph_stride_of = 0;
@@ -186,8 +331,157 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden);
 // multi-component one (`type: compositemodel`), whose geometry files stay at the root. Exported for the unit test.
 std::string find_token_fconst_exported(const std::string& pack_dir);
 
+// A FastFlowLM NPU2 model source (engine#1786, item F1) is a safetensors container named `model.q4nx`: an 8-byte
+// little-endian header length, that many bytes of JSON mapping tensor name -> {dtype, shape, data_offsets}, then the
+// payload. There is no graph and no `model.onnx`, which is why the importer above refuses such a pack before reading a
+// byte of it. The tensor NAMES are the model's own HF names, so this reader is also the work list: what it reports is
+// what a container-genre plan has to map.
+//
+// Header only: no weights are read, no device is opened. Exported because it is the half that can be wrong silently
+// (an off-by-one header length reports an empty inventory and looks like "a pack with no tensors").
+struct Q4nxTensor {
+    std::string name;
+    std::string dtype;
+    std::vector<int64_t> shape;
+    int64_t begin = 0;      // data_offsets[0]
+    int64_t end = 0;        // data_offsets[1]
+};
+struct Q4nxContainer {
+    int64_t header_bytes = 0;
+    int64_t payload_bytes = 0;
+    std::vector<Q4nxTensor> tensors;   // in header order
+    // The safetensors `__metadata__` object, kept because it is where this genre states its own geometry (engine#1786).
+    // Three quarters of the packs measured on this box carry a `dims` block with hidden/intermediate/layers/heads/vocab;
+    // two carry no metadata at all (`d3-edge`, `d3-flash`), which is why the reader keeps it as data and does not
+    // interpret it here.
+    nlohmann::json meta;
+    std::string why;                        // non-empty when the container could not be read; tensors is then empty
+};
+Q4nxContainer read_q4nx_container(const std::string& path);
+
+// engine#1786 (item F1): the container genre's geometry, from the two places a pack can state it, in order of
+// authority -- the container's own `dims` block, then config.json. `source` names which one answered, so a plan can
+// never present a declared number and a file's number as the same kind of fact; `missing` names the fields neither
+// could fill, and `inferred` the ones derived from other fields (head_dim from hidden/heads).
+//
+// Pure: no file is opened, so the three genres the census measured -- 13 self-describing, 14 gguf-converted, 2 with
+// no metadata at all -- can all be pinned without a pack, which is the point of extracting it from `plan()`.
+struct ContainerGeometry {
+    Dims dims;
+    std::string source;                 // "dims", "config.json", or empty when neither answered
+    std::vector<std::string> missing;   // fields no source could fill, by name
+    std::vector<std::string> inferred;  // fields derived from another field, by name
+};
+ContainerGeometry container_geometry(const nlohmann::json& meta, const nlohmann::json& config);
+
+// engine#1786 (item F1), slice 3a: a container's ROLES, from tensor names alone -- the question a plan must answer
+// before it can map a tensor to a projection.
+//
+// Measured on this box (engine#1786 comment of 2026-11-11, headers only, 30 packs): **21 of 30 classify fully by name
+// alone**, and the entire residue is two families -- `model.layers.N.linear_attn.ssm_*` (the SSM-hybrid attention) and
+// `model.mtp.*` (MTP draft heads, which are not models). Both HF and the alternate spellings resolve (`q_proj` and
+// `attn_q`/`wq`), and so do the biases. So the rule below is a RULE, not a per-pack table -- which is why it is worth
+// having before the SSM forward exists.
+//
+// What a role does NOT establish: the byte layout of the tensor, or whether it is stored transposed. A name says which
+// projection; `graph_weights` (present on 13 of the packs) and the pack's own `dims` are what check the rest.
+struct ContainerRoles {
+    std::map<std::string, std::string> role_of;   // tensor name -> role
+    std::vector<std::string> unassigned;          // names no role matched, in header order
+    std::map<std::string, int> counts;            // role -> number of tensors
+};
+ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors);
+
+// engine#1788, slice 3c, the writer's destination side. A role says WHAT a tensor is; the engine reads weights by SLOT
+// name (the string literals in npu/forward/src), so an import needs role -> slot. Only the roles whose destination does
+// not depend on the LAYER TYPE are placed here. The rest are named in `no_slot` with a reason instead of guessed:
+// a wrong slot does not fail loudly, it loads a tensor into a field the engine reads with another shape, and the
+// symptom is a wrong number rather than an error.
+struct RoleSlotReport {
+    std::map<std::string, std::string> slot_of;   // role -> engine slot; absent when this slice does not place it
+    std::vector<std::string> placed;              // placed roles, sorted
+    std::vector<std::string> no_slot;             // deliberately unplaced roles, sorted
+    std::map<std::string, std::string> why;       // role -> why it is not placed here
+};
+RoleSlotReport container_role_slots(const ContainerRoles& roles);
+
+// engine#1788, slice 3c: the one role whose destination the LAYER TYPE decides, and the reason it decides it. The engine
+// carries `linear_attn.qkv_proj.weight` and has NO `self_attn.qkv_proj` slot at all (grep the literals in npu/forward/src),
+// so the fused qkv has a destination on a linear layer and nowhere else. Empty string = no destination; the caller must
+// not treat that as "unchanged", which is why this returns a string and the report above returns the reasons.
+std::string container_role_slot(const std::string& role, const std::string& layer_type);
+
+// engine#1788, 3c: the last pure step before bytes are written -- where each tensor's bytes go and which bytes they are.
+// Separated from the I/O so it can be tested without a filesystem, and so a caller can refuse a container BEFORE writing
+// anything into an output directory. `layer_types` comes from config.json beside the container (NOT from its safetensors
+// metadata: that is where the measured ones live, and reading meta instead silently refused every layer-typed role).
+struct ImportItem {
+    std::string slot;      // the engine slot the bytes are written to (layer-qualified)
+    std::string source;    // the container tensor they come from
+    int64_t begin = 0;     // data_offsets[0] within the payload
+    int64_t end = 0;
+    std::vector<int64_t> shape;
+    std::string dtype;
+};
+struct ImportPlan {
+    std::vector<ImportItem> items;        // placed tensors only; an empty slot is never written
+    std::vector<std::string> unplaced;    // "<role>: <tensor>" -- a refusal, not a silent skip
+    int64_t bytes = 0;                    // payload bytes the items carry
+    int64_t payload_bytes = 0;            // what the container says it has, so a writer can prove coverage
+};
+ImportPlan container_import_plan(const Q4nxContainer& container, const std::vector<std::string>& layer_types);
+
+// engine#1788, slice 3c: the writer's per-TENSOR decision, which is what an import actually iterates. Reads the tensor's
+// own layer, takes that layer's declared type, and asks the table above for a destination. A tensor with no role and a
+// tensor with a role but no destination are counted apart, because the first is a vocabulary gap and the second is a
+// decision that was made on purpose.
+struct PlacementRow {
+    std::string tensor;
+    std::string layer;        // "" when the tensor belongs to no layer (embed, final_norm, lm_head)
+    std::string layer_type;   // "" for the same reason
+    std::string role;
+    std::string slot;         // "" when there is no destination
+    std::string why;          // the reason, when slot is empty
+    std::vector<int64_t> shape;   // carried so a placement can be checked against the shape the engine documents
+    std::string dtype;
+};
+struct PlacementReport {
+    std::vector<PlacementRow> rows;
+    std::map<std::string, int64_t> slot_counts;
+    int64_t placed = 0, unplaced = 0, no_role = 0;
+};
+PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
+                                    const std::vector<std::string>& layer_types);
+
+// engine#1788, slice 3c: a container's roles need a SECOND key, and the second key is the layer type.
+// Measured: gemma4-e2b's `q_proj` is N=384 on all 28 `sliding_attention` layers and N=768 on all 7 `full_attention` ones;
+// bolt-e4b's is (640,5120) on all 35 sliding and (1280,5120) on all 7 full. A perfect partition, structural in origin
+// (5 heads against 10 at head_dim 128). A writer keyed on role alone cannot express these packs; (role, layer type) can.
+// A pair that spans TWO shapes is reported in `spans` rather than resolved -- that would need a third key, not a guess.
+struct RoleLayerRow {
+    std::string stem;       // the tensor's name with the layer index elided: `model.layers.N.mlp.gate_proj.weight`
+    std::string role;       // that tensor's role, for a reader
+    std::string layer_type;
+    std::string shape;      // "[a,b,c] I8"
+    int64_t count = 0;
+};
+struct RoleLayerReport {
+    std::vector<RoleLayerRow> rows;      // the writer's key, one row per (role, layer type)
+    std::vector<std::string> spans;      // "<role> in <type> appears in N shapes" -- needs a third key
+    std::vector<std::string> no_layer;   // roles with no tensor inside a layer (an embedding, a head, a rope table)
+    int64_t out_of_range = 0;            // tensors whose layer index is outside layer_types
+};
+RoleLayerReport container_role_layer_types(const std::vector<Q4nxTensor>& tensors,
+                                           const std::vector<std::string>& layer_types);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
+// engine#1889 (review of #2063): plan()'s wide-q branch (q_out != hidden), as one function so its effect on the plan is
+// testable without a fabricated 1.9 pack. When the section was read (`wq.ok`) and q is wider than hidden, it places the
+// q/k/v run, o_proj and the gains, and sets attn_q_first when the gap held the gains: that block is the Hunyuan writer's,
+// whose first payload is q, k, v (read as k, q, v, the container's k_proj was q_proj's first rows, correlation 0.01).
+// Returns false and leaves `p` untouched otherwise.
+bool apply_wide_q_section(Plan& p, const WideQAttnSection& wq, int64_t n_kv, int64_t n_q, int q_out, int64_t hidden);
 Plan plan(const std::string& pack_dir);
 
 // Whether the canonical Token .fconst already on the scratch path holds exactly the bytes this run would write,
@@ -195,6 +489,16 @@ Plan plan(const std::string& pack_dir);
 // out of canonical_token_fconst() so the decision has a test that needs no 1.9 pack: a truncated copy, a missing file
 // and a directory on the scratch path must all come back false.
 bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
+
+// engine#1985: how the canonical copy reaches `work`. It is written under canonical_copy_temp_name(work) -- a private name
+// in the same directory -- and renamed into place, so a concurrent import of the same pack finds no copy or a complete one,
+// never one that is being written. Writing in place let a second import truncate the file the first was about to read.
+// Throws std::runtime_error when the copy cannot be written or moved; the temporary file is removed on either failure.
+// Exposed so the rule has an arm that needs no pack (threads writing one path while a reader checks every complete-length
+// file it finds), and so the temporary name's two properties are pinned: a pack's sweep prefix never matches it, and the
+// age rule does.
+std::string canonical_copy_temp_name(const std::string& work);
+void write_canonical_copy(const std::string& work, const uint8_t* data, size_t len);
 
 // Removes the canonical Token .fconst copies in `dir` that nothing will reuse (engine#1770). Reuse writes a new copy when the
 // source changes rather than overwriting, so without this the scratch directory grows one multi-hundred-MB file per change; on
@@ -210,6 +514,14 @@ bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
 void evict_stale_canonical_copies(const std::string& dir, const std::string& keep_name, const std::string& prefix,
                                   const std::string& legacy_name  = std::string(),
                                   int64_t            max_age_seconds = 0);
+
+// engine#1907: apply evict_stale_canonical_copies() to EVERY scratch candidate, not only the one being written. Since #1801 the
+// write lands in the on-disk cache, so a sweep of that directory alone never reached /tmp again, and the copies older binaries
+// had left in tmpfs (17.0 GiB of RAM, measured 2026-11-10) stayed until reboot. `written_dir` is swept even if it is not yet a
+// directory as seen here; every other entry is swept only when it already exists, and is never created.
+void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::string& written_dir,
+                               const std::string& keep_name, const std::string& prefix, const std::string& legacy_name,
+                               int64_t max_age_seconds);
 
 // The text artifacts a runnable container needs beside model.q4nx, and which of them the pack
 // actually carries. A pack fetched weight by weight can be weights-only (engine#1024; AMD's repos
@@ -275,6 +587,10 @@ std::string weight_layout_refusal(const std::string& want);
 // broken container, so it is refused here, by name, before anything is written.
 std::string kernel_set_refusal(const std::vector<std::string>& file_names, const std::string& layout);
 
+// The tied-head fit (engine#1503); what each field means is stated at fit_head() below.
+struct HeadFit {
+    double rel = 0, scale = 1, rms_ratio = 1, floor = 0;
+};
 struct Report {
     std::string out_dir;
     int tensors = 0;
@@ -291,7 +607,14 @@ struct Report {
     // check; an untied pack's head and embedding are separate matrices by construction, and the same number is
     // meaningless -- reported as such rather than left looking like a failed import.
     bool selfcheck_tied = false;
+    // engine#1503: tied, correlated -- but MIS-SCALED. Correlation alone passes a head that is a scaled copy of the
+    // embedding: two packs measured on this box report corr 0.9915/0.9961 with rel_err 0.095/0.136 and serve garbage
+    // ("myself" forever), while the pack that serves correctly reports rel_err 0.000000. A pack in this state imports
+    // cleanly and answers nonsense, so it is refused rather than reported.
+    bool selfcheck_scaled = false;
     double lmhead_corr = 0, lmhead_rel = 0, ctrl_corr_nibble = 0, ctrl_corr_nozp = 0;
+    HeadFit head_fit;   // engine#1503: scale, rms ratio and the 4-bit noise floor beside lmhead_rel
+    std::string model_type;   // the pack's, so the CLI can refuse a known-bad architecture by name
     // The tail (.fconst) path has no MatMulNBits bytes to mis-decode, so its control is an ALIGNMENT one: the same
     // tiles, the same decoder, rows matched against the neighbouring embedding row. A correct decode correlates ~1
     // with the embedding; if a row-misaligned head still did, the check would be measuring nothing. -1 = not run.
@@ -319,6 +642,10 @@ struct Report {
     // walk and the pack is tied). Empty means it was read, as usual. Carried on the Report because the config JSON is
     // built after the .fconst block that discovers this.
     std::string head_synthesized_note;
+    // engine#1740: set when a block-32 head was READ from the .fconst tail (never together with the note above)
+    std::string head_read_note;
+    // engine#1725: the per-layer embedding block the container carries (0 = none): row width per layer, and rows
+    int64_t per_layer_P = 0, per_layer_V = 0;
     bool prefill_tail_seen = false;        // a second copy was readable in the prefill .fconst
     bool final_norm_crosscheck = false;    // ... and it is byte-identical to the Token_Token copy
 
@@ -334,6 +661,10 @@ struct Report {
     long long mlp_groups_ok = 0, mlp_groups_total = 0;
     int mlp_projections = 0;
     double mlp_zero_inexact_pct = 0;
+
+    // engine#1503: the all-block-32 path. Units read (640-byte-strip units plus gate/up units, head included). There
+    // is no decode->encode round trip on this path, so the two counters above stay 0 for such a pack.
+    long long block32_units = 0;
 };
 
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options&);
@@ -349,6 +680,115 @@ struct Q4 {
     std::vector<float> scale;    // [N, K/32]
     std::vector<float> zero;     // [N, K/32]
 };
+// The 1.9 block-32 tail head (engine#1740). A pack whose `/lm_head/MatMul_Q4` is declared `block_size 32` keeps the
+// head in the Token .fconst tail, after the same `64 + 2*hidden` envelope every other 1.9 tail opens with, but NOT in
+// the block-128 tile: it is written in 64-row units of `2,560 + 2*(K/32)*640` bytes.
+//
+// Measured on `Qwen-2.5_1.5B_Instruct_rai_1.9.0_npu` (tied, V 151,936, K 1,536; unit 64,000 B, 2,374 units, then
+// 110,208,000 B of zeros to EOF) against the pack's own `model.embed_tokens`:
+//     unit   : 2,560 B of zeros, then 2*(K/32) strips of 640 B
+//     strip s: K block `s/2` (32 columns), rows `32*(s%2) .. +31` of the unit
+//       +0   512 B of 4-bit codes, low nibble first; code position p (0..1023) is row `(p/256)*8 + p%8`, column
+//            `(p/8)%32` -- four 8-row bands, each written column by column
+//       +512  16 B of zero points, one nibble per row (0x8 everywhere on the measured pack)
+//       +528  48 B of zeros
+//       +576  32 bf16 scales, one per row; SIGNED -- the measured writer stores `-m/8` where m is the block's
+//            largest-magnitude weight, so about half of them are negative
+//     w = (code - zero_point) * scale
+// Every one of the 3,072 scales of a unit equals `bf16(-m/8)` of its embedding block exactly, and the decoded rows
+// correlate 0.990 .. 0.997 with the embedding (4-bit), which is what fixed the field positions. The result is returned
+// with positive scales (a negative one is folded into its codes: `15 - code`, `15 - zp`), as a `Q4` at block 32, rows
+// padded to whole units the way the block-128 tail head is.
+//
+// What is checked, because a wrong region read with confidence is the failure this path exists to avoid: the unit
+// count is `ceil(V/64)` and has to fit; every unit's 2,560 B and every strip's 48 B are zero; every scale is finite;
+// and everything after the last unit is zero. Any of those failing is a refusal with the offset in it.
+constexpr int64_t kB32UnitRows = 64, kB32UnitHeader = 2560, kB32StripBytes = 640;
+inline int64_t block32_unit_bytes(int64_t K) { return kB32UnitHeader + 2 * (K / 32) * kB32StripBytes; }
+struct Block32Head {
+    bool ok = false;
+    Q4 q;                 // N = units x 64 (>= V), K, block 32; value = code*scale + zero, scale > 0
+    int64_t units = 0;
+    int64_t bytes = 0;    // units x block32_unit_bytes(K)
+    int64_t padding = 0;  // zero bytes after the last unit
+    std::string why;      // set when !ok
+};
+// `p` points at the first unit (tail_off + envelope), `avail` is the bytes from there to the end of the file, and
+// `file_off` is where `p` sits in the file (only used to put an offset in a refusal).
+Block32Head read_block32_head(const uint8_t* p, int64_t avail, int64_t V, int64_t K, int64_t file_off = 0);
+
+// The same units for any matrix (engine#1503): `ceil(rows/64)` units of `block32_unit_bytes(K)` starting at `p`. This
+// is the head reader without its tail rule (nothing is required of the bytes after the last unit), and it is what the
+// all-block-32 layer block's q/k/v/o/down are read with. `what` names the tensor in a refusal. Same checks: the bytes
+// fit, every unit header and strip gap is zero, every scale is finite; same normalisation (positive scales).
+struct Block32Units {
+    bool ok = false;
+    Q4 q;                 // N = units x 64 (>= rows), K, block 32
+    int64_t units = 0;
+    int64_t bytes = 0;    // units x block32_unit_bytes(K)
+    std::string why;      // set when !ok
+};
+Block32Units read_block32_units(const uint8_t* p, int64_t avail, int64_t rows, int64_t K, const char* what = "head",
+                                int64_t file_off = 0);
+
+// The gate/up unit of an all-block-32 pack (engine#1503): gate_proj and up_proj share one run of 64-row units, each
+// `4,864 + 2*(K/32)*1,216` bytes.
+//
+// Measured on `SmolLM2-135M-Instruct_rai_1.9.0_npu` (K 576, intermediate 1,536: 24 units of 48,640 B per layer)
+// against the public checkpoint's gate_proj / up_proj:
+//     unit   : 4,864 B of zeros, then 2*(K/32) strips of 1,216 B
+//     strip s: K block `s/2` (32 columns), 64 row SLOTS: slots 0..31 are GATE rows `32*(s%2) .. +31` of the unit,
+//              slots 32..63 are UP rows with the same numbers
+//       +0    1,024 B of 4-bit codes, low nibble first; code position p (0..2047) is slot `(p/256)*8 + p%8`, column
+//             `(p/8)%32` -- the head strip's order over eight 8-slot bands instead of four
+//       +1024 32 B of zero points, one nibble per slot
+//       +1056 32 B of zeros
+//       +1088 64 bf16 scales, one per slot, signed
+// The code order is the measured part (0.98 .. 0.996 per 32-code block against the reference). That zero point and
+// scale are indexed by slot is ASSUMED by analogy with the 640-byte strip; the import of the measured pack is what
+// tests it (a container gate/up that still correlates with the checkpoint after the zero points and scales are
+// applied). Returned as two `Q4`s with the same normalisation and the same refusals as the unit reader.
+constexpr int64_t kB32MlpUnitHeader = 4864, kB32MlpStripBytes = 1216;
+inline int64_t block32_mlp_unit_bytes(int64_t K) { return kB32MlpUnitHeader + 2 * (K / 32) * kB32MlpStripBytes; }
+struct Block32GateUp {
+    bool ok = false;
+    Q4 gate, up;          // each N = units x 64, K, block 32
+    int64_t units = 0;
+    int64_t bytes = 0;    // units x block32_mlp_unit_bytes(K)
+    std::string why;      // set when !ok
+};
+Block32GateUp read_block32_gate_up(const uint8_t* p, int64_t avail, int64_t rows, int64_t K, int64_t file_off = 0);
+
+// The layer block of a pack whose EVERY MatMulNBits is block 32 (engine#1503), as offsets from the block's start.
+// Read from the RAW 1.9 Token .fconst (not the canonical 1.8-form copy). With H = hidden, Nq = heads*head_dim,
+// Nkv = kv_heads*head_dim, IM = intermediate, unit = block32_unit_bytes, mlp_unit = block32_mlp_unit_bytes:
+//     +0        64 + 2*H   envelope: bf16 rms_norm_eps, zeros to 64, input_layernorm bf16[H]
+//     q_off     (Nq/64)  x unit(H)       q_proj [Nq][H]
+//     k_off     (Nkv/64) x unit(H)       k_proj [Nkv][H]
+//     v_off     (Nkv/64) x unit(H)       v_proj [Nkv][H]
+//     sink_off  4*heads bytes            not a weight; skipped (int32 0xFF7F0000 x heads on the measured pack)
+//     o_off     (H/64)   x unit(Nq)      o_proj [H][Nq]
+//     post_off  64 + 2*H   envelope: eps, zeros, post_attention_layernorm bf16[H]
+//     gu_off    (IM/64)  x mlp_unit(H)   gate_proj + up_proj, [IM][H] each
+//     hdr_off   64 bytes                 skipped, content not interpreted (01 then 63 zeros on the measured pack)
+//     down_off  (H/64)   x unit(IM)      down_proj [H][IM]
+//     stride
+// and the tail at `layers x stride`: the same envelope with the final norm, `ceil(V/64)` head units at K = H, zeros.
+// Measured on SmolLM2-135M-Instruct 1.9 only (stride 2,360,292; file 90,470,776 B), where Nq == H -- so o_proj's K
+// being Nq rather than H is the declared shape, not a measurement. There is no bias field in this layout.
+struct Block32Layout {
+    std::string why;      // non-empty: this geometry does not fit the layout (a width that is not whole units)
+    int64_t env = 0, q_off = 0, k_off = 0, v_off = 0, sink_off = 0, o_off = 0, post_off = 0, gu_off = 0, hdr_off = 0,
+            down_off = 0, stride = 0;
+    int64_t tail_off = 0, head_off = 0, head_units = 0;
+    int64_t min_size = 0; // head_off + head_units x unit(H); the file is this plus zero padding
+};
+Block32Layout block32_layout(const Dims& d);
+// Empty when a mapped file fits `lay`: it is at least `min_size` long, and every envelope (two per layer and the
+// tail's) opens with the pack's epsilon followed by zeros up to the norm. Otherwise the reason, with the offset. The
+// zero padding after the head is the head reader's check.
+std::string block32_file_refusal(const uint8_t* map, int64_t size, const Dims& d, const Block32Layout& lay);
+
 // The 1.9 external-data tile (engine#1503): the `.fconst` tile's subvolume written densely per tensor.
 //
 // Measured on `amd/phi-4_rai_1.9.0_npu` (`eager-mm.onnx.data`, 9.74 GB): every `MatMulNBitsBf` weight is a 1-D byte
@@ -373,6 +813,11 @@ constexpr bool kExtQuantsRowMajor = false;
 // measurably NOT the same weights: on a real phi-4 tile it reproduced the pack's codes on only 2,826 of 8,192
 // entries and moved weights by 2.5 % of the tensor's range (engine#1503). `m_inexact` reports how many group
 // offsets were not bf16-exact (86.3 % are, measured), because that rounding is the only loss this path has.
+// engine#1990: a head whose row count is not a multiple of the 32-row tile quantum (CodeLlama: 32,016 rows) cannot be
+// held by the q4_1 grid, so pad it with zero rows that decode to zero and leave the container's vocab_size alone. Exposed
+// because the property -- padding is invisible to the vocabulary -- is what a test can pin without a pack.
+void pad_rows_to_tile_quantum(Q4& q, int vocab);
+
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact = nullptr);
 
 // The container role a matmul plays, read off the graph's own tensor name: `...qkv_proj...` -> "QKV",
@@ -400,6 +845,13 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
                         bool row_major = kExtQuantsRowMajor);
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
                       int N, int K, int block, bool swap_nibbles = false, bool drop_zero = false);
+
+// The implicit zero point 2^(bits-1) for a MatMulNBits with no zeros tensor, and the bit width its SPELLING implies
+// (`weight_Q4` -> 4, `weight_Q8` -> 8, anything else -> the node's own value). Exposed because the pair is what can drift:
+// the projection path used to pass a hardcoded 4 while the head path passed the node's bits, so a future `weight_Q8`
+// spelling would have kept the lookup working and left the zero point at 8 instead of 128 (engine#1841).
+void implicit_zp_zero(Q4& q, int bits);
+int  zp_bits_for_spelling(const std::string& spelling, int node_bits);
 
 // One 64-row tile of the .fconst attention payload, as the pack stores it. Established byte-exactly
 // (amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md §7.13, §7.15): the tile is 2*(K/128)+2 subvolumes
@@ -504,6 +956,20 @@ bool fconst_scratch_ready(const std::string& dir);
 const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
                                               std::string* why);
 
+// engine#1503: the tied-head rule, as ONE predicate so the four call sites cannot drift: the head must reproduce the
+// embedding (corr) AND not be a scaled copy of it (rel_err). The constant is the measured gap between the two states --
+// 0.000000 for the pack that serves, 0.095/0.136 for the two that do not -- so 0.02 sits far from both.
+inline constexpr double kSelfcheckRelMax = 0.02;
+bool selfcheck_head_ok(double corr, double rel);   // the same rule with no fit: scale 1, no noise floor
+// engine#1503: the rule on what it claims. A head passes when it correlates (kTieCorr), is NOT scaled (scale and
+// rms_ratio within kHeadScaleTol of 1), and its rel error is no worse than kHeadFloorFactor x the embedding's own 4-bit
+// noise floor at the head's block (and never refused below kSelfcheckRelMax, so a head that IS its embedding passes).
+inline constexpr double kHeadScaleTol = 0.05;
+inline constexpr double kHeadFloorFactor = 1.5;
+bool selfcheck_head_ok(double corr, const HeadFit& fit);
+// A model_type this route is MEASURED to serve garbage on, with the reason; nullptr for every other (engine#1503).
+const char* known_bad_architecture(const std::string& model_type);
+
 int64_t attn_tile_bytes(int64_t k);
 // Pearson correlation between a quantised head and a bf16 embedding table (engine#1690; the self-check's own statistic,
 // exported so a test can pin the buffer width it decodes).
@@ -522,6 +988,16 @@ struct EmbedTable {
 };
 // The only decode: bf16 or f16 per t.fmt. out-of-range rows still read (callers clamp), as before.
 double embed_at(const EmbedTable& t, int row, int k);
+
+// engine#1503: what the tied-head self-check measures, beyond the correlation. `rel` alone cannot tell a scaled head
+// from a correct 4-bit head whose embedding is kept at higher precision: both score ~0.09 (measured: Qwen2-1.5B 1.9,
+// tail head block 32, rel 0.094316; gemma-2-2b AWQ hybrid, rel 0.094874), while the pack 0.02 was calibrated on
+// scores 0 only because its embedding IS the dequantised head. So the fit also carries:
+//   scale     -- the least-squares a in e ~= a * head. A scaled copy shows it directly; the two above are 0.994 / 0.992.
+//   rms_ratio -- rms(head) / rms(embedding), the same question without the fit (1.0018 / 1.0038).
+//   floor     -- the rel error of the EMBEDDING quantised the way the head is (asymmetric 4-bit, min/max per `block`
+//                columns): what a correct head costs. The two above are 1.12x / 1.07x of theirs (0.083865 / 0.088985).
+HeadFit fit_head(const Q4& q, const EmbedTable& embed, int rows, int block);
 
 double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows);
 // Where a layer block's attention payload starts: the block's 64-byte header, then its

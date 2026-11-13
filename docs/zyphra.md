@@ -279,6 +279,15 @@ have been measured in three windows and answered differently every time.
   per tensor: asking for `ffn_gate_up_adapter=q6_K` yields `_a` = Q6_K but `_b` = **Q8_0**, because the `[128, 28672]` pair's contraction has
   `input_size = 128` and HRX's block-format admission needs `>= 256` while the float predicate needs only `>= 4`. So the pair leaves the device for *any*
   block type, including the substitute — the same "the label is not evidence" rule this page applies to arm names, applied to the tensors inside them.
+
+  > **Set it in both arms of an A/B, and record box load beside any rate (engine#2143).** #2143 asked whether this
+  > flag changes behaviour: one 18,782-token request failed without it and completed with it, and one 18.6k prefill
+  > measured 271.75 t/s unset against 118.86 t/s set. At the engine's pin the flag only gates `fprintf` calls
+  > (`dispatch_log_match()` and `dispatch_log_requested_output()` in `dispatch-registry.cpp`): the readback check and
+  > its decline run in both arms, so the dispatches selected are the same either way. Each of those measurements is
+  > one run per arm, #1536 then failed in 4 of 6 runs, and box load moves a rate by about 2x here, so neither shows
+  > a flag effect. Setting it in both arms is right whichever way #2143 settles.
+
 - **A control on 2026-11-08 shows how far a single reading can be off, and it retire the A/B this page would need.** One file whose form cause 2
   did **not** touch (`Zamba-7B-v1` `Q6_K`) was re-benched on a current build: `pp512 211.16 (sd 170.84)`, `pp4096 47.14 (sd 12.73)`, `tg128 4.26
   (sd 3.04)` against its own published `108.07 / 92.28 / 12.20`. **The same bytes, 2-2.9× apart, with 71 % sd on decode.** So the rows in this

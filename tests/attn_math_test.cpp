@@ -28,7 +28,9 @@
 #include "attn_math.h"
 
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -104,6 +106,102 @@ int main() {
           q4nx_attn::dot(z.data(), ones.data(), 96), 0.0);
     check(q4nx_attn::dot_scalar(z.data(), ones.data(), 96) == 0.0f, "dot_scalar on zeros != 0", 96,
           q4nx_attn::dot_scalar(z.data(), ones.data(), 96), 0.0);
+
+    // engine#1990: M rows in one thread team (rows_context) against the form it replaces, one row at a time and
+    // one head at a time through head_context -- bit for bit, on every thread count, for the three read windows
+    // the forward uses: causal (row m reads start+m+1 positions), noncausal (every row reads all of them), and a
+    // sliding window (t0 > 0). A (row, head) pair writes only its own HD floats, so there is nothing to round
+    // differently; this is the arm that would catch a shared score buffer or a wrong KV head.
+    {
+        struct Shape { int M, NH, NKV, HD, start; };
+        const Shape shapes[] = {{16, 32, 8, 128, 320}, {16, 8, 8, 64, 0}, {7, 12, 4, 96, 33}, {1, 4, 2, 17, 5}, {4, 6, 6, 8, 0}};
+        int compared = 0;
+        for (const Shape& sh : shapes) {
+            const int P = sh.start + sh.M;
+            std::vector<float> kc((size_t)P * sh.NKV * sh.HD), vc(kc.size()), q((size_t)sh.M * sh.NH * sh.HD);
+            for (float& x : kc) x = u(rng);
+            for (float& x : vc) x = u(rng);
+            for (float& x : q) x = 4.0f * u(rng);
+            const float scale = 1.0f / std::sqrt((float)sh.HD);
+            for (int mode = 0; mode < 3; mode++) {
+                std::vector<int> T((size_t)sh.M), t0((size_t)sh.M);
+                for (int m = 0; m < sh.M; m++) {
+                    T[(size_t)m] = mode == 1 ? P : sh.start + m + 1;
+                    t0[(size_t)m] = (mode == 2 && T[(size_t)m] > 5) ? T[(size_t)m] - 5 : 0;
+                }
+                std::vector<float> want(q.size(), 0.0f), score((size_t)P);
+                for (int m = 0; m < sh.M; m++)
+                    for (int h = 0; h < sh.NH; h++)
+                        q4nx_attn::head_context(&q[((size_t)m * sh.NH + h) * sh.HD], kc.data(), vc.data(), sh.NKV,
+                                                h / (sh.NH / sh.NKV), sh.HD, t0[(size_t)m], T[(size_t)m], scale,
+                                                score.data(), &want[((size_t)m * sh.NH + h) * sh.HD]);
+                double mass = 0.0;
+                for (float x : want) mass += std::fabs((double)x);
+                check(mass > 0.0, "rows reference is all zero (the arm compares nothing)", sh.M, mass, 1.0);
+                for (int nt : {1, 2, 5, 12}) {
+                    std::vector<float> got(q.size(), 123.0f);   // rows_context must zero it itself
+                    q4nx_attn::rows_context(q.data(), kc.data(), vc.data(), sh.M, sh.NH, sh.NKV, sh.HD, T.data(),
+                                            t0.data(), scale, got.data(), nt);
+                    size_t diff = 0;
+                    for (size_t i = 0; i < got.size(); i++)
+                        if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) diff++;
+                    char what[112];
+                    std::snprintf(what, sizeof what, "rows_context != per-row (M=%d NH=%d HD=%d mode=%d threads=%d)",
+                                  sh.M, sh.NH, sh.HD, mode, nt);
+                    check(diff == 0, what, (int)got.size(), (double)diff, 0.0);
+                    compared++;
+                }
+            }
+        }
+#if defined(_OPENMP)
+        std::printf("rows: %d comparisons bit-identical to the per-row form (OpenMP build: threads 1, 2, 5, 12)\n", compared);
+#else
+        std::printf("rows: %d comparisons bit-identical to the per-row form (no OpenMP: all on one thread)\n", compared);
+#endif
+    }
+
+    // engine#1786: GPT-OSS's attention sink -- one logit per head that joins the softmax and carries no value. A null
+    // sink must leave every other model's head bit-identical; a sink must give the explicit softmax over [scores, s].
+    {
+        const int NKVs = 2, HDs = 64, T = 9, t0 = 2;
+        std::vector<float> q((size_t)HDs), kc((size_t)T * NKVs * HDs), vc(kc.size()), score((size_t)T);
+        for (auto& v : q) v = u(rng);
+        for (auto& v : kc) v = u(rng);
+        for (auto& v : vc) v = u(rng);
+        const float scale = 0.125f;
+        std::vector<float> a((size_t)HDs, 0.0f), b((size_t)HDs, 0.0f), c((size_t)HDs, 0.0f);
+        q4nx_attn::head_context(q.data(), kc.data(), vc.data(), NKVs, 1, HDs, t0, T, scale, score.data(), a.data());
+        q4nx_attn::head_context(q.data(), kc.data(), vc.data(), NKVs, 1, HDs, t0, T, scale, score.data(), b.data(), nullptr);
+        if (std::memcmp(a.data(), b.data(), sizeof(float) * HDs) != 0) {
+            std::printf("FAIL sink: a null sink changed a bit\n");
+            failures++;
+        }
+        const float sink = 0.7f;
+        q4nx_attn::head_context(q.data(), kc.data(), vc.data(), NKVs, 1, HDs, t0, T, scale, score.data(), c.data(), &sink);
+        double mx = sink, s[16], den = 0.0;
+        for (int t = t0; t < T; t++) {
+            double z = 0.0;
+            for (int i = 0; i < HDs; i++) z += (double)q[(size_t)i] * kc[((size_t)t * NKVs + 1) * HDs + i];
+            s[t] = z * scale;
+            mx = s[t] > mx ? s[t] : mx;
+        }
+        for (int t = t0; t < T; t++) den += std::exp(s[t] - mx);
+        den += std::exp(sink - mx);
+        double worst = 0.0;
+        for (int i = 0; i < HDs; i++) {
+            double ref = 0.0;
+            for (int t = t0; t < T; t++) ref += std::exp(s[t] - mx) / den * vc[((size_t)t * NKVs + 1) * HDs + i];
+            worst = std::max(worst, std::fabs(ref - (double)c[(size_t)i]));
+        }
+        double drop = 0.0;   // and the sink took some mass: the context is not the sinkless one
+        for (int i = 0; i < HDs; i++) drop = std::max(drop, (double)std::fabs(c[(size_t)i] - a[(size_t)i]));
+        if (worst > 1e-5 || drop < 1e-3) {
+            std::printf("FAIL sink: |ctx - softmax over [scores, sink]| = %.3g, change from no sink %.3g\n", worst, drop);
+            failures++;
+        } else {
+            std::printf("sink: ctx = softmax over [scores, sink] (max |d| %.2g); a null sink is bit-identical\n", worst);
+        }
+    }
 
     if (failures) {
         std::printf("%d check(s) failed\n", failures);

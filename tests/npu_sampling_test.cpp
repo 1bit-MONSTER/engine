@@ -49,6 +49,8 @@ using onebit::npu::logprobs_of;
 using onebit::npu::options_from_body;
 using onebit::npu::SampleParams;
 using onebit::npu::sample_token;
+using onebit::npu::argmax_token;
+using onebit::npu::token_bound;
 using onebit::npu::stop_holdback;
 
 int failures = 0;
@@ -175,6 +177,46 @@ void test_sampler() {
     std::vector<char> none(3, 0);
     check(sample(three, hot, 1, &none) == -1, "an empty mask is refused");
     check(sample(three, SampleParams(), 1, &mask) == 2, "greedy still honors the mask");
+}
+
+// sample_probs() is what sample_token() draws from (engine#1781: a speculative round checks drafts against it, so a
+// mismatch would bias a sampled reply): for each set of parameters the draw's frequencies over 200000 seeded draws
+// sit within 0.01 total variation of sample_probs(), every id it zeroes is never drawn, the row sums to 1, ids past
+// the tokenizer's bound get no entry, and greedy parameters give the argmax's one-hot.
+void test_sample_probs() {
+    const std::vector<float> lg = {1.0f, 2.5f, 0.3f, 2.4f, -1.0f, 0.9f, 1.7f, 0.0f, 2.0f, -0.5f, 3.0f, 2.9f};
+    struct Case { const char* name; float t; int k; float tp; };
+    const Case cases[] = {{"temperature 0.8", 0.8f, 0, 1.0f},
+                          {"temperature 1.3, top_k 4", 1.3f, 4, 1.0f},
+                          {"temperature 0.7, top_p 0.8", 0.7f, 0, 0.8f},
+                          {"temperature 1, top_k 6, top_p 0.9", 1.0f, 6, 0.9f}};
+    for (const Case& cs : cases) {
+        SampleParams p;
+        p.temperature = cs.t;
+        p.top_k = cs.k;
+        p.top_p = cs.tp;
+        const int bound = 10;   // the last two ids (the two largest logits but one) are padding
+        const std::vector<float> q = onebit::npu::sample_probs(lg.data(), lg.size(), p, bound);
+        double total = 0;
+        for (float v : q) total += v;
+        std::vector<double> f(lg.size(), 0.0);
+        std::mt19937_64 rng(1781);
+        const int N = 200000;
+        for (int i = 0; i < N; i++) f[size_t(sample_token(lg, p, rng, nullptr, bound))] += 1.0 / N;
+        double tv = 0;
+        bool zero_never = true;
+        for (size_t i = 0; i < q.size(); i++) {
+            tv += std::fabs(f[i] - q[i]);
+            if (q[i] == 0.0f && f[i] > 0.0) zero_never = false;
+        }
+        tv /= 2;
+        std::printf("    sample_probs %-36s tv %.4f\n", cs.name, tv);
+        check(q.size() == size_t(bound) && std::fabs(total - 1.0) < 1e-5,
+              std::string("sample_probs covers the bounded row and sums to 1: ") + cs.name);
+        check(tv < 0.01 && zero_never, std::string("sample_token draws what sample_probs says: ") + cs.name);
+    }
+    const std::vector<float> g = onebit::npu::sample_probs(lg.data(), lg.size(), SampleParams(), 10);
+    check(g.size() == 10 && g[1] == 1.0f, "sample_probs at greedy is the bounded argmax's one-hot");
 }
 
 // The draw has to match the distribution the logits define.  Temperature divides logits
@@ -391,7 +433,7 @@ void test_logprobs() {
     // Two candidates, logits 0 and ln 2: probabilities 1/3 and 2/3.
     const double ln2 = std::log(2.0);
     const std::vector<float> logits = {0.0f, float(ln2)};
-    const auto lp = logprobs_of(logits, 1, 2);
+    const auto lp = logprobs_of(logits, 0, 1, 2);
     check(lp.id == 1, "logprobs report the id that was drawn");
     check(std::fabs(lp.logprob - float(std::log(2.0 / 3.0))) < 1e-6f,
           "the drawn token's log-probability is log 2/3");
@@ -401,26 +443,69 @@ void test_logprobs() {
     check(std::fabs(lp.top[1].logprob - float(std::log(1.0 / 3.0))) < 1e-6f, "the second entry carries log 1/3");
 
     // A flat vocabulary: every token is -log(N), and top_logprobs 0 asks for no alternatives.
-    const auto flat = logprobs_of(std::vector<float>(8, 1.5f), 3, 0);
+    const auto flat = logprobs_of(std::vector<float>(8, 1.5f), 0, 3, 0);
     check(std::fabs(flat.logprob - float(std::log(1.0 / 8.0))) < 1e-6f, "a flat vocabulary gives -log N");
     check(flat.top.empty(), "top_logprobs 0 reports no alternatives");
 
     // Ties go to the lower id, the rule the sampler draws by.
-    const auto tied = logprobs_of(std::vector<float>{1.0f, 1.0f, 1.0f}, 0, 2);
+    // engine#2272: a padded head stores rows past the vocabulary (engine#2026), and those rows are
+    // not tokens. Normalising over them shifts every reported logprob by the padding's mass, and the
+    // padding is given the LARGEST logits here so the shift cannot be mistaken for rounding. The
+    // expected values are computed from the vocabulary-only softmax below, not through the helper.
+    {
+        const size_t vocab = 3, pad = 2;
+        std::vector<float> padded(vocab + pad, 50.0f);      // padding: the largest logits, as a head may store
+        padded[0] = 0.0f; padded[1] = 0.0f; padded[2] = 0.0f;
+        double z = 0.0;
+        for (size_t i = 0; i < vocab; i++) z += std::exp(double(padded[i]));
+        const double log_z = std::log(z);
+        const auto bounded = logprobs_of(padded, int(vocab), 1, 64);
+        check(std::fabs(bounded.logprob - float(-log_z)) < 1e-6f,
+              "a padded row: the logprob is the vocabulary-only softmax, not the padding's");
+        bool padding_reported = false;
+        for (const auto& t : bounded.top) padding_reported = padding_reported || t.id >= int(vocab);
+        check(!padding_reported, "a padded row: no id at or past the vocabulary appears in top_logprobs");
+    }
+
+    const auto tied = logprobs_of(std::vector<float>{1.0f, 1.0f, 1.0f}, 0, 0, 2);
     check(tied.top.size() == 2 && tied.top[0].id == 0 && tied.top[1].id == 1, "ties keep the lower id first");
 
+    // engine#2272: a head WIDER than the tokenizer (Qwen3: 151,669 ids against 151,936 rows). The row carries logits for
+    // ids the vocabulary does not have; they must not join the normaliser, and they must not be nameable in `top`.
+    {
+        const std::vector<float> padded = {1.0f, 2.0f, 0.5f, /* padding: */ 9.0f, 9.0f, 9.0f};
+        const int vocab = 3;
+        const auto bounded = logprobs_of(padded.data(), token_bound(padded.size(), vocab), 1, 2);
+        const auto unbounded = logprobs_of(padded.data(), padded.size(), 1, 2);
+        const double m = 2.0, lz = m + std::log(std::exp(1.0 - m) + 1.0 + std::exp(0.5 - m));
+        check(std::fabs(double(bounded.logprob) - (2.0 - lz)) < 1e-6,
+              "a padded row's logprob is the softmax over the VOCABULARY, not over the padding");
+        check(std::fabs(double(unbounded.logprob) - double(bounded.logprob)) > 1e-3,
+              "...which differs from the unbounded computation, so this was visible, not cosmetic");
+        check(bounded.top.size() == 2 && bounded.top[0].id == 1 && bounded.top[1].id == 0,
+              "...and `top` names only real ids, in the sampler's tie order");
+        bool padding_in_top = false;
+        for (const auto& e : bounded.top) padding_in_top = padding_in_top || e.id >= vocab;
+        check(!padding_in_top, "...no padding id (3..5) appears in top_logprobs");
+        // The vector overload takes the bound as a required argument (no form of it can forget the cut).
+        const auto whole = logprobs_of(padded, vocab, 1, 2);
+        check(whole.logprob == bounded.logprob && whole.top.size() == 2 && whole.top[0].id == 1 &&
+                  whole.top[1].id == 0 && whole.top[0].logprob == bounded.top[0].logprob,
+              "the vector overload cuts at the vocabulary it is given, as the pointer form with token_bound does");
+    }
+
     // More alternatives than the vocabulary reports what exists.
-    check(logprobs_of(logits, 1, 100).top.size() == 2, "top_n past the vocabulary reports all of it");
+    check(logprobs_of(logits, 0, 1, 100).top.size() == 2, "top_n past the vocabulary reports all of it");
 
     // The grammar mask can put the drawn token outside the top list, and it still carries its own
     // value: this is the "before penalties and constraints" convention, measured.
-    const auto masked = logprobs_of(std::vector<float>{5.0f, 0.0f}, 1, 1);
+    const auto masked = logprobs_of(std::vector<float>{5.0f, 0.0f}, 0, 1, 1);
     check(masked.top.size() == 1 && masked.top[0].id == 0, "top_logprobs is the raw distribution, mask-free");
     check(masked.logprob < masked.top[0].logprob, "a masked-in token reports its own, lower value");
 
     // Degenerate inputs are reported, never fatal.
-    check(logprobs_of({}, 0, 4).top.empty(), "an empty vocabulary reports nothing");
-    check(logprobs_of(logits, -1, 1).logprob == 0.0f, "an id outside the vocabulary reports zero");
+    check(logprobs_of(std::vector<float>{}, 0, 0, 4).top.empty(), "an empty vocabulary reports nothing");
+    check(logprobs_of(logits, 0, -1, 1).logprob == 0.0f, "an id outside the vocabulary reports zero");
 }
 
 void test_logprob_options() {
@@ -447,6 +532,160 @@ void test_logprob_options() {
           "a fractional top_logprobs is refused");
     check(starts_with(error_of(nlohmann::json::parse(R"({"top_logprobs": 3})")), "top_logprobs:"),
           "top_logprobs without logprobs: true is refused rather than ignored");
+}
+
+// The pinned shared prefix (engine#1785): single-turn requests that share a system prompt and differ in the
+// user turn. `sys(n)` + `turn(k)` stand for the two parts; the table sees token ids only.
+void test_prefix_pin() {
+    using onebit::npu::shared_prefix_len;
+    auto prompt = [](int sys, int turn_start, int turn) {
+        std::vector<int> v;
+        for (int i = 0; i < sys; i++) v.push_back(1 + i);
+        for (int i = 0; i < turn; i++) v.push_back(turn_start + i);
+        return v;
+    };
+    PrefixOptions o;
+    o.slots = 4;
+    o.cache_mb = 1;
+    o.min_gain = 128;
+    const std::vector<int> q1 = prompt(900, 5000, 40), q2 = prompt(900, 6000, 30), q3 = prompt(900, 7000, 50);
+
+    {   // the gap, on the table as it was: a whole saved prompt is no use to the next single-turn request
+        PrefixCache c(o);
+        check(c.insert(q1, 1000) >= 0, "the first single-turn prompt is saved whole");
+        const auto d = c.lookup(q2);
+        check(d.slot == -1 && d.cached_tokens == 0,
+              "a second question under the same 900-token system prompt reuses nothing from the first");
+    }
+    {   // the pin: request 2 finds the shared part, request 3 resumes from it
+        PrefixCache c(o);
+        check(c.pin_point({}, q1) == 0, "the first request has nothing to compare with");
+        c.insert(q1, 1000);
+        check(shared_prefix_len(q1, q2) == 900, "the two prompts share exactly the system part");
+        const size_t at = c.pin_point(q1, q2);
+        check(at == 900, "the second request's pin point is the end of what it shares with the first");
+        std::string why;
+        const int pin = c.pin(std::vector<int>(q2.begin(), q2.begin() + long(at)), 2000, &why);
+        check(pin >= 0 && why == "pinned" && c.pinned_slot() == pin, "the shared part is pinned");
+        const auto d = c.lookup(q3);
+        check(d.slot == pin && d.cached_tokens == 900 && d.pinned && d.reason == "hit",
+              "a third question resumes from the pin: 900 of its 950 tokens are already there");
+        check(onebit::npu::resume_point(d, q3.size()) == 899, "and resumes one token short of it, as every hit does");
+        check(c.pin_point(q2, q3) == 0, "a prefix the pin already covers is not pinned again");
+        check(!c.lookup(q1).pinned && c.lookup(q1).cached_tokens == 940,
+              "a whole-prompt slot is still preferred when it is the longer match, and says it is not the pin");
+    }
+    {   // what is not a pin point
+        PrefixCache c(o);
+        check(c.pin_point(q1, q1) == 0, "a repeated prompt is insert()'s business, not a pin");
+        std::vector<int> longer = q1;
+        for (int i = 0; i < 200; i++) longer.push_back(9000 + i);
+        check(c.pin_point(q1, longer) == 0, "a continued conversation is insert()'s business too");
+        check(c.pin_point(longer, q1) == 0, "and so is a prompt the previous one continued");
+        check(c.pin_point(prompt(100, 5000, 40), prompt(100, 6000, 40)) == 0,
+              "100 shared tokens do not beat prefix-min-gain 128");
+        check(c.pin_point(prompt(900, 5000, 40), prompt(0, 6000, 40)) == 0, "prompts that share nothing have no pin point");
+        {   // only the leading tokens count: the same 900 tokens at the end of both prompts are not a prefix
+            std::vector<int> a1 = prompt(0, 5000, 200), a2 = prompt(0, 6000, 200);
+            const std::vector<int> tail = prompt(900, 0, 0);
+            a1.insert(a1.end(), tail.begin(), tail.end());
+            a2.insert(a2.end(), tail.begin(), tail.end());
+            check(shared_prefix_len(a1, a2) == 0 && c.pin_point(a1, a2) == 0,
+                  "a shared ending under different openings is not a pin point");
+            a2[0] = a1[0];  // one shared leading token, then they part: still nothing worth a slot
+            check(shared_prefix_len(a1, a2) == 1 && c.pin_point(a1, a2) == 0,
+                  "and one shared leading token before that ending is not one either");
+        }
+        // the contract the forward relies on: a pin point is a real common prefix, never longer than either
+        for (int sys : {0, 1, 127, 128, 129, 500, 900}) {
+            for (int turn : {1, 40}) {
+                const std::vector<int> x = prompt(sys, 5000, turn), y = prompt(sys, 6000, turn + 7);
+                const size_t n = c.pin_point(x, y);
+                check(n <= x.size() && n <= y.size() && std::equal(x.begin(), x.begin() + long(n), y.begin()),
+                      "a pin point never reaches past the tokens both prompts start with");
+                check(n == (sys >= 128 ? size_t(sys) : 0u),
+                      "it is the whole shared opening when that is worth a slot, and 0 (no pin) when it is not");
+            }
+        }
+        PrefixOptions off = o;
+        off.slots = 0;
+        check(PrefixCache(off).pin_point(q1, q2) == 0, "an off cache pins nothing");
+        check(PrefixCache(off).pin(q1, 10) == -1, "and refuses a pin");
+    }
+    {   // pin_at: the end of the system turn is known on the FIRST request, so the second one is already warm
+        PrefixCache c(o);
+        check(c.pin_at(q1, 900) == 900, "the first request under a 900-token system prompt pins its 900 tokens");
+        check(c.pin_point({}, q1) == 0, "where comparing with a previous request has nothing to offer yet");
+        std::string why;
+        const int pin = c.pin(std::vector<int>(q1.begin(), q1.begin() + 900), 2000, &why);
+        c.insert(q1, 1000);
+        const auto d = c.lookup(q2);
+        check(pin >= 0 && d.slot == pin && d.cached_tokens == 900 && d.pinned,
+              "so the SECOND question resumes from the pin: 900 of its 930 tokens");
+        check(c.pin_at(q2, 900) == 0 && c.pin_at(q3, 900) == 0, "and later requests do not pin the same point again");
+        // what is not worth a pin, or is not one
+        check(c.pin_at(q1, 0) == 0, "no system turn, no pin");
+        check(c.pin_at(q1, q1.size()) == 0 && c.pin_at(q1, q1.size() + 5) == 0, "a point at or past the end of the prompt is insert()'s");
+        PrefixCache fresh(o);
+        check(fresh.pin_at(q1, 127) == 0 && fresh.pin_at(q1, 128) == 128, "a system turn shorter than prefix-min-gain is not pinned");
+        PrefixOptions off = o;
+        off.slots = 0;
+        check(PrefixCache(off).pin_at(q1, 900) == 0, "an off cache pins nothing");
+        // a pin that ran into the question (two questions opening alike) does not cover a question that opens
+        // differently, and the system turn's own end then replaces it
+        PrefixCache over(o);
+        std::vector<int> a1 = prompt(900, 5000, 40), a2 = prompt(900, 5000, 40), b1 = prompt(900, 8000, 40);
+        a2[905] = 4242;                                            // same first five question tokens, then different
+        const size_t ran_over = over.pin_point(a1, a2);
+        check(ran_over == 905, "comparing two alike-opening questions pins five tokens into the question");
+        over.pin(std::vector<int>(a2.begin(), a2.begin() + long(ran_over)), 2000);
+        check(over.lookup(b1).cached_tokens == 0, "which a differently opening question cannot use");
+        check(over.pin_at(b1, 900) == 900, "the system turn's end is still worth pinning for it");
+        const int repin = over.pin(std::vector<int>(b1.begin(), b1.begin() + 900), 2000);
+        check(repin >= 0 && over.lookup(b1).cached_tokens == 900 && over.lookup(a1).cached_tokens == 900,
+              "and once pinned there, every question under that system prompt resumes from it");
+    }
+    {   // the pin outlives what evicts and replaces everything else
+        PrefixOptions b = o;
+        b.slots = 4;  // one more than the three snapshots the budget holds, so a slot is always free
+        b.min_gain = 1;
+        PrefixCache c(b);  // 1 MB
+        const std::vector<int> sys(q1.begin(), q1.begin() + 900);
+        const int pin = c.pin(sys, 300000);
+        const int a = c.insert(prompt(0, 100, 10), 300000);
+        const int bb = c.insert(prompt(0, 200, 10), 300000);
+        check(pin >= 0 && a >= 0 && bb >= 0 && c.used_bytes() == 900000, "a pin and two prompts fit under 1 MB");
+        // The pin is the least recently used of the three, and 300000 more does not fit: something goes.
+        const int cc = c.insert(prompt(0, 300, 10), 300000);
+        check(cc == a, "room is made from the oldest whole prompt");
+        check(c.pinned_slot() == pin && c.lookup(q2).slot == pin, "not from the pin, though it is the oldest slot");
+        // A prompt that extends the pin does not replace it.
+        std::string why;
+        const int whole = c.insert(q2, 1000, pin, &why);
+        check(whole >= 0 && whole != pin && c.pinned_slot() == pin,
+              "a prompt that resumed from the pin is saved beside it, not over it");
+        check(c.lookup(q3).slot == pin && c.lookup(q3).cached_tokens == 900, "so the next question still finds the pin");
+        // A new pin replaces the old one: one shared prefix at a time.
+        const std::vector<int> other = prompt(0, 40000, 500);
+        const int pin2 = c.pin(other, 1000);
+        check(pin2 >= 0 && c.pinned_slot() == pin2, "a new pin takes over");
+        check(c.lookup(q3).slot != pin || !c.lookup(q3).pinned, "and the old one is no longer pinned");
+        check(c.pin(other, 2u * 1024u * 1024u, &why) == -1 && why == "larger than prefix-cache-mb" &&
+                  c.pinned_slot() == pin2,
+              "a pin over the budget is refused and the standing pin is kept");
+    }
+    {   // every slot holds a whole prompt: the pin takes the oldest
+        PrefixOptions b = o;
+        b.slots = 2;
+        b.min_gain = 1;
+        PrefixCache c(b);
+        const int s0 = c.insert(prompt(0, 100, 10), 100);
+        c.insert(prompt(0, 200, 10), 100);
+        const int pin = c.pin(prompt(900, 0, 0), 100);
+        check(pin == s0, "with no free slot the pin takes the least recently used prompt's");
+        check(c.insert(prompt(0, 300, 10), 100) != pin, "and a later prompt cannot take it back");
+        check(c.pinned_slot() == pin, "the pin is still there");
+    }
 }
 
 void test_prefix_cache() {
@@ -653,11 +892,171 @@ void test_json_schema_refusals() {
           "grammar and json_schema together are refused");
 }
 
+
+// Gemma 4's own markup (engine#1779, F10 fault 4), taken from the pack's tokenizer_config.json: the call body is
+// `call:NAME{key:value,...}` with string values wrapped in <|"|>, which is not JSON. Asserted on the normalised
+// JSON rather than on "a call was found", because the normalisation is the part that can be silently wrong.
+void test_gemma4_answer_parser() {
+    const auto G = AnswerFamily::gemma4;
+    {
+        const std::string reply =
+            "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3,metric:true}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1, "gemma4: a <|tool_call> body is a call when tools were sent");
+        check(a.calls[0].name == "get_weather", "gemma4: the name is what follows call:");
+        check(a.calls[0].arguments == R"({"city":"Paris","days":3,"metric":true})",
+              "gemma4: arguments are rewritten to JSON (escaped strings, numbers, booleans)");
+        check(a.content.empty() && a.content_null, "gemma4: a call-only reply has content: null");
+    }
+    {
+        // A comma inside an escaped string must not split the argument list -- the case a naive splitter gets wrong.
+        const std::string reply =
+            "<|tool_call>call:say{text:<|\"|>hello, world<|\"|>,n:2}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == R"({"text":"hello, world","n":2})",
+              "gemma4: a comma inside <|\"|>...<|\"|> stays inside the string");
+    }
+    {
+        const std::string reply = "<|tool_call>call:ping{}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == "{}", "gemma4: a call with no arguments is {}");
+        const auto without = parse_answer(reply, G, false);
+        check(without.calls.empty(), "gemma4: the same markup is not a call when no tools were sent");
+        check(without.content.find("<|tool_call>") != std::string::npos,
+              "gemma4: and it stays in content, marker included");
+    }
+    {
+        const auto a = parse_answer("<|channel>thought\nlet me think<channel|>Done.", G, false);
+        check(a.reasoning == "let me think" && a.content == "Done.",
+              "gemma4: the thought channel is reasoning, without the newline the template puts after the tag");
+        check(a.content == "Done.", "gemma4: and the reply after it is content");
+    }
+    {
+        // A string whose closing <|"|> never arrives is malformed: no call, and the markup is back in content.
+        const std::string reply = "<|tool_call>call:say{text:<|\"|>hello}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.empty(), "gemma4: an unterminated <|\"|> string is not a call");
+        check(a.content == reply, "gemma4: and what the model wrote is back in content, whole");
+        const auto b = parse_answer("<|tool_call>call:f{a:1}tail}<tool_call|>", G, true);
+        check(b.calls.empty() && !b.content.empty(), "gemma4: text after the arguments object is not a call");
+        const auto c = parse_answer("<|tool_call>call:f{a:[1,2}<tool_call|>", G, true);
+        check(c.calls.empty() && !c.content.empty(), "gemma4: an array that never closes is not a call");
+    }
+    {
+        // Nested object and array, the same bare-key form one level down.
+        const auto a = parse_answer(
+            "<|tool_call>call:f{o:{k:<|\"|>v<|\"|>},l:[1,<|\"|>a,b<|\"|>],z:null}<tool_call|>", G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == R"({"o":{"k":"v"},"l":[1,"a,b"],"z":null})",
+              "gemma4: nested objects and arrays are rewritten too");
+    }
+}
+
+// GPT-OSS's harmony markup (engine#1786). The first reply is the one FastFlowLM's GPT-OSS-20B-NPU2 gave on the NPU
+// (byte for byte, then the final message the 32-token budget cut off); the call forms are the pack's template's own
+// order and the order the model card shows, asserted on name and JSON arguments.
+void test_harmony_answer_parser() {
+    const auto H = AnswerFamily::harmony;
+    {
+        const std::string reply =
+            "<|channel|>analysis<|message|>The user asks: \"What is the capital of France? Answer with one word.\" "
+            "The answer is \"Paris\". So we answer \"Paris\".<|end|><|start|>assistant<|channel|>final<|message|>Paris";
+        const auto a = parse_answer(reply, H, false);
+        check(a.reasoning.rfind("The user asks:", 0) == 0 && a.reasoning.find("<|") == std::string::npos,
+              "harmony: the analysis channel is reasoning, with no header left in it");
+        check(a.content == "Paris", "harmony: the final channel is content, headers dropped");
+        // Streamed one byte at a time: the same split.
+        AnswerStream s(H, false);
+        std::vector<std::pair<bool, std::string>> out;
+        for (const char c : reply) s.feed(std::string(1, c), out);
+        s.finish(out);
+        check(s.reasoning() == a.reasoning && s.content() == "Paris", "harmony: byte-at-a-time stream agrees");
+    }
+    {
+        const auto a = parse_answer("<|channel|>analysis<|message|>think<|channel|>final<|message|>Done.", H, false);
+        check(a.reasoning == "think" && a.content == "Done.", "harmony: a final header without <|end|> ends reasoning");
+        const auto b = parse_answer("<|channel|>final<|message|>Only this.<|return|>", H, false);
+        check(b.reasoning.empty() && b.content == "Only this.", "harmony: no analysis, and a rendered stop token");
+    }
+    {
+        const std::string tmpl_form =
+            "<|channel|>analysis<|message|>Need weather.<|end|><|start|>assistant to=functions.get_weather"
+            "<|channel|>commentary json<|message|>{\"city\":\"Paris\"}<|call|>";
+        const auto a = parse_answer(tmpl_form, H, true);
+        check(a.calls.size() == 1 && a.calls[0].name == "get_weather" && a.calls[0].arguments == R"({"city":"Paris"})",
+              "harmony: the template's call order is a call");
+        check(a.reasoning == "Need weather." && a.content.empty() && a.content_null,
+              "harmony: a call-only reply has content: null");
+        const auto b = parse_answer(
+            "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"city\":\"Oslo\"}<|call|>", H, true);
+        check(b.calls.size() == 1 && b.calls[0].name == "get_weather" && b.calls[0].arguments == R"({"city":"Oslo"})",
+              "harmony: the card's call order is a call too");
+        const auto c = parse_answer(tmpl_form, H, false);
+        check(c.calls.empty() && c.content.find("to=functions.get_weather") != std::string::npos,
+              "harmony: without tools the call markup stays in content");
+        const std::string bad = "to=functions.f<|channel|>commentary json<|message|>{not json<|call|>";
+        const auto d = parse_answer(bad, H, true);
+        check(d.calls.empty() && d.content == bad, "harmony: arguments that are not JSON are back in content, whole");
+    }
+}
+
+// The family comes from the container's chat template. The Gemma 4 lines are the two literals the pack's own
+// chat_template carries (amd/gemma-4-e4b-it-mobius-int4_rai_1.9.0_npu: `<|tool_call>` x1, `<|channel>thought`
+// x1, `<tool_call>` x0, `<think>` x0), not a guess at them.
+void test_answer_family_of_template() {
+    using onebit::npu::answer_family_of_template;
+    check(answer_family_of_template("") == AnswerFamily::qwen3, "no template is qwen3, as before");
+    check(answer_family_of_template("{%- if tools %}<tool_call>\n{\"name\": ...}</tool_call>{% endif %}<think>") ==
+              AnswerFamily::qwen3,
+          "a template with <tool_call> and <think> is qwen3");
+    check(answer_family_of_template("{{- '<|tool_call>call:' + function['name'] + '{' -}}") == AnswerFamily::gemma4,
+          "a template that writes <|tool_call>call: is gemma4");
+    check(answer_family_of_template("{{- '<|channel>thought\\n<channel|>' -}}") == AnswerFamily::gemma4,
+          "a template with the thought channel and no tools is gemma4 too");
+    check(answer_family_of_template("{{- \"<|start|>assistant<|channel|>analysis<|message|>\" + message.thinking -}}") ==
+              AnswerFamily::harmony,
+          "a template that writes the analysis channel is harmony");
+    check(answer_family_of_template("<|im_start|>user\n{{ content }}<|im_end|>") == AnswerFamily::qwen3,
+          "a template with neither marker is qwen3");
+}
+
+// Every tag every family declares must be recognised, whatever its length, whole and split across two chunks at
+// every byte. The scanner once read tags through a 16-byte window, so a 17-byte tag read as text (engine#1779);
+// this arm fails for any family whose tags the scanner cannot match, including one added later.
+void test_every_family_tag_is_matched() {
+    for (const AnswerFamily f : {AnswerFamily::qwen3, AnswerFamily::gemma4, AnswerFamily::harmony}) {
+        const auto t = onebit::npu::answer_detail::tags_of(f);
+        const std::string name = onebit::npu::answer_detail::family_name(f);
+        const std::string think = std::string(t.think_open) + "R" + t.think_close + "C";
+        const std::string call = std::string(t.call_open) + "not a call" + t.call_close;
+        for (size_t cut = 0; cut <= think.size(); cut++) {
+            AnswerStream s(f, false);
+            std::vector<std::pair<bool, std::string>> out;
+            s.feed(think.substr(0, cut), out);
+            s.feed(think.substr(cut), out);
+            s.finish(out);
+            check(s.reasoning() == "R" && s.content() == "C",
+                  (name + ": think tags are matched, split at byte " + std::to_string(cut)).c_str());
+        }
+        for (size_t cut = 0; cut <= call.size(); cut++) {
+            AnswerStream s(f, true);
+            std::vector<std::pair<bool, std::string>> out;
+            s.feed(call.substr(0, cut), out);
+            s.feed(call.substr(cut), out);
+            s.finish(out);
+            // Not a valid body, so it comes back as content: open tag, body and close tag, which proves both
+            // call tags were seen (an unseen close tag would leave the body unterminated and drop the tag).
+            check(s.calls().empty() && s.content() == call && s.reasoning().empty(),
+                  (name + ": call tags are matched, split at byte " + std::to_string(cut)).c_str());
+        }
+    }
+}
+
 void test_answer_parser() {
     const auto F = AnswerFamily::qwen3;
     {   // reasoning, then content: the Qwen3 shape this route sees on every answer
         const auto a = parse_answer("<think>\nOkay, the user asked.", F, false);
-        check(a.reasoning == "\nOkay, the user asked.", "reasoning_content is the inside of <think>");
+        check(a.reasoning == "Okay, the user asked.",
+              "reasoning_content is the inside of <think>, without the newline the model puts after the tag");
         check(a.content.empty() && a.calls.empty(), "a reasoning-only answer has no content and no calls");
         check(!a.content_null, "content is empty string, not null, when there are no calls");
 
@@ -964,9 +1363,39 @@ void test_request_parsing() {
 
 }  // namespace
 
+// engine#2017: the logits row is `vocab_size` wide, which may exceed the tokenizer (Qwen3-0.6B: 151,936 for 151,669
+// ids; the shape below is the issue's, 32,032 for 32,016). Ids past the tokenizer are padding positions: every real
+// logit negative and the padding at exactly 0.0 is the row where an unbounded argmax picks one (engine#1182).
+void test_vocab_bound() {
+    const int V = 32016, W = 32032;
+    std::vector<float> row(size_t(W), 0.0f);
+    for (int v = 0; v < V; v++) row[size_t(v)] = -1.0f - float(v % 97) * 0.01f;
+    row[123] = -0.5f;  // the real best
+    check(argmax_token(row.data(), size_t(W)) >= V, "control: an unbounded argmax lands on a padding id");
+    check(argmax_token(row.data(), size_t(W), V) == 123, "the bounded argmax picks the best real id");
+    check(sample(row, SampleParams(), 1) >= V, "control: unbounded greedy sample lands on a padding id");
+    std::mt19937_64 rng(1);
+    check(sample_token(row, SampleParams(), rng, nullptr, V) == 123, "bounded greedy sample picks the best real id");
+    SampleParams hot;
+    hot.temperature = 1.0f;
+    bool all_real = true;
+    for (uint64_t s = 0; s < 200; s++) {
+        std::mt19937_64 r(s);
+        if (sample_token(row, hot, r, nullptr, V) >= V) all_real = false;
+    }
+    check(all_real, "a bounded draw at temperature 1 never draws a padding id");
+    std::vector<char> mask(size_t(W), 1);
+    std::mt19937_64 r2(2);
+    check(sample_token(row, SampleParams(), r2, &mask, V) == 123, "the bound holds with a mask that allows padding");
+    check(token_bound(size_t(W), 0) == size_t(W), "no tokenizer keeps the whole row");
+    check(token_bound(size_t(V), W) == size_t(V), "a tokenizer larger than the row does not widen it");
+}
+
 int main() {
+    test_vocab_bound();
     test_sampler();
     test_sampler_distribution();
+    test_sample_probs();
     test_stop();
     test_json_grammar();
     test_gbnf();
@@ -974,11 +1403,16 @@ int main() {
     test_logprobs();
     test_logprob_options();
     test_prefix_cache();
+    test_prefix_pin();
     test_json_schema();
     test_json_schema_refusals();
     test_answer_parser();
     test_answer_stream();
     test_tool_grammar();
+    test_gemma4_answer_parser();
+    test_harmony_answer_parser();
+    test_every_family_tag_is_matched();
+    test_answer_family_of_template();
     test_tool_request_parsing();
     test_content_mask();
     test_request_parsing();

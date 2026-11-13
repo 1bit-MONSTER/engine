@@ -38,7 +38,11 @@
 # LIBHSA overrides the HSA runtime source; the default is the system's libhsa-runtime64.so.1.
 set -euo pipefail
 
-[ $# -ge 3 ] || { sed -n '18,34p' "$0"; exit 2; }
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
+[ $# -ge 3 ] || { usage; exit 2; }
 bundle=$(cd "$1" && pwd) out=$2 ver=$3
 [ -x "$bundle/1bit" ] || { echo "not a 1bit bundle: $bundle (no 1bit binary)" >&2; exit 1; }
 [ -d "$bundle/hrx/llama/bin" ] || { echo "not a 1bit bundle: $bundle (no hrx/llama/bin)" >&2; exit 1; }

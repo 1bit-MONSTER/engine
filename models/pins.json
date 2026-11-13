@@ -2385,24 +2385,24 @@
    }
   },
   "unsloth/Qwen3.8-27B-GGUF": {
-   "commit": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
-   "pinned": "2026-11-05",
+   "commit": "4af51b3542f775b0a8e4b310bfb3f17e01c306c9",
+   "pinned": "2026-11-12",
    "used_for": [
     "stick: Lemonade catalogue (Qwen3.8-27B-UD-Q4_K_XL.gguf)",
     "upstream of 1bit-MONSTER/Qwen3.8-27B-UD-Q4_K_XL-MTP"
    ],
    "files": {
-    "Qwen3.8-27B-UD-Q4_K_XL.gguf": {
-     "oid": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
-     "size": 17559178144,
-     "lfs": true,
-     "template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
-    },
     "MTP/mtp-Qwen3.8-27B-Q4_0.gguf": {
      "oid": "50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e",
      "size": 1369590656,
      "lfs": true,
      "template_sha256": "701ba13a085c0c1b5e05414dec1aa3069904f962beee36f0899e441720b83974"
+    },
+    "Qwen3.8-27B-UD-Q4_K_XL.gguf": {
+     "oid": "2a5f3565f39cf885103da591182c1266da64745737b42b452fd3e675369f1211",
+     "size": 17659407264,
+     "lfs": true,
+     "template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
     }
    }
   },

@@ -55,6 +55,11 @@ GGUF's own. A shared expert (ffn_*_shexp, ffn_gate_inp_shexp) is packed like any
 projection; Qwen3-30B-A3B has none.
 
 Supported architectures: qwen3, qwen3moe and qwen2. Needs numpy and gguf (gguf-py).
+
+A GGUF of another architecture is refused before anything is written, with every tensor kind that
+has no Q4NX name in one message; qwen35 (gated linear attention) is tools/qwen35_to_q4nx.py's. A
+tensor type the installed gguf package does not know (PTQ1_0 is ggml type 143) is refused by
+number (engine#2013).
 """
 import argparse
 import json
@@ -158,13 +163,70 @@ ROUTER = {"ffn_gate_inp", "ffn_gate_inp_shexp"}
 def hf_name(name):
     base, _, suffix = name.rpartition(".")
     if base.startswith("blk."):
-        _, L, part = base.split(".", 2)
-        if part not in LAYER:
+        bits = base.split(".", 2)
+        # blk.N.ssm_a has no suffix, so its base is "blk.N": that is an unnamed tensor too, not a crash
+        if len(bits) < 3 or bits[2] not in LAYER:
             raise SystemExit(f"no Q4NX name for {name}")
-        return f"model.layers.{L}.{LAYER[part]}.{suffix}"
+        return f"model.layers.{bits[1]}.{LAYER[bits[2]]}.{suffix}"
     if base not in TOP:
         raise SystemExit(f"no Q4NX name for {name}")
     return f"{TOP[base]}.{suffix}"
+
+
+# Where a GGUF this converter cannot name goes instead.
+OTHER_CONVERTER = {
+    "qwen35": "tools/qwen35_to_q4nx.py packs a qwen35 GGUF (gated linear attention layers)",
+}
+# ggml tensor types the gguf package may not know, by number.
+FOREIGN_TYPES = {
+    143: "PTQ1_0, PrismML's ternary type; tools/ternary_to_q4_0.py rewrites it as Q4_0",
+}
+
+
+def open_gguf(path):
+    """gguf.GGUFReader, with an unknown tensor type refused by number instead of an enum ValueError.
+
+    The reader turns every tensor's type into gguf.GGMLQuantizationType while it parses the table, so a type the
+    installed package does not know ends the run in `ValueError: np.uint32(143) is not a valid
+    GGMLQuantizationType` and a traceback (engine#2013). It is the file's type this converter cannot read, and
+    that is what the message has to say.
+    """
+    try:
+        return gguf.GGUFReader(path)
+    except ValueError as e:
+        m = re.search(r"(\d+)\)? is not a valid GGMLQuantizationType", str(e))
+        if not m:
+            raise
+        n = int(m.group(1))
+        known = FOREIGN_TYPES.get(n)
+        raise SystemExit(
+            f"{path}: a tensor has ggml quantisation type {n}, which the installed gguf package cannot read"
+            + (f" ({known})" if known else "") + "; nothing was converted") from None
+
+
+def refuse_unnamed(r):
+    """Every tensor kind with no Q4NX name, in one refusal, before anything is written (engine#2013).
+
+    hf_name() stops at the first one, which on a GGUF of another architecture is blk.0's first unknown part: the
+    message then reads like one missing table row when the whole layer family is missing.
+    """
+    kinds = {}
+    for t in r.tensors:
+        try:
+            hf_name(t.name)
+        except SystemExit:
+            kind = re.sub(r"^blk\.\d+\.", "blk.N.", t.name)
+            kinds.setdefault(kind, [0, t.name])[0] += 1
+    if not kinds:
+        return
+    first = next(iter(kinds.values()))[1]
+    arch = field(r, "general.architecture")
+    listing = ", ".join(f"{k} x{n}" for k, (n, _) in kinds.items())
+    hint = OTHER_CONVERTER.get(str(arch))
+    raise SystemExit(
+        f"no Q4NX name for {first}: architecture {arch!r} has {len(kinds)} tensor kind(s) this converter cannot "
+        f"name ({listing}); it converts qwen3, qwen3moe and qwen2" + (f". {hint}" if hint else "")
+        + "; nothing was written")
 
 
 def field(r, key, default=None):
@@ -373,7 +435,8 @@ def moe_meta(r, items, table):
 
 
 def pack(args):
-    r = gguf.GGUFReader(args.gguf)
+    r = open_gguf(args.gguf)
+    refuse_unnamed(r)            # before the output directory exists: no empty directory left behind
     refuse_unsupported_rope(r)   # before the output directory exists: no half-written container
     os.makedirs(args.out, exist_ok=True)
     items = planned(r)
@@ -460,7 +523,8 @@ def pack(args):
 
 def verify(args):
     """Every Q4NX tensor against the GGUF, dequantized."""
-    r = gguf.GGUFReader(args.gguf)
+    r = open_gguf(args.gguf)
+    refuse_unnamed(r)
     with open(os.path.join(args.out, "model.q4nx"), "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
         hdr = json.loads(f.read(n))

@@ -33,6 +33,10 @@
 # says where else it belongs and why a scheduled red needs a workflow change (an RFC under CONTRIBUTING).
 set -uo pipefail
 
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
 repo=1bit-MONSTER/engine
 require=()
 list=0
@@ -41,7 +45,7 @@ while [ $# -gt 0 ]; do
         --repo) repo=$2; shift 2 ;;
         --require) shift; while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do require+=("$1"); shift; done ;;
         --list) list=1; shift ;;
-        -h|--help) sed -n '16,33p' "$0"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
         *) echo "check-ci-runners.sh: unknown option $1" >&2; exit 2 ;;
     esac
 done

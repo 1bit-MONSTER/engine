@@ -53,9 +53,13 @@
 # the family it is building, so each family is proven in that family's container:
 # docs/install-any-distro.md.
 set -euo pipefail
+
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- two of these ranges had
+# drifted past the end of their header and printed code to whoever asked for help (engine#2129).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
 umask 022
 
-[ $# -ge 2 ] || { sed -n '16,62p' "$0"; exit 2; }
+[ $# -ge 2 ] || { usage; exit 2; }
 out=$1 ver=$2; shift 2
 repo=$(cd "$(dirname "$0")/.." && pwd)
 

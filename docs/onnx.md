@@ -463,18 +463,47 @@ silent fall back cannot be mistaken for a device pass.
 
 ## Any graph: `ort-run --input`
 
-`ort-run` speaks two interfaces. With `--ids` it is the Qwen3 language model of
-[Qwen3-0.6B](#qwen3-06b) below. With `--input` it is **any** ONNX graph: nothing about the graph's
-names, shapes or roles is assumed, so a vision model, an audio model and a one-op toy all take the
-same path.
+`ort-run` speaks two interfaces, and **which binary you are holding decides which one you get**
+(engine#2000):
+
+* **`--ids`** is the Qwen3 language model of [Qwen3-0.6B](#qwen3-06b) below.
+* **`--input`** (with `--output`, `--dump-all`) is **any** ONNX graph: nothing about the graph's names,
+  shapes or roles is assumed, so a vision model, an audio model and a one-op toy all take the same path.
+
+Both are implemented once, in `onnx/ort_run.cpp`, and that file backs two entry points:
+
+| entry point | built by | notes |
+|---|---|---|
+| `1bit ort-run` | `ninja onebit` **with `-DONEBIT_ORT=ON`** | dispatches to the same `onebit_ort_run_main` (`app/main.cpp`), whose parser handles `--input` (`onnx/ort_run.cpp`) |
+| `build/onnx/ort_run` | `ninja -C build ort_run` | the standalone binary; **not** part of `ninja onebit` |
+
+The trap is the guard, not the flags. `app/main.cpp` dispatches `ort-run` inside `#ifdef ONEBIT_ORT`, and
+`onnx/` is added with `add_subdirectory(onnx)` under the same option — so in a configure without
+`ONEBIT_ORT` there is no standalone binary *and* the subcommand does not exist:
+
+```sh
+$ 1bit ort-run --model m.onnx --input x=x.bin:float32:1x4x4   # ONEBIT_ORT not configured
+1bit: unknown command 'ort-run'
+```
+
+Build the ONNX component before reaching for either form, and note where the standalone binary lands —
+`add_executable(ort_run …)` lives in `onnx/CMakeLists.txt` and the root does not override
+`CMAKE_RUNTIME_OUTPUT_DIRECTORY`, so a Ninja or Makefiles build puts it in the subdirectory (measured):
+
+```sh
+cmake -B build -DONEBIT_ORT=ON
+ninja -C build ort_run      # -> build/onnx/ort_run
+```
+
+Earlier revisions of this page wrote the examples below as `build/ort_run`, which is not that path.
 
 ```sh
 # one declared input, raw little-endian float32, NHWC 1x640x640x3
-build/ort_run --model yolov8m.onnx \
+build/onnx/ort_run --model yolov8m.onnx \
   --input DetectionModel::input_0=x.bin:float32:1x640x640x3 \
   --dump-all out/
 # the same, writing only what you name, and with our plugin EP asked first
-build/ort_run --model m.onnx --ep build/ep/libonebit_ep.so \
+build/onnx/ort_run --model m.onnx --ep build/ep/libonebit_ep.so \
   --input x=x.bin:float32:1x4x4 --output y=y.bin
 ```
 

@@ -33,8 +33,10 @@
 //   [2] the last chunk's logits equal the sequential reference's at that position, bit for bit: in host-GEMM mode
 //       both sides are the same arithmetic in the same order, so any tolerance would only hide a one-row prefix leak.
 //
-// Where it runs: the row is registered under if(ONEBIT_NPU) (it links onebit_npu_forward) and ci.yml configures
-// without it, so it runs on a dev box with ONEBIT_NPU=ON and a container, not in CI.
+// Where it runs: in CI (engine#1946), built against the public runtime stub and run by tests/batch_check_state_ci.py
+// on a two-layer container that script fabricates; and on a dev box with ONEBIT_NPU=ON, on the container named by
+// ONEBIT_TEST_Q4NX.
+#include "file_create.h"
 #include "q4nx_forward.h"
 
 #include <cmath>
@@ -103,6 +105,17 @@ int main() {
             return 1;
         }
     }
+    // A caller that has its own reference forward of the container (tests/batch_check_state_ci.py lfm3) asks for the
+    // sequential logits: batched == sequential cannot see a rule both paths get wrong, a reference can.
+    if (const char* out = std::getenv("ONEBIT_TEST_LOGITS_OUT")) {
+        FILE* f = onebit_fopen_private_wb(out);   // 0600, never through a symlink (file_create.h)
+        if (!f || std::fwrite(ref.data(), sizeof(float), ref.size(), f) != ref.size()) {
+            std::printf("FAIL  cannot write the sequential logits to %s\n", out);
+            if (f) std::fclose(f);
+            return 1;
+        }
+        std::fclose(f);
+    }
 
     fwd.reset();
     std::vector<float> logits;
@@ -121,6 +134,44 @@ int main() {
     std::snprintf(msg, sizeof msg, "last chunk's logits vs the sequential reference: rel-L1 %.2e, argmax %d vs %d", rel,
                   argmax(logits), argmax(ref));
     check(argmax(logits) == argmax(ref) && rel == 0.0, msg);
+
+    // engine#1780: the verify a speculative decoder runs. A prefix, then k drafted rows in one step_batch_all(): every
+    // row's logits must be the sequential step's at that position, bit for bit; then a partial accept rolls the cache
+    // back to the accepted rows, and the next step must continue exactly as a forward that only ever saw those rows.
+    // The rollback is where a model with two attention geometries (Gemma4) lost half its full layers' positions.
+    {
+        const std::vector<int> prefix = {1, 2, 3}, drafts = {4, 5, 6, 7};
+        const int next_tok = 8, accepted = 2;
+        const int P = (int)prefix.size(), K = (int)drafts.size();
+        fwd.reset();
+        std::vector<float> seq, rows_ref;
+        for (int i = 0; i < P; i++)
+            if (!fwd.step(prefix[(size_t)i], i, seq)) { std::printf("FAIL  prefix step: %s\n", fwd.last_error()); return 1; }
+        for (int i = 0; i < K; i++) {
+            if (!fwd.step(drafts[(size_t)i], P + i, seq)) { std::printf("FAIL  draft step: %s\n", fwd.last_error()); return 1; }
+            rows_ref.insert(rows_ref.end(), seq.begin(), seq.end());
+        }
+        // The forward that only ever saw the accepted rows, then the next token.
+        fwd.reset();
+        std::vector<float> next_ref;
+        for (int i = 0; i < P; i++) fwd.step(prefix[(size_t)i], i, seq);
+        for (int i = 0; i < accepted; i++) fwd.step(drafts[(size_t)i], P + i, seq);
+        if (!fwd.step(next_tok, P + accepted, next_ref)) { std::printf("FAIL  reference step: %s\n", fwd.last_error()); return 1; }
+
+        fwd.reset();
+        for (int i = 0; i < P; i++) fwd.step(prefix[(size_t)i], i, seq);
+        std::vector<float> rows;
+        fwd.begin_verify(K, P);
+        if (!fwd.step_batch_all(drafts, P, rows)) { std::printf("FAIL  step_batch_all: %s\n", fwd.last_error()); return 1; }
+        check(rows.size() == rows_ref.size() && rows == rows_ref,
+              "verify: every drafted row's logits are the sequential step's, bit for bit (" + std::to_string(K) + " rows)");
+        if (!fwd.commit_verify_rows(accepted)) { std::printf("FAIL  commit_verify_rows: %s\n", fwd.last_error()); return 1; }
+        check(holds_exactly(fwd, P + accepted),
+              "verify: a partial accept leaves exactly prefix + accepted positions (" + std::to_string(P + accepted) + ")");
+        std::vector<float> next;
+        if (!fwd.step(next_tok, P + accepted, next)) { std::printf("FAIL  step after commit: %s\n", fwd.last_error()); return 1; }
+        check(next == next_ref, "verify: the step after a partial accept equals the forward that saw only those rows");
+    }
 
     std::printf("%s (%d failed)\n", fails == 0 ? "ALL PASS" : "FAILED", fails);
     return fails == 0 ? 0 : 1;

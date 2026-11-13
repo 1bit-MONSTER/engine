@@ -53,6 +53,13 @@ git -C "$tmp" commit -qm base
 
 # captured into a variable, never piped: `gate | grep -q` would make grep close the pipe early and, with pipefail,
 # report the gate's SIGPIPE instead of its verdict
+NOTICE_BLOCK=$(python3 - "$tmp/copyright.py" <<'PYN'
+import sys
+src = open(sys.argv[1]).read()
+notice = src.split('NOTICE = """')[1].split('""".split')[0]
+print("".join("# " + l + "\n" if l.strip() else "#\n" for l in notice.splitlines()), end="")
+PYN
+)
 gate() { ( cd "$tmp" && python3 copyright.py --check 2>&1 ); }
 gate_has() { case "$(gate)" in *"$1"*) return 0;; *) return 1;; esac; }
 
@@ -136,6 +143,64 @@ check "near-miss beside an existing notice leaves exactly two copyright lines" \
       "[ $(grep -c '^# Copyright' "$both") -eq 2 ]" "$(grep -c '^# Copyright' "$both") line(s)"
 check "and the near-miss spelling is the one that went" "[ $(grep -c 'bong-water-bong$' "$both") -eq 0 ]" "$(grep 'Copyright' "$both")"
 rm -f "$both"; git -C "$tmp" update-index --force-remove both.py 2>/dev/null
+
+# 2. the two-liner without the licence block: --fix must leave ONE notice, not a copy of the pair beside the block
+# (engine#2129 -- --fix used to prepend the block, keep the two-liner, and then fail its own --check with "duplicated
+# inside the header window", so the file it had just written was invalid and neither mode said so).
+printf '# Copyright 2026 bong-water-bong\n# SPDX-License-Identifier: Apache-2.0\n\nx = 1\n' > "$tmp/twoliner.py"
+git -C "$tmp" add twoliner.py
+( cd "$tmp" && python3 copyright.py --fix >/dev/null 2>&1 )
+check "--fix on a two-liner leaves a file that its own --check accepts" \
+      "! ( cd \"$tmp\" && python3 copyright.py --check 2>&1 | grep -q duplicated )" \
+      "$( cd "$tmp" && python3 copyright.py --check 2>&1 )"
+check "...and exactly one SPDX line is left in the window" \
+      "[ \$(head -20 \"$tmp/twoliner.py\" | grep -c 'SPDX-License-Identifier') -eq 1 ]" \
+      "window: $(head -20 "$tmp/twoliner.py" | grep -c 'SPDX-License-Identifier') SPDX line(s)"
+
+# 3. the block pasted twice: --fix must leave ONE notice. This is #2192's second shape -- `--fix` printed `repaired:` and
+# left the copy in place, so the file it had just written still failed the very check that sent it there.
+printf '%s%s\nx = 1\n' "$NOTICE_BLOCK" "$NOTICE_BLOCK" > "$tmp/doubled.py"
+git -C "$tmp" add doubled.py
+# (checked with `case`, not `python --check | grep -q`: this file runs under `set -o pipefail` and `--check` exits 1 BY DESIGN
+# for the duplicate it just reported, so the pipeline would return 1 even when grep matched -- the same `cmd | grep` trap that
+# makes `$?` the pipeline's rather than the command's.)
+# the report must name the command that repairs it: the old text said "delete the second copy", i.e. hand-edit a file that
+# `--fix` had been failing on and now repairs (engine#2192), so a reader was told to do by hand what the tool does.
+# assigned first, not nested: `\"` inside `$( )` inside a double-quoted argument is NOT unescaped by bash, so a nested form
+# comparing the captured output passes the quote characters into the path (`cd: "/tmp/..."`).
+dup_report=$( cd "$tmp" && python3 copyright.py --check 2>&1 )
+check "the duplicate report names --fix rather than telling the reader to edit by hand" \
+      "case \"\$dup_report\" in *'keeps the first copy'*) true ;; *) false ;; esac" \
+      "$( cd "$tmp" && python3 copyright.py --check 2>&1 | grep duplicated )"
+( cd "$tmp" && python3 copyright.py --fix >/dev/null 2>&1 )
+check "--fix on a doubled block leaves a file that its own --check accepts" \
+      "! ( cd \"$tmp\" && python3 copyright.py --check 2>&1 | grep -q duplicated )" \
+      "$( cd "$tmp" && python3 copyright.py --check 2>&1 )"
+check "...and exactly one SPDX line survives the repair" \
+      "[ \$(grep -c 'SPDX-License-Identifier' \"$tmp/doubled.py\") -eq 1 ]" \
+      "$(grep -c 'SPDX-License-Identifier' "$tmp/doubled.py") SPDX line(s)"
+
+# engine#2183: outside a repository `git ls-files` exits 128, and `check=True` turned that into a bare
+# Python traceback. Six pushes to one PR were made without the header the tool was asking for, because a
+# traceback reads as "the tool is broken" rather than "run it from the repository root". A directory that
+# is not inside any work tree must get a diagnostic naming the cause and the remedy, and its own exit code.
+#
+# The status is captured rather than piped: this file runs with `pipefail`, so `python3 ... | grep -q` fails
+# on the tool's own non-zero exit even when the pattern matches, and an arm written that way tests nothing.
+nogit=$(mktemp -d)
+cp "$root/tools/copyright.py" "$nogit/copyright.py"
+nogit_out=$( cd "$nogit" && python3 copyright.py --check 2>&1 )
+nogit_rc=$( cd "$nogit" && python3 copyright.py --check >/dev/null 2>&1; echo $? )
+check "outside any work tree: a diagnostic, not a traceback" \
+      "[ \$(printf %s \"\$nogit_out\" | grep -c Traceback) -eq 0 ]" \
+      "$(printf %s "$nogit_out" | tail -3)"
+check "...it names the remedy (the repository root)" \
+      "printf %s \"\$nogit_out\" | grep -q 'root of the repository'" \
+      "$nogit_out"
+check "...and exits 2, distinct from 1 (offenders found)" \
+      "[ \"\$nogit_rc\" -eq 2 ]" \
+      "exit $nogit_rc"
+rm -rf "$nogit"
 
 echo "$([ $fail -eq 0 ] && echo PASS || echo FAIL)"
 exit $((fail))

@@ -32,6 +32,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -282,6 +284,45 @@ static void oga_geometry(void) {
                       "fused: a non-q4_1 byte count returns -2 so the caller keeps the two-step path");
             printf("  fused chunks->int8: K=%d N=%d  %d codes and %d scales byte-identical to dequant->pack\n",
                    K, N, K * N, N);
+
+            /* THE SAME COMPARISON ON A SYMMETRIC TENSOR WITH AN UNDECIDED TILE (the LFM2 packs' tile kind). Three tiles
+             * are symmetric on their own evidence (zero-points 0, scales of both signs); tile 1 has every zero-point 0
+             * and every scale positive, which decides nothing on its own. The tensor is symmetric, so both paths must
+             * read tile 1 as two's-complement codes: decoded as a one-tile tensor it comes out unsigned, and the fused
+             * path did exactly that. */
+            for (size_t t = 0; t < ntr * ntc; t++) {
+                uint8_t* tile = tiles + t * 5120;
+                for (int i = 0; i < 256; i++) {
+                    const int neg = (t != 1) && (i % 3 == 0);
+                    tile[2 * i] = 0x00;
+                    tile[2 * i + 1] = neg ? 0xBE : 0x3E;        /* bf16 -0.125 / +0.125 */
+                    tile[512 + 2 * i] = 0; tile[512 + 2 * i + 1] = 0;
+                }
+                for (size_t i = 0; i < 4096; i++) tile[1024 + i] = (uint8_t)((i * 53 + t * 29 + 0xC8) & 0xFF);
+            }
+            check_int(q4nx_tile_kind(tiles + 5120), Q4NX_TILE_UNDECIDED, "fused, symmetric: tile 1 decides nothing on its own");
+            check_int(q4nx_tiles_kind(tiles, ntr * ntc, 5120), Q4NX_TILE_SYMMETRIC, "fused, symmetric: the tensor is symmetric");
+            check_int(q4nx_dequant_tensor_chunked(tiles, ntr * ntc * 5120, K, N, 5120, B), 0,
+                      "fused, symmetric: the reference path dequantises it");
+            int neg_in_tile1 = 0;
+            for (int r = 0; r < 32; r++)
+                for (int c = 256; c < 512; c++)
+                    if (B[(size_t)r * N + c] < 0) neg_in_tile1++;
+            check(neg_in_tile1 > 0, "fused, symmetric: the reference reads tile 1 with negative weights (signed codes, positive scales)");
+            q4nx_pack_B_int8(B, K, N, ref, ld, sc_ref);
+            check_int(q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120, K, N, fused, ld, sc_fused), 0,
+                      "fused, symmetric: the fused path accepts it");
+            bad_code = 0; bad_scale = 0;
+            for (int i = 0; i < K * N; i++) if (fused[i] != ref[i]) bad_code++;
+            for (int j = 0; j < N; j++) if (sc_fused[j] != sc_ref[j]) bad_scale++;
+            check_int(bad_code, 0, "fused, symmetric: every code is byte-identical to dequant -> pack, the undecided tile's included");
+            check_int(bad_scale, 0, "fused, symmetric: every column scale as well");
+            /* one zero-point in tile 3: a tensor with both kinds, refused by both paths */
+            tiles[3 * 5120 + 512 + 1] = 0x3F;
+            check_int(q4nx_dequant_tensor_chunked(tiles, ntr * ntc * 5120, K, N, 5120, B), -1,
+                      "fused, mixed: the reference path refuses a tensor with both kinds");
+            check_int(q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120, K, N, fused, ld, sc_fused), -1,
+                      "fused, mixed: and so does the fused path");
         }
         free(tiles); free(B); free(ref); free(fused); free(sc_ref); free(sc_fused);
     }
@@ -599,13 +640,335 @@ static void test_head_image(void) {
                       "head image: a truncated image is refused");
                 remove(path);
             }
+            /* (e) TWO WRITERS, ONE IMAGE. Two serves that start cold on the same pack write the same file at the same
+             * time. Each must end with a successful write and the path must read back intact after every one of them:
+             * with one shared temp name the second open truncated the first writer's file and one rename found nothing. */
+            {
+                const int bk = 2048, bn = 2048;     /* 4 MiB, so a write is long enough for the two to overlap */
+                int8_t* big = malloc((size_t)bk * bn);
+                int8_t* big_back = malloc((size_t)bk * bn);
+                float* bsc = malloc((size_t)bn * sizeof(float));
+                float* bsc_back = malloc((size_t)bn * sizeof(float));
+                check(big && big_back && bsc && bsc_back, "head image: the two-writer fixture allocates");
+                if (big && big_back && bsc && bsc_back) {
+                    for (size_t i = 0; i < (size_t)bk * bn; i++) big[i] = (int8_t)((i * 31u + 7u) % 251u - 125);
+                    for (int n = 0; n < bn; n++) bsc[n] = 0.001f * (float)(n + 1);
+                    const char* shared = "head_image_two_writers.bin";
+                    remove(shared);
+                    const int rounds = 40;
+                    fflush(stdout);
+                    const pid_t child = fork();
+                    if (child == 0) {
+                        int bad = 0;
+                        for (int i = 0; i < rounds; i++) bad += q4nx_head_image_write(shared, big, bsc, bk, bn) != 1;
+                        _exit(bad > 255 ? 255 : bad);
+                    }
+                    int bad_w = 0, bad_r = 0;
+                    for (int i = 0; i < rounds; i++) {
+                        bad_w += q4nx_head_image_write(shared, big, bsc, bk, bn) != 1;
+                        bad_r += q4nx_head_image_read(shared, big_back, bk * bn, bsc_back, bn, &info, why, (int)sizeof why) != 1;
+                    }
+                    int st = 0, bad_c = -1;
+                    if (child > 0 && waitpid(child, &st, 0) == child && WIFEXITED(st)) bad_c = WEXITSTATUS(st);
+                    check_int(bad_w, 0, "head image: with a second writer on the same path, every write of ours lands");
+                    check_int(bad_c, 0, "... and so does every write of the other process");
+                    check_int(bad_r, 0, "... and the path reads back intact after each of them");
+                    check(q4nx_head_image_read(shared, big_back, bk * bn, bsc_back, bn, &info, why, (int)sizeof why) == 1 &&
+                              memcmp(big, big_back, (size_t)bk * bn) == 0,
+                          "... and what is left is the image both wrote");
+                    remove(shared);
+                }
+                free(big); free(big_back); free(bsc); free(bsc_back);
+            }
         }
         free(bt); free(codes); free(back); free(scales); free(sc_back);
     }
 }
 
+/* ── THE HEAD TILE CACHE (engine#1716): what a serve calls instead of packing ─────────────────────────────────────────
+ * The issue is "the packed lm-head is rebuilt on every serve". The arms below are that sentence and its two dangerous
+ * neighbours, with a COUNTER on the gather so they are about work done and not about a log line:
+ *   - a second pass over the same tiles gathers only the sample, and returns the bytes a fresh pack returns;
+ *   - a changed key (layout, head bytes) packs again rather than borrowing the other image;
+ *   - a damaged file, and an intact file written for OTHER weights, are both replaced rather than used. */
+typedef struct {
+    int nv, k;
+    int variant;     /* 0: the fixture; 1: row 3 negated (same column scales, different codes); 2: everything x1.25 */
+    long calls;      /* columns gathered */
+} HeadFixture;
+
+static void head_fixture_col(void* ctx, int n, float* out) {
+    HeadFixture* f = (HeadFixture*)ctx;
+    f->calls++;
+    for (int k = 0; k < f->k; k++) {
+        float v = 0.0f;
+        if (n < f->nv) {
+            /* a distinct absmax per column (the lesson of #1778: equal column scales hide a per-column mistake) */
+            v = ((float)((k * 37 + n * 11) % 211) - 105.0f) * 0.004f * (1.0f + 0.01f * (float)(n % 97));
+            if (f->variant == 1 && k == 3) v = -v;
+            if (f->variant == 2) v *= 1.25f;
+        }
+        out[k] = v;
+    }
+}
+
+/* What I8Ctx::packB_into() writes for one tile: zero the image, gather the tile, pack it. */
+static void head_reference(HeadFixture* f, int n0, int ncols, int k, int t, int kd, int nd, int blocked, int8_t* codes,
+                           float* scales) {
+    float* bt = calloc((size_t)k * t, sizeof(float));
+    float* col = malloc((size_t)k * sizeof(float));
+    const long keep = f->calls;
+    for (int j = 0; j < ncols; j++) {
+        head_fixture_col(f, n0 + j, col);
+        for (int i = 0; i < k; i++) bt[(size_t)i * t + j] = col[i];
+    }
+    f->calls = keep;
+    memset(codes, 0, (size_t)kd * nd);
+    for (int j = 0; j < nd; j++) scales[j] = 0.0f;
+    double ssum = 0.0;
+    q4nx_pack_B_int8_blocked(codes, bt, k, t, kd, nd, blocked, scales, &ssum);
+    free(bt); free(col);
+}
+
+static void head_tile_path(const char* dir, const Q4nxHeadImageKey* key, int tile, char* out, size_t out_n) {
+    char name[64];
+    q4nx_head_image_key_name(key, name, (int)sizeof name);
+    char* dot = strrchr(name, '.');
+    if (dot) *dot = 0;
+    snprintf(out, out_n, "%s/%s-t%03d.q4hi", dir, name, tile);
+}
+
+static void test_head_tile_cache(void) {
+    const int k = 128, t = 128, kd = 128, nd = 128, nv = 300, ntiles = 3;   /* the last tile holds 44 real columns */
+    char dir[] = "head_tile_cache.XXXXXX";
+    check(mkdtemp(dir) != NULL, "head tile cache: a scratch cache directory");
+    int8_t* codes = malloc((size_t)kd * nd);
+    int8_t* ref = malloc((size_t)kd * nd);
+    float* scales = malloc((size_t)nd * sizeof(float));
+    float* sref = malloc((size_t)nd * sizeof(float));
+    check(codes && ref && scales && sref, "head tile cache: the fixture allocates");
+    if (!codes || !ref || !scales || !sref) return;
+    HeadFixture fx = {nv, k, 0, 0};
+    char paths[8][512];
+    int npaths = 0;
+
+    for (int blocked = 0; blocked <= 1; blocked++) {
+        Q4nxHeadImageKey key = {(uint32_t)k, (uint32_t)t, (uint32_t)blocked, 0x1716c0ffeeull};
+        int cold_ok = 0, cold_same = 0, warm_hit = 0, warm_same = 0;
+        long cold_calls = 0, warm_calls = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            for (int tile = 0; tile < ntiles; tile++) {
+                const int n0 = tile * t, ncols = (nv - n0 < t) ? nv - n0 : t;
+                head_reference(&fx, n0, ncols, k, t, kd, nd, blocked, ref, sref);
+                Q4nxHeadTileResult r;
+                const long before = fx.calls;
+                memset(codes, 0x55, (size_t)kd * nd);   /* the BO is not ours to assume zero on a hit */
+                const int rc = q4nx_head_tile_image(dir, &key, tile, n0, ncols, k, t, kd, nd, head_fixture_col, &fx, codes,
+                                                    scales, &r);
+                const int same = memcmp(codes, ref, (size_t)kd * nd) == 0 && memcmp(scales, sref, (size_t)t * sizeof(float)) == 0;
+                if (pass == 0) {
+                    cold_ok += rc == 1 && r.hit == 0 && r.wrote == 1 && r.refused == 0;
+                    cold_same += same;
+                    cold_calls += fx.calls - before;
+                    if (npaths < 8) head_tile_path(dir, &key, tile, paths[npaths++], sizeof paths[0]);
+                } else {
+                    warm_hit += rc == 1 && r.hit == 1 && r.wrote == 0 && r.refused == 0 && r.sampled > 0;
+                    warm_same += same;
+                    warm_calls += fx.calls - before;
+                }
+            }
+        }
+        check_int(cold_ok, ntiles, blocked ? "head tile cache (b8): a first pass packs and writes every tile"
+                                           : "head tile cache (rm): a first pass packs and writes every tile");
+        check_int(cold_same, ntiles, "... and its bytes are packB_into()'s bytes (codes and scales)");
+        check_int((int)cold_calls, nv, "... having gathered every vocabulary column once");
+        check_int(warm_hit, ntiles, "head tile cache: a SECOND pass takes every tile from the cache");
+        check_int(warm_same, ntiles, "... byte-identical to a fresh pack, over a buffer that was not zero");
+        check(warm_calls > 0 && warm_calls <= (long)ntiles * Q4NX_HEAD_TILE_SAMPLE,
+              "... gathering only the verification sample, not the vocabulary (the head is NOT rebuilt)");
+    }
+
+    /* a different key must not borrow the image: the layout and the head bytes each name a different file */
+    {
+        Q4nxHeadImageKey other = {(uint32_t)k, (uint32_t)t, 0, 0x1716c0ffeeull ^ 1ull};
+        Q4nxHeadTileResult r;
+        const long before = fx.calls;
+        const int rc = q4nx_head_tile_image(dir, &other, 0, 0, t, k, t, kd, nd, head_fixture_col, &fx, codes, scales, &r);
+        check(rc == 1 && r.hit == 0 && r.wrote == 1, "head tile cache: a different head hash packs, it does not hit");
+        check_int((int)(fx.calls - before), t, "... gathering the whole tile");
+        if (npaths < 8) head_tile_path(dir, &other, 0, paths[npaths++], sizeof paths[0]);
+    }
+
+    Q4nxHeadImageKey key = {(uint32_t)k, (uint32_t)t, 1, 0x1716c0ffeeull};
+    char path[512];
+    head_tile_path(dir, &key, 0, path, sizeof path);
+
+    /* (a) a damaged file is replaced, with the reason, and the next serve hits again */
+    {
+        FILE* f = fopen(path, "r+b");
+        check(f != NULL, "head tile cache: the cached file is where the key says it is");
+        if (f) { fseek(f, 24 + 777, SEEK_SET); int c = fgetc(f); fseek(f, 24 + 777, SEEK_SET); fputc((c ^ 0x21) & 0xff, f); fclose(f); }
+        head_reference(&fx, 0, t, k, t, kd, nd, 1, ref, sref);
+        Q4nxHeadTileResult r;
+        int rc = q4nx_head_tile_image(dir, &key, 0, 0, t, k, t, kd, nd, head_fixture_col, &fx, codes, scales, &r);
+        check(rc == 1 && r.hit == 0 && r.refused == 1 && r.wrote == 1, "head tile cache: a damaged image is REPLACED, not used");
+        check(strstr(r.why, "hash") != NULL, "... and the reason names the hash");
+        check(memcmp(codes, ref, (size_t)kd * nd) == 0, "... and the tile served is the freshly packed one");
+        rc = q4nx_head_tile_image(dir, &key, 0, 0, t, k, t, kd, nd, head_fixture_col, &fx, codes, scales, &r);
+        check(rc == 1 && r.hit == 1, "... after which the cache hits again");
+    }
+    /* (b) THE ARM THE PAYLOAD HASH CANNOT PASS FOR US: an intact, self-consistent image written for OTHER weights under
+     * the same name. Variant 1 keeps every column scale and changes codes; variant 2 changes the scales. Both must be
+     * caught by the sample and replaced -- copying either into a weight BO would answer plausibly and wrongly. */
+    for (int variant = 1; variant <= 2; variant++) {
+        fx.variant = variant;
+        head_reference(&fx, 0, t, k, t, kd, nd, 1, ref, sref);
+        Q4nxHeadTileResult r;
+        int rc = q4nx_head_tile_image(dir, &key, 0, 0, t, k, t, kd, nd, head_fixture_col, &fx, codes, scales, &r);
+        check(rc == 1 && r.hit == 0 && r.refused == 1,
+              variant == 1 ? "head tile cache: an intact image for OTHER weights (same scales, other codes) is not used"
+                           : "head tile cache: an intact image for OTHER weights (other scales) is not used");
+        check(strstr(r.why, variant == 1 ? "holds code" : "has scale") != NULL, "... and the reason names what disagreed");
+        check(memcmp(codes, ref, (size_t)kd * nd) == 0 && memcmp(scales, sref, (size_t)t * sizeof(float)) == 0,
+              "... and the tile served is packed from the weights actually held");
+        rc = q4nx_head_tile_image(dir, &key, 0, 0, t, k, t, kd, nd, head_fixture_col, &fx, codes, scales, &r);
+        check(rc == 1 && r.hit == 1, "... and the replacement is what the next serve hits");
+    }
+    fx.variant = 0;
+    /* (c) the cache is never required: no directory, or one that cannot be written, packs and says it wrote nothing */
+    {
+        head_reference(&fx, 256, 44, k, t, kd, nd, 1, ref, sref);
+        Q4nxHeadTileResult r;
+        int rc = q4nx_head_tile_image(NULL, &key, 2, 256, 44, k, t, kd, nd, head_fixture_col, &fx, codes, scales, &r);
+        check(rc == 1 && r.hit == 0 && r.wrote == 0 && memcmp(codes, ref, (size_t)kd * nd) == 0,
+              "head tile cache: with no cache directory the tile packs as it always did");
+        rc = q4nx_head_tile_image("head_tile_cache.no-such-dir/x", &key, 2, 256, 44, k, t, kd, nd, head_fixture_col, &fx,
+                                  codes, scales, &r);
+        check(rc == 1 && r.hit == 0 && r.wrote == 0 && r.refused == 0 && memcmp(codes, ref, (size_t)kd * nd) == 0,
+              "head tile cache: an unwritable directory is not an error either");
+        /* and a geometry the key does not describe is refused outright rather than packed under the wrong name */
+        rc = q4nx_head_tile_image(dir, &key, 0, 0, t, k - 64, t, kd, nd, head_fixture_col, &fx, codes, scales, &r);
+        check(rc == 0 && r.why[0] != 0, "head tile cache: a K that is not the key's kpad is refused");
+    }
+    /* (d) the source hash moves with the bytes and with the facts beside them */
+    {
+        unsigned char bytes[64];
+        for (int i = 0; i < 64; i++) bytes[i] = (unsigned char)(i * 7);
+        uint32_t extra[2] = {300, 128};
+        const uint64_t h0 = q4nx_head_source_hash(bytes, sizeof bytes, extra, 2);
+        bytes[40] ^= 1;
+        const uint64_t h1 = q4nx_head_source_hash(bytes, sizeof bytes, extra, 2);
+        bytes[40] ^= 1;
+        extra[0] = 301;
+        const uint64_t h2 = q4nx_head_source_hash(bytes, sizeof bytes, extra, 2);
+        check(h0 != 0 && h1 != h0 && h2 != h0 && h1 != h2, "head source hash: one byte, or one fact beside the bytes, changes it");
+        check(q4nx_head_source_hash(NULL, 0, NULL, 0) == 0, "head source hash: no data is 0, which names no cache entry");
+    }
+
+    for (int i = 0; i < npaths; i++) remove(paths[i]);
+    check(rmdir(dir) == 0, "head tile cache: only the files the keys name were written (the directory empties)");
+    free(codes); free(ref); free(scales); free(sref);
+}
+
+/* LFM2-1.2B: a hybrid whose conv layers need one more projection, in_proj (K=H, N=3*H). It is the fused-projection
+ * role at a new N and nothing else: no Z, the other four designs untouched, and off when the model has GDN layers. */
+static void shortconv_geometry(void) {
+    Q4nxModelDims d;
+    memset(&d, 0, sizeof d);
+    d.H = 2048; d.NH = 32; d.NKV = 8; d.HD = 64; d.IM = 8192;
+    d.fused_gu = 1; d.M = Q4NX_DESIGN_M_PREFILL;
+    Q4nxDesignGeom plain[Q4NX_MAX_DESIGNS], g[Q4NX_MAX_DESIGNS];
+    const int n0 = q4nx_derive_designs(&d, plain);
+    d.shortconv_n = 3 * d.H;
+    check_int(q4nx_num_designs(&d), n0 + 1, "short-convolution layers add exactly one design to the count");
+    const int n = q4nx_derive_designs(&d, g);
+    check_int(n, n0 + 1, "and exactly one to the derived table");
+    Q4nxDesignGeom* in = find(g, n, Q4NX_DESIGN_QKVLIN);
+    check(in != NULL, "it is the fused-projection role");
+    if (in) {
+        check_int(in->K, 2048, "in_proj K is the hidden size");
+        check_int(in->N, 6144, "in_proj N is 3 * hidden: [B | C | X]");
+        check(strcmp(in->elf_name, "full_i8_QKV_K2048_N6144.elf") == 0, "its artifact name is geometry-derived, like every other");
+    }
+    check(find(g, n, Q4NX_DESIGN_Z) == NULL, "no Z design: a conv layer has no gate projection");
+    int same = 1;
+    for (int i = 0; i < n0; i++)
+        if (g[i].role != plain[i].role || g[i].K != plain[i].K || g[i].N != plain[i].N ||
+            strcmp(g[i].elf_name, plain[i].elf_name) != 0) same = 0;
+    check(same, "the attention and feed-forward designs are the ones the same model derives without it");
+    Q4nxDesignGeom* o = find(g, n, Q4NX_DESIGN_O);
+    check(o && o->K == 2048 && o->N == 2048, "out_proj (H -> H) is the O design when NH*HD == H");
+    d.lin_kd = 1024; d.lin_vd = 2048;
+    Q4nxDesignGeom both[Q4NX_MAX_DESIGNS];
+    const int nb = q4nx_derive_designs(&d, both);
+    check_int(nb, n0 + 2, "with GDN dims set the GDN pair is derived and shortconv_n adds nothing");
+    check_int(q4nx_num_designs(&d), nb, "and the count agrees with the table");
+}
+
+/* engine#1999 / #2001 review, closed here: the head path on a geometry that is not a whole 128-column tile grid.
+ * `blocked_fits(128, 96)` is false, so the forward packs the head ROW-MAJOR and the key carries blocked = 0.
+ * `test_head_tile_cache()` loops blocked 0/1 over an ALIGNED 128x128, so neither of the two things that matter here is
+ * covered: (a) a key that claims the blocked layout for an unaligned geometry must be REFUSED -- blocked_index()
+ * addresses whole tiles, so serving one would read past the image or read foreign bytes -- and (b) a row-major image
+ * still caches: cold writes, warm hits, and the bytes are packB_into()'s. */
+static void test_head_tile_unaligned(void) {
+    const int k = 128, t = 96, kd = 128, nd = 96, nv = 90, ntiles = 1;   /* 96 columns: 3/4 of a tile */
+    char dir[] = "head_tile_unaligned.XXXXXX";
+    check(mkdtemp(dir) != NULL, "unaligned head: a scratch cache directory");
+    int8_t* codes = malloc((size_t)kd * nd);
+    int8_t* ref = malloc((size_t)kd * nd);
+    float* scales = malloc((size_t)nd * sizeof(float));
+    float* sref = malloc((size_t)nd * sizeof(float));
+    check(codes && ref && scales && sref, "unaligned head: the fixture allocates");
+    if (!codes || !ref || !scales || !sref) return;
+    HeadFixture fx = {nv, k, 0, 0};
+
+    /* (a) a blocked key on a geometry with no blocked layout is refused, by name, and writes nothing */
+    {
+        Q4nxHeadImageKey key = {(uint32_t)k, (uint32_t)t, 1, 0xa11a11a11ull};
+        Q4nxHeadTileResult r;
+        const int rc = q4nx_head_tile_image(dir, &key, 0, 0, nv, k, t, kd, nd, head_fixture_col, &fx, codes, scales, &r);
+        check(rc != 1, "unaligned head: a blocked key on a 128x96 geometry is REFUSED, not served");
+        check(strstr(r.why, "no blocked layout") != NULL, "... and the reason names the missing layout");
+        check(r.wrote == 0, "... and nothing was written for it");
+    }
+
+    /* (b) the row-major image caches: cold writes, warm hits, both byte-identical to a fresh pack */
+    {
+        Q4nxHeadImageKey key = {(uint32_t)k, (uint32_t)t, 0, 0xa11a11a11ull};
+        int cold_ok = 0, cold_same = 0, warm_hit = 0, warm_same = 0;
+        Q4nxHeadTileResult r;
+        for (int pass = 0; pass < 2; pass++) {
+            for (int tile = 0; tile < ntiles; tile++) {
+                const int n0 = tile * t, ncols = (nv - n0 < t) ? nv - n0 : t;
+                head_reference(&fx, n0, ncols, k, t, kd, nd, /*blocked=*/0, ref, sref);
+                memset(codes, 0x5a, (size_t)kd * nd);
+                const int rc = q4nx_head_tile_image(dir, &key, tile, n0, ncols, k, t, kd, nd, head_fixture_col, &fx, codes,
+                                                    scales, &r);
+                const int same = memcmp(codes, ref, (size_t)kd * nd) == 0 &&
+                                 memcmp(scales, sref, (size_t)t * sizeof(float)) == 0;
+                if (pass == 0) {
+                    cold_ok += rc == 1 && r.hit == 0 && r.wrote == 1 && r.refused == 0;
+                    cold_same += same;
+                } else {
+                    warm_hit += rc == 1 && r.hit == 1 && r.wrote == 0 && r.refused == 0 && r.sampled > 0;
+                    warm_same += same;
+                }
+            }
+        }
+        check_int(cold_ok, ntiles, "unaligned head: a first pass packs and writes the row-major tile");
+        check_int(cold_same, ntiles, "... and its bytes are packB_into()'s (codes and scales)");
+        check_int(warm_hit, ntiles, "unaligned head: a SECOND pass takes it from the cache");
+        check_int(warm_same, ntiles, "... byte-identical to a fresh pack, over a buffer that was not zero");
+    }
+    free(codes); free(ref); free(scales); free(sref);
+}
+
 int main(void) {
+    shortconv_geometry();
     test_head_image();
+    test_head_tile_cache();
+    test_head_tile_unaligned();
     oga_geometry();
     on_grid_geometry();
     activation_pad();

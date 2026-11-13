@@ -6176,6 +6176,46 @@ void test_tail_head_placement() {
 }
 
 
+// engine#1889 (review of #1976): the importer reads config.json's `use_qk_norm` itself, in read_dims(), and that value
+// is what decides three refusals. Nothing drove it from a config: with the read replaced by `false` the whole suite stayed
+// green, so the importer could stop reading the key and Hunyuan-7B's "declared, gains not located" refusal would vanish
+// with no test noticing. These arms go from the JSON text to the refusals, through the same entry points the importer uses.
+void test_use_qk_norm_declaration(const std::string& root) {
+    const std::string base = R"("model_type":"hunyuan_v1_dense","hidden_size":4096,"num_hidden_layers":32,)"
+                             R"("num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,)"
+                             R"("intermediate_size":13312,"vocab_size":120818)";
+    auto dims = [&](const std::string& extra) {
+        return pi::read_dims_exported(nlohmann::json::parse("{" + base + extra + "}"), "config.json");
+    };
+    const pi::Dims yes = dims(R"(,"use_qk_norm":true)");
+    check(yes.use_qk_norm, "use_qk_norm: a config that states true is read as declared");
+    check(!dims(R"(,"use_qk_norm":false)").use_qk_norm, "use_qk_norm: a config that states false is not declared");
+    check(!dims("").use_qk_norm, "use_qk_norm: an absent key is not declared (every pack without the norm)");
+    check(!dims(R"(,"use_qk_norm":null)").use_qk_norm, "use_qk_norm: null is absent, not a parse error");
+    bool threw = false;
+    try { (void)dims(R"(,"use_qk_norm":"true")"); } catch (const nlohmann::json::exception&) { threw = true; }
+    check(threw, "use_qk_norm: a value of the wrong type is an error, never a silent false");
+
+    // the declaration is what the refusals are fed: from the JSON to the message, with no hand-written `true` between
+    check(!pi::qk_norm_refusal(yes.use_qk_norm, false).empty(),
+          "use_qk_norm: declared in config.json and gains not located is refused (engine#1889)");
+    check(pi::qk_norm_refusal(dims("").use_qk_norm, false).empty(),
+          "use_qk_norm: an undeclared pack with no gains is not refused");
+    check(!pi::header_witness_refusal(1, yes.use_qk_norm).empty() && pi::header_witness_refusal(1, dims("").use_qk_norm).empty(),
+          "use_qk_norm: the one-header refusal follows the config's declaration (engine#1985)");
+
+    // and through the file reader, which is what plan() calls: the key survives load_geometry()
+    const fs::path dir = fs::path(root) / "qkdecl";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    put_file((dir / "config.json").string(), "{" + base + R"(,"use_qk_norm":true})");
+    std::string src;
+    const nlohmann::json g = pi::load_geometry_exported(dir.string(), &src);
+    check(pi::read_dims_exported(g, src).use_qk_norm, "use_qk_norm: declared in a config.json on disk reaches Dims (" + src + ")");
+    fs::remove_all(dir);
+    std::printf("  use_qk_norm declaration: 9 arms (true/false/absent/null/wrong type, three refusals fed from JSON, file reader)\n");
+}
+
 /* engine#1889: a pack that declares per-head q/k gains and whose gains the importer did not locate must be REFUSED,
  * not imported without them. Hunyuan-7B is the measured case: `use_qk_norm: true`, 32x128 + 8x128 gains in its block,
  * a 96-tile attention payload against the 160 the same geometry gets elsewhere -- and the import reported
@@ -6668,6 +6708,7 @@ int main(int argc, char** argv) {
         test_fconst_variable_stride(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
+        test_use_qk_norm_declaration(golden_dir.empty() ? "." : golden_dir);
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
         test_container_roles();

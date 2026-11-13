@@ -55,10 +55,12 @@ freeport() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 
 # (a bound socket with no backlog refuses) and bind() gets EADDRINUSE, so the arm tests what it says.
 deadport() {
     local pf="$scratch/dead.port"
+    # >/dev/null: the child must not inherit $( )'s stdout, or the substitution waits for the sleep to
+    # end -- measured: 4015 ms for a 4 s sleeper with the fd inherited, 27 ms detached (review of #2355).
     python3 -c 'import socket,sys,time
 s = socket.socket(); s.bind(("127.0.0.1", 0))
 open(sys.argv[1], "w").write(str(s.getsockname()[1]))
-time.sleep(600)' "$pf" &
+time.sleep(600)' "$pf" >/dev/null 2>&1 &
     pids+=($!)
     for _ in $(seq 1 200); do [ -s "$pf" ] && break; sleep 0.02; done
     cat "$pf"
@@ -179,7 +181,7 @@ check "a refusal from the executor reaches the client" '[[ "$(echo "$reply" | jq
 check "  pm.spawns says ok false" '[ "$(echo "$reply" | jq "d[\"pm\"][\"spawns\"][0][\"ok\"]")" = False ]'
 check "  and the PM still answered (HTTP 200)" '[ -n "$reply" ]'
 
-dead_port=$(freeport)
+dead_port=$(deadport)
 PM_CALL_FORM=spawn serve spawndead --lemonade-url "$lemonade" --pm-spawn-url "http://127.0.0.1:$dead_port" || fail=1
 reply=$(ask)
 check "an unreachable executor: the PM says so and still answers" '[[ "$(echo "$reply" | jq "d[\"choices\"][0][\"message\"][\"content\"]")" == *"did not answer"* ]]'

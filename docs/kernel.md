@@ -20,6 +20,13 @@ The Strix Halo box runs a kernel we build, not the distribution's: everything th
 need is pinned by hand, so the next kernel is a step list, not an investigation. This page is that
 list, with the facts that go stale marked as facts and the commands that do not.
 
+- **The pin:** [`config/kernel.config`](../config/kernel.config) names the kernel: the tag (`v7.4-rc1`), the
+  commit it points at (`6628e7d4c6b2`), the release string `uname -r` prints, the compiler that built it, and the
+  sha256 of the config of record. The config itself is
+  [`os/kernel/config-7.4.0-rc1-1bit`](../os/kernel/config-7.4.0-rc1-1bit), byte for byte the box's
+  `/boot/config-7.4.0-rc1-1bit`. ctest `kernel_pin` checks the file against the pin, offline.
+  `tests/kernel_pin_test.sh . --box` compares the running kernel too, and is the check to run on the box
+  before a release. A kernel bump is a change to that file plus the new `os/kernel/config-<release>`.
 - **Runs today:** `7.4.0-rc1-1bit` — Linux `v7.4-rc1`, in use since 2026-11-04 05:45
   (`/boot/vmlinuz-7.4.0-rc1-1bit`); every boot since has loaded it, and the box reboots on each Puppy
   board cycle, so read `uptime -s` for the boot you are looking at. PerfOpt is present in it,
@@ -107,7 +114,7 @@ machine with the box's config.
 ```sh
 git clone --depth 1 --branch <tag> https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git ~/wt/k74/<tag>
 cd ~/wt/k74/<tag>
-cp <box>:/boot/config-$(uname -r of the box) .config      # or the config of record, see below
+cp <engine>/os/kernel/config-7.4.0-rc1-1bit .config     # the config of record (config/kernel.config names it)
 scripts/config --file .config --set-str LOCALVERSION "-1bit-perfopt"
 # only while the tag lacks the series: our patch files are plain `diff --git` (a prose paragraph, then
 # the diff), so `git am` refuses them with "Patch format detection failed" - strip to the first diff

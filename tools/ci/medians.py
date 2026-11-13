@@ -54,15 +54,19 @@ def verdict(a, b):
     inside B's min..max, then B produced that number by itself and the difference needs more
     runs before it means anything.
     """
+    # A single sample has no range, so it can never be shown to be OUTSIDE the other arm's range:
+    # [5.0] against [6.0] would read as a win on one run. It may still LOSE -- a point below the
+    # other arm's min is below every one of its observations, which needs no spread to see.
+    # (engine#2369 item 1: the previous version let a one-sample arm win.)
     _, alo, ahi, _ = spread(a)
     _, blo, bhi, _ = spread(b)
     # Disjoint ranges, not disjoint medians: if the loser's MAX reaches into the winner's
     # range, the loser produced that value on its own and the difference is not yet evidence.
     # (The first version compared medians and passed [5.0] against [5.0, 6.0] as "B" -- B had
     #  produced 5.0 itself. The self-test below is the arm that caught it.)
-    if alo > bhi:
+    if alo > bhi and len(a) >= 2:
         return "A"
-    if blo > ahi:
+    if blo > ahi and len(b) >= 2:
         return "B"
     return "NOISE"
 
@@ -101,6 +105,8 @@ def self_test():
     check(verdict([20.0, 20.0], [19.0, 20.0]) == "NOISE", "a shared endpoint is not evidence")
 
     # a single sample has no range, so an arm whose range contains it cannot be distinguished from it
+    check(verdict([5.0], [6.0]) == "NOISE", "two single samples are not evidence (no spread on either arm)")
+    check(verdict([5.0, 5.1], [6.0]) == "NOISE", "one sample on either arm cannot win")
     check(verdict([5.0], [5.0, 6.0]) == "NOISE", "an arm whose range contains the single sample is not evidence")
     check(verdict([5.0], [6.0, 7.0]) == "B", "a single sample below a disjoint arm loses to it")
 
@@ -133,12 +139,23 @@ def main(argv):
         return self_test()
     lower_is_better = "--lower" in argv
     argv = [a for a in argv if a != "--lower"]
-    if "--a" in argv and "--b" in argv:
-        i, j = argv.index("--a"), argv.index("--b")
-        a = [float(x) for x in argv[i + 1 : j]]
-        b = [float(x) for x in argv[j + 1 :]]
+    def samples(tokens, flag):
+        out = []
+        for tok in tokens:
+            try:
+                out.append(float(tok))
+            except ValueError:
+                print(f"medians.py: {flag} expects numbers, got {tok!r}", file=sys.stderr)
+                raise SystemExit(2)
+        return out
+
+    if "--a" in argv:
+        i = argv.index("--a")
+        j = argv.index("--b") if "--b" in argv else len(argv)
+        a = samples(argv[i + 1 : j], "--a")
+        b = samples(argv[j + 1 :], "--b") if "--b" in argv else None
     else:
-        a, b = [float(x) for x in argv], None
+        a, b = samples(argv, "args"), None
     if not a:
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
         return 2

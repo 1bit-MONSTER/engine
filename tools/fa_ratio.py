@@ -131,8 +131,13 @@ def preflight_problems(load, gpu_busy_percent, resident, max_load, max_gpu_busy)
         problems.append(f"load {load:.2f} > {max_load:.2f}")
     if gpu_busy_percent is not None and gpu_busy_percent > max_gpu_busy:
         problems.append(f"gpu_busy_percent {gpu_busy_percent} > {max_gpu_busy}")
-    for pid, gtt in resident or []:
+    resident_found, unknown = (resident if isinstance(resident, tuple) else (resident, []))
+    for pid, gtt in resident_found or []:
         problems.append(f"llama-server pid {pid} holds {gtt} MiB of GTT")
+    for pid in unknown or []:
+        # A llama-server whose fdinfo cannot be read may be holding the memory this gate refuses over.
+        # "Cannot tell" refuses and says so, rather than passing the pid through as holding nothing.
+        problems.append(f"llama-server pid {pid}: its GTT cannot be read, so this gate cannot clear it")
     return problems
 
 
@@ -145,7 +150,7 @@ def read_gpu_busy_percent(path="/sys/class/drm/card0/device/gpu_busy_percent"):
 
 
 def held_gtt_mib(pid, proc="/proc"):
-    """-> GTT a process holds, in MiB, from its own fdinfo; 0 when it holds none or cannot be read.
+    """-> GTT a process holds, in MiB; 0 when it holds none, None when it cannot be read.
 
     This is the discriminator that matters: a `llama-server` that is up but holds no device memory is not the contention this
     gate exists to catch, and on the reference box two permanent embed servers (serving :8090/:8095) would otherwise make the
@@ -158,8 +163,14 @@ def held_gtt_mib(pid, proc="/proc"):
     fdinfo = os.path.join(proc, str(pid), "fdinfo")
     try:
         fds = os.listdir(fdinfo)
+    except FileNotFoundError:
+        return 0        # no such process: it holds nothing, which is a measurement
     except OSError:
-        return 0
+        # Cannot read THIS process (permission, a race with its exit): that is not "0 GiB in use".
+        # Returning 0 here made a resident server count as absent and `environment()` report "no resident
+        # server holds GTT" -- the exact contention the gate exists to catch, answered from the one case it
+        # cannot see. `None` propagates as "cannot tell".
+        return None
     for fd in fds:
         try:
             with open(os.path.join(fdinfo, fd), encoding="utf-8", errors="replace") as handle:
@@ -176,7 +187,7 @@ def resident_servers(max_gtt_mib=256, proc="/proc"):
 
     Counted by what they hold, not by whether they exist: a resident server with no GTT is not using the pool the arms share.
     """
-    found = []
+    found, unknown = [], []
     try:
         entries = os.listdir(proc)
     except OSError:
@@ -192,9 +203,11 @@ def resident_servers(max_gtt_mib=256, proc="/proc"):
         if "llama-server" not in cmdline or "fa_ratio.py" in cmdline:
             continue
         gtt = held_gtt_mib(entry, proc)
-        if gtt > max_gtt_mib:
+        if gtt is None:
+            unknown.append(int(entry))
+        elif gtt > max_gtt_mib:
             found.append((int(entry), gtt))
-    return found
+    return found, unknown
 
 
 def environment(max_gtt_mib=256):
@@ -210,8 +223,12 @@ def environment(max_gtt_mib=256):
             load = float(handle.read().split()[0])
     except OSError:
         pass
-    resident = resident_servers(max_gtt_mib)
+    resident, unknown = resident_servers(max_gtt_mib)
     largest = max((gtt for _pid, gtt in resident), default=0)
+    if unknown:
+        # A resident llama-server whose GTT could not be read: "largest" is not a measurement, and `None`
+        # is what this function already uses for "unreadable" (see its docstring).
+        largest = None
     return load, read_gpu_busy_percent(), largest
 
 
@@ -299,6 +316,22 @@ def self_test():
             handle.write("drm-total-gtt:\t11247616 kB\n")
         check("the largest fd wins", held_gtt_mib(4242, fake) == 10984, str(held_gtt_mib(4242, fake)))
         check("a pid with no fdinfo is zero", held_gtt_mib(9999, fake) == 0)
+        # ... but a process whose fdinfo exists and cannot be READ is not "0 GiB in use": it is "cannot
+        # tell", and `environment()` must not report the two as the same number.
+        # A `fdinfo` that is a FILE, not a directory: `os.listdir` raises NotADirectoryError for every uid,
+        # including root -- which is what a `chmod 000` arm did NOT do (CI runs as root, root lists it anyway,
+        # and the arm failed there while passing here). An arm whose result depends on the runner's uid is the
+        # same defect as the one it tests for.
+        not_a_dir = os.path.join(fake, "4243", "fdinfo")
+        os.makedirs(os.path.dirname(not_a_dir), exist_ok=True)
+        with open(not_a_dir, "w", encoding="utf-8") as handle:
+            handle.write("not a directory\n")
+        check("an unreadable fdinfo is NOT zero", held_gtt_mib(4243, fake) is None,
+              str(held_gtt_mib(4243, fake)))
+        check("and the preflight refuses over it rather than passing it through",
+              any("cannot be read" in why for why in
+                  preflight_problems(None, None, ([], [4243]), 99.0, 99)),
+              str(preflight_problems(None, None, ([], [4243]), 99.0, 99)))
 
     row = "| qwen3 0.6B Q4_K - Medium       | 372.65 MiB |   596.05 M | HRX        |  99 |   1 |          pp2048 |       1718.51 ± 0.00 |"
     check("row parse", parse_rate(row) == 1718.51, str(parse_rate(row)))
@@ -375,8 +408,10 @@ def main(argv):
     if trace:
         # Only when the box moved: a run that was stable end to end needs no extra noise in its output.
         loads = [row[1] for row in trace if row[1] is not None]
-        largest = max((row[3] for row in trace), default=0)
-        if loads and (max(loads) - min(loads) > 5.0 or largest > 0):
+        known = [row[3] for row in trace if row[3] is not None]
+        largest = max(known, default=0)
+        if loads and (max(loads) - min(loads) > 5.0 or largest > 0
+                      or any(row[3] is None for row in trace)):
             print(f"environment per pair (load1, gpu_busy%, largest resident GTT MiB): {trace}")
     return {"accepted": EXIT_ACCEPTED, "void": EXIT_VOID}.get(verdict, EXIT_VOID)
 

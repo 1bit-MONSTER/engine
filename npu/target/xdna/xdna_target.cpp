@@ -528,7 +528,13 @@ int64_t XdnaTarget::m16_check_gemm_rows(I8Ctx& ref, I8Ctx& fast, const float* A,
 }
 
 void XdnaTarget::prof_add(ProfAcc* acc, int design, double pack, double quant,
-                              double wait, double rb) {
+                              double wait, double rb, double fill) {
+    // engine#1783: `pack` (tp->tl) also spanned the weight-cache fill on a launch that missed. The warm-up pass and a
+    // short request each launch every (layer, role) once or twice, so half the prefill launches in such a window were
+    // fills, and `pack` read ~3 ms/launch on the 768 family where a cached launch's host side is ~0. An encoder
+    // window (12 launches per projection per layer) then extrapolated a one-time cost twelve times. The fill now
+    // is printed on its own line after the table, and `pack` is what every launch pays.
+    if (fill > 0.0) pack = pack > fill ? pack - fill : 0.0;
     // g_ph is what the [bs] (batch) and [ph] (decode step) lines print, and both read it. Only the DECODE
     // accumulator used to be counted, so a 219-row prefill -- which launches through prof_pre_ -- reported
     // "n=0 launches, host=93113 ms" for 224 launches and 93 s of device wait: the wait fell into the line's
@@ -552,6 +558,7 @@ void XdnaTarget::prof_add(ProfAcc* acc, int design, double pack, double quant,
     ProfAcc& a = acc[design];
     a.pack += pack; a.quant += quant; a.wait += wait; a.rb += rb;
     a.n++;
+    if (fill > 0.0) { a.fill += fill; a.nfill++; }
 }
 
 void XdnaTarget::prof_dump() {
@@ -570,6 +577,14 @@ void XdnaTarget::prof_dump() {
                     a.pack / n, a.quant / n, a.wait / n, a.rb / n,
                     (a.pack + a.quant + a.wait + a.rb) / n);
         }
+    }
+    for (int ph = 0; ph < 2; ph++) {
+        ProfAcc* acc = ph ? prof_pre_ : prof_dec_;
+        long nf = 0; double fill = 0;
+        for (int i = 0; i < ndesigns_; i++) { nf += acc[i].nfill; fill += acc[i].fill; }
+        if (nf)
+            fprintf(stderr, "[prof] %-5s weight-cache fills (one-time, not in pack): %ld, %.1f ms, %.3f ms/fill\n",
+                    ph ? "pre" : "dec", nf, fill, fill / (double)nf);
     }
     if (prof_head_.n) {
         const double n = (double)prof_head_.n;
@@ -908,6 +923,7 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
     I8Ctx& kctx = *kctx1;
     const bool prof = prof_;
     const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    double fill_ms = 0.0;   // engine#1783: weight-cache fill time inside tp->tl, reported apart from `pack`
 
     // pb16i: the weight BO holds the sidecar image unchanged, so a cache miss is a
     // file read (no dequant, no quantise, no pack) and the result is dequantised with
@@ -922,6 +938,7 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
             auto& m = wcache_[size_t(ar.layer)];
             auto  it = m.find(wkey);
             if (it == m.end()) {
+                const auto f0 = std::chrono::steady_clock::now();   // a weight-cache fill: one-time, not per launch
                 q4nx_lh::LhScope _tlh_pk(LH_PACK_UPLOAD);
                 PackedWeight pw;
                 pw.bo = kctx.make_weight_bo(*dev_, /*zero=*/false);
@@ -934,6 +951,7 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
                 }
                 pw.eref = std::move(eref);
                 pw.pb16i_mode = mode;
+                fill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
                 it = m.emplace(wkey, std::move(pw)).first;
             }
             slot = &it->second;
@@ -1021,7 +1039,7 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
             const double dql = std::chrono::duration<double, std::milli>(tq - tl).count();
             const double dwt = std::chrono::duration<double, std::milli>(tw - tq).count();
             const double drb = std::chrono::duration<double, std::milli>(tr - tw).count();
-            prof_add(prof_dec_, design_index(&kctx), dpk, dql, dwt, drb);
+            prof_add(prof_dec_, design_index(&kctx), dpk, dql, dwt, drb, fill_ms);
             if (++prof_dec_n_ % 100 == 0) prof_dump();
         }
         return;
@@ -1037,6 +1055,7 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
         auto& m = wcache_[size_t(ar.layer)];
         auto  it = m.find(wkey);
         if (it == m.end()) {
+            const auto f0 = std::chrono::steady_clock::now();   // a weight-cache fill: one-time, not per launch
             // Cache miss only: this is the per-request re-pack/re-upload the
             // `prefill` row would hide.  It must be zero for a warm process.
             q4nx_lh::LhScope _tlh_pk(LH_PACK_UPLOAD);
@@ -1054,6 +1073,7 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
                 float sout = 1.0f;
                 kctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
             }
+            fill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
             it = m.emplace(wkey, std::move(pw)).first;
         }
         slot = &it->second;
@@ -1112,7 +1132,7 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
         const double dql = std::chrono::duration<double, std::milli>(tq - tl).count();
         const double dwt = std::chrono::duration<double, std::milli>(tw - tq).count();
         const double drb = std::chrono::duration<double, std::milli>(tr - tw).count();
-        prof_add(prof_dec_, design_index(&kctx), dpk, dql, dwt, drb);
+        prof_add(prof_dec_, design_index(&kctx), dpk, dql, dwt, drb, fill_ms);
         if (++prof_dec_n_ % 100 == 0) prof_dump();
     }
 }
@@ -1192,6 +1212,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     I8Ctx& kctx = *kctxp;
     const bool prof = prof_;
     const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    double fill_ms = 0.0;   // engine#1783: weight-cache fill time inside tp->tl, reported apart from `pack`
     if (pb16i_ && kctx.pb16i) {
         out.assign((size_t)M * (size_t)N, 0.0f);   // sized before every refusal path below
         if (M > kctx.MD) {
@@ -1206,6 +1227,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
             auto& m = wcache_[size_t(ar.layer)];
             auto  it = m.find(wkey);
             if (it == m.end()) {
+                const auto f0 = std::chrono::steady_clock::now();   // a weight-cache fill: one-time, not per launch
                 q4nx_lh::LhScope _tlh_pk(LH_PACK_UPLOAD);
                 PackedWeight pw;
                 pw.bo = kctx.make_weight_bo(*dev_, /*zero=*/false);
@@ -1218,6 +1240,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
                 }
                 pw.eref = std::move(eref);
                 pw.pb16i_mode = mode;
+                fill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
                 it = m.emplace(wkey, std::move(pw)).first;
             }
             slot = &it->second;
@@ -1292,10 +1315,10 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
             const double drb = std::chrono::duration<double, std::milli>(tr - tw).count();
             const int di = design_index(&kctx);
             if (M == 1) {
-                prof_add(prof_dec_, di, dpk, dql, dwt, drb);
+                prof_add(prof_dec_, di, dpk, dql, dwt, drb, fill_ms);
                 prof_dec_n_++;
             } else {
-                prof_add(prof_pre_, di, dpk, dql, dwt, drb);
+                prof_add(prof_pre_, di, dpk, dql, dwt, drb, fill_ms);
                 prof_pre_n_++;
             }
             // Dump on either family's count. The `prof_dec_n_ &&` guard meant a PREFILL-ONLY process never dumped at
@@ -1314,6 +1337,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
         auto& m = wcache_[size_t(ar.layer)];
         auto  it = m.find(wkey);
         if (it == m.end()) {
+            const auto f0 = std::chrono::steady_clock::now();   // a weight-cache fill: one-time, not per launch
             q4nx_lh::LhScope _tlh_pk(LH_PACK_UPLOAD);
             PackedWeight pw;
             pw.bo = kctx.make_weight_bo(*dev_);
@@ -1326,6 +1350,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
             if (std::getenv("NPU_PACK_SPLIT") && wmiss_n_ % 20 == 0)
                 fprintf(stderr, "[wm] n=%ld cache-miss repacks, avg packB_into=%.3f ms\n",
                         wmiss_n_, wmiss_ms_ / wmiss_n_);
+            fill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
             it = m.emplace(wkey, std::move(pw)).first;
         }
         slot = &it->second;
@@ -1392,10 +1417,10 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
         const double drb = std::chrono::duration<double, std::milli>(tr - tw).count();
         const int di = design_index(&kctx);
         if (M == 1) {
-            prof_add(prof_dec_, di, dpk, dql, dwt, drb);
+            prof_add(prof_dec_, di, dpk, dql, dwt, drb, fill_ms);
             prof_dec_n_++;
         } else {
-            prof_add(prof_pre_, di, dpk, dql, dwt, drb);
+            prof_add(prof_pre_, di, dpk, dql, dwt, drb, fill_ms);
             prof_pre_n_++;
         }
         if ((prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();   // same reason as above: prefill-only runs

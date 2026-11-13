@@ -55,6 +55,10 @@ struct PackedWeight {
 struct ProfAcc {
     double pack = 0, quant = 0, wait = 0, rb = 0;
     long   n = 0;
+    // engine#1783: weight-cache fills (the first launch of a (layer, weight) packs or loads its image) are kept out
+    // of `pack`, which is the per-launch host cost. Counted here so the one-time cost is still printed.
+    double fill = 0;
+    long   nfill = 0;
 };
 
 class XdnaTarget final : public NpuTarget {
@@ -221,7 +225,8 @@ public:
 private:
     I8Ctx* ctx_for(I8Ctx* prefill, int rows, bool decode_twin);
     int    design_index(I8Ctx* c) const;
-    void   prof_add(ProfAcc* acc, int design, double pack, double quant, double wait, double rb);
+    void   prof_add(ProfAcc* acc, int design, double pack, double quant, double wait, double rb,
+                    double fill = 0.0);
     void   prof_dump();
     void   npu_gemm(const GemvArgs& a, std::vector<float>& out, std::string& err);
     void   npu_gemm_rows(const GemvArgs& a, std::vector<float>& out, std::string& err);

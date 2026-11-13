@@ -246,6 +246,10 @@ add_test(NAME config_pin_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tool
 # 2026-11-09 and 2026-11-13 with no change in this tree. Offline, reads the tree only.
 add_test(NAME moving_ref_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/moving_ref_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_test(NAME moving_ref_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/moving_ref_check.py --self-test)
+# Gantt "Kernel 7.4 readiness": config/kernel.config names the kernel by tag, commit, release and config hash, and
+# os/kernel/config-<release> is the config of record itself. Offline: the hash and the config's own LOCALVERSION /
+# CC_VERSION_TEXT agree with the pin (`--box`, run by hand, compares the running kernel too).
+add_test(NAME kernel_pin COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_pin_test.sh ${CMAKE_SOURCE_DIR})
 # engine#2183: the lost-update class has a second medium. `registration_loss_check` covers what a branch removes
 # from the BUILD; this covers what it removes from the DOCS -- a rebase that resolved `docs/npu.md` by taking the
 # branch's side dropped a section that had merged that morning (#2314). Offline, git-only, no build input.

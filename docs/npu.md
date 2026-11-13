@@ -3969,7 +3969,9 @@ control the executor:
 
 - `ONEBIT_AUDIO_THREADS=<n>` sets the number of worker threads. The default is the process's CPU affinity count, capped
   at 8. MatMul splits its rows over these threads; Conv splits its output channels; Softmax and LayerNormalization split
-  their rows. Each unit runs the same serial loop as one thread would, so the output does not depend on the count.
+  their rows. The elementwise ops (Add, Sub, Mul and Div with their broadcasts, Erf, Gelu) and Transpose split their
+  output into ranges (engine#2366). Each unit runs the same serial loop as one thread would, so the output does not
+  depend on the count. `tests/audio_parallel_test.cpp` checks that byte for byte for MatMul and the elementwise chain.
 - `ONEBIT_AUDIO_OP_TIMES=1` prints, after each graph run, one line per op type with its calls and total wall time,
   sorted, plus the node and thread counts:
 

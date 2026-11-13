@@ -16,11 +16,12 @@
 // audio_parallel_test.cpp -- the two claims npu/audio_parallel.h makes, as assertions (engine#1931 review):
 //
 //   1. the executor's MatMul is BIT-identical whatever ONEBIT_AUDIO_THREADS says. A tolerance cannot see this, and the
-//      pack-gated comparison against onnxruntime runs at one thread count, so here the same MatMul runs through
+//      pack-gated comparison against onnxruntime runs at one thread count, so here the same MatMul (and, for engine#2366,
+//      an Add/Mul/Sub/Div/Erf/Transpose chain) runs through
 //      run_audio_graph() at 1, 2, 3, 7, 8 and 64 threads and unset, and the outputs are compared with memcmp;
 //   2. a unit that throws is an exception on the calling thread after every worker has been joined, not std::terminate.
 //
-// The graph is built in memory (one MatMul against an inline initializer), so this needs no pack, no file and no device.
+// The graphs are built in memory (against inline initializers), so this needs no pack, no file and no device.
 
 #include <atomic>
 #include <cmath>
@@ -160,6 +161,82 @@ void test_bit_identity() {
     unsetenv("ONEBIT_AUDIO_THREADS");
 }
 
+// engine#2366: the elementwise families (Add/Sub/Mul/Div with each broadcast form the encoder uses, Erf) and Transpose
+// split over threads too. The chain runs at several thread counts and is compared byte for byte with the plain serial
+// arithmetic written out here. 301 x 193 spans several units, and the 193-wide rows do not divide a unit.
+std::vector<float> chain_at(const char* threads, int64_t M, int64_t K, const std::vector<float>& x,
+                            const std::vector<float>& bias, const std::vector<float>& col, const float& scale) {
+    if (threads != nullptr) setenv("ONEBIT_AUDIO_THREADS", threads, 1);
+    else unsetenv("ONEBIT_AUDIO_THREADS");
+    OnnxGraphInfo g;
+    g.dir = ".";
+    g.inputs = {"x"};
+    g.outputs = {"y"};
+    auto init = [&](const char* name, std::vector<int64_t> dims, const float* data, size_t n) {
+        OnnxInit t;
+        t.name = name;
+        t.dtype = 1;
+        t.dims = std::move(dims);
+        t.raw = reinterpret_cast<const uint8_t*>(data);
+        t.raw_len = n * sizeof(float);
+        g.initializers.push_back(name);
+        g.init_tensors.push_back(t);
+    };
+    init("B", {K}, bias.data(), bias.size());        // a bias row: broadcast over the leading axes
+    init("S", {}, &scale, 1);                         // a scalar
+    init("C", {M, 1}, col.data(), col.size());        // a column: broadcast along the last axis
+    auto node = [&](const char* op, std::vector<std::string> ins, const char* out) {
+        OnnxNodeInfo n;
+        n.op = op;
+        n.name = out;
+        n.ins = std::move(ins);
+        n.outs = {out};
+        g.nodes.push_back(n);
+        return &g.nodes.back();
+    };
+    node("Add", {"x", "B"}, "a");
+    node("Mul", {"a", "S"}, "m");
+    node("Sub", {"C", "m"}, "s");                    // the column first: its last-axis stride is 0 on the left
+    node("Div", {"s", "x"}, "d");
+    node("Erf", {"d"}, "e");
+    node("Transpose", {"e"}, "y")->attrs_list["perm"] = {0, 2, 1};
+    AudioRunResult out;
+    std::string why;
+    if (!run_audio_graph(g, x.data(), M, K, "y", &out, &why)) {
+        std::printf("FAIL elementwise chain at ONEBIT_AUDIO_THREADS=%s refused: %s\n", threads ? threads : "(unset)",
+                    why.c_str());
+        ++g_failures;
+        return {};
+    }
+    check(out.dims == std::vector<int64_t>({1, K, M}), "the chain's Transpose gives (1, K, M)");
+    return out.data;
+}
+
+void test_elementwise_bit_identity() {
+    const int64_t M = 301, K = 193;
+    std::vector<float> x(size_t(M * K)), bias(static_cast<size_t>(K)), col(static_cast<size_t>(M));
+    for (size_t i = 0; i < x.size(); ++i) x[i] = float(std::sin(0.29 * double(i + 1)) * 2.0 + 0.01);
+    for (size_t i = 0; i < bias.size(); ++i) bias[i] = float(std::cos(0.7 * double(i)) * 0.5);
+    for (size_t i = 0; i < col.size(); ++i) col[i] = float(0.001 * double(i) - 0.1);
+    const float scale = 0.125f;
+
+    std::vector<float> want(x.size());
+    for (int64_t i = 0; i < M; ++i)
+        for (int64_t k = 0; k < K; ++k) {
+            const float xv = x[size_t(i * K + k)];
+            const float d = (col[size_t(i)] - (xv + bias[size_t(k)]) * scale) / xv;
+            want[size_t(k * M + i)] = std::erf(d);
+        }
+    for (const char* threads : {"1", "2", "3", "7", "8", "64", static_cast<const char*>(nullptr)}) {
+        const std::vector<float> got = chain_at(threads, M, K, x, bias, col, scale);
+        const std::string name = threads ? threads : "(unset)";
+        check(got.size() == want.size() && std::memcmp(got.data(), want.data(), want.size() * sizeof(float)) == 0,
+              "Add/Mul/Sub/Div/Erf/Transpose at ONEBIT_AUDIO_THREADS=" + name +
+                  " is the serial per-element arithmetic, bit for bit");
+    }
+    unsetenv("ONEBIT_AUDIO_THREADS");
+}
+
 void test_every_unit_once() {
     for (size_t units : {size_t(0), size_t(1), size_t(2), size_t(7), size_t(37), size_t(1000)})
         for (size_t want : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(8), size_t(64), size_t(5000)}) {
@@ -220,6 +297,7 @@ void test_a_throwing_unit() {
 int main() {
     test_bit_identity();
     test_row_group_edges();
+    test_elementwise_bit_identity();
     test_every_unit_once();
     test_a_throwing_unit();
     if (g_failures == 0) std::printf("audio_parallel: ok\n");

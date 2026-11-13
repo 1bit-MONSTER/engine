@@ -98,6 +98,21 @@ case "$woof_real/" in
     exit 1 ;;
 esac
 kernel=$(cd "$kernel" && pwd)
+# The pinned inputs (os/v3/puppy/pin.txt): the woof-CE commit, the build container by digest, vercmp.c by commit.
+pinfile="$(cd "$(dirname "$0")" && pwd)/pin.txt"
+pin() { sed -n "s/^$1=//p" "$pinfile" | head -n 1; }
+woof_pin=$(pin woof_ce_commit) build_image=$(pin build_image)
+[ -n "$woof_pin" ] && [ -n "$build_image" ] || { echo "build: REFUSED: $pinfile names no woof_ce_commit / build_image" >&2; exit 1; }
+woof_head=$(git -C "$woof" rev-parse HEAD 2>/dev/null || echo "no git metadata")
+if [ "$woof_head" != "$woof_pin" ]; then
+    if [ "${WOOF_CE_UNPINNED:-0}" = 1 ]; then
+        echo "build: WARNING: woof-CE at $woof is $woof_head, the pin is $woof_pin (WOOF_CE_UNPINNED=1: building anyway; this image is not reproducible from the tree)" >&2
+    else
+        printf 'build: REFUSED: woof-CE at %s is %s, os/v3/puppy/pin.txt pins %s.\n' "$woof" "$woof_head" "$woof_pin" >&2
+        printf 'build:          git -C %s fetch origin && git -C %s checkout %s   (or WOOF_CE_UNPINNED=1 for a deliberate experiment)\n' "$woof" "$woof" "$woof_pin" >&2
+        exit 1
+    fi
+fi
 ls "$kernel"/huge-*.tar.* >/dev/null 2>&1 || {
     echo "build: no huge-*.tar.* in $kernel (run mk-huge-kernel.sh first)" >&2; exit 1; }
 mkdir -p "$out"; out=$(cd "$out" && pwd)
@@ -161,7 +176,7 @@ if [ -n "$tui_bin" ]; then
     echo "build: console TUI $tui_bin ($(sha256sum "$tui_bin" | cut -c1-16))"
 fi
 
-echo "build: woof-CE $woof, kernel $kernel, out $out, build root $build_root ($mnt_opts)"
+echo "build: woof-CE $woof ($woof_head), image $build_image, kernel $kernel, out $out, build root $build_root ($mnt_opts)"
 # The container side is its own file (os/v3/puppy/container-build.sh, mounted at /recipe) since 2026-11-02:
 # it was a 300-line single-quoted `bash -c '...'` string here, where one apostrophe in a comment ended the
 # quote and bash reported a syntax error a hundred lines away - five builds in this lane, two of them in
@@ -179,4 +194,4 @@ exec docker run --rm --privileged --memory=12g --cpus=4 \
     ${tui_bin:+-v "$tui_bin":/console-tui:ro} \
     ${tui_bin:+-e CONSOLE_TUI_BIN=/console-tui} \
     --device /dev/loop-control:/dev/loop-control \
-    -e COMPAT="$compat" ubuntu:24.04 bash /recipe/container-build.sh
+    -e COMPAT="$compat" "$build_image" bash /recipe/container-build.sh

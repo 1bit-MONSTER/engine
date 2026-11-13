@@ -274,12 +274,18 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 // than rendered as text and answered. The chain it would call exists; the parse and the join here do not.
                 if (npu::message_carries_an_image(ordered.at("messages"))) {
                     res.status = 400;
-                    res.set_content(nlohmann::ordered_json{{"error", nlohmann::ordered_json{{"message",
-                        "this route has no vision wiring yet (engine#2324): the request carries an image part and the "
-                        "NPU route parses no pixels, so answering it would ignore the picture. Text-only requests are "
-                        "unaffected. The vision chain exists (npu/vision_tower.h and friends) and is driven by "
-                        "npu/forward/minicpm_image_probe.cpp; the serve-side parse and the image positions are what is missing."},
-                        {"type", "unsupported_image_part"}, {"code", 400}}}.dump(), "application/json");
+                    // engine#2327 left this one brace short of compiling; written the way the other error bodies in
+                    // this file are, so the next reader does not have to count braces to see what it says.
+                    nlohmann::ordered_json body_out;
+                    body_out["error"] = {
+                        {"message",
+                         "this route has no vision wiring yet (engine#2324): the request carries an image part and the "
+                         "NPU route parses no pixels, so answering it would ignore the picture. Text-only requests are "
+                         "unaffected. The vision chain exists (npu/vision_tower.h and friends) and is driven by "
+                         "npu/forward/minicpm_image_probe.cpp; the serve-side parse and the image positions are what is missing."},
+                        {"type", "unsupported_image_part"},
+                        {"code", 400}};
+                    res.set_content(body_out.dump(), "application/json");
                     return;
                 }
                 // An earlier call's arguments arrive as a JSON string; the template is written against the

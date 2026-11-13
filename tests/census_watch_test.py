@@ -1119,4 +1119,33 @@ check("support paths: the committed router pin watches the d3 family and the Sys
 if failures:
     print(f"\n{len(failures)} check(s) failed")
     sys.exit(1)
+# engine#1922: the digest cannot tell "our pin is behind" from "nobody upstream has this class" without asking upstream, and
+# the two need opposite actions (bump a pin vs do nothing here). Settling it by hand took two commands; these arms make the
+# classification testable offline, including the case where the answer is UNKNOWN -- which must not be guessed as either.
+_src = """
+@Model.register("NimbusMindForCausalLM")
+class NimbusMindModel(Model):
+    pass
+
+@Model.register("Qwen3_5MVLAAbsorbedForCausalLM", "Qwen3_5Other")
+class Qwen35(Model):
+    pass
+"""
+up = cw.upstream_classes(_src)
+check("upstream_classes reads every registered class", up == {"NimbusMindForCausalLM", "Qwen3_5MVLAAbsorbedForCausalLM", "Qwen3_5Other"})
+# the arm that caught a real bug in this function: `@Model.register("A", "B")` must yield BOTH names. Taking only the first
+# labels B as upstream-only, i.e. tells a lane to ignore a class a pin bump would fix.
+check("upstream_classes reads EVERY name in a multi-name registration",
+      cw.upstream_classes('@Model.register("AForCausalLM", "B",\n    "C")') == {"AForCausalLM", "B", "C"})
+check("upstream_classes on empty text is empty, not an error", cw.upstream_classes("") == set())
+check("upstream_classes on None is empty", cw.upstream_classes(None) == set())
+
+v = cw.classify_uncovered({"NimbusMindForCausalLM", "MicroLlamaForCausalLM"}, up)
+check("a class upstream registers but we lack is pin-behind", v["NimbusMindForCausalLM"] == "pin-behind")
+check("a class nobody registers is upstream-only", v["MicroLlamaForCausalLM"] == "upstream")
+
+# the arm that matters: no upstream answer must not become an answer
+v = cw.classify_uncovered({"NimbusMindForCausalLM"}, None)
+check("an unavailable converter yields 'unknown', never a guess", v["NimbusMindForCausalLM"] == "unknown")
+
 print("\nall checks passed")

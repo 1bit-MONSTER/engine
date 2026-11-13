@@ -277,6 +277,56 @@ def is_derivative(model):
             or any(t in tags for t in DERIVATIVE_TAGS))
 
 
+def upstream_classes(text):
+    """The HF architectures a NEWER llama.cpp would map, from its `convert_hf_to_gguf.py`.
+
+    engine#1922: the digest says `!! UNCOVERED` for any class our registry does not carry, but the registry is GENERATED from the
+    pinned sources, so that label alone cannot tell "our pin is behind" from "nobody upstream knows this class either". The first
+    needs a pin bump (the registry regenerates for free); the second needs nothing from us. Both looked identical to every reader,
+    and settling one by hand took two commands against a raw.githubusercontent URL.
+
+    `text` is the converter's source; each `@Model.register("XForCausalLM")` names a class llama.cpp can convert. A class the
+    converter names but the registry lacks is pin-behind; anything else is upstream-only. Pure, so the classification is testable
+    without a network call -- which matters, because the wrong answer here sends a lane to bump a pin for nothing, or to ignore a
+    real gap.
+    """
+    out = set()
+    src = text or ""
+    for m in re.finditer(r"@Model\.register\(", src):
+        # Scan to the matching close paren rather than matching one quoted name: the converter registers SEVERAL classes
+        # per decorator (`@Model.register("AForCausalLM", "B")`), and a regex that takes only the first would label the
+        # second as upstream-only -- the wrong answer in the direction that tells a lane to ignore a real gap.
+        depth, i, end = 0, m.end() - 1, len(src)
+        while i < end:
+            if src[i] == "(":
+                depth += 1
+            elif src[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        for name in re.findall(r'"([A-Za-z0-9_]+)"', src[m.end():i]):
+            out.add(name)
+    return out
+
+
+def classify_uncovered(classes, upstream):
+    """Which uncovered classes a pin bump would fix, and which nobody has (engine#1922).
+
+    `upstream` is a set from upstream_classes(), or None when the fetch failed -- in which case every class is reported as
+    `unknown`, not guessed as either. A digest that cannot tell must say so rather than pick the flattering label.
+    """
+    verdict = {}
+    for cls in classes:
+        if upstream is None:
+            verdict[cls] = "unknown"
+        elif cls in upstream:
+            verdict[cls] = "pin-behind"
+        else:
+            verdict[cls] = "upstream"
+    return verdict
+
+
 def classify(models, archs, sig, previously_seen=()):
     """Classify a batch of HF model records against the registry.
 
@@ -388,6 +438,22 @@ def remember(state, res):
         for mid in res[group]:
             state["seen"][mid] = group
     return state
+
+
+UPSTREAM_CONVERTER_URL = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py"
+
+
+def get_text(url, tries=3):
+    """The raw body of `url`, or raises. Separate from get_json because the converter is Python source, not JSON."""
+    last = None
+    for _ in range(tries):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=request_headers()), timeout=30) as r:
+                return r.read().decode("utf-8", "replace")
+        except Exception as e:      # noqa: BLE001 - the caller decides; this helper only reports
+            last = e
+            time.sleep(1)
+    raise last
 
 
 def get_json(url, tries=3):
@@ -876,8 +942,28 @@ def report(models, res, previously_seen):
                   f"accepting it, record why in registry/significant.json ('mapped_ok')")
         else:
             print(f"  !! UNCOVERED {cls} (new class): {len(ids)} model(s), e.g. {ids[0]}")
+            # engine#1922: the registry is GENERATED from the pinned sources, so "not in the registry" cannot by itself
+            # say whether a pin bump would fix this or whether nobody upstream has it. Say which, when it is knowable.
+            verdict = res.get("upstream_verdict", {}).get(cls, "unknown")
+            if verdict == "pin-behind":
+                print(f"     -> UPSTREAM HAS IT: llama.cpp's converter registers this class, our pin does not -- "
+                      f"a pin bump regenerates the registry")
+            elif verdict == "upstream":
+                print(f"     -> UPSTREAM DOES NOT HAVE IT: no llama.cpp converter maps this class, so there is nothing "
+                      f"to map here until one does")
+            else:
+                print(f"     -> could not tell whether upstream has it (converter unavailable); check before mapping")
             print(f"     -> map it in registry/architectures.json (a pinned backend's code "
                   f"must accept the architecture)")
+    # engine#1922: ask upstream ONCE whether it knows the uncovered classes, and only when there is something to ask about.
+    # A failed fetch is recorded as None so the report says "could not tell" rather than guessing either way.
+    if res["classes"]:
+        upstream = None
+        try:
+            upstream = upstream_classes(get_text(UPSTREAM_CONVERTER_URL))
+        except Exception:
+            upstream = None
+        res["upstream_verdict"] = classify_uncovered(res["classes"], upstream)
     # say whether a token was already sent: "gated repos need a token" is misleading advice on a
     # run that sent one and still got no config back
     hint = " (HF_TOKEN sent, still no config)" if hf_token() else ""

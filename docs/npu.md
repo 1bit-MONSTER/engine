@@ -885,7 +885,31 @@ blocks per arm, two arms per binary run A B B A in one ticket):
 | of which GDN recurrence | 30.5-33.4 ms | 27.0-30.0 ms | |
 
 So prefill on this route is bound by host work outside the launches and by the M=16 launch geometry above, in that
-order, and not by packing. "After" is one change: the per-(row, head) alpha/beta dot products of a GDN layer ran on one
+order, and not by packing.
+
+**The `pack` column no longer carries the weight-cache fill (#1783).** The fill moved before the ready line, but the
+warm-up pass is itself a profiled prefill, so a short request still printed a `[prof] pre` table where half the
+launches were fills: `pack` read 2.7-3.5 ms per launch on the 768 family and 2.9-7.2 ms on the 1280 family, against
+0.00 in the decode rows of the same process. An encoder window at those numbers was extrapolated as twelve launches per
+projection per layer, each paying the one-time fill again. `NPU_PROFILE=1` now times each fill on its own and leaves
+it out of `pack`. `pack` is what every launch pays, and a separate line gives the fills. The same request on the same
+768 container and kernel set (2026-11-13, one `npu-hold` ticket, `amdxdna` error count 632 before and after, same
+greedy text):
+
+| `[prof] pre`, M=128, 24 launches per role | QKV | O | GU | D |
+|---|---:|---:|---:|---:|
+| `pack` before (ms/launch) | 3.10 | 3.09 | 3.49 | 2.73 |
+| `pack` after (ms/launch) | 0.00 | 0.00 | 0.00 | 0.00 |
+| `ms/launch` after | 1.269 | 1.359 | 1.935 | 1.595 |
+
+```
+[prof] pre   weight-cache fills (one-time, not in pack): 48, 310.4 ms, 6.466 ms/fill
+```
+
+The 48 fills are 12 layers x 4 roles, all in the warm-up pass, and they account for the old `pack` totals (24 x 12.41
+= 298 ms).
+
+An uncached launch (`NPU_NO_WCACHE=1`) packs its weight on every launch, and that stays in `pack`. "After" is one change: the per-(row, head) alpha/beta dot products of a GDN layer ran on one
 thread inside the row loop (0.099 ms per row and layer, 48 GDN layers), and they now run as a second worksharing loop
 inside the parallel region that layer already opens for the recurrence. No region is added, because the region count is
 what a loaded box pays for. Each dot product is the same sequential loop as before and the build has no `-ffast-math`,

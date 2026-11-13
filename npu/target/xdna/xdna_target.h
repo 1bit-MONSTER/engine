@@ -34,6 +34,7 @@
 
 #include "target/target.h"
 #include "plan/plan.h"   // onebit::npu::plan::Plan (engine #799 P1)
+#include "target/xdna/prof_acc.h"   // ProfAcc and the fill rule (engine#1783), header-only so CI tests it
 #include "q4nx_pack.h"       // Q4nxDesignGeom, Q4NX_MAX_DESIGNS
 #include "rt.h"          // xrt::device, xrt::bo
 
@@ -52,10 +53,6 @@ struct PackedWeight {
 };
 
 // Per-role dispatch accounting for NPU_PROFILE=1.
-struct ProfAcc {
-    double pack = 0, quant = 0, wait = 0, rb = 0;
-    long   n = 0;
-};
 
 class XdnaTarget final : public NpuTarget {
 public:
@@ -221,7 +218,8 @@ public:
 private:
     I8Ctx* ctx_for(I8Ctx* prefill, int rows, bool decode_twin);
     int    design_index(I8Ctx* c) const;
-    void   prof_add(ProfAcc* acc, int design, double pack, double quant, double wait, double rb);
+    void   prof_add(ProfAcc* acc, int design, double pack, double quant, double wait, double rb,
+                    double fill = 0.0);
     void   prof_dump();
     void   npu_gemm(const GemvArgs& a, std::vector<float>& out, std::string& err);
     void   npu_gemm_rows(const GemvArgs& a, std::vector<float>& out, std::string& err);

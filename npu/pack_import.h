@@ -428,8 +428,44 @@ struct ImportPlan {
     std::vector<std::string> unplaced;    // "<role>: <tensor>" -- a refusal, not a silent skip
     int64_t bytes = 0;                    // payload bytes the items carry
     int64_t payload_bytes = 0;            // what the container says it has, so a writer can prove coverage
+    // engine#1788, 3c: where the payload STARTS in the container file. `Q4nxTensor::begin/end` are PAYLOAD-relative, so a
+    // writer that seeks to `begin` in the file reads the safetensors header instead of the tensor -- which is exactly what
+    // happened: the bytes came out right in total (1024+128) and wrong in content.
+    int64_t payload_base = 0;
 };
 ImportPlan container_import_plan(const Q4nxContainer& container, const std::vector<std::string>& layer_types);
+
+// engine#1788, 3c: the I/O half -- copy each planned byte range out of the container's payload into one file per
+// destination slot, plus a manifest. It REFUSES to write when the container has tensors the plan could not place, unless
+// `allow_unplaced` is set: a pack that silently omits a fifth of the model is worse than no pack, and the caller is the
+// only one who can decide that an omission is intended.
+struct WriteLayoutResult {
+    bool ok = false;
+    int64_t files = 0;
+    int64_t bytes = 0;
+    std::string why;          // why it refused, or what failed, when ok is false
+};
+WriteLayoutResult container_write_layout(const std::string& payload_path, const ImportPlan& plan,
+                                         const std::string& out_dir, bool allow_unplaced);
+// The PACK form: one contiguous payload plus a header, which is the shape the forward opens (a container of the same genre).
+// Same refusal as the layout form -- nothing is written when the plan has unplaced tensors and allow_unplaced is false --
+// because a header that omits a fifth of the model is exactly as silent as a missing file.
+struct WritePackResult {
+    bool ok = false;
+    int64_t tensors = 0;
+    int64_t bytes = 0;
+    std::string payload;   // the file written, when ok
+    std::string header;
+    std::string why;
+};
+WritePackResult container_write_pack(const std::string& payload_path, const ImportPlan& plan,
+                                     const std::string& out_dir, bool allow_unplaced);
+// engine#1788, 3c: what the import should EMIT, learned from the source rather than invented. A container tensor's shape is
+// already the chunk: `[4096,8,4736] I8` is N=4096, 8 groups, 4736 bytes per row, and 4736 is exactly the Q4_K chunk size.
+// So the payload IS q4nx chunk data and the import needs no re-quantisation -- it emits a container OF THE SAME GENRE:
+// one contiguous payload (the planned byte ranges in order) plus a header naming each destination slot with its dtype,
+// shape and offset. That is also the only safe answer to q4nx.h's two-Q8-layouts problem: the bytes never change.
+// `container_write_layout` above is the debugging form (one file per slot); the pack form concatenates instead.
 
 // engine#1788, slice 3c: the writer's per-TENSOR decision, which is what an import actually iterates. Reads the tensor's
 // own layer, takes that layer's declared type, and asks the table above for a destination. A tensor with no role and a

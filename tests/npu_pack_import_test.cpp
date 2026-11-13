@@ -5432,6 +5432,124 @@ void test_container_import_plan() {
     check(okp.unplaced.empty() && okp.bytes == 24, "import: disjoint ranges out of order are fine");
 }
 
+// engine#1788, 3c: the I/O half. Writes real files to a scratch dir and reads them back -- the only way to know the byte
+// ranges are the right bytes.
+void test_container_write_layout() {
+    namespace fs = std::filesystem;
+    using pi::Q4nxTensor;
+    const std::string dir = (fs::temp_directory_path() / "onebit-write-layout-test").string();
+    fs::remove_all(dir); fs::create_directories(dir);
+    const std::string payload = dir + "/payload.bin";
+    { std::ofstream o(payload, std::ios::binary); for (int i = 0; i < 64; ++i) o.put(char('A' + (i % 26))); }
+
+    pi::Q4nxContainer c;
+    const auto t = [](const std::string& n, int64_t b, int64_t e) {
+        Q4nxTensor x; x.name = n; x.shape = {2, 2}; x.dtype = "I8"; x.begin = b; x.end = e; return x;
+    };
+    c.tensors = {t("model.embed_tokens.weight", 0, 8), t("model.layers.0.self_attn.q_proj.weight", 8, 24)};
+    c.payload_bytes = 64;
+    const pi::ImportPlan plan = pi::container_import_plan(c, {"full_attention"});
+
+    const std::string out = dir + "/out";
+    const pi::WriteLayoutResult w = pi::container_write_layout(payload, plan, out, false);
+    check(w.ok, "write: a complete plan writes");
+    check(w.files == 2, "write: one file per placed tensor");
+    check(w.bytes == 24, "write: and the bytes are the ranges, not the payload");
+    {
+        std::ifstream i1(out + "/model.embed_tokens.weight", std::ios::binary);
+        std::string s1((std::istreambuf_iterator<char>(i1)), std::istreambuf_iterator<char>());
+        check(s1 == "ABCDEFGH", "write: the embedding carries ITS bytes (0..8)");
+        std::ifstream i2(out + "/model.layers.0.self_attn.q_proj.weight", std::ios::binary);
+        std::string s2((std::istreambuf_iterator<char>(i2)), std::istreambuf_iterator<char>());
+        check(s2 == "IJKLMNOPQRSTUVWX", "write: the projection carries ITS bytes (8..24)");
+        std::ifstream mi(out + "/manifest.json");
+        const std::string mtext((std::istreambuf_iterator<char>(mi)), std::istreambuf_iterator<char>());
+        check(mtext.find("model.layers.0.self_attn.q_proj.weight") != std::string::npos,
+              "write: the manifest names the slot");
+        check(mtext.find("\"source\": \"model.layers.0.self_attn.q_proj.weight\"") != std::string::npos,
+              "write: and the container tensor it came from");
+    }
+
+    // the refusal: an unplaced tensor means the pack would silently omit part of the model
+    pi::Q4nxContainer bad;
+    bad.tensors = {t("model.embed_tokens.weight", 0, 8), t("model.layers.0.mystery.weight", 8, 16)};
+    bad.payload_bytes = 64;
+    const pi::ImportPlan bp = pi::container_import_plan(bad, {});
+    const std::string out2 = dir + "/out2";
+    const pi::WriteLayoutResult w2 = pi::container_write_layout(payload, bp, out2, false);
+    check(!w2.ok, "write: an incomplete plan is refused");
+    check(w2.why.find("no destination") != std::string::npos, "write: and says why");
+    check(!fs::exists(out2 + "/model.embed_tokens.weight"), "write: and writes NOTHING, not a partial pack");
+    // ... unless the caller says the omission is intended
+    const pi::WriteLayoutResult w3 = pi::container_write_layout(payload, bp, out2, true);
+    check(w3.ok && w3.files == 1, "write: allow_unplaced writes the placed part and no more");
+    fs::remove_all(dir);
+}
+
+// engine#1788, 3c: the PACK form. One contiguous payload plus a header of offsets -- so the arm reads the payload back at
+// each header offset and compares with the source range. An offset header that is merely self-consistent is not enough.
+void test_container_write_pack() {
+    namespace fs = std::filesystem;
+    using pi::Q4nxTensor;
+    const std::string dir = (fs::temp_directory_path() / "onebit-write-pack-test").string();
+    fs::remove_all(dir); fs::create_directories(dir);
+    const std::string payload = dir + "/payload.bin";
+    { std::ofstream o(payload, std::ios::binary); for (int i = 0; i < 64; ++i) o.put(char('A' + (i % 26))); }
+
+    pi::Q4nxContainer c;
+    const auto t = [](const std::string& n, int64_t b, int64_t e) {
+        Q4nxTensor x; x.name = n; x.shape = {2, 2}; x.dtype = "I8"; x.begin = b; x.end = e; return x;
+    };
+    c.tensors = {t("model.embed_tokens.weight", 0, 8), t("model.layers.0.self_attn.q_proj.weight", 8, 24)};
+    c.payload_bytes = 64;
+    const pi::ImportPlan plan = pi::container_import_plan(c, {"full_attention"});
+
+    const std::string out = dir + "/pack";
+    // REVIEW of the first end-to-end run: the ranges are PAYLOAD-relative, so a container with a non-zero header must be
+    // read from payload_base. This arm only means anything if the payload has a header in front of it, which is why the
+    // fixture below prepends one -- the earlier arms could not have caught the bug because their base was 0.
+    const std::string with_hdr = dir + "/payload_with_header.bin";
+    { std::ofstream o(with_hdr, std::ios::binary); for (int i = 0; i < 24; ++i) o.put(char('0' + (i % 10))); }
+    { std::ofstream o(with_hdr, std::ios::binary | std::ios::app); for (int i = 0; i < 64; ++i) o.put(char('A' + (i % 26))); }
+    pi::Q4nxContainer hc;
+    hc.tensors = {t("model.embed_tokens.weight", 0, 8), t("model.layers.0.self_attn.q_proj.weight", 8, 24)};
+    hc.payload_bytes = 64;
+    hc.header_bytes = 16;   // the JSON length; the payload starts at 8 + this, after the length prefix
+    const pi::ImportPlan hplan = pi::container_import_plan(hc, {"full_attention"});
+    check(hplan.payload_base == 24, "pack: the plan carries where the payload starts (8 + the JSON length)");
+    const pi::WritePackResult hw = pi::container_write_pack(with_hdr, hplan, dir + "/pack_hdr", false);
+    check(hw.ok, "pack: a container with a header writes");
+    {
+        std::ifstream bi(dir + "/pack_hdr/model.q4nx", std::ios::binary);
+        const std::string blob((std::istreambuf_iterator<char>(bi)), std::istreambuf_iterator<char>());
+        check(blob == "ABCDEFGHIJKLMNOPQRSTUVWX",
+              "pack: and the bytes are the PAYLOAD's, not the header's (got: " + blob.substr(0, 12) + ")");
+    }
+
+    const pi::WritePackResult w = pi::container_write_pack(payload, plan, out, false);
+    check(w.ok, "pack: writes");
+    check(w.tensors == 2 && w.bytes == 24, "pack: two tensors, 24 bytes");
+    {
+        std::ifstream pi_in(out + "/model.q4nx", std::ios::binary);
+        const std::string blob((std::istreambuf_iterator<char>(pi_in)), std::istreambuf_iterator<char>());
+        check(blob.size() == 24, "pack: the payload is exactly the planned bytes");
+        check(blob.substr(0, 8) == "ABCDEFGH", "pack: the first slot sits at offset 0");
+        check(blob.substr(8, 16) == "IJKLMNOPQRSTUVWX", "pack: the second follows contiguously");
+        std::ifstream hi(out + "/pack.json");
+        const std::string htext((std::istreambuf_iterator<char>(hi)), std::istreambuf_iterator<char>());
+        check(htext.find("\"offset\": 0") != std::string::npos, "pack: the header states offset 0");
+        check(htext.find("\"offset\": 8") != std::string::npos, "pack: and offset 8 for the second");
+    }
+    // same refusal as the layout form
+    pi::Q4nxContainer bad;
+    bad.tensors = {t("model.embed_tokens.weight", 0, 8), t("model.layers.0.mystery.weight", 8, 16)};
+    bad.payload_bytes = 64;
+    const pi::ImportPlan bp = pi::container_import_plan(bad, {});
+    const pi::WritePackResult w2 = pi::container_write_pack(payload, bp, dir + "/pack2", false);
+    check(!w2.ok && w2.why.find("no destination") != std::string::npos, "pack: an incomplete plan is refused with a reason");
+    fs::remove_all(dir);
+}
+
 void test_container_placement() {
     using pi::Q4nxTensor;
     const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
@@ -6715,6 +6833,8 @@ int main(int argc, char** argv) {
         test_container_roles_gemma_local();
         test_container_roles_moe_and_singular_layer();
         test_container_placement();
+        test_container_write_pack();
+        test_container_write_layout();
         test_container_import_plan();
         test_scale_and_proj_norm_roles();
         test_role_tables_disagree_nowhere();

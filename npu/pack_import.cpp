@@ -3482,9 +3482,121 @@ static std::string group_suffix_slot(const std::string& role, const std::string&
     return std::string();
 }
 
+// engine#1788, 3c: WHY THIS IS A BYTE COPY AND MUST STAY ONE. npu/q4nx.h records that the Q8 chunk (8704 B) comes in TWO
+// code layouts and that nothing in the chunk or the container says which: the forward's decoder picks per tensor from the
+// codes (q4nx_q8_split16 -- in the right layout every group's absmax code is 127). So a writer that re-encoded or
+// re-quantised would have to make a choice the container does not make, and getting it wrong is a pack that decodes to
+// wrong weights with no error anywhere. Copying the payload's bytes verbatim cannot make that mistake: the layout is the
+// container's, and the forward already knows how to read it.
+WritePackResult container_write_pack(const std::string& payload_path, const ImportPlan& plan,
+                                     const std::string& out_dir, bool allow_unplaced) {
+    WritePackResult r;
+    r.payload = out_dir + "/model.q4nx";
+    r.header = out_dir + "/pack.json";
+    if (!plan.unplaced.empty() && !allow_unplaced) {
+        r.why = std::to_string(plan.unplaced.size()) + " tensor(s) have no destination (e.g. " + plan.unplaced.front() +
+                "); refusing to write a partial pack";
+        return r;
+    }
+    std::ifstream in(payload_path, std::ios::binary);
+    if (!in) { r.why = "cannot open the payload: " + payload_path; return r; }
+    std::error_code ec;
+    std::filesystem::create_directories(out_dir, ec);
+    if (ec) { r.why = "cannot create " + out_dir + ": " + ec.message(); return r; }
+    std::ofstream out(r.payload, std::ios::binary | std::ios::trunc);
+    if (!out) { r.why = "cannot write " + r.payload; return r; }
+    json tensors = json::object();
+    int64_t off = 0;
+    for (const auto& item : plan.items) {
+        in.seekg(plan.payload_base + item.begin);
+        std::string bytes(size_t(item.end - item.begin), '\0');
+        if (!in.read(&bytes[0], std::streamsize(bytes.size()))) {
+            r.why = "short read at " + std::to_string(plan.payload_base + item.begin) + " for " + item.source; return r;
+        }
+        out.write(bytes.data(), std::streamsize(bytes.size()));
+        if (!out) { r.why = "short write to " + r.payload; return r; }
+        // the header records where each slot's bytes sit in the contiguous payload: the offsets ARE the format
+        tensors[item.slot] = {{"offset", off}, {"bytes", int64_t(bytes.size())},
+                              {"shape", item.shape}, {"dtype", item.dtype}, {"source", item.source}};
+        off += int64_t(bytes.size());
+        ++r.tensors;
+    }
+    out.close();
+    if (!out) { r.why = "short write to " + r.payload; return r; }
+    json h;
+    h["tensors"] = tensors;
+    h["bytes"] = off;
+    h["payload_bytes"] = plan.payload_bytes;
+    h["unplaced"] = plan.unplaced;
+    std::ofstream hout(r.header, std::ios::trunc);
+    if (!hout) { r.why = "cannot write " + r.header; return r; }
+    hout << h.dump(2) << "\n";
+    if (!hout) { r.why = "short write to " + r.header; return r; }
+    r.bytes = off;
+    r.ok = true;
+    return r;
+}
+
+WriteLayoutResult container_write_layout(const std::string& payload_path, const ImportPlan& plan,
+                                         const std::string& out_dir, bool allow_unplaced) {
+    WriteLayoutResult r;
+    if (!plan.unplaced.empty() && !allow_unplaced) {
+        r.why = std::to_string(plan.unplaced.size()) + " tensor(s) have no destination (e.g. " + plan.unplaced.front() +
+                "); refusing to write a partial pack";
+        return r;
+    }
+    std::ifstream in(payload_path, std::ios::binary);
+    if (!in) { r.why = "cannot open the payload: " + payload_path; return r; }
+    json manifest = json::object();
+    std::error_code ec;
+    std::filesystem::create_directories(out_dir, ec);
+    if (ec) { r.why = "cannot create " + out_dir + ": " + ec.message(); return r; }
+    for (const auto& item : plan.items) {
+        in.seekg(plan.payload_base + item.begin);
+        std::string bytes(size_t(item.end - item.begin), '\0');
+        if (!in.read(&bytes[0], std::streamsize(bytes.size()))) {
+            r.why = "short read at " + std::to_string(plan.payload_base + item.begin) + " for " + item.source;
+            return r;
+        }
+        const std::string path = out_dir + "/" + item.slot;
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) { r.why = "cannot write " + path; return r; }
+        out.write(bytes.data(), std::streamsize(bytes.size()));
+        if (!out) { r.why = "short write to " + path; return r; }
+        ++r.files;
+        r.bytes += int64_t(bytes.size());
+        manifest[item.slot] = {{"source", item.source},
+                               {"bytes", int64_t(bytes.size())},
+                               {"shape", item.shape},
+                               {"dtype", item.dtype}};
+    }
+    // The layout is self-describing: a directory of files whose names are engine slots is not enough, because the reader
+    // also needs to know which container tensor each came from and what shape/dtype it is.
+    {
+        const std::string mpath = out_dir + "/manifest.json";
+        std::ofstream mout(mpath, std::ios::trunc);
+        if (!mout) { r.why = "cannot write " + mpath; return r; }
+        json j;
+        j["tensors"] = manifest;
+        j["files"] = r.files;
+        j["bytes"] = r.bytes;
+        j["payload_bytes"] = plan.payload_bytes;
+        j["unplaced"] = plan.unplaced;
+        mout << j.dump(2) << "\n";
+        if (!mout) { r.why = "short write to " + mpath; return r; }
+    }
+    r.ok = true;
+    return r;
+}
+
 ImportPlan container_import_plan(const Q4nxContainer& container, const std::vector<std::string>& layer_types) {
     ImportPlan out;
     out.payload_bytes = container.payload_bytes;
+    // `header_bytes` is the JSON length alone; the file prefixes it with an 8-byte little-endian length, so the payload
+    // starts at 8 + header_bytes. Getting this by 8 wrong is what made the first end-to-end run write header bytes.
+    // ... and there is no prefix when the container declares no header at all (a bare payload has header_bytes 0), so the
+    // +8 only applies to a real safetensors-shaped container.
+    out.payload_base = container.header_bytes > 0 ? container.header_bytes + 8 : 0;
     const PlacementReport rep = container_placement(container.tensors, layer_types);
     std::map<std::string, const Q4nxTensor*> by_name;
     for (const auto& t : container.tensors) by_name[t.name] = &t;
@@ -5081,10 +5193,32 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // the first byte fails with "cannot open <pack>/model.onnx" -- a missing-file message about a pack that has no graph
     // at all. Refused by name, the same way the external-data genre below is, until the container-genre writer exists.
     if (p.container_tensors >= 0) {
-        throw std::runtime_error(
-            "this pack is a safetensors container (model.q4nx): " + std::to_string(p.container_tensors) +
-            " tensor(s); importing it needs the container-genre writer (engine#1786, item F1), which the importer does "
-            "not have yet. `1bit npu-pack info` reports what the container holds");
+        // engine#1788: the writer exists now. The payload is copied, never re-quantised -- the container's bytes ARE the
+        // q4nx chunks (a tensor shaped [4096,8,4736] I8 is 4096 rows of the 4736-byte Q4_K chunk), and copying is the only
+        // safe answer to q4nx.h's two-Q8-layouts problem: the bytes never change, so the choice the container does not make
+        // never has to be made.
+        const std::string multi = pack_dir + "/model.q4nx";
+        const Q4nxContainer c = read_q4nx_container(multi);
+        if (!c.why.empty()) throw std::runtime_error("container: " + c.why);
+        // the layer types live in config.json beside the container, not in its safetensors metadata
+        std::string cfg_source;
+        const json cfg = load_geometry(pack_dir, &cfg_source);
+        std::vector<std::string> lt;
+        const json* src = cfg.contains("layer_types") ? &cfg : nullptr;
+        if (!src && cfg.contains("text_config") && cfg["text_config"].is_object() && cfg["text_config"].contains("layer_types"))
+            src = &cfg["text_config"];
+        if (src && (*src)["layer_types"].is_array())
+            for (const auto& x : (*src)["layer_types"]) if (x.is_string()) lt.push_back(x.get<std::string>());
+        const ImportPlan ip = container_import_plan(c, lt);
+        const WritePackResult w = container_write_pack(multi, ip, out_dir, opt.allow_incomplete);
+        if (!w.ok) throw std::runtime_error("container: " + w.why);
+        Report rep;
+        rep.out_dir = out_dir;
+        rep.tensors = int(w.tensors);
+        rep.tiles = w.bytes;
+        // the unplaced list is a REFUSAL list, so it goes where the caller already looks for refusals
+        for (const auto& u : ip.unplaced) rep.refused.push_back(u);
+        return rep;
     }
     if (p.graph_packed_siblings > 0) {
         // The genre has a writer now (engine#1503): decode -> convert -> split by role -> the same I8 tile chunks,

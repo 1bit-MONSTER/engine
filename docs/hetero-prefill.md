@@ -170,8 +170,8 @@ numbers of this document dated, and to re-run the ratio before anyone quotes a c
 > therefore comes from the binary's RUNPATH, `~/wt/release-rc/work/build/hrx/llama/bin/libggml-hrx.so.0.18.0`, and that file is
 > dated **2026-11-02 07:03** - four days before the #782 fix. Two device-free checks settle it: that library references
 > `m128_w8_f2_sb` **24 times**, while the post-fix build at `~/.cache/hw-gate/build-13a7fda57a/bin` (2026-11-06 16:12,
-> gpu-kernels `fd69590`) references it **0 times**, and `origin/main`'s `config/gpu-kernels.config` pins
-> `fd69590c6c471507f6d804751f38473261436350` - i.e. **the pin already carries the fix; the installed runtime the capture
+> gpu-kernels `fd69590`) references it **0 times**, and `config/gpu-kernels.config` **at the time of this capture** pinned
+> `fd69590c6c471507f6d804751f38473261436350` - i.e. **the pin already carried the fix; the installed runtime the capture
 > used was stale**. The pp2048 anchor could not have caught this: pp2048 is below the M=2048 knee, which is why it is fast
 > on both builds.
 >

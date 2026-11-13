@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "whisper_args.h"
 #include "audio_mel.h"
 
 namespace {
@@ -99,6 +100,17 @@ int main() {
     // Silence is the floor of the whole chain: power 0 -> log10(1e-10) = -10, the max is that too, so the max-8 clamp never
     // bites and the scale gives (-10+4)/4 = -1.5. (My first expectation here said 1.0 -- the test caught its author again.)
     expect_close(smel[0], -1.5f, 1e-6, "silence lands on the log floor: (-10+4)/4 == -1.5");
+
+    // engine#2183: WHERE the wav is. The tool carried a sentinel `int audio_arg_index = 1;` meaning "two-graph form" and never
+    // converted it, so the documented `whisper_transcribe enc.onnx dec.onnx file.wav` handed the ENCODER GRAPH to the wav reader
+    // and answered "wav: not a RIFF/WAVE file" for the invocation its own --help prints. Twelve heads of a PR tried to fix that
+    // line and lost it to rebases; this arm is the fix that a rebase cannot lose.
+    check(audio_arg_index_for("pack-dir") == 2, "whisper args: the pack form's wav is argv[2]");
+    check(audio_arg_index_for("whisper-small") == 2, "whisper args: a directory without .onnx is a pack");
+    check(audio_arg_index_for("encoder_model.onnx") == 3, "whisper args: the two-graph form's wav is argv[3]");
+    check(audio_arg_index_for("decoder_model.onnx") == 3, "whisper args: either graph decides it");
+    // the value the bug shipped with must be unreachable: no input yields the encoder-graph index 1
+    check(audio_arg_index_for("encoder_model.onnx") != 1, "whisper args: never the encoder graph's own index");
 
     if (g_failures != 0) {
         std::printf("audio mel: %d failures\n", g_failures);

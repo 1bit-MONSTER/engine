@@ -436,6 +436,11 @@ add_python_test(notice_covers_deps ${CMAKE_SOURCE_DIR}/tools/ci/notice_covers_de
 # reviews: a PR that carries another PR's files lands two merge decisions as one, and one whose work base
 # already has reads as a fresh duplicate. Both are invisible to a diffstat; this compares blobs. Device-free.
 add_python_test(pr_carry_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_carry_check.py --self-test)
+# engine#2021 / engine#2369 review: `registry_build.py --check-gaps` iterates the classes that are PRESENT, so a
+# branch that deletes a reviewed class passes it -- measured on #2021, where 41 classes became 40 and --check-gaps
+# still printed "none of the 41 reviewed significant classes is mapped". A test row for the three arms that do see it.
+add_python_test(registry_loss_check_test ${CMAKE_SOURCE_DIR}/tests/registry_loss_check_test.py)
+
 add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
 # `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and

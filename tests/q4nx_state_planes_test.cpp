@@ -32,6 +32,7 @@
 #include "npu_prefix_cache.h"
 #include "q4nx_state_planes.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -155,6 +156,51 @@ void test_kv_planes_still_per_position() {
     check(dst[3].empty(), "shared-KV layer is left empty");
 }
 
+// engine#1780: Gemma4-E4B's geometry. 42 layers, sliding ones 2 x 256 = 512 floats per position and every sixth (the
+// full layers) 2 x 512 = 1024; layers 24.. share an owner's KV and hold nothing. One width (NKV * HD = 512) counted the
+// full layers as holding twice the positions and cut them at half on snapshot, restore and rollback.
+void test_two_width_planes() {
+    using q4nx_state::give_per_pos;
+    using q4nx_state::held_positions;
+    using q4nx_state::keep_positions;
+    using q4nx_state::take_per_pos;
+    constexpr size_t kL = 42, kShared = 24, kNarrow = 512, kWide = 1024, kPos = 6;
+    std::vector<size_t> per(kL, kNarrow);
+    for (size_t l = 5; l < kL; l += 6) per[l] = kWide;
+    std::vector<std::vector<float>> kv(kL);
+    for (size_t l = 0; l < kShared; l++) {
+        kv[l].resize(kPos * per[l]);
+        for (size_t i = 0; i < kv[l].size(); i++) kv[l][i] = float(l * 100000 + i);
+    }
+    // The old count: the longest plane at the one width says 12 positions for a 6-position cache.
+    size_t old_held = 0;
+    for (const auto& p : kv) old_held = std::max(old_held, p.size() / kNarrow);
+    check(old_held == 2 * kPos, "the one-width count reads a full layer's 6 positions as 12 (the defect)");
+    check(held_positions(kv, per) == kPos, "the per-layer count holds exactly the 6 positions");
+
+    std::vector<std::vector<float>> old_saved, saved;
+    take_per_pos(kv, old_saved, 4 * kNarrow);
+    check(old_saved[5].size() == 2 * kWide, "a one-width snapshot of 4 positions keeps 2 of a full layer's (the defect)");
+    take_per_pos(kv, saved, per, 4);
+    check(saved[5].size() == 4 * kWide && saved[0].size() == 4 * kNarrow,
+          "a per-layer snapshot keeps 4 positions of every layer, wide and narrow");
+    check(saved[5].back() == kv[5][4 * kWide - 1], "...and they are the first 4 positions, not another cut");
+    check(saved[30].empty(), "a shared-KV layer's empty plane stays empty");
+
+    std::vector<std::vector<float>> dst(kL);
+    check(give_per_pos(saved, dst, per, 3), "restore of 3 of the 4 positions is accepted");
+    check(dst[5].size() == 3 * kWide && dst[11].size() == 3 * kWide && dst[4].size() == 3 * kNarrow,
+          "...and every layer resumes at 3 positions of its own width");
+    check(!give_per_pos(saved, dst, per, 5), "restore refuses positions the snapshot does not hold");
+
+    auto rolled = kv;
+    keep_positions(rolled, per, 2);
+    check(rolled[5].size() == 2 * kWide && rolled[0].size() == 2 * kNarrow && rolled[30].empty(),
+          "a verify rollback to 2 positions keeps 2 of every layer");
+    keep_positions(rolled, per, 5);
+    check(rolled[5].size() == 2 * kWide, "a rollback never grows a plane");
+}
+
 void test_truncated_whole_plane_is_refused() {
     // The safety property: a snapshot whose GDN plane is short must be refused (the caller re-prefills), never
     // installed short, which would leave the GDN step reading past the end of the plane.
@@ -195,6 +241,7 @@ int main() {
     test_old_planes_were_truncated();
     test_whole_planes_survive();
     test_kv_planes_still_per_position();
+    test_two_width_planes();
     test_truncated_whole_plane_is_refused();
     test_resume_point_is_one_token_short();
     if (failures) {

@@ -124,6 +124,9 @@ public:
     // Copy the state of the first `tokens` positions out.  False when the forward is not ready or
     // `tokens` exceeds what it holds.
     bool snapshot_state(int tokens, StateSnapshot& out) const;
+    // Floats one position adds to each layer's K (and V) cache: NKV * HD, or the full layers' own width on a model
+    // with two attention geometries (engine#1780).
+    std::vector<size_t> kv_widths() const;
     // Replace the state with the first `tokens` positions of `in`: the caller then continues at
     // position `tokens`.  Restoring fewer positions than the snapshot holds is the normal case (a
     // request resumes to just short of its own prompt and re-runs the last token), and restoring
@@ -327,6 +330,9 @@ private:
     // The same elementwise gate*up on caller memory, so a batched pass can read its ACT row and write its HH
     // row where they already are instead of staging both through a vector (a copy on each side).
     bool mlp(const float* gu, float* h, int im);
+    // engine#1780: the end of a Gemma-family layer for M rows in the batched body, as step() runs it for one: the
+    // per-layer embedding block (when the model has one; `ple_rows` is [M][NL * ple_dim]) and then layer_scalar.
+    bool gemma4_tail_rows(int l, int M, const std::vector<float>& ple_rows, std::vector<float>& X);
     // `tag` is the NPU_INFER_DUMP_OPS label (ops-dump.h); the per-head q/k norms pass their own.
     float rmsnorm(const float* x, const float* w, int n, float* out, const char* tag = "rmsnorm") const;
     float rmsnorm_noweight(const float* x, int n, float* out) const;

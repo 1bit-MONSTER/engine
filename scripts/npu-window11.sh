@@ -342,6 +342,21 @@ bad = write("bad.log", {keys[0]: 2.600, keys[1]: 5.100})    # +30 % and +2 %
 
 rc, out = run(a, b)
 check(rc == 2 and "no tolerance given" in out, "no tolerance and no control is refused", out)
+# The empty-transcript arm: three rows whose sha is the empty string's (what a failed request records) compared
+# "3/3 identical" and PASSED before `chars` was read, so the gate could pass having compared nothing.
+empty_sha = subprocess.run(["bash", "-c", "printf '' | sha256sum | cut -d' ' -f1"], capture_output=True,
+                           text=True).stdout.strip()
+ea = os.path.join(d, "empty-a.log")
+eb = os.path.join(d, "empty-b.log")
+for path in (ea, eb):
+    with open(path, "w") as f:
+        for i in (1, 2, 3):
+            f.write(f"text {i} sha256={empty_sha} chars=0 text=\n")
+        f.write("prof dec QKV M=128 ms=2.000 launches=100\n")
+rc, out = run(ea, eb, "--tol", "10")
+check(rc == 1 and "empty transcript" in out,
+      "three empty transcripts are not an identical pair (the sha of '' matches in every run)", out)
+
 rc, out = run(a, b, "--tol", "10")
 check(rc == 0 and "statistic in force: ratio-of-medians" in out and "tolerance 10% from --tol" in out,
       "--tol 10 passes a 5 % row and names the statistic", out)

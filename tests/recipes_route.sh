@@ -24,6 +24,9 @@
 #     every listed key matches, the same architecture without it does not, and a non-list is refused,
 #   - the qwen4exp (Qwen3.8-Flash-Next) recipes are hrx-only: GGML_HRX_GRAPH_PROGRAM_CACHE=128 and -ub 2048 (engine #572),
 #     added once, and nothing for another architecture on hrx or for qwen4exp on cpu,
+#   - a recipe flag with a llama-server environment variable (-ub: LLAMA_ARG_UBATCH) is not added over that
+#     variable, because llama-server's command line beats its environment, nor over the underscore spelling
+#     (--ubatch_size) that llama-server's parser reads as --ubatch-size,
 #   - a malformed recipe file stops serve with the reason.
 #
 # usage: tests/recipes_route.sh path/to/1bit
@@ -64,6 +67,11 @@ open(d + "/gkorder.json", "w").write("""{"recipes": [
   {"id": "gkg", "match": {"architecture": ["qwen35"]}, "args": ["--spec-draft-n-max", "3"], "measured": "test"}]}""")
 open(d + "/pmin.json", "w").write("""{"recipes": [{"id": "pmin", "match": {"drafter": ["dflash"]},
   "args": ["--spec-draft-p-min", "0"], "measured": "test"}]}""")
+open(d + "/ubu.json", "w").write("""{"recipes": [
+  {"id": "ubu", "match": {"architecture": ["llama"]}, "args": ["--ubatch_size", "512"], "measured": "test"},
+  {"id": "ub", "match": {"architecture": ["llama"]}, "args": ["-ub", "999"], "measured": "test"}]}""")
+open(d + "/ub.json", "w").write("""{"recipes": [{"id": "ub", "match": {"architecture": ["llama"]},
+  "args": ["-ub", "999"], "measured": "test"}]}""")
 open(d + "/mine.json", "w").write("""{"recipes": [{"id": "mine", "match": {"architecture": ["llama"]},
   "args": ["--threads", "7"], "env": {"ONEBIT_RECIPE_TEST": "1"}, "measured": "test"}]}""")
 open(d + "/bad.json", "w").write("""{"recipes": [{"id": "bad", "match": {"archtecture": ["llama"]},
@@ -143,6 +151,14 @@ check "--no-recipes adds nothing" '[ "$(after "$scratch/none.json" --spec-draft-
 run "$scratch/plain.gguf" "$scratch/dfp.json" --dflash "$scratch/draft.gguf" --mtp-p-min 0.5 --recipes "$scratch/pmin.json"
 check "a flag serve set wins: --mtp-p-min 0.5 is the only p-min" '[ "$(after "$scratch/dfp.json" --spec-draft-p-min)" = 0.5 ] && [ "$(count "$scratch/dfp.json" --spec-draft-p-min)" = 1 ]'
 
+run "$scratch/plain.gguf" "$scratch/ub-run.json" --recipes "$scratch/ub.json"
+check "a recipe's -ub is added when nothing sets the micro-batch" '[ "$(after "$scratch/ub-run.json" -ub)" = 999 ] && grep -q "recipe ub: -ub 999" "$scratch/ub-run.json.log"'
+LLAMA_ARG_UBATCH=1024 run "$scratch/plain.gguf" "$scratch/ub-env.json" --recipes "$scratch/ub.json"
+check "  but not over LLAMA_ARG_UBATCH, which llama-server's command line would replace (engine #572)" \
+      '[ "$(after "$scratch/ub-env.json" -ub)" = None ] && ! grep -q "recipe ub" "$scratch/ub-env.json.log"'
+run "$scratch/plain.gguf" "$scratch/ub-us.json" --recipes "$scratch/ubu.json"
+check "  nor over --ubatch_size, which llama-server's parser reads as --ubatch-size (engine #2292 review)" \
+      '[ "$(after "$scratch/ub-us.json" --ubatch_size)" = 512 ] && [ "$(after "$scratch/ub-us.json" -ub)" = None ] && ! grep -q "recipe ub:" "$scratch/ub-us.json.log"'
 run "$scratch/plain.gguf" "$scratch/mine-run.json" --recipes "$scratch/mine.json"
 check "--recipes FILE adds its flags" '[ "$(after "$scratch/mine-run.json" --threads)" = 7 ]'
 check "  and its environment" '[ "$(field "$scratch/mine-run.json" "r[\"env\"].get(\"ONEBIT_RECIPE_TEST\")")" = 1 ]'

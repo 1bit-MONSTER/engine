@@ -52,9 +52,10 @@ struct Recipes {
     // Parses recipe JSON; on failure returns false and leaves the reason in `err`.
     bool parse(const std::string& json_text, std::string& err);
 
-    // Adds each matching recipe's flags (a flag with the values after it) unless `argv` already
-    // has that flag, and its variables unless `env` or the process environment already sets
-    // them. Returns "id: what it added" for every recipe that added something.
+    // Adds each matching recipe's flags (a flag with the values after it) unless the backend
+    // already has that flag (on `argv`, or for -ub / -b also as its long form or as the
+    // LLAMA_ARG_UBATCH / LLAMA_ARG_BATCH variable llama-server reads), and its variables unless
+    // `env` or the process environment already sets them. Returns "id: what it added" for every recipe that added something.
     std::vector<std::string> apply(const RecipeFacts& f, std::vector<std::string>& argv,
                                    std::vector<std::string>& env) const;
 

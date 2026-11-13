@@ -37,6 +37,42 @@ bool is_flag(const std::string& t) {
     return t.size() > 1 && t[0] == '-' && !std::isdigit(static_cast<unsigned char>(t[1])) && t[1] != '.';
 }
 
+// The llama-server flags a recipe sets that have other spellings: the long form, and the environment
+// variable llama-server reads for it (common/arg.cpp). llama-server applies the environment first and its
+// command line after, so a recipe flag on the command line would replace a value the user set as
+// LLAMA_ARG_UBATCH (engine #572: serve has no -ub option of its own, so the environment is how a user picks it).
+// These are the flags our recipes set that llama-server also reads from the environment (-ub today, -b one step
+// ahead); add a row when a recipe sets another one.
+struct FlagSpelling { const char* flag; const char* long_flag; const char* env; };
+constexpr FlagSpelling kFlagSpellings[] = {
+    {"-ub", "--ubatch-size", "LLAMA_ARG_UBATCH"},
+    {"-b", "--batch-size", "LLAMA_ARG_BATCH"},
+};
+
+bool env_has(const std::vector<std::string>& env, const std::string& name) {
+    return std::getenv(name.c_str()) != nullptr ||
+           std::any_of(env.begin(), env.end(), [&](const std::string& e) { return e.rfind(name + "=", 0) == 0; });
+}
+
+// True when the backend already has `flag`: on its command line in any spelling, or in the environment.
+// llama-server's parser turns '_' into '-' in a "--" option before it looks the option up (common/arg.cpp), so
+// --ubatch_size is --ubatch-size; compare in that form. A "--opt=value" token is rejected there, so it needs no case.
+std::string as_parsed(std::string a) {
+    if (a.rfind("--", 0) == 0) std::replace(a.begin(), a.end(), '_', '-');
+    return a;
+}
+
+bool flag_set(const std::string& flag, const std::vector<std::string>& argv, const std::vector<std::string>& env) {
+    auto on_argv = [&](const std::string& f) {
+        return std::any_of(argv.begin(), argv.end(), [&](const std::string& a) { return as_parsed(a) == f; });
+    };
+    const std::string want = as_parsed(flag);
+    if (on_argv(want)) return true;
+    for (const auto& s : kFlagSpellings)
+        if (want == s.flag || want == s.long_flag) return on_argv(s.flag) || on_argv(s.long_flag) || env_has(env, s.env);
+    return false;
+}
+
 std::vector<std::string> strings(const nlohmann::json& j, const char* key, const std::string& id) {
     if (!j.is_array()) throw std::runtime_error("recipe " + id + ": " + key + " is not a list");
     std::vector<std::string> out;
@@ -131,7 +167,7 @@ std::vector<std::string> Recipes::apply(const RecipeFacts& f, std::vector<std::s
         for (size_t i = 0; i < r.args.size();) {
             size_t j = i + 1;
             while (j < r.args.size() && !is_flag(r.args[j])) ++j;
-            if (std::find(argv.begin(), argv.end(), r.args[i]) == argv.end()) {
+            if (!flag_set(r.args[i], argv, env)) {
                 for (size_t k = i; k < j; ++k) {
                     argv.push_back(r.args[k]);
                     added += (added.empty() ? "" : " ") + r.args[k];
@@ -140,9 +176,7 @@ std::vector<std::string> Recipes::apply(const RecipeFacts& f, std::vector<std::s
             i = j;
         }
         for (const auto& [name, value] : r.env) {
-            const bool set = std::getenv(name.c_str()) != nullptr ||
-                             std::any_of(env.begin(), env.end(), [&](const std::string& e) { return e.rfind(name + "=", 0) == 0; });
-            if (set) continue;
+            if (env_has(env, name)) continue;
             env.push_back(name + "=" + value);
             added += (added.empty() ? "" : " ") + name + "=" + value;
         }

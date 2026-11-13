@@ -27,6 +27,7 @@
 // ONEBIT_VISION_KEEP_FIXTURE=1 leaves the container and its config.json in the working directory (that is how the
 // goldens were produced). ONEBIT_MINICPM_PACK=<pack dir> with ONEBIT_MINICPM_ORACLE=<dir holding pixels.f32, tower.f32,
 // out.f32 and grid.txt> compares a published pack's output with a reference run of the same input.
+#include "../npu/vision_plan.h"    // engine#2324: text-side rows vs the tower's own row count
 #include "../npu/vision_tower.h"
 
 #include <nlohmann/json.hpp>
@@ -311,6 +312,44 @@ int main() {
     if (!std::getenv("ONEBIT_VISION_KEEP_FIXTURE")) {
         std::remove(kContainer);
         std::remove(kConfig);
+    }
+    // engine#2324: the join's invariant on a REAL vision pack, with no oracle needed -- one text-side row per
+    // placeholder, and the tower's own row count is the merger's second halving away from it. The reference arm below
+    // needs ONEBIT_MINICPM_ORACLE (pixels.f32/tower.f32/out.f32/grid.txt); this one needs only the pack, which is the
+    // thing a lane actually has. What it pins is the arithmetic that only minicpm_image_probe.cpp checked, and only on a
+    // 21 GB model: `PiecePlan::rows` is "grid_h/4 * grid_w/4", so `out.size()/out_hidden` must equal it, and the tower
+    // before the merger must be "grid_h/2 * grid_w/2" rows.
+    {
+        const char* pdir = std::getenv("ONEBIT_MINICPM_PACK");
+        if (pdir && *pdir) {
+            try {
+                // `Pack(pack_dir)` reads config.json and the container it names. The plan is built at FOUR PATCHES PER SIDE
+                // over the pack's own patch size, not at the pack's 980-pixel image: 4 * patch is the smallest geometry the
+                // planner leaves alone (scale_resolution must be at least 4 * patch, and a bigger request is resized), and
+                // this arm is about the two row counts, not about running a 70 x 70 grid on four cores.
+                const std::string pdir_s = pdir;          // `Pack pk(std::string(pdir))` is a function declaration
+                const vis::Pack pk(pdir_s);
+                const vis::Geometry& g = pk.geometry();
+                const int side = 4 * g.patch;
+                const vis::ImagePlan plan = vis::plan_image(side, side, /*max_slice_nums=*/1,
+                                                            /*scale_resolution=*/side, /*patch=*/g.patch);
+                const vis::PiecePlan& src = plan.source;
+                const int gh = src.grid_h, gw = src.grid_w;
+                std::vector<float> px(size_t(3) * size_t(gh * g.patch) * size_t(gw * g.patch));
+                for (size_t k = 0; k < px.size(); ++k) px[k] = float(int(k % 251) - 125) / 128.0f;
+                std::vector<float> tower;
+                const std::vector<float> out = vis::tower_forward(pk, px.data(), gh, gw, &tower);
+                const size_t text_rows = g.out_hidden ? out.size() / size_t(g.out_hidden) : 0;
+                check(int(text_rows) == src.rows,
+                      "join (real pack): the merger hands the text model exactly PiecePlan::rows rows");
+                check(tower.size() == size_t(gh / 2) * size_t(gw / 2) * size_t(g.hidden),
+                      "join (real pack): the tower before the merger is grid/2 x grid/2 rows");
+            } catch (const std::exception& e) {
+                check(false, std::string("join (real pack): opened and ran (") + e.what() + ")");
+            }
+        } else {
+            std::printf("  (ONEBIT_MINICPM_PACK not set: the join arm did not run)\n");
+        }
     }
     const char* pack = std::getenv("ONEBIT_MINICPM_PACK");
     const char* oracle = std::getenv("ONEBIT_MINICPM_ORACLE");

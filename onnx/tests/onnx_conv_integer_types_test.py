@@ -79,6 +79,9 @@ def run(runner, model, tensor, dtype, out_dir):
 
 
 def main(argv):
+    if len(argv) > 1 and argv[1] in ("-h", "--help"):
+        print(__doc__.strip().splitlines()[0] if __doc__ else "usage: onnx_conv_integer_types_test.py [runner]")
+        return 2
     runner = argv[1] if len(argv) > 1 else "build/ort_run"
     types = {"uint8": TensorProto.UINT8, "int8": TensorProto.INT8}
     results = {}

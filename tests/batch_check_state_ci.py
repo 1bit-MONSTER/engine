@@ -508,6 +508,9 @@ def tmp_root():
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip().splitlines()[0])
+        return 2
     if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("lfm2", "lfm3", "qwen2", "qwen2vl", "qwen2_untied", "qwen3_5", "hy_v3", "hy_v3_sgate")):
         print(__doc__.strip().splitlines()[2])
         return 2

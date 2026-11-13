@@ -383,7 +383,8 @@ What the goldens record at the release pin:
 - ZAYA1-8B and Qwen3.8-27B answer every case.
 
 The MoE and IQ rows (`qwen3-coder-30b-a3b`, `qwen3-4b-iq4xs`) were recorded on 2026-10-20 at
-llama.cpp 00f2a68d / hrx-system 82804197 (`manifest.json` `recorded_at`). Both answer every kat case.
+llama.cpp 00f2a68d / hrx-system 82804197 (`manifest.json` `recorded_at`; a submodule whose pin could not be read is
+recorded as `null` and named on stderr, never as the string "unknown"). Both answer every kat case.
 Their HRX base logits against a CPU run of the same file (`--device none`) give:
 
 | model | mean KLD | KLD p99 | same top token |

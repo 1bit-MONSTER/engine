@@ -62,14 +62,23 @@ def model_fingerprint(path):
 
 
 def pins(root):
+    """The two submodule pins, or None for a submodule whose pin could not be read.
+
+    This used to write the string "unknown" into the manifest's `recorded_at`, and NOTHING consumes that field
+    (`grep -rn recorded_at` finds only this writer), so a `git ls-tree` failure produced an artifact that still
+    looked like a record of what ran. `recorded_at` is a name that promises commit ids: an unreadable pin is
+    recorded as **null** and said out loud, rather than as a value a reader would have to know is a placeholder.
+    """
     out = {}
     for sub in ("llama.cpp", "hrx-system"):
         try:
             line = subprocess.run(["git", "-C", root, "ls-tree", "HEAD", "third_party/" + sub],
                                   capture_output=True, text=True, check=True).stdout.split()
             out[sub] = line[2]
-        except (subprocess.CalledProcessError, IndexError):
-            out[sub] = "unknown"
+        except (subprocess.CalledProcessError, IndexError) as exc:
+            print(f"hw_gate_manifest: could not read the pin of third_party/{sub} - recording null "
+                  f"({type(exc).__name__})", file=sys.stderr)
+            out[sub] = None
     return out
 
 

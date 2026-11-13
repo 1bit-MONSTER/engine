@@ -19,6 +19,8 @@
   hrx_decode_bw.py run MODEL.gguf --bench BIN [--depth N] [--reps 3] [--n 128] [--label L] [--json FILE]
                        [-- extra llama-bench args]                 bytes, then llama-bench tg, then the row
   hrx_decode_bw.py table ROW.json [ROW.json ...]                  rows written by run --json, as one markdown table
+  hrx_decode_bw.py top EVENTS.jsonl --steps N [--top 10] [--map KERNEL-IDS.map]
+                                                                  top kernels by device time per decode step
   hrx_decode_bw.py --self-test
 
 effective GB/s = bytes one decode step must read / step time. Bytes come from the GGUF itself (every split file):
@@ -37,6 +39,13 @@ effective GB/s = bytes one decode step must read / step time. Bytes come from th
 Activations, norms' f32 reads, the logits write and the extra rows of a per-layer n-gram embedding (a few KB) are
 not counted (each under 1 MB per token on the models measured).
 ms/step is llama-bench `-p 0 -n N -r REPS` (with `-d DEPTH`), the median of its per-repetition t/s.
+
+`top` reads HRX's own dispatch profile (rocprofv3 does not see HRX dispatches):
+  HRX_PROFILE_MODE=dispatch HRX_PROFILE_FILE=x.prof llama-bench -m M -ngl 99 -p 0 -n 32 -r 1
+  iree-profile dispatch --format=jsonl --dispatch_events x.prof > x.events.jsonl   (the iree-profile of the same build)
+and sums duration_ns per kernel key over --steps decode steps (llama-bench's warm-up token counts as a step: give
+n + 1). Profiling slows a step down, so read the shares and the device-time total, not the step time it implies.
+Add-on kernels have opaque ids (k_<12 hex>); --map names them from the build's KERNEL-IDS.map.
 """
 import argparse
 import glob
@@ -170,6 +179,37 @@ def cmd_table(a):
               f"{100 * r['gb_s'] / 220:.0f} % | {r['backend']} |")
 
 
+def top_kernels(events_path, steps, n_top=10, id_map=None):
+    """([(name, us_per_step, share, dispatches_per_step)], device_us_per_step)."""
+    import collections
+    names = {}
+    if id_map:
+        for line in open(id_map):
+            parts = line.split()
+            if len(parts) >= 2:
+                names[parts[1]] = parts[0]
+    total, count = collections.Counter(), collections.Counter()
+    for line in open(events_path):
+        d = json.loads(line)
+        if d.get("type") != "dispatch_event" or not d.get("valid", True):
+            continue
+        k = names.get(d["key"], d["key"])
+        total[k] += d.get("duration_ns", 0)
+        count[k] += 1
+    all_ns = sum(total.values()) or 1
+    rows = [(k, ns / 1e3 / steps, ns / all_ns, count[k] / steps) for k, ns in total.most_common(n_top)]
+    return rows, all_ns / 1e3 / steps
+
+
+def cmd_top(a):
+    rows, dev_us = top_kernels(a.events, a.steps, a.top, a.map)
+    print(f"device time {dev_us / 1e3:.2f} ms per step over {a.steps} steps (profiled; shares are what to read)")
+    print("| kernel | us/step | share | dispatches/step |")
+    print("|---|---:|---:|---:|")
+    for k, us, share, n in rows:
+        print(f"| `{k}` | {us:.0f} | {100 * share:.1f} % | {n:.0f} |")
+
+
 def self_test():
     f = {"general.architecture": "t", "t.block_count": 3, "t.nextn_predict_layers": 1, "t.expert_count": 8,
          "t.expert_used_count": 2, "t.attention.head_count_kv": 2, "t.attention.key_length": 4,
@@ -188,6 +228,18 @@ def self_test():
     terms_tied, _ = step_bytes(f, [x for x in t if x[0] != "output.weight"])
     assert terms_tied["embedding_rows"] == 0 and terms_tied["weights_dense"] == 1000 + 40 + 40 + 64 + 64
     assert split_files("/x/m-00001-of-00003.gguf") == [] and split_files("/x/m.gguf") == ["/x/m.gguf"]
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        ev, mp = os.path.join(d, "e.jsonl"), os.path.join(d, "m.map")
+        with open(ev, "w") as f:
+            for k, ns in (("k_aaaaaaaaaaaa", 3000), ("k_aaaaaaaaaaaa", 3000), ("loom_x", 4000)):
+                f.write(json.dumps({"type": "dispatch_event", "key": k, "duration_ns": ns, "valid": True}) + "\n")
+            f.write(json.dumps({"type": "dispatch_summary"}) + "\n")
+        with open(mp, "w") as f:
+            f.write("gemv_small\tk_aaaaaaaaaaaa\tgemv\n")
+        rows, dev = top_kernels(ev, 2, 10, mp)
+        assert rows[0][0] == "gemv_small" and abs(rows[0][1] - 3.0) < 1e-9 and abs(rows[0][2] - 0.6) < 1e-9, rows
+        assert rows[0][3] == 1 and abs(dev - 5.0) < 1e-9 and rows[1][0] == "loom_x"
     print("self-test passed")
 
 
@@ -211,8 +263,13 @@ def main(argv):
             p.add_argument("extra", nargs="*")
     p = sub.add_parser("table")
     p.add_argument("rows", nargs="+")
+    p = sub.add_parser("top")
+    p.add_argument("events")
+    p.add_argument("--steps", type=int, required=True)
+    p.add_argument("--top", type=int, default=10)
+    p.add_argument("--map")
     a = ap.parse_args(argv[1:])
-    {"bytes": cmd_bytes, "run": cmd_run, "table": cmd_table}[a.cmd](a)
+    {"bytes": cmd_bytes, "run": cmd_run, "table": cmd_table, "top": cmd_top}[a.cmd](a)
     return 0
 
 

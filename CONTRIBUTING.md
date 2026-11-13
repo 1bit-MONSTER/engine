@@ -41,6 +41,11 @@ This repository exists to be reviewable. Five rules keep it that way.
    template that emits the notice into a generated file) and is left alone;
    the three such files say so in a comment.
 
+Before you ask for a merge, run the six host-side checks in
+[docs/pre-pr-checks.md](docs/pre-pr-checks.md). None of them needs a device or a build, and each answers a question that a
+green CI tick and a careful read of your own diff do not. The page also covers the one thing that is not a command: build the
+target that contains the file you edited, which is not necessarily the target your test links.
+
 ## RFCs: design before code
 
 Changes that shape the engine start as an RFC in

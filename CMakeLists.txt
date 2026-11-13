@@ -428,6 +428,10 @@ add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tes
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the
 # check; the two permanent services are exempt by name. --self-test drives the decision, no device needed.
 add_python_test(device_holders ${CMAKE_SOURCE_DIR}/tools/device_holders.py --self-test)
+# engine#1901's rule: a tool that declares --self-test must be registered where something runs it. engine#1828's
+# fconst19_prescreen has one (the alignment decision on a synthetic pair whose answer is known -- the control that caught a
+# broken negative arm in its first version), and it needs no network and no packs, so it belongs in the default suite.
+add_python_test(fconst19_prescreen_selftest ${CMAKE_SOURCE_DIR}/tools/fconst19_prescreen.py --self-test)
 # engine#1911/#2018: a tools/*.py whose --selftest nothing runs is a comment, not a test. npu_pack_components.py
 # lists the components of a partitioned 1.9 pack (root text + sibling vision in either form) and its rule is pinned by
 # --selftest, which builds a synthetic layout: three components across both forms, a directory with no graph ignored,

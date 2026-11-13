@@ -16,7 +16,7 @@ limitations under the License.
 -->
 # Before you ask for a merge
 
-Seven commands, all host-side, none needing a device or a build. Every one of them answers a question that
+Eight commands, all host-side, none needing a device or a build. Every one of them answers a question that
 `mergeable=true`, a green CI tick and a careful read of your own diff do not.
 
 Run them from the repository root on the branch you are about to hand over.
@@ -29,6 +29,7 @@ below says why.
 | command | red means |
 |---|---|
 | `python3 tools/copyright.py --check` | a file has no notice, or has two |
+| `python3 tools/ci/notice_covers_deps.py --check` | a dependency that is fetched and compiled into the binary is not named in `NOTICE` |
 | `python3 tools/ci/tests_referenced_check.py` | a test, tool self-test or python test exists that nothing runs |
 | `python3 tools/ci/ci_targets_check.py --check` | a CI row names a target or path that does not exist |
 | `python3 tools/ci/registration_loss_check.py --check --base origin/main` | your branch would drop rows `main` has |

@@ -45,6 +45,7 @@
 #include <string>
 #include <vector>
 
+#include "whisper_args.h"
 #include "audio_exec.h"
 #ifdef ONEBIT_WHISPER_NPU
 #include "whisper_npu_device.h"
@@ -215,12 +216,10 @@ int main(int argc, char** argv) {
     std::string dec_path = (argc > 2) ? argv[2] : "";
 
     std::string why;
-    // `1` means the two-graph form is in use and the wav is argv[3]; the pack form sets this to 2 after it discovers the graphs.
-    int audio_arg_index = 1;
     onebit::audio::MelConfig cfg;
-    // The pack form is decided by the first argument: a directory (or anything without `.onnx`) is a pack, and it also carries the
-    // mel-bin count, which has to be known before the wav is turned into a spectrogram.
-    if (argc >= 3 && std::string(argv[1]).find(".onnx") == std::string::npos) audio_arg_index = 2;
+    // Where the wav is: argv[2] for the pack form, argv[3] for the two-graph form. Decided once, in tools/whisper_args.h, so
+    // that a test can hold it -- the old sentinel `1` was never converted and made the two-graph form read the encoder graph.
+    const int audio_arg_index = audio_arg_index_for(argv[1]);
     if (audio_arg_index == 2) {
         const std::string pack_dir = argv[1];
         onebit::audio::AudioPack pack;

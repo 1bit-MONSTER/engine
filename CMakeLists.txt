@@ -1592,7 +1592,7 @@ add_executable(whisper_transcribe tools/whisper_transcribe.cpp)
 target_include_directories(whisper_transcribe PRIVATE npu/forward/include)
 target_link_libraries(whisper_transcribe PRIVATE onebit_npu)
 add_executable(audio_mel_test tests/audio_mel_test.cpp)
-target_include_directories(audio_mel_test PRIVATE npu/forward/include)
+target_include_directories(audio_mel_test PRIVATE npu/forward/include ${CMAKE_SOURCE_DIR}/tools)   # engine#2183: whisper_args.h
 add_executable(audio_exec_test tests/audio_exec_test.cpp)
 target_link_libraries(audio_exec_test PRIVATE onebit_npu)
 # The executor's fork-join (npu/audio_parallel.h): MatMul bit-identical across ONEBIT_AUDIO_THREADS, and a throwing unit

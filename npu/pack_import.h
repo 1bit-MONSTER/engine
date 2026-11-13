@@ -969,6 +969,13 @@ FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x35
 // recurs `min_repeat` or more times (offset 0, the block start, excluded). Kept as a list, not a mode: a Qwen3 block has
 // three equally frequent inner headers.
 std::vector<int64_t> fconst_block_headers(const std::vector<int64_t>& pos, int64_t stride, int min_repeat);
+// engine#1985: the same list with the count floor taken from the *observed* distribution -- half the most frequent offset's
+// count, never below 3 -- instead of a constant or a fraction of the scan window. A real inner header lands at the same
+// offset in most of the blocks (all of them in a uniform pack, about half in a mixed attention/GDN pack, where a
+// q_norm-style header exists only in the attention layers), while a payload coincidence is a handful of hits by
+// construction and does not grow with the block count. Counting offsets rather than anchors is deliberate: `pos` may carry
+// more than one anchor per block, so its length is not the block count (review of engine#2021, gap 1).
+std::vector<int64_t> fconst_block_headers_observed(const std::vector<int64_t>& pos, int64_t stride);
 // engine#1831: set `hdr`/`h1`/`period` from that list the way locate_fconst() does -- one inner header is a 2-header block,
 // three is a 4-header block. Returns false, and changes nothing, for any other count.
 bool fconst_set_block_headers(FconstGeom& g, const std::vector<int64_t>& inner);

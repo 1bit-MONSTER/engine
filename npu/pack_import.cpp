@@ -1835,16 +1835,15 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
         return g;
     }
     const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
-    // The scan window is the first GiB, so a real section boundary repeats once per block in it, while a payload
-    // coincidence repeats a handful of times. The cut therefore has to scale with how many blocks the window holds:
-    // a constant `3` was calibrated on h3584 ("about 8 blocks"), and at a smaller stride the same window holds more
-    // blocks, so a coincidence accrues more chances to reach 3 while the real boundaries stay near one-per-block
-    // (engine#1985: Qwen3-1.7B, hidden 2048, came back with four in-block offsets -- three real plus a coincidence --
-    // and `fconst_set_block_headers` accepts only 1 or 3, so the whole layout was dropped and the pack refused with
-    // "the 4-header block is read as 2-header"). One repeat per block is the floor the comment above already assumes.
-    const int64_t blocks_in_window = int64_t(pos.size());
-    const int min_repeat = int(std::max<int64_t>(3, blocks_in_window / 4));
-    const std::vector<int64_t> inner = fconst_block_headers(pos, stride8, min_repeat);
+    // engine#1985: a constant cut of `3` was calibrated on h3584, where the first-GiB window holds about 8 blocks. At a
+    // smaller stride the window holds more blocks, so a payload coincidence accrues more chances to reach 3 while a real
+    // boundary stays at one per block -- Qwen3-1.7B (hidden 2048) came back with four in-block offsets, three real plus a
+    // coincidence, and `fconst_set_block_headers` accepts only 1 or 3, so the whole layout was dropped and the pack was
+    // refused. The floor is taken from the observed distribution (half the most frequent offset, never below 3) rather than
+    // from the window: `pos.size()` counts anchors, not blocks, and in a mixed attention/GDN pack a real header appears in
+    // only about half the blocks, so neither `pos.size()/4` nor a fixed fraction of the window separates the two cases
+    // (review of engine#2021, gaps 1 and 2).
+    const std::vector<int64_t> inner = fconst_block_headers_observed(pos, stride8);
     if (!fconst_set_block_headers(g, inner)) {
         g.why = "the 1.9 header gives stride " + std::to_string(stride8) + ", but the epsilon anchors repeat at " +
                 std::to_string(inner.size()) + " in-block offset(s), and a layer block has 1 (2-header) or 3 (4-header); "
@@ -1858,6 +1857,23 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
 // bytes lands at `r` modulo `stride` in every block, so the offsets that recur `min_repeat` or more times are the block's
 // section boundaries; offset 0 is the block start, not an inner header. ALL of them are kept rather than the most common
 // one: a Qwen3 block has three equally frequent inner headers, and keeping only the first maximum picked k_norm's.
+std::vector<int64_t> fconst_block_headers_observed(const std::vector<int64_t>& pos, int64_t stride) {
+    std::vector<int64_t> out;
+    if (stride <= 0) return out;
+    std::map<int64_t, int> count;
+    int most = 0;
+    for (const int64_t q : pos) {
+        const int64_t r = q % stride;
+        if (r > 0) most = std::max(most, ++count[r]);
+    }
+    // Never below 3: that is the value measured on a h3584 window of ~8 blocks, and a smaller floor would keep payload
+    // coincidences on a short pack. Half the mode covers the mixed-layer case without a per-architecture constant.
+    const int floor_count = std::max(3, most / 2);
+    for (const auto& [r, n] : count)
+        if (n >= floor_count) out.push_back(r);
+    return out;
+}
+
 std::vector<int64_t> fconst_block_headers(const std::vector<int64_t>& pos, int64_t stride, int min_repeat) {
     std::vector<int64_t> out;
     if (stride <= 0) return out;

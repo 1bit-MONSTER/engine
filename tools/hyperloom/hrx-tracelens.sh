@@ -28,9 +28,11 @@
 #   -- ggml/src/ggml-hrx` finds no commit that writes it, so hrx2kineto's --shapes path (hrx:: op names, per-op
 #   FLOPs/bytes) cannot run from a checkout -- the run still works and reports kernel names only, with every op
 #   in TraceLens' "other" category. Restore the producer before promising ggml-op attribution.
+#   llama.cpp#340 adds one (unmerged at this head; its record type and fields match what hrx2kineto reads), so
+#   when it lands this caveat stops applying rather than needing a rewrite.
 #   Aborts the run at 93 C Tctl; needs MemAvailable >= model size + 11 GB.
 set -uo pipefail
-[ $# -ge 2 ] || { sed -n 17,28p "$0"; exit 2; }
+[ $# -ge 2 ] || { sed -n 17,33p "$0"; exit 2; }
 MODEL=$(readlink -f "$1"); MODE=$2; shift 2
 for kv in "$@"; do export "$kv"; done
 BIN=${HRX_BIN:-$HOME/wt/hrx2kineto-src/build/bin}

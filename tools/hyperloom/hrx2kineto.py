@@ -25,6 +25,8 @@ itself instead:
 (`git log --all -S`), so everything below that depends on `--shapes` -- the hrx:: op names, FLOPs and bytes --
 cannot be produced from a checkout. The converter still runs without it and emits kernel names only, and
 TraceLens then puts every op in "other". Restore the producer before relying on the attribution half.
+llama.cpp#340 adds one (unmerged at this head) and its record type and fields match what this converter
+reads, so when it lands the paragraph above stops applying rather than needing a rewrite.
 
 Basic use (the original behaviour, kept byte-compatible):
 

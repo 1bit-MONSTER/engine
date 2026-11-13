@@ -421,6 +421,9 @@ carries `"watch": "report"`, so the census watcher lists new uploads of it as `.
 does not alert while no pinned backend can serve the class; remove that field (and record
 `mapped_ok`) when the llama.cpp pin gains `hrm_text`.
 
+* **Mapped since `2c178f44b`** (2026-11-13, the llama.cpp #327 pin engine#2138 moves to): `conversion/hrm_text.py` registers `HrmTextForCausalLM` as `hrm_text`, `src/llama-arch.cpp` registers `LLM_ARCH_HRM_TEXT`, and `src/models/hrm-text.cpp` builds its own graph: a second architecture, not an alias of a supported one.
+  `registry/significant.json` records the same fact as a `mapped_ok` reason, so `--check-gaps` stays quiet.
+
 ### `dflash2` - `nchapman/Qwen3.5-4B-DFlash2` (also `arc-kumbhar/incoai-Qwen3.8-27B-DFlash2`)
 
 Architecture class `DFlash2DraftModel`, no `auto_map` and `library_name: speculators` on the
@@ -452,6 +455,9 @@ Its `registry/significant.json` entry carries `"watch": "report"`, so the census
 new uploads of it as `. REVIEWED` and does not alert; remove that field (and record `mapped_ok`)
 when a pin bump reaches DFlash2 support (selector + conv heads, per-layer window) and its
 converter class registers `DFlash2DraftModel`.
+
+* **Mapped since `2c178f44b`** (2026-11-13, the llama.cpp #327 pin engine#2138 moves to): the condition above is met. `conversion/qwen.py` registers `DFlash2DraftModel` with `DFlashDraftModel` and writes `conv_kernel_size`, `conv_group_size`, `selector_rank`, `selector_top_k` and the `candidate_selector` codebooks; `src/models/dflash.cpp` loads the selector tensors and builds the conv and selector heads (`build_dflash2_conv`, `build_dflash2_selector`). The draft no longer drops them.
+  `registry/significant.json` records the same fact as a `mapped_ok` reason, so `--check-gaps` stays quiet.
 
 ### `tashkeel_nano` - `ahmadsy/tashkeel-nano-1p1m`
 
@@ -550,6 +556,9 @@ the target box today. Reviewed 2026-10-17: **not an alias**. Its `registry/signi
 entry carries `"watch": "report"`, so the census watcher lists new uploads as `. REVIEWED` and
 does not alert; remove that field (and record `mapped_ok`) when the pin gains `muse-spark`.
 
+* **Mapped since `2c178f44b`** (2026-11-13, the llama.cpp #327 pin engine#2138 moves to): `conversion/muse_spark.py` registers `MuseSparkForConditionalGeneration` as `muse_spark`, `src/llama-arch.cpp` registers `LLM_ARCH_MUSE_SPARK`, and `src/models/muse-spark.cpp` builds its own graph.
+  `registry/significant.json` records the same fact as a `mapped_ok` reason, so `--check-gaps` stays quiet.
+
 ### `glm5_next` - `azampatti/GLM-5.3-Flash-AZ` (also `zai-org/GLM-5.3-Flash`)
 
 Architecture class `Glm5NextForConditionalGeneration`, `model_type: glm5_next`, no `auto_map` and
@@ -601,6 +610,9 @@ person to confirm the sync really brought the KDA + DSA + hyper-connection layer
 counts as supported. Reviewed 2026-10-23: **not an alias**. Its `registry/significant.json` entry
 carries `"watch": "report"`, so the census watcher lists new uploads as `. REVIEWED` and does not
 alert; remove that field (and record `mapped_ok`) when the pin gains `glm5-next`.
+
+* **Mapped since `2c178f44b`** (2026-11-13, the llama.cpp #327 pin engine#2138 moves to): `conversion/glm.py` (text) and `conversion/qwen3vl.py` (the vision tower) register `Glm5NextForConditionalGeneration`, `src/llama-arch.cpp` registers `LLM_ARCH_GLM5_NEXT` with its KDA + MLA cache layout in `src/llama-model.cpp`, and `src/models/glm5-next.cpp` builds its own graph.
+  `registry/significant.json` records the same fact as a `mapped_ok` reason, so `--check-gaps` stays quiet.
 
 ### 2026-10-27 batch (engine#619)
 
@@ -703,6 +715,9 @@ family already ships GGUFs (`ibm-granite/granite-switch-4.1-8b-GGUF`, whose
   `registry/significant.json` entry carries `"watch": "report"`, so the census watcher lists new
   uploads as `. REVIEWED` instead of filing an issue; remove that field (and record `mapped_ok`)
   when the pin gains `graniteswitch`.
+
+* **Mapped since `2c178f44b`** (2026-11-13, the llama.cpp #327 pin engine#2138 moves to): `conversion/granite.py` registers `GraniteSwitchForCausalLM` as `graniteswitch`, `src/llama-arch.cpp` registers `LLM_ARCH_GRANITE_SWITCH`, and `src/models/granite-switch.cpp` builds its own graph.
+  `registry/significant.json` records the same fact as a `mapped_ok` reason, so `--check-gaps` stays quiet.
 
 ### 2026-11-05 batch (engine#619)
 
@@ -815,6 +830,9 @@ inline `config` and the repo's own `config.json`; metadata only, no weights).
 * **Real support needs**: a new GGUF architecture (sandwich norm, sliding attention with partial
   rotary, 7-tap conv) in the pinned backend, validated against HF reference logits. The family is
   already 96 models in the census, so this is worth its own issue rather than an alias.
+
+* **Mapped since `2c178f44b`** (2026-11-13, the llama.cpp #327 pin engine#2138 moves to): `conversion/lfm3.py` registers `Lfm3ForCausalLM` as `lfm3`, `src/llama-arch.cpp` registers `LLM_ARCH_LFM3`, and `src/models/lfm3.cpp` builds its own graph: not an alias of `lfm2`/`lfm2moe`.
+  `registry/significant.json` records the same fact as a `mapped_ok` reason, so `--check-gaps` stays quiet.
 
 #### `needle` - `Amdkn7/needle3`
 

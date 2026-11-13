@@ -71,12 +71,14 @@
   "HrmTextForCausalLM": {
    "model_type": "hrm_text",
    "family": "HRM-Text hierarchical-reasoning LM (Sapient)",
-   "watch": "report"
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps HrmTextForCausalLM -> hrm_text (conversion/__init__.py, conversion/hrm_text.py), registers LLM_ARCH_HRM_TEXT (src/llama-arch.cpp) and builds its graph in src/models/hrm-text.cpp. docs/arch-gaps.md carries the dated note."
   },
   "DFlash2DraftModel": {
    "model_type": "dflash2",
    "family": "DFlash2 speculative drafter (speculators; selector + conv heads the pinned dflash does not run)",
-   "watch": "report"
+   "watch": "report",
+   "mapped_ok": "the pinned backend now runs DFlash2, the condition docs/arch-gaps.md set: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) registers DFlash2DraftModel with DFlashDraftModel in conversion/qwen.py, which writes conv_kernel_size, conv_group_size, selector_rank, selector_top_k and the candidate_selector codebooks, and src/models/dflash.cpp loads selector_prev/next/hidden and builds them (build_dflash2_conv, build_dflash2_selector). docs/arch-gaps.md carries the dated note."
   },
   "DiacritizerModel": {
    "model_type": "tashkeel_nano",
@@ -101,12 +103,14 @@
   "MuseSparkForConditionalGeneration": {
    "model_type": "muse_spark",
    "family": "Meta Muse Spark Open (816B-A42B latent-MoE, vision + audio; upstream llama.cpp ba3c05f71, after the pin)",
-   "watch": "report"
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps MuseSparkForConditionalGeneration -> muse_spark (conversion/__init__.py, conversion/muse_spark.py), registers LLM_ARCH_MUSE_SPARK (src/llama-arch.cpp) and builds its graph in src/models/muse-spark.cpp. docs/arch-gaps.md carries the dated note."
   },
   "Glm5NextForConditionalGeneration": {
    "model_type": "glm5_next",
    "family": "GLM-5.3-Flash (KDA linear-attention + DeepSeek sparse attention hybrid, hyper-connections; upstream llama.cpp 649dcb10, after the pin)",
-   "watch": "report"
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps Glm5NextForConditionalGeneration -> glm5-next (conversion/__init__.py; text in conversion/glm.py, vision tower in conversion/qwen3vl.py), registers LLM_ARCH_GLM5_NEXT (src/llama-arch.cpp, with its KDA + MLA cache layout in src/llama-model.cpp) and builds its graph in src/models/glm5-next.cpp. docs/arch-gaps.md carries the dated note."
   },
   "LiveMemForCausalLM": {
    "model_type": "livemem",
@@ -126,7 +130,8 @@
   "GraniteSwitchForCausalLM": {
    "model_type": "granite_switch",
    "family": "Granite Switch 4.1 (dense all-attention Granite with N embedded per-token LoRA adapters, a zero adapter slot and weightless switch layers; upstream llama.cpp 157b81fe, not in the pin)",
-   "watch": "report"
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps GraniteSwitchForCausalLM -> graniteswitch (conversion/__init__.py, conversion/granite.py), registers LLM_ARCH_GRANITE_SWITCH (src/llama-arch.cpp) and builds its graph in src/models/granite-switch.cpp. docs/arch-gaps.md carries the dated note."
   },
   "Ernie5_5_MoeForCausalLM": {
    "model_type": "ernie5_5_moe",
@@ -141,7 +146,8 @@
   "Lfm3ForCausalLM": {
    "model_type": "lfm3",
    "family": "LiquidAI LFM3 (sandwich norms, sliding-attention layers with partial rotary, 7-tap conv cache, tied embeddings; not an alias of lfm2/lfm2moe, nothing at the pin registers it)",
-   "watch": "report"
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps Lfm3ForCausalLM -> lfm3 (conversion/__init__.py, conversion/lfm3.py), registers LLM_ARCH_LFM3 (src/llama-arch.cpp) and builds its graph in src/models/lfm3.cpp. docs/arch-gaps.md carries the dated note."
   },
   "NeedleForToolCalling": {
    "model_type": "needle",

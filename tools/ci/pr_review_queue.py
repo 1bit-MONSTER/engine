@@ -121,6 +121,11 @@ def self_test():
         'a verdict at a DIFFERENT head does not count: that is the case the queue exists for')
     chk(False, reviewed_at([{'body': 'looks good to me'}], 'abc1234'),
         'a review without a verdict line does not count')
+    # The guard is the VERDICT word, not the head: removing it left --self-test at rc 0, because every arm above
+    # passed a body that contained BOTH. A comment that quotes the head while reviewing is the shape that separates
+    # them, and it is the common one -- reviewers quote the sha they looked at.
+    chk(False, reviewed_at([{'body': 'I read abc1234 carefully and it looks fine to me'}], 'abc1234'),
+        'a comment that NAMES the head but is not a verdict does not count')
     chk(False, reviewed_at([{'body': None}], 'abc1234'), 'a null body does not raise')
     chk(True, reviewed_at([{'body': 'VERDICT: CHANGES at `abc1234`'}], 'abc1234'),
         'CHANGES is a verdict: the PR was reviewed, the answer was no')

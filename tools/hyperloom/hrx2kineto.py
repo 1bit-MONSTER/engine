@@ -17,9 +17,16 @@
 rocprofv3 sees no HRX dispatches (HRX loads its own libhsa and IREE writes the AQL packets). HRX profiles
 itself instead:
 
-    HRX_PROFILE_MODE=dispatch HRX_PROFILE_FILE=x.prof GGML_HRX_DISPATCH_SHAPE_LOG=x.shapes.jsonl <llama-*>
+    HRX_PROFILE_MODE=dispatch HRX_PROFILE_FILE=x.prof <llama-*>          (shapes log: see below)
     iree-profile dispatch --format=jsonl --dispatch_events x.prof > x.events.jsonl
     iree-profile command  --format=jsonl x.prof > x.commands.jsonl
+
+`GGML_HRX_DISPATCH_SHAPE_LOG` has no producer at this pin: no commit under ggml/src/ggml-hrx ever writes it
+(`git log --all -S`), so everything below that depends on `--shapes` -- the hrx:: op names, FLOPs and bytes --
+cannot be produced from a checkout. The converter still runs without it and emits kernel names only, and
+TraceLens then puts every op in "other". Restore the producer before relying on the attribution half.
+llama.cpp#340 adds one (unmerged at this head) and its record type and fields match what this converter
+reads, so when it lands the paragraph above stops applying rather than needing a rewrite.
 
 Basic use (the original behaviour, kept byte-compatible):
 

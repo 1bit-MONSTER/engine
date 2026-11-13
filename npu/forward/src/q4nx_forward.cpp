@@ -24,8 +24,16 @@
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
 #include "q4nx_forward.h"
+#include "batch_split.h"          // one wide launch or several narrow ones, decided from measured costs
+#include "weight_keys.h"     // the per-layer weight-cache keys, held distinct at compile time
+#include "layer_taps.h"      // engine#1780: where a tapped layer's rows go in the sink
+#include "pad_head_rows.h"   // engine#1990: the padded-head row rule, header-only for its arm
+#include "bf16_matrix.h"     // engine#1786: an unquantised BF16 matrix in either orientation
 #include "batch_width.h"
+#include "ffn_cache_policy.h"
+#include "lfm2_shortconv.h"          // LFM2 conv layers: the host part between the two projections
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
+#include "file_create.h"         // dumps are created 0600, never through a symlink
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
 #include <fcntl.h>
@@ -50,6 +58,8 @@
 #include "q4nx_dequant.h"
 #include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
 #include "q4nx_semantics.h"
+#include "quant_i8.h"
+#include "q4nx_host_head.h"
 #include "q4nx_pack.h"
 #include "q4nx_head_image.h"   // the lm-head tile cache (engine#1716)
 
@@ -177,13 +187,51 @@ static bool valid_sidecar_dir(const std::string& d) {
 // and a 3-D [ntr, ntc, N] tensor both work.  (src/q4nx_dequant.c; the Q4_K/Q8
 // layouts are in docs/qwen35-4b-weight-format.md.)
 
-static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out) {
+// The row width a tensor declares, in bytes: 1280 names the quarter-tile kind (Q4NX_CHUNK_Q4H), which a byte count
+// cannot tell from the 5120-byte tile. 0 for a tensor that is not two-dimensional.
+// A three-dimensional [rows/16, K/256, bytes] declares its chunk in the last dimension: 2304 and 4352 are the wide kinds
+// (Q4NX_CHUNK_Q4W / Q8W), and a Q4W tensor's byte count would otherwise pass for a 4608-byte Q4S grid.
+static int64_t declared_row_bytes(const TensorDesc* d) {
+    if (d && d->ndim == 3 && (d->shape[2] == Q4NX_CHUNK_Q4W || d->shape[2] == Q4NX_CHUNK_Q8W)) return d->shape[2];
+    // GPT-OSS's [RB, CB, S, 2560] (Q4NX_CHUNK_D2560): routed by the 4-D shape, read by dequant_desc below.
+    if (d && d->ndim == 4 && d->shape[3] == Q4NX_CHUNK_D2560 && !strcmp(d->dtype, "I8")) return Q4NX_CHUNK_D2560;
+    return (d && d->ndim == 2) ? d->shape[1] : 0;
+}
+
+static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out, const TensorDesc* desc = nullptr) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
+    // engine#1786: an unquantised BF16 matrix, [out, in] (Embedding-Gemma's projections, into a grid that may be padded
+    // past the declared shape, pad zero) or [in, out] (Qwen3.6-35B-A3B's ssm_alpha/beta): bf16_matrix.h says which.
+    if (desc && desc->ndim == 2 && !strcmp(desc->dtype, "BF16"))
+        return q4nx_bf16_matrix_into((const uint16_t*)data, nbytes, desc->shape[0], desc->shape[1], rows, cols, out);
+    const int64_t decl_row_bytes = declared_row_bytes(desc);
+    if (decl_row_bytes == Q4NX_CHUNK_D2560) {
+        // GPT-OSS: [RB, CB, S, 2560]; the container's K (CB*128) may be padded past the model's, and is read into
+        // the forward's width (cols) with the excess written 0.
+        const int RB = (int)desc->shape[0], CB = (int)desc->shape[1], S = (int)desc->shape[2];
+        const int k = std::min(cols, CB * Q4NX_D2560_COLS);
+        return q4nx_dequant_tensor_d2560((const uint8_t*)data, nbytes, RB, CB, S, rows, k, cols, out);
+    }
+    if (decl_row_bytes == Q4NX_CHUNK_Q4H) {
+        // Quarter tiles on the container's own K (Gemma3-270M: 640), read into the forward's padded width.
+        if (rows % Q4NX_Q4H_ROWS) return -1;
+        const size_t chunks = nbytes / Q4NX_CHUNK_Q4H, row_tiles = (size_t)(rows / Q4NX_Q4H_ROWS);
+        if (chunks % row_tiles) return -1;
+        return q4nx_dequant_tensor_q4h((const uint8_t*)data, nbytes, rows,
+                                       (int)(chunks / row_tiles) * Q4NX_Q4H_COLS, cols, out);
+    }
+    if (decl_row_bytes == Q4NX_CHUNK_Q4W || decl_row_bytes == Q4NX_CHUNK_Q8W) {
+        if (rows % Q4NX_WIDE_ROWS) return -1;
+        const size_t chunks = nbytes / (size_t)decl_row_bytes, row_tiles = (size_t)(rows / Q4NX_WIDE_ROWS);
+        if (chunks % row_tiles) return -1;
+        return q4nx_dequant_tensor_wide((const uint8_t*)data, nbytes, (int)decl_row_bytes, rows,
+                                        (int)(chunks / row_tiles) * Q4NX_WIDE_COLS, cols, out);
+    }
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
     const size_t n = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
     if (n == 0) return -1;
     const int cb = (int)(nbytes / n);
-    if (cb == Q4NX_TILE_BYTES || cb == Q4NX_CHUNK_Q4K || cb == Q4NX_CHUNK_Q8)
+    if (cb == Q4NX_TILE_BYTES || cb == Q4NX_CHUNK_Q4K || cb == Q4NX_CHUNK_Q8 || cb == Q4NX_CHUNK_Q4S)
         return q4nx_dequant_tensor_chunked((const uint8_t*)data, nbytes, rows, cols, cb, out);
     // The container may store this weight on a wider grid than the model's dimensions (engine#1097).
     // Read it on the container's grid and write only the model's [rows, cols], so buffers, row
@@ -198,9 +246,10 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
 // transformers' _compute_llama3_parameters applies.  `on == 0` unless the config names the type, so
 // every other architecture builds exactly the table it built before.  Keys are searched with their
 // quotes, which is what keeps "factor" from matching inside "high_freq_factor".
-// Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`. Hunyuan's
-// 1.9 packs declare factor 1.0 with a 262,144 window, i.e. a no-op until a prompt passes that window -- which is why
-// accepting it is safe rather than a guess: below the window the base IS theta, so the served bytes are plain rope.
+// Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`: below the
+// window the base IS theta, so a block with factor 1.0 serves plain rope. Hunyuan's 1.9 packs declare that AND
+// `alpha: 1000.0`, which is a different rule (a fixed base theta * alpha^(dim/(dim-2)), engine#1889): reading only
+// the factor made their block a no-op and rotated every position by the wrong angle.
 Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
     Q4nxRopeDynamic d{};
     std::ifstream f(cfg_path);
@@ -217,8 +266,31 @@ Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
     };
     d.factor = number("factor");
     d.original_max_position = number("max_position_embeddings");
-    d.on = (d.factor > 0.0 && d.original_max_position > 0.0) ? 1 : 0;
+    // engine#1889: `alpha` selects Hunyuan's fixed-base form (q4nx_rope.h). The key is searched with its quotes and its
+    // colon, so "lora_alpha" or an "alpha" inside a string value cannot be taken for it.
+    d.alpha = number("alpha");
+    d.on = ((d.factor > 0.0 && d.original_max_position > 0.0) || d.alpha > 0.0) ? 1 : 0;
     return d;
+}
+
+// rope_type "linear": the factor of the config's rope_scaling block when that block declares "linear" with a factor
+// above zero, else 0 (no scaling; a "linear" block without a usable factor is still refused by the caller).
+static double read_rope_linear(const std::string& cfg_path) {
+    std::ifstream f(cfg_path);
+    if (!f) return 0.0;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    char type[64];
+    q4nx_rope_declared_type(t.c_str(), type, (int)sizeof type);
+    if (std::strcmp(type, "linear")) return 0.0;
+    const size_t rs = t.find("\"rope_scaling\"");
+    const size_t at = rs == std::string::npos ? rs : t.find("\"factor\"", rs);
+    // the key must sit inside the block: before the first closing brace after it (the block holds no objects)
+    if (at == std::string::npos || at > t.find('}', rs)) return 0.0;
+    const size_t colon = t.find(':', at);
+    if (colon == std::string::npos) return 0.0;
+    char* end = nullptr;
+    const double v = std::strtod(t.c_str() + colon + 1, &end);
+    return (end != t.c_str() + colon + 1 && v > 0.0) ? v : 0.0;
 }
 
 static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
@@ -242,6 +314,35 @@ static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
     s.original_max_position = num("\"original_max_position_embeddings\"", 0.0);
     s.on = s.factor > 0.0 && s.original_max_position > 0.0 && s.high_freq_factor > s.low_freq_factor;
     return s;
+}
+
+static Q4nxRopeYarn read_rope_yarn(const std::string& cfg_path) {
+    Q4nxRopeYarn y{};
+    std::ifstream f(cfg_path);
+    if (!f) return y;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    char declared[32];
+    q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
+    if (std::strcmp(declared, "yarn")) return y;
+    auto num = [&t](const char* key, double def) -> double {
+        const char* p = strstr(t.c_str(), key);
+        if (!p) return def;
+        const char* c = strchr(p + strlen(key), ':');
+        if (!c) return def;
+        char* end = nullptr;
+        const double v = strtod(c + 1, &end);
+        return end == c + 1 ? def : v;
+    };
+    y.factor = num("\"factor\"", 0.0);
+    y.original_max_position = num("\"original_max_position_embeddings\"", 0.0);
+    y.beta_fast = num("\"beta_fast\"", 32.0);
+    y.beta_slow = num("\"beta_slow\"", 1.0);
+    y.attention_factor = num("\"attention_factor\"", 0.0);
+    if (!(y.attention_factor > 0.0) && y.factor > 1.0) y.attention_factor = 0.1 * std::log(y.factor) + 1.0;
+    if (!(y.attention_factor > 0.0)) y.attention_factor = 1.0;
+    y.truncate = !(strstr(t.c_str(), "\"truncate\": false") || strstr(t.c_str(), "\"truncate\":false"));
+    y.on = y.factor > 0.0 && y.original_max_position > 0.0;
+    return y;
 }
 
 // One top-level string field out of a small sidecar JSON (decision_config.json's `attention_mode`).
@@ -344,21 +445,37 @@ size_t Q4nxNpuForward::StateSnapshot::bytes() const {
     return n;
 }
 
+// engine#1780: the floats one position adds to layer l's K (and V) cache. attention() appends n_kv_heads * head_dim
+// of the layer's own geometry, which on a model with two attention geometries (Gemma4: QKV2 on the full layers,
+// 2 x 512, against 2 x 256 on the sliding ones) is not NKV * HD on every layer. Every place that turns positions into
+// cache floats -- snapshot, restore, a verify's rollback, extend_context -- goes through this.
+std::vector<size_t> Q4nxNpuForward::kv_widths() const {
+    const size_t base = size_t(c_.NKV) * size_t(c_.HD);
+    std::vector<size_t> w((size_t)std::max(c_.NL, 0), base);
+    const int i_qkv2 = idx_of(Q4NX_DESIGN_QKV2);
+    if (i_qkv2 < 0 || designs_[i_qkv2].k_rows <= 0) return w;
+    for (int l = 0; l < c_.NL; l++) {
+        const int lt = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
+        if (lt != Q4NX_LAYER_SLIDING) w[(size_t)l] = (size_t)designs_[i_qkv2].k_rows;   // as step(): QKV2 on a full layer
+    }
+    return w;
+}
+
 bool Q4nxNpuForward::snapshot_state(int tokens, StateSnapshot& out) const {
     if (!ready_ || tokens <= 0) return false;
     const size_t per = size_t(c_.NKV) * size_t(c_.HD);
-    size_t held = 0;  // positions the KV caches hold (a layer that shares its KV holds none)
-    for (const auto& layer : kcache_) held = std::max(held, layer.size() / per);
+    const std::vector<size_t> widths = kv_widths();
+    // positions the KV caches hold, each plane counted in its own row width (a layer that shares its KV holds none)
+    const size_t held = q4nx_state::held_positions(kcache_, widths);
     if (size_t(tokens) > held) return false;
     out.tokens = tokens;
     out.per_pos = per;
-    const size_t want = size_t(tokens) * per;
     // KV is per position, so a snapshot of the first `tokens` positions keeps exactly that many; the GDN conv
     // window and recurrent state are fixed-size blocks updated per position, so they go in whole.  Cutting them
     // with `want` truncated them (23 % of the recurrent plane at 180 tokens) and made restore_state refuse the
     // snapshot -- the prefix cache's `slot has no usable state`, which cost a full re-prefill on every request.
-    q4nx_state::take_per_pos(kcache_, out.k, want);
-    q4nx_state::take_per_pos(vcache_, out.v, want);
+    q4nx_state::take_per_pos(kcache_, out.k, widths, size_t(tokens));
+    q4nx_state::take_per_pos(vcache_, out.v, widths, size_t(tokens));
     q4nx_state::take_whole(conv_state_, out.conv);
     q4nx_state::take_whole(rec_state_, out.rec);
     return true;
@@ -368,12 +485,12 @@ bool Q4nxNpuForward::restore_state(const StateSnapshot& in, int tokens) {
     if (!ready_ || tokens <= 0 || tokens > in.tokens) return false;
     const size_t per = size_t(c_.NKV) * size_t(c_.HD);
     if (in.per_pos != per) return false;
-    const size_t want = size_t(tokens) * per;
+    const std::vector<size_t> widths = kv_widths();
     // Same split as snapshot_state: KV is restored per position (a layer whose KV is shared carries none of its
     // own, so an empty plane leaves the destination empty rather than filling it with the owner's), and the GDN
     // planes are restored whole -- refusing a truncated one instead of installing it short.
-    if (!q4nx_state::give_per_pos(in.k, kcache_, want)) return false;
-    if (!q4nx_state::give_per_pos(in.v, vcache_, want)) return false;
+    if (!q4nx_state::give_per_pos(in.k, kcache_, widths, size_t(tokens))) return false;
+    if (!q4nx_state::give_per_pos(in.v, vcache_, widths, size_t(tokens))) return false;
     if (!q4nx_state::give_whole(in.conv, conv_state_)) return false;
     if (!q4nx_state::give_whole(in.rec, rec_state_)) return false;
     return true;
@@ -394,8 +511,9 @@ void Q4nxNpuForward::reset() {
 bool Q4nxNpuForward::extend_context(int n_tokens) {
     if (!ready_ || n_tokens <= 0) return false;
     if (kcache_.empty() || vcache_.empty()) return false;
-    const size_t per = (size_t)c_.NKV * (size_t)c_.HD;   // floats per layer per token
+    const std::vector<size_t> widths = kv_widths();   // floats per token, per layer (engine#1780)
     for (int l = 0; l < c_.NL; l++) {
+        const size_t per = widths[(size_t)l];
         kcache_[l].reserve(kcache_[l].size() + (size_t)n_tokens * per);
         vcache_[l].reserve(vcache_[l].size() + (size_t)n_tokens * per);
         kcache_[l].insert(kcache_[l].end(), (size_t)n_tokens * per, 0.0f);
@@ -427,17 +545,19 @@ bool Q4nxNpuForward::init_host(const char* model_path, const std::string& dir) {
     return init_impl(nullptr, model_path, dir);
 }
 
-// engine#803 A2b, step one: the decode family gets its own method with the body unchanged, exactly as the lm
-// head did before it moved behind XdnaTarget (open_head). That precedent is why this is a move and not a
-// rewrite: the next step is then a copy into the target rather than surgery inside init_impl, and the three
-// log lines below are copied byte-for-byte because gates grep them ("[pb16i-trace]", the decode-family
-// line, the pb16i refusal) -- "improving" a message here breaks a gate that reads it.
+// engine#803 A2b: the model's half of opening the decode family. It derives the decode designs and their ELF
+// names (the container's naming), hands the per-role ELF resolution and context creation to
+// XdnaTarget::open_decode_family(), prints the summary lines, and loads the wide and narrow sealed families on
+// top. The log lines here and in the target are byte-for-byte what they were, because gates grep them (the
+// decode-family line, the pb16i refusal) -- "improving" a message breaks a gate that reads it.
 bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, const std::string& mdir,
                                              const std::string& dir) {
     if (host_gemm_) return true;          // the host arm packs its own weights; no decode family is loaded
+    (void)mdir;   // the decode directories reach the target through Setup::decode_dirs, resolved in init_impl
     if (!want_m16) {
         fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n", 0,
                 Q4NX_DESIGN_M_DECODE, ndesigns_, Q4NX_DESIGN_M_PREFILL, " (NPU_DECODE_M16=0: disabled)");
+        decode_disabled_ = true;   // engine#2102: turned off on purpose, which the ready line must not call missing
         return true;
     }
     q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
@@ -496,100 +616,14 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
             snprintf(designs16_[i].elf_name, Q4NX_ELF_NAME_MAX, "%s", n16.c_str());
         }
     }
-    std::vector<std::string> m16dirs;
-    plan_decode_dirs_.clear();
-    if (plan_.loaded() && !plan_.decode_dirs.empty()) {
-        // The plan says which of the two given paths each candidate hangs off, so the runtime
-        // stops guessing which base a bare directory name meant.
-        for (const auto& d : plan_.decode_dirs)
-            plan_decode_dirs_.push_back((d.under_model ? mdir : dir) + "/" + d.path);
-        for (const auto& p : plan_decode_dirs_) m16dirs.push_back(p);
-    } else {
-        m16dirs.push_back(mdir + "/kernels-m16");
-        m16dirs.push_back(dir + "/m16");
-        m16dirs.push_back(dir);
-    }
+    // The per-role loop is the target's (engine#803 A2b): it resolves each role's `_m16` ELF under the decode
+    // directories the setup carried (the plan's, or the built-in three), or the sealed pb16i image, creates the
+    // context and configures it. What stays here is the container's naming -- the designs' ELF names above and
+    // which sidecar file the sealed ELF is -- the summary lines, and the wide and narrow families below.
     int made = 0, skipped = 0;
-    for (int i = 0; i < ndesigns_; i++) {
-        if (designs16_[i].M <= 0) { skipped++; continue; }
-        std::string elf, kname = "main:seq";
-        if (pb16i_ && !pb16i_sealed_.empty()) {
-            // One ELF for every ternary phase: the file is the same for all roles and
-            // only the instance name differs, so I8Ctx reuses the one hw_context.
-            const char* inst = pb16i_instance(designs16_[i].role);
-            if (!inst) {
-                fprintf(stderr, "  [forward] pb16i: the sealed ELF has no instance for "
-                                "role %s; this role has no decode kernel\n",
-                        role_tag(designs16_[i].role));
-                designs16_[i].M = 0;
-                skipped++;
-                continue;
-            }
-            elf = dir + "/" + pb16i_sealed_;
-            sealed_dir_ = dir;
-            kname = inst;
-            if (!file_exists(elf)) {
-                err_ = plan_.loaded() ? ("plan " + plan_path_ + ": decode.sealed_elf \"" +
-                                         pb16i_sealed_ + "\" is not in " + dir + " (missing)")
-                                      : ("pb16i: missing sealed ELF " + elf);
-                return false;
-            }
-        } else {
-            for (const std::string& d : m16dirs) {
-                std::string cand = d + "/" + designs16_[i].elf_name;
-                if (file_exists(cand)) { elf = cand; break; }
-            }
-        }
-        if (elf.empty()) {
-            // A pb16i role without its image kernel must stop the load: it is not
-            // a slower path, it is a missing one (the int8 weights are not packed
-            // for these geometries under this layout).
-            if (pb16i_) {
-                err_ = plan_.loaded()
-                           ? std::string("plan ") + plan_path_ + ": decode role " +
-                                 role_tag(designs16_[i].role) + " needs \"" + designs16_[i].elf_name +
-                                 "\" (missing)"
-                           : std::string("pb16i: missing decode ELF ") + designs16_[i].elf_name;
-                return false;
-            }
-            skipped++;
-            continue;   // stay on M=128
-        }
-        I8Ctx* c16 = xd_->make_ctx16(i, designs16_[i]);
-        if (!c16) { err_ = "cannot create the decode context for role " + std::to_string(i); return false; }
-        c16->MD = designs16_[i].M;
-        c16->KD = designs16_[i].K;
-        c16->ND = designs16_[i].N;
-        c16->blocked_b = weight_layout_b8_;
-        c16->pb16i = pb16i_;
-        c16->t2s = t2s_;
-        // Which pb16i ELFs leave two int32 planes (the arena's ACC64 family: D, O and
-        // the full-attention q half).  This mirrors the ELF family contract rather
-        // than inferring it, and load/launch refuse a tensor that needs two planes on
-        // a one-plane ELF.
-        if (pb16i_) {
-            const Q4nxDesign r = designs16_[i].role;
-            c16->pb16i_planes =
-                (r == Q4NX_DESIGN_D || r == Q4NX_DESIGN_O || r == Q4NX_DESIGN_QKVFA_Q) ? 2 : 1;
-        }
-        if (!c16->init_elf(*dev, elf.c_str(), designs16_[i].M,
-                           designs16_[i].K, designs16_[i].N, 1, kname.c_str())) {
-            if (pb16i_) {
-                err_ = "pb16i: init_elf failed for " + elf;
-                return false;
-            }
-            fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "
-                            "this role keeps M=128\n", designs16_[i].elf_name);
-            xd_->drop_ctx16(i);
-            skipped++;
-            continue;
-        }
-        made++;
-        fprintf(stderr, "  [forward] %-7s M=%d K=%d N=%d  %s (decode)\n",
-                role_tag(designs_[i].role), designs16_[i].M, designs16_[i].K,
-                designs16_[i].N, elf.c_str());
-    }
-    xd_->note_m16_made(made > 0);
+    if (pb16i_ && !pb16i_sealed_.empty()) sealed_dir_ = dir;   // where the wide/narrow sealed files are looked for
+    if (!xd_->open_decode_family(designs16_, ndesigns_, pb16i_sealed_, &made, &skipped, err_)) return false;
+    decode_roles_ = made;   // engine#2102: the caller-facing count, beside the byte-for-byte log line below
     if (pb16i_ && made < ndesigns_ - 0) {
         fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
                 t2s_ ? "t2s" : "pb16i", made, ndesigns_);
@@ -604,44 +638,64 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
     // All roles or none -- max_batch_rows() is the chunk width, so one role without a wide kernel would be
     // launched past its buffers. A named file that is missing or does not load is logged and the pass stays at
     // 16 rows: a pack must never stop serving over an optional speed-up.
-    const std::string wide_path =
-        onebit::npu::wide_elf_path(getenv("NPU_WIDE_SEALED_ELF"), wide_sealed_, sealed_dir_);
-    if (const char* wide_elf = wide_path.c_str();
-        !wide_path.empty() && pb16i_ && !pb16i_sealed_.empty() && made > 0) {
-        const char* wr = getenv("NPU_WIDE_ROWS");
-        const int rows = wr && *wr ? atoi(wr) : wide_sealed_rows_;
-        int wide = 0;
+    // The narrow decode family is the mirror image: the same instances built for FEWER rows (default 4), taken
+    // by launches of 1..rows rows -- a decode step carries one. Config `q4nx_<layout>_sealed_narrow_elf` and
+    // `q4nx_sealed_narrow_rows`; NPU_NARROW_SEALED_ELF / NPU_NARROW_ROWS override, "0" = off.
+    // One loader for both: `wide` picks the row bound, the target's make/adopt/drop trio and the log text.
+    auto load_family = [&](bool wide, const std::string& path, int rows) {
+        if (path.empty() || !pb16i_ || pb16i_sealed_.empty() || made <= 0) return;
+        const char* tag = wide ? "wide" : "narrow";
+        int n = 0;
         std::string why;
-        if (rows <= Q4NX_DESIGN_M_DECODE || rows > Q4NX_DESIGN_M_PREFILL) why = "NPU_WIDE_ROWS must be 17..128";
-        else if (!file_exists(wide_elf)) why = std::string("no such file: ") + wide_elf;
+        if (wide && (rows <= Q4NX_DESIGN_M_DECODE || rows > Q4NX_DESIGN_M_PREFILL)) why = "NPU_WIDE_ROWS must be 17..128";
+        else if (!wide && (rows < 1 || rows >= Q4NX_DESIGN_M_DECODE)) why = "NPU_NARROW_ROWS must be 1..15";
+        else if (!file_exists(path)) why = "no such file: " + path;
         for (int i = 0; why.empty() && i < ndesigns_; i++) {
             I8Ctx* c16 = xd_->ctx16(i);
             if (!c16) continue;
             const char* inst = pb16i_instance(designs16_[i].role);
-            I8Ctx* cw = inst ? xd_->make_ctx_wide(i) : nullptr;
-            if (!cw) { why = std::string("no wide context for role ") + role_tag(designs16_[i].role); break; }
-            cw->MD = rows;
-            cw->KD = c16->KD;
-            cw->ND = c16->ND;
-            cw->blocked_b = c16->blocked_b;
-            cw->pb16i = c16->pb16i;
-            cw->t2s = c16->t2s;
-            cw->pb16i_planes = c16->pb16i_planes;
-            if (!cw->init_elf(*dev, wide_elf, rows, c16->KD, c16->ND, 1, inst)) {
+            I8Ctx* c = !inst ? nullptr : (wide ? xd_->make_ctx_wide(i) : xd_->make_ctx_narrow(i));
+            if (!c) { why = std::string("no ") + tag + " context for role " + role_tag(designs16_[i].role); break; }
+            c->MD = rows;
+            c->KD = c16->KD;
+            c->ND = c16->ND;
+            c->blocked_b = c16->blocked_b;
+            c->pb16i = c16->pb16i;
+            c->t2s = c16->t2s;
+            c->pb16i_planes = c16->pb16i_planes;
+            if (!c->init_elf(*dev, path.c_str(), rows, c16->KD, c16->ND, 1, inst)) {
                 why = std::string("init_elf failed for instance ") + inst;
                 break;
             }
-            wide++;
+            n++;
         }
-        if (why.empty() && wide > 0 && !xd_->adopt_wide(rows)) why = "a role with a decode context has no wide one";
-        if (why.empty() && wide > 0) {
-            fprintf(stderr, "  [forward] wide family: %d role(s) at M=%d from %s (chunks of 17..%d rows)\n",
-                    wide, rows, wide_elf, rows);
+        if (why.empty() && n > 0 && !(wide ? xd_->adopt_wide(rows) : xd_->adopt_narrow(rows)))
+            why = std::string("a role with a decode context has no ") + tag + " one";
+        if (why.empty() && n > 0) {
+            if (wide)
+                fprintf(stderr, "  [forward] wide family: %d role(s) at M=%d from %s (chunks of 17..%d rows)\n",
+                        n, rows, path.c_str(), rows);
+            else
+                fprintf(stderr, "  [forward] narrow family: %d role(s) at M=%d from %s (launches of 1..%d rows)\n",
+                        n, rows, path.c_str(), rows);
         } else {
-            xd_->drop_wide();
-            fprintf(stderr, "  [forward] wide family NOT adopted (%s); chunks stay at %d rows\n",
-                    why.empty() ? "no role has a decode context" : why.c_str(), Q4NX_DESIGN_M_DECODE);
+            if (wide) xd_->drop_wide(); else xd_->drop_narrow();
+            if (wide)
+                fprintf(stderr, "  [forward] wide family NOT adopted (%s); chunks stay at %d rows\n",
+                        why.empty() ? "no role has a decode context" : why.c_str(), Q4NX_DESIGN_M_DECODE);
+            else
+                fprintf(stderr, "  [forward] narrow family NOT adopted (%s); decode stays on the %d-row kernels\n",
+                        why.empty() ? "no role has a decode context" : why.c_str(), Q4NX_DESIGN_M_DECODE);
         }
+    };
+    {
+        const char* wr = getenv("NPU_WIDE_ROWS");
+        load_family(true, onebit::npu::wide_elf_path(getenv("NPU_WIDE_SEALED_ELF"), wide_sealed_, sealed_dir_),
+                    wr && *wr ? atoi(wr) : wide_sealed_rows_);
+        const char* nr = getenv("NPU_NARROW_ROWS");
+        load_family(false,
+                    onebit::npu::wide_elf_path(getenv("NPU_NARROW_SEALED_ELF"), narrow_sealed_, sealed_dir_),
+                    nr && *nr ? atoi(nr) : narrow_sealed_rows_);
     }
     return true;
 }
@@ -684,6 +738,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         mdir = slash == std::string::npos ? std::string(".") : mp.substr(0, slash);
         cfg_path = mdir + "/config.json";
     }
+    cfg_path_ = cfg_path;
 
     ModelConfig cfg = QWEN3_0_6B_CONFIG;
     // Device-side weight layout this container declares (see read_config_string).
@@ -696,6 +751,14 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         weight_layout_b8_ = (lay == "b8");
         t2s_ = (lay == "t2s");
         pb16i_ = (lay == "pb16i") || t2s_;
+        if (weight_layout_b8_) {
+            // engine#2208: a b8 container's decode roles can run from one sealed int8 ELF, one hw_context
+            // instead of one per role. The decode wait on a 24-layer pack is mostly context switches, so this
+            // is the same artifact shape pb16i uses, under the layout's own key. Empty keeps the per-role
+            // `_b8_m16.elf` files.
+            const char* e = getenv("NPU_I8_SEALED_ELF");
+            pb16i_sealed_ = e ? e : read_config_string(cfg_path, "\"q4nx_b8_sealed_elf\"", "");
+        }
         if (pb16i_) {
             // Where the images live: blk_<layer>_<tag>_weight.{pb16i|t2s,ref}.  The env
             // variable wins so a run can point at a fresh set without editing the
@@ -738,6 +801,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             wide_sealed_ = read_config_string(
                 cfg_path, t2s_ ? "\"q4nx_t2s_sealed_wide_elf\"" : "\"q4nx_pb16i_sealed_wide_elf\"", "");
             wide_sealed_rows_ = q4nx_config_int(cfg_path.c_str(), "q4nx_sealed_wide_rows", 32);
+            // ... and an optional third one built for fewer rows, for decode steps.
+            narrow_sealed_ = read_config_string(
+                cfg_path, t2s_ ? "\"q4nx_t2s_sealed_narrow_elf\"" : "\"q4nx_pb16i_sealed_narrow_elf\"", "");
+            narrow_sealed_rows_ = q4nx_config_int(cfg_path.c_str(), "q4nx_sealed_narrow_rows", 4);
             // A folded container also declares the fold: `q4nx_hadamard` names the sign table and
             // `q4nx_hadamard_block` the Hadamard block.  Without it the sidecar images would be
             // read in the stored (rotated) basis against un-rotated activations.
@@ -823,6 +890,15 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // The plan is the runtime's copy of the sealed-ELF decision; when it names one it wins, so a plan
     // and a container cannot disagree about which file the decode roles run.
     if (plan_.loaded() && !plan_.sealed_elf.empty()) pb16i_sealed_ = plan_.sealed_elf;
+    // The plan is the pack's description when there is one, so its wide family wins over config.json's keys.
+    if (plan_.loaded() && !plan_.sealed_wide_elf.empty()) {
+        wide_sealed_ = plan_.sealed_wide_elf;
+        wide_sealed_rows_ = plan_.sealed_wide_rows;
+    }
+    if (plan_.loaded() && !plan_.sealed_narrow_elf.empty()) {
+        narrow_sealed_ = plan_.sealed_narrow_elf;
+        narrow_sealed_rows_ = plan_.sealed_narrow_rows;
+    }
     // Hand the layout family to the launch layer now that the plan (or the probes) has settled it.
     xd_->set_pb16i(pb16i_, pb16i_dir_, pb16i_sealed_);
     xd_->set_hadamard_block(had_block);
@@ -840,7 +916,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
+    rope_yarn_ = read_rope_yarn(cfg_path);           // rope_type "yarn" (GPT-OSS, engine#1786)
     rope_dynamic_ = read_rope_dynamic(cfg_path);     // rope_type "dynamic" (NTK by base, engine#1740 W2)
+    rope_linear_factor_ = read_rope_linear(cfg_path); // rope_type "linear" (Gemma3's full layers, engine#1786)
     {
         // A declared scaling this forward does not apply is refused BY NAME (engine#1087): serving it
         // would run plain rope, stay fluent and be wrong past the original window, with nothing in the
@@ -849,15 +927,22 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         char declared[64];
         q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
-        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on)) {
+        const bool linear_ok = !std::strcmp(declared, "linear") && rope_linear_factor_ > 0.0;
+        // Qwen2.5-VL's "mrope" is a position layout, not a frequency scaling: plain RoPE frequencies, each taking its
+        // position from the t, h or w plane. Accepted here and checked against its sections once the semantics are
+        // read (below), where a malformed block is refused.
+        mrope_declared_ = !std::strcmp(declared, "mrope");
+        if (!linear_ok && !mrope_declared_ &&
+            !q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on,
+                                      rope_yarn_.on)) {
             if (!std::strcmp(declared, "llama3"))
                 err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
                        "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
                        "scaling cannot be applied; serving it would run plain RoPE";
             else
                 err_ = std::string("config.json declares rope scaling \"") + declared +
-                       "\", which this forward does not implement (only llama3 and longrope short_factor "
-                       "are), so it would be served plain RoPE and reply wrongly past the model's "
+                       "\", which this forward does not implement (only llama3, linear with a factor and "
+                       "longrope short_factor are), so it would be served plain RoPE and reply wrongly past the model's "
                        "original window (engine#1048, #1087)";
             return false;
         }
@@ -897,6 +982,60 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         err_ = "config.json num_hidden_layers (" + std::to_string(cfg.num_layers) + ") does not match the " +
                std::to_string(mw_->config.num_layers) + " layers in model.q4nx";
         return false;
+    }
+    // LFM2 declares its hybrid through `full_attn_idxs`, not `layer_types`, so the layer_types check below cannot see
+    // it: its gated short-convolution layers carry shortconv.* tensors and no self_attn.* at all. The container is
+    // the authority on which layers they are (model_shortconv_layers), and on the kernel length (the taps' own
+    // shape). What is refused, by name, is what the conv path does not cover: a kernel length that differs between
+    // layers or does not match the tensor's bytes, and the image layouts (pb16i/t2s), whose weights are sidecar
+    // images this path has no tags for.
+    {
+        int first_conv = -1;
+        const int n_conv = model_shortconv_layers(mw_, cfg.num_layers, &first_conv);
+        shortconv_ = n_conv > 0;
+        sc_layer_.assign((size_t)cfg.num_layers, 0);
+        sc_taps_ = 0;
+        if (shortconv_) {
+            if (pb16i_) {
+                err_ = "model.q4nx has gated short-convolution layers (LFM2's hybrid) and config.json declares an "
+                       "image weight layout (pb16i/t2s); the conv layers' projections have no image form here";
+                return false;
+            }
+            for (int l = 0; l < cfg.num_layers; l++) {
+                const LayerWeights* lw = &mw_->layers[l];
+                if (lw->shortconv_in_proj_weight.shape[0] == 0) continue;
+                sc_layer_[(size_t)l] = 1;
+                const TensorDesc* t = &lw->shortconv_conv_weight;
+                const int L = (int)t->shape[1];
+                const std::string where = "model.layers." + std::to_string(l) + ".shortconv";
+                if (lw->shortconv_out_proj_weight.shape[0] == 0 || t->shape[0] == 0) {
+                    err_ = where + " has in_proj but not conv.weight and out_proj.weight";
+                    return false;
+                }
+                if ((int)t->shape[0] != cfg.hidden_size || L < 1 || L > 64 ||
+                    (size_t)t->data_size != (size_t)cfg.hidden_size * (size_t)L * 2) {
+                    err_ = where + ".conv.weight is not bf16 [hidden_size][L] (shape " +
+                           std::to_string((long long)t->shape[0]) + " x " + std::to_string((long long)t->shape[1]) +
+                           ", " + std::to_string((unsigned long long)t->data_size) + " bytes, hidden_size " +
+                           std::to_string(cfg.hidden_size) + ")";
+                    return false;
+                }
+                if (sc_taps_ == 0) sc_taps_ = L;
+                else if (L != sc_taps_) {
+                    err_ = where + ".conv.weight has kernel length " + std::to_string(L) + " where layer " +
+                           std::to_string(first_conv) + " has " + std::to_string(sc_taps_) +
+                           "; one kernel length per model is what this forward runs";
+                    return false;
+                }
+            }
+            if (cfg.num_attention_heads * cfg.head_dim != cfg.hidden_size) {
+                err_ = "gated short-convolution layers need out_proj (hidden_size -> hidden_size) to be the attention "
+                       "output geometry, and num_attention_heads * head_dim is not hidden_size here";
+                return false;
+            }
+            fprintf(stderr, "  [forward] %d gated short-convolution layer(s) of %d, kernel length %d (LFM2 hybrid)\n",
+                    n_conv, cfg.num_layers, sc_taps_);
+        }
     }
 
     // forward dims mirror the config the weights were loaded with
@@ -994,7 +1133,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             }
             if (!embed_tile_ && !embed_i8_) {   // no element-wise read: keep the whole-table buffer (unchanged path)
                 embed_f_.resize((size_t)NV * (size_t)kpad_);
-                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data()) != 0) {
+                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data(), etd) != 0) {
                     err_ = std::string("embedding dtype ") + dt + " but dequant failed";
                     return false;
                 }
@@ -1032,6 +1171,60 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             return false;
         }
         if (sem_.eps <= 0) sem_.eps = c_.eps;
+        if (sem_.bidirectional) {
+            noncausal_attn_ = true;
+            bidir_sliding_ = true;
+            fprintf(stderr, "  [forward] use_bidirectional_attention: an encoder -- every layer, sliding ones included, "
+                            "reads the whole prompt in one pass at position 0 (up to %d tokens, half the %d-token "
+                            "window); it cannot generate\n", sem_.sliding_window > 0 ? sem_.sliding_window / 2 : 0,
+                    sem_.sliding_window);
+        }
+        // engine#1788: whether q and k are normalised per head is a fact about the container, not about its name
+        // (q4nx_semantics.h). A layer that carries both q_norm and k_norm turns it on for a model_type the table
+        // does not know; said out loud, because the dump below then prints 1 beside "<- model_type".
+        if (mw_ && mw_->config.num_layers > 0) {
+            std::vector<unsigned char> has_q(size_t(mw_->config.num_layers), 0), has_k(has_q);
+            for (int l = 0; l < mw_->config.num_layers; l++) {
+                has_q[size_t(l)] = mw_->layers[l].q_norm_weight.name[0] && mw_->layers[l].q_norm_weight.data_size > 0;
+                has_k[size_t(l)] = mw_->layers[l].k_norm_weight.name[0] && mw_->layers[l].k_norm_weight.data_size > 0;
+            }
+            const int by = q4nx_semantics_qk_norm_from_tensors(&sem_, has_q.data(), has_k.data(), mw_->config.num_layers);
+            if (by >= 0)
+                fprintf(stderr, "  [semantics] qk_norm=1  <- the container: layer %d carries self_attn.q_norm and k_norm "
+                                "(config.json's model_type is not a family the table knows)\n", by);
+        }
+        // engine#1786: attention_bias the same way. Qwen2's config.json never states it and every layer carries q/k/v
+        // biases; with the key absent they were loaded and never added, so Qwen2.5-3B-Instruct-NPU2 answered noise.
+        if (mw_ && mw_->config.num_layers > 0) {
+            std::vector<unsigned char> has_b(size_t(mw_->config.num_layers), 0);
+            auto present = [](const TensorDesc& t) { return t.name[0] && t.data_size > 0; };
+            for (int l = 0; l < mw_->config.num_layers; l++)
+                has_b[size_t(l)] = present(mw_->layers[l].q_proj_bias) || present(mw_->layers[l].k_proj_bias) ||
+                                   present(mw_->layers[l].v_proj_bias);
+            const int by = q4nx_semantics_attention_bias_from_tensors(&sem_, has_b.data(), mw_->config.num_layers);
+            if (by == -2) {
+                err_ = "config.json says attention_bias is false and model.q4nx carries q/k/v projection biases; "
+                       "serving it either way would be a guess";
+                return false;
+            }
+            if (by >= 0)
+                fprintf(stderr, "  [semantics] attention_bias=1  <- the container: layer %d carries q/k/v projection "
+                                "biases (config.json does not state attention_bias)\n", by);
+        }
+        if (mrope_declared_) {
+            const int s3 = sem_.mrope_section[0] + sem_.mrope_section[1] + sem_.mrope_section[2];
+            const int rot = sem_.rotary_dim > 0 ? sem_.rotary_dim : c_.HD;
+            if (!sem_.mrope_sectioned || sem_.n_mrope_section != 3 || s3 != rot / 2) {
+                err_ = "config.json declares rope scaling \"mrope\" and its mrope_section (" +
+                       std::to_string(sem_.n_mrope_section) + " values, summing to " + std::to_string(s3) +
+                       ") does not cover the " + std::to_string(rot / 2) + " rotary frequencies; the (t, h, w) "
+                       "layout would be a guess";
+                return false;
+            }
+            fprintf(stderr, "  [semantics] mrope: contiguous sections t=%d h=%d w=%d (Qwen2-VL form)  <- "
+                            "rope_scaling.type \"mrope\"\n",
+                    sem_.mrope_section[0], sem_.mrope_section[1], sem_.mrope_section[2]);
+        }
         q4nx_semantics_dump(&sem_);
         // A layer kind nothing implements is refused BY NAME, here beside the other precise refusals (engine#1087's
         // shape): q4nx_semantics maps an unrecognised layer_types entry to Q4NX_LAYER_OTHER and the attention path
@@ -1043,6 +1236,19 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                    "\", a layer kind this forward does not implement (it runs full_attention, sliding-window and "
                    "linear/GDN layers), so serving it would run those layers as full attention and be wrong at every "
                    "position; file the kind you need instead of converting it";
+            return false;
+        }
+        // LFM3 names its gated short-convolution layers in layer_types ("conv"); LFM2 does not, and the container
+        // decides there (model_shortconv_layers, above).  When both speak they have to agree layer for layer: a
+        // "conv" entry the container has no conv tensors for would run as attention with no attention weights,
+        // and a conv layer listed as attention would be given a KV cache and the wrong RoPE.
+        for (int l = 0; l < sem_.n_layer_types && l < c_.NL; l++) {
+            const bool said_conv = sem_.layer_types[l] == Q4NX_LAYER_CONV;
+            if (said_conv == is_conv_layer(l) || (!said_conv && !shortconv_)) continue;
+            err_ = "config.json layer_types[" + std::to_string(l) + "] is \"" +
+                   (said_conv ? std::string("conv") : std::string("attention")) + "\" but model.q4nx " +
+                   (is_conv_layer(l) ? "holds" : "has no") + " model.layers." + std::to_string(l) +
+                   ".shortconv (conv) tensors for that layer";
             return false;
         }
         // Refuse rather than silently apply full-attention math to a model whose
@@ -1147,11 +1353,48 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                            q4nx_config_int(cfg_path.c_str(), "num_experts_per_tok", 0));
         const int moe_im = q4nx_config_int(cfg_path.c_str(), "moe_intermediate_size", 0);
         expert_im_ = moe_im > 0 ? moe_im : c_.IM;
+        // hy_v3 states both: moe_intermediate_size 1536 and expert_hidden_dim 768, and its experts (and the shared
+        // expert) are [768][2048] in tencent/Hy-Memory-30B-A3B's own checkpoint, so expert_hidden_dim is the width.
+        const int ehd = q4nx_config_int(cfg_path.c_str(), "expert_hidden_dim", 0);
+        if (ehd > 0) expert_im_ = ehd;
         dense_im_ = q4nx_config_int(cfg_path.c_str(), "dense_intermediate_size", 0);
         leading_dense_ = q4nx_config_int(cfg_path.c_str(), "leading_dense_block_count", 0);
         expert_gating_sigmoid_ =
             q4nx_config_int(cfg_path.c_str(), "expert_gating_func", 1) == 2;  // 2 = sigmoid
         expert_w_scale_ = read_config_float(cfg_path, "\"expert_weights_scale\"", 1.0f);
+        // Hy-Memory (hy_v3, engine#1786) states the same DeepSeek-V3 routing under its own keys: the
+        // sigmoid as moe_router_use_sigmoid, the scale as router_scaling_factor, the leading dense block
+        // as first_k_dense_replace, and the dense FFN's width as intermediate_size. Our llama.cpp fork's
+        // hy-v3.cpp routes it as deepseek2 does (sigmoid probs, top-k on probs + expert bias, the
+        // unbiased probs sum-normalised and scaled), which is the path moe_mlp runs.
+        {
+            std::ifstream cf(cfg_path);
+            const std::string ct((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>());
+            if (ct.find("\"moe_router_use_sigmoid\": true") != std::string::npos ||
+                ct.find("\"moe_router_use_sigmoid\":true") != std::string::npos)
+                expert_gating_sigmoid_ = true;
+            if (ct.find("\"expert_weights_scale\"") == std::string::npos)
+                expert_w_scale_ = read_config_float(cfg_path, "\"router_scaling_factor\"", expert_w_scale_);
+            if (leading_dense_ == 0)
+                leading_dense_ = q4nx_config_int(cfg_path.c_str(), "first_k_dense_replace", 0);
+            if (leading_dense_ > 0 && dense_im_ == 0) dense_im_ = c_.IM;
+        }
+        // The per-expert tile grid, from the first MoE layer's own gate stack rather than the name convention:
+        // FLM-named Qwen MoE containers transpose each expert ([K][N] slices), Hy-Memory-30B-A3B's do not -- its
+        // gate stack is [E * N/32][K/256][chunk] = [3072][8][4736] for N = 768, K = 2048. Read the wrong way, every
+        // expert is a permutation and the model answers " of of of".
+        {
+            char gn[160];
+            snprintf(gn, sizeof gn, "model.layers.%d.mlp.gate_exps_proj.weight", leading_dense_ > 0 ? leading_dense_ : 0);
+            const TensorDesc* gt = model_tensor_by_name(mw_, gn);
+            if (gt && gt->ndim == 3 && n_expert_ > 0 && gt->shape[0] % n_expert_ == 0 &&
+                gt->shape[0] / n_expert_ * Q4NX_TILE_ROWS == expert_im_ &&
+                gt->shape[1] * Q4NX_TILE_COLS == q4nx_pad_k(c_.H) && expert_im_ != q4nx_pad_k(c_.H)) {
+                moe_slice_nk_ = true;
+                fprintf(stderr, "  [moe] per-expert slices are [N][K] (%s is [%lld][%lld][...])\n", gn,
+                        (long long)gt->shape[0], (long long)gt->shape[1]);
+            }
+        }
         if (top_k_ <= 0 || top_k_ > n_expert_ || expert_im_ <= 0) {
             fprintf(stderr, "  [moe] config incomplete (n_expert=%d top_k=%d im=%d)\n",
                     n_expert_, top_k_, expert_im_);
@@ -1182,6 +1425,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     dims.qk_nope = qk_nope_; dims.dense_im = dense_im_;
     dims.H = c_.H; dims.NH = c_.NH; dims.NKV = c_.NKV; dims.HD = c_.HD;
     dims.IM = c_.IM;
+    dims.shortconv_n = shortconv_ ? 3 * c_.H : 0;   // LFM2 conv in_proj [B | C | X]
     // Activation tile of the PREFILL family.  It used to be the only family (a
     // bare 128 here decided the whole engine's M); decode now selects the M=16
     // twin instead -- see the m16 block after q4nx_derive_designs() and
@@ -1213,8 +1457,28 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                  q4nx_pad_n(dims.IM), tag);
         dims.fused_gu = file_exists(gu) || !file_exists(g) ? 1 : 0;
     }
+    // A MoE with a leading dense layer and no MLA (hy_v3): the routed experts' G/U/D are at the expert width, and the
+    // dense layer gets its own DG/DU/DD at intermediate_size -- the arrangement the MLA path already uses.
+    const bool moe_lead_dense = n_expert_ > 0 && !mla_ && leading_dense_ > 0 && dense_im_ > 0;
+    if (moe_lead_dense) { dims.IM = expert_im_; dims.fused_gu = 0; }
     ndesigns_ = q4nx_derive_designs(&dims, designs_);
     if (ndesigns_ <= 0) { err_ = "design derivation failed"; return false; }
+    if (moe_lead_dense && ndesigns_ + 3 <= Q4NX_MAX_DESIGNS) {
+        const struct { Q4nxDesign role; int K, N; const char* tag; } dd[3] = {
+            {Q4NX_DESIGN_DG, c_.H, dense_im_, "DG"}, {Q4NX_DESIGN_DU, c_.H, dense_im_, "DU"},
+            {Q4NX_DESIGN_DD, dense_im_, c_.H, "DD"}};
+        for (const auto& x : dd) {
+            memset(&designs_[ndesigns_], 0, sizeof(designs_[ndesigns_]));
+            designs_[ndesigns_].M = dims.M; designs_[ndesigns_].K = q4nx_pad_k(x.K); designs_[ndesigns_].N = q4nx_pad_n(x.N);
+            designs_[ndesigns_].real_k = x.K; designs_[ndesigns_].real_n = x.N;
+            designs_[ndesigns_].role = x.role;
+            snprintf(designs_[ndesigns_].elf_name, Q4NX_ELF_NAME_MAX, "full_i8_%s_K%d_N%d.elf", x.tag,
+                     q4nx_pad_k(x.K), q4nx_pad_n(x.N));
+            ndesigns_++;
+        }
+        fprintf(stderr, "  [forward] MoE with %d leading dense layer(s): experts at IM %d, dense FFN at %d\n",
+                leading_dense_, expert_im_, dense_im_);
+    }
     // Batched expert gate/up (MoE): one GEMM per projection over ALL top-k experts
     // at once, instead of one per expert.  Derived here rather than in
     // q4nx_derive_designs because it depends on top_k, which the dims struct does
@@ -1299,6 +1563,27 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         }
         conv_state_.assign(NL, std::vector<float>((size_t)CD * (size_t)(lin_ck_ - 1), 0.0f));
         rec_state_.assign(NL, std::vector<float>((size_t)lin_nvh_ * (size_t)lin_khd_ * (size_t)lin_vhd_, 0.0f));
+    }
+
+    // LFM2 conv layers: the two projections' f32 scratch (read only by assemble_B until the packed weight is on
+    // the device), the taps decoded once, and the per-layer state -- (L-1)*H floats on a conv layer, nothing on an
+    // attention layer -- in conv_state_, where snapshot/restore/reset already look.
+    if (shortconv_) {
+        if (lin_kd_ > 0) { err_ = "a model with both linear_attention and short-convolution layers is not implemented"; return false; }
+        wqkvlin_.resize((size_t)3 * (size_t)H * (size_t)H);
+        woutlin_.resize((size_t)H * (size_t)q4nx_pad_k(H));
+        sc_w_.assign((size_t)NL, std::vector<float>());
+        sc_rows_.assign((size_t)NL, std::vector<float>());
+        conv_state_.assign((size_t)NL, std::vector<float>());
+        for (int l = 0; l < NL; l++) {
+            if (!sc_layer_[(size_t)l]) continue;
+            const size_t n = (size_t)H * (size_t)sc_taps_;
+            const uint16_t* p = bf16_data(mw_, &mw_->layers[l].shortconv_conv_weight, n);
+            if (!p) { err_ = "model.layers." + std::to_string(l) + ".shortconv.conv.weight has no data"; return false; }
+            sc_w_[(size_t)l].resize(n);
+            for (size_t i = 0; i < n; i++) sc_w_[(size_t)l][i] = bf16_to_f32(p[i]);
+            conv_state_[(size_t)l].assign((size_t)(sc_taps_ - 1) * (size_t)H, 0.0f);
+        }
     }
 
     fprintf(stderr, "  [forward] derived %d designs (fused_gu=%d, H=%d NH=%d NKV=%d HD=%d IM=%d)\n",
@@ -1434,6 +1719,11 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         setup.pb16i_dir = pb16i_dir_;
         setup.head_pb16i_images =
             pb16i_ && !pb16i_dir_.empty() && file_exists(head_pb16i_stem(0) + image_ext());
+        // The plan's decode directories, resolved before the target is configured: the decode family and the
+        // lm-head both search setup.decode_dirs, so a list filled after this line reaches neither. (It used to be
+        // filled inside the M=16 block further down, after this point, so a plan's directories never reached the
+        // head lookup; with the decode loop on the target, nothing else would fill it at all.)
+        plan_decode_dirs_ = plan_.resolved_decode_dirs(mdir, dir);
         setup.decode_dirs = m16dirs_like_head(mdir, dir, plan_decode_dirs_);
         setup.hidden = c_.H;
         setup.vocab = c_.NV;
@@ -1482,8 +1772,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     xd_->set_m16_check(getenv("NPU_M16_CHECK") != nullptr);
     const char* m16_env = getenv("NPU_DECODE_M16");
     const bool want_m16 = !m16_env || atoi(m16_env) != 0;
-    // engine#803 A2b (step one): the block moved verbatim into open_decode_family_local(); the call site keeps the
-    // guard so the "disabled" log line is still printed from one place.
+    // engine#803 A2b: open_decode_family_local() names the decode designs and the target opens them; the call site
+    // keeps the guard so the "disabled" log line is still printed from one place.
     if (!open_decode_family_local(want_m16, dev, mdir, dir)) return false;
 
     // The lm head's own context (pb16i ternary images, the int8 ladder, or the q4_1 gemv head).  Cut out
@@ -1505,16 +1795,111 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // (packed I8); dequantize it once here.  Nanbeige4.1-3B is such a model and
     // its head is unrelated to the embedding (corr 0.013), so decoding logits
     // from the embedding returns '的' instead of 'Paris'.
+    // engine#1786: a config that does not state tie_word_embeddings is not evidence of a tie. FastFlowLM's
+    // Qwen3.5-9B-NPU2 omits the key, ships a separate lm_head.weight and is untied (upstream says false), so reading
+    // the logits off the embedding answered noise on the host and on the NPU. When the key is absent and the
+    // container carries both tables, sample rows of each and let the weights say: a tied head is the embedding's
+    // quantised copy (corr ~1), an untied one is unrelated (measured 0.00x on the 9B).
+    // Every way this check can end prints one line: an un-taken measurement names the condition that stopped it and
+    // the default it keeps, so the assumption this replaces can never come back silently (review of #2309).
+    if (!sem_.tie_stated && sem_.tie_embeddings) {
+        TensorDesc* ltd = model_tensor_by_name(mw_, "lm_head.weight");
+        TensorDesc* etd = &mw_->embed_tokens;
+        char why[160] = "";
+        if (!ltd || !ltd->data_size)
+            snprintf(why, sizeof(why), "no separate lm_head.weight");
+        else if (!etd->data_size || etd->name[0] == '\0' || !strcmp(ltd->name, etd->name))
+            snprintf(why, sizeof(why), "lm_head.weight is the only table (it is also the embedding)");
+        else if (kpad_ <= 0 || kpad_ % Q4NX_TILE_COLS != 0)
+            snprintf(why, sizeof(why), "lm_head.weight present but kpad %d is not a multiple of %d", kpad_, Q4NX_TILE_COLS);
+        const int samples = 16;
+        double corr = 0.0;
+        bool measured = false;
+        if (!why[0]) {
+            const int64_t head_shape[3] = {ltd->shape[0], ltd->ndim >= 2 ? ltd->shape[1] : 0, ltd->ndim >= 3 ? ltd->shape[2] : 0};
+            const int head_rows = padded_head_rows(head_shape, ltd->ndim, kpad_, NV);
+            const int cb = q4nx_tile_row_kind((size_t)ltd->data_size, head_rows, kpad_);
+            const uint8_t* lp = (const uint8_t*)model_tensor_data(mw_, ltd);
+            if (cb == 0 || !lp)
+                snprintf(why, sizeof(why), "lm_head.weight (%llu bytes) has no row-readable chunk kind on a %d x %d grid",
+                         (unsigned long long)ltd->data_size, head_rows, kpad_);
+            else {
+                std::vector<float> row((size_t)kpad_);
+                double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, n = 0;
+                for (int i = 0; i < samples && !why[0]; i++) {
+                    const int r = (int)((int64_t)i * (NV - 1) / (samples - 1));
+                    if (q4nx_dequant_tile_row(lp, (size_t)ltd->data_size, head_rows, kpad_, cb, r, row.data()) != 0) {
+                        snprintf(why, sizeof(why), "lm_head.weight row %d did not decode", r);
+                        break;
+                    }
+                    for (int k = 0; k < H; k++) {
+                        const double x = row[(size_t)k], y = embed_at(r, k);
+                        sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; n += 1;
+                    }
+                }
+                if (!why[0]) {
+                    const double cov = sxy - sx * sy / n, vx = sxx - sx * sx / n, vy = syy - sy * sy / n;
+                    if (vx > 0 && vy > 0) { corr = cov / std::sqrt(vx * vy); measured = true; }
+                    else snprintf(why, sizeof(why), "corr n/a (zero variance: %s)", vy > 0 ? "lm_head rows" : "embedding rows");
+                }
+            }
+        }
+        if (measured) {
+            const bool untied = corr < 0.5;
+            std::fprintf(stderr, "  [forward] tie_word_embeddings not stated: lm_head.weight vs the embedding on %d rows, "
+                                 "corr %.4f -> %s\n", samples, corr,
+                         untied ? "untied (the separate head is used)" : "tied (the embedding is the head)");
+            if (untied) sem_.tie_embeddings = 0;
+        } else {
+            std::fprintf(stderr, "  [forward] tie_word_embeddings not stated: %s, keeping tied\n", why);
+        }
+    }
     if (!sem_.tie_embeddings) {
         TensorDesc* ltd = model_tensor_by_name(mw_, "lm_head.weight");
         if (ltd) {
             lm_head_f_.assign((size_t)NV * (size_t)kpad_, 0.0f);
             lm_w_ = kpad_;
             const uint8_t* lp = (const uint8_t*)model_tensor_data(mw_, ltd);
-            if (!lp || dequant_any(lp, (size_t)ltd->data_size, NV, kpad_,
-                                   lm_head_f_.data()) != 0) {
+            /* engine#1990: the container's head may carry MORE rows than the vocabulary, for the same reason a padded
+             * column exists -- q4_1 tiles hold 32-row multiples and a pack's vocabulary need not be one (CodeLlama's is
+             * 32,016). The importer pads those rows; the reader must therefore dequantise on the tensor's own grid and
+             * keep only the vocabulary's rows. Asking for exactly NV rows is what failed here: 32,016 is not a multiple
+             * of the tile's 32 rows, so dequant_any() refused a head that was perfectly well formed.
+             *
+             * The extra rows decode to zero and are never sampled: the logits vector stays NV long. */
+            int head_rows = NV;
+            if (ltd->ndim >= 2 && kpad_ > 0 && kpad_ % Q4NX_TILE_COLS == 0) {
+                const int64_t per_block = kpad_ / Q4NX_TILE_COLS;   // tiles per 32-row block
+                // engine#1990: the tile COUNT is shape[0] when the tensor is stored as [tiles, tile bytes] -- which is
+                // what this container does (CodeLlama-7b: I8 [16016, 6144] for a 32,032-row head at kpad_ 4,096) -- and
+                // it is shape[0] / per_block when it is stored as a row grid. Gating on `shape[1] == kpad_` saw only the
+                // second form, so a padded head in the first form kept head_rows = NV and dequant_any() refused it:
+                // "lm_head dequant failed" on a head that is exactly what the importer was asked to write.
+                // Both spellings count TILE-ROWS in shape[0] -- [rows, kpad_] and [tiles, tile bytes] -- so the number of
+                // 32-row blocks is shape[0] / per_block either way; only the row WIDTH in shape[1] differs. Exposed as a
+                // pure function because these numbers are what a test can drive without a container.
+                // The rule reads the whole shape: [tiles, tile bytes], [row tiles, column tiles, bytes] (FastFlowLM's
+                // own containers, engine#1788) and [rows, kpad_] each say where the row count is (pad_head_rows.h).
+                const int64_t head_shape[3] = {ltd->shape[0], ltd->shape[1], ltd->ndim >= 3 ? ltd->shape[2] : 0};
+                head_rows = padded_head_rows(head_shape, ltd->ndim, kpad_, NV);
+            }
+            std::vector<float> head_f32;
+            float* head_out = lm_head_f_.data();
+            if (head_rows != NV) {
+                head_f32.assign((size_t)head_rows * (size_t)kpad_, 0.0f);
+                head_out = head_f32.data();
+            }
+            if (!lp || dequant_any(lp, (size_t)ltd->data_size, head_rows, kpad_, head_out, ltd) != 0) {
                 err_ = "lm_head dequant failed";
                 return false;
+            }
+            if (head_rows != NV) {
+                for (int r = 0; r < NV; r++)
+                    std::memcpy(&lm_head_f_[(size_t)r * (size_t)kpad_], &head_f32[(size_t)r * (size_t)kpad_],
+                                sizeof(float) * (size_t)kpad_);
+                std::fprintf(stderr,
+                             "  [forward] lm head: %d row(s) stored for a vocabulary of %d; the %d padding row(s) are "
+                             "not read (engine#1990)\n", head_rows, NV, head_rows - NV);
             }
             fprintf(stderr, "  [forward] separate lm_head.weight -> dequantized "
                             "(%zu floats)\n", lm_head_f_.size());
@@ -1525,10 +1910,19 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // scalar) are only read when gemma4_layer_ is set, so loading them before the
     // config was parsed left those vectors empty and crashed the first step.
     if (!load_norms()) return false;
+    if (sem_.gpt_oss && !load_gptoss()) return false;
     // qwen3_5 declares one model_type for two RMSNorm conventions and this box carries one of each (the
     // official 0.8B release is zero-centered; the hybrid 27B packs are plain gains). Resolve it from the
     // weight that was just loaded, and print the evidence so a surprising answer is visible rather than
     // buried. Every other model_type keeps the convention it already decided above.
+    if (sem_.gemma3_bf16_norm_probe && !sem_.rmsnorm_offset) {
+        const TensorDesc* q0 = model_tensor_by_name(mw_, "model.layers.0.self_attn.q_proj.weight");
+        if (q0 && !strcmp(q0->dtype, "BF16")) {
+            sem_.rmsnorm_offset = 1;
+            fprintf(stderr, "  [semantics] rmsnorm_offset=1  <- gemma3 with BF16 projections (an unconverted HF copy: its "
+                            "norms are HF's w, applied as 1 + w)\n");
+        }
+    }
     if (sem_.rmsnorm_offset_probe && !in_norm_.empty() && c_.H > 0) {
         const std::vector<float>& w0 = in_norm_[0];
         double sum = 0.0;
@@ -1698,6 +2092,39 @@ bool Q4nxNpuForward::load_norms() {
         layer_attn_dims(l, hd_l, nkv_l);
         if (!read_bf16(&mw_->layers[l].input_layernorm_weight, in_norm_[l].data(), H)) return false;
         if (!read_bf16(&mw_->layers[l].post_attention_layernorm_weight, post_norm_[l].data(), H)) return false;
+        // LFM3: the per-head sigmoid output gate, self_attn.gate_proj [heads, hidden] in bf16, on every attention
+        // layer.  Missing, it would leave the context ungated, so a layer without one is refused by name.
+        if (sem_.attn_head_gate) {
+            if (l == 0) head_gate_.assign((size_t)NL, std::vector<float>());
+            const TensorDesc* gd = &mw_->layers[l].self_attn_gate_proj_weight;
+            if (!is_conv_layer(l)) {
+                if (absent(gd) || strcmp(gd->dtype, "BF16") != 0 || gd->ndim != 2 || gd->shape[0] != c_.NH ||
+                    gd->shape[1] != H) {
+                    err_ = "config.json's model_type gates each attention head (LFM3) and model.layers." +
+                           std::to_string(l) + ".self_attn.gate_proj.weight is not bf16 [num_attention_heads, "
+                           "hidden_size]";
+                    return false;
+                }
+                head_gate_[(size_t)l].resize((size_t)c_.NH * (size_t)H);
+                if (!read_bf16(gd, head_gate_[(size_t)l].data(), c_.NH * H)) return false;
+            }
+        }
+        // engine#1889: the config says q and k are normalised and this layer has no gain to normalise with. read_bf16
+        // would hand back zeros for the absent tensor and rmsnorm(q, 0) is 0 for every head, so the layer would attend
+        // uniformly and answer fluent nonsense. A Hunyuan container imported before the importer claimed the gains is
+        // exactly this shape, so it is refused by name here instead.
+        // Only a layer with softmax attention has a q to normalise, so only such a layer can miss its gain. LFM2's
+        // short-convolution layers have no attention at all, and a qwen3_5 linear-attention (GDN) layer has no
+        // self_attn.q_norm either (18 of Qwen3.5-2B's 24 layers, layer 0 among them): the test is the one the step
+        // bodies use to send a layer to gdn_layer() or conv_layer() instead of the attention path.
+        const bool gdn_l = lin_kd_ > 0 && l < sem_.n_layer_types && sem_.layer_types[l] == Q4NX_LAYER_LINEAR;
+        if (q4nx_qk_gain_missing(sem_.qk_norm, !is_conv_layer(l) && !gdn_l, !absent(&mw_->layers[l].q_norm_weight))) {
+            err_ = "config.json says q and k are normalised per head (" +
+                   std::string(q4nx_semantics_field(Q4NX_SEM_QK_NORM)) + ") and layer " + std::to_string(l) +
+                   " has no self_attn.q_norm.weight: normalising with an absent gain zeroes q, so this container "
+                   "would answer wrong text (engine#1889); re-import the pack with a build that carries the gains";
+            return false;
+        }
         if (!read_bf16(&mw_->layers[l].q_norm_weight, q_norm_[l].data(), hd_l)) return false;
         // Qwen2.5-style attention biases (q/k/v projection biases); absent on the
         // bias-free families, so a miss is not an error.  Loaded BEFORE the k_norm
@@ -1729,9 +2156,10 @@ bool Q4nxNpuForward::load_norms() {
             auto rd = [&](const char* fmt, float* dst, int n) -> bool {
                 snprintf(nm, sizeof(nm), fmt, l);
                 TensorDesc* td = model_tensor_by_name(mw_, nm);
-                if (!td || n < 0) return false;
+                // named, not silent: init_host used to fail here with an empty error (Gemma4-12B-IT, engine#1786)
+                if (!td || n < 0) { err_ = std::string("model.q4nx has no ") + nm; return false; }
                 const uint16_t* p = bf16_data(mw_, td, (size_t)n);
-                if (!p) return false;
+                if (!p) { err_ = std::string(nm) + " is not bf16 of " + std::to_string(n) + " values"; return false; }
                 for (int i = 0; i < n; i++) dst[i] = bf16_to_f32(p[i]);
                 return true;
             };
@@ -1757,8 +2185,15 @@ bool Q4nxNpuForward::load_norms() {
                         pre_ff_norm_[l].data(), H)) return false;
                 if (!rd("model.layers.%d.post_feedforward_layernorm.weight",
                         post_ff_norm_[l].data(), H)) return false;
-                if (!rd("model.layers.%d.post_layernorm.weight", post_ln_[l].data(), H)) return false;
-                if (!rd("model.layers.%d.layer_output_scale.weight", &layer_scale_[l], 1)) return false;
+                // Gemma3 (extra_layer_norms 2) has the two feedforward norms only: no post-PLE norm and no
+                // layer scalar, so post_ln_ stays unused (ple_dim_ is 0) and layer_scale_ stays 1.
+                if (sem_.extra_layer_norms == 1) {
+                    // post_layernorm is the per-layer-embedding block's norm (post_ln_ is read only there): a dense
+                    // Gemma4 (Gemma4-12B-IT, hidden_size_per_layer_input 0) has no PLE and no such tensor.
+                    if (ple_dim_ > 0 &&
+                        !rd("model.layers.%d.post_layernorm.weight", post_ln_[l].data(), H)) return false;
+                    if (!rd("model.layers.%d.layer_output_scale.weight", &layer_scale_[l], 1)) return false;
+                }
             }
             if (ple_dim_ > 0) {
                 inp_gate_[l].assign((size_t)ple_dim_ * (size_t)H, 0.0f);
@@ -1771,6 +2206,175 @@ bool Q4nxNpuForward::load_norms() {
         }
     }
     return true;
+}
+
+bool Q4nxNpuForward::load_gptoss() {
+    const int NL = c_.NL, H = c_.H, NH = c_.NH, IM = c_.IM;
+    gpt_ne_ = q4nx_config_int(cfg_path_.c_str(), "num_local_experts", 0);
+    gpt_topk_ = q4nx_config_int(cfg_path_.c_str(), "num_experts_per_tok", 0);
+    if (gpt_ne_ <= 0 || gpt_topk_ <= 0 || gpt_topk_ > gpt_ne_) {
+        err_ = "gpt_oss: config.json needs num_local_experts and num_experts_per_tok (top-k <= experts)";
+        return false;
+    }
+    const int E = gpt_ne_;
+    for (auto* v : {&gpt_sinks_, &gpt_obias_, &gpt_router_, &gpt_router_b_, &gpt_gb_, &gpt_ub_, &gpt_db_})
+        v->assign((size_t)NL, std::vector<float>());
+    gpt_exps_.assign((size_t)NL, nullptr);
+    // a bf16 tensor's first `cols` of each of `rows` rows (the router is stored K-padded: [E][2944] for H 2880)
+    auto rd = [&](int l, const char* suffix, std::vector<float>& dst, int rows, int cols) -> bool {
+        char nm[160];
+        snprintf(nm, sizeof nm, "model.layers.%d.%s", l, suffix);
+        TensorDesc* td = model_tensor_by_name(mw_, nm);
+        if (!td || strcmp(td->dtype, "BF16")) { err_ = std::string("gpt_oss: model.q4nx has no bf16 ") + nm; return false; }
+        const int64_t stride = td->ndim >= 2 ? td->shape[td->ndim - 1] : td->shape[0];
+        if (stride < cols || (size_t)td->data_size < (size_t)rows * (size_t)stride * 2) {
+            err_ = std::string("gpt_oss: ") + nm + " is smaller than [" + std::to_string(rows) + "][" +
+                   std::to_string(cols) + "]";
+            return false;
+        }
+        const uint16_t* p = bf16_data(mw_, td, (size_t)rows * (size_t)stride);
+        if (!p) { err_ = std::string("gpt_oss: cannot read ") + nm; return false; }
+        dst.resize((size_t)rows * cols);
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++) dst[(size_t)r * cols + c] = bf16_to_f32(p[(size_t)r * stride + c]);
+        return true;
+    };
+    for (int l = 0; l < NL; l++) {
+        if (!rd(l, "self_attn.sinks.weight", gpt_sinks_[l], 1, NH)) return false;
+        if (!rd(l, "self_attn.o_proj.bias", gpt_obias_[l], 1, H)) return false;
+        if (!rd(l, "mlp.router.weight_prefill", gpt_router_[l], E, H)) return false;
+        if (!rd(l, "mlp.router.bias", gpt_router_b_[l], 1, E)) return false;
+        if (!rd(l, "mlp.experts.gate_proj_bias", gpt_gb_[l], E, IM)) return false;
+        if (!rd(l, "mlp.experts.up_proj_bias", gpt_ub_[l], E, IM)) return false;
+        if (!rd(l, "mlp.experts.down_proj_bias", gpt_db_[l], E, H)) return false;
+        char nm[160];
+        snprintf(nm, sizeof nm, "model.layers.%d.ffn_gate_up_down_exps.weight", l);
+        const TensorDesc* td = model_tensor_by_name(mw_, nm);
+        // [E, 3 * RB, CB, S, 2560]: per expert RB gate and RB up row-blocks alternating, then RB down row-blocks.
+        // TensorDesc keeps four dimensions, so the 2560 is checked through the byte count.
+        if (!td || td->ndim < 4 || td->shape[0] != E || td->shape[1] % 3 ||
+            (int64_t)(td->shape[1] / 3) * td->shape[3] * Q4NX_D2560_ROWS < std::max(IM, H) ||
+            td->shape[2] * Q4NX_D2560_COLS < std::max(IM, H) ||
+            (size_t)td->data_size != (size_t)E * td->shape[1] * td->shape[2] * td->shape[3] * Q4NX_CHUNK_D2560) {
+            err_ = std::string("gpt_oss: ") + nm + " is not an [experts, 3 x row-blocks, col-blocks, 4, 2560] MXFP4 tensor";
+            return false;
+        }
+        gpt_exps_[l] = td;
+    }
+    fprintf(stderr, "  [forward] gpt_oss: %d experts, top %d, MXFP4 experts read in place; sinks, o bias\n", E, gpt_topk_);
+    return true;
+}
+
+bool Q4nxNpuForward::gptoss_moe(int l, const std::vector<float>& xn, std::vector<float>& d) {
+    LhScope _tlh(LH_MLP);
+    const int H = c_.H, IM = c_.IM, E = gpt_ne_, K = gpt_topk_;
+    const TensorDesc* td = gpt_exps_[(size_t)l];
+    const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, const_cast<TensorDesc*>(td));
+    if (!raw) { err_ = "gpt_oss: expert tensor has no data"; return false; }
+    const int RB = (int)(td->shape[1] / 3), CB = (int)td->shape[2], S = (int)td->shape[3];
+    const size_t per_expert = (size_t)td->shape[1] * CB * S * Q4NX_CHUNK_D2560;
+    // router: top-k of the biased logits, then a softmax over those k (llama.cpp's SOFTMAX_WEIGHT)
+    std::vector<float> logit((size_t)E);
+    for (int e = 0; e < E; e++) {
+        double z = gpt_router_b_[(size_t)l][(size_t)e];
+        const float* w = &gpt_router_[(size_t)l][(size_t)e * H];
+        for (int k = 0; k < H; k++) z += (double)w[k] * xn[(size_t)k];
+        logit[(size_t)e] = (float)z;
+    }
+    std::vector<int> idx((size_t)E);
+    for (int e = 0; e < E; e++) idx[(size_t)e] = e;
+    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
+                      [&](int a, int b) { return logit[(size_t)a] > logit[(size_t)b] || (logit[(size_t)a] == logit[(size_t)b] && a < b); });
+    std::vector<float> wsel((size_t)K);
+    float mx = logit[(size_t)idx[0]], sum = 0.0f;
+    for (int j = 0; j < K; j++) { wsel[(size_t)j] = std::exp(logit[(size_t)idx[(size_t)j]] - mx); sum += wsel[(size_t)j]; }
+    for (int j = 0; j < K; j++) wsel[(size_t)j] /= sum;
+
+    d.assign((size_t)H, 0.0f);
+    std::vector<float> g((size_t)IM), u((size_t)IM), act((size_t)IM), dn((size_t)H);
+    // y[row] = sum over the row's 128-column chunks of chunk . x; rows of block `bi` are bi*128 + s*32 + r
+    auto matvec = [&](const uint8_t* ex, int b0, int nrows, const float* x, int xlen, float* y) {
+#pragma omp parallel num_threads(omp_heads_threads())
+        {
+            float tmp[Q4NX_D2560_ROWS * Q4NX_D2560_COLS];
+#pragma omp for schedule(static)
+            for (int rbs = 0; rbs < RB * S; rbs++) {
+                const int bi = rbs / S, s = rbs % S;
+                const int r0 = bi * 128 + s * Q4NX_D2560_ROWS;
+                if (r0 >= nrows) continue;
+                double acc[Q4NX_D2560_ROWS] = {0};
+                for (int cb = 0; cb < CB; cb++) {
+                    const int c0 = cb * Q4NX_D2560_COLS;
+                    if (c0 >= xlen) break;
+                    q4nx_dequant_chunk_mx2560(ex + (((size_t)(b0 + bi) * CB + cb) * S + s) * Q4NX_CHUNK_D2560, tmp,
+                                              Q4NX_D2560_COLS);
+                    const int cn = std::min(Q4NX_D2560_COLS, xlen - c0);
+                    for (int r = 0; r < Q4NX_D2560_ROWS; r++) {
+                        double z = 0.0;
+                        for (int c = 0; c < cn; c++) z += (double)tmp[r * Q4NX_D2560_COLS + c] * x[c0 + c];
+                        acc[r] += z;
+                    }
+                }
+                for (int r = 0; r < Q4NX_D2560_ROWS && r0 + r < nrows; r++) y[r0 + r] = (float)acc[r];
+            }
+        }
+    };
+    for (int j = 0; j < K; j++) {
+        const int e = idx[(size_t)j];
+        const uint8_t* ex = raw + (size_t)e * per_expert;
+        // gate and up alternate by 128-row block (gate 2i, up 2i+1): all 2*RB blocks in one pass, then split
+        {
+            std::vector<float> y((size_t)2 * RB * 128, 0.0f);
+            const int RB2 = 2 * RB;
+#pragma omp parallel num_threads(omp_heads_threads())
+            {
+                float tmp[Q4NX_D2560_ROWS * Q4NX_D2560_COLS];
+#pragma omp for schedule(static)
+                for (int rbs = 0; rbs < RB2 * S; rbs++) {
+                    const int bi = rbs / S, s = rbs % S;
+                    double acc[Q4NX_D2560_ROWS] = {0};
+                    for (int cb = 0; cb < CB; cb++) {
+                        const int c0 = cb * Q4NX_D2560_COLS;
+                        if (c0 >= H) break;
+                        q4nx_dequant_chunk_mx2560(ex + (((size_t)bi * CB + cb) * S + s) * Q4NX_CHUNK_D2560, tmp,
+                                                  Q4NX_D2560_COLS);
+                        const int cn = std::min(Q4NX_D2560_COLS, H - c0);
+                        for (int r = 0; r < Q4NX_D2560_ROWS; r++) {
+                            double z = 0.0;
+                            for (int c = 0; c < cn; c++) z += (double)tmp[r * Q4NX_D2560_COLS + c] * xn[(size_t)(c0 + c)];
+                            acc[r] += z;
+                        }
+                    }
+                    for (int r = 0; r < Q4NX_D2560_ROWS; r++) y[(size_t)bi * 128 + s * Q4NX_D2560_ROWS + r] = (float)acc[r];
+                }
+            }
+            for (int i = 0; i < IM; i++) {
+                const int blk = i / 128, off = i % 128;
+                g[(size_t)i] = y[(size_t)(2 * blk) * 128 + off] + gpt_gb_[(size_t)l][(size_t)e * IM + i];
+                u[(size_t)i] = y[(size_t)(2 * blk + 1) * 128 + off] + gpt_ub_[(size_t)l][(size_t)e * IM + i];
+            }
+        }
+        // ggml swiglu_oai: x = min(gate, 7), y = clamp(up, -7, 7), x * sigmoid(1.702 x) * (y + 1)
+        for (int i = 0; i < IM; i++) {
+            const float xg = std::min(g[(size_t)i], 7.0f), yu = std::max(-7.0f, std::min(u[(size_t)i], 7.0f));
+            act[(size_t)i] = xg / (1.0f + std::exp(-1.702f * xg)) * (yu + 1.0f);
+        }
+        matvec(ex, 2 * RB, H, act.data(), IM, dn.data());
+        for (int o = 0; o < H; o++) d[(size_t)o] += wsel[(size_t)j] * (dn[(size_t)o] + gpt_db_[(size_t)l][(size_t)e * H + o]);
+    }
+    return true;
+}
+
+void Q4nxNpuForward::apply_head_gate(int l, const float* xn, float* ctx, int hd) const {
+    if (l < 0 || (size_t)l >= head_gate_.size() || head_gate_[(size_t)l].empty()) return;
+    const int H = c_.H;
+    const float* w = head_gate_[(size_t)l].data();
+    for (int h = 0; h < c_.NH; h++) {
+        double z = 0.0;
+        for (int k = 0; k < H; k++) z += (double)w[(size_t)h * H + k] * (double)xn[k];
+        const float g = 1.0f / (1.0f + std::exp(-(float)z));
+        for (int i = 0; i < hd; i++) ctx[(size_t)h * hd + i] *= g;
+    }
 }
 
 void Q4nxNpuForward::layer_attn_dims(int l, int& hd, int& nkv) const {
@@ -1788,15 +2392,11 @@ void Q4nxNpuForward::layer_attn_dims(int l, int& hd, int& nkv) const {
 // it -- a GDN model (lin_kd_ > 0, the one case step()'s `dense_weights_cached`
 // can never cover, since that guard stops at lin_kd_ == 0), packed weights
 // actually being cached, and a dense tail big enough for the per-token reload to
-// be material.  Qwen3.8-27B-NPU2 (IM 17408 x H 5120) clears it with 1.07 GB per
-// layer, and measured 117.4 -> 104.5 s wall and 63.3 -> 22.9 s CPU per token on
-// an 8-token request with identical text (~/lb/587-cache-20261030).
-// The floor is a size guard, not a second measurement: below it the reload is
-// small enough that the behaviour change is not worth taking unasked.
+// be material.  The size rule and the two measurements it rests on (Qwen3.8-27B
+// and, since engine#1785, Qwen3.5-2B) are in ffn_cache_policy.h.
 bool Q4nxNpuForward::ffn_cache_default() const {
     if (host_gemm_ || !xd_->weight_cache_on() || lin_kd_ <= 0) return false;
-    const double tail_bytes = 3.0 * (double)c_.IM * (double)c_.H * 4.0;   // wg_+wu_+wd_
-    return tail_bytes >= 256.0 * 1024.0 * 1024.0;
+    return onebit::npu::ffn_cache_worth_it(c_.IM, c_.H);
 }
 // ---- layer-loop host attribution ------------------------------------------
 // The `host=` residual of the [ph] line is layer time that is NOT any of the
@@ -1845,7 +2445,7 @@ bool Q4nxNpuForward::load_layer(int l) {
             if (!d) { fprintf(stderr, "  [mla] missing " ); snprintf(nm,sizeof(nm),fmt,l); fprintf(stderr,"%s\n", nm); return false; }
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) == 0;
         };
         // A bf16 tensor (norms, router) is stored raw, not in 5120-byte tiles, so
         // it bypasses dequant_any.
@@ -1927,7 +2527,7 @@ bool Q4nxNpuForward::load_layer(int l) {
     auto deq = [&](TensorDesc* d, float* out, int rows, int cols) -> bool {
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw) { err_ = std::string("MLP tensor ") + d->name + " has no data"; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, d) != 0) {
             // Name it: the bare "dequant failed" this used to leave cost an afternoon on engine#1097.
             const size_t tiles = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
             char why[256];
@@ -1961,16 +2561,60 @@ bool Q4nxNpuForward::load_layer(int l) {
     // copies of the big projections are never needed: skipping them here is the
     // difference between a first token that dequantises the whole 17.9 GB model and
     // one that opens 13.4 GB of images.  The norms and every small member still load.
-    if (!xd_->pb16i()) {
+    // The four attention f32 buffers (wq_/wk_/wv_/wo_) are read only by q4nx_assemble_B(), which step() and
+    // step_batch() skip once this layer's packed QKV (key 0) and O (key 1) images are on the device -- the
+    // same argument as ffn_tail_cached() for the MLP and proj_cached for a GDN layer. A dense model never
+    // gets here on a cached layer (step()'s `dense_weights_cached`), but a hybrid one does on every token:
+    // its full-attention layers re-dequantised q, k, v and o each decode step, 17.5 ms of a 285 ms token on
+    // Qwen3.5-2B (6 of 24 layers), for buffers nothing read (engine#1785). BOTH keys must be cached:
+    // step_batch() guards its O assemble with the QKV key, so a half-cached layer still loads everything.
+    // NPU_ATTN_RELOAD=1 keeps the old per-token reload, for the A/B.
+    static const bool attn_reload = getenv("NPU_ATTN_RELOAD") != nullptr;
+    const bool attn_cached = !attn_reload && !host_gemm_ && xd_ && xd_->weight_cached(l, 0) && xd_->weight_cached(l, 1);
+    if (is_conv_layer(l)) {
+        // LFM2 conv layer: two projections where an attention layer has four. Same f32-until-packed rule.
+        LhScope _t_p(LH_LOAD_PROJ);
+        if (!deq(&lw->shortconv_in_proj_weight, wqkvlin_.data(), 3 * H, H)) return false;
+        if (!deq(&lw->shortconv_out_proj_weight, woutlin_.data(), H, q4nx_pad_k(H))) return false;
+    } else if (!xd_->pb16i() && !attn_cached) {
         if (!deq(&lw->q_proj_weight, wq_.data(),
                  NH * hd * (attn_gate_ ? 2 : 1), kpad_)) return false;   // q|gate rows
         if (!kv_shared) {
             if (!deq(&lw->k_proj_weight, wk_.data(), nkv * hd, kpad_)) return false;
-            if (!deq(&lw->v_proj_weight, wv_.data(), nkv * hd, kpad_)) return false;
+            const bool v_absent = lw->v_proj_weight.name[0] == '\0' || lw->v_proj_weight.data_size == 0;
+            if (v_absent && sem_.attention_k_eq_v) {
+                // attention_k_eq_v: v is the k projection (normalised scale-free in attention(), as Gemma4's v is)
+                std::copy(wk_.begin(), wk_.begin() + (ptrdiff_t)((size_t)nkv * hd * kpad_), wv_.begin());
+            } else if (v_absent) {
+                err_ = "model.layers." + std::to_string(l) + " has no self_attn.v_proj.weight and config.json does not "
+                       "declare attention_k_eq_v";
+                return false;
+            } else if (!deq(&lw->v_proj_weight, wv_.data(), nkv * hd, kpad_)) {
+                return false;
+            }
         }
         if (!deq(&lw->o_proj_weight, wo_.data(), H, q4nx_pad_k(NH * hd))) return false;
     }
-    if (n_expert_ > 0) {
+    if (n_expert_ > 0 && !mla_ && l < leading_dense_) {
+        // the leading dense layer of a non-MLA MoE (hy_v3): dense_mlp's DG/DU/DD weights
+        char dn[160];
+        auto load_dense = [&](const char* fmt, std::vector<float>& v, int rows, int cols) -> bool {
+            snprintf(dn, sizeof dn, fmt, l);
+            TensorDesc* d = model_tensor_by_name(mw_, dn);
+            if (!d) { err_ = std::string("leading dense layer: model.q4nx has no ") + dn; return false; }
+            v.resize((size_t)rows * (size_t)cols);
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            if (!raw || dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) != 0) {
+                err_ = std::string("leading dense layer: cannot read ") + dn;
+                return false;
+            }
+            return true;
+        };
+        return load_dense("model.layers.%d.mlp.gate_proj.weight", dense_g_, dense_im_, H) &&
+               load_dense("model.layers.%d.mlp.up_proj.weight", dense_u_, dense_im_, H) &&
+               load_dense("model.layers.%d.mlp.down_proj.weight", dense_d_, H, dense_im_);
+    }
+    if (n_expert_ > 0 && l >= leading_dense_) {   // a leading dense layer (hy_v3's first_k_dense_replace) runs the dense FFN
         // Qwen MoE layer (qwen3moe / qwen35moe): a router + top-k routed experts
         // instead of a dense gate/up/down.  The router is bf16; its bias is OPTIONAL
         // (Qwen MoE has none, deepseek2 does).  The experts stay pooled -- one
@@ -1996,7 +2640,31 @@ bool Q4nxNpuForward::load_layer(int l) {
             return true;
         };
         if (!load_bf16_named(mn.router, moe_router_, n_expert_ * H)) { err_ = "moe router"; return false; }
-        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) moe_router_b_.clear();
+        {
+            // A router stored [H][E] (Hy-Memory-30B-A3B's moe_router.weight is upstream's [E][H] transposed,
+            // checked against tencent/Hy-Memory-30B-A3B) is read flat as [E][H] by moe_mlp: transpose it.
+            const TensorDesc* rd = td_named(mn.router);
+            if (rd && rd->ndim == 2 && rd->shape[0] == H && rd->shape[1] == n_expert_ && H != n_expert_) {
+                std::vector<float> t((size_t)n_expert_ * H);
+                for (int k = 0; k < H; k++)
+                    for (int e = 0; e < n_expert_; e++) t[(size_t)e * H + k] = moe_router_[(size_t)k * n_expert_ + e];
+                moe_router_.swap(t);
+            }
+        }
+        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) {
+            moe_router_b_.clear();
+            // hy_v3: the expert-selection bias is `moe_expert_bias`, F32 in FastFlowLM's pack (bf16 from our packer)
+            const TensorDesc* bd = td_named("moe_expert_bias");
+            const void* bp = bd ? model_tensor_data(mw_, const_cast<TensorDesc*>(bd)) : nullptr;
+            if (bp && !strcmp(bd->dtype, "F32") && (size_t)bd->data_size >= sizeof(float) * (size_t)n_expert_) {
+                const float* fp = (const float*)bp;
+                moe_router_b_.assign(fp, fp + n_expert_);
+            } else if (bp && !strcmp(bd->dtype, "BF16") && (size_t)bd->data_size >= 2 * (size_t)n_expert_) {
+                const uint16_t* hp = (const uint16_t*)bp;
+                moe_router_b_.resize((size_t)n_expert_);
+                for (int e = 0; e < n_expert_; e++) moe_router_b_[(size_t)e] = bf16_to_f32(hp[e]);
+            }
+        }
         auto pool = [&](const char* suffix, const uint8_t** p, size_t* bytes) -> bool {
             TensorDesc* d = td_named(suffix);
             if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
@@ -2015,14 +2683,20 @@ bool Q4nxNpuForward::load_layer(int l) {
             if (!d) return false;
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) == 0;
         };
         if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
         if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
         if (!load_share(mn.share_down, share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
-        if (!load_bf16_named(mn.share_router, share_router_, H)) share_router_.clear();
+        // The shared expert's sigmoid gate: `mlp.share_router.weight` in the FLM table, `shared_expert_gate.weight`
+        // (at the layer, beside the router) in FastFlowLM's Qwen3.6-35B-A3B-NPU2 -- missed, the shared expert was added
+        // ungated in every layer and the reply was noise (engine#1786).
+        if (!load_bf16_named(mn.share_router, share_router_, H) &&
+            !load_bf16_named("shared_expert_gate.weight", share_router_, H))
+            share_router_.clear();
         return true;
     }
+    if (sem_.gpt_oss) return true;   // gpt_oss: the MoE reads its MXFP4 experts in place (gptoss_moe)
     if (!xd_->pb16i() && !ffn_tail_cached()) {
         LhScope _t_f(LH_LOAD_FFN);
         if (!deq(&lw->gate_proj_weight, wg_.data(), im, kpad_)) return false;
@@ -2048,7 +2722,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         if (!d) { err_ = std::string("GDN: no tensor ") + nm; return false; }
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw) { err_ = std::string("GDN: no data ") + nm; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, d) != 0) {
             char m[64];
             snprintf(m, sizeof(m), " (rows=%d cols=%d bytes=%llu)", rows, cols,
                      (unsigned long long)d->data_size);
@@ -2125,7 +2799,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
     auto deqT = [&](TensorDesc* d, float* out, int rows, int cols) -> bool {
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         if (!raw || d->data_size == 0) { err_ = std::string("GDN: missing MLP tensor ") + d->name; return false; }
-        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out) != 0) {
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out, d) != 0) {
             err_ = std::string("GDN: MLP dequant ") + d->name;
             return false;
         }
@@ -2152,7 +2826,31 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
             return true;
         };
         if (!load_bf16_named(mn.router, moe_router_, n_expert_ * H)) { err_ = "moe router"; return false; }
-        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) moe_router_b_.clear();
+        {
+            // A router stored [H][E] (Hy-Memory-30B-A3B's moe_router.weight is upstream's [E][H] transposed,
+            // checked against tencent/Hy-Memory-30B-A3B) is read flat as [E][H] by moe_mlp: transpose it.
+            const TensorDesc* rd = td_named(mn.router);
+            if (rd && rd->ndim == 2 && rd->shape[0] == H && rd->shape[1] == n_expert_ && H != n_expert_) {
+                std::vector<float> t((size_t)n_expert_ * H);
+                for (int k = 0; k < H; k++)
+                    for (int e = 0; e < n_expert_; e++) t[(size_t)e * H + k] = moe_router_[(size_t)k * n_expert_ + e];
+                moe_router_.swap(t);
+            }
+        }
+        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) {
+            moe_router_b_.clear();
+            // hy_v3: the expert-selection bias is `moe_expert_bias`, F32 in FastFlowLM's pack (bf16 from our packer)
+            const TensorDesc* bd = td_named("moe_expert_bias");
+            const void* bp = bd ? model_tensor_data(mw_, const_cast<TensorDesc*>(bd)) : nullptr;
+            if (bp && !strcmp(bd->dtype, "F32") && (size_t)bd->data_size >= sizeof(float) * (size_t)n_expert_) {
+                const float* fp = (const float*)bp;
+                moe_router_b_.assign(fp, fp + n_expert_);
+            } else if (bp && !strcmp(bd->dtype, "BF16") && (size_t)bd->data_size >= 2 * (size_t)n_expert_) {
+                const uint16_t* hp = (const uint16_t*)bp;
+                moe_router_b_.resize((size_t)n_expert_);
+                for (int e = 0; e < n_expert_; e++) moe_router_b_[(size_t)e] = bf16_to_f32(hp[e]);
+            }
+        }
         auto pool = [&](const char* suffix, const uint8_t** p, size_t* bytes) -> bool {
             TensorDesc* d = td_named(suffix);
             if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
@@ -2171,12 +2869,17 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
             if (!d) return false;
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data(), d) == 0;
         };
         if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
         if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
         if (!load_share(mn.share_down, share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
-        if (!load_bf16_named(mn.share_router, share_router_, H)) share_router_.clear();
+        // The shared expert's sigmoid gate: `mlp.share_router.weight` in the FLM table, `shared_expert_gate.weight`
+        // (at the layer, beside the router) in FastFlowLM's Qwen3.6-35B-A3B-NPU2 -- missed, the shared expert was added
+        // ungated in every layer and the reply was noise (engine#1786).
+        if (!load_bf16_named(mn.share_router, share_router_, H) &&
+            !load_bf16_named("shared_expert_gate.weight", share_router_, H))
+            share_router_.clear();
         return true;
     }
     if (!ffn_tail_cached()) {
@@ -2357,6 +3060,7 @@ void Q4nxNpuForward::begin_verify(int rows, int start_pos) {
         for (size_t l = 0; l < rec_state_.size(); l++) snap_rec_[l] = rec_state_[l];
     row_in_.resize(rec_state_.size());
     for (auto& v : row_in_) v.assign((size_t)rows, GdnRowIn{});
+    for (auto& v : sc_rows_) v.clear();   // conv layers record their rows' B*X as the batch runs
 }
 
 // Keep the first `accepted` rows of the verify batch and drop the rest: restore the snapshot, then re-apply the
@@ -2378,14 +3082,20 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
         expect_rec = rec_state_;
         expect_conv = conv_state_;
     }
-    const size_t per = (size_t)c_.NKV * (size_t)c_.HD;
-    const size_t keep = (size_t)(verify_pos_ + accepted) * per;
-    for (size_t l = 0; l < kcache_.size(); l++) {
-        if (!kcache_[l].empty() && kcache_[l].size() > keep) kcache_[l].resize(keep);
-        if (!vcache_[l].empty() && vcache_[l].size() > keep) vcache_[l].resize(keep);
+    // Each plane in its own row width (engine#1780): one width cut a two-geometry model's wide planes at half.
+    const std::vector<size_t> widths = kv_widths();
+    q4nx_state::keep_positions(kcache_, widths, (size_t)(verify_pos_ + accepted));
+    q4nx_state::keep_positions(vcache_, widths, (size_t)(verify_pos_ + accepted));
+    // A full accept keeps the state the batch's own recurrence left: that is the state the restore + replay would
+    // rebuild (NPU_REPLAY_CHECK holds the two equal), so the restore and the replay are skipped. On the served 27B
+    // they are 11 ms + 7 ms per row, 67 ms of an 8-row round. NPU_COMMIT_FULL_REPLAY=1 keeps them, for an A/B.
+    static const bool always_replay = std::getenv("NPU_COMMIT_FULL_REPLAY") != nullptr;
+    const bool keep_batch_state = accepted == verify_rows_ && accepted > 0 && !always_replay && !replay_check;
+    if (keep_batch_state) full_accepts_kept_++;
+    if (!keep_batch_state) {
+        for (size_t l = 0; l < conv_state_.size(); l++) conv_state_[l] = snap_conv_[l];
+        for (size_t l = 0; l < rec_state_.size(); l++) rec_state_[l] = snap_rec_[l];
     }
-    for (size_t l = 0; l < conv_state_.size(); l++) conv_state_[l] = snap_conv_[l];
-    for (size_t l = 0; l < rec_state_.size(); l++) rec_state_[l] = snap_rec_[l];
     // The accepted prefix is the only thing a drafter may advance over: drop the rejected rows' hidden here, so
     // that last_hidden_rows() is exactly `accepted` rows starting at verify_pos_.  Leaving all verify_rows_ made
     // the draft loop's own size check fail, and it skipped the drafter advance without a word.
@@ -2395,7 +3105,8 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
     }
     const auto cv_t1 = std::chrono::steady_clock::now();
     verify_open_ = false;                        // the replay below must not re-record
-    if (accepted > 0 && !gdn_apply_rows(0, accepted)) return false;
+    if (!keep_batch_state && accepted > 0 && shortconv_) conv_apply_rows(accepted);
+    if (!keep_batch_state && accepted > 0 && !gdn_apply_rows(0, accepted)) return false;
     if (cv_prof) {
         const auto cv_t2 = std::chrono::steady_clock::now();
         const double restore = std::chrono::duration<double, std::milli>(cv_t1 - cv_t0).count();
@@ -2426,6 +3137,7 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
                      accepted, maxd, scale, ok_state ? "OK" : "MISMATCH");
     }
     for (auto& v : row_in_) v.clear();
+    for (auto& v : sc_rows_) v.clear();
     return true;
 }
 
@@ -2538,6 +3250,7 @@ bool Q4nxNpuForward::gdn_apply_rows(int from, int to) {
 // its array launches are M-independent (a pb16i ELF runs its 16 rows whatever M is), so the marginal cost of
 // a row is host-side and has to be named, not inferred.  Snapshots the same slots step() fills, prints the
 // delta of one step_batch() call when NPU_PHASE_PROF is set.  Measurement only: nothing here is read back.
+
 namespace {
 struct BatchPhases {
     const bool on = lh_on();
@@ -2598,6 +3311,17 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         }
         npu_gemm_rows(i_z, xn.data(), M, g->K, g->N, B_.data(), Z, 1, "attn_gate", g->real_k);
     }
+    // A projection's M rows come back at the DESIGN's N, which is the model's width rounded up to the kernel's N grid
+    // (512). Every qwen3_5 pack so far has 2*KD + VD and VD on that grid, so reading row m at m * CD and m * VD
+    // happened to be right; on a geometry that is off it (CD 768 pads to 1024), every row after the first was read
+    // from the wrong place, and a batched prefill of two or more tokens left other logits and another state than
+    // the token-by-token path (rel-L1 0.6 on a fabricated two-layer model; a one-row batch was exact).
+    const size_t qkv_stride = (size_t)designs_[i_qkv].N, z_stride = (size_t)designs_[i_z].N;
+    if (qkv_stride < (size_t)CD || z_stride < (size_t)VD || QKV.size() < (size_t)M * qkv_stride ||
+        Z.size() < (size_t)M * z_stride) {
+        err_ = "gdn batch: a projection returned fewer values than rows * its design's N";
+        return false;
+    }
 
     // NPU_QKV_DUMP=<layer>: a GDN layer's projections as the engine sees them (q, k, v and the
     // attn_gate/Z), rows 0 and 3, on both paths.  Layer 0 is the first divergent layer and its
@@ -2606,8 +3330,8 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     if (const char* dl = getenv("NPU_QKV_DUMP")) {
         if (l == atoi(dl)) {
             for (int m = 0; m < M; m += (m == 0 ? 3 : 1)) {
-                const float* r = QKV.data() + (size_t)m * CD;
-                const float* zr = Z.data() + (size_t)m * VD;
+                const float* r = QKV.data() + (size_t)m * qkv_stride;
+                const float* zr = Z.data() + (size_t)m * z_stride;
                 fprintf(stderr, "[qkv-dump] l=%d m=%d", l, m);
                 for (int i = 0; i < 8; i++) fprintf(stderr, " q%d=%.6g", i, (double)r[KD + i]);
                 for (int i = 0; i < 8; i++) fprintf(stderr, " k%d=%.6g", i, (double)r[2 * KD + i]);
@@ -2637,7 +3361,7 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     std::vector<float> co_dump;   // NPU_INFER_DUMP_LAYERS only: keeps `co` per row for the [GB] line
     if (dump_gb) co_dump.assign((size_t)M * CD, 0.0f);
     for (int m = 0; m < M; m++) {
-        const float* qkv = QKV.data() + (size_t)m * CD;
+        const float* qkv = QKV.data() + (size_t)m * qkv_stride;
         // depthwise causal conv1d (CK) + SiLU, state carried across positions
         float* st = conv_state_[l].data();
         for (int ch = 0; ch < CD; ch++) {
@@ -2692,7 +3416,7 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         const float* kh = &KLS[((size_t)m * NVH + hh) * KHD];
         const float* qh = &QLS[((size_t)m * NVH + hh) * KHD];
         const float* vh = &VVS[((size_t)m * NVH + hh) * VHD];
-        const float* zv = Z.data() + (size_t)m * VD + (size_t)hh * VHD;
+        const float* zv = Z.data() + (size_t)m * z_stride + (size_t)hh * VHD;
 #pragma omp simd
         for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
         // Loops EXCHANGED (kd outer, vd inner) so the inner loop walks sh and vh contiguously instead of
@@ -2854,9 +3578,9 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                 for (int i = 0; i < n; i++) { float a = fabsf(v[i]); sm += a; if (a > mx) mx = a; }
                 fprintf(stderr, "  [GB] m=%d %-5s %.6f %.4f\n", m, nm, sm / n, mx);
             };
-            d2("qkv", QKV.data() + (size_t)m * CD, CD);
+            d2("qkv", QKV.data() + (size_t)m * qkv_stride, CD);
             d2("co", co_dump.data() + (size_t)m * CD, CD);
-            d2("z", Z.data() + (size_t)m * VD, VD);
+            d2("z", Z.data() + (size_t)m * z_stride, VD);
             d2("a", AHS.data() + (size_t)m * NVH, NVH);
             d2("b", BHS.data() + (size_t)m * NVH, NVH);
             d2("core", CORE.data() + (size_t)m * VD, VD);
@@ -2873,6 +3597,107 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         npu_gemm_rows(i_o, CORE.data(), M, g->K, g->N, B_.data(), out, 6, "ssm_out", g->real_k);
     }
     return true;
+}
+
+// --------------------------------------------------------------------------
+// LFM2 gated short-convolution layers
+// --------------------------------------------------------------------------
+// One token: in_proj on the device, the gate + depthwise causal conv on the host (lfm2_shortconv.h, the one
+// definition decode, prefill and the tests share), out_proj on the device. The state is borrowed from
+// conv_state_[l] for the call and handed back, so there is one copy of it.
+bool Q4nxNpuForward::conv_layer(int l, const std::vector<float>& xn, std::vector<float>& out) {
+    const int H = c_.H;
+    const int i_in = idx_of(Q4NX_DESIGN_QKVLIN);
+    const int i_o = idx_of(Q4NX_DESIGN_O);
+    if (i_in < 0 || i_o < 0) { err_ = "short-convolution designs missing (QKV 3H / O)"; return false; }
+    std::vector<float> bcx;
+    {
+        const Q4nxDesignGeom* g = &designs_[i_in];
+        Q4nxProjections p{};
+        p.ple = wqkvlin_.data();
+        if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble conv in_proj"; return false; }
+        npu_gemm(i_in, xn.data(), g->K, g->N, B_.data(), bcx, 0, "conv_in", g->real_k);
+    }
+    if (bcx.size() < (size_t)3 * (size_t)H) { err_ = "conv in_proj returned fewer than 3*hidden values"; return false; }
+    const Q4nxDesignGeom* go = &designs_[i_o];
+    std::vector<float> y((size_t)std::max(H, go->K), 0.0f);
+    onebit::npu::ShortConvState st;
+    st.hidden = H; st.taps = sc_taps_;
+    st.history.swap(conv_state_[(size_t)l]);
+    const bool ok = onebit::npu::shortconv_step(st, bcx.data(), sc_w_[(size_t)l].data(), y.data());
+    st.history.swap(conv_state_[(size_t)l]);
+    if (!ok) { err_ = "short-convolution state of layer " + std::to_string(l) + " is not sized"; return false; }
+    if (onebit::npu::ops_dump_enabled()) onebit::npu::ops_dump("conv_core", l, 1, y.data(), H);
+    {
+        Q4nxProjections p{};
+        p.o = woutlin_.data();
+        if (!weight_cached(1) && q4nx_assemble_B(go, &p, B_.data()) != 0) { err_ = "assemble conv out_proj"; return false; }
+        npu_gemm(i_o, y.data(), go->K, go->N, B_.data(), out, 1, "conv_out", go->real_k);
+    }
+    return true;
+}
+
+// M tokens: each projection is one M-row launch, and between them the rows go through shortconv_step() in position
+// order -- the same calls conv_layer() makes -- so a batched prefill leaves exactly the state token-by-token decode
+// would. A verify batch also keeps each row's B*X, the only thing needed to re-apply an accepted prefix.
+bool Q4nxNpuForward::conv_layer_batch(int l, const std::vector<float>& xn, int M, std::vector<float>& out) {
+    const int H = c_.H;
+    const int i_in = idx_of(Q4NX_DESIGN_QKVLIN);
+    const int i_o = idx_of(Q4NX_DESIGN_O);
+    if (i_in < 0 || i_o < 0) { err_ = "short-convolution designs missing (QKV 3H / O)"; return false; }
+    std::vector<float> BCX;
+    const Q4nxDesignGeom* g = &designs_[i_in];
+    {
+        Q4nxProjections p{};
+        p.ple = wqkvlin_.data();
+        if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble conv in_proj"; return false; }
+        npu_gemm_rows(i_in, xn.data(), M, g->K, g->N, B_.data(), BCX, 0, "conv_in", g->real_k);
+    }
+    const size_t stride = (size_t)g->N;
+    if (stride < (size_t)3 * (size_t)H || BCX.size() < (size_t)M * stride) {
+        err_ = "conv in_proj returned fewer than rows * 3*hidden values";
+        return false;
+    }
+    const Q4nxDesignGeom* go = &designs_[i_o];
+    const size_t ystride = (size_t)std::max(H, go->K);
+    std::vector<float> Y((size_t)M * ystride, 0.0f);
+    std::vector<float>* rec = verify_open_ ? &sc_rows_[(size_t)l] : nullptr;
+    if (rec) rec->resize((size_t)M * (size_t)H);
+    onebit::npu::ShortConvState st;
+    st.hidden = H; st.taps = sc_taps_;
+    st.history.swap(conv_state_[(size_t)l]);
+    bool ok = true;
+    for (int m = 0; m < M && ok; m++) {
+        const float* row = BCX.data() + (size_t)m * stride;
+        if (rec) {
+            float* bx = rec->data() + (size_t)m * (size_t)H;
+            for (int h = 0; h < H; h++) bx[h] = row[h] * row[2 * H + h];
+        }
+        ok = onebit::npu::shortconv_step(st, row, sc_w_[(size_t)l].data(), Y.data() + (size_t)m * ystride);
+    }
+    st.history.swap(conv_state_[(size_t)l]);
+    if (!ok) { err_ = "short-convolution state of layer " + std::to_string(l) + " is not sized"; return false; }
+    {
+        Q4nxProjections p{};
+        p.o = woutlin_.data();
+        if (!weight_cached(1) && q4nx_assemble_B(go, &p, B_.data()) != 0) { err_ = "assemble conv out_proj"; return false; }
+        npu_gemm_rows(i_o, Y.data(), M, go->K, go->N, B_.data(), out, 1, "conv_out", go->real_k);
+    }
+    return true;
+}
+
+// After commit_verify_rows() has put the pre-batch state back: advance each conv layer over the accepted rows
+// only. No projection is recomputed; the window is B*X, and the batch kept it.
+void Q4nxNpuForward::conv_apply_rows(int rows) {
+    const int H = c_.H;
+    for (size_t l = 0; l < sc_rows_.size(); l++) {
+        if (!sc_layer_[l] || sc_rows_[l].size() < (size_t)rows * (size_t)H) continue;
+        onebit::npu::ShortConvState st;
+        st.hidden = H; st.taps = sc_taps_;
+        st.history.swap(conv_state_[l]);
+        for (int m = 0; m < rows; m++) onebit::npu::shortconv_push(st, sc_rows_[l].data() + (size_t)m * (size_t)H);
+        st.history.swap(conv_state_[l]);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -3252,7 +4077,7 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         static int n = 0;
         char path[4096];
         std::snprintf(path, sizeof path, "%s/arm_L%d_N%d_K%d_%03d.bin", gdir, cur_layer_, N, K, n++);
-        if (std::FILE* f = std::fopen(path, "wb")) {
+        if (std::FILE* f = onebit_fopen_private_wb(path)) {
             std::fwrite(t.d.data(), sizeof(float), std::min<size_t>((size_t)N, t.d.size()), f);
             std::fclose(f);
         }
@@ -3260,15 +4085,21 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
     std::vector<int8_t> a8((size_t)K);
     for (int m = 0; m < M; m++) {
         const float* a = A + (size_t)m * (size_t)a_k;
+        // engine#845's pad on THIS leg too (kept across the merge: main fixed the IMAGE side of the padded-geometry
+        // problem -- unpadded images, row-major when blocked does not fit -- but the activation read still ran past the
+        // row). A padded design has K > a_k: chatglm3-6b's IM is 13,696 and its D design is K = 13,824, so reading A[k]
+        // for k < K runs 128 floats into the next row, or past the buffer. Measured before this: cos 0.40 -> -0.003
+        // against the device while the f32 arm tracked it at 0.985-0.988; after, max|d| = 0 on all four steps.
+        const auto act = [a, a_k](int k) { return k < a_k ? a[(size_t)k] : 0.0f; };
         float amax = 0.0f;
         for (int k = 0; k < K; k++) {
-            const float v = std::fabs(a[k]);
+            const float v = std::fabs(act(k));
             if (std::isfinite(v) && v > amax) amax = v;
         }
         const float ascale = (amax >= 1e-12f) ? amax / 127.0f : 1.0f;
         const float tis = 1.0f / ascale;
         for (int k = 0; k < K; k++) {
-            float v = a[k];
+            float v = act(k);
             if (!std::isfinite(v)) v = 0.0f;
             int q = (int)std::round(v * tis);
             a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
@@ -3342,6 +4173,11 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     // choke point every batched projection goes through: the same launches in the same order, each within the
     // BO. Each row's result is independent of the others -- the row loops downstream (`row_attn`, the GDN
     // recurrence) never needed the whole prompt in one launch, only the GEMMs did.
+    // A's row stride. `a_k` is the activation's real width when the design pads it up to K, and 0 (or K) when it
+    // does not -- the designs that do not set real_k. So the stride is a_k only when it is a real, narrower width:
+    // the same rule the target applies (xdna_target.cpp: astride). Walking by `a_k` itself made every block after
+    // the first read block 0's rows on a design with real_k == 0 (engine#1959 follow-up, found on a t2s pack).
+    const int astride = onebit::npu::row_stride(a_k, K);
     const int blk = max_batch_rows();
     if (blk > 0 && M > blk) {
         // engine#1582: say the block width out loud, once. A log that reads "0 launches, 93 s host" cannot be told
@@ -3359,7 +4195,7 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
             const int rows = std::min(blk, M - b0);
             std::vector<float> part;
             // A's row stride is the caller's a_k, not the padded K (the same stride trap the host path documents).
-            npu_gemm_rows(role, A + (size_t)b0 * a_k, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
+            npu_gemm_rows(role, A + (size_t)b0 * (size_t)astride, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
             if (part.size() < (size_t)rows * N) {
                 if (err_.empty()) err_ = std::string("npu_gemm_rows: a blocked ") + sc + " launch returned short";
                 return;
@@ -3374,6 +4210,67 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         }
         return;
     }
+    // engine#1959: a chunk wider than the 16-row twin runs the wide (prefill) design, and that design walks all of
+    // its baked rows whatever the chunk holds -- a 17-row chunk pays for 128. Measured on an imported 7B pack: one
+    // 16-row pass 1073 ms, one 17-row pass 6992 ms. So when this projection has both designs and several narrow
+    // launches are measured cheaper than the one wide launch, the chunk is walked at the twin's width instead. Rows are
+    // independent, so the results are the same rows; only the launches differ. Which side wins is a property of the
+    // kernel family, so it is decided from this process's own two launch costs (batch_split.h), and an unmeasured side
+    // keeps the wide launch -- which is also how the wide cost gets measured. Uncached weights (wkey < 0, routed
+    // experts) are never split: each launch re-packs them, and that cost would be multiplied.
+    const bool   in_range = role >= 0 && role < Q4NX_MAX_DESIGNS;
+    const int    narrow = (xd_ && in_range && !decode_twin) ? xd_->rows_for(role, 1) : 0;
+    const int    wide = (xd_ && in_range && narrow > 0) ? xd_->rows_for(role, narrow + 1) : 0;
+    if (split_mode_ == -2) {
+        const char* e = getenv("NPU_PREFILL_SPLIT");
+        split_mode_ = !e ? -1 : (atoi(e) != 0 ? 1 : 0);
+    }
+    if (in_range && wkey >= 0 && split_mode_ != 0 && narrow >= 2 && wide > narrow && M > narrow && M <= wide) {
+        // Forced mode stands in two costs that always split, so the route can be A/B'd and checked bit for bit.
+        const double nms = split_mode_ == 1 ? 1.0 : split_narrow_ms_[role];
+        // A pack that names a wide sealed family (engine#1990) has stated which side is cheaper, from a measurement
+        // made when the set was built; the costs timed here cannot overrule it, because a narrow launch is mostly
+        // timed carrying one row (a decode step) and its host share grows with the rows it carries. Measured on
+        // bonsai2-27b-t2s2: 0.50 ms per 16-row launch against 1.23 ms per 32-row launch looked like a saving and
+        // was not. So with a wide family the rule stands down unless it is forced (which is how the walk is tested).
+        const bool family = xd_ && xd_->wide_rows() > 0;
+        const double wms = split_mode_ == 1 ? 1e9
+                           : family ? 0.0
+                                    : onebit::npu::split_wide_cost(split_wide_ms_[role], split_wide_n_[role]);
+        const int sb = onebit::npu::batch_split_rows(M, narrow, wide, nms, wms);
+        if (sb > 0) {
+            if (!split_said_) {
+                split_said_ = true;
+                if (split_mode_ == 1)
+                    std::fprintf(stderr, "  [batch] a %d-row chunk runs as %d launch(es) of %d rows instead of one %d-row "
+                                         "launch (NPU_PREFILL_SPLIT=1)\n", M, (M + sb - 1) / sb, sb, wide);
+                else
+                    std::fprintf(stderr, "  [batch] a %d-row chunk runs as %d launch(es) of %d rows instead of one %d-row "
+                                         "launch: measured %.2f ms per %d-row launch against %.2f ms per %d-row launch "
+                                         "(%s; NPU_PREFILL_SPLIT=0 keeps the wide launch)\n",
+                                 M, (M + sb - 1) / sb, sb, wide, nms, sb, wms, wide, sc ? sc : "?");
+            }
+            out.assign((size_t)M * N, 0.0f);
+            // NPU_INFER_DUMP_OPS: one projection, one line -- the same rule as the block walk above.
+            onebit::npu::OpsDumpMute ops_mute;
+            for (int b0 = 0; b0 < M && err_.empty(); b0 += sb) {
+                const int rows = std::min(sb, M - b0);
+                std::vector<float> part;
+                npu_gemm_rows(role, A + (size_t)b0 * (size_t)astride, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
+                if (part.size() < (size_t)rows * N) {
+                    if (err_.empty()) err_ = std::string("npu_gemm_rows: a split ") + (sc ? sc : "?") + " launch returned short";
+                    return;
+                }
+                std::copy(part.begin(), part.begin() + (size_t)rows * N, out.begin() + (size_t)b0 * N);
+            }
+            if (err_.empty() && onebit::npu::ops_dump_enabled() && onebit::npu::ops_dump_mute_depth() == 1) {
+                char line[192];
+                if (onebit::npu::ops_dump_line(line, sizeof line, sc, cur_layer_, M, out.data(), N) > 0)
+                    std::fputs(line, stderr);
+            }
+            return;
+        }
+    }
     npu::target::GemvArgs a;
     a.role = role; a.layer = cur_layer_; a.M = M; a.K = K; a.N = N;
     a.x = A; a.Bmat = Bmat; a.wkey = wkey; a.tag = sc;
@@ -3381,8 +4278,55 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     a.rows = true; a.decode_twin = decode_twin;
     a.tiles = &Q4nxNpuForward::gemv_tile_cb; a.tiles_self = this;
     std::string err;
+    // Time the launch only when its weights were already resident: a first touch packs or reads the weight image and
+    // would be recorded as the design's cost.
+    const bool timed = in_range && wkey >= 0 && narrow >= 2 && wide > narrow && weight_cached(wkey);
+    const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!xd_ || !xd_->gemv(a, out, err)) { err_ = err.empty() ? "npu_gemm_rows: no target" : err; return; }
+    if (timed) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (M <= narrow) {
+            // a running mean that follows the box's load: narrow launches happen on every decode step
+            split_narrow_ms_[role] = split_narrow_ms_[role] > 0.0 ? 0.75 * split_narrow_ms_[role] + 0.25 * ms : ms;
+        } else {
+            // the BEST wide launch seen: once a chunk is split the wide design is not launched again, so a wide cost
+            // taken in a noisy moment must not be what keeps it out. Counted, because the first one is a start-up.
+            if (split_wide_n_[role] < 1 << 20) split_wide_n_[role]++;
+            if (!(split_wide_ms_[role] > 0.0) || ms < split_wide_ms_[role]) split_wide_ms_[role] = ms;
+        }
+    }
     op_line(sc, cur_layer_, M, out, N);
+}
+
+bool Q4nxNpuForward::set_layer_taps(const std::vector<int>& layers, std::vector<float>* sink) {
+    if (layers.empty() || !sink) {
+        tap_layers_.clear();
+        tap_sink_ = nullptr;
+        return true;
+    }
+    if (!onebit::npu::layer_taps_usable(layers.data(), int(layers.size()), c_.NL)) return false;
+    tap_layers_ = layers;
+    tap_sink_ = sink;
+    tap_base_ = sink->size();
+    return true;
+}
+
+// One tapped layer of one pass: M rows of H, written into the pass's rows of the sink at this layer's column block.
+void Q4nxNpuForward::tap_layer(int layer, const float* X, int M) {
+    const int T = int(tap_layers_.size());
+    const int j = onebit::npu::layer_tap_index(tap_layers_.data(), T, layer);
+    if (j < 0 || !tap_sink_ || M <= 0) return;
+    const size_t H = size_t(c_.H);
+    if (j == 0) {   // the first listed layer opens the pass's rows
+        tap_base_ = tap_sink_->size();
+        tap_sink_->resize(tap_base_ + size_t(M) * size_t(T) * H);
+    }
+    if (tap_sink_->size() != tap_base_ + size_t(M) * size_t(T) * H) {   // not the rows this pass opened with
+        tap_fault_ = true;
+        return;
+    }
+    for (int m = 0; m < M; m++)
+        onebit::npu::layer_tap_put(tap_sink_->data() + tap_base_, m, j, T, int(H), X + size_t(m) * H);
 }
 
 // The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
@@ -3463,6 +4407,82 @@ bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int sta
     return step_batch(placeholder, start_pos, logits);
 }
 
+bool Q4nxNpuForward::gemma4_tail_rows(int l, int M, const std::vector<float>& ple_rows, std::vector<float>& X) {
+    const int H = c_.H;
+    if (ple_dim_ > 0) {
+        // x = x + post_per_layer_input_norm(per_layer_projection(act(per_layer_input_gate(x)) * per_layer_input[l]))
+        const int i_pg = idx_of(Q4NX_DESIGN_PLEGATE);
+        const int i_pp = idx_of(Q4NX_DESIGN_PLEPROJ);
+        if (i_pg < 0 || i_pp < 0) { err_ = "batch: the PLE gate/projection designs are missing"; return false; }
+        const Q4nxDesignGeom* gg = &designs_[i_pg];
+        const Q4nxDesignGeom* gp = &designs_[i_pp];
+        const size_t w = (size_t)c_.NL * (size_t)ple_dim_;
+        if (ple_rows.size() < (size_t)M * w) { err_ = "batch: per-layer inputs short"; return false; }
+        // The gate reads the residual stream; the activation rows go at the stride npu_gemm_rows walks.
+        const int sg = onebit::npu::row_stride(gg->real_k, gg->K);
+        if (sg < H) { err_ = "batch: the PLE gate's K is narrower than the hidden size"; return false; }
+        std::vector<float> a_g((size_t)M * (size_t)sg, 0.0f), pg, pp;
+        for (int m = 0; m < M; m++)
+            std::copy(X.begin() + (ptrdiff_t)((size_t)m * H), X.begin() + (ptrdiff_t)((size_t)(m + 1) * H),
+                      a_g.begin() + (ptrdiff_t)((size_t)m * sg));
+        {
+            Q4nxProjections p{};
+            p.ple = inp_gate_[l].data();
+            if (!weight_cached(onebit::npu::kWkeyPleGate) && q4nx_assemble_B(gg, &p, B_.data()) != 0) {
+                err_ = "assemble plegate"; return false;
+            }
+            npu_gemm_rows(i_pg, a_g.data(), M, gg->K, gg->N, B_.data(), pg, onebit::npu::kWkeyPleGate, "ple_gate",
+                          gg->real_k);
+        }
+        if (pg.size() < (size_t)M * (size_t)gg->N || !err_.empty()) {
+            if (err_.empty()) err_ = "batch: the PLE gate returned short";
+            return false;
+        }
+        const int sp = onebit::npu::row_stride(gp->real_k, gp->K);
+        if (sp < ple_dim_ || gg->N < ple_dim_) { err_ = "batch: the PLE widths do not fit the designs"; return false; }
+        std::vector<float> a_p((size_t)M * (size_t)sp, 0.0f);
+        const int gelu = (sem_.mlp_act == Q4NX_ACT_GELU);
+        for (int m = 0; m < M; m++) {
+            const float* g = pg.data() + (size_t)m * gg->N;
+            const float* in = ple_rows.data() + (size_t)m * w + (size_t)l * ple_dim_;
+            float* dst = a_p.data() + (size_t)m * sp;
+            for (int i = 0; i < ple_dim_; i++) {
+                float a;
+                if (gelu) {
+                    const float cc = 0.7978845608028654f;
+                    a = 0.5f * g[i] * (1.0f + std::tanh(cc * (g[i] + 0.044715f * g[i] * g[i] * g[i])));
+                } else {
+                    a = g[i] / (1.0f + std::exp(-g[i]));
+                }
+                dst[i] = a * in[i];
+            }
+        }
+        {
+            Q4nxProjections p{};
+            p.ple = ple_proj_[l].data();
+            if (!weight_cached(onebit::npu::kWkeyPleProj) && q4nx_assemble_B(gp, &p, B_.data()) != 0) {
+                err_ = "assemble pleproj"; return false;
+            }
+            npu_gemm_rows(i_pp, a_p.data(), M, gp->K, gp->N, B_.data(), pp, onebit::npu::kWkeyPleProj, "ple_proj",
+                          gp->real_k);
+        }
+        if (pp.size() < (size_t)M * (size_t)gp->N || gp->N < H || !err_.empty()) {
+            if (err_.empty()) err_ = "batch: the PLE projection returned short";
+            return false;
+        }
+        std::vector<float> xn((size_t)H);
+        for (int m = 0; m < M; m++) {
+            rmsnorm(pp.data() + (size_t)m * gp->N, post_ln_[l].data(), H, xn.data());
+            for (int k = 0; k < H; k++) X[(size_t)m * H + k] += xn[(size_t)k];
+        }
+    }
+    // layer_scalar (layer_output_scale) closes the layer.
+    const float ls = (l < (int)layer_scale_.size()) ? layer_scale_[l] : 1.0f;
+    if (ls != 1.0f)
+        for (size_t i = 0; i < (size_t)M * (size_t)H; i++) X[i] *= ls;
+    return true;
+}
+
 bool Q4nxNpuForward::step_batch_all(const std::vector<int>& tokens, int start_pos,
                                     std::vector<float>& logits_all) {
     // A noncausal pack's full-attention layers read the whole prompt, so in a batch every row attends to
@@ -3485,8 +4505,88 @@ bool Q4nxNpuForward::step_batch_all(const std::vector<int>& tokens, int start_po
     return ok;
 }
 
-bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
-                                std::vector<float>& logits) {
+// engine#1780: a pass that fails must not leave rows in the tap sink. The bodies below return false from many
+// places, so the rule is applied once, here, around each of them.
+bool Q4nxNpuForward::embed_pooled(const std::vector<int>& ids, std::vector<float>& out) {
+    out.clear();
+    if (!noncausal_attn_) {
+        err_ = "embed_pooled(): this model is causal (no use_bidirectional_attention, no noncausal plan); a sentence "
+               "embedding pools an encoder's rows";
+        return false;
+    }
+    if (ids.empty()) { err_ = "embed_pooled(): empty input"; return false; }
+    const int H = c_.H;
+    // The sentence-transformers head, as stored: dense_2 [D2, H] then dense_3 [D3, D2], both linear (identity
+    // activation). Read once, f32; a pack without them pools to H.
+    auto load_dense = [&](const char* name, int in_w, std::vector<float>& w, int& rows) -> bool {
+        if (!w.empty()) return true;
+        TensorDesc* d = model_tensor_by_name(mw_, name);
+        if (!d) { rows = 0; return true; }
+        if (d->ndim != 2 || d->shape[1] != in_w || strcmp(d->dtype, "BF16") != 0) {
+            err_ = std::string("embed_pooled(): ") + name + " is not a BF16 [out, " + std::to_string(in_w) + "] matrix";
+            return false;
+        }
+        rows = (int)d->shape[0];
+        const uint16_t* raw = (const uint16_t*)model_tensor_data(mw_, d);
+        if (!raw || (size_t)d->data_size < (size_t)rows * (size_t)in_w * 2) { err_ = std::string("embed_pooled(): ") + name + " is short"; return false; }
+        w.resize((size_t)rows * (size_t)in_w);
+        for (size_t i = 0; i < w.size(); i++) w[i] = bf16_to_f32(raw[i]);
+        return true;
+    };
+    if (!load_dense("dense_2.weight", H, dense2_, dense2_out_)) return false;
+    if (dense2_out_ > 0 && !load_dense("dense_3.weight", dense2_out_, dense3_, dense3_out_)) return false;
+    std::vector<float> unused;
+    hidden_only_ = true;
+    const bool ok = step_batch(ids, 0, unused);
+    hidden_only_ = false;
+    if (!ok) return false;
+    const int M = (int)ids.size();
+    if (last_hidden_rows_.size() != (size_t)M * (size_t)H) { err_ = "embed_pooled(): row count"; return false; }
+    std::vector<double> mean((size_t)H, 0.0);
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < H; k++) mean[(size_t)k] += last_hidden_rows_[(size_t)m * H + k];
+    std::vector<float> v((size_t)H);
+    for (int k = 0; k < H; k++) v[(size_t)k] = (float)(mean[(size_t)k] / M);
+    auto linear = [](const std::vector<float>& w, int rows, int in_w, const std::vector<float>& x) {
+        std::vector<float> y((size_t)rows);
+        for (int r = 0; r < rows; r++) {
+            double s = 0.0;
+            const float* wr = &w[(size_t)r * (size_t)in_w];
+            for (int k = 0; k < in_w; k++) s += (double)wr[k] * x[(size_t)k];
+            y[(size_t)r] = (float)s;
+        }
+        return y;
+    };
+    if (dense2_out_ > 0) v = linear(dense2_, dense2_out_, H, v);
+    if (dense3_out_ > 0) v = linear(dense3_, dense3_out_, dense2_out_, v);
+    double n2 = 0.0;
+    for (float x : v) n2 += (double)x * x;
+    const double inv = n2 > 0 ? 1.0 / std::sqrt(n2) : 0.0;
+    for (float& x : v) x = (float)(x * inv);
+    out = std::move(v);
+    return true;
+}
+
+bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos, std::vector<float>& logits) {
+    onebit::npu::LayerTapPass pass(tap_sink_);
+    tap_fault_ = false;
+    const bool ok = step_batch_impl(tokens, start_pos, logits);
+    if (tap_fault_ && tap_sink_)
+        std::fprintf(stderr, "  [taps] a batched pass at position %d changed its row count between tapped layers; "
+                             "its rows are dropped\n", start_pos);
+    pass.keep = ok && !tap_fault_;
+    return ok;
+}
+
+bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int cache_pos) {
+    onebit::npu::LayerTapPass pass(tap_sink_);
+    const bool ok = step_impl(token, pos, logits, cache_pos);
+    pass.keep = ok;
+    return ok;
+}
+
+bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_pos,
+                                     std::vector<float>& logits) {
     if (!ready_) { err_ = "not initialised"; return false; }
     // A noncausal pack reads the whole prompt at once, so a chunk that starts above 0 was already
     // encoded causally by an earlier call and cannot be repaired here.  Named, not silently causal.
@@ -3499,6 +4599,14 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     const int H = c_.H;
     const int M = (int)tokens.size();
     if (M <= 0) { err_ = "empty batch"; return false; }
+    // A bidirectional sliding layer was trained on a band around each position; reading the whole prompt is that
+    // band only while the prompt fits half the window, whichever side convention the band uses.
+    if (bidir_sliding_ && sem_.sliding_window > 0 && M > sem_.sliding_window / 2) {
+        err_ = "use_bidirectional_attention: a " + std::to_string(M) + "-token input is longer than half the " +
+               std::to_string(sem_.sliding_window) + "-token sliding window, where a sliding layer's band is no " +
+               "longer the whole prompt; send at most " + std::to_string(sem_.sliding_window / 2) + " tokens";
+        return false;
+    }
     for (int t : tokens)
         if (t < 0 || t >= c_.NV) { err_ = "token out of range"; return false; }
 
@@ -3527,8 +4635,16 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // recurrence), so lin_kd_ no longer disqualifies a model, and attn_output_gate
     // is handled in the attention block below. MLA, per-layer embeddings, Gemma4
     // and shared-KV stacks still fall back.
+    // Gemma3 (extra_layer_norms 2) is Gemma4's sandwich without PLE or KV sharing. engine#1780: Gemma4 itself runs
+    // here too -- its per-layer inputs are built per row, its PLE gate and projection are M-row GEMMs, a KV-shared
+    // layer reads (and does not append to) its owner's cache, which the owner filled for every row of this batch
+    // earlier in the same pass, and a shared layer's double-wide MLP uses the GU2/D2 designs, all as step() does. A
+    // verify of k drafted rows is then one weight stream instead of k.
+    const bool sandwich = gemma4_layer_;
+    // gpt_oss runs its MoE, sinks and o bias in step() only, so a batched prefill takes the per-token path
     const bool simple_dense =
-        !mla_ && ple_dim_ == 0 && !gemma4_layer_ && kv_self;
+        !mla_ && (ple_dim_ == 0 || !inject_embeds_) && (kv_self || gemma4_layer_) && !sem_.gpt_oss &&
+        !(n_expert_ > 0 && leading_dense_ > 0);   // a leading dense layer of a non-MLA MoE runs in step() only
     if (!simple_dense || getenv("NPU_NO_BATCH")) {
         if (inject_embeds_) {
             err_ = "step_batch_embeds: this model's batched body falls back to per-token step(), which needs "
@@ -3541,9 +4657,15 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                          "gate=%d kv_self=%d no_batch=%d\n",
                          M, mla_, lin_kd_, ple_dim_, (int)gemma4_layer_, n_expert_,
                          attn_gate_, (int)kv_self, (int)(getenv("NPU_NO_BATCH") != nullptr));
+        // step_batch_all() asks for every row: the per-token path owes it each step's logits, not only the last
+        // one's (it used to leave logits_all as it found it, so a verifier on a fallback model read no rows, or a
+        // previous batch's -- engine#1780, found by batch_check_state's verify arm on hy_v3 and gpt-oss).
         std::vector<float> one;
-        for (int m = 0; m < M; m++)
+        if (batch_all_out_) batch_all_out_->clear();
+        for (int m = 0; m < M; m++) {
             if (!step(tokens[m], start_pos + m, one)) return false;
+            if (batch_all_out_) batch_all_out_->insert(batch_all_out_->end(), one.begin(), one.end());
+        }
         logits = one;
         return true;
     }
@@ -3651,8 +4773,23 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 X[size_t(r) * (size_t)H + k] += add[size_t(r - lo) * (size_t)H + k];
     };
 
+    // Gemma4: every row's per-layer inputs, [M][NL * ple_dim], built as step() builds one token's (engine#1780).
+    std::vector<float> ple_rows;
+    if (ple_dim_ > 0) {
+        const size_t w = (size_t)c_.NL * (size_t)ple_dim_;
+        ple_rows.resize((size_t)M * w);
+        for (int m = 0; m < M; m++) {
+            build_ple_inputs(tokens[m]);
+            if (ple_input_.size() < w) { err_ = "batch: per-layer inputs were not built"; return false; }
+            std::copy(ple_input_.begin(), ple_input_.begin() + (ptrdiff_t)w, ple_rows.begin() + (ptrdiff_t)((size_t)m * w));
+        }
+    }
+
     std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row;
     for (int l = 0; l < c_.NL; l++) {
+        // engine#1780: the stream as this layer receives it is the previous layer's output. Taken here and not at
+        // the end of the body, because the body leaves through more than one `continue`.
+        if (l > 0 && tap_sink_) tap_layer(l - 1, X.data(), M);
         cur_layer_ = l;   // the layer index the per-layer helpers read
         const bool cached = weight_cached(0);
         const int lt0 = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
@@ -3660,7 +4797,11 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         // norm) live outside the weight cache and are per layer, so load_gdn_layer
         // must run every time; it skips its own big deqs when the BOs are cached.
         const bool gdn_l = (lin_kd_ > 0 && lt0 == Q4NX_LAYER_LINEAR);
-        if ((gdn_l || !cached) && !load_layer(l)) {
+        // A Gemma4 layer's PLE gate and projection have their own weight keys; reload when either is missing, as
+        // step() does (its dense_weights_cached).
+        const bool ple_cached = ple_dim_ == 0 || (weight_cached(onebit::npu::kWkeyPleGate) &&
+                                                  weight_cached(onebit::npu::kWkeyPleProj));
+        if ((gdn_l || !cached || !ple_cached) && !load_layer(l)) {
             if (err_.empty()) err_ = "dequant failed";
             return false;
         }
@@ -3673,18 +4814,29 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         const int l_win   = l_full ? 0 : sem_.sliding_window;
         const int i_qkv_l = (two_widths && l_full) ? i_qkv2 : i_qkv;
         const int i_o_l   = (two_widths && l_full) ? i_o2 : i_o;
+        // KV sharing (Gemma4), as step(): a shared layer reads its owner's cache and appends nothing. The owner ran
+        // earlier in this loop and appended every row of the batch, so a causal row still sees exactly its prefix.
+        const bool kv_shared = (l < (int)kv_owner_.size() && kv_owner_[l] != l);
+        const int kv_layer = (l < (int)kv_owner_.size()) ? kv_owner_[l] : l;
+        const bool wide = kv_shared && sem_.double_wide_mlp;
+        const int i_gu_l = wide ? idx_of(Q4NX_DESIGN_GU2) : i_gu;
+        const int i_d_l = wide ? idx_of(Q4NX_DESIGN_D2) : i_d;
+        const int im_l = wide ? 2 * im : im;
 
         // ---- attention ---- (a GDN layer goes through gdn_layer_batch instead) ----
         for (int m = 0; m < M; m++)
             rmsnorm(X.data() + (size_t)m * H, in_norm_[l].data(), H,
                     XN.data() + (size_t)m * H);
         O.assign((size_t)M * H, 0.0f);
-        if (lin_kd_ > 0 && lt == Q4NX_LAYER_LINEAR) {
+        if (is_conv_layer(l)) {
+            if (!conv_layer_batch(l, XN, M, O)) { if (err_.empty()) err_ = "conv batch failed"; return false; }
+        } else if (lin_kd_ > 0 && lt == Q4NX_LAYER_LINEAR) {
             if (!gdn_layer_batch(l, XN, M, O)) { err_ = "gdn batch failed"; return false; }
         } else {
             const Q4nxDesignGeom* g = &designs_[i_qkv_l];
             Q4nxProjections p{};
             p.q = wq_.data(); p.k = wk_.data(); p.v = wv_.data();
+            if (kv_shared) { p.k = wq_.data(); p.v = wq_.data(); }   // no k/v weights: that half is discarded (step())
             if (!xd_->pb16i() && !cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
                 err_ = "assemble qkv"; return false;
             }
@@ -3798,7 +4950,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 }
                 if (!attention(*in, start_pos + m, pos3_ ? trio : nullptr, dst ? ctx_row : ctx_scratch,
                                l_hd, l_nkv, l_theta,
-                               l_rot, l_prop, l_win, l, append, kvlen, q_keep)) {
+                               l_rot, l_prop, l_win, kv_layer, append && !kv_shared, kvlen, q_keep)) {
                     err_ = "attention failed"; return false;
                 }
                 if (q_keep) return true;       // prepare only: q is in *q_keep, k/v are in the cache
@@ -3831,7 +4983,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 return e && e[0] == '1';
             }();
             if (attn_rows_on && M > 1 && l_hd > 0 && c_.NH % l_nkv == 0) {
-                const bool whole = noncausal_attn_ && l_full;
+                const bool whole = noncausal_attn_ && (l_full || bidir_sliding_);
                 const size_t qw = (size_t)nhd;
                 std::vector<float> qall((size_t)M * qw), qm;
                 std::vector<int> Tm((size_t)M), t0m((size_t)M);
@@ -3845,9 +4997,11 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 }
                 {
                     LhScope _t_attn(LH_ATTN);
-                    const float scale = sem_.attn_scaling_one ? 1.0f : 1.0f / std::sqrt((float)l_hd);
+                    const float scale = sem_.attn_scaling_one ? 1.0f
+                                        : 1.0f / std::sqrt(sem_.query_pre_attn_scalar > 0 ? sem_.query_pre_attn_scalar
+                                                                                         : (float)l_hd);
                     const int nt = ((long)M * (start_pos + M) * l_hd >= 8192) ? omp_heads_threads() : 1;
-                    q4nx_attn::rows_context(qall.data(), kcache_[l].data(), vcache_[l].data(), M, c_.NH, l_nkv,
+                    q4nx_attn::rows_context(qall.data(), kcache_[kv_layer].data(), vcache_[kv_layer].data(), M, c_.NH, l_nkv,
                                             l_hd, Tm.data(), t0m.data(), scale, CTX.data(), nt);
                     if (attn_gate_)
                         for (int m = 0; m < M; m++) {
@@ -3872,7 +5026,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                         return false;
                     }
                 }
-            } else if (noncausal_attn_ && l_full) {
+            } else if (noncausal_attn_ && (l_full || bidir_sliding_)) {
                 for (int m = 0; m < M; m++)
                     if (!row_attn(m, nullptr, true, 0)) return false;
                 for (int m = 0; m < M; m++)
@@ -3882,6 +5036,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 for (int m = 0; m < M; m++)
                     if (!row_attn(m, CTX.data() + (size_t)m * ctx_w, true, 0)) return false;
             }
+            for (int m = 0; m < M; m++)
+                apply_head_gate(l, XN.data() + (size_t)m * H, CTX.data() + (size_t)m * ctx_w, l_hd);
             const Q4nxDesignGeom* go = &designs_[i_o_l];
             Q4nxProjections po{};
             po.o = wo_.data();
@@ -3897,16 +5053,25 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         {
             LhScope _t_res(LH_RES);
             const int nrow = q4nx_pad_n(H);
-            for (int m = 0; m < M; m++)
-                for (int k = 0; k < H; k++)
-                    X[(size_t)m * H + k] += O[(size_t)m * nrow + k] * residual_scale_;
+            if (sandwich) {
+                // as step(): the attention output is normalised (post_attention_layernorm) before the add
+                std::vector<float> on((size_t)H);
+                for (int m = 0; m < M; m++) {
+                    rmsnorm(O.data() + (size_t)m * nrow, post_norm_[l].data(), H, on.data());
+                    for (int k = 0; k < H; k++) X[(size_t)m * H + k] += on[(size_t)k];
+                }
+            } else {
+                for (int m = 0; m < M; m++)
+                    for (int k = 0; k < H; k++)
+                        X[(size_t)m * H + k] += O[(size_t)m * nrow + k] * residual_scale_;
+            }
         }
 
         // ---- MLP ----
         for (int m = 0; m < M; m++)
-            rmsnorm(X.data() + (size_t)m * H, post_norm_[l].data(), H,
+            rmsnorm(X.data() + (size_t)m * H, (sandwich ? pre_ff_norm_ : post_norm_)[l].data(), H,
                     XN.data() + (size_t)m * H);
-        if (n_expert_ > 0) {
+        if (n_expert_ > 0 && l >= leading_dense_) {   // a leading dense layer (hy_v3's first_k_dense_replace) runs the dense FFN
             // MoE FFN: the router/top-k pick different experts per row, so this
             // stays per-token (the attention GEMMs above are already batched).
             // Grouping rows by expert so each expert's weight read serves the
@@ -3930,16 +5095,20 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         // design's N); the split branch packs its own buffer at the same width rather than at 2*im, so
         // there is one layout and one stride -- reading a real-width buffer at the design stride is
         // what the review of #885 caught (latent until a container has im % 256 != 0, then an OOB read).
-        const size_t act_w = (size_t)q4nx_pad_n(2 * im);
-        if (i_gu >= 0) {
-            const Q4nxDesignGeom* g = &designs_[i_gu];
+        const size_t act_w = (size_t)q4nx_pad_n(2 * im_l);
+        if (i_gu_l >= 0) {
+            const Q4nxDesignGeom* g = &designs_[i_gu_l];
             Q4nxProjections p{};
             p.gate = wg_.data(); p.up = wu_.data();
             if (!xd_->pb16i() && !cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
                 err_ = "assemble gu"; return false;
             }
-            npu_gemm_rows(i_gu, XN.data(), M, g->K, g->N, B_.data(), ACT, 2,
+            npu_gemm_rows(i_gu_l, XN.data(), M, g->K, g->N, B_.data(), ACT, 2,
                           "ffn_gate_up", g->real_k);
+            if ((size_t)g->N != act_w) { err_ = "batch: the gate/up design's N is not the padded 2 x intermediate"; return false; }
+        } else if (wide) {
+            err_ = "batch: a double-wide MLP layer has no fused GU2 design";
+            return false;
         } else if (i_g >= 0 && i_u >= 0) {
             std::vector<float> gv, uv, av((size_t)M * act_w, 0.0f);
             const Q4nxDesignGeom* gg = &designs_[i_g];
@@ -3969,34 +5138,44 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             err_ = "no gate/up design";
             return false;
         }
-        HH.assign((size_t)M * (size_t)im, 0.0f);
+        HH.assign((size_t)M * (size_t)im_l, 0.0f);
         {
             // act_w is the stride both branches above leave ACT at; only the first 2*im columns of a
             // row are real (the rest is the kernel's zero column pad), so the elementwise gate*up reads
             // that row in place and writes HH's row in place: no staging copy on either side.  The two
             // copies this replaces were 12.75 MiB of a 15.38 MiB row (NPU_COPY_PROF=1, 2026-11-05).
             for (int m = 0; m < M; m++)
-                if (!mlp(ACT.data() + (size_t)m * act_w, HH.data() + (size_t)m * im, im)) {
+                if (!mlp(ACT.data() + (size_t)m * act_w, HH.data() + (size_t)m * im_l, im_l)) {
                     err_ = "mlp failed"; return false;
                 }
         }
         {
-            const Q4nxDesignGeom* g = &designs_[i_d];
+            const Q4nxDesignGeom* g = &designs_[i_d_l];
             Q4nxProjections p{};
             p.down = wd_.data();
             if (!xd_->pb16i() && !cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
                 err_ = "assemble d"; return false;
             }
-            npu_gemm_rows(i_d, HH.data(), M, g->K, g->N, B_.data(), D, 4,
+            npu_gemm_rows(i_d_l, HH.data(), M, g->K, g->N, B_.data(), D, 4,
                           "ffn_down", g->real_k);
         }
         {
             LhScope _t_res(LH_RES);
             const int nrow = q4nx_pad_n(H);   // as above: the design's N, identity when H is on the grid
-            for (int m = 0; m < M; m++)
-                for (int k = 0; k < H; k++)
-                    X[(size_t)m * H + k] += D[(size_t)m * nrow + k] * residual_scale_;
+            if (sandwich) {
+                // post_feedforward_layernorm on the down projection, then the add (as step())
+                std::vector<float> dn((size_t)H);
+                for (int m = 0; m < M; m++) {
+                    rmsnorm(D.data() + (size_t)m * nrow, post_ff_norm_[l].data(), H, dn.data());
+                    for (int k = 0; k < H; k++) X[(size_t)m * H + k] += dn[(size_t)k];
+                }
+            } else {
+                for (int m = 0; m < M; m++)
+                    for (int k = 0; k < H; k++)
+                        X[(size_t)m * H + k] += D[(size_t)m * nrow + k] * residual_scale_;
+            }
         }
+        if (sandwich && !gemma4_tail_rows(l, M, ple_rows, X)) return false;
 
         // Same post-residual hidden-state dump as step() emits as [L], one row per
         // position, so the two paths can be compared layer by layer.
@@ -4048,6 +5227,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // residual here produced garbage logits (the M=1 self-check caught it).
     std::vector<float> fnorm(H);
     bool ok = true;
+    if (tap_sink_) tap_layer(c_.NL - 1, X.data(), M);
     last_residual_.assign(X.begin() + (size_t)(M - 1) * H, X.end());
     if (batch_all_out_) {
         // step_batch_all(): the verifier needs the model's own choice at every drafted position, so every
@@ -4064,13 +5244,20 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         logits.assign(batch_all_out_->begin() + (size_t)(M - 1) * (size_t)c_.NV, batch_all_out_->end());
         // engine#1781: keep the batched rows so the oracle can compare all of them, not just the last one's argmax.
         if (batch_check) bat_rows.assign(batch_all_out_->begin(), batch_all_out_->end());
+    } else if (hidden_only_) {
+        // embed_pooled(): an encoder has no next token, so the head is not run; every row is normed and kept.
+        last_hidden_rows_.assign((size_t)M * (size_t)H, 0.0f);
+        for (int m = 0; m < M; m++)
+            rmsnorm(&X[(size_t)m * H], final_norm_.data(), H, &last_hidden_rows_[(size_t)m * H]);
+        std::copy(last_hidden_rows_.begin() + (size_t)(M - 1) * H, last_hidden_rows_.end(), fnorm.begin());
+        logits.clear();
     } else {
         std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
         rmsnorm(last.data(), final_norm_.data(), H, fnorm.data());
         ok = run_lm_head(fnorm, logits);
     }
     last_hidden_ = fnorm;  // for last_hidden(): the same vector the head reads, last position only
-    if (getenv("NPU_INFER_DUMP_LAYERS")) {
+    if (getenv("NPU_INFER_DUMP_LAYERS") && !logits.empty()) {
         int best[5] = {-1, -1, -1, -1, -1};
         for (int i = 0; i < (int)logits.size(); i++) {
             for (int r = 0; r < 5; r++) {
@@ -4225,6 +5412,7 @@ bool Q4nxNpuForward::mla_expert(const uint8_t* pool, size_t per_expert, int e,
     // 0.00855 on [K][N].
     int rows = K, cols = N;
     moe_slice_geometry(moe_format_, N, K, &rows, &cols);
+    if (moe_slice_nk_) { rows = N; cols = K; }   // the container's own grid says [N][K] (init_impl)
     if (dequant_any(pool + (size_t)e * per_expert, per_expert, rows, cols, out.data()) != 0)
         return false;
     return true;
@@ -4627,7 +5815,11 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
 
     // per-head RMSNorm on q and k, only for architectures that have it.  A KV-shared
     // layer (Gemma4) computed no k at all, so its k is never normalized or used.
-    if (sem_.qk_norm) {
+    // engine#1889: WHERE it runs is per family. Qwen3 and Gemma normalise and then rotate; Hunyuan's graph rotates
+    // and then normalises (q_proj -> RotaryEmbedding -> q_norm -> attention), so for it the same code runs after the
+    // RoPE block below. The RMS itself is rotation-invariant; the per-dimension gain is not, so the order matters
+    // wherever a rotary pair's two gains differ.
+    auto qk_normalise = [&]() {
         std::vector<float> t(HD);
         for (int h = 0; h < NH; h++) {
             rmsnorm(&q[(size_t)h * HD], q_norm_[cur_layer_].data(), HD, t.data(), "q_norm");
@@ -4639,7 +5831,8 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
                 memcpy(&k[(size_t)h * HD], t.data(), sizeof(float) * HD);
             }
         }
-    }
+    };
+    if (sem_.qk_norm && !sem_.qk_norm_after_rope) qk_normalise();
     // Gemma4 normalises v with a SCALE-FREE RMSNorm (its v_norm has no weight).
     if (sem_.v_norm && append_kv) {
         std::vector<float> tv(HD);
@@ -4659,7 +5852,8 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         std::vector<float> cos_(half), sin_(half);
         // Dynamic NTK: the base moves with the position, so it is one pow per position rather than one per dim pair.
         // Below the model's original window this returns theta unchanged, which is what makes a short prompt
-        // bit-identical to the same model served without the scaling.
+        // bit-identical to the same model served without the scaling. A block with `alpha` (Hunyuan) is the fixed
+        // base theta * alpha^(dim/(dim-2)) at every position instead (engine#1889).
         // engine#1792 review: the exponent is HF's `dim / (dim - 2)` over the ROTARY width (`dim = int(head_dim *
         // partial_rotary_factor)`), which is `rot` here -- passing `HD` was wrong for any model that declares dynamic
         // scaling together with partial_rotary_factor < 1. Unreachable in today's catalog, so this is a correctness
@@ -4670,6 +5864,9 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
             if (proportional) {
                 inv = 1.0 / std::pow(rope_theta, 2.0 * (double)i / (double)HD);
                 if (i >= rot / 2) inv = 0.0;
+            } else if (rope_yarn_.on) {
+                // YaRN (GPT-OSS): the pair's blend of the plain and the plain / factor frequency (q4nx_rope.h)
+                inv = q4nx_rope_yarn_inv_freq(i, rot, rope_theta, &rope_yarn_);
             } else {
                 inv = 1.0 / std::pow(rope_theta, (double)i / (double)half);
                 // LongRoPE (MiniCPM4): ggml's rope applies the factor as
@@ -4687,13 +5884,19 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
                 // llama3 (Llama-3.1/3.2/3.3): the wavelength-band rule, on the FREQUENCY, so it costs
                 // nothing per token.  No-op unless the config declares rope_type "llama3".
                 inv = q4nx_rope_llama3_inv_freq(inv, &rope_llama3_);
+                // rope_type "linear": positions divided by the factor, i.e. the frequency is.  Gemma3 applies its
+                // block to the full layers only; its sliding layers have their own base (rope_local_base_freq) and
+                // no scaling.  A model without that split scales every layer, as HF does.
+                if (rope_linear_factor_ > 0.0 && (window == 0 || !sem_.rope_local_base)) inv /= rope_linear_factor_;
             }
             // Interleaved MRoPE: each rotary frequency rotates by its own axis's position (t, h or w). With the
             // three planes equal this is exactly `pos * inv`, which is why text-only prompts are bit-identical
             // to plain RoPE (measured: 0 angle difference over positions 0..262143, engine#1311/TQVL).
             const double ang = (double)(pos3 ? pos3[mrope_plane(i)] : pos) * inv;
-            cos_[i] = (float)std::cos(ang);
-            sin_[i] = (float)std::sin(ang);
+            // YaRN scales cos and sin by its attention factor (q and k both, as transformers does); 1 otherwise
+            const double af = rope_yarn_.on ? rope_yarn_.attention_factor : 1.0;
+            cos_[i] = (float)(std::cos(ang) * af);
+            sin_[i] = (float)(std::sin(ang) * af);
         }
         auto rot_half = [&](float* x) {
             // pairs (i, i + half) inside the rotated block; the rest passes through
@@ -4706,6 +5909,7 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         for (int h = 0; h < NH; h++) rot_half(&q[(size_t)h * HD]);
         for (int h = 0; h < NKV; h++) rot_half(&k[(size_t)h * HD]);
     }
+    if (sem_.qk_norm && sem_.qk_norm_after_rope) qk_normalise();
 
     // append to cache (a KV-shared layer reuses its owner's, which the owner has
     // already appended earlier in this same step).
@@ -4726,7 +5930,9 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     const int T = kv_len > 0 ? kv_len : pos + 1;
     // Gemma4 sets attention scaling to 1.0 (q/k carry an RMSNorm); everyone else
     // uses the usual 1/sqrt(head_dim).
-    const float scale = sem_.attn_scaling_one ? 1.0f : 1.0f / std::sqrt((float)HD);
+    // Gemma2/3 scale by query_pre_attn_scalar, which equals head_dim on most of the family but not all (Gemma3-27B).
+    const float scale = sem_.attn_scaling_one ? 1.0f
+                        : 1.0f / std::sqrt(sem_.query_pre_attn_scalar > 0 ? sem_.query_pre_attn_scalar : (float)HD);
     // Sliding-window attention: ignore positions older than the window.
     const int t0 = (window > 0 && T > window)
                        ? T - window : 0;
@@ -4744,7 +5950,8 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
 #pragma omp for schedule(static)
         for (int h = 0; h < NH; h++)
             q4nx_attn::head_context(&q[(size_t)h * HD], kcache_[kv_layer].data(), vcache_[kv_layer].data(), NKV,
-                                    h / gqa, HD, t0, T, scale, score.data(), &ctx[(size_t)h * HD]);
+                                    h / gqa, HD, t0, T, scale, score.data(), &ctx[(size_t)h * HD],
+                                    sem_.gpt_oss ? &gpt_sinks_[(size_t)kv_layer][(size_t)h] : nullptr);
     }
     return true;
 }
@@ -4777,7 +5984,7 @@ bool Q4nxNpuForward::mlp(const float* gu, float* h, int im) {
 // --------------------------------------------------------------------------
 // step
 // --------------------------------------------------------------------------
-bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int cache_pos) {
+bool Q4nxNpuForward::step_impl(int token, int pos, std::vector<float>& logits, int cache_pos) {
     if (!ready_) { err_ = "not initialised"; return false; }
     // Generation is causal by construction (one position at a time, keys only in the past), so a pack
     // whose full-attention layers read the whole prompt cannot be run this way.  Refused by name
@@ -4834,12 +6041,21 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
     if (ph) { g_ph.embed = ph_ms(tp_step); tp_lap = std::chrono::steady_clock::now(); }
 
     for (int l = 0; l < c_.NL; l++) {
+        if (l > 0 && tap_sink_) tap_layer(l - 1, x.data(), 1);   // engine#1780, as in the batched body
         cur_layer_ = l;
         // Dense models: once this layer's projections are packed (after the
         // first token), the f32 weights are no longer read, so skip the per-token
-        // Q4NX dequant.  GDN/MLA/PLE load members used outside the GEMMs, so they
+        // Q4NX dequant.  GDN/MLA load members used outside the GEMMs, so they
         // keep loading every token.
-        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_dim_ == 0 && n_expert_ == 0 && weight_cached(0);
+        // A per-layer-embedding (Gemma4) model is dense in this sense too: its gate and projection are read once at
+        // init and are GEMM weights like the rest, so once THEIR images are packed as well nothing here reads the
+        // layer's f32 weights. It used to be excluded, and every token dequantised all 42 layers again: 3.5 s per
+        // token on an E4B with the device idle most of that time.
+        // NPU_PLE_RELOAD=1 keeps the per-token reload, for an A/B.
+        static const bool ple_reload = getenv("NPU_PLE_RELOAD") != nullptr;
+        const bool ple_cached = ple_dim_ == 0 || (!ple_reload && weight_cached(onebit::npu::kWkeyPleGate) &&
+                                                  weight_cached(onebit::npu::kWkeyPleProj));
+        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_cached && n_expert_ == 0 && weight_cached(0);
         {
             LhScope _tlh(LH_LOAD);
         if (!dense_weights_cached && !load_layer(l)) { if (err_.empty()) err_ = "dequant failed"; return false; }
@@ -4934,7 +6150,9 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
 
         // ---- attention ---- (or, for a GDN layer, gdn_layer below)
         rmsnorm(x.data(), in_norm_[l].data(), H, xn.data());
-        if (lin_kd_ > 0 && lt == Q4NX_LAYER_LINEAR) {
+        if (is_conv_layer(l)) {
+            if (!conv_layer(l, xn, o)) return false;
+        } else if (lin_kd_ > 0 && lt == Q4NX_LAYER_LINEAR) {
             LhScope _tlh(LH_GDN);
             if (!gdn_layer(l, xn, o)) return false;
         } else {
@@ -5016,6 +6234,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
             if (gate_ptr)
                 for (int i = 0; i < nhd; i++)
                     ctx[i] *= 1.0f / (1.0f + expf(-gate_ptr[i]));
+            apply_head_gate(l, xn.data(), ctx.data(), l_hd);
         }
         {
             const Q4nxDesignGeom* g = &designs_[i_o_l];
@@ -5024,6 +6243,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
             if (!xd_->pb16i() && !weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
             npu_gemm(i_o_l, ctx.data(), g->K, g->N, B_.data(), o, 1,
                      l_full ? "attn_output" : "ssm_out", g->real_k);
+            if (sem_.gpt_oss)
+                for (int k = 0; k < H; k++) o[(size_t)k] += gpt_obias_[(size_t)l][(size_t)k];
         }
         }  // end non-GDN attention
         if (gemma4_layer_) {
@@ -5045,7 +6266,21 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
         } else {
             rmsnorm(x.data(), post_norm_[l].data(), H, xn.data());
         }
-        if (n_expert_ > 0) {
+        if (sem_.gpt_oss) {
+            if (!gptoss_moe(l, xn, d)) return false;
+            { LhScope _tlh(LH_RES);
+            for (int k = 0; k < H; k++) x[k] += d[k]; }
+            if (!nancheck("moe")) return false;
+            continue;
+        }
+        if (n_expert_ > 0 && !mla_ && l < leading_dense_) {
+            if (!dense_mlp(l, xn, d)) return false;
+            { LhScope _tlh(LH_RES);
+            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_; }
+            if (!nancheck("dense")) return false;
+            continue;
+        }
+        if (n_expert_ > 0 && l >= leading_dense_) {   // a leading dense layer (hy_v3's first_k_dense_replace) runs the dense FFN
             // Qwen MoE layer (qwen3moe / qwen35moe): the FFN is router -> top-k
             // experts, not a dense gate/up/down.  moe_mlp writes the whole FFN
             // delta into d.  (deepseek2/GLM MoE layers never reach here -- the MLA
@@ -5124,8 +6359,10 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
                 const Q4nxDesignGeom* g = &designs_[i_pg];
                 Q4nxProjections p{};
                 p.ple = inp_gate_[l].data();
-                if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble plegate"; return false; }
-                npu_gemm(i_pg, x.data(), g->K, g->N, B_.data(), pg, 0, nullptr, g->real_k);
+                // The layer's own weight-cache keys (weight_keys.h): 0 and 1 are this layer's QKV and O, and a gate
+                // launched under key 0 ran with the QKV image on the device -- the host arms have no such cache.
+                if (!weight_cached(onebit::npu::kWkeyPleGate) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble plegate"; return false; }
+                npu_gemm(i_pg, x.data(), g->K, g->N, B_.data(), pg, onebit::npu::kWkeyPleGate, "ple_gate", g->real_k);
             }
             const int gelu = (sem_.mlp_act == Q4NX_ACT_GELU);
             for (int i = 0; i < ple_dim_; i++) {
@@ -5143,8 +6380,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
                 const Q4nxDesignGeom* g = &designs_[i_pp];
                 Q4nxProjections p{};
                 p.ple = ple_proj_[l].data();
-                if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble pleproj"; return false; }
-                npu_gemm(i_pp, pg.data(), g->K, g->N, B_.data(), pp, 1, nullptr, g->real_k);
+                if (!weight_cached(onebit::npu::kWkeyPleProj) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble pleproj"; return false; }
+                npu_gemm(i_pp, pg.data(), g->K, g->N, B_.data(), pp, onebit::npu::kWkeyPleProj, "ple_proj", g->real_k);
             }
             rmsnorm(pp.data(), post_ln_[l].data(), H, xn.data());
             for (int k = 0; k < H; k++) x[k] += xn[k];
@@ -5156,6 +6393,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
     }
     if (ph) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
 
+    if (tap_sink_) tap_layer(c_.NL - 1, x.data(), 1);
     last_residual_ = x;                        // one norm earlier, for a drafter that wants the residual
     rmsnorm(x.data(), final_norm_.data(), H, xn.data());
     last_hidden_ = xn;  // for last_hidden(): the post-final-norm state of this position
@@ -5480,7 +6718,15 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         // q4nx_pack_B_int8_blocked(): one multiplier per column, int8 codes. Chunked by vocabulary block, because a
         // whole head image is H x V bytes (622 MB at this vocabulary).
         const float inv_es = (sem_.tie_embeddings && sem_.embed_scale > 0) ? 1.0f / sem_.embed_scale : 1.0f;
-        const int TB = 8192;   // vocabulary block; a tile's image is H x TB bytes
+        // engine#1990: the block width is an experiment knob, because the residual on CodeLlama is confined to exactly
+        // 16 logit positions starting at 16384 -- the start of a block -- and is identical at every step, i.e. a WEIGHT
+        // difference localised at a block boundary rather than an accumulation difference. NPU_I8_HEAD_TB moves the
+        // boundaries: if the wrong positions move with it, the chunking is the cause; if they stay at 16384, it is not.
+        static const int TB = [] {
+            const char* e = std::getenv("NPU_I8_HEAD_TB");
+            const int v = e ? std::atoi(e) : 8192;
+            return (v >= 1024 && v % 128 == 0) ? v : 8192;
+        }();
         if ((int)lm_head_i8_.size() != (NV + TB - 1) / TB) lm_head_i8_.assign((NV + TB - 1) / TB, HostI8Tensor());
         logits.assign((size_t)NV, 0.0f);
         std::vector<float> a8v((size_t)H);
@@ -5761,6 +7007,101 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             std::chrono::steady_clock::now() - hh0).count();
         xd_->add_hadamard_cost(had_ms, 1);
         head_got.assign((size_t)T, 0.0f);
+    }
+    // ---- the int8 head on the host (engine#1785), NPU_HEAD_HOST=1 ---------------------------------------
+    // A decode step is ONE row, and a launch costs the same weight pass for one row as for 128, so the
+    // head's launches are the most expensive way to use the device: 21 launches, 65 ms of each token on a
+    // 248,320 x 2,048 head, against a few ms for the same sums on the host. Nothing is approximated: the
+    // activation codes come from the device path's own quantiser (q4nx_quant_i8::row, the amax/127 scale
+    // below), the weight codes are read from the very image the device reads (the resident BO's host
+    // mapping), the sums are int32, and the epilogue is the loop below's, term for term. The tiles are
+    // independent, so they are split over a few threads (NPU_HEAD_HOST_THREADS, default 4, at most 16).
+    // A tile the kernel refuses (a geometry with no image) sends the whole head to the device as before.
+    // NPU_HEAD_HOST=alt is the measuring form: calls alternate host, device, host, ... in ONE serve, and each
+    // call logs the previous one's head time and the time from its end to this call (the layers of the token in
+    // between). Two serves on a shared box differ by more than the head costs; adjacent tokens of one serve do not.
+    // On unless NPU_HEAD_HOST=0: measured on two models with byte-identical logits (docs/npu.md), and the window11
+    // row comparison accepts its `HEAD M=1` profile row. Any value other than 0 or alt reads as on.
+    static const int head_host_mode = [] {
+        const char* e = getenv("NPU_HEAD_HOST");
+        if (!e) return 1;
+        if (e[0] == '0' && e[1] == 0) return 0;
+        return std::strcmp(e, "alt") == 0 ? 2 : 1;
+    }();
+    static long head_calls = 0;
+    const bool head_host = head_host_mode == 1 || (head_host_mode == 2 && (head_calls % 2) == 0);
+    struct HeadAb {
+        bool on, host;
+        std::chrono::steady_clock::time_point t0;
+        ~HeadAb() {
+            if (!on) return;
+            static std::chrono::steady_clock::time_point prev_end{};
+            const auto t1 = std::chrono::steady_clock::now();
+            const double gap = prev_end.time_since_epoch().count()
+                                   ? std::chrono::duration<double, std::milli>(t0 - prev_end).count() : -1.0;
+            fprintf(stderr, "[head-ab] call=%ld head=%s head_ms=%.2f layers_before_ms=%.2f\n", head_calls, host ? "host" : "device",
+                    std::chrono::duration<double, std::milli>(t1 - t0).count(), gap);
+            prev_end = t1;
+            head_calls++;
+        }
+    } head_ab{head_host_mode == 2, head_host, std::chrono::steady_clock::now()};
+    if (head_host && head_packed && !head_pb16i && !lctx.gemv && H <= (int)lctx.KD && T <= (int)lctx.ND) {
+        const auto hh0 = std::chrono::steady_clock::now();
+        float amax = 0.0f;
+        for (int k = 0; k < H; k++) { float a = std::fabs(hs[(size_t)k]); if (a > amax) amax = a; }
+        const float as = amax > 0 ? amax / 127.0f : 1.0f;
+        std::vector<int8_t> a8((size_t)H);
+        q4nx_quant_i8::row(hs.data(), H, 1.0f / as, a8.data());
+        std::vector<const int8_t*> images((size_t)ntiles, nullptr);
+        bool mapped = true;
+        for (int t = 0; t < ntiles; t++) {
+            images[(size_t)t] = (const int8_t*)lm_head_packed_[(size_t)t].bo->map();
+            mapped = mapped && images[(size_t)t] != nullptr;
+        }
+        static const int head_threads = [] {
+            const char* e = getenv("NPU_HEAD_HOST_THREADS");
+            const int n = e ? atoi(e) : 4;
+            return n < 1 ? 1 : (n > 16 ? 16 : n);
+        }();
+        const int nthreads = std::min(head_threads, ntiles);
+        std::vector<char> tile_ok((size_t)ntiles, 0);
+        const bool blocked = lctx.blocked_b;
+        const int KD = (int)lctx.KD, ND = (int)lctx.ND;
+        auto work = [&](int w) {
+            std::vector<int32_t> acc((size_t)T);
+            for (int t = w; t < ntiles; t += nthreads) {
+                const int n0 = t * T, n1 = std::min(NV, n0 + T);
+                if (!q4nx_host_head::tile(images[(size_t)t], KD, ND, blocked, a8.data(), H, n1 - n0, acc.data())) continue;
+                const std::vector<float>& gs = lm_head_packed_[(size_t)t].scales;
+                for (int n = n0; n < n1; n++) {
+                    float v = (float)acc[(size_t)(n - n0)] * as * gs[(size_t)(n - n0)];
+                    if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                    logits[(size_t)n] = v;
+                }
+                tile_ok[(size_t)t] = 1;
+            }
+        };
+        bool all = mapped;
+        if (mapped) {
+            std::vector<std::thread> pool;
+            for (int w = 1; w < nthreads; w++) pool.emplace_back(work, w);
+            work(0);
+            for (auto& th : pool) th.join();
+            for (int t = 0; t < ntiles; t++) all = all && tile_ok[(size_t)t];
+        }
+        if (all) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hh0).count();
+            static bool said = false;
+            if (!said) {
+                said = true;
+                fprintf(stderr, "  [forward] lm head: on the host (%s), %d tile(s), %d thread(s), first pass %.1f ms\n",
+                        head_host_mode == 2 ? "NPU_HEAD_HOST=alt" : "default; NPU_HEAD_HOST=0 for the device", ntiles, nthreads, ms);
+            }
+            if (xd_->profiling()) xd_->note_head(1, ms, 0.0, 0.0, 0.0);
+            if (ph) { g_ph.h_pack += ms; g_ph.h_total = ph_ms(hp0); g_in_head = false; }
+            return true;
+        }
+        fprintf(stderr, "  [forward] lm head: the image cannot be read on the host; using the device\n");
     }
     for (int t = 0; t < ntiles; t++) {
         const int n0 = t * T, n1 = std::min(NV, n0 + T);

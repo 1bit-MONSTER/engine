@@ -24,6 +24,9 @@
 #   tools/bench-preflight.sh                    check the box; FATAL and exit 1 if a number would lie
 #   tools/bench-preflight.sh --strict           every warning becomes fatal
 #   tools/bench-preflight.sh --need-gtt GiB     also fatal if the die has less than GiB free GTT
+#   tools/bench-preflight.sh [--drop-gib N] --watch -- CMD...
+#                                               gate, then run CMD under tools/bench-arm.sh: memory start/min/end,
+#                                               FAIL if MemAvailable fell below the floor or by more than N GiB
 #   tools/bench-preflight.sh --dispatch B N     then one GGML_HRX_LOG_DISPATCH=1 pass of `B -p N` and
 #                                               the matcher each MUL_MAT took
 #
@@ -47,18 +50,22 @@ set -uo pipefail
 
 busy_pct=5
 busy_window=10
-ram_floor_gib=20
+ram_floor_gib=${BENCH_RAM_FLOOR_GIB:-20}
 uptime_floor=600
 
 die=/sys/class/drm/card0/device
 here=$(dirname "$0")
 strict=0
 need_gtt=0
+watch=0
+drop_gib=${BENCH_DROP_GIB:-0}
 
 while [ $# -gt 0 ]; do
     case $1 in
         --strict) strict=1; shift ;;
         --need-gtt) need_gtt=${2:?--need-gtt needs a GiB value}; shift 2 ;;
+        --drop-gib) drop_gib=${2:?--drop-gib needs a GiB value}; shift 2 ;;
+        --watch) watch=1; shift; [ "${1:-}" = "--" ] && shift; break ;;
         --dispatch) break ;;
         *) echo "bench-preflight: unknown option $1" >&2; exit 2 ;;
     esac
@@ -127,6 +134,20 @@ if [ -n "$warned" ] && [ "$strict" = 1 ]; then
     fatal "the box is usable but not clean, and --strict was asked for"
 fi
 
+# --watch: the start gate says nothing about the rest of the run. engine#572's second arm started at 85 GiB
+# available, another load arrived, MemAvailable fell to 1-3 GiB with swap full, and the arm timed out at 540 s
+# -- so the number that came back (a timeout) and the number that did not (the arm) were both produced on a box
+# nobody had described. Sample for the whole command and report start/min/end, so an arm is either clean or
+# visibly contaminated where its number is printed.
+if [ "$watch" = 1 ]; then
+    # engine#572: the start gate describes the wrong moment -- a mid-arm load can take MemAvailable from 85 GiB to
+    # 1-3 GiB and the arm times out, so the number is produced on a box nobody described. The sampler lives in its own
+    # tool so it can be tested on a busy box (this gate would refuse to reach it).
+    [ $# -gt 0 ] || { echo "bench-preflight: --watch needs a command after --" >&2; exit 2; }
+    # Both tests reach the arm: the floor, and the drop (--drop-gib N before --watch, or BENCH_DROP_GIB; 0 = off).
+    exec "$here/bench-arm.sh" --floor "$ram_floor_gib" --drop-gib "$drop_gib" -- "$@"
+fi
+
 printf 'bench-preflight: OK\n'
 printf '  kernel     %s\n' "$(uname -r)"
 printf '  uptime     %ss  gpu_busy %s%%  mem_avail %s GiB\n' "$up_s" "$busy" "$avail_gib"
@@ -167,7 +188,80 @@ case "$lm" in
     *) fatal "PREFLIGHT_LM='$lm' is not a llama-bench load mode (none|mmap|mlock|mmap+mlock|dio); the mode is part of the measurement, so it is not guessed (engine #1668)" ;;
 esac
 GGML_HRX_LOG_DISPATCH=1 "$bench" -m "$model" -p "$tokens" -n 0 -ngl 99 --device HRX0 -r 3 -lm "$lm" \
-    >/dev/null 2>"$log"
+    >/dev/null 2>"$log" &
+bench_pid=$!
+# The bench is a background child from here on, so nothing ends it when this script ends unless the script does: a
+# signalled preflight (a ticket that ends, Ctrl-C, an operator's kill) or a refusal below would otherwise leave it on the
+# GPU with no owner. Every way out goes through EXIT, and EXIT stops the bench and waits for it before the log goes.
+# TERM first, at most 5 s for the bench to go, then KILL, then reap: a bench that ignores TERM (wedged in the device) must
+# not hang this trap, because a ticket that then kills the shell leaves the same orphan. A child that has exited stays a
+# zombie until it is waited for and still answers `kill -0`, so "gone" is read from its state. bench_pid is emptied once
+# the bench is reaped, here or below, so a pid the system has handed to another process is never signalled.
+stop_bench() {
+    [ -n "${bench_pid:-}" ] || return 0
+    kill "$bench_pid" 2>/dev/null
+    local n=0
+    while [ "$n" -lt 50 ] && kill -0 "$bench_pid" 2>/dev/null &&
+          ! grep -q '^State:[[:space:]]*Z' "/proc/$bench_pid/status" 2>/dev/null; do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    kill -KILL "$bench_pid" 2>/dev/null
+    wait "$bench_pid" 2>/dev/null
+    bench_pid=
+}
+trap 'stop_bench; rm -f "$log"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# The mode is REQUESTED above and OBSERVED here (engine #1668): llama.cpp puts a model it mmaps in `/proc/<pid>/maps` and a
+# model it only reads is not there, so the run can be checked against the flag instead of trusted to honour it. A bench that
+# ignores `-lm` yields a number the header mislabels, which is the same defect as an unstated mode -- one variable measured,
+# two reported.
+# What counts as seen. A MAPPING is the model's resolved path as a whole pathname in the maps file: a basename would also
+# accept another directory's file of the same name, and would miss a model given through a symlink. An ABSENCE is one sample
+# where the bench was already dispatching before the maps file was read and was still running after it: before the first
+# dispatch the model may simply not be loaded yet, and a read of a process that has gone is a failed read, not an empty one.
+real=$(realpath -- "$model")
+in_maps() {
+    awk -v p="$real" '{ i = index($0, "/"); if (i && substr($0, i) == p) { f = 1; exit } } END { exit !f }' \
+        "/proc/$bench_pid/maps" 2>/dev/null
+}
+running() {
+    kill -0 "$bench_pid" 2>/dev/null && ! grep -q '^State:[[:space:]]*Z' "/proc/$bench_pid/status" 2>/dev/null
+}
+absent_need=3
+mapped=no; absent=0
+while :; do
+    dispatching=no
+    grep -q 'ggml_hrx dispatch:' "$log" 2>/dev/null && dispatching=yes
+    in_maps && { mapped=yes; break; }
+    running || break
+    [ "$dispatching" = yes ] && absent=$((absent + 1))
+    sleep 0.1
+done
+bench_rc=0
+wait "$bench_pid" || bench_rc=$?
+bench_was=$bench_pid          # for the messages below; the process is reaped, so the trap has nothing left to stop
+bench_pid=
+[ "$bench_rc" -eq 0 ] || fatal "the bench exited $bench_rc; see $log"
+# Only the modes whose mapping is unambiguous are asserted: `mmap`/`mmap+mlock` map, `none`/`dio` do not, and `mlock` alone is
+# not asserted because whether it maps depends on the loader -- a gate that guessed would fail a correct run. An OBSERVED
+# mapping is trusted on its own. An absent one is trusted only after $absent_need samples of the kind described above, because
+# a bench that maps, runs and exits between two polls leaves no mapping to see and has still honoured `-lm mmap`: refusing it
+# would refuse a correct run. Anything short of that is said as a WARN and the tally goes ahead, unchecked and labelled so.
+verdict=unseen
+[ "$mapped" = yes ] && verdict=mapped
+[ "$mapped" = no ] && [ "$absent" -ge "$absent_need" ] && verdict=absent
+case "$lm:$verdict" in
+    mmap:absent|mmap+mlock:absent)
+        fatal "the load mode is -lm $lm but the model is not in /proc/$bench_was/maps; the run is not the measurement the header claims (engine #1668)" ;;
+    none:mapped|dio:mapped)
+        fatal "the load mode is -lm $lm but the model IS in /proc/$bench_was/maps; the run is not the measurement the header claims (engine #1668)" ;;
+    mlock:*) ;;
+    *:unseen)
+        printf '  WARN the bench finished before the load mode could be observed; -lm %s not checked\n' "$lm" ;;
+esac
 
 lines=$(grep -c 'ggml_hrx dispatch:' "$log" || true)
 # A silent bench is the failure this flag exists to catch: an empty tally looks like "nothing declined"

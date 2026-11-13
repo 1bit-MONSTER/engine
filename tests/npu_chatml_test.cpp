@@ -154,6 +154,21 @@ int main(int argc, char** argv) {
         check(pin_probe_messages(oreq).size() == 2, "the same for the ordered JSON the template path uses");
     }
 
+    // A text route on a decision-only pack (engine#1786, D3-Nano-NPU2): a 400 that names the right route
+    {
+        const nlohmann::json up = onebit::npu::decision_only_refusal("D3-Nano-NPU2", true);
+        const std::string m = up["error"]["message"].get<std::string>();
+        check(m.find("D3-Nano-NPU2") == 0 && m.find("does not generate text") != std::string::npos &&
+                  m.find("POST /v1/systemone") != std::string::npos,
+              "the refusal names the model, says it does not generate text, and names the decision route");
+        check(up["error"]["type"] == "decision_model_error", "and carries a type a client can match on");
+        const std::string none = onebit::npu::decision_only_refusal("x", false)["error"]["message"].get<std::string>();
+        check(none.find("POST /v1/systemone") == std::string::npos && none.find("no decision head") != std::string::npos,
+              "with no head loaded it does not send the client to a route that would answer 503");
+        check(m.find("forward step failed") == std::string::npos && m.find("position") == std::string::npos,
+              "none of the forward's internal wording reaches the client");
+    }
+
     if (failures == 0) std::printf("npu_chatml: ok\n");
     return failures == 0 ? 0 : 1;
 }

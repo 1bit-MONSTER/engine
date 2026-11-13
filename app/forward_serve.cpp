@@ -34,6 +34,10 @@
 // Requests run one at a time: the forward holds one KV cache, and each request
 // resets it from position 0.
 #include "forward_serve.h"
+#include "q4nx_cache.h"   // engine#2263: the sweep after a forward load
+
+#include "../npu/forward/include/file_create.h"   // dumps are created 0600, never through a symlink
+#include "npu_decode_note.h"
 
 #include "../npu/forward/include/q4nx_forward.h"
 #include "../npu/target/xdna/xdna_target.h"  // XdnaTarget::kName for --npu-target
@@ -46,11 +50,14 @@
 #include "npu_prefix_cache.h"
 #include "npu_prompt_ids.h"
 #include "npu_sampling.h"
+#include "npu_spec_sampler.h"
 #include "npu_stop_tokens.h"
 #include "stream_bridge.h"
 #include "npu_systemone.h"
 #include "tokenizer.h"
 #include "../npu/decision.h"  // the d3 readout head (npu/decision.h, issue #653)
+#include "../npu/mtp/prompt_lookup.h"  // --spec-lookup: the speculative loop with a prompt-lookup drafter (#1781)
+#include "../npu/dflash_head.h"        // --spec-draft: the same loop with a DFlash draft package (#1781)
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
 #include <httplib.h>
@@ -72,6 +79,7 @@
 #include <vector>
 
 namespace onebit {
+
 
 namespace {
 
@@ -135,6 +143,29 @@ struct ForwardEngine {
     // KL-divergence comparison against another stack (engine#671 gate b) needs the distribution
     // itself.  Empty means off, which is the default: nothing is written unless asked.
     std::string dump_logits;
+    // --spec-lookup K (engine#1781): a greedy request (grammar or not) decodes through mtp::run_from() with
+    // the prompt-lookup drafter, up to K drafts verified per batch; 0 = off (the default). --spec-fallback X: stop
+    // drafting for the rest of a reply once its last 3 rounds averaged fewer than X tokens (0 = never). Unset, it
+    // defaults to 2 with the lookup drafter and 3 with a draft model: below that a round costs more than the plain steps
+    // it replaces (served 27B, prose, A B A B: a draft that keeps 2.24 tokens per round ran 2.51 tok/s with no fallback
+    // against 3.88 with the default, which stops drafting after round 5).
+    int spec_lookup = 0;
+    double spec_fallback = 0.0;
+    // --spec-sample: a sampled request (temperature > 0) takes the speculative path too, its drafts kept or refused by
+    // the rule that keeps the target's distribution (npu/mtp/spec_accept.h through mtp::RowSampler). Off by default: the
+    // reply then follows the same distribution but not the plain loop's random stream, so a seed gives a different
+    // reply than it does without the flag.
+    bool spec_sample = false;
+    bool host_gemm = false;   // NPU_INFER_HOST_GEMM: the forward runs on the host, with no launch width of its own
+    // --spec-draft <dir> (engine#1781): a DFlash draft package as the drafter instead of the prompt lookup, up to
+    // spec_draft_k drafts a round. The forward writes the draft's tap layers into draft_taps on every pass; the sink
+    // is emptied at the start of each request, so a request that resumed from a saved prefix has no rows for the
+    // positions it did not run, and its head refuses to draft (it decodes with plain steps, the same text).
+    std::unique_ptr<npu::dflash::DraftModel> draft;
+    npu::dflash::DraftWeights draft_w;
+    std::vector<float> draft_hproj;   // generation 2: the selector's hidden projection, decoded once
+    std::vector<float> draft_taps;
+    int spec_draft_k = 0;
     // The dump's response index. `step_<n>.bin` used the decode index alone, so a second request overwrote the first
     // request's steps: a multi-prompt comparison (the KLD row, engine#803) then silently compared only the LAST prompt's
     // dumps and looked complete. Numbering the response too makes the set of files say how many responses it holds.
@@ -153,6 +184,10 @@ struct CallStats {
     double prompt_ms = 0;
     double predicted_ms = 0;
     npu::PrefixDecision prefix{-1, 0, "off"};  // "off" when --prefix-slots 0
+    // engine#2111: each generated token's text, in order, and how many of them were reasoning. -1 = not counted (a
+    // /v1/completions reply is raw text with no split), so the usage object then carries no details at all.
+    std::vector<std::string> pieces;
+    int reasoning_tokens = -1;
 };
 
 // One generated token's log-probability entry, with the text that token produced.  The two travel
@@ -232,12 +267,13 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 // template that serializes its input (a tools block through `tojson`) renders the
                 // request's key order into the prompt, so it has to be the caller's order, not ours.
                 const nlohmann::ordered_json ordered = nlohmann::ordered_json::parse(req.body);
-                nlohmann::ordered_json extra = nlohmann::ordered_json::object();
-                if (ordered.contains("chat_template_kwargs") && ordered["chat_template_kwargs"].is_object())
-                    extra = ordered["chat_template_kwargs"];
-                extra["enable_thinking"] = npu::thinking_from_body(body);
-                prompt = npu::render_chat_template(e.tmpl, ordered.at("messages"), /*add_generation_prompt=*/true,
-                                                   extra, e.bos_text, e.eos_text);
+                // The functions the request offers go the same way (npu::request_template_vars): the
+                // template is where a model learns what it may call.
+                const nlohmann::ordered_json extra = npu::request_template_vars(ordered, npu::thinking_from_body(body));
+                // An earlier call's arguments arrive as a JSON string; the template is written against the
+                // object (npu::messages_for_template).
+                prompt = npu::render_chat_template(e.tmpl, npu::messages_for_template(ordered.at("messages")),
+                                                   /*add_generation_prompt=*/true, extra, e.bos_text, e.eos_text);
                 if (e.prefix_pin) {
                     // A template that cannot render the probe is no reason to refuse the request: it only means
                     // there is no early pin, and the log says so.
@@ -337,6 +373,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         if (room < 1) throw ContextOverflow(ids.size(), e.max_context);
         const int limit = std::clamp(max_tokens, 0, room);
         std::lock_guard<std::mutex> lock(e.mu);
+        e.draft_taps.clear();   // --spec-draft: this request's tap rows start at its first position run
 
         const auto t_request = std::chrono::steady_clock::now();
         std::vector<float> logits;
@@ -482,20 +519,23 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // unconditionally allowed (engine#1182: the model drifts into them once the grammar leaves it
         // nothing to say, and they emit no text and never end the reply).
         const size_t vocab = size_t(e.tok->size());
-        auto refresh_allowed = [&]() {
-            allowed.assign(logits.size(), 0);
-            const npu::ByteMask first = gram->next_bytes(grammar_state);
+        // The mask in any grammar state: the plain loop's (refresh_allowed) and, for each draft of a speculative round,
+        // the state after the drafts before it (ServeConstraint below).
+        auto mask_for = [&](const npu::Grammar::State& st, std::vector<char>& out) {
+            out.assign(logits.size(), 0);
+            const npu::ByteMask first = gram->next_bytes(st);
             for (size_t i = 0; i < logits.size() && i < vocab; i++) {
                 const std::string& t = e.tok_text[i];
                 if (t.empty()) {
-                    allowed[i] = 1;  // a half-character byte fragment cannot leave the grammar
+                    out[i] = 1;  // a half-character byte fragment cannot leave the grammar
                 } else if (first.has(static_cast<unsigned char>(t[0]))) {
-                    npu::Grammar::State probe = grammar_state;
-                    allowed[i] = gram->feed(probe, t) ? 1 : 0;
+                    npu::Grammar::State probe = st;
+                    out[i] = gram->feed(probe, t) ? 1 : 0;
                 }
             }
-            npu::allow_end_tokens(allowed, grammar_state, end_ids);
+            npu::allow_end_tokens(out, st, end_ids);
         };
+        auto refresh_allowed = [&]() { mask_for(grammar_state, allowed); };
 
         std::string pending;  // decoded, not yet sent: a stop sequence may still match in it
         // Entries whose bytes are still held in `pending`, each with the bytes of its piece not yet
@@ -520,41 +560,32 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         };
         bool stopped_at_eos = false, stopped_at_stop = false;
         int produced = 0;
-        for (int n = 0; n < limit; n++) {
-            // the client is gone: free the NPU (the bridge knows first when a write to it failed)
-            if (req.is_connection_closed() || (bridge && bridge->cancelled())) break;
-            if (gram) refresh_allowed();
-            // Raw distribution for a reference comparison: sample_token() takes logits by const
-            // reference and the copy below happens before it runs, so what lands on disk is what
-            // the model produced, not what the sampler chose.
-            if (!e.dump_logits.empty()) {
-                const std::string path = e.dump_logits + "/step_" + std::to_string(dump_req) + "_" +
-                                          std::to_string(n) + ".bin";
-                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
-                    std::fwrite(logits.data(), sizeof(float), logits.size(), f);
-                    std::fclose(f);
-                }
-            }
-            const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr, e.tok->size());
-            // -1: the grammar allows no token here, so the answer ends where it is.  An end token is
-            // in the mask only where the grammar can stop (refresh_allowed), so a constrained reply
-            // that completes reports "stop" instead of padding to the budget (engine#1182).
-            if (next < 0) { stopped_at_eos = true; break; }
+        // One chosen token through the reply: the end tokens, the grammar, the stop sequences and the hold-back that
+        // keeps a partial stop match unsent. false = the reply ends here (an end token, a stop sequence, or a client
+        // that stopped reading). The plain loop and the speculative one hand every token to this, in order.
+        // `row` is the logits row `next` was chosen from (the head's full width); null means `logits`.
+        auto deliver = [&](int next, const float* row = nullptr) -> bool {
             if (std::find(e.eos.begin(), e.eos.end(), next) != e.eos.end() ||
-                (e.endoftext >= 0 && next == e.endoftext)) { stopped_at_eos = true; break; }
+                (e.endoftext >= 0 && next == e.endoftext)) { stopped_at_eos = true; return false; }
             if (gram) gram->feed(grammar_state, e.tok_text[next]);
             const std::string piece = e.tok->decode(next);
             pending += piece;
             // Raw distribution: sample_token() takes logits by const reference, so this is
-            // pre-top_k/top_p/temperature and the grammar mask cannot narrow it.
+            // pre-top_k/top_p/temperature and the grammar mask cannot narrow it.  Over the tokenizer's ids only, as
+            // sample_token() draws: a row is as wide as the head, which can be wider (Qwen3 151,936 against 151,669,
+            // engine#2272), and the padding would join the normaliser and could be named in top_logprobs.
             if (want_lp)
-                held.emplace_back(Emitted{piece, npu::logprobs_of(logits, next, opts.sample.top_logprobs)}, piece.size());
+                held.emplace_back(Emitted{piece, npu::logprobs_of(row ? row : logits.data(),
+                                                                  npu::token_bound(logits.size(), e.tok->size()), next,
+                                                                  opts.sample.top_logprobs)},
+                                  piece.size());
+            stats.pieces.push_back(piece);   // engine#2111: reasoning_tokens is counted over these
             ++produced;
             const size_t stop_at = npu::find_stop(pending, opts.stop);
             if (stop_at != std::string::npos) {
                 if (stop_at > 0) on_text(pending.substr(0, stop_at), take_held(stop_at));
                 stopped_at_stop = true;
-                break;
+                return false;
             }
             // Send what no stop sequence can still match, and keep the tail: the next
             // token may complete a match that starts in it.
@@ -565,8 +596,131 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             if (emit > 0) {
                 const std::string out = pending.substr(0, emit);
                 pending.erase(0, emit);
-                if (!on_text(out, take_held(emit))) break;
+                if (!on_text(out, take_held(emit))) return false;
             }
+            return true;
+        };
+        // engine#1781: the speculative path, only where it cannot change a token. Greedy, so each token is the bounded
+        // argmax the verify rows check drafts against; no logit dump (it writes one file per decode step). A grammar
+        // goes through the sampler: each draft is checked in the grammar state after the drafts before it, the token
+        // the round emits is the masked choice, and so a constrained greedy reply is still the plain loop's. The text is then the plain loop's token for token -- what
+        // tests/serve_spec_lookup_test.py holds it to. Logprobs are reported from the row each token came from
+        // (Options::on_token_row), the base's own logits at that position, as the plain loop reports them.
+        // --spec-sample widens it to sampled requests, whose drafts are then judged by the distribution-keeping rule
+        // instead (npu::SpecSampler): the reply follows the same distribution as the plain loop's, not its stream.
+        const bool spec = (e.spec_lookup > 0 || e.draft) && (opts.sample.greedy() || e.spec_sample) &&
+                          e.dump_logits.empty();
+        if (spec) {
+            struct ServeBase : npu::mtp::BaseModel {
+                Q4nxNpuForward& f;
+                int nv, width, rows;
+                ServeBase(Q4nxNpuForward& fw, int v, int w, int r) : f(fw), nv(v), width(w), rows(r) {}
+                int vocab() const override { return nv; }
+                // The forward's rows are the head's width (M x NV), wider than vocab() (the tokenizer's bound)
+                // whenever the head carries padding ids (Qwen3: 151,936 against 151,669); the loop strides by this.
+                int row_stride() const override { return width; }
+                int hidden_size() const override { return int(f.last_hidden().size()); }
+                int max_batch_rows() const override { return rows; }
+                bool step(int t, int p, std::vector<float>& l) override { return f.step(t, p, l); }
+                bool step_batch_all(const std::vector<int>& t, int s0, std::vector<float>& l) override {
+                    f.begin_verify(int(t.size()), s0);
+                    return f.step_batch_all(t, s0, l) && l.size() == t.size() * size_t(width);
+                }
+                bool commit_verify(int a) override { return f.commit_verify_rows(a); }
+                const std::vector<float>& last_hidden() const override { return f.last_hidden(); }
+            };
+            // The bound sample_token() applies: ids past the tokenizer are padding and never chosen (engine#2017).
+            // The device verifies as many rows as its kernels are wide; host GEMMs have no width, and 1 (what the
+            // forward reports there) would leave no row for a draft, so host mode verifies the device's 16.
+            ServeBase base(*e.fwd, int(npu::token_bound(logits.size(), e.tok->size())), int(logits.size()),
+                           e.host_gemm ? 16 : e.fwd->max_batch_rows());
+            npu::mtp::PromptLookupHead lookup(ids);
+            std::unique_ptr<npu::dflash::DFlashHead> dflash;
+            if (e.draft) {
+                const int bound = int(npu::token_bound(logits.size(), e.tok->size()));
+                npu::dflash::HeadHooks hooks;
+                hooks.embed = [&e](int t, std::vector<float>& row) {
+                    e.fwd->embed_row(t, row);
+                    return !row.empty();
+                };
+                // The target's own head on the drafted row, then the package's rule: DFlash 2's selector when it has
+                // one, else the head's choice, bounded like sample_token().
+                hooks.pick = [&e, bound](const float* h, int prev) {
+                    std::vector<float> hv(h, h + e.draft_w.hidden), lg;
+                    if (!e.fwd->lm_head_logits(hv, lg) || lg.empty()) return -1;
+                    if (e.draft->cfg.generation >= 2) return npu::dflash::dflash2_select(*e.draft, e.draft_hproj, h, prev, lg, bound);
+                    return npu::argmax_token(lg.data(), lg.size(), bound);
+                };
+                dflash = std::make_unique<npu::dflash::DFlashHead>(e.draft_w, e.draft_taps, hooks,
+                                                                   int(e.draft->cfg.mask_token_id),
+                                                                   e.draft->cfg.block_size, e.draft->cfg.sliding_window);
+            }
+            npu::mtp::DraftHead& head = dflash ? static_cast<npu::mtp::DraftHead&>(*dflash) : lookup;
+            // The grammar as a TokenConstraint: the committed state is grammar_state, which deliver() advances as
+            // tokens are emitted; a round starts from a copy of it and moves the copy past each kept draft.
+            struct ServeConstraint : npu::TokenConstraint {
+                const std::function<void(const npu::Grammar::State&, std::vector<char>&)> mask;
+                const npu::Grammar& g;
+                const npu::Grammar::State& committed;
+                const std::vector<std::string>& text;
+                npu::Grammar::State round;
+                ServeConstraint(std::function<void(const npu::Grammar::State&, std::vector<char>&)> m,
+                                const npu::Grammar& gr, const npu::Grammar::State& c, const std::vector<std::string>& t)
+                    : mask(std::move(m)), g(gr), committed(c), text(t) {}
+                void mask_committed(std::vector<char>& out) override { mask(committed, out); }
+                void begin_round() override { round = committed; }
+                void mask_round(std::vector<char>& out) override { mask(round, out); }
+                void advance_round(int t) override {
+                    if (t >= 0 && size_t(t) < text.size()) g.feed(round, text[size_t(t)]);
+                }
+            };
+            std::unique_ptr<ServeConstraint> constraint;
+            if (gram) constraint = std::make_unique<ServeConstraint>(mask_for, *gram, grammar_state, e.tok_text);
+            // Sampled or constrained requests choose through it (npu_spec_sampler.h); plain greedy ones need none.
+            npu::SpecSampler sampler(opts.sample, rng, constraint.get());
+            npu::mtp::Options o;
+            o.k = e.draft ? e.spec_draft_k : e.spec_lookup;
+            o.max_tokens = limit;
+            o.tau = 0.0f;
+            o.fallback_below = e.spec_fallback;
+            o.consume_last = false;   // the plain loop does not run the reply's last token either
+            o.sampler = (opts.sample.greedy() && !gram) ? nullptr : &sampler;
+            // Each token with the row it came from, so a request with logprobs reports them from the same row the
+            // plain loop would have: the base's own logits at that position, at the head's full width.
+            o.on_token_row = [&](int t, const float* row) {
+                if (req.is_connection_closed() || (bridge && bridge->cancelled())) return false;
+                return deliver(t, row);
+            };
+            const npu::mtp::Result r = npu::mtp::run_from(base, &head, int(ids.size()), logits, o);
+            if (!r.ok) throw std::runtime_error("speculative decode: " + r.err);
+            // the grammar allowed no token: the answer ends where it is, as the plain loop's -1 does
+            if (r.sampler_ended) stopped_at_eos = true;
+            std::fprintf(stderr, "[spec] %s%s %d tokens: %d rounds, %d of %d drafts accepted, %d plain steps%s\n",
+                         e.draft ? "dflash" : "lookup", gram ? " grammar" : o.sampler ? " sampled" : "", int(r.tokens.size()), r.stats.batches, r.stats.accepted, r.stats.drafted, r.stats.steps,
+                         r.stats.fell_back_at >= 0 ? (", fell back after round " + std::to_string(r.stats.fell_back_at)).c_str()
+                                                   : "");
+        }
+        for (int n = 0; !spec && n < limit; n++) {
+            // the client is gone: free the NPU (the bridge knows first when a write to it failed)
+            if (req.is_connection_closed() || (bridge && bridge->cancelled())) break;
+            if (gram) refresh_allowed();
+            // Raw distribution for a reference comparison: sample_token() takes logits by const
+            // reference and the copy below happens before it runs, so what lands on disk is what
+            // the model produced, not what the sampler chose.
+            if (!e.dump_logits.empty()) {
+                const std::string path = e.dump_logits + "/step_" + std::to_string(dump_req) + "_" +
+                                          std::to_string(n) + ".bin";
+                if (std::FILE* f = onebit_fopen_private_wb(path.c_str())) {   // 0600, no symlink (file_create.h)
+                    std::fwrite(logits.data(), sizeof(float), logits.size(), f);
+                    std::fclose(f);
+                }
+            }
+            const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr, e.tok->size());
+            // -1: the grammar allows no token here, so the answer ends where it is.  An end token is
+            // in the mask only where the grammar can stop (refresh_allowed), so a constrained reply
+            // that completes reports "stop" instead of padding to the budget (engine#1182).
+            if (next < 0) { stopped_at_eos = true; break; }
+            if (!deliver(next)) break;
             // No further token will be sampled after this one (limit reached), so the
             // decode step that would only produce the NEXT position's logits is a whole
             // weight stream -- 8.7 s on the 27B -- spent on a result nobody reads.  At
@@ -596,15 +750,19 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
 
     // OpenAI's usage object plus the two fields issue #650 reports: how many prompt tokens came
     // from a saved prefix, and what the cache decided (which slot, and why).
+    // engine#2111: the usage object is `onebit::usage_json_text()` now (app/forward_serve.h) - a pure function, so
+    // the rule "reasoning_tokens appears iff the route could count it" has known answers without an NPU
+    // (tests/serve_usage_test.cpp). The JSON stays here, where the rest of the reply is built.
     auto usage_json = [](const CallStats& st) {
-        return json{{"prompt_tokens", st.prompt_tokens},
-                    {"completion_tokens", st.completion_tokens},
-                    {"total_tokens", st.prompt_tokens + st.completion_tokens},
-                    {"prompt_tokens_details", {{"cached_tokens", st.prefix.cached_tokens}}},
-                    {"flm_prefix_cache", {{"slot", st.prefix.slot},
-                                          {"cached_tokens", st.prefix.cached_tokens},
-                                          {"reason", st.prefix.reason},
-                                          {"pinned", st.prefix.pinned}}}};
+        UsageCounters u;
+        u.prompt_tokens = st.prompt_tokens;
+        u.completion_tokens = st.completion_tokens;
+        u.cached_tokens = st.prefix.cached_tokens;
+        u.prefix_slot = st.prefix.slot;
+        u.prefix_reason = st.prefix.reason;
+        u.prefix_pinned = st.prefix.pinned;
+        u.reasoning_tokens = st.reasoning_tokens;
+        return json::parse(usage_json_text(u));
     };
 
     // OpenAI's logprobs.content entry: the token's text, its log-probability, and the most likely
@@ -625,6 +783,9 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     // markup whatever the container is (app/npu_tool_grammar.h), so that reply is split as qwen3.  Every
     // other reply is in the container's own markup.
     const npu::AnswerFamily family = opts.tool_grammar ? npu::AnswerFamily::qwen3 : e.answer_family;
+    // A template whose generation prompt already opens the reasoning block leaves the answer inside it
+    // (npu::prompt_opens_reasoning).  Only a rendered chat prompt can: an ids prompt and /v1/completions are raw.
+    const bool starts_in_reasoning = chat && !prompt_is_ids && npu::prompt_opens_reasoning(prompt, family);
     auto wrap = [&](const std::string& content, const std::string& finish, const std::vector<Emitted>& lps) {
         json out;
         out["id"] = id;
@@ -635,7 +796,8 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             // (issue #652 item 3) one shared parser splits what the model wrote into OpenAI's three
             // parts; a reply that is only tool calls says content: null.
             const npu::ParsedAnswer ans =
-                npu::parse_answer(content, family, opts.tools_sent);
+                npu::parse_answer(content, family, opts.tools_sent, starts_in_reasoning);
+            stats.reasoning_tokens = npu::reasoning_token_count(stats.pieces, family, opts.tools_sent, starts_in_reasoning);
             json message{{"role", "assistant"}};
             message["content"] = ans.content_null ? json(nullptr) : json(ans.content);
             if (!ans.reasoning.empty()) message["reasoning_content"] = ans.reasoning;
@@ -656,7 +818,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 std::vector<std::string> texts;
                 texts.reserve(lps.size());
                 for (const auto& x : lps) texts.push_back(x.text);
-                const std::vector<char> keep = npu::content_mask(texts, family, opts.tools_sent);
+                const std::vector<char> keep = npu::content_mask(texts, family, opts.tools_sent, starts_in_reasoning);
                 std::vector<Emitted> content_lps;
                 for (size_t i = 0; i < lps.size(); i++)
                     if (i < keep.size() && keep[i]) content_lps.push_back(lps[i]);
@@ -703,7 +865,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             };
             // The same splitter as the non-streamed path, fed piece by piece, so a streamed reply
             // and a non-streamed one cannot disagree about what is reasoning and what is content.
-            npu::AnswerStream stream(family, opts.tools_sent);
+            npu::AnswerStream stream(family, opts.tools_sent, starts_in_reasoning);
             auto emit_pieces = [&](const std::string& t, const std::vector<Emitted>& lp) {
                 std::vector<std::pair<bool, std::string>> pieces;
                 stream.feed(t, pieces);
@@ -764,6 +926,10 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             {
                 json tail = chunk_tpl;
                 tail["choices"] = json::array();
+                // engine#2111: the same count as the non-streamed reply's, over the same pieces.
+                if (chat)
+                    stats.reasoning_tokens =
+                        npu::reasoning_token_count(stats.pieces, family, opts.tools_sent, starts_in_reasoning);
                 tail["usage"] = usage_json(stats);
             tail["timings"] = timings_json(stats);
                 send("data: " + tail.dump() + "\n\n");
@@ -804,6 +970,12 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
 // this thread waits for the first frame or the end, and only then decides between an ordinary response -- the 400s
 // and 500s a request can earn before it has produced anything keep their status codes -- and a stream.
 void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Response& res, bool chat) {
+    // A non-causal decision pack has no decode to run (npu::decision_only_refusal): say so before any work.
+    if (e.fwd && e.fwd->noncausal()) {
+        res.status = 400;
+        res.set_content(npu::decision_only_refusal(e.id, e.head != nullptr).dump(), "application/json");
+        return;
+    }
     bool wants_stream = false;
     try {
         const json body = json::parse(req.body);
@@ -986,6 +1158,7 @@ int run_forward_ids(const std::string& model_dir, const std::string& kernels, co
     Q4nxNpuForward fwd;
     const bool ok = dev ? fwd.init(*dev, model.c_str(), kernels) : fwd.init_host(model.c_str(), kernels);
     if (!ok) throw std::runtime_error("forward init failed: " + std::string(fwd.last_error()));
+    q4nx_cache_sweep_after_load();   // engine#2263: the load wrote the device form and head images into the cache
     const int width = fwd.max_batch_rows();
     if (int(ids.size()) > width)
         std::fprintf(stderr, "1bit npu-run: %zu ids, so this runs in passes of %d rows (the kernel's width)\n", ids.size(),
@@ -1034,6 +1207,12 @@ int run_forward_serve(int argc, char** argv) {
     npu::PrefixOptions prefix_opts;  // --prefix-slots / --prefix-cache-mb / --prefix-min-gain (#650)
     bool prefix_pin = false;         // --prefix-pin (engine#1785)
     int ctx_size = 0;                // --ctx-size N: prompt plus answer, at most the model's own (0 = the model's)
+    int spec_lookup = 0;             // --spec-lookup K (engine#1781): prompt-lookup drafts, K per verify batch
+    double spec_fallback = 0.0;      // --spec-fallback X: stop drafting below X tokens per round
+    bool fallback_set = false;       // unset: the drafter's default (below)
+    bool spec_sample = false;        // --spec-sample: sampled requests speculate too (distribution-keeping rule)
+    std::string spec_draft;          // --spec-draft <dir>: a DFlash draft package as the drafter
+    int spec_draft_k = 0;            // --spec-draft-k K: drafts per round (default: the package's block - 1)
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -1053,10 +1232,28 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--npu-streams") streams = std::stoi(next());
         else if (a == "--npu-target") npu_target = next();
         else if (a == "--dump-logits") dump_logits = next();
+        else if (a == "--spec-lookup") spec_lookup = std::stoi(next());
+        else if (a == "--spec-fallback") { spec_fallback = std::stod(next()); fallback_set = true; }
+        else if (a == "--spec-sample") spec_sample = true;
+        else if (a == "--spec-draft") spec_draft = next();
+        else if (a == "--spec-draft-k") spec_draft_k = std::stoi(next());
         else throw std::runtime_error("unknown option " + a);
     }
     if (model.empty())
-        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N] [--npu-target xdna] [--dump-logits <dir>]");
+        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N] [--npu-target xdna] [--dump-logits <dir>] [--spec-lookup K | --spec-draft <dir> [--spec-draft-k K]] [--spec-fallback X] [--spec-sample]");
+    if (!spec_draft.empty() && spec_lookup > 0)
+        throw std::runtime_error("--spec-draft and --spec-lookup are two drafters; give one");
+    if (spec_draft_k != 0 && spec_draft.empty()) throw std::runtime_error("--spec-draft-k needs --spec-draft");
+    if (spec_lookup < 0 || spec_lookup > 15)
+        throw std::runtime_error("--spec-lookup takes 0..15 drafts per round (a verify batch holds at most 16 rows), not " +
+                                 std::to_string(spec_lookup));
+    if (!(spec_fallback >= 0.0)) throw std::runtime_error("--spec-fallback takes a number of tokens >= 0");
+    if (!fallback_set) spec_fallback = !spec_draft.empty() ? 3.0 : spec_lookup > 0 ? 2.0 : 0.0;
+    if (spec_lookup > 0 || !spec_draft.empty())
+        std::fprintf(stderr, "1bit forward-serve: speculative decode falls back to plain below %g tokens per round (%s)\n",
+                     spec_fallback, fallback_set ? "--spec-fallback" : "default");
+    if (spec_sample && spec_lookup == 0 && spec_draft.empty())
+        throw std::runtime_error("--spec-sample needs a drafter (--spec-lookup K or --spec-draft <dir>)");
     if (streams < 1 || streams > kNpuMaxStreams)
         throw std::runtime_error("--npu-streams takes 1.." + std::to_string(kNpuMaxStreams) +
                                  " (the device's hwctx limit), not " + std::to_string(streams));
@@ -1076,6 +1273,9 @@ int run_forward_serve(int argc, char** argv) {
 
     ForwardEngine e;
     e.id = alias.empty() ? std::filesystem::path(dir).filename().string() : alias;
+    e.spec_lookup = spec_lookup;
+    e.spec_fallback = spec_fallback;
+    e.spec_sample = spec_sample;
     if (!dump_logits.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(dump_logits, ec);
@@ -1087,6 +1287,22 @@ int run_forward_serve(int argc, char** argv) {
     e.tok = std::make_unique<npu::Tokenizer>(tok_json);
     e.bos_id  = json_int(cfg, "bos_token_id", -1);
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;
+    // config.json is the first source; what it does not state, tokenizer_config.json does (the BOS text, looked up
+    // in the tokenizer, and add_bos_token). Without this a Gemma3 pack was served with no BOS at all.
+    if (e.bos_id < 0 || json_int(cfg, "add_bos_token", -1) < 0) {
+        const nlohmann::json tc = npu::read_json_or_null(dir + "/tokenizer_config.json");
+        if (e.bos_id < 0) {
+            const std::string b = npu::special_token_text(tc, "bos_token");
+            if (!b.empty()) e.bos_id = e.tok->token_id(b);
+        }
+        if (json_int(cfg, "add_bos_token", -1) < 0) {
+            const int a = npu::add_bos_token_flag(tc);
+            if (a >= 0) e.add_bos = a != 0;
+        }
+        if (e.bos_id >= 0 && e.add_bos)
+            std::fprintf(stderr, "1bit forward-serve: BOS %d from tokenizer_config.json (config.json does not state it)\n",
+                         e.bos_id);
+    }
     e.eos = npu::eos_token_ids_from_config(cfg);
     const size_t eos_from_config = e.eos.size();
     e.endoftext = e.tok->token_id("<|endoftext|>");
@@ -1120,8 +1336,7 @@ int run_forward_serve(int argc, char** argv) {
                  e.tmpl.present() ? "" : " -- the chat route uses ChatML with anchors, else refuses");
     const bool can_render = e.tmpl.present() && npu::renderer_built();
     if (can_render) e.answer_family = npu::answer_family_of_template(e.tmpl.text);
-    std::fprintf(stderr, "1bit forward-serve: answer markup=%s\n",
-                 e.answer_family == npu::AnswerFamily::gemma4 ? "gemma4" : "qwen3");
+    std::fprintf(stderr, "1bit forward-serve: answer markup=%s\n", npu::answer_detail::family_name(e.answer_family));
     if (e.tmpl.present() && !npu::renderer_built())
         std::fprintf(stderr,
                      "1bit forward-serve: this build has no chat-template renderer (ONEBIT_JINJA=OFF), so the "
@@ -1149,9 +1364,27 @@ int run_forward_serve(int argc, char** argv) {
     // after the template, because whether the route renders ChatML is known only now.
     {
         const bool chatml_route = !can_render && e.chat_ok;
+        // The marker this route's prompts close an assistant turn with.  On the ChatML fallback it is <|im_end|>.
+        // With the container's own template it is read off the template: render a two-message exchange and take
+        // what follows the assistant's text (npu::turn_end_marker).  A template that cannot render that exchange
+        // contributes nothing, and the load line below shows what the serve stops on either way.
+        std::string turn_end = chatml_route ? std::string("<|im_end|>") : std::string();
+        if (can_render) {
+            static const char* const kProbe = "\xC2\xA4turn-end-probe\xC2\xA4";
+            try {
+                nlohmann::ordered_json exchange = nlohmann::ordered_json::array();
+                exchange.push_back({{"role", "user"}, {"content", "u"}});
+                exchange.push_back({{"role", "assistant"}, {"content", kProbe}});
+                const std::string rendered = npu::render_chat_template(e.tmpl, exchange, /*add_generation_prompt=*/false,
+                                                                       nlohmann::ordered_json::object(), e.bos_text, e.eos_text);
+                const size_t at = rendered.find(kProbe);
+                if (at != std::string::npos) turn_end = npu::turn_end_marker(rendered.substr(at + std::strlen(kProbe)));
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr, "1bit forward-serve: the template did not render a two-message exchange (%s); no turn-end marker from it\n", ex.what());
+            }
+        }
         e.eos = npu::stop_token_ids(npu::read_json_or_null(cfg), npu::read_json_or_null(dir + "/tokenizer_config.json"),
-                                    chatml_route ? std::string("<|im_end|>") : std::string(),
-                                    [&](const std::string& text) { return e.tok->token_id(text); });
+                                    turn_end, [&](const std::string& text) { return e.tok->token_id(text); });
         std::string named;
         for (size_t i = 0; i < e.eos.size(); i++)
             named += std::string(i ? ", " : "") + std::to_string(e.eos[i]) + " " + e.tok->decode(e.eos[i]) +
@@ -1199,6 +1432,7 @@ int run_forward_serve(int argc, char** argv) {
     // other lanes' device work.  Open the device, and the lock, only when the forward is
     // going to use it.
     const bool host_gemm = std::getenv("NPU_INFER_HOST_GEMM") != nullptr;
+    e.host_gemm = host_gemm;
     if (npu_lock_taken(!host_gemm, std::getenv("NPU_NO_DEVICE_LOCK") != nullptr))
         e.lock_fd = take_npu_device_lock(streams);
     std::unique_ptr<xrt::device> dev;
@@ -1215,6 +1449,9 @@ int run_forward_serve(int argc, char** argv) {
         }
         throw std::runtime_error(why);
     }
+    // engine#2263: loading a pack writes into the Q4NX cache (the device-form copy, the head images) and, until this, only a
+    // GGUF repack swept it -- so a box that serves packs, or runs reviews through npu-run, grew it without bound.
+    q4nx_cache_sweep_after_load();
 
     // A d3 pack keeps its decision head next to model.q4nx (npu/decision.h). Both files present means
     // the decision routes come up beside the chat ones; a pack without them is a chat model, which is
@@ -1327,6 +1564,30 @@ int run_forward_serve(int argc, char** argv) {
         // "hung". Measured cost is 44.5 s on a folded 27B pack, and `tests/serve_port.sh`'s helper defaults to a 30 s
         // budget -- a caller that only knows about `ready` would time out and report "serve never reported a port",
         // which is the misleading shape #1531/#1545 spent effort removing.
+        if (!spec_draft.empty()) {
+            // The draft is loaded once and checked against this target before the server says ready: a package
+            // for another model would otherwise fail only at the first greedy request's first draft.
+            auto dm = std::make_unique<npu::dflash::DraftModel>(npu::dflash::load_draft(spec_draft));
+            std::vector<float> row;
+            e.fwd->embed_row(0, row);
+            if (int(row.size()) != dm->cfg.hidden)
+                throw std::runtime_error("--spec-draft " + spec_draft + ": the draft is " + std::to_string(dm->cfg.hidden) +
+                                         " wide, this model " + std::to_string(row.size()));
+            if (!e.fwd->set_layer_taps(dm->cfg.target_layer_ids, &e.draft_taps))
+                throw std::runtime_error("--spec-draft " + spec_draft + ": its target layers do not fit this model");
+            const int most = dm->cfg.block_size - 1;
+            if (most < 1) throw std::runtime_error("--spec-draft " + spec_draft + ": block size " + std::to_string(most + 1));
+            if (spec_draft_k < 0 || spec_draft_k > most)
+                throw std::runtime_error("--spec-draft-k takes 1.." + std::to_string(most) + " for this package");
+            e.spec_draft_k = spec_draft_k > 0 ? spec_draft_k : most;
+            e.draft_w = npu::dflash::decode_draft(*dm);
+            if (dm->cfg.generation >= 2) e.draft_hproj = npu::dflash::decode_plain(dm->selector_hproj);
+            std::fprintf(stderr, "1bit forward-serve: speculative drafts from %s (DFlash %d, %d layers, taps",
+                         spec_draft.c_str(), dm->cfg.generation, dm->cfg.layers);
+            for (int l : dm->cfg.target_layer_ids) std::fprintf(stderr, " %d", l);
+            std::fprintf(stderr, "), up to %d per round\n", e.spec_draft_k);
+            e.draft = std::move(dm);
+        }
         std::fprintf(stderr, "1bit forward-serve: warming (weight cache; first request would otherwise pay it)\n");
         std::fflush(stderr);
         const auto t0 = std::chrono::steady_clock::now();
@@ -1356,6 +1617,13 @@ int run_forward_serve(int argc, char** argv) {
     // The target that is actually serving, so a log says which one answered rather than leaving it to the build.
     std::fprintf(stderr, " [npu-target=%s]", npu_target.c_str());
     std::fprintf(stderr, "\n");
+    // engine#2102: the machine line `[forward] decode family: …` stays byte-for-byte (gates grep it). This is the sentence
+    // an operator needs at the ready line's level when it says 0 of N -- the route that answers correctly and 50x slower.
+    {
+        const std::string note = onebit::npu::decode_family_note(e.fwd->decode_roles(), e.fwd->design_roles(), kernels,
+                                                                 e.fwd->decode_disabled(), e.fwd->decode_image());
+        if (!note.empty()) std::fprintf(stderr, "%s\n", note.c_str());
+    }
 
     while (true) std::this_thread::sleep_for(std::chrono::seconds(3600));
     return 0;

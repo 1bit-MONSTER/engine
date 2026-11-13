@@ -163,6 +163,18 @@ public:
     // forward and arrives through Setup, because deciding which sidecar file the head has is the container's
     // rule and not a target's.
     bool open_head(const Q4nxDesignGeom* designs, int n, std::string& err);
+    // The M=16 decode family (engine#803 A2b): for each role, resolve its `_m16` ELF under Setup::decode_dirs (or
+    // the sealed pb16i image in the kernels directory, whose instance name comes from q4nx_pb16i_instance), create
+    // the context and configure it.  `made`/`skipped` are what the forward logs its summary line from.  A role
+    // whose ELF is absent keeps its M=128 kernel (a slower path, not a missing one) EXCEPT under pb16i, where the
+    // int8 weights are not packed for these geometries and the load stops by name.  This is the per-role loop that
+    // lived in Q4nxNpuForward: it is ELF resolution and context creation, which a target owns.  The container's
+    // naming (`sealed_elf`, and the designs' elf_name) still arrives from the forward, and so do the wide and
+    // narrow sealed families, which the forward loads on top of the contexts this opens.
+    // `designs16` is mutable: a role with no decode kernel has its M zeroed, which is how the launch path knows
+    // to stay on M=128 -- the flag lives in the design, not in a parallel array.
+    bool open_decode_family(Q4nxDesignGeom* designs16, int n, const std::string& sealed_elf, int* made,
+                            int* skipped, std::string& err);
     // Whether open_head() found and opened the pb16i ternary head.  The model path reads this flag in four
     // places, so it stays the forward's; the target writes it.
     bool head_is_pb16i() const { return head_pb16i_; }
@@ -189,6 +201,13 @@ public:
     void   drop_wide();
     bool   adopt_wide(int rows);
     int    wide_rows() const { return wide_rows_; }
+    // The NARROW family: the same roles built for fewer than 16 rows per launch, for decode steps and other
+    // launches of 1..narrow_rows() rows. Same rules as the wide family (all roles or none, one sealed hw_context);
+    // a launch of more rows keeps the 16-row family.
+    I8Ctx* make_ctx_narrow(int role);
+    bool   adopt_narrow(int rows);
+    void   drop_narrow();
+    int    narrow_rows() const { return narrow_rows_; }
     // The context a launch of `rows` rows on `role` would use: the M=16 twin when one was adopted and
     // the row count fits, otherwise the M=128 one. The forward needs this where it launches a GEMM
     // itself (the LM head) instead of going through gemv().
@@ -232,6 +251,8 @@ private:
     std::unique_ptr<I8Ctx> ctx16_[Q4NX_MAX_DESIGNS];
     std::unique_ptr<I8Ctx> ctxw_[Q4NX_MAX_DESIGNS];   // the wide pb16i/t2s family (engine#1990)
     int wide_rows_ = 0;                               // 0 = no wide family
+    std::unique_ptr<I8Ctx> ctxn_[Q4NX_MAX_DESIGNS];   // the narrow pb16i/t2s family (decode)
+    int narrow_rows_ = 0;                             // 0 = no narrow family
     std::unique_ptr<I8Ctx> ctx_head_;
     bool m16_ = false;
     bool m16_check_ = false;

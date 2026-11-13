@@ -21,16 +21,25 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <unistd.h>
 #include <fstream>
 #include <string>
+#include <vector>
 #include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace fs = std::filesystem;
 static int failures = 0;
 static void check(bool ok, const std::string& what) {
     if (!ok) { std::printf("FAIL %s\n", what.c_str()); ++failures; }
+}
+
+// argv for run_q4nx_cache(): the vector must outlive the call, so callers keep it named.
+static std::vector<char*> mkargv(std::vector<std::string>& a) {
+    std::vector<char*> v;
+    for (auto& s : a) v.push_back(const_cast<char*>(s.c_str()));
+    return v;
 }
 
 static void make_entry(const fs::path& root, const std::string& name, int mb, int age_minutes) {
@@ -122,8 +131,141 @@ int main() {
     check(q4nx_cache_bound_bytes("40G") == 40 * gib, "a number with a suffix keeps its number");
     check(q4nx_cache_bound_bytes("7", 9) == 7 * gib && q4nx_cache_bound_bytes(nullptr, 9) == 9 * gib, "the default is the caller's");
 
+    // engine#1788 / disk pressure: the sweep as a COMMAND. Until now a serve start was the only trigger, so nothing
+    // swept while the NPU was off -- the cache sat at 70.9 GiB against its 60 GiB bound with / at 149 G.
+    {
+        const fs::path cr = root / "cli";
+        make_entry(cr, "big-a", 8, 500);
+        make_entry(cr, "big-b", 8, 400);
+        const std::string root_arg = "--root", root_val = cr.string();
+        {
+            // dry-run over the bound: reports and removes nothing
+            std::vector<std::string> a = {"evict", root_arg, root_val, "--max-gib", "0", "--dry-run"};
+            std::vector<char*> av = mkargv(a);
+            check(::run_q4nx_cache(int(av.size()), av.data()) == 0,
+                  "q4nx-cache evict: --max-gib 0 is 'sweep is off', exit 0");
+            check(fs::exists(cr / "big-a") && fs::exists(cr / "big-b"), "q4nx-cache evict: nothing removed with the sweep off");
+        }
+        {
+            // a real sweep with min-age 0 and a 0 GiB bound still cannot remove the `keep` entry
+            std::vector<std::string> a = {"evict", root_arg, root_val, "--max-mib", "6", "--min-age", "0",
+                                          "--keep", "big-a"};
+            std::vector<char*> av = mkargv(a);
+            ::run_q4nx_cache(int(av.size()), av.data());
+            check(fs::exists(cr / "big-a"), "q4nx-cache evict: the --keep entry is never removed");
+            check(!fs::exists(cr / "big-b"), "q4nx-cache evict: the least-recently-used entry goes first");
+        }
+        {
+            std::vector<std::string> a = {"evict", "--nonsense"};
+            std::vector<char*> av = mkargv(a);
+            check(::run_q4nx_cache(int(av.size()), av.data()) == 2,
+                  "q4nx-cache evict: an unknown argument is usage, exit 2");
+        }
+        fs::remove_all(cr, ec);
+    }
+    // engine#1788 follow-up, from USING the command: --dry-run now lists WHICH entries it would remove, and it lists them
+    // from the same selection the sweep applies, so the two cannot drift.
+    {
+        const fs::path cr = root / "cand";
+        make_entry(cr, "c-old", 2, 500);
+        make_entry(cr, "c-mid", 2, 400);
+        make_entry(cr, "c-new", 2, 300);
+        const int64_t bound = 3 * 1024 * 1024;   // 6 MiB of entries against a 3 MiB bound: two must go
+        const std::vector<Q4nxCacheCandidate> c1 = q4nx_cache_candidates(cr.string(), "", bound, 0);
+        check(c1.size() == 2, "q4nx-cache candidates: the list stops at the bound");
+        check(c1[0].name == "c-old" && c1[1].name == "c-mid", "q4nx-cache candidates: least-recently-used first");
+        check(c1[0].bytes == 2 * 1024 * 1024, "q4nx-cache candidates: each entry carries its size");
+        check(fs::exists(cr / "c-old") && fs::exists(cr / "c-mid") && fs::exists(cr / "c-new"),
+              "q4nx-cache candidates: nothing is removed by listing");
+        const std::vector<Q4nxCacheCandidate> c2 = q4nx_cache_candidates(cr.string(), "c-old", bound, 0);
+        // with c-old kept out of the total, 4 MiB remains against a 3 MiB bound: exactly one entry goes
+        check(c2.size() == 1 && c2[0].name == "c-mid", "q4nx-cache candidates: --keep is not a candidate");
+        check(q4nx_cache_candidates(cr.string(), "", bound, 100000).empty(),
+              "q4nx-cache candidates: the age window protects everything inside it");
+        fs::remove_all(cr, ec);
+    }
+    // engine#2263 review: the sweep's note and the CLI print sizes through one formatter, MiB below 1 GiB, so a small
+    // cache never reads "0.0 GiB" (which looks like the sweep being off).
+    check(q4nx_cache_size_text(int64_t(6) << 20) == "6.0 MiB", "size text: 6 MiB is MiB, not 0.0 GiB");
+    check(q4nx_cache_size_text(0) == "0.0 MiB", "size text: an empty cache is 0.0 MiB");
+    check(q4nx_cache_size_text((int64_t(1) << 30) - 1) == "1.0 GiB", "size text: just under 1 GiB is 1.0 GiB, not \"1024.0 MiB\"");
+    check(q4nx_cache_size_text(int64_t(1023) << 20) == "1023.0 MiB", "size text: a real 1023 MiB still reads MiB");
+    check(q4nx_cache_size_text(int64_t(60) << 30) == "60.0 GiB", "size text: 60 GiB is GiB");
+    // engine#2263: head-images/ is swept per key, not as one entry. Two keys of 2 MiB (two 1 MiB tiles each) beside a 2 MiB
+    // container: over a 4 MiB bound only the older KEY goes, its tiles and nothing else.
+    {
+        const fs::path cr = root / "heads";
+        const fs::path hd = cr / kQ4nxHeadImagesDir;
+        fs::create_directories(hd);
+        make_entry(cr, "pack-a", 2, 300);
+        const std::string ka = "headimg-00000000000000aa", kb = "headimg-00000000000000bb";
+        const auto tile = [&](const std::string& key, int t, int age_minutes) {
+            char name[64];
+            std::snprintf(name, sizeof name, "%s-t%03d.q4hi", key.c_str(), t);
+            const fs::path f = hd / name;
+            std::ofstream o(f, std::ios::binary);
+            o << std::string(size_t(1024) * 1024, 'h');
+            o.close();
+            std::error_code tec;
+            fs::last_write_time(f, fs::file_time_type::clock::now() - std::chrono::minutes(age_minutes), tec);
+            return f;
+        };
+        const fs::path a0 = tile(ka, 0, 600), a1 = tile(ka, 1, 590), b0 = tile(kb, 0, 200), b1 = tile(kb, 1, 190);
+        const int64_t bound = 4 * 1024 * 1024;
+        const std::vector<Q4nxCacheCandidate> c = q4nx_cache_candidates(cr.string(), "", bound, 0);
+        check(c.size() == 1 && c[0].name == std::string(kQ4nxHeadImagesDir) + "/" + ka,
+              "q4nx-cache head images: the oldest KEY is the candidate, not the whole directory");
+        check(c.size() == 1 && c[0].bytes == 2 * 1024 * 1024 && c[0].files.size() == 2,
+              "q4nx-cache head images: a key carries all its tiles and their bytes");
+        q4nx_cache_evict(cr.string(), "", bound, 0);
+        check(!fs::exists(a0) && !fs::exists(a1), "q4nx-cache head images: the evicted key's tiles are removed");
+        check(fs::exists(b0) && fs::exists(b1) && fs::exists(cr / "pack-a"),
+              "q4nx-cache head images: the other key and the container survive");
+        // a key whose newest tile is recent is inside the age window, even with an old tile (a hit marks the tile it read)
+        tile(ka, 0, 600);
+        tile(ka, 1, 1);
+        check(q4nx_cache_candidates(cr.string(), "", 1, 3600).size() == 2,
+              "q4nx-cache head images: a key is aged by its newest tile (only the old key and the container qualify)");
+        fs::remove_all(cr, ec);
+    }
+    // engine#2263: the command resolves the root every writer uses ($ONEBIT_Q4NX_CACHE, else ~/.cache/1bit/q4nx), not
+    // ONEBIT_Q4NX_CACHE_DIR / $XDG_CACHE_HOME, which no writer reads.
+    {
+        const char* keep_env[] = {"ONEBIT_Q4NX_CACHE", "ONEBIT_Q4NX_CACHE_DIR", "XDG_CACHE_HOME", "HOME"};
+        std::string saved[4];
+        bool had[4];
+        for (int i = 0; i < 4; ++i) {
+            const char* v = std::getenv(keep_env[i]);
+            had[i] = v != nullptr;
+            if (v) saved[i] = v;
+        }
+        const fs::path cr = root / "envroot";
+        setenv("ONEBIT_Q4NX_CACHE", cr.string().c_str(), 1);
+        setenv("ONEBIT_Q4NX_CACHE_DIR", (root / "elsewhere").string().c_str(), 1);
+        check(q4nx_cache_default_root() == cr.string(), "q4nx-cache root: ONEBIT_Q4NX_CACHE wins, as for every writer");
+        unsetenv("ONEBIT_Q4NX_CACHE");
+        setenv("HOME", (root / "home").string().c_str(), 1);
+        setenv("XDG_CACHE_HOME", (root / "xdg").string().c_str(), 1);
+        check(q4nx_cache_default_root() == (root / "home").string() + "/.cache/1bit/q4nx",
+              "q4nx-cache root: then HOME, and neither ONEBIT_Q4NX_CACHE_DIR nor XDG_CACHE_HOME moves it");
+        // and the command without --root sweeps that directory
+        setenv("ONEBIT_Q4NX_CACHE", cr.string().c_str(), 1);
+        make_entry(cr, "e-old", 2, 500);
+        make_entry(cr, "e-new", 2, 400);
+        std::vector<std::string> a = {"evict", "--max-mib", "3", "--min-age", "0"};
+        std::vector<char*> av = mkargv(a);
+        ::run_q4nx_cache(int(av.size()), av.data());
+        check(!fs::exists(cr / "e-old") && fs::exists(cr / "e-new"),
+              "q4nx-cache evict: with no --root it sweeps $ONEBIT_Q4NX_CACHE");
+        for (int i = 0; i < 4; ++i) {
+            if (had[i]) setenv(keep_env[i], saved[i].c_str(), 1);
+            else unsetenv(keep_env[i]);
+        }
+        fs::remove_all(cr, ec);
+    }
     fs::remove_all(root, ec);
-    std::printf("q4nx cache: %d arm(s) over the sweep (bound, LRU order, keep, age window, disabled, touch on a hit, bound text)\n",
-                failures ? 0 : 26);
+    std::printf("q4nx cache: %d arm(s) over the sweep (bound, LRU order, keep, age window, disabled, touch on a hit, bound text, "
+                "size text, head images per key, one root)\n",
+                failures ? 0 : 44);
     return failures ? 1 : 0;
 }

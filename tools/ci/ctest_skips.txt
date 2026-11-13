@@ -1,0 +1,26 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Tests that legitimately do not run in the CI configuration, one name per line with the reason.
+# Written by tools/ci/ctest_skips.py --write. A name here that stops skipping is reported, so the list
+# shrinks rather than rots (the shape of tools/ci/unreferenced_tests.txt, engine#1824).
+# A test whose BINARY is missing is never baselined here: that is a build-list mistake, not a fixture.
+
+amdxdna_restart   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+npu_import_contract   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+npu_repack_path   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+patch_sfs_atomic   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+serve_client_hangup_cpu   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+serve_context_limit_cpu   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+serve_embed_vectors_cpu   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)

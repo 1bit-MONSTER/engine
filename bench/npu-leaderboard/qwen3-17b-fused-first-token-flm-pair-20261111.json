@@ -1,0 +1,26 @@
+{
+  "id": "qwen3-17b-fused-first-token-flm-pair-20261111",
+  "host": "strixhalo",
+  "model": "Qwen3-1.7B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX q4_1 tiles (FastFlowLM's published container, unmodified), sealed fused set 2048x6144x16x8",
+  "metric": {
+    "name": "first token (warm)",
+    "value": 0.568,
+    "unit": "s"
+  },
+  "settings": {
+    "device": "accel0",
+    "engine": "1bit 80aceca152a909d5 (lemonade-onebit-rc-2026-11-07-c32)",
+    "container": "FastFlowLM/Qwen3-1.7B-NPU2 model.q4nx, sha256 b1c1fe9d6c4a6d0c…, the same file both runtimes loaded",
+    "ticket": "one npu-hold ticket, 38 s, arms in the order theirs, ours, ours, theirs",
+    "sampling": "greedy, streamed",
+    "reply": "63 streamed chunks per request",
+    "load1": "4.34 at start, 3.30 at end"
+  },
+  "instrument": "time from request to the first streamed chunk; 3 repeats in each of two arms, median of the six (range 0.566 to 0.578)",
+  "repeats": 6,
+  "timestamp": "2026-11-11T05:42:39Z",
+  "source": "~/lb/aval/clperf-f9-abba-20261111T054201Z/run.log on strixhalo (lane cl-perf's f9-npu-abba.sh, unmodified; engine#1787)",
+  "notes": "Same ticket as qwen3-17b-fused-decode-flm-pair-20261111. FastFlowLM 1.0.12's runtime on the same model.q4nx: 0.591 s (median of its six). The two are level within the ticket's own spread; the first request of each of their arms was slower (0.658 and 0.653 s) and is inside their median."
+}

@@ -139,6 +139,59 @@ with tempfile.TemporaryDirectory() as root:
     check(json.load(open(os.path.join(d2c, "plan.json")))["decode"]["sealed_elf"] == "",
           "a t2s container does not inherit q4nx_pb16i_sealed_elf")
 
+    # 4c2. engine#2208: a b8 container names its sealed int8 ELF under its own key, and does not take pb16i's.
+    d2b8 = model_dir(os.path.join(root, "b3b8"), layout="b8", q4nx_b8_sealed_elf="SEALED-I8.elf",
+                     layer_types=["linear_attention", "full_attention"])
+    run(d2b8)
+    p2b8 = json.load(open(os.path.join(d2b8, "plan.json")))
+    check(p2b8["kernels"]["tag"] == "_b8" and p2b8["decode"]["sealed_elf"] == "SEALED-I8.elf",
+          "b8 layout -> its own sealed int8 ELF named")
+    d2b8n = model_dir(os.path.join(root, "b3b8n"), layout="b8", sealed="pb16i_sealed.elf",
+                      layer_types=["linear_attention", "full_attention"])
+    run(d2b8n)
+    check(json.load(open(os.path.join(d2b8n, "plan.json")))["decode"]["sealed_elf"] == "",
+          "a b8 container does not inherit q4nx_pb16i_sealed_elf")
+
+    # 4d. engine#1990: a wide prefill family is carried into prefill{}, with its row count; a pack without
+    #     one keeps the two-key-free block it always had; and a layout reads only its own key.
+    check(p2b["prefill"] == {"M": 128}, "no wide key in config -> prefill block unchanged")
+    d2d = model_dir(os.path.join(root, "b4"), layout="t2s", q4nx_weight_layout_version=6,
+                    q4nx_t2s_sealed_elf="SEALED-T2S.elf", q4nx_t2s_sealed_wide_elf="SEALED-T2S-m32.elf",
+                    layer_types=["full_attention", "full_attention"])
+    run(d2d)
+    p2d = json.load(open(os.path.join(d2d, "plan.json")))
+    check(p2d["prefill"] == {"M": 128, "sealed_elf": "SEALED-T2S-m32.elf", "sealed_rows": 32},
+          "t2s wide key -> prefill.sealed_elf and the default 32 rows")
+    d2e = model_dir(os.path.join(root, "b5"), layout="t2s", q4nx_weight_layout_version=6,
+                    q4nx_t2s_sealed_elf="SEALED-T2S.elf", q4nx_t2s_sealed_wide_elf="W64.elf",
+                    q4nx_sealed_wide_rows=64, layer_types=["full_attention", "full_attention"])
+    run(d2e)
+    check(json.load(open(os.path.join(d2e, "plan.json")))["prefill"]["sealed_rows"] == 64,
+          "q4nx_sealed_wide_rows is carried")
+    d2f = model_dir(os.path.join(root, "b6"), layout="t2s", q4nx_weight_layout_version=6,
+                    q4nx_t2s_sealed_elf="SEALED-T2S.elf", q4nx_pb16i_sealed_wide_elf="PB-WIDE.elf",
+                    layer_types=["full_attention", "full_attention"])
+    run(d2f)
+    check(json.load(open(os.path.join(d2f, "plan.json")))["prefill"] == {"M": 128},
+          "a t2s container does not inherit q4nx_pb16i_sealed_wide_elf")
+
+    # 4e. engine#2073: the narrow decode family is carried into decode{} the same way.
+    check("narrow_elf" not in p2b["decode"] and "narrow_rows" not in p2b["decode"],
+          "no narrow key in config -> decode block unchanged")
+    d2g = model_dir(os.path.join(root, "b7"), layout="t2s", q4nx_weight_layout_version=6,
+                    q4nx_t2s_sealed_elf="SEALED-T2S.elf", q4nx_t2s_sealed_narrow_elf="SEALED-T2S-m4.elf",
+                    layer_types=["full_attention", "full_attention"])
+    run(d2g)
+    dg = json.load(open(os.path.join(d2g, "plan.json")))["decode"]
+    check(dg.get("narrow_elf") == "SEALED-T2S-m4.elf" and dg.get("narrow_rows") == 4,
+          "t2s narrow key -> decode.narrow_elf and the default 4 rows")
+    d2h = model_dir(os.path.join(root, "b8"), layout="t2s", q4nx_weight_layout_version=6,
+                    q4nx_t2s_sealed_elf="SEALED-T2S.elf", q4nx_pb16i_sealed_narrow_elf="PB-NARROW.elf",
+                    layer_types=["full_attention", "full_attention"])
+    run(d2h)
+    check("narrow_elf" not in json.load(open(os.path.join(d2h, "plan.json")))["decode"],
+          "a t2s container does not inherit q4nx_pb16i_sealed_narrow_elf")
+
     # 5. The plan printer writes nothing.
     r = run(d2, "--print")
     check(r.returncode == 0 and '"format": "1bit-npu-plan/1"' in r.stdout, "--print emits the plan on stdout")

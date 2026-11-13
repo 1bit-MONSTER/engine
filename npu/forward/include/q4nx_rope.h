@@ -69,15 +69,61 @@ typedef struct {
     int on;                        /* config declared rope_type "dynamic" with usable numbers */
     double factor;                 /* 1.0 on Hunyuan-0.5B -- a factor of 1 is a no-op until pos > original */
     double original_max_position;  /* 262144 on Hunyuan-0.5B */
+    /* engine#1889: Hunyuan's own form of "dynamic". Its rope_scaling block also carries `alpha` (1000.0 on every
+     * Hunyuan/HY-MT 1.9 pack), and when alpha is set the model's rotary embedding does not move the base with the
+     * position at all: it uses the FIXED base
+     *
+     *     base = theta * alpha ^ (dim / (dim - 2))
+     *
+     * (HunYuanDenseV1RotaryEmbedding, "DynamicNTKAlphaRotary"). Measured against the pack rather than taken from the
+     * reference: Hunyuan-7B's model.onnx.data holds the graph's cos_cache/sin_cache (FP16 [32768, 64]), and they match
+     * base 10000 * 1000^(128/126) = 11,158,840 to 0.00024 at positions 1, 2, 7, 50 and 300, where plain theta 10000 is
+     * off by up to 1.99. Reading the block as factor-only made it a no-op, i.e. every position rotated by the wrong
+     * angle. 0 = the block has no alpha, and the factor rule above applies. */
+    double alpha;
 } Q4nxRopeDynamic;
 
 static inline double q4nx_rope_dynamic_base(double theta, const Q4nxRopeDynamic* d, double pos, int dim) {
     if (!d || !d->on) return theta;
+    if (d->alpha > 0.0) {                                       /* the alpha form: one fixed base, every position */
+        if (dim <= 2) return theta;
+        return theta * pow(d->alpha, (double)dim / (double)(dim - 2));
+    }
     if (!(d->factor > 0.0) || !(d->original_max_position > 0.0) || dim <= 2) return theta;
     if (!(pos >= d->original_max_position)) return theta;      /* inside the window: plain rope, bit for bit */
     const double scaled = d->factor * pos / d->original_max_position - (d->factor - 1.0);
     if (!(scaled > 0.0)) return theta;                          /* a factor below 1 can drive this negative */
     return theta * pow(scaled, (double)dim / (double)(dim - 2));
+}
+
+/* `rope_type: "yarn"` (GPT-OSS-20B: factor 32, original 4096, beta_fast 32, beta_slow 1, truncate false), as
+ * transformers' `_compute_yarn_parameters`: each pair's frequency blends the plain one (extrapolation) and the plain
+ * one / factor (interpolation) with a linear ramp over the pair index between two correction dims, and cos/sin are
+ * scaled by the attention factor (0.1 * ln(factor) + 1 unless the block states attention_factor). */
+typedef struct {
+    int on;
+    double factor, original_max_position, beta_fast, beta_slow, attention_factor;
+    int truncate;                  /* default 1 (HF): floor/ceil the correction dims */
+} Q4nxRopeYarn;
+
+static inline double q4nx_yarn_corr_dim(double nrot, int dim, double base, double orig) {
+    return (dim * log(orig / (nrot * 2.0 * 3.14159265358979323846))) / (2.0 * log(base));
+}
+
+/* Pair i of a `dim`-wide rotary block at `base`: the YaRN inverse frequency. */
+static inline double q4nx_rope_yarn_inv_freq(int i, int dim, double base, const Q4nxRopeYarn* y) {
+    const double extra = 1.0 / pow(base, 2.0 * (double)i / (double)dim);
+    if (!y || !y->on) return extra;
+    double low = q4nx_yarn_corr_dim(y->beta_fast, dim, base, y->original_max_position);
+    double high = q4nx_yarn_corr_dim(y->beta_slow, dim, base, y->original_max_position);
+    if (y->truncate) { low = floor(low); high = ceil(high); }
+    if (low < 0) low = 0;
+    if (high > dim - 1) high = dim - 1;
+    if (low == high) high += 0.001;
+    double ramp = ((double)i - low) / (high - low);
+    ramp = ramp < 0 ? 0 : (ramp > 1 ? 1 : ramp);
+    const double extra_factor = 1.0 - ramp;
+    return (extra / y->factor) * (1.0 - extra_factor) + extra * extra_factor;
 }
 
 /* One dim pair's inverse frequency, after the llama3 rule.  `inv` is the plain theta^(-i/half).
@@ -162,8 +208,9 @@ static inline void q4nx_rope_declared_type(const char* json, char* out, int cap)
  * usable numbers (a declared-but-unusable block is not the same thing as no block) and `longrope`
  * needs the short_factor the forward reads. */
 static inline int q4nx_rope_type_supported(const char* type, const Q4nxRopeLlama3* llama3,
-                                           int has_short_factor, int has_dynamic_numbers) {
+                                           int has_short_factor, int has_dynamic_numbers, int has_yarn_numbers) {
     if (!type || !type[0]) return 1;                        /* no block declared: plain rope */
+    if (!strcmp(type, "yarn")) return has_yarn_numbers ? 1 : 0;
     if (!strcmp(type, "default") || !strcmp(type, "none")) return 1;
     if (!strcmp(type, "llama3")) return llama3 && llama3->on;
     if (!strcmp(type, "longrope")) return has_short_factor ? 1 : 0;
@@ -171,7 +218,7 @@ static inline int q4nx_rope_type_supported(const char* type, const Q4nxRopeLlama
      * and a declared-but-unusable block must be refused rather than served as plain rope (engine#1087).  The
      * predicate cannot see the numbers, so the caller passes `has_short_factor` as "the numbers were read". */
     if (!strcmp(type, "dynamic") || !strcmp(type, "dynamic_ntk")) return has_dynamic_numbers ? 1 : 0;
-    return 0;                                               /* yarn, linear, mrope, ... */
+    return 0;                                               /* linear, mrope, ... */
 }
 
 #ifdef __cplusplus

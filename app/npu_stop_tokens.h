@@ -58,12 +58,57 @@ inline std::vector<int> eos_token_ids(const nlohmann::json& cfg) {
 
 /// tokenizer_config.json's `eos_token` as text: a plain string, or the AddedToken object form
 /// `{"content": "<|im_end|>", ...}`.  Empty when the key is absent, null or another shape.
-inline std::string eos_token_text(const nlohmann::json& tokenizer_config) {
-    if (!tokenizer_config.is_object() || !tokenizer_config.contains("eos_token")) return {};
-    const nlohmann::json& e = tokenizer_config["eos_token"];
+/// A special token's text from tokenizer_config.json, in either spelling HF writes ("<bos>" or {"content": "<bos>"}).
+inline std::string special_token_text(const nlohmann::json& tokenizer_config, const char* key) {
+    if (!tokenizer_config.is_object() || !tokenizer_config.contains(key)) return {};
+    const nlohmann::json& e = tokenizer_config[key];
     if (e.is_string()) return e.get<std::string>();
     if (e.is_object() && e.contains("content") && e["content"].is_string()) return e["content"].get<std::string>();
     return {};
+}
+
+inline std::string eos_token_text(const nlohmann::json& tokenizer_config) {
+    return special_token_text(tokenizer_config, "eos_token");
+}
+
+/// tokenizer_config.json's add_bos_token: 1 or 0 when it states a boolean (or integer), -1 when it says nothing.
+/// A container's config.json often omits bos_token_id and add_bos_token (FastFlowLM's Medgemma-4B-NPU2 has neither)
+/// while its tokenizer_config.json states both; HF's tokenizer then adds the BOS, and Gemma without it answers
+/// "The sky is blue because of the way the light is" where it should explain Rayleigh scattering (engine#1786).
+inline int add_bos_token_flag(const nlohmann::json& tokenizer_config) {
+    if (!tokenizer_config.is_object() || !tokenizer_config.contains("add_bos_token")) return -1;
+    const nlohmann::json& a = tokenizer_config["add_bos_token"];
+    if (a.is_boolean()) return a.get<bool>() ? 1 : 0;
+    if (a.is_number_integer()) return a.get<int>() != 0 ? 1 : 0;
+    return -1;
+}
+
+/// The marker a chat template closes an assistant turn with, read off the template's own output.  `after` is the
+/// text a template rendered immediately after an assistant message's content; the marker is the `<...>` token it
+/// starts with (leading whitespace skipped), or empty when it starts with anything else.
+///
+/// Why this exists: a model ends its turn with whatever its template ends an assistant turn with, and neither
+/// config.json nor tokenizer_config.json has to name that token.  FastFlowLM's Phi4-mini-Instruct-NPU2 names
+/// <|endoftext|> in both, and its template closes every turn with <|end|> (200020); the upstream checkpoint
+/// lists it in generation_config.json, which the pack does not ship.  Served with only the two files' ids, the
+/// answer was "Paris<|end|><|assistant|>**Follow-up Question 1:** ..." until the token budget ran out
+/// (engine#1786).  The template is the one file every chat pack has, and it cannot disagree with itself.
+///
+///   "<|end|>"            -> "<|end|>"          (Phi)
+///   "<|im_end|>\n"       -> "<|im_end|>"       (ChatML)
+///   "<|eot_id|>"         -> "<|eot_id|>"       (Llama 3)
+///   "<end_of_turn>\n"    -> "<end_of_turn>"    (Gemma)
+///   "\n", "", "</s>x"... -> "" unless it starts with a whole <...> token: plain text after a turn is not a stop.
+inline std::string turn_end_marker(const std::string& after) {
+    size_t i = 0;
+    while (i < after.size() && (after[i] == ' ' || after[i] == '\n' || after[i] == '\r' || after[i] == '\t')) ++i;
+    if (i >= after.size() || after[i] != '<') return {};
+    const size_t close = after.find('>', i);
+    if (close == std::string::npos || close - i < 2) return {};
+    const std::string marker = after.substr(i, close - i + 1);
+    for (char c : marker)
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') return {};
+    return marker;
 }
 
 /// Every id that ends a generation on a container, in the order they were found and without repeats:
@@ -75,9 +120,10 @@ inline std::string eos_token_text(const nlohmann::json& tokenizer_config) {
 ///      model ends a chat turn with the second.  With only the first, the answer came back as
 ///      "Item 3 is the 3D printer.<|im_end|>\n": the turn end served as text and one more token generated
 ///      after it (engine#1785's row on that container);
-///   3. `chat_turn_end`, when the caller's chat route renders a prompt whose turns end with a marker of its
-///      own (ChatML's <|im_end|>): a prompt we close with that marker is answered by a turn that ends with it,
-///      whatever the two files say.  Pass an empty string when the route has no such marker.
+///   3. `chat_turn_end`, the marker the chat route's prompt closes an assistant turn with: ChatML's <|im_end|>
+///      on the fallback route, or turn_end_marker() of the container's own template when that is rendered.  A
+///      prompt whose turns end with that marker is answered by a turn that ends with it, whatever the two files
+///      say.  Pass an empty string when the route has no such marker.
 ///
 /// `id_of` maps a token's text to its id, or a negative number when the tokenizer has no such token; a name it
 /// does not know adds nothing.

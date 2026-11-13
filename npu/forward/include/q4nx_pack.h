@@ -246,6 +246,13 @@ typedef struct {
     int qk_nope;     /* per-head qk width excluding rope             */
     int dense_im;    /* leading dense layer's intermediate width     */
     int mla_kva_pad; /* KVA design N pad: ceil((kv_lora+rope_dim)/128)*128 */
+    /* LFM2's gated short-convolution layers: in_proj is one fused (K=H, N=3*H)
+     * projection [B | C | X] and out_proj is (K=H, N=H), which is the O design
+     * whenever NH*HD == H.  shortconv_n is in_proj's N; 0 means the model has no
+     * such layer.  It derives one QKVLIN design and nothing else (no Z), and is
+     * exclusive with lin_kd: a model has GDN layers or conv layers, not both.
+     * Appended last so positional initialisers keep their meaning. */
+    int shortconv_n;
 } Q4nxModelDims;
 
 /* No model-specific geometry constant lives here by design: every caller
@@ -291,6 +298,12 @@ const char* q4nx_design_log_tag(Q4nxDesign role);
 // target opens the decode family (engine#803 A2b) and a table the two sides must agree on cannot live on one
 // side of the split: a duplicate would be two contracts that drift silently.
 const char* q4nx_pb16i_instance(Q4nxDesign role);
+
+// The same for a SEALED int8 b8 ELF (engine#2208): one hw_context for the decode roles of a b8 container whose
+// full-attention QKV is one fused role (QKV, with the output gate) and whose gate/up is one fused role (GU).
+// The split G and U roles have no instance: the sealed GU instance is the fused width, so they keep their own
+// kernels. NULL means the sealed ELF does not cover the role.
+const char* q4nx_i8_sealed_instance(Q4nxDesign role);
 
 /* Look up the entry for a role in a derived set; NULL if absent. */
 const Q4nxDesignGeom* q4nx_find_design(const Q4nxDesignGeom* designs, int count,

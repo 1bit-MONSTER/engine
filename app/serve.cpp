@@ -2952,14 +2952,11 @@ std::string command_text(const std::vector<std::string>& argv) {
 // be /tmp/.cache, which every local user can write; a cached directory there would be served
 // (weights, tokenizer, kernel directory) without knowing who made it. The home directory now
 // comes from the user database instead, and serve refuses rather than guess.
+// engine#2263: one resolution (app/q4nx_cache.h), shared with `1bit q4nx-cache evict`, so the command sweeps this directory.
 std::string q4nx_cache_root() {
-    if (const char* c = std::getenv("ONEBIT_Q4NX_CACHE"); c && *c) return c;
-    if (const char* h = std::getenv("HOME"); h && *h) return std::string(h) + "/.cache/1bit/q4nx";
-#ifndef _WIN32
-    if (const passwd* pw = ::getpwuid(::geteuid()); pw && pw->pw_dir && *pw->pw_dir)
-        return std::string(pw->pw_dir) + "/.cache/1bit/q4nx";
-#endif
-    throw std::runtime_error("no home directory for the Q4NX cache: set HOME or ONEBIT_Q4NX_CACHE");
+    std::string root = q4nx_cache_default_root();
+    if (root.empty()) throw std::runtime_error("no home directory for the Q4NX cache: set HOME or ONEBIT_Q4NX_CACHE");
+    return root;
 }
 
 // Repack a GGUF into a Q4NX model directory with the FLM_Q4NX_Converter
@@ -3180,11 +3177,12 @@ void usage(FILE* out) {
                  "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
                  "                  [--npu-streams N]   with --device npu: this serve is one of N sharing the NPU\n"
+                 "                  (default 1, the device exclusive; docs/npu.md)\n"
                  "                  [--prefix-slots N] [--prefix-cache-mb N] [--prefix-min-gain N]   the prompt prefix cache\n"
                  "                  (docs/npu.md; 0 slots turns it off). Unset keeps the forward's defaults: 8 / 4096 / 128\n"
                  "                  [--prefix-pin]   keep the part a request shares with the previous one (one system prompt, many questions)\n"
                  "                  [--flash]   with --device npu: the single-turn profile, --ctx-size 1024 plus --prefix-pin\n"
-                 "                  (default 1, the device exclusive; docs/npu.md)\n"
+                 "                  (a system turn shorter than --prefix-min-gain, 128 by default, is not pinned)\n"
                  "                  [--load-queue-ms N]   a load refused because another client holds the NPU array\n"
                  "                  waits at most N ms for it to free before the driver is called dead\n"
                  "                  (default 45000; 0 refuses at once; docs/npu.md)\n"
@@ -3404,7 +3402,7 @@ int run_serve(int argc, char** argv) {
         if (o.device == "npu") return serve_only("--device npu runs in serve's own process");
     }
 
-    if (embed_serve::container(o.model)) {
+    if (embed_serve::container(o.model) || (o.role == "embedding" && embed_serve::forward_encoder(o.model))) {
         // `--embedding -m <container> [--device npu|cpu]`: a 1-bit encoder container is served in-process by the
         // engine's own encoder, so it must be dispatched BEFORE the NPU-directory rules below (those are about
         // q4nx/forward-serve directories, which do not run on the host). app/embed_serve.h.

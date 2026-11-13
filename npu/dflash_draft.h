@@ -59,6 +59,13 @@ struct DraftConfig {
     float rope_theta = 0.0f;
     float embedding_scale = 0.0f;
     bool causal = false;
+    // Which draft this is. 1: DFlashDraftModel (model_type "dflash"). 2: DFlash2DraftModel, which adds a grouped
+    // convolution around each layer's attention and MLP and a candidate selector, states its interface under
+    // "dflash_config", and stores every projection (the fusion matrix included) as Q4_K chunks.
+    int generation = 1;
+    int conv_kernel = 0, conv_group = 0;       // generation 2
+    int selector_rank = 0, selector_top_k = 0; // generation 2
+    int vocab = 0;                             // generation 2: rows of the selector's codebooks
     std::string draft_weight;  // the container's file name, relative to the package
     std::string base_model;    // the target this draft was made for, as the package names it (may be empty)
 
@@ -74,17 +81,25 @@ struct TensorView {
     size_t bytes = 0;
     int rows = 0;              // N (out); 1 for a vector
     int cols = 0;              // K (in), or the vector's length
+    int chunk = 0;             // a projection's bytes per 32 x 256 tile: 0 or 5120 = q4_1, 4736 = Q4_K
     bool ok() const { return data != nullptr && bytes != 0; }
 };
 
 struct DraftLayer {
     TensorView q, k, v, o, gate, up, down;                 // q4_1 tile grids, N x K
     TensorView input_norm, post_norm, q_norm, k_norm;      // 2-byte gains
+    // Generation 2, 2 bytes per element: base kernels [2][kernel][hidden], kernel projections
+    // [2 * kernel * hidden / group][hidden] row-major.
+    TensorView attn_conv_base, attn_conv_proj, mlp_conv_base, mlp_conv_proj;
 };
 
 struct DraftModel {
     DraftConfig cfg;
-    TensorView fc;             // hidden x (taps * hidden): fuses the target layers' hidden states
+    TensorView fc;             // hidden x (taps * hidden): fuses the target layers' hidden states (generation 1: 2-byte
+                               // elements in 32-row blocks, decode_fusion(); generation 2: a tile grid, decode_projection())
+    // Generation 2: the candidate selector. hidden_projection [rank][hidden], the two codebooks [vocab][rank], all at
+    // 2 bytes per element. The codebooks are 254 MB each as f32, so a caller reads rows out of the view (decode_row()).
+    TensorView selector_hproj, selector_pred, selector_succ;
     TensorView hidden_norm;    // applied to the fused features
     TensorView norm;           // the final norm
     std::vector<DraftLayer> layers;
@@ -104,6 +119,12 @@ std::vector<float> decode_projection(const TensorView& t);
 
 // A norm's gains as f32.
 std::vector<float> decode_gain(const TensorView& t);
+
+// A plain 2-byte-per-element tensor as f32, row-major [rows][cols].
+std::vector<float> decode_plain(const TensorView& t);
+
+// One row of a plain 2-byte-per-element tensor into out[cols]. Throws if the row is outside the tensor.
+void decode_row(const TensorView& t, int row, float* out);
 
 // The fusion matrix as f32, row-major [hidden][taps * hidden]. The container stores it as [hidden/32][taps*hidden][32]
 // -- 32-row blocks, column by column, the row inside the block last -- and that is the order this undoes:

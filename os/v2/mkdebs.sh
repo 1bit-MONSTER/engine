@@ -42,7 +42,11 @@
 # prefix (bin/lemond, bin/lemonade, bin/resources). <version> is the release tag, with or without the
 # leading v: v2026.43 becomes 2026.43-1.
 set -euo pipefail
-[ $# -ge 4 ] || { sed -n '22,45p' "$0"; exit 2; }
+
+# usage(): the header comment as prose, anchored on the comment block rather than a line range -- several of these ranges
+# had drifted past the end of their header and printed code to whoever asked for help (the same defect engine PR #2258 fixed in scripts/).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+[ $# -ge 4 ] || { usage; exit 2; }
 stage_in=$1 lemon=$2 version=${3#v} out=$4 keyring=${5:-} kstage=${KERNEL_STAGE:-} kver=
 here=$(cd "$(dirname "$0")" && pwd)
 src=$(cd "$here/../.." && pwd)

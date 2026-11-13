@@ -21,6 +21,7 @@
 // docs/npu-p4-target-split.md records what moved in A1 and what A2 (plan-driven setup) still owes.
 #include "target/xdna/xdna_target.h"
 #include "batch_width.h"
+#include "file_create.h"   // dumps are created 0600, never through a symlink
 
 #include <algorithm>
 #include <chrono>
@@ -366,6 +367,28 @@ bool XdnaTarget::adopt_wide(int rows) {
     wide_rows_ = rows;
     return true;
 }
+I8Ctx* XdnaTarget::make_ctx_narrow(int role) {
+    if (role < 0 || role >= Q4NX_MAX_DESIGNS) return nullptr;
+    ctxn_[role] = std::make_unique<I8Ctx>();
+    return ctxn_[role].get();
+}
+bool XdnaTarget::adopt_narrow(int rows) {
+    int base[Q4NX_MAX_DESIGNS] = {0}, narrow[Q4NX_MAX_DESIGNS] = {0};
+    for (int i = 0; i < Q4NX_MAX_DESIGNS; i++) {
+        if (ctx16_[i]) base[i] = ctx16_[i]->MD;
+        if (ctxn_[i]) narrow[i] = ctxn_[i]->MD;
+    }
+    if (!pb16i_ || !onebit::npu::narrow_family_complete(base, narrow, Q4NX_MAX_DESIGNS, rows)) {
+        drop_narrow();
+        return false;
+    }
+    narrow_rows_ = rows;
+    return true;
+}
+void XdnaTarget::drop_narrow() {
+    for (auto& c : ctxn_) c.reset();
+    narrow_rows_ = 0;
+}
 void XdnaTarget::drop_wide() {
     for (auto& c : ctxw_) c.reset();
     wide_rows_ = 0;
@@ -394,7 +417,8 @@ void XdnaTarget::note_head(int M, double dpk, double dql, double dwt, double drb
 int XdnaTarget::design_index(I8Ctx* c) const {
     if (!c) return -1;
     for (int i = 0; i < ndesigns_ && i < Q4NX_MAX_DESIGNS; i++)
-        if (ctx_[i].get() == c || (ctx16_[i] && ctx16_[i].get() == c) || (ctxw_[i] && ctxw_[i].get() == c))
+        if (ctx_[i].get() == c || (ctx16_[i] && ctx16_[i].get() == c) || (ctxw_[i] && ctxw_[i].get() == c) ||
+            (ctxn_[i] && ctxn_[i].get() == c))
             return i;
     return -1;
 }
@@ -571,6 +595,113 @@ void XdnaTarget::prof_dump() {
         prof_pre_[i] = ProfAcc{};
     }
     prof_head_ = ProfAcc{};
+}
+
+namespace {
+// Same test the forward's file_exists() made: the file opens and is not empty.
+bool decode_elf_exists(const std::string& p) {
+    FILE* f = std::fopen(p.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::fclose(f);
+    return sz >= 1;
+}
+}  // namespace
+
+// The log lines and refusals below are byte-for-byte the forward's: gates grep them.
+bool XdnaTarget::open_decode_family(Q4nxDesignGeom* designs16, int n, const std::string& sealed_elf,
+                                    int* made, int* skipped, std::string& err) {
+    int made_n = 0, skipped_n = 0;
+    for (int i = 0; i < n; i++) {
+        if (designs16[i].M <= 0) { ++skipped_n; continue; }
+        std::string elf, kname = "main:seq";
+        if ((setup_.pb16i || setup_.b8) && !sealed_elf.empty()) {
+            // One ELF for every phase: the file is the same for all roles and only the instance name
+            // differs, so I8Ctx reuses the one hw_context. pb16i and b8 (engine#2208) each have their own
+            // instance table.
+            const char* inst = setup_.pb16i ? q4nx_pb16i_instance(designs16[i].role)
+                                            : q4nx_i8_sealed_instance(designs16[i].role);
+            if (!inst) {
+                if (setup_.pb16i) {
+                    std::fprintf(stderr, "  [forward] pb16i: the sealed ELF has no instance for "
+                                         "role %s; this role has no decode kernel\n",
+                                 q4nx_design_log_tag(designs16[i].role));
+                    designs16[i].M = 0;
+                    ++skipped_n;
+                    continue;
+                }
+                // b8: an uncovered role is not a missing kernel; its per-role M=16 twin still serves it below.
+                std::fprintf(stderr, "  [forward] b8: the sealed ELF has no instance for role %s; "
+                                     "it keeps its per-role decode kernel\n",
+                             q4nx_design_log_tag(designs16[i].role));
+            } else {
+                elf = setup_.kernels_dir + "/" + sealed_elf;
+                kname = inst;
+                if (!decode_elf_exists(elf)) {
+                    err = plan_.loaded() ? ("plan " + setup_.plan_path + ": decode.sealed_elf \"" + sealed_elf +
+                                            "\" is not in " + setup_.kernels_dir + " (missing)")
+                                         : (std::string(setup_.pb16i ? "pb16i" : "b8") + ": missing sealed ELF " + elf);
+                    return false;
+                }
+            }
+        }
+        if (elf.empty()) {   // not sealed, or a b8 role the sealed ELF does not cover
+            for (const std::string& d : setup_.decode_dirs) {
+                const std::string cand = d + "/" + designs16[i].elf_name;
+                if (decode_elf_exists(cand)) { elf = cand; break; }
+            }
+        }
+        if (elf.empty()) {
+            // A pb16i role without its image kernel must stop the load: it is not a slower path, it is a missing
+            // one (the int8 weights are not packed for these geometries under this layout).
+            if (setup_.pb16i) {
+                err = plan_.loaded() ? std::string("plan ") + setup_.plan_path + ": decode role " +
+                                           q4nx_design_log_tag(designs16[i].role) + " needs \"" + designs16[i].elf_name +
+                                           "\" (missing)"
+                                     : std::string("pb16i: missing decode ELF ") + designs16[i].elf_name;
+                return false;
+            }
+            ++skipped_n;
+            continue;   // stay on M=128
+        }
+        I8Ctx* c16 = make_ctx16(i, designs16[i]);
+        if (!c16) {
+            err = "cannot create the decode context for role " + std::to_string(i);
+            return false;
+        }
+        c16->MD = designs16[i].M;
+        c16->KD = designs16[i].K;
+        c16->ND = designs16[i].N;
+        c16->blocked_b = setup_.b8;
+        c16->pb16i = setup_.pb16i;
+        c16->t2s = setup_.t2s;
+        // Which pb16i ELFs leave two int32 planes (the arena's ACC64 family: D, O and the full-attention q half).
+        // This mirrors the ELF family contract rather than inferring it, and load/launch refuse a tensor that
+        // needs two planes on a one-plane ELF.
+        if (setup_.pb16i) {
+            const Q4nxDesign r = designs16[i].role;
+            c16->pb16i_planes = (r == Q4NX_DESIGN_D || r == Q4NX_DESIGN_O || r == Q4NX_DESIGN_QKVFA_Q) ? 2 : 1;
+        }
+        if (!c16->init_elf(*dev_, elf.c_str(), designs16[i].M, designs16[i].K, designs16[i].N, 1, kname.c_str())) {
+            if (setup_.pb16i) {
+                err = "pb16i: init_elf failed for " + elf;
+                return false;
+            }
+            std::fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "
+                                 "this role keeps M=128\n", designs16[i].elf_name);
+            drop_ctx16(i);
+            ++skipped_n;
+            continue;
+        }
+        ++made_n;
+        std::fprintf(stderr, "  [forward] %-7s M=%d K=%d N=%d  %s (decode)\n",
+                     q4nx_design_log_tag(designs16[i].role), designs16[i].M, designs16[i].K, designs16[i].N, elf.c_str());
+    }
+    note_m16_made(made_n > 0);
+    if (made) *made = made_n;
+    if (skipped) *skipped = skipped_n;
+    return true;
 }
 
 bool XdnaTarget::open_head(const Q4nxDesignGeom* designs, int n, std::string& err) {
@@ -769,7 +900,12 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
     const float as = amax > 0.0f ? amax / 127.0f : 1.0f;
     // Phase-selected activation tile: a one-row call is decode, so it runs this
     // role's M=16 twin (one core row instead of 128 rows / 8 live tiles).
-    I8Ctx& kctx = *ctx_for(&ctx, 1, ar.decode_twin);
+    I8Ctx* kctx1 = ctx_for(&ctx, 1, ar.decode_twin);
+    // A decode step carries one row: with a narrow family it runs the kernel built for a few rows instead of 16.
+    if (pb16i_ && ar.role >= 0 && ar.role < Q4NX_MAX_DESIGNS && ctxn_[ar.role] &&
+        onebit::npu::narrow_takes(1, narrow_rows_))
+        kctx1 = ctxn_[ar.role].get();
+    I8Ctx& kctx = *kctx1;
     const bool prof = prof_;
     const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
@@ -1050,6 +1186,9 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     if (pb16i_ && ar.role >= 0 && ar.role < Q4NX_MAX_DESIGNS && ctxw_[ar.role] &&
         onebit::npu::wide_takes(M, Q4NX_DESIGN_M_DECODE, wide_rows_))
         kctxp = ctxw_[ar.role].get();
+    else if (pb16i_ && ar.role >= 0 && ar.role < Q4NX_MAX_DESIGNS && ctxn_[ar.role] &&
+             onebit::npu::narrow_takes(M, narrow_rows_))
+        kctxp = ctxn_[ar.role].get();   // a short chunk (a verify pass of a few rows) fits the narrow kernel
     I8Ctx& kctx = *kctxp;
     const bool prof = prof_;
     const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1231,7 +1370,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
         static int n = 0;
         char path[4096];
         std::snprintf(path, sizeof path, "%s/dev_L%d_N%d_K%d_%03d.bin", gdir, ar.layer, N, K, n++);
-        if (std::FILE* f = std::fopen(path, "wb")) {
+        if (std::FILE* f = onebit_fopen_private_wb(path)) {
             if (gs && !gs->empty()) std::fwrite(gs->data(), sizeof(float), (size_t)N, f);
             std::fclose(f);
         }

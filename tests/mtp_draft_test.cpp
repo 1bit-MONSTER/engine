@@ -26,6 +26,7 @@
 #include "mtp/draft.h"
 #include "mtp/mtp_head.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -287,6 +288,42 @@ private:
 };
 
 bool same(const std::vector<int>& a, const std::vector<int>& b) { return a == b; }
+
+// [17]'s head: drafts from the position alone and declares needs_last_hidden() == false, the shape of a DFlash draft
+// (it reads the base's committed rows, not the hidden after the last token), so run() takes the one-pass round. It also
+// follows its own stream: every committed row must reach commit_rows() exactly once and in order, t1's row included.
+class OnePassHead : public DraftHead {
+public:
+    enum Kind { kPerfect, kGarbage, kHalf };
+    OnePassHead(Kind kind, int prompt_len) : kind_(kind), expect_(prompt_len + 1) {}
+    bool needs_last_hidden() const override { return false; }
+    int draft(const std::vector<float>& hidden, int, int pos, int k, std::vector<int>& out,
+              std::vector<float>* conf = nullptr) override {
+        if (!hidden.empty()) handed_hidden_++;
+        if (conf) conf->assign((size_t)k, 1.0f);
+        out.clear();
+        for (int i = 0; i < k; i++) {
+            const int t = truth(pos + i);
+            out.push_back(kind_ == kPerfect || (kind_ == kHalf && i == 0) ? t : (t + 1) % V);
+        }
+        return (int)out.size();
+    }
+    void commit_rows(const std::vector<int>& tokens, const std::vector<float>& rows, int M) override {
+        if ((int)tokens.size() != M || (int)rows.size() < M) { bad_++; return; }
+        for (int m = 0; m < M; m++)
+            if ((int)rows[(size_t)m] != expect_ + m) bad_++;   // the toy's row m is "positions consumed after it"
+        expect_ += M;
+        seen_ += M;
+    }
+    int seen() const { return seen_; }
+    int bad() const { return bad_; }
+    int handed_hidden() const { return handed_hidden_; }
+
+private:
+    Kind kind_;
+    int expect_;
+    int seen_ = 0, bad_ = 0, handed_hidden_ = 0;
+};
 
 // ---- the drafter's own stream (MtpDrafter's cursor) ------------------------------------------------------------
 //
@@ -908,6 +945,167 @@ int main() {
               "leaf fill (2): widening the batch (k=8, M=16 rows) buys exactly nothing when the parent is refused");
         std::printf("INFO leaf fill (2): correct deeper candidates, accepted %d at k=4, %d at k=8 (of %d / %d rows)\n",
                     r4.stats.accepted, r8.stats.accepted, r4.stats.drafted, r8.stats.drafted);
+    }
+
+    // [17] the one-pass round (engine#1781): a head that does not read the hidden after t1 gets [t1, d1..dk] verified as
+    //      ONE batch. Pinned: the text and the recurrent state equal plain decode's for every accept shape, k is held to
+    //      max_batch_rows() - 1 (t1 takes a row), a fully accepted chain costs one base pass per k + 1 tokens and no
+    //      step, and the drafter sees every committed row once, in order.
+    {
+        ToyBase rm;
+        rm.use_recurrence(true);
+        const Result rref = onebit::npu::mtp::run_plain(rm, P, base_opt);
+        const char* names[] = {"perfect", "garbage", "half"};
+        for (int k : {1, 2, 4, 7, 12}) {
+            for (int kind = 0; kind < 3; kind++) {
+                for (int keep : {0, 1}) {
+                    ToyBase m(8);
+                    m.use_recurrence(true);
+                    m.keep_batch_rows(keep != 0);
+                    OnePassHead h((OnePassHead::Kind)kind, (int)P.size());
+                    Options o = base_opt;
+                    o.k = k;
+                    const Result r = onebit::npu::mtp::run(m, &h, P, o);
+                    const int kk = std::min(k, 7);
+                    char msg[200];
+                    std::snprintf(msg, sizeof msg,
+                                  "one-pass k=%d head=%s rows=%s: text, state and positions equal plain decode",
+                                  k, names[kind], keep ? "batch" : "prefix");
+                    check(r.ok && same(r.tokens, ref.tokens) && m.state() == rm.state() && m.bad_pos() == 0 &&
+                              m.consumed() == (int)P.size() + (int)r.tokens.size() && m.pending() == 0,
+                          msg);
+                    std::snprintf(msg, sizeof msg, "one-pass k=%d head=%s rows=%s: never past %d rows (over=%d)", k,
+                                  names[kind], keep ? "batch" : "prefix", m.max_batch_rows(), m.over_batch());
+                    check(m.over_batch() == 0, msg);
+                    std::snprintf(msg, sizeof msg,
+                                  "one-pass k=%d head=%s rows=%s: drafter saw %d rows in order (want %d), no hidden",
+                                  k, names[kind], keep ? "batch" : "prefix", h.seen(), m.consumed() - (int)P.size());
+                    check(r.ok && h.bad() == 0 && h.seen() == m.consumed() - (int)P.size() && h.handed_hidden() == 0,
+                          msg);
+                    if (kind == OnePassHead::kPerfect) {
+                        const int want_batches = (WANT + kk) / (kk + 1);
+                        std::snprintf(msg, sizeof msg,
+                                      "one-pass k=%d perfect rows=%s: %d batches (want %d), %d steps (want the %zu of "
+                                      "the prompt), every draft accepted",
+                                      k, keep ? "batch" : "prefix", m.batches(), want_batches, m.steps(), P.size());
+                        check(m.batches() == want_batches && m.steps() == (int)P.size() &&
+                                  r.stats.accepted == r.stats.drafted,
+                              msg);
+                    } else if (kind == OnePassHead::kGarbage) {
+                        std::snprintf(msg, sizeof msg,
+                                      "one-pass k=%d garbage rows=%s: nothing accepted, one base pass per token (%d)", k,
+                                      keep ? "batch" : "prefix", m.batches() + m.steps() - (int)P.size());
+                        check(r.stats.accepted == 0 && m.batches() + m.steps() - (int)P.size() == WANT, msg);
+                    } else if (k > 1) {
+                        std::snprintf(msg, sizeof msg, "one-pass k=%d half rows=%s: the first draft only (%d of %d)", k,
+                                      keep ? "batch" : "prefix", r.stats.accepted, r.stats.drafted);
+                        check(r.stats.accepted == r.stats.iterations && r.stats.accepted < r.stats.drafted, msg);
+                    }
+                }
+            }
+        }
+        // The same perfect chain through the two-pass round, for the number the one-pass round exists to change.
+        ToyBase m2(8), m1(8);
+        PerfectHead two;
+        OnePassHead one(OnePassHead::kPerfect, (int)P.size());
+        Options o = base_opt;
+        o.k = 7;
+        const Result r2 = onebit::npu::mtp::run(m2, &two, P, o);
+        const Result r1 = onebit::npu::mtp::run(m1, &one, P, o);
+        std::printf("INFO one-pass vs two-pass, perfect head, k=7: %.3f vs %.3f base passes per token\n",
+                    r1.stats.passes_per_token(), r2.stats.passes_per_token());
+        check(r1.ok && r2.ok && same(r1.tokens, r2.tokens) && m1.steps() + m1.batches() < m2.steps() + m2.batches(),
+              "one-pass k=7: same text as the two-pass round in fewer base passes");
+        // A consumer that stops inside an accepted prefix stops the run there, and the refused token stays committed
+        // (run()'s contract on both rounds).
+        int n = 0;
+        ToyBase ms(8);
+        OnePassHead hs(OnePassHead::kPerfect, (int)P.size());
+        const Result rs = onebit::npu::mtp::run(ms, &hs, P, o, [&](int) { return ++n < 6; });
+        check(rs.ok && rs.tokens.size() == 6 && same(rs.tokens, std::vector<int>(ref.tokens.begin(), ref.tokens.begin() + 6)) &&
+                  ms.consumed() == (int)P.size() + 6 && ms.pending() == 0,
+              "one-pass: on_token false on the 6th token stops the run with 6 tokens emitted and committed");
+        // A batch that holds one row leaves no row for a draft: plain decode, no batch.
+        ToyBase m0(1);
+        OnePassHead h0(OnePassHead::kPerfect, (int)P.size());
+        const Result r0 = onebit::npu::mtp::run(m0, &h0, P, o);
+        check(r0.ok && same(r0.tokens, ref.tokens) && m0.batches() == 0 && m0.over_batch() == 0 &&
+                  h0.seen() == WANT,
+              "one-pass with max_batch_rows() == 1: plain steps, no batch, the drafter still sees every row");
+    }
+
+    // [18] run_from(): the loop after a caller's own prefill gives run()'s result; and the fallback stops drafting
+    //      after the window it is given, on both rounds, without changing the text.
+    {
+        Options o = base_opt;
+        o.k = 4;
+        ToyBase a(8), b(8);
+        OnePassHead ha(OnePassHead::kHalf, (int)P.size()), hb(OnePassHead::kHalf, (int)P.size());
+        const Result ra = onebit::npu::mtp::run(a, &ha, P, o);
+        std::vector<float> lg;
+        int pos = 0;
+        for (int t : P) b.step(t, pos++, lg);
+        const Result rb = onebit::npu::mtp::run_from(b, &hb, pos, lg, o);
+        check(ra.ok && rb.ok && same(ra.tokens, rb.tokens) && ra.stats.batches == rb.stats.batches &&
+                  a.consumed() == b.consumed(),
+              "run_from after the caller's prefill: run()'s tokens, batches and positions");
+        ToyBase c(8);
+        OnePassHead hc(OnePassHead::kHalf, 0);
+        check(!onebit::npu::mtp::run_from(c, &hc, 0, std::vector<float>(V, 0.0f), o).ok,
+              "run_from with no prefilled position is refused");
+
+        for (int one_pass : {1, 0}) {
+            ToyBase m(8);
+            OnePassHead og(OnePassHead::kGarbage, (int)P.size());
+            GarbageHead tg;
+            Options f = base_opt;
+            f.k = 4;
+            f.tau = 0.0f;
+            f.fallback_below = 2.0;
+            f.fallback_window = 3;
+            DraftHead* h = one_pass ? (DraftHead*)&og : (DraftHead*)&tg;
+            const Result r = onebit::npu::mtp::run(m, h, P, f);
+            char msg[200];
+            std::snprintf(msg, sizeof msg,
+                          "fallback (%s round): a head that never lands stops after 3 rounds (fell back at %d, %d batches), "
+                          "same text",
+                          one_pass ? "one-pass" : "two-pass", r.stats.fell_back_at, m.batches());
+            check(r.ok && same(r.tokens, ref.tokens) && r.stats.fell_back_at == 3 && m.batches() == 3 &&
+                      m.consumed() == (int)P.size() + WANT,
+                  msg);
+        }
+        ToyBase m(8);
+        OnePassHead op(OnePassHead::kPerfect, (int)P.size());
+        Options f = base_opt;
+        f.k = 4;
+        f.fallback_below = 2.0;
+        const Result r = onebit::npu::mtp::run(m, &op, P, f);
+        check(r.ok && same(r.tokens, ref.tokens) && r.stats.fell_back_at == -1,
+              "fallback: a head that lands every draft never falls back");
+        ToyBase eq(8);
+        OnePassHead oh(OnePassHead::kHalf, (int)P.size());   // every round emits exactly 2: at the bar, not under it
+        const Result re = onebit::npu::mtp::run(eq, &oh, P, f);
+        check(re.ok && same(re.tokens, ref.tokens) && re.stats.fell_back_at == -1,
+              "fallback: rounds of exactly 2 tokens against a bar of 2.0 keep drafting");
+        // consume_last = false: a run whose budget ends on the base's own token does not pay the pass after it.
+        for (int kind : {0, 1}) {
+            ToyBase m1(8), m2(8);
+            OnePassHead h1((OnePassHead::Kind)kind, (int)P.size()), h2((OnePassHead::Kind)kind, (int)P.size());
+            Options c = base_opt;
+            c.k = 4;
+            const Result a1 = onebit::npu::mtp::run(m1, &h1, P, c);
+            c.consume_last = false;
+            const Result a2 = onebit::npu::mtp::run(m2, &h2, P, c);
+            const int passes1 = m1.steps() + m1.batches(), passes2 = m2.steps() + m2.batches();
+            char msg[200];
+            std::snprintf(msg, sizeof msg, "consume_last=false, %s head: same text, %d passes against %d, base at %d of %d",
+                          kind == 0 ? "perfect" : "garbage", passes2, passes1, m2.consumed(), m1.consumed());
+            // perfect at k=4 ends inside a batch (nothing to skip); garbage ends on the base's own token (one skipped)
+            const int skipped = kind == 0 ? 0 : 1;
+            check(a1.ok && a2.ok && same(a1.tokens, a2.tokens) && passes2 == passes1 - skipped &&
+                      m2.consumed() == m1.consumed() - skipped,
+                  msg);
+        }
     }
 
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);

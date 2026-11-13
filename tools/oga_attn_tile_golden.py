@@ -112,10 +112,19 @@ def tiles_q4_1(code, scale, zp):
 
 
 def main(argv):
-    if len(argv) < 2:
+    # --help is a request, not a path: without this it arrives as argv[1] and the tool
+    # opens a file literally named "--help" (FileNotFoundError) instead of saying anything.
+    if "-h" in argv or "--help" in argv:
+        print(__doc__ or "usage: see the header of this file")
+        return 0
+    positional = [a for a in argv[1:] if not a.startswith("-")]
+    if not positional:
+        # The usage line is `<pack dir> [--check]`, so a bare `--check` has no pack dir. Before this
+        # it became argv[1] and the tool opened a directory literally named "--check" and crashed
+        # with FileNotFoundError -- a documented invocation shape reported as a traceback.
         print(__doc__.strip().splitlines()[-1], file=sys.stderr)
         return 2
-    pack, check = Path(argv[1]), "--check" in argv
+    pack, check = Path(positional[0]), "--check" in argv
     tile = read_tile(pack)
     code, scale, zp, bias = decode(tile)
     q4 = tiles_q4_1(code, scale, zp)

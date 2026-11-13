@@ -40,7 +40,7 @@ int q4nx_num_designs(const Q4nxModelDims* d) {
         return 10;
     return (d->fused_gu ? 4 : 5) + (d->ple_dim > 0 ? 2 : 0) +
            (d->double_wide_mlp ? 2 : 0) + (has_second_attn(d) ? 2 : 0) +
-           (d->lin_kd > 0 ? 2 : 0);
+           (d->lin_kd > 0 ? 2 : 0) + (d->lin_kd <= 0 && d->shortconv_n > 0 ? 1 : 0);
 }
 
 /* MLA + MoE design set (see q4nx_num_designs).  dims->HD must be the per-head
@@ -275,6 +275,18 @@ const char* q4nx_pb16i_instance(Q4nxDesign role) {
     }
 }
 
+const char* q4nx_i8_sealed_instance(Q4nxDesign role) {
+    switch (role) {
+        case Q4NX_DESIGN_QKVLIN: return "main:qkv";
+        case Q4NX_DESIGN_QKV:    return "main:qkvfa";
+        case Q4NX_DESIGN_Z:      return "main:z";
+        case Q4NX_DESIGN_O:      return "main:o";
+        case Q4NX_DESIGN_GU:     return "main:gu";
+        case Q4NX_DESIGN_D:      return "main:d";
+        default:                 return 0;
+    }
+}
+
 const char* q4nx_design_log_tag(Q4nxDesign role) {
     switch (role) {
         case Q4NX_DESIGN_QKV: return "QKV";
@@ -463,6 +475,11 @@ int q4nx_derive_designs(const Q4nxModelDims* d, Q4nxDesignGeom* out) {
 
         i++;
         geom(&out[i], d->M, d->H, d->lin_vd, Q4NX_DESIGN_Z, "Z");
+    } else if (d->shortconv_n > 0) {
+        /* LFM2 short-convolution in_proj: the same fused-projection role and
+         * kernel format as the GDN q|k|v, at N = 3*H, and no Z. */
+        i++;
+        geom(&out[i], d->M, d->H, d->shortconv_n, Q4NX_DESIGN_QKVLIN, "QKV");
     }
 
     return i + 1;
@@ -684,7 +701,7 @@ float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
  *
  * This emits the int8 image STRAIGHT FROM THE TILES: one 32x256 tile is dequantised into a 32 KB scratch, folded into
  * the per-column amax, then a second pass dequantises the same tiles again and writes the codes. Same dequantiser
- * (q4nx_dequant_tile), same arithmetic, same amax floor -- so the result is byte-identical to the two-step path, which
+ * (q4nx_dequant_tile_as, with the tensor's tile kind), same arithmetic, same amax floor -- so the result is byte-identical to the two-step path, which
  * is what the fixture in tests/npu_design_grid_test.c asserts by running both.
  *
  * Only the q4_1 tile kind (5120 B, 32x256) has a one-tile decoder; any other chunk kind returns -2 so the caller keeps
@@ -696,18 +713,26 @@ int q4nx_pack_q4_1_tiles_to_int8(const uint8_t* tiles, size_t nbytes, int K, int
     if (K % Q4NX_TILE_ROWS || N % Q4NX_TILE_COLS) return -1;
     const size_t ntr = (size_t)(K / Q4NX_TILE_ROWS), ntc = (size_t)(N / Q4NX_TILE_COLS);
     if (nbytes != ntr * ntc * (size_t)Q4NX_TILE_BYTES) return -2;   // not the q4_1 tile kind: a caller keeps its path
+    // The kind of 5,120-byte tile is the TENSOR's (q4nx_dequant.h): taken once over all of its tiles, exactly as the
+    // tensor readers of the two-step path take it, so a tile that decides nothing on its own is read here as it is
+    // read there. Decoding tile by tile as one-tile tensors read such a tile as asymmetric inside a symmetric tensor
+    // (8192 of 8192 elements different on a two-tile probe). A tensor holding both kinds is refused, as it is there.
+    const int kind = q4nx_tiles_kind(tiles, ntr * ntc, (size_t)Q4NX_TILE_BYTES);
+    if (kind < 0) {
+        fprintf(stderr, "q4nx: a tensor of %zu 5120-byte tiles holds symmetric and asymmetric tiles; one tensor is one "
+                        "kind, so it is not packed\n", ntr * ntc);
+        return -1;
+    }
+    const int sym = (kind == Q4NX_TILE_SYMMETRIC);
     float* amax = (float*)calloc((size_t)N, sizeof(float));
     if (!amax) return -1;
     float tilef[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];
     // pass 1: per-column amax, one tile at a time
     for (size_t r = 0; r < ntr; r++) {
         for (size_t c = 0; c < ntc; c++) {
-            // the SAME decoder the two-step reference path uses, applied to one tile: q4nx_dequant_tile() is a
-            // different function, and on the fixture it disagreed with the tensor path on 316 of 32768 codes -- rounding
-            // detail at the .5 boundary rather than layout (the scales matched exactly). Byte-exactness needs one
-            // decoder, not two that agree to 99%.
-            q4nx_dequant_tensor_chunked(tiles + (r * ntc + c) * (size_t)Q4NX_TILE_BYTES, Q4NX_TILE_BYTES,
-                                        Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_TILE_BYTES, tilef);
+            // the SAME one-tile decoder the tensor readers of the two-step path call (q4nx_dequant_tile_as), with
+            // the tensor's kind: byte-exactness needs one decoder and one decision, not two that agree to 99%.
+            q4nx_dequant_tile_as(tiles + (r * ntc + c) * (size_t)Q4NX_TILE_BYTES, tilef, Q4NX_TILE_COLS, sym);
             for (int i = 0; i < Q4NX_TILE_ROWS; i++) {
                 const float* row = tilef + (size_t)i * Q4NX_TILE_COLS;
                 float* am = amax + c * Q4NX_TILE_COLS;
@@ -730,8 +755,7 @@ int q4nx_pack_q4_1_tiles_to_int8(const uint8_t* tiles, size_t nbytes, int K, int
     // pass 2: codes, same tile order
     for (size_t r = 0; r < ntr; r++) {
         for (size_t c = 0; c < ntc; c++) {
-            q4nx_dequant_tensor_chunked(tiles + (r * ntc + c) * (size_t)Q4NX_TILE_BYTES, Q4NX_TILE_BYTES,
-                                        Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_TILE_BYTES, tilef);
+            q4nx_dequant_tile_as(tiles + (r * ntc + c) * (size_t)Q4NX_TILE_BYTES, tilef, Q4NX_TILE_COLS, sym);
             const float* tis = amax + c * Q4NX_TILE_COLS;
             for (int i = 0; i < Q4NX_TILE_ROWS; i++) {
                 const float* row = tilef + (size_t)i * Q4NX_TILE_COLS;

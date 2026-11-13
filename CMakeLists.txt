@@ -586,6 +586,12 @@ add_executable(bf16_matrix_test tests/bf16_matrix_test.cpp)
 target_include_directories(bf16_matrix_test PRIVATE npu/forward/include)
 add_test(NAME bf16_matrix COMMAND bf16_matrix_test)
 add_dependencies(onebit bf16_matrix_test)   # ci.yml builds onebit: this is how the arm reaches CI's ctest
+# engine#1783: the NPU_PROFILE accumulator keeps a weight-cache fill out of `pack` (npu/target/xdna/prof_acc.h). The
+# target that uses it needs the private runtime, so this header-only arm is what CI compiles of the rule.
+add_executable(prof_acc_test tests/prof_acc_test.cpp)
+target_include_directories(prof_acc_test PRIVATE npu/target/xdna)
+add_test(NAME prof_acc COMMAND prof_acc_test)
+add_dependencies(onebit prof_acc_test)
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
 # The shape rule for a 1.8 external-data initializer (npu/pack_initializer_shape.h, engine#1503's graph-initializer
 # reader). Those packs zero every `dims`, so a byte length has to become a shape -- and a shape inferred wrongly imports

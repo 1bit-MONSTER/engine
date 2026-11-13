@@ -534,7 +534,8 @@ void XdnaTarget::prof_add(ProfAcc* acc, int design, double pack, double quant,
     // fills, and `pack` read ~3 ms/launch on the 768 family where a cached launch's host side is ~0. An encoder
     // window (12 launches per projection per layer) then extrapolated a one-time cost twelve times. The fill now
     // is printed on its own line after the table, and `pack` is what every launch pays.
-    if (fill > 0.0) pack = pack > fill ? pack - fill : 0.0;
+    // The g_ph totals below take the same rule as the per-role accumulator (prof_acc.h).
+    const double pack_paid = prof_pack_without_fill(pack, fill);
     // g_ph is what the [bs] (batch) and [ph] (decode step) lines print, and both read it. Only the DECODE
     // accumulator used to be counted, so a 219-row prefill -- which launches through prof_pre_ -- reported
     // "n=0 launches, host=93113 ms" for 224 launches and 93 s of device wait: the wait fell into the line's
@@ -550,15 +551,12 @@ void XdnaTarget::prof_add(ProfAcc* acc, int design, double pack, double quant,
     // (it can go negative) on exactly the multi-row passes this line exists for. The head keeps its own accounting.
     if (q4nx_lh::phprof_on() && acc != &prof_head_ &&
         (acc == prof_dec_ || (q4nx_lh::g_in_batch && acc == prof_pre_)) && !q4nx_lh::g_in_head) {
-        q4nx_lh::g_ph.g_pack += pack; q4nx_lh::g_ph.g_ql += quant;
+        q4nx_lh::g_ph.g_pack += pack_paid; q4nx_lh::g_ph.g_ql += quant;
         q4nx_lh::g_ph.g_wait += wait; q4nx_lh::g_ph.g_rb += rb;
         q4nx_lh::g_ph.launches++;
     }
     if (design < 0 || design >= Q4NX_MAX_DESIGNS) return;
-    ProfAcc& a = acc[design];
-    a.pack += pack; a.quant += quant; a.wait += wait; a.rb += rb;
-    a.n++;
-    if (fill > 0.0) { a.fill += fill; a.nfill++; }
+    prof_acc_add(acc[design], pack, quant, wait, rb, fill);
 }
 
 void XdnaTarget::prof_dump() {

@@ -189,7 +189,7 @@ SH
     docker run --rm -v "$work:/build" -w /build -e HOSTUID="$(id -u)" -e HOSTGID="$(id -g)" \
         -e VER="$ver" -e REL="$rel" -e SPEC="$(basename "$spec")" \
         -e CHLOGDATE="$(LC_ALL=C date '+%a %b %d %Y')" \
-        fedora:latest bash /build/in-container.sh > "$work/rpmbuild.log" 2>&1 ||
+        fedora:45@sha256:a7d72ba2745b100a3351087472e5ee7b2450af7cf331e7673007e3817612839c bash /build/in-container.sh > "$work/rpmbuild.log" 2>&1 ||
         { tail -30 "$work/rpmbuild.log" >&2; exit 1; }
     built=$(find "$work/rpmbuild/RPMS" -name '*.rpm' -type f | head -1)
     [ -n "$built" ] || { echo "pack-distro.sh: rpmbuild produced no package" >&2; exit 1; }
@@ -220,7 +220,7 @@ su builder -c 'cd /build && makepkg -f --nodeps --noconfirm'
 SH
     docker run --rm -v "$work:/build" -w /build -e HOSTUID="$(id -u)" -e HOSTGID="$(id -g)" \
         -e PKGVER="$ver" -e PKGREL="$rel" \
-        archlinux:latest bash /build/in-container.sh > "$work/makepkg.log" 2>&1 ||
+        archlinux:base-20261108.0.623074@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899 bash /build/in-container.sh > "$work/makepkg.log" 2>&1 ||
         { tail -30 "$work/makepkg.log" >&2; exit 1; }
     built=$(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' -type f | head -1)
     [ -n "$built" ] || { echo "pack-distro.sh: makepkg produced no package" >&2; exit 1; }

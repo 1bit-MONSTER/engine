@@ -103,6 +103,7 @@ apt-get remove -y -qq 1bit-engine >/dev/null 2>&1 || { echo 'apt-get remove fail
 [ ! -e /opt/1bit/engine/1bit ] || { echo 'the payload survived the removal'; exit 1; }
 "
 
+# moving-ref: the proof is that the package installs on this distro as a user pulls it today, so the newest image is the point
 run_row "rpm, fedora" fedora:latest "
 dnf -y -q install /pkg/$rpm >/dev/null 2>&1 || { echo 'dnf install failed'; exit 1; }
 $body
@@ -110,6 +111,7 @@ dnf -y -q remove 1bit-engine >/dev/null 2>&1 || { echo 'dnf remove failed'; exit
 [ ! -e /opt/1bit/engine/1bit ] || { echo 'the payload survived the removal'; exit 1; }
 "
 
+# moving-ref: the proof is that the package installs on this distro as a user pulls it today, so the newest image is the point
 run_row "rpm, opensuse tumbleweed" opensuse/tumbleweed:latest "
 zypper --non-interactive --gpg-auto-import-keys install --allow-unsigned-rpm /pkg/$rpm >/dev/null 2>&1 ||
     { echo 'zypper install failed'; exit 1; }
@@ -118,6 +120,7 @@ zypper --non-interactive remove 1bit-engine >/dev/null 2>&1 || { echo 'zypper re
 [ ! -e /opt/1bit/engine/1bit ] || { echo 'the payload survived the removal'; exit 1; }
 "
 
+# moving-ref: the proof is that the package installs on this distro as a user pulls it today, so the newest image is the point
 run_row "arch, pacman" archlinux:latest "
 pacman -Sy --noconfirm >/dev/null 2>&1 || { echo 'pacman -Sy failed'; exit 1; }
 pacman -U --noconfirm /pkg/$arch_pkg >/dev/null 2>&1 || { echo 'pacman -U failed'; exit 1; }

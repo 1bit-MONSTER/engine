@@ -1,0 +1,22 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Moving build inputs that are known and owed (tools/ci/moving_ref_check.py). One row per finding:
+#   path<TAB>rule<TAB>text<TAB>why it waits
+# The check fails on a finding not listed here AND on a row that no longer matches, so this file only shrinks.
+# All three rows are workflow files: a push that changes .github/workflows needs the `workflow` token scope, which the
+# lanes do not have. The fix is the patch named in the PR that added this file; the owner applies it, then deletes these rows.
+.github/workflows/ci.yml	image	ubuntu:26.04	pin to ubuntu:26.04@sha256:065aa8626841f16057b78b027b464cd59c4fac36c204c72dcbf48d66f5fa8a96 (workflow scope)
+.github/workflows/ci.yml	pip	numpy gguf (no ==version)	pin numpy==2.5.4 gguf==0.19.0 (workflow scope)
+.github/workflows/bump-tokenizers.yml	latest	releases/latest	deliberate (the bump bot proposes a pin): add a moving-ref comment (workflow scope)

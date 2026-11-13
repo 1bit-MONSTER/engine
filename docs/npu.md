@@ -3961,3 +3961,23 @@ and `--device hybrid` splits a single request across them ([hybrid.md](hybrid.md
 
 The NPU needs the `amdxdna` kernel driver. The [1bit OS](os-v3.md) appliance ships a kernel built
 with it, and the [Linux kernel](kernel.md) page covers building your own.
+
+## The Whisper host chain: threads and per-op times (engine#1783)
+
+`tools/whisper_transcribe` runs a Whisper pack's two ONNX graphs on the host (`npu/audio_exec.cpp`). Two variables
+control the executor:
+
+- `ONEBIT_AUDIO_THREADS=<n>` sets the number of worker threads. The default is the process's CPU affinity count, capped
+  at 8. MatMul splits its rows over these threads; Conv splits its output channels; Softmax and LayerNormalization split
+  their rows. Each unit runs the same serial loop as one thread would, so the output does not depend on the count.
+- `ONEBIT_AUDIO_OP_TIMES=1` prints, after each graph run, one line per op type with its calls and total wall time,
+  sorted, plus the node and thread counts:
+
+```
+[audio-op] 447 nodes, 5783.3 ms, 4 thread(s)
+[audio-op] MatMul                   96 calls     3491.8 ms
+[audio-op] Softmax                  12 calls      509.3 ms
+```
+
+On a loaded box, compare one op with MatMul in the same run rather than across runs: MatMul's share moves with load
+much less than the wall total does.

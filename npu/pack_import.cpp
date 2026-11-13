@@ -3492,6 +3492,7 @@ WriteLayoutResult container_write_layout(const std::string& payload_path, const 
     }
     std::ifstream in(payload_path, std::ios::binary);
     if (!in) { r.why = "cannot open the payload: " + payload_path; return r; }
+    json manifest = json::object();
     std::error_code ec;
     std::filesystem::create_directories(out_dir, ec);
     if (ec) { r.why = "cannot create " + out_dir + ": " + ec.message(); return r; }
@@ -3509,6 +3510,25 @@ WriteLayoutResult container_write_layout(const std::string& payload_path, const 
         if (!out) { r.why = "short write to " + path; return r; }
         ++r.files;
         r.bytes += int64_t(bytes.size());
+        manifest[item.slot] = {{"source", item.source},
+                               {"bytes", int64_t(bytes.size())},
+                               {"shape", item.shape},
+                               {"dtype", item.dtype}};
+    }
+    // The layout is self-describing: a directory of files whose names are engine slots is not enough, because the reader
+    // also needs to know which container tensor each came from and what shape/dtype it is.
+    {
+        const std::string mpath = out_dir + "/manifest.json";
+        std::ofstream mout(mpath, std::ios::trunc);
+        if (!mout) { r.why = "cannot write " + mpath; return r; }
+        json j;
+        j["tensors"] = manifest;
+        j["files"] = r.files;
+        j["bytes"] = r.bytes;
+        j["payload_bytes"] = plan.payload_bytes;
+        j["unplaced"] = plan.unplaced;
+        mout << j.dump(2) << "\n";
+        if (!mout) { r.why = "short write to " + mpath; return r; }
     }
     r.ok = true;
     return r;

@@ -5462,6 +5462,12 @@ void test_container_write_layout() {
         std::ifstream i2(out + "/model.layers.0.self_attn.q_proj.weight", std::ios::binary);
         std::string s2((std::istreambuf_iterator<char>(i2)), std::istreambuf_iterator<char>());
         check(s2 == "IJKLMNOPQRSTUVWX", "write: the projection carries ITS bytes (8..24)");
+        std::ifstream mi(out + "/manifest.json");
+        const std::string mtext((std::istreambuf_iterator<char>(mi)), std::istreambuf_iterator<char>());
+        check(mtext.find("model.layers.0.self_attn.q_proj.weight") != std::string::npos,
+              "write: the manifest names the slot");
+        check(mtext.find("\"source\": \"model.layers.0.self_attn.q_proj.weight\"") != std::string::npos,
+              "write: and the container tensor it came from");
     }
 
     // the refusal: an unplaced tensor means the pack would silently omit part of the model

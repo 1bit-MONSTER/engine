@@ -719,6 +719,21 @@ void test_prefix_cache() {
         check(c.lookup(ids(10, 2)).slot == -1, "a prompt whose start differs misses");
         check(c.lookup(ids(5)).slot == -1, "a shorter prompt does not hit a longer slot");
     }
+    {   // engine#2324: the pixels are not in `ids`, so a slot must also match the digest of the image parts.
+        // Without this, "same text, different picture" is a cache HIT and the answer comes from the wrong image.
+        PrefixCache c(o);
+        const uint64_t imageA = 0xAAAAull, imageB = 0xBBBBull;
+        const int slot = c.insert(ids(12), 4096, -1, nullptr, imageA);
+        check(slot >= 0, "a prompt with a picture is saved");
+        check(c.lookup(ids(12), imageA).slot == slot, "the same picture hits");
+        check(c.lookup(ids(12), imageB).slot == -1, "a DIFFERENT picture misses, even with identical tokens");
+        check(c.lookup(ids(12)).slot == -1, "and so does a request with no picture at all");
+        check(c.lookup(ids(12), imageB).reason == "no slot shares a prefix", "the miss is reported like any other");
+        // the text-only path is unchanged: two text-only slots still hit each other
+        PrefixCache t(o);
+        const int ts = t.insert(ids(10), 1024);
+        check(t.lookup(ids(10)).slot == ts, "a text-only prompt still hits a text-only slot");
+    }
     {   // the LONGEST matching slot wins, not the newest and not the immediately preceding one
         PrefixCache c(o);
         c.insert(ids(20), 1024);

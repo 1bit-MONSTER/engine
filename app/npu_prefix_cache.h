@@ -103,6 +103,11 @@ struct PrefixSlot {
     uint64_t last_used = 0;   // monotonic, for eviction
     bool live = false;        // false = free/reusable
     bool pinned = false;      // the shared prefix: not evicted for room, not replaced by a longer prompt
+    // engine#2324: a request's PIXELS are not in `ids`, so a slot matched on tokens alone can hand a picture's
+    // prefill state to a different picture. Every slot carries the digest of the image parts it was prefilled
+    // with (0 = no image), and a match requires equality -- without that, "same text, different picture" is a
+    // cache hit that answers the wrong question with confidence.
+    uint64_t image_digest = 0;
 };
 
 class PrefixCache {
@@ -121,7 +126,7 @@ public:
 
     // The longest live slot whose tokens are a prefix of `ids`.  A slot that covers the whole
     // prompt is still a hit: the request continues from it instead of re-prefilling.
-    PrefixDecision lookup(const std::vector<int>& ids) {
+    PrefixDecision lookup(const std::vector<int>& ids, uint64_t image_digest = 0) {
         PrefixDecision d;
         if (!enabled()) {
             d.reason = "off";
@@ -132,6 +137,7 @@ public:
         for (size_t i = 0; i < slots_.size(); i++) {
             const PrefixSlot& s = slots_[i];
             if (!s.live || s.ids.empty() || s.ids.size() > ids.size()) continue;
+            if (s.image_digest != image_digest) continue;   // a different picture is a different prefix
             if (!std::equal(s.ids.begin(), s.ids.end(), ids.begin())) continue;
             if (s.ids.size() > best) {
                 best = s.ids.size();
@@ -155,7 +161,8 @@ public:
     // store the state in, or -1 when the prompt is not worth keeping.  `extended` is the slot the
     // request resumed from (-1 when it prefilled from scratch): that slot is replaced, because the
     // longer prompt covers it.
-    int insert(const std::vector<int>& ids, size_t bytes, int extended = -1, std::string* why = nullptr) {
+    int insert(const std::vector<int>& ids, size_t bytes, int extended = -1, std::string* why = nullptr,
+               uint64_t image_digest = 0) {
         auto refuse = [&](const std::string& reason) {
             if (why) *why = reason;
             return -1;
@@ -183,7 +190,7 @@ public:
             slot = free_slot();
             if (slot < 0) return refuse("no free slot");  // every slot holds a better prompt
         }
-        fill(slot, ids, bytes, /*pinned=*/false);
+        fill(slot, ids, bytes, /*pinned=*/false, image_digest);
         if (why) *why = "saved";
         return slot;
     }
@@ -235,7 +242,7 @@ public:
             if (slot < 0) return refuse("no free slot");
             release(slots_[size_t(slot)]);
         }
-        fill(slot, prefix, bytes, /*pinned=*/true);
+        fill(slot, prefix, bytes, /*pinned=*/true, 0);   // a pin is the system prefix: text only
         if (why) *why = "pinned";
         return slot;
     }
@@ -288,12 +295,13 @@ private:
             if (!slots_[i].live) return int(i);
         return -1;
     }
-    void fill(int slot, const std::vector<int>& ids, size_t bytes, bool pinned) {
+    void fill(int slot, const std::vector<int>& ids, size_t bytes, bool pinned, uint64_t image_digest) {
         PrefixSlot& s = slots_[size_t(slot)];
         s.ids = ids;
         s.bytes = bytes;
         s.live = true;
         s.pinned = pinned;
+        s.image_digest = image_digest;
         s.last_used = ++last_used_;
         used_ += bytes;
     }

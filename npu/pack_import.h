@@ -443,6 +443,19 @@ struct WriteLayoutResult {
 };
 WriteLayoutResult container_write_layout(const std::string& payload_path, const ImportPlan& plan,
                                          const std::string& out_dir, bool allow_unplaced);
+// The PACK form: one contiguous payload plus a header, which is the shape the forward opens (a container of the same genre).
+// Same refusal as the layout form -- nothing is written when the plan has unplaced tensors and allow_unplaced is false --
+// because a header that omits a fifth of the model is exactly as silent as a missing file.
+struct WritePackResult {
+    bool ok = false;
+    int64_t tensors = 0;
+    int64_t bytes = 0;
+    std::string payload;   // the file written, when ok
+    std::string header;
+    std::string why;
+};
+WritePackResult container_write_pack(const std::string& payload_path, const ImportPlan& plan,
+                                     const std::string& out_dir, bool allow_unplaced);
 // engine#1788, 3c: what the import should EMIT, learned from the source rather than invented. A container tensor's shape is
 // already the chunk: `[4096,8,4736] I8` is N=4096, 8 groups, 4736 bytes per row, and 4736 is exactly the Q4_K chunk size.
 // So the payload IS q4nx chunk data and the import needs no re-quantisation -- it emits a container OF THE SAME GENRE:

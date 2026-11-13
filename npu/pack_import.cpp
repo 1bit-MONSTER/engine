@@ -3488,6 +3488,55 @@ static std::string group_suffix_slot(const std::string& role, const std::string&
 // re-quantised would have to make a choice the container does not make, and getting it wrong is a pack that decodes to
 // wrong weights with no error anywhere. Copying the payload's bytes verbatim cannot make that mistake: the layout is the
 // container's, and the forward already knows how to read it.
+WritePackResult container_write_pack(const std::string& payload_path, const ImportPlan& plan,
+                                     const std::string& out_dir, bool allow_unplaced) {
+    WritePackResult r;
+    r.payload = out_dir + "/model.q4nx";
+    r.header = out_dir + "/pack.json";
+    if (!plan.unplaced.empty() && !allow_unplaced) {
+        r.why = std::to_string(plan.unplaced.size()) + " tensor(s) have no destination (e.g. " + plan.unplaced.front() +
+                "); refusing to write a partial pack";
+        return r;
+    }
+    std::ifstream in(payload_path, std::ios::binary);
+    if (!in) { r.why = "cannot open the payload: " + payload_path; return r; }
+    std::error_code ec;
+    std::filesystem::create_directories(out_dir, ec);
+    if (ec) { r.why = "cannot create " + out_dir + ": " + ec.message(); return r; }
+    std::ofstream out(r.payload, std::ios::binary | std::ios::trunc);
+    if (!out) { r.why = "cannot write " + r.payload; return r; }
+    json tensors = json::object();
+    int64_t off = 0;
+    for (const auto& item : plan.items) {
+        in.seekg(item.begin);
+        std::string bytes(size_t(item.end - item.begin), '\0');
+        if (!in.read(&bytes[0], std::streamsize(bytes.size()))) {
+            r.why = "short read at " + std::to_string(item.begin) + " for " + item.source; return r;
+        }
+        out.write(bytes.data(), std::streamsize(bytes.size()));
+        if (!out) { r.why = "short write to " + r.payload; return r; }
+        // the header records where each slot's bytes sit in the contiguous payload: the offsets ARE the format
+        tensors[item.slot] = {{"offset", off}, {"bytes", int64_t(bytes.size())},
+                              {"shape", item.shape}, {"dtype", item.dtype}, {"source", item.source}};
+        off += int64_t(bytes.size());
+        ++r.tensors;
+    }
+    out.close();
+    if (!out) { r.why = "short write to " + r.payload; return r; }
+    json h;
+    h["tensors"] = tensors;
+    h["bytes"] = off;
+    h["payload_bytes"] = plan.payload_bytes;
+    h["unplaced"] = plan.unplaced;
+    std::ofstream hout(r.header, std::ios::trunc);
+    if (!hout) { r.why = "cannot write " + r.header; return r; }
+    hout << h.dump(2) << "\n";
+    if (!hout) { r.why = "short write to " + r.header; return r; }
+    r.bytes = off;
+    r.ok = true;
+    return r;
+}
+
 WriteLayoutResult container_write_layout(const std::string& payload_path, const ImportPlan& plan,
                                          const std::string& out_dir, bool allow_unplaced) {
     WriteLayoutResult r;

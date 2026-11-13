@@ -5486,6 +5486,49 @@ void test_container_write_layout() {
     fs::remove_all(dir);
 }
 
+// engine#1788, 3c: the PACK form. One contiguous payload plus a header of offsets -- so the arm reads the payload back at
+// each header offset and compares with the source range. An offset header that is merely self-consistent is not enough.
+void test_container_write_pack() {
+    namespace fs = std::filesystem;
+    using pi::Q4nxTensor;
+    const std::string dir = (fs::temp_directory_path() / "onebit-write-pack-test").string();
+    fs::remove_all(dir); fs::create_directories(dir);
+    const std::string payload = dir + "/payload.bin";
+    { std::ofstream o(payload, std::ios::binary); for (int i = 0; i < 64; ++i) o.put(char('A' + (i % 26))); }
+
+    pi::Q4nxContainer c;
+    const auto t = [](const std::string& n, int64_t b, int64_t e) {
+        Q4nxTensor x; x.name = n; x.shape = {2, 2}; x.dtype = "I8"; x.begin = b; x.end = e; return x;
+    };
+    c.tensors = {t("model.embed_tokens.weight", 0, 8), t("model.layers.0.self_attn.q_proj.weight", 8, 24)};
+    c.payload_bytes = 64;
+    const pi::ImportPlan plan = pi::container_import_plan(c, {"full_attention"});
+
+    const std::string out = dir + "/pack";
+    const pi::WritePackResult w = pi::container_write_pack(payload, plan, out, false);
+    check(w.ok, "pack: writes");
+    check(w.tensors == 2 && w.bytes == 24, "pack: two tensors, 24 bytes");
+    {
+        std::ifstream pi_in(out + "/model.q4nx", std::ios::binary);
+        const std::string blob((std::istreambuf_iterator<char>(pi_in)), std::istreambuf_iterator<char>());
+        check(blob.size() == 24, "pack: the payload is exactly the planned bytes");
+        check(blob.substr(0, 8) == "ABCDEFGH", "pack: the first slot sits at offset 0");
+        check(blob.substr(8, 16) == "IJKLMNOPQRSTUVWX", "pack: the second follows contiguously");
+        std::ifstream hi(out + "/pack.json");
+        const std::string htext((std::istreambuf_iterator<char>(hi)), std::istreambuf_iterator<char>());
+        check(htext.find("\"offset\": 0") != std::string::npos, "pack: the header states offset 0");
+        check(htext.find("\"offset\": 8") != std::string::npos, "pack: and offset 8 for the second");
+    }
+    // same refusal as the layout form
+    pi::Q4nxContainer bad;
+    bad.tensors = {t("model.embed_tokens.weight", 0, 8), t("model.layers.0.mystery.weight", 8, 16)};
+    bad.payload_bytes = 64;
+    const pi::ImportPlan bp = pi::container_import_plan(bad, {});
+    const pi::WritePackResult w2 = pi::container_write_pack(payload, bp, dir + "/pack2", false);
+    check(!w2.ok && w2.why.find("no destination") != std::string::npos, "pack: an incomplete plan is refused with a reason");
+    fs::remove_all(dir);
+}
+
 void test_container_placement() {
     using pi::Q4nxTensor;
     const auto t = [](const std::string& n) { Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
@@ -6769,6 +6812,7 @@ int main(int argc, char** argv) {
         test_container_roles_gemma_local();
         test_container_roles_moe_and_singular_layer();
         test_container_placement();
+        test_container_write_pack();
         test_container_write_layout();
         test_container_import_plan();
         test_scale_and_proj_norm_roles();

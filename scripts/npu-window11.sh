@@ -105,11 +105,12 @@ if tol is None and control is None:
 
 
 def load(path):
-    texts, prof, order, taps, head = {}, {}, [], [], {}
+    texts, prof, order, taps, head, chars = {}, {}, [], [], {}, {}
     for line in open(path, encoding="utf-8", errors="replace"):
         m = re.match(r"text (\d+) sha256=(\S+) chars=(\d+) text=(.*)$", line)
         if m:
             texts.setdefault(int(m.group(1)), []).append(m.group(2))
+            chars[int(m.group(1))] = int(m.group(3))
             continue
         m = re.match(r"prof (dec|pre) (\S+) M=(\d+) ms=([-\d.]+) launches=(\d+)$", line)
         if m:
@@ -125,7 +126,7 @@ def load(path):
             continue
         if line.startswith("tap "):
             taps.append(line[4:].rstrip("\n"))
-    return texts, prof, order, taps, head
+    return texts, prof, order, taps, head, chars
 
 
 def stat_row(pa, pb, paired_ok):
@@ -143,8 +144,8 @@ def stat_row(pa, pb, paired_ok):
 
 def spread(c1, c2):
     """One binary run twice: its own spread is the only tolerance this box can justify."""
-    _, p1, o1, _, _ = load(c1)
-    _, p2, _, _, _ = load(c2)
+    _, p1, o1, _, _, _ = load(c1)
+    _, p2, _, _, _, _ = load(c2)
     rows = [k for k in o1 if k in p2]
     if not rows:
         die("compare: the control logs share no prof rows")
@@ -187,8 +188,8 @@ if control is not None:
 else:
     tol_from = "--tol"
 
-ta, pa, oa, ka, ha = load(a)
-tb, pb, ob, kb, hb = load(b)
+ta, pa, oa, ka, ha, ca = load(a)
+tb, pb, ob, kb, hb, cb = load(b)
 
 rounds = {k: min(len(pa[k]), len(pb[k])) for k in set(pa) & set(pb)}
 paired_ok = bool(rounds) and min(rounds.values()) >= 2
@@ -199,6 +200,15 @@ fail = 0
 
 if len(ta) != 3 or len(tb) != 3:
     print(f"FAIL only {len(ta)}/{len(tb)} transcript prompts recorded (3 expected)"); fail = 1
+# A row with chars=0 is a response the writer could not parse: the request failed, or came back as something that is
+# not a chat completion. Its sha is the empty string's, so two such runs compare "3/3 identical" and this gate passes
+# having tested nothing - measured on two logs of three empty rows: "window11: PASS", rc 0. An answer that is merely
+# empty is not this: the writer joins content, reasoning, tool_calls and finish_reason with separators, so a real
+# answer is never 0 characters.
+empty = sorted(i for i, n in list(ca.items()) + list(cb.items()) if n == 0)
+if empty:
+    print(f"FAIL prompt {sorted(set(empty))} recorded an empty transcript - the response could not be parsed, so "
+          f"there is nothing to compare"); fail = 1
 same = sum(1 for i in ta if i in tb and ta[i] == tb[i])
 print(f"texts: {same}/3 identical")
 for i in sorted(ta):

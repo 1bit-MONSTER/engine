@@ -113,11 +113,20 @@ inline bool decode_image_data_url(const std::string& url, DecodedImage& out) {
             else break;
         }
     };
+    // Accumulated in int64_t and bounded BEFORE it can overflow an int: the input is a remote data: URL, so a header
+    // claiming a width of 10^14 is a hostile value, not a typo. `int` arithmetic here was undefined behaviour that happened
+    // to be caught afterwards by the `w <= 0` check -- a parser must not rely on the wrap landing somewhere detectable.
+    bool range_error = false;
     auto read_uint = [&](int& v) {
         skip_ws_and_comments();
         if (i >= raw.size() || raw[i] < '0' || raw[i] > '9') return false;
-        v = 0;
-        while (i < raw.size() && raw[i] >= '0' && raw[i] <= '9') { v = v * 10 + (raw[i] - '0'); ++i; }
+        int64_t acc = 0;
+        while (i < raw.size() && raw[i] >= '0' && raw[i] <= '9') {
+            acc = acc * 10 + (raw[i] - '0');
+            ++i;
+            if (acc > 2147483647LL) { range_error = true; return false; }
+        }
+        v = int(acc);
         return true;
     };
     if (raw.size() < 2 || raw[0] != 'P' || raw[1] != '6') {
@@ -127,7 +136,8 @@ inline bool decode_image_data_url(const std::string& url, DecodedImage& out) {
     i = 2;
     int h = 0, w = 0, maxval = 0;
     if (!read_uint(w) || !read_uint(h) || !read_uint(maxval)) {
-        out.error = "the PPM header is truncated (width, height and maxval are required)";
+        out.error = range_error ? "a PPM header field is out of range (a dimension is larger than 2^31-1)"
+                                : "the PPM header is truncated (width, height and maxval are required)";
         return false;
     }
     if (maxval != 255) {
@@ -139,6 +149,9 @@ inline bool decode_image_data_url(const std::string& url, DecodedImage& out) {
         return false;
     }
     ++i;   // exactly one whitespace byte after maxval, then binary samples
+    // "At least", not "exactly": a PPM stream may carry trailing data after the samples, and refusing it would reject files
+    // that are correct. What the buffer handed downstream is -- exactly w*h*3 bytes -- is what has to be exact, and that is
+    // the `assign` below rather than this test.
     const size_t need = size_t(w) * size_t(h) * 3u;
     if (raw.size() < i + need) {
         out.error = "the PPM is short: " + std::to_string(raw.size() - i) + " of " + std::to_string(need) + " sample bytes";

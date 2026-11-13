@@ -117,6 +117,31 @@ int main() {
         check(!decode_image_data_url("data:image/x-portable-pixmap," + ppm(1, 1), img),
               "a non-base64 data URL is refused");
     }
+    // 4b. the hostile header: a dimension past 2^31-1 is refused as out of range, not as a wrapped int. This is a parser of
+    // a REMOTE string, so the width is attacker-controlled; before the fix the multiply was signed-overflow UB and only the
+    // `w <= 0` check afterwards caught the wrap.
+    {
+        DecodedImage img;
+        check(!decode_image_data_url("data:image/x-portable-pixmap;base64," + b64("P6\n2147483648 2\n255\n"), img),
+              "a width past 2^31-1 is refused");
+        check(img.error.find("out of range") != std::string::npos,
+              "...and says the field is out of range rather than calling the header truncated");
+    }
+    {
+        DecodedImage img;
+        check(!decode_image_data_url("data:image/x-portable-pixmap;base64," + b64("P6\n99999999999999 2\n255\n"), img),
+              "a 14-digit width is refused too");
+    }
+    // 4c. trailing bytes ARE accepted, deliberately: a PPM stream may carry data after the samples. Pinned so the leniency
+    // cannot be mistaken for the "exact" the earlier comment claimed, and so the buffer handed downstream stays exactly w*h*3.
+    {
+        DecodedImage img;
+        const std::string p = ppm(2, 1) + "trailing";
+        check(decode_image_data_url("data:image/x-portable-pixmap;base64," + b64(p), img),
+              "a PPM with trailing bytes after the samples is still accepted");
+        check(img.rgb.size() == 6, "...and the buffer handed downstream is exactly w*h*3, not the trailing bytes too");
+    }
+
     // 5. the decoder is not fooled by a P3 (ASCII PPM) header
     {
         DecodedImage img;

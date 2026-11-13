@@ -190,6 +190,11 @@ if(ONEBIT_JINJA)
         ${_onebit_jinja_dir}/jinja/caps.cpp
         # jinja/value.cpp includes the fork's unicode.h, and these are its implementation
         ${_onebit_jinja_dir}/unicode.cpp)
+    # engine#2138: from llama.cpp #327 on, jinja/value.cpp works through common_json (common/json.cpp),
+    # whose JSON_ASSERT is GGML_ASSERT. The binary does not link ggml, so the one function that needs,
+    # ggml_abort(), comes from app/jinja_ggml_abort.cpp; ggml.h is read for its declaration only.
+    target_sources(onebit_jinja PRIVATE ${_onebit_jinja_dir}/json.cpp ${CMAKE_SOURCE_DIR}/app/jinja_ggml_abort.cpp)
+    target_include_directories(onebit_jinja PRIVATE ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/ggml/include)
     target_include_directories(onebit_jinja PUBLIC ${_onebit_jinja_dir})
     target_link_libraries(onebit_jinja PUBLIC nlohmann_json::nlohmann_json)
     target_compile_definitions(onebit_jinja PUBLIC ONEBIT_JINJA=1)

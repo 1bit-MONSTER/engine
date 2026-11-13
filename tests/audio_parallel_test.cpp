@@ -82,6 +82,34 @@ std::vector<float> matmul_at(const char* threads, int64_t M, int64_t K, int64_t 
     return out.data;
 }
 
+// engine#2366: the GEMM groups four output rows per unit, so the shapes that are NOT a multiple of four -- and a group
+// whose four rows are all zero, which is the only case the group-level zero shortcut can skip -- must equal a plain
+// ordered sum. M=37 above already covers the tail with one row; these cover M < 4 and the all-zero group.
+void test_row_group_edges() {
+    const int64_t N = 17, K = 23;
+    const int64_t ms[] = {1, 2, 3, 5, 8};          // 1..3 = a lone short group, 5 = one full group + a short one
+    for (int64_t M : ms) {
+        std::vector<float> x(size_t(M * K)), w(size_t(K * N));
+        for (size_t i = 0; i < x.size(); ++i) x[i] = float(std::sin(0.019 * double(i + 1)) * 2.0);
+        for (size_t i = 0; i < w.size(); ++i) w[i] = float(std::cos(0.031 * double(i + 2)) * 0.5);
+        if (M >= 4)                                     // rows 0..3 all zero: the group shortcut fires for that k only
+            for (int64_t r = 0; r < 4; ++r)
+                for (int64_t k = 0; k < K; ++k) x[size_t(r * K + k)] = 0.0f;
+        std::vector<float> want(size_t(M * N), 0.0f);
+        for (int64_t i = 0; i < M; ++i)
+            for (int64_t k = 0; k < K; ++k) {
+                const float av = x[size_t(i * K + k)];
+                for (int64_t j = 0; j < N; ++j) want[size_t(i * N + j)] += av * w[size_t(k * N + j)];
+            }
+        for (const char* t : {"1", "2", "4"}) {
+            const std::vector<float> got = matmul_at(t, M, K, N, x, w);
+            check(got.size() == want.size() && std::memcmp(got.data(), want.data(), want.size() * sizeof(float)) == 0,
+                  "MatMul M=" + std::to_string(M) + " at ONEBIT_AUDIO_THREADS=" + t +
+                      " matches the ordered sum (row-group tail and all-zero group)");
+        }
+    }
+}
+
 void test_bit_identity() {
     // 37 rows: divisible by none of the thread counts below, so the last worker's share is short at every one of them.
     const int64_t M = 37, K = 53, N = 29;
@@ -191,6 +219,7 @@ void test_a_throwing_unit() {
 
 int main() {
     test_bit_identity();
+    test_row_group_edges();
     test_every_unit_once();
     test_a_throwing_unit();
     if (g_failures == 0) std::printf("audio_parallel: ok\n");

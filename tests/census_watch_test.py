@@ -348,13 +348,12 @@ check("without the watch field the reviewed class alerts", rc == 1 and res["sign
 # 15. The classes the 2026-10-14..16 streak flagged (issue #427 and the two un-filed runs
 #     before it) are reviewed, documented and non-alerting.
 for cls, mid in (
-    ("DFlash2DraftModel", "nchapman/Qwen3.5-4B-DFlash2"),
+    # DFlash2DraftModel used to be here; pin 2c178f44 implements it (asserted as covered, section 15b).
     ("DiacritizerModel", "ahmadsy/tashkeel-nano-1p1m"),
     ("MBartForConditionalGeneration", "nhatho1999/orthomni-codeco"),
     ("BlindForCausalLM", "Vi-LAB/KenT_0.5B_Base"),
     ("NanochronoForCausalLM", "tensin320/round14_5_114_fitleech_sn38-2023-01"),
-    # issue #437 (2026-10-17): upstream-only architecture, after the pin.
-    ("MuseSparkForConditionalGeneration", "Interchained/Muse-Spark-Open-816B-A42B-GGUF"),
+    # MuseSparkForConditionalGeneration (issue #437) used to be here; pin 2c178f44 implements it (section 15b).
     # engine #1667 (2026-11-09): the two UNCOVERED classes the daily census raised that day, declined
     # with their reasons in significant.json. report-only, because nothing a backend can read defines
     # Liwet's router and nanoGPT's GPT is not GPT-2 under another name.
@@ -383,6 +382,22 @@ check("DeepseekV41ForCausalLM mapped at this pin -> covered, exit 0",
       rc == 0 and res[cw.COVERED] == ["overhand/DeepSeek-V4.1-Flash-1017-MXFP4-uncensored"])
 check("DeepseekV41ForCausalLM mapped -> no significant alert and no reviewed_report line",
       res["significant"] == [] and res["reviewed_report"] == [])
+
+# 15b. engine#2138: pin 2c178f44 (llama.cpp #327) implements four more reviewed classes as their own
+#      architectures (docs/arch-gaps.md, "Mapped since 2c178f44b"). The same uploads that were listed
+#      REVIEWED are now covered and silent, and significant.json says why (mapped_ok).
+MAPPED_2138 = (
+    ("DFlash2DraftModel", "nchapman/Qwen3.5-4B-DFlash2"),
+    ("MuseSparkForConditionalGeneration", "Interchained/Muse-Spark-Open-816B-A42B-GGUF"),
+    ("GraniteSwitchForCausalLM", "ibm-granite/granite-switch-4.1-8b"),
+    ("Lfm3ForCausalLM", "D0zy/essay-model-merged"),
+)
+for cls, mid in MAPPED_2138:
+    check(f"{cls} is mapped at this pin, with a mapped_ok reason and its dated note",
+          cls in archs and sig.get(cls, {}).get("mapped_ok") and cls in gap_docs)
+    rc, res = rc_of([model(mid, cls)], archs, sig)
+    check(f"{cls} mapped -> covered, exit 0, no significant alert and no reviewed_report line",
+          rc == 0 and res[cw.COVERED] == [mid] and res["significant"] == [] and res["reviewed_report"] == [])
 
 # --- FastFlowLM org + releases watch (engine#588) ----------------------------------
 #
@@ -431,12 +446,14 @@ def flm_state():
 # measured there, bench/npu-leaderboard/27b-*.json), so the example moved to a family that is
 # still HRX-only - gemma3, which FLM also publishes Q4NX packs for. Reading the live registry is
 # the point: if gemma3 is ever registered for the NPU this check fails and the example moves again.
-LFM3_REPO = {
-    "id": "FastFlowLM/LFM3-1.7B-NPU2",
+# A pack for a reviewed-and-declined class. It was FLM's real LFM3-1.7B pack until pin 2c178f44 implemented
+# lfm3 (engine#2138); NeedleForToolCalling is still declined, so this listing entry is built for the test.
+DECLINED_REPO = {
+    "id": "FastFlowLM/Needle-Test-NPU2",
     "lastModified": "2026-10-28T00:00:00.000Z",
-    "tags": ["base_model:LiquidAI/LFM3-1.7B", "license:other"],
+    "tags": ["base_model:Amdkn7/needle3", "license:other"],
     # reviewed, not an alias: registry/significant.json, watch: report -> the pack is listed, not alerted
-    "config": {"architectures": ["Lfm3ForCausalLM"], "model_type": "lfm3"},
+    "config": {"architectures": ["NeedleForToolCalling"], "model_type": "needle"},
     "siblings": [{"rfilename": "config.json"}, {"rfilename": "model.q4nx"}],
 }
 
@@ -473,9 +490,16 @@ check("flm org: the npu route is reported for a family it serves",
 llama = by_id["FastFlowLM/Llama-3.2-1B-NPU2"]
 check("flm org: a second npu family is reported", llama["npu_model_type"] == "llama")
 mini = by_id["FastFlowLM/MiniCPM-V-4.7-1B-NPU2"]
-check("flm org: an unmapped architecture is unmapped, not a guess",
+# engine#2138: from pin 2c178f44 the fork converts MiniCPM-V 4.7 (a qwen35 text model plus its own
+# projector), so the live registry maps it for hrx only and its pack reads as an NPU gap. The unmapped
+# case is the same listing against a registry without the class - the one before that pin.
+pre_2138_archs = {k: v for k, v in live_archs.items() if k != "MiniCPMV4_7ForConditionalGeneration"}
+check("flm org: a family mapped for hrx only reads as an NPU gap, not as served",
       mini["architecture"] == "MiniCPMV4_7ForConditionalGeneration"
-      and not mini["mapped"] and cw.unmapped(mini) and not mini["npu"])
+      and mini["mapped"] and not mini["npu"] and cw.unmapped(mini))
+mini_pre = {r["id"]: r for r in cw.sweep_org(pre_2138_archs, fetch=flm_fetch)}["FastFlowLM/MiniCPM-V-4.7-1B-NPU2"]
+check("flm org: an unmapped architecture is unmapped, not a guess",
+      not mini_pre["mapped"] and cw.unmapped(mini_pre) and not mini_pre["npu"])
 gguf = by_id["FastFlowLM/Qwen3.5-0.8B-gguf"]
 check("flm org: a config-less gguf drop is a derivative, not a new family",
       gguf["derivative"] and not cw.unmapped(gguf) and not gguf["mapped"])
@@ -511,14 +535,15 @@ with contextlib.redirect_stderr(io.StringIO()):
 check("flm sizes: a failed detail fetch keeps the repo (size 0, no crash)",
       [f["size"] for f in kept["q4nx"]] == [0])
 
-# engine#1451: `Lfm3ForCausalLM` and `DFlash2DraftModel` are recorded in registry/significant.json as
+# engine#1451: `Lfm3ForCausalLM` and `DFlash2DraftModel` were recorded in registry/significant.json as
 # reviewed-not-an-alias. The class census already printed them `. REVIEWED`; the FLM half printed
 # `!! NEW FLM ... registry: none` forever, which is what kept a daily issue open on an answered question.
-_declined_rows = cw.sweep_org(live_archs, fetch=lambda url: fixture("org.json") + [LFM3_REPO])
+# Both are mapped from pin 2c178f44 (engine#2138), so a still-declined class stands in for them.
+_declined_rows = cw.sweep_org(live_archs, fetch=lambda url: fixture("org.json") + [DECLINED_REPO])
 _buf = io.StringIO()
 with contextlib.redirect_stdout(_buf):
     cw.report_flm(_declined_rows, cw.sweep_releases(fetch=flm_fetch),
-                  [r for r in _declined_rows if r["id"] == "FastFlowLM/LFM3-1.7B-NPU2"], [], answers=NO_ANSWERS)
+                  [r for r in _declined_rows if r["id"] == DECLINED_REPO["id"]], [], answers=NO_ANSWERS)
 _declined_listing = _buf.getvalue()
 
 # 18. One line per repo, `!! NEW FLM` only for a family we cannot serve, and the exit code
@@ -533,14 +558,19 @@ check("flm first run: an unmapped family alerts (exit 1)", flm_rc == 1)
 check("flm report: one line per repo",
       len([ln for ln in first.splitlines()
            if ln.startswith(FLM_LINE_PREFIXES)]) == 5)
-check("flm report: the unknown family is marked !! NEW FLM",
-      "  !! NEW FLM FastFlowLM/MiniCPM-V-4.7-1B-NPU2" in first)
+check("flm report: a family mapped for hrx only is marked !! NPU FLM (engine#2138: MiniCPM-V 4.7)",
+      "  !! NPU FLM FastFlowLM/MiniCPM-V-4.7-1B-NPU2" in first)
+_pre_buf = io.StringIO()
+with contextlib.redirect_stdout(_pre_buf), contextlib.redirect_stderr(io.StringIO()):
+    _pre_rc, _ = cw.watch_flm(pre_2138_archs, flm_state(), fetch=flm_fetch, detail=flm_detail, answers=NO_ANSWERS)
+check("flm report: the unknown family is marked !! NEW FLM (the registry before pin 2c178f44)",
+      "  !! NEW FLM FastFlowLM/MiniCPM-V-4.7-1B-NPU2" in _pre_buf.getvalue() and _pre_rc == 1)
 check("flm report: a reviewed-and-declined class is listed, not alerted (engine#1451)",
-      "  . FLM FastFlowLM/LFM3-1.7B-NPU2" in _declined_listing
-      and "!! NEW FLM FastFlowLM/LFM3-1.7B-NPU2" not in _declined_listing
+      "  . FLM " + DECLINED_REPO["id"] in _declined_listing
+      and "!! NEW FLM " + DECLINED_REPO["id"] not in _declined_listing
       and "registry: none (reviewed, not an alias" in _declined_listing)
 check("flm report: a reviewed-and-declined class is not counted as an unmapped family",
-      "LFM3-1.7B-NPU2" not in _declined_listing.split("publish a family this engine does not serve")[-1]
+      DECLINED_REPO["id"] not in _declined_listing.split("publish a family this engine does not serve")[-1]
       if "publish a family this engine does not serve" in _declined_listing else True)
 check("flm report: a mapped family is not marked",
       "  + FLM FastFlowLM/Qwen3-8B-NPU2" in first and "!! NEW FLM FastFlowLM/Qwen3-8B-NPU2" not in first)
@@ -749,7 +779,7 @@ batch_619 = {
     "LiveMemForCausalLM": ("livemem", "Popbones/LiveMem-RL-mlx-q4-backbone"),
     "CDMMoELMPoincare": ("cdm_moe_poincare", "DuoNeural/Lattice-7-Hermes-CDM-Poincare-Instruct"),
     "Senryu2ForCausalLM": ("senryu2", "KerzgrAI/Senryu-2.2-1B"),
-    "GraniteSwitchForCausalLM": ("granite_switch", "ibm-granite/granite-switch-4.1-8b"),
+    # GraniteSwitchForCausalLM was the fourth; pin 2c178f44 implements it (section 15b, engine#2138).
 }
 for cls, (model_type, mid) in batch_619.items():
     entry = sig.get(cls) or {}
@@ -761,8 +791,8 @@ for cls, (model_type, mid) in batch_619.items():
           rc == 0 and res["reviewed_report"] == [cls] and res["significant"] == []
           and res[cw.UNCOVERED] == [mid])
 _, out = text_of([model("ibm-granite/granite-switch-4.1-8b", "GraniteSwitchForCausalLM")], archs, sig)
-check("granite switch is printed as REVIEWED, not UNCOVERED",
-      ". REVIEWED GraniteSwitchForCausalLM" in out and "UNCOVERED" not in out)
+check("granite switch is not printed as REVIEWED or UNCOVERED now that the pin implements it (engine#2138)",
+      "REVIEWED GraniteSwitchForCausalLM" not in out and "UNCOVERED" not in out)
 
 variant_619 = {
     "LNewqForConditionalGeneration": "crussella0129/LNewq",
@@ -784,7 +814,7 @@ for cls, mid in variant_619.items():
 with open(os.path.join(ROOT, "registry", "census.json")) as f:
     counts = json.load(f)["raw"]["counts"]
 check("census.json records every engine#619 class",
-      all(counts.get(cls) for cls in list(batch_619) + list(variant_619)))
+      all(counts.get(cls) for cls in list(batch_619) + list(variant_619) + ["GraniteSwitchForCausalLM"]))
 check("census.json shows granite switch is not a one-off",
       counts["GraniteSwitchForCausalLM"] > 1)
 
@@ -824,13 +854,15 @@ for repo_id, cls in flm_1105:
     check(f"{repo_id} is recorded in docs/npu.md", repo_id in npu_docs)
     if not cls:
         continue
-    if cls == "HYV3ForCausalLM":
-        check("Hy-Memory's hy_v3 is mapped for hrx only, so its pack is an NPU gap",
+    if cls in archs:
+        # Hy-Memory's hy_v3 from the start; from pin 2c178f44 (engine#2138) also MiniCPM-V 4.7, MiniCPM-OCR,
+        # DFlash2 and LFM3, which the fork now converts. Mapped for hrx only, so the pack is an NPU gap.
+        check(f"{cls} is mapped for hrx only, so {repo_id} is an NPU gap",
               archs[cls]["backends"] == ["hrx"] and "npu" not in archs[cls]["backends"]
               and cls in npu_docs)
         hy = cw.flm_repo({"id": repo_id, "config": {"architectures": [cls]},
                           "siblings": [{"rfilename": "model.q4nx"}]}, archs)
-        check("Hy-Memory pack resolves to the recorded npu gap, not a mapping",
+        check(f"{repo_id} resolves to the recorded npu gap, not a mapping",
               hy["mapped"] and cw.npu_gap(hy) and cw.unmapped(hy) and not hy["npu"])
     else:
         check(f"{cls} stays out of the registry (no GGUF alias claimed)",
@@ -845,7 +877,7 @@ for repo_id, cls in flm_1105:
 #     report-only, and the FastFlowLM NPU rows are answered family by family in docs/npu.md
 #     instead of being mapped as GGUF aliases or given an `npu` backend they do not have.
 batch_1106 = {
-    "Lfm3ForCausalLM": ("lfm3", "D0zy/essay-model-merged"),
+    # Lfm3ForCausalLM was the other; pin 2c178f44 implements it (section 15b, engine#2138).
     "NeedleForToolCalling": ("needle", "Amdkn7/needle3"),
 }
 for cls, (model_type, mid) in batch_1106.items():

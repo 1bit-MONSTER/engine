@@ -306,13 +306,31 @@ want_model() { [ -z "$ONLY_MODELS" ] && return 0; case ",$ONLY_MODELS," in *",$1
 
 ring_timeouts() { journalctl -k --since "@$START" --no-pager 2>/dev/null | grep -c "ring .*timeout" || true; }
 
+coder_busy_from_json() {  # stdin: the /slots body. prints the busy count, or -1 when it cannot be read
+  python3 -c 'import json,sys
+try: print(sum(1 for s in json.load(sys.stdin) if s.get("is_processing")))
+except Exception: print(-1)'
+}
+
 wait_coder_idle() {  # the PR-Agent's Vulkan model: never start an HRX step while it is generating
   local waited=0
   while [ "$waited" -lt "$CODER_WAIT" ]; do
-    busy=$(curl -s --max-time 5 "$CODER_URL/slots" 2>/dev/null | python3 -c \
-      'import json,sys
-try: print(sum(1 for s in json.load(sys.stdin) if s.get("is_processing")))
-except Exception: print(0)' 2>/dev/null)
+    # `curl -s` exits 0 on a 404 and the old parser answered 0 for every unreadable body, so "cannot ask" and
+    # "idle" were the same answer and this probe could not fail. The guard is coder_busy_from_json's `-1` for an
+    # unparseable body; `-f` is not what protects, it is what lets the message say "did not answer" rather than
+    # "answered something that is not a slots list". Measured: with `-f` removed the safety arms still pass, which
+    # is why the test pins the parse and not the flag.
+    local body rc
+    body=$(curl -sf --max-time 5 "$CODER_URL/slots" 2>/dev/null); rc=$?
+    if [ "$rc" != 0 ]; then
+      note "::warning::$CODER_URL/slots did not answer (curl exit $rc) - cannot tell whether the coder is busy, proceeding"
+      return 0
+    fi
+    busy=$(printf '%s' "$body" | coder_busy_from_json)
+    if [ "${busy:-}" = -1 ]; then
+      note "::warning::$CODER_URL/slots answered something that is not a slots list - cannot tell whether the coder is busy, proceeding"
+      return 0
+    fi
     [ "${busy:-0}" = 0 ] && return 0
     [ "$waited" = 0 ] && note "waiting for coder-llm ($CODER_URL) to finish a request"
     sleep 15; waited=$((waited + 15))

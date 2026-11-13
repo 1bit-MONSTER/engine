@@ -318,16 +318,16 @@ def self_test():
         check("a pid with no fdinfo is zero", held_gtt_mib(9999, fake) == 0)
         # ... but a process whose fdinfo exists and cannot be READ is not "0 GiB in use": it is "cannot
         # tell", and `environment()` must not report the two as the same number.
-        locked = os.path.join(fake, "4243", "fdinfo")
-        os.makedirs(locked)
-        with open(os.path.join(locked, "0"), "w", encoding="utf-8") as handle:
-            handle.write("drm-total-gtt: 1048576 kB\n")
-        os.chmod(locked, 0o000)
-        try:
-            check("an unreadable fdinfo is NOT zero", held_gtt_mib(4243, fake) is None,
-                  str(held_gtt_mib(4243, fake)))
-        finally:
-            os.chmod(locked, 0o755)
+        # A `fdinfo` that is a FILE, not a directory: `os.listdir` raises NotADirectoryError for every uid,
+        # including root -- which is what a `chmod 000` arm did NOT do (CI runs as root, root lists it anyway,
+        # and the arm failed there while passing here). An arm whose result depends on the runner's uid is the
+        # same defect as the one it tests for.
+        not_a_dir = os.path.join(fake, "4243", "fdinfo")
+        os.makedirs(os.path.dirname(not_a_dir), exist_ok=True)
+        with open(not_a_dir, "w", encoding="utf-8") as handle:
+            handle.write("not a directory\n")
+        check("an unreadable fdinfo is NOT zero", held_gtt_mib(4243, fake) is None,
+              str(held_gtt_mib(4243, fake)))
         check("and the preflight refuses over it rather than passing it through",
               any("cannot be read" in why for why in
                   preflight_problems(None, None, ([], [4243]), 99.0, 99)),

@@ -21,6 +21,11 @@ Seven commands, all host-side, none needing a device or a build. Every one of th
 
 Run them from the repository root on the branch you are about to hand over.
 
+**`scripts/pre-pr-checks.sh` runs the first six**, one line each (`--base <ref>` for the registration check, `--list` to see the
+commands; a check that cannot run says `skip` and why, and an unresolvable `--base` is a usage error rather than a skip). The
+seventh is an **author's check**, true or false exactly once — when you add a page — so it is not in the runner, and the section
+below says why.
+
 | command | red means |
 |---|---|
 | `python3 tools/copyright.py --check` | a file has no notice, or has two |
@@ -46,7 +51,11 @@ open the PR, grep for your own page's name and see someone else's file come back
 
     git grep -l -F "$(basename docs/your-new-page.md)" -- '*.md'
 
-Empty output means the page exists for whoever already knows about it, which is nobody. Prefer the link from the page a reader is
+Empty output means the page exists for whoever already knows about it, which is nobody.
+
+**Why this one is not in `scripts/pre-pr-checks.sh`**: that runner is a loop over `python3` tools that carry their own self-tests,
+and a repo-wide form of this check is a new tool for an invariant that measures **0 today** (45 docs, none orphaned). It is worth
+one command at the moment a page is added — which is the only moment it can be false. Prefer the link from the page a reader is
 already on when they need yours — here `CONTRIBUTING.md`, under the rules the page operationalises — rather than from an index
 nobody opens.
 

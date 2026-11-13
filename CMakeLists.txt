@@ -382,6 +382,11 @@ find_package(Python3 COMPONENTS Interpreter)
 function(add_python_test name)
     if(Python3_Interpreter_FOUND)
         add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE} ${ARGN})
+        # engine#2344 review: ctest runs a test in the BUILD directory unless told otherwise, so a python
+        # row whose tool defaults to `--root .` looked for CMakeLists.txt where there is none -- the
+        # self-test passed beside a failing check and the log said only "no CMakeLists.txt under .".
+        # The source tree is what these rows are about; a row that needs the build tree says so itself.
+        set_tests_properties(${name} PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     else()
         message(STATUS "ctest: not registering ${name} (no Python3 interpreter)")
     endif()

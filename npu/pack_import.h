@@ -270,7 +270,8 @@ struct Plan {
     // engine#1788, 3c residue: the writer's two measurements, kept on the plan because `manifest()` renders from
     // members and has no container in scope. `payload_rows` counts the 3-D I8 tensors by payload width (the K the
     // fconst tile is built for); `role_shapes` says which shapes each role appears in.
-    std::map<int64_t, int64_t> container_payload_rows;
+    std::map<int64_t, int64_t> container_payload_tensors;   // K -> how many 3-D I8 tensors carry that width
+    std::map<int64_t, int64_t> container_payload_rows;      // K -> the ROWS those tensors have, summed over shape[0]
     std::map<std::string, std::map<std::string, int64_t>> container_role_shapes;
     int64_t container_role_layer_rows = -1;
     int64_t container_role_layer_spans = -1;
@@ -411,6 +412,10 @@ struct RoleSlotReport {
 RoleSlotReport container_role_slots(const ContainerRoles& roles);
 
 // engine#1788, 3c residue: the two measurements a writer needs, as plain functions over the tensors.
+// engine#1788 review: called `payload_rows` while counting TENSORS -- `out[K]++` is one per tensor, and two gate_exps
+// tensors are 4096 rows each, so a reader taking the key at its word was off by shape[0] (2713x on the 35B). Both are
+// emitted now, each under what it counts.
+std::map<int64_t, int64_t> container_payload_tensors_of(const std::vector<Q4nxTensor>& tensors);
 std::map<int64_t, int64_t> container_payload_rows_of(const std::vector<Q4nxTensor>& tensors);
 std::map<std::string, std::map<std::string, int64_t>> container_role_shapes_of(const std::vector<Q4nxTensor>& tensors);
 

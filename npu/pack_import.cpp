@@ -3329,6 +3329,7 @@ std::string Plan::manifest() const {
             c["role_layer_types"] = {{"keys", container_role_layer_rows},
                                      {"spans", container_role_layer_spans},
                                      {"out_of_range", container_role_layer_out_of_range}};
+        if (!container_payload_tensors.empty()) c["payload_tensors"] = container_payload_tensors;
         if (!container_payload_rows.empty()) c["payload_rows"] = container_payload_rows;
         if (!container_role_shapes.empty()) c["role_shapes"] = container_role_shapes;
         if (!container_role_layer_span_names.empty())
@@ -3649,10 +3650,18 @@ ImportPlan container_import_plan(const Q4nxContainer& container, const std::vect
     return out;
 }
 
-std::map<int64_t, int64_t> container_payload_rows_of(const std::vector<Q4nxTensor>& tensors) {
+std::map<int64_t, int64_t> container_payload_tensors_of(const std::vector<Q4nxTensor>& tensors) {
     std::map<int64_t, int64_t> out;
     for (const auto& t : tensors)
         if (t.dtype == "I8" && t.shape.size() == 3) out[t.shape[2]]++;
+    return out;
+}
+
+// the ROWS at each width: what the old name claimed to count
+std::map<int64_t, int64_t> container_payload_rows_of(const std::vector<Q4nxTensor>& tensors) {
+    std::map<int64_t, int64_t> out;
+    for (const auto& t : tensors)
+        if (t.dtype == "I8" && t.shape.size() == 3) out[t.shape[2]] += t.shape[0];
     return out;
 }
 
@@ -4106,6 +4115,7 @@ Plan plan(const std::string& pack_dir) {
                         if (x.is_string()) lt.push_back(x.get<std::string>());
                 if (!lt.empty()) {
                     const RoleLayerReport rep = container_role_layer_types(cc.tensors, lt);
+                    p.container_payload_tensors = container_payload_tensors_of(cc.tensors);
                     p.container_payload_rows = container_payload_rows_of(cc.tensors);
                     p.container_role_shapes = container_role_shapes_of(cc.tensors);
                     p.container_role_layer_rows = int64_t(rep.rows.size());

@@ -443,6 +443,12 @@ struct WriteLayoutResult {
 };
 WriteLayoutResult container_write_layout(const std::string& payload_path, const ImportPlan& plan,
                                          const std::string& out_dir, bool allow_unplaced);
+// engine#1788, 3c: what the import should EMIT, learned from the source rather than invented. A container tensor's shape is
+// already the chunk: `[4096,8,4736] I8` is N=4096, 8 groups, 4736 bytes per row, and 4736 is exactly the Q4_K chunk size.
+// So the payload IS q4nx chunk data and the import needs no re-quantisation -- it emits a container OF THE SAME GENRE:
+// one contiguous payload (the planned byte ranges in order) plus a header naming each destination slot with its dtype,
+// shape and offset. That is also the only safe answer to q4nx.h's two-Q8-layouts problem: the bytes never change.
+// `container_write_layout` above is the debugging form (one file per slot); the pack form concatenates instead.
 
 // engine#1788, slice 3c: the writer's per-TENSOR decision, which is what an import actually iterates. Reads the tensor's
 // own layer, takes that layer's declared type, and asks the table above for a destination. A tensor with no role and a

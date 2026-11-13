@@ -311,19 +311,22 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 if (int64_t(scale.data.size()) != nrm) fail(where() + ": scale is not the normalised width");
                 r.dims = a.dims;
                 r.data.resize(a.data.size());
-                for (size_t row = 0; row < a.data.size() / size_t(nrm); ++row) {
+                parallel_units(a.data.size() / size_t(nrm), [&](size_t row) {   // per row, as above (engine#1783)
                     audio::layer_norm(a.data.data() + row * size_t(nrm), scale.data.data(),
                                       bias != nullptr ? bias->data.data() : nullptr, int(nrm), eps,
                                       r.data.data() + row * size_t(nrm));
-                }
+                });
             } else if (n.op == "Softmax") {
                 const Tensor& a = need(n.ins[0]);
                 const int64_t axis = n.attrs.count("axis") ? n.attrs.at("axis") : -1;
                 if (axis != -1 && axis != int64_t(a.dims.size()) - 1) fail(where() + ": only the last axis is implemented");
                 r = a;
                 const int64_t nrm = a.dims.back();
-                for (size_t row = 0; row < r.data.size() / size_t(nrm); ++row)
+                // engine#1783: rows are independent and each keeps its own serial arithmetic, so splitting them over
+                // threads moves no bit (attention's 12 x 1500 rows of 1500 per layer were the serial term).
+                parallel_units(r.data.size() / size_t(nrm), [&](size_t row) {
                     audio::softmax_row(r.data.data() + row * size_t(nrm), int(nrm));
+                });
             } else if (n.op == "Transpose") {
                 const Tensor& a = need(n.ins[0]);
                 const auto it = n.attrs_list.find("perm");
@@ -389,10 +392,17 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 const int64_t tout = audio::conv1d_out_len(int(T), int(k), stride, pad);
                 r.dims = {a.dims[0], cout, tout};
                 r.data.resize(size_t(a.dims[0]) * size_t(cout) * size_t(tout));
-                for (int64_t n0 = 0; n0 < a.dims[0]; ++n0)
-                    audio::conv1d(a.data.data() + size_t(n0) * size_t(cin) * size_t(T), int(cin), int(T), w.data.data(),
-                                  bias != nullptr ? bias->data.data() : nullptr, int(cout), int(k), stride, pad,
-                                  r.data.data() + size_t(n0) * size_t(cout) * size_t(tout));
+                // engine#1783: one output channel per unit. conv1d with cout = 1 on that channel's weights, bias and output
+                // row runs exactly the loop the full call runs for it, so the result is bit-identical; the mel stem's two
+                // Convs were a serial 3.2 G multiply-adds per 30 s window.
+                const size_t units = size_t(a.dims[0]) * size_t(cout);
+                parallel_units(units, [&](size_t u) {
+                    const size_t n0 = u / size_t(cout), co = u % size_t(cout);
+                    audio::conv1d(a.data.data() + n0 * size_t(cin) * size_t(T), int(cin), int(T),
+                                  w.data.data() + co * size_t(cin) * size_t(k),
+                                  bias != nullptr ? bias->data.data() + co : nullptr, 1, int(k), stride, pad,
+                                  r.data.data() + (n0 * size_t(cout) + co) * size_t(tout));
+                });
             } else if (n.op == "Gather") {
                 // The token embedding: axis 0, indices are the int64 token window.
                 const Tensor& a = any_t(n.ins[0]);

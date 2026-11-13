@@ -399,8 +399,9 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 if (ids[i] == ex.image_pad) {
                     // A key id no token has (negative), and a different one for a different picture: two pictures of one
                     // size expand to identical ids, and an ids-only key would hand one picture's state to the other.
-                    // The key is 30 bits of the 64-bit FNV-1a hash, mixed with the row: a false hit between two pictures
-                    // needs those 30 bits to agree on every one of their rows, which is a cache-key risk, not a token one.
+                    // The key keeps 30 bits of the 64-bit FNV-1a hash. The row is mixed in the same way for every picture,
+                    // so two pictures share keys exactly when their hashes agree in those 30 bits: a false hit is one
+                    // 30-bit collision (about 1 in 1e9 per pair), acceptable for a cache key.
                     key_ids[i] = -int(1 + ((ex.image_hash ^ (uint64_t(row) * 0x9E3779B97F4A7C15ull)) & 0x3FFFFFFF));
                     ++row;
                 }

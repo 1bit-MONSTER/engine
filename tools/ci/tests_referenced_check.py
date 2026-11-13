@@ -110,6 +110,37 @@ def scan_files(root):
                 continue
 
 
+# The FULL path after the variable, not the tail that happens to contain `tests/`: `tools/tests/x.sh` is a
+# different file from `tests/x.sh`, and clipping the prefix made this report two files that do exist.
+MENTION = re.compile(r"\$\{CMAKE_SOURCE_DIR\}/([A-Za-z0-9_./+-]+\.sh)|(?<![\w/.-])(tests/[A-Za-z0-9_.+-]+\.sh)")
+
+
+def missing_mentions(root):
+    """[(runner, mentioned path)] for a `tests/*.sh` a RUNNER names that is not in the tree.
+
+    The other direction of this file's question, and the one that actually bit: engine#2183 added a row whose
+    script the rebase had dropped. The row existed, `referenced()` was satisfied by the mention in CMakeLists.txt,
+    `ci_targets_check` follows `$<TARGET_FILE:...>` targets and not plain paths, so **every gate stayed green and
+    the row reported "Not Run"** for ever. A row that names a file that is not there is a row that cannot fail.
+    """
+    out = []
+    for sub in RUNNERS:
+        base = root / sub
+        paths = [base] if base.is_file() else sorted(base.rglob("*")) if base.is_dir() else []
+        for path in paths:
+            if path.is_dir() or path.suffix not in SUFFIXES:
+                continue
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            for m in MENTION.finditer(text):
+                mentioned = m.group(1) or m.group(2)
+                if not (root / mentioned).exists():
+                    out.append((str(path.relative_to(root)), mentioned))
+    return sorted(set(out))
+
+
 def referenced(root, need):
     """{name: [files]}, ignoring a file mentioning its own basename."""
     found = {name: [] for name in need}
@@ -248,11 +279,14 @@ def check(root):
               "CMakeLists.txt or cmake/*.cmake), or add it to %s if it cannot be one yet" % (rel, PYBASE))
     for name in py_cleared:
         print("tests_referenced: %s is in %s and no longer needs to be -- drop the line" % (name, PYBASE))
+    for runner, mentioned in missing_mentions(root):
+        print("tests_referenced: %s names %s, which is not in the tree -- the row exists and can only report "
+              "Not Run" % (runner, mentioned))
     tools_drift = unregistered_selftest_tools(root)
     for rel in tools_drift:
         print("tests_referenced: %s declares a self-test and no runner names it -- add a ctest row (add_test in "
               "CMakeLists.txt or cmake/*.cmake) or a workflow step, or the arm is dead code" % rel)
-    if drift or gone or idle or py_drift or tools_drift:
+    if drift or gone or idle or py_drift or tools_drift or missing_mentions(root):
         return 1
     print("tests_referenced: all %d test script(s) are referenced%s; %d tool self-test(s) and %d python test(s) are registered" % (
         len(need), "" if not allow else " (%d deliberately not a row: %s)" % (len(allow), ", ".join(sorted(allow))),
@@ -299,6 +333,22 @@ def self_test():
     # 1. a test nobody mentions -> drift, and it is NAMED
     r = root_with({"tests/lonely.sh": "#!/bin/sh\n", "CMakeLists.txt": "# nothing here\n"})
     cases.append(("an unreferenced test is drift", check(r), 1, "lonely.sh")); cases_root["an unreferenced test is drift"] = r
+
+    # 1b. the inverse: a row that names a script which is not in the tree. engine#2183 shipped one -- the row
+    # existed, the mention satisfied the check above, `ci_targets_check` follows $<TARGET_FILE:> and not plain
+    # paths, and the row reported "Not Run" with every gate green.
+    r = root_with({"tests/ok.sh": "#!/bin/sh\n",
+                   "CMakeLists.txt": "add_test(NAME ok COMMAND bash ${CMAKE_SOURCE_DIR}/tests/ok.sh)\n"
+                                     "add_test(NAME gone COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gone.sh)\n"})
+    cases.append(("a row naming a script that is not there is drift", check(r), 1, "tests/gone.sh"))
+    cases_root["a row naming a script that is not there is drift"] = r
+
+    # 1c. and the prefix matters: `tools/tests/x.sh` is a different file from `tests/x.sh`. Clipping the prefix
+    #   here reported two existing files as missing on the real tree, which is the false positive this arm pins.
+    r = root_with({"tests/ok.sh": "#!/bin/sh\n", "tools/tests/kept.sh": "#!/bin/sh\n",
+                   "CMakeLists.txt": "add_test(NAME ok COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/kept.sh)\n"
+                                     "add_test(NAME ok2 COMMAND bash tests/ok.sh)\n"})
+    cases.append(("tools/tests/x.sh is not tests/x.sh", check(r), 0, None))
 
     # 2. referenced from CMakeLists.txt -> clean
     r = root_with({"tests/ok.sh": "#!/bin/sh\n", "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n"})

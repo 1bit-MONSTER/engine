@@ -1588,7 +1588,7 @@ target_link_libraries(audio_parallel_test PRIVATE onebit_npu Threads::Threads)
 # ci.yml's build list is not ours to edit without `workflow` scope, so these reach CI the way ops_dump_test does: as build
 # dependencies of a target it already builds (tools/ci/ci_targets_check.py follows this edge).
 # One line, deliberately: tools/ci/ci_targets_check.py follows `add_dependencies` line by line.
-add_dependencies(onebit audio_ops_test audio_mel_test onnx_graph_test audio_exec_test audio_parallel_test audio_pack_test audio_kernel_roles_test whisper_ids_test audio_device_gemm_test audio_launch_plan_test audio_kernel_shapes whisper_transcribe)
+add_dependencies(onebit audio_ops_test audio_mel_test onnx_graph_test audio_exec_test audio_parallel_test audio_pack_test audio_kernel_roles_test whisper_ids_test audio_device_gemm_test audio_npu_gemm_test audio_launch_plan_test audio_kernel_shapes whisper_transcribe)
 # A DFlash draft package as a model source (engine#1780): config + container -> a checked model whose tensors decode
 # one at a time. The loader is compiled here and not into onebit_npu because it needs the q4_1 tile decoder, which
 # lives with the forward (npu/forward/src/q4nx_dequant.c); it moves there with the draft's forward. Synthetic package,
@@ -1986,6 +1986,11 @@ target_link_libraries(audio_kernel_shapes PRIVATE onebit_npu)
 add_executable(audio_device_gemm_test tests/audio_device_gemm_test.cpp)
 target_include_directories(audio_device_gemm_test PRIVATE npu/forward/include npu/target npu/plan)
 target_link_libraries(audio_device_gemm_test PRIVATE nlohmann_json::nlohmann_json)
+# engine#1783: the encoder's products on an NpuTarget (routing by staged shape, M-row chunks, padded weight sent once,
+# de-pad), against a fake target.
+add_executable(audio_npu_gemm_test tests/audio_npu_gemm_test.cpp)
+target_include_directories(audio_npu_gemm_test PRIVATE npu/forward/include npu/target npu/plan)
+target_link_libraries(audio_npu_gemm_test PRIVATE nlohmann_json::nlohmann_json)
 add_executable(audio_launch_plan_test tests/audio_launch_plan_test.cpp)
 target_include_directories(audio_launch_plan_test PRIVATE npu/forward/include npu/target npu/plan)
 target_link_libraries(audio_launch_plan_test PRIVATE nlohmann_json::nlohmann_json)
@@ -1993,6 +1998,7 @@ add_test(NAME whisper_ids COMMAND whisper_ids_test)
 add_test(NAME audio_kernel_roles COMMAND audio_kernel_roles_test)
 add_test(NAME audio_pack COMMAND audio_pack_test)
 add_test(NAME audio_device_gemm COMMAND audio_device_gemm_test)
+add_test(NAME audio_npu_gemm COMMAND audio_npu_gemm_test)
 add_test(NAME audio_launch_plan COMMAND audio_launch_plan_test)
 add_test(NAME whisper_transcribe_jfk COMMAND whisper_transcribe)
 set_tests_properties(whisper_transcribe_jfk PROPERTIES
@@ -2206,6 +2212,11 @@ endif()
     # The library body is onebit_npu_forward_library() (defined above the runtime options), so the CI build of the
     # same sources against the runtime stub (engine#1946) cannot drift from this one.
     onebit_npu_forward_library(onebit_npu_forward onebit_npu_rt)
+    # engine#1783: whisper_transcribe with the encoder's products on the NPU (ONEBIT_WHISPER_NPU_KERNELS=<dir>).
+    add_executable(whisper_transcribe_npu tools/whisper_transcribe.cpp)
+    target_compile_definitions(whisper_transcribe_npu PRIVATE ONEBIT_WHISPER_NPU)
+    target_include_directories(whisper_transcribe_npu PRIVATE npu/forward/include npu/target tools)
+    target_link_libraries(whisper_transcribe_npu PRIVATE onebit_npu_forward onebit_npu_rt)
     target_sources(onebit PRIVATE app/forward_serve.cpp app/stb_image_impl.cpp)   # engine#2324: stb_image for pictures
     target_include_directories(onebit PRIVATE ${stb_SOURCE_DIR})
     # engine#1781: forward-serve --spec-draft runs a DFlash draft package (npu/dflash_head.h) as its drafter.
@@ -2330,6 +2341,12 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
     target_link_libraries(npu_gemm_shape_guard_test PRIVATE onebit_npu_forward_ci)
     add_test(NAME npu_gemm_shape_guard COMMAND npu_gemm_shape_guard_test)
     add_dependencies(onebit npu_gemm_shape_guard_test)   # CI builds `onebit` only; without this the test is Not Run
+    # engine#1783: the device build of whisper_transcribe, compiled here against the stub so CI sees its sources.
+    add_executable(whisper_transcribe_npu_ci tools/whisper_transcribe.cpp)
+    target_compile_definitions(whisper_transcribe_npu_ci PRIVATE ONEBIT_WHISPER_NPU)
+    target_include_directories(whisper_transcribe_npu_ci PRIVATE npu/forward/include npu/target tools)
+    target_link_libraries(whisper_transcribe_npu_ci PRIVATE onebit_npu_forward_ci)
+    add_dependencies(onebit whisper_transcribe_npu_ci)
     add_executable(batch_check_state_test tests/batch_check_state_test.cpp)
     target_link_libraries(batch_check_state_test PRIVATE onebit_npu_forward_ci)
     # direction B (tools/ci/ci_targets_check.py): ci.yml's --target list is a workflow file no lane can patch; the

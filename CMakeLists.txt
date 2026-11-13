@@ -236,6 +236,11 @@ add_test(NAME config_pin_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/conf
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME config_pin_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/config_pin_check.py --self-test
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# engine#2183: the lost-update class has a second medium. `registration_loss_check` covers what a branch removes
+# from the BUILD; this covers what it removes from the DOCS -- a rebase that resolved `docs/npu.md` by taking the
+# branch's side dropped a section that had merged that morning (#2314). Offline, git-only, no build input.
+add_test(NAME doc_section_loss_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/doc_section_loss_check.py --self-test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_dependencies(onebit npu_decode_note_test)
 # engine#2106: a shipped kernel set's own consistency -- manifest vs bytes, one form or none, name vs directory. The
 # refusal this pre-empts ("differ in size") needed private-repo archaeology to diagnose; the symptom is checkable here.

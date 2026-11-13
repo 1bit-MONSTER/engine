@@ -67,6 +67,8 @@ LINE_STYLES = [
       "ctest_skips.txt",
       # engine#2018: the test-registration baseline of `tests/*_test.py`, same shape and the same reason -- data,
       "unreferenced_py_tests.txt",
+      # Gantt "Kernel 7.4 readiness": the moving-ref baseline, same shape and the same reason -- '#'-comment data.
+      "moving_ref_baseline.txt",
             "hrx_f16_narrowing.txt",
             # engine#2186: the accumulator baseline of `tools/ci/hrx_f16_narrowing.py --write`, same shape and the same
             # reason -- data, `.txt` has no comment style of its own, and the notice is already at the top of the file.
@@ -100,6 +102,9 @@ EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*",
           # engine#315 evidence artefacts that cannot carry a comment: diffs must stay byte-applicable
           # and data files have no comment syntax. Matches the existing "patches/*" exemption.
           "*.patch", "*.csv", "*.cfg",
+          # Gantt "Kernel 7.4 readiness": the kernel config of record is the box's /boot/config-<release> byte for byte,
+          # and config/kernel.config pins its sha256 -- a notice would make it a different file from the one that booted.
+          "os/kernel/config-*",
           # engine#1146, generalised by engine#805: an acceptance ticket under tests/fixtures/ is DATA that a parser
           # reads byte-verbatim (like tests/golden/*/tokens.txt), so a notice comment would make the fixture no longer
           # the log it claims to be; each fixture directory's README carries the notice instead. By kind, not by

@@ -32,6 +32,7 @@ not with this installer. The Ubuntu design in [docs/os-v3.md](../../../docs/os-v
 | `sb-vars.sh` | OVMF's variable store with our certificate enrolled in `db`, so a QEMU boot verifies the appliance the way the board does |
 | `mk-huge-kernel.sh` | our kernel as woof-CE's kernel package (`huge-<kver>.tar.*`: `vmlinuz-<kver>` + a zdrv SFS with the module tree, the firmware and a marker). **Refuses an unsigned kernel image** |
 | `build.sh` | woof-CE's CI recipe in a throwaway container, with our kernel and the build root on a host filesystem. Host side only: it resolves the inputs, then runs `container-build.sh` |
+| `pin.txt` | the inputs by commit or digest: the woof-CE commit, the build container (`ubuntu:24.04@sha256:…`), and `vercmp.c` by initrd_progs commit + sha256. `build.sh` **refuses a woof-CE clone at any other commit** (`WOOF_CE_UNPINNED=1` builds anyway, with a warning that the image is not reproducible from the tree); `container-build.sh` refuses a `vercmp.c` whose sha256 differs |
 | `container-build.sh` | what runs **inside** the container (merge2out → kernel into `kernel-kit/output` → 0setup → 1download → 2createpackages → 3builddistro, then the embed and the artifact checks). Its own file since cycle 14: as a 300-line single-quoted `bash -c '…'` string inside `build.sh`, one apostrophe in a comment ended the quote and bash reported a syntax error a hundred lines away — five builds in this lane — and shellcheck could not check it at all |
 | `g2-probe.sh` | gate G2: boot the built ISO headless in QEMU and keep the init's transcript, so "it boots on our kernel" is a measurement |
 | `g3-probe.sh` | gate G3, artifact half: the ISO carries our kernel, **that kernel image is signed**, its zdrv carries the module tree, and `amdxdna`/`ec_su_axb35` are built for that kernel and signed. `--cert <mok.pem>` requires the image's signature to be the enrolled MOK's; `--require-mok` for the release gate |
@@ -113,6 +114,8 @@ os/v3/puppy/mk-huge-kernel.sh <stage> <out-dir>
 os/v3/puppy/build.sh resolute64 <kernel-out-dir> <puppy-out-dir> [woof-CE-dir]
 #    (woof-CE defaults to $HOME/wt/woof-CE - not /tmp, which a reboot empties; the 4th argument is the
 #    clone, and the build copies it into the build root itself)
+#    The clone must be at the woof_ce_commit in os/v3/puppy/pin.txt:
+#      git clone https://github.com/puppylinux-woof-CE/woof-CE ~/wt/woof-CE-pin && git -C ~/wt/woof-CE-pin checkout <woof_ce_commit>
 #    A new BUILD_ROOT downloads 2.6 GB again, and one mirror hiccup over a thousand files fails the
 #    build (measured: one package, all four mirrors, and the URL was fine minutes later). If the box has
 #    built before, seed the cache instead: sudo cp -a <old-build-root>/local-repositories <new-build-root>/

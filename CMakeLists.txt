@@ -540,6 +540,8 @@ add_python_test(hrx_gtt_split_self ${CMAKE_SOURCE_DIR}/tools/hrx_gtt_split.py --
 add_python_test(hrx_log_dispatch_neutral ${CMAKE_SOURCE_DIR}/tests/hrx_log_dispatch_neutral_test.py)
 # engine#679: time per HRX dispatch from the backend's serial trace (the id hash and the per-kernel sums).
 add_python_test(hrx_dispatch_profile_self ${CMAKE_SOURCE_DIR}/tools/hrx_dispatch_profile.py --self-test)
+# CL-220GBS (owner goal 220 GB/s): bytes one decode step reads, from the GGUF, and the effective-bandwidth row.
+add_python_test(hrx_decode_bw_self ${CMAKE_SOURCE_DIR}/tools/hrx_decode_bw.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The

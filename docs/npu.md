@@ -2039,11 +2039,56 @@ decoder is involved, and the prompt is the one the pack's chat template renders 
 with one image and thinking off, written out in the probe rather than rendered. The text model opens
 the device unless `NPU_INFER_HOST_GEMM` is set.
 
-It is a probe, not a route: `forward-serve` does not accept an image, and the tower runs on the
-CPU (about 3 s per 448 × 448 view on 16 threads, 18 s on one). The measured rows are in
+The probe is the bench for the route below. Its tower runs on the CPU (about 3 s per 448 × 448 view on
+16 threads, 18 s on one). The measured rows are in
 engine#1788. On the published packs the text model only loads once the padded-head rule of
 engine#2026 is in: their head is stored 2 and 16 rows past the vocabulary, and without that rule the
 probe stops at `text model: lm_head dequant failed`.
+
+**Pictures on the chat route (engine#2324).** A pack with a vision component (`vision_weight.q4nx` beside
+`model.q4nx`) takes pictures through `1bit serve -m <pack dir> --device npu`, as OpenAI content parts:
+
+```
+{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+                             {"type": "text", "text": "What colour is this image?"}]}
+```
+
+- Only `data:` URLs are taken; the route fetches nothing from the network. PNG, JPEG and binary PPM are decoded
+  (`stb_image`, pinned in `CMakeLists.txt`, built with those three formats only). A picture over 16 M pixels, a
+  part with no URL, and a pack with no vision component are each a 400 naming the reason.
+- The pack's own template renders one `<|image_pad|>` per picture, in order. `npu/vision_request.h` replaces the
+  k-th pad with `<image_id>k</image_id>` and the picture's tokens, runs the tower on each piece (on the host, before
+  the engine lock), and lays out the three position planes. The prompt then goes through `step_batch_embeds` in
+  the route's usual chunks, with the tower's rows where the placeholders are. Decoding resumes at the planes' next
+  position, while the cache slot counts from the prompt's length.
+- The prompt cache is keyed on the ids with every image row replaced by a key derived from that picture's bytes.
+  Two pictures of one size expand to identical ids, and an ids-only key would hand one picture's state to the
+  other. Measured on the 1B (host GEMM): red, then blue at the same size, then red again answered `Red`, `Blue`,
+  `Red`. With a 672 × 1344 picture (486 prompt rows, 444 of them the picture's), it hits as it should:
+
+  | request | answer | time | cached |
+  |---|---|---|---|
+  | red | `red` | 381.3 s | 0 |
+  | the same picture again | `red` | 48.2 s | 485 of 486 |
+  | blue, same size | `Blue` | 382.9 s | 0 |
+
+  That host run still ran the tower on a hit. The route now expands a picture's ids, positions and key from its plan
+  alone, looks the prompt up first, and runs the tower only when a picture row lies past the resume point. On the
+  NPU (`npu-hold`, amdxdna clean before and after), the same three requests:
+
+  | request | answer | time | cached |
+  |---|---|---|---|
+  | red | `Red` | 43.0 s | 0 |
+  | the same picture again | `Red` | 1.1 s | 485 of 486 (the tower is not run) |
+  | blue, same size | `Blue` | 55.5 s | 0 |
+
+  Prompts under the cache's `--prefix-min-gain` (128 tokens) are not saved at all, picture or not: a 448 × 448
+  picture with a short question is 93 rows.
+- Speculative decoding is off for a request with pictures: its rotary positions are not the cache slots the
+  drafter counts.
+
+`tests/npu_image_request_test.cpp` decodes crafted PPM and PNG data URLs to exactly their pixels, keeps request
+order and names each refusal.
 
 Three options exist to bisect a wrong answer against a reference run of the same prompt, and are how
 the missing q/k norm above was found:

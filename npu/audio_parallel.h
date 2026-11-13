@@ -35,6 +35,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef __linux__
+#include <sched.h>
+#endif
+
 namespace onebit::npu::pack_import {
 
 // How many threads the audio executor may use. ONEBIT_AUDIO_THREADS=N sets it; anything that is not a positive number
@@ -45,7 +49,26 @@ inline size_t audio_thread_count() {
         const long n = std::strtol(env, nullptr, 10);
         return n > 0 ? size_t(n) : 1;
     }
-    const size_t hw = std::thread::hardware_concurrency();
+    // hardware_concurrency() answers "how many CPUs does this machine have", not "how many may this process use". Under a
+    // cpuset -- a thermal-run scope, a container, a systemd AllowedCPUs= -- it over-reports: measured on this box it says 32
+    // while the scope allows 4, so the capped-at-8 default spawned 8 threads for 4 CPUs. The affinity mask is what the
+    // scheduler enforces, so that is what this follows.
+    // What this is NOT: a measured speedup. Three interleaved repetitions at 4 CPUs (8 threads / 4 threads) gave encoder
+    // 10.38/10.40 s and decode 2.58/2.69 s per token -- within the box's own noise, and my first, non-interleaved comparison
+    // of 8 threads against serial (5.21 against 4.24 s/token) was load, not threading. The reason to prefer the mask is that
+    // oversubscribing a cpuset cannot help and can only queue, not that it measured faster.
+    size_t hw = 0;
+#ifdef __linux__
+    {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(0, sizeof set, &set) == 0) {
+            const int allowed = CPU_COUNT(&set);
+            if (allowed > 0) hw = size_t(allowed);
+        }
+    }
+#endif
+    if (hw == 0) hw = std::thread::hardware_concurrency();
     return hw == 0 ? 1 : (hw > 8 ? 8 : hw);
 }
 

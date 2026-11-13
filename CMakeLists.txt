@@ -925,7 +925,7 @@ if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp npu/vision_request.cpp
-                            npu/audio_exec.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
+                            npu/audio_exec.cpp npu/audio_pack.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json onebit_q4nx_cache PRIVATE PkgConfig::PCRE2)
@@ -1560,7 +1560,8 @@ add_executable(audio_parallel_test tests/audio_parallel_test.cpp)
 target_link_libraries(audio_parallel_test PRIVATE onebit_npu Threads::Threads)
 # ci.yml's build list is not ours to edit without `workflow` scope, so these reach CI the way ops_dump_test does: as build
 # dependencies of a target it already builds (tools/ci/ci_targets_check.py follows this edge).
-add_dependencies(onebit audio_ops_test audio_mel_test onnx_graph_test audio_exec_test audio_parallel_test)
+# One line, deliberately: tools/ci/ci_targets_check.py follows `add_dependencies` line by line.
+add_dependencies(onebit audio_ops_test audio_mel_test onnx_graph_test audio_exec_test audio_parallel_test audio_pack_test audio_kernel_roles_test whisper_ids_test audio_device_gemm_test audio_launch_plan_test audio_kernel_shapes whisper_transcribe)
 # A DFlash draft package as a model source (engine#1780): config + container -> a checked model whose tensors decode
 # one at a time. The loader is compiled here and not into onebit_npu because it needs the q4_1 tile decoder, which
 # lives with the forward (npu/forward/src/q4nx_dequant.c); it moves there with the draft's forward. Synthetic package,
@@ -1943,6 +1944,40 @@ add_test(NAME audio_mel COMMAND audio_mel_test)
 set_tests_properties(audio_ops PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME onnx_graph COMMAND onnx_graph_test ${ONEBIT_AUDIO_ONNX})
 add_test(NAME audio_exec COMMAND audio_exec_test ${ONEBIT_AUDIO_ONNX})
+# engine#1783: the audio pack -- two graphs by their exported names (never `decoder_with_past`), mel bins from the encoder's
+# own first Conv, config.json as a cross-check.
+add_executable(audio_pack_test tests/audio_pack_test.cpp)
+target_include_directories(audio_pack_test PRIVATE npu/forward/include)
+target_link_libraries(audio_pack_test PRIVATE onebit_npu)
+add_executable(audio_kernel_roles_test tests/audio_kernel_roles_test.cpp)
+target_include_directories(audio_kernel_roles_test PRIVATE npu/forward/include)
+add_executable(whisper_ids_test tests/whisper_ids_test.cpp)
+target_include_directories(whisper_ids_test PRIVATE npu/forward/include)
+add_executable(audio_kernel_shapes tools/audio_kernel_shapes.cpp)
+target_include_directories(audio_kernel_shapes PRIVATE npu/forward/include)
+target_link_libraries(audio_kernel_shapes PRIVATE onebit_npu)
+add_executable(audio_device_gemm_test tests/audio_device_gemm_test.cpp)
+target_include_directories(audio_device_gemm_test PRIVATE npu/forward/include npu/target npu/plan)
+target_link_libraries(audio_device_gemm_test PRIVATE nlohmann_json::nlohmann_json)
+add_executable(audio_launch_plan_test tests/audio_launch_plan_test.cpp)
+target_include_directories(audio_launch_plan_test PRIVATE npu/forward/include npu/target npu/plan)
+target_link_libraries(audio_launch_plan_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME whisper_ids COMMAND whisper_ids_test)
+add_test(NAME audio_kernel_roles COMMAND audio_kernel_roles_test)
+add_test(NAME audio_pack COMMAND audio_pack_test)
+add_test(NAME audio_device_gemm COMMAND audio_device_gemm_test)
+add_test(NAME audio_launch_plan COMMAND audio_launch_plan_test)
+add_test(NAME whisper_transcribe_jfk COMMAND whisper_transcribe)
+set_tests_properties(whisper_transcribe_jfk PROPERTIES
+    ENVIRONMENT "ONEBIT_TEST_WHISPER_IDS_FILE=${CMAKE_SOURCE_DIR}/tests/data/whisper-jfk-ids.json"
+    SKIP_RETURN_CODE 77 TIMEOUT 1800)
+add_test(NAME whisper_transcribe_jfk_lv3
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/whisper_lv3_row.sh $<TARGET_FILE:whisper_transcribe>
+                 ${CMAKE_SOURCE_DIR}/tests/data/whisper-jfk-ids.json)
+set_tests_properties(whisper_transcribe_jfk_lv3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
+add_test(NAME audio_kernel_plan
+         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/audio_kernel_plan.sh $<TARGET_FILE:audio_kernel_shapes>)
+set_tests_properties(audio_kernel_plan PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME audio_parallel COMMAND audio_parallel_test)
 set_tests_properties(audio_exec PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(onnx_graph PROPERTIES SKIP_RETURN_CODE 77)

@@ -7134,13 +7134,33 @@ OnnxGraphInfo parse_onnx_graph(const std::string& path) {
     OnnxGraphInfo out;
     const size_t slash = path.find_last_of('/');
     out.dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
+    // engine#1783: the declared SHAPE of each graph input and output beside its name -- a decoder's token window and an
+    // encoder's mel-bin count are facts of the graph, not constants a caller may assume (128 vs 448 positions).
+    const auto dims_of_vi = [](const std::vector<Field>& vi) {
+        std::vector<int64_t> dims;
+        if (const auto* tp = field1(vi, 2)) {
+            for (const auto* tt : fields(pb(tp->p, tp->n), 1)) {
+                const auto ttb = pb(tt->p, tt->n);
+                for (const auto* sh : fields(ttb, 2)) {
+                    for (const auto* d : fields(pb(sh->p, sh->n), 1)) {
+                        const auto db = pb(d->p, d->n);
+                        if (const auto* v = field1(db, 1)) dims.push_back(int64_t(v->v));
+                        else dims.push_back(-1);   // a symbolic dimension
+                    }
+                }
+            }
+        }
+        return dims;
+    };
     for (const auto* f : fields(g, 11)) {           // graph.input
         const auto vi = pb(f->p, f->n);
         if (const auto* nm = field1(vi, 1)) out.inputs.push_back(pb_str(*nm));
+        out.input_dims.push_back(dims_of_vi(vi));
     }
     for (const auto* f : fields(g, 12)) {           // graph.output
         const auto vi = pb(f->p, f->n);
         if (const auto* nm = field1(vi, 1)) out.outputs.push_back(pb_str(*nm));
+        out.output_dims.push_back(dims_of_vi(vi));
     }
     for (const auto* f : fields(g, 5)) {            // graph.initializer
         const auto t = pb(f->p, f->n);

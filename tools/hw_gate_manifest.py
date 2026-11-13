@@ -189,6 +189,11 @@ def cmd_memcheck(model, llama_dir):
         try:
             led = json.loads(p.stdout)
         except ValueError:
+            # Not a refusal, by this function's contract: mem-guard.sh still guards the step. But say so - a
+            # pre-check that fails silently reads as "ok" in the log, and "I could not measure" is not "there is
+            # 0 GiB in use" (tools/ci's own doc_section_loss/lane_syntax rule, one level up).
+            print("memory pre-check: could not read tools/mem_budget.py box output - not refusing "
+                  "(scripts/mem-guard.sh still guards this step)", file=sys.stderr)
             return 0
         used = led.get("gtt_used", 0) / g
         avail = led["mem_available"] / g
@@ -203,6 +208,9 @@ def cmd_memcheck(model, llama_dir):
     try:
         r = json.loads(p.stdout)
     except ValueError:
+        print(f"memory pre-check: could not read tools/mem_budget.py model output for "
+              f"{os.path.basename(model)} - not refusing (scripts/mem-guard.sh still guards this step)",
+              file=sys.stderr)
         return 0
     msg = (f"memory pre-check: {os.path.basename(model)} needs {r['need'] / g:.1f} GiB, GTT after load "
            f"{r['gtt_used_after'] / g:.1f} GiB, MemAvailable {r['mem_available'] / g:.1f} GiB")

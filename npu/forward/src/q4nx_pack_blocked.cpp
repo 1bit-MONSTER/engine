@@ -37,6 +37,21 @@ inline size_t bpos(size_t i, size_t j, int KD, int ND, int blocked) {
                    : q4nx_layout::rowmajor_index(i, j, KD, ND);
 }
 
+// One code: roundf(v * tis) clamped to [-127, 127], a non-finite v as 0 -- the expression this packer has always used,
+// written so the loop vectorises (engine#1783: std::roundf and std::isfinite kept it scalar, ~3 ns per element, and a
+// 1536 x 1536 activation is packed on every attention call). Exact, not approximate: y = v * tis is finite with
+// |y| <= 127 (v is bounded by its column's amax, or zeroed), so the truncation t fits an int and y - t is exact; rounding
+// half away from zero is then t + 1 for a fraction >= 0.5 and t - 1 for one <= -0.5. `v - v == 0` holds for finite v only.
+inline int8_t quant_code(float v, float tis) {
+    const float y = (v - v == 0.0f) ? v * tis : 0.0f;
+    int x = (int)y;
+    const float f = y - (float)x;
+    x += (f >= 0.5f) - (f <= -0.5f);
+    x = x > 127 ? 127 : x;
+    x = x < -127 ? -127 : x;
+    return (int8_t)x;
+}
+
 }  // namespace
 
 extern "C" int q4nx_pack_B_int8_blocked(int8_t* Bm, const float* w, int K, int N, int KD, int ND, int blocked,
@@ -52,14 +67,25 @@ extern "C" int q4nx_pack_B_int8_blocked(int8_t* Bm, const float* w, int K, int N
     // The scale sum is accumulated in a serial loop over j rather than inside a `reduction(+:ssum)` parallel loop. That is
     // deliberate: the mean column scale becomes order-independent, where the parallel reduction left its last bits to the
     // schedule. Codes and scales are unchanged (the amax of a column is a max over rows, and the rounding is per element).
+    // Column amax in parallel over row chunks, each thread into its own array, merged after: a max is exact and
+    // order-independent, so the scales are the serial loop's bit for bit (engine#1783: the serial pass was most of a
+    // 1536 x 1536 pack once the write below was parallel).
     std::vector<float> amax((size_t)N, 0.0f);
     std::vector<float> tis((size_t)N, 0.0f);
-    for (int i = 0; i < K; i++) {
-        const float* row = w + (size_t)i * (size_t)N;
-        for (int j = 0; j < N; j++) {
-            const float a = std::fabs(row[j]);
-            if (std::isfinite(a) && a > amax[(size_t)j]) amax[(size_t)j] = a;
+#pragma omp parallel
+    {
+        std::vector<float> mine((size_t)N, 0.0f);
+#pragma omp for schedule(static) nowait
+        for (int i = 0; i < K; i++) {
+            const float* row = w + (size_t)i * (size_t)N;
+            for (int j = 0; j < N; j++) {
+                const float a = std::fabs(row[j]);
+                if (std::isfinite(a) && a > mine[(size_t)j]) mine[(size_t)j] = a;
+            }
         }
+#pragma omp critical(q4nx_pack_amax)
+        for (int j = 0; j < N; j++)
+            if (mine[(size_t)j] > amax[(size_t)j]) amax[(size_t)j] = mine[(size_t)j];
     }
     double ssum = 0.0;
     for (int j = 0; j < N; j++) {
@@ -69,16 +95,16 @@ extern "C" int q4nx_pack_B_int8_blocked(int8_t* Bm, const float* w, int K, int N
         tis[(size_t)j] = 127.0f / am;
         ssum += (double)(am / 127.0f);
     }
+    // The write, one address per 8-column run. Inside the blocked layout, columns j0..j0+7 of a row with j0 % 8 == 0 sit
+    // in one 8x8 microtile row, so they are 8 consecutive bytes from blocked_index(i, j0) (q4nx_weight_layout.h, the
+    // image_index/copy note); row-major is consecutive anyway. The element arithmetic is unchanged.
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < K; i++) {
         const float* row = w + (size_t)i * (size_t)N;
-        for (int j = 0; j < N; j++) {
-            float v = row[j];
-            if (!std::isfinite(v)) v = 0.0f;
-            int x = (int)std::roundf(v * tis[(size_t)j]);
-            if (x > 127) x = 127;
-            else if (x < -127) x = -127;
-            Bm[bpos((size_t)i, (size_t)j, KD, ND, blocked)] = (int8_t)x;
+        for (int j0 = 0; j0 < N; j0 += 8) {
+            int8_t* dst = Bm + bpos((size_t)i, (size_t)j0, KD, ND, blocked);
+            const int jn = N - j0 < 8 ? N - j0 : 8;
+            for (int c = 0; c < jn; c++) dst[c] = quant_code(row[j0 + c], tis[(size_t)(j0 + c)]);
         }
     }
     *ssum_out = ssum;

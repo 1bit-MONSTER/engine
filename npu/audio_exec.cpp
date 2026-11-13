@@ -196,7 +196,7 @@ void load_init_i64(const OnnxGraphInfo& g, const OnnxInit& t, std::vector<int64_
 namespace {
 
 bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, const std::string& out_name, AudioRunResult* out,
-                    std::string* why) {
+                    std::string* why, AudioGemm* dev = nullptr) {
     try {
 
         std::map<std::string, const OnnxInit*> inits;
@@ -229,6 +229,37 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         const char* ot = std::getenv("ONEBIT_AUDIO_OP_TIMES");
         const bool op_times = ot != nullptr && ot[0] != '\0' && ot[0] != '0';
         std::map<std::string, std::pair<double, long>> op_ms;   // op -> (ms, calls)
+
+        // engine#1783: offer one product to the device. True when the device ran it into `c`; false when the host must, with
+        // the reason counted. A device without a `gemm` is no device.
+        auto offer = [&](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
+                         std::vector<float>* c) -> bool {
+            if (dev == nullptr) return false;
+            std::string reason;
+            if (dev->gemm && dev->gemm(key, A, M, K, B, N, c, &reason)) {
+                if (c->size() != size_t(M) * size_t(N))
+                    fail("device gemm for '" + key + "' wrote " + std::to_string(c->size()) + " floats, not " +
+                         std::to_string(M) + " x " + std::to_string(N));
+                ++dev->device;
+                return true;
+            }
+            ++dev->host;
+            ++dev->host_why[reason.empty() ? std::string("declined without a reason") : reason];
+            return false;
+        };
+
+        // Every node ends here, including the products the device ran (they leave the loop early), so ONEBIT_AUDIO_OP_TIMES
+        // counts a device-run MatMul or Conv under its op like a host one.
+        auto finish_node = [&](const std::string& op, const std::string& name, Tensor& res,
+                               std::chrono::steady_clock::time_point t0) {
+            t[name] = std::move(res);
+            if (op_times) {
+                auto& e = op_ms[op];
+                e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                e.second++;
+            }
+        };
+
         int node_index = 0;
         for (const auto& n : g.nodes) {
             ++node_index;
@@ -251,6 +282,22 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 r.dims = bp.dims;
                 r.dims.push_back(M);
                 r.dims.push_back(N);
+                // A projection (B a rank-2 weight) is one GEMM over every row of A, whatever A's leading axes are.
+                if (dev != nullptr) {
+                    if (rb == 2 && inits.count(n.ins[1]) != 0) {
+                        std::vector<float> c;
+                        if (offer(n.ins[1], a.data.data(), int64_t(a.data.size() / size_t(K)), K, b.data.data(), N, &c)) {
+                            r.dims = a.dims;
+                            r.dims.back() = N;
+                            r.data = std::move(c);
+                            finish_node(n.op, oname, r, op_t0);
+                            continue;
+                        }
+                    } else {
+                        ++dev->host;
+                        ++dev->host_why["MatMul with an activation as B (attention product): not offered"];
+                    }
+                }
                 r.data.assign(nelem(r.dims), 0.0f);
                 // Rows are independent, so the work splits over (batch, row) without touching any element's arithmetic.
                 const size_t batches = nelem(bp.dims);
@@ -392,6 +439,35 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 const int64_t tout = audio::conv1d_out_len(int(T), int(k), stride, pad);
                 r.dims = {a.dims[0], cout, tout};
                 r.data.resize(size_t(a.dims[0]) * size_t(cout) * size_t(tout));
+                const auto ga = n.attrs.find("group");
+                if (ga != n.attrs.end() && ga->second != 1) fail(where() + ": only group=1 is implemented");
+                if (dev != nullptr) {
+                    // The im2col GEMM: (tout, cin*k) x (cin*k, cout), then out[co][t] = bias[co] + C[t][co].
+                    const int64_t kk = cin * k;
+                    std::vector<float> bkn(size_t(kk) * size_t(cout));
+                    audio::conv1d_weight_as_kn(w.data.data(), int(cout), int(cin), int(k), bkn.data());
+                    std::vector<float> acol(size_t(tout) * size_t(kk));
+                    bool all = true;
+                    for (int64_t n0 = 0; n0 < a.dims[0] && all; ++n0) {
+                        audio::conv1d_im2col(a.data.data() + size_t(n0) * size_t(cin) * size_t(T), int(cin), int(T), int(k),
+                                             stride, pad, acol.data());
+                        std::vector<float> c;
+                        if (!offer(n.ins[1] + "#conv", acol.data(), tout, kk, bkn.data(), cout, &c)) {
+                            all = false;
+                            break;
+                        }
+                        float* o = r.data.data() + size_t(n0) * size_t(cout) * size_t(tout);
+                        for (int64_t co = 0; co < cout; ++co) {
+                            const float bv = bias != nullptr ? bias->data[size_t(co)] : 0.0f;
+                            for (int64_t tt = 0; tt < tout; ++tt)
+                                o[size_t(co) * size_t(tout) + size_t(tt)] = bv + c[size_t(tt) * size_t(cout) + size_t(co)];
+                        }
+                    }
+                    if (all) {
+                        finish_node(n.op, oname, r, op_t0);
+                        continue;
+                    }
+                }
                 // engine#1783: one output channel per unit. conv1d with cout = 1 on that channel's weights, bias and output
                 // row runs exactly the loop the full call runs for it, so the result is bit-identical; the mel stem's two
                 // Convs were a serial 3.2 G multiply-adds per 30 s window.
@@ -545,12 +621,7 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
             } else {
                 fail(where() + " is not implemented; the pack needs an op this executor does not have");
             }
-            t[oname] = std::move(r);
-            if (op_times) {
-                auto& e = op_ms[n.op];
-                e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - op_t0).count();
-                e.second++;
-            }
+            finish_node(n.op, oname, r, op_t0);
         }
         if (op_times) {
             std::vector<std::pair<double, std::string>> order;
@@ -580,6 +651,11 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
 
 bool run_audio_graph(const OnnxGraphInfo& g, const float* mel, int64_t mel_bins, int64_t frames, const std::string& out_name,
                      AudioRunResult* out, std::string* why) {
+    return run_audio_graph(g, mel, mel_bins, frames, out_name, out, why, nullptr);
+}
+
+bool run_audio_graph(const OnnxGraphInfo& g, const float* mel, int64_t mel_bins, int64_t frames, const std::string& out_name,
+                     AudioRunResult* out, std::string* why, AudioGemm* dev) {
     std::map<std::string, Tensor> seed;
     Tensor in;
     in.dims = {1, mel_bins, frames};
@@ -589,7 +665,7 @@ bool run_audio_graph(const OnnxGraphInfo& g, const float* mel, int64_t mel_bins,
         return false;
     }
     seed[g.inputs[0]] = std::move(in);
-    return run_graph_impl(g, std::move(seed), out_name, out, why);
+    return run_graph_impl(g, std::move(seed), out_name, out, why, dev);
 }
 
 bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_tokens, const float* xa,

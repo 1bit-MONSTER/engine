@@ -2681,7 +2681,11 @@ that runs the phase is private, like the kernels it runs.
   `tests/data/qwen3_tokenizer_golden.json` holds 14 cases encoded by `tokenizers` 0.23.1, and
   all 14 match, ids and round trip.
 - **Endpoints:** `/v1/health` (503 while loading), `/v1/models`, `/v1/chat/completions`
-  (streaming or not) and `/v1/completions`.
+  (streaming or not) and `/v1/completions`. The serve also answers `/health` beside `/v1/health`, and there is
+  **no `/api/v1/*` prefix**: a probe against `/api/v1/health` is a 404, `curl -s` exits 0 on a 404, and a
+  readiness check written that way therefore passes while the weights are still loading -- the request then
+  comes back `{"error":{"message":"model is loading"}}`. Use `curl -sf <host>/health` (measured: `/api/v1/health`
+  404, `/health` 503 while loading then 200; `scripts/npu-window11.sh` is the house form of this probe).
 - **Prompt:** the **container's own chat template** — `tokenizer_config.json`'s `chat_template` string, else
   `chat_template.jinja` beside it — rendered with the pinned llama.cpp fork's Jinja engine
   (`app/npu_template.h`, `docs/npu-chat-template.md`). A container that declares no template keeps ChatML

@@ -25,6 +25,11 @@
 // (see PR #1931); `ctest` would time out for a reason that has nothing to do with correctness. The numbers it prints are
 // the ones a test would assert, so `expected-ids-csv` turns it into a check when run by hand.
 //
+// whisper_transcribe_npu is this file built with ONEBIT_WHISPER_NPU (engine#1783, the encoder route). With
+// ONEBIT_WHISPER_NPU_KERNELS=<dir> in the environment, the encoder's projections and Conv stems run on the NPU through
+// NpuTarget::gemv, and the tool prints `device_gemm=<X> s + host_remainder=<Y> s` for the encoder pass. Without the variable
+// the binary is the host tool. The kernel ELFs are generated at one M; ONEBIT_WHISPER_NPU_ROWS names it (default 1536).
+//
 // The pack on disk carries no tokenizer, so this stops at ids: `400 370 452 ...` is the sentence, and comparing ids is a
 // stricter check than comparing text (two ids can share a detokenisation, and neither can share an id).
 
@@ -35,11 +40,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "audio_exec.h"
+#ifdef ONEBIT_WHISPER_NPU
+#include "whisper_npu_device.h"
+#endif
 #include "audio_pack.h"
 #include "whisper_ids.h"
 #include "audio_parallel.h"
@@ -257,6 +266,20 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "graph: %s\n", e.what());
         return 1;
     }
+    AudioGemm* dev_hook = nullptr;
+#ifdef ONEBIT_WHISPER_NPU
+    whisper_npu::Device npu_dev;
+    if (const char* kdir = std::getenv("ONEBIT_WHISPER_NPU_KERNELS")) {
+        const char* rows_env = std::getenv("ONEBIT_WHISPER_NPU_ROWS");
+        const int rows = rows_env != nullptr ? std::atoi(rows_env) : 1536;
+        if (!whisper_npu::open(enc, kdir, rows, &npu_dev, &why)) {
+            std::fprintf(stderr, "npu: %s\n", why.c_str());
+            return 1;
+        }
+        for (const auto& m : npu_dev.missing) std::fprintf(stderr, "npu: no ELF for staged %s -- its products run on the host\n", m.c_str());
+        dev_hook = &npu_dev.hook;
+    }
+#endif
     const auto t_load = std::chrono::steady_clock::now();
 
     // <|startoftranscript|>, <|en|>, <|transcribe|>, <|notimestamps|> -- then greedy, reading the logits of the last real
@@ -313,11 +336,28 @@ int main(int argc, char** argv) {
         }
         const auto tw_mel = std::chrono::steady_clock::now();
         AudioRunResult xa;
-        if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why)) {
+#ifdef ONEBIT_WHISPER_NPU
+        const double dev_ms0 = dev_hook != nullptr ? npu_dev.gemm->device_ms() : 0.0;
+#endif
+        if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why, dev_hook)) {
             std::fprintf(stderr, "encoder (window %zu): %s\n", w, why.c_str());
             return 1;
         }
         const auto tw_enc = std::chrono::steady_clock::now();
+#ifdef ONEBIT_WHISPER_NPU
+        if (dev_hook != nullptr) {
+            // The split the issue is scored on, from this run: the wall inside gemv against everything else in this window's
+            // encoder pass. device_ms() accumulates over the process, so a window's share is the difference.
+            const double enc_ms = std::chrono::duration<double, std::milli>(tw_enc - tw_mel).count();
+            const double dev_ms = npu_dev.gemm->device_ms() - dev_ms0;
+            std::printf("encoder split: device_gemm=%.3f s + host_remainder=%.3f s per window (window %zu; %d product(s) on the "
+                        "device in %d launch(es) so far, %d on the host)\n",
+                        dev_ms / 1000.0, (enc_ms - dev_ms) / 1000.0, w, dev_hook->device, npu_dev.gemm->launches(),
+                        dev_hook->host);
+            if (w == 0)
+                for (const auto& kv : dev_hook->host_why) std::printf("  host: %d x %s\n", kv.second, kv.first.c_str());
+        }
+#endif
         if (w == 0) {
             std::printf("encoder: [");
             for (int64_t d : xa.dims) std::printf(" %lld", (long long)d);

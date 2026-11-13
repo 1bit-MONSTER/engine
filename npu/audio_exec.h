@@ -23,12 +23,35 @@
 
 #pragma once
 
+#include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "onnx_graph.h"
 
 namespace onebit::npu::pack_import {
+
+// A device for the graph's matrix products (engine#1783). The executor stays host-only and device-free: it offers each
+// product whose right operand is a CONSTANT weight to `gemm`, and runs it on the host itself when the device declines.
+//
+// Offered: every MatMul whose B is a rank-2 initializer (the projections q, k, v, o, fc1, fc2), with A's leading axes
+// flattened into rows, and every Conv, as its im2col GEMM (A = (tout, cin*k), B = the kernel as (cin*k, cout)).
+// Not offered: a MatMul whose B is an activation (attention's q.k^T and scores.v). Its operand changes every call, so it
+// has no weight to stay resident, and the reason is recorded like any other host product.
+//
+// `key` names the weight and is stable across calls (the initializer's name; "<name>#conv" for a Conv's transposed
+// kernel), so an implementation may cache the packed weight by it. Return false with `why` to leave the product to
+// the host. The executor then runs it, counts it under `host`, and keeps the reason in `host_why`, so a run whose
+// products silently fell back to the host is visible in the counts.
+struct AudioGemm {
+    std::function<bool(const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
+                       std::vector<float>* C, std::string* why)>
+        gemm;
+    int device = 0;                           // products the device ran
+    int host = 0;                             // products the host ran (declined, or not offered)
+    std::map<std::string, int> host_why;      // reason -> count
+};
 
 struct AudioRunResult {
     std::vector<int64_t> dims;      // dims of the requested output
@@ -45,6 +68,9 @@ struct AudioRunResult {
 // Returns true and fills `out`; on failure returns false and sets `why` to the node and the reason.
 bool run_audio_graph(const OnnxGraphInfo& g, const float* mel, int64_t mel_bins, int64_t frames,
                      const std::string& out_name, AudioRunResult* out, std::string* why);
+// The same, with the matrix products offered to `dev` (null = host only, identical to the overload above).
+bool run_audio_graph(const OnnxGraphInfo& g, const float* mel, int64_t mel_bins, int64_t frames,
+                     const std::string& out_name, AudioRunResult* out, std::string* why, AudioGemm* dev);
 
 // The decoder: `tokens` is the int64 token window for the graph's first input; `xa` (the encoder output, row-major f32) is
 // bound to the graph's second input when the graph has one. `xa_dims` may be empty when there is no cross-attention input.

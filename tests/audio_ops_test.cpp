@@ -78,6 +78,34 @@ void conv1d_arms() {
     expect_eq(onebit::audio::conv1d_out_len(5, 3, 1, 0), 3, "conv1d_out_len T5 k3 s1 p0");
 }
 
+// engine#1783: the Conv as a GEMM (what the device runs) must be the Conv. Same strided, padded case as above, so a
+// wrong column order (j*cin + ci instead of ci*k + j) or a missed pad tap shows up as a value, not just a shape.
+void conv1d_gemm_arm() {
+    const std::vector<float> x = {0.5f, -1.0f, 0.25f, 2.0f, -0.75f, 1.5f, 0.0f, -0.5f, 1.0f, 0.25f};
+    std::vector<float> w(3 * 2 * 3);
+    for (int i = 0; i < 18; ++i) w[i] = static_cast<float>((i + 1) * 0.0625);
+    const std::vector<float> b = {0.125f, -0.25f, 0.5f};
+    const int cin = 2, T = 5, cout = 3, k = 3, stride = 2, pad = 1;
+    const int tout = onebit::audio::conv1d_out_len(T, k, stride, pad);
+    std::vector<float> ref(size_t(cout) * tout);
+    onebit::audio::conv1d(x.data(), cin, T, w.data(), b.data(), cout, k, stride, pad, ref.data());
+
+    std::vector<float> A(size_t(tout) * cin * k), B(size_t(cin) * k * cout);
+    onebit::audio::conv1d_im2col(x.data(), cin, T, k, stride, pad, A.data());
+    onebit::audio::conv1d_weight_as_kn(w.data(), cout, cin, k, B.data());
+    expect_close(A[0], 0.0, 0.0, "im2col t0 tap 0 is the left pad");
+    expect_close(A[1], 0.5, 0.0, "im2col t0 tap 1 is x[0][0]");
+    expect_close(A[3], 0.0, 0.0, "im2col t0 channel 1 tap 0 is the left pad");
+    expect_close(B[1 * cout + 2], w[2 * 6 + 1], 0.0, "B[ci0,j1][co2] = w[co2][ci0][j1]");
+    for (int co = 0; co < cout; ++co)
+        for (int t = 0; t < tout; ++t) {
+            double acc = b[size_t(co)];
+            for (int r = 0; r < cin * k; ++r) acc += double(A[size_t(t) * cin * k + r]) * B[size_t(r) * cout + co];
+            expect_close(float(acc), ref[size_t(co) * tout + t], 1e-6,
+                         "im2col GEMM = conv1d at co " + std::to_string(co) + " t " + std::to_string(t));
+        }
+}
+
 // 2. Layer norm: biased variance, eps added under the root, gamma/beta applied after the normalise.
 void layernorm_arm() {
     const std::vector<float> v = {0.25f, -1.5f, 2.0f, 0.75f};
@@ -136,6 +164,7 @@ void softmax_arm() {
 
 int main() {
     conv1d_arms();
+    conv1d_gemm_arm();
     layernorm_arm();
     gelu_arm();
     softmax_arm();
@@ -143,7 +172,7 @@ int main() {
         std::printf("audio ops: %d failures\n", g_failures);
         return 1;
     }
-    std::printf("audio ops: conv1d (strided + padded + edge), layer_norm (biased var, null affine), gelu (erf), softmax "
+    std::printf("audio ops: conv1d (strided + padded + edge), conv1d as im2col GEMM, layer_norm (biased var, null affine), gelu (erf), softmax "
                 "(stable, shift-invariant) -- all pass\n");
     return 0;
 }

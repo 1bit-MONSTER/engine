@@ -2252,6 +2252,10 @@ endif()
     add_executable(batch_check_state_test tests/batch_check_state_test.cpp)
     target_include_directories(batch_check_state_test PRIVATE npu/forward/include)
     target_link_libraries(batch_check_state_test PRIVATE onebit_npu_forward)
+    # engine#1783: XdnaTarget::gemv() refuses a launch wider than its context, through the target itself (no device).
+    add_executable(npu_gemm_shape_guard_test tests/npu_gemm_shape_guard_test.cpp)
+    target_link_libraries(npu_gemm_shape_guard_test PRIVATE onebit_npu_forward)
+    add_test(NAME npu_gemm_shape_guard COMMAND npu_gemm_shape_guard_test)
     add_dependencies(npu_sampling_test batch_check_state_test)
     add_test(NAME batch_check_state COMMAND batch_check_state_test)
     # The MTP drafter measured against the real base model (tools/mtp_acceptance.cpp): draft, verify through
@@ -2315,6 +2319,10 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
     target_compile_definitions(onebit_npu_rt_ci_stub PUBLIC ONEBIT_NPU_RUNTIME_OWN)
     target_link_libraries(onebit_npu_rt_ci_stub PUBLIC Threads::Threads)
     onebit_npu_forward_library(onebit_npu_forward_ci onebit_npu_rt_ci_stub)
+    # engine#1783: the same gemv()-level shape-guard test as the NPU configure's, on the stub runtime (no device call).
+    add_executable(npu_gemm_shape_guard_test tests/npu_gemm_shape_guard_test.cpp)
+    target_link_libraries(npu_gemm_shape_guard_test PRIVATE onebit_npu_forward_ci)
+    add_test(NAME npu_gemm_shape_guard COMMAND npu_gemm_shape_guard_test)
     add_executable(batch_check_state_test tests/batch_check_state_test.cpp)
     target_link_libraries(batch_check_state_test PRIVATE onebit_npu_forward_ci)
     # direction B (tools/ci/ci_targets_check.py): ci.yml's --target list is a workflow file no lane can patch; the

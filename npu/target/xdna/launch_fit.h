@@ -12,8 +12,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-// npu/target/xdna/launch_fit.h -- does a launch fit the context it was routed to? Header-only so a test with no device
-// arms it (xdna_target.cpp includes the private runtime header, so no CI job compiles it).
+// npu/target/xdna/launch_fit.h -- does a launch fit the context it was routed to? Header-only so the rule is tested
+// on its own (tests/launch_fit_test.cpp). xdna_target.cpp applies it in both launch paths, and CI compiles that file
+// too: a configure without ONEBIT_NPU builds it into onebit_npu_forward_ci against the runtime stub, which is where
+// tests/npu_gemm_shape_guard_test.cpp drives XdnaTarget::gemv() with no device.
 //
 // engine#1783: a standalone caller passed role 0 for every shape (O K768 N1024, GU K768 N6144, D K3072 N1024), so
 // GU and D ran on role 0's context. The int8 batched path packs K x N weights into a BO sized KD x ND and reads M x K

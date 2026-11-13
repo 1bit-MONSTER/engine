@@ -241,6 +241,11 @@ add_test(NAME config_pin_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/conf
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME config_pin_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/config_pin_check.py --self-test
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# Gantt "Kernel 7.4 readiness": the inputs written inline in workflows and build scripts (a container image, a
+# `uses:` ref, a raw download, a pip requirement) name a commit or a digest. CI's `ubuntu:26.04` changed digest between
+# 2026-11-09 and 2026-11-13 with no change in this tree. Offline, reads the tree only.
+add_test(NAME moving_ref_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/moving_ref_check.py --check --root ${CMAKE_SOURCE_DIR})
+add_test(NAME moving_ref_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/moving_ref_check.py --self-test)
 # Gantt "Kernel 7.4 readiness": config/kernel.config names the kernel by tag, commit, release and config hash, and
 # os/kernel/config-<release> is the config of record itself. Offline: the hash and the config's own LOCALVERSION /
 # CC_VERSION_TEXT agree with the pin (`--box`, run by hand, compares the running kernel too).

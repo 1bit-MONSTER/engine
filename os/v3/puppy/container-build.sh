@@ -87,7 +87,13 @@ bash -n woof-code/3builddistro || { echo "build: REFUSED: the patched 3builddist
 echo "   ok: 3builddistro normalises rootfs-complete and devx before packing, keeping their setuid bits"
 mkdir -p /work/local-repositories petbuild-sources petbuild-cache petbuild-output
 [ -e ../local-repositories ] || ln -s /work/local-repositories ../local-repositories
-[ -f local-repositories/vercmp ] || curl -fsSL https://raw.githubusercontent.com/puppylinux-woof-CE/initrd_progs/master/pkg/w_apps_static/w_apps/vercmp.c | gcc -x c -o local-repositories/vercmp -
+# vercmp.c at the commit and sha256 os/v3/puppy/pin.txt names (it came from initrd_progs `master` before 2026-11-13)
+if [ ! -f local-repositories/vercmp ]; then
+    vercmp_url=$(sed -n 's/^vercmp_url=//p' /recipe/pin.txt) vercmp_sha=$(sed -n 's/^vercmp_sha256=//p' /recipe/pin.txt)
+    curl -fsSL "$vercmp_url" -o /tmp/vercmp.c
+    echo "$vercmp_sha  /tmp/vercmp.c" | sha256sum -c --quiet - || { echo "build: REFUSED: vercmp.c from $vercmp_url is not sha256 $vercmp_sha" >&2; exit 1; }
+    gcc -x c -o local-repositories/vercmp /tmp/vercmp.c
+fi
 install -m 755 local-repositories/vercmp /usr/local/bin/vercmp
 install -D -m 644 woof-code/rootfs-skeleton/usr/local/petget/categories.dat /usr/local/petget/categories.dat
 # initrd-progs packs its initrd with `find . | cpio -o -H newc > ../initrd 2>/dev/null`, so without cpio the

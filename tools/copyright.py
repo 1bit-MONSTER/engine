@@ -67,6 +67,8 @@ LINE_STYLES = [
       "ctest_skips.txt",
       # engine#2018: the test-registration baseline of `tests/*_test.py`, same shape and the same reason -- data,
       "unreferenced_py_tests.txt",
+      # Gantt "Kernel 7.4 readiness": the moving-ref baseline, same shape and the same reason -- '#'-comment data.
+      "moving_ref_baseline.txt",
             "hrx_f16_narrowing.txt",
             # engine#2186: the accumulator baseline of `tools/ci/hrx_f16_narrowing.py --write`, same shape and the same
             # reason -- data, `.txt` has no comment style of its own, and the notice is already at the top of the file.

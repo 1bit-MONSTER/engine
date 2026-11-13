@@ -230,6 +230,12 @@ add_test(NAME npu_decode_note COMMAND npu_decode_note_test)
 # so a script row is the whole registration.
 add_test(NAME xhci_verdict_line COMMAND bash ${CMAKE_SOURCE_DIR}/tests/xhci_verdict_line_test.sh
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# engine#2316 named the gap: `tools/check_pins.py` compares submodule gitlinks and does not look at
+# `config/*.config` shas, which are consumed by fetch-private.sh and hw-gate.sh. Offline shape, no network.
+add_test(NAME config_pin_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/config_pin_check.py --check
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME config_pin_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/config_pin_check.py --self-test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_dependencies(onebit npu_decode_note_test)
 # engine#2106: a shipped kernel set's own consistency -- manifest vs bytes, one form or none, name vs directory. The
 # refusal this pre-empts ("differ in size") needed private-repo archaeology to diagnose; the symptom is checkable here.

@@ -408,7 +408,8 @@ private:
     // hw_context, 7 kernel instances), so changing phase costs nothing: measured on this
     // box, a phase change inside the sealed context is 0 ms against ~2.7 ms between two
     // hw_contexts.  Config `q4nx_pb16i_sealed_elf` names it in the kernels dir; without
-    // it the per-role `_pb16i.elf` files are used as before.
+    // it the per-role `_pb16i.elf` files are used as before.  A b8 container uses the same slot for its
+    // sealed int8 ELF (`q4nx_b8_sealed_elf` or NPU_I8_SEALED_ELF, engine#2208).
     std::string pb16i_sealed_;
     std::string wide_sealed_;       // q4nx_<layout>_sealed_wide_elf: a wide prefill family (engine#1990)
     int wide_sealed_rows_ = 32;    // q4nx_sealed_wide_rows

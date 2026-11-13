@@ -91,6 +91,21 @@ bool has(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+// engine#2208: a b8 container may name a sealed int8 decode ELF; an rm container still may not.
+void test_b8_sealed() {
+    auto b8 = base_plan();
+    b8["container"]["layout"] = "b8";
+    b8["kernels"]["tag"] = "_b8";
+    b8["decode"]["sealed_elf"] = "SEALED-I8.elf";
+    const std::string r = refusal(write_plan("b8_sealed", b8));
+    check(r.empty(), "a b8 plan naming decode.sealed_elf loads (" + r + ")");
+    if (r.empty()) check(Plan::load(write_plan("b8_sealed", b8)).sealed_elf == "SEALED-I8.elf", "b8 decode.sealed_elf is read");
+    auto rm = base_plan();
+    rm["decode"]["sealed_elf"] = "SEALED-I8.elf";
+    check(has(refusal(write_plan("rm_sealed", rm)), "container.layout is not b8"),
+          "an rm plan naming decode.sealed_elf is still refused");
+}
+
 // engine#1990: prefill.sealed_elf / prefill.sealed_rows, the wide family.
 void test_wide_family() {
     auto pb = base_plan();
@@ -800,6 +815,7 @@ void test_drafter_and_state() {
 int main() {
     test_valid();
     test_wide_family();
+    test_b8_sealed();
     test_narrow_family();
     test_rope_and_inputs();
     test_drafter_and_state();

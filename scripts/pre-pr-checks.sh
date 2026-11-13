@@ -77,6 +77,25 @@ checks=(
     "tools/ci/registration_loss_check.py --check --base $base"
 )
 
+# The page and this list drift apart, and it has happened twice in one night: the page said the runner "runs the first six"
+# after a seventh was added (its count sentence contradicting its own table three lines down), and the table's order disagreed
+# with this array at three positions while THIS file's comment above claims the order is the page's. Both were found by hand, by
+# a lane that happened to compare two lists. So the comparison is now part of the run: whoever edits one list and not the other
+# gets a refusal naming the difference, instead of a page that describes a tool it no longer matches.
+page="${PRE_PR_CHECKS_PAGE:-docs/pre-pr-checks.md}"
+if [ -f "$page" ]; then
+    want=$(sed -n '/^checks=(/,/^)/p' "$0" | sed -n 's/^[[:space:]]*"\([a-zA-Z0-9_\/\.]*\).*/\1/p')
+    have=$(sed -n '/^| command | red means |/,/^$/p' "$page" | sed -n 's/^| `python3 \([a-zA-Z0-9_\/\.]*\).*/\1/p')
+    if [ "$want" != "$have" ]; then
+        echo "pre-pr-checks: the page and this runner disagree about WHICH checks run, or their order:" >&2
+        diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") | sed 's/^/  /' >&2
+        echo "  runner: $0   page: $page   (set PRE_PR_CHECKS_PAGE to point elsewhere)" >&2
+        exit 2
+    fi
+else
+    echo "pre-pr-checks: no $page to cross-check against; the page/runner agreement is unchecked" >&2
+fi
+
 if [ "$list_only" = 1 ]; then
     for c in "${checks[@]}"; do echo "python3 $c"; done
     exit 0

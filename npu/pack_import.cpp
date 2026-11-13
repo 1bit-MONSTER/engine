@@ -3482,6 +3482,59 @@ static std::string group_suffix_slot(const std::string& role, const std::string&
     return std::string();
 }
 
+ImportPlan container_import_plan(const Q4nxContainer& container, const std::vector<std::string>& layer_types) {
+    ImportPlan out;
+    out.payload_bytes = container.payload_bytes;
+    const PlacementReport rep = container_placement(container.tensors, layer_types);
+    std::map<std::string, const Q4nxTensor*> by_name;
+    for (const auto& t : container.tensors) by_name[t.name] = &t;
+    std::set<std::string> seen;
+    for (const auto& row : rep.rows) {
+        if (row.slot.empty()) {
+            out.unplaced.push_back((row.role.empty() ? std::string("(no role)") : row.role) + ": " + row.tensor);
+            continue;
+        }
+        if (!seen.insert(row.slot).second) {   // a second write would silently replace the first
+            out.unplaced.push_back(row.role + ": " + row.tensor + " (destination already taken)");
+            continue;
+        }
+        ImportItem item;
+        item.slot = row.slot; item.source = row.tensor; item.shape = row.shape; item.dtype = row.dtype;
+        const auto it = by_name.find(row.tensor);
+        if (it != by_name.end()) { item.begin = it->second->begin; item.end = it->second->end; }
+        out.bytes += item.end - item.begin;
+        out.items.push_back(item);
+    }
+    // engine#1788, 3c (review): a SUM is only coverage if the ranges are DISJOINT. Uniqueness is enforced on the slot, but
+    // two tensors with different slots and overlapping [begin,end) would double-count one region and skip another, and the
+    // totals would still add up. Sorted by offset, so an overlap is caught once and named.
+    std::vector<std::pair<int64_t, std::string>> spans;
+    for (const auto& it : out.items) spans.push_back({it.begin, it.source});
+    std::sort(spans.begin(), spans.end());
+    std::set<std::string> overlapping;
+    for (size_t i = 1; i < spans.size(); ++i) {
+        const auto prev = by_name.find(spans[i - 1].second);
+        if (prev != by_name.end() && prev->second->end > spans[i].first) {
+            overlapping.insert(spans[i - 1].second);
+            overlapping.insert(spans[i].second);
+            out.unplaced.push_back("overlapping payload ranges: " + spans[i - 1].second + " and " + spans[i].second +
+                                   " (a sum over these would count one region twice and skip another)");
+        }
+    }
+    if (!overlapping.empty()) {
+        // the totals must not be quoted when they can cancel: drop the offending items and rebuild the sum
+        std::vector<ImportItem> kept;
+        out.bytes = 0;
+        for (const auto& it : out.items) {
+            if (overlapping.count(it.source)) continue;
+            kept.push_back(it);
+            out.bytes += it.end - it.begin;
+        }
+        out.items.swap(kept);
+    }
+    return out;
+}
+
 PlacementReport container_placement(const std::vector<Q4nxTensor>& tensors,
                                   const std::vector<std::string>& layer_types) {
     PlacementReport out;

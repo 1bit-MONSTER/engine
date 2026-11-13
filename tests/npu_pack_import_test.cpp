@@ -5246,6 +5246,12 @@ static void test_container_placement_real(const std::string& dir, const std::vec
             check(row.dtype == "I8", "placement: and I8 (" + row.slot + ") in " + dir);
         }
     }
+    {
+        // the question a writer must answer before writing: do the item ranges add up to the payload?
+        const ImportPlan ip = container_import_plan(c, layer_types);
+        std::printf("    import: %zu items, %lld of %lld bytes, %zu unplaced\n", ip.items.size(),
+                    (long long)ip.bytes, (long long)ip.payload_bytes, ip.unplaced.size());
+    }
     std::printf("    roles:"); for (const auto& kv : roles_seen) std::printf(" %s=%lld", kv.first.c_str(), (long long)kv.second);
     std::printf("\n");
     std::printf("    UNKNOWN:");
@@ -5371,6 +5377,59 @@ static void test_scale_and_proj_norm_roles() {
         const pi::PlacementReport p = pi::container_placement(v, {});
         check(p.rows[1].slot == "model.per_layer_proj_norm.weight", "proj_norm: and it has its own top-level slot");
     }
+}
+
+// engine#1788, 3c: the import plan -- where each tensor's bytes go and which bytes they are.
+void test_container_import_plan() {
+    using pi::Q4nxTensor;
+    const auto t = [](const std::string& n, std::vector<int64_t> sh, const std::string& dt, int64_t b, int64_t e) {
+        Q4nxTensor x; x.name = n; x.shape = sh; x.dtype = dt; x.begin = b; x.end = e; return x;
+    };
+    pi::Q4nxContainer c;
+    c.tensors = {
+        t("model.embed_tokens.weight", {128, 64}, "BF16", 0, 100),
+        t("model.layers.0.self_attn.q_proj.weight", {256, 8, 4736}, "I8", 100, 400),
+        t("model.layers.0.unknown_thing.weight", {4}, "I8", 400, 410),
+    };
+    c.payload_bytes = 410;
+    const pi::ImportPlan p = pi::container_import_plan(c, {"full_attention"});
+    check(p.items.size() == 2, "import: two tensors placed, one not");
+    check(p.items[0].slot == "model.embed_tokens.weight", "import: the embedding keeps its own name");
+    check(p.items[1].slot == "model.layers.0.self_attn.q_proj.weight", "import: the projection is layer-qualified");
+    check(p.items[1].begin == 100 && p.items[1].end == 400, "import: and carries ITS byte range");
+    check(p.bytes == 400, "import: bytes are the placed tensors', not the whole payload");
+    check(p.unplaced.size() == 1 && p.unplaced[0].find("unknown_thing") != std::string::npos,
+          "import: the unplaced tensor is NAMED");
+    check(p.payload_bytes == 410, "import: the container's payload size is carried for a coverage check");
+
+    // the layer-type dependency, as a pair: q_proj places without one, qkv_proj does not
+    pi::Q4nxContainer q;
+    q.tensors = {t("model.layers.0.self_attn.q_proj.weight", {256, 8, 4736}, "I8", 0, 50),
+                 t("model.layers.0.self_attn.qkv_proj.weight", {256, 8, 4736}, "I8", 50, 100)};
+    q.payload_bytes = 100;
+    const pi::ImportPlan pq = pi::container_import_plan(q, {});
+    check(pq.items.size() == 1 && pq.items[0].slot == "model.layers.0.self_attn.q_proj.weight",
+          "import: q_proj places without layer types");
+    check(pq.unplaced.size() == 1 && pq.unplaced[0].find("qkv_proj") != std::string::npos,
+          "import: qkv_proj does not, and is named");
+    // engine#1788 review: a SUM is not coverage unless the ranges are disjoint. Two tensors with different slots and
+    // overlapping bytes would double-count one region and skip another, and the totals would still add up.
+    pi::Q4nxContainer ov;
+    ov.tensors = {t("model.embed_tokens.weight", {2, 2}, "I8", 0, 16),
+                  t("model.layers.0.self_attn.q_proj.weight", {2, 2}, "I8", 8, 24)};
+    ov.payload_bytes = 64;
+    const pi::ImportPlan ovp = pi::container_import_plan(ov, {"full_attention"});
+    check(!ovp.unplaced.empty() && ovp.unplaced.back().find("overlapping") != std::string::npos,
+          "import: overlapping byte ranges are caught and named");
+    check(ovp.bytes == 0 && ovp.items.empty(),
+          "import: and the totals are not quoted for a plan that can cancel");
+    // disjoint ranges in a different order are NOT reported
+    pi::Q4nxContainer ok_order;
+    ok_order.tensors = {t("model.layers.0.self_attn.q_proj.weight", {2, 2}, "I8", 8, 24),
+                        t("model.embed_tokens.weight", {2, 2}, "I8", 0, 8)};
+    ok_order.payload_bytes = 64;
+    const pi::ImportPlan okp = pi::container_import_plan(ok_order, {"full_attention"});
+    check(okp.unplaced.empty() && okp.bytes == 24, "import: disjoint ranges out of order are fine");
 }
 
 void test_container_placement() {
@@ -6615,6 +6674,7 @@ int main(int argc, char** argv) {
         test_container_roles_gemma_local();
         test_container_roles_moe_and_singular_layer();
         test_container_placement();
+        test_container_import_plan();
         test_scale_and_proj_norm_roles();
         test_role_tables_disagree_nowhere();
         if (argc > 4) {

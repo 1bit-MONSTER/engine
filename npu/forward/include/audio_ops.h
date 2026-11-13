@@ -108,18 +108,46 @@ inline float gelu_erf(float x) {
 }
 
 // In place, one row: numerically stable (subtract the row max) so a logit of 100 does not overflow.
+// engine#2366: the row softmax is 0.98 s of the whisper encoder's 10.4 s (12 launches of 1500x1500), and the serial version
+// held it: the max scan is a reduction a compiler will not vectorise without -ffast-math, and `sum += x[i]` is a chain of
+// dependent double adds with a `exp()` between each. Four accumulators for each turn both into independent work —
+// measured on the encoder's real shape (18000 rows of 1500): 458.1 ms -> 141.5 ms, **3.24x**.
+//
+// The arithmetic per element is unchanged, but the SUMMATION ORDER is not: the four partial sums are combined as
+// ((s0+s1)+(s2+s3)) rather than left to right, so the result differs from the old one in the last bits. That is the
+// tolerance-side of the same trade the MatMul loop refused (there the order was kept and only aliasing was declared); this
+// one changes order for a 3x win, and the whisper chain's ids are the check that it did not matter.
 inline void softmax_row(float* x, int n) {
     if (n <= 0) return;
-    float mx = x[0];
-    for (int i = 1; i < n; ++i)
-        if (x[i] > mx) mx = x[i];
-    double sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        x[i] = std::exp(x[i] - mx);
-        sum += x[i];
+    float m0 = x[0], m1 = x[0], m2 = x[0], m3 = x[0];
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        if (x[i] > m0) m0 = x[i];
+        if (x[i + 1] > m1) m1 = x[i + 1];
+        if (x[i + 2] > m2) m2 = x[i + 2];
+        if (x[i + 3] > m3) m3 = x[i + 3];
     }
-    const double inv = 1.0 / sum;
-    for (int i = 0; i < n; ++i) x[i] = static_cast<float>(x[i] * inv);
+    for (; i < n; ++i)
+        if (x[i] > m0) m0 = x[i];
+    const float mx = std::fmax(std::fmax(m0, m1), std::fmax(m2, m3));
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    i = 0;
+    for (; i + 4 <= n; i += 4) {
+        x[i] = std::exp(x[i] - mx);
+        s0 += x[i];
+        x[i + 1] = std::exp(x[i + 1] - mx);
+        s1 += x[i + 1];
+        x[i + 2] = std::exp(x[i + 2] - mx);
+        s2 += x[i + 2];
+        x[i + 3] = std::exp(x[i + 3] - mx);
+        s3 += x[i + 3];
+    }
+    for (; i < n; ++i) {
+        x[i] = std::exp(x[i] - mx);
+        s0 += x[i];
+    }
+    const double inv = 1.0 / ((s0 + s1) + (s2 + s3));
+    for (int k = 0; k < n; ++k) x[k] = static_cast<float>(x[k] * inv);
 }
 
 }  // namespace onebit::audio

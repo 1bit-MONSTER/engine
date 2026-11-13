@@ -118,7 +118,7 @@ check "the built-in set adds nothing to a MoE file" '[ "$(after "$scratch/moe.js
 run "$scratch/plain.gguf" "$scratch/dfv.json" --dflash "$scratch/draft.gguf"
 check "  nor to --dflash" '[ "$(after "$scratch/dfv.json" --spec-draft-p-min)" = None ] && ! grep -q recipe "$scratch/dfv.json.log"'
 
-run "$scratch/q4exp.gguf" "$scratch/q4exp.json"
+SERVE_DEVICE=cpu run "$scratch/q4exp.gguf" "$scratch/q4exp.json"  # cpu by name: on a box with HRX, auto is hrx
 check "the qwen4exp graph-program-cache recipe is hrx-scoped: nothing on cpu" \
       '! grep -q "hrx-graph-program-cache-128" "$scratch/q4exp.json.log"'
 check "  and nothing is set for the other architectures" '[ "$(field "$scratch/moe.json" "r[\"env\"].get(\"GGML_HRX_GRAPH_PROGRAM_CACHE\")")" = None ]'

@@ -56,6 +56,33 @@ inline void conv1d(const float* x, int cin, int T, const float* w, const float* 
     }
 }
 
+// The same convolution as a GEMM (engine#1783: so the encoder's two Conv stems can run on the NPU's GEMM family).
+//   A = im2col(x): (tout, cin*k), A[t][ci*k + j] = x[ci][t*stride + j - pad], 0 outside [0, T).
+//   B = w as (cin*k, cout): B[ci*k + j][co] = w[co][ci][j].
+//   out[co][t] = b[co] + (A x B)[t][co]
+// conv1d() above is the reference this is tested against (tests/audio_ops_test.cpp); the column order ci*k + j is the
+// initializer's own (cout, cin, k) flattening, so B is a plain transpose of w viewed as (cout, cin*k).
+inline void conv1d_im2col(const float* x, int cin, int T, int k, int stride, int pad, float* A) {
+    const int tout = conv1d_out_len(T, k, stride, pad);
+    const std::size_t kk = static_cast<std::size_t>(cin) * static_cast<std::size_t>(k);
+    for (int t = 0; t < tout; ++t) {
+        float* row = A + static_cast<std::size_t>(t) * kk;
+        for (int ci = 0; ci < cin; ++ci) {
+            const float* xr = x + static_cast<std::size_t>(ci) * T;
+            for (int j = 0; j < k; ++j) {
+                const int src = t * stride + j - pad;
+                row[static_cast<std::size_t>(ci) * k + j] = (src >= 0 && src < T) ? xr[src] : 0.0f;
+            }
+        }
+    }
+}
+
+inline void conv1d_weight_as_kn(const float* w, int cout, int cin, int k, float* B) {
+    const std::size_t kk = static_cast<std::size_t>(cin) * static_cast<std::size_t>(k);
+    for (int co = 0; co < cout; ++co)
+        for (std::size_t r = 0; r < kk; ++r) B[r * static_cast<std::size_t>(cout) + co] = w[static_cast<std::size_t>(co) * kk + r];
+}
+
 // y = (x - mean) / sqrt(var + eps) * gamma + beta, biased variance (divide by n), one row.
 inline void layer_norm(const float* x, const float* gamma, const float* beta, int n, float eps, float* out) {
     double sum = 0.0;

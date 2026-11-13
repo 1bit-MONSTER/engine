@@ -48,6 +48,23 @@ trap cleanup EXIT
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 freeport() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+# A port that refuses connections AND cannot be taken by another process: bound, never `listen()`ed, and
+# held open for the life of the test. `freeport()` above closes its socket, so the kernel is free to hand
+# that port to anything else on the box -- and on a busy runner something does, which makes the
+# "unreachable executor" arm reachable and fails it (main CI, 50b68e76). Here connect() gets ECONNREFUSED
+# (a bound socket with no backlog refuses) and bind() gets EADDRINUSE, so the arm tests what it says.
+deadport() {
+    local pf="$scratch/dead.port"
+    # >/dev/null: the child must not inherit $( )'s stdout, or the substitution waits for the sleep to
+    # end -- measured: 4015 ms for a 4 s sleeper with the fd inherited, 27 ms detached (review of #2355).
+    python3 -c 'import socket,sys,time
+s = socket.socket(); s.bind(("127.0.0.1", 0))
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+time.sleep(600)' "$pf" >/dev/null 2>&1 &
+    pids+=($!)
+    for _ in $(seq 1 200); do [ -s "$pf" ] && break; sleep 0.02; done
+    cat "$pf"
+}
 jq() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))' "$1"; }  # jq EXPR over stdin JSON as d
 
 lem_port=$(freeport)
@@ -116,7 +133,7 @@ check "  its <parameter=context> reached the expert" '[[ "$(tail -1 "$scratch/le
 check "  and the answer came back" '[[ "$(echo "$reply" | jq "d[\"choices\"][0][\"message\"][\"content\"]")" == *EXPERT_ANSWER* ]]'
 
 # 6. Lemonade not running
-dead_port=$(freeport)
+dead_port=$(deadport)
 serve dead --lemonade-url "http://127.0.0.1:$dead_port" || fail=1
 code=$(curl -s -o "$scratch/dead.json" -w '%{http_code}' "$api/v1/chat/completions" -H 'Content-Type: application/json' \
     -d '{"model": "ZAYA1-8B-PM", "messages": [{"role": "user", "content": "write a C function that reverses a string"}]}')
@@ -164,7 +181,7 @@ check "a refusal from the executor reaches the client" '[[ "$(echo "$reply" | jq
 check "  pm.spawns says ok false" '[ "$(echo "$reply" | jq "d[\"pm\"][\"spawns\"][0][\"ok\"]")" = False ]'
 check "  and the PM still answered (HTTP 200)" '[ -n "$reply" ]'
 
-dead_port=$(freeport)
+dead_port=$(deadport)
 PM_CALL_FORM=spawn serve spawndead --lemonade-url "$lemonade" --pm-spawn-url "http://127.0.0.1:$dead_port" || fail=1
 reply=$(ask)
 check "an unreachable executor: the PM says so and still answers" '[[ "$(echo "$reply" | jq "d[\"choices\"][0][\"message\"][\"content\"]")" == *"did not answer"* ]]'

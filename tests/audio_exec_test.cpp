@@ -19,6 +19,7 @@
 // The mel is mel[b,t] = sin(0.013*(b+1)*(t+1))*0.5 + 0.25 for 80 bins and 3000 frames, computed in double on both sides.
 // Expected values below are onnxruntime's, on whisper-small's encoder_model.onnx. Skips (77) without the pack.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +27,7 @@
 #include <vector>
 
 #include "audio_exec.h"
+#include "audio_parallel.h"
 #include "audio_pack.h"
 #include "onnx_graph.h"
 
@@ -143,6 +145,76 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("audio exec: whole encoder on the host matches onnxruntime\n");
+
+    // ---- engine#1783: the same encoder with its matrix products offered to a device -----------------------------------
+    // The "device" here is an exact f32 GEMM on the host, so this checks the OFFER, not a kernel: that every projection
+    // and both Conv stems leave the executor as (A, B) GEMMs, that the result comes back in the right layout, and that
+    // only the attention products stay on the host. whisper-small: 12 layers x (q, k, v, o, fc1, fc2) + 2 convs = 74
+    // offered, 12 x 2 attention products not offered.
+    {
+        AudioGemm dev;
+        dev.gemm = [](const std::string&, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
+                      std::vector<float>* C, std::string*) {
+            C->assign(size_t(M) * size_t(N), 0.0f);
+            parallel_units(size_t(M), [&](size_t i) {
+                float* c = C->data() + i * size_t(N);
+                for (int64_t k = 0; k < K; ++k) {
+                    const float a = A[i * size_t(K) + size_t(k)];
+                    const float* b = B + size_t(k) * size_t(N);
+                    for (int64_t j = 0; j < N; ++j) c[j] += a * b[j];
+                }
+            });
+            return true;
+        };
+        AudioRunResult rd;
+        if (!run_audio_graph(g, mel.data(), bins, frames, "", &rd, &why, &dev)) {
+            std::printf("FAIL run with a device: %s\n", why.c_str());
+            return 1;
+        }
+        check(dev.device == 74, "74 products offered to the device (72 projections + 2 convs), got " + std::to_string(dev.device));
+        check(dev.host == 24, "24 attention products stay on the host, got " + std::to_string(dev.host));
+        check(rd.dims == r.dims, "the device run has the host run's dims");
+        double maxd = 0.0;
+        for (size_t i = 0; i < r.data.size() && i < rd.data.size(); ++i)
+            maxd = std::max(maxd, std::fabs(double(r.data[i]) - double(rd.data[i])));
+        std::printf("device-offer run: %d device, %d host, max |host - offered| %.3g\n", dev.device, dev.host, maxd);
+        // Not bit-identical: the im2col Conv adds its bias after the taps, conv1d() before them, and 12 layers carry that
+        // rounding to ~1.6e-3 at the output (std 1.68). So the offered run is held to the same onnxruntime values as the
+        // host run, plus a bound on its distance from the host run.
+        check(maxd < 5e-3, "the offered run is within 5e-3 of the host run");
+        if (rd.data.size() == r.data.size()) {
+            double m2 = 0.0, v2 = 0.0;
+            for (float v : rd.data) m2 += v;
+            m2 /= double(rd.data.size());
+            for (float v : rd.data) v2 += (double(v) - m2) * (double(v) - m2);
+            v2 /= double(rd.data.size());
+            expect_close(float(m2), -0.009045244, 2e-4, "offered run: output mean");
+            expect_close(float(std::sqrt(v2)), 1.678493023, 2e-4, "offered run: output std");
+            auto at2 = [&](int64_t tt, int64_t h) { return rd.data[size_t(tt) * H + size_t(h)]; };
+            for (int i = 0; i < 5; ++i) expect_close(at2(0, i), p0[i], 2e-3, "offered run: frame 0 col " + std::to_string(i));
+            for (int i = 0; i < 4; ++i) expect_close(at2(750, i), p1[i], 2e-3, "offered run: frame 750 col " + std::to_string(i));
+            for (int i = 0; i < 4; ++i) expect_close(at2(1499, i), p2[i], 2e-3, "offered run: frame 1499 col " + std::to_string(i));
+        }
+        // A device that declines everything is the host run, counted as host.
+        AudioGemm none;
+        none.gemm = [](const std::string&, const float*, int64_t, int64_t, const float*, int64_t, std::vector<float>*,
+                       std::string* w) {
+            *w = "test: declined";
+            return false;
+        };
+        AudioRunResult rn;
+        if (!run_audio_graph(g, mel.data(), bins, frames, "", &rn, &why, &none)) {
+            std::printf("FAIL run with a declining device: %s\n", why.c_str());
+            return 1;
+        }
+        check(none.device == 0 && none.host == 98 && none.host_why["test: declined"] == 74,
+              "a declining device runs all 98 products on the host and names the 74 refusals");
+        check(rn.data == r.data, "a declining device is bit-identical to the host run");
+        if (g_failures != 0) {
+            std::printf("audio exec: %d failures\n", g_failures);
+            return 1;
+        }
+    }
 
     // ---- the decoder, on the same pack: 128-position token window x, the encoder output xa ----------------------------
     const char* dpath = (dpath_arg != nullptr) ? dpath_arg : std::getenv("ONEBIT_TEST_WHISPER_DECODER");

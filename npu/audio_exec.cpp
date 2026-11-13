@@ -250,8 +250,24 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
 
         // Every node ends here, including the products the device ran (they leave the loop early), so ONEBIT_AUDIO_OP_TIMES
         // counts a device-run MatMul or Conv under its op like a host one.
+        // ONEBIT_AUDIO_NODE_TIMES=1 (engine#2366): one line per node, in graph order, with the output shape. The op totals
+        // below collapse the 72 projections and the 24 attention products into one `MatMul` row, and apportioning that row by
+        // node count is how a 0.39 s family was reported as 1.7 s. The executor already times every node to build the totals,
+        // so this costs a string per node and nothing else.
+        const char* nt = std::getenv("ONEBIT_AUDIO_NODE_TIMES");
+        const bool node_times = nt != nullptr && nt[0] != '\0' && nt[0] != '0';
+        std::vector<std::string> node_lines;
         auto finish_node = [&](const std::string& op, const std::string& name, Tensor& res,
                                std::chrono::steady_clock::time_point t0) {
+            if (node_times) {
+                std::string shape;
+                for (int64_t d : res.dims) shape += (shape.empty() ? "" : "x") + std::to_string(d);
+                char line[220];
+                std::snprintf(line, sizeof line, "[audio-node] %4d %-18s %-22s %9.3f ms\n", int(node_lines.size()) + 1,
+                              op.c_str(), shape.c_str(),
+                              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                node_lines.emplace_back(line);
+            }
             t[name] = std::move(res);
             if (op_times) {
                 auto& e = op_ms[op];
@@ -631,6 +647,10 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
             std::fprintf(stderr, "[audio-op] %zu nodes, %.1f ms, %zu thread(s)\n", g.nodes.size(), total, audio_thread_count());
             for (const auto& o : order)
                 std::fprintf(stderr, "[audio-op] %-20s %6ld calls %10.1f ms\n", o.second.c_str(), op_ms[o.second].second, o.first);
+        }
+        if (node_times) {
+            for (const auto& l : node_lines) std::fputs(l.c_str(), stderr);
+            std::fprintf(stderr, "[audio-node] %zu node(s)\n", node_lines.size());
         }
 
         const std::string want = out_name.empty() ? (g.outputs.empty() ? std::string() : g.outputs[0]) : out_name;

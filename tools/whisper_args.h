@@ -28,7 +28,16 @@
 
 #include <string>
 
-// The index of the wav among argv. `first` is argv[1]: anything carrying `.onnx` is a graph, which means the two-graph form.
+// The index of the wav among argv. `first` is argv[1]: a path ENDING in `.onnx` is a graph, which means the two-graph form.
+//
+// The test is a suffix, not a substring, and that is deliberate: the tool used `find(".onnx")`, so a pack directory named
+// `models.onnx.d/` or a file named `whisper.onnx.d/` would have been read as a graph and the wav taken from argv[3] -- the
+// same substring-where-an-identity-was-meant defect that this session kept finding in roles, layer types and MoE spellings.
+inline bool path_is_onnx(const std::string& path) {
+    static const std::string kExt = ".onnx";
+    return path.size() >= kExt.size() && path.compare(path.size() - kExt.size(), kExt.size(), kExt) == 0;
+}
+
 inline int audio_arg_index_for(const std::string& first) {
-    return first.find(".onnx") == std::string::npos ? 2 : 3;
+    return path_is_onnx(first) ? 3 : 2;
 }

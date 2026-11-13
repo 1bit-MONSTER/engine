@@ -111,6 +111,11 @@ int main() {
     check(audio_arg_index_for("decoder_model.onnx") == 3, "whisper args: either graph decides it");
     // the value the bug shipped with must be unreachable: no input yields the encoder-graph index 1
     check(audio_arg_index_for("encoder_model.onnx") != 1, "whisper args: never the encoder graph's own index");
+    // and the test is a SUFFIX, not a substring: a directory whose name merely contains ".onnx" is still a pack
+    check(audio_arg_index_for("models.onnx.d") == 2, "whisper args: a directory containing '.onnx' is a pack");
+    check(audio_arg_index_for("whisper.onnx.d/") == 2, "whisper args: trailing slash does not make it a graph");
+    check(audio_arg_index_for("a.onnx") == 3, "whisper args: a name that ends in .onnx is a graph");
+    check(!path_is_onnx("onnx"), "whisper args: 'onnx' alone is not a suffix match");
 
     if (g_failures != 0) {
         std::printf("audio mel: %d failures\n", g_failures);

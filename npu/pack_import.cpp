@@ -3329,6 +3329,8 @@ std::string Plan::manifest() const {
             c["role_layer_types"] = {{"keys", container_role_layer_rows},
                                      {"spans", container_role_layer_spans},
                                      {"out_of_range", container_role_layer_out_of_range}};
+        if (!container_payload_rows.empty()) c["payload_rows"] = container_payload_rows;
+        if (!container_role_shapes.empty()) c["role_shapes"] = container_role_shapes;
         if (!container_role_layer_span_names.empty())
             c["role_layer_types"]["span_names"] = container_role_layer_span_names;
         c["note"] = container_note;
@@ -3643,6 +3645,29 @@ ImportPlan container_import_plan(const Q4nxContainer& container, const std::vect
             out.bytes += it.end - it.begin;
         }
         out.items.swap(kept);
+    }
+    return out;
+}
+
+std::map<int64_t, int64_t> container_payload_rows_of(const std::vector<Q4nxTensor>& tensors) {
+    std::map<int64_t, int64_t> out;
+    for (const auto& t : tensors)
+        if (t.dtype == "I8" && t.shape.size() == 3) out[t.shape[2]]++;
+    return out;
+}
+
+std::map<std::string, std::map<std::string, int64_t>> container_role_shapes_of(const std::vector<Q4nxTensor>& tensors) {
+    std::map<std::string, std::map<std::string, int64_t>> out, by_name;
+    const ContainerRoles roles = container_roles(tensors);
+    for (const auto& t : tensors) {
+        std::string sh = "[";
+        for (size_t i = 0; i < t.shape.size(); ++i) sh += (i ? "," : "") + std::to_string(t.shape[i]);
+        by_name[t.name][sh + "] " + t.dtype]++;
+    }
+    for (const auto& kv : roles.role_of) {
+        const auto it = by_name.find(kv.first);
+        if (it == by_name.end()) continue;
+        for (const auto& shape : it->second) out[kv.second][shape.first] += shape.second;
     }
     return out;
 }
@@ -4081,6 +4106,8 @@ Plan plan(const std::string& pack_dir) {
                         if (x.is_string()) lt.push_back(x.get<std::string>());
                 if (!lt.empty()) {
                     const RoleLayerReport rep = container_role_layer_types(cc.tensors, lt);
+                    p.container_payload_rows = container_payload_rows_of(cc.tensors);
+                    p.container_role_shapes = container_role_shapes_of(cc.tensors);
                     p.container_role_layer_rows = int64_t(rep.rows.size());
                     p.container_role_layer_spans = int64_t(rep.spans.size());
                     p.container_role_layer_out_of_range = rep.out_of_range;

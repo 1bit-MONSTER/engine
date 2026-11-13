@@ -267,6 +267,11 @@ struct Plan {
     std::map<std::string, int64_t> container_dtypes;
     std::string container_note;   // what the container genre still needs, empty for a non-container pack
     // engine#1788, slice 3c: the (role, layer type) key, when the pack declares layer_types. -1 when it does not.
+    // engine#1788, 3c residue: the writer's two measurements, kept on the plan because `manifest()` renders from
+    // members and has no container in scope. `payload_rows` counts the 3-D I8 tensors by payload width (the K the
+    // fconst tile is built for); `role_shapes` says which shapes each role appears in.
+    std::map<int64_t, int64_t> container_payload_rows;
+    std::map<std::string, std::map<std::string, int64_t>> container_role_shapes;
     int64_t container_role_layer_rows = -1;
     int64_t container_role_layer_spans = -1;
     int64_t container_role_layer_out_of_range = 0;
@@ -404,6 +409,10 @@ struct RoleSlotReport {
     std::map<std::string, std::string> why;       // role -> why it is not placed here
 };
 RoleSlotReport container_role_slots(const ContainerRoles& roles);
+
+// engine#1788, 3c residue: the two measurements a writer needs, as plain functions over the tensors.
+std::map<int64_t, int64_t> container_payload_rows_of(const std::vector<Q4nxTensor>& tensors);
+std::map<std::string, std::map<std::string, int64_t>> container_role_shapes_of(const std::vector<Q4nxTensor>& tensors);
 
 // engine#1788, slice 3c: the one role whose destination the LAYER TYPE decides, and the reason it decides it. The engine
 // carries `linear_attn.qkv_proj.weight` and has NO `self_attn.qkv_proj` slot at all (grep the literals in npu/forward/src),

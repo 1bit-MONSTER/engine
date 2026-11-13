@@ -16,7 +16,7 @@ limitations under the License.
 -->
 # Before you ask for a merge
 
-Six commands, all host-side, none needing a device or a build. Every one of them answers a question that
+Seven commands, all host-side, none needing a device or a build. Every one of them answers a question that
 `mergeable=true`, a green CI tick and a careful read of your own diff do not.
 
 Run them from the repository root on the branch you are about to hand over.
@@ -29,6 +29,7 @@ Run them from the repository root on the branch you are about to hand over.
 | `python3 tools/ci/registration_loss_check.py --check --base origin/main` | your branch would drop rows `main` has |
 | `python3 tools/ci/tmp_path_check.py --check` | a new `/tmp` or `/dev/shm` path, where builds and dumps belong under `~/wt` or `~/.cache/scratch-*` |
 | `python3 tools/ci/submodule_pin_check.py --check` | a submodule's checkout is not the commit the tree pins |
+| `git grep -l -F "$(basename <your new page>)" -- '*.md'` | nothing links to the page you just added — measured tonight: 45 docs, one with no inbound link, and it was the page whose whole subject is pre-merge checks |
 
 Two more, for the moments they are for:
 
@@ -36,6 +37,18 @@ Two more, for the moments they are for:
 |---|---|
 | `python3 tools/ci/conflict_triage.py . <their-branch>` | before resolving a merge with many conflicted files: it classifies them by kind (content, add/add, mod/del, rename) from the index, which text tools cannot see in a file whose conflict has no markers |
 | `python3 tools/ci/hrx_f16_narrowing.py --check --root <tree with the .loom corpus>` | when the change could touch f32→f16 narrowing; it lists every body that narrows |
+
+## A page nothing links to is a page nobody runs
+
+`docs/pre-pr-checks.md` had no inbound link from any other `.md` for two hours after it merged: it was reachable only by knowing
+its name. A new page is a claim that someone should read it, and the only mechanical half of that claim is a link — so before you
+open the PR, grep for your own page's name and see someone else's file come back:
+
+    git grep -l -F "$(basename docs/your-new-page.md)" -- '*.md'
+
+Empty output means the page exists for whoever already knows about it, which is nobody. Prefer the link from the page a reader is
+already on when they need yours — here `CONTRIBUTING.md`, under the rules the page operationalises — rather than from an index
+nobody opens.
 
 ## A private pin (`config/*.config`) is the one bump CI cannot check
 

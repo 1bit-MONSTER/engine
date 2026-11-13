@@ -277,6 +277,13 @@ add_test(NAME dupdef_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_c
 # row keeps the next one from landing.
 add_test(NAME tool_help_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/tool_help_check.py --check --root tools
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# The same question, asked of the two trees the row above does not cover: `tests/` had 7 helpers that treated the
+# flag as a path (4 crashed with FileNotFoundError, 2 as int(), and tests/laya_route_cases.py WROTE a file named
+# `--help` into the checkout), plus one onnx runner path. They answer with a usage line and rc 2 now.
+add_test(NAME tool_help_check_tests COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/tool_help_check.py --check --root tests
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME tool_help_check_onnx COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/tool_help_check.py --check --root onnx
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME tool_help_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/tool_help_check.py --self-test
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 

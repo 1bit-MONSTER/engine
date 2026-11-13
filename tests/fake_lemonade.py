@@ -21,6 +21,9 @@
 import json, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+    print("usage: fake_lemonade.py <port> <record-path>")
+    sys.exit(2)
 port, record = int(sys.argv[1]), sys.argv[2]
 
 

@@ -224,6 +224,9 @@ def start(binary, model, port, extra, log):
 
 
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip().splitlines()[0])
+        return 2
     if len(sys.argv) != 2:
         print(__doc__.strip().splitlines()[2])
         return 2

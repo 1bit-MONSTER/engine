@@ -184,6 +184,9 @@ def main():
         instr = LONG_INSTR[i % len(LONG_INSTR)]
         cases.append({"class": "long_doc", "text": f"{instr}\n\n{body(k, r)}"})
     assert all(sum(c["class"] == k for c in cases) == 50 for k in ("code", "prose", "short", "long_doc"))
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip().splitlines()[0])
+        sys.exit(2)
     out = sys.argv[1] if len(sys.argv) > 1 else "tests/laya_route_cases.json"
     json.dump({"about": "RFC #186: labelled requests for the Laya request classifier; regenerate with tests/laya_route_cases.py",
                "classes": ["code", "prose", "short", "long_doc"], "cases": cases}, open(out, "w"), indent=1, ensure_ascii=False)

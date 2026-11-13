@@ -23,6 +23,9 @@
 import json, os, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+    print("usage: fake_spawn_exec.py <port>")
+    sys.exit(2)
 port = int(sys.argv[1])
 RECORD = os.environ.get("SPAWN_RECORD")
 

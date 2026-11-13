@@ -54,8 +54,10 @@ open the PR, grep for your own page's name and see someone else's file come back
 Empty output means the page exists for whoever already knows about it, which is nobody.
 
 **Why this one is not in `scripts/pre-pr-checks.sh`**: that runner is a loop over `python3` tools that carry their own self-tests,
-and a repo-wide form of this check is a new tool for an invariant that measures **0 today** (45 docs, none orphaned). It is worth
-one command at the moment a page is added — which is the only moment it can be false. Prefer the link from the page a reader is
+and a repo-wide form of this check is a new tool for an invariant that measures **1 today — this page** — and 0 once engine#2350
+adds its inbound link. That is the strongest argument for it being an author's step rather than a gate: **the number it reports is a
+property of the tree at that moment, not of your change** — it flips from 1 to 0 when a *different* PR merges, which is not a
+statement about anything the author did. What the author's own command answers is: does the page I am adding have a way in. Prefer the link from the page a reader is
 already on when they need yours — here `CONTRIBUTING.md`, under the rules the page operationalises — rather than from an index
 nobody opens.
 

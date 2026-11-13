@@ -54,7 +54,7 @@ BASELINE = pathlib.Path("tools/ci/hrx_f16_narrowing.txt")
 # that have one, so a new one is drift.
 ACC_BASELINE = pathlib.Path("tools/ci/hrx_f16_accumulators.txt")
 ACC_INIT = re.compile(r"vector\.fragment<init>[^\n]*vector<(\d+)xf16>")
-ACC_MUL = re.compile(r"vector\.mulf|template\.apply<@[^>]*wmma[^>]*>|vector\.(fma|contract|dot|outerproduct)\b|wmma\.(mma|load|store)")
+ACC_MUL = re.compile(r"vector\.mulf|vector\.mma\b|template\.apply<@[^>]*wmma[^>]*>|vector\.(fma|contract|dot|outerproduct)\b|wmma\.(mma|load|store)")
 # Measured (engine#2167): at 120 lines past the init, `mul_mat_id_f16_f16_wmma_core`'s four accumulators read as
 # unaffected, because their update sits ~250 lines below in a long Q4_K/Q6 loop body. 250 finds them.
 ACC_WINDOW = 250
@@ -370,6 +370,24 @@ def self_test():
         empty = root / "empty"
         empty.mkdir()
         check_that(check(empty) == 77, "a missing corpus returns 77, not 0")
+        # engine#2244 review: nothing reached check()'s FAIL condition, so deleting `grew` from it still passed
+        # --self-test. The failure set is the one thing this tool exists to enforce, so it needs an arm of its own:
+        # a listed body that gains a narrowing line must come back rc 1.
+        ck = root / "ck"
+        ck_corpus = ck / CORPUS
+        ck_corpus.mkdir(parents=True)
+        (ck / BASELINE).parent.mkdir(parents=True, exist_ok=True)
+        (ck_corpus / "listed.loom").write_text("  %x = scalar.fptrunc %y : f32 to f16\n")
+        (ck / BASELINE).write_text("# c\nlisted.loom 1\n")
+        (ck / ACC_BASELINE).write_text("# c\n")
+        check_that(check(ck) == 0, "check(): a corpus that matches its baseline is rc 0")
+        (ck_corpus / "listed.loom").write_text(
+            "  %x = scalar.fptrunc %y : f32 to f16\n  %z = scalar.fptrunc %w : f32 to f16\n")
+        check_that(check(ck) == 1,
+                   "check(): one extra narrowing LINE in a listed body is rc 1 -- the fail condition is armed")
+        (ck_corpus / "listed.loom").write_text("  %x = scalar.constant 0.0 : f32\n")
+        check_that(check(ck) == 1,
+                   "check(): a body that drops to zero is also rc 1, not a silent pass")
         # engine#2244 review: the two cases "absent from counts" used to collapse into one `continue`. A body that
         # went to ZERO narrowing lines is the outcome this ratchet exists for, and a body whose file was deleted
         # must lose its baseline line instead of rotting quietly.

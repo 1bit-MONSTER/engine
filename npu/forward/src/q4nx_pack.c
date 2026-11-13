@@ -275,6 +275,18 @@ const char* q4nx_pb16i_instance(Q4nxDesign role) {
     }
 }
 
+const char* q4nx_i8_sealed_instance(Q4nxDesign role) {
+    switch (role) {
+        case Q4NX_DESIGN_QKVLIN: return "main:qkv";
+        case Q4NX_DESIGN_QKV:    return "main:qkvfa";
+        case Q4NX_DESIGN_Z:      return "main:z";
+        case Q4NX_DESIGN_O:      return "main:o";
+        case Q4NX_DESIGN_GU:     return "main:gu";
+        case Q4NX_DESIGN_D:      return "main:d";
+        default:                 return 0;
+    }
+}
+
 const char* q4nx_design_log_tag(Q4nxDesign role) {
     switch (role) {
         case Q4NX_DESIGN_QKV: return "QKV";

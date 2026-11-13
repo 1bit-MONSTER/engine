@@ -139,6 +139,19 @@ with tempfile.TemporaryDirectory() as root:
     check(json.load(open(os.path.join(d2c, "plan.json")))["decode"]["sealed_elf"] == "",
           "a t2s container does not inherit q4nx_pb16i_sealed_elf")
 
+    # 4c2. engine#2208: a b8 container names its sealed int8 ELF under its own key, and does not take pb16i's.
+    d2b8 = model_dir(os.path.join(root, "b3b8"), layout="b8", q4nx_b8_sealed_elf="SEALED-I8.elf",
+                     layer_types=["linear_attention", "full_attention"])
+    run(d2b8)
+    p2b8 = json.load(open(os.path.join(d2b8, "plan.json")))
+    check(p2b8["kernels"]["tag"] == "_b8" and p2b8["decode"]["sealed_elf"] == "SEALED-I8.elf",
+          "b8 layout -> its own sealed int8 ELF named")
+    d2b8n = model_dir(os.path.join(root, "b3b8n"), layout="b8", sealed="pb16i_sealed.elf",
+                      layer_types=["linear_attention", "full_attention"])
+    run(d2b8n)
+    check(json.load(open(os.path.join(d2b8n, "plan.json")))["decode"]["sealed_elf"] == "",
+          "a b8 container does not inherit q4nx_pb16i_sealed_elf")
+
     # 4d. engine#1990: a wide prefill family is carried into prefill{}, with its row count; a pack without
     #     one keeps the two-key-free block it always had; and a layout reads only its own key.
     check(p2b["prefill"] == {"M": 128}, "no wide key in config -> prefill block unchanged")

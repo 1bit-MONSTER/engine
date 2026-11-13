@@ -607,13 +607,15 @@ struct Plan {
                                 " but layers[] holds " + std::to_string(p.layer_plans.size()));
         }
         // A pb16i plan whose decode family is the sealed ELF must name it, and a plan that names one
-        // must be pb16i: the two fields describe the same decision.
+        // must be pb16i or b8 (engine#2208: a sealed int8 ELF for a b8 container): the fields describe
+        // the same decision.
         if (p.pb16i && p.decode_enabled && p.sealed_elf.empty() && p.tag == "_pb16i")
             throw PlanError("plan: " + path +
                             " is the pb16i family but decode.sealed_elf is empty (the sealed ELF is what "
                             "the decode roles run)");
-        if (!p.pb16i && !p.sealed_elf.empty())
-            throw PlanError("plan: " + path + " names decode.sealed_elf but container.pb16i is false");
+        if (!p.pb16i && p.layout != "b8" && !p.sealed_elf.empty())
+            throw PlanError("plan: " + path + " names decode.sealed_elf but container.pb16i is false "
+                            "and container.layout is not b8");
         // The wide family is the decode family's instances at another width, so it cannot exist without it, and
         // its row count must be one a chunk can have: more than the 16 rows of the decode family, at most 128.
         if (!p.sealed_wide_elf.empty()) {

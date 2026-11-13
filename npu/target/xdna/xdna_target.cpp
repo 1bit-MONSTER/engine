@@ -616,27 +616,37 @@ bool XdnaTarget::open_decode_family(Q4nxDesignGeom* designs16, int n, const std:
     for (int i = 0; i < n; i++) {
         if (designs16[i].M <= 0) { ++skipped_n; continue; }
         std::string elf, kname = "main:seq";
-        if (setup_.pb16i && !sealed_elf.empty()) {
-            // One ELF for every ternary phase: the file is the same for all roles and only the instance name
-            // differs, so I8Ctx reuses the one hw_context.
-            const char* inst = q4nx_pb16i_instance(designs16[i].role);
+        if ((setup_.pb16i || setup_.b8) && !sealed_elf.empty()) {
+            // One ELF for every phase: the file is the same for all roles and only the instance name
+            // differs, so I8Ctx reuses the one hw_context. pb16i and b8 (engine#2208) each have their own
+            // instance table.
+            const char* inst = setup_.pb16i ? q4nx_pb16i_instance(designs16[i].role)
+                                            : q4nx_i8_sealed_instance(designs16[i].role);
             if (!inst) {
-                std::fprintf(stderr, "  [forward] pb16i: the sealed ELF has no instance for "
-                                     "role %s; this role has no decode kernel\n",
+                if (setup_.pb16i) {
+                    std::fprintf(stderr, "  [forward] pb16i: the sealed ELF has no instance for "
+                                         "role %s; this role has no decode kernel\n",
+                                 q4nx_design_log_tag(designs16[i].role));
+                    designs16[i].M = 0;
+                    ++skipped_n;
+                    continue;
+                }
+                // b8: an uncovered role is not a missing kernel; its per-role M=16 twin still serves it below.
+                std::fprintf(stderr, "  [forward] b8: the sealed ELF has no instance for role %s; "
+                                     "it keeps its per-role decode kernel\n",
                              q4nx_design_log_tag(designs16[i].role));
-                designs16[i].M = 0;
-                ++skipped_n;
-                continue;
+            } else {
+                elf = setup_.kernels_dir + "/" + sealed_elf;
+                kname = inst;
+                if (!decode_elf_exists(elf)) {
+                    err = plan_.loaded() ? ("plan " + setup_.plan_path + ": decode.sealed_elf \"" + sealed_elf +
+                                            "\" is not in " + setup_.kernels_dir + " (missing)")
+                                         : (std::string(setup_.pb16i ? "pb16i" : "b8") + ": missing sealed ELF " + elf);
+                    return false;
+                }
             }
-            elf = setup_.kernels_dir + "/" + sealed_elf;
-            kname = inst;
-            if (!decode_elf_exists(elf)) {
-                err = plan_.loaded() ? ("plan " + setup_.plan_path + ": decode.sealed_elf \"" + sealed_elf +
-                                        "\" is not in " + setup_.kernels_dir + " (missing)")
-                                     : ("pb16i: missing sealed ELF " + elf);
-                return false;
-            }
-        } else {
+        }
+        if (elf.empty()) {   // not sealed, or a b8 role the sealed ELF does not cover
             for (const std::string& d : setup_.decode_dirs) {
                 const std::string cand = d + "/" + designs16[i].elf_name;
                 if (decode_elf_exists(cand)) { elf = cand; break; }

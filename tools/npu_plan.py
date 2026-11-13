@@ -350,8 +350,11 @@ def generate(model_dir: str, kernels: str) -> dict:
             # layout never borrows the other's image format).  A t2s decode family shipped as
             # per-role ELFs pays a hw_context switch on every launch -- measured 2026-11-02 at
             # +2.0-2.3 ms, more than the kernels themselves.
-            "sealed_elf": cfg.get("q4nx_t2s_sealed_elf" if layout == "t2s" else "q4nx_pb16i_sealed_elf", "")
-            if layout in ("pb16i", "t2s") else "",
+            # A b8 container's sealed int8 ELF has its own key too (engine#2208): an int8 ELF reads b8 tiles,
+            # not pb16i or t2s images.
+            "sealed_elf": cfg.get({"t2s": "q4nx_t2s_sealed_elf", "pb16i": "q4nx_pb16i_sealed_elf",
+                                   "b8": "q4nx_b8_sealed_elf"}[layout], "")
+            if layout in ("pb16i", "t2s", "b8") else "",
             **narrow_fields(cfg, layout),
         },
         "kernels": {"tag": tag},

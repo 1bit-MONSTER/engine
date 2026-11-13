@@ -142,6 +142,27 @@ inline nlohmann::ordered_json messages_for_template(nlohmann::ordered_json messa
     return messages;
 }
 
+// Does any message carry a PICTURE? (engine#2324)
+//
+// OpenAI spells an image as a content-part array: `content: [{"type":"text",...}, {"type":"image_url","image_url":{...}}]`.
+// This route parses no pixels -- there is no base64 decode and no call into npu/vision_*.h -- so a request that carries one
+// would otherwise reach the template as an array and be answered as if the picture were text: a wrong answer with a 200.
+// The vision chain itself exists (npu/vision_tower.h, vision_prompt.h, vision_plan.h, vision_image.h, driven by
+// npu/forward/minicpm_image_probe.cpp); what is missing is the serve wiring, so this refuses rather than guesses.
+inline bool message_carries_an_image(const nlohmann::ordered_json& messages) {
+    if (!messages.is_array()) return false;
+    for (const auto& m : messages) {
+        if (!m.is_object() || !m.contains("content") || !m["content"].is_array()) continue;
+        for (const auto& part : m["content"]) {
+            if (!part.is_object() || !part.contains("type") || !part["type"].is_string()) continue;
+            const std::string type = part["type"].get<std::string>();
+            // `image_url` is the OpenAI spelling; `image` is what several local servers accept. Both mean pixels.
+            if (type == "image_url" || type == "image") return true;
+        }
+    }
+    return false;
+}
+
 // Render `messages` with the container's template.
 //
 //   messages          the request's messages array, as the OpenAI API spells it

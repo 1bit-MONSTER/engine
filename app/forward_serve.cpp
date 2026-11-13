@@ -270,6 +270,18 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 // The functions the request offers go the same way (npu::request_template_vars): the
                 // template is where a model learns what it may call.
                 const nlohmann::ordered_json extra = npu::request_template_vars(ordered, npu::thinking_from_body(body));
+                // engine#2324: this route has no vision wiring, so a picture in the request is refused by name rather
+                // than rendered as text and answered. The chain it would call exists; the parse and the join here do not.
+                if (npu::message_carries_an_image(ordered.at("messages"))) {
+                    res.status = 400;
+                    res.set_content(nlohmann::ordered_json{{"error", nlohmann::ordered_json{{"message",
+                        "this route has no vision wiring yet (engine#2324): the request carries an image part and the "
+                        "NPU route parses no pixels, so answering it would ignore the picture. Text-only requests are "
+                        "unaffected. The vision chain exists (npu/vision_tower.h and friends) and is driven by "
+                        "npu/forward/minicpm_image_probe.cpp; the serve-side parse and the image positions are what is missing."},
+                        {"type", "unsupported_image_part"}, {"code", 400}}}.dump(), "application/json");
+                    return;
+                }
                 // An earlier call's arguments arrive as a JSON string; the template is written against the
                 // object (npu::messages_for_template).
                 prompt = npu::render_chat_template(e.tmpl, npu::messages_for_template(ordered.at("messages")),

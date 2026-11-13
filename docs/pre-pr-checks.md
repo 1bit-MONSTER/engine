@@ -95,6 +95,23 @@ carried an already-merged commit for the same reason.
   side drops them; rebase and keep every row `main` has;
 - **stale and clean** — behind, not destructive: the merge keeps `main`'s rows. Rebase when convenient.
 
+## The one that is not a command: build the target that contains the file you edited
+
+Nothing above compiles anything, and a green `build` tick does not answer this question either -- it answers "the targets CI built
+compile", which is a different set, built by a different runner, from a different checkout.
+
+    engine#2327, 2026-11-13: the image refusal added a 400 body to app/forward_serve.cpp and it was one brace short. The PR's unit
+    test built and passed -- it covered `npu::message_carries_an_image()`, the *predicate*. The PR merged, `main` did not compile,
+    and another lane fixed it in 273f6e9df ("serve: main does not compile at the #2327 image refusal") before I knew.
+
+The trap is that the test which seemed to be the evidence links a different translation unit from the one that broke. Ask which
+target compiles the file, not whether the file looks right:
+
+    cmake --build build-<cfg> --target <that target> -j 6
+
+`forward_serve.cpp` is in the serve binary, not in the helper's test. If you cannot name the target, `grep` `CMakeLists.txt` for
+the file name -- and if the answer is "the whole `1bit` binary", that is the answer, not a reason to skip it.
+
 ## These are not CI rows
 
 Every check above runs in CI except `registration_loss_check` and `conflict_triage`, which compare two revisions — a build only

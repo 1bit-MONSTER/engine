@@ -403,7 +403,10 @@ add_python_test(conflict_triage_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_triag
 # shipped without a licence line until a reviewer noticed. Matched on the GIT_REPOSITORY URL: that is
 # what the two files share (`stb` in CMake is `stb_image (nothings/stb)` in NOTICE, so the name is not).
 add_python_test(notice_covers_deps_self ${CMAKE_SOURCE_DIR}/tools/ci/notice_covers_deps.py --self-test)
-add_python_test(notice_covers_deps ${CMAKE_SOURCE_DIR}/tools/ci/notice_covers_deps.py --check)
+# `--root` is explicit: add_python_test() sets no WORKING_DIRECTORY, so ctest runs this row in the BUILD
+# directory and a `--root .` default would look for CMakeLists.txt where there is none (review of #2344 --
+# the self-test passed next to a failing check, which is that diagnosis in one line).
+add_python_test(notice_covers_deps ${CMAKE_SOURCE_DIR}/tools/ci/notice_covers_deps.py --check --root ${CMAKE_SOURCE_DIR})
 # reviews: a PR that carries another PR's files lands two merge decisions as one, and one whose work base
 # already has reads as a fresh duplicate. Both are invisible to a diffstat; this compares blobs. Device-free.
 add_python_test(pr_carry_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_carry_check.py --self-test)

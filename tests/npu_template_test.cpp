@@ -178,6 +178,32 @@ int main(int argc, char** argv) {
         check(onebit::npu::messages_for_template(odd) == odd, "call arguments: a string that is not a JSON object is left as sent");
     }
 
+    // engine#2324: which requests carry a PICTURE. The NPU route parses no pixels, so the route refuses by name instead of
+    // rendering the part as text and answering; these arms are the predicate that decides, and both directions matter --
+    // over-matching would break the tool-call requests above, under-matching would answer a picture as if it were text.
+    {
+        using onebit::npu::message_carries_an_image;
+        const auto m = [](const char* text) { return nlohmann::ordered_json::parse(text); };
+        check(!message_carries_an_image(m(R"([{"role":"user","content":"hello"}])")),
+              "an image part: a plain string content is not a picture");
+        check(!message_carries_an_image(m(R"([{"role":"user","content":[{"type":"text","text":"hello"}]}])")),
+              "an image part: a text-only content ARRAY is not a picture");
+        check(message_carries_an_image(
+                  m(R"([{"role":"user","content":[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"data:image/ppm;base64,AAA"}}]}])")),
+              "an image part: the OpenAI image_url part is a picture");
+        check(message_carries_an_image(m(R"([{"role":"user","content":[{"type":"image","data":"AAA"}]}])")),
+              "an image part: the bare image spelling several local servers accept is a picture too");
+        check(message_carries_an_image(
+                  m(R"([{"role":"system","content":"x"},{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://h/i.png"}}]}])")),
+              "an image part: it is found in a later message, not only the first");
+        check(!message_carries_an_image(m(R"({"not":"an array"})")),
+              "an image part: a body whose messages are not an array is not a picture");
+        check(!message_carries_an_image(m(R"([{"role":"user","content":[{"no_type":1},{"type":2}]}])")),
+              "an image part: parts without a string type are not pictures");
+        check(!message_carries_an_image(m(R"([{"role":"assistant","tool_calls":[{"function":{"arguments":"{\"type\":\"image_url\"}"}}]}])")),
+              "an image part: the string image_url inside tool arguments is not a picture (it is not a content part)");
+    }
+
     // A container that declares no template is this layer's "no", not a ChatML render: the route decides
     // what to do about that (app/forward_serve.cpp: ChatML with anchors, else the #987 400).
     {

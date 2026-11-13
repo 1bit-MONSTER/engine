@@ -1127,6 +1127,29 @@ watcher already classes it as remote code) and needs no entry.
   (`attn_res_mixer`, `attn_res_mlp`, `res_out`), and the GQA layers have a fused `qg_proj` and a value-residual
   `v_mix`. No pinned graph has those tensors. Reported, not alerted (`"watch": "report"`).
 
+## 2026-11-13: `Skylar2ForCausalLM` — reviewed, not an alias (engine#2367)
+
+The one `!! UNCOVERED` line of the 2026-11-13 watcher run. It was read from the repo's own `config.json` and the
+safetensors header (`model.safetensors`, tensor names and shapes), not from the class name. The run's two
+`REMOTE-CODE` lines (`ParenthesesForCausalLM`, `Spark2_5ForCausalLM`) are informational, and the `UNVERIFIABLE` lines
+are retried by the watcher, so neither needs an entry.
+
+* `Skylar2ForCausalLM` (`model_type` `skylar2`, 1 model, `Skyl4r-Ai/Skylar2-1B-Instruct`) is "Skylar 2". It is a
+  from-scratch 1B model that transformers loads only after `import skylar` from its own pip package: the repo has no
+  `auto_map` and no modelling code. It has 36 layers, hidden 1536 and vocab 64000, in a 3:1 hybrid:
+  * 27 KDA linear-attention layers, with `A_log`, `dt_bias`, per-q/k/v short convs (`q_conv`, `k_conv`, `v_conv`)
+    and low-rank gates (`f_a`/`f_b`, `g_a`/`g_b`);
+  * 9 GQA layers (12 heads / 4 KV, `qk_norm`), each with a per-head output gate (`W_gate`, 12 x 1536).
+
+  Every norm is a gated RMSNorm with a rank-16 `gate_up`/`gate_down`. Every attention and FFN sublayer has an
+  attention-residual mixer (`res_attn`/`res_ffn`, a `query` and a `key_weight`), and so does the output
+  (`res_final`). The FFN uses a `situ_glu` activation (`situ_beta1` 4, `situ_beta2` 25).
+
+  **It is not an alias of `KimiLinearForCausalLM`**: that class has a different KDA gate, no gated norms and no
+  residual mixers. Nor is it Kimi K3, which llama.cpp #327 adds: K3 shares the situ activation and attention residuals,
+  but has MLA attention, a full-rank KDA gate and a latent MoE where Skylar 2 has GQA, a low-rank gate and a dense
+  FFN. No pinned graph has these tensors. Reported, not alerted (`"watch": "report"`).
+
 ## FLM 1.0.12's build on the box: one family root with nothing, three that are already somewhere (engine#1787)
 
 F9 of `TNPU-ALL` §9 asks for a row for *every family FastFlowLM's build serves and we do not*. The build is on the box,

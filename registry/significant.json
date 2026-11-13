@@ -187,6 +187,11 @@
    "model_type": "oleander",
    "family": "Oleander-150M, a from-scratch training export (first seen: CyanMonkey/Test-Subject-3; its own config says step 2000 of 28820, 6.94 %). Hybrid 28 layers in a gdn2,gdn2,gdn2,gqa pattern, hidden 576, vocab 32770, F32. Ships no modelling code and no auto_map. Not an alias of the Qwen3.5 / Qwen3-Next linear-attention families despite the same layer_types: gdn2 layers carry per-q/k/v conv1d and low-rank f/g gate projections, every sublayer has attention-residual mixers (attn_res_*), and GQA layers a fused qg_proj and a value-residual v_mix; no pinned graph has those tensors.",
    "watch": "report"
+  },
+  "Skylar2ForCausalLM": {
+   "model_type": "skylar2",
+   "family": "Skylar 2 (first seen: Skyl4r-Ai/Skylar2-1B-Instruct, the 2026-11-13 census), a from-scratch 1B hybrid that loads through its own `skylar` pip package (no auto_map, no modelling code in the repo). 36 layers, hidden 1536, vocab 64000: 27 KDA linear-attention layers (A_log, dt_bias, per-q/k/v short conv, low-rank f_a/f_b and g_a/g_b gates) and 9 GQA layers (12 heads / 4 KV, qk_norm, a per-head output gate W_gate) in a 3:1 pattern; every norm is a gated RMSNorm with rank-16 gate_up/gate_down, every sublayer has an attention-residual mixer (res_attn/res_ffn query + key_weight), and the FFN uses a situ_glu activation. Not an alias of KimiLinearForCausalLM (different KDA gate, norms and residual mixers) nor of Kimi K3 in llama.cpp #327, which shares situ and attention residuals but uses MLA attention, a full-rank KDA gate and a latent MoE. No pinned graph has these tensors.",
+   "watch": "report"
   }
  }
 }

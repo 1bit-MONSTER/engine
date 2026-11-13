@@ -964,6 +964,18 @@ check("engine#1922 class stays out of the runtime registry", _DS not in archs)
 check("engine#1922 entry records its model_type", sig.get(_DS, {}).get("model_type") == "deepseek_v4_flash_superexpert")
 
 
+# engine#2367: the 2026-11-13 run's one UNCOVERED class, read from its config and safetensors header. Skylar 2 is a
+# KDA + GQA hybrid with gated norms and attention-residual mixers that no pinned graph has: declined, report-only.
+_SK = "Skylar2ForCausalLM"
+check("engine#2367 Skylar2ForCausalLM is reviewed report-only and documented",
+      sig.get(_SK, {}).get("watch") == "report" and sig[_SK].get("model_type") == "skylar2"
+      and _SK not in archs and _SK in gap_docs)
+rc, res = rc_of([model("Skyl4r-Ai/Skylar2-1B-Instruct", _SK)], archs, sig)
+check("engine#2367 the run's upload -> exit 0, listed as reviewed, no alert",
+      rc == 0 and res["reviewed_report"] == [_SK] and res["significant"] == [])
+_, out = text_of([model("Skyl4r-Ai/Skylar2-1B-Instruct", _SK)], archs, sig)
+check("engine#2367 printed as REVIEWED, not UNCOVERED", ". REVIEWED " + _SK in out and "UNCOVERED" not in out)
+
 # 27. engine#2171: an answered gap stays answered. CI keeps no state, so every scheduled run sees the whole
 # FastFlowLM org as new; before registry/flm_answers.json each family docs/npu.md had already answered
 # printed `!! NPU FLM` / `!! NEW FLM` again and re-filed the census issue the day after it closed.

@@ -764,6 +764,17 @@ carrying every instance (`main:gu|d|qkv|o|z|qh|kv`), named by the container's ow
 a pb16i ELF would read 4,608-byte tiles out of 2,176-byte images). `tools/npu_plan.py` writes the key into
 `plan.json`'s `decode.sealed_elf`, and the engine runs every decode role inside that one context.
 
+**A b8 (int8) container can use a sealed set too (#2208).** The 24-layer Qwen3.5 packs spend most of a
+decode token's device wait switching between per-role hw_contexts, which is the same tax. A b8 container
+names one sealed int8 ELF with its own key, `q4nx_b8_sealed_elf` (or `NPU_I8_SEALED_ELF=<file>` for a
+run), in the kernels directory. Its instances are `main:qkv` (linear-attention QKV), `main:qkvfa` (the
+fused full-attention QKV with its output gate), `main:z`, `main:o`, `main:gu` (fused gate/up) and `main:d`
+(`q4nx_i8_sealed_instance`). A role the ELF has no instance for, such as split `G`/`U`, keeps its per-role
+`_b8_m16.elf` and the load logs `b8: the sealed ELF has no instance for role ...`. `tools/npu_plan.py`
+copies the key into `decode.sealed_elf`, and the plan accepts a sealed ELF for `container.layout` b8 as
+well as pb16i. The ELF is built for one model's shapes; naming it for a pack with other shapes is a
+container error, as with pb16i.
+
 #### The t2s family is M=16 today, and that is what caps prefill (#1416)
 
 Measured, not inferred: a t2s container's kernel set contains **only `*_t2s2_m16.elf`** for 8 of the nine decode roles, and the engine reports the

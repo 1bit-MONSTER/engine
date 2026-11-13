@@ -299,6 +299,12 @@ const char* q4nx_design_log_tag(Q4nxDesign role);
 // side of the split: a duplicate would be two contracts that drift silently.
 const char* q4nx_pb16i_instance(Q4nxDesign role);
 
+// The same for a SEALED int8 b8 ELF (engine#2208): one hw_context for the decode roles of a b8 container whose
+// full-attention QKV is one fused role (QKV, with the output gate) and whose gate/up is one fused role (GU).
+// The split G and U roles have no instance: the sealed GU instance is the fused width, so they keep their own
+// kernels. NULL means the sealed ELF does not cover the role.
+const char* q4nx_i8_sealed_instance(Q4nxDesign role);
+
 /* Look up the entry for a role in a derived set; NULL if absent. */
 const Q4nxDesignGeom* q4nx_find_design(const Q4nxDesignGeom* designs, int count,
                                        Q4nxDesign role);

@@ -734,6 +734,14 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         weight_layout_b8_ = (lay == "b8");
         t2s_ = (lay == "t2s");
         pb16i_ = (lay == "pb16i") || t2s_;
+        if (weight_layout_b8_) {
+            // engine#2208: a b8 container's decode roles can run from one sealed int8 ELF, one hw_context
+            // instead of one per role. The decode wait on a 24-layer pack is mostly context switches, so this
+            // is the same artifact shape pb16i uses, under the layout's own key. Empty keeps the per-role
+            // `_b8_m16.elf` files.
+            const char* e = getenv("NPU_I8_SEALED_ELF");
+            pb16i_sealed_ = e ? e : read_config_string(cfg_path, "\"q4nx_b8_sealed_elf\"", "");
+        }
         if (pb16i_) {
             // Where the images live: blk_<layer>_<tag>_weight.{pb16i|t2s,ref}.  The env
             // variable wins so a run can point at a fresh set without editing the

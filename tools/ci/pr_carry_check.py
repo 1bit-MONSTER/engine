@@ -100,18 +100,58 @@ def classify(repo, base, refs):
     return carried, sorted(landed), own
 
 
+def added_lines(repo, base, ref):
+    """The lines this ref ADDS, as a set -- the unit two PRs share when one carries another's WORK."""
+    mb = git(repo, "merge-base", base, ref)
+    if not mb:
+        die(f"no merge base between {base!r} and {ref!r}")
+    out = set()
+    for line in git(repo, "diff", "-U0", mb, ref).splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            out.add(line[1:].strip())   # indentation-only differences must not hide a copied block
+    out.discard("")
+    return out
+
+
+WORK_FLOOR = 10   # a shared *block*; below this two PRs share boilerplate, not work
+
+
+def shared_work(repo, base, refs):
+    """[(smaller, bigger, n)] for each pair where one ref's added lines are a SUBSET of the other's.
+
+    llama.cpp #333/#334 are the case: the same 36 added lines, but into a branch each, so the file-level
+    comparison in classify() sees two independent PRs. A subset is the shape that cannot be coincidence --
+    an identical block plus extra lines is still one PR taking another's work and extending it.
+    """
+    per = {ref: added_lines(repo, base, ref) for ref in refs}
+    rows = []
+    for i, a in enumerate(sorted(per)):
+        for b in sorted(per)[i + 1:]:
+            la, lb = per[a], per[b]
+            if len(la) < WORK_FLOOR or len(lb) < WORK_FLOOR:
+                continue
+            if la <= lb or lb <= la:
+                small, big = (a, b) if la <= lb else (b, a)
+                rows.append((small, big, min(len(la), len(lb))))
+    return rows
+
+
 def run(repo, refs, base):
     for ref in refs:
         resolve(repo, ref)
     resolve(repo, base)
     carried, landed, own = classify(repo, base, refs)
+    work = shared_work(repo, base, refs)
     for path, who in carried:
         print(f"CARRIED  {path}  -- identical in {', '.join(who)} and absent from {base}")
     for ref, path in landed:
         print(f"LANDED   {path}  -- {ref} changes it to what {base} already has")
+    for small, big, n in work:
+        print(f"SHARED   {n} added line(s) of {small} are also in {big}  -- one PR's work, two branches")
     print()
-    print(f"pr_carry_check: {len(refs)} ref(s) against {base}: carried={len(carried)} landed={len(landed)} own={len(own)}")
-    return 1 if (carried or landed) else 0
+    print(f"pr_carry_check: {len(refs)} ref(s) against {base}: carried={len(carried)} landed={len(landed)} "
+          f"own={len(own)} shared_work={len(work)}")
+    return 1 if (carried or landed or work) else 0
 
 
 def self_test():
@@ -182,6 +222,34 @@ def self_test():
         carried3, landed3, _ = classify(repo, "refs/heads/later", ["c"])
         check_that(("c", "carried.txt") in landed3, "a ref that re-adds what base already has is LANDED")
         check_that(not carried3, "and it is not also CARRIED (one ref, not two)")
+
+        # the #333/#334 shape: the SAME added block into a different file, so the file-level test sees
+        # two independent PRs and only the added lines give it away
+        for branch, fname in (("w1", "one.cpp"), ("w2", "two.cpp")):
+            run_git("checkout", "-q", "-B", branch, "refs/heads/base")
+            body = "".join(f"    row_{i}(x);\n" for i in range(12))
+            with open(os.path.join(repo, fname), "w", encoding="utf-8") as f:
+                f.write("void t() {\n" + body + "}\n")
+            run_git("add", "-A")
+            run_git("commit", "-qm", branch)
+        carried5, landed5, _ = classify(repo, "refs/heads/base", ["w1", "w2"])
+        check_that(not carried5 and not landed5, "the same work into two files is neither carried nor landed")
+        work5 = shared_work(repo, "refs/heads/base", ["w1", "w2"])
+        check_that(len(work5) == 1 and work5[0][2] == 14, "but it IS shared work: one row, 14 added lines (the block and its braces)")
+
+        # below the floor two PRs share boilerplate, not work
+        for branch, fname in (("b1", "b1.cpp"), ("b2", "b2.cpp")):
+            run_git("checkout", "-q", "-B", branch, "refs/heads/base")
+            with open(os.path.join(repo, fname), "w", encoding="utf-8") as f:
+                f.write("#include <cstdio>\n#include <vector>\nint main() { return 0; }\n")
+            run_git("add", "-A")
+            run_git("commit", "-qm", branch)
+        check_that(not shared_work(repo, "refs/heads/base", ["b1", "b2"]),
+                   "three shared boilerplate lines are below the work floor")
+
+        # a subset counts: one PR takes the block and extends it
+        check_that(len(shared_work(repo, "refs/heads/base", ["w1", "b1"])) == 0,
+                   "disjoint changes share no work")
 
         # A path that one side deletes must not read as carried: there is no blob to compare.
         run_git("checkout", "-q", "-B", "d", "refs/heads/base")

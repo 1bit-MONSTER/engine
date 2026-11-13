@@ -311,7 +311,7 @@ def check(root, corpus=None):
     return 0
 
 
-def write(root, corpus=None):
+def write(root, corpus=None, allow_guard_loss=False):
     corpus = pathlib.Path(corpus) if corpus else root / CORPUS
     if not corpus.is_dir():
         print(f"skip: no .loom corpus at {corpus}", file=sys.stderr)
@@ -330,6 +330,18 @@ def write(root, corpus=None):
     guard_head = "".join(line for line in (root / GUARD_BASELINE).read_text(encoding="utf-8").splitlines(True)
                          if line.lstrip().startswith("#")) if (root / GUARD_BASELINE).is_file() else ""
     guards = sorted(guarded(counts, corpus))
+    # engine#2244: `--write` is what a PIN BUMP runs, and recording a smaller guard set is how a merge that took the
+    # other side of a .loom conflict gets laundered into a new baseline -- 34 body changes in one diff and the five lost
+    # guards vanish in the noise. So a loss has to be asked for, and the message names what would disappear.
+    old_guards = (baseline_paths((root / GUARD_BASELINE).read_text(encoding="utf-8"))
+                  if (root / GUARD_BASELINE).is_file() else set())
+    guard_loss = sorted(old_guards - set(guards))
+    if guard_loss and not allow_guard_loss:
+        for rel in guard_loss:
+            print(f"hrx_f16_narrowing: REFUSING to write: {rel} would lose its guard marker from the baseline")
+        print(f"hrx_f16_narrowing: {len(guard_loss)} guard(s) would disappear. If the merge really did revert them, fix "
+              f"the merge; if the guard genuinely moved, re-run with --allow-guard-loss and say why in the commit")
+        return 1
     (root / GUARD_BASELINE).write_text(guard_head + "\n".join(guards) + "\n", encoding="utf-8")
     print(f"hrx_f16_narrowing: wrote {len(bodies)} body(ies) to {BASELINE}, {len(accs)} to {ACC_BASELINE} and "
           f"{len(guards)} to {GUARD_BASELINE}")
@@ -418,6 +430,15 @@ def self_test():
         (ck / GUARD_BASELINE).write_text("# c\nlisted.loom\n")
         check_that(check(ck) == 1,
                    "check(): a lost guard marker fails even though every body and line count matches")
+        check_that(write(ck) == 1,
+                   "write(): refuses to record a baseline that would drop a guard marker")
+        check_that(write(ck, allow_guard_loss=True) == 0,
+                   "write(): --allow-guard-loss records it, so the loss is an explicit act")
+        check_that(baseline_paths((ck / GUARD_BASELINE).read_text()) == set(),
+                   "write(): and the baseline now records no guards, which is what the flag agreed to")
+        # give the next arm its precondition back: the baseline now says one line, so this is one line MORE
+        (ck_corpus / "listed.loom").write_text(
+            "  %x = scalar.fptrunc %y : f32 to f16\n  %z = scalar.fptrunc %w : f32 to f16\n")
         check_that(check(ck) == 1,
                    "check(): one extra narrowing LINE in a listed body is rc 1 -- the fail condition is armed")
         (ck_corpus / "listed.loom").write_text("  %x = scalar.constant 0.0 : f32\n")
@@ -514,6 +535,9 @@ def main():
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--write", action="store_true")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--allow-guard-loss", action="store_true",
+                    help="let --write record FEWER guarded bodies than the baseline has; without this a write that "
+                         "would drop a guard marker is refused, because a merge can revert one silently (engine#2244)")
     ap.add_argument("--root", default=".")
     ap.add_argument("--corpus", default=None,
                     help="the .loom corpus to scan (default: the pinned llama.cpp checkout's kernel-corpus)")
@@ -533,7 +557,7 @@ def main():
                   f"the baseline is written into the root and would describe a corpus this tree does not have",
                   file=sys.stderr)
             return 2
-        return write(root, corpus)
+        return write(root, corpus, allow_guard_loss=args.allow_guard_loss)
     if args.check:
         return check(root, corpus)
     ap.print_help()

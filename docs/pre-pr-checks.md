@@ -21,10 +21,11 @@ Eight commands, all host-side, none needing a device or a build. Every one of th
 
 Run them from the repository root on the branch you are about to hand over.
 
-**`scripts/pre-pr-checks.sh` runs the first six**, one line each (`--base <ref>` for the registration check, `--list` to see the
+**`scripts/pre-pr-checks.sh` runs the first seven**, one line each (`--base <ref>` for the registration check, `--list` to see the
 commands; a check that cannot run says `skip` and why, and an unresolvable `--base` is a usage error rather than a skip). The
-seventh is an **author's check**, true or false exactly once — when you add a page — so it is not in the runner, and the section
-below says why.
+eighth is an **author's check**, true or false exactly once — when you add a page — so it is not in the runner, and the section
+below says why. The table's order is the runner's order: cheapest and most common first, and the check that needs a revision
+(`registration_loss_check --base`) last.
 
 | command | red means |
 |---|---|
@@ -32,9 +33,9 @@ below says why.
 | `python3 tools/ci/notice_covers_deps.py --check` | a dependency that is fetched and compiled into the binary is not named in `NOTICE` |
 | `python3 tools/ci/tests_referenced_check.py` | a test, tool self-test or python test exists that nothing runs |
 | `python3 tools/ci/ci_targets_check.py --check` | a CI row names a target or path that does not exist |
-| `python3 tools/ci/registration_loss_check.py --check --base origin/main` | your branch would drop rows `main` has |
 | `python3 tools/ci/tmp_path_check.py --check` | a new `/tmp` or `/dev/shm` path, where builds and dumps belong under `~/wt` or `~/.cache/scratch-*` |
 | `python3 tools/ci/submodule_pin_check.py --check` | a submodule's checkout is not the commit the tree pins |
+| `python3 tools/ci/registration_loss_check.py --check --base origin/main` | your branch would drop rows `main` has |
 | `git grep -l -F "$(basename <your new page>)" -- '*.md'` | nothing links to the page you just added — measured tonight: 45 docs, one with no inbound link, and it was the page whose whole subject is pre-merge checks |
 
 Two more, for the moments they are for:

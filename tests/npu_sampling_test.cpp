@@ -18,6 +18,7 @@
 // Header only, no device: runs in CI.
 #include "npu_answer_parser.h"
 #include "npu_grammar.h"
+#include "npu_image_request.h"   // engine#2324: the image digest the prefix cache compares
 #include "npu_prefix_cache.h"
 #include "npu_sampling.h"
 
@@ -718,6 +719,21 @@ void test_prefix_cache() {
         check(c.lookup(ids(10, 1)).slot == slot, "a longer prompt that starts the same way hits");
         check(c.lookup(ids(10, 2)).slot == -1, "a prompt whose start differs misses");
         check(c.lookup(ids(5)).slot == -1, "a shorter prompt does not hit a longer slot");
+    }
+    {   // engine#2324: the digest that slot comparison uses -- computed from the PIXELS, not the wire bytes
+        auto img = [](int w, int h, uint8_t fill) { onebit::npu::vision::RgbImage i; i.width = w; i.height = h; i.rgb.assign(size_t(w) * h * 3, fill); return i; };
+        const auto a1 = onebit::npu::image_digest_of({img(4, 3, 0x11)});
+        const auto a2 = onebit::npu::image_digest_of({img(4, 3, 0x11)});            // same pixels, same digest
+        const auto b  = onebit::npu::image_digest_of({img(4, 3, 0x22)});            // one byte different
+        const auto c  = onebit::npu::image_digest_of({img(3, 4, 0x11)});            // transposed: same byte count, different picture
+        const auto none = onebit::npu::image_digest_of({});
+        const auto two  = onebit::npu::image_digest_of({img(4, 3, 0x11), img(4, 3, 0x22)});
+        const auto twof = onebit::npu::image_digest_of({img(4, 3, 0x22), img(4, 3, 0x11)});   // order matters
+        check(a1 == a2, "digest: identical pixels give the identical digest");
+        check(a1 != b, "digest: one changed pixel changes it");
+        check(a1 != c, "digest: a transposed image is a different picture");
+        check(a1 != none && none != two, "digest: no picture differs from one, and from two");
+        check(two != twof, "digest: the same two pictures in the other order are a different prompt");
     }
     {   // engine#2324: the pixels are not in `ids`, so a slot must also match the digest of the image parts.
         // Without this, "same text, different picture" is a cache HIT and the answer comes from the wrong image.

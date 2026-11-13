@@ -122,4 +122,33 @@ inline bool request_images(const Json& messages, std::vector<vision::RgbImage>& 
     return !out.empty();
 }
 
+// engine#2324: the digest a prefix-cache slot carries, so "same text, different picture" cannot be a cache hit.
+// It covers the DIMENSIONS and the PIXELS, and the pictures in order: two identical images in a different order are a
+// different prompt, and a re-encode of the same picture (PNG vs PPM) decodes to the same pixels and therefore to the same
+// digest -- which is the behaviour we want, because the cache stores prefill state, not bytes on the wire.
+inline uint64_t image_digest_of(const std::vector<vision::RgbImage>& images) {
+    uint64_t h = 1469598103934665603ull;   // FNV-1a, 64-bit: stable across runs and platforms, which a std::hash is not
+    auto mix = [&h](const void* p, size_t n) {
+        const unsigned char* b = static_cast<const unsigned char*>(p);
+        for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    };
+    const uint64_t count = images.size();
+    mix(&count, sizeof count);            // 0 images and 1 empty image must not collide
+    for (const auto& im : images) {
+        const int64_t wh[2] = {im.width, im.height};
+        mix(wh, sizeof wh);
+        if (!im.rgb.empty()) mix(im.rgb.data(), im.rgb.size());
+    }
+    return h;
+}
+
+// The digest for a whole request: 0 (the text-only value) when there is no picture.
+template <class Json>
+inline uint64_t request_image_digest(const Json& messages) {
+    std::vector<vision::RgbImage> images;
+    if (!request_images(messages, images)) return 0;
+    return image_digest_of(images);
+}
+
+
 }  // namespace onebit::npu

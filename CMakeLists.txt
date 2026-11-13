@@ -614,7 +614,7 @@ add_executable(pack_initializer_shape_test tests/pack_initializer_shape_test.cpp
 target_include_directories(pack_initializer_shape_test PRIVATE npu)
 add_test(NAME pack_initializer_shape COMMAND pack_initializer_shape_test)
 add_dependencies(onebit pack_initializer_shape_test)
-target_include_directories(npu_sampling_test PRIVATE app)
+target_include_directories(npu_sampling_test PRIVATE app ${CMAKE_SOURCE_DIR}/npu)   # engine#2324: the image digest arms
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 # The speculative round's bookkeeping (app/spec_decode.h, engine#1781): a drafter's proposals against the verifier's
 # per-row logits, with the acceptance rule from npu/mtp/spec_accept.h (#1958, merged). Header-only and pure -- the

@@ -5188,10 +5188,32 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // the first byte fails with "cannot open <pack>/model.onnx" -- a missing-file message about a pack that has no graph
     // at all. Refused by name, the same way the external-data genre below is, until the container-genre writer exists.
     if (p.container_tensors >= 0) {
-        throw std::runtime_error(
-            "this pack is a safetensors container (model.q4nx): " + std::to_string(p.container_tensors) +
-            " tensor(s); importing it needs the container-genre writer (engine#1786, item F1), which the importer does "
-            "not have yet. `1bit npu-pack info` reports what the container holds");
+        // engine#1788: the writer exists now. The payload is copied, never re-quantised -- the container's bytes ARE the
+        // q4nx chunks (a tensor shaped [4096,8,4736] I8 is 4096 rows of the 4736-byte Q4_K chunk), and copying is the only
+        // safe answer to q4nx.h's two-Q8-layouts problem: the bytes never change, so the choice the container does not make
+        // never has to be made.
+        const std::string multi = pack_dir + "/model.q4nx";
+        const Q4nxContainer c = read_q4nx_container(multi);
+        if (!c.why.empty()) throw std::runtime_error("container: " + c.why);
+        // the layer types live in config.json beside the container, not in its safetensors metadata
+        std::string cfg_source;
+        const json cfg = load_geometry(pack_dir, &cfg_source);
+        std::vector<std::string> lt;
+        const json* src = cfg.contains("layer_types") ? &cfg : nullptr;
+        if (!src && cfg.contains("text_config") && cfg["text_config"].is_object() && cfg["text_config"].contains("layer_types"))
+            src = &cfg["text_config"];
+        if (src && (*src)["layer_types"].is_array())
+            for (const auto& x : (*src)["layer_types"]) if (x.is_string()) lt.push_back(x.get<std::string>());
+        const ImportPlan ip = container_import_plan(c, lt);
+        const WritePackResult w = container_write_pack(multi, ip, out_dir, opt.allow_incomplete);
+        if (!w.ok) throw std::runtime_error("container: " + w.why);
+        Report rep;
+        rep.out_dir = out_dir;
+        rep.tensors = int(w.tensors);
+        rep.tiles = w.bytes;
+        // the unplaced list is a REFUSAL list, so it goes where the caller already looks for refusals
+        for (const auto& u : ip.unplaced) rep.refused.push_back(u);
+        return rep;
     }
     if (p.graph_packed_siblings > 0) {
         // The genre has a writer now (engine#1503): decode -> convert -> split by role -> the same I8 tile chunks,

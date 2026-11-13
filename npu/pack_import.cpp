@@ -3482,6 +3482,12 @@ static std::string group_suffix_slot(const std::string& role, const std::string&
     return std::string();
 }
 
+// engine#1788, 3c: WHY THIS IS A BYTE COPY AND MUST STAY ONE. npu/q4nx.h records that the Q8 chunk (8704 B) comes in TWO
+// code layouts and that nothing in the chunk or the container says which: the forward's decoder picks per tensor from the
+// codes (q4nx_q8_split16 -- in the right layout every group's absmax code is 127). So a writer that re-encoded or
+// re-quantised would have to make a choice the container does not make, and getting it wrong is a pack that decodes to
+// wrong weights with no error anywhere. Copying the payload's bytes verbatim cannot make that mistake: the layout is the
+// container's, and the forward already knows how to read it.
 WriteLayoutResult container_write_layout(const std::string& payload_path, const ImportPlan& plan,
                                          const std::string& out_dir, bool allow_unplaced) {
     WriteLayoutResult r;

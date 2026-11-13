@@ -53,6 +53,16 @@ done
 top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "pre-pr-checks: not inside a git work tree" >&2; exit 2; }
 cd "$top" || { echo "pre-pr-checks: cannot enter $top" >&2; exit 2; }
 
+# A `--base` that does not resolve is a USAGE error, not a skip: the caller asked for a comparison that
+# cannot happen, and a run that prints "all 5 check(s) green, 1 skipped" then exits 0 is the shape this
+# script exists to stop (review of engine#2313). A skip is for a check that cannot run in this
+# environment; an argument that cannot be resolved is the caller's to fix.
+git rev-parse --verify -q "$base^{commit}" >/dev/null || {
+    echo "pre-pr-checks: --base '$base' does not resolve to a commit here" >&2
+    echo "  the registration check compares against it; pass a ref that exists (default: origin/main)" >&2
+    exit 2
+}
+
 # The checks, in the order docs/pre-pr-checks.md lists them: cheapest and most common first, the two
 # that need a revision last.
 checks=(
@@ -72,11 +82,6 @@ fi
 ok=0; failed=0; skipped=0; detail=""
 for c in "${checks[@]}"; do
     name=${c%% *}
-    # A check that needs a revision it cannot resolve is skipped WITH ITS REASON, not reported green.
-    if [ "$name" = "tools/ci/registration_loss_check.py" ] && ! git rev-parse --verify -q "$base" >/dev/null; then
-        printf 'skip  %-42s %s does not resolve here\n' "$name" "$base"
-        skipped=$((skipped + 1)); continue
-    fi
     out=$(python3 $c 2>&1); rc=$?
     last=$(printf '%s\n' "$out" | grep -v '^$' | tail -1)
     if [ $rc -eq 0 ]; then

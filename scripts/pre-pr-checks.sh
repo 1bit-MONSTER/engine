@@ -48,6 +48,11 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$base" ] || { echo "pre-pr-checks: --base needs a ref" >&2; exit 2; }
 
+# Run from the toplevel: the six commands name `tools/...` and `config/...` relative to it, so a caller
+# in scripts/ got twelve `can't open file` lines and rc 1 with every row red for the wrong reason.
+top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "pre-pr-checks: not inside a git work tree" >&2; exit 2; }
+cd "$top" || { echo "pre-pr-checks: cannot enter $top" >&2; exit 2; }
+
 # The checks, in the order docs/pre-pr-checks.md lists them: cheapest and most common first, the two
 # that need a revision last.
 checks=(
@@ -92,7 +97,11 @@ for c in "${checks[@]}"; do
     else
         printf 'FAIL  %-42s %s\n' "$name" "$last"
         failed=$((failed + 1))
-        detail="$detail$name: $last"$'\n'
+        # The whole output, not its last line: the case that matters is a checker whose summary is
+        # generic and whose detail line names the commit or file (`submodule_pin_check` prints "NOT the
+        # commit this tree pins" above a summary that only counts), and the last line sends the reader
+        # to the wrong place.
+        detail="$detail$name:"$'\n'"$out"$'\n'
     fi
 done
 

@@ -246,6 +246,12 @@ add_test(NAME config_pin_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tool
 # branch's side dropped a section that had merged that morning (#2314). Offline, git-only, no build input.
 add_test(NAME doc_section_loss_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/doc_section_loss_check.py --self-test
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# engine#2330: CI builds with ONEBIT_NPU=OFF, so a source added to a target only inside `if(ONEBIT_NPU)` is never
+# compiled by it -- `app/forward_serve.cpp` was one `}` short after #2327 and main did not compile for the lane, while
+# every commit reported `build: success`. A brace imbalance needs no headers, no runtime and no link, so this catches
+# the class in CI. Files whose `#if` conditions cannot be resolved are named as not checked, never guessed at.
+add_test(NAME lane_syntax_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/lane_syntax_check.py --self-test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_dependencies(onebit npu_decode_note_test)
 # engine#2106: a shipped kernel set's own consistency -- manifest vs bytes, one form or none, name vs directory. The
 # refusal this pre-empts ("differ in size") needed private-repo archaeology to diagnose; the symptom is checkable here.

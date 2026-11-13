@@ -28,7 +28,9 @@
 // The pack on disk carries no tokenizer, so this stops at ids: `400 370 452 ...` is the sentence, and comparing ids is a
 // stricter check than comparing text (two ids can share a detokenisation, and neither can share an id).
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -228,21 +230,25 @@ int main(int argc, char** argv) {
         enc_path = pack.encoder;
         dec_path = pack.decoder;
     }
+    // engine#1783: a recording longer than one window is cut into consecutive 30 s windows, each padded with silence to 30 s
+    // and turned into its OWN log-mel. That is what Whisper's feature extractor does to one window, and it matters: the
+    // log-mel is normalised against its own maximum, so a mel computed over the whole recording and cut afterwards is a
+    // different input (measured on fx-5min's first window: max 8.5e-3 from WhisperFeatureExtractor that way, 1e-5 per window).
+    // Each window is decoded with the same prompt and no carried text, which is the plain chunked form; there are no
+    // timestamps, so nothing is stitched across a boundary.
     const size_t want = size_t(cfg.sample_rate) * 30;
     std::vector<float> audio = read_wav_16k_mono(argv[audio_arg_index], &why);
     if (audio.empty()) {
         std::fprintf(stderr, "wav: %s\n", why.c_str());
         return 1;
     }
-    audio.resize(std::max(audio.size(), want), 0.0f);
+    const size_t n_windows = std::max<size_t>(1, (audio.size() + want - 1) / want);
+    const double audio_s = double(audio.size()) / double(cfg.sample_rate);
 
     const auto t_start = std::chrono::steady_clock::now();
-    std::vector<float> mel;
-    if (!onebit::audio::log_mel_spectrogram(audio.data(), audio.size(), cfg, &mel)) {
-        std::fprintf(stderr, "mel: refused\n");
-        return 1;
-    }
-    const auto t_mel = std::chrono::steady_clock::now();
+    const auto secs = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
     OnnxGraphInfo enc, dec;
     try {
         enc = parse_onnx_graph(enc_path);
@@ -251,15 +257,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "graph: %s\n", e.what());
         return 1;
     }
-    AudioRunResult xa;
-    if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why)) {
-        std::fprintf(stderr, "encoder: %s\n", why.c_str());
-        return 1;
-    }
-    const auto t_enc = std::chrono::steady_clock::now();
-    std::printf("encoder: [");
-    for (int64_t d : xa.dims) std::printf(" %lld", (long long)d);
-    std::printf(" ]\n");
+    const auto t_load = std::chrono::steady_clock::now();
 
     // <|startoftranscript|>, <|en|>, <|transcribe|>, <|notimestamps|> -- then greedy, reading the logits of the last real
     // prompt position (HF pads the 448/128-token window with <|endoftext|>, so the prompt is a prefix, not a suffix).
@@ -297,38 +295,87 @@ int main(int argc, char** argv) {
                 (long long)slot.transcribe, (long long)slot.no_timestamps);
     const int64_t kEot = slot.eot, kSot = slot.sot, kEn = slot.lang_en;
     const int64_t kTranscribe = slot.transcribe, kNoTimestamps = slot.no_timestamps;
-    std::vector<int64_t> seq = {kSot, kEn, kTranscribe, kNoTimestamps};
+    const std::vector<int64_t> prompt = {kSot, kEn, kTranscribe, kNoTimestamps};
+    std::printf("audio: %.2f s -> %zu window(s) of 30 s\n", audio_s, n_windows);
+
     std::vector<int64_t> ids;
-    for (int step = 0; step < 60; ++step) {
-        std::vector<int64_t> toks(size_t(window), kEot);
-        for (size_t i = 0; i < seq.size() && i < size_t(window); ++i) toks[i] = seq[i];
-        AudioRunResult y;
-        if (!run_decoder_graph(dec, toks.data(), window, xa.data.data(), xa.dims, "", &y, &why)) {
-            std::fprintf(stderr, "decoder at step %d: %s\n", step, why.c_str());
+    double mel_s = 0.0, enc_s = 0.0, dec_s = 0.0, ttft_s = 0.0, ttft_mel_s = 0.0, ttft_enc_s = 0.0;
+    for (size_t w = 0; w < n_windows; ++w) {
+        const auto tw0 = std::chrono::steady_clock::now();
+        const size_t from = w * want;
+        const size_t to = std::min(audio.size(), from + want);
+        std::vector<float> chunk(audio.begin() + std::ptrdiff_t(from), audio.begin() + std::ptrdiff_t(to));
+        chunk.resize(want, 0.0f);
+        std::vector<float> mel;
+        if (!onebit::audio::log_mel_spectrogram(chunk.data(), chunk.size(), cfg, &mel)) {
+            std::fprintf(stderr, "mel: refused (window %zu)\n", w);
             return 1;
         }
-        const int64_t out_vocab = y.dims.empty() ? 0 : y.dims.back();
-        const int64_t& vocab = out_vocab;
-        const size_t row = (seq.size() - 1) * size_t(vocab);
-        int64_t best = 0;
-        for (int64_t v = 1; v < vocab; ++v)
-            if (y.data[row + size_t(v)] > y.data[row + size_t(best)]) best = v;
-        if (best == kEot || seq.size() >= size_t(window)) break;
-        ids.push_back(best);
-        seq.push_back(best);
+        const auto tw_mel = std::chrono::steady_clock::now();
+        AudioRunResult xa;
+        if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why)) {
+            std::fprintf(stderr, "encoder (window %zu): %s\n", w, why.c_str());
+            return 1;
+        }
+        const auto tw_enc = std::chrono::steady_clock::now();
+        if (w == 0) {
+            std::printf("encoder: [");
+            for (int64_t d : xa.dims) std::printf(" %lld", (long long)d);
+            std::printf(" ]\n");
+        }
+        // The loop runs until <|endoftext|> or until the token window is full. It used to stop after 60 steps, which a
+        // 30 s window of dense speech outruns: fx-5min's first window needs 66 tokens, and the tail was dropped with no
+        // message (engine#1783).
+        std::vector<int64_t> seq = prompt;
+        size_t got = 0;
+        bool full = false;
+        while (true) {
+            if (seq.size() >= size_t(window)) { full = true; break; }
+            std::vector<int64_t> toks(size_t(window), kEot);
+            for (size_t i = 0; i < seq.size(); ++i) toks[i] = seq[i];
+            AudioRunResult y;
+            if (!run_decoder_graph(dec, toks.data(), window, xa.data.data(), xa.dims, "", &y, &why)) {
+                std::fprintf(stderr, "decoder at window %zu step %zu: %s\n", w, got, why.c_str());
+                return 1;
+            }
+            const int64_t out_vocab = y.dims.empty() ? 0 : y.dims.back();
+            const size_t row = (seq.size() - 1) * size_t(out_vocab);
+            int64_t best = 0;
+            for (int64_t v = 1; v < out_vocab; ++v)
+                if (y.data[row + size_t(v)] > y.data[row + size_t(best)]) best = v;
+            if (best == kEot) break;
+            ids.push_back(best);
+            seq.push_back(best);
+            ++got;
+        }
+        const auto tw_dec = std::chrono::steady_clock::now();
+        mel_s += secs(tw0, tw_mel);
+        enc_s += secs(tw_mel, tw_enc);
+        dec_s += secs(tw_enc, tw_dec);
+        if (w == 0) {
+            ttft_mel_s = secs(t_start, tw_mel);
+            ttft_enc_s = secs(tw_mel, tw_enc);
+            ttft_s = secs(t_start, tw_enc);
+        }
+        if (n_windows > 1 || full)
+            std::printf("window %zu: mel %.3f s, encoder %.3f s, decode %.3f s for %zu token(s)%s\n", w, secs(tw0, tw_mel),
+                        secs(tw_mel, tw_enc), secs(tw_enc, tw_dec), got,
+                        full ? " -- the token window filled before <|endoftext|>" : "");
     }
     const auto t_dec = std::chrono::steady_clock::now();
-    const auto secs = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
-        return std::chrono::duration<double>(b - a).count();
-    };
+    const double load_s = secs(t_start, t_load);
     std::printf("time: mel+load %.3f s, encoder %.3f s, decode %.3f s for %zu token(s) -> %.3f s/token, wall %.3f s\n",
-                secs(t_start, t_mel), secs(t_mel, t_enc), secs(t_enc, t_dec), ids.size(),
-                ids.empty() ? 0.0 : secs(t_enc, t_dec) / double(ids.size()), secs(t_start, t_dec));
+                mel_s + load_s, enc_s, dec_s, ids.size(), ids.empty() ? 0.0 : dec_s / double(ids.size()),
+                secs(t_start, t_dec));
+    if (n_windows > 1)
+        std::printf("per window: encoder %.3f s, wall %.3f s; recording %.2f s in %.3f s (RTF %.3f)\n",
+                    enc_s / double(n_windows), secs(t_load, t_dec) / double(n_windows), audio_s, secs(t_start, t_dec),
+                    secs(t_start, t_dec) / audio_s);
     // The row's completion asks for "s/window AND time to first token", and TTFT for this chain is everything before the first
-    // decoded token: the mel front-end, the graph load, and the whole encoder pass. Named rather than left to be derived from the
-    // line above, because "which of those three is the TTFT" is exactly the question a reader gets wrong at 2 a.m.
-    std::printf("ttft: %.3f s (mel %.3f + encoder %.3f; the first token needs no extra forward)\n",
-                secs(t_start, t_enc), secs(t_start, t_mel), secs(t_mel, t_enc));
+    // decoded token: the graph load, the first window's mel front-end and its encoder pass. Named rather than left to be derived
+    // from the line above, because "which of those three is the TTFT" is exactly the question a reader gets wrong at 2 a.m.
+    std::printf("ttft: %.3f s (load+mel %.3f + encoder %.3f; the first token needs no extra forward)\n", ttft_s, ttft_mel_s,
+                ttft_enc_s);
     std::printf("ids:");
     for (int64_t v : ids) std::printf(" %lld", (long long)v);
     std::printf("\n");

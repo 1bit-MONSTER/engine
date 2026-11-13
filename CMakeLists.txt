@@ -932,6 +932,18 @@ if(OpenMP_CXX_FOUND)
 endif()
 add_dependencies(onebit onebit_npu_forward_syntax)
 
+# engine#2330: app/forward_serve.cpp lives under `if(ONEBIT_NPU)` (below), and CI configures without it because
+# the NPU runtime is private -- so on 2026-11-13 a one-brace error in that file reached main with `build` green,
+# and the next lane's container import failed on it. The file is compiled by ITSELF here, outside the guard, with
+# ONEBIT_NPU_RUNTIME_OWN and only public headers: the same shape as onebit_npu_forward_syntax above, and it needs
+# no private runtime, no device and no workflow change -- `add_dependencies(onebit ...)` puts it in the CI build.
+add_library(onebit_serve_syntax OBJECT app/forward_serve.cpp)
+target_compile_definitions(onebit_serve_syntax PRIVATE ONEBIT_NPU_RUNTIME_OWN)
+target_include_directories(onebit_serve_syntax PRIVATE
+    app npu npu/forward/include ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(onebit_serve_syntax PRIVATE nlohmann_json::nlohmann_json httplib::httplib)
+add_dependencies(onebit onebit_serve_syntax)
+
 # What one MTP head step costs on the HOST (tools/mtp_head_bench.cpp).  The draft route's per-iteration cost is two
 # base passes plus the drafter's logits calls (both on the array) and the head's own arithmetic (this host), so this
 # is the only term measurable without the device -- and the term a maths change has to be stated on.  It also prints

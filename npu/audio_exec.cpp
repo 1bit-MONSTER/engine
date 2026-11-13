@@ -19,6 +19,9 @@
 #include "audio_parallel.h"
 
 #include <cmath>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <set>
@@ -221,9 +224,15 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
             return t.count(name) != 0 ? need(name) : init_f32(name);
         };
 
+        // ONEBIT_AUDIO_OP_TIMES=1 (engine#1783): wall time per op type over this graph, printed once at the end, so a
+        // host split ("Conv 3.74 s, Softmax 2.56 s") is read from the executor that runs the window rather than inferred.
+        const char* ot = std::getenv("ONEBIT_AUDIO_OP_TIMES");
+        const bool op_times = ot != nullptr && ot[0] != '\0' && ot[0] != '0';
+        std::map<std::string, std::pair<double, long>> op_ms;   // op -> (ms, calls)
         int node_index = 0;
         for (const auto& n : g.nodes) {
             ++node_index;
+            const auto op_t0 = std::chrono::steady_clock::now();
             const auto where = [&]() { return "node " + std::to_string(node_index) + " (" + n.op + ")"; };
             if (n.outs.empty()) fail(where() + " has no output");
             const std::string& oname = n.outs[0];
@@ -527,6 +536,20 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 fail(where() + " is not implemented; the pack needs an op this executor does not have");
             }
             t[oname] = std::move(r);
+            if (op_times) {
+                auto& e = op_ms[n.op];
+                e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - op_t0).count();
+                e.second++;
+            }
+        }
+        if (op_times) {
+            std::vector<std::pair<double, std::string>> order;
+            double total = 0.0;
+            for (const auto& kv : op_ms) { order.push_back({kv.second.first, kv.first}); total += kv.second.first; }
+            std::sort(order.rbegin(), order.rend());
+            std::fprintf(stderr, "[audio-op] %zu nodes, %.1f ms, %zu thread(s)\n", g.nodes.size(), total, audio_thread_count());
+            for (const auto& o : order)
+                std::fprintf(stderr, "[audio-op] %-20s %6ld calls %10.1f ms\n", o.second.c_str(), op_ms[o.second].second, o.first);
         }
 
         const std::string want = out_name.empty() ? (g.outputs.empty() ? std::string() : g.outputs[0]) : out_name;

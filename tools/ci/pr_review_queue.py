@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 
@@ -66,15 +67,27 @@ def gh(path, paginate=False):
     return json.dumps(out)
 
 
+VERDICT_LINE = re.compile(r'^[^A-Za-z0-9]*VERDICT\b', re.MULTILINE)
+
+
 def reviewed_at(reviews, head):
-    """True if any review body carries a VERDICT naming this head prefix.
+    """True if any review OR COMMENT body carries a VERDICT line naming this head prefix.
+
+    Two things this has to get right, both learned from a review of this tool:
+
+    * a verdict posted as an **issue comment** counts. Most lanes put `VERDICT: ...` in a comment, not in a review
+      object -- measured on the open queue, four PRs (llama.cpp#280, site#17/#16/#15) had a comment verdict and no
+      review at all, so a reviews-only queue asked for reviews that already existed;
+    * the token alone is not a verdict: `no VERDICT at abc1234 yet` contains both the word and the sha and means the
+      opposite. The verdict has to START a line (markdown decoration before it is fine), which is the convention the
+      lanes actually write.
 
     A verdict line carries the 7-hex head (`VERDICT: READY at `abc1234``); a body that names a longer sha covers the
     shorter prefix too, which is why this is a substring test on the head rather than an equality on the whole sha.
     """
     for r in reviews:
         body = r.get('body') or ''
-        if 'VERDICT' in body and head in body:
+        if head in body and VERDICT_LINE.search(body):
             return True
     return False
 
@@ -91,7 +104,9 @@ def queue(repos, min_age_hours=0.0, now_epoch=None):
             head = (pr.get('head') or {}).get('sha', '')
             if not head:
                 continue
+            # Both channels: a review body and an issue comment. Same list, because `reviewed_at` asks one question.
             revs = json.loads(gh(f"repos/{OWNER}/{repo}/pulls/{pr['number']}/reviews", paginate=True) or '[]')
+            revs += json.loads(gh(f"repos/{OWNER}/{repo}/issues/{pr['number']}/comments", paginate=True) or '[]')
             if reviewed_at(revs, head[:7]):
                 continue
             created = datetime.datetime.fromisoformat(pr['created_at'].replace('Z', '+00:00')).timestamp()
@@ -126,7 +141,13 @@ def self_test():
     # them, and it is the common one -- reviewers quote the sha they looked at.
     chk(False, reviewed_at([{'body': 'I read abc1234 carefully and it looks fine to me'}], 'abc1234'),
         'a comment that NAMES the head but is not a verdict does not count')
+    # The review of this tool found the arm above too weak: it carries no VERDICT token at all, so it passes even
+    # when the matcher is `'VERDICT' in body`. This one has both tokens and still means the opposite.
+    chk(False, reviewed_at([{'body': 'no VERDICT at abc1234 yet'}], 'abc1234'),
+        'a sentence that DISCLAIMS a verdict is not a verdict')
     chk(False, reviewed_at([{'body': None}], 'abc1234'), 'a null body does not raise')
+    chk(True, reviewed_at([{'body': '**VERDICT: READY** `abc1234`'}], 'abc1234'),
+        'a verdict with markdown decoration before it still counts')
     chk(True, reviewed_at([{'body': 'VERDICT: CHANGES at `abc1234`'}], 'abc1234'),
         'CHANGES is a verdict: the PR was reviewed, the answer was no')
     print(f"pr_review_queue --self-test: {'ok' if rc == 0 else 'FAIL'}")

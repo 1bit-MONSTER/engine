@@ -261,7 +261,11 @@ add_test(NAME doc_section_loss_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tool
 # the class in CI. Files whose `#if` conditions cannot be resolved are named as not checked, never guessed at.
 add_test(NAME lane_syntax_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/lane_syntax_check.py --self-test
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-# The review queue every reviewer hand-rolls with `gh api`, which defaults to per_page=30 -- a PR with 30+ reviews
+
+# engine#679/tools/ci/medians.py: the median+spread verdict tool. Its self-test carries the arms that make
+# the rule checkable -- disjoint ranges (not disjoint medians), the shared-endpoint case, and the direction.
+add_test(NAME medians_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/medians.py --self-test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})# The review queue every reviewer hand-rolls with `gh api`, which defaults to per_page=30 -- a PR with 30+ reviews
 # loses its newest ones, so a verdict that exists reads as missing and a reviewer repeats work. Only the SELF-TEST is a
 # row: the live mode needs `gh` and the network, which a ctest row must not.
 add_test(NAME pr_review_queue_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/pr_review_queue.py --self-test

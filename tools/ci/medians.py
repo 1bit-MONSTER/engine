@@ -21,10 +21,13 @@ published before that was quoted to two or three decimals as if the spread did n
 item 3a's "2.0x slower decode" turned out to be that spread showing up in the first rep.
 
 So: report median, min, max and the ratio, and answer the only question a reader actually has --
-is arm A's median outside arm B's observed range, or is the difference inside the noise?
+are the two arms' observed ranges DISJOINT, or is the difference inside the noise? Disjoint ranges,
+not disjoint medians: if the loser's maximum reaches into the winner's range then the loser produced
+that value on its own.
 
     medians.py 7.94 11.78 10.39 12.57                  # one arm
     medians.py --a 7.94 11.78 10.39 12.57 --b 9.1 9.3 # two arms, verdict
+    medians.py --a ... --b ... --lower                 # B is better when lower (ms/token)
     medians.py --self-test
 
 A verdict of NOISE is not a failure of the measurement; it is the measurement telling you to
@@ -64,6 +67,16 @@ def verdict(a, b):
     return "NOISE"
 
 
+def direction_word(winner, lower_is_better):
+    """Which arm is better, spelled out. "A" alone is ambiguous: higher is better for tok/s and worse
+    for ms/token, and a caller that reads the letter without the unit draws the wrong conclusion."""
+    if winner == "NOISE":
+        return "neither -- the ranges overlap"
+    if lower_is_better:
+        return f"{winner} (lower, and lower is better here)"
+    return f"{winner} (higher, and higher is better here)"
+
+
 def self_test():
     fails = 0
 
@@ -87,10 +100,16 @@ def self_test():
     # touching ranges are not disjoint: B's max equals A's min means B can reach it
     check(verdict([20.0, 20.0], [19.0, 20.0]) == "NOISE", "a shared endpoint is not evidence")
 
-    # a single sample has no range, so it can never be separated from anything
-    check(verdict([5.0], [5.0, 6.0]) == "NOISE", "one sample cannot beat two")
+    # a single sample has no range, so an arm whose range contains it cannot be distinguished from it
+    check(verdict([5.0], [5.0, 6.0]) == "NOISE", "an arm whose range contains the single sample is not evidence")
+    check(verdict([5.0], [6.0, 7.0]) == "B", "a single sample below a disjoint arm loses to it")
 
     check(ratio != 1.0, "sanity: the real data is not a flat line")
+
+    # direction: the same verdict reads differently for tok/s and for ms/token
+    check("higher" in direction_word("A", False), "default direction says higher")
+    check("lower" in direction_word("B", True), "--lower says lower is better")
+    check("neither" in direction_word("NOISE", True), "noise names no winner")
 
     # spread() refuses what it cannot express
     for bad in ([], [0, 1]):
@@ -107,8 +126,13 @@ def self_test():
 
 
 def main(argv):
+    if "--help" in argv or "-h" in argv:
+        print(__doc__.strip())
+        return 0
     if "--self-test" in argv:
         return self_test()
+    lower_is_better = "--lower" in argv
+    argv = [a for a in argv if a != "--lower"]
     if "--a" in argv and "--b" in argv:
         i, j = argv.index("--a"), argv.index("--b")
         a = [float(x) for x in argv[i + 1 : j]]
@@ -129,8 +153,10 @@ def main(argv):
     mb, blo, bhi, bratio = spread(b)
     print(f"B: median {mb:.3f}  min {blo:.3f}  max {bhi:.3f}  spread {bratio:.2f}x  (n={len(b)})")
     result = verdict(a, b)
-    # a difference inside the observed spread is not a result
-    print(f"verdict: {result}" + ("" if result != "NOISE" else " -- the ranges overlap, take more samples"))
+    # a difference inside the observed spread is not a result, and the winner needs its direction
+    print(f"verdict: {direction_word(result, lower_is_better)}" +
+          ("" if result != "NOISE" else f" (A={a}, B={b} medians)") if result != "NOISE"
+          else "verdict: NOISE -- the ranges overlap, take more samples")
     return 0
 
 

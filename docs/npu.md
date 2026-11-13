@@ -273,6 +273,46 @@ Measured on this box through that route, 1,000 fixed sentences (the gate's own s
 and STS-B through the same route: **Spearman ×100 82.9412** (the model card's 82.87, its own runtime 82.75 on the
 same evaluator).
 
+### Sentence embeddings from a q4nx encoder (Embedding-Gemma-300M-NPU2, engine#1786)
+
+FastFlowLM's `Embedding-Gemma-300M-NPU2` is a `Gemma3TextModel` with `use_bidirectional_attention: true` plus the
+sentence-transformers head (`dense_2` 768 -> 3072, `dense_3` 3072 -> 768). The same flags serve it:
+
+```
+1bit serve --embedding -m <pack dir> --device npu|cpu        # ONEBIT_NPU_KERNELS, <dir>/kernels or the build's set
+```
+
+`/v1/embeddings` has the shape described above. The per-op forward encodes the input in one batched pass at
+position 0 (`Q4nxNpuForward::embed_pooled`). Every layer reads the whole input in both directions, sliding layers
+included. That equals the band a sliding layer was trained with only while the input fits half the window, so an
+input longer than 256 tokens (the window is 512) is refused with a 400 naming the cap. The rows are mean-pooled
+after the final norm, then pass through `dense_2` and `dense_3` (linear, no bias) and are L2-normalised. Ids are
+framed as the pack's `tokenizer_config.json` says (`add_bos_token`, `add_eos_token`: `<bos> text <eos>`), which gives
+the reference tokenizer's ids exactly.
+
+Four things about this pack differ from the other gemma3 packs, and each is read from the pack:
+- the tensors carry no `model.` prefix (`layers.N.*`, `embed_tokens`, `norm`), and the loader prefixes them;
+- the projections are unquantised BF16, read as they are;
+- the embedding is stored pre-scaled by sqrt(H), so the forward applies no input scale;
+- the norms are HF's raw `w`. FastFlowLM's quantised gemma3 packs store `1 + w`; this one is a copy of the HF
+  checkpoint, so a gemma3 pack with BF16 projections is run as `1 + w` (the load prints `rmsnorm_offset=1 <- gemma3
+  with BF16 projections`).
+
+Measured against transformers' own `Gemma3TextModel` on `unsloth/embeddinggemma-300m` (the ungated copy of google's
+checkpoint, mean pooling and the two dense modules as sentence-transformers applies them), five sentences, the same
+ids:
+
+| route | cos to the reference (min of 5) | 5 inputs |
+|---|---|---|
+| `--device cpu` (host GEMM) | 0.999990 | |
+| `--device npu` | 0.999093 | 0.88 s |
+
+The similarity matrix is the reference's to three decimals on the host (the two cat sentences 0.885, the unrelated
+pairs 0.09 to 0.28). Each rule matters: with the norm rule off the host reads cos 0.09, and with the sliding layers
+left causal 0.70 to 0.90. `tests/embed_forward_ci.py` (`embed_forward`) pins the encoder on a fabricated two-layer
+container in this layout against a numpy Gemma3 encoder (cos 1.0000000). The same two mutants fail it (0.99 and
+0.24).
+
 ### Q4NX chunks
 
 Q4NX is [FastFlowLM](https://github.com/ROCm/FastFlowLM)'s NPU model format (MIT), and its models on

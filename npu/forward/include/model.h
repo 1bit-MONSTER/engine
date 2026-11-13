@@ -140,6 +140,11 @@ TensorDesc* model_tensor_by_name(ModelWeights* mw, const char* name);
 // form, where post_attention_layernorm is the attention/conv output's norm) and post_attention_layernorm
 // otherwise.  Returns the number of tensors renamed.
 int model_alias_lfm_names(TensorDesc* tensors, int count);
+// engine#1786: FastFlowLM's Embedding-Gemma-300M-NPU2 keeps the sentence-transformers module's names, with no
+// `model.` prefix: `layers.N.*`, `embed_tokens.weight`, `norm.weight` (beside its `dense_2` / `dense_3` head). This
+// prefixes those three forms with `model.`, in place and only where the prefixed name is not already taken, so the
+// loader addresses them as it does every other pack. Returns the number of tensors renamed.
+int model_alias_unprefixed_names(TensorDesc* tensors, int count);
 // engine#1786 (item F1): three FastFlowLM NPU2 model sources spell the per-layer prefix `model.layer.` (singular)
 // where this forward addresses `model.layers.`. Writes the OTHER spelling into `out` and returns 1 when `name` carries
 // either prefix, 0 when it does not. Only the leading prefix is swapped, once: a caller that wants a fallback retries

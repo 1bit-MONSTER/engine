@@ -29,6 +29,13 @@
 
 #ifdef ONEBIT_NPU
 #include "embed_npu.h"
+#include "../npu/forward/include/q4nx_forward.h"
+#include "npu_device_lock.h"
+#include "tokenizer.h"
+#include "rt.h"
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
 #endif
 
 namespace fs = std::filesystem;
@@ -41,11 +48,36 @@ bool container(const std::string& path) {
     return fs::is_directory(path, ec) && fs::is_regular_file(fs::path(path) / "model.embed", ec);
 }
 
+bool forward_encoder(const std::string& path) {
+#ifdef ONEBIT_NPU
+    std::error_code ec;
+    const fs::path d(path);
+    if (!fs::is_directory(d, ec) || !fs::is_regular_file(d / "model.q4nx", ec)) return false;
+    std::ifstream f(d / "config.json");
+    if (!f) return false;
+    try {
+        const json c = json::parse(f);
+        return c.value("use_bidirectional_attention", false);
+    } catch (const std::exception&) {
+        return false;
+    }
+#else
+    (void)path;
+    return false;
+#endif
+}
+
 struct Backend::Impl {
     embed::Model model;
 #ifdef ONEBIT_NPU
     embed::NpuGemm npu;
     bool npu_installed = false;
+    // engine#1786: the q4nx encoder kind. One forward, so requests are serialised.
+    std::unique_ptr<xrt::device> dev;
+    std::unique_ptr<Q4nxNpuForward> fwd;
+    std::unique_ptr<onebit::npu::Tokenizer> tok;
+    int bos = -1, eos = -1, cap = 0, lock_fd = -1;
+    std::mutex mu;
 #endif
 };
 
@@ -55,6 +87,66 @@ bool Backend::load(const std::string& dir, const std::string& device, std::strin
         return false;
     }
     impl_ = std::make_shared<Impl>();
+#ifdef ONEBIT_NPU
+    if (forward_encoder(dir)) {
+        Impl& m = *impl_;
+        const fs::path d(dir);
+        // The kernel directory the chat route resolves too: ONEBIT_NPU_KERNELS, else <dir>/kernels, else the build's.
+        std::string kernels;
+        if (const char* e = std::getenv("ONEBIT_NPU_KERNELS")) kernels = e;
+        if (kernels.empty() && fs::is_directory(d / "kernels")) kernels = (d / "kernels").string();
+#ifdef ONEBIT_NPU_KERNELS_DIR
+        if (kernels.empty()) kernels = ONEBIT_NPU_KERNELS_DIR;
+#endif
+        const bool host = device == "cpu" || std::getenv("NPU_INFER_HOST_GEMM") != nullptr;
+        if (host) setenv("NPU_INFER_HOST_GEMM", "1", 1);   // the forward reads it: --device cpu is host GEMM
+        if (!host && kernels.empty()) {
+            why = "no NPU kernel (full ELF) directory resolves for this encoder: set ONEBIT_NPU_KERNELS or put them in " +
+                  (d / "kernels").string();
+            return false;
+        }
+        m.fwd = std::make_unique<Q4nxNpuForward>();
+        const std::string model = (d / "model.q4nx").string();
+        if (!host) {
+            if (npu_lock_taken(true, std::getenv("NPU_NO_DEVICE_LOCK") != nullptr)) m.lock_fd = take_npu_device_lock(1);
+            m.dev = std::make_unique<xrt::device>(0);
+        }
+        const bool ok = m.dev ? m.fwd->init(*m.dev, model.c_str(), kernels) : m.fwd->init_host(model.c_str(), kernels);
+        if (!ok) { why = std::string("encoder init failed: ") + m.fwd->last_error(); return false; }
+        if (!m.fwd->noncausal()) { why = "config.json declares use_bidirectional_attention, but the forward is causal"; return false; }
+        try {
+            m.tok = std::make_unique<onebit::npu::Tokenizer>((d / "tokenizer.json").string());
+        } catch (const std::exception& e) {
+            why = std::string("tokenizer.json: ") + e.what();
+            return false;
+        }
+        // The framing the model was trained with: tokenizer_config.json's add_bos_token / add_eos_token (both true
+        // on Embedding-Gemma-300M-NPU2, `<bos> text <eos>`, the reference tokenizer's ids exactly).
+        std::ifstream tc(d / "tokenizer_config.json");
+        json t = json::object(), c = json::object();
+        try { if (tc) t = json::parse(tc); } catch (const std::exception&) {}
+        std::ifstream cf(d / "config.json");
+        try { if (cf) c = json::parse(cf); } catch (const std::exception&) {}
+        auto token_of = [&](const char* key) {
+            if (!t.contains(key) || !t[key].is_string()) return -1;
+            return m.tok->token_id(t[key].get<std::string>());
+        };
+        if (t.value("add_bos_token", false)) m.bos = token_of("bos_token");
+        if (t.value("add_eos_token", false)) m.eos = token_of("eos_token");
+        const int win = c.value("sliding_window", 0);
+        m.cap = win > 0 ? win / 2 : c.value("max_position_embeddings", 512);
+        std::vector<int> probe;
+        if (m.bos >= 0) probe.push_back(m.bos);
+        if (m.eos >= 0) probe.push_back(m.eos);
+        if (probe.empty()) probe.push_back(0);
+        std::vector<float> v;
+        if (!m.fwd->embed_pooled(probe, v)) { why = std::string("encoder warm-up failed: ") + m.fwd->last_error(); return false; }
+        device_ = host ? "cpu" : "npu";
+        dim_ = (int)v.size();
+        id_ = d.filename().string();
+        return true;
+    }
+#endif
     if (!impl_->model.load(dir, why)) return false;
     device_ = device;
     dim_ = impl_->model.config().out_dim;
@@ -80,7 +172,12 @@ bool Backend::load(const std::string& dir, const std::string& device, std::strin
     return true;
 }
 
-int Backend::max_tokens() const { return impl_ ? impl_->model.config().max_tokens : 0; }
+int Backend::max_tokens() const {
+#ifdef ONEBIT_NPU
+    if (impl_ && impl_->fwd) return impl_->cap;
+#endif
+    return impl_ ? impl_->model.config().max_tokens : 0;
+}
 
 std::string Backend::health_json(bool ready) const {
     return json{{"status", ready ? "ok" : "loading"},
@@ -132,6 +229,27 @@ std::string Backend::embeddings(const std::string& body, int& status) {
     long tokens = 0;
     for (size_t i = 0; i < texts.size(); ++i) {
         std::string why;
+#ifdef ONEBIT_NPU
+        if (impl_->fwd) {
+            Impl& m = *impl_;
+            std::vector<int> ids;
+            if (m.bos >= 0) ids.push_back(m.bos);
+            for (int t : m.tok->encode(texts[i])) ids.push_back(t);
+            if (m.eos >= 0) ids.push_back(m.eos);
+            tokens += static_cast<long>(ids.size());
+            if ((int)ids.size() > m.cap)
+                return fail(400, "input[" + std::to_string(i) + "] is " + std::to_string(ids.size()) +
+                                     " tokens; this encoder takes at most " + std::to_string(m.cap));
+            std::vector<float> v;
+            {
+                std::lock_guard<std::mutex> g(m.mu);
+                if (!m.fwd->embed_pooled(ids, v)) why = m.fwd->last_error();
+            }
+            if (v.empty()) return fail(500, "embedding of input[" + std::to_string(i) + "] failed: " + why);
+            data.push_back({{"object", "embedding"}, {"index", static_cast<int>(i)}, {"embedding", v}});
+            continue;
+        }
+#endif
         const auto ids = impl_->model.tokenize(texts[i]);
         tokens += static_cast<long>(ids.size());
         const auto v = impl_->model.encode_ids(ids, why);

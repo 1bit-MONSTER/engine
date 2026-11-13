@@ -38,6 +38,11 @@ namespace onebit::embed_serve {
 // True when `path` is a 1-bit encoder container rather than a GGUF or a q4nx directory.
 bool container(const std::string& path);
 
+// engine#1786: true when `path` is a q4nx directory whose config.json declares `use_bidirectional_attention: true`
+// (FastFlowLM's Embedding-Gemma-300M-NPU2): an encoder the per-op forward runs in one non-causal pass, pooled
+// (Q4nxNpuForward::embed_pooled). Served by the same flags and the same /v1/embeddings surface. NPU builds only.
+bool forward_encoder(const std::string& path);
+
 class Backend {
 public:
     // `device` is "npu" or "cpu". Loading reads the container and the vocabulary; on "npu" the ternary

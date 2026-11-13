@@ -2256,6 +2256,15 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> qwen3_5)
     set_tests_properties(batch_check_state_qwen35 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # engine#1786: the bidirectional gemma3 encoder (Embedding-Gemma-300M-NPU2's layout: BF16 projections, unprefixed
+    # names, pre-scaled embedding, raw norms, a sliding and a full layer) through embed_pooled(), against a numpy
+    # encoder on the same weights, and an over-long input refused by name.
+    add_executable(embed_pooled_test tests/embed_pooled_test.cpp)
+    target_link_libraries(embed_pooled_test PRIVATE onebit_npu_forward_ci)
+    add_dependencies(onebit embed_pooled_test)
+    add_test(NAME embed_forward
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/embed_forward_ci.py $<TARGET_FILE:embed_pooled_test>)
+    set_tests_properties(embed_forward PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 
 # Private NPU routes (docs/npu.md, "Private routes"): closed-source add-ons in a checkout of

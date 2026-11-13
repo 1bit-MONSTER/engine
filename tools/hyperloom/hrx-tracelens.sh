@@ -23,7 +23,11 @@
 #   shape log), TAG, COMPARE=<other
 #   run dir> (adds TraceDiff vs that run's trace), PROMPT_TOKENS (512), DECODE_TOKENS (8), OUT_ROOT
 #   (~/lb/tracelens), BOX_LOCK (flock file shared with other GPU jobs; empty = none), IREE_PROFILE, H2K.
-#   Needs a llama.cpp build with GGML_HRX_DISPATCH_SHAPE_LOG and TraceLens in ~/.cache/tracelens-venv.
+#   Needs TraceLens in ~/.cache/tracelens-venv. The shapes log it exports
+#   (GGML_HRX_DISPATCH_SHAPE_LOG) has NO producer in this repo: `git log --all -S GGML_HRX_DISPATCH_SHAPE_LOG
+#   -- ggml/src/ggml-hrx` finds no commit that writes it, so hrx2kineto's --shapes path (hrx:: op names, per-op
+#   FLOPs/bytes) cannot run from a checkout -- the run still works and reports kernel names only, with every op
+#   in TraceLens' "other" category. Restore the producer before promising ggml-op attribution.
 #   Aborts the run at 93 C Tctl; needs MemAvailable >= model size + 11 GB.
 set -uo pipefail
 [ $# -ge 2 ] || { sed -n 17,28p "$0"; exit 2; }

@@ -37,6 +37,40 @@ Two more, for the moments they are for:
 | `python3 tools/ci/conflict_triage.py . <their-branch>` | before resolving a merge with many conflicted files: it classifies them by kind (content, add/add, mod/del, rename) from the index, which text tools cannot see in a file whose conflict has no markers |
 | `python3 tools/ci/hrx_f16_narrowing.py --check --root <tree with the .loom corpus>` | when the change could touch f32→f16 narrowing; it lists every body that narrows |
 
+## A private pin (`config/*.config`) is the one bump CI cannot check
+
+Two of these files pin a **private** repository; they are the ones whose bumps need evidence:
+
+| file | `repo=` | private? |
+|---|---|---|
+| `config/npu-runtime.config` | `1bit-MONSTER/1bit-MONSTER` | **yes** (`gh api repos/… --jq .private` → `true`) |
+| `config/gpu-kernels.config` | `1bit-MONSTER/gpu-kernels` | **yes** |
+
+The other two are **not** private pins, and assuming otherwise sends a reader looking for evidence that does not exist:
+`config/llama-mirror-hold.config` holds a **bare sha** — which commit the mirror is held at, a decision rather than a fetched
+pin — and `config/hrx-toolchain.config` names a **public** index (`index=https://nightly.repo.amd.com/rocm/whl-next/`, fetched by
+`scripts/fetch-rocm-sdk.sh`).
+`ONEBIT_GPU_PRIVATE` or `gpu-kernels` — so a green `build` on a pin bump proves the engine configures and builds *without* that
+dependency and says nothing about the commit the pin names. `tools/check_pins.py` does not help either: it compares **submodule
+gitlinks**, not `config/*.config` shas.
+
+Three commands are the evidence, and they are cheap enough to run before merge (a fetched private pin was 3.4 MB and 1.4 s):
+
+```bash
+git ls-remote https://github.com/1bit-MONSTER/<repo>.git refs/heads/main     # the pinned sha IS the advertised tip
+bash scripts/fetch-private.sh config/<the>.config ~/.cache/scratch-<lane>/pin # rc 0, HEAD == the pinned sha,
+                                                                             # both require= paths present
+git -C ~/.cache/scratch-<lane>/pin diff --stat <the previous pin>..HEAD       # what the range actually contains
+```
+
+Run the first two **from the branch that changes the pin**: `fetch-private.sh` reads the config out of the *working tree*, so the
+same command in a checkout of an older commit fetches the older pin and returns **rc 0** — indistinguishable output, wrong answer.
+
+That third command is the one a reviewer needs. A pin range is not "the fixes I named": measured on engine#2316,
+`fd69590c..b0ed206` was **ten commits**, of which two were the f16-range fixes the PR closed, one was #572's routed GEMM, and the
+rest were **two new ~400-line kernels, a new refusal path and an id renumbering**. A body that says "three fixes" asks a reviewer
+to accept eight things they were not told about.
+
 ## Why the merge-base one is not the same as "it merges"
 
 A PR's diff is computed against its **merge base**. If `main` moved under you, every row another lane landed shows in your

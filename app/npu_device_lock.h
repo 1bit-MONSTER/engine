@@ -269,8 +269,46 @@ inline std::string npu_lock_holder_line(const char* path = kNpuDeviceLock, long 
 // engine#1241 cure 2: the line an NPU failure path prints when the runtime said "No such device" but
 // another pid owns the array through the device lock -- the state that made a held array read as a
 // broken device, ELF or container. "" when nobody holds it, i.e. the device really is the thing to look at.
+// Is one rendered holder entry ("pid <N> (<cmd>)") THIS process? A pure function so the boundary can be tested with
+// crafted pids: the first version used `item.rfind(mine, 0) != 0` (a PREFIX match), which also drops a co-tenant whose pid
+// merely starts with ours - pid 1234 hides pid 12345 - and a forked-child fixture can never produce that pair on demand.
+// engine#2441 review, measured: the boundary is what made it wrong, not the idea.
+inline bool npu_holder_item_is_self(const std::string& item, long self_pid) {
+    const std::string mine = "pid " + std::to_string(self_pid);
+    if (item == mine) return true;                       // a list of one, no " (cmd)"
+    if (item.rfind(mine, 0) != 0) return false;           // does not start with our pid at all
+    const char next = item.size() > mine.size() ? item[mine.size()] : '\0';
+    return next == ' ' || next == '(';                    // the pid ENDS here: 1234 is not 12345
+}
+
 inline std::string npu_lock_refusal_note(const char* path = kNpuDeviceLock) {
-    const std::string text = npu_lock_holders_text(path);
+    // engine#2434: SELF IS NOT THE ANSWER. A serve takes this lock BEFORE it opens a device context, so when its own
+    // init_elf is refused, /proc/locks reports the only holder - itself - and this note named the process that had just
+    // failed and told the operator to wait for, or stop, it. Measured with a FastFlowLM co-tenant that does not take our
+    // lock: `[npu] the device lock is held by pid 2230435 (…/1bit serve …)` where 2230435 was the failing serve.
+    std::string text = npu_lock_holders_text(path);
+    if (!text.empty()) {
+        // Drop our own pid from the rendered list, keeping the rest verbatim. The rendered text is
+        // "pid N (cmd), pid M (cmd)", so filter on the exact "pid <ours>" token rather than by parsing it back.
+        const long self_pid = static_cast<long>(::getpid());
+        std::string kept;
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t comma = text.find(", ", pos);
+            const std::string item = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            if (!item.empty() && !npu_holder_item_is_self(item, self_pid)) kept += (kept.empty() ? "" : ", ") + item;
+            if (comma == std::string::npos) break;
+            pos = comma + 2;
+        }
+        if (kept.empty()) {
+            // The only holder was us: say the thing that is actually true, because the advice for another client
+            // ("wait for it, or stop it") is unusable when the client is the caller.
+            return "[npu] this process holds the device lock and is still refused a hardware context: another client is "
+                   "using the array outside our lock protocol (measured with a FastFlowLM serve), so stopping this "
+                   "process will not help - wait for that client, or stop it";
+        }
+        text = kept;
+    }
     if (text.empty()) return {};
     return "[npu] the device lock is held by " + text +
            ": 'No such device' here is another client owning the array, not a dead device/ELF (wait for it, or stop "

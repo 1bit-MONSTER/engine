@@ -75,21 +75,27 @@ else
 fi
 out=$(ONEBIT_BIN=/bin/true NPU_TOKEN_FILE="$tmp/NPU-TOKEN" NPU_HOLD_TICKET="$foreign" \
       bash "$SRC/scripts/npu-kernel-bitx.sh" /x /y 2>&1)
-if printf '%s' "$out" | grep -q 'cannot prove it owns the device'; then
-    echo "  FAIL the consumer refused a ticket line that matches the token"
-    fails=$((fails + 1))
+# engine#2447 review: this arm used to assert only the ABSENCE of the refusal text, so a run that died for any
+# other reason (bad usage, missing binary, a reworded message) passed it. Assert POSITIVE progress instead: the
+# script prints the device line only after the guard, so a refused run cannot produce it. Mutant: give the
+# consumer a ticket line that does NOT match the token and this arm must fail.
+if printf '%s' "$out" | grep -q '^device' && ! printf '%s' "$out" | grep -q 'cannot prove it owns the device'; then
+    echo "  ok   a matching ticket line gets past the consumer guard (reached the device line)"
 else
-    echo "  ok   a matching ticket line gets past the consumer guard"
+    echo "  FAIL the consumer refused a ticket line that matches the token, or never got past the guard"
+    printf '%s\n' "$out" | sed -n '1,3p' | sed 's/^/       /'
+    fails=$((fails + 1))
 fi
 # and the variable the helper chain ACTUALLY exports must be the one accepted - the P0: the first version required
 # NPU_HOLD_TICKET, which no helper sets, so every run was refused.
 out=$(ONEBIT_BIN=/bin/true NPU_TOKEN_FILE="$tmp/NPU-TOKEN" GPU_HOLD_TICKET="$foreign" NPU_HOLD_TICKET= \
       bash "$SRC/scripts/npu-kernel-bitx.sh" /x /y 2>&1)
-if printf '%s' "$out" | grep -q 'cannot prove it owns the device'; then
-    echo "  FAIL GPU_HOLD_TICKET is not accepted although it is what npu-hold's chain exports"
-    fails=$((fails + 1))
+if printf '%s' "$out" | grep -q '^device' && ! printf '%s' "$out" | grep -q 'cannot prove it owns the device'; then
+    echo "  ok   GPU_HOLD_TICKET (what the helper chain exports) is accepted (reached the device line)"
 else
-    echo "  ok   GPU_HOLD_TICKET (what the helper chain exports) is accepted"
+    echo "  FAIL GPU_HOLD_TICKET is not accepted although it is what npu-hold's chain exports"
+    printf '%s\n' "$out" | sed -n '1,3p' | sed 's/^/       /'
+    fails=$((fails + 1))
 fi
 
 echo "gpu_hold_child_identity: $fails failure(s)"

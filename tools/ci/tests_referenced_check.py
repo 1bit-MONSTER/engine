@@ -105,7 +105,7 @@ def scan_files(root):
             if path == root / ALLOW:
                 continue  # the allow-list names the file too; it is not a runner
             try:
-                yield path, path.read_text(errors="replace")
+                yield path, code_only(path.read_text(errors="replace"))
             except OSError:
                 continue
 
@@ -154,6 +154,20 @@ def referenced(root, need):
     return found
 
 
+# engine#2456: a runner is something that INVOKES a file, and a comment cannot. The haystacks below were raw file text, so a
+# comment in tests/pack_modes_test.sh that mentioned scripts/window-run.sh made that self-test "registered" with no row at
+# all (reproduced on engine#2455: green with the comment, red once it was reworded, green again with a real add_test).
+# Every runner file kind this checker reads (CMake, shell, Python, YAML) comments with `#`, so drop whole-line comments
+# and a `#` comment that follows whitespace. A real invocation still counts wherever it is, including an add_test(...)
+# wrapped across lines, because the match is still by name, not by line shape.
+_COMMENT_TAIL = re.compile(r"(^|\s)#.*$")
+
+
+def code_only(text):
+    """`text` without its `#` comments, line structure kept (so a wrapped call stays one match)."""
+    return "\n".join(_COMMENT_TAIL.sub(r"\1", line) for line in text.splitlines())
+
+
 SELFTEST = re.compile(r"--self[-_]?test\b")
 RUNNERS = ("CMakeLists.txt", "cmake", ".github/workflows")
 # A tool's `--self-test` can also be run from a python test, so THAT gate reads one more directory. The python-test gate must
@@ -185,7 +199,7 @@ def unregistered_selftest_tools(root):
         files = [p] if p.is_file() else (sorted(q for q in p.rglob("*") if q.is_file()) if p.is_dir() else [])
         for f in files:
             try:
-                runner_text.append(f.read_text(errors="replace"))
+                runner_text.append(code_only(f.read_text(errors="replace")))
             except OSError:
                 pass
     drift = []
@@ -238,7 +252,7 @@ def unregistered_py_tests(root):
             if base.is_dir() else [])
         for path in paths:
             try:
-                runner_text.append(path.read_text(errors="replace"))
+                runner_text.append(code_only(path.read_text(errors="replace")))
             except OSError:
                 continue
     out = []
@@ -405,6 +419,23 @@ def self_test():
                                       "add_test(NAME t COMMAND tools/registered.py --self-test)\n",
                     "tools/registered.py": "# --self-test\n"})
     cases.append(("a registered tool self-test is clean", check(r3), 0, None))
+    # engine#2456: a comment is a mention, not a runner. Reproduced on engine#2455: a comment in a tests/ script naming a
+    # scripts/*.sh self-test kept the check green with no row anywhere.
+    r = root_with(dict(base_ok, **{"scripts/window.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
+                                    "tests/pack_modes_test.sh": "#!/bin/sh\n# shares its fixtures with scripts/window.sh\nexit 0\n",
+                                    "CMakeLists.txt": "add_test(NAME ok COMMAND tests/ok.sh)\n"
+                                                      "add_test(NAME pm COMMAND bash tests/pack_modes_test.sh)\n"}))
+    cases.append(("a self-test named only in a comment is drift", check(r), 1, "window.sh"))
+    cases_root["a self-test named only in a comment is drift"] = r
+    r = root_with(dict(base_ok, **{"scripts/window.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
+                                    "CMakeLists.txt": "add_test(NAME ok COMMAND tests/ok.sh)\n"
+                                                      "add_test(NAME window_self\n         COMMAND bash\n"
+                                                      "         ${CMAKE_SOURCE_DIR}/scripts/window.sh --self-test)  # the arm\n"}))
+    cases.append(("an add_test wrapped across lines still counts", check(r), 0, None))
+    r = root_with({"tests/ok.sh": "#!/bin/sh\n", "tests/orphan.sh": "#!/bin/sh\n",
+                   "CMakeLists.txt": "add_test(NAME ok COMMAND tests/ok.sh)\n# tests/orphan.sh is flaky, see #1\n"})
+    cases.append(("a tests/*.sh named only in a CMake comment is drift", check(r), 1, "orphan.sh"))
+    cases_root["a tests/*.sh named only in a CMake comment is drift"] = r
 
     # 9. the entry may be written either way: path form and basename mean the same line
     r = root_with({"tests/keeper2.sh": "#!/bin/sh\n", "CMakeLists.txt": "",

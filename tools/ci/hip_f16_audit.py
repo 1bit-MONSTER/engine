@@ -45,6 +45,7 @@ not a pass -- the same rule as the ratchet: `cannot tell` never reads as clean).
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -224,12 +225,48 @@ def self_test():
         chk(False, sha_matches(None, at), "a tree with no commit never matches, not even a guess")
         chk(False, sha_matches(at, ""), "an empty expectation is not a wildcard")
 
+    # --find (engine#2416): where the ctest row looks, and that "nothing found" is a skip, never a clean pass
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = Path(tmp) / "engine"
+        (engine / "third_party").mkdir(parents=True)
+        explicit = Path(tmp) / "gk"
+        explicit.mkdir()
+        chk(None, find_tree(engine, env={}), "no $GPU_KERNELS_DIR and no submodule: nothing found")
+        chk(str(explicit), find_tree(engine, env={"GPU_KERNELS_DIR": str(explicit)}), "$GPU_KERNELS_DIR is used")
+        chk(None, find_tree(engine, env={"GPU_KERNELS_DIR": str(Path(tmp) / "missing")}),
+            "a $GPU_KERNELS_DIR that is not a directory is not a tree")
+        (engine / "third_party" / "gpu-kernels").mkdir()
+        chk(str(engine / "third_party" / "gpu-kernels"), find_tree(engine, env={}), "the submodule path is used")
+        chk(str(explicit), find_tree(engine, env={"GPU_KERNELS_DIR": str(explicit)}),
+            "$GPU_KERNELS_DIR wins over the submodule")
+        empty = Path(tmp) / "empty-engine"
+        empty.mkdir()
+        saved = os.environ.pop("GPU_KERNELS_DIR", None)
+        try:
+            chk(SKIPPED, main(["--find", str(empty)]), "--find with no tree exits 77 (skipped), not 0")
+        finally:
+            if saved is not None:
+                os.environ["GPU_KERNELS_DIR"] = saved
+
     if problems:
         for problem in problems:
             print("FAIL " + problem)
         return 1
     print("hip_f16_audit self-test: ok")
     return 0
+
+
+SKIPPED = 77   # ctest SKIP_RETURN_CODE: the same convention as hrx_f16_narrowing's "skip: no .loom corpus"
+
+
+def find_tree(engine_root, env=None):
+    """The gpu-kernels checkout --find audits: $GPU_KERNELS_DIR, else <engine>/third_party/gpu-kernels. None when
+    neither is a directory -- the engine has no gpu-kernels submodule, so a plain checkout has none (engine#2416)."""
+    env = os.environ if env is None else env
+    for candidate in (env.get("GPU_KERNELS_DIR"), str(Path(engine_root) / "third_party" / "gpu-kernels")):
+        if candidate and Path(candidate).is_dir():
+            return candidate
+    return None
 
 
 def main(argv):
@@ -241,10 +278,22 @@ def main(argv):
     ap.add_argument("--expect-sha", help="audit THIS commit (7..40 hex characters), for a candidate pin that has not "
                                          "merged yet; overrides --config-root. An audit of the wrong tree reads as "
                                          "clean, so the commit audited has to be asserted, not remembered")
+    ap.add_argument("--find", metavar="ENGINE_ROOT",
+                    help="the ctest row (engine#2416): audit $GPU_KERNELS_DIR or ENGINE_ROOT/third_party/gpu-kernels "
+                         "against ENGINE_ROOT's pin; with neither, say the audit did NOT run and exit 77 (skipped)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
+    if a.find:
+        tree = find_tree(a.find)
+        if tree is None:
+            print("SKIPPED: hip_f16_audit found no gpu-kernels tree ($GPU_KERNELS_DIR unset, no "
+                  f"{Path(a.find) / 'third_party' / 'gpu-kernels'}) - the add-on f16 audit did NOT run")
+            return SKIPPED
+        a.dir = tree
+        if not a.expect_sha:
+            a.config_root = a.find
     if not a.dir:
         print("hip_f16_audit: --dir is required (the gpu-kernels checkout to audit)", file=sys.stderr)
         return 2

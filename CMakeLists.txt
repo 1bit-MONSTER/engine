@@ -444,6 +444,9 @@ add_python_test(pr_carry_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_carry_check.
 # branch that deletes a reviewed class passes it -- measured on #2021, where 41 classes became 40 and --check-gaps
 # still printed "none of the 41 reviewed significant classes is mapped". A test row for the three arms that do see it.
 add_python_test(registry_loss_check_test ${CMAKE_SOURCE_DIR}/tests/registry_loss_check_test.py)
+# engine#2406 puts "audit those on a pin bump" on the f16 ratchet's green line; this is that audit
+# for the HIP add-on's kernels, which the ratchet cannot see (it walks *.loom).
+add_python_test(hip_f16_audit_self ${CMAKE_SOURCE_DIR}/tools/ci/hip_f16_audit.py --self-test)
 # engine#2398: the stale-branch test, which `tests_referenced` refuses to leave unregistered -- a test no
 # runner names is a test nobody runs.
 add_python_test(branch_stale_check_test ${CMAKE_SOURCE_DIR}/tests/branch_stale_check_test.py)

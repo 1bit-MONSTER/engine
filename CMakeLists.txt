@@ -452,6 +452,12 @@ add_python_test(registry_loss_check_test ${CMAKE_SOURCE_DIR}/tests/registry_loss
 # engine#2406 puts "audit those on a pin bump" on the f16 ratchet's green line; this is that audit
 # for the HIP add-on's kernels, which the ratchet cannot see (it walks *.loom).
 add_python_test(hip_f16_audit_self ${CMAKE_SOURCE_DIR}/tools/ci/hip_f16_audit.py --self-test)
+# engine#2416: the audit above had a self-test row and NO caller, so "audit those on a pin bump" was still a thing
+# a person remembered. This row is the caller: it audits the tree the gpu-kernels pin names, and skips (77) with a
+# line that says the audit did NOT run when this checkout has no gpu-kernels tree -- a quiet skip would read as
+# "checked" when nothing was checked, which is the failure the audit exists to prevent.
+add_python_test(hip_f16_audit_pinned ${CMAKE_SOURCE_DIR}/tools/ci/hip_f16_audit_pinned.py)
+set_tests_properties(hip_f16_audit_pinned PROPERTIES SKIP_RETURN_CODE 77)
 # engine#2398: the stale-branch test, which `tests_referenced` refuses to leave unregistered -- a test no
 # runner names is a test nobody runs.
 add_python_test(branch_stale_check_test ${CMAKE_SOURCE_DIR}/tests/branch_stale_check_test.py)

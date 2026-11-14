@@ -338,6 +338,14 @@ int main(int argc, char** argv) {
 #ifdef ONEBIT_WHISPER_NPU
         const double dev_ms0 = dev_hook != nullptr ? npu_dev.gemm->device_ms() : 0.0;
 #endif
+        // engine#2399: ONEBIT_AUDIO_NODE_TIMES=1 prints per-node lines for the whole run, which is encoder PLUS a
+        // 25-token decode -- and the decode's GEMMs are M=1, so their MatMul rows swamp the encoder's. This marker
+        // is what makes the per-node output attributable: everything between here and the decoder marker is the
+        // encoder, which is the pass this issue is about.
+        const bool node_times = std::getenv("ONEBIT_AUDIO_NODE_TIMES") != nullptr;
+        if (node_times) {
+            std::fprintf(stdout, "[audio-graph] encoder\n");
+        }
         if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why, dev_hook)) {
             std::fprintf(stderr, "encoder (window %zu): %s\n", w, why.c_str());
             return 1;
@@ -367,6 +375,11 @@ int main(int argc, char** argv) {
         // message (engine#1783).
         std::vector<int64_t> seq = prompt;
         size_t got = 0;
+        if (node_times) {
+            // engine#2399: closes the encoder region and names the rest. Everything after this is the greedy decode,
+            // whose GEMMs are M=1 and must not be counted against the encoder's MatMul share.
+            std::fprintf(stdout, "[audio-graph] decoder\n");
+        }
         bool full = false;
         while (true) {
             if (seq.size() >= size_t(window)) { full = true; break; }

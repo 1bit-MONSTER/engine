@@ -106,6 +106,22 @@ class RegistryLossCheckTest(unittest.TestCase):
         result = self.run_check(self.base, "HEAD")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_a_class_missing_only_because_the_branch_is_behind_is_not_a_loss(self):
+        # engine#2390: the endpoint diff says the class is gone; the merge keeps it, so nothing was lost.
+        self.write("notes.txt", "branch work\n")
+        commit(self.repo, "the branch does something unrelated")
+        behind = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "checkout", "-q", self.base)
+        self.write("registry/significant.json",
+                   json.dumps({"classes": {"Skylar2ForCausalLM": {"model_type": "skylar2"},
+                                           "OmoikaneForCausalLM": {},
+                                           "LaterForCausalLM": {}}}, indent=1))
+        commit(self.repo, "the base adds a class after the branch was cut")
+        result = self.run_check("HEAD", behind)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("behind the base", result.stdout)
+        self.assertNotIn("FAIL", result.stdout)
+
     def test_a_ref_that_cannot_be_read_refuses_instead_of_passing(self):
         result = self.run_check(self.base, "no-such-ref")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

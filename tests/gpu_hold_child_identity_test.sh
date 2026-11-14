@@ -25,6 +25,7 @@
 # usage: gpu_hold_child_identity_test.sh <path-to-gpu-hold>
 set -u
 HOLD=${1:?usage: gpu_hold_child_identity_test.sh <path-to-gpu-hold>}
+SRC=$(cd "$(dirname "$HOLD")/.." && pwd)   # the tree, for scripts/npu-kernel-bitx.sh
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/ghid.XXXXXX") || exit 77
 trap 'rm -rf "$tmp"' EXIT
 fails=0
@@ -58,10 +59,38 @@ if [ "$label" != "child-identity" ]; then
 else
     echo "  ok   GPU_HOLD_LABEL carries the sanitised label"
 fi
-# And the bystander direction: outside any hold the variables must be absent, which is what makes the check meaningful.
-env -u GPU_HOLD_TICKET -u GPU_HOLD_LABEL bash -c '[ -z "${GPU_HOLD_TICKET:-}" ] && [ -z "${GPU_HOLD_LABEL:-}" ]' \
-    && echo "  ok   outside a hold neither variable is set (so a bare presence check cannot pass)" \
-    || { echo "  FAIL leaked into this shell"; fails=$((fails + 1)); }
+# THE ARM THAT MATTERS, and the first version of this file did not have it: a token present but NOT ours must be refused by a
+# real consumer. The old arm here ran `env -u X bash -c '[ -z "$X" ]'` - it unset the variables and then asserted they were
+# unset, a tautology that printed ok unconditionally and pinned nothing (engine#2447 review). The incident this file exists for
+# is "another lane holds the token and the guard still passes", so that is the case to drive.
+foreign="gpu-hold another-lane pid 999999 2026-11-14T00:00:00-04:00"
+printf '%s\n' "$foreign" > "$tmp/NPU-TOKEN"
+out=$(ONEBIT_BIN=/bin/true NPU_TOKEN_FILE="$tmp/NPU-TOKEN" NPU_HOLD_TICKET= bash "$SRC/scripts/npu-kernel-bitx.sh" /x /y 2>&1)
+rc=$?
+if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q 'cannot prove it owns the device'; then
+    echo "  ok   a foreign token with no ticket line is REFUSED by the consumer (rc 2)"
+else
+    echo "  FAIL the consumer did not refuse a foreign token: rc=$rc"
+    fails=$((fails + 1))
+fi
+out=$(ONEBIT_BIN=/bin/true NPU_TOKEN_FILE="$tmp/NPU-TOKEN" NPU_HOLD_TICKET="$foreign" \
+      bash "$SRC/scripts/npu-kernel-bitx.sh" /x /y 2>&1)
+if printf '%s' "$out" | grep -q 'cannot prove it owns the device'; then
+    echo "  FAIL the consumer refused a ticket line that matches the token"
+    fails=$((fails + 1))
+else
+    echo "  ok   a matching ticket line gets past the consumer guard"
+fi
+# and the variable the helper chain ACTUALLY exports must be the one accepted - the P0: the first version required
+# NPU_HOLD_TICKET, which no helper sets, so every run was refused.
+out=$(ONEBIT_BIN=/bin/true NPU_TOKEN_FILE="$tmp/NPU-TOKEN" GPU_HOLD_TICKET="$foreign" NPU_HOLD_TICKET= \
+      bash "$SRC/scripts/npu-kernel-bitx.sh" /x /y 2>&1)
+if printf '%s' "$out" | grep -q 'cannot prove it owns the device'; then
+    echo "  FAIL GPU_HOLD_TICKET is not accepted although it is what npu-hold's chain exports"
+    fails=$((fails + 1))
+else
+    echo "  ok   GPU_HOLD_TICKET (what the helper chain exports) is accepted"
+fi
 
 echo "gpu_hold_child_identity: $fails failure(s)"
 exit $((fails > 0))

@@ -49,10 +49,15 @@ fi
 # the line they wrote into the token, so compare against that. A caller that holds the device in a shell created some
 # other way can pass NPU_HOLD_TICKET explicitly; without it, refuse rather than guess.
 _tok=${NPU_TOKEN_FILE:-$HOME/NPU-TOKEN}
-_want=${NPU_HOLD_TICKET:-}
+# WHICH VARIABLE: the one the helper that actually runs this script exports. `npu-hold` execs `gpu-hold`, and gpu-hold hands
+# its child GPU_HOLD_TICKET - nobody exports NPU_HOLD_TICKET. The first version of this check required NPU_HOLD_TICKET, so it
+# refused EVERY run and told the reader "the helper exports NPU_HOLD_TICKET for you", which was false (engine#2447 review,
+# measured: inside a real npu-hold the script refused with exactly that message). NPU_HOLD_TICKET stays as an override name
+# for a caller that sets it by hand; GPU_HOLD_TICKET is the one that exists on the helper path.
+_want=${NPU_HOLD_TICKET:-${GPU_HOLD_TICKET:-}}
 if [ -z "$_want" ]; then
-    echo "npu-kernel-bitx: refusing: NPU_HOLD_TICKET is not set, so this run cannot prove it owns the device ticket." >&2
-    echo "  Run it under: npu-hold -l <label> -t <min> -- $0 ... (the helper exports NPU_HOLD_TICKET for you)." >&2
+    echo "npu-kernel-bitx: refusing: no ticket line in the environment (NPU_HOLD_TICKET or GPU_HOLD_TICKET), so this run" >&2
+    echo "  cannot prove it owns the device. Run it under: npu-hold -l <label> -t <min> -- $0 ..." >&2
     exit 2
 fi
 if [ ! -e "$_tok" ] || [ "$(cat "$_tok" 2>/dev/null)" != "$_want" ]; then

@@ -345,6 +345,7 @@ int main(int argc, char** argv) {
         const bool node_times = std::getenv("ONEBIT_AUDIO_NODE_TIMES") != nullptr;
         if (node_times) {
             std::fprintf(stdout, "[audio-graph] encoder\n");
+            std::fflush(stdout);   // the node lines go to stderr; without this they interleave after the marker
         }
         if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why, dev_hook)) {
             std::fprintf(stderr, "encoder (window %zu): %s\n", w, why.c_str());
@@ -379,6 +380,7 @@ int main(int argc, char** argv) {
             // engine#2399: closes the encoder region and names the rest. Everything after this is the greedy decode,
             // whose GEMMs are M=1 and must not be counted against the encoder's MatMul share.
             std::fprintf(stdout, "[audio-graph] decoder\n");
+            std::fflush(stdout);
         }
         bool full = false;
         while (true) {

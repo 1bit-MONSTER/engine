@@ -37,7 +37,7 @@ below says why. The table's order is the runner's order: cheapest and most commo
 | `python3 tools/ci/submodule_pin_check.py --check` | a submodule's checkout is not the commit the tree pins |
 | `python3 tools/ci/registration_loss_check.py --check --base origin/main` | your branch would drop rows `main` has |
 | `python3 tools/ci/registry_loss_check.py --base origin/main` | a reviewed class, a `coverage` counter or a test's mention of a class that the base has is gone at the merge, not only at the endpoint (engine#2385, #2391) |
-| `python3 tools/ci/branch_stale_check.py --base origin/main` | the branch carries an older copy of a file it never touched, so a squash merge would write that copy over the base's (engine#2398) |
+| `python3 tools/ci/branch_stale_check.py --base origin/main` | the merge with the base conflicts, or would not keep a base change the branch never touched; a branch that is only behind gets a note (the merge keeps the base's copy, but the branch's tests ran on the older one) (engine#2398, #2410) |
 | `git grep -l -F "$(basename <your new page>)" -- '*.md'` | nothing links to the page you just added — measured tonight: 45 docs, one with no inbound link, and it was the page whose whole subject is pre-merge checks |
 
 Two more, for the moments they are for:

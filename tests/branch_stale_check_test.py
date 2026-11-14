@@ -15,9 +15,9 @@
 # limitations under the License.
 """branch_stale_check_test.py -- the stale-branch shape, built in throwaway repositories.
 
-Each case is the thing the check exists for: a file the base advances after the branch was cut, which the branch
-never touched. The check must name it, must stay quiet when the branch does touch the file, and must refuse rather
-than pass when a ref cannot be read.
+A file the base advances after the branch was cut, which the branch never touched. The merge keeps the base's copy
+(engine#2410), so the check names it as behind without failing; it fails on a conflict, stays quiet when the
+branch does touch the file, and refuses rather than passes when a ref cannot be read.
 """
 
 import os
@@ -64,11 +64,34 @@ class BranchStaleCheckTest(unittest.TestCase):
         return subprocess.run((sys.executable, CHECK, "--base", base, "--head", head), cwd=self.repo,
                               capture_output=True, text=True)
 
-    def test_a_file_the_base_advanced_is_named(self):
+    def test_a_file_the_base_advanced_is_named_as_behind_not_failed(self):
         result = self.run_check(self.main, self.feature_before_base_moves)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("note branch_stale_check: shared.txt - behind the base (the merge keeps the base's copy)",
+                      result.stdout)
+        self.assertNotIn("FAIL", result.stdout)
+        self.assertIn("rebase before trusting them", result.stdout)
+
+    def test_a_squash_merge_keeps_the_base_copy_of_a_path_the_branch_never_changed(self):
+        # engine#2410: the premise the check rests on, measured rather than asserted.
+        git(self.repo, "checkout", "-q", "main")
+        merged = git(self.repo, "merge", "--squash", "feature")
+        self.assertEqual(merged.returncode, 0, merged.stdout + merged.stderr)
+        with open(os.path.join(self.repo, "shared.txt"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "v2 - merged while the branch was open\n")
+
+    def test_a_conflict_with_the_base_fails(self):
+        git(self.repo, "checkout", "-q", "feature")
+        self.write("other.txt", "the branch's other\n")
+        commit(self.repo, "the branch edits other.txt")
+        head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "checkout", "-q", "main")
+        self.write("other.txt", "the base's other\n")
+        commit(self.repo, "the base edits other.txt too")
+        base = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        result = self.run_check(base, head)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("shared.txt - the branch carries an older copy and never changed it", result.stdout)
-        self.assertIn("rebase onto the base", result.stderr)
+        self.assertIn("FAIL branch_stale_check: other.txt - the merge with the base conflicts here", result.stdout)
 
     def test_the_branchs_own_file_is_not_reported(self):
         # `feature.txt` does not exist on the base at all: the branch adds it and that must never be a failure.

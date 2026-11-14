@@ -97,44 +97,96 @@ size_t bcast_index(const std::vector<int64_t>& od, const std::vector<int64_t>& s
     return off;
 }
 
+// Elements per parallel unit of the elementwise loops below: large enough that a unit is not dominated by the fork, small
+// enough that a [1, 1500, 768] activation splits into ~70 units.
+constexpr size_t kElemUnit = 16384;
+
+// engine#2366: one row (the output's last axis) at a time, the row's source offsets computed once from its index and then
+// stepped by the last-axis strides, rows split over threads. Each element is still the one float operation of the serial
+// loop on the same two operands, so the result is bit-identical at any thread count (tests/audio_parallel_test.cpp).
+template <typename Op>
+void broadcast_rows(const Tensor& a, const Tensor& b, const Broadcast& p, Tensor* out, Op op) {
+    const size_t rank = p.dims.size();
+    const size_t width = rank == 0 ? 1 : size_t(p.dims[rank - 1]);
+    const size_t rows = width == 0 ? 0 : out->data.size() / width;
+    const size_t sa = rank == 0 ? 0 : p.stride_big[rank - 1], sb = rank == 0 ? 0 : p.stride_small[rank - 1];
+    const size_t rows_per_unit = std::max<size_t>(1, kElemUnit / std::max<size_t>(1, width));
+    const float* ad = a.data.data();
+    const float* bd = b.data.data();
+    float* od = out->data.data();
+    parallel_units((rows + rows_per_unit - 1) / rows_per_unit, [&](size_t u) {
+        const size_t r0 = u * rows_per_unit, r1 = std::min(rows, r0 + rows_per_unit);
+        for (size_t row = r0; row < r1; ++row) {
+            size_t ia = 0, ib = 0, rem = row;
+            for (size_t d = rank > 0 ? rank - 1 : 0; d-- > 0;) {   // the row's index on every axis but the last
+                const size_t i = rem % size_t(p.dims[d]);
+                rem /= size_t(p.dims[d]);
+                ia += i * p.stride_big[d];
+                ib += i * p.stride_small[d];
+            }
+            float* o = od + row * width;
+            // A last-axis stride of 0 (a scalar, a column) is one value for the whole row: read it once, which lets the
+            // loop vectorise (scalar Mul on 1x1500x3072, one thread: 1.39 -> 0.6 ms). Same operation per element.
+            if (sb == 0) {
+                const float y = bd[ib];
+                for (size_t j = 0; j < width; ++j) o[j] = op(ad[ia + j * sa], y);
+            } else if (sa == 0) {
+                const float x = ad[ia];
+                for (size_t j = 0; j < width; ++j) o[j] = op(x, bd[ib + j * sb]);
+            } else {
+                for (size_t j = 0; j < width; ++j) o[j] = op(ad[ia + j * sa], bd[ib + j * sb]);
+            }
+        }
+    });
+}
+
+// engine#2366: equal dims (residual adds, the GELU chain) and a scalar operand need no index arithmetic at all, so they
+// take a flat loop (#2383: 66.76 -> 7.10 ms for Add/Mul/Div on 1x1500x3072). Every other broadcast takes the row loop
+// above. Both split over the executor's threads in kElemUnit ranges or row blocks, and each element is the serial loop's
+// one float operation on the same operands, so the output is bit-identical at any thread count.
+template <typename Op>
+void broadcast_apply(const Tensor& a, const Tensor& b, const Broadcast& p, Tensor* out, Op op) {
+    const size_t n = out->data.size();
+    const float* ad = a.data.data();
+    const float* bd = b.data.data();
+    float* od = out->data.data();
+    const bool equal = a.dims == p.dims && b.dims == p.dims;
+    if (equal || b.data.size() == 1) {
+        parallel_units((n + kElemUnit - 1) / kElemUnit, [&](size_t u) {
+            const size_t i1 = std::min(n, (u + 1) * kElemUnit);
+            if (equal) {
+                for (size_t i = u * kElemUnit; i < i1; ++i) od[i] = op(ad[i], bd[i]);
+            } else {
+                const float y = bd[0];
+                for (size_t i = u * kElemUnit; i < i1; ++i) od[i] = op(ad[i], y);
+            }
+        });
+        return;
+    }
+    broadcast_rows(a, b, p, out, op);
+}
+
 void broadcast_binary(const Tensor& a, const Tensor& b, const std::string& op, Tensor* out) {
     const Broadcast p = plan_broadcast(a.dims, b.dims);
     out->dims = p.dims;
     out->data.resize(nelem(p.dims));
-    // engine#2366: 165 of the whisper encoder's nodes are one of these ops, 3.6 s of it, and the loop below does two dot
-    // products over the dims plus a carry step PER ELEMENT -- and compares the op name with std::string, twice, per
-    // element. For the two shapes that dominate the graph (equal dims: residual adds and the GELU chain; a scalar) there is
-    // no index arithmetic at all. Measured on the widest elementwise shape (1x1500x3072, 20 reps each, one process so load
-    // cancels): 66.76 ms -> 7.10 ms for Add/Mul/Div, **9.40x**, and the outputs are byte-identical because nothing about
-    // the arithmetic changes -- only where the indices come from.
-    const int kind = op == "Add" ? 0 : op == "Sub" ? 1 : op == "Mul" ? 2 : 3;
-    auto apply = [kind](float x, float y) {
-        return kind == 0 ? x + y : kind == 1 ? x - y : kind == 2 ? x * y : x / y;
-    };
-    const size_t n = out->data.size();
-    if (a.dims == p.dims && b.dims == p.dims) {
-        for (size_t o = 0; o < n; ++o) out->data[o] = apply(a.data[o], b.data[o]);
-        return;
-    }
-    if (b.data.size() == 1) {
-        const float y = b.data[0];
-        for (size_t o = 0; o < n; ++o) out->data[o] = apply(a.data[o], y);
-        return;
-    }
-    std::vector<size_t> idx(p.dims.size(), 0);
-    for (size_t o = 0; o < out->data.size(); ++o) {
-        size_t ia = 0, ib = 0;
-        for (size_t d = 0; d < idx.size(); ++d) {
-            ia += idx[d] * p.stride_big[d];
-            ib += idx[d] * p.stride_small[d];
-        }
-        const float x = a.data[ia], y = b.data[ib];
-        out->data[o] = apply(x, y);
-        for (size_t d = idx.size(); d-- > 0;) {
-            if (++idx[d] < size_t(p.dims[d])) break;
-            idx[d] = 0;
-        }
-    }
+    if (op == "Add") broadcast_apply(a, b, p, out, [](float x, float y) { return x + y; });
+    else if (op == "Sub") broadcast_apply(a, b, p, out, [](float x, float y) { return x - y; });
+    else if (op == "Mul") broadcast_apply(a, b, p, out, [](float x, float y) { return x * y; });
+    else broadcast_apply(a, b, p, out, [](float x, float y) { return x / y; });
+}
+
+// y[i] = f(x[i]) over kElemUnit-sized ranges on the executor's threads (engine#2366); per element the serial arithmetic.
+template <typename Fn>
+void map_elements(const std::vector<float>& x, std::vector<float>* y, Fn f) {
+    y->resize(x.size());
+    const float* xd = x.data();
+    float* yd = y->data();
+    const size_t n = x.size();
+    parallel_units((n + kElemUnit - 1) / kElemUnit, [&](size_t u) {
+        const size_t i1 = std::min(n, (u + 1) * kElemUnit);
+        for (size_t i = u * kElemUnit; i < i1; ++i) yd[i] = f(xd[i]);
+    });
 }
 
 std::vector<int64_t> dims_of(const OnnxInit& t) { return t.dims; }
@@ -403,15 +455,13 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
             } else if (n.op == "Erf") {
                 const Tensor& a = need(n.ins[0]);
                 r.dims = a.dims;
-                r.data.resize(a.data.size());
-                for (size_t i = 0; i < a.data.size(); ++i) r.data[i] = std::erf(a.data[i]);
+                map_elements(a.data, &r.data, [](float v) { return std::erf(v); });
             } else if (n.op == "Gelu") {
                 const Tensor& a = need(n.ins[0]);
                 r.dims = a.dims;
-                r.data.resize(a.data.size());
                 const auto ap = n.attrs.find("approximate");
                 (void)ap;   // ONNX spells it as a string; the export here is 'none', which is what audio_ops::gelu_erf is
-                for (size_t i = 0; i < a.data.size(); ++i) r.data[i] = audio::gelu_erf(a.data[i]);
+                map_elements(a.data, &r.data, [](float v) { return audio::gelu_erf(v); });
             } else if (n.op == "LayerNormalization") {
                 const Tensor& a = need(n.ins[0]);
                 const Tensor& scale = init_f32(n.ins[1]);
@@ -455,16 +505,26 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                     in_stride[i - 1] = in_stride[i] * size_t(a.dims[i]);
                     out_stride[i - 1] = out_stride[i] * size_t(r.dims[i]);
                 }
-                std::vector<size_t> idx(perm.size(), 0);
-                for (size_t o = 0; o < r.data.size(); ++o) {
-                    size_t src = 0;
-                    for (size_t i = 0; i < idx.size(); ++i) src += idx[i] * in_stride[size_t(perm[i])];
-                    r.data[o] = a.data[src];
-                    for (size_t d = idx.size(); d-- > 0;) {
-                        if (++idx[d] < size_t(r.dims[d])) break;
-                        idx[d] = 0;
+                // engine#2366: kElemUnit-sized output ranges on the executor's threads, each starting its index walk from
+                // its first element. A copy, so any split is bit-identical.
+                const size_t total = r.data.size();
+                parallel_units((total + kElemUnit - 1) / kElemUnit, [&](size_t u) {
+                    const size_t o0 = u * kElemUnit, o1 = std::min(total, o0 + kElemUnit);
+                    std::vector<size_t> idx(perm.size(), 0);
+                    for (size_t d = 0, rem = o0; d < idx.size(); ++d) {
+                        idx[d] = rem / out_stride[d];
+                        rem %= out_stride[d];
                     }
-                }
+                    for (size_t o = o0; o < o1; ++o) {
+                        size_t src = 0;
+                        for (size_t i = 0; i < idx.size(); ++i) src += idx[i] * in_stride[size_t(perm[i])];
+                        r.data[o] = a.data[src];
+                        for (size_t d = idx.size(); d-- > 0;) {
+                            if (++idx[d] < size_t(r.dims[d])) break;
+                            idx[d] = 0;
+                        }
+                    }
+                });
             } else if (n.op == "Reshape") {
                 const Tensor& a = need(n.ins[0]);
                 std::vector<int64_t> want;

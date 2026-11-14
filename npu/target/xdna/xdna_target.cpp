@@ -166,7 +166,9 @@ bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string&
         ctx->MD = g->M; ctx->KD = g->K; ctx->ND = g->N;
         ctx->blocked_b = b8;
         if (!ctx->init_elf(*dev_, elf.c_str(), g->M, g->K, g->N, 1)) {
-            err = "I8Ctx init_elf failed for " + elf;
+            // engine#2434: carry the runtime's reason, so a refused context ("code 102 ... No such device") reaches
+            // open_with_retry's queue test and the lock-holder note instead of reading as a generic init failure.
+            err = "I8Ctx init_elf failed for " + elf + (ctx->init_error.empty() ? "" : ": " + ctx->init_error);
             return false;
         }
         std::fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s\n", q4nx_design_log_tag(g->role),
@@ -699,7 +701,7 @@ bool XdnaTarget::open_decode_family(Q4nxDesignGeom* designs16, int n, const std:
         }
         if (!c16->init_elf(*dev_, elf.c_str(), designs16[i].M, designs16[i].K, designs16[i].N, 1, kname.c_str())) {
             if (setup_.pb16i) {
-                err = "pb16i: init_elf failed for " + elf;
+                err = "pb16i: init_elf failed for " + elf + (c16->init_error.empty() ? "" : ": " + c16->init_error);  // engine#2434
                 return false;
             }
             std::fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "

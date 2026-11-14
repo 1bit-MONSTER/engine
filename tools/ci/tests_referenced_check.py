@@ -188,6 +188,19 @@ def unregistered_selftest_tools(root):
                 runner_text.append(f.read_text(errors="replace"))
             except OSError:
                 pass
+    # engine#2456: a COMMENT naming the script satisfied this gate, so a self-test with no runner read green.
+    # What the gate means is "a runner INVOKES this script", so the name has to appear on a line that is not a
+    # comment (and, for a shell/python runner, is not merely prose in a docstring). Reproduced on engine#2455: a
+    # comment in tests/pack_modes_test.sh mentioning scripts/window-run.sh turned this green with no row existing.
+    def invoked(name, text):
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+                continue
+            if name in stripped:
+                return True
+        return False
+
     drift = []
     for tool in sorted(cand):
         try:
@@ -196,7 +209,7 @@ def unregistered_selftest_tools(root):
             continue
         if not SELFTEST.search(src):
             continue
-        if not any(tool.name in text for text in runner_text):
+        if not any(invoked(tool.name, text) for text in runner_text):
             drift.append(str(tool.relative_to(root)))
     return drift
 
@@ -329,6 +342,21 @@ def self_test():
     r = root_with(dict(base, **{"scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
                                  "cmake/tests-helper.cmake": "add_test(NAME helper_self COMMAND bash scripts/helper.sh --self-test)\n"}))
     cases.append(("...and a registration in cmake/*.cmake clears it", check(r), 0, None))
+
+    # 0c. engine#2456: a COMMENT naming the self-test script must not satisfy the gate. Reproduced on
+    # engine#2455, where a comment in tests/pack_modes_test.sh mentioning scripts/window-run.sh turned this
+    # check green while no row existed. The pair is the arm: the same tree passes once the row is real.
+    r = root_with(dict(base, **{"scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
+                                 "tests/notes_test.sh": "#!/bin/sh\n# see scripts/helper.sh --self-test\n"}))
+    cases.append(("a comment naming the self-test is not a runner", check(r), 1, "helper.sh"))
+    cases_root["a comment naming the self-test is not a runner"] = r
+
+    r = root_with(dict(base, **{"scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
+                                 "tests/notes_test.sh": "#!/bin/sh\n# see scripts/helper.sh --self-test\n",
+                                 "CMakeLists.txt": base["CMakeLists.txt"] +
+                                     "add_test(NAME notes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/notes_test.sh)\n"
+                                     "add_test(NAME helper_self COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/helper.sh --self-test)\n"}))
+    cases.append(("...and a real row clears it even with the comment still there", check(r), 0, None))
 
     # 1. a test nobody mentions -> drift, and it is NAMED
     r = root_with({"tests/lonely.sh": "#!/bin/sh\n", "CMakeLists.txt": "# nothing here\n"})

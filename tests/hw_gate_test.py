@@ -190,6 +190,36 @@ def main():
             f.write(b"x")
         if subprocess.run([sys.executable, MAN, "verify", man2, "m", base, model, text], capture_output=True).returncode != 1:
             bad.append("verify must refuse a changed base")
+
+        # recorded_at: a pin that cannot be read is null AND named on stderr with the exception type (#2362).
+        # Nothing consumes recorded_at, so this arm is the only thing that would notice "unknown" coming back,
+        # or a None with the message dropped. Two unresolvable refs, each in a repo of its own (a bare temp dir
+        # could sit inside some other checkout and read that checkout's pins):
+        #   no commit at all -> `git ls-tree HEAD` fails  -> CalledProcessError
+        #   a commit without the submodule rows -> no line -> IndexError
+        git_env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                       GIT_COMMITTER_EMAIL="t@t")
+        empty, norows = os.path.join(d, "pin-empty"), os.path.join(d, "pin-norows")
+        for repo in (empty, norows):
+            subprocess.run(["git", "init", "-q", repo], check=True, env=git_env)
+        subprocess.run(["git", "-C", norows, "commit", "-q", "--allow-empty", "-m", "x"], check=True, env=git_env)
+        read_pins = ("import json, sys; sys.path.insert(0, sys.argv[1]); import hw_gate_manifest as h; "
+                     "print(json.dumps(h.pins(sys.argv[2])))")
+        for repo, exc in ((empty, "CalledProcessError"), (norows, "IndexError")):
+            p = subprocess.run([sys.executable, "-c", read_pins, os.path.join(ROOT, "tools"), repo],
+                               capture_output=True, text=True)
+            name = os.path.basename(repo)
+            try:
+                got = json.loads(p.stdout)
+            except ValueError:
+                bad.append(f"pins {name}: rc {p.returncode}, no JSON on stdout: {p.stdout!r} {p.stderr!r}")
+                continue
+            for sub in ("llama.cpp", "hrx-system"):
+                if sub not in got or got[sub] is not None:
+                    bad.append(f"pins {name}: {sub} must be null when unreadable, got {got.get(sub, '<missing>')!r}")
+                said = [l for l in p.stderr.splitlines() if "third_party/" + sub in l]
+                if not said or exc not in said[0]:
+                    bad.append(f"pins {name}: stderr must name third_party/{sub} and {exc}; said {p.stderr.strip()!r}")
     srv.shutdown()
     for b in bad:
         print("FAIL:", b)

@@ -106,6 +106,13 @@ check("empty backends -> uncovered", rc == 1 and res[cw.UNCOVERED] == ["c/three"
 # 4. A reviewed not-an-alias class is still the alert, and is labeled as such.
 rc, res = rc_of([model("d/four", "Qwen3_5MVLAAbsorbedForCausalLM")])
 check("significant class -> uncovered, exit 1", rc == 1)
+# engine#2427: the count is not the demand. Four models of one class under one org is ONE mapping decision, and a
+# row that says "4 model(s)" reads like four people asking. REMOTE-CODE has printed the uploader count since the
+# spread rule landed; UNCOVERED now does too, so the two rows can be compared.
+_rco, _rtxt = text_of([model(f"same/{i}", "OneOrgForCausalLM") for i in range(4)])
+check("one org, four models -> says 1 uploader", "from 1 uploader(s)" in _rtxt)
+_rco, _rtxt = text_of([model(f"org{i}/m", "SpreadForCausalLM") for i in range(3)])
+check("three orgs -> says 3 uploader(s)", "from 3 uploader(s)" in _rtxt)
 check("significant class is labeled", res["significant"] == ["Qwen3_5MVLAAbsorbedForCausalLM"])
 
 # 4b. A custom-code class (auto_map) from fewer than REMOTE_CODE_SPREAD uploaders is reported,

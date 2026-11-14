@@ -937,11 +937,16 @@ def report(models, res, previously_seen):
                   f"alerts once {REMOTE_CODE_SPREAD} uploaders use it")
         elif cls in res["significant"]:
             print(f"  !! UNCOVERED {cls} (reviewed, not an alias — docs/arch-gaps.md): "
-                  f"{len(ids)} model(s), e.g. {ids[0]}")
+                  f"{len(ids)} model(s) from {len({i.split('/')[0] for i in ids})} uploader(s), e.g. {ids[0]}")
             print(f"     -> needs real engine support, not a mapping; if a backend starts "
                   f"accepting it, record why in registry/significant.json ('mapped_ok')")
         else:
-            print(f"  !! UNCOVERED {cls} (new class): {len(ids)} model(s), e.g. {ids[0]}")
+            # engine#2427: REMOTE-CODE already says how many uploaders a class spans, and UNCOVERED did not -- so
+            # four models of one class under one org read the same as four orgs standardising on it, and the first
+            # is one mapping decision while the second is demand. The registry grows entries nobody asked for when
+            # a count reads as demand.
+            print(f"  !! UNCOVERED {cls} (new class): {len(ids)} model(s) from "
+                  f"{len({i.split('/')[0] for i in ids})} uploader(s), e.g. {ids[0]}")
             # engine#1922: the registry is GENERATED from the pinned sources, so "not in the registry" cannot by itself
             # say whether a pin bump would fix this or whether nobody upstream has it. Say which, when it is knowable.
             verdict = res.get("upstream_verdict", {}).get(cls, "unknown")

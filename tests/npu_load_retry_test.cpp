@@ -137,6 +137,16 @@ int main() {
                "a submit that failed with an ordinary errno is not the dead-array case");
         expect(std::string(onebit::npu_contexts_refused_hint()).find("modprobe") != std::string::npos,
                "the hint names the one action that works");
+        // engine#2434: forward-serve's error as it reaches open_with_retry. Before the fix the runtime's reason stayed
+        // on stderr and the error was only "...init_elf failed for <elf>", which is NOT a refused context, so a live
+        // co-tenant got the short window (measured: 5 attempts in 2.3 s) instead of the queue. With the reason
+        // carried (xdna_target.cpp, I8Ctx::init_error) it is recognised, and the queue window applies (7 attempts
+        // over an 8 s window, then the hint, measured against a live FLM serve holding the array on strixhalo).
+        expect(!onebit::npu_contexts_refused("forward init failed: I8Ctx init_elf failed for /k/full_i8_QKV_K1024_N4096.elf"),
+               "the cause-less forward error cannot be queued: why the reason has to travel with it");
+        expect(onebit::npu_contexts_refused("forward init failed: I8Ctx init_elf failed for /k/full_i8_QKV_K1024_N4096.elf: "
+                                            "npu runtime: device error (code 102): No such device"),
+               "the forward error with the runtime's reason is a refused context");
 
         LoadRetryPolicy p;
         p.window_s = 0.05;

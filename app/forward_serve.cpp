@@ -1321,6 +1321,7 @@ int run_forward_serve(int argc, char** argv) {
     bool spec_sample = false;        // --spec-sample: sampled requests speculate too (distribution-keeping rule)
     std::string spec_draft;          // --spec-draft <dir>: a DFlash draft package as the drafter
     int spec_draft_k = 0;            // --spec-draft-k K: drafts per round (default: the package's block - 1)
+    int load_queue_ms = 45000;       // --load-queue-ms N (engine#2434): how long a refused NPU context is queued (serve's default)
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -1345,6 +1346,7 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--spec-sample") spec_sample = true;
         else if (a == "--spec-draft") spec_draft = next();
         else if (a == "--spec-draft-k") spec_draft_k = std::stoi(next());
+        else if (a == "--load-queue-ms") load_queue_ms = std::stoi(next());
         else throw std::runtime_error("unknown option " + a);
     }
     if (model.empty())
@@ -1352,6 +1354,7 @@ int run_forward_serve(int argc, char** argv) {
     if (!spec_draft.empty() && spec_lookup > 0)
         throw std::runtime_error("--spec-draft and --spec-lookup are two drafters; give one");
     if (spec_draft_k != 0 && spec_draft.empty()) throw std::runtime_error("--spec-draft-k needs --spec-draft");
+    if (load_queue_ms < 0) throw std::runtime_error("--load-queue-ms takes milliseconds >= 0, not " + std::to_string(load_queue_ms));
     if (spec_lookup < 0 || spec_lookup > 15)
         throw std::runtime_error("--spec-lookup takes 0..15 drafts per round (a verify batch holds at most 16 rows), not " +
                                  std::to_string(spec_lookup));
@@ -1555,20 +1558,25 @@ int run_forward_serve(int argc, char** argv) {
     e.host_gemm = host_gemm;
     if (npu_lock_taken(!host_gemm, std::getenv("NPU_NO_DEVICE_LOCK") != nullptr))
         e.lock_fd = take_npu_device_lock(streams);
+    // engine#2434: the driver refuses a context with code 102 / ENODEV while ANOTHER client holds the array's columns
+    // (a co-tenant: FastFlowLM, another engine), the same answer a dead array gives. unified.cpp's routes already queue
+    // on that (open_with_retry: a refused context waits --load-queue-ms, then names the lock holder and the reload
+    // hint); this route made one attempt and exited in ~0 s, so a live co-tenant read as a broken device. Each attempt
+    // starts from a fresh forward and device handle, so nothing a failed init left half-built is reused.
     std::unique_ptr<xrt::device> dev;
-    if (!host_gemm) dev = std::make_unique<xrt::device>(0);
-    const bool ok = dev ? e.fwd->init(*dev, model.c_str(), kernels) : e.fwd->init_host(model.c_str(), kernels);
-    if (!ok) {
-        const std::string why = std::string("forward init failed: ") + e.fwd->last_error();
-        // engine#1241 cure 2: the driver refuses a second client with code 102 / ENODEV, the same message a dead array
-        // answers, so "No such device" reads as a broken device or ELF. If another pid holds the device lock, say so
-        // now: the array is merely owned, and the fix is to wait for that process, not to rebuild anything.
-        if (npu_contexts_refused(why)) {
-            const std::string held = npu_lock_refusal_note();
-            if (!held.empty()) std::fprintf(stderr, "%s\n", held.c_str());
-        }
-        throw std::runtime_error(why);
-    }
+    onebit::LoadRetryPolicy load_policy;
+    load_policy.refusal_window_s = load_queue_ms / 1000.0;
+    onebit::open_with_retry(
+        load_policy, "initialising the forward NPU context",
+        [&] {
+            e.fwd = std::make_unique<Q4nxNpuForward>();
+            dev.reset();
+            if (!host_gemm) dev = std::make_unique<xrt::device>(0);
+            const bool ok = dev ? e.fwd->init(*dev, model.c_str(), kernels) : e.fwd->init_host(model.c_str(), kernels);
+            if (!ok) throw std::runtime_error(std::string("forward init failed: ") + e.fwd->last_error());
+        },
+        [](const std::string& line) { std::fprintf(stderr, "1bit forward-serve: %s\n", line.c_str()); },
+        [](double s) { std::this_thread::sleep_for(std::chrono::duration<double>(s)); });
     // engine#2263: loading a pack writes into the Q4NX cache (the device-form copy, the head images) and, until this, only a
     // GGUF repack swept it -- so a box that serves packs, or runs reviews through npu-run, grew it without bound.
     q4nx_cache_sweep_after_load();

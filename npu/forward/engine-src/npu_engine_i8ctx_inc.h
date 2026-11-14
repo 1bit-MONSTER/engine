@@ -78,6 +78,10 @@ struct I8Ctx {
     std::vector<std::unique_ptr<xrt::bo>> layerB;     // weight BOs
     int8_t* Am;
     int32_t* Cm;
+    // engine#2434: why the last init_elf threw (the runtime's own message, e.g. "npu runtime: device error (code 102):
+    // No such device"). init_elf returns bool, so without this the cause reached stderr only and every caller's error
+    // said "init_elf failed" -- which is why a context refused by a co-tenant could not be told from any other failure.
+    std::string init_error;
     std::vector<std::vector<float>> group_scales;
     bool initialized = false;
 
@@ -188,6 +192,7 @@ struct I8Ctx {
     bool init_elf(xrt::device& d, const char* ep, int M, int K, int N,
                   int nlayers, const char* kname = "main:seq") {
         MD = M; KD = K; ND = N; NL = nlayers;
+        init_error.clear();
         fprintf(stderr, "  I8Ctx::init_elf ep=%s M=%d K=%d N=%d nl=%d\n",
                 ep, M, K, N, nlayers);
         // The blocked image is built from whole 64x128 tiles: a geometry that is
@@ -235,6 +240,7 @@ struct I8Ctx {
                     ep, key.c_str(), kname, host_->kernels.size());
         } catch (std::exception& ex) {
             fprintf(stderr, "  I8Ctx::init_elf failed: %s\n", ex.what());
+            init_error = ex.what();
             return false;
         }
         // A group-less xrt::bo is rejected by the amdxdna driver ("unsupported

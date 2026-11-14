@@ -3479,6 +3479,8 @@ int run_serve(int argc, char** argv) {
                 // The context limit reaches this route too: it used to stop here, so `serve --ctx-size N` on a
                 // model-generic container was accepted and the forward kept the model's own limit.
                 if (o.ctx_size > 0) { fargs.push_back("--ctx-size"); fargs.push_back(std::to_string(o.ctx_size)); }
+                // engine#2434: the queue window for a refused NPU context, as the unified routes get it.
+                fargs.push_back("--load-queue-ms"); fargs.push_back(std::to_string(o.load_queue_ms));
                 std::vector<char*> fav;
                 for (auto& a : fargs) fav.push_back(a.data());
                 return run_forward_serve(int(fav.size()), fav.data());
@@ -3619,6 +3621,7 @@ int run_serve(int argc, char** argv) {
                                          "-p", std::to_string(o.port), "--host", o.host};
         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
         if (o.npu_streams > 1) { args.push_back("--npu-streams"); args.push_back(std::to_string(o.npu_streams)); }
+        args.push_back("--load-queue-ms"); args.push_back(std::to_string(o.load_queue_ms));   // engine#2434
         std::vector<char*> av;
         for (auto& s : args) av.push_back(s.data());
         return run_forward_serve(int(av.size()), av.data());

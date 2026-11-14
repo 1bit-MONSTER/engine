@@ -70,6 +70,61 @@ def gh(path, paginate=False):
 VERDICT_LINE = re.compile(r'^[^A-Za-z0-9]*VERDICT\b', re.MULTILINE)
 
 
+VERDICT_KIND = re.compile(r'^[^A-Za-z0-9]*VERDICT\b[^\n]*', re.MULTILINE)
+
+
+def verdict_kind(body):
+    """'READY' / 'CHANGES' / None from a verdict line.
+
+    Three forms are in use and a queue that reads only one of them is wrong about the other two: `VERDICT: READY at
+    `abc1234``, `VERDICT: CHANGES at `abc1234``, and the two older shapes `VERDICT: APPROVE at `abc1234`` /
+    `VERDICT at `abc1234`: READY`. The kind is the first token after the word VERDICT that is one of the known ones.
+    """
+    found = VERDICT_KIND.search(body or '')
+    if not found:
+        return None
+    words = re.findall(r'[A-Z][A-Z_-]+', found.group(0))
+    for word in words[1:]:
+        if word in ('READY', 'APPROVE', 'APPROVED'):
+            return 'READY'
+        # `NEEDS-CHANGE`, `CHANGES-REQUESTED`, `NOT-READY`: a lane writes the verdict in prose as often as in the
+        # two canonical words, and treating those as "no verdict" makes the newest RECOGNISED verdict win -- which
+        # is how engine#2397 read as READY here while its newest line said `VERDICT: NEEDS-CHANGE at this head`.
+        if word in ('CHANGES', 'CHANGES_REQUESTED', 'CHANGES-REQUESTED', 'CHANGE', 'NEEDS-CHANGE', 'NEEDS-CHANGES',
+                    'REQUEST-CHANGES', 'NOT-READY'):
+            return 'CHANGES'
+    return 'OTHER'   # a verdict line whose kind this does not know: say so, never fall through to an older READY
+
+
+def newest_verdict(reviews, comments, head):
+    """(kind, timestamp, head_named) for the newest verdict object that names this head, or None.
+
+    Newest across BOTH object types, because the merge gate holds on the newest one and the two are posted minutes
+    apart by different lanes: on engine#2369 the same head carried four verdicts inside 35 seconds -- CHANGES, a
+    comment CHANGES, a READY, another comment CHANGES -- and a tool that read reviews only would have called it
+    reviewed-and-clean.
+    """
+    named = None      # newest verdict that names THIS head
+    any_verdict = None  # newest verdict-shaped object, head named or not
+    for item in list(reviews) + list(comments):
+        body = item.get('body') or ''
+        kind = verdict_kind(body)
+        if kind is None:
+            continue
+        when = item.get('submitted_at') or item.get('created_at') or ''
+        if any_verdict is None or when > any_verdict[1]:
+            any_verdict = (kind, when)
+        if head in body and (named is None or when > named[1]):
+            named = (kind, when)
+    if any_verdict is not None and (named is None or any_verdict[1] > named[1]):
+        # A verdict newer than the last one that names the head: `VERDICT: NEEDS-CHANGE at this head` is a real
+        # line a lane wrote on engine#2397 and it carries no sha, so the attributed answer there was an older
+        # READY. Reporting the old READY as current is the failure the queue exists to prevent, so say what
+        # actually happened instead of choosing between two wrong answers.
+        return ('UNATTRIBUTED', any_verdict[1])
+    return named
+
+
 def reviewed_at(reviews, head):
     """True if any review OR COMMENT body carries a VERDICT line naming this head prefix.
 
@@ -154,15 +209,82 @@ def self_test():
     return rc
 
 
+def state(repos):
+    """Per open PR: the newest verdict object, and whether it is a CHANGES at the current head.
+
+    `queue()` answers "is anybody home"; this answers "what does the record say right now", which is the question a
+    lane asks when a CHANGES is holding the gate and it cannot tell whether the author answered it.
+    """
+    rows = []
+    for repo in repos:
+        prs = json.loads(gh(f'repos/{OWNER}/{repo}/pulls?state=open&per_page={PAGE}', paginate=True) or '[]')
+        for pr in prs:
+            if pr.get('draft'):
+                continue
+            head = ((pr.get('head') or {}).get('sha') or '')[:7]   # verdicts name the 7-hex prefix
+            revs = json.loads(gh(f"repos/{OWNER}/{repo}/pulls/{pr['number']}/reviews", paginate=True) or '[]')
+            coms = json.loads(gh(f"repos/{OWNER}/{repo}/issues/{pr['number']}/comments", paginate=True) or '[]')
+            newest = newest_verdict(revs, coms, head)
+            rows.append({'repo': repo, 'number': pr['number'], 'head': head[:7],
+                         'kind': newest[0] if newest else None,
+                         'at': newest[1] if newest else None,
+                         'title': (pr.get('title') or '')[:60]})
+    return rows
+
+
+def self_test_state():
+    """The two shapes that made `--state` lie until they were run against the live queue."""
+    problems = []
+
+    def chk(want, got, what):
+        if want != got:
+            problems.append(f"{what}: want {want!r}, got {got!r}")
+
+    revs = [{'body': 'VERDICT at `abc1234`: READY', 'submitted_at': '2026-11-14T03:37:05Z'}]
+    coms = [{'body': 'VERDICT: NEEDS-CHANGE at this head -- the rule', 'created_at': '2026-11-14T03:57:04Z'}]
+    chk(('UNATTRIBUTED', '2026-11-14T03:57:04Z'), newest_verdict(revs, coms, 'abc1234'),
+        'a newer verdict that does not name the head is UNATTRIBUTED, not the older READY')
+    chk('CHANGES', verdict_kind('VERDICT: NEEDS-CHANGE at this head'), 'NEEDS-CHANGE is a change request')
+    chk('OTHER', verdict_kind('VERDICT: something nobody has seen before'),
+        'an unknown kind is OTHER, never a silent none')
+
+    # the attributed case must still prefer the newest NAMED verdict
+    revs2 = [{'body': 'VERDICT: CHANGES at `abc1234`', 'submitted_at': '2026-11-14T03:00:00Z'},
+             {'body': 'VERDICT: READY at `abc1234`', 'submitted_at': '2026-11-14T03:10:00Z'}]
+    chk(('READY', '2026-11-14T03:10:00Z'), newest_verdict(revs2, [], 'abc1234'),
+        'the newest verdict that names the head wins')
+
+    if problems:
+        for problem in problems:
+            print('FAIL ' + problem)
+        return 1
+    print('pr_review_queue --state self-test: ok')
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--repos', nargs='+', default=list(DEFAULT_REPOS))
     ap.add_argument('--min-age-hours', type=float, default=0.0)
     ap.add_argument('--json', action='store_true')
     ap.add_argument('--self-test', action='store_true')
+    ap.add_argument('--state', action='store_true',
+                    help='per open PR: the newest verdict object across reviews and comments')
     a = ap.parse_args(argv)
     if a.self_test:
-        return self_test()
+        return self_test() if not a.state else self_test_state()
+    if a.state:
+        rows = state(a.repos)
+        if a.json:
+            print(json.dumps(rows, indent=1))
+            return 0
+        for row in rows:
+            kind = row['kind'] or 'none'
+            print(f"  {row['repo']:12} #{row['number']:<5} head={row['head']}  newest={kind:8} "
+                  f"{row['at'] or '-':20}  {row['title']}")
+        held = [row for row in rows if row['kind'] == 'CHANGES']
+        print(f"pr_review_queue --state: {len(rows)} open PR(s), {len(held)} whose newest verdict is CHANGES")
+        return 0
     q = queue(a.repos, a.min_age_hours)
     if a.json:
         print(json.dumps(q, indent=1))

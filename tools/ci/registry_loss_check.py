@@ -212,6 +212,16 @@ def main():
             if base_counts[name] and not head_counts[name]:
                 lost_mentions.append(f"{name}: {base_counts[name]} mention(s) under tests/ on the base, 0 at the head")
 
+    # The check reads commits: `git show <ref>:<path>`. Uncommitted work is invisible to it, so say so
+    # rather than letting a dirty tree read as a clean one (the shape this lane keeps finding).
+    if args.head == "HEAD":
+        dirty = git("status", "--porcelain")
+        # tracked modifications only: an untracked build directory is not a registry change
+        changed = [line for line in dirty.stdout.splitlines() if line.strip() and not line.startswith("??")]
+        if changed and not args.quiet:
+            print(f"registry_loss_check: HEAD is what was read; {len(changed)} uncommitted path(s) are NOT included "
+                  f"- commit them and re-run to check the branch you are handing over")
+
     if not args.quiet:
         print(f"registry_loss_check: base {args.base} has {len(base_classes)} class(es), head {args.head} has "
               f"{len(head_classes)}")

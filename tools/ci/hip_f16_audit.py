@@ -112,6 +112,25 @@ def head_sha(tree):
     return got.stdout.strip() if got.returncode == 0 else None
 
 
+def addon_dir_mistake(root):
+    """The sentence to print when `root` is `<checkout>/addons/hip-hrx` rather than the checkout.
+
+    engine#2439's hw-gate call passed the value `fetch-private.sh` echoes (`<dest>/<path>`, i.e. the add-on
+    directory `-DGGML_HRX_HIP_ADDON_DIR` wants) where this tool wants the checkout, so the walk looked for
+    `<checkout>/addons/hip-hrx/addons/hip-hrx/kernels`. The old message was "not a directory - cannot tell",
+    which is true, sends the reader to the kernels, and cost a round trip (engine#2442). Returns None when the
+    directory is not that mistake.
+    """
+    here = Path(root)
+    if not (here / "kernels").is_dir() or (here / "addons").is_dir():
+        return None                      # not shaped like an add-on directory; let the caller report normally
+    checkout = here.parent.parent
+    if not (checkout / KERNEL_SUBDIR).is_dir():
+        return None                      # nothing up there either: the reader's path is wrong in another way
+    return (f"hip_f16_audit: {root} is the add-on directory; pass the gpu-kernels checkout instead "
+            f"({checkout}, whose {KERNEL_SUBDIR} is the tree this audits)")
+
+
 def audit(root):
     kernels = Path(root) / KERNEL_SUBDIR
     if not kernels.is_dir():
@@ -236,6 +255,15 @@ def self_test():
         ordered = sorted(rows2, key=lambda r: (-r["narrowings"], -len(r["accumulators"]), r["file"]))
         chk("busy.hip", ordered[0]["file"], "the file with the most narrowings sorts first")
         chk(2, ordered[0]["narrowings"], "and its count is the count")
+
+        # the engine#2439 mistake: the add-on directory handed in as if it were the checkout
+        (Path(tmp) / "checkout" / "addons" / "hip-hrx" / "kernels").mkdir(parents=True)
+        addon = str(Path(tmp) / "checkout" / "addons" / "hip-hrx")
+        said = addon_dir_mistake(addon) or ""
+        chk(True, "is the add-on directory; pass the gpu-kernels checkout instead" in said and
+                  str(Path(tmp) / "checkout") in said, "the add-on directory is named as the mistake it is")
+        chk(None, addon_dir_mistake(str(Path(tmp) / "checkout")), "the checkout itself is not that mistake")
+        chk(None, addon_dir_mistake(tempfile.mkdtemp()), "an unrelated empty directory is not that mistake")
 
         chk(None, audit("/nonexistent-path-xyz"), "an unreadable tree is None, not an empty pass")
 
@@ -371,6 +399,10 @@ def main(argv):
             return 2
     rows = audit(a.dir)
     if rows is None:
+        mistaken = addon_dir_mistake(a.dir)
+        if mistaken is not None:
+            print(mistaken, file=sys.stderr)
+            return 2
         print(f"hip_f16_audit: {Path(a.dir) / KERNEL_SUBDIR} is not a directory - cannot tell, "
               f"and that is not a pass", file=sys.stderr)
         return 2

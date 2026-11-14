@@ -4345,6 +4345,27 @@ void test_fconst_block_headers() {
         check(inner.size() == 2 && inner[0] == 300 && inner[1] == 900,
               "block headers: a header in half the blocks still clears the floor (mixed-layer pack)");
     }
+    // Review of #2021: when the mode is a payload coincidence, half of it can exceed the real headers. Three real headers in
+    // 6 blocks (6 hits each) and one residue at 20 hits: the floor is 10 and keeps only the residue, which
+    // `fconst_set_block_headers` would accept as a 2-header block. It must refuse instead.
+    {
+        std::vector<int64_t> pos = blocks({300, 320, 340}, 6, {});
+        for (int i = 0; i < 20; ++i) pos.push_back(7 * stride + 1234 + int64_t(i) * stride);   // residue 234, 20 hits
+        std::sort(pos.begin(), pos.end());
+        const auto inner = pi::fconst_block_headers_observed(pos, stride);
+        pi::FconstGeom g;
+        g.stride = stride;
+        check(inner.empty() && !pi::fconst_set_block_headers(g, inner) && g.hdr.empty() && g.period == 0,
+              "block headers: a dominant coincidence (reals x6, noise x20) is refused, not read as a 2-header block");
+    }
+    // ...and a real 2-header block through the same path still imports: one inner header, stray residues at 1-2 hits.
+    {
+        const auto inner = pi::fconst_block_headers_observed(blocks({400}, 8, {1234, 5678, 5678}), stride);
+        pi::FconstGeom g;
+        g.stride = stride;
+        check(inner.size() == 1 && inner[0] == 400 && pi::fconst_set_block_headers(g, inner) && g.period == 2,
+              "block headers: a real 2-header block with stray coincidences still imports through the observed floor");
+    }
 
     // coincidences alone are not a header, and a count that is neither 1 nor 3 sets nothing
     {

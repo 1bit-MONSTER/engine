@@ -1871,6 +1871,17 @@ std::vector<int64_t> fconst_block_headers_observed(const std::vector<int64_t>& p
     const int floor_count = std::max(3, most / 2);
     for (const auto& [r, n] : count)
         if (n >= floor_count) out.push_back(r);
+    // A floor taken from the mode is only meaningful if the mode is a real header. `fconst_set_block_headers` accepts ONE
+    // offset as a 2-header block, so when the cut leaves one, a dominant payload coincidence would become a silent layout
+    // instead of a refusal (review of #2021: 3 real headers x6 blocks + one residue x20 -> floor 10 keeps only the
+    // residue). A real 2-header block has exactly one recurring inner offset, so every other residue must stay below the
+    // constant floor 3 that main used; if one does not, return nothing and the caller refuses. This is never more
+    // permissive than the constant: under it a second residue at >= 3 already gave two offsets, which is refused too.
+    // (A ">= 2x the next residue" test does not catch the review's case: 20 >= 2 x 6.)
+    if (out.size() == 1) {
+        for (const auto& [r, n] : count)
+            if (r != out.front() && n >= 3) return {};
+    }
     return out;
 }
 

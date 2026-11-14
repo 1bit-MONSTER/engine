@@ -41,7 +41,7 @@ This repository exists to be reviewable. Five rules keep it that way.
    template that emits the notice into a generated file) and is left alone;
    the three such files say so in a comment.
 
-Before you ask for a merge, run `scripts/pre-pr-checks.sh`. It runs the six host-side checks described in
+Before you ask for a merge, run `scripts/pre-pr-checks.sh`. It runs the host-side checks described in
 [docs/pre-pr-checks.md](docs/pre-pr-checks.md) and prints one line each (`--base <ref>` for the registration check, `--list`
 to see the commands); a check that cannot run says `skip` and why, and an unresolvable `--base` is a usage error rather than a
 skip. None of them needs a device or a build, and each answers a question that a green CI tick and a careful read of your own

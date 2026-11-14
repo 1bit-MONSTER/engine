@@ -784,6 +784,10 @@ payload_modes_noexec() {   # <payload dir> -> the binaries present but not execu
     # makes hrx-placement SKIP (`[ -x ]` cannot find a runnable engine), so the check was green over a payload that cannot run.
     # Absence is deliberately NOT an offender: a binary that is not here is hrx-device's or identity's claim, and a payload still
     # being extracted is caught by the entry floor above.
+    #
+    # `[ -x ]` is the right predicate and NOT a stricter "is it 0755" (engine#2424's phrasing, worth keeping): the appliance runs as
+    # root, and access(2) documents that a real UID of zero passes X_OK "if execute permission is enabled for any of the file owner,
+    # group, or other". So the property is *can it execute*, which is exactly what the row that would start the engine tests.
     _pe_dir=${1:-} _pe_out=
     for _pe_b in "$_pe_dir/1bit/1bit" "$_pe_dir/bin/lemond" "$_pe_dir/lemond-onebit"; do
         [ -f "$_pe_b" ] || continue

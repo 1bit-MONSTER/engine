@@ -62,14 +62,23 @@ def model_fingerprint(path):
 
 
 def pins(root):
+    """The two submodule pins, or None for a submodule whose pin could not be read.
+
+    This used to write the string "unknown" into the manifest's `recorded_at`, and NOTHING consumes that field
+    (`grep -rn recorded_at` finds only this writer), so a `git ls-tree` failure produced an artifact that still
+    looked like a record of what ran. `recorded_at` is a name that promises commit ids: an unreadable pin is
+    recorded as **null** and said out loud, rather than as a value a reader would have to know is a placeholder.
+    """
     out = {}
     for sub in ("llama.cpp", "hrx-system"):
         try:
             line = subprocess.run(["git", "-C", root, "ls-tree", "HEAD", "third_party/" + sub],
                                   capture_output=True, text=True, check=True).stdout.split()
             out[sub] = line[2]
-        except (subprocess.CalledProcessError, IndexError):
-            out[sub] = "unknown"
+        except (subprocess.CalledProcessError, IndexError) as exc:
+            print(f"hw_gate_manifest: could not read the pin of third_party/{sub} - recording null "
+                  f"({type(exc).__name__})", file=sys.stderr)
+            out[sub] = None
     return out
 
 
@@ -189,6 +198,11 @@ def cmd_memcheck(model, llama_dir):
         try:
             led = json.loads(p.stdout)
         except ValueError:
+            # Not a refusal, by this function's contract: mem-guard.sh still guards the step. But say so - a
+            # pre-check that fails silently reads as "ok" in the log, and "I could not measure" is not "there is
+            # 0 GiB in use" (tools/ci's own doc_section_loss/lane_syntax rule, one level up).
+            print("memory pre-check: could not read tools/mem_budget.py box output - not refusing "
+                  "(scripts/mem-guard.sh still guards this step)", file=sys.stderr)
             return 0
         used = led.get("gtt_used", 0) / g
         avail = led["mem_available"] / g
@@ -203,6 +217,9 @@ def cmd_memcheck(model, llama_dir):
     try:
         r = json.loads(p.stdout)
     except ValueError:
+        print(f"memory pre-check: could not read tools/mem_budget.py model output for "
+              f"{os.path.basename(model)} - not refusing (scripts/mem-guard.sh still guards this step)",
+              file=sys.stderr)
         return 0
     msg = (f"memory pre-check: {os.path.basename(model)} needs {r['need'] / g:.1f} GiB, GTT after load "
            f"{r['gtt_used_after'] / g:.1f} GiB, MemAvailable {r['mem_available'] / g:.1f} GiB")

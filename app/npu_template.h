@@ -61,6 +61,7 @@
 #include "jinja/parser.h"
 #include "jinja/runtime.h"
 #include "jinja/value.h"
+#include "json.h"         // common_json, the fork's JSON type global_from_json takes (engine#2138)
 #endif
 
 namespace onebit::npu {
@@ -212,7 +213,9 @@ inline std::string render_chat_template(const ChatTemplate& tmpl, const nlohmann
         if (tmpl.wants_user_system_prompt && !in.contains("user_system_prompt")) in["user_system_prompt"] = "";
         // mark_input=true: everything that came in as data (messages, tool arguments, extra request
         // fields) is marked, so the tokenizer can refuse to parse special tokens inside it.
-        jinja::global_from_json(ctx, in, /*mark_input=*/true);
+        // The fork's renderer takes its own common_json (common/json.h, an ordered_json underneath since
+        // llama.cpp #327), so the round trip through text keeps the order set above.
+        jinja::global_from_json(ctx, common_json::parse(in.dump()), /*mark_input=*/true);
 
         jinja::runtime runtime(ctx);
         const jinja::value result = runtime.execute(prog);

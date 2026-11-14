@@ -19,12 +19,63 @@
 # perfectly correct. What the list buys is that a NEW narrowing body cannot appear without someone
 # writing it down and saying what feeds it -- and that is the open question on engine#1962: which of
 # these are protected by a producer-side prescale cannot be answered by reading them.
+#
+# engine#2138 (pin 2f7f04f0d..ca5aac715, llama.cpp #327's AMD merge + #345): 34 bodies added, 1 dropped, 1 recount.
+# What feeds each new body is the producer of its fptrunc operand. A script classified them; I checked the
+# activation and projection classes against matmul_id/skinny_input_f32_dequant_accumulate_f32,
+# matmul/tiled_input_f32_dequant_accumulate_f32 and matmul_id/f16_projection_q4k (the rest share their shape):
+#   f32 ACTIVATION narrowed for an f16 WMMA tile, no guard marker (engine#1962's open question; nothing upstream of
+#   these is known to prescale): matmul/tiled_input_f32_{,codebook_}dequant_accumulate_f32{,_token64},
+#   matmul/tiled_pair_input_f32_dequant_accumulate_f32, matmul/vector_q6_f32_body, matmul_id/{skinny,tiled,pair}_input_
+#   f32_dequant_accumulate_f32, matmul_id/f16_pair_accumulate, copy/convert_f32_f16.
+#   ROUTED f16 projections, AMD's composable copies (matmul_id/f16_projection_q{4,5,6}k): the dequantized value and the
+#   loaded activation are narrowed with NO guard marker, where this line's mul_mat_id_q{4,5,6}k_f16_wmma_projection carry
+#   one (hrx_f16_guards.txt, engine#2127). They are library sources of the dispatched
+#   ggml_mul_mat_id_swiglu_f32_f32_wmma{,_iq3s_table}. Whether those kernels reach these functions is not established.
+#   DEQUANTIZED WEIGHTS (bounded by the format's scale): the dequant callers in the matmul motifs above, the
+#   rmsnorm-weight multiplies in gated_delta_net/rmsnorm_gate and ops/rows/get_rows_rmsnorm_binary_q8_1_x4_f16;
+#   dequant.loom 20 -> 21 is #345's ggml_codebook_f16_vector4.
+#   ATTENTION probabilities and softmax scales (in [0,1] or a 1/sum): flash_attention/{online_softmax,decode_partials,
+#   qk_block_wmma,pv_block_wmma,publish_f32}.
+#   PUBLISHED OUTPUTS stored as f16 (a result's own range; a KV cache or a normalized row): rows/cache_publish,
+#   attention/rmsnorm_neox_cache_f16, ops/llm/llm_attention_{k_matmul_rope,v_matmul}_set_rows_vector_f32_f32,
+#   matmul/{tiled,vector}_publish, matmul_id/f16_pair_binary_publish, normalization/{publish_f16,rmsnorm_binary}.
+#   q8_1 BLOCK scale d and scaled sum s (engine#2186 item 2's class): quantize_q8_1_x4_group, normalization/
+#   rmsnorm_q8_1_x4, matmul_id/vector_pair.
+#   STATE: gated_delta_net/scan_state_head128 (54 lines, the recurrent state and its deltas).
+#   TEST-ONLY kernel: ops/flash_attention/decode_split_next_q8_test.
+# Dropped: qwen_moe/qwen3_moe/attention_postprocess_f32_f16.loom no longer narrows (3 -> 0 at this pin).
+loom-libs/motifs/attention/rmsnorm_neox_cache_f16.loom	3
 loom-libs/motifs/bf16_f16.loom	1
-loom-libs/motifs/dequant.loom	20
+loom-libs/motifs/copy/convert_f32_f16.loom	2
+loom-libs/motifs/dequant.loom	21
 loom-libs/motifs/dequant_1bit.loom	5
 loom-libs/motifs/dequant_prism.loom	2
 loom-libs/motifs/f32_f16.loom	1
+loom-libs/motifs/flash_attention/decode_partials.loom	2
+loom-libs/motifs/flash_attention/online_softmax.loom	1
+loom-libs/motifs/flash_attention/publish_f32.loom	8
+loom-libs/motifs/flash_attention/pv_block_wmma.loom	2
+loom-libs/motifs/flash_attention/qk_block_wmma.loom	1
+loom-libs/motifs/gated_delta_net/rmsnorm_gate.loom	1
+loom-libs/motifs/gated_delta_net/scan_state_head128.loom	54
 loom-libs/motifs/llm_attention_qkv_matmul_postops.loom	1
+loom-libs/motifs/matmul/tiled_input_f32_codebook_dequant_accumulate_f32.loom	2
+loom-libs/motifs/matmul/tiled_input_f32_dequant_accumulate_f32.loom	3
+loom-libs/motifs/matmul/tiled_input_f32_dequant_accumulate_f32_token64.loom	1
+loom-libs/motifs/matmul/tiled_pair_input_f32_dequant_accumulate_f32.loom	5
+loom-libs/motifs/matmul/tiled_publish.loom	1
+loom-libs/motifs/matmul/vector_publish.loom	1
+loom-libs/motifs/matmul/vector_q6_f32_body.loom	12
+loom-libs/motifs/matmul_id/f16_pair_accumulate.loom	1
+loom-libs/motifs/matmul_id/f16_pair_binary_publish.loom	1
+loom-libs/motifs/matmul_id/f16_projection_q4k.loom	5
+loom-libs/motifs/matmul_id/f16_projection_q5k.loom	5
+loom-libs/motifs/matmul_id/f16_projection_q6k.loom	2
+loom-libs/motifs/matmul_id/pair_input_f32_dequant_accumulate_f32.loom	1
+loom-libs/motifs/matmul_id/skinny_input_f32_dequant_accumulate_f32.loom	1
+loom-libs/motifs/matmul_id/tiled_input_f32_dequant_accumulate_f32.loom	1
+loom-libs/motifs/matmul_id/vector_pair.loom	2
 loom-libs/motifs/mul_mat_f32_f32_wmma_core.loom	3
 loom-libs/motifs/mul_mat_id_f16_f16_wmma_core.loom	5
 loom-libs/motifs/mul_mat_id_f32_f32_wmma_core.loom	1
@@ -34,16 +85,24 @@ loom-libs/motifs/mul_mat_id_q6k_f16_wmma_projection.loom	2
 loom-libs/motifs/mul_mat_id_swiglu_f16_f16_accumulate.loom	1
 loom-libs/motifs/mul_mat_id_swiglu_f16_f16_wmma_body.loom	1
 loom-libs/motifs/mul_mat_quantized_f16_prefill.loom	4
+loom-libs/motifs/normalization/publish_f16.loom	2
+loom-libs/motifs/normalization/rmsnorm_binary.loom	2
+loom-libs/motifs/normalization/rmsnorm_q8_1_x4.loom	2
 loom-libs/motifs/publish_f32.loom	1
 loom-libs/motifs/q4_k_f16.loom	4
 loom-libs/motifs/q6_k_f16.loom	5
 loom-libs/motifs/q8_0_f16.loom	1
 loom-libs/motifs/q8_1_f16.loom	1
 loom-libs/motifs/quantize_q8_1_x4.loom	2
+loom-libs/motifs/quantize_q8_1_x4_group.loom	2
+loom-libs/motifs/rows/cache_publish.loom	2
 loom-libs/ops/copy_f32.loom	2
+loom-libs/ops/flash_attention/decode_split_next_q8_test.loom	3
 loom-libs/ops/flash_attention_decode_split_f32_f16_wmma.loom	2
 loom-libs/ops/flash_attention_f32_f16_wmma.loom	9
 loom-libs/ops/gated_delta_net_f32_wmma.loom	56
+loom-libs/ops/llm/llm_attention_k_matmul_rope_set_rows_vector_f32_f32.loom	1
+loom-libs/ops/llm/llm_attention_v_matmul_set_rows_vector_f32_f32.loom	2
 loom-libs/ops/llm_attention_k_matmul_rope_set_rows_decode_f32_f32.loom	1
 loom-libs/ops/llm_attention_v_matmul_set_rows_decode_f32_f32.loom	2
 loom-libs/ops/mul_mat_id_swiglu_f32_f32_wmma.loom	1
@@ -54,11 +113,11 @@ loom-libs/ops/mul_mat_symmetric_i4_wmma.loom	1
 loom-libs/ops/mul_mat_symmetric_i8_wmma.loom	1
 loom-libs/ops/rmsnorm_binary_f32.loom	2
 loom-libs/ops/rope_set_rows_f32.loom	2
+loom-libs/ops/rows/get_rows_rmsnorm_binary_q8_1_x4_f16.loom	1
 loom-libs/ops/set_rows.loom	2
 loom-libs/ops/small_rows_f32.loom	1
 qwen_moe/ggml/linear_q6k_q8_1_x4.loom	1
 qwen_moe/ggml/quantize_q8_1_x4.loom	2
-qwen_moe/qwen3_moe/attention_postprocess_f32_f16.loom	3
 qwen_moe/qwen3_moe/attention_prepare_quantized.loom	2
 qwen_moe/qwen3_moe/dense_linear_quantized_f16_wmma.loom	5
 qwen_moe/qwen3_moe/flash_attention_decode_f32_f16_wmma.loom	11

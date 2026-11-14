@@ -352,6 +352,14 @@ int main(int argc, char** argv) {
             return 1;
         }
         const auto tw_enc = std::chrono::steady_clock::now();
+        // engine#2399: stop after the encoder. The issue is scored on the encoder pass, and every whole-tool
+        // measurement (perf stat included) is dominated by the 20k-node decode that follows it -- 2,046 G
+        // instructions against ~19 GFLOP of encoder work is 106 instructions per FLOP, which is the decode, not the
+        // GEMM. This makes `perf stat` and any other counter attributable to the pass that is being optimised.
+        if (std::getenv("ONEBIT_WHISPER_ENCODE_ONLY") != nullptr) {
+            std::printf("encode-only: encoder %.3f s (decode skipped)\n", secs(tw_mel, tw_enc));
+            return 0;
+        }
 #ifdef ONEBIT_WHISPER_NPU
         if (dev_hook != nullptr) {
             // The split the issue is scored on, from this run: the wall inside gemv against everything else in this window's

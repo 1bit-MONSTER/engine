@@ -987,9 +987,12 @@ pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 # ways: flags on both sides -> ok at ONEBIT_AUDIO_THREADS=1,2,4; library only -> 16 failures.
 #
 # Explicit -mavx2 -mfma rather than -march=native: the same speed within noise, but it states the requirement instead
-# of inheriting the build host. The cost is real, which is why this is an option: the binary then needs AVX2+FMA at RUN
-# time (universal on this fleet -- Zen 2 and later -- not universal for a distributed build). OFF restores portability.
-option(ONEBIT_AUDIO_AVX2 "Compile with -mavx2 -mfma: audio GEMM 1.33x; the binary then requires AVX2+FMA at run time" ON)
+# of inheriting the build host. The cost is real: the audio TUs then need AVX2+FMA at RUN time (universal on this
+# fleet -- Zen 2 and later -- not universal for a distributed build). The cost is real, so this is an OPTION, and an
+# option that imposes a run-time ISA requirement defaults to OFF: the speedup is 1.33x on the audio GEMM and buying it
+# is a decision the distributor makes, not one a default makes for them. (engine#2403: the default was ON while the
+# paragraph above argued that the requirement is why it is optional -- the two disagreed with each other.)
+option(ONEBIT_AUDIO_AVX2 "Compile the audio TUs with -mavx2 -mfma: audio GEMM 1.33x; those TUs then require AVX2+FMA at run time" OFF)
 if(ONEBIT_AUDIO_AVX2)
     include(CheckCXXCompilerFlag)
     check_cxx_compiler_flag("-mavx2" ONEBIT_HAVE_MAVX2)
@@ -2047,9 +2050,23 @@ add_executable(audio_launch_plan_test tests/audio_launch_plan_test.cpp)
 if(ONEBIT_AUDIO_AVX2_READY)
     # Enumerated HERE, after every audio target exists: the option block runs ~600 lines earlier, where
     # audio_ops_test/audio_parallel_test are not defined yet, so an `if(TARGET ...)` test there is always false.
-    set(_avx2_targets onebit_npu audio_parallel_test audio_ops_test audio_exec_test audio_mel_test
-        whisper_transcribe audio_kernel_shapes audio_device_gemm_test)
-    foreach(_t ${_avx2_targets})
+    # engine#2403: onebit_npu is a STATIC library that ALSO holds the tokenizer, the pack/ELF import path and the
+    # vision packer. A target-level flag here made every one of those TUs require AVX2+FMA, which is a run-time
+    # requirement nobody asked them to take. The requirement belongs to the audio sources, so the flags go on the
+    # audio sources -- and the list is a GLOB, so the next npu/audio_*.cpp is covered without anyone remembering.
+    file(GLOB _onebit_audio_srcs CONFIGURE_DEPENDS npu/audio_*.cpp)
+    if(_onebit_audio_srcs)
+        set_source_files_properties(${_onebit_audio_srcs} PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+    endif()
+    # The test targets below compute their per-element reference in their OWN TU, and the comment above records that
+    # flags on one side only fails 16 checks at ONEBIT_AUDIO_THREADS=1,2,4 -- so both sides get them. Same glob
+    # argument: a new tests/audio_*.cpp is picked up, and the named targets are the ones whose TU is not named audio_*.
+    file(GLOB _onebit_audio_test_srcs CONFIGURE_DEPENDS tests/audio_*.cpp tests/whisper_*.cpp)
+    if(_onebit_audio_test_srcs)
+        set_source_files_properties(${_onebit_audio_test_srcs} PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+    endif()
+    foreach(_t audio_parallel_test audio_ops_test audio_exec_test audio_mel_test audio_kernel_shapes
+             audio_device_gemm_test whisper_transcribe)
         if(TARGET ${_t})
             target_compile_options(${_t} PRIVATE -mavx2 -mfma)
         endif()

@@ -73,6 +73,26 @@ def audit_file(path):
             "lines": text.count("\n") + 1}
 
 
+def pin_sha(config_root):
+    """The gpu-kernels sha `config/gpu-kernels.config` pins, or None with the reason printed."""
+    cfg = Path(config_root) / "config" / "gpu-kernels.config"
+    if not cfg.is_file():
+        print(f"hip_f16_audit: {cfg} does not exist - cannot tell what the pin is", file=sys.stderr)
+        return None
+    for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("sha="):
+            return line.split("=", 1)[1].strip()
+    print(f"hip_f16_audit: {cfg} has no sha= line - cannot tell what the pin is", file=sys.stderr)
+    return None
+
+
+def head_sha(tree):
+    """The commit a gpu-kernels checkout is at, or None when it is not a git tree."""
+    import subprocess
+    got = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], capture_output=True, text=True)
+    return got.stdout.strip() if got.returncode == 0 else None
+
+
 def audit(root):
     kernels = Path(root) / KERNEL_SUBDIR
     if not kernels.is_dir():
@@ -152,6 +172,25 @@ def self_test():
 
         chk(None, audit("/nonexistent-path-xyz"), "an unreadable tree is None, not an empty pass")
 
+        # the pin gate: an audit of a tree that is not the pinned commit is the false clean this tool exists for
+        import subprocess as _sp
+        root = Path(tmp) / "engine"
+        (root / "config").mkdir(parents=True)
+        tree = Path(tmp) / "kernels-repo"
+        tree.mkdir()
+        for cmd in (["git", "init", "-q"], ["git", "add", "-A"],
+                    ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"]):
+            _sp.run(cmd, cwd=tree, capture_output=True)
+        at = _sp.run(["git", "rev-parse", "HEAD"], cwd=tree, capture_output=True, text=True).stdout.strip()
+        (root / "config" / "gpu-kernels.config").write_text(f"sha={at}\n")
+        chk(at, pin_sha(root), "the pin is read from config/gpu-kernels.config")
+        chk(at, head_sha(tree), "the tree's commit is read")
+        (root / "config" / "gpu-kernels.config").write_text("sha=" + "f" * 40 + "\n")
+        chk("f" * 40, pin_sha(root), "a different pin is read as different")
+        chk(None, head_sha(Path(tmp) / "not-a-repo") if (Path(tmp) / "not-a-repo").mkdir() is None else None,
+            "a non-git directory has no commit")
+        chk(None, pin_sha(Path(tmp) / "nowhere"), "an engine checkout with no config/ is None, not a guess")
+
     if problems:
         for problem in problems:
             print("FAIL " + problem)
@@ -164,6 +203,8 @@ def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dir", help="a gpu-kernels checkout (must contain addons/hip-hrx/kernels)")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--config-root", help="an engine checkout: audit the tree the gpu-kernels pin names, and refuse "
+                                          "a tree at any other commit (an audit of the wrong tree reads as clean)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
@@ -171,6 +212,21 @@ def main(argv):
     if not a.dir:
         print("hip_f16_audit: --dir is required (the gpu-kernels checkout to audit)", file=sys.stderr)
         return 2
+    if a.config_root:
+        # engine#2406's instruction is "audit those on a pin bump": the audit is of THE PINNED TREE, and a checkout
+        # at another commit is exactly the false clean this tool exists to prevent.
+        want = pin_sha(a.config_root)
+        if want is None:
+            return 2
+        got = head_sha(a.dir)
+        if got is None:
+            print(f"hip_f16_audit: {a.dir} is not a git checkout - cannot tell which commit is audited",
+                  file=sys.stderr)
+            return 2
+        if got != want:
+            print(f"hip_f16_audit: this tree is at {got[:12]}, the pin is {want[:12]} - audit the pinned tree "
+                  f"or drop --config-root and say which commit you audited", file=sys.stderr)
+            return 2
     rows = audit(a.dir)
     if rows is None:
         print(f"hip_f16_audit: {Path(a.dir) / KERNEL_SUBDIR} is not a directory - cannot tell, "

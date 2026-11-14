@@ -444,6 +444,9 @@ add_python_test(pr_carry_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_carry_check.
 # branch that deletes a reviewed class passes it -- measured on #2021, where 41 classes became 40 and --check-gaps
 # still printed "none of the 41 reviewed significant classes is mapped". A test row for the three arms that do see it.
 add_python_test(registry_loss_check_test ${CMAKE_SOURCE_DIR}/tests/registry_loss_check_test.py)
+# engine#2398: the stale-branch test, which `tests_referenced` refuses to leave unregistered -- a test no
+# runner names is a test nobody runs.
+add_python_test(branch_stale_check_test ${CMAKE_SOURCE_DIR}/tests/branch_stale_check_test.py)
 
 add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.

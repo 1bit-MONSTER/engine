@@ -516,6 +516,15 @@ the first sampled token, which is [engine#1536](https://github.com/1bit-MONSTER/
   5.4K-token prompt in a new process 4.46 -> 3.43 s, first short prompt 0.47 -> 0.22 s, with
   identical output. `GGML_HRX_JIT_CACHE=0` turns it off; it is off while a Loom sanitizer is set.
   Deleting the directory is always safe.
+- **Routed-expert MoE on the HRX route (flint-40b-a2.5b).** `flint-UD-Q4_K_XL`, a 6-of-256 MoE that needs
+  31.01 GiB at its own context, serves with `--device hrx --no-strict-device`: 64-token completions at
+  **42.61 tok/s** (2 runs, 35.24 and 49.97, spread 1.418x — a sample, not a rate). A step reads 2.213 GB at
+  this depth, so that is **~94.3 GB/s effective**, 37 % of this box's 256 GB/s peak and 43 % of the 220 GB/s
+  goal. The flag is required because `embd` is `GET_ROWS` f32 `ne=[2048,2,1,1]` and strict placement refuses
+  the model over those 2 of 3,576 nodes; see `dispatch-get-rows.cpp`, whose demand list is only ever given
+  `Q8_1`, so a tied f32 embedding never matches and lands on the CPU. Two rows would finish it: demand `F32`
+  for a non-Qwen f32 gather, or accept a named off-device op instead of refusing the model. Measured
+  2026-11-14 under one gpu-hold window, `dmesg` clean before and after.
 - **Fused residual scale (llama.cpp #35).** ZAYA scales both residual branches twice per layer,
   `(x + bx) * sx + (r + br) * sr`, which ran as up to nine ADD / MUL dispatches per layer. Each side
   now runs as one dispatch (`common.res_scale_pair.*`, `ops/res_scale_pair_f32.loom`): 3,366 -> 3,165

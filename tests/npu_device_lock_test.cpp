@@ -234,6 +234,15 @@ int main() {
         expect(text.find("pid " + std::to_string(holder)) != std::string::npos,
                "the live holder's pid is named: " + text);
         expect(text.find("npu_device_lock_test") != std::string::npos, "and its cmdline: " + text);
+        // engine#2434: the refusal NOTE must not name this process. A serve takes the lock before it opens a device
+        // context, so when its own init is refused /proc/locks reports the only holder - itself - and the note told the
+        // operator to wait for, or stop, the process that had just failed. Measured with a FastFlowLM co-tenant that does
+        // not take our lock: the note named the failing serve's own pid.
+        {
+            const std::string note = onebit::npu_lock_refusal_note(lk);
+            expect(note.find("pid " + std::to_string(holder)) != std::string::npos,
+                   "the note names the real holder: " + note);
+        }
         const std::string line = onebit::npu_lock_holder_line(lk, 41);
         expect(line.find("[npu] device lock held by pid " + std::to_string(holder)) != std::string::npos,
                "one line in the issue's shape: " + line);
@@ -294,6 +303,28 @@ int main() {
                "and names the live holder after ~2 s without being asked: " + wait_err);
         expect(wait_err.find("npu_device_lock_test") != std::string::npos, "with the holder's cmdline: " + wait_err);
         if (release_fd >= 0) ::close(release_fd);
+
+    // engine#2434: the SELF case, which is the one the note got wrong - and it has to run AFTER the forked child above
+    // releases, because a blocking flock here would deadlock against the child's own hold (it did: the test hung until the
+    // timeout, which is how this placement was found). A serve takes this lock before it opens a device context, so when
+    // its own init is refused /proc/locks reports the only holder - itself - and the old note named the process that had
+    // just failed. The child-holder checks above cannot see this: there an exclusion that did nothing would still pass.
+    {
+        const int self_fd = ::open(lk, O_RDONLY | O_CLOEXEC);
+        const bool took = self_fd >= 0 && ::flock(self_fd, LOCK_EX | LOCK_NB) == 0;
+        expect(took, "this process can take the lock once the child released it");
+        if (took) {
+            const std::string mine = "pid " + std::to_string(static_cast<long>(::getpid()));
+            const std::string held = onebit::npu_lock_holders_text(lk);
+            expect(held.find(mine) != std::string::npos, "the raw holder text does name this process: " + held);
+            const std::string note = onebit::npu_lock_refusal_note(lk);
+            expect(note.find(mine) == std::string::npos, "but the refusal note does not: " + note);
+            expect(note.find("this process holds the device lock and is still refused") != std::string::npos,
+                   "and it says the true thing instead of advising us to stop ourselves: " + note);
+            (void)::flock(self_fd, LOCK_UN);
+        }
+        if (self_fd >= 0) ::close(self_fd);
+    }
         ::waitpid(holder, nullptr, 0);
     }
 

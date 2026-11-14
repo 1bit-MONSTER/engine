@@ -43,8 +43,22 @@ if [ -z "$bin" ]; then
     done
 fi
 [ -n "$bin" ] && [ -x "$bin" ] || { echo "npu-kernel-bitx: no 1bit binary (set ONEBIT_BIN=)" >&2; exit 2; }
-if [ ! -e "$HOME/NPU-TOKEN" ]; then
-    echo "npu-kernel-bitx: not inside an npu-hold ticket (no ~/NPU-TOKEN); refusing to start a serve on the device" >&2
+# OWNERSHIP, not presence. `[ -e ~/NPU-TOKEN ]` is true whenever ANY lane holds the device, so the old check let this
+# script start a serve inside someone else's ticket while telling itself it was "inside an npu-hold" (engine#2434's
+# family; measured 2026-11-14 on a sibling runner that did exactly that for 40 s). npu-hold/gpu-hold now hand the child
+# the line they wrote into the token, so compare against that. A caller that holds the device in a shell created some
+# other way can pass NPU_HOLD_TICKET explicitly; without it, refuse rather than guess.
+_tok=${NPU_TOKEN_FILE:-$HOME/NPU-TOKEN}
+_want=${NPU_HOLD_TICKET:-}
+if [ -z "$_want" ]; then
+    echo "npu-kernel-bitx: refusing: NPU_HOLD_TICKET is not set, so this run cannot prove it owns the device ticket." >&2
+    echo "  Run it under: npu-hold -l <label> -t <min> -- $0 ... (the helper exports NPU_HOLD_TICKET for you)." >&2
+    exit 2
+fi
+if [ ! -e "$_tok" ] || [ "$(cat "$_tok" 2>/dev/null)" != "$_want" ]; then
+    echo "npu-kernel-bitx: refusing: the device ticket is not ours." >&2
+    echo "  ours:   $_want" >&2
+    echo "  in file: $(cat "$_tok" 2>/dev/null || echo '(absent)')" >&2
     exit 2
 fi
 container=${1:-}; kernels=${2:-}

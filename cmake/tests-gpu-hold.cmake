@@ -57,3 +57,9 @@ add_test(NAME gpu_hold_group
 # resolve under DIFFERENT bases, so two callers could each hold a token and both run GPU work. Asserts the two
 # resolve under one base in all three states, plus that the script's two predicates are textually identical.
 add_test(NAME gpu_hold_hold_dir COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_hold_dir_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
+# The holder can PROVE it holds the ticket. `[ -e "$TOKEN" ]` is true whenever ANY lane holds the box, so a guard built
+# on it passes exactly when starting work is most harmful - measured 2026-11-14, when a lane's runner served on the GPU
+# for 40 s inside another lane's 45-minute hold. gpu-hold exports the exact token line it wrote (GPU_HOLD_TICKET) and the
+# label, and this asserts the child sees both, on a sandboxed HOME.
+add_test(NAME gpu_hold_child_identity COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_child_identity_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)

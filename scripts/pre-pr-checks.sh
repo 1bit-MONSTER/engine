@@ -67,6 +67,10 @@ checks=(
     "tools/ci/registration_loss_check.py --check --base $base"
     "tools/ci/registry_loss_check.py --base $base"
     "tools/ci/branch_stale_check.py --base $base"
+    # engine#2429: a refusing/asserting condition deleted in the diff with nothing replacing it. Calibrated on 15
+    # open PR heads (one spurious hit, fixed by the head-tree search) and on the real llama.cpp#371 diff; exit 2 when
+    # it cannot read the refs, so "cannot tell" is never a pass.
+    "tools/ci/guard_loss_check.py --check --base $base"
     # engine#2416: the HIP add-on's f16 audit over $GPU_KERNELS_DIR (or third_party/gpu-kernels) at the pin; with no
     # tree it exits 77 and is listed as `skip`, never `ok`
     "tools/ci/hip_f16_audit.py --find ."

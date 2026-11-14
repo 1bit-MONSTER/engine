@@ -38,6 +38,7 @@ below says why. The table's order is the runner's order: cheapest and most commo
 | `python3 tools/ci/registration_loss_check.py --check --base origin/main` | your branch would drop rows `main` has |
 | `python3 tools/ci/registry_loss_check.py --base origin/main` | a reviewed class, a `coverage` counter or a test's mention of a class that the base has is gone at the merge, not only at the endpoint (engine#2385, #2391) |
 | `python3 tools/ci/branch_stale_check.py --base origin/main` | the merge with the base conflicts, or would not keep a base change the branch never touched; a branch that is only behind gets a note (the merge keeps the base's copy, but the branch's tests ran on the older one) (engine#2398, #2410) |
+| `python3 tools/ci/guard_loss_check.py --check --base origin/main` | a guard-shaped line was deleted and its identifiers appear nowhere at head (a refusal or an assert silently removed) |
 | `python3 tools/ci/hip_f16_audit.py --find .` | a HIP add-on kernel accumulates in f16, or the gpu-kernels tree is not at the pinned commit; `skip` (the audit did NOT run) when there is no tree: set `GPU_KERNELS_DIR` to a checkout at the pin |
 | `git grep -l -F "$(basename <your new page>)" -- '*.md'` | nothing links to the page you just added — measured tonight: 45 docs, one with no inbound link, and it was the page whose whole subject is pre-merge checks |
 

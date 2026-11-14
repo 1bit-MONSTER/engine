@@ -128,7 +128,11 @@ def check(root, base, head):
             else:
                 lost.append((path, body, "not in this file and not anywhere at head: " + ", ".join(sorted(missing))))
         else:
-            moved.append((path, body))
+            # every `moved` entry is a 3-tuple: the print loop unpacks a destination list. This path
+            # (guard rewritten in place, identifiers still present) appended 2-tuples and crashed the
+            # tool - and Python's traceback exits 1, which a runner reads as "guard LOST". Found by
+            # running the row below against a diff that rewrites a guard.
+            moved.append((path, body, []))
     for path, body, why in lost:
         print(f"LOST {path}: {body.strip()[:100]}\n     {why}")
     for path, body, elsewhere in moved:
@@ -194,6 +198,17 @@ def self_test():
             pathlib.Path(td, name).write_text(text)
         g("add", "-A"); g("commit", "-qm", "head")
         return td
+
+    # 0. THE CRASH ARM: a guard REWRITTEN in place, identifiers still present -> note, rc 0, no unpack
+    #    error. This path appended a 2-tuple into a list the printer unpacks as 3, so the tool raised
+    #    ValueError and exited 1: a crash wearing the LOST exit code.
+    td0 = scratch({"src/a.cpp": "int f(void*p,size_t n){ if (n % TENSOR_ALIGNMENT != 0) { return -1; } return 0; }\n"},
+                  {"src/a.cpp": "int f(void*p,size_t TENSOR_ALIGNMENT){ if (TENSOR_ALIGNMENT == 0) { return -2; } return 0; }\n"})
+    buf0 = io.StringIO()
+    with contextlib.redirect_stdout(buf0):
+        rc_rw = check(td0, "HEAD^", "HEAD")
+    chk("a guard rewritten with its identifiers present is a note, not a crash", rc_rw, 0)
+    chk("  ... and it is reported as rewritten", "rewritten" in buf0.getvalue(), True)
 
     # 1. a guard deleted outright, nothing else changed -> LOST, rc 1
     td = scratch({"src/a.cpp": "int f(void*p,size_t n){ if (p == nullptr || n % TENSOR_ALIGNMENT != 0) { return -1; } return 0; }\n"},

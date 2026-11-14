@@ -20,7 +20,7 @@
 # writing it down and saying what feeds it -- and that is the open question on engine#1962: which of
 # these are protected by a producer-side prescale cannot be answered by reading them.
 #
-# engine#2138 (pin 2f7f04f0d..6485e5d69, llama.cpp #327's AMD merge + #345): 34 bodies added, 1 dropped, 1 recount.
+# engine#2138 (pin 2f7f04f0d..ca5aac715, llama.cpp #327's AMD merge + #345): 34 bodies added, 1 dropped, 1 recount.
 # What feeds each new body is the producer of its fptrunc operand. A script classified them; I checked the
 # activation and projection classes against matmul_id/skinny_input_f32_dequant_accumulate_f32,
 # matmul/tiled_input_f32_dequant_accumulate_f32 and matmul_id/f16_projection_q4k (the rest share their shape):

@@ -25,6 +25,7 @@
 # regenerates this file and tools/ci/hrx_f16_narrowing.txt; a new entry is drift the ratchet
 # refuses, and a line whose file no longer has a mul-updated f16 fragment is stale and should be
 # dropped as the corpus is fixed.
+loom-libs/motifs/flash_attention/online_softmax.loom
 loom-libs/motifs/mul_mat_f32_f32_wmma_core.loom
 loom-libs/motifs/mul_mat_id_f32_f32_wmma_core.loom
 loom-libs/motifs/mul_mat_id_q4k_f16_wmma_projection.loom

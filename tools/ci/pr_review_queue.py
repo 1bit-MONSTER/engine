@@ -75,10 +75,14 @@ def gh(path, paginate=False):
     return json.dumps(out)
 
 
-VERDICT_LINE = re.compile(r'^[^A-Za-z0-9]*VERDICT\b', re.MULTILINE)
+# A verdict does not begin inside an inline code span. Lanes quote the verdict *format* (`` `VERDICT: READY at
+# `abc1234` ``) and quote **other people's** verdicts when reconciling them, and both were being read as verdicts by the
+# author. Measured 2026-11-14: this lane's own reconciliation comment on npu-kernels#70 quoted `VERDICT: NEEDS-CHANGE` at
+# the head, so `--state` reported a READY PR as held by a CHANGES that no reviewer had written.
+VERDICT_LINE = re.compile(r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b', re.MULTILINE)
 
 
-VERDICT_KIND = re.compile(r'^[^A-Za-z0-9]*VERDICT\b[^\n]*', re.MULTILINE)
+VERDICT_KIND = re.compile(r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b[^\n]*', re.MULTILINE)
 
 
 def verdict_kind(body):
@@ -215,6 +219,12 @@ def self_test():
     finally:
         _os.environ['PATH'] = _old
     chk(True, crashed, 'a non-list page is reported, not extended into the queue as strings')
+    # The false POSITIVE, measured on my own comment (npu-kernels#70, 07:5xZ): reconciling two verdicts quotes the one being
+    # disagreed with, and the quote named the head. A quotation is not a verdict - in either direction.
+    chk(False, reviewed_at([{'body': '`VERDICT: NEEDS-CHANGE` at `abc1234` measured:'}], 'abc1234'),
+        'a backticked verdict being QUOTED is not a verdict at this head')
+    chk(False, reviewed_at([{'body': 'Write it as `VERDICT: READY at <head>`'}], 'abc1234'),
+        'quoting the verdict FORMAT is not a verdict either')
     chk(False, reviewed_at([{'body': 'looks good to me'}], 'abc1234'),
         'a review without a verdict line does not count')
     # The guard is the VERDICT word, not the head: removing it left --self-test at rc 0, because every arm above

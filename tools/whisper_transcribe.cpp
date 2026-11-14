@@ -338,6 +338,15 @@ int main(int argc, char** argv) {
 #ifdef ONEBIT_WHISPER_NPU
         const double dev_ms0 = dev_hook != nullptr ? npu_dev.gemm->device_ms() : 0.0;
 #endif
+        // engine#2399: ONEBIT_AUDIO_NODE_TIMES=1 prints per-node lines for the whole run, which is encoder PLUS a
+        // 25-token decode -- and the decode's GEMMs are M=1, so their MatMul rows swamp the encoder's. This marker
+        // is what makes the per-node output attributable: everything between here and the decoder marker is the
+        // encoder, which is the pass this issue is about.
+        const bool node_times = std::getenv("ONEBIT_AUDIO_NODE_TIMES") != nullptr;
+        if (node_times) {
+            std::fprintf(stdout, "[audio-graph] encoder\n");
+            std::fflush(stdout);   // the node lines go to stderr; without this they interleave after the marker
+        }
         if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why, dev_hook)) {
             std::fprintf(stderr, "encoder (window %zu): %s\n", w, why.c_str());
             return 1;
@@ -357,6 +366,16 @@ int main(int argc, char** argv) {
                 for (const auto& kv : dev_hook->host_why) std::printf("  host: %d x %s\n", kv.second, kv.first.c_str());
         }
 #endif
+        // engine#2399: stop after the encoder. The issue is scored on the encoder pass, and every whole-tool
+        // measurement (perf stat included) is dominated by the 20k-node decode that follows it -- 2,046 G
+        // instructions against ~19 GFLOP of encoder work is 106 instructions per FLOP, which is the decode, not the
+        // GEMM. This makes `perf stat` and any other counter attributable to the pass being optimised.
+        // It sits AFTER the ONEBIT_WHISPER_NPU block on purpose: the device_gemm/host_remainder split is the number
+        // this issue is scored on, so the mode has to return after printing it rather than before.
+        if (std::getenv("ONEBIT_WHISPER_ENCODE_ONLY") != nullptr) {
+            std::printf("encode-only: encoder %.3f s (decode skipped)\n", secs(tw_mel, tw_enc));
+            return 0;
+        }
         if (w == 0) {
             std::printf("encoder: [");
             for (int64_t d : xa.dims) std::printf(" %lld", (long long)d);
@@ -367,6 +386,12 @@ int main(int argc, char** argv) {
         // message (engine#1783).
         std::vector<int64_t> seq = prompt;
         size_t got = 0;
+        if (node_times) {
+            // engine#2399: closes the encoder region and names the rest. Everything after this is the greedy decode,
+            // whose GEMMs are M=1 and must not be counted against the encoder's MatMul share.
+            std::fprintf(stdout, "[audio-graph] decoder\n");
+            std::fflush(stdout);
+        }
         bool full = false;
         while (true) {
             if (seq.size() >= size_t(window)) { full = true; break; }

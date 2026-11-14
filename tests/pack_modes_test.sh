@@ -127,7 +127,11 @@ for f in "$here"/../scripts/*.sh; do
 done
 # A floor, not an exact count: a fifth packing site that does carry the guard is a good change, and failing on it
 # would teach the next person to edit the test instead of the packer. The per-site loop above is the real assertion.
-sites=$(for f in "$here"/../scripts/*.sh; do grep -q 'pack-elf.sh' "$f" && grep -qE '\btar -C' "$f" && echo x; done | wc -l)
+# `|| true` because of `set -o pipefail`: the loop's status is its LAST iteration's, so any script
+# that sorts after the last packing site and does not match the selector made this pipeline fail.
+# engine#2455 is exactly that - the check was correct only while "weekly.sh"
+# happened to be the last file in the glob. A selector deciding "not a packing site" is not an error.
+sites=$(for f in "$here"/../scripts/*.sh; do { grep -q 'pack-elf.sh' "$f" && grep -qE '\btar -C' "$f" && echo x; } || true; done | wc -l)
 check "the enumeration found every known packing site (>= 3)" "$([ "$sites" -ge 3 ] && echo yes || echo no)" "yes"
 
 rm -rf "$(dirname "$stage")"

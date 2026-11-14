@@ -2611,3 +2611,6 @@ foreach(_onebit_route_test IN LISTS _onebit_route_tests)
     endif()
 endforeach()
 
+# engine#2455: the window runner self-test, which tests_referenced_check requires a runner for: the
+# claim is that its refusals hold, so it has to run somewhere other than by hand.
+add_test(NAME window_run_self COMMAND ${CMAKE_SOURCE_DIR}/scripts/window-run.sh --self-test)

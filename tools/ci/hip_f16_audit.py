@@ -120,14 +120,25 @@ def audit(root):
     return rows
 
 
-def report(rows, as_json):
+def report(rows, as_json, top=None):
     if as_json:
         print(json.dumps(rows, indent=1))
     else:
-        for row in rows:
+        # The narrowing arm counts literal-excluded casts across every kernel, which on gpu-kernels 96593660718d
+        # is 62 rows -- more than a reader scans, so the files worth looking at come first and the rest is a count.
+        # `--top 0` prints every row (the pre-rollup behaviour) for anyone who wants the full table.
+        ordered = sorted(rows, key=lambda r: (-r["narrowings"], -len(r["accumulators"]), r["file"]))
+        limit = 20 if top is None else top
+        shown = ordered if limit <= 0 else ordered[:limit]
+        for row in shown:
             acc = ", ".join(row["accumulators"]) if row["accumulators"] else "-"
             print(f"  {row['file']:34} {row['lines']:5} lines  narrowings {row['narrowings']:3}  "
                   f"f16 accumulators {acc}")
+        rest = ordered[len(shown):]
+        if rest:
+            with_narrowings = sum(1 for row in rest if row["narrowings"])
+            print(f"  … {len(rest)} more file(s), {sum(row['narrowings'] for row in rest)} narrowing(s) among "
+                  f"{with_narrowings} of them (--top 0 for every row)")
     bad = [row for row in rows if row["accumulators"]]
     return bad
 
@@ -195,6 +206,13 @@ def self_test():
         chk(0, by["comment.hip"]["narrowings"], "a comment mentioning 'half (' is not a narrowing")
         chk(8, len(rows), "every file in the tree is audited (4 originals + 2 vector cases + 2 _Float16 cases)")
 
+        # the rollup: the top rows are the files with the most narrowings, and --top 0 shows everything
+        (kernels / "busy.hip").write_text("_Float16 a = (_Float16) v[0];\n_Float16 b = (_Float16) v[1];\n")
+        rows2 = audit(tmp)
+        ordered = sorted(rows2, key=lambda r: (-r["narrowings"], -len(r["accumulators"]), r["file"]))
+        chk("busy.hip", ordered[0]["file"], "the file with the most narrowings sorts first")
+        chk(2, ordered[0]["narrowings"], "and its count is the count")
+
         chk(None, audit("/nonexistent-path-xyz"), "an unreadable tree is None, not an empty pass")
 
         # the pin gate: an audit of a tree that is not the pinned commit is the false clean this tool exists for
@@ -236,6 +254,8 @@ def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dir", help="a gpu-kernels checkout (must contain addons/hip-hrx/kernels)")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--top", type=int, default=None,
+                    help="rows to print before rolling up the rest (default 20; 0 prints every row)")
     ap.add_argument("--config-root", help="an engine checkout: audit the tree the gpu-kernels pin names, and refuse "
                                           "a tree at any other commit (an audit of the wrong tree reads as clean)")
     ap.add_argument("--expect-sha", help="audit THIS commit (7..40 hex characters), for a candidate pin that has not "
@@ -281,7 +301,7 @@ def main(argv):
         print(f"hip_f16_audit: {Path(a.dir) / KERNEL_SUBDIR} is not a directory - cannot tell, "
               f"and that is not a pass", file=sys.stderr)
         return 2
-    bad = report(rows, a.json)
+    bad = report(rows, a.json, a.top)
     if bad:
         for row in bad:
             print(f"FAIL hip_f16_audit: {row['file']} accumulates in f16 ({', '.join(row['accumulators'])}) -- "

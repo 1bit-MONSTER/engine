@@ -298,17 +298,115 @@ def self_test_state():
     return 0
 
 
+def duplicates(repos):
+    """Open PR pairs that are doing the same work, which cost a review round each to discover.
+
+    Measured on 2026-11-14: three pairs in one session -- engine#2418/#2419 both ADDED
+    `tools/ci/hip_f16_audit_pinned.py` (two different implementations of the same wrapper), and
+    engine#2423/#2424 both changed the same single file `os/mini/release-check.sh` for the same issue.
+    Nothing in the fleet's tooling noticed either pair; the reviewer did, after reading both.
+
+    Two signals, both cheap and both unambiguous:
+
+      added-path   two open PRs in one repo add the same NEW path -- the stronger one, because two
+                   implementations of one new file cannot both land
+      same-files   two open PRs whose changed-file sets are identical and small (<= 3 files each),
+                   which is the "same one-file fix from two lanes" shape
+
+    Deliberately not a similarity score over file sets: #2420 and #2421 both touch CMakeLists.txt and
+    are *complementary* (the row and its runner), so a Jaccard threshold would have flagged a pair
+    that had to land together. Only identical small sets and duplicated new paths are reported.
+    """
+    rows = []
+    for repo in repos:
+        prs = json.loads(gh(f'repos/{OWNER}/{repo}/pulls?state=open&per_page={PAGE}', paginate=True) or '[]')
+        per_pr = []
+        for pr in prs:
+            if pr.get('draft'):
+                continue
+            files = json.loads(gh(f"repos/{OWNER}/{repo}/pulls/{pr['number']}/files?per_page={PAGE}",
+                                  paginate=True) or '[]')
+            paths = {f.get('filename') for f in files if f.get('filename')}
+            added = {f.get('filename') for f in files if f.get('status') == 'added' and f.get('filename')}
+            per_pr.append({'number': pr['number'], 'title': (pr.get('title') or '')[:60],
+                           'paths': paths, 'added': added})
+        for i, left in enumerate(per_pr):
+            for right in per_pr[i + 1:]:
+                shared_added = sorted(left['added'] & right['added'])
+                if shared_added:
+                    rows.append({'repo': repo, 'a': left['number'], 'b': right['number'], 'kind': 'added-path',
+                                 'detail': shared_added[0],
+                                 'a_title': left['title'], 'b_title': right['title']})
+                elif (left['paths'] and left['paths'] == right['paths'] and len(left['paths']) <= 3):
+                    rows.append({'repo': repo, 'a': left['number'], 'b': right['number'], 'kind': 'same-files',
+                                 'detail': ', '.join(sorted(left['paths'])),
+                                 'a_title': left['title'], 'b_title': right['title']})
+    return rows
+
+
+def self_test_duplicates():
+    """The two signals, on hand-built rows -- no gh call, because the classification is the logic under test."""
+    problems = []
+    rows = [
+        {'number': 1, 'title': 'a', 'paths': {'tools/x.py'}, 'added': {'tools/x.py'}},
+        {'number': 2, 'title': 'b', 'paths': {'tools/x.py'}, 'added': {'tools/x.py'}},
+        {'number': 3, 'title': 'c', 'paths': {'CMakeLists.txt'}, 'added': set()},
+        {'number': 4, 'title': 'd', 'paths': {'CMakeLists.txt'}, 'added': set()},
+        {'number': 5, 'title': 'e', 'paths': {'CMakeLists.txt', 'a.cc', 'b.cc', 'c.cc'}, 'added': set()},
+    ]
+
+    def classify(prs):
+        out = []
+        for i, left in enumerate(prs):
+            for right in prs[i + 1:]:
+                shared = sorted(left['added'] & right['added'])
+                if shared:
+                    out.append((left['number'], right['number'], 'added-path'))
+                elif left['paths'] and left['paths'] == right['paths'] and len(left['paths']) <= 3:
+                    out.append((left['number'], right['number'], 'same-files'))
+        return out
+
+    got = classify(rows)
+    if (1, 2, 'added-path') not in got:
+        problems.append(f"two PRs adding the same new path were not paired: {got}")
+    if (3, 4, 'same-files') not in got:
+        problems.append(f"two PRs with the same one-file set were not paired: {got}")
+    if any(pair[0] == 5 or pair[1] == 5 for pair in got):
+        problems.append(f"a 4-file PR was paired by the small-set rule: {got}")
+    if problems:
+        for problem in problems:
+            print('FAIL ' + problem)
+        return 1
+    print('pr_review_queue --duplicates self-test: ok')
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--repos', nargs='+', default=list(DEFAULT_REPOS))
     ap.add_argument('--min-age-hours', type=float, default=0.0)
     ap.add_argument('--json', action='store_true')
     ap.add_argument('--self-test', action='store_true')
+    ap.add_argument('--duplicates', action='store_true',
+                    help='open PR pairs that add the same new path, or change the same small file set')
     ap.add_argument('--state', action='store_true',
                     help='per open PR: the newest verdict object across reviews and comments')
     a = ap.parse_args(argv)
     if a.self_test:
+        if a.duplicates:
+            return self_test_duplicates()
         return self_test() if not a.state else self_test_state()
+    if a.duplicates:
+        rows = duplicates(a.repos)
+        if a.json:
+            print(json.dumps(rows, indent=1))
+            return 0
+        for row in rows:
+            print(f"  {row['repo']:12} #{row['a']:<5} and #{row['b']:<5} both {row['kind']}: {row['detail']}")
+            print(f"               {row['a_title']}")
+            print(f"               {row['b_title']}")
+        print(f"pr_review_queue --duplicates: {len(rows)} pair(s) doing the same work")
+        return 0
     if a.state:
         rows = state(a.repos)
         if a.json:

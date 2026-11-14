@@ -67,6 +67,12 @@ checks=(
     "tools/ci/registration_loss_check.py --check --base $base"
     "tools/ci/registry_loss_check.py --base $base"
     "tools/ci/branch_stale_check.py --base $base"
+    # engine#2416: the audit #2406 asks for on the ratchet's green line had no runner at all -- the tool
+    # existed, a gate existed (#2411), and nothing invoked either. It audits the gpu-kernels tree the pin names,
+    # so it needs that checkout; GPU_KERNELS_DIR says where a lane keeps it, and --skip-if-absent makes a lane
+    # without one report a skip WITH the reason instead of failing. Set GPU_KERNELS_REQUIRE=1 (a release build)
+    # to turn the skip into a failure.
+    "tools/ci/hip_f16_audit.py --dir ${GPU_KERNELS_DIR:-../gpu-kernels} --skip-if-absent"
 )
 
 # The page and this list drift apart, and it has happened twice in one night: the page said the runner "runs the first six"
@@ -117,6 +123,9 @@ for c in "${checks[@]}"; do
         # a pass`, exits 2 and is left to fail: the tool already refuses to call that a pass.
         # `--require-initialised` is where a release build turns this one into a failure.
         case "$last" in
+            "hip_f16_audit: no gpu-kernels checkout at "*)
+                printf 'skip  %-42s nothing audited: %s\n' "$name" "${last#hip_f16_audit: }"
+                skipped=$((skipped + 1)); continue ;;
             "submodule_pin: 0 submodule(s) at their pinned commit, "*)
                 printf 'skip  %-42s nothing compared: %s\n' "$name" "${last#submodule_pin: }"
                 skipped=$((skipped + 1)); continue ;;

@@ -235,6 +235,11 @@ def self_test():
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dir", help="a gpu-kernels checkout (must contain addons/hip-hrx/kernels)")
+    # engine#2416: a lane without a gpu-kernels checkout next to its engine should SKIP, not fail -- a pre-PR
+    # check that fails for want of a second repository is one people learn to skip. The tool says it in its own
+    # voice and exits 0 so scripts/pre-pr-checks.sh can report the skip and its reason.
+    ap.add_argument("--skip-if-absent", action="store_true",
+                    help="when --dir does not exist, say so and exit 0 (a skip, for a check runner)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--config-root", help="an engine checkout: audit the tree the gpu-kernels pin names, and refuse "
                                           "a tree at any other commit (an audit of the wrong tree reads as clean)")
@@ -248,6 +253,12 @@ def main(argv):
     if not a.dir:
         print("hip_f16_audit: --dir is required (the gpu-kernels checkout to audit)", file=sys.stderr)
         return 2
+    if a.skip_if_absent and not Path(a.dir).is_dir():
+        # "cannot tell" is not a pass: the message says so, and the exit code tells a runner to count it skipped.
+        # stdout, not stderr: a check runner classifies by the tool's last line on stdout, and a skip is a
+        # result rather than an error.
+        print(f"hip_f16_audit: no gpu-kernels checkout at {a.dir} - cannot tell, and that is not a pass")
+        return 0
     if a.expect_sha or a.config_root:
         # engine#2406's instruction is "audit those on a pin bump": the audit is of THE PINNED TREE, and a checkout
         # at another commit is exactly the false clean this tool exists to prevent.

@@ -16,7 +16,7 @@ limitations under the License.
 -->
 # Before you ask for a merge
 
-Ten commands, all host-side, none needing a device or a build. Every one of them answers a question that
+Eleven commands, all host-side, none needing a device or a build. Every one of them answers a question that
 `mergeable=true`, a green CI tick and a careful read of your own diff do not.
 
 Run them from the repository root on the branch you are about to hand over.
@@ -38,6 +38,7 @@ below says why. The table's order is the runner's order: cheapest and most commo
 | `python3 tools/ci/registration_loss_check.py --check --base origin/main` | your branch would drop rows `main` has |
 | `python3 tools/ci/registry_loss_check.py --base origin/main` | a reviewed class, a `coverage` counter or a test's mention of a class that the base has is gone at the merge, not only at the endpoint (engine#2385, #2391) |
 | `python3 tools/ci/branch_stale_check.py --base origin/main` | the merge with the base conflicts, or would not keep a base change the branch never touched; a branch that is only behind gets a note (the merge keeps the base's copy, but the branch's tests ran on the older one) (engine#2398, #2410) |
+| `python3 tools/ci/hip_f16_audit.py --dir ../gpu-kernels --skip-if-absent` | an f16 narrowing in the **gpu-kernels add-on**, which the Loom ratchet cannot see; audits the tree the pin names, and skips with a reason when that checkout is absent (`GPU_KERNELS_DIR` says where yours is) |
 | `git grep -l -F "$(basename <your new page>)" -- '*.md'` | nothing links to the page you just added — measured tonight: 45 docs, one with no inbound link, and it was the page whose whole subject is pre-merge checks |
 
 Two more, for the moments they are for:

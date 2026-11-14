@@ -294,7 +294,53 @@ void test_a_throwing_unit() {
 
 }  // namespace
 
+// engine#2437: a tensor that is BOTH the graph's requested output and the input of exactly one node. The move
+// optimisation counts uses, and before this case existed it counted node inputs only -- so `y` looked last-used by
+// the Reshape, was MOVED into it, and the fetch of "y" afterwards copied a moved-from (empty) vector while the run
+// still returned true. That is a silent empty output, which is why the arm asserts the DATA and not just the rc.
+void output_also_feeds_one_node() {
+    OnnxGraphInfo g;
+    g.dir = ".";
+    g.inputs = {"x"};
+    g.outputs = {"y"};                       // y is the requested output ...
+    const std::vector<float> x = {1.f, 2.f, 3.f, 4.f};
+    OnnxInit shp;
+    shp.name = "shape22";
+    shp.dtype = 7;                           // int64
+    static const int64_t d22[2] = {2, 2};
+    shp.dims = {2};                          // a 1-D shape tensor of two values
+    shp.raw = reinterpret_cast<const uint8_t*>(d22);
+    shp.raw_len = sizeof(d22);
+    OnnxInit shp4;
+    shp4.name = "shape4";
+    shp4.dtype = 7;
+    static const int64_t d4[1] = {4};
+    shp4.dims = {1};
+    shp4.raw = reinterpret_cast<const uint8_t*>(d4);
+    shp4.raw_len = sizeof(d4);
+    g.initializers = {"shape22", "shape4"};
+    g.init_tensors.push_back(shp);
+    g.init_tensors.push_back(shp4);
+    // node 1 produces y from the input ...
+    OnnxNodeInfo r1;
+    r1.op = "Reshape"; r1.name = "r1"; r1.ins = {"x", "shape22"}; r1.outs = {"y"};
+    g.nodes.push_back(r1);
+    // ... and y then feeds exactly ONE node, whose output nobody fetches. take_if_last used to read that as
+    // "last use of y" and move it, emptying the tensor the fetch below then copies.
+    OnnxNodeInfo r2;
+    r2.op = "Reshape"; r2.name = "r2"; r2.ins = {"y", "shape4"}; r2.outs = {"z"};
+    g.nodes.push_back(r2);
+    AudioRunResult out;
+    std::string why;
+    const bool ok = run_audio_graph(g, x.data(), 2, 2, "y", &out, &why);
+    if (!ok) std::printf("       (why: %s)\n", why.c_str());
+    check(ok, "y-as-output-and-reshape-input: ran");
+    check(out.data.size() == x.size(), "y-as-output-and-reshape-input: output is not empty");
+    check(out.data == x, "y-as-output-and-reshape-input: output bytes survive the Reshape move");
+}
+
 int main() {
+    output_also_feeds_one_node();
     test_bit_identity();
     test_row_group_edges();
     test_elementwise_bit_identity();

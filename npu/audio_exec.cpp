@@ -358,6 +358,15 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 if (!in.empty()) ++use_count[in];
             }
         }
+        // engine#2437: a graph OUTPUT is a use too. The fetch after the loop reads the requested tensor out of `t`
+        // (`out_name`, else g.outputs[0]), so a tensor that is an output can never be "last used by a node" even
+        // when it has exactly one node consumer -- moving it there leaves the fetch copying a moved-from (empty)
+        // vector, and the run still returns true. Counting outputs keeps the invariant in one place: the count
+        // answers "how many more users of `name` are there", and the fetch is one of them.
+        for (const auto& o : g.outputs) {
+            if (!o.empty()) ++use_count[o];
+        }
+        if (!out_name.empty()) ++use_count[out_name];
         auto take_if_last = [&](const std::string& name) -> Tensor* {
             const auto c = use_count.find(name);
             const auto it = t.find(name);

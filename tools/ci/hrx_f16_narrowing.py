@@ -308,6 +308,12 @@ def check(root, corpus=None):
           f"{len(acc_baseline)} f16 accumulator body(ies), none new, none stale; "
           f"{len(guard)} of the narrowing bodies carry a guard marker" +
           (f" ({', '.join(sorted(guard))})" if guard else " (the guard sits on the producer, engine#1962)"))
+    # State the scope on the green line, not only in the docstring. A PASS here is read as "the HRX kernels are
+    # clean", and it is clean over the Loom corpus only: the HIP add-on's kernels live in the gpu-kernels repo as
+    # .hip/.cpp and are never scanned. A gpu-kernels pin bump is therefore invisible to this check (engine#2405),
+    # and the one that prompted this line added 1,116 lines of new .hip that had to be audited by hand.
+    print("hrx_f16_narrowing: scope = .loom bodies under that corpus ONLY; gpu-kernels add-on kernels "
+          "(.hip/.cpp, a separate repo) are NOT scanned -- audit those on a pin bump (engine#2405)")
     return 0
 
 

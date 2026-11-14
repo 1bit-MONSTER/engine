@@ -345,7 +345,13 @@ set -m
 # `while read m; do gpu-hold -- bench "$m"; done < list`: without `set -m` the loop runs every entry, with `set -m` the
 # first payload's `cat` swallows the rest and the sweep silently runs once. Background jobs on `main` already got
 # /dev/null (a non-interactive shell's rule), so this keeps that semantic and takes only the process group.
-"$@" < /dev/null &
+# A child cannot otherwise prove it is the HOLDER rather than a bystander: `[ -e "$TOKEN" ]` is true whenever ANY lane
+# holds the box, so a guard written with it passes exactly when starting work is most harmful (measured 2026-11-14: my
+# own runner did that for 40 s against another lane's 45-minute ticket). The token's content is what this run wrote, so
+# give it to the child - exact, not a string guess:
+#   GPU_HOLD_TICKET  the exact line in the token file ("gpu-hold <label> pid <pid> <ts>")
+#   GPU_HOLD_LABEL   the label, sanitised, as it appears in that line
+env GPU_HOLD_TICKET="$mine" GPU_HOLD_LABEL="$SAFE" "$@" < /dev/null &
 child=$!
 set +m   # job control is needed only to place THIS job in its own group; leaving it on would make every later
          # background job in this shell a background *group*, which is a semantic this script does not want to

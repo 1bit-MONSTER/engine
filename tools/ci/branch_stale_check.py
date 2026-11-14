@@ -13,25 +13,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""branch_stale_check.py -- a branch that is behind carries older copies of files it never touched.
+"""branch_stale_check.py -- a branch that is behind, and what its merge would actually write.
 
-The fleet squash-merges, so the branch's tree becomes main's tree for every path in the diff. On a branch cut
-before another PR landed, the endpoint diff lists that PR's files as *modified* -- the branch's copy is the older
-one -- and the squash reverts them. Five PRs on 2026-11-13/14 had exactly that shape: #358 would have removed
-llama.cpp#357's alignment refusal and its case, #361 would have removed #355, #2021 would have removed #2387's
-ctest row, #2387 would have removed #2366's arms, #2397 would have removed #2021's single-offset guard.
+A branch cut before another PR landed carries the older copy of every file that PR changed. Its endpoint diff
+(`git diff base..branch`, two dots) shows those files as reverted, and that reading is wrong: a squash merge applies
+`merge-base..branch`, a path the branch never changed has no hunk there, and the base's copy survives (engine#2410,
+measured in a scratch repo and on #2021 x cmake/tests-pre-pr-checks.cmake; the fleet merges with
+`gh pr merge --squash`).
 
-`git diff base...branch` (three dots) answers "what did the branch change", which is why it does not show this: the
-files it misses are the ones the branch never changed. This check asks the other question directly.
+So this check reads the merge itself (`git merge-tree --write-tree base head`) and reports:
 
-  for every path the base has that the branch does NOT change:
-      is the branch's copy byte-identical to the base's?
+  FAIL  the merge conflicts, or it would leave a path the branch never changed different from the base's copy
+        (a real loss: the base's content would not survive);
+  note  the branch is behind on N path(s) it never changed: the merge keeps the base's copies, but the branch's
+        own tests ran against the older ones, so rebase before trusting them.
 
-A difference there cannot be the branch's intent -- it did not touch the file -- so it is a stale copy, and merging
-it would write the old content over the base's. Files the branch does change are excluded, so a legitimate
-divergence is never reported.
+Paths changed on BOTH sides are where a conflict resolution can silently take the branch's side; this check does
+not judge a resolution (compare it against both parents by hand, as on #2021/#2368).
 
-Exit 0 quiet, 1 stale files found, 2 a ref could not be read (which is not a pass).
+Exit 0 no loss, 1 a conflict or a lost base change, 2 a ref could not be read (which is not a pass).
 """
 
 import argparse
@@ -69,7 +69,7 @@ def touched_by_branch(base, head, merge_base):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Report files where the branch carries an older copy.")
+    parser = argparse.ArgumentParser(description="Report what merging the branch would lose from the base.")
     parser.add_argument("--base", default="origin/main", help="base ref (default: origin/main)")
     parser.add_argument("--head", default="HEAD", help="head ref (default: HEAD)")
     parser.add_argument("--quiet", action="store_true", help="only print failures")
@@ -100,7 +100,7 @@ def main():
         print("branch_stale_check: could not diff the branch against its merge base", file=sys.stderr)
         return 2
 
-    stale = []
+    behind = []
     added_by_base = []
     for path in base_paths:
         base_blob = blob_sha(args.base, path)
@@ -115,7 +115,18 @@ def main():
             # that can only fire on the harmless case is an arm that would teach readers to ignore the check.
             added_by_base.append(path)
         elif base_blob != head_blob:
-            stale.append(path)
+            behind.append(path)
+
+    # engine#2410: what lands is the merge, not the branch's endpoint, so read the merge.
+    merged = git("merge-tree", "--write-tree", "--no-messages", args.base, args.head)
+    if merged.returncode not in (0, 1) or not merged.stdout.strip():
+        print(f"branch_stale_check: git merge-tree failed ({merged.stderr.strip()}) - cannot tell, and that is not a pass",
+              file=sys.stderr)
+        return 2
+    merged_lines = merged.stdout.splitlines()
+    merge_tree = merged_lines[0].strip()
+    conflicted = sorted({line.split("\t", 1)[1] for line in merged_lines[1:] if "\t" in line})
+    lost = [path for path in behind + added_by_base if blob_sha(merge_tree, path) != blob_sha(args.base, path)]
 
     # The check reads commits (`git show <ref>:<path>`). Uncommitted work is invisible to it, so say so rather
     # than letting a dirty tree read as a clean one -- measured while wiring it: an uncommitted stale copy
@@ -128,20 +139,28 @@ def main():
                   f"- commit them and re-run to check the branch you are handing over")
 
     if not args.quiet:
-        print(f"branch_stale_check: base {args.base} {len(base_paths)} path(s), branch touches {len(touched)} of them; "
-              f"{len(stale)} older cop(ies) (the base also added {len(added_by_base)} path(s) the branch predates, "
-              f"which a merge supplies)")
+        print(f"branch_stale_check: base {args.base} {len(base_paths)} path(s), branch touches {len(touched)}; "
+              f"behind on {len(behind)} it never changed (the base also added {len(added_by_base)} the branch "
+              f"predates); the merge keeps the base's copy of {len(behind) + len(added_by_base) - len(lost)} of them")
 
-    for path in stale[: args.limit]:
-        print(f"FAIL branch_stale_check: {path} - the branch carries an older copy and never changed it")
-    if len(stale) > args.limit:
-        print(f"FAIL branch_stale_check: … and {len(stale) - args.limit} more older cop(ies)")
-    if stale:
-        print("branch_stale_check: rebase onto the base - a squash merge of this branch would write these older "
-              "copies over it", file=sys.stderr)
+    for path in conflicted[: args.limit]:
+        print(f"FAIL branch_stale_check: {path} - the merge with the base conflicts here")
+    for path in lost[: args.limit]:
+        print(f"FAIL branch_stale_check: {path} - the branch never changed it, yet the merge would not keep the "
+              f"base's copy")
+    if conflicted or lost:
+        print("branch_stale_check: rebase onto the base and resolve, then re-run", file=sys.stderr)
         return 1
+    if behind and not args.quiet:
+        for path in behind[: args.limit]:
+            print(f"note branch_stale_check: {path} - behind the base (the merge keeps the base's copy)")
+        if len(behind) > args.limit:
+            print(f"note branch_stale_check: ... and {len(behind) - args.limit} more")
+        print("branch_stale_check: nothing the base has is lost by the merge; the branch's own tests ran against the "
+              "older copies above, so rebase before trusting them")
+        return 0
     if not args.quiet:
-        print("branch_stale_check: no file the branch left alone differs from the base")
+        print("branch_stale_check: the merge keeps every base change the branch left alone")
     return 0
 
 

@@ -23,7 +23,10 @@ that audit, mechanised.
 
 Two properties, the same two the Loom ratchet counts:
 
-  narrowing    -- an f32 value written into f16 (`__float2half*`, `(half)x`, `half(x)`)
+  narrowing    -- an f32 value written into f16 (`__float2half*`, `(half)x`, `half(x)`,
+                  `(_Float16)x`). The cast arms require an identifier or `(` after the cast, so a cast
+                  of a NUMERIC LITERAL (`(_Float16) 0.0f`) is not counted: that converts a constant, not
+                  an f32 value
   accumulator  -- an f16 accumulator (`half acc`, `__half acc`, `half sum`, `half_t acc`)
 
 A narrowing is not automatically a defect: writing a block's `d` scale into a q4_0 block is the format, and
@@ -49,7 +52,8 @@ from pathlib import Path
 KERNEL_SUBDIR = Path("addons/hip-hrx/kernels")
 
 # `__float2half`, `__float2half_rn`, `(half)v`, `half(v)`. Deliberately not `half x = ...`, which declares.
-NARROWING = re.compile(r"__float2half\w*\s*\(|\(\s*(?:__)?half\s*\)\s*[A-Za-z_(]|\b(?:__)?half\s*\(\s*[A-Za-z_]")
+NARROWING = re.compile(r"__float2half\w*\s*\(|\(\s*(?:(?:__)?half|_Float16)\s*\)\s*[A-Za-z_(]"   # (half)x, (_Float16)x
+                       r"|\b(?:__)?half\s*\(\s*[A-Za-z_]")                                                   # half(x)
 # an accumulator declared in f16: `half acc`, `__half acc =`, `half_t acc`, and `acc` declared as such.
 # `half`, `__half`, `half_t`, `_Float16`, and the vector spellings these kernels actually use
 # (`half16`/`half8`/`half2`, `typedef _Float16 half16 __attribute__((ext_vector_type(16)))`). Measured on
@@ -149,12 +153,19 @@ def self_test():
         # the defect case
         (kernels / "f16acc.hip").write_text(
             "__half acc = 0;\nfor (int i = 0; i < n; ++i) acc = acc + __float2half(v[i]);\n")
+        # the `_Float16` spelling the add-on actually uses, and the numeric-literal cast beside it
+        (kernels / "f116.hip").write_text("_Float16 h = (_Float16) value[k];\n")
+        (kernels / "f116lit.hip").write_text("_Float16 h = (_Float16) 0.0f;\n")
         rows = audit(tmp)
-        chk(3, len(rows), "three kernels audited")
+        chk(5, len(rows), "five kernels audited")
         by = {row["file"]: row for row in rows}
         chk(1, by["format.hip"]["narrowings"], "the block scale is one narrowing")
         chk([], by["format.hip"]["accumulators"], "a narrowing alone is not an accumulator")
         chk(0, by["clean.hip"]["narrowings"], "fmaf accumulation narrows nothing")
+        # `_Float16` is the spelling the add-on's kernels actually use (engine#2405: every cast in its three new
+        # kernels is `(_Float16)`), so a pattern that only knew `half`/`__half` reported zero of them.
+        chk(1, by["f116.hip"]["narrowings"], "(_Float16)x is a narrowing")
+        chk(0, by["f116lit.hip"]["narrowings"], "(_Float16) 0.0f is a constant conversion, not a value narrowing")
         chk([], by["clean.hip"]["accumulators"], "a float accumulator is not f16")
         chk(["__half acc"], by["f16acc.hip"]["accumulators"], "the actual defect is found")
         bad = [row["file"] for row in rows if row["accumulators"]]
@@ -182,7 +193,7 @@ def self_test():
         rows = audit(tmp)
         by = {row["file"]: row for row in rows}
         chk(0, by["comment.hip"]["narrowings"], "a comment mentioning 'half (' is not a narrowing")
-        chk(6, len(rows), "every file in the tree is audited (4 originals + 2 vector cases)")
+        chk(8, len(rows), "every file in the tree is audited (4 originals + 2 vector cases + 2 _Float16 cases)")
 
         chk(None, audit("/nonexistent-path-xyz"), "an unreadable tree is None, not an empty pass")
 

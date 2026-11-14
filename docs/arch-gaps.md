@@ -1209,3 +1209,18 @@ went from listed to settled that way.
 
 The `!! NPU FLM` class above is where the owed rows belong. Its owning issue is engine#1786 (every `*-NPU2` source
 serves), which is open.
+
+## 2026-11-14: `SegaForCausalLM` — reviewed, not an alias (engine#2427)
+
+The one `!! UNCOVERED` line of the 2026-11-14 watcher run. Read from the repo's own `config.json`
+(`the123manaic/Sega-7.0-Singularity-Infinity`), not from the class name.
+
+* `SegaForCausalLM` (`model_type` `sega_tot_moe`, 4 models in the 2026-11-14 census) is "Sega 7.0
+  Singularity-Infinity". The config is **plain and non-standard at once**: 40 layers, hidden 4096, 64 heads,
+  alongside keys no supported family has (`reasoning_passes`, `reasoning_speed_*`). There is **no `auto_map`**
+  and no modelling code in the repo, so it is **not** the remote-code case that `OpensciForCausalLM` covers —
+  it is a custom architecture whose weights we do not have a backend for.
+* **Not an alias** of any family the registry maps, and no pinned backend accepts `sega_tot_moe`. Reported,
+  not alerted (`"watch": "report"`), so the daily watcher prints `. REVIEWED` instead of `!! UNCOVERED` and
+  does not exit 1 on it. If a backend starts accepting the class, record why as `mapped_ok` in
+  `registry/significant.json` rather than deleting this entry.

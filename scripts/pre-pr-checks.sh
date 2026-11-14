@@ -67,6 +67,9 @@ checks=(
     "tools/ci/registration_loss_check.py --check --base $base"
     "tools/ci/registry_loss_check.py --base $base"
     "tools/ci/branch_stale_check.py --base $base"
+    # engine#2416: the HIP add-on's f16 audit over $GPU_KERNELS_DIR (or third_party/gpu-kernels) at the pin; with no
+    # tree it exits 77 and is listed as `skip`, never `ok`
+    "tools/ci/hip_f16_audit.py --find ."
 )
 
 # The page and this list drift apart, and it has happened twice in one night: the page said the runner "runs the first six"
@@ -108,6 +111,12 @@ for c in "${checks[@]}"; do
     name=${c%% *}
     out=$(python3 $c 2>&1); rc=$?
     last=$(printf '%s\n' "$out" | grep -v '^$' | tail -1)
+    if [ $rc -eq 77 ]; then
+        # 77 is the repo's "cannot run here" (ctest SKIP_RETURN_CODE): counted as a skip with the tool's own
+        # reason, so the summary still says something did not run
+        printf 'skip  %-42s %s\n' "$name" "$last"
+        skipped=$((skipped + 1)); continue
+    fi
     if [ $rc -eq 0 ]; then
         # `submodule_pin_check --check` exits 0 having compared NOTHING when submodules are declared but
         # none is checked out -- `0 submodule(s) at their pinned commit, N not initialised` -- which would

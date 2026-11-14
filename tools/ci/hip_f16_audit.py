@@ -289,7 +289,8 @@ def main(argv):
         tree = find_tree(a.find)
         if tree is None:
             print("SKIPPED: hip_f16_audit found no gpu-kernels tree ($GPU_KERNELS_DIR unset, no "
-                  f"{Path(a.find) / 'third_party' / 'gpu-kernels'}) - the add-on f16 audit did NOT run")
+                  f"{Path(a.find) / 'third_party' / 'gpu-kernels'}) - the add-on f16 audit did NOT run; set "
+                  "GPU_KERNELS_DIR to a gpu-kernels checkout at the pin in config/gpu-kernels.config to run it")
             return SKIPPED
         a.dir = tree
         if not a.expect_sha:

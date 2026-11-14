@@ -779,8 +779,15 @@ kernel_cve_verdict() {
     fi
 }
 
-payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
-    _f=${1:-} _d=${2:-} _sample=${3:-}
+payload_modes_verdict() {   # <writable files> <writable dirs> [<sample>] [<binaries that cannot execute>]
+    _f=${1:-} _d=${2:-} _sample=${3:-} _noexec=${4:-}
+    # engine#2422: the row printed the binaries' modes and required nothing of them, so a payload with `1bit` and
+    # `lemond` at 0644 said PASS (measured on a real 258-entry payload). An appliance runs as root, so ANY execute
+    # bit is enough to run a file -- the property is "can it execute", not "is it 0755".
+    if [ -n "$_noexec" ]; then
+        printf 'FAIL these payload binaries cannot execute:%s - a payload that cannot run its own binaries is not a release' "$_noexec"
+        return 0
+    fi
     case "$_f" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s file modes could not be counted (%s)' "${_f:-empty}"; return 0 ;; esac
     case "$_d" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s directory modes could not be counted (%s)' "${_d:-empty}"; return 0 ;; esac
     if [ "$_f" = 0 ] && [ "$_d" = 0 ]; then
@@ -1024,6 +1031,10 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(payload_modes_verdict 0 1)"           # the c33 first cut: no files, the payload ROOT writable
     check FAIL "$(payload_modes_verdict 1 0 '/opt/1bit-package/1bit/1bit')"
     check FAIL "$(payload_modes_verdict '' 0)"
+    # engine#2422: a payload whose binaries cannot execute was PASSing, because the row printed their modes and
+    # required nothing. The sample below is the measured shape (both binaries at 0644).
+    check FAIL "$(payload_modes_verdict 0 0 '' ' 1bit/1bit bin/lemond')"
+    check PASS "$(payload_modes_verdict 0 0 '' '')"
     check FAIL "$(payload_modes_verdict 0 '')"
     check FAIL "$(payload_modes_verdict x 0)"
     # engine#1557: the payload's own identity - a claim that matches is a PASS, a stale one is a FAIL, and an image without
@@ -2194,10 +2205,12 @@ else
         # and `drwxrwxr-x opt/1bit-package` is.
         _pm_s=$(find "$PDIR" -mindepth 0 \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -3 |
             while IFS= read -r _p; do _r=${_p#"$PDIR"}; _r=${_r#/}; printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "${_r:-.}"; done)
-        PM=$(payload_modes_verdict "${_pm_f:-}" "${_pm_d:-}" "${_pm_s:-}")
+        PM=$(payload_modes_verdict "${_pm_f:-}" "${_pm_d:-}" "${_pm_s:-}" "${_pm_noexec:-}")
         _pm_bits=
-        for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemond-onebit"; do
+        _pm_noexec=
+        for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemonade-onebit"; do
             [ -f "$_b" ] && _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"
+            [ -f "$_b" ] && [ ! -x "$_b" ] && _pm_noexec="$_pm_noexec ${_b#"$PDIR"/}"
         done
         case "$PM" in
             PASS*) pass payload-modes "${PM#PASS }${_pm_bits:+ (modes:$_pm_bits)}" ;;

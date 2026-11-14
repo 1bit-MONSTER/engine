@@ -1,0 +1,26 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# engine#2456. `tests_referenced_check` was satisfied by a *mention*, so these four tools' `--self-test` arms counted as run while
+# nothing ran them: their rows name a test that exercises the tool's logic (`tests/<tool>_test.py`), and the tool's own name appeared
+# only in the comments beside those rows. Under the narrowed rule they are real debt, and each now has the row it claimed.
+#
+# The spellings differ and that is the tools', not a typo: `gsm8k_eval.py` and `mtp_depth_pool.py` implement `--selftest` (the
+# hyphenated form is an argument error on the first and a *filename* on the second), while `q4nx_diff.py` and `seal_manifest.py` take
+# `--self-test`. All four were measured green at these spellings before the rows were written.
+add_python_test(gsm8k_eval_self ${CMAKE_SOURCE_DIR}/tools/gsm8k_eval.py --selftest)
+add_python_test(mtp_depth_pool_self ${CMAKE_SOURCE_DIR}/tools/mtp_depth_pool.py --selftest)
+add_python_test(q4nx_diff_self ${CMAKE_SOURCE_DIR}/tools/q4nx_diff.py --self-test)
+add_python_test(seal_manifest_self ${CMAKE_SOURCE_DIR}/tools/seal_manifest.py --self-test)

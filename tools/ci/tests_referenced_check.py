@@ -163,6 +163,46 @@ RUNNERS = ("CMakeLists.txt", "cmake", ".github/workflows")
 TOOL_RUNNERS = RUNNERS + ("tests",)
 
 
+# engine#2456: a mention is not an invocation. The old test was `tool.name in text` over the runner files, so a *comment* that
+# named the script satisfied the gate that exists to catch a self-test nobody runs -- measured by writing exactly such a comment:
+# green with the comment, red once it was reworded, green again with a real row.
+INVOCATION = re.compile(r"add_test|add_python_test|\bCOMMAND\b|\bpython3?\b|--self-test|\bbash\b")
+
+
+def _statements(text):
+    """Logical statements: backslash continuations joined, and newlines inside parentheses collapsed.
+
+    The parenthesised collapse is the part a one-line scan gets wrong (engine#2455): CMake wraps `add_test(NAME x` and
+    `COMMAND .../tool.py` onto separate lines with no backslash, so a line-at-a-time match reports four genuinely-registered
+    scripts as unregistered.
+    """
+    text = re.sub(r"\\\n", " ", text)
+    out, depth = [], 0
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth:
+            depth -= 1
+        if ch == "\n" and depth:
+            out.append(" ")
+            continue
+        out.append(ch)
+    return "".join(out).splitlines()
+
+
+def invokes(name, text):
+    """True when a statement names the script AND carries an invocation shape; comment lines are mentions, not invocations."""
+    if name in text and not INVOCATION.search(text):
+        return False                      # cheap out: a file with no invocation vocabulary cannot invoke anything
+    for line in _statements(text):
+        stripped = line.strip()
+        if stripped.startswith(("#", "//", "*", "<!--")) or stripped.endswith(".md") and stripped.startswith("* ["):
+            continue
+        if name in line and INVOCATION.search(line):
+            return True
+    return False
+
+
 def unregistered_selftest_tools(root):
     """tools/**/*.py and scripts/*.sh that declare a self-test and that no RUNNER names (engine#1901, engine#2129).
 
@@ -196,7 +236,7 @@ def unregistered_selftest_tools(root):
             continue
         if not SELFTEST.search(src):
             continue
-        if not any(tool.name in text for text in runner_text):
+        if not any(invokes(tool.name, text) for text in runner_text):
             drift.append(str(tool.relative_to(root)))
     return drift
 
@@ -329,6 +369,25 @@ def self_test():
     r = root_with(dict(base, **{"scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
                                  "cmake/tests-helper.cmake": "add_test(NAME helper_self COMMAND bash scripts/helper.sh --self-test)\n"}))
     cases.append(("...and a registration in cmake/*.cmake clears it", check(r), 0, None))
+
+    # 0c-0e. engine#2456: a mention is not an invocation. The gate exists to catch a self-test nobody runs, and it was satisfied
+    # by a *comment* that named the script -- the loophole was found by writing one, so it is pinned by writing one.
+    r = root_with(dict(base, **{"scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
+                                 "tests/mention.sh": "#!/bin/sh\n# see scripts/helper.sh for the self-test\n"}))
+    cases.append(("a comment that names a scripts/ self-test does NOT satisfy the gate", check(r), 1, "helper.sh"))
+    cases_root["a comment that names a scripts/ self-test does NOT satisfy the gate"] = r
+
+    r = root_with({"tests/ok.sh": "#!/bin/sh\n",
+                   "scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
+                   # continuation-wrapped, no backslash: the shape engine#2455's first scan mis-read on four real rows
+                   "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\nadd_test(NAME helper_self\n  COMMAND bash scripts/helper.sh --self-test)\n"})
+    cases.append(("...and a continuation-wrapped add_test DOES (the four false positives)", check(r), 0, None))
+
+    # the invocation goes INSIDE the already-registered test: a new tests/*.sh would be drift for a different, correct reason
+    r = root_with({"tests/ok.sh": "#!/bin/sh\npython3 scripts/helper.sh --self-test\n",
+                   "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n",
+                   "scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n"})
+    cases.append(("...and a python3 line in a registered test does", check(r), 0, None))
 
     # 1. a test nobody mentions -> drift, and it is NAMED
     r = root_with({"tests/lonely.sh": "#!/bin/sh\n", "CMakeLists.txt": "# nothing here\n"})

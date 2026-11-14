@@ -505,25 +505,24 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                     in_stride[i - 1] = in_stride[i] * size_t(a.dims[i]);
                     out_stride[i - 1] = out_stride[i] * size_t(r.dims[i]);
                 }
-                // engine#2366: kElemUnit-sized output ranges on the executor's threads, each starting its index walk from
-                // its first element. A copy, so any split is bit-identical.
-                const size_t total = r.data.size();
-                parallel_units((total + kElemUnit - 1) / kElemUnit, [&](size_t u) {
-                    const size_t o0 = u * kElemUnit, o1 = std::min(total, o0 + kElemUnit);
-                    std::vector<size_t> idx(perm.size(), 0);
-                    for (size_t d = 0, rem = o0; d < idx.size(); ++d) {
-                        idx[d] = rem / out_stride[d];
-                        rem %= out_stride[d];
+                // engine#2366: the inner loop walked the output one element at a time and recomputed the source offset
+                // with a dot product over all ranks (plus a carry) for every element. The output's LAST axis has a
+                // constant source stride -- in_stride[perm[rank-1]] -- whatever the perm is, so it is one strided gather
+                // per row: the offset is computed once, then stepped. Same reads, same writes, same order, so the result
+                // is bit-identical; only the index arithmetic leaves the inner loop.
+                const size_t rank = perm.size();
+                const size_t width = rank == 0 ? 1 : size_t(r.dims[rank - 1]);
+                const size_t rows_out = width == 0 ? 0 : r.data.size() / width;
+                const size_t step = rank == 0 ? 0 : in_stride[size_t(perm[rank - 1])];
+                parallel_units(rows_out, [&](size_t row) {
+                    size_t src = 0, rem = row;
+                    for (size_t d = rank; d-- > 1;) {
+                        const size_t dim = size_t(r.dims[d - 1]);
+                        src += (rem % dim) * in_stride[size_t(perm[d - 1])];
+                        rem /= dim;
                     }
-                    for (size_t o = o0; o < o1; ++o) {
-                        size_t src = 0;
-                        for (size_t i = 0; i < idx.size(); ++i) src += idx[i] * in_stride[size_t(perm[i])];
-                        r.data[o] = a.data[src];
-                        for (size_t d = idx.size(); d-- > 0;) {
-                            if (++idx[d] < size_t(r.dims[d])) break;
-                            idx[d] = 0;
-                        }
-                    }
+                    float* o = r.data.data() + row * width;
+                    for (size_t j = 0; j < width; ++j) o[j] = a.data[src + j * step];
                 });
             } else if (n.op == "Reshape") {
                 const Tensor& a = need(n.ins[0]);

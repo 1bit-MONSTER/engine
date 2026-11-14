@@ -461,6 +461,9 @@ set_tests_properties(hip_f16_audit PROPERTIES SKIP_RETURN_CODE 77)
 # engine#2398: the stale-branch test, which `tests_referenced` refuses to leave unregistered -- a test no
 # runner names is a test nobody runs.
 add_python_test(branch_stale_check_test ${CMAKE_SOURCE_DIR}/tests/branch_stale_check_test.py)
+# engine#2429: the guard-loss check declares a self-test, so it needs a row -- tests_referenced_check caught
+# this omission on the PR that added the tool, which is the check doing exactly its job.
+add_python_test(guard_loss_check_self ${CMAKE_SOURCE_DIR}/tools/ci/guard_loss_check.py --self-test)
 
 add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.

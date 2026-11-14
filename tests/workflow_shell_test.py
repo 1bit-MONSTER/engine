@@ -29,6 +29,7 @@ Two guarantees, both offline (CI installs no PyYAML, so the blocks are lifted ou
 """
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -203,6 +204,41 @@ if script:
         check("pin-watch: an unread upstream fails the run instead of a green no-PR day",
               p.returncode != 0 and "could not be bumped" in p.stdout + p.stderr, f"rc={p.returncode}")
         check("pin-watch: and opens nothing", not [c for c in calls if c.startswith("pr create")], str(calls))
+
+# 3. sync-lemonade-fork: keeping the fork's side of a conflicting commit can EMPTY the pick, and an
+#    unguarded `cherry-pick --continue` then fails the whole port - which is how main's sync went red
+#    on 2026-11-14 15:07Z ("The previous cherry-pick is now empty ... use 'git cherry-pick --skip'").
+#    Two arms: the step must keep the guard, and the guard must be the thing that works.
+text = open(os.path.join(WORKFLOWS, "sync-lemonade-fork.yml")).read()
+script = step_script(text, "Port upstream's latest release into the fork")
+check("sync: has the port step", script is not None)
+if script:
+    check("sync: an emptied pick is skipped, not left to `set -e`",
+          "if ! GIT_EDITOR=true git cherry-pick --continue" in script)
+    with tempfile.TemporaryDirectory() as tmp:
+        def g(*a):
+            return subprocess.run(["git"] + list(a), cwd=tmp, capture_output=True, text=True)
+        g("init", "-q"); g("config", "user.email", "t@e"); g("config", "user.name", "t")
+        pathlib.Path(tmp, "f.txt").write_text("base\n")
+        g("add", "-A"); g("commit", "-qm", "base"); base = g("rev-parse", "HEAD").stdout.strip()
+        g("checkout", "-q", "-b", "port"); pathlib.Path(tmp, "f.txt").write_text("fork\n")
+        g("commit", "-qam", "fork"); fork_head = g("rev-parse", "HEAD").stdout.strip()
+        g("checkout", "-q", "-b", "up", base); pathlib.Path(tmp, "f.txt").write_text("release\n")
+        g("commit", "-qam", "release"); rel = g("rev-parse", "HEAD").stdout.strip()
+        g("checkout", "-q", "port")
+        pick = g("cherry-pick", "-x", rel)
+        check("sync: the release commit does conflict with the fork's line", pick.returncode != 0, pick.stderr[:120])
+        g("checkout", "--ours", "--", "f.txt"); g("add", "-A", "--", "f.txt")
+        empty = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=tmp).returncode == 0
+        check("sync: and keeping ours leaves the pick empty (the CI failure)", empty)
+        cont = subprocess.run(["git", "cherry-pick", "--continue"], cwd=tmp, capture_output=True, text=True,
+                              env=dict(os.environ, GIT_EDITOR="true"))
+        check("sync: `--continue` alone refuses that empty pick", cont.returncode != 0, f"rc={cont.returncode}")
+        skip = subprocess.run(["git", "cherry-pick", "--skip"], cwd=tmp, capture_output=True, text=True,
+                              env=dict(os.environ, GIT_EDITOR="true"))
+        check("sync: `--skip` recovers it and keeps the fork's side",
+              skip.returncode == 0 and g("rev-parse", "HEAD").stdout.strip() == fork_head, f"rc={skip.returncode}")
+
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

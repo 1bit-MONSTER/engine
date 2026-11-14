@@ -198,7 +198,16 @@ jobs:
             conflicts+=("${changed[@]}")
             git checkout --ours -- "${changed[@]}" 2>/dev/null || true
             git add -A -- "${changed[@]}"
-            GIT_EDITOR=true git cherry-pick --continue > /dev/null
+            # Keeping the fork's side of a file the release also rewrote can leave the pick with
+            # NOTHING to commit -- the release's whole change to those files is what we just
+            # discarded -- and `git cherry-pick --continue` refuses an empty pick ("The previous
+            # cherry-pick is now empty ... use 'git cherry-pick --skip'"). Unguarded, that exit 1
+            # failed the whole sync on 2026-11-14 15:07Z. It is the same outcome as the skip in the
+            # no-conflict branch above: the fork's side is kept, and the files stay in the list for
+            # a person because the release's version of them is not in the port.
+            if ! GIT_EDITOR=true git cherry-pick --continue > /dev/null 2>&1; then
+              GIT_EDITOR=true git cherry-pick --skip > /dev/null 2>&1 || git cherry-pick --abort
+            fi
           done
           # One commit for the port, as the old merge produced: main's history stays one line per
           # upstream release. keep_fork_github for the same reason as before - the push must not

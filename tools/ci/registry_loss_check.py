@@ -65,6 +65,35 @@ def ref_exists(rev):
     return git("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}").returncode == 0
 
 
+def merged_classes(base, head, problems):
+    """The class set a merge of `head` into `base` would produce, or None when git cannot tell.
+
+    A two-ended comparison answers "what does the branch's tree look like", not "what would merging it do".
+    On a branch that is merely behind the base those differ: the endpoint diff lists every file the base has
+    advanced as removed, and nothing is removed by the merge. `git merge-tree --write-tree` is git's own
+    answer, so ask it instead of reasoning about the diff (engine#2390).
+    """
+    result = git("merge-tree", "--write-tree", head, base)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        first = detail[0][:160] if detail else ""
+        if result.returncode == 1:
+            problems.append(f"merging {head} into {base} conflicts ({first}); resolve it and re-run - "
+                            f"a conflicted branch is neither a loss nor a pass")
+        else:
+            problems.append(f"git merge-tree {head} {base} failed: {first}")
+        return None
+    tree = result.stdout.split("\n", 1)[0].strip()
+    if not tree:
+        problems.append("git merge-tree printed no tree")
+        return None
+    shown = git("show", f"{tree}:{SIGNIFICANT}")
+    if shown.returncode != 0:
+        problems.append(f"the merged tree {tree} has no {SIGNIFICANT}")
+        return None
+    return classes_of(shown.stdout, problems, "merged")
+
+
 def classes_of(text, problems, label):
     if text is None:
         return None
@@ -151,6 +180,15 @@ def main():
 
     lost_classes = sorted(base_classes - head_classes)
     added_classes = sorted(head_classes - base_classes)
+    behind_classes = []
+    if lost_classes:
+        merged = merged_classes(args.base, args.head, problems)
+        if merged is None:
+            print("registry_loss_check: " + "; ".join(problems[-1:]), file=sys.stderr)
+            return 2
+        # The merge is the authority: a class the merge keeps was never lost, only behind the base's moves.
+        behind_classes = [name for name in lost_classes if name in merged]
+        lost_classes = [name for name in lost_classes if name not in merged]
 
     base_census = counters_of(read_ref(args.base, CENSUS), problems, "base")
     head_census = counters_of(read_ref(args.head, CENSUS), problems, "head")
@@ -184,6 +222,9 @@ def main():
         print(f"FAIL registry_loss_check: census counter {item}")
     for item in lost_mentions:
         print(f"FAIL registry_loss_check: {item}")
+    if behind_classes and not args.quiet:
+        print(f"registry_loss_check: {len(behind_classes)} class(es) are absent at the head only because it is "
+              f"behind the base - the merge keeps them, so they are not a loss: {', '.join(behind_classes)}")
     if added_classes and not args.quiet:
         print(f"registry_loss_check: {len(added_classes)} class(es) added: {', '.join(added_classes)}")
     if moved_counters and not args.quiet:

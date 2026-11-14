@@ -289,6 +289,15 @@ add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set
 # gets one row.
 add_test(NAME dupdef_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --check
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# engine#2456: `tests_referenced_check` used to accept a MENTION of a script as an invocation, so four tools whose
+# `--self-test`/`--selftest` no row ever ran read as referenced -- by a comment in a test file. It now requires the
+# script's name and a self-test flag on the same line, which is what these four rows are: the check got stricter and
+# main has to be green under the stricter rule. Each flag spelling is the tool's own (`gsm8k_eval` spells it without
+# the hyphen; the other three with it).
+add_test(NAME dupdef_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --self-test)
+add_test(NAME gsm8k_eval_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/gsm8k_eval.py --selftest)
+add_test(NAME q4nx_diff_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/q4nx_diff.py --self-test)
+add_test(NAME seal_manifest_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/seal_manifest.py --self-test)
 # engine#2255: `--help` must not be a traceback. Five tools indexed sys.argv directly, so the flag
 # arrived as a filename -- one with IndexError, the others with `FileNotFoundError: '--help'`, and two
 # of those on `--help/dd_metastate_...`, which is what a path join with the flag looks like. Fixed; this

@@ -155,6 +155,13 @@ def referenced(root, need):
 
 
 SELFTEST = re.compile(r"--self[-_]?test\b")
+
+# engine#2456: a runner line that only *documents* a script is not a runner. Both comment styles appear in the tree
+# (`#` in CMake/shell/YAML, `//` in C++); a line starting with either, after leading whitespace, cannot invoke
+# anything, so a match there is a mention.
+def is_comment(line):
+    t = line.lstrip()
+    return t.startswith("#") or t.startswith("//")
 RUNNERS = ("CMakeLists.txt", "cmake", ".github/workflows")
 # A tool's `--self-test` can also be run from a python test, so THAT gate reads one more directory. The python-test gate must
 # not: with "tests" in the shared tuple, `tests/lonely_test.py` mentioning its own name satisfied "some runner names it" and the
@@ -179,6 +186,12 @@ def unregistered_selftest_tools(root):
         cand += [p for p in scripts.glob("*.sh")]
     if not cand:
         return []
+    # engine#2456: a MENTION is not an INVOCATION. `tests/` is a runner directory, so a comment in a test file that
+    # names the script used to satisfy this check -- i.e. the class it exists to prevent ("a self-test nobody runs",
+    # engine#2429/#2418/#2416) could be re-introduced by documenting the script. Reproduced on #2455: a comment in
+    # tests/pack_modes_test.sh naming scripts/window-run.sh read green while no row existed, and rewording the
+    # comment read red -- the check was answering "does this string appear" where it meant "does a runner run it".
+    # So collect LINES, not blobs, and count only a line that names the script AND passes --self-test.
     runner_text = []
     for sub in TOOL_RUNNERS:
         p = root / sub
@@ -188,6 +201,7 @@ def unregistered_selftest_tools(root):
                 runner_text.append(f.read_text(errors="replace"))
             except OSError:
                 pass
+    runner_lines = [ln for text in runner_text for ln in text.splitlines()]
     drift = []
     for tool in sorted(cand):
         try:
@@ -196,7 +210,12 @@ def unregistered_selftest_tools(root):
             continue
         if not SELFTEST.search(src):
             continue
-        if not any(tool.name in text for text in runner_text):
+        # Both spellings occur in the tree (`--self-test` and `--selftest`); the same regex the declaration side
+        # uses must decide the invocation side, or a tool declaring one form reads as unreferenced forever.
+        # AND the line must not be a comment: a comment naming the script WITH the flag is precisely the case that
+        # read green for months (`# see tools/x.py --self-test for the arms`), and it is the shape the self-test's
+        # first arm pins -- requiring the flag alone did not catch it, excluding comment lines does.
+        if not any(tool.name in ln and SELFTEST.search(ln) and not is_comment(ln) for ln in runner_lines):
             drift.append(str(tool.relative_to(root)))
     return drift
 
@@ -363,6 +382,22 @@ def self_test():
     r = root_with({"tests/ci.sh": "#!/bin/sh\n", "CMakeLists.txt": "",
                    ".github/workflows/ci.yml": "run: bash tests/ci.sh\n"})
     cases.append(("a mention in a workflow counts", check(r), 0, None))
+
+    # 4a. engine#2456: a MENTION is not an INVOCATION. A comment in a runner file that names the script used to
+    # satisfy this check -- reproduced on #2455, where a comment in tests/pack_modes_test.sh naming
+    # scripts/window-run.sh read green while no row existed. The pair below is the whole rule: the same tree, once
+    # with the name only in a comment (drift) and once with a real row (clean), so a regression to substring
+    # matching fails the first arm while anything that only checks the positive case still passes.
+    tool = "import sys\nif '--self-test' in sys.argv: pass\n"
+    row_t = "add_test(NAME t COMMAND bash tests/t.sh)\n"
+    r = root_with({"tools/mine.py": tool,
+                   "tests/t.sh": "#!/bin/sh\n# see tools/mine.py --self-test for the arms\n",
+                   "CMakeLists.txt": row_t})
+    cases.append(("a COMMENT naming a tool --self-test is still drift", check(r), 1, "tools/mine.py"))
+    cases_root["a COMMENT naming a tool --self-test is still drift"] = r
+    r = root_with({"tools/mine.py": tool, "tests/t.sh": "#!/bin/sh\n",
+                   "CMakeLists.txt": row_t + "add_test(NAME mine COMMAND python3 tools/mine.py --self-test)\n"})
+    cases.append(("...and a real add_test row clears the same tree", check(r), 0, None))
 
     # 4b. a PYTHON test naming only itself is drift even though `tests/` is a run site for TOOL self-tests -- the two gates
     # read different corpora on purpose (measured: sharing one tuple let tests/lonely_test.py register itself)

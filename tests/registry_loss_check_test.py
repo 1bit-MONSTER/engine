@@ -122,6 +122,33 @@ class RegistryLossCheckTest(unittest.TestCase):
         self.assertIn("behind the base", result.stdout)
         self.assertNotIn("FAIL", result.stdout)
 
+    def test_a_squash_merge_keeps_the_class_the_base_added(self):
+        """The premise the behind-the-base classification rests on, demonstrated rather than assumed.
+
+        `registry_loss_check` reports a class missing from a behind branch as *not a loss* because the merge is what
+        lands. This runs the merge, and it is built so the two answers differ: the branch is cut BEFORE the class
+        exists, so a checkout of the branch would lose it and a merge keeps it -- which is why the assertion can tell
+        them apart (a version of this test using the setUp history could not: the branch carried the class too, so a
+        mutant that swapped the merge for a checkout still passed).
+        """
+        fork = self.repo
+        self.write("registry/significant.json", json.dumps({"classes": {"OmoikaneForCausalLM": {}}}, indent=1))
+        commit(fork, "before the class exists")
+        cut = git(fork, "rev-parse", "HEAD").stdout.strip()
+        self.write("notes.txt", "branch work\n")
+        commit(fork, "the branch does something unrelated")
+        behind = git(fork, "rev-parse", "HEAD").stdout.strip()
+        git(fork, "checkout", "-q", cut)
+        self.write("registry/significant.json",
+                   json.dumps({"classes": {"OmoikaneForCausalLM": {}, "Skylar2ForCausalLM": {}}}, indent=1))
+        commit(fork, "the base adds a class after the branch was cut")
+
+        merged = git(fork, "merge", "--squash", behind)
+        self.assertEqual(0, merged.returncode, merged.stdout + merged.stderr)
+        landed = json.loads(open(os.path.join(fork, "registry/significant.json"), encoding="utf-8").read())
+        self.assertIn("Skylar2ForCausalLM", landed["classes"],
+                      "a squash merge keeps the class the base added; the behind classification depends on this")
+
     def test_a_dirty_tree_is_named_because_the_check_reads_commits(self):
         # It reads `git show HEAD:...`, so uncommitted work is invisible. A dirty tree must say so instead of
         # reading as a clean result.

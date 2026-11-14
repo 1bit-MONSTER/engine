@@ -1043,6 +1043,18 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(payload_modes_verdict '' 0)"
     check FAIL "$(payload_modes_verdict 0 '')"
     check FAIL "$(payload_modes_verdict x 0)"
+    # engine#2422 (the helper main kept from #2423): the row now FAILS on a payload that carries its own binaries
+    # without an execute bit, and nothing above exercised the helper that decides it -- so the rule was asserted in
+    # prose and untested where the tool tests itself. engine#2424 measured the shape: both binaries at 0644.
+    ST=$(mktemp -d)
+    mkdir -p "$ST/noexec/1bit" "$ST/noexec/bin" "$ST/exec/1bit" "$ST/exec/bin"
+    for _f in "$ST/noexec/1bit/1bit" "$ST/noexec/bin/lemond" "$ST/exec/1bit/1bit" "$ST/exec/bin/lemond"; do : > "$_f"; done
+    chmod 0644 "$ST/noexec/1bit/1bit" "$ST/noexec/bin/lemond"
+    chmod 0755 "$ST/exec/1bit/1bit" "$ST/exec/bin/lemond"
+    check ' 1bit/1bit bin/lemond' "$(payload_modes_noexec "$ST/noexec")"   # the measured 0644 shape: named, in payload order
+    check '' "$(payload_modes_noexec "$ST/exec")"                        # an executable payload is not an offender
+    check '' "$(payload_modes_noexec "$ST/absent")"                      # absence is deliberately NOT an offender (the helper's own note)
+    rm -rf "$ST"
     # engine#1557: the payload's own identity - a claim that matches is a PASS, a stale one is a FAIL, and an image without
     # the field is a SKIP that says why rather than a pass by absence
     check PASS "$(payload_identity_verdict '2026.47.0~8.f44ff953' '2026.47.0~8.f44ff953')"

@@ -448,7 +448,9 @@ add_python_test(pr_carry_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_carry_check.
 # engine#2021 / engine#2369 review: `registry_build.py --check-gaps` iterates the classes that are PRESENT, so a
 # branch that deletes a reviewed class passes it -- measured on #2021, where 41 classes became 40 and --check-gaps
 # still printed "none of the 41 reviewed significant classes is mapped". A test row for the three arms that do see it.
-add_python_test(registry_loss_check_test ${CMAKE_SOURCE_DIR}/tests/registry_loss_check_test.py)
+# engine#2445 review: run the tool, not the file, so CI exercises `--self-test` itself -- a row that
+# invokes tests/<tool>_test.py directly never notices if the flag stops working. Same row names, same arms.
+add_python_test(registry_loss_check_test ${CMAKE_SOURCE_DIR}/tools/ci/registry_loss_check.py --self-test)
 # engine#2406 puts "audit those on a pin bump" on the f16 ratchet's green line; this is that audit
 # for the HIP add-on's kernels, which the ratchet cannot see (it walks *.loom).
 add_python_test(hip_f16_audit_self ${CMAKE_SOURCE_DIR}/tools/ci/hip_f16_audit.py --self-test)
@@ -460,10 +462,16 @@ add_test(NAME hip_f16_audit COMMAND ${Python3_EXECUTABLE}
 set_tests_properties(hip_f16_audit PROPERTIES SKIP_RETURN_CODE 77)
 # engine#2398: the stale-branch test, which `tests_referenced` refuses to leave unregistered -- a test no
 # runner names is a test nobody runs.
-add_python_test(branch_stale_check_test ${CMAKE_SOURCE_DIR}/tests/branch_stale_check_test.py)
+# engine#2445 review: the rows run the tool, so CI exercises the flag (a row naming the test file never
+# would). base's own addition here -- guard_loss_check_self -- is kept as it is.
+add_python_test(branch_stale_check_test ${CMAKE_SOURCE_DIR}/tools/ci/branch_stale_check.py --self-test)
 # engine#2429: the guard-loss check declares a self-test, so it needs a row -- tests_referenced_check caught
 # this omission on the PR that added the tool, which is the check doing exactly its job.
 add_python_test(guard_loss_check_self ${CMAKE_SOURCE_DIR}/tools/ci/guard_loss_check.py --self-test)
+# engine#2445 review: and the flag itself must be load-bearing -- a row that ran the tool but
+# dropped the child's status would stay green while both arms above went red. Measured with a
+# scratch tree whose test file exits 1 (status dropped -> 0 vs 0), and with the flag ignored.
+add_python_test(self_test_flag ${CMAKE_SOURCE_DIR}/tests/self_test_flag_test.py)
 
 add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.

@@ -241,9 +241,16 @@ def unregistered_py_tests(root):
                 runner_text.append(path.read_text(errors="replace"))
             except OSError:
                 continue
+    # engine#2445: a row that runs `tools/ci/<tool>.py --self-test` DOES run tests/<tool>_test.py -- that
+    # is what the flag executes. Without this, rewiring a row from the file to the tool (so CI exercises
+    # the flag at all) reads as "no runner names the test", and the check fails on the improvement.
+    selftest_named = set()
+    for t in runner_text:
+        for m in re.finditer(r"tools/ci/([A-Za-z0-9_]+)\.py\s+--self[-_]?test", t):
+            selftest_named.add(m.group(1) + "_test.py")
     out = []
     for q in cand:
-        if q.name in imported:
+        if q.name in imported or q.name in selftest_named:
             continue
         if not any(q.name in t for t in runner_text):
             out.append(str(q.relative_to(root)))
@@ -331,6 +338,19 @@ def self_test():
     cases.append(("...and a registration in cmake/*.cmake clears it", check(r), 0, None))
 
     # 1. a test nobody mentions -> drift, and it is NAMED
+    # 1a-ii. engine#2445: a row may run the TOOL's --self-test instead of the test file, because that is
+    # what makes CI exercise the flag. Both halves are pinned: with the flag it counts as a row, and the
+    # same row without `--self-test` does not (otherwise this rule would excuse a row that runs nothing).
+    r = root_with({"tests/foo_test.py": "print('ok')\n",
+                   "tools/ci/foo.py": "import argparse\nargparse.ArgumentParser().add_argument('--self-test', action='store_true')\n",
+                   "CMakeLists.txt": "add_python_test(foo ${CMAKE_SOURCE_DIR}/tools/ci/foo.py --self-test)\n"})
+    cases.append(("a row running tools/ci/foo.py --self-test references tests/foo_test.py", check(r), 0, None))
+    r = root_with({"tests/foo_test.py": "print('ok')\n",
+                   "tools/ci/foo.py": "print('no flag here')\n",
+                   "CMakeLists.txt": "add_python_test(foo ${CMAKE_SOURCE_DIR}/tools/ci/foo.py --check)\n"})
+    cases.append(("...but the same row WITHOUT --self-test does not", check(r), 1, "foo_test.py"))
+    cases_root["...but the same row WITHOUT --self-test does not"] = r
+
     r = root_with({"tests/lonely.sh": "#!/bin/sh\n", "CMakeLists.txt": "# nothing here\n"})
     cases.append(("an unreferenced test is drift", check(r), 1, "lonely.sh")); cases_root["an unreferenced test is drift"] = r
 

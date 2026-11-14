@@ -30,55 +30,50 @@
 # sites by design.
 #
 # usage: release_check_payload_modes_test.sh <path-to-release-check.sh>
+#
+# The FIRST version of this fixture ran `release-check.sh --check` three times, once per payload: 34 s here and **392 s in CI**
+# (18 s per run locally became 130 s in a container), for three `[ -x ]` lines. So it now does what the neighbouring
+# `release_check_hrx_init_reason_test.sh` does - extract the function and test it - plus one grep that pins the CALL SITE, because a
+# correct function nothing calls is the defect this whole row is about (engine#2416/#2422 shape, and the engine#2238 lesson: a test
+# should pin where the call lives, not only that the callee works).
 set -u
 
 RC=${1:?usage: release_check_payload_modes_test.sh <path-to-release-check.sh>}
 [ -r "$RC" ] || { echo "not readable: $RC"; exit 1; }
 
+FN=$(awk '/^ *payload_modes_noexec\(\) \{/{f=1} f{print} f&&/^ *\}$/{exit}' "$RC")
+[ -n "$FN" ] || { echo "FAIL no payload_modes_noexec() in $RC - the row cannot require an executable engine (engine#2422)"; exit 1; }
+case "$RC" in
+    *"this line is never matched"*) : ;;
+esac
+grep -q 'payload_modes_noexec "\$PDIR"' "$RC" || { echo "FAIL payload_modes_noexec() is defined but never called on the payload - a guard nothing calls"; exit 1; }
+
 ROOT=$(mktemp -d "${TMPDIR:-$HOME/.cache}/release-check-pm.XXXXXX") || exit 1
 trap 'rm -rf "$ROOT"' EXIT
 fail=0
 
-mkpayload() {   # <dir> <mode or "none">
-    local d=$ROOT/$1 mode=$2 i
-    mkdir -p "$d/1bit" "$d/bin"
-    for i in $(seq 1 120); do : > "$d/lib$i.so"; done
-    find "$d" -type d -exec chmod 0755 {} +
-    find "$d" -type f -exec chmod 0644 {} +
-    if [ "$mode" != none ]; then
-        printf 'x' > "$d/1bit/1bit"; printf 'x' > "$d/bin/lemond"
-        chmod "$mode" "$d/1bit/1bit" "$d/bin/lemond"
+mktree() {   # <name> <mode|none>
+    mkdir -p "$ROOT/$1/1bit" "$ROOT/$1/bin"
+    if [ "$2" != none ]; then
+        printf 'x' > "$ROOT/$1/1bit/1bit"; printf 'x' > "$ROOT/$1/bin/lemond"
+        chmod "$2" "$ROOT/$1/1bit/1bit" "$ROOT/$1/bin/lemond"
     fi
 }
 
-run_row() {     # <dir> -> the payload-modes line
-    PAYLOAD_DIR=$ROOT/$1 HW_SKIPPED=gpu,npu,npu-power,models,chat-hrx,chat-npu \
-        timeout 300 bash "$RC" --check 2>&1 | grep -m1 'payload-modes' || true
-}
-
-mkpayload p644 0644
-line=$(run_row p644)
-case "$line" in
-    FAIL*"payload-modes"*"not executable"*"1bit/1bit"*"bin/lemond"*)
-        echo "ok    a 0644 engine and lemond FAIL, and both are named" ;;
-    *)  echo "FAIL  a 0644 payload was not refused: ${line:-<no payload-modes line>}"; fail=1 ;;
+mktree p644 0644
+got=$(bash -c "$FN"$'\npayload_modes_noexec "$1"' _ "$ROOT/p644")
+case "$got" in
+    *1bit/1bit*bin/lemond*) echo "ok    a 0644 engine and lemond are both named as not executable" ;;
+    *) echo "FAIL  a 0644 payload was not reported: '${got}'"; fail=1 ;;
 esac
 
-mkpayload p755 0755
-line=$(run_row p755)
-case "$line" in
-    PASS*"payload-modes"*"modes:"*"755 1bit/1bit"*)
-        echo "ok    a 0755 payload PASSes and still prints its modes" ;;
-    *)  echo "FAIL  a healthy payload was not accepted with its modes: ${line:-<no payload-modes line>}"; fail=1 ;;
-esac
+mktree p755 0755
+got=$(bash -c "$FN"$'\npayload_modes_noexec "$1"' _ "$ROOT/p755")
+[ -z "$got" ] && echo "ok    a 0755 payload reports nothing" || { echo "FAIL  a healthy payload was reported: '${got}'"; fail=1; }
 
-mkpayload pnone none
-line=$(run_row pnone)
-case "$line" in
-    PASS*"payload-modes"*)
-        echo "ok    a payload with no binaries still PASSes (absence is another row's claim)" ;;
-    *)  echo "FAIL  a binary-less payload changed verdict: ${line:-<no payload-modes line>}"; fail=1 ;;
-esac
+mktree pnone none
+got=$(bash -c "$FN"$'\npayload_modes_noexec "$1"' _ "$ROOT/pnone")
+[ -z "$got" ] && echo "ok    a payload with no binaries reports nothing (absence is another row's claim)" || { echo "FAIL  a binary-less payload was reported: '${got}'"; fail=1; }
 
 echo "release_check_payload_modes_test: $fail failure(s)"
 exit $((fail > 0))

@@ -779,6 +779,19 @@ kernel_cve_verdict() {
     fi
 }
 
+payload_modes_noexec() {   # <payload dir> -> the binaries present but not executable, space-separated and payload-relative
+    # engine#2422: the row prints the modes, and printing is not asserting. A 0644 `1bit/1bit` passes the writability rule and then
+    # makes hrx-placement SKIP (`[ -x ]` cannot find a runnable engine), so the check was green over a payload that cannot run.
+    # Absence is deliberately NOT an offender: a binary that is not here is hrx-device's or identity's claim, and a payload still
+    # being extracted is caught by the entry floor above.
+    _pe_dir=${1:-} _pe_out=
+    for _pe_b in "$_pe_dir/1bit/1bit" "$_pe_dir/bin/lemond" "$_pe_dir/lemond-onebit"; do
+        [ -f "$_pe_b" ] || continue
+        { [ -x "$_pe_b" ] || _pe_out="$_pe_out ${_pe_b#"$_pe_dir"/}"; } 2>/dev/null || true
+    done
+    printf '%s' "$_pe_out"
+}
+
 payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
     _f=${1:-} _d=${2:-} _sample=${3:-}
     case "$_f" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s file modes could not be counted (%s)' "${_f:-empty}"; return 0 ;; esac
@@ -2201,12 +2214,13 @@ else
         # engine cannot run - measured on a real 258-entry payload: `PASS payload-modes (modes: 644 1bit/1bit 644 bin/lemond)`
         # beside `SKIP hrx-placement`. Absence stays out of this row's claim: a binary that is not here is hrx-device's or
         # identity's business, and a payload mid-extraction is already caught by the floor above.
-        _pm_noexec=
         for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemond-onebit"; do
-            [ -f "$_b" ] || continue
-            _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"
-            [ -x "$_b" ] || _pm_noexec="$_pm_noexec ${_b#"$PDIR"/}"
+            [ -f "$_b" ] && _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"
         done
+        # The executability requirement is its own function so `tests/release_check_payload_modes_test.sh` can extract and test
+        # it without running the whole check: the first version of that fixture ran `release-check.sh --check` three times and cost
+        # **392 s** in CI (18 s locally became 130 s per arm in a container), which is not a price three `[ -x ]` lines may charge.
+        _pm_noexec=$(payload_modes_noexec "$PDIR")
         if [ -n "$_pm_noexec" ]; then
             fail payload-modes "in the payload but not executable:${_pm_noexec} - a 0644 engine or lemond refuses to run, and hrx-placement then SKIPs instead of failing (modes:$_pm_bits)"
         else

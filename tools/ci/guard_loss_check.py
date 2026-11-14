@@ -41,7 +41,12 @@ import argparse, re, subprocess, sys
 
 GUARD_KEYWORDS = ("refus", "assert", "GGML_ABORT", "!= 0", "== nullptr", "cannot", "must be", "is not set")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]{3,}")
-SKIP_DIRS = ("third_party/", "docs/", "registry/", "tests/data/")
+# engine#2451: `tests/`, not only `tests/data/`. A test's `REQUIRE`/`CHECK` is a fixture, not the
+# product's refusal - and the heuristic cannot see that style anyway (REQUIRE is not a guard keyword),
+# so skipping tests/ loses nothing it could catch while removing the case that would redden a PR for
+# rewriting an assertion on purpose (measured: 8 of 72 LOST hits over 55 fork commits were in tests/,
+# every one a deliberate assertion rewrite; the engine, where the row runs, was 0 over 11 heads).
+SKIP_DIRS = ("third_party/", "docs/", "registry/", "tests/")
 
 
 def git(*args, cwd=None):
@@ -209,6 +214,22 @@ def self_test():
         rc_rw = check(td0, "HEAD^", "HEAD")
     chk("a guard rewritten with its identifiers present is a note, not a crash", rc_rw, 0)
     chk("  ... and it is reported as rewritten", "rewritten" in buf0.getvalue(), True)
+
+    # 0b. THE SKIP ARM (engine#2451): a guard deleted under tests/ is not reported, and the same guard
+    #     under src/ is - the docstring and SKIP_DIRS must say the same thing, and the skip must not be
+    #     so wide that it silences product code.
+    guard = "int f(void*p,size_t n){ if (p == nullptr || n % TENSOR_ALIGNMENT != 0) { return -1; } return 0; }\n"
+    gone  = "int f(void*p,size_t n){ return 0; }\n"
+    td_t = scratch({"tests/a.cpp": guard}, {"tests/a.cpp": gone})
+    buf_t = io.StringIO()
+    with contextlib.redirect_stdout(buf_t):
+        rc_test = check(td_t, "HEAD^", "HEAD")
+    chk("a guard deleted under tests/ is skipped (fixtures are not refusals)", rc_test, 0)
+    td_s = scratch({"src/a.cpp": guard}, {"src/a.cpp": gone})
+    buf_s = io.StringIO()
+    with contextlib.redirect_stdout(buf_s):
+        rc_src = check(td_s, "HEAD^", "HEAD")
+    chk("the same guard under src/ is still reported", rc_src, 1)
 
     # 1. a guard deleted outright, nothing else changed -> LOST, rc 1
     td = scratch({"src/a.cpp": "int f(void*p,size_t n){ if (p == nullptr || n % TENSOR_ALIGNMENT != 0) { return -1; } return 0; }\n"},

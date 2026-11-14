@@ -34,6 +34,8 @@ A verdict of NOISE is not a failure of the measurement; it is the measurement te
 take more samples or to stop quoting the difference.
 """
 import statistics
+import json
+import os
 import sys
 
 
@@ -113,6 +115,29 @@ def self_test():
     check(ratio != 1.0, "sanity: the real data is not a flat line")
 
     # direction: the same verdict reads differently for tok/s and for ms/token
+    # --bench reads the metric a cell actually means: a ttft cell's latency is ttft_s, not bench.py's `median`
+    ttft = {"cell": "ttft2k", "median": 61.9, "reps": [{"ttft_s": 0.91, "tg_tok_s": 61.9}, {"ttft_s": 0.93, "tg_tok_s": 62.0}]}
+    series, lower = bench_series(ttft)
+    check(series == [0.91, 0.93] and lower, "a ttft cell's series is ttft_s, and lower is better")
+    pp = {"cell": "pp512", "median": 2200.0, "reps": [{"ttft_s": 0.2, "pp_tok_s": 2200.0}, {"ttft_s": 0.21, "pp_tok_s": 2210.0}]}
+    series, lower = bench_series(pp)
+    check(series == [2200.0, 2210.0] and not lower, "a prefill cell's series is pp_tok_s, and higher is better")
+
+    # an arm that measured nothing must not be compared: bench.py records `skip` and no median for a cell it could not
+    # run, and tonight one arm produced exactly that (a compute fault on a 35B). The mode says "no cell measured in both
+    # arms" and returns 1 rather than printing an empty table that reads like agreement.
+    import tempfile as _tf
+    _d = _tf.mkdtemp()
+    _empty = os.path.join(_d, "empty.json")
+    _full = os.path.join(_d, "full.json")
+    with open(_empty, "w") as f:
+        json.dump({"cells": [{"cell": "pp512", "skip": "no content streamed"}], "started": "x", "tag": "empty"}, f)
+    with open(_full, "w") as f:
+        json.dump({"cells": [{"cell": "pp512", "median": 700.0, "prompt_tokens": 512,
+                              "reps": [{"ttft_s": 0.7, "pp_tok_s": 700.0}, {"ttft_s": 0.71, "pp_tok_s": 710.0}]}],
+                   "started": "x", "tag": "full"}, f)
+    check(bench_compare(_empty, _full) == 1, "an arm that measured nothing is not a comparison")
+
     check("higher" in direction_word("A", False), "default direction says higher")
     check("lower" in direction_word("B", True), "--lower says lower is better")
     check("neither" in direction_word("NOISE", True), "noise names no winner")
@@ -131,12 +156,77 @@ def self_test():
     return 0 if fails == 0 else 1
 
 
+def bench_series(cell):
+    """(series, lower_is_better) for one bench.json cell, in the metric the cell actually means.
+
+    `ttft2k` runs with max_tokens=32, so bench.py's `median` for it is the DECODE tok/s measured after the first token;
+    the latency is `ttft_median_s` and the per-rep latency is `reps[].ttft_s`. summary.py:88 documents this and its
+    value() returns ttft_median_s - reading `median` for a ttft cell is how a latency row ends up wrong.
+    """
+    reps = cell.get("reps") or []
+    if cell.get("cell", "").startswith("ttft"):
+        return [r.get("ttft_s") for r in reps if r.get("ttft_s") is not None], True
+    key = "tg_tok_s" if (cell.get("prompt_tokens") or 0) and len(reps) and reps[0].get("tg_tok_s") is not None \
+        else "pp_tok_s"
+    return [r.get(key) for r in reps if r.get(key) is not None], False
+
+
+def bench_compare(path_a, path_b):
+    """Per-cell winner between two bench.py arms, using THIS file's rule (disjoint ranges)."""
+    def cells(path):
+        data = json.load(open(path))
+        return {c["cell"]: c for c in data.get("cells", []) if c.get("median") is not None or c.get("ttft_median_s")}, \
+            data.get("started", "?"), data.get("tag", "?")
+
+    a_cells, a_start, a_tag = cells(path_a)
+    b_cells, b_start, b_tag = cells(path_b)
+    common = [c for c in a_cells if c in b_cells]
+    if not common:
+        print(f"medians.py: no cell measured in both arms (A: {sorted(a_cells)}, B: {sorted(b_cells)})", file=sys.stderr)
+        return 1
+    print(f"A: {path_a}  (tag {a_tag}, started {a_start})")
+    print(f"B: {path_b}  (tag {b_tag}, started {b_start})")
+    print()
+    print("| cell | A median [min,max] n | B median [min,max] n | winner | margin | why |")
+    print("|---|---|---|---|---|---|")
+    counts = {"A": 0, "B": 0, "NOISE": 0}
+    for name in common:
+        sa, lower = bench_series(a_cells[name])
+        sb, _ = bench_series(b_cells[name])
+        if len(sa) < 2 or len(sb) < 2:
+            counts["NOISE"] += 1
+            print(f"| {name} | n={len(sa)} | n={len(sb)} | NOISE | - | a single sample is not a range |")
+            continue
+        result = verdict(sa, sb)
+        counts[result] += 1
+        ma, la, ha, _ = spread(sa)
+        mb, lb, hb, _ = spread(sb)
+        if result == "NOISE":
+            margin, why = "-", "ranges overlap"
+        elif result == "A":
+            margin, why = f"x{((mb / ma) if lower else (ma / mb)):.2f}", "ranges disjoint"
+        else:
+            margin, why = f"x{((ma / mb) if lower else (mb / ma)):.2f}", "ranges disjoint"
+        print(f"| {name} | {ma:.3f} [{la:.3f},{ha:.3f}] {len(sa)} | {mb:.3f} [{lb:.3f},{hb:.3f}] {len(sb)} | "
+              f"{result} | {margin} | {why} |")
+    print()
+    print(f"verdicts: A {counts['A']}, B {counts['B']}, NOISE {counts['NOISE']} ({len(common)} cells compared)")
+    return 0
+
+
 def main(argv):
     if "--help" in argv or "-h" in argv:
         print(__doc__.strip())
         return 0
     if "--self-test" in argv:
         return self_test()
+    if "--bench" in argv:
+        i = argv.index("--bench")
+        paths = [a for a in argv[i + 1:] if not a.startswith("-")]
+        if len(paths) != 2:
+            print("medians.py: --bench takes exactly two bench.json paths", file=sys.stderr)
+            return 2
+        return bench_compare(paths[0], paths[1])
     lower_is_better = "--lower" in argv
     argv = [a for a in argv if a != "--lower"]
     def samples(tokens, flag):

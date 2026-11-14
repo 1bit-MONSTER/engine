@@ -1078,7 +1078,9 @@ The text is identical. Over six interleaved arms (trace off), prompt eval was 32
 (or `GGML_HRX_PREFILL_FOLLOWS_DECODE=0`) restores the fused kernel for Q4_K, `GGML_HRX_Q6K_PACKED_ROWS=0` the stored Q6_K binding.
 Before either, making decode step aside instead was measured and does not help:
 the same duplicates, and decode 8.5 % slower. flint UD-Q4_K_XL (routed experts) reads every weight stored and holds one copy per
-weight with or without the default.
+weight with or without the default. (That sentence is about **resident copies**, not bytes read per decode step: a step reads
+only the routed experts, `expert_used_count / expert_count` = 6 of 256 for this model. Had it read all 256, flint's measured
+42.61 tok/s would imply 1,067 GB/s, above this box's 256 GB/s peak.)
 
 **Since pin `962507f8e` a short prompt holds no weight twice either** (llama.cpp #324, #325). At 6 to 8 tokens the few-token
 kernels took the batch and read the stored layout of weights that prefill reads in the packed rows, so a short prompt or a

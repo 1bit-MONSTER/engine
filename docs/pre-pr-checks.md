@@ -16,12 +16,12 @@ limitations under the License.
 -->
 # Before you ask for a merge
 
-Eight commands, all host-side, none needing a device or a build. Every one of them answers a question that
+Nine commands, all host-side, none needing a device or a build. Every one of them answers a question that
 `mergeable=true`, a green CI tick and a careful read of your own diff do not.
 
 Run them from the repository root on the branch you are about to hand over.
 
-**`scripts/pre-pr-checks.sh` runs the first seven**, one line each (`--base <ref>` for the registration check, `--list` to see the
+**`scripts/pre-pr-checks.sh` runs the first eight**, one line each (`--base <ref>` for the registration check, `--list` to see the
 commands; a check that cannot run says `skip` and why, and an unresolvable `--base` is a usage error rather than a skip). The
 eighth is an **author's check**, true or false exactly once — when you add a page — so it is not in the runner, and the section
 below says why. The table's order is the runner's order: cheapest and most common first, and the check that needs a revision
@@ -36,6 +36,7 @@ below says why. The table's order is the runner's order: cheapest and most commo
 | `python3 tools/ci/tmp_path_check.py --check` | a new `/tmp` or `/dev/shm` path, where builds and dumps belong under `~/wt` or `~/.cache/scratch-*` |
 | `python3 tools/ci/submodule_pin_check.py --check` | a submodule's checkout is not the commit the tree pins |
 | `python3 tools/ci/registration_loss_check.py --check --base origin/main` | your branch would drop rows `main` has |
+| `python3 tools/ci/registry_loss_check.py --base origin/main` | a reviewed class, a `coverage` counter or a test's mention of a class that the base has is gone at the merge, not only at the endpoint (engine#2385, #2391) |
 | `git grep -l -F "$(basename <your new page>)" -- '*.md'` | nothing links to the page you just added — measured tonight: 45 docs, one with no inbound link, and it was the page whose whole subject is pre-merge checks |
 
 Two more, for the moments they are for:

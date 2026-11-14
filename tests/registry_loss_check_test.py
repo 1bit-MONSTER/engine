@@ -122,6 +122,14 @@ class RegistryLossCheckTest(unittest.TestCase):
         self.assertIn("behind the base", result.stdout)
         self.assertNotIn("FAIL", result.stdout)
 
+    def test_a_dirty_tree_is_named_because_the_check_reads_commits(self):
+        # It reads `git show HEAD:...`, so uncommitted work is invisible. A dirty tree must say so instead of
+        # reading as a clean result.
+        with open(os.path.join(self.repo, "registry/significant.json"), "w", encoding="utf-8") as handle:
+            json.dump({"classes": {}}, handle)
+        result = self.run_check(self.base, "HEAD")
+        self.assertIn("uncommitted path(s) are NOT included", result.stdout)
+
     def test_a_ref_that_cannot_be_read_refuses_instead_of_passing(self):
         result = self.run_check(self.base, "no-such-ref")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

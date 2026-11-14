@@ -121,6 +121,32 @@ carried an already-merged commit for the same reason.
   side drops them; rebase and keep every row `main` has;
 - **stale and clean** — behind, not destructive: the merge keeps `main`'s rows. Rebase when convenient.
 
+### The same thing read from the reviewer's side: a stale branch is not a revert
+
+`git diff --name-status origin/main <branch>` compares **two endpoints**, so on a branch that is merely behind it lists every file
+`main` advanced as *modified or deleted* — including files the branch never touched. That output is indistinguishable from a branch
+that reverted them, and on 2026-11-13 three reviewers in one night read it as a revert: #2021 ("the merge reverts #2368"), #2369
+("the branch deletes a file it should keep") and #2387 ("would revert #2366/#2386's audio work"). In two of the three, the merge
+preserved every file byte-for-byte.
+
+Two commands separate the cases, and neither needs the branch checked out:
+
+```bash
+git diff --name-status origin/main...<branch>        # three dots: the branch's OWN changes, against its merge base
+git merge-tree --write-tree <branch> origin/main     # what a merge would actually produce
+```
+
+If the three-dot diff lists only files the PR means to change, and the merged tree's copy of the suspect files is identical to
+`main`'s, the branch is **behind, not reverting** — a merge or squash takes its diff from the merge base, which contains neither the
+missing files nor a deletion of them. The case it *is* a revert is easy to tell apart too:
+
+```bash
+git log --oneline origin/main..<branch> -- <suspect file>    # empty = your branch never touched it
+```
+
+Rebasing is still worth doing for a stale branch — a rebased head makes the endpoint diff self-evident to the next reader and costs
+one command — but *hold* is a different verdict from *stale*, and the difference is one `merge-tree` away.
+
 ## The one that is not a command: build the target that contains the file you edited
 
 Nothing above compiles anything, and a green `build` tick does not answer this question either -- it answers "the targets CI built

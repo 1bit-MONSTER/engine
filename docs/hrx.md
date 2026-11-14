@@ -518,9 +518,10 @@ the first sampled token, which is [engine#1536](https://github.com/1bit-MONSTER/
   Deleting the directory is always safe.
 - **Routed-expert MoE on the HRX route (flint-40b-a2.5b).** `flint-UD-Q4_K_XL`, a 6-of-256 MoE that needs
   31.01 GiB at its own context, serves with `--device hrx --no-strict-device`: 64-token completions at
-  **42.61 tok/s** (2 runs, 35.24 and 49.97, spread 1.418x — a sample, not a rate). A step reads 2.213 GB at
-  this depth, so that is **~94.3 GB/s effective**, 37 % of this box's 256 GB/s peak and 43 % of the 220 GB/s
-  goal. The flag is required because `embd` is `GET_ROWS` f32 `ne=[2048,2,1,1]` and strict placement refuses
+  **50.66 tok/s**, median of **6 runs** (45.69–50.92, spread 1.114x). A step reads 2.213 GB at this depth, so
+  that is **~112 GB/s effective**, **44 % of this box's 256 GB/s peak and 51 % of the 220 GB/s goal**. (A 2-run
+  sample before this read 42.61 tok/s with a 1.418x spread; six runs move the median up 19 %, which is the
+  argument for not quoting two.) The flag is required because `embd` is `GET_ROWS` f32 `ne=[2048,2,1,1]` and strict placement refuses
   the model over those 2 of 3,576 nodes; see `dispatch-get-rows.cpp`, whose demand list is only ever given
   `Q8_1`, so a tied f32 embedding never matches and lands on the CPU. Two rows would finish it: demand `F32`
   for a non-Qwen f32 gather, or accept a named off-device op instead of refusing the model. Measured
@@ -1080,7 +1081,7 @@ Before either, making decode step aside instead was measured and does not help:
 the same duplicates, and decode 8.5 % slower. flint UD-Q4_K_XL (routed experts) reads every weight stored and holds one copy per
 weight with or without the default. (That sentence is about **resident copies**, not bytes read per decode step: a step reads
 only the routed experts, `expert_used_count / expert_count` = 6 of 256 for this model. Had it read all 256, flint's measured
-42.61 tok/s would imply 1,067 GB/s, above this box's 256 GB/s peak.)
+50.66 tok/s would imply 1,269 GB/s, above this box's 256 GB/s peak.)
 
 **Since pin `962507f8e` a short prompt holds no weight twice either** (llama.cpp #324, #325). At 6 to 8 tokens the few-token
 kernels took the batch and read the stored layout of weights that prefill reads in the packed rows, so a short prompt or a

@@ -2196,13 +2196,25 @@ else
             while IFS= read -r _p; do _r=${_p#"$PDIR"}; _r=${_r#/}; printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "${_r:-.}"; done)
         PM=$(payload_modes_verdict "${_pm_f:-}" "${_pm_d:-}" "${_pm_s:-}")
         _pm_bits=
+        # engine#2422: printing the bits is not asserting them. A 0644 `1bit/1bit` passes the writability rule and then makes
+        # hrx-placement SKIP (`[ -x ]` cannot find a runnable engine), so the release check was green over a payload whose
+        # engine cannot run - measured on a real 258-entry payload: `PASS payload-modes (modes: 644 1bit/1bit 644 bin/lemond)`
+        # beside `SKIP hrx-placement`. Absence stays out of this row's claim: a binary that is not here is hrx-device's or
+        # identity's business, and a payload mid-extraction is already caught by the floor above.
+        _pm_noexec=
         for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemond-onebit"; do
-            [ -f "$_b" ] && _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"
+            [ -f "$_b" ] || continue
+            _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"
+            [ -x "$_b" ] || _pm_noexec="$_pm_noexec ${_b#"$PDIR"/}"
         done
-        case "$PM" in
-            PASS*) pass payload-modes "${PM#PASS }${_pm_bits:+ (modes:$_pm_bits)}" ;;
-            *)     fail payload-modes "${PM#FAIL }${_pm_bits:+ (modes:$_pm_bits)}" ;;
-        esac
+        if [ -n "$_pm_noexec" ]; then
+            fail payload-modes "in the payload but not executable:${_pm_noexec} - a 0644 engine or lemond refuses to run, and hrx-placement then SKIPs instead of failing (modes:$_pm_bits)"
+        else
+            case "$PM" in
+                PASS*) pass payload-modes "${PM#PASS }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+                *)     fail payload-modes "${PM#FAIL }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+            esac
+        fi
     fi
 fi
 

@@ -199,6 +199,10 @@ add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
 add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $<TARGET_FILE:onebit>)
+# token_rate_floor's four arms (engine#374): the rate floor that fails in the direction a correctness check
+# cannot, since a 3.7x regression still emits the right tokens. The self-test needs no device; the --log mode
+# is what a device row calls with llama-cli's output.
+add_test(NAME token_rate_floor_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/token_rate_floor.py --self-test)
 # scripts/lemonade-hrx: the PPA lemond's HRX recipe runs our llama-server (docs/lemonade.md): no GPU.
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)

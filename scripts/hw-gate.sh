@@ -452,6 +452,16 @@ if [ -z "$BIN" ]; then
       # the add-on's own check (the ops phase runs it)
       targets+=(ggml-hrx-fa-decode-bench)
       note "private HIP kernels: gpu-kernels ${addon_pin:0:12} (addons/hip-hrx)"
+      # engine#2406 put "audit the add-on's f16 narrowing on a pin bump" on the f16 ratchet's green line and
+      # nothing ran it: the ratchet walks *.loom only, and this is the one flow that already has the tree (CI has
+      # no checkout, so its row always takes the 77 path). Auditing here is the "on a pin bump" moment, and
+      # --expect-sha makes it refuse a tree that is not the pin it just fetched rather than reporting clean.
+      if ! python3 "$ROOT/tools/ci/hip_f16_audit.py" --dir "$addon" --expect-sha "$addon_pin" > "$OUT/hip-f16-audit.txt" 2>&1; then
+        note "::error::the gpu-kernels add-on at ${addon_pin:0:12} fails the f16 audit (see hip-f16-audit.txt)"
+        sed -n '1,6p' "$OUT/hip-f16-audit.txt" | sed 's/^/  /'
+        exit 2
+      fi
+      note "add-on f16 audit: $(grep -c . "$OUT/hip-f16-audit.txt") line(s), no f16 accumulator"
     fi
     # configure once per add-on pin (a new pin can add kernel files the old configure never saw);
     # otherwise ninja re-runs cmake itself when a CMakeLists.txt changes

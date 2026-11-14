@@ -456,7 +456,12 @@ if [ -z "$BIN" ]; then
       # nothing ran it: the ratchet walks *.loom only, and this is the one flow that already has the tree (CI has
       # no checkout, so its row always takes the 77 path). Auditing here is the "on a pin bump" moment, and
       # --expect-sha makes it refuse a tree that is not the pin it just fetched rather than reporting clean.
-      if ! python3 "$ROOT/tools/ci/hip_f16_audit.py" --dir "$addon" --expect-sha "$addon_pin" > "$OUT/hip-f16-audit.txt" 2>&1; then
+      # --dir is the gpu-kernels CHECKOUT, not "$addon": fetch-private.sh echoes "$dest/$path", i.e. .../addons/hip-hrx,
+      # which is the -DGGML_HRX_HIP_ADDON_DIR argument. The audit walks <dir>/addons/hip-hrx/kernels, so handing it
+      # $addon made it look for .../addons/hip-hrx/addons/hip-hrx/kernels, refuse ("cannot tell, and that is not a
+      # pass"), and this block turns that refusal into a failed gate -- on every run, with a message blaming the
+      # kernels. engine#2439's own CHANGES called for the audit; the path is what makes it fire at all.
+      if ! python3 "$ROOT/tools/ci/hip_f16_audit.py" --dir "$STORE/gpu-kernels" --expect-sha "$addon_pin" > "$OUT/hip-f16-audit.txt" 2>&1; then
         note "::error::the gpu-kernels add-on at ${addon_pin:0:12} fails the f16 audit (see hip-f16-audit.txt)"
         sed -n '1,6p' "$OUT/hip-f16-audit.txt" | sed 's/^/  /'
         exit 2

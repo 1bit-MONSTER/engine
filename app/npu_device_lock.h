@@ -269,6 +269,18 @@ inline std::string npu_lock_holder_line(const char* path = kNpuDeviceLock, long 
 // engine#1241 cure 2: the line an NPU failure path prints when the runtime said "No such device" but
 // another pid owns the array through the device lock -- the state that made a held array read as a
 // broken device, ELF or container. "" when nobody holds it, i.e. the device really is the thing to look at.
+// Is one rendered holder entry ("pid <N> (<cmd>)") THIS process? A pure function so the boundary can be tested with
+// crafted pids: the first version used `item.rfind(mine, 0) != 0` (a PREFIX match), which also drops a co-tenant whose pid
+// merely starts with ours - pid 1234 hides pid 12345 - and a forked-child fixture can never produce that pair on demand.
+// engine#2441 review, measured: the boundary is what made it wrong, not the idea.
+inline bool npu_holder_item_is_self(const std::string& item, long self_pid) {
+    const std::string mine = "pid " + std::to_string(self_pid);
+    if (item == mine) return true;                       // a list of one, no " (cmd)"
+    if (item.rfind(mine, 0) != 0) return false;           // does not start with our pid at all
+    const char next = item.size() > mine.size() ? item[mine.size()] : '\0';
+    return next == ' ' || next == '(';                    // the pid ENDS here: 1234 is not 12345
+}
+
 inline std::string npu_lock_refusal_note(const char* path = kNpuDeviceLock) {
     // engine#2434: SELF IS NOT THE ANSWER. A serve takes this lock BEFORE it opens a device context, so when its own
     // init_elf is refused, /proc/locks reports the only holder - itself - and this note named the process that had just
@@ -278,13 +290,13 @@ inline std::string npu_lock_refusal_note(const char* path = kNpuDeviceLock) {
     if (!text.empty()) {
         // Drop our own pid from the rendered list, keeping the rest verbatim. The rendered text is
         // "pid N (cmd), pid M (cmd)", so filter on the exact "pid <ours>" token rather than by parsing it back.
-        const std::string mine = "pid " + std::to_string(static_cast<long>(::getpid()));
+        const long self_pid = static_cast<long>(::getpid());
         std::string kept;
         size_t pos = 0;
-        while (pos <= text.size()) {
+        while (pos < text.size()) {
             size_t comma = text.find(", ", pos);
             const std::string item = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-            if (item.rfind(mine, 0) != 0) kept += (kept.empty() ? "" : ", ") + item;
+            if (!item.empty() && !npu_holder_item_is_self(item, self_pid)) kept += (kept.empty() ? "" : ", ") + item;
             if (comma == std::string::npos) break;
             pos = comma + 2;
         }

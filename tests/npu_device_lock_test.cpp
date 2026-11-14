@@ -304,6 +304,16 @@ int main() {
         expect(wait_err.find("npu_device_lock_test") != std::string::npos, "with the holder's cmdline: " + wait_err);
         if (release_fd >= 0) ::close(release_fd);
 
+    // engine#2441 review: the BOUNDARY, with crafted pids. A forked child can never share a prefix with our own pid on
+    // demand, so the arm that matters here is the pure classifier: "pid 1234" must not match "pid 12345".
+    expect(onebit::npu_holder_item_is_self("pid 1234", 1234), "an entry with no cmdline is ours");
+    expect(onebit::npu_holder_item_is_self("pid 1234 (1bit serve)", 1234), "an entry with a cmdline is ours");
+    expect(!onebit::npu_holder_item_is_self("pid 12345 (1bit serve)", 1234),
+           "a pid that merely STARTS with ours is not ours (the prefix bug the review caught)");
+    expect(!onebit::npu_holder_item_is_self("pid 123 (1bit serve)", 1234), "a pid that is a prefix OF ours is not ours");
+    expect(!onebit::npu_holder_item_is_self("pid 0 (kernel)", 1234), "an unrelated pid is not ours");
+    expect(!onebit::npu_holder_item_is_self("pid 1234x (odd)", 1234), "our pid followed by a non-delimiter is not ours");
+
     // engine#2434: the SELF case, which is the one the note got wrong - and it has to run AFTER the forked child above
     // releases, because a blocking flock here would deadlock against the child's own hold (it did: the test hung until the
     // timeout, which is how this placement was found). A serve takes this lock before it opens a device context, so when

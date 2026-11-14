@@ -84,6 +84,21 @@ def identifiers(text):
     return {i for i in IDENT.findall(text) if i not in ("const", "size_t", "return", "nullptr", "reinterpret_cast")}
 
 
+def head_mentions(root, head, names):
+    """Files in the head tree that still mention any of `names` (engine#2436: a guard can move
+    into a helper). One `git grep` per name, deduped; a failure is an empty answer, which only
+    means the caller keeps its stricter verdict -- never a claim that the identifier is gone."""
+    seen = []
+    for n in names:
+        r = git("grep", "-l", "-F", n, head, cwd=root)
+        for line in r.stdout.splitlines():
+            path = line.split(":", 1)[0].split(":", 1)[-1] if ":" in line else line
+            path = path.split(":")[-1] if path.startswith(head) else path
+            if path and path not in seen:
+                seen.append(path)
+    return seen
+
+
 def check(root, base, head):
     mb = git("merge-base", base, head, cwd=root)
     if mb.returncode != 0:
@@ -103,13 +118,20 @@ def check(root, base, head):
             continue
         missing = [i for i in identifiers(body) if i not in at_head.stdout]
         if missing:
-            lost.append((path, body, "no longer mentions " + ", ".join(sorted(missing))))
+            # engine#2436, measured: a guard moved into a helper (`npu_contexts_refused` left
+            # forward_serve.cpp for npu_load_retry.h) is a rewrite, not a loss. Ask the head tree
+            # before calling it lost.
+            elsewhere = [p for p in head_mentions(root, head, missing) if p != path]
+            if elsewhere:
+                moved.append((path, body))
+            else:
+                lost.append((path, body, "not in this file and not anywhere at head: " + ", ".join(sorted(missing))))
         else:
             moved.append((path, body))
     for path, body, why in lost:
         print(f"LOST {path}: {body.strip()[:100]}\n     {why}")
     for path, body in moved:
-        print(f"note {path}: guard rewritten, identifiers still present: {body.strip()[:80]}")
+        print(f"note {path}: guard rewritten, identifiers still present in the file or at head: {body.strip()[:72]}")
     print(f"guard_loss_check: {len(guards_removed(diff.stdout))} removed guard-shaped line(s), "
           f"{len(lost)} lost, {len(moved)} rewritten")
     return 1 if lost else 0
@@ -134,6 +156,25 @@ def self_test():
     chk("a plain comment is not guard-shaped", guards_removed("+++ b/a.cpp\n-// the buffer is aligned\n"), [])
     chk("a comment that MENTIONS an assert is not a guard",
         guards_removed("+++ b/a.cpp\n-        // the case must reach a kernel or it asserts nothing\n"), [])
+    # engine#2436, measured on a real PR: a guard that moved into a helper is a rewrite, not a loss.
+    # Built in a scratch repo because the answer comes from the head tree, not from a string.
+    import subprocess, tempfile, os, pathlib
+    with tempfile.TemporaryDirectory() as td:
+        def g(*a):
+            return subprocess.run(["git"] + list(a), cwd=td, capture_output=True, text=True)
+        g("init", "-q"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+        pathlib.Path(td, "a.cpp").write_text("int f(){ if (npu_contexts_refused(why)) { return 1; } return 0; }\n")
+        g("add", "."); g("commit", "-qm", "base"); base = g("rev-parse", "HEAD").stdout.strip()
+        pathlib.Path(td, "a.cpp").write_text("int f(){ return open_with_retry(); }\n")
+        pathlib.Path(td, "help.h").write_text("bool npu_contexts_refused(const std::string&);\n")
+        g("add", "."); g("commit", "-qm", "head"); head = g("rev-parse", "HEAD").stdout.strip()
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_moved = check(td, base, head)
+        chk("a guard whose identifier moved to a helper is NOT lost", rc_moved, 0)
+        chk("and it is reported as a rewrite", "note " in buf.getvalue(), True)
+        chk("saying where it went is not required, but the file is named", "a.cpp" in buf.getvalue(), True)
     print(f"guard_loss_check self-test: {'ok' if fail == 0 else str(fail) + ' failure(s)'}")
     return 0 if fail == 0 else 1
 

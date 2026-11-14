@@ -60,7 +60,7 @@ def check(root, online=False):
     import pathlib
     cfg = pathlib.Path(root) / 'config'
     files = sorted(cfg.glob('*.config')) if cfg.is_dir() else []
-    bad, checked = [], []
+    bad, checked, at_tip, asked = [], [], [], []
     for f in files:
         got = parse(f)
         if 'sha' not in got:
@@ -81,10 +81,17 @@ def check(root, online=False):
                       f"(not checked, not a pass)")
                 continue
             branch = br.stdout.strip()
+            asked.append(f.name)
             tip = subprocess.run(['git', 'ls-remote', f"https://github.com/{got['repo']}.git",
                                   f'refs/heads/{branch}'], capture_output=True, text=True).stdout.split()
             if not tip:
                 print(f"config_pin: {f.name}: {got['repo']} did not answer for refs/heads/{branch} (not checked)")
+            elif tip[0] == got['sha']:
+                # A match prints nothing in the first version, so `--online` silence meant either "asked and equal"
+                # or "never asked" -- measured on engine#2405, where I cited a rc 0 that could not tell me whether
+                # the gpu-kernels pin had been compared at all. Say the match out loud.
+                at_tip.append(f.name)
+                print(f"config_pin: {f.name}: sha is {got['sha'][:12]}, at the tip of {got['repo']} {branch}")
             elif tip[0] != got['sha']:
                 # Not a failure: a pin may deliberately lag the tip (that is what a pin is for). Reported so a bump
                 # PR can show the gap it closes, which is what engine#2316's body does by hand.
@@ -98,7 +105,13 @@ def check(root, online=False):
     if bad:
         print(f"config_pin_check: {len(bad)} bad pin(s) of {len(checked)} checked")
         return 1
-    print(f"config_pin_check: {len(checked)} sha pin(s) are 40 lowercase hex characters")
+    online_note = ""
+    if online:
+        # The count alone cannot say whether --online did anything, which is how a matching pin could look
+        # unchecked. Name the comparison: M of N were asked, K were at the tip, and the rest had no repo=.
+        online_note = (f"; {len(asked)} asked online, {len(at_tip)} at the tip, "
+                       f"{len(asked) - len(at_tip)} behind it")
+    print(f"config_pin_check: {len(checked)} sha pin(s) are 40 lowercase hex characters{online_note}")
     return 0
 
 
@@ -145,6 +158,31 @@ def self_test():
     return rc
 
 
+def self_test_online_reporting():
+    """`--online` must say what it compared: a match used to print nothing, which reads as "never asked"."""
+    import pathlib, tempfile
+    problems = []
+    tmp = tempfile.mkdtemp(prefix="pincheck-")
+    cfg = pathlib.Path(tmp) / "config"
+    cfg.mkdir()
+    (cfg / "a.config").write_text("repo=1bit-MONSTER/gpu-kernels\nsha=" + "0" * 40 + "\n")
+    (cfg / "b.config").write_text("sha=" + "1" * 40 + "\n")            # no repo=: cannot be asked
+    (cfg / "c.config").write_text("repo=1bit-MONSTER/does-not-exist\nsha=" + "2" * 40 + "\n")
+    # offline: no online line at all
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        check(tmp, online=False)
+    if "asked online" in buf.getvalue():
+        problems.append("offline run claimed an online comparison")
+    if problems:
+        for problem in problems:
+            print("FAIL " + problem)
+        return 1
+    print("config_pin_check --online self-test: ok")
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--check', action='store_true')
@@ -153,7 +191,7 @@ def main(argv):
     ap.add_argument('--self-test', action='store_true')
     a = ap.parse_args(argv)
     if a.self_test:
-        return self_test()
+        return self_test() if not a.online else self_test_online_reporting()
     if not a.check:
         ap.print_help()
         return 2

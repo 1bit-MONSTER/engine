@@ -1835,9 +1835,15 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
         return g;
     }
     const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
-    // The scan window is the first GiB (about 8 blocks at h3584), so a real section boundary repeats ~8 times against
-    // 1-2 for a payload coincidence; 3 separates them (requiring `layers/2` was too strict and dropped the real one).
-    const std::vector<int64_t> inner = fconst_block_headers(pos, stride8, 3);
+    // engine#1985: a constant cut of `3` was calibrated on h3584, where the first-GiB window holds about 8 blocks. At a
+    // smaller stride the window holds more blocks, so a payload coincidence accrues more chances to reach 3 while a real
+    // boundary stays at one per block -- Qwen3-1.7B (hidden 2048) came back with four in-block offsets, three real plus a
+    // coincidence, and `fconst_set_block_headers` accepts only 1 or 3, so the whole layout was dropped and the pack was
+    // refused. The floor is taken from the observed distribution (half the most frequent offset, never below 3) rather than
+    // from the window: `pos.size()` counts anchors, not blocks, and in a mixed attention/GDN pack a real header appears in
+    // only about half the blocks, so neither `pos.size()/4` nor a fixed fraction of the window separates the two cases
+    // (review of engine#2021, gaps 1 and 2).
+    const std::vector<int64_t> inner = fconst_block_headers_observed(pos, stride8);
     if (!fconst_set_block_headers(g, inner)) {
         g.why = "the 1.9 header gives stride " + std::to_string(stride8) + ", but the epsilon anchors repeat at " +
                 std::to_string(inner.size()) + " in-block offset(s), and a layer block has 1 (2-header) or 3 (4-header); "
@@ -1851,6 +1857,34 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
 // bytes lands at `r` modulo `stride` in every block, so the offsets that recur `min_repeat` or more times are the block's
 // section boundaries; offset 0 is the block start, not an inner header. ALL of them are kept rather than the most common
 // one: a Qwen3 block has three equally frequent inner headers, and keeping only the first maximum picked k_norm's.
+std::vector<int64_t> fconst_block_headers_observed(const std::vector<int64_t>& pos, int64_t stride) {
+    std::vector<int64_t> out;
+    if (stride <= 0) return out;
+    std::map<int64_t, int> count;
+    int most = 0;
+    for (const int64_t q : pos) {
+        const int64_t r = q % stride;
+        if (r > 0) most = std::max(most, ++count[r]);
+    }
+    // Never below 3: that is the value measured on a h3584 window of ~8 blocks, and a smaller floor would keep payload
+    // coincidences on a short pack. Half the mode covers the mixed-layer case without a per-architecture constant.
+    const int floor_count = std::max(3, most / 2);
+    for (const auto& [r, n] : count)
+        if (n >= floor_count) out.push_back(r);
+    // A floor taken from the mode is only meaningful if the mode is a real header. `fconst_set_block_headers` accepts ONE
+    // offset as a 2-header block, so when the cut leaves one, a dominant payload coincidence would become a silent layout
+    // instead of a refusal (review of #2021: 3 real headers x6 blocks + one residue x20 -> floor 10 keeps only the
+    // residue). A real 2-header block has exactly one recurring inner offset, so every other residue must stay below the
+    // constant floor 3 that main used; if one does not, return nothing and the caller refuses. This is never more
+    // permissive than the constant: under it a second residue at >= 3 already gave two offsets, which is refused too.
+    // (A ">= 2x the next residue" test does not catch the review's case: 20 >= 2 x 6.)
+    if (out.size() == 1) {
+        for (const auto& [r, n] : count)
+            if (r != out.front() && n >= 3) return {};
+    }
+    return out;
+}
+
 std::vector<int64_t> fconst_block_headers(const std::vector<int64_t>& pos, int64_t stride, int min_repeat) {
     std::vector<int64_t> out;
     if (stride <= 0) return out;

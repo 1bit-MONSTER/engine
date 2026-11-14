@@ -66,6 +66,7 @@ checks=(
     "tools/ci/submodule_pin_check.py --check"
     "tools/ci/registration_loss_check.py --check --base $base"
     "tools/ci/registry_loss_check.py --base $base"
+    "tools/ci/branch_stale_check.py --base $base"
 )
 
 # The page and this list drift apart, and it has happened twice in one night: the page said the runner "runs the first six"

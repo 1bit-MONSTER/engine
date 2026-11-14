@@ -96,6 +96,13 @@ class BranchStaleCheckTest(unittest.TestCase):
         self.assertIn("the base also added", result.stdout)
         self.assertNotIn("added-after-the-fork.txt - the branch carries", result.stdout)
 
+    def test_a_dirty_tree_is_named_because_the_check_reads_commits(self):
+        # It reads `git show HEAD:...`, so an uncommitted stale copy is invisible. It must say so.
+        git(self.repo, "checkout", "-q", "main")
+        self.write("shared.txt", "an uncommitted edit\n")
+        result = self.run_check(self.main, "HEAD")
+        self.assertIn("uncommitted path(s) are NOT included", result.stdout)
+
     def test_an_unreadable_ref_refuses_instead_of_passing(self):
         result = self.run_check(self.main, "no-such-ref")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

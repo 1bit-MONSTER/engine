@@ -117,6 +117,16 @@ def main():
         elif base_blob != head_blob:
             stale.append(path)
 
+    # The check reads commits (`git show <ref>:<path>`). Uncommitted work is invisible to it, so say so rather
+    # than letting a dirty tree read as a clean one -- measured while wiring it: an uncommitted stale copy
+    # produced "no file differs" and nothing else.
+    if args.head == "HEAD":
+        dirty = git("status", "--porcelain")
+        changed = [line for line in dirty.stdout.splitlines() if line.strip() and not line.startswith("??")]
+        if changed and not args.quiet:
+            print(f"branch_stale_check: HEAD is what was read; {len(changed)} uncommitted path(s) are NOT included "
+                  f"- commit them and re-run to check the branch you are handing over")
+
     if not args.quiet:
         print(f"branch_stale_check: base {args.base} {len(base_paths)} path(s), branch touches {len(touched)} of them; "
               f"{len(stale)} older cop(ies) (the base also added {len(added_by_base)} path(s) the branch predates, "

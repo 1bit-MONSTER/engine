@@ -348,6 +348,24 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
             }
         };
 
+        // engine#2399: a tensor with exactly one use can be MOVED into its consumer instead of copied. Reshape
+        // was deep-copying 4.6 MB per node (216 nodes, ~130 ms per encoder pass) to change a shape and no bytes.
+        // A move changes no bits, so this cannot alter any result; the count makes it safe (a twice-used input,
+        // e.g. Add(x, x), keeps its copy).
+        std::map<std::string, int> use_count;
+        for (const auto& n : g.nodes) {
+            for (const auto& in : n.ins) {
+                if (!in.empty()) ++use_count[in];
+            }
+        }
+        auto take_if_last = [&](const std::string& name) -> Tensor* {
+            const auto c = use_count.find(name);
+            const auto it = t.find(name);
+            if (c == use_count.end() || c->second != 1 || it == t.end()) return nullptr;
+            use_count[name] = 0;
+            return &it->second;
+        };
+
         int node_index = 0;
         for (const auto& n : g.nodes) {
             ++node_index;
@@ -547,7 +565,11 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 if (infer >= 0) dims[size_t(infer)] = int64_t(a.data.size() / std::max<size_t>(known, 1));
                 if (nelem(dims) != a.data.size()) fail(where() + ": reshape changes the element count");
                 r.dims = dims;
-                r.data = a.data;
+                if (Tensor* src = take_if_last(n.ins[0])) {
+                    r.data = std::move(src->data);          // engine#2399: same bits, no copy
+                } else {
+                    r.data = a.data;
+                }
             } else if (n.op == "Conv") {
                 const Tensor& a = need(n.ins[0]);
                 const Tensor& w = init_f32(n.ins[1]);

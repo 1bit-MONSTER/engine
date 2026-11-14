@@ -58,6 +58,14 @@ def gh(path, paginate=False):
             got = json.loads(chunk or '[]')
         except json.JSONDecodeError:
             break
+        # A list endpoint answers with a list. An error object (`{"message": ...}`, a rate limit, a renamed repo) is a
+        # dict, and `out.extend(dict)` silently extends with the DICT'S KEYS - strings - which then explode in the
+        # caller as `'str' object has no attribute 'get'` (this crashed the whole queue on 2026-11-14 07:13Z). Reported,
+        # not skipped: a failed read must not come out as "no verdicts exist", which is exactly the false-negative this
+        # tool exists to avoid.
+        if not isinstance(got, list):
+            msg = got.get('message', got) if isinstance(got, dict) else got
+            raise RuntimeError(f"gh api {path} did not answer with a list: {msg}")
         if not got:
             break
         out.extend(got)
@@ -67,10 +75,14 @@ def gh(path, paginate=False):
     return json.dumps(out)
 
 
-VERDICT_LINE = re.compile(r'^[^A-Za-z0-9]*VERDICT\b', re.MULTILINE)
+# A verdict does not begin inside an inline code span. Lanes quote the verdict *format* (`` `VERDICT: READY at
+# `abc1234` ``) and quote **other people's** verdicts when reconciling them, and both were being read as verdicts by the
+# author. Measured 2026-11-14: this lane's own reconciliation comment on npu-kernels#70 quoted `VERDICT: NEEDS-CHANGE` at
+# the head, so `--state` reported a READY PR as held by a CHANGES that no reviewer had written.
+VERDICT_LINE = re.compile(r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b', re.MULTILINE)
 
 
-VERDICT_KIND = re.compile(r'^[^A-Za-z0-9]*VERDICT\b[^\n]*', re.MULTILINE)
+VERDICT_KIND = re.compile(r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b[^\n]*', re.MULTILINE)
 
 
 def verdict_kind(body):
@@ -189,6 +201,30 @@ def self_test():
         'a verdict naming a longer sha of the same head counts too')
     chk(False, reviewed_at([{'body': 'VERDICT: READY at `9999999`'}], 'abc1234'),
         'a verdict at a DIFFERENT head does not count: that is the case the queue exists for')
+    # The 07:13Z crash, reproduced from the shape that caused it: an error object where a list belongs. A guard that
+    # cannot fail is not a guard, so this drives `gh` itself (a stubbed binary) rather than a hand-built list.
+    import tempfile as _tf, os as _os
+    _d = _tf.mkdtemp()
+    _stub = _os.path.join(_d, 'gh')
+    with open(_stub, 'w') as f:
+        f.write('#!/bin/sh\nprintf \'{"message":"API rate limit exceeded"}\'\n')
+    _os.chmod(_stub, 0o700)
+    _old = _os.environ.get('PATH', '')
+    _os.environ['PATH'] = _d + ':' + _old
+    try:
+        gh('repos/x/y/pulls?state=open', paginate=True)
+        crashed = 'no exception'
+    except RuntimeError as e:
+        crashed = 'rate limit' in str(e)
+    finally:
+        _os.environ['PATH'] = _old
+    chk(True, crashed, 'a non-list page is reported, not extended into the queue as strings')
+    # The false POSITIVE, measured on my own comment (npu-kernels#70, 07:5xZ): reconciling two verdicts quotes the one being
+    # disagreed with, and the quote named the head. A quotation is not a verdict - in either direction.
+    chk(False, reviewed_at([{'body': '`VERDICT: NEEDS-CHANGE` at `abc1234` measured:'}], 'abc1234'),
+        'a backticked verdict being QUOTED is not a verdict at this head')
+    chk(False, reviewed_at([{'body': 'Write it as `VERDICT: READY at <head>`'}], 'abc1234'),
+        'quoting the verdict FORMAT is not a verdict either')
     chk(False, reviewed_at([{'body': 'looks good to me'}], 'abc1234'),
         'a review without a verdict line does not count')
     # The guard is the VERDICT word, not the head: removing it left --self-test at rc 0, because every arm above
@@ -285,7 +321,11 @@ def main(argv):
         held = [row for row in rows if row['kind'] == 'CHANGES']
         print(f"pr_review_queue --state: {len(rows)} open PR(s), {len(held)} whose newest verdict is CHANGES")
         return 0
-    q = queue(a.repos, a.min_age_hours)
+    try:
+        q = queue(a.repos, a.min_age_hours)
+    except RuntimeError as e:
+        print(f"pr_review_queue: {e}", file=sys.stderr)
+        return 2
     if a.json:
         print(json.dumps(q, indent=1))
         return 0

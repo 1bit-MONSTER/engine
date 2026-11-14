@@ -51,7 +51,11 @@ KERNEL_SUBDIR = Path("addons/hip-hrx/kernels")
 # `__float2half`, `__float2half_rn`, `(half)v`, `half(v)`. Deliberately not `half x = ...`, which declares.
 NARROWING = re.compile(r"__float2half\w*\s*\(|\(\s*(?:__)?half\s*\)\s*[A-Za-z_(]|\b(?:__)?half\s*\(\s*[A-Za-z_]")
 # an accumulator declared in f16: `half acc`, `__half acc =`, `half_t acc`, and `acc` declared as such.
-ACCUMULATOR = re.compile(r"\b(?:__)?half(?:_t)?\s+(?:acc|accum|sum|total|dot|partial)\w*")
+# `half`, `__half`, `half_t`, `_Float16`, and the vector spellings these kernels actually use
+# (`half16`/`half8`/`half2`, `typedef _Float16 half16 __attribute__((ext_vector_type(16)))`). Measured on
+# gpu-kernels 96593660718d: the first version matched only the scalar spellings, and `glm_mla_decode.hip`
+# declares its operands as `half16` -- an accumulator written that way would have been missed entirely.
+ACCUMULATOR = re.compile(r"\b(?:(?:__)?half\w*|_Float16)\s+(?:acc|accum|sum|total|dot|partial)\w*")
 
 
 COMMENTS = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
@@ -122,6 +126,21 @@ def self_test():
         bad = [row["file"] for row in rows if row["accumulators"]]
         chk(["f16acc.hip"], bad, "exactly the one defect file fails")
 
+        # the vector spelling: glm_mla_decode.hip declares its operands as `half16`, and an accumulator written
+        # that way must fail too -- the first version of this regex matched only the scalar spellings.
+        (kernels / "vecacc.hip").write_text(
+            "typedef _Float16 half16 __attribute__((ext_vector_type(16)));\n"
+            "half16 acc = (half16) 0.0f;\nacc = acc + v;\n")
+        rows = audit(tmp)
+        by = {row["file"]: row for row in rows}
+        chk(["half16 acc"], by["vecacc.hip"]["accumulators"], "a half16 accumulator is found")
+        # and an operand declared half16 is NOT an accumulator: the real kernel is correct
+        (kernels / "vecoperand.hip").write_text(
+            "float8 s = (float8) 0.0f;\nhalf16 a = load();\ns = wmma(a, b, s);\n")
+        rows = audit(tmp)
+        by = {row["file"]: row for row in rows}
+        chk([], by["vecoperand.hip"]["accumulators"], "a half16 operand with a float8 accumulator is clean")
+
         # prose is not a narrowing: the first real run flagged a comment saying "half (by bit M ...)"
         (kernels / "comment.hip").write_text(
             "// sends half of them and keeps the other half (by bit M of its lane id)\n"
@@ -129,7 +148,7 @@ def self_test():
         rows = audit(tmp)
         by = {row["file"]: row for row in rows}
         chk(0, by["comment.hip"]["narrowings"], "a comment mentioning 'half (' is not a narrowing")
-        chk(4, len(rows), "the comment file is still audited")
+        chk(6, len(rows), "every file in the tree is audited (4 originals + 2 vector cases)")
 
         chk(None, audit("/nonexistent-path-xyz"), "an unreadable tree is None, not an empty pass")
 

@@ -974,6 +974,33 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
+# engine#2399: the audio graph's core is a 4-row f32 GEMM. At the tree's own -O3 the microbenchmark gives 37.5 GFLOP/s,
+# but the ISA is never requested, so the vectoriser emits mul+add instead of fused multiply-add. Measured IN SITU on the
+# whisper-small encoder's MatMul family, alternating two binaries under one load at 4 threads:
+#   2698.9 / 2699.4 ms (-O3)   ->   2037.9 / 2019.2 ms (-O3 -mavx2 -mfma)   1.33x
+# Transcripts unchanged: ids md5 91c6561060 (jfk.wav) and fd875ac0d9 (a German clip -- checked because FMA changes
+# rounding, and English transcribe==translate would hide a last-bit divergence).
+#
+# The flags must cover the TESTS as well as the library: audio_parallel_test compares each thread count against an
+# ordered per-element reference computed in its own TU. Flags on the library only fails 16 checks with "matches the
+# ordered sum" at every thread count -- not a reproducibility defect, just two TUs compiled differently. Verified both
+# ways: flags on both sides -> ok at ONEBIT_AUDIO_THREADS=1,2,4; library only -> 16 failures.
+#
+# Explicit -mavx2 -mfma rather than -march=native: the same speed within noise, but it states the requirement instead
+# of inheriting the build host. The cost is real, which is why this is an option: the binary then needs AVX2+FMA at RUN
+# time (universal on this fleet -- Zen 2 and later -- not universal for a distributed build). OFF restores portability.
+option(ONEBIT_AUDIO_AVX2 "Compile with -mavx2 -mfma: audio GEMM 1.33x; the binary then requires AVX2+FMA at run time" ON)
+if(ONEBIT_AUDIO_AVX2)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-mavx2" ONEBIT_HAVE_MAVX2)
+    check_cxx_compiler_flag("-mfma" ONEBIT_HAVE_MFMA)
+    if(ONEBIT_HAVE_MAVX2 AND ONEBIT_HAVE_MFMA)
+        set(ONEBIT_AUDIO_AVX2_READY ON)
+    else()
+        message(STATUS "ONEBIT_AUDIO_AVX2=ON but the compiler rejects -mavx2/-mfma; building portable")
+    endif()
+endif()
+
 add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp npu/vision_request.cpp
                             npu/audio_exec.cpp npu/audio_pack.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
@@ -2015,6 +2042,19 @@ add_executable(audio_npu_gemm_test tests/audio_npu_gemm_test.cpp)
 target_include_directories(audio_npu_gemm_test PRIVATE npu/forward/include npu/target npu/plan)
 target_link_libraries(audio_npu_gemm_test PRIVATE nlohmann_json::nlohmann_json)
 add_executable(audio_launch_plan_test tests/audio_launch_plan_test.cpp)
+# engine#2399: apply the ISA flags to the audio targets only (see the option above). Placed here, after those targets are
+# declared, so nothing outside the audio path inherits an AVX2 requirement.
+if(ONEBIT_AUDIO_AVX2_READY)
+    # Enumerated HERE, after every audio target exists: the option block runs ~600 lines earlier, where
+    # audio_ops_test/audio_parallel_test are not defined yet, so an `if(TARGET ...)` test there is always false.
+    set(_avx2_targets onebit_npu audio_parallel_test audio_ops_test audio_exec_test audio_mel_test
+        whisper_transcribe audio_kernel_shapes audio_device_gemm_test)
+    foreach(_t ${_avx2_targets})
+        if(TARGET ${_t})
+            target_compile_options(${_t} PRIVATE -mavx2 -mfma)
+        endif()
+    endforeach()
+endif()
 target_include_directories(audio_launch_plan_test PRIVATE npu/forward/include npu/target npu/plan)
 target_link_libraries(audio_launch_plan_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME whisper_ids COMMAND whisper_ids_test)

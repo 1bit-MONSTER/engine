@@ -145,6 +145,7 @@ def report(rows, as_json, top=None):
 
 
 def self_test():
+    import subprocess
     import tempfile
     problems = []
 
@@ -173,6 +174,28 @@ def self_test():
         by = {row["file"]: row for row in rows}
         chk(1, by["format.hip"]["narrowings"], "the block scale is one narrowing")
         chk([], by["format.hip"]["accumulators"], "a narrowing alone is not an accumulator")
+
+        # the AUDITED line: a pasted report is only evidence if it names the commit it read (engine#2416's playbook
+        # asks a pin-bump PR body for exactly that). Asserted through main() so the wiring is covered, not just the
+        # helper -- a self-test that calls the function directly is how the missing default-path gate got through.
+        import contextlib
+        import io
+        repo = Path(tmp) / "git-tree"
+        (repo / KERNEL_SUBDIR).mkdir(parents=True)
+        (repo / KERNEL_SUBDIR / "clean.hip").write_text("float acc[4] = {0}; acc[0] = fmaf(d, q, acc[0]);\n")
+        for cmd in (["git", "init", "-q"], ["git", "add", "-A"],
+                    ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"]):
+            subprocess.run(cmd, cwd=repo, capture_output=True)
+        at_repo = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main(["--dir", str(repo)])
+        chk(True, "AUDITED" in buf.getvalue() and at_repo[:12] in buf.getvalue(),
+            "the report names the commit it audited")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main(["--dir", str(kernels.parent.parent.parent)])       # a tree that is not a checkout
+        chk(True, "no commit" in buf.getvalue(), "a tree that is not a checkout says so instead of printing a sha")
         chk(0, by["clean.hip"]["narrowings"], "fmaf accumulation narrows nothing")
         # `_Float16` is the spelling the add-on's kernels actually use (engine#2405: every cast in its three new
         # kernels is `(_Float16)`), so a pattern that only knew `half`/`__half` reported zero of them.
@@ -351,6 +374,13 @@ def main(argv):
         print(f"hip_f16_audit: {Path(a.dir) / KERNEL_SUBDIR} is not a directory - cannot tell, "
               f"and that is not a pass", file=sys.stderr)
         return 2
+    # Say WHICH commit was audited, before the counts and on stdout, for the same reason the Loom ratchet prints
+    # CORPUS and FINGERPRINT before its verdict: a report is evidence only if it names the tree it read, and a FAIL
+    # is when the identity matters most. engine#2416's playbook asks a pin-bump PR body for "the commit audited" --
+    # until now the tool never printed it, so that line depended on someone remembering to run rev-parse as well.
+    if not a.json:
+        audited = head_sha(a.dir)
+        print(f"AUDITED      {audited if audited else 'no commit: ' + str(a.dir) + ' is not a git checkout'}")
     bad = report(rows, a.json, a.top)
     if bad:
         for row in bad:

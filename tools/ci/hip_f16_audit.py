@@ -73,6 +73,20 @@ def audit_file(path):
             "lines": text.count("\n") + 1}
 
 
+def sha_matches(got, want):
+    """True when `got` (a full HEAD sha) is the commit `want` names, which may be abbreviated.
+
+    Compared prefix-wise in both directions for the same reason the fleet's verdict checker does: a 7-character sha
+    in a PR body and a 40-character sha from git name the same commit, and refusing that pair would make the gate
+    fire on the one case it is meant to allow — auditing a candidate pin copied out of a PR description.
+    """
+    if not got or not want:
+        return False
+    got, want = got.lower(), want.lower()
+    n = min(len(got), len(want))
+    return got[:n] == want[:n]
+
+
 def pin_sha(config_root):
     """The gpu-kernels sha `config/gpu-kernels.config` pins, or None with the reason printed."""
     cfg = Path(config_root) / "config" / "gpu-kernels.config"
@@ -191,6 +205,14 @@ def self_test():
             "a non-git directory has no commit")
         chk(None, pin_sha(Path(tmp) / "nowhere"), "an engine checkout with no config/ is None, not a guess")
 
+        # --expect-sha: the candidate-pin case, where the commit is in a PR rather than in config/ yet (engine#2411)
+        chk(True, sha_matches(at, at), "a full sha matches itself")
+        chk(True, sha_matches(at, at[:7]), "a 7-character sha from a PR names the same commit")
+        chk(True, sha_matches(at, at.upper()), "case does not change the commit")
+        chk(False, sha_matches(at, "f" * 40), "a different sha does not match")
+        chk(False, sha_matches(None, at), "a tree with no commit never matches, not even a guess")
+        chk(False, sha_matches(at, ""), "an empty expectation is not a wildcard")
+
     if problems:
         for problem in problems:
             print("FAIL " + problem)
@@ -205,6 +227,9 @@ def main(argv):
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--config-root", help="an engine checkout: audit the tree the gpu-kernels pin names, and refuse "
                                           "a tree at any other commit (an audit of the wrong tree reads as clean)")
+    ap.add_argument("--expect-sha", help="audit THIS commit (7..40 hex characters), for a candidate pin that has not "
+                                         "merged yet; overrides --config-root. An audit of the wrong tree reads as "
+                                         "clean, so the commit audited has to be asserted, not remembered")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
@@ -212,20 +237,33 @@ def main(argv):
     if not a.dir:
         print("hip_f16_audit: --dir is required (the gpu-kernels checkout to audit)", file=sys.stderr)
         return 2
-    if a.config_root:
+    if a.expect_sha or a.config_root:
         # engine#2406's instruction is "audit those on a pin bump": the audit is of THE PINNED TREE, and a checkout
         # at another commit is exactly the false clean this tool exists to prevent.
-        want = pin_sha(a.config_root)
-        if want is None:
-            return 2
+        #
+        # --expect-sha exists because the pin is configured in the engine's working tree, and the audit a pin BUMP
+        # needs happens BEFORE that bump merges: the candidate commit is in the PR, not yet in config/. Without an
+        # explicit sha the gate refuses the one audit it was built for, and the escape it prints ("drop --config-root
+        # and say which commit you audited") records nothing, which reopens the hole. engine#2411.
+        if a.expect_sha:
+            want, where = a.expect_sha.strip(), "--expect-sha"
+            if not (7 <= len(want) <= 40) or any(c not in "0123456789abcdef" for c in want.lower()):
+                print(f"hip_f16_audit: --expect-sha {a.expect_sha!r} is not a 7..40 character hex sha",
+                      file=sys.stderr)
+                return 2
+        else:
+            want = pin_sha(a.config_root)
+            if want is None:
+                return 2
+            where = f"the pin in {Path(a.config_root) / 'config' / 'gpu-kernels.config'}"
         got = head_sha(a.dir)
         if got is None:
             print(f"hip_f16_audit: {a.dir} is not a git checkout - cannot tell which commit is audited",
                   file=sys.stderr)
             return 2
-        if got != want:
-            print(f"hip_f16_audit: this tree is at {got[:12]}, the pin is {want[:12]} - audit the pinned tree "
-                  f"or drop --config-root and say which commit you audited", file=sys.stderr)
+        if not sha_matches(got, want):
+            print(f"hip_f16_audit: this tree is at {got[:12]}, {where} says {want[:12]} - audit the pinned tree "
+                  f"or say which commit you audited with --expect-sha", file=sys.stderr)
             return 2
     rows = audit(a.dir)
     if rows is None:

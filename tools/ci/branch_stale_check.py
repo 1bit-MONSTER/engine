@@ -35,6 +35,7 @@ Exit 0 no loss, 1 a conflict or a lost base change, 2 a ref could not be read (w
 """
 
 import argparse
+import os
 import subprocess
 import sys
 
@@ -72,9 +73,18 @@ def main():
     parser = argparse.ArgumentParser(description="Report what merging the branch would lose from the base.")
     parser.add_argument("--base", default="origin/main", help="base ref (default: origin/main)")
     parser.add_argument("--head", default="HEAD", help="head ref (default: HEAD)")
+    # engine#2443: the other two tools in tools/ci carry --self-test and these two kept their arms in
+    # tests/*_test.py, so `--self-test` here answered "unrecognized arguments" -- which reads as "there is
+    # no self-test" rather than "its arms live elsewhere". The arms stay where they are; this runs them.
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the arms in tests/branch_stale_check_test.py and exit with their status")
     parser.add_argument("--quiet", action="store_true", help="only print failures")
     parser.add_argument("--limit", type=int, default=25, help="how many files to name (default: 25)")
     args = parser.parse_args()
+    if args.self_test:
+        return subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))), "tests/branch_stale_check_test.py")]).returncode
+
 
     for label, rev in (("base", args.base), ("head", args.head)):
         if not ref_exists(rev):

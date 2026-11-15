@@ -2784,7 +2784,6 @@ int serve_child(const Options& given) {
         // engine#2537: a backend that died because its port was taken is relaunched on a fresh one, twice at most. Only that
         // cause is retried: any other failure to start still fails serve, below.
         for (int retry = 1; !laya && i < backends.size() && retry <= kPortTakenRetries; ++retry) {
-            backend_port_taken = false;
             if (children[i]->wait_ready(std::chrono::seconds(600), g_stop) || g_stop) break;
             if (children[i]->alive() || !backend_port_taken) break;
             const int taken = backends[i].port;
@@ -2793,6 +2792,9 @@ int serve_child(const Options& given) {
             std::fprintf(stderr, "1bit serve: backend %zu could not bind port %d (address already in use: another process took it "
                                  "after serve picked it); relaunching on port %d (%d of %d)\n",
                          i, taken, backends[i].port, retry, kPortTakenRetries);
+            // cleared only here, before the relaunch: a backend can print its EADDRINUSE while serve is still waiting on an
+            // earlier backend, and clearing the flag before this backend's wait would drop that line
+            backend_port_taken = false;
             children[i] = std::make_unique<Child>(backends[i].argv, backends[i].env, backends[i].port, backends[i].ready_path,
                                                   backend_line, backends[i].env_override);
         }

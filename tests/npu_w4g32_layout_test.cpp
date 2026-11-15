@@ -126,20 +126,33 @@ static void test_factor_pack() {
         }
     std::vector<int8_t> c2(K * N);
     std::vector<float> s2((K / 32) * N);
-    CHECK(w::factor(B.data(), S.data(), K, N, c2.data(), s2.data()), "factor refused a valid input");
-    for (int i = 0; i < K * N; i++) {
-        const bool zero_group = S[i] == 0.0f;
-        CHECK(c2[i] == (zero_group ? 0 : c[i]), "factor code %d: %d vs %d", i, c2[i], c[i]);
-    }
-    CHECK(s2 == s, "factor scales");
+    CHECK(w::factor(B.data(), K, N, c2.data(), s2.data()), "factor refused a valid input");
+    // any exact form is acceptable: check B = c2 * s2 element for element, and |c2| fits int4
+    for (int k = 0; k < K; k++)
+        for (int n = 0; n < N; n++) {
+            const float sg = s2[(k / 32) * N + n];
+            CHECK(c2[k * N + n] >= -8 && c2[k * N + n] <= 7, "code range");
+            CHECK((float)c2[k * N + n] * sg == B[k * N + n], "factor (%d,%d) not exact", k, n);
+        }
+    // and where the group holds a -8 code the container's own (c, s) is the one found (q = 8 tried first)
+    int same = 0, groups = 0;
+    for (int g = 0; g < K / 32; g++)
+        for (int n = 0; n < N; n++) {
+            bool has8 = false;
+            for (int kk = 0; kk < 32; kk++) has8 |= c[(g * 32 + kk) * N + n] == -8;
+            if (!has8 || s[g * N + n] == 0.0f) continue;
+            ++groups;
+            same += s2[g * N + n] == s[g * N + n];
+        }
+    CHECK(groups > 0 && same == groups, "own scale recovered in %d of %d groups with a -8", same, groups);
+    // a group of only even codes may be represented at twice the scale: still exact, checked above
     // refusals
-    auto refused = [&](std::vector<float> b, std::vector<float> sm, const char* what) {
-        CHECK(!w::factor(b.data(), sm.data(), K, N, c2.data(), s2.data()), "factor accepted: %s", what);
+    auto refused = [&](std::vector<float> b, const char* what) {
+        CHECK(!w::factor(b.data(), K, N, c2.data(), s2.data()), "factor accepted: %s", what);
     };
-    { auto b = B; auto sm = S; sm[5 * N + 9] *= 2.0f; refused(b, sm, "S not constant in a group"); }
-    { auto b = B; size_t i = 40 * N + 1; while (S[i] == 0.0f) i++; b[i] = 0.5f * S[i]; refused(b, S, "B/S = 0.5"); }
-    { auto b = B; size_t i = 41 * N + 2; while (S[i] == 0.0f) i++; b[i] = 8.0f * S[i]; refused(b, S, "code +8"); }
-    { auto b = B; b[3] = 1.0f; refused(b, S, "B != 0 where S == 0"); }
+    { auto b = B; size_t i = 40 * N + 1; while (S[i] == 0.0f) i++; b[i] = 0.37f * S[i]; refused(b, "a non-multiple element"); }
+    { auto b = B; b[50 * N + 7] = std::nanf(""); refused(b, "NaN"); }
+    { auto b = B; for (int kk = 0; kk < 32; kk++) b[(64 + kk) * N + 3] = (float)(kk * 9 - 140); refused(b, "a 32-level ramp (needs > 4 bits)"); }
 
     std::vector<uint8_t> img(w::w_bytes(K, N));
     std::vector<float> cs(N);

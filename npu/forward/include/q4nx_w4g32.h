@@ -47,6 +47,9 @@
 //   A_packed[rt][ki][mb][kb][r][cc] = A[rt*32 + mb*4 + r][ki*128 + kb*16 + cc]
 // (rt = m/32, mb = 4-row block, r = row in it, kb = 16-K block, cc = k in it).  C is int32 row-major M x N.
 //
+// The packer's input is the int8 path's own assembled float B (no second scale stream): factor() finds an exact
+// code x per-32 scale form of it or refuses.
+//
 // This header is the contract between the packer, the A pack, the host dequantisation and the kernel's
 // tap (mm_g32h.cc: codes at w + (kb*8+nb)*128, mags at w + 8192 + (nb*4+g)*16, A at (mb*8+kb)*64).
 // tests/npu_w4g32_layout_test.cpp restates it independently and pins it without a device.
@@ -98,30 +101,49 @@ inline offsets index(int K, int N, int k, int n) {
     return o;
 }
 
-// Recover c and s from an ASSEMBLED design matrix: B[k][n] (= c * s exactly, the q4_1 dequant of a
-// z = -8 s pack) and S[k][n] (the same scatter of each element's group scale).  Writes code[k][n] and
-// scale[g][n].  Returns false -- and the caller keeps the int8 path -- unless S is constant over every
-// 32-K group of a column and B / S is an integer in [-8, 7] wherever S != 0 (B must be 0 where S == 0).
-inline bool factor(const float* B, const float* S, int K, int N, int8_t* code, float* scale) {
-    if (!B || !S || !code || !scale || K % GROUP || N <= 0) return false;
-    for (int g = 0; g < K / GROUP; g++)
-        for (int n = 0; n < N; n++) {
-            const float s = S[(size_t)g * GROUP * N + n];
-            scale[(size_t)g * N + n] = s;
-            for (int kk = 0; kk < GROUP; kk++) {
-                const size_t i = (size_t)(g * GROUP + kk) * N + n;
-                if (S[i] != s) return false;
-                const float b = B[i];
-                if (s == 0.0f) {
-                    if (b != 0.0f) return false;
-                    code[i] = 0;
-                    continue;
-                }
-                const float q = b / s;
-                if (!(q >= -8.0f && q <= 7.0f) || q != std::nearbyint(q) || (float)q * s != b) return false;
-                code[i] = (int8_t)q;
+// Factor an ASSEMBLED design matrix B[k][n] (the float the int8 path packs) into code[k][n] in [-8, 7] and
+// one scale per (32-K group, column): B = code * scale exactly, element for element.  The representation the
+// kernel needs is any exact one, not the container's own: for each group with a = max |B| the candidates are
+// s = +-a/q for q = 8 .. 1, and the first under which every element is an exact in-range multiple is taken (a
+// q4_1 z = -8s pack, a symmetric q4_0 pack and a ternary pack all have one; a/q is exact whenever the true
+// scale is a/q, because the correctly rounded quotient of q*s by q is s).  An all-zero group gets scale 0.
+// Returns false -- and the tier must not run on this weight -- when some group has no such scale.
+inline bool factor_group(const float* B, size_t stride, int8_t* code, float* scale_out) {
+    float a = 0.0f;
+    for (int i = 0; i < GROUP; i++) {
+        const float v = B[(size_t)i * stride];
+        if (!std::isfinite(v)) return false;
+        a = std::fmax(a, std::fabs(v));
+    }
+    if (a == 0.0f) {
+        for (int i = 0; i < GROUP; i++) code[(size_t)i * stride] = 0;
+        *scale_out = 0.0f;
+        return true;
+    }
+    for (int q = 8; q >= 1; q--)
+        for (int sg = 0; sg < 2; sg++) {
+            const float s = sg ? -a / (float)q : a / (float)q;
+            bool ok = true;
+            for (int i = 0; i < GROUP && ok; i++) {
+                const float v = B[(size_t)i * stride];
+                const float c = std::nearbyint(v / s);
+                ok = c >= -8.0f && c <= 7.0f && c * s == v;
             }
+            if (!ok) continue;
+            for (int i = 0; i < GROUP; i++) code[(size_t)i * stride] = (int8_t)std::nearbyint(B[(size_t)i * stride] / s);
+            *scale_out = s;
+            return true;
         }
+    return false;
+}
+
+inline bool factor(const float* B, int K, int N, int8_t* code, float* scale) {
+    if (!B || !code || !scale || K % GROUP || N <= 0) return false;
+    for (int g = 0; g < K / GROUP; g++)
+        for (int n = 0; n < N; n++)
+            if (!factor_group(B + (size_t)g * GROUP * N + n, (size_t)N, code + (size_t)g * GROUP * N + n,
+                              scale + (size_t)g * N + n))
+                return false;
     return true;
 }
 

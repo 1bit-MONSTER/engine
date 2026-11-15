@@ -79,10 +79,23 @@ def gh(path, paginate=False):
 # `abc1234` ``) and quote **other people's** verdicts when reconciling them, and both were being read as verdicts by the
 # author. Measured 2026-11-14: this lane's own reconciliation comment on npu-kernels#70 quoted `VERDICT: NEEDS-CHANGE` at
 # the head, so `--state` reported a READY PR as held by a CHANGES that no reviewer had written.
-VERDICT_LINE = re.compile(r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b', re.MULTILINE)
-
-
-VERDICT_KIND = re.compile(r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b[^\n]*', re.MULTILINE)
+# Two line shapes, because both are written and only one was read (measured 2026-11-15): the canonical
+#   VERDICT: READY at `abc1234`
+# and the sha-first
+#   79e7b2e READY — the arm that was missing is there
+# where the head comes first and the verdict word right after it, with no `VERDICT` word anywhere. Four verdicts of
+# the second shape were posted on one night's queue and every one of them was invisible: `verdict_kind` answered None,
+# so the PR stayed on the queue and the review was repeated by the next lane. The queue's whole claim is that it knows
+# what has been reviewed; a convention it cannot read is not a convention.
+#
+# The sha-first shape requires the head to be a real abbreviated sha (7-40 hex) followed by a known verdict word, so a
+# prose line that starts with a number ("3 arms, 0 failed") or a commit subject cannot be mistaken for a verdict.
+_SHA_FIRST = r'^(?=([0-9a-f]{7,40}[ \t]+(?:VERDICT[ \t]+)?(?:READY|APPROVE|APPROVED|CHANGES|CHANGES_REQUESTED|CHANGES-REQUESTED|CHANGE|NEEDS-CHANGE|NEEDS-CHANGES|REQUEST-CHANGES|NOT-READY)\b))'
+VERDICT_LINE = re.compile(
+    r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b' + '|' + _SHA_FIRST, re.MULTILINE)
+VERDICT_KIND = re.compile(
+    r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b[^\n]*' +
+    '|' + r'^[0-9a-f]{7,40}[ \t]+(?:VERDICT[ \t]+)?[A-Z][A-Z_-]+[^\n]*', re.MULTILINE)
 
 
 def verdict_kind(body):
@@ -95,8 +108,10 @@ def verdict_kind(body):
     found = VERDICT_KIND.search(body or '')
     if not found:
         return None
-    words = re.findall(r'[A-Z][A-Z_-]+', found.group(0))
-    for word in words[1:]:
+    # `VERDICT` is the marker word, not a kind: drop it rather than skipping the first token, because in the sha-first
+    # shape the first token IS the kind (`79e7b2e READY`).
+    words = [w for w in re.findall(r'[A-Z][A-Z_-]+', found.group(0)) if w != 'VERDICT']
+    for word in words:
         if word in ('READY', 'APPROVE', 'APPROVED'):
             return 'READY'
         # `NEEDS-CHANGE`, `CHANGES-REQUESTED`, `NOT-READY`: a lane writes the verdict in prose as often as in the
@@ -283,6 +298,21 @@ def self_test_state():
     chk('CHANGES', verdict_kind('VERDICT: NEEDS-CHANGE at this head'), 'NEEDS-CHANGE is a change request')
     chk('OTHER', verdict_kind('VERDICT: something nobody has seen before'),
         'an unknown kind is OTHER, never a silent none')
+
+    # The sha-first shape, measured on the live queue 2026-11-15: four verdicts written `79e7b2e READY — <why>` were
+    # invisible, so the PR stayed on the queue and the next lane reviewed it again. Every arm below is one of the four
+    # that were posted that night, plus the lines that must NOT be read as a verdict.
+    sha_first = [{'body': '79e7b2e READY — the arm that was missing is there', 'submitted_at': '2026-11-15T05:48:17Z'}]
+    chk(True, reviewed_at(sha_first, '79e7b2e'), 'a sha-first READY naming this head counts')
+    chk(('READY', '2026-11-15T05:48:17Z'), newest_verdict(sha_first, [], '79e7b2e'),
+        'and --state reports it as READY, not UNATTRIBUTED')
+    chk('READY', verdict_kind('79e7b2e READY — the arm is there'), 'the sha-first kind is read, not skipped')
+    chk('CHANGES', verdict_kind('c0cefd5 CHANGES — one claim has no arm'), 'sha-first CHANGES too')
+    chk('CHANGES', verdict_kind('7f7cfff CHANGES - a hyphen, not an em dash'), 'the ASCII-hyphen form too')
+    chk(False, reviewed_at([{'body': '79e7b2e READY — x'}], '9999999'),
+        'a sha-first verdict at a DIFFERENT head still does not count')
+    chk(None, verdict_kind('3 arms, 0 failed'), 'a line that starts with a number is not a verdict')
+    chk(None, verdict_kind('abc1234 needs-review'), 'a known sha followed by a non-verdict word is not a verdict')
 
     # the attributed case must still prefer the newest NAMED verdict
     revs2 = [{'body': 'VERDICT: CHANGES at `abc1234`', 'submitted_at': '2026-11-14T03:00:00Z'},

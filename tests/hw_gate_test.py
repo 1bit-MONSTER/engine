@@ -166,10 +166,18 @@ def main():
         off = "placement_observer: placement: 354 nodes, 20 off HRX (MUL_MAT x 20), 5 graph splits\n"
         abort = ('ggml-hrx.cpp:444: placement_observer: GGML_HRX_STRICT=1: "attn_out-0" is MUL_MAT f32 '
                  'ne=[1024,7,1,1] and is not placed on HRX; 1 of 512 nodes off HRX (MUL_MAT x 1), 3 splits\n')
+        # engine#2450: the engine classifies an off-HRX node as by-design (mapped weight, unaligned matmul) or
+        # unexplained, and only the second is a misplacement -- measured on main at 989/3897/6570 nodes, always
+        # the same two token-embedding GET_ROWS. The row must stop calling a documented default a failure, and
+        # must keep calling a real misplacement one; both directions are pinned below.
+        byd = "placement_observer: placement: 989 nodes, 2 off HRX (GET_ROWS x 2), 2 by design, 0 unexplained, 2 graph splits\n"
+        unex = "placement_observer: placement: 989 nodes, 2 off HRX (GET_ROWS x 2), 1 by design, 1 unexplained, 2 graph splits\n"
         for name, text, want, says in (("clean", clean * 3, 0, "all on HRX in 3 graphs"),
                                        ("worst graph", clean + off + clean, 1, "20 of 354 nodes off HRX"),
                                        ("no report", "srv  load_model: loaded\n", 1, "no placement report"),
-                                       ("strict abort", clean + abort, 1, "attn_out-0")):
+                                       ("strict abort", clean + abort, 1, "attn_out-0"),
+                                       ("by design only", clean + byd, 0, "BY DESIGN and none unexplained"),
+                                       ("one unexplained", clean + unex, 1, "1 unexplained")):
             log = os.path.join(d, "server.log")
             with open(log, "w") as f:
                 f.write(text)

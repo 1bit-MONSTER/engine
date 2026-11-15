@@ -155,7 +155,13 @@ def cmd_judge(manifest, name, logpath):
 
 # ggml-hrx's placement observer (GGML_HRX_REPORT=2, engine #390), one line per graph:
 # "placement_observer: placement: 512 nodes, 34 off HRX (MUL_MAT x 30, GET_ROWS x 4), 7 graph splits"
-PLACEMENT = re.compile(r"placement: (\d+) nodes, (\d+) off HRX \(([^)]*)\), (\d+) graph splits")
+# engine#2450: the engine now CLASSIFIES an off-HRX node as by-design (a weight in the loader's file mapping, or an
+# unaligned-matmul input with no HRX dense schedule) or unexplained, and only the second is a misplacement -- but the
+# placement line printed neither count, so this row failed on nodes the engine itself documents as intended. The two
+# fields are OPTIONAL here so the row keeps working against a binary that does not print them yet: present -> decide on
+# `unexplained`, absent -> the old rule (any node off HRX fails). That keeps this change mergeable before the fork's.
+PLACEMENT = re.compile(r"placement: (\d+) nodes, (\d+) off HRX \(([^)]*)\)"
+                       r"(?:, (\d+) by design, (\d+) unexplained)?, (\d+) graph splits")
 STRICT_ABORT = re.compile(r"GGML_HRX_STRICT=1: (.*)")
 
 
@@ -165,7 +171,9 @@ def cmd_placement(logpath):
     the server was started with GGML_HRX_REPORT=2 and -lv 4, so silence means the check saw nothing."""
     with open(logpath, errors="replace") as f:
         log = f.read()
-    graphs = [(int(n), int(off), ops, int(splits)) for n, off, ops, splits in PLACEMENT.findall(log)]
+    graphs = [(int(n), int(off), ops, int(splits), (int(byd) if byd else None),
+               (int(unex) if unex else None))
+              for n, off, ops, byd, unex, splits in PLACEMENT.findall(log)]
     abort = STRICT_ABORT.search(log)
     if abort:
         print("GGML_HRX_STRICT refused: " + abort.group(1).strip()[:300])
@@ -173,13 +181,27 @@ def cmd_placement(logpath):
     if not graphs:
         print("no placement report in the server log (GGML_HRX_REPORT=2, -lv 4 were passed)")
         return 1
-    worst = max(graphs, key=lambda g: g[1])
     largest = max(g[0] for g in graphs)
-    if worst[1] > 0:
-        bad = sum(1 for g in graphs if g[1] > 0)
-        print(f"{worst[1]} of {worst[0]} nodes off HRX ({worst[2]}), {worst[3]} graph splits; "
-              f"{bad} of {len(graphs)} graphs had nodes off HRX")
+    # Which number decides: `unexplained` when the engine printed it, the raw off-HRX count when it did not.
+    classified = any(g[5] is not None for g in graphs)
+    if classified:
+        # A log can hold both shapes (an older line and a newer one from the same run); an unclassified graph falls
+        # back to its raw count so the comparison never mixes None with int.
+        worst = max(graphs, key=lambda g: (g[5] if g[5] is not None else g[1], g[1]))
+        unexplained, by_design = (worst[5] if worst[5] is not None else worst[1]), (worst[4] or 0)
+    else:
+        worst = max(graphs, key=lambda g: g[1])
+        unexplained, by_design = worst[1], 0
+    if unexplained > 0:
+        bad = sum(1 for g in graphs if (g[5] if g[5] is not None else g[1]) > 0)
+        print(f"{worst[1]} of {worst[0]} nodes off HRX ({worst[2]}), {worst[3]} graph splits"
+              + (f", {by_design} by design, {unexplained} unexplained" if classified else "")
+              + f"; {bad} of {len(graphs)} graphs had misplaced nodes")
         return 1
+    if classified and by_design > 0:
+        print(f"{by_design} off-HRX node(s) BY DESIGN and none unexplained, in {len(graphs)} graphs "
+              f"(largest {largest} nodes); the engine classifies mapped-weight and unaligned-matmul nodes as intended")
+        return 0
     print(f"all on HRX in {len(graphs)} graphs (largest {largest} nodes)")
     return 0
 

@@ -163,6 +163,32 @@ def self_test():
 
     ok("one boot cannot answer the cross-boot question", intersection(c), None)
 
+    # The counts engine#2478 actually measured in the boot that died: five addresses carrying most of the 2361 faults.
+    # Until this arm existed, nothing tested the top-five ORDER -- only that the numbers were counted somewhere.
+    real = {
+        "0xebe54000": 301,
+        "0xeb5fa000": 299,
+        "0xe54de000": 297,
+        "0xeb5f1000": 278,
+        "0xebc8e000": 262,
+        "0x1000": 1,
+        "0x2000": 1,
+    }
+    text = "".join(
+        "Nov 14 20:00 host kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=%s flags=0x0000]\n"
+        % a
+        for a, n in real.items()
+        for _ in range(n)
+    )
+    c = census(parse(text, "died"))[0]
+    ok("the measured boot censuses to 1439 faults over 7 distinct addresses", (c["faults"], c["distinct"]), (1439, 7))
+    ok(
+        "the top five keep the measured order, largest first",
+        [(t["address"], t["count"]) for t in c["top"]],
+        [("0xebe54000", 301), ("0xeb5fa000", 299), ("0xe54de000", 297), ("0xeb5f1000", 278), ("0xebc8e000", 262)],
+    )
+    ok("the top five stop at five and do not list the singletons", len(c["top"]), 5)
+
     print("iommu_fault_census self-test: %d failure(s)" % fails)
     return 1 if fails else 0
 

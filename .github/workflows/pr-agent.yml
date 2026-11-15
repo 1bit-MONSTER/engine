@@ -35,15 +35,16 @@ permissions:
 
 jobs:
   # The model runs only inside a gpu-hold ticket, in on-demand windows (engine#2494, docs/ci-runners.md): this job asks
-  # for a window and waits for it, bounded. If the model never answers, pr_agent below is SKIPPED, shown as skipped,
-  # with "reviewer unavailable" in this job's summary - never a review that did not happen reported as a pass.
+  # for a window and waits for it, bounded at 10 min so the single pr-agent runner is not held for long. If the model
+  # never answers, THIS job FAILS with "reviewer unavailable" (a skipped job would count as a pass for a required check,
+  # so "no review" must be visible as a red reviewer, never as green), and pr_agent below does not run.
   reviewer:
     runs-on: [self-hosted, pr-agent]
     if: |
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
-    timeout-minutes: 30
+    timeout-minutes: 15
     outputs:
       available: ${{ steps.wait.outputs.available }}
     steps:
@@ -52,7 +53,7 @@ jobs:
         run: |
           demand="$HOME/.cache/coder-llm/demand"; mkdir -p "$(dirname "$demand")"
           # a real one-token completion, not just /v1/models: the server answers that before the model is loaded
-          deadline=$(( $(date +%s) + 25 * 60 ))
+          deadline=$(( $(date +%s) + 10 * 60 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
             touch "$demand"
             if curl -sf --max-time 60 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
@@ -62,8 +63,9 @@ jobs:
             sleep 15
           done
           echo "available=false" >> "$GITHUB_OUTPUT"
-          echo "::warning::reviewer unavailable: the local model (coder-llm, :8090) did not answer within 25 min; no review was run"
-          echo "### reviewer unavailable: no GPU window for the local model within 25 min; pr_agent is skipped, not passed" >> "$GITHUB_STEP_SUMMARY"
+          echo "### reviewer unavailable: no GPU window for the local model (coder-llm, :8090) within 10 min; no review was run" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::reviewer unavailable: the local model (coder-llm, :8090) did not answer within 10 min; no review was run (re-run this job to retry)"
+          exit 1
 
   pr_agent:
     needs: reviewer

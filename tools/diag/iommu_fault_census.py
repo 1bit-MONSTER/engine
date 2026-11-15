@@ -59,6 +59,22 @@ def parse(text, label):
     return rows
 
 
+SUPPRESSED = re.compile(r"(\S+): (\d+) callbacks suppressed")
+
+
+def suppressed(text):
+    """{caller: N} from `printk_ratelimited`'s "N callbacks suppressed" lines.
+
+    engine#2478: `amd_iommu_report_page_fault: 5611 callbacks suppressed` means the kernel DROPPED 5611 fault
+    callbacks, so every count on this page is the printed subset. A census that reports a compressed stream
+    without saying so is the same failure as a histogram that drops the lines it cannot read (engine#2562).
+    The counter is per caller, not per device, so it is reported per journal rather than per device row."""
+    out = {}
+    for caller, n in SUPPRESSED.findall(text):
+        out[caller] = out.get(caller, 0) + int(n)
+    return out
+
+
 def census(rows):
     out = []
     for (label, dev, domain), pairs in sorted(rows.items()):
@@ -148,7 +164,7 @@ def shape(e):
     )
 
 
-def render(entries, inter, as_json):
+def render(entries, inter, as_json, sup=None):
     if as_json:
         return json.dumps(
             {
@@ -192,6 +208,16 @@ def render(entries, inter, as_json):
             )
             for a in offs[:5]:
                 lines.append("    +%s" % hex(a))
+    # engine#2478: the ratelimiter drops fault callbacks, so the counts above are a subset. Say so, and by how
+    # much, or a reader compares two boots whose drop rates differ and reads the difference as the device's.
+    for label, drops in sorted((sup or {}).items()):
+        n = sum(drops.values())
+        if n:
+            printed = sum(e["faults"] for e in entries if e["label"] == label)
+            lines.append(
+                "%s suppressed: %d fault callback(s) dropped by printk -- %d printed here, so the stream is at least %d"
+                % (label, n, printed, printed + n)
+            )
     return "\n".join(lines)
 
 
@@ -266,6 +292,12 @@ def self_test():
     # one boot each, so no device has two sets to compare: nothing is reported, and in particular the NVMe/NPU address
     # that happens to be equal is never offered as a shared buffer (before the fix, pooling them made it one).
     ok("an NPU address equal to an NVMe address is not a shared buffer", intersection(pooled), None)
+
+    ok("printk's suppressed count parses", suppressed("x: amd_iommu_report_page_fault: 5611 callbacks suppressed"), {"amd_iommu_report_page_fault": 5611})
+    ok("...and a journal with no suppression line reports none", suppressed(one), {})
+    ok("...and the rendered page says the stream is larger than the printed count",
+       "so the stream is at least 12" in render(census(parse(one + "y: amd_iommu_report_page_fault: 10 callbacks suppressed\n", "b1")),
+                                                 None, False, {"b1": {"amd_iommu_report_page_fault": 10}}), True)
 
     noise = "Nov 14 23:40:00 host kernel: nvme nvme0: I/O 12 QID 1 timeout, aborting\n"
     ok("a line that is not a page fault is ignored", parse(noise, "b1"), {})
@@ -358,22 +390,31 @@ def main():
         return self_test()
 
     rows = {}
+    sup = {}
     if a.journal:
         for path in a.journal:
             try:
                 with open(path, "r", errors="replace") as fh:
-                    rows.update(parse(fh.read(), path))
+                    text = fh.read()
             except OSError as e:
                 print("iommu_fault_census: cannot read %s: %s" % (path, e), file=sys.stderr)
                 return 2
+            rows.update(parse(text, path))
+            drops = suppressed(text)
+            if drops:
+                sup[path] = drops
     else:
-        rows = parse(sys.stdin.read(), a.label)
+        text = sys.stdin.read()
+        rows = parse(text, a.label)
+        drops = suppressed(text)
+        if drops:
+            sup[a.label] = drops
 
     entries = census(rows)
     if not entries:
         print("no IO_PAGE_FAULT lines in the input", file=sys.stderr)
         return 0
-    print(render(entries, intersection(entries), a.json))
+    print(render(entries, intersection(entries), a.json, sup))
     return 0
 
 

@@ -27,6 +27,8 @@
 # Exit 0: the model answers (at once, when the unit is resident or its window is already open).
 # Exit 75: it did not answer within SECONDS (default 900). The window is queued behind other GPU tickets and comes
 #          round in FIFO order, so a long wait is the queue, not a fault: report "not run", never a fake answer.
+#          The demand file is removed on the way out: a demand that outlives its caller would buy a GPU ticket for
+#          nobody (review of #2588). A waiter that is still alive re-touches it within 30 s, so this starves no one.
 # Exit 2: usage.
 set -u
 unit=${1:-}; url=${2:-}; limit=${3:-900}
@@ -41,7 +43,8 @@ echo "ticketed-wait: asked for $unit (touched $demand); waiting up to ${limit}s 
 while :; do
     now=$(date +%s)
     if [ $(( now - start )) -ge "$limit" ]; then
-        echo "ticketed-wait: $unit did not answer in ${limit}s (still queued for the GPU?): not run" >&2
+        echo "ticketed-wait: $unit did not answer in ${limit}s (still queued for the GPU?): not run; demand withdrawn" >&2
+        rm -f "$demand"
         exit 75
     fi
     [ $(( now - touched )) -ge 30 ] && { touch "$demand"; touched=$now; }

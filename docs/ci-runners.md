@@ -334,7 +334,9 @@ on HRX, `:8095`) costing 3-9 % of every other GPU job while it sat idle. Tickete
 
 The script touches the demand file every 30 s while it waits, and polls `/v1/models`. It returns 0 once the model
 answers, at once if the unit is resident or its window is already open, and 75 after the limit. A 75 means the window
-is queued behind other tickets, so the run is **not run**, never a fake answer. A caller that works longer than the
+is queued behind other tickets, so the run is **not run**, never a fake answer. On a 75 it also **removes the demand
+file**, so a caller that has gone does not buy a GPU ticket for nobody. A unit other than coder-llm also takes demand
+as stale after 5 minutes (`CODER_LLM_DEMAND_TTL_MIN=5`), so even a crashed caller's touch expires quickly. A caller that works longer than the
 unit's idle time (5 min) keeps touching the demand file, or the window closes under it.
 
 

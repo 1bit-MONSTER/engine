@@ -86,7 +86,7 @@ cenvs=(CODER_LLM_UNIT=1bit-canonical CODER_LLM_UNIT_DIR="$scratch/cunit" CODER_L
 env "${cenvs[@]}" "$inst" --install > "$scratch/c1" 2>&1; rc=$?
 [ "$rc" = 0 ] || { echo "FAIL 5: --install of 1bit-canonical rc $rc: $(tail -2 "$scratch/c1")"; fail=1; }
 for want in "Environment=CODER_LLM_LABEL=1bit-canonical" "Environment=CODER_LLM_DEMAND=$HOME/.cache/1bit-canonical/demand" \
-            "Environment=CODER_LLM_URL=http://127.0.0.1:8095" "Environment=CODER_LLM_GH_POLL=0" \
+            "Environment=CODER_LLM_URL=http://127.0.0.1:8095" "Environment=CODER_LLM_GH_POLL=0" "Environment=CODER_LLM_DEMAND_TTL_MIN=5" \
             "ExecStart=$scratch/bin/coder-llm-ticketed -- $cserve"; do
     grep -qxF "$want" "$scratch/cunit/zz.conf" || { echo "FAIL 5: missing '$want'"; fail=1; }
 done

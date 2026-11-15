@@ -29,7 +29,9 @@
 # label, demand file and URL (engine#2579: 1bit-canonical on :8095 cost 3-9 % of every other GPU job while idle):
 #     CODER_LLM_UNIT=1bit-canonical install-coder-llm-ticketed.sh --diff
 # For a unit other than coder-llm the drop-in gets CODER_LLM_LABEL=<unit>, CODER_LLM_DEMAND=~/.cache/<unit>/demand,
-# CODER_LLM_URL=http://127.0.0.1:<the --port of its serve line> (refused when there is none) and CODER_LLM_GH_POLL=0
+# CODER_LLM_URL=http://127.0.0.1:<the --port of its serve line> (refused when there is none), CODER_LLM_DEMAND_TTL_MIN=5
+# (its callers re-touch every 30 s through ticketed-wait, so a crashed caller's demand expires in minutes, not 30) and
+# CODER_LLM_GH_POLL=0
 # (the pr-agent fallback is coder-llm's only). Its callers ask for it with scripts/ticketed-wait.
 #
 # Environment (tests): CODER_LLM_UNIT_DIR (default ~/.config/systemd/user/<unit>.service.d), CODER_LLM_DROPIN
@@ -56,7 +58,8 @@ render() {
         [ -n "$port" ] || { echo "no --port on $UNIT's serve line in $DROPIN: refusing to guess its URL" >&2; return 2; }
         extra="Environment=CODER_LLM_LABEL=$UNIT
 Environment=CODER_LLM_DEMAND=$HOME/.cache/$UNIT/demand
-Environment=CODER_LLM_URL=http://127.0.0.1:$port"
+Environment=CODER_LLM_URL=http://127.0.0.1:$port
+Environment=CODER_LLM_DEMAND_TTL_MIN=5"
     fi
     awk -v w="$WRAPPER" -v b="$BIN_DIR" -v unit="$UNIT" -v extra="$extra" '
         /^ExecStart=$/ && !done {

@@ -50,6 +50,7 @@
 #include "model/npu_model.h"   // NpuModel owns the target (engine#803 A3)
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 struct I8Ctx;
 
@@ -475,6 +476,17 @@ private:
     // stride and this width the same number.
     int kpad_ = 0;        // c_.H on the container's K grid
     int impad_ = 0;       // c_.IM on the container's K grid
+    // engine#2536: outlier-channel split for the int8 ffn_down GEMM (NPU_ACT_OUTLIER_TAU, act_outliers.h). Columns of
+    // the layer's down_proj are decoded one 256-wide block at a time and cached per (layer, channel).
+    float outl_tau_ = 0.0f;    // set in init_impl: 40 unless NPU_ACT_OUTLIER_TAU says otherwise
+    int outl_kmax_ = 16;
+    bool outl_busy_ = false;
+    bool outl_gather_ok_ = true;
+    std::unordered_map<uint64_t, std::vector<float>> outl_cols_;
+    std::unordered_set<int> outl_checked_;
+    std::vector<float> outl_scratch_;
+    bool ffn_down_outliers(const float* A, int M, int a_k, int K, int N, const float* Bmat, std::vector<float>& out,
+                           int wkey, int role, bool rows_form, bool decode_twin);
     // Row stride of the f32 table embed_at()/lm_at() read: the padded width when the table was
     // dequantised from a container tensor, c_.H when it is the raw BF16 embedding.
     int lm_w_ = 0;

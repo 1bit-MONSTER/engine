@@ -33,7 +33,11 @@ touch "$scratch/tiny.gguf"
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 pid=
-cleanup() { [ -n "$pid" ] && { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }; rm -rf "$scratch"; }
+# stop_tree: the serve runs in its own process group (see start), so TERM the GROUP. Killing only the pid
+# reaped `1bit serve` and left `fake_backend.py` orphaned with its listener up; the next section then failed
+# to bind the same derived port and serve reported it as "backend 0 did not become ready" (engine#2537).
+stop_tree() { [ -n "${1:-}" ] || return 0; kill -- -"$1" 2>/dev/null || kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; }
+cleanup() { stop_tree "$pid"; rm -rf "$scratch"; }
 trap cleanup EXIT
 
 start() {   # start <log> [env...]: serve on the port it reports, with the fake backend and env applied
@@ -41,9 +45,9 @@ start() {   # start <log> [env...]: serve on the port it reports, with the fake 
     local port code deadline
     # --port 0: the kernel picks and serve reports it, so nothing here picks a port and releases it before serve binds -
     # the release-then-bind race this test used to retry around is gone rather than mitigated (engine #1444/#1485).
-    env FAKE_SLOT_MARKER="$scratch/slot.json" "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port 0 --alias hybrid-model \
+    setsid env FAKE_SLOT_MARKER="$scratch/slot.json" "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port 0 --alias hybrid-model \
         --llama-server "$here/fake_backend.py" --no-mem-check >"$log" 2>&1 &
-    pid=$!
+    pid=$! pgid=$pid           # setsid execs in place, so the command's pid IS its process group (engine#2537)
     port=$(serve_port_wait "$log" "$pid" 900) || { echo "FAIL serve never reported a port; log=$log"; tail -5 "$log" 2>/dev/null; return 1; }
     api="http://127.0.0.1:$port"
     # A deadline in seconds, not a try count: the old 100-try loop took 6.7 s on a quiet box and 15.2 s on the
@@ -69,7 +73,7 @@ start() {   # start <log> [env...]: serve on the port it reports, with the fake 
     done | head -1)
     [ "$code" = 200 ]
 }
-stop() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; pid=; }
+stop() { stop_tree "$pid"; pid=; }
 
 # 1. the handoff: provider named, the backend sees id_slot 0 and cache_prompt true
 check "serve starts with the fake provider" 'start "$scratch/a.log" ONEBIT_HYBRID_PREFILL="$here/fake_prefill_provider.py" FAKE_PREFILL_COPY=1'
@@ -93,6 +97,12 @@ check "streamed reply relayed ($chunks chunks)" '[ "$chunks" = 7 ]'
 check "no handoff file left in the slot directory" '[ -n "$slotdir" ] && [ -z "$(ls "$slotdir" 2>/dev/null)" ]'
 stop
 check "the slot directory is removed at exit" '[ -n "$slotdir" ] && [ ! -d "$slotdir" ]'
+# engine#2537: the backend is a CHILD of serve, so a teardown that signals only serve's pid leaves it holding
+# the port and the next section's bind fails. Nothing of this run's scratch tree may still be listening.
+# setsid makes serve's pid its own process group, so the GROUP is the thing to test: with a teardown that
+# signals only serve's pid the orphaned backend stays in the group and this fails.
+for _ in $(seq 50); do kill -0 -- -"$pgid" 2>/dev/null || break; sleep 0.1; done
+check "the serve's process group is gone, so no backend survives its stop" '! kill -0 -- -"$pgid" 2>/dev/null'
 
 # 2. no provider: the device serves, the backend prefills (said once)
 check "serve starts without a provider" 'start "$scratch/b.log"'

@@ -330,6 +330,11 @@ set_tests_properties(token_rate_floor_device PROPERTIES SKIP_RETURN_CODE 77)
 # misses the server and it survives with PPID 1 holding the device. Scans scripts/ and tools/ (fails) and,
 # with --include-bin, ~/bin (warns) -- which is where the orphan lived and where no check had ever looked.
 add_test(NAME server_launch_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/server_launch_check.py --root ${CMAKE_SOURCE_DIR})
+# engine#2542: name the driver's refusals -- "Unsupported op %d" is a bare DECIMAL ERT op while
+# "command opcode 0x%x failed" is a HEX mailbox opcode: two namespaces in one log, and 18 vs 0x12 is the
+# coincidence this row exists to keep apart.
+add_test(NAME driver_refusal_census_selftest
+         COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/diag/driver_refusal_census.py --self-test)
 add_test(NAME server_launch_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/server_launch_check.py --self-test)
 # scripts/lemonade-hrx: the PPA lemond's HRX recipe runs our llama-server (docs/lemonade.md): no GPU.
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)

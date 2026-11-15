@@ -645,6 +645,9 @@ add_test(NAME hw_gate_mem COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_mem_tes
 # the first version overwrote the previous run's evidence), and a failed copy names nothing. No GPU, no ticket.
 add_test(NAME hw_gate_kept_log COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_kept_log_test.sh ${CMAKE_SOURCE_DIR})
 add_test(NAME hw_gate_phase_rows COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_phase_rows_test.sh ${CMAKE_SOURCE_DIR})
+# engine#2542: the accel sampler's self-test -- the correlation and rotation arms must be green before anyone
+# starts a long capture, because a silent correlator loses exactly the event it exists to catch.
+add_test(NAME accel_sampler COMMAND bash ${CMAKE_SOURCE_DIR}/tools/diag/accel_sampler.sh selftest)
 # engine#2523's rule reached main without its runtime arm: the source-reading hw_gate_test.py asserts the SKIP rows'
 # text and their `infra=1`, and hw_gate_phase_rows asserts phase parsing, but nothing ran the gate end to end with a
 # backend that reports "no test case ran". That is the case the fix was for -- zero cases must read INCOMPLETE and exit

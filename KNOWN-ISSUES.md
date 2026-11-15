@@ -17,6 +17,34 @@ limitations under the License.
 
 # Known issues
 
+## engine#823 — on the Bosgame BeyondMax board only the front USB-A port works under Linux
+
+**Status: OPEN, hardware/firmware, not reproducible in software.** On this board (AXB35-02, BIOS 1.09 05/08/2026)
+only the front USB-A port enumerates a device. Any drive in the front **Type-C** port or any **rear** port is
+electrically dead under Linux, on our kernel and on stock Ubuntu — while the same ports work in Windows on the same
+box, with the same drives (a Realtek RTL9210 USB4/USB 3.2 enclosure and a Gigastone flash drive).
+
+What the kernel can see, measured 2026-11-16 on this box:
+
+```
+lspci: 4 x "Strix Halo USB 3.1 xHCI"  (c5:00.4, c7:00.0, c7:00.3, c7:00.4)
+       2 x "Strix Halo USB4 Host Router" (c7:00.5, c7:00.6)
+/sys/class/typec                     : empty -- the kernel knows of no Type-C port at all
+/sys/bus/acpi/devices USBC000|PNP0CA0: 0 matches -- no UCSI device, as engine#823 reports
+lsmod                                : ec_su_axb35 loaded, refcount 0 -- the board EC driver has no USB controls
+```
+
+Empty `/sys/class/typec` is the part worth stating plainly: this is not a Type-C port that fails to negotiate, it is a
+port the kernel has **no model of**. Nothing in the standard interfaces (typec class, UCSI, EC) can power it or switch
+it, and the BIOS exposes no option for it, so there is no software fix in this tree. The hypothesis in the issue — port
+power or retimer switching done by a Windows-only driver or an EC/PD path the BIOS does not expose — is consistent with
+everything above and is the reason this is filed as a hardware limitation rather than a driver bug.
+
+**Affected:** every install on the Bosgame BeyondMax (AXB35-02) with BIOS 1.09 or the shipping build. One usable
+external USB port. Other Strix Halo boards are not known to be affected; this is the board, not the SoC.
+
+**Workaround:** use the front USB-A port, or a USB-A hub on it. Release notes must carry this line for this board.
+
 ## engine#370 — intermittent MUL_MAT f32 m=1 n=1 k=2048 error on `common.mul_mat.f32_f32_decode`
 
 **Status: CLOSED 2026-10-10 — closed as not reproducible, not as fixed at source.** The issue is closed

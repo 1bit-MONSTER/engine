@@ -175,6 +175,25 @@ grep -q "ABORT GPU/NPU fault" "$scratch/log3" && { echo "FAIL arm 3: the watcher
 # arm 4: the default (variable unset) must be ON
 run 4 600 1 unset
 if [ "$rc" != 78 ]; then echo "FAIL arm 4: rc $rc with GPU_HOLD_FAULT_ABORT unset, want 78 (the default must be on)"; fail=1; fi
+# ── arm 6: a ticket the max hold cut short says so in a way the NEXT lane can act on (engine#2542) ────────────────
+# Measured on this box: the op-18 line and one IO_PAGE_FAULT burst fell 8m29s after a ticket that exited 124, with
+# nothing running, and the boot's other two bursts fell 3m26s and 1m36s after other releases. "command exited 124"
+# alone leaves the next lane's take-time refusal looking like the next lane's fault. The cut is REAL here -- `-t 0.05`
+# is three seconds and the payload sleeps 600 -- so the arm exercises the same path a lane hits, not a faked rc.
+q6=$scratch/q6; mkdir -p "$q6"; : > "$scratch/klog6"; rm -f "$scratch/deep.pid"
+printf '%s\n' "kernel: usb 1-1: new device" > "$scratch/klog6"
+env GPU_HOLD_FAULT_ABORT=1 GPU_HOLD_KLOG_FILE="$scratch/klog6" \
+    GPU_QUEUE_DIR="$q6" GPU_TOKEN_FILE="$scratch/TOKEN6" GPU_HOLD_LOG="$scratch/log6" \
+    GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 GPU_HOLD_RESET_WINDOW_MIN=0 \
+    GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x" \
+        timeout 60 "$hold" -t 0.05 -l faulttest6 -- "$scratch/wrapper.sh" "$scratch" 600 > /dev/null 2>&1
+rc=$?
+if [ "$rc" != 124 ]; then echo "FAIL arm 6: rc $rc for a payload cut by the max hold, want 124"; fail=1; fi
+grep -q "the max hold cut it short" "$scratch/log6" || { echo "FAIL arm 6: a 124 release does not name the max hold"; fail=1; }
+grep -q "may appear AFTER this release" "$scratch/log6" || { echo "FAIL arm 6: a 124 release does not warn about deferred work"; fail=1; }
+
+if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
+
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 
 # arm 5: an amdxdna fault DURING the hold. #2498 added this spelling at take time only; with one shared pattern the
@@ -197,5 +216,5 @@ grep -q "newest line is from the NPU" "$scratch/log5" || { echo "FAIL arm 5: the
 grep -q "newest line is from the GPU" "$scratch/log1" || { echo "FAIL arm 1: the abort does not name the GPU as the faulting device"; fail=1; }
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 
-[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on -> 78; take-time page fault/MES/ring/hang -> 78; NPU fault in hold -> 78; a recovery notice does NOT abort; a real power-cycling event does)"
+[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on; 124 named -> 78; take-time page fault/MES/ring/hang -> 78; NPU fault in hold -> 78; a recovery notice does NOT abort; a real power-cycling event does)"
 exit "$fail"

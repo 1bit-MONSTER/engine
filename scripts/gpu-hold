@@ -99,7 +99,15 @@ COOLDOWN_TCTL=${GPU_HOLD_COOLDOWN_TCTL:-85}
 # the previous hold with rc 78, and only a MODE2 reset line refused. The during-hold copy lacked the amdxdna "fault" that
 # #2498 added at take time. The union is the rule's own list: a page fault, any amdgpu/MES reset or failure, a ring
 # timeout, an amdxdna command timeout, power-cycle or fault.
-GPU_FAULT_RE='\[gfxhub\] page fault|amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure|failed to respond)|amdxdna.*(command timeout|power.?cycle|fault)'
+# `power.?cycle` missed the driver's own event line: it writes "power-cycling NPU to recover" and "power-cycling
+# NPU" (the -ing form does not match `cycle`), while the RECOVERY notice -- "TDR recovery throttled: last
+# power-cycle 45560 ms ago ... no context touched" -- did match. Measured 2026-11-15: the notice aborted another
+# lane's hold 493 s in (GPU-HOLD.log:134, rc 78), and a real `Array stopped dispatching, power-cycling NPU to
+# recover` did not abort at all. The event is `power.?cycl(e|ing)`; the recovery notice is excluded by name.
+GPU_FAULT_RE='\[gfxhub\] page fault|amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure|failed to respond)|amdxdna.*(command timeout|power.?cycl(e|ing)|fault)'
+# A line that says the driver did NOTHING ("no context touched") is not a fault: it is the throttle that follows
+# one, and it is logged for 60 s after every power-cycle, which is exactly when the next ticket is granted.
+GPU_FAULT_SKIP_RE='aie2_tdr_recover_all: TDR recovery throttled'
 
 while getopts ":t:l:w:q:h" opt; do
     case $opt in
@@ -313,7 +321,7 @@ while [ "$state" = queued ]; do
                     # take an NPU ticket minutes after the command timeout the rules say to stop for (measured
                     # 2026-11-15: the hold ran on a log whose newest line was an amdxdna command timeout).
                     _reset_re=$GPU_FAULT_RE
-                    _resets=$(printf '%s\n' "$_klog" | grep -ciE "$_reset_re")
+                    _resets=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | grep -c .)
                     if [ "${_resets:-0}" -gt 0 ]; then
                         rm -f "$TOKEN"; state=done
                         # HOW OLD is the newest one? "in the last 10 min" cannot tell a wedged device from another lane's
@@ -321,12 +329,15 @@ while [ "$state" = queued ]; do
                         # refused a ticket arrived 1.5-8.5 min AFTER the previous ticket released the NPU, i.e. nothing was
                         # running when it was logged (engine#2542). The age is the datum a reader needs; the epoch comes
                         # from a second query so the printed lines keep their human-readable form.
+                        # The skip term applies to the age as well as to the count: the recovery-throttle notice is logged
+                        # for 60 s after every power-cycle and says "no context touched", so without this the refusal could
+                        # count only real faults and then report the notice's age as if it were the newest fault's.
                         _newest=$(journalctl -k --since "-${_reset_window} min" --no-pager -o short-unix -q 2> /dev/null |
-                                  grep -iE "$_reset_re" | tail -1 | awk '{print int($1)}')
+                                  grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -1 | awk '{print int($1)}')
                         _age=""
                         case "${_newest:-}" in ''|*[!0-9]*) ;; *) _age=", newest $(( $(date +%s) - _newest ))s ago" ;; esac
                         log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault line(s) in the last ${_reset_window} min${_age} - the ticket is released unheld. Inspect the kernel log, then retry"
-                        printf '%s\n' "$_klog" | grep -iE "$_reset_re" | tail -3
+                        printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -3
                         exit 78
                     fi
                 fi
@@ -443,7 +454,7 @@ fault_lines() {
         cat "$GPU_HOLD_KLOG_FILE" 2> /dev/null
     else
         journalctl -k --since "@$started" --no-pager -q 2> /dev/null
-    fi | grep -iE "$FAULT_RE"
+    fi | grep -iE "$FAULT_RE" | grep -viE "$GPU_FAULT_SKIP_RE"
 }
 
 watch() {

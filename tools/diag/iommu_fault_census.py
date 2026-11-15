@@ -27,6 +27,7 @@ device: it takes journal text on stdin or from `--journal`, so it can run on a c
 synthetic fixture in the self-test.
 
     journalctl -k -b -1 | python3 tools/diag/iommu_fault_census.py --label -1
+    # the runbook that reads this output, and the two root-only tests it decides: docs/nvme-iommu-fault-triage.md
     journalctl -k -b -2 | python3 tools/diag/iommu_fault_census.py --label -2 --json
     python3 tools/diag/iommu_fault_census.py --journal a.txt --journal b.txt   # intersects the files
 

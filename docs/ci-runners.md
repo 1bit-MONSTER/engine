@@ -284,7 +284,10 @@ ticket, in on-demand windows, through `scripts/coder-llm-ticketed` (deployed to 
 2. **It queues for the GPU like any other job**: `gpu-hold -l coder-llm -t 25`. The FIFO queue, the temperature, memory
    and kernel-fault watchdogs, and the release wait that lets the next label in all apply.
 3. **Inside the ticket it serves**, and ends the window when no slot in `/slots` has been processing **and** the demand
-   file has not been touched for 5 minutes, or when the 25-minute max hold ends it.
+   file has not been touched for 5 minutes, or when the 25-minute max hold ends it. A server that is stopping gets 30 s
+   (`CODER_LLM_STOP_WAIT_S`), and gpu-hold's TERM-to-KILL grace for the window is set 10 s longer. That way the window
+   ends its own server before gpu-hold KILLs it. The 30B server needed more than gpu-hold's default 10 s at the first
+   live max hold (2026-11-15 10:56Z), which ended rc 137. A KILL after the max hold is still reported as rc 124.
 4. **It exits**, and the unit's `Restart=always` starts the next invocation, which waits for demand and queues again at
    the back of the line. After a kernel fault (gpu-hold rc 78) it backs off 10 minutes first. It queues with a long
    `gpu-hold -w` (24 h): a ticket that gave up would be replaced at the back, so a short wait on a busy box starves it.

@@ -56,6 +56,11 @@
 #                               touched the demand file; 0 = the demand file only
 #   CODER_LLM_GH_REPO           default 1bit-MONSTER/engine
 #   CODER_LLM_FAULT_BACKOFF_S   back-off after gpu-hold rc 78 (a fault, or a refused ticket), default 600
+#   CODER_LLM_STOP_WAIT_S       how long a stopping server gets after TERM before this KILLs it, default 30. The 30B
+#                               HRX server needed more than 10 s to exit at the first live max hold (11-15 10:56Z)
+#   CODER_LLM_KILL_GRACE_S      gpu-hold's TERM->KILL grace for the window (GPU_HOLD_KILL_GRACE), default STOP_WAIT+10,
+#                               so the window can end its own server before gpu-hold KILLs the window; an explicit
+#                               GPU_HOLD_KILL_GRACE in the environment wins
 #   CODER_LLM_GPU_HOLD          gpu-hold to use, default the one on PATH
 #   CODER_LLM_ALWAYS=1          skip the demand wait (a resident window, still ticketed and still max-hold bounded)
 #
@@ -73,6 +78,8 @@ GH_POLL=${CODER_LLM_GH_POLL:-1}
 GH_POLL_S=${CODER_LLM_GH_POLL_S:-60}
 GH_REPO=${CODER_LLM_GH_REPO:-1bit-MONSTER/engine}
 BACKOFF=${CODER_LLM_FAULT_BACKOFF_S:-600}
+STOP_WAIT=${CODER_LLM_STOP_WAIT_S:-30}
+KILL_GRACE=${GPU_HOLD_KILL_GRACE:-${CODER_LLM_KILL_GRACE_S:-$(( STOP_WAIT + 10 ))}}
 GPU_HOLD=${CODER_LLM_GPU_HOLD:-gpu-hold}
 
 log() { echo "coder-llm-ticketed[$$] $*"; }
@@ -125,11 +132,12 @@ if [ "${1:-}" = "--window" ]; then
         log "ticket granted with no fresh demand: releasing without starting the server"
         exit 0
     fi
+    [ -n "${CODER_LLM_WINDOW_STAMP:-}" ] && date +%s > "$CODER_LLM_WINDOW_STAMP"
     "$@" &
     server=$!
     stop_server() {
         kill -TERM "$server" 2> /dev/null
-        for _ in $(seq 1 30); do kill -0 "$server" 2> /dev/null || return; sleep 1; done
+        for _ in $(seq 1 "$STOP_WAIT"); do kill -0 "$server" 2> /dev/null || return; sleep 1; done
         kill -KILL "$server" 2> /dev/null
     }
     trap 'stop_server; exit 143' TERM INT HUP
@@ -174,8 +182,19 @@ if [ "${CODER_LLM_ALWAYS:-0}" != 1 ]; then
 fi
 holder=$(head -c 120 "${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}" 2> /dev/null | head -1)
 log "demand: queueing for the GPU (gpu-hold -l coder-llm -t $MAX_HOLD -w $QUEUE_WAIT)${holder:+; queued behind $holder}"
-"$GPU_HOLD" -t "$MAX_HOLD" -l coder-llm -w "$QUEUE_WAIT" -- "$0" --window "$@"
+# gpu-hold's default 10 s grace KILLed the window at the first live max hold while the server was still exiting:
+# rc 137 and an unclean stop instead of 124 (11-15 10:56Z)
+export CODER_LLM_WINDOW_STAMP="${TMPDIR:-/tmp}/coder-llm-window.$$"
+rm -f "$CODER_LLM_WINDOW_STAMP"
+GPU_HOLD_KILL_GRACE=$KILL_GRACE "$GPU_HOLD" -t "$MAX_HOLD" -l coder-llm -w "$QUEUE_WAIT" -- "$0" --window "$@"
 rc=$?
+# a KILL once the window has been open for the max hold is still the max hold (as 143 is, which gpu-hold maps to
+# 124); timed from the window's own start, so a long queue wait followed by some other KILL is not relabelled
+opened=$(cat "$CODER_LLM_WINDOW_STAMP" 2> /dev/null); rm -f "$CODER_LLM_WINDOW_STAMP"
+if [ "$rc" = 137 ] && [ -n "$opened" ] && awk -v e=$(( $(date +%s) - opened )) -v m="$MAX_HOLD" 'BEGIN { exit !(e >= m * 60) }'; then
+    log "the window was KILLed after the max hold (rc 137; raise CODER_LLM_STOP_WAIT_S if the server needs longer to exit)"
+    rc=124
+fi
 case "$rc" in
     0)   log "window closed (idle)" ;;
     124) log "window closed (max hold ${MAX_HOLD} min); re-queueing" ;;

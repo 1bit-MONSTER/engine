@@ -688,14 +688,9 @@ add_dependencies(onebit serve_degenerate_test)
 
 add_executable(http_guard_test tests/http_guard_test.cpp)
 target_include_directories(http_guard_test PRIVATE app)
+# engine#2482: this test also drives a loopback httplib::Server, so it links the server and threads.
+target_link_libraries(http_guard_test PRIVATE httplib::httplib Threads::Threads)
 add_test(NAME http_guard COMMAND http_guard_test)
-
-# engine#2482: a form-labelled body over 8 KiB must reach the handler instead of a 413 with an empty
-# reply. CPU only -- it starts an httplib::Server on a loopback port and POSTs to it, so no model, no
-# device and no `1bit serve`; the compile-time limit is the thing that changed.
-add_executable(http_form_limit_test tests/http_form_limit_test.cpp)
-target_link_libraries(http_form_limit_test PRIVATE httplib::httplib Threads::Threads)
-add_test(NAME http_form_limit COMMAND http_form_limit_test)
 # The "the device is gone" classifiers of app/serve_watchdog.h: a backend's device-lost stderr line, and the
 # NPU runtime's failed-runlist message that makes `1bit unified` answer the request and exit non-zero. Header
 # only, no device, no model.

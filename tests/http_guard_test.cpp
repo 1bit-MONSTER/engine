@@ -15,9 +15,11 @@
 
 // http_guard_test: which Host and Origin values app/http_guard.h lets through.
 #include "http_guard.h"
+#include "httplib.h"
 
 #include <cstdio>
 #include <string>
+#include <thread>
 
 static int failures = 0;
 
@@ -57,6 +59,40 @@ int main() {
     expect(true, "0.0.0.0", "POST", "box.lan:8000", "http://box.lan:8000");
     expect(false, "0.0.0.0", "POST", "box.lan:8000", "http://other.lan:8000");
     expect(false, "0.0.0.0", "DELETE", "box.lan:8000", "https://evil.example");
+
+    // engine#2482: what the HTTP layer refuses, not only what the guard refuses. cpp-httplib returns 413
+    // with an EMPTY body when a request labelled `application/x-www-form-urlencoded` (which is what
+    // `curl -d` sends) carries more than CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH -- 8 KiB by
+    // default. The engine logged nothing, so a legitimate request looked like a deliberate refusal.
+    // Same subject as the arms above: a request the server should let through.
+    {
+        httplib::Server srv;
+        bool answered = false;
+        srv.Post("/v1/completions", [&](const httplib::Request &, httplib::Response & res) {
+            answered = true;
+            res.set_content(R"({"ok":true})", "application/json");
+        });
+        const int port = srv.bind_to_any_port("127.0.0.1");
+        if (port <= 0) { ++failures; std::printf("FAIL could not bind a loopback port\n"); }
+        else {
+            std::thread th([&] { srv.listen_after_bind(); });
+            srv.wait_until_ready();   // void in v0.47.0; the POST is the real readiness check
+            httplib::Client cli("127.0.0.1", port);
+            cli.set_read_timeout(10, 0);
+            cli.set_write_timeout(10, 0);
+            auto short_r = cli.Post("/v1/completions", httplib::Headers{}, std::string(771, 'x'),
+                                    "application/x-www-form-urlencoded");
+            if (!(short_r && short_r->status == 200)) { ++failures; std::printf("FAIL 771-byte form body did not reach the handler\n"); }
+            answered = false;
+            auto long_r = cli.Post("/v1/completions", httplib::Headers{}, std::string(94 * 1024, 'x'),
+                                   "application/x-www-form-urlencoded");
+            if (!(long_r && long_r->status == 200)) { ++failures; std::printf("FAIL 94 KiB form body -> %d (engine#2482: the 8 KiB form limit)\n", long_r ? long_r->status : -1); }
+            if (!answered) { ++failures; std::printf("FAIL the 94 KiB request never reached the handler\n"); }
+            srv.stop();
+            th.join();
+        }
+    }
+
     std::printf("%s\n", failures ? "FAILED" : "http_guard: ok");
     return failures ? 1 : 0;
 }

@@ -276,8 +276,9 @@ The `pr-agent` job talks to a local model, Qwen3-Coder-30B-A3B served by `1bit s
 job at a time" never held, and its model is the one whose prefill faults the GPU (engine#2494). It now runs only inside a
 ticket, in on-demand windows, through `scripts/coder-llm-ticketed` (deployed to `~/.local/bin`):
 
-1. **It waits for demand.** Demand is the file `~/.cache/coder-llm/demand` touched within the last 30 minutes, or
-   (`CODER_LLM_GH_POLL=1`) a `pr-agent` workflow run that is queued or in progress.
+1. **It waits for demand.** Demand is the file `~/.cache/coder-llm/demand` touched within the last 30 minutes (the
+   `pr-agent` workflow's `reviewer` job touches it), or, as the fallback that is on by default (`CODER_LLM_GH_POLL=1`),
+   a `pr-agent` workflow run that is queued or in progress. So a review is never starved by a workflow that forgot to ask.
 2. **It queues for the GPU like any other job**: `gpu-hold -l coder-llm -t 25`. The FIFO queue, the temperature, memory
    and kernel-fault watchdogs, and the release wait that lets the next label in all apply.
 3. **Inside the ticket it serves**, and ends the window when no slot in `/slots` has been processing **and** the demand

@@ -63,6 +63,7 @@ envs=(GPU_QUEUE_DIR="$scratch/q" GPU_TOKEN_FILE="$scratch/TOKEN" GPU_HOLD_LOG="$
       GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x"
       GPU_HOLD_KLOG_FILE="$scratch/klog" PATH="$(dirname "$hold"):$PATH"
       CODER_LLM_GPU_HOLD="$hold" CODER_LLM_DEMAND="$scratch/demand" CODER_LLM_URL="http://127.0.0.1:$port"
+      CODER_LLM_GH_POLL=0
       CODER_LLM_POLL_S=1 CODER_LLM_DEMAND_TTL_S=60 CODER_LLM_FAULT_BACKOFF_S=1 CODER_LLM_QUEUE_WAIT_S=60)
 mkdir -p "$scratch/q"; : > "$scratch/klog"
 

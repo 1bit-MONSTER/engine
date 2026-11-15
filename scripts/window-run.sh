@@ -186,6 +186,13 @@ JLOG
     chk "  ... and the deferral is not reported as a failed restart" "$(grep -c 'restart=FAILED' "$tmp/t.log")" 0
     # the loading-vs-wedged check needs a live child growing in CPU, which a self-test cannot fake without testing its
     # own fake; pin the reader instead so it cannot be deleted silently (the same technique the probe arm uses).
+    # 3k. engine#2496's contract: a ticketed coder-llm that is QUEUED is not a failed restart
+    : > "$tmp/t.calls"; mkdir -p "$tmp/q"; : > "$tmp/q/0179.coder-llm"; printf 'label=coder-llm\npid=999999\n' > "$tmp/q/0179.coder-llm"
+    printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/t.log"
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token GPU_QUEUE_DIR=$tmp/q \
+      WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "a queued coder-llm is recorded as queued, not failed" "$(grep -c 'restart=queued(waiting for a GPU ticket)' "$tmp/t.log")" 1
+    chk "  ... and it is not reported as a failed restart" "$(grep -c 'restart=FAILED' "$tmp/t.log")" 0
     chk "the poll reads the largest child's CPU, not the idle embed child" "$(grep -c 'sort -k2 -n | tai[l] -1' "$me")" 1
     # 4. an old enough end opens the gate again (the refusal above is about the gap, not about the file)
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/w.log"
@@ -379,6 +386,20 @@ restore() {
       printf '%s: coder-llm restarts when the next lane releases the GPU (holder %s); not a failed restart\n' "$SELF" "${_held:-?}" >&2
       rm -rf "$WR_DIR"; exit "$rc"
     fi
+    # QUEUED IS NOT DEAD EITHER (engine#2496's contract, live 2026-11-15): once `coder-llm` runs inside
+    # `coder-llm-ticketed`, `systemctl start` means "queue for a GPU ticket" -- so with lanes ahead of it the unit
+    # is `active` and `:8090` stays empty for minutes. A restart-then-fail there is a false signal on EVERY window,
+    # which is how lanes learn to ignore the failure. Measured: the unit ran `coder-llm-ticketed`, `coder-llm` was
+    # 4th in ~/GPU-QUEUE, and this restore reported failure for a window whose job had succeeded.
+    coder_llm_queued() {
+        local q=${GPU_QUEUE_DIR:-$HOME/GPU-QUEUE} f
+        [ -d "$q" ] || return 1
+        for f in "$q"/*; do
+            case "${f##*/}" in .*) continue ;; esac
+            grep -qx 'label=coder-llm' "$f" 2>/dev/null && return 0
+        done
+        return 1
+    }
     # LOADING IS NOT WEDGED (same windows): a child loading a 30B answers 503 while its CPU time advances;
     # restarting it there throws the load away. Only a child whose CPU time has not moved for ~30 s is dead.
     # The LARGEST llama-server is the one loading -- the embed service's idle child is ~15 MB.
@@ -408,6 +429,12 @@ restore() {
       sleep "$_poll_s"
     done
     _state=$(systemctl --user is-active coder-llm 2>/dev/null)
+    if [ "$code" != 200 ] && [ "$_state" = active ] && coder_llm_queued; then
+        printf '%s end   lane=%s issue=%s label=%s coder-llm=active :8090=queued restart=queued(waiting for a GPU ticket) rc=%s\n' \
+          "$(date -u +%FT%TZ)" "$WR_LANE" "$ISSUE" "$LABEL" "$rc" >> "$LOG"
+        printf '%s: coder-llm is queued for a GPU ticket (engine#2496), not dead: :8090 answers when it gets one\n' "$SELF" >&2
+        rm -rf "$WR_DIR"; exit "$rc"
+    fi
     _waiting=0
     if [ "$code" != 200 ] && [ "$_state" = active ]; then
         _waiting=$(coder_llm_asleep ${WR_JOURNAL_FILE:+"$WR_JOURNAL_FILE"})

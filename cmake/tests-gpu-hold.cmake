@@ -43,6 +43,8 @@ add_test(NAME gpu_hold_fault_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_ho
 # /slots server: no demand -> no ticket, idle -> window closes, busy -> max hold, kernel fault -> rc 78, FIFO with a lane.
 add_test(NAME coder_llm_ticketed COMMAND bash ${CMAKE_SOURCE_DIR}/tests/coder_llm_ticketed_test.sh
          ${CMAKE_SOURCE_DIR}/scripts/coder-llm-ticketed ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+# its fake /slots server binds a loopback port, so it takes the route-port lock like every other route test (#1070)
+set_tests_properties(coder_llm_ticketed PROPERTIES RESOURCE_LOCK route_ports)
 # ...and scripts/install-coder-llm-ticketed.sh, on a fake unit dir and a stub systemctl: --diff changes nothing, --install
 # backs up and keeps the server command byte for byte behind the wrapper, --status tells ticketed from not, idempotent.
 add_test(NAME install_coder_llm_ticketed COMMAND bash ${CMAKE_SOURCE_DIR}/tests/install_coder_llm_ticketed_test.sh)

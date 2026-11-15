@@ -335,6 +335,11 @@ add_test(NAME server_launch_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/s
 # coincidence this row exists to keep apart.
 add_test(NAME driver_refusal_census_selftest
          COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/diag/driver_refusal_census.py --self-test)
+# engine#2542: the accel sampler's logs (pi-pkg) are written to be *read*, and the reader is where the difference
+# between "no sample in the window" and "sampled, nothing held the node" survives. Self-test only: it never reads the
+# live logs (a CI runner has no /dev/accel), and it pins the window arithmetic with hand-checked cases.
+add_test(NAME accel_attribution_selftest
+         COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/diag/accel_attribution.py --self-test)
 add_test(NAME server_launch_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/server_launch_check.py --self-test)
 # scripts/lemonade-hrx: the PPA lemond's HRX recipe runs our llama-server (docs/lemonade.md): no GPU.
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)

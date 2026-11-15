@@ -672,7 +672,13 @@ if has kat || has needle || has kld; then
       # failure line so a reader does not have to guess. The name is unique per failure (keep_failed_log).
       kept=$(keep_failed_log "$OUT/server-$name.log" "$name")
       [ -n "$kept" ] && echo "hw-gate: kept the failing server log at $kept" >&2
-      result "model $name" FAIL "$secs" "server failed (rc $rc): $(tail -n 3 "$OUT/server-$name.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200) [log: ${kept:-$OUT/server-$name.log}]"
+      # engine#2500 ask 2: at failure time, record what the box ACTUALLY looked like -- the pre-check
+      # records the predicted need, which is the number that was satisfiable. A load that dies in the
+      # allocator shows up here as GTT near the ceiling, and that is attributable in one line.
+      gtt=$(awk '{printf "%.1f", $1/1073741824}' /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1)
+      avail=$(awk '/MemAvailable/{printf "%.1f", $2/1048576}' /proc/meminfo 2>/dev/null)
+      box="GTT now ${gtt:-?} GiB, MemAvailable ${avail:-?} GiB"
+      result "model $name" FAIL "$secs" "server failed (rc $rc): $(tail -n 3 "$OUT/server-$name.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200) [$box] [log: ${kept:-$OUT/server-$name.log}]"
       continue
     fi
     if [ $dokat = 1 ]; then

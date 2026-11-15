@@ -120,6 +120,13 @@ if [ "$(uname)" = Linux ]; then
     imp_rc=$?
     check "a port held by another process is refused (rc $imp_rc)" \
         '[ "$imp_rc" = 1 ] && grep -q "not from the backend serve started" "$scratch/impostor.log"'
+    # The impostor detaches itself (setsid), so killing the backend does not reap it and the port stays LISTENing
+    # for the rest of the suite. Measured before the fix: 1 listener survived; the fake backend now dies with it.
+    if [ -f "$scratch/impostor" ]; then
+        imp=$(cat "$scratch/impostor")
+        for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$imp" 2>/dev/null || break; sleep 0.2; done
+        check "the impostor does not outlive the case (pid $imp)" '! kill -0 "$imp" 2>/dev/null'
+    fi
 fi
 
 if [ $fail -ne 0 ]; then echo "--- serve log"; cat "$scratch/serve.log"; echo FAIL; exit 1; fi

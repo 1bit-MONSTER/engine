@@ -231,9 +231,22 @@ time.sleep(0.5)  # a real backend takes a moment to load; serve must answer 503 
 if os.environ.get("FAKE_BACKEND_IMPOSTOR"):
     # A process serve did not start answers on the port instead: this one detaches a server
     # (writing its pid to $FAKE_BACKEND_IMPOSTOR) and stays alive without listening itself.
+    root = os.getpid()   # the process the tests kill; the setsid'd grandchild is not in its group
     if os.fork() == 0:
         os.setsid()
         if os.fork() == 0:
+            # Die with the backend that spawned this impostor. Without this the detached listener outlives
+            # `kill "$pid"; wait "$pid"` and keeps the port for the rest of the suite: measured on 2026-11-15,
+            # LISTEN 0 5 127.0.0.1:PORT survived a kill -TERM of the parent. A test that starts a server must not
+            # leave one behind, and the pid this impostor writes is only read by the test that asked for it.
+            def die_with(pid: int) -> None:
+                while True:
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        os._exit(0)
+                    time.sleep(0.2)
+            threading.Thread(target=die_with, args=(root,), daemon=True).start()
             with open(os.environ["FAKE_BACKEND_IMPOSTOR"], "w") as f:
                 f.write(str(os.getpid()))
             ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()

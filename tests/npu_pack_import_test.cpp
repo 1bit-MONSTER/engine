@@ -708,13 +708,24 @@ void test_external_import_success(const std::string& root) {
         const float v = float((i % 61) - 30) * 0.5f;
         std::memcpy(&embed[size_t(i) * 4], &v, 4);
     }
-    put_file((dir / "eager-mm.onnx.data").string(), embed + blob);
+    // engine#2561: a final norm at a PSEUDO LAYER INDEX, the way phi-4's exporter writes it
+    // (`model.layers.<num_hidden_layers>/final_norm_layernorm`). No value is 1.0, so a unit gain cannot pass by
+    // coincidence at any index.
+    std::string final_norm(size_t(H) * 4, '\0');
+    for (int i = 0; i < H; ++i) {
+        const float v = 0.3f + 0.05f * float(i % 9);
+        std::memcpy(&final_norm[size_t(i) * 4], &v, 4);
+    }
+    const uint64_t fn_off = uint64_t(embed.size()) + uint64_t(blob.size());
+    put_file((dir / "eager-mm.onnx.data").string(), embed + blob + final_norm);
     put_file((dir / "eager-mm.onnx").string(),
              pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "eager-mm.onnx.data", 0, uint64_t(embed.size())),
                         pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
                         pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty"),
                         pb::tensor("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", {int64_t(blob.size())},
-                                   "eager-mm.onnx.data", uint64_t(embed.size()), uint64_t(blob.size()))},
+                                   "eager-mm.onnx.data", uint64_t(embed.size()), uint64_t(blob.size())),
+                        pb::tensor("model.layers.1.final_norm_layernorm.weight", {H}, "eager-mm.onnx.data", fn_off,
+                                   uint64_t(final_norm.size()))},
                        {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
                                                 "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
                                         K, N, 4, 128, "MatMulNBitsBf")}));
@@ -754,6 +765,29 @@ void test_external_import_success(const std::string& root) {
             why = e.what();
         }
         const std::string tag = "external success" + std::string(layout.empty() ? "" : " (b8)") + ": ";
+        if (fs::exists(out / "model.q4nx")) {
+            // engine#2561: the pack's final norm sits at a pseudo layer, so it must reach model.norm.weight as ITS bytes.
+            // EVERY element must match: an arm that accepts "one element matches" passes on a unit gain by coincidence
+            // whenever any fixture value is 1.0 -- measured on main, where the first version of this arm passed.
+            bool got = false, all_match = true;
+            const Container c = read_container(out);
+            if (c.table.contains("model.norm.weight")) {
+                const auto offs = c.table["model.norm.weight"]["data_offsets"].get<std::vector<uint64_t>>();
+                got = offs[1] - offs[0] == uint64_t(H) * 2;
+                for (int i = 0; i < H && got; ++i) {
+                    const uint16_t bits = uint16_t(uint8_t(c.data[offs[0] + size_t(2 * i)])) |
+                                          uint16_t(uint16_t(uint8_t(c.data[offs[0] + size_t(2 * i) + 1])) << 8);
+                    const uint32_t f32 = uint32_t(bits) << 16;
+                    float v = 0.f;
+                    std::memcpy(&v, &f32, 4);
+                    const float want = 0.3f + 0.05f * float(i % 9);
+                    if (std::fabs(v - want) > 1e-2f) all_match = false;   // bf16 keeps 8 mantissa bits
+                }
+            }
+            check(got, tag + "pseudo-layer final norm: the container carries model.norm.weight (engine#2561)");
+            check(got && all_match,
+                  tag + "pseudo-layer final norm: every element is the pack's, not a unit gain (engine#2561)");
+        }
         check(why.empty() && r.refused.empty() && fs::exists(out / "model.q4nx"),
               tag + "a pack whose geometry the split satisfies imports to completion (" + why +
                   (r.refused.empty() ? "" : r.refused.front()) + ")");

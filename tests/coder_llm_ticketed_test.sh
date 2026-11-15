@@ -26,7 +26,8 @@
 #     gone and the token released;
 #   C a busy server is cut at the max hold (rc 124), the server is gone;
 #   D a gfxhub page fault in the kernel log during the window ends it (rc 78) and the server dies with it;
-#   E a lane that queues during a window gets the GPU before the next coder-llm window (FIFO; the restart re-queues).
+#   E a lane that queues during a window gets the GPU before the next coder-llm window (FIFO; the restart re-queues);
+#   F a failing gh (the pr-agent-run fallback) is logged once per wait with its reason, and opens no window.
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)   # the defaults work from any directory, not only the repo root
 tick=${1:-$root/scripts/coder-llm-ticketed}
@@ -133,5 +134,16 @@ holders=$(grep -oE "^gpu-hold\[[0-9]+\] took" "$scratch/hold.log" | wc -l)
 seq_labels=$(awk '/queued/ {match($0, /queued .[a-z-]+./); q[$1]=substr($0, RSTART+8, RLENGTH-9)} / took / {print q[$1]}' "$scratch/hold.log" | tr '\n' ' ')
 [ "$seq_labels" = "coder-llm lanejob coder-llm " ] || { echo "FAIL E: hold order '$seq_labels', want 'coder-llm lanejob coder-llm '"; fail=1; }
 
-[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm)"
+# ---- F: the pr-agent-run fallback says so when it cannot ask (a failing gh), once per wait -------------------------
+mkdir -p "$scratch/ghbin"
+printf '#!/bin/bash\nif [ "$1" = auth ]; then exit 1; fi\necho "HTTP 401: Bad credentials" >&2; exit 1\n' > "$scratch/ghbin/gh"
+chmod +x "$scratch/ghbin/gh"
+touch -d '-2 hours' "$scratch/demand"
+env "${envs[@]}" CODER_LLM_GH_POLL=1 CODER_LLM_GH_POLL_S=1 PATH="$scratch/ghbin:$PATH" \
+    timeout 6 "$tick" -- "$scratch/fake" > "$scratch/f.log" 2>&1
+[ "$(grep -c 'gh poll failed (HTTP 401' "$scratch/f.log")" = 1 ] || { echo "FAIL F: want exactly one 'gh poll failed' line, got $(grep -c 'gh poll failed' "$scratch/f.log")"; fail=1; }
+grep -q 'gh is not logged in' "$scratch/f.log" || { echo "FAIL F: no warning that gh is not logged in"; fail=1; }
+[ -e "$scratch/TOKEN" ] && { echo "FAIL F: a failing poll opened a window"; fail=1; }
+
+[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window)"
 exit "$fail"

@@ -80,12 +80,26 @@ demand_fresh() {   # $1 = window in seconds
     [ $(( $(date +%s) - $(mtime "$DEMAND") )) -lt "$1" ]
 }
 
+# Only pull_request runs count: every comment on a PR also creates a pr-agent run (about one every two minutes on a
+# busy night) and most never review, so counting them would keep a 30B window open on chatter. Command comments
+# (/review, /ask ...) reach the model through the demand file the workflow's reviewer job touches (engine#2509).
+GH_FAIL_LOGGED=0
 gh_demand() {
     [ "$GH_POLL" = 1 ] || return 1
-    local s n
+    local s n err errf="${TMPDIR:-/tmp}/coder-llm-gh.$$"
     for s in queued in_progress; do
-        n=$(gh api "repos/$GH_REPO/actions/workflows/pr-agent.yml/runs?status=$s&per_page=1" -q .total_count 2> /dev/null)
-        [ "${n:-0}" -gt 0 ] 2> /dev/null && return 0
+        n=$(gh api "repos/$GH_REPO/actions/workflows/pr-agent.yml/runs?status=$s&event=pull_request&per_page=1" \
+                -q .total_count 2> "$errf")
+        if [ $? -ne 0 ] || ! [ "$n" -ge 0 ] 2> /dev/null; then
+            # an absent answer is not "no demand": say why, once per wait (the behaviour stays "no demand", the safe side)
+            err=$(head -c 200 "$errf" 2> /dev/null | tr '\n' ' ')
+            [ "$GH_FAIL_LOGGED" = 1 ] || log "gh poll failed (${err:-answer '$n'}): treating it as no demand; check with: gh api repos/$GH_REPO/actions/workflows/pr-agent.yml/runs"
+            GH_FAIL_LOGGED=1
+            rm -f "$errf"
+            return 1
+        fi
+        rm -f "$errf"
+        [ "$n" -gt 0 ] && return 0
     done
     return 1
 }
@@ -135,7 +149,10 @@ fi
 mkdir -p "$(dirname "$DEMAND")"
 
 if [ "${CODER_LLM_ALWAYS:-0}" != 1 ]; then
-    log "waiting for demand ($DEMAND touched within ${DEMAND_TTL}s$([ "$GH_POLL" = 1 ] && echo ", or a pr-agent run on $GH_REPO"))"
+    log "waiting for demand ($DEMAND touched within ${DEMAND_TTL}s$([ "$GH_POLL" = 1 ] && echo ", or a pr-agent pull_request run on $GH_REPO"))"
+    if [ "$GH_POLL" = 1 ] && ! gh auth status > /dev/null 2>&1; then
+        log "WARNING: gh is not logged in, so the pr-agent-run fallback cannot see demand; only the demand file will wake the model"
+    fi
     next_gh=0
     while :; do
         demand_fresh "$DEMAND_TTL" && break

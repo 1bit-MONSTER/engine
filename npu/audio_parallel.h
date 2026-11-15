@@ -56,6 +56,16 @@ inline size_t audio_thread_count() {
     // cpuset -- a thermal-run scope, a container, a systemd AllowedCPUs= -- it over-reports: measured on this box it says 32
     // while the scope allows 4, so the capped-at-8 default spawned 8 threads for 4 CPUs. The affinity mask is what the
     // scheduler enforces, so that is what this follows.
+    // MEASURED SCALING (engine#1783, whisper-small encoder, 447 nodes, 32-core box, host build of main,
+    // ONEBIT_AUDIO_THREADS=N, single run per count, box spread 7-8 %):
+    //     threads   1        2        4        6        8
+    //     encoder   11403.8  6627.8   4001.0   4467.4   4515.6  ms
+    //     speed-up  1.00x    1.72x    2.85x    2.55x    2.53x
+    // The knee is at 4: 6 and 8 threads are SLOWER than 4, which is what a memory-bound kernel does when more
+    // workers compete for the same bandwidth and L3 rather than a work-splitting shortfall. The 29 points of
+    // efficiency lost at 4 are therefore not the harness: the threaded spawn tax measured 0.018 ms/call, 2.6 %
+    // of threaded time (engine#2505). Do not raise this default without a new interleaved table -- the
+    // remaining lever is the GEMM's memory traffic, not more threads (73 % of the gap is MatMul).
     // What this is NOT: a measured speedup. Three interleaved repetitions at 4 CPUs (8 threads / 4 threads) gave encoder
     // 10.38/10.40 s and decode 2.58/2.69 s per token -- within the box's own noise, and my first, non-interleaved comparison
     // of 8 threads against serial (5.21 against 4.24 s/token) was load, not threading. The reason to prefer the mask is that

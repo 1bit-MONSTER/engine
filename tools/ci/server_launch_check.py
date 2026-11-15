@@ -42,31 +42,44 @@ SKIP = 77
 _LAUNCH = re.compile(r"\b(serve|forward-serve|llama-server|llama-cli)\b")
 _SETSID = re.compile(r"\bsetsid\b")
 _AMP = re.compile(r"&\s*$")
+# A kill that targets a whole PROCESS GROUP is the correct remedy, not the defect: `setsid cmd &` makes the
+# child a session leader, so its pgid IS the leader's pid -- which is what `$!` holds -- and a group kill
+# reaches the server even though the leader has exited. Without this the checker reds the fix (2026-11-15).
+_GROUP_KILL = re.compile(r"\bkill\s+(-[A-Za-z]+\s+)*--?\s*-")
+# An explicit waiver, for the residue a text scan cannot decide: `# server-launch-check: ok <reason>` on or
+# just above the kill line.
+_SUPPRESS = re.compile(r"server-launch-check:\s*ok\b")
 
 
 def check_text(text, path="<text>"):
     """-> list of (lineno, line, kind) findings. kind is 'setsid-launch' or 'kill-after-setsid'."""
     lines = text.splitlines()
-    findings = []
-    setsid_launch = False
+    launches = []
     for i, line in enumerate(lines, 1):
         stripped = line.strip()
         if stripped.startswith("#"):
             continue                                  # a comment naming the pattern is not the pattern
         if _SETSID.search(stripped) and _LAUNCH.search(stripped) and _AMP.search(stripped):
-            findings.append((i, stripped, "setsid-launch"))
-            setsid_launch = True
+            launches.append((i, stripped))
+    if not launches:
+        return []
+    # A group kill anywhere in the file is the remedy, and it decides the whole file: `kill -- -$PID` signals
+    # the session the server lives in, so the cleanup cannot miss it even though the leader has exited.
+    body = [(i, l.strip()) for i, l in enumerate(lines, 1)
+            if not l.strip().startswith("#") and re.match(r"kill\b", l.strip())]
+    if any(_GROUP_KILL.search(t) for _, t in body):
+        return []
     # The second half of the defect: `$!` captured from a setsid launch is the wrong process. Report it
     # once, because that is what turns "setsid is unusual" into "the cleanup provably misses the server".
-    if setsid_launch:
-        for i, line in enumerate(lines, 1):
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                continue
-            if re.search(r"\bkill\b.*\$(PID|\!|pid)\b", stripped) or "$!" == stripped[-2:]:
-                findings.append((i, stripped, "kill-after-setsid"))
-                break
-    return findings
+    targets = [(i, t) for i, t in body if re.search(r"\bkill\b.*\$(PID|\!|pid)\b", t)]
+    if not targets:                                   # no kill: fall back to the capture line itself
+        targets = [(i, l.strip()) for i, l in enumerate(lines, 1)
+                   if not l.strip().startswith("#") and l.strip().endswith("$!")]
+    for i, stripped in targets:
+        if any(_SUPPRESS.search(c) for c in lines[max(0, i - 4):i - 1]):
+            return []                             # explicitly waived, with a stated reason
+        return [(n, t, "setsid-launch") for n, t in launches] + [(i, stripped, "kill-after-setsid")]
+    return [(n, t, "setsid-launch") for n, t in launches]
 
 
 def self_test():
@@ -79,6 +92,18 @@ def self_test():
          '"$BIN" forward-serve -m "$MODEL" -p "$PORT" &\nPID=$!\nkill $PID\n', []),
         ("a COMMENT naming setsid is not the defect",
          '# do not use setsid here: it makes $! the wrong pid\nnohup "$BIN" serve -p $PORT &\n', []),
+            # 2026-11-15: the correct remedy must be GREEN, or the only way to satisfy the gate is to avoid
+            # setsid rather than to fix the cleanup.
+            ("kill -- -$PID (group kill by the captured setsid pid) is the fix, not the defect",
+             'setsid "$BIN" forward-serve -p "$PORT" &\nPID=$!\nsleep 3\nkill -- -"$PID"\n', []),
+            ("kill -TERM -- -$PGID is the same fix, named group",
+             'setsid "$BIN" serve -p $PORT &\nsleep 3\nkill -TERM -- -$PGID\n', []),
+            ("an explicit waiver just above the kill line is honoured",
+             'setsid "$BIN" serve -p $PORT &\nPID=$!\n# server-launch-check: ok pid re-resolved below\nkill $PID\n',
+             []),
+            ("the un-waived defect itself is still the defect",
+             'setsid "$BIN" serve -p $PORT &\nPID=$!\nkill $PID\n',
+             ["setsid-launch", "kill-after-setsid"]),
     ]
     bad = 0
     for name, text, want in arms:

@@ -448,6 +448,11 @@ add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py
 # the four cases a KLD implementation gets wrong (identical -> exactly 0, a shift is positive and directional, a
 # uniform shift stays 0, and an asymmetric file set is refused by name).
 add_python_test(logits_kld_self ${CMAKE_SOURCE_DIR}/tools/logits_kld.py --self-test)
+# engine#2542: the sampler's rate arithmetic (a frozen printed count with a growing dropped count is FAULTING,
+# and a falling total is the ring buffer rotating, not a negative rate) is why the file is not a two-line shell
+# loop. `tests_referenced` requires a row for any tools/**/*.py that declares --self-test, and it caught this
+# omission on this PR -- which is the gate doing its job, not an obstacle.
+add_python_test(iommu_fault_sampler_self ${CMAKE_SOURCE_DIR}/tools/diag/iommu_fault_sampler.py --self-test)
 # engine#2018: this one was in tools/ci/unreferenced_py_tests.txt as a baseline entry, and it should not have been: the
 # file is portable and passes (worst-case |sum| 11.18e6 inside int32 at K=11008, 4 arms), it just never had a runner. A
 # baseline records a test as never-run, which for a passing test is the wrong outcome -- so it is registered and the line

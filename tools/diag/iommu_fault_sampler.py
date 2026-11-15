@@ -124,10 +124,10 @@ def main():
     ap.add_argument("--count", type=int, default=0, help="samples to take (0 = forever)")
     ap.add_argument("--out", default="-", help="log file to append to ('-' = stdout)")
     ap.add_argument("--dmesg", default="dmesg", help="command whose stdout is the dmesg text")
-    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
-    if args.selftest:
+    if args.self_test:
         self_test()
         return 0
 

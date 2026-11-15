@@ -715,7 +715,13 @@ void test_external_import_success(const std::string& root) {
         std::memcpy(&final_norm[size_t(i) * 4], &v, 4);
     }
     const uint64_t fn_off = uint64_t(embed.size()) + uint64_t(blob.size());
-    put_file((dir / "eager-mm.onnx.data").string(), embed + blob + final_norm);
+    std::string cosc(size_t(64) * 48 * 4, '\0');   // engine#2571: a real-looking cache, theta 1e4
+    for (int r2 = 0; r2 < 64; ++r2)
+        for (int i2 = 0; i2 < 48; ++i2) {
+            const float v = std::cos(double(r2) / std::pow(1e4, 2.0 * double(i2) / 128.0));
+            std::memcpy(&cosc[size_t(r2 * 48 + i2) * 4], &v, 4);
+        }
+    put_file((dir / "eager-mm.onnx.data").string(), embed + blob + final_norm + cosc);
     put_file((dir / "eager-mm.onnx").string(),
              pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "eager-mm.onnx.data", 0, uint64_t(embed.size())),
                         pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
@@ -723,7 +729,11 @@ void test_external_import_success(const std::string& root) {
                         pb::tensor("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", {int64_t(blob.size())},
                                    "eager-mm.onnx.data", uint64_t(embed.size()), uint64_t(blob.size())),
                         pb::tensor("model.layers.1.final_norm_layernorm.weight", {H}, "eager-mm.onnx.data", fn_off,
-                                   uint64_t(final_norm.size()))},
+                                   uint64_t(final_norm.size())),
+                        // engine#2571: 48 frequency columns = 96 rotated dims of head_dim 128 (= HF
+                        // partial_rotary_factor 0.75), which is all a pack without a config.json states.
+                        pb::tensor("cos_cache", {64, 48}, "eager-mm.onnx.data", fn_off + uint64_t(final_norm.size()),
+                                   uint64_t(64 * 48 * 4))},
                        {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
                                                 "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
                                         K, N, 4, 128, "MatMulNBitsBf")}));
@@ -785,6 +795,16 @@ void test_external_import_success(const std::string& root) {
             check(got, tag + "pseudo-layer final norm: the container carries model.norm.weight (engine#2561)");
             check(got && all_match,
                   tag + "pseudo-layer final norm: every element is the pack's, not a unit gain (engine#2561)");
+            // engine#2571: the span comes from the cache's column count when no config states it. It belongs in the
+            // container's CONFIG (which is what q4nx_semantics.c reads), not in the tensor table -- my first version
+            // of this arm looked in the table and read 0 while the importer was writing 0.75.
+            const json cfg2 = json_of(out / "config.json");
+            double prf = 0.0;
+            bool have = false;
+            if (cfg2.contains("partial_rotary_factor")) { prf = cfg2["partial_rotary_factor"].get<double>(); have = true; }
+            check(have && std::fabs(prf - 0.75) < 1e-6,
+                  tag + "partial_rotary_factor 0.75 inferred from a 48-column cos_cache (engine#2571), got " +
+                      std::to_string(prf));
         }
         check(why.empty() && r.refused.empty() && fs::exists(out / "model.q4nx"),
               tag + "a pack whose geometry the split satisfies imports to completion (" + why +

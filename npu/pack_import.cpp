@@ -5304,6 +5304,20 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
                                          "keeping %.6g, attention may be wrong\n", best_corr, best_theta,
                                  double(p.dims.rope_theta));
                 }
+                // THE ROTARY SPAN, from the same cache (engine#2571): `cos_cache` carries one column per rotated
+                // FREQUENCY PAIR, so `2 * half` is the number of dims the pack actually rotates. Phi-4-mini rotates 96
+                // of each head's 128 (HF `partial_rotary_factor: 0.75`) and its 1.7.1 hybrid packs ship **no
+                // config.json**, so nothing else states it; without this the forward rotated all 128 and the answer
+                // drifted after the first token ("multiply 12 by 7 by 7 by 7 ..."). Only written when the cache is
+                // narrower than the head, so a full-width cache keeps the existing behaviour.
+                if (p.dims.head_dim > 0 && 2 * half < p.dims.head_dim) {
+                    const double factor = double(2 * half) / double(p.dims.head_dim);
+                    c["partial_rotary_factor"] = factor;
+                    std::fprintf(stderr,
+                                 "note: partial_rotary_factor %.4f (%lld of %lld head dims) from the pack's cos_cache: "
+                                 "%lld frequency columns, no config.json states the span (engine#2571)\n",
+                                 factor, (long long) (2 * half), (long long) p.dims.head_dim, (long long) half);
+                }
             }
         }
     }
@@ -6759,6 +6773,20 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     if (alpha_base > 0.0) cands.insert(cands.begin(), alpha_base);
                     double best_corr = -2.0, best_theta = p.dims.rope_theta;
                     const int HD2 = int(half) * 2;          // head_dim implied by the cache
+                    // engine#2571: the cache states the rotary SPAN as well as the base, and this is the only place a
+                    // pack without `config.json` says it. Phi-4-mini rotates 96 of each head's 128 dims (HF
+                    // `partial_rotary_factor: 0.75`) and its 1.7.1 hybrid packs ship no config, so nothing wrote the
+                    // span: the forward rotated all 128 and the answer drifted from the second token ("multiply 12 by
+                    // 7 by 7 by 7 ...", "... on the Moon on the Moon ..."). Only when the cache is NARROWER than the
+                    // head, so a full-width cache keeps the existing behaviour.
+                    if (p.dims.head_dim > 0 && HD2 < p.dims.head_dim) {
+                        const double factor = double(HD2) / double(p.dims.head_dim);
+                        c["partial_rotary_factor"] = factor;
+                        std::fprintf(stderr,
+                                     "note: partial_rotary_factor %.4f (%d of %lld head dims) from the pack's cos_cache: "
+                                     "%lld frequency columns, and no config states the span (engine#2571)\n",
+                                     factor, HD2, (long long) p.dims.head_dim, (long long) half);
+                    }
                     const int64_t pmax = std::min<int64_t>(rows, 4096);
                     std::vector<double> ang(pmax), cs(size_t(pmax));
                     for (double th : cands) {

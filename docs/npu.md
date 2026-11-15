@@ -3243,6 +3243,42 @@ usable beside another NPU engine, and what its limits are:
   not wait for other shared holders"; `LOCK_EX` = "I want the device to myself". A holder keeps its fd
   open for the life of the process; closing or exiting releases it. `LOCK_EX` and `LOCK_SH` never
   overlap, in either order, on one file.
+### `NPU_ACT_OUTLIER_TAU`: the ffn_down outlier-channel split (engine#2536)
+
+The i8 GEMM quantises each activation row with one scale, `amax/127`. On Qwen2.5-3B the `ffn_down` input rows run at
+`amax/rms` 38 (median over 36 layers) to 100 (layer 35, one channel at 1200), so a typical channel keeps 1-3 int8 levels.
+That turned "July 20, 1969" into "1 lick this out 1969" on both AMD Qwen2.5-3B packs. The cause was traced at the
+failing position:
+
+- the f32 host GEMM on the same container answered `969,`;
+- the host i8 arm and the device both said ` lick`;
+- host f32 for `ffn_down` alone, or `ffn_gate_up` alone, fixed it, while `attn_qkv` and `attn_output` did not.
+
+The split (`npu/forward/include/act_outliers.h`, wired in `ffn_down_outliers()`) works per row:
+
+1. The channels with `|x| > tau * rms` (at most `NPU_ACT_OUTLIER_KMAX`, default 16) are zeroed in the int8 activation,
+   so the scale is set by the remaining channels.
+2. Their `x_c * W[:, c]` is added on the host in f32, from the layer's own `down_proj` column.
+
+Columns are decoded one 256-wide tile block at a time and cached per (layer, channel). The first block of each layer is
+checked bit-for-bit against a full decode; a difference turns the gather off and logs `[outlier]`. A row with no such
+channel runs the plain launch, so a model without outliers pays one scan per row. Host-GEMM runs (`NPU_INFER_HOST_GEMM`)
+are not changed.
+
+**Default: on, `tau` 40.** `NPU_ACT_OUTLIER_TAU=0` turns it off. Measured with `serve --device npu`, using teacher-forced
+top-1 agreement against HF fp32 on 64 positions (the same probes for every column):
+
+| model | off | tau 20 | tau 40 | reply |
+|---|---|---|---|---|
+| Qwen2.5-3B-Instruct 1.7.1 hybrid | 54/64 | 57/64 | 60/64 | off: "1 lick this out 1969"; 20 and 40: "July 20, 1969" |
+| Qwen2.5-0.5B-Instruct 1.9.0 | 53/64 | 53/64 | 51/64 | same answers |
+| SmolLM2-135M-Instruct 1.9.0 | 53/64 | 51/64 | 53/64 | same answers (wrong at int4 either way) |
+
+The small-model swings are near-tie flips. A 64-position top-1 cannot resolve better than about ±2.
+
+Decode speed on Qwen2.5-3B, 96-token reply, A B A B in one ticket, at tau 20 (tau 40 touches fewer rows): off 1.900 and
+2.018 tok/s; on 1.888 and 1.963. That is a 0.6-2.7 % difference, inside the box's run-to-run scatter.
+
 ### `NPU_INFER_HOST_GEMM=i8`: the integer arm, and why a float one cannot gate a kernel
 
 `NPU_INFER_HOST_GEMM=1` runs the forward on the host with **f32** GEMMs. That is enough to tell a structural

@@ -54,6 +54,7 @@
 
 #include "npu_engine_i8ctx_inc.h"   // I8Ctx
 #include "hadamard.h"                // the activation rotation, SIMD path + scalar reference
+#include "act_outliers.h"            // engine#2536: the ffn_down outlier-channel split
 #include "attn_math.h"               // attention's score dot + value accumulation, SIMD + portable
 #include "q4nx_dequant.h"
 #include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
@@ -702,6 +703,11 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
 
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir) {
+    // engine#2536: on by default at tau 40 (the measured table is in docs/npu.md); NPU_ACT_OUTLIER_TAU=0 turns it off,
+    // NPU_ACT_OUTLIER_KMAX caps the channels split out of one row.
+    outl_tau_ = 40.0f;
+    if (const char* t = getenv("NPU_ACT_OUTLIER_TAU")) outl_tau_ = (float)atof(t);
+    if (const char* k = getenv("NPU_ACT_OUTLIER_KMAX")) outl_kmax_ = std::max(1, atoi(k));
     if (const char* hg = getenv("NPU_INFER_HOST_GEMM")) {
         host_gemm_ = true;
         // engine#1808: "i8" selects the integer arm, whose int32 accumulation is the only thing a
@@ -4123,6 +4129,101 @@ static inline void op_line(const char* tag, int layer, int rows, const std::vect
         onebit::npu::ops_dump(tag, layer, rows, out.data(), n);
 }
 
+// engine#2536: ffn_down with its outlier channels split out (act_outliers.h). Runs on the device path only (a host-GEMM
+// run returns before the hook). Returns false when no row has an outlier: the caller then runs the plain launch, so a
+// model without outliers pays one scan of its rows.
+bool Q4nxNpuForward::ffn_down_outliers(const float* A, int M, int a_k, int K, int N, const float* Bmat,
+                                       std::vector<float>& out, int wkey, int role, bool rows_form, bool decode_twin) {
+    const int w = (a_k > 0 && a_k < K) ? a_k : K;
+    const int stride = rows_form ? onebit::npu::row_stride(a_k, K) : w;
+    std::vector<onebit::npu::ActOutlier> picks;
+    onebit::npu::act_outlier_pick(A, M, stride, w, outl_tau_, outl_kmax_, picks);
+    if (picks.empty()) return false;
+    const int L = cur_layer_, rowsW = c_.H, colsW = q4nx_pad_k(c_.IM);
+    auto key_of = [L](int ch) { return ((uint64_t)(uint32_t)L << 32) | (uint32_t)ch; };
+    std::vector<int> blocks;
+    for (const auto& pk : picks)
+        if (!outl_cols_.count(key_of(pk.ch))) blocks.push_back(pk.ch / Q4NX_TILE_COLS);
+    std::sort(blocks.begin(), blocks.end());
+    blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+    if (!blocks.empty()) {
+        TensorDesc* d = &mw_->layers[L].down_proj_weight;
+        const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+        if (!raw) return false;
+        if (outl_cols_.size() > 8192) outl_cols_.clear();   // 8192 columns x H floats: 64 MB at H 2048
+        // A column of a [rowsW, colsW] tile tensor lives in one 256-wide block (tile (tr, c/256) of every tile-row).
+        // For uniform chunked tiles in row-major tile order, that block decodes on its own as a [rowsW, 256] tensor.
+        // The first block of each layer is checked bit-for-bit against the full decode; a difference turns the
+        // gather off for good and says so, and every other layout takes the full decode.
+        const int TR = rowsW / Q4NX_TILE_ROWS, TC = colsW / Q4NX_TILE_COLS;
+        const size_t ntiles = (size_t)TR * (size_t)TC;
+        const int cb = (ntiles && rowsW % Q4NX_TILE_ROWS == 0 && colsW % Q4NX_TILE_COLS == 0)
+                           ? (int)((size_t)d->data_size / ntiles) : 0;
+        const bool chunked = cb > 0 && (size_t)cb * ntiles == (size_t)d->data_size &&
+                             (cb == Q4NX_TILE_BYTES || cb == Q4NX_CHUNK_Q4K || cb == Q4NX_CHUNK_Q8 || cb == Q4NX_CHUNK_Q4S) &&
+                             !(d->ndim == 2 && !strcmp(d->dtype, "BF16"));
+        bool full_done = false;
+        auto full_decode = [&]() -> bool {
+            if (full_done) return true;
+            outl_scratch_.resize((size_t)rowsW * (size_t)colsW);
+            if (dequant_any(raw, (size_t)d->data_size, rowsW, colsW, outl_scratch_.data(), d) != 0) return false;
+            full_done = true;
+            return true;
+        };
+        std::vector<uint8_t> gbuf;
+        std::vector<float> bout;
+        for (int tc : blocks) {
+            const float* src = nullptr;
+            int ld = colsW, off = tc * Q4NX_TILE_COLS;
+            if (chunked && outl_gather_ok_) {
+                onebit::npu::act_outlier_gather_block(raw, TR, TC, cb, tc, gbuf);
+                bout.resize((size_t)rowsW * Q4NX_TILE_COLS);
+                if (q4nx_dequant_tensor_chunked(gbuf.data(), gbuf.size(), rowsW, Q4NX_TILE_COLS, cb, bout.data()) != 0)
+                    return false;
+                if (!outl_checked_.count(L)) {
+                    if (!full_decode()) return false;
+                    bool same = true;
+                    for (int n = 0; n < rowsW && same; n++)
+                        same = std::memcmp(&bout[(size_t)n * Q4NX_TILE_COLS], &outl_scratch_[(size_t)n * colsW + off],
+                                           Q4NX_TILE_COLS * sizeof(float)) == 0;
+                    outl_checked_.insert(L);
+                    if (!same) {
+                        outl_gather_ok_ = false;
+                        std::fprintf(stderr, "  [outlier] layer %d: a gathered down_proj column block differs from the "
+                                             "full decode; every later column takes the full decode\n", L);
+                    }
+                }
+                if (outl_gather_ok_) { src = bout.data(); ld = Q4NX_TILE_COLS; off = 0; }
+            }
+            if (!src) {
+                if (!full_decode()) return false;
+                src = outl_scratch_.data();
+            }
+            for (const auto& pk : picks) {
+                if (pk.ch / Q4NX_TILE_COLS != tc || outl_cols_.count(key_of(pk.ch))) continue;
+                std::vector<float> col((size_t)rowsW);
+                const int cc = off + pk.ch % Q4NX_TILE_COLS;
+                for (int n = 0; n < rowsW; n++) col[(size_t)n] = src[(size_t)n * ld + cc];
+                outl_cols_.emplace(key_of(pk.ch), std::move(col));
+            }
+        }
+    }
+    std::vector<float> Az(A, A + (size_t)(M - 1) * (size_t)stride + (size_t)w);
+    for (const auto& pk : picks) Az[(size_t)pk.row * (size_t)stride + (size_t)pk.ch] = 0.0f;
+    outl_busy_ = true;
+    if (rows_form) npu_gemm_rows(role, Az.data(), M, K, N, Bmat, out, wkey, "ffn_down", a_k, decode_twin);
+    else npu_gemm(role, Az.data(), K, N, Bmat, out, wkey, "ffn_down", a_k);
+    outl_busy_ = false;
+    if (out.size() < (size_t)M * (size_t)N) return true;   // the launch failed and set err_; keep its message
+    const int nn = std::min(N, rowsW);
+    for (const auto& pk : picks) {
+        const std::vector<float>& col = outl_cols_[key_of(pk.ch)];
+        float* y = &out[(size_t)pk.row * (size_t)N];
+        for (int n = 0; n < nn; n++) y[n] += pk.x * col[(size_t)n];
+    }
+    return true;
+}
+
 void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const float* Bmat,
                               std::vector<float>& out, int wkey, const char* sc, int a_k) {
     if (host_gemm_) {
@@ -4140,6 +4241,9 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
         op_line(sc, cur_layer_, 1, out, N);
         return;
     }
+    if (outl_tau_ > 0.0f && !outl_busy_ && sc && std::strcmp(sc, "ffn_down") == 0 &&
+        ffn_down_outliers(A, 1, a_k, K, N, Bmat, out, wkey, role, false, false))
+        return;
     npu::target::GemvArgs a;
     a.role = role; a.layer = cur_layer_; a.M = 1; a.K = K; a.N = N;
     a.x = A; a.Bmat = Bmat; a.wkey = wkey; a.tag = sc;
@@ -4177,6 +4281,9 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     // does not -- the designs that do not set real_k. So the stride is a_k only when it is a real, narrower width:
     // the same rule the target applies (xdna_target.cpp: astride). Walking by `a_k` itself made every block after
     // the first read block 0's rows on a design with real_k == 0 (engine#1959 follow-up, found on a t2s pack).
+    if (outl_tau_ > 0.0f && !outl_busy_ && sc && std::strcmp(sc, "ffn_down") == 0 &&
+        ffn_down_outliers(A, M, a_k, K, N, Bmat, out, wkey, role, true, decode_twin))
+        return;
     const int astride = onebit::npu::row_stride(a_k, K);
     const int blk = max_batch_rows();
     if (blk > 0 && M > blk) {

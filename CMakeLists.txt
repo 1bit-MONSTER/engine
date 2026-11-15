@@ -1761,6 +1761,11 @@ add_test(NAME ops_dump COMMAND ops_dump_test)
 add_dependencies(onebit ops_dump_test)
 # When the dense-tail cache is on by default (npu/forward/include/ffn_cache_policy.h): the size rule and the two
 # models it was measured on, one on each side of the old floor. Header-only, no device.
+# engine#2536: the ffn_down outlier-channel split's picking, arithmetic and column-block gather (act_outliers.h).
+add_executable(act_outliers_test tests/act_outliers_test.cpp npu/forward/src/q4nx_dequant.c)
+target_include_directories(act_outliers_test PRIVATE npu/forward/include)
+add_test(NAME act_outliers COMMAND act_outliers_test)
+add_dependencies(onebit act_outliers_test)
 add_executable(ffn_cache_policy_test tests/ffn_cache_policy_test.cpp)
 target_include_directories(ffn_cache_policy_test PRIVATE npu/forward/include)
 add_test(NAME ffn_cache_policy COMMAND ffn_cache_policy_test)

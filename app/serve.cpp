@@ -1672,8 +1672,9 @@ int serve_only(const std::string& why) {
 // them itself; --print-backend hands the same requests to Lemonade as the plan's "warmups" ([{path, body}],
 // in order; "warmup" is the first one, for a lemond that reads only that), and Lemonade's onebit recipe
 // sends them once the backend is ready, before it marks the model loaded.
-// ONEBIT_WARMUP selects which warm-up requests are sent (engine#1539's bisect): "" or "both" = the shipped pair,
-// "long" = only the sampling chat request, "short" = only the 16-token /completion prompt, "none" = neither (the
+// ONEBIT_WARMUP selects which warm-up requests are sent (engine#1539's bisect): "" or "both" = the shipped set (the
+// pair, plus warmup_spec_body when the backend speculates), "long" = only the sampling chat request, "short" = only the
+// 16-token /completion prompt, "spec" = only the speculative last-step request, "none" = none of them (the
 // spelling ONEBIT_NO_WARMUP already had). The two requests are not interchangeable -- the first samples and the
 // second does not -- so which one a model cannot survive is a question one load can answer instead of a rebuild.
 static std::string warmup_selection() {
@@ -1717,16 +1718,32 @@ static json warmup_short_body() {
                  { "temperature", 0 }, { "cache_prompt", false } };
 }
 
-static json warmup_requests() {
-    // An unrecognised value is the shipped pair, not "none": a typo must not quietly disable a warm-up that moves a
+// The third warm-up request, sent only when the backend speculates (--mtp, an own MTP head, --dflash): the same
+// 16-token prompt, n_predict 2. A speculating server decodes the LAST token of a request without a draft
+// (llama-server's get_n_draft_max() is n_remaining - 1 = 0 there), so that step runs the plain one-token decode
+// program, and the first time it runs, ggml-hrx builds the layout that program reads for any weight the verify pass
+// reads in another one. On Qwen3.8-27B Q4_K_M that is the mixed layers' Q6_K ffn weights: 76 host copies, ~5.6 GB,
+// 10.4 s, paid by whichever client request first ends on such a step. With n_predict 2 the second token is that
+// step, so the build happens here instead (DECODE-BW 11-15: the duplicates appeared during this request, and the
+// next perf.py pass decoded 23.55 tok/s instead of absorbing the 10 s).
+static json warmup_spec_body() {
+    json body = warmup_short_body();
+    body["n_predict"] = 2;
+    return body;
+}
+
+static json warmup_requests(bool speculative) {
+    // An unrecognised value is the shipped set, not "none": a typo must not quietly disable a warm-up that moves a
     // measured 2 s off the client's first request. Normalised here so a caller cannot see the two states differently.
     std::string sel = warmup_selection();
-    if (sel != "long" && sel != "short" && sel != "none") sel = "both";
+    if (sel != "long" && sel != "short" && sel != "spec" && sel != "none") sel = "both";
     const bool want_chat  = sel == "both" || sel == "long";
     const bool want_short = sel == "both" || sel == "short";
+    const bool want_spec  = speculative && (sel == "both" || sel == "spec");
     json out = json::array();
     if (want_chat)  out.push_back(json{ { "path", kWarmupPath },    { "body", warmup_body() } });
     if (want_short) out.push_back(json{ { "path", "/completion" },  { "body", warmup_short_body() } });
+    if (want_spec)  out.push_back(json{ { "path", "/completion" },  { "body", warmup_spec_body() } });
     return out;
 }
 
@@ -1768,8 +1785,11 @@ int print_backend(const Options& o, const Launch& l) {
     out["env"] = env;
     // a chat backend on HRX: the request Lemonade sends before it marks the model loaded (warmup_wanted)
     if (o.role.empty() && warmup_wanted(l.device)) {
-        out["warmups"] = warmup_requests();
-        if (!out["warmups"].empty()) out["warmup"] = out["warmups"][0];
+        json warmups = warmup_requests(l.mtp);
+        if (!warmups.empty()) {  // ONEBIT_WARMUP=spec on a backend that does not speculate selects none of them
+            out["warmup"]  = warmups[0];
+            out["warmups"] = std::move(warmups);
+        }
     }
     std::printf("%s\n", out.dump().c_str());
     return 0;
@@ -1786,14 +1806,14 @@ int print_backend(const Options& o, const Launch& l) {
 // decoded 12.47 tok/s, the same as the later ones. Only the decode shape and this prompt length are covered;
 // a client prompt of another length still builds its own prefill program once (~130-200 ms on the 27B).
 // HRX only, and ONEBIT_NO_WARMUP=1 turns it off.
-static void warm_backend(int port, const std::string& device) {
+static void warm_backend(int port, const std::string& device, bool speculative) {
     if (!warmup_wanted(device)) {
         return;
     }
     httplib::Client c("127.0.0.1", port);
     c.set_connection_timeout(5);
     c.set_read_timeout(600);
-    for (const auto & w : warmup_requests()) {
+    for (const auto & w : warmup_requests(speculative)) {
         const std::string path = w["path"].get<std::string>();
         const auto t0 = std::chrono::steady_clock::now();
         const auto r  = c.Post(path, w["body"].dump(), "application/json");
@@ -2450,7 +2470,7 @@ int serve_child(const Options& given) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s), picked by laya\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
         auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line, b.env_override);
         if (!c->wait_ready(std::chrono::seconds(600), g_stop)) return false;
-        warm_backend(b.port, b.device);
+        warm_backend(b.port, b.device, b.mtp);
         started[i] = c.get();
         children.push_back(std::move(c));
         return true;
@@ -2754,7 +2774,7 @@ int serve_child(const Options& given) {
     // the one-time per-shape cost (see warm_backend)
     if (!laya) {
         for (size_t i = 0; i < children.size() && i < backends.size(); i++) {
-            warm_backend(children[i]->port(), on_device(backends[i]));
+            warm_backend(children[i]->port(), on_device(backends[i]), backends[i].mtp);
         }
     }
     // engine #390: --strict-device. GGML_HRX_STRICT=1 makes the backend abort at load on the first

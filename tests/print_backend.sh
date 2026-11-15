@@ -202,6 +202,19 @@ out=$(ONEBIT_WARMUP=bogus "$bin" serve -m "$scratch/small.gguf" --device hrx --l
       --no-mem-check --port 43135 --print-backend 2>"$scratch/err"); rc=$?
 check "hrx plan: an unknown ONEBIT_WARMUP keeps the shipped pair (exit $rc)" \
     '[ "$rc" = 0 ] && [ "$(get "len(d[\"warmups\"])")" = 2 ]'
+# DECODE-BW: a speculating backend decodes the last token of a request without a draft, and that plain one-token step
+# builds a host layout the verify pass does not use (Qwen3.8-27B Q4_K_M: ~5.6 GB, 10 s, inside a client request).
+# The third warm-up (n_predict 2) makes that step at load; only plans that speculate carry it.
+out=$(mplan mtp hrx); rc=$?
+check "hrx plan, own MTP head: warmups = the pair + a 2-token /completion (exit $rc)" \
+    '[ "$rc" = 0 ] && [ "$(get "len(d[\"warmups\"])")" = 3 ] && [ "$(get "(d[\"warmups\"][2][\"path\"], d[\"warmups\"][2][\"body\"][\"n_predict\"], d[\"warmups\"][2][\"body\"][\"prompt\"].count(\"a\"))")" = "('"'"'/completion'"'"', 2, 16)" ]'
+out=$(ONEBIT_WARMUP=spec mplan mtp hrx); rc=$?
+check "hrx plan, own MTP head: ONEBIT_WARMUP=spec sends only the 2-token request (exit $rc)" \
+    '[ "$rc" = 0 ] && [ "$(get "[(w[\"path\"], w[\"body\"][\"n_predict\"]) for w in d[\"warmups\"]]")" = "[('"'"'/completion'"'"', 2)]" ]'
+out=$(ONEBIT_WARMUP=spec "$bin" serve -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" \
+      --no-mem-check --port 43136 --print-backend 2>"$scratch/err"); rc=$?
+check "hrx plan without a drafter: ONEBIT_WARMUP=spec selects nothing (exit $rc)" \
+    '[ "$rc" = 0 ] && [ "$(get "\"warmup\" in d or \"warmups\" in d")" = False ]'
 out=$(mplan small cpu); rc=$?
 check "cpu plan: no warmup (exit $rc)" '[ "$rc" = 0 ] && [ "$(get "\"warmup\" in d")" = False ]'
 

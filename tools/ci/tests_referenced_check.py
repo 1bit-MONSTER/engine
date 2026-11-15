@@ -308,7 +308,9 @@ def unregistered_py_tests(root):
             if base.is_dir() else [])
         for path in paths:
             try:
-                runner_text.append(path.read_text(errors="replace"))
+                # engine#2464: this half reads raw text, and `selftest_named` only REMOVES a finding -- so a comment
+                # naming `tools/ci/<tool>.py --self-test` was enough to make the gate go quiet about a test nothing runs.
+                runner_text.append(_strip_line_comments(path.read_text(errors="replace")))
             except OSError:
                 continue
     # engine#2445: a row that runs `tools/ci/<tool>.py --self-test` DOES run tests/<tool>_test.py -- that
@@ -426,6 +428,12 @@ def self_test():
                    "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n# note (unbalanced\n"
                                       "add_test(NAME helper_self COMMAND bash scripts/helper.sh --self-test)\n"})
     cases.append(("an unclosed ( in a comment does not hide the row after it", check(r), 0, None))
+
+    # engine#2464: the test half reads raw text; #2445's selftest_named only suppresses findings, so a MENTION cleared one
+    r = root_with({"tests/helper_test.py": "print('x')\n",
+                   "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n# someday: tools/ci/helper.py --self-test\n"})
+    cases.append(("a comment naming a tool does NOT clear tests/<tool>_test.py", check(r), 1, "tests/helper_test.py"))
+    cases_root["a comment naming a tool does NOT clear tests/<tool>_test.py"] = r
 
     # the invocation goes INSIDE the already-registered test: a new tests/*.sh would be drift for a different, correct reason
     r = root_with({"tests/ok.sh": "#!/bin/sh\npython3 scripts/helper.sh --self-test\n",

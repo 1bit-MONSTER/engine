@@ -169,6 +169,24 @@ JLOG
     PATH=$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
     chk "a ticketed coder-llm is never stopped by a window" "$(grep -c 'stop coder-llm' "$tmp/t.calls")" 0
     chk "  ... and the window's start line says so" "$(grep -c 'coder-llm ticketed: not stopped' "$tmp/t.log")" 1
+    # 3j. a restart deferred to the NEXT lane's window is not a failure (engine: measured 2026-11-15 11:30Z/12:54Z)
+    : > "$tmp/t.calls"
+    # a NON-ticketed unit that is active: the window stops it (creating WR_STOPPED), which is what makes the restore
+    # path -- and therefore the deferral -- reachable at all.
+    # its own directory, so the ticketed arm's fake systemctl (which asserts the opposite) stays in place
+    mkdir -p "$tmp/tbin2"
+    printf '#!/bin/bash\necho "$*" >> %s/t.calls\ncase "$*" in *"show coder-llm -p ExecStart"*) echo "{ path=/x/plain-1bit ; argv[]= }";; *"is-active --quiet coder-llm"*) exit 0;; *"is-active coder-llm"*) echo active;; esac\n' "$tmp" > "$tmp/tbin2/systemctl"
+    chmod +x "$tmp/tbin2/systemctl"
+    printf 'gpu-hold cl-other 999999\n' > "$tmp/token"
+    printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/t.log"
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/token WINDOWS_LOG=$tmp/t.log \
+      "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "a GPU token held by the next lane defers the restart" "$(grep -c 'restart=deferred(gpu held by 999999)' "$tmp/t.log")" 1
+    chk "  ... and the window still starts the unit, so it is not left down" "$(grep -c 'start coder-llm' "$tmp/t.calls")" 1
+    chk "  ... and the deferral is not reported as a failed restart" "$(grep -c 'restart=FAILED' "$tmp/t.log")" 0
+    # the loading-vs-wedged check needs a live child growing in CPU, which a self-test cannot fake without testing its
+    # own fake; pin the reader instead so it cannot be deleted silently (the same technique the probe arm uses).
+    chk "the poll reads the largest child's CPU, not the idle embed child" "$(grep -c 'sort -k2 -n | tai[l] -1' "$me")" 1
     # 4. an old enough end opens the gate again (the refusal above is about the gap, not about the file)
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/w.log"
     out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true 2>&1); rc=$?
@@ -349,7 +367,25 @@ restore() {
   fi
   if [ -e "$WR_STOPPED" ]; then
     systemctl --user start coder-llm 2>/dev/null
-    for i in $(seq 1 40); do
+    # A DEFERRED RESTART IS NOT A FAILED ONE (measured 2026-11-15 11:30Z and 12:54Z): when the next lane's window
+    # already holds the GPU token, coder-llm cannot load -- it needs the GTT that window is using -- so polling
+    # here burns minutes and, worse, delays this window's END line, which is what every other lane reads as
+    # "still holding". Say so in one line and let the unit come up when that window ends.
+    _tok=${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}
+    if [ -e "$_tok" ]; then
+      _held=$(awk '{print $NF}' "$_tok" 2>/dev/null | head -1)
+      printf '%s end   lane=%s issue=%s label=%s coder-llm=%s :8090=deferred restart=deferred(gpu held by %s) rc=%s\n' \
+        "$(date -u +%FT%TZ)" "$WR_LANE" "$ISSUE" "$LABEL" "$(systemctl --user is-active coder-llm)" "${_held:-?}" "$rc" >> "$LOG"
+      printf '%s: coder-llm restarts when the next lane releases the GPU (holder %s); not a failed restart\n' "$SELF" "${_held:-?}" >&2
+      rm -rf "$WR_DIR"; exit "$rc"
+    fi
+    # LOADING IS NOT WEDGED (same windows): a child loading a 30B answers 503 while its CPU time advances;
+    # restarting it there throws the load away. Only a child whose CPU time has not moved for ~30 s is dead.
+    # The LARGEST llama-server is the one loading -- the embed service's idle child is ~15 MB.
+    cpu_of() { ps -o time=,rss= -C llama-server 2>/dev/null | sort -k2 -n | tail -1 | awk '{print $1}'; }
+    prev=""; froze=0
+    _poll_s=${WR_POLL_S:-3}
+    for i in $(seq 1 "${WR_POLL_MAX:-100}"); do
       # /v1/health, NOT /v1/models: /v1/models is a static registry listing (app/serve.cpp:1909) that
       # answers 200 from the moment the process binds, so it reports success while the weights are still
       # loading and every PR-agent check is still failing. /v1/health is 503 until `ready` and 503 when a
@@ -364,7 +400,12 @@ restore() {
       code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
                  -d '{"model":"qwen3-coder","messages":[{"role":"user","content":"ok"}],"max_tokens":1,"temperature":0}' \
                  http://127.0.0.1:8090/v1/chat/completions 2>/dev/null || true)
-      [ "$code" = 200 ] && break; sleep 3
+      [ "$code" = 200 ] && break
+      _cpu=$(cpu_of)
+      if [ -n "$_cpu" ] && [ "$_cpu" = "$prev" ]; then froze=$((froze + 1)); else froze=0; fi
+      prev=$_cpu
+      [ "$froze" -ge 10 ] && break      # ~30 s without CPU progress: a wedge, not a load
+      sleep "$_poll_s"
     done
     _state=$(systemctl --user is-active coder-llm 2>/dev/null)
     _waiting=0

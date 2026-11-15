@@ -65,6 +65,16 @@
 #   CODER_LLM_ALWAYS=1          skip the demand wait (a resident window, still ticketed and still max-hold bounded)
 #
 # Internal: "coder-llm-ticketed --window SERVER_CMD..." is what gpu-hold runs; it is the idle-aware window itself.
+#
+# Exit status of one invocation (the journal line after "window" says which; review of engine#2525):
+#   0    the window closed idle, or a grant whose demand went stale was released without starting the server
+#   124  the max hold ended the window: gpu-hold's deadline, including a window gpu-hold had to KILL after the deadline
+#        (a 137 once the window has been open for the max hold, timed from the window's own start). Planned, not a crash
+#   130  a stop was requested (gpu-hold's stop stamp) and the window refused to die; gpu-hold released the token anyway
+#   137  something KILLed the window or the server BEFORE the max hold (the OOM killer, a manual kill -9): a failure
+#   78   gpu-hold ended the hold on a GPU/NPU fault in the kernel log, or refused the ticket; backed off before exiting
+#   75   the queue never came round within CODER_LLM_QUEUE_WAIT_S
+#   any other: the server's own exit status (it exited by itself)
 set -u
 
 DEMAND=${CODER_LLM_DEMAND:-$HOME/.cache/coder-llm/demand}
@@ -135,10 +145,16 @@ if [ "${1:-}" = "--window" ]; then
     [ -n "${CODER_LLM_WINDOW_STAMP:-}" ] && date +%s > "$CODER_LLM_WINDOW_STAMP"
     "$@" &
     server=$!
-    stop_server() {
+    stop_server() {   # logs how long the teardown took: the number that says how close the next one is to the grace
+        local t0 n
+        t0=$(date +%s)
         kill -TERM "$server" 2> /dev/null
-        for _ in $(seq 1 "$STOP_WAIT"); do kill -0 "$server" 2> /dev/null || return; sleep 1; done
+        for n in $(seq 1 "$STOP_WAIT"); do
+            kill -0 "$server" 2> /dev/null || { log "server stopped in $(( $(date +%s) - t0 ))s after TERM (stop wait ${STOP_WAIT}s)"; return; }
+            sleep 1
+        done
         kill -KILL "$server" 2> /dev/null
+        log "server did not stop in ${STOP_WAIT}s after TERM: KILLed (raise CODER_LLM_STOP_WAIT_S)"
     }
     trap 'stop_server; exit 143' TERM INT HUP
     log "window open: server pid $server"
@@ -181,6 +197,10 @@ if [ "${CODER_LLM_ALWAYS:-0}" != 1 ]; then
     done
 fi
 holder=$(head -c 120 "${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}" 2> /dev/null | head -1)
+# an explicit GPU_HOLD_KILL_GRACE wins, so it can undo the nesting (gpu-hold KILLing the window while the server is still
+# inside its stop wait): say so, do not override the operator's choice
+[ "$KILL_GRACE" -ge $(( STOP_WAIT + 5 )) ] 2> /dev/null \
+    || log "WARNING: the kill grace ${KILL_GRACE}s is not at least 5 s longer than CODER_LLM_STOP_WAIT_S=${STOP_WAIT}s: gpu-hold will KILL the window before the server can exit"
 log "demand: queueing for the GPU (gpu-hold -l coder-llm -t $MAX_HOLD -w $QUEUE_WAIT)${holder:+; queued behind $holder}"
 # gpu-hold's default 10 s grace KILLed the window at the first live max hold while the server was still exiting:
 # rc 137 and an unclean stop instead of 124 (11-15 10:56Z)
@@ -198,6 +218,8 @@ fi
 case "$rc" in
     0)   log "window closed (idle)" ;;
     124) log "window closed (max hold ${MAX_HOLD} min); re-queueing" ;;
+    130) log "window stop requested and refused; gpu-hold released the token anyway" ;;
+    137) log "window KILLed before its max hold (rc 137: the OOM killer or a kill -9, not a planned close)" ;;
     75)  log "the queue never came round in ${QUEUE_WAIT}s" ;;
     78)  log "gpu-hold rc 78 (a GPU fault in the kernel log, or a refused ticket): backing off ${BACKOFF}s"; sleep "$BACKOFF" ;;
     *)   log "window ended rc $rc" ;;

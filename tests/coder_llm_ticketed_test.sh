@@ -32,7 +32,10 @@
 #     without starting the server;
 #   I a server that needs 12 s to exit after TERM at the max hold: the window's own kill grace (not gpu-hold's 10 s
 #     default) lets it exit cleanly, rc 124; with a grace too short for it, gpu-hold's KILL (rc 137) is still reported
-#     as the max hold, rc 124 (the first live window, 11-15 10:56Z, ended rc 137).
+#     as the max hold, rc 124 (the first live window, 11-15 10:56Z, ended rc 137); the teardown time is logged, and a
+#     grace too short for the stop wait is warned about;
+#   J a server KILLed 1 s into a window that queued 9 s behind a lane stays rc 137: the relabel is timed from the
+#     window's start, not the queue's, so a real KILL is not reported as a max hold.
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)   # the defaults work from any directory, not only the repo root
 tick=${1:-$root/scripts/coder-llm-ticketed}
@@ -179,18 +182,38 @@ rc=$?
 [ "$rc" = 124 ] || { echo "FAIL I: rc $rc for a slow-exiting server at the max hold, want 124"; fail=1; }
 [ -e "$scratch/slow.exit" ] || { echo "FAIL I: the slow server was KILLed before it could exit (the window's kill grace did not reach gpu-hold)"; fail=1; }
 grep -q "window closed (max hold" "$scratch/i1.log" || { echo "FAIL I: the log does not say max hold"; fail=1; }
+grep -Eq "server stopped in 1[1-4]s after TERM" "$scratch/i1.log" || { echo "FAIL I: the teardown time is not logged ($(grep -m1 'server stopped\|did not stop' "$scratch/i1.log"))"; fail=1; }
+grep -q "WARNING: the kill grace" "$scratch/i1.log" && { echo "FAIL I: warned about a grace that fits the stop wait"; fail=1; }
 [ -e "$scratch/TOKEN" ] && { echo "FAIL I: the token is still held"; fail=1; }
 echo busy > "$scratch/state"; rm -f "$scratch/server.pid" "$scratch/slow.exit"; touch "$scratch/demand"
 env "${envs[@]}" CODER_LLM_IDLE_S=60 CODER_LLM_MAX_HOLD_MIN=0.1 timeout 120 "$tick" -- "$scratch/slow" > "$scratch/i2.log" 2>&1
 rc=$?
 [ "$rc" = 124 ] || { echo "FAIL I: rc $rc when gpu-hold KILLs the window after the max hold, want 124"; fail=1; }
 grep -q "KILLed after the max hold" "$scratch/i2.log" || { echo "FAIL I: the KILL after the max hold was not reported as such"; fail=1; }
+grep -q "WARNING: the kill grace 3s is not at least 5 s longer than CODER_LLM_STOP_WAIT_S=30s" "$scratch/i2.log" || { echo "FAIL I: an explicit grace shorter than the stop wait was not warned about"; fail=1; }
 [ -e "$scratch/TOKEN" ] && { echo "FAIL I: the token is still held after the KILL"; fail=1; }
 pkill -9 -f "$scratch/slow" 2> /dev/null
+
+# ---- J: a KILL shortly after a long queue wait is a real 137 ----------------------------------------------------------
+cat > "$scratch/selfkill" <<SK
+#!/bin/bash
+# the fake, then a SIGKILL of the server 1 s in (the OOM killer's shape)
+"$scratch/fake" & sleep 1; kill -9 \$! 2> /dev/null; kill -9 \$\$
+SK
+chmod +x "$scratch/selfkill"
+echo busy > "$scratch/state"; rm -f "$scratch/server.pid"; : > "$scratch/klog"; touch "$scratch/demand"
+env "${envs[@]}" GPU_HOLD_WAIT=60 "$hold" -t 1 -l lanehold -- sleep 9 > /dev/null 2>&1 &
+lj=$!; pids+=($lj)
+wait_for 10 test -e "$scratch/TOKEN" || { echo "FAIL J: the lane did not take the token"; fail=1; }
+env "${envs[@]}" CODER_LLM_IDLE_S=60 CODER_LLM_MAX_HOLD_MIN=0.1 timeout 60 "$tick" -- "$scratch/selfkill" > "$scratch/j.log" 2>&1
+rc=$?
+wait "$lj"
+[ "$rc" = 137 ] || { echo "FAIL J: rc $rc for a server KILLed 1 s into its window after a 9 s queue, want 137 (relabelled as a max hold?)"; fail=1; }
+grep -q "KILLed before its max hold" "$scratch/j.log" || { echo "FAIL J: the log does not call it a KILL before the max hold"; fail=1; }
 
 # ---- G: the default queue wait keeps the ticket's place on a busy box (a give-up re-queues at the back) ------------
 sed -n 's/^QUEUE_WAIT=\${CODER_LLM_QUEUE_WAIT_S:-\([0-9]*\)}$/\1/p' "$tick" > "$scratch/qw"
 [ "$(cat "$scratch/qw")" -ge 14400 ] 2> /dev/null || { echo "FAIL G: default queue wait $(cat "$scratch/qw")s; under 4 h a busy queue makes it re-queue at the back and starve"; fail=1; }
 
-[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load; a slow-exiting server gets its grace, a KILL after the max hold is 124)"
+[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load; a slow-exiting server gets its grace, a KILL after the max hold is 124, one after a queue wait stays 137)"
 exit "$fail"

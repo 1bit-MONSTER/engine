@@ -144,10 +144,14 @@ The models (`MODEL_TABLE` in the script, files under `~/models`):
 | qwen3-0.6b | Qwen3-0.6B-Q4_K_M.gguf | small dense K-quant | 3 | yes |
 | zaya1-8b | zaya1-8b-Q4_K_M.gguf | ZAYA1 (16 experts, 1 active per token), K-quant | 2 | yes |
 | qwen3.8-27b | qwen38/UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf | gated delta net + attention hybrid, Unsloth dynamic mix | 2 | no |
-| qwen3-coder-30b-a3b | Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf | qwen3moe: 128 experts, 8 active per token (MUL_MAT_ID with top-8 routing) | 2 | no |
+| qwen3.6-35b-a3b | qwen36/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf | qwen35moe: 256 experts, 8 active per token (MUL_MAT_ID with top-8 routing; IQ4_XS / IQ3_S experts) | 2 | no |
 | qwen3-4b-iq4xs | Qwen3-4B-IQ4_XS.gguf | an IQ quant (IQ4_XS matmul and GET_ROWS) | 2 | no |
 | qwen3-0.6b-kq8 | Qwen3-0.6B-Q4_K_M.gguf, served with `-fa on -ctk q8_0` | a q8_0 K cache with an f16 V cache | 2 | yes |
 | qwen3-0.6b-kvq8 | Qwen3-0.6B-Q4_K_M.gguf, served with `-fa on -ctk q8_0 -ctv q8_0` | q8_0 K and V caches | 2 | yes |
+
+The qwen3-coder-30b-a3b row (Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf, 128 experts) is out of the table until
+#2494 closes (engine#2501): its multi-token prefill faults the GPU, so every gate run would reproduce that crash
+trigger. The row stays in `MODEL_TABLE` as a comment; re-enable it when #2494 closes.
 
 The last two rows give `llama-server` extra arguments (the fifth column of `MODEL_TABLE`). Their kat
 needle (about 4.7K tokens) and the 7.1K-token needle decode past 1,024 KV cells, where the add-on's

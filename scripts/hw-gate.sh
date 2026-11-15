@@ -195,8 +195,8 @@ FLAKY_CASES=${HW_GATE_FLAKY:-"MUL_MAT(type_a=f32,type_b=f32,m=1,n=1,k=2048"}
 
 # name | file under $MODELS | kat --repeat | needle (1 = run tests/hrx_long_prompt.py on it)
 #   | extra llama-server arguments
-# The first three are K-quants (ZAYA1-8B routes 1 of 16 experts). The Qwen3-Coder row covers
-# MUL_MAT_ID with top-8 of 128 experts, the IQ row the IQ4_XS matmul and GET_ROWS paths. The
+# The first three are K-quants (ZAYA1-8B routes 1 of 16 experts). The Qwen3.6-35B-A3B row covers
+# MUL_MAT_ID with top-8 of 256 experts (IQ4_XS / IQ3_S experts, qwen35moe), the IQ row the IQ4_XS matmul and GET_ROWS paths. The
 # needle runs on a small and a mid-size model.
 # The two -kq8/-kvq8 rows serve Qwen3-0.6B with a q8_0 K cache (V f16, `-ctk q8_0` alone) and with
 # q8_0 K and V. Their kat needle (~4.7K tokens) and the 7.1K-token needle decode past 1024 KV
@@ -207,10 +207,13 @@ FLAKY_CASES=${HW_GATE_FLAKY:-"MUL_MAT(type_a=f32,type_b=f32,m=1,n=1,k=2048"}
 # 0..31 only (test-backend-ops has no FLASH_ATTN_EXT case with K and V of different types).
 # Rows with server arguments run kat, needle and placement, not kld: the KLD bases are stored per
 # model file and recorded with the default f16 cache.
+# engine#2501: qwen3-coder-30b-a3b|Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf|2|0 -- re-enable when #2494 closes. Its
+# multi-token prefill faults the GPU (MES REMOVE_QUEUE -> MODE2 reset), so every gate run would reproduce the crash
+# trigger, and its GGUF was removed from ~/models. Its MoE coverage moved to the qwen3.6-35b-a3b row.
 MODEL_TABLE="qwen3-0.6b|Qwen3-0.6B-Q4_K_M.gguf|3|1
 zaya1-8b|zaya1-8b-Q4_K_M.gguf|2|1
 qwen3.8-27b|qwen38/UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf|2|0
-qwen3-coder-30b-a3b|Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf|2|0
+qwen3.6-35b-a3b|qwen36/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf|2|0
 qwen3-4b-iq4xs|Qwen3-4B-IQ4_XS.gguf|2|0
 qwen3-0.6b-kq8|Qwen3-0.6B-Q4_K_M.gguf|2|1|-fa on -ctk q8_0
 qwen3-0.6b-kvq8|Qwen3-0.6B-Q4_K_M.gguf|2|1|-fa on -ctk q8_0 -ctv q8_0"

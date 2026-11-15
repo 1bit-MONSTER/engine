@@ -290,7 +290,7 @@ void host_gemm_4rows_base(const float* a0, const float* bpp, float* r0, int64_t 
 
 #if defined(__x86_64__) && defined(__GNUC__)
 #pragma GCC push_options
-#pragma GCC target("avx2,fma")
+#pragma GCC target("avx2")   // NOT fma: a fused multiply-add rounds once, the ordered SSE2 sum rounds twice
 __attribute__((noinline)) void host_gemm_4rows_avx2(const float* a0, const float* bpp, float* r0, int64_t K, int64_t N) {
     ONEBIT_HOST_GEMM_4ROWS_BODY
 }
@@ -302,9 +302,9 @@ void (*host_gemm_4rows())(const float*, const float*, float*, int64_t, int64_t) 
 #if defined(__x86_64__) && defined(__GNUC__)
     static void (*pick)(const float*, const float*, float*, int64_t, int64_t) = [] {
         const char* e = std::getenv("ONEBIT_AUDIO_AVX2");
-        const bool fast = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+        const bool fast = __builtin_cpu_supports("avx2");
         if (e != nullptr && e[0] == '1' && e[1] == '\0') {
-            if (!fast) std::fprintf(stderr, "[audio] ONEBIT_AUDIO_AVX2=1 but this CPU has no AVX2+FMA: keeping the baseline\n");
+            if (!fast) std::fprintf(stderr, "[audio] ONEBIT_AUDIO_AVX2=1 but this CPU has no AVX2: keeping the baseline\n");
             return fast ? &host_gemm_4rows_avx2 : &host_gemm_4rows_base;
         }
         if (e != nullptr && e[0] == '0' && e[1] == '\0') return &host_gemm_4rows_base;

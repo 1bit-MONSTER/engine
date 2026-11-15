@@ -340,6 +340,12 @@ add_test(NAME driver_refusal_census_selftest
 # live logs (a CI runner has no /dev/accel), and it pins the window arithmetic with hand-checked cases.
 add_test(NAME accel_attribution_selftest
          COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/diag/accel_attribution.py --self-test)
+# engine#2478/#2568: the unmap/fault ordering correlator. Volume is ruled out four ways (3 TiB O_DIRECT, 157 TiB of
+# mmap churn, three boots of uptime, 60,459 dma_iova_destroy calls in one build), so what is left is ordering -- and
+# this is the tool for it. Self-test only: it pins the four shapes (before / after / out-of-window / no timestamp) and
+# the tracefs line shape, which is where my own first parser failed (timestamps are not at the start of the line).
+add_test(NAME unmap_fault_order_selftest
+         COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/diag/unmap_fault_order.py --self-test)
 add_test(NAME server_launch_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/server_launch_check.py --self-test)
 # scripts/lemonade-hrx: the PPA lemond's HRX recipe runs our llama-server (docs/lemonade.md): no GPU.
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)

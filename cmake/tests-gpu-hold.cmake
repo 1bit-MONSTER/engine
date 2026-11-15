@@ -78,3 +78,7 @@ add_test(NAME gpu_hold_hold_dir COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_
 # for 40 s inside another lane's 45-minute hold. gpu-hold exports the exact token line it wrote (GPU_HOLD_TICKET) and the
 # label, and this asserts the child sees both, on a sandboxed HOME.
 add_test(NAME gpu_hold_child_identity COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_child_identity_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
+# docs/ci-runners.md's exit-code table is a contract (review of engine#2539): every "<script> exits/sets it" in a row
+# must be backed by `exit <rc>` or `rc=<rc>` in that script, and every row must name an emitter.
+add_test(NAME exit_code_table COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tests/exit_code_table_test.py ${CMAKE_SOURCE_DIR})

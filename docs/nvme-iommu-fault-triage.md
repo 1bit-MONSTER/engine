@@ -131,6 +131,43 @@ Two things to be careful about, both learned the hard way here:
 * **pick the right symbol.** `iommu_unmap` had zero hits in 5 s on a box doing heavy I/O; `iommu_unmap_fast` had 40,510.
   Probe a known-hot function (`ksys_write`) once to prove the plumbing, then argue about symbols.
 
+## Validating a capture before you believe it
+
+Four failures in one afternoon on this row, and every one was method rather than kernel. The pattern that catches all
+four costs about ten lines:
+
+```bash
+# 1. the probe exists and fires -- verify with a known-hot symbol the first time you use a new tracefs
+echo "p:hot ksys_write" > /sys/kernel/tracing/kprobe_events
+echo 1 > /sys/kernel/tracing/events/kprobes/hot/enable; sleep 3
+grep -c 'hot:' /sys/kernel/tracing/trace     # must be > 0 before you trust any other probe
+echo > /sys/kernel/tracing/kprobe_events     # cleaning up removes the DEFINITION, not just the enable
+
+# 2. pre-flight INSIDE the long run: abort instead of sleeping on a dead instrument
+echo 1 > /sys/kernel/tracing/events/kprobes/unm/enable; sleep 5
+H=$(grep -c 'unm:' /sys/kernel/tracing/trace)
+[ "$H" -gt 0 ] || { echo "INVALID: probes silent, aborting"; exit 1; }
+
+# 3. copy the output, then make sure it is readable
+sudo cp /sys/kernel/tracing/trace ./cap.txt && sudo chmod 644 ./cap.txt
+
+# 4. read it back before analysing: an unreadable file greps as "no events"
+grep -c 'unm:' ./cap.txt || echo "GREP FAILED - check permissions, not the data"
+```
+
+The four ways this went wrong here, in the order they happened:
+
+| mistake | what it looked like | what it cost |
+|---|---|---|
+| `echo > .../filter` to clear a filter | `event filter parse error`; the old filter stayed and the probe matched nothing | a 12-minute capture reported "0 unmaps" |
+| probing `iommu_unmap` because that is the name you remember | 0 hits in 5 s on a box doing heavy I/O | a wrong conclusion about which path unmaps take |
+| enabling a probe whose definition a previous cleanup had removed | silence, reported as "no events" | a 20-minute capture measured nothing |
+| `sudo cp` output, then `grep 2>/dev/null` | silence, reported as "no events" | the data was in the file; only the read failed |
+
+Every one of them produces the same symptom — **an empty result** — which is indistinguishable from the finding you
+might legitimately be looking for. That is why the pre-flight is not optional: it is the only thing that separates
+"nothing happened" from "nothing was watching".
+
 ## Two traps this runbook exists to stop
 
 * **A count without a device split is not a measurement.** `distinct` exposes the mixing.

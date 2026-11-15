@@ -224,7 +224,10 @@ Four things generalise, and each one was a decision rather than a discovery:
 
 1. **Split by `(device, domain)` before counting.** The NVMe stream is domain `0x0015`, the NPU's is `0x0003`; a raw
    `grep -c IO_PAGE_FAULT` mixes them and inflates whichever you were looking for. `tools/diag/iommu_fault_census.py`
-   exists for exactly this.
+   exists for exactly this. To measure the **rate** rather than take one census of a buffer that both throttles and
+   rotates, `tools/diag/iommu_fault_sampler.py` appends `<epoch> <printed> <suppressed_total>` per interval: the
+   dropped-callback delta is the only count `printk_ratelimited` cannot hide, and a falling total means the ring
+   buffer forgot (engine#2542 quoted three different populations for one boot, 20 / 78 / 41, all true when read).
 2. **`flags` is not decoded here, and must not be until it is cited.** The streams carry **three** values, not one:
 
    ```

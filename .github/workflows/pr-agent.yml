@@ -34,7 +34,41 @@ permissions:
   contents: read
 
 jobs:
+  # The model runs only inside a gpu-hold ticket, in on-demand windows (engine#2494, docs/ci-runners.md): this job asks
+  # for a window and waits for it, bounded at 10 min so the single pr-agent runner is not held for long. If the model
+  # never answers, THIS job FAILS with "reviewer unavailable" (a skipped job would count as a pass for a required check,
+  # so "no review" must be visible as a red reviewer, never as green), and pr_agent below does not run.
+  reviewer:
+    runs-on: [self-hosted, pr-agent]
+    if: |
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    timeout-minutes: 15
+    outputs:
+      available: ${{ steps.wait.outputs.available }}
+    steps:
+      - name: Wait for the local model (coder-llm, a gpu-hold window)
+        id: wait
+        run: |
+          demand="$HOME/.cache/coder-llm/demand"; mkdir -p "$(dirname "$demand")"
+          # a real one-token completion, not just /v1/models: the server answers that before the model is loaded
+          deadline=$(( $(date +%s) + 10 * 60 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            touch "$demand"
+            if curl -sf --max-time 60 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
+                 -d '{"model":"qwen3-coder","messages":[{"role":"user","content":"ok"}],"max_tokens":1}' > /dev/null; then
+              echo "available=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            sleep 15
+          done
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          echo "### reviewer unavailable: no GPU window for the local model (coder-llm, :8090) within 10 min; no review was run" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::reviewer unavailable: the local model (coder-llm, :8090) did not answer within 10 min; no review was run (re-run this job to retry)"
+          exit 1
+
   pr_agent:
+    needs: reviewer
     runs-on: [self-hosted, pr-agent]
     # on the job, not the workflow: a comment that skips the job (a bot's, say) must not cancel a review
     concurrency:
@@ -46,11 +80,8 @@ jobs:
       group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
       cancel-in-progress: true
     timeout-minutes: 30
-    # same-repo PRs, and comments by the owner, members or collaborators on a pull request
-    if: |
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    # only when the reviewer job got a model answer (the same-repo / trusted-comment filter is on that job)
+    if: needs.reviewer.outputs.available == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: PR-Agent
@@ -75,16 +106,10 @@ jobs:
             python3 -m venv "$venv"
             "$venv/bin/pip" install -q "pr-agent[github]==$PRA_VERSION"
           fi
-          # a real one-token completion, not just /v1/models: the server answers that before the model is loaded
-          ready=0
-          for i in $(seq 1 30); do
-            if curl -sf --max-time 60 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
-                 -d '{"model":"qwen3-coder","messages":[{"role":"user","content":"ok"}],"max_tokens":1}' > /dev/null; then
-              ready=1; break
-            fi
-            sleep 10
-          done
-          [ "$ready" = 1 ] || { echo "::error::the local model (coder-llm on :8090) does not answer"; exit 1; }
+          # keep the gpu-hold window open while this job works: the window closes after 5 idle minutes without demand
+          demand="$HOME/.cache/coder-llm/demand"
+          ( while :; do touch "$demand"; sleep 60; done ) & toucher=$!
+          trap 'kill $toucher 2> /dev/null' EXIT
           # PR-Agent exits 0 even when every model call failed or the command never ran, so check its log
           run() {
             pr-agent --pr_url "$pr" "$@" 2>&1 | tee "$RUNNER_TEMP/pr-agent.log"

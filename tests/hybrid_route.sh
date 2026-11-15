@@ -185,6 +185,10 @@ check "serve names the taken port and relaunches" 'grep -q "could not bind port 
 reply=$(curl -s "$api/v1/chat/completions" -H 'Content-Type: application/json' \
     -d '{"model": "hybrid-model", "messages": [{"role": "user", "content": "What is the capital of France?"}]}')
 check "the relaunched backend answers" '[[ "$reply" == *Paris* ]]'
+# the relaunch is on a different port from the taken one: a change that reintroduced a fixed backend port fails here
+taken=$(grep -o "could not bind port [0-9]*" "$scratch/t.log" | head -1 | grep -o "[0-9]*$")
+relaunched=$(grep -o "relaunching on port [0-9]*" "$scratch/t.log" | head -1 | grep -o "[0-9]*$")
+check "the relaunch uses a fresh port ($taken -> $relaunched)" '[ -n "$taken" ] && [ -n "$relaunched" ] && [ "$taken" != "$relaunched" ]'
 check "no did-not-become-ready for a taken port" '! grep -q "did not become ready" "$scratch/t.log"'
 stop
 

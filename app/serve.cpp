@@ -2801,7 +2801,8 @@ int serve_child(const Options& given) {
         if (!children[i]->wait_ready(std::chrono::seconds(600), g_stop)) {
             if (g_stop) return 0;
             if (backend_port_taken && !children[i]->alive()) {
-                std::fprintf(stderr, "1bit serve: backend %zu could not bind port %d: address already in use\n", i, children[i]->port());
+                std::fprintf(stderr, "1bit serve: backend %zu could not bind port %d: address already in use, after %d relaunches "
+                                     "on fresh ports; giving up\n", i, children[i]->port(), kPortTakenRetries);
                 return 1;
             }
             // a strict HRX backend (app/hrx_strict.h) that refused a node said which; serve says it again

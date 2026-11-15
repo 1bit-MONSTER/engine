@@ -100,15 +100,29 @@ inline bool log_mel_spectrogram(const float* audio, size_t samples, const MelCon
     const std::vector<float> fb = mel_filterbank(cfg.bins, cfg.n_fft, cfg.sample_rate);
     out->assign(size_t(cfg.bins) * size_t(cfg.frames), 0.0f);
     std::vector<double> re(nfreqs), im(nfreqs), power(nfreqs);
+    // engine#1783: this was a naive DFT with std::cos/std::sin evaluated PER TERM -- frames(3000) x nfreqs(201) x
+    // n_fft(400) = 241 M iterations and 482 M transcendental calls for one 30 s window, which is why the front-end
+    // measured 3.49 s. The angle depends only on (k, n), so the twiddles are a table built ONCE. The entries are the
+    // same std::cos/std::sin of the same double argument, so the sums below are bit-identical -- this is not an
+    // approximation, and audio_mel_test (which compares against the reference extractor) proves it.
+    std::vector<double> tw_c(size_t(nfreqs) * size_t(cfg.n_fft)), tw_s(size_t(nfreqs) * size_t(cfg.n_fft));
+    for (int k = 0; k < nfreqs; ++k) {
+        for (int n = 0; n < cfg.n_fft; ++n) {
+            const double ang = -2.0 * M_PI * double(k) * double(n) / double(cfg.n_fft);
+            tw_c[size_t(k) * size_t(cfg.n_fft) + size_t(n)] = std::cos(ang);
+            tw_s[size_t(k) * size_t(cfg.n_fft) + size_t(n)] = std::sin(ang);
+        }
+    }
     for (int t = 0; t < cfg.frames; ++t) {
         const size_t base = size_t(t) * size_t(cfg.hop);
         for (int k = 0; k < nfreqs; ++k) {
             double sr = 0.0, si = 0.0;
+            const double* tc = &tw_c[size_t(k) * size_t(cfg.n_fft)];
+            const double* ts = &tw_s[size_t(k) * size_t(cfg.n_fft)];
             for (int n = 0; n < cfg.n_fft; ++n) {
                 const double v = x[base + size_t(n)] * win[size_t(n)];
-                const double ang = -2.0 * M_PI * double(k) * double(n) / double(cfg.n_fft);
-                sr += v * std::cos(ang);
-                si += v * std::sin(ang);
+                sr += v * tc[size_t(n)];
+                si += v * ts[size_t(n)];
             }
             re[size_t(k)] = sr;
             im[size_t(k)] = si;

@@ -428,6 +428,10 @@ int main(int argc, char** argv) {
     }
     const auto t_dec = std::chrono::steady_clock::now();
     const double load_s = secs(t_start, t_load);
+    // engine#1783: `mel+load` was reported as one number, and at a 30 s window it is 2.37 s of a 4.47 s TTFT --
+    // larger than the encoder it feeds. Split them: they have completely different fixes (graph parse + mmap vs
+    // the mel front-end), and summing them is why nobody could tell which half to look at.
+    std::printf("time: load %.3f s, mel %.3f s, encoder %.3f s\n", load_s, mel_s, enc_s);
     std::printf("time: mel+load %.3f s, encoder %.3f s, decode %.3f s for %zu token(s) -> %.3f s/token, wall %.3f s\n",
                 mel_s + load_s, enc_s, dec_s, ids.size(), ids.empty() ? 0.0 : dec_s / double(ids.size()),
                 secs(t_start, t_dec));

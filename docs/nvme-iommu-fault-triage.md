@@ -197,9 +197,24 @@ Four things generalise, and each one was a decision rather than a discovery:
 1. **Split by `(device, domain)` before counting.** The NVMe stream is domain `0x0015`, the NPU's is `0x0003`; a raw
    `grep -c IO_PAGE_FAULT` mixes them and inflates whichever you were looking for. `tools/diag/iommu_fault_census.py`
    exists for exactly this.
-2. **Decode `flags`.** `0x0007` is present=0, write=1, user=1 — a **write to a non-present page**, which rules out a
-   permission fault on live memory and points at an address that was never (or no longer) mapped. `flags=0x0000` on the
-   NVMe stream means the same for a read.
+2. **Decode `flags` — from the spec, not from memory.** The two streams carry **different** flags and that difference is
+   the whole point:
+
+   ```
+   NPU  (c6:00.1, 0x0003):  flags=0x0007
+   NVMe (c4:00.0, 0x0015):  flags=0x0000
+   ```
+
+   An earlier version of this page decoded `0x0007` as "present=0, write=1, user=1 — a write to a non-present page" and
+   then said `0x0000` "means the same for a read". **Both cannot be true**: a single bit cannot be set in one stream and
+   clear in the other while both are the same state. The kernel does not expand these bits — it prints `flags=0x…` raw —
+   and the local headers do not carry them either, so the decode has to come from the **AMD IOMMU specification's event-log
+   table** (bit 0 present, bit 1 write, bit 2 user, in the spec's ordering) and be cited next to the claim.
+
+   The stakes are the diagnosis, in opposite directions: if the NPU's bit 0 is set, the page **is** mapped and the fault is
+   a **rights** failure (a write to memory that exists but is not writable) rather than a walk off the end of a mapping;
+   if the NVMe's bit 0 is clear, its stream is an **absent** translation. So the flags must be resolved before either
+   engine#2478 or engine#2542 is described as one kind or the other — the *walk* evidence is unaffected either way.
 3. **Read the walk, not the count.** Nine contiguous pages followed by one page far above is *two ranges in one stride*
    — a descriptor list whose tenth entry lives elsewhere — not a scatter of unrelated pointers. The stride tells you
    which structure to look for; the count tells you nothing.

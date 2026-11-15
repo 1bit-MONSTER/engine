@@ -392,7 +392,7 @@ trap 'exit 143' TERM INT HUP   # so a killed run (timeout, CI cancel) still rele
 # (engine#1504; tests/hw_gate_mem_test.sh).
 gpu() {
   if ! take_token; then
-    result gpu-token FAIL "$TOKEN_WAIT" "$TOKEN held by another job for ${TOKEN_WAIT}s: $(cat "$TOKEN" 2> /dev/null)"
+    result gpu-token SKIP "$TOKEN_WAIT" "$TOKEN held by another job for ${TOKEN_WAIT}s: $(cat "$TOKEN" 2> /dev/null)"
     exit 2
   fi
   wait_coder_idle
@@ -414,7 +414,7 @@ gpu() {
     release_token
     sleep "${HW_GATE_MEM_RETRY_SLEEP:-60}"
     if ! take_token; then
-      result gpu-token FAIL "$TOKEN_WAIT" "$TOKEN held by another job for ${TOKEN_WAIT}s: $(cat "$TOKEN" 2> /dev/null)"
+      result gpu-token SKIP "$TOKEN_WAIT" "$TOKEN held by another job for ${TOKEN_WAIT}s: $(cat "$TOKEN" 2> /dev/null)"
       exit 2
     fi
   done
@@ -513,7 +513,7 @@ if [ -z "$BIN" ]; then
     # reading), and the compile runs under mem-guard --term, which ends the whole thermal-run scope below
     # MEM_FLOOR GB. A guard stop is not heat: the loop below does not resume it.
     if ! "$ROOT/scripts/mem-wait.sh" "$BUILD_MEM_FLOOR" "$BUILD_MEM_WAIT" >> "$OUT/build.log" 2>&1; then
-      result build FAIL $(( $(date +%s) - t0 )) "not started: $(tail -n 1 "$OUT/build.log")"
+      result build SKIP $(( $(date +%s) - t0 )) "not started (could not run): $(tail -n 1 "$OUT/build.log")"
       exit 2
     fi
     # thermal-run kills a build at 93 C (the box is shared); ninja resumes where it stopped
@@ -543,7 +543,7 @@ if [ -z "$BIN" ]; then
       result build PASS $(( $(date +%s) - t0 )) "$build"
     else
       if [ $guarded = 1 ]; then
-        result build FAIL $(( $(date +%s) - t0 )) "stopped by the memory guard: $(grep "^GUARD:" "$OUT/build.log" | tail -n 1); re-run once memory frees (engine#1504)"
+        result build SKIP $(( $(date +%s) - t0 )) "stopped by the memory guard (could not run): $(grep "^GUARD:" "$OUT/build.log" | tail -n 1); re-run once memory frees (engine#1504)"
         exit 2
       fi
       result build FAIL $(( $(date +%s) - t0 )) "see $OUT/build.log"
@@ -566,7 +566,7 @@ fi
 # ---- the GPU token, before the first GPU step (gpu() would take it too, but its output is a step log)
 if has ops || has kat || has needle || has kld || has placement; then
   if ! take_token; then
-    result gpu-token FAIL "$TOKEN_WAIT" "$TOKEN held by another job for ${TOKEN_WAIT}s: $(cat "$TOKEN" 2> /dev/null)"
+    result gpu-token SKIP "$TOKEN_WAIT" "$TOKEN held by another job for ${TOKEN_WAIT}s: $(cat "$TOKEN" 2> /dev/null)"
     exit 2
   fi
 fi

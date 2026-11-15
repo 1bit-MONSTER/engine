@@ -922,6 +922,21 @@ void relay(int port, const httplib::Request& req, httplib::Response& res) {
     res.set_content(r->body, r->get_header_value("Content-Type").empty() ? "application/json" : r->get_header_value("Content-Type"));
 }
 
+// engine#2537: the line a backend prints when its listening port is already bound. Python's socketserver
+// ("OSError: [Errno 98] Address already in use") and llama-server ("couldn't bind HTTP server socket").
+inline bool port_in_use_line(const std::string& line) {
+    return line.find("Address already in use") != std::string::npos ||
+           line.find("couldn't bind HTTP server socket") != std::string::npos;
+}
+
+// Rewrite the value after "--port" in a backend's argv; the launch built it with the port serve first picked.
+inline void set_port_arg(std::vector<std::string>& argv, int port) {
+    for (size_t k = 0; k + 1 < argv.size(); ++k)
+        if (argv[k] == "--port") { argv[k + 1] = std::to_string(port); return; }
+}
+
+constexpr int kPortTakenRetries = 2;
+
 struct Launch {
     std::string device;
     int port = 0;
@@ -2385,8 +2400,14 @@ int serve_child(const Options& given) {
     Lifecycle lifecycle(id);
     std::mutex wedged_mu;
     std::string wedged;   // set by the watchdog: why the backend is taken down
-    auto backend_line = [&metrics, &placement_worst, &wedged_mu, &wedged](const std::string& line) {
+    // engine#2537: free_port() releases the port before the backend binds it, and a backend takes a moment before it
+    // binds (a model load; tests/fake_backend.py sleeps 0.5 s), so under load another process can be handed the same
+    // port in between. The backend then dies with EADDRINUSE; this records that, so serve names it and relaunches the
+    // backend on a fresh port instead of reporting "did not become ready".
+    std::atomic<bool> backend_port_taken{false};
+    auto backend_line = [&metrics, &placement_worst, &wedged_mu, &wedged, &backend_port_taken](const std::string& line) {
         metrics.backend_line(line);
+        if (port_in_use_line(line)) backend_port_taken = true;
         if (device_lost_line(line)) {
             std::lock_guard<std::mutex> lock(wedged_mu);
             if (wedged.empty()) wedged = "the backend lost its GPU: " + line.substr(0, 200);
@@ -2760,8 +2781,27 @@ int serve_child(const Options& given) {
     // Launch::device is "hrx", or "hrx reranking" for a role or RAG server: the device is the first word
     auto on_device = [](const Launch& b) { return b.device.substr(0, b.device.find(' ')); };
     for (size_t i = 0; i < children.size(); i++) {
+        // engine#2537: a backend that died because its port was taken is relaunched on a fresh one, twice at most. Only that
+        // cause is retried: any other failure to start still fails serve, below.
+        for (int retry = 1; !laya && i < backends.size() && retry <= kPortTakenRetries; ++retry) {
+            backend_port_taken = false;
+            if (children[i]->wait_ready(std::chrono::seconds(600), g_stop) || g_stop) break;
+            if (children[i]->alive() || !backend_port_taken) break;
+            const int taken = backends[i].port;
+            backends[i].port = free_port();
+            set_port_arg(backends[i].argv, backends[i].port);
+            std::fprintf(stderr, "1bit serve: backend %zu could not bind port %d (address already in use: another process took it "
+                                 "after serve picked it); relaunching on port %d (%d of %d)\n",
+                         i, taken, backends[i].port, retry, kPortTakenRetries);
+            children[i] = std::make_unique<Child>(backends[i].argv, backends[i].env, backends[i].port, backends[i].ready_path,
+                                                  backend_line, backends[i].env_override);
+        }
         if (!children[i]->wait_ready(std::chrono::seconds(600), g_stop)) {
             if (g_stop) return 0;
+            if (backend_port_taken && !children[i]->alive()) {
+                std::fprintf(stderr, "1bit serve: backend %zu could not bind port %d: address already in use\n", i, children[i]->port());
+                return 1;
+            }
             // a strict HRX backend (app/hrx_strict.h) that refused a node said which; serve says it again
             if (const std::string why = metrics.strict_refusal(); !why.empty())
                 std::fprintf(stderr, "1bit serve: %s\n", strict_refusal_message(why).c_str());

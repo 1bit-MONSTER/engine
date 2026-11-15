@@ -228,6 +228,13 @@ if os.environ.get("FAKE_BACKEND_LOG_LINES"):
                  "ggml_hrx: CPU fallback: GET_ROWS x2, SOFTPLUS x1"):
         print(line, file=sys.stderr, flush=True)
 time.sleep(0.5)  # a real backend takes a moment to load; serve must answer 503 meanwhile
+if os.environ.get("FAKE_BACKEND_PORT_TAKEN_ONCE"):
+    # engine#2537: the first launch finds its port taken (another process bound it between serve's free_port() and this
+    # bind), as socketserver reports it; the marker makes the relaunch on serve's fresh port bind normally.
+    marker = os.environ["FAKE_BACKEND_PORT_TAKEN_ONCE"]
+    if not os.path.exists(marker):
+        open(marker, "w").close()
+        raise OSError(98, "Address already in use")
 if os.environ.get("FAKE_BACKEND_IMPOSTOR"):
     # A process serve did not start answers on the port instead: this one detaches a server
     # (writing its pid to $FAKE_BACKEND_IMPOSTOR) and stays alive without listening itself.

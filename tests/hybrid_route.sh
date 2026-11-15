@@ -177,6 +177,17 @@ signal.signal(signal.SIGTERM, term)
 time.sleep(30)
 PY
 chmod +x "$scratch/finishing_provider.py"
+# engine#2537: a backend whose port was taken after serve picked it (free_port() releases the port, the backend binds it a
+# moment later) is relaunched on a fresh port, and serve says why, instead of "backend 0 did not become ready".
+check "serve starts when the backend's first port is taken" \
+    'start "$scratch/t.log" FAKE_BACKEND_PORT_TAKEN_ONCE="$scratch/port-taken.marker"'
+check "serve names the taken port and relaunches" 'grep -q "could not bind port [0-9]* (address already in use.*relaunching on port [0-9]* (1 of 2)" "$scratch/t.log"'
+reply=$(curl -s "$api/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model": "hybrid-model", "messages": [{"role": "user", "content": "What is the capital of France?"}]}')
+check "the relaunched backend answers" '[[ "$reply" == *Paris* ]]'
+check "no did-not-become-ready for a taken port" '! grep -q "did not become ready" "$scratch/t.log"'
+stop
+
 check "serve starts with a provider that finishes after its deadline" \
     'start "$scratch/f.log" ONEBIT_HYBRID_PREFILL="$scratch/finishing_provider.py" ONEBIT_HYBRID_PREFILL_TIMEOUT_S=1'
 reply=$(curl -s "$api/v1/chat/completions" -H 'Content-Type: application/json' \

@@ -65,6 +65,41 @@ run() {   # $1 arm  $2 payload seconds  $3 inject fault (1/0)  $4 GPU_HOLD_FAULT
 
 echo 40000 > "$scratch/tctl"   # 40 C, in millidegrees
 
+# ── the TAKE-TIME guard (engine#2480), which had no automated arm until now ───────────────────────────────────────
+# It shipped with manual arms only, and the NPU spellings were missing from its regex although `npu-hold` execs this
+# script: an NPU ticket's only look at the log before work starts is this check, so `amdxdna` faults have to count.
+# Each arm runs the real hold against a klog file with a 10-minute take-time window and the during-hold watch OFF, so
+# what is being tested is the refusal and nothing else.
+take_run() {   # $1 arm name  $2 the kernel-log line (or "clean")
+    local q=$scratch/tq$1; mkdir -p "$q"; rm -f "$scratch/TTOKEN$1"
+    : > "$scratch/tklog$1"
+    printf '%s\n' "kernel: amdgpu 0000:c5:00.0: [drm] Initialized" > "$scratch/tklog$1"
+    [ "$2" = clean ] || printf '%s\n' "$2" >> "$scratch/tklog$1"
+    env GPU_HOLD_KLOG_FILE="$scratch/tklog$1" GPU_QUEUE_DIR="$q" GPU_TOKEN_FILE="$scratch/TTOKEN$1" \
+        GPU_HOLD_LOG="$scratch/tlog$1" GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 \
+        GPU_HOLD_RESET_WINDOW_MIN=10 GPU_HOLD_FAULT_ABORT=0 GPU_HOLD_TCTL_START=100 \
+        GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x" \
+        timeout 60 "$hold" -t 1 -l taketest$1 -- true > /dev/null 2>&1
+    trc=$?
+    [ -e "$scratch/TTOKEN$1" ] && ttok=held || ttok=released
+}
+
+take_run amdgpu "kernel: amdgpu 0000:c5:00.0: [drm] *ERROR* amdgpu: GPU reset begin!"
+[ "$trc" = 78 ] || { echo "FAIL take-time: an amdgpu reset -> rc $trc, want 78"; fail=1; }
+[ "$ttok" = released ] || { echo "FAIL take-time: the token was still held after a refusal"; fail=1; }
+
+# the NPU spelling: this is the line the rules say to stop for, and npu-hold has no other take-time check
+take_run npu "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* command timeout: opcode 0x2"
+[ "$trc" = 78 ] || { echo "FAIL take-time: an amdxdna command timeout -> rc $trc, want 78 (the NPU rule)"; fail=1; }
+[ "$ttok" = released ] || { echo "FAIL take-time: the token was still held after an NPU refusal"; fail=1; }
+
+take_run powercycle "kernel: amdxdna 0000:c6:00.1: [drm] power-cycle"
+[ "$trc" = 78 ] || { echo "FAIL take-time: an amdxdna power-cycle -> rc $trc, want 78"; fail=1; }
+
+take_run clean clean
+[ "$trc" = 0 ] || { echo "FAIL take-time: a clean log -> rc $trc, want 0 (a healthy hold must still run)"; fail=1; }
+
+
 # arm 1: the fault fires
 run 1 600 1 1
 e1=$elapsed

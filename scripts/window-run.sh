@@ -69,15 +69,20 @@ self_test() {
     local fail=0
     chk() { local label=$1 got=$2 want=$3; if [ "$got" = "$want" ]; then echo "ok   $label"; else echo "FAIL $label (got $got, want $want)"; fail=$((fail+1)); fi; }
     mkdir -p "${WR_TMPDIR:-$HOME/.cache}"; tmp=$(mktemp -d "${WR_TMPDIR:-$HOME/.cache}/window-run-test.XXXXXX"); trap 'rm -rf "$tmp"' RETURN
-    # 0. THE RESTART PROBE READS READINESS, NOT THE MODEL LIST. No device is touched here, so this arm reads the
-    # artifact the gate ships: /v1/models is a static registry listing that answers 200 while the weights load
-    # (app/serve.cpp:1909), so a window would self-report a live LLM that cannot answer yet (measured 2026-11-15:
-    # /v1/health went 503 -> 200 across a real restart while /v1/models was already 200).
+    # 0. THE RESTART PROBE ASKS FOR A COMPLETION. No device is touched here, so this arm reads the artifact the
+    # gate ships. /v1/models is a static registry listing that answers 200 while the weights load (app/serve.cpp
+    # :1909) -- a false green; /v1/health read 503 twice while the service was serving (2026-11-15 07:09Z,
+    # 07:15Z) -- a false red. A 1-token completion is the only probe that cannot be right while the LLM is
+    # unusable, and it is what the caller needs anyway.
     local me; me=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${BASH_SOURCE[0]##*/}   # WR_SELF is exported later, not yet here
     # The patterns carry cu[r]l rather than curl so that this arm's OWN text cannot satisfy them: a "/v1/health" count
     # that includes the line asserting it is an arm that can pass for the wrong reason.
-    chk "the restart probe is /v1/health" "$(grep -c 'cu[r]l.*8090/v1/health' "$me")" 1
-    chk "  ... and never the static model list" "$(grep -c 'cu[r]l.*8090/v1/models' "$me")" 0
+    # The pattern spells the digit as a class so that this arm's own text cannot satisfy it.
+    # The patterns spell one letter as a class so that the arm's own text cannot satisfy it, and they assert the
+    # URL the probe hits -- a payload-only arm was verified vacuous: pointing the probe back at /v1/models left
+    # every arm green (mutation, 2026-11-15).
+    chk "the restart probe hits /v1/chat/completions" "$(grep -c '8090/v1/chat/completio[n]s' "$me")" 1
+    chk "  ... and never the static model list" "$(grep -c '8090/v1/model[s]' "$me")" 0
     # 1. a duration outside 1..15 is refused, with the reason
     out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 0 -l x -c true 2>&1); rc=$?
     chk "a zero-minute window is refused" "$rc" 2
@@ -340,7 +345,14 @@ restore() {
       # child is dead (app/serve.cpp:1892). Measured 2026-11-15: /v1/health went 503 -> 200 across a real
       # restart while /v1/models was already 200. The engine's own child poll uses /health first for the
       # same reason (app/serve.cpp:694).
-      code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/v1/health 2>/dev/null || true)
+      # A TINY COMPLETION, not a status endpoint. /v1/health is a readiness signal, but on this payload it also
+      # read 503 while the service was serving (measured 2026-11-15 07:09Z and 07:15Z, then 200 on five consecutive
+      # samples with a completion in between), so a status-only probe trades a false GREEN for a false RED -- and a
+      # false 69 is how a lane learns to ignore 69. A 1-token completion is what the caller needs, so it is what the
+      # check asks for: slower than a status code, and the only probe that cannot be right while the LLM is unusable.
+      code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+                 -d '{"model":"qwen3-coder","messages":[{"role":"user","content":"ok"}],"max_tokens":1,"temperature":0}' \
+                 http://127.0.0.1:8090/v1/chat/completions 2>/dev/null || true)
       [ "$code" = 200 ] && break; sleep 3
     done
     _state=$(systemctl --user is-active coder-llm 2>/dev/null)

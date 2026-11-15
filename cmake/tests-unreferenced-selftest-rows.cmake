@@ -24,3 +24,8 @@ add_python_test(gsm8k_eval_self ${CMAKE_SOURCE_DIR}/tools/gsm8k_eval.py --selfte
 add_python_test(mtp_depth_pool_self ${CMAKE_SOURCE_DIR}/tools/mtp_depth_pool.py --selftest)
 add_python_test(q4nx_diff_self ${CMAKE_SOURCE_DIR}/tools/q4nx_diff.py --self-test)
 add_python_test(seal_manifest_self ${CMAKE_SOURCE_DIR}/tools/seal_manifest.py --self-test)
+
+# engine#2478: the census that turns the NVMe IO_PAGE_FAULT question into a command (same address set across boots =
+# one stale translation; disjoint = re-allocation behind a live descriptor). Its arms are synthetic journals, so the
+# row runs anywhere -- the device is only needed for the input, never for the check.
+add_python_test(iommu_fault_census ${CMAKE_SOURCE_DIR}/tools/diag/iommu_fault_census.py --self-test)

@@ -329,16 +329,28 @@ What serve did on the request path is the backend's own on this route:
 - **Warm-up.** serve sends a backend two synthetic requests once it is ready (HRX only): a chat
   request (a 360-token prompt, 8 tokens, temperature 0, `cache_prompt` off), so the first client
   request does not pay HRX's one-time per-shape program build (#492), and a 16-token `/completion`
-  prompt (`" a"` x 16, `n_predict` 0), below. On this route the plan carries them as
+  prompt (`" a"` x 16, `n_predict` 0), below. A backend that speculates (`--mtp`, a model's own MTP head,
+  `--dflash`) gets a third: the same 16-token prompt with `n_predict` 2 (**Why the 2-token request**, below). On this route the plan carries them as
   `"warmups": [{"path", "body"}, ...]` (and `"warmup"`, the first one, for an older lemond), on `hrx`
   chat plans only; Lemonade's onebit recipe sends them in order after `/health` answers and before it
   marks the model loaded. `ONEBIT_NO_WARMUP=1` in lemond's environment leaves them out of the plan, as
-  it turns serve's own warm-up off. `ONEBIT_WARMUP=long|short|none` selects *which* of the two, in
+  it turns serve's own warm-up off. `ONEBIT_WARMUP=long|short|spec|none` selects *which* of them, in
   serve's own environment and in the plan alike (`long` = the chat request, `short` = the 16-token
-  completion, `none` = neither; unset or `both` is the shipped pair, and an unrecognised value keeps
-  it). The two are not interchangeable — the first samples, the second does not — so when a model
+  completion, `spec` = the 2-token completion, sent only when the backend speculates, `none` = none
+  of them; unset or `both` is the shipped set, and an unrecognised value keeps it). The two are not interchangeable — the first samples, the second does not — so when a model
   cannot survive one of them, this is the difference between one load per hypothesis and a rebuild
   (engine#1539).
+
+  **Why the 2-token request.** A speculating llama-server decodes the last token of a request without a
+  draft (`get_n_draft_max()` is `n_remaining - 1` = 0 there), so that one step runs the plain one-token
+  decode program. The first time that program runs, ggml-hrx builds the host layout it reads for any
+  weight the verify pass reads in another layout. On Qwen3.8-27B Q4_K_M with its own MTP head that is the
+  mixed layers' Q6_K ffn weights: 76 `HRX weight residency` lines, ~5.6 GB, **10.4 s**. Without this
+  request the cost lands in whichever client request first ends on such a step, and whether a request
+  does depends on its acceptance pattern. With `n_predict` 2 the second token is that step, so the
+  build happens at load. Measured (DECODE-BW, 2026-11-15): the duplicates appeared during this request,
+  and the next `perf.py` pass decoded 23.55 tok/s instead of absorbing the 10 s. The plain pair is
+  unchanged: the second request still does not sample (engine#1539).
 
   **Why the 16-token request.** The first batch of 13 to 20 tokens after a load takes ggml-hrx's
   small-batch matmul kernels, which read the weights in a layout ggml-hrx builds on the host the first

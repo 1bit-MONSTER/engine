@@ -316,7 +316,16 @@ while [ "$state" = queued ]; do
                     _resets=$(printf '%s\n' "$_klog" | grep -ciE "$_reset_re")
                     if [ "${_resets:-0}" -gt 0 ]; then
                         rm -f "$TOKEN"; state=done
-                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault line(s) in the last ${_reset_window} min - the ticket is released unheld. Inspect the kernel log, then retry"
+                        # HOW OLD is the newest one? "in the last 10 min" cannot tell a wedged device from another lane's
+                        # teardown nine minutes ago, and on 2026-11-15 that distinction mattered: every amdxdna fault that
+                        # refused a ticket arrived 1.5-8.5 min AFTER the previous ticket released the NPU, i.e. nothing was
+                        # running when it was logged (engine#2542). The age is the datum a reader needs; the epoch comes
+                        # from a second query so the printed lines keep their human-readable form.
+                        _newest=$(journalctl -k --since "-${_reset_window} min" --no-pager -o short-unix -q 2> /dev/null |
+                                  grep -iE "$_reset_re" | tail -1 | awk '{print int($1)}')
+                        _age=""
+                        case "${_newest:-}" in ''|*[!0-9]*) ;; *) _age=", newest $(( $(date +%s) - _newest ))s ago" ;; esac
+                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault line(s) in the last ${_reset_window} min${_age} - the ticket is released unheld. Inspect the kernel log, then retry"
                         printf '%s\n' "$_klog" | grep -iE "$_reset_re" | tail -3
                         exit 78
                     fi

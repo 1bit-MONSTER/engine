@@ -263,6 +263,59 @@ void load_init_i64(const OnnxGraphInfo& g, const OnnxInit& t, std::vector<int64_
     if (mapped != nullptr) unmap_file(mapped, size);
 }
 
+// engine#1783: the host GEMM's four-row inner loop, compiled twice and picked at run time. The box's own
+// measurement (whisper-small encoder, 4 threads) is 1.269x min-over-repeats with AVX2+FMA over the SSE2
+// baseline -- the loop is a plain `rr[j] += av * br[j]` reduction, so SSE2 gives 4-wide and AVX2+FMA 8-wide
+// fused. It cannot be a build-wide flag: the compiler is chosen per repo, but the ISA is per box, and the
+// appliance must keep running on whatever it is installed on (engine#2403).  ONEBIT_AUDIO_AVX2=0 forces the
+// baseline, =1 requires AVX2+FMA (and fails loudly if the box has none), unset asks the CPU.
+#define ONEBIT_HOST_GEMM_4ROWS_BODY \
+    for (int64_t k = 0; k < K; ++k) { \
+        const float v0 = a0[size_t(k)], v1 = a0[size_t(K) + size_t(k)]; \
+        const float v2 = a0[size_t(2 * K) + size_t(k)], v3 = a0[size_t(3 * K) + size_t(k)]; \
+        if ((v0 == 0.0f) && (v1 == 0.0f) && (v2 == 0.0f) && (v3 == 0.0f)) continue; \
+        const float* br = bpp + size_t(k) * size_t(N); \
+        for (int64_t j = 0; j < N; ++j) { \
+            const float bv = br[j]; \
+            r0[j] += v0 * bv; \
+            r0[N + j] += v1 * bv; \
+            r0[2 * N + j] += v2 * bv; \
+            r0[3 * N + j] += v3 * bv; \
+        } \
+    }
+
+void host_gemm_4rows_base(const float* a0, const float* bpp, float* r0, int64_t K, int64_t N) {
+    ONEBIT_HOST_GEMM_4ROWS_BODY
+}
+
+#if defined(__x86_64__) && defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC target("avx2,fma")
+__attribute__((noinline)) void host_gemm_4rows_avx2(const float* a0, const float* bpp, float* r0, int64_t K, int64_t N) {
+    ONEBIT_HOST_GEMM_4ROWS_BODY
+}
+#pragma GCC pop_options
+#endif
+
+// The four-row body, if the box can run the fast one. Read once: the answer cannot change inside a process.
+void (*host_gemm_4rows())(const float*, const float*, float*, int64_t, int64_t) {
+#if defined(__x86_64__) && defined(__GNUC__)
+    static void (*pick)(const float*, const float*, float*, int64_t, int64_t) = [] {
+        const char* e = std::getenv("ONEBIT_AUDIO_AVX2");
+        const bool fast = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+        if (e != nullptr && e[0] == '1' && e[1] == '\0') {
+            if (!fast) std::fprintf(stderr, "[audio] ONEBIT_AUDIO_AVX2=1 but this CPU has no AVX2+FMA: keeping the baseline\n");
+            return fast ? &host_gemm_4rows_avx2 : &host_gemm_4rows_base;
+        }
+        if (e != nullptr && e[0] == '0' && e[1] == '\0') return &host_gemm_4rows_base;
+        return fast ? &host_gemm_4rows_avx2 : &host_gemm_4rows_base;
+    }();
+    return pick;
+#else
+    return &host_gemm_4rows_base;
+#endif
+}
+
 }  // namespace
 
 namespace {
@@ -446,19 +499,7 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                     float* r0 = r.data.data() + bi * size_t(M * N) + size_t(i0) * size_t(N);
                     if (i1 - i0 == 4) {
                         const float* a0 = ap + size_t(i0) * size_t(K);
-                        for (int64_t k = 0; k < K; ++k) {
-                            const float v0 = a0[size_t(k)], v1 = a0[size_t(K) + size_t(k)];
-                            const float v2 = a0[size_t(2 * K) + size_t(k)], v3 = a0[size_t(3 * K) + size_t(k)];
-                            if ((v0 == 0.0f) && (v1 == 0.0f) && (v2 == 0.0f) && (v3 == 0.0f)) continue;
-                            const float* br = bpp + size_t(k) * size_t(N);
-                            for (int64_t j = 0; j < N; ++j) {
-                                const float bv = br[j];
-                                r0[j] += v0 * bv;
-                                r0[N + j] += v1 * bv;
-                                r0[2 * N + j] += v2 * bv;
-                                r0[3 * N + j] += v3 * bv;
-                            }
-                        }
+                        host_gemm_4rows()(a0, bpp, r0, K, N);   // engine#1783: baseline or AVX2+FMA, picked once
                     } else {
                         for (int64_t i = i0; i < i1; ++i) {
                             float* rr = r0 + size_t(i - i0) * size_t(N);

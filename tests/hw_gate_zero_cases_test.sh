@@ -40,10 +40,21 @@ for b in llama-server test-backend-ops llama-perplexity; do
     } > "$scratch/bin/$b"
     chmod +x "$scratch/bin/$b"
 done
+# thermal-run's contract is "run the rest of the argv"; /bin/true exits 0 and the step then reports nothing at all,
+# which is how my first version of this arm turned a passing test into rc 1 with no rows.
+printf '#!/bin/sh\nexec "$@"\n' > "$scratch/thermal.sh"
+chmod +x "$scratch/thermal.sh"
 mkdir -p "$scratch/run"
+# Every input this arm depends on is pinned, and each line is a hang that was measured on CI (e2e build 43752965195,
+# 120.02 s, rc 124): the step loop retries rc 76 up to HW_GATE_MEM_RETRIES times, and a runner whose MemAvailable sits
+# under the 12 GB floor never reaches the zero-case path at all -- the arm then reported rc 124 instead of the verdict
+# it was written for. thermal-run is not on a CI runner either, so a real one would have been 127. The queue is not
+# what this test is about: HW_GATE_TOKEN=none says so, and the memory floor is 1 GB so it cannot wait.
 env HW_GATE_MODELS="$scratch" HW_GATE_TOKEN=none HW_GATE_PRIVATE=0 HW_GATE_COOL_C=1000 \
+    HW_GATE_MEM_FLOOR=1 HW_GATE_MEM_RETRIES=0 HW_GATE_THERMAL="$scratch/thermal.sh" \
+    HW_GATE_CODER_URL=http://127.0.0.1:9 HW_GATE_LOCK="$scratch/npu.lock" \
     HW_GATE_STORE="$scratch/run/store" HW_GATE_OUT="$scratch/run/out" GITHUB_STEP_SUMMARY= \
-    timeout 120 "$root/scripts/hw-gate.sh" --phases ops --bin "$scratch/bin" > "$scratch/run/stdout" 2>&1
+    timeout 90 "$root/scripts/hw-gate.sh" --phases ops --bin "$scratch/bin" > "$scratch/run/stdout" 2>&1
 rc=$?
 out=$scratch/run/stdout
 
@@ -51,5 +62,11 @@ grep -q '| ops | SKIP |' "$out" || { echo "FAIL: a zero-case ops run did not pro
 grep -q 'INCOMPLETE' "$out" || { echo "FAIL: a run that tested nothing did not read as INCOMPLETE"; fail=1; }
 grep -q '## HRX hardware gate: PASS' "$out" && { echo "FAIL: a run that tested nothing read as PASS"; fail=1; }
 [ "$rc" = 2 ] || { echo "FAIL: rc $rc for a zero-case phase, want 2 (infra, not green)"; fail=1; }
+# A fixture that fails without saying why costs a CI cycle each time (measured: 8 minutes to learn "rc 124"). The gate's
+# own output is what names the cause, so print it whenever an arm failed.
+if [ "$fail" != 0 ]; then
+    echo "--- the gate's output follows ---"
+    tail -40 "$out" 2> /dev/null || echo "(no output file at $out)"
+fi
 [ "$fail" = 0 ] && echo "ok   a zero-case ops phase reads INCOMPLETE and exits 2, not PASS"
 [ "$fail" = 0 ]

@@ -72,7 +72,10 @@
 #        (a 137 once the window has been open for the max hold, timed from the window's own start). Planned, not a crash
 #   130  a stop was requested (gpu-hold's stop stamp) and the window refused to die; gpu-hold released the token anyway
 #   137  something KILLed the window or the server BEFORE the max hold (the OOM killer, a manual kill -9): a failure
-#   78   gpu-hold ended the hold on a GPU/NPU fault in the kernel log, or refused the ticket; backed off before exiting
+#   78   one code from gpu-hold for two causes, told apart in the journal line by whether the window had opened:
+#        "fault during the window after Ns" = the kernel logged a GPU/NPU fault while it served (report it);
+#        "ticket refused before the window" = a recent fault/reset line made gpu-hold refuse the grant (#2480;
+#        nothing ran). Either way it backs off CODER_LLM_FAULT_BACKOFF_S before exiting
 #   75   the queue never came round within CODER_LLM_QUEUE_WAIT_S
 #   any other: the server's own exit status (it exited by itself)
 set -u
@@ -211,17 +214,24 @@ rc=$?
 # a KILL once the window has been open for the max hold is still the max hold (as 143 is, which gpu-hold maps to
 # 124); timed from the window's own start, so a long queue wait followed by some other KILL is not relabelled
 opened=$(cat "$CODER_LLM_WINDOW_STAMP" 2> /dev/null); rm -f "$CODER_LLM_WINDOW_STAMP"
+# printed on every outcome line, so the 124/137 boundary at the max hold can be checked from the log, not trusted
+if [ -n "$opened" ]; then open_for="open $(( $(date +%s) - opened ))s of ${MAX_HOLD} min"; else open_for="the window never opened"; fi
 if [ "$rc" = 137 ] && [ -n "$opened" ] && awk -v e=$(( $(date +%s) - opened )) -v m="$MAX_HOLD" 'BEGIN { exit !(e >= m * 60) }'; then
-    log "the window was KILLed after the max hold (rc 137; raise CODER_LLM_STOP_WAIT_S if the server needs longer to exit)"
+    log "the window was KILLed after the max hold (rc 137, $open_for; raise CODER_LLM_STOP_WAIT_S if the server needs longer to exit)"
     rc=124
 fi
 case "$rc" in
-    0)   log "window closed (idle)" ;;
-    124) log "window closed (max hold ${MAX_HOLD} min); re-queueing" ;;
-    130) log "window stop requested and refused; gpu-hold released the token anyway" ;;
-    137) log "window KILLed before its max hold (rc 137: the OOM killer or a kill -9, not a planned close)" ;;
+    0)   log "window closed (idle; $open_for)" ;;
+    124) log "window closed (max hold ${MAX_HOLD} min; $open_for); re-queueing" ;;
+    130) log "window stop requested and refused ($open_for); gpu-hold released the token anyway" ;;
+    137) log "window KILLed before its max hold (rc 137, $open_for: the OOM killer or a kill -9, not a planned close)" ;;
     75)  log "the queue never came round in ${QUEUE_WAIT}s" ;;
-    78)  log "gpu-hold rc 78 (a GPU fault in the kernel log, or a refused ticket): backing off ${BACKOFF}s"; sleep "$BACKOFF" ;;
-    *)   log "window ended rc $rc" ;;
+    78)  if [ -n "$opened" ]; then
+             log "gpu-hold rc 78: fault during the window after $(( $(date +%s) - opened ))s (a GPU/NPU fault line in the kernel log; report it): backing off ${BACKOFF}s"
+         else
+             log "gpu-hold rc 78: ticket refused before the window (a recent fault/reset line in the kernel log; nothing ran): backing off ${BACKOFF}s"
+         fi
+         sleep "$BACKOFF" ;;
+    *)   log "window ended rc $rc ($open_for)" ;;
 esac
 exit "$rc"

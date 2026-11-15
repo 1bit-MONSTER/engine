@@ -103,6 +103,22 @@ def script_invariants():
     npu = src.find("if has npu;")
     if npu < 0 or "flock" not in src[npu:]:
         bad.append("the NPU phase must still hold ~/npu.lock: an NPU dispatch must not overlap another")
+    # engine#2501: an absent INPUT is a SKIP row, not a FAIL row. The exit code already said so
+    # (infra=1 -> exit 2), but the row is what a human reads, and it said FAIL on something nobody can
+    # fix -- so every PR went red on main's own pin. A `sed` over all three FAILs would also flip the
+    # KLD row, and that one is a RESULT: asserted below to stay FAIL.
+    for absent in ('"model missing', '"text missing'):
+        i = src.find(absent)
+        if i < 0:                       # renamed or removed: fail rather than pass over nothing
+            bad.append(f"no {absent} row found: the absent-input rows must exist and be SKIP")
+            continue
+        line = src[src.rfind(chr(10), 0, i) + 1:src.find(chr(10), i)]
+        if " SKIP " not in line:
+            bad.append(f"{absent} must be SKIP, not FAIL: an absent input is not a result (engine#2501)")
+        if "infra=1" not in line:       # SKIP alone would let "ran nothing" look like "all passed"
+            bad.append(f"{absent} must keep infra=1, so a run with no inputs still exits 2")
+    if src.find('result "kld $name" FAIL') < 0:
+        bad.append("the KLD mismatch row must stay FAIL: a verify mismatch is a result, not an absent input")
     return bad
 
 

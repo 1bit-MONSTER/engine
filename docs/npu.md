@@ -2430,6 +2430,13 @@ route loads and a captured `--device npu` run stands behind it; the regenerated 
 GGUF-on-NPU forward), while every D3-* pack in this body declares the dense `qwen3_5` family, so
 the two are not the same answer and the registry keeps them apart.
 
+How a pack's line is marked, as `census_watch.flm_line()` decides it: a class the registry does not map is `!! NEW FLM`
+unless `registry/significant.json` reviews it as not-an-alias or `flm_answers.json` answers it (then `. FLM`); a class
+mapped for a backend other than `npu` is `!! NPU FLM` unless `flm_answers.json` answers it (then `. NPU FLM`), and
+`significant.json` does not quiet it; a family the route serves is `+ FLM`. So a reviewed class that the registry later
+maps for hrx only starts alerting again until it gets an answer here (engine#2528: `DFlash2DraftModel`,
+`Lfm3ForCausalLM`).
+
 The answers are also machine-readable, in `registry/flm_answers.json`, because CI keeps no watcher state: every scheduled
 run sees the whole org as new, and before that file each family answered above printed `!! NPU FLM` again and re-filed
 the census issue the day after it closed (engine#2171; the 2026-11-11 run alerted on 31 packs, every one already

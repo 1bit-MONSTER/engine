@@ -5194,6 +5194,37 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     bool have_final_norm = false;
     for (const auto& t : onnx.tensors)
         if (t.name == "model.norm.weight" || t.name == "model.final_layernorm.weight") have_final_norm = true;
+    // A final norm can also sit at a PSEUDO LAYER INDEX instead of model scope: phi-4's exporter attaches it to
+    // `model.layers.<num_hidden_layers>/final_norm_layernorm` (SkipSimplifiedLayerNormalization), which is neither of the
+    // two names above nor the name the container reads. Exact-name detection therefore wrote a UNIT gain OVER a pack
+    // that carries a learned one -- measured on amd/phi-4_rai_1.9.0_npu: every prompt answered " void void void ..."
+    // with an input-independent output (engine#2561). The pack's tensor is already in this container under its own name
+    // (the auxiliary copy above keeps anything matching `layernorm.weight`), so the fix is an alias to
+    // `model.norm.weight`, not another copy of the unit gain.
+    const OnnxTensor* pack_final = nullptr;
+    if (!have_final_norm)
+        for (const auto& t : onnx.tensors) {
+            if (t.name.find("final_norm_layernorm.weight") != std::string::npos ||
+                t.name.find("final_layernorm.weight") != std::string::npos) {
+                pack_final = &t;
+                break;
+            }
+        }
+    if (pack_final != nullptr && p.dims.hidden > 0 && !pack_final->dims.empty()) {
+        uint64_t n = 1;
+        for (auto d : pack_final->dims) n *= uint64_t(d);
+        if (n == uint64_t(p.dims.hidden)) {
+            std::vector<int64_t> shape(pack_final->dims.begin(), pack_final->dims.end());
+            w.add("model.norm.weight", "BF16", shape,
+                  as_bf16(bytes_of(*pack_final, n * (pack_final->type == kF32 ? 4 : 2)), pack_final->type, size_t(n)));
+            ++r.tensors;
+            have_final_norm = true;
+            std::fprintf(stderr,
+                         "npu-pack: the final RMSNorm was at a pseudo layer (`%s`, not model scope); wrote it to "
+                         "model.norm.weight instead of a unit gain (engine#2561)\n",
+                         pack_final->name.c_str());
+        }
+    }
     if (!have_final_norm && p.dims.hidden > 0) {
         std::vector<uint8_t> ones(size_t(p.dims.hidden) * 2);
         for (int64_t i = 0; i < p.dims.hidden; ++i) {

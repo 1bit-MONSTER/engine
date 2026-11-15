@@ -29,7 +29,10 @@
 #   E a lane that queues during a window gets the GPU before the next coder-llm window (FIFO; the restart re-queues);
 #   F a failing gh (the pr-agent-run fallback) is logged once per wait with its reason, and opens no window;
 #   G the default queue wait is long enough to keep the ticket's place; H a grant whose demand went stale releases
-#     without starting the server.
+#     without starting the server;
+#   I a server that needs 12 s to exit after TERM at the max hold: the window's own kill grace (not gpu-hold's 10 s
+#     default) lets it exit cleanly, rc 124; with a grace too short for it, gpu-hold's KILL (rc 137) is still reported
+#     as the max hold, rc 124 (the first live window, 11-15 10:56Z, ended rc 137).
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)   # the defaults work from any directory, not only the repo root
 tick=${1:-$root/scripts/coder-llm-ticketed}
@@ -160,9 +163,34 @@ wait "$lh"
 grep -q "ticket granted with no fresh demand" "$scratch/h.log" || { echo "FAIL H: the stale grant did not say it released"; fail=1; }
 [ -s "$scratch/server.pid" ] && { echo "FAIL H: the server was started for a stale grant"; fail=1; }
 
+# ---- I: a slow-exiting server at the max hold ---------------------------------------------------------------------
+cat > "$scratch/slow" <<SLOW
+#!/bin/bash
+# the fake behind a TERM handler that takes 12 s, as the 30B HRX server's teardown did
+trap 'trap "" TERM; sleep 12; echo clean > "$scratch/slow.exit"; kill \$p 2> /dev/null; exit 0' TERM
+"$scratch/fake" & p=\$!
+while :; do sleep 1 & wait \$!; done
+SLOW
+chmod +x "$scratch/slow"
+nograce=(); for e in "${envs[@]}"; do case "$e" in GPU_HOLD_KILL_GRACE=*) ;; *) nograce+=("$e") ;; esac; done
+echo busy > "$scratch/state"; rm -f "$scratch/server.pid" "$scratch/slow.exit"; touch "$scratch/demand"
+env "${nograce[@]}" CODER_LLM_STOP_WAIT_S=20 CODER_LLM_IDLE_S=60 CODER_LLM_MAX_HOLD_MIN=0.1 timeout 120 "$tick" -- "$scratch/slow" > "$scratch/i1.log" 2>&1
+rc=$?
+[ "$rc" = 124 ] || { echo "FAIL I: rc $rc for a slow-exiting server at the max hold, want 124"; fail=1; }
+[ -e "$scratch/slow.exit" ] || { echo "FAIL I: the slow server was KILLed before it could exit (the window's kill grace did not reach gpu-hold)"; fail=1; }
+grep -q "window closed (max hold" "$scratch/i1.log" || { echo "FAIL I: the log does not say max hold"; fail=1; }
+[ -e "$scratch/TOKEN" ] && { echo "FAIL I: the token is still held"; fail=1; }
+echo busy > "$scratch/state"; rm -f "$scratch/server.pid" "$scratch/slow.exit"; touch "$scratch/demand"
+env "${envs[@]}" CODER_LLM_IDLE_S=60 CODER_LLM_MAX_HOLD_MIN=0.1 timeout 120 "$tick" -- "$scratch/slow" > "$scratch/i2.log" 2>&1
+rc=$?
+[ "$rc" = 124 ] || { echo "FAIL I: rc $rc when gpu-hold KILLs the window after the max hold, want 124"; fail=1; }
+grep -q "KILLed after the max hold" "$scratch/i2.log" || { echo "FAIL I: the KILL after the max hold was not reported as such"; fail=1; }
+[ -e "$scratch/TOKEN" ] && { echo "FAIL I: the token is still held after the KILL"; fail=1; }
+pkill -9 -f "$scratch/slow" 2> /dev/null
+
 # ---- G: the default queue wait keeps the ticket's place on a busy box (a give-up re-queues at the back) ------------
 sed -n 's/^QUEUE_WAIT=\${CODER_LLM_QUEUE_WAIT_S:-\([0-9]*\)}$/\1/p' "$tick" > "$scratch/qw"
 [ "$(cat "$scratch/qw")" -ge 14400 ] 2> /dev/null || { echo "FAIL G: default queue wait $(cat "$scratch/qw")s; under 4 h a busy queue makes it re-queue at the back and starve"; fail=1; }
 
-[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load)"
+[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load; a slow-exiting server gets its grace, a KILL after the max hold is 124)"
 exit "$fail"

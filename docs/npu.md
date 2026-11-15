@@ -3345,7 +3345,7 @@ CodeLlama speed, tau 0 vs 20, A B A B in one ticket:
 - **Decode (64 tok):** 0.997 / 1.046 tok/s vs 1.030 / 1.001 tok/s, unchanged.
 - **Prefill (520 tok, ms, lower is better):** 14,260 / 14,400 vs 15,165 / 17,244, so **tau 20 costs 6-20 % more prefill time**. The two tau-20 samples differ from each other by 13.7 %, so treat the upper end as noise. At tau 20 more prefill rows split, and each new channel costs one column-block gather on first use.
 
-The trade: 6-20 % more prefill buys EOS correctness on 1.7.1 hybrid Llama-2, where host f32 gives EOS and tau 40 does not. The default lives in one place, `kActOutlierTauDefault` in `npu/forward/include/act_outliers.h`, and `act_outliers_test` asserts it (unset -> 20, `0` -> off).
+The trade: 6-20 % more prefill buys EOS correctness on 1.7.1 hybrid Llama-2, where host f32 gives EOS and tau 40 does not. The default lives in one place, `kActOutlierTauDefault` in `npu/forward/include/act_outliers.h`, and `act_outliers_test` asserts it. The env contract: `NPU_ACT_OUTLIER_TAU` unset means 20, `0` turns the split off, and any other value is used as given. `NPU_ACT_OUTLIER_KMAX` unset means 16, and a value below 1 is clamped to 1. No model in the table above does better at 40 than at 20 (Qwen2.5-3B 58/64 at both, Qwen2.5-0.5B 52 vs 51, SmolLM2 54 vs 53), so 20 costs the others prefill time only, not correctness.
 
 The older table below was measured before gate/up were covered and is kept as it was measured.
 

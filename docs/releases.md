@@ -21,7 +21,8 @@ Lemonade and the engine embedded, our MOK-signed kernel, headless by default and
 entry): [os/README.md](../os/README.md), [docs/os-v3.md](os-v3.md). The candidates below shipped the
 BusyBox `os/mini` image under the name `1bit-os-<tag>.img.zst`; that image is the CI/VM target now, not
 1bit OS. **Nothing here is published**: v2026.44 is a draft, and the next release carries the Puppy
-appliance.
+appliance. Every release is **held until every open engine issue is fixed** (owner, 2026-11-11), so no
+release date is set.
 
 The first release, **v2026.44**, is a **draft**: it is not published, and nothing is tagged — see
 [v2026.44](#v202644-1-nov-2026--the-first-release-a-draft) for why, and for the candidate that replaces the one it was

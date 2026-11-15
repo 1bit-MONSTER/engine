@@ -61,6 +61,12 @@
 #include <cstring>
 #include <vector>
 
+#if defined(_OPENMP)
+#define Q4NX_W4G32_PAR _Pragma("omp parallel for schedule(static)")
+#else
+#define Q4NX_W4G32_PAR
+#endif
+
 namespace q4nx_w4g32 {
 
 constexpr int KT = 128;            // K rows per tile (one kernel call)
@@ -139,41 +145,70 @@ inline bool factor_group(const float* B, size_t stride, int8_t* code, float* sca
 
 inline bool factor(const float* B, int K, int N, int8_t* code, float* scale) {
     if (!B || !code || !scale || K % GROUP || N <= 0) return false;
-    for (int g = 0; g < K / GROUP; g++)
+    int bad = 0;
+    Q4NX_W4G32_PAR
+    for (int g = 0; g < K / GROUP; g++) {
+        int b = 0;
         for (int n = 0; n < N; n++)
-            if (!factor_group(B + (size_t)g * GROUP * N + n, (size_t)N, code + (size_t)g * GROUP * N + n,
-                              scale + (size_t)g * N + n))
-                return false;
-    return true;
+            b |= !factor_group(B + (size_t)g * GROUP * N + n, (size_t)N, code + (size_t)g * GROUP * N + n,
+                               scale + (size_t)g * N + n);
+        if (b) {
+#if defined(_OPENMP)
+#pragma omp atomic write
+#endif
+            bad = 1;
+        }
+    }
+    return bad == 0;
 }
 
 // Build the image and the column scales from code[k][n] (in [-8, 7]) and scale[g][n].  `img` must hold
 // w_bytes(K, N).  Returns false on a bad geometry or a code out of range.
 inline bool pack(const int8_t* code, const float* scale, int K, int N, uint8_t* img, float* cs) {
     if (!fits(K, N) || !code || !scale || !img || !cs) return false;
-    const int mm = magmax(K);
-    std::memset(img, 0, w_bytes(K, N));
+    const int mm = magmax(K), G = K / GROUP, KTn = K / KT, NTn = N / NT;
+    Q4NX_W4G32_PAR
     for (int n = 0; n < N; n++) {
         float amax = 0.0f;
-        for (int g = 0; g < K / GROUP; g++) amax = std::fmax(amax, std::fabs(scale[(size_t)g * N + n]));
+        for (int g = 0; g < G; g++) amax = std::fmax(amax, std::fabs(scale[(size_t)g * N + n]));
         cs[n] = amax > 0.0f ? amax / (float)mm : 1.0f;
     }
-    for (int g = 0; g < K / GROUP; g++)
-        for (int n = 0; n < N; n++) {
-            long q = std::lrint(scale[(size_t)g * N + n] / cs[n]);
-            if (q > mm) q = mm;
-            if (q < -mm) q = -mm;
-            img[index(K, N, g * GROUP, n).mag] = (uint8_t)(int8_t)q;
+    int bad = 0;
+    // One tile per iteration: tile (nt, ki) owns bytes [(nt*KTn + ki) * TILE, +TILE), so iterations never share
+    // a byte and the image does not depend on the schedule.
+    Q4NX_W4G32_PAR
+    for (int t = 0; t < NTn * KTn; t++) {
+        const int nt = t / KTn, ki = t % KTn;
+        uint8_t* tile = img + (size_t)t * TILE;
+        std::memset(tile, 0, TILE);
+        int b = 0;
+        for (int g = 0; g < KT / GROUP; g++)
+            for (int nn = 0; nn < NT; nn++) {
+                const int n = nt * NT + nn;
+                long q = std::lrint(scale[(size_t)(ki * (KT / GROUP) + g) * N + n] / cs[n]);
+                if (q > mm) q = mm;
+                if (q < -mm) q = -mm;
+                tile[CODE_BYTES + (nn / 16 * 4 + g) * 16 + nn % 16] = (uint8_t)(int8_t)q;
+            }
+        for (int kk = 0; kk < KT; kk++) {
+            const int8_t* row = code + (size_t)(ki * KT + kk) * N + (size_t)nt * NT;
+            const int kb = kk / 16, r = kk % 16;
+            for (int nn = 0; nn < NT; nn++) {
+                const int c = row[nn];
+                b |= (c < -8 || c > 7);
+                const int e = r * 16 + nn % 16;
+                uint8_t& byte = tile[(kb * 8 + nn / 16) * 128 + e / 2];
+                byte |= (e & 1) ? (uint8_t)((c & 0x0F) << 4) : (uint8_t)(c & 0x0F);
+            }
         }
-    for (int k = 0; k < K; k++)
-        for (int n = 0; n < N; n++) {
-            const int c = code[(size_t)k * N + n];
-            if (c < -8 || c > 7) return false;
-            const offsets o = index(K, N, k, n);
-            const uint8_t nib = (uint8_t)(c & 0x0F);
-            img[o.code] = o.high ? (uint8_t)((img[o.code] & 0x0F) | (nib << 4)) : (uint8_t)((img[o.code] & 0xF0) | nib);
+        if (b) {
+#if defined(_OPENMP)
+#pragma omp atomic write
+#endif
+            bad = 1;
         }
-    return true;
+    }
+    return bad == 0;
 }
 
 // Read element (k, n) back as (code, mag).

@@ -175,6 +175,29 @@ TOOL_RUNNERS = RUNNERS + ("tests",)
 INVOCATION = re.compile(r"add_test|add_python_test|\bCOMMAND\b|\bpython3?\b|--self-test|\bbash\b")
 
 
+def _strip_line_comments(text):
+    """Drop `#...` to end of line before any depth walk, outside a quoted string.
+
+    The review of engine#2460 measured the need on the engine's own file: `CMakeLists.txt` has a comment containing an unclosed `(`
+    (line 2562, "# \"By name\" means a line CMake would execute -- include( at the start of a line …"), so the depth walk that counted
+    parentheses inside comments swallowed the remaining 51 lines into one statement. That statement starts with `#`, so `invokes()`
+    skipped it as a comment and **the tail of the file became invisible to the gate** -- exactly where rows get appended. Nothing
+    registered lived there yet, which is why it read green; the next row added would have been reported as unregistered while registered.
+    """
+    out = []
+    for line in text.splitlines():
+        quoted = False
+        cut = len(line)
+        for i, ch in enumerate(line):
+            if ch == '"':
+                quoted = not quoted
+            elif ch == "#" and not quoted:
+                cut = i
+                break
+        out.append(line[:cut])
+    return "\n".join(out)
+
+
 def _statements(text):
     """Logical statements: backslash continuations joined, and newlines inside parentheses collapsed.
 
@@ -182,6 +205,7 @@ def _statements(text):
     `COMMAND .../tool.py` onto separate lines with no backslash, so a line-at-a-time match reports four genuinely-registered
     scripts as unregistered.
     """
+    text = _strip_line_comments(text)
     text = re.sub(r"\\\n", " ", text)
     out, depth = [], 0
     for ch in text:
@@ -388,6 +412,13 @@ def self_test():
                    # continuation-wrapped, no backslash: the shape engine#2455's first scan mis-read on four real rows
                    "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\nadd_test(NAME helper_self\n  COMMAND bash scripts/helper.sh --self-test)\n"})
     cases.append(("...and a continuation-wrapped add_test DOES (the four false positives)", check(r), 0, None))
+
+    # the review's case: an unclosed '(' inside a COMMENT must not swallow the rows below it (measured on the engine's own file)
+    r = root_with({"tests/ok.sh": "#!/bin/sh\n",
+                   "scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
+                   "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n# note (unbalanced\n"
+                                      "add_test(NAME helper_self COMMAND bash scripts/helper.sh --self-test)\n"})
+    cases.append(("an unclosed ( in a comment does not hide the row after it", check(r), 0, None))
 
     # the invocation goes INSIDE the already-registered test: a new tests/*.sh would be drift for a different, correct reason
     r = root_with({"tests/ok.sh": "#!/bin/sh\npython3 scripts/helper.sh --self-test\n",

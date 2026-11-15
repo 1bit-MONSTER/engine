@@ -59,7 +59,12 @@ software IO TLB: mapped [mem 0x5927e000-0x5d27e000] (64MB)
 
 ## Test 1 — disable the HMB (no reboot, decides whether the buffer is the HMB at all)
 
+**`nvme-cli` is not installed on this host** (checked: `command -v nvme` → nothing), so the first command below is
+`apt install nvme-cli` on this box, not `nvme …`. Whoever takes this on should expect that step and not treat
+"command not found" as the test failing:
+
 ```bash
+sudo apt install nvme-cli                      # not present as of 11-15 08:1xZ
 nvme get-feature /dev/nvme0 -f 0x0d -H          # Host Memory Buffer: current preference
 nvme set-feature /dev/nvme0 -f 0x0d -v 0        # ask for no HMB
 journalctl -k -f | grep -c IO_PAGE_FAULT        # watch one burst interval (~2-5 min under load)
@@ -94,6 +99,8 @@ teardown/re-establish ordering bug on the NVMe side, and the next step is tracin
 ## Two traps this runbook exists to stop
 
 * **A count without a device split is not a measurement.** `distinct` exposes the mixing.
+* **A command is not a fact until you check the box has it.** This page's first draft opened with `nvme get-feature`,
+  and `nvme-cli` is not installed on the very host it is written for -- found by applying this page's own rule to itself.
 * **A flag is not a fact until you check the binary that parses it.** The first `strings` attempt here ran against the
   *compressed* `vmlinuz` and returned 0 for every pattern, including ones that exist — which would have "proved" the
   parameter absent. Decompress first (`extract-vmlinux`), then count.

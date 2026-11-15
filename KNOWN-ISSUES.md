@@ -17,6 +17,39 @@ limitations under the License.
 
 # Known issues
 
+## engine#823 — Bosgame BeyondMax board: the USB ports need the xHCI keep-awake rule
+
+**Status: MITIGATED in 1bit OS — the ports work; the fix is a udev rule, not a driver.** On this board (AXB35-02)
+every external port **works** once the xHCI controllers are kept out of D3cold. The owner's plug test on **BIOS 1.10**
+(2026-11-14 22:09–22:23 ADT) exercised each one:
+
+```
+front Type-C   c7:00.3   5 Gbps         rear Type-C   c7:00.4   5 Gbps
+rear USB-A     c5:00.4   5 Gbps         rear USB-A    c7:00.0   port 4, USB 2 (a USB 2 port)
+```
+
+**Cause: D3cold autosuspend.** A port whose controller has been allowed to suspend does not come back on this board's
+firmware, which is why the symptom looked electrical: the port is fine, the controller is asleep and does not wake for
+a hot-plug. The fix is `os/v3/puppy/embed/etc/udev/rules.d/91-1bit-xhci-keepawake.rules`, **shipped in 1bit OS** and now also installed on
+strixhalo, which pins the xHCI controllers in D0.
+
+**What the earlier write-up here got wrong, kept so nobody re-derives it:** empty `/sys/class/typec` and the absence of
+a UCSI device are both **true**, and neither is the cause. The board indeed exposes no Type-C port model to the kernel,
+but that does not stop the ports working — the failure was power management, not a missing port description. The
+`ec_su_axb35` refcount-0 observation is likewise true and likewise not the mechanism.
+
+**Not established:** **USB4 / Thunderbolt devices are untested** through these ports. The keep-awake rule covers the
+xHCI controllers; a USB4 tunnel is a different path (the two `Strix Halo USB4 Host Router` functions) and nobody has put
+a TB device on it.
+
+**One device stays USB 2:** the **Ugreen RTL9210** enclosure enumerates at USB 2 on the rear USB-A port (`c7:00.0`
+port 4). That port is USB 2, and the enclosure/cable pair is the other half of it — it is not the controller.
+
+**Affected:** every install on the Bosgame BeyondMax (AXB35-02) **without** the keep-awake rule. With the rule, all
+four ports above behave. Other Strix Halo boards are not known to be affected.
+
+**Release notes:** 1bit OS ships `91-1bit-xhci-keepawake.rules` for this board; without it the ports appear dead.
+
 ## engine#370 — intermittent MUL_MAT f32 m=1 n=1 k=2048 error on `common.mul_mat.f32_f32_decode`
 
 **Status: CLOSED 2026-10-10 — closed as not reproducible, not as fixed at source.** The issue is closed

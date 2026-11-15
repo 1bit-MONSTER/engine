@@ -16,7 +16,30 @@ limitations under the License.
 -->
 # AXB35-02 (Bosgame BeyondMax): the rear USB-A and Type-C ports
 
-**Status: fix merged, mechanism verified on the board, functional plug test still outstanding.** engine#823.
+**Status: verified on hardware 2026-11-14 (BIOS 1.10): every external port enumerates with the keep-awake rule; USB4 device untested.** engine#823.
+
+| physical port | xHCI controller | measured with the controllers kept in D0 |
+|---|---|---|
+| front USB-A | `c7:00.0` (`1588`) | worked before the rule as well (the one controller that stays in D0) |
+| front Type-C | `c7:00.3` (`1589`) | SuperSpeed 5 Gbps, USB storage |
+| rear Type-C | `c7:00.4` (`158b`) | SuperSpeed 5 Gbps, USB storage |
+| rear USB-A | `c7:00.0` (`1588`), port 4 | high-speed with a USB 2 stick; a USB 3 device on this port is untested |
+| rear USB-A next to the power connector | `c5:00.4` (`1587`) | SuperSpeed 5 Gbps, USB storage |
+
+How it was measured: on the board's Ubuntu host (kernel `7.4.0-rc1-1bit`), first with `power/control=on` written by hand on the
+four xHCI functions, then with `91-1bit-xhci-keepawake.rules` installed in `/etc/udev/rules.d`. Both produce the same state, and
+the rule's device list matches these four controllers exactly. Before the change, the three silent controllers had taken no
+interrupts since boot, and every port read `RxDetect` with no connect. So the D3cold autosuspend is the whole cause for USB 2 and
+USB 3 devices.
+
+Not covered yet:
+
+- a USB4/Thunderbolt device on a Type-C port (both USB4 routers still report no link);
+- a USB 3 device on the `c7:00.0` rear USB-A port;
+- a 1bit OS boot with the rule loaded from the image.
+
+One enclosure (a Realtek RTL9210, the device from the original report) enumerates at high-speed (USB 2) on **every** port, including
+ports where another drive reaches 5 Gbps. That limit belongs to the enclosure or its cable, not to the board.
 
 On this board, stock boots leave three of the four xHCI functions in `D3cold`, so the rear USB-A ports and both Type-C ports never
 enumerate; only the controller that carries the front USB-A (and Bluetooth, and the JetKVM) stays in `D0`. Windows drives every
@@ -83,6 +106,10 @@ Measured on the board 2026-11-10, BIOS 1.10, a dev boot with the rule not instal
 0000:c7:00.6  0x158e  thunderbolt  D3cold   <- the rule does NOT match this
 ```
 
+*Corrected 2026-11-14 by the plug test above:* USB 2 and USB 3 devices on **both** Type-C ports run through xHCI functions the
+rule covers (`c7:00.3`, `c7:00.4`); only a USB4/Thunderbolt tunnel uses the routers. The reading below was written before the plug,
+and is kept as written.
+
 The **rear USB-A** ports hang off the four xHCI functions the rule matches. The **Type-C** ports hang off the two USB4 host routers
 (`0x158d`/`0x158e`), which the rule's device list does not contain, and which are in `D3cold` with the `thunderbolt` driver bound and
 four live IRQs. So:
@@ -116,6 +143,10 @@ taken **155,139**, and both USB4 host routers are up (`gen=4`, `authorized=1`, ~
 USB4 side is alive at PCI level and the missing thing is below it.
 
 ## What is still owed
+
+*Updated 2026-11-14:* the plug test on a host with the rule passed on every external port (table at the top). What remains is
+the same plug **on a 1bit-OS boot** with the rule from the image, a USB 3 device on `c7:00.0`, and a USB4/Thunderbolt device.
+The paragraph below is the earlier plan, kept as written.
 
 One device into a rear USB-A or a Type-C port **on a 1bit-OS boot**, checked with `--require-awake` first. If a port is then still
 dead the next diagnostic is the one no one has run: compare `_DSM` on the xHCI/USB4 ACPI nodes against what Windows sends. Until

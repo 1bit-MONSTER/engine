@@ -34,6 +34,17 @@
 #                   command and the rc -- the command is what makes a window auditable afterwards
 #   the child       gets its own ticket pid in GPU_HOLD_TICKET, so a measurement script can prove
 #                   ownership instead of guessing it from the global token file
+#
+# Exit status (what a caller should do with it):
+#   0     the window ran, the job succeeded, and coder-llm is back (:8090 answered 200)
+#   N     the job's own rc, whenever the job failed (a restart failure never masks it)
+#   2     refused before anything happened: bad arguments, inside the 45-min gap without -w, no gpu-hold / setsid
+#   69    the job succeeded but THIS window stopped coder-llm and :8090 did not answer 200 after the restart: the fleet
+#         LLM is down because of this run; look now (a window that found coder-llm already stopped never returns 69,
+#         its end line says coder-llm=was-not-running and it does not start it)
+#   75    the ticket came, but another lane's window had ended less than 45 min before: nothing stopped, nothing logged;
+#         queue again later (-w waits only before the ticket, not after a refusal)
+#   130 / 143   INT / TERM: the job group was killed, coder-llm restored if this window stopped it
 set -uo pipefail
 
 SELF=${0##*/}
@@ -57,7 +68,7 @@ die() { printf '%s: %s\n' "$SELF" "$*" >&2; exit 2; }
 self_test() {
     local fail=0
     chk() { local label=$1 got=$2 want=$3; if [ "$got" = "$want" ]; then echo "ok   $label"; else echo "FAIL $label (got $got, want $want)"; fail=$((fail+1)); fi; }
-    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+    mkdir -p "${WR_TMPDIR:-$HOME/.cache}"; tmp=$(mktemp -d "${WR_TMPDIR:-$HOME/.cache}/window-run-test.XXXXXX"); trap 'rm -rf "$tmp"' RETURN
     # 1. a duration outside 1..15 is refused, with the reason
     out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 0 -l x -c true 2>&1); rc=$?
     chk "a zero-minute window is refused" "$rc" 2
@@ -89,6 +100,21 @@ self_test() {
     chk "a TERM'd runner exits 143" "$rrc" 143
     kill -0 "$(cat "$tmp/fake.pid" 2>/dev/null)" 2>/dev/null; chk "  ... and its queued job is gone" "$?" 1
     chk "  ... and nothing is logged" "$(wc -l < "$tmp/q.log")" 0
+    # 3e. coder-llm not back after the restart fails the run (69) unless the job already failed
+    chk "--final-rc 200 0 -> 0" "$("$0" --final-rc 200 0)" 0
+    chk "--final-rc 000 0 -> 69 (coder-llm did not come back)" "$("$0" --final-rc 000 0)" 69
+    chk "--final-rc 503 3 -> 3 (the job's own failure is kept)" "$("$0" --final-rc 503 3)" 3
+    # 3f. the ticket's child really re-checks the gap: another window ends while this one is queued (the fake gpu-hold
+    #     appends that end line, then runs the real child) -> rc 75, coder-llm never stopped, nothing else logged.
+    #     systemctl is a recording fake first on PATH, so even a regression here cannot stop the real coder-llm.
+    mkdir -p "$tmp/fakebin"
+    printf '#!/bin/bash\necho "$*" >> %s/systemctl.calls\n[ "$*" = "--user is-active --quiet coder-llm" ] && exit 0\nexit 0\n' "$tmp" > "$tmp/fakebin/systemctl"
+    printf '#!/bin/bash\n[ "${1:-}" = --status ] && exit 0\nwhile [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift\nprintf "%%s end   lane=other issue=0 label=other coder-llm=active :8090=200 rc=0\\n" "$(date -u +%%FT%%TZ)" >> "$WR_LOG"\nexec "$@"\n' > "$tmp/fakebin/gpu-hold"
+    chmod +x "$tmp/fakebin/systemctl" "$tmp/fakebin/gpu-hold"; : > "$tmp/r.log"; : > "$tmp/systemctl.calls"
+    PATH=$tmp/fakebin:$PATH GPU_HOLD=$tmp/fakebin/gpu-hold WINDOWS_LOG=$tmp/r.log "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "a window that ended while queued refuses the ticket (75)" "$?" 75
+    chk "  ... coder-llm is never stopped" "$(grep -c 'stop coder-llm' "$tmp/systemctl.calls")" 0
+    chk "  ... and the log holds only the other lane's end line" "$(wc -l < "$tmp/r.log")" 1
     # 4. an old enough end opens the gate again (the refusal above is about the gap, not about the file)
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/w.log"
     out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true 2>&1); rc=$?
@@ -121,6 +147,10 @@ self_test() {
 }
 [ "${1:-}" = --self-test ] && { self_test; exit $?; }
 
+# The run's final status once coder-llm was restarted: the job's rc when :8090 answers 200, else 69 (EX_UNAVAILABLE) for
+# a job that itself succeeded. A window that leaves the fleet LLM down is a failed window, not a WARNING line.
+final_rc() { if [ "$1" = 200 ] || [ "$2" != 0 ]; then echo "$2"; else echo 69; fi; }
+if [ "${1:-}" = "--final-rc" ]; then final_rc "${2:-}" "${3:-0}"; exit 0; fi
 # --gap-ok: rc 0 when the 45-minute gap is open now, rc 1 (with the reason) when it is not. The ticket's child runs it
 # right before it stops coder-llm, so a window another lane ran while this one queued still counts.
 if [ "${1:-}" = "--gap-ok" ]; then
@@ -192,6 +222,8 @@ if [ "$NOW" = 1 ]; then
 fi
 
 [ -x "$GPU_HOLD" ] || die "no executable gpu-hold at $GPU_HOLD (set GPU_HOLD): refusing before anything is logged"
+# setsid (util-linux) puts the job in its own process group, which is what lets a TERM kill the whole tree
+command -v setsid >/dev/null 2>&1 || die "setsid not found (util-linux): the job could not be killed as one group; refusing"
 if [ "$DRY" = 1 ]; then
   printf '%s: would take gpu-hold -t %s -l %s, stop coder-llm, run: %s\n' "$SELF" "$MINS" "$LABEL" "$CMD"
   exit 0
@@ -199,7 +231,8 @@ fi
 [ -d "$(dirname "$LOG")" ] || mkdir -p "$(dirname "$LOG")"
 # Markers the ticket's child writes: STARTED once it logged the start line, STOPPED once it stopped coder-llm. A run that
 # never got that far (refused, killed in the queue, gpu-hold missing) logs nothing and restarts nothing.
-WR_DIR=$(mktemp -d); export WR_STARTED=$WR_DIR/started WR_STOPPED=$WR_DIR/stopped
+mkdir -p "${WR_TMPDIR:-$HOME/.cache}"   # /tmp is tmpfs on strixhalo and the lane rules keep new files off it
+WR_DIR=$(mktemp -d "${WR_TMPDIR:-$HOME/.cache}/window-run.XXXXXX"); export WR_STARTED=$WR_DIR/started WR_STOPPED=$WR_DIR/stopped
 export WR_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${BASH_SOURCE[0]##*/}" WR_LOG=$LOG WR_LANE=${LANE:-$SELF} \
        WR_ISSUE=$ISSUE WR_LABEL=$LABEL WR_MINS=$MINS WR_CMD=$CMD WINDOWS_LOG=$LOG
 JOB=""
@@ -221,9 +254,11 @@ restore() {
       code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/v1/models 2>/dev/null || true)
       [ "$code" = 200 ] && break; sleep 3
     done
-    printf '%s end   lane=%s issue=%s label=%s coder-llm=%s :8090=%s rc=%s\n' "$(date -u +%FT%TZ)" \
-      "$WR_LANE" "$ISSUE" "$LABEL" "$(systemctl --user is-active coder-llm)" "$code" "$rc" >> "$LOG"
-    [ "$code" = 200 ] || printf '%s: WARNING coder-llm restarted but :8090 answers %s\n' "$SELF" "$code" >&2
+    rc=$(final_rc "$code" "$rc")
+    printf '%s end   lane=%s issue=%s label=%s coder-llm=%s :8090=%s rc=%s%s\n' "$(date -u +%FT%TZ)" \
+      "$WR_LANE" "$ISSUE" "$LABEL" "$(systemctl --user is-active coder-llm)" "$code" "$rc" \
+      "$([ "$code" = 200 ] || echo ' restart=FAILED')" >> "$LOG"
+    [ "$code" = 200 ] || printf '%s: ERROR coder-llm was restarted but :8090 answers %s: exit %s\n' "$SELF" "$code" "$rc" >&2
   else
     printf '%s end   lane=%s issue=%s label=%s coder-llm=was-not-running :8090=n/a rc=%s\n' "$(date -u +%FT%TZ)" \
       "$WR_LANE" "$ISSUE" "$LABEL" "$rc" >> "$LOG"

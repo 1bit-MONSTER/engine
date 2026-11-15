@@ -46,6 +46,8 @@
 #   N ticketed-wait on a model that never answers gives up with 75 after its limit and WITHDRAWS the demand it made,
 #     so the unit does not take a ticket for a caller that has gone (review of #2588);
 #   O ticketed-wait on a model that already answers returns 0 at once and creates no demand at all.
+#   Q SECONDS is a hard bound (review of #2590): against a port that accepts and never answers (each probe would wait for
+#     its own curl timeout), a 3 s limit still ends in 75 within a few seconds.
 #   P readiness, not liveness (review of #2588): a server that lists /v1/models (200 from bind) but cannot complete yet
 #     (503 while "loading") does not count as answering: ticketed-wait waits, and returns 0 only once a 1-token
 #     completion is answered.
@@ -300,9 +302,19 @@ env TICKETED_WAIT_DEMAND="$scratch/p.demand" TICKETED_WAIT_POLL_S=1 "$waiter" te
 [ "$rc" = 0 ] && grep -q 'answers after' "$scratch/p2.wait" || { echo "FAIL P: rc $rc once loaded, want 0 after a wait ($(tail -1 "$scratch/p2.wait"))"; fail=1; }
 kill "$pf" 2> /dev/null; wait "$pf" 2> /dev/null; rm -f "$scratch/loading"
 
+# ---- Q: the limit holds against a server that accepts and hangs -------------------------------------------------------
+hang=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1',$hang)); s.listen(8); time.sleep(120)" & hq=$!; pids+=($hq)
+sleep 1; t0=$(date +%s)
+env TICKETED_WAIT_DEMAND="$scratch/q.demand" TICKETED_WAIT_POLL_S=1 "$waiter" test-unit "http://127.0.0.1:$hang" 3 2> "$scratch/q.wait"; rc=$?
+el=$(( $(date +%s) - t0 ))
+[ "$rc" = 75 ] || { echo "FAIL Q: rc $rc against a hanging server, want 75"; fail=1; }
+[ "$el" -le 7 ] || { echo "FAIL Q: a 3 s limit took ${el}s against a server that accepts and hangs (the probe's own timeout stretched it)"; fail=1; }
+kill "$hq" 2> /dev/null; wait "$hq" 2> /dev/null
+
 # ---- G: the default queue wait keeps the ticket's place on a busy box (a give-up re-queues at the back) ------------
 sed -n 's/^QUEUE_WAIT=\${CODER_LLM_QUEUE_WAIT_S:-\([0-9]*\)}$/\1/p' "$tick" > "$scratch/qw"
 [ "$(cat "$scratch/qw")" -ge 14400 ] 2> /dev/null || { echo "FAIL G: default queue wait $(cat "$scratch/qw")s; under 4 h a busy queue makes it re-queue at the back and starve"; fail=1; }
 
-[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load; a slow-exiting server gets its grace, a KILL after the max hold is 124, one after a queue wait stays 137; a refused grant is told from a fault during a window; a window takes its label; ticketed-wait asks, waits, gives up with 75 and withdraws its demand, and asks for nothing when the model is up; bound-but-loading is not an answer)"
+[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load; a slow-exiting server gets its grace, a KILL after the max hold is 124, one after a queue wait stays 137; a refused grant is told from a fault during a window; a window takes its label; ticketed-wait asks, waits, gives up with 75 and withdraws its demand, and asks for nothing when the model is up; bound-but-loading is not an answer; the limit is hard)"
 exit "$fail"

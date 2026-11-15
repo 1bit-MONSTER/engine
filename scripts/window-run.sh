@@ -68,6 +68,11 @@ die() { printf '%s: %s\n' "$SELF" "$*" >&2; exit 2; }
 self_test() {
     local fail=0
     chk() { local label=$1 got=$2 want=$3; if [ "$got" = "$want" ]; then echo "ok   $label"; else echo "FAIL $label (got $got, want $want)"; fail=$((fail+1)); fi; }
+    # A SELF-TEST MUST NOT POLL FOR REAL: these arms assert the verdict, not the wait. Every arm that reaches
+    # restore() would otherwise poll :8090 -- 200 on a working box (instant break), refused in CI (the full bound).
+    # That ambient difference is exactly how engine#2566's build died at ctest's 600 s: same arms, 3 s x 100 each.
+    export WR_POLL_MAX=3 WR_POLL_S=0.05
+    # arm 3l gets its own queue: a LIVE coder-llm ticket left in the shared $tmp/q is inherited by later arms.
     mkdir -p "${WR_TMPDIR:-$HOME/.cache}"; tmp=$(mktemp -d "${WR_TMPDIR:-$HOME/.cache}/window-run-test.XXXXXX"); trap 'rm -rf "$tmp"' RETURN
     # 0. THE RESTART PROBE ASKS FOR A COMPLETION. No device is touched here, so this arm reads the artifact the
     # gate ships. /v1/models is a static registry listing that answers 200 while the weights load (app/serve.cpp
@@ -186,6 +191,40 @@ JLOG
     chk "  ... and the deferral is not reported as a failed restart" "$(grep -c 'restart=FAILED' "$tmp/t.log")" 0
     # the loading-vs-wedged check needs a live child growing in CPU, which a self-test cannot fake without testing its
     # own fake; pin the reader instead so it cannot be deleted silently (the same technique the probe arm uses).
+    # 3k. engine#2496's contract: a ticketed coder-llm that is QUEUED is not a failed restart
+    : > "$tmp/t.calls"; mkdir -p "$tmp/q"
+    # a LIVE pid: the arm used to write pid=999999, which does not exist -- so it demonstrated a STALE entry and
+    # asserted "queued" as correct (review of this PR). $$ is this test's own live shell.
+    printf 'label=coder-llm\npid=%s\n' "$$" > "$tmp/q/0179.coder-llm"
+    printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/t.log"
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token GPU_QUEUE_DIR=$tmp/q WR_HEALTH_URL=http://127.0.0.1:9/x \
+      WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "a queued coder-llm is recorded as queued, not failed" "$(grep -c 'restart=queued(WAITING for a GPU ticket when this window ended, not restored)' "$tmp/t.log")" 1
+    chk "  ... and it is not reported as a failed restart" "$(grep -c 'restart=FAILED' "$tmp/t.log")" 0
+    # a DEAD pid is a stale entry, which gpu-hold drops -- it must not license "queued" forever
+    : > "$tmp/t.log"; printf 'label=coder-llm\npid=999999\n' > "$tmp/q/0179.coder-llm"
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token GPU_QUEUE_DIR=$tmp/q WR_HEALTH_URL=http://127.0.0.1:9/x \
+      WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "a STALE queue entry (dead pid) does not count as queued" "$(grep -c 'restart=queued' "$tmp/t.log")" 0
+    # 3l. BOTH conditions true: another lane holds the token AND a live coder-llm ticket is queued.
+    # The deferred branch is checked before the poll, so the more specific state must win -- a `queued` here
+    # would claim the LLM is waiting for a ticket when it is in fact waiting behind a token in someone's hand.
+    mkdir -p "$tmp/q3l"          # own queue: a LIVE ticket left in $tmp/q is inherited by later arms
+    : > "$tmp/t.log"; printf 'gpu-hold cl-other 999999\n' > "$tmp/token"; printf 'label=coder-llm\npid=%s\n' "$$" > "$tmp/q3l/0179.coder-llm"
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/token GPU_QUEUE_DIR=$tmp/q3l \
+      WR_HEALTH_URL=http://127.0.0.1:9/x WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "a held token wins over a queued entry (deferred, not queued)" "$(grep -c 'restart=deferred' "$tmp/t.log")" 1
+    chk "  ... and it is not reported as queued" "$(grep -c 'restart=queued' "$tmp/t.log")" 0
+    # 3m. NO llama-server on the box (the CI condition): the freeze detector must fire instead of burning the whole
+    # bound. With the old `-n "$_cpu"` guard an empty reading never counted as no-progress, so the loop ran
+    # WR_POLL_MAX x WR_POLL_S whatever happened -- 300 s per arm; ctest's 600 s limit is how #2566 found it.
+    mkdir -p "$tmp/nops" "$tmp/q3m"; printf '#!/bin/bash\nexit 1\n' > "$tmp/nops/ps"; chmod +x "$tmp/nops/ps"
+    : > "$tmp/tr.log"
+    PATH=$tmp/nops:$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token \
+      GPU_QUEUE_DIR=$tmp/q3m WR_HEALTH_URL=http://127.0.0.1:9/x WR_POLL_MAX=100 WR_POLL_S=0.01 \
+      WR_POLL_TRACE=$tmp/tr.log WINDOWS_LOG=$tmp/t3m.log "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "no llama-server: the freeze detector fires (froze reaches 10)" "$(grep -c 'froze=10' "$tmp/tr.log")" 1
+    chk "  ... after 10 polls, not the whole WR_POLL_MAX" "$(grep -c '^poll ' "$tmp/tr.log")" 10
     chk "the poll reads the largest child's CPU, not the idle embed child" "$(grep -c 'sort -k2 -n | tai[l] -1' "$me")" 1
     # 4. an old enough end opens the gate again (the refusal above is about the gap, not about the file)
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/w.log"
@@ -379,6 +418,27 @@ restore() {
       printf '%s: coder-llm restarts when the next lane releases the GPU (holder %s); not a failed restart\n' "$SELF" "${_held:-?}" >&2
       rm -rf "$WR_DIR"; exit "$rc"
     fi
+    # QUEUED IS NOT DEAD EITHER (engine#2496's contract, live 2026-11-15): once `coder-llm` runs inside
+    # `coder-llm-ticketed`, `systemctl start` means "queue for a GPU ticket" -- so with lanes ahead of it the unit
+    # is `active` and `:8090` stays empty for minutes. A restart-then-fail there is a false signal on EVERY window,
+    # which is how lanes learn to ignore the failure. Measured: the unit ran `coder-llm-ticketed`, `coder-llm` was
+    # 4th in ~/GPU-QUEUE, and this restore reported failure for a window whose job had succeeded.
+    # LIVENESS, not existence (review of this PR, and the same mistake #2547 made with the token file): an entry
+    # left behind by a killed process outlives it, and `gpu-hold` itself calls such an entry stale and DROPS it
+    # (stale(), nineteen lines in: "no pid, or whose pid is gone"). Matching on the label alone makes a dead
+    # ticket licence a `queued` verdict for every later window -- a permanent false calm, which is worse than the
+    # false alarm this PR removes.
+    coder_llm_queued() {
+        local q=${GPU_QUEUE_DIR:-$HOME/GPU-QUEUE} f pid
+        [ -d "$q" ] || return 1
+        for f in "$q"/*; do
+            case "${f##*/}" in .*) continue ;; esac
+            grep -qx 'label=coder-llm' "$f" 2>/dev/null || continue
+            pid=$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' "$f" 2>/dev/null | head -1)
+            [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+        done
+        return 1
+    }
     # LOADING IS NOT WEDGED (same windows): a child loading a 30B answers 503 while its CPU time advances;
     # restarting it there throws the load away. Only a child whose CPU time has not moved for ~30 s is dead.
     # The LARGEST llama-server is the one loading -- the embed service's idle child is ~15 MB.
@@ -399,15 +459,26 @@ restore() {
       # check asks for: slower than a status code, and the only probe that cannot be right while the LLM is unusable.
       code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
                  -d '{"model":"qwen3-coder","messages":[{"role":"user","content":"ok"}],"max_tokens":1,"temperature":0}' \
-                 http://127.0.0.1:8090/v1/chat/completions 2>/dev/null || true)
+                 "${WR_HEALTH_URL:-http://127.0.0.1:8090/v1/chat/completions}" 2>/dev/null || true)
       [ "$code" = 200 ] && break
       _cpu=$(cpu_of)
-      if [ -n "$_cpu" ] && [ "$_cpu" = "$prev" ]; then froze=$((froze + 1)); else froze=0; fi
+      # NO PROCESS IS NO PROGRESS. An empty reading used to skip this check (`-n "$_cpu"`), so with no
+      # llama-server on the box -- CI, or a restart whose child never appeared -- the detector could never fire and
+      # the loop always burned its whole bound (WR_POLL_MAX 100 x WR_POLL_S 3 s = 300 s per arm; ctest's 600 s limit
+      # is how engine#2566's build found this). Nothing running for ~30 s after a restart is a wedge, not a load.
+      if [ "$_cpu" = "$prev" ]; then froze=$((froze + 1)); else froze=0; fi
       prev=$_cpu
+      [ -n "${WR_POLL_TRACE:-}" ] && printf 'poll i=%s froze=%s cpu=%s\n' "$i" "$froze" "${_cpu:-none}" >> "$WR_POLL_TRACE"
       [ "$froze" -ge 10 ] && break      # ~30 s without CPU progress: a wedge, not a load
       sleep "$_poll_s"
     done
     _state=$(systemctl --user is-active coder-llm 2>/dev/null)
+    if [ "$code" != 200 ] && [ "$_state" = active ] && coder_llm_queued; then
+        printf '%s end   lane=%s issue=%s label=%s coder-llm=active :8090=queued restart=queued(WAITING for a GPU ticket when this window ended, not restored) rc=%s\n' \
+          "$(date -u +%FT%TZ)" "$WR_LANE" "$ISSUE" "$LABEL" "$rc" >> "$LOG"
+        printf '%s: coder-llm is queued for a GPU ticket (engine#2496), not dead: :8090 answers when it gets one\n' "$SELF" >&2
+        rm -rf "$WR_DIR"; exit "$rc"
+    fi
     _waiting=0
     if [ "$code" != 200 ] && [ "$_state" = active ]; then
         _waiting=$(coder_llm_asleep ${WR_JOURNAL_FILE:+"$WR_JOURNAL_FILE"})

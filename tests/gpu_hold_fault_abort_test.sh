@@ -26,7 +26,9 @@
 #   1 a page fault appears 5 s in: the hold ends WELL before its payload would (600 s), with rc 78, the log says why,
 #     and the job's deepest TERM-ignoring descendant is gone;
 #   2 a clean log: the payload runs to completion, rc 0 (the watcher does not fire on nothing);
-#   3 the same fault with GPU_HOLD_FAULT_ABORT=0: the payload runs to completion, rc 0 (the opt-out works).
+#   3 the same fault with GPU_HOLD_FAULT_ABORT=0: the payload runs to completion, rc 0 (the opt-out works);
+#   4 the same fault with GPU_HOLD_FAULT_ABORT UNSET: rc 78, so the DEFAULT is on (arms 1-3 set it explicitly; a
+#     mutant that flipped the default to off passed them - review on #2486).
 set -u
 hold=${1:-./scripts/gpu-hold}
 [ -x "$hold" ] || { echo "not executable: $hold"; exit 2; }
@@ -43,14 +45,15 @@ sleep "$2"
 WRAP
 chmod +x "$scratch/wrapper.sh"
 
-run() {   # $1 arm  $2 payload seconds  $3 inject fault (1/0)  $4 GPU_HOLD_FAULT_ABORT
+run() {   # $1 arm  $2 payload seconds  $3 inject fault (1/0)  $4 GPU_HOLD_FAULT_ABORT, or "unset" to leave it out
     local q=$scratch/q$1; mkdir -p "$q"; : > "$scratch/klog$1"; rm -f "$scratch/deep.pid"
     printf '%s\n' "kernel: usb 1-1: new device" > "$scratch/klog$1"
     if [ "$3" = 1 ]; then
         ( sleep 5; printf '%s\n' "kernel: amdgpu 0000:c5:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:9 pasid:26332)" >> "$scratch/klog$1" ) &
     fi
     local t0; t0=$(date +%s)
-    GPU_HOLD_KLOG_FILE="$scratch/klog$1" GPU_HOLD_FAULT_ABORT="$4" \
+    local abort_env=(GPU_HOLD_FAULT_ABORT="$4"); [ "$4" = unset ] && abort_env=()
+    env -u GPU_HOLD_FAULT_ABORT "${abort_env[@]}" GPU_HOLD_KLOG_FILE="$scratch/klog$1" \
     GPU_QUEUE_DIR="$q" GPU_TOKEN_FILE="$scratch/TOKEN$1" GPU_HOLD_LOG="$scratch/log$1" \
     GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 GPU_HOLD_RESET_WINDOW_MIN=0 \
     GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x" \
@@ -82,5 +85,10 @@ run 3 12 1 0
 if [ "$rc" != 0 ]; then echo "FAIL arm 3: rc $rc with GPU_HOLD_FAULT_ABORT=0, want 0"; fail=1; fi
 grep -q "ABORT GPU/NPU fault" "$scratch/log3" && { echo "FAIL arm 3: the watcher fired with GPU_HOLD_FAULT_ABORT=0"; fail=1; }
 
-[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0)"
+# arm 4: the default (variable unset) must be ON
+run 4 600 1 unset
+if [ "$rc" != 78 ]; then echo "FAIL arm 4: rc $rc with GPU_HOLD_FAULT_ABORT unset, want 78 (the default must be on)"; fail=1; fi
+if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
+
+[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on -> 78)"
 exit "$fail"

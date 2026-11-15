@@ -17,7 +17,7 @@ limitations under the License.
 # 1bit engine: local LLM inference on AMD Strix Halo (Ryzen AI MAX+ 395)
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Lemonade pin: last bump](https://img.shields.io/github/last-commit/1bit-MONSTER/engine?path=third_party%2Flemonade&label=Lemonade%20pin&color=f5c518)](https://github.com/1bit-MONSTER/engine/tree/main/third_party/lemonade)
+[![Lemonade pin: last bump](https://img.shields.io/github/last-commit/1bit-MONSTER/engine?path=third_party%2Flemonade&label=Lemonade%20pin&color=f5c518)](https://github.com/1bit-MONSTER/engine/commits/main/third_party/lemonade)
 [![Releases](https://img.shields.io/badge/releases-GitHub-24292f)](https://github.com/1bit-MONSTER/engine/releases)
 [![Documentation: 1bit.gg](https://img.shields.io/badge/docs-1bit.gg-1779e1)](https://1bit.gg/)
 [![Discord](https://img.shields.io/badge/chat-Discord-5865F2)](https://discord.gg/fa5m4Vawpa)

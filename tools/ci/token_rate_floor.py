@@ -67,7 +67,8 @@ def verdict(rates, floor, subject=""):
         return 0, {"status": "recorded", "rate": last, "floor": floor, "subject": subject}
     if last < floor:
         return 1, {"status": "below_floor", "rate": last, "floor": floor, "subject": subject,
-                   "why": f"generated {last:g} tokens/s, floor is {floor:g} -- a slowdown, not a failure"}
+                   "why": f"generated {last:g} tokens/s, floor is {floor:g} -- correct output, "
+                          f"{floor / last:.1f}x below the floor"}
     return 0, {"status": "ok", "rate": last, "floor": floor, "subject": subject}
 
 

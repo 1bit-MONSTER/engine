@@ -203,6 +203,11 @@ add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $
 # cannot, since a 3.7x regression still emits the right tokens. The self-test needs no device; the --log mode
 # is what a device row calls with llama-cli's output.
 add_test(NAME token_rate_floor_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/token_rate_floor.py --self-test)
+# The --log mode's caller (engine#2432 review item 1: a self-test with no consumer is engine#2418's defect). It
+# judges one real `1bit serve` rate inside a gpu-hold ticket, and exits 77 -- CTest's skip -- naming the missing
+# prerequisite when it cannot: a device row that passes for want of a model would be the failure this tool catches.
+add_test(NAME token_rate_floor_device COMMAND ${CMAKE_SOURCE_DIR}/tools/ci/token_rate_floor_device.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(token_rate_floor_device PROPERTIES SKIP_RETURN_CODE 77)
 # scripts/lemonade-hrx: the PPA lemond's HRX recipe runs our llama-server (docs/lemonade.md): no GPU.
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)

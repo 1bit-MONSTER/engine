@@ -3278,6 +3278,9 @@ The small-model swings are near-tie flips. A 64-position top-1 cannot resolve be
 
 Decode speed on Qwen2.5-3B, 96-token reply, A B A B in one ticket, at tau 20 (tau 40 touches fewer rows): off 1.900 and
 2.018 tok/s; on 1.888 and 1.963. That is a 0.6-2.7 % difference, inside the box's run-to-run scatter.
+Prefill, where up to 128 rows each split their own channels: a 487-token chat prompt on Qwen2.5-3B, A B A B in one
+ticket at tau 40, two requests per server. Off took 7313, 7272, 7333 and 7214 ms (mean 7283 ms); on took 7504, 7445,
+7805 and 7259 ms (mean 7503 ms), so **+3.0 % prefill time**.
 
 ### `NPU_INFER_HOST_GEMM=i8`: the integer arm, and why a float one cannot gate a kernel
 

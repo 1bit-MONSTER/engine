@@ -17,33 +17,38 @@ limitations under the License.
 
 # Known issues
 
-## engine#823 — on the Bosgame BeyondMax board only the front USB-A port works under Linux
+## engine#823 — Bosgame BeyondMax board: the USB ports need the xHCI keep-awake rule
 
-**Status: OPEN, hardware/firmware, not reproducible in software.** On this board (AXB35-02, BIOS 1.09 05/08/2026)
-only the front USB-A port enumerates a device. Any drive in the front **Type-C** port or any **rear** port is
-electrically dead under Linux, on our kernel and on stock Ubuntu — while the same ports work in Windows on the same
-box, with the same drives (a Realtek RTL9210 USB4/USB 3.2 enclosure and a Gigastone flash drive).
-
-What the kernel can see, measured 2026-11-16 on this box:
+**Status: MITIGATED in 1bit OS — the ports work; the fix is a udev rule, not a driver.** On this board (AXB35-02)
+every external port **works** once the xHCI controllers are kept out of D3cold. The owner's plug test on **BIOS 1.10**
+(2026-11-14 22:09–22:23 ADT) exercised each one:
 
 ```
-lspci: 4 x "Strix Halo USB 3.1 xHCI"  (c5:00.4, c7:00.0, c7:00.3, c7:00.4)
-       2 x "Strix Halo USB4 Host Router" (c7:00.5, c7:00.6)
-/sys/class/typec                     : empty -- the kernel knows of no Type-C port at all
-/sys/bus/acpi/devices USBC000|PNP0CA0: 0 matches -- no UCSI device, as engine#823 reports
-lsmod                                : ec_su_axb35 loaded, refcount 0 -- the board EC driver has no USB controls
+front Type-C   c7:00.3   5 Gbps         rear Type-C   c7:00.4   5 Gbps
+rear USB-A     c5:00.4   5 Gbps         rear USB-A    c7:00.0   port 4, USB 2 (a USB 2 port)
 ```
 
-Empty `/sys/class/typec` is the part worth stating plainly: this is not a Type-C port that fails to negotiate, it is a
-port the kernel has **no model of**. Nothing in the standard interfaces (typec class, UCSI, EC) can power it or switch
-it, and the BIOS exposes no option for it, so there is no software fix in this tree. The hypothesis in the issue — port
-power or retimer switching done by a Windows-only driver or an EC/PD path the BIOS does not expose — is consistent with
-everything above and is the reason this is filed as a hardware limitation rather than a driver bug.
+**Cause: D3cold autosuspend.** A port whose controller has been allowed to suspend does not come back on this board's
+firmware, which is why the symptom looked electrical: the port is fine, the controller is asleep and does not wake for
+a hot-plug. The fix is `os/v3/puppy/embed/etc/udev/rules.d/91-1bit-xhci-keepawake.rules`, **shipped in 1bit OS** and now also installed on
+strixhalo, which pins the xHCI controllers in D0.
 
-**Affected:** every install on the Bosgame BeyondMax (AXB35-02) with BIOS 1.09 or the shipping build. One usable
-external USB port. Other Strix Halo boards are not known to be affected; this is the board, not the SoC.
+**What the earlier write-up here got wrong, kept so nobody re-derives it:** empty `/sys/class/typec` and the absence of
+a UCSI device are both **true**, and neither is the cause. The board indeed exposes no Type-C port model to the kernel,
+but that does not stop the ports working — the failure was power management, not a missing port description. The
+`ec_su_axb35` refcount-0 observation is likewise true and likewise not the mechanism.
 
-**Workaround:** use the front USB-A port, or a USB-A hub on it. Release notes must carry this line for this board.
+**Not established:** **USB4 / Thunderbolt devices are untested** through these ports. The keep-awake rule covers the
+xHCI controllers; a USB4 tunnel is a different path (the two `Strix Halo USB4 Host Router` functions) and nobody has put
+a TB device on it.
+
+**One device stays USB 2:** the **Ugreen RTL9210** enclosure enumerates at USB 2 on the rear USB-A port (`c7:00.0`
+port 4). That port is USB 2, and the enclosure/cable pair is the other half of it — it is not the controller.
+
+**Affected:** every install on the Bosgame BeyondMax (AXB35-02) **without** the keep-awake rule. With the rule, all
+four ports above behave. Other Strix Halo boards are not known to be affected.
+
+**Release notes:** 1bit OS ships `91-1bit-xhci-keepawake.rules` for this board; without it the ports appear dead.
 
 ## engine#370 — intermittent MUL_MAT f32 m=1 n=1 k=2048 error on `common.mul_mat.f32_f32_decode`
 

@@ -319,6 +319,19 @@ stage_test() { run_tests; }
 
 
 
+# private_tracked_names <pin>...: the basenames of every file the named private pins track under their
+# config path=, minus README.md/NOTICE/LICENSE. An empty answer is valid (no checkout at hand, or nothing
+# tracked), so no stage of this pipeline may fail on it: under pipefail a selector that matches nothing
+# would otherwise kill the caller, or, inside package_checks (called with ||, so set -e is off), leave
+# the list empty and turn the check that reads it into a pass that examined nothing (engine#2469).
+private_tracked_names() {
+    local pin
+    for pin in "$@"; do
+        [ -d "$W/$pin" ] || continue
+        git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null || true
+    done | xargs -r -n1 basename | { grep -v -x -E 'README.md|NOTICE|LICENSE' || true; } | LC_ALL=C sort -u
+}
+
 package_checks() {  # package_checks <linux tarball>
     # (no `cmd | grep -q` here: under pipefail grep's early exit fails the pipeline on a match)
     # (lists go to stderr through `tee >(cat >&2)`, not `tee /dev/stderr`: reopening the log by
@@ -363,12 +376,13 @@ package_checks() {  # package_checks <linux tarball>
         done
         if [ $bad = 0 ]; then echo "ok   GGUF-on-NPU helpers packed (3 files): the three public scripts"; fi
     fi
-    names=$(for pin in npu-runtime gpu-kernels npu-kernels; do
-                [ -d "$W/$pin" ] || continue
-                git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null
-            done | xargs -r -n1 basename | grep -v -x -E 'README.md|NOTICE|LICENSE' | LC_ALL=C sort -u)
-    n=$(find "$t" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | tee >(cat >&2) | wc -l)
-    [ "$n" = 0 ] || { echo "FAIL files named like the private sources in the tarball"; bad=1; }
+    names=$(private_tracked_names npu-runtime gpu-kernels npu-kernels)
+    if [ -z "$names" ]; then
+        echo "skip file names vs the private sources: no private pin checkout under $W, nothing to compare"
+    else
+        n=$(find "$t" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | tee >(cat >&2) | wc -l)
+        [ "$n" = 0 ] || { echo "FAIL files named like the private sources in the tarball"; bad=1; }
+    fi
     [ $bad = 0 ] && echo "ok   no private source in $(basename "$1")"
     # The NPU kernels, when the package carries them (WEEKLY_NPU_KERNELS): every kernel file is
     # sealed (never a plaintext ELF), no ELF in the tarball is for anything but the host (an NPU
@@ -443,13 +457,15 @@ package_checks() {  # package_checks <linux tarball>
         local b1=0
         n=$(nm --defined-only "$f" 2>/dev/null | wc -l)
         [ "$n" = 0 ] || { echo "FAIL the packed 1bit still has a symbol table ($n symbols)"; b1=1; }
-        privsrc=$(for pin in npu-runtime npu-kernels; do
-                      [ -d "$W/$pin" ] || continue
-                      git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null
-                  done | grep -E '\.(c|cc|cpp|cxx|h|hpp|py)$' | xargs -r -n1 basename | LC_ALL=C sort -u)
-        n=0; [ -z "$privsrc" ] || n=$(strings -a "$f" | grep -c -F -f <(printf '%s\n' "$privsrc") || true)
-        [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a private source file ($n strings)"; b1=1; }
-        if [ $b1 = 0 ]; then echo "ok   the packed 1bit: no symbol table, no private source names"; else bad=1; fi
+        privsrc=$(private_tracked_names npu-runtime npu-kernels | { grep -E '\.(c|cc|cpp|cxx|h|hpp|py)$' || true; })
+        if [ -z "$privsrc" ]; then
+            # nothing to look for is not a pass: say so instead of an `ok` that reads as a search (engine#2469)
+            echo "skip the packed 1bit vs private source names: the npu pins track no .c/.h/.py here, nothing to look for"
+        else
+            n=$(strings -a "$f" | grep -c -F -f <(printf '%s\n' "$privsrc") || true)
+            [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a private source file ($n strings)"; b1=1; }
+        fi
+        if [ $b1 = 0 ]; then echo "ok   the packed 1bit: no symbol table${privsrc:+, no private source names}"; else bad=1; fi
     fi
     for f in LICENSE NOTICE LICENSE-BINARY NOTICE-BINARY; do
         n=$(find "$t" -maxdepth 2 -type f -name "$f" | wc -l)

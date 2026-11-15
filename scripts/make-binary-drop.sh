@@ -136,6 +136,13 @@ cp -a "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$
 bad=0
 is_elf() { pack_is_elf "$1"; }
 fail() { echo "FAIL $*"; bad=1; }
+# require_names <pin>...: basenames of every require= entry in the pins' configs (empty is a valid answer)
+require_names() {
+    local pin
+    for pin in "$@"; do
+        sed -n 's/^require=//p' "$src/config/$pin.config" | tr ' ' '\n'
+    done | { grep -v '^$' || true; } | xargs -r -n1 basename | LC_ALL=C sort -u
+}
 
 # every ELF is a compiled binary with no source-name leakage
 while IFS= read -r -d '' f; do
@@ -180,9 +187,9 @@ n=$(find "$stage" -type f \( -name '*.hip' -o -name '*.c' -o -name '*.cc' -o -na
 
 # nothing named like the private sources: the pins' require= names, plus every tracked file name
 # when a private checkout happens to be at hand (the same rule weekly.sh applies)
-names=$(for pin in npu-runtime gpu-kernels; do
-            sed -n 's/^require=//p' "$src/config/$pin.config" | tr ' ' '\n'
-        done | grep -v '^$' | xargs -r -n1 basename | LC_ALL=C sort -u)
+# (a config with no require= line contributes nothing; `|| true` keeps that from failing the pipeline
+# under pipefail and killing the drop -- engine#2469)
+names=$(require_names npu-runtime gpu-kernels)
 n=$(find "$stage" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | wc -l)
 [ "$n" = 0 ] || fail "$n files named like the private sources"
 

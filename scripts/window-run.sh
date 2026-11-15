@@ -158,6 +158,17 @@ JLOG
     chk "a window that ended while queued refuses the ticket (75)" "$?" 75
     chk "  ... coder-llm is never stopped" "$(grep -c 'stop coder-llm' "$tmp/systemctl.calls")" 0
     chk "  ... and the log holds only the other lane's end line" "$(wc -l < "$tmp/r.log")" 1
+    # 3i. a TICKETED coder-llm is never stopped by a window (it is queued, not resident): the fake systemctl reports an
+    #     ExecStart that runs coder-llm-ticketed and an active unit; the window runs for real through a pass-through
+    #     gpu-hold, and must make no stop call and say why in its start line.
+    mkdir -p "$tmp/tbin"
+    printf '#!/bin/bash\necho "$*" >> %s/t.calls\ncase "$*" in *"show coder-llm -p ExecStart"*) echo "{ path=/x/coder-llm-ticketed ; argv[]=/x/coder-llm-ticketed -- serve }";; esac\nexit 0\n' "$tmp" > "$tmp/tbin/systemctl"
+    printf '#!/bin/bash\n[ "${1:-}" = --status ] && exit 0\nwhile [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift\nexec "$@"\n' > "$tmp/tbin/gpu-hold"
+    chmod +x "$tmp/tbin/systemctl" "$tmp/tbin/gpu-hold"; : > "$tmp/t.calls"
+    printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/t.log"
+    PATH=$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "a ticketed coder-llm is never stopped by a window" "$(grep -c 'stop coder-llm' "$tmp/t.calls")" 0
+    chk "  ... and the window's start line says so" "$(grep -c 'coder-llm ticketed: not stopped' "$tmp/t.log")" 1
     # 4. an old enough end opens the gate again (the refusal above is about the gap, not about the file)
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/w.log"
     out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true 2>&1); rc=$?
@@ -382,8 +393,14 @@ trap 'exit 143' TERM
 trap 'exit 130' INT
 setsid "$GPU_HOLD" -t "$MINS" -l "$LABEL" -- bash -c '
   "$WR_SELF" --gap-ok || exit 75
-  if systemctl --user is-active --quiet coder-llm; then systemctl --user stop coder-llm && touch "$WR_STOPPED"; fi
-  printf "%s start lane=%s issue=%s label=%s mins=%s cmd=%s\n" "$(date -u +%FT%TZ)" "$WR_LANE" "$WR_ISSUE" "$WR_LABEL" "$WR_MINS" "$WR_CMD" >> "$WR_LOG"
+  # a TICKETED coder-llm (engine#2496) is not resident outside its own gpu-hold windows, and this window holds the
+  # token, so it cannot be serving now; stopping it would only throw away its queued ticket (seen 2026-11-15 10:00Z:
+  # a window stopped it and its place in the queue was lost). Stop the old always-on unit only.
+  note=""
+  if systemctl --user show coder-llm -p ExecStart --value 2>/dev/null | grep -q coder-llm-ticketed; then
+    note=" (coder-llm ticketed: not stopped)"
+  elif systemctl --user is-active --quiet coder-llm; then systemctl --user stop coder-llm && touch "$WR_STOPPED"; fi
+  printf "%s start lane=%s issue=%s label=%s mins=%s cmd=%s%s\n" "$(date -u +%FT%TZ)" "$WR_LANE" "$WR_ISSUE" "$WR_LABEL" "$WR_MINS" "$WR_CMD" "$note" >> "$WR_LOG"
   touch "$WR_STARTED"
   holder=$(sed -n "s/.*pid \([0-9]*\).*/\1/p" <<<"$("$GPU_HOLD" --status 2>/dev/null | head -1)" | head -1)
   [ -n "$holder" ] && export GPU_HOLD_TICKET="${GPU_HOLD_TICKET:-$holder}"

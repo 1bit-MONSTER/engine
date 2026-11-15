@@ -296,6 +296,9 @@ wrapper that restarts the unit from inside its own gpu-hold ticket and then poll
 behind that very ticket. The server can answer only after the caller's ticket is released, so such a poll must not count a
 silent `:8090` as "the fleet LLM did not come back". The unit's journal says `queued behind <holder>` when it queues. With
 the model ticketed, a memory window no longer needs to stop it: it is not resident outside its own windows.
+`scripts/window-run.sh` therefore leaves a ticketed unit alone (its window log says `coder-llm ticketed: not stopped`).
+Stopping it would only drop its queued ticket. That happened on 2026-11-15 at 10:00Z, when a window stopped the
+just-switched unit and its place in the queue was lost.
 
 `scripts/install-coder-llm-ticketed.sh` does the switch:
 

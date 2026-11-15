@@ -90,12 +90,19 @@ def gh(path, paginate=False):
 #
 # The sha-first shape requires the head to be a real abbreviated sha (7-40 hex) followed by a known verdict word, so a
 # prose line that starts with a number ("3 arms, 0 failed") or a commit subject cannot be mistaken for a verdict.
-_SHA_FIRST = r'^(?=([0-9a-f]{7,40}[ \t]+(?:VERDICT[ \t]+)?(?:READY|APPROVE|APPROVED|CHANGES|CHANGES_REQUESTED|CHANGES-REQUESTED|CHANGE|NEEDS-CHANGE|NEEDS-CHANGES|REQUEST-CHANGES|NOT-READY)\b))'
+# ONE vocabulary, used by both regexes. The first version of this fix had the sha-first alternative written twice:
+# VERDICT_LINE restricted the word after the sha to the verdict vocabulary while VERDICT_KIND accepted ANY capitalised
+# word. So `abc1234 FAILED - the build broke` (a commit subject, or a quoted log line) was not a VERDICT_LINE but WAS a
+# verdict of kind OTHER, and `newest_verdict` - which gates on verdict_kind only - would call a PR reviewed on a comment
+# that merely quoted a failing build. The tool disagreed with itself, which is worse than either answer alone.
+_KINDS = (r'READY|APPROVE|APPROVED|CHANGES|CHANGES_REQUESTED|CHANGES-REQUESTED|CHANGE|NEEDS-CHANGE|NEEDS-CHANGES|'
+          r'REQUEST-CHANGES|NOT-READY')
+_SHA_FIRST = r'^(?=([0-9a-f]{7,40}[ \t]+(?:VERDICT[ \t]+)?(?:' + _KINDS + r')\b))'
 VERDICT_LINE = re.compile(
     r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b' + '|' + _SHA_FIRST, re.MULTILINE)
 VERDICT_KIND = re.compile(
     r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b[^\n]*' +
-    '|' + r'^[0-9a-f]{7,40}[ \t]+(?:VERDICT[ \t]+)?[A-Z][A-Z_-]+[^\n]*', re.MULTILINE)
+    '|' + r'^[0-9a-f]{7,40}[ \t]+(?:VERDICT[ \t]+)?(?:' + _KINDS + r')\b[^\n]*', re.MULTILINE)
 
 
 def verdict_kind(body):
@@ -313,6 +320,16 @@ def self_test_state():
         'a sha-first verdict at a DIFFERENT head still does not count')
     chk(None, verdict_kind('3 arms, 0 failed'), 'a line that starts with a number is not a verdict')
     chk(None, verdict_kind('abc1234 needs-review'), 'a known sha followed by a non-verdict word is not a verdict')
+
+    # The tool must not disagree with itself. A commit subject or a QUOTED log line that starts with a sha is not a
+    # verdict, and `newest_verdict` gates on verdict_kind alone -- so a broad verdict_kind would let a quoted `FAILED`
+    # mark a PR reviewed while `reviewed_at` says it is not.
+    quoted = [{'body': 'here is what the log said:\n\n79e7b2e FAILED - the build broke\n', 'created_at': '2026-11-15T05:00:00Z'}]
+    chk(None, verdict_kind('79e7b2e FAILED - the build broke'), 'a quoted FAILED line is not a verdict kind')
+    chk(None, newest_verdict([], quoted, '79e7b2e'), 'and --state does not count it as a review at all')
+    chk(False, reviewed_at(quoted, '79e7b2e'), 'which is what reviewed_at already said - the two now agree')
+    chk(None, verdict_kind('dff38fb0 pr_review_queue: read the sha-first verdict shape'),
+        'a commit subject is not a verdict either')
 
     # the attributed case must still prefer the newest NAMED verdict
     revs2 = [{'body': 'VERDICT: CHANGES at `abc1234`', 'submitted_at': '2026-11-14T03:00:00Z'},

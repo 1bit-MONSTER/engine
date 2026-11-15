@@ -66,6 +66,25 @@ def binds_a_port(script):
         return bool(BIND_RE.search(f.read()))
 
 
+# A `tests/*.cpp` that starts a loopback server: the shape `route_script` cannot see, because such a
+# test's COMMAND is an executable rather than a .sh (engine#2504: `http_guard` gained an httplib::Server
+# and took no lock, and this census reported nothing about it).
+EXE_BIND_RE = re.compile(r'bind_to_any_port|httplib::Server')
+
+
+def route_source(test):
+    """The tests/*.cpp an executable test is built from, if that source binds a loopback port."""
+    for arg in test.get("command", []):
+        if not isinstance(arg, str):
+            continue
+        src = os.path.join(TESTS_DIR, os.path.basename(arg) + ".cpp")
+        if os.path.exists(src):
+            with open(src, encoding="utf-8", errors="replace") as f:
+                if EXE_BIND_RE.search(f.read()):
+                    return src
+    return None
+
+
 def lock_of(test):
     for prop in test.get("properties", []):
         if prop.get("name") == "RESOURCE_LOCK":
@@ -85,6 +104,10 @@ class RoutePortLockTest(unittest.TestCase):
             script = route_script(test)
             if script and binds_a_port(script):
                 found[test["name"]] = script
+                continue
+            src = route_source(test)          # engine#2504: a C++ route test is the same hazard
+            if src:
+                found[test["name"]] = src
         return found
 
     def test_the_census_finds_the_route_tests(self):
@@ -100,6 +123,11 @@ class RoutePortLockTest(unittest.TestCase):
         # the number the CI build has, not the number a developer's build may have. It counted 15 before engine #1485
         # moved fifteen scripts to `serve --port 0`; the rest of the old
         # list was `bench_selftest` (binds through tools/bench.py, pinned by its own case below).
+        # engine#2504: the census read .sh only, so a C++ route test was invisible here. Named for the same
+        # reason the three above are: a reader that stops seeing this shape must fail by name, not report a
+        # smaller census that still clears the floor.
+        self.assertIn("http_guard", found,
+                      "http_guard starts an httplib::Server from C++; the census must see it (engine#2504)")
         self.assertGreaterEqual(len(found), 5,
                                 "fewer route tests found than the suite has: " + ", ".join(sorted(found)))
 

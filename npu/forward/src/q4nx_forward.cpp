@@ -703,9 +703,9 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
 
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir) {
-    // engine#2536: on by default at tau 40 (the measured table is in docs/npu.md); NPU_ACT_OUTLIER_TAU=0 turns it off,
-    // NPU_ACT_OUTLIER_KMAX caps the channels split out of one row.
-    outl_tau_ = 40.0f;
+    // engine#2536 / #2576: on by default at tau 20 (the measured table is in docs/npu.md: 40 left Llama-2-7b-chat's EOS
+    // lost once gate/up were covered); NPU_ACT_OUTLIER_TAU=0 turns it off, NPU_ACT_OUTLIER_KMAX caps channels per row.
+    outl_tau_ = 20.0f;
     if (const char* t = getenv("NPU_ACT_OUTLIER_TAU")) outl_tau_ = (float)atof(t);
     if (const char* k = getenv("NPU_ACT_OUTLIER_KMAX")) outl_kmax_ = std::max(1, atoi(k));
     if (const char* hg = getenv("NPU_INFER_HOST_GEMM")) {

@@ -3330,7 +3330,24 @@ At that position, host f32 for `ffn_gate_up` alone restored EOS. So did a fully 
 
 At the default tau 40 the same container answers `'Sure! 12 times 7 is 84.'` and stops after 14 tokens.
 
-**Default: on, `tau` 40.** `NPU_ACT_OUTLIER_TAU=0` turns it off. Measured with `serve --device npu`, using teacher-forced
+**Default: on, `tau` 20 (since engine#2576; it was 40 while only `ffn_down` was split).** With gate/up covered, tau 40 still left Llama-2-7b-chat (1.7.1 hybrid) answering `'… 84. Unterscheidung between …'`, where host f32 gives EOS. Tau 20, 10 and 5 all give EOS. The same tickets measured, with gate/up included:
+
+| model | tau 0 | tau 20 | tau 40 | reply at tau 20 |
+|---|---|---|---|---|
+| Llama-2-7b-chat 1.7.1 | — | — | — | `Great! 12 times 7 is equal to 84.` (stop, 16 tok); EOS at the failing prefix |
+| CodeLlama-7b-Instruct 1.7.1 | — | — | — | EOS at the failing prefix (also at 40) |
+| Qwen2.5-3B-Instruct 1.7.1 | — | 58/64 | 58/64 | `… July 20, 1969 …`; the `…, 1` prefix gives `96` |
+| Qwen2.5-0.5B-Instruct 1.9.0 | 53/64 | 52/64 | 51/64 | answers unchanged |
+| SmolLM2-135M-Instruct 1.9.0 | 53/64 | 54/64 | 53/64 | answers unchanged |
+
+CodeLlama speed, tau 0 vs 20, A B A B in one ticket:
+
+- **Decode (64 tok):** 0.997 / 1.046 tok/s vs 1.030 / 1.001 tok/s, unchanged.
+- **Prefill (520 tok):** 14,260 / 14,400 ms vs 15,165 / 17,244 ms, **+6 % to +20 %**. At tau 20 more prefill rows split, and each new channel costs one column-block gather on first use.
+
+The older table below was measured before gate/up were covered and is kept as it was measured.
+
+**Before engine#2576 (ffn_down only): default tau 40.** `NPU_ACT_OUTLIER_TAU=0` turns it off. Measured with `serve --device npu`, using teacher-forced
 top-1 agreement against HF fp32 on 64 positions (the same probes for every column):
 
 | model | off | tau 20 | tau 40 | reply |

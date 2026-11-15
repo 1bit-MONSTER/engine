@@ -45,7 +45,10 @@
 #   CODER_LLM_DEMAND_TTL_MIN    a touch this recent is demand, default 30 (CODER_LLM_DEMAND_TTL_S in seconds wins)
 #   CODER_LLM_IDLE_MIN          idle minutes that end a window, default 5 (CODER_LLM_IDLE_S in seconds wins)
 #   CODER_LLM_MAX_HOLD_MIN      max hold per window (gpu-hold -t), default 25
-#   CODER_LLM_QUEUE_WAIT_S      how long one window queues for the GPU (gpu-hold -w), default 5400
+#   CODER_LLM_QUEUE_WAIT_S      how long one window queues for the GPU (gpu-hold -w), default 86400. Long on purpose:
+#                               a ticket that gives up (rc 75) is replaced by a NEW one at the BACK of the FIFO, so a
+#                               short wait on a busy box (10+ lane tickets) would lose its place every time and starve
+#                               reviews; systemd's Restart= makes the wait unbounded anyway, so length only keeps place
 #   CODER_LLM_URL               the server's base URL for /slots, default http://127.0.0.1:8090
 #   CODER_LLM_POLL_S            poll interval, default 15
 #   CODER_LLM_GH_POLL           1 (the default) = also treat a queued/in-progress pr-agent run as demand (REST,
@@ -63,7 +66,7 @@ DEMAND=${CODER_LLM_DEMAND:-$HOME/.cache/coder-llm/demand}
 DEMAND_TTL=${CODER_LLM_DEMAND_TTL_S:-$(( ${CODER_LLM_DEMAND_TTL_MIN:-30} * 60 ))}
 IDLE=${CODER_LLM_IDLE_S:-$(( ${CODER_LLM_IDLE_MIN:-5} * 60 ))}
 MAX_HOLD=${CODER_LLM_MAX_HOLD_MIN:-25}
-QUEUE_WAIT=${CODER_LLM_QUEUE_WAIT_S:-5400}
+QUEUE_WAIT=${CODER_LLM_QUEUE_WAIT_S:-86400}
 URL=${CODER_LLM_URL:-http://127.0.0.1:8090}
 POLL=${CODER_LLM_POLL_S:-15}
 GH_POLL=${CODER_LLM_GH_POLL:-1}
@@ -116,6 +119,12 @@ if [ "${1:-}" = "--window" ]; then
     shift
     [ "${1:-}" = "--" ] && shift
     [ $# -gt 0 ] || { log "--window needs a server command"; exit 2; }
+    # a ticket granted after its demand went stale (a long queue) releases at once instead of loading a 30B model and
+    # idling for IDLE seconds: on a deep queue that is a load per stale entry, about an hour of GPU (review of #2514)
+    if [ "${CODER_LLM_ALWAYS:-0}" != 1 ] && ! demand_fresh "$DEMAND_TTL" && ! gh_demand; then
+        log "ticket granted with no fresh demand: releasing without starting the server"
+        exit 0
+    fi
     "$@" &
     server=$!
     stop_server() {

@@ -27,7 +27,9 @@
 #   C a busy server is cut at the max hold (rc 124), the server is gone;
 #   D a gfxhub page fault in the kernel log during the window ends it (rc 78) and the server dies with it;
 #   E a lane that queues during a window gets the GPU before the next coder-llm window (FIFO; the restart re-queues);
-#   F a failing gh (the pr-agent-run fallback) is logged once per wait with its reason, and opens no window.
+#   F a failing gh (the pr-agent-run fallback) is logged once per wait with its reason, and opens no window;
+#   G the default queue wait is long enough to keep the ticket's place; H a grant whose demand went stale releases
+#     without starting the server.
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)   # the defaults work from any directory, not only the repo root
 tick=${1:-$root/scripts/coder-llm-ticketed}
@@ -145,5 +147,22 @@ env "${envs[@]}" CODER_LLM_GH_POLL=1 CODER_LLM_GH_POLL_S=1 PATH="$scratch/ghbin:
 grep -q 'gh is not logged in' "$scratch/f.log" || { echo "FAIL F: no warning that gh is not logged in"; fail=1; }
 [ -e "$scratch/TOKEN" ] && { echo "FAIL F: a failing poll opened a window"; fail=1; }
 
-[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window)"
+# ---- H: a ticket granted after its demand went stale releases without starting the server ---------------------------
+echo busy > "$scratch/state"; rm -f "$scratch/server.pid"; : > "$scratch/klog"
+env "${envs[@]}" GPU_HOLD_WAIT=60 "$hold" -t 1 -l lanehold -- sleep 7 > /dev/null 2>&1 &
+lh=$!; pids+=($lh)
+wait_for 10 test -e "$scratch/TOKEN" || { echo "FAIL H: the lane did not take the token"; fail=1; }
+touch "$scratch/demand"   # fresh when coder-llm queues, stale (TTL 3 s) by the time the lane releases
+env "${envs[@]}" CODER_LLM_DEMAND_TTL_S=3 CODER_LLM_IDLE_S=60 CODER_LLM_MAX_HOLD_MIN=5 timeout 60 "$tick" -- "$scratch/fake" > "$scratch/h.log" 2>&1
+rc=$?
+wait "$lh"
+[ "$rc" = 0 ] || { echo "FAIL H: rc $rc for a stale-demand grant, want 0"; fail=1; }
+grep -q "ticket granted with no fresh demand" "$scratch/h.log" || { echo "FAIL H: the stale grant did not say it released"; fail=1; }
+[ -s "$scratch/server.pid" ] && { echo "FAIL H: the server was started for a stale grant"; fail=1; }
+
+# ---- G: the default queue wait keeps the ticket's place on a busy box (a give-up re-queues at the back) ------------
+sed -n 's/^QUEUE_WAIT=\${CODER_LLM_QUEUE_WAIT_S:-\([0-9]*\)}$/\1/p' "$tick" > "$scratch/qw"
+[ "$(cat "$scratch/qw")" -ge 14400 ] 2> /dev/null || { echo "FAIL G: default queue wait $(cat "$scratch/qw")s; under 4 h a busy queue makes it re-queue at the back and starve"; fail=1; }
+
+[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load)"
 exit "$fail"

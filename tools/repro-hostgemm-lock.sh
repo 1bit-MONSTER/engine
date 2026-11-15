@@ -48,9 +48,13 @@ if ls -l /proc/[0-9]*/fd 2>/dev/null | grep -q "$LOCK"; then
 fi
 
 echo "== $LABEL: $BIN (lock held by another process at start: $HELD_BY_OTHER)"
-NPU_INFER_HOST_GEMM=1 setsid "$BIN" forward-serve -m "$MODEL/model.q4nx" --kernels "$MODEL" -p "$PORT" > "$LOG" 2>&1 &
+# NOT `setsid`: it makes `$!` the setsid pid, so `kill $PID` below would miss the server and leave a
+# forward-serve holding the NPU context after this script exits — the same defect that left a 22 h
+# `flm-real serve` orphan on 2026-11-15 and blocked two lanes' hwctx creates. The port-scoped pkill in
+# the trap is the belt for the same reason: cleanup must not depend on `$!` being the server.
+NPU_INFER_HOST_GEMM=1 "$BIN" forward-serve -m "$MODEL/model.q4nx" --kernels "$MODEL" -p "$PORT" > "$LOG" 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null' EXIT
+trap 'kill $PID 2>/dev/null; pkill -f "forward-serve .* -p $PORT" 2>/dev/null; wait $PID 2>/dev/null' EXIT
 up=0
 for i in $(seq 1 120); do
     curl -s -m 2 "http://127.0.0.1:$PORT/health" | grep -q '"ok"' && { up=1; break; }

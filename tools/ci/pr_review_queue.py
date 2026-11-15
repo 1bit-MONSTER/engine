@@ -79,10 +79,30 @@ def gh(path, paginate=False):
 # `abc1234` ``) and quote **other people's** verdicts when reconciling them, and both were being read as verdicts by the
 # author. Measured 2026-11-14: this lane's own reconciliation comment on npu-kernels#70 quoted `VERDICT: NEEDS-CHANGE` at
 # the head, so `--state` reported a READY PR as held by a CHANGES that no reviewer had written.
-VERDICT_LINE = re.compile(r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b', re.MULTILINE)
-
-
-VERDICT_KIND = re.compile(r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b[^\n]*', re.MULTILINE)
+# Two line shapes, because both are written and only one was read (measured 2026-11-15): the canonical
+#   VERDICT: READY at `abc1234`
+# and the sha-first
+#   79e7b2e READY — the arm that was missing is there
+# where the head comes first and the verdict word right after it, with no `VERDICT` word anywhere. Four verdicts of
+# the second shape were posted on one night's queue and every one of them was invisible: `verdict_kind` answered None,
+# so the PR stayed on the queue and the review was repeated by the next lane. The queue's whole claim is that it knows
+# what has been reviewed; a convention it cannot read is not a convention.
+#
+# The sha-first shape requires the head to be a real abbreviated sha (7-40 hex) followed by a known verdict word, so a
+# prose line that starts with a number ("3 arms, 0 failed") or a commit subject cannot be mistaken for a verdict.
+# ONE vocabulary, used by both regexes. The first version of this fix had the sha-first alternative written twice:
+# VERDICT_LINE restricted the word after the sha to the verdict vocabulary while VERDICT_KIND accepted ANY capitalised
+# word. So `abc1234 FAILED - the build broke` (a commit subject, or a quoted log line) was not a VERDICT_LINE but WAS a
+# verdict of kind OTHER, and `newest_verdict` - which gates on verdict_kind only - would call a PR reviewed on a comment
+# that merely quoted a failing build. The tool disagreed with itself, which is worse than either answer alone.
+_KINDS = (r'READY|APPROVE|APPROVED|CHANGES|CHANGES_REQUESTED|CHANGES-REQUESTED|CHANGE|NEEDS-CHANGE|NEEDS-CHANGES|'
+          r'REQUEST-CHANGES|NOT-READY')
+_SHA_FIRST = r'^(?=([0-9a-f]{7,40}[ \t]+(?:VERDICT[ \t]+)?(?:' + _KINDS + r')\b))'
+VERDICT_LINE = re.compile(
+    r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b' + '|' + _SHA_FIRST, re.MULTILINE)
+VERDICT_KIND = re.compile(
+    r'^(?![^A-Za-z0-9]*`[^`]*VERDICT)[^A-Za-z0-9]*VERDICT\b[^\n]*' +
+    '|' + r'^[0-9a-f]{7,40}[ \t]+(?:VERDICT[ \t]+)?(?:' + _KINDS + r')\b[^\n]*', re.MULTILINE)
 
 
 def verdict_kind(body):
@@ -95,8 +115,10 @@ def verdict_kind(body):
     found = VERDICT_KIND.search(body or '')
     if not found:
         return None
-    words = re.findall(r'[A-Z][A-Z_-]+', found.group(0))
-    for word in words[1:]:
+    # `VERDICT` is the marker word, not a kind: drop it rather than skipping the first token, because in the sha-first
+    # shape the first token IS the kind (`79e7b2e READY`).
+    words = [w for w in re.findall(r'[A-Z][A-Z_-]+', found.group(0)) if w != 'VERDICT']
+    for word in words:
         if word in ('READY', 'APPROVE', 'APPROVED'):
             return 'READY'
         # `NEEDS-CHANGE`, `CHANGES-REQUESTED`, `NOT-READY`: a lane writes the verdict in prose as often as in the
@@ -187,9 +209,11 @@ def queue(repos, min_age_hours=0.0, now_epoch=None):
 
 def self_test():
     rc = 0
+    arms = [0]
 
     def chk(want, got, what):
         nonlocal rc
+        arms[0] += 1
         if want == got:
             print(f"ok   {what}")
         else:
@@ -241,7 +265,7 @@ def self_test():
         'a verdict with markdown decoration before it still counts')
     chk(True, reviewed_at([{'body': 'VERDICT: CHANGES at `abc1234`'}], 'abc1234'),
         'CHANGES is a verdict: the PR was reviewed, the answer was no')
-    print(f"pr_review_queue --self-test: {'ok' if rc == 0 else 'FAIL'}")
+    print(f"pr_review_queue --self-test: {'ok' if rc == 0 else 'FAIL'} ({arms[0]} arms)")
     return rc
 
 
@@ -271,8 +295,10 @@ def state(repos):
 def self_test_state():
     """The two shapes that made `--state` lie until they were run against the live queue."""
     problems = []
+    arms = [0]
 
     def chk(want, got, what):
+        arms[0] += 1
         if want != got:
             problems.append(f"{what}: want {want!r}, got {got!r}")
 
@@ -284,6 +310,31 @@ def self_test_state():
     chk('OTHER', verdict_kind('VERDICT: something nobody has seen before'),
         'an unknown kind is OTHER, never a silent none')
 
+    # The sha-first shape, measured on the live queue 2026-11-15: four verdicts written `79e7b2e READY — <why>` were
+    # invisible, so the PR stayed on the queue and the next lane reviewed it again. Every arm below is one of the four
+    # that were posted that night, plus the lines that must NOT be read as a verdict.
+    sha_first = [{'body': '79e7b2e READY — the arm that was missing is there', 'submitted_at': '2026-11-15T05:48:17Z'}]
+    chk(True, reviewed_at(sha_first, '79e7b2e'), 'a sha-first READY naming this head counts')
+    chk(('READY', '2026-11-15T05:48:17Z'), newest_verdict(sha_first, [], '79e7b2e'),
+        'and --state reports it as READY, not UNATTRIBUTED')
+    chk('READY', verdict_kind('79e7b2e READY — the arm is there'), 'the sha-first kind is read, not skipped')
+    chk('CHANGES', verdict_kind('c0cefd5 CHANGES — one claim has no arm'), 'sha-first CHANGES too')
+    chk('CHANGES', verdict_kind('7f7cfff CHANGES - a hyphen, not an em dash'), 'the ASCII-hyphen form too')
+    chk(False, reviewed_at([{'body': '79e7b2e READY — x'}], '9999999'),
+        'a sha-first verdict at a DIFFERENT head still does not count')
+    chk(None, verdict_kind('3 arms, 0 failed'), 'a line that starts with a number is not a verdict')
+    chk(None, verdict_kind('abc1234 needs-review'), 'a known sha followed by a non-verdict word is not a verdict')
+
+    # The tool must not disagree with itself. A commit subject or a QUOTED log line that starts with a sha is not a
+    # verdict, and `newest_verdict` gates on verdict_kind alone -- so a broad verdict_kind would let a quoted `FAILED`
+    # mark a PR reviewed while `reviewed_at` says it is not.
+    quoted = [{'body': 'here is what the log said:\n\n79e7b2e FAILED - the build broke\n', 'created_at': '2026-11-15T05:00:00Z'}]
+    chk(None, verdict_kind('79e7b2e FAILED - the build broke'), 'a quoted FAILED line is not a verdict kind')
+    chk(None, newest_verdict([], quoted, '79e7b2e'), 'and --state does not count it as a review at all')
+    chk(False, reviewed_at(quoted, '79e7b2e'), 'which is what reviewed_at already said - the two now agree')
+    chk(None, verdict_kind('dff38fb0 pr_review_queue: read the sha-first verdict shape'),
+        'a commit subject is not a verdict either')
+
     # the attributed case must still prefer the newest NAMED verdict
     revs2 = [{'body': 'VERDICT: CHANGES at `abc1234`', 'submitted_at': '2026-11-14T03:00:00Z'},
              {'body': 'VERDICT: READY at `abc1234`', 'submitted_at': '2026-11-14T03:10:00Z'}]
@@ -294,7 +345,7 @@ def self_test_state():
         for problem in problems:
             print('FAIL ' + problem)
         return 1
-    print('pr_review_queue --state self-test: ok')
+    print(f'pr_review_queue --state self-test: ok ({arms[0]} arms)')
     return 0
 
 
@@ -395,7 +446,16 @@ def main(argv):
     if a.self_test:
         if a.duplicates:
             return self_test_duplicates()
-        return self_test() if not a.state else self_test_state()
+        # Both suites, always. `--state` used to SELECT one of them, so the row CI runs (`--self-test`, no flag) never
+        # executed the 16 assertions about the shapes that made `--state` lie -- a check the row does not run is not a
+        # check. `--state --self-test` still works and runs the same two; the flag now only says which output the caller
+        # expected, not which half to skip.
+        rc_main = self_test()
+        rc_state = self_test_state()
+        # One verdict for both halves: the per-suite lines print in order, so a reader who sees "ok (12 arms)" and then a
+        # FAIL from the second suite needs the last line to say the run failed.
+        print(f"pr_review_queue --self-test: {'ok' if not (rc_main or rc_state) else 'FAIL'} (both suites)")
+        return rc_main or rc_state
     if a.duplicates:
         rows = duplicates(a.repos)
         if a.json:

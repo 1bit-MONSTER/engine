@@ -279,6 +279,28 @@ while [ "$state" = queued ]; do
             if ( set -o noclobber; printf '%s\n' "$mine" > "$TOKEN" ) 2> /dev/null; then
                 state=holding
                 log "took $TOKEN after ${waited}s (die $(tctl)C)"
+                # A RECENT amdgpu/MES RESET, checked at the one choke point every lane goes through. The standing rule is
+                # "on any amdgpu reset: stop, release the ticket" and until now nothing implemented it - my own window
+                # harness had no such check (grep 'dmesg|reset|MES' = 0 in all three scripts) and on 2026-11-15 a window
+                # started 7 minutes after an MES reset, hours before the box took a hard CPU shutdown. Lane-local guards
+                # only protect the lanes that wrote them; this one protects the ticket.
+                #
+                # Refuse only when the kernel log is READABLE and shows a reset in the window. On a CI runner there is no
+                # kernel log to read and `gpu_hold_*`'s own tests must keep passing, so "cannot read" is a note, not a
+                # refusal - the opposite of a device guard, and worth stating because it is the surprising half.
+                _reset_window=${GPU_HOLD_RESET_WINDOW_MIN:-10}
+                _klog=$(journalctl -k --since "-${_reset_window} min" --no-pager 2> /dev/null)
+                if [ -z "$_klog" ]; then
+                    log "note: no kernel log available, so a reset in the last ${_reset_window} min cannot be ruled out (not refusing: CI has no journal)"
+                else
+                    _resets=$(printf '%s\n' "$_klog" | grep -ciE 'amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure)')
+                    if [ "${_resets:-0}" -gt 0 ]; then
+                        rm -f "$TOKEN"; state=done
+                        log "::error::refusing: ${_resets} amdgpu/MES reset line(s) in the last ${_reset_window} min - the ticket is released unheld. Inspect the kernel log, then retry"
+                        printf '%s\n' "$_klog" | grep -iE 'amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure)' | tail -3
+                        exit 78
+                    fi
+                fi
                 # the previous holder left a process the kernel would not kill: say so before this lane measures
                 if [ -s "$SURVIVORS" ]; then
                     log "::warning::previous holder left $(tr '\n' ';' < "$SURVIVORS") - that device may still hold its memory (engine #1639)"

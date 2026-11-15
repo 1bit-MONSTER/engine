@@ -32,6 +32,9 @@
 #include <cstddef>
 #include <cstdlib>
 #include <exception>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <thread>
 #include <vector>
 
@@ -72,6 +75,9 @@ inline size_t audio_thread_count() {
     return hw == 0 ? 1 : (hw > 8 ? 8 : hw);
 }
 
+struct par_overhead;
+inline par_overhead & par_overhead_stats();
+
 // Run fn(0) .. fn(units-1), each exactly once, on at most `want` threads. Worker t takes units t, t+want, t+2*want, ...
 template <typename Fn>
 void parallel_units(size_t units, size_t want, Fn&& fn) {
@@ -80,8 +86,17 @@ void parallel_units(size_t units, size_t want, Fn&& fn) {
         for (size_t u = 0; u < units; ++u) fn(u);
         return;
     }
+    // engine#2366: instrumented because the question could not be answered any other way. Whole-model A/B runs
+    // cannot resolve a 2 % effect against this box's 8-11 % run-to-run spread (measured), and a micro-benchmark
+    // measures thread CREATION on an idle box rather than the cost inside a graph. So: time each threaded call and
+    // each worker's own work; the summed (call - slowest_worker) is exactly what a persistent pool would remove.
+    // Measured this way on a whisper decode: 16079 calls, 292.4 ms of tax, 0.018 ms/call, 2.0 % of wall.
+    // It also caught a pool implementation that was 54 % SLOWER, which no wall-clock A/B would have attributed.
+    const bool measure = std::getenv("ONEBIT_AUDIO_PAR_OVERHEAD") != nullptr;
+    const auto t_call = std::chrono::steady_clock::now();
     std::vector<std::exception_ptr> failed(want);
     std::vector<std::thread> pool;
+    std::vector<std::chrono::steady_clock::time_point> w_stop(want);
     pool.reserve(want);
     for (size_t t = 0; t < want; ++t)
         pool.emplace_back([&, t]() {
@@ -90,10 +105,46 @@ void parallel_units(size_t units, size_t want, Fn&& fn) {
             } catch (...) {
                 failed[t] = std::current_exception();
             }
+            if (measure) w_stop[t] = std::chrono::steady_clock::now();
         });
     for (auto& th : pool) th.join();
+    if (measure) {
+        using ns = std::chrono::nanoseconds;
+        const auto t_done = std::chrono::steady_clock::now();
+        uint64_t work = 0;
+        for (size_t t = 0; t < want; ++t) {
+            if (w_stop[t].time_since_epoch().count() == 0) continue;
+            const uint64_t d = (uint64_t) std::chrono::duration_cast<ns>(w_stop[t] - t_call).count();
+            if (d > work) work = d;   // the slowest worker bounds how long the join could usefully wait
+        }
+        auto& s = par_overhead_stats();
+        s.calls.fetch_add(1);
+        s.ns_total.fetch_add((uint64_t) std::chrono::duration_cast<ns>(t_done - t_call).count());
+        s.ns_work_max.fetch_add(work);
+    }
     for (const auto& ep : failed)
         if (ep) std::rethrow_exception(ep);
+}
+
+// engine#2366: see parallel_units. One line at exit when ONEBIT_AUDIO_PAR_OVERHEAD is set; nothing is measured
+// when it is unset (the branch is a single getenv at the top of each call, and the setenv result is stable).
+struct par_overhead {
+    std::atomic<uint64_t> calls{0}, ns_total{0}, ns_work_max{0};
+    ~par_overhead() {
+        if (std::getenv("ONEBIT_AUDIO_PAR_OVERHEAD") == nullptr) return;
+        const uint64_t c = calls.load(), tot = ns_total.load(), work = ns_work_max.load();
+        if (c == 0) return;
+        const double ms_tot = double(tot) / 1e6, ms_work = double(work) / 1e6, ms_tax = ms_tot - ms_work;
+        std::fprintf(stderr,
+                     "[par-overhead] %llu threaded calls: total %.1f ms, slowest-worker work %.1f ms, tax %.1f ms "
+                     "(%.1f%% of threaded time, %.3f ms/call)\n",
+                     (unsigned long long) c, ms_tot, ms_work, ms_tax, ms_tot > 0 ? 100.0 * ms_tax / ms_tot : 0.0,
+                     c ? ms_tax / double(c) : 0.0);
+    }
+};
+inline par_overhead & par_overhead_stats() {
+    static par_overhead s;
+    return s;
 }
 
 template <typename Fn>

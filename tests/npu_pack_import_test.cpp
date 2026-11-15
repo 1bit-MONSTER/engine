@@ -2672,6 +2672,15 @@ void test_block32_layers(const std::string& root) {
                   std::to_string(l.stride) + ")");
         check(l.head_off == 70809976 && l.head_units == 768 && l.min_size == 90470776,
               "block-32 layout: its head at 70,809,976 and the file's 90,470,776 B (" + std::to_string(l.min_size) + ")");
+        // engine#2594: the 1.8 Token .fconst of the same model: k_proj first, then q_proj, v_proj, and no sink field
+        // (4 * 9 heads = 36 B less per layer). These offsets rebuild the 1.9 file from the 1.8 one byte for byte
+        // except 112 code bytes of layer 3's o_proj.
+        const pi::Block32Layout n = pi::block32_layout(d, true);
+        check(n.why.empty() && n.k_off == 1216 && n.q_off == 78016 && n.v_off == 308416 && n.o_off == 385216 &&
+                  n.post_off == 615616 && n.stride == 2360256 && n.min_size == 90469696,
+              "block-32 layout, 1.8 form: SmolLM2-135M, k at 1,216, q at 78,016, o at 385,216, stride 2,360,256 and "
+              "90,469,696 B (" + std::to_string(n.q_off) + " / " + std::to_string(n.stride) + " / " +
+                  std::to_string(n.min_size) + ")");
         d.intermediate = 1500;
         check(pi::block32_layout(d).why.find("intermediate 1500") != std::string::npos,
               "block-32 layout: a width that is not whole 64-row units is refused by name");
@@ -2703,14 +2712,18 @@ void test_block32_layers(const std::string& root) {
         e[0] = char(0x86), e[1] = char(0x35);   // bf16 1e-06
         return e + norm_bytes(which);
     };
-    const auto fconst = [&] {
+    const auto fconst = [&](bool form18 = false) {
         std::string fc;
         for (int l = 0; l < LAYERS; ++l) {
             const auto& m = [&](int i) -> const std::vector<float>& { return mats[size_t(l * NPROJ + i)]; };
             fc += envelope(10 * l + 1);
-            fc += encode_block32_units(m(Q), NQ, H) + encode_block32_units(m(K_), NKV, H) +
-                  encode_block32_units(m(V_), NKV, H);
-            fc += std::string(4 * 2, '\x7f');   // 4 x heads bytes that are not a weight (their content is not read)
+            if (form18)   // engine#2594: the 1.8 writer puts k_proj first and writes no sink field
+                fc += encode_block32_units(m(K_), NKV, H) + encode_block32_units(m(Q), NQ, H) +
+                      encode_block32_units(m(V_), NKV, H);
+            else
+                fc += encode_block32_units(m(Q), NQ, H) + encode_block32_units(m(K_), NKV, H) +
+                      encode_block32_units(m(V_), NKV, H) +
+                      std::string(4 * 2, '\x7f');   // 4 x heads bytes that are not a weight (not read)
             fc += encode_block32_units(m(O), H, NQ);
             fc += envelope(10 * l + 2);
             fc += encode_block32_gate_up(m(G), m(U), IM, H);
@@ -2804,6 +2817,7 @@ void test_block32_layers(const std::string& root) {
             const pi::Plan p = pi::plan(dir.string());
             check(p.block32_layers && p.block32_note.empty() && p.refused().empty(),
                   "all-block-32: the plan takes the block-32 layout and refuses nothing (" + p.block32_note + ")");
+            check(!p.block32_form18, "all-block-32: a 1.9-form file keeps the 1.9 layout");
             r = pi::import_pack(dir.string(), out, pi::Options{});
         } catch (const std::exception& e) {
             said = e.what();
@@ -2853,6 +2867,49 @@ void test_block32_layers(const std::string& root) {
             check(!tbl.contains("model.layers.0.self_attn.q_proj.bias"), "all-block-32: no bias tensor is invented");
         } else {
             check(false, "all-block-32: the container was written");
+        }
+        fs::remove_all(out);
+        fs::remove_all(dir);
+    }
+    {   // 5n: the 1.8 writer's file (engine#2594): k_proj before q_proj and no sink field. The plan takes the 1.8
+        // form, and every projection comes back as its own matrix -- q and k are not swapped (they differ in rows and
+        // content here), and the 4*heads shift is applied from o_proj on in every layer, not only at the head.
+        const std::string nosink = fconst(true);
+        check(int64_t(nosink.size()) + 2 * 4 * 2 == int64_t(good.size()), "no-sink fixture: 8 B shorter per layer");
+        const fs::path dir = build("b32-nosink", nosink, true);
+        const std::string out = out_of("nosink");
+        fs::remove_all(out);
+        pi::Report r;
+        std::string said;
+        try {
+            const pi::Plan p = pi::plan(dir.string());
+            check(p.block32_layers && p.block32_form18 && p.block32_note.empty() && p.refused().empty(),
+                  "all-block-32, 1.8 form: the plan takes it (" + p.block32_note + ")");
+            r = pi::import_pack(dir.string(), out, pi::Options{});
+        } catch (const std::exception& e) {
+            said = e.what();
+        }
+        check(said.empty() && r.refused.empty(), "all-block-32, 1.8 form: imports (" + said + ")");
+        check(r.stride == (int64_t(good.size()) - (64 + 2 * H) - pi::block32_unit_bytes(H)) / LAYERS - 4 * 2,
+              "all-block-32, 1.8 form: the stride is the 1.9 one less 4 x heads (" +
+                  std::to_string(r.stride) + ")");
+        if (fs::exists(out + "/model.q4nx")) {
+            const json tbl = container_table(out + "/model.q4nx");
+            const std::vector<uint8_t> blob = container_payload(out + "/model.q4nx");
+            for (int l = 0; l < LAYERS; ++l)
+                for (int i = 0; i < NPROJ; ++i) {
+                    const std::string name = "model.layers." + std::to_string(l) + "." + pname[i] + ".weight";
+                    const int cols = std::min(pcol[i], onebit::npu::q4nx::kCols);
+                    const std::vector<float> got = tile0(tbl, blob, name, cols);
+                    const double c = got.empty() ? 0.0 : ncorr(got, head_of(mats[size_t(l * NPROJ + i)], pcol[i], cols));
+                    check(c > 0.99, "all-block-32, 1.8 form: " + name + " is its own matrix (corr " +
+                                        std::to_string(c) + ")");
+                }
+            const std::vector<float> hd = tile0(tbl, blob, "lm_head.weight", H);
+            check(!hd.empty() && ncorr(hd, head_of(emb, H, H)) > 0.99,
+                  "all-block-32, 1.8 form: lm_head is the tail's head");
+        } else {
+            check(false, "all-block-32, 1.8 form: the container was written");
         }
         fs::remove_all(out);
         fs::remove_all(dir);

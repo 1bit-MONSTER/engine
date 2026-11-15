@@ -2967,7 +2967,7 @@ Block32GateUp read_block32_gate_up(const uint8_t* p, int64_t avail, int64_t rows
     return h;
 }
 
-Block32Layout block32_layout(const Dims& d) {
+Block32Layout block32_layout(const Dims& d, bool form18) {
     Block32Layout l;
     const int64_t H = d.hidden, IM = d.intermediate, Nq = int64_t(d.heads) * d.head_dim,
                   Nkv = int64_t(d.kv_heads) * d.head_dim, V = d.vocab;
@@ -2986,11 +2986,17 @@ Block32Layout block32_layout(const Dims& d) {
             return l;
         }
     l.env = kNormOff + 2 * H;
-    l.q_off = l.env;
-    l.k_off = l.q_off + (Nq / kB32UnitRows) * block32_unit_bytes(H);
-    l.v_off = l.k_off + (Nkv / kB32UnitRows) * block32_unit_bytes(H);
+    if (form18) {   // engine#2594: the 1.8 writer puts k_proj first and has no sink field
+        l.k_off = l.env;
+        l.q_off = l.k_off + (Nkv / kB32UnitRows) * block32_unit_bytes(H);
+        l.v_off = l.q_off + (Nq / kB32UnitRows) * block32_unit_bytes(H);
+    } else {
+        l.q_off = l.env;
+        l.k_off = l.q_off + (Nq / kB32UnitRows) * block32_unit_bytes(H);
+        l.v_off = l.k_off + (Nkv / kB32UnitRows) * block32_unit_bytes(H);
+    }
     l.sink_off = l.v_off + (Nkv / kB32UnitRows) * block32_unit_bytes(H);
-    l.o_off = l.sink_off + 4 * int64_t(d.heads);
+    l.o_off = l.sink_off + (form18 ? 0 : 4 * int64_t(d.heads));
     l.post_off = l.o_off + (H / kB32UnitRows) * block32_unit_bytes(Nq);
     l.gu_off = l.post_off + l.env;
     l.hdr_off = l.gu_off + (IM / kB32UnitRows) * block32_mlp_unit_bytes(H);
@@ -3303,8 +3309,9 @@ std::string Plan::manifest() const {
     // engine#1503: an all-block-32 pack is read with its own layout, so the block-128 measurements above are 0 for it;
     // this says which layout was used and what its arithmetic gives. Absent for every other pack.
     if (block32_layers) {
-        const Block32Layout lay = block32_layout(dims);
-        j["block32_layers"] = {{"stride", lay.stride},
+        const Block32Layout lay = block32_layout(dims, block32_form18);
+        j["block32_layers"] = {{"form", block32_form18 ? "1.8 (k, q, v, o; no sink field)" : "1.9 (q, k, v, sink, o)"},
+                               {"stride", lay.stride},
                                {"post_attention_envelope", lay.post_off},
                                {"head_offset", lay.head_off},
                                {"head_units", lay.head_units},
@@ -4396,6 +4403,16 @@ Plan plan(const std::string& pack_dir) {
         } else {
             Fconst fc = open_fconst(tok_path);
             p.block32_note = block32_file_refusal(fc.map, int64_t(fc.size), p.dims, lay);
+            // engine#2594: the 1.8 file is the same block with k_proj before q_proj and no sink field. Taken only when
+            // the file fits that form and not the 1.9 one; the envelopes move by 4*heads bytes a layer, so both cannot
+            // pass on a multi-layer file.
+            if (!p.block32_note.empty()) {
+                const Block32Layout f18 = block32_layout(p.dims, true);
+                if (block32_file_refusal(fc.map, int64_t(fc.size), p.dims, f18).empty()) {
+                    p.block32_note.clear();
+                    p.block32_form18 = true;
+                }
+            }
             unmap_file(fc.map, fc.size);
         }
     }
@@ -6033,7 +6050,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // below writes, in the same form. This layout has no bias field, so no bias tensor is written.
         std::vector<std::string> late;
         if (p.block32_note.empty()) {
-            const Block32Layout lay = block32_layout(p.dims);
+            const Block32Layout lay = block32_layout(p.dims, p.block32_form18);
             Fconst fc = open_fconst(find_token_fconst(pack_dir));
             // the file is re-checked on this mapping: plan() looked at its own
             if (const std::string why = block32_file_refusal(fc.map, int64_t(fc.size), p.dims, lay); !why.empty())

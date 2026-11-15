@@ -64,6 +64,10 @@ private:
     // The normalizer rewrites spaces to the metaspace symbol but prepends none (Gemma4): no dummy prefix is added on
     // encode and none is stripped on decode.
     bool spm_no_prefix_ = false;
+    // The prefix comes from a Metaspace PRE-TOKENIZER (prepend_scheme first/always, Mistral-7B v0.2/v0.3, engine#1503):
+    // like the tokenizers library, it is added only when the text does not already start with a space, so " a" is
+    // "\u2581a" and not "\u2581\u2581a". A Prepend NORMALIZER (spm_prepends_meta) always prepends and keeps the old rule.
+    bool spm_prefix_unless_leading_ = false;
     // SentencePiece AND a merge list (Phi-3.5, engine#1189): pieces are merged by rank over the
     // normalised text instead of greedy longest-match, which is only right for a merge-less
     // vocabulary.

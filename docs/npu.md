@@ -68,13 +68,19 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
   npu/                   the model's NPU kernels
 ```
 
-The NPU route reads `tokenizer.json` with its own reader (`npu/tokenizer.cpp`). Four vocabulary shapes are handled:
+The NPU route reads `tokenizer.json` with its own reader (`npu/tokenizer.cpp`). Five vocabulary shapes are handled:
 byte-level BPE; SentencePiece pieces with no merges; SentencePiece pieces with merges and a normalizer that prepends
-the word-boundary symbol (Phi-3.5); and BPE with merges whose normalizer only rewrites spaces to that symbol and
+the word-boundary symbol (Phi-3.5); the same pieces declared through a `Metaspace` pre-tokenizer instead of a
+normalizer (Mistral-7B-Instruct v0.2 and v0.3: `prepend_scheme` `first`/`always`, or the older `add_prefix_space`),
+where, as in the reference library, the symbol is prepended only when the text does not already start with a space;
+and BPE with merges whose normalizer only rewrites spaces to that symbol and
 prepends none (the Gemma family, engine#2215). The last one is encoded by rank over the whole run with no prefix, and
 the symbol decodes back to a space. Before that shape was recognised a Gemma4 prompt encoded to 31 ids where the
 reference library gives 21, and replies kept the raw symbols. With `-DONEBIT_GEMMA_TOKENIZER=<tokenizer.json>` ctest
 `tokenizer_gemma4` holds the reader to the 17 reference cases kept for that file (2 of 17 before, 17 of 17 now).
+Before the `Metaspace` pre-tokenizer was read, the Mistral vocabularies fell to the byte-level path ("The capital of
+France is" gave 7 ids where the reference gives 5, and replies kept the raw symbols); ctest `tokenizer_metaspace`
+holds the reader to 7 reference cases on an eleven-token vocabulary of that shape.
 
 **What ends an answer.** The serve stops on every id in `config.json`'s `eos_token_id` (one integer or a list), on
 `<|endoftext|>` when the tokenizer has it, on `tokenizer_config.json`'s `eos_token` when that file is beside the

@@ -1,0 +1,107 @@
+{
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [
+  {
+   "id": 0,
+   "content": "<unk>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 1,
+   "content": "<s>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 2,
+   "content": "</s>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  }
+ ],
+ "normalizer": null,
+ "pre_tokenizer": {
+  "type": "Metaspace",
+  "replacement": "▁",
+  "prepend_scheme": "first",
+  "split": false
+ },
+ "post_processor": null,
+ "decoder": {
+  "type": "Sequence",
+  "decoders": [
+   {
+    "type": "Replace",
+    "pattern": {
+     "String": "▁"
+    },
+    "content": " "
+   },
+   {
+    "type": "ByteFallback"
+   },
+   {
+    "type": "Fuse"
+   },
+   {
+    "type": "Strip",
+    "content": " ",
+    "start": 1,
+    "stop": 0
+   }
+  ]
+ },
+ "model": {
+  "type": "BPE",
+  "dropout": null,
+  "unk_token": "<unk>",
+  "continuing_subword_prefix": null,
+  "end_of_word_suffix": null,
+  "fuse_unk": true,
+  "byte_fallback": true,
+  "ignore_merges": false,
+  "vocab": {
+   "<unk>": 0,
+   "<s>": 1,
+   "</s>": 2,
+   "<0x0A>": 3,
+   "▁": 4,
+   "a": 5,
+   "b": 6,
+   "▁a": 7,
+   "▁b": 8,
+   "ab": 9,
+   "▁ab": 10
+  },
+  "merges": [
+   [
+    "▁",
+    "a"
+   ],
+   [
+    "▁",
+    "b"
+   ],
+   [
+    "a",
+    "b"
+   ],
+   [
+    "▁a",
+    "b"
+   ]
+  ]
+ }
+}

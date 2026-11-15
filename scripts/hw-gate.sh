@@ -589,7 +589,15 @@ if has ops; then
     # pass". That is a *filter* problem, not a kernel result - and it must never read as a pass either.
     # Report it as SKIP with the selection that produced it, so neither an empty run nor a broken filter
     # can be mistaken for a measured one.
+    # infra=1: nothing was tested, so this is "could not run", not a measured SKIP. Without the flag a filter
+    # that matches no case leaves the gate reporting PASS (engine#2522 set it on the absent-input SKIPs for the
+    # same reason; the zero-cases SKIP was the one that was missed).
+    infra=1
     result ops SKIP $(( $(date +%s) - t0 )) "no case matched -b HRX0 -o \"$OPS\": the zero-cases guard refused to report a pass (fork engine#657) - fix the filter or the build"
+    # engine#2522's rule, applied to this row: a SKIP means the run did not test what it claims to test, so the run
+    # as a whole is infra-incomplete and must not read as PASS. The verdict block now consults infra, so setting it
+    # here is what turns "the ops phase had nothing to run" into a non-green gate instead of a quiet row.
+    infra=1
   else
     unknown=$(printf '%s\n' "$fails" | grep -v -F "$FLAKY_CASES" | grep -c . || true)
     st=FAIL detail="${passed:-rc=$rc}: $(printf '%s' "$fails" | head -n 3 | tr '\n' ' ')"
@@ -807,9 +815,13 @@ for _ph in $(printf '%s' "$PHASES" | tr ',' ' '); do
   case "$_ph" in ''|*' '*) continue ;; esac
   # The per-model phases report their missing/throttled models as a `model <name>` row, so that row satisfies the
   # request for any of them; only a phase that produced NO row at all is a slip.
+  # `placement` has its OWN row kind, so a `model …` row must not satisfy a request for it: with the prefix rule
+  # below covering all four phases, `--phases placement` was satisfied by any model row and a run with no placement
+  # row at all still read as green -- the same defect one level in (review at 9dd6077). The per-model phases DO
+  # report their missing/throttled models as `model <name>` rows, so only those three accept that alternative.
   case "$_ph" in
-    placement|kat|kld|needle) _phre="^($_ph|model )" ;;
-    *)                        _phre="^$_ph" ;;
+    kat|kld|needle) _phre="^($_ph|model )" ;;
+    *)              _phre="^$_ph" ;;
   esac
   grep -qE "$_phre" "$RESULTS" 2>/dev/null ||
     printf '%s\tFAIL\t0\trequested but produced no result row: --phases %s ran nothing for it\n' "$_ph" "$_ph" >> "$RESULTS"

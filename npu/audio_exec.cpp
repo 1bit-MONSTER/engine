@@ -626,13 +626,20 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 // engine#1783: one output channel per unit. conv1d with cout = 1 on that channel's weights, bias and output
                 // row runs exactly the loop the full call runs for it, so the result is bit-identical; the mel stem's two
                 // Convs were a serial 3.2 G multiply-adds per 30 s window.
-                const size_t units = size_t(a.dims[0]) * size_t(cout);
+                // engine#2366: four output channels per unit, not one. Per-channel calls make each output
+                // element a single cin*k-long dependent float chain; four channels give four independent
+                // accumulators and measured 2.63x on the [768,768,3] stride-2 stem (N=5 interleaved medians,
+                // 1044 -> 398 ms) with a bit-identical result -- every channel still accumulates ci-outer /
+                // j-inner in conv1d's order. The last 1..3 channels go through conv1d_channels' tail.
+                const size_t co_blocks = (size_t(cout) + 3) / 4;
+                const size_t units = size_t(a.dims[0]) * co_blocks;
                 parallel_units(units, [&](size_t u) {
-                    const size_t n0 = u / size_t(cout), co = u % size_t(cout);
-                    audio::conv1d(a.data.data() + n0 * size_t(cin) * size_t(T), int(cin), int(T),
-                                  w.data.data() + co * size_t(cin) * size_t(k),
-                                  bias != nullptr ? bias->data.data() + co : nullptr, 1, int(k), stride, pad,
-                                  r.data.data() + (n0 * size_t(cout) + co) * size_t(tout));
+                    const size_t n0 = u / co_blocks, co = (u % co_blocks) * 4;
+                    const size_t nco = std::min<size_t>(4, size_t(cout) - co);
+                    audio::conv1d_channels(a.data.data() + n0 * size_t(cin) * size_t(T), int(cin), int(T),
+                                           w.data.data() + co * size_t(cin) * size_t(k),
+                                           bias != nullptr ? bias->data.data() + co : nullptr, int(nco), int(k),
+                                           stride, pad, r.data.data() + (n0 * size_t(cout) + co) * size_t(tout));
                 });
             } else if (n.op == "Gather") {
                 // The token embedding: axis 0, indices are the int64 token window.

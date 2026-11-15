@@ -652,7 +652,15 @@ if has kat || has needle || has kld; then
     secs=$(( $(date +%s) - t0 )) held=$LAST_HOLD
     if [ $rc = 76 ]; then result "model $name" FAIL "$secs" "could not run: the memory pre-check refused it (rc 76)"; continue; fi
     if [ $rc = 3 ] || [ $rc -ge 16 ]; then
-      result "model $name" FAIL "$secs" "server failed (rc $rc): $(tail -n 3 "$OUT/server-$name.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+      # A gate that deletes its own evidence turns an environmental flake into an unfalsifiable bug
+      # (engine#2500: the failing row's log was gone before anyone could read it, and every hypothesis
+      # was unverifiable). Keep a copy outside the run dir, which CI cleans, and name the path in the
+      # failure line so a reader does not have to guess.
+      kept="$STORE/failed/$(basename "$OUT")-$name.log"
+      mkdir -p "$STORE/failed" 2>/dev/null
+      cp "$OUT/server-$name.log" "$kept" 2>/dev/null && \
+        echo "hw-gate: kept the failing server log at $kept" >&2
+      result "model $name" FAIL "$secs" "server failed (rc $rc): $(tail -n 3 "$OUT/server-$name.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200) [log: ${kept:-$OUT/server-$name.log}]"
       continue
     fi
     if [ $dokat = 1 ]; then

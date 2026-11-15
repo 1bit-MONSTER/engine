@@ -922,6 +922,21 @@ void relay(int port, const httplib::Request& req, httplib::Response& res) {
     res.set_content(r->body, r->get_header_value("Content-Type").empty() ? "application/json" : r->get_header_value("Content-Type"));
 }
 
+// engine#2537: the line a backend prints when its listening port is already bound. Python's socketserver
+// ("OSError: [Errno 98] Address already in use") and llama-server ("couldn't bind HTTP server socket").
+inline bool port_in_use_line(const std::string& line) {
+    return line.find("Address already in use") != std::string::npos ||
+           line.find("couldn't bind HTTP server socket") != std::string::npos;
+}
+
+// Rewrite the value after "--port" in a backend's argv; the launch built it with the port serve first picked.
+inline void set_port_arg(std::vector<std::string>& argv, int port) {
+    for (size_t k = 0; k + 1 < argv.size(); ++k)
+        if (argv[k] == "--port") { argv[k + 1] = std::to_string(port); return; }
+}
+
+constexpr int kPortTakenRetries = 2;
+
 struct Launch {
     std::string device;
     int port = 0;
@@ -2385,6 +2400,12 @@ int serve_child(const Options& given) {
     Lifecycle lifecycle(id);
     std::mutex wedged_mu;
     std::string wedged;   // set by the watchdog: why the backend is taken down
+    // engine#2537: free_port() releases the port before the backend binds it, and a backend takes a moment before it
+    // binds (a model load; tests/fake_backend.py sleeps 0.5 s), so under load another process can be handed the same
+    // port in between. The backend then dies with EADDRINUSE; this records that, so serve names it and relaunches the
+    // backend on a fresh port instead of reporting "did not become ready". One flag per backend: a single shared one said that
+    // *some* backend printed EADDRINUSE, so a second backend's taken port could relaunch a first one that failed otherwise.
+    std::vector<std::unique_ptr<std::atomic<bool>>> port_taken;
     auto backend_line = [&metrics, &placement_worst, &wedged_mu, &wedged](const std::string& line) {
         metrics.backend_line(line);
         if (device_lost_line(line)) {
@@ -2748,9 +2769,20 @@ int serve_child(const Options& given) {
     ::sigaction(SIGTERM, &sa, nullptr);
     ::sigaction(SIGINT, &sa, nullptr);
 #endif
-    for (const auto& b : laya ? std::vector<Launch>{} : backends) {
-        std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line, b.env_override));
+    for (size_t k = 0; k < backends.size(); ++k) port_taken.push_back(std::make_unique<std::atomic<bool>>(false));
+    // backend i's line callback: the shared one, plus backend i's own port-taken flag (engine#2537)
+    auto line_for = [&backend_line, &port_taken](size_t i) {
+        return [&backend_line, flag = port_taken[i].get()](const std::string& l) {
+            backend_line(l);
+            if (port_in_use_line(l)) *flag = true;
+        };
+    };
+    if (!laya) {
+        for (size_t k = 0; k < backends.size(); ++k) {
+            const auto& b = backends[k];
+            std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
+            children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, line_for(k), b.env_override));
+        }
     }
     for (const auto& b : rag) {
         if (b.port == 0) continue;   // in-process: the encoder is this process (app/embed_serve.h)
@@ -2760,8 +2792,30 @@ int serve_child(const Options& given) {
     // Launch::device is "hrx", or "hrx reranking" for a role or RAG server: the device is the first word
     auto on_device = [](const Launch& b) { return b.device.substr(0, b.device.find(' ')); };
     for (size_t i = 0; i < children.size(); i++) {
+        // engine#2537: a backend that died because its port was taken is relaunched on a fresh one, twice at most. Only that
+        // cause is retried: any other failure to start still fails serve, below.
+        for (int retry = 1; !laya && i < backends.size() && retry <= kPortTakenRetries; ++retry) {
+            if (children[i]->wait_ready(std::chrono::seconds(600), g_stop) || g_stop) break;
+            if (children[i]->alive() || !*port_taken[i]) break;
+            const int taken = backends[i].port;
+            backends[i].port = free_port();
+            set_port_arg(backends[i].argv, backends[i].port);
+            std::fprintf(stderr, "1bit serve: backend %zu could not bind port %d (address already in use: another process took it "
+                                 "after serve picked it); relaunching on port %d (%d of %d)\n",
+                         i, taken, backends[i].port, retry, kPortTakenRetries);
+            // cleared only here, before the relaunch: a backend can print its EADDRINUSE while serve is still waiting on an
+            // earlier backend, and clearing the flag before this backend's wait would drop that line
+            *port_taken[i] = false;
+            children[i] = std::make_unique<Child>(backends[i].argv, backends[i].env, backends[i].port, backends[i].ready_path,
+                                                  line_for(i), backends[i].env_override);
+        }
         if (!children[i]->wait_ready(std::chrono::seconds(600), g_stop)) {
             if (g_stop) return 0;
+            if (!laya && i < port_taken.size() && *port_taken[i] && !children[i]->alive()) {
+                std::fprintf(stderr, "1bit serve: backend %zu could not bind port %d: address already in use, after %d relaunches "
+                                     "on fresh ports; giving up\n", i, children[i]->port(), kPortTakenRetries);
+                return 1;
+            }
             // a strict HRX backend (app/hrx_strict.h) that refused a node said which; serve says it again
             if (const std::string why = metrics.strict_refusal(); !why.empty())
                 std::fprintf(stderr, "1bit serve: %s\n", strict_refusal_message(why).c_str());

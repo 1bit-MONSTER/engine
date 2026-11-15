@@ -115,6 +115,21 @@ take_run ring "kernel: amdgpu 0000:c5:00.0: [drm] *ERROR* ring gfx_0.0.0 timeout
 take_run hang "kernel: amdgpu 0000:c5:00.0: amdgpu: GPU hang detected on ring gfx"
 [ "$trc" = 78 ] || { echo "FAIL take-time: an amdgpu hang -> rc $trc, want 78"; fail=1; }
 
+# the refusal must say HOW OLD the newest line is: "in the last 10 min" cannot tell a wedged device from another lane's
+# teardown nine minutes ago, and on 2026-11-15 every amdxdna fault that refused a ticket arrived 1.5-8.5 min AFTER the
+# previous ticket released the NPU, with nothing running (engine#2542). A stub journalctl supplies the epoch.
+mkdir -p "$scratch/agebin"
+printf '#!/bin/bash\nprintf "1700000000 kernel: amdgpu 0000:c5:00.0: [drm] *ERROR* amdgpu: GPU reset begin!\\n"\n' > "$scratch/agebin/journalctl"
+chmod +x "$scratch/agebin/journalctl"
+q=$scratch/tqage; mkdir -p "$q"; rm -f "$scratch/age-token"
+env PATH="$scratch/agebin:$PATH" HOME=$scratch ONEBIT_HOLD_DIR="$scratch/agehold" GPU_HOLD_COOLDOWN=0 \
+    GPU_HOLD_WAIT=5 GPU_HOLD_MINUTES=1 GPU_HOLD_THERMAL_FLAG="$scratch/x" GPU_HOLD_RESET_WINDOW_MIN=10 \
+    timeout 60 "$hold" -l takeage -- true > "$scratch/tlogage" 2>&1
+age_rc=$?
+[ "$age_rc" = 78 ] || { echo "FAIL take-time age: rc $age_rc, want 78"; fail=1; }
+grep -qE 'newest [0-9]+s ago' "$scratch/tlogage" || { echo "FAIL take-time age: the refusal does not say how old the newest line is"; fail=1; }
+grep -qE 'newest [0-9]{9,}s ago' "$scratch/tlogage" && { echo "FAIL take-time age: the age printed in seconds, not an epoch"; fail=1; }
+
 take_run clean clean
 [ "$trc" = 0 ] || { echo "FAIL take-time: a clean log -> rc $trc, want 0 (a healthy hold must still run)"; fail=1; }
 

@@ -46,6 +46,9 @@
 #   N ticketed-wait on a model that never answers gives up with 75 after its limit and WITHDRAWS the demand it made,
 #     so the unit does not take a ticket for a caller that has gone (review of #2588);
 #   O ticketed-wait on a model that already answers returns 0 at once and creates no demand at all.
+#   P readiness, not liveness (review of #2588): a server that lists /v1/models (200 from bind) but cannot complete yet
+#     (503 while "loading") does not count as answering: ticketed-wait waits, and returns 0 only once a 1-token
+#     completion is answered.
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)   # the defaults work from any directory, not only the repo root
 tick=${1:-$root/scripts/coder-llm-ticketed}
@@ -70,6 +73,14 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         busy = open("$scratch/state").read().strip() == "busy"
         body = json.dumps([{"id": 0, "is_processing": busy}]).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+    def do_POST(self):
+        # a completion answers only once "loaded": a $scratch/loading file makes it 503 (weights still loading), while
+        # GET /v1/models above keeps answering 200 from bind, as 1bit serve's static listing does
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if os.path.exists("$scratch/loading"):
+            self.send_response(503); self.end_headers(); return
+        body = json.dumps({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
     def log_message(self, *a): pass
 http.server.ThreadingHTTPServer(("127.0.0.1", $port), H).serve_forever()
@@ -278,9 +289,20 @@ env TICKETED_WAIT_DEMAND="$scratch/o.demand" TICKETED_WAIT_POLL_S=1 "$waiter" te
 kill "$of" 2> /dev/null; wait "$of" 2> /dev/null
 [ $(( $(date +%s) - t0 )) -le 10 ] || { echo "FAIL N: ticketed-wait overran its 3 s limit"; fail=1; }
 
+# ---- P: bound but still loading is not "answers" ---------------------------------------------------------------------
+echo idle > "$scratch/state"; rm -f "$scratch/p.demand"; touch "$scratch/loading"
+"$scratch/fake" > /dev/null 2>&1 & pf=$!; pids+=($pf)
+wait_for 10 curl -sf -o /dev/null "http://127.0.0.1:$port/v1/models" || { echo "FAIL P: the fake did not come up"; fail=1; }
+env TICKETED_WAIT_DEMAND="$scratch/p.demand" TICKETED_WAIT_POLL_S=1 "$waiter" test-unit "http://127.0.0.1:$port" 3 2> "$scratch/p.wait"; rc=$?
+[ "$rc" = 75 ] || { echo "FAIL P: ticketed-wait rc $rc while the model was still loading (only /v1/models answered), want 75"; fail=1; }
+( sleep 2; rm -f "$scratch/loading" ) &
+env TICKETED_WAIT_DEMAND="$scratch/p.demand" TICKETED_WAIT_POLL_S=1 "$waiter" test-unit "http://127.0.0.1:$port" 20 2> "$scratch/p2.wait"; rc=$?
+[ "$rc" = 0 ] && grep -q 'answers after' "$scratch/p2.wait" || { echo "FAIL P: rc $rc once loaded, want 0 after a wait ($(tail -1 "$scratch/p2.wait"))"; fail=1; }
+kill "$pf" 2> /dev/null; wait "$pf" 2> /dev/null; rm -f "$scratch/loading"
+
 # ---- G: the default queue wait keeps the ticket's place on a busy box (a give-up re-queues at the back) ------------
 sed -n 's/^QUEUE_WAIT=\${CODER_LLM_QUEUE_WAIT_S:-\([0-9]*\)}$/\1/p' "$tick" > "$scratch/qw"
 [ "$(cat "$scratch/qw")" -ge 14400 ] 2> /dev/null || { echo "FAIL G: default queue wait $(cat "$scratch/qw")s; under 4 h a busy queue makes it re-queue at the back and starve"; fail=1; }
 
-[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load; a slow-exiting server gets its grace, a KILL after the max hold is 124, one after a queue wait stays 137; a refused grant is told from a fault during a window; a window takes its label; ticketed-wait asks, waits, gives up with 75 and withdraws its demand, and asks for nothing when the model is up)"
+[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load; a slow-exiting server gets its grace, a KILL after the max hold is 124, one after a queue wait stays 137; a refused grant is told from a fault during a window; a window takes its label; ticketed-wait asks, waits, gives up with 75 and withdraws its demand, and asks for nothing when the model is up; bound-but-loading is not an answer)"
 exit "$fail"

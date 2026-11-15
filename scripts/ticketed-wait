@@ -18,9 +18,15 @@
 #
 # Ask for a model that runs in gpu-hold windows (scripts/coder-llm-ticketed: coder-llm on :8090, 1bit-canonical on
 # :8095; engine#2494, #2579) and wait until it answers, bounded. It touches ~/.cache/UNIT/demand (the file the
-# unit's window waits for) every 30 s while it waits, and polls URL/v1/models. /v1/models, not /health: /health
-# answers before a model is loaded. Run it right before the requests, and keep touching the demand file while you
-# work if that takes longer than the unit's idle time (5 min), or the window closes under you.
+# unit's window waits for) every 30 s while it waits. Run it right before the requests, and keep touching the demand
+# file while you work if that takes longer than the unit's idle time (5 min), or the window closes under you.
+#
+# "Answers" is READINESS, and only a completion shows it (review of #2588; the same probe window-run.sh uses after
+# #2492/#2497/#2507). Each poll is a cheap GET /v1/models first (liveness: is anything bound there?), then one 1-token
+# chat completion, and only a 200 from the completion counts. /v1/models alone is a static listing that answers 200
+# from bind, while the weights are still loading. /health is a PROGRESS probe: it reads 503 both while loading and
+# when idle-but-healthy (okf references/health-is-a-progress-probe-not-a-liveness-probe.md). Neither says whether
+# YOUR request will be answered now.
 #
 #   ticketed-wait 1bit-canonical http://127.0.0.1:8095 900 && curl ... http://127.0.0.1:8095/v1/chat/completions
 #
@@ -35,7 +41,13 @@ unit=${1:-}; url=${2:-}; limit=${3:-900}
 [ -n "$unit" ] && [ -n "$url" ] && [ "$limit" -ge 0 ] 2> /dev/null || { echo "usage: ticketed-wait UNIT URL [SECONDS]" >&2; exit 2; }
 demand=${TICKETED_WAIT_DEMAND:-$HOME/.cache/$unit/demand}
 poll=${TICKETED_WAIT_POLL_S:-5}
-up() { [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' "${url%/}/v1/models" 2> /dev/null)" = 200 ]; }
+model=${TICKETED_WAIT_MODEL:-m}   # 1bit serve answers any model name with its loaded model
+up() {
+    [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' "${url%/}/v1/models" 2> /dev/null)" = 200 ] || return 1
+    [ "$(curl -s -o /dev/null -m 30 -w '%{http_code}' -H 'Content-Type: application/json' \
+         -d '{"model":"'"$model"'","messages":[{"role":"user","content":"ok"}],"max_tokens":1,"temperature":0}' \
+         "${url%/}/v1/chat/completions" 2> /dev/null)" = 200 ]
+}
 up && exit 0
 mkdir -p "$(dirname "$demand")" && touch "$demand" || { echo "ticketed-wait: cannot touch $demand" >&2; exit 2; }
 start=$(date +%s); touched=$start

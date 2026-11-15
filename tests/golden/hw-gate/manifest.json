@@ -70,6 +70,29 @@
     "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08"
    }
   },
+  "qwen3.6-35b-a3b": {
+   "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
+   "base_bytes": 1013178324,
+   "base_sha256": "9a4b5a7b29debdaf2a47db9aeb8d1803aec8f14e33cd4cecf1548c05e0f2f2a1",
+   "limits": {
+    "max_kld_p99": 0.2,
+    "max_mean_kld": 0.01,
+    "min_same_top_p": 95.0
+   },
+   "model": {
+    "file": "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf",
+    "sha256_first_64MiB": "fd7ca8d6957a0ab300d8f142c5e254de40bd64d4f0447f8be8303d026304891d",
+    "size": 17730509792
+   },
+   "recorded_at": {
+    "hrx-system": "7f4236924aadc069fb7425681525dddbd1535567",
+    "llama.cpp": "6b9fcacb7fbdff749060f25393577b8d7a5af5bc"
+   },
+   "text": {
+    "file": "wiki.test.raw",
+    "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08"
+   }
+  },
   "qwen3.8-27b": {
    "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
    "base_bytes": 1013178324,

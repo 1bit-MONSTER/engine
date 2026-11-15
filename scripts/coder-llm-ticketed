@@ -62,6 +62,9 @@
 #                               so the window can end its own server before gpu-hold KILLs the window; an explicit
 #                               GPU_HOLD_KILL_GRACE in the environment wins
 #   CODER_LLM_GPU_HOLD          gpu-hold to use, default the one on PATH
+#   CODER_LLM_LABEL             the gpu-hold label of the windows, default coder-llm. The same wrapper runs other resident
+#                               models the same way (1bit-canonical on :8095, engine#2579): one label, demand file and
+#                               URL per unit, set by scripts/install-coder-llm-ticketed.sh (CODER_LLM_UNIT)
 #   CODER_LLM_ALWAYS=1          skip the demand wait (a resident window, still ticketed and still max-hold bounded)
 #
 # Internal: "coder-llm-ticketed --window SERVER_CMD..." is what gpu-hold runs; it is the idle-aware window itself.
@@ -94,6 +97,7 @@ BACKOFF=${CODER_LLM_FAULT_BACKOFF_S:-600}
 STOP_WAIT=${CODER_LLM_STOP_WAIT_S:-30}
 KILL_GRACE=${GPU_HOLD_KILL_GRACE:-${CODER_LLM_KILL_GRACE_S:-$(( STOP_WAIT + 10 ))}}
 GPU_HOLD=${CODER_LLM_GPU_HOLD:-gpu-hold}
+LABEL=${CODER_LLM_LABEL:-coder-llm}
 
 log() { echo "coder-llm-ticketed[$$] $*"; }
 
@@ -204,12 +208,12 @@ holder=$(head -c 120 "${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}" 2> /dev/null | head -1
 # inside its stop wait): say so, do not override the operator's choice
 [ "$KILL_GRACE" -ge $(( STOP_WAIT + 5 )) ] 2> /dev/null \
     || log "WARNING: the kill grace ${KILL_GRACE}s is not at least 5 s longer than CODER_LLM_STOP_WAIT_S=${STOP_WAIT}s: gpu-hold will KILL the window before the server can exit"
-log "demand: queueing for the GPU (gpu-hold -l coder-llm -t $MAX_HOLD -w $QUEUE_WAIT)${holder:+; queued behind $holder}"
+log "demand: queueing for the GPU (gpu-hold -l $LABEL -t $MAX_HOLD -w $QUEUE_WAIT)${holder:+; queued behind $holder}"
 # gpu-hold's default 10 s grace KILLed the window at the first live max hold while the server was still exiting:
 # rc 137 and an unclean stop instead of 124 (11-15 10:56Z)
 export CODER_LLM_WINDOW_STAMP="${TMPDIR:-/tmp}/coder-llm-window.$$"
 rm -f "$CODER_LLM_WINDOW_STAMP"
-GPU_HOLD_KILL_GRACE=$KILL_GRACE "$GPU_HOLD" -t "$MAX_HOLD" -l coder-llm -w "$QUEUE_WAIT" -- "$0" --window "$@"
+GPU_HOLD_KILL_GRACE=$KILL_GRACE "$GPU_HOLD" -t "$MAX_HOLD" -l "$LABEL" -w "$QUEUE_WAIT" -- "$0" --window "$@"
 rc=$?
 # a KILL once the window has been open for the max hold is still the max hold (as 143 is, which gpu-hold maps to
 # 124); timed from the window's own start, so a long queue wait followed by some other KILL is not relabelled

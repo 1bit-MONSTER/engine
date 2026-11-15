@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ticketed-wait UNIT URL [SECONDS]
+#
+# Ask for a model that runs in gpu-hold windows (scripts/coder-llm-ticketed: coder-llm on :8090, 1bit-canonical on
+# :8095; engine#2494, #2579) and wait until it answers, bounded. It touches ~/.cache/UNIT/demand (the file the
+# unit's window waits for) every 30 s while it waits, and polls URL/v1/models. /v1/models, not /health: /health
+# answers before a model is loaded. Run it right before the requests, and keep touching the demand file while you
+# work if that takes longer than the unit's idle time (5 min), or the window closes under you.
+#
+#   ticketed-wait 1bit-canonical http://127.0.0.1:8095 900 && curl ... http://127.0.0.1:8095/v1/chat/completions
+#
+# Exit 0: the model answers (at once, when the unit is resident or its window is already open).
+# Exit 75: it did not answer within SECONDS (default 900). The window is queued behind other GPU tickets and comes
+#          round in FIFO order, so a long wait is the queue, not a fault: report "not run", never a fake answer.
+#          The demand file is removed on the way out: a demand that outlives its caller would buy a GPU ticket for
+#          nobody (review of #2588). A waiter that is still alive re-touches it within 30 s, so this starves no one.
+# Exit 2: usage.
+set -u
+unit=${1:-}; url=${2:-}; limit=${3:-900}
+[ -n "$unit" ] && [ -n "$url" ] && [ "$limit" -ge 0 ] 2> /dev/null || { echo "usage: ticketed-wait UNIT URL [SECONDS]" >&2; exit 2; }
+demand=${TICKETED_WAIT_DEMAND:-$HOME/.cache/$unit/demand}
+poll=${TICKETED_WAIT_POLL_S:-5}
+up() { [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' "${url%/}/v1/models" 2> /dev/null)" = 200 ]; }
+up && exit 0
+mkdir -p "$(dirname "$demand")" && touch "$demand" || { echo "ticketed-wait: cannot touch $demand" >&2; exit 2; }
+start=$(date +%s); touched=$start
+echo "ticketed-wait: asked for $unit (touched $demand); waiting up to ${limit}s for $url; GPU token: $(head -c 80 "${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}" 2> /dev/null | head -1)" >&2
+while :; do
+    now=$(date +%s)
+    if [ $(( now - start )) -ge "$limit" ]; then
+        echo "ticketed-wait: $unit did not answer in ${limit}s (still queued for the GPU?): not run; demand withdrawn" >&2
+        rm -f "$demand"
+        exit 75
+    fi
+    [ $(( now - touched )) -ge 30 ] && { touch "$demand"; touched=$now; }
+    sleep "$poll"
+    up && { echo "ticketed-wait: $unit answers after $(( $(date +%s) - start ))s" >&2; touch "$demand"; exit 0; }
+done

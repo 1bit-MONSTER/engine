@@ -25,12 +25,22 @@
 #   --install  back up the drop-in as <name>.bak-<YYYYMMDD>, write the new one, install the wrapper into ~/.local/bin,
 #              daemon-reload, restart the unit, print --status. Already ticketed: nothing to do, exit 0.
 #
-# Environment (tests): CODER_LLM_UNIT_DIR (default ~/.config/systemd/user/coder-llm.service.d), CODER_LLM_DROPIN
+# CODER_LLM_UNIT picks the unit, default coder-llm. Any other resident model is ticketed the same way, with its own
+# label, demand file and URL (engine#2579: 1bit-canonical on :8095 cost 3-9 % of every other GPU job while idle):
+#     CODER_LLM_UNIT=1bit-canonical install-coder-llm-ticketed.sh --diff
+# For a unit other than coder-llm the drop-in gets CODER_LLM_LABEL=<unit>, CODER_LLM_DEMAND=~/.cache/<unit>/demand,
+# CODER_LLM_URL=http://127.0.0.1:<the --port of its serve line> (refused when there is none), CODER_LLM_DEMAND_TTL_MIN=5
+# (its callers re-touch every 30 s through ticketed-wait, so a crashed caller's demand expires in minutes, not 30) and
+# CODER_LLM_GH_POLL=0
+# (the pr-agent fallback is coder-llm's only). Its callers ask for it with scripts/ticketed-wait.
+#
+# Environment (tests): CODER_LLM_UNIT_DIR (default ~/.config/systemd/user/<unit>.service.d), CODER_LLM_DROPIN
 # (default zz-c22-selfcontained.conf), CODER_LLM_BIN_DIR (default ~/.local/bin), CODER_LLM_SYSTEMCTL (default
 # "systemctl --user").
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
-UNIT_DIR=${CODER_LLM_UNIT_DIR:-$HOME/.config/systemd/user/coder-llm.service.d}
+UNIT=${CODER_LLM_UNIT:-coder-llm}
+UNIT_DIR=${CODER_LLM_UNIT_DIR:-$HOME/.config/systemd/user/$UNIT.service.d}
 DROPIN=$UNIT_DIR/${CODER_LLM_DROPIN:-zz-c22-selfcontained.conf}
 BIN_DIR=${CODER_LLM_BIN_DIR:-$HOME/.local/bin}
 read -r -a SYSTEMCTL <<< "${CODER_LLM_SYSTEMCTL:-systemctl --user}"
@@ -38,13 +48,33 @@ WRAPPER=$BIN_DIR/coder-llm-ticketed
 mode=${1:---diff}
 
 # the new drop-in, from the live one: env lines before the final "ExecStart=" reset, wrapper in front of the command
+# the serve line's --port, for a unit's own URL (coder-llm keeps the wrapper's :8090 default)
+unit_port() { awk '/^ExecStart=./ { l = $0 } END { if (match(l, /--port[ =][0-9]+/)) { p = substr(l, RSTART, RLENGTH); sub(/--port[ =]/, "", p); print p } }' "$DROPIN"; }
+
 render() {
-    awk -v w="$WRAPPER" -v b="$BIN_DIR" '
+    local extra="" port
+    if [ "$UNIT" != coder-llm ]; then
+        port=$(unit_port)
+        [ -n "$port" ] || { echo "no --port on $UNIT's serve line in $DROPIN: refusing to guess its URL" >&2; return 2; }
+        extra="Environment=CODER_LLM_LABEL=$UNIT
+Environment=CODER_LLM_DEMAND=$HOME/.cache/$UNIT/demand
+Environment=CODER_LLM_URL=http://127.0.0.1:$port
+Environment=CODER_LLM_DEMAND_TTL_MIN=5"
+    fi
+    awk -v w="$WRAPPER" -v b="$BIN_DIR" -v unit="$UNIT" -v extra="$extra" '
         /^ExecStart=$/ && !done {
-            print "# 2026-11-15 CODER-LLM-TICKETED (engine#2494): the model runs ONLY inside gpu-hold tickets, in on-demand windows"
-            print "# (label coder-llm, max hold 25 min, re-queued FIFO by Restart=always); the server command below is unchanged."
-            print "# `systemctl --user start coder-llm` now means QUEUED, not \":8090 answers\" (docs/ci-runners.md)."
-            print "Environment=CODER_LLM_GH_POLL=1"
+            if (unit == "coder-llm") {
+                print "# 2026-11-15 CODER-LLM-TICKETED (engine#2494): the model runs ONLY inside gpu-hold tickets, in on-demand windows"
+                print "# (label coder-llm, max hold 25 min, re-queued FIFO by Restart=always); the server command below is unchanged."
+                print "# `systemctl --user start coder-llm` now means QUEUED, not \":8090 answers\" (docs/ci-runners.md)."
+                print "Environment=CODER_LLM_GH_POLL=1"
+            } else {
+                print "# engine#2579: " unit " runs ONLY inside gpu-hold tickets, in on-demand windows, like coder-llm (label " unit ","
+                print "# max hold 25 min, re-queued FIFO by Restart=always); the server command below is unchanged. Callers ask for it"
+                print "# with scripts/ticketed-wait; `systemctl --user start " unit "` now means QUEUED (docs/ci-runners.md)."
+                print extra
+                print "Environment=CODER_LLM_GH_POLL=0"
+            }
             print "Environment=CODER_LLM_GPU_HOLD=" b "/gpu-hold"
             print "Environment=PATH=" b ":/usr/local/bin:/usr/bin:/bin"
             print "Environment=CODER_LLM_MAX_HOLD_MIN=25"
@@ -71,7 +101,7 @@ status() {
         echo "wrapper: NOT installed at $WRAPPER"; ok=1
     fi
     if is_ticketed_file; then echo "drop-in: $DROPIN runs the wrapper"; else echo "drop-in: $DROPIN does NOT run the wrapper"; ok=1; fi
-    exec_line=$("${SYSTEMCTL[@]}" show coder-llm -p ExecStart --value 2> /dev/null | head -1)
+    exec_line=$("${SYSTEMCTL[@]}" show "$UNIT" -p ExecStart --value 2> /dev/null | head -1)
     case "$exec_line" in
         *coder-llm-ticketed*) echo "running unit: executes coder-llm-ticketed" ;;
         *) echo "running unit: does NOT execute coder-llm-ticketed (${exec_line:0:120})"; ok=1 ;;
@@ -85,7 +115,10 @@ status() {
 case "$mode" in
     --diff)
         if is_ticketed_file; then echo "already ticketed: $DROPIN"; exit 0; fi
-        diff -u "$DROPIN" <(render) | sed "2s|/dev/fd/[0-9]*|$DROPIN (new)|"
+        tmp=$(mktemp) || exit 2
+        render > "$tmp" || { rm -f "$tmp"; exit 2; }
+        diff -u "$DROPIN" "$tmp" | sed "2s|$tmp|$DROPIN (new)|"
+        rm -f "$tmp"
         exit 0 ;;
     --status)
         status; exit $? ;;
@@ -95,10 +128,10 @@ case "$mode" in
         bak=$DROPIN.bak-$(date +%Y%m%d)
         [ -e "$bak" ] && bak=$bak-$(date +%H%M%S)
         cp -p "$DROPIN" "$bak" || exit 1
-        render > "$DROPIN.new" && mv "$DROPIN.new" "$DROPIN" || exit 1
+        render > "$DROPIN.new" && mv "$DROPIN.new" "$DROPIN" || { rm -f "$DROPIN.new"; exit 1; }
         mkdir -p "$BIN_DIR" && install -m 0755 "$here/coder-llm-ticketed" "$WRAPPER" || exit 1
         echo "backed up: $bak"
-        "${SYSTEMCTL[@]}" daemon-reload && "${SYSTEMCTL[@]}" restart coder-llm || { echo "systemctl failed; roll back with: cp -p $bak $DROPIN" >&2; exit 1; }
+        "${SYSTEMCTL[@]}" daemon-reload && "${SYSTEMCTL[@]}" restart "$UNIT" || { echo "systemctl failed; roll back with: cp -p $bak $DROPIN" >&2; exit 1; }
         status; exit $? ;;
     *)
         echo "usage: $0 [--diff | --status | --install]" >&2; exit 2 ;;

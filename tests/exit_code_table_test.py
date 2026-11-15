@@ -33,7 +33,8 @@ ap.add_argument("root", nargs="?", default=str(Path(__file__).resolve().parent.p
                 help="engine checkout to check (default: this test's own tree)")
 root = Path(ap.parse_args().root)
 SCRIPTS = {"gpu-hold": "scripts/gpu-hold", "npu-hold": "scripts/npu-hold", "hw-gate.sh": "scripts/hw-gate.sh",
-           "window-run.sh": "scripts/window-run.sh", "coder-llm-ticketed": "scripts/coder-llm-ticketed"}
+           "window-run.sh": "scripts/window-run.sh", "coder-llm-ticketed": "scripts/coder-llm-ticketed",
+           "ticketed-wait": "scripts/ticketed-wait"}
 
 doc = (root / "docs/ci-runners.md").read_text()
 m = re.search(r"^## Exit codes on the GPU and NPU path.*?(?=^## )", doc, re.S | re.M)

@@ -319,7 +319,26 @@ A silent `:8090` is therefore **not** evidence of a failed restart on its own â€
 purpose, and a window that reports them as failures is how lanes learn to ignore failures (#2496, #2547, #2566).
 `--restart-rc` encodes the same table, and its self-test asserts each row.
 
-`scripts/install-coder-llm-ticketed.sh` does the switch:
+### Other resident models: 1bit-canonical on :8095 (engine#2579)
+
+The same wrapper runs any model that used to stay resident. engine#2579 measured `1bit-canonical.service` (Qwen3-4B
+on HRX, `:8095`) costing 3-9 % of every other GPU job while it sat idle. Ticketed, it gets its own gpu-hold label
+(`1bit-canonical`), its own demand file (`~/.cache/1bit-canonical/demand`) and its own URL, read from its serve line's
+`--port`. The pr-agent poll is coder-llm's alone.
+
+    CODER_LLM_UNIT=1bit-canonical scripts/install-coder-llm-ticketed.sh --diff     # then --install, --status
+
+**A caller asks before it requests**, with `scripts/ticketed-wait UNIT URL [SECONDS]`:
+
+    ticketed-wait 1bit-canonical http://127.0.0.1:8095 900 || { echo "not run: :8095 queued"; exit 75; }
+
+The script touches the demand file every 30 s while it waits, and polls `/v1/models`. It returns 0 once the model
+answers, at once if the unit is resident or its window is already open, and 75 after the limit. A 75 means the window
+is queued behind other tickets, so the run is **not run**, never a fake answer. On a 75 it also **removes the demand
+file**, so a caller that has gone does not buy a GPU ticket for nobody. A unit other than coder-llm also takes demand
+as stale after 5 minutes (`CODER_LLM_DEMAND_TTL_MIN=5`), so even a crashed caller's touch expires quickly. A caller that works longer than the
+unit's idle time (5 min) keeps touching the demand file, or the window closes under it.
+
 
 - with no argument, or `--diff`, it prints the drop-in change;
 - `--status` says whether the wrapper is installed and the running unit executes it (exit 0 only when both are true);
@@ -355,7 +374,7 @@ Each script's own header stays the reference for its edge cases.
 | 2 | one code, four causes; **the stderr line says which** and is part of the contract (each phrase below is what the script prints, so grep your log for it): (a) a **usage error**, `gpu-hold: unknown option` or `gpu-hold: no command given`: the command line is wrong, not the box; (b) **could not run / INCOMPLETE**, `INCOMPLETE (an input was absent: nothing was tested)`: an input was absent (a model, text, a binary, a checkout) or a build or memory floor refused it. hw-gate reports 2 even when some rows failed, because an untested input means the run did not answer its question; (c) the box could not set up the ticket, `gpu-hold: cannot create` or `gpu-hold: cannot write`; (d) a **policy refusal**, `npu-hold: REFUSED:` (a shared queue while npu-serve-keeper reads it) | gpu-hold and hw-gate.sh exit it; npu-hold exits (d) | **read stderr first**. (a) and (d): fix the command or config, because re-queueing repeats the same mistake; (b): after providing the input; (c): after fixing the box |
 | 3 | the server under test never came up | hw-gate.sh exits it from its server-start step | read the server log |
 | 69 | the job ran, but coder-llm did not answer `:8090` after the window | window-run.sh (computed by `final_rc`, not a literal exit) | see "The PR-Agent model runs in gpu-hold windows" |
-| 75 | the queue never came round within `-w` | gpu-hold exits it; npu-hold and coder-llm-ticketed pass it through | yes, but **at the back** of the queue. That is why coder-llm queues with a 24 h `-w`, and why a lane should size `-w` for the queue instead of treating 75 as a free retry |
+| 75 | the queue never came round within `-w`, or a ticketed model did not answer within `ticketed-wait`'s limit | gpu-hold exits it; ticketed-wait exits it; npu-hold and coder-llm-ticketed pass it through | yes, but **at the back** of the queue. That is why coder-llm queues with a 24 h `-w`, and why a lane should size `-w` for the queue instead of treating 75 as a free retry |
 | 76 | the memory pre-check refused the run | hw-gate.sh `--mem` exits it | when MemAvailable is back |
 | **78** | a GPU/NPU fault line in the kernel log: **during** the hold (the hold was ended) or **at take time** (the ticket was refused, nothing ran). The coder-llm journal says which one | gpu-hold exits it; npu-hold and coder-llm-ticketed pass it through (the coder-llm journal names the cause) | after the fault is understood. Never in a loop |
 | **124** | the max hold (`-t`) ended the job: a deadline, and planned. coder-llm-ticketed also maps a KILL after its max hold to 124 | gpu-hold sets it (its own code, after `timeout(1)`'s convention; it also maps a TERM at its deadline from 143); npu-hold passes it through; coder-llm-ticketed passes it through and relabels a post-deadline 137 to it | yes |

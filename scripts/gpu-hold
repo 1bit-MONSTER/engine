@@ -289,15 +289,28 @@ while [ "$state" = queued ]; do
                 # kernel log to read and `gpu_hold_*`'s own tests must keep passing, so "cannot read" is a note, not a
                 # refusal - the opposite of a device guard, and worth stating because it is the surprising half.
                 _reset_window=${GPU_HOLD_RESET_WINDOW_MIN:-10}
-                _klog=$(journalctl -k --since "-${_reset_window} min" --no-pager 2> /dev/null)
+                # GPU_HOLD_KLOG_FILE is the same override the during-hold watcher uses: without it this refusal had no
+                # automated arm at all (it shipped with manual arms only), because "a reset two minutes ago" cannot be
+                # produced in a test that reads the real journal.
+                if [ -n "${GPU_HOLD_KLOG_FILE:-}" ]; then
+                    _klog=$(cat "$GPU_HOLD_KLOG_FILE" 2> /dev/null)
+                else
+                    _klog=$(journalctl -k --since "-${_reset_window} min" --no-pager 2> /dev/null)
+                fi
                 if [ -z "$_klog" ]; then
                     log "note: no kernel log available, so a reset in the last ${_reset_window} min cannot be ruled out (not refusing: CI has no journal)"
                 else
-                    _resets=$(printf '%s\n' "$_klog" | grep -ciE 'amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure)')
+                    # The NPU spellings belong here too: npu-hold execs this script with the NPU's own queue and
+                    # token, so this take-time check is an NPU ticket's ONLY look at the log before work starts,
+                    # while the during-hold watch below already reads amdxdna faults. Without them a lane could
+                    # take an NPU ticket minutes after the command timeout the rules say to stop for (measured
+                    # 2026-11-15: the hold ran on a log whose newest line was an amdxdna command timeout).
+                    _reset_re='amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure)|amdxdna.*(command timeout|power.?cycle|fault)'
+                    _resets=$(printf '%s\n' "$_klog" | grep -ciE "$_reset_re")
                     if [ "${_resets:-0}" -gt 0 ]; then
                         rm -f "$TOKEN"; state=done
-                        log "::error::refusing: ${_resets} amdgpu/MES reset line(s) in the last ${_reset_window} min - the ticket is released unheld. Inspect the kernel log, then retry"
-                        printf '%s\n' "$_klog" | grep -iE 'amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure)' | tail -3
+                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault line(s) in the last ${_reset_window} min - the ticket is released unheld. Inspect the kernel log, then retry"
+                        printf '%s\n' "$_klog" | grep -iE "$_reset_re" | tail -3
                         exit 78
                     fi
                 fi

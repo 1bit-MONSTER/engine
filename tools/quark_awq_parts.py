@@ -27,10 +27,20 @@ are the same), and the frozen state dict is written with the zero points as F32 
 The default scheme is int4_wo_32: symmetric (zero = -8 s, exact in Q4NX's bf16 zero) and group 32 (the q4_1
 group).  uint4_* converts only with tools/quark_to_q4nx.py --allow-uint4; see that tool for why.
 Cost on the strixhalo CPU (4 threads under thermal-run): about 3.1 h for Qwen3-1.7B AWQ at 128 x 512.
+Calibration data is a real cost RTN does not have: every AWQ pack needs this run once, then ships like any pack.
+
+Not run in CI (it needs torch and Quark). Its gate is a by-hand end-to-end run on a tiny random Qwen3 into
+tools/quark_to_q4nx.py (docs/npu.md "An AWQ pack from AMD Quark"); re-run that whenever the Quark version moves.
+The parts file records the Quark version in its metadata for that reason.
 """
 import argparse
 import time
 
+# The qwen2 scaling groups, registered for qwen3 (Quark 0.13 has none). AWQ pairs an op with the linear(s) it
+# feeds and folds the scale into that op, so the pairs depend only on which op feeds which linear. Qwen3 adds
+# q_norm / k_norm AFTER q_proj / k_proj, which leaves input_layernorm -> q/k/v, v -> o, post_attention_layernorm
+# -> gate/up and up -> down unchanged. check_pairs() refuses a model whose layer does not have these modules,
+# so a future layout change fails here instead of quantizing the wrong pairs.
 QWEN3_AWQ = {
     "name": "awq",
     "model_decoder_layers": "model.layers",
@@ -43,6 +53,19 @@ QWEN3_AWQ = {
         {"prev_op": "mlp.up_proj", "layers": ["mlp.down_proj"], "inp": "mlp.down_proj"},
     ],
 }
+
+
+def check_pairs(model, cfg):
+    """Every op a scaling group names must exist in the first decoder layer (and the norm must be a norm)."""
+    layer = model.get_submodule(cfg["model_decoder_layers"])[0]
+    names = dict(layer.named_modules())
+    for g in cfg["scaling_layers"]:
+        for n in [g["prev_op"], *g["layers"], g["inp"]]:
+            if n not in names:
+                raise SystemExit(f"AWQ pair {g['prev_op']} -> {g['layers']}: the layer has no module {n!r}; "
+                                 "this model's layout differs from qwen2/qwen3, so the scaling groups do not apply")
+        if g["prev_op"].endswith("layernorm") and "norm" not in type(names[g["prev_op"]]).__name__.lower():
+            raise SystemExit(f"{g['prev_op']} is a {type(names[g['prev_op']]).__name__}, not a norm")
 
 
 def main():
@@ -69,6 +92,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(a.hf, dtype=torch.bfloat16, device_map=None).eval()
     mt = model.config.model_type
     if mt == "qwen3" and a.algo == "awq":
+        check_pairs(model, QWEN3_AWQ)
         LLMTemplate.register_template(create_template_from_json_dict({
             "model_type": "qwen3", "kv_layers_name": ["*k_proj", "*v_proj"], "q_layer_name": "*q_proj",
             "exclude_layers_name": ["lm_head"], "algorithm_configs": {"awq": QWEN3_AWQ}}))
@@ -86,7 +110,9 @@ def main():
         elif "_quantizer" in k and not k.endswith("._weight_quantizer.scale"):
             continue
         parts[k] = v
-    save_file(parts, a.out, metadata={"quark_scheme": a.scheme, "quark_algo": a.algo, "source": a.hf})
+    import quark
+    save_file(parts, a.out, metadata={"quark_scheme": a.scheme, "quark_algo": a.algo, "source": a.hf,
+                                      "quark_version": str(getattr(quark, "__version__", "unknown"))})
     print(f"{len(parts)} tensors -> {a.out} in {time.time() - t0:.0f} s")
 
 

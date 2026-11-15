@@ -1206,6 +1206,16 @@ tools/quark_to_q4nx.py parts.safetensors <hf dir> <out dir>
   scaled-up salient channels amplify it: on `down_proj` a float reader of the pack sees a large error. The NPU's
   int8 requantization absorbs most of it, but a Q4NX file is not NPU-only, so `quark_to_q4nx.py` refuses uint4
   unless `--allow-uint4` is given.
+- **Where the AWQ scale lives:** nowhere at run time. Quark divides each salient input channel's activation by its
+  scale by folding 1/s into the op that feeds it (the RMSNorm weight, or the previous linear's output rows) and
+  multiplies the linear's input columns by s. Both halves are ordinary weights in the pack, so the NPU route and a
+  float reader of the pack need nothing AWQ-specific: the pack is a self-contained model.
+- **What the comparison held fixed:** both arms are the same container format (row-major q4_1, the same config.json),
+  served on the same route and kernels; only the weight values differ. The driver needs calibration data (128 x 512
+  pileval samples) that round-to-nearest does not. That is a one-time cost per pack.
+- **`quark_awq_parts.py` is not run in CI** (it needs torch and Quark). Re-run its tiny end-to-end check by hand
+  whenever the Quark version moves: a random 2-layer Qwen3 through both tools must report `"int4": 14,
+  "max_zero_round_steps": 0.0`. The parts file records the Quark version it came from.
 - **`lm_head`** is excluded by Quark and gets the same round-to-nearest q4_1 as the baseline pack. Every other
   tensor Quark changed (the AWQ-rescaled norms) is taken from the parts file.
 - **Why a driver and not `quark-cli torch-llm-ptq`:** Quark 0.13 has no qwen3 AWQ configuration (the driver

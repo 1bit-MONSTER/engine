@@ -145,8 +145,14 @@ def referenced(root, need):
     """{name: [files]}, ignoring a file mentioning its own basename."""
     found = {name: [] for name in need}
     for path, text in scan_files(root):
+        # engine#2456 (cl-flm's arm, PR #2458): the TEST half had the same loophole as the tool half -- a CMake comment naming a
+        # `tests/*.sh` counted as a runner, so the gate that asks "does anything run this test" was satisfied by prose describing it.
+        # Comment lines are dropped rather than requiring a full invocation shape: a workflow `run:` line, a Makefile line and a
+        # ctest row all count legitimately, and only the comment form is the defect. A markdown heading also starts with `#` and loses
+        # nothing: a script named in a doc's body text is still found, which is what `unregistered_py_tests` relies on.
+        haystack = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
         for name in need:
-            if name not in text:
+            if name not in haystack:
                 continue
             if path.name == name:
                 continue  # a test naming itself is not a runner
@@ -161,6 +167,70 @@ RUNNERS = ("CMakeLists.txt", "cmake", ".github/workflows")
 # test registered itself (measured on a fixture -- the guard against a test naming itself lives in the other function's path
 # shape, not in this haystack). engine#1901's tools half and engine#2129's scripts half are unchanged.
 TOOL_RUNNERS = RUNNERS + ("tests",)
+
+
+# engine#2456: a mention is not an invocation. The old test was `tool.name in text` over the runner files, so a *comment* that
+# named the script satisfied the gate that exists to catch a self-test nobody runs -- measured by writing exactly such a comment:
+# green with the comment, red once it was reworded, green again with a real row.
+INVOCATION = re.compile(r"add_test|add_python_test|\bCOMMAND\b|\bpython3?\b|--self-test|\bbash\b")
+
+
+def _strip_line_comments(text):
+    """Drop `#...` to end of line before any depth walk, outside a quoted string.
+
+    The review of engine#2460 measured the need on the engine's own file: `CMakeLists.txt` has a comment containing an unclosed `(`
+    (line 2562, "# \"By name\" means a line CMake would execute -- include( at the start of a line …"), so the depth walk that counted
+    parentheses inside comments swallowed the remaining 51 lines into one statement. That statement starts with `#`, so `invokes()`
+    skipped it as a comment and **the tail of the file became invisible to the gate** -- exactly where rows get appended. Nothing
+    registered lived there yet, which is why it read green; the next row added would have been reported as unregistered while registered.
+    """
+    out = []
+    for line in text.splitlines():
+        quoted = False
+        cut = len(line)
+        for i, ch in enumerate(line):
+            if ch == '"':
+                quoted = not quoted
+            elif ch == "#" and not quoted:
+                cut = i
+                break
+        out.append(line[:cut])
+    return "\n".join(out)
+
+
+def _statements(text):
+    """Logical statements: backslash continuations joined, and newlines inside parentheses collapsed.
+
+    The parenthesised collapse is the part a one-line scan gets wrong (engine#2455): CMake wraps `add_test(NAME x` and
+    `COMMAND .../tool.py` onto separate lines with no backslash, so a line-at-a-time match reports four genuinely-registered
+    scripts as unregistered.
+    """
+    text = _strip_line_comments(text)
+    text = re.sub(r"\\\n", " ", text)
+    out, depth = [], 0
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth:
+            depth -= 1
+        if ch == "\n" and depth:
+            out.append(" ")
+            continue
+        out.append(ch)
+    return "".join(out).splitlines()
+
+
+def invokes(name, text):
+    """True when a statement names the script AND carries an invocation shape; comment lines are mentions, not invocations."""
+    if name in text and not INVOCATION.search(text):
+        return False                      # cheap out: a file with no invocation vocabulary cannot invoke anything
+    for line in _statements(text):
+        stripped = line.strip()
+        if stripped.startswith(("#", "//", "*", "<!--")) or stripped.endswith(".md") and stripped.startswith("* ["):
+            continue
+        if name in line and INVOCATION.search(line):
+            return True
+    return False
 
 
 def unregistered_selftest_tools(root):
@@ -196,7 +266,7 @@ def unregistered_selftest_tools(root):
             continue
         if not SELFTEST.search(src):
             continue
-        if not any(tool.name in text for text in runner_text):
+        if not any(invokes(tool.name, text) for text in runner_text):
             drift.append(str(tool.relative_to(root)))
     return drift
 
@@ -336,6 +406,38 @@ def self_test():
     r = root_with(dict(base, **{"scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
                                  "cmake/tests-helper.cmake": "add_test(NAME helper_self COMMAND bash scripts/helper.sh --self-test)\n"}))
     cases.append(("...and a registration in cmake/*.cmake clears it", check(r), 0, None))
+
+    # 0c-0e. engine#2456: a mention is not an invocation. The gate exists to catch a self-test nobody runs, and it was satisfied
+    # by a *comment* that named the script -- the loophole was found by writing one, so it is pinned by writing one.
+    r = root_with(dict(base, **{"scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
+                                 "tests/mention.sh": "#!/bin/sh\n# see scripts/helper.sh for the self-test\n"}))
+    cases.append(("a comment that names a scripts/ self-test does NOT satisfy the gate", check(r), 1, "helper.sh"))
+    cases_root["a comment that names a scripts/ self-test does NOT satisfy the gate"] = r
+
+    r = root_with({"tests/ok.sh": "#!/bin/sh\n",
+                   "scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
+                   # continuation-wrapped, no backslash: the shape engine#2455's first scan mis-read on four real rows
+                   "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\nadd_test(NAME helper_self\n  COMMAND bash scripts/helper.sh --self-test)\n"})
+    cases.append(("...and a continuation-wrapped add_test DOES (the four false positives)", check(r), 0, None))
+
+    # the review's case: an unclosed '(' inside a COMMENT must not swallow the rows below it (measured on the engine's own file)
+    r = root_with({"tests/ok.sh": "#!/bin/sh\n",
+                   "scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n",
+                   "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n# note (unbalanced\n"
+                                      "add_test(NAME helper_self COMMAND bash scripts/helper.sh --self-test)\n"})
+    cases.append(("an unclosed ( in a comment does not hide the row after it", check(r), 0, None))
+
+    # the invocation goes INSIDE the already-registered test: a new tests/*.sh would be drift for a different, correct reason
+    r = root_with({"tests/ok.sh": "#!/bin/sh\npython3 scripts/helper.sh --self-test\n",
+                   "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n",
+                   "scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n"})
+    cases.append(("...and a python3 line in a registered test does", check(r), 0, None))
+
+    # 0f. cl-flm's case in PR #2458: a CMake COMMENT naming a tests/*.sh satisfied the test-registration half
+    r = root_with({"CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n# see tests/described.sh for the arm\n",
+                   "tests/ok.sh": "#!/bin/sh\n", "tests/described.sh": "#!/bin/sh\n"})
+    cases.append(("a tests/*.sh named only in a CMake comment is drift", check(r), 1, "described.sh"))
+    cases_root["a tests/*.sh named only in a CMake comment is drift"] = r
 
     # 1. a test nobody mentions -> drift, and it is NAMED
     # 1a-ii. engine#2445: a row may run the TOOL's --self-test instead of the test file, because that is

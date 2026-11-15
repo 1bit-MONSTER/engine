@@ -119,6 +119,12 @@ if [ "${1:-}" = "--window" ]; then
     shift
     [ "${1:-}" = "--" ] && shift
     [ $# -gt 0 ] || { log "--window needs a server command"; exit 2; }
+    # a ticket granted after its demand went stale (a long queue) releases at once instead of loading a 30B model and
+    # idling for IDLE seconds: on a deep queue that is a load per stale entry, about an hour of GPU (review of #2514)
+    if [ "${CODER_LLM_ALWAYS:-0}" != 1 ] && ! demand_fresh "$DEMAND_TTL" && ! gh_demand; then
+        log "ticket granted with no fresh demand: releasing without starting the server"
+        exit 0
+    fi
     "$@" &
     server=$!
     stop_server() {

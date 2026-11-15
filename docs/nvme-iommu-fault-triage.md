@@ -178,33 +178,46 @@ Every one of them produces the same symptom — **an empty result** — which is
 might legitimately be looking for. That is why the pre-flight is not optional: it is the only thing that separates
 "nothing happened" from "nothing was watching".
 
-## Reproduction status: four shapes tried, none reproduced it
+## Reproduction status: five shapes tried while the stream was already stopped
 
-Recorded before the theory, because the first thing anyone will try is to make the stream happen again, and the obvious
-attempts have already been made and failed. All four against a fixed baseline (740 faults), all under `thermal-run.sh`
-(nice 19, ionice idle), all through `O_DIRECT` — i.e. the per-request DMA mapping path the stack named:
+Recorded before the theory, because the first thing anyone will try is to make the stream happen again. **But read the
+"before" column first** — it is the difference between this table being evidence and being five ways of saying nothing.
 
-| attempt | load | faults |
-|---|---|---|
-| sequential direct reads | 12 GiB, 4 MiB blocks, 3.9 GB/s | **0** |
-| random direct reads | 400 × 64 KiB at random offsets | **0** |
-| concurrent direct reads | 24 threads, ~3.8 GB | **0** |
-| direct writes + fsync | 1 GiB written, read back, unlinked | **0** |
+```
+last NVMe fault this boot: 08:53:17        the five attempts ran from ~16:00 onward
+faults in the 10 minutes before each attempt: 0, 0, 0, 0, 0
+```
 
-So **the stream is not reproducible from userspace I/O** — read or write, sequential or random, one thread or twenty-four
-— and a reproduction has to come from something else. In order of what the evidence still allows:
+| attempt | load | faults in the 10 min before | faults during | what it shows |
+|---|---|---|---|---|
+| sequential direct reads | 12 GiB, 4 MiB blocks, 3.9 GB/s | 0 | **0** | does not restart a stopped stream |
+| random direct reads | 400 × 64 KiB at random offsets | 0 | **0** | same |
+| concurrent direct reads | 24 threads, ~3.8 GB | 0 | **0** | same |
+| direct writes + fsync | 1 GiB written, read back, unlinked | 0 | **0** | same |
+| memory pressure + reads | 8 GiB held/touched during 30 direct reads | 0 | **0** | same |
 
-1. **memory pressure / allocator state** — the bursts coincided with builds, which allocate and free heavily; a fault
-   needs the allocator to hand back an IOVA whose TLB entry has not been invalidated while a command is still
-   outstanding, and the reuse is real (494 reuses of one address in 15 minutes);
+**So the honest summary is narrower than "reproduction ruled out": five shapes were tried while the stream was already
+stopped, and none of them restarted it.** That is worth knowing — a stopped stream is not restarted by load, and the
+obvious ways to provoke one do not work — but it does **not** show that those loads cannot *trigger* the stream when it is
+running, because none of them was ever run against a live one. An earlier version of this section said "four shapes tried,
+none reproduced it", which claimed more than the data supports; the fifth row made the pattern obvious but did not cause it.
+
+Reproducing it therefore needs a window when the stream is live, which means either waiting for the box to produce one
+(it happened during other lanes' builds) or running the same shapes *while faults are arriving* and recording the rate
+before and during. If a run starts from a quiet stream, it can only report what these five did: no restart.
+
+What the evidence still leaves as candidate *triggers*, unchanged by the five zeros:
+
+1. **memory pressure far heavier than 8 GiB** — a `cmake` build on a 122 GiB box applies more, and the bursts coincided
+   with builds. The mechanism it would reach is real: the allocator hands the same IOVA straight back (494 reuses of one
+   address in 15 minutes), and a fault needs that hand-back to happen while a command is still outstanding;
 2. **uptime** — allocator history may be the precondition, which no short test creates;
 3. **a caller outside the block path** — a minority of traced unmaps arrived via `nvme_unmap_data -> dma_iova_unlink ->
    dma_iova_destroy`, i.e. teardown rather than completion.
 
-Two lessons from that list. The first three shapes were chosen because of **my own story** about the trigger, and the story
-was wrong — cheap tests turned a plausible narrative into four ruled-out candidates. And the fourth is the one I nearly
-did not run, because I had convinced myself it needed someone's permission; it needed a bounded write to this lane's own
-scratch directory.
+One measurement note the fifth test produced, which applies to any experiment on this host: `MemAvailable` moved from 58 to
+88 GiB **during my own thirty-second window**, purely from other work. A memory-pressure experiment on a shared box has to
+record the baseline either side of the window, or it cannot separate its own effect from a neighbour's.
 
 ## The same method on a second device (the NPU)
 

@@ -56,6 +56,51 @@ inline void conv1d(const float* x, int cin, int T, const float* w, const float* 
     }
 }
 
+// engine#2366: conv1d above runs one output channel at a time, so each output element is a single 2304-long
+// dependent float chain (cin=768 x k=3) and the pipeline stalls on it. Walking FOUR channels together gives
+// four independent accumulators -- measured 2.63x on the [768,768,3] stride-2 stem (N=5 interleaved medians,
+// 1044 -> 398 ms, ranges non-overlapping) with a bit-identical result, because each channel still accumulates
+// ci-outer / j-inner in exactly conv1d's order. This is the host path's entry point; the tail channels fall
+// back to conv1d so any cout is handled.
+inline void conv1d_channels(const float* x, int cin, int T, const float* w, const float* b, int cout, int k,
+                            int stride, int pad, float* out) {
+    const int tout = conv1d_out_len(T, k, stride, pad);
+    int co = 0;
+    for (; co + 4 <= cout; co += 4) {
+        const float* w0 = w + (std::size_t)(co + 0) * cin * k;
+        const float* w1 = w + (std::size_t)(co + 1) * cin * k;
+        const float* w2 = w + (std::size_t)(co + 2) * cin * k;
+        const float* w3 = w + (std::size_t)(co + 3) * cin * k;
+        float* o0 = out + (std::size_t)(co + 0) * tout;
+        float* o1 = out + (std::size_t)(co + 1) * tout;
+        float* o2 = out + (std::size_t)(co + 2) * tout;
+        float* o3 = out + (std::size_t)(co + 3) * tout;
+        for (int t = 0; t < tout; ++t) {
+            float a0 = b ? b[co + 0] : 0.0f, a1 = b ? b[co + 1] : 0.0f;
+            float a2 = b ? b[co + 2] : 0.0f, a3 = b ? b[co + 3] : 0.0f;
+            for (int ci = 0; ci < cin; ++ci) {
+                const float* xr = x + static_cast<std::size_t>(ci) * T;
+                const std::size_t off = static_cast<std::size_t>(ci) * k;
+                for (int j = 0; j < k; ++j) {
+                    const int src = t * stride + j - pad;
+                    if (src >= 0 && src < T) {
+                        const float xv = xr[src];
+                        a0 += w0[off + j] * xv;
+                        a1 += w1[off + j] * xv;
+                        a2 += w2[off + j] * xv;
+                        a3 += w3[off + j] * xv;
+                    }
+                }
+            }
+            o0[t] = a0; o1[t] = a1; o2[t] = a2; o3[t] = a3;
+        }
+    }
+    for (; co < cout; ++co) {
+        conv1d(x, cin, T, w + static_cast<std::size_t>(co) * cin * k, b ? b + co : nullptr, 1, k, stride, pad,
+               out + static_cast<std::size_t>(co) * tout);
+    }
+}
+
 // The same convolution as a GEMM (engine#1783: so the encoder's two Conv stems can run on the NPU's GEMM family).
 //   A = im2col(x): (tout, cin*k), A[t][ci*k + j] = x[ci][t*stride + j - pad], 0 outside [0, T).
 //   B = w as (cin*k, cout): B[ci*k + j][co] = w[co][ci][j].

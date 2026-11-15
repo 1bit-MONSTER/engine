@@ -122,6 +122,26 @@ self_test() {
     chk "--restart-rc 000 0 inactive waiting -> 69 (inactive is never healthy)" "$("$0" --restart-rc 000 0 0 1)" 69
     chk "--restart-rc 000 3 active waiting -> 3 (the job's failure is still kept)" "$("$0" --restart-rc 000 3 1 1)" 3
     chk "--restart-rc 503 0 active waiting -> 0 (a 503 with a waiting unit is still asleep)" "$("$0" --restart-rc 503 0 1 1)" 0
+    # 3h. the journal reader itself (review on this PR): the crash-on-load sequence must NOT read as "waiting for demand",
+    #     even though a stale "waiting for demand" from the PREVIOUS invocation is still in the tail.
+    cat > "$tmp/j-crash.log" <<'JLOG'
+coder-llm-ticketed[100] waiting for demand (demand file touched within 1800s)
+Stopping coder-llm.service...
+Started coder-llm.service...
+coder-llm-ticketed[200] demand: queueing for the GPU (gpu-hold -l coder-llm -t 25 -w 900)
+coder-llm-ticketed[201] window open: server pid 202
+E hrx: device lost
+coder-llm-ticketed[201] server exited by itself, rc 1
+coder-llm-ticketed[200] window ended rc 1
+JLOG
+    chk "a crash-on-load after a stale 'waiting for demand' is NOT asleep" "$("$0" --asleep "$tmp/j-crash.log")" 0
+    chk "  ... so the restart verdict for it is 69" "$("$0" --restart-rc 000 0 1 "$("$0" --asleep "$tmp/j-crash.log")")" 69
+    printf '%s\n' 'coder-llm-ticketed[300] waiting for demand (demand file touched within 1800s)' > "$tmp/j-wait.log"
+    chk "the newest wrapper line saying 'waiting for demand' IS asleep" "$("$0" --asleep "$tmp/j-wait.log")" 1
+    : > "$tmp/j-empty.log"
+    chk "an empty journal is not asleep (the safe direction)" "$("$0" --asleep "$tmp/j-empty.log")" 0
+    printf '%s\n' 'no wrapper lines here at all' > "$tmp/j-none.log"
+    chk "a journal with no wrapper line at all is not asleep" "$("$0" --asleep "$tmp/j-none.log")" 0
     # 3f. the ticket's child really re-checks the gap: another window ends while this one is queued (the fake gpu-hold
     #     appends that end line, then runs the real child) -> rc 75, coder-llm never stopped, nothing else logged.
     #     systemctl is a recording fake first on PATH, so even a regression here cannot stop the real coder-llm.
@@ -181,11 +201,39 @@ final_rc() { if [ "$1" = 200 ] || [ "$2" != 0 ]; then echo "$2"; else echo 69; f
 # `active` while `:8090` is silent. Without this, every window that ran more than CODER_LLM_DEMAND_TTL_MIN after the
 # last PR-Agent call would return 69 and print "the fleet LLM is down because of this run", which is false and is the
 # alert that gets ignored by the third occurrence.
+# "Waiting for demand" is only the answer if it is what THIS invocation is doing NOW. Two things make that true, and my
+# first version got both wrong (review on this PR):
+#   * scope to the current invocation -- `journalctl --user _SYSTEMD_INVOCATION_ID=<id>` -- because the same unit's
+#     PREVIOUS run also logged "waiting for demand", and the last 60 lines can easily still hold it;
+#   * read the LAST wrapper state line, not any matching one. A crash on load right after this window logs
+#     `demand: queueing …` -> `window open: server pid …` -> `device lost` -> `server exited by itself, rc 1`, all after
+#     that stale "waiting for demand", and calling that "asleep on purpose" is exactly the failure 69 exists for.
+# The journal is read through a seam so a test can feed a fixture: coder_llm_asleep [journal-file].
+coder_llm_asleep() {   # [journal file] -> prints 1 when the unit is waiting for demand on THIS invocation, else 0
+    local jid src
+    if [ -n "${1:-}" ]; then
+        src=$(cat "$1" 2>/dev/null)
+    else
+        jid=$(systemctl --user show -p InvocationID --value coder-llm 2>/dev/null)
+        [ -n "$jid" ] || { echo 0; return; }
+        src=$(journalctl --user --no-pager -q _SYSTEMD_INVOCATION_ID="$jid" 2>/dev/null)
+    fi
+    [ -n "$src" ] || { echo 0; return; }
+    # the wrapper's own lines, newest last; only the newest one is a statement about now
+    local last
+    last=$(printf '%s\n' "$src" | grep -F 'coder-llm-ticketed[' | tail -1)
+    case "$last" in
+        *'waiting for demand'*) echo 1 ;;
+        *)                      echo 0 ;;
+    esac
+}
+
 restart_rc() {   # <code> <job rc> <unit active: 0|1> <journal says waiting for demand: 0|1>
     if [ "$1" = 200 ] || [ "$3" != 1 ] || [ "$4" != 1 ]; then final_rc "$1" "$2"; else echo "$2"; fi
 }
 if [ "${1:-}" = "--final-rc" ]; then final_rc "${2:-}" "${3:-0}"; exit 0; fi
 if [ "${1:-}" = "--restart-rc" ]; then restart_rc "${2:-000}" "${3:-0}" "${4:-0}" "${5:-0}"; exit 0; fi
+if [ "${1:-}" = "--asleep" ]; then coder_llm_asleep "${2:-}"; exit 0; fi
 # --gap-ok: rc 0 when the 45-minute gap is open now, rc 1 (with the reason) when it is not. The ticket's child runs it
 # right before it stops coder-llm, so a window another lane ran while this one queued still counts.
 if [ "${1:-}" = "--gap-ok" ]; then
@@ -297,9 +345,8 @@ restore() {
     done
     _state=$(systemctl --user is-active coder-llm 2>/dev/null)
     _waiting=0
-    if [ "$code" != 200 ] && [ "$_state" = active ] &&
-        journalctl --user -u coder-llm -n 60 --no-pager 2>/dev/null | grep -q 'waiting for demand'; then
-        _waiting=1
+    if [ "$code" != 200 ] && [ "$_state" = active ]; then
+        _waiting=$(coder_llm_asleep ${WR_JOURNAL_FILE:+"$WR_JOURNAL_FILE"})
     fi
     rc=$(restart_rc "$code" "$rc" "$([ "$_state" = active ] && echo 1 || echo 0)" "$_waiting")
     # The end line keeps its shape for the gap parser (`Z end ` prefix) and names which case it took, so a reader does

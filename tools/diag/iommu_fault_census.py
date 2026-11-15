@@ -65,8 +65,12 @@ def census(rows):
         counts, flag_counts = {}, {}
         for a, fl in pairs:
             counts[a] = counts.get(a, 0) + 1
-            if fl:
-                flag_counts[fl] = flag_counts.get(fl, 0) + 1
+            # A line whose flags field is absent -- or present and unparseable, which this cannot tell apart --
+            # is counted in ``faults`` either way, so it must appear in the histogram too: a bucket that only
+            # holds the lines it could parse under-counts, and an under-count is indistinguishable from a quiet
+            # device. ``(absent)`` keeps sum(flags) == faults for every bucket (review of engine#2559).
+            key = fl or "(absent)"
+            flag_counts[key] = flag_counts.get(key, 0) + 1
         top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
         out.append(
             {
@@ -143,10 +147,9 @@ def render(entries, inter, as_json):
         )
         for t in e["top"]:
             lines.append("    %s x%d" % (t["address"], t["count"]))
-        if e["flags"]:
-            lines.append(
-                "    flags: %s" % ", ".join("%s x%d" % (f, n) for f, n in sorted(e["flags"].items(), key=lambda kv: -kv[1]))
-            )
+        lines.append(
+            "    flags: %s" % ", ".join("%s x%d" % (f, n) for f, n in sorted(e["flags"].items(), key=lambda kv: -kv[1]))
+        )
         lines.append("    -> %s" % shape(e))
     if inter is None:
         lines.append("shared across boots: (need two or more labeled journals of the same device)")
@@ -281,6 +284,12 @@ def self_test():
         "AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0001 address=0x1000]\n"
     )
     ok("a fault line without a flags field still parses", census(parse(no_flags, "b"))[0]["faults"], 1)
+    ok("  ...and it is COUNTED, not dropped from the histogram",
+       census(parse(no_flags, "b"))[0]["flags"], {"(absent)": 1})
+    # engine#2559 review: the histogram must partition the total, or the lines it could not bucket vanish from a
+    # report that still says how many faults there were -- the same loss the histogram was added to prevent.
+    for _e in census(parse(two_flags + no_flags, "b")):
+        ok("  flags partition the fault count (%s)" % _e["device"], sum(_e["flags"].values()), _e["faults"])
 
     print("iommu_fault_census self-test: %d failure(s)" % fails)
     return 1 if fails else 0

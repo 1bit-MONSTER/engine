@@ -187,12 +187,20 @@ JLOG
     # the loading-vs-wedged check needs a live child growing in CPU, which a self-test cannot fake without testing its
     # own fake; pin the reader instead so it cannot be deleted silently (the same technique the probe arm uses).
     # 3k. engine#2496's contract: a ticketed coder-llm that is QUEUED is not a failed restart
-    : > "$tmp/t.calls"; mkdir -p "$tmp/q"; : > "$tmp/q/0179.coder-llm"; printf 'label=coder-llm\npid=999999\n' > "$tmp/q/0179.coder-llm"
+    : > "$tmp/t.calls"; mkdir -p "$tmp/q"
+    # a LIVE pid: the arm used to write pid=999999, which does not exist -- so it demonstrated a STALE entry and
+    # asserted "queued" as correct (review of this PR). $$ is this test's own live shell.
+    printf 'label=coder-llm\npid=%s\n' "$$" > "$tmp/q/0179.coder-llm"
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/t.log"
-    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token GPU_QUEUE_DIR=$tmp/q \
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token GPU_QUEUE_DIR=$tmp/q WR_HEALTH_URL=http://127.0.0.1:9/x \
       WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
-    chk "a queued coder-llm is recorded as queued, not failed" "$(grep -c 'restart=queued(waiting for a GPU ticket)' "$tmp/t.log")" 1
+    chk "a queued coder-llm is recorded as queued, not failed" "$(grep -c 'restart=queued(WAITING for a GPU ticket when this window ended, not restored)' "$tmp/t.log")" 1
     chk "  ... and it is not reported as a failed restart" "$(grep -c 'restart=FAILED' "$tmp/t.log")" 0
+    # a DEAD pid is a stale entry, which gpu-hold drops -- it must not license "queued" forever
+    : > "$tmp/t.log"; printf 'label=coder-llm\npid=999999\n' > "$tmp/q/0179.coder-llm"
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token GPU_QUEUE_DIR=$tmp/q WR_HEALTH_URL=http://127.0.0.1:9/x \
+      WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "a STALE queue entry (dead pid) does not count as queued" "$(grep -c 'restart=queued' "$tmp/t.log")" 0
     chk "the poll reads the largest child's CPU, not the idle embed child" "$(grep -c 'sort -k2 -n | tai[l] -1' "$me")" 1
     # 4. an old enough end opens the gate again (the refusal above is about the gap, not about the file)
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/w.log"
@@ -391,12 +399,19 @@ restore() {
     # is `active` and `:8090` stays empty for minutes. A restart-then-fail there is a false signal on EVERY window,
     # which is how lanes learn to ignore the failure. Measured: the unit ran `coder-llm-ticketed`, `coder-llm` was
     # 4th in ~/GPU-QUEUE, and this restore reported failure for a window whose job had succeeded.
+    # LIVENESS, not existence (review of this PR, and the same mistake #2547 made with the token file): an entry
+    # left behind by a killed process outlives it, and `gpu-hold` itself calls such an entry stale and DROPS it
+    # (stale(), nineteen lines in: "no pid, or whose pid is gone"). Matching on the label alone makes a dead
+    # ticket licence a `queued` verdict for every later window -- a permanent false calm, which is worse than the
+    # false alarm this PR removes.
     coder_llm_queued() {
-        local q=${GPU_QUEUE_DIR:-$HOME/GPU-QUEUE} f
+        local q=${GPU_QUEUE_DIR:-$HOME/GPU-QUEUE} f pid
         [ -d "$q" ] || return 1
         for f in "$q"/*; do
             case "${f##*/}" in .*) continue ;; esac
-            grep -qx 'label=coder-llm' "$f" 2>/dev/null && return 0
+            grep -qx 'label=coder-llm' "$f" 2>/dev/null || continue
+            pid=$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' "$f" 2>/dev/null | head -1)
+            [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
         done
         return 1
     }
@@ -420,7 +435,7 @@ restore() {
       # check asks for: slower than a status code, and the only probe that cannot be right while the LLM is unusable.
       code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
                  -d '{"model":"qwen3-coder","messages":[{"role":"user","content":"ok"}],"max_tokens":1,"temperature":0}' \
-                 http://127.0.0.1:8090/v1/chat/completions 2>/dev/null || true)
+                 "${WR_HEALTH_URL:-http://127.0.0.1:8090/v1/chat/completions}" 2>/dev/null || true)
       [ "$code" = 200 ] && break
       _cpu=$(cpu_of)
       if [ -n "$_cpu" ] && [ "$_cpu" = "$prev" ]; then froze=$((froze + 1)); else froze=0; fi
@@ -430,7 +445,7 @@ restore() {
     done
     _state=$(systemctl --user is-active coder-llm 2>/dev/null)
     if [ "$code" != 200 ] && [ "$_state" = active ] && coder_llm_queued; then
-        printf '%s end   lane=%s issue=%s label=%s coder-llm=active :8090=queued restart=queued(waiting for a GPU ticket) rc=%s\n' \
+        printf '%s end   lane=%s issue=%s label=%s coder-llm=active :8090=queued restart=queued(WAITING for a GPU ticket when this window ended, not restored) rc=%s\n' \
           "$(date -u +%FT%TZ)" "$WR_LANE" "$ISSUE" "$LABEL" "$rc" >> "$LOG"
         printf '%s: coder-llm is queued for a GPU ticket (engine#2496), not dead: :8090 answers when it gets one\n' "$SELF" >&2
         rm -rf "$WR_DIR"; exit "$rc"

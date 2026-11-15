@@ -51,8 +51,16 @@ def read_int(path, default=None):
 
 
 def meminfo():
+    """The box's memory, from /proc/meminfo or from MEM_GUARD_MEMINFO when set.
+
+    scripts/mem-guard.sh has honoured MEM_GUARD_MEMINFO since it was written (its comment says why: "the tests:
+    'plenty, then starved' cannot be produced on demand"). This reader did not, so a test could starve one half of
+    the memory accounting and not the other -- and the hw-gate zero-cases arm could not run on a CI runner at all,
+    because its no-model pre-check refuses under 16 GiB MemAvailable (measured: e2e 43756744545, `ops FAIL 0s
+    could not run: the memory pre-check refused it (rc 76)`). Same variable, same meaning, one definition."""
+    path = os.environ.get("MEM_GUARD_MEMINFO", "/proc/meminfo")
     out = {}
-    with open("/proc/meminfo") as f:
+    with open(path) as f:
         for line in f:
             k, v = line.split(":", 1)
             out[k] = int(v.split()[0]) * 1024

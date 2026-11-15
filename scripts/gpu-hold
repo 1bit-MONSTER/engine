@@ -93,6 +93,13 @@ LOG=${GPU_HOLD_LOG:-}
 THERMAL_FLAG=${GPU_HOLD_THERMAL_FLAG:-$HOME/THERMAL-HOLD}
 COOLDOWN=${GPU_HOLD_COOLDOWN:-180}
 COOLDOWN_TCTL=${GPU_HOLD_COOLDOWN_TCTL:-85}
+# ONE pattern for a GPU/NPU fault line, read by both the take-time refusal (#2480) and the during-hold watch (#2486).
+# They had one each and the two drifted (engine#2494, cl-infra 11-15): the take-time copy lacked the gfxhub page fault
+# and the MES "failed to respond", so a ticket was granted onto a log whose newest line was the fault that had just ended
+# the previous hold with rc 78, and only a MODE2 reset line refused. The during-hold copy lacked the amdxdna "fault" that
+# #2498 added at take time. The union is the rule's own list: a page fault, any amdgpu/MES reset or failure, a ring
+# timeout, an amdxdna command timeout, power-cycle or fault.
+GPU_FAULT_RE='\[gfxhub\] page fault|amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure|failed to respond)|amdxdna.*(command timeout|power.?cycle|fault)'
 
 while getopts ":t:l:w:q:h" opt; do
     case $opt in
@@ -305,7 +312,7 @@ while [ "$state" = queued ]; do
                     # while the during-hold watch below already reads amdxdna faults. Without them a lane could
                     # take an NPU ticket minutes after the command timeout the rules say to stop for (measured
                     # 2026-11-15: the hold ran on a log whose newest line was an amdxdna command timeout).
-                    _reset_re='amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure)|amdxdna.*(command timeout|power.?cycle|fault)'
+                    _reset_re=$GPU_FAULT_RE
                     _resets=$(printf '%s\n' "$_klog" | grep -ciE "$_reset_re")
                     if [ "${_resets:-0}" -gt 0 ]; then
                         rm -f "$TOKEN"; state=done
@@ -420,7 +427,7 @@ mem_available_gb() {
 # GPU_HOLD_FAULT_ABORT=0 turns it off. With no readable kernel log (a CI runner) it is inert, as #2480's check is.
 # GPU_HOLD_KLOG_FILE replaces the kernel log with a file (tests).
 FAULT_ABORT=${GPU_HOLD_FAULT_ABORT:-1}
-FAULT_RE='\[gfxhub\] page fault|amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure|failed to respond)|amdxdna.*(command timeout|power.?cycle)'
+FAULT_RE=$GPU_FAULT_RE
 FAULT_FLAG="$QUEUE/.fault.$SAFE.$$"
 fault_lines() {
     if [ -n "${GPU_HOLD_KLOG_FILE:-}" ]; then

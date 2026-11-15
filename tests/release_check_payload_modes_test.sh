@@ -71,6 +71,19 @@ mktree p755 0755
 got=$(bash -c "$FN"$'\npayload_modes_noexec "$1"' _ "$ROOT/p755")
 [ -z "$got" ] && echo "ok    a 0755 payload reports nothing" || { echo "FAIL  a healthy payload was reported: '${got}'"; fail=1; }
 
+# The fourth binary: `serve` spawns the HRX backend for every onebit/llamacpp-hrx model, and a payload whose
+# `llama-server` was 0644 answered the first chat request with "Failed to execute: ... Permission denied" (measured
+# 2026-11-15) while this row - which required the other three - said nothing about it.
+mkdir -p "$ROOT/pbackend/1bit/hrx/llama/bin" "$ROOT/pbackend/bin"
+printf 'x' > "$ROOT/pbackend/1bit/1bit"; printf 'x' > "$ROOT/pbackend/bin/lemond"
+chmod 0755 "$ROOT/pbackend/1bit/1bit" "$ROOT/pbackend/bin/lemond"
+printf 'x' > "$ROOT/pbackend/1bit/hrx/llama/bin/llama-server"; chmod 0644 "$ROOT/pbackend/1bit/hrx/llama/bin/llama-server"
+got=$(bash -c "$FN"$'\npayload_modes_noexec "$1"' _ "$ROOT/pbackend")
+case "$got" in
+    *hrx/llama/bin/llama-server*) echo "ok    a 0644 HRX backend is named even when the three named binaries are 0755" ;;
+    *) echo "FAIL  a 0644 HRX backend went unreported: '${got}'"; fail=1 ;;
+esac
+
 mktree pnone none
 got=$(bash -c "$FN"$'\npayload_modes_noexec "$1"' _ "$ROOT/pnone")
 [ -z "$got" ] && echo "ok    a payload with no binaries reports nothing (absence is another row's claim)" || { echo "FAIL  a binary-less payload was reported: '${got}'"; fail=1; }

@@ -788,8 +788,13 @@ payload_modes_noexec() {   # <payload dir> -> the binaries present but not execu
     # `[ -x ]` is the right predicate and NOT a stricter "is it 0755" (engine#2424's phrasing, worth keeping): the appliance runs as
     # root, and access(2) documents that a real UID of zero passes X_OK "if execute permission is enabled for any of the file owner,
     # group, or other". So the property is *can it execute*, which is exactly what the row that would start the engine tests.
+    # The HRX backend is the fourth binary and the one that actually failed first (2026-11-15): a payload whose
+    # `llama-server` was 0644 answered the first chat request with "Failed to execute: ... Permission denied" and
+    # HTTP 500 in one second, while this row - which had just been fixed to require the other three - was silent
+    # about it. The three are the ones the appliance starts by name; this one is the one `serve` spawns for a model.
     _pe_dir=${1:-} _pe_out=
-    for _pe_b in "$_pe_dir/1bit/1bit" "$_pe_dir/bin/lemond" "$_pe_dir/lemond-onebit"; do
+    for _pe_b in "$_pe_dir/1bit/1bit" "$_pe_dir/bin/lemond" "$_pe_dir/lemond-onebit" \
+        "$_pe_dir/1bit/hrx/llama/bin/llama-server"; do
         [ -f "$_pe_b" ] || continue
         { [ -x "$_pe_b" ] || _pe_out="$_pe_out ${_pe_b#"$_pe_dir"/}"; } 2>/dev/null || true
     done
@@ -2245,6 +2250,46 @@ else
                 *)     fail payload-modes "${PM#FAIL }${_pm_bits:+ (modes:$_pm_bits)}" ;;
             esac
         fi
+    fi
+fi
+
+payload_backend_missing() {   # <payload dir> -> the HRX backend pieces absent from it, payload-relative and space-separated
+    # Measured 2026-11-15 in an `npu-hold`+`gpu-hold` demo rehearsal: a partial payload dir launched `lemond-onebit`,
+    # listed all three demo models, and then answered `/api/v1/chat/completions` with HTTP 500 in 1 s:
+    #   "Failed to execute: <payload>/1bit/hrx/llama/bin/llama-server"
+    # `payload-modes` catches that particular payload on its entry floor (94 entries), but the floor is a count: a
+    # payload with hundreds of entries can still be missing the one binary every HRX model spawns, and the first
+    # request is where that surfaces - for a user, not for a checker.
+    # Two pieces, because `llama-server` present and its HRX compute library absent is the same failure one step later
+    # (the exec succeeds and the `dlopen` of `libggml-hrx.so` does not).
+    #
+    # Absence of the CATALOG is not this function's question and neither is a payload that ships no HRX model: the
+    # caller skips both. This returns only "which pieces are missing from a payload that should have them".
+    _pb_dir=${1:-} _pb_out=
+    [ -f "$_pb_dir/1bit/hrx/llama/bin/llama-server" ] || _pb_out="$_pb_out 1bit/hrx/llama/bin/llama-server"
+    if ! ls "$_pb_dir"/1bit/hrx/llama/bin/libggml-hrx.so* > /dev/null 2>&1; then
+        _pb_out="$_pb_out 1bit/hrx/llama/bin/libggml-hrx.so*"
+    fi
+    printf '%s' "$_pb_out"
+}
+
+# ── payload-backend: the executable `serve` spawns for an HRX model ─────────────────────────────────────────────
+# The presence question comes from the payload's OWN catalog, so a payload that ships no HRX model is not asked for an
+# HRX backend, and a payload with no catalog at all is a different row's FAIL (payload-modes' floor) rather than a
+# claim invented here.
+_cat=$PDIR/bin/resources/server_models.json
+if [ ! -d "$PDIR" ]; then
+    skip payload-backend "no $PDIR on this system: the payload is not unpacked where an appliance keeps it"
+elif [ ! -f "$_cat" ]; then
+    skip payload-backend "the payload has no catalog at $_cat, so what it will spawn cannot be read"
+elif ! grep -qE '"recipe"[[:space:]]*:[[:space:]]*"(onebit|llamacpp-hrx)"' "$_cat" 2> /dev/null; then
+    skip payload-backend "the payload's catalog ships no HRX model, so it needs no HRX backend"
+else
+    _pb_miss=$(payload_backend_missing "$PDIR")
+    if [ -n "$_pb_miss" ]; then
+        fail payload-backend "the payload's catalog ships HRX models but the backend is incomplete:${_pb_miss} - the first chat request fails with \"Failed to execute\" (HTTP 500), which is what a partial extraction looks like"
+    else
+        pass payload-backend "llama-server and libggml-hrx are both in the payload beside the catalog that needs them"
     fi
 fi
 

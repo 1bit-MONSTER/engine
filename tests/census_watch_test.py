@@ -206,6 +206,19 @@ check("no config -> unverifiable, exit 0",
 rc, res = rc_of([model("f/seven", tags=["text-generation"])], seen={"f/seven"})
 check("unverifiable remembered -> quiet", rc == 0 and res[cw.UNVERIFIABLE] == [])
 
+# 7b. engine#2528: the LINE must say what the behaviour does. The arm above pins that an unverifiable
+# model is remembered and not re-reported; this one pins that the message does not promise a retry that
+# the code will never perform. It said "retried next run" for as long as the behaviour was already
+# correct, so pinning the behaviour alone could not catch it.
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    cw.report([model("f/eight", tags=["text-generation"])],
+              cw.classify([model("f/eight", tags=["text-generation"])], ARCHS, SIG, ()), ())
+line = [l for l in buf.getvalue().splitlines() if "UNVERIFIABLE" in l]
+check("unverifiable line says it is recorded, not retried",
+      len(line) == 1 and "retried next run" not in line[0]
+      and "not retried automatically" in line[0])
+
 # 8. A mixed batch: the alert fires, and the summary counts each group.
 rc, res = rc_of([
     model("g/eight", "Qwen3ForCausalLM"),

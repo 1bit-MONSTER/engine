@@ -80,6 +80,19 @@
    "answer": "not served: a speech encoder-decoder the registry does not map; the Whisper encoder on our runtime is engine#1783",
    "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
    "issue": 1783
+  },
+  "Qwen3ASRForConditionalGeneration": {
+   "answer": "not served: a speech-recognition pack (audio encoder + text decoder); `qwen3vl`, hrx only, and the route claims text decoders only",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 1783
+  },
+  "DFlash2DraftModel": {
+   "answer": "not served: a speculative drafter, not a standalone decoder; `dflash`, hrx only",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve"
+  },
+  "Lfm3ForCausalLM": {
+   "answer": "not served: `lfm3`, hrx only; no LFM3 model type or kernels in the route",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve"
   }
  },
  "repos": {

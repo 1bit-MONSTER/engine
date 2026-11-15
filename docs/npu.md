@@ -2396,8 +2396,8 @@ not a mapping:
 |---|---|---|---|
 | `FastFlowLM/MiniCPM-OCR-1.0-NPU2` | `MiniCPMOcrForConditionalGeneration` | none (the pin registers `MiniCPMForCausalLM`, `MiniCPM3` and `MiniCPMV4_6` only) | not served: an OCR/vision tower; the route claims text decoders only |
 | `FastFlowLM/MiniCPM-V-4.7-35B-A3B-NPU2`, `FastFlowLM/MiniCPM-V-4.7-1B-NPU2` | `MiniCPMV4_7ForConditionalGeneration` | none (V4_6's text tower maps through `qwen35`, a VLM wrapper the pin does not register) | not served: a vision-language pack; a converter registration for the text tower plus a vision scope decision come first |
-| `FastFlowLM/Qwen3.8-27B-DFlash2-NPU2` | `DFlash2DraftModel` | none; reviewed not-an-alias (docs/arch-gaps.md, `dflash2`) | not served: a speculative drafter, not a standalone decoder; it needs the reviewed dflash2 support, not a mapping |
-| `FastFlowLM/LFM3-1.7B-NPU2` | `Lfm3ForCausalLM` | none (LFM2 / LFM2-MoE are mapped; LFM3 is not registered at the pin) | not served: no LFM3 model type or kernels in the route |
+| `FastFlowLM/Qwen3.8-27B-DFlash2-NPU2` | `DFlash2DraftModel` | none on 2026-11-05 (reviewed not-an-alias, docs/arch-gaps.md, `dflash2`); since mapped -> `dflash`, hrx only | not served: a speculative drafter, not a standalone decoder; it needs the reviewed dflash2 support, not a mapping |
+| `FastFlowLM/LFM3-1.7B-NPU2` | `Lfm3ForCausalLM` | none on 2026-11-05 (LFM3 was not registered at the pin); since mapped -> `lfm3`, hrx only | not served: no LFM3 model type or kernels in the route |
 | `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | none on 2026-11-05 (no config); `HYV3ForCausalLM` / model_type `hy_v3` by 2026-11-06 | `HYV3ForCausalLM` -> `hy_v3`, hrx only | not served: an hrx-only family; the 2026-11-06 dev-box run prints it as `!! NPU FLM ... npu route: no` |
 | `FastFlowLM/smolvla-NPU2` | none (no config), no `*.q4nx` | none | not a pack: a config-less VLA repo. It prints as `!! NEW FLM` because its config carries no `library_name` for the custom-code rule, but there is no architecture to map and no Q4NX file to serve |
 
@@ -2454,6 +2454,9 @@ pack declares (a config with no `architectures` declares its `model_type`):
 | `Phi3ForCausalLM` | Phi4-mini-Instruct | not served: `phi3`, hrx only | engine#1786 |
 | `Gemma3TextModel` | Embedding-Gemma-300M | not served: `gemma-embedding`, an embedding model, hrx only | engine#1786 |
 | `WhisperForConditionalGeneration` | Whisper-V3-Turbo | not served: a speech encoder-decoder the registry does not map | engine#1783 |
+| `Qwen3ASRForConditionalGeneration` | Confucius4-R2T2 (2026-11-15) | not served: a speech-recognition pack (audio encoder + text decoder), `qwen3vl`, hrx only | engine#1783 |
+| `DFlash2DraftModel` | Qwen3.8-27B-DFlash2 | not served: a speculative drafter, `dflash`, hrx only (the first table above) | this section |
+| `Lfm3ForCausalLM` | LFM3-1.7B | not served: `lfm3`, hrx only (the first table above) | this section |
 
 `FastFlowLM/smolvla-NPU2` is answered by its repo id (`repos` in the same file): it has no config and no `*.q4nx`
 file, so there is no architecture to key on and nothing for the route to load.

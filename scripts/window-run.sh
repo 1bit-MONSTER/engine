@@ -43,6 +43,15 @@ LOG=${WINDOWS_LOG:-$HOME/briefs/WINDOWS.log}
 # and moved every lane's 45-minute gap (11-15 03:31Z).
 GPU_HOLD=${GPU_HOLD:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu-hold}
 export GPU_HOLD
+
+# epoch of the newest END line in the log (0 when there is none); read fresh every time it is asked, because another
+# lane can open and close a window while this one waits (11-15 04:14-04:17Z, inside my -w wait)
+last_end_s() {
+  local e
+  [ -f "$LOG" ] || { echo 0; return; }
+  e=$(sed -n 's/^\([0-9T:-]*Z\) end .*/\1/p' "$LOG" | sort | tail -1)
+  [ -n "$e" ] && date -u -d "$e" +%s 2>/dev/null || echo 0
+}
 die() { printf '%s: %s\n' "$SELF" "$*" >&2; exit 2; }
 
 self_test() {
@@ -65,6 +74,21 @@ self_test() {
     : > "$tmp/g.log"
     GPU_HOLD=$tmp/none WINDOWS_LOG=$tmp/g.log "$0" --dry-run -m 5 -l x -c true >/dev/null 2>&1; chk "a missing gpu-hold is refused" "$?" 2
     chk "  ... and writes nothing to the log" "$(wc -l < "$tmp/g.log")" 0
+    # 3c. --gap-ok reads the log fresh: a window that ended 5 minutes ago refuses, one 90 minutes ago does not
+    printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '5 minutes ago' +%FT%TZ)" > "$tmp/k.log"
+    WINDOWS_LOG=$tmp/k.log "$0" --gap-ok >/dev/null 2>&1; chk "--gap-ok refuses 5 min after a window" "$?" 1
+    printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/k.log"
+    WINDOWS_LOG=$tmp/k.log "$0" --gap-ok >/dev/null 2>&1; chk "--gap-ok passes 90 min after one" "$?" 0
+    # 3d. TERM while the ticket is still queued: the queued job dies with the runner and nothing is logged
+    #     (11-15 04:24Z: a TERM to the runner left coder-llm down and a llama-server outliving its ticket)
+    printf '#!/bin/bash\n[ "${1:-}" = --status ] && exit 0\necho $$ > %s/fake.pid; exec sleep 60\n' "$tmp" > "$tmp/fake-gpu-hold"
+    chmod +x "$tmp/fake-gpu-hold"; : > "$tmp/q.log"
+    GPU_HOLD=$tmp/fake-gpu-hold WINDOWS_LOG=$tmp/q.log "$0" -m 1 -l x -c true >/dev/null 2>&1 & local runner=$!
+    for _ in $(seq 1 50); do [ -s "$tmp/fake.pid" ] && break; sleep 0.1; done
+    kill -TERM "$runner" 2>/dev/null; wait "$runner" 2>/dev/null; local rrc=$?
+    chk "a TERM'd runner exits 143" "$rrc" 143
+    kill -0 "$(cat "$tmp/fake.pid" 2>/dev/null)" 2>/dev/null; chk "  ... and its queued job is gone" "$?" 1
+    chk "  ... and nothing is logged" "$(wc -l < "$tmp/q.log")" 0
     # 4. an old enough end opens the gate again (the refusal above is about the gap, not about the file)
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/w.log"
     out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true 2>&1); rc=$?
@@ -97,6 +121,16 @@ self_test() {
 }
 [ "${1:-}" = --self-test ] && { self_test; exit $?; }
 
+# --gap-ok: rc 0 when the 45-minute gap is open now, rc 1 (with the reason) when it is not. The ticket's child runs it
+# right before it stops coder-llm, so a window another lane ran while this one queued still counts.
+if [ "${1:-}" = "--gap-ok" ]; then
+  e=$(last_end_s); g=$(( $(date -u +%s) - e ))
+  if [ "$e" -gt 0 ] && [ "$g" -lt 2700 ]; then
+    printf '%s: the gap closed while queued: a window ended %s min ago (45 needed); coder-llm left running\n' "$SELF" "$(( g / 60 ))" >&2
+    exit 1
+  fi
+  exit 0
+fi
 LABEL=""; ISSUE=""; MINS=15; CMD=""; NOW=${NOW:-0}; DRY=0; WAIT=0
 while [ $# -gt 0 ]; do case "$1" in
   -n|--now) NOW=1; shift;;
@@ -126,7 +160,11 @@ if [ -f "$LOG" ]; then
         # stops *running*, it never shortens the 45 minutes - and it is the same service gpu-hold does
         # for a ticket, which is why a lane that waits out a window by hand is doing the queue's job.
         printf '%s: waiting %s min for the 45-minute gap (last window ended %s)\n' "$SELF" "$left" "$last_end" >&2
-        while [ "$gap" -lt 2700 ]; do sleep 30; gap=$(( $(date -u +%s) - end_s )); done
+        while :; do
+          end_s=$(last_end_s); gap=$(( $(date -u +%s) - end_s ))
+          { [ "$end_s" -eq 0 ] || [ "$gap" -ge 2700 ]; } && break
+          sleep 30
+        done
         printf '%s: the gap is open after waiting %s min\n' "$SELF" "$left" >&2
       else
         die "not yet: the last window ended $last_end ($(( gap / 60 )) min ago of 45 needed; -w waits for it)"
@@ -158,29 +196,51 @@ if [ "$DRY" = 1 ]; then
   printf '%s: would take gpu-hold -t %s -l %s, stop coder-llm, run: %s\n' "$SELF" "$MINS" "$LABEL" "$CMD"
   exit 0
 fi
-saw_up=0; systemctl --user is-active --quiet coder-llm && saw_up=1
 [ -d "$(dirname "$LOG")" ] || mkdir -p "$(dirname "$LOG")"
-printf '%s start lane=%s issue=%s label=%s mins=%s cmd=%s\n' "$(date -u +%FT%TZ)" "${LANE:-$SELF}" "$ISSUE" "$LABEL" "$MINS" "$CMD" >> "$LOG"
+# Markers the ticket's child writes: STARTED once it logged the start line, STOPPED once it stopped coder-llm. A run that
+# never got that far (refused, killed in the queue, gpu-hold missing) logs nothing and restarts nothing.
+WR_DIR=$(mktemp -d); export WR_STARTED=$WR_DIR/started WR_STOPPED=$WR_DIR/stopped
+export WR_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${BASH_SOURCE[0]##*/}" WR_LOG=$LOG WR_LANE=${LANE:-$SELF} \
+       WR_ISSUE=$ISSUE WR_LABEL=$LABEL WR_MINS=$MINS WR_CMD=$CMD WINDOWS_LOG=$LOG
+JOB=""
 restore() {
   local rc=${1:-0} i code=000
-  if [ "$saw_up" = 1 ]; then
+  trap - EXIT TERM INT
+  # the job runs in its own process group: a signal to this runner stops the whole tree, not just gpu-hold
+  # (killing gpu-hold alone leaves its child running, 11-12; 11-15 04:24Z a llama-server outlived its ticket)
+  if [ -n "$JOB" ] && kill -0 "$JOB" 2>/dev/null; then
+    kill -TERM -- "-$JOB" 2>/dev/null; sleep 3; kill -KILL -- "-$JOB" 2>/dev/null
+  fi
+  if [ ! -e "$WR_STARTED" ]; then
+    printf '%s: no window was opened (rc %s): coder-llm untouched, nothing logged\n' "$SELF" "$rc" >&2
+    rm -rf "$WR_DIR"; exit "$rc"
+  fi
+  if [ -e "$WR_STOPPED" ]; then
     systemctl --user start coder-llm 2>/dev/null
     for i in $(seq 1 40); do
       code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/v1/models 2>/dev/null || true)
       [ "$code" = 200 ] && break; sleep 3
     done
     printf '%s end   lane=%s issue=%s label=%s coder-llm=%s :8090=%s rc=%s\n' "$(date -u +%FT%TZ)" \
-      "${LANE:-$SELF}" "$ISSUE" "$LABEL" "$(systemctl --user is-active coder-llm)" "$code" "$rc" >> "$LOG"
+      "$WR_LANE" "$ISSUE" "$LABEL" "$(systemctl --user is-active coder-llm)" "$code" "$rc" >> "$LOG"
     [ "$code" = 200 ] || printf '%s: WARNING coder-llm restarted but :8090 answers %s\n' "$SELF" "$code" >&2
   else
     printf '%s end   lane=%s issue=%s label=%s coder-llm=was-not-running :8090=n/a rc=%s\n' "$(date -u +%FT%TZ)" \
-      "${LANE:-$SELF}" "$ISSUE" "$LABEL" "$rc" >> "$LOG"
+      "$WR_LANE" "$ISSUE" "$LABEL" "$rc" >> "$LOG"
   fi
+  rm -rf "$WR_DIR"; exit "$rc"
 }
 trap 'restore $?' EXIT
-"$GPU_HOLD" -t "$MINS" -l "$LABEL" -- bash -c '
-  if systemctl --user is-active --quiet coder-llm; then systemctl --user stop coder-llm; fi
+trap 'exit 143' TERM
+trap 'exit 130' INT
+setsid "$GPU_HOLD" -t "$MINS" -l "$LABEL" -- bash -c '
+  "$WR_SELF" --gap-ok || exit 75
+  if systemctl --user is-active --quiet coder-llm; then systemctl --user stop coder-llm && touch "$WR_STOPPED"; fi
+  printf "%s start lane=%s issue=%s label=%s mins=%s cmd=%s\n" "$(date -u +%FT%TZ)" "$WR_LANE" "$WR_ISSUE" "$WR_LABEL" "$WR_MINS" "$WR_CMD" >> "$WR_LOG"
+  touch "$WR_STARTED"
   holder=$(sed -n "s/.*pid \([0-9]*\).*/\1/p" <<<"$("$GPU_HOLD" --status 2>/dev/null | head -1)" | head -1)
   [ -n "$holder" ] && export GPU_HOLD_TICKET="${GPU_HOLD_TICKET:-$holder}"
   '"$CMD"'
-'
+' &
+JOB=$!
+wait "$JOB"

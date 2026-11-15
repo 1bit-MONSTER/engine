@@ -179,7 +179,7 @@ PY
 chmod +x "$scratch/finishing_provider.py"
 # engine#2537 (multi-backend case unpinned: outside --laya, serve launches one backend, and --laya's backends and RAG children are
 # not retried, so two retry-eligible backends cannot be started here; the flag is per backend all the same)
-# engine#2537: a backend whose port was taken after serve picked it (free_port() releases the port, the backend binds it a
+# engine#2537: a backend whose port was taken after serve picked it (serve releases the port it picked, the backend binds it a
 # moment later) is relaunched on a fresh port, and serve says why, instead of "backend 0 did not become ready".
 check "serve starts when the backend's first port is taken" \
     'start "$scratch/t.log" FAKE_BACKEND_PORT_TAKEN_ONCE="$scratch/port-taken.marker"'

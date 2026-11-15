@@ -229,7 +229,7 @@ if os.environ.get("FAKE_BACKEND_LOG_LINES"):
         print(line, file=sys.stderr, flush=True)
 time.sleep(0.5)  # a real backend takes a moment to load; serve must answer 503 meanwhile
 if os.environ.get("FAKE_BACKEND_PORT_TAKEN_ONCE"):
-    # engine#2537: the first launch finds its port taken (another process bound it between serve's free_port() and this
+    # engine#2537: the first launch finds its port taken (another process bound it between serve picking it and this
     # bind), as socketserver reports it; the marker makes the relaunch on serve's fresh port bind normally.
     marker = os.environ["FAKE_BACKEND_PORT_TAKEN_ONCE"]
     if not os.path.exists(marker):

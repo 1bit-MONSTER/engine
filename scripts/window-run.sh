@@ -201,6 +201,14 @@ JLOG
     PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token GPU_QUEUE_DIR=$tmp/q WR_HEALTH_URL=http://127.0.0.1:9/x \
       WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
     chk "a STALE queue entry (dead pid) does not count as queued" "$(grep -c 'restart=queued' "$tmp/t.log")" 0
+    # 3l. BOTH conditions true: another lane holds the token AND a live coder-llm ticket is queued.
+    # The deferred branch is checked before the poll, so the more specific state must win -- a `queued` here
+    # would claim the LLM is waiting for a ticket when it is in fact waiting behind a token in someone's hand.
+    : > "$tmp/t.log"; printf 'gpu-hold cl-other 999999\n' > "$tmp/token"; printf 'label=coder-llm\npid=%s\n' "$$" > "$tmp/q/0179.coder-llm"
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/token GPU_QUEUE_DIR=$tmp/q \
+      WR_HEALTH_URL=http://127.0.0.1:9/x WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "a held token wins over a queued entry (deferred, not queued)" "$(grep -c 'restart=deferred' "$tmp/t.log")" 1
+    chk "  ... and it is not reported as queued" "$(grep -c 'restart=queued' "$tmp/t.log")" 0
     chk "the poll reads the largest child's CPU, not the idle embed child" "$(grep -c 'sort -k2 -n | tai[l] -1' "$me")" 1
     # 4. an old enough end opens the gate again (the refusal above is about the gap, not about the file)
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/w.log"

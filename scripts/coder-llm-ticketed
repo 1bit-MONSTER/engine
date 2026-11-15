@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# coder-llm-ticketed [--] SERVER_CMD [ARGS...]
+#
+# Runs the PR-Agent reviewer model (the coder-llm user service, :8090) ONLY inside a gpu-hold ticket, in on-demand
+# windows (owner 2026-11-15, CODER-LLM-TICKETED; engine#2494). It used to run 24/7 outside any ticket, so "one GPU job
+# at a time" never held, and the model it serves (Qwen3-Coder-30B on HRX) is the one whose prefill faults the GPU.
+#
+# One invocation is ONE window, and systemd's Restart= makes the next one:
+#   1. wait for demand: the demand file was touched within CODER_LLM_DEMAND_TTL_MIN, or (CODER_LLM_GH_POLL=1) a
+#      pr-agent workflow run is queued or in progress;
+#   2. queue for the GPU like any other job: gpu-hold -l coder-llm -t CODER_LLM_MAX_HOLD_MIN (FIFO; gpu-hold's
+#      temperature, memory and kernel-fault watchdogs apply, and its release wait lets the next label in);
+#   3. inside the ticket, start SERVER_CMD and end the window once the server has been idle (no slot in /slots is
+#      processing) AND the demand file has not been touched for CODER_LLM_IDLE_MIN - or when the max hold ends it;
+#   4. exit, so systemd starts the next invocation, which goes back to waiting for demand and re-queues.
+# A window cut short by a kernel fault (gpu-hold rc 78) or a refused ticket backs off CODER_LLM_FAULT_BACKOFF_S
+# before exiting, so a faulting GPU does not turn into a restart loop.
+#
+# Anything else that needs the model asks for it the same way the workflow does: touch "$CODER_LLM_DEMAND" (and
+# keep touching it while working), then wait for :8090 to answer.
+#
+# Environment (all optional):
+#   CODER_LLM_DEMAND            demand file, default ~/.cache/coder-llm/demand
+#   CODER_LLM_DEMAND_TTL_MIN    a touch this recent is demand, default 30 (CODER_LLM_DEMAND_TTL_S in seconds wins)
+#   CODER_LLM_IDLE_MIN          idle minutes that end a window, default 5 (CODER_LLM_IDLE_S in seconds wins)
+#   CODER_LLM_MAX_HOLD_MIN      max hold per window (gpu-hold -t), default 25
+#   CODER_LLM_QUEUE_WAIT_S      how long one window queues for the GPU (gpu-hold -w), default 5400
+#   CODER_LLM_URL               the server's base URL for /slots, default http://127.0.0.1:8090
+#   CODER_LLM_POLL_S            poll interval, default 15
+#   CODER_LLM_GH_POLL           1 = also treat a queued/in-progress pr-agent run as demand (REST, every
+#                               CODER_LLM_GH_POLL_S, default 60), default 0
+#   CODER_LLM_GH_REPO           default 1bit-MONSTER/engine
+#   CODER_LLM_FAULT_BACKOFF_S   back-off after gpu-hold rc 78 (a fault, or a refused ticket), default 600
+#   CODER_LLM_GPU_HOLD          gpu-hold to use, default the one on PATH
+#   CODER_LLM_ALWAYS=1          skip the demand wait (a resident window, still ticketed and still max-hold bounded)
+#
+# Internal: "coder-llm-ticketed --window SERVER_CMD..." is what gpu-hold runs; it is the idle-aware window itself.
+set -u
+
+DEMAND=${CODER_LLM_DEMAND:-$HOME/.cache/coder-llm/demand}
+DEMAND_TTL=${CODER_LLM_DEMAND_TTL_S:-$(( ${CODER_LLM_DEMAND_TTL_MIN:-30} * 60 ))}
+IDLE=${CODER_LLM_IDLE_S:-$(( ${CODER_LLM_IDLE_MIN:-5} * 60 ))}
+MAX_HOLD=${CODER_LLM_MAX_HOLD_MIN:-25}
+QUEUE_WAIT=${CODER_LLM_QUEUE_WAIT_S:-5400}
+URL=${CODER_LLM_URL:-http://127.0.0.1:8090}
+POLL=${CODER_LLM_POLL_S:-15}
+GH_POLL=${CODER_LLM_GH_POLL:-0}
+GH_POLL_S=${CODER_LLM_GH_POLL_S:-60}
+GH_REPO=${CODER_LLM_GH_REPO:-1bit-MONSTER/engine}
+BACKOFF=${CODER_LLM_FAULT_BACKOFF_S:-600}
+GPU_HOLD=${CODER_LLM_GPU_HOLD:-gpu-hold}
+
+log() { echo "coder-llm-ticketed[$$] $*"; }
+
+mtime() { stat -c %Y "$1" 2> /dev/null || echo 0; }
+
+demand_fresh() {   # $1 = window in seconds
+    [ $(( $(date +%s) - $(mtime "$DEMAND") )) -lt "$1" ]
+}
+
+gh_demand() {
+    [ "$GH_POLL" = 1 ] || return 1
+    local s n
+    for s in queued in_progress; do
+        n=$(gh api "repos/$GH_REPO/actions/workflows/pr-agent.yml/runs?status=$s&per_page=1" -q .total_count 2> /dev/null)
+        [ "${n:-0}" -gt 0 ] 2> /dev/null && return 0
+    done
+    return 1
+}
+
+slots_busy() {   # 0 = some slot is processing, or the server cannot say (not up yet counts as busy)
+    local j
+    j=$(curl -sf --max-time 5 "$URL/slots" 2> /dev/null) || return 0
+    grep -Eq '"is_processing"[[:space:]]*:[[:space:]]*true' <<< "$j" && return 0
+    return 1
+}
+
+# ---- the window: runs INSIDE the gpu-hold ticket --------------------------------------------------------------------
+if [ "${1:-}" = "--window" ]; then
+    shift
+    [ "${1:-}" = "--" ] && shift
+    [ $# -gt 0 ] || { log "--window needs a server command"; exit 2; }
+    "$@" &
+    server=$!
+    stop_server() {
+        kill -TERM "$server" 2> /dev/null
+        for _ in $(seq 1 30); do kill -0 "$server" 2> /dev/null || return; sleep 1; done
+        kill -KILL "$server" 2> /dev/null
+    }
+    trap 'stop_server; exit 143' TERM INT HUP
+    log "window open: server pid $server"
+    last_busy=$(date +%s)
+    while kill -0 "$server" 2> /dev/null; do
+        sleep "$POLL"
+        now=$(date +%s)
+        if slots_busy || demand_fresh "$IDLE"; then
+            last_busy=$now
+        elif [ $(( now - last_busy )) -ge "$IDLE" ]; then
+            log "idle ${IDLE}s and no fresh demand: closing the window"
+            stop_server
+            exit 0
+        fi
+    done
+    wait "$server"
+    rc=$?
+    log "server exited by itself, rc $rc"
+    exit "$rc"
+fi
+
+# ---- one service invocation: wait for demand, then one ticketed window ----------------------------------------------
+[ "${1:-}" = "--" ] && shift
+[ $# -gt 0 ] || { echo "usage: coder-llm-ticketed [--] SERVER_CMD [ARGS...]" >&2; exit 2; }
+mkdir -p "$(dirname "$DEMAND")"
+
+if [ "${CODER_LLM_ALWAYS:-0}" != 1 ]; then
+    log "waiting for demand ($DEMAND touched within ${DEMAND_TTL}s$([ "$GH_POLL" = 1 ] && echo ", or a pr-agent run on $GH_REPO"))"
+    next_gh=0
+    while :; do
+        demand_fresh "$DEMAND_TTL" && break
+        if [ "$GH_POLL" = 1 ] && [ "$(date +%s)" -ge "$next_gh" ]; then
+            gh_demand && { touch "$DEMAND"; break; }
+            next_gh=$(( $(date +%s) + GH_POLL_S ))
+        fi
+        sleep "$POLL"
+    done
+fi
+log "demand: queueing for the GPU (gpu-hold -l coder-llm -t $MAX_HOLD -w $QUEUE_WAIT)"
+"$GPU_HOLD" -t "$MAX_HOLD" -l coder-llm -w "$QUEUE_WAIT" -- "$0" --window "$@"
+rc=$?
+case "$rc" in
+    0)   log "window closed (idle)" ;;
+    124) log "window closed (max hold ${MAX_HOLD} min); re-queueing" ;;
+    75)  log "the queue never came round in ${QUEUE_WAIT}s" ;;
+    78)  log "gpu-hold rc 78 (a GPU fault in the kernel log, or a refused ticket): backing off ${BACKOFF}s"; sleep "$BACKOFF" ;;
+    *)   log "window ended rc $rc" ;;
+esac
+exit "$rc"

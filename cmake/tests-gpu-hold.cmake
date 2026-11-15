@@ -38,6 +38,12 @@ add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold
 # when the token is taken; the 11-13 crash was nine resets inside two tickets. The kernel log is a fixture file.
 add_test(NAME gpu_hold_fault_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_fault_abort_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 
+# CODER-LLM-TICKETED 2026-11-15 (engine#2494): the PR-Agent model (coder-llm, :8090) runs only inside a gpu-hold ticket,
+# in on-demand windows. Drives scripts/coder-llm-ticketed with the real scripts/gpu-hold on a private queue and a fake
+# /slots server: no demand -> no ticket, idle -> window closes, busy -> max hold, kernel fault -> rc 78, FIFO with a lane.
+add_test(NAME coder_llm_ticketed COMMAND bash ${CMAKE_SOURCE_DIR}/tests/coder_llm_ticketed_test.sh
+         ${CMAKE_SOURCE_DIR}/scripts/coder-llm-ticketed ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
 # engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
 # queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
 # Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a

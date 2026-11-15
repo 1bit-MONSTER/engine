@@ -277,7 +277,8 @@ a plug test on hardware on 2026-11-14 (BIOS 1.10, on a host with the rule instal
 Boot the stick from the **front USB-A** port all the same. It is the one port that works before the rule applies, and the same
 plug test has not yet been run on a 1bit OS boot, where the rule comes from the image. USB4/Thunderbolt devices are untested. The
 per-port results, the controller states and a read-only check (`tools/xhci_keepawake_check.sh`) are in
-[axb35-usb-ports.md](axb35-usb-ports.md).
+[axb35-usb-ports.md](axb35-usb-ports.md). The same fix for another Linux install on this board is in
+[Bosgame M5 USB-C not working on Linux: the fix](https://1bit.gg/blog-bosgame-m5-usb-c-linux-fix.html).
 
 ## What was verified for this page
 

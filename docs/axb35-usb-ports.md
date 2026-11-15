@@ -41,6 +41,9 @@ Not covered yet:
 One enclosure (a Realtek RTL9210, the device from the original report) enumerates at high-speed (USB 2) on **every** port, including
 ports where another drive reaches 5 Gbps. That limit belongs to the enclosure or its cable, not to the board.
 
+The short, copy-pasteable version (symptom, rule, check) is the blog post
+[Bosgame M5 USB-C not working on Linux: the fix](https://1bit.gg/blog-bosgame-m5-usb-c-linux-fix.html).
+
 On this board, stock boots leave three of the four xHCI functions in `D3cold`, so the rear USB-A ports and both Type-C ports never
 enumerate; only the controller that carries the front USB-A (and Bluetooth, and the JetKVM) stays in `D0`. Windows drives every
 port, the board's ACPI exposes no UCSI (`USBC000`/`PNP0CA0`), and `ec_su_axb35` has no USB controls — so a Windows-only port-power

@@ -48,10 +48,12 @@ if ls -l /proc/[0-9]*/fd 2>/dev/null | grep -q "$LOCK"; then
 fi
 
 echo "== $LABEL: $BIN (lock held by another process at start: $HELD_BY_OTHER)"
-# NOT `setsid`: it makes `$!` the setsid pid, so `kill $PID` below would miss the server and leave a
-# forward-serve holding the NPU context after this script exits — the same defect that left a 22 h
-# `flm-real serve` orphan on 2026-11-15 and blocked two lanes' hwctx creates. The port-scoped pkill in
-# the trap is the belt for the same reason: cleanup must not depend on `$!` being the server.
+# NOT `setsid`: it puts the server in its OWN session. When this script dies without running its EXIT trap
+# (SIGKILL, an orchestrator stop, a closed terminal), a server outside the session gets no SIGHUP and survives
+# with PPID 1, holding the NPU context -- the orphan class that blocked two lanes' hwctx creates on 2026-11-15.
+# (It is not about `$!`: in a non-interactive script, without `set -m`, util-linux setsid does not fork, so `$!`
+# IS the server; only under job control does `$!` become the forking setsid parent.) The port-scoped pkill in
+# the trap is the belt for any path where `$!` is not the server.
 NPU_INFER_HOST_GEMM=1 "$BIN" forward-serve -m "$MODEL/model.q4nx" --kernels "$MODEL" -p "$PORT" > "$LOG" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; pkill -f "forward-serve .* -p $PORT" 2>/dev/null; wait $PID 2>/dev/null' EXIT

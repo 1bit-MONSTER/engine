@@ -43,6 +43,7 @@ import sys
 FAULT = re.compile(
     r"(?:(?P<dev>[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]):\s+)?"
     r"AMD-Vi: Event logged \[IO_PAGE_FAULT domain=(?P<domain>0x[0-9a-fA-F]+) address=(?P<addr>0x[0-9a-fA-F]+)"
+    r"(?: flags=(?P<flags>0x[0-9a-fA-F]+))?"
 )
 
 
@@ -54,24 +55,30 @@ def parse(text, label):
         if not m:
             continue
         key = (label, m.group("dev") or "-", m.group("domain"))
-        rows.setdefault(key, []).append(int(m.group("addr"), 16))
+        rows.setdefault(key, []).append((int(m.group("addr"), 16), (m.group("flags") or "").lower()))
     return rows
 
 
 def census(rows):
     out = []
-    for (label, dev, domain), addrs in sorted(rows.items()):
-        counts = {}
-        for a in addrs:
+    for (label, dev, domain), pairs in sorted(rows.items()):
+        counts, flag_counts = {}, {}
+        for a, fl in pairs:
             counts[a] = counts.get(a, 0) + 1
+            if fl:
+                flag_counts[fl] = flag_counts.get(fl, 0) + 1
         top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
         out.append(
             {
                 "label": label,
                 "device": dev,
                 "domain": domain,
-                "faults": len(addrs),
+                "faults": len(pairs),
                 "distinct": len(counts),
+                # engine#2542: the flags field is the most informative part of a fault line and the least obvious --
+                # two devices on this host carry different values (0x0007 vs 0x0000, plus rare 0x0050), and a decode that
+                # explains two of three is incomplete. Report the histogram so nobody has to hand-grep for it.
+                "flags": dict(sorted(flag_counts.items())),
                 "top": [{"address": hex(a), "count": c} for a, c in top],
                 "_set": set(counts),
             }
@@ -136,6 +143,10 @@ def render(entries, inter, as_json):
         )
         for t in e["top"]:
             lines.append("    %s x%d" % (t["address"], t["count"]))
+        if e["flags"]:
+            lines.append(
+                "    flags: %s" % ", ".join("%s x%d" % (f, n) for f, n in sorted(e["flags"].items(), key=lambda kv: -kv[1]))
+            )
         lines.append("    -> %s" % shape(e))
     if inter is None:
         lines.append("shared across boots: (need two or more labeled journals of the same device)")
@@ -251,6 +262,25 @@ def self_test():
         [("0xebe54000", 301), ("0xeb5fa000", 299), ("0xe54de000", 297), ("0xeb5f1000", 278), ("0xebc8e000", 262)],
     )
     ok("the top five stop at five and do not list the singletons", len(c["top"]), 5)
+
+    # engine#2542: two flag values on one device must both appear -- a histogram with one bucket hides the outlier that
+    # any decode has to explain, which is exactly how a wrong decode survived review.
+    two_flags = (
+        "Nov 14 20:00 host kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged "
+        "[IO_PAGE_FAULT domain=0x0015 address=0x1000 flags=0x0000]\n"
+        "Nov 14 20:01 host kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged "
+        "[IO_PAGE_FAULT domain=0x0015 address=0x1000 flags=0x0050]\n"
+        "Nov 14 20:02 host kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged "
+        "[IO_PAGE_FAULT domain=0x0015 address=0x2000 flags=0x0000]\n"
+    )
+    f = census(parse(two_flags, "b"))[0]
+    ok("both flags values on one device are counted", f["flags"], {"0x0000": 2, "0x0050": 1})
+    ok("...and the rare one is not lost in the total", f["faults"], 3)
+
+    no_flags = (
+        "AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0001 address=0x1000]\n"
+    )
+    ok("a fault line without a flags field still parses", census(parse(no_flags, "b"))[0]["faults"], 1)
 
     print("iommu_fault_census self-test: %d failure(s)" % fails)
     return 1 if fails else 0

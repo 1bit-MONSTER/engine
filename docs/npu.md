@@ -2967,7 +2967,7 @@ byte ranges the grammar can continue with. Both headers are device-free, and
 request parser in CI without a model or an NPU.
 
 ```
-$ curl -sS localhost:8000/v1/completions -d '{"prompt": "The capital of France is", "max_tokens": 16,
+$ curl -sS localhost:8000/v1/completions -H 'Content-Type: application/json' -d '{"prompt": "The capital of France is", "max_tokens": 16,
     "grammar": "root ::= \" Paris\" | \" Lyon\" | \" Marseille\""}'
 {"choices":[{"finish_reason":"length","index":0,"text":" Paris"},...]}
 ```
@@ -2975,7 +2975,7 @@ $ curl -sS localhost:8000/v1/completions -d '{"prompt": "The capital of France i
 `prompt` may also be the **token ids themselves**, the shape llama.cpp's `/completion` accepts:
 
 ```
-$ curl -sS localhost:8000/v1/completions -d '{"prompt": [151646, 785, 6722, 315, 9625, 374], "max_tokens": 16}'
+$ curl -sS localhost:8000/v1/completions -H 'Content-Type: application/json' -d '{"prompt": [151646, 785, 6722, 315, 9625, 374], "max_tokens": 16}'
 ```
 
 Supplied ids are used exactly as given — nothing is tokenized and no BOS is inserted — which is what a

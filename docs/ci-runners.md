@@ -332,7 +332,10 @@ on HRX, `:8095`) costing 3-9 % of every other GPU job while it sat idle. Tickete
 
     ticketed-wait 1bit-canonical http://127.0.0.1:8095 900 || { echo "not run: :8095 queued"; exit 75; }
 
-The script touches the demand file every 30 s while it waits, and polls `/v1/models`. It returns 0 once the model
+The script touches the demand file every 30 s while it waits. Each poll is a cheap `GET /v1/models` (liveness), then
+one 1-token chat completion (readiness): `/v1/models` is a static listing that answers 200 from bind while the
+weights are still loading, and `/health` reads 503 both while loading and when idle (okf
+`references/health-is-a-progress-probe-not-a-liveness-probe.md`). It returns 0 once the model
 answers, at once if the unit is resident or its window is already open, and 75 after the limit. A 75 means the window
 is queued behind other tickets, so the run is **not run**, never a fake answer. On a 75 it also **removes the demand
 file**, so a caller that has gone does not buy a GPU ticket for nobody. A unit other than coder-llm also takes demand

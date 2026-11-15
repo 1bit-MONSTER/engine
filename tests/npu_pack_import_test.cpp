@@ -252,96 +252,94 @@ int q4_1f_tensors(const json& table) {
 // references. A reader that follows node inputs only reports a weightless graph for a 9.7 GB pack; one that sees the
 // sibling must also say whether the bytes fit the stride the .fconst tile already carries --
 // length == N x (K/128 + 1) x 68 -- as a count, not an assumption.
-// The external-data tile's own decode (engine#1503): a synthetic blob laid out the way the pack lays it out must come
-// back exactly, under BOTH code orderings -- the decoder's constant picks one, and the test holds each to the spec it
-// claims, so flipping the constant cannot silently change what the other branch means.
+// The external-data tile's own decode (engine#1503, corrected by engine#2561): a synthetic blob laid out the way AMD's
+// own packer lays it out must come back exactly. The layout was proven by a known-answer write through
+// `matmulnbits_pack_const_float32` (mladf v2, K 5120 x N 1024, group 128): 100 % of planted codes, zero points and
+// scales recovered with THIS layout, 6 % / 9 % / 0 % with the previous one (rows swapped, four zeros per row, signed).
+// Both code orderings are still held to their own spec so flipping the constant cannot silently change either.
 void test_external_tile_decode() {
     const int N = 128, K = 256;                       // 2 tiles of 64 rows, 2 K-blocks -> 3 subvolume pairs
     const int64_t tiles = N / 64, per_tile = 2 * (K / 128 + 1);
     const int64_t bytes = tiles * per_tile * 2176;
-    // A code matrix and per-block scale/zero-points to encode, then to find again.
     std::vector<uint8_t> codes(size_t(N) * K);
     for (size_t i = 0; i < codes.size(); ++i) codes[i] = uint8_t((i * 7 + i / 13) % 16);
     const auto bf16_bits = [](float v) {
         unsigned int u;
         std::memcpy(&u, &v, 4);
-        return uint16_t((u + 0x8000u + ((u >> 16) & 1u)) >> 16);   // round to nearest even, as the importer does
+        return uint16_t((u + 0x8000u + ((u >> 16) & 1u)) >> 16);
     };
+    // DISTINCT scale and zero point per (row, k-block): a fixture with one value everywhere lets a decoder that reads
+    // the wrong row's parameters pass, which is exactly what the old row swap did.
+    const auto scale_for = [&](int64_t row, int64_t kk) {
+        return 0.001953125f * float(1 + int(row % 11) * 3 + int(kk) * 5);   // bf16-exact multiples of 2^-9
+    };
+    const auto zero_for = [&](int64_t row, int64_t kk) { return uint8_t((int(row) * 3 + int(kk) * 7) % 16); };
     for (const bool row_major : {false, true}) {
-    // DISTINCT scale and zero points per (tile, half, kk, r): a fixture that writes one value everywhere lets a decoder
-    // that reads row 0's scale for all 32 rows pass, which is exactly the addressing this test exists to pin.
-    const auto scale_for = [&](int64_t tile, int half, int64_t kk, int r) {
-        return 0.001953125f * float(1 + int(tile) * 7 + half * 5 + int(kk) * 3 + (r % 4));   // bf16-exact multiples of 2^-9
-    };
-    const auto zero_for = [&](int64_t tile, int half, int64_t kk, int r, int g) {
-        return uint8_t((int(tile) * 3 + half * 5 + int(kk) * 7 + r + g) % 16);
-    };
-    std::vector<uint8_t> blob(size_t(bytes), 0);
-    for (int64_t tile = 0; tile < tiles; ++tile)
-        for (int half = 0; half < 2; ++half)
-            for (int64_t kk = 1; kk <= K / 128; ++kk) {
-                uint8_t* subv = blob.data() + (tile * per_tile + kk * 2 + half) * 2176;
-                for (int r = 0; r < 32; ++r) {
-                    // The decoder reads the block's FIRST 32 rows from the pair's SECOND subvolume, so the fixture encodes
-                    // its rows in that order; without this the test pins a mapping the decoder does not use (engine#1503).
-                    const int64_t row = tile * 64 + (1 - half) * 32 + r;
-                    const uint16_t sc = bf16_bits(scale_for(tile, half, kk, r));
-                    subv[2112 + r * 2] = uint8_t(sc & 0xFF);
-                    subv[2113 + r * 2] = uint8_t(sc >> 8);
-                    subv[2048 + r * 2] = uint8_t(zero_for(tile, half, kk, r, 0) | (zero_for(tile, half, kk, r, 1) << 4));
-                    subv[2049 + r * 2] = uint8_t(zero_for(tile, half, kk, r, 2) | (zero_for(tile, half, kk, r, 3) << 4));
-                    for (int c = 0; c < 128; ++c) {
-                        const uint8_t nib = codes[size_t(row) * K + (kk - 1) * 128 + c];
-                        if (row_major) {
-                            if (c % 2 == 0) subv[r * 64 + c / 2] = uint8_t((subv[r * 64 + c / 2] & 0xF0) | nib);
-                            else subv[r * 64 + c / 2] = uint8_t((subv[r * 64 + c / 2] & 0x0F) | (nib << 4));
-                        } else {
-                            const int cp = r / 2;      // one byte per column, holding the row pair 2cp / 2cp+1
-                            uint8_t& b = subv[(cp % 4) + c * 4 + (cp / 4) * 512];
-                            if (r % 2 == 0) b = uint8_t((b & 0xF0) | nib);
-                            else b = uint8_t((b & 0x0F) | (nib << 4));
+        std::vector<uint8_t> blob(size_t(bytes), 0);
+        for (int64_t tile = 0; tile < tiles; ++tile)
+            for (int half = 0; half < 2; ++half)
+                for (int64_t kk = 1; kk <= K / 128; ++kk) {
+                    uint8_t* subv = blob.data() + (tile * per_tile + kk * 2 + half) * 2176;
+                    for (int r = 0; r < 32; ++r) {
+                        const int64_t row = tile * 64 + half * 32 + r;          // NOT swapped
+                        const uint16_t sc = bf16_bits(scale_for(row, kk));
+                        subv[2112 + r * 2] = uint8_t(sc & 0xFF);
+                        subv[2113 + r * 2] = uint8_t(sc >> 8);
+                        uint8_t& zb = subv[2048 + r / 2];                        // one zero point per row, 16 bytes
+                        zb = (r % 2 == 0) ? uint8_t((zb & 0xF0) | zero_for(row, kk)) : uint8_t((zb & 0x0F) | (zero_for(row, kk) << 4));
+                        for (int c = 0; c < 128; ++c) {
+                            const uint8_t nib = codes[size_t(row) * K + (kk - 1) * 128 + c];
+                            if (row_major) {
+                                if (c % 2 == 0) subv[r * 64 + c / 2] = uint8_t((subv[r * 64 + c / 2] & 0xF0) | nib);
+                                else subv[r * 64 + c / 2] = uint8_t((subv[r * 64 + c / 2] & 0x0F) | (nib << 4));
+                            } else {
+                                const int cp = r / 2;      // one byte per K column, holding the row pair 2cp / 2cp+1
+                                uint8_t& b = subv[(cp % 4) + c * 4 + (cp / 4) * 512];
+                                if (r % 2 == 0) b = uint8_t((b & 0xF0) | nib);
+                                else b = uint8_t((b & 0x0F) | (nib << 4));
+                            }
                         }
                     }
                 }
-            }
-    std::string err;
-    const pi::Q4 q = pi::decode_external_tile(blob.data(), blob.size(), N, K, err, row_major);
-    check(err.empty() && q.N == N && q.K == K && q.block == 32,
-          "external tile: a blob of the measured size decodes (" + err + ")");
-    bool codes_ok = q.codes.size() == codes.size(), scale_ok = true, zero_ok = true;
-    // The pack's codes are int4 TWO'S COMPLEMENT; the container's form is the offset from the group minimum, i.e.
-    // c_signed + 8. A test that expected the raw nibble passed on the unsigned bug (engine#1503).
-    for (size_t i = 0; codes_ok && i < codes.size(); ++i) {
-        const int raw = codes[i];
-        const int cs = (raw >= 8) ? raw - 16 : raw;
-        if (q.codes[i] != uint8_t(cs + 8)) codes_ok = false;
-    }
-    // Every row's own scale and all four of its zero points, so the addressing (row r*2 in the param regions, the
-    // group index (kk-1)*4+g, the half and tile choice) is pinned rather than the value of one row repeated.
-    for (int64_t tile = 0; tile < tiles; ++tile)
-        for (int half = 0; half < 2; ++half)
+        std::string err;
+        const pi::Q4 q = pi::decode_external_tile(blob.data(), blob.size(), N, K, err, row_major);
+        check(err.empty() && q.N == N && q.K == K && q.block == 32,
+              "external tile: a blob of the measured size decodes (" + err + ")");
+        // The nibbles are the ONNX MatMulNBits codes as given (unsigned), and they ARE the container's codes.
+        check(q.codes == codes, std::string("external tile: every 4-bit code comes back unchanged, ") +
+                                    (row_major ? "row-major" : "w8 interleave"));
+        bool scale_ok = q.scale.size() == size_t(N) * (K / 32), zero_ok = q.zero.size() == q.scale.size();
+        for (int64_t row = 0; scale_ok && zero_ok && row < N; ++row)
             for (int64_t kk = 1; kk <= K / 128; ++kk)
-                for (int r = 0; r < 32; ++r) {
-                    // The decoder reads the block's FIRST 32 rows from the pair's SECOND subvolume, so the fixture encodes
-                    // its rows in that order; without this the test pins a mapping the decoder does not use (engine#1503).
-                    const int64_t row = tile * 64 + (1 - half) * 32 + r;
-                    for (int g = 0; g < 4; ++g) {
-                        const size_t at = size_t(row) * (K / 32) + (kk - 1) * 4 + g;
-                        if (q.scale[at] != scale_for(tile, half, kk, r)) scale_ok = false;
-                        // and the container's zero is the offset, m = (-8 - z) * scale, for a signed int4 z
-                        const int zraw = zero_for(tile, half, kk, r, g);
-                        const int zs = (zraw >= 8) ? zraw - 16 : zraw;
-                        if (q.zero[at] != float(-8 - zs) * scale_for(tile, half, kk, r)) zero_ok = false;
-                    }
+                for (int g = 0; g < 4; ++g) {
+                    const size_t at = size_t(row) * (K / 32) + (kk - 1) * 4 + g;
+                    if (q.scale[at] != scale_for(row, kk)) scale_ok = false;
+                    // w = (c - z) * s  ==  c*s + (-z*s): the container's offset is -z*s
+                    if (q.zero[at] != -float(zero_for(row, kk)) * scale_for(row, kk)) zero_ok = false;
                 }
-    check(codes_ok, std::string("external tile: every 4-bit code comes back exactly, ") + (row_major ? "row-major" : "w8 interleave"));
-    check(scale_ok, "external tile: every row keeps its own bf16 scale, repeated over its four groups");
-    check(zero_ok, "external tile: every (row, group) keeps its own int4 zero point");
-    std::string err2;
-    (void)pi::decode_external_tile(blob.data(), blob.size() - 2176, N, K, err2);
-    check(!err2.empty() && err2.find("is not") != std::string::npos,
-          "external tile: a blob one subvolume short is refused with the arithmetic (" + err2 + ")");
+        check(scale_ok, "external tile: every row keeps its own bf16 scale per 128-block, over its four groups");
+        check(zero_ok, "external tile: every row keeps its own zero point per 128-block, as the offset -z*s");
+        std::string err2;
+        (void)pi::decode_external_tile(blob.data(), blob.size() - 2176, N, K, err2);
+        check(!err2.empty() && err2.find("is not") != std::string::npos,
+              "external tile: a blob one subvolume short is refused with the arithmetic (" + err2 + ")");
     }
+}
+
+// engine#2561: phi-4's config.json is `{}`, so the importer reads the RoPE base from the pack's own cos_cache. A cache
+// built at theta 250000 (phi-4's) must pick 250000 out of the candidates, also when the cache is scaled.
+void test_rope_cache_best_theta() {
+    const int64_t rows = 512, half = 64;
+    std::vector<float> cache(size_t(rows) * size_t(half));
+    for (int64_t p = 0; p < rows; ++p)
+        for (int64_t i = 0; i < half; ++i)
+            cache[size_t(p) * half + i] = 1.875f * float(std::cos(double(p) / std::pow(250000.0, 2.0 * double(i) / 128.0)));
+    double th = 0.0;
+    const double r = pi::rope_cache_best_theta(cache, rows, half, {10000.0, 1e5, 2.5e5, 5e5, 1e6}, &th);
+    check(th == 250000.0 && r > 0.999, "rope cache: theta 250000 is recovered from its own (scaled) cos_cache");
+    double th2 = 0.0;
+    (void)pi::rope_cache_best_theta(cache, rows, half, {10000.0, 1e6}, &th2);
+    check(th2 != 250000.0, "rope cache: without the right candidate the fit does not invent it");
 }
 
 // The conversion half of the writer (engine#1503): the pack's `(code - zp)*scale` and the container's
@@ -666,15 +664,15 @@ void test_external_import_success(const std::string& root) {
 
     // The fixture's own weights: w(row, col) = (code - zp) * scale, chosen so every product is exact in f32 (scales are
     // bf16-exact with 7 mantissa bits, |code - zp| <= 15), so the container's `code*scale + m` form must reproduce them
-    // bit for bit. Both nibbles are int4 TWO'S COMPLEMENT (the pack's writer asserts -8 <= x <= 7), so the reference
-    // sign-extends them: the generators walk all 16 nibble values, and for a code and zero of opposite sign an
-    // unsigned reading is off by 16 * scale (engine#1503, #1874).
+    // bit for bit. The nibbles are UNSIGNED, as AMD's packer stores the ONNX fields it is handed (engine#2561, which
+    // replaces the two's-complement reading of engine#1503/#1874); the generators walk all 16 nibble values.
     auto scale_of = [](int row) { return (1.0f + float(row % 128) / 128.0f) * std::ldexp(1.0f, -(row / 128 + 2)); };
-    auto zp_of = [](int row, int kb, int g) { return uint8_t((row + 3 * kb + 5 * g) % 16); };
+    // engine#2561: ONE zero point per row per 128-block, and the fields are the ONNX MatMulNBits nibbles as given
+    // (unsigned): w = (c - z) * s -- the layout AMD's own packer writes (known-answer write, 100 % recovered).
+    auto zp_of = [](int row, int kb) { return uint8_t((row + 3 * kb) % 16); };
     auto code_of = [](int row, int col) { return uint8_t((row * 7 + col * 3) % 16); };
     auto w_of = [&](int row, int col) {
-        auto sx = [](uint8_t v) { return v >= 8 ? int(v) - 16 : int(v); };
-        return float(sx(code_of(row, col)) - sx(zp_of(row, col / 128, (col % 128) / 32))) * scale_of(row);
+        return float(int(code_of(row, col)) - int(zp_of(row, col / 128))) * scale_of(row);
     };
     // Encode the blob as the pack lays it out -- the inverse of decode_external_tile() for the shipped ordering
     // (pi::kExtQuantsRowMajor == false: byte (cp%4) + c*4 + (cp/4)*512 holds rows 2cp/2cp+1 of column c).
@@ -685,13 +683,13 @@ void test_external_import_success(const std::string& root) {
             for (int kk = 1; kk <= blocks; ++kk) {
                 char* subv = &blob[size_t(tile * per_tile + kk * 2 + half) * 2176];
                 for (int r = 0; r < 32; ++r) {
-                    // A 64-row block's FIRST 32 rows live in the pair's SECOND subvolume (measured on the pack, #1874).
-                    const int row = tile * 64 + (1 - half) * 32 + r;
+                    // Subvolume `half` holds rows half*32 + r (engine#2561: the earlier swap was circular).
+                    const int row = tile * 64 + half * 32 + r;
                     const uint16_t s = pi::bf16_bits_of(scale_of(row));
                     subv[2112 + r * 2] = char(s & 0xFF);
                     subv[2112 + r * 2 + 1] = char(s >> 8);
-                    subv[2048 + r * 2] = char(zp_of(row, kk - 1, 0) | (zp_of(row, kk - 1, 1) << 4));
-                    subv[2048 + r * 2 + 1] = char(zp_of(row, kk - 1, 2) | (zp_of(row, kk - 1, 3) << 4));
+                    uint8_t& zb = reinterpret_cast<uint8_t&>(subv[2048 + r / 2]);
+                    zb = (r % 2 == 0) ? uint8_t((zb & 0xF0) | zp_of(row, kk - 1)) : uint8_t((zb & 0x0F) | (zp_of(row, kk - 1) << 4));
                     for (int c = 0; c < 128; ++c) {
                         const int cp = r / 2;
                         uint8_t& b = reinterpret_cast<uint8_t&>(subv[(cp % 4) + c * 4 + (cp / 4) * 512]);
@@ -6925,6 +6923,7 @@ int main(int argc, char** argv) {
     try {
         test_bounds();
         test_external_tile_decode();
+    test_rope_cache_best_theta();
     test_external_to_container();
     test_external_roles();
     test_external_container_names();

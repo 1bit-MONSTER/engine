@@ -2391,30 +2391,28 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
                 const uint8_t* zeros = subv + 2048;
                 const uint8_t* scales = subv + 2112;
                 for (int r = 0; r < kExtSubvRows; ++r) {
-                    // MEASURED, not assumed: a 64-row block's two subvolume halves are stored in the order (half 1,
-                    // half 0) -- the block's FIRST 32 rows live in the pair's SECOND subvolume. Checked row for row against
-                    // the imported container: with `half * 32 + r` exactly one row in 64 matched (R mod 64 == 0), and with the
-                    // swap the sampled rows match (engine#1503).
-                    const int64_t row = tile * kExtTileRows + (1 - half) * kExtSubvRows + r;
+                    // engine#2561, proven by a known-answer write through AMD's own packer (matmulnbits_pack_const_float32,
+                    // mladf v2, K 5120 x N 1024, group 128: 2,854,912 B = 16 tiles x 82 subvolumes x 2,176 B, the eager
+                    // blob's own geometry): this layout recovers 100 % of the planted codes, zero points and scales.
+                    // Subvolume `2 + 2*kblock + half` holds output rows `half*32 + r` of the 64-row tile -- NOT swapped (the
+                    // earlier swap was measured against this importer's own container, so it agreed with itself).
+                    const int64_t row = tile * kExtTileRows + half * kExtSubvRows + r;
                     const float s = bf16_to_f32(uint16_t(scales[r * 2] | (scales[r * 2 + 1] << 8)));
-                    // four int4 zero points per row, one per 32-column group of the 128-column block
-                    const uint8_t z0 = zeros[r * 2], z1 = zeros[r * 2 + 1];
-                    // Both fields are int4 in TWO'S COMPLEMENT, not 0..15 (the pack's own writer asserts -8 <= x <= 7,
-                    // FACTS-oga-pack-weight-layout.md §7.13). Reading them unsigned is only equivalent when the code and
-                    // its zero point happen to share a sign: for one negative and one positive the difference is off by
-                    // 16 * scale, which is ~16 codes wide and dominates the weight. That is what left phi-4 answering
-                    // '都都都都': every row where the two differed in sign became a near-constant matrix (engine#1503).
-                    const int zp[4] = {int8_t(z0 << 4) >> 4, int8_t(z0) >> 4, int8_t(z1 << 4) >> 4, int8_t(z1) >> 4};
+                    // ONE zero point per output row per 128-column block: 16 bytes at +2048, nibble r (low nibble = even r).
+                    // Reading 64 bytes as four zero points per row recovered 9 % of them.
+                    const uint8_t zb = zeros[r / 2];
+                    const int z = (r % 2 == 0) ? int(zb & 0xF) : int(zb >> 4);
                     for (int g = 0; g < 4; ++g) {
                         q.scale[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = s;
-                        // The container's form is w = code*d + m with code in 0..15 and m the group MIN, so the signed
-                        // code c becomes c + 8 and m becomes (-8 - z) * scale: (c+8)*s + (-8-z)*s == (c - z)*s exactly.
-                        q.zero[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = float(-8 - zp[g]) * s;
+                        // The fields are the ONNX MatMulNBits nibbles as given, UNSIGNED: w = (c - z) * s. In the container's
+                        // form w = code*d + m that is code = c, d = s, m = -z * s. (The packer stores the nibbles it is
+                        // handed unchanged; the earlier two's-complement reading was a correction for the other two bugs.)
+                        q.zero[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = -float(z) * s;
                     }
                     for (int c = 0; c < 128; ++c) {
-                        // Row-major: a row's 128 codes are 64 contiguous bytes, even column in the low nibble.
-                        // The .fconst formula: one byte per COLUMN holds the row PAIR 2cp (low) / 2cp+1 (high), so a
-                        // row's codes are strided by 4 through a 512-byte block -- no column pairing at all.
+                        // w8 interleave (the packer's wh_w8_index): one byte per K column holds the output-row pair
+                        // 2cp (low nibble) / 2cp+1 (high), strided by 4 through a 512-byte block. Row-major is kept only
+                        // as the alternative the unit test holds to its own spec.
                         uint8_t nib;
                         if (row_major) {
                             const uint8_t b = quants[r * 64 + c / 2];
@@ -2424,10 +2422,7 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
                             const uint8_t b = quants[(cp % 4) + c * 4 + (cp / 4) * 512];
                             nib = (r % 2 == 0) ? uint8_t(b & 0xF) : uint8_t(b >> 4);
                         }
-                        // signed int4 -> the container's 0..15 offset from the group minimum: c_signed = nib-16 for a
-                        // negative nibble, then +8. A no-op would have been `nib`, which is the bug this replaces.
-                        const int cs = (nib >= 8) ? int(nib) - 16 : int(nib);
-                        q.codes[size_t(row) * K + (kk - 1) * 128 + c] = uint8_t(cs + 8);
+                        q.codes[size_t(row) * K + (kk - 1) * 128 + c] = nib;
                     }
                 }
             }
@@ -5063,6 +5058,32 @@ std::string kernel_set_refusal(const std::vector<std::string>& file_names, const
 // Copies the tokenizer/chat files the container needs beside model.q4nx; defined past kTextFiles' declaration.
 static int copy_text_artifacts(const std::string& pack_dir, const std::string& out_dir);
 
+double rope_cache_best_theta(const std::vector<float>& cache, int64_t rows, int64_t half,
+                             const std::vector<double>& cands, double* best_theta) {
+    // ONE Pearson r of the cache against cos(p * theta^(-2i/d)) over the whole matrix (the per-column mean is noise
+    // for the flat high columns; see the .fconst path's note on Qwen3-1.7B). Invariant to a per-pack cache scale.
+    double best = -2.0;
+    if (best_theta) *best_theta = 0.0;
+    const int64_t pmax = std::min<int64_t>(rows, 4096);
+    const double d = double(half) * 2.0;
+    for (const double th : cands) {
+        if (!(th > 0)) continue;
+        double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, n = 0;
+        for (int64_t i = 0; i < half; ++i) {
+            const double inv = 1.0 / std::pow(th, 2.0 * double(i) / d);
+            for (int64_t p = 0; p < pmax; ++p) {
+                const double y = cache[size_t(p) * size_t(half) + size_t(i)], x = std::cos(double(p) * inv);
+                sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; n += 1;
+            }
+        }
+        const double cx = sxx - sx * sx / n, cy = syy - sy * sy / n;
+        if (cx <= 1e-12 || cy <= 1e-12) continue;
+        const double r = (sxy - sx * sy / n) / std::sqrt(cx * cy);
+        if (r == r && r > best) { best = r; if (best_theta) *best_theta = th; }
+    }
+    return best;
+}
+
 Report import_external(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
     const Plan p = plan(pack_dir);
     const std::string graph = graph_filename(pack_dir);
@@ -5260,6 +5281,32 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     c["head_dim"] = p.dims.head_dim;
     c["vocab_size"] = p.dims.vocab;
     c["rope_theta"] = p.dims.rope_theta;
+    // engine#2561: this genre's config.json can be `{}` (phi-4), so rope_theta above is a default (10000); the graph's
+    // GroupQueryAttention reads a precomputed `cos_cache` initializer, which is the pack's own statement of its base.
+    if (onnx.index.count("cos_cache")) {
+        const OnnxTensor& cc = onnx.tensors[onnx.index.at("cos_cache")];
+        if (cc.dims.size() == 2 && cc.dims[0] > 1 && cc.dims[1] > 0 && cc.type == kF32) {
+            const int64_t rows = cc.dims[0], half = cc.dims[1];
+            uint64_t need = 0;
+            if (mul_ok(uint64_t(rows) * uint64_t(half), 4u, need)) {
+                std::vector<float> cache(size_t(rows) * size_t(half));
+                std::memcpy(cache.data(), bytes_of(cc, need), size_t(need));
+                const std::vector<double> cands{double(p.dims.rope_theta), 1e4, 5e4, 1e5, 2.5e5, 5e5, 1e6, 5e6, 1e7};
+                double best_theta = 0.0;
+                const double best_corr = rope_cache_best_theta(cache, rows, half, cands, &best_theta);
+                if (best_corr > 0.99 && best_theta > 0.0) {
+                    if (std::fabs(best_theta - double(p.dims.rope_theta)) > 1e-6)
+                        std::fprintf(stderr, "note: rope_theta %.6g declared, %.6g adopted (correlation %.4f against the "
+                                             "pack's own cos_cache)\n", double(p.dims.rope_theta), best_theta, best_corr);
+                    c["rope_theta"] = best_theta;
+                } else {
+                    std::fprintf(stderr, "WARNING: no candidate rope_theta explains the pack's cos_cache (best %.4f at %.6g); "
+                                         "keeping %.6g, attention may be wrong\n", best_corr, best_theta,
+                                 double(p.dims.rope_theta));
+                }
+            }
+        }
+    }
     c["q4nx_parameters"] = "fp32 scale/zero per 32-column group";
     if (!opt.weight_layout.empty() && opt.weight_layout != "rm") c["q4nx_weight_layout"] = opt.weight_layout;
     c["q4nx_source"] = {{"kind", "oga-npu-pack external data"}, {"pack", p.pack},

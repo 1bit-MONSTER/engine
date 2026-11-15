@@ -1414,6 +1414,24 @@ stride the `.fconst` attention tile already carries (2,176 B subvolume = 32 rows
 from the node's own `N`/`K` (`gate_proj`/`up_proj` → N, `down_proj` → K), because the weight is a 1-D byte blob with no
 shape to read it from (engine#1503).
 
+**How the `.packed` blob decodes (engine#2561).** It is the same 2,176-byte subvolume layout as the
+[`.fconst` attention payload](#the-fconst-attention-payload), with the same rules:
+
+- **Codes:** the w8 interleave.
+- **Zero points:** one per output row in the 16 bytes at `+2048`.
+- **Scales:** 32 bf16 values at `+2112`.
+- **Row order:** subvolume `2 + 2*kblock + half` holds rows `half*32 + r` of the 64-row tile. The halves are **not** swapped.
+- **Values:** the nibbles are the ONNX MatMulNBits fields as given, read **unsigned**: `w = (c - z) * s`.
+
+This was established offline with a known-answer write. AMD's packer (`matmulnbits_pack_const_float32`, mladf v2, K 5120 x N 1024, group 128) was run on chosen weights only as an oracle; the engine neither calls nor ships it. Its output has the blob's own geometry (2,854,912 B = 16 tiles x 82 x 2,176). This layout recovers 100 % of the planted codes, zero points and scales. The earlier reading recovered 6 %, 9 % and 0 %, because it swapped the halves, read four zero points per row from 64 bytes, and sign-extended. That earlier reading had been checked only against this importer's own container.
+
+On `phi-4` the corrected decode reproduces HF `microsoft/phi-4` layer-0 `qkv_proj` times the pack's AWQ fold ratio (`ln_HF / ln_pack`) at corr **+0.992**, with the same row norm (14.79 vs 14.89). The old decode gave corr 0.00 and rows 49x too large, and the model answered `void void ...` on every prompt. With the fix it answers "Paris.", "hydrogen ..." and "Neil Armstrong." on `--device npu`.
+
+Two more facts this genre needs:
+
+- **Final norm:** the graph hangs it on a pseudo layer one past the last (`model.layers.40.final_norm_layernorm.weight`, equal to HF `model.norm.weight`). The importer writes it as `model.norm.weight`, not as a unit gain.
+- **RoPE base:** `config.json` can be `{}`, so the base comes from the pack's own `cos_cache` initializer (`rope_cache_best_theta`). On phi-4 that adopts 250000 at corr 1.0000, where the default was 10000.
+
 **The 1.8 hybrid line (`*_rai_1.8.0_hybrid`) is not importable, and that is a decision, not a gap still to be filled (engine#1503).** These packs pair a `model.onnx` with a `model.bin`: 1.3 GB on `Llama-3.2-1B-Instruct_rai_1.8.0_hybrid`, alongside a 542 MB `model.onnx.data` that holds only the embedding and the norms. In the graph, every `.MatMulNBits.*` initializer is a `[0]` placeholder with no bytes, and so is its `.packed` sibling (162 of 162 on that pack). The weights exist only in `model.bin`, a compiled container that the vendor's runtime reads. Writing a reader for it means decoding that container, which this engine does not do, so `npu-pack info` and `npu-pack import` refuse these packs by name before reading anything:
 
 ```

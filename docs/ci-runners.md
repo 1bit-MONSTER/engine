@@ -269,6 +269,55 @@ allocation failed as an exception rather than as an OOM kill, so that experiment
 directive is the documented mechanism and it is what the fresh install's single end-to-end run should confirm,
 together with the rest of #1504's acceptance.
 
+## The PR-Agent model runs in gpu-hold windows (engine#2494)
+
+The `pr-agent` job talks to a local model, Qwen3-Coder-30B-A3B served by `1bit serve` on HRX at `127.0.0.1:8090` (the
+`coder-llm` user service). Until 2026-11-15 that server ran around the clock **outside any gpu-hold ticket**, so "one GPU
+job at a time" never held, and its model is the one whose prefill faults the GPU (engine#2494). It now runs only inside a
+ticket, in on-demand windows, through `scripts/coder-llm-ticketed` (deployed to `~/.local/bin`):
+
+1. **It waits for demand.** Demand is the file `~/.cache/coder-llm/demand` touched within the last 30 minutes (the
+   `pr-agent` workflow's `reviewer` job touches it), or, as the fallback that is on by default (`CODER_LLM_GH_POLL=1`),
+   a `pr-agent` **pull_request** run that is queued or in progress (comment runs are not counted: most never review). So
+   a review is never starved by a workflow that forgot to ask. A poll that cannot ask (an expired token, a rate limit) is
+   logged once per wait as `gh poll failed (<reason>)` and treated as no demand.
+2. **It queues for the GPU like any other job**: `gpu-hold -l coder-llm -t 25`. The FIFO queue, the temperature, memory
+   and kernel-fault watchdogs, and the release wait that lets the next label in all apply.
+3. **Inside the ticket it serves**, and ends the window when no slot in `/slots` has been processing **and** the demand
+   file has not been touched for 5 minutes, or when the 25-minute max hold ends it.
+4. **It exits**, and the unit's `Restart=always` starts the next invocation, which waits for demand and queues again at
+   the back of the line. After a kernel fault (gpu-hold rc 78) it backs off 10 minutes first.
+
+Anything else that needs the model asks the same way: touch `~/.cache/coder-llm/demand`, keep touching it while it
+works, and wait for `:8090` to answer a real completion. Until a window opens, the port refuses.
+
+**The contract this changes: `systemctl --user start coder-llm` now means *queued*, not ":8090 answers".** A window
+wrapper that restarts the unit from inside its own gpu-hold ticket and then polls `:8090` is polling a server that is queued
+behind that very ticket. The server can answer only after the caller's ticket is released, so such a poll must not count a
+silent `:8090` as "the fleet LLM did not come back". The unit's journal says `queued behind <holder>` when it queues. With
+the model ticketed, a memory window no longer needs to stop it: it is not resident outside its own windows.
+
+`scripts/install-coder-llm-ticketed.sh` does the switch:
+
+- with no argument, or `--diff`, it prints the drop-in change;
+- `--status` says whether the wrapper is installed and the running unit executes it (exit 0 only when both are true);
+- `--install` backs the drop-in up as `<name>.bak-<YYYYMMDD>`, rewrites it, installs the wrapper, reloads and restarts.
+
+The server command stays byte for byte; the wrapper goes in front of it:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=%h/.local/bin/coder-llm-ticketed -- <the 1bit serve command line>
+Environment=CODER_LLM_GH_POLL=1
+Restart=always
+RestartSec=15
+TimeoutStopSec=90
+```
+
+`tests/coder_llm_ticketed_test.sh` (ctest `coder_llm_ticketed`) drives the wrapper with the real `scripts/gpu-hold` on a
+private queue and a fake `/slots` server. No device is used.
+
 ## What a restart policy cannot do
 
 It cannot notice that a runner is *not* coming back (a version mismatch, a revoked token, a full disk under

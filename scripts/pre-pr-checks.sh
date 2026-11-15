@@ -64,6 +64,11 @@ checks=(
     "tools/ci/ci_targets_check.py --check"
     "tools/ci/tmp_path_check.py --check"
     "tools/ci/submodule_pin_check.py --check"
+    # engine#2445: the tree must CONFIGURE, not just parse as text. A rebase resolution left one line
+    # ending `…_test.py)ms)` and every check above stayed green -- they read files, run Python and diff
+    # refs, and none asks CMake to read CMakeLists.txt the way CI's Configure step does. That step caught
+    # it in 63s; this is the same read, run here.
+    "tools/ci/cmake_configure_check.py --check"
     "tools/ci/registration_loss_check.py --check --base $base"
     "tools/ci/registry_loss_check.py --base $base"
     "tools/ci/branch_stale_check.py --base $base"

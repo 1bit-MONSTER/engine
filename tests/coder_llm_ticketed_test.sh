@@ -35,7 +35,10 @@
 #     as the max hold, rc 124 (the first live window, 11-15 10:56Z, ended rc 137); the teardown time is logged, and a
 #     grace too short for the stop wait is warned about;
 #   J a server KILLed 1 s into a window that queued 9 s behind a lane stays rc 137: the relabel is timed from the
-#     window's start, not the queue's, so a real KILL is not reported as a max hold.
+#     window's start, not the queue's, so a real KILL is not reported as a max hold; every outcome line says how long
+#     the window was open;
+#   K a fault line already in the kernel log makes gpu-hold refuse the grant (rc 78): the journal says "ticket refused
+#     before the window", not a fault during one (arm D says "fault during the window"), and no server starts.
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)   # the defaults work from any directory, not only the repo root
 tick=${1:-$root/scripts/coder-llm-ticketed}
@@ -119,6 +122,7 @@ env "${envs[@]}" GPU_HOLD_FAULT_ABORT=1 CODER_LLM_IDLE_S=60 CODER_LLM_MAX_HOLD_M
 rc=$?
 [ "$rc" = 78 ] || { echo "FAIL D: rc $rc after a gfxhub fault, want 78"; fail=1; }
 grep -q "backing off" "$scratch/d.log" || { echo "FAIL D: no back-off after rc 78"; fail=1; }
+grep -Eq "rc 78: fault during the window after [0-9]+s" "$scratch/d.log" || { echo "FAIL D: rc 78 not reported as a fault during the window"; fail=1; }
 server_alive && { echo "FAIL D: the server survived the fault abort"; fail=1; }
 [ -e "$scratch/TOKEN" ] && { echo "FAIL D: the token is still held"; fail=1; }
 : > "$scratch/klog"
@@ -210,10 +214,22 @@ rc=$?
 wait "$lj"
 [ "$rc" = 137 ] || { echo "FAIL J: rc $rc for a server KILLed 1 s into its window after a 9 s queue, want 137 (relabelled as a max hold?)"; fail=1; }
 grep -q "KILLed before its max hold" "$scratch/j.log" || { echo "FAIL J: the log does not call it a KILL before the max hold"; fail=1; }
+grep -Eq "KILLed before its max hold \(rc 137, open [0-9]s of 0.1 min" "$scratch/j.log" || { echo "FAIL J: the 137 line does not say how long the window was open"; fail=1; }
+
+# ---- K: a grant refused on a recent fault line is not a fault during a window ----------------------------------------
+echo busy > "$scratch/state"; rm -f "$scratch/server.pid"; touch "$scratch/demand"
+echo "$(date '+%b %d %H:%M:%S') strixhalo kernel: amdgpu 0000:c5:00.0: amdgpu: MODE2 reset" > "$scratch/klog"
+nowin=(); for e in "${envs[@]}"; do case "$e" in GPU_HOLD_RESET_WINDOW_MIN=*) ;; *) nowin+=("$e") ;; esac; done
+env "${nowin[@]}" GPU_HOLD_RESET_WINDOW_MIN=10 CODER_LLM_IDLE_S=60 CODER_LLM_MAX_HOLD_MIN=1 timeout 60 "$tick" -- "$scratch/fake" > "$scratch/k.log" 2>&1
+rc=$?
+: > "$scratch/klog"
+[ "$rc" = 78 ] || { echo "FAIL K: rc $rc for a refused grant, want 78 ($(grep -m1 'refus' "$scratch/k.log"))"; fail=1; }
+grep -q "rc 78: ticket refused before the window" "$scratch/k.log" || { echo "FAIL K: a refused grant is not reported as such ($(grep -m1 'rc 78' "$scratch/k.log"))"; fail=1; }
+[ -s "$scratch/server.pid" ] && { echo "FAIL K: a server started on a refused grant"; fail=1; }
 
 # ---- G: the default queue wait keeps the ticket's place on a busy box (a give-up re-queues at the back) ------------
 sed -n 's/^QUEUE_WAIT=\${CODER_LLM_QUEUE_WAIT_S:-\([0-9]*\)}$/\1/p' "$tick" > "$scratch/qw"
 [ "$(cat "$scratch/qw")" -ge 14400 ] 2> /dev/null || { echo "FAIL G: default queue wait $(cat "$scratch/qw")s; under 4 h a busy queue makes it re-queue at the back and starve"; fail=1; }
 
-[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load; a slow-exiting server gets its grace, a KILL after the max hold is 124, one after a queue wait stays 137)"
+[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load; a slow-exiting server gets its grace, a KILL after the max hold is 124, one after a queue wait stays 137; a refused grant is told from a fault during a window)"
 exit "$fail"

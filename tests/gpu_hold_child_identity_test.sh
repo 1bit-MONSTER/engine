@@ -86,6 +86,20 @@ else
     printf '%s\n' "$out" | sed -n '1,3p' | sed 's/^/       /'
     fails=$((fails + 1))
 fi
+# engine#2447 review: the CONTENT comparison must be exercised by a NON-EMPTY line that differs. The arms above
+# cover "no ticket line at all" (refused for absence) and "a line equal to the token" (accepted); neither reaches
+# `[ "$(cat $_tok)" != "$_want" ]`, so dropping that comparison passed 0 failures. This is the arm for it: a
+# well-formed ticket line for a DIFFERENT hold, with the token present.
+other="gpu-hold some-other-lane pid 424242 2026-11-14T00:00:00-04:00"
+out=$(ONEBIT_BIN=/bin/true NPU_TOKEN_FILE="$tmp/NPU-TOKEN" NPU_HOLD_TICKET="$other" \
+      bash "$SRC/scripts/npu-kernel-bitx.sh" /x /y 2>&1)
+if printf '%s' "$out" | grep -q 'the device ticket is not ours'; then
+    echo "  ok   a NON-EMPTY ticket line that differs from the token is refused ('not ours')"
+else
+    echo "  FAIL a well-formed ticket line for a different hold was not refused as 'not ours'"
+    printf '%s\n' "$out" | sed -n '1,3p' | sed 's/^/       /'
+    fails=$((fails + 1))
+fi
 # and the variable the helper chain ACTUALLY exports must be the one accepted - the P0: the first version required
 # NPU_HOLD_TICKET, which no helper sets, so every run was refused.
 out=$(ONEBIT_BIN=/bin/true NPU_TOKEN_FILE="$tmp/NPU-TOKEN" GPU_HOLD_TICKET="$foreign" NPU_HOLD_TICKET= \

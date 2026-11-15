@@ -629,6 +629,7 @@ add_test(NAME hw_gate_mem COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_mem_tes
 # engine#2500/#2513: a failing row's kept server log gets a name unique per failure (CI's $OUT basename is constant, so
 # the first version overwrote the previous run's evidence), and a failed copy names nothing. No GPU, no ticket.
 add_test(NAME hw_gate_kept_log COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_kept_log_test.sh ${CMAKE_SOURCE_DIR})
+add_test(NAME hw_gate_phase_rows COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_phase_rows_test.sh ${CMAKE_SOURCE_DIR})
 # engine #1504: the release preflight blocks on a runner unit that is down and only warns on a short restart policy.
 # The gate's "is the coder busy?" probe: `0` idle, `N` busy, `-1` cannot tell. The parser answered `0` on any
 # exception while `curl -s` exits 0 on a 404, so a wrong URL, a refused connection and an idle coder were one answer.

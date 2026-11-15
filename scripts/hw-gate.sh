@@ -819,9 +819,12 @@ for _ph in $(printf '%s' "$PHASES" | tr ',' ' '); do
   # below covering all four phases, `--phases placement` was satisfied by any model row and a run with no placement
   # row at all still read as green -- the same defect one level in (review at 9dd6077). The per-model phases DO
   # report their missing/throttled models as `model <name>` rows, so only those three accept that alternative.
+  # A phase is the ROW'S FIRST FIELD, not a prefix of it: `npu` is a prefix of `npuserve`, so `^npu` read an
+  # `npuserve` row as proof that `npu` had run (review of engine#2523, measured on a results file holding only
+  # `build` and `npuserve`). Rows are `name<TAB>status...`, so `[[:space:]]` is what makes it a field match.
   case "$_ph" in
-    kat|kld|needle) _phre="^($_ph|model )" ;;
-    *)              _phre="^$_ph" ;;
+    kat|kld|needle) _phre="^(${_ph}|model)[[:space:]]" ;;
+    *)              _phre="^${_ph}[[:space:]]" ;;
   esac
   grep -qE "$_phre" "$RESULTS" 2>/dev/null ||
     printf '%s\tFAIL\t0\trequested but produced no result row: --phases %s ran nothing for it\n' "$_ph" "$_ph" >> "$RESULTS"

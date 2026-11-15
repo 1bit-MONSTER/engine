@@ -1413,6 +1413,10 @@ add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/
     # device, no download.
     add_test(NAME safetensors_to_q4nx
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/safetensors_to_q4nx_test.py)
+    # AMD Quark int4 -> Q4NX with Quark's own codes (tools/quark_to_q4nx.py): synthetic parts, numpy only.
+    # Pins the exact int4 map, the uint4 refusal (the bf16 zero rounds) and "no Quark linear" refusing.
+    add_test(NAME quark_to_q4nx
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/quark_to_q4nx_test.py)
 endif()
 
 # The d3 readout head loader (npu/decision.h): two files and the arithmetic on a hidden vector, so

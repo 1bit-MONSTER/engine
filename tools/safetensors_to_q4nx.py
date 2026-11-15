@@ -267,7 +267,12 @@ def gate_geometry(hf_dir):
     return (int(nh), int(hd))
 
 
-def pack(args):
+def pack(args, source=None):
+    """`source` (optional) supplies tensors from a quantizer instead of the BF16 checkpoint, keeping this one
+    container writer for both (tools/quark_to_q4nx.py, engine QUARK-EVAL).  It has two methods:
+      value(name, w)  -> the array to write in place of w (e.g. AWQ's rescaled norms), or w;
+      q4_1(name, w)   -> (codes, scale, zero) for a 2-D tensor that becomes q4_1 tiles, or None to RTN it.
+    Without it the tool behaves exactly as before."""
     os.makedirs(args.out, exist_ok=True)
     table, blobs, off = {}, [], 0
     count = 0
@@ -285,6 +290,8 @@ def pack(args):
             skipped += 1                    # decided from the name, before reading its bytes
             continue
         w = read_tensor(path, header, data_off, name)
+        if source is not None:
+            w = source.value(name, w)
         got = transcode(name, w, arch, gate)
         if got is None:
             skipped += 1
@@ -308,10 +315,11 @@ def pack(args):
             data = bf16_bits(flat)
             how = "bf16"
         else:
-            codes, scale, zero = quantize_q4_1(w)
+            parts = source.q4_1(name, w) if source is not None else None
+            codes, scale, zero = parts if parts is not None else quantize_q4_1(w)
             data = tiles(codes, scale, zero)
             table[name] = {"dtype": "I8", "shape": list(data.shape)}
-            how = "q4_1"
+            how = "q4_1" if parts is None else "q4_1 (source)"
         b = np.ascontiguousarray(data).tobytes()
         pad = (-off) % 64
         if pad:

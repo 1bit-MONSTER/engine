@@ -592,7 +592,15 @@ if has ops; then
     # pass". That is a *filter* problem, not a kernel result - and it must never read as a pass either.
     # Report it as SKIP with the selection that produced it, so neither an empty run nor a broken filter
     # can be mistaken for a measured one.
+    # infra=1: nothing was tested, so this is "could not run", not a measured SKIP. Without the flag a filter
+    # that matches no case leaves the gate reporting PASS (engine#2522 set it on the absent-input SKIPs for the
+    # same reason; the zero-cases SKIP was the one that was missed).
+    infra=1
     result ops SKIP $(( $(date +%s) - t0 )) "no case matched -b HRX0 -o \"$OPS\": the zero-cases guard refused to report a pass (fork engine#657) - fix the filter or the build"
+    # engine#2522's rule, applied to this row: a SKIP means the run did not test what it claims to test, so the run
+    # as a whole is infra-incomplete and must not read as PASS. The verdict block now consults infra, so setting it
+    # here is what turns "the ops phase had nothing to run" into a non-green gate instead of a quiet row.
+    infra=1
   else
     unknown=$(printf '%s\n' "$fails" | grep -v -F "$FLAKY_CASES" | grep -c . || true)
     st=FAIL detail="${passed:-rc=$rc}: $(printf '%s' "$fails" | head -n 3 | tr '\n' ' ')"
@@ -646,8 +654,11 @@ if has ops; then
   fi
 fi
 
-# ---- kat + needle + KLD: one step per model -----------------------------------------------
-if has kat || has needle || has kld; then
+# ---- kat + needle + KLD + placement: one step per model ------------------------------------
+# `placement` must be in this guard. It was not, so `--phases build,placement` (and `placement` alone) entered nothing,
+# produced no row, and the gate reported PASS over a run that never asked the question (2026-11-15, dispatch 43700775742:
+# "PHASES: build,placement" then a summary table with `build` and nothing else, `## HRX hardware gate: PASS`).
+if has kat || has needle || has kld || has placement; then
   [ -f "$TEXT" ] || { has kld && { result kld SKIP 0 "text missing (input absent): $TEXT"; infra=1; }; }
   while IFS='|' read -r name file repeat donee srvargs; do
     want_model "$name" || continue
@@ -805,10 +816,38 @@ fi
 
 # ---- summary ---------------------------------------------------------------------------------
 total=$(( $(date +%s) - START ))
+# A REQUESTED PHASE THAT PRODUCED NO ROW IS A FAILURE, not a pass. `--phases placement` entered no model loop until the
+# guard above was fixed, and the gate reported `## HRX hardware gate: PASS` over a run that never asked the question
+# (dispatch 43700775742). Whatever the next such slip is, it must not be able to read as green: every phase named on the
+# command line has to appear as a row (PASS, FAIL, SKIP, or a `model …` row), or the gate says so by name.
+for _ph in $(printf '%s' "$PHASES" | tr ',' ' '); do
+  case "$_ph" in ''|*' '*) continue ;; esac
+  # The per-model phases report their missing/throttled models as a `model <name>` row, so that row satisfies the
+  # request for any of them; only a phase that produced NO row at all is a slip.
+  # `placement` has its OWN row kind, so a `model …` row must not satisfy a request for it: with the prefix rule
+  # below covering all four phases, `--phases placement` was satisfied by any model row and a run with no placement
+  # row at all still read as green -- the same defect one level in (review at 9dd6077). The per-model phases DO
+  # report their missing/throttled models as `model <name>` rows, so only those three accept that alternative.
+  # A phase is the ROW'S FIRST FIELD, not a prefix of it: `npu` is a prefix of `npuserve`, so `^npu` read an
+  # `npuserve` row as proof that `npu` had run (review of engine#2523, measured on a results file holding only
+  # `build` and `npuserve`). Rows are `name<TAB>status...`, so `[[:space:]]` is what makes it a field match.
+  case "$_ph" in
+    kat|kld|needle) _phre="^(${_ph}|model)[[:space:]]" ;;
+    *)              _phre="^${_ph}[[:space:]]" ;;
+  esac
+  grep -qE "$_phre" "$RESULTS" 2>/dev/null ||
+    printf '%s\tFAIL\t0\trequested but produced no result row: --phases %s ran nothing for it\n' "$_ph" "$_ph" >> "$RESULTS"
+done
 nfail=$(awk -F'\t' '$2 == "FAIL"' "$RESULTS" | wc -l)
 rings=$(ring_timeouts)
 {
-  echo "## HRX hardware gate: $([ "$nfail" = 0 ] && echo PASS || echo "FAIL ($nfail)")"
+  # A run that could not test an input is NOT a pass. `infra=1` marks that (an absent model, absent text, a refused
+  # memory pre-check); before this, the flag was only consulted inside `if [ "$nfail" != 0 ]`, so once an absent input
+  # became a SKIP row (engine#2522) a run with nothing to test reported `## HRX hardware gate: PASS` and exited 0.
+  _verdict=PASS
+  [ "$nfail" != 0 ] && _verdict="FAIL ($nfail)"
+  [ "$infra" = 1 ] && [ "$_verdict" = PASS ] && _verdict="INCOMPLETE (an input was absent: nothing was tested)"
+  echo "## HRX hardware gate: $_verdict"
   echo
   echo "Commit \`$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)\`, llama.cpp \`$(git -C "$ROOT" ls-tree HEAD third_party/llama.cpp | awk '{print substr($3,1,12)}')\`, hrx-system \`$(git -C "$ROOT" ls-tree HEAD third_party/hrx-system | awk '{print substr($3,1,12)}')\`, binaries \`$BIN\`, ${total}s, Tctl at end $(tctl) C, amdgpu ring timeouts during the run: $rings."
   echo
@@ -822,8 +861,6 @@ rings=$(ring_timeouts)
 } > "$OUT/summary.md"
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
 cat "$OUT/summary.md"
-if [ "$nfail" != 0 ]; then
-  [ "$infra" = 1 ] && exit 2
-  exit 1
-fi
+[ "$infra" = 1 ] && exit 2      # not green: an input was absent, so the gate did not test what it was asked to
+[ "$nfail" != 0 ] && exit 1
 exit 0

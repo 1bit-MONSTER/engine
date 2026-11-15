@@ -703,11 +703,10 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
 
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir) {
-    // engine#2536 / #2576: on by default at tau 20 (the measured table is in docs/npu.md: 40 left Llama-2-7b-chat's EOS
+    // engine#2536 / #2576: on by default (kActOutlierTauDefault in act_outliers.h; the measured table is in docs/npu.md: 40 left Llama-2-7b-chat's EOS
     // lost once gate/up were covered); NPU_ACT_OUTLIER_TAU=0 turns it off, NPU_ACT_OUTLIER_KMAX caps channels per row.
-    outl_tau_ = 20.0f;
-    if (const char* t = getenv("NPU_ACT_OUTLIER_TAU")) outl_tau_ = (float)atof(t);
-    if (const char* k = getenv("NPU_ACT_OUTLIER_KMAX")) outl_kmax_ = std::max(1, atoi(k));
+    outl_tau_ = onebit::npu::act_outlier_tau_from(getenv("NPU_ACT_OUTLIER_TAU"));
+    outl_kmax_ = onebit::npu::act_outlier_kmax_from(getenv("NPU_ACT_OUTLIER_KMAX"));
     if (const char* hg = getenv("NPU_INFER_HOST_GEMM")) {
         host_gemm_ = true;
         // engine#1808: "i8" selects the integer arm, whose int32 accumulation is the only thing a

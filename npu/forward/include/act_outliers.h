@@ -32,11 +32,26 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
 
 namespace onebit::npu {
+
+// The defaults, in one place so act_outliers_test can assert them (engine#2585 review): tau 20 (docs/npu.md has the
+// table; 40 left Llama-2-7b-chat 1.7.1 without its EOS once gate/up were covered) and at most 16 channels per row.
+constexpr float kActOutlierTauDefault = 20.0f;
+constexpr int kActOutlierKmaxDefault = 16;
+
+// NPU_ACT_OUTLIER_TAU as read: unset gives the default, "0" turns the split off.
+inline float act_outlier_tau_from(const char* env) { return env ? (float)std::atof(env) : kActOutlierTauDefault; }
+// NPU_ACT_OUTLIER_KMAX as read: unset gives the default; anything below 1 is clamped to 1.
+inline int act_outlier_kmax_from(const char* env) {
+    if (!env) return kActOutlierKmaxDefault;
+    const int k = std::atoi(env);
+    return k < 1 ? 1 : k;
+}
 
 struct ActOutlier {
     int row;   // activation row

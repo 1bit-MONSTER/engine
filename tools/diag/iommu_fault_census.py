@@ -79,46 +79,70 @@ def census(rows):
 
 
 def intersection(entries):
-    """Distinct addresses present in EVERY label's set: the deterministic-allocation signature."""
-    by_label = {}
+    """{(device, domain): [addresses present in every label]}. Per device: pooling them mixed an NPU address with an
+    NVMe address and called the pair a shared buffer (review of engine#2491)."""
+    groups = {}
     for e in entries:
-        by_label.setdefault(e["label"], set()).update(e["_set"])
-    if len(by_label) < 2:
-        return None
-    sets = list(by_label.values())
-    return sorted(set.intersection(*sets))
+        groups.setdefault((e["device"], e["domain"]), {})[e["label"]] = e["_set"]
+    out = {}
+    for key, per_label in groups.items():
+        if len(per_label) >= 2:
+            out[key] = sorted(set.intersection(*per_label.values()))
+    return out or None
+
+
+def shape(e):
+    """Which fault shape this (boot, device, domain) is, decided by what the tool already counts: repeats per address.
+
+    The cross-boot set cannot decide it. These addresses are IOVAs, handed out per boot by dma-iommu in probe/allocation
+    order, so one deterministic buffer with a stale translation still lands on a different IOVA every boot -- "disjoint"
+    is the expected answer under BOTH hypotheses, and a tool that reads it as "race" is wrong on real hardware
+    (review of engine#2491, measured on the box: NVMe 3800 faults over 10 distinct, then 2361/9, then 71/4).
+    """
+    repeats = e["faults"] / float(max(e["distinct"], 1))
+    # Both criteria, because each one alone mislabels the box's real streams: 20+ distinct pages is churn even if a few of
+    # them repeat (the NPU stream is 390 faults over 321 distinct, max 6 each), and a handful of pages repeating fewer than
+    # five times is not evidence of a live stale mapping either.
+    if e["distinct"] < 20 and repeats >= 5:
+        return (
+            "few live mappings faulting over and over (%.1f faults per address) -> a stale translation: find the buffer"
+            % repeats
+        )
+    return (
+        "many distinct pages faulted about once each (%.1f faults per address) -> re-allocation, or a free behind a live "
+        "descriptor: find the race" % repeats
+    )
 
 
 def render(entries, inter, as_json):
     if as_json:
         return json.dumps(
             {
-                "boots": [{k: v for k, v in e.items() if not k.startswith("_")} for e in entries],
-                "shared_across_boots": None if inter is None else [hex(a) for a in inter],
+                "boots": [
+                    dict({k: v for k, v in e.items() if not k.startswith("_")}, shape=shape(e)) for e in entries
+                ],
+                "shared_addresses": None
+                if inter is None
+                else {("%s %s" % k): [hex(a) for a in v] for k, v in inter.items()},
             },
             indent=2,
         )
     lines = []
     for e in entries:
         lines.append(
-            "%s %s domain=%s: %d fault(s), %d distinct" % (e["label"], e["device"], e["domain"], e["faults"], e["distinct"])
+            "%s %s domain=%s: %d fault(s), %d distinct"
+            % (e["label"], e["device"], e["domain"], e["faults"], e["distinct"])
         )
         for t in e["top"]:
             lines.append("    %s x%d" % (t["address"], t["count"]))
+        lines.append("    -> %s" % shape(e))
     if inter is None:
-        lines.append("shared across boots: (need two or more labeled journals)")
+        lines.append("shared across boots: (need two or more labeled journals of the same device)")
     else:
-        lines.append(
-            "shared across boots: %d address(es) -> %s"
-            % (
-                len(inter),
-                "one deterministic allocation with a stale translation: find the buffer"
-                if inter
-                else "disjoint sets: re-allocation or free behind a live descriptor: find the race",
-            )
-        )
-        for a in inter[:5]:
-            lines.append("    %s" % hex(a))
+        for (dev, dom), addrs in sorted(inter.items()):
+            lines.append("shared across boots, %s domain=%s: %d address(es)" % (dev, dom, len(addrs)))
+            for a in addrs[:5]:
+                lines.append("    %s" % hex(a))
     return "\n".join(lines)
 
 
@@ -146,11 +170,35 @@ def self_test():
 
     other = one.replace("0xeb536000", "0xeb5fa000")
     both = census({**parse(one, "b1"), **parse(other, "b2")})
-    ok("disjoint boots share nothing", intersection(both), [])
+    ok("disjoint boots share nothing", intersection(both), {("0000:c4:00.0", "0x0015"): []})
 
     mixed = other + one
     both = census({**parse(one, "b1"), **parse(mixed, "b2")})
-    ok("a shared address is found across boots", intersection(both), [0xEB536000])
+    ok("a shared address is found across boots", intersection(both), {("0000:c4:00.0", "0x0015"): [0xEB536000]})
+
+    # the review's arm: two boots sharing no page, each with a few pages repeating many times, must NOT be called a race
+    heavy = "".join(
+        "Nov 14 20:0%d host kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=%s flags=0x0000]\n"
+        % (i % 10, a)
+        for a in ("0xe8247000", "0xe7fdd000")
+        for i in range(300)
+    )
+    heavy2 = heavy.replace("0xe8247000", "0xebe54000").replace("0xe7fdd000", "0xeb5fa000")
+    hb = census({**parse(heavy, "b-2"), **parse(heavy2, "b-1")})
+    ok("repeating pages in disjoint boots are still the stale-translation shape", shape(hb[0]), shape(hb[1]))
+    ok("...and that arm's own text is the buffer one", "find the buffer" in shape(hb[0]), True)
+    ok(
+        "...while the intersection is reported as an empty FACT, not as a race",
+        intersection(hb),
+        {("0000:c4:00.0", "0x0015"): []},
+    )
+
+    # the second bug the review found: intersections must not pool devices
+    npu = "Nov 14 20:00 host kernel: nvme 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0002 address=0xeb536000 flags=0x0000]\n"
+    pooled = census({**parse(one, "b1"), **parse(npu, "b2")})
+    # one boot each, so no device has two sets to compare: nothing is reported, and in particular the NVMe/NPU address
+    # that happens to be equal is never offered as a shared buffer (before the fix, pooling them made it one).
+    ok("an NPU address equal to an NVMe address is not a shared buffer", intersection(pooled), None)
 
     noise = "Nov 14 23:40:00 host kernel: nvme nvme0: I/O 12 QID 1 timeout, aborting\n"
     ok("a line that is not a page fault is ignored", parse(noise, "b1"), {})
@@ -162,6 +210,20 @@ def self_test():
     )
 
     ok("one boot cannot answer the cross-boot question", intersection(c), None)
+    ok("one fault on one address is the churn shape, not a buffer", "find the race" in shape(c[0]), True)
+
+    # the review's NPU numbers, which the old repeats-only rule would have called a stale translation: 390 faults spread
+    # over 321 distinct pages with at most 6 on any one of them.
+    npu_real = {"0x%012x" % (0x7FC64EFC6000 + i * 0x1000): (6 if i < 3 else 1) for i in range(321)}
+    npu_real["0x%012x" % 0x7FC64EFC6000] = 6
+    n = census(parse("".join(
+        "Nov 14 20:00 host kernel: nvme 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0002 address=%s flags=0x0000]\n"
+        % a for a, c in npu_real.items() for _ in range(c)), "b0"))[0]
+    ok("the box's NPU stream (321 distinct pages, max 6 each) is the churn shape", "find the race" in shape(n), True)
+    ok("...and the box's NVMe stream (10 distinct, hundreds each) is the buffer shape",
+       "find the buffer" in shape(census(parse("".join(
+           "Nov 14 20:00 host kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x%x000 flags=0x0000]\n"
+           % i for i in range(10) for _ in range(380)), "b-2"))[0]), True)
 
     # The counts engine#2478 actually measured in the boot that died: five addresses carrying most of the 2361 faults.
     # Until this arm existed, nothing tested the top-five ORDER -- only that the numbers were counted somewhere.

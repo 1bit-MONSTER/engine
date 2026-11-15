@@ -90,6 +90,28 @@ def census(rows):
     return out
 
 
+def offsets(entries):
+    """{(device, domain): [address minus the label's own lowest address]}.
+
+    engine#2478: an absolute intersection answers "does the same page fault again next boot" and came back empty across
+    three boots while every boot's faults sat in the same 0.1 GiB window -- the slot recurs and the pages do not. A
+    buffer re-allocated at the same place has the same *offset* from each boot's base, so comparing offsets answers the
+    question the absolute set cannot."""
+    groups = {}
+    for e in entries:
+        if not e["_set"]:
+            continue
+        base = min(e["_set"])
+        # 0 is excluded: it is the base by construction, so every boot shares it and it says nothing. What matters is
+        # whether the pages *above* the base land at the same offsets, which only holds if the object's layout recurs.
+        groups.setdefault((e["device"], e["domain"]), {})[e["label"]] = {a - base for a in e["_set"]} - {0}
+    out = {}
+    for key, per_label in groups.items():
+        if len(per_label) >= 2:
+            out[key] = sorted(set.intersection(*per_label.values()))
+    return out or None
+
+
 def intersection(entries):
     """{(device, domain): [addresses present in every label]}. Per device: pooling them mixed an NPU address with an
     NVMe address and called the pair a shared buffer (review of engine#2491)."""
@@ -158,6 +180,18 @@ def render(entries, inter, as_json):
             lines.append("shared across boots, %s domain=%s: %d address(es)" % (dev, dom, len(addrs)))
             for a in addrs[:5]:
                 lines.append("    %s" % hex(a))
+        # engine#2478: the absolute set is empty when the same buffer moves between boots. The offset set says whether
+        # it moved *to the same relative place*, which is what a re-allocation of one object looks like.
+        off = offsets(entries)
+        for (dev, dom), offs in sorted((off or {}).items()):
+            if not offs:
+                continue
+            lines.append(
+                "shared across boots by offset, %s domain=%s: %d offset(s) from each boot's lowest address"
+                % (dev, dom, len(offs))
+            )
+            for a in offs[:5]:
+                lines.append("    +%s" % hex(a))
     return "\n".join(lines)
 
 
@@ -207,6 +241,24 @@ def self_test():
         intersection(hb),
         {("0000:c4:00.0", "0x0015"): []},
     )
+
+    # engine#2478: the same buffer re-allocated at the same relative place shares an OFFSET, not an address, so the
+    # absolute intersection is empty while the offset intersection is not. Both are reported because the pair, not
+    # either half, is the diagnosis ("moved with the object" vs "moved with the slot").
+    moved = "".join(
+        "Nov 14 20:0%d host kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=%s flags=0x0000]\n"
+        % (i % 10, a)
+        for a in ("0xeb536000", "0xeb537000", "0xeb5fa000")
+        for i in range(3)
+    )
+    moved2 = moved.replace("0xeb536000", "0xe6000000").replace("0xeb537000", "0xe6001000").replace("0xeb5fa000", "0xe60c4000")
+    mb = census({**parse(moved, "b1"), **parse(moved2, "b2")})
+    ok("the same object at a different base shares no address", intersection(mb), {("0000:c4:00.0", "0x0015"): []})
+    ok("...but it does share offsets, which is the point", offsets(mb),
+       {("0000:c4:00.0", "0x0015"): [0x1000, 0xC4000]})
+    ok("...and two objects at different offsets share nothing by offset",
+       offsets(census({**parse(moved, "b1"), **parse(moved.replace("0xeb5fa000", "0xeb636000"), "b2")})),
+       {("0000:c4:00.0", "0x0015"): [0x1000]})
 
     # the second bug the review found: intersections must not pool devices
     npu = "Nov 14 20:00 host kernel: nvme 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0002 address=0xeb536000 flags=0x0000]\n"

@@ -1185,6 +1185,35 @@ So a PrismML ternary GGUF needs two steps before this one: PTQ1_0 to Q4_0
 tree. The 27B container on the dev box (`__metadata__.converter = qwen35_to_q4nx.py`) was made from
 an un-rotated Q4_0 GGUF.
 
+### An AWQ pack from AMD Quark
+
+`tools/safetensors_to_q4nx.py` rounds each 32-column group to nearest. AMD Quark's AWQ chooses per-channel
+scales from calibration data and folds them into the norms and the previous linear before it rounds. On
+Qwen3-1.7B on the NPU, an AWQ `int4_wo_32` pack beat the round-to-nearest pack on logit KLD against BF16, top-1
+agreement and a multiple-choice accuracy set, at the same speed (the same tiles and kernels). The measurements
+are in the lane brief (`QUARK-EVAL`). Building one is two steps:
+
+```
+# 1. Quark (0.13, its own environment: torch + amd-quark). CPU is fine; Qwen3-1.7B takes about 3 h.
+tools/quark_awq_parts.py <hf dir> parts.safetensors            # AWQ, int4_wo_32, 128 x 512 pileval
+# 2. numpy only: the same container writer as safetensors_to_q4nx, with Quark's own codes
+tools/quark_to_q4nx.py parts.safetensors <hf dir> <out dir>
+```
+
+- **Use a symmetric scheme (`int4_wo_32`, or `int4_wo_128`).** q4_1 stores each group's zero in bf16. For int4
+  that zero is `-8 s`, which bf16 holds exactly, so the pack decodes to Quark's weights. For asymmetric
+  `uint4_*` it is `-zp s`, which bf16 rounds. The rounding is a constant offset across each group, and AWQ's
+  scaled-up salient channels amplify it: on `down_proj` a float reader of the pack sees a large error. The NPU's
+  int8 requantization absorbs most of it, but a Q4NX file is not NPU-only, so `quark_to_q4nx.py` refuses uint4
+  unless `--allow-uint4` is given.
+- **`lm_head`** is excluded by Quark and gets the same round-to-nearest q4_1 as the baseline pack. Every other
+  tensor Quark changed (the AWQ-rescaled norms) is taken from the parts file.
+- **Why a driver and not `quark-cli torch-llm-ptq`:** Quark 0.13 has no qwen3 AWQ configuration (the driver
+  registers the qwen2 scaling groups for qwen3), and its CLI cannot quantize on CPU: the device-map check refuses
+  `--device cpu`, and `--multi_device` calibrates on meta tensors.
+- `ctest -R quark_to_q4nx` pins the exact int4 map, the uint4 refusal, and the refusals for a parts file with
+  no Quark linear or a weight off Quark's grid.
+
 ### Routed expert stacks
 
 A MoE GGUF keeps its routed experts as one three-dimensional tensor per projection

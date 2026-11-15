@@ -64,7 +64,13 @@ def verdict(rates, floor, subject=""):
     last = rates[-1]
     # A floor of 0 means "record, do not judge" -- useful while calibrating on a new box.
     if floor <= 0:
-        return 0, {"status": "recorded", "rate": last, "floor": floor, "subject": subject}
+        # A record-only run asserts NOTHING, so exit 0 would have ctest report PASS for a check that checked
+        # nothing -- the "a verdict that answers fine" defect this file exists to catch, in its own default
+        # (the device row's TOKEN_RATE_FLOOR defaults to 0). 77 is CTest's skip; the rate still lands in the
+        # message so a lane running it by hand gets the number and knows it judged nothing.
+        return SKIP, {"status": "recorded", "rate": last, "floor": floor, "subject": subject,
+                      "why": f"recorded {last:g} tokens/s and asserted nothing (floor {floor:g}); "
+                             f"pass --floor N to judge"}
     if last < floor:
         return 1, {"status": "below_floor", "rate": last, "floor": floor, "subject": subject,
                    "why": f"generated {last:g} tokens/s, floor is {floor:g} -- correct output, "
@@ -87,6 +93,9 @@ def self_test():
         # engine#2426's lesson applied to rates: a floor without its subject is a recollection, not evidence.
         ("the verdict carries its subject, so a pasted failure is checkable",
          "eval: 8.4 tokens per second\n", 20.0, 1),
+        # engine#2432 review: --floor 0 is "record only", so it must not read as a pass (77 = ctest SKIP).
+        ("floor 0 records and SKIPs -- a record-only run is not a pass",
+         "eval: 31.3 tokens per second\n", 0.0, SKIP),
     ]
     bad = 0
     SUBJECT = "selftest q4_k_m ctx2048"

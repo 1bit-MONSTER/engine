@@ -50,9 +50,17 @@ mkdir -p "$scratch/run"
 # under the 12 GB floor never reaches the zero-case path at all -- the arm then reported rc 124 instead of the verdict
 # it was written for. thermal-run is not on a CI runner either, so a real one would have been 127. The queue is not
 # what this test is about: HW_GATE_TOKEN=none says so, and the memory floor is 1 GB so it cannot wait.
+# The no-model memory pre-check refuses under a hardcoded 16 GiB MemAvailable (hw_gate_manifest.cmd_memcheck), and a CI
+# runner is routinely under it: e2e 43756744545 showed `ops FAIL 0s could not run: the memory pre-check refused it
+# (rc 76)` even with HW_GATE_MEM_FLOOR=1, because that variable is not what the pre-check reads. Supply the reading the
+# way the fleet already supplies it -- MEM_GUARD_MEMINFO, the same variable scripts/mem-guard.sh has honoured all
+# along -- instead of pretending the runner has memory.
+printf 'MemTotal: 67108864 kB\nMemAvailable: 50331648 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n' > "$scratch/meminfo"
+
 env HW_GATE_MODELS="$scratch" HW_GATE_TOKEN=none HW_GATE_PRIVATE=0 HW_GATE_COOL_C=1000 \
     HW_GATE_MEM_FLOOR=1 HW_GATE_MEM_RETRIES=0 HW_GATE_THERMAL="$scratch/thermal.sh" \
     HW_GATE_CODER_URL=http://127.0.0.1:9 HW_GATE_LOCK="$scratch/npu.lock" \
+    MEM_GUARD_MEMINFO="$scratch/meminfo" \
     HW_GATE_STORE="$scratch/run/store" HW_GATE_OUT="$scratch/run/out" GITHUB_STEP_SUMMARY= \
     timeout 90 "$root/scripts/hw-gate.sh" --phases ops --bin "$scratch/bin" > "$scratch/run/stdout" 2>&1
 rc=$?

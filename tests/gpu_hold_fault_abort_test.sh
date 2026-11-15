@@ -46,10 +46,12 @@ WRAP
 chmod +x "$scratch/wrapper.sh"
 
 run() {   # $1 arm  $2 payload seconds  $3 inject fault (1/0)  $4 GPU_HOLD_FAULT_ABORT, or "unset" to leave it out
+          # $5 the fault line to inject (default: the 11-13 gfxhub page fault)
     local q=$scratch/q$1; mkdir -p "$q"; : > "$scratch/klog$1"; rm -f "$scratch/deep.pid"
     printf '%s\n' "kernel: usb 1-1: new device" > "$scratch/klog$1"
+    local line=${5:-"kernel: amdgpu 0000:c5:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:9 pasid:26332)"}
     if [ "$3" = 1 ]; then
-        ( sleep 5; printf '%s\n' "kernel: amdgpu 0000:c5:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:9 pasid:26332)" >> "$scratch/klog$1" ) &
+        ( sleep 5; printf '%s\n' "$line" >> "$scratch/klog$1" ) &
     fi
     local t0; t0=$(date +%s)
     local abort_env=(GPU_HOLD_FAULT_ABORT="$4"); [ "$4" = unset ] && abort_env=()
@@ -96,6 +98,15 @@ take_run npu "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* command timeout: opcod
 take_run powercycle "kernel: amdxdna 0000:c6:00.1: [drm] power-cycle"
 [ "$trc" = 78 ] || { echo "FAIL take-time: an amdxdna power-cycle -> rc $trc, want 78"; fail=1; }
 
+# engine#2494 (cl-infra 11-15): the take-time pattern was a separate copy that lacked these two, so the ticket after a
+# fault-ended hold was GRANTED on the very log that had just ended it; only the MODE2 line further down the chain refused.
+take_run gfxhub "kernel: amdgpu 0000:c5:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:9 pasid:26332)"
+[ "$trc" = 78 ] || { echo "FAIL take-time: a gfxhub page fault -> rc $trc, want 78 (engine#2494)"; fail=1; }
+[ "$ttok" = released ] || { echo "FAIL take-time: the token was still held after a page-fault refusal"; fail=1; }
+
+take_run mesremove "kernel: amdgpu 0000:c5:00.0: amdgpu: MES failed to respond to msg=REMOVE_QUEUE"
+[ "$trc" = 78 ] || { echo "FAIL take-time: an MES REMOVE_QUEUE timeout -> rc $trc, want 78 (engine#2494)"; fail=1; }
+
 take_run clean clean
 [ "$trc" = 0 ] || { echo "FAIL take-time: a clean log -> rc $trc, want 0 (a healthy hold must still run)"; fail=1; }
 
@@ -125,5 +136,11 @@ run 4 600 1 unset
 if [ "$rc" != 78 ]; then echo "FAIL arm 4: rc $rc with GPU_HOLD_FAULT_ABORT unset, want 78 (the default must be on)"; fail=1; fi
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 
-[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on -> 78)"
+# arm 5: an amdxdna fault DURING the hold. #2498 added this spelling at take time only; with one shared pattern the
+# during-hold watch now reads it too (the NPU rule: on any amdxdna fault, stop).
+run 5 600 1 1 "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_error_worker: fault at 0x00000000"
+if [ "$rc" != 78 ]; then echo "FAIL arm 5: rc $rc after an amdxdna fault line, want 78"; fail=1; fi
+if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
+
+[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on -> 78; take-time page fault/MES -> 78; NPU fault in hold -> 78)"
 exit "$fail"

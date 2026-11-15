@@ -69,6 +69,15 @@ self_test() {
     local fail=0
     chk() { local label=$1 got=$2 want=$3; if [ "$got" = "$want" ]; then echo "ok   $label"; else echo "FAIL $label (got $got, want $want)"; fail=$((fail+1)); fi; }
     mkdir -p "${WR_TMPDIR:-$HOME/.cache}"; tmp=$(mktemp -d "${WR_TMPDIR:-$HOME/.cache}/window-run-test.XXXXXX"); trap 'rm -rf "$tmp"' RETURN
+    # 0. THE RESTART PROBE READS READINESS, NOT THE MODEL LIST. No device is touched here, so this arm reads the
+    # artifact the gate ships: /v1/models is a static registry listing that answers 200 while the weights load
+    # (app/serve.cpp:1909), so a window would self-report a live LLM that cannot answer yet (measured 2026-11-15:
+    # /v1/health went 503 -> 200 across a real restart while /v1/models was already 200).
+    local me; me=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${BASH_SOURCE[0]##*/}   # WR_SELF is exported later, not yet here
+    # The patterns carry cu[r]l rather than curl so that this arm's OWN text cannot satisfy them: a "/v1/health" count
+    # that includes the line asserting it is an arm that can pass for the wrong reason.
+    chk "the restart probe is /v1/health" "$(grep -c 'cu[r]l.*8090/v1/health' "$me")" 1
+    chk "  ... and never the static model list" "$(grep -c 'cu[r]l.*8090/v1/models' "$me")" 0
     # 1. a duration outside 1..15 is refused, with the reason
     out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 0 -l x -c true 2>&1); rc=$?
     chk "a zero-minute window is refused" "$rc" 2
@@ -251,7 +260,13 @@ restore() {
   if [ -e "$WR_STOPPED" ]; then
     systemctl --user start coder-llm 2>/dev/null
     for i in $(seq 1 40); do
-      code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/v1/models 2>/dev/null || true)
+      # /v1/health, NOT /v1/models: /v1/models is a static registry listing (app/serve.cpp:1909) that
+      # answers 200 from the moment the process binds, so it reports success while the weights are still
+      # loading and every PR-agent check is still failing. /v1/health is 503 until `ready` and 503 when a
+      # child is dead (app/serve.cpp:1892). Measured 2026-11-15: /v1/health went 503 -> 200 across a real
+      # restart while /v1/models was already 200. The engine's own child poll uses /health first for the
+      # same reason (app/serve.cpp:694).
+      code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/v1/health 2>/dev/null || true)
       [ "$code" = 200 ] && break; sleep 3
     done
     rc=$(final_rc "$code" "$rc")

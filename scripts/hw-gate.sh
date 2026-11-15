@@ -631,11 +631,19 @@ fi
 
 # ---- kat + needle + KLD: one step per model -----------------------------------------------
 if has kat || has needle || has kld; then
-  [ -f "$TEXT" ] || { has kld && { result kld FAIL 0 "text missing: $TEXT"; infra=1; }; }
+  # A corpus that is not on this runner says nothing about the PR (engine#2501). SKIP + a warning, not infra:
+  # `infra` reds the whole gate, which is right for "tried and could not" and wrong for "was never here".
+  [ -f "$TEXT" ] || { has kld && { result kld SKIP 0 "text missing: $TEXT (not provisioned)"; note "::warning::hw-gate: kld corpus not provisioned: $TEXT"; }; }
   while IFS='|' read -r name file repeat donee srvargs; do
     want_model "$name" || continue
     model=$MODELS/$file base=$STORE/kld/$name.kld
-    if [ ! -f "$model" ]; then result "model $name" FAIL 0 "model missing: $model"; infra=1; continue; fi
+    if [ ! -f "$model" ]; then
+      # Same rule as the corpus above (engine#2501): the GGUF is absent from THIS runner, which is not a
+      # finding about the PR. SKIP, warn, and let the rest of the gate speak.
+      result "model $name" SKIP 0 "model missing: $model (not provisioned)"
+      note "::warning::hw-gate: model not provisioned on this runner: $model"
+      continue
+    fi
     dokat=0; has kat && dokat=1
     needle=0; [ "$donee" = 1 ] && has needle && needle=1
     dokld=0; has kld && [ -f "$TEXT" ] && [ -z "$srvargs" ] && dokld=1

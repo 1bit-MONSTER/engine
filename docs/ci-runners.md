@@ -286,7 +286,8 @@ ticket, in on-demand windows, through `scripts/coder-llm-ticketed` (deployed to 
 3. **Inside the ticket it serves**, and ends the window when no slot in `/slots` has been processing **and** the demand
    file has not been touched for 5 minutes, or when the 25-minute max hold ends it.
 4. **It exits**, and the unit's `Restart=always` starts the next invocation, which waits for demand and queues again at
-   the back of the line. After a kernel fault (gpu-hold rc 78) it backs off 10 minutes first.
+   the back of the line. After a kernel fault (gpu-hold rc 78) it backs off 10 minutes first. It queues with a long
+   `gpu-hold -w` (24 h): a ticket that gave up would be replaced at the back, so a short wait on a busy box starves it.
 
 Anything else that needs the model asks the same way: touch `~/.cache/coder-llm/demand`, keep touching it while it
 works, and wait for `:8090` to answer a real completion. Until a window opens, the port refuses.

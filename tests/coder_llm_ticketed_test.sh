@@ -145,5 +145,9 @@ env "${envs[@]}" CODER_LLM_GH_POLL=1 CODER_LLM_GH_POLL_S=1 PATH="$scratch/ghbin:
 grep -q 'gh is not logged in' "$scratch/f.log" || { echo "FAIL F: no warning that gh is not logged in"; fail=1; }
 [ -e "$scratch/TOKEN" ] && { echo "FAIL F: a failing poll opened a window"; fail=1; }
 
-[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window)"
+# ---- G: the default queue wait keeps the ticket's place on a busy box (a give-up re-queues at the back) ------------
+sed -n 's/^QUEUE_WAIT=\${CODER_LLM_QUEUE_WAIT_S:-\([0-9]*\)}$/\1/p' "$tick" > "$scratch/qw"
+[ "$(cat "$scratch/qw")" -ge 14400 ] 2> /dev/null || { echo "FAIL G: default queue wait $(cat "$scratch/qw")s; under 4 h a busy queue makes it re-queue at the back and starve"; fail=1; }
+
+[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place)"
 exit "$fail"

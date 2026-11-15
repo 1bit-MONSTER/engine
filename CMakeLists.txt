@@ -326,6 +326,11 @@ add_test(NAME token_rate_floor_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tool
 # prerequisite when it cannot: a device row that passes for want of a model would be the failure this tool catches.
 add_test(NAME token_rate_floor_device COMMAND ${CMAKE_SOURCE_DIR}/tools/ci/token_rate_floor_device.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(token_rate_floor_device PROPERTIES SKIP_RETURN_CODE 77)
+# The check for 2026-11-15's 22 h NPU orphan: `setsid CMD &` makes $! the setsid pid, so every `kill "$pid"`
+# misses the server and it survives with PPID 1 holding the device. Scans scripts/ and tools/ (fails) and,
+# with --include-bin, ~/bin (warns) -- which is where the orphan lived and where no check had ever looked.
+add_test(NAME server_launch_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/server_launch_check.py --root ${CMAKE_SOURCE_DIR})
+add_test(NAME server_launch_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/server_launch_check.py --self-test)
 # scripts/lemonade-hrx: the PPA lemond's HRX recipe runs our llama-server (docs/lemonade.md): no GPU.
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)

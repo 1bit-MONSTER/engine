@@ -75,15 +75,24 @@ self_test() {
     chk "and no log at all says so too" "$(printf '%s' "$out" | grep -c 'no .*UNCHECKED\|UNCHECKED')" 1
     chk "  ... while a fresh window still plans normally" "$(printf '%s' "$out" | grep -c 'would take gpu-hold')" 1
 
+    # 6. --wait holds the lane instead of refusing, and it refuses to *shorten* the rule: a window 5 min
+    #    inside the gap still has ~40 min to go, which the message must say. (The loop itself is not
+    #    exercised here - an arm that slept 40 minutes is not a self-test.)
+    printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '40 minutes ago' +%FT%TZ)" > "$tmp/w.log"
+    out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true 2>&1)
+    chk "5 min inside the gap: a plain run still refuses" "$(printf '%s' "$out" | grep -c 'not yet')" 1
+    chk "  ... and names -w as the way to wait" "$(printf '%s' "$out" | grep -c '\-w waits for it')" 1
+
     printf '\n%s self-test: %s\n' "$SELF" "$([ "$fail" = 0 ] && echo ok || echo "$fail failure(s)")"
     return "$([ "$fail" = 0 ] && echo 0 || echo 1)"
 }
 [ "${1:-}" = --self-test ] && { self_test; exit $?; }
 
-LABEL=""; ISSUE=""; MINS=15; CMD=""; NOW=${NOW:-0}; DRY=0
+LABEL=""; ISSUE=""; MINS=15; CMD=""; NOW=${NOW:-0}; DRY=0; WAIT=0
 while [ $# -gt 0 ]; do case "$1" in
   -n|--now) NOW=1; shift;;
   --dry-run) DRY=1; shift;;
+  -w|--wait) WAIT=1; shift;;
   -l) LABEL=${2:-}; shift 2;;
   -i) ISSUE=${2:-}; shift 2;;
   -m) MINS=${2:-}; shift 2;;
@@ -101,7 +110,19 @@ if [ -f "$LOG" ]; then
     end_s=$(date -u -d "$last_end" +%s 2>/dev/null || echo 0)
     now_s=$(date -u +%s)
     gap=$(( now_s - end_s ))
-    [ "$end_s" -gt 0 ] && [ "$gap" -lt 2700 ] && die "not yet: the last window ended $last_end ($(( gap / 60 )) min ago of 45 needed)"
+    if [ "$end_s" -gt 0 ] && [ "$gap" -lt 2700 ]; then
+      left=$(( (2700 - gap + 59) / 60 ))
+      if [ "$WAIT" = 1 ] && [ "$DRY" != 1 ]; then
+        # --wait: hold the lane here instead of making it come back. The rule is unchanged - this only
+        # stops *running*, it never shortens the 45 minutes - and it is the same service gpu-hold does
+        # for a ticket, which is why a lane that waits out a window by hand is doing the queue's job.
+        printf '%s: waiting %s min for the 45-minute gap (last window ended %s)\n' "$SELF" "$left" "$last_end" >&2
+        while [ "$gap" -lt 2700 ]; do sleep 30; gap=$(( $(date -u +%s) - end_s )); done
+        printf '%s: the gap is open after waiting %s min\n' "$SELF" "$left" >&2
+      else
+        die "not yet: the last window ended $last_end ($(( gap / 60 )) min ago of 45 needed; -w waits for it)"
+      fi
+    fi
     # Honesty about what this check actually covered: on 2026-11-15 twenty lane scripts in ~/lb were
     # found to stop and start coder-llm WITHOUT writing this file, so the gap above is only as good as
     # the runs that log. A stale (or empty) log is not evidence that no window happened.

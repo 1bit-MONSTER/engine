@@ -62,6 +62,7 @@ mkdir -p "$LOGS"
 . "$(cd "$(dirname "$0")" && pwd)/pack-elf.sh"
 # shellcheck source=scripts/pack-check.sh
 . "$(cd "$(dirname "$0")" && pwd)/pack-check.sh"   # build_path_strings, runtime_selfcontained
+. "$(cd "$(dirname "$0")" && pwd)/pin-names.sh"    # pin_tracked_names, pin_private_sources (engine#2469)
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 trap 'say "FAILED at line $LINENO: $BASH_COMMAND (logs: $LOGS)"' ERR
 # Heavy steps wait for room, and stop before the box runs out of memory (unified memory: GPU
@@ -363,13 +364,12 @@ package_checks() {  # package_checks <linux tarball>
         done
         if [ $bad = 0 ]; then echo "ok   GGUF-on-NPU helpers packed (3 files): the three public scripts"; fi
     fi
-    names=$(for pin in npu-runtime gpu-kernels npu-kernels; do
-                [ -d "$W/$pin" ] || continue
-                git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null
-            done | xargs -r -n1 basename | grep -v -x -E 'README.md|NOTICE|LICENSE' | LC_ALL=C sort -u)
+    names=$(pin_tracked_names "$W" "$SRC" npu-runtime gpu-kernels npu-kernels)
     n=$(find "$t" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | tee >(cat >&2) | wc -l)
     [ "$n" = 0 ] || { echo "FAIL files named like the private sources in the tarball"; bad=1; }
-    [ $bad = 0 ] && echo "ok   no private source in $(basename "$1")"
+    # an empty list is "nothing to compare against" (no private pin checked out under $W), not a passed search
+    if [ -z "$names" ]; then echo "skip no private source names to compare $(basename "$1") against (no private pin under $W)"
+    elif [ $bad = 0 ]; then echo "ok   no private source in $(basename "$1")"; fi
     # The NPU kernels, when the package carries them (WEEKLY_NPU_KERNELS): every kernel file is
     # sealed (never a plaintext ELF), no ELF in the tarball is for anything but the host (an NPU
     # kernel would be), the shipped 1bit has no symbol table, and its strings name no private
@@ -443,13 +443,12 @@ package_checks() {  # package_checks <linux tarball>
         local b1=0
         n=$(nm --defined-only "$f" 2>/dev/null | wc -l)
         [ "$n" = 0 ] || { echo "FAIL the packed 1bit still has a symbol table ($n symbols)"; b1=1; }
-        privsrc=$(for pin in npu-runtime npu-kernels; do
-                      [ -d "$W/$pin" ] || continue
-                      git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null
-                  done | grep -E '\.(c|cc|cpp|cxx|h|hpp|py)$' | xargs -r -n1 basename | LC_ALL=C sort -u)
+        privsrc=$(pin_private_sources "$W" "$SRC" npu-runtime npu-kernels)
         n=0; [ -z "$privsrc" ] || n=$(strings -a "$f" | grep -c -F -f <(printf '%s\n' "$privsrc") || true)
         [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a private source file ($n strings)"; b1=1; }
-        if [ $b1 = 0 ]; then echo "ok   the packed 1bit: no symbol table, no private source names"; else bad=1; fi
+        if [ $b1 != 0 ]; then bad=1
+        elif [ -z "$privsrc" ]; then echo "ok   the packed 1bit: no symbol table; skip the private-name search (no private source file in the pins)"
+        else echo "ok   the packed 1bit: no symbol table, no private source names"; fi
     fi
     for f in LICENSE NOTICE LICENSE-BINARY NOTICE-BINARY; do
         n=$(find "$t" -maxdepth 2 -type f -name "$f" | wc -l)

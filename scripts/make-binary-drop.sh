@@ -50,6 +50,7 @@ usage() {
 die() { echo "$me: $*" >&2; exit 1; }
 # shellcheck source=scripts/pack-elf.sh
 . "$(cd "$(dirname "$0")" && pwd)/pack-elf.sh"
+. "$(cd "$(dirname "$0")" && pwd)/pin-names.sh"   # pin_require_names (engine#2469)
 
 src=${1:-}; out=${2:-}
 [ -n "$src" ] && [ -n "$out" ] || usage; shift 2
@@ -180,9 +181,7 @@ n=$(find "$stage" -type f \( -name '*.hip' -o -name '*.c' -o -name '*.cc' -o -na
 
 # nothing named like the private sources: the pins' require= names, plus every tracked file name
 # when a private checkout happens to be at hand (the same rule weekly.sh applies)
-names=$(for pin in npu-runtime gpu-kernels; do
-            sed -n 's/^require=//p' "$src/config/$pin.config" | tr ' ' '\n'
-        done | grep -v '^$' | xargs -r -n1 basename | LC_ALL=C sort -u)
+names=$(pin_require_names "$src" npu-runtime gpu-kernels)
 n=$(find "$stage" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | wc -l)
 [ "$n" = 0 ] || fail "$n files named like the private sources"
 

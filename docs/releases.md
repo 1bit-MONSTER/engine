@@ -388,7 +388,11 @@ on the NPU.
 `scripts/weekly.sh` packs them by default (`WEEKLY_NPU_KERNELS=0` builds without): the sealed
 kernel sets go beside `1bit` in `npu/kernels`, the build loads sealed kernels only
 (`ONEBIT_NPU_RELEASE`), the `lemond-onebit` launcher sets `ONEBIT_KCRYPT_REQUIRE_SEALED=1`, and the package checks refuse a plaintext kernel,
-an ELF for anything but the host, a symbol table in `1bit`, or a private source name in it. The
+an ELF for anything but the host, a symbol table in `1bit`, or a private source name in it. The names
+those last checks compare against come from the private pins checked out under the work directory
+(`scripts/pin-names.sh`); when there is nothing to compare against, because no pin is checked out or the pins
+track no source file, the check prints `skip`, not `ok`, so an empty list never reads as a passed search
+(engine#2469). The
 release machine holds the kernel key in `ONEBIT_NPU_KEY_DIR` (default `~/.config/1bit-npu-key`).
 
 Sealing is confidentiality; each set is signed too (#574). Before a set is packed it gets

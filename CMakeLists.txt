@@ -1870,6 +1870,7 @@ add_test(NAME npu_window11_policy COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/npu-w
 # 0755 (was executable) or 0644 (was not), no file or directory is group/other-writable, and the reporter that catches a
 # staging line added below the normalisation still fires on a tree nobody normalised.  Fixture tree: no build, no tar.
 add_test(NAME pack_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_modes_test.sh)
+add_test(NAME pin_names COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pin_names_test.sh)
 # patch-sfs must not destroy the artifact it was asked to replace (#1491: two pre-pack refusals did `rm -f "$out"` before the
 # output had been reassigned to its .partial name, so a failed cut deleted the previous good SFS). Skips without root, since
 # patch-sfs needs uid/gid and setuid bits - this is the only test here that does, hence the property.

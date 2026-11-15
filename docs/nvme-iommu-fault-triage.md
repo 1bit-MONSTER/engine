@@ -59,16 +59,25 @@ software IO TLB: mapped [mem 0x5927e000-0x5d27e000] (64MB)
 
 ## Test 1 — disable the HMB (no reboot, decides whether the buffer is the HMB at all)
 
-**`nvme-cli` is not installed on this host** (checked: `command -v nvme` → nothing), so the first command below is
-`apt install nvme-cli` on this box, not `nvme …`. Whoever takes this on should expect that step and not treat
-"command not found" as the test failing:
+**No `nvme-cli` needed, and none is installed here** (`command -v nvme` → nothing). The kernel exposes the same switch
+in sysfs, so this is one write and no package. Measured on this host:
 
 ```bash
-sudo apt install nvme-cli                      # not present as of 11-15 08:1xZ
-nvme get-feature /dev/nvme0 -f 0x0d -H          # Host Memory Buffer: current preference
-nvme set-feature /dev/nvme0 -f 0x0d -v 0        # ask for no HMB
-journalctl -k -f | grep -c IO_PAGE_FAULT        # watch one burst interval (~2-5 min under load)
+$ cat /sys/class/nvme/nvme0/hmb
+1                       # HMB is on; 0 means off
+$ ls -l /sys/class/nvme/nvme0/hmb
+-rw-r--r-- 1 root root 4096 …   # readable as a user, writable only by root
 ```
+
+```bash
+echo 0 | sudo tee /sys/class/nvme/nvme0/hmb   # ask the controller for no HMB
+cat /sys/class/nvme/nvme0/hmb                 # must read 0 before you trust the test
+journalctl -k -f | grep -c IO_PAGE_FAULT      # watch one burst interval (~2-5 min under load)
+echo 1 | sudo tee /sys/class/nvme/nvme0/hmb   # put it back
+```
+
+If a firmware refuses the sysfs write, the `nvme-cli` equivalent is `nvme set-feature /dev/nvme0 -f 0x0d -v 0`
+(feature `0x0d`, Host Memory Buffer).
 
 **Prediction:** the `c4:00.0` stream stops within one burst interval.
 **If it stops** the faulting region is the HMB, and the remaining question is only why its mapping goes stale.
@@ -99,8 +108,10 @@ teardown/re-establish ordering bug on the NVMe side, and the next step is tracin
 ## Two traps this runbook exists to stop
 
 * **A count without a device split is not a measurement.** `distinct` exposes the mixing.
-* **A command is not a fact until you check the box has it.** This page's first draft opened with `nvme get-feature`,
-  and `nvme-cli` is not installed on the very host it is written for -- found by applying this page's own rule to itself.
+* **A command is not a fact until you check the box has it, and the interface is often better than the tool.**
+  This page's first draft opened with `nvme get-feature`; `nvme-cli` is not installed here, and the switch it fronts is
+  a root-writable sysfs file — so the test became one write instead of an apt step. Found by applying the page's rule
+  to the page.
 * **A flag is not a fact until you check the binary that parses it.** The first `strings` attempt here ran against the
   *compressed* `vmlinuz` and returned 0 for every pattern, including ones that exist — which would have "proved" the
   parameter absent. Decompress first (`extract-vmlinux`), then count.

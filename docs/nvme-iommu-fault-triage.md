@@ -136,12 +136,17 @@ Two things to be careful about, both learned the hard way here:
 Four failures in one afternoon on this row, and every one was method rather than kernel. The pattern that catches all
 four costs about ten lines:
 
+All of this needs root on the tracing filesystem; run the block under `sudo -s`.
+
 ```bash
 # 1. the probe exists and fires -- verify with a known-hot symbol the first time you use a new tracefs
-echo "p:hot ksys_write" > /sys/kernel/tracing/kprobe_events
+echo "p:hot ksys_write" >> /sys/kernel/tracing/kprobe_events
 echo 1 > /sys/kernel/tracing/events/kprobes/hot/enable; sleep 3
 grep -c 'hot:' /sys/kernel/tracing/trace     # must be > 0 before you trust any other probe
-echo > /sys/kernel/tracing/kprobe_events     # cleaning up removes the DEFINITION, not just the enable
+# remove THIS probe only: disable it, then delete it by name. `echo > kprobe_events` would truncate the file and
+# remove every lane's probe definitions on a shared box -- and a still-enabled probe cannot be removed at all.
+echo 0 > /sys/kernel/tracing/events/kprobes/hot/enable
+echo '-:hot' >> /sys/kernel/tracing/kprobe_events
 
 # 2. pre-flight INSIDE the long run: abort instead of sleeping on a dead instrument
 echo 1 > /sys/kernel/tracing/events/kprobes/unm/enable; sleep 5
@@ -152,7 +157,10 @@ H=$(grep -c 'unm:' /sys/kernel/tracing/trace)
 sudo cp /sys/kernel/tracing/trace ./cap.txt && sudo chmod 644 ./cap.txt
 
 # 4. read it back before analysing: an unreadable file greps as "no events"
-grep -c 'unm:' ./cap.txt || echo "GREP FAILED - check permissions, not the data"
+#    `grep -c` exits 1 on ZERO MATCHES and 2 on an error, so `|| echo FAILED` reports a legitimate empty capture as a
+#    permissions problem -- the exact confusion this section exists to prevent. Separate the count from the error.
+n=$(grep -c 'unm:' ./cap.txt); rc=$?; [ "$rc" -le 1 ] || echo "GREP FAILED (rc $rc): check permissions, not the data"
+echo "events: $n"      # zero is a result; rc 2 is a broken read
 ```
 
 The four ways this went wrong here, in the order they happened:
@@ -163,6 +171,8 @@ The four ways this went wrong here, in the order they happened:
 | probing `iommu_unmap` because that is the name you remember | 0 hits in 5 s on a box doing heavy I/O | a wrong conclusion about which path unmaps take |
 | enabling a probe whose definition a previous cleanup had removed | silence, reported as "no events" | a 20-minute capture measured nothing |
 | `sudo cp` output, then `grep 2>/dev/null` | silence, reported as "no events" | the data was in the file; only the read failed |
+| `grep -c ... || echo FAILED` on a legitimately empty file | "FAILED", though the read was fine | a real zero called a permissions problem |
+| `echo > kprobe_events` to clean up | every lane's probe definitions gone (and a still-enabled probe cannot be removed) | other people's instruments, silently |
 
 Every one of them produces the same symptom — **an empty result** — which is indistinguishable from the finding you
 might legitimately be looking for. That is why the pre-flight is not optional: it is the only thing that separates

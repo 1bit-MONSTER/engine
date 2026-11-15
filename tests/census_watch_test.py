@@ -40,6 +40,7 @@ import contextlib
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import census_watch as cw  # noqa: E402
+import census  # noqa: E402  (coverage(): the committed summary is derived, so it can be re-derived)
 
 ARCHS = {
     "Qwen3ForCausalLM": {"gguf": "qwen3", "backends": ["hrx"]},
@@ -1112,6 +1113,15 @@ check(f"flm answers: no answer is for a family the registry serves on the NPU ro
 _undocumented = [a for a in list(_arch_answers) + list(_committed.get("repos") or {}) if f"`{a}`" not in _npu_md]
 check(f"flm answers: every answered architecture has a row in docs/npu.md (missing: {_undocumented})",
       not _undocumented)
+
+# The summary is derived from the raw block, so the only proof it is right is re-deriving it. A stale or
+# hand-edited count reads as coverage we do not have: main shipped `declined_models: 430` over raw data
+# that computes to 434 (engine#2533 fixed that file; this is the arm that would have caught it).
+_census = json.load(open(os.path.join(ROOT, "registry", "census.json")))
+_derived = census.coverage(_census["raw"])
+_drift = {k: (v, _census["coverage"].get(k)) for k, v in _derived.items()
+          if (round(v, 2) if isinstance(v, float) else v) != _census["coverage"].get(k)}
+check(f"census: the committed summary is what its own raw block implies (drift: {_drift})", not _drift)
 
 # 21b. engine#2171: a pin that names its `paths` moves only when a commit touches one of them.
 # vllm-project/semantic-router lands dozens of router-side commits a day; the d3 contract it is pinned for

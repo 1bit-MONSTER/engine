@@ -478,7 +478,7 @@ private:
     int impad_ = 0;       // c_.IM on the container's K grid
     // engine#2536: outlier-channel split for the int8 ffn_down GEMM (NPU_ACT_OUTLIER_TAU, act_outliers.h). Columns of
     // the layer's down_proj are decoded one 256-wide block at a time and cached per (layer, channel).
-    float outl_tau_ = 0.0f;    // set in init_impl: 40 unless NPU_ACT_OUTLIER_TAU says otherwise
+    float outl_tau_ = 0.0f;    // set in init_impl: 20 unless NPU_ACT_OUTLIER_TAU says otherwise
     int outl_kmax_ = 16;
     bool outl_busy_ = false;
     bool outl_gather_ok_ = true;

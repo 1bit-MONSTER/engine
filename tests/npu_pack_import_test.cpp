@@ -715,7 +715,17 @@ void test_external_import_success(const std::string& root) {
         std::memcpy(&final_norm[size_t(i) * 4], &v, 4);
     }
     const uint64_t fn_off = uint64_t(embed.size()) + uint64_t(blob.size());
-    put_file((dir / "eager-mm.onnx.data").string(), embed + blob + final_norm);
+    // engine#2571: a cos_cache with 48 frequency columns for head_dim 128 -- a pack that rotates 96 of 128 dims
+    // (Phi-4-mini's partial_rotary_factor 0.75) and states it nowhere else. Built at theta 10000 so the theta check passes.
+    const int CC_ROWS = 64, CC_HALF = 48;
+    std::string cos_cache(size_t(CC_ROWS) * CC_HALF * 4, '\0');
+    for (int pp = 0; pp < CC_ROWS; ++pp)
+        for (int i = 0; i < CC_HALF; ++i) {
+            const float v = float(std::cos(double(pp) / std::pow(10000.0, 2.0 * double(i) / double(2 * CC_HALF))));
+            std::memcpy(&cos_cache[(size_t(pp) * CC_HALF + i) * 4], &v, 4);
+        }
+    const uint64_t cc_off = fn_off + uint64_t(final_norm.size());
+    put_file((dir / "eager-mm.onnx.data").string(), embed + blob + final_norm + cos_cache);
     put_file((dir / "eager-mm.onnx").string(),
              pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "eager-mm.onnx.data", 0, uint64_t(embed.size())),
                         pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
@@ -723,7 +733,8 @@ void test_external_import_success(const std::string& root) {
                         pb::tensor("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", {int64_t(blob.size())},
                                    "eager-mm.onnx.data", uint64_t(embed.size()), uint64_t(blob.size())),
                         pb::tensor("model.layers.1.final_norm_layernorm.weight", {H}, "eager-mm.onnx.data", fn_off,
-                                   uint64_t(final_norm.size()))},
+                                   uint64_t(final_norm.size())),
+                        pb::tensor("cos_cache", {CC_ROWS, CC_HALF}, "eager-mm.onnx.data", cc_off, uint64_t(cos_cache.size()))},
                        {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
                                                 "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
                                         K, N, 4, 128, "MatMulNBitsBf")}));
@@ -793,6 +804,10 @@ void test_external_import_success(const std::string& root) {
 
         // config.json: the geometry, and q4nx_weight_layout ONLY for a non-default layout (engine#1840 / #1793).
         const json cfg = json_of(out / "config.json");
+        // engine#2571: the rotary span comes from the cache's shape when the pack states it nowhere else.
+        check(std::fabs(cfg.value("partial_rotary_factor", 0.0) - 0.75) < 1e-9,
+              tag + "config.json carries partial_rotary_factor 0.75 from the 48-column cos_cache (head_dim 128)");
+        check(cfg.value("rope_theta", 0.0) == 10000.0, tag + "and the cache still verifies rope_theta 10000");
         check(cfg.value("num_attention_heads", 0) == NH && cfg.value("num_key_value_heads", 0) == NKV &&
                   cfg.value("head_dim", 0) == HD && cfg.value("hidden_size", 0) == H,
               tag + "config.json carries the pack's geometry");

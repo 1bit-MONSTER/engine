@@ -16,7 +16,7 @@ limitations under the License.
 -->
 # Before you ask for a merge
 
-Ten commands, all host-side, none needing a device or a build. Every one of them answers a question that
+Eleven commands, all host-side, none needing a device or a build. Every one of them answers a question that
 `mergeable=true`, a green CI tick and a careful read of your own diff do not.
 
 Run them from the repository root on the branch you are about to hand over.
@@ -33,6 +33,7 @@ below says why. The table's order is the runner's order: cheapest and most commo
 | `python3 tools/ci/ci_targets_check.py --check` | a CI row names a target or path that does not exist |
 | `python3 tools/ci/tmp_path_check.py --check` | a new `/tmp` or `/dev/shm` path, where builds and dumps belong under `~/wt` or `~/.cache/scratch-*` |
 | `python3 tools/ci/submodule_pin_check.py --check` | a submodule's checkout is not the commit the tree pins |
+| `python3 tools/ci/cmake_configure_check.py --check` | `CMakeLists.txt` no longer configures -- CI's Configure step would fail, and no text check can see a line that starts correctly and ends wrong |
 | `python3 tools/ci/registration_loss_check.py --check --base origin/main` | your branch would drop rows `main` has |
 | `python3 tools/ci/registry_loss_check.py --base origin/main` | a reviewed class, a `coverage` counter or a test's mention of a class that the base has is gone at the merge, not only at the endpoint (engine#2385, #2391) |
 | `python3 tools/ci/branch_stale_check.py --base origin/main` | the merge with the base conflicts, or would not keep a base change the branch never touched; a branch that is only behind gets a note (the merge keeps the base's copy, but the branch's tests ran on the older one) (engine#2398, #2410) |

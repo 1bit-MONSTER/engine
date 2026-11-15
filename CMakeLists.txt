@@ -479,6 +479,9 @@ add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_ben
 # tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.
 add_python_test(tests_referenced ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(tests_referenced_self ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --self-test)
+# engine#2445: the tree must CONFIGURE, not just parse as text -- a rebase resolution left one line ending
+# `…_test.py)ms)` and every text check stayed green while CI's Configure step failed in 63 s.
+add_python_test(cmake_configure_check_self ${CMAKE_SOURCE_DIR}/tools/ci/cmake_configure_check.py --self-test)
 # engine#1901: five tools ship a --self-test that no runner named, so the arms existed, were maintained beside the logic they
 # check, and never executed. All five run device-free and fast (58-277 ms measured), so they are rows rather than allow-list
 # excuses, and tools/ci/tests_referenced_check.py now counts tools/**/*.py that declare one and are named by no RUNNER

@@ -89,6 +89,10 @@ self_test() {
     chk "a TERM'd runner exits 143" "$rrc" 143
     kill -0 "$(cat "$tmp/fake.pid" 2>/dev/null)" 2>/dev/null; chk "  ... and its queued job is gone" "$?" 1
     chk "  ... and nothing is logged" "$(wc -l < "$tmp/q.log")" 0
+    # 3e. coder-llm not back after the restart fails the run (69) unless the job already failed
+    chk "--final-rc 200 0 -> 0" "$("$0" --final-rc 200 0)" 0
+    chk "--final-rc 000 0 -> 69 (coder-llm did not come back)" "$("$0" --final-rc 000 0)" 69
+    chk "--final-rc 503 3 -> 3 (the job's own failure is kept)" "$("$0" --final-rc 503 3)" 3
     # 4. an old enough end opens the gate again (the refusal above is about the gap, not about the file)
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/w.log"
     out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true 2>&1); rc=$?
@@ -121,6 +125,10 @@ self_test() {
 }
 [ "${1:-}" = --self-test ] && { self_test; exit $?; }
 
+# The run's final status once coder-llm was restarted: the job's rc when :8090 answers 200, else 69 (EX_UNAVAILABLE) for
+# a job that itself succeeded. A window that leaves the fleet LLM down is a failed window, not a WARNING line.
+final_rc() { if [ "$1" = 200 ] || [ "$2" != 0 ]; then echo "$2"; else echo 69; fi; }
+if [ "${1:-}" = "--final-rc" ]; then final_rc "${2:-}" "${3:-0}"; exit 0; fi
 # --gap-ok: rc 0 when the 45-minute gap is open now, rc 1 (with the reason) when it is not. The ticket's child runs it
 # right before it stops coder-llm, so a window another lane ran while this one queued still counts.
 if [ "${1:-}" = "--gap-ok" ]; then
@@ -221,9 +229,11 @@ restore() {
       code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/v1/models 2>/dev/null || true)
       [ "$code" = 200 ] && break; sleep 3
     done
-    printf '%s end   lane=%s issue=%s label=%s coder-llm=%s :8090=%s rc=%s\n' "$(date -u +%FT%TZ)" \
-      "$WR_LANE" "$ISSUE" "$LABEL" "$(systemctl --user is-active coder-llm)" "$code" "$rc" >> "$LOG"
-    [ "$code" = 200 ] || printf '%s: WARNING coder-llm restarted but :8090 answers %s\n' "$SELF" "$code" >&2
+    rc=$(final_rc "$code" "$rc")
+    printf '%s end   lane=%s issue=%s label=%s coder-llm=%s :8090=%s rc=%s%s\n' "$(date -u +%FT%TZ)" \
+      "$WR_LANE" "$ISSUE" "$LABEL" "$(systemctl --user is-active coder-llm)" "$code" "$rc" \
+      "$([ "$code" = 200 ] || echo ' restart=FAILED')" >> "$LOG"
+    [ "$code" = 200 ] || printf '%s: ERROR coder-llm was restarted but :8090 answers %s: exit %s\n' "$SELF" "$code" "$rc" >&2
   else
     printf '%s end   lane=%s issue=%s label=%s coder-llm=was-not-running :8090=n/a rc=%s\n' "$(date -u +%FT%TZ)" \
       "$WR_LANE" "$ISSUE" "$LABEL" "$rc" >> "$LOG"

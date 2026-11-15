@@ -43,7 +43,10 @@ BUILD_DIR = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "build")
 
 # The shapes a route script binds a loopback port in: the freeport helper, the :0 bind it makes,
 # and the fixed 43xxx literals print_backend/lemonade_hrx/template_pin start their servers on.
-BIND_RE = re.compile(r'freeport|free_port|bind\(\s*\("127\.0\.0\.1",\s*0\)\s*\)|--port\s+43\d{3}\b')
+# engine#2482: a C++ route test binds through httplib, not a shell helper. These three spellings are the
+# ones tests/http_guard_test.cpp uses, and each alone is enough to mean "this source starts a server".
+BIND_RE = re.compile(r'freeport|free_port|bind\(\s*\("127\.0\.0\.1",\s*0\)\s*\)|--port\s+43\d{3}\b'
+                     r'|httplib::Server|bind_to_any_port|listen_after_bind')
 
 
 def configured_tests(ctest, build_dir):
@@ -53,11 +56,20 @@ def configured_tests(ctest, build_dir):
 
 
 def route_script(test):
-    """The tests/*.sh a configured test runs, or None for a test that is not a script."""
+    """The tests/*.sh or tests/*.cpp a configured test runs, or None for a test that is neither.
+
+    A C++ test's COMMAND names the BUILD TREE executable, not a source file, so the source is found by
+    basename: `http_guard_test` -> tests/http_guard_test.cpp. That is the only link ctest gives us, and
+    it is the convention the CMake target names already follow (engine#2482: the one C++ route test was
+    invisible here, so its missing `route_ports` lock went unreported)."""
     for arg in test.get("command", []):
-        if isinstance(arg, str) and arg.endswith(".sh") \
-                and os.path.dirname(os.path.abspath(arg)) == TESTS_DIR:
+        if not isinstance(arg, str):
+            continue
+        if arg.endswith(".sh") and os.path.dirname(os.path.abspath(arg)) == TESTS_DIR:
             return arg
+        candidate = os.path.join(TESTS_DIR, os.path.basename(arg) + ".cpp")
+        if os.path.isfile(candidate):
+            return candidate
     return None
 
 
@@ -95,6 +107,9 @@ class RoutePortLockTest(unittest.TestCase):
         # their port before launching.
         for name in ("pm_route", "print_backend", "smoke_serve"):
             self.assertIn(name, found, f"{name} starts a server; the census must find it")
+        # engine#2482: the one C++ route test. It binds through httplib, and this arm is what makes a
+        # broken .cpp scan a failure rather than a vacuous pass -- the same reason the three above exist.
+        self.assertIn("http_guard", found, "http_guard starts a loopback server; the census must find it")
         # 5 in a build with no model passed; a model-enabled build configures more (hybrid_e2e,
         # laya_route_e2e, laya_models_e2e, pm_laya_route, hrx_cpu_weight_parity and serve_e2e_<dev>), so the floor is
         # the number the CI build has, not the number a developer's build may have. It counted 15 before engine #1485

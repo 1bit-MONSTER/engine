@@ -2403,11 +2403,11 @@ int serve_child(const Options& given) {
     // engine#2537: free_port() releases the port before the backend binds it, and a backend takes a moment before it
     // binds (a model load; tests/fake_backend.py sleeps 0.5 s), so under load another process can be handed the same
     // port in between. The backend then dies with EADDRINUSE; this records that, so serve names it and relaunches the
-    // backend on a fresh port instead of reporting "did not become ready".
-    std::atomic<bool> backend_port_taken{false};
-    auto backend_line = [&metrics, &placement_worst, &wedged_mu, &wedged, &backend_port_taken](const std::string& line) {
+    // backend on a fresh port instead of reporting "did not become ready". One flag per backend: a single shared one said that
+    // *some* backend printed EADDRINUSE, so a second backend's taken port could relaunch a first one that failed otherwise.
+    std::vector<std::unique_ptr<std::atomic<bool>>> port_taken;
+    auto backend_line = [&metrics, &placement_worst, &wedged_mu, &wedged](const std::string& line) {
         metrics.backend_line(line);
-        if (port_in_use_line(line)) backend_port_taken = true;
         if (device_lost_line(line)) {
             std::lock_guard<std::mutex> lock(wedged_mu);
             if (wedged.empty()) wedged = "the backend lost its GPU: " + line.substr(0, 200);
@@ -2769,9 +2769,20 @@ int serve_child(const Options& given) {
     ::sigaction(SIGTERM, &sa, nullptr);
     ::sigaction(SIGINT, &sa, nullptr);
 #endif
-    for (const auto& b : laya ? std::vector<Launch>{} : backends) {
-        std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line, b.env_override));
+    for (size_t k = 0; k < backends.size(); ++k) port_taken.push_back(std::make_unique<std::atomic<bool>>(false));
+    // backend i's line callback: the shared one, plus backend i's own port-taken flag (engine#2537)
+    auto line_for = [&backend_line, &port_taken](size_t i) {
+        return [&backend_line, flag = port_taken[i].get()](const std::string& l) {
+            backend_line(l);
+            if (port_in_use_line(l)) *flag = true;
+        };
+    };
+    if (!laya) {
+        for (size_t k = 0; k < backends.size(); ++k) {
+            const auto& b = backends[k];
+            std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
+            children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, line_for(k), b.env_override));
+        }
     }
     for (const auto& b : rag) {
         if (b.port == 0) continue;   // in-process: the encoder is this process (app/embed_serve.h)
@@ -2785,7 +2796,7 @@ int serve_child(const Options& given) {
         // cause is retried: any other failure to start still fails serve, below.
         for (int retry = 1; !laya && i < backends.size() && retry <= kPortTakenRetries; ++retry) {
             if (children[i]->wait_ready(std::chrono::seconds(600), g_stop) || g_stop) break;
-            if (children[i]->alive() || !backend_port_taken) break;
+            if (children[i]->alive() || !*port_taken[i]) break;
             const int taken = backends[i].port;
             backends[i].port = free_port();
             set_port_arg(backends[i].argv, backends[i].port);
@@ -2794,13 +2805,13 @@ int serve_child(const Options& given) {
                          i, taken, backends[i].port, retry, kPortTakenRetries);
             // cleared only here, before the relaunch: a backend can print its EADDRINUSE while serve is still waiting on an
             // earlier backend, and clearing the flag before this backend's wait would drop that line
-            backend_port_taken = false;
+            *port_taken[i] = false;
             children[i] = std::make_unique<Child>(backends[i].argv, backends[i].env, backends[i].port, backends[i].ready_path,
-                                                  backend_line, backends[i].env_override);
+                                                  line_for(i), backends[i].env_override);
         }
         if (!children[i]->wait_ready(std::chrono::seconds(600), g_stop)) {
             if (g_stop) return 0;
-            if (backend_port_taken && !children[i]->alive()) {
+            if (!laya && i < port_taken.size() && *port_taken[i] && !children[i]->alive()) {
                 std::fprintf(stderr, "1bit serve: backend %zu could not bind port %d: address already in use, after %d relaunches "
                                      "on fresh ports; giving up\n", i, children[i]->port(), kPortTakenRetries);
                 return 1;

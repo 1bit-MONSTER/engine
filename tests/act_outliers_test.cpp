@@ -45,6 +45,9 @@ static int failures = 0;
     } while (0)
 
 using onebit::npu::ActOutlier;
+using onebit::npu::act_outlier_kmax_from;
+using onebit::npu::act_outlier_pick;
+using onebit::npu::act_outlier_tau_from;
 
 // The per-row int8 GEMM the i8 path computes: one scale amax/127 per row, codes in [-127, 127], f32 weights.
 static void gemm_i8_row(const std::vector<float>& x, const std::vector<float>& W, int K, int N, std::vector<float>& y) {
@@ -232,7 +235,28 @@ static void test_fused_gate_up() {
     CHECK(guard == split, "fused: an offset at N writes nothing");
 }
 
+// engine#2585 review: the default is asserted, not only stated. Unset -> 20 (a 30*rms channel is split, which 40 would
+// leave in int8), "0" -> off, explicit values pass through; kmax unset -> 16, below 1 -> 1.
+static void test_defaults() {
+    CHECK(act_outlier_tau_from(nullptr) == 20.0f, "tau default %g, want 20", act_outlier_tau_from(nullptr));
+    CHECK(act_outlier_tau_from("0") == 0.0f, "tau \"0\" gives %g, want 0 (off)", act_outlier_tau_from("0"));
+    CHECK(act_outlier_tau_from("40") == 40.0f, "tau \"40\" gives %g", act_outlier_tau_from("40"));
+    CHECK(act_outlier_kmax_from(nullptr) == 16, "kmax default %d, want 16", act_outlier_kmax_from(nullptr));
+    CHECK(act_outlier_kmax_from("0") == 1, "kmax \"0\" gives %d, want 1", act_outlier_kmax_from("0"));
+    CHECK(act_outlier_kmax_from("4") == 4, "kmax \"4\" gives %d", act_outlier_kmax_from("4"));
+    // One row of 4096 ones with one channel at 30 * rms: the default picks it, tau 40 does not.
+    const int w = 4096;
+    std::vector<float> a((size_t)w, 1.0f);
+    a[100] = 30.0f * 1.06f;  // rms of the row is ~1.06 with this channel in it, so x/rms is just under 30
+    std::vector<ActOutlier> p20, p40;
+    act_outlier_pick(a.data(), 1, w, w, act_outlier_tau_from(nullptr), act_outlier_kmax_from(nullptr), p20);
+    act_outlier_pick(a.data(), 1, w, w, 40.0f, 16, p40);
+    CHECK(p20.size() == 1 && p20[0].ch == 100, "default tau picked %zu channels, want channel 100", p20.size());
+    CHECK(p40.empty(), "tau 40 picked %zu channels, want none", p40.size());
+}
+
 int main() {
+    test_defaults();
     test_pick();
     test_arithmetic();
     test_gather();

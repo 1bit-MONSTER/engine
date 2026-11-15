@@ -589,7 +589,10 @@ if has ops; then
     # pass". That is a *filter* problem, not a kernel result - and it must never read as a pass either.
     # Report it as SKIP with the selection that produced it, so neither an empty run nor a broken filter
     # can be mistaken for a measured one.
+    # An input that was not tested is not a pass (engine#2522 set the same flag for absent inputs): the
+    # zero-cases guard refused to report a PASS, so neither may the gate.
     result ops SKIP $(( $(date +%s) - t0 )) "no case matched -b HRX0 -o \"$OPS\": the zero-cases guard refused to report a pass (fork engine#657) - fix the filter or the build"
+    infra=1
   else
     unknown=$(printf '%s\n' "$fails" | grep -v -F "$FLAKY_CASES" | grep -c . || true)
     st=FAIL detail="${passed:-rc=$rc}: $(printf '%s' "$fails" | head -n 3 | tr '\n' ' ')"
@@ -805,11 +808,13 @@ total=$(( $(date +%s) - START ))
 # command line has to appear as a row (PASS, FAIL, SKIP, or a `model …` row), or the gate says so by name.
 for _ph in $(printf '%s' "$PHASES" | tr ',' ' '); do
   case "$_ph" in ''|*' '*) continue ;; esac
-  # The per-model phases report their missing/throttled models as a `model <name>` row, so that row satisfies the
-  # request for any of them; only a phase that produced NO row at all is a slip.
+  # The per-model phases (kat/kld/needle) report their missing/throttled models as a `model <name>` row, so that row
+  # satisfies the request for any of them; only a phase that produced NO row at all is a slip. `placement` is NOT one
+  # of those: it writes `placement <name>` rows, so it matches on its own name only.
   case "$_ph" in
-    placement|kat|kld|needle) _phre="^($_ph|model )" ;;
-    *)                        _phre="^$_ph" ;;
+    kat|kld|needle) _phre="^($_ph|model )" ;;
+    placement)      _phre="^placement" ;;
+    *)              _phre="^$_ph" ;;
   esac
   grep -qE "$_phre" "$RESULTS" 2>/dev/null ||
     printf '%s\tFAIL\t0\trequested but produced no result row: --phases %s ran nothing for it\n' "$_ph" "$_ph" >> "$RESULTS"

@@ -304,6 +304,21 @@ the model ticketed, a memory window no longer needs to stop it: it is not reside
 Stopping it would only drop its queued ticket. That happened on 2026-11-15 at 10:00Z, when a window stopped the
 just-switched unit and its place in the queue was lost.
 
+**Read the window's end line before believing a restart failed.** `scripts/window-run.sh` ends every window with one
+`end` line in `~/briefs/WINDOWS.log`, and the state it names decides whether anything is wrong. Four tokens, four
+meanings — only the last is a fault:
+
+| the line says | what was true when the window ended | what to do |
+|---|---|---|
+| `restart=queued(WAITING for a GPU ticket when this window ended, not restored)` | `coder-llm` is ticketed and waiting behind other tickets: `systemctl start` means *queued*, so `:8090` is silent **by design** | nothing; it answers when its ticket is granted |
+| `restart=deferred(gpu held by <label> (pid N))` | another lane held the GPU token, so the unit could not load: the window started it and did **not** wait on `:8090` | nothing; it comes up when that ticket is released |
+| `asleep-no-demand` | the unit is `active` and its journal says it is waiting for demand (ticketed units sleep between requests) | nothing; a request wakes it |
+| `restart=FAILED` | `:8090` did not answer a 1-token completion and none of the above held | investigate: it was restarted and did not come back |
+
+A silent `:8090` is therefore **not** evidence of a failed restart on its own — three of these four states are silent on
+purpose, and a window that reports them as failures is how lanes learn to ignore failures (#2496, #2547, #2566).
+`--restart-rc` encodes the same table, and its self-test asserts each row.
+
 `scripts/install-coder-llm-ticketed.sh` does the switch:
 
 - with no argument, or `--diff`, it prints the drop-in change;

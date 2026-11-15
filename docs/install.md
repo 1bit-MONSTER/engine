@@ -87,8 +87,8 @@ appliance is blank ([os-v3.md](os-v3.md)).
 
 ## 1. Run from the stick (no install)
 
-1. Put the stick in the machine. On the Bosgame BeyondMax use the **front USB-A** port
-   ([7](#7-the-bosgame-beyondmax-has-one-usable-usb-port)).
+1. Put the stick in the machine. On the Bosgame BeyondMax, boot from the **front USB-A** port
+   ([7](#7-the-bosgame-beyondmax-usb-ports)).
 2. Boot it. The default entry, `1bit OS (headless console, 7.4.0-rc1-1bit)`, comes up headless:
    a console with no X, whose first screen prints the box's address and how to connect to it (web UI,
    API, `ssh`), above a menu whose item 1 turns the Lemonade API key on (the shipped default is no key)
@@ -266,18 +266,19 @@ mokutil --sb-state          # SecureBoot enabled
 mokutil --list-enrolled | grep -i "1bit\|strixhalo"
 ```
 
-## 7. The Bosgame BeyondMax has one usable USB port
+## 7. The Bosgame BeyondMax USB ports
 
-On the Bosgame BeyondMax (`AXB35-02`) **only the front USB-A port works under Linux**: a drive plugged into
-the front or rear Type-C, or a rear USB-A port, produces no kernel event at all — the xHCI port registers
-stay in RxDetect, and three of the four controllers have taken no interrupt. The same ports work in Windows
-on the same box, so it is a firmware/EC gap, not a driver in this image
-([#823](https://github.com/1bit-MONSTER/engine/issues/823)). Boot from the front USB-A port.
+On the Bosgame BeyondMax (`AXB35-02`), three of the four xHCI controllers autosuspend to `D3cold` under Linux. A drive plugged
+into the front or rear Type-C port, or into a rear USB-A port, then produces no kernel event at all, while the same ports work in
+Windows ([#823](https://github.com/1bit-MONSTER/engine/issues/823)). The image ships a udev rule,
+`91-1bit-xhci-keepawake.rules`, that keeps the four controllers awake. With them kept awake, **every external port enumerated** in
+a plug test on hardware on 2026-11-14 (BIOS 1.10, on a host with the rule installed).
 
-That is measured on **BIOS 1.09 and, since the owner's reflash, on 1.10** (11/04/2026): the newer firmware
-does not change the picture — three of the four controllers still autosuspend to `D3cold` — so the front
-port is still the one to use. The capture, the per-controller states and the keepawake rule that follows
-from them are in [axb35-usb-ports.md](axb35-usb-ports.md).
+Boot the stick from the **front USB-A** port all the same. It is the one port that works before the rule applies, and the same
+plug test has not yet been run on a 1bit OS boot, where the rule comes from the image. USB4/Thunderbolt devices are untested. The
+per-port results, the controller states and a read-only check (`tools/xhci_keepawake_check.sh`) are in
+[axb35-usb-ports.md](axb35-usb-ports.md). The same fix for another Linux install on this board is in
+[Bosgame M5 USB-C not working on Linux: the fix](https://1bit.gg/blog-bosgame-m5-usb-c-linux-fix.html).
 
 ## What was verified for this page
 

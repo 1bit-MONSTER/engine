@@ -44,7 +44,8 @@ them `zamba`, `zamba2`, `blackmamba`; `qwen4exp` is back since pin `e57beb97`) a
 The `zinc` column (ZINC's `parseArchitecture`; 63 HF architectures on 2026-10-03) left with ZINC in
 the core strip (2026-10-04).
 
-On 2026-10-04 (core strip): 290 HF architectures mapped, hrx 290, npu 7. The file
+At the current pins (llama.cpp `8c12dfa6`, 2026-11-15): 350 HF architectures mapped, hrx 350, npu 9, and 171 GGUF
+architectures in `gguf_architectures.hrx`. On 2026-10-04 (core strip): 290 HF architectures mapped, hrx 290, npu 7. The file
 also lists `gguf_architectures.hrx`, every GGUF architecture the pinned fork's runtime builds (141
 then): CMakeLists.txt compiles that list into `1bit serve`, which refuses any other architecture on
 hrx and cpu with a pointer to Lemonade's llamacpp backend. Mapped means a backend's code accepts the architecture; the census below reports how many were checked. `registry/architectures.json` always holds the current counts and the pins they come from: every pin bump regenerates it (`scripts/registry-regen.sh`, run by the bump workflows), and CI's `registry_pins` test fails a pin that moved without it.

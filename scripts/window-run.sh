@@ -68,6 +68,11 @@ die() { printf '%s: %s\n' "$SELF" "$*" >&2; exit 2; }
 self_test() {
     local fail=0
     chk() { local label=$1 got=$2 want=$3; if [ "$got" = "$want" ]; then echo "ok   $label"; else echo "FAIL $label (got $got, want $want)"; fail=$((fail+1)); fi; }
+    # A SELF-TEST MUST NOT POLL FOR REAL: these arms assert the verdict, not the wait. Every arm that reaches
+    # restore() would otherwise poll :8090 -- 200 on a working box (instant break), refused in CI (the full bound).
+    # That ambient difference is exactly how engine#2566's build died at ctest's 600 s: same arms, 3 s x 100 each.
+    export WR_POLL_MAX=3 WR_POLL_S=0.05
+    # arm 3l gets its own queue: a LIVE coder-llm ticket left in the shared $tmp/q is inherited by later arms.
     mkdir -p "${WR_TMPDIR:-$HOME/.cache}"; tmp=$(mktemp -d "${WR_TMPDIR:-$HOME/.cache}/window-run-test.XXXXXX"); trap 'rm -rf "$tmp"' RETURN
     # 0. THE RESTART PROBE ASKS FOR A COMPLETION. No device is touched here, so this arm reads the artifact the
     # gate ships. /v1/models is a static registry listing that answers 200 while the weights load (app/serve.cpp
@@ -204,11 +209,22 @@ JLOG
     # 3l. BOTH conditions true: another lane holds the token AND a live coder-llm ticket is queued.
     # The deferred branch is checked before the poll, so the more specific state must win -- a `queued` here
     # would claim the LLM is waiting for a ticket when it is in fact waiting behind a token in someone's hand.
-    : > "$tmp/t.log"; printf 'gpu-hold cl-other 999999\n' > "$tmp/token"; printf 'label=coder-llm\npid=%s\n' "$$" > "$tmp/q/0179.coder-llm"
-    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/token GPU_QUEUE_DIR=$tmp/q \
+    mkdir -p "$tmp/q3l"          # own queue: a LIVE ticket left in $tmp/q is inherited by later arms
+    : > "$tmp/t.log"; printf 'gpu-hold cl-other 999999\n' > "$tmp/token"; printf 'label=coder-llm\npid=%s\n' "$$" > "$tmp/q3l/0179.coder-llm"
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/token GPU_QUEUE_DIR=$tmp/q3l \
       WR_HEALTH_URL=http://127.0.0.1:9/x WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
     chk "a held token wins over a queued entry (deferred, not queued)" "$(grep -c 'restart=deferred' "$tmp/t.log")" 1
     chk "  ... and it is not reported as queued" "$(grep -c 'restart=queued' "$tmp/t.log")" 0
+    # 3m. NO llama-server on the box (the CI condition): the freeze detector must fire instead of burning the whole
+    # bound. With the old `-n "$_cpu"` guard an empty reading never counted as no-progress, so the loop ran
+    # WR_POLL_MAX x WR_POLL_S whatever happened -- 300 s per arm; ctest's 600 s limit is how #2566 found it.
+    mkdir -p "$tmp/nops" "$tmp/q3m"; printf '#!/bin/bash\nexit 1\n' > "$tmp/nops/ps"; chmod +x "$tmp/nops/ps"
+    : > "$tmp/tr.log"
+    PATH=$tmp/nops:$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token \
+      GPU_QUEUE_DIR=$tmp/q3m WR_HEALTH_URL=http://127.0.0.1:9/x WR_POLL_MAX=100 WR_POLL_S=0.01 \
+      WR_POLL_TRACE=$tmp/tr.log WINDOWS_LOG=$tmp/t3m.log "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "no llama-server: the freeze detector fires (froze reaches 10)" "$(grep -c 'froze=10' "$tmp/tr.log")" 1
+    chk "  ... after 10 polls, not the whole WR_POLL_MAX" "$(grep -c '^poll ' "$tmp/tr.log")" 10
     chk "the poll reads the largest child's CPU, not the idle embed child" "$(grep -c 'sort -k2 -n | tai[l] -1' "$me")" 1
     # 4. an old enough end opens the gate again (the refusal above is about the gap, not about the file)
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/w.log"
@@ -446,8 +462,13 @@ restore() {
                  "${WR_HEALTH_URL:-http://127.0.0.1:8090/v1/chat/completions}" 2>/dev/null || true)
       [ "$code" = 200 ] && break
       _cpu=$(cpu_of)
-      if [ -n "$_cpu" ] && [ "$_cpu" = "$prev" ]; then froze=$((froze + 1)); else froze=0; fi
+      # NO PROCESS IS NO PROGRESS. An empty reading used to skip this check (`-n "$_cpu"`), so with no
+      # llama-server on the box -- CI, or a restart whose child never appeared -- the detector could never fire and
+      # the loop always burned its whole bound (WR_POLL_MAX 100 x WR_POLL_S 3 s = 300 s per arm; ctest's 600 s limit
+      # is how engine#2566's build found this). Nothing running for ~30 s after a restart is a wedge, not a load.
+      if [ "$_cpu" = "$prev" ]; then froze=$((froze + 1)); else froze=0; fi
       prev=$_cpu
+      [ -n "${WR_POLL_TRACE:-}" ] && printf 'poll i=%s froze=%s cpu=%s\n' "$i" "$froze" "${_cpu:-none}" >> "$WR_POLL_TRACE"
       [ "$froze" -ge 10 ] && break      # ~30 s without CPU progress: a wedge, not a load
       sleep "$_poll_s"
     done

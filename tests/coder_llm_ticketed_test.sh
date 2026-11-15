@@ -28,8 +28,9 @@
 #   D a gfxhub page fault in the kernel log during the window ends it (rc 78) and the server dies with it;
 #   E a lane that queues during a window gets the GPU before the next coder-llm window (FIFO; the restart re-queues).
 set -u
-tick=${1:-./scripts/coder-llm-ticketed}
-hold=${2:-./scripts/gpu-hold}
+root=$(cd "$(dirname "$0")/.." && pwd)   # the defaults work from any directory, not only the repo root
+tick=${1:-$root/scripts/coder-llm-ticketed}
+hold=${2:-$root/scripts/gpu-hold}
 for f in "$tick" "$hold"; do [ -x "$f" ] || { echo "not executable: $f"; exit 2; }; done
 tick=$(readlink -f "$tick"); hold=$(readlink -f "$hold")
 

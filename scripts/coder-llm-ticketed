@@ -34,6 +34,11 @@
 # Anything else that needs the model asks for it the same way the workflow does: touch "$CODER_LLM_DEMAND" (and
 # keep touching it while working), then wait for :8090 to answer.
 #
+# The contract this changes: `systemctl --user start coder-llm` now means QUEUED, not ":8090 answers". A window
+# wrapper that restarts the unit from inside its own gpu-hold ticket and then polls :8090 is polling a server that is
+# queued behind that very ticket; it answers only after the caller's ticket is released. The journal line
+# "queued behind <holder>" says which state it is in.
+#
 # Environment (all optional):
 #   CODER_LLM_DEMAND            demand file, default ~/.cache/coder-llm/demand
 #   CODER_LLM_DEMAND_TTL_MIN    a touch this recent is demand, default 30 (CODER_LLM_DEMAND_TTL_S in seconds wins)
@@ -139,7 +144,8 @@ if [ "${CODER_LLM_ALWAYS:-0}" != 1 ]; then
         sleep "$POLL"
     done
 fi
-log "demand: queueing for the GPU (gpu-hold -l coder-llm -t $MAX_HOLD -w $QUEUE_WAIT)"
+holder=$(head -c 120 "${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}" 2> /dev/null | head -1)
+log "demand: queueing for the GPU (gpu-hold -l coder-llm -t $MAX_HOLD -w $QUEUE_WAIT)${holder:+; queued behind $holder}"
 "$GPU_HOLD" -t "$MAX_HOLD" -l coder-llm -w "$QUEUE_WAIT" -- "$0" --window "$@"
 rc=$?
 case "$rc" in

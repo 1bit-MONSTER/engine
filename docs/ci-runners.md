@@ -288,7 +288,19 @@ ticket, in on-demand windows, through `scripts/coder-llm-ticketed` (deployed to 
 Anything else that needs the model asks the same way: touch `~/.cache/coder-llm/demand`, keep touching it while it
 works, and wait for `:8090` to answer a real completion. Until a window opens, the port refuses.
 
-The unit's drop-in runs the same server command as before, behind the wrapper:
+**The contract this changes: `systemctl --user start coder-llm` now means *queued*, not ":8090 answers".** A window
+wrapper that restarts the unit from inside its own gpu-hold ticket and then polls `:8090` is polling a server that is queued
+behind that very ticket. The server can answer only after the caller's ticket is released, so such a poll must not count a
+silent `:8090` as "the fleet LLM did not come back". The unit's journal says `queued behind <holder>` when it queues. With
+the model ticketed, a memory window no longer needs to stop it: it is not resident outside its own windows.
+
+`scripts/install-coder-llm-ticketed.sh` does the switch:
+
+- with no argument, or `--diff`, it prints the drop-in change;
+- `--status` says whether the wrapper is installed and the running unit executes it (exit 0 only when both are true);
+- `--install` backs the drop-in up as `<name>.bak-<YYYYMMDD>`, rewrites it, installs the wrapper, reloads and restarts.
+
+The server command stays byte for byte; the wrapper goes in front of it:
 
 ```ini
 [Service]

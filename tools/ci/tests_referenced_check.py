@@ -145,8 +145,14 @@ def referenced(root, need):
     """{name: [files]}, ignoring a file mentioning its own basename."""
     found = {name: [] for name in need}
     for path, text in scan_files(root):
+        # engine#2456 (cl-flm's arm, PR #2458): the TEST half had the same loophole as the tool half -- a CMake comment naming a
+        # `tests/*.sh` counted as a runner, so the gate that asks "does anything run this test" was satisfied by prose describing it.
+        # Comment lines are dropped rather than requiring a full invocation shape: a workflow `run:` line, a Makefile line and a
+        # ctest row all count legitimately, and only the comment form is the defect. A markdown heading also starts with `#` and loses
+        # nothing: a script named in a doc's body text is still found, which is what `unregistered_py_tests` relies on.
+        haystack = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
         for name in need:
-            if name not in text:
+            if name not in haystack:
                 continue
             if path.name == name:
                 continue  # a test naming itself is not a runner
@@ -388,6 +394,12 @@ def self_test():
                    "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n",
                    "scripts/helper.sh": "#!/bin/sh\ncase \"${1:-}\" in --self-test) exit 0;; esac\n"})
     cases.append(("...and a python3 line in a registered test does", check(r), 0, None))
+
+    # 0f. cl-flm's case in PR #2458: a CMake COMMENT naming a tests/*.sh satisfied the test-registration half
+    r = root_with({"CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n# see tests/described.sh for the arm\n",
+                   "tests/ok.sh": "#!/bin/sh\n", "tests/described.sh": "#!/bin/sh\n"})
+    cases.append(("a tests/*.sh named only in a CMake comment is drift", check(r), 1, "described.sh"))
+    cases_root["a tests/*.sh named only in a CMake comment is drift"] = r
 
     # 1. a test nobody mentions -> drift, and it is NAMED
     r = root_with({"tests/lonely.sh": "#!/bin/sh\n", "CMakeLists.txt": "# nothing here\n"})

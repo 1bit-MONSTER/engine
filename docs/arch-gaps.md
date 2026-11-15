@@ -1224,3 +1224,21 @@ The one `!! UNCOVERED` line of the 2026-11-14 watcher run. Read from the repo's 
   not alerted (`"watch": "report"`), so the daily watcher prints `. REVIEWED` instead of `!! UNCOVERED` and
   does not exit 1 on it. If a backend starts accepting the class, record why as `mapped_ok` in
   `registry/significant.json` rather than deleting this entry.
+
+### Reviewed 2026-11-15 (engine#2528): two remote-code classes, not aliases
+
+Both were reported `REMOTE-CODE` by the daily watcher — under `REMOTE_CODE_SPREAD`, so listed and not
+alerted — and are now recorded so the report stops re-reporting them as new. `model_type` values read from
+each repo's own `config.json`, not inferred from the class name.
+
+* **Class / model_type**: `MegatronGPTMoeForCausalLM` / `megatron_gpt_moe`, `library_name: transformers`,
+  `auto_map` to `modeling_megatron_gpt_moe.py` (e.g. `nagohachi/tiny-lm-v3-japanese-1.5b-a500m-base` and
+  `-sft`). **Not an alias of anything mapped**: 16 experts with top-3 routing, a shared expert, GQA 16/8 at
+  head_dim 64 and tied embeddings — the expert layout is defined by the checkpoint's own code, and nothing at
+  the pin registers `megatron_gpt_moe`. Not servable as-is.
+* **Class / model_type**: `RusMindAIForCausalLM` / `rusmind_ai`, `auto_map` to `modeling_rusmind_ai.py`
+  (`DICPlay/RusMind-Zernyshko-2.0.1`). **Not an alias in the registry**, but the shape is a plain Llama-3
+  stack — silu, RMSNorm, default rotary, GQA 16/4 at head_dim 64, tied embeddings, no attention or MLP bias —
+  so the honest reading is *unmapped pending a conversion with a llama alias*, not declined. Anyone wanting to
+  serve it should run that conversion first; recording it as declined would be true of the registry and wrong
+  about the model.

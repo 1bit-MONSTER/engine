@@ -2364,6 +2364,19 @@ if(ONEBIT_NPU)
     add_test(NAME npu_dmabuf_import COMMAND npu_dmabuf_import_test "")
     set_tests_properties(npu_dmabuf_import PROPERTIES SKIP_RETURN_CODE 77)
 
+    # The w4g32 prefill kernel (q4nx_w4g32.h, NPU_W4_PREFILL), bit-exact on the device against the CPU reference over a
+    # seed set and the edge set (|P| at the int16 bound, |C| at the int32 bound MAGMAX picks).  W4G32_GATE="<elf> M K N"
+    # names the ELF; unset it SKIPS (77).  It submits to the NPU: run it inside an npu-hold ticket.
+    add_executable(npu_w4g32_gate_test tests/npu_w4g32_gate_test.cpp)
+    target_include_directories(npu_w4g32_gate_test PRIVATE ${CMAKE_SOURCE_DIR}/npu/forward/include)
+    target_link_libraries(npu_w4g32_gate_test PRIVATE onebit_npu_lane)
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(npu_w4g32_gate_test PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    add_test(NAME npu_w4g32_gate COMMAND npu_w4g32_gate_test)
+    set_tests_properties(npu_w4g32_gate PROPERTIES SKIP_RETURN_CODE 77)
+
     # The model-generic forward (npu/forward): the GGUF-on-NPU serve route
     # (docs/npu.md, "Open"). q4nx_forward.cpp + its Q4NX dequant/pack/semantics
     # + model loader, against the engine tree's I8Ctx header.

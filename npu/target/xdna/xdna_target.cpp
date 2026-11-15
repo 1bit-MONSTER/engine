@@ -108,6 +108,38 @@ bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string&
         err = "open_prefill: no design set (" + std::to_string(n) + " designs)";
         return false;
     }
+    // NPU_W4_PREFILL=1: the large-M int4-weight prefill tier (q4nx_w4g32.h).  Each int8 prefill role is opened on
+    // "<its ELF stem>_w4g32_m<M>.elf" instead, from the same directory, when EVERY such role has one at the same M (all
+    // roles or none: max_rows() is the chunk width, and a mixed set would launch some roles past their buffers).  A
+    // missing file is logged and the set stays int8 -- an optional speed-up never stops a model loading.  Not for the
+    // pb16i/t2s/b8 layouts, whose images are not the int8 path's float B.
+    w4_rows_ = 0;
+    std::vector<std::string> w4_elf((size_t)n);
+    if (const char* w4 = std::getenv("NPU_W4_PREFILL"); w4 && std::atoi(w4) != 0 && !host_gemm) {
+        std::string why;
+        int rows = 0;
+        if (b8 || pb16i_) why = "the container's weight layout is not row-major int8";
+        for (int i = 0; why.empty() && i < n; i++) {
+            if (role_is_pb16i_split(i)) continue;
+            std::string stem(designs[i].elf_name);
+            if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, ".elf") == 0) stem.resize(stem.size() - 4);
+            int got = 0;
+            for (int m : {512, 256, 128}) {
+                const std::string f = dir + "/" + stem + "_w4g32_m" + std::to_string(m) + ".elf";
+                if (elf_present(f)) { got = m; w4_elf[(size_t)i] = f; break; }
+            }
+            if (!got) why = "no " + stem + "_w4g32_m<512|256|128>.elf in " + dir;
+            else if (rows && got != rows) why = "the roles' w4g32 kernels disagree on M (" + std::to_string(rows) + " vs " +
+                                                std::to_string(got) + ")";
+            rows = got;
+        }
+        if (why.empty() && rows > 0) {
+            w4_rows_ = rows;
+            std::fprintf(stderr, "  [forward] w4g32 prefill tier: every prefill role at M=%d (NPU_W4_PREFILL)\n", rows);
+        } else {
+            std::fprintf(stderr, "  [forward] w4g32 prefill tier NOT adopted (%s); prefill stays int8\n", why.c_str());
+        }
+    }
     for (int i = 0; i < n; i++) {
         const Q4nxDesignGeom* g = &designs[i];
         // The two full-attention-QKV-split designs exist only as pb16i kernels (the role has no int8
@@ -115,7 +147,7 @@ bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string&
         // is built from the _pb16i ELF by the caller's twin pass.
         adopt_geometry(i, *g);
         if (role_is_pb16i_split(i)) continue;
-        const std::string elf = dir + "/" + g->elf_name;
+        const std::string elf = w4_rows_ ? w4_elf[(size_t)i] : dir + "/" + g->elf_name;
         if (host_gemm) {
             // Offline mode: host GEMMs are plain float matmuls over the decoded weights, so no ELF is
             // opened and none is required.  A model whose kernel set is not built yet can still be
@@ -163,16 +195,18 @@ bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string&
             err = "cannot create a context for role " + std::to_string(i);
             return false;
         }
-        ctx->MD = g->M; ctx->KD = g->K; ctx->ND = g->N;
+        const int md = w4_rows_ ? w4_rows_ : g->M;
+        ctx->MD = md; ctx->KD = g->K; ctx->ND = g->N;
         ctx->blocked_b = b8;
-        if (!ctx->init_elf(*dev_, elf.c_str(), g->M, g->K, g->N, 1)) {
+        ctx->w4g32 = w4_rows_ > 0;
+        if (!ctx->init_elf(*dev_, elf.c_str(), md, g->K, g->N, 1)) {
             // engine#2434: carry the runtime's reason, so a refused context ("code 102 ... No such device") reaches
             // open_with_retry's queue test and the lock-holder note instead of reading as a generic init failure.
             err = "I8Ctx init_elf failed for " + elf + (ctx->init_error.empty() ? "" : ": " + ctx->init_error);
             return false;
         }
         std::fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s\n", q4nx_design_log_tag(g->role),
-                     g->M, g->K, g->N, elf.c_str());
+                     md, g->K, g->N, elf.c_str());
     }
     return true;
 }
@@ -208,7 +242,8 @@ bool XdnaTarget::open(const onebit::npu::plan::Plan& plan, const std::string& ke
         if (ctx_[i] && ctx_[i]->MD > adopted_prefill) adopted_prefill = ctx_[i]->MD;
         if (ctx16_[i] && ctx16_[i]->MD > adopted_decode) adopted_decode = ctx16_[i]->MD;
     }
-    if (plan_.prefill_m > 0 && adopted_prefill > 0 && plan_.prefill_m != adopted_prefill)
+    // The w4g32 tier is a runtime choice (NPU_W4_PREFILL) over the plan's int8 set, at its own M: not a disagreement.
+    if (plan_.prefill_m > 0 && adopted_prefill > 0 && plan_.prefill_m != adopted_prefill && adopted_prefill != w4_rows_)
         { err = "plan: prefill M=" + std::to_string(plan_.prefill_m) + " but the adopted kernels run M=" +
                 std::to_string(adopted_prefill); return false; }
     if (plan_.decode_enabled && plan_.decode_m > 0 && adopted_decode > 0 &&
@@ -283,6 +318,30 @@ void XdnaTarget::set_pb16i(bool on, std::string dir, std::string sealed) {
 bool XdnaTarget::weight_cached(int layer, int key) const {
     return weight_cache_ && layer >= 0 && layer < (int)wcache_.size() &&
            wcache_[(size_t)layer].find(key) != wcache_[(size_t)layer].end();
+}
+
+bool XdnaTarget::fill_int8_and_w4(PackedWeight& pw, I8Ctx& kctx, int role, const float* Bmat, int K, int N,
+                                  std::string& err) {
+    const bool in_range = role >= 0 && role < Q4NX_MAX_DESIGNS;
+    I8Ctx* c8 = !kctx.w4g32 ? &kctx : (in_range && ctx16_[role] ? ctx16_[role].get() : nullptr);
+    I8Ctx* c4 = kctx.w4g32 ? &kctx
+                           : (w4_rows_ > 0 && in_range && ctx_[role] && ctx_[role]->w4g32 ? ctx_[role].get() : nullptr);
+    float sout = 1.0f;
+    if (c8) {
+        pw.bo = c8->make_weight_bo(*dev_);
+        c8->packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+    }
+    if (c4) {
+        pw.bo4 = c4->make_weight_bo(*dev_);
+        c4->packB_into(*pw.bo4, Bmat, K, N, sout, pw.scales4);
+    }
+    if (!c8 && !c4) { err = "weight cache: no context to pack this weight for"; return false; }
+    return true;
+}
+
+xrt::bo* XdnaTarget::slot_bo(PackedWeight& pw, const I8Ctx& kctx) { return kctx.w4g32 ? pw.bo4.get() : pw.bo.get(); }
+const std::vector<float>* XdnaTarget::slot_scales(const PackedWeight& pw, const I8Ctx& kctx) {
+    return kctx.w4g32 ? &pw.scales4 : &pw.scales;
 }
 
 int XdnaTarget::max_rows() const {
@@ -1071,8 +1130,8 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
             // `prefill` row would hide.  It must be zero for a warm process.
             q4nx_lh::LhScope _tlh_pk(LH_PACK_UPLOAD);
             PackedWeight pw;
-            pw.bo = kctx.make_weight_bo(*dev_);
             if (kctx.gemv) {
+                pw.bo = kctx.make_weight_bo(*dev_);
                 // The gemv family dequantises from the container's own tiles: upload them unchanged.
                 if (!ar.tiles) { err = "gemv: the model has no tile stream for this container"; return; }
                 std::vector<uint8_t> blob;
@@ -1080,15 +1139,15 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
                 if (!kctx.upload_tiles_into(*pw.bo, blob.data(), blob.size())) {
                     err = "gemv: tile upload failed"; return;
                 }
-            } else {
-                float sout = 1.0f;
-                kctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            } else if (!fill_int8_and_w4(pw, kctx, ar.role, Bmat, K, N, err)) {
+                return;
             }
             fill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
             it = m.emplace(wkey, std::move(pw)).first;
         }
         slot = &it->second;
-        gs = &slot->scales;
+        if (!slot_bo(*slot, kctx)) { err = "weight cache: the filled slot has no image for this context's layout"; return; }
+        gs = slot_scales(*slot, kctx);
     } else if (kctx.gemv) {
         err = "gemv: this family needs the weight cache (NPU_NO_WCACHE=1 is not supported with it)";
         return;
@@ -1101,7 +1160,7 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
 
     const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto issue = [&]() -> xrt::run {
-        return slot ? kctx.launch_async_with_bo(*slot->bo, A, 1, K, as)
+        return slot ? kctx.launch_async_with_bo(*slot_bo(*slot, kctx), A, 1, K, as)
                     : kctx.sync_and_launch(0);
     };
     xrt::run r = issue();
@@ -1136,7 +1195,7 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
     }
 
     if (m16_check_ && &kctx != &ctx)
-        m16_check_gemm(ctx, kctx, A, K, N, Bmat, slot ? slot->bo.get() : nullptr, as);
+        m16_check_gemm(ctx, kctx, A, K, N, Bmat, slot ? slot_bo(*slot, kctx) : nullptr, as);
 
     if (prof) {
         const double dpk = std::chrono::duration<double, std::milli>(tl - tp).count();
@@ -1361,10 +1420,8 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
             const auto f0 = std::chrono::steady_clock::now();   // a weight-cache fill: one-time, not per launch
             q4nx_lh::LhScope _tlh_pk(LH_PACK_UPLOAD);
             PackedWeight pw;
-            pw.bo = kctx.make_weight_bo(*dev_);
-            float sout = 1.0f;
             const auto w0 = std::chrono::steady_clock::now();       // engine#1416: the 22 ms candidate
-            kctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            if (!fill_int8_and_w4(pw, kctx, ar.role, Bmat, K, N, err)) return;
             const auto w1 = std::chrono::steady_clock::now();
             wmiss_n_++;
             wmiss_ms_ += std::chrono::duration<double, std::milli>(w1 - w0).count();
@@ -1375,7 +1432,8 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
             it = m.emplace(wkey, std::move(pw)).first;
         }
         slot = &it->second;
-        gs = &slot->scales;
+        if (!slot_bo(*slot, kctx)) { err = "weight cache: the filled slot has no image for this context's layout"; return; }
+        gs = slot_scales(*slot, kctx);
     } else {
         float sout = 1.0f;
         const auto w0 = std::chrono::steady_clock::now();           // engine#1416: uncached branch
@@ -1390,7 +1448,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     }
     const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto issue = [&]() -> xrt::run {
-        return slot ? kctx.launch_async_with_bo_rows(*slot->bo, A, M, K, ascales.data())
+        return slot ? kctx.launch_async_with_bo_rows(*slot_bo(*slot, kctx), A, M, K, ascales.data())
                     : kctx.launch_async_rows(0, A, M, K, ascales.data());
     };
     xrt::run r = issue();
@@ -1429,7 +1487,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
             o[n] = (float)cm[n] * asc * (*gs)[(size_t)n];
     }
     if (m16_check_ && &kctx != &ctx)
-        m16_check_gemm_rows(ctx, kctx, A, M, K, N, slot ? slot->bo.get() : nullptr,
+        m16_check_gemm_rows(ctx, kctx, A, M, K, N, slot ? slot_bo(*slot, kctx) : nullptr,
                             ascales);
     if (prof) {
         const double dpk = std::chrono::duration<double, std::milli>(tl - tp).count();

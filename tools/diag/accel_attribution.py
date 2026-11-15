@@ -84,16 +84,38 @@ def intervals(samples):
 
 
 def holder_table(samples):
-    """{pid: {cmd, ticket, first, last, n}} for every real holder (the '-' rows excluded)."""
+    """{pid: {cmd, spans, first, last, n}} for every real holder (the '-' rows excluded).
+
+    `spans` is the ORDERED list of (ticket, first, last) for that pid. It matters because the sampler records the
+    token as it stood at sample time, not the ticket the process belongs to: a process that outlives its own ticket
+    is relabelled with whatever ticket is live next, so a single-ticket view silently launders a leaked holder into
+    "part of the next ticket". Four cl-1077 PIDs did exactly this on 2026-11-15 18:20 (three boundaries) and were
+    invisible until the spans were kept.
+    """
     t = {}
     for epoch, pid, _fds, cmd, _scope, ticket in samples:
         if pid == "-":
             continue
-        e = t.setdefault(pid, {"cmd": cmd, "ticket": ticket, "first": epoch, "last": epoch, "n": 0})
+        e = t.setdefault(pid, {"cmd": cmd, "spans": [], "first": epoch, "last": epoch, "n": 0})
         e["first"] = min(e["first"], epoch)
         e["last"] = max(e["last"], epoch)
         e["n"] += 1
+        tk = ticket.rstrip()
+        if e["spans"] and e["spans"][-1][0] == tk:
+            e["spans"][-1] = (tk, e["spans"][-1][1], epoch)
+        else:
+            e["spans"].append((tk, epoch, epoch))
     return t
+
+
+def spans_ticket_boundaries(table):
+    """[(pid, spans)] for holders seen under more than one ticket.
+
+    An fd held across a release is not proof that two AIE2 contexts were live -- a process can hold the node open
+    without submitting -- but it is the precondition the fleet's reset guard exists for (two contexts on one array is
+    what produced the double TDR on 2026-11-02), so it is reported rather than inferred away.
+    """
+    return [(pid, e["spans"]) for pid, e in table.items() if len(e["spans"]) > 1]
 
 
 def in_window(samples, ts, window):
@@ -140,7 +162,7 @@ def self_test():
     assert intervals(samples) == [6, 6], intervals(samples)
     t = holder_table(samples)
     assert set(t) == {"111", "222"}, t
-    assert t["111"]["n"] == 1 and t["222"]["ticket"].startswith("gpu-hold cl-b"), t
+    assert t["111"]["n"] == 1 and t["222"]["spans"][0][0].startswith("gpu-hold cl-b"), t
 
     # The window decides the answer, which is the point of printing it. Hand-checked against the samples above:
     #   window 3, fault 100 -> [97,103]  -> {111}            one holder
@@ -159,6 +181,14 @@ def self_test():
     assert "sampled 1x, nothing held the node" in dot, dot
     assert "AMBIGUOUS: 2 holders inside +-5s (111, 222)" in wide, wide
     assert "not 'nobody held it'" in narrow, narrow
+
+    # A holder that outlives its ticket is RELABELLED by the sampler (it records the token as it stood), so the
+    # spans are what make the leak visible: same pid, two tickets.
+    leaky = [(100, "111", "1", "/a", "s", "gpu-hold cl-a 1"), (106, "111", "1", "/a", "s", "gpu-hold cl-b 2")]
+    lt = holder_table(leaky)
+    assert [x[0] for x in lt["111"]["spans"]] == ["gpu-hold cl-a 1", "gpu-hold cl-b 2"], lt
+    assert [p for p, _ in spans_ticket_boundaries(lt)] == ["111"], spans_ticket_boundaries(lt)
+    assert spans_ticket_boundaries(holder_table(samples)) == [], "the plain fixture must not trip the arm"
 
     # A partially written row must not kill the reader.
     import tempfile
@@ -204,6 +234,14 @@ def main():
     print(f"'nothing holds the node' rows: {nobody} of {len(samples)}")
 
     t = holder_table(samples)
+    crossed = spans_ticket_boundaries(t)
+    if crossed:
+        print(f"\nholders that outlived their ticket ({len(crossed)} pid(s)) -- an fd held across a release is the "
+              f"precondition for two contexts on one array, not proof of one:")
+        for pid, spans in crossed:
+            print(f"  {pid:<9} {t[pid]['cmd'][:44]}")
+            for tk, a, b in spans:
+                print(f"      {a}..{b} ({b - a:>4}s)  {tk[:46]}")
     if t:
         print("\nholders seen (pid, first..last, samples, ticket):")
         for pid, e in sorted(t.items(), key=lambda kv: -kv[1]["n"]):

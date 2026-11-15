@@ -18,14 +18,20 @@
 # scripts it names (review of engine#2539: the table is a contract and prose rots). Every "<script> exits it" or
 # "<script> sets it" in a row's scripts cell must be backed by `exit <rc>` or `rc=<rc>` in that script, and every row
 # must name an emitter (a script that exits, sets or passes the code, or "any payload" / "all" / "the payload").
-# A code that is computed rather than literal is written that way in the row ("computed by ...") and is not grepped.
+# Each verb is checked against the script names written since the previous verb, so "A exits it, B exits it" checks
+# both (review of #2546). A code that is computed rather than literal is written that way in the row ("<script>
+# (computed by ...)"): the named script must contain the compute site (`echo <rc>`), so the name itself is checked.
 # The 2 row's quoted stderr phrases (review of engine#2544: a lane greps its log for them) must each be printed by one of
 # the scripts, verbatim.
+import argparse
 import re
 import sys
 from pathlib import Path
 
-root = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent)
+ap = argparse.ArgumentParser(description="Check docs/ci-runners.md's exit-code table against the scripts it names.")
+ap.add_argument("root", nargs="?", default=str(Path(__file__).resolve().parent.parent),
+                help="engine checkout to check (default: this test's own tree)")
+root = Path(ap.parse_args().root)
 SCRIPTS = {"gpu-hold": "scripts/gpu-hold", "npu-hold": "scripts/npu-hold", "hw-gate.sh": "scripts/hw-gate.sh",
            "window-run.sh": "scripts/window-run.sh", "coder-llm-ticketed": "scripts/coder-llm-ticketed"}
 
@@ -43,21 +49,32 @@ for row in rows:
     cells = [c.strip() for c in row.strip().strip("|").split("|")]
     rc, where = cells[0].strip("*"), cells[2]
     named = False
+    def names(text):
+        return [n for n in SCRIPTS if re.search(r"(?<![\w-])" + re.escape(n) + r"(?![\w-])", text)]
     for seg in where.split(";"):
-        if re.search(r"pass(es)? it through|relabels|any payload|^all$|the payload|computed by", seg):
+        if re.search(r"pass(es)? it through|relabels|any payload|^all$|the payload", seg):
             named = True
-        if "computed by" in seg:   # a code computed at run time (window-run's 69) has no literal to grep
-            continue
-        verb = re.search(r"\b(exits?|sets) (it\b|\()", seg)
-        if not verb:
-            continue
-        named = True
-        for name in [n for n in SCRIPTS if re.search(r"(?<![\w-])" + re.escape(n) + r"(?![\w-])", seg[:verb.start()])]:
-            text = (root / SCRIPTS[name]).read_text()
-            checked += 1
-            if not re.search(rf"\bexit {rc}\b|\brc={rc}\b", text):
-                print(f"FAIL: rc {rc}: the table says {name} {verb.group(1)} it, but {SCRIPTS[name]} has no 'exit {rc}' or 'rc={rc}'")
+        comp = re.search(r"\(computed by", seg)
+        if comp:   # computed at run time (window-run's 69): no literal exit, so check the named script computes it
+            who = names(seg[:comp.start()])
+            if not who:
+                print(f"FAIL: rc {rc}: 'computed by' names no script ({seg.strip()[:80]})")
                 fail = 1
+            for name in who:
+                named = True
+                checked += 1
+                if not re.search(rf"\becho {rc}\b|\bexit {rc}\b|\brc={rc}\b", (root / SCRIPTS[name]).read_text()):
+                    print(f"FAIL: rc {rc}: the table says {name} computes it, but {SCRIPTS[name]} has no 'echo {rc}', 'exit {rc}' or 'rc={rc}'")
+                    fail = 1
+            continue
+        verbs = list(re.finditer(r"\b(exits?|sets) (it\b|\()", seg))
+        for k, verb in enumerate(verbs):
+            named = True
+            for name in names(seg[verbs[k - 1].end() if k else 0:verb.start()]):
+                checked += 1
+                if not re.search(rf"\bexit {rc}\b|\brc={rc}\b", (root / SCRIPTS[name]).read_text()):
+                    print(f"FAIL: rc {rc}: the table says {name} {verb.group(1)} it, but {SCRIPTS[name]} has no 'exit {rc}' or 'rc={rc}'")
+                    fail = 1
     if not named:
         print(f"FAIL: rc {rc}: the scripts cell names no emitter ({where[:80]})")
         fail = 1
@@ -71,8 +88,9 @@ for ph in phrases:
     if ph not in alltext:
         print(f"FAIL: rc 2: the stderr phrase '{ph}' is not printed by any of the scripts")
         fail = 1
-if checked < 8:
-    print(f"FAIL: only {checked} (code, script) claims were checked; the parser no longer reads the table")
+FLOOR = 10   # the claims on main when this was written: a parser that stops finding claims must not pass as "nothing to check"
+if checked < FLOOR:
+    print(f"FAIL: only {checked} (code, script) claims were checked, the table has at least {FLOOR}; the parser no longer reads it")
     fail = 1
 if not fail:
     print(f"exit_code_table: ok ({len(rows)} rows, {checked} (code, script) claims backed by the scripts; {len(phrases)} rc 2 stderr phrases found verbatim)")

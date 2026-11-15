@@ -190,16 +190,23 @@ attempts have already been made and failed. All four against a fixed baseline (7
 | random direct reads | 400 × 64 KiB at random offsets | **0** |
 | concurrent direct reads | 24 threads, ~3.8 GB | **0** |
 | direct writes + fsync | 1 GiB written, read back, unlinked | **0** |
+| memory pressure + reads | 8 GiB held and touched during 30 direct reads | **0** |
 
 So **the stream is not reproducible from userspace I/O** — read or write, sequential or random, one thread or twenty-four
-— and a reproduction has to come from something else. In order of what the evidence still allows:
+— and neither mild memory pressure nor that pressure combined with light I/O brings it back. A reproduction has to come
+from something else. In order of what the evidence still allows:
 
-1. **memory pressure / allocator state** — the bursts coincided with builds, which allocate and free heavily; a fault
-   needs the allocator to hand back an IOVA whose TLB entry has not been invalidated while a command is still
-   outstanding, and the reuse is real (494 reuses of one address in 15 minutes);
+1. **memory pressure far heavier than 8 GiB** — the fifth test only covers *mild* pressure on a 122 GiB box; a `cmake`
+   build applies more, and the bursts did coincide with builds, which allocate and free heavily. The mechanism it would
+   have to reach is still real: the allocator hands the same IOVA straight back (494 reuses of one address in 15 minutes),
+   and a fault needs that hand-back to happen while a command is still outstanding;
 2. **uptime** — allocator history may be the precondition, which no short test creates;
 3. **a caller outside the block path** — a minority of traced unmaps arrived via `nvme_unmap_data -> dma_iova_unlink ->
    dma_iova_destroy`, i.e. teardown rather than completion.
+
+One measurement note from the fifth test that applies to any experiment on this host: `MemAvailable` moved from 58 to
+88 GiB **during my own thirty-second window**, purely from other work. A memory-pressure experiment on a shared box has to
+record the baseline either side of the window, or it cannot separate its own effect from a neighbour's.
 
 Two lessons from that list. The first three shapes were chosen because of **my own story** about the trigger, and the story
 was wrong — cheap tests turned a plausible narrative into four ruled-out candidates. And the fourth is the one I nearly

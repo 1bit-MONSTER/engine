@@ -38,7 +38,12 @@
 #     window's start, not the queue's, so a real KILL is not reported as a max hold; every outcome line says how long
 #     the window was open;
 #   K a fault line already in the kernel log makes gpu-hold refuse the grant (rc 78): the journal says "ticket refused
-#     before the window", not a fault during one (arm D says "fault during the window"), and no server starts.
+#     before the window", not a fault during one (arm D says "fault during the window"), and no server starts;
+#   L CODER_LLM_LABEL names the window's ticket (another resident model, 1bit-canonical, runs in its own windows;
+#     engine#2579);
+#   M scripts/ticketed-wait asks a waiting unit for the model and returns 0 once it answers: it touches the demand
+#     file, the wrapper queues and opens a window, and /v1/models answers;
+#   N ticketed-wait on a model that never answers gives up with 75 after its limit, having touched the demand file.
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)   # the defaults work from any directory, not only the repo root
 tick=${1:-$root/scripts/coder-llm-ticketed}
@@ -227,9 +232,43 @@ rc=$?
 grep -q "rc 78: ticket refused before the window" "$scratch/k.log" || { echo "FAIL K: a refused grant is not reported as such ($(grep -m1 'rc 78' "$scratch/k.log"))"; fail=1; }
 [ -s "$scratch/server.pid" ] && { echo "FAIL K: a server started on a refused grant"; fail=1; }
 
+# ---- L: the window holds the token under its own label ----------------------------------------------------------
+echo idle > "$scratch/state"; rm -f "$scratch/server.pid"; : > "$scratch/klog"; touch "$scratch/demand"
+env "${envs[@]}" CODER_LLM_LABEL=1bit-canonical CODER_LLM_IDLE_S=4 CODER_LLM_MAX_HOLD_MIN=1 timeout 60 "$tick" -- "$scratch/fake" > "$scratch/l.log" 2>&1 &
+ll=$!; pids+=($ll)
+wait_for 15 server_alive || { echo "FAIL L: no window opened"; fail=1; }
+grep -qs '1bit-canonical' "$scratch/TOKEN" || { echo "FAIL L: the token is not held as 1bit-canonical ($(head -c 60 "$scratch/TOKEN" 2> /dev/null))"; fail=1; }
+grep -qs 'coder-llm' "$scratch/TOKEN" && { echo "FAIL L: the token still says coder-llm"; fail=1; }
+wait "$ll"
+
+# ---- M: ticketed-wait asks for the model and returns once it answers ---------------------------------------------
+waiter=$root/scripts/ticketed-wait
+echo idle > "$scratch/state"; rm -f "$scratch/server.pid" "$scratch/demand"; : > "$scratch/klog"
+touch -d '-10 min' "$scratch/demand"
+env "${envs[@]}" CODER_LLM_IDLE_S=6 CODER_LLM_MAX_HOLD_MIN=1 timeout 90 "$tick" -- "$scratch/fake" > "$scratch/m.log" 2>&1 &
+mm=$!; pids+=($mm)
+sleep 3
+if [ -e "$scratch/TOKEN" ] || server_alive; then echo "FAIL M: a window opened before anyone asked"; fail=1; fi
+t0=$(date +%s)
+env TICKETED_WAIT_DEMAND="$scratch/demand" TICKETED_WAIT_POLL_S=1 GPU_TOKEN_FILE="$scratch/TOKEN" \
+    "$waiter" test-unit "http://127.0.0.1:$port" 40 2> "$scratch/m.wait"; rc=$?
+[ "$rc" = 0 ] || { echo "FAIL M: ticketed-wait rc $rc, want 0 ($(tail -1 "$scratch/m.wait"))"; fail=1; }
+[ $(( $(date +%s) - t0 )) -lt 40 ] || { echo "FAIL M: ticketed-wait took the whole limit"; fail=1; }
+grep -q 'answers after' "$scratch/m.wait" || { echo "FAIL M: ticketed-wait returned without the model answering"; fail=1; }
+grep -qs coder-llm "$scratch/TOKEN" || { echo "FAIL M: the model answered outside a ticket"; fail=1; }
+wait "$mm"
+
+# ---- N: a model that never answers: 75 after the limit, demand touched -------------------------------------------
+dead=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+rm -f "$scratch/n.demand"; t0=$(date +%s)
+env TICKETED_WAIT_DEMAND="$scratch/n.demand" TICKETED_WAIT_POLL_S=1 "$waiter" test-unit "http://127.0.0.1:$dead" 3 2> "$scratch/n.wait"; rc=$?
+[ "$rc" = 75 ] || { echo "FAIL N: ticketed-wait rc $rc for a model that never answers, want 75"; fail=1; }
+[ -e "$scratch/n.demand" ] || { echo "FAIL N: ticketed-wait did not touch the demand file"; fail=1; }
+[ $(( $(date +%s) - t0 )) -le 10 ] || { echo "FAIL N: ticketed-wait overran its 3 s limit"; fail=1; }
+
 # ---- G: the default queue wait keeps the ticket's place on a busy box (a give-up re-queues at the back) ------------
 sed -n 's/^QUEUE_WAIT=\${CODER_LLM_QUEUE_WAIT_S:-\([0-9]*\)}$/\1/p' "$tick" > "$scratch/qw"
 [ "$(cat "$scratch/qw")" -ge 14400 ] 2> /dev/null || { echo "FAIL G: default queue wait $(cat "$scratch/qw")s; under 4 h a busy queue makes it re-queue at the back and starve"; fail=1; }
 
-[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load; a slow-exiting server gets its grace, a KILL after the max hold is 124, one after a queue wait stays 137; a refused grant is told from a fault during a window)"
+[ "$fail" = 0 ] && echo "coder_llm_ticketed: ok (no demand -> no ticket; idle -> rc 0; busy -> 124 at max hold; fault -> 78 + back-off; FIFO: coder-llm, lane, coder-llm; a failing gh poll is logged once, no window; default queue wait keeps its place; a stale grant releases without a load; a slow-exiting server gets its grace, a KILL after the max hold is 124, one after a queue wait stays 137; a refused grant is told from a fault during a window; a window takes its label; ticketed-wait asks, waits and gives up with 75)"
 exit "$fail"

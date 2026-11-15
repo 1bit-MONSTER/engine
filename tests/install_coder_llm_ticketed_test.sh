@@ -20,7 +20,10 @@
 #   2 --status says NOT ticketed (exit 1) before the install;
 #   3 --install backs up the drop-in, keeps the server command byte for byte behind the wrapper, installs the wrapper,
 #     reloads and restarts (the stub records both), and --status then says ticketed (exit 0);
-#   4 a second --install changes nothing (idempotent).
+#   4 a second --install changes nothing (idempotent);
+#   5 CODER_LLM_UNIT=1bit-canonical (engine#2579): the drop-in gets that unit's own label, demand file and URL (from the
+#     --port of its serve line), the pr-agent poll off, the command byte for byte; the restart is of that unit; a serve
+#     line with no --port is refused rather than guessed.
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
 inst=${1:-$root/scripts/install-coder-llm-ticketed.sh}
@@ -73,5 +76,26 @@ env "${envs[@]}" "$inst" --install > "$scratch/i2" 2>&1; rc=$?
     || { echo "FAIL 4: a second --install was not a no-op (rc $rc)"; fail=1; }
 [ "$(ls "$scratch/unit"/zz.conf.bak-* | wc -l)" = 1 ] || { echo "FAIL 4: a second backup was written"; fail=1; }
 
-[ "$fail" = 0 ] && echo "install_coder_llm_ticketed: ok (--diff changes nothing; status before = NOT; install keeps the command byte for byte, backs up, reloads+restarts; idempotent)"
+# ---- 5: another resident model, 1bit-canonical -------------------------------------------------------------------
+mkdir -p "$scratch/cunit"; : > "$scratch/calls"
+cserve='/opt/x/1bit serve -m /models/q.gguf --device hrx --host 127.0.0.1 --port 8095 --ctx-size 8192 --alias qwen3-4b'
+printf '[Service]\nEnvironment=HSA_USERPTR_FOR_PAGED_MEM=0\nExecStart=\nExecStart=%s\n' "$cserve" > "$scratch/cunit/zz.conf"
+sed "s|$scratch/unit/zz.conf|$scratch/cunit/zz.conf|" "$scratch/systemctl" > "$scratch/csystemctl"; chmod +x "$scratch/csystemctl"
+cenvs=(CODER_LLM_UNIT=1bit-canonical CODER_LLM_UNIT_DIR="$scratch/cunit" CODER_LLM_DROPIN=zz.conf CODER_LLM_BIN_DIR="$scratch/bin"
+       CODER_LLM_SYSTEMCTL="$scratch/csystemctl" GPU_TOKEN_FILE="$scratch/none")
+env "${cenvs[@]}" "$inst" --install > "$scratch/c1" 2>&1; rc=$?
+[ "$rc" = 0 ] || { echo "FAIL 5: --install of 1bit-canonical rc $rc: $(tail -2 "$scratch/c1")"; fail=1; }
+for want in "Environment=CODER_LLM_LABEL=1bit-canonical" "Environment=CODER_LLM_DEMAND=$HOME/.cache/1bit-canonical/demand" \
+            "Environment=CODER_LLM_URL=http://127.0.0.1:8095" "Environment=CODER_LLM_GH_POLL=0" \
+            "ExecStart=$scratch/bin/coder-llm-ticketed -- $cserve"; do
+    grep -qxF "$want" "$scratch/cunit/zz.conf" || { echo "FAIL 5: missing '$want'"; fail=1; }
+done
+grep -q 'CODER_LLM_GH_POLL=1' "$scratch/cunit/zz.conf" && { echo "FAIL 5: the pr-agent poll is on for 1bit-canonical"; fail=1; }
+grep -qx 'restart 1bit-canonical' "$scratch/calls" || { echo "FAIL 5: 1bit-canonical was not restarted ($(tr '\n' ';' < "$scratch/calls"))"; fail=1; }
+grep -qx 'restart coder-llm' "$scratch/calls" && { echo "FAIL 5: coder-llm was restarted for a 1bit-canonical install"; fail=1; }
+printf '[Service]\nExecStart=\nExecStart=/opt/x/1bit serve -m /models/q.gguf\n' > "$scratch/cunit/zz.conf"
+env "${cenvs[@]}" "$inst" --diff > "$scratch/c2" 2>&1; rc=$?
+[ "$rc" = 2 ] && grep -q 'no --port' "$scratch/c2" || { echo "FAIL 5: a serve line with no --port was not refused (rc $rc)"; fail=1; }
+
+[ "$fail" = 0 ] && echo "install_coder_llm_ticketed: ok (--diff changes nothing; status before = NOT; install keeps the command byte for byte, backs up, reloads+restarts; idempotent; another unit gets its own label, demand and URL, and no --port is refused)"
 exit "$fail"

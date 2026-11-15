@@ -161,11 +161,23 @@ if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 
 # arm 5: an amdxdna fault DURING the hold. #2498 added this spelling at take time only; with one shared pattern the
 # during-hold watch now reads it too (the NPU rule: on any amdxdna fault, stop).
+# engine#2542/11-29Z: the driver's RECOVERY notices contain "power-cycle" and "aie2_tdr_recover_all", so they match
+# `amdxdna.*power.?cycle` -- and one aborted a real hold. Measured 2026-11-15 (07:29:38 local, GPU-HOLD.log :134):
+#   gpu-hold[402117] ::error::ABORT GPU/NPU fault ... (rc 78) after 493s
+#   | amdxdna ... aie2_tdr_recover_all: TDR recovery throttled: last power-cycle 45560 ms ago (< 60000 ms),
+#   |          retrying on the next watchdog tick; no context touched
+# The line says NO CONTEXT TOUCHED: the fault it refers to was 45 s old, and the hold it ended belonged to another
+# lane's job. A bookkeeping line must not abort a hold; the events it summarises must still abort.
+run 6 600 1 1 "kernel: amdxdna 0000:c6:00.1: [drm] aie2_tdr_recover_all: TDR recovery throttled: last power-cycle 45560 ms ago (< 60000 ms), retrying on the next watchdog tick; no context touched"
+if [ "$rc" = 78 ]; then echo "FAIL arm 6: a recovery-throttle notice (\"no context touched\") aborted the hold"; fail=1; fi
+run 7 600 1 1 "kernel: amdxdna 0000:c6:00.1: [drm] aie2_tdr_recover_all: Array stopped dispatching, power-cycling NPU to recover"
+if [ "$rc" != 78 ]; then echo "FAIL arm 7: a real power-cycle event did not abort (rc $rc)"; fail=1; fi
+
 run 5 600 1 1 "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_error_worker: fault at 0x00000000"
 if [ "$rc" != 78 ]; then echo "FAIL arm 5: rc $rc after an amdxdna fault line, want 78"; fail=1; fi
 grep -q "newest line is from the NPU" "$scratch/log5" || { echo "FAIL arm 5: the abort does not name the NPU as the faulting device"; fail=1; }
 grep -q "newest line is from the GPU" "$scratch/log1" || { echo "FAIL arm 1: the abort does not name the GPU as the faulting device"; fail=1; }
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 
-[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on -> 78; take-time page fault/MES/ring/hang -> 78; NPU fault in hold -> 78)"
+[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on -> 78; take-time page fault/MES/ring/hang -> 78; NPU fault in hold -> 78; a recovery notice does NOT abort; a real power-cycling event does)"
 exit "$fail"

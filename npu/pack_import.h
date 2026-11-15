@@ -893,6 +893,10 @@ bool external_container_tensors(const std::string& role, int nh, int nkv, int hd
 
 Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err,
                         bool row_major = kExtQuantsRowMajor);
+// engine#2561: the candidate theta whose cos(p * theta^(-2i/d)) best explains a pack's precomputed cos_cache
+// ([rows, half] row-major, d = 2*half), as one Pearson r over the whole matrix; writes the winner to *best_theta.
+double rope_cache_best_theta(const std::vector<float>& cache, int64_t rows, int64_t half,
+                             const std::vector<double>& cands, double* best_theta);
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
                       int N, int K, int block, bool swap_nibbles = false, bool drop_zero = false);
 

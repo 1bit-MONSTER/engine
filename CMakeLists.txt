@@ -82,6 +82,14 @@ set(HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_USE_ZSTD_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_INSTALL OFF CACHE BOOL "" FORCE)
+
+# engine#2482: cpp-httplib refuses a body over 8 KiB with 413 and an EMPTY reply when the request says
+# `Content-Type: application/x-www-form-urlencoded` -- which is what `curl -d` sends by default, even when
+# the bytes are JSON. A 413 is right for a form body and wrong for this one, and the empty body plus no
+# server log line makes it indistinguishable from a refusal the engine chose. Raised to 64 MiB, not to
+# unlimited: the engine takes base64 images in a chat request (a 10 MB PNG is ~13 MB encoded), so the
+# ceiling has to clear that, and it stays a ceiling because the limit exists to bound a parse.
+add_compile_definitions(CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH=67108864)
 FetchContent_Declare(httplib
     GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
     GIT_TAG fe332fa06bac76a1c6d402c08f414052999347da)  # v0.47.0
@@ -681,6 +689,13 @@ add_dependencies(onebit serve_degenerate_test)
 add_executable(http_guard_test tests/http_guard_test.cpp)
 target_include_directories(http_guard_test PRIVATE app)
 add_test(NAME http_guard COMMAND http_guard_test)
+
+# engine#2482: a form-labelled body over 8 KiB must reach the handler instead of a 413 with an empty
+# reply. CPU only -- it starts an httplib::Server on a loopback port and POSTs to it, so no model, no
+# device and no `1bit serve`; the compile-time limit is the thing that changed.
+add_executable(http_form_limit_test tests/http_form_limit_test.cpp)
+target_link_libraries(http_form_limit_test PRIVATE httplib::httplib Threads::Threads)
+add_test(NAME http_form_limit COMMAND http_form_limit_test)
 # The "the device is gone" classifiers of app/serve_watchdog.h: a backend's device-lost stderr line, and the
 # NPU runtime's failed-runlist message that makes `1bit unified` answer the request and exit non-zero. Header
 # only, no device, no model.

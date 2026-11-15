@@ -19,13 +19,14 @@ limitations under the License.
 
 ## engine#823 — Bosgame BeyondMax board: the USB ports need the xHCI keep-awake rule
 
-**Status: MITIGATED in 1bit OS — the ports work; the fix is a udev rule, not a driver.** On this board (AXB35-02)
-every external port **works** once the xHCI controllers are kept out of D3cold. The owner's plug test on **BIOS 1.10**
-(2026-11-14 22:09–22:23 ADT) exercised each one:
+**Status: MITIGATED — the ports work; the fix is a udev rule, not a driver. Verified on a host with the rule, not yet on
+a 1bit OS boot.** On this board (AXB35-02) every external port **works** once the xHCI controllers are kept out of
+D3cold. The owner's plug test on **BIOS 1.10** (2026-11-14 22:09–22:23 ADT, on the Ubuntu host with the rule installed
+in `/etc/udev/rules.d`) exercised each one:
 
 ```
 front Type-C   c7:00.3   5 Gbps         rear Type-C   c7:00.4   5 Gbps
-rear USB-A     c5:00.4   5 Gbps         rear USB-A    c7:00.0   port 4, USB 2 (a USB 2 port)
+rear USB-A     c5:00.4   5 Gbps         rear USB-A    c7:00.0   port 4, high-speed with a USB 2 stick (USB 3 not yet tried)
 ```
 
 **Cause: D3cold autosuspend.** A port whose controller has been allowed to suspend does not come back on this board's
@@ -38,12 +39,14 @@ a UCSI device are both **true**, and neither is the cause. The board indeed expo
 but that does not stop the ports working — the failure was power management, not a missing port description. The
 `ec_su_axb35` refcount-0 observation is likewise true and likewise not the mechanism.
 
-**Not established:** **USB4 / Thunderbolt devices are untested** through these ports. The keep-awake rule covers the
+**Not established:** a **1bit OS boot** with the rule loaded from the image has not been plug-tested yet, and
+**USB4 / Thunderbolt devices are untested** through these ports. The keep-awake rule covers the
 xHCI controllers; a USB4 tunnel is a different path (the two `Strix Halo USB4 Host Router` functions) and nobody has put
 a TB device on it.
 
-**One device stays USB 2:** the **Ugreen RTL9210** enclosure enumerates at USB 2 on the rear USB-A port (`c7:00.0`
-port 4). That port is USB 2, and the enclosure/cable pair is the other half of it — it is not the controller.
+**One device stays USB 2:** the **Ugreen RTL9210** enclosure enumerates at USB 2 (high-speed) on **every** port,
+including `c5:00.4`, where a different drive reaches 5 Gbps. So the limit is the enclosure or its cable, not the board.
+Only a USB 2 stick has been tried on `c7:00.0` port 4, so whether that port carries USB 3 is not established.
 
 **Affected:** every install on the Bosgame BeyondMax (AXB35-02) **without** the keep-awake rule. With the rule, all
 four ports above behave. Other Strix Halo boards are not known to be affected.

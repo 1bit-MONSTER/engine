@@ -619,6 +619,7 @@ add_test(NAME hw_gate_mem COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_mem_tes
 add_test(NAME hw_gate_coder_idle COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_coder_idle_test.sh ${CMAKE_SOURCE_DIR})
 # The real scripts/ci-runner-health.sh and weekly.sh's preflight_runner_units() against a stub systemctl; no systemd.
 add_test(NAME weekly_runner_preflight COMMAND ${CMAKE_SOURCE_DIR}/tests/weekly_runner_preflight_test.sh)
+add_test(NAME empty_selector COMMAND ${CMAKE_SOURCE_DIR}/tests/empty_selector_test.sh)
 add_test(NAME ci_runner_health_selftest COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/ci-runner-health.sh --self-test)
 # engine #1750: the carried amdxdna series applies in order to the pinned driver, and the context-restart code it
 # produces fails a context's jobs (and logs it) when the restart fails, instead of leaving them parked or running

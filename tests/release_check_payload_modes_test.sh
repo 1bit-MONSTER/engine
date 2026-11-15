@@ -47,6 +47,12 @@ case "$RC" in
     *"this line is never matched"*) : ;;
 esac
 grep -q 'payload_modes_noexec "\$PDIR"' "$RC" || { echo "FAIL payload_modes_noexec() is defined but never called on the payload - a guard nothing calls"; exit 1; }
+# The second half of the same defect: the `payload-backend` row owns ABSENCE (the mode function owns the mode), so it needs
+# the same two things - the decision is a function, and the row actually calls it. A row that exists to catch a missing
+# backend and has no arm of its own is the defect this PR is about, one level up.
+FN_BK=$(awk '/^ *payload_backend_missing\(\) \{/{f=1} f{print} f&&/^ *\}$/{exit}' "$RC")
+[ -n "$FN_BK" ] || { echo "FAIL no payload_backend_missing() in $RC - the row cannot require a backend"; exit 1; }
+grep -q 'payload_backend_missing "\$PDIR"' "$RC" || { echo "FAIL payload_backend_missing() is defined but never called on the payload"; exit 1; }
 
 ROOT=$(mktemp -d "${TMPDIR:-$HOME/.cache}/release-check-pm.XXXXXX") || exit 1
 trap 'rm -rf "$ROOT"' EXIT
@@ -82,6 +88,31 @@ got=$(bash -c "$FN"$'\npayload_modes_noexec "$1"' _ "$ROOT/pbackend")
 case "$got" in
     *hrx/llama/bin/llama-server*) echo "ok    a 0644 HRX backend is named even when the three named binaries are 0755" ;;
     *) echo "FAIL  a 0644 HRX backend went unreported: '${got}'"; fail=1 ;;
+esac
+
+# payload-backend's own decision, three ways: a complete backend reports nothing; an absent one names both pieces
+# (the executable and the compute library, which fail at exec and at dlopen respectively); and a backend that is
+# present but not executable is NOT this function's claim - the mode function above owns that.
+mkdir -p "$ROOT/pbk/1bit/hrx/llama/bin"
+: > "$ROOT/pbk/1bit/hrx/llama/bin/llama-server"; : > "$ROOT/pbk/1bit/hrx/llama/bin/libggml-hrx.so.0"
+got=$(bash -c "$FN_BK"$'\npayload_backend_missing "$1"' _ "$ROOT/pbk")
+[ -z "$got" ] && echo "ok    a complete HRX backend reports nothing missing" || { echo "FAIL  a complete backend was reported: '${got}'"; fail=1; }
+
+mkdir -p "$ROOT/pbn/1bit"
+got=$(bash -c "$FN_BK"$'\npayload_backend_missing "$1"' _ "$ROOT/pbn")
+case "$got" in
+    *hrx/llama/bin/llama-server*libggml-hrx*) echo "ok    a payload with no backend names the executable and the library" ;;
+    *) echo "FAIL  an absent backend was under-reported: '${got}'"; fail=1 ;;
+esac
+
+mkdir -p "$ROOT/pbl/1bit/hrx/llama/bin"; : > "$ROOT/pbl/1bit/hrx/llama/bin/libggml-hrx.so.0"
+got=$(bash -c "$FN_BK"$'\npayload_backend_missing "$1"' _ "$ROOT/pbl")
+case "$got" in
+    *llama-server*) case "$got" in
+        *libggml-hrx*) echo "FAIL  a present library was reported missing: '${got}'"; fail=1 ;;
+        *) echo "ok    an executable-only gap names the executable and not the library it does have" ;;
+    esac ;;
+    *) echo "FAIL  the missing executable was not named: '${got}'"; fail=1 ;;
 esac
 
 mktree pnone none

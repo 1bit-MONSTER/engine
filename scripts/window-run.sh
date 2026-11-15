@@ -61,6 +61,20 @@ self_test() {
     out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true 2>&1); rc=$?
     chk "  ... and 90 minutes later the gap no longer refuses" "$(printf '%s' "$out" | grep -c 'not yet')" 0
     chk "  ... and the run is only PLANNED, no ticket taken" "$(printf '%s' "$out" | grep -c 'would take gpu-hold')" 1
+    # 5. the gap check says when it could not check: a stale log, a log with no END line, and no log at
+    #    all. Twenty lane scripts in ~/lb stop coder-llm without writing this file, so silence here is
+    #    not evidence that no window happened - each branch has to be able to say its own name.
+    printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '20 hours ago' +%FT%TZ)" > "$tmp/w.log"
+    out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true 2>&1)
+    chk "a stale log is called out, not silently trusted" "$(printf '%s' "$out" | grep -c 'invisible to this check')" 1
+    : > "$tmp/w.log"
+    out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true 2>&1)
+    chk "a log with no END line says the gap is UNCHECKED" "$(printf '%s' "$out" | grep -c 'UNCHECKED')" 1
+    rm -f "$tmp/w.log"
+    out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true 2>&1)
+    chk "and no log at all says so too" "$(printf '%s' "$out" | grep -c 'no .*UNCHECKED\|UNCHECKED')" 1
+    chk "  ... while a fresh window still plans normally" "$(printf '%s' "$out" | grep -c 'would take gpu-hold')" 1
+
     printf '\n%s self-test: %s\n' "$SELF" "$([ "$fail" = 0 ] && echo ok || echo "$fail failure(s)")"
     return "$([ "$fail" = 0 ] && echo 0 || echo 1)"
 }
@@ -88,7 +102,18 @@ if [ -f "$LOG" ]; then
     now_s=$(date -u +%s)
     gap=$(( now_s - end_s ))
     [ "$end_s" -gt 0 ] && [ "$gap" -lt 2700 ] && die "not yet: the last window ended $last_end ($(( gap / 60 )) min ago of 45 needed)"
+    # Honesty about what this check actually covered: on 2026-11-15 twenty lane scripts in ~/lb were
+    # found to stop and start coder-llm WITHOUT writing this file, so the gap above is only as good as
+    # the runs that log. A stale (or empty) log is not evidence that no window happened.
+    if [ "$end_s" -gt 0 ] && [ "$gap" -gt 14400 ]; then
+      printf '%s: note: the last logged window ended %s (%s h ago); windows that do not write %s are invisible to this check\n' \
+        "$SELF" "$last_end" "$(( gap / 3600 ))" "$LOG" >&2
+    fi
+  else
+    printf '%s: note: %s exists but has no END line, so the 45-minute gap is UNCHECKED here\n' "$SELF" "$LOG" >&2
   fi
+else
+  printf '%s: note: no %s, so the 45-minute gap is UNCHECKED here\n' "$SELF" "$LOG" >&2
 fi
 
 # a held ticket is not a refusal: gpu-hold is a FIFO queue, and queueing is how "one GPU job at a

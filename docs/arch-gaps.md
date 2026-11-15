@@ -1224,3 +1224,33 @@ The one `!! UNCOVERED` line of the 2026-11-14 watcher run. Read from the repo's 
   not alerted (`"watch": "report"`), so the daily watcher prints `. REVIEWED` instead of `!! UNCOVERED` and
   does not exit 1 on it. If a backend starts accepting the class, record why as `mapped_ok` in
   `registry/significant.json` rather than deleting this entry.
+
+## `megatron_gpt_moe` — Megatron-LM GPT-MoE checkpoints
+
+* **Class / model_type**: `MegatronGPTMoeForCausalLM` / `megatron_gpt_moe`; example
+  `nagohachi/tiny-lm-v3-japanese-1.5b-a500m-sft`.
+* **Evidence**: the repo's HF tags carry `megatron_gpt_moe` and `custom_code`
+  (checked 2026-11-17) — the modeling code ships in the repository rather than in
+  transformers, which is what the census calls `REMOTE-CODE`.
+* **Why an alias is wrong**: this is a **training-framework checkpoint format**,
+  not a serving topology. A gguf conversion of one lands on whichever
+  architecture its exporter targets, so there is no single engine arch to map it
+  to, and treating it as an alias of `qwen*moe` / `llama` / `deepseek2` would
+  serve the model with the wrong tensor names — the failure mode that produces a
+  load error at best and wrong numbers at worst.
+* **Real support needs**: an exporter (Megatron → gguf) and then whichever arch
+  it emits; the engine side would be that arch's path, not this class.
+
+## `rusmind_ai` — RusMind AI (from-scratch)
+
+* **Class / model_type**: `RusMindAIForCausalLM` / `rusmind_ai`; example
+  `DICPlay/RusMind-Zernyshko-2.0.1`.
+* **Evidence**: the repo's HF tags carry `rusmind_ai`, `from-scratch` and
+  `custom_code` (checked 2026-11-17). The `from-scratch` tag is the load-bearing
+  one: it says this is not a finetune of a known family under a new name, which
+  is the case where a mapping would otherwise be plausible.
+* **Why an alias is wrong**: the class string of a renamed finetune is not
+  evidence of the underlying architecture, and here the repository says it is a
+  new architecture. Mapping on the name would be guessing at the tensor layout.
+* **Real support needs**: the architecture itself (attention/FFN/embedding
+  layout) plus a converter; nothing to map until that exists.

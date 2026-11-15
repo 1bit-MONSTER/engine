@@ -1,93 +1,9 @@
 {
  "about": "HF architecture classes reviewed as NOT aliases of a supported family (docs/arch-gaps.md). tools/registry_build.py --check-gaps fails if one becomes mapped without a 'mapped_ok' reason.",
  "classes": {
-  "DeepseekV41ForCausalLM": {
-   "model_type": "deepseek_v41",
-   "family": "DeepSeek V4.1 (engram embeddings + candidate-block sparse attention; NOT an alias of deepseek4 - different layer/head/expert shape, and the V4 path runs neither, which is why it needed its own port)",
-   "watch": "report",
-   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 5e6388a5a maps DeepseekV41ForCausalLM -> deepseek41 (conversion/__init__.py), registers LLM_ARCH_DEEPSEEK41 (src/llama-arch.cpp) and implements hparams/tensors/graph/engram in src/models/deepseek41.cpp - fork #156, the port of upstream #31086 + #31300. tools/registry_build.py --check-gaps stays quiet for this class; docs/arch-gaps.md carries the dated note."
-  },
-  "Qwen3Mamba3ForCausalLM": {
-   "model_type": "qwen3_mamba3",
-   "family": "Qwen3 + Mamba-3 hybrid"
-  },
-  "MolmoAct2ForConditionalGeneration": {
-   "model_type": "molmoact2",
-   "family": "MolmoAct2, vision-language-action"
-  },
-  "Cosmos3EdgeForConditionalGeneration": {
-   "model_type": "cosmos3_edge",
-   "family": "Cosmos3-Edge, video world model"
-  },
-  "QwenDriveForPlanning": {
-   "model_type": "qwen_drive",
-   "family": "Qwen-Drive, driving planner"
-  },
-  "Qwen3_5MLAForConditionalGeneration": {
-   "model_type": "qwen3_5_mla",
-   "family": "Qwen3.5 MLA attention variant"
-  },
-  "EnglishBaseForCausalLM": {
-   "model_type": "fabryka_english_base",
-   "family": "relu2 MLP + parameter-free QK-norm (implemented in the old engine only)"
-  },
-  "GDN2ForCausalLM": {
-   "model_type": "gdn2",
-   "family": "GDN2 hybrid (fla config)"
-  },
-  "HaikuForCausalLM": {
-   "model_type": "haiku",
-   "family": "Haiku"
-  },
-  "VaporForCausalLM": {
-   "model_type": "vapor",
-   "family": "Vapor (lfm2-shaped config, different tensors)"
-  },
-  "FidelForCausalLM": {
-   "model_type": "fidel",
-   "family": "Mamba/MoE hybrid"
-  },
-  "Zarya": {
-   "model_type": "zarya",
-   "family": "Zarya, diffusion LM sampler"
-  },
-  "Needle3ForCausalLM": {
-   "model_type": "needle3",
-   "family": "Sakura Needle-3 (ONNX export)"
-  },
-  "SepiaCharMLP": {
-   "model_type": "sepia-char-mlp",
-   "family": "SEPIA character-level MLP"
-  },
-  "KairoForCausalLM": {
-   "model_type": "kairo",
-   "family": "Kairo (crypto-model research)"
-  },
-  "GrugMoeForCausalLM": {
-   "model_type": "grug_moe",
-   "family": "Grug MoE (marin-community research MoE)",
-   "watch": "report"
-  },
-  "HrmTextForCausalLM": {
-   "model_type": "hrm_text",
-   "family": "HRM-Text hierarchical-reasoning LM (Sapient)",
-   "watch": "report",
-   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps HrmTextForCausalLM -> hrm_text (conversion/__init__.py, conversion/hrm_text.py), registers LLM_ARCH_HRM_TEXT (src/llama-arch.cpp) and builds its graph in src/models/hrm-text.cpp. docs/arch-gaps.md carries the dated note."
-  },
-  "DFlash2DraftModel": {
-   "model_type": "dflash2",
-   "family": "DFlash2 speculative drafter (speculators; selector + conv heads the pinned dflash does not run)",
-   "watch": "report",
-   "mapped_ok": "the pinned backend now runs DFlash2, the condition docs/arch-gaps.md set: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) registers DFlash2DraftModel with DFlashDraftModel in conversion/qwen.py, which writes conv_kernel_size, conv_group_size, selector_rank, selector_top_k and the candidate_selector codebooks, and src/models/dflash.cpp loads selector_prev/next/hidden and builds them (build_dflash2_conv, build_dflash2_selector). docs/arch-gaps.md carries the dated note."
-  },
-  "DiacritizerModel": {
-   "model_type": "tashkeel_nano",
-   "family": "tashkeel_nano Arabic diacritizer (bidirectional tagger, not a decoder)",
-   "watch": "report"
-  },
-  "MBartForConditionalGeneration": {
-   "model_type": "mbart",
-   "family": "mBART encoder-decoder seq2seq (no decoder-only route)",
+  "BagelForConditionalGeneration": {
+   "model_type": "bagel",
+   "family": "BAGEL-style unified understand+generate model (first seen: benson123dc/tmp-4461ae1a1900, 4 models in the 2026-11-12 census). Composite config: llm_config Qwen2 (hidden 3584, 28 layers, 28 heads / 4 KV) with qk_norm, a SigLIP vit_config (27 layers, patch 14) and a VAE latent path (visual_gen true). Every LLM layer carries a second Mixture-of-Transformers copy (*_moe_gen q/k/v/o, MLP and norms) for the image-generation tokens. Not an alias of Qwen2ForCausalLM: the qwen2 graph has no q_norm/k_norm and no _moe_gen weights, so even an understanding-only text path needs its own converter.",
    "watch": "report"
   },
   "BlindForCausalLM": {
@@ -95,43 +11,40 @@
    "family": "KenT Compressed-QK attention + gated key refinement (Vi-LAB)",
    "watch": "report"
   },
-  "NanochronoForCausalLM": {
-   "model_type": "sn38-nanochrono",
-   "family": "sn38-nanochrono (ChronoLLM tap/aux-gate stack)",
-   "watch": "report"
-  },
-  "MuseSparkForConditionalGeneration": {
-   "model_type": "muse_spark",
-   "family": "Meta Muse Spark Open (816B-A42B latent-MoE, vision + audio; upstream llama.cpp ba3c05f71, after the pin)",
-   "watch": "report",
-   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps MuseSparkForConditionalGeneration -> muse_spark (conversion/__init__.py, conversion/muse_spark.py), registers LLM_ARCH_MUSE_SPARK (src/llama-arch.cpp) and builds its graph in src/models/muse-spark.cpp. docs/arch-gaps.md carries the dated note."
-  },
-  "Glm5NextForConditionalGeneration": {
-   "model_type": "glm5_next",
-   "family": "GLM-5.3-Flash (KDA linear-attention + DeepSeek sparse attention hybrid, hyper-connections; upstream llama.cpp 649dcb10, after the pin)",
-   "watch": "report",
-   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps Glm5NextForConditionalGeneration -> glm5-next (conversion/__init__.py; text in conversion/glm.py, vision tower in conversion/qwen3vl.py), registers LLM_ARCH_GLM5_NEXT (src/llama-arch.cpp, with its KDA + MLA cache layout in src/llama-model.cpp) and builds its graph in src/models/glm5-next.cpp. docs/arch-gaps.md carries the dated note."
-  },
-  "LiveMemForCausalLM": {
-   "model_type": "livemem",
-   "family": "LiveMem RL backbone (Qwen2.5-shaped dense decoder, MLX q4 uploads)",
-   "watch": "report"
-  },
   "CDMMoELMPoincare": {
    "model_type": "cdm_moe_poincare",
    "family": "CDM Poincare-geometry MoE (hyperbolic attention + telepathy gate, 629M, one uploader)",
    "watch": "report"
   },
-  "Senryu2ForCausalLM": {
-   "model_type": "senryu2",
-   "family": "Senryu-2.2 GDN2 + parallax-attention hybrid with repo-local n-gram tables",
+  "Cosmos3EdgeForConditionalGeneration": {
+   "model_type": "cosmos3_edge",
+   "family": "Cosmos3-Edge, video world model"
+  },
+  "DFlash2DraftModel": {
+   "model_type": "dflash2",
+   "family": "DFlash2 speculative drafter (speculators; selector + conv heads the pinned dflash does not run)",
+   "watch": "report",
+   "mapped_ok": "the pinned backend now runs DFlash2, the condition docs/arch-gaps.md set: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) registers DFlash2DraftModel with DFlashDraftModel in conversion/qwen.py, which writes conv_kernel_size, conv_group_size, selector_rank, selector_top_k and the candidate_selector codebooks, and src/models/dflash.cpp loads selector_prev/next/hidden and builds them (build_dflash2_conv, build_dflash2_selector). docs/arch-gaps.md carries the dated note."
+  },
+  "DeepseekV41ForCausalLM": {
+   "model_type": "deepseek_v41",
+   "family": "DeepSeek V4.1 (engram embeddings + candidate-block sparse attention; NOT an alias of deepseek4 - different layer/head/expert shape, and the V4 path runs neither, which is why it needed its own port)",
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 5e6388a5a maps DeepseekV41ForCausalLM -> deepseek41 (conversion/__init__.py), registers LLM_ARCH_DEEPSEEK41 (src/llama-arch.cpp) and implements hparams/tensors/graph/engram in src/models/deepseek41.cpp - fork #156, the port of upstream #31086 + #31300. tools/registry_build.py --check-gaps stays quiet for this class; docs/arch-gaps.md carries the dated note."
+  },
+  "DeepseekV4FlashSuperExpertForCausalLM": {
+   "model_type": "deepseek_v4_flash_superexpert",
+   "family": "DeepSeek V4.1 Flash SuperExpert, published as remote code and with AW-SECD-compressed weights (8.5 GB, claimed 0.962 retention); MLA-style geometry (kv_lora_rank 512, q_lora_rank 1536, qk_rope_head_dim 64, v_head_dim 128, 32 heads / 16 KV, IM 4096). Not an alias of deepseek_v41: nothing at the pin decodes AW-SECD weights, so mapping it would name a backend that cannot read it",
    "watch": "report"
   },
-  "GraniteSwitchForCausalLM": {
-   "model_type": "granite_switch",
-   "family": "Granite Switch 4.1 (dense all-attention Granite with N embedded per-token LoRA adapters, a zero adapter slot and weightless switch layers; upstream llama.cpp 157b81fe, not in the pin)",
-   "watch": "report",
-   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps GraniteSwitchForCausalLM -> graniteswitch (conversion/__init__.py, conversion/granite.py), registers LLM_ARCH_GRANITE_SWITCH (src/llama-arch.cpp) and builds its graph in src/models/granite-switch.cpp. docs/arch-gaps.md carries the dated note."
+  "DiacritizerModel": {
+   "model_type": "tashkeel_nano",
+   "family": "tashkeel_nano Arabic diacritizer (bidirectional tagger, not a decoder)",
+   "watch": "report"
+  },
+  "EnglishBaseForCausalLM": {
+   "model_type": "fabryka_english_base",
+   "family": "relu2 MLP + parameter-free QK-norm (implemented in the old engine only)"
   },
   "Ernie5_5_MoeForCausalLM": {
    "model_type": "ernie5_5_moe",
@@ -143,15 +56,17 @@
    "family": "Factorial selection/memmap LM (repo-local training and inference code, .pt + weights.dat, SentencePiece; not a Transformer decoder, so nothing to alias)",
    "watch": "report"
   },
-  "Lfm3ForCausalLM": {
-   "model_type": "lfm3",
-   "family": "LiquidAI LFM3 (sandwich norms, sliding-attention layers with partial rotary, 7-tap conv cache, tied embeddings; not an alias of lfm2/lfm2moe, nothing at the pin registers it)",
-   "watch": "report",
-   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps Lfm3ForCausalLM -> lfm3 (conversion/__init__.py, conversion/lfm3.py), registers LLM_ARCH_LFM3 (src/llama-arch.cpp) and builds its graph in src/models/lfm3.cpp. docs/arch-gaps.md carries the dated note."
+  "FidelForCausalLM": {
+   "model_type": "fidel",
+   "family": "Mamba/MoE hybrid"
   },
-  "NeedleForToolCalling": {
-   "model_type": "needle",
-   "family": "Cactus-Compute needle3 tool-calling model (hadamard MLP, engram slots, confidence head, cactus-quants, .cact container for its own on-device runtime; not a Transformer a pinned backend can load)",
+  "GDN2ForCausalLM": {
+   "model_type": "gdn2",
+   "family": "GDN2 hybrid (fla config)"
+  },
+  "GPT": {
+   "model_type": "nanogpt-custom",
+   "family": "nanoGPT-style one-offs (first seen: learner-subodh/Delivery-Rider-Assistant-SLM). 'GPT' is the class name nanoGPT's model.py exports, so this key covers any upload that saves nanoGPT's own state dict. Not an alias of GPT2LMHeadModel: the config uses nanoGPT's keys (n_embd 384, n_layer 6, n_head 8, block_size 256, bias, dropout) rather than GPT2Config's n_positions/n_ctx, the repo carries only a pickled pytorch_model.bin (no safetensors, no tokenizer files; the card names tiktoken gpt2), and nanoGPT stores nn.Linear weights where GPT-2's checkpoint stores Conv1D (transposed), so the gpt2 converter would read every projection the wrong way round. Nothing at the pin registers the class. Declined on 2026-11-09 under engine #1667; the census reports it as . REVIEWED. Remove this entry if a backend gains a nanoGPT import.",
    "watch": "report"
   },
   "GRTForCausalLM": {
@@ -159,34 +74,86 @@
    "family": "GRT rotational/coupling decoder (MatterWaveAI grt-30m-code, 8 models in registry/census.json). Not an alias of anything mapped: the config reads model_type grt with a rotational coupling mixer (n_qkv_rotations 11, n_mixer_rotations 1, mor_router_mode rotational, mor_delta_scale 0.5, coupling_init_mode diagonal, angle_init_scale 0.1), learnable_rope with rope_placement stream, residual_gate_mode bounded_depth, no residual norm, and it declares transformers_version 5.23.0.dev0 - a research decoder, not a llama/qwen shape with extra keys. Nothing at the pin registers the class or a 'grt' gguf architecture (conversion/ has no grt module, src/llama-arch.cpp has no grt arch), so mapping it would claim a graph the engine cannot run. Declined with this reason on 2026-11-07 under engine #1328; the census reports it as . REVIEWED instead of !! UNCOVERED. Remove this entry and watch: report if a backend ever ports it.",
    "watch": "report"
   },
-  "RMSN": {
-   "model_type": "rmsn",
-   "family": "RMSN, Resonant Metriplectic Sheaf Network (DuoNeural physical-informed research decoder: model_type rmsn with dim/depth/slots/seq_len and a Lyapunov diagnostic in the config, card tags port-hamiltonian/metriplectic/lyapunov/sheaf, its own GitHub runtime - a continuous-time dynamical system, not a Transformer with attention/FFN tensors). Not an alias of anything mapped: config.json declares architectures [RMSN] with vocab_size 49152 on the HuggingFaceTB/cosmo2-tokenizer, dim 1024, depth 16, slots 64, seq_len 512, 243.7 M parameters and no attention/FFN keys, and nothing at the pin registers the class or an 'rmsn' gguf architecture (conversion/ has no module for it, src/llama-arch.cpp has no arch), so mapping it would claim a graph the engine cannot run. Declined with this reason on 2026-11-08 under engine #1451; the census reports it as . REVIEWED instead of !! UNCOVERED. Remove this entry and watch: report if a backend ever ports it.",
+  "Glm5NextForConditionalGeneration": {
+   "model_type": "glm5_next",
+   "family": "GLM-5.3-Flash (KDA linear-attention + DeepSeek sparse attention hybrid, hyper-connections; upstream llama.cpp 649dcb10, after the pin)",
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps Glm5NextForConditionalGeneration -> glm5-next (conversion/__init__.py; text in conversion/glm.py, vision tower in conversion/qwen3vl.py), registers LLM_ARCH_GLM5_NEXT (src/llama-arch.cpp, with its KDA + MLA cache layout in src/llama-model.cpp) and builds its graph in src/models/glm5-next.cpp. docs/arch-gaps.md carries the dated note."
+  },
+  "GraniteSwitchForCausalLM": {
+   "model_type": "granite_switch",
+   "family": "Granite Switch 4.1 (dense all-attention Granite with N embedded per-token LoRA adapters, a zero adapter slot and weightless switch layers; upstream llama.cpp 157b81fe, not in the pin)",
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps GraniteSwitchForCausalLM -> graniteswitch (conversion/__init__.py, conversion/granite.py), registers LLM_ARCH_GRANITE_SWITCH (src/llama-arch.cpp) and builds its graph in src/models/granite-switch.cpp. docs/arch-gaps.md carries the dated note."
+  },
+  "GrugMoeForCausalLM": {
+   "model_type": "grug_moe",
+   "family": "Grug MoE (marin-community research MoE)",
    "watch": "report"
+  },
+  "HaikuForCausalLM": {
+   "model_type": "haiku",
+   "family": "Haiku"
+  },
+  "HrmTextForCausalLM": {
+   "model_type": "hrm_text",
+   "family": "HRM-Text hierarchical-reasoning LM (Sapient)",
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps HrmTextForCausalLM -> hrm_text (conversion/__init__.py, conversion/hrm_text.py), registers LLM_ARCH_HRM_TEXT (src/llama-arch.cpp) and builds its graph in src/models/hrm-text.cpp. docs/arch-gaps.md carries the dated note."
   },
   "IndonesianChatLM": {
    "model_type": "indonesian_chat_lm",
    "family": "Liwet (fadhilahkhairogi, a from-scratch Indonesian coursework MoE: Liwet-400M-A188M-id-{base,instruct,chat}). Not an alias of anything mapped. The repo ships config.json, model.safetensors and a tokenizer but no modeling code and no auto_map, and the class is not registered at the pin (conversion/ has no module for it, src/llama-arch.cpp has no arch). Its tensors are read from the safetensors header: no 'model.' prefix; per layer, q/k/v/o (16Q/4KV, head_dim 64, no q/k norm), a fused gate_up_proj [8, 1024, 720] and down_proj [8, 360, 1024] over 8 experts top-2, a router.weight [8, 1024], and two non-standard buffers, expert_bias [8] and load_ema [8], alongside router_bias_update_speed / router_load_decay / moe_capacity_factor in the config. Whether expert_bias enters the selection only (aux-loss-free balancing) or also the weights, and whether routing is softmax or sigmoid, is defined nowhere the engine can read, and the config's intermediate_size 2880 has no tensor behind it. Mapping it to a Mixtral/Qwen-MoE family would claim a routing rule the uploader never published. Declined on 2026-11-09 under engine #1667; the census reports it as . REVIEWED. Remove this entry if the uploader publishes modeling code a backend ports.",
    "watch": "report"
   },
-  "GPT": {
-   "model_type": "nanogpt-custom",
-   "family": "nanoGPT-style one-offs (first seen: learner-subodh/Delivery-Rider-Assistant-SLM). 'GPT' is the class name nanoGPT's model.py exports, so this key covers any upload that saves nanoGPT's own state dict. Not an alias of GPT2LMHeadModel: the config uses nanoGPT's keys (n_embd 384, n_layer 6, n_head 8, block_size 256, bias, dropout) rather than GPT2Config's n_positions/n_ctx, the repo carries only a pickled pytorch_model.bin (no safetensors, no tokenizer files; the card names tiktoken gpt2), and nanoGPT stores nn.Linear weights where GPT-2's checkpoint stores Conv1D (transposed), so the gpt2 converter would read every projection the wrong way round. Nothing at the pin registers the class. Declined on 2026-11-09 under engine #1667; the census reports it as . REVIEWED. Remove this entry if a backend gains a nanoGPT import.",
+  "KairoForCausalLM": {
+   "model_type": "kairo",
+   "family": "Kairo (crypto-model research)"
+  },
+  "Lfm3ForCausalLM": {
+   "model_type": "lfm3",
+   "family": "LiquidAI LFM3 (sandwich norms, sliding-attention layers with partial rotary, 7-tap conv cache, tied embeddings; not an alias of lfm2/lfm2moe, nothing at the pin registers it)",
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps Lfm3ForCausalLM -> lfm3 (conversion/__init__.py, conversion/lfm3.py), registers LLM_ARCH_LFM3 (src/llama-arch.cpp) and builds its graph in src/models/lfm3.cpp. docs/arch-gaps.md carries the dated note."
+  },
+  "LiveMemForCausalLM": {
+   "model_type": "livemem",
+   "family": "LiveMem RL backbone (Qwen2.5-shaped dense decoder, MLX q4 uploads)",
    "watch": "report"
   },
-  "DeepseekV4FlashSuperExpertForCausalLM": {
-   "model_type": "deepseek_v4_flash_superexpert",
-   "family": "DeepSeek V4.1 Flash SuperExpert, published as remote code and with AW-SECD-compressed weights (8.5 GB, claimed 0.962 retention); MLA-style geometry (kv_lora_rank 512, q_lora_rank 1536, qk_rope_head_dim 64, v_head_dim 128, 32 heads / 16 KV, IM 4096). Not an alias of deepseek_v41: nothing at the pin decodes AW-SECD weights, so mapping it would name a backend that cannot read it",
+  "MBartForConditionalGeneration": {
+   "model_type": "mbart",
+   "family": "mBART encoder-decoder seq2seq (no decoder-only route)",
    "watch": "report"
   },
-  "OpensciForCausalLM": {
-   "model_type": "opensci",
-   "family": "OpenSci (1.7B 'nemotron-hq' recipe). A REMOTE-CODE class: its config carries an auto_map pointing at modeling_opensci.py / configuration_opensci.py, so the pinned backends cannot accept the architecture without that custom code. Not an alias of any supported family, and not mappable until the code is vendored or upstreamed.",
+  "MegatronGPTMoeForCausalLM": {
+   "model_type": "megatron_gpt_moe",
+   "family": "Megatron-LM GPT-MoE: a training-framework checkpoint format with its own modeling code, not a serving topology. A gguf conversion of one lands on whichever architecture its exporter targets, so there is no single engine arch this class maps to and treating it as an alias of qwen*moe / llama / deepseek2 would serve the model with the wrong tensor names. Checked 2026-11-17 against nagohachi/tiny-lm-v3-japanese-1.5b-a500m-sft: HF tags include megatron_gpt_moe and custom_code.",
+   "watch": "report",
+   "checked": "2026-11-17"
+  },
+  "MolmoAct2ForConditionalGeneration": {
+   "model_type": "molmoact2",
+   "family": "MolmoAct2, vision-language-action"
+  },
+  "MuseSparkForConditionalGeneration": {
+   "model_type": "muse_spark",
+   "family": "Meta Muse Spark Open (816B-A42B latent-MoE, vision + audio; upstream llama.cpp ba3c05f71, after the pin)",
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 2c178f44b (llama.cpp #327, engine#2138) maps MuseSparkForConditionalGeneration -> muse_spark (conversion/__init__.py, conversion/muse_spark.py), registers LLM_ARCH_MUSE_SPARK (src/llama-arch.cpp) and builds its graph in src/models/muse-spark.cpp. docs/arch-gaps.md carries the dated note."
+  },
+  "NanochronoForCausalLM": {
+   "model_type": "sn38-nanochrono",
+   "family": "sn38-nanochrono (ChronoLLM tap/aux-gate stack)",
    "watch": "report"
   },
-  "BagelForConditionalGeneration": {
-   "model_type": "bagel",
-   "family": "BAGEL-style unified understand+generate model (first seen: benson123dc/tmp-4461ae1a1900, 4 models in the 2026-11-12 census). Composite config: llm_config Qwen2 (hidden 3584, 28 layers, 28 heads / 4 KV) with qk_norm, a SigLIP vit_config (27 layers, patch 14) and a VAE latent path (visual_gen true). Every LLM layer carries a second Mixture-of-Transformers copy (*_moe_gen q/k/v/o, MLP and norms) for the image-generation tokens. Not an alias of Qwen2ForCausalLM: the qwen2 graph has no q_norm/k_norm and no _moe_gen weights, so even an understanding-only text path needs its own converter.",
+  "Needle3ForCausalLM": {
+   "model_type": "needle3",
+   "family": "Sakura Needle-3 (ONNX export)"
+  },
+  "NeedleForToolCalling": {
+   "model_type": "needle",
+   "family": "Cactus-Compute needle3 tool-calling model (hadamard MLP, engram slots, confidence head, cactus-quants, .cact container for its own on-device runtime; not a Transformer a pinned backend can load)",
    "watch": "report"
   },
   "OleanderForCausalLM": {
@@ -194,15 +161,60 @@
    "family": "Oleander-150M, a from-scratch training export (first seen: CyanMonkey/Test-Subject-3; its own config says step 2000 of 28820, 6.94 %). Hybrid 28 layers in a gdn2,gdn2,gdn2,gqa pattern, hidden 576, vocab 32770, F32. Ships no modelling code and no auto_map. Not an alias of the Qwen3.5 / Qwen3-Next linear-attention families despite the same layer_types: gdn2 layers carry per-q/k/v conv1d and low-rank f/g gate projections, every sublayer has attention-residual mixers (attn_res_*), and GQA layers a fused qg_proj and a value-residual v_mix; no pinned graph has those tensors.",
    "watch": "report"
   },
-  "Skylar2ForCausalLM": {
-   "model_type": "skylar2",
-   "family": "Skylar 2 (first seen: Skyl4r-Ai/Skylar2-1B-Instruct, the 2026-11-13 census), a from-scratch 1B hybrid that loads through its own `skylar` pip package (no auto_map, no modelling code in the repo). 36 layers, hidden 1536, vocab 64000: 27 KDA linear-attention layers (A_log, dt_bias, per-q/k/v short conv, low-rank f_a/f_b and g_a/g_b gates) and 9 GQA layers (12 heads / 4 KV, qk_norm, a per-head output gate W_gate) in a 3:1 pattern; every norm is a gated RMSNorm with rank-16 gate_up/gate_down, every sublayer has an attention-residual mixer (res_attn/res_ffn query + key_weight), and the FFN uses a situ_glu activation. Not an alias of KimiLinearForCausalLM (different KDA gate, norms and residual mixers) nor of Kimi K3 in llama.cpp #327, which shares situ and attention residuals but uses MLA attention, a full-rank KDA gate and a latent MoE. No pinned graph has these tensors.",
+  "OpensciForCausalLM": {
+   "model_type": "opensci",
+   "family": "OpenSci (1.7B 'nemotron-hq' recipe). A REMOTE-CODE class: its config carries an auto_map pointing at modeling_opensci.py / configuration_opensci.py, so the pinned backends cannot accept the architecture without that custom code. Not an alias of any supported family, and not mappable until the code is vendored or upstreamed.",
    "watch": "report"
+  },
+  "Qwen3Mamba3ForCausalLM": {
+   "model_type": "qwen3_mamba3",
+   "family": "Qwen3 + Mamba-3 hybrid"
+  },
+  "Qwen3_5MLAForConditionalGeneration": {
+   "model_type": "qwen3_5_mla",
+   "family": "Qwen3.5 MLA attention variant"
+  },
+  "QwenDriveForPlanning": {
+   "model_type": "qwen_drive",
+   "family": "Qwen-Drive, driving planner"
+  },
+  "RMSN": {
+   "model_type": "rmsn",
+   "family": "RMSN, Resonant Metriplectic Sheaf Network (DuoNeural physical-informed research decoder: model_type rmsn with dim/depth/slots/seq_len and a Lyapunov diagnostic in the config, card tags port-hamiltonian/metriplectic/lyapunov/sheaf, its own GitHub runtime - a continuous-time dynamical system, not a Transformer with attention/FFN tensors). Not an alias of anything mapped: config.json declares architectures [RMSN] with vocab_size 49152 on the HuggingFaceTB/cosmo2-tokenizer, dim 1024, depth 16, slots 64, seq_len 512, 243.7 M parameters and no attention/FFN keys, and nothing at the pin registers the class or an 'rmsn' gguf architecture (conversion/ has no module for it, src/llama-arch.cpp has no arch), so mapping it would claim a graph the engine cannot run. Declined with this reason on 2026-11-08 under engine #1451; the census reports it as . REVIEWED instead of !! UNCOVERED. Remove this entry and watch: report if a backend ever ports it.",
+   "watch": "report"
+  },
+  "RusMindAIForCausalLM": {
+   "model_type": "rusmind_ai",
+   "family": "RusMind AI: a from-scratch architecture with its own modeling code, not a rename of a supported family. Checked 2026-11-17 against DICPlay/RusMind-Zernyshko-2.0.1: HF tags include rusmind_ai, from-scratch and custom_code, which is the evidence that it is neither an alias nor a conversion target today.",
+   "watch": "report",
+   "checked": "2026-11-17"
   },
   "SegaForCausalLM": {
    "model_type": "sega_tot_moe",
    "family": "Sega 7.0 'Singularity-Infinity' (the123manaic) - 40 layers, hidden 4096, 64 heads. Reviewed as NOT an alias of a family we serve: model_type `sega_tot_moe` is not supported, the config carries non-standard `reasoning_passes` / `reasoning_speed_*` keys, and there is no auto_map (so it is not the remote-code case either - it is a custom architecture with a plain config).",
    "watch": "report"
+  },
+  "Senryu2ForCausalLM": {
+   "model_type": "senryu2",
+   "family": "Senryu-2.2 GDN2 + parallax-attention hybrid with repo-local n-gram tables",
+   "watch": "report"
+  },
+  "SepiaCharMLP": {
+   "model_type": "sepia-char-mlp",
+   "family": "SEPIA character-level MLP"
+  },
+  "Skylar2ForCausalLM": {
+   "model_type": "skylar2",
+   "family": "Skylar 2 (first seen: Skyl4r-Ai/Skylar2-1B-Instruct, the 2026-11-13 census), a from-scratch 1B hybrid that loads through its own `skylar` pip package (no auto_map, no modelling code in the repo). 36 layers, hidden 1536, vocab 64000: 27 KDA linear-attention layers (A_log, dt_bias, per-q/k/v short conv, low-rank f_a/f_b and g_a/g_b gates) and 9 GQA layers (12 heads / 4 KV, qk_norm, a per-head output gate W_gate) in a 3:1 pattern; every norm is a gated RMSNorm with rank-16 gate_up/gate_down, every sublayer has an attention-residual mixer (res_attn/res_ffn query + key_weight), and the FFN uses a situ_glu activation. Not an alias of KimiLinearForCausalLM (different KDA gate, norms and residual mixers) nor of Kimi K3 in llama.cpp #327, which shares situ and attention residuals but uses MLA attention, a full-rank KDA gate and a latent MoE. No pinned graph has these tensors.",
+   "watch": "report"
+  },
+  "VaporForCausalLM": {
+   "model_type": "vapor",
+   "family": "Vapor (lfm2-shaped config, different tensors)"
+  },
+  "Zarya": {
+   "model_type": "zarya",
+   "family": "Zarya, diffusion LM sampler"
   }
  }
 }

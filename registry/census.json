@@ -7,8 +7,8 @@
    "declined": "a human reviewed the class and deliberately did not map it (registry/significant.json, `watch: \"report\"`). Counted separately and excluded from top_unmapped: it is a recorded decision, not work remaining. The denominator is unchanged -- declined models are still `with_architecture`",
    "with_architecture": "models whose HF card names an architecture this census can look up; models with no architecture are excluded from every percentage above"
   },
-  "declined_models": 434,
-  "declined_architectures": 21,
+  "declined_models": 442,
+  "declined_architectures": 23,
   "models": 438457,
   "with_architecture": 345360,
   "architectures_seen": 3071,

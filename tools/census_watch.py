@@ -973,8 +973,14 @@ def report(models, res, previously_seen):
     # run that sent one and still got no config back
     hint = " (HF_TOKEN sent, still no config)" if hf_token() else ""
     for mid in sorted(res[UNVERIFIABLE]):
+        # engine#2528: this said "retried next run", which is not what happens. remember() records an
+        # unverifiable model in state["seen"] like every other group, and classify() skips anything already
+        # there -- so the row is reported ONCE and then goes quiet. Promising a retry that never comes is how a
+        # daily report teaches its readers to skim: they wait for a resolution, stop seeing the line, and cannot
+        # tell "resolved" from "remembered". Say which one it is, and name the way back in.
         print(f"  ? UNVERIFIABLE {mid} ({res['reasons'][mid]}) — gated repos need a token{hint}; "
-              f"retried next run")
+              f"recorded, not retried automatically (remove it from {DEFAULT_STATE}, or add a token and "
+              f"re-run, to see it again)")
     return 1 if any(c not in quiet for c in res["classes"]) else 0
 
 

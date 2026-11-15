@@ -571,6 +571,14 @@ kill "$watchdog" 2> /dev/null
 wait "$watchdog" 2> /dev/null
 # And end whatever is left from here too, so the promise does not depend on a helper having outlived its parent.
 kill_tree "$child"
-log "command exited $rc after ${held}s"
+if [ "$rc" = 124 ]; then
+    # engine#2542, measured on the NPU: a ticket cut short by the max hold was followed 8m29s later -- with nothing
+    # running -- by `Unsupported op 18` and an IO_PAGE_FAULT burst, and the two other bursts of that boot sat 3m26s
+    # and 1m36s after other releases. Fault lines can therefore be the PREVIOUS ticket's deferred work, and the next
+    # lane's take-time refusal (#2498) must not read as the next lane's fault. One clause here is what tells them apart.
+    log "command exited 124 after ${held}s (the max hold cut it short: the device can still be finishing deferred work, so fault lines may appear AFTER this release)"
+else
+    log "command exited $rc after ${held}s"
+fi
 release
 exit "$rc"

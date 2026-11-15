@@ -88,6 +88,29 @@ def kat(url, *args):
     return p.returncode, p.stdout
 
 
+def missing_model_is_a_skip():
+    """engine#2501: a GGUF that is not on this runner must SKIP its row and be named at the end, not FAIL it.
+
+    The FAIL cost every PR's gate a row for a reason no PR could fix, and the row was red on main's own pin. The
+    opposite mistake is worse: a silently skipped model makes the matrix look complete, so the run has to say which
+    rows it did not exercise. Both halves are asserted from the script text, like the lock invariant above (no GPU,
+    no models: the behaviour under test is what the missing-file branch does)."""
+    bad = []
+    with open(os.path.join(ROOT, "scripts", "hw-gate.sh")) as f:
+        src = f.read()
+    if 'result "model $name" FAIL 0 "model missing' in src:
+        bad.append("a missing GGUF still FAILs its row (engine#2501)")
+    if 'result "model $name" SKIP 0 "not on this runner' not in src:
+        bad.append("a missing GGUF does not SKIP its row with the path named")
+    if "missing_models=" not in src or "model rows skipped because the GGUF is not on this runner" not in src:
+        bad.append("skipped model rows are not named in the run summary")
+    # the skip must not set infra: a missing model is an environment fact, not an infrastructure failure
+    i = src.find('result "model $name" SKIP 0')
+    if i != -1 and "infra=1" in src[i:i + 400]:
+        bad.append("the missing-model skip still raises infra (the gate would exit 2)")
+    return bad
+
+
 def script_invariants():
     """The gate's lock placement, from the script itself (no GPU needed): engine#682 took ~/npu.lock off the
     GPU steps, because an NPU serve and the GPU run concurrently here (engine#673 measured ~87 % of the NPU
@@ -111,6 +134,7 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{srv.server_address[1]}"
     bad = script_invariants()
+    bad += missing_model_is_a_skip()
     with tempfile.TemporaryDirectory() as d:
         gold = os.path.join(d, "g.json")
         STATE["mode"] = "good"

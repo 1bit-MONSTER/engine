@@ -635,7 +635,14 @@ if has kat || has needle || has kld; then
   while IFS='|' read -r name file repeat donee srvargs; do
     want_model "$name" || continue
     model=$MODELS/$file base=$STORE/kld/$name.kld
-    if [ ! -f "$model" ]; then result "model $name" FAIL 0 "model missing: $model"; infra=1; continue; fi
+    # engine#2501: a model file that is not on this runner is an ENVIRONMENT fact, not a gate result, and a FAIL
+    # row here reds every PR's gate for a reason no PR can fix. SKIP it and name the path -- and collect it, so the
+    # run ends with one line saying which models were not exercised instead of a silently smaller matrix.
+    if [ ! -f "$model" ]; then
+      result "model $name" SKIP 0 "not on this runner: $model"
+      missing_models="${missing_models:-} $name"
+      continue
+    fi
     dokat=0; has kat && dokat=1
     needle=0; [ "$donee" = 1 ] && has needle && needle=1
     dokld=0; has kld && [ -f "$TEXT" ] && [ -z "$srvargs" ] && dokld=1
@@ -802,6 +809,10 @@ rings=$(ring_timeouts)
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
 cat "$OUT/summary.md"
 if [ "$nfail" != 0 ]; then
+  # engine#2501: coverage that did not happen has to be visible on the run, or the matrix looks complete.
+  if [ -n "${missing_models:-}" ]; then
+    note "::warning::model rows skipped because the GGUF is not on this runner:"$missing_models
+  fi
   [ "$infra" = 1 ] && exit 2
   exit 1
 fi

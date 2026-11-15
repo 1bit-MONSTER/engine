@@ -42,13 +42,18 @@ unit=${1:-}; url=${2:-}; limit=${3:-900}
 demand=${TICKETED_WAIT_DEMAND:-$HOME/.cache/$unit/demand}
 poll=${TICKETED_WAIT_POLL_S:-5}
 model=${TICKETED_WAIT_MODEL:-m}   # 1bit serve answers any model name with its loaded model
+# $1 = the most seconds this probe may take: SECONDS is a hard bound, so a server that accepts and then hangs cannot
+# stretch the wait by a probe's own timeout (review of #2590)
 up() {
-    [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' "${url%/}/v1/models" 2> /dev/null)" = 200 ] || return 1
-    [ "$(curl -s -o /dev/null -m 30 -w '%{http_code}' -H 'Content-Type: application/json' \
+    local cap=${1:-30} m1 m2
+    m1=$(( cap < 5 ? cap : 5 )); m2=$(( cap < 30 ? cap : 30 ))
+    [ "$m1" -ge 1 ] || return 1
+    [ "$(curl -s -o /dev/null -m "$m1" -w '%{http_code}' "${url%/}/v1/models" 2> /dev/null)" = 200 ] || return 1
+    [ "$(curl -s -o /dev/null -m "$m2" -w '%{http_code}' -H 'Content-Type: application/json' \
          -d '{"model":"'"$model"'","messages":[{"role":"user","content":"ok"}],"max_tokens":1,"temperature":0}' \
          "${url%/}/v1/chat/completions" 2> /dev/null)" = 200 ]
 }
-up && exit 0
+up "$(( limit < 30 ? (limit < 1 ? 1 : limit) : 30 ))" && exit 0
 mkdir -p "$(dirname "$demand")" && touch "$demand" || { echo "ticketed-wait: cannot touch $demand" >&2; exit 2; }
 start=$(date +%s); touched=$start
 echo "ticketed-wait: asked for $unit (touched $demand); waiting up to ${limit}s for $url; GPU token: $(head -c 80 "${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}" 2> /dev/null | head -1)" >&2
@@ -60,6 +65,8 @@ while :; do
         exit 75
     fi
     [ $(( now - touched )) -ge 30 ] && { touch "$demand"; touched=$now; }
-    sleep "$poll"
-    up && { echo "ticketed-wait: $unit answers after $(( $(date +%s) - start ))s" >&2; touch "$demand"; exit 0; }
+    rem=$(( limit - (now - start) ))
+    sleep "$(( poll < rem ? poll : rem ))"
+    rem=$(( limit - ($(date +%s) - start) ))
+    [ "$rem" -ge 1 ] && up "$rem" && { echo "ticketed-wait: $unit answers after $(( $(date +%s) - start ))s" >&2; touch "$demand"; exit 0; }
 done

@@ -178,6 +178,40 @@ Every one of them produces the same symptom — **an empty result** — which is
 might legitimately be looking for. That is why the pre-flight is not optional: it is the only thing that separates
 "nothing happened" from "nothing was watching".
 
+## The same method on a second device (the NPU)
+
+The title says NVMe because that is where the fault stream was found, but nothing in the method is NVMe-specific:
+engine#2542 is the same instrument applied to the NPU (`0000:c6:00.1`, domain `0x0003`) on the same host, and it
+produced a diagnosis in two measurements without touching the device.
+
+```
+20 events this boot, two bursts: 10 @ 08:43, 10 @ 08:53
+walk: 0x4128000 0x4129000 … 0x4130000   (9 contiguous pages)
+      0x5128000                          (1 page, 16 MiB above)
+      0x4128000 …                        (restarts)
+flags=0x0007 on all 20
+```
+
+Four things generalise, and each one was a decision rather than a discovery:
+
+1. **Split by `(device, domain)` before counting.** The NVMe stream is domain `0x0015`, the NPU's is `0x0003`; a raw
+   `grep -c IO_PAGE_FAULT` mixes them and inflates whichever you were looking for. `tools/diag/iommu_fault_census.py`
+   exists for exactly this.
+2. **Decode `flags`.** `0x0007` is present=0, write=1, user=1 — a **write to a non-present page**, which rules out a
+   permission fault on live memory and points at an address that was never (or no longer) mapped. `flags=0x0000` on the
+   NVMe stream means the same for a read.
+3. **Read the walk, not the count.** Nine contiguous pages followed by one page far above is *two ranges in one stride*
+   — a descriptor list whose tenth entry lives elsewhere — not a scatter of unrelated pointers. The stride tells you
+   which structure to look for; the count tells you nothing.
+4. **Eliminate the spaces a number could belong to.** `Unsupported op 18` is outside the DRM ioctl ids (0–9) and the
+   command types (0–2) in the shipped UAPI, so it is an opcode in the command stream, and the engine repo cannot name it
+   either (its NPU path calls `xrt::run`; there is no opcode table in-tree). Three candidates eliminated in one pass.
+
+The pre-flight pattern above is what made the NPU run cheap: the live probe on those ten IOVAs found nothing in 8 s,
+which correctly said "these buffers are idle now" instead of being mistaken for the absence of unmaps. Hours-old bursts
+are not observable live — that is a property of the instrument, and knowing it saved a twenty-minute capture that could
+only have reported "idle".
+
 ## Two traps this runbook exists to stop
 
 * **A count without a device split is not a measurement.** `distinct` exposes the mixing.

@@ -5287,6 +5287,17 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
         const OnnxTensor& cc = onnx.tensors[onnx.index.at("cos_cache")];
         if (cc.dims.size() == 2 && cc.dims[0] > 1 && cc.dims[1] > 0 && cc.type == kF32) {
             const int64_t rows = cc.dims[0], half = cc.dims[1];
+            // engine#2571: the cache's second dimension is rotary_dim / 2. A pack that rotates only part of each head
+            // (Phi-4-mini: 48 frequency columns for head_dim 128, i.e. partial_rotary_factor 0.75) and ships no config.json
+            // used to be served with full rotary -- coherent for a few tokens, then drifting ('multiply 12 by 7 by 7 by 7').
+            // Stated configs win; otherwise the cache is the pack's own statement of its rotary span.
+            if (!c.contains("partial_rotary_factor") && p.dims.head_dim > 0 && 2 * half < int64_t(p.dims.head_dim) &&
+                half > 0) {
+                const double prf = double(2 * half) / double(p.dims.head_dim);
+                c["partial_rotary_factor"] = prf;
+                std::fprintf(stderr, "note: partial_rotary_factor %.4g taken from the pack's cos_cache (%lld of %d head "
+                                     "dims rotate)\n", prf, (long long)(2 * half), int(p.dims.head_dim));
+            }
             uint64_t need = 0;
             if (mul_ok(uint64_t(rows) * uint64_t(half), 4u, need)) {
                 std::vector<float> cache(size_t(rows) * size_t(half));
@@ -6728,6 +6739,17 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             const OnnxTensor& cc = onnx.tensors[onnx.index.at("cos_cache")];
             if (!cc.dims.empty() && cc.dims.size() == 2 && cc.dims.at(2 % cc.dims.size()) > 0) {
                 const int64_t rows = cc.dims.at(0), half = cc.dims.at(1);
+                // engine#2571: the cache's second dimension is rotary_dim / 2. A pack that rotates only part of each head
+                // (Phi-4-mini: 48 frequency columns for head_dim 128, i.e. partial_rotary_factor 0.75) and ships no config.json
+                // used to be served with full rotary -- coherent for a few tokens, then drifting ('multiply 12 by 7 by 7 by 7').
+                // Stated configs win; otherwise the cache is the pack's own statement of its rotary span.
+                if (!c.contains("partial_rotary_factor") && p.dims.head_dim > 0 && 2 * half < int64_t(p.dims.head_dim) &&
+                    half > 0) {
+                    const double prf = double(2 * half) / double(p.dims.head_dim);
+                    c["partial_rotary_factor"] = prf;
+                    std::fprintf(stderr, "note: partial_rotary_factor %.4g taken from the pack's cos_cache (%lld of %d head "
+                                         "dims rotate)\n", prf, (long long)(2 * half), int(p.dims.head_dim));
+                }
                 const size_t n = size_t(rows) * size_t(half);
                 uint64_t need = 0;
                 if (mul_ok(n, cc.type == kF32 ? 4u : 2u, need)) {

@@ -22,7 +22,15 @@
 # that silently passes because there was no model would be exactly the failure this tool exists to catch.
 set -u
 ROOT=${1:-$(cd "$(dirname "$0")/../.." && pwd)}
-FLOOR=${TOKEN_RATE_FLOOR:-0}
+# A REAL default, not 0. `--floor 0` means "record, do not judge" and exits 77 (SKIP), so a default of 0 would
+# make this row a permanent skip: registered, tested, never applied -- engine#2418's defect. 60 is measured, not
+# guessed: this row's own model (Qwen3-0.6B-Q4_K_M) ran **144.5 tok/s** sequential through `1bit serve` on
+# gfx1151 (2026-11-15), so 60 keeps 2.4x headroom and still catches a 2.4x regression. Override with TOKEN_RATE_FLOOR.
+FLOOR=${TOKEN_RATE_FLOOR:-60}
+if [ "$FLOOR" = "0" ]; then
+    echo "SKIPPED: token_rate_floor device row did NOT run -- TOKEN_RATE_FLOOR=0 is record-only, which asserts nothing; unset it to judge at the default 60" >&2
+    exit 77
+fi
 PORT=${TOKEN_RATE_PORT:-8191}
 SKIP=77
 

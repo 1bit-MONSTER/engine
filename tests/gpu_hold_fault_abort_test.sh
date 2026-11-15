@@ -107,6 +107,14 @@ take_run gfxhub "kernel: amdgpu 0000:c5:00.0: [gfxhub] page fault (src_id:0 ring
 take_run mesremove "kernel: amdgpu 0000:c5:00.0: amdgpu: MES failed to respond to msg=REMOVE_QUEUE"
 [ "$trc" = 78 ] || { echo "FAIL take-time: an MES REMOVE_QUEUE timeout -> rc $trc, want 78 (engine#2494)"; fail=1; }
 
+# every term of GPU_FAULT_RE gets an arm (#2538 review): without one, a term could drop out of the pattern and every
+# arm would stay green. These two were ridden only through other spellings.
+take_run ring "kernel: amdgpu 0000:c5:00.0: [drm] *ERROR* ring gfx_0.0.0 timeout, signaled seq=1234, emitted seq=1236"
+[ "$trc" = 78 ] || { echo "FAIL take-time: a ring timeout -> rc $trc, want 78"; fail=1; }
+
+take_run hang "kernel: amdgpu 0000:c5:00.0: amdgpu: GPU hang detected on ring gfx"
+[ "$trc" = 78 ] || { echo "FAIL take-time: an amdgpu hang -> rc $trc, want 78"; fail=1; }
+
 take_run clean clean
 [ "$trc" = 0 ] || { echo "FAIL take-time: a clean log -> rc $trc, want 0 (a healthy hold must still run)"; fail=1; }
 
@@ -140,7 +148,9 @@ if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 # during-hold watch now reads it too (the NPU rule: on any amdxdna fault, stop).
 run 5 600 1 1 "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_error_worker: fault at 0x00000000"
 if [ "$rc" != 78 ]; then echo "FAIL arm 5: rc $rc after an amdxdna fault line, want 78"; fail=1; fi
+grep -q "newest line is from the NPU" "$scratch/log5" || { echo "FAIL arm 5: the abort does not name the NPU as the faulting device"; fail=1; }
+grep -q "newest line is from the GPU" "$scratch/log1" || { echo "FAIL arm 1: the abort does not name the GPU as the faulting device"; fail=1; }
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 
-[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on -> 78; take-time page fault/MES -> 78; NPU fault in hold -> 78)"
+[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on -> 78; take-time page fault/MES/ring/hang -> 78; NPU fault in hold -> 78)"
 exit "$fail"

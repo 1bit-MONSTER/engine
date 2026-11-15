@@ -446,7 +446,11 @@ watch() {
             hits=$(fault_lines)
             if [ -n "$hits" ]; then
                 : > "$FAULT_FLAG"
-                log "::error::ABORT GPU/NPU fault in the kernel log during this hold - ending it before the next one (rc 78):"
+                # Name the device from the newest line: npu-hold execs this script too and the watch reads every kernel
+                # line, so a GPU ticket can end on another lane's NPU fault (and the other way round). Saying which
+                # device faulted keeps a lane from searching its own job for a fault it did not cause (#2538 review).
+                _dev=GPU; printf '%s\n' "$hits" | tail -1 | grep -qi amdxdna && _dev=NPU
+                log "::error::ABORT GPU/NPU fault in the kernel log during this hold - ending it before the next one (rc 78): newest line is from the ${_dev}; if this ticket is not for the ${_dev}, another lane's job produced it:"
                 printf '%s\n' "$hits" | tail -3 | while IFS= read -r l; do log "  $l"; done
                 kill_tree "$target" "${GPU_HOLD_KILL_GRACE:-10}"
                 return

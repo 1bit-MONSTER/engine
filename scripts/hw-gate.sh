@@ -91,6 +91,20 @@ esac
 # usage path must take no hardware, and this one is now answered before the queue like -h/--help.
 [ $# -gt 0 ] || { usage; exit 2; }
 
+# Keep a failing row's server log outside the run dir and print where it went (engine#2500; #2513). The name must be
+# unique per CALL, not per $OUT: CI sets HW_GATE_OUT=$RUNNER_TEMP/hw-gate, so basename "$OUT" is the constant "hw-gate"
+# and a name built from it made every failing run on every PR overwrite the last one's evidence. UTC time and the CI
+# run id tie the copy to the run that printed it; mktemp makes it unique even within one second. Prints nothing when
+# the copy fails, so the caller's ${kept:-...} fallback names the original log instead of a file that does not exist.
+keep_failed_log() {   # <source log> <model name>
+  local dir="${STORE:-${HW_GATE_STORE:-$HOME/.cache/hw-gate}}/failed" kept
+  mkdir -p "$dir" 2>/dev/null || return 0
+  kept=$(mktemp --suffix=.log "$dir/$(date -u +%Y%m%dT%H%M%SZ)-run${GITHUB_RUN_ID:-local}.${GITHUB_RUN_ATTEMPT:-0}-$2-XXXXXX" 2>/dev/null) || return 0
+  if cp "$1" "$kept" 2>/dev/null; then echo "$kept"; else rm -f "$kept"; fi
+}
+
+if [ "${1:-}" = --keep-failed-log ]; then keep_failed_log "$2" "$3"; exit 0; fi   # internal: tests/hw_gate_kept_log_test.sh; before the GPU queue, so it takes no ticket
+
 # Fair GPU queue (the protocol is written down in ~/amd-oss/GPU-TOKEN.md on the box): when the gpu-hold helper
 # is installed, the whole gate runs inside one claim on ~/GPU-TOKEN instead of racing for it with a noclobber
 # open. Claims are served in arrival order, a killed run cannot leave the token behind, the die temperature
@@ -655,11 +669,9 @@ if has kat || has needle || has kld; then
       # A gate that deletes its own evidence turns an environmental flake into an unfalsifiable bug
       # (engine#2500: the failing row's log was gone before anyone could read it, and every hypothesis
       # was unverifiable). Keep a copy outside the run dir, which CI cleans, and name the path in the
-      # failure line so a reader does not have to guess.
-      kept="$STORE/failed/$(basename "$OUT")-$name.log"
-      mkdir -p "$STORE/failed" 2>/dev/null
-      cp "$OUT/server-$name.log" "$kept" 2>/dev/null && \
-        echo "hw-gate: kept the failing server log at $kept" >&2
+      # failure line so a reader does not have to guess. The name is unique per failure (keep_failed_log).
+      kept=$(keep_failed_log "$OUT/server-$name.log" "$name")
+      [ -n "$kept" ] && echo "hw-gate: kept the failing server log at $kept" >&2
       result "model $name" FAIL "$secs" "server failed (rc $rc): $(tail -n 3 "$OUT/server-$name.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200) [log: ${kept:-$OUT/server-$name.log}]"
       continue
     fi

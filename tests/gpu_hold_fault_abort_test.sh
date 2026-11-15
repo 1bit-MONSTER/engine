@@ -1,0 +1,86 @@
+#!/bin/bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# tests/gpu_hold_fault_abort_test.sh — a hold ends itself when the kernel log shows a GPU fault DURING the hold
+# (CRASH-HUNT 2026-11-15). The 11-13 crash was nine MES REMOVE_QUEUE -> MODE2 resets inside two tickets, each after a
+# gfxhub page fault from the ticket's own job; #2480 checks for resets only when the token is taken, so a storm inside
+# one ticket ran on until the GPU wedged.
+#
+# Usage: gpu_hold_fault_abort_test.sh [path-to-gpu-hold]
+#
+# The kernel log is a FILE (GPU_HOLD_KLOG_FILE): the test needs "clean, then a fault", which cannot be produced on
+# demand. Three arms:
+#   1 a page fault appears 5 s in: the hold ends WELL before its payload would (600 s), with rc 78, the log says why,
+#     and the job's deepest TERM-ignoring descendant is gone;
+#   2 a clean log: the payload runs to completion, rc 0 (the watcher does not fire on nothing);
+#   3 the same fault with GPU_HOLD_FAULT_ABORT=0: the payload runs to completion, rc 0 (the opt-out works).
+set -u
+hold=${1:-./scripts/gpu-hold}
+[ -x "$hold" ] || { echo "not executable: $hold"; exit 2; }
+
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+fail=0
+
+cat > "$scratch/wrapper.sh" <<'WRAP'
+#!/bin/bash
+( trap '' TERM; exec -a fault-abort-child sleep "$2" ) &
+echo $! > "$1/deep.pid"
+sleep "$2"
+WRAP
+chmod +x "$scratch/wrapper.sh"
+
+run() {   # $1 arm  $2 payload seconds  $3 inject fault (1/0)  $4 GPU_HOLD_FAULT_ABORT
+    local q=$scratch/q$1; mkdir -p "$q"; : > "$scratch/klog$1"; rm -f "$scratch/deep.pid"
+    printf '%s\n' "kernel: usb 1-1: new device" > "$scratch/klog$1"
+    if [ "$3" = 1 ]; then
+        ( sleep 5; printf '%s\n' "kernel: amdgpu 0000:c5:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:9 pasid:26332)" >> "$scratch/klog$1" ) &
+    fi
+    local t0; t0=$(date +%s)
+    GPU_HOLD_KLOG_FILE="$scratch/klog$1" GPU_HOLD_FAULT_ABORT="$4" \
+    GPU_QUEUE_DIR="$q" GPU_TOKEN_FILE="$scratch/TOKEN$1" GPU_HOLD_LOG="$scratch/log$1" \
+    GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 GPU_HOLD_RESET_WINDOW_MIN=0 \
+    GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x" \
+        timeout 120 "$hold" -t 10 -l faulttest$1 -- "$scratch/wrapper.sh" "$scratch" "$2" > /dev/null 2>&1
+    rc=$?
+    elapsed=$(( $(date +%s) - t0 ))
+    deep=$(cat "$scratch/deep.pid" 2> /dev/null)
+}
+
+echo 40000 > "$scratch/tctl"   # 40 C, in millidegrees
+
+# arm 1: the fault fires
+run 1 600 1 1
+e1=$elapsed
+if [ "$rc" != 78 ]; then echo "FAIL arm 1: rc $rc, want 78 (the fault abort)"; fail=1; fi
+if [ "$elapsed" -ge 60 ]; then echo "FAIL arm 1: the hold took ${elapsed}s; the fault was at 5 s and the payload sleeps 600 s"; fail=1; fi
+grep -q "ABORT GPU/NPU fault" "$scratch/log1" || { echo "FAIL arm 1: the log does not say the fault ended the hold"; fail=1; }
+grep -q "gfxhub" "$scratch/log1" || { echo "FAIL arm 1: the log does not quote the fault line"; fail=1; }
+if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then echo "FAIL arm 1: the TERM-ignoring grandchild $deep survived"; kill -9 "$deep"; fail=1; fi
+[ -e "$scratch/TOKEN1" ] && { echo "FAIL arm 1: the token is still held"; fail=1; }
+
+# arm 2: a clean log
+run 2 12 0 1
+if [ "$rc" != 0 ]; then echo "FAIL arm 2: rc $rc with a clean kernel log, want 0"; fail=1; fi
+grep -q "ABORT GPU/NPU fault" "$scratch/log2" && { echo "FAIL arm 2: the watcher fired on a clean log"; fail=1; }
+
+# arm 3: the opt-out
+run 3 12 1 0
+if [ "$rc" != 0 ]; then echo "FAIL arm 3: rc $rc with GPU_HOLD_FAULT_ABORT=0, want 0"; fail=1; fi
+grep -q "ABORT GPU/NPU fault" "$scratch/log3" && { echo "FAIL arm 3: the watcher fired with GPU_HOLD_FAULT_ABORT=0"; fail=1; }
+
+[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0)"
+exit "$fail"

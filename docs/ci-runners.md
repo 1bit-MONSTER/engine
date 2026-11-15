@@ -328,21 +328,23 @@ private queue and a fake `/slots` server. No device is used.
 ## Exit codes on the GPU and NPU path: one table
 
 A lane reading an exit code wants one answer: **did my job fail, or did the box not let it run?** The fleet's scheduler
-scripts answer it with a few shared codes. Each code below means the same thing in every script that uses it, and each
-script's own header stays the reference for its edge cases.
+scripts answer it with a few shared codes. Every code but **2** has a single meaning across the scripts. 2 is the exception,
+with four causes that its stderr line tells apart (the row says which). The "scripts" column says whether a script
+*exits* a code itself, *passes it through* from gpu-hold, or *relabels* it, because that tells you which script to read.
+Each script's own header stays the reference for its edge cases.
 
 | rc | meaning | scripts | retry? |
 |---|---|---|---|
 | 0 | the job (or gate) passed / the window closed on its own | all | - |
 | 1 | the job's own failure: a check failed | hw-gate.sh, the payload | no: read the log |
-| 2 | **could not run / INCOMPLETE**: an input was absent (a model, text, a binary, a checkout), a build or memory floor refused it, a refused shared queue, or a usage error. hw-gate reports 2 even when some rows failed, because an untested input means the run did not answer its question | hw-gate.sh, npu-hold | after fixing the input |
-| 3 | the server under test never came up | hw-gate.sh (internal) | read the server log |
-| 69 | the job ran, but coder-llm did not answer `:8090` after the window | window-run.sh | see "The PR-Agent model runs in gpu-hold windows" |
-| 75 | the queue never came round within `-w` | gpu-hold, npu-hold, coder-llm-ticketed | yes: re-queue (at the back) |
-| 76 | the memory pre-check refused the run | hw-gate.sh `--mem` | when MemAvailable is back |
-| **78** | a GPU/NPU fault line in the kernel log: **during** the hold (the hold was ended) or **at take time** (the ticket was refused, nothing ran). The coder-llm journal says which one | gpu-hold, npu-hold, coder-llm-ticketed | after the fault is understood. Never in a loop |
-| **124** | the max hold (`-t`) ended the job: a deadline, and planned. coder-llm-ticketed also maps a KILL after its max hold to 124 | gpu-hold, npu-hold, coder-llm-ticketed | yes |
-| 130 | a stop was requested and the job refused to die; the token was released anyway | gpu-hold, coder-llm-ticketed | check for a survivor (`~/GPU-QUEUE/.gpu-hold-survivors`) |
+| 2 | one code, four causes; **the stderr line says which** and is part of the contract: (a) a **usage error** (`unknown option … (try -h)`, `no command given`): the command line is wrong, not the box; (b) **could not run / INCOMPLETE**: an input was absent (a model, text, a binary, a checkout) or a build or memory floor refused it. hw-gate reports 2 even when some rows failed, because an untested input means the run did not answer its question; (c) the box could not set up the ticket (`cannot create <queue>`, `cannot write <ticket>`); (d) a **policy refusal** (npu-hold: a shared queue while npu-serve-keeper reads it) | gpu-hold and hw-gate.sh exit it; npu-hold exits (d) | **read stderr first**. (a) and (d): fix the command or config, because re-queueing repeats the same mistake; (b): after providing the input; (c): after fixing the box |
+| 3 | the server under test never came up | hw-gate.sh exits it from its server-start step | read the server log |
+| 69 | the job ran, but coder-llm did not answer `:8090` after the window | window-run.sh (computed by `final_rc`, not a literal exit) | see "The PR-Agent model runs in gpu-hold windows" |
+| 75 | the queue never came round within `-w` | gpu-hold exits it; npu-hold and coder-llm-ticketed pass it through | yes, but **at the back** of the queue. That is why coder-llm queues with a 24 h `-w`, and why a lane should size `-w` for the queue instead of treating 75 as a free retry |
+| 76 | the memory pre-check refused the run | hw-gate.sh `--mem` exits it | when MemAvailable is back |
+| **78** | a GPU/NPU fault line in the kernel log: **during** the hold (the hold was ended) or **at take time** (the ticket was refused, nothing ran). The coder-llm journal says which one | gpu-hold exits it; npu-hold and coder-llm-ticketed pass it through (the coder-llm journal names the cause) | after the fault is understood. Never in a loop |
+| **124** | the max hold (`-t`) ended the job: a deadline, and planned. coder-llm-ticketed also maps a KILL after its max hold to 124 | gpu-hold sets it (its own code, after `timeout(1)`'s convention; it also maps a TERM at its deadline from 143); npu-hold passes it through; coder-llm-ticketed passes it through and relabels a post-deadline 137 to it | yes |
+| 130 | a stop was requested and the job refused to die; the token was released anyway | gpu-hold sets it; coder-llm-ticketed passes it through | check for a survivor (`~/GPU-QUEUE/.gpu-hold-survivors`) |
 | **137** | SIGKILL **before** any deadline: the OOM killer or a `kill -9`. A failure, not a timeout | any payload | no: find the killer |
 | 143 | SIGTERM (a cancel) that was not the max hold | any payload | depends on who sent it |
 

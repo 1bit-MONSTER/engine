@@ -3311,7 +3311,7 @@ failing position:
 - the host i8 arm and the device both said ` lick`;
 - host f32 for `ffn_down` alone, or `ffn_gate_up` alone, fixed it, while `attn_qkv` and `attn_output` did not.
 
-The split (`npu/forward/include/act_outliers.h`, wired in `ffn_down_outliers()`) works per row:
+The split (`npu/forward/include/act_outliers.h`, wired in `ffn_outliers()`) works per row:
 
 1. The channels with `|x| > tau * rms` (at most `NPU_ACT_OUTLIER_KMAX`, default 16) are zeroed in the int8 activation,
    so the scale is set by the remaining channels.
@@ -3321,6 +3321,14 @@ Columns are decoded one 256-wide tile block at a time and cached per (layer, cha
 checked bit-for-bit against a full decode; a difference turns the gather off and logs `[outlier]`. A row with no such
 channel runs the plain launch, so a model without outliers pays one scan per row. Host-GEMM runs (`NPU_INFER_HOST_GEMM`)
 are not changed.
+
+**It covers the gate/up GEMMs too (engine#2576).** CodeLlama-7b-Instruct (1.7.1 hybrid) answered `'Sure! 12 times 7 is 84. package.'`, then newlines to the length cap: `</s>` was lost.
+
+At that position, host f32 for `ffn_gate_up` alone restored EOS. So did a fully f32 host run. `ffn_down`, `attn_qkv` and `attn_output` alone did not, and lowering tau on the `ffn_down` split did not either (20, 10 and 5). The int8 loss there is in the gate/up input, the post-attention norm output.
+
+`ffn_outliers()` therefore applies the same split to `ffn_gate_up` and to split `ffn_gate`/`ffn_up` designs, with columns from `gate_proj`/`up_proj`. For the fused design the corrections land at their own offsets: the outputs are `[gate | up]` along N, as `q4nx_assemble_B` lays them, so `up` starts at `gate_rows`.
+
+At the default tau 40 the same container answers `'Sure! 12 times 7 is 84.'` and stops after 14 tokens.
 
 **Default: on, `tau` 40.** `NPU_ACT_OUTLIER_TAU=0` turns it off. Measured with `serve --device npu`, using teacher-forced
 top-1 agreement against HF fp32 on 64 positions (the same probes for every column):

@@ -186,9 +186,19 @@ JLOG
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/t.log"
     PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/token WINDOWS_LOG=$tmp/t.log \
       "$0" -m 1 -l x -c true >/dev/null 2>&1
-    chk "a GPU token held by the next lane defers the restart" "$(grep -c 'restart=deferred(gpu held by 999999)' "$tmp/t.log")" 1
+    chk "a GPU token held by the next lane defers the restart" "$(grep -c 'restart=deferred(gpu held by cl-other 999999)' "$tmp/t.log")" 1
     chk "  ... and the window still starts the unit, so it is not left down" "$(grep -c 'start coder-llm' "$tmp/t.calls")" 1
     chk "  ... and the deferral is not reported as a failed restart" "$(grep -c 'restart=FAILED' "$tmp/t.log")" 0
+    : > "$tmp/t.calls"          # this arm drives the same systemctl stub; count only its own calls
+    # 3h. The token in the shape gpu-hold ACTUALLY writes. Labels contain spaces and the line ends with an ISO
+    # stamp, so `awk '{print $NF}'` printed the timestamp and the deferred line named nothing a lane could act on
+    # ("gpu held by 2026-11-15T16:08:40-04:00"). The holder must be the label, and never a timestamp.
+    : > "$tmp/t.log"; printf 'gpu-hold cl-hrxkern mtp-bisect wall pid 1743670 2026-11-15T16:08:40-04:00\n' > "$tmp/token"
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/token GPU_QUEUE_DIR=$tmp/q3h \
+      WR_HEALTH_URL=http://127.0.0.1:9/x WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
+    chk "a real-shaped token names the labelling lane, spaces and all" \
+      "$(grep -c 'restart=deferred(gpu held by cl-hrxkern mtp-bisect wall (pid 1743670))' "$tmp/t.log")" 1
+    chk "  ... and never the timestamp the token ends with" "$(grep -c 'gpu held by 20[0-9][0-9]-' "$tmp/t.log")" 0
     # the loading-vs-wedged check needs a live child growing in CPU, which a self-test cannot fake without testing its
     # own fake; pin the reader instead so it cannot be deleted silently (the same technique the probe arm uses).
     # 3k. engine#2496's contract: a ticketed coder-llm that is QUEUED is not a failed restart
@@ -412,10 +422,15 @@ restore() {
     # "still holding". Say so in one line and let the unit come up when that window ends.
     _tok=${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}
     if [ -e "$_tok" ]; then
-      _held=$(awk '{print $NF}' "$_tok" 2>/dev/null | head -1)
-      printf '%s end   lane=%s issue=%s label=%s coder-llm=%s :8090=deferred restart=deferred(gpu held by %s) rc=%s\n' \
-        "$(date -u +%FT%TZ)" "$WR_LANE" "$ISSUE" "$LABEL" "$(systemctl --user is-active coder-llm)" "${_held:-?}" "$rc" >> "$LOG"
-      printf '%s: coder-llm restarts when the next lane releases the GPU (holder %s); not a failed restart\n' "$SELF" "${_held:-?}" >&2
+      # NAME THE HOLDER, NOT ITS TIMESTAMP. The token is `gpu-hold <label…> pid <pid> <iso>` and labels
+      # contain spaces (`gpu-hold cl-hrxkern mtp-bisect wall pid 1743670 2026-11-15T16:08:40-04:00`), so
+      # `awk '{print $NF}'` printed the TIMESTAMP: a lane was told "gpu held by 2026-11-15T16:08:40-04:00".
+      # The legacy two-field shape (`gpu-hold <label> <pid>`) still parses, as label plus pid in one word.
+      _held=$(sed -E 's/^gpu-hold +//; s/ pid [0-9]+ .*$//' "$_tok" 2>/dev/null | head -1)
+      _hpid=$(sed -nE 's/.* pid ([0-9]+).*$/\1/p' "$_tok" 2>/dev/null | head -1)
+      printf '%s end   lane=%s issue=%s label=%s coder-llm=%s :8090=deferred restart=deferred(gpu held by %s%s) rc=%s\n' \
+        "$(date -u +%FT%TZ)" "$WR_LANE" "$ISSUE" "$LABEL" "$(systemctl --user is-active coder-llm)" "${_held:-?}" "${_hpid:+ (pid $_hpid)}" "$rc" >> "$LOG"
+      printf '%s: coder-llm restarts when the next lane releases the GPU (holder %s%s); not a failed restart\n' "$SELF" "${_held:-?}" "${_hpid:+ (pid $_hpid)}" >&2
       rm -rf "$WR_DIR"; exit "$rc"
     fi
     # QUEUED IS NOT DEAD EITHER (engine#2496's contract, live 2026-11-15): once `coder-llm` runs inside

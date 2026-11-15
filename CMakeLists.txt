@@ -1834,6 +1834,13 @@ add_test(NAME npu_pb16i_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
                  ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.cpp)
+# The w4g32 weight image (q4nx_w4g32.h): the large-M int4-weight prefill tier's contract -- the b4 tile
+# order, the per-32 signed magnitudes, the A pack and the int64 reference.  No device; set
+# W4G32_VEC="<dir> M K N" to also check it against a gate vector set the NPU reproduced bit-exact.
+add_test(NAME npu_w4g32_layout
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_w4g32_layout_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
+                 ${CMAKE_SOURCE_DIR}/tests/npu_w4g32_layout_test.cpp)
 # The t2s weight stream (q4nx_weight_layout "t2s"): the same integer-exact weights at 2.125 b/w,
 # expanded on the core.  Its host-side contract is the file size, so the test pins the tile against
 # the numbers tools/q4nx_t2s.py measured on a real image (50,135,040 -> 23,674,880 B for gate/up).

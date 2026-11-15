@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 // install_request_guard() is defined when httplib.h was included first.
@@ -79,8 +80,36 @@ inline std::string refuse_request(const std::string& bound, const std::string& m
 }
 
 #ifdef CPPHTTPLIB_HTTPLIB_H
+// engine#2482: an error httplib raises before a route runs (a 413 on the body, a bad request line) gave the client an
+// empty body and wrote nothing to the log. Every such error now leaves one stderr line, and an error response that has
+// no body gets a JSON one, so the client and the log name the same cause.
+inline std::string request_error_line(const std::string& error, const httplib::Request* q) {
+    std::string line = "1bit serve: request refused before routing: " + error;
+    if (q) {
+        line += " (" + q->method + " " + q->path + ", Content-Type '" + q->get_header_value("Content-Type") +
+                "', body " + std::to_string(q->body.size()) + " B)";
+    }
+    return line;
+}
+
+inline void fill_empty_error_body(httplib::Response& r) {
+    if (r.status < 400 || !r.body.empty()) return;
+    std::string message = "HTTP " + std::to_string(r.status);
+    if (r.status == 413) message += ": the request body is larger than this server accepts";
+    r.set_content("{\"error\":{\"message\":\"" + message + "\",\"code\":" + std::to_string(r.status) + "}}",
+                  "application/json");
+}
+
 // Answers a refused request with 403 before it reaches a route.
 inline void install_request_guard(httplib::Server& srv, const std::string& bound) {
+    srv.set_error_logger([](const httplib::Error& e, const httplib::Request* q) {
+        std::fprintf(stderr, "%s\n", request_error_line(httplib::to_string(e), q).c_str());
+    });
+    srv.set_error_handler([](const httplib::Request&, httplib::Response& r) {
+        if (!r.body.empty()) return httplib::Server::HandlerResponse::Unhandled;
+        fill_empty_error_body(r);
+        return httplib::Server::HandlerResponse::Handled;
+    });
     srv.set_pre_routing_handler([bound](const httplib::Request& q, httplib::Response& r) {
         const std::string why = refuse_request(bound, q.method, q.get_header_value("Host"), q.get_header_value("Origin"));
         if (why.empty()) return httplib::Server::HandlerResponse::Unhandled;

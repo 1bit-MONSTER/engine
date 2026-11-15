@@ -91,6 +91,14 @@ FetchContent_Declare(stb
     GIT_REPOSITORY https://github.com/nothings/stb.git
     GIT_TAG 9600522de53973336fa033a289858a4354cbb04c)
 FetchContent_MakeAvailable(json httplib stb)
+# engine#2482: httplib caps an application/x-www-form-urlencoded body at 8192 bytes (its default for
+# CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH) and answers 413. `curl -d` labels a JSON body that way, so every
+# request over 8 KB sent like that was refused. No engine route takes a form, but a form-labelled body is still
+# parsed into req.params after it is buffered: a dedupe copy per '&' segment plus the decoded key and value, so its
+# peak is about 3x the body, where a JSON-labelled body is buffered once (up to CPPHTTPLIB_PAYLOAD_MAX_LENGTH,
+# 100 MiB). 16 MiB keeps that peak near 48 MiB and is far above any real request (long prompts, base64 images).
+# On the INTERFACE target, so every translation unit that includes httplib.h through it gets the same value.
+target_compile_definitions(httplib INTERFACE CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH=16777216)
 
 # config/laya-first.json (the routing table, docs/laya-first.md §4) is compiled in like
 # config/recipes.json; `1bit laya-first --laya-first FILE` replaces it at run time.
@@ -680,6 +688,8 @@ add_dependencies(onebit serve_degenerate_test)
 
 add_executable(http_guard_test tests/http_guard_test.cpp)
 target_include_directories(http_guard_test PRIVATE app)
+# engine#2482: the test starts a real httplib server on loopback, the entry point the 413 came through.
+target_link_libraries(http_guard_test PRIVATE httplib::httplib Threads::Threads)
 add_test(NAME http_guard COMMAND http_guard_test)
 # The "the device is gone" classifiers of app/serve_watchdog.h: a backend's device-lost stderr line, and the
 # NPU runtime's failed-runlist message that makes `1bit unified` answer the request and exit non-zero. Header

@@ -197,24 +197,29 @@ Four things generalise, and each one was a decision rather than a discovery:
 1. **Split by `(device, domain)` before counting.** The NVMe stream is domain `0x0015`, the NPU's is `0x0003`; a raw
    `grep -c IO_PAGE_FAULT` mixes them and inflates whichever you were looking for. `tools/diag/iommu_fault_census.py`
    exists for exactly this.
-2. **Decode `flags` — from the spec, not from memory.** The two streams carry **different** flags and that difference is
-   the whole point:
+2. **`flags` is not decoded here, and must not be until it is cited.** The streams carry **three** values, not one:
 
    ```
-   NPU  (c6:00.1, 0x0003):  flags=0x0007
-   NVMe (c4:00.0, 0x0015):  flags=0x0000
+   NVMe  (c4:00.0, 0x0015):  717 × flags=0x0000    3 × flags=0x0050
+   NPU   (c6:00.1, 0x0003):   20 × flags=0x0007
    ```
 
-   An earlier version of this page decoded `0x0007` as "present=0, write=1, user=1 — a write to a non-present page" and
-   then said `0x0000` "means the same for a read". **Both cannot be true**: a single bit cannot be set in one stream and
-   clear in the other while both are the same state. The kernel does not expand these bits — it prints `flags=0x…` raw —
-   and the local headers do not carry them either, so the decode has to come from the **AMD IOMMU specification's event-log
-   table** (bit 0 present, bit 1 write, bit 2 user, in the spec's ordering) and be cited next to the claim.
+   An earlier version of this page decoded `0x0007` as "present=0, write=1, user=1 — a write to a non-present page"
+   and then said `0x0000` "means the same for a read". **Both cannot be true**: one bit is not set and clear at once
+   while both are described as the same state. A later version demanded a spec citation while asserting the bit ordering
+   in a parenthetical — the same error wearing the rule that forbids it. The parenthetical is gone.
 
-   The stakes are the diagnosis, in opposite directions: if the NPU's bit 0 is set, the page **is** mapped and the fault is
-   a **rights** failure (a write to memory that exists but is not writable) rather than a walk off the end of a mapping;
-   if the NVMe's bit 0 is clear, its stream is an **absent** translation. So the flags must be resolved before either
-   engine#2478 or engine#2542 is described as one kind or the other — the *walk* evidence is unaffected either way.
+   What is observable, and all this page will claim: the two devices are in **different states** (`0x0007` vs `0x0000`),
+   and the NVMe stream additionally has rare `0x0050` lines (3 of them, at one of the four addresses the census tracks).
+   **Any bit ordering must explain all three values**, so a decode that explains `0x0000` and `0x0007` and stays silent
+   about `0x0050` is incomplete by construction. The meaning of the bits, and therefore which state is "mapped but not
+   writable" versus "not mapped", comes from the **AMD IOMMU specification's event-log chapter** — document, revision and
+   table — and the kernel does not provide it: its own format string is `flags=0x%04x` with no expansion.
+
+   The stakes are the diagnosis, in opposite directions: if the NPU's bit 0 is set, the page **is** mapped and the fault
+   is a **rights** failure; if the NVMe's bit 0 is clear, its stream is an **absent** translation. The *walk* evidence
+   below is unaffected either way.
+
 3. **Read the walk, not the count.** Nine contiguous pages followed by one page far above is *two ranges in one stride*
    — a descriptor list whose tenth entry lives elsewhere — not a scatter of unrelated pointers. The stride tells you
    which structure to look for; the count tells you nothing.

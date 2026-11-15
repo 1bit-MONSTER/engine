@@ -696,6 +696,12 @@ target_include_directories(http_guard_test PRIVATE app)
 # engine#2482: the test starts a real httplib server on loopback, the entry point the 413 came through.
 target_link_libraries(http_guard_test PRIVATE httplib::httplib Threads::Threads)
 add_test(NAME http_guard COMMAND http_guard_test)
+
+# engine#2482 follow-up: this test now drives a loopback httplib::Server, so it takes the route_ports lock
+# like every other test that binds a port (tests/route_port_lock_test.py: "a new route test that forgets
+# the lock fails here by name, instead of flaking a later PR"). That check reads tests/*.sh only, so a
+# C++ route test is invisible to it -- this property is the lock it would have required had it seen it.
+set_tests_properties(http_guard PROPERTIES RESOURCE_LOCK route_ports)
 # The "the device is gone" classifiers of app/serve_watchdog.h: a backend's device-lost stderr line, and the
 # NPU runtime's failed-runlist message that makes `1bit unified` answer the request and exit non-zero. Header
 # only, no device, no model.

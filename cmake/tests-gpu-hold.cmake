@@ -34,6 +34,10 @@ add_test(NAME gpu_hold_tree COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_tree
 # failure where an unbudgeted GPU run took the box to 0.7 GiB and the OOM killer chose the PR-agent LLM.
 add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_mem_abort_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 
+# CRASH-HUNT 2026-11-15: a GPU page fault / MES reset in the kernel log DURING a hold ends it (rc 78). #2480 checks only
+# when the token is taken; the 11-13 crash was nine resets inside two tickets. The kernel log is a fixture file.
+add_test(NAME gpu_hold_fault_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_fault_abort_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
 # engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
 # queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
 # Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a

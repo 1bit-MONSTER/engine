@@ -399,9 +399,39 @@ mem_available_gb() {
     awk '/^MemAvailable:/ { printf "%d", $2 / 1048576; exit }' "${GPU_HOLD_MEMINFO:-/proc/meminfo}" 2> /dev/null
 }
 
+# A GPU FAULT DURING THE HOLD (CRASH-HUNT 2026-11-15, ~/briefs/CRASH-HUNT-STATE.md): #2480 refuses a ticket after a recent
+# reset, but only at the moment the token is taken. The 11-13 crash was nine MES REMOVE_QUEUE -> MODE2 resets inside two
+# tickets: each reset followed a gfxhub page fault ~2 s earlier from the ticket's own job, the job's next process faulted
+# again, and the GPU wedged after the ninth. So the watchdog also reads the kernel log for lines that appeared SINCE this
+# hold started: a page fault, an amdgpu/MES reset or ring timeout, or an amdxdna command timeout ends the hold (rc 78).
+# GPU_HOLD_FAULT_ABORT=0 turns it off. With no readable kernel log (a CI runner) it is inert, as #2480's check is.
+# GPU_HOLD_KLOG_FILE replaces the kernel log with a file (tests).
+FAULT_ABORT=${GPU_HOLD_FAULT_ABORT:-1}
+FAULT_RE='\[gfxhub\] page fault|amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure|failed to respond)|amdxdna.*(command timeout|power.?cycle)'
+FAULT_FLAG="$QUEUE/.fault.$SAFE.$$"
+fault_lines() {
+    if [ -n "${GPU_HOLD_KLOG_FILE:-}" ]; then
+        cat "$GPU_HOLD_KLOG_FILE" 2> /dev/null
+    else
+        journalctl -k --since "@$started" --no-pager -q 2> /dev/null
+    fi | grep -iE "$FAULT_RE"
+}
+
 watch() {
-    local target=$1
+    local target=$1 tick=0
     while sleep 2; do
+        tick=$((tick + 1))
+        # every 10 s: journalctl over the hold's own window is cheap, but not free every 2 s
+        if [ "$FAULT_ABORT" != 0 ] && [ $((tick % 5)) = 0 ]; then
+            hits=$(fault_lines)
+            if [ -n "$hits" ]; then
+                : > "$FAULT_FLAG"
+                log "::error::ABORT GPU/NPU fault in the kernel log during this hold - ending it before the next one (rc 78):"
+                printf '%s\n' "$hits" | tail -3 | while IFS= read -r l; do log "  $l"; done
+                kill_tree "$target" "${GPU_HOLD_KILL_GRACE:-10}"
+                return
+            fi
+        fi
         # The OOM kill this prevents is not the run's own: on 2026-11-08/09 a GPU run took the box to 0.7 GiB
         # available and the kernel chose the PR-agent LLM as the victim, which took the fleet's own brains down.
         # The temperature gate has the same shape — one sampled number, one threshold, end the hold — so the
@@ -476,6 +506,8 @@ else
 fi
 # wait reports 143 for SIGTERM; say 124 for a max hold, as timeout does
 if [ "$rc" = 143 ] && [ "$(date +%s)" -ge "$deadline" ]; then rc=124; fi
+# a fault abort is its own outcome (the same 78 as #2480's refusal), whatever the killed job returned
+if [ -f "$FAULT_FLAG" ]; then rc=78; rm -f "$FAULT_FLAG"; fi
 held=$(( $(date +%s) - started ))
 
 # Reap the watchdog BEFORE killing anything it may be in the middle of: it is the process that runs

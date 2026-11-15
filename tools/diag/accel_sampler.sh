@@ -124,7 +124,7 @@ sample_once() {  # one line per (moment, holder); "none" when nothing holds the 
 }
 
 correlate() {  # $1 lo $2 hi -> "pid:cmd:scope" for every sample in [lo,hi], deduplicated
-  awk -F'\t' -v lo="$1" -v hi="$2" '$1 >= lo && $1 <= hi' "$SAMP" 2>/dev/null | cut -f2,4,5 | sort -u | tr '\n' ';'
+  awk -F'\t' -v lo="$1" -v hi="$2" '$1 >= lo && $1 <= hi' "$SAMP" 2>/dev/null | cut -f2,4,5,6 | sort -u | tr '\n' ';'
 }
 
 selftest() {  # prove the correlation before an event needs it: the window, the fields, and the miss case
@@ -134,6 +134,10 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   SAMP=$d/samples.log
   out=$(correlate 1005 1015)                       # +-5 s around a fault at 1010
   case "$out" in *222*) ;; *) echo "FAIL: the holder at the fault instant is missing"; fail=1 ;; esac
+  # The ticket is the field this whole issue is about: without it a record cannot say which hold was live. This arm exists
+  # because a refactor dropped exactly that field while every other arm stayed green (review of engine#2591); the fixture
+  # already carries ticket1/ticket2, so it needs no new data.
+  case "$out" in *ticket2*) ;; *) echo "FAIL: the npu-hold ticket was dropped from the record"; fail=1 ;; esac
   case "$out" in *111*) echo "FAIL: a sample outside the window was included"; fail=1 ;; esac
   out=$(correlate 2000 2010)
   [ -z "$out" ] || { echo "FAIL: a window with no samples produced '$out'"; fail=1; }
@@ -147,7 +151,7 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   [ -f "$d/rot.log.1" ] || { echo "FAIL: rotation did not keep a previous file"; fail=1; }
   [ "$(stat -c %s "$d/rot.log")" -eq 0 ] || { echo "FAIL: the live file was not truncated"; fail=1; }
   rm -rf "$d"
-  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (window, fields, empty window, no-holder sample, rotation)"
+  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (window, fields+ticket, empty window, no-holder sample, rotation)"
   return "$fail"
 }
 

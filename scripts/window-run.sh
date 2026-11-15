@@ -38,6 +38,11 @@ set -uo pipefail
 
 SELF=${0##*/}
 LOG=${WINDOWS_LOG:-$HOME/briefs/WINDOWS.log}
+# gpu-hold next to this script, not "scripts/gpu-hold" relative to wherever the caller stands: run from another directory,
+# the relative path failed AFTER the start line was written, so a window that never took a ticket logged a start/end pair
+# and moved every lane's 45-minute gap (11-15 03:31Z).
+GPU_HOLD=${GPU_HOLD:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu-hold}
+export GPU_HOLD
 die() { printf '%s: %s\n' "$SELF" "$*" >&2; exit 2; }
 
 self_test() {
@@ -56,6 +61,10 @@ self_test() {
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u +%FT%TZ)" > "$tmp/w.log"
     WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true >/dev/null 2>&1; chk "a window inside the gap is refused" "$?" 2
     chk "  ... and a refusal is not written to the log" "$(wc -l < "$tmp/w.log")" 1
+    # 3b. no gpu-hold where the script expects it: refused before the start line, so nothing is logged
+    : > "$tmp/g.log"
+    GPU_HOLD=$tmp/none WINDOWS_LOG=$tmp/g.log "$0" --dry-run -m 5 -l x -c true >/dev/null 2>&1; chk "a missing gpu-hold is refused" "$?" 2
+    chk "  ... and writes nothing to the log" "$(wc -l < "$tmp/g.log")" 0
     # 4. an old enough end opens the gate again (the refusal above is about the gap, not about the file)
     printf '%s end   lane=t issue=0 label=t coder-llm=active :8090=200 rc=0\n' "$(date -u -d '90 minutes ago' +%FT%TZ)" > "$tmp/w.log"
     out=$(WINDOWS_LOG=$tmp/w.log "$0" --dry-run -m 5 -l x -c true 2>&1); rc=$?
@@ -139,11 +148,12 @@ fi
 
 # a held ticket is not a refusal: gpu-hold is a FIFO queue, and queueing is how "one GPU job at a
 # time" is honoured. --now keeps the refuse-instead-of-wait case.
-tick=$(scripts/gpu-hold --status 2>/dev/null | head -1 || true)
+tick=$("$GPU_HOLD" --status 2>/dev/null | head -1 || true)
 if [ "$NOW" = 1 ]; then
   case "$tick" in ""|*NONE*|*none*) : ;; *) die "--now was asked for, and a ticket is held: $tick";; esac
 fi
 
+[ -x "$GPU_HOLD" ] || die "no executable gpu-hold at $GPU_HOLD (set GPU_HOLD): refusing before anything is logged"
 if [ "$DRY" = 1 ]; then
   printf '%s: would take gpu-hold -t %s -l %s, stop coder-llm, run: %s\n' "$SELF" "$MINS" "$LABEL" "$CMD"
   exit 0
@@ -168,9 +178,9 @@ restore() {
   fi
 }
 trap 'restore $?' EXIT
-scripts/gpu-hold -t "$MINS" -l "$LABEL" -- bash -c '
+"$GPU_HOLD" -t "$MINS" -l "$LABEL" -- bash -c '
   if systemctl --user is-active --quiet coder-llm; then systemctl --user stop coder-llm; fi
-  holder=$(sed -n "s/.*pid \([0-9]*\).*/\1/p" <<<"$(scripts/gpu-hold --status 2>/dev/null | head -1)" | head -1)
+  holder=$(sed -n "s/.*pid \([0-9]*\).*/\1/p" <<<"$("$GPU_HOLD" --status 2>/dev/null | head -1)" | head -1)
   [ -n "$holder" ] && export GPU_HOLD_TICKET="${GPU_HOLD_TICKET:-$holder}"
   '"$CMD"'
 '

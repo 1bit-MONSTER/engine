@@ -88,6 +88,11 @@ def kat(url, *args):
     return p.returncode, p.stdout
 
 
+def result_build_real_failure_missing(src):
+    """The one build FAIL that must survive: a compile that ran and failed, not a box condition."""
+    return 'result build FAIL $(( $(date +%s) - t0 )) "see ' not in src
+
+
 def script_invariants():
     """The gate's lock placement, from the script itself (no GPU needed): engine#682 took ~/npu.lock off the
     GPU steps, because an NPU serve and the GPU run concurrently here (engine#673 measured ~87 % of the NPU
@@ -117,6 +122,21 @@ def script_invariants():
             bad.append(f"{absent} must be SKIP, not FAIL: an absent input is not a result (engine#2501)")
         if "infra=1" not in line:       # SKIP alone would let "ran nothing" look like "all passed"
             bad.append(f"{absent} must keep infra=1, so a run with no inputs still exits 2")
+    # engine#2501/#2522's rule, third site: a GPU token held by another job is "could not run", not a
+    # verdict on the PR under test. As a FAIL row it reds every PR for a queue condition -- the most
+    # frequently hit of the three infra-as-failure sites, because any lane holding the token causes it.
+    if 'result gpu-token FAIL' in src:
+        bad.append("a held GPU token is an infra condition: the row must be SKIP, not FAIL")
+    if 'result gpu-token SKIP' not in src:
+        bad.append("the gpu-token row must exist and be SKIP (it was renamed or removed)")
+    # Same rule, third and fourth sites: a build that never started, or that the memory guard stopped,
+    # is "could not run". The compile failure stays FAIL -- that one IS the job's verdict.
+    if 'result build FAIL' in src and '"not started' in src.split('result build FAIL', 1)[1][:40]:
+        bad.append("a build that never started is an infra condition: the row must be SKIP, not FAIL")
+    if 'stopped by the memory guard' in src and 'result build SKIP' not in src:
+        bad.append("a memory-guard stop is an infra condition: the row must be SKIP, not FAIL")
+    if result_build_real_failure_missing(src):
+        bad.append("the compile-failure build row must stay FAIL: that is the job's own verdict")
     if src.find('result "kld $name" FAIL') < 0:
         bad.append("the KLD mismatch row must stay FAIL: a verify mismatch is a result, not an absent input")
     return bad

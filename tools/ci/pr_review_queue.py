@@ -209,9 +209,11 @@ def queue(repos, min_age_hours=0.0, now_epoch=None):
 
 def self_test():
     rc = 0
+    arms = [0]
 
     def chk(want, got, what):
         nonlocal rc
+        arms[0] += 1
         if want == got:
             print(f"ok   {what}")
         else:
@@ -263,7 +265,7 @@ def self_test():
         'a verdict with markdown decoration before it still counts')
     chk(True, reviewed_at([{'body': 'VERDICT: CHANGES at `abc1234`'}], 'abc1234'),
         'CHANGES is a verdict: the PR was reviewed, the answer was no')
-    print(f"pr_review_queue --self-test: {'ok' if rc == 0 else 'FAIL'}")
+    print(f"pr_review_queue --self-test: {'ok' if rc == 0 else 'FAIL'} ({arms[0]} arms)")
     return rc
 
 
@@ -293,8 +295,10 @@ def state(repos):
 def self_test_state():
     """The two shapes that made `--state` lie until they were run against the live queue."""
     problems = []
+    arms = [0]
 
     def chk(want, got, what):
+        arms[0] += 1
         if want != got:
             problems.append(f"{what}: want {want!r}, got {got!r}")
 
@@ -341,7 +345,7 @@ def self_test_state():
         for problem in problems:
             print('FAIL ' + problem)
         return 1
-    print('pr_review_queue --state self-test: ok')
+    print(f'pr_review_queue --state self-test: ok ({arms[0]} arms)')
     return 0
 
 
@@ -442,7 +446,16 @@ def main(argv):
     if a.self_test:
         if a.duplicates:
             return self_test_duplicates()
-        return self_test() if not a.state else self_test_state()
+        # Both suites, always. `--state` used to SELECT one of them, so the row CI runs (`--self-test`, no flag) never
+        # executed the 16 assertions about the shapes that made `--state` lie -- a check the row does not run is not a
+        # check. `--state --self-test` still works and runs the same two; the flag now only says which output the caller
+        # expected, not which half to skip.
+        rc_main = self_test()
+        rc_state = self_test_state()
+        # One verdict for both halves: the per-suite lines print in order, so a reader who sees "ok (12 arms)" and then a
+        # FAIL from the second suite needs the last line to say the run failed.
+        print(f"pr_review_queue --self-test: {'ok' if not (rc_main or rc_state) else 'FAIL'} (both suites)")
+        return rc_main or rc_state
     if a.duplicates:
         rows = duplicates(a.repos)
         if a.json:

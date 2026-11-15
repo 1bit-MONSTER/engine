@@ -645,11 +645,11 @@ fi
 
 # ---- kat + needle + KLD: one step per model -----------------------------------------------
 if has kat || has needle || has kld; then
-  [ -f "$TEXT" ] || { has kld && { result kld FAIL 0 "text missing: $TEXT"; infra=1; }; }
+  [ -f "$TEXT" ] || { has kld && { result kld SKIP 0 "text missing (input absent): $TEXT"; infra=1; }; }
   while IFS='|' read -r name file repeat donee srvargs; do
     want_model "$name" || continue
     model=$MODELS/$file base=$STORE/kld/$name.kld
-    if [ ! -f "$model" ]; then result "model $name" FAIL 0 "model missing: $model"; infra=1; continue; fi
+    if [ ! -f "$model" ]; then result "model $name" SKIP 0 "model missing (input absent): $model"; infra=1; continue; fi
     dokat=0; has kat && dokat=1
     needle=0; [ "$donee" = 1 ] && has needle && needle=1
     dokld=0; has kld && [ -f "$TEXT" ] && [ -z "$srvargs" ] && dokld=1

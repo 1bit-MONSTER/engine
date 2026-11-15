@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// act_outliers.h -- the outlier-channel split for the int8 ffn_down GEMM (engine#2536).
+// act_outliers.h -- the outlier-channel split for the int8 FFN GEMMs (engine#2536 ffn_down, engine#2576 gate/up).
 //
 // The i8 GEMM path quantises each activation row with ONE scale, amax/127. On Qwen2.5-3B the ffn_down input rows have
 // amax/rms of 38 (median over the 36 layers) to 100 (layer 35, one channel at 1200), so a typical channel keeps 1-3 int8
@@ -73,6 +73,22 @@ inline void act_outlier_gather_block(const uint8_t* raw, int TR, int TC, int cb,
     buf.resize((size_t)TR * (size_t)cb);
     for (int tr = 0; tr < TR; tr++)
         std::memcpy(&buf[(size_t)tr * (size_t)cb], raw + ((size_t)tr * (size_t)TC + (size_t)tc) * (size_t)cb, (size_t)cb);
+}
+
+// Add the split-out channels back on the host: for every pick, out[row][out_off + n] += x * col(ch)[n], n < rows (and
+// within N). `out_off` is where this tensor's outputs start in the GEMM's N: 0 for a single projection, gate_rows for
+// the `up` half of a fused [gate | up] design (engine#2576).
+template <class ColFn>
+inline void act_outlier_correct(float* out, int N, const std::vector<ActOutlier>& picks, int out_off, int rows,
+                                ColFn col) {
+    if (!out || N <= 0 || out_off < 0 || out_off >= N) return;
+    const int nn = std::min(rows, N - out_off);
+    for (const auto& pk : picks) {
+        const float* c = col(pk.ch);
+        if (!c) continue;
+        float* y = out + (size_t)pk.row * (size_t)N + (size_t)out_off;
+        for (int n = 0; n < nn; n++) y[n] += pk.x * c[n];
+    }
 }
 
 }  // namespace onebit::npu

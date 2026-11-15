@@ -483,10 +483,10 @@ private:
     bool outl_busy_ = false;
     bool outl_gather_ok_ = true;
     std::unordered_map<uint64_t, std::vector<float>> outl_cols_;
-    std::unordered_set<int> outl_checked_;
+    std::unordered_set<int> outl_checked_;   // (layer * 8 + tensor id) whose gather was checked
     std::vector<float> outl_scratch_;
-    bool ffn_down_outliers(const float* A, int M, int a_k, int K, int N, const float* Bmat, std::vector<float>& out,
-                           int wkey, int role, bool rows_form, bool decode_twin);
+    bool ffn_outliers(const char* sc, const float* A, int M, int a_k, int K, int N, const float* Bmat,
+                      std::vector<float>& out, int wkey, int role, bool rows_form, bool decode_twin);
     // Row stride of the f32 table embed_at()/lm_at() read: the padded width when the table was
     // dequantised from a container tensor, c_.H when it is the raw BF16 embedding.
     int lm_w_ = 0;

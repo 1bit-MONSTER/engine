@@ -188,10 +188,55 @@ static void test_gather() {
           "block 1 decoded equal to block 0: the gather check cannot fail");
 }
 
+// engine#2576: a FUSED [gate | up] GEMM (outputs gate rows first, then up rows, as q4nx_assemble_B lays them). The
+// outlier channel feeds both halves, so each half's correction must land at its own offset. A correction applied with
+// the up half at offset 0 (on top of gate) must not pass.
+static void test_fused_gate_up() {
+    const int K = 2048, R = 128, N = 2 * R;
+    std::mt19937 rng(23);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    std::vector<float> x((size_t)K), Wg((size_t)R * K), Wu((size_t)R * K);
+    for (auto& v : x) v = g(rng);
+    for (auto& v : Wg) v = 0.02f * g(rng);
+    for (auto& v : Wu) v = 0.02f * g(rng);
+    x[777] = 90.0f;   // one channel ~90x the row's rms: the post-attention norm output on CodeLlama
+    std::vector<float> W((size_t)N * K);   // fused rows: [gate; up]
+    std::memcpy(W.data(), Wg.data(), Wg.size() * sizeof(float));
+    std::memcpy(W.data() + Wg.size(), Wu.data(), Wu.size() * sizeof(float));
+    std::vector<float> ref((size_t)N, 0.0f);
+    for (int n = 0; n < N; n++)
+        for (int k = 0; k < K; k++) ref[(size_t)n] += x[(size_t)k] * W[(size_t)n * K + k];
+    std::vector<ActOutlier> p;
+    onebit::npu::act_outlier_pick(x.data(), 1, K, K, 40.0f, 16, p);
+    CHECK(p.size() == 1 && p[0].ch == 777, "fused: the split finds channel 777 at tau 40");
+    std::vector<float> xz = x;
+    for (const auto& e : p) xz[(size_t)e.ch] = 0.0f;
+    std::vector<float> colg((size_t)R), colu((size_t)R);
+    for (int n = 0; n < R; n++) { colg[(size_t)n] = Wg[(size_t)n * K + 777]; colu[(size_t)n] = Wu[(size_t)n * K + 777]; }
+    std::vector<float> plain, split, wrong;
+    gemm_i8_row(x, W, K, N, plain);
+    gemm_i8_row(xz, W, K, N, split);
+    wrong = split;
+    onebit::npu::act_outlier_correct(split.data(), N, p, 0, R, [&](int) { return colg.data(); });
+    onebit::npu::act_outlier_correct(split.data(), N, p, R, R, [&](int) { return colu.data(); });
+    onebit::npu::act_outlier_correct(wrong.data(), N, p, 0, R, [&](int) { return colg.data(); });
+    onebit::npu::act_outlier_correct(wrong.data(), N, p, 0, R, [&](int) { return colu.data(); });   // up at the WRONG offset
+    const double ep = rel_err(plain, ref), es = rel_err(split, ref), ew = rel_err(wrong, ref);
+    std::printf("  fused gate|up vs f32: plain %.4f, split %.4f, up-at-offset-0 %.4f\n", ep, es, ew);
+    CHECK(es < 0.02, "fused: split rel_err %.4f is not at int8 noise", es);
+    CHECK(es * 5.0 < ep, "fused: split (%.4f) is not 5x better than plain (%.4f)", es, ep);
+    CHECK(ew > 10.0 * es, "fused: the up half at offset 0 (%.4f) must be far worse than the right offset (%.4f)", ew, es);
+    // out_off past N is a no-op, not a write past the row
+    std::vector<float> guard = split;
+    onebit::npu::act_outlier_correct(guard.data(), N, p, N, R, [&](int) { return colu.data(); });
+    CHECK(guard == split, "fused: an offset at N writes nothing");
+}
+
 int main() {
     test_pick();
     test_arithmetic();
     test_gather();
+    test_fused_gate_up();
     if (failures) {
         std::fprintf(stderr, "act_outliers_test: %d failure(s)\n", failures);
         return 1;

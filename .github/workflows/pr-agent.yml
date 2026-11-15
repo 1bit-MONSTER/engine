@@ -40,10 +40,19 @@ jobs:
   # so "no review" must be visible as a red reviewer, never as green), and pr_agent below does not run.
   reviewer:
     runs-on: [self-hosted, pr-agent]
+    # its own group (not pr_agent's, so the two jobs of one run never cancel each other), keyed the same way: a newer push
+    # replaces a reviewer still waiting for a window instead of queueing behind it
+    concurrency:
+      group: pr-agent-reviewer-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
+      cancel-in-progress: true
+    # A comment asks for the model only when it IS a command: the fleet posts many trusted comments that are not, and
+    # each one would otherwise open a 30B window and then report a red "reviewer unavailable" (engine#2509 review).
     if: |
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+       (startsWith(github.event.comment.body, '/review') || startsWith(github.event.comment.body, '/describe') ||
+        startsWith(github.event.comment.body, '/improve') || startsWith(github.event.comment.body, '/ask')))
     timeout-minutes: 15
     outputs:
       available: ${{ steps.wait.outputs.available }}

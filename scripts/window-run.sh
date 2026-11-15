@@ -74,7 +74,7 @@ self_test() {
     # (app/serve.cpp:1909), so a window would self-report a live LLM that cannot answer yet (measured 2026-11-15:
     # /v1/health went 503 -> 200 across a real restart while /v1/models was already 200).
     local me; me=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${BASH_SOURCE[0]##*/}   # WR_SELF is exported later, not yet here
-    # The patterns carry cu[r]l rather than curl so that this arm's OWN text cannot satisfy them: a"/v1/health" count
+    # The patterns carry cu[r]l rather than curl so that this arm's OWN text cannot satisfy them: a "/v1/health" count
     # that includes the line asserting it is an arm that can pass for the wrong reason.
     chk "the restart probe is /v1/health" "$(grep -c 'cu[r]l.*8090/v1/health' "$me")" 1
     chk "  ... and never the static model list" "$(grep -c 'cu[r]l.*8090/v1/models' "$me")" 0

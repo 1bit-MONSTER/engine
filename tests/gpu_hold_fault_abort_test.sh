@@ -130,6 +130,24 @@ age_rc=$?
 grep -qE 'newest [0-9]+s ago' "$scratch/tlogage" || { echo "FAIL take-time age: the refusal does not say how old the newest line is"; fail=1; }
 grep -qE 'newest [0-9]{9,}s ago' "$scratch/tlogage" && { echo "FAIL take-time age: the age printed in seconds, not an epoch"; fail=1; }
 
+# The age query must exclude the recovery notice too, not just the count. If it does not, a run whose only matching line
+# is the notice reports the NOTICE's age while the count says zero real faults - a fresh timestamp attached to a stale
+# event, which is worse than no age at all (review of #2550: the skip was added to the age on the strength of an
+# argument, not a test). Two epochs: a real fault 600 s old, the notice 10 s old; the age must come from the fault.
+mkdir -p "$scratch/agebin2"; t1=$(( $(date +%s) - 600 )); t2=$(( $(date +%s) - 10 ))
+printf '#!/bin/bash\nprintf "%s kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_error_worker: fault at 0x0\\n" %s\nprintf "%s kernel: amdxdna 0000:c6:00.1: aie2_tdr_recover_all: TDR recovery throttled: last power-cycle 45560 ms ago; no context touched\\n" %s\n' "$t1" "$t1" "$t2" "$t2" > "$scratch/agebin2/journalctl"
+chmod +x "$scratch/agebin2/journalctl"
+rm -f "$scratch/age-token2"
+env PATH="$scratch/agebin2:$PATH" HOME=$scratch ONEBIT_HOLD_DIR="$scratch/agehold2" GPU_HOLD_COOLDOWN=0 \
+    GPU_HOLD_WAIT=5 GPU_HOLD_MINUTES=1 GPU_HOLD_THERMAL_FLAG="$scratch/x" GPU_HOLD_RESET_WINDOW_MIN=10 \
+    timeout 60 "$hold" -l takeage2 -- true > "$scratch/tlogage2" 2>&1
+age2_rc=$?
+[ "$age2_rc" = 78 ] || { echo "FAIL take-time age/skip: rc $age2_rc, want 78"; fail=1; }
+grep -q 'refusing: 1 ' "$scratch/tlogage2" || { echo "FAIL take-time age/skip: the notice was counted as a fault"; fail=1; }
+_age2=$(sed -n 's/.*newest \([0-9]\+\)s ago.*/\1/p' "$scratch/tlogage2" | head -1)
+if [ -z "$_age2" ]; then echo "FAIL take-time age/skip: the refusal has no age"; fail=1;
+elif [ "$_age2" -lt 300 ]; then echo "FAIL take-time age/skip: age ${_age2}s is the RECOVERY NOTICE's, not the fault's (~600s)"; fail=1; fi
+
 take_run clean clean
 [ "$trc" = 0 ] || { echo "FAIL take-time: a clean log -> rc $trc, want 0 (a healthy hold must still run)"; fail=1; }
 

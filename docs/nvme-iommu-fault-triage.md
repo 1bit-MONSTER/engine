@@ -80,30 +80,56 @@ If a firmware refuses the sysfs write, the `nvme-cli` equivalent is `nvme set-fe
 (feature `0x0d`, Host Memory Buffer).
 
 **Prediction:** the `c4:00.0` stream stops within one burst interval.
-**If it stops** the faulting region is the HMB, and the remaining question is only why its mapping goes stale.
-**If it continues** the HMB is a bystander and the faulting region is the SWIOTLB bounce area or another map — go to
-test 2 with that expectation written down first.
+**Result (11-15 10:2xZ, run and logged on the issue): it continued** — 8 faults in 4 min with `hmb` verified `0`, against a
+2.3/min baseline, and 7 in 4 min after restoring it. **The HMB is a bystander.** That test cost four minutes and closed a
+hypothesis that had been argued for twenty; run it first on any successor question, because it is the cheapest one.
 
-## Test 2 — strict IOMMU invalidation (one reboot, separates "stale" from "unmapped")
+## Test 2 — trace the ordering, **not** a boot flag
+
+This section used to prescribe `iommu.strict=1` and predict "zero faults for a full boot". **That prediction was wrong**,
+and the measurement that broke it is worth more than the boot would have been:
+
+```
+# kprobe on iommu_unmap_fast, filtered to the six IOVAs that fault, with stacktrace on
+<idle>-0  [024] d.h1. 25466.371055: fastunmap: dom=0xffff8c75848ade00 iova=0xeba66000 size=0x1000
+<stack trace>
+ => iommu_unmap_fast
+ => __iommu_dma_unmap
+ => iommu_dma_unmap_phys
+ => dma_unmap_phys
+ => nvme_pci_complete_batch
+ => nvme_irq
+```
+
+88 such unmaps in 45 s, all on addresses that fault, from the **NVMe driver's hard-IRQ completion path**; a further 20
+come through `nvme_unmap_data -> dma_iova_unlink -> dma_iova_destroy` on teardown.
+
+`iommu_unmap_fast` drops the **page-table** entry immediately and defers only the **TLB invalidation**, so a page-table
+miss faults whether or not the flush was eager. Strict mode changes when stale TLB entries are dropped; it does not stop
+a device writing an IOVA the tables no longer map. Expect `iommu.strict=1` to change nothing about this stream — run it
+only if you want to confirm that, not as a discriminator.
+
+**What to measure instead**, on one address, both events timestamped:
 
 ```bash
-# verify the parameter against the kernel that will parse it, not from memory:
-/usr/src/linux-headers-$(uname -r)/scripts/extract-vmlinux /boot/vmlinuz-$(uname -r) > /tmp/vmlinux
-strings /tmp/vmlinux | grep -c 'iommu.strict'     # 3 on 7.4.0-rc1-1bit
-strings /tmp/vmlinux | grep -c 'amd_iommu=strict' # 0 -- this spelling does NOT exist here
+# 1. pick the top faulting IOVA from the census
+# 2. kprobe iommu_unmap_fast on that iova alone (filter), stacktrace on, capture for minutes in the background
+# 3. in the same capture window, note the fault timestamps for that iova
 ```
 
-Add to the kernel command line:
+The question the ordering answers: does a fault follow an unmap of the *same* address, or does it arrive while the
+address is still mapped? The first is a write-after-unmap — the device dirtying a buffer the CPU released, or the driver
+reusing the IOVA for the next request before the device acknowledged the previous one, both NVMe-side ordering questions
+on a DRAM-less controller under load. The second would mean the mapping was never there, which the unmap stream above
+already argues against.
 
-```
-iommu.strict=1
-```
+Two things to be careful about, both learned the hard way here:
 
-**Prediction:** the `c4:00.0`/`0x0015` stream goes to **zero for a full boot**; the NPU `c6:00.1` churn is unchanged.
-**If it goes to zero** the mapping is *stale but still present* in a lazily-invalidated TLB for a **live** HMB — the fix
-belongs in how the HMB mapping interacts with lazy invalidation, not in the NVMe driver.
-**If it survives strict mode** the HMB pages are genuinely unmapped while the controller still writes them: a
-teardown/re-establish ordering bug on the NVMe side, and the next step is tracing that ordering, not another boot.
+* **validate the probe before believing a silence.** A first capture reported "0 unmaps in 12 min" and was worthless: the
+  control showed the probe never fired, because `echo > filter` does not clear a kprobe filter (it fails to parse, and the
+  old filter stays). Use `echo 0 > .../filter` and read it back.
+* **pick the right symbol.** `iommu_unmap` had zero hits in 5 s on a box doing heavy I/O; `iommu_unmap_fast` had 40,510.
+  Probe a known-hot function (`ksys_write`) once to prove the plumbing, then argue about symbols.
 
 ## Two traps this runbook exists to stop
 

@@ -27,6 +27,7 @@
 # `--check` exits 1 when an initializer-fed Transpose survives, so a pack build can refuse the fold-less file
 # instead of silently paying the 2.6 s again.
 
+import os
 import sys
 
 import numpy as np
@@ -121,6 +122,10 @@ def main(argv):
     check = argv[1] == "--check"
     args = argv[2:] if check else argv[1:]
     path = args[0]
+    # Whether the SOURCE kept its weights external has to be read before `onnx.load()` pulls them into memory: after
+    # that the initializers carry no `data_location`, so the answer is gone (engine#2769 review).
+    was_external = any(i.data_location == onnx.TensorProto.EXTERNAL
+                       for i in onnx.load(path, load_external_data=False).graph.initializer)
     model = onnx.load(path)
     before = len(model.graph.node)
     if check:
@@ -131,7 +136,14 @@ def main(argv):
         return 1 if bad else 0
     folded = fold(model)
     out = args[1] if len(args) > 1 else path
-    onnx.save(model, out)
+    # engine#2769 review: the pack's layout is the export's, and `onnx.save()` inlines every external tensor by default
+    # -- a 159 MB weight lands inside the graph and the `.onnx.data` beside it becomes dead weight. If the source graph
+    # kept its weights external, keep them external, one sidecar next to the output (same shape as the input's).
+    if was_external:
+        onnx.save(model, out, save_as_external_data=True, all_tensors_to_one_file=True,
+                  location=os.path.basename(out) + ".data", size_threshold=1024)
+    else:
+        onnx.save(model, out)
     for src, dst, shape in folded:
         print(f"folded {src} -> {dst} {shape}")
     print(f"{out}: nodes {before} -> {len(model.graph.node)}, folded {len(folded)}")

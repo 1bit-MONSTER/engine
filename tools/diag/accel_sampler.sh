@@ -42,12 +42,10 @@
 #            (from ~/NPU-TOKEN) as they stood at that moment
 #   watch    journalctl -k -f, and for each IO_PAGE_FAULT line, the samples within +-WINDOW_S seconds, written as one
 #            attribution record
-#   selftest  proves the correlation and the rotation WITHOUT needing a fault -- run it before a long capture, because a
-#            silent correlator loses the event it exists to catch (that mistake was made twice in one day on this issue)
 #
 # Inputs (env, all optional): ACCEL_SAMPLER_DIR, SAMPLE_S (2), WINDOW_S (5), MAX_BYTES (50 MB), ACCEL_NODE.
 set -u
-DIR=${ACCEL_SAMPLER_DIR:-$HOME/.cache/accel-sampler}   # override to run a second instance
+DIR=${ACCEL_SAMPLER_DIR:-$HOME/.cache/accel-sampler}
 SAMPLE_S=${SAMPLE_S:-2}
 FULL_SCAN_S=${FULL_SCAN_S:-30}   # a full /proc sweep every 2 s cost 62% of a core (measured); holders are long-lived
                                  # servers, so re-checking the known ones each sample is enough between sweeps
@@ -134,9 +132,8 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   SAMP=$d/samples.log
   out=$(correlate 1005 1015)                       # +-5 s around a fault at 1010
   case "$out" in *222*) ;; *) echo "FAIL: the holder at the fault instant is missing"; fail=1 ;; esac
-  # The ticket is the field this whole issue is about: without it a record cannot say which hold was live. This arm exists
-  # because a refactor dropped exactly that field while every other arm stayed green (review of engine#2591); the fixture
-  # already carries ticket1/ticket2, so it needs no new data.
+  # the ticket is the field the whole issue is about -- a record without it cannot say which ticket was live. This arm
+  # is here because a refactor dropped exactly that field and the other arms stayed green (review of engine#2591).
   case "$out" in *ticket2*) ;; *) echo "FAIL: the npu-hold ticket was dropped from the record"; fail=1 ;; esac
   case "$out" in *111*) echo "FAIL: a sample outside the window was included"; fail=1 ;; esac
   out=$(correlate 2000 2010)
@@ -168,6 +165,29 @@ watch_faults() {  # correlate each fault with the samples around it
   done
 }
 
+summary() {  # what the run observed, so a 24 h expiry is not silence
+  local out=$DIR/summary.txt n attr
+  if [ -f "$SAMP" ]; then n=$(wc -l < "$SAMP"); else n=0; fi
+  if [ -f "$ATTR" ]; then attr=$(wc -l < "$ATTR"); else attr=0; fi
+  {
+    echo "# accel sampler summary $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "samples: $n   attributed faults: $attr"
+    echo
+    echo "## holders seen (pid, cmd, scope, ticket, sample count)"
+    awk -F'\t' '$2 != "-" {print $2"\t"$4"\t"$5"\t"$6}' "$SAMP" 2>/dev/null | sort | uniq -c | sort -rn | head -20
+    echo
+    if [ "$attr" -gt 0 ]; then
+      echo "## attribution records"
+      cut -c1-300 "$ATTR" | tail -20
+    else
+      echo "## no IO_PAGE_FAULT was seen in this window"
+      echo "The sampler cannot attribute a burst that did not happen. What it does establish: the holders above were"
+      echo "live for the whole window, so if a burst had occurred, its record would name them."
+    fi
+  } > "$out"
+  echo "summary written: $out"
+}
+
 case "${1:-both}" in
   sample) sample_once ;;
   watch)  watch_faults ;;
@@ -175,13 +195,19 @@ case "${1:-both}" in
     # the fault reader first, so no fault is missed between start and the first sample
     watch_faults &
     W=$!
-    trap 'kill "$W" 2>/dev/null' EXIT INT TERM
+    trap 'kill "$W" 2>/dev/null; summary; exit 0' TERM INT
+    trap 'kill "$W" 2>/dev/null' EXIT
     while :; do
       sample_once
+      # refresh the summary every ~15 min (450 samples at 2 s): a reboot kills the unit and SIGTERM never arrives, so a
+      # summary written only on exit can be hours stale exactly when it is needed
+      SAMP_N=$(( ${SAMP_N:-0} + 1 ))
+      [ $(( SAMP_N % 450 )) -eq 0 ] && summary
       sleep "$SAMPLE_S"
     done
     ;;
   holders) holders ;;
   selftest|--self-test) selftest ;;
-  *) echo "usage: $0 [both|sample|watch|holders|selftest]" >&2; exit 2 ;;
+  summary) summary ;;
+  *) echo "usage: $0 [both|sample|watch|holders|summary|selftest]" >&2; exit 2 ;;
 esac

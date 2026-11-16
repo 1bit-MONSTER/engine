@@ -342,6 +342,168 @@ void test_rope_cache_best_theta() {
     check(th2 != 250000.0, "rope cache: without the right candidate the fit does not invent it");
 }
 
+// engine#2634: llama3 RoPE read from a cos_cache over its whole length. Plain RoPE must not be called llama3, and the
+// original window is searched: Llama-3.2-1B-Instruct-onnx-ryzenai-npu's cache is factor 32 / original 131072.
+void test_rope_cache_llama3() {
+    const int64_t rows = 131072, half = 32;
+    const double theta = 500000.0, pi_ = 3.14159265358979323846;
+    const auto cache_of = [&](double fac, double orig) {
+        std::vector<float> c(size_t(rows) * size_t(half));
+        for (int64_t i = 0; i < half; ++i) {
+            double f = 1.0 / std::pow(theta, double(2 * i) / double(2 * half));
+            if (fac > 0) {
+                const double wl = 2 * pi_ / f;
+                if (wl > orig) f /= fac;
+                else if (wl >= orig / 4) {
+                    const double sm = (orig / wl - 1) / 3;
+                    f = (1 - sm) * f / fac + sm * f;
+                }
+            }
+            for (int64_t p = 0; p < rows; ++p) c[size_t(p) * size_t(half) + size_t(i)] = float(std::cos(double(p) * f));
+        }
+        return c;
+    };
+    const pi::RopeLlama3Fit a = pi::rope_cache_llama3(cache_of(32, 131072), rows, half, theta);
+    check(a.found && a.factor == 32 && a.orig == 131072 && a.err < 0.02,
+          "rope llama3: factor 32 / original 131072 is recovered (err " + std::to_string(a.err) + ")");
+    const pi::RopeLlama3Fit b = pi::rope_cache_llama3(cache_of(8, 8192), rows, half, theta);
+    check(b.found && b.factor == 8 && b.orig == 8192, "rope llama3: factor 8 / original 8192 is recovered");
+    const pi::RopeLlama3Fit c = pi::rope_cache_llama3(cache_of(0, 0), rows, half, theta);
+    check(!c.found && c.plain_err < 1e-3, "rope llama3: a plain cache is not called llama3 (plain err " +
+                                              std::to_string(c.plain_err) + ")");
+}
+
+// engine#2634: the 1.7 -onnx-ryzenai-npu Token .fconst -> its 1.8 form, byte for byte, on a synthetic geometry. The 1.8
+// stream is built first with every field its own bytes; the 1.7 stream is derived from it with the measured map (q first,
+// no headers, no MLP separator, each block ending with the next layer's input gain, layer 0's input gain only in the
+// graph); the rewrite has to give the 1.8 stream back exactly.
+void test_fconst17_rewrite() {
+    pi::Dims d;
+    d.hidden = 128, d.intermediate = 256, d.layers = 2, d.heads = 2, d.kv_heads = 1, d.head_dim = 64, d.vocab = 64;
+    d.model_type = "llama";
+    d.rms_norm_eps = 1e-5f;
+    d.eps_bits = pi::bf16_bits_of(1e-5f);
+    const int64_t H = 128, T = pi::attn_tile_bytes(H), nq = 2, nkv = 1, no = 2;
+    const int64_t gu = (256 / 64) * pi::group_bytes(H, 128), down = (H / 64) * pi::group_bytes(256, 64);
+    const int64_t head = 1 * T;   // vocab 64 = one 64-row tile
+    uint32_t seed = 12345;
+    const auto rnd = [&](int64_t n) {
+        std::string b(size_t(n), '\0');
+        for (auto& ch : b) { seed = seed * 1103515245u + 12345u; ch = char(seed >> 16); }
+        return b;
+    };
+    std::vector<uint16_t> gain0_bf(static_cast<size_t>(H), 0), gain0_f16(static_cast<size_t>(H), 0);
+    for (int64_t i = 0; i < H; ++i) {
+        const int m = int(i % 128);
+        gain0_bf[size_t(i)] = pi::bf16_bits_of(1.0f + float(m) / 128.0f);
+        gain0_f16[size_t(i)] = uint16_t((15 << 10) | (m << 3));      // 1 + m/128 in fp16, exactly
+    }
+    const auto bytes_of = [](const std::vector<uint16_t>& v) {
+        return std::string(reinterpret_cast<const char*>(v.data()), v.size() * 2);
+    };
+    std::string hdr(64, '\0');
+    hdr[0] = char(d.eps_bits & 0xFF), hdr[1] = char(d.eps_bits >> 8);
+    std::string sep(64, '\0');
+    sep[0] = 1;
+    // per-layer fields
+    std::vector<std::string> K, Q, Vv, O, POST, GU, DN, IN;
+    for (int L = 0; L < 2; ++L) {
+        K.push_back(rnd(nkv * T)); Q.push_back(rnd(nq * T)); Vv.push_back(rnd(nkv * T)); O.push_back(rnd(no * T));
+        POST.push_back(rnd(2 * H)); GU.push_back(rnd(gu)); DN.push_back(rnd(down));
+        IN.push_back(L == 0 ? bytes_of(gain0_bf) : rnd(2 * H));
+    }
+    const std::string FIN = rnd(2 * H), HEAD = rnd(head);
+    std::string f18, f17;
+    for (int L = 0; L < 2; ++L) {
+        f18 += hdr + IN[L] + K[L] + Q[L] + Vv[L] + O[L] + hdr + POST[L] + GU[L] + sep + DN[L];
+        f17 += Q[L] + K[L] + Vv[L] + O[L] + POST[L] + GU[L] + DN[L] + (L + 1 < 2 ? IN[L + 1] : FIN);
+    }
+    f18 += hdr + FIN + HEAD;
+    f17 += HEAD;
+    check(pi::fconst17_geometry_exported(f17.size(), d).empty(), "1.7 fconst: the synthetic stream fits the arithmetic");
+    check(!pi::fconst17_geometry_exported(f17.size() + 64, d).empty(), "1.7 fconst: 64 B more does not");
+    const fs::path dir = fs::temp_directory_path() / ("fconst17." + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string tok = (dir / "dd_metastate_Llm_Token_MatMulNBits_2_0.fconst").string();
+    put_file(tok, f17);
+    put_file((dir / "genai_config.json").string(), R"({"model":{"decoder":{"filename":"fusion.onnx"}}})");
+    put_file((dir / "fusion.onnx.data").string(), bytes_of(gain0_f16));
+    put_file((dir / "fusion.onnx").string(),
+             pb::model({pb::tensor("model.layers.0.input_layernorm.weight", {H}, "fusion.onnx.data", 0, uint64_t(2 * H), 10)},
+                       {}));
+    const std::string work = (dir / "canonical.fconst").string();
+    std::string said;
+    std::string got;
+    try {
+        got = pi::canonical_token_fconst17_exported(tok, dir.string(), d, work);
+    } catch (const std::exception& e) {
+        said = e.what();
+    }
+    check(said.empty() && got == work, "1.7 fconst: the rewrite runs and writes the copy (" + said + ")");
+    std::string out;
+    {
+        std::ifstream f(work, std::ios::binary);
+        out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    check(out == f18, "1.7 fconst: the rewrite is the 1.8 stream byte for byte (" + std::to_string(out.size()) + " vs " +
+                          std::to_string(f18.size()) + " B)");
+    // controls: a 1.8 file and a file of the wrong size come back as themselves, untouched
+    const std::string tok18 = (dir / "as18.fconst").string();
+    put_file(tok18, f18);
+    check(pi::canonical_token_fconst17_exported(tok18, dir.string(), d, work + ".2") == tok18,
+          "1.7 fconst: a 1.8 file is not rewritten");
+    const std::string tokx = (dir / "odd.fconst").string();
+    put_file(tokx, f17 + std::string(64, '\0'));
+    check(pi::canonical_token_fconst17_exported(tokx, dir.string(), d, work + ".3") == tokx,
+          "1.7 fconst: a file that does not fit the arithmetic is not rewritten");
+    // the graph's RMSNorm epsilon (a node with a float attribute), read back
+    std::string node, attr;
+    pb::str(node, 4, "SimplifiedLayerNormalization");
+    pb::str(attr, 1, "epsilon");
+    pb::tag(attr, 2, 5);
+    const float e = 1e-5f;
+    char eb[4];
+    std::memcpy(eb, &e, 4);
+    attr.append(eb, 4);
+    pb::ints(attr, 20, 1);   // AttributeProto.type = FLOAT
+    pb::str(node, 5, attr);
+    put_file((dir / "eps.onnx").string(), pb::model({}, {node, node}));
+    int n_eps = 0;
+    bool conflict = true;
+    const float got_eps = pi::graph_norm_eps_exported((dir / "eps.onnx").string(), &n_eps, &conflict);
+    check(got_eps == 1e-5f && n_eps == 2 && !conflict, "1.7 fconst: the graph's RMSNorm epsilon is read (" +
+                                                           std::to_string(got_eps) + ", " + std::to_string(n_eps) + " nodes)");
+    // #2638 review: two nodes that DISAGREE are a conflict, and the decision says so instead of falling back in silence
+    const auto eps_node = [&](float v) {
+        std::string nd, at;
+        pb::str(nd, 4, "SimplifiedLayerNormalization");
+        pb::str(at, 1, "epsilon");
+        pb::tag(at, 2, 5);
+        char vb[4];
+        std::memcpy(vb, &v, 4);
+        at.append(vb, 4);
+        pb::ints(at, 20, 1);
+        pb::str(nd, 5, at);
+        return nd;
+    };
+    put_file((dir / "eps2.onnx").string(), pb::model({}, {eps_node(1e-5f), eps_node(1e-6f)}));
+    int n2 = 0;
+    bool conflict2 = false;
+    (void)pi::graph_norm_eps_exported((dir / "eps2.onnx").string(), &n2, &conflict2);
+    check(conflict2 && n2 == 2, "1.7 fconst: two RMSNorm nodes stating different epsilons are a conflict");
+    std::string msg;
+    const float kept = pi::graph_eps_decision(false, 1e-6f, 2, true, 1e-5f, &msg);
+    check(kept == 1e-6f && msg.find("WARNING") != std::string::npos && msg.find("DIFFERENT") != std::string::npos,
+          "1.7 fconst: on a conflict the configured eps is kept and a WARNING says why (" + msg + ")");
+    const float taken = pi::graph_eps_decision(false, 1e-6f, 18, false, 1e-5f, &msg);
+    check(taken == 1e-5f && msg.find("taken from the graph") != std::string::npos,
+          "1.7 fconst: agreeing nodes give their eps, with a note");
+    const float stated = pi::graph_eps_decision(true, 1e-6f, 18, false, 1e-5f, &msg);
+    check(stated == 1e-6f && msg.empty(), "1.7 fconst: a stated config.json eps wins, silently");
+    fs::remove_all(dir);
+}
+
 // The conversion half of the writer (engine#1503): the pack's `(code - zp)*scale` and the container's
 // `code*d + m` are different conventions, and the mapping has to reproduce the pack's own numbers. The obvious
 // alternative -- dequantise and re-quantise with the container's quantiser -- was measured on a real phi-4 tile and
@@ -7092,6 +7254,8 @@ int main(int argc, char** argv) {
         test_bounds();
         test_external_tile_decode();
     test_rope_cache_best_theta();
+    test_rope_cache_llama3();
+    test_fconst17_rewrite();
     test_external_to_container();
     test_external_roles();
     test_external_container_names();

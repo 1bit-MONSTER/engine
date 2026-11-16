@@ -30,7 +30,12 @@ Every lane shares one GitHub account, and a verdict is the fleet's unit of revie
 
 Usage:
     tools/ci/pr_verdict.py --check REPO PR                 # pending review? head? verdicted at this head?
-    tools/ci/pr_verdict.py --post REPO PR BODY_FILE VERDICT [--dry-run]
+    tools/ci/pr_verdict.py --post REPO PR BODY_FILE VERDICT [--dry-run] [--as-comment]
+
+`--as-comment` posts the verdict as an issue comment instead of a review. It exists because a PENDING review from
+another lane blocks every review post on that PR (failure 1), and pr_review_queue reads the sha-first verdict from
+*both* lists -- so a comment is a verdict when a review cannot be posted. Measured 2026-11-16: a peer's draft
+blocked #2612's verdict, and the only way through was to post it by hand.
 
 `--post` refuses (exit 2) when the body's first line does not carry the current head, or when a pending review
 exists; it posts and then re-reads to prove the review landed with this head in it.
@@ -117,7 +122,7 @@ def do_check(repo, pr):
     return 0
 
 
-def do_post(repo, pr, body_file, verdict, dry_run):
+def do_post(repo, pr, body_file, verdict, dry_run, as_comment=False):
     head = (api_json(f"repos/{repo}/pulls/{pr}") or {}).get("head", {}).get("sha", "")
     if not head:
         return 2
@@ -132,18 +137,25 @@ def do_post(repo, pr, body_file, verdict, dry_run):
         print(f"pr_verdict: refusing to post: {why}", file=sys.stderr)
         return 2
     pend = pending_ids(api_json(f"repos/{repo}/pulls/{pr}/reviews?per_page=100") or [])
-    if pend:
+    if pend and not as_comment:
         print(f"pr_verdict: refusing to post: pending review(s) {pend} block it "
-              f"(clear: gh api -X DELETE repos/{repo}/pulls/{pr}/reviews/<id>)", file=sys.stderr)
+              f"(clear: gh api -X DELETE repos/{repo}/pulls/{pr}/reviews/<id>; or pass --as-comment, "
+              f"which pr_review_queue also reads)", file=sys.stderr)
         return 2
     if dry_run:
-        print(f"would post {verdict} about {head[:7]} to {repo}#{pr}")
+        how = "comment" if as_comment else "review"
+        print(f"would post {verdict} about {head[:7]} to {repo}#{pr} as a {how}")
         return 0
-    rc, out, err = gh("pr", "review", str(pr), "--repo", repo, "--comment", "--body-file", body_file)
+    if as_comment:
+        rc, out, err = gh("pr", "comment", str(pr), "--repo", repo, "--body-file", body_file)
+    else:
+        rc, out, err = gh("pr", "review", str(pr), "--repo", repo, "--comment", "--body-file", body_file)
     if rc != 0:
         print(f"pr_verdict: post failed: {(err or out).strip()[:200]}", file=sys.stderr)
         return 2
-    if not verdicted_at(api_json(f"repos/{repo}/pulls/{pr}/reviews?per_page=100") or [], head):
+    back = ((api_json(f"repos/{repo}/pulls/{pr}/reviews?per_page=100") or [])
+            + (api_json(f"repos/{repo}/issues/{pr}/comments?per_page=100") or []))
+    if not verdicted_at(back, head):
         print(f"pr_verdict: posted, but no review at {head[:7]} is readable back: check the PR by hand", file=sys.stderr)
         return 2
     print(f"posted {verdict} about {head[:7]} (read back)")
@@ -173,6 +185,8 @@ def self_test():
     assert verdicted_at([{"body": "abcdef1 READY — x"}], H)
     assert not verdicted_at([{"body": "READY — no head here"}], H)
     assert not verdicted_at([{"body": "abcdef1 looks fine"}], H)
+    # the --as-comment fallback is read back from the ISSUE-comment list, same shape
+    assert verdicted_at([{"body": "abcdef1 READY — posted as a comment"}], H)
     print("pr_verdict self-test: ok (head in line 1, stale head, missing verdict, empty, pending, read-back)")
     return 0
 
@@ -182,6 +196,8 @@ def main():
     ap.add_argument("--check", nargs=2, metavar=("REPO", "PR"))
     ap.add_argument("--post", nargs=4, metavar=("REPO", "PR", "BODY_FILE", "VERDICT"))
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--as-comment", action="store_true",
+                    help="post as an issue comment when a peer's pending review blocks a review")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
@@ -193,7 +209,7 @@ def main():
         if verdict not in VERDICTS:
             print(f"pr_verdict: VERDICT must be one of {VERDICTS}", file=sys.stderr)
             return 2
-        return do_post(repo, pr, body, verdict, a.dry_run)
+        return do_post(repo, pr, body, verdict, a.dry_run, a.as_comment)
     ap.print_help()
     return 2
 

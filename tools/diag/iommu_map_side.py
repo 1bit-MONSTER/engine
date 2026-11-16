@@ -84,8 +84,8 @@ FAULT = re.compile(r"^\[\s*(\d+\.\d+)\].*IO_PAGE_FAULT.*address=(0x[0-9a-f]+)")
 
 
 def parse_events(path):
-    """([(t, iova, size)] maps, [...] unmaps, Counter of unrecognised functions) -- in log order."""
-    maps, unmaps, other = [], [], collections.Counter()
+    """([(t, iova, size)] maps, [...] unmaps, Counter unrecognised, Counter widened) -- in log order."""
+    maps, unmaps, other, widened = [], [], collections.Counter(), collections.Counter()
     try:
         fh = open(path, errors="replace")
     except OSError as e:
@@ -106,7 +106,9 @@ def parse_events(path):
                 unmaps.append((t, iova, size))
             else:
                 other[fn] += 1
-    return maps, unmaps, other
+            if (kind == "map" and fn not in MAP_FUNCS) or (kind == "unmap" and fn not in UNMAP_FUNCS):
+                widened[fn] += 1
+    return maps, unmaps, other, widened
 
 
 def parse_faults(path):
@@ -138,7 +140,7 @@ def _nearest(times, t):
     return best, len(times)
 
 
-def analyse(maps, unmaps, faults, before, after, other=()):
+def analyse(maps, unmaps, faults, before, after, other=(), widened=()):
     """[(t, iova, text)] -- one line per fault inside the capture window, in the words the census reads."""
     if not maps and not unmaps:
         return [], "no capture events: the probe recorded nothing, so this file says nothing about the device"
@@ -191,6 +193,9 @@ def analyse(maps, unmaps, faults, before, after, other=()):
            f"{len(rows)} fault(s) in the window")
     if other:
         hdr += "; %d events with an unrecognised function (e.g. %s)" % (sum(other.values()), next(iter(other)))
+    if widened:
+        hdr += "; %d events counted by substring but not in the documented names (e.g. %s)" % (
+            sum(widened.values()), next(iter(widened)))
     if not maps:
         hdr += "; no map events in this capture (the map side is unanswerable)"
     elif not unmaps:
@@ -236,7 +241,7 @@ def self_test() -> int:
         (d / "before.txt").write_text(before)
         (d / "after.txt").write_text(after)
 
-        maps, unmaps, _other = parse_events(str(d / "cap.txt"))
+        maps, unmaps, _other, _w = parse_events(str(d / "cap.txt"))
         chk(len(maps) == 2 and len(unmaps) == 1, "a task name containing a space still parses (2 map, 1 unmap)")
         # 2b. the same events under ANOTHER lane's naming (`unm:`/`map:`/`prs2mp:`) parse identically, because the
         #     class comes from the probed function. A tool that only reads its own event names cannot read the
@@ -244,7 +249,7 @@ def self_test() -> int:
         #     are named `unm:`, and the first version of this file refused them.
         other = pathlib.Path(td) / "other.txt"
         other.write_text(cap.replace("capmap:", "whatever:").replace("capunm:", "unm:"))
-        m2, u2, _o2 = parse_events(str(other))
+        m2, u2, _o2, _w2 = parse_events(str(other))
         chk((m2, u2) == (maps, unmaps), "event names invented by another lane parse by the probed function, not the name")
         chk(all(e[2] == 0x1000 for e in maps + unmaps), "size parses as 4 KiB")
 
@@ -256,13 +261,25 @@ def self_test() -> int:
             "          <idle>-0       [001] ..s1. 1001.000000: p: (iommu_map_pages+0x4/0x80) iova=0x2000 size=0x1000\n"
             "          <idle>-0       [001] ..s1. 1002.000000: p: (iommu_map.part.0+0x4/0x80) iova=0x3000 size=0x1000\n"
             "          <idle>-0       [001] ..s1. 1003.000000: p: (iommu_tlb_sync+0x4/0x80) iova=0x4000 size=0x1000\n")
-        m4, u4, o4 = parse_events(str(odd))
+        m4, u4, o4, w4 = parse_events(str(odd))
         chk(len(m4) == 3, "__iommu_map, iommu_map_pages and iommu_map.part.0 are all counted as maps (3)")
         chk(u4 == [] and o4 == {"iommu_tlb_sync": 1},
             "a function with neither word is counted, not dropped: %s" % dict(o4))
-        _r4, hdr4 = analyse(m4, u4, [(1004.0, 0x9999000)], [], [(1004.0, 0x9999000)], o4)
+        chk(w4 == {"__iommu_map": 1, "iommu_map_pages": 1, "iommu_map.part.0": 1},
+            "the three widened names are surfaced with their counts, not just counted as maps: %s" % dict(w4))
+        # a name that contains `map` and is NOT an IOMMU map: the substring rule catches it, so the header must
+        # say so. A denylist would be a guess; a number a reader can see is not.
+        odd2 = pathlib.Path(td) / "odd2.txt"
+        odd2.write_text("          <idle>-0       [001] ..s1. 1000.000000: p: (bitmap_alloc+0x4/0x80) iova=0x1000 size=0x1000\n")
+        m6, _u6, _o6, w6 = parse_events(str(odd2))
+        chk(len(m6) == 1 and w6 == {"bitmap_alloc": 1},
+            "a `map`-containing non-IOMMU name is counted AND surfaced (%s), so the map side cannot be inflated silently"
+            % dict(w6))
+        _r4, hdr4 = analyse(m4, u4, [(1004.0, 0x9999000)], [], [(1004.0, 0x9999000)], o4, w4)
         chk("1 events with an unrecognised function (e.g. iommu_tlb_sync)" in hdr4,
             "the unrecognised event is named in the header: %s" % hdr4)
+        chk("3 events counted by substring but not in the documented names" in hdr4,
+            "the widened names are surfaced in the header: %s" % hdr4)
 
         # 2d. ONE-SIDED captures: an unmap-only trace cannot say a page was never mapped, and says so.
         rows5, hdr5 = analyse([], [(1000.0, 0x4128000, 0x1000), (1002.0, 0x5128000, 0x1000)],
@@ -348,9 +365,9 @@ def main(argv):
     if not (a.trace and a.before and a.after):
         ap.print_help()
         return 2
-    maps, unmaps, other = parse_events(a.trace)
+    maps, unmaps, other, widened = parse_events(a.trace)
     rows, header = analyse(maps, unmaps, parse_faults(a.after), parse_faults(a.before), parse_faults(a.after),
-                           other)
+                           other, widened)
     for line in render(rows, header):
         print(line)
     return exit_code(maps, unmaps)

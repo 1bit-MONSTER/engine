@@ -135,6 +135,15 @@ tctl() {
     if [ -n "$v" ]; then echo $((v / 1000)); else echo 0; fi
 }
 
+# WHICH COPY RAN, recorded on the take line. What runs on the box is ~/.local/bin/gpu-hold, a copy that nothing
+# re-installs on merge, so the guards in this file can be merged and still not be live: measured twice, once as
+# "identical to engine main" after #2486 (11-15 05:52Z) and 16 h later as the pre-#2538 copy with no take-time
+# guard at all (11-16 03:2xZ, pi-os3). Reconstructing that meant comparing sizes, mtimes and pattern counts by
+# hand. The sha256 of the running file answers it in one field: `sha256sum scripts/gpu-hold` is the comparison.
+# $0 is resolved here, before anything could change the working directory.
+SCRIPT_ID=$(sha256sum -- "$0" 2> /dev/null | cut -c1-12) || SCRIPT_ID=""
+[ -n "$SCRIPT_ID" ] || SCRIPT_ID="unknown"
+
 log() {
     local line
     line="gpu-hold[$$] $* $(date -Is)"
@@ -293,7 +302,7 @@ while [ "$state" = queued ]; do
             mine="gpu-hold $LABEL pid $$ $(date -Is)"
             if ( set -o noclobber; printf '%s\n' "$mine" > "$TOKEN" ) 2> /dev/null; then
                 state=holding
-                log "took $TOKEN after ${waited}s (die $(tctl)C)"
+                log "took $TOKEN after ${waited}s (die $(tctl)C; script $SCRIPT_ID)"
                 # A RECENT amdgpu/MES RESET, checked at the one choke point every lane goes through. The standing rule is
                 # "on any amdgpu reset: stop, release the ticket" and until now nothing implemented it - my own window
                 # harness had no such check (grep 'dmesg|reset|MES' = 0 in all three scripts) and on 2026-11-15 a window

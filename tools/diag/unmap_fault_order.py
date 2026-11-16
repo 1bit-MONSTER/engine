@@ -53,7 +53,11 @@ EPOCH_RE = re.compile(r"(\d+\.\d+):")
 # and a `dmesg`/trace-style capture writes `[1234.567890]` seconds-since-boot. A fault line is only correlatable
 # when its clock is the trace's, so the seconds form is preferred when both appear.
 ISO_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?)")
-BOOT_RE = re.compile(r"^\s*\[(\d+\.\d+)\]")
+# The kernel pads the stamp to a fixed width: `[  321.308031]`, two spaces here and one for values >= 1000 s.
+# Written without the inner `\s*` the regex only matched the unpadded shape a doc example uses, so EVERY real
+# boot-stamped line parsed as untimed and the tool could not correlate on a capture it produced itself --
+# measured 2026-11-16 on `journalctl -k -o short-monotonic`: `[  321.308031] … IO_PAGE_FAULT …` -> t=None.
+BOOT_RE = re.compile(r"^\s*\[\s*(\d+\.\d+)\]")
 
 
 def read_lines(path):
@@ -172,7 +176,19 @@ def self_test():
                        "iova=0xffff8e83841c3a00 size=0x45ec0"])
     chk(pointer_shaped(ptr), "a pointer-shaped iova column is detected, not read as uncorrelated")
     chk(not pointer_shaped(got), "a real IOVA column is not mistaken for one")
+    # 7. the REAL kernel stamp is PADDED (`[  321.308031]`, two spaces; `[    0.000000]` early in a dmesg). The doc
+    #    example above writes the unpadded `[1234.567890]`, and an arm built only from it passed while every real
+    #    capture parsed as untimed -- the tool then reported "nothing correlated" on data it had just been given.
+    padded = "[  321.308031] strixhalo kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged " \
+             "[IO_PAGE_FAULT domain=0x0015 address=0x4128000]"
+    pf = parse_faults([padded], lambda _s: None)
+    chk(pf and pf[0][0] == 321.308031, "a padded boot stamp parses (measure with journalctl -k -o short-monotonic)")
+    ptr_tr = parse_trace(["   bash-1 [002] .... 321.308000: unm: (iommu_unmap_fast) iova=0x4128000 size=0x1000"])
+    hits = correlate(ptr_tr, pf, 5000)
+    chk(hits and hits[0][3] and hits[0][3][1] < 0,
+        "a padded fault correlates with an unmap 31 us earlier (BEFORE, not an uncorrelated negative)")
     return 0 if ok else 1
+
 
 
 def main():

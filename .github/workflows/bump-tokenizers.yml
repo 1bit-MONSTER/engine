@@ -61,6 +61,7 @@ jobs:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
         run: |
           set -euo pipefail
+          # moving-ref: the bump bot reads the newest release in order to PROPOSE a pin; it consumes none
           tag=$(gh api repos/huggingface/tokenizers/releases/latest --jq .tag_name)
           upstream=$(git ls-remote https://github.com/huggingface/tokenizers.git "refs/tags/${tag}^{}" | awk '{print $1}')
           [ -n "$upstream" ] || upstream=$(git ls-remote https://github.com/huggingface/tokenizers.git "refs/tags/${tag}" | awk '{print $1}')

@@ -1820,6 +1820,37 @@ then zeros. On SmolLM2-135M the block is 2,360,292 B (q at 1,216, k at 231,616, 
 
 **The 1.8 file is the same block in another order (engine#2594).** `SmolLM2-135M-Instruct_rai_1.8.0_npu_4K`'s Token `.fconst` is 90,469,696 B, 1,080 B less than the 1.9 file, which is 30 layers x 4 x 9 heads. It writes `k_proj` before `q_proj` and has no `4 x heads` field: k at 1,216, q at 78,016, v at 308,416, o at 385,216, stride 2,360,256, head at 70,808,896. Rebuilt into the 1.9 order, it equals the 1.9 file byte for byte, except 112 code bytes in layer 3's `o_proj`. `plan()` takes this form only when the file fits it and does not fit the one above. The envelopes move 4 x heads bytes a layer, so on a multi-layer file only one of the two can pass, and `npu-pack info` names the form in `block32_layers.form`. The tied-head self-check cannot see a q/k swap. With the sink field dropped but q still first, the import passed its own checks (head vs embedding corr 0.999999, 60/60 norm anchors), and the device scored 2/64 on the teacher-forced probes. With k first, the device scores 53/64, the same as the 1.9 pack (53/64; RTN int4 of the HF model scores 47/64). It answers "Neil Armstrong … July 20, 1969". It declines the France question, and so do the host f32 and host int8 GEMMs on the same container, so that comes from the pack's 4-bit weights; the HF fp32 model answers Paris.
 
+**The Ryzen AI 1.7 `-onnx-ryzenai-npu` Token file has no norm envelopes (engine#2634).** These packs ship
+`dd_metastate_Llm_Token_MatMulNBits_2_0.fconst` and an empty `config.json`. Measured on Llama-3.2-1B-Instruct against
+its 1.8 `npu_4K` twin, a layer block holds the same tiles in a different arrangement:
+
+| 1.7 `-onnx-ryzenai-npu` | 1.8 |
+|---|---|
+| q, k, v, o tiles, **q first** | header + input gain, then k, q, v, o |
+| post_attention gain bf16[H], **no header** | header + post gain |
+| MLP gate/up then down, **no 64-byte separator** | the MLP with a separator (`01`, then zeros) |
+| the **next** layer's input gain (after the last layer: the final norm) | -- |
+| tail: the head's tiles | header + final norm, then the head's tiles |
+
+Layer 0's input_layernorm is not in the file. It is the graph's fp16 `model.layers.0.input_layernorm.weight` (in
+`fusion.onnx`'s `If` branches), and every gain the file does carry equals bf16 of the graph's fp16 exactly.
+`materialise_token_fconst()` detects this form by its arithmetic: the file must be exactly layers x stride + head, and
+it must not open with an epsilon header. It then rewrites the file into the 1.8 form, so every check of the 1.8 reader
+runs unchanged. Rebuilt this way, the Llama file is the 1.8 twin's size. Every tile, gate/up unit and down group is at
+least 96.4 % byte-equal to the twin at its mapped place (a one-unit misplacement scores 8.5 %), and the rest is the two
+exports' re-quantization.
+
+With `config.json` empty, the model's numbers come from the pack itself:
+- **rms_norm_eps** from the graph's RMSNorm nodes (18 nodes state 1e-5). The default was 1e-6.
+- **RoPE** from `cos_cache`. The theta fit (500000) looks only at the first 4,096 positions, where llama3 scaling is
+  invisible. So the whole cache is also compared, by max error, with plain RoPE and with llama3 variants:
+  - this pack's cache is **factor 32 with original_max_position_embeddings 131072**, max error 0.009, against 1.995
+    for plain RoPE;
+  - the upstream config states 8192, and that fits no better than plain, so the pack's own cache wins.
+
+On the NPU, the result is "The capital of France is Paris.", "12 * 7 = 84" and "Neil Armstrong ... July 20, 1969"
+(all stop, 3.9-5.0 tok/s).
+
 The **gate/up unit** is the head's unit with 64 row *slots* per strip instead of 32 rows: 4,864
 zero bytes, then `2 x (K/32)` strips of 1,216 B. Strip `s` holds K block `s/2`; slots 0..31 are
 `gate_proj` rows `32 x (s%2) .. +31` of the unit and slots 32..63 are the same rows of `up_proj`.

@@ -163,10 +163,23 @@ def provenance(recorded, tested, repo):
     rc, base = _git(repo, "merge-base", recorded, tested)
     if rc != 0 or not base:
         shallow = _git(repo, "rev-parse", "--is-shallow-repository")[1] or "?"
-        return f"{head}: cannot place (no common history in this clone; shallow={shallow})"
+        return (f"{head}: cannot place (no common history in this clone; shallow={shallow}"
+                + ("; fetch the history with `git -C <llama.cpp> fetch --unshallow`"
+                   if shallow == "true" else "") + ")")
     a = _git(repo, "rev-list", "--count", f"{base}..{recorded}")[1]
     b = _git(repo, "rev-list", "--count", f"{base}..{tested}")[1]
     return f"{head}: diverged at {short(base)} (golden +{a}, tested +{b})"
+
+
+def cmd_judge_exit(where, bad):
+    """The judge's exit from the two things that decide it: the provenance relation and the KLD limits.
+
+    An unplaceable base is 2 (INCOMPLETE) even when every number is inside the limits: the numbers were not
+    compared against a base this clone can place, so the run could not judge the gate (engine#2643).
+    """
+    if "cannot place" in where:
+        return 2
+    return 1 if bad else 0
 
 
 def cmd_judge(manifest, name, logpath):
@@ -192,7 +205,7 @@ def cmd_judge(manifest, name, logpath):
         bad.append(f"same top token {top:.2f}% < {limits['min_same_top_p']}%")
     msg = f"mean KLD {mean:.6f}, p99 {p99 if p99 is not None else float('nan'):.5f}, same top {top:.2f}%"
     print(msg + ("; " + "; ".join(bad) if bad else "") + f" [{where}]")
-    return 1 if bad else 0
+    return cmd_judge_exit(where, bad)
 
 
 # ggml-hrx's placement observer (GGML_HRX_REPORT=2, engine #390), one line per graph:
@@ -342,6 +355,16 @@ def cmd_selftest():
         check(provenance(c1, None, repo), "cannot place (a null pin)", "a null tested pin is refused")
         check(provenance("0" * 40, c3, repo), "cannot place (", "an absent object is refused, not related")
         check(provenance(c1, c3, repo), "golden is 2 commits behind", "an ancestor is counted, exactly")
+        # engine#2643: a base this clone cannot place is INCOMPLETE (2), not a PASS and not a FAIL -- and the
+        # signal is the word the line already carries, so the two cannot drift apart.
+        if "cannot place" not in provenance("0" * 40, c3, repo):
+            print("FAIL an absent object did not say 'cannot place'"); fails += 1
+        if cmd_judge_exit(provenance("0" * 40, c3, repo), bad=False) != 2:
+            print("FAIL an unplaceable base judged 0 instead of 2 (INCOMPLETE)"); fails += 1
+        if cmd_judge_exit(provenance(c3, c3, repo), bad=False) != 0:
+            print("FAIL a placeable, in-limits base did not judge 0"); fails += 1
+        if cmd_judge_exit(provenance(c3, c3, repo), bad=True) != 1:
+            print("FAIL a placeable base outside the limits did not judge 1"); fails += 1
         check(provenance(c3, c1, repo), "golden is 2 commits AHEAD", "the reverse direction is distinct")
         behind = provenance(c1, c3, repo)
         check("behind" in behind and "AHEAD" not in behind, True, "the two directions never both appear")

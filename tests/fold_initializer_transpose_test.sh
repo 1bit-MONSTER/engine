@@ -120,6 +120,45 @@ check "the two consumers read different initializers" "$distinct" "True"
 rc=0; python3 "$TOOL" --check "$tmp/two_out.onnx" >/dev/null 2>&1 || rc=$?
 check "check accepts the two-perm folded graph" "$rc" 0
 
+# The suffixed name must not collide with an initializer the graph already carries: reusing a same-named tensor of a
+# different shape would be the same defect one level down.
+python3 - "$tmp/coll.onnx" <<'FIXTURE'
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+
+w = numpy_helper.from_array(np.arange(6, dtype=np.float32).reshape(2, 3), "w")
+clash = numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), "w_t0_1")
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[1, 0]),
+     helper.make_node("Transpose", ["w"], ["b"], perm=[0, 1]),
+     helper.make_node("Identity", ["a"], ["out_a"]),
+     helper.make_node("Identity", ["b"], ["out_b"]),
+     helper.make_node("Identity", ["w_t0_1"], ["out_c"])],
+    "coll", [], [helper.make_tensor_value_info("out_a", TensorProto.FLOAT, None),
+                 helper.make_tensor_value_info("out_b", TensorProto.FLOAT, None),
+                 helper.make_tensor_value_info("out_c", TensorProto.FLOAT, None)], [w, clash])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+FIXTURE
+
+python3 "$TOOL" "$tmp/coll.onnx" "$tmp/coll_out.onnx" >"$tmp/coll.log" 2>&1 || { cat "$tmp/coll.log"; fail=$((fail+1)); }
+python3 - "$tmp/coll_out.onnx" >"$tmp/coll.txt" <<'PROBE'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: list(numpy_helper.to_array(i).shape) for i in m.graph.initializer}
+ids = [n for n in m.graph.node if n.op_type == "Identity"]
+a, b = inits.get(ids[0].input[0], []), inits.get(ids[1].input[0], [])
+print("x".join(str(d) for d in a), "x".join(str(d) for d in b), "x".join(str(d) for d in inits["w_t0_1"]))
+PROBE
+read -r ca cb clash_shape <"$tmp/coll.txt"
+check "the colliding name is not reused for a different shape" "$cb" "2x3"
+check "the pre-existing initializer keeps its shape" "$clash_shape" "4x4"
+check "the [1,0] consumer is still 3x2" "$ca" "3x2"
+
 echo "---"
 if [ "$fail" -ne 0 ]; then echo "$fail failed"; exit 1; fi
 echo "fold_initializer_transpose: all checks ok"

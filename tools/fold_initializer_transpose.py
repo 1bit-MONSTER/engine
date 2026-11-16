@@ -60,6 +60,12 @@ def fold(model):
         dst = f"{src}_t"
         if dst in inits and list(numpy_helper.to_array(inits[dst]).shape) != list(want.shape):
             dst = f"{src}_t{perm_tag}"
+            # A graph may already carry an initializer with the suffixed name; only reuse it when it is the same tensor,
+            # otherwise find a free one rather than rewiring consumers onto a weight of the wrong shape.
+            n_suffix = 1
+            while dst in inits and list(numpy_helper.to_array(inits[dst]).shape) != list(want.shape):
+                dst = f"{src}_t{perm_tag}_{n_suffix}"
+                n_suffix += 1
         # The suffix only appears for a second orientation; a single-perm caller keeps the byte-identical `w_t`.
         if dst not in inits:
             new = numpy_helper.from_array(np.ascontiguousarray(want), dst)

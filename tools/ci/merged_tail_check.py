@@ -449,6 +449,24 @@ def self_test():
         "one line of ten edited away by main is PARTIAL, not LOST")
     d.cleanup()
 
+    # The fifth state. A later commit that REWRITES the file leaves the branch's lines absent and
+    # the base file longer. Measured 2026-11-16: #2504's 15-of-18 "absent" lines, base longer,
+    # and the commit's own subject (`httplib::Server`) on main three times. The evidence was in the
+    # detail string while the verdict said LOST.
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    branch(r, "pr")
+    sup_sha = commit(r, "s.py", "".join(f"branch_line_{i} = {i}\n" for i in range(6)),
+                     "the branch adds six lines")
+    # The rewrite must land on the BASE, not on the branch: branch() moves HEAD, so without this
+    # checkout main never receives s.py and the fixture tests "unreadable base", not "rewritten".
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    commit(r, "s.py", "".join(f"rewritten_{i} = f({i})\n" for i in range(12)),
+           "a later commit rewrites the region and is longer")
+    chk("SUPERSEDED", classify_commit(r, sup_sha, "main")[0],
+        "a base that rewrote every affected file is SUPERSEDED, not LOST")
+    d.cleanup()
+
     # The gate: an unknown frozen head must never skip a branch, and equal heads must skip.
     chk(True, same_head("0193a29e5" + "0" * 31, "0193a29e5" + "9" * 31), "an equal frozen head skips")
     chk(False, same_head("0193a29e5" + "0" * 31, "f7700ba0a" + "1" * 31),

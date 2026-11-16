@@ -1840,6 +1840,18 @@ runs unchanged. Rebuilt this way, the Llama file is the 1.8 twin's size. Every t
 least 96.4 % byte-equal to the twin at its mapped place (a one-unit misplacement scores 8.5 %), and the rest is the two
 exports' re-quantization.
 
+**The 1.7 `Gemma-3-4b-it-mm-onnx-ryzenai-npu` embedding (engine#2663).** `genai_config.json` names the embedding
+graph `gemma-3-embedding.onnx`. It is a `Gather` over **`lm_head.weight` [262208, 2560] f32** (the model is tied; the
+decoder's 238 `MatMulNBitsBf` are exactly 34 layers x 7, with no head), followed by a multiply by the 0-D
+`model.language_model.embed_tokens.embed_scale`. When no `*embed_tokens*` table is named, the reader takes the
+component's only 2-D f32 initializer as the table; with two candidates it guesses neither. A 0-D tensor is never taken
+as the 4-bit table's scales (those are 2-D `[V, groups]`). The container stores a gemma embedding pre-scaled: the
+forward's lookup applies no gemma scale, and its tied head divides sqrt(H) back out. So `embed_scale` is applied to
+the table, and only when it equals sqrt(hidden); any other value is refused by name. A small inline initializer
+payload (64 B or less) is now copied when the graph is parsed, because the graph's mapping is gone by the time the
+reader looks. Inline tables larger than that still point into the unmapped file, so they stay unread here; the packs
+measured so far keep their tables in external data.
+
 With `config.json` empty, the model's numbers come from the pack itself:
 - **rms_norm_eps** from the graph's RMSNorm nodes (18 nodes state 1e-5). The default was 1e-6. When the nodes state different epsilons nothing is taken, and the import prints a WARNING naming the conflict and the value it keeps (`graph_eps_decision()`).
 - **RoPE** from `cos_cache`. The theta fit (500000) looks only at the first 4,096 positions, where llama3 scaling is

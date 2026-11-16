@@ -198,7 +198,12 @@ summary() {  # what the run observed, so a 24 h expiry is not silence
       echo "The sampler cannot attribute a burst that did not happen. What it does establish: the holders above were"
       echo "live for the whole window, so if a burst had occurred, its record would name them."
     fi
-  } > "$out"
+  } > "$out.tmp"
+  # engine#2778: written to a temp file and renamed, NOT truncated in place. Since #2613 the summary is refreshed every
+  # ~15 min (96 windows/day on a 24 h capture), so an in-place truncation leaves a reader -- accel_attribution.py, or a
+  # lane grepping the summary at the moment of a fault -- with a partial file whose header line is already valid, i.e.
+  # a zero that reads as "nothing was held". rename(2) within one directory shows the old summary or the new one.
+  mv -f "$out.tmp" "$out"
   echo "summary written: $out"
 }
 

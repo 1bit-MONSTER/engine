@@ -265,6 +265,41 @@ def fmt_fault(sec, addr, verdict):
     return "%s\t%s\t%s" % ("-" if sec is None else "%.0f" % sec, addr, verdict)
 
 
+def drop_pre_boot(rows, boot_epoch):
+    """[(epoch, pid, ticket)] with samples from a previous boot removed.
+
+    Kernel stamps are boot-relative, so a fault's absolute time is (this boot's epoch + stamp). A samples.log that
+    straddles a reboot -- kept across one, or copied from an earlier capture -- holds epochs from BEFORE that boot,
+    and the gap test is `fault - sample <= max_gap`, so a fault in the first seconds after a reboot falls within
+    max_gap of a sample taken hours earlier and would be attributed to a holder that cannot have been running.
+
+    This landed on a branch that merged before the commit reached it, so it is restored here (engine#2623).
+    """
+    if boot_epoch is None:
+        return rows, 0
+    kept = [r for r in rows if r[0] >= boot_epoch]
+    return kept, len(rows) - len(kept)
+
+
+def distances(rows):
+    """How far a fault would be from its nearest sample, predicted from a trace with no faults in it.
+
+    A fault lands at a random time, so its nearest-sample distance is distributed like the gaps between samples.
+    engine#2627 measured the real thing (median 1 s, p90 27 s, max 45 s; 24 of 119 beyond 10 s); this prints the same
+    statistic from the samples alone, which is what tells a capture's owner -- before any fault -- whether the
+    sampler is dense enough to attribute one, and whether a run will be dominated by WEAK verdicts.
+    """
+    ts = [r[0] for r in rows]
+    gaps = sorted(b - a for a, b in zip(ts, ts[1:]) if b >= a)
+    if not gaps:
+        return None
+    n = len(gaps)
+    return {"n": n, "median": gaps[n // 2], "p90": gaps[min(n - 1, n * 9 // 10)], "max": gaps[-1],
+            "within2": 100.0 * sum(1 for g in gaps if g <= 2) / n,
+            "within5": 100.0 * sum(1 for g in gaps if g <= 5) / n,
+            "within10": 100.0 * sum(1 for g in gaps if g <= 10) / n}
+
+
 def self_test():
     # One hour of holders, one sample per 100 s, handing over at 300.
     rows = [(0, "111", "gpu-hold cl-a pid 1 t0"), (100, "111", "gpu-hold cl-a pid 1 t0"),
@@ -377,6 +412,24 @@ def self_test():
         "faults: 1; attributable 0 (weak 0), ambiguous 0, nothing-held 0, no-sample 0, other-device 1"), \
         yield_line([(1.0, "0x1", "NOT THE ACCEL NODE: other device")])
 
+    # A far sample is reported as WEAK rather than dropped or called certain (engine#2627), and the tally splits it.
+    weak = attribute([(1000, "1234", "gpu-hold cl-a pid 9")], [(1030.0, "0x1", True)], 150)
+    assert weak[0][2].startswith("ATTRIBUTED-WEAK"), weak
+    assert yield_line(weak).startswith("faults: 1; attributable 1 (weak 1)"), yield_line(weak)
+
+    # The distance distribution must be computable from a quiet trace, and must be the same statistic #2627 measured
+    # on real faults. 4 gaps of 1 s and one of 20 s: median 1, p90 20, 80 % within 2 s.
+    dd = distances([(0, "a", ""), (1, "a", ""), (2, "a", ""), (3, "a", ""), (4, "a", ""), (24, "a", "")])
+    assert (dd["n"], dd["median"], dd["p90"], dd["max"]) == (5, 1, 20, 20), dd
+    assert abs(dd["within2"] - 80.0) < 0.01 and dd["within5"] == 80.0, dd
+    assert distances([(0, "a", "")]) is None, "one sample has no gaps"
+
+    # A samples.log from a previous boot must not be joined to this boot's faults (see drop_pre_boot): the gap test
+    # would match a fresh fault against a sample taken hours earlier.
+    assert drop_pre_boot([(100, "111", "old"), (110, "111", "old")], 1000) == ([], 2)
+    assert drop_pre_boot([(100, "111", "old"), (1200, "222", "new")], 1000) == ([(1200, "222", "new")], 1)
+    assert drop_pre_boot([(100, "111", "old")], None) == ([(100, "111", "old")], 0), "no boot epoch: filter nothing"
+
     # Stamps and addresses are parsed, and non-fault lines are ignored.
     text = ("[1234.500000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0007]\n"
             "[1235.000000] unrelated kernel line\n")
@@ -422,6 +475,8 @@ def main():
                          "holders describe /dev/accel, so attributing another device's fault is a category error)")
     ap.add_argument("--attributed", default=None,
                     help="sampler attributed.log: print its windowed hits beside this tool's verdict")
+    ap.add_argument("--distances", action="store_true",
+                    help="print the nearest-sample distance distribution a fault would see (no faults needed)")
     ap.add_argument("--outlook", type=float, nargs="*", metavar="W",
                     help="print attributability for these +-W windows and exit (no faults needed)")
     ap.add_argument("--selftest", "--self-test", dest="self_test", action="store_true")
@@ -432,8 +487,12 @@ def main():
         return 0
     if not args.samples:
         ap.error("--samples is required unless --self-test")
+    boot = args.boot_epoch
+    if boot is None:
+        with open("/proc/stat", encoding="utf-8") as f:
+            boot = float(next(int(l.split()[1]) for l in f if l.startswith("btime")))
     if args.attributed:
-        rows = samples(args.samples)
+        rows, _ = drop_pre_boot(samples(args.samples), boot)
         pairs = attributed_rows(open(args.attributed, encoding="utf-8", errors="replace").read())
         ds = disagreements(rows, pairs, args.max_gap)
         for epoch, hits, verdict, agree in ds:
@@ -442,20 +501,31 @@ def main():
         print("faults: %d; agree %d, disagree %d" % (len(ds), sum(1 for d in ds if d[3]),
                                                       sum(1 for d in ds if not d[3])))
         return 0
+    if args.distances:
+        rows, _ = drop_pre_boot(samples(args.samples), boot)
+        d = distances(rows)
+        if d is None:
+            print("no sample gaps in this trace: nothing to measure")
+            return 0
+        print("gaps %d  median %.0fs  p90 %.0fs  max %.0fs" % (d["n"], d["median"], d["p90"], d["max"]))
+        print("nearest sample within 2s: %.1f%%, within 5s: %.1f%%, within 10s: %.1f%%"
+              % (d["within2"], d["within5"], d["within10"]))
+        print("an attribution past %.0fs is reported WEAK (ATTRIBUTED-WEAK)" % WEAK_AFTER_S)
+        return 0
     if args.outlook:
-        rows = samples(args.samples)
+        rows, _ = drop_pre_boot(samples(args.samples), boot)
         print("window  one-holder  ambiguous  nothing-held  no-sample")
         for w, one, amb, nothing, none in outlook(rows, args.outlook):
             print(fmt_outlook_row(w, one, amb, nothing, none))
         return 0
 
-    boot = args.boot_epoch
-    if boot is None:
-        with open("/proc/stat", encoding="utf-8") as f:
-            boot = float(next(int(l.split()[1]) for l in f if l.startswith("btime")))
     text = sys.stdin.read() if args.dmesg == "-" else open(args.dmesg, encoding="utf-8", errors="replace").read()
 
     rows = samples(args.samples)
+    rows, dropped = drop_pre_boot(rows, boot)
+    if dropped:
+        print("note: %d sample(s) predate this boot (btime %d) and were ignored: a fault's absolute time is "
+              "boot + kernel stamp, so they cannot describe this boot" % (dropped, boot), file=sys.stderr)
     boots = [(None if s is None else boot + s, a, acc) for s, a, acc in faults(text)]
     res = attribute(rows, boots, args.max_gap, any_device=args.any_device)
     for sec, addr, verdict in res:

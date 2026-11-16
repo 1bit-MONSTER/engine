@@ -137,6 +137,10 @@ struct OnnxTensor {
     // before the model goes away (engine#2668: parse_onnx() used to unmap before returning, so every `raw` dangled).
     const uint8_t* raw = nullptr;
     size_t raw_len = 0;
+    // engine#2663: `raw` points into the graph file's mapping, which parse_onnx() unmaps before it returns, so it is only
+    // valid inside the parse. A small inline payload (a scalar such as gemma-3's embed_scale) is copied here and stays
+    // readable for the tensor's lifetime.
+    std::vector<uint8_t> small;
 };
 
 struct OnnxMatMul {
@@ -211,6 +215,7 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m, const std::string& bra
         if (const auto* d = field1(t, 9)) {
             x.raw = d->p;
             x.raw_len = d->n;
+            if (d->n <= 64) x.small.assign(d->p, d->p + d->n);
         }
         for (const auto* d : fields(t, 13)) {
             const auto kv = pb(d->p, d->n);
@@ -1608,12 +1613,26 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
     }
     const OnnxTensor* table = nullptr;
     const OnnxTensor* scales = nullptr;
+    const OnnxTensor* embed_scale = nullptr;   // engine#2663: a 0-D multiplier the component applies after its Gather
     for (const auto& t : em.tensors) {
         const bool emb = t.name.find("embed_tokens") != std::string::npos;
         if (!emb) continue;
-        if (t.name.find("scale") != std::string::npos) scales = &t;
+        // engine#2663: `...embed_tokens.embed_scale` is a 0-D f32 (Gemma-3-4b-it-mm 1.7), not the 4-bit table's scales,
+        // which are 2-D [V, groups]. Taking it as scales left the reader with "no table + scales".
+        if (t.dims.empty() && t.name.find("embed_scale") != std::string::npos) { embed_scale = &t; continue; }
+        if (t.name.find("scale") != std::string::npos) { if (t.dims.size() == 2) scales = &t; }
         else if (t.name.size() > 3 && t.name.compare(t.name.size() - 3, 3, "_Q4") == 0) table = &t;
         else if (!table && t.dims.size() == 2) table = &t;   // an unquantised [V, H] table
+    }
+    // engine#2663: Gemma-3-4b-it-mm's component keeps its table as `lm_head.weight` [262208, 2560] f32 (the model is tied,
+    // and the decoder has no head matmul). When no `embed_tokens` table is named, the component's ONLY 2-D f32 initializer
+    // is the table; with two candidates nothing is guessed.
+    if (!table && !scales) {
+        const OnnxTensor* only = nullptr;
+        int n2 = 0;
+        for (const auto& t : em.tensors)
+            if (t.dims.size() == 2 && t.type == kF32) { only = &t; ++n2; }
+        if (n2 == 1) table = only;
     }
     // engine#1725: the gemma-4 components are f32 and UNQUANTISED -- an `embed_tokens` table with no `*scales*` beside
     // it -- while the shape above is the 4-bit packed one another family ships. Reading the f32 table is worth doing
@@ -1657,6 +1676,27 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
         if (raw == nullptr) { if (why) *why = "an f32 embed_tokens table with no data"; return {}; }
         std::vector<float> out(size_t(Vf) * size_t(Hf));
         std::memcpy(out.data(), raw, out.size() * sizeof(float));
+        // engine#2663: the container stores the embedding PRE-SCALED (the forward's lookup applies no gemma scale and its
+        // tied head divides sqrt(H) back out; q4nx_forward.cpp), so a component that multiplies its raw table by a 0-D
+        // embed_scale is applied here -- and only when that scale is the sqrt(H) the forward will divide out.
+        if (embed_scale) {
+            float v = 0.0f;
+            if (embed_scale->type != kF32 || embed_scale->small.size() != 4) {
+                if (why) *why = "embed_scale is not an inline f32 scalar, so the table's scale is unknown (engine#2663)";
+                return {};
+            }
+            std::memcpy(&v, embed_scale->small.data(), 4);
+            const double want = std::sqrt(double(Hf));
+            if (!(std::fabs(double(v) - want) <= 1e-3 * want)) {
+                if (why) *why = "embed_scale is " + std::to_string(v) + ", not sqrt(hidden) = " + std::to_string(want) +
+                                ", which is the only scale the forward divides back out (engine#2663)";
+                return {};
+            }
+            for (auto& x : out) x *= v;
+            std::fprintf(stderr, "note: the embedding component's table is %s, scaled by its embed_scale %.6g (= sqrt(%lld)) "
+                                 "into the container's pre-scaled form (engine#2663)\n",
+                         table->name.c_str(), double(v), (long long)Hf);
+        }
         return out;
     }
     if (!table || !scales) { if (why) *why = "embedding.onnx has no embed_tokens table + scales"; return {}; }

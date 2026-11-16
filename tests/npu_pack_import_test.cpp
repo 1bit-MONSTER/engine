@@ -5534,6 +5534,102 @@ void test_embedding_in_component(const std::string& root) {
 }
 
 
+// engine#2663: Gemma-3-4b-it-mm 1.7's component -- the table is `lm_head.weight` f32 (tied; no `embed_tokens` name) and a
+// 0-D `model.language_model.embed_tokens.embed_scale` multiplies it. The table is read and scaled by embed_scale into the
+// container's pre-scaled form; a scale other than sqrt(H) is refused; two unnamed 2-D candidates are not guessed between;
+// and the control without embed_scale reads the raw table.
+void test_embedding_gemma3mm_component(const std::string& root) {
+    const int64_t V = 8, H = 256;   // sqrt(256) = 16, exact in f32
+    std::vector<float> tok(size_t(V) * size_t(H));
+    for (size_t i = 0; i < tok.size(); ++i) tok[i] = float(int(i % 97) - 48) * 0.25f;
+    const auto scalar = [](const std::string& name, float v) {
+        std::string t, raw(4, '\0');
+        std::memcpy(&raw[0], &v, 4);
+        pb::ints(t, 2, 1);   // data_type FLOAT, no dims: 0-D
+        pb::str(t, 8, name);
+        pb::str(t, 9, raw);  // raw_data
+        return t;
+    };
+    const auto build = [&](const fs::path& dir, bool with_scale, float scale, bool second_table) {
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        std::string data(reinterpret_cast<const char*>(tok.data()), tok.size() * sizeof(float));
+        std::vector<std::string> inits{pb::tensor("lm_head.weight", {V, H}, "gemma-3-embedding.onnx.data", 0, data.size(), 1)};
+        if (second_table) {
+            const size_t off = data.size();
+            data.append(reinterpret_cast<const char*>(tok.data()), tok.size() * sizeof(float));
+            inits.push_back(pb::tensor("other.weight", {V, H}, "gemma-3-embedding.onnx.data", off, tok.size() * 4, 1));
+        }
+        if (with_scale) inits.push_back(scalar("model.language_model.embed_tokens.embed_scale", scale));
+        put_file((dir / "gemma-3-embedding.onnx.data").string(), data);
+        put_file((dir / "gemma-3-embedding.onnx").string(), pb::model(inits, {}));
+        put_file((dir / "genai_config.json").string(),
+                 R"({"model":{"type":"gemma3","embedding":{"filename":"gemma-3-embedding.onnx"},)"
+                 R"("decoder":{"filename":"model.onnx"}}})");
+    };
+    const fs::path dir = fs::path(root) / ("g3mm-embed." + std::to_string(::getpid()));
+    {
+        build(dir, true, 16.0f, false);
+        std::string why;
+        const std::vector<float> got = pi::read_embedding_component(dir.string(), &why);
+        bool scaled = got.size() == tok.size();
+        for (size_t i = 0; scaled && i < tok.size(); ++i) scaled = got[i] == tok[i] * 16.0f;
+        check(scaled, "gemma3-mm embedding: lm_head.weight is the table and embed_scale (16 = sqrt(256)) is applied (" +
+                          std::to_string(got.size()) + " values, " + why + ")");
+    }
+    {
+        build(dir, false, 0.0f, false);
+        std::string why;
+        const std::vector<float> got = pi::read_embedding_component(dir.string(), &why);
+        check(got == tok, "gemma3-mm embedding: control -- without embed_scale the raw table is read (" + why + ")");
+    }
+    {
+        build(dir, true, 10.0f, false);
+        std::string why;
+        check(pi::read_embedding_component(dir.string(), &why).empty() && why.find("embed_scale is") != std::string::npos,
+              "gemma3-mm embedding: an embed_scale that is not sqrt(H) is refused by name (" + why + ")");
+    }
+    {
+        build(dir, true, 16.0f, true);
+        std::string why;
+        check(pi::read_embedding_component(dir.string(), &why).empty(),
+              "gemma3-mm embedding: two unnamed 2-D f32 tables are not guessed between (" + why + ")");
+    }
+    fs::remove_all(dir);
+    // #2664 review: at H = 256 the scale the arm quotes (16) IS sqrt(256), so a hardcoded 16 would pass. The real pack's
+    // width, 2560: sqrt(2560) = 50.596... is accepted and applied, and 16 is refused naming the sqrt it wanted.
+    {
+        const int64_t V2 = 4, H2 = 2560;
+        std::vector<float> t2(size_t(V2) * size_t(H2));
+        for (size_t i = 0; i < t2.size(); ++i) t2[i] = float(int(i % 31) - 15) * 0.125f;
+        const float s2 = float(std::sqrt(2560.0));
+        const auto build2 = [&](float scale) {
+            fs::remove_all(dir);
+            fs::create_directories(dir);
+            const std::string data(reinterpret_cast<const char*>(t2.data()), t2.size() * sizeof(float));
+            put_file((dir / "gemma-3-embedding.onnx.data").string(), data);
+            put_file((dir / "gemma-3-embedding.onnx").string(),
+                     pb::model({pb::tensor("lm_head.weight", {V2, H2}, "gemma-3-embedding.onnx.data", 0, data.size(), 1),
+                                scalar("model.language_model.embed_tokens.embed_scale", scale)},
+                               {}));
+            put_file((dir / "genai_config.json").string(),
+                     R"({"model":{"type":"gemma3","embedding":{"filename":"gemma-3-embedding.onnx"}}})");
+        };
+        build2(s2);
+        std::string why;
+        const std::vector<float> got = pi::read_embedding_component(dir.string(), &why);
+        bool ok = got.size() == t2.size();
+        for (size_t i = 0; ok && i < t2.size(); ++i) ok = got[i] == t2[i] * s2;
+        check(ok, "gemma3-mm embedding: at H 2560 the scale sqrt(2560) = 50.596 is accepted and applied (" + why + ")");
+        build2(16.0f);
+        std::string why16;
+        check(pi::read_embedding_component(dir.string(), &why16).empty() && why16.find("50.59") != std::string::npos,
+              "gemma3-mm embedding: at H 2560 a scale of 16 is refused, naming sqrt(hidden) = 50.59 (" + why16 + ")");
+        fs::remove_all(dir);
+    }
+}
+
+
 // engine#1725: the gemma-4 component is f32 and unquantised -- an `embed_tokens` table with no scales beside it -- and its
 // decoder also needs a PER-LAYER table. Two arms: the f32 token table alone is read, and a per-layer table is refused by
 // name rather than reported as a missing table. Measured sizes on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu:
@@ -7468,6 +7564,7 @@ int main(int argc, char** argv) {
         test_per_layer_container(golden_dir.empty() ? "." : golden_dir);
         test_per_layer_import(golden_dir.empty() ? "." : golden_dir);
         test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
+        test_embedding_gemma3mm_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_tied_block32_head(golden_dir.empty() ? "." : golden_dir);

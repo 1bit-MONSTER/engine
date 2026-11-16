@@ -177,7 +177,13 @@ def analyse(maps, unmaps, faults, before, after, other=()):
         parts = []
         for label, d, n in (("map", dm, nm), ("unmap", du, nu)):
             if d is None:
-                parts.append(f"no {label} of this iova")
+                # Two different facts print the same word if this is not split: a side that WAS probed and has no
+                # event for this iova ("no map of this iova"), and a side that was never probed at all ("no map
+                # probe in this capture"). On a one-sided capture the second is the truth, and writing the first
+                # makes silence read as absence -- the same error the absence branch above now refuses.
+                probed = bool(maps if label == "map" else unmaps)
+                parts.append(f"no {label} of this iova" if probed
+                             else f"no {label} probe in this capture, so that half is unanswerable (see exit code)")
             else:
                 parts.append(f"nearest {label} {d * 1e6:+.0f} us (of {n})")
         rows.append((t, iova, " | ".join(parts)))
@@ -284,6 +290,17 @@ def self_test() -> int:
         empty, hdr2 = analyse([], [], faults, [], faults)
         chk(empty == [] and "says nothing about the device" in hdr2,
             "an empty capture is refused as evidence rather than reported as a negative")
+
+        # 7b. a one-sided capture: the row answers on the side it probed AND says the other half was never asked about.
+        #     Measured: burst.trace has 579,219 unmaps and no map probe, and its rows used to read "no map of this
+        #     iova" -- which says the iova was never mapped rather than that nobody looked.
+        # two unmap events bracket the fault so it is inside the buffered range: a single event gives lo == hi and
+        # the row (correctly) reports "OUTSIDE" instead, which would make this arm pass for the wrong reason.
+        rows4, _h4 = analyse([], [(1000.5, 0x4128000, 0x1000), (1002.0, 0x5128000, 0x1000)],
+                            [(1001.0, 0x4128000)], [], [(1001.0, 0x4128000)])
+        txt = " | ".join(r[2] for r in rows4)
+        chk("no map probe in this capture" in txt and "no map of this iova" not in txt,
+            "a row on a one-sided capture says the other half was never probed")
 
         # a fault outside the buffered range is named as such, not silently correlated
         rows3, _ = analyse(maps, unmaps, [(9000.0, 0x4128000)], [], [(9000.0, 0x4128000)])

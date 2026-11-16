@@ -45,7 +45,13 @@ import re
 import sys
 
 FAULT_RE = re.compile(r"IO_PAGE_FAULT domain=\S+ address=(0x[0-9a-fA-F]+)")
+# TWO shapes, because there are two ways to capture an unmap and both are in use:
+#   kprobe      `unm: (iommu_unmap_fast+0x4/0x10) iova=0x35540000 size=0x40000`   <- a format string a lane writes
+#   tracepoint  `unmap: IOMMU: iova=0x00000000e4240000 - 0x00000000e4241000 size=4096`   <- events/iommu/unmap
+# The tracepoint carries the same iova and size with fixed widths and a range end; a reader that knows only the
+# kprobe shape reports "no unmap events" on a tracepoint capture and blames the probe (engine#2478).
 UNMAP_RE = re.compile(r"unm:.*iova=(0x[0-9a-fA-F]+)(?:.*size=(0x[0-9a-fA-F]+))?")
+TP_UNMAP_RE = re.compile(r"\bunmap: IOMMU: iova=(0x[0-9a-fA-F]+) .*?size=(\d+)")
 # tracefs puts the timestamp AFTER the comm/pid/cpu/flags fields (` bash-1 [001] .... 100.000000: ev: ...`),
 # so it is searched mid-line, not anchored -- my first version anchored it and parsed nothing.
 EPOCH_RE = re.compile(r"(\d+\.\d+):")
@@ -75,10 +81,13 @@ def parse_trace(lines):
         if not m:
             continue
         mu = UNMAP_RE.search(line)
-        if not mu:
+        if mu:
+            size = int(mu.group(2), 16) if mu.group(2) else 0x1000
+            out.append((float(m.group(1)), int(mu.group(1), 16), size))
             continue
-        size = int(mu.group(2), 16) if mu.group(2) else 0x1000
-        out.append((float(m.group(1)), int(mu.group(1), 16), size))
+        mt = TP_UNMAP_RE.search(line)
+        if mt:
+            out.append((float(m.group(1)), int(mt.group(1), 16), int(mt.group(2))))
     return out
 
 
@@ -170,6 +179,14 @@ def self_test():
     # 5. the parser reads a real tracefs line shape
     got = parse_trace(["    bash-1234 [001] .... 100.000000: unm: (iommu_unmap_fast+0x0/0x20) iova=0x4128000 size=0x1000"])
     chk(len(got) == 1 and got[0][1] == 0x4128000 and got[0][2] == 0x1000, "a tracefs unmap line parses (iova, size)")
+    # engine#2478: the tracepoint shape parses beside the kprobe shape. Both are real captures of the same call,
+    # and a reader that knows only one of them reports "no unmap events" on the other.
+    chk(parse_trace(["          <idle>-0  [030] d.h1.  100.5: unmap: IOMMU: iova=0x00000000e4240000 - "
+         "0x00000000e4241000 size=4096 unmapped_size=4096"])
+         == [(100.5, 0xE4240000, 4096)], "a tracepoint unmap line parses (iova, size)")
+    chk(parse_trace(["   x-1 [0] d.h1. 100.0: unm: (iommu_unmap_fast+0x4) iova=0x35540000 size=0x40000"])
+        == [(100.0, 0x35540000, 0x40000)], "... and the kprobe shape still parses beside it")
+
     # 6. a pointer-shaped iova column is refused, not reported as "nothing correlated". My first recipe named %di/%si
     #    for a (domain, iova, size) function, which put the domain pointer here and made every capture uncorrelatable.
     ptr = parse_trace(["    pi-1-1 [016] d.h.. 358.053875: unm: (iommu_unmap_fast+0x4/0x10) "
@@ -211,6 +228,18 @@ def main():
         print(f"unmap_fault_order: {e}", file=sys.stderr)
         return 2
     if not unmaps:
+        # "no unmap events" covers two different situations and only one of them is about the probe. A capture with
+        # lines that match neither known shape is a PARSER miss, and telling the reader to check their probe sends
+        # them to the wrong place (engine#2478: a tracepoint capture was reported as "was the probe armed?").
+        try:
+            n_lines = sum(1 for _ in read_lines(args.trace))
+        except OSError:
+            n_lines = 0
+        if n_lines > 1:   # a header line alone is a genuinely empty capture
+            print(f"unmap_fault_order: {n_lines} line(s) in the trace and none of them is an unmap in either known "
+                  "shape (kprobe `unm: ... iova=` or tracepoint `unmap: IOMMU: iova=...`): this is a parser miss, "
+                  "not an empty capture -- show --self-test the line you have", file=sys.stderr)
+            return 3
         print("unmap_fault_order: no unmap events in the trace -- an empty capture is not a negative; was the "
               "probe armed before the load, and did it fire? (see --self-test for the four shapes)", file=sys.stderr)
         return 3

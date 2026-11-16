@@ -37,7 +37,7 @@ fall back on. A stable count therefore says nothing, so each offending entry is 
 Both are still failures - neither is something a package should carry - but only LIVE changes what the
 binary can start without. Exit codes are unchanged.
 
-usage: check-installed-rpath.py [ROOT...]     (default: ~/.local/share/1bit-*)
+usage: check-installed-rpath.py [--self-test | ROOT...]     (default: ~/.local/share/1bit-*)
        exit 0 every RUNPATH is $ORIGIN; 1 some ELF is not; 2 a ROOT does not exist
 """
 import glob
@@ -77,6 +77,35 @@ def live_in(entry, elf_path, needed):
     return hits
 
 
+BUILD_TREE_RE = re.compile(r"^/work(?:-[A-Za-z0-9_.-]+)?(?:/|$)")   # /work, /work-c22, /work-c33 -- not /workshop
+def resolved_kind(real):
+    """What a LIVE entry resolves THROUGH: a build tree, a declared SDK, or something else.
+
+    The distinction is the whole point of the LIVE count. `44 LIVE` is not actionable because it mixes
+    a catastrophic case with a normal one (engine#1411, decided there):
+
+      BUILD TREE    /work-c22/hrx-toolchain, ~/wt/build, /tmp/... -- exists because we built there.
+                    Deleting or rebuilding it stops an installed package starting: this is the hazard.
+      DECLARED SDK  /opt/rocm-therock/... -- the installed ROCm SDK. The entry is a dependency on a
+                    system SDK, the same coupling every ROCm consumer here has. Making the package
+                    `$ORIGIN`-only would vendor a SECOND libomp and ship an artifact that is not the
+                    one that was tested, so it is reported and not failed.
+
+    A function, not an inline test, so the classification has an arm that does not need a real ELF.
+    """
+    home = os.path.expanduser("~")
+    # segment-aware: `/work` must match `/work/...` and `/work` itself, not `/workshop` (the arm below
+    # caught exactly that on the first run of this function)
+    if BUILD_TREE_RE.match(real) or real.startswith(("/tmp/", "/dev/shm/")) \
+            or real.startswith(home + "/wt/") or real == home + "/wt" \
+            or real.startswith(home + "/lb/") \
+            or "/.cache/scratch-" in real:
+        return "BUILD TREE"
+    if real.startswith("/opt/rocm"):
+        return "DECLARED SDK"
+    return "OTHER"
+
+
 def verdict(elvs):
     """The failures among [(path, kind, value, needed)], one per offending entry, deduplicated by value."""
     bad, seen = [], set()
@@ -97,9 +126,57 @@ def verdict(elvs):
     return bad
 
 
+def hazard_fails(build_tree_live, other_live):
+    """True when a LIVE entry resolves somewhere this check can vouch for: a build tree, or a path it
+    cannot classify. A DECLARED SDK entry does not fail -- it is a dependency on an installed SDK, and
+    the decision to accept that is recorded on engine#1411. An UNCLASSIFIED path does fail: "I do not
+    know what that is" may not pass a gate (the first version of this change let /work-c22 fall into
+    OTHER and returned 0 with six build-tree entries still load-bearing -- measured)."""
+    return bool(build_tree_live or other_live)
+
+
+def self_test():
+    """The classifier's three answers, and the one that makes the exit code mean something.
+
+    No ELF is built: `resolved_kind` is pure, which is the reason it is a function. The real-box run is
+    the other half of the evidence -- 6 LIVE entries resolve through /work-c22 and 36 through the
+    installed ROCm SDK, so the same FAIL line used to conflate a hazard with a dependency.
+    """
+    home = os.path.expanduser("~")
+    cases = [
+        ("/work-c22/hrx-toolchain/lib/python3.14/site-packages/x/libomp.so", "BUILD TREE"),
+        (home + "/wt/release-rc/build/lib/libggml.so", "BUILD TREE"),
+        (home + "/lb/k74-ab/proof/pkg-B/1bit/hrx/llama/bin/libhrx.so.0", "BUILD TREE"),
+        ("/tmp/scratch/lib/libomp.so", "BUILD TREE"),
+        ("/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/llvm/lib/libomp.so",
+         "DECLARED SDK"),
+        ("/usr/lib/x86_64-linux-gnu/libz.so.1", "OTHER"),
+        ("/opt/otherthing/lib/libx.so", "OTHER"),
+    ]
+    fails = 0
+    for real, want in cases:
+        got = resolved_kind(real)
+        if got != want:
+            print(f"FAIL {real} -> {got}, expected {want}")
+            fails += 1
+    # a prefix that merely LOOKS like a build tree must not match: /workshop is not /work
+    if resolved_kind("/workshop/lib/libx.so") == "BUILD TREE":
+        print("FAIL /workshop matched the /work prefix")
+        fails += 1
+    # ... and the exit policy: a build tree fails, an unknown path fails, a declared SDK does not
+    for args, want in (((6, 0), True), ((0, 1), True), ((0, 0), False)):
+        if hazard_fails(*args) != want:
+            print(f"FAIL hazard_fails{args} -> {hazard_fails(*args)}, expected {want}")
+            fails += 1
+    print(f"check-installed-rpath self-test: {fails} failure(s)")
+    return 1 if fails else 0
+
+
 def main(argv):
     # the default glob also matches 1bit-weekly.log and friends, so it keeps only directories;
     # an explicit ROOT is taken as given and a typo in it still fails loudly below.
+    if len(argv) > 1 and argv[1] == "--self-test":
+        return self_test()
     roots = argv[1:] or sorted(d for d in glob.glob(os.path.expanduser("~/.local/share/1bit-*"))
                                if os.path.isdir(d))
     if not roots:
@@ -111,6 +188,7 @@ def main(argv):
         print("check-installed-rpath: not a directory: " + ", ".join(missing), file=sys.stderr)
         return 2
     total_elfs = total_bad = total_live = 0
+    total_build_tree = total_other_live = 0
     for root in roots:
         elvs, bad = [], []
         for dirpath, _dirnames, filenames in os.walk(root):
@@ -137,7 +215,7 @@ def main(argv):
                 if hits:
                     print(f"  {os.path.relpath(path, root)}  {kind}={value}")
                     for soname, real in hits:
-                        print(f"      LIVE {soname} -> {real}")
+                        print(f"      LIVE {soname} -> {real}  [{resolved_kind(real)}]")
                 else:
                     print(f"  {os.path.relpath(path, root)}  {kind}={value}  (dead)")
             if len(bad) > MAX_SHOWN:
@@ -146,17 +224,34 @@ def main(argv):
                 print(f"  (dead = nothing this sweep can see is needed here; $LIB/$PLATFORM are not "
                       "expanded, so dead is not a promise that the entry can be dropped)")
             total_live += len(live)
+            for _p, _e, hits in live:
+                for _soname, _real in hits:
+                    _k = resolved_kind(_real)
+                    if _k == "BUILD TREE":
+                        total_build_tree += 1
+                    elif _k != "DECLARED SDK":
+                        total_other_live += 1
         else:
             print(f"{root}: every RUNPATH is $ORIGIN")
     if total_bad:
-        load_bearing = (f", {total_live} of them LIVE: a library is found through the entry, so the "
-                        "binary cannot start if that directory is rebuilt, moved or removed"
-                        if total_live else ", none of them currently resolve anything")
-        print(f"FAIL {total_bad} offending RUNPATH entr{'y' if total_bad == 1 else 'ies'} across "
-              f"{total_elfs} ELF(s){load_bearing} - an installed package must find its libraries "
-              "beside itself (a path into a build tree swaps the libraries under a running service "
-              "when it rebuilds)")
-        return 1
+        if hazard_fails(total_build_tree, total_other_live):
+            where = (f"{total_build_tree} through a BUILD TREE (deleting or rebuilding that directory "
+                     "stops the installed package starting)")
+            if total_other_live:
+                where += f", {total_other_live} through an UNCLASSIFIED absolute path (a dependency this "
+                where += "check cannot vouch for)"
+            print(f"FAIL {total_bad} offending RUNPATH entr{'y' if total_bad == 1 else 'ies'} across "
+                  f"{total_elfs} ELF(s), {total_live} of them LIVE: {where}")
+            return 1
+        if total_live:
+            print(f"WARN {total_bad} offending RUNPATH entr{'y' if total_bad == 1 else 'ies'} across "
+                  f"{total_elfs} ELF(s); {total_live} LIVE, all through a DECLARED SDK ({total_other_live} "
+                  "through something else) - a dependency on an installed SDK, not a path into a build "
+                  "tree, so it does not stop the package starting")
+        else:
+            print(f"WARN {total_bad} offending RUNPATH entr{'y' if total_bad == 1 else 'ies'} across "
+                  f"{total_elfs} ELF(s); none of them currently resolve anything")
+        return 0
     print(f"PASS every RUNPATH in {len(roots)} installed tree(s) ({total_elfs} ELF(s)) is $ORIGIN")
     return 0
 

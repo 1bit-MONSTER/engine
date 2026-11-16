@@ -1357,6 +1357,12 @@ if(Python3_Interpreter_FOUND)
     # an installed package must find its libraries beside itself: the 2026-11-08 incident's rule, from
     # the installed side that no release gate can reach (engine #1411). Skips without patchelf/readelf.
     add_test(NAME installed_rpath COMMAND bash ${CMAKE_SOURCE_DIR}/tests/installed_rpath_test.sh)
+    # engine#1411 decision: the sweep's LIVE count by what it resolves THROUGH -- a build tree fails (the
+    # tree going away stops the package starting), a declared SDK warns (it is a dependency, and making
+    # the package $ORIGIN-only would vendor a second libomp and ship an untested artifact), and an
+    # unclassified absolute path fails, because "I do not know what that is" may not pass a gate.
+    add_test(NAME installed_rpath_kind_self
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check-installed-rpath.py --self-test)
     # every scheduled bump workflow must report its own failure (engine #665): bump-hrx froze its
     # pin while going red every day unnoticed. The step is driven against a stubbed gh, with and
     # without an open issue.

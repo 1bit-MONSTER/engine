@@ -5630,6 +5630,71 @@ void test_embedding_gemma3mm_component(const std::string& root) {
 }
 
 
+// engine#2686: a MatMulNBitsBf blob packed at its stored shape (real_N x real_K) larger than the logical N x K. Built here
+// at stored 128 x 256 with the logical 64 x 128 corner filled and the rest zero, the shape of Gemma-3-4b-it-mm 1.7's
+// gate_proj (N padded) and down_proj (K padded). Arms: the padded decode recovers every planted code, zero point and
+// scale; control: the plain decode at the logical shape refuses the blob by its size; a non-zero byte in the padding is
+// refused by name; and an unpadded node (real_* 0) decodes exactly as before.
+void test_external_tile_padded() {
+    const int N = 64, K = 128, RN = 128, RK = 256;
+    const auto code_of = [](int row, int col) { return uint8_t((row * 7 + col * 3) % 16); };
+    const auto zp_of = [](int row) { return uint8_t((row * 5 + 1) % 16); };
+    const auto scale_of = [](int row) { return 0.015625f * float(1 + row % 7); };
+    const int blocks = RK / 128, tiles = RN / 64, per_tile = 2 * (blocks + 1);
+    std::string blob(size_t(tiles) * per_tile * 2176, '\0');
+    for (int tile = 0; tile < N / 64; ++tile)
+        for (int half = 0; half < 2; ++half)
+            for (int kk = 1; kk <= K / 128; ++kk) {
+                char* subv = &blob[size_t(tile * per_tile + kk * 2 + half) * 2176];
+                for (int r = 0; r < 32; ++r) {
+                    const int row = tile * 64 + half * 32 + r;
+                    const uint16_t sb = pi::bf16_bits_of(scale_of(row));
+                    subv[2112 + r * 2] = char(sb & 0xFF);
+                    subv[2112 + r * 2 + 1] = char(sb >> 8);
+                    uint8_t& zb = reinterpret_cast<uint8_t&>(subv[2048 + r / 2]);
+                    zb = uint8_t(r % 2 == 0 ? ((zb & 0xF0) | zp_of(row)) : ((zb & 0x0F) | (zp_of(row) << 4)));
+                    for (int c = 0; c < 128; ++c) {
+                        const int cp = r / 2;
+                        uint8_t& b = reinterpret_cast<uint8_t&>(subv[(cp % 4) + c * 4 + (cp / 4) * 512]);
+                        const uint8_t v = code_of(row, (kk - 1) * 128 + c);
+                        b = uint8_t(r % 2 == 0 ? ((b & 0xF0) | v) : ((b & 0x0F) | (v << 4)));
+                    }
+                }
+            }
+    const auto* d = reinterpret_cast<const uint8_t*>(blob.data());
+    std::string err;
+    const pi::Q4 q = pi::decode_external_tile_padded(d, blob.size(), N, K, RN, RK, err);
+    bool ok = err.empty() && q.N == N && q.K == K;
+    for (int row = 0; ok && row < N; ++row) {
+        for (int col = 0; ok && col < K; ++col) ok = q.codes[size_t(row) * K + col] == code_of(row, col);
+        for (int g = 0; ok && g < K / 32; ++g)
+            ok = q.scale[size_t(row) * (K / 32) + g] == scale_of(row) &&
+                 q.zero[size_t(row) * (K / 32) + g] == -float(zp_of(row)) * scale_of(row);
+    }
+    check(ok, "padded external tile: every planted code, zero point and scale of the logical 64 x 128 is recovered from "
+              "the stored 128 x 256 (" + err + ")");
+    std::string e2;
+    (void)pi::decode_external_tile(d, blob.size(), N, K, e2);
+    check(!e2.empty(), "padded external tile: control -- the plain decode at the logical shape refuses it by size (" + e2 + ")");
+    std::string nz = blob;
+    nz[size_t((1 * per_tile + 2) * 2176 + 2112)] = 0x3c;   // a scale byte in tile 1 (rows 64..127: all padding)
+    std::string e3;
+    (void)pi::decode_external_tile_padded(reinterpret_cast<const uint8_t*>(nz.data()), nz.size(), N, K, RN, RK, e3);
+    check(e3.find("is not zero") != std::string::npos, "padded external tile: a non-zero byte in the padding is refused (" + e3 + ")");
+    std::string nzk = blob;
+    nzk[size_t((0 * per_tile + 4) * 2176 + 2112)] = 0x3c;   // K block 2 (columns 128..255: padding) of tile 0
+    std::string e4;
+    (void)pi::decode_external_tile_padded(reinterpret_cast<const uint8_t*>(nzk.data()), nzk.size(), N, K, RN, RK, e4);
+    check(e4.find("is not zero") != std::string::npos, "padded external tile: a non-zero byte in the K padding is refused (" + e4 + ")");
+    std::string e5, e6;
+    const std::string small = blob.substr(0, size_t(1) * (2 * (1 + 1)) * 2176);   // an unpadded 64 x 128 blob
+    const pi::Q4 a = pi::decode_external_tile(reinterpret_cast<const uint8_t*>(small.data()), small.size(), 64, 128, e5);
+    const pi::Q4 b = pi::decode_external_tile_padded(reinterpret_cast<const uint8_t*>(small.data()), small.size(), 64, 128, 0, 0, e6);
+    check(e5 == e6 && a.codes == b.codes && a.scale == b.scale && a.zero == b.zero,
+          "padded external tile: a node with no real_* decodes exactly as before");
+}
+
+
 // engine#1725: the gemma-4 component is f32 and unquantised -- an `embed_tokens` table with no scales beside it -- and its
 // decoder also needs a PER-LAYER table. Two arms: the f32 token table alone is read, and a per-layer table is refused by
 // name rather than reported as a missing table. Measured sizes on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu:
@@ -7564,6 +7629,7 @@ int main(int argc, char** argv) {
         test_per_layer_container(golden_dir.empty() ? "." : golden_dir);
         test_per_layer_import(golden_dir.empty() ? "." : golden_dir);
         test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
+        test_external_tile_padded();
         test_embedding_gemma3mm_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);

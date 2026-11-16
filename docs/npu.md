@@ -1858,6 +1858,22 @@ payload (64 B or less) is now copied when the graph is parsed, because the graph
 reader looks. Inline tables larger than that still point into the unmapped file (engine#2668); the packs measured so far keep
 their tables in external data.
 
+**Its decoder blobs are packed at the compiled kernel's shape (engine#2686).** Each `MatMulNBitsBf` states its logical
+`K`/`N` and its stored `real_K`/`real_N`, and the packed blob is laid out at the stored shape. On layer 0, every one of
+the seven blobs equals stored N/64 tiles x (2 x stored K/128 + 2) x 2,176 B, to the byte:
+
+| weight | logical K x N | stored | blob |
+|---|---|---|---|
+| q_proj | 2560 x 2048 | 2560 x 2560 | 3,655,680 B |
+| k/v_proj | 2560 x 1024 | same | 1,462,272 B |
+| o_proj | 2048 x 2560 | same | 2,959,360 B |
+| gate/up_proj | 2560 x 10240 | 2560 x 14336 | 20,471,808 B |
+| down_proj | 10240 x 2560 | 11008 x 4096 | 24,231,936 B |
+
+The padding is at the end. In `gate_proj`, tiles 0..159 carry data and tiles 160..223 are all zero bytes (read from the
+published file). The reader decodes at the stored shape and crops to the logical one, and refuses the weight by name
+when any padded row or K block has a non-zero scale.
+
 With `config.json` empty, the model's numbers come from the pack itself:
 - **rms_norm_eps** from the graph's RMSNorm nodes (18 nodes state 1e-5). The default was 1e-6. When the nodes state different epsilons nothing is taken, and the import prints a WARNING naming the conflict and the value it keeps (`graph_eps_decision()`).
 - **RoPE** from `cos_cache`. The theta fit (500000) looks only at the first 4,096 positions, where llama3 scaling is

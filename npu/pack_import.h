@@ -901,6 +901,10 @@ bool external_container_tensors(const std::string& role, int nh, int nkv, int hd
 
 Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err,
                         bool row_major = kExtQuantsRowMajor);
+// engine#2686: the same blob packed at a larger stored shape (real_N x real_K, padding at the end of N and of K): decoded at
+// that shape and cropped to N x K, refused when any padded row or K block is not zero. real_* <= 0 means "not stated".
+Q4 decode_external_tile_padded(const uint8_t* data, size_t bytes, int N, int K, int64_t real_N, int64_t real_K,
+                               std::string& err);
 // engine#2561: the candidate theta whose cos(p * theta^(-2i/d)) best explains a pack's precomputed cos_cache
 // ([rows, half] row-major, d = 2*half), as one Pearson r over the whole matrix; writes the winner to *best_theta.
 double rope_cache_best_theta(const std::vector<float>& cache, int64_t rows, int64_t half,

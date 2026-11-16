@@ -106,7 +106,12 @@ jobs:
           # Pinned, because the unversioned line resolved differently on different days: these are the versions
           # CI resolved on 2026-11-09 and 2026-11-13, and both are still installable on 2026-11-16 (newest are
           # numpy 2.5.5, gguf 0.19.0). A bump is a reviewed edit of this line, not a silent `pip install -U`.
-          python3 -m pip install numpy==2.5.4 gguf==0.19.0
+          #
+          # onnx, because three ctest rows (`q4nx_tail_head`, `fold_initializer_transpose`, `make_audio_pack`)
+          # returned 77 without it and were baselined as skips: a row that skips is not a gate, and the fold row's
+          # whole point is to catch an invalid pack before it is written (engine#2779). Each of the three passes
+          # locally with this pin (measured on 2026-11-16), and they come OUT of tools/ci/ctest_skips.txt below.
+          python3 -m pip install numpy==2.5.4 gguf==0.19.0 onnx==1.23.2
           python3 tests/gguf_to_q4nx_test.py
           python3 tests/repack_verify_source_test.py
           python3 tests/ternary_to_q4_0_test.py

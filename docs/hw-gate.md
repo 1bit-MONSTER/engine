@@ -27,7 +27,8 @@ and #370. The hardware gate checks every HRX pin bump, and every PR that asks fo
 - **A labelled PR.** Add the label `hw-gate` to a PR from this repository. Adding the label starts
   the job, and every later push runs it again.
 - **Every PR that bump-hrx opens** (branch `bump-hrx/*`).
-- **By hand.** Actions -> hw-gate -> Run workflow, with a ref (a branch, tag, SHA or `pull/N/head`).
+- **By hand.** Actions -> hw-gate -> Run workflow, with a ref (a branch, tag, `pull/N/head`, or the **full
+  40-character** commit SHA — a short SHA is not a ref, and `actions/checkout` fails before the job starts).
   The run posts the commit status `hw-gate` on the commit it checked, so a PR shows the result.
 
 Both runners this page names - `strixhalo-engine` here and `strixhalo-bench` for the bench jobs - are installed and

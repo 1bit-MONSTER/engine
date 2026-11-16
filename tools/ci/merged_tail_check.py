@@ -78,6 +78,36 @@ def significant_lines(text):
     return out
 
 
+def same_head(frozen, tip):
+    """True when the live tip is the head the PR was merged at.
+
+    `frozen` is `headRefOid`, recorded at merge time and never moved afterwards. An empty or
+    unreadable frozen head must answer False -- "I do not know" may not skip a branch.
+    """
+    frozen, tip = (frozen or "").strip(), (tip or "").strip()
+    if len(frozen) < 7 or not tip:
+        return False
+    return tip.lower().startswith(frozen.lower()[:7]) or frozen.lower().startswith(tip.lower()[:7])
+
+
+def branch_mode(repo, branch, base_ref):
+    """List the commits on `branch` that are not on `base_ref` -- the recovery workflow.
+
+    A PR-list scan answers "is anything lost?"; this answers "what of MY branch never landed?",
+    which is what a lane needs immediately after it notices. (merge_content_check, #2655.)
+    """
+    if git(repo, "rev-parse", "--verify", "-q", branch).returncode != 0:
+        return None
+    tail = merge_commits(repo, branch, base_ref)
+    if tail is None:
+        return None
+    for sha, subject in tail:
+        kind, detail = classify_commit(repo, sha, base_ref)
+        print(f"{kind:12s} {sha} {subject[:60]}\n{'':12s} {detail}")
+    print(f"merged_tail_check: {len(tail)} commit(s) on {branch} are not on {base_ref}")
+    return tail
+
+
 def merge_commits(repo, ref, base_ref):
     """Commits reachable from `ref` and not from `base_ref` -- the branch's tail."""
     r = git(repo, "rev-list", "--format=%h %s", f"{base_ref}..{ref}")
@@ -173,7 +203,8 @@ def scan(repo, days, limit, base_url=None, prs=None):
             capture_output=True, text=True).stdout.strip()
         r = gh("pr", "list", "-R", base_url, "--state", "merged", "--limit", str(limit),
                "--search", f"merged:>={since}",
-               "--json", "number,title,headRefName,baseRefName,headRepositoryOwner,headRepository")
+               "--json", "number,title,headRefName,baseRefName,headRepositoryOwner,headRepository,"
+                         "headRefOid")
         # `gh` exits 0 and prints the failure on stdout when the repo does not resolve
         # ("GraphQL: Could not resolve to a Repository with the name ..."), so the exit code cannot
         # tell a real list from an error message. The parsed shape is the only evidence.
@@ -217,6 +248,14 @@ def scan(repo, days, limit, base_url=None, prs=None):
         if not ls.stdout.strip():
             rows.append(("GONE", pr, branch, None, "the branch is deleted: the tail cannot be examined"))
             continue
+
+        # Cheap gate before any fetch. `headRefOid` is frozen at merge time -- measured on #2623,
+        # where it is 0193a29e5, a commit that is NOT an ancestor of main while the branch tip is
+        # f7700ba0a. So `frozen != tip` means something was pushed (or force-pushed) after the merge
+        # and the branch is worth reading; `frozen == tip` means nothing was, and the content check
+        # would only re-derive that at the cost of a fetch per PR. (merged_branch_check, #2656.)
+        if same_head(pr.get("headRefOid"), ls.stdout.split()[0] if ls.stdout.split() else ""):
+            continue  # the branch tip is exactly what merged: nothing was pushed after
 
         ref = f"refs/mtck/{pr['number']}"
         if git(repo, "fetch", "-q", "--no-tags", url, f"{branch}:{ref}").returncode != 0:
@@ -347,6 +386,13 @@ def self_test():
         "one line of ten edited away by main is PARTIAL, not LOST")
     d.cleanup()
 
+    # The gate: an unknown frozen head must never skip a branch, and equal heads must skip.
+    chk(True, same_head("0193a29e5" + "0" * 31, "0193a29e5" + "9" * 31), "an equal frozen head skips")
+    chk(False, same_head("0193a29e5" + "0" * 31, "f7700ba0a" + "1" * 31),
+        "a moved branch tip does not skip")
+    chk(False, same_head("", "f7700ba0a" + "1" * 31),
+        "an unknown frozen head does NOT skip -- not knowing is not a pass")
+
     # The tail set itself: a branch tip equal to the base has no tail.
     d, r = scratch()
     commit(r, "f.txt", "x\n", "one")
@@ -376,9 +422,25 @@ def main():
     ap.add_argument("--days", type=int, default=30, help="how far back to look (default 30)")
     ap.add_argument("--limit", type=int, default=200, help="max merged PRs to examine")
     ap.add_argument("--worktree", default=".", help="a clone with origin = --repo")
+    ap.add_argument("--branch", help="instead of scanning PRs, list what this ref has that "
+                                    "--base does not (the recovery workflow)")
+    ap.add_argument("--base", default="origin/main", help="base for --branch (default origin/main)")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
+    if a.branch:
+        wt = pathlib.Path(a.worktree)
+        if git(wt, "fetch", "-q", "--no-tags", "origin",
+               a.base.replace("origin/", "")).returncode != 0:
+            print(f"merged_tail_check: could not fetch {a.base} -- cannot tell, and that is not "
+                  f"a pass", file=sys.stderr)
+            return 2
+        tail = branch_mode(wt, a.branch, a.base)
+        if tail is None:
+            print(f"merged_tail_check: could not read {a.branch} -- cannot tell, and that is not "
+                  f"a pass", file=sys.stderr)
+            return 2
+        return 1 if tail else 0
     rc, _, _ = report(pathlib.Path(a.worktree), a.days, a.limit, a.repo)
     return rc
 

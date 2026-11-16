@@ -339,6 +339,54 @@ int main() {
             std::printf("FAIL the in-flight refusal does not say why: %s\n", b_err.c_str());
             return 1;
         }
+        // A release asked for WHILE a row of that slot is in the pass must not be lost: the slot is freed when the row
+        // finishes, not stranded (the only caller of release() is a destructor that cannot read the bool).
+        {
+            const int s2 = batch.acquire();
+            if (s2 < 0) {
+                std::printf("FAIL acquire for the deferred-release arm\n");
+                return 1;
+            }
+            std::string w2;
+            if (!batch.prefill(s2, {1, 2, 3}, nullptr, &w2)) {
+                std::printf("FAIL deferred-release prefill: %s\n", w2.c_str());
+                return 1;
+            }
+            std::thread worker([&] {
+                std::vector<float> row;
+                std::string w;
+                if (!batch.step(s2, 4, 3, &row, &w)) std::printf("FAIL deferred-release step: %s\n", w.c_str());
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));   // the row is in the running pass
+            const bool released = batch.release(s2);
+            const bool stolen = batch.acquire(0) >= 0;
+            worker.join();   // join BEFORE any early return: a joinable thread destroyed is std::terminate, which is how
+                             // the stranding mutant "failed" the first version of this arm (a crash, not a verdict)
+            if (!released) {
+                std::printf("FAIL release during a pass was refused (the slot would be stranded)\n");
+                return 1;
+            }
+            if (stolen) {
+                std::printf("FAIL the slot was handed out again while its row was still running\n");
+                return 1;
+            }
+            // ... and it comes back once the pass is done.
+            bool back = false;
+            for (int i = 0; i < 100 && !back; i++) {
+                const int s3 = batch.acquire(0);
+                if (s3 >= 0) {
+                    back = true;
+                    batch.release(s3);
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            }
+            if (!back) {
+                std::printf("FAIL a slot released during its pass never came back\n");
+                return 1;
+            }
+        }
+
         // Double release: the first frees it, the second must say so instead of freeing it twice.
         if (!batch.release(slot)) {
             std::printf("FAIL a held slot was not released\n");

@@ -89,22 +89,25 @@ class NpuDecodeBatch {
         return take();
     }
 
-    // false when the slot is out of range, was ALREADY free, or still has a row in the running pass. A double release is a
-    // caller bug and silently accepting it would let the next acquire() hand a slot to a second request while the first is
-    // still using it (review of #2734).
+    // false when the slot is out of range or was ALREADY free (a double release is a caller bug, and silently accepting it
+    // would let the next acquire() hand a slot to a second request). A slot whose row is still in the running pass is
+    // accepted and freed as soon as that row completes -- see release_pending_.
     bool release(int slot) {
         if (slot < 0) return false;
-        bool freed = false;
+        bool freed_now = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            if (size_t(slot) < free_.size() && !free_[size_t(slot)] &&
-                !(inflight_.size() > size_t(slot) && inflight_[size_t(slot)] > 0)) {
-                free_[size_t(slot)] = true;
-                freed = true;
+            if (size_t(slot) >= free_.size() || free_[size_t(slot)]) return false;
+            if (release_pending_.size() < free_.size()) release_pending_.resize(free_.size(), false);
+            if (inflight_.size() > size_t(slot) && inflight_[size_t(slot)] > 0) {
+                release_pending_[size_t(slot)] = true;   // deferred: the slot is freed when its row finishes
+                return true;
             }
+            free_[size_t(slot)] = true;
+            freed_now = true;
         }
-        if (freed) cv_.notify_all();   // a request queued in acquire(wait_ms) is waiting for exactly this
-        return freed;
+        if (freed_now) cv_.notify_all();   // a request queued in acquire(wait_ms) is waiting for exactly this
+        return true;
     }
 
     // Run `tokens` as the slot's prompt (position 0 = a new sequence, which the forward clears). Blocking.
@@ -154,6 +157,10 @@ class NpuDecodeBatch {
         std::unique_lock<std::mutex> lk(mu_);
         if (size_t(j->slot) >= free_.size() || free_[size_t(j->slot)]) {
             if (why) *why = "decode batch: slot " + std::to_string(j->slot) + " is not held by this request";
+            return false;
+        }
+        if (release_pending_.size() > size_t(j->slot) && release_pending_[size_t(j->slot)]) {
+            if (why) *why = "decode batch: slot " + std::to_string(j->slot) + " has been released by its request";
             return false;
         }
         if (inflight_.size() <= size_t(j->slot)) inflight_.resize(free_.size(), 0);
@@ -268,9 +275,17 @@ class NpuDecodeBatch {
             }
 
             lk.lock();
+            bool woke = false;
             for (size_t i = 0; i < round_jobs.size(); i++) {
                 auto& q = round_jobs[i];
                 if (inflight_[size_t(q->slot)] > 0) inflight_[size_t(q->slot)]--;
+                // A deferred release (release() during the pass) frees the slot now that its last row is done.
+                if (inflight_[size_t(q->slot)] == 0 && release_pending_.size() > size_t(q->slot) &&
+                    release_pending_[size_t(q->slot)]) {
+                    release_pending_[size_t(q->slot)] = false;
+                    free_[size_t(q->slot)] = true;
+                    woke = true;
+                }
                 if (!err.empty()) {
                     q->err = err;
                 } else if (q->prefill) {
@@ -283,6 +298,7 @@ class NpuDecodeBatch {
                 q->done = true;
             }
             rounds_++;
+            (void)woke;   // the notify below covers the deferred-release wake as well
             cv_.notify_all();
         }
     }
@@ -305,6 +321,11 @@ class NpuDecodeBatch {
     // `queued_` before the pass, so a second submit arriving mid-pass would not see them and would queue a second row for a
     // sequence whose first row is still being computed (review of #2734).
     std::vector<int> inflight_;
+    // A release asked for while the slot's row was still in the running pass. Freeing it then would hand the slot to
+    // another request while this one's row is being computed, and refusing it outright strands the slot for the life of
+    // the process when the caller's thread unwinds mid-round (review of #2734). So it is DEFERRED: the callback is
+    // remembered and the slot is freed the moment its last in-flight row completes.
+    std::vector<bool> release_pending_;
     long rounds_ = 0;
     int window_us_ = 2000;
     bool stopping_ = false;

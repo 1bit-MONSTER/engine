@@ -59,7 +59,13 @@ import sys
 # Anchored on the timestamp, NOT on the task name: a task name can contain a space ("next-server (v1-8386"), and
 # anchoring on `^\s+\S+\s+\[` silently dropped 2,176 of 115,941 map lines on a real capture -- 1.9 %, which is
 # exactly the fraction that can contain the event being looked for.
-EVENT = re.compile(r"(\d+\.\d+):\s+\S*cap(map|unm):\s+\([^)]*\)\s+iova=(0x[0-9a-f]+)\s+size=(0x[0-9a-f]+)")
+#
+# The map/unmap distinction comes from the PROBED FUNCTION in the event text, not from the event's name: any lane
+# names its probe differently (`capmap`, `unm`, `b2map`, `prs2mp`), and a tool that only reads its own naming
+# cannot read the captures that already exist on the box. The function is the fact; the name is a convention.
+EVENT = re.compile(r"(\d+\.\d+):\s+\S*:\s+\((\w+)\+[^)]*\)\s+iova=(0x[0-9a-f]+)\s+size=(0x[0-9a-f]+)")
+MAP_FUNCS = ("iommu_map", "iommu_map_sg")
+UNMAP_FUNCS = ("iommu_unmap", "iommu_unmap_fast")
 FAULT = re.compile(r"^\[\s*(\d+\.\d+)\].*IO_PAGE_FAULT.*address=(0x[0-9a-f]+)")
 
 
@@ -75,8 +81,11 @@ def parse_events(path):
             m = EVENT.search(line)
             if not m:
                 continue
-            t, kind, iova, size = float(m.group(1)), m.group(2), int(m.group(3), 16), int(m.group(4), 16)
-            (maps if kind == "map" else unmaps).append((t, iova, size))
+            t, fn, iova, size = float(m.group(1)), m.group(2), int(m.group(3), 16), int(m.group(4), 16)
+            if fn in MAP_FUNCS:
+                maps.append((t, iova, size))
+            elif fn in UNMAP_FUNCS:
+                unmaps.append((t, iova, size))
     return maps, unmaps
 
 
@@ -185,6 +194,14 @@ def self_test() -> int:
 
         maps, unmaps = parse_events(str(d / "cap.txt"))
         chk(len(maps) == 2 and len(unmaps) == 1, "a task name containing a space still parses (2 map, 1 unmap)")
+        # 2b. the same events under ANOTHER lane's naming (`unm:`/`map:`/`prs2mp:`) parse identically, because the
+        #     class comes from the probed function. A tool that only reads its own event names cannot read the
+        #     captures that already exist on the box -- measured: 579,219 unmaps in ~/.cache/scratch-*/burst.trace
+        #     are named `unm:`, and the first version of this file refused them.
+        other = pathlib.Path(td) / "other.txt"
+        other.write_text(cap.replace("capmap:", "whatever:").replace("capunm:", "unm:"))
+        m2, u2 = parse_events(str(other))
+        chk((m2, u2) == (maps, unmaps), "event names invented by another lane parse by the probed function, not the name")
         chk(all(e[2] == 0x1000 for e in maps + unmaps), "size parses as 4 KiB")
 
         faults = parse_faults(str(d / "after.txt"))

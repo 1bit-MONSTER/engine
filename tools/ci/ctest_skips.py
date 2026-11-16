@@ -40,6 +40,10 @@ import re
 import sys
 
 BASELINE = pathlib.Path("tools/ci/ctest_skips.txt")
+# The repo this tool ships in: tools/ci/ctest_skips.py -> repo root. `--root` defaulted to "." until engine#2730's wiring, which made the
+# answer depend on the caller's cwd -- running it from anywhere else reported every skipped test as unbaselined, i.e. a wrong
+# `--root` looked exactly like a broken baseline. Every sibling tool resolves its root from __file__ for the same reason.
+TOOL_ROOT = pathlib.Path(__file__).resolve().parents[2]
 # ctest writes "did not run" in two shapes, and the second is the worse one:
 #   " 16/192 Test  #16: npu_repack_path .......***Skipped   0.72 sec"     the test ran and returned 77
 #   "\t182 - npu_private_route (Not Run)"                                  the binary was not built at all
@@ -169,17 +173,24 @@ def self_test() -> int:
     ok(list(skipped(with_notrun)) == ["npu_private_route"], "a '(Not Run)' line is read")
     ok(check(root, with_notrun) == 1, "a missing binary is refused with no way to baseline it (rc 1)")
     ok(skipped(with_skip) != skipped(with_notrun), "... and the two shapes are not the same verdict")
+    ok(_parser().parse_args([]).root == str(TOOL_ROOT),
+       "with no --root the baseline is the repo's own, so a run from another cwd cannot read a stranger's")
     print("self-test ok" if not fails else f"self-test FAILED ({fails})")
     return 1 if fails else 0
 
 
-def main() -> int:
+def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--log", default="build/ctest.log", help="a ctest log (default: build/ctest.log)")
-    ap.add_argument("--root", default=".")
+    ap.add_argument("--root", default=str(TOOL_ROOT),
+                    help="the tree that holds %s (default: the repo this tool ships in, never the caller's cwd)" % BASELINE)
     ap.add_argument("--write", action="store_true")
     ap.add_argument("--self-test", action="store_true")
-    a = ap.parse_args()
+    return ap
+
+
+def main() -> int:
+    a = _parser().parse_args()
     if a.self_test:
         return self_test()
     path = pathlib.Path(a.log)

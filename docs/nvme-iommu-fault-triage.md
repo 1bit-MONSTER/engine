@@ -144,10 +144,36 @@ pooled page. **Three of the four faults on it** followed an unmap of that same p
 page within 60 s** -- the nearest is **+74 s**, after the fault -- so this capture correlates three faults and shows
 the ceiling on the fourth; a wider window does not help it, and the earlier "19.60 s" I quoted for it came from a
 different capture and does not reproduce on this one. So `tools/diag/unmap_fault_order.py` defaults to **30 s** and
-the page's own numbers are **5-25 s**: a millisecond window reports "nothing correlated" on a capture that contains
-the correlation. Because the same sentence is printed whether the window is too narrow or the fault genuinely has no
-nearby unmap, **the negative now names the window it used and the measured interval** -- a default alone does not fix
-the failure, only a negative that says *at what scale* it found nothing does.
+the page's own numbers are **5-25 s on that sparse stream**: a millisecond window reports "nothing correlated" on a
+capture that contains the correlation. Because the same sentence is printed whether the window is too narrow or the
+fault genuinely has no nearby unmap, **the negative names the window it used and the measured interval** -- a default
+alone does not fix the failure, only a negative that says *at what scale* it found nothing does.
+
+**But "seconds" is not the rate of this stream -- it is the rate of that capture.** The same page measured again on a
+busier boot is mapped and unmapped **about 470 times a second**: `nvme_prep_rq` maps it through `dma_map_phys` ->
+`iommu_map`, and `nvme_pci_complete_batch` unmaps it from the completion IRQ through both `dma_unmap_phys` and
+`dma_iova_unlink`/`dma_iova_destroy` (150 s, one IOVA, filtered, counts 27644 / 35907 / 33141). **So a wide window is
+the wrong instrument in the other direction**: at that rate a +/-30 s window holds ~14,000 unmaps of the page and "the
+nearest one was 31 us before the fault" is not evidence of anything. The tool therefore **carries the count** and flags
+a pairing whose window held more than three unmaps of the same IOVA:
+`[1 of N unmaps of this iova in the window -- NOT discriminating, narrow --window]`. On the burst capture above it
+fires on the -5.65 s pairing immediately (`1 of 7`), which is the honest reading: **the interval is real, its precision
+is not.**
+
+**Three ways a filtered kprobe silently measures nothing**, all hit while taking the counts above:
+
+1. **`tracing_on=0` with `enable=1`** records nothing, and the empty buffer reads exactly like "0 events". Check
+   `tracing_on` and `entries-written` on every capture, and run a **positive control** first (30 s of events, abort if
+   zero).
+2. **A `stacktrace` trigger suppresses the event's own line.** The dump is `<stack trace>` blocks with no `iova=` text
+   at all, so a filter that is working perfectly looks like it never applied. Count events *without* the trigger first.
+   And `stacktrace:unlimited` must be cleared (`echo '!stacktrace:0' > .../trigger`) before `-:kprobes/x` will delete
+   the event -- otherwise the delete fails with `echo: I/O error` and the probe stays armed.
+3. **tracefs rejects range filters, and the failed write leaves the probe UNFILTERED.**
+   `(iova + size > 0xX && iova <= 0xX)` gives `parse_error: Invalid operator`; the event then records **every** unmap
+   (1,947 in 20 s, against 18 in 30 s for the working exact filter). **Read the filter file back after writing it**, and
+   keep in mind that an exact-iova filter cannot see a *larger* mapping that covers the page -- for this driver that is
+   tolerable because its unmaps are all 4 KiB (60 of 60 measured), but it is a measured caveat, not a proof.
 
 **And the reverse is just as wrong: a positive must say whether it discriminates.** The same page's cadence is
 workload-dependent -- a later capture on this box (05:40Z, 150 s, one IOVA filtered) found the NVMe paths mapping it

@@ -282,14 +282,19 @@ def classify_commit(repo, sha, base_ref, after=None):
             # bump rewrote the value" is; a commit that touched only another line is not that.
             since = after or sha
             moved = False
-            if after is not None and not longer:      # a longer base file already answers it
+            # engine#2716: the line test decides whenever the merge commit is known. `longer` cannot tell
+            # "a later commit rewrote this line" from "a later commit appended somewhere else in the same
+            # file", and on the second it reports SUPERSEDED, which report() exits 0 on -- a genuine loss
+            # then reads as a clean scan (measured: a file that grew after the merge, the lost line untouched).
+            # `longer` stays only as the fallback for when no merge commit is in hand.
+            if after is not None:
                 for path, line in missing_all:
                     if path != f:
                         continue
                     if git(repo, "log", "--oneline", "-S", line, f"{since}..{base_ref}", "--", f).stdout.strip():
                         moved = True
                         break
-            superseded = superseded and (longer or moved)
+            superseded = superseded and (moved if after is not None else longer)
             ctx = ("the line was replaced on the base after this PR merged" if moved else
                    ("base is longer" if longer else "base is shorter"))
             sizes += f"; {f}: this commit {mine} lines, base {theirs} lines ({ctx})"
@@ -522,6 +527,22 @@ def self_test():
         "the same commit is SUPERSEDED once a later commit replaced the line itself")
     chk("LOST", classify_commit(r, pin, "main")[0],
         "and without after= it is LOST again: the exit-0 path is what after= selects")
+    d.cleanup()
+
+    # engine#2716: the shape the block above cannot see. A later PR that APPENDS to the same file makes the base
+    # file longer while leaving the lost line alone, and `longer` alone calls that a supersession -- LOST at exit 0
+    # with nothing replaced. The line test is the only one that can tell "this line was replaced" from "this file
+    # grew", so with the merge commit in hand it has to be the one that decides.
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    branch(r, "pr")
+    lost_line = commit(r, "conf.config", "sha=aa11\n", "the value this branch pushed after the merge")
+    branch(r, "main", "pr~1")
+    merged2 = commit(r, "other.txt", "unrelated\n", "the merge point")
+    commit(r, "conf.config", "sha=zz99\nsha2=bb22\nsha3=cc33\n",
+           "a later PR appends two lines: the base file is LONGER and the lost line is untouched")
+    chk("LOST", classify_commit(r, lost_line, "main", after=merged2)[0],
+        "a longer base file whose lost line nothing replaced is still LOST (length is not the evidence)")
     d.cleanup()
 
     # The same content, already on the base by another commit: not a loss.

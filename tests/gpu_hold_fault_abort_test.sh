@@ -173,6 +173,32 @@ _age2=$(sed -n 's/.*newest \([0-9]\+\)s ago.*/\1/p' "$scratch/tlogage2" | head -
 if [ -z "$_age2" ]; then echo "FAIL take-time age/skip: the refusal has no age"; fail=1;
 elif [ "$_age2" -lt 300 ]; then echo "FAIL take-time age/skip: age ${_age2}s is the RECOVERY NOTICE's, not the fault's (~600s)"; fail=1; fi
 
+# A BACKTRACE IS ONE EVENT, NOT ELEVEN (measured 2026-11-16 19:33:03Z). The driver's reset path logs a WARN whose stack
+# frames each read `amdgpu_...reset...+0x1a2/0x3b4 [amdgpu]`, and GPU_FAULT_RE (`amdgpu.*(reset|hang)`) matches every one
+# of them: gpu-hold reported "22 fault line(s)" for a log holding 118 matching lines across TWO timestamps. The refusal
+# was correct -- a real reset had happened -- but the count is the number a lane reads when its ticket is thrown away,
+# and 22 sends it hunting a storm. A frame carries a `+0x` offset; a real fault line does not.
+mkdir -p "$scratch/framebin"; t3=$(( $(date +%s) - 30 ))
+{
+  printf '%s kernel: amdgpu 0000:c5:00.0: GPU reset(2) succeeded!\n' "$t3"
+  printf '%s kernel: amdgpu 0000:c5:00.0: GPU reset: queues of 2 process(es) are no longer usable\n' "$t3"
+  for _f in amdgpu_device_gpu_recover.cold amdgpu_device_asic_reset amdgpu_do_asic_reset \
+            amdgpu_device_reinit_after_reset.cold amdgpu_amdkfd_reset_work amdgpu_dm_atomic_commit_tail \
+            amdgpu_device_gpu_recover amdgpu_amdkfd_reset amdgpu_reset_work amdgpu_sched_reset; do
+    printf '%s kernel:  %s+0x2f54/0x3830 [amdgpu]\n' "$t3" "$_f"
+  done
+} > "$scratch/framelog"
+printf '#!/bin/bash\ncat %s\n' "$scratch/framelog" > "$scratch/framebin/journalctl"
+chmod +x "$scratch/framebin/journalctl"
+env PATH="$scratch/framebin:$PATH" HOME=$scratch ONEBIT_HOLD_DIR="$scratch/framehold" GPU_HOLD_COOLDOWN=0 \
+    GPU_HOLD_WAIT=5 GPU_HOLD_MINUTES=1 GPU_HOLD_THERMAL_FLAG="$scratch/x" GPU_HOLD_RESET_WINDOW_MIN=10 \
+    timeout 60 "$hold" -l takeframe -- true > "$scratch/tlogframe" 2>&1
+frame_rc=$?
+[ "$frame_rc" = 78 ] || { echo "FAIL take-time frames: rc $frame_rc, want 78 (a real reset is still a refusal)"; fail=1; }
+grep -q 'refusing: 2 ' "$scratch/tlogframe" || {
+    echo "FAIL take-time frames: a WARN backtrace was counted as more than the 2 real lines ($(sed -n 's/.*refusing: \([0-9]*\) .*/\1/p' "$scratch/tlogframe" | head -1) counted)"; fail=1; }
+grep -qE '\+0x[0-9a-f]+/0x' "$scratch/tlogframe" && { echo "FAIL take-time frames: a stack frame was printed as a fault line"; fail=1; }
+
 take_run clean clean
 [ "$trc" = 0 ] || { echo "FAIL take-time: a clean log -> rc $trc, want 0 (a healthy hold must still run)"; fail=1; }
 
@@ -247,5 +273,5 @@ grep -q "newest line is from the NPU" "$scratch/log5" || { echo "FAIL arm 5: the
 grep -q "newest line is from the GPU" "$scratch/log1" || { echo "FAIL arm 1: the abort does not name the GPU as the faulting device"; fail=1; }
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 
-[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on; 124 named -> 78; take-time page fault/MES/ring/hang -> 78; NPU fault in hold -> 78; a recovery notice does NOT abort; a real power-cycling event does)"
+[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on; 124 named -> 78; take-time page fault/MES/ring/hang -> 78; NPU fault in hold -> 78; a recovery notice does NOT abort; a real power-cycling event does; a WARN backtrace counts once)"
 exit "$fail"

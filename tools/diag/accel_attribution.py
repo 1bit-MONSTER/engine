@@ -281,6 +281,36 @@ def self_test():
         assert datetime.datetime.fromtimestamp(1794798800).strftime("%m-%d %H:%M:%S") in out.split("capture window: ")[1][:40], \
             "the window's start is not the first sample's stamp: " + out[:400]
 
+    # engine#2542: an ARCHIVED episode is readable by path. The sampler renames its logs on every reboot
+    # (`<name>.log.pre-reboot2`), so after a reboot the episode worth reading is the one `--dir` cannot reach.
+    # The arm uses those exact names, so a tool that ignored --samples/--attributed would answer from the
+    # default paths and fail here by name rather than quietly reporting nothing.
+    with tempfile.TemporaryDirectory() as _t:
+        with open(os.path.join(_t, "samples.log.pre-reboot2"), "w") as _f:
+            _f.write("1794798800\t222\t1\t/a serve\tscope\tticket\n")
+            _f.write("1794798802\t222\t1\t/a serve\tscope\tticket\n")
+        with open(os.path.join(_t, "attributed.log.pre-reboot2"), "w") as _f:
+            _f.write("1794798810\t215633\t/serve\t-\tscope\tt\t" + A_ + "\n")
+        _argv = sys.argv
+        # `--dir` points at an EMPTY directory on purpose: a tool that ignored --samples/--attributed would find
+        # nothing there and return 2, instead of answering from this box's real sampler log (which is what the
+        # first version of this arm did -- the mutation caught the arm, not the code).
+        _empty = os.path.join(_t, "empty")
+        os.makedirs(_empty, exist_ok=True)
+        sys.argv = ["accel_attribution.py", "--dir", _empty,
+                    "--samples", os.path.join(_t, "samples.log.pre-reboot2"),
+                    "--attributed", os.path.join(_t, "attributed.log.pre-reboot2"), "--window", "5"]
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = main()
+        finally:
+            sys.argv = _argv
+        out = buf.getvalue()
+        assert rc == 0, f"an archived episode should be readable by path, got rc {rc}: " + out[-400:]
+        assert "capture window: " in out, "the archived episode produced no window line: " + out[:400]
+        assert "fault records: 1 -- 1 on amdxdna" in out, "the archived fault was not read: " + out[-400:]
+
     # A partially written row must not kill the reader.
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
         f.write("100\t111\t1\t/a serve\tscope\tticket\n")
@@ -326,6 +356,11 @@ def render_holders(t):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dir", default=os.path.expanduser("~/.cache/accel-sampler"))
+    # engine#2542: the sampler's logs are ARCHIVED on every reboot (`<name>.log.pre-reboot2`), so after a reboot
+    # the episode most worth reading is the one `--dir` cannot reach -- the 11-13 stream of 102 gfxhub faults
+    # sits in samples.log.pre-reboot2 and had to be read as journal text instead. Two explicit paths cost nothing.
+    ap.add_argument("--samples", help="samples.log to read (default: <dir>/samples.log)")
+    ap.add_argument("--attributed", help="attributed.log to read (default: <dir>/attributed.log)")
     ap.add_argument("--window", type=int, default=5, help="the sampler's WINDOW_S (default 5)")
     ap.add_argument("--any-device", action="store_true",
                     help="also attribute faults from devices the sampler does not watch (default: name and skip them)")
@@ -335,14 +370,16 @@ def main():
         self_test()
         return 0
 
-    samples = read_samples(os.path.join(args.dir, "samples.log"))
-    attrs = read_attributions(os.path.join(args.dir, "attributed.log"))
+    spath = args.samples or os.path.join(args.dir, "samples.log")
+    apath = args.attributed or os.path.join(args.dir, "attributed.log")
+    samples = read_samples(spath)
+    attrs = read_attributions(apath)
     if attrs is None:
         print("accel_attribution: no attributed.log yet: the sampler has recorded no fault "
               "(it creates the file on the first one)", file=sys.stderr)
         attrs = []
     if not samples:
-        print(f"accel_attribution: no samples in {args.dir}/samples.log", file=sys.stderr)
+        print(f"accel_attribution: no samples in {spath}", file=sys.stderr)
         return 2
 
     iv = intervals(samples)

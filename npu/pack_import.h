@@ -960,6 +960,24 @@ struct FconstGeom {
     int64_t post_attn_hdr() const { return hdr.empty() ? h1 : hdr.back(); }
     std::string why;      // non-empty when the geometry could not be established
 };
+// engine#2604: where the MLP section starts inside a layer block, and how many bytes of the block's tail are NOT
+// part of it. Two forms, and the difference is a whole norm:
+//   * 2- and 4-header blocks (Qwen2.5/Llama/Qwen3): the MLP follows the block's LAST header (post_attention), and
+//     nothing trails it -- `end_trim` is 0.
+//   * the 6-header gemma3 form: the pre-feedforward norm opens the MLP and the POST-feedforward norm closes it, so
+//     the MLP starts after the SECOND-TO-LAST header and the block ends `kNormOff + 2H` bytes after the MLP does.
+//     Measured on translategemma-4b (hidden 2560): h3 8,814,816, h4 8,820,000, MLP 42,921,088, h5 51,741,088.
+// Reading the last header on the 6-header form put the MLP one envelope past its start, which is the refusal
+// "the MLP section ends at 51,741,088 B in a 51,746,272-byte layer block".
+inline int64_t mlp_start_in_block(const std::vector<int64_t>& hdr, int64_t kNormOff, int64_t H, int64_t* end_trim) {
+    const int64_t last = hdr.empty() ? 0 : hdr.back();
+    if (hdr.size() == 5) {   // gemma3: five in-block headers, the last one AFTER the MLP
+        *end_trim = kNormOff + H * 2;
+        return hdr[3] + kNormOff + H * 2;
+    }
+    *end_trim = 0;
+    return last + kNormOff + H * 2;
+}
 unsigned short bf16_bits_of(float v);
 
 // engine#1650: config.json may declare an OPTIONAL field as JSON null (AMD's 1.9

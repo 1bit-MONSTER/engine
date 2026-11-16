@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <optional>
 #include "pack_import.h"
 
 #include "onnx_graph.h"
@@ -4525,6 +4526,7 @@ Plan plan(const std::string& pack_dir) {
                 const int64_t attn_off = attn_payload_off(H);
                 const int64_t per_head = int64_t(d.head_dim) * 2;  // one QK norm gain, bf16
                 const int64_t tile_o = attn_tile_bytes(q_out);
+                std::optional<int64_t> mlp_off_6h;   // engine#2604: set only by the 6-header form
                 const int64_t n_kv = kv_out / 64, n_q = q_out / 64;
                 auto refuse = [&](const std::string& s) {
                     p.attn_note = s;
@@ -4655,14 +4657,65 @@ Plan plan(const std::string& pack_dir) {
                         p.o_off = g.hdr[1] + kNormOff + per_head;
                         p.o_k = q_out;
                     }
+                } else if (g.hdr.size() == 5) {
+                    // engine#2604: the gemma3 1.8 Token block -- Qwen3's four headers plus Gemma-3's pre- and
+                    // post-feedforward norms, i.e. six per layer. Measured on amd/translategemma-4b-it_rai_1.8.0_npu_4K
+                    // (hidden 2560, 34 layers, 8 heads, head_dim 256): headers are `eps` + 62 zero bytes, 205 of them
+                    // (34 x 6 + the tail), and the block spans are
+                    //   h0->h1 q/k/v tiles | h1->h2 first per-head gain | h2->h3 second per-head gain [+32 B on the 29
+                    //   SLIDING-window layers] then o_proj | h3->h4 post_attention | h4->h5 pre/post-feedforward | MLP.
+                    // Both spans reproduce exactly: 64 + 512 + 578*5120 = 2,959,936 on the 5 full-attention layers, and
+                    // + 32 = 2,959,968 on the other 29. The 32 B is 16 bf16 = 2 x num_attention_heads: a per-head scalar
+                    // pair the reader has to SKIP, not interpret. Its presence is cross-checked against the span itself,
+                    // so nothing here is inferred from a version or a config.
+                    const int64_t kv_tiles = n_kv + n_q + n_kv;
+                    const int64_t s0 = g.hdr[0] - attn_off;
+                    const int64_t s1 = g.hdr[1] - g.hdr[0];
+                    const int64_t s2 = g.hdr[2] - g.hdr[1];
+                    const int64_t after_gains = s2 - (kNormOff + per_head);   // o_proj tiles, plus that 32 B
+                    const int64_t extra = after_gains >= 0 ? after_gains % tile_o : -1;
+                    const int64_t n_otiles = after_gains >= 0 ? after_gains / tile_o : 0;
+                    if (s0 != kv_tiles * tile_bytes)
+                        refuse("the attention payload before the first per-head gain is " + std::to_string(s0) +
+                               " B; k/q/v at 64 rows each are " + std::to_string(kv_tiles * tile_bytes) + " B");
+                    else if (s1 != kNormOff + per_head)
+                        refuse("the section between the block's first two gains is " + std::to_string(s1) + " B; a " +
+                               std::to_string(kNormOff) + "-byte header plus a bf16 [head_dim " +
+                               std::to_string(d.head_dim) + "] gain is " + std::to_string(kNormOff + per_head));
+                    else if (n_otiles != H / kTileRows || (extra != 0 && extra != 32))
+                        refuse("the o_proj section is " + std::to_string(after_gains) + " B after the gains; hidden " +
+                               std::to_string(H) + " rows at K = q_proj's " + std::to_string(q_out) + " are " +
+                               std::to_string(H / kTileRows) + " tiles of " + std::to_string(tile_o) +
+                               " B, optionally preceded by 32 B of per-head scalars on a sliding-window layer");
+                    else {
+                        p.attn_tiles = kv_tiles;
+                        p.knorm_off = g.hdr[0] + kNormOff;
+                        p.qnorm_off = g.hdr[1] + kNormOff;
+                        p.o_off = g.hdr[1] + kNormOff + per_head + extra;   // skip the per-head scalar pair
+                        p.o_k = q_out;
+                        // engine#2604: the MLP sits BETWEEN the pre- and post-feedforward norms, so `hdr.back()`
+                        // (the post-feedforward header) is PAST it -- measured on translategemma-4b: h3 8,814,816,
+                        // h4 8,820,000, MLP 42,921,088, h5 51,741,088. The MLP therefore starts after h4.
+                        mlp_off_6h = g.hdr[3] + kNormOff + H * 2;
+                    }
                 } else {
                     refuse("the layer block has " + std::to_string(g.hdr.size() + 1) +
-                           " epsilon headers, and this importer reads blocks of 2 (q/k/v/o in one payload) "
-                           "or 4 (q/k/v, two per-head QK norms, o_proj) -- recorded 2026-11-04 on Qwen3");
+                           " epsilon headers, and this importer reads blocks of 2 (q/k/v/o in one payload), "
+                           "4 (q/k/v, two per-head QK norms, o_proj) or 6 (the same plus pre/post-feedforward "
+                           "norms, engine#2604) -- recorded 2026-11-04 on Qwen3");
                 }
-                // the MLP section starts right after the block's post-attention norm
-                const int64_t mlp_off = g.post_attn_hdr() + kNormOff + H * 2;
-                const MlpGeom mg = mlp_geom(H, d.intermediate, mlp_off, g.stride);
+                // the MLP section starts right after the block's post-attention norm -- except on the 6-header
+                // form, where the pre/post-feedforward norms straddle it and the branch above moves mlp_off.
+                int64_t mlp_end_trim = 0;
+                const int64_t mlp_off = mlp_off_6h ? *mlp_off_6h
+                                                   : mlp_start_in_block(g.hdr, kNormOff, H, &mlp_end_trim);
+                // engine#2604: on the 6-header form the MLP is followed by the post-feedforward norm, which is an
+                // envelope + bf16[H] (5,184 B at hidden 2560) INSIDE the block -- so the section ends that much
+                // before the block does. Passing the full stride made the decoder expect 5,184 B more than the
+                // file has (measured: "ends at 51,741,088 in a 51,746,272-byte block", the two differing by
+                // exactly h5's own envelope+weight).
+                const int64_t mlp_end = g.stride - mlp_end_trim;
+                const MlpGeom mg = mlp_geom(H, d.intermediate, mlp_off, mlp_end);
                 p.mlp_note = mg.why;
                 if (mg.ok()) {
                     p.mlp_gu_units = mg.gu_units;

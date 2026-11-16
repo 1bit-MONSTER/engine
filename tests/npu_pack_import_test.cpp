@@ -3904,6 +3904,34 @@ void test_import_fp32_params(const std::string& root) {
 // payload came out as "whole tiles plus a stray run" and the attention section was refused. The two
 // numbers below are the packs' OWN measured second-header offsets, so this is a known-answer test: with
 // the derived offset each section is exactly the tiles q/k/v/o need, and with the old constant it is not.
+// engine#2604: the MLP offset rule, with the real pack's own header offsets. The 6-header gemma3 block puts the
+// pre-feedforward norm BEFORE the MLP and the post-feedforward norm AFTER it, so the block's last header is past
+// the section at BOTH ends -- reading it as the MLP start is the refusal "the MLP section ends at 51,741,088 B in a
+// 51,746,272-byte layer block", and reading the full stride as the MLP's length is 5,184 B too generous.
+void test_mlp_start_in_block() {
+    const int64_t kNormOff = 64, H = 2560;
+    // translategemma-4b layer 0, measured: q/k/v | h1 5,854,272 | h2 5,854,848 | h3 8,814,816 | h4 8,820,000 |
+    // MLP 42,921,088 | h5 51,741,088 | next block
+    const std::vector<int64_t> six{5854272, 5854848, 8814816, 8820000, 51741088};
+    int64_t trim = -1;
+    const int64_t start = pi::mlp_start_in_block(six, kNormOff, H, &trim);
+    check(start == 8820000 + 64 + H * 2, "mlp start: the 6-header form opens the MLP after h4, not h5 (" +
+                                             std::to_string(start) + " vs " + std::to_string(8820000 + 64 + H * 2) + ")");
+    check(start != six.back() + 64 + H * 2, "mlp start: h5 is past the MLP, so it is not the start");
+    check(trim == 64 + H * 2, "mlp start: the block ends one envelope+weight after the MLP (" + std::to_string(trim) + ")");
+    check(51746272 - start - trim == 42915904, "mlp start: the section is 42,915,904 B, as the file has");
+    // a 4-header block is unchanged by the rule: last header is the post-attention norm, nothing trails it
+    const std::vector<int64_t> four{1000, 2000, 3000};
+    int64_t trim4 = -1;
+    const int64_t s4 = pi::mlp_start_in_block(four, kNormOff, H, &trim4);
+    check(s4 == 3000 + 64 + H * 2 && trim4 == 0, "mlp start: a 4-header block keeps the last header and trims nothing");
+    // a 2-header block likewise
+    const std::vector<int64_t> two{5000};
+    int64_t trim2 = -1;
+    check(pi::mlp_start_in_block(two, kNormOff, H, &trim2) == 5000 + 64 + H * 2 && trim2 == 0,
+          "mlp start: a 2-header block keeps its only in-block header");
+}
+
 void test_attn_payload_off() {
     check(pi::attn_payload_off(896) == 1856,
           "attn off: hidden 896 is the 1,856 the importer shipped with (64 + 2 x 896)");
@@ -7055,6 +7083,7 @@ int main(int argc, char** argv) {
         test_mlp_gu(golden_dir);
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_fconst_variable_stride(golden_dir.empty() ? "." : golden_dir);
+        test_mlp_start_in_block();
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_use_qk_norm_declaration(golden_dir.empty() ? "." : golden_dir);

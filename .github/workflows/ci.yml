@@ -71,7 +71,14 @@ jobs:
             if apt-get update &&
                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git \
                  python3 python3-venv curl jq file procps make gcc-16 g++-16 cmake ninja-build libcurl4-openssl-dev \
-                 libzstd-dev libssl-dev libdrm-dev libpcre2-dev; then
+                 libzstd-dev libssl-dev libdrm-dev libpcre2-dev \
+                 binutils patchelf; then
+              # `patchelf` and `readelf` are installed for one test: `installed_rpath` builds ELFs with a chosen RUNPATH
+              # and checks that a path leaving $ORIGIN is caught. It exits 77 without them and `ctest_skips.py` then
+              # reports it as a NEW SKIP -- which is how this became visible: before #2758 the skip exited 0, i.e. it
+              # read as a PASS and the check never ran in CI at all (engine#2761's shape, one file over). Baselining it
+              # in tools/ci/ctest_skips.txt would hide the hazard the test exists to catch, so it gets its fixture
+              # instead: with both present it runs in the build job and its four arms are real.
               ok=1; break
             fi
             echo "apt attempt $attempt failed (mirror 404 is a known transient, engine#1814); retrying in $((attempt * 15))s"

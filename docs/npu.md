@@ -1851,6 +1851,21 @@ With `config.json` empty, the model's numbers come from the pack itself:
 On the NPU, the result is "The capital of France is Paris.", "12 * 7 = 84" and "Neil Armstrong ... July 20, 1969"
 (all stop, 3.9-5.0 tok/s).
 
+The rewritten copy is then located from the same arithmetic, not by the epsilon vote (engine#2650). The vote's anchor
+is 12 bytes, epsilon then 10 zeros, and that pattern can occur inside 4-bit tiles. On
+`Phi-3-mini-4k-instruct-onnx-ryzenai-npu` one occurs 16,232,526 B into block 0, and the vote took it as the second
+header. The pack was refused on 320 tensors, although its rewrite was right: Phi-3.5-mini and Phi-3-mini-128k have the
+identical layout and read with 0 gaps. Phi-4-mini (320) and Qwen2-7B (280) were refused the same way. The rewrite
+wrote every header, so the locator only checks that each one is where it was put, and refuses the copy by block when
+one is not. When the same process wrote the copy, the stride the writer measured from its own offsets (#2653) is a
+second witness: the arithmetic and the measurement must agree, or the pack is refused naming both.
+
+The export can also zero-pad the head (engine#2650). `CodeLlama-7b-Instruct-hf-onnx-ryzenai-npu` (vocab 32,016, so
+501 head tiles, the last holding 16 rows) carries 515 more tiles of zeros after the head. That is 1,016 tiles, 65,024
+rows, while its 32 layer blocks sit exactly where the arithmetic puts them. The size gate therefore also takes whole
+head tiles after the head, up to 65,536 padded head rows. The rewrite drops them, and only once every padding byte is
+checked to be zero; with one non-zero byte the file is not rewritten.
+
 The **gate/up unit** is the head's unit with 64 row *slots* per strip instead of 32 rows: 4,864
 zero bytes, then `2 x (K/32)` strips of 1,216 B. Strip `s` holds K block `s/2`; slots 0..31 are
 `gate_proj` rows `32 x (s%2) .. +31` of the unit and slots 32..63 are the same rows of `up_proj`.

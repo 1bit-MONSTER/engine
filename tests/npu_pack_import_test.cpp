@@ -487,6 +487,32 @@ void test_fconst17_rewrite() {
     put_file(tokx, f17 + std::string(64, '\0'));
     check(pi::canonical_token_fconst17_exported(tokx, dir.string(), d, work + ".3") == tokx,
           "1.7 fconst: a file that does not fit the arithmetic is not rewritten");
+    // engine#2650: a head padded with whole zero tiles (CodeLlama-7b-Instruct: 515 after 501) rewrites to the same 1.8
+    // stream; the same padding with one non-zero byte, or padding past 65,536 head rows, is not taken for this form
+    {
+        check(pi::fconst17_geometry_exported(f17.size() + 3 * T, d).empty(), "1.7 fconst: whole zero tiles after the head fit");
+        const std::string tokp = (dir / "padded.fconst").string();
+        put_file(tokp, f17 + std::string(size_t(3 * T), '\0'));
+        std::string outp, saidp;
+        try {
+            const std::string gotp = pi::canonical_token_fconst17_exported(tokp, dir.string(), d, work + ".p");
+            check(gotp == work + ".p", "1.7 fconst: a zero-padded head is rewritten");
+        } catch (const std::exception& e) { saidp = e.what(); }
+        {
+            std::ifstream f(work + ".p", std::ios::binary);
+            outp.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        check(saidp.empty() && outp == f18, "1.7 fconst: the zero-padded head rewrites to the 1.8 stream byte for byte (" +
+                                               std::to_string(outp.size()) + " B, " + saidp + ")");
+        std::string nz = f17 + std::string(size_t(3 * T), '\0');
+        nz[nz.size() - 7] = 1;
+        const std::string tokn = (dir / "padded-nz.fconst").string();
+        put_file(tokn, nz);
+        check(pi::canonical_token_fconst17_exported(tokn, dir.string(), d, work + ".n") == tokn,
+              "1.7 fconst: padding with a non-zero byte is not rewritten");
+        check(!pi::fconst17_geometry_exported(f17.size() + 1024 * T, d).empty(),
+              "1.7 fconst: padding past 65,536 head rows does not fit");
+    }
     // the graph's RMSNorm epsilon (a node with a float attribute), read back
     std::string node, attr;
     pb::str(node, 4, "SimplifiedLayerNormalization");
@@ -531,6 +557,67 @@ void test_fconst17_rewrite() {
           "1.7 fconst: agreeing nodes give their eps, with a note");
     const float stated = pi::graph_eps_decision(true, 1e-6f, 18, false, 1e-5f, &msg);
     check(stated == 1e-6f && msg.empty(), "1.7 fconst: a stated config.json eps wins, silently");
+    fs::remove_all(dir);
+}
+
+// engine#2650: the canonical copy of a 1.7 headerless pack is located from the rewrite's arithmetic, not by the epsilon
+// vote. A 12-byte anchor (epsilon + 10 zeros) planted inside block 0's q tiles fools the vote -- the control -- and the
+// importer's locator still gives the exact stride and second header.
+void test_fconst17_known_geometry() {
+    pi::Dims d;
+    d.hidden = 128, d.intermediate = 256, d.layers = 3, d.heads = 2, d.kv_heads = 1, d.head_dim = 64, d.vocab = 64;
+    d.model_type = "llama";
+    d.rms_norm_eps = 1e-5f;
+    d.eps_bits = pi::bf16_bits_of(1e-5f);
+    const int64_t H = 128, T = pi::attn_tile_bytes(H), nq = 2, nkv = 1, no = 2;
+    const int64_t gu = (256 / 64) * pi::group_bytes(H, 128), down = (H / 64) * pi::group_bytes(256, 64), head = T;
+    uint32_t seed = 777;
+    const auto rnd = [&](int64_t n) {
+        std::string b(size_t(n), '\0');
+        for (auto& ch : b) { seed = seed * 1103515245u + 12345u; ch = char((seed >> 16) | 1); }   // never 0: no anchors
+        return b;
+    };
+    std::string f17;
+    for (int L = 0; L < 3; ++L) f17 += rnd(nq * T) + rnd(nkv * T) + rnd(nkv * T) + rnd(no * T) + rnd(2 * H) + rnd(gu) + rnd(down) + rnd(2 * H);
+    f17 += rnd(head);
+    // the coincidence: epsilon then 10 zeros, 1000 B into q's first tile of block 0
+    f17[1000] = char(d.eps_bits & 0xFF), f17[1001] = char(d.eps_bits >> 8);
+    for (int i = 2; i < 12; ++i) f17[size_t(1000 + i)] = '\0';
+    check(pi::fconst17_geometry_exported(f17.size(), d).empty(), "known geometry: the synthetic 3-layer stream fits");
+    const fs::path dir = fs::temp_directory_path() / ("fconst17kg." + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string tok = (dir / "dd_metastate_Llm_Token_MatMulNBits_2_0.fconst").string();
+    put_file(tok, f17);
+    std::vector<uint16_t> g0(static_cast<size_t>(H), uint16_t(15 << 10));   // fp16 1.0
+    put_file((dir / "genai_config.json").string(), R"({"model":{"decoder":{"filename":"fusion.onnx"}}})");
+    put_file((dir / "fusion.onnx.data").string(), std::string(reinterpret_cast<const char*>(g0.data()), g0.size() * 2));
+    put_file((dir / "fusion.onnx").string(),
+             pb::model({pb::tensor("model.layers.0.input_layernorm.weight", {H}, "fusion.onnx.data", 0, uint64_t(2 * H), 10)}, {}));
+    const std::string work = (dir / "canonical.fconst").string();
+    std::string said;
+    try { (void)pi::canonical_token_fconst17_exported(tok, dir.string(), d, work); } catch (const std::exception& e) { said = e.what(); }
+    const int64_t env = 64 + 2 * H, payload = (nq + 2 * nkv) * T + no * T;
+    const int64_t h1 = env + payload, stride = env + payload + env + gu + 64 + down;
+    const pi::FconstGeom vote = pi::locate_fconst(work, d.eps_bits);
+    check(said.empty() && vote.h1 != h1, "known geometry: the planted anchor fools the epsilon vote (h1 " +
+                                             std::to_string(vote.h1) + " vs " + std::to_string(h1) + ") -- the control");
+    const pi::FconstGeom g = pi::locate_fconst_with_header_exported(work, dir.string(), d);
+    check(g.stride == stride && g.h1 == h1 && g.hdr.size() == 1 && g.why.empty(),
+          "known geometry: the canonical copy is located from the rewrite's arithmetic (stride " +
+              std::to_string(g.stride) + ", h1 " + std::to_string(g.h1) + ", " + g.why + ")");
+    // a copy whose headers are not where the rewrite put them is refused, not located some other way
+    {
+        std::string bad;
+        std::ifstream f(work, std::ios::binary);
+        bad.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        bad[size_t(stride + h1)] = 0;   // block 1's second header
+        const std::string work2 = (dir / "canonical-bad.fconst").string();
+        put_file(work2, bad);
+        const pi::FconstGeom gb = pi::locate_fconst_with_header_exported(work2, dir.string(), d);
+        check(gb.stride == 0 && gb.why.find("block 1") != std::string::npos,
+              "known geometry: a header missing from the copy is refused by block (" + gb.why + ")");
+    }
     fs::remove_all(dir);
 }
 
@@ -7286,6 +7373,7 @@ int main(int argc, char** argv) {
     test_rope_cache_best_theta();
     test_rope_cache_llama3();
     test_fconst17_rewrite();
+    test_fconst17_known_geometry();
     test_external_to_container();
     test_external_roles();
     test_external_container_names();

@@ -996,6 +996,9 @@ std::string fconst17_geometry_exported(uint64_t size, const Dims& d);
 // The 1.8 form of such a file written to `work` (returns `work`), or `path` unchanged when it is not in that form.
 std::string canonical_token_fconst17_exported(const std::string& path, const std::string& pack_dir, const Dims& d,
                                               const std::string& work);
+// engine#2650: where the importer puts the layer blocks of `tok` (the Token .fconst it reads -- for a 1.7 headerless pack,
+// the canonical copy), given the pack directory it came from.
+FconstGeom locate_fconst_with_header_exported(const std::string& tok, const std::string& pack_dir, const Dims& dims);
 // engine#2650: the block stride and head size that the 1.7 rewrite above actually WROTE for `pack_dir` (measured from the
 // writer's own offsets), or 0 when this process did not rewrite that pack. The reader prefers these over the epsilon vote,
 // which loses when a 12-byte anchor occurs inside a 4-bit tile.

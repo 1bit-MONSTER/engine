@@ -23,6 +23,10 @@
 
 set -uo pipefail
 
+# The tool needs `onnx`; the CI image does not install it, so this is a SKIP there rather than a red build
+# (the same 77 the C++ device tests use). Everything the fold does is still checked wherever onnx is present.
+python3 -c "import onnx, numpy" 2>/dev/null || { echo "SKIP: python onnx module not installed"; exit 77; }
+
 TOOL=${1:-$(dirname "$0")/../tools/fold_initializer_transpose.py}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/foldtest.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT

@@ -964,6 +964,7 @@ namespace {
 struct Geom17Known {
     int64_t stride = 0;   // bytes per layer block in the canonical copy, measured from the writer's own offsets
     int64_t head = 0;     // the trailing head block
+    int64_t tail = 0;     // everything after the last layer block: a 64-byte header, the final norm, the head block
 };
 std::map<std::string, Geom17Known> g_geom17_by_pack;
 }  // namespace
@@ -1038,9 +1039,11 @@ std::string canonical_token_fconst17(const std::string& path, const std::string&
         o.write(sep, 64);
         put(b + g.payload + 2 * H + g.gu, g.down);
     }
+    const std::streampos tail0 = o.tellp();
     o.write(hdr, 64);
     put(fc.map + size_t(d.layers) * size_t(g.stride) - size_t(2 * H), 2 * H);   // the final norm
     put(fc.map + size_t(d.layers) * size_t(g.stride), g.head);
+    g_geom17_by_pack[pack_dir].tail = int64_t(o.tellp() - tail0);   // measured, so the test need not model it
     o.close();
     unmap_file(fc.map, fc.size);
     if (!o) throw std::runtime_error("writing " + work + " failed");
@@ -1976,7 +1979,6 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
     // writer's own offsets, and the epsilon vote is the weaker witness (a 12-byte anchor occurs inside 4-bit tiles: measured
     // 16,232,526 B into block 0 of Phi-3-mini-4k, at an offset that is not even 64-aligned, which cost 320 gaps).
     if (const auto it = g_geom17_by_pack.find(pack_dir); it != g_geom17_by_pack.end() && it->second.stride > 0) {
-        {
         std::string why;
         const int64_t agreed = fconst17_reconcile(g.stride, it->second.stride, &why);
         if (agreed == 0) {   // two witnesses that disagree: refuse naming both (see fconst17_reconcile)
@@ -7847,6 +7849,10 @@ int64_t fconst17_reconcile_exported(int64_t vote, int64_t recorded, std::string*
 int64_t fconst17_known_stride_exported(const std::string& pack_dir) {
     const auto it = g_geom17_by_pack.find(pack_dir);
     return it == g_geom17_by_pack.end() ? 0 : it->second.stride;
+}
+int64_t fconst17_known_tail_exported(const std::string& pack_dir) {
+    const auto it = g_geom17_by_pack.find(pack_dir);
+    return it == g_geom17_by_pack.end() ? 0 : it->second.tail;
 }
 int64_t fconst17_known_head_exported(const std::string& pack_dir) {
     const auto it = g_geom17_by_pack.find(pack_dir);

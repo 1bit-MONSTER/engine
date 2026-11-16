@@ -446,8 +446,9 @@ void test_fconst17_rewrite() {
         const int64_t hd = pi::fconst17_known_head_exported(dir.string());
         check(st > 0, "1.7 rewrite: the block stride it wrote is recorded");
         const auto sz = std::filesystem::file_size(work);
-        check(int64_t(sz) == int64_t(d.layers) * st + hd,
-              "1.7 rewrite: layers x recorded stride + head is the copy's exact size");
+        const int64_t tl = pi::fconst17_known_tail_exported(dir.string());
+        check(int64_t(sz) == int64_t(d.layers) * st + tl,
+              "1.7 rewrite: layers x recorded stride + measured tail is the copy's exact size");
 
         // engine#2650 review: the REFUSAL is the branch a later edit is most likely to relax ("helpfully" preferring the
         // recorded value would pass every other arm and reintroduce the failure in the other direction), so pin it directly.

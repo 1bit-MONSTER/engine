@@ -2712,18 +2712,19 @@ void test_block32_layers(const std::string& root) {
         e[0] = char(0x86), e[1] = char(0x35);   // bf16 1e-06
         return e + norm_bytes(which);
     };
-    const auto fconst = [&](bool form18 = false) {
+    const auto fconst = [&](bool form18 = false, bool k_first = true) {
         std::string fc;
         for (int l = 0; l < LAYERS; ++l) {
             const auto& m = [&](int i) -> const std::vector<float>& { return mats[size_t(l * NPROJ + i)]; };
             fc += envelope(10 * l + 1);
-            if (form18)   // engine#2594: the 1.8 writer puts k_proj first and writes no sink field
+            if (form18 && k_first)   // engine#2594: the 1.8 writer puts k_proj first and writes no sink field
                 fc += encode_block32_units(m(K_), NKV, H) + encode_block32_units(m(Q), NQ, H) +
                       encode_block32_units(m(V_), NKV, H);
             else
                 fc += encode_block32_units(m(Q), NQ, H) + encode_block32_units(m(K_), NKV, H) +
                       encode_block32_units(m(V_), NKV, H) +
-                      std::string(4 * 2, '\x7f');   // 4 x heads bytes that are not a weight (not read)
+                      (form18 ? std::string()   // 5q: 1.8 size, q first (not a real writer)
+                              : std::string(4 * 2, '\x7f'));   // 4 x heads bytes that are not a weight (not read)
             fc += encode_block32_units(m(O), H, NQ);
             fc += envelope(10 * l + 2);
             fc += encode_block32_gate_up(m(G), m(U), IM, H);
@@ -2910,6 +2911,43 @@ void test_block32_layers(const std::string& root) {
                   "all-block-32, 1.8 form: lm_head is the tail's head");
         } else {
             check(false, "all-block-32, 1.8 form: the container was written");
+        }
+        fs::remove_all(out);
+        fs::remove_all(dir);
+    }
+    {   // 5q (engine#2594 review): the import's own checks cannot see a q/k swap. A 1.8-sized file with q first plans
+        // as the 1.8 form, imports with nothing refused, and its tied head still verifies -- only the per-tensor check
+        // against the source matrices catches it. This is the 2/64-on-device bug of the first fix, as a unit test.
+        const fs::path dir = build("b32-qfirst", fconst(true, false), true);
+        const std::string out = out_of("qfirst");
+        fs::remove_all(out);
+        pi::Report r;
+        std::string said;
+        try {
+            const pi::Plan p = pi::plan(dir.string());
+            check(p.block32_form18 && p.block32_note.empty() && p.refused().empty(),
+                  "q/k swap: a 1.8-sized q-first file plans as the 1.8 form with nothing refused (" + p.block32_note +
+                      ")");
+            r = pi::import_pack(dir.string(), out, pi::Options{});
+        } catch (const std::exception& e) {
+            said = e.what();
+        }
+        check(said.empty() && r.refused.empty() && r.selfcheck_tied && r.lmhead_corr > 0.99,
+              "q/k swap: the import passes its own checks, the tied head included (corr " +
+                  std::to_string(r.lmhead_corr) + ") -- they are blind to it");
+        if (fs::exists(out + "/model.q4nx")) {
+            const json tbl = container_table(out + "/model.q4nx");
+            const std::vector<uint8_t> blob = container_payload(out + "/model.q4nx");
+            const int cols = std::min(H, onebit::npu::q4nx::kCols);
+            const std::vector<float> q = tile0(tbl, blob, "model.layers.0.self_attn.q_proj.weight", cols),
+                                     k = tile0(tbl, blob, "model.layers.0.self_attn.k_proj.weight", cols);
+            const double cq = q.empty() ? 1.0 : ncorr(q, head_of(mats[size_t(Q)], H, cols)),
+                         ck = k.empty() ? 1.0 : ncorr(k, head_of(mats[size_t(K_)], H, cols));
+            check(std::fabs(cq) < 0.3 && std::fabs(ck) < 0.3,
+                  "q/k swap: only the per-tensor check sees it (q corr " + std::to_string(cq) + ", k corr " +
+                      std::to_string(ck) + ")");
+        } else {
+            check(false, "q/k swap: the container was written");
         }
         fs::remove_all(out);
         fs::remove_all(dir);

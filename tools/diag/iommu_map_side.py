@@ -81,6 +81,31 @@ def classify(fn):
         return "map"
     return "other"
 FAULT = re.compile(r"^\[\s*(\d+\.\d+)\].*IO_PAGE_FAULT.*address=(0x[0-9a-f]+)")
+# The IOMMU's OWN tracepoints (engine#2678): `/sys/kernel/tracing/events/iommu/{map,unmap,io_page_fault}`.
+# The class is the EVENT NAME, so this form needs no classifier at all -- which is why it is the better
+# capture: a kprobe is a convention the text only half-satisfies, an event name is the kernel's statement.
+#   wget-1394013 [012] .... 34862.494190: map: IOMMU: iova=0x3d207000 - 0x3d208000 paddr=0x187168a000 size=4096
+#   irq/26-AMD-Vi-265 [003] .... 34226.857983: io_page_fault: IOMMU:nvme 0000:c4:00.0 iova=0xe5356000 flags=0x0000
+TP_EVENT = re.compile(r"(\d+\.\d+):\s+(map|unmap|io_page_fault):\s+IOMMU:\s*(.*)$")
+TP_IOVA = re.compile(r"iova=(0x[0-9a-f]+)")
+TP_SIZE = re.compile(r"size=(0x[0-9a-f]+|\d+)")
+TP_RANGE = re.compile(r"iova=(0x[0-9a-f]+)\s*-\s*(0x[0-9a-f]+)")
+
+
+def _tp(event, rest):
+    """(t, iova, size) from a tracepoint event body, or None when it carries no iova."""
+    mi = TP_IOVA.search(rest)
+    if not mi:
+        return None
+    iova = int(mi.group(1), 16)
+    ms = TP_SIZE.search(rest)
+    if ms:
+        raw = ms.group(1)
+        size = int(raw, 16) if raw.startswith("0x") else int(raw)
+    else:
+        mr = TP_RANGE.search(rest)
+        size = (int(mr.group(2), 16) - iova) if mr else 0
+    return iova, size
 
 
 def parse_events(path):
@@ -94,6 +119,14 @@ def parse_events(path):
         for line in fh:
             m = EVENT.search(line)
             if not m:
+                tp = TP_EVENT.search(line)
+                if tp:
+                    got = _tp(tp.group(2), tp.group(3))
+                    if got and tp.group(2) == "map":
+                        maps.append((float(tp.group(1)), got[0], got[1]))
+                    elif got and tp.group(2) == "unmap":
+                        unmaps.append((float(tp.group(1)), got[0], got[1]))
+                    continue
                 loose = IOVA_LINE.search(line)
                 if loose:
                     other[loose.group(1)] += 1
@@ -123,6 +156,12 @@ def parse_faults(path):
             m = FAULT.match(line)
             if m:
                 out.append((float(m.group(1)), int(m.group(2), 16)))
+                continue
+            tp = TP_EVENT.search(line)
+            if tp and tp.group(2) == "io_page_fault":
+                got = _tp(tp.group(2), tp.group(3))
+                if got:
+                    out.append((float(tp.group(1)), got[0]))
     return out
 
 
@@ -322,6 +361,25 @@ def self_test() -> int:
         # a fault outside the buffered range is named as such, not silently correlated
         rows3, _ = analyse(maps, unmaps, [(9000.0, 0x4128000)], [], [(9000.0, 0x4128000)])
         chk("OUTSIDE the buffered range" in rows3[0][2], "a fault the ring does not cover says so")
+        # 2e. the IOMMU's own tracepoints (engine#2678): the event name IS the class, and the fault carries
+        #     `iova=` where journalctl's IO_PAGE_FAULT carries `address=`. Both forms must read the same way.
+        tp = pathlib.Path(td) / "tp.txt"
+        tp.write_text(
+            "wget-1394013 [012] .... 34862.494190: map: IOMMU: iova=0x3d207000 - 0x3d208000 paddr=0x187168a000 size=4096\n"
+            "wget-1394013 [012] .... 34862.494290: unmap: IOMMU: iova=0x3d207000 size=4096\n"
+            "irq/26-AMD-Vi-265 [003] .... 34862.494250: io_page_fault: IOMMU:nvme 0000:c4:00.0 iova=0x3d207000 flags=0x0000\n"
+            "wget-1394013 [012] .... 34862.494300: map: IOMMU: iova=0x4e000000 size=0x1000\n")
+        m7, u7, o7, w7 = parse_events(str(tp))
+        chk(len(m7) == 2 and len(u7) == 1 and o7 == {} and w7 == {},
+            "tracepoint map/unmap parse by EVENT NAME, nothing unrecognised (2 map, 1 unmap) -- %s %s" % (o7, w7))
+        chk(m7[0][2] == 4096 and m7[1][2] == 4096,
+            "tracepoint size parses from size= and from size=0x1000 (%d, %d)" % (m7[0][2], m7[1][2]))
+        f7 = parse_faults(str(tp))
+        chk(f7 == [(34862.49425, 0x3D207000)], "tracepoint io_page_fault parses its iova (not journalctl's address=)")
+        rows7, hdr7 = analyse(m7, u7, f7, [], f7)
+        chk(len(rows7) == 1 and "nearest map" in rows7[0][2],
+            "a tracepoint capture correlates: %s" % (rows7[0][2][:70] if rows7 else "no rows"))
+
         # 3. the ASSEMBLY: main() is what a lane runs, and until this arm nothing exercised it end to end --
         #    the exit code and the header shape of a one-sided capture were asserted only piecewise.
         import contextlib

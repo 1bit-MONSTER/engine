@@ -439,6 +439,12 @@ kill_tree() {
 # The environment is the detector that does not depend on the tree: every process the payload started INHERITED this
 # ticket's GPU_HOLD_TICKET, whatever it did to its parentage, session or group. So after the teardown, any live process
 # still carrying this exact ticket line is work this ticket started and did not end.
+#
+# This is a detector, not an enforcement of the promise, and the boundary is worth naming: a payload that also scrubs
+# its environment (`env -i`, `unset GPU_HOLD_TICKET`) starts work that carries no ticket line, and nothing here would
+# see it. For that case the `.gpu-hold-survivors` file and the next holder's #1639 warning are the backstop -- so is
+# the memory floor's other side, a lane that reads GTT before it takes a ticket. A reader deciding whether to trust the
+# teardown line should read it as "no escapee that kept its environment", not as "no escapee".
 env_survivors() {   # <exact ticket line> -> pids carrying it, excluding this shell and any nested holder
     local want=$1 d p line cmd first second
     ENV_UNREADABLE=0

@@ -83,6 +83,28 @@ static const char* role_tag(Q4nxDesign r) {
 // The forward's own probe, kept identical (exists and non-empty): an ELF that is present but zero bytes
 // is the failure this catches, and a target that decided differently from its caller would be a second
 // definition of "the kernel is there".
+// engine#2599: is the prefill ELF the very same artifact as its M=16 decode twin?  bonsai2-27b-NPU ships
+// kernels/full_i8_<ROLE>_K*_N*.elf byte-identical (md5) to the matching _m16.elf, i.e. its "prefill" set IS the
+// 16-row design.  Nothing in the artifact says how many rows it computes (its declared widths are per-tile, and a
+// narrower declared width than the buffer is legal), so a context sized from the design geometry (M=128) chunked the
+// prompt at 128 rows and the kernel computed the first 16 of each: 112 rows of every chunk came back as 0.  Equal size
+// and equal bytes is the evidence; anything else (a real M=128 build, or no twin in the directory) changes nothing.
+static bool same_artifact(const std::string& a, const std::string& b) {
+    std::ifstream fa(a, std::ios::binary | std::ios::ate), fb(b, std::ios::binary | std::ios::ate);
+    if (!fa || !fb) return false;
+    const std::streamoff na = fa.tellg(), nb = fb.tellg();
+    if (na <= 0 || na != nb) return false;
+    fa.seekg(0); fb.seekg(0);
+    std::vector<char> ba(1 << 16), bb(1 << 16);
+    for (std::streamoff left = na; left > 0;) {
+        const std::streamsize n = (std::streamsize)std::min<std::streamoff>(left, (std::streamoff)ba.size());
+        if (!fa.read(ba.data(), n) || !fb.read(bb.data(), n)) return false;
+        if (std::memcmp(ba.data(), bb.data(), (size_t)n) != 0) return false;
+        left -= n;
+    }
+    return true;
+}
+
 static bool elf_present(const std::string& p) {
     FILE* f = std::fopen(p.c_str(), "rb");
     if (!f) return false;
@@ -163,16 +185,29 @@ bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string&
             err = "cannot create a context for role " + std::to_string(i);
             return false;
         }
-        ctx->MD = g->M; ctx->KD = g->K; ctx->ND = g->N;
+        int md = g->M;
+        {
+            std::string twin(g->elf_name);
+            if (twin.size() > 4 && twin.compare(twin.size() - 4, 4, ".elf") == 0) twin.resize(twin.size() - 4);
+            twin = dir + "/" + twin + "_m16.elf";
+            if (md > Q4NX_DESIGN_M_DECODE && same_artifact(elf, twin)) {
+                md = Q4NX_DESIGN_M_DECODE;
+                prefill_is_decode_design_ = true;
+                std::fprintf(stderr, "  [forward] %-3s %s is byte-identical to its _m16 twin: it is the %d-row design, so "
+                                     "this role launches %d rows at a time, not %d (engine#2599)\n",
+                             q4nx_design_log_tag(g->role), g->elf_name, md, md, g->M);
+            }
+        }
+        ctx->MD = md; ctx->KD = g->K; ctx->ND = g->N;
         ctx->blocked_b = b8;
-        if (!ctx->init_elf(*dev_, elf.c_str(), g->M, g->K, g->N, 1)) {
+        if (!ctx->init_elf(*dev_, elf.c_str(), md, g->K, g->N, 1)) {
             // engine#2434: carry the runtime's reason, so a refused context ("code 102 ... No such device") reaches
             // open_with_retry's queue test and the lock-holder note instead of reading as a generic init failure.
             err = "I8Ctx init_elf failed for " + elf + (ctx->init_error.empty() ? "" : ": " + ctx->init_error);
             return false;
         }
         std::fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s\n", q4nx_design_log_tag(g->role),
-                     g->M, g->K, g->N, elf.c_str());
+                     md, g->K, g->N, elf.c_str());
     }
     return true;
 }
@@ -208,7 +243,10 @@ bool XdnaTarget::open(const onebit::npu::plan::Plan& plan, const std::string& ke
         if (ctx_[i] && ctx_[i]->MD > adopted_prefill) adopted_prefill = ctx_[i]->MD;
         if (ctx16_[i] && ctx16_[i]->MD > adopted_decode) adopted_decode = ctx16_[i]->MD;
     }
-    if (plan_.prefill_m > 0 && adopted_prefill > 0 && plan_.prefill_m != adopted_prefill)
+    // engine#2599: a pack whose "prefill" ELFs are byte-identical to the decode twins states the design geometry's M in
+    // its plan (bonsai2-27b-NPU: prefill.M = 128) but its kernels compute 16 rows; open_prefill() said so by name, and
+    // launching at the kernel's real width is the fix, not a disagreement with the plan.
+    if (plan_.prefill_m > 0 && adopted_prefill > 0 && plan_.prefill_m != adopted_prefill && !prefill_is_decode_design_)
         { err = "plan: prefill M=" + std::to_string(plan_.prefill_m) + " but the adopted kernels run M=" +
                 std::to_string(adopted_prefill); return false; }
     if (plan_.decode_enabled && plan_.decode_m > 0 && adopted_decode > 0 &&

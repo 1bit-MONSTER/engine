@@ -448,6 +448,23 @@ void test_fconst17_rewrite() {
         const auto sz = std::filesystem::file_size(work);
         check(int64_t(sz) == int64_t(d.layers) * st + hd,
               "1.7 rewrite: layers x recorded stride + head is the copy's exact size");
+
+        // engine#2650 review: the REFUSAL is the branch a later edit is most likely to relax ("helpfully" preferring the
+        // recorded value would pass every other arm and reintroduce the failure in the other direction), so pin it directly.
+        {
+            std::string why;
+            check(pi::fconst17_reconcile_exported(0, 200, &why) == 200 && why.empty(),
+                  "reconcile: a failed vote yields to the rewrite's measurement");
+            check(pi::fconst17_reconcile_exported(200, 200, &why) == 200 && why.empty(),
+                  "reconcile: two witnesses that agree keep the stride");
+            check(pi::fconst17_reconcile_exported(100, 0, &why) == 100 && why.empty(),
+                  "reconcile: no rewrite record leaves the vote alone (the 1.8 / R1-Distill line)");
+            why.clear();
+            check(pi::fconst17_reconcile_exported(100, 200, &why) == 0,
+                  "reconcile: disagreement REFUSES rather than choosing");
+            check(why.find("100") != std::string::npos && why.find("200") != std::string::npos,
+                  "reconcile: the refusal names both numbers");
+        }
     }
     } catch (const std::exception& e) {
         said = e.what();

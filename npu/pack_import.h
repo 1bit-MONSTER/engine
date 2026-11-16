@@ -1000,6 +1000,9 @@ std::string canonical_token_fconst17_exported(const std::string& path, const std
 // writer's own offsets), or 0 when this process did not rewrite that pack. The reader prefers these over the epsilon vote,
 // which loses when a 12-byte anchor occurs inside a 4-bit tile.
 int64_t fconst17_known_stride_exported(const std::string& pack_dir);
+// The two-witness decision itself (engine#2650 review): the stride to use, or 0 with `why` naming both when the epsilon
+// anchors and the rewrite's measurement disagree. Pure, so a test pins the refusal directly.
+int64_t fconst17_reconcile_exported(int64_t vote, int64_t recorded, std::string* why);
 int64_t fconst17_known_head_exported(const std::string& pack_dir);
 // The epsilon the graph's RMSNorm nodes state (0 when none), how many state it, and whether two disagree.
 float graph_norm_eps_exported(const std::string& onnx_path, int* nodes, bool* conflict);

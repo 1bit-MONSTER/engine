@@ -1956,22 +1956,36 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
 // with "the epsilon headers do not repeat with a single period" while its own header reported the stride exactly.
 // So ask the header first on the SOURCE file (the canonical copy has the 1.9 header removed by construction), and keep the eps
 // vote as the fallback for packs with no 1.9 header -- the 1.8 / R1-Distill line, where it works today.
+// engine#2650 review: the two-witness decision as a pure function, so a test can pin the REFUSAL without a fixture that has
+// to lie about its own geometry. `vote` is the epsilon anchors' stride (0 when they failed); `recorded` is what the 1.7
+// rewrite measured while writing. Returns the stride to use, or 0 with `why` naming both numbers when they disagree -- a
+// wrong stride reads weights from the wrong place instead of failing cleanly, so a disagreement is refused, never tie-broken.
+int64_t fconst17_reconcile(int64_t vote, int64_t recorded, std::string* why) {
+    if (recorded <= 0) return vote;
+    if (vote != 0 && vote != recorded) {
+        *why = "the 1.7 rewrite produced stride " + std::to_string(recorded) + " and the epsilon anchors give " +
+               std::to_string(vote) + "; refusing rather than choosing";
+        return 0;
+    }
+    return recorded;
+}
+
 FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& pack_dir, const Dims& dims) {
     FconstGeom g = locate_fconst(tok, dims.eps_bits);
     // engine#2650: if this process rewrote the pack from its 1.7 headerless form, the stride of the copy is known from the
     // writer's own offsets, and the epsilon vote is the weaker witness (a 12-byte anchor occurs inside 4-bit tiles: measured
     // 16,232,526 B into block 0 of Phi-3-mini-4k, at an offset that is not even 64-aligned, which cost 320 gaps).
     if (const auto it = g_geom17_by_pack.find(pack_dir); it != g_geom17_by_pack.end() && it->second.stride > 0) {
-        if (g.stride != 0 && g.stride != it->second.stride) {
-            // Two witnesses that disagree. They cannot both be right, and a wrong stride reads weights from the wrong
-            // place instead of failing cleanly -- so refuse naming both, as the 1.9 header path already does.
-            g.why = "the 1.7 rewrite produced stride " + std::to_string(it->second.stride) +
-                    " and the epsilon anchors give " + std::to_string(g.stride) + "; refusing rather than choosing";
+        {
+        std::string why;
+        const int64_t agreed = fconst17_reconcile(g.stride, it->second.stride, &why);
+        if (agreed == 0) {   // two witnesses that disagree: refuse naming both (see fconst17_reconcile)
+            g.why = why;
             g.stride = 0;
             return g;
         }
         if (g.stride == 0) g.why.clear();     // the vote failed; the rewrite's own measurement is the answer
-        g.stride = it->second.stride;
+        g.stride = agreed;
     }
     // engine#2604: the 1.8 gemma3 6-header form -- per-layer starts from every header, not one stride. Only on a file with
     // no 1.9 header (below, a 6-header 1.9 block is refused by name).
@@ -7827,6 +7841,9 @@ std::string fconst17_geometry_exported(uint64_t size, const Dims& d) {
 }
 // engine#2650: what the 1.7 rewrite recorded for this pack (0 when it did not rewrite one). Exported so a test can check it
 // against the file the writer produced rather than against the same arithmetic that produced it.
+int64_t fconst17_reconcile_exported(int64_t vote, int64_t recorded, std::string* why) {
+    return fconst17_reconcile(vote, recorded, why);
+}
 int64_t fconst17_known_stride_exported(const std::string& pack_dir) {
     const auto it = g_geom17_by_pack.find(pack_dir);
     return it == g_geom17_by_pack.end() ? 0 : it->second.stride;

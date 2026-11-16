@@ -141,6 +141,15 @@ with tempfile.TemporaryDirectory() as tmp:
     left = os.listdir(os.path.join(tmp, "dl2"))
     check(rc == 1 and left == [], f"a fetch of other bytes is refused and leaves nothing (rc {rc}, left {left})")
 
+    # 4b. a non-LFS pin is fetched and verified by its git blob id (streamed), and refused when the bytes differ.
+    rc = M.main(["--pins", pf, "--fetch", "up/Good-GGUF", "tokenizer_config.json", "--dest", os.path.join(tmp, "dlt")])
+    check(rc == 0 and open(os.path.join(tmp, "dlt", "tokenizer_config.json"), "rb").read() == TEXT,
+          f"a non-LFS fetch verifies by blob id (rc {rc})")
+    SERVED[("up/Good-GGUF", "tokenizer_config.json")] = TEXT + b" "
+    rc = M.main(["--pins", pf, "--fetch", "up/Good-GGUF", "tokenizer_config.json", "--dest", os.path.join(tmp, "dlt2")])
+    check(rc == 1 and os.listdir(os.path.join(tmp, "dlt2")) == [], f"a changed non-LFS fetch is refused (rc {rc})")
+    SERVED[("up/Good-GGUF", "tokenizer_config.json")] = TEXT
+
     # 5. a partial download resumes and the hash covers the bytes already on disk.
     d3 = os.path.join(tmp, "dl3")
     os.makedirs(d3)

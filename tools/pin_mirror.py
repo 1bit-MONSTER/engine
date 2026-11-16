@@ -29,7 +29,8 @@ Everything here is anonymous: the public listing and download need no token, and
             records a git blob id, which a sha256 cannot be compared with, so a small text file is downloaded
             (<= 1 MiB) and its blob id computed.
   --fetch   download one pinned file from the mirror into DIR, hashing while it streams; the file is moved into
-            place only if its sha256 is the pin's oid, and deleted otherwise. A partial download resumes.
+            place only if its hash is the pin's oid (sha256 for an LFS file, the git blob id for the rest), and
+            deleted otherwise. A partial download resumes.
 
 Exit codes: 0 every compared file matches (--check) or the file was fetched and verified (--fetch); 1 a mirror
 serves different bytes for a pinned file (--check), or the fetched file is not the pinned one (--fetch); 2 usage,
@@ -185,11 +186,15 @@ def fetch(pins: dict, repo: str, path: str, dest: str) -> int:
                 out.write(b)
                 if h is not None:
                     h.update(b)
+    size = os.path.getsize(part)
     if h is not None:
         got = h.hexdigest()
-    else:
-        got = gitblob(open(part, "rb").read())
-    size = os.path.getsize(part)
+    else:  # a git blob id needs the size first, so it is a second streamed pass, never the whole file in memory
+        g = hashlib.sha1(b"blob %d\0" % size)
+        with open(part, "rb") as f:
+            for b in iter(lambda: f.read(CHUNK), b""):
+                g.update(b)
+        got = g.hexdigest()
     if got != want["oid"] or (want.get("size") is not None and size != want["size"]):
         os.remove(part)
         print(f"pin_mirror: {repo} {path} from ModelScope is {got[:12]}… {size} B, the pin is "

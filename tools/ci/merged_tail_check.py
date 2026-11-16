@@ -212,7 +212,8 @@ def classify_commit(repo, sha, base_ref):
             theirs = base_lines.get(f)
             if theirs is None:
                 b = git(repo, "show", f"{base_ref}:{f}")
-                theirs = len(b.stdout.splitlines()) if b.returncode == 0 else 0
+                # still None when the base cannot be read: "unknown size", not "zero lines"
+                theirs = len(b.stdout.splitlines()) if b.returncode == 0 else None
             if theirs is None:
                 superseded = False
                 sizes += f"; {f}: this commit {mine} lines, base size UNREADABLE"

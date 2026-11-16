@@ -39,6 +39,6 @@ Environment=ONEBIT_PIN_LOG=%h/briefs/PIN-HOLDINGS.log
 Nice=19
 IOSchedulingClass=idle
 ExecStartPre=/usr/bin/mkdir -p %h/.1bit/logs
-ExecStart=/bin/sh -c 'e="$ONEBIT_ENGINE"; for f in tools/pin_holdings.py models/pins.json models/holdings.json; do [ -f "$e/$f" ] || { echo "pin-holdings: $e/$f is missing: ONEBIT_ENGINE must be an engine checkout that follows main"; exit 2; }; done; cd "$e" && exec %h/lb/thermal-run.sh /usr/bin/python3 -I tools/pin_holdings.py --out %h/.1bit/logs/pin-holdings-latest.md --log "$ONEBIT_PIN_LOG"'
+ExecStart=/bin/sh -c 'e="$ONEBIT_ENGINE"; for f in tools/pin_holdings.py models/pins.json models/holdings.json; do [ -f "$e/$f" ] || { echo "pin-holdings: $e/$f is missing: ONEBIT_ENGINE must be an engine checkout that follows main"; exit 2; }; done; cd "$e" && exec %h/lb/thermal-run.sh /usr/bin/python3 -I tools/pin_holdings.py --out %h/.1bit/logs/pin-holdings-latest.md --log "$ONEBIT_PIN_LOG" --scan %h/models'
 StandardOutput=journal
 StandardError=journal

@@ -16,7 +16,7 @@
 """Do the files we hold match the pins? The box half of the pin watch (docs/model-pins.md).
 
 usage: tools/pin_holdings.py [--pins FILE] [--holdings FILE] [--cache FILE] [--out FILE] [--json FILE]
-                             [--log FILE] [--rehost-only]
+                             [--log FILE] [--scan DIR]... [--rehost-only]
 
 tools/pin_watch.py --check compares each pin with what Hugging Face serves. It cannot see the box, so a pin
 can be bumped to a new upstream file while the box keeps serving the old one, and every daily run stays
@@ -36,7 +36,8 @@ Two checks, one report:
             box nor the network, and --rehost-only runs it alone (CI can).
 
 Exit codes: 0 every holding and every re-host matches, 1 a drift (a holding differs from its pin or is
-missing, or a re-host holds a different file than its upstream pin), 2 usage, or a holding names a pin or a
+missing, a re-host holds a different file than its upstream pin, or --scan found a pinned file the map does
+not list), 2 usage, or a holding names a pin or a
 file pins.json does not have (the map is wrong, which must not read as clean).
 """
 from __future__ import annotations
@@ -166,12 +167,42 @@ def gb(n) -> str:
     return "?" if n is None else f"{n / 1e9:.2f} GB"
 
 
-def coverage(pins: dict, holdings: list[dict]) -> dict:
-    """How much of pins.json the map covers: a pinned file with no holding is simply not examined, so a clean run
-    has to say how many it did not look at (most pins are not on the box; one held but unmapped is the hole)."""
+def coverage(pins: dict, holdings: list[dict], scan: list[str] | None = None) -> dict:
+    """How much of pins.json the map covers. A pinned file with no holding is either ABSENT (the box does not hold
+    it: expected, most pins are not on the box) or UNMAPPED (the box holds a file with its name and size and
+    models/holdings.json does not list it: the blindness this tool exists to remove). The two are told apart only
+    by looking, so --scan DIR walks the given trees for files whose basename and size match a pinned, unmapped file;
+    without --scan the split is unknown and said so."""
     pinned = {(repo, f) for repo, p in pins.items() for f in p["files"]}
     mapped = pinned & {(h.get("pin"), h.get("file")) for h in holdings}
-    return {"pinned_files": len(pinned), "mapped": len(mapped), "unlisted_pins": len(pinned - mapped)}
+    rest = pinned - mapped
+    out = {"pinned_files": len(pinned), "mapped": len(mapped), "unlisted_pins": len(rest),
+           "absent": None, "unmapped": None, "unmapped_files": []}
+    if scan is None:
+        return out
+    want = {}
+    for repo, f in rest:
+        size = pins[repo]["files"][f].get("size")
+        if size:  # a size is what makes a name match mean something (tokenizer_config.json is everywhere)
+            want.setdefault((os.path.basename(f), size), []).append((repo, f))
+    mapped_paths = {os.path.realpath(os.path.expanduser(h.get("path") or "")) for h in holdings}
+    seen = set()
+    for root in scan:
+        for d, _, files in os.walk(os.path.expanduser(root)):
+            for name in files:
+                fp = os.path.join(d, name)
+                try:
+                    hit = want.get((name, os.path.getsize(fp)))
+                except OSError:
+                    continue
+                if hit and os.path.realpath(fp) not in mapped_paths:
+                    for repo, f in hit:
+                        if (repo, f) not in seen:
+                            seen.add((repo, f))
+                            out["unmapped_files"].append({"pin": repo, "file": f, "path": fp})
+    out["unmapped"] = len(seen)
+    out["absent"] = len(rest) - len(seen)
+    return out
 
 
 def report(hrows: list[dict] | None, rrows: list[dict], errors: list[str], hashed: int,
@@ -185,8 +216,14 @@ def report(hrows: list[dict] | None, rrows: list[dict], errors: list[str], hashe
         lines.append(f"Holdings: {len(hrows)} checked, {len(bad)} differ from their pin "
                      f"({hashed} hashed this run, the rest from the cache).")
         if cov is not None:
-            lines.append(f"Coverage: {cov['unlisted_pins']} of {cov['pinned_files']} pinned files have no holding on "
-                         f"this box (not held here, or held and missing from models/holdings.json): not checked.")
+            if cov["unmapped"] is None:
+                split = "not held here or held and unmapped: unknown without --scan"
+            else:
+                split = f"{cov['absent']} not held here, {cov['unmapped']} held and missing from models/holdings.json"
+            lines.append(f"Coverage: {cov['mapped']} of {cov['pinned_files']} pinned files checked; "
+                         f"{cov['unlisted_pins']} not checked ({split}).")
+            for u in cov["unmapped_files"]:
+                lines.append(f"  - UNMAPPED: `{u['path']}` has the name and size of pin {u['pin']} `{u['file']}`")
     lines.append(f"Re-hosts: {len(rrows)} differ from their upstream pin.")
     if errors:
         lines.append(f"Map errors: {len(errors)} (exit 2).")
@@ -220,6 +257,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--cache", default=CACHE, help="hash cache ('' disables it)")
     ap.add_argument("--out", help="also write the Markdown report here")
     ap.add_argument("--json", help="also write the rows as JSON here")
+    ap.add_argument("--scan", action="append", metavar="DIR",
+                    help="look under DIR for pinned files the map does not list (name + size); repeatable")
     ap.add_argument("--rehost-only", action="store_true", help="only the pins.json half (no box files read)")
     ap.add_argument("--log", help="append one line per run here (UTC, outcome, counts): a result that outlives the "
                                   "journal")
@@ -238,7 +277,7 @@ def main(argv: list[str]) -> int:
             print(f"pin_holdings: cannot read {a.holdings}: {e}", file=sys.stderr)
             return 2
         hrows, errors = check_holdings(pins, holdings, cache)
-        cov = coverage(pins, holdings)
+        cov = coverage(pins, holdings, a.scan)
         cache.save()
     rrows = check_rehosts(pins)
     text = report(hrows, rrows, errors, cache.hashed, cov)
@@ -250,12 +289,17 @@ def main(argv: list[str]) -> int:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"holdings": hrows, "rehosts": rrows, "errors": errors, **(cov or {})}, f, indent=1)
     drift = [r for r in hrows or [] if r["state"] != "ok"]
-    rc = 2 if errors else 1 if (rrows or drift) else 0
+    unmapped = (cov or {}).get("unmapped") or 0
+    rc = 2 if errors else 1 if (rrows or drift or unmapped) else 0
     if a.log:
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        line = (f"{stamp} {('ok', 'drift', 'error')[rc]} holdings={'-' if hrows is None else len(hrows)} "
-                f"drift={len(drift)} rehost={len(rrows)} errors={len(errors)} "
-                f"unlisted={'-' if cov is None else cov['unlisted_pins']}")
+        n = lambda k: "-" if cov is None or cov.get(k) is None else cov[k]  # noqa: E731
+        word = ("ok", "drift", "error")[rc]
+        if cov is not None:
+            word += f" ({cov['mapped']}/{cov['pinned_files']} checked)"  # a 5 % check must not read as a clean bill
+        line = (f"{stamp} {word} mapped={n('mapped')} checked={'-' if hrows is None else len(hrows)} "
+                f"drifted={len(drift)} rehost_drifted={len(rrows)} map_errors={len(errors)} "
+                f"absent={n('absent')} unmapped={n('unmapped')}")
         with open(a.log, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     return rc

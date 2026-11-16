@@ -108,7 +108,23 @@ with tempfile.TemporaryDirectory() as tmp:
     # 1b. a clean-looking run says how much it did not look at: 3 of the 7 pinned files have a holding.
     check(out.get("pinned_files") == 7 and out.get("unlisted_pins") == 4,
           f"coverage counts the pinned files with no holding ({out.get('pinned_files')}, {out.get('unlisted_pins')})")
-    check("4 of 7 pinned files have no holding" in r.stdout, "and the report says so in its header")
+    check("3 of 7 pinned files checked; 4 not checked" in r.stdout and "unknown without --scan" in r.stdout,
+          "the header says how many were not checked, and that absent vs unmapped is unknown without --scan")
+
+    # 1c. --scan tells ABSENT (not on the box) from UNMAPPED (on the box, missing from the map): a box file with a
+    # pinned name and size that no holding lists is the blindness the tool exists for, and fails the run.
+    scan = os.path.join(tmp, "scan")
+    os.makedirs(os.path.join(scan, "deep"))
+    open(os.path.join(scan, "deep", "renamed.gguf"), "wb").write(b"r")          # pin up renamed.gguf: size 1, unmapped
+    open(os.path.join(scan, "deep", "other-name.gguf"), "wb").write(b"zz")      # pinned name, wrong size: not a match
+    open(os.path.join(scan, "head.gguf"), "wb").write(good)                     # us/Model-Rehost head.gguf: unmapped
+    r2, out2 = run(tmp, "--scan", scan)
+    um = sorted((u["pin"], u["file"]) for u in out2.get("unmapped_files", []))
+    check(um == [("up/Model-GGUF", "renamed.gguf"), ("us/Model-Rehost", "head.gguf")] and out2.get("absent") == 2,
+          f"--scan finds the unmapped copies by name and size, not by name alone ({um}, absent {out2.get('absent')})")
+    check("UNMAPPED:" in r2.stdout and "2 held and missing from models/holdings.json" in r2.stdout,
+          "the report names each unmapped file")
+
 
     # 2. the re-host fixed: everything clean, rc 0.
     pins["pins"]["us/Model-Rehost"]["files"]["m.gguf"] = dict(pins["pins"]["up/Model-GGUF"]["files"]["m.gguf"])
@@ -116,6 +132,8 @@ with tempfile.TemporaryDirectory() as tmp:
     r, out = run(tmp)
     check(r.returncode == 0 and out["rehosts"] == [], f"all copies and re-hosts match -> rc 0 (rc {r.returncode})")
     check("0 hashed" in r.stdout, "the second run takes every hash from the cache")
+    r2, _ = run(tmp, "--scan", scan)
+    check(r2.returncode == 1, f"on an otherwise clean run, an unmapped copy alone fails it (rc {r2.returncode})")
 
     # 3. the box holds the OLD file under the pinned name: a size mismatch, reported without reading it.
     holdings(base[:2] + [{"pin": "up/Model-GGUF", "file": "m.gguf", "path": paths["m-old.gguf"]}])
@@ -160,7 +178,7 @@ with tempfile.TemporaryDirectory() as tmp:
     holdings([{"pin": "no/Such", "file": "m.gguf", "path": paths["m-new.gguf"]}])
     run(tmp, "--log", lg)
     rows = open(lg).read().splitlines()
-    check(len(rows) == 2 and " ok holdings=2 drift=0 rehost=0 errors=0 unlisted=5" in rows[0]
+    check(len(rows) == 2 and " ok (2/7 checked) mapped=2 checked=2 drifted=0 rehost_drifted=0 map_errors=0 absent=- unmapped=-" in rows[0]
           and " error " in rows[1], f"--log: one line per run, outcome first ({rows})")
 
     # 8. --rehost-only needs no holdings file and reads no box file.

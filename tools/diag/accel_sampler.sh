@@ -137,7 +137,7 @@ correlate() {  # $1 lo $2 hi -> "pid:cmd:scope" for every sample in [lo,hi], ded
 }
 
 selftest() {  # prove the correlation before an event needs it: the window, the fields, and the miss case
-  local d fail=0 out
+  local d fail=0 out i1 i2 _dir_save
   d=$(mktemp -d "$DIR/selftest.XXXXXX")   # never /tmp: this lane's rule, and tmpfs pressure has bitten the box
   printf '1000\t111\t1\t/serve A\t/scope/a\tticket1\n1010\t222\t2\t/serve B\t/scope/b\tticket2\n' > "$d/samples.log"
   SAMP=$d/samples.log
@@ -161,8 +161,21 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   rotate "$d/rot.log"
   [ -f "$d/rot.log.1" ] || { echo "FAIL: rotation did not keep a previous file"; fail=1; }
   [ "$(stat -c %s "$d/rot.log")" -eq 0 ] || { echo "FAIL: the live file was not truncated"; fail=1; }
+  # engine#2778: the summary is rewritten every ~15 min, so it must never be observable half-written. The signature is
+  # the INODE: mv replaces it, an in-place `> "$out"` keeps it -- deterministic, no race to reproduce.
+  _dir_save=$DIR
+  DIR=$d
+  : > "$d/attr.log"
+  ATTR=$d/attr.log
+  summary > /dev/null
+  i1=$(stat -c %i "$d/summary.txt")
+  summary > /dev/null
+  i2=$(stat -c %i "$d/summary.txt")
+  [ "$i1" != "$i2" ] || { echo "FAIL: the summary was rewritten in place (inode $i1 unchanged) -- a reader inside the rewrite window sees a partial file with a valid header"; fail=1; }
+  ls "$d"/summary.txt.tmp > /dev/null 2>&1 && { echo "FAIL: the summary left a .tmp file behind"; fail=1; }
+  DIR=$_dir_save
   rm -rf "$d"
-  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation)"
+  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation, summary renamed not truncated)"
   return "$fail"
 }
 
@@ -198,7 +211,10 @@ summary() {  # what the run observed, so a 24 h expiry is not silence
       echo "The sampler cannot attribute a burst that did not happen. What it does establish: the holders above were"
       echo "live for the whole window, so if a burst had occurred, its record would name them."
     fi
-  } > "$out"
+  } > "$out.tmp" && mv -f "$out.tmp" "$out"   # engine#2778: rename, not truncation. Since #2613 this runs every
+    # ~15 min, so an in-place `> "$out"` emptied a file whose header (the ISO line above) is written FIRST -- a reader
+    # inside that window saw a partial summary that did not look stale, it looked read. mv within one directory is a
+    # rename(2): a reader gets the whole old file or the whole new one.
   echo "summary written: $out"
 }
 

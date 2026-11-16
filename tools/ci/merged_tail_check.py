@@ -36,12 +36,20 @@ Classes reported:
 
   LOST          most of the commit's added lines are not in the base AND no base file is longer:
                 it needs a recovering PR
-  SUPERSEDED    most added lines absent, but every affected base file is LONGER -- a later
-                commit rewrote that region, which is not evidence of a loss
+  SUPERSEDED    most added lines absent, and the base CHANGED that file after this PR merged
+                (`git log <merge>..<base> -- <file>`), or -- the fallback that stays -- every
+                affected base file is LONGER. Either way a later commit rewrote that region,
+                which is not evidence of a loss. Scoped to the merge commit rather than to line
+                counts, because a one-line value file (a pin bump) is never "longer" and read
+                as LOST for four different PRs (engine#2586, #2572, #2583, #2554).
   PARTIAL       a few of them are gone because main edited those lines since: not a loss
   IN-BASE       every added line is already there (the content arrived another way): not a loss
   UNVERIFIABLE  the commit adds no significant line (deletion-only): neither of the above, a gap
-  GONE          the branch is deleted, so the tail cannot be examined at all: a gap, never a pass
+  GONE          neither the branch nor `refs/pull/<n>/head` exists: a gap, never a pass. The PR
+                ref is the MERGE-TIME head, so a push after the merge stays unverified even when
+                it is read -- it is a fallback for a deleted branch, not a way to see a late push
+  UNVERIFIED    the PR ref was read and the branch is gone: what it shows is the head the PR
+                merged at, so anything pushed afterwards is outside what this row can see
 
 Exit 0 no loss and nothing unexamined, 1 a LOST commit, 2 a ref could not be read or something was
 unverifiable -- **a scan that could not look is not a scan that found nothing.**
@@ -437,7 +445,26 @@ def self_test():
     branch(r, "main", "pr~1")
     chk("LOST", classify_commit(r, lost_sha, "main")[0],
         "a commit pushed after the merge is LOST")
+
     chk(1, len(merge_commits(r, "pr", "main")), "the branch has a tail of exactly one")
+    d.cleanup()
+
+    # The `after=` path had no arm at any head: a pin bump whose one line the base replaced is
+    # SUPERSEDED when the base touched that file AFTER the merge, and LOST without it. Same tree,
+    # both answers, so the arm is load-bearing rather than decorative.
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    branch(r, "pr")
+    pin = commit(r, "pins.config", "sha=53c0ffee00\n", "the pin this branch landed")
+    branch(r, "main", "pr~1")
+    merged_at = commit(r, "other.txt", "unrelated\n", "the merge point: main goes no further here")
+    chk("LOST", classify_commit(r, pin, "main")[0],
+        "a one-line pin bump the base never touched is LOST")
+    commit(r, "pins.config", "sha=60b8eef000\n", "the base moves to a later pin, after the merge")
+    chk("SUPERSEDED", classify_commit(r, pin, "main", after=merged_at)[0],
+        "the same commit is SUPERSEDED once the base changed that file after the merge")
+    chk("LOST", classify_commit(r, pin, "main")[0],
+        "and without after= it is LOST again: the exit-0 path is what after= selects")
     d.cleanup()
 
     # The same content, already on the base by another commit: not a loss.

@@ -166,9 +166,15 @@ def provenance(recorded, tested, repo):
         # measured on this box: the golden's OBJECT can be present in a --depth clone while the ancestry between
         # it and the tested commit is not (220 commits held against ~11k in the fork), so the honest words are
         # "the history between them", not "no common history" -- the two lines do meet, past the shallow boundary.
-        return (f"{head}: cannot place (the history between them is not in this clone; shallow={shallow}"
-                + ("; fetch the history with `git -C <llama.cpp> fetch --unshallow`"
-                   if shallow == "true" else "") + ")")
+        if shallow == "true":
+            # measured on this box: the two commits are both PRESENT and the ancestry between them is not (220
+            # commits held against ~11k in the fork). "no common history" would be wrong here -- they do meet,
+            # past the shallow boundary -- so the line names the missing ancestry and the way to get it.
+            return (f"{head}: cannot place (the history between them is not in this clone; shallow=true"
+                    "; fetch it with `git -C <llama.cpp> fetch --unshallow`)")
+        # Not shallow: two unrelated root histories really do have no common ancestor, and saying "the history is
+        # not in this clone" would hide that the whole history IS here and simply never connects.
+        return f"{head}: cannot place (no common ancestor in this repository: two root histories; shallow=false)"
     a = _git(repo, "rev-list", "--count", f"{base}..{recorded}")[1]
     b = _git(repo, "rev-list", "--count", f"{base}..{tested}")[1]
     return f"{head}: diverged at {short(base)} (golden +{a}, tested +{b})"

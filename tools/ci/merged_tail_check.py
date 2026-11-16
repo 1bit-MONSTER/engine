@@ -71,6 +71,8 @@ LOST_FRACTION = 0.5
 # "0 findings" without it -- the absent-denominator failure this fleet fixed four times tonight
 # (#2624, #2627, #2645, #2656).
 examined = [0]
+# same_head() returns before any fetch: those branches are assumed unchanged, not compared.
+unchanged = [0]
 
 
 def git(repo, *args, check=False):
@@ -310,6 +312,7 @@ def scan(repo, days, limit, base_url=None, prs=None):
         # and the branch is worth reading; `frozen == tip` means nothing was, and the content check
         # would only re-derive that at the cost of a fetch per PR. (merged_branch_check, #2656.)
         if same_head(pr.get("headRefOid"), ls.stdout.split()[0] if ls.stdout.split() else ""):
+            unchanged[0] += 1   # assumed unchanged, not compared -- the summary says so
             continue  # the branch tip is exactly what merged: nothing was pushed after
 
         ref = f"refs/mtck/{pr['number']}"
@@ -342,7 +345,8 @@ def report(repo, days, limit, base_url):
             head = f"{head} {commit[0]} {commit[1][:56]}"
         print(f"{kind:12s} {head}\n{'':12s} {detail}")
     print(f"merged_tail_check: examined {examined[0]} PR(s) merged in the last {days} day(s); "
-          f"{examined[0] - counts['GONE']} with a live branch, {counts['GONE']} branch gone")
+          f"{examined[0] - counts['GONE']} with a live branch, {counts['GONE']} branch gone, "
+          f"{unchanged[0]} tip identical to the merged head (assumed, not compared)")
     print(f"merged_tail_check: {len(rows)} finding(s) over PRs merged in the last {days} day(s) "
           f"-- {counts['LOST']} LOST, {counts['PARTIAL']} partly edited by main, "
           f"{counts['IN-BASE']} already on the base, {counts['SUPERSEDED']} rewritten by a later commit, "

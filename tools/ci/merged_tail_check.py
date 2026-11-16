@@ -170,6 +170,18 @@ def classify_commit(repo, sha, base_ref, after=None):
         if not want:
             continue
         checked_all += len(want)
+        # engine#2652 sweep: a SUBMODULE GITLINK is not a blob, so `git show <rev>:<path>` prints nothing for it
+        # and every added line then reads as absent -- that is why #2583 (third_party/llama.cpp: pin to
+        # 148e7f329) and #2554 (third_party/laya: source af8ada06) were the only rows a two-day sweep still
+        # reported after the pin-bump class was fixed. A gitlink's content IS its sha, so compare that:
+        # equal -> the pointer landed (IN-BASE for this file), different -> fall through to the line test, which
+        # will decide LOST/SUPERSEDED for the surrounding text.
+        tree = git(repo, "ls-tree", base_ref, "--", f)
+        fields = tree.stdout.split()
+        if len(fields) >= 3 and fields[0] == "160000":
+            mine = git(repo, "ls-tree", sha, "--", f).stdout.split()
+            if len(mine) >= 3 and mine[2] == fields[2]:
+                continue                      # same submodule commit on both sides: nothing is missing
         show = git(repo, "show", f"{base_ref}:{f}")
         base_text = show.stdout if show.returncode == 0 else ""
         for line in want:

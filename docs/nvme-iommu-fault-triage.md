@@ -134,8 +134,10 @@ only if you want to confirm that, not as a discriminator.
 
 ```bash
 # 1. pick the top faulting IOVA from the census
-<<<<<<< HEAD
-=======
+# 2. kprobe iommu_unmap_fast on that iova alone (filter), stacktrace on, capture for minutes in the background
+# 3. in the same capture window, note the fault timestamps for that iova
+```
+
 **The interval is seconds, not milliseconds (measured 2026-11-16).** A filtered probe on one faulting IOVA
 (`0xe1e18000`), captured over a boot's first 28 minutes, found **60 unmaps of that page, every one a single 4 KiB
 page, 59 of them from `<idle>` (interrupt context)**: the NVMe completion path repeatedly maps and tears down one
@@ -175,6 +177,38 @@ is not.**
    keep in mind that an exact-iova filter cannot see a *larger* mapping that covers the page -- for this driver that is
    tolerable because its unmaps are all 4 KiB (60 of 60 measured), but it is a measured caveat, not a proof.
 
+**Arm the map side too, unfiltered, and the argument for one address stops being needed (measured 11-16 06:42Z).**
+A filtered capture on five addresses chosen from the fault census recorded **zero events in 30 s** and aborted on its
+own positive control -- because **the fault target moves**: the last three faults were all on an address the list did
+not contain. The capture that worked armed `iommu_map` and `iommu_unmap_fast` with **no filter** for 13 minutes
+(44 unmaps/s is what a quiet minute looks like; a busy one is ~1,000/s, and the per-CPU ring still covered all 795 s).
+Of the 8 faults in that window:
+
+```
+0xebf50000  x4 faults   NO map or unmap of this iova anywhere in the 795 s
+0x6925f000  x1          nearest map +230 ms AFTER the fault
+0xe407f000  x2          nearest map/unmap -58 s
+0xe1d00000  x1          nearest -347 s
+```
+
+**Four of eight faults hit an IOVA that was never mapped and never unmapped at any point in 795 seconds of a capture
+holding 252,704 map/unmap events** -- so the translation is not stale, it is **absent, and nothing re-creates it**. That
+moves the question to the descriptor: the device writes to an address the driver has already finished with, which is a
+DMA-mapping lifetime bug, not a TLB or lazy-invalidation one. `0x6925f000` is the exception and worth separating: it is
+**re-mapped 230 ms after** the fault, the profile of a live pool page faulting before its re-map.
+
+The kprobe recipes, corrected against the kernel's own argument order -- the first one was wrong in this page's tool:
+
+```
+iommu_map(domain, iova, paddr, size, prot)        ->  iova=%si size=%cx    # %dx is PADDR, and a probe
+                                                                          # using it printed size=0x138ec90000
+iommu_unmap_fast(domain, iova, size, ...)        ->  iova=%si size=%dx
+```
+
+**A task name can contain a space** (`next-server (v1-8386`), so a regex anchored with `^\s+\S+\s+\[` silently dropped
+**2,176 of 115,941 map lines** -- 1.9 %, which is exactly the fraction that can contain the event being looked for.
+Anchor on the timestamp instead, and reconcile the parse count against `grep -c` before believing a negative.
+
 **And the reverse is just as wrong: a positive must say whether it discriminates.** The same page's cadence is
 workload-dependent -- a later capture on this box (05:40Z, 150 s, one IOVA filtered) found the NVMe paths mapping it
 from `nvme_prep_rq` through `dma_map_phys` and unmapping it from `nvme_pci_complete_batch` through
@@ -189,10 +223,6 @@ a filtered probe on the same function with **zero** -- the trace ring buffer is 
 IOVA, one call site) is the one that should be armed, and checking `grep -c '<probe>:' trace` before trusting a
 capture is the same "prove the plumbing" rule two paragraphs up.
 
->>>>>>> 2b1faf1b2 (diag: a negative names the window it used, and the window reads in seconds)
-# 2. kprobe iommu_unmap_fast on that iova alone (filter), stacktrace on, capture for minutes in the background
-# 3. in the same capture window, note the fault timestamps for that iova
-```
 
 The question the ordering answers: does a fault follow an unmap of the *same* address, or does it arrive while the
 address is still mapped? The first is a write-after-unmap — the device dirtying a buffer the CPU released, or the driver

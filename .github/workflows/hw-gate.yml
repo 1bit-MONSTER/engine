@@ -85,10 +85,14 @@ jobs:
           # `third_party/gpu-kernels` is NOT a submodule: the kernel pin is a file (sha= in config/gpu-kernels.config), so a gk
           # bump touches that config and never a gitlink (#2753, #2586). A re-recorded golden changes what the gate compares
           # against (#2502), so it belongs here too.
-          changed=$(git diff --name-only "$base...HEAD" -- \
-                      third_party/llama.cpp third_party/hrx-system config/gpu-kernels.config tests/golden/hw-gate \
-                    || fail_closed)
-          if grep -q . <<< "$changed"; then
+          # NOT `changed=$(… || fail_closed)`: a command substitution exits only its own subshell and CAPTURES its stdout,
+          # so the ::warning:: would be swallowed (GitHub reads annotations from the step's stdout) and the captured
+          # warning text would then read as "changed", writing moved=1 a second time -- right answer, invisible reason.
+          if ! changed=$(git diff --name-only "$base...HEAD" -- \
+                  third_party/llama.cpp third_party/hrx-system config/gpu-kernels.config tests/golden/hw-gate); then
+            fail_closed
+          fi
+          if [ -n "$changed" ]; then
             echo "moved=1" >> "$GITHUB_OUTPUT"
             echo "this PR moves a pin: the gate runs"
           else

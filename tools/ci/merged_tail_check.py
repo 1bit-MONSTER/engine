@@ -34,7 +34,10 @@ the base's copy of the file it touched** -- with one row per commit and the miss
 
 Classes reported:
 
-  LOST          most of the commit's added lines are not in the base: it needs a recovering PR
+  LOST          most of the commit's added lines are not in the base AND no base file is longer:
+                it needs a recovering PR
+  SUPERSEDED    most added lines absent, but every affected base file is LONGER -- a later
+                commit rewrote that region, which is not evidence of a loss
   PARTIAL       a few of them are gone because main edited those lines since: not a loss
   IN-BASE       every added line is already there (the content arrived another way): not a loss
   UNVERIFIABLE  the commit adds no significant line (deletion-only): neither of the above, a gap
@@ -188,7 +191,11 @@ def classify_commit(repo, sha, base_ref):
     for f, _ in missing_all[:1] or [(None, None)]:
         if f:
             show = git(repo, "show", f"{base_ref}:{f}")
-            base_lines[f] = len(show.stdout.splitlines()) if show.returncode == 0 else 0
+            # An unreadable base path is UNKNOWN, not empty. Reading it as 0 makes the size
+            # comparison say "base is shorter" for a file the base may well have rewritten, and
+            # that biases every verdict toward LOST -- mea 2026-11-16 while writing the SUPERSEDED
+            # arm: a 12-line base file read as "base 0 lines (base is shorter)".
+            base_lines[f] = len(show.stdout.splitlines()) if show.returncode == 0 else None
     frac = len(missing_all) / checked_all
     where = "; ".join(f"{f}: {ln[:60]}" for f, ln in missing_all[:3])
     more = "" if len(missing_all) <= 3 else f" (+{len(missing_all) - 3} more)"
@@ -196,6 +203,7 @@ def classify_commit(repo, sha, base_ref):
               f"({frac:.0%}; LOST at {LOST_FRACTION:.0%})")
     if frac >= LOST_FRACTION:
         sizes = ""
+        superseded = True   # every missing path has a LONGER base file -> a later commit rewrote it
         for f in {f for f, _ in missing_all}:
             show = git(repo, "show", f"{sha}:{f}")
             mine = len(show.stdout.splitlines()) if show.returncode == 0 else 0
@@ -203,8 +211,21 @@ def classify_commit(repo, sha, base_ref):
             if theirs is None:
                 b = git(repo, "show", f"{base_ref}:{f}")
                 theirs = len(b.stdout.splitlines()) if b.returncode == 0 else 0
-            ctx = "base SUPERSEDED it (base is longer)" if theirs > mine else "base is shorter"
+            if theirs is None:
+                superseded = False
+                sizes += f"; {f}: this commit {mine} lines, base size UNREADABLE"
+                continue
+            longer = theirs > mine
+            superseded = superseded and longer
+            ctx = "base SUPERSEDED it (base is longer)" if longer else "base is shorter"
             sizes += f"; {f}: this commit {mine} lines, base {theirs} lines ({ctx})"
+        # A later commit that rewrote every affected file leaves the added lines absent for the
+        # wrong reason. Measured 2026-11-16 on #2504: 15 of 18 lines "absent", base file longer,
+        # and `httplib::Server` -- the commit's own subject -- present three times on main. The
+        # evidence for SUPERSEDED was already in the detail string while the verdict said LOST.
+        if superseded:
+            return "SUPERSEDED", (f"{detail} -- {where}{more}{sizes} -- the base rewrote every "
+                                  f"affected file, so this is not evidence of a loss")
         return "LOST", f"{detail} -- {where}{more}{sizes}"
     if missing_all:
         return "PARTIAL", f"{detail} -- main edited these lines; the commit is on the base"
@@ -310,7 +331,7 @@ def scan(repo, days, limit, base_url=None, prs=None):
 
 
 def report(repo, days, limit, base_url):
-    counts = {"LOST": 0, "PARTIAL": 0, "IN-BASE": 0, "UNVERIFIABLE": 0, "GONE": 0, "GAP": 0}
+    counts = {"SUPERSEDED": 0, "LOST": 0, "PARTIAL": 0, "IN-BASE": 0, "UNVERIFIABLE": 0, "GONE": 0, "GAP": 0}
     rows = scan(repo, days, limit, base_url)
     if rows is None:
         return 2, counts, []
@@ -324,7 +345,7 @@ def report(repo, days, limit, base_url):
           f"{examined[0] - counts['GONE']} with a live branch, {counts['GONE']} branch gone")
     print(f"merged_tail_check: {len(rows)} finding(s) over PRs merged in the last {days} day(s) "
           f"-- {counts['LOST']} LOST, {counts['PARTIAL']} partly edited by main, "
-          f"{counts['IN-BASE']} already on the base, "
+          f"{counts['IN-BASE']} already on the base, {counts['SUPERSEDED']} rewritten by a later commit, "
           f"{counts['UNVERIFIABLE']} unverifiable, {counts['GONE']} branch gone, {counts['GAP']} gap")
     if counts["LOST"]:
         print("merged_tail_check: a LOST commit needs a PR that branches from origin/main -- "

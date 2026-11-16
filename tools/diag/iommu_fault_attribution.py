@@ -76,7 +76,10 @@ def rows_from_text(text):
         parts = line.split("\t")
         if len(parts) < 6 or not parts[0].strip().isdigit():
             continue
-        rows.append((int(parts[0]), parts[1].strip(), parts[5].strip()))
+        # A GAP row (engine#2624) carries its length in column 3 where a sample carries its fds; keep the length as
+        # the note so the verdict can say how long the sampler was stalled, not just that it was.
+        pid = parts[1].strip()
+        rows.append((int(parts[0]), pid, (parts[2].strip() or "?") if pid == "GAP" else parts[5].strip()))
     rows.sort()
     return rows
 
@@ -105,6 +108,11 @@ def attribute(rows, boots, max_gap):
             continue
         if pid == "-":
             out.append((sec, addr, "NOTHING HELD: sampled at the node, no accel client held it"))
+            continue
+        if pid == "GAP":
+            # engine#2624: the sampler writes a GAP row when it slept too long to sample. That is the absence of an
+            # observation, NOT a process called GAP -- attributing a fault here would invent a holder.
+            out.append((sec, addr, "NO SAMPLE: the sampler was stalled across this fault (GAP row %s)" % ticket))
             continue
         who = f"pid {pid} {ticket[:64]}"
         if after and after[0][1] != pid:
@@ -143,7 +151,7 @@ def outlook(rows, windows):
         one = amb = nothing = none = 0
         for epoch, _pid, _ticket in rows:
             near = [(e, p) for e, p, _t in rows if abs(e - epoch) <= w]
-            holders = {p for _e, p in near if p != "-"}
+            holders = {p for _e, p in near if p not in ("-", "GAP")}
             if not near:
                 none += 1
             elif not holders:
@@ -287,6 +295,17 @@ def self_test():
     # the case worth printing rather than hiding.
     one_vs_hand = disagreements(rows, [(150, "111")], max_gap=150)
     assert one_vs_hand[0][3] is False, one_vs_hand
+
+    # engine#2624: the sampler writes `<epoch>\tGAP\t<gap s>\t-\t-\t-` when it slept too long. Column 2 is the pid
+    # column, so a reader that trusts it invents a holder called GAP -- which is what this tool did before this arm.
+    gap_log = "1000\t-\t-\t-\t-\t-\n1010\tGAP\t93\t-\t-\t-\n"
+    gap_rows = rows_from_text(gap_log)
+    assert gap_rows == [(1000, "-", "-"), (1010, "GAP", "93")], gap_rows   # the note carries the gap length
+    assert attribute(gap_rows, [(1015.0, "0x1")], 150)[0][2].startswith("NO SAMPLE"), attribute(gap_rows, [(1015.0, "0x1")], 150)
+    assert "stalled" in attribute(gap_rows, [(1015.0, "0x1")], 150)[0][2]
+    # ... and it is not a holder for the outlook either: with a real holder after it, the window still sees one.
+    mixed = gap_rows + [(1020, "1234", "gpu-hold cl-a pid 9")]
+    assert outlook(mixed, [5])[0][1] > 0.0, outlook(mixed, [5])   # some windows span the real holder
 
     # Stamps and addresses are parsed, and non-fault lines are ignored.
     text = ("[1234.500000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0007]\n"

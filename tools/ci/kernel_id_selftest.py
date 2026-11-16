@@ -111,6 +111,30 @@ def self_test() -> int:
         sub_tree = _fake_tree(sub / "third_party", None)
         chk(find_tree(str(sub), env={}) == str(sub_tree), "find_tree falls back to third_party/gpu-kernels")
         chk(find_tree(str(root / "nowhere"), env={}) is None, "find_tree: no tree is None, not a guess")
+        # engine#2478 review: the CLI path, which is what `pre-pr-checks.sh` runs. Without this arm the bug is
+        # invisible: the three `find_tree` arms above all pass `env=` explicitly, and the SKIP message's advice --
+        # "set GPU_KERNELS_DIR" -- was never exercised through `main()`. Measured: with the variable exported,
+        # `hip_f16_audit.py --find .` resolved the tree while this tool printed "$GPU_KERNELS_DIR unset".
+        import os as _os, io as _io, contextlib as _cl
+        _saved = _os.environ.get("GPU_KERNELS_DIR")
+        _os.environ["GPU_KERNELS_DIR"] = str(ok_tree)
+        try:
+            with _cl.redirect_stdout(_io.StringIO()):
+                _rc = main(["--check"])
+            _cwd = _os.getcwd()
+            _os.chdir(str(root))          # a root with no third_party/, so only the env can find a tree
+            try:
+                with _cl.redirect_stdout(_io.StringIO()):
+                    _rc_root = main(["--check"])
+            finally:
+                _os.chdir(_cwd)
+        finally:
+            if _saved is None:
+                _os.environ.pop("GPU_KERNELS_DIR", None)
+            else:
+                _os.environ["GPU_KERNELS_DIR"] = _saved
+        chk(_rc == 0, "main() --check with no flags honours $GPU_KERNELS_DIR (rc 0, the tree's self-test passed)")
+        chk(_rc_root == 0, "  ... and from a directory with no third_party/, so only the env could have found it")
 
     print("kernel_id_selftest --self-test:", "ok" if bad == 0 else f"{bad} failure(s)")
     return 0 if bad == 0 else 1
@@ -128,7 +152,12 @@ def main(argv: list[str]) -> int:
     if not a.check:
         print("kernel_id_selftest: one of --check or --self-test is required", file=sys.stderr)
         return 2
-    tree = a.dir or (find_tree(a.find) if a.find else None)
+    # engine#2478 review: with neither flag the tool must still consult GPU_KERNELS_DIR -- the import of
+    # `find_tree` from hip_f16_audit is exactly the shared discovery, and the SKIP message tells the reader to
+    # "set GPU_KERNELS_DIR to a gpu-kernels checkout", which could never work: `find_tree` was only called when
+    # --find was passed. Measured: with the variable exported, hip_f16_audit.py --find . resolved the tree while
+    # this check printed "$GPU_KERNELS_DIR unset".
+    tree = a.dir or find_tree(a.find or ".")
     return check(tree)
 
 

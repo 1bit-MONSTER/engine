@@ -3625,6 +3625,20 @@ bounds the wait (unset = unlimited, still the default, because ordinary contenti
 for); on timeout it fails with the holder named rather than spending a device ticket. Nothing here
 reaps or signals the holder -- killing another lane's live serve is the box-crashing path.
 
+**The client that never took the lock (#2689).** `flock(2)` only names clients that took the lock, so a
+co-tenant that does not -- FastFlowLM, another build, a hand-run ELF runner -- was invisible and the note
+could only say "another client is using the array". The device fds are not invisible: `/proc/<pid>/fd/<n>`
+links to the node it was opened through, so one scan of `/proc` names every process holding something under
+`/dev/accel`, whatever protocol it follows:
+
+    [npu] no client holds the device lock, but pid 2230435 (flm serve ...) hold(s) the NPU device open:
+    'No such device' here is another client owning the array, not a dead device/ELF (wait for it, or stop it if it is yours)
+
+It is the same rendering as the lock line (`pid <n> (<cmdline>)`), it leaves out the process that is
+failing, and `tests/npu_device_lock_test.cpp` proves it against both a fake `/proc` and a live forked
+holder. A device opened through a *different* name for the same node (a bind mount,
+`/proc/<pid>/root/dev/accel/accel0`) is not named: the scan compares the link target as a path prefix.
+
 **The row this exists for.** On Linux the two engines are two instances of this runtime on two
 *different* models at the same time -- "all NPU models at once" -- and that is what
 `tools/showcase-612-npu-streams.sh` measures with `MODEL` and `MODEL_B` (default Qwen3-0.6B and

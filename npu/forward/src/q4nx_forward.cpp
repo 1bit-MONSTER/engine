@@ -4768,6 +4768,16 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
                 return false;
             }
             // a new slot starts at its own position; nothing to check beyond the range above
+        } else if (m > 0 && slot[m] == slot[m - 1] && pos[m] != pos[m - 1] + 1) {
+            // engine#2689 review: rows of ONE slot must sit on consecutive positions, because each row appends its K at
+            // its position and then reads up to it. A gap leaves a hole in the cache that the next row reads as zeros,
+            // and an order swap appends at 5 then at 3 and reads from stale state -- wrong tokens with no error, which is
+            // the failure this whole entry point exists to refuse by name instead.
+            err_ = "step_users: rows of one slot must be on consecutive positions (row " + std::to_string(m) +
+                   " of slot " + std::to_string(slot[m]) + " is position " + std::to_string(pos[m]) +
+                   " after position " + std::to_string(pos[m - 1]) + "; a gap or a swap would leave a hole in that "
+                   "slot's KV cache and be read as state the request does not own)";
+            return false;
         }
         smax = std::max(smax, slot[m]);
     }
@@ -4911,6 +4921,16 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
     // then let the batched pass run and compare. One process, both paths, same
     // device state -- localises a batched-vs-sequential divergence immediately.
     static const bool batch_check = getenv("NPU_BATCH_CHECK") != nullptr;
+    if (batch_check && rows_slot_ != nullptr) {
+        // engine#2689 review: the oracle below replays every row as ONE sequence (step(tokens[m], start_pos + m) with
+        // start_pos 0), so against a multi-slot pass it compares a conversation nobody ran with the pass that did run
+        // and prints a guaranteed `differing>0` -- a row-dependence bug that is not there, on the flag whose whole job
+        // is to find real ones. Refused for the same reason injected rows are refused below: a debug tool that lies is
+        // worse than one that says "not applicable".
+        err_ = "step_users: NPU_BATCH_CHECK compares one sequence's replay with the pass, so it is not applicable to a "
+               "multi-slot pass; unset it to run several users";
+        return false;
+    }
     int seq_argmax = -1;
     // engine#1781: the old oracle compared ONE argmax at ONE position -- the last row's -- which is not the question a
     // speculative decoder asks. Every drafted position's LOGITS matter (the accept rule consumes the target's

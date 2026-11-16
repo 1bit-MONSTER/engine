@@ -236,15 +236,24 @@ mkdir -p "$tmp/twin/good" "$tmp/twin/dup"
 printf 'A' > "$tmp/twin/good/full_i8_O_K768_N768_b8.elf"
 printf 'B' > "$tmp/twin/good/full_i8_O_K768_N768_b8_m16.elf"
 printf 'A' > "$tmp/twin/dup/full_i8_O_K768_N768_b8.elf"
-printf 'A' > "$tmp/twin/dup/full_i8_O_K768_N768_b8_m16.elf"
+printf 'A' > "$tmp/twin/dup/full_i8_GU_K768_N3072_b8.elf"   # NOT a _m16 twin: no documented reconciliation
 "$script" "$tmp/twin/good" > "$tmp/out21" 2>&1
 check $([ $? -ne 0 ] || ! has "$tmp/out21" "identical content" && echo ok || echo fail) \
       "distinct ELFs are not reported as twins"
 "$script" "$tmp/twin/dup" > "$tmp/out22" 2>&1
 check $(has "$tmp/out22" "identical content" && echo ok || echo fail) \
       "two ELFs with the same content are refused"
-check $(has "$tmp/out22" "full_i8_O_K768_N768_b8.elf" && has "$tmp/out22" "_m16.elf" && echo ok || echo fail) \
+check $(has "$tmp/out22" "full_i8_O_K768_N768_b8.elf" && has "$tmp/out22" "full_i8_GU_K768_N3072_b8.elf" && echo ok || echo fail) \
       "... and both paths are named"
+
+# engine#2611 tolerates exactly the documented _m16 twin shape at load (16 rows a chunk, correct but slow),
+# so that pair is a WARNING here; refusing it would block a pack the loader runs.
+mkdir -p "$tmp/twin/doc"
+printf 'A' > "$tmp/twin/doc/full_i8_O_K768_N768_b8.elf"
+printf 'A' > "$tmp/twin/doc/full_i8_O_K768_N768_b8_m16.elf"
+"$script" "$tmp/twin/doc" > "$tmp/out23" 2>&1
+check $(has "$tmp/out23" "WARN" && ! has "$tmp/out23" "NOT a documented" && echo ok || echo fail) \
+      "a byte-identical _m16 twin pair is warned about, not refused"
 
 if [ "$fails" -ne 0 ]; then
     printf 'kernel_set_check: %d failure(s)\n' "$fails"

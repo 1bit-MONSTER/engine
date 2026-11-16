@@ -229,17 +229,38 @@ fi
 # engine#2599: two ELFs with the same content under different names is a refusal. See the header for why a
 # hash is the only host-side instrument that can see it.
 check_twins() {
-    local dir=$1 dup
+    # engine#2611 tolerates exactly ONE shape of twin at load: a prefill ELF byte-identical to its own `_m16`
+    # sibling, where open_prefill sizes the context from the twin's 16 rows and says so. That pack is correct but
+    # SLOW (16 rows a chunk instead of 128), so it is a WARNING here -- refusing it would block a pack the loader
+    # now runs. Any OTHER identical pair has no such reconciliation and stays a FAIL.
+    local dir=$1 dup fail_list="" warn_list="" h name prev="" prevname=""
     dup=$(find "$dir" -maxdepth 2 -name '*.elf' -type f -print0 2>/dev/null |
-          xargs -0 -r md5sum 2>/dev/null | sort | awk '{h=$1; $1=""; if (h==prev) print prevname " and" $0; prev=h; prevname=$0}')
-    if [ -n "$dup" ]; then
-        printf 'FAIL %s: ELFs with identical content under different names (a copied twin computes the wrong M):\n%s\n' \
-            "$(basename "$dir")" "$dup"
+          xargs -0 -r md5sum 2>/dev/null | sort | awk '{print $1, $2}')
+    while read -r h name; do
+        [ -n "$h" ] || continue
+        if [ "$h" = "$prev" ]; then
+            local base_a=${prevname##*/} base_b=${name##*/}
+            if [ "${base_b%_m16.elf}" = "${base_a%.elf}" ] || [ "${base_a%_m16.elf}" = "${base_b%.elf}" ]; then
+                warn_list="$warn_list
+    $prevname and $name (documented _m16 twin: loader sizes from 16 rows)"
+            else
+                fail_list="$fail_list
+    $prevname and $name"
+            fi
+        fi
+        prev=$h; prevname=$name
+    done <<< "$dup"
+    if [ -n "$warn_list" ]; then
+        printf 'WARN %s: byte-identical ELF twin(s) this build tolerates but does not exploit:%s\n' \
+            "$(basename "$dir")" "$warn_list"
+    fi
+    if [ -n "$fail_list" ]; then
+        printf 'FAIL %s: ELFs with identical content under names that are NOT a documented _m16 twin:%s\n' \
+            "$(basename "$dir")" "$fail_list"
         return 1
     fi
     return 0
 }
-
 rc=0
 for dir in "$@"; do
     check_set "$dir" || { rc=$?; [ "$rc" -gt 1 ] && rc=2; }

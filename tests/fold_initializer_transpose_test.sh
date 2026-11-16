@@ -78,6 +78,48 @@ check "the folded weight has the matmul orientation" "$shape" "3x4"
 rc=0; python3 "$TOOL" --check "$tmp/out.onnx" >/dev/null 2>&1 || rc=$?
 check "check accepts the folded graph" "$rc" 0
 
+# engine#2779: one initializer folded two ways. Naming the folded weight after the SOURCE alone gave both consumers the
+# first perm's array. The graph keeps no Transpose, so --check cannot see it, and a square weight would pack and compute
+# wrong values with no symptom at all. The two consumers must end up on two initializers of their own shapes.
+python3 - "$tmp/two.onnx" <<'FIXTURE'
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+
+w = numpy_helper.from_array(np.arange(6, dtype=np.float32).reshape(2, 3), "w")      # 2x3
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[1, 0]),                     # 3x2
+     helper.make_node("Transpose", ["w"], ["b"], perm=[0, 1]),                     # 2x3
+     helper.make_node("Identity", ["a"], ["out_a"]),
+     helper.make_node("Identity", ["b"], ["out_b"])],
+    "two", [], [helper.make_tensor_value_info("out_a", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("out_b", TensorProto.FLOAT, None)], [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+FIXTURE
+
+python3 "$TOOL" "$tmp/two.onnx" "$tmp/two_out.onnx" >"$tmp/two.log" 2>&1 || { cat "$tmp/two.log"; fail=$((fail+1)); }
+check "a two-perm decoder folds two weights" "$(grep -c '^folded ' "$tmp/two.log")" 2
+
+python3 - "$tmp/two_out.onnx" >"$tmp/two.txt" <<'PROBE'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: list(numpy_helper.to_array(i).shape) for i in m.graph.initializer}
+ids = [n for n in m.graph.node if n.op_type == "Identity"]
+a, b = inits.get(ids[0].input[0], []), inits.get(ids[1].input[0], [])
+print("x".join(str(d) for d in a), "x".join(str(d) for d in b), str(ids[0].input[0] != ids[1].input[0]))
+PROBE
+read -r a_shape b_shape distinct <"$tmp/two.txt"
+check "the [1,0] consumer reads a 3x2 weight" "$a_shape" "3x2"
+check "the [0,1] consumer reads a 2x3 weight" "$b_shape" "2x3"
+check "the two consumers read different initializers" "$distinct" "True"
+
+rc=0; python3 "$TOOL" --check "$tmp/two_out.onnx" >/dev/null 2>&1 || rc=$?
+check "check accepts the two-perm folded graph" "$rc" 0
+
 echo "---"
 if [ "$fail" -ne 0 ]; then echo "$fail failed"; exit 1; fi
 echo "fold_initializer_transpose: all checks ok"

@@ -52,8 +52,15 @@ def fold(model):
             raise SystemExit(f"{src}: Transpose without a perm attribute cannot be folded")
         array = numpy_helper.to_array(inits[src])
         want = np.transpose(array, perm[0])
+        # The folded name has to distinguish the ORIENTATION, not just the source (engine#2779): a decoder that folds
+        # one weight two ways (two Transposes of the same initializer with different perms) otherwise reuses the first
+        # fold's array for the second's consumers - the graph keeps no Transpose, --check passes, and the pack holds a
+        # weight of the wrong shape for one of them (silently wrong values on a square weight).
+        perm_tag = "_".join(str(p) for p in perm[0])
         dst = f"{src}_t"
-        # A second reference to the same weight uses the same folded name, so a duplicated Transpose folds once.
+        if dst in inits and list(numpy_helper.to_array(inits[dst]).shape) != list(want.shape):
+            dst = f"{src}_t{perm_tag}"
+        # The suffix only appears for a second orientation; a single-perm caller keeps the byte-identical `w_t`.
         if dst not in inits:
             new = numpy_helper.from_array(np.ascontiguousarray(want), dst)
             graph.initializer.append(new)
@@ -66,7 +73,8 @@ def fold(model):
     if folded:
         gone = {f[1] for f in folded}
         keep = [n for n in graph.node if not (n.op_type == "Transpose" and n.input[0] in inits
-                                              and f"{n.input[0]}_t" in gone)]
+                                              and (f"{n.input[0]}_t" in gone or
+                                                   any(d in gone for d in n.output)))]
         del graph.node[:]
         graph.node.extend(keep)
         # An initializer the fold replaced and nothing else reads would otherwise be packed into the container.

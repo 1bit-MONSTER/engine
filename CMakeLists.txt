@@ -495,6 +495,9 @@ add_python_test(conflict_triage_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_triag
 # maintained by hand and nothing compared it to CMakeLists, so `stb_image` was fetched, compiled and
 # shipped without a licence line until a reviewer noticed. Matched on the GIT_REPOSITORY URL: that is
 # what the two files share (`stb` in CMake is `stb_image (nothings/stb)` in NOTICE, so the name is not).
+# engine#2643: provenance() tells apart four cases a reader cannot re-check by eye -- same commit, absent
+# object, ancestor at N commits, shallow clone -- and shipped with no arm. Hermetic: throwaway repos, no network.
+add_python_test(hw_gate_manifest_self ${CMAKE_SOURCE_DIR}/tools/hw_gate_manifest.py selftest)
 add_python_test(notice_covers_deps_self ${CMAKE_SOURCE_DIR}/tools/ci/notice_covers_deps.py --self-test)
 # `--root` is explicit: add_python_test() sets no WORKING_DIRECTORY, so ctest runs this row in the BUILD
 # directory and a `--root .` default would look for CMakeLists.txt where there is none (review of #2344 --

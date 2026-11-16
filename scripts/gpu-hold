@@ -492,6 +492,23 @@ fault_lines() {
     fi | grep -iE "$FAULT_RE" | grep -viE "$GPU_FAULT_SKIP_RE"
 }
 
+# WHAT THE TICKET HELD ON THE DEVICE, recorded at the moment a fault ends it (engine#2494). Every post-mortem of this
+# class has started by reconstructing that from `ps` and `/sys` after the fact, and the numbers are gone once the ticket
+# is killed: measured 2026-11-16, 67 fault blocks classified by hand with no memory figure for the faulting moment, and
+# the one that mattered (a 44.4 GiB serve that outlived its ticket) was only visible because `ps` still had it. A few
+# sysfs reads per descendant, no device call, before kill_tree runs.
+gpu_state_dump() {   # <payload-pid>; logs one line per KFD holder, or one line saying this ticket holds none
+    local p v q holders=0 kfd=/sys/class/kfd/kfd/proc
+    for p in $(descendants "$1"); do
+        [ -d "$kfd/$p" ] || continue
+        holders=$((holders + 1))
+        v=$(cat "$kfd/$p"/vram_* 2> /dev/null | head -1)
+        q=$(ls "$kfd/$p"/queues 2> /dev/null | wc -l)
+        log "  held: pid $p gpu=$(( ${v:-0} / 1048576 ))MiB queues=$q cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2> /dev/null | cut -c1-80)"
+    done
+    [ "$holders" -gt 0 ] || log "  held: no process of this ticket has a KFD context (this fault came from another lane's job)"
+}
+
 watch() {
     local target=$1 tick=0
     while sleep 2; do
@@ -507,6 +524,7 @@ watch() {
                 _dev=GPU; printf '%s\n' "$hits" | tail -1 | grep -qi amdxdna && _dev=NPU
                 log "::error::ABORT GPU/NPU fault in the kernel log during this hold - ending it before the next one (rc 78): newest line is from the ${_dev}; if this ticket is not for the ${_dev}, another lane's job produced it:"
                 printf '%s\n' "$hits" | tail -3 | while IFS= read -r l; do log "  $l"; done
+                gpu_state_dump "$target"   # before the kill: after it the numbers are gone
                 kill_tree "$target" "${GPU_HOLD_KILL_GRACE:-10}"
                 return
             fi

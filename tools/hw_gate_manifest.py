@@ -293,6 +293,81 @@ def cmd_memcheck(model, llama_dir):
     return 0
 
 
+def cmd_selftest():
+    """Arms for provenance(), which tells four easy-to-conflate cases apart and shipped with none (engine#2643).
+
+    Hermetic: throwaway repos in a temp dir, no network, no gate, no device. The case that matters most is the
+    last one -- a clone that holds a commit WITHOUT its parents answers "no common history" for two commits that
+    share one, which is exactly how #2643 first read an ancestor as a disjoint history.
+    """
+    import pathlib
+    import tempfile
+    import shutil
+
+    def run(repo, *a):
+        return subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True)
+
+    def commit(repo, name):
+        (pathlib.Path(repo) / name).write_text(name)
+        run(repo, "add", "-A")
+        run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", name)
+        return run(repo, "rev-parse", "HEAD").stdout.strip()
+
+    fails = 0
+
+    def check(got, want, what):
+        nonlocal fails
+        if isinstance(got, bool):
+            ok = got is want
+        elif isinstance(want, str):
+            ok = want in got
+        else:
+            ok = got == want
+        print(("ok   " if ok else "FAIL ") + what + ("" if ok else f"\n  want {want!r}\n  got  {got!r}"))
+        if not ok:
+            fails += 1
+
+    tmp = tempfile.mkdtemp(prefix="prov-")
+    try:
+        repo = os.path.join(tmp, "r")
+        os.makedirs(repo)
+        run(repo, "init", "-q", "-b", "main")
+        c1 = commit(repo, "one")
+        c2 = commit(repo, "two")
+        c3 = commit(repo, "three")
+
+        check(provenance(c1, c1, repo), "same commit", "the same commit is named, not diffed")
+        check(provenance(None, c3, repo), "cannot place (a null pin)", "a null recorded pin is refused")
+        check(provenance(c1, None, repo), "cannot place (a null pin)", "a null tested pin is refused")
+        check(provenance("0" * 40, c3, repo), "cannot place (", "an absent object is refused, not related")
+        check(provenance(c1, c3, repo), "golden is 2 commits behind", "an ancestor is counted, exactly")
+        check(provenance(c3, c1, repo), "golden is 2 commits AHEAD", "the reverse direction is distinct")
+        behind = provenance(c1, c3, repo)
+        check("behind" in behind and "AHEAD" not in behind, True, "the two directions never both appear")
+
+        # diverged: a branch from c2 that is not on main's tip
+        run(repo, "checkout", "-q", "-b", "side", c2)
+        side = commit(repo, "side-one")
+        run(repo, "checkout", "-q", "main")
+        d = provenance(side, c3, repo)
+        check(d, "diverged at", "two branches off one base are diverged, not related")
+        check("golden +1, tested +1" in d, True, "the divergence names both counts")
+
+        # the case #2643 got wrong: a SHALLOW clone holds the tip and none of its parents
+        shallow = os.path.join(tmp, "shallow")
+        subprocess.run(["git", "clone", "-q", "--depth", "1", "file://" + repo, shallow],
+                       capture_output=True, text=True)
+        got = provenance(c1, c3, shallow)
+        check(got, "cannot place (", "a shallow clone cannot place an older commit")
+        check("no common history" not in got, True,
+              "a shallow clone does NOT answer 'no common history' -- that was the #2643 misread")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print(f"hw_gate_manifest self-test: {fails} failure(s)")
+    return 1 if fails else 0
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
@@ -306,6 +381,8 @@ def main(argv):
         return cmd_memcheck(*args)
     if cmd == "judge" and len(args) == 3:
         return cmd_judge(*args)
+    if cmd == "selftest" and not args:
+        return cmd_selftest()
     if cmd == "placement" and len(args) == 1:
         return cmd_placement(*args)
     print(__doc__)

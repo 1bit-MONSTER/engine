@@ -30,6 +30,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 hold=$(mktemp -d); fake_home=$(mktemp -d)
 trap 'rm -rf "$hold" "$fake_home"' EXIT
 fail=0
+# The take-time refusal reads the kernel log and refuses a ticket after a recent fault line (#2480/#2498). On a box
+# whose NPU is faulting every few minutes (#2542) that refuses EVERY ticket, so this test would fail with rc 78 for a
+# reason that is not the code -- measured 2026-11-16 16:4xZ. The fixture is the same override the fault-abort test
+# uses: a log with no fault lines in it, so the refusal runs for real and finds nothing.
+printf 'kernel: gpu-hold test fixture: no fault lines in this log\n' > $hold/klog
+export GPU_HOLD_KLOG_FILE=$hold/klog
 
 claim() {   # claim: run one very short claim with the given HOME and hold dir, nothing else in the environment
     # the output is kept: gpu-hold logs "took <token>", which is the only evidence of WHICH token a claim used

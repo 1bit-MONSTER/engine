@@ -135,6 +135,42 @@ ships or was converted from it, and that reason is what makes the entry reviewab
 per **file**, never per model — `Qwen3-4B`'s GGUF in our org and the quant the box serves carry two
 different templates, both legitimate.
 
+## What the box holds
+
+A pin records the bytes we **mean** to serve; the daily check compares it with Hugging Face, which cannot see
+the box. So a pin can move to a new upstream file while the box keeps serving the old one, and every run stays
+green. That happened: `unsloth/Qwen3.8-27B-GGUF` was pinned at the UD3.1 `Qwen3.8-27B-UD-Q4_K_XL.gguf` on
+2026-11-12 (`2a5f3565…`, 17,659,407,264 B) while `~/models/qwen38/UD-Q4_K_XL/` and our re-host
+`1bit-MONSTER/Qwen3.8-27B-UD-Q4_K_XL-MTP` still held the earlier file (`3f227079…`, 17,559,178,144 B).
+
+`tools/pin_holdings.py` closes both halves:
+
+* **holdings** — [`models/holdings.json`](../models/holdings.json) maps a pinned file to its copy on the box.
+  Each copy's sha256 (the git blob id for a non-LFS file, which is what the pin records there) is compared with
+  the pin's oid. The hashes are cached by path, size, mtime and inode (`~/.cache/1bit/pin-holdings-sha256.json`),
+  so a daily run re-reads only a file that changed, and a size mismatch is reported without reading the file.
+  A path in the map is a promise that the box serves the pinned bytes: add one when a pinned file lands on the
+  box, and change it in the same PR that moves a default path.
+* **re-hosts** — a pin whose `used_for` says `upstream of <repo>` is compared, file by file of the same name,
+  with `<repo>`'s own pin. Both oids are in `models/pins.json`, so this half needs neither the box nor the
+  network (`--rehost-only`, which CI can run), and the box run reports it too. The fix is a re-upload, and
+  publishing is the owner's.
+
+| exit | meaning |
+|---|---|
+| 0 | every holding and every re-host matches its pin |
+| 1 | a holding differs from its pin or is missing, or a re-host holds a different file than its upstream pin |
+| 2 | usage, or a holding names a pin or file `models/pins.json` does not have (a wrong map is never clean) |
+
+On the box it runs daily from `scripts/1bit-pin-holdings.{service,timer}` (05:00 UTC); exit 1 marks the unit
+failed and the report is `~/.1bit/logs/pin-holdings-latest.md`.
+
+```bash
+tools/pin_holdings.py                       # both halves; report on stdout
+tools/pin_holdings.py --rehost-only         # pins.json only (CI)
+tools/pin_holdings.py --out r.md --json r.json
+```
+
 ## The repos we publish (the other direction)
 
 `--check` iterates over pins, so a repo that was never pinned is invisible to it — including one we publish

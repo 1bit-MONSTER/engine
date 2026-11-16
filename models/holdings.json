@@ -1,0 +1,15 @@
+{
+ "about": "The pinned files the development box (strixhalo) keeps, and where. tools/pin_holdings.py compares each copy's sha256 with its pin's oid (docs/model-pins.md, 'What the box holds'). A path here is a promise that the box serves the pinned bytes: add one when a pinned file lands on the box, and change it in the same PR that moves a default path.",
+ "host": "strixhalo",
+ "holdings": [
+  {"pin": "unsloth/Qwen3.8-27B-GGUF", "file": "Qwen3.8-27B-UD-Q4_K_XL.gguf", "path": "~/models/qwen38/UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf"},
+  {"pin": "1bit-MONSTER/Qwen3.8-27B-DFlash2-GGUF", "file": "Qwen3.8-27B-DFlash2-q4k.gguf", "path": "~/models/qwen38/DFlash2/Qwen3.8-27B-DFlash2-q4k.gguf"},
+  {"pin": "1bit-MONSTER/Qwen3.8-27B-DFlash2-GGUF", "file": "Qwen3.8-27B-DFlash2-q8_0.gguf", "path": "~/models/qwen38/DFlash2/Qwen3.8-27B-DFlash2-q8_0.gguf"},
+  {"pin": "unsloth/flint-GGUF", "file": "flint-UD-Q4_K_XL.gguf", "path": "~/models/flint/flint-UD-Q4_K_XL.gguf"},
+  {"pin": "unsloth/Qwen3-0.6B-GGUF", "file": "Qwen3-0.6B-Q4_K_M.gguf", "path": "~/models/Qwen3-0.6B-Q4_K_M.gguf"},
+  {"pin": "unsloth/Qwen3-4B-GGUF", "file": "Qwen3-4B-Q4_K_M.gguf", "path": "~/models/Qwen3-4B-Q4_K_M.gguf"},
+  {"pin": "1bit-MONSTER/ZAYA1-8B-GGUF", "file": "zaya1-8b-Q4_K_M.gguf", "path": "~/models/zaya1-8b-Q4_K_M.gguf"},
+  {"pin": "Qwen/Qwen2.5-0.5B-Instruct-GGUF", "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf", "path": "~/models/gpnpu/Qwen2.5-0.5B/qwen2.5-0.5b-instruct-q4_k_m.gguf"},
+  {"pin": "1bit-MONSTER/ZR1-1.5B-GGUF", "file": "ZR1-1.5B-Q4_K_M.gguf", "path": "~/models/zyphra-orig/quant/ZR1-1.5B/ZR1-1.5B-Q4_K_M.gguf"}
+ ]
+}

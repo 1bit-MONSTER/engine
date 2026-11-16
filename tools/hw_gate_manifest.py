@@ -153,6 +153,12 @@ def provenance(recorded, tested, repo):
         return f"{head}: same commit"
     for c in (recorded, tested):
         if _git(repo, "cat-file", "-e", c + "^{commit}")[0] != 0:
+            # engine#2713: "not in the repo" is two different facts -- the commit may be gone upstream, or the clone may be
+            # too shallow to have it. The first is a fact about the golden, the second about the runner, and a reader who
+            # cannot tell them apart retries the wrong thing. Say which one, and say it on the verdict line.
+            if _git(repo, "rev-parse", "--is-shallow-repository")[1].strip() == "true":
+                return (f"{head}: cannot place ({short(c)} is not in {repo}), and {repo} is a SHALLOW clone, so this is an "
+                        f"absent input rather than a wrong row: deepen the clone or fetch {short(c)} to evaluate it")
             return f"{head}: cannot place ({short(c)} is not in {repo})"
     if _git(repo, "merge-base", "--is-ancestor", recorded, tested)[0] == 0:
         n = _git(repo, "rev-list", "--count", f"{recorded}..{tested}")[1]

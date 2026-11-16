@@ -109,8 +109,15 @@ def _tp(event, rest):
 
 
 def parse_events(path):
-    """([(t, iova, size)] maps, [...] unmaps, Counter unrecognised, Counter widened) -- in log order."""
+    """([(t, iova, size)] maps, [...] unmaps, Counter unrecognised, Counter widened, Counter by_name) -- log order.
+
+    `by_name` is the audit trail: this file classifies by the PROBED FUNCTION (so it can read any lane's capture),
+    which means two lanes' probes on the same function land in one denominator. Measured 2026-11-16: a capture
+    meant to hold 2 filtered events held 389,508 from another lane's unfiltered probe on the same function, and
+    nothing in the output said so. Naming the event names and their counts makes a mixed capture visible.
+    """
     maps, unmaps, other, widened = [], [], collections.Counter(), collections.Counter()
+    by_name = collections.Counter()
     try:
         fh = open(path, errors="replace")
     except OSError as e:
@@ -124,8 +131,10 @@ def parse_events(path):
                     got = _tp(tp.group(2), tp.group(3))
                     if got and tp.group(2) == "map":
                         maps.append((float(tp.group(1)), got[0], got[1]))
+                        by_name["iommu:map"] += 1
                     elif got and tp.group(2) == "unmap":
                         unmaps.append((float(tp.group(1)), got[0], got[1]))
+                        by_name["iommu:unmap"] += 1
                     continue
                 loose = IOVA_LINE.search(line)
                 if loose:
@@ -141,7 +150,10 @@ def parse_events(path):
                 other[fn] += 1
             if (kind == "map" and fn not in MAP_FUNCS) or (kind == "unmap" and fn not in UNMAP_FUNCS):
                 widened[fn] += 1
-    return maps, unmaps, other, widened
+            # the event name is the token between the timestamp and the "(", e.g. "funm:" in "... 480.2: funm: ("
+            nm = re.search(r"\d+\.\d+:\s+(\S+):\s+\(", m.group(0))
+            by_name[nm.group(1) if nm else fn] += 1
+    return maps, unmaps, other, widened, by_name
 
 
 def parse_faults(path):
@@ -287,7 +299,7 @@ def self_test() -> int:
         (d / "before.txt").write_text(before)
         (d / "after.txt").write_text(after)
 
-        maps, unmaps, _other, _w = parse_events(str(d / "cap.txt"))
+        maps, unmaps, _other, _w, _by = parse_events(str(d / "cap.txt"))
         chk(len(maps) == 2 and len(unmaps) == 1, "a task name containing a space still parses (2 map, 1 unmap)")
         # 2b. the same events under ANOTHER lane's naming (`unm:`/`map:`/`prs2mp:`) parse identically, because the
         #     class comes from the probed function. A tool that only reads its own event names cannot read the
@@ -295,7 +307,7 @@ def self_test() -> int:
         #     are named `unm:`, and the first version of this file refused them.
         other = pathlib.Path(td) / "other.txt"
         other.write_text(cap.replace("capmap:", "whatever:").replace("capunm:", "unm:"))
-        m2, u2, _o2, _w2 = parse_events(str(other))
+        m2, u2, _o2, _w2, _by = parse_events(str(other))
         chk((m2, u2) == (maps, unmaps), "event names invented by another lane parse by the probed function, not the name")
         chk(all(e[2] == 0x1000 for e in maps + unmaps), "size parses as 4 KiB")
 
@@ -307,7 +319,7 @@ def self_test() -> int:
             "          <idle>-0       [001] ..s1. 1001.000000: p: (iommu_map_pages+0x4/0x80) iova=0x2000 size=0x1000\n"
             "          <idle>-0       [001] ..s1. 1002.000000: p: (iommu_map.part.0+0x4/0x80) iova=0x3000 size=0x1000\n"
             "          <idle>-0       [001] ..s1. 1003.000000: p: (iommu_tlb_sync+0x4/0x80) iova=0x4000 size=0x1000\n")
-        m4, u4, o4, w4 = parse_events(str(odd))
+        m4, u4, o4, w4, _by = parse_events(str(odd))
         chk(len(m4) == 3, "__iommu_map, iommu_map_pages and iommu_map.part.0 are all counted as maps (3)")
         chk(u4 == [] and o4 == {"iommu_tlb_sync": 1},
             "a function with neither word is counted, not dropped: %s" % dict(o4))
@@ -317,7 +329,7 @@ def self_test() -> int:
         # say so. A denylist would be a guess; a number a reader can see is not.
         odd2 = pathlib.Path(td) / "odd2.txt"
         odd2.write_text("          <idle>-0       [001] ..s1. 1000.000000: p: (bitmap_alloc+0x4/0x80) iova=0x1000 size=0x1000\n")
-        m6, _u6, _o6, w6 = parse_events(str(odd2))
+        m6, _u6, _o6, w6, _by = parse_events(str(odd2))
         chk(len(m6) == 1 and w6 == {"bitmap_alloc": 1},
             "a `map`-containing non-IOMMU name is counted AND surfaced (%s), so the map side cannot be inflated silently"
             % dict(w6))
@@ -376,6 +388,16 @@ def self_test() -> int:
         chk("no map probe in this capture" in txt and "no map of this iova" not in txt,
             "a row on a one-sided capture says the other half was never probed")
 
+        # 8b. a MIXED capture: two lanes' probe names on the same function pool into one denominator, and the header
+        #     must say so. Measured: 2 filtered events beside 389,508 from another lane's unfiltered probe.
+        mixed = pathlib.Path(td) / "mixed.txt"
+        mixed.write_text(
+            "   <idle>-0 [001] ..s1. 1000.5: funm: (iommu_unmap_fast+0x4/0x10) iova=0x4128000 size=0x1000\n"
+            "   <idle>-0 [001] ..s1. 1000.6: unmap: (iommu_unmap_fast+0x4/0x10) iova=0x4128000 size=0x1000\n")
+        _m, _u, _o, _w, by = parse_events(str(mixed))
+        chk(set(by) == {"funm", "unmap"} and sum(by.values()) == 2,
+            "each event name is counted, so a mixed capture is identifiable")
+
         # a fault outside the buffered range is named as such, not silently correlated
         rows3, _ = analyse(maps, unmaps, [(9000.0, 0x4128000)], [], [(9000.0, 0x4128000)])
         chk("OUTSIDE the buffered range" in rows3[0][2], "a fault the ring does not cover says so")
@@ -387,7 +409,7 @@ def self_test() -> int:
             "wget-1394013 [012] .... 34862.494290: unmap: IOMMU: iova=0x3d207000 size=4096\n"
             "irq/26-AMD-Vi-265 [003] .... 34862.494250: io_page_fault: IOMMU:nvme 0000:c4:00.0 iova=0x3d207000 flags=0x0000\n"
             "wget-1394013 [012] .... 34862.494300: map: IOMMU: iova=0x4e000000 size=0x1000\n")
-        m7, u7, o7, w7 = parse_events(str(tp))
+        m7, u7, o7, w7, _by = parse_events(str(tp))
         chk(len(m7) == 2 and len(u7) == 1 and o7 == {} and w7 == {},
             "tracepoint map/unmap parse by EVENT NAME, nothing unrecognised (2 map, 1 unmap) -- %s %s" % (o7, w7))
         chk(m7[0][2] == 4096 and m7[1][2] == 4096,
@@ -441,9 +463,18 @@ def main(argv):
     if not (a.trace and a.before and a.after):
         ap.print_help()
         return 2
-    maps, unmaps, other, widened = parse_events(a.trace)
+    maps, unmaps, other, widened, by_name = parse_events(a.trace)
     faults = parse_faults(a.after)
     rows, header = analyse(maps, unmaps, faults, parse_faults(a.before), faults, other, widened)
+    # Which event names produced this denominator. The classifier reads the PROBED FUNCTION, so a capture taken by
+    # two lanes' probes pools into one dataset without saying so -- measured 2026-11-16: a capture meant to hold 2
+    # filtered events held 389,508 from another lane's unfiltered probe on the same function, and the header read as
+    # if all of it were mine. Naming the names is the fix; more than one name per class is a MIXED capture.
+    if by_name:
+        header += "; events by name: " + ", ".join(f"{n} {c}" for n, c in by_name.most_common(4))
+        if len(by_name) > 1:
+            header += (" [MIXED: this capture holds more than one probe's events; the counts above are their sum, "
+                       "so filter or split before reading them as one lane's measurement]")
     for line in render(rows, header):
         print(line)
     return exit_code(maps, unmaps, faults)

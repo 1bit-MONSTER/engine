@@ -38,6 +38,7 @@ import os
 import sys
 import shutil
 import io
+import tempfile
 
 
 def read_samples(path):
@@ -56,6 +57,18 @@ def read_samples(path):
     except FileNotFoundError:
         pass
     return out
+
+
+# The sampler watches ONE device node (/dev/accel/accel0, the amdxdna NPU), so a fault belonging to another PCI
+# function says nothing about its holders. Measured 2026-11-16 on this box: 189 of 189 fault records in one capture
+# were `nvme 0000:c4:00.0 domain=0x0015`, and every one was attributed to whatever held the NPU at the time --
+# a category error, not a weak answer (the same correction engine#2623 made to the sibling reader).
+ACCEL_DEVICE = "amdxdna"
+
+
+def is_accel_fault(line):
+    """True when the fault line belongs to the device whose holders the sampler records."""
+    return ACCEL_DEVICE in line
 
 
 def read_attributions(path):
@@ -131,10 +144,18 @@ def in_window(samples, ts, window):
     return [s for s in samples if ts - window <= s[0] <= ts + window]
 
 
-def explain(samples, attributions, window):
-    """One block per fault: what was sampled around it, in order, and whether that identifies a single holder."""
+def explain(samples, attributions, window, any_device=False):
+    """One block per fault: what was sampled around it, in order, and whether that identifies a single holder.
+
+    A fault on another PCI function is reported as NOT THIS DEVICE: attributing an NVMe fault to the process holding
+    /dev/accel is a category error, and a reader that does it silently produces a confident wrong holder.
+    """
     lines = []
     for ts, _hits, fault in attributions:
+        if not any_device and not is_accel_fault(fault):
+            lines.append(f"  {ts}  NOT THIS DEVICE: the fault is not {ACCEL_DEVICE}'s, so the holders cannot explain it")
+            lines.append(f"      {fault[:110]}")
+            continue
         w = sorted(in_window(samples, ts, window), key=lambda s: s[0])
         if not w:
             verdict = "NO SAMPLE in the window: nothing can be attributed (this is not 'nobody held it')"
@@ -180,13 +201,17 @@ def self_test():
     #   window 1, fault 112 -> [111,113] -> {'-'}            sampled, nothing held the node
     #   window 5, fault 103 -> [98,108]  -> {111, 222}       AMBIGUOUS: the same fault is unambiguous at 3
     #   window 3, fault 200 -> [197,203] -> {}               nothing sampled: not evidence of absence
-    narrow, wide = "\n".join(explain(samples, [(100, "", "A"), (106, "", "B"), (109, "", "C"),
-                                               (200, "", "D")], 3)), "\n".join(explain(samples, [(103, "", "E")], 5))
+    # The fault text names the device, as every real line does -- the fixtures used to carry a bare "A"/"B", which
+    # is why none of them could see the category error engine#2623/#2542 found: a line with no device cannot be
+    # classified as ours or not.
+    A_ = "amdxdna 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0003 address=0x4128000]"
+    narrow, wide = "\n".join(explain(samples, [(100, "", A_), (106, "", A_), (109, "", A_),
+                                               (200, "", A_)], 3)), "\n".join(explain(samples, [(103, "", A_)], 5))
     assert narrow.count("one holder across 1 sample(s): pid 111") == 1, narrow
     assert narrow.count("one holder across 1 sample(s): pid 222") == 2, narrow   # faults B and C
     assert narrow.count("; 1 of 2 samples had nothing holding the node") == 1, narrow   # fault C
     assert "NO SAMPLE in the window" in narrow, narrow
-    dot = "\n".join(explain(samples, [(112, "", "F")], 1))
+    dot = "\n".join(explain(samples, [(112, "", A_)], 1))
     assert "sampled 1x, nothing held the node" in dot, dot
     assert "AMBIGUOUS: 2 holders inside +-5s (111, 222)" in wide, wide
     assert "not 'nobody held it'" in narrow, narrow
@@ -207,8 +232,27 @@ def self_test():
     assert "gpu-hold cl-b 2" in rendered, rendered          # the LAST span: what the process was relabelled with
     assert "cl-a" not in rendered, rendered
 
+    # engine#2542: a fault on another PCI function must be NAMED, not attributed to the NPU's holders. Measured on
+    # this box: 189 of 189 records in one capture were `nvme 0000:c4:00.0 domain=0x0015` and every one was given the
+    # process holding /dev/accel -- a category error that reads as a confident answer.
+    foreign = ("1794798810\t215633\t/serve\t-\tscope\tgpu-hold cl-a\t"
+               "[  321.308031] strixhalo kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged "
+               "[IO_PAGE_FAULT domain=0x0015 address=0xe4240000 flags=0x0000]\n")
+    ppath = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+    ppath.write(foreign); ppath.close()
+    try:
+        at = read_attributions(ppath.name)
+        assert len(at) == 1, at
+        out = "\n".join(explain(samples, at, 5))
+        assert "NOT THIS DEVICE" in out, out
+        assert "one holder" not in out, out
+        # ... and the override still lets a reader ask the cross-device question deliberately
+        out2 = "\n".join(explain(samples, at, 5, any_device=True))
+        assert "NOT THIS DEVICE" not in out2, out2
+    finally:
+        os.unlink(ppath.name)
+
     # A partially written row must not kill the reader.
-    import tempfile
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
         f.write("100\t111\t1\t/a serve\tscope\tticket\n")
         f.write("106\t22")                                  # torn
@@ -254,6 +298,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dir", default=os.path.expanduser("~/.cache/accel-sampler"))
     ap.add_argument("--window", type=int, default=5, help="the sampler's WINDOW_S (default 5)")
+    ap.add_argument("--any-device", action="store_true",
+                    help="also attribute faults from devices the sampler does not watch (default: name and skip them)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -298,7 +344,7 @@ def main():
         print(render_holders(t))
 
     print(f"\nattributions: {len(attrs)}")
-    for line in explain(samples, attrs, args.window):
+    for line in explain(samples, attrs, args.window, args.any_device):
         print(line)
     return 0
 

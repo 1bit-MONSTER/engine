@@ -1857,7 +1857,8 @@ is 12 bytes, epsilon then 10 zeros, and that pattern can occur inside 4-bit tile
 header. The pack was refused on 320 tensors, although its rewrite was right: Phi-3.5-mini and Phi-3-mini-128k have the
 identical layout and read with 0 gaps. Phi-4-mini (320) and Qwen2-7B (280) were refused the same way. The rewrite
 wrote every header, so the locator only checks that each one is where it was put, and refuses the copy by block when
-one is not.
+one is not. When the same process wrote the copy, the stride the writer measured from its own offsets (#2653) is a
+second witness: the arithmetic and the measurement must agree, or the pack is refused naming both.
 
 The export can also zero-pad the head (engine#2650). `CodeLlama-7b-Instruct-hf-onnx-ryzenai-npu` (vocab 32,016, so
 501 head tiles, the last holding 16 rows) carries 515 more tiles of zeros after the head. That is 1,016 tiles, 65,024

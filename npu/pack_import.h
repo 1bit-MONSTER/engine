@@ -999,6 +999,16 @@ std::string canonical_token_fconst17_exported(const std::string& path, const std
 // engine#2650: where the importer puts the layer blocks of `tok` (the Token .fconst it reads -- for a 1.7 headerless pack,
 // the canonical copy), given the pack directory it came from.
 FconstGeom locate_fconst_with_header_exported(const std::string& tok, const std::string& pack_dir, const Dims& dims);
+// engine#2650: the block stride and head size that the 1.7 rewrite above actually WROTE for `pack_dir` (measured from the
+// writer's own offsets), or 0 when this process did not rewrite that pack. The reader prefers these over the epsilon vote,
+// which loses when a 12-byte anchor occurs inside a 4-bit tile.
+int64_t fconst17_known_stride_exported(const std::string& pack_dir);
+// The two-witness decision itself (engine#2650 review): the stride to use, or 0 with `why` naming both when the epsilon
+// anchors and the rewrite's measurement disagree. Pure, so a test pins the refusal directly.
+int64_t fconst17_reconcile_exported(int64_t vote, int64_t recorded, std::string* why);
+int64_t fconst17_known_head_exported(const std::string& pack_dir);
+// Everything after the last layer block (a 64-byte header, the final norm, the head block), measured the same way.
+int64_t fconst17_known_tail_exported(const std::string& pack_dir);
 // The epsilon the graph's RMSNorm nodes state (0 when none), how many state it, and whether two disagree.
 float graph_norm_eps_exported(const std::string& onnx_path, int* nodes, bool* conflict);
 // The rms_norm_eps to serve with: config.json's when it states one, else the graph's when its nodes agree; when they

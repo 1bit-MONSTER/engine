@@ -48,26 +48,41 @@ import subprocess
 import sys
 
 HEAD_RE = re.compile(r"\b([0-9a-f]{7,40})\b")
-VERDICTS = ("READY", "CHANGES")
+# The merge gate's own reader (~/lb/verdict_sweep.py STRICT, ~/lb/pr-scan.py): `VERDICT at <sha>: <STATE>` at the start
+# of a line, nothing before it -- no `## ` heading, no state before the sha. A body this tool accepts must be one the
+# gate counts, or the tool is one more way to post an invisible verdict (review of #2620).
+GATE_RE = re.compile(r"^VERDICT at `?([0-9a-f]{7,40})`?:?\s*(READY|CHANGES|NOT READY)")
+GATE_RE_LINES = re.compile(GATE_RE.pattern, re.M)
+# NOT READY first: it contains READY, so a substring test in any other order reads it as READY (review of #2607).
+VERDICTS = ("NOT READY", "READY", "CHANGES")
 
 
 def first_line_sha(body):
-    """The head a verdict is about: the 7-hex in the FIRST line, which is what pr_review_queue matches."""
+    """The head a verdict is about: the sha of a gate-readable FIRST line (`VERDICT at <sha>: ...`), else any 7-40 hex
+    run in that line (so a malformed line can still be told apart from a stale one)."""
     first = body.splitlines()[0] if body.strip() else ""
+    m = GATE_RE.match(first)
+    if m:
+        return m.group(1)
     m = HEAD_RE.search(first)
     return m.group(1) if m else None
 
 
+# whole words, NOT READY first: "READYs" in "(abc1234 has its READYs)" is not a verdict, and NOT READY is not READY
+VERDICT_RE = re.compile(r"\b(NOT READY|READY|CHANGES)\b")
+
+
 def verdict_in_first_line(body):
     first = body.splitlines()[0] if body.strip() else ""
-    for v in VERDICTS:
-        if v in first:
-            return v
-    return None
+    m = VERDICT_RE.search(first)
+    return m.group(1) if m else None
 
 
-def classify(body, head):
-    """(ok, reason) for a body against a head -- pure, so the self-test can drive every case."""
+def classify(body, head, verdict=None):
+    """(ok, reason) for a body against a head -- pure, so the self-test can drive every case.
+
+    `verdict`, when given, is the VERDICT argument of --post: a body whose first line says something else is refused,
+    because that mismatch is exactly the mistake the argument exists to catch (review of #2607)."""
     if not body.strip():
         return False, "empty body"
     sha = first_line_sha(body)
@@ -77,6 +92,14 @@ def classify(body, head):
         return False, f"the first line names {sha}, the head is {head[:7]}: this would review code that is gone"
     if verdict_in_first_line(body) is None:
         return False, f"the first line names no verdict ({', '.join(VERDICTS)}); a reader cannot tell what it says"
+    first = body.splitlines()[0]
+    g = GATE_RE.match(first)
+    if g is None:
+        return False, ("the first line is not `VERDICT at <sha>: READY|CHANGES|NOT READY`, the only form the merge gate "
+                       "reads (~/lb/verdict_sweep.py STRICT): no heading, nothing before VERDICT, the state after the sha")
+    said = g.group(2)
+    if verdict is not None and said != verdict:
+        return False, f"the first line says {said}, the VERDICT argument is {verdict}"
     return True, "ok"
 
 
@@ -86,12 +109,32 @@ def pending_ids(reviews):
 
 
 def verdicted_at(reviews_and_comments, head):
-    """Whether any review or issue comment carries this head with a verdict word in it."""
+    """Whether any review or issue comment is a verdict about this head: its FIRST line names the head and a verdict.
+
+    Anywhere-in-the-body matching counted a "**Not a verdict** (abc1234 has its READYs)" note as a verdict, and the
+    post's read-back passed on any older one (review of #2616); the first line is also what pr_review_queue reads."""
+    # Mirrors the gate: any line of the body that is a gate-readable verdict about this head. (A reply that QUOTES such a
+    # line counts here exactly as it does for the gate -- which is the reason not to quote one.)
     for x in reviews_and_comments:
-        b = x.get("body") or ""
-        if head[:7] in b and any(v in b for v in VERDICTS):
-            return True
+        for m in GATE_RE_LINES.finditer(x.get("body") or ""):
+            if head.startswith(m.group(1)) or m.group(1).startswith(head[:7]):
+                return True
     return False
+
+
+def read_back_ok(obj, head, verdict, kind):
+    """(ok, reason) for the ONE object a post returned, read again by its id -- pure, for the self-test.
+
+    Proof that THIS post landed, not that some verdict exists: the body read back must classify as the verdict that
+    was posted, and a review must be attached to the head it is about (`commit_id`)."""
+    if not obj or "id" not in obj:
+        return False, f"the {kind} could not be read back by id"
+    ok, why = classify(obj.get("body") or "", head, verdict)
+    if not ok:
+        return False, f"the {kind} read back does not say it: {why}"
+    if kind == "review" and (obj.get("commit_id") or "") != head:
+        return False, f"the review is attached to {(obj.get('commit_id') or '?')[:7]}, not the head {head[:7]}"
+    return True, "ok"
 
 
 def gh(*args):
@@ -117,7 +160,7 @@ def do_check(repo, pr):
     pend = pending_ids(reviews)
     if pend:
         print(f"PENDING review(s) {pend}: every lane's post to this PR will be rejected until they are cleared")
-        print(f"  clear with: gh api -X DELETE repos/{repo}/pulls/{pr}/reviews/<id>")
+        print("  post with --as-comment (pr_review_queue reads comments too); the draft belongs to the lane that opened it")
     print(f"verdicted at this head: {'yes' if verdicted_at(reviews + comments, head) else 'NO'}")
     return 0
 
@@ -132,48 +175,56 @@ def do_post(repo, pr, body_file, verdict, dry_run, as_comment=False):
     except OSError as e:
         print(f"pr_verdict: {e}", file=sys.stderr)
         return 2
-    ok, why = classify(body, head)
+    ok, why = classify(body, head, verdict)
     if not ok:
         print(f"pr_verdict: refusing to post: {why}", file=sys.stderr)
         return 2
     pend = pending_ids(api_json(f"repos/{repo}/pulls/{pr}/reviews?per_page=100") or [])
     if pend and not as_comment:
         print(f"pr_verdict: refusing to post: pending review(s) {pend} block it "
-              f"(clear: gh api -X DELETE repos/{repo}/pulls/{pr}/reviews/<id>; or pass --as-comment, "
-              f"which pr_review_queue also reads)", file=sys.stderr)
+              f"(pass --as-comment, which pr_review_queue also reads; the draft is another lane's work and is "
+              f"theirs to submit or delete)", file=sys.stderr)
         return 2
     if dry_run:
         how = "comment" if as_comment else "review"
         print(f"would post {verdict} about {head[:7]} to {repo}#{pr} as a {how}")
         return 0
+    # Post through the REST API so the result carries the new object's id, and a review is pinned to `head` by
+    # commit_id (gh pr review attaches to whatever the head is at that moment).
+    kind = "comment" if as_comment else "review"
     if as_comment:
-        rc, out, err = gh("pr", "comment", str(pr), "--repo", repo, "--body-file", body_file)
+        rc, out, err = gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/comments", "-F", f"body=@{body_file}")
     else:
-        rc, out, err = gh("pr", "review", str(pr), "--repo", repo, "--comment", "--body-file", body_file)
+        rc, out, err = gh("api", "-X", "POST", f"repos/{repo}/pulls/{pr}/reviews", "-f", "event=COMMENT",
+                          "-f", f"commit_id={head}", "-F", f"body=@{body_file}")
     if rc != 0:
         print(f"pr_verdict: post failed: {(err or out).strip()[:200]}", file=sys.stderr)
         return 2
-    back = ((api_json(f"repos/{repo}/pulls/{pr}/reviews?per_page=100") or [])
-            + (api_json(f"repos/{repo}/issues/{pr}/comments?per_page=100") or []))
-    if not verdicted_at(back, head):
-        print(f"pr_verdict: posted, but no review at {head[:7]} is readable back: check the PR by hand", file=sys.stderr)
+    try:
+        oid = json.loads(out).get("id")
+    except ValueError:
+        oid = None
+    path = f"repos/{repo}/issues/comments/{oid}" if as_comment else f"repos/{repo}/pulls/{pr}/reviews/{oid}"
+    ok, why = read_back_ok(api_json(path) if oid else None, head, verdict, kind)
+    if not ok:
+        print(f"pr_verdict: posted, but {why}: check the PR by hand", file=sys.stderr)
         return 2
-    print(f"posted {verdict} about {head[:7]} (read back)")
+    print(f"posted {verdict} about {head[:7]} as {kind} {oid} (read back by id)")
     return 0
 
 
 def self_test():
     H = "abcdef1234567890"
-    assert first_line_sha("abcdef1 READY — ok\nmore") == "abcdef1"
+    assert first_line_sha("VERDICT at abcdef1: READY\nmore") == "abcdef1"
     assert first_line_sha("VERDICT: READY\nabcdef1 in the body") is None          # the trap: sha not in line 1
     assert verdict_in_first_line("abcdef1 CHANGES — no") == "CHANGES"
     assert verdict_in_first_line("abcdef1 maybe") is None
 
-    ok, why = classify("abcdef1 READY — one holder verified", H)
+    ok, why = classify("VERDICT at abcdef1: READY", H)
     assert ok, why
     ok, why = classify("VERDICT: READY\nthe head is abcdef1", H)
     assert not ok and "first line names no head" in why, why
-    ok, why = classify("1234567 READY", H)                                       # stale head
+    ok, why = classify("VERDICT at 1234567: READY", H)                                     # stale head
     assert not ok and "code that is gone" in why, why
     ok, why = classify("abcdef1 approved", H)                                     # no verdict word in line 1
     assert not ok and "no verdict" in why, why
@@ -182,12 +233,41 @@ def self_test():
 
     assert pending_ids([{"id": 1, "state": "PENDING"}, {"id": 2, "state": "COMMENTED"}]) == [1]
     assert pending_ids([{"id": 3, "state": "COMMENTED"}]) == []
-    assert verdicted_at([{"body": "abcdef1 READY — x"}], H)
+    assert verdicted_at([{"body": "VERDICT at abcdef1: READY"}], H)
     assert not verdicted_at([{"body": "READY — no head here"}], H)
     assert not verdicted_at([{"body": "abcdef1 looks fine"}], H)
     # the --as-comment fallback is read back from the ISSUE-comment list, same shape
-    assert verdicted_at([{"body": "abcdef1 READY — posted as a comment"}], H)
-    print("pr_verdict self-test: ok (head in line 1, stale head, missing verdict, empty, pending, read-back)")
+    assert verdicted_at([{"body": "VERDICT at abcdef1: READY\n(posted as a comment)"}], H)
+
+    # review of #2607: NOT READY is its own verdict, never READY
+    assert verdict_in_first_line("VERDICT at abcdef1: NOT READY") == "NOT READY"
+    assert verdict_in_first_line("abcdef1 has its READYs") is None
+    ok, why = classify("VERDICT at abcdef1: NOT READY", H, "READY")
+    assert not ok and "says NOT READY" in why, why
+    assert classify("VERDICT at abcdef1: NOT READY", H, "NOT READY") == (True, "ok")
+    # ... and the VERDICT argument must match the body
+    ok, why = classify("VERDICT at abcdef1: CHANGES", H, "READY")
+    assert not ok and "says CHANGES, the VERDICT argument is READY" in why, why
+
+    # review of #2616: a note that mentions the head is not a verdict, and an older verdict is not proof of this post
+    assert not verdicted_at([{"body": "**Not a verdict** (abcdef1 has its READYs)."}], H)
+    # the gate counts a verdict line anywhere in the body, so --check does too (and so a quoted one is a vote)
+    assert verdicted_at([{"body": "context first\nVERDICT at abcdef1: READY"}], H)
+
+    # review of #2620: only the gate's form is accepted -- the state after `at <sha>`, nothing before VERDICT
+    for bad in ("VERDICT: READY at abcdef1", "## VERDICT at abcdef1: READY", "abcdef1 READY — ok", "Verdict at abcdef1: READY"):
+        ok, why = classify(bad, H, "READY")
+        assert not ok, (bad, why)
+    assert classify("VERDICT at `abcdef1`: READY — fine", H, "READY") == (True, "ok")
+    assert not verdicted_at([{"body": "VERDICT: READY at abcdef1"}], H)              # the gate cannot see it
+    assert read_back_ok({"id": 7, "body": "VERDICT at abcdef1: READY", "commit_id": H}, H, "READY", "review") == (True, "ok")
+    assert not read_back_ok(None, H, "READY", "comment")[0]                        # nothing came back by that id
+    assert not read_back_ok({"id": 7, "body": "VERDICT at abcdef1: READY", "commit_id": "1234567890"}, H, "READY",
+                            "review")[0]                                            # attached to another head
+    assert not read_back_ok({"id": 7, "body": "VERDICT at abcdef1: CHANGES"}, H, "READY", "comment")[0]
+    assert read_back_ok({"id": 8, "body": "VERDICT at abcdef1: READY"}, H, "READY", "comment") == (True, "ok")
+    print("pr_verdict self-test: ok (head in line 1, stale head, missing verdict, empty, pending, NOT READY, "
+          "verdict argument, first-line verdicts, read-back by id)")
     return 0
 
 

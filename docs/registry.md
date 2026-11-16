@@ -48,7 +48,11 @@ At the current pins (llama.cpp `8c12dfa6`, 2026-11-15): 350 HF architectures map
 architectures in `gguf_architectures.hrx`. On 2026-10-04 (core strip): 290 HF architectures mapped, hrx 290, npu 7. The file
 also lists `gguf_architectures.hrx`, every GGUF architecture the pinned fork's runtime builds (141
 then): CMakeLists.txt compiles that list into `1bit serve`, which refuses any other architecture on
-hrx and cpu with a pointer to Lemonade's llamacpp backend. Mapped means a backend's code accepts the architecture; the census below reports how many were checked. `registry/architectures.json` always holds the current counts and the pins they come from: every pin bump regenerates it (`scripts/registry-regen.sh`, run by the bump workflows), and CI's `registry_pins` test fails a pin that moved without it.
+hrx and cpu with a pointer to Lemonade's llamacpp backend. Mapped means a backend's code accepts the architecture; the census below reports how many were checked. `registry/architectures.json` always holds the current counts and the pins they come from: every pin bump regenerates it (`scripts/registry-regen.sh`, run by the bump workflows), and CI's `registry_pins` test fails a pin that moved without it. Two rows, because there are two axes: `registry_pins`
+compares the recorded pin and never reads the fork, so `registry_content` (`--check`) is the one that regenerates the
+file from the pinned fork and fails a hand-edited CONTENT — the architecture list is compiled into `1bit serve`, and a
+one-line edit to it passed every other row (engine#2698). It skips (rc 77) where `third_party/llama.cpp` is not
+checked out, so a lane sees a skip with the checkout it needs rather than a pass it did not earn.
 
 **Reviewed gaps.** Some unmapped architectures only look like a supported family. [Architecture gaps](arch-gaps.md) records why each of them is not an alias. `registry/significant.json` lists those classes, and `tools/registry_build.py --check-gaps` (ctest `registry_gaps`) fails if one becomes mapped without a recorded reason.
 
@@ -192,7 +196,7 @@ quiet day — but an alert from the other watch still wins the exit code.
 
 ```
 tools/registry_build.py            # rebuild registry/architectures.json from the pins
-tools/registry_build.py --check    # exit 1 if it is stale
+tools/registry_build.py --check    # exit 1 if it is stale; rc 77 (a skip) without the llama.cpp submodule
 tools/registry_check.py build/1bit --models ~/models   # run the checks on Strix Halo
 tools/census.py                    # full HF sweep (about 420 pages)
 tools/census.py --report           # recompute coverage from the saved counts

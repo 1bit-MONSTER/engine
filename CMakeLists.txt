@@ -1336,6 +1336,15 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME registry_gaps_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_gaps_test.py)
     # a pin bump that did not regenerate the registry (only the gitlinks: no checkouts)
     add_test(NAME registry_pins COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-pins)
+    # the CONTENT axis, which registry_pins above cannot see: it compares one sha and never reads the fork, so a
+    # hand-edited architecture list or backend -- including `gguf_architectures.hrx`, which CMakeLists.txt compiles
+    # into hrx_archs.h and `serve` refuses architectures against -- passed every PR job (engine#2698). The content
+    # comes from a submodule, so this skips (77) where the fork is not checked out, like hrx_f16_narrowing_check.
+    add_test(NAME registry_content COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check)
+    set_tests_properties(registry_content PROPERTIES SKIP_RETURN_CODE 77)
+    # the row's own mutant: a fake fork and a fake gitlink in a scratch repo, so the content edit that made every
+    # other row green is proved to make this one red, and the no-checkout case is proved to be 77 and not 0.
+    add_test(NAME registry_content_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_content_test.py)
     # engine#1745 review: pin() reads the INDEX (a staged bump) and refuses an UNMERGED index instead of returning the
     # merge base. Hermetic: a scratch git repo and a copy of the tool, git only, ~0.1 s.
     add_test(NAME registry_pin_index COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_pin_index_test.py)

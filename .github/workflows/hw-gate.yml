@@ -80,6 +80,16 @@ jobs:
           set -euo pipefail
           git submodule sync -- third_party/llama.cpp third_party/hrx-system
           git -c protocol.version=2 submodule update --init --depth 1 third_party/llama.cpp third_party/hrx-system
+          # engine#2713: the KLD rows place each golden's `recorded_at` commit against the tested pin, and a
+          # `--depth 1` clone holds neither that object nor the ancestry between them -- so every KLD row came
+          # back "cannot place (...)" (INCOMPLETE, infra=1) and a labelled pin PR could not go green on any pin.
+          # Measured on the same fork: the depth-1 .git is 41 MB, and unshallowing this one submodule takes 27 s
+          # and 366 MB, after which all three golden bases place (234 / 16 / 7 commits behind the tested tree).
+          # hrx-system is not read by the KLD rows and stays shallow. Guarded so a runner that already holds the
+          # full history (a cached checkout) is a no-op rather than a `--unshallow on a complete repository` error.
+          if [ "$(git -C third_party/llama.cpp rev-parse --is-shallow-repository)" = true ]; then
+            git -C third_party/llama.cpp fetch --unshallow
+          fi
           git submodule status -- third_party/llama.cpp third_party/hrx-system
 
       - name: Pending status

@@ -41,11 +41,16 @@ import pathlib
 import re
 import sys
 
-# Three places a row can be written, and `cmake/*.cmake` is the one I missed on the first pass: engine#2456
+# FOUR places a self-test can be run from, and review of engine#2675 found two I had missed:
+#   cmake/*.cmake            -- engine#2456 already put four such rows in cmake/tests-unreferenced-selftest-rows.cmake
+#   .github/workflows/*.yml  -- ci.yml RUNS `template_bom.py --self-test` and `pin_watch.py --self-test` on every
+#                               push, in a `run:` block. A checker that reads only CMakeLists.txt and the pre-pr list
+#                               reports them unwired, which is a false positive on the class this file exists for.
+# The tuple below was `("CMakeLists.txt", "scripts/pre-pr-checks.sh")` on the first pass: engine#2456
 # already put four such rows in `cmake/tests-unreferenced-selftest-rows.cmake`, so a checker that read only
 # CMakeLists.txt and the pre-pr list reported them as unwired when they had been wired for a day.
 REFERENCE_SOURCES = ("CMakeLists.txt", "scripts/pre-pr-checks.sh")
-REFERENCE_GLOBS = ("cmake/*.cmake",)
+REFERENCE_GLOBS = ("cmake/*.cmake", ".github/workflows/*.yml", ".github/workflows/*.yaml")
 # The three spellings the tree uses. Kept as a tuple so the self-test can exercise one at a time.
 SELFTEST_MARKERS = ("--self-test", "--selftest", "selftest")
 MARKER_RE = re.compile(r"(?<![\w-])(" + "|".join(re.escape(m) for m in SELFTEST_MARKERS) + r")(?![\w-])")
@@ -141,6 +146,18 @@ def self_test() -> int:
         got = sorted(str(p.relative_to(root)) for p in unwired(tools, refs))
         chk(["tools/diag/orphan.py", "tools/selfonly.py"], got,
             "a tool no source names is reported (and a tool that only spells the flag is NOT wired)")
+
+        # engine#2675 review: `.github/workflows/` is a fourth place, and it is the one where two of the four tools
+        # already ran. A `run:` line is a wiring; a YAML comment naming the tool is not, exactly as for CMakeLists.
+        wf = root / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        # The `run:` line names the one tool that is otherwise unwired, so a reference set WITHOUT the workflows
+        # cannot produce the expected answer -- an arm whose fixture is already wired elsewhere does not test this.
+        (wf / "ci.yml").write_text("jobs:\n  t:\n    steps:\n      - run: python3 tools/diag/orphan.py --self-test\n")
+        (wf / "ci2.yaml").write_text("# tools/selfonly.py --self-test   <- a YAML comment, not a wiring\n")
+        got = sorted(str(p.relative_to(root)) for p in unwired(discover(root), references(root)))
+        chk(["tools/selfonly.py"], got,
+            "a workflow `run:` line counts as a wiring, and a workflow comment still does not")
 
         (root / "CMakeLists.txt").unlink()
         chk(None, references(root), "a reference source that cannot be read is None, not an empty string")

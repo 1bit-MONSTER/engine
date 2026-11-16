@@ -30,11 +30,12 @@ add_python_test(seal_manifest_self ${CMAKE_SOURCE_DIR}/tools/seal_manifest.py --
 # row runs anywhere -- the device is only needed for the input, never for the check.
 add_python_test(iommu_fault_census ${CMAKE_SOURCE_DIR}/tools/diag/iommu_fault_census.py --self-test)
 
-# engine#2478 review: four more tools carried a self-test that no row ran -- the same debt engine#2456 found for the
-# four above, found by `tools/ci/tool_selftest_wired_check.py` (which now fails when the list grows again). Each was
-# run at the spelling below before the row was written: `template_bom.py` and `pin_watch.py` and `split_ceiling.py`
-# take `--self-test`, `moe_q4nx_ref.py` takes the bare word.
-add_python_test(template_bom_self ${CMAKE_SOURCE_DIR}/tools/template_bom.py --self-test)
+# engine#2478 review: two more tools carried a self-test that nothing ran -- the same debt engine#2456 found for the
+# four above, found by `tools/ci/tool_selftest_wired_check.py` (which now fails when the list grows again).
+# `split_ceiling.py` takes `--self-test`, `moe_q4nx_ref.py` the bare word, each run at that spelling before its row.
+#
+# `template_bom.py` and `pin_watch.py` are NOT here on purpose: review of engine#2675 found that `.github/workflows/
+# ci.yml` already runs both on every push (`python3 tools/template_bom.py --self-test`, `tools/pin_watch.py
+# --self-test`). A row here would duplicate the run, and the checker now reads the workflows as a reference source.
 add_python_test(moe_q4nx_ref_self ${CMAKE_SOURCE_DIR}/tools/moe_q4nx_ref.py selftest)
-add_python_test(pin_watch_self ${CMAKE_SOURCE_DIR}/tools/pin_watch.py --self-test)
 add_python_test(split_ceiling_self ${CMAKE_SOURCE_DIR}/tools/split_ceiling.py --self-test)

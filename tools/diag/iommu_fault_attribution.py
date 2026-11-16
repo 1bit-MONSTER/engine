@@ -69,17 +69,22 @@ def faults(text):
     return out
 
 
-def samples(path):
-    """[(epoch, pid, ticket)] from the sampler log; a '-' pid is its 'nothing holds it' row."""
+def rows_from_text(text):
+    """[(epoch, pid, ticket)] from sampler-log text; a '-' pid is its 'nothing holds it' row."""
     rows = []
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) < 6 or not parts[0].strip().isdigit():
-                continue
-            rows.append((int(parts[0]), parts[1].strip(), parts[5].strip()))
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 6 or not parts[0].strip().isdigit():
+            continue
+        rows.append((int(parts[0]), parts[1].strip(), parts[5].strip()))
     rows.sort()
     return rows
+
+
+def samples(path):
+    """[(epoch, pid, ticket)] from the sampler log; a '-' pid is its 'nothing holds it' row."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return rows_from_text(f.read())
 
 
 def attribute(rows, boots, max_gap):
@@ -198,6 +203,17 @@ def self_test():
     ol = {w: (one, amb) for w, one, amb, _n, _z in outlook(rows, [5, 400])}
     assert ol[5][0] == 80.0 and ol[5][1] == 0.0, ol   # 4 of 5: the 200s sample IS the "-" row, so it is nothing-held
     assert ol[400][1] > 0.0, ol                               # 400s spans the handover -> ambiguous
+
+    # THE WRITER/READER CONTRACT. These are the sampler's own fixture lines, copied verbatim from
+    # tools/diag/accel_sampler.sh: if that writer changes its columns, this reader must fail here
+    # rather than silently parse zeros out of a shifted line.
+    contract = ("1000\t111\t1\t/serve A\t/scope/a\tticket1\n"
+                "1010\t222\t2\t/serve B\t/scope/b\tticket2\n")
+    assert rows_from_text(contract) == [(1000, "111", "ticket1"), (1010, "222", "ticket2")], \
+        rows_from_text(contract)
+    assert rows_from_text("1000\t-\t-\t-\t-\t-\n") == [(1000, "-", "-")], "the '-' row shape"
+    # And a line with fewer columns is skipped rather than mis-parsed into a holder.
+    assert rows_from_text("1000\t111\tonly-three\n") == [], "a short row must not become a holder"
 
     # Stamps and addresses are parsed, and non-fault lines are ignored.
     text = ("[1234.500000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0007]\n"

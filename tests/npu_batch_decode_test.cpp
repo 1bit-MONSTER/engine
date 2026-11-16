@@ -298,6 +298,68 @@ int main() {
         }
     }
 
+    // The two guards a serve caller can actually hit (review of #2734):
+    //   1. a second row submitted WHILE the first is in the pass that is running -- the queue alone does not catch it,
+    //      because the running round's jobs are swapped out of the queue before the pass;
+    //   2. a double release, which used to hand one slot to two requests.
+    {
+        Q4nxNpuForward srv;
+        if (!init(srv, d)) return 77;
+        onebit::NpuDecodeBatch batch(srv, 2, 0);
+        const int slot = batch.acquire();
+        if (slot < 0) {
+            std::printf("FAIL acquire for the in-flight arm\n");
+            return 1;
+        }
+        std::string why;
+        if (!batch.prefill(slot, {1, 2, 3}, nullptr, &why)) {
+            std::printf("FAIL prefill for the in-flight arm: %s\n", why.c_str());
+            return 1;
+        }
+        // Thread A starts a decode row; while it is running, the main thread submits a second row for the SAME slot.
+        std::string a_err;
+        std::thread a([&] {
+            std::vector<float> row;
+            if (!batch.step(slot, 4, 3, &row, &a_err)) a_err = "A refused: " + a_err;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));   // host GEMM: a row takes seconds
+        std::vector<float> row_b;
+        std::string b_err;
+        const bool b_ok = batch.step(slot, 5, 4, &row_b, &b_err);
+        a.join();
+        if (!a_err.empty()) {
+            std::printf("FAIL the first row of a slot was refused: %s\n", a_err.c_str());
+            return 1;
+        }
+        if (b_ok) {
+            std::printf("FAIL a second row was accepted while the first was in the running pass\n");
+            return 1;
+        }
+        if (b_err.find("in the pass that is running") == std::string::npos) {
+            std::printf("FAIL the in-flight refusal does not say why: %s\n", b_err.c_str());
+            return 1;
+        }
+        // Double release: the first frees it, the second must say so instead of freeing it twice.
+        if (!batch.release(slot)) {
+            std::printf("FAIL a held slot was not released\n");
+            return 1;
+        }
+        if (batch.release(slot)) {
+            std::printf("FAIL a double release was accepted (a second request could then take a slot still in use)\n");
+            return 1;
+        }
+        // ... and the slot is free exactly once: the next acquire gets it, the one after does not.
+        const int again = batch.acquire();
+        if (again < 0) {
+            std::printf("FAIL the released slot was not acquirable\n");
+            return 1;
+        }
+        if (batch.release(again) == false) {
+            std::printf("FAIL re-release after re-acquire failed\n");
+            return 1;
+        }
+    }
+
     // A full batch QUEUES a new request rather than failing it: two slots, two holders, a third caller that must wait
     // until one releases. This is the serve case -- a busy batch is not a bad request.
     {

@@ -89,13 +89,22 @@ class NpuDecodeBatch {
         return take();
     }
 
-    void release(int slot) {
-        if (slot < 0) return;
+    // false when the slot is out of range, was ALREADY free, or still has a row in the running pass. A double release is a
+    // caller bug and silently accepting it would let the next acquire() hand a slot to a second request while the first is
+    // still using it (review of #2734).
+    bool release(int slot) {
+        if (slot < 0) return false;
+        bool freed = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            if (size_t(slot) < free_.size()) free_[size_t(slot)] = true;
+            if (size_t(slot) < free_.size() && !free_[size_t(slot)] &&
+                !(inflight_.size() > size_t(slot) && inflight_[size_t(slot)] > 0)) {
+                free_[size_t(slot)] = true;
+                freed = true;
+            }
         }
-        cv_.notify_all();   // a request queued in acquire(wait_ms) is waiting for exactly this
+        if (freed) cv_.notify_all();   // a request queued in acquire(wait_ms) is waiting for exactly this
+        return freed;
     }
 
     // Run `tokens` as the slot's prompt (position 0 = a new sequence, which the forward clears). Blocking.
@@ -145,6 +154,14 @@ class NpuDecodeBatch {
         std::unique_lock<std::mutex> lk(mu_);
         if (size_t(j->slot) >= free_.size() || free_[size_t(j->slot)]) {
             if (why) *why = "decode batch: slot " + std::to_string(j->slot) + " is not held by this request";
+            return false;
+        }
+        if (inflight_.size() <= size_t(j->slot)) inflight_.resize(free_.size(), 0);
+        if (inflight_[size_t(j->slot)] > 0) {
+            if (why)
+                *why = "decode batch: slot " + std::to_string(j->slot) +
+                       " already has a row in the pass that is running (two rows of one sequence would interleave "
+                       "positions)";
             return false;
         }
         for (const auto& q : queued_)
@@ -223,6 +240,8 @@ class NpuDecodeBatch {
             for (const auto& q : queued_)
                 if (std::find(round_jobs.begin(), round_jobs.end(), q) == round_jobs.end()) rest.push_back(q);
             queued_.swap(rest);
+            if (inflight_.size() < free_.size()) inflight_.resize(free_.size(), 0);
+            for (const auto& q : round_jobs) inflight_[size_t(q->slot)]++;
             if (std::getenv("NPU_BATCH_DBG")) {
                 std::string line = "  [batch-dbg] round slots:";
                 for (int sl : slots) line += " " + std::to_string(sl);
@@ -251,6 +270,7 @@ class NpuDecodeBatch {
             lk.lock();
             for (size_t i = 0; i < round_jobs.size(); i++) {
                 auto& q = round_jobs[i];
+                if (inflight_[size_t(q->slot)] > 0) inflight_[size_t(q->slot)]--;
                 if (!err.empty()) {
                     q->err = err;
                 } else if (q->prefill) {
@@ -281,6 +301,10 @@ class NpuDecodeBatch {
     std::condition_variable cv_;
     std::vector<bool> free_;
     std::deque<std::shared_ptr<Job>> queued_;
+    // A slot whose row is IN THE PASS THAT IS RUNNING. The queue alone is not enough: a round's jobs are swapped out of
+    // `queued_` before the pass, so a second submit arriving mid-pass would not see them and would queue a second row for a
+    // sequence whose first row is still being computed (review of #2734).
+    std::vector<int> inflight_;
     long rounds_ = 0;
     int window_us_ = 2000;
     bool stopping_ = false;

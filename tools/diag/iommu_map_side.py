@@ -836,7 +836,7 @@ def main(argv):
             print(f"note: no faults in --after; using the {len(faults)} fault event(s) carried by the trace itself")
     # engine#2542: a capture that carries the marker and parses to nothing is in the wrong FORM, not empty. Saying which
     # form the parser reads turns "there were no faults" into "this file is not the shape I read".
-    for src in (a.after, a.trace):
+    for src in (a.after, a.before, a.trace):   # every source main() reads faults from, before included
         if not src:
             continue
         n = unparsed_faults(src)

@@ -340,6 +340,11 @@ add_test(NAME driver_refusal_census_selftest
 # live logs (a CI runner has no /dev/accel), and it pins the window arithmetic with hand-checked cases.
 add_test(NAME accel_attribution_selftest
          COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/diag/accel_attribution.py --self-test)
+# engine#2542's review loop: a verdict is a claim about a HEAD, and four measured failures (a pending review blocking
+# every lane, a body whose first line names no head, a stale head, an issue comment mistaken for a review) are
+# refusals here. Self-test only: it drives the pure decisions, never the API.
+add_test(NAME pr_verdict_selftest
+         COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/pr_verdict.py --self-test)
 # engine#2478/#2568: the unmap/fault ordering correlator. Volume is ruled out four ways (3 TiB O_DIRECT, 157 TiB of
 # mmap churn, three boots of uptime, 60,459 dma_iova_destroy calls in one build), so what is left is ordering -- and
 # this is the tool for it. Self-test only: it pins the four shapes (before / after / out-of-window / no timestamp) and

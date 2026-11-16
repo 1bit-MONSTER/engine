@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import os
 import collections
 import re
 import sys
@@ -530,6 +531,34 @@ def self_test() -> int:
     chk("no map event carried a paddr" in _b3.getvalue() and "later mapping exists" in _b3.getvalue(),
         "...and a fault BEFORE any mapping says so instead of falling forward")
     chk("unavailable" in page_class(0, flags="/nonexistent/kpageflags"), "an unreadable kpageflags says so, not 'none'")
+    # engine#2765 (1): a page class must not be attributed ACROSS an unmap. The issue's own trace: map, release,
+    # then fault 1.5 s later -- the page was gone when the fault happened, so a class there is worse than none.
+    pu = pathlib.Path(tempfile.mkdtemp()) / "map-unmap.txt"
+    pu.write_text("wget-1 [012] .... 1000.1: map: IOMMU: iova=0xe3ff5000 - 0xe3ff6000 paddr=0x1dd3dea000 size=4096\n"
+                  "wget-1 [012] .... 1002.0: unmap: IOMMU: iova=0xe3ff5000 - 0xe3ff6000 size=4096 unmapped_size=4096\n")
+    _b4 = _io.StringIO()
+    with _cl.redirect_stdout(_b4):
+        report_page_classes(str(pu), [(1003.5, 0xe3ff5000)])
+    _o4 = _b4.getvalue()
+    chk("no page class" in _o4 and "RELEASED" in _o4 and "paddr=" not in _o4,
+        "a mapping released before the fault gets no page class, and the release is named")
+    _b5 = _io.StringIO()
+    with _cl.redirect_stdout(_b5):
+        report_page_classes(str(pu), [(1001.0, 0xe3ff5000)])
+    chk("paddr=" in _b5.getvalue() and "RELEASED" not in _b5.getvalue(),
+        "...and a fault BEFORE the release still gets the class (the control)")
+
+    # engine#2765 (2): kpageflags is indexed by PAGE-SIZED entries, so a hardcoded 4096 reads another page's flags on
+    # another PAGE_SIZE. An explicit page size is honoured, and an unknown one is reported rather than guessed.
+    # Distinct entries, or the fixture cannot tell one page from another: entry 0 is UPTODATE|LRU (40), entry 1 is 0.
+    kp = pathlib.Path(tempfile.mkdtemp()) / "kpf"
+    kp.write_bytes(bytes([40, 0, 0, 0, 0, 0, 0, 0]) + bytes(8) + bytes([40, 0, 0, 0, 0, 0, 0, 0]) * 6)
+    chk(page_class(0, flags=str(kp), pagesize=4096) == "UPTODATE, LRU",
+        "paddr 0 at 4 KiB reads entry 0")
+    chk(page_class(4096, flags=str(kp), pagesize=4096) == "none",
+        "...and the next page reads entry 1, so the index really is paddr // pagesize")
+    chk(page_class(4096, flags=str(kp), pagesize=8192) == "UPTODATE, LRU",
+        "the same paddr at 8 KiB lands in entry 0: assuming 4096 would read a neighbour's flags")
 
     return 0 if ok else 1
 
@@ -581,17 +610,50 @@ def paddrs(path):
     return out
 
 
-def page_class(paddr, flags="/proc/kpageflags"):
-    """The kpageflags names for a physical address, or why it cannot be read (needs root; PAGE_SIZE assumed 4096)."""
+def page_size():
+    """The kernel's page size, or None if it cannot be determined.
+
+    `kpageflags` is indexed by PAGE-SIZED entries, so `paddr // 4096` on a kernel with another PAGE_SIZE reads a
+    DIFFERENT page's flags and prints them as the answer -- the one place in this file that guessed instead of
+    reporting (engine#2765). Everywhere else an unknown is `unavailable (…)`.
+    """
+    try:
+        size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        return None
+    return size if size > 0 else None
+
+
+def page_class(paddr, flags="/proc/kpageflags", pagesize=None):
+    """The kpageflags names for a physical address, or why it cannot be read (needs root)."""
+    ps = pagesize if pagesize is not None else page_size()
+    if ps is None:
+        return "unavailable (page size unknown, so kpageflags cannot be indexed)"
     try:
         with open(flags, "rb") as f:
-            f.seek(paddr // 4096 * 8)
+            f.seek(paddr // ps * 8)
             raw = f.read(8)
     except OSError as e:
         return f"unavailable ({e.strerror})"
     if len(raw) < 8:
         return "unavailable (past the end of kpageflags)"
     return decode_kpageflags(int.from_bytes(raw, "little"))
+
+
+def unmaps_of(trace):
+    """{iova: [t, ...]} -- when each IOVA was unmapped, so a page class is not attributed across a release."""
+    out = {}
+    rx = re.compile(r"(\d+\.\d+):\s+unmap:.*?iova=(0x[0-9a-f]+)")
+    try:
+        fh = open(trace, errors="replace")
+    except OSError as e:
+        raise SystemExit(f"iommu_map_side: cannot read {trace}: {e}")
+    with fh:
+        for line in fh:
+            m = rx.search(line)
+            if m:
+                out.setdefault(int(m.group(2), 16), []).append(float(m.group(1)))
+    return out
 
 
 def report_page_classes(trace, faults):
@@ -602,6 +664,7 @@ def report_page_classes(trace, faults):
     rather than falling forward to a later one -- the same rule as every other negative in this file.
     """
     pm = paddrs(trace)
+    um = unmaps_of(trace)
     for t, iova in faults:
         cands = [(mt, pa) for mt, pa in pm.get(iova, ()) if mt <= t]
         if not cands:
@@ -610,7 +673,19 @@ def report_page_classes(trace, faults):
                   f"{'' if not later else f' (a later mapping exists; it cannot be what the fault touched)'}")
             continue
         mt, pa = max(cands)
-        print(f"  {hex(iova):>12}  paddr={hex(pa):>14}  pfn={pa // 4096:<9}  {page_class(pa)}"
+        # A mapping released before the fault describes a page the faulting access could not have been using:
+        # engine#2765 measured exactly that (`map @1000.1, unmap @1002.0, fault @1003.5` printed a class for a page
+        # that had been gone for 1.5 s). A class there is worse than none -- it is engine#2478's "NEVER MAPPED OR
+        # UNMAPPED" shape with a confident label on it.
+        between = [ut for ut in um.get(iova, ()) if mt < ut <= t]
+        if between:
+            ut = max(between)
+            print(f"  {hex(iova):>12}  no page class: the mapping at t={mt:.3f} s was RELEASED at t={ut:.3f} s,"
+                  f" {t - ut:.1f} s before the fault -- the translation was absent when the fault happened")
+            continue
+        ps = page_size()
+        pfn = pa // ps if ps else 0
+        print(f"  {hex(iova):>12}  paddr={hex(pa):>14}  pfn={pfn:<9}  {page_class(pa, pagesize=ps)}"
               f"   (mapped at t={mt:.3f} s{'' if t - mt < 1 else f', {t - mt:.1f} s before the fault'})")
 
 

@@ -417,6 +417,13 @@ failure of the model. So a gate run from a shallow `third_party/llama.cpp` repor
 line, and `git -C third_party/llama.cpp fetch --unshallow` makes it answerable: the same goldens then read
 `golden is 227 commits behind the tested tree` and judge on their numbers. `diverged` and `AHEAD` stay relations a
 row can be judged on — only a missing relation is INCOMPLETE.
+
+The hw-gate workflow therefore unshallows that one submodule before the gate runs (engine#2713). A person running
+the gate by hand can fetch the history and re-run; a labelled PR's gate cannot, and with the pair checked out at
+`--depth 1` every KLD row was INCOMPLETE, so that check read red on any pin (engine#2692: 840 s in the gate, ops
+3604/3604, kat/needle/placement green, `kld SKIP x5`). The fetch is guarded on `--is-shallow-repository`, so a
+runner that already holds the history does nothing, and it is measured at 27 s and 366 MB on the gate box's own
+clone (41 MB depth-1 `.git` against 407 MB unshallowed).
 Their HRX base logits against a CPU run of the same file (`--device none`) give:
 
 | model | mean KLD | KLD p99 | same top token |

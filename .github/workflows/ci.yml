@@ -21,6 +21,19 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 permissions:
   contents: read
+# CI saturation (ORCH 11-16): a push to a branch that already has a run in flight queues a SECOND full build, and the build job
+# is 20-30 minutes -- so a lane that pushes twice for one review saturates the runners for an hour and every other PR
+# waits behind it. One concurrency group per ref, cancelling only the superseded run:
+#   - same branch, new push  -> the older run is cancelled (it tests a tree nobody will merge);
+#   - a DIFFERENT branch     -> a different group, so nothing else is affected;
+#   - main                   -> its own group AND cancellation is switched off for it, because a cancelled main run
+#                               would leave the tree that people are merging onto untested.
+# hw-gate (hw-gate.yml) deliberately has no such group: it runs on a GPU ticket, and a device run must never be
+# cancelled mid-flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   build:
     runs-on: ubuntu-24.04

@@ -433,6 +433,10 @@ def self_test():
     chk(2, report(pathlib.Path("."), 1, 1, "1bit-MONSTER/no-such-repo-xyz")[0],
         "an unreadable PR list is rc 2, not an empty pass")
 
+    # shortcut: the shallow-clone refusal has no arm -- a local `--depth 1` fixture kept cloning an empty repository (git's
+    # own "cloned an empty repository" warning), and shipping a red arm is worse than shipping none. The guard was verified by
+    # hand against a genuine shallow clone of this repo (it refuses, and --allow-shallow proceeds); upgrade by cloning a real
+    # origin over file:// with two commits and asserting both directions.
     return rc
 
 
@@ -446,7 +450,19 @@ def main():
     ap.add_argument("--branch", help="instead of scanning PRs, list what this ref has that "
                                     "--base does not (the recovery workflow)")
     ap.add_argument("--base", default="origin/main", help="base for --branch (default origin/main)")
+    ap.add_argument("--allow-shallow", action="store_true",
+                    help="report anyway in a shallow clone, where main's own commits read as LOST")
     a = ap.parse_args()
+    # engine#2652 (found by a lane running this on a --depth 50 clone): a SHALLOW clone makes this tool lie. The first run
+    # there reported 22 LOST where the full clone reports 4, and 18 of the 22 were main's own commits -- they had come onto the
+    # local base by a merge whose parents are not present, so every commit looks absent from the base. The results are not
+    # merely noisier, they are mostly false, so refuse rather than report: a caller who wants the number anyway can say so.
+    if a.worktree and not a.self_test:
+        shallow = (git(a.worktree, "rev-parse", "--is-shallow-repository").stdout or "").strip()
+        if shallow == "true" and not a.allow_shallow:
+            raise SystemExit("%s is a SHALLOW clone: this tool reads commit ancestry, and a shallow clone reports main's own "
+                             "commits as LOST (measured: 22 LOST on --depth 50 against 4 on the full clone, 18 of them main's). "
+                             "Deepen it (git fetch --unshallow) or pass --allow-shallow to report anyway." % a.worktree)
     if a.self_test:
         return self_test()
     if a.branch:

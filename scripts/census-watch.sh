@@ -77,7 +77,9 @@ fi
 echo "== census-watch $(date -u +%FT%TZ) ==" | tee "${LOG}"
 
 set +e
-python3 "${ROOT}/tools/census_watch.py" "$@" 2>&1 | tee -a "${LOG}"
+# -u: stdout and stderr both land in one file below, so an unbuffered stdout keeps them line-correct --
+# with buffering, a `!! … FAILED` line on stderr was written into the middle of the previous row (engine#2780).
+python3 -u "${ROOT}/tools/census_watch.py" "$@" 2>&1 | tee -a "${LOG}"
 RC=${PIPESTATUS[0]}
 set -e
 

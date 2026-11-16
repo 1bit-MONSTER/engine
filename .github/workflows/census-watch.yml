@@ -113,9 +113,14 @@ jobs:
           # whose 40 matched rows are all `?`/`.` rows the Q4NX gap conclusion never reached the issue -- the same
           # "issue looks empty" failure `#2677` was filed about, and a Q4NX gap's `->` line is its ONLY output.
           pat="UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|NPU FLM|SUPPORT MOVED|kernel-format|Q4NX \(NPU\)|support_pins"
-          lines=$({ grep -E "$pat" /tmp/census-watch.log | grep -F '!!'
+          # A row is an alert only if it IS one: the prefix, not the substring. On 2026-11-16 (#2780) the
+          # watcher's last stdout row and a `!! SUPPORT WATCH FAILED` line on stderr were written into the
+          # same line (block-buffered stdout, unbuffered stderr, one file), and `grep -F '!!'` promoted that
+          # `. NPU FLM … census-watch: !! SUPPORT WATCH FAILED …` line into the alert tier -- an informational
+          # row leading the alerts and eating one of the 21 slots.
+          lines=$({ grep -E "$pat" /tmp/census-watch.log | grep -E '^  !! '
                     grep -F -- '  -> ' /tmp/census-watch.log
-                    grep -E "$pat" /tmp/census-watch.log | grep -vF '!!' | grep -vF -- '  -> '; } | tr -d '`@' | head -n 40 | base64 -w0)
+                    grep -E "$pat" /tmp/census-watch.log | grep -vE '^  !! ' | grep -vF -- '  -> '; } | tr -d '`@' | head -n 40 | base64 -w0)
           echo "lines=$lines" >> "$GITHUB_OUTPUT"
           # Three outcomes, and the run colour has to mean something (the watcher's contract:
           # 0 quiet, 1 the alert, 2 the watch did not run).

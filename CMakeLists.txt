@@ -651,7 +651,9 @@ add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-tes
 # engine#1946: a test that returns 77 is green, and green-because-it-did-not-run is the failure this fleet keeps paying
 # for. `tools/ci/ctest_skips.py` reads a ctest log and reports every test that did not execute -- `***Skipped` (77) against
 # `tools/ci/ctest_skips.txt`, and `(Not Run)` (a missing binary) as a build-list mistake that can never be baselined.
-# Self-test only here: wiring it into ci.yml's Test step needs the log plus a `workflow`-scoped token (engine#1817).
+# The tool's `--self-test` is a ctest row; its useful mode (`--log`) runs in ci.yml's Test step, on that step's own log,
+# since engine#2730: a workflow edit needed a `workflow`-scoped token over HTTPS OAuth, which this fleet pushes over
+# `ssh://git@github.com/...` instead, so the row is no longer blocked. `--write` stays a manual developer action.
 add_python_test(ctest_skips_self ${CMAKE_SOURCE_DIR}/tools/ci/ctest_skips.py --self-test)
 # engine#2106 / #2102: the release gate's NPU serve check asserts the fast route, a decode floor, the first token and a
 # non-empty answer, because a serve on the slow per-op route still answers. --self-test drives the judging on the shape

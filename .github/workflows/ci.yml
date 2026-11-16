@@ -157,4 +157,18 @@ jobs:
             tokenizer_linear_test hrx_placement_test hrx_cwsr_test hrx_runtime_test npu_device_lock_test -j
       - name: Test
         # One hung test must not hold the job for hours: each test gets 10 minutes.
-        run: ctest --test-dir build --output-on-failure --timeout 600
+        # The log is kept for the next step: ctest prints `***Skipped` per skipped test and then counts those skips in
+        # `N% tests passed`, so the summary line alone cannot tell a suite that ran from a suite that did not.
+        run: |
+          set +e
+          ctest --test-dir build --output-on-failure --timeout 600 > build/ctest.log 2>&1
+          rc=$?
+          cat build/ctest.log
+          exit $rc
+      - name: Every test that did not run is a known one
+        # engine#2715/#2726 named all 16 tests that skip in this configuration, so the set is complete and the NEXT skip is
+        # the only unnamed row -- which is when this is worth running. `if: always()` because a red ctest still deserves the
+        # report, and a new skip is worth seeing beside it. rc 1 names the new skip; rc 2 means the log could not be read, and
+        # a check that cannot look is not a pass (tools/ci/ctest_skips.py).
+        if: always()
+        run: python3 tools/ci/ctest_skips.py --log build/ctest.log

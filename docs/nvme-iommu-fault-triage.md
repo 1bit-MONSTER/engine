@@ -29,11 +29,32 @@ tools/diag/iommu_fault_census.py --journal boot-2.txt --journal boot-1.txt --jou
 boot -2  0000:c4:00.0 domain=0x0015: 3800 faults, 10 distinct   x688 top
 boot -1  0000:c4:00.0 domain=0x0015: 2361 faults,  9 distinct   x301 top
 boot  0  0000:c4:00.0 domain=0x0015:  213 faults,  7 distinct   x81 top
-         -> few live mappings faulting over and over -> a stale translation: find the buffer
+         -> few live mappings faulting over and over
+         -> (11-16) NOT a stale translation: the probe below shows those addresses are never unmapped
 
 boot -2  0000:c6:00.1 domain=0x0002:  390 faults, 321 distinct  max 6 each
          -> many distinct pages about once each -> re-allocation: find the race
 ```
+
+**The one hypothesis this file got wrong, and how it was retired.** The shape above ("few live mappings faulting over and
+over") reads as a stale translation — a released buffer still being written, with lazy invalidation deferring the flush. That
+was the working hypothesis for a day. It is false for this stream, and a continuous probe settled it:
+
+```
+armed on iommu_unmap_fast filtered to ALL eight addresses that faulted in the current boot
+window  ~13 minutes, with a real burst underneath it
+faults  30 inside the window, all 30 on filtered addresses, 0 outside
+unmaps  of any of those eight addresses:  0        (fault totals 138 -> 168, unmap_events stayed 0)
+```
+
+**The IOVA is never unmapped while the device writes it.** No released buffer, no stale TLB entry, nothing for lazy
+invalidation to defer: the translation is simply absent when the write arrives. That moves the whole question from the
+*unmap* path to the **map** path — the address was never mapped in that context, or it is mapped with insufficient rights
+(`flags` bit 0 clear argues absent rather than denied), or the device is using an address a descriptor should not carry.
+
+Two method notes from getting this far, both now sections below: **a fixed capture window will keep missing seconds-long
+bursts** (three short windows missed three bursts, the last by seven seconds — the probe has to be armed continuously across
+the whole address set), and **the phenomenon must be live before the capture starts** (step 0).
 
 Four facts that constrain the answer, each of which cost a measurement to learn:
 

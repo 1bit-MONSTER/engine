@@ -138,6 +138,26 @@ four costs about ten lines:
 
 All of this needs root on the tracing filesystem; run the block under `sudo -s`.
 
+### Step 0, which this page learned the hard way twice: prove the *phenomenon* is live
+
+Validating the instrument says nothing about whether there is anything to observe. Twice in one night a capture was launched
+correctly and measured nothing, because the stream had already stopped:
+
+* five reproduction attempts (bulk read, random read, concurrency, direct write, a full build) all ran hours after the last
+  fault — they answered "does this load restart a stopped stream", not "does this load trigger it";
+* an 8-minute address-lifetime kprobe on the top faulting address opened **60 seconds after** the storm's last fault, so it
+  measured an idle system and its "0 unmaps" meant nothing.
+
+One line prevents both:
+
+```bash
+n=$(journalctl -k -b 0 --since '-5 min' | grep -c IO_PAGE_FAULT)
+[ "$n" -gt 0 ] || { echo "nothing is happening: $n faults in 5 min -- a capture now can only prove silence"; exit 1; }
+```
+
+Launch only when `$n` is non-zero, and record `$n` beside the result: a capture taken at 3 faults/minute and one taken at
+zero are not the same experiment, and a table that does not say which is which reads as stronger than it is.
+
 ```bash
 # 1. the probe exists and fires -- verify with a known-hot symbol the first time you use a new tracefs
 echo "p:hot ksys_write" >> /sys/kernel/tracing/kprobe_events

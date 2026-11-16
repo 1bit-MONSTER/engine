@@ -956,6 +956,19 @@ std::string fconst17_geometry(uint64_t size, const Dims& d, Fconst17Geom* g) {
 // Write the 1.8 form of a 1.7 headerless Token .fconst to `work`. Returns `work`, or the source path unchanged when the
 // file is not in that form (so a 1.8 / 1.9 pack is untouched). Throws when it IS that form and the graph does not give
 // layer 0's input norm.
+// engine#2650: the 1.7 rewrite writes every header itself, so the block stride of the copy it produces is known exactly --
+// but it was a local (`Fconst17Geom g`), and the reader downstream had nothing but bytes and asked the epsilon vote, which
+// loses to a 12-byte anchor occurring inside a 4-bit tile. Record what was written, keyed by the PACK (both the rewrite and
+// the reader are looking at the same pack, so no path matching is involved), and let the reader prefer it over the vote.
+namespace {
+struct Geom17Known {
+    int64_t stride = 0;   // bytes per layer block in the canonical copy, measured from the writer's own offsets
+    int64_t head = 0;     // the trailing head block
+    int64_t tail = 0;     // everything after the last layer block: a 64-byte header, the final norm, the head block
+};
+std::map<std::string, Geom17Known> g_geom17_by_pack;
+}  // namespace
+
 std::string canonical_token_fconst17(const std::string& path, const std::string& pack_dir, const Dims& d,
                                      const std::string& work) {
     Fconst fc = open_fconst(path);
@@ -1008,8 +1021,11 @@ std::string canonical_token_fconst17(const std::string& path, const std::string&
     char sep[64] = {0};
     sep[0] = 1;   // 1.8's gate/up | down separator: 01 then 63 zeros (measured)
     const auto put = [&](const uint8_t* p, int64_t n) { o.write(reinterpret_cast<const char*>(p), std::streamsize(n)); };
+    std::streampos block0 = 0;
     for (int L = 0; L < d.layers; ++L) {
         const uint8_t* b = fc.map + size_t(L) * size_t(g.stride);
+        if (L == 0) block0 = o.tellp();
+        if (L == 1) g_geom17_by_pack[pack_dir].stride = int64_t(o.tellp() - block0);   // measured, not derived
         o.write(hdr, 64);
         if (L == 0) put(in0.data(), 2 * H);
         else put(b - 2 * H, 2 * H);                                              // the previous block's trailing gain
@@ -1023,12 +1039,17 @@ std::string canonical_token_fconst17(const std::string& path, const std::string&
         o.write(sep, 64);
         put(b + g.payload + 2 * H + g.gu, g.down);
     }
+    const std::streampos tail0 = o.tellp();
     o.write(hdr, 64);
     put(fc.map + size_t(d.layers) * size_t(g.stride) - size_t(2 * H), 2 * H);   // the final norm
     put(fc.map + size_t(d.layers) * size_t(g.stride), g.head);
+    g_geom17_by_pack[pack_dir].tail = int64_t(o.tellp() - tail0);   // measured, so the test need not model it
     o.close();
     unmap_file(fc.map, fc.size);
     if (!o) throw std::runtime_error("writing " + work + " failed");
+    g_geom17_by_pack[pack_dir].head = g.head;
+    if (g_geom17_by_pack[pack_dir].stride == 0)   // one layer: no second block to measure against
+        g_geom17_by_pack[pack_dir].stride = g.stride + 3 * 64;   // the three 64-byte headers this loop writes per block
     std::fprintf(stderr, "1bit npu-pack: note: a Ryzen AI 1.7 headerless Token .fconst (engine#2634) was rewritten into its "
                          "1.8 form at %s (remove it when done)\n", work.c_str());
     return work;
@@ -1938,8 +1959,36 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
 // with "the epsilon headers do not repeat with a single period" while its own header reported the stride exactly.
 // So ask the header first on the SOURCE file (the canonical copy has the 1.9 header removed by construction), and keep the eps
 // vote as the fallback for packs with no 1.9 header -- the 1.8 / R1-Distill line, where it works today.
+// engine#2650 review: the two-witness decision as a pure function, so a test can pin the REFUSAL without a fixture that has
+// to lie about its own geometry. `vote` is the epsilon anchors' stride (0 when they failed); `recorded` is what the 1.7
+// rewrite measured while writing. Returns the stride to use, or 0 with `why` naming both numbers when they disagree -- a
+// wrong stride reads weights from the wrong place instead of failing cleanly, so a disagreement is refused, never tie-broken.
+int64_t fconst17_reconcile(int64_t vote, int64_t recorded, std::string* why) {
+    if (recorded <= 0) return vote;
+    if (vote != 0 && vote != recorded) {
+        *why = "the 1.7 rewrite produced stride " + std::to_string(recorded) + " and the epsilon anchors give " +
+               std::to_string(vote) + "; refusing rather than choosing";
+        return 0;
+    }
+    return recorded;
+}
+
 FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& pack_dir, const Dims& dims) {
     FconstGeom g = locate_fconst(tok, dims.eps_bits);
+    // engine#2650: if this process rewrote the pack from its 1.7 headerless form, the stride of the copy is known from the
+    // writer's own offsets, and the epsilon vote is the weaker witness (a 12-byte anchor occurs inside 4-bit tiles: measured
+    // 16,232,526 B into block 0 of Phi-3-mini-4k, at an offset that is not even 64-aligned, which cost 320 gaps).
+    if (const auto it = g_geom17_by_pack.find(pack_dir); it != g_geom17_by_pack.end() && it->second.stride > 0) {
+        std::string why;
+        const int64_t agreed = fconst17_reconcile(g.stride, it->second.stride, &why);
+        if (agreed == 0) {   // two witnesses that disagree: refuse naming both (see fconst17_reconcile)
+            g.why = why;
+            g.stride = 0;
+            return g;
+        }
+        if (g.stride == 0) g.why.clear();     // the vote failed; the rewrite's own measurement is the answer
+        g.stride = agreed;
+    }
     // engine#2604: the 1.8 gemma3 6-header form -- per-layer starts from every header, not one stride. Only on a file with
     // no 1.9 header (below, a 6-header 1.9 block is refused by name).
     auto six_18 = [&]() -> FconstGeom {
@@ -7792,6 +7841,24 @@ std::string fconst17_geometry_exported(uint64_t size, const Dims& d) {
     Fconst17Geom g;
     return fconst17_geometry(size, d, &g);
 }
+// engine#2650: what the 1.7 rewrite recorded for this pack (0 when it did not rewrite one). Exported so a test can check it
+// against the file the writer produced rather than against the same arithmetic that produced it.
+int64_t fconst17_reconcile_exported(int64_t vote, int64_t recorded, std::string* why) {
+    return fconst17_reconcile(vote, recorded, why);
+}
+int64_t fconst17_known_stride_exported(const std::string& pack_dir) {
+    const auto it = g_geom17_by_pack.find(pack_dir);
+    return it == g_geom17_by_pack.end() ? 0 : it->second.stride;
+}
+int64_t fconst17_known_tail_exported(const std::string& pack_dir) {
+    const auto it = g_geom17_by_pack.find(pack_dir);
+    return it == g_geom17_by_pack.end() ? 0 : it->second.tail;
+}
+int64_t fconst17_known_head_exported(const std::string& pack_dir) {
+    const auto it = g_geom17_by_pack.find(pack_dir);
+    return it == g_geom17_by_pack.end() ? 0 : it->second.head;
+}
+
 std::string canonical_token_fconst17_exported(const std::string& path, const std::string& pack_dir, const Dims& d,
                                               const std::string& work) {
     return canonical_token_fconst17(path, pack_dir, d, work);

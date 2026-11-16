@@ -71,10 +71,17 @@ fi
 # is "another lane holds the token and the guard still passes", so that is the case to drive.
 foreign="gpu-hold another-lane pid 999999 2026-11-14T00:00:00-04:00"
 printf '%s\n' "$foreign" > "$tmp/NPU-TOKEN"
-out=$(ONEBIT_BIN=/bin/true NPU_TOKEN_FILE="$tmp/NPU-TOKEN" NPU_HOLD_TICKET= bash "$SRC/scripts/npu-kernel-bitx.sh" /x /y 2>&1)
+# The bystander is simulated by EMPTYING the ticket variables -- and `NPU_HOLD_TICKET=` alone is not enough, because the
+# consumer reads GPU_HOLD_TICKET first (that is what npu-hold's chain exports). This test is run by lanes INSIDE a
+# gpu-hold ticket, which exports GPU_HOLD_TICKET to its payload, so the inherited line made the consumer answer "the
+# device ticket is not ours" (rc 2, a different message than this arm asserts) and the arm failed for every lane that
+# followed the one-GPU-job rule (measured 2026-11-16 19:2xZ, the engine suite's only failure of this file). Scrub both.
+out=$(env -u GPU_HOLD_TICKET -u GPU_HOLD_LABEL ONEBIT_BIN=/bin/true NPU_TOKEN_FILE="$tmp/NPU-TOKEN" NPU_HOLD_TICKET= \
+      bash "$SRC/scripts/npu-kernel-bitx.sh" /x /y 2>&1)
 rc=$?
 if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q 'cannot prove it owns the device'; then
-    echo "  ok   a foreign token with no ticket line is REFUSED by the consumer (rc 2)"
+    echo "  ok   a foreign token with no ticket line is REFUSED by the consumer (rc 2, also when the caller's own\
+         gpu-hold ticket exported GPU_HOLD_TICKET; mutant = drop the `env -u` and this fails inside a ticket)"
 else
     echo "  FAIL the consumer did not refuse a foreign token: rc=$rc"
     fails=$((fails + 1))

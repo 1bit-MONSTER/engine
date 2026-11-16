@@ -65,20 +65,37 @@ class NpuDecodeBatch {
     NpuDecodeBatch& operator=(const NpuDecodeBatch&) = delete;
 
     // A free slot, or -1 when every slot is taken. A request holds its slot from its prompt to its last token.
-    int acquire() {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (size_t i = 0; i < free_.size(); i++)
-            if (free_[i]) {
-                free_[i] = false;
-                return int(i);
-            }
-        return -1;
+    // `wait_ms >= 0` makes it QUEUE instead of failing, which is what a serve wants: the batch is full because other
+    // requests are being served, not because this one is wrong. -1 keeps the non-blocking form (and the test).
+    int acquire(long wait_ms = -1) {
+        std::unique_lock<std::mutex> lk(mu_);
+        auto take = [&]() -> int {
+            for (size_t i = 0; i < free_.size(); i++)
+                if (free_[i]) {
+                    free_[i] = false;
+                    return int(i);
+                }
+            return -1;
+        };
+        if (int s = take(); s >= 0 || wait_ms < 0) return s;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+        while (!stopping_) {
+            if (cv_.wait_until(lk, deadline, [&] { return stopping_ || std::any_of(free_.begin(), free_.end(),
+                                                                                  [](bool f) { return f; }); }))
+                break;
+            if (std::chrono::steady_clock::now() >= deadline) break;
+        }
+        if (stopping_) return -1;
+        return take();
     }
 
     void release(int slot) {
         if (slot < 0) return;
-        std::lock_guard<std::mutex> lk(mu_);
-        if (size_t(slot) < free_.size()) free_[size_t(slot)] = true;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (size_t(slot) < free_.size()) free_[size_t(slot)] = true;
+        }
+        cv_.notify_all();   // a request queued in acquire(wait_ms) is waiting for exactly this
     }
 
     // Run `tokens` as the slot's prompt (position 0 = a new sequence, which the forward clears). Blocking.

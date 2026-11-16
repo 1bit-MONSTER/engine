@@ -247,6 +247,51 @@ int main() {
                     batch.rounds());
     }
 
+    // A full batch QUEUES a new request rather than failing it: two slots, two holders, a third caller that must wait
+    // until one releases. This is the serve case -- a busy batch is not a bad request.
+    {
+        Q4nxNpuForward srv;
+        if (!init(srv, d)) return 77;
+        onebit::NpuDecodeBatch batch(srv, 2);
+        const int a = batch.acquire();
+        const int b2 = batch.acquire();
+        if (a < 0 || b2 < 0) {
+            std::printf("FAIL two slots on a fresh batch\n");
+            return 1;
+        }
+        if (batch.acquire(0) >= 0) {   // wait_ms = 0: still nothing free right now
+            std::printf("FAIL acquire(0) on a full batch returned a slot\n");
+            return 1;
+        }
+        std::chrono::steady_clock::time_point waited_until;
+        bool got = false;
+        std::thread waiter([&] {
+            const int s2 = batch.acquire(10000);   // queues until a release
+            waited_until = std::chrono::steady_clock::now();
+            got = s2 >= 0;
+            if (got) batch.release(s2);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (got) {
+            std::printf("FAIL the queued acquire returned while the batch was still full\n");
+            return 1;
+        }
+        const auto t_release = std::chrono::steady_clock::now();
+        batch.release(a);
+        waiter.join();
+        if (!got) {
+            std::printf("FAIL the queued acquire never got the freed slot\n");
+            return 1;
+        }
+        const double after_ms =
+            1000.0 * std::chrono::duration<double>(waited_until - t_release).count();
+        if (after_ms > 500) {
+            std::printf("FAIL the queued acquire took %.0f ms to notice a release\n", after_ms);
+            return 1;
+        }
+        batch.release(b2);
+    }
+
     // A second row for a slot whose first is still in flight is refused (it would interleave one sequence's positions).
     {
         Q4nxNpuForward solo;

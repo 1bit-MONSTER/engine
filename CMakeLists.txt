@@ -1834,6 +1834,13 @@ add_test(NAME npu_pb16i_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
                  ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.cpp)
+# The w4g32 weight image (q4nx_w4g32.h): the large-M int4-weight prefill tier's contract -- the b4 tile
+# order, the per-32 signed magnitudes, the A pack and the int64 reference.  No device; set
+# W4G32_VEC="<dir> M K N" to also check it against a gate vector set the NPU reproduced bit-exact.
+add_test(NAME npu_w4g32_layout
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_w4g32_layout_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
+                 ${CMAKE_SOURCE_DIR}/tests/npu_w4g32_layout_test.cpp)
 # The t2s weight stream (q4nx_weight_layout "t2s"): the same integer-exact weights at 2.125 b/w,
 # expanded on the core.  Its host-side contract is the file size, so the test pins the tile against
 # the numbers tools/q4nx_t2s.py measured on a real image (50,135,040 -> 23,674,880 B for gate/up).
@@ -2356,6 +2363,19 @@ if(ONEBIT_NPU)
     target_link_libraries(npu_dmabuf_import_test PRIVATE onebit_npu_lane)
     add_test(NAME npu_dmabuf_import COMMAND npu_dmabuf_import_test "")
     set_tests_properties(npu_dmabuf_import PROPERTIES SKIP_RETURN_CODE 77)
+
+    # The w4g32 prefill kernel (q4nx_w4g32.h, NPU_W4_PREFILL), bit-exact on the device against the CPU reference over a
+    # seed set and the edge set (|P| at the int16 bound, |C| at the int32 bound MAGMAX picks).  W4G32_GATE="<elf> M K N"
+    # names the ELF; unset it SKIPS (77).  It submits to the NPU: run it inside an npu-hold ticket.
+    add_executable(npu_w4g32_gate_test tests/npu_w4g32_gate_test.cpp)
+    target_include_directories(npu_w4g32_gate_test PRIVATE ${CMAKE_SOURCE_DIR}/npu/forward/include)
+    target_link_libraries(npu_w4g32_gate_test PRIVATE onebit_npu_lane)
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(npu_w4g32_gate_test PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    add_test(NAME npu_w4g32_gate COMMAND npu_w4g32_gate_test)
+    set_tests_properties(npu_w4g32_gate PROPERTIES SKIP_RETURN_CODE 77)
 
     # The model-generic forward (npu/forward): the GGUF-on-NPU serve route
     # (docs/npu.md, "Open"). q4nx_forward.cpp + its Q4NX dequant/pack/semantics

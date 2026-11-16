@@ -35,6 +35,7 @@
 
 #include "q4nx_weight_layout.h"   // bpos(): the container's device weight layout
 #include "q4nx_pb16i.h"          // the pb16i image: integer-exact ternary decode weights
+#include "q4nx_w4g32.h"          // the w4g32 image: the large-M int4-weight prefill tier
 #include "q4nx_t2s.h"            // the t2s stream: the same weights at 2.125 bits/weight
 #include "q4nx_pack.h"           // q4nx_elf_arg_sizes(): args_fit_elf() checks the ELF's own widths
 #include "quant_i8.h"             // the A-row quantiser: scalar reference + an AVX2 path, byte-identical
@@ -116,6 +117,14 @@ struct I8Ctx {
     // `_m16` ELFs are byte-identical to the one-row design), which is why the batched paths fall back
     // to per-row launches.  Measured 2026-11-02 on the OGA 0.5B pack's five ELFs.
     bool gemv = false;
+    // Weight image "w4g32" (q4nx_w4g32.h; NPU_W4_PREFILL=1, engine HETEROMOSAIC-2): the large-M int4-weight prefill
+    // tier.  The BO holds the container's own int4 codes plus a signed int8 magnitude per (32-K group, column), built at
+    // the weight-cache fill by factor() of the same assembled float B the int8 image is packed from; group_scales[l]
+    // carries the per-column cs, so dequant_only_rows() is unchanged.  A is quantised exactly as the int8 path does
+    // (q4nx_quant_i8::row into a row-major scratch), then permuted into the design's per-32-row tile order.
+    bool w4g32 = false;
+    std::vector<int8_t> w4_rows_;      // w4g32: the row-major int8 rows before pack_a()
+    int w4_written_rows_ = -1;         // rows of w4_rows_ that may be non-zero (-1 = unknown: zero it all)
     uint16_t* Ag = nullptr;   // gemv: the bf16 activation BO, mapped
     float*    Cg = nullptr;   // gemv: the f32 output BO, mapped
 
@@ -181,6 +190,7 @@ struct I8Ctx {
     size_t w_bytes() const {
         if (gemv) return gemv_w_bytes(KD, ND);
         if (t2s) return q4nx_t2s::w_bytes(KD, ND);
+        if (w4g32) return q4nx_w4g32::w_bytes(KD, ND);
         return pb16i ? q4nx_pb16i::w_bytes(KD, ND) : (size_t)KD * (size_t)ND;
     }
 
@@ -206,6 +216,11 @@ struct I8Ctx {
         if (t2s && !q4nx_t2s::fits(KD, ND)) {
             fprintf(stderr, "  I8Ctx::init_elf: the t2s layout needs K%%256==0 and N%%32==0 "
                             "(K=%d N=%d)\n", KD, ND);
+            return false;
+        }
+        if (w4g32 && (pb16i || t2s || blocked_b || !q4nx_w4g32::fits(KD, ND) || ND % 1024 || MD % 128)) {
+            fprintf(stderr, "  I8Ctx::init_elf: the w4g32 layout needs K%%128==0, N%%1024==0, M%%128==0 and no other "
+                            "weight layout (M=%d K=%d N=%d)\n", MD, KD, ND);
             return false;
         }
         if (pb16i && !t2s && !q4nx_pb16i::fits(KD, ND)) {
@@ -526,8 +541,41 @@ struct I8Ctx {
     }
 
     // Pack weights into an arbitrary (already-allocated) weight BO.
+    // w4g32: factor + pack the assembled B[K][N] (zero-padded to KD x ND) into `img`; col = the per-column cs.  A weight
+    // that is not code x per-32 scale exactly cannot run on this tier, and there is no int8 image to fall back to inside
+    // this context, so it is a hard, named stop: unset NPU_W4_PREFILL for this model.
+    void packB_w4g32(uint8_t* img, const float* w, int K, int N, std::vector<float>& col, double& ssum) {
+        const float* B = w;
+        std::vector<float> pad;
+        if (K != KD || N != ND) {
+            pad.assign((size_t)KD * ND, 0.0f);
+            for (int k = 0; k < K; k++) memcpy(pad.data() + (size_t)k * ND, w + (size_t)k * N, (size_t)N * sizeof(float));
+            B = pad.data();
+        }
+        std::vector<int8_t> code((size_t)KD * ND);
+        std::vector<float> sc((size_t)(KD / q4nx_w4g32::GROUP) * ND), cs((size_t)ND);
+        if (!q4nx_w4g32::factor(B, KD, ND, code.data(), sc.data()) ||
+            !q4nx_w4g32::pack(code.data(), sc.data(), KD, ND, img, cs.data())) {
+            fprintf(stderr, "  I8Ctx: NPU_W4_PREFILL: a K=%d N=%d weight is not int4 code x per-32 scale exactly, so the "
+                            "w4g32 tier cannot carry it; unset NPU_W4_PREFILL for this model\n", K, N);
+            std::exit(3);
+        }
+        col.assign(cs.begin(), cs.begin() + N);
+        ssum = 0;
+        for (int n = 0; n < N; n++) ssum += (double)col[(size_t)n];
+    }
+
     void packB_into(xrt::bo& bo, const float* w, int K, int N,
                     float& sout, std::vector<float>& col_out) {
+        if (w4g32) {
+            std::vector<float> col;
+            double ssum = 0;
+            packB_w4g32((uint8_t*)bo.map(), w, K, N, col, ssum);
+            bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            col_out = std::move(col);
+            sout = (float)(ssum / N);
+            return;
+        }
         auto* Bm = (int8_t*)bo.map();
         memset(Bm, 0, (size_t)KD * ND);
         std::vector<float> col(N);
@@ -616,6 +664,15 @@ struct I8Ctx {
         // per-tensor scale packed low-magnitude columns (Qwen3 v_proj rms
         // ~0.007 vs q/k ~0.02-0.03) onto ~10 int8 levels -> ~5% output error
         // that compounds over 28 layers and flips the final token.
+        if (w4g32) {
+            std::vector<float> col;
+            double ssum = 0;
+            packB_w4g32((uint8_t*)layerB[l]->map(), w, K, N, col, ssum);
+            layerB[l]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            group_scales[l] = std::move(col);
+            sout = (float)(ssum / N);
+            return;
+        }
         auto* Bm = (int8_t*)layerB[l]->map();
         memset(Bm, 0, (size_t)KD * ND);
         std::vector<float> col(N);
@@ -670,6 +727,23 @@ struct I8Ctx {
     // to whatever the BO was allocated with. That is the defect this line closes: -1 means "nothing known yet",
     // which costs one whole-BO zero on the first launch and cannot depend on the allocation or on member order.
     int a_written_rows_ = -1;   // rows [0, a_written_rows_) may hold host data; -1 = nothing known yet
+
+    // w4g32: prepare_activation()'s zeroing rules, applied to the row-major scratch; then the whole of bA is rewritten by
+    // pack_a() (the tile order interleaves every row, so there is no narrow dirty range).
+    inline int8_t* w4_prepare(int am, int ak) {
+        if (w4_rows_.size() != (size_t)MD * KD) { w4_rows_.assign((size_t)MD * KD, 0); w4_written_rows_ = 0; }
+        if (ak != KD || w4_written_rows_ < 0) {
+            memset(w4_rows_.data(), 0, w4_rows_.size());
+        } else if (w4_written_rows_ > am) {
+            memset(w4_rows_.data() + (size_t)am * KD, 0, (size_t)(w4_written_rows_ - am) * KD);
+        }
+        w4_written_rows_ = ak != KD ? -1 : am;   // a short K leaves the column tail to re-zero next time too
+        return w4_rows_.data();
+    }
+    inline void w4_finish() {
+        q4nx_w4g32::pack_a(w4_rows_.data(), KD, MD, KD, Am);
+        a_dirty(MD);
+    }
 
     inline void prepare_activation(int am, int ak) {
         if (ak != KD || a_written_rows_ < 0) {
@@ -728,6 +802,12 @@ struct I8Ctx {
         last_am_ = am;
         if (gemv) { quantize_bf16(A, am, ak); return Am; }
         float ais = 1.0f / ascale;
+        if (w4g32) {
+            int8_t* rows = w4_prepare(am, ak);
+            for (int m = 0; m < am; m++) q4nx_quant_i8::row(A + (size_t)m * ak, ak, ais, rows + (size_t)m * KD);
+            w4_finish();
+            return Am;
+        }
         prepare_activation(am, ak);
         for (int m = 0; m < am; m++)
             q4nx_quant_i8::row(A + (size_t)m * ak, ak, ais, Am + (size_t)m * KD);
@@ -755,6 +835,13 @@ struct I8Ctx {
             return Am;
         }
         last_am_ = am;
+        if (w4g32) {
+            int8_t* rows = w4_prepare(am, ak);
+            for (int m = 0; m < am; m++)
+                q4nx_quant_i8::row(A + (size_t)m * ak, ak, 1.0f / ascales[m], rows + (size_t)m * KD);
+            w4_finish();
+            return Am;
+        }
         prepare_activation(am, ak);
         for (int m = 0; m < am; m++)
             q4nx_quant_i8::row(A + (size_t)m * ak, ak, 1.0f / ascales[m], Am + (size_t)m * KD);

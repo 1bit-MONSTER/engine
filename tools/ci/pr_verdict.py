@@ -48,13 +48,22 @@ import subprocess
 import sys
 
 HEAD_RE = re.compile(r"\b([0-9a-f]{7,40})\b")
+# The merge gate's own reader (~/lb/verdict_sweep.py STRICT, ~/lb/pr-scan.py): `VERDICT at <sha>: <STATE>` at the start
+# of a line, nothing before it -- no `## ` heading, no state before the sha. A body this tool accepts must be one the
+# gate counts, or the tool is one more way to post an invisible verdict (review of #2620).
+GATE_RE = re.compile(r"^VERDICT at `?([0-9a-f]{7,40})`?:?\s*(READY|CHANGES|NOT READY)")
+GATE_RE_LINES = re.compile(GATE_RE.pattern, re.M)
 # NOT READY first: it contains READY, so a substring test in any other order reads it as READY (review of #2607).
 VERDICTS = ("NOT READY", "READY", "CHANGES")
 
 
 def first_line_sha(body):
-    """The head a verdict is about: the 7-hex in the FIRST line, which is what pr_review_queue matches."""
+    """The head a verdict is about: the sha of a gate-readable FIRST line (`VERDICT at <sha>: ...`), else any 7-40 hex
+    run in that line (so a malformed line can still be told apart from a stale one)."""
     first = body.splitlines()[0] if body.strip() else ""
+    m = GATE_RE.match(first)
+    if m:
+        return m.group(1)
     m = HEAD_RE.search(first)
     return m.group(1) if m else None
 
@@ -83,7 +92,12 @@ def classify(body, head, verdict=None):
         return False, f"the first line names {sha}, the head is {head[:7]}: this would review code that is gone"
     if verdict_in_first_line(body) is None:
         return False, f"the first line names no verdict ({', '.join(VERDICTS)}); a reader cannot tell what it says"
-    said = verdict_in_first_line(body)
+    first = body.splitlines()[0]
+    g = GATE_RE.match(first)
+    if g is None:
+        return False, ("the first line is not `VERDICT at <sha>: READY|CHANGES|NOT READY`, the only form the merge gate "
+                       "reads (~/lb/verdict_sweep.py STRICT): no heading, nothing before VERDICT, the state after the sha")
+    said = g.group(2)
     if verdict is not None and said != verdict:
         return False, f"the first line says {said}, the VERDICT argument is {verdict}"
     return True, "ok"
@@ -99,10 +113,12 @@ def verdicted_at(reviews_and_comments, head):
 
     Anywhere-in-the-body matching counted a "**Not a verdict** (abc1234 has its READYs)" note as a verdict, and the
     post's read-back passed on any older one (review of #2616); the first line is also what pr_review_queue reads."""
+    # Mirrors the gate: any line of the body that is a gate-readable verdict about this head. (A reply that QUOTES such a
+    # line counts here exactly as it does for the gate -- which is the reason not to quote one.)
     for x in reviews_and_comments:
-        first = ((x.get("body") or "").strip().splitlines() or [""])[0]
-        if head[:7] in first and verdict_in_first_line(first) is not None:
-            return True
+        for m in GATE_RE_LINES.finditer(x.get("body") or ""):
+            if head.startswith(m.group(1)) or m.group(1).startswith(head[:7]):
+                return True
     return False
 
 
@@ -199,16 +215,16 @@ def do_post(repo, pr, body_file, verdict, dry_run, as_comment=False):
 
 def self_test():
     H = "abcdef1234567890"
-    assert first_line_sha("abcdef1 READY — ok\nmore") == "abcdef1"
+    assert first_line_sha("VERDICT at abcdef1: READY\nmore") == "abcdef1"
     assert first_line_sha("VERDICT: READY\nabcdef1 in the body") is None          # the trap: sha not in line 1
     assert verdict_in_first_line("abcdef1 CHANGES — no") == "CHANGES"
     assert verdict_in_first_line("abcdef1 maybe") is None
 
-    ok, why = classify("abcdef1 READY — one holder verified", H)
+    ok, why = classify("VERDICT at abcdef1: READY", H)
     assert ok, why
     ok, why = classify("VERDICT: READY\nthe head is abcdef1", H)
     assert not ok and "first line names no head" in why, why
-    ok, why = classify("1234567 READY", H)                                       # stale head
+    ok, why = classify("VERDICT at 1234567: READY", H)                                     # stale head
     assert not ok and "code that is gone" in why, why
     ok, why = classify("abcdef1 approved", H)                                     # no verdict word in line 1
     assert not ok and "no verdict" in why, why
@@ -217,11 +233,11 @@ def self_test():
 
     assert pending_ids([{"id": 1, "state": "PENDING"}, {"id": 2, "state": "COMMENTED"}]) == [1]
     assert pending_ids([{"id": 3, "state": "COMMENTED"}]) == []
-    assert verdicted_at([{"body": "abcdef1 READY — x"}], H)
+    assert verdicted_at([{"body": "VERDICT at abcdef1: READY"}], H)
     assert not verdicted_at([{"body": "READY — no head here"}], H)
     assert not verdicted_at([{"body": "abcdef1 looks fine"}], H)
     # the --as-comment fallback is read back from the ISSUE-comment list, same shape
-    assert verdicted_at([{"body": "abcdef1 READY — posted as a comment"}], H)
+    assert verdicted_at([{"body": "VERDICT at abcdef1: READY\n(posted as a comment)"}], H)
 
     # review of #2607: NOT READY is its own verdict, never READY
     assert verdict_in_first_line("VERDICT at abcdef1: NOT READY") == "NOT READY"
@@ -235,7 +251,15 @@ def self_test():
 
     # review of #2616: a note that mentions the head is not a verdict, and an older verdict is not proof of this post
     assert not verdicted_at([{"body": "**Not a verdict** (abcdef1 has its READYs)."}], H)
-    assert not verdicted_at([{"body": "context first\nVERDICT at abcdef1: READY"}], H)
+    # the gate counts a verdict line anywhere in the body, so --check does too (and so a quoted one is a vote)
+    assert verdicted_at([{"body": "context first\nVERDICT at abcdef1: READY"}], H)
+
+    # review of #2620: only the gate's form is accepted -- the state after `at <sha>`, nothing before VERDICT
+    for bad in ("VERDICT: READY at abcdef1", "## VERDICT at abcdef1: READY", "abcdef1 READY — ok", "Verdict at abcdef1: READY"):
+        ok, why = classify(bad, H, "READY")
+        assert not ok, (bad, why)
+    assert classify("VERDICT at `abcdef1`: READY — fine", H, "READY") == (True, "ok")
+    assert not verdicted_at([{"body": "VERDICT: READY at abcdef1"}], H)              # the gate cannot see it
     assert read_back_ok({"id": 7, "body": "VERDICT at abcdef1: READY", "commit_id": H}, H, "READY", "review") == (True, "ok")
     assert not read_back_ok(None, H, "READY", "comment")[0]                        # nothing came back by that id
     assert not read_back_ok({"id": 7, "body": "VERDICT at abcdef1: READY", "commit_id": "1234567890"}, H, "READY",

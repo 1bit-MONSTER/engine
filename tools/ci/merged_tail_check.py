@@ -304,8 +304,20 @@ def scan(repo, days, limit, base_url=None, prs=None):
             rows.append(("GAP", pr, branch, None, f"could not read {url}"))
             continue
         if not ls.stdout.strip():
-            rows.append(("GONE", pr, branch, None, "the branch is deleted: the tail cannot be examined"))
-            continue
+            # engine#2652: the PR REF outlives the branch. GitHub keeps `refs/pull/<n>/head` after a branch is
+            # deleted -- measured: `ls-remote --heads` reports 0 matches for a deleted branch while
+            # `ls-remote refs/pull/2606/head` still resolves. So a deleted branch is NOT the end of the tail: read
+            # the PR ref, which holds exactly the tip a tail comparison needs, and only report GONE when that is
+            # missing too (a repo that prunes PR refs, or a PR never opened from one).
+            pr_ref = f"refs/pull/{pr.get('number')}/head"
+            ls_pr = git(repo, "ls-remote", url, pr_ref)
+            if ls_pr.returncode == 0 and ls_pr.stdout.strip():
+                branch = pr_ref          # the tail is examined from the PR ref, and the row says which ref it used
+            else:
+                rows.append(("GONE", pr, branch, None,
+                             "the branch is deleted and %s does not resolve either: the tail cannot be examined"
+                             % pr_ref))
+                continue
 
         # Cheap gate before any fetch. `headRefOid` is frozen at merge time -- measured on #2623,
         # where it is 0193a29e5, a commit that is NOT an ancestor of main while the branch tip is
@@ -488,6 +500,21 @@ def self_test():
     subprocess.run(["git", "branch", "-q", "tip"], cwd=r, check=True)
     commit(r, "f.txt", "x\ny\n", "two")
     chk(1, len(merge_commits(r, "HEAD", "tip")), "a branch with one extra commit has a tail of 1")
+    d.cleanup()
+
+    # engine#2652: THE PR REF OUTLIVES THE BRANCH, which is what the GONE fallback reads. Measured on the real repo
+    # (a deleted branch reports 0 `--heads` matches while `refs/pull/<n>/head` still resolves), and pinned here so a
+    # future "GONE is unavoidable" assumption has to argue with a test.
+    d, r = scratch()
+    commit(r, "f.txt", "x\n", "one")
+    branch(r, "main")
+    pr_tip = commit(r, "f.txt", "x\ny\n", "the PR tip")
+    subprocess.run(["git", "update-ref", "refs/pull/7/head", pr_tip], cwd=r, check=True)
+    heads = git(r, "ls-remote", r, "refs/heads/gone")
+    prref = git(r, "ls-remote", r, "refs/pull/7/head")
+    chk(True, not heads.stdout.strip(), "a branch that never existed reports no --heads match (the GONE condition)")
+    chk(True, prref.stdout.strip() != "", "and the PR ref still resolves, so the tail is readable")
+    chk(True, prref.stdout.split()[0].startswith(pr_tip[:7]), "the PR ref is the tip the tail comparison needs")
     d.cleanup()
 
     # The shape the tool exists for and a normal merge-commit repo never produces: a SQUASH merge rewrites every

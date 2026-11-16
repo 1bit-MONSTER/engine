@@ -182,7 +182,14 @@ def _nearest(times, t):
 def analyse(maps, unmaps, faults, before, after, other=(), widened=()):
     """[(t, iova, text)] -- one line per fault inside the capture window, in the words the census reads."""
     if not maps and not unmaps:
-        return [], "no capture events: the probe recorded nothing, so this file says nothing about the device"
+        if not faults:
+            return [], "no capture events: the probe recorded nothing, so this file says nothing about the device"
+        # Faults, no map/unmap events: the fault side WAS captured, so the file is not empty -- it just cannot
+        # answer the map-side question. Its own header says which half is missing.
+        return ([(t, iova, "not in this capture's map side: no map or unmap events were recorded, so whether this "
+                            "iova was ever mapped is not answerable here") for t, iova in faults],
+                "no map or unmap events in this capture: %d fault(s) recorded, so the fault side is present and "
+                "the map side is unanswerable" % len(faults))
     times = [e[0] for e in maps + unmaps]
     lo, hi = min(times), max(times)
     win = {f for f in after if f not in set(before)}
@@ -342,10 +349,21 @@ def self_test() -> int:
         chk("NEVER MAPPED OR UNMAPPED" in by_iova[0x9999000],
             "a page with no map or unmap anywhere in the capture is named as absent, not as uncorrelated")
 
-        # an empty capture must not read as "the device is fine"
-        empty, hdr2 = analyse([], [], faults, [], faults)
+        # an empty capture must not read as "the device is fine" -- NO events of either kind.
+        empty, hdr2 = analyse([], [], [], [], [])
         chk(empty == [] and "says nothing about the device" in hdr2,
             "an empty capture is refused as evidence rather than reported as a negative")
+
+        # 5. FAULTS ONLY: the fault side was captured, so the file is not empty, and it must not claim the probe
+        #    recorded nothing. Measured on ~/.cache/scratch-prs2/tp3/trace.txt (26 io_page_fault lines, no
+        #    map/unmap events): it read "no capture events ... says nothing about the device", rc 3.
+        fo, hdr_fo = analyse([], [], faults, [], faults)
+        chk(len(fo) == len(faults) and "the fault side is present" in hdr_fo,
+            "a faults-only capture reports its faults, not 'the probe recorded nothing': %s" % hdr_fo[:70])
+        chk(all("map side" in r[2] and "not answerable" in r[2] for r in fo),
+            "and every row says which half is missing rather than claiming absence")
+        chk(exit_code([], [], faults) == 4 and exit_code([], [], []) == 3,
+            "faults-only exits 4 (a side is absent); truly nothing exits 3")
 
         # 7b. a one-sided capture: the row answers on the side it probed AND says the other half was never asked about.
         #     Measured: burst.trace has 579,219 unmaps and no map probe, and its rows used to read "no map of this
@@ -402,10 +420,10 @@ def self_test() -> int:
     return 0 if ok else 1
 
 
-def exit_code(maps, unmaps):
-    """0 both sides probed; 3 nothing captured; 4 ONE side absent, so the missing half cannot be claimed."""
+def exit_code(maps, unmaps, faults=()):
+    """0 both sides probed; 3 nothing captured at all; 4 a side is absent, so the missing half cannot be claimed."""
     if not maps and not unmaps:
-        return 3
+        return 3 if not faults else 4
     if not maps or not unmaps:
         return 4
     return 0
@@ -424,11 +442,11 @@ def main(argv):
         ap.print_help()
         return 2
     maps, unmaps, other, widened = parse_events(a.trace)
-    rows, header = analyse(maps, unmaps, parse_faults(a.after), parse_faults(a.before), parse_faults(a.after),
-                           other, widened)
+    faults = parse_faults(a.after)
+    rows, header = analyse(maps, unmaps, faults, parse_faults(a.before), faults, other, widened)
     for line in render(rows, header):
         print(line)
-    return exit_code(maps, unmaps)
+    return exit_code(maps, unmaps, faults)
 
 
 if __name__ == "__main__":

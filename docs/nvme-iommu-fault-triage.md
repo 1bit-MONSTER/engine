@@ -178,6 +178,37 @@ Every one of them produces the same symptom — **an empty result** — which is
 might legitimately be looking for. That is why the pre-flight is not optional: it is the only thing that separates
 "nothing happened" from "nothing was watching".
 
+## Pin the build you measured on
+
+Every number in this page came from one host, and on 11-15 that host was **cold-rebooted onto a different NPU driver**:
+
+```
+before:  amdxdna srcversion F87D0BDF248067862F83BA3     <- all 740 faults, all six ruled-out workloads
+after:    amdxdna srcversion E48F9326AC573D2E06BC926     <- production, 0 IO_PAGE_FAULT so far
+```
+
+So the observations here describe a build, not a machine. Record the build with the observation, or the next reader will
+compare two different kernels and call the difference a finding:
+
+```bash
+modinfo -F srcversion amdxdna          # driver build
+uname -r                               # kernel, which also carries the IOMMU side
+uptime -p                              # boot age: the allocator-history candidate resets here
+```
+
+`srcversion` is the right field rather than `version`, because the module reports a vendor tag (`version: 0.1`) that did
+not change across that swap while the code underneath did.
+
+Three consequences worth stating explicitly, all of which this page got wrong once:
+
+* the six ruled-out workloads (bulk read, random read, concurrency, direct write, mild memory pressure, a full build) stand
+  as evidence about the **old** build — they are not yet evidence about production, and a quiet window on the new driver is
+  not an exoneration of them;
+* the address walk, the flags histogram and the burst shape are **old-build** facts until a burst on the new build shows the
+  same shape;
+* a reboot **resets the uptime candidate to zero**, so "nothing faulted for 24 h" right after a reboot is expected under
+  more than one hypothesis and proves less than it looks.
+
 ## Reproduction status: five shapes tried while the stream was already stopped
 
 Recorded before the theory, because the first thing anyone will try is to make the stream happen again. **But read the

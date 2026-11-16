@@ -31,7 +31,15 @@ permissions:
 # hw-gate (hw-gate.yml) deliberately has no such group: it runs on a GPU ticket, and a device run must never be
 # cancelled mid-flight.
 concurrency:
-  group: ci-${{ github.ref }}
+  # A PR ref and main are NOT in the same group. Cancelling a superseded PR run is right -- the tree it
+  # tested no longer exists -- and one group per ref is what does that.
+  #
+  # Main is different, and this was measured the hard way (engine#2708, 20:10Z-20:38Z): with main in the
+  # shared group, eleven consecutive `push` runs on main were CANCELLED and left no validation behind. A
+  # concurrency group holds one running plus one pending run, so a new merge cancels the still-queued run
+  # of the merge before it even when `cancel-in-progress` is false for that ref. Every main run therefore
+  # gets its own group, keyed by its commit: nothing on main can cancel anything else on main.
+  group: ci-${{ github.ref == 'refs/heads/main' && format('main-{0}', github.sha) || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:

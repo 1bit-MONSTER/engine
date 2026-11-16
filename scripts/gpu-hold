@@ -57,6 +57,11 @@
 #   GPU_HOLD_POLL          queue poll interval in seconds, default 2
 #   GPU_HOLD_LOG           also append the protocol log to this file
 #   GPU_HOLD_IGNORE_THERMAL_HOLD=1  start even while strixhalo-thermal-guard's ~/THERMAL-HOLD is up
+#   GPU_HOLD_ALLOW_NESTED=1  allow a nested gpu-hold on the SAME queue; by default it refuses (rc 2), because a payload
+#                  that wraps itself in another ticket can only wait for the ticket it is already inside (engine#2727).
+#                  The payload gets GPU_HOLD_TICKET, GPU_HOLD_LABEL, GPU_HOLD_HELD_QUEUE, GPU_HOLD_HELD_LABEL and
+#                  GPU_HOLD_HELD_TOKEN, so it can ask "am I already inside a ticket, and on which queue/token" instead of
+#                  guessing. The token is compared as well as the queue because -q moves the queue but not the token.
 #   GPU_HOLD_COOLDOWN      seconds the WHOLE queue waits after a hold that ended at or above
 #                          GPU_HOLD_COOLDOWN_TCTL, whatever its label; default 180, 0 disables the cool-down
 #   GPU_HOLD_COOLDOWN_TCTL die temperature at release that counts as "ended hot", default 85
@@ -124,6 +129,36 @@ while getopts ":t:l:w:q:h" opt; do
 done
 shift $((OPTIND - 1))
 [ $# -gt 0 ] || { echo "gpu-hold: no command given (try -h)" >&2; exit 2; }
+
+# engine#2727: a payload that re-invokes gpu-hold on the queue it is ALREADY inside queues behind its own ticket and then
+# waits for it -- the outer hold burns its whole max-hold with the GPU idle (measured 2026-11-16: 764 s of a 14-minute
+# window, while coder-llm waited 25 min behind it and every PR's pr-agent/reviewer check waited behind that). The
+# payload can now see the ticket (GPU_HOLD_TICKET) but not WHICH queue it is inside, so the "wrap myself if I am not
+# already under a ticket" idiom could not answer the question it exists for. The queue is exported for exactly that, and
+# the same-queue case is refused here rather than left to burn a window. A DIFFERENT queue still runs: npu-hold execs
+# this script with the NPU's queue and the hw-gate takes its own GPU claim inside an NPU ticket, and that is the shape
+# npu-hold documents as required.
+if [ -n "${GPU_HOLD_HELD_QUEUE:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; then
+    _nest_here=$(cd "$QUEUE" 2> /dev/null && pwd -P || printf '%s' "$QUEUE")
+    _nest_there=$(cd "$GPU_HOLD_HELD_QUEUE" 2> /dev/null && pwd -P || printf '%s' "$GPU_HOLD_HELD_QUEUE")
+    if [ "$_nest_here" = "$_nest_there" ]; then
+        echo "gpu-hold: refusing to queue inside the ticket that is already running this command (label '${GPU_HOLD_HELD_LABEL:-?}', queue $_nest_there, rc 2). The outer ticket already holds the GPU, so this invocation could only wait for its own parent and waste the window (engine#2727). Drop the inner gpu-hold: the outer one is the ticket. A run that really needs a second ticket on the same queue must say so with GPU_HOLD_ALLOW_NESTED=1." >&2
+        exit 2
+    fi
+fi
+# ...and the QUEUE is not the whole key: `-q` moves $QUEUE without moving $TOKEN (a separate option, and the token's own
+# default does not read $QUEUE), so a nested claim on a DIFFERENT queue still waits for the token its parent holds. The
+# token is the thing it waits on -- gpu-hold's own wait line says so ("first in the queue, waiting for <token> (held by:
+# <label> pid <pid>)") -- so the comparison is on the token too. engine#2727 review, measured: outer on q1, payload
+# running `-q q2` with the inherited token sat 4 s and then reported "queue never came round" (rc 75) with the outer.
+if [ -n "${GPU_HOLD_HELD_TOKEN:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; then
+    _tok_here=$(cd "$(dirname "$TOKEN")" 2> /dev/null && pwd -P || dirname "$TOKEN")
+    _tok_there=$(cd "$(dirname "$GPU_HOLD_HELD_TOKEN")" 2> /dev/null && pwd -P || dirname "$GPU_HOLD_HELD_TOKEN")
+    if [ "$_tok_here/$(basename "$TOKEN")" = "$_tok_there/$(basename "$GPU_HOLD_HELD_TOKEN")" ]; then
+        echo "gpu-hold: refusing to queue inside the ticket that is already running this command (label '${GPU_HOLD_HELD_LABEL:-?}', token $_tok_here/$(basename "$TOKEN"), rc 2). -q moves the queue but not the token, so this invocation would wait for the token its own parent holds and waste the window (engine#2727). Drop the inner gpu-hold, or say GPU_HOLD_ALLOW_NESTED=1 if a second ticket on the same token is really wanted." >&2
+        exit 2
+    fi
+fi
 
 tctl_file() {
     if [ -n "${GPU_HOLD_TCTL_FILE:-}" ]; then printf '%s' "$GPU_HOLD_TCTL_FILE"; return; fi
@@ -272,7 +307,12 @@ reap_token() {
     [ -e "$TOKEN" ] || return 0
     local content pid
     content=$(cat "$TOKEN" 2> /dev/null) || return 0
-    case $content in gpu-hold*) ;; *) return 0 ;; esac
+    # Any writer that stamps a pid, not only gpu-hold. `npu-serve-keeper` holds the NPU token while the
+    # owner's serve is up (npu-hold:22), so when the owner stops the keeper -- a normal, sanctioned action --
+    # its token is the one that strands every NPU ticket. The prefix gate here used to be `gpu-hold*`, so that
+    # exact token was never reaped: measured on 2026-11-16, a ticket waited 246 s behind
+    # "npu-serve-keeper pid 298235" whose pid was already gone, and every NPU ticket on the box would have run
+    # to -w the same way. The pid is the identity; the prefix is not.
     pid=$(printf '%s' "$content" | sed -n 's/.* pid \([0-9][0-9]*\) .*/\1/p' | head -n 1)
     if [ -n "$pid" ] && ! kill -0 "$pid" 2> /dev/null; then
         rm -f "$TOKEN"
@@ -298,6 +338,23 @@ while [ "$state" = queued ]; do
         exit 75
     fi
     reap_token
+    # engine#2494: say it AT QUEUE TIME, not only at take. A ticket granted while the last N minutes carry a fault line is
+    # refused (the check below, #2480/#2498), and since the shared pattern covers both devices an NPU burst refuses GPU
+    # tickets too: measured 2026-11-16, an NPU line sat inside that window for **27 % of the day** while the GPU itself
+    # logged nothing. From a queue position a lane cannot see that, so it waits and then loses the position to a refusal
+    # it could have predicted. This is the same PATTERN (GPU_FAULT_RE/GPU_FAULT_SKIP_RE, so the two cannot drift) read
+    # over the same window; it decides nothing -- the refusal still happens at take, when the window is re-read, because
+    # a queue wait can be minutes long and the condition can clear (or arrive) in the meantime.
+    if [ "$waited" = 0 ] && [ "${GPU_HOLD_FAULT_ABORT:-1}" != 0 ] && [ -z "${GPU_HOLD_QUEUE_STATE_OFF:-}" ]; then
+        _qs_window=${GPU_HOLD_RESET_WINDOW_MIN:-10}
+        _qs_hits=$(if [ -n "${GPU_HOLD_KLOG_FILE:-}" ]; then cat "$GPU_HOLD_KLOG_FILE" 2> /dev/null
+                   else journalctl -k --since "-${_qs_window} min" --no-pager -q 2> /dev/null; fi |
+                   grep -iE "$GPU_FAULT_RE" | grep -viE "$GPU_FAULT_SKIP_RE")
+        if [ -n "$_qs_hits" ]; then
+            _qs_dev=GPU; printf '%s\n' "$_qs_hits" | tail -1 | grep -qi amdxdna && _qs_dev=NPU
+            log "::warning::queued while the kernel log carries a ${_qs_dev} fault line in the last ${_qs_window} min - if it is still there when this ticket reaches the front, the take is REFUSED (rc 78) and this queue position is lost; newest: $(printf '%s\n' "$_qs_hits" | tail -1 | cut -c1-160)"
+        fi
+    fi
     cool=$(cool_left)
     head_ticket=$(oldest_ticket)
     if [ "$head_ticket" = "$TICKET_NAME" ]; then
@@ -493,7 +550,8 @@ set -m
 # give it to the child - exact, not a string guess:
 #   GPU_HOLD_TICKET  the exact line in the token file ("gpu-hold <label> pid <pid> <ts>")
 #   GPU_HOLD_LABEL   the label, sanitised, as it appears in that line
-env GPU_HOLD_TICKET="$mine" GPU_HOLD_LABEL="$SAFE" "$@" < /dev/null &
+env GPU_HOLD_TICKET="$mine" GPU_HOLD_LABEL="$SAFE" GPU_HOLD_HELD_QUEUE="$QUEUE" GPU_HOLD_HELD_LABEL="$LABEL" \
+        GPU_HOLD_HELD_TOKEN="$TOKEN" "$@" < /dev/null &
 child=$!
 set +m   # job control is needed only to place THIS job in its own group; leaving it on would make every later
          # background job in this shell a background *group*, which is a semantic this script does not want to

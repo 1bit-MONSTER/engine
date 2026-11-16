@@ -41,6 +41,7 @@
 
 #include "../npu/forward/include/q4nx_forward.h"
 #include "../npu/target/xdna/xdna_target.h"  // XdnaTarget::kName for --npu-target
+#include "npu_batch_decode.h"
 #include "npu_device_lock.h"
 #include "npu_answer_parser.h"
 #include "npu_chatml.h"
@@ -107,6 +108,9 @@ struct ForwardEngine {
     int  bos_id  = -1;     // config.json bos_token_id (the chat template may open with it)
     bool add_bos = false;  // config.json add_bos_token: the rendered chat prompt needs BOS
     std::unique_ptr<Q4nxNpuForward> fwd;
+    // engine#2689 item 3b (--npu-batch-users N > 1): in-flight requests share one decode pass. When this exists it OWNS
+    // the forward -- its thread is the only one that touches fwd -- so the serial path must not run beside it.
+    std::unique_ptr<onebit::NpuDecodeBatch> batch;
     std::vector<int> eos;   // config.json eos_token_id: one id or a list (app/npu_stop_tokens.h)
     int endoftext = -1;
     int max_context = 0;   // config.json max_position_embeddings: prompt plus answer
@@ -433,7 +437,39 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         const int room = e.max_context - int(ids.size());
         if (room < 1) throw ContextOverflow(ids.size(), e.max_context);
         const int limit = std::clamp(max_tokens, 0, room);
-        std::lock_guard<std::mutex> lock(e.mu);
+        // engine#2689 item 3b (--npu-batch-users N > 1): this request takes a slot and hands its prompt and each decode
+        // step to the batch, whose thread owns the forward. Two consequences, both deliberate:
+        //   * it must NOT take e.mu -- holding it for the request's life would serialise exactly what batching exists to
+        //     overlap; the lock's job here is the prefix cache and the draft taps, and both are refused below;
+        //   * a request that needs the forward itself (a picture tower, the prefix cache, a drafter) is REFUSED BY NAME
+        //     rather than served serially beside the batch, because the serial path would call e.fwd->step() while the
+        //     batch's thread is inside it -- a silent race, which is worse than a refusal.
+        int batch_slot = -1;
+        if (e.batch) {
+            if (img)
+                throw std::runtime_error(
+                    "--npu-batch-users: a request with pictures is refused while decode batching is on (the tower and the "
+                    "row embeddings run on the forward the batch thread owns); run this request without --npu-batch-users");
+            if (e.prefix && e.prefix->enabled())
+                throw std::runtime_error(
+                    "--npu-batch-users: a request with the prefix cache on is refused while decode batching is on (the cache "
+                    "snapshots come from the forward the batch thread owns); start the serve with --prefix-slots 0");
+            if (e.spec_lookup > 0 || e.draft)
+                throw std::runtime_error(
+                    "--npu-batch-users: a request with a drafter is refused while decode batching is on (a verify batch is "
+                    "the forward's own rows); run without --spec-lookup / --spec-draft");
+            batch_slot = e.batch->acquire(60000);
+            if (batch_slot < 0)
+                throw std::runtime_error("--npu-batch-users: no decode slot came free in 60 s (one per in-flight request, up "
+                                         "to the batch width); try again or raise --npu-batch-users");
+        }
+        struct BatchSlotRelease {
+            onebit::NpuDecodeBatch* b = nullptr;
+            int slot = -1;
+            ~BatchSlotRelease() { if (b != nullptr && slot >= 0) b->release(slot); }
+        } batch_slot_guard{e.batch.get(), batch_slot};
+        std::optional<std::lock_guard<std::mutex>> serial_lock;
+        if (!e.batch) serial_lock.emplace(e.mu);
         e.draft_taps.clear();   // --spec-draft: this request's tap rows start at its first position run
 
         const auto t_request = std::chrono::steady_clock::now();
@@ -525,6 +561,18 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         }
         // One prefill call over prompt rows [off, off + take): token ids, or (pictures) those rows' embeddings and planes.
         auto prefill = [&](int off, int take) -> bool {
+            if (e.batch) {
+                // The batch runs the whole prompt as one pass (its positions are 0..n-1 by contract), so the chunk loop's
+                // later calls have nothing to do. `logits` receives the last row -- the answer's first token is drawn
+                // from it, exactly as the serial path draws it from its own last prefill row.
+                if (off != 0) return true;
+                std::string why;
+                if (!e.batch->prefill(batch_slot, ids, &logits, &why)) {
+                    std::fprintf(stderr, "1bit forward-serve: decode batch prefill failed: %s\n", why.c_str());
+                    return false;
+                }
+                return true;
+            }
             if (!img) {
                 const std::vector<int> part(ids.begin() + off, ids.begin() + off + take);
                 return e.fwd->step_batch(part, off, logits);
@@ -833,14 +881,24 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             // weight stream -- 8.7 s on the 27B -- spent on a result nobody reads.  At
             // max_tokens=1 that is half the request's latency.
             if (n + 1 >= limit) break;
-            if (!(img ? e.fwd->step(next, img_next + n, logits, (int)ids.size() + n)
-                      : e.fwd->step(next, (int)ids.size() + n, logits)))
+            std::string step_why;
+            const bool stepped = e.batch
+                ? e.batch->step(batch_slot, next, (int)ids.size() + n, &logits, &step_why)
+                : (img ? e.fwd->step(next, img_next + n, logits, (int)ids.size() + n)
+                       : e.fwd->step(next, (int)ids.size() + n, logits));
+            if (!stepped) {
+                if (e.batch) throw std::runtime_error("decode batch step failed: " + step_why);
+            }
+            if (!stepped)
                 throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
         }
         if (!stopped_at_stop) {
             const size_t cut = complete_utf8(pending);
             if (cut > 0) on_text(pending.substr(0, cut), take_held(cut));
         }
+        if (e.batch)
+            std::fprintf(stderr, "[batch] slot %d finished after %ld decode pass(es) for the whole serve\n", batch_slot,
+                         e.batch->rounds());
         stats.completion_tokens = produced;
         stats.predicted_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_first).count();
@@ -1308,11 +1366,15 @@ int run_forward_ids(const std::string& model_dir, const std::string& kernels, co
 int run_forward_serve(int argc, char** argv) {
     std::string model, kernels, host = "127.0.0.1", alias, dump_logits;
     int port = 8000, streams = 1;
+    // engine#2689 item 3b: --npu-batch-users N (default 1 = today's serial path byte-for-byte). > 1 lets N in-flight
+    // requests share one decode pass (npu_batch_decode.h).
+    int batch_users = 1;
     // Which NPU target serves this route (engine#799 P4). A1 compiles one, xdna; the point of the option
     // is that a name this build does not have is refused BY NAME below, before the device is opened,
     // instead of being ignored and served by whatever target happened to be linked.
     std::string npu_target = ::npu::target::xdna::XdnaTarget::kName;
     npu::PrefixOptions prefix_opts;  // --prefix-slots / --prefix-cache-mb / --prefix-min-gain (#650)
+    bool prefix_slots_set = false;   // --prefix-slots was given (it has a non-zero default, so this is the only way to know)
     bool prefix_pin = false;         // --prefix-pin (engine#1785)
     int ctx_size = 0;                // --ctx-size N: prompt plus answer, at most the model's own (0 = the model's)
     int spec_lookup = 0;             // --spec-lookup K (engine#1781): prompt-lookup drafts, K per verify batch
@@ -1333,12 +1395,13 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "-p" || a == "--port") port = std::stoi(next());
         else if (a == "--host") host = next();
         else if (a == "--alias") alias = next();
-        else if (a == "--prefix-slots") prefix_opts.slots = std::stoi(next());
+        else if (a == "--prefix-slots") { prefix_opts.slots = std::stoi(next()); prefix_slots_set = true; }
         else if (a == "--prefix-cache-mb") prefix_opts.cache_mb = std::stoul(next());
         else if (a == "--prefix-min-gain") prefix_opts.min_gain = std::stoi(next());
         else if (a == "--prefix-pin") prefix_pin = true;
         else if (a == "-c" || a == "--ctx-size") ctx_size = std::stoi(next());
         else if (a == "--npu-streams") streams = std::stoi(next());
+        else if (a == "--npu-batch-users") batch_users = std::stoi(next());
         else if (a == "--npu-target") npu_target = next();
         else if (a == "--dump-logits") dump_logits = next();
         else if (a == "--spec-lookup") spec_lookup = std::stoi(next());
@@ -1355,6 +1418,9 @@ int run_forward_serve(int argc, char** argv) {
         throw std::runtime_error("--spec-draft and --spec-lookup are two drafters; give one");
     if (spec_draft_k != 0 && spec_draft.empty()) throw std::runtime_error("--spec-draft-k needs --spec-draft");
     if (load_queue_ms < 0) throw std::runtime_error("--load-queue-ms takes milliseconds >= 0, not " + std::to_string(load_queue_ms));
+    if (batch_users < 1 || batch_users > 16)
+        throw std::runtime_error("--npu-batch-users takes 1..16 (the decode design's row width), not " +
+                                 std::to_string(batch_users));
     if (spec_lookup < 0 || spec_lookup > 15)
         throw std::runtime_error("--spec-lookup takes 0..15 drafts per round (a verify batch holds at most 16 rows), not " +
                                  std::to_string(spec_lookup));
@@ -1572,6 +1638,40 @@ int run_forward_serve(int argc, char** argv) {
         },
         [](const std::string& line) { std::fprintf(stderr, "1bit forward-serve: %s\n", line.c_str()); },
         [](double s) { std::this_thread::sleep_for(std::chrono::duration<double>(s)); });
+    // engine#2689 item 3b: one forward, one decode loop, N requests sharing its rows. The batch's thread takes the forward
+    // from here on, so the serial path below is only used when --npu-batch-users is 1 (the default).
+    if (batch_users > 1) {
+        // engine#2689 item 3b follow-up: a model whose per-sequence state is more than its KV cache cannot share a
+        // pass at all, so the flag is refused HERE -- before /health answers. Measured: --npu-batch-users 8 on
+        // bonsai2-27b-t2s2 (GDN) got a healthy endpoint that returned HTTP 500 to every single request, with the
+        // reason only in the server log.
+        if (!e.fwd->step_users_supported())
+            throw std::runtime_error(
+                "--npu-batch-users " + std::to_string(batch_users) + " refused: this model keeps per-sequence attention "
+                "state beside its KV cache (GDN linear attention or MLA), or is a noncausal pack, so one pass cannot "
+                "carry several sequences; run without --npu-batch-users");
+        // The prefix cache is on by default (8 slots) and its snapshots come from the forward, so a batched serve turns it
+        // OFF unless the operator asked for it explicitly -- and an explicit one is then refused per request, below, rather
+        // than silently ignored.
+        if (!prefix_slots_set && e.prefix) {
+            e.prefix.reset();
+            e.prefix_state.clear();
+            std::fprintf(stderr,
+                         "1bit forward-serve: --npu-batch-users turns the prefix cache off (its snapshots are the forward's "
+                         "own state, which the batch thread owns); pass --prefix-slots N to keep it and have those requests "
+                         "refused by name\n");
+        }
+        e.batch = std::make_unique<onebit::NpuDecodeBatch>(*e.fwd, batch_users);
+        std::fprintf(stderr,
+                     "1bit forward-serve: decode batching on: up to %d request(s) per pass; text requests only (a "
+                     "request needing the prefix cache, pictures or a drafter is refused rather than raced)\n",
+                     batch_users);
+        if (prefix_opts.slots > 0 || spec_lookup > 0 || !spec_draft.empty())
+            std::fprintf(stderr,
+                         "1bit forward-serve: --npu-batch-users with %s: those requests are refused by name, not served "
+                         "serially beside the batch\n",
+                         prefix_opts.slots > 0 ? "the prefix cache on" : "a drafter");
+    }
     // engine#2263: loading a pack writes into the Q4NX cache (the device-form copy, the head images) and, until this, only a
     // GGUF repack swept it -- so a box that serves packs, or runs reviews through npu-run, grew it without bound.
     q4nx_cache_sweep_after_load();

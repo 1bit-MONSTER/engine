@@ -97,6 +97,12 @@ public:
     // noncausal_full_attention, so a caller can check the served pack against its own declaration
     // (app/forward_serve.cpp, engine#796).
     bool noncausal() const { return noncausal_attn_; }
+    // engine#2689 item 3b follow-up: can ONE decode pass carry several sequences? `step_users()` swaps each slot's KV
+    // into the working caches, so the only per-sequence state that supports it is the KV cache itself. GDN linear
+    // attention and MLA keep a recurrence/absorption state per sequence, and a noncausal (or bidirectional-sliding)
+    // pack encodes one prompt per pass -- a serve that asked for --npu-batch-users on one of those would answer
+    // /health and then fail EVERY request inside step_users, so the flag is refused at startup instead.
+    bool step_users_supported() const { return !lin_kd_ && !mla_ && !noncausal_attn_ && !bidir_sliding_; }
     // engine#2102: what the decode family turned out to be, so a caller can say it out loud. `decode_roles()` is the number of
     // roles that got an M=16 kernel, `design_roles()` the number of roles the model has. 0 of N is the state that serves at a
     // fraction of the fused route's rate while printing nothing an operator would notice at the ready line: every decode step
@@ -294,6 +300,7 @@ private:
     const std::vector<int>* rows_pos_ = nullptr;
     const std::vector<int>* rows_slot_ = nullptr;
     std::vector<std::vector<std::vector<float>>> user_kc_, user_vc_;   // [slot][layer] KV of each served slot
+    std::vector<int> user_len_;                                        // positions each slot holds (see step_users)
     std::vector<std::vector<float>> own_kc_, own_vc_;                  // the model's caches, parked for a pass
     int user_slot_on_ = -1;                                            // which slot kcache_ holds, -1 = the model's
     bool load_user_slot(int s);

@@ -67,6 +67,7 @@ import shutil
 import tempfile
 import subprocess
 import sys
+import time
 
 # A line worth looking for: long enough not to be punctuation, and not a brace or a lone keyword.
 # Below this the containment test answers "yes" for `}`, `);` and `#endif` in every file on earth.
@@ -89,11 +90,31 @@ examined = [0]
 unchanged = [0]
 
 
+# `git` is indirected for the same reason `gh` is: an arm has to be able to make one call fail.
+GIT_BIN = "git"
+
+
 def git(repo, *args, check=False):
-    p = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
+    p = subprocess.run([GIT_BIN, *args], cwd=str(repo), capture_output=True, text=True)
     if check and p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {p.stderr.strip()}")
     return p
+
+
+def fetch_retry(repo, *args):
+    """`git fetch`, twice. A transient failure must not become a GAP.
+
+    Measured 2026-11-16: a scan reported `#2719 … could not fetch https://… refs/pull/2719/head`, i.e. a GAP and
+    exit 2 on a clean tree, and the same fetch by hand succeeded seconds later (both transports). The GAP is the safe
+    answer while it is true -- a scan that could not look is not a clean scan -- but a dropped connection is not a
+    finding, and every merged-and-branch-deleted PR goes through this one call, so one flaky minute read as a fault.
+    Two attempts cost a second git call only on the failure path.
+    """
+    r = git(repo, "fetch", *args)
+    if r.returncode == 0:
+        return r
+    time.sleep(2)
+    return git(repo, "fetch", *args)
 
 
 # `gh` may simply not be installed -- the CI container does not have it, and the first version of this
@@ -430,8 +451,7 @@ def scan(repo, days, limit, base_url=None, prs=None):
         url = f"https://github.com/{owner}/{name}.git"
         base_ref = f"refs/mtck/base/{pr['baseRefName']}"
 
-        if git(repo, "fetch", "-q", "--no-tags", "origin",
-               f"{pr['baseRefName']}:{base_ref}").returncode != 0:
+        if fetch_retry(repo, "-q", "--no-tags", "origin", f"{pr['baseRefName']}:{base_ref}").returncode != 0:
             rows.append(("GAP", pr, branch, None, f"could not fetch base {pr['baseRefName']}"))
             continue
 
@@ -464,7 +484,7 @@ def scan(repo, days, limit, base_url=None, prs=None):
             continue  # the branch tip is exactly what merged: nothing was pushed after
 
         ref = f"refs/mtck/{pr['number']}"
-        if git(repo, "fetch", "-q", "--no-tags", url, f"{branch}:{ref}").returncode != 0:
+        if fetch_retry(repo, "-q", "--no-tags", url, f"{branch}:{ref}").returncode != 0:
             rows.append(("GAP", pr, branch, None, f"could not fetch {url} {branch}"))
             continue
 
@@ -865,13 +885,48 @@ def self_test():
     chk(2, report(pathlib.Path("."), 1, 1, "1bit-MONSTER/no-such-repo-xyz")[0],
         "an unreadable PR list is rc 2, not an empty pass")
 
-    # shortcut: the shallow-clone refusal has no arm -- a local `--depth 1` fixture kept cloning an empty repository (git's
-    # own "cloned an empty repository" warning), and shipping a red arm is worse than shipping none. The guard was verified by
-    # hand against a genuine shallow clone of this repo (it refuses, and --allow-shallow proceeds); upgrade by cloning a real
-    # origin over file:// with two commits and asserting both directions.
+    # The shallow-clone refusal had no arm: a local `--depth 1` fixture kept cloning an EMPTY repository, so the guard was
+    # verified by hand only. The fixture was wrong, not the idea -- `git clone --depth 1 file://<dir>` needs the origin to have
+    # a commit first. Two commits, then a --depth 1 clone and a full clone of the same origin, and both directions are asserted
+    # against the shipped `shallow_refusal()` rather than a copy of its rule.
+    d, r = scratch()
+    commit(r, "tool.py", "x\n", "c1")
+    commit(r, "tool.py", "x\ny\n", "c2")
+    sh_dir = r.parent / (r.name + "-shallow")
+    full_dir = r.parent / (r.name + "-full")
+    subprocess.run(["git", "clone", "-q", "--depth", "1", "file://" + str(r), str(sh_dir)], check=True)
+    subprocess.run(["git", "clone", "-q", "file://" + str(r), str(full_dir)], check=True)
+    chk(True, "SHALLOW clone" in shallow_refusal(sh_dir),
+        "a --depth 1 worktree is refused, and the message says why rather than reporting numbers")
+    chk("", shallow_refusal(full_dir),
+        "a full clone of the same origin is not refused: the guard answers about the clone, not about the tool")
+    chk("", shallow_refusal(sh_dir, allow_shallow=True),
+        "and --allow-shallow buys the number anyway, which is what the message tells the caller to do")
     # And the arm CI added: this row FAILED in the build container because `gh` is not installed
     # there, so the call raised FileNotFoundError instead of answering "I could not look". Measured
     # on #2659: 11/11 arms locally, 75 - merged_tail_check_self (Failed) in CI.
+    # engine#2725: a fetch that fails once is retried, because a transient failure used to become a GAP and exit 2 on
+    # a clean tree (measured: #2719's PR-ref fetch failed in one scan and worked by hand seconds later). The stub fails
+    # the FIRST `git fetch` and execs the real git afterwards, so the arm measures the retry rather than the network.
+    d, r = scratch()
+    commit(r, "f.txt", "x\n", "one")
+    subprocess.run(["git", "remote", "add", "origin", str(r)], cwd=r, check=True)   # a real origin to fetch FROM
+    real_git = shutil.which("git")
+    stub = pathlib.Path(d.name) / "git-stub"
+    counter = pathlib.Path(d.name) / "count"
+    stub.write_text('#!/bin/sh\nn=$(cat "' + str(counter) + '" 2>/dev/null || echo 0)\nn=$((n+1))\n'
+                    'echo $n > "' + str(counter) + '"\n[ "$n" -ge 2 ] && exec ' + real_git + ' "$@"\nexit 1\n')
+    stub.chmod(0o755)
+    global GIT_BIN
+    saved_git, GIT_BIN = GIT_BIN, str(stub)
+    try:
+        rc = fetch_retry(r, "origin", "main").returncode
+        attempts = int(counter.read_text()) if counter.is_file() else 0
+    finally:
+        GIT_BIN = saved_git
+    chk(0, rc, "a fetch that fails once is retried and succeeds: a transient failure is not a GAP")
+    chk(2, attempts, "... in exactly two attempts")
+
     global GH_BIN
     saved, GH_BIN = GH_BIN, "gh-that-is-not-installed"
     try:
@@ -881,6 +936,20 @@ def self_test():
         GH_BIN = saved
 
     return rc
+
+
+def shallow_refusal(worktree, allow_shallow=False):
+    """Why this worktree must not be scanned, or "" if it may be (engine#2659).
+
+    Extracted from main() so the refusal can be asserted in both directions with no network: the guard used to be inline,
+    which is why it shipped with a `shortcut:` and no arm -- exercising it through main() would have run a `git fetch`.
+    """
+    shallow = (git(worktree, "rev-parse", "--is-shallow-repository").stdout or "").strip()
+    if shallow == "true" and not allow_shallow:
+        return ("%s is a SHALLOW clone: this tool reads commit ancestry, and a shallow clone reports main's own commits as "
+                "LOST (measured: 22 LOST on --depth 50 against 4 on the full clone, 18 of them main's). "
+                "Deepen it (git fetch --unshallow) or pass --allow-shallow to report anyway." % worktree)
+    return ""
 
 
 def main():
@@ -901,17 +970,14 @@ def main():
     # local base by a merge whose parents are not present, so every commit looks absent from the base. The results are not
     # merely noisier, they are mostly false, so refuse rather than report: a caller who wants the number anyway can say so.
     if a.worktree and not a.self_test:
-        shallow = (git(a.worktree, "rev-parse", "--is-shallow-repository").stdout or "").strip()
-        if shallow == "true" and not a.allow_shallow:
-            raise SystemExit("%s is a SHALLOW clone: this tool reads commit ancestry, and a shallow clone reports main's own "
-                             "commits as LOST (measured: 22 LOST on --depth 50 against 4 on the full clone, 18 of them main's). "
-                             "Deepen it (git fetch --unshallow) or pass --allow-shallow to report anyway." % a.worktree)
+        refusal = shallow_refusal(a.worktree, a.allow_shallow)
+        if refusal:
+            raise SystemExit(refusal)
     if a.self_test:
         return self_test()
     if a.branch:
         wt = pathlib.Path(a.worktree)
-        if git(wt, "fetch", "-q", "--no-tags", "origin",
-               a.base.replace("origin/", "")).returncode != 0:
+        if fetch_retry(wt, "-q", "--no-tags", "origin", a.base.replace("origin/", "")).returncode != 0:
             print(f"merged_tail_check: could not fetch {a.base} -- cannot tell, and that is not "
                   f"a pass", file=sys.stderr)
             return 2

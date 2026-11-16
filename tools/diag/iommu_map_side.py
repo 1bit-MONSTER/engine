@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import os
 import collections
 import re
 import sys
@@ -80,7 +81,13 @@ def classify(fn):
     if "map" in fn:
         return "map"
     return "other"
-FAULT = re.compile(r"^\[\s*(\d+\.\d+)\].*IO_PAGE_FAULT.*address=(0x[0-9a-f]+)")
+# `domain=` precedes `address=` in the kernel's own line -- a capture reads
+#   `[IO_PAGE_FAULT domain=0x0003 address=0x7f291bd63000 flags=0x0077]`
+# so the domain group has to sit before the address one (engine#2542: this box carries BOTH kinds today,
+# 80 faults domain 0x0002 on 0x7f5../0x7f9../0x7fa../0x7fd../0x7fe../0x7ff.. and 10 at domain 0x0003 on
+# 0x7f29.., so a regex that only reads one order answers "unknown" for the other half).
+FAULT = re.compile(r"^\[\s*(\d+\.\d+)\].*IO_PAGE_FAULT(?:\s+domain=(0x[0-9a-f]+))?"
+                   r".*?address=(0x[0-9a-f]+)")
 # The IOMMU's OWN tracepoints (engine#2678): `/sys/kernel/tracing/events/iommu/{map,unmap,io_page_fault}`.
 # The class is the EVENT NAME, so this form needs no classifier at all -- which is why it is the better
 # capture: a kprobe is a convention the text only half-satisfies, an event name is the kernel's statement.
@@ -165,8 +172,33 @@ def parse_events(path):
     return maps, unmaps, other, widened, by_name, map_names, unmap_names
 
 
-def parse_faults(path):
-    """[(boot_seconds, iova)] for every IO_PAGE_FAULT line in a `journalctl -o short-monotonic` capture."""
+def address_kind(domain):
+    """What a fault's `domain=` says its address IS -- the thing a page class has to be read against (engine#2542).
+
+    The two faults this tool has been asked about are different objects wearing the same word:
+      0x0002  a HOST virtual address (userspace). `/proc/kpageflags` is indexed by PFN, so no class can be read
+              from it without a VA -> PFN translation (that is `/proc/<pid>/pagemap`, root, and only while the
+              process lives). Naming the address a paddr here would read an unrelated page's flags.
+      0x0003  a DEVICE aperture address: the IOVA the engine mapped, whose map event carries the paddr that
+              WAS behind it. That is what `paddrs()` is for, and a class there is meaningful.
+    Anything else (or no domain in the line) is said to be unknown rather than assumed to be either.
+    """
+    if not domain:
+        return "unknown domain"
+    try:
+        d = int(domain, 16)
+    except (TypeError, ValueError):
+        return "unknown domain"
+    if d == 0x0002:
+        return "host VA"
+    if d == 0x0003:
+        return "device aperture"
+    return f"unknown domain {domain}"
+
+
+def parse_faults(path, with_domain=False):
+    """[(boot_seconds, iova)] (or [(boot_seconds, iova, domain)]) for every IO_PAGE_FAULT line in a
+    `journalctl -o short-monotonic` capture."""
     out = []
     try:
         fh = open(path, errors="replace")
@@ -176,7 +208,8 @@ def parse_faults(path):
         for line in fh:
             m = FAULT.match(line)
             if m:
-                out.append((float(m.group(1)), int(m.group(2), 16)))
+                row = (float(m.group(1)), int(m.group(3), 16))
+                out.append(row + ((m.group(2) or ""),) if with_domain else row)
                 continue
             tp = TP_EVENT.search(line)
             if tp and tp.group(2) == "io_page_fault":
@@ -208,7 +241,7 @@ def analyse(maps, unmaps, faults, before, after, other=(), widened=()):
         # Faults, no map/unmap events: the fault side WAS captured, so the file is not empty -- it just cannot
         # answer the map-side question. Its own header says which half is missing.
         return ([(t, iova, "not in this capture's map side: no map or unmap events were recorded, so whether this "
-                            "iova was ever mapped is not answerable here") for t, iova in faults],
+                            "iova was ever mapped is not answerable here") for t, iova in ((f[0], f[1]) for f in faults)],
                 "no map or unmap events in this capture: %d fault(s) recorded, so the fault side is present and "
                 "the map side is unanswerable" % len(faults))
     times = [e[0] for e in maps + unmaps]
@@ -221,7 +254,8 @@ def analyse(maps, unmaps, faults, before, after, other=(), widened=()):
     for t, iova, _s in sorted(unmaps):
         by_unm[iova].append(t)
     rows = []
-    for t, iova in win:
+    for _r in win:            # a fault may carry its domain (3-tuple) or not (2-tuple)
+        t, iova = _r[0], _r[1]
         if not (lo <= t <= hi):
             rows.append((t, iova, "OUTSIDE the buffered range: the ring held %.0f s and this fault is not in it"
                                       % (hi - lo)))
@@ -499,7 +533,105 @@ def self_test() -> int:
         chk("[MIXED" not in buf3.getvalue(),
             "the printed header does not carry the MIXED flag for one lane's map+unmap")
 
+    # engine#2478: the page class step. decode is pure, so both directions are pinned without root or a capture.
+    chk(decode_kpageflags(40) == "UPTODATE, LRU", "kpageflags 40 is UPTODATE|LRU (an ordinary page-cache page)")
+    chk(decode_kpageflags(0) == "none", "no flags decodes to 'none', not an empty string")
+    chk(decode_kpageflags(0x80 | 0x1000) == "SLAB, ANON", "SLAB and ANON are distinct and ordered by bit")
+    pf = pathlib.Path(tempfile.mkdtemp()) / "map-paddr.txt"
+    # The review's own capture: map to A at 1000.1, fault at 1000.5, remap to B at 1000.9.
+    pf.write_text("wget-1 [012] .... 1000.1: map: IOMMU: iova=0xe3ff5000 - 0xe3ff6000 paddr=0x1e8455000 size=4096\n"
+                  "wget-1 [012] .... 1000.9: map: IOMMU: iova=0xe3ff5000 - 0xe3ff6000 paddr=0x1dd3de000 size=4096\n")
+    # The capture the review measured: map to A, fault, remap to B. The class must come from A -- the mapping in
+    # force when the fault happened -- and NOT from the last one in the file.
+    pm = paddrs(str(pf))
+    chk([pa for _t, pa in pm.get(0xe3ff5000, ())] == [0x1e8455000, 0x1dd3de000],
+        "paddrs keeps EVERY mapping for an iova, in log order")
+    import contextlib as _cl
+    import io as _io
+    _b = _io.StringIO()
+    with _cl.redirect_stdout(_b):
+        report_page_classes(str(pf), [(1000.5, 0xe3ff5000)])
+    _out = _b.getvalue()
+    chk("0x1e8455000" in _out and "0x1dd3de000" not in _out,
+        "the page class comes from the mapping BEFORE the fault, not the last one in the file")
+    _b2 = _io.StringIO()
+    with _cl.redirect_stdout(_b2):
+        report_page_classes(str(pf), [(1001.0, 0xe3ff5000)])
+    chk("0x1dd3de000" in _b2.getvalue(), "...and a fault after the remap gets the remapped page")
+    _b3 = _io.StringIO()
+    with _cl.redirect_stdout(_b3):
+        report_page_classes(str(pf), [(999.0, 0xe3ff5000)])
+    chk("no map event carried a paddr" in _b3.getvalue() and "later mapping exists" in _b3.getvalue(),
+        "...and a fault BEFORE any mapping says so instead of falling forward")
+    chk("unavailable" in page_class(0, flags="/nonexistent/kpageflags"), "an unreadable kpageflags says so, not 'none'")
+    # engine#2765 (1): a page class must not be attributed ACROSS an unmap. The issue's own trace: map, release,
+    # then fault 1.5 s later -- the page was gone when the fault happened, so a class there is worse than none.
+    pu = pathlib.Path(tempfile.mkdtemp()) / "map-unmap.txt"
+    pu.write_text("wget-1 [012] .... 1000.1: map: IOMMU: iova=0xe3ff5000 - 0xe3ff6000 paddr=0x1dd3dea000 size=4096\n"
+                  "wget-1 [012] .... 1002.0: unmap: IOMMU: iova=0xe3ff5000 - 0xe3ff6000 size=4096 unmapped_size=4096\n")
+    _b4 = _io.StringIO()
+    with _cl.redirect_stdout(_b4):
+        report_page_classes(str(pu), [(1003.5, 0xe3ff5000)])
+    _o4 = _b4.getvalue()
+    chk("no page class" in _o4 and "RELEASED" in _o4 and "paddr=" not in _o4,
+        "a mapping released before the fault gets no page class, and the release is named")
+    _b5 = _io.StringIO()
+    with _cl.redirect_stdout(_b5):
+        report_page_classes(str(pu), [(1001.0, 0xe3ff5000)])
+    chk("paddr=" in _b5.getvalue() and "RELEASED" not in _b5.getvalue(),
+        "...and a fault BEFORE the release still gets the class (the control)")
+
+    # engine#2765 (2): kpageflags is indexed by PAGE-SIZED entries, so a hardcoded 4096 reads another page's flags on
+    # another PAGE_SIZE. An explicit page size is honoured, and an unknown one is reported rather than guessed.
+    # Distinct entries, or the fixture cannot tell one page from another: entry 0 is UPTODATE|LRU (40), entry 1 is 0.
+    kp = pathlib.Path(tempfile.mkdtemp()) / "kpf"
+    kp.write_bytes(bytes([40, 0, 0, 0, 0, 0, 0, 0]) + bytes(8) + bytes([40, 0, 0, 0, 0, 0, 0, 0]) * 6)
+    chk(page_class(0, flags=str(kp), pagesize=4096) == "UPTODATE, LRU",
+        "paddr 0 at 4 KiB reads entry 0")
+    chk(page_class(4096, flags=str(kp), pagesize=4096) == "none",
+        "...and the next page reads entry 1, so the index really is paddr // pagesize")
+    chk(page_class(4096, flags=str(kp), pagesize=8192) == "UPTODATE, LRU",
+        "the same paddr at 8 KiB lands in entry 0: assuming 4096 would read a neighbour's flags")
+
+    # engine#2542: a fault's `domain=` says what its address IS, and the two kinds on this box are different
+    # objects -- 0x0002 a host VA (kpageflags is indexed by PFN, so no class without a VA -> PFN translation),
+    # 0x0003 a device aperture whose map event carries the paddr. The kernel writes domain BEFORE address.
+    _dl = (pathlib.Path(tempfile.mkdtemp()) / "faults.txt")
+    _dl.write_text(
+        "[  3421.292034] strixhalo kernel: amdxdna 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT "
+        "domain=0x0002 address=0x7fa381800000 flags=0x0077]\n"
+        "[  3421.293034] strixhalo kernel: amdxdna 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT "
+        "domain=0x0003 address=0x7f291bd63000 flags=0x0077]\n")
+    _dd = parse_faults(str(_dl), with_domain=True)
+    chk(_dd[0][2] == "0x0002" and _dd[1][2] == "0x0003",
+        "the domain is read from BEFORE the address, which is the kernel's own order")
+    chk(parse_faults(str(_dl))[0] == (3421.292034, 0x7fa381800000),
+        "and the two-tuple form is unchanged for every existing caller")
+    _hv = pathlib.Path(tempfile.mkdtemp()) / "hv.txt"
+    _hv.write_text("wget-1 [012] .... 1000.1: map: IOMMU: iova=0x7fa381800000 - 0x7fa381801000 "
+                   "paddr=0x1dd3dea000 size=4096\n")
+    _b6 = _io.StringIO()
+    with _cl.redirect_stdout(_b6):
+        report_page_classes(str(_hv), [(1003.5, 0x7fa381800000, "0x0002")])
+    _o6 = _b6.getvalue()
+    chk("HOST VA fault (domain 0x0002)" in _o6 and "pfn=" not in _o6 and "PFN" in _o6,
+        "a host VA gets no page class even when a map event names the same number, and the line says why")
+    _b7 = _io.StringIO()
+    with _cl.redirect_stdout(_b7):
+        report_page_classes(str(_hv), [(1003.5, 0x7fa381800000, "0x0003")])
+    chk("device aperture" in _b7.getvalue(),
+        "...and the same address in domain 0x0003 is an aperture, so it is answered rather than refused")
+    _b8 = _io.StringIO()
+    with _cl.redirect_stdout(_b8):
+        report_page_classes(str(_hv), [(1003.5, 0x7fa381800000, "")])
+    # With no domain in the capture the old behaviour is the correct one: the map event still answers, and no
+    # kind is invented. (My first version of this arm asserted "no map event", which is what a log WITHOUT the
+    # map side says -- the fixture here has one, so that expectation was mine to correct, not the code's.)
+    chk("pfn=" in _b8.getvalue() and "HOST VA" not in _b8.getvalue() and "aperture" not in _b8.getvalue(),
+        "a capture with no domain field keeps the old behaviour and does not invent a kind")
+
     return 0 if ok else 1
+
 
 
 def exit_code(maps, unmaps, faults=()):
@@ -508,7 +640,140 @@ def exit_code(maps, unmaps, faults=()):
         return 3 if not faults else 4
     if not maps or not unmaps:
         return 4
+
+
     return 0
+
+
+# ---- page class (engine#2478) ------------------------------------------------------------------------------------
+# A faulting IOVA is half a fact: the other half is what kind of page sat behind the mapping. The tracepoint's `map`
+# event carries `paddr`, so /proc/kpageflags answers it -- and the answer changed the diagnosis there: an ordinary
+# page-cache page (`UPTODATE|LRU`) means the driver DMAs into the page cache, not into a slab buffer of its own.
+# Kept as a separate pass so the tested parse/analyse paths keep their tuple shapes.
+KPF = ("LOCKED", "ERROR", "REFERENCED", "UPTODATE", "DIRTY", "LRU", "ACTIVE", "SLAB", "WRITEBACK", "RECLAIM",
+       "BUDDY", "MMAP", "ANON", "SWAPCACHE", "SWAPBACKED", "COMPOUND_HEAD", "COMPOUND_TAIL", "HUGE", "UNEVICTABLE",
+       "HWPOISON", "NOPAGE", "KSM", "THP", "OFFLINE", "ZERO_PAGE", "IDLE")
+
+
+def decode_kpageflags(v):
+    """The flag names in an 8-byte /proc/kpageflags entry. 0x28 -> 'UPTODATE, LRU' (bit 3 and bit 5)."""
+    return ", ".join(n for b, n in enumerate(KPF) if (v >> b) & 1) or "none"
+
+
+def paddrs(path):
+    """{iova: [(t, paddr), ...]} -- EVERY mapping that carried a paddr, in log order.
+
+    It used to keep only the last paddr per IOVA, which answers "what is this IOVA mapped to NOW" and is wrong for
+    "what page sat behind a fault at time t": on a capture where an IOVA is mapped to A, faulted, and remapped to B,
+    the last-mapping rule names B -- a page the faulting access could not have touched (review of engine#2703, whose
+    CHANGES measured exactly that: `paddr B, mapped 400 ms AFTER the fault` beside a row that correctly used the map
+    BEFORE it). The capture in engine#2478 is 731 s with 403k maps, so a reused IOVA is not a corner case.
+    """
+    out = {}
+    rx = re.compile(r"(\d+\.\d+):\s+map:.*?iova=(0x[0-9a-f]+).*?paddr=(0x[0-9a-f]+)")
+    try:
+        fh = open(path, errors="replace")
+    except OSError as e:
+        raise SystemExit(f"iommu_map_side: cannot read {path}: {e}")
+    with fh:
+        for line in fh:
+            m = rx.search(line)
+            if m:
+                out.setdefault(int(m.group(2), 16), []).append((float(m.group(1)), int(m.group(3), 16)))
+    return out
+
+
+def page_size():
+    """The kernel's page size, or None if it cannot be determined.
+
+    `kpageflags` is indexed by PAGE-SIZED entries, so `paddr // 4096` on a kernel with another PAGE_SIZE reads a
+    DIFFERENT page's flags and prints them as the answer -- the one place in this file that guessed instead of
+    reporting (engine#2765). Everywhere else an unknown is `unavailable (…)`.
+    """
+    try:
+        size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        return None
+    return size if size > 0 else None
+
+
+def page_class(paddr, flags="/proc/kpageflags", pagesize=None):
+    """The kpageflags names for a physical address, or why it cannot be read (needs root)."""
+    ps = pagesize if pagesize is not None else page_size()
+    if ps is None:
+        return "unavailable (page size unknown, so kpageflags cannot be indexed)"
+    try:
+        with open(flags, "rb") as f:
+            f.seek(paddr // ps * 8)
+            raw = f.read(8)
+    except OSError as e:
+        return f"unavailable ({e.strerror})"
+    if len(raw) < 8:
+        return "unavailable (past the end of kpageflags)"
+    return decode_kpageflags(int.from_bytes(raw, "little"))
+
+
+def unmaps_of(trace):
+    """{iova: [t, ...]} -- when each IOVA was unmapped, so a page class is not attributed across a release."""
+    out = {}
+    rx = re.compile(r"(\d+\.\d+):\s+unmap:.*?iova=(0x[0-9a-f]+)")
+    try:
+        fh = open(trace, errors="replace")
+    except OSError as e:
+        raise SystemExit(f"iommu_map_side: cannot read {trace}: {e}")
+    with fh:
+        for line in fh:
+            m = rx.search(line)
+            if m:
+                out.setdefault(int(m.group(2), 16), []).append(float(m.group(1)))
+    return out
+
+
+def report_page_classes(trace, faults):
+    """One line per fault: the paddr of the last mapping of its IOVA at or BEFORE the fault, and that page's class.
+
+    `faults` is [(t, iova)], not a set of IOVAs: the question is "what page sat behind THIS fault", so the answer has
+    to be the mapping that was in force when it happened. With no mapping at or before the fault the line says so
+    rather than falling forward to a later one -- the same rule as every other negative in this file.
+    """
+    pm = paddrs(trace)
+    um = unmaps_of(trace)
+    for item in faults:
+        t, iova = item[0], item[1]
+        dom = item[2] if len(item) > 2 else ""
+        kind = address_kind(dom)
+        if kind == "host VA":
+            # The address is a userspace VA, and kpageflags is indexed by PFN. A class here would be read from
+            # whatever page the VA happens to equal as a number -- engine#2542's 11-16 faults are exactly this
+            # (domain 0x0002, 0x7fa381800000.., ten consecutive pages, flags 0x0077), so no map event can be
+            # what the fault touched and the honest answer is that this tool cannot read a class for it.
+            print(f"  {hex(iova):>12}  no page class: a HOST VA fault (domain {dom or '?'}) -- /proc/kpageflags is "
+                  f"indexed by PFN, so a class needs a VA -> PFN translation (/proc/<pid>/pagemap, root, while the "
+                  f"process lives) that this tool does not do")
+            continue
+        cands = [(mt, pa) for mt, pa in pm.get(iova, ()) if mt <= t]
+        if not cands:
+            later = len(pm.get(iova, ()))
+            print(f"  {hex(iova):>12}  {kind + ': ' if kind != 'unknown domain' else ''}"
+                  f"no map event carried a paddr for it at or before t={t:.3f} s"
+                  f"{'' if not later else f' (a later mapping exists; it cannot be what the fault touched)'}")
+            continue
+        mt, pa = max(cands)
+        # A mapping released before the fault describes a page the faulting access could not have been using:
+        # engine#2765 measured exactly that (`map @1000.1, unmap @1002.0, fault @1003.5` printed a class for a page
+        # that had been gone for 1.5 s). A class there is worse than none -- it is engine#2478's "NEVER MAPPED OR
+        # UNMAPPED" shape with a confident label on it.
+        between = [ut for ut in um.get(iova, ()) if mt < ut <= t]
+        if between:
+            ut = max(between)
+            print(f"  {hex(iova):>12}  no page class: the mapping at t={mt:.3f} s was RELEASED at t={ut:.3f} s,"
+                  f" {t - ut:.1f} s before the fault -- the translation was absent when the fault happened")
+            continue
+        ps = page_size()
+        pfn = pa // ps if ps else 0
+        print(f"  {hex(iova):>12}  {kind + ' ' if kind != 'unknown domain' else ''}"
+              f"paddr={hex(pa):>14}  pfn={pfn:<9}  {page_class(pa, pagesize=ps)}"
+              f"   (mapped at t={mt:.3f} s{'' if t - mt < 1 else f', {t - mt:.1f} s before the fault'})")
 
 
 def main(argv):
@@ -516,6 +781,8 @@ def main(argv):
     ap.add_argument("--trace")
     ap.add_argument("--before")
     ap.add_argument("--after")
+    ap.add_argument("--page-class", action="store_true",
+                    help="for each faulted IOVA, its last paddr in the capture and the kpageflags class behind it")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
@@ -523,8 +790,18 @@ def main(argv):
     if not (a.trace and a.before and a.after):
         ap.print_help()
         return 2
+    # main merged the [MIXED] audit counters (#2742) and this PR adds the page-class read; both need the same call.
     maps, unmaps, other, widened, by_name, map_names, unmap_names = parse_events(a.trace)
-    faults = parse_faults(a.after)
+    # A TRACEPOINT capture carries its own `io_page_fault` events, so it can be the fault source. Without this the
+    # tool answers "no fault inside the window" for a capture that visibly holds five -- measured on engine#2478,
+    # where the trace had 5 faults and the same file passed as --after was needed to see them.
+    faults = parse_faults(a.after, with_domain=True)
+    if not faults:
+        faults = parse_faults(a.trace, with_domain=True)
+        if faults:
+            print(f"note: no faults in --after; using the {len(faults)} fault event(s) carried by the trace itself")
+    if a.page_class:
+        report_page_classes(a.trace, faults)
     rows, header = analyse(maps, unmaps, faults, parse_faults(a.before), faults, other, widened)
     # Which event names produced this denominator. The classifier reads the PROBED FUNCTION, so a capture taken by
     # two lanes' probes pools into one dataset without saying so -- measured 2026-11-16: a capture meant to hold 2

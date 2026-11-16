@@ -119,20 +119,50 @@ def check(root: pathlib.Path, log_text: str) -> int:
     return 0
 
 
-def write_baseline(root: pathlib.Path, log_text: str) -> int:
+def _header(path: pathlib.Path) -> list[str]:
+    """The file's own leading comment block, kept verbatim across a rewrite.
+
+    `--write` regenerated the file from three hard-coded lines until engine#2750, which dropped the Apache notice every engine
+    file carries, and it replaced every existing reason with a TODO placeholder. Both are the same mistake: a maintenance
+    command that silently discards the evidence beside the names it keeps.
+    """
+    if not path.is_file():
+        return ["# Tests that legitimately do not run in the CI configuration, one name per line with the reason.",
+                "# Written by tools/ci/ctest_skips.py --write. A name here that stops skipping is reported, so the list",
+                "# shrinks rather than rots (the shape of tools/ci/unreferenced_tests.txt, engine#1824).",
+                "# A test whose BINARY is missing is never baselined here: that is a build-list mistake, not a fixture.",
+                ""]
+    head = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith("#") or not line.strip():
+            head.append(line)
+            continue
+        break
+    return head or [""]
+
+
+def write_baseline(root: pathlib.Path, log_text: str, reason: str = "") -> int:
     did_not_run = skipped(log_text)
     # Only a test that RAN and returned 77 can be baselined. "Not Run" means the binary is missing, which is a build-list
     # mistake (ci_targets_check's subject) and would become invisible the moment this file named it.
     skipped_only = sorted(n for n, kind in did_not_run.items() if kind == "skipped")
     not_run = sorted(n for n, kind in did_not_run.items() if kind == "not-run")
     path = root / BASELINE
-    lines = ["# Tests that legitimately do not run in the CI configuration, one name per line with the reason.",
-             "# Written by tools/ci/ctest_skips.py --write. A name here that stops skipping is reported, so the list",
-             "# shrinks rather than rots (the shape of tools/ci/unreferenced_tests.txt, engine#1824).",
-             "# A test whose BINARY is missing is never baselined here: that is a build-list mistake, not a fixture.",
-             ""]
+    known = baseline(root)
+    new = [n for n in skipped_only if n not in known]
+    # engine#2750: a NEW entry must carry the caller's reason. Writing a TODO placeholder and then passing the check is the
+    # green tick over nothing this tool exists to remove -- the entry names a test nobody explained. Existing entries keep
+    # the reason they already carry, so the routine refresh (`--write`) stays a single command.
+    if new and not reason.strip():
+        print(f"ctest_skips: {len(new)} test(s) would be baselined with no reason: {', '.join(new[:6])}"
+              f"{' …' if len(new) > 6 else ''}", file=sys.stderr)
+        print("ctest_skips: give the reason they cannot run here (--reason \"...\"), or give the test its fixture. "
+              "Nothing was written.", file=sys.stderr)
+        return 1
+    lines = _header(path)
     for name in skipped_only:
-        lines.append(f"{name}   # TODO: why this cannot run here")
+        kept = known.get(name) or (reason.strip() if name in new else "")
+        lines.append(f"{name}   # {kept}" if kept else name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"ctest_skips: wrote {path} with {len(skipped_only)} skipped test(s)")
@@ -175,6 +205,24 @@ def self_test() -> int:
     ok(skipped(with_skip) != skipped(with_notrun), "... and the two shapes are not the same verdict")
     ok(_parser().parse_args([]).root == str(TOOL_ROOT),
        "with no --root the baseline is the repo's own, so a run from another cwd cannot read a stranger's")
+    # engine#2750: --write must not baseline a name with a placeholder reason, and must keep the file's own header.
+    (root / BASELINE).write_text("# Copyright notice that must survive\nnpu_pack_import   # a real reason\n")
+    with_new = with_skip + " 14/15 Test #14: brand_new ....................***Skipped   0.01 sec\n" \
+                          + "100% tests passed, 0 tests failed out of 15\n"
+    import contextlib
+    import io
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc_no_reason = write_baseline(root, with_new)
+    ok(rc_no_reason == 1, "a new name with no --reason is refused (rc 1)")
+    ok("brand_new" not in (root / BASELINE).read_text(), "... and nothing was written")
+    ok("brand_new" in err.getvalue() and "--reason" in err.getvalue(),
+       "... the refusal names the test and the flag that would allow it")
+    ok(write_baseline(root, with_new, "needs a container") == 0, "with --reason the write is allowed")
+    text = (root / BASELINE).read_text()
+    ok("brand_new   # needs a container" in text, "... the caller's reason is the one recorded")
+    ok("npu_pack_import   # a real reason" in text, "... an existing entry keeps its own reason")
+    ok(text.startswith("# Copyright notice that must survive"), "... the header block survives a rewrite")
     print("self-test ok" if not fails else f"self-test FAILED ({fails})")
     return 1 if fails else 0
 
@@ -185,6 +233,8 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--root", default=str(TOOL_ROOT),
                     help="the tree that holds %s (default: the repo this tool ships in, never the caller's cwd)" % BASELINE)
     ap.add_argument("--write", action="store_true")
+    ap.add_argument("--reason", default="",
+                    help="why the tests a --write would ADD cannot run here (required for a new name)")
     ap.add_argument("--self-test", action="store_true")
     return ap
 
@@ -199,7 +249,7 @@ def main() -> int:
         return 2
     text = path.read_text(encoding="utf-8", errors="replace")
     root = pathlib.Path(a.root).resolve()
-    return write_baseline(root, text) if a.write else check(root, text)
+    return write_baseline(root, text, a.reason) if a.write else check(root, text)
 
 
 if __name__ == "__main__":

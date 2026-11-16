@@ -163,7 +163,10 @@ def provenance(recorded, tested, repo):
     rc, base = _git(repo, "merge-base", recorded, tested)
     if rc != 0 or not base:
         shallow = _git(repo, "rev-parse", "--is-shallow-repository")[1] or "?"
-        return (f"{head}: cannot place (no common history in this clone; shallow={shallow}"
+        # measured on this box: the golden's OBJECT can be present in a --depth clone while the ancestry between
+        # it and the tested commit is not (220 commits held against ~11k in the fork), so the honest words are
+        # "the history between them", not "no common history" -- the two lines do meet, past the shallow boundary.
+        return (f"{head}: cannot place (the history between them is not in this clone; shallow={shallow}"
                 + ("; fetch the history with `git -C <llama.cpp> fetch --unshallow`"
                    if shallow == "true" else "") + ")")
     a = _git(repo, "rev-list", "--count", f"{base}..{recorded}")[1]
@@ -385,6 +388,20 @@ def cmd_selftest():
         check(got, "cannot place (", "a shallow clone cannot place an older commit")
         check("no common history" not in got, True,
               "a shallow clone does NOT answer 'no common history' -- that was the #2643 misread")
+        # The shape this box actually has, and the arm above does NOT cover it: both commits PRESENT, each its own
+        # shallow root, so `merge-base` finds nothing while `cat-file -e` succeeds on both. Two depth-1 fetches
+        # produce exactly that (measured on the engine's submodule: 4a58da9b0 is present, 220 commits held, and the
+        # relation is unanswerable). The words must name the missing ancestry, not a missing history.
+        both = os.path.join(tmp, "both")
+        subprocess.run(["git", "init", "-q", both], capture_output=True, text=True)
+        run(both, "fetch", "-q", "--depth", "1", "file://" + repo, c3)
+        run(both, "fetch", "-q", "--depth", "1", "file://" + repo, c1)
+        present = all(subprocess.run(["git", "-C", both, "cat-file", "-e", c + "^{commit}"],
+                                     capture_output=True).returncode == 0 for c in (c1, c3))
+        check(present, True, "the fixture holds BOTH commits (else it is the absent-object case again)")
+        two = provenance(c1, c3, both)
+        check(two, "the history between them is not in this clone",
+              "two shallow roots are 'history between them', not 'no common history'")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

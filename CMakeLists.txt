@@ -709,6 +709,11 @@ add_test(NAME hw_gate_phase_rows COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_
 # engine#2542: the accel sampler's self-test -- the correlation and rotation arms must be green before anyone
 # starts a long capture, because a silent correlator loses exactly the event it exists to catch.
 add_test(NAME accel_sampler COMMAND bash ${CMAKE_SOURCE_DIR}/tools/diag/accel_sampler.sh selftest)
+# engine#2778: the arm for the rename that #2784 merged. `summary()` was rewritten in place every ~15 min (96 windows/day),
+# so a reader -- accel_attribution.py, or a lane grepping at the moment of a fault -- could see a partial file whose header
+# is already valid: a zero that reads as "nothing was held". Hermetic: the real summary() driven in a subshell against
+# synthetic samples, with a racing reader; no device, no sampler, no ticket.
+add_test(NAME accel_sampler_summary COMMAND bash ${CMAKE_SOURCE_DIR}/tests/accel_sampler_summary_test.sh ${CMAKE_SOURCE_DIR})
 # engine#2523's rule reached main without its runtime arm: the source-reading hw_gate_test.py asserts the SKIP rows'
 # text and their `infra=1`, and hw_gate_phase_rows asserts phase parsing, but nothing ran the gate end to end with a
 # backend that reports "no test case ran". That is the case the fix was for -- zero cases must read INCOMPLETE and exit

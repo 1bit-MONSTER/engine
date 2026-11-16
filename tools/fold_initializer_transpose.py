@@ -53,7 +53,15 @@ def fold(model):
         array = numpy_helper.to_array(inits[src])
         want = np.transpose(array, perm[0])
         dst = f"{src}_t"
-        # A second reference to the same weight uses the same folded name, so a duplicated Transpose folds once.
+        # engine#2779: a second Transpose of the same weight with a DIFFERENT perm gets its own folded array. Naming
+        # both by the source alone made the second fold skip creating its array and rewire its consumers to the
+        # FIRST perm's tensor -- a silently invalid graph that `--check` cannot see, because no initializer-fed
+        # Transpose is left in it (measured: two perms over one 2x3 weight produce out_b declared [2,3] reading a
+        # [3,2] tensor, and tools/make-audio-pack.sh packs it happily).
+        if dst in inits and list(numpy_helper.to_array(inits[dst]).shape) != list(want.shape):
+            dst = f"{src}_t{''.join(str(p) for p in perm[0])}"
+        # A second reference to the same weight with the SAME perm reuses the same folded name, so a duplicated
+        # Transpose folds once.
         if dst not in inits:
             new = numpy_helper.from_array(np.ascontiguousarray(want), dst)
             graph.initializer.append(new)

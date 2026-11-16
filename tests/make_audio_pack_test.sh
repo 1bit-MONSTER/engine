@@ -74,6 +74,42 @@ EOF
 check "the pack's decoder has no initializer-fed Transpose" "$left" 0
 check "and the node was actually removed" "$nodes" 1      # Transpose + MatMul -> MatMul
 
+# engine#2779: a decoder that folds one weight TWO ways. The tool used to name both folds after the source, so the
+# second Transpose rewired its consumers to the first perm's array: the pack then carried one weight where the graph
+# needs two, `--check` passed (no initializer-fed Transpose was left) and the script exited 0. Each consumer must now
+# read its own folded weight -- the check below reads the initializer each consumer actually names.
+python3 - "$tmp/dec2.onnx" <<'PY2' || { echo "FAIL could not build the two-perm fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+w = numpy_helper.from_array(np.arange(6, dtype=np.float32).reshape(2, 3), "wp")
+nodes = [helper.make_node("Transpose", ["wp"], ["t1"], perm=[1, 0]),
+         helper.make_node("Transpose", ["wp"], ["t2"], perm=[0, 1]),
+         helper.make_node("Identity", ["t1"], ["a"]),
+         helper.make_node("Identity", ["t2"], ["b"])]
+g = helper.make_graph(nodes, "g", [], [
+    helper.make_tensor_value_info("a", TensorProto.FLOAT, [3, 2]),
+    helper.make_tensor_value_info("b", TensorProto.FLOAT, [2, 3])], [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY2
+"$SCRIPT" --out "$tmp/pack2" "$tmp/enc.onnx" "$tmp/dec2.onnx" >"$tmp/log3" 2>&1
+check "a two-perm decoder packs" "$?" 0
+read -r consumers shapes <<EOF
+$(python3 - "$tmp/pack2/decoder_model.onnx" <<'PY3'
+import sys
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: tuple(numpy_helper.to_array(i).shape) for i in m.graph.initializer}
+named = [i for n in m.graph.node for i in n.input if i in inits]
+print(len(set(named)), len({inits[n] for n in named}))
+PY3
+)
+EOF
+check "each consumer names a folded weight" "$consumers" 2
+check "and the two weights are the two orientations" "$shapes" 2
+
 # The refusal arm: with `onnx` unimportable the script must fail rather than write the unfurled decoder. The
 # stub is a module that raises, so the check is the same one CI would hit with no onnx installed at all.
 mkdir -p "$tmp/stub" && echo 'raise ImportError("no onnx here")' > "$tmp/stub/onnx.py"

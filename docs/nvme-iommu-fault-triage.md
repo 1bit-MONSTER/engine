@@ -78,6 +78,33 @@ PCI-DMA: Using software bounce buffering for IO (SWIOTLB)
 software IO TLB: mapped [mem 0x5927e000-0x5d27e000] (64MB)
 ```
 
+### Reading the controller's own view — and checking the offsets against the kernel's number
+
+The log line gives the size; the controller's Identify data confirms it and is readable without `nvme-cli`, with a
+read-only admin ioctl (`NVME_IOCTL_ADMIN_CMD`, opcode `0x06`, `cdw10 = 0x01`) into a 4096-byte buffer.
+
+**Find the field by value, not by remembered offset.** Locate the number the kernel already printed: 64 MiB in
+4 KiB units is `16384 = 0x4000`, so scan the buffer for `00 40 00 00`.
+
+```
+$ … identify controller … -> model: YMTC PC41Q-2TB-B
+4-byte words == 16384 at offsets: 0x110, 0x114
+  0x0110: 00 40 00 00 00 40 00 00   -> HMPRE = HMMIN = 16384 x 4 KiB = 64 MiB
+raw 0x0a0..0x0d0: all zero          <- where a probe using the wrong offsets looked
+```
+
+`HMPRE`/`HMMIN` are at **0x110/0x114**. A probe reading `0x0B0/0x0B4` returns zeros, which reads as *"the controller
+advertises no HMB"* — and that conclusion was published on engine#2478 and cost the issue a day of its leading
+hypothesis before it was withdrawn. **A probe whose value contradicts a kernel log line is the suspect**: the log said
+64 MiB, the controller said 64 MiB, and only the hand-rolled offsets disagreed.
+
+One arithmetic check this enables: does the faulting address set fit inside the HMB? On this boot six of the nine
+faulting addresses — `0xe1352000`, `0xe1d00000`, `0xe1e18000`, `0xe407f000`, `0xe4240000`, `0xe5356000` — span exactly
+`0xe1352000 .. 0xe5356000` plus one page = **64.02 MiB**, against a **64.00 MiB** buffer. It misses by 20,480 B, so those
+six are *not* inside the HMB: close enough to have been worth computing, and not close enough to assert. The three
+addresses outside that span (`0x6925f000`, `0x7f6af000`, `0xebf50000`) are a separate population, and the two that
+`iommu_map_side.py` could not place are exactly two of them.
+
 ## Test 1 — disable the HMB (no reboot, decides whether the buffer is the HMB at all)
 
 **No `nvme-cli` needed, and none is installed here** (`command -v nvme` → nothing). The kernel exposes the same switch

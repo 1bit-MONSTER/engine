@@ -373,17 +373,16 @@ def main(argv):
         for i, b in enumerate(bursts, 1):
             print("burst %d/%d" % (i, len(bursts)))
             print(render(summarize(b), []))
-        gaps = []
-        for prev, nxt in zip(bursts, bursts[1:]):
-            gaps.append("--split %.0fs took %d burst(s) >= a %.0fs gap (observed gaps: %s)"
-                        % (a.split, len(bursts), a.split,
-                           ",".join("%.0fs" % g for g in _gaps(stamped))))
-            break
+        # The threshold is a choice, so show what it was chosen against: the DISTINCT
+        # non-zero gaps. Listing all 89 gaps (mostly 0 s, inside a burst) hides the
+        # one that matters -- the smallest gap between bursts.
+        seen = sorted({g for g in _gaps(stamped) if g > 0})
+        if seen:
+            print("--split %.0fs: %d burst(s); the gaps between bursts in this log are %s"
+                  % (a.split, len(bursts), ",".join("%.0fs" % g for g in seen)))
         print("%d burst(s); access counts %s%s"
               % (len(bursts), sorted(counts),
                  " -- all equal" if len(set(counts)) == 1 else " -- NOT all equal"))
-        for line in gaps:
-            print(line)
         return 0
     print(render(summarize(events), snaps))
     return 0

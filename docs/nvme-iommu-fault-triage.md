@@ -132,6 +132,39 @@ If a firmware refuses the sysfs write, the `nvme-cli` equivalent is `nvme set-fe
 2.3/min baseline, and 7 in 4 min after restoring it. **The HMB is a bystander.** That test cost four minutes and closed a
 hypothesis that had been argued for twenty; run it first on any successor question, because it is the cheapest one.
 
+### Before the kprobes below: the IOMMU has its own tracepoints, and they cost nothing to arm
+
+`/sys/kernel/tracing/events/iommu/` carries `io_page_fault`, `map` and `unmap` as **real tracepoints**, not kprobes. Same
+facts, structured fields, and **none of the three kprobe failure modes below** -- no probe slot to leak, no `stacktrace`
+suppression, no unfiltered write from a rejected range filter.
+
+```
+$ echo 1 > /sys/kernel/tracing/events/iommu/io_page_fault/enable
+$ echo 1 > /sys/kernel/tracing/tracing_on ; sleep 45 ; echo 0 > /sys/kernel/tracing/tracing_on
+$ grep io_page_fault /sys/kernel/tracing/trace | head -2
+
+ irq/26-AMD-Vi-265 [003] ..... 34226.857983: io_page_fault: IOMMU:nvme 0000:c4:00.0 iova=0x…e5356000 flags=0x0000
+ irq/26-AMD-Vi-265 [003] ..... 34252.900147: io_page_fault: IOMMU:nvme 0000:c4:00.0 iova=0x…e1e18000 flags=0x0000
+```
+
+**`map` is the event worth knowing about**, because it carries the physical page, which no `journalctl` line has:
+
+```
+wget-1394013 [012] ..... 34862.494190: map: IOMMU: iova=0x3d207000 - 0x3d208000 paddr=0x187168a000 size=4096
+```
+
+That is the missing link between a faulting IOVA and an allocation: map event -> `paddr` -> `/proc/kpageflags`, with no
+`/sys/kernel/debug/iommu` (absent on this kernel) and no `nvme-cli` (not installed).
+
+**The trap, measured**: 40 s of ordinary I/O (`wget`) with `map`, `unmap` and `io_page_fault` all enabled produced
+**4,079 map + 1,206 unmap and 0 faults** -- 5,285 events, all unrelated 4 KiB DMA. At ~1.7 faults/min a fault is **one line
+in five thousand**, so an unfiltered capture does not merely get noisy, it **loses the fault and reads as a quiet box**.
+Filter by IOVA (`/sys/kernel/tracing/events/iommu/unmap/filter`) or leave `map`/`unmap` off and capture faults alone.
+
+**What the tracepoints cannot give you**: a caller stack. `iommu_unmap_fast` with `stacktrace:on` remains the only way to
+see *which* kernel path freed a page -- so the kprobes below are still the instrument for "who", and the tracepoints are the
+cheap one for "what and where", including the `paddr`.
+
 ## Test 2 — trace the ordering, **not** a boot flag
 
 This section used to prescribe `iommu.strict=1` and predict "zero faults for a full boot". **That prediction was wrong**,

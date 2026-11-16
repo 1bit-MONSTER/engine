@@ -1606,6 +1606,25 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
         else if (t.name.size() > 3 && t.name.compare(t.name.size() - 3, 3, "_Q4") == 0) table = &t;
         else if (!table && t.dims.size() == 2) table = &t;   // an unquantised [V, H] table
     }
+    // engine#2663: a TIED-embedding graph (the gemma3 family) carries no `embed_tokens` node at all -- its token table IS
+    // the output projection, shipped as `lm_head.weight`. The scan above is name-driven, so such a pack found no table and
+    // the refusal below reported "no embed_tokens table", which is a true sentence about a NAME and a false one about the
+    // pack. Accept the tied name only when the component carries no `embed_tokens` tensor whatsoever, so every pack that
+    // has one keeps exactly the behaviour it had, and only when the tensor is 2-D: a 4-bit tied table would need `scales`,
+    // and guessing that the `embed_scale` scalar beside it is the quantisation scale is what #2663 was filed about.
+    if (table == nullptr) {
+        bool any_embed = false;
+        for (const auto& t : em.tensors) {
+            if (t.name.find("embed_tokens") != std::string::npos) { any_embed = true; break; }
+        }
+        if (!any_embed) {
+            for (const auto& t : em.tensors) {
+                const bool tied = t.name == "lm_head.weight" ||
+                                  (t.name.size() > 14 && t.name.compare(t.name.size() - 14, 14, "/lm_head.weight") == 0);
+                if (tied && t.dims.size() == 2) { table = &t; break; }
+            }
+        }
+    }
     // engine#1725: the gemma-4 components are f32 and UNQUANTISED -- an `embed_tokens` table with no `*scales*` beside
     // it -- while the shape above is the 4-bit packed one another family ships. Reading the f32 table is worth doing
     // (the container wants BF16 and the conversion is exact); claiming the pack is not, because its decoder also carries

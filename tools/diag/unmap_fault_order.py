@@ -105,19 +105,24 @@ def parse_faults(lines, journal_epoch):
 
 
 def correlate(unmaps, faults, window_us):
-    """[(fault, delta_us, unmap)] -- the nearest unmap of the same iova within the window, or None."""
+    """[(fault, delta_us, unmap, n)] -- the nearest unmap of the same iova within the window, or None, and how many
+    unmaps of that iova the window held. `n` is the discriminator: a page recycled ~470 times a second puts thousands
+    of unmaps inside a 30 s window, and then "the nearest one" is not evidence of anything."""
     by_iova = {}
     for t, iova, size in unmaps:
         by_iova.setdefault(iova, []).append((t, size))
     rows = []
     for t, iova, text in faults:
         best = None
+        n = 0
         if t is not None:
             for ut, size in by_iova.get(iova, ()):
                 d = (ut - t) * 1e6   # negative = the unmap came first
-                if abs(d) <= window_us and (best is None or abs(d) < abs(best[1])):
-                    best = ((ut, iova, size), d)
-        rows.append((t, iova, text, best))
+                if abs(d) <= window_us:
+                    n += 1
+                    if best is None or abs(d) < abs(best[1]):
+                        best = ((ut, iova, size), d)
+        rows.append((t, iova, text, best, n))
     return rows
 
 
@@ -146,10 +151,13 @@ def render(rows, unmaps, window_us):
         lines.append(f"  sizes: {sorted({u[2] for u in unmaps})[0]:#x} .. {sorted({u[2] for u in unmaps})[-1]:#x}")
     hit = [r for r in rows if r[3] is not None]
     lines.append(f"faults parsed: {len(rows)}; with an unmap of the same iova within +-{_span(window_us)}: {len(hit)}")
-    for t, iova, _text, best in hit[:20]:
+    for t, iova, _text, best, n in hit[:20]:
         (ut, _u, size), d = best
         verdict = "unmap BEFORE fault (translation gone)" if d < 0 else "unmap AFTER fault (stale mapping or other cause)"
-        lines.append(f"  iova {iova:#x} size {size:#x}: unmap {d:+.0f} us, {verdict}")
+        # A positive must say whether it discriminates. Measured 2026-11-16: one NVMe pool page is mapped and unmapped
+        # ~470 times a second, so a 30 s window holds thousands of unmaps of it and "the nearest" means nothing.
+        disc = "" if n <= 3 else f"  [1 of {n} unmaps of this iova in the window -- NOT discriminating, narrow --window]"
+        lines.append(f"  iova {iova:#x} size {size:#x}: unmap {d:+.0f} us, {verdict}{disc}")
     if rows and not hit:
         # A negative must name its own condition. The same sentence at a 5 ms window and at 30 s read alike, and the
         # 5 ms one was simply wrong, so the scale is in the line and the remedy is named with it.
@@ -221,6 +229,15 @@ def self_test():
     hit = correlate(near, pf[:1], 30_000_000)
     chk(hit and hit[0][3] is not None and hit[0][3][1] < 0,
         "a padded fault correlates with an unmap 31 us earlier (BEFORE), not an uncorrelated negative")
+    # 9. a POSITIVE must say whether it discriminates: a page recycled hundreds of times a second puts thousands of
+    #    unmaps in a wide window, and then "the nearest one" is not evidence. Measured 2026-11-16: one NVMe pool page
+    #    is mapped and unmapped ~470 times a second (nvme_prep_rq maps it, nvme_pci_complete_batch unmaps it).
+    hot = [(100.0 + i * 0.001, 0x4128000, 0x1000) for i in range(500)]   # 500 unmaps over 0.5 s
+    hr = correlate(hot, [(100.4, 0x4128000, "f6")], 30_000_000)
+    chk(hr[0][4] == 500 and "NOT discriminating" in " ".join(render(hr, hot, 30_000_000)),
+        "a page recycled hundreds of times a second is flagged as not discriminating")
+    chk("NOT discriminating" not in " ".join(render(correlate(unm, [(100.0005, 0x4128000, "f1")], 5000), unm, 5000)),
+        "a lone unmap in the window is not flagged")
     return 0 if ok else 1
 
 

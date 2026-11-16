@@ -149,6 +149,15 @@ the correlation. Because the same sentence is printed whether the window is too 
 nearby unmap, **the negative now names the window it used and the measured interval** -- a default alone does not fix
 the failure, only a negative that says *at what scale* it found nothing does.
 
+**And the reverse is just as wrong: a positive must say whether it discriminates.** The same page's cadence is
+workload-dependent -- a later capture on this box (05:40Z, 150 s, one IOVA filtered) found the NVMe paths mapping it
+from `nvme_prep_rq` through `dma_map_phys` and unmapping it from `nvme_pci_complete_batch` through
+`iommu_unmap_fast`, **about 470 times a second**. At that rate a ±30 s window holds ~14,000 unmaps of the page, so
+"the nearest one was 31 us before the fault" is not evidence of anything. **The tool now carries the count**: a
+pairing whose window held more than three unmaps of the same IOVA is printed with
+`[1 of N unmaps of this iova in the window -- NOT discriminating, narrow --window]`. On the burst capture above that
+fires immediately -- the -5.65 s pairing is `1 of 7` -- which is the honest reading of it.
+
 **One probe owns the shared buffer.** A kprobe on `iommu_unmap_fast` with **no filter** wrote 579,000 events and left
 a filtered probe on the same function with **zero** -- the trace ring buffer is shared, so the *narrow* probe (one
 IOVA, one call site) is the one that should be armed, and checking `grep -c '<probe>:' trace` before trusting a

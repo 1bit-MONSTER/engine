@@ -234,6 +234,7 @@ public:
 private:
     I8Ctx* ctx_for(I8Ctx* prefill, int rows, bool decode_twin, bool int8_only = false);
     bool   open_w4_decode(const Q4nxDesignGeom* designs16, int n);
+    int    w4_decode_head_role(const Q4nxDesignGeom* designs16, int n) const;
     int    design_index(I8Ctx* c) const;
     void   prof_add(ProfAcc* acc, int design, double pack, double quant, double wait, double rb,
                     double fill = 0.0);

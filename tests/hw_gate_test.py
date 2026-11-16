@@ -139,6 +139,21 @@ def script_invariants():
         bad.append("the compile-failure build row must stay FAIL: that is the job's own verdict")
     if src.find('result "kld $name" FAIL') < 0:
         bad.append("the KLD mismatch row must stay FAIL: a verify mismatch is a result, not an absent input")
+    # engine#2643/#2676: hw_gate_manifest's judge exits 2 when the golden's base cannot be placed (INCOMPLETE). The
+    # gate's KLD row must read that as "could not run" -- SKIP + infra=1 -- after the line that maps any non-zero
+    # exit to FAIL, or a shallow submodule turns every KLD row into a FAIL for a clone depth, not a measurement.
+    j = src.find('hw_gate_manifest.py" judge')
+    row = src.find('result "kld $name" $st', j) if j >= 0 else -1
+    if j < 0 or row < 0:
+        bad.append("the KLD judge call and its result row must exist (renamed or removed)")
+    else:
+        block = src[j:row]
+        fail_at = block.find("st=FAIL")
+        skip = block.find("[ $vrc = 2 ] && { st=SKIP; infra=1; }")
+        if skip < 0:
+            bad.append("judge exit 2 (INCOMPLETE) must map to SKIP + infra=1, not FAIL (engine#2643)")
+        elif fail_at < 0 or skip < fail_at:
+            bad.append("the exit-2 SKIP must come AFTER the non-zero -> FAIL line, or FAIL overwrites it")
     return bad
 
 

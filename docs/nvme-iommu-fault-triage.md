@@ -193,6 +193,15 @@ is not.**
    kprobe slot on `iommu_map`/`iommu_unmap_fast` until the next reboot, and there is no userspace way to remove it. A
    fresh event created and deleted in the same minute works fine, so the subsystem is not wedged -- only that event is.
 
+5. **Both the rate and the target go stale within minutes, so re-derive them immediately before arming.** Measured
+   on this box: an unfiltered `iommu_map`+`iommu_unmap_fast` pair ran at **~1,000 events/s** at 06:42Z and at
+   **14,449/s** (650,210 in 45 s) at 08:10Z, because another lane started a DMA-heavy build -- a 30-minute unfiltered
+   capture therefore keeps only its **last ~20 s** in the 1,410 KB per-CPU ring, which cannot contain a fault at one
+   per three minutes. And a filter built from the **last 25 faults** recorded 8 events in 30 s, then **0 in 30 s** five
+   minutes later: the faulting IOVAs move on faster than a capture can be planned. Consequence for a capture owner:
+   **refresh the address list and size the window from a positive control taken seconds, not minutes, earlier** -- and
+   let the positive control abort you, which is what it did three times today.
+
    **Treat each event's `filter` as write-once.** To change a filter, delete the event and recreate it; do not clear or
    edit one in place. And after deleting, **check `grep -c 'kprobes/' kprobe_events` back to its previous count** --
    cleanup that fails silently is how a probe outlives the run that armed it, which is the rule this page already has

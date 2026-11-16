@@ -40,42 +40,68 @@ def initializer_transposes(model):
     return [n for n in model.graph.node if n.op_type == "Transpose" and n.input[0] in inits]
 
 
+def folded_name(src, perm, want, inits, taken):
+    """The initializer a fold of `src` under `perm` is stored as, created if it is not there yet.
+
+    engine#2779: one weight folded under TWO different perms must not collapse onto one tensor. The first fold of a
+    source keeps the plain `<src>_t` name (so every existing pack and every printed name is unchanged), and each further
+    DISTINCT perm gets the perm in its name, which makes the collision impossible rather than unlikely. A repeated
+    identical perm still reuses the one tensor, which is the case the old comment was written for.
+
+    A name is only reused when it already holds EXACTLY this perm's values: an unrelated `<src>_t` in the source graph
+    (or one of a different shape) is a collision too, and rewiring consumers onto it is the same silent corruption in a
+    different disguise, so a free name is picked instead of trusting the name.
+    """
+    candidates = [f"{src}_t", f"{src}_t_" + "_".join(str(d) for d in perm)]
+    i = 2
+    while len(candidates) < 8:
+        candidates.append(f"{src}_t_{i}")
+        i += 1
+    for name in candidates:
+        existing = inits.get(name)
+        if existing is None:
+            return name
+        have = numpy_helper.to_array(existing)
+        if have.shape == want.shape and np.array_equal(have, want):
+            return name
+    raise SystemExit(f"{src}: no free initializer name for perm {perm} near {src}_t (engine#2779)")
+
+
 def fold(model):
     """Rewrite every initializer-fed Transpose in place. Returns [(src, dst, shape)] for what it folded."""
     folded = []
     graph = model.graph
     inits = {i.name: i for i in graph.initializer}
+    # (src, perm) -> the tensor that perm was folded into, and every name this run has already produced.
     by_perm = {}
-    folded_nodes = []
+    taken = set(inits)
     for node in initializer_transposes(model):
         src = node.input[0]
         perm = [a.ints for a in node.attribute if a.name == "perm"]
         if not perm:
             raise SystemExit(f"{src}: Transpose without a perm attribute cannot be folded")
+        array = numpy_helper.to_array(inits[src])
+        want = np.transpose(array, perm[0])
         key = (src, tuple(perm[0]))
-        dst = by_perm.get(key)
-        # A second reference to the same weight in the SAME orientation folds once and reuses the name. A different
-        # orientation needs an initializer of its own: one name per weight, keyed by the perm, used to give both
-        # consumers the first perm's tensor while the graph declared the second one's shape (engine#2779) -- and
-        # `--check` could not see it, because no Transpose is left. The key is the PERM, not the shape: on a square
-        # weight the two orientations have the same shape, so a shape test would still collapse them, and that is
-        # the case that validates and computes wrong values with no symptom.
-        if dst is None:
-            taken = any(k[0] == src for k in by_perm)
-            dst = f"{src}_t" if not taken else f"{src}_t_" + "".join(str(p) for p in perm[0])
-            want = np.transpose(numpy_helper.to_array(inits[src]), perm[0])
-            new = numpy_helper.from_array(np.ascontiguousarray(want), dst)
-            graph.initializer.append(new)
-            inits[dst] = new
+        if key in by_perm:
+            dst = by_perm[key]
+        else:
+            dst = folded_name(src, perm[0], want, inits, taken)
+            if dst not in inits:
+                new = numpy_helper.from_array(np.ascontiguousarray(want), dst)
+                graph.initializer.append(new)
+                inits[dst] = new
+                taken.add(dst)
             by_perm[key] = dst
-            folded.append((src, dst, list(want.shape)))
         for consumer in graph.node:
             for i, name in enumerate(consumer.input):
                 if name == node.output[0]:
                     consumer.input[i] = dst
-        folded_nodes.append(node)
-    if folded_nodes:
-        keep = [n for n in graph.node if not any(n is f for f in folded_nodes)]
+        folded.append((src, dst, list(want.shape)))
+    if folded:
+        gone = {f[1] for f in folded}
+        keep = [n for n in graph.node if not (n.op_type == "Transpose" and n.input[0] in inits
+                                              and f"{n.input[0]}_t" in gone)]
         del graph.node[:]
         graph.node.extend(keep)
         # An initializer the fold replaced and nothing else reads would otherwise be packed into the container.

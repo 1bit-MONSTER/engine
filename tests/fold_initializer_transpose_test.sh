@@ -78,56 +78,127 @@ check "the folded weight has the matmul orientation" "$shape" "3x4"
 rc=0; python3 "$TOOL" --check "$tmp/out.onnx" >/dev/null 2>&1 || rc=$?
 check "check accepts the folded graph" "$rc" 0
 
-# engine#2779: one weight feeding TWO Transposes with different perms used to fold to a single `{src}_t`, so both
-# consumers read the first perm's tensor while the graph declared the second one's shape. `--check` cannot see it
-# (no Transpose is left), so the pack built green and was invalid.
-python3 - "$tmp/two.onnx" "$tmp/square.onnx" <<'PY' || { echo "FAIL could not build the two-perm fixtures"; exit 1; }
+# engine#2779: ONE weight folded under TWO DIFFERENT perms. The fold used to name the result after the source only, so
+# the second perm reused the first one's tensor and rewired its consumers to the wrong orientation while --check passed.
+python3 - "$tmp/two.onnx" <<'PY2' || { echo "FAIL could not build the two-perm fixture"; exit 1; }
 import sys
 import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
+w = numpy_helper.from_array(np.arange(12, dtype=np.float32).reshape(2, 3, 2), "w")     # 2x3x2: two perms differ in shape
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[1, 0, 2]),
+     helper.make_node("Transpose", ["w"], ["b"], perm=[0, 2, 1]),
+     helper.make_node("Identity", ["a"], ["oa"]),
+     helper.make_node("Identity", ["b"], ["ob"])],
+    "g",
+    [],
+    [helper.make_tensor_value_info("oa", TensorProto.FLOAT, None),
+     helper.make_tensor_value_info("ob", TensorProto.FLOAT, None)],
+    [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY2
 
-def two_perm(path, shape, perms):
-    w = numpy_helper.from_array(np.arange(int(np.prod(shape)), dtype=np.float32).reshape(shape), "w")
-    nodes = [helper.make_node("Transpose", ["w"], [f"t{i}"], perm=p) for i, p in enumerate(perms)]
-    nodes += [helper.make_node("Identity", ["t0"], ["y0"]), helper.make_node("Identity", ["t1"], ["y1"])]
-    outs = [helper.make_tensor_value_info("y0", TensorProto.FLOAT, None),
-            helper.make_tensor_value_info("y1", TensorProto.FLOAT, None)]
-    onnx.save(helper.make_model(helper.make_graph(nodes, "g", [], outs, [w]),
-                                opset_imports=[helper.make_opsetid("", 17)]), path)
-
-# Two different orientations of a NON-square weight: (2,3,4) -> (2,4,3) and -> (4,3,2).
-two_perm(sys.argv[1], (2, 3, 4), [[0, 2, 1], [2, 1, 0]])
-# ... and of a SQUARE one: (3,3,3) -> (3,3,3) both ways, so a shape-based discriminator cannot tell them apart.
-two_perm(sys.argv[2], (3, 3, 3), [[1, 0, 2], [0, 2, 1]])
-PY
-
-for m in two square; do
-  python3 "$TOOL" "$tmp/$m.onnx" "$tmp/$m.out.onnx" >"$tmp/$m.log" 2>&1 || { cat "$tmp/$m.log"; fail=$((fail+1)); }
-  check "$m: two different perms fold to two weights" "$(grep -c '^folded ' "$tmp/$m.log")" 2
-  read -r same shapes values <<EOF
-$(python3 - "$tmp/$m.out.onnx" <<'PY'
+python3 "$TOOL" "$tmp/two.onnx" "$tmp/two-out.onnx" >"$tmp/two.log" 2>&1 || { cat "$tmp/two.log"; fail=$((fail+1)); }
+check "two perms fold into two weights" "$(grep -c '^folded ' "$tmp/two.log")" 2
+read -r distinct d0 d1 ok_a ok_b <<EOF
+$(python3 - "$tmp/two-out.onnx" <<'PY2'
 import sys
 import numpy as np
 import onnx
 from onnx import numpy_helper
-after = onnx.load(sys.argv[1])
-inits = {i.name: numpy_helper.to_array(i) for i in after.graph.initializer}
-reads = [n.input[0] for n in after.graph.node if n.op_type == "Identity"]
-w0, w1 = inits[reads[0]], inits[reads[1]]
-print(int(reads[0] == reads[1]),
-      "x".join(str(d) for d in w0.shape) + "/" + "x".join(str(d) for d in w1.shape),
-      int(np.array_equal(w0, w1)))
-PY
+m = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
+ident = {n.output[0]: n.input[0] for n in m.graph.node if n.op_type == "Identity"}
+a, b = ident["oa"], ident["ob"]
+w = np.arange(12, dtype=np.float32).reshape(2, 3, 2)     # the source is dropped when nothing else reads it
+print(a != b,
+      "x".join(str(d) for d in inits[a].shape), "x".join(str(d) for d in inits[b].shape),
+      np.array_equal(inits[a], np.transpose(w, (1, 0, 2))),
+      np.array_equal(inits[b], np.transpose(w, (0, 2, 1))))
+PY2
 )
 EOF
-  check "$m: the two consumers read DIFFERENT initializers" "$same" "0"
-  check "$m: and the two tensors differ" "$values" "0"
-  case "$m" in
-    two)    check "two-perm shapes are the two orientations" "$shapes" "2x4x3/4x3x2" ;;
-    square) check "square weight: same shape, still two distinct tensors" "$shapes" "3x3x3/3x3x3" ;;
-  esac
-done
+check "each perm gets its own name" "$distinct" "True"
+check "perm [1,0,2] tensor has shape" "$d0" "3x2x2"
+check "perm [0,2,1] tensor has shape" "$d1" "2x2x3"
+check "consumer a reads perm [1,0,2]'s values" "$ok_a" "True"
+check "consumer b reads perm [0,2,1]'s values" "$ok_b" "True"
+
+# ...and the case with NO symptom at all: a square weight, where both perms have the same shape and only the values
+# differ. This is the arm that would pass silently on a shape-only check.
+python3 - "$tmp/sq.onnx" <<'PY2' || { echo "FAIL could not build the square fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+w = numpy_helper.from_array(np.arange(4, dtype=np.float32).reshape(2, 2), "w")        # [[0,1],[2,3]]
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[0, 1]),
+     helper.make_node("Transpose", ["w"], ["b"], perm=[1, 0]),
+     helper.make_node("Identity", ["a"], ["oa"]),
+     helper.make_node("Identity", ["b"], ["ob"])],
+    "g",
+    [],
+    [helper.make_tensor_value_info("oa", TensorProto.FLOAT, None),
+     helper.make_tensor_value_info("ob", TensorProto.FLOAT, None)],
+    [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY2
+
+python3 "$TOOL" "$tmp/sq.onnx" "$tmp/sq-out.onnx" >"$tmp/sq.log" 2>&1 || { cat "$tmp/sq.log"; fail=$((fail+1)); }
+same_shape_dir=$(python3 - "$tmp/sq-out.onnx" <<'PY2'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
+ident = {n.output[0]: n.input[0] for n in m.graph.node if n.op_type == "Identity"}
+a, b = ident["oa"], ident["ob"]
+print("different" if not np.array_equal(inits[a], inits[b]) else "same")
+PY2
+)
+check "square weight: the two consumers still read different values" "$same_shape_dir" "different"
+
+# ...and the collision in the other direction: the SOURCE graph already carries an initializer called `w_t` that has
+# nothing to do with the fold. Reusing it because the name matches would be the same silent corruption on a graph that
+# never had two perms at all.
+python3 - "$tmp/taken.onnx" <<'PY2' || { echo "FAIL could not build the taken-name fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+w   = numpy_helper.from_array(np.arange(6, dtype=np.float32).reshape(2, 3), "w")
+# an unrelated tensor that happens to be called w_t, with the RIGHT shape and the WRONG values
+w_t = numpy_helper.from_array(np.full((3, 2), 7.0, dtype=np.float32), "w_t")
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[1, 0]),
+     helper.make_node("Identity", ["a"], ["oa"]),
+     helper.make_node("Identity", ["w_t"], ["keep"])],
+    "g",
+    [],
+    [helper.make_tensor_value_info("oa", TensorProto.FLOAT, None),
+     helper.make_tensor_value_info("keep", TensorProto.FLOAT, None)],
+    [w, w_t])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY2
+
+python3 "$TOOL" "$tmp/taken.onnx" "$tmp/taken-out.onnx" >"$tmp/taken.log" 2>&1 || { cat "$tmp/taken.log"; fail=$((fail+1)); }
+taken_verdict=$(python3 - "$tmp/taken-out.onnx" <<'PY2'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
+ident = {n.output[0]: n.input[0] for n in m.graph.node if n.op_type == "Identity"}
+read = ident.get("oa")
+w = np.arange(6, dtype=np.float32).reshape(2, 3)
+print("right" if read and np.array_equal(inits[read], np.transpose(w, (1, 0))) else f"WRONG({read})")
+PY2
+)
+check "an unrelated w_t in the source graph is not reused" "$taken_verdict" "right"
 
 echo "---"
 if [ "$fail" -ne 0 ]; then echo "$fail failed"; exit 1; fi

@@ -805,6 +805,22 @@ same process. Two settings make a model fit that rule:
 A model set up this way uses `NPU_I8_SEALED_ELF` (decode) and `NPU_I8_SEALED_PREFILL_ELF` (prefill), both
 built at the same width, e.g. with npu-kernels `sealed/build.sh … -c 4 --partition 4`.
 
+**Several users in one decode pass (#2689 item 3).** A decode step is M rows of the M=16 design, and one user fills
+one of them: the step costs the same from 1 to 16 rows (measured 11-16: Llama-3.2-1B about 146 ms, Qwen3-1.7B about
+214 ms, exact at every N), so 16 users of one model cost about what one does. `Q4nxNpuForward::step_users(tokens,
+pos, slot, logits)` is that step: one batched pass, one entry per row, rows of one slot contiguous and the slots
+ascending, and each row's logits identical to that sequence's own single-sequence run. Each slot keeps its own KV
+cache (`load_user_slot()` swaps it into the working pair), so a slot continues from the positions it is given and the
+model's own single-sequence cache is untouched between calls.
+- A model whose state is more than KV is **refused by name**: GDN linear attention and MLA keep a recurrence or an
+  absorption state per sequence, and a noncausal pack encodes one prompt per pass. A model that falls back to
+  per-token `step()` has no batched body to share and is refused for that reason.
+- The kernel side is unchanged: the projections were already one launch per M rows, and `rows_context` already takes
+  the read length and window start per row.
+- `tests/step_users_test.cpp` (`ctest step_users`) is the gate: three sequences of different lengths, one separate
+  forward instance each as the reference, and every row of every pass must match its own sequence's logits bit for
+  bit. It is host-GEMM and device-free (`ONEBIT_TEST_Q4NX=<container>`), so it runs where no NPU does.
+
 #### The t2s family is M=16 today, and that is what caps prefill (#1416)
 
 Measured, not inferred: a t2s container's kernel set contains **only `*_t2s2_m16.elf`** for 8 of the nine decode roles, and the engine reports the

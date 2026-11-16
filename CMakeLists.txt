@@ -294,6 +294,7 @@ add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set
 # passed and the shadowed one's arms could never fail. It takes no build input, so a ctest row is the
 # route that needs no ci.yml line (the workflow is not editable from a lane).
 # engine#2246 also added a row for that file's --self-test; `add_python_test(hrx_f16_narrowing ...)`
+
 # at line 418 has run exactly that since #2204, so the row was a duplicate and is gone -- one script
 # gets one row.
 add_test(NAME dupdef_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --check
@@ -498,6 +499,11 @@ add_python_test(conflict_triage_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_triag
 # engine#2643: provenance() tells apart four cases a reader cannot re-check by eye -- same commit, absent
 # object, ancestor at N commits, shallow clone -- and shipped with no arm. Hermetic: throwaway repos, no network.
 add_python_test(hw_gate_manifest_self ${CMAKE_SOURCE_DIR}/tools/hw_gate_manifest.py selftest)
+# engine#2478 review: a tool whose self-test nothing runs is a tool with no arms. The other rows live in
+# cmake/tests-unreferenced-selftest-rows.cmake (engine#2456 made the same point for four of them); the checker
+# below is what stops the next one from going quiet, across all three reference sources.
+add_python_test(tool_selftest_wired ${CMAKE_SOURCE_DIR}/tools/ci/tool_selftest_wired_check.py)
+add_python_test(tool_selftest_wired_self ${CMAKE_SOURCE_DIR}/tools/ci/tool_selftest_wired_check.py --self-test)
 add_python_test(notice_covers_deps_self ${CMAKE_SOURCE_DIR}/tools/ci/notice_covers_deps.py --self-test)
 # `--root` is explicit: add_python_test() sets no WORKING_DIRECTORY, so ctest runs this row in the BUILD
 # directory and a `--root .` default would look for CMakeLists.txt where there is none (review of #2344 --

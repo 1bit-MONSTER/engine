@@ -158,6 +158,52 @@ with tempfile.TemporaryDirectory() as tmp:
     check(r.returncode == 1 and state(out, paths["head.gguf"]) == "oid differs",
           f"rewritten in place at the same size -> re-hashed and caught (rc {r.returncode})")
 
+    # 5b. a cached hash does not outlive a file REPLACED IN PLACE with the same size AND the same mtime.
+    # The docstring of the cache says an entry counts only while "size, mtime and inode" are what was hashed; arms
+    # 5 covers size+mtime (a rewrite bumps mtime_ns) and nothing covered the inode, so dropping st_ino from the
+    # stamp passed every arm (review of engine#2619). This is the shape that needs it: rename a different file over
+    # the path, then put the original times back, so only the inode and the bytes differ.
+    victim = paths["head.gguf"]
+    # arm 5 left the file rewritten; put the good bytes back so the baseline below is a real one, with its own
+    # mtime so the cache entry from arm 5 cannot be the thing that makes this pass.
+    open(victim, "wb").write(good)
+    os.utime(victim, ns=(0, os.stat(victim).st_mtime_ns + 5_000_000_000))
+    holdings(base[:1])
+    r, out = run(tmp)
+    check(r.returncode == 0, "the head copy is ok before the inode swap")
+    st = os.stat(victim)
+    other = os.path.join(tmp, "other.gguf")
+    open(other, "wb").write(b"X" * st.st_size)          # same size, different bytes
+    os.replace(other, victim)                            # new inode at the same path
+    os.utime(victim, ns=(st.st_atime_ns, st.st_mtime_ns))  # and the times put back
+    st2 = os.stat(victim)
+    check(st2.st_ino != st.st_ino and st2.st_size == st.st_size and st2.st_mtime_ns == st.st_mtime_ns,
+          "the fixture replaces the inode and keeps size+mtime (else the arm below proves nothing)")
+    r, out = run(tmp)
+    check(r.returncode == 1 and state(out, victim) == "oid differs",
+          f"same path, new inode, same size and mtime -> re-hashed and caught (rc {r.returncode})")
+
+    # 5c. ... nor a file WRITTEN IN PLACE with size and mtime put back: the inode stays the same by definition, so
+    # 5b's field cannot see it. That is what cp -p, rsync -a --times, a same-length git checkout or a snapshot restore
+    # produce. Only st_ctime_ns separates it: every write bumps it and os.utime cannot put it back (review of #2631).
+    open(victim, "wb").write(good)
+    os.utime(victim, ns=(0, os.stat(victim).st_mtime_ns + 7_000_000_000))
+    r, out = run(tmp)
+    check(r.returncode == 0, "the head copy is ok before the in-place write")
+    st = os.stat(victim)
+    time.sleep(0.02)                                     # a ctime tick apart, so the write is a different ctime
+    with open(victim, "r+b") as f:
+        f.write(b"Y" * st.st_size)                       # same size, different bytes, same inode
+        f.flush(); os.fsync(f.fileno())
+    os.utime(victim, ns=(st.st_atime_ns, st.st_mtime_ns))  # and the times put back
+    st2 = os.stat(victim)
+    check(st2.st_ino == st.st_ino and st2.st_size == st.st_size and st2.st_mtime_ns == st.st_mtime_ns
+          and st2.st_ctime_ns != st.st_ctime_ns,
+          "the fixture writes IN PLACE: same inode, size and mtime, only ctime moved (else the arm below proves nothing)")
+    r, out = run(tmp)
+    check(r.returncode == 1 and state(out, victim) == "oid differs",
+          f"same inode, same size and mtime, written in place -> re-hashed and caught (rc {r.returncode})")
+
     # 6. a missing copy is drift, not a skip.
     holdings([{"pin": "x/Text", "file": "tokenizer_config.json", "path": os.path.join(box, "gone.json")}])
     r, out = run(tmp)
@@ -189,6 +235,19 @@ with tempfile.TemporaryDirectory() as tmp:
     r, out = run(tmp, "--rehost-only", holdings="absent.json")
     check(r.returncode == 1 and any(x["state"] == "re-host not pinned" for x in out["rehosts"]),
           "an 'upstream of' naming an unpinned re-host is reported")
+
+# The stamp's fields are each load-bearing, and the filesystem-level arms cannot prove the INODE is: a
+# replaced file bumps ctime as well, so deleting st_ino left every arm green (measured, review of #2631).
+# Two synthetic stat records separate them -- same size, mtime and ctime, different inode.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+import pin_holdings as _ph                                          # noqa: E402
+import types as _types                                              # noqa: E402
+def _fake(size, mtime, ino, ctime):
+    return _types.SimpleNamespace(st_size=size, st_mtime_ns=mtime, st_ino=ino, st_ctime_ns=ctime)
+_base = _ph.cache_stamp(_fake(10, 111, 222, 333))
+check(_base != _ph.cache_stamp(_fake(10, 111, 999, 333)), "a different inode alone changes the stamp")
+check(_base != _ph.cache_stamp(_fake(10, 111, 222, 444)), "a different ctime alone changes the stamp")
+check(_base == _ph.cache_stamp(_fake(10, 111, 222, 333)), "identical fields give an identical stamp")
 
 print("pin_holdings_test: " + ("PASS" if fails == 0 else f"{fails} FAILED"))
 sys.exit(1 if fails else 0)

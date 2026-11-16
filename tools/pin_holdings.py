@@ -28,7 +28,7 @@ Two checks, one report:
 
   holdings  each entry of models/holdings.json names a pin, a file of that pin, and the path of our copy on
             the box. The copy's sha256 (the git blob id for a non-LFS file, which is what the pin records
-            for those) is compared with the pin's oid. Hashes are cached by path, size, mtime and inode
+            for those) is compared with the pin's oid. Hashes are cached by path, size, mtime, inode and ctime
             (--cache), so a daily run re-reads only a file that changed; a size mismatch is reported
             without reading the file at all.
   re-hosts  a pin whose used_for says "upstream of <repo>" is compared, file by file of the same name,
@@ -73,8 +73,27 @@ def file_id(path: str, lfs: bool) -> str:
     return h.hexdigest()
 
 
+def cache_stamp(st) -> list:
+    """The fields a hash cache may trust: size, mtime, inode, ctime.
+
+    ctime is the field nothing can set back: a write in place keeps the inode and `os.utime` puts size and
+    mtime back, but every write bumps `st_ctime_ns`. **ino is kept as well**, because the two cover different
+    filesystems: on one with a coarse ctime, a write-and-restore inside a single tick keeps ctime, while a
+    REPLACED file never keeps its inode whatever the timestamp granularity.
+
+    A function rather than a list literal in `get()` because both fields are load-bearing and the filesystem
+    arms alone cannot isolate the inode -- a replacement bumps ctime too, so deleting `st_ino` left every arm
+    green (measured, review of engine#2631). The synthetic-stats arm in the test separates them.
+    """
+    return [st.st_size, st.st_mtime_ns, st.st_ino, st.st_ctime_ns]
+
+
 class Cache:
-    """Hash cache keyed by real path; an entry counts only while size, mtime and inode are what was hashed."""
+    """Hash cache keyed by real path; an entry counts only while size, mtime, inode and ctime are what was hashed.
+
+    ctime is the field nothing can set back: a write in place keeps the inode and `os.utime` (cp -p, rsync -a, a
+    snapshot restore) puts size and mtime back, but every write bumps st_ctime_ns (review of engine#2631). A cache
+    written before ctime was in the stamp re-hashes each file once, then counts again."""
 
     def __init__(self, path: str | None):
         self.path = path
@@ -91,7 +110,7 @@ class Cache:
         st = os.stat(real)
         key = f"{real}|{'sha256' if lfs else 'gitblob'}"
         row = self.rows.get(key)
-        stamp = [st.st_size, st.st_mtime_ns, st.st_ino]
+        stamp = cache_stamp(st)
         if row and row.get("stat") == stamp:
             return row["id"]
         got = file_id(real, lfs)

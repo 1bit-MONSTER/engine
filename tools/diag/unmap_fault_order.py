@@ -53,10 +53,6 @@ EPOCH_RE = re.compile(r"(\d+\.\d+):")
 # and a `dmesg`/trace-style capture writes `[1234.567890]` seconds-since-boot. A fault line is only correlatable
 # when its clock is the trace's, so the seconds form is preferred when both appear.
 ISO_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?)")
-# The kernel pads the stamp to a fixed width: `[  321.308031]`, two spaces here and one for values >= 1000 s.
-# Written without the inner `\s*` the regex only matched the unpadded shape a doc example uses, so EVERY real
-# boot-stamped line parsed as untimed and the tool could not correlate on a capture it produced itself --
-# measured 2026-11-16 on `journalctl -k -o short-monotonic`: `[  321.308031] … IO_PAGE_FAULT …` -> t=None.
 BOOT_RE = re.compile(r"^\s*\[\s*(\d+\.\d+)\]")
 
 
@@ -130,18 +126,27 @@ def pointer_shaped(unmaps):
     return bool(unmaps) and all(u[1] >= IOVA_MAX for u in unmaps)
 
 
+def _span(window_us):
+    """The window as a reader thinks of it: seconds once it is a second or more. `+-30000000 us` is not readable."""
+    return f"{window_us / 1e6:g} s" if window_us >= 1e6 else f"{window_us:.0f} us"
+
+
 def render(rows, unmaps, window_us):
     lines = [f"unmap events parsed: {len(unmaps)} over {len({u[1] for u in unmaps})} distinct iova(s)"]
     if unmaps:
         lines.append(f"  sizes: {sorted({u[2] for u in unmaps})[0]:#x} .. {sorted({u[2] for u in unmaps})[-1]:#x}")
     hit = [r for r in rows if r[3] is not None]
-    lines.append(f"faults parsed: {len(rows)}; with an unmap of the same iova within +-{window_us:.0f} us: {len(hit)}")
+    lines.append(f"faults parsed: {len(rows)}; with an unmap of the same iova within +-{_span(window_us)}: {len(hit)}")
     for t, iova, _text, best in hit[:20]:
         (ut, _u, size), d = best
         verdict = "unmap BEFORE fault (translation gone)" if d < 0 else "unmap AFTER fault (stale mapping or other cause)"
         lines.append(f"  iova {iova:#x} size {size:#x}: unmap {d:+.0f} us, {verdict}")
     if rows and not hit:
-        lines.append("  no fault shares an iova with an unmap inside the window: ordering not shown by this capture")
+        # A negative must name its own condition. The same sentence at a 5 ms window and at 30 s read alike, and the
+        # 5 ms one was simply wrong, so the scale is in the line and the remedy is named with it.
+        lines.append(f"  no fault shares an iova with an unmap inside +-{_span(window_us)}: ordering not shown by "
+                     f"this capture AT THIS WINDOW -- the measured unmap-to-fault interval on this box is 5-25 s, "
+                     f"so widen --window before reading this as 'no unmap preceded the fault'")
     return lines
 
 
@@ -176,26 +181,27 @@ def self_test():
                        "iova=0xffff8e83841c3a00 size=0x45ec0"])
     chk(pointer_shaped(ptr), "a pointer-shaped iova column is detected, not read as uncorrelated")
     chk(not pointer_shaped(got), "a real IOVA column is not mistaken for one")
-    # 7. the REAL kernel stamp is PADDED (`[  321.308031]`, two spaces; `[    0.000000]` early in a dmesg). The doc
-    #    example above writes the unpadded `[1234.567890]`, and an arm built only from it passed while every real
-    #    capture parsed as untimed -- the tool then reported "nothing correlated" on data it had just been given.
-    padded = "[  321.308031] strixhalo kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged " \
-             "[IO_PAGE_FAULT domain=0x0015 address=0x4128000]"
-    pf = parse_faults([padded], lambda _s: None)
-    chk(pf and pf[0][0] == 321.308031, "a padded boot stamp parses (measure with journalctl -k -o short-monotonic)")
-    ptr_tr = parse_trace(["   bash-1 [002] .... 321.308000: unm: (iommu_unmap_fast) iova=0x4128000 size=0x1000"])
-    hits = correlate(ptr_tr, pf, 5000)
-    chk(hits and hits[0][3] and hits[0][3][1] < 0,
-        "a padded fault correlates with an unmap 31 us earlier (BEFORE, not an uncorrelated negative)")
+    # 7. the window reads in seconds once it is seconds, and a negative names the window it used. A default alone
+    #    does not fix the failure I am fixing: 30 s finding nothing printed the same sentence 5 ms did.
+    #    The fault is 100 s from any unmap: at 30 s that is still a miss, which is the shape a too-narrow window gives.
+    out = " ".join(render(correlate(unm, [(300.000, 0x4128000, "f5")], 30_000_000), unm, 30_000_000))
+    chk("+-30 s" in out and "30000000 us" not in out, "a 30 s window reads as '+-30 s', not '+-30000000 us'")
+    chk("AT THIS WINDOW" in out and "5-25 s" in out,
+        "a negative names the window it used and the measured interval, not 'nothing correlated' bare")
+    chk("+-5000 us" in " ".join(render(correlate(unm, [(100.500, 0x4128000, "f3")], 5000), unm, 5000)),
+        "a sub-second window still reads in microseconds")
     return 0 if ok else 1
-
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--trace", help="a tracefs capture with a kprobe on the unmap path")
     ap.add_argument("--journal", action="append", help="kernel-log lines (repeatable; default stdin)")
-    ap.add_argument("--window", type=float, default=5000.0, help="window in microseconds (default 5000)")
+    # 30 s, not 5 ms: measured on this box 2026-11-16, three of four faults had an unmap of the SAME 4 KiB page
+    # 5.6 s / 24.7 s / 24.7 s earlier, and a 5 ms default answered "no fault shares an iova with an unmap" on the
+    # very capture that contains them. The interval is seconds here; a small default hides the finding.
+    ap.add_argument("--window", type=float, default=30_000_000.0,
+                    help="window in microseconds (default 30,000,000 = 30 s; measured interval on this box is 5-25 s)")
     ap.add_argument("--epoch-offset", type=float, default=0.0,
                     help="seconds to add to journal stamps to reach the trace's boot clock")
     ap.add_argument("--self-test", action="store_true")

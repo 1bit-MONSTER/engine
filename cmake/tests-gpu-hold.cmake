@@ -85,6 +85,12 @@ add_test(NAME gpu_hold_child_identity COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu
 # now names the copy by its sha256, so the log answers "which copy ran?" in one field. Two claims, no device.
 add_test(NAME gpu_hold_script_id COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_script_id_test.sh)
 
+# engine#2727: a payload that re-invokes gpu-hold on the SAME queue queued behind the ticket it was already inside and
+# waited for it -- one 14-minute window produced no work and coder-llm was second in a 7-deep queue behind it. The
+# payload already receives GPU_HOLD_TICKET/GPU_HOLD_LABEL (engine#1640); the queue is exported too now, which is what
+# lets the nested call refuse instead of guessing, while npu-hold's different-queue case still runs. No device.
+add_test(NAME gpu_hold_nested COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_nested_test.sh)
+
 # docs/ci-runners.md's exit-code table is a contract (review of engine#2539): every "<script> exits/sets it" in a row
 # must be backed by `exit <rc>` or `rc=<rc>` in that script, and every row must name an emitter.
 add_test(NAME exit_code_table COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tests/exit_code_table_test.py ${CMAKE_SOURCE_DIR})

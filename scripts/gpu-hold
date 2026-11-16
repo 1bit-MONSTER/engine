@@ -177,6 +177,24 @@ log() {
     if [ -n "$LOG" ]; then printf '%s\n' "$line" >> "$LOG"; fi
 }
 
+# engine#2727: the "wrap myself if I am not already under a ticket" idiom queued behind the ticket it was already
+# inside, and waited for it -- one 14-minute window produced no work and coder-llm was second in a 7-deep queue behind
+# it. The payload already receives GPU_HOLD_TICKET/GPU_HOLD_LABEL (see the env line below, engine#1640's "exact, not a
+# string guess"), and the queue is added here, so the idiom can be answered instead of guessed at:
+#   same queue      -> refuse: a nested hold would wait for its own parent (the window is spent idle)
+#   other queue     -> run: npu-hold's documented case, a gpu-hold inside an NPU ticket, MUST still queue on the GPU
+# GPU_HOLD_ALLOW_NESTED=1 keeps a deliberate nesting possible for the rare payload that wants it.
+# Compared as resolved paths: a payload that re-invokes with `-q ./q` under a parent started with `-q /abs/q` is on
+# the same queue, and a string compare would miss it. `readlink -f` on a directory that does not exist yet still
+# normalises the parents, and falls back to the literal value if it fails.
+_queue_of() { readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"; }
+if [ -n "${GPU_HOLD_TICKET:-}" ] && [ "$(_queue_of "${GPU_HOLD_QUEUE:-}")" = "$(_queue_of "$QUEUE")" ] \
+        && [ -z "${GPU_HOLD_ALLOW_NESTED:-}" ]; then
+    echo "gpu-hold: already inside a ticket on this queue (${GPU_HOLD_LABEL:-?}: ${GPU_HOLD_TICKET}) --" \
+         "a nested hold would queue behind itself and spend the window waiting. Run the command directly, or set" \
+         "GPU_HOLD_ALLOW_NESTED=1 if a second hold on this queue is really what you want." >&2
+    exit 2
+fi
 mkdir -p "$QUEUE" || { echo "gpu-hold: cannot create $QUEUE" >&2; exit 2; }
 COOLDOWN_STAMP="$QUEUE/.cooldown"      # "<epoch> <C>" of the last hold that ended hot; shared by every label
 [ -n "$LABEL" ] || LABEL="$(basename -- "$1")-$$"
@@ -448,7 +466,7 @@ set -m
 # give it to the child - exact, not a string guess:
 #   GPU_HOLD_TICKET  the exact line in the token file ("gpu-hold <label> pid <pid> <ts>")
 #   GPU_HOLD_LABEL   the label, sanitised, as it appears in that line
-env GPU_HOLD_TICKET="$mine" GPU_HOLD_LABEL="$SAFE" "$@" < /dev/null &
+env GPU_HOLD_TICKET="$mine" GPU_HOLD_LABEL="$SAFE" GPU_HOLD_QUEUE="$QUEUE" "$@" < /dev/null &
 child=$!
 set +m   # job control is needed only to place THIS job in its own group; leaving it on would make every later
          # background job in this shell a background *group*, which is a semantic this script does not want to

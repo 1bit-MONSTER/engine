@@ -53,6 +53,23 @@ WINDOW_S=${WINDOW_S:-5}
 MAX_BYTES=${MAX_BYTES:-52428800}   # 50 MB, rotate rather than grow without bound
 NODE=${ACCEL_NODE:-/dev/accel/accel0}
 mkdir -p "$DIR" || exit 1
+# WHICH COPY IS RUNNING (engine#2795). The unit runs ~/.cache/accel-sampler/accel-sampler.sh, a copy placed by hand, so
+# the running instrument and the repository's drift silently: measured 2026-11-16, deployed 207 lines vs main 253, with
+# 'GAP' records and nearest-sample attribution missing from the copy that had been reporting "1527/1527 faults
+# attributed". Every summary now carries the sha256 of the script that wrote it, and the installer writes the commit
+# and sha it deployed beside the copy (DEPLOYED_META), so "what is running" is a file rather than someone's memory.
+# Same shape as gpu-hold's take line (engine#2705/#2712): the identity is computed from $0 before any cd, and an absent
+# or unreadable provenance is reported as `unknown`, never as `same`.
+SELF_SHA=$(sha256sum -- "$0" 2> /dev/null | cut -c1-12) || SELF_SHA=""
+[ -n "$SELF_SHA" ] || SELF_SHA="unknown"
+DEPLOYED_META=${ACCEL_SAMPLER_META:-$DIR/deployed.provenance}
+provenance() {   # "<sha> <commit|unknown>" from the file the installer wrote, or "unknown unknown"
+  [ -r "$DEPLOYED_META" ] || { printf 'unknown unknown'; return; }
+  local sha commit
+  sha=$(sed -n 's/^sha=//p' "$DEPLOYED_META" 2> /dev/null | head -n 1)
+  commit=$(sed -n 's/^commit=//p' "$DEPLOYED_META" 2> /dev/null | head -n 1)
+  printf '%s %s' "${sha:-unknown}" "${commit:-unknown}"
+}
 SAMP=$DIR/samples.log
 ATTR=$DIR/attributed.log
 mkdir -p "$DIR"
@@ -175,9 +192,29 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   [ "$ino_before" != "$ino_after" ] || { echo "FAIL: the summary is truncated in place (same inode) -- a reader can see a header with nothing under it"; fail=1; }
   [ -e "$d/sum/summary.txt.tmp" ] && { echo "FAIL: the temp file was left behind"; fail=1; }
   head -1 "$d/sum/summary.txt" | grep -q '^# accel sampler summary ' || { echo "FAIL: the written summary has no header"; fail=1; }
+  # engine#2795: the summary must name the copy that wrote it, and a modified copy must be caught. Two halves, because a
+  # check that cannot fail is decoration: the unmodified copy must read `same`, and a copy with one byte appended -- run
+  # against the provenance recorded for the ORIGINAL -- must read `DRIFTED`. No device, no timing: it compares hashes.
+  local pv=$d/deployed.provenance orig_sha tmpcopy outsum
+  orig_sha=$(sha256sum -- "$0" | cut -c1-12)
+  printf 'sha=%s\ncommit=selftest\n' "$orig_sha" > "$pv"
+  outsum=$(ACCEL_SAMPLER_DIR=$d ACCEL_SAMPLER_META=$pv bash "$0" summary 2>&1)
+  case "$(sed -n 's/^# script sha256 .*; deployed \(same\|DRIFTED\|unknown\).*/\1/p' "$d/summary.txt" 2>/dev/null)" in
+    same) ;;
+    *) echo "FAIL: an unmodified copy does not report 'same' against its own provenance"; fail=1 ;;
+  esac
+  tmpcopy=$d/modified.sh
+  cp "$0" "$tmpcopy"; printf '# one byte of drift\n' >> "$tmpcopy"
+  outsum=$(ACCEL_SAMPLER_DIR=$d ACCEL_SAMPLER_META=$pv bash "$tmpcopy" summary 2>&1)
+  case "$(sed -n 's/^# script sha256 .*; deployed \(same\|DRIFTED\|unknown\).*/\1/p' "$d/summary.txt" 2>/dev/null)" in
+    DRIFTED) ;;
+    *) echo "FAIL: a modified copy is not reported as DRIFTED against the provenance of the original (engine#2795)"; fail=1 ;;
+  esac
+
   rm -rf "$d"
-  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation, summary replaced not truncated)"
+  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation, summary replaced not truncated, script identity + drift)"
   return "$fail"
+
 }
 
 watch_faults() {  # correlate each fault with the samples around it
@@ -198,7 +235,16 @@ summary() {  # what the run observed, so a 24 h expiry is not silence
   if [ -f "$SAMP" ]; then n=$(wc -l < "$SAMP"); else n=0; fi
   if [ -f "$ATTR" ]; then attr=$(wc -l < "$ATTR"); else attr=0; fi
   {
+    read -r dep_sha dep_commit <<< "$(provenance)"
+    if [ "$dep_sha" = "unknown" ]; then
+        drift="unknown (no provenance file at $DEPLOYED_META - this copy was not installed by tools/diag/install_accel_sampler.sh)"
+    elif [ "$dep_sha" = "$SELF_SHA" ]; then
+        drift="same (commit ${dep_commit})"
+    else
+        drift="DRIFTED (this run is ${SELF_SHA}, the installer recorded ${dep_sha} at commit ${dep_commit})"
+    fi
     echo "# accel sampler summary $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "# script sha256 ${SELF_SHA}; deployed ${drift}"
     echo "samples: $n   attributed faults: $attr"
     echo
     echo "## holders seen (pid, cmd, scope, ticket, sample count)"

@@ -131,8 +131,49 @@ def stat(log, label):
     return float(m.group(1)) if m else None
 
 
+def _git(repo, *args):
+    p = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    return p.returncode, p.stdout.strip()
+
+
+def provenance(recorded, tested, repo):
+    """Where the golden's llama.cpp commit sits relative to the tested one, for the verdict line (engine#2643).
+
+    `recorded_at` is the only record of which tree a KLD base came from, and a verdict that compares today's run
+    against a base from another tree has to say so on the line that reports it. "cannot place" is never folded into
+    a relation: a clone that holds a commit without its parents (a --depth fetch) answers "no common ancestor" for
+    commits that do share one, which is how #2643 first read an ancestor as a disjoint history.
+    """
+    short = lambda c: c[:12] if c else "null"
+    head = f"golden llama.cpp {short(recorded)}, tested {short(tested)}"
+    if not recorded or not tested:
+        return f"{head}: cannot place (a null pin)"
+    if recorded == tested:
+        return f"{head}: same commit"
+    for c in (recorded, tested):
+        if _git(repo, "cat-file", "-e", c + "^{commit}")[0] != 0:
+            return f"{head}: cannot place ({short(c)} is not in {repo})"
+    if _git(repo, "merge-base", "--is-ancestor", recorded, tested)[0] == 0:
+        n = _git(repo, "rev-list", "--count", f"{recorded}..{tested}")[1]
+        return f"{head}: golden is {n} commits behind the tested tree"
+    if _git(repo, "merge-base", "--is-ancestor", tested, recorded)[0] == 0:
+        n = _git(repo, "rev-list", "--count", f"{tested}..{recorded}")[1]
+        return f"{head}: golden is {n} commits AHEAD of the tested tree"
+    rc, base = _git(repo, "merge-base", recorded, tested)
+    if rc != 0 or not base:
+        shallow = _git(repo, "rev-parse", "--is-shallow-repository")[1] or "?"
+        return f"{head}: cannot place (no common history in this clone; shallow={shallow})"
+    a = _git(repo, "rev-list", "--count", f"{base}..{recorded}")[1]
+    b = _git(repo, "rev-list", "--count", f"{base}..{tested}")[1]
+    return f"{head}: diverged at {short(base)} (golden +{a}, tested +{b})"
+
+
 def cmd_judge(manifest, name, logpath):
-    limits = load(manifest)["kld"].get(name, {}).get("limits", DEFAULT_LIMITS)
+    entry = load(manifest)["kld"].get(name, {})
+    limits = entry.get("limits", DEFAULT_LIMITS)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    where = provenance((entry.get("recorded_at") or {}).get("llama.cpp"), pins(root).get("llama.cpp"),
+                       os.path.join(root, "third_party", "llama.cpp"))
     with open(logpath, errors="replace") as f:
         log = f.read()
     mean = stat(log, "Mean    KLD")
@@ -149,7 +190,7 @@ def cmd_judge(manifest, name, logpath):
     if top < limits["min_same_top_p"]:
         bad.append(f"same top token {top:.2f}% < {limits['min_same_top_p']}%")
     msg = f"mean KLD {mean:.6f}, p99 {p99 if p99 is not None else float('nan'):.5f}, same top {top:.2f}%"
-    print(msg + ("; " + "; ".join(bad) if bad else ""))
+    print(msg + ("; " + "; ".join(bad) if bad else "") + f" [{where}]")
     return 1 if bad else 0
 
 

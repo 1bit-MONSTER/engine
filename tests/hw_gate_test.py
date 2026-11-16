@@ -264,6 +264,53 @@ def main():
                 said = [l for l in p.stderr.splitlines() if "third_party/" + sub in l]
                 if not said or exc not in said[0]:
                     bad.append(f"pins {name}: stderr must name third_party/{sub} and {exc}; said {p.stderr.strip()!r}")
+        # provenance (engine#2643): the verdict line names the golden's llama.cpp commit and the tested one, with their
+        # relation. Each outcome is pinned on a repo of its own making, the shallow one included: a clone holding two
+        # commits without the history between them answers "no common ancestor" for commits that DO share one, which is
+        # how #2643 first read an ancestor as a disjoint history; that case must say "cannot place", never a relation.
+        prov_repo = os.path.join(d, "prov")
+        subprocess.run(["git", "init", "-q", "-b", "main", prov_repo], check=True, env=git_env)
+        sha = {}
+        for c in ("A", "B", "C"):
+            subprocess.run(["git", "-C", prov_repo, "commit", "-q", "--allow-empty", "-m", c], check=True, env=git_env)
+            sha[c] = subprocess.run(["git", "-C", prov_repo, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                    check=True).stdout.strip()
+        subprocess.run(["git", "-C", prov_repo, "checkout", "-q", "-b", "side", sha["B"]], check=True, env=git_env)
+        subprocess.run(["git", "-C", prov_repo, "commit", "-q", "--allow-empty", "-m", "E"], check=True, env=git_env)
+        sha["E"] = subprocess.run(["git", "-C", prov_repo, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                  check=True).stdout.strip()
+        subprocess.run(["git", "-C", prov_repo, "checkout", "-q", "--orphan", "other"], check=True, env=git_env)
+        subprocess.run(["git", "-C", prov_repo, "commit", "-q", "--allow-empty", "-m", "D"], check=True, env=git_env)
+        sha["D"] = subprocess.run(["git", "-C", prov_repo, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                  check=True).stdout.strip()
+        shallow = os.path.join(d, "prov-shallow")
+        subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", "main", "file://" + prov_repo, shallow],
+                       check=True, env=git_env)
+        subprocess.run(["git", "-C", shallow, "fetch", "-q", "--depth", "1", "origin", sha["A"]], check=True, env=git_env)
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import hw_gate_manifest as hgm
+        cases = (("same", sha["C"], sha["C"], prov_repo, "same commit"),
+                 ("behind", sha["A"], sha["C"], prov_repo, "golden is 2 commits behind the tested tree"),
+                 ("ahead", sha["C"], sha["A"], prov_repo, "golden is 2 commits AHEAD of the tested tree"),
+                 ("diverged", sha["E"], sha["C"], prov_repo, f"diverged at {sha['B'][:12]} (golden +1, tested +1)"),
+                 ("disjoint", sha["D"], sha["C"], prov_repo, "cannot place (no common history in this clone; shallow=false)"),
+                 ("shallow", sha["A"], sha["C"], shallow, "cannot place (no common history in this clone; shallow=true)"),
+                 ("absent", "0" * 40, sha["C"], prov_repo, "is not in"),
+                 ("null golden", None, sha["C"], prov_repo, "cannot place (a null pin)"),
+                 ("null tested", sha["C"], None, prov_repo, "cannot place (a null pin)"))
+        for name, rec, tst, repo, says in cases:
+            got = hgm.provenance(rec, tst, repo)
+            if says not in got or not got.startswith(f"golden llama.cpp {(rec or 'null')[:12]}, tested {(tst or 'null')[:12]}"):
+                bad.append(f"provenance {name}: said {got!r}, want {says!r}")
+        # and it reaches the verdict line the gate prints, on a pass as well as on a fail
+        for top, want in ((100.0, 0), (91.0, 1)):
+            with open(os.path.join(d, "ppl.log"), "w") as f:
+                f.write(f"Mean    KLD:   0.000000 ±   0.000010\n99.0%   KLD:   0.000000\nSame top p: {top:6.3f} ± 0.1 %\n")
+            p = subprocess.run([sys.executable, MAN, "judge", man, "m", os.path.join(d, "ppl.log")],
+                               capture_output=True, text=True)
+            if p.returncode != want or "[golden llama.cpp " not in p.stdout or len(p.stdout.strip().splitlines()) != 1:
+                bad.append(f"judge top={top}: rc {p.returncode} (want {want}), one line naming the golden's commit; "
+                           f"said {p.stdout.strip()!r}")
     srv.shutdown()
     for b in bad:
         print("FAIL:", b)

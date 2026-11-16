@@ -145,6 +145,43 @@ makes the run's first line say so, and adding it is `--pin` plus a `used_for` th
 A repo of `.1bp` packs is not pinned here, and a private repo never is (next section) — both are filtered
 out, so the census cannot go permanently red over something this file must not contain.
 
+## A fallback source: ModelScope
+
+ModelScope (modelscope.cn) mirrors many of the repos we pin, under the same id, and its public file listing
+gives each file's sha256. So a mirror can stand in for Hugging Face exactly when its file carries the pinned oid,
+whatever the file is called. `tools/pin_mirror.py` checks that and fetches through it. It is anonymous:
+the public listing and download need no token, and the tool never sends one. The owner's ModelScope key stays
+off this box, and nothing here uploads.
+
+```bash
+tools/pin_mirror.py --check                       # every pin outside our own orgs: is the mirror the pinned file?
+tools/pin_mirror.py --check --repo unsloth/Qwen3.8-27B-GGUF
+tools/pin_mirror.py --fetch REPO FILE --dest DIR  # download from the mirror; kept only if sha256 == the pin's oid
+```
+
+`--check` reports each pinned file as one of four states:
+
+- `match`: the mirror may serve it.
+- `DIFFERS`: other bytes under the pinned name, so do not use it.
+- `missing`.
+- no mirror under that id.
+
+A non-LFS pin records a git blob id, which a sha256 cannot be compared with. For those, a small text file
+(≤ 1 MiB) is downloaded and its blob id computed. `--fetch` hashes while it streams, resumes a `.part`
+(the hash covers the bytes already on disk), and deletes a file that is not the pinned one rather than moving it
+into place. Exit codes:
+
+- **0** everything compared matches, or the fetch verified.
+- **1** a mirror differs, or the fetch did not verify.
+- **2** usage, or no listing read.
+
+Measured 2026-11-16 against `models/pins.json` (72 pins outside our orgs):
+
+- 63 are mirrored under the same id, and all 76 of their pinned files match, including
+  `unsloth/Qwen3.8-27B-GGUF`'s UD3.1 `Qwen3.8-27B-UD-Q4_K_XL.gguf` (`2a5f3565…`).
+- 9 have no mirror under that id: two RichardErkhov repos, three mradermacher repos, mys, nomic-ai, nvidia and pqnet.
+- One real fetch, `unsloth/Qwen3-0.6B-GGUF` `Qwen3-0.6B-Q4_K_M.gguf` (397 MB, 36 s), verified against its pin.
+
 ## Build inputs
 
 The model pins above are one kind of input. A build or CI run also takes inputs written inline in workflows and

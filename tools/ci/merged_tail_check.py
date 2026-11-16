@@ -865,10 +865,23 @@ def self_test():
     chk(2, report(pathlib.Path("."), 1, 1, "1bit-MONSTER/no-such-repo-xyz")[0],
         "an unreadable PR list is rc 2, not an empty pass")
 
-    # shortcut: the shallow-clone refusal has no arm -- a local `--depth 1` fixture kept cloning an empty repository (git's
-    # own "cloned an empty repository" warning), and shipping a red arm is worse than shipping none. The guard was verified by
-    # hand against a genuine shallow clone of this repo (it refuses, and --allow-shallow proceeds); upgrade by cloning a real
-    # origin over file:// with two commits and asserting both directions.
+    # The shallow-clone refusal had no arm: a local `--depth 1` fixture kept cloning an EMPTY repository, so the guard was
+    # verified by hand only. The fixture was wrong, not the idea -- `git clone --depth 1 file://<dir>` needs the origin to have
+    # a commit first. Two commits, then a --depth 1 clone and a full clone of the same origin, and both directions are asserted
+    # against the shipped `shallow_refusal()` rather than a copy of its rule.
+    d, r = scratch()
+    commit(r, "tool.py", "x\n", "c1")
+    commit(r, "tool.py", "x\ny\n", "c2")
+    sh_dir = r.parent / (r.name + "-shallow")
+    full_dir = r.parent / (r.name + "-full")
+    subprocess.run(["git", "clone", "-q", "--depth", "1", "file://" + str(r), str(sh_dir)], check=True)
+    subprocess.run(["git", "clone", "-q", "file://" + str(r), str(full_dir)], check=True)
+    chk(True, "SHALLOW clone" in shallow_refusal(sh_dir),
+        "a --depth 1 worktree is refused, and the message says why rather than reporting numbers")
+    chk("", shallow_refusal(full_dir),
+        "a full clone of the same origin is not refused: the guard answers about the clone, not about the tool")
+    chk("", shallow_refusal(sh_dir, allow_shallow=True),
+        "and --allow-shallow buys the number anyway, which is what the message tells the caller to do")
     # And the arm CI added: this row FAILED in the build container because `gh` is not installed
     # there, so the call raised FileNotFoundError instead of answering "I could not look". Measured
     # on #2659: 11/11 arms locally, 75 - merged_tail_check_self (Failed) in CI.
@@ -881,6 +894,20 @@ def self_test():
         GH_BIN = saved
 
     return rc
+
+
+def shallow_refusal(worktree, allow_shallow=False):
+    """Why this worktree must not be scanned, or "" if it may be (engine#2659).
+
+    Extracted from main() so the refusal can be asserted in both directions with no network: the guard used to be inline,
+    which is why it shipped with a `shortcut:` and no arm -- exercising it through main() would have run a `git fetch`.
+    """
+    shallow = (git(worktree, "rev-parse", "--is-shallow-repository").stdout or "").strip()
+    if shallow == "true" and not allow_shallow:
+        return ("%s is a SHALLOW clone: this tool reads commit ancestry, and a shallow clone reports main's own commits as "
+                "LOST (measured: 22 LOST on --depth 50 against 4 on the full clone, 18 of them main's). "
+                "Deepen it (git fetch --unshallow) or pass --allow-shallow to report anyway." % worktree)
+    return ""
 
 
 def main():
@@ -901,11 +928,9 @@ def main():
     # local base by a merge whose parents are not present, so every commit looks absent from the base. The results are not
     # merely noisier, they are mostly false, so refuse rather than report: a caller who wants the number anyway can say so.
     if a.worktree and not a.self_test:
-        shallow = (git(a.worktree, "rev-parse", "--is-shallow-repository").stdout or "").strip()
-        if shallow == "true" and not a.allow_shallow:
-            raise SystemExit("%s is a SHALLOW clone: this tool reads commit ancestry, and a shallow clone reports main's own "
-                             "commits as LOST (measured: 22 LOST on --depth 50 against 4 on the full clone, 18 of them main's). "
-                             "Deepen it (git fetch --unshallow) or pass --allow-shallow to report anyway." % a.worktree)
+        refusal = shallow_refusal(a.worktree, a.allow_shallow)
+        if refusal:
+            raise SystemExit(refusal)
     if a.self_test:
         return self_test()
     if a.branch:

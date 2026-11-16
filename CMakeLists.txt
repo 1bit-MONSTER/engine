@@ -1834,6 +1834,14 @@ add_test(NAME npu_pb16i_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
                  ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.cpp)
+# engine#2599's decision (npu/target/xdna/elf_twin.h): a prefill ELF runs at 16 rows only when it is byte-identical to
+# the _m16 twin of its own stem.  Every arm, on files it writes itself; no device.
+# Self-compiling (like npu_pb16i_layout): CI builds an explicit target list, so a plain add_executable would be "Not Run"
+# there and trip ci_targets.
+add_test(NAME npu_elf_twin
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_elf_twin_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu
+                 ${CMAKE_SOURCE_DIR}/tests/npu_elf_twin_test.cpp)
 # The w4g32 weight image (q4nx_w4g32.h): the large-M int4-weight prefill tier's contract -- the b4 tile
 # order, the per-32 signed magnitudes, the A pack and the int64 reference.  No device; set
 # W4G32_VEC="<dir> M K N" to also check it against a gate vector set the NPU reproduced bit-exact.

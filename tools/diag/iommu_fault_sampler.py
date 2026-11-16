@@ -30,8 +30,12 @@ So this appends one line per interval:
     # a bounded sample, for a window run
     tools/diag/iommu_fault_sampler.py --interval 2 --count 10 --dmesg "cat fixture.txt"
 
-`suppressed_total` is `sum(io.census.suppressed(text).values())`: the counters grow monotonically, so
-the DELTA across two lines is the number of faults the kernel dropped in that interval. A rising
+`suppressed_total` is `census.suppressed(text)["amd_iommu_report_page_fault"]`, the IOMMU fault
+reporter's own counter and no other caller's: the same journal carries `kauditd_printk_skb` and
+`set_capacity_and_notify` suppression lines (267 and 2 on the 11-15 boot, beside the IOMMU's 5699), and
+summing every caller counted an audit burst as dropped faults. `--caller` names another reporter. The
+counters grow monotonically, so the DELTA across two lines is the number of faults the kernel dropped
+in that interval. A rising
 suppressed_total with a flat printed count is the normal case under load and is not a quiet system --
 that is the whole point of keeping it.
 
@@ -57,10 +61,15 @@ def _load_census():
     return mod
 
 
-def sample(census, text):
-    """(printed fault lines, dropped-callback total) for one dmesg snapshot."""
+# The printk_ratelimited caller that reports AMD-Vi IO_PAGE_FAULT events. Other callers' counters (audit,
+# block-device resize, ...) are in the same buffer and are NOT dropped faults (review of engine#2580).
+IOMMU_CALLER = "amd_iommu_report_page_fault"
+
+
+def sample(census, text, caller=IOMMU_CALLER):
+    """(printed fault lines, dropped-callback total for `caller`) for one dmesg snapshot."""
     printed = sum(1 for line in text.splitlines() if "IO_PAGE_FAULT" in line)
-    return printed, sum(census.suppressed(text).values())
+    return printed, census.suppressed(text).get(caller, 0)
 
 
 def describe(prev, cur):
@@ -112,6 +121,15 @@ def self_test():
     # interval must not be rendered as a negative fault count; it means the buffer forgot.
     assert describe((5, 11311), (5, 5611)) == "rotated (-5700 from total), re-baselined"
 
+    # Only the IOMMU reporter's counter is a dropped fault. The 11-15 journal had kauditd (267) and
+    # set_capacity (2) suppression lines beside it; summing every caller turned an audit burst into
+    # "FAULTING +267 dropped" with no fault at all (review of engine#2580).
+    others = ("kernel: kauditd_printk_skb: 267 callbacks suppressed\n"
+              "kernel: set_capacity_and_notify: 2 callbacks suppressed\n")
+    assert sample(census, burst + others) == (2, 5611), sample(census, burst + others)
+    assert describe(sample(census, burst), sample(census, burst + others)) == "quiet"
+    assert sample(census, others, caller="kauditd_printk_skb") == (0, 267)
+
     # The fixture above is the shape that misled engine#2542: two devices, one log format, so the
     # printed count mixes populations. The sampler does not classify by device -- the census does --
     # it only measures rate, which is why it can stay this small.
@@ -124,6 +142,8 @@ def main():
     ap.add_argument("--count", type=int, default=0, help="samples to take (0 = forever)")
     ap.add_argument("--out", default="-", help="log file to append to ('-' = stdout)")
     ap.add_argument("--dmesg", default="dmesg", help="command whose stdout is the dmesg text")
+    ap.add_argument("--caller", default=IOMMU_CALLER,
+                    help="the printk_ratelimited caller whose suppressed count is the dropped-fault count")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
@@ -137,7 +157,7 @@ def main():
     try:
         while not args.count or n < args.count:
             text = subprocess.run(args.dmesg, shell=True, capture_output=True, text=True).stdout
-            cur = sample(census, text)
+            cur = sample(census, text, args.caller)
             print(f"{int(time.time())} {cur[0]} {cur[1]} {describe(prev, cur)}", file=out)
             prev, n = cur, n + 1
             if args.count and n >= args.count:

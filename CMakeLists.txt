@@ -2193,6 +2193,11 @@ add_executable(tokenizer_replace_meta_test tests/tokenizer_replace_meta_test.cpp
 target_link_libraries(tokenizer_replace_meta_test PRIVATE onebit_npu)
 add_test(NAME tokenizer_replace_meta COMMAND tokenizer_replace_meta_test ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_replace_meta.json)
 add_dependencies(onebit tokenizer_replace_meta_test)
+# engine#1503: a Metaspace PRE-TOKENIZER (no normalizer) is SentencePiece too -- Mistral-7B v0.2/v0.3's shape.
+add_executable(tokenizer_metaspace_test tests/tokenizer_metaspace_test.cpp)
+target_link_libraries(tokenizer_metaspace_test PRIVATE onebit_npu)
+add_test(NAME tokenizer_metaspace COMMAND tokenizer_metaspace_test ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_metaspace.json)
+add_dependencies(onebit tokenizer_metaspace_test)
 # A SentencePiece-shaped vocabulary that KEEPS its merge list (engine#1189): the shape Phi-3.5-mini's
 # pack has, whose ids come from Hugging Face `tokenizers` on the same fixture. No model needed.
 add_test(NAME tokenizer_spm_bpe

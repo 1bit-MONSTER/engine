@@ -81,6 +81,28 @@ bool spm_prepends_meta(const nlohmann::json& n) {
     return false;
 }
 
+// True when the PRE-TOKENIZER is the metaspace step and prepends the symbol: {Metaspace, replacement "\u2581",
+// prepend_scheme "first"|"always"} (or the older add_prefix_space: true), bare or inside a Sequence. Mistral-7B-Instruct
+// v0.2/v0.3 (the Ryzen AI 1.9 packs, engine#1503) spell their SentencePiece model this way, with no normalizer at all, so
+// spm_prepends_meta() never saw it and the vocabulary fell to the byte-level path: "The capital of France is" came out as 7
+// ids where the reference gives 5, and every reply came back with the symbols still in it ("Paris,\u2581Question:...").
+// With split false (what these files declare) the encoder's single prefixed run is exactly what the pre_tokenizer asks for.
+bool pre_tokenizer_prepends_meta(const nlohmann::json& p) {
+    if (!p.is_object()) return false;
+    if (p.value("type", "") == "Metaspace") {
+        if (p.value("replacement", "\xE2\x96\x81") != "\xE2\x96\x81") return false;
+        if (p.contains("prepend_scheme")) {
+            const std::string s = p.value("prepend_scheme", "");
+            return s == "first" || s == "always";
+        }
+        return p.value("add_prefix_space", true);
+    }
+    if (p.contains("pretokenizers"))
+        for (const auto& sub : p["pretokenizers"])
+            if (pre_tokenizer_prepends_meta(sub)) return true;
+    return false;
+}
+
 // True when the normalizer rewrites every space to the metaspace symbol and does NOT prepend one: a
 // {Replace " " -> "\u2581"} step, bare or inside a Sequence, with no Prepend beside it. Gemma4's tokenizer.json is
 // this shape (BPE with merges, this normalizer, a decoder that turns the symbol back into a space). After that
@@ -241,7 +263,10 @@ Tokenizer::Tokenizer(const std::string& path) {
         // is" -- engine#1189. Measured on that pack's own vocabulary, greedy longest-match is not a
         // substitute for the merges either (it disagrees with the reference on 6 of 20 strings), so
         // a vocabulary that keeps its merges is merged by rank -- see spm_merged().
-        const bool prepends = root.contains("normalizer") && spm_prepends_meta(root["normalizer"]);
+        const bool norm_prepends = root.contains("normalizer") && spm_prepends_meta(root["normalizer"]);
+        const bool pre_prepends = !norm_prepends && root.contains("pre_tokenizer") &&
+                                  pre_tokenizer_prepends_meta(root["pre_tokenizer"]);
+        const bool prepends = norm_prepends || pre_prepends;
         // A vocabulary with merges whose normalizer only rewrites spaces (no Prepend): the same pieces and the same
         // rank merge, without the dummy prefix. It used to fall to the byte-level path, which split on spaces and
         // byte-mapped them: a Gemma4 prompt came out as 31 ids where the reference gives 21, and a reply came back
@@ -251,6 +276,7 @@ Tokenizer::Tokenizer(const std::string& path) {
         spm_ = has_meta && (merges.empty() || prepends || replaces);
         spm_merges_ = spm_ && !merges.empty();
         spm_no_prefix_ = spm_ && replaces;
+        spm_prefix_unless_leading_ = spm_ && pre_prepends;
         if (spm_) {
             for (const auto& [text, id] : vocab_) {
                 if (text.size() == 6 && text.compare(0, 3, "<0x") == 0 && text[5] == '>') {
@@ -340,7 +366,7 @@ std::vector<int> Tokenizer::spm_merged(const std::string& text) const {
     static const char kMeta[] = "\xE2\x96\x81";
     std::string s;
     s.reserve(text.size() + 3);
-    if (!spm_no_prefix_) s += kMeta;
+    if (!spm_no_prefix_ && !(spm_prefix_unless_leading_ && !text.empty() && text[0] == ' ')) s += kMeta;
     for (char c : text) {
         if (c == ' ') s += kMeta;
         else s += c;
@@ -358,7 +384,7 @@ std::vector<int> Tokenizer::spm(const std::string& text) const {
     static const char kMeta[] = "\xE2\x96\x81";
     std::string s;
     s.reserve(text.size() + 3);
-    s += kMeta;
+    if (!(spm_prefix_unless_leading_ && !text.empty() && text[0] == ' ')) s += kMeta;
     for (char c : text) {
         if (c == ' ') s += kMeta;
         else s += c;

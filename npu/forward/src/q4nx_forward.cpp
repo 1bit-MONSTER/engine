@@ -4777,6 +4777,16 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
         if (user_kc_[s].empty()) user_kc_[s].assign((size_t)c_.NL, {});
         if (user_vc_[s].empty()) user_vc_[s].assign((size_t)c_.NL, {});
     }
+    // A slot whose FIRST row is position 0 starts a NEW sequence, so what the previous conversation left in its caches
+    // is cleared first: pos 0 has to mean here what it means everywhere else in this file (a request that begins at the
+    // start), and a re-used slot that kept the last conversation's K/V would answer from state the request does not own.
+    // (One clear per slot: rows of a slot are contiguous, checked above.)
+    for (size_t m = 0; m < M; m++) {
+        if (m > 0 && slot[m] == slot[m - 1]) continue;
+        if (pos[m] != 0) continue;
+        user_kc_[(size_t)slot[m]].assign((size_t)c_.NL, {});
+        user_vc_[(size_t)slot[m]].assign((size_t)c_.NL, {});
+    }
     // The pass owns the working caches for its duration: the model's own two are parked and put back whatever happens.
     own_kc_.swap(kcache_);
     own_vc_.swap(vcache_);

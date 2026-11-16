@@ -811,7 +811,9 @@ one of them: the step costs the same from 1 to 16 rows (measured 11-16: Llama-3.
 pos, slot, logits)` is that step: one batched pass, one entry per row, rows of one slot contiguous and the slots
 ascending, and each row's logits identical to that sequence's own single-sequence run. Each slot keeps its own KV
 cache (`load_user_slot()` swaps it into the working pair), so a slot continues from the positions it is given and the
-model's own single-sequence cache is untouched between calls.
+model's own single-sequence cache is untouched between calls. A slot whose first row is **position 0** starts a new
+sequence, so its cache is cleared first -- position 0 means there what it means everywhere else in the engine, and a
+re-used slot never answers from the previous conversation's K/V.
 - A model whose state is more than KV is **refused by name**: GDN linear attention and MLA keep a recurrence or an
   absorption state per sequence, and a noncausal pack encodes one prompt per pass. A model that falls back to
   per-token `step()` has no batched body to share and is refused for that reason.

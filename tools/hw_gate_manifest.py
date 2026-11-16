@@ -163,10 +163,32 @@ def provenance(recorded, tested, repo):
     rc, base = _git(repo, "merge-base", recorded, tested)
     if rc != 0 or not base:
         shallow = _git(repo, "rev-parse", "--is-shallow-repository")[1] or "?"
-        return f"{head}: cannot place (no common history in this clone; shallow={shallow})"
+        # measured on this box: the golden's OBJECT can be present in a --depth clone while the ancestry between
+        # it and the tested commit is not (220 commits held against ~11k in the fork), so the honest words are
+        # "the history between them", not "no common history" -- the two lines do meet, past the shallow boundary.
+        if shallow == "true":
+            # measured on this box: the two commits are both PRESENT and the ancestry between them is not (220
+            # commits held against ~11k in the fork). "no common history" would be wrong here -- they do meet,
+            # past the shallow boundary -- so the line names the missing ancestry and the way to get it.
+            return (f"{head}: cannot place (the history between them is not in this clone; shallow=true"
+                    "; fetch it with `git -C <llama.cpp> fetch --unshallow`)")
+        # Not shallow: two unrelated root histories really do have no common ancestor, and saying "the history is
+        # not in this clone" would hide that the whole history IS here and simply never connects.
+        return f"{head}: cannot place (no common ancestor in this repository: two root histories; shallow=false)"
     a = _git(repo, "rev-list", "--count", f"{base}..{recorded}")[1]
     b = _git(repo, "rev-list", "--count", f"{base}..{tested}")[1]
     return f"{head}: diverged at {short(base)} (golden +{a}, tested +{b})"
+
+
+def cmd_judge_exit(where, bad):
+    """The judge's exit from the two things that decide it: the provenance relation and the KLD limits.
+
+    An unplaceable base is 2 (INCOMPLETE) even when every number is inside the limits: the numbers were not
+    compared against a base this clone can place, so the run could not judge the gate (engine#2643).
+    """
+    if "cannot place" in where:
+        return 2
+    return 1 if bad else 0
 
 
 def cmd_judge(manifest, name, logpath):
@@ -192,7 +214,7 @@ def cmd_judge(manifest, name, logpath):
         bad.append(f"same top token {top:.2f}% < {limits['min_same_top_p']}%")
     msg = f"mean KLD {mean:.6f}, p99 {p99 if p99 is not None else float('nan'):.5f}, same top {top:.2f}%"
     print(msg + ("; " + "; ".join(bad) if bad else "") + f" [{where}]")
-    return 1 if bad else 0
+    return cmd_judge_exit(where, bad)
 
 
 # ggml-hrx's placement observer (GGML_HRX_REPORT=2, engine #390), one line per graph:
@@ -342,6 +364,16 @@ def cmd_selftest():
         check(provenance(c1, None, repo), "cannot place (a null pin)", "a null tested pin is refused")
         check(provenance("0" * 40, c3, repo), "cannot place (", "an absent object is refused, not related")
         check(provenance(c1, c3, repo), "golden is 2 commits behind", "an ancestor is counted, exactly")
+        # engine#2643: a base this clone cannot place is INCOMPLETE (2), not a PASS and not a FAIL -- and the
+        # signal is the word the line already carries, so the two cannot drift apart.
+        if "cannot place" not in provenance("0" * 40, c3, repo):
+            print("FAIL an absent object did not say 'cannot place'"); fails += 1
+        if cmd_judge_exit(provenance("0" * 40, c3, repo), bad=False) != 2:
+            print("FAIL an unplaceable base judged 0 instead of 2 (INCOMPLETE)"); fails += 1
+        if cmd_judge_exit(provenance(c3, c3, repo), bad=False) != 0:
+            print("FAIL a placeable, in-limits base did not judge 0"); fails += 1
+        if cmd_judge_exit(provenance(c3, c3, repo), bad=True) != 1:
+            print("FAIL a placeable base outside the limits did not judge 1"); fails += 1
         check(provenance(c3, c1, repo), "golden is 2 commits AHEAD", "the reverse direction is distinct")
         behind = provenance(c1, c3, repo)
         check("behind" in behind and "AHEAD" not in behind, True, "the two directions never both appear")
@@ -362,6 +394,20 @@ def cmd_selftest():
         check(got, "cannot place (", "a shallow clone cannot place an older commit")
         check("no common history" not in got, True,
               "a shallow clone does NOT answer 'no common history' -- that was the #2643 misread")
+        # The shape this box actually has, and the arm above does NOT cover it: both commits PRESENT, each its own
+        # shallow root, so `merge-base` finds nothing while `cat-file -e` succeeds on both. Two depth-1 fetches
+        # produce exactly that (measured on the engine's submodule: 4a58da9b0 is present, 220 commits held, and the
+        # relation is unanswerable). The words must name the missing ancestry, not a missing history.
+        both = os.path.join(tmp, "both")
+        subprocess.run(["git", "init", "-q", both], capture_output=True, text=True)
+        run(both, "fetch", "-q", "--depth", "1", "file://" + repo, c3)
+        run(both, "fetch", "-q", "--depth", "1", "file://" + repo, c1)
+        present = all(subprocess.run(["git", "-C", both, "cat-file", "-e", c + "^{commit}"],
+                                     capture_output=True).returncode == 0 for c in (c1, c3))
+        check(present, True, "the fixture holds BOTH commits (else it is the absent-object case again)")
+        two = provenance(c1, c3, both)
+        check(two, "the history between them is not in this clone",
+              "two shallow roots are 'history between them', not 'no common history'")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

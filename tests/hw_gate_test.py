@@ -179,10 +179,19 @@ def main():
         if rc != 0 or "so did the golden" not in out:
             bad.append("a case the golden also missed must not FAIL on the expected answer:\n" + out)
 
-        # KLD verdicts
+        # KLD verdicts. `_tested_pin` is what hw_gate_manifest reads as the tested tree, so a fixture that names it
+        # as its own base has a PLACEABLE provenance and these arms stay about the limits (engine#2643).
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(MAN)))
+        _tested_pin = subprocess.run(["git", "-C", _root, "ls-tree", "HEAD", "third_party/llama.cpp"],
+                                     capture_output=True, text=True).stdout.split()[2]
         man = os.path.join(d, "manifest.json")
         with open(man, "w") as f:
-            json.dump({"kld": {"m": {"limits": {"max_mean_kld": 0.01, "max_kld_p99": 0.2, "min_same_top_p": 95.0}}}}, f)
+            # engine#2643: the base's provenance is part of the verdict now -- a manifest whose base cannot be
+            # placed is INCOMPLETE (2), not a PASS. These arms are about the LIMITS, so the fixture names the
+            # tested pin as its base: provenance is then "same commit" and cannot decide the outcome.
+            json.dump({"kld": {"m": {"recorded_at": {"llama.cpp": _tested_pin},
+                                     "limits": {"max_mean_kld": 0.01, "max_kld_p99": 0.2,
+                                                "min_same_top_p": 95.0}}}}, f)
         for mean, p99, top, want in ((0.0, 0.0, 100.0, 0), (0.002, 0.05, 99.1, 0), (0.08, 0.9, 91.0, 1)):
             log = os.path.join(d, "ppl.log")
             with open(log, "w") as f:
@@ -293,8 +302,10 @@ def main():
                  ("behind", sha["A"], sha["C"], prov_repo, "golden is 2 commits behind the tested tree"),
                  ("ahead", sha["C"], sha["A"], prov_repo, "golden is 2 commits AHEAD of the tested tree"),
                  ("diverged", sha["E"], sha["C"], prov_repo, f"diverged at {sha['B'][:12]} (golden +1, tested +1)"),
-                 ("disjoint", sha["D"], sha["C"], prov_repo, "cannot place (no common history in this clone; shallow=false)"),
-                 ("shallow", sha["A"], sha["C"], shallow, "cannot place (no common history in this clone; shallow=true)"),
+                 ("disjoint", sha["D"], sha["C"], prov_repo,
+                  "cannot place (no common ancestor in this repository: two root histories; shallow=false)"),
+                 ("shallow", sha["A"], sha["C"], shallow,
+                  "cannot place (the history between them is not in this clone; shallow=true"),
                  ("absent", "0" * 40, sha["C"], prov_repo, "is not in"),
                  ("null golden", None, sha["C"], prov_repo, "cannot place (a null pin)"),
                  ("null tested", sha["C"], None, prov_repo, "cannot place (a null pin)"))

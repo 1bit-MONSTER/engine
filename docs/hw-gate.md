@@ -408,7 +408,15 @@ Each KLD verdict line ends with where its golden came from, e.g. `[golden llama.
 148e7f329ff9: golden is 227 commits behind the tested tree]` (engine#2643). A comparison across two trees is then
 visible on the line that reports it. The relation is computed in `third_party/llama.cpp`. A clone that holds the
 commits without the history between them (a `--depth` fetch) says `cannot place (no common history in this clone;
-shallow=true)`, never "disjoint": #2643 first read an ancestor as a disjoint history that way.
+shallow=true)`, never "disjoint": #2643 first read an ancestor as a disjoint history that way. The golden's
+*object* can be present in such a clone — this box holds 220 commits against ~11k in the fork — so the missing thing
+is the ancestry between the two commits, past the shallow boundary, and that is what the line says.
+**A base that cannot be placed is exit 2 (INCOMPLETE), not a PASS** — the numbers can be inside every limit and the
+row still has not compared this run against a base from this tree, which is the third state `--phases` uses, not a
+failure of the model. So a gate run from a shallow `third_party/llama.cpp` reports INCOMPLETE with the reason on the
+line, and `git -C third_party/llama.cpp fetch --unshallow` makes it answerable: the same goldens then read
+`golden is 227 commits behind the tested tree` and judge on their numbers. `diverged` and `AHEAD` stay relations a
+row can be judged on — only a missing relation is INCOMPLETE.
 Their HRX base logits against a CPU run of the same file (`--device none`) give:
 
 | model | mean KLD | KLD p99 | same top token |

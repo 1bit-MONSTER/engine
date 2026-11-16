@@ -121,6 +121,34 @@ int main(int argc, char** argv) {
         run_fixture(a);
     }
 
+    // engine#2604: the turn-end probe takes the first user-content shape a template renders. A template that refuses a
+    // string (translategemma's) still yields its marker, and an ordinary one is read with the plain shape.
+    {
+        onebit::npu::ChatTemplate strict;
+        strict.text = "{% for m in messages %}{% if m.role == 'user' %}{% if m.content is string %}"
+                      "{{ raise_exception('User role must provide content as an iterable') }}{% endif %}"
+                      "{% if m.content[0].source_lang_code is not defined %}{{ raise_exception('no language codes') }}"
+                      "{% endif %}"
+                      "<start_of_turn>user\n{{ m.content[0].source_lang_code }}:{{ m.content[0].text }}<end_of_turn>\n"
+                      "{% else %}<start_of_turn>model\n{{ m.content }}<end_of_turn>\n{% endif %}{% endfor %}";
+        strict.source = "test";
+        const onebit::npu::TurnEndProbe p = onebit::npu::turn_end_from_template(strict, "", "");
+        check(p.marker == "<end_of_turn>" && p.form == "translation",
+              "turn-end probe: a template that refuses string content still yields <end_of_turn> (form " + p.form +
+                  ", " + p.why + ")");
+        onebit::npu::ChatTemplate plain;
+        plain.text = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}";
+        plain.source = "test";
+        const onebit::npu::TurnEndProbe q = onebit::npu::turn_end_from_template(plain, "", "");
+        check(q.marker == "<|im_end|>" && q.form == "plain", "turn-end probe: an ordinary template is read with the plain shape");
+        onebit::npu::ChatTemplate broken;
+        broken.text = "{{ raise_exception('never renders') }}";
+        broken.source = "test";
+        const onebit::npu::TurnEndProbe b = onebit::npu::turn_end_from_template(broken, "", "");
+        check(b.marker.empty() && b.form.empty() && b.why.find("never renders") != std::string::npos,
+              "turn-end probe: a template that renders no shape yields no marker and says why");
+    }
+
     // The chat route's own variables (engine#1788): a request's `tools` reach the template, in the
     // caller's key order, and an empty list is "none offered".  The route used to pass only
     // chat_template_kwargs and enable_thinking, so a template's tools block never rendered.

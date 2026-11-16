@@ -1797,6 +1797,14 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
 // vote as the fallback for packs with no 1.9 header -- the 1.8 / R1-Distill line, where it works today.
 FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& pack_dir, const Dims& dims) {
     FconstGeom g = locate_fconst(tok, dims.eps_bits);
+    if (g.stride != 0 && g.six_headers()) {   // engine#2604: per-layer starts from every header, not one stride
+        if (const std::string why = fconst_six_header_blocks(tok, dims.eps_bits, dims.layers, dims.kv_heads, g);
+            !why.empty()) {
+            g.why = why;
+            g.stride = 0;
+        }
+        return g;
+    }
     const std::string src = find_token_fconst(pack_dir);
     if (src.empty()) return g;
     Fconst fc = open_fconst(src);
@@ -1902,11 +1910,71 @@ std::vector<int64_t> fconst_block_headers(const std::vector<int64_t>& pos, int64
 // first entry) and `period` (headers per block, counting the block's own). One inner header is a 2-header block
 // (Qwen2.5/Llama), three is a 4-header block (Qwen3); anything else is not a layout this reader knows, so nothing is set.
 bool fconst_set_block_headers(FconstGeom& g, const std::vector<int64_t>& inner) {
-    if (inner.size() != 1 && inner.size() != 3) return false;
+    if (inner.size() != 1 && inner.size() != 3 && inner.size() != 5) return false;   // 5: gemma3 1.8 (engine#2604)
     g.hdr = inner;
     g.h1 = inner.front();
     g.period = int(inner.size()) + 1;
     return true;
+}
+
+std::string fconst_six_header_blocks(const std::string& path, unsigned short eps_bits, int layers, int kv_heads,
+                                     FconstGeom& g) {
+    // Every header in the file, from a mapping (no read-chunk seams) and in the strict 64-byte form -- epsilon, then 62
+    // zero bytes -- because the 12-byte prefix eps_header_positions() votes with is not rare inside 4-bit weights, and
+    // one coincidence here would shift a block start.
+    std::vector<int64_t> pos;
+    {
+        Fconst fc = open_fconst(path);
+        const uint8_t lo8 = uint8_t(eps_bits & 0xFF), hi8 = uint8_t(eps_bits >> 8);
+        for (size_t i = 0; i + 64 <= fc.size;) {
+            const void* hit = std::memchr(fc.map + i, lo8, fc.size - 64 - i + 1);
+            if (!hit) break;
+            const size_t j = size_t(static_cast<const uint8_t*>(hit) - fc.map);
+            bool ok = fc.map[j + 1] == hi8;
+            for (int k = 2; ok && k < 64; ++k) ok = fc.map[j + size_t(k)] == 0;
+            if (ok) {
+                pos.push_back(int64_t(j));
+                i = j + 64;
+            } else {
+                i = j + 1;
+            }
+        }
+        unmap_file(fc.map, fc.size);
+    }
+    const size_t want = size_t(layers) * 6 + 1;
+    if (layers <= 0 || pos.size() != want || pos[0] != 0)
+        return "a 6-header layer block needs 6 x " + std::to_string(layers) + " + 1 = " + std::to_string(want) +
+               " epsilon headers from offset 0, and the file has " + std::to_string(pos.size());
+    const int64_t field = int64_t(kv_heads) * 8;
+    std::vector<int64_t> rel_q(static_cast<size_t>(layers), 0);   // h3 - h2: the only section whose size varies
+    int64_t lo = INT64_MAX, hi = 0;
+    for (int L = 0; L < layers; ++L) {
+        const int64_t* b = &pos[size_t(L) * 6];
+        if (b[1] - b[0] != pos[1] - pos[0] || b[2] - b[1] != pos[2] - pos[1] || b[4] - b[3] != pos[4] - pos[3] ||
+            b[5] - b[4] != pos[5] - pos[4] || b[6] - b[5] != pos[6] - pos[5])
+            return "layer " + std::to_string(L) + "'s headers are not at the first block's offsets outside the "
+                   "q_norm/o_proj section";
+        rel_q[size_t(L)] = b[3] - b[2];
+        lo = std::min(lo, rel_q[size_t(L)]);
+        hi = std::max(hi, rel_q[size_t(L)]);
+    }
+    if (hi != lo && hi - lo != field)
+        return "the q_norm/o_proj section comes in sizes " + std::to_string(lo) + " and " + std::to_string(hi) +
+               " B; the sliding-window field is 4 x kv_heads x 8 = " + std::to_string(field) + " B";
+    g.bases.assign(size_t(layers) + 1, 0);
+    g.shifts.assign(size_t(layers), 0);
+    for (int L = 0; L < layers; ++L) {
+        g.bases[size_t(L)] = pos[size_t(L) * 6];
+        g.shifts[size_t(L)] = rel_q[size_t(L)] - lo;
+    }
+    g.bases[size_t(layers)] = pos[size_t(layers) * 6];
+    // the global form: block 0's offsets less its own shift from h3 on
+    const int64_t s0 = g.shifts[0];
+    g.hdr = {pos[1], pos[2], pos[3] - s0, pos[4] - s0, pos[5] - s0};
+    g.h1 = pos[1];
+    g.stride = pos[6] - s0;
+    g.period = 6;
+    return "";
 }
 
 std::string find_token_fconst_exported(const std::string& pack_dir) { return find_token_fconst(pack_dir); }
@@ -2456,6 +2524,20 @@ static double corr(const Q4& q, const EmbedTable& embed, int rows);   // defined
 double embed_at(const EmbedTable& t, int row, int k) {
     const uint16_t v = reinterpret_cast<const uint16_t*>(t.p)[size_t(row) * size_t(t.H) + size_t(k)];
     return t.fmt == EmbedTable::Fmt::BF16 ? bf16_to_f32(v) : f16_to_f32(v);
+}
+
+// engine#2604: a gemma pack stores its embedding PRE-SCALED by sqrt(hidden), and so does the forward
+// (q4nx_semantics: embed_scale = sqrt(hidden); on a tied model the LM head divides its output by it), while the pack's
+// 4-bit head is the raw table -- measured on translategemma-4b-it 1.8: best-fit scale 50.33 against sqrt(2560) =
+// 50.60. Scaling the head's scale and zero by sqrt(hidden) is exact for an affine code and gives the forward the head
+// it divides back out. Applied before the head is tiled and fitted, so every self-check gate then runs unchanged and a
+// head off by anything other than that factor is still refused. No-op for any other model type.
+bool gemma_prescale_head(Q4& q, const std::string& model_type, int64_t hidden) {
+    if (model_type.rfind("gemma", 0) != 0 || hidden <= 0) return false;
+    const float s = float(std::sqrt(double(hidden)));
+    for (auto& v : q.scale) v *= s;
+    for (auto& v : q.zero) v *= s;
+    return true;
 }
 
 double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows) {
@@ -4627,7 +4709,10 @@ Plan plan(const std::string& pack_dir) {
                         p.o_k = int(H);
                     }
 
-                } else if (g.hdr.size() == 3) {
+                } else if (g.hdr.size() == 3 || g.six_headers()) {
+                    // engine#2604: the gemma3 6-header block opens the same way (its hdr[0..2] are k_norm, q_norm and
+                    // post_attention_layernorm, in the global form); the per-layer sliding-window field is applied
+                    // as a shift by the import.
                     // engine#979: the Qwen3 families split the attention section in four. Measured on
                     // both shipped packs: [k,q,v tiles][header + per-head k_norm][header + per-head q_norm
                     // + o_proj tiles], with o_proj's tiles at K = q_proj's output width.
@@ -4660,9 +4745,10 @@ Plan plan(const std::string& pack_dir) {
                            " epsilon headers, and this importer reads blocks of 2 (q/k/v/o in one payload) "
                            "or 4 (q/k/v, two per-head QK norms, o_proj) -- recorded 2026-11-04 on Qwen3");
                 }
-                // the MLP section starts right after the block's post-attention norm
-                const int64_t mlp_off = g.post_attn_hdr() + kNormOff + H * 2;
-                const MlpGeom mg = mlp_geom(H, d.intermediate, mlp_off, g.stride);
+                // the MLP section starts right after the block's post-attention norm -- or, on the gemma3 6-header
+                // block, after pre_feedforward_layernorm, and ends at post_feedforward_layernorm's header (engine#2604)
+                const int64_t mlp_off = (g.six_headers() ? g.hdr[3] : g.post_attn_hdr()) + kNormOff + H * 2;
+                const MlpGeom mg = mlp_geom(H, d.intermediate, mlp_off, g.six_headers() ? g.hdr[4] : g.stride);
                 p.mlp_note = mg.why;
                 if (mg.ok()) {
                     p.mlp_gu_units = mg.gu_units;
@@ -5901,6 +5987,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // no qzeros tensor -> the implicit zero point (engine#1503: Qwen3-VL-4B's spelling, three-input nodes)
         if (!have_zp) implicit_zp_zero(q, zp_bits_for_spelling(mm.weight, mm.bits));
 
+        if (q.N == int(V) && q.K == int(H) && gemma_prescale_head(q, p.dims.model_type, H))
+            r.head_prescaled = true;
         std::vector<uint8_t> tiled;
         long long pinexact = 0;
         tile_q4_1_f32(q, tiled, &pinexact);
@@ -6173,7 +6261,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 bool head32_read = false;
                 std::string head32_why;
                 if (p.head_block == 32) {
-                    const int64_t tail_off = int64_t(p.dims.layers) * g.stride;
+                    const int64_t tail_off = g.base_of(p.dims.layers);
                     const int64_t env = attn_payload_off(H);
                     if (tail_off + env > int64_t(fc.size)) {
                         head32_why = "the .fconst ends before the tail's envelope";
@@ -6258,7 +6346,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                  (long long)p.head_block);
                 }
             } else if (onnx.matmuls.empty()) {
-                const int64_t tail_off = int64_t(p.dims.layers) * g.stride;
+                const int64_t tail_off = g.base_of(p.dims.layers);
                 const int64_t tile = attn_tile_bytes(H);
                 // ceil, not floor: a vocab that is not a multiple of 64 is padded up to whole tiles in the pack
                 // (Hunyuan-0.5B: 120,818 rows = 1,887.8 tiles, so the tail holds 1,888 and the last one is partly
@@ -6311,6 +6399,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                          "note: the head is stored as %d rows for a vocabulary of %lld (the pack pads "
                                          "to whole 64-row tiles); vocab_size stays %lld in the container\n",
                                          q.N, (long long)V, (long long)V);
+                        if (q.K == int(H) && gemma_prescale_head(q, p.dims.model_type, H)) r.head_prescaled = true;
                         std::vector<uint8_t> tiled;
                         long long pinexact = 0;
                         tile_q4_1_f32(q, tiled, &pinexact);
@@ -6366,18 +6455,25 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 ++r.tensors;
             };
             for (int L = 0; L < p.dims.layers; ++L) {
-                const int64_t base = int64_t(L) * g.stride;
+                const int64_t base = g.base_of(L), sh = g.shift_of(L);
+                const std::string ln = "model.layers." + std::to_string(L) + ".";
                 r.norm_anchors_total += 2;
                 r.norm_anchors_ok += int(eps_at(fc, base, p.dims.eps_bits)) +
-                                 int(eps_at(fc, base + g.post_attn_hdr(), p.dims.eps_bits));
-                add_norm(base + kNormOff, "model.layers." + std::to_string(L) + ".input_layernorm.weight");
-                add_norm(base + g.post_attn_hdr() + kNormOff,
-                         "model.layers." + std::to_string(L) + ".post_attention_layernorm.weight");
+                                 int(eps_at(fc, base + g.post_attn_hdr() + sh, p.dims.eps_bits));
+                add_norm(base + kNormOff, ln + "input_layernorm.weight");
+                add_norm(base + g.post_attn_hdr() + sh + kNormOff, ln + "post_attention_layernorm.weight");
+                if (g.six_headers()) {   // engine#2604: gemma3's two feed-forward norms, the block's 5th and 6th headers
+                    r.norm_anchors_total += 2;
+                    r.norm_anchors_ok += int(eps_at(fc, base + g.hdr[3] + sh, p.dims.eps_bits)) +
+                                         int(eps_at(fc, base + g.hdr[4] + sh, p.dims.eps_bits));
+                    add_norm(base + g.hdr[3] + sh + kNormOff, ln + "pre_feedforward_layernorm.weight");
+                    add_norm(base + g.hdr[4] + sh + kNormOff, ln + "post_feedforward_layernorm.weight");
+                }
             }
             // the final norm: the tail envelope opens at `layers x stride`, the norm sits at +64, and the
             // prefill file (when the pack ships one) holds a second copy that has to match byte for byte
             {
-                const int64_t tail = int64_t(p.dims.layers) * g.stride;
+                const int64_t tail = g.base_of(p.dims.layers);
                 if (!eps_at(fc, tail, p.dims.eps_bits)) {
                     late.push_back("model.norm.weight: no RMSNorm epsilon at " + std::to_string(tail) +
                                    " B, where the .fconst tail envelope opens, so its position is not "
@@ -6459,15 +6555,29 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                       {"v_proj", kv_out, attn_off, int(H), ft.v},
                                       {"o_proj", int(H), p.o_off, p.o_k, 0}};
                 for (int L = 0; L < p.dims.layers; ++L) {
-                    const int64_t block = int64_t(L) * g.stride;
+                    const int64_t block = g.base_of(L);
+                    // engine#2604: a gemma3 sliding-window layer carries 4 x kv_heads records of 8 B (bf16 0xFF7F,
+                    // then zeros) between q_norm's gain and o_proj. Checked byte for byte before o_proj is read past it.
+                    const int64_t sh = g.shift_of(L);
+                    if (sh) {
+                        const uint8_t* fld = at(fc, block + p.o_off, sh);
+                        bool fld_ok = sh == int64_t(p.dims.kv_heads) * 8;
+                        for (int64_t i = 0; fld_ok && i < sh; ++i)
+                            fld_ok = fld[i] == ((i % 8) == 0 ? 0x7f : (i % 8) == 1 ? 0xff : 0x00);
+                        if (!fld_ok)
+                            late.push_back("model.layers." + std::to_string(L) + ".self_attn.o_proj.weight: the " +
+                                           std::to_string(sh) + " B before o_proj are not 4 x kv_heads records of "
+                                           "bf16 0xFF7F and zeros, so o_proj's start is not known");
+                    }
                     for (const auto& sl : slots) {
+                        const int64_t sl_base = sl.base + (std::strcmp(sl.proj, "o_proj") == 0 ? sh : 0);
                         const int nt = sl.rows / kTileRows;
                         const int tile_bytes = int(attn_tile_bytes(sl.k));
                         std::vector<TileW> tiles;
                         tiles.reserve(size_t(nt));
                         bool exact = true;
                         for (int i = 0; i < nt; ++i) {
-                            const uint8_t* src = at(fc, block + sl.base + int64_t(sl.first + i) * tile_bytes,
+                            const uint8_t* src = at(fc, block + sl_base + int64_t(sl.first + i) * tile_bytes,
                                                     tile_bytes);
                             tiles.push_back(decode_tile(src, sl.k));
                             ++r.attn_tiles_total;
@@ -6543,7 +6653,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // not survive that is refused by name. The geometry is re-derived from this block rather
             // than taken from plan(), so the stride identity is checked against the file being read.
             if (p.mlp_gu_units) {
-                const MlpGeom mg = mlp_geom(H, p.dims.intermediate, p.mlp_off, g.stride);
+                const MlpGeom mg = mlp_geom(H, p.dims.intermediate, p.mlp_off, g.six_headers() ? g.hdr[4] : g.stride);
                 if (!mg.ok()) {
                     late.push_back("the MLP section: " + mg.why);
                 } else {
@@ -6551,7 +6661,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     const int64_t gu_unit = group_bytes(H, kMlpRows);
                     const int64_t down_group = group_bytes(inter, kTileRows);
                     for (int L = 0; L < p.dims.layers; ++L) {
-                        const int64_t base_gu = int64_t(L) * g.stride + mg.off;
+                        const int64_t base_gu = g.base_of(L) + g.shift_of(L) + mg.off;
                         const int64_t base_down = base_gu + mg.gu + mg.gap;
                         std::vector<TileW> gate, up, down;
                         bool gate_ok = true, up_ok = true, down_ok = true;

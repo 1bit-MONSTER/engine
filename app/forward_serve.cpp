@@ -1493,18 +1493,13 @@ int run_forward_serve(int argc, char** argv) {
         // contributes nothing, and the load line below shows what the serve stops on either way.
         std::string turn_end = chatml_route ? std::string("<|im_end|>") : std::string();
         if (can_render) {
-            static const char* const kProbe = "\xC2\xA4turn-end-probe\xC2\xA4";
-            try {
-                nlohmann::ordered_json exchange = nlohmann::ordered_json::array();
-                exchange.push_back({{"role", "user"}, {"content", "u"}});
-                exchange.push_back({{"role", "assistant"}, {"content", kProbe}});
-                const std::string rendered = npu::render_chat_template(e.tmpl, exchange, /*add_generation_prompt=*/false,
-                                                                       nlohmann::ordered_json::object(), e.bos_text, e.eos_text);
-                const size_t at = rendered.find(kProbe);
-                if (at != std::string::npos) turn_end = npu::turn_end_marker(rendered.substr(at + std::strlen(kProbe)));
-            } catch (const std::exception& ex) {
-                std::fprintf(stderr, "1bit forward-serve: the template did not render a two-message exchange (%s); no turn-end marker from it\n", ex.what());
-            }
+            // engine#2604: three user-content shapes, first that renders (translategemma's template takes only its own)
+            const npu::TurnEndProbe probe = npu::turn_end_from_template(e.tmpl, e.bos_text, e.eos_text);
+            if (probe.form.empty())
+                std::fprintf(stderr, "1bit forward-serve: the template did not render a two-message exchange (%s); no turn-end marker from it\n", probe.why.c_str());
+            else if (probe.form != "plain")
+                std::fprintf(stderr, "1bit forward-serve: turn-end marker read with %s user content (the plain probe did not render)\n", probe.form.c_str());
+            turn_end = probe.marker;
         }
         e.eos = npu::stop_token_ids(npu::read_json_or_null(cfg), npu::read_json_or_null(dir + "/tokenizer_config.json"),
                                     turn_end, [&](const std::string& text) { return e.tok->token_id(text); });

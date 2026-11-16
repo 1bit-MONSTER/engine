@@ -161,6 +161,45 @@ PY2
 )
 check "square weight: the two consumers still read different values" "$same_shape_dir" "different"
 
+# ...and the collision in the other direction: the SOURCE graph already carries an initializer called `w_t` that has
+# nothing to do with the fold. Reusing it because the name matches would be the same silent corruption on a graph that
+# never had two perms at all.
+python3 - "$tmp/taken.onnx" <<'PY2' || { echo "FAIL could not build the taken-name fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+w   = numpy_helper.from_array(np.arange(6, dtype=np.float32).reshape(2, 3), "w")
+# an unrelated tensor that happens to be called w_t, with the RIGHT shape and the WRONG values
+w_t = numpy_helper.from_array(np.full((3, 2), 7.0, dtype=np.float32), "w_t")
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[1, 0]),
+     helper.make_node("Identity", ["a"], ["oa"]),
+     helper.make_node("Identity", ["w_t"], ["keep"])],
+    "g",
+    [],
+    [helper.make_tensor_value_info("oa", TensorProto.FLOAT, None),
+     helper.make_tensor_value_info("keep", TensorProto.FLOAT, None)],
+    [w, w_t])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY2
+
+python3 "$TOOL" "$tmp/taken.onnx" "$tmp/taken-out.onnx" >"$tmp/taken.log" 2>&1 || { cat "$tmp/taken.log"; fail=$((fail+1)); }
+taken_verdict=$(python3 - "$tmp/taken-out.onnx" <<'PY2'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
+ident = {n.output[0]: n.input[0] for n in m.graph.node if n.op_type == "Identity"}
+read = ident.get("oa")
+w = np.arange(6, dtype=np.float32).reshape(2, 3)
+print("right" if read and np.array_equal(inits[read], np.transpose(w, (1, 0))) else f"WRONG({read})")
+PY2
+)
+check "an unrelated w_t in the source graph is not reused" "$taken_verdict" "right"
+
 echo "---"
 if [ "$fail" -ne 0 ]; then echo "$fail failed"; exit 1; fi
 echo "fold_initializer_transpose: all checks ok"

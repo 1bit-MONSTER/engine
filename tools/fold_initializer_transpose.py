@@ -40,18 +40,31 @@ def initializer_transposes(model):
     return [n for n in model.graph.node if n.op_type == "Transpose" and n.input[0] in inits]
 
 
-def folded_name(src, perm, taken):
-    """The initializer a fold of `src` under `perm` is stored as.
+def folded_name(src, perm, want, inits, taken):
+    """The initializer a fold of `src` under `perm` is stored as, created if it is not there yet.
 
     engine#2779: one weight folded under TWO different perms must not collapse onto one tensor. The first fold of a
     source keeps the plain `<src>_t` name (so every existing pack and every printed name is unchanged), and each further
     DISTINCT perm gets the perm in its name, which makes the collision impossible rather than unlikely. A repeated
     identical perm still reuses the one tensor, which is the case the old comment was written for.
+
+    A name is only reused when it already holds EXACTLY this perm's values: an unrelated `<src>_t` in the source graph
+    (or one of a different shape) is a collision too, and rewiring consumers onto it is the same silent corruption in a
+    different disguise, so a free name is picked instead of trusting the name.
     """
-    base = f"{src}_t"
-    if base not in taken:
-        return base
-    return f"{src}_t_" + "_".join(str(d) for d in perm)
+    candidates = [f"{src}_t", f"{src}_t_" + "_".join(str(d) for d in perm)]
+    i = 2
+    while len(candidates) < 8:
+        candidates.append(f"{src}_t_{i}")
+        i += 1
+    for name in candidates:
+        existing = inits.get(name)
+        if existing is None:
+            return name
+        have = numpy_helper.to_array(existing)
+        if have.shape == want.shape and np.array_equal(have, want):
+            return name
+    raise SystemExit(f"{src}: no free initializer name for perm {perm} near {src}_t (engine#2779)")
 
 
 def fold(model):
@@ -73,17 +86,8 @@ def fold(model):
         if key in by_perm:
             dst = by_perm[key]
         else:
-            dst = folded_name(src, perm[0], taken)
-            existing = inits.get(dst)
-            if existing is not None:
-                # A hand-written `<src>_t` (or a name this run produced for another perm, before the fix above) with a
-                # different shape: rewiring consumers to it is exactly the invalid pack engine#2779 reported, so refuse.
-                have = tuple(numpy_helper.to_array(existing).shape)
-                if have != tuple(want.shape):
-                    raise SystemExit(
-                        f"{src}: folding perm {perm[0]} needs a {tuple(want.shape)} initializer but {dst} is {have}; "
-                        f"refusing to rewire consumers onto the wrong shape (engine#2779)")
-            else:
+            dst = folded_name(src, perm[0], want, inits, taken)
+            if dst not in inits:
                 new = numpy_helper.from_array(np.ascontiguousarray(want), dst)
                 graph.initializer.append(new)
                 inits[dst] = new

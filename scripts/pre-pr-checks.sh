@@ -63,6 +63,7 @@ checks=(
     "tools/ci/tests_referenced_check.py"
     "tools/ci/ci_targets_check.py --check"
     "tools/ci/tmp_path_check.py --check"
+    "tools/ci/conflict_marker_check.py --check"
     "tools/ci/submodule_pin_check.py --check"
     # engine#2445: the tree must CONFIGURE, not just parse as text. A rebase resolution left one line
     # ending `…_test.py)ms)` and every check above stayed green -- they read files, run Python and diff

@@ -460,6 +460,12 @@ add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_or
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
 add_python_test(ci_targets ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#2641: #2625 merged with its own conflict markers still in docs/nvme-iommu-fault-triage.md, inside a ```bash
+# block, so the page did not render and nothing noticed -- the merge kept them because the file was never read back.
+# The check is stateful on purpose: a bare `=======` is a Markdown underline or a shell rule (the first version
+# flagged 10 of those on a clean tree), so a separator counts only inside an unterminated conflict block.
+add_python_test(conflict_marker ${CMAKE_SOURCE_DIR}/tools/ci/conflict_marker_check.py --check --root ${CMAKE_SOURCE_DIR})
+add_python_test(conflict_marker_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_marker_check.py --self-test)
 # engine#803 gate, second half: the comparator that turns two --dump-logits directories into the KLD verdict the
 # P4 gate asks for. No device and no model, so the gate is one command when a ticket is free; the self-test pins
 # the four cases a KLD implementation gets wrong (identical -> exactly 0, a shift is positive and directional, a

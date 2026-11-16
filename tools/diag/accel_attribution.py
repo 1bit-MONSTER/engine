@@ -36,6 +36,8 @@ import argparse
 import collections
 import os
 import sys
+import shutil
+import io
 
 
 def read_samples(path):
@@ -57,7 +59,14 @@ def read_samples(path):
 
 
 def read_attributions(path):
-    """[(epoch, hits, fault_line)] as written by the sampler's watch loop."""
+    """[(epoch, hits, fault_line)] as written by the sampler's watch loop, or None when there is no file yet.
+
+    None is not a read failure. The sampler creates attributed.log on the FIRST IO_PAGE_FAULT
+    (accel-sampler.sh's watch loop appends to it), so a box that has recorded no fault this boot has no such file --
+    and that is the healthy state (measured 2026-11-16: 5894 samples, zero faults). Swallowing the error and returning
+    [] answered "no attributions" correctly but said nothing about why; raising would report a working capture as
+    broken. Returning None lets main() print the reason once and still answer zero, rc 0.
+    """
     out = []
     try:
         with open(path, errors="replace") as f:
@@ -70,7 +79,7 @@ def read_attributions(path):
                 except ValueError:
                     continue
     except FileNotFoundError:
-        pass
+        return None
     return out
 
 
@@ -208,6 +217,25 @@ def self_test():
         assert [s[0] for s in read_samples(p)] == [100], read_samples(p)
     finally:
         os.unlink(p)
+    # engine#2610 review: the ONLY arm that can fail for this change. samples.log missing already answers rc 2 through
+    # main()'s `if not samples` guard (that behaviour predates this branch, and an arm for it cannot fail until the
+    # guard is removed) -- so the arm here is for the file whose absence is *healthy*: with samples present and no
+    # attributed.log (no fault recorded yet, the state this box is in) the answer must be zero attributions and rc 0,
+    # with one line saying why.
+    _d = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(_d, "samples.log"), "w") as _f:
+            _f.write("100\t111\tx\tA\t1\tk\n")
+        _argv, _err = sys.argv, sys.stderr
+        sys.argv = ["accel_attribution.py", "--dir", _d]
+        sys.stderr = io.StringIO()
+        try:
+            assert main() == 0, "no attributed.log is the healthy state: zero attributions, rc 0"
+            assert "no attributed.log yet" in sys.stderr.getvalue(), "the absence must be explained, not silent"
+        finally:
+            sys.argv, sys.stderr = _argv, _err
+    finally:
+        shutil.rmtree(_d, ignore_errors=True)
     print("accel_attribution self-test: ok")
 
 
@@ -234,6 +262,10 @@ def main():
 
     samples = read_samples(os.path.join(args.dir, "samples.log"))
     attrs = read_attributions(os.path.join(args.dir, "attributed.log"))
+    if attrs is None:
+        print("accel_attribution: no attributed.log yet: the sampler has recorded no fault "
+              "(it creates the file on the first one)", file=sys.stderr)
+        attrs = []
     if not samples:
         print(f"accel_attribution: no samples in {args.dir}/samples.log", file=sys.stderr)
         return 2

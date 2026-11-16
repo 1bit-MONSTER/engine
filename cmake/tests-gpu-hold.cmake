@@ -49,6 +49,14 @@ set_tests_properties(coder_llm_ticketed PROPERTIES RESOURCE_LOCK route_ports)
 # backs up and keeps the server command byte for byte behind the wrapper, --status tells ticketed from not, idempotent.
 add_test(NAME install_coder_llm_ticketed COMMAND bash ${CMAKE_SOURCE_DIR}/tests/install_coder_llm_ticketed_test.sh)
 
+# engine#2741: a payload that leaves the process tree (`setsid`, double fork) is in neither the process group nor the
+# descendant snapshot, so the release leaves it running with its memory mapped -- measured 2026-11-16: a `1bit serve`
+# held 44.4 GiB of GTT for 64 minutes after its ticket ended, while the box went to 351 MiB available. The environment
+# is the detector that does not depend on the tree: every process the payload started inherited this ticket's
+# GPU_HOLD_TICKET. Four arms; arm 4 (the hold says it ended one) is decisive, arms 1/3 report inconclusive on a box that
+# is itself killing sleepers.
+add_test(NAME gpu_hold_escape COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_escape_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
 # engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
 # queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
 # Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a

@@ -429,6 +429,28 @@ kill_tree() {
     kill -KILL -- "-$root" 2> /dev/null
     for p in $tree; do kill -KILL "$p" 2> /dev/null; done
 }
+# A payload can leave the process group entirely -- `setsid`, or a double fork -- and then neither the group kill nor
+# the descendant snapshot can see it, because both are anchored on the tree. Measured 2026-11-16: a `1bit serve` took
+# **44.4 GiB of GTT**, its ticket ended, and the serve held the memory for 64 minutes while the box went to 351 MiB
+# available with two OOM kills in the hour (`ps -o ppid=` -> 1, and its own environment still said
+# `GPU_HOLD_TICKET=... pid 3216578`, a pid that no longer existed). engine#1621 fixed grandchildren and engine#1649 the
+# process group; this is the one shape neither reaches.
+#
+# The environment is the detector that does not depend on the tree: every process the payload started INHERITED this
+# ticket's GPU_HOLD_TICKET, whatever it did to its parentage, session or group. So after the teardown, any live process
+# still carrying this exact ticket line is work this ticket started and did not end.
+env_survivors() {   # <exact ticket line> -> pids carrying it, excluding this shell
+    local want=$1 d p line
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [ "$p" = "$$" ] && continue
+        [ -r "$d/environ" ] || continue
+        line=$(tr '\0' '\n' < "$d/environ" 2> /dev/null | grep -m1 -F "GPU_HOLD_TICKET=$want") || continue
+        [ "$line" = "GPU_HOLD_TICKET=$want" ] || continue
+        printf '%s\n' "$p"
+    done
+}
+
 # The payload gets its PROCESS GROUP of its own (`set -m` makes every background job a group leader), because a
 # process group is the one thing a descendant cannot escape: reparenting to init does not change it, and a group
 # outlives its leader, so `kill -- -$child` still reaches the children AFTER the payload's root has gone. Without it
@@ -606,6 +628,28 @@ kill "$watchdog" 2> /dev/null
 wait "$watchdog" 2> /dev/null
 # And end whatever is left from here too, so the promise does not depend on a helper having outlived its parent.
 kill_tree "$child"
+# ...and the part of the tree that left the tree: a process still carrying this ticket's GPU_HOLD_TICKET is work this
+# hold started, wherever it moved itself. TERM, then KILL after the same grace the tree kill uses, then record it, so
+# the next holder is warned even if the KILL somehow failed.
+escaped=$(env_survivors "$mine")
+if [ -n "$escaped" ]; then
+    log "::warning::$(printf '%s' "$escaped" | tr '\n' ' ') escaped the ticket's process tree but still carry this ticket's GPU_HOLD_TICKET - ending them (engine#2741)"
+    for p in $escaped; do kill -TERM "$p" 2> /dev/null; done
+    i=0
+    while [ "$i" -lt "${GPU_HOLD_KILL_GRACE:-10}" ] && kill -0 $escaped 2> /dev/null; do
+        sleep 1
+        i=$((i + 1))
+    done
+    for p in $escaped; do
+        kill -0 "$p" 2> /dev/null || continue
+        kill -KILL "$p" 2> /dev/null
+        {
+            printf 'pid=%s start=%s cmd=%s\n' "$p" \
+                "$(ps -o lstart= -p "$p" 2> /dev/null | sed 's/^ *//' || printf unknown)" \
+                "$(tr '\0' ' ' < "/proc/$p/cmdline" 2> /dev/null | cut -c1-120 || printf unknown)"
+        } >> "$SURVIVORS" 2> /dev/null || true
+    done
+fi
 if [ "$rc" = 124 ]; then
     # engine#2542, measured on the NPU: a ticket cut short by the max hold was followed 8m29s later -- with nothing
     # running -- by `Unsupported op 18` and an IO_PAGE_FAULT burst, and the two other bursts of that boot sat 3m26s

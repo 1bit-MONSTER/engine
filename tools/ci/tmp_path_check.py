@@ -64,6 +64,14 @@ SUFFIXES = (".c", ".cc", ".cpp", ".h", ".hpp", ".sh", ".py")
 # the run prints it (--check counts excluded files) so a second such file cannot appear unnoticed.
 SELF = "tools/ci/tmp_path_check.py"
 
+# A path RECOGNISER names /tmp because naming it is the job: `tools/check-installed-rpath.py` classifies a
+# RUNPATH entry by the directory it resolves through, and /tmp is one of the build trees it must refuse, so a
+# classifier with no `/tmp` in it cannot do its work. It writes nothing there. Excluded BY NAME for the same
+# reason SELF is -- one line a reader can check, counted in the run so a second such file cannot appear
+# unnoticed. (engine#2667: the addition of that classifier failed this check on the tree-wide scan, which is
+# the check doing its job, not an obstacle.)
+RECOGNISERS = ("tools/check-installed-rpath.py",)
+
 # Test files are excluded: a test that writes to a temp dir it created is not the defect, and the fixtures would
 # otherwise have to be baselined too.
 def is_test(rel: str) -> bool:
@@ -96,7 +104,9 @@ def scan(root: pathlib.Path) -> dict[str, list[str]]:
     """{file: [literal, ...]} for every in-scope site, sorted and de-duplicated."""
     found: dict[str, list[str]] = {}
     excluded_self: set[str] = set()
+    excluded_recognisers: set[str] = set()
     scan.excluded_self = excluded_self          # read by --check so the exclusion is printed, not implicit
+    scan.excluded_recognisers = excluded_recognisers
     for top in SCAN:
         base = root / top
         if not base.is_dir():
@@ -107,7 +117,9 @@ def scan(root: pathlib.Path) -> dict[str, list[str]]:
             rel = path.relative_to(root).as_posix()
             if rel == SELF:
                 excluded_self.add(rel)
-            if is_test(rel) or rel == SELF:
+            if rel in RECOGNISERS:
+                excluded_recognisers.add(rel)
+            if is_test(rel) or rel == SELF or rel in RECOGNISERS:
                 continue
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
@@ -187,8 +199,10 @@ def main(argv: list[str]) -> int:
         )
         return 1
     excluded = len(getattr(scan, "excluded_self", ()))
+    recog = sorted(getattr(scan, "excluded_recognisers", ()))
     print(f"tmp_path_check: {len(base)} baselined site(s), none new, none stale "
-          f"({excluded} file(s) excluded: this checker's own fixtures)")
+          f"({excluded} file(s) excluded: this checker's own fixtures"
+          + (f"; {len(recog)} recogniser(s) named by RECOGNISERS: {', '.join(recog)}" if recog else "") + ")")
     return 0
 
 

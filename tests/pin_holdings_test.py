@@ -105,6 +105,11 @@ with tempfile.TemporaryDirectory() as tmp:
           "a same-named file with the same oid (in another folder) is not drift; a renamed one is not compared")
     check("needs a re-upload" in r.stdout, "the report says the re-host needs a re-upload")
 
+    # 1b. a clean-looking run says how much it did not look at: 3 of the 7 pinned files have a holding.
+    check(out.get("pinned_files") == 7 and out.get("unlisted_pins") == 4,
+          f"coverage counts the pinned files with no holding ({out.get('pinned_files')}, {out.get('unlisted_pins')})")
+    check("4 of 7 pinned files have no holding" in r.stdout, "and the report says so in its header")
+
     # 2. the re-host fixed: everything clean, rc 0.
     pins["pins"]["us/Model-Rehost"]["files"]["m.gguf"] = dict(pins["pins"]["up/Model-GGUF"]["files"]["m.gguf"])
     json.dump(pins, open(os.path.join(tmp, "pins.json"), "w"))
@@ -147,6 +152,16 @@ with tempfile.TemporaryDirectory() as tmp:
         r, out = run(tmp)
         check(r.returncode == 2 and out.get("errors"), f"unresolvable holding {bad['pin']}:{bad['file']} -> rc 2 "
                                                      f"(rc {r.returncode})")
+
+    # 7b. --log appends one line per run with the outcome, so a failing timer is visible after the journal rotates.
+    lg = os.path.join(tmp, "PIN-HOLDINGS.log")
+    holdings(base[1:])  # head.gguf was rewritten in 5; the other two still match
+    run(tmp, "--log", lg)
+    holdings([{"pin": "no/Such", "file": "m.gguf", "path": paths["m-new.gguf"]}])
+    run(tmp, "--log", lg)
+    rows = open(lg).read().splitlines()
+    check(len(rows) == 2 and " ok holdings=2 drift=0 rehost=0 errors=0 unlisted=5" in rows[0]
+          and " error " in rows[1], f"--log: one line per run, outcome first ({rows})")
 
     # 8. --rehost-only needs no holdings file and reads no box file.
     r, out = run(tmp, "--rehost-only", holdings="absent.json")

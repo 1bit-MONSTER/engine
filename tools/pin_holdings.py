@@ -16,7 +16,7 @@
 """Do the files we hold match the pins? The box half of the pin watch (docs/model-pins.md).
 
 usage: tools/pin_holdings.py [--pins FILE] [--holdings FILE] [--cache FILE] [--out FILE] [--json FILE]
-                             [--rehost-only]
+                             [--log FILE] [--rehost-only]
 
 tools/pin_watch.py --check compares each pin with what Hugging Face serves. It cannot see the box, so a pin
 can be bumped to a new upstream file while the box keeps serving the old one, and every daily run stays
@@ -166,7 +166,16 @@ def gb(n) -> str:
     return "?" if n is None else f"{n / 1e9:.2f} GB"
 
 
-def report(hrows: list[dict] | None, rrows: list[dict], errors: list[str], hashed: int) -> str:
+def coverage(pins: dict, holdings: list[dict]) -> dict:
+    """How much of pins.json the map covers: a pinned file with no holding is simply not examined, so a clean run
+    has to say how many it did not look at (most pins are not on the box; one held but unmapped is the hole)."""
+    pinned = {(repo, f) for repo, p in pins.items() for f in p["files"]}
+    mapped = pinned & {(h.get("pin"), h.get("file")) for h in holdings}
+    return {"pinned_files": len(pinned), "mapped": len(mapped), "unlisted_pins": len(pinned - mapped)}
+
+
+def report(hrows: list[dict] | None, rrows: list[dict], errors: list[str], hashed: int,
+           cov: dict | None = None) -> str:
     day = datetime.datetime.now(datetime.timezone.utc).date().isoformat()  # UTC, as the CI run dates its report
     bad = [r for r in hrows or [] if r["state"] != "ok"]
     lines = [f"# Pin holdings, {day}", ""]
@@ -175,6 +184,9 @@ def report(hrows: list[dict] | None, rrows: list[dict], errors: list[str], hashe
     else:
         lines.append(f"Holdings: {len(hrows)} checked, {len(bad)} differ from their pin "
                      f"({hashed} hashed this run, the rest from the cache).")
+        if cov is not None:
+            lines.append(f"Coverage: {cov['unlisted_pins']} of {cov['pinned_files']} pinned files have no holding on "
+                         f"this box (not held here, or held and missing from models/holdings.json): not checked.")
     lines.append(f"Re-hosts: {len(rrows)} differ from their upstream pin.")
     if errors:
         lines.append(f"Map errors: {len(errors)} (exit 2).")
@@ -209,6 +221,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--out", help="also write the Markdown report here")
     ap.add_argument("--json", help="also write the rows as JSON here")
     ap.add_argument("--rehost-only", action="store_true", help="only the pins.json half (no box files read)")
+    ap.add_argument("--log", help="append one line per run here (UTC, outcome, counts): a result that outlives the "
+                                  "journal")
     a = ap.parse_args(argv)
     try:
         pins = load(a.pins)["pins"]
@@ -216,7 +230,7 @@ def main(argv: list[str]) -> int:
         print(f"pin_holdings: cannot read {a.pins}: {e}", file=sys.stderr)
         return 2
     cache = Cache(a.cache or None)
-    hrows, errors = None, []
+    hrows, errors, cov = None, [], None
     if not a.rehost_only:
         try:
             holdings = load(a.holdings)["holdings"]
@@ -224,21 +238,27 @@ def main(argv: list[str]) -> int:
             print(f"pin_holdings: cannot read {a.holdings}: {e}", file=sys.stderr)
             return 2
         hrows, errors = check_holdings(pins, holdings, cache)
+        cov = coverage(pins, holdings)
         cache.save()
     rrows = check_rehosts(pins)
-    text = report(hrows, rrows, errors, cache.hashed)
+    text = report(hrows, rrows, errors, cache.hashed, cov)
     print(text)
     if a.out:
         with open(a.out, "w", encoding="utf-8") as f:
             f.write(text + "\n")
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
-            json.dump({"holdings": hrows, "rehosts": rrows, "errors": errors}, f, indent=1)
-    if errors:
-        return 2
-    if rrows or any(r["state"] != "ok" for r in hrows or []):
-        return 1
-    return 0
+            json.dump({"holdings": hrows, "rehosts": rrows, "errors": errors, **(cov or {})}, f, indent=1)
+    drift = [r for r in hrows or [] if r["state"] != "ok"]
+    rc = 2 if errors else 1 if (rrows or drift) else 0
+    if a.log:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = (f"{stamp} {('ok', 'drift', 'error')[rc]} holdings={'-' if hrows is None else len(hrows)} "
+                f"drift={len(drift)} rehost={len(rrows)} errors={len(errors)} "
+                f"unlisted={'-' if cov is None else cov['unlisted_pins']}")
+        with open(a.log, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    return rc
 
 
 if __name__ == "__main__":

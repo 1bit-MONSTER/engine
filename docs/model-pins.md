@@ -166,8 +166,14 @@ Its exit codes are its own, not `pin_watch.py`'s (whose table is above):
 On the box it runs daily from `scripts/1bit-pin-holdings.{service,timer}` (05:00 UTC) under `~/lb/thermal-run.sh`,
 from the engine checkout named by `ONEBIT_ENGINE` in the unit (default `%h/wt/engine-main`; set it at install to a
 checkout of this repository that follows `main`, which `~/1bit-MONSTER` on strixhalo is not). A missing checkout
-exits 2 with a line saying so, so "cannot run" never reads as "a pin differs". Exit 1 marks the unit failed and the
-report is `~/.1bit/logs/pin-holdings-latest.md`.
+exits 2 with a line saying so, so "cannot run" never reads as "a pin differs". Exit 1 marks the unit failed, the
+report is `~/.1bit/logs/pin-holdings-latest.md`, and every run appends one line to `~/briefs/PIN-HOLDINGS.log`
+(`--log`; `<utc> ok|drift|error holdings=N drift=N rehost=N errors=N unlisted=N`), so the daily result outlives the
+journal.
+
+The report also says what it did **not** check: `Coverage: U of P pinned files have no holding on this box`
+(`unlisted_pins` in `--json`). Most pins are not on the box; one that is held and missing from
+`models/holdings.json` is the hole, and a clean run must not hide how many it never looked at.
 
 ```bash
 tools/pin_holdings.py                       # both halves; report on stdout

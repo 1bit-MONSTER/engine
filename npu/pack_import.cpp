@@ -929,6 +929,7 @@ std::string graph_filename(const std::string& pack_dir);
 struct Fconst17Geom {
     int64_t tile_h = 0, tile_o = 0, n_q = 0, n_kv = 0, n_o = 0, payload = 0, gu = 0, down = 0, stride = 0, head = 0;
     int64_t pad = 0;   // engine#2650: whole head tiles after the head (CodeLlama-7b-Instruct: 515); must be all zero
+    bool no_head = false;   // engine#2658: a tied model's file ends with the last layer; the head is the graph's
 };
 // The arithmetic, and whether `size` is layers x stride + head, plus whole head tiles of padding after the head (the
 // caller checks those are zero). Empty when it is; otherwise why not.
@@ -958,6 +959,15 @@ std::string fconst17_geometry(uint64_t size, const Dims& d, Fconst17Geom* g) {
         return "";
     }
     g->pad = 0;
+    // engine#2658: Phi-4-mini-instruct-onnx-ryzenai-npu (tied, vocab 200,064) is exactly 32 layer strides, 1,758,724,096
+    // B: no head tiles at all. Its head is the graph's lm_head MatMulNBits, as in its 1.8 npu_4K twin (whose Token file
+    // has no head either and reads with 0 gaps). The rewrite then ends at the final norm, and the reader takes the head
+    // from the graph -- or refuses the pack by name when the graph has none.
+    if (size == uint64_t(d.layers) * uint64_t(g->stride)) {
+        g->head = 0;
+        g->no_head = true;
+        return "";
+    }
     if (size != want)
         return "the file is " + std::to_string(size) + " B, and the 1.7 headerless form of this geometry is " +
                std::to_string(d.layers) + " x " + std::to_string(g->stride) + " + a " + std::to_string(g->head) +

@@ -1866,6 +1866,14 @@ rows, while its 32 layer blocks sit exactly where the arithmetic puts them. The 
 head tiles after the head, up to 65,536 padded head rows. The rewrite drops them, and only once every padding byte is
 checked to be zero; with one non-zero byte the file is not rewritten.
 
+A tied model's file may carry no head at all (engine#2658). `Phi-4-mini-instruct-onnx-ryzenai-npu` (vocab 200,064,
+tied) is exactly 32 layer strides, 1,758,724,096 B. Its head is the graph's `lm_head` MatMulNBits in
+`fusion.onnx.data`, the same arrangement as its 1.8 `npu_4K` twin, whose Token file has no head either and reads with
+0 gaps. So a file of exactly layers x stride is taken as this form, and the rewrite ends at the final norm. The
+rewrite is the twin's size to the byte (1,758,736,448 B) and 76.7 % byte-equal to it at the mapped place, against
+2.6 % with the twin shifted one attention tile; the rest is the two exports' re-quantization. The reader then takes
+the head from the graph, or refuses the pack by name when the graph has none.
+
 The **gate/up unit** is the head's unit with 64 row *slots* per strip instead of 32 rows: 4,864
 zero bytes, then `2 x (K/32)` strips of 1,216 B. Strip `s` holds K block `s/2`; slots 0..31 are
 `gate_proj` rows `32 x (s%2) .. +31` of the unit and slots 32..63 are the same rows of `up_proj`.

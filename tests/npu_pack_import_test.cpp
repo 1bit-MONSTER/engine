@@ -513,6 +513,27 @@ void test_fconst17_rewrite() {
         check(!pi::fconst17_geometry_exported(f17.size() + 1024 * T, d).empty(),
               "1.7 fconst: padding past 65,536 head rows does not fit");
     }
+    // engine#2658: a tied model's file ends with the last layer (Phi-4-mini: exactly 32 strides). The rewrite is the 1.8
+    // stream without the head -- what that pack's 1.8 twin carries -- and a file one tile short of that is not taken.
+    {
+        const std::string f17n = f17.substr(0, f17.size() - size_t(head));
+        const std::string f18n = f18.substr(0, f18.size() - size_t(head));
+        check(pi::fconst17_geometry_exported(f17n.size(), d).empty(), "1.7 fconst: a file with no head fits");
+        check(!pi::fconst17_geometry_exported(f17n.size() - size_t(T), d).empty(), "1.7 fconst: one tile short of the layers does not");
+        const std::string tokh = (dir / "nohead.fconst").string();
+        put_file(tokh, f17n);
+        std::string outh, saidh;
+        try {
+            check(pi::canonical_token_fconst17_exported(tokh, dir.string(), d, work + ".h") == work + ".h",
+                  "1.7 fconst: a file with no head is rewritten");
+        } catch (const std::exception& e) { saidh = e.what(); }
+        {
+            std::ifstream f(work + ".h", std::ios::binary);
+            outh.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        check(saidh.empty() && outh == f18n, "1.7 fconst: the no-head file rewrites to the 1.8 stream without its head (" +
+                                                 std::to_string(outh.size()) + " vs " + std::to_string(f18n.size()) + " B, " + saidh + ")");
+    }
     // the graph's RMSNorm epsilon (a node with a float attribute), read back
     std::string node, attr;
     pb::str(node, 4, "SimplifiedLayerNormalization");

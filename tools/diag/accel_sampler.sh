@@ -161,8 +161,22 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   rotate "$d/rot.log"
   [ -f "$d/rot.log.1" ] || { echo "FAIL: rotation did not keep a previous file"; fail=1; }
   [ "$(stat -c %s "$d/rot.log")" -eq 0 ] || { echo "FAIL: the live file was not truncated"; fail=1; }
+  # engine#2778: the summary must be REPLACED, not truncated in place. The observable is the inode: `> "$out"` keeps it
+  # (truncate + fill, so a reader inside the window sees a valid header and nothing else), `> "$out.tmp" && mv -f` changes it
+  # (rename over the old entry). This arm is deterministic -- no reader race -- and it fails on the truncating line.
+  mkdir -p "$d/sum"
+  : > "$d/sum/samples.log"
+  SAMP=$d/sum/samples.log ATTR=$d/sum/attributed.log DIR=$d/sum
+  summary > /dev/null 2>&1
+  ino_before=$(stat -c %i "$d/sum/summary.txt" 2>/dev/null || echo none)
+  summary > /dev/null 2>&1
+  ino_after=$(stat -c %i "$d/sum/summary.txt" 2>/dev/null || echo none)
+  [ "$ino_before" != none ] && [ "$ino_after" != none ] || { echo "FAIL: summary() did not write a summary"; fail=1; }
+  [ "$ino_before" != "$ino_after" ] || { echo "FAIL: the summary is truncated in place (same inode) -- a reader can see a header with nothing under it"; fail=1; }
+  [ -e "$d/sum/summary.txt.tmp" ] && { echo "FAIL: the temp file was left behind"; fail=1; }
+  head -1 "$d/sum/summary.txt" | grep -q '^# accel sampler summary ' || { echo "FAIL: the written summary has no header"; fail=1; }
   rm -rf "$d"
-  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation)"
+  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation, summary replaced not truncated)"
   return "$fail"
 }
 
@@ -198,7 +212,11 @@ summary() {  # what the run observed, so a 24 h expiry is not silence
       echo "The sampler cannot attribute a burst that did not happen. What it does establish: the holders above were"
       echo "live for the whole window, so if a burst had occurred, its record would name them."
     fi
-  } > "$out"
+  } > "$out.tmp" && mv -f "$out.tmp" "$out"
+  # engine#2778: written to a temp file and renamed, never truncated in place. Since #2613 refreshes this every ~15 min, a
+  # 24 h capture has 96 windows per day in which a reader (accel_attribution.py, or a lane grepping the summary at the moment
+  # of a fault) opens a file that exists, has a valid header line, and is empty after it -- i.e. "nothing was held" for a
+  # window in which something was. rename(2) within one directory makes a reader see the old summary or the new one.
   echo "summary written: $out"
 }
 

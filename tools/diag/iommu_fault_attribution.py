@@ -513,6 +513,13 @@ def main():
     if args.attributed:
         rows, _ = drop_pre_boot(samples(args.samples), boot)
         pairs = attributed_rows(open(args.attributed, encoding="utf-8", errors="replace").read())
+        # What agree/disagree MEANS, on every run: it compares this tool's verdict against the sampler's own `hits`
+        # LIST, so a window naming two holders is DISAGREE by design -- a window listing two lanes is not
+        # corroboration. That makes the column a measure of HOLDER TURNOVER, not of either rule's correctness: on a
+        # stable holder the nearest sample (either side) and the last preceding sample name the same holder (measured
+        # here: 279 of 281 faults, 99.3 %), so the two rules coincide whenever turnover is low.
+        print("# agree/disagree compares the sampler's windowed hits with this tool's verdict: a window naming two "
+              "holders is DISAGREE by design, so the count measures HOLDER TURNOVER, not rule correctness")
         ds = disagreements(rows, pairs, args.max_gap)
         for epoch, hits, verdict, agree in ds:
             print(fmt_attr(epoch, hits, verdict, agree))

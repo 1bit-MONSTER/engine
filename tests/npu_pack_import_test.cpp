@@ -533,6 +533,15 @@ void test_fconst17_rewrite() {
         }
         check(saidh.empty() && outh == f18n, "1.7 fconst: the no-head file rewrites to the 1.8 stream without its head (" +
                                                  std::to_string(outh.size()) + " vs " + std::to_string(f18n.size()) + " B, " + saidh + ")");
+        // #2666 review, the negative case: the no-head form is NOT a catch-all for a missing head. With no graph matmul of the
+        // head's geometry (N = V, K = H), the reader falls to the tail; the rewritten copy's tail is the envelope alone,
+        // and plan_tail_head() refuses it by name -- so an untied pack without a head anywhere still refuses.
+        const int64_t env18 = 64 + 2 * H, layers_end = int64_t(f18n.size()) - env18;
+        const pi::TailHeadPlacement th = pi::plan_tail_head(int64_t(f18n.size()), layers_end, env18, 1, T, 0);
+        check(!th.why.empty() && th.why.find("shorter") != std::string::npos,
+              "1.7 fconst: with no head in the graph, the no-head copy's tail is refused by name (" + th.why + ")");
+        const pi::TailHeadPlacement th2 = pi::plan_tail_head(int64_t(f18.size()), layers_end, env18, 1, T, 0);
+        check(th2.why.empty(), "1.7 fconst: control -- the copy WITH its head places the head in the tail (" + th2.why + ")");
     }
     // the graph's RMSNorm epsilon (a node with a float attribute), read back
     std::string node, attr;

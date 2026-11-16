@@ -1872,7 +1872,11 @@ tied) is exactly 32 layer strides, 1,758,724,096 B. Its head is the graph's `lm_
 0 gaps. So a file of exactly layers x stride is taken as this form, and the rewrite ends at the final norm. The
 rewrite is the twin's size to the byte (1,758,736,448 B) and 76.7 % byte-equal to it at the mapped place, against
 2.6 % with the twin shifted one attention tile; the rest is the two exports' re-quantization. The reader then takes
-the head from the graph, or refuses the pack by name when the graph has none.
+the head from the graph, or refuses the pack by name when the graph has none. "Tied" is not inferred from the
+missing tiles. The head is the graph's MatMulNBits whose geometry is the head's (N = vocab, K = hidden, the #1671 rule);
+Phi-4-mini's is `lm_head.weight` [200064, 3072] in `fusion.onnx.data`. With no such node the reader falls to the
+`.fconst` tail, and a tail that holds only the final norm's envelope is refused ("shorter than ... its envelope and
+head tiles would take"). So an untied pack with no head anywhere still refuses.
 
 The **gate/up unit** is the head's unit with 64 row *slots* per strip instead of 32 rows: 4,864
 zero bytes, then `2 x (K/32)` strips of 1,216 B. Strip `s` holds K block `s/2`; slots 0..31 are

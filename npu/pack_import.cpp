@@ -928,8 +928,10 @@ std::string graph_filename(const std::string& pack_dir);
 // mapped place (a one-unit misplacement scores 8.5 %); the rest is the two exports' re-quantization.
 struct Fconst17Geom {
     int64_t tile_h = 0, tile_o = 0, n_q = 0, n_kv = 0, n_o = 0, payload = 0, gu = 0, down = 0, stride = 0, head = 0;
+    int64_t pad = 0;   // engine#2650: whole head tiles after the head (CodeLlama-7b-Instruct: 515); must be all zero
 };
-// The arithmetic, and whether `size` is exactly layers x stride + head. Empty when it is; otherwise why not.
+// The arithmetic, and whether `size` is layers x stride + head, plus whole head tiles of padding after the head (the
+// caller checks those are zero). Empty when it is; otherwise why not.
 std::string fconst17_geometry(uint64_t size, const Dims& d, Fconst17Geom* g) {
     const int64_t H = d.hidden, IM = d.intermediate, Nq = int64_t(d.heads) * d.head_dim,
                   Nkv = int64_t(d.kv_heads) * d.head_dim, V = d.vocab;
@@ -946,6 +948,16 @@ std::string fconst17_geometry(uint64_t size, const Dims& d, Fconst17Geom* g) {
     g->stride = g->payload + 2 * H + g->gu + g->down + 2 * H;
     g->head = ((V + 63) / 64) * g->tile_h;
     const uint64_t want = uint64_t(d.layers) * uint64_t(g->stride) + uint64_t(g->head);
+    // engine#2650: CodeLlama-7b-Instruct-hf-onnx-ryzenai-npu (vocab 32016, 501 head tiles) carries 515 more tiles of
+    // zeros after the head; the export pads the head's rows. Its 32 layer blocks are where this arithmetic puts them.
+    // The padded head stays within 65,536 rows (there, 1,016 tiles = 65,024 rows), so an unrelated larger file is not
+    // taken for this form by its size.
+    if (size > want && (size - want) % uint64_t(g->tile_h) == 0 &&
+        uint64_t(g->head) + (size - want) <= uint64_t(65536 / 64) * uint64_t(g->tile_h)) {
+        g->pad = int64_t(size - want);
+        return "";
+    }
+    g->pad = 0;
     if (size != want)
         return "the file is " + std::to_string(size) + " B, and the 1.7 headerless form of this geometry is " +
                std::to_string(d.layers) + " x " + std::to_string(g->stride) + " + a " + std::to_string(g->head) +
@@ -967,6 +979,20 @@ std::string canonical_token_fconst17(const std::string& path, const std::string&
     if (opens_with_eps || !fconst17_geometry(fc.size, d, &g).empty()) {
         unmap_file(fc.map, fc.size);
         return path;
+    }
+    if (g.pad > 0) {
+        // the padding is dropped from the rewrite, so it must carry nothing: a non-zero byte there means this is not
+        // the padded form, and the file is left to the 1.8 reader (which refuses it with its own reasons)
+        const uint8_t* p = fc.map + size_t(d.layers) * size_t(g.stride) + size_t(g.head);
+        bool zero = true;
+        for (int64_t i = 0; i < g.pad && zero; ++i) zero = p[i] == 0;
+        if (!zero) {
+            std::fprintf(stderr, "1bit npu-pack: note: %s fits the 1.7 headerless arithmetic with %lld B after the "
+                                 "head, but those bytes are not zero, so it is not rewritten\n",
+                         path.c_str(), (long long)g.pad);
+            unmap_file(fc.map, fc.size);
+            return path;
+        }
     }
     const int64_t H = d.hidden;
     // layer 0's input_layernorm, from the graph (either branch: the two copies are one tensor)

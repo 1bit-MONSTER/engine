@@ -457,6 +457,32 @@ void test_fconst17_rewrite() {
     put_file(tokx, f17 + std::string(64, '\0'));
     check(pi::canonical_token_fconst17_exported(tokx, dir.string(), d, work + ".3") == tokx,
           "1.7 fconst: a file that does not fit the arithmetic is not rewritten");
+    // engine#2650: a head padded with whole zero tiles (CodeLlama-7b-Instruct: 515 after 501) rewrites to the same 1.8
+    // stream; the same padding with one non-zero byte, or padding past 65,536 head rows, is not taken for this form
+    {
+        check(pi::fconst17_geometry_exported(f17.size() + 3 * T, d).empty(), "1.7 fconst: whole zero tiles after the head fit");
+        const std::string tokp = (dir / "padded.fconst").string();
+        put_file(tokp, f17 + std::string(size_t(3 * T), '\0'));
+        std::string outp, saidp;
+        try {
+            const std::string gotp = pi::canonical_token_fconst17_exported(tokp, dir.string(), d, work + ".p");
+            check(gotp == work + ".p", "1.7 fconst: a zero-padded head is rewritten");
+        } catch (const std::exception& e) { saidp = e.what(); }
+        {
+            std::ifstream f(work + ".p", std::ios::binary);
+            outp.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        check(saidp.empty() && outp == f18, "1.7 fconst: the zero-padded head rewrites to the 1.8 stream byte for byte (" +
+                                               std::to_string(outp.size()) + " B, " + saidp + ")");
+        std::string nz = f17 + std::string(size_t(3 * T), '\0');
+        nz[nz.size() - 7] = 1;
+        const std::string tokn = (dir / "padded-nz.fconst").string();
+        put_file(tokn, nz);
+        check(pi::canonical_token_fconst17_exported(tokn, dir.string(), d, work + ".n") == tokn,
+              "1.7 fconst: padding with a non-zero byte is not rewritten");
+        check(!pi::fconst17_geometry_exported(f17.size() + 1024 * T, d).empty(),
+              "1.7 fconst: padding past 65,536 head rows does not fit");
+    }
     // the graph's RMSNorm epsilon (a node with a float attribute), read back
     std::string node, attr;
     pb::str(node, 4, "SimplifiedLayerNormalization");

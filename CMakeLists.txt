@@ -258,6 +258,10 @@ add_test(NAME config_pin_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tool
 # `uses:` ref, a raw download, a pip requirement) name a commit or a digest. CI's `ubuntu:26.04` changed digest between
 # 2026-11-09 and 2026-11-13 with no change in this tree. Offline, reads the tree only.
 add_test(NAME moving_ref_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/moving_ref_check.py --check --root ${CMAKE_SOURCE_DIR})
+# engine#2652: a merge lands the head recorded when it was queued, so a commit pushed after that point is lost
+# with nothing saying so (4 instances in one night). This asks main for the work, not the PR badge.
+add_test(NAME merge_content_check_selftest
+         COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/merge_content_check.py --self-test)
 add_test(NAME moving_ref_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/moving_ref_check.py --self-test)
 # Gantt "Kernel 7.4 readiness": config/kernel.config names the kernel by tag, commit, release and config hash, and
 add_test(NAME kernel_id_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/kernel_id_selftest.py --self-test)

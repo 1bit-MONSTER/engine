@@ -258,6 +258,40 @@ int main() {
         }
     }
 
+    // A pass that touches only slot 0 must not disturb the other slots' caches (engine#2689 item 3b found this: the
+    // bank used to be resized to the highest slot of the CURRENT call, so a single-user call between multi-user rounds
+    // dropped slots 1..3 and their next row attended over an empty cache at a position above 0 -- NaN in the serve
+    // batcher). Slots 0..2 all hold conversations at this point; one call for slot 0 alone, then each of the other two
+    // must still continue its own sequence bit for bit.
+    {
+        std::vector<int> last(users, 0);
+        for (int u = 0; u < users; u++) last[(size_t)u] = next_token[(size_t)u];
+        // A one-slot call, on the LOWEST slot, in the middle of everything.
+        std::vector<float> throwaway;
+        if (!fwd.step_users({last[0]}, {at_pos[0]}, {0}, throwaway)) {
+            std::printf("FAIL single-slot pass on slot 0: %s\n", fwd.last_error());
+            return 1;
+        }
+        for (int u = 1; u < users; u++) {   // slot 0 was the one the single-slot call advanced; 1..n-1 must be untouched
+            std::vector<float> want;
+            if (!ref[(size_t)u]->step(last[(size_t)u], at_pos[(size_t)u], want)) {
+                std::printf("FAIL reference after the single-slot pass %d: %s\n", u, ref[(size_t)u]->last_error());
+                return 1;
+            }
+            std::vector<float> row;
+            if (!fwd.step_users({last[(size_t)u]}, {at_pos[(size_t)u]}, {u}, row)) {
+                std::printf("FAIL slot %d after the single-slot pass: %s\n", u, fwd.last_error());
+                return 1;
+            }
+            const int at = first_difference(row, want);
+            if (at >= 0) {
+                std::printf("FAIL slot %d lost its cache when slot 0 ran alone: logit %d is %.9g, its own run says %.9g\n",
+                            u, at, row[(size_t)at], want[(size_t)at]);
+                return 1;
+            }
+        }
+    }
+
     // Refusals must be by name, not by producing wrong tokens.
     {
         std::vector<float> all;

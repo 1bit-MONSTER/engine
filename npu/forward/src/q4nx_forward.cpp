@@ -4771,8 +4771,12 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
         }
         smax = std::max(smax, slot[m]);
     }
-    user_kc_.resize((size_t)smax + 1);
-    user_vc_.resize((size_t)smax + 1);
+    // The bank only ever GROWS. A pass that touches slot 0 alone must not shrink a bank that is holding slots 0..3: that
+    // would drop the other sequences' KV and their next row would attend over an empty cache at a position above 0
+    // (found by the serve batcher, engine#2689 item 3b -- a single-user call between multi-user rounds turned the next
+    // row into NaN).
+    if (user_kc_.size() < (size_t)smax + 1) user_kc_.resize((size_t)smax + 1);
+    if (user_vc_.size() < (size_t)smax + 1) user_vc_.resize((size_t)smax + 1);
     for (size_t s = 0; s <= (size_t)smax; s++) {
         if (user_kc_[s].empty()) user_kc_[s].assign((size_t)c_.NL, {});
         if (user_vc_[s].empty()) user_vc_[s].assign((size_t)c_.NL, {});

@@ -73,6 +73,21 @@ def file_id(path: str, lfs: bool) -> str:
     return h.hexdigest()
 
 
+def cache_stamp(st) -> list:
+    """The fields a hash cache may trust: size, mtime, inode, ctime.
+
+    ctime is the field nothing can set back: a write in place keeps the inode and `os.utime` puts size and
+    mtime back, but every write bumps `st_ctime_ns`. **ino is kept as well**, because the two cover different
+    filesystems: on one with a coarse ctime, a write-and-restore inside a single tick keeps ctime, while a
+    REPLACED file never keeps its inode whatever the timestamp granularity.
+
+    A function rather than a list literal in `get()` because both fields are load-bearing and the filesystem
+    arms alone cannot isolate the inode -- a replacement bumps ctime too, so deleting `st_ino` left every arm
+    green (measured, review of engine#2631). The synthetic-stats arm in the test separates them.
+    """
+    return [st.st_size, st.st_mtime_ns, st.st_ino, st.st_ctime_ns]
+
+
 class Cache:
     """Hash cache keyed by real path; an entry counts only while size, mtime, inode and ctime are what was hashed.
 
@@ -95,7 +110,7 @@ class Cache:
         st = os.stat(real)
         key = f"{real}|{'sha256' if lfs else 'gitblob'}"
         row = self.rows.get(key)
-        stamp = [st.st_size, st.st_mtime_ns, st.st_ino, st.st_ctime_ns]
+        stamp = cache_stamp(st)
         if row and row.get("stat") == stamp:
             return row["id"]
         got = file_id(real, lfs)

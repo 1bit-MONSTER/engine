@@ -236,5 +236,18 @@ with tempfile.TemporaryDirectory() as tmp:
     check(r.returncode == 1 and any(x["state"] == "re-host not pinned" for x in out["rehosts"]),
           "an 'upstream of' naming an unpinned re-host is reported")
 
+# The stamp's fields are each load-bearing, and the filesystem-level arms cannot prove the INODE is: a
+# replaced file bumps ctime as well, so deleting st_ino left every arm green (measured, review of #2631).
+# Two synthetic stat records separate them -- same size, mtime and ctime, different inode.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+import pin_holdings as _ph                                          # noqa: E402
+import types as _types                                              # noqa: E402
+def _fake(size, mtime, ino, ctime):
+    return _types.SimpleNamespace(st_size=size, st_mtime_ns=mtime, st_ino=ino, st_ctime_ns=ctime)
+_base = _ph.cache_stamp(_fake(10, 111, 222, 333))
+check(_base != _ph.cache_stamp(_fake(10, 111, 999, 333)), "a different inode alone changes the stamp")
+check(_base != _ph.cache_stamp(_fake(10, 111, 222, 444)), "a different ctime alone changes the stamp")
+check(_base == _ph.cache_stamp(_fake(10, 111, 222, 333)), "identical fields give an identical stamp")
+
 print("pin_holdings_test: " + ("PASS" if fails == 0 else f"{fails} FAILED"))
 sys.exit(1 if fails else 0)

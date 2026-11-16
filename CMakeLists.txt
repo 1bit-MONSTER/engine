@@ -631,6 +631,13 @@ add_test(NAME bench_arm_watch COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # 32,032-row head at kpad 4,096). It is header-only (`npu/forward/include/pad_head_rows.h`) precisely so it can live HERE:
 # an earlier version linked `onebit_npu_forward`, which exists only under `if(ONEBIT_NPU)`, so CI -- which configures
 # without the NPU runtime -- never built or ran the arm. `add_dependencies(onebit ...)` keeps it in the build CI runs.
+# engine#2689: a model that shares the NPU opens every context at one partition width and keeps decode and prefill in
+# one hardware context. Host-only: the ELF partition-note reader (elf_partition.h) on crafted ELFs, and the sealed
+# prefill instance table (no key may equal a decode key, since one context refuses a duplicate).
+add_executable(npu_partition_test tests/npu_partition_test.cpp npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
+target_include_directories(npu_partition_test PRIVATE npu/forward/include)
+add_dependencies(onebit npu_partition_test)
+add_test(NAME npu_partition COMMAND npu_partition_test)
 add_executable(npu_pad_head_rows_test tests/npu_pad_head_rows_test.cpp)
 target_include_directories(npu_pad_head_rows_test PRIVATE npu/forward/include)
 add_dependencies(onebit npu_pad_head_rows_test)

@@ -194,6 +194,22 @@ def disagreements(rows, pairs, max_gap):
     return out
 
 
+def fmt_attr(epoch, hits, verdict, agree):
+    """One --attributed line. A function so the self-test can execute it: a format error here would pass
+    every analysis assertion and crash on the first real log (engine#2602)."""
+    return "%d\twindow=%s\t%s\t%s" % (epoch, hits, "agree" if agree else "DISAGREE", verdict)
+
+
+def fmt_outlook_row(w, one, amb, nothing, none):
+    """One --outlook row, for the same reason."""
+    return "%5.0fs  %9.1f%%  %8.1f%%  %11.1f%%  %8.1f%%" % (w, one, amb, nothing, none)
+
+
+def fmt_fault(sec, addr, verdict):
+    """One per-fault line, for the same reason."""
+    return "%s\t%s\t%s" % ("-" if sec is None else "%.0f" % sec, addr, verdict)
+
+
 def self_test():
     # One hour of holders, one sample per 100 s, handing over at 300.
     rows = [(0, "111", "gpu-hold cl-a pid 1 t0"), (100, "111", "gpu-hold cl-a pid 1 t0"),
@@ -276,6 +292,17 @@ def self_test():
     text = ("[1234.500000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0007]\n"
             "[1235.000000] unrelated kernel line\n")
     assert faults(text) == [(1234.5, "0x4128000")], faults(text)
+    # EVERY OUTPUT LINE IS EXERCISED. engine#2602 shipped a renderer that crashed on the first real log
+    # because its self-test only asserted the analysis; a tool that cannot print is not a tool that works.
+    assert fmt_attr(105, "111", "ATTRIBUTED: pid 111 x", True).endswith("\tATTRIBUTED: pid 111 x")
+    assert "DISAGREE" in fmt_attr(105, "111", "v", False)
+    # Field ORDER and content, not column widths: a width literal is a brittle assertion that fails on a
+    # cosmetic change and says nothing about a format-string crash, which is the failure worth catching.
+    row = fmt_outlook_row(5, 62.1, 23.1, 14.9, 0.0).split()
+    assert row == ["5s", "62.1%", "23.1%", "14.9%", "0.0%"], row
+    assert fmt_fault(None, "0x1", "v") == "-\t0x1\tv", fmt_fault(None, "0x1", "v")
+    assert fmt_fault(105.4, "0x1", "v") == "105\t0x1\tv", fmt_fault(105.4, "0x1", "v")
+
     print("self-test ok")
 
 
@@ -304,7 +331,7 @@ def main():
         pairs = attributed_rows(open(args.attributed, encoding="utf-8", errors="replace").read())
         ds = disagreements(rows, pairs, args.max_gap)
         for epoch, hits, verdict, agree in ds:
-            print("%d\twindow=%s\t%s\t%s" % (epoch, hits, "agree" if agree else "DISAGREE", verdict))
+            print(fmt_attr(epoch, hits, verdict, agree))
         n = len(ds) or 1
         print("faults: %d; agree %d, disagree %d" % (len(ds), sum(1 for d in ds if d[3]),
                                                       sum(1 for d in ds if not d[3])))
@@ -313,7 +340,7 @@ def main():
         rows = samples(args.samples)
         print("window  one-holder  ambiguous  nothing-held  no-sample")
         for w, one, amb, nothing, none in outlook(rows, args.outlook):
-            print("%5.0fs  %9.1f%%  %8.1f%%  %11.1f%%  %8.1f%%" % (w, one, amb, nothing, none))
+            print(fmt_outlook_row(w, one, amb, nothing, none))
         return 0
 
     boot = args.boot_epoch
@@ -327,7 +354,7 @@ def main():
     res = attribute(rows, boots, args.max_gap)
     for sec, addr, verdict in res:
         when = "-" if sec is None else "%.0f" % sec
-        print("%s\t%s\t%s" % (when, addr, verdict))
+        print(fmt_fault(sec, addr, verdict))
     print(yield_line(res))
     return 0
 

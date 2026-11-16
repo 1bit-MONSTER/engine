@@ -197,7 +197,15 @@ case "${1:-both}" in
     W=$!
     trap 'kill "$W" 2>/dev/null; summary; exit 0' TERM INT
     trap 'kill "$W" 2>/dev/null' EXIT
+    LAST=0
     while :; do
+      # gap record: a stall is data. Measured need: the loop lost 93 s at the peak of a fault storm, and those minutes became
+      # "no holder" attribution records -- silence that looked like a finding. Now the gap is written (and kept) instead.
+      NOW=$(date +%s)
+      if [ "$LAST" -gt 0 ] && [ $((NOW - LAST)) -gt $((SAMPLE_S * 3)) ]; then
+        printf '%s\tGAP\t%s\t-	-	-\n' "$NOW" "$((NOW - LAST))" >> "$SAMP"
+      fi
+      LAST=$NOW
       sample_once
       # refresh the summary every ~15 min (450 samples at 2 s): a reboot kills the unit and SIGTERM never arrives, so a
       # summary written only on exit can be hours stale exactly when it is needed

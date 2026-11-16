@@ -162,7 +162,12 @@ def classify_commit(repo, sha, base_ref):
                 missing_all.append((f, line))
 
     if checked_all == 0:
-        return "UNVERIFIABLE", "(no significant added line to look for -- deletion only)"
+        # NOT "deletion only": a commit whose every added line was filtered out (too short to be
+        # distinctive) lands here too, and the operator sent to look for a deletion would find none.
+        added_n = sum(1 for f in files for ln in git(repo, "diff", f"{sha}^..{sha}", "--", f).stdout.splitlines()
+                      if ln.startswith("+") and not ln.startswith("+++")) if files else 0
+        return "UNVERIFIABLE", (f"(no added line survived the significance filter: {added_n} added, "
+                                f"0 usable -- not necessarily deletion)")
     # A commit can be absent from the base because the base SUPERSEDED it (the branch was rebased or
     # reworked before merging, so its earlier formulation never landed while a later one did). The
     # line counts tell the reader which case they are looking at, and they are already in hand:
@@ -427,6 +432,31 @@ def self_test():
     subprocess.run(["git", "branch", "-q", "tip"], cwd=r, check=True)
     commit(r, "f.txt", "x\ny\n", "two")
     chk(1, len(merge_commits(r, "HEAD", "tip")), "a branch with one extra commit has a tail of 1")
+    d.cleanup()
+
+    # The shape the tool exists for and a normal merge-commit repo never produces: a SQUASH merge rewrites every
+    # sha, so the *whole* branch tail reads as absent by sha (tail = 2 here, not 1), and a push that lands after
+    # the merge is on a branch nothing will merge again. The added line is deliberately realistic -- a one-char
+    # line is filtered by significant_lines() and lands in the UNVERIFIABLE branch instead, which would have made
+    # this arm pass for the wrong reason.
+    d, r = scratch()
+    big = "".join(f"value_{i:02d} = compute({i})\n" for i in range(10))
+    commit(r, "m.py", big.replace("value_09 = compute(9)\n", ""), "base")
+    branch(r, "main")
+    subprocess.run(["git", "checkout", "-q", "-b", "pr"], cwd=r, check=True)
+    squash_sha = commit(r, "m.py", big, "the branch adds all ten")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    subprocess.run(["git", "merge", "-q", "--squash", "pr"], cwd=r, check=True)
+    commit(r, "m.py", big, "squashed: the branch adds all ten")
+    subprocess.run(["git", "checkout", "-q", "pr"], cwd=r, check=True)
+    tail_sha = commit(r, "m.py", big + "late_value = compute(99)\n", "pushed after the squash merge")
+    # 2, not 1, and that is the point: a squash merge rewrites the sha of the commit it landed, so the branch
+    # commit itself reads as absent from main as well. This is exactly why the sha half cannot decide this case
+    # and the content arm must -- which is the arm below.
+    chk(2, len(merge_commits(r, "pr", "main")),
+        "after a squash merge the whole branch tail reads as absent by sha (2: the squashed commit and the push)")
+    chk("LOST", classify_commit(r, tail_sha, "main")[0],
+        "a commit pushed after a squash merge is LOST by content")
     d.cleanup()
 
     # Zero findings must be distinguishable from not having looked: an unreadable PR list is rc 2.

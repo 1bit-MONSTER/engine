@@ -27,7 +27,8 @@ and #370. The hardware gate checks every HRX pin bump, and every PR that asks fo
 - **A labelled PR.** Add the label `hw-gate` to a PR from this repository. Adding the label starts
   the job, and every later push runs it again.
 - **Every PR that bump-hrx opens** (branch `bump-hrx/*`).
-- **By hand.** Actions -> hw-gate -> Run workflow, with a ref (a branch, tag, SHA or `pull/N/head`).
+- **By hand.** Actions -> hw-gate -> Run workflow, with a ref (a branch, tag, `pull/N/head`, or the **full
+  40-character** commit SHA — a short SHA is not a ref, and `actions/checkout` fails before the job starts).
   The run posts the commit status `hw-gate` on the commit it checked, so a PR shows the result.
 
 Both runners this page names - `strixhalo-engine` here and `strixhalo-bench` for the bench jobs - are installed and
@@ -417,6 +418,13 @@ failure of the model. So a gate run from a shallow `third_party/llama.cpp` repor
 line, and `git -C third_party/llama.cpp fetch --unshallow` makes it answerable: the same goldens then read
 `golden is 227 commits behind the tested tree` and judge on their numbers. `diverged` and `AHEAD` stay relations a
 row can be judged on — only a missing relation is INCOMPLETE.
+
+The hw-gate workflow therefore unshallows that one submodule before the gate runs (engine#2713). A person running
+the gate by hand can fetch the history and re-run; a labelled PR's gate cannot, and with the pair checked out at
+`--depth 1` every KLD row was INCOMPLETE, so that check read red on any pin (engine#2692: 840 s in the gate, ops
+3604/3604, kat/needle/placement green, `kld SKIP x5`). The fetch is guarded on `--is-shallow-repository`, so a
+runner that already holds the history does nothing, and it is measured at 27 s and 366 MB on the gate box's own
+clone (41 MB depth-1 `.git` against 407 MB unshallowed).
 Their HRX base logits against a CPU run of the same file (`--device none`) give:
 
 | model | mean KLD | KLD p99 | same top token |

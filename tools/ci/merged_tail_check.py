@@ -36,12 +36,23 @@ Classes reported:
 
   LOST          most of the commit's added lines are not in the base AND no base file is longer:
                 it needs a recovering PR
-  SUPERSEDED    most added lines absent, but every affected base file is LONGER -- a later
-                commit rewrote that region, which is not evidence of a loss
+  SUPERSEDED    most added lines absent, but a later commit REPLACED one of those lines: the base
+                changed THAT line after this PR merged (`git log -S <line> <merge>..<base> -- <file>`),
+                or -- the fallback that stays when no merge commit is in hand -- every affected base
+                file is LONGER. Either way a later commit rewrote that region, which is not evidence
+                of a loss. Scoped to the merge commit rather than to line counts, because a one-line
+                value file (a pin bump) is never "longer" and read as LOST for four different PRs
+                (engine#2586, #2572, #2583, #2554) -- and to the LINE rather than the file, because a
+                commit that touched some other line of the same file would otherwise turn a genuine
+                loss into SUPERSEDED, and report() exits 0 on SUPERSEDED.
   PARTIAL       a few of them are gone because main edited those lines since: not a loss
   IN-BASE       every added line is already there (the content arrived another way): not a loss
   UNVERIFIABLE  the commit adds no significant line (deletion-only): neither of the above, a gap
-  GONE          the branch is deleted, so the tail cannot be examined at all: a gap, never a pass
+  GONE          neither the branch nor `refs/pull/<n>/head` exists: a gap, never a pass. The PR
+                ref is the MERGE-TIME head, so what it shows is the head the PR merged at -- it is a
+                fallback for a deleted branch (the merge loop deletes them), not a way to see a push
+                that landed afterwards, which is why the branch route is tried first. A row examined
+                through that ref says so in its branch column, so a reader can tell which route it was.
 
 Exit 0 no loss and nothing unexamined, 1 a LOST commit, 2 a ref could not be read or something was
 unverifiable -- **a scan that could not look is not a scan that found nothing.**
@@ -114,6 +125,57 @@ def significant_lines(text):
     return out
 
 
+# The identifier a missing line is ABOUT, for the fallback below: the longest identifier-ish run in it,
+# long enough to be distinctive and not a keyword that appears in every file.
+TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{5,}")
+TOKEN_STOP = {"return", "define", "include", "static", "struct", "string", "sizeof", "unsigned",
+              "continue", "function", "default", "template", "typename", "operator"}
+
+
+def distinctive_token(line):
+    """The longest identifier in `line`, or "" when it carries nothing distinctive."""
+    best = ""
+    for tok in TOKEN_RE.findall(line):
+        if tok in TOKEN_STOP or len(tok) < 6:
+            continue
+        if len(tok) > len(best):
+            best = tok
+    return best
+
+
+def moved_since(repo, line, since, base_ref, path, base_text):
+    """How a later commit on the base superseded `line`: "line", "token", or "" for not at all.
+
+    Two questions, weakest evidence last, and BOTH are needed (engine#2693 review follow-up):
+
+      * `git log -S <line>` -- the base carried this exact line and a later commit changed it. This is
+        the pin-bump shape (#2586/#2572: `sha=<old>` replaced by `sha=<new>`), and it is silent when the
+        line never landed at all, because the occurrence count of a string that was never there cannot
+        change.
+      * `git log -S <token>` **only when the base carries that token**: the content landed in other words
+        and a later commit touched it. This is #2504 exactly -- its missing lines are all silent on the
+        exact test, yet a later commit (a20f6ee89, #2508) rewrites `httplib::Server`, which main carries
+        three times. Requiring the token to be present is what stops a dropped feature from being called
+        superseded because some unrelated commit elsewhere in the file happened to mention a shared word,
+        and requiring it to be ABSENT from the file as of the merge commit is what stops a word the file
+        already carried from satisfying -S on a count change (engine#2718 review; #2504 passes because
+        `httplib` is new to its file at the merge).
+    """
+    if git(repo, "log", "--oneline", "-S", line, f"{since}..{base_ref}", "--", path).stdout.strip():
+        return "line"
+    tok = distinctive_token(line)
+    # engine#2718 review: the token is the line's longest identifier, so on a real line it can be a word the
+    # file already used everywhere (`executable` resolved #2504). A token that was ALREADY in the file before
+    # the merge cannot be evidence that this line's content landed -- some unrelated commit that mentions a
+    # shared word satisfies the -S test, and the verdict then reads SUPERSEDED, which exits 0. That is the
+    # silent direction, so the token must be absent from the file as of the merge commit and present after it.
+    if tok and tok in base_text and \
+            not git(repo, "show", f"{since}:{path}").stdout.count(tok) and \
+            git(repo, "log", "--oneline", "-S", tok, f"{since}..{base_ref}", "--", path).stdout.strip():
+        return "token"
+    return ""
+
+
 def same_head(frozen, tip):
     """True when the live tip is the head the PR was merged at.
 
@@ -162,7 +224,7 @@ def merge_commits(repo, ref, base_ref, merged_head=None):
     return [ln.split(" ", 1) for ln in lines]
 
 
-def classify_commit(repo, sha, base_ref):
+def classify_commit(repo, sha, base_ref, after=None):
     """LOST / IN-BASE / UNVERIFIABLE for one commit, with the missing lines named.
 
     # engine#2679 asked for a content test here rather than a line subset, and I measured the two
@@ -194,6 +256,18 @@ def classify_commit(repo, sha, base_ref):
         if not want:
             continue
         checked_all += len(want)
+        # engine#2652 sweep: a SUBMODULE GITLINK is not a blob, so `git show <rev>:<path>` prints nothing for it
+        # and every added line then reads as absent -- that is why #2583 (third_party/llama.cpp: pin to
+        # 148e7f329) and #2554 (third_party/laya: source af8ada06) were the only rows a two-day sweep still
+        # reported after the pin-bump class was fixed. A gitlink's content IS its sha, so compare that:
+        # equal -> the pointer landed (IN-BASE for this file), different -> fall through to the line test, which
+        # will decide LOST/SUPERSEDED for the surrounding text.
+        tree = git(repo, "ls-tree", base_ref, "--", f)
+        fields = tree.stdout.split()
+        if len(fields) >= 3 and fields[0] == "160000":
+            mine = git(repo, "ls-tree", sha, "--", f).stdout.split()
+            if len(mine) >= 3 and mine[2] == fields[2]:
+                continue                      # same submodule commit on both sides: nothing is missing
         show = git(repo, "show", f"{base_ref}:{f}")
         base_text = show.stdout if show.returncode == 0 else ""
         for line in want:
@@ -243,8 +317,47 @@ def classify_commit(repo, sha, base_ref):
                 sizes += f"; {f}: this commit {mine} lines, base size UNREADABLE"
                 continue
             longer = theirs > mine
-            superseded = superseded and longer
-            ctx = "base SUPERSEDED it (base is longer)" if longer else "base is shorter"
+            # engine#2652 sweep: "the base file is LONGER" is a proxy for "a later edit replaced this line", and
+            # it fails for every one-line value file -- a pin bump rewrites the value and leaves the file the
+            # same length (measured: #2586/#2572 config/gpu-kernels.config sha=, #2583/#2554 Subproject commit;
+            # all reported LOST while main had been bumped after the merge). The exact test needs the PR's
+            # MERGE commit as the lower bound: a move before it is this PR's own landing (the squash-tail case,
+            # which must stay LOST), a move after it is a later supersession.
+            #
+            # engine#2693 review: a merge-commit scope on its own is still FILE-granular, so any later PR that
+            # edited one unrelated line of the same file turned a genuine LOST into SUPERSEDED -- and
+            # report() exits 0 on SUPERSEDED, so the tool's most important class went quiet (measured: the
+            # same fixture read LOST on the pre-change version and SUPERSEDED on this one, with the commit
+            # still absent). Ask the exact question instead: did a later commit REPLACE one of THESE lines?
+            # `git log -S` finds the commits that change a string's occurrence count, which is what "a pin
+            # bump rewrote the value" is; a commit that touched only another line is not that.
+            since = after or sha
+            # engine#2693 review follow-up (cl-infra): this test used to run only when the base file was NOT
+            # longer ("a longer base file already answers it"), and that is the one case it does not answer.
+            # A longer file only says the base GREW: a feature dropped by the merge plus twenty unrelated
+            # lines added afterwards still read SUPERSEDED, and report() exits 0 on SUPERSEDED, so the class
+            # went quiet exactly as before (measured: a 3-line function dropped by the merge, 20 unrelated
+            # lines added later, 3 of 3 added lines absent -> SUPERSEDED, detail "base is longer"). Ask the
+            # question on every file when there is a merge commit to scope it with; moved_since() also asks
+            # the weaker token question, so #2504 stays SUPERSEDED for a reason rather than by file length.
+            moved, how = "", ""
+            if after is not None:
+                for path, line in missing_all:
+                    if path != f:
+                        continue
+                    moved = moved_since(repo, line, since, base_ref, f, base_text)
+                    if moved:
+                        how = line if moved == "line" else distinctive_token(line)
+                        break
+            superseded = superseded and (bool(moved) if after is not None else longer)
+            if moved == "line":
+                ctx = "the line was replaced on the base after this PR merged"
+            elif moved == "token":
+                ctx = f"the base carries `{how}`, which a later commit changed, so the content landed in other words"
+            elif longer:
+                ctx = "base is longer, but no later commit replaced these lines"
+            else:
+                ctx = "base is shorter"
             sizes += f"; {f}: this commit {mine} lines, base {theirs} lines ({ctx})"
         # A later commit that rewrote every affected file leaves the added lines absent for the
         # wrong reason. Measured 2026-11-16 on #2504: 15 of 18 lines "absent", base file longer,
@@ -285,7 +398,7 @@ def scan(repo, days, limit, base_url=None, prs=None):
         r = gh("pr", "list", "-R", base_url, "--state", "merged", "--limit", str(limit),
                "--search", f"merged:>={since}",
                "--json", "number,title,headRefName,baseRefName,headRepositoryOwner,headRepository,"
-                         "headRefOid")
+                         "headRefOid,mergeCommit")
         # `gh` exits 0 and prints the failure on stdout when the repo does not resolve
         # ("GraphQL: Could not resolve to a Repository with the name ..."), so the exit code cannot
         # tell a real list from an error message. The parsed shape is the only evidence.
@@ -328,8 +441,18 @@ def scan(repo, days, limit, base_url=None, prs=None):
             rows.append(("GAP", pr, branch, None, f"could not read {url}"))
             continue
         if not ls.stdout.strip():
-            rows.append(("GONE", pr, branch, None, "the branch is deleted: the tail cannot be examined"))
-            continue
+            # engine#2652 sweep: 196 of 200 PRs merged in two days reported GONE because the merge loop deletes
+            # its branches, so this tool was blind on 98 % of the population. GitHub keeps the PR head reachable
+            # at refs/pull/<n>/head after the branch is gone -- that ref is how #2679 was settled -- so use it
+            # before giving up, and say which route was used so a reader knows what was examined.
+            pull = f"refs/pull/{pr['number']}/head"
+            lsp = git(repo, "ls-remote", url, pull)
+            if lsp.returncode == 0 and lsp.stdout.strip():
+                branch = pull
+            else:
+                rows.append(("GONE", pr, branch, None,
+                             "the branch is deleted and refs/pull/<n>/head is absent: the tail cannot be examined"))
+                continue
 
         # Cheap gate before any fetch. `headRefOid` is frozen at merge time -- measured on #2623,
         # where it is 0193a29e5, a commit that is NOT an ancestor of main while the branch tip is
@@ -363,7 +486,8 @@ def scan(repo, days, limit, base_url=None, prs=None):
         if not tail:
             continue  # the branch tip is exactly what merged: the normal case
         for sha, subject in tail:
-            kind, detail = classify_commit(repo, sha, base_ref)
+            kind, detail = classify_commit(repo, sha, base_ref,
+                                           after=(pr.get("mergeCommit") or {}).get("oid"))
             rows.append((kind, pr, branch, (sha, subject), detail))
         git(repo, "update-ref", "-d", ref)
     return rows
@@ -440,7 +564,52 @@ def self_test():
     branch(r, "main", "pr~1")
     chk("LOST", classify_commit(r, lost_sha, "main")[0],
         "a commit pushed after the merge is LOST")
+
     chk(1, len(merge_commits(r, "pr", "main")), "the branch has a tail of exactly one")
+    d.cleanup()
+
+    # The `after=` path had no arm at any head: a pin bump whose one line the base replaced is
+    # SUPERSEDED when the base touched that file AFTER the merge, and LOST without it. Same tree,
+    # both answers, so the arm is load-bearing rather than decorative.
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    branch(r, "pr")
+    pin = commit(r, "pins.config", "sha=53c0ffee00\n", "the pin this branch landed")
+    branch(r, "main", "pr~1")
+    merged_at = commit(r, "other.txt", "unrelated\n", "the merge point: main goes no further here")
+    chk("LOST", classify_commit(r, pin, "main")[0],
+        "a one-line pin bump the base never touched is LOST")
+    chk("LOST", classify_commit(r, pin, "main", after=merged_at)[0],
+        "and it stays LOST with after= while the base never carried that line: a commit that only "
+        "wrote a different value into the same file is not a supersession, and SUPERSEDED exits 0")
+    commit(r, "pins.config", "sha=53c0ffee00\n", "the same pin lands on the base by another route")
+    commit(r, "pins.config", "sha=60b8eef000\n", "a later bump replaces that line")
+    chk("SUPERSEDED", classify_commit(r, pin, "main", after=merged_at)[0],
+        "the same commit is SUPERSEDED once a later commit replaced the line itself")
+    chk("LOST", classify_commit(r, pin, "main")[0],
+        "and without after= it is LOST again: the exit-0 path is what after= selects")
+    d.cleanup()
+
+    # The per-LINE path (`git log -S <line> <merge>..<base>`) had no arm, because the shape it fires on
+    # is narrow and nobody had a fixture for it. It needs all three of these at once:
+    #   the commit ADDS the line (or it is not in `missing_all` at all),
+    #   the line LANDED via the squash (so it is in the base at the merge, which is what puts a commit
+    #   in the merge..base range that changes its occurrence count), and
+    #   a later commit REMOVED it, while a different line the same commit added never landed.
+    # Written down because two earlier attempts failed on the first condition and one on the second.
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    branch(r, "pr")
+    rep = commit(r, "tool.py", "def landed():\n    return 7\n\n\ndef lost():\n"
+                               "    return 9\n", "adds two lines: one lands, one never does")
+    branch(r, "main", "pr~1")
+    merged_at = commit(r, "tool.py", "def landed():\n    return 7\n",
+                       "the squash: only the first line landed")
+    commit(r, "tool.py", "\n", "after the merge, the base drops the line it had landed")
+    kind, why = classify_commit(r, rep, "main", after=merged_at)
+    chk("SUPERSEDED", kind, "a landed-then-dropped line is SUPERSEDED, not LOST")
+    chk(True, "replaced on the base after this PR merged" in why,
+        "and the reason names the per-line path rather than the length fallback")
     d.cleanup()
 
     # The same content, already on the base by another commit: not a loss.
@@ -584,6 +753,112 @@ def self_test():
         "after a squash merge the whole branch tail reads as absent by sha (2: the squashed commit and the push)")
     chk("LOST", classify_commit(r, tail_sha, "main")[0],
         "a commit pushed after a squash merge is LOST by content")
+    d.cleanup()
+
+    # engine#2693 review: the `after` form is what the live scan always uses, and it had no arm at all --
+    # every call above is the two-argument form, so the exit-0 path below was only ever exercised against
+    # the real repo. A LOST commit whose file was ALSO edited elsewhere on the base after the merge: the
+    # file-level test called that a supersession and report() exits 0 on it. Measured 2026-11-16 on the
+    # same fixture: LOST on the version before the merge-commit scope, SUPERSEDED on the one with it.
+    d, r = scratch()
+    commit(r, "tool.py", "def kept():\n    return 1\n", "base")
+    branch(r, "pr")
+    commit(r, "tool.py", "def kept():\n    return 1\n\n\ndef merged():\n    return 2\n",
+           "the head the merge landed")
+    branch(r, "main")                       # a squash merge: same content, new sha
+    merge = git(r, "rev-parse", "HEAD").stdout.strip()
+    branch(r, "pr")
+    late_sha = commit(r, "tool.py", "def kept():\n    return 1\n\n\ndef merged():\n    return 2\n"
+                                  "\n\ndef WEAK_AFTER_S():\n    return 3\n", "pushed after the merge")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    commit(r, "tool.py", "def kept():\n    return 7\n\n\ndef merged():\n    return 2\n",
+           "an unrelated PR edits kept() on main after the merge")
+    chk("LOST", classify_commit(r, late_sha, "main", after=merge)[0],
+        "a LOST commit whose file was edited elsewhere after the merge stays LOST with after=")
+    d.cleanup()
+
+    # engine#2693 review follow-up (cl-infra): the per-line test ran only when the base file was NOT longer,
+    # so "the base is longer" was still a proxy verdict -- and a file growing is the common case. A feature
+    # dropped by the merge plus an unrelated commit that ADDS lines to the same file read SUPERSEDED, and
+    # report() exits 0 on that, which is the silence this tool exists to prevent. Measured before the fix:
+    # 3 of 3 added lines absent, detail "base is longer" -> SUPERSEDED.
+    d, r = scratch()
+    commit(r, "tool.py", "def kept():\n    return 1\n", "base")
+    branch(r, "pr")
+    commit(r, "tool.py", "def kept():\n    return 1\n\n\ndef unrelated():\n    return 0\n",
+           "the head the merge landed")
+    branch(r, "main")                       # a squash merge: same content, new sha
+    merge = git(r, "rev-parse", "HEAD").stdout.strip()
+    branch(r, "pr")
+    dropped_sha = commit(r, "tool.py", "def kept():\n    return 1\n\n\ndef unrelated():\n    return 0\n"
+                                    "\n\ndef recover_route_lock(rows):\n    total = sum(rows)\n"
+                                    "    return total / max(len(rows), 1)\n", "pushed after the merge")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    commit(r, "tool.py", "def kept():\n    return 1\n\n\ndef unrelated():\n    return 0\n"
+                         + "".join(f"UNRELATED_{i} = {i}\n" for i in range(20)),
+           "an unrelated commit GROWS the same file after the merge")
+    chk("LOST", classify_commit(r, dropped_sha, "main", after=merge)[0],
+        "a LOST commit stays LOST when an unrelated commit only GROWS the same base file")
+    d.cleanup()
+
+    # ...and the case that must stay SUPERSEDED, so the arm above cannot be satisfied by calling everything
+    # LOST: the base carries the content in OTHER WORDS and a later commit changed it (#2504's shape, measured
+    # there as `-S <line>` silent while `-S httplib::Server` finds a20f6ee89 and main carries it three times).
+    # The token test requires the token to be ON the base, which is what keeps a dropped feature from being
+    # called superseded by an unrelated commit that happens to mention a shared word.
+    d, r = scratch()
+    commit(r, "tool.py", "def kept():\n    return 1\n", "base")
+    branch(r, "pr")
+    commit(r, "tool.py", "def kept():\n    return 1\n\n\ndef unrelated():\n    return 0\n",
+           "the head the merge landed")
+    branch(r, "main")                       # the squash merge, in other words: the feature is NOT here
+    merge = git(r, "rev-parse", "HEAD").stdout.strip()
+    branch(r, "pr")
+    rewritten_sha = commit(r, "tool.py", "def kept():\n    return 1\n\n\ndef unrelated():\n    return 0\n"
+                                      "\n\ndef recover_route_lock(rows):\n    total = sum(rows)\n"
+                                      "    return total / max(len(rows), 1)\n", "pushed after the merge")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    commit(r, "tool.py", "def kept():\n    return 1\n\n\ndef unrelated():\n    return 0\n\n"
+                         "# recover_route_lock lives in the C++ guard test now (#2508)\n",
+           "a later commit carries the same content by name, in other words")
+    chk("SUPERSEDED", classify_commit(r, rewritten_sha, "main", after=merge)[0],
+        "a base that carries the missing line's own token, changed later, is SUPERSEDED (#2504's shape)")
+
+    # engine#2718 review: the token test is evidence only when the token is NEW to the file. `-S <token>` fires
+    # whenever the token's OCCURRENCE COUNT changes, so a word the file already carried answers "yes, a later
+    # commit changed it" for a line that was never there -- and SUPERSEDED exits 0, so the cost is silence. The
+    # old word has to appear twice before the merge, because that is the only way a later commit can make its
+    # count DROP (measured both directions on this fixture: with the guard the dropped feature is LOST, without
+    # it SUPERSEDED). #2504 is unaffected and must stay SUPERSEDED: `httplib` is absent from its file at the
+    # merge commit (fafcf593b) and present three times on main, so that token really is new.
+    d, r = scratch()
+    commit(r, "cfg.py", "session_capacity = 8\nsession_capacity_max = 64\n",
+           "the file already carries the old word TWICE, so its count can drop later")
+    branch(r, "pr")
+    dropped = commit(r, "cfg.py",
+                     "session_capacity = 8\nsession_capacity_max = 64\n"
+                     + "".join(f"def slot_{i}():\n    return session_capacity * {i + 2}\n\n"
+                               for i in range(3)),
+                     "three dropped functions that name only the pre-existing word")
+    branch(r, "main", "pr~1")     # the merge point WITHOUT the feature, as in the #2504 arm above
+    merge5 = git(r, "rev-parse", "HEAD").stdout.strip()
+    commit(r, "cfg.py", "session_capacity_max = 64\n",
+           "a later commit removes one use of the old word, so -S finds a count change inside the range")
+    chk("LOST", classify_commit(r, dropped, "main", after=merge5)[0],
+        "a token the file already carried before the merge cannot make a dropped line SUPERSEDED")
+    d.cleanup()
+
+    # The gitlink route (#2583/#2554): a submodule pointer prints nothing from `git show <rev>:<path>`, so
+    # every added `Subproject commit ...` line read as absent. The same pointer on both sides is IN-BASE,
+    # and without this arm that half is the one part of the change no test reaches.
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    subprocess.run(["git", "update-index", "--add", "--cacheinfo",
+                    "160000," + "1" * 40 + ",third_party/pinned"], cwd=r, check=True)
+    subprocess.run(["git", "commit", "-qm", "the branch pins the submodule"], cwd=r, check=True)
+    pin = git(r, "rev-parse", "HEAD").stdout.strip()
+    chk("IN-BASE", classify_commit(r, pin, "main")[0],
+        "a submodule pointer already at the same sha is IN-BASE, not LOST")
     d.cleanup()
 
     # Zero findings must be distinguishable from not having looked: an unreadable PR list is rc 2.

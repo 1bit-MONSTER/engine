@@ -108,9 +108,14 @@ jobs:
           # at 40 lines, and engine#2677 was filed with 21 `? UNVERIFIABLE` and 19 answered
           # `. NPU FLM` rows filling all 40, so its only two alerts (`!! SUPPORT MOVED`) never
           # reached the issue body.
+          # Three tiers, not two (engine#2696 review): `!!` alert rows, then the watcher's own `->` conclusions, then
+          # the per-row stream that can be long by nature. Two tiers put the conclusions in the last bucket, so on a day
+          # whose 40 matched rows are all `?`/`.` rows the Q4NX gap conclusion never reached the issue -- the same
+          # "issue looks empty" failure `#2677` was filed about, and a Q4NX gap's `->` line is its ONLY output.
           pat="UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|NPU FLM|SUPPORT MOVED|kernel-format|Q4NX \(NPU\)|support_pins"
           lines=$({ grep -E "$pat" /tmp/census-watch.log | grep -F '!!'
-                    grep -E "$pat" /tmp/census-watch.log | grep -vF '!!'; } | tr -d '`@' | head -n 40 | base64 -w0)
+                    grep -F -- '  -> ' /tmp/census-watch.log
+                    grep -E "$pat" /tmp/census-watch.log | grep -vF '!!' | grep -vF -- '  -> '; } | tr -d '`@' | head -n 40 | base64 -w0)
           echo "lines=$lines" >> "$GITHUB_OUTPUT"
           # Three outcomes, and the run colour has to mean something (the watcher's contract:
           # 0 quiet, 1 the alert, 2 the watch did not run).

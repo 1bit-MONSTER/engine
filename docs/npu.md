@@ -805,6 +805,24 @@ same process. Two settings make a model fit that rule:
 A model set up this way uses `NPU_I8_SEALED_ELF` (decode) and `NPU_I8_SEALED_PREFILL_ELF` (prefill), both
 built at the same width, e.g. with npu-kernels `sealed/build.sh … -c 4 --partition 4`.
 
+**Several users in one decode pass (#2689 item 3).** A decode step is M rows of the M=16 design, and one user fills
+one of them: the step costs the same from 1 to 16 rows (measured 11-16: Llama-3.2-1B about 146 ms, Qwen3-1.7B about
+214 ms, exact at every N), so 16 users of one model cost about what one does. `Q4nxNpuForward::step_users(tokens,
+pos, slot, logits)` is that step: one batched pass, one entry per row, rows of one slot contiguous and the slots
+ascending, and each row's logits identical to that sequence's own single-sequence run. Each slot keeps its own KV
+cache (`load_user_slot()` swaps it into the working pair), so a slot continues from the positions it is given and the
+model's own single-sequence cache is untouched between calls. A slot whose first row is **position 0** starts a new
+sequence, so its cache is cleared first -- position 0 means there what it means everywhere else in the engine, and a
+re-used slot never answers from the previous conversation's K/V.
+- A model whose state is more than KV is **refused by name**: GDN linear attention and MLA keep a recurrence or an
+  absorption state per sequence, and a noncausal pack encodes one prompt per pass. A model that falls back to
+  per-token `step()` has no batched body to share and is refused for that reason.
+- The kernel side is unchanged: the projections were already one launch per M rows, and `rows_context` already takes
+  the read length and window start per row.
+- `tests/step_users_test.cpp` (`ctest step_users`) is the gate: three sequences of different lengths, one separate
+  forward instance each as the reference, and every row of every pass must match its own sequence's logits bit for
+  bit. It is host-GEMM and device-free (`ONEBIT_TEST_Q4NX=<container>`), so it runs where no NPU does.
+
 #### The t2s family is M=16 today, and that is what caps prefill (#1416)
 
 Measured, not inferred: a t2s container's kernel set contains **only `*_t2s2_m16.elf`** for 8 of the nine decode roles, and the engine reports the
@@ -1876,6 +1894,27 @@ the table, and only when it equals sqrt(hidden); any other value is refused by n
 payload (64 B or less) is now copied when the graph is parsed, because the graph's mapping is gone by the time the
 reader looks. Inline tables larger than that still point into the unmapped file (engine#2668); the packs measured so far keep
 their tables in external data.
+
+**Its decoder blobs are packed at the compiled kernel's shape (engine#2686).** Each `MatMulNBitsBf` states its logical
+`K`/`N` and its stored `real_K`/`real_N`, and the packed blob is laid out at the stored shape. On layer 0, every one of
+the seven blobs equals stored N/64 tiles x (2 x stored K/128 + 2) x 2,176 B, to the byte:
+
+| weight | logical K x N | stored | blob |
+|---|---|---|---|
+| q_proj | 2560 x 2048 | 2560 x 2560 | 3,655,680 B |
+| k/v_proj | 2560 x 1024 | same | 1,462,272 B |
+| o_proj | 2048 x 2560 | same | 2,959,360 B |
+| gate/up_proj | 2560 x 10240 | 2560 x 14336 | 20,471,808 B |
+| down_proj | 10240 x 2560 | 11008 x 4096 | 24,231,936 B |
+
+The padding is at the end. In `gate_proj`, tiles 0..159 carry data and tiles 160..223 are all zero bytes (read from the
+published file). The reader decodes at the stored shape and crops to the logical one, and refuses the weight by name
+when any padded row or K block has a non-zero scale. The declaration is per tensor: each node's `real_K`/`real_N` applies to its own blob
+only, so a pack that mixes padded and unpadded tensors reads each at its own stored shape. A node that states no
+`real_*`, or states its logical shape, decodes exactly as before. The same pack's decoder head is a plain `com.microsoft:MatMulNBits`, not a packed tile:
+`qweight` [262208, 80, 16] (block 32), with f16 `scales` and `qzeros`. The external-data writer reads a node of that
+shape, a 3-D `qweight` with real scales, through `decode_matmulnbits()`, and the gemma head takes the sqrt(hidden)
+prescale its pre-scaled embedding needs, as the `.fconst` route's head does.
 
 With `config.json` empty, the model's numbers come from the pack itself:
 - **rms_norm_eps** from the graph's RMSNorm nodes (18 nodes state 1e-5). The default was 1e-6. When the nodes state different epsilons nothing is taken, and the import prints a WARNING naming the conflict and the value it keeps (`graph_eps_decision()`).
@@ -3643,6 +3682,20 @@ used to send operators looking at the device, the ELF or the container. `ONEBIT_
 bounds the wait (unset = unlimited, still the default, because ordinary contention is what the wait is
 for); on timeout it fails with the holder named rather than spending a device ticket. Nothing here
 reaps or signals the holder -- killing another lane's live serve is the box-crashing path.
+
+**The client that never took the lock (#2689).** `flock(2)` only names clients that took the lock, so a
+co-tenant that does not -- FastFlowLM, another build, a hand-run ELF runner -- was invisible and the note
+could only say "another client is using the array". The device fds are not invisible: `/proc/<pid>/fd/<n>`
+links to the node it was opened through, so one scan of `/proc` names every process holding something under
+`/dev/accel`, whatever protocol it follows:
+
+    [npu] no client holds the device lock, but pid 2230435 (flm serve ...) hold(s) the NPU device open:
+    'No such device' here is another client owning the array, not a dead device/ELF (wait for it, or stop it if it is yours)
+
+It is the same rendering as the lock line (`pid <n> (<cmdline>)`), it leaves out the process that is
+failing, and `tests/npu_device_lock_test.cpp` proves it against both a fake `/proc` and a live forked
+holder. A device opened through a *different* name for the same node (a bind mount,
+`/proc/<pid>/root/dev/accel/accel0`) is not named: the scan compares the link target as a path prefix.
 
 **The row this exists for.** On Linux the two engines are two instances of this runtime on two
 *different* models at the same time -- "all NPU models at once" -- and that is what

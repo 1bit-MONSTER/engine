@@ -146,6 +146,10 @@ struct OnnxTensor {
 struct OnnxMatMul {
     std::string data, weight, scales, zeros;
     int64_t K = 0, N = 0;
+    // engine#2686: `MatMulNBitsBf`'s stored shape when the packed blob is padded to the compiled kernel's (Gemma-3-4b-it-mm
+    // 1.7: gate_proj K 2560 N 10240 is stored real_N 14336; down_proj K 10240 N 2560 is stored real_K 11008, real_N 4096).
+    // 0 when the node does not say.
+    int64_t real_K = 0, real_N = 0;
     int bits = 0, block = 0;
     // Which `If` branch declared it, as the AttributeProto's name (`then_branch` / `else_branch`), or empty in the
     // top-level graph. An OGA pack splits prefill from decode with `If (Shape(input_ids) == 1)`: Qwen3-8B declares ONE
@@ -287,6 +291,8 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m, const std::string& bra
             if (attrs.count("N")) mm.N = attrs["N"];
             if (attrs.count("bits")) mm.bits = int(attrs["bits"]);
             if (attrs.count("block_size")) mm.block = int(attrs["block_size"]);
+            if (attrs.count("real_K")) mm.real_K = attrs["real_K"];
+            if (attrs.count("real_N")) mm.real_N = attrs["real_N"];
             mm.branch = branch;
             if (!mm.weight.empty()) m.matmuls.push_back(std::move(mm));
         }
@@ -2863,6 +2869,50 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
                 }
             }
         }
+    }
+    return q;
+}
+
+// engine#2686: a blob packed at its stored shape (real_N x real_K >= N x K, padding at the END of N and of K -- measured
+// on Gemma-3-4b-it-mm 1.7's gate_proj: tiles 0..159 carry data, 160..223 are all zero) is decoded at that shape and
+// cropped to the logical N x K. Every padded row and every padded K block must decode to scale 0, or the weight is refused:
+// a non-zero there means the padding is not where this assumes, and cropping would drop real weights.
+Q4 decode_external_tile_padded(const uint8_t* data, size_t bytes, int N, int K, int64_t real_N, int64_t real_K,
+                               std::string& err) {
+    const int64_t RN = real_N > 0 ? real_N : N, RK = real_K > 0 ? real_K : K;
+    if (RN == N && RK == K) return decode_external_tile(data, bytes, N, K, err);
+    if (RN < N || RK < K || RN > INT32_MAX || RK > INT32_MAX) {
+        err = "external tile: stored shape " + std::to_string(RN) + " x " + std::to_string(RK) +
+              " is smaller than the logical " + std::to_string(N) + " x " + std::to_string(K);
+        return Q4{};
+    }
+    const Q4 full = decode_external_tile(data, bytes, int(RN), int(RK), err);
+    if (!err.empty()) {
+        // #2690 review: name both shapes, so a size mismatch reads as a diagnosis -- which shape was expected and why
+        err += "; the node states it is stored at real_N x real_K = " + std::to_string(RN) + " x " + std::to_string(RK) +
+               " for the logical " + std::to_string(N) + " x " + std::to_string(K) + " (engine#2686)";
+        return Q4{};
+    }
+    const int64_t gF = RK / 32, gL = K / 32;
+    for (int64_t row = 0; row < RN; ++row)
+        for (int64_t g = (row < N ? gL : 0); g < gF; ++g)
+            if (full.scale[size_t(row * gF + g)] != 0.0f) {
+                err = "external tile: the padding past the logical " + std::to_string(N) + " x " + std::to_string(K) +
+                      " (stored " + std::to_string(RN) + " x " + std::to_string(RK) + ") is not zero at row " +
+                      std::to_string(row) + ", K group " + std::to_string(g) + " (engine#2686)";
+                return Q4{};
+            }
+    Q4 q;
+    q.N = N;
+    q.K = K;
+    q.block = full.block;
+    q.codes.resize(size_t(N) * K);
+    q.scale.resize(size_t(N) * gL);
+    q.zero.resize(size_t(N) * gL);
+    for (int64_t row = 0; row < N; ++row) {
+        std::copy_n(full.codes.begin() + row * RK, K, q.codes.begin() + row * K);
+        std::copy_n(full.scale.begin() + row * gF, gL, q.scale.begin() + row * gL);
+        std::copy_n(full.zero.begin() + row * gF, gL, q.zero.begin() + row * gL);
     }
     return q;
 }
@@ -5670,7 +5720,45 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
         if (!mul_ok(uint64_t(wt.length ? wt.length : wt.raw_len), 1, need) || need == 0)
             throw std::runtime_error(mm.weight + ": no external length recorded");
         std::string derr;
-        const Q4 pack = decode_external_tile(bytes_of(wt, need), size_t(need), int(mm.N), int(mm.K), derr);
+        Q4 pack;
+        // engine#2686: a plain com.microsoft MatMulNBits in this genre -- Gemma-3-4b-it-mm 1.7's decoder head: qweight
+        // [262208, 80, 16] (K/block x block/2 per row, block 32) with real f16 scales and qzeros -- is the standard ONNX
+        // layout, not the packed tile. It is decoded as such; the head then takes the gemma sqrt(H) prescale the
+        // embedding already carries (as import_pack's head path does).
+        const auto si = mm.scales.empty() ? onnx.index.end() : onnx.index.find(mm.scales);
+        const bool standard = wt.dims.size() == 3 && si != onnx.index.end() && !onnx.tensors[si->second].dims.empty() &&
+                              onnx.tensors[si->second].dims[0] > 0;
+        if (standard) {
+            if (mm.bits != 4 || mm.block <= 0 || mm.K % mm.block || mm.K % 32)
+                throw std::runtime_error(mm.weight + ": MatMulNBits geometry this reader does not take (bits " +
+                                         std::to_string(mm.bits) + ", block " + std::to_string(mm.block) + ")");
+            const uint64_t groups = uint64_t(mm.N) * uint64_t(mm.K / mm.block);
+            const OnnxTensor& st = onnx.tensors[si->second];
+            std::vector<float> sc(static_cast<size_t>(groups), 0.0f);
+            if (st.type == kF32) {
+                std::memcpy(sc.data(), bytes_of(st, groups * 4), size_t(groups) * 4);
+            } else if (st.type == kF16 || st.type == kBF16) {
+                const auto* d = reinterpret_cast<const uint16_t*>(bytes_of(st, groups * 2));
+                for (uint64_t i = 0; i < groups; ++i) sc[size_t(i)] = st.type == kF16 ? f16_to_f32(d[i]) : bf16_to_f32(d[i]);
+            } else {
+                throw std::runtime_error(mm.scales + ": scales of dtype " + std::to_string(st.type) + " are not read here");
+            }
+            const uint8_t* zp = nullptr;
+            if (!mm.zeros.empty())
+                if (const auto zi = onnx.index.find(mm.zeros); zi != onnx.index.end() && !onnx.tensors[zi->second].dims.empty())
+                    zp = bytes_of(onnx.tensors[zi->second], uint64_t(mm.N) * uint64_t((mm.K / mm.block + 1) / 2));
+            pack = decode_matmulnbits(bytes_of(wt, groups * uint64_t(mm.block / 2)), sc.data(), zp, int(mm.N), int(mm.K),
+                                      mm.block);
+            if (!zp) implicit_zp_zero(pack, zp_bits_for_spelling(mm.weight, mm.bits));
+            if (std::strcmp(role, "HEAD") == 0 && pack.K == int(p.dims.hidden) &&
+                gemma_prescale_head(pack, p.dims.model_type, p.dims.hidden))
+                std::fprintf(stderr, "note: %s is a standard MatMulNBits (block %d), read as such and prescaled by "
+                                     "sqrt(%lld) for the gemma head (engine#2686)\n",
+                             mm.weight.c_str(), mm.block, (long long)p.dims.hidden);
+        } else {
+            pack = decode_external_tile_padded(bytes_of(wt, need), size_t(need), int(mm.N), int(mm.K), mm.real_N,
+                                               mm.real_K, derr);
+        }
         if (!derr.empty()) throw std::runtime_error(mm.weight + ": " + derr);
         const Q4 conv = container_from_external_q4(pack);
         std::vector<ContainerTensor> outs;

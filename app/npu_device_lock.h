@@ -53,6 +53,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdexcept>
 #include <string>
@@ -255,6 +256,73 @@ inline std::string npu_lock_holders_text(const char* path = kNpuDeviceLock) {
     return out;
 }
 
+// engine#2689 item 2: WHO ELSE HAS THE DEVICE OPEN. The lock above only sees clients that took it; a co-tenant that does
+// not (a FastFlowLM serve, another build, a hand-run ELF runner) is invisible to /proc/locks, so its refusal note can only
+// say "another client". The device fds are not invisible: /proc/<pid>/fd/<n> links to the node it was opened through, so
+// one scan names every process holding it, whatever lock protocol it follows.
+//
+// The link target is compared by PREFIX: "/dev/accel" names accel0..accel15 and anything below that directory, which is
+// what "who has the NPU" means on a box with more than one node. A target the kernel has marked " (deleted)" still
+// matches on the prefix, so the suffix needs no special case.
+// shortcut: a device opened through another name for the same node (a bind mount, /proc/<pid>/root/dev/accel/accel0) is
+// not named by the prefix test; upgrade if such an alias ever shows up on the box.
+inline bool npu_fd_target_is(const std::string& target, const std::string& dev_prefix) {
+    if (dev_prefix.empty()) return false;
+    if (target.size() < dev_prefix.size() || target.compare(0, dev_prefix.size(), dev_prefix) != 0) return false;
+    // "/dev/accel" names the directory itself or something below it, never "/dev/accelx".
+    return target.size() == dev_prefix.size() || target[dev_prefix.size()] == '/' || dev_prefix.back() == '/';
+}
+
+// The pids under `proc_root` (a real /proc, or a fixture holding <pid>/fd/<n> symlinks) that have something under
+// `dev_prefix` open, ascending. `self_pid` is left out: naming the process that has just failed is the engine#2434 bug,
+// not a diagnostic.
+inline std::vector<long> npu_device_users_in(const std::string& proc_root, const std::string& dev_prefix,
+                                            long self_pid = -1) {
+    std::vector<long> pids;
+    if (proc_root.empty() || dev_prefix.empty()) return pids;
+    DIR* d = ::opendir(proc_root.c_str());
+    if (d == nullptr) return pids;
+    while (const dirent* e = ::readdir(d)) {
+        long pid = 0;
+        if (!npu_parse_pid(e->d_name, &pid) || pid == self_pid) continue;
+        const std::string fddir = proc_root + "/" + e->d_name + "/fd";
+        DIR* f = ::opendir(fddir.c_str());
+        if (f == nullptr) continue;   // a kernel thread, or a pid that went away mid-scan
+        bool holds = false;
+        while (const dirent* fe = ::readdir(f)) {
+            if (fe->d_name[0] == '.') continue;
+            const std::string link = fddir + "/" + fe->d_name;
+            char buf[4096];
+            const ssize_t n = ::readlink(link.c_str(), buf, sizeof buf - 1);
+            if (n <= 0) continue;
+            if (npu_fd_target_is(std::string(buf, size_t(n)), dev_prefix)) {
+                holds = true;
+                break;
+            }
+        }
+        ::closedir(f);
+        if (holds) pids.push_back(pid);
+    }
+    ::closedir(d);
+    std::sort(pids.begin(), pids.end());
+    return pids;
+}
+
+// "pid 2230435 (flm serve ...), pid 2691230 (1bit serve ...)" for every process holding the device open, "" when nobody
+// does. The same rendering as npu_lock_holders_text, from the fd scan instead of the lock.
+inline std::string npu_device_users_text(const std::string& dev_prefix = "/dev/accel",
+                                        const std::string& proc_root = "/proc") {
+    const std::vector<long> pids = npu_device_users_in(proc_root, dev_prefix, static_cast<long>(::getpid()));
+    std::string out;
+    for (size_t i = 0; i < pids.size(); ++i) {
+        if (i) out += ", ";
+        out += "pid " + std::to_string(pids[i]);
+        const std::string cmd = npu_holder_cmdline(pids[i]);
+        if (!cmd.empty()) out += " (" + cmd + ")";
+    }
+    return out;
+}
+
 // The one line engine#1241 asks for, or "" when nobody holds `path`. `held_s >= 0` adds "for N s", the
 // time this process has spent waiting: a lower bound on the hold, because the holder had it before we
 // started waiting.
@@ -281,7 +349,8 @@ inline bool npu_holder_item_is_self(const std::string& item, long self_pid) {
     return next == ' ' || next == '(';                    // the pid ENDS here: 1234 is not 12345
 }
 
-inline std::string npu_lock_refusal_note(const char* path = kNpuDeviceLock) {
+inline std::string npu_lock_refusal_note(const char* path = kNpuDeviceLock,
+                                        const std::string& dev_prefix = "/dev/accel") {
     // engine#2434: SELF IS NOT THE ANSWER. A serve takes this lock BEFORE it opens a device context, so when its own
     // init_elf is refused, /proc/locks reports the only holder - itself - and this note named the process that had just
     // failed and told the operator to wait for, or stop, it. Measured with a FastFlowLM co-tenant that does not take our
@@ -302,14 +371,26 @@ inline std::string npu_lock_refusal_note(const char* path = kNpuDeviceLock) {
         }
         if (kept.empty()) {
             // The only holder was us: say the thing that is actually true, because the advice for another client
-            // ("wait for it, or stop it") is unusable when the client is the caller.
+            // ("wait for it, or stop it") is unusable when the client is the caller. engine#2689 item 2: and name the
+            // co-tenant that owns the array, when the fd scan can see one.
+            const std::string users = npu_device_users_text(dev_prefix);
             return "[npu] this process holds the device lock and is still refused a hardware context: another client is "
                    "using the array outside our lock protocol (measured with a FastFlowLM serve), so stopping this "
-                   "process will not help - wait for that client, or stop it";
+                   "process will not help - " +
+                   (users.empty() ? std::string("wait for that client, or stop it")
+                                  : "it is " + users + "; wait for it, or stop it if it is yours");
         }
         text = kept;
     }
-    if (text.empty()) return {};
+    if (text.empty()) {
+        // engine#2689 item 2: nobody took the lock, but the array can still be held -- name the process that has the
+        // device open, which is the one thing /proc/locks cannot see.
+        const std::string users = npu_device_users_text(dev_prefix);
+        if (users.empty()) return {};
+        return "[npu] no client holds the device lock, but " + users +
+               " hold(s) the NPU device open: 'No such device' here is another client owning the array, not a dead "
+               "device/ELF (wait for it, or stop it if it is yours)";
+    }
     return "[npu] the device lock is held by " + text +
            ": 'No such device' here is another client owning the array, not a dead device/ELF (wait for it, or stop "
            "it if it is yours)";

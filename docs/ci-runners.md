@@ -531,3 +531,35 @@ per unit naming only `MemoryMax=infinity(want a ceiling)`: the drop-in sets no m
 documents (`MemoryHigh=43G`, `MemoryMax=48G`) comes with a full `scripts/install-ci-runner.sh` install, or with
 `sudo systemctl set-property <unit> MemoryHigh=43G MemoryMax=48G` per unit. To undo a drop-in, delete the
 `restart.conf` and run `sudo systemctl daemon-reload`.
+
+## Landing a change under `.github/workflows/`
+
+A lane's token is the `gh` OAuth token, `gist, read:org, repo` and **no `workflow`** (`gh auth status`, and the
+server's own `X-OAuth-Scopes` header agree). GitHub refuses the **HTTPS** push that introduces such a change, and the
+refusal names the scope rather than the file:
+
+```
+$ git push https://github.com/1bit-MONSTER/engine.git HEAD:refs/heads/cl-1077-transport-probe2
+ ! [remote rejected] HEAD -> cl-1077-transport-probe2 (refusing to allow an OAuth App to create or update
+   workflow `.github/workflows/ci.yml` without `workflow` scope)
+```
+
+The same commit pushed over ssh is accepted — a key authenticates the account, not an OAuth grant:
+
+```
+$ git push ssh://git@github.com/1bit-MONSTER/engine.git HEAD:refs/heads/ci/2707-concurrency
+ * [new branch]      HEAD -> ci/2707-concurrency
+```
+
+Both measured on this box on 2026-11-16 (engine#2707, whose `ci.yml` concurrency group went up that way as #2708;
+#2696 landed the `census-watch.yml` excerpt fix the same way an hour earlier). **It grants nothing extra**: whoever
+can push a branch can already write every other path in the repository, the change still arrives as a PR with the
+same checks, and a *new* workflow is still an RFC under CONTRIBUTING.md. ssh moves the file; it does not move the
+decision — so a lane holding a workflow fix that nobody can land should open the PR rather than park the fix on a
+scope that only the transport was withholding.
+
+One trap, because it produces the wrong conclusion in the other direction. GitHub scans the commits a push
+*introduces*: pushing a ref whose commit is already on the server (an existing branch, or a commit reachable from
+one) is accepted by the same token, and reads as "I do have `workflow` scope" when the push only proved the content
+was already there. The two measurements above are a commit that exists nowhere else, which is the only form of the
+test that means anything.

@@ -340,6 +340,37 @@ def main():
     srv.shutdown()
     for b in bad:
         print("FAIL:", b)
+    # engine#2713: "cannot place" is two different facts. A shallow clone lacks the commit because the RUNNER is too
+    # shallow; a full clone lacks it because the commit is gone upstream. A reader who cannot tell them apart retries the
+    # wrong thing, so the verdict line must name which. Fixture: a two-commit origin and a --depth 1 clone of it, which is
+    # the shape the gate's own `submodule update --depth 1` produces. Both directions are asserted: the shallow clone says
+    # "absent input", the full clone keeps the plain sentence.
+    with tempfile.TemporaryDirectory() as td:
+        org = os.path.join(td, "origin")
+        def sh(*a, cwd=None):
+            return subprocess.run(a, cwd=cwd, capture_output=True, text=True)
+        sh("git", "init", "-q", org)
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        for msg in ("one", "two"):
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", msg],
+                           cwd=org, capture_output=True, env=env)
+        shal = os.path.join(td, "shallow")
+        sh("git", "clone", "-q", "--depth", "1", "file://" + org, shal)
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+        from hw_gate_manifest import provenance
+        shallow_line = provenance("4a58da9b087d", "deadbeef1234", shal)
+        full_line = provenance("4a58da9b087d", "deadbeef1234", org)
+        if "SHALLOW clone" not in shallow_line or "absent input" not in shallow_line:
+            print("  arm engine#2713 shallow-absence: FAIL (a --depth 1 clone must say the input is absent, not that the row is wrong)")
+            print("   ", shallow_line)
+            bad = True
+        elif "SHALLOW" in full_line:
+            print("  arm engine#2713 shallow-absence: FAIL (a full clone must not be described as shallow)")
+            print("   ", full_line)
+            bad = True
+        else:
+            print("  arm engine#2713 shallow-absence: ok (shallow names the absent input; full clone keeps the plain line)")
+
     print("hw_gate_test:", "FAIL" if bad else "PASS")
     return 1 if bad else 0
 

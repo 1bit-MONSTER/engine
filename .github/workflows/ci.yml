@@ -40,7 +40,12 @@ jobs:
     # Ubuntu 26.04's own GCC 16 (16-20260322 and later) ships <simd> (C++26 std::simd); the
     # toolchain PPA's GCC 16 for 24.04 is an older snapshot without it.
     container:
-      image: ubuntu:26.04
+      # The digest, not the tag: `ubuntu:26.04` moved under us three times (sha256:6a06111c... on 2026-11-09,
+      # sha256:065aa862... on 2026-11-13, sha256:d66b366d... on 2026-11-16T01:04Z, measured from the Hub tag API
+      # `last_updated`), so two runs of one commit built on two images. This is the OCI index digest, so
+      # the runner still picks its own architecture. A new image is a reviewed bump of this line
+      # (tools/ci/moving_ref_check.py, docs/model-pins.md "Build inputs").
+      image: ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db
       # A real init as PID 1 reaps orphans, as systemd does on a host: smoke_serve SIGKILLs
       # serve and checks that its backend is gone, and without a reaper the exited backend
       # stays a zombie that kill -0 still finds.
@@ -90,7 +95,10 @@ jobs:
         run: git submodule update --init --depth 1 third_party/llama.cpp
       - name: GGUF -> Q4NX repack, ternary -> Q4_0, MTP draft vocabulary
         run: |
-          python3 -m pip install numpy gguf
+          # Pinned, because the unversioned line resolved differently on different days: these are the versions
+          # CI resolved on 2026-11-09 and 2026-11-13, and both are still installable on 2026-11-16 (newest are
+          # numpy 2.5.5, gguf 0.19.0). A bump is a reviewed edit of this line, not a silent `pip install -U`.
+          python3 -m pip install numpy==2.5.4 gguf==0.19.0
           python3 tests/gguf_to_q4nx_test.py
           python3 tests/repack_verify_source_test.py
           python3 tests/ternary_to_q4_0_test.py
@@ -162,4 +170,18 @@ jobs:
             tokenizer_linear_test hrx_placement_test hrx_cwsr_test hrx_runtime_test npu_device_lock_test -j
       - name: Test
         # One hung test must not hold the job for hours: each test gets 10 minutes.
-        run: ctest --test-dir build --output-on-failure --timeout 600
+        # The log is kept for the next step: ctest prints `***Skipped` per skipped test and then counts those skips in
+        # `N% tests passed`, so the summary line alone cannot tell a suite that ran from a suite that did not.
+        run: |
+          set +e
+          ctest --test-dir build --output-on-failure --timeout 600 > build/ctest.log 2>&1
+          rc=$?
+          cat build/ctest.log
+          exit $rc
+      - name: Every test that did not run is a known one
+        # engine#2715/#2726 named all 16 tests that skip in this configuration, so the set is complete and the NEXT skip is
+        # the only unnamed row -- which is when this is worth running. `if: always()` because a red ctest still deserves the
+        # report, and a new skip is worth seeing beside it. rc 1 names the new skip; rc 2 means the log could not be read, and
+        # a check that cannot look is not a pass (tools/ci/ctest_skips.py).
+        if: always()
+        run: python3 tools/ci/ctest_skips.py --log build/ctest.log

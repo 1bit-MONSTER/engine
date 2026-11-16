@@ -20,6 +20,7 @@
 // flock on a temp file, so no NPU and no /tmp/1bit-npu-device.lock is touched. Runs in CI.
 #include "npu_device_lock.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -130,6 +131,41 @@ static pid_t spawn_holder(const char* path, int* release_fd) {
     return pid;
 }
 
+// Fork a child that opens `path` and holds the fd until a byte arrives on the returned pipe write end. Same
+// acknowledgement discipline as spawn_holder, no flock: this is the co-tenant that has the device open but never took
+// our lock, which is the client engine#2689 item 2 has to be able to name.
+static pid_t spawn_fd_holder(const std::string& path, int* release_fd) {
+    int ack[2] = {-1, -1};
+    int rel[2] = {-1, -1};
+    if (::pipe(ack) != 0 || ::pipe(rel) != 0) return -1;
+    const pid_t pid = ::fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        ::close(ack[0]);
+        ::close(rel[1]);
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) ::_exit(90);
+        const char ok = 'y';
+        if (::write(ack[1], &ok, 1) != 1) ::_exit(92);
+        char b = 0;
+        const ssize_t released = ::read(rel[0], &b, 1);
+        (void)released;
+        ::_exit(0);
+    }
+    ::close(ack[1]);
+    ::close(rel[0]);
+    char b = 0;
+    const bool acked = ::read(ack[0], &b, 1) == 1;
+    ::close(ack[0]);
+    if (!acked) {
+        ::waitpid(pid, nullptr, 0);
+        ::close(rel[1]);
+        return -1;
+    }
+    *release_fd = rel[1];
+    return pid;
+}
+
 int main() {
     std::string dir = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/npu-lock-XXXXXX";
     if (!::mkdtemp(dir.data())) {
@@ -205,6 +241,77 @@ int main() {
         expect(onebit::npu_lock_holders_in("", 0, 0x2f, 1234).empty(), "an empty /proc/locks names nobody");
         expect(onebit::npu_lock_holder_line("/nonexistent-npu-lock", 5).empty(),
                "no lock file is no diagnostic, not a failure");
+    }
+
+    // --- engine#2689 item 2: naming the co-tenant that never took the lock -----------------------------------------
+    // The fd scan reads the link target, so the fixture is a fake /proc whose <pid>/fd/<n> symlinks point at the same
+    // kind of names a real one holds: the node, the directory itself, a second node, a node whose path is gone
+    // (" (deleted)"), a look-alike (accelx0), an unrelated fd, a pid directory with no fd, and a non-pid directory.
+    {
+        const std::string prefix = dir + "/dev/accel";
+        const std::string fake = dir + "/proc";
+        auto link = [](const std::string& from, const std::string& to) {
+            return ::symlink(to.c_str(), from.c_str()) == 0;
+        };
+        ::mkdir(fake.c_str(), 0700);
+        for (const std::string& d : {fake + "/4242", fake + "/4343", fake + "/4444", fake + "/4646",
+                                     fake + "/notanumber", fake + "/5000"})
+            ::mkdir(d.c_str(), 0700);
+        for (const std::string& d : {fake + "/4242/fd", fake + "/4343/fd", fake + "/4444/fd", fake + "/4646/fd",
+                                     fake + "/notanumber/fd"})
+            ::mkdir(d.c_str(), 0700);
+        bool made = link(fake + "/4242/fd/3", prefix + "/accel0");         // ours
+        made &= link(fake + "/4242/fd/4", "/dev/null");                     // an unrelated fd on the same pid
+        made &= link(fake + "/4343/fd/0", prefix + "/accel1 (deleted)");    // a second node whose path is gone
+        made &= link(fake + "/4444/fd/1", prefix);                           // the directory itself
+        made &= link(fake + "/4646/fd/9", prefix + "x0");                    // a look-alike, not below the prefix
+        made &= link(fake + "/notanumber/fd/3", prefix + "/accel0");        // not a pid
+        expect(made, "the fake /proc symlinks are in place");
+        expect(onebit::npu_device_users_in(fake, prefix) == std::vector<long>({4242, 4343, 4444}),
+               "the fd scan names the pids with a node below the prefix, and only those");
+        expect(onebit::npu_device_users_in(fake, prefix, 4242) == std::vector<long>({4343, 4444}),
+               "self is left out: naming the process that just failed is the engine#2434 bug");
+        expect(onebit::npu_device_users_in(fake, "").empty(), "an empty prefix names nobody");
+        expect(onebit::npu_device_users_in("/nonexistent-proc", prefix).empty(), "a missing proc root names nobody");
+        expect(onebit::npu_fd_target_is(prefix + "/accel0", prefix), "a child of the prefix is a match");
+        expect(onebit::npu_fd_target_is(prefix, prefix), "the prefix itself is a match");
+        expect(!onebit::npu_fd_target_is(prefix + "x0", prefix), "a look-alike is not a match");
+        expect(!onebit::npu_fd_target_is(prefix + "/accel0", ""), "an empty prefix matches nothing");
+    }
+
+    // A real /proc, a live co-tenant: a forked child opens a file that stands in for the node (the scan reads the link
+    // target, so a plain file exercises the same path as a device here) and the scan must name it. No NPU is touched.
+    {
+        const std::string prefix = dir + "/dev/accel";
+        ::mkdir((dir + "/dev").c_str(), 0700);
+        ::mkdir(prefix.c_str(), 0700);
+        const std::string node = prefix + "/accel0";
+        ::close(::open(node.c_str(), O_CREAT | O_WRONLY, 0600));   // a plain file stands in for the device node
+        int release_fd = -1;
+        const pid_t holder = spawn_fd_holder(node, &release_fd);
+        expect(holder > 0, "forked a live fd holder");
+        if (holder > 0) {
+            const std::vector<long> pids = onebit::npu_device_users_in("/proc", prefix, static_cast<long>(::getpid()));
+            expect(std::find(pids.begin(), pids.end(), static_cast<long>(holder)) != pids.end(),
+                   "a live holder is named by a scan of the real /proc");
+            const std::string text = onebit::npu_device_users_text(prefix);
+            expect(text.find("pid " + std::to_string(holder)) != std::string::npos, "and rendered: " + text);
+            expect(text.find("npu_device_lock_test") != std::string::npos, "with its cmdline: " + text);
+            // The note an operator reads when a load is refused: the lock file exists and nobody holds it, so the
+            // fd scan is the only thing that can name the co-tenant -- and it must.
+            const std::string note = onebit::npu_lock_refusal_note(lk, prefix);
+            expect(note.find("pid " + std::to_string(holder)) != std::string::npos,
+                   "the refusal note names the client that never took the lock: " + note);
+            expect(note.find("no client holds the device lock") != std::string::npos,
+                   "and says the lock was not the thing to look at: " + note);
+            const char go = 'g';
+            (void)!::write(release_fd, &go, 1);
+            ::close(release_fd);
+            ::waitpid(holder, nullptr, 0);
+        }
+        expect(onebit::npu_device_users_text(prefix).empty(), "nobody holds it once the child is gone");
+        // And with nobody holding the device the note says nothing at all, rather than inventing a holder.
+        expect(onebit::npu_lock_refusal_note(lk, prefix).empty(), "no lock holder and no device user is no note");
     }
 
     // ONEBIT_NPU_LOCK_WAIT_MAX: only a positive number bounds the wait; everything else keeps the

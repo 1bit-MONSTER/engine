@@ -132,7 +132,12 @@ ADD_EXE = re.compile(r"^\s*add_executable\s*\(\s*([A-Za-z0-9_.+-]+)", re.IGNOREC
 ADD_TEST = re.compile(r"^\s*add_test\s*\(\s*NAME\s+([A-Za-z0-9_.+-]+)\s+COMMAND\s+(.*)$", re.IGNORECASE)
 BASELINE = "tools/ci/add_test_gaps.txt"
 # `add_dependencies(<target> <dep>…)`: the second way a target gets built (engine#1595 review).
-ADD_DEPS = re.compile(r"add_dependencies\s*\(\s*([A-Za-z0-9_.+-]+)([^)]*)\)", re.IGNORECASE)
+# engine#2700: anchored. Unanchored, this matched a COMMENT that mentions the hook -- a commented-out
+# `# add_dependencies(onebit X)` cleared a drifting test exactly like a live edge (measured: identical
+# closure, no test in the build), and the prose "`add_dependencies(onebit ...)`" in CMakeLists.txt put a
+# phantom target `...` in the closure. Every other directive regex in this file is anchored for the same
+# reason (`ADD`, `ADD_EXE`, `add_test_blocks`).
+ADD_DEPS = re.compile(r"^\s*add_dependencies\s*\(\s*([A-Za-z0-9_.+-]+)([^)]*)\)", re.IGNORECASE)
 
 
 def build_closure(cmake_text, listed, defines=None, defaults=None):
@@ -835,6 +840,20 @@ add_executable(live_test live.cpp)
 add_test(NAME live_suite COMMAND live_test)
 add_dependencies(onebit live_test)
 """, 0, baseline="unbuilt_test\n")
+    # engine#2700: the same edge, but only in a comment. `ADD_DEPS` is an unanchored search over lines whose
+    # comments were still attached, so a commented-out line cleared a drifting test exactly like a live one.
+    case("a commented-out add_dependencies does not clear a drifting test",
+         B_CI, B_CMAKE + """
+add_executable(hoisted_test hoisted.cpp)
+add_test(NAME hoisted_suite COMMAND hoisted_test)
+# add_dependencies(onebit hoisted_test)
+""", 1, baseline="unbuilt_test\n")
+    case("a trailing comment that names add_dependencies adds no edge",
+         B_CI, B_CMAKE + """
+add_executable(hoisted_test hoisted.cpp)
+add_test(NAME hoisted_suite COMMAND hoisted_test)
+# the old line was add_dependencies(onebit hoisted_test)
+""", 1, baseline="unbuilt_test\n")
     # engine#1696: a test that lives in an included family file is still ratcheted. `case` writes only
     # .github/workflows/CI and CMakeLists.txt, so this arm builds its tree by hand.
     def family_tree(included):

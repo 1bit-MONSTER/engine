@@ -24,3 +24,14 @@ patch_sfs_atomic   # returns 77: needs a fixture this configuration does not hav
 serve_client_hangup_cpu   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
 serve_context_limit_cpu   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
 serve_embed_vectors_cpu   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
+# The audio/whisper rows all wait on the same fixture: a Whisper pack. The build job fetches submodules and nothing else,
+# so ONEBIT_TEST_WHISPER / ONEBIT_TEST_WHISPER_PACK / _PACK_LV3 are unset and each test prints its own SKIP and returns 77.
+audio_exec   # returns 77: ONEBIT_TEST_WHISPER (a pack dir or the encoder .onnx) is unset in CI
+onnx_graph   # returns 77: ONEBIT_TEST_WHISPER (the encoder .onnx) is unset in CI
+audio_kernel_plan   # returns 77: ONEBIT_TEST_WHISPER_PACK is unset in CI
+whisper_transcribe_jfk   # returns 77: ONEBIT_TEST_WHISPER_PACK and _WAV are unset in CI (CMake sets only _IDS_FILE)
+whisper_transcribe_jfk_lv3   # returns 77: no pack or wav (ONEBIT_TEST_WHISPER_PACK_LV3/_WAV_LV3) in CI
+laya_finetune   # returns 77: needs torch + numpy, which the build container does not install (engine#1313 item 3)
+hip_f16_audit   # returns 77: needs a gpu-kernels checkout at the pin; the build job initialises llama.cpp only
+q4nx_tail_head   # returns 77: needs the onnx module; without it the row would pass having never run (CMakeLists.txt:302)
+token_rate_floor_device   # returns 77: needs a device, a model and a gpu-hold ticket: it judges a real 1bit serve rate

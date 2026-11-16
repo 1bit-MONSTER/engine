@@ -245,16 +245,17 @@ scripts, and each of those is named by a commit or a digest too, so a release is
 
 | input | pinned where | example |
 |---|---|---|
-| CI container | `.github/workflows/ci.yml` `image:` | `ubuntu:26.04@sha256:065aa862…` (the tag moved between 2026-11-09 and 2026-11-13). **Owed**: a workflow edit needs the `workflow` token scope, so it is baselined in `tools/ci/moving_ref_baseline.txt` until the owner applies it |
-| CI Python packages | the `pip install` line | `numpy==2.5.4 gguf==0.19.0` (**owed**, same reason) |
+| CI container | `.github/workflows/ci.yml` `image:` | `ubuntu:26.04@sha256:d66b366d…` (the tag moved three times: 2026-11-09, 2026-11-13, 2026-11-16T01:04Z) |
+| CI Python packages | the `pip install` line | `numpy==2.5.4 gguf==0.19.0`, the versions CI resolved on 2026-11-09 and 2026-11-13 |
 | GitHub Actions | every `uses:` | a 40-hex commit |
 | package-build containers | `scripts/pack-distro.sh` | `fedora:45@sha256:…`, `archlinux:base-20261108.0.623074@sha256:…` |
 | Puppy appliance | [`os/v3/puppy/pin.txt`](../os/v3/puppy/pin.txt) | the woof-CE commit, the build container digest, `vercmp.c` by commit + sha256 |
 
 [`tools/ci/moving_ref_check.py`](../tools/ci/moving_ref_check.py) (ctest `moving_ref_check`) fails a tree that names
 a branch, a tag or no version in any of these places, except the rows listed in
-[`tools/ci/moving_ref_baseline.txt`](../tools/ci/moving_ref_baseline.txt). That baseline only shrinks: a row that no
-longer matches anything fails the check too. A read that is moving on purpose carries a
+[`tools/ci/moving_ref_baseline.txt`](../tools/ci/moving_ref_baseline.txt). That baseline only shrinks -- it is empty
+since 2026-11-16, when the three workflow rows it held were pinned instead -- and a row that no longer matches
+anything fails the check too. A read that is moving on purpose carries a
 `moving-ref: <why>` comment on the line or the line above it, and the check prints that reason. Two kinds of read
 are marked this way: the bump bots, which read the newest release only to propose a pin, and `scripts/pack-proof.sh`,
 whose point is "installs on this distro as users pull it today". A new image or version is a reviewed edit of the

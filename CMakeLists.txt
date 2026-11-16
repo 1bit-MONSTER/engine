@@ -651,7 +651,9 @@ add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-tes
 # engine#1946: a test that returns 77 is green, and green-because-it-did-not-run is the failure this fleet keeps paying
 # for. `tools/ci/ctest_skips.py` reads a ctest log and reports every test that did not execute -- `***Skipped` (77) against
 # `tools/ci/ctest_skips.txt`, and `(Not Run)` (a missing binary) as a build-list mistake that can never be baselined.
-# Self-test only here: wiring it into ci.yml's Test step needs the log plus a `workflow`-scoped token (engine#1817).
+# The tool's `--self-test` is a ctest row; its useful mode (`--log`) runs in ci.yml's Test step, on that step's own log,
+# since engine#2730: a workflow edit needed a `workflow`-scoped token over HTTPS OAuth, which this fleet pushes over
+# `ssh://git@github.com/...` instead, so the row is no longer blocked. `--write` stays a manual developer action.
 add_python_test(ctest_skips_self ${CMAKE_SOURCE_DIR}/tools/ci/ctest_skips.py --self-test)
 # engine#2106 / #2102: the release gate's NPU serve check asserts the fast route, a decode floor, the first token and a
 # non-empty answer, because a serve on the slow per-op route still answers. --self-test drives the judging on the shape
@@ -1343,6 +1345,15 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME registry_gaps_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_gaps_test.py)
     # a pin bump that did not regenerate the registry (only the gitlinks: no checkouts)
     add_test(NAME registry_pins COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-pins)
+    # the CONTENT axis, which registry_pins above cannot see: it compares one sha and never reads the fork, so a
+    # hand-edited architecture list or backend -- including `gguf_architectures.hrx`, which CMakeLists.txt compiles
+    # into hrx_archs.h and `serve` refuses architectures against -- passed every PR job (engine#2698). The content
+    # comes from a submodule, so this skips (77) where the fork is not checked out, like hrx_f16_narrowing_check.
+    add_test(NAME registry_content COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check)
+    set_tests_properties(registry_content PROPERTIES SKIP_RETURN_CODE 77)
+    # the row's own mutant: a fake fork and a fake gitlink in a scratch repo, so the content edit that made every
+    # other row green is proved to make this one red, and the no-checkout case is proved to be 77 and not 0.
+    add_test(NAME registry_content_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_content_test.py)
     # engine#1745 review: pin() reads the INDEX (a staged bump) and refuses an UNMERGED index instead of returning the
     # merge base. Hermetic: a scratch git repo and a copy of the tool, git only, ~0.1 s.
     add_test(NAME registry_pin_index COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_pin_index_test.py)
@@ -1385,6 +1396,11 @@ if(Python3_Interpreter_FOUND)
     # payloads under tests/fixtures/fflm/ — engine #588), so a regression cannot leave the
     # daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
+    # engine#2710: the WATCHER is tested above; the issue EXCERPT that carries its findings is shell in
+    # .github/workflows/census-watch.yml, and it is capped at 40 lines, so which lines fill it decides whether the
+    # issue says anything. Runs the workflow's own block against a log of the 11-16 13:00Z shape.
+    add_test(NAME census_watch_excerpt COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_excerpt_test.py)
+    set_tests_properties(census_watch_excerpt PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     # an installed package must find its libraries beside itself: the 2026-11-08 incident's rule, from
     # the installed side that no release gate can reach (engine #1411). Skips without patchelf/readelf.
     add_test(NAME installed_rpath COMMAND bash ${CMAKE_SOURCE_DIR}/tests/installed_rpath_test.sh)
@@ -2574,6 +2590,14 @@ endif()
     add_test(NAME layer_taps_model COMMAND layer_taps_model_test)
     # engine#1781: a fully accepted verify batch keeps its own state, and it equals the restore + replay path, bit for
     # bit. Host-GEMM, no device; skips (77) unless ONEBIT_TEST_Q4NX names a causal model with GDN layers.
+    # engine#2689 item 3: several sequences in ONE batched pass. Host-GEMM, no device; skips (77) unless
+    # ONEBIT_TEST_Q4NX names a container. Each row must be bit-identical to that sequence's own single-sequence run.
+    add_executable(step_users_test tests/step_users_test.cpp)
+    target_include_directories(step_users_test PRIVATE npu/forward/include)
+    target_link_libraries(step_users_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test step_users_test)
+    add_test(NAME step_users COMMAND step_users_test)
+    set_tests_properties(step_users PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(commit_full_accept_test tests/commit_full_accept_test.cpp)
     target_include_directories(commit_full_accept_test PRIVATE npu/forward/include)
     target_link_libraries(commit_full_accept_test PRIVATE onebit_npu_forward)

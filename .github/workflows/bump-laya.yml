@@ -91,7 +91,21 @@ jobs:
           p = json.load(open("config/laya.json")); p["revision"] = sys.argv[1]
           open("config/laya.json", "w").write(json.dumps(p, indent=2) + "\n")
           PY
-          git add config/laya.json
+          # docs/laya.md names both pins and says `bump-laya.yml` keeps them current; until engine#2725 this
+          # did not happen, and the row had drifted two source bumps behind while the doc claimed it was
+          # maintained. Match whatever short sha is in the cell rather than the old value: a value-based
+          # replace only works while the doc is current, which is the state that had already failed.
+          python3 - "$SRC" "$REV" <<'PY'
+          import re, sys
+          path = "docs/laya.md"
+          text = open(path).read()
+          for pattern, sha in ((r"(main \*\*`)[0-9a-f]{8,40}(`\*\*)", sys.argv[1]),
+                               (r"(at revision \*\*`)[0-9a-f]{8,40}(`\*\*)", sys.argv[2])):
+              text = re.sub(pattern, lambda m, sha=sha: m.group(1) + sha[:12] + m.group(2), text)
+          open(path, "w").write(text)
+          PY
+          # One commit for both pins, so a doc row that already reads correctly cannot leave an empty commit.
+          git add config/laya.json docs/laya.md
           git commit -q -m "Bump Laya: source ${SRC:0:12}, model ${REV:0:12}"
           git push -q origin "$branch"
           gh pr create --base main --head "$branch" \

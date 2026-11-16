@@ -48,6 +48,9 @@
 #                  agrees, because the default - not an environment variable - is what moved.
 #   GPU_HOLD_RELEASE_WAIT  seconds a label must wait after releasing, default 180
 #   GPU_HOLD_TCTL_START    start gate in C, default 75 - a hot box is not taken
+#   GPU_HOLD_REPO          engine checkout to compare the running copy against (default: the checkout
+#                          this file lives in). Unset and outside a checkout -> the take line says
+#                          "repo unknown"; a mismatch is logged as DRIFTED and never refuses a ticket.
 #   GPU_HOLD_TCTL_ABORT    abort in C, default 93
 #   GPU_HOLD_MEM_ABORT_GB  end the hold when MemAvailable falls below this (GB); 0 = off, the default
 #   GPU_HOLD_TCTL_FILE     temperature file in millidegrees, default the k10temp hwmon
@@ -143,6 +146,29 @@ tctl() {
 # $0 is resolved here, before anything could change the working directory.
 SCRIPT_ID=$(sha256sum -- "$0" 2> /dev/null | cut -c1-12) || SCRIPT_ID=""
 [ -n "$SCRIPT_ID" ] || SCRIPT_ID="unknown"
+# ...and the copy to compare it WITH, because "which copy ran" only becomes a detector when the other side is known.
+# GPU_HOLD_REPO names an engine checkout; otherwise the checkout $0 itself lives in, if it lives in one. The installed
+# copy is normally in no checkout at all and then says `repo unknown` -- never `same`, which would be the one wrong
+# answer (the 11-16 03:2xZ copy reported itself as fine for 16 h). DRIFTED is a warning, never a refusal: a lane
+# testing a branch copy is a legitimate reason for the two to differ.
+_repo_root=""
+if [ -n "${GPU_HOLD_REPO:-}" ]; then
+    _repo_root=$GPU_HOLD_REPO
+elif _r=$(git -C "$(dirname -- "$0")" rev-parse --show-toplevel 2> /dev/null); then
+    _repo_root=$_r
+fi
+REPO_ID=""
+if [ -n "$_repo_root" ] && [ -f "$_repo_root/scripts/gpu-hold" ]; then
+    REPO_ID=$(sha256sum -- "$_repo_root/scripts/gpu-hold" 2> /dev/null | cut -c1-12)
+fi
+REPO_ID=${REPO_ID:-unknown}
+if [ "$REPO_ID" = "unknown" ]; then
+    COPY_CHECK="repo unknown"
+elif [ "$REPO_ID" = "$SCRIPT_ID" ]; then
+    COPY_CHECK="repo $REPO_ID same"
+else
+    COPY_CHECK="repo $REPO_ID DRIFTED (this box runs a copy that is not the checkout's)"
+fi
 
 log() {
     local line
@@ -302,7 +328,7 @@ while [ "$state" = queued ]; do
             mine="gpu-hold $LABEL pid $$ $(date -Is)"
             if ( set -o noclobber; printf '%s\n' "$mine" > "$TOKEN" ) 2> /dev/null; then
                 state=holding
-                log "took $TOKEN after ${waited}s (die $(tctl)C; script $SCRIPT_ID)"
+                log "took $TOKEN after ${waited}s (die $(tctl)C; script $SCRIPT_ID; $COPY_CHECK)"
                 # A RECENT amdgpu/MES RESET, checked at the one choke point every lane goes through. The standing rule is
                 # "on any amdgpu reset: stop, release the ticket" and until now nothing implemented it - my own window
                 # harness had no such check (grep 'dmesg|reset|MES' = 0 in all three scripts) and on 2026-11-15 a window

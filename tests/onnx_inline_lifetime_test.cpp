@@ -35,6 +35,19 @@
 #include <string>
 #include <vector>
 
+// The arm is only an arm under AddressSanitizer: without it, a read of reused pages can return the right floats by luck and
+// pass. So a build without the sanitizer fails here, loudly, instead of going green (PR #2670 review).
+#if defined(__SANITIZE_ADDRESS__)
+#define ONNX_INLINE_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define ONNX_INLINE_ASAN 1
+#endif
+#endif
+#ifndef ONNX_INLINE_ASAN
+#define ONNX_INLINE_ASAN 0
+#endif
+
 namespace fs = std::filesystem;
 namespace pi = onebit::npu::pack_import;
 
@@ -108,6 +121,11 @@ bool same_bits(const std::vector<float>& a, const std::vector<float>& b) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (!ONNX_INLINE_ASAN) {
+        std::printf("FAIL this test was built without -fsanitize=address, so it cannot see a dangling read (CMake target "
+                    "onnx_inline_lifetime_test must carry the sanitizer)\n");
+        return 1;
+    }
     const fs::path root = argc > 1 ? fs::path(argv[1]) : fs::temp_directory_path();
     const int64_t V = 64, H = 1024;   // 64 x 1024 f32 = 256 KiB inline: 64 pages of the graph file's own mapping
     std::vector<float> tok(size_t(V) * size_t(H));

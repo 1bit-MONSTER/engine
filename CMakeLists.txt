@@ -1758,7 +1758,9 @@ target_link_libraries(npu_pack_import_test PRIVATE onebit_npu)
 add_test(NAME npu_pack_import COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden)
 # engine#2668: an INLINE initializer's OnnxTensor::raw must still be readable after parse_onnx() returns (it used to point
 # into a mapping the parse had already unmapped). Built with AddressSanitizer so a read of freed or unmapped memory is a
-# report, not a lucky pass; leak detection is off because the arm is about lifetime, not about the library's caches.
+# report, not a lucky pass (the test fails if it was built without the sanitizer). Leak detection is off on purpose: the
+# arm is about a mapping's lifetime, and the library holds some allocations for the process lifetime, which a leak report
+# would list as noise -- do not "fix" detect_leaks=0 into a leak hunt here.
 add_executable(onnx_inline_lifetime_test tests/onnx_inline_lifetime_test.cpp)
 target_link_libraries(onnx_inline_lifetime_test PRIVATE onebit_npu)
 target_include_directories(onnx_inline_lifetime_test PRIVATE npu)

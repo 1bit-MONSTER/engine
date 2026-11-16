@@ -397,8 +397,9 @@ check run straight after it gives:
 - kat 9/9 with 0 warnings, and every answer's text identical to the old file's goldens (only the logprobs moved);
 - KLD mean 0.000001, p99 0.00004, same top 100 %.
 
-The A/B measured the new file against the old base: mean KLD 0.0064, p99 0.065, same top 96.2 %, all inside the
-limits. That is the size of the re-quantization, not a kernel change.
+The A/B measured the new file against the old base: mean KLD 0.0064, p99 0.065, same top 96.2 %. That is inside
+the row's own `limits` in `manifest.json` (`max_mean_kld` 0.01, `max_kld_p99` 0.2, `min_same_top_p` 95.0), and it
+is the size of the re-quantization, not a kernel change.
 
 The MoE and IQ rows (`qwen3-coder-30b-a3b`, `qwen3-4b-iq4xs`) were recorded on 2026-10-20 at
 llama.cpp 00f2a68d / hrx-system 82804197 (`manifest.json` `recorded_at`; a submodule whose pin could not be read is

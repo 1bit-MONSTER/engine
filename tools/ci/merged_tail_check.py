@@ -123,7 +123,7 @@ def same_head(frozen, tip):
     return tip.lower().startswith(frozen.lower()[:7]) or frozen.lower().startswith(tip.lower()[:7])
 
 
-def branch_mode(repo, branch, base_ref):
+def branch_mode(repo, branch, base_ref, merged_head=None):
     """List the commits on `branch` that are not on `base_ref` -- the recovery workflow.
 
     A PR-list scan answers "is anything lost?"; this answers "what of MY branch never landed?",
@@ -131,7 +131,7 @@ def branch_mode(repo, branch, base_ref):
     """
     if git(repo, "rev-parse", "--verify", "-q", branch).returncode != 0:
         return None
-    tail = merge_commits(repo, branch, base_ref)
+    tail = merge_commits(repo, branch, base_ref, merged_head)
     if tail is None:
         return None
     for sha, subject in tail:
@@ -141,9 +141,19 @@ def branch_mode(repo, branch, base_ref):
     return tail
 
 
-def merge_commits(repo, ref, base_ref):
-    """Commits reachable from `ref` and not from `base_ref` -- the branch's tail."""
-    r = git(repo, "rev-list", "--format=%h %s", f"{base_ref}..{ref}")
+def merge_commits(repo, ref, base_ref, merged_head=None):
+    """Commits reachable from `ref` and not from `base_ref` -- the branch's tail.
+
+    engine#2679: ALSO exclude everything reachable from the frozen `headRefOid`, i.e. the PR's own history. A SQUASH
+    merge creates a new commit, so none of the branch's commits is an ancestor of the base any more and `base..ref`
+    returns the WHOLE BRANCH -- the PR's own history then reads as post-merge work and its intermediate commits are
+    reported LOST (#2659's dfa27be00 and 0861ff085: lines a later commit in the same PR had already replaced).
+    For a non-squash merge the frozen head IS in the base, so `^<merged_head>` excludes nothing new and every
+    existing LOST keeps its meaning: a detector fix may only remove false positives.
+    """
+    # Two argv elements, not one: `"a..b ^c"` as a single argument is not two revisions to git.
+    specs = [f"{base_ref}..{ref}"] + ([f"^{merged_head}"] if merged_head else [])
+    r = git(repo, "rev-list", "--format=%h %s", *specs)
     if r.returncode != 0:
         return None
     lines = [ln for ln in r.stdout.splitlines() if ln and not ln.startswith("commit ")]
@@ -320,7 +330,7 @@ def scan(repo, days, limit, base_url=None, prs=None):
             rows.append(("GAP", pr, branch, None, f"could not fetch {url} {branch}"))
             continue
 
-        tail = merge_commits(repo, ref, base_ref)
+        tail = merge_commits(repo, ref, base_ref, pr.get("headRefOid"))
         if tail is None:
             rows.append(("GAP", pr, branch, None, "could not list the branch's tail"))
             continue
@@ -492,6 +502,13 @@ def self_test():
     # and the content arm must -- which is the arm below.
     chk(2, len(merge_commits(r, "pr", "main")),
         "after a squash merge the whole branch tail reads as absent by sha (2: the squashed commit and the push)")
+    # engine#2679: THE FIX. Pass the frozen merged head and the PR's OWN history drops out, leaving the one commit
+    # that really was pushed after the merge -- the only population this tool exists for. Without this, #2659's
+    # intermediate commits (lines a later commit in the same PR had already replaced) were reported LOST.
+    kept = merge_commits(r, "pr", "main", squash_sha)
+    chk(1, len(kept), "with the merged head excluded, a squashed PR's tail is only the commit pushed after it")
+    chk(True, tail_sha.startswith(kept[0][0]),
+        "and the surviving tail commit is the one pushed after the merge, not the PR's own")
     chk("LOST", classify_commit(r, tail_sha, "main")[0],
         "a commit pushed after a squash merge is LOST by content")
     d.cleanup()

@@ -78,6 +78,89 @@ check "the folded weight has the matmul orientation" "$shape" "3x4"
 rc=0; python3 "$TOOL" --check "$tmp/out.onnx" >/dev/null 2>&1 || rc=$?
 check "check accepts the folded graph" "$rc" 0
 
+# engine#2779: ONE weight folded under TWO DIFFERENT perms. The fold used to name the result after the source only, so
+# the second perm reused the first one's tensor and rewired its consumers to the wrong orientation while --check passed.
+python3 - "$tmp/two.onnx" <<'PY2' || { echo "FAIL could not build the two-perm fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+w = numpy_helper.from_array(np.arange(12, dtype=np.float32).reshape(2, 3, 2), "w")     # 2x3x2: two perms differ in shape
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[1, 0, 2]),
+     helper.make_node("Transpose", ["w"], ["b"], perm=[0, 2, 1]),
+     helper.make_node("Identity", ["a"], ["oa"]),
+     helper.make_node("Identity", ["b"], ["ob"])],
+    "g",
+    [],
+    [helper.make_tensor_value_info("oa", TensorProto.FLOAT, None),
+     helper.make_tensor_value_info("ob", TensorProto.FLOAT, None)],
+    [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY2
+
+python3 "$TOOL" "$tmp/two.onnx" "$tmp/two-out.onnx" >"$tmp/two.log" 2>&1 || { cat "$tmp/two.log"; fail=$((fail+1)); }
+check "two perms fold into two weights" "$(grep -c '^folded ' "$tmp/two.log")" 2
+read -r distinct d0 d1 ok_a ok_b <<EOF
+$(python3 - "$tmp/two-out.onnx" <<'PY2'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
+ident = {n.output[0]: n.input[0] for n in m.graph.node if n.op_type == "Identity"}
+a, b = ident["oa"], ident["ob"]
+w = np.arange(12, dtype=np.float32).reshape(2, 3, 2)     # the source is dropped when nothing else reads it
+print(a != b,
+      "x".join(str(d) for d in inits[a].shape), "x".join(str(d) for d in inits[b].shape),
+      np.array_equal(inits[a], np.transpose(w, (1, 0, 2))),
+      np.array_equal(inits[b], np.transpose(w, (0, 2, 1))))
+PY2
+)
+EOF
+check "each perm gets its own name" "$distinct" "True"
+check "perm [1,0,2] tensor has shape" "$d0" "3x2x2"
+check "perm [0,2,1] tensor has shape" "$d1" "2x2x3"
+check "consumer a reads perm [1,0,2]'s values" "$ok_a" "True"
+check "consumer b reads perm [0,2,1]'s values" "$ok_b" "True"
+
+# ...and the case with NO symptom at all: a square weight, where both perms have the same shape and only the values
+# differ. This is the arm that would pass silently on a shape-only check.
+python3 - "$tmp/sq.onnx" <<'PY2' || { echo "FAIL could not build the square fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+w = numpy_helper.from_array(np.arange(4, dtype=np.float32).reshape(2, 2), "w")        # [[0,1],[2,3]]
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[0, 1]),
+     helper.make_node("Transpose", ["w"], ["b"], perm=[1, 0]),
+     helper.make_node("Identity", ["a"], ["oa"]),
+     helper.make_node("Identity", ["b"], ["ob"])],
+    "g",
+    [],
+    [helper.make_tensor_value_info("oa", TensorProto.FLOAT, None),
+     helper.make_tensor_value_info("ob", TensorProto.FLOAT, None)],
+    [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY2
+
+python3 "$TOOL" "$tmp/sq.onnx" "$tmp/sq-out.onnx" >"$tmp/sq.log" 2>&1 || { cat "$tmp/sq.log"; fail=$((fail+1)); }
+same_shape_dir=$(python3 - "$tmp/sq-out.onnx" <<'PY2'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
+ident = {n.output[0]: n.input[0] for n in m.graph.node if n.op_type == "Identity"}
+a, b = ident["oa"], ident["ob"]
+print("different" if not np.array_equal(inits[a], inits[b]) else "same")
+PY2
+)
+check "square weight: the two consumers still read different values" "$same_shape_dir" "different"
+
 echo "---"
 if [ "$fail" -ne 0 ]; then echo "$fail failed"; exit 1; fi
 echo "fold_initializer_transpose: all checks ok"

@@ -389,6 +389,11 @@ What the goldens record at the release pin:
 The MoE and IQ rows (`qwen3-coder-30b-a3b`, `qwen3-4b-iq4xs`) were recorded on 2026-10-20 at
 llama.cpp 00f2a68d / hrx-system 82804197 (`manifest.json` `recorded_at`; a submodule whose pin could not be read is
 recorded as `null` and named on stderr, never as the string "unknown"). Both answer every kat case.
+Each KLD verdict line ends with where its golden came from, e.g. `[golden llama.cpp 4a58da9b087d, tested
+148e7f329ff9: golden is 227 commits behind the tested tree]` (engine#2643). A comparison across two trees is then
+visible on the line that reports it. The relation is computed in `third_party/llama.cpp`. A clone that holds the
+commits without the history between them (a `--depth` fetch) says `cannot place (no common history in this clone;
+shallow=true)`, never "disjoint": #2643 first read an ancestor as a disjoint history that way.
 Their HRX base logits against a CPU run of the same file (`--device none`) give:
 
 | model | mean KLD | KLD p99 | same top token |

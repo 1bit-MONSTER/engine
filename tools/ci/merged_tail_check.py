@@ -79,6 +79,10 @@ SIGNIFICANT = 8
 # threshold of "any line absent" would have called all five lost, and "all lines absent" would have
 # missed #2623's first lost commit at 89 %.
 LOST_FRACTION = 0.5
+# engine#2716: the tokens that carry meaning in a line of code -- `snake_case_or_underscored` and
+# `cpp::qualified` names. Prose words are deliberately not matched: an English word in a comment says nothing about
+# whether the base kept the change, while a function or a macro name does.
+IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+|[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+")
 
 
 # The denominator. A scan that finds nothing and a scan that read nothing print the same
@@ -289,9 +293,27 @@ def classify_commit(repo, sha, base_ref, after=None):
                     if git(repo, "log", "--oneline", "-S", line, f"{since}..{base_ref}", "--", f).stdout.strip():
                         moved = True
                         break
-            superseded = superseded and (longer or moved)
+            # engine#2716: neither heuristic can carry the decision alone, and they fail in opposite directions.
+            #   * `longer` alone reports SUPERSEDED for a file a LATER PR appended to, with the lost line never
+            #     looked at -- exit 0 on a genuine loss (measured: base 3 lines, the value line in no commit);
+            #   * `moved` alone reports LOST for a REWORDED landing, because a rewrite in other words never puts
+            #     that exact line on the base, so its occurrence count never changes and `git log -S` sees nothing
+            #     (measured on #2504: 15 of 18 lines absent, base longer, `httplib::Server` on main three times).
+            # The test that separates them is the CONTENT one: did the base keep this change in other words? Its
+            # distinctive identifiers are still there even when its lines are not.
+            reworded = 0
+            if after is not None and longer and not moved:
+                toks = set()
+                for path, line in missing_all:
+                    if path == f:
+                        toks |= set(IDENT.findall(line))
+                if len(toks) >= 2:
+                    reworded = sum(1 for t in toks if t in base_text)
+                    reworded = 1 if reworded * 3 >= len(toks) * 2 else 0   # two thirds of the identifiers survive
+            superseded = superseded and (moved or reworded or (longer and after is None))
             ctx = ("the line was replaced on the base after this PR merged" if moved else
-                   ("base is longer" if longer else "base is shorter"))
+                   ("the base kept this change in other words" if reworded else
+                    ("base is longer" if longer else "base is shorter")))
             sizes += f"; {f}: this commit {mine} lines, base {theirs} lines ({ctx})"
         # A later commit that rewrote every affected file leaves the added lines absent for the
         # wrong reason. Measured 2026-11-16 on #2504: 15 of 18 lines "absent", base file longer,
@@ -522,6 +544,59 @@ def self_test():
         "the same commit is SUPERSEDED once a later commit replaced the line itself")
     chk("LOST", classify_commit(r, pin, "main")[0],
         "and without after= it is LOST again: the exit-0 path is what after= selects")
+    d.cleanup()
+
+    # engine#2716: the file grew for a reason that has nothing to do with the lost line. `longer` alone called that
+    # a supersession and report() exits 0 on SUPERSEDED, so the loss went quiet; and `-S` cannot rescue it either,
+    # because the line is absent from every commit of the base. Only the content question separates this from a
+    # reworded landing, and here the identifiers of the lost line are on the base nowhere.
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    branch(r, "pr")
+    lost_line = commit(r, "conf.config", "set_route_lock_port=aa11\n", "the value this branch pushed after the merge")
+    branch(r, "main", "pr~1")
+    merged3 = commit(r, "other.txt", "unrelated\n", "the merge point")
+    commit(r, "conf.config", "set_route_lock_port=zz99\nother_knob=bb22\nthird_knob=cc33\n",
+           "a later PR appends two lines: the base file is LONGER and the lost value is gone")
+    chk("LOST", classify_commit(r, lost_line, "main", after=merged3)[0],
+        "a longer base file whose lost line nothing replaced is still LOST (length is not the evidence)")
+    d.cleanup()
+
+    # engine#2716, the other direction, measured on engine#2504: the base REWROTE the region in other words, so the
+    # added lines are absent while the identifiers that carry the change are all there. That is a supersession, and a
+    # line-level test cannot see it (`git log -S` finds no commit that ever held those exact lines).
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    branch(r, "pr")
+    reworded_sha = commit(r, "route_lock.py", "def route_ports_lock(http_guard_test):  # bind via socket_server\n"
+                                             "    return http_guard_test.bind()\n", "the commit that lands reworded")
+    branch(r, "main", "pr~1")
+    merged4 = commit(r, "other.txt", "unrelated\n", "the merge point")
+    commit(r, "route_lock.py",
+           "# a C++ route test binds through socket_server, not a shell helper\n"
+           "def route_ports_lock(http_guard_test):\n"
+           "    # three spellings, each enough to mean a server starts\n"
+           "    return http_guard_test.bind()\n"
+           "def route_ports_lock_unused():\n"
+           "    return None\n",
+           "a later PR rewrote it in a fuller form: longer file, same identifiers, those exact lines never on main")
+    chk("SUPERSEDED", classify_commit(r, reworded_sha, "main", after=merged4)[0],
+        "a base that kept the change in other words is SUPERSEDED, not LOST (the reworded landing, engine#2504)")
+    d.cleanup()
+
+    # ...and the threshold is load-bearing: half the identifiers surviving is not "the base kept this change". One of
+    # this commit's two identifiers is on the base for an unrelated reason, the other is nowhere, and the answer is
+    # still LOST -- otherwise every lost line that mentions a common helper name would read as a supersession.
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    branch(r, "pr")
+    half_sha = commit(r, "half.config", "half_lost_knob=aa11 shared_existing_helper=1\n", "one name is common")
+    branch(r, "main", "pr~1")
+    merged5 = commit(r, "other.txt", "shared_existing_helper=9\n", "the merge point")
+    commit(r, "half.config", "shared_existing_helper=9\nunrelated_b=2\n",
+           "a later PR rewrites the file: it keeps the common name, drops the lost knob, and the file is longer")
+    chk("LOST", classify_commit(r, half_sha, "main", after=merged5)[0],
+        "one identifier surviving out of two is not a reworded landing: the row is LOST")
     d.cleanup()
 
     # The same content, already on the base by another commit: not a loss.

@@ -156,17 +156,21 @@ def moved_since(repo, line, since, base_ref, path, base_text):
         and a later commit touched it. This is #2504 exactly -- its missing lines are all silent on the
         exact test, yet a later commit (a20f6ee89, #2508) rewrites `httplib::Server`, which main carries
         three times. Requiring the token to be present is what stops a dropped feature from being called
-        superseded because some unrelated commit elsewhere in the file happened to mention a shared word.
+        superseded because some unrelated commit elsewhere in the file happened to mention a shared word,
+        and requiring it to be ABSENT from the file as of the merge commit is what stops a word the file
+        already carried from satisfying -S on a count change (engine#2718 review; #2504 passes because
+        `httplib` is new to its file at the merge).
     """
     if git(repo, "log", "--oneline", "-S", line, f"{since}..{base_ref}", "--", path).stdout.strip():
         return "line"
     tok = distinctive_token(line)
-    # shortcut: the token is the line's longest identifier, which on a real line can be a generic word
-    # (measured: #2504 resolves through `executable`). The remaining weakness is therefore a SUPERSEDED for a
-    # loss, not the reverse -- the detail string names the token so a reader can rule it out, and the exact-line
-    # test above always gets first refusal. Upgrade by requiring the token to be absent from the rest of the base
-    # file before the merge, so a word the whole file already used cannot decide it.
+    # engine#2718 review: the token is the line's longest identifier, so on a real line it can be a word the
+    # file already used everywhere (`executable` resolved #2504). A token that was ALREADY in the file before
+    # the merge cannot be evidence that this line's content landed -- some unrelated commit that mentions a
+    # shared word satisfies the -S test, and the verdict then reads SUPERSEDED, which exits 0. That is the
+    # silent direction, so the token must be absent from the file as of the merge commit and present after it.
     if tok and tok in base_text and \
+            not git(repo, "show", f"{since}:{path}").stdout.count(tok) and \
             git(repo, "log", "--oneline", "-S", tok, f"{since}..{base_ref}", "--", path).stdout.strip():
         return "token"
     return ""
@@ -797,6 +801,29 @@ def self_test():
            "a later commit carries the same content by name, in other words")
     chk("SUPERSEDED", classify_commit(r, rewritten_sha, "main", after=merge)[0],
         "a base that carries the missing line's own token, changed later, is SUPERSEDED (#2504's shape)")
+
+    # engine#2718 review: the token test is evidence only when the token is NEW to the file. `-S <token>` fires
+    # whenever the token's OCCURRENCE COUNT changes, so a word the file already carried answers "yes, a later
+    # commit changed it" for a line that was never there -- and SUPERSEDED exits 0, so the cost is silence. The
+    # old word has to appear twice before the merge, because that is the only way a later commit can make its
+    # count DROP (measured both directions on this fixture: with the guard the dropped feature is LOST, without
+    # it SUPERSEDED). #2504 is unaffected and must stay SUPERSEDED: `httplib` is absent from its file at the
+    # merge commit (fafcf593b) and present three times on main, so that token really is new.
+    d, r = scratch()
+    commit(r, "cfg.py", "session_capacity = 8\nsession_capacity_max = 64\n",
+           "the file already carries the old word TWICE, so its count can drop later")
+    branch(r, "pr")
+    dropped = commit(r, "cfg.py",
+                     "session_capacity = 8\nsession_capacity_max = 64\n"
+                     + "".join(f"def slot_{i}():\n    return session_capacity * {i + 2}\n\n"
+                               for i in range(3)),
+                     "three dropped functions that name only the pre-existing word")
+    branch(r, "main", "pr~1")     # the merge point WITHOUT the feature, as in the #2504 arm above
+    merge5 = git(r, "rev-parse", "HEAD").stdout.strip()
+    commit(r, "cfg.py", "session_capacity_max = 64\n",
+           "a later commit removes one use of the old word, so -S finds a count change inside the range")
+    chk("LOST", classify_commit(r, dropped, "main", after=merge5)[0],
+        "a token the file already carried before the merge cannot make a dropped line SUPERSEDED")
     d.cleanup()
 
     # The gitlink route (#2583/#2554): a submodule pointer prints nothing from `git show <rev>:<path>`, so

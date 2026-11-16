@@ -4235,3 +4235,12 @@ control the executor:
 
 On a loaded box, compare one op with MatMul in the same run rather than across runs: MatMul's share moves with load
 much less than the wall total does.
+
+**RoPE pair order (engine#2673).** The forward's RoPE rotates half-split pairs (i, i + rot/2), the HF `rotate_half`
+form. chatglm3's attention nodes (28 `com.ryzenai:GQO` in `chatglm3-6b-onnx-ryzenai-npu`'s `fusion.onnx`) state
+`rotary_interleaved = 1` with `rotary_embedding_dim = 64`, meaning consecutive pairs (2i, 2i+1) over the first 64 of
+128 head dims. Served half-split, both 1.7 chatglm3 packs answered fluently but wrong: "12 times 7" and then
+end-of-sequence, and "Neil Armstrong. Neil Armstrong." The importer now carries the nodes' `rotary_interleaved` into
+the container config as `rope_interleaved`, unless the pack's config states one. Nodes that disagree are refused by
+name. `q4nx_semantics` reads the key, and the forward rotates (2i, 2i+1) through `q4nx_rope_rotate_pairs()`; frequency
+i belongs to pair i in both forms. Proportional RoPE keeps its whole-head pairing.

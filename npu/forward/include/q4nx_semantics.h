@@ -110,6 +110,9 @@ typedef struct {
     /* Interleaved/multimodal RoPE variant that this forward does not implement.
      * Source: rope_parameters.mrope_interleaved (or rope_type != "default"). */
     int mrope;
+    /* engine#2673: RoPE pair order. 0 = half-split, pairs (i, i + rot/2) (HF rotate_half, NeoX); 1 = consecutive pairs
+     * (2i, 2i+1) over the first `rot` channels -- chatglm3 (GQO rotary_interleaved = 1). Source: config "rope_interleaved". */
+    int rope_interleaved;
     /* MVROPE sections: how many of the rotary frequencies belong to each of the (t, h, w) axes.  Read from
      * rope_scaling.mrope_section (Hugging Face) or rope_parameters.mrope_section (OGA/Qwen3.5); zeros and
      * n_mrope_section == 0 mean "declared mrope without sections", which a consumer must refuse rather than

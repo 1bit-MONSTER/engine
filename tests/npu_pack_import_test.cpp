@@ -5534,6 +5534,45 @@ void test_embedding_in_component(const std::string& root) {
 }
 
 
+// engine#2673: the attention nodes' rotary_interleaved reaches the container config. chatglm3's 28 GQO state 1; a graph
+// whose nodes state 0 or nothing writes nothing (half-split stays the default); two that disagree are refused by name.
+void test_rope_interleaved_from_graph(const std::string& root) {
+    const auto gqo = [](const std::string& op, int ri) {
+        std::string n;
+        pb::str(n, 1, "x");
+        pb::str(n, 4, op);
+        if (ri >= 0) {
+            std::string a;
+            pb::str(a, 1, "rotary_interleaved");
+            pb::ints(a, 3, ri);
+            pb::tag(n, 5, 2);
+            pb::varint(n, a.size());
+            n += a;
+        }
+        return n;
+    };
+    const fs::path dir = fs::path(root) / ("rope-interleave." + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string g = (dir / "g.onnx").string();
+    put_file(g, pb::model({}, {gqo("GQO", 1), gqo("GQO", 1)}));
+    const std::string a = pi::rope_interleaved_exported(g);
+    check(a.find("\"rope_interleaved\":true") != std::string::npos,
+          "rope pair order: chatglm3-shaped GQO (rotary_interleaved 1) -> config rope_interleaved true (" + a + ")");
+    put_file(g, pb::model({}, {gqo("GroupQueryAttention", 0)}));
+    const std::string b = pi::rope_interleaved_exported(g);
+    check(b == "{}", "rope pair order: rotary_interleaved 0 writes nothing (half-split default) (" + b + ")");
+    put_file(g, pb::model({}, {gqo("GQO", -1)}));
+    const std::string c0 = pi::rope_interleaved_exported(g);
+    check(c0 == "{}", "rope pair order: a node that states nothing writes nothing (" + c0 + ")");
+    put_file(g, pb::model({}, {gqo("GQO", 1), gqo("GQO", 0)}));
+    const std::string d = pi::rope_interleaved_exported(g);
+    check(d.rfind("refused:", 0) == 0 && d.find("disagree") != std::string::npos,
+          "rope pair order: nodes that disagree are refused by name (" + d + ")");
+    fs::remove_all(dir);
+}
+
+
 // engine#2663: Gemma-3-4b-it-mm 1.7's component -- the table is `lm_head.weight` f32 (tied; no `embed_tokens` name) and a
 // 0-D `model.language_model.embed_tokens.embed_scale` multiplies it. The table is read and scaled by embed_scale into the
 // container's pre-scaled form; a scale other than sqrt(H) is refused; two unnamed 2-D candidates are not guessed between;
@@ -7564,6 +7603,7 @@ int main(int argc, char** argv) {
         test_per_layer_container(golden_dir.empty() ? "." : golden_dir);
         test_per_layer_import(golden_dir.empty() ? "." : golden_dir);
         test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
+        test_rope_interleaved_from_graph(golden_dir.empty() ? "." : golden_dir);
         test_embedding_gemma3mm_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);

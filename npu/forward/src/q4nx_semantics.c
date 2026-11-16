@@ -439,6 +439,8 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
     s->bidirectional = 0;
     if (get_num(json, "use_bidirectional_attention", &d)) s->bidirectional = d != 0;
     if (get_num(json, "tie_word_embeddings", &d)) { s->tie_embeddings = d != 0; s->tie_stated = 1; }
+    /* engine#2673: consecutive-pair RoPE (chatglm3), written by the importer from the graph's attention nodes */
+    if (get_num(json, "rope_interleaved", &d)) s->rope_interleaved = d != 0;
 
     /* layer_types -> the per-layer attention kind the forward dispatches on */
     {

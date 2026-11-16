@@ -33,9 +33,16 @@ The capture this reads is three files, and the recipe matters more than the pars
   echo 1 > $TR/tracing_on; sleep 300; echo 0 > $TR/tracing_on
   cat $TR/trace > capture.txt; journalctl -k -b 0 -o short-monotonic > after.txt
 
-Two rules, both learned by losing runs: **check a positive control first** (30 s of events; if the probe records
-nothing, the probe is wrong, not the device), and **never filter on an address list chosen minutes earlier** --
-the faulting IOVAs move faster than that (measured: a five-address filter saw 8 events, then 0 five minutes later).
+Three rules, all learned by losing runs: **check a positive control first** (30 s of events; if the probe records
+nothing, the probe is wrong, not the device); **never filter on an address list chosen minutes earlier** -- the
+faulting IOVAs move faster than that (measured: a five-address filter saw 8 events, then 0 five minutes later); and
+**count the probes back after cleanup, because the delete can lie**. Measured 2026-11-16 on one box, five tries:
+a fresh event deletes; an event that recorded 810 or 1,148 events deletes; one that reported `echo: I/O error` was
+**gone anyway**; and an event that had recorded ~40,000 events stayed armed through three deletes, a buffer clear and
+a `free_buffer` kick -- `enable=0`, so it records nothing, but it holds a kprobe slot on `iommu_map` until reboot.
+So: the error message is wrong in both directions, and **only `grep -c . kprobe_events` before and after tells you
+whether you cleaned up**. Keep the capture as short as the question allows, and prefer the one probe the question
+needs (the unmap side answers most of them) over two.
 
 Usage:
   tools/diag/iommu_map_side.py --trace capture.txt --before before.txt --after after.txt

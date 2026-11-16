@@ -63,6 +63,12 @@ add_test(NAME gpu_hold_escape COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_es
 # and decides nothing -- the refusal at take is still the authority, because a queue wait can outlast the condition.
 add_test(NAME gpu_hold_queue_state COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_state_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 
+# engine#2727: a payload that re-invokes gpu-hold on the queue it is ALREADY inside queues behind its own ticket and
+# waits for it -- 764 s of a 14-minute window with the GPU idle on 2026-11-16, while coder-llm (every PR's pr-agent
+# check) waited 25 min behind it. The queue is now exported to the payload (GPU_HOLD_HELD_QUEUE/LABEL) and a same-queue
+# nest is refused (rc 2); a DIFFERENT queue still runs (npu-hold's documented GPU claim). Five arms, private queue.
+add_test(NAME gpu_hold_nested COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_nested_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
 # engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
 # queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
 # Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a

@@ -110,6 +110,20 @@ if [ "${1:-}" = --keep-failed-log ]; then keep_failed_log "$2" "$3"; exit 0; fi 
 # open. Claims are served in arrival order, a killed run cannot leave the token behind, the die temperature
 # gates the start and aborts the run, and the hold has a deadline. Without the helper this script behaves
 # exactly as before. HW_GATE_GPU_HOLD=0 skips the queue; the inner run (GPU_HOLD=1) uses the outer claim.
+# engine#2727: a lane that already runs the gate inside its OWN gpu-hold ticket ("gpu-hold -- scripts/hw-gate.sh") is
+# inside a claim already, on this queue. gpu-hold now refuses a same-queue nest by name, so without this the gate would
+# exit 2 on a pattern that used to run (wastefully: it queued behind its own ticket and waited). Use the outer claim
+# instead, which is what HW_GATE_TOKEN=none has always meant for the inner run. A ticket on a DIFFERENT queue - npu-hold,
+# which is how the release gate runs - is not this case and still takes its own GPU claim below.
+if [ "${GPU_HOLD:-}" != 1 ] && [ "${HW_GATE_GPU_HOLD:-1}" != 0 ] && [ -z "${HW_GATE_TOKEN:-}" ] &&
+   [ -n "${GPU_HOLD_HELD_QUEUE:-}" ]; then
+    _gq=${GPU_QUEUE_DIR:-$([ -d "${ONEBIT_HOLD_DIR:-/var/lib/1bit-fleet}" ] && printf '%s' "${ONEBIT_HOLD_DIR:-/var/lib/1bit-fleet}/gpu-queue" || printf '%s' "$HOME/GPU-QUEUE")}
+    _here=$(cd "$_gq" 2> /dev/null && pwd -P || printf '%s' "$_gq")
+    _held=$(cd "$GPU_HOLD_HELD_QUEUE" 2> /dev/null && pwd -P || printf '%s' "$GPU_HOLD_HELD_QUEUE")
+    if [ "$_here" = "$_held" ]; then
+        GPU_HOLD=1 HW_GATE_TOKEN=none exec "$0" "$@"
+    fi
+fi
 if [ "${GPU_HOLD:-}" != 1 ] && [ "${HW_GATE_GPU_HOLD:-1}" != 0 ] && [ -z "${HW_GATE_TOKEN:-}" ]; then
     hold=$(command -v gpu-hold 2> /dev/null || true)
     if [ -z "$hold" ] && [ -x "$(dirname "$0")/gpu-hold" ]; then hold="$(dirname "$0")/gpu-hold"; fi

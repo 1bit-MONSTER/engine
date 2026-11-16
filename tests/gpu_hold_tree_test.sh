@@ -31,6 +31,12 @@ command -v setsid > /dev/null 2>&1 || { echo "skip: no setsid"; exit 77; }
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
+# The take-time refusal reads the kernel log and refuses a ticket after a recent fault line (#2480/#2498). On a box
+# whose NPU is faulting every few minutes (#2542) that refuses EVERY ticket, so this test would fail with rc 78 for a
+# reason that is not the code -- measured 2026-11-16 16:4xZ. The fixture is the same override the fault-abort test
+# uses: a log with no fault lines in it, so the refusal runs for real and finds nothing.
+printf 'kernel: gpu-hold test fixture: no fault lines in this log\n' > $scratch/klog
+export GPU_HOLD_KLOG_FILE=$scratch/klog
 q=$scratch/queue; mkdir -p "$q"
 
 # THREE levels: hold → wrapper → mid → the work. Every orphan had at least this depth (a ticket's shell

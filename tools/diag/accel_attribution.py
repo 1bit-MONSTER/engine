@@ -190,6 +190,14 @@ def self_test():
     assert [p for p, _ in spans_ticket_boundaries(lt)] == ["111"], spans_ticket_boundaries(lt)
     assert spans_ticket_boundaries(holder_table(samples)) == [], "the plain fixture must not trip the arm"
 
+    # THE RENDERER, not only the analysis (engine#2542): the "holders seen" line read a `ticket` key that
+    # holder_table() stopped building when it grew `spans`, so the merged tool raised KeyError on the first real log
+    # (3,500+ samples) and had only ever run on fixtures where that line was not reached. Rendering is asserted here
+    # because a reader that crashes on real data is not a reader.
+    rendered = render_holders(holder_table(leaky))
+    assert "gpu-hold cl-b 2" in rendered, rendered          # the LAST span: what the process was relabelled with
+    assert "cl-a" not in rendered, rendered
+
     # A partially written row must not kill the reader.
     import tempfile
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
@@ -201,6 +209,17 @@ def self_test():
     finally:
         os.unlink(p)
     print("accel_attribution self-test: ok")
+
+
+def render_holders(t):
+    """The "holders seen" block. A separate function so the self-test can drive it: this line read a `ticket` key
+    that holder_table() stopped building when it grew `spans`, and the crash only appeared on the first real log."""
+    out = []
+    for pid, e in sorted(t.items(), key=lambda kv: -kv[1]["n"]):
+        last = e["spans"][-1][0] if e["spans"] else "-"   # the LAST span: what the process was relabelled with
+        out.append(f"  {pid:<9} {e['first']}..{e['last']} ({e['last'] - e['first']:>5}s) n={e['n']:<4} "
+                   f"{e['cmd'][:46]}  {last[:30]}")
+    return "\n".join(out)
 
 
 def main():
@@ -244,9 +263,7 @@ def main():
                 print(f"      {a}..{b} ({b - a:>4}s)  {tk[:46]}")
     if t:
         print("\nholders seen (pid, first..last, samples, ticket):")
-        for pid, e in sorted(t.items(), key=lambda kv: -kv[1]["n"]):
-            print(f"  {pid:<9} {e['first']}..{e['last']} ({e['last'] - e['first']:>5}s) n={e['n']:<4} "
-                  f"{e['cmd'][:46]}  {e['ticket'].rstrip()[:30]}")
+        print(render_holders(t))
 
     print(f"\nattributions: {len(attrs)}")
     for line in explain(samples, attrs, args.window):

@@ -24,7 +24,11 @@ outstanding. That is not measurable by a load; it needs the two events in one ca
 This reads two inputs and correlates them:
 
   * `--trace FILE`  a `tracefs` capture with a kprobe on the unmap path, e.g.
-      echo 'p:unm iommu_unmap_fast iova=%di size=%si' >> kprobe_events
+      # iommu_unmap_fast(domain, iova, size) -> %rdi/%rsi/%rdx on x86-64. Written as %di/%si the probe
+      # FIRES and parses, but the iova column holds the domain POINTER and the size column holds the iova
+      # (measured 2026-11-16: iova=0xffff8e83841c3a00 size=0x45ec0), so nothing can ever correlate --
+      # which this tool would print as an ordinary negative. Use %si/%dx and check the values look like IOVAs.
+      echo 'p:unm iommu_unmap_fast iova=%si size=%dx' >> kprobe_events
       ... (run the workload) ... cat trace > cap.txt
   * `--journal FILE` (or stdin) kernel-log lines carrying `IO_PAGE_FAULT ... address=0x...`
 
@@ -108,6 +112,20 @@ def correlate(unmaps, faults, window_us):
     return rows
 
 
+IOVA_MAX = 1 << 47          # x86-64 IOMMU IOVAs are below this; a canonical kernel pointer (0xffff8...) is not
+
+
+def pointer_shaped(unmaps):
+    """True when the capture's iova column cannot be IOVAs at all.
+
+    A kprobe whose format string names the wrong argument (engine#2592 review: `%di` instead of `%si` puts the
+    domain pointer in the iova field) yields values like 0xffff8e83841c3a00. Nothing can correlate them, and this
+    tool's ordinary negative -- "no fault shares an iova with an unmap" -- would read as a real finding. Every iova
+    at or above 2**47 is that mistake, not a measurement.
+    """
+    return bool(unmaps) and all(u[1] >= IOVA_MAX for u in unmaps)
+
+
 def render(rows, unmaps, window_us):
     lines = [f"unmap events parsed: {len(unmaps)} over {len({u[1] for u in unmaps})} distinct iova(s)"]
     if unmaps:
@@ -148,6 +166,12 @@ def self_test():
     # 5. the parser reads a real tracefs line shape
     got = parse_trace(["    bash-1234 [001] .... 100.000000: unm: (iommu_unmap_fast+0x0/0x20) iova=0x4128000 size=0x1000"])
     chk(len(got) == 1 and got[0][1] == 0x4128000 and got[0][2] == 0x1000, "a tracefs unmap line parses (iova, size)")
+    # 6. a pointer-shaped iova column is refused, not reported as "nothing correlated". My first recipe named %di/%si
+    #    for a (domain, iova, size) function, which put the domain pointer here and made every capture uncorrelatable.
+    ptr = parse_trace(["    pi-1-1 [016] d.h.. 358.053875: unm: (iommu_unmap_fast+0x4/0x10) "
+                       "iova=0xffff8e83841c3a00 size=0x45ec0"])
+    chk(pointer_shaped(ptr), "a pointer-shaped iova column is detected, not read as uncorrelated")
+    chk(not pointer_shaped(got), "a real IOVA column is not mistaken for one")
     return 0 if ok else 1
 
 
@@ -174,6 +198,12 @@ def main():
         print("unmap_fault_order: no unmap events in the trace -- an empty capture is not a negative; was the "
               "probe armed before the load, and did it fire? (see --self-test for the four shapes)", file=sys.stderr)
         return 3
+    if pointer_shaped(unmaps):
+        print("unmap_fault_order: this capture's iova column is not IOVA-shaped (every value >= 2**47, e.g. "
+              f"{unmaps[0][1]:#x}): the kprobe is naming the wrong argument. iommu_unmap_fast(domain, iova, size) "
+              "is %si/%dx, not %di/%si -- re-arm and check that the values look like IOVAs before reading any "
+              "result from it.", file=sys.stderr)
+        return 4
     lines = []
     for j in (args.journal or [None]):
         try:

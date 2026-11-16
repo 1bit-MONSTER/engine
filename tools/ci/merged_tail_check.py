@@ -77,9 +77,19 @@ def git(repo, *args, check=False):
     return p
 
 
+# `gh` may simply not be installed -- the CI container does not have it, and the first version of this
+# tool crashed there instead of reporting that it could not look, which is the same fault the tool
+# exists to catch one level up. Missing, unauthorised and network-down all answer like this: a
+# non-zero result with a reason, never an exception and never an empty success.
+GH_BIN = "gh"
+
+
 def gh(*args):
-    p = subprocess.run(["gh", *args], capture_output=True, text=True)
-    return p
+    try:
+        return subprocess.run([GH_BIN, *args], capture_output=True, text=True)
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        return subprocess.CompletedProcess([GH_BIN, *args], 127, "",
+                                           f"{GH_BIN} could not be run: {e}")
 
 
 def significant_lines(text):
@@ -342,7 +352,9 @@ def self_test():
     def scratch():
         d = tempfile.TemporaryDirectory()
         r = pathlib.Path(d.name)
-        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=r, check=True)
+        # `git init -b` needs git >= 2.28; the self-test must not depend on the runner's git.
+        subprocess.run(["git", "init", "-q"], cwd=r, check=True)
+        subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=r, check=True)
         subprocess.run(["git", "config", "user.email", "t@e"], cwd=r, check=True)
         subprocess.run(["git", "config", "user.name", "t"], cwd=r, check=True)
         return d, r
@@ -467,6 +479,17 @@ def self_test():
     # own "cloned an empty repository" warning), and shipping a red arm is worse than shipping none. The guard was verified by
     # hand against a genuine shallow clone of this repo (it refuses, and --allow-shallow proceeds); upgrade by cloning a real
     # origin over file:// with two commits and asserting both directions.
+    # And the arm CI added: this row FAILED in the build container because `gh` is not installed
+    # there, so the call raised FileNotFoundError instead of answering "I could not look". Measured
+    # on #2659: 11/11 arms locally, 75 - merged_tail_check_self (Failed) in CI.
+    global GH_BIN
+    saved, GH_BIN = GH_BIN, "gh-that-is-not-installed"
+    try:
+        chk(2, report(pathlib.Path("."), 1, 1, "1bit-MONSTER/engine")[0],
+            "a missing gh is rc 2, not a crash and not an empty pass")
+    finally:
+        GH_BIN = saved
+
     return rc
 
 

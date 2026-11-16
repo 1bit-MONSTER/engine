@@ -135,6 +135,31 @@ with tempfile.TemporaryDirectory() as tmp:
     check(r.returncode == 1 and state(out, paths["head.gguf"]) == "oid differs",
           f"rewritten in place at the same size -> re-hashed and caught (rc {r.returncode})")
 
+    # 5b. a cached hash does not outlive a file REPLACED IN PLACE with the same size AND the same mtime.
+    # The docstring of the cache says an entry counts only while "size, mtime and inode" are what was hashed; arms
+    # 5 covers size+mtime (a rewrite bumps mtime_ns) and nothing covered the inode, so dropping st_ino from the
+    # stamp passed every arm (review of engine#2619). This is the shape that needs it: rename a different file over
+    # the path, then put the original times back, so only the inode and the bytes differ.
+    victim = paths["head.gguf"]
+    # arm 5 left the file rewritten; put the good bytes back so the baseline below is a real one, with its own
+    # mtime so the cache entry from arm 5 cannot be the thing that makes this pass.
+    open(victim, "wb").write(good)
+    os.utime(victim, ns=(0, os.stat(victim).st_mtime_ns + 5_000_000_000))
+    holdings(base[:1])
+    r, out = run(tmp)
+    check(r.returncode == 0, "the head copy is ok before the inode swap")
+    st = os.stat(victim)
+    other = os.path.join(tmp, "other.gguf")
+    open(other, "wb").write(b"X" * st.st_size)          # same size, different bytes
+    os.replace(other, victim)                            # new inode at the same path
+    os.utime(victim, ns=(st.st_atime_ns, st.st_mtime_ns))  # and the times put back
+    st2 = os.stat(victim)
+    check(st2.st_ino != st.st_ino and st2.st_size == st.st_size and st2.st_mtime_ns == st.st_mtime_ns,
+          "the fixture replaces the inode and keeps size+mtime (else the arm below proves nothing)")
+    r, out = run(tmp)
+    check(r.returncode == 1 and state(out, victim) == "oid differs",
+          f"same path, new inode, same size and mtime -> re-hashed and caught (rc {r.returncode})")
+
     # 6. a missing copy is drift, not a skip.
     holdings([{"pin": "x/Text", "file": "tokenizer_config.json", "path": os.path.join(box, "gone.json")}])
     r, out = run(tmp)

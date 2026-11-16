@@ -5669,6 +5669,164 @@ void test_embedding_gemma3mm_component(const std::string& root) {
 }
 
 
+// engine#2686: in the external-data genre, Gemma-3-4b-it-mm 1.7's decoder head is a plain com.microsoft MatMulNBits --
+// qweight [V, K/32, 16], f16 scales, qzeros -- not a packed tile. A one-layer external pack whose only matmul is such a head
+// imports to completion and writes lm_head.weight; before engine#2686 it threw "external tile: ... B is not ... B".
+void test_external_standard_head(const std::string& root) {
+    const fs::path dir = fs::path(root) / ("ext-std-head." + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const int H = 256, V = 64, BLK = 32, G = H / BLK;
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"llama","hidden_size":256,"intermediate_size":512,"num_hidden_layers":1,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":128,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":false})");
+    put_file((dir / "genai_config.json").string(),
+             R"({"model":{"decoder":{"filename":"m.onnx","hidden_size":256,"num_hidden_layers":1,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_size":128,"intermediate_size":512}}})");
+    put_file((dir / "tokenizer.json").string(), R"({"model":{"type":"BPE"}})");
+    std::string embed(size_t(V) * H * 4, '\0');
+    for (int i = 0; i < V * H; ++i) { const float v = float((i % 61) - 30) * 0.5f; std::memcpy(&embed[size_t(i) * 4], &v, 4); }
+    std::string qw(size_t(V) * G * (BLK / 2), '\0');
+    for (size_t i = 0; i < qw.size(); ++i) qw[i] = char((i * 37) & 0xFF);
+    std::string sc(size_t(V) * G * 2, '\0');   // f16 scales: 0x2C00 = 0.0625
+    for (int i = 0; i < V * G; ++i) { sc[size_t(i) * 2] = 0x00; sc[size_t(i) * 2 + 1] = 0x2C; }
+    std::string zp(size_t(V) * ((G + 1) / 2), char(0x88));
+    std::string fnorm(size_t(H) * 4, '\0');
+    for (int i = 0; i < H; ++i) { const float v = 0.5f; std::memcpy(&fnorm[size_t(i) * 4], &v, 4); }
+    // one packed sibling (a zero o_proj, 4 tiles x 6 subvolumes): it is what routes the pack to the external-data writer,
+    // the route the real Gemma pack takes, and it decodes to zeros
+    const std::string opk(size_t(4) * 6 * 2176, '\0');
+    const uint64_t o_qw = embed.size(), o_sc = o_qw + qw.size(), o_zp = o_sc + sc.size(), o_fn = o_zp + zp.size(),
+                   o_op = o_fn + fnorm.size();
+    put_file((dir / "m.onnx.data").string(), embed + qw + sc + zp + fnorm + opk);
+    put_file((dir / "m.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "m.onnx.data", 0, uint64_t(embed.size())),
+                        pb::tensor("lm_head.MatMulNBits.qweight", {V, G, BLK / 2}, "m.onnx.data", o_qw, uint64_t(qw.size()), 2),
+                        pb::tensor("lm_head.MatMulNBits.scales", {V * G}, "m.onnx.data", o_sc, uint64_t(sc.size()), 10),
+                        pb::tensor("lm_head.MatMulNBits.qzeros", {V * G / 2}, "m.onnx.data", o_zp, uint64_t(zp.size()), 2),
+                        pb::tensor("model.layers.1.final_norm_layernorm.weight", {H}, "m.onnx.data", o_fn, uint64_t(fnorm.size())),
+                        pb::placeholder("model.layers.0.attn.o_proj.MatMulNBits.qweight.empty"),
+                        pb::placeholder("model.layers.0.attn.o_proj.MatMulNBits.scales.empty"),
+                        pb::tensor("model.layers.0.attn.o_proj.MatMulNBits.qweight.packed", {int64_t(opk.size())}, "m.onnx.data",
+                                   o_op, uint64_t(opk.size()))},
+                       {pb::matmulnbits("o", {"x", "model.layers.0.attn.o_proj.MatMulNBits.qweight.empty",
+                                              "model.layers.0.attn.o_proj.MatMulNBits.scales.empty", "y"},
+                                        H, H, 4, 128, "MatMulNBitsBf"),
+                        pb::matmulnbits("lm_head", {"x", "lm_head.MatMulNBits.qweight", "lm_head.MatMulNBits.scales",
+                                                    "lm_head.MatMulNBits.qzeros"},
+                                        H, V, 4, BLK, "MatMulNBits")}));
+    pi::Options opt;
+    opt.allow_incomplete = true;
+    std::string why;
+    try {
+        (void)pi::import_pack(dir.string(), (dir / "out").string(), opt);
+    } catch (const std::exception& e) {
+        why = e.what();
+    }
+    bool head = false;
+    if (fs::exists(dir / "out" / "model.q4nx")) {
+        std::ifstream f(dir / "out" / "model.q4nx", std::ios::binary);
+        uint64_t hlen = 0;
+        f.read(reinterpret_cast<char*>(&hlen), 8);
+        std::string hdr(size_t(hlen), '\0');
+        f.read(hdr.data(), std::streamsize(hlen));
+        head = hdr.find("\"lm_head.weight\"") != std::string::npos;
+    }
+    check(why.find("external tile") == std::string::npos && head,
+          "external standard head: a plain MatMulNBits head (block 32, f16 scales) is read as such and written as "
+          "lm_head.weight (" + why + ")");
+    fs::remove_all(dir);
+}
+
+
+// engine#2686: a MatMulNBitsBf blob packed at its stored shape (real_N x real_K) larger than the logical N x K. Built here
+// at stored 128 x 256 with the logical 64 x 128 corner filled and the rest zero, the shape of Gemma-3-4b-it-mm 1.7's
+// gate_proj (N padded) and down_proj (K padded). Arms: the padded decode recovers every planted code, zero point and
+// scale; control: the plain decode at the logical shape refuses the blob by its size; a non-zero byte in the padding is
+// refused by name; and an unpadded node (real_* 0) decodes exactly as before.
+void test_external_tile_padded() {
+    const int N = 64, K = 128, RN = 128, RK = 256;
+    const auto code_of = [](int row, int col) { return uint8_t((row * 7 + col * 3) % 16); };
+    const auto zp_of = [](int row) { return uint8_t((row * 5 + 1) % 16); };
+    const auto scale_of = [](int row) { return 0.015625f * float(1 + row % 7); };
+    const int blocks = RK / 128, tiles = RN / 64, per_tile = 2 * (blocks + 1);
+    std::string blob(size_t(tiles) * per_tile * 2176, '\0');
+    for (int tile = 0; tile < N / 64; ++tile)
+        for (int half = 0; half < 2; ++half)
+            for (int kk = 1; kk <= K / 128; ++kk) {
+                char* subv = &blob[size_t(tile * per_tile + kk * 2 + half) * 2176];
+                for (int r = 0; r < 32; ++r) {
+                    const int row = tile * 64 + half * 32 + r;
+                    const uint16_t sb = pi::bf16_bits_of(scale_of(row));
+                    subv[2112 + r * 2] = char(sb & 0xFF);
+                    subv[2112 + r * 2 + 1] = char(sb >> 8);
+                    uint8_t& zb = reinterpret_cast<uint8_t&>(subv[2048 + r / 2]);
+                    zb = uint8_t(r % 2 == 0 ? ((zb & 0xF0) | zp_of(row)) : ((zb & 0x0F) | (zp_of(row) << 4)));
+                    for (int c = 0; c < 128; ++c) {
+                        const int cp = r / 2;
+                        uint8_t& b = reinterpret_cast<uint8_t&>(subv[(cp % 4) + c * 4 + (cp / 4) * 512]);
+                        const uint8_t v = code_of(row, (kk - 1) * 128 + c);
+                        b = uint8_t(r % 2 == 0 ? ((b & 0xF0) | v) : ((b & 0x0F) | (v << 4)));
+                    }
+                }
+            }
+    const auto* d = reinterpret_cast<const uint8_t*>(blob.data());
+    std::string err;
+    const pi::Q4 q = pi::decode_external_tile_padded(d, blob.size(), N, K, RN, RK, err);
+    bool ok = err.empty() && q.N == N && q.K == K;
+    for (int row = 0; ok && row < N; ++row) {
+        for (int col = 0; ok && col < K; ++col) ok = q.codes[size_t(row) * K + col] == code_of(row, col);
+        for (int g = 0; ok && g < K / 32; ++g)
+            ok = q.scale[size_t(row) * (K / 32) + g] == scale_of(row) &&
+                 q.zero[size_t(row) * (K / 32) + g] == -float(zp_of(row)) * scale_of(row);
+    }
+    check(ok, "padded external tile: every planted code, zero point and scale of the logical 64 x 128 is recovered from "
+              "the stored 128 x 256 (" + err + ")");
+    std::string e2;
+    (void)pi::decode_external_tile(d, blob.size(), N, K, e2);
+    check(!e2.empty(), "padded external tile: control -- the plain decode at the logical shape refuses it by size (" + e2 + ")");
+    std::string nz = blob;
+    nz[size_t((1 * per_tile + 2) * 2176 + 2112)] = 0x3c;   // a scale byte in tile 1 (rows 64..127: all padding)
+    std::string e3;
+    (void)pi::decode_external_tile_padded(reinterpret_cast<const uint8_t*>(nz.data()), nz.size(), N, K, RN, RK, e3);
+    check(e3.find("is not zero") != std::string::npos, "padded external tile: a non-zero byte in the padding is refused (" + e3 + ")");
+    std::string nzk = blob;
+    nzk[size_t((0 * per_tile + 4) * 2176 + 2112)] = 0x3c;   // K block 2 (columns 128..255: padding) of tile 0
+    std::string e4;
+    (void)pi::decode_external_tile_padded(reinterpret_cast<const uint8_t*>(nzk.data()), nzk.size(), N, K, RN, RK, e4);
+    check(e4.find("is not zero") != std::string::npos, "padded external tile: a non-zero byte in the K padding is refused (" + e4 + ")");
+    std::string e5, e6;
+    const std::string small = blob.substr(0, size_t(1) * (2 * (1 + 1)) * 2176);   // an unpadded 64 x 128 blob
+    const pi::Q4 a = pi::decode_external_tile(reinterpret_cast<const uint8_t*>(small.data()), small.size(), 64, 128, e5);
+    const pi::Q4 b = pi::decode_external_tile_padded(reinterpret_cast<const uint8_t*>(small.data()), small.size(), 64, 128, 0, 0, e6);
+    check(e5 == e6 && a.codes == b.codes && a.scale == b.scale && a.zero == b.zero,
+          "padded external tile: a node with no real_* decodes exactly as before");
+    // #2690 review, the negative case: a node that DECLARES itself unpadded (real_* == logical) also decodes exactly as before
+    std::string e7;
+    const pi::Q4 c = pi::decode_external_tile_padded(reinterpret_cast<const uint8_t*>(small.data()), small.size(), 64, 128, 64, 128, e7);
+    check(e7 == e5 && a.codes == c.codes && a.scale == c.scale && a.zero == c.zero,
+          "padded external tile: real_* equal to the logical shape decodes exactly as before");
+    // #2690 review: N padded alone (real_K absent), stored 128 x 128 for the logical 64 x 128 -- the gate/up shape on one axis
+    {
+        const int pt1 = 2 * (1 + 1);
+        std::string nb(size_t(2) * pt1 * 2176, '\0');
+        nb.replace(0, size_t(pt1) * 2176, blob.substr(0, size_t(pt1) * 2176));   // tile 0 = the planted rows 0..63, K block 0
+        std::string e8;
+        const pi::Q4 qn = pi::decode_external_tile_padded(reinterpret_cast<const uint8_t*>(nb.data()), nb.size(), 64, 128, 128, 0, e8);
+        bool okn = e8.empty() && qn.N == 64 && qn.K == 128;
+        for (int row = 0; okn && row < 64; ++row)
+            for (int col = 0; okn && col < 128; ++col) okn = qn.codes[size_t(row) * 128 + col] == code_of(row, col);
+        check(okn, "padded external tile: N padded alone (stored 128 x 128, real_K not stated) is recovered (" + e8 + ")");
+    }
+    // #2690 review: a blob that fits neither shape names both in the refusal
+    std::string e9;
+    (void)pi::decode_external_tile_padded(d, blob.size() - 2176, N, K, RN, RK, e9);
+    check(e9.find("real_N x real_K = 128 x 256") != std::string::npos && e9.find("logical 64 x 128") != std::string::npos,
+          "padded external tile: a size mismatch names the stored and the logical shape (" + e9 + ")");
+}
+
+
 // engine#1725: the gemma-4 component is f32 and unquantised -- an `embed_tokens` table with no scales beside it -- and its
 // decoder also needs a PER-LAYER table. Two arms: the f32 token table alone is read, and a per-layer table is refused by
 // name rather than reported as a missing table. Measured sizes on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu:
@@ -7603,6 +7761,8 @@ int main(int argc, char** argv) {
         test_per_layer_container(golden_dir.empty() ? "." : golden_dir);
         test_per_layer_import(golden_dir.empty() ? "." : golden_dir);
         test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
+        test_external_tile_padded();
+        test_external_standard_head(golden_dir.empty() ? "." : golden_dir);
         test_rope_interleaved_from_graph(golden_dir.empty() ? "." : golden_dir);
         test_embedding_gemma3mm_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();

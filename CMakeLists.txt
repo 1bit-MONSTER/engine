@@ -2594,6 +2594,14 @@ endif()
     # bit. Host-GEMM, no device; skips (77) unless ONEBIT_TEST_Q4NX names a causal model with GDN layers.
     # engine#2689 item 3: several sequences in ONE batched pass. Host-GEMM, no device; skips (77) unless
     # ONEBIT_TEST_Q4NX names a container. Each row must be bit-identical to that sequence's own single-sequence run.
+    # engine#2689 item 3b: several in-flight requests share one decode pass. Host-GEMM, no device; skips (77) unless
+    # ONEBIT_TEST_Q4NX names a container. Threads, because a serve runs one worker per request.
+    add_executable(npu_batch_decode_test tests/npu_batch_decode_test.cpp)
+    target_include_directories(npu_batch_decode_test PRIVATE npu/forward/include app)
+    target_link_libraries(npu_batch_decode_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test npu_batch_decode_test)
+    add_test(NAME npu_batch_decode COMMAND npu_batch_decode_test)
+    set_tests_properties(npu_batch_decode PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(step_users_test tests/step_users_test.cpp)
     target_include_directories(step_users_test PRIVATE npu/forward/include)
     target_link_libraries(step_users_test PRIVATE onebit_npu_forward)

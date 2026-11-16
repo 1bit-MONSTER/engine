@@ -4757,6 +4757,19 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
                "a pass on it";
         return false;
     }
+    // engine#2738: the NPU_BATCH_CHECK oracle in step_batch_impl replays every row as ONE sequence, so under a multi-slot
+    // pass it compares a multi-sequence pass against a single-sequence replay and prints a guaranteed mismatch that reads
+    // exactly like the row-dependence bug the flag exists to find. A debug tool that lies is worse than one that says it
+    // does not apply here.
+    if (std::getenv("NPU_BATCH_CHECK")) {
+        bool multi = false;
+        for (size_t m = 1; m < M && !multi; m++) multi = slot[m] != slot[0];
+        if (multi) {
+            err_ = "step_users: NPU_BATCH_CHECK replays every row as one sequence, so it cannot judge a multi-slot pass "
+                   "(it would report a mismatch that is the pass's shape, not a bug); unset it for batched serving";
+            return false;
+        }
+    }
     int smax = -1;
     for (size_t m = 0; m < M; m++) {
         if (slot[m] < 0 || pos[m] < 0) { err_ = "step_users: negative slot or position"; return false; }
@@ -4768,6 +4781,17 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
                 return false;
             }
             // a new slot starts at its own position; nothing to check beyond the range above
+        } else if (m > 0 && pos[m] != pos[m - 1] + 1) {
+            // engine#2738 (found reviewing #2714): each row appends its K at its OWN position and then reads up to it, so
+            // a gap leaves a hole the next row reads as zeros, and a position that goes backwards appends over rows that
+            // are already in the cache and then reads state that is not that row's. Both produce wrong tokens with no
+            // error, which is the one thing this entry point refuses to do. Consecutive, not merely ascending: ascending
+            // alone still admits the gap.
+            err_ = "step_users: the rows of one slot must sit on CONSECUTIVE positions (slot " +
+                   std::to_string(slot[m]) + " has position " + std::to_string(pos[m - 1]) + " then " +
+                   std::to_string(pos[m]) + "); each row appends its keys at its own position, so a gap or a step back "
+                   "would leave a hole or overwrite rows the cache already holds";
+            return false;
         }
         smax = std::max(smax, slot[m]);
     }
@@ -4781,6 +4805,22 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
         if (user_kc_[s].empty()) user_kc_[s].assign((size_t)c_.NL, {});
         if (user_vc_[s].empty()) user_vc_[s].assign((size_t)c_.NL, {});
     }
+    if (user_len_.size() < (size_t)smax + 1) user_len_.resize((size_t)smax + 1, 0);
+    // HOW MANY POSITIONS EACH SLOT HOLDS. A row appends its keys at its own position and then reads 0..pos, so a position
+    // beyond what the slot holds reads past the cache (a fresh slot asked for position 5 reads an empty array: measured,
+    // a segfault in npu_batch_decode_test). The first row of a slot must therefore sit exactly where the slot's sequence
+    // ends; position 0 also means "start a new sequence" and clears it (below).
+    for (size_t m = 0; m < M; m++) {
+        if (m > 0 && slot[m] == slot[m - 1]) continue;
+        const int have = user_len_[(size_t)slot[m]];
+        if (pos[m] != have) {
+            err_ = "step_users: slot " + std::to_string(slot[m]) + " holds " + std::to_string(have) +
+                   " position(s), but this pass starts it at " + std::to_string(pos[m]) +
+                   " (each row appends at its own position and reads up to it, so a start that is not the end of the "
+                   "slot's sequence reads state that is not there; position 0 starts a new sequence)";
+            return false;
+        }
+    }
     // A slot whose FIRST row is position 0 starts a NEW sequence, so what the previous conversation left in its caches
     // is cleared first: pos 0 has to mean here what it means everywhere else in this file (a request that begins at the
     // start), and a re-used slot that kept the last conversation's K/V would answer from state the request does not own.
@@ -4790,6 +4830,7 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
         if (pos[m] != 0) continue;
         user_kc_[(size_t)slot[m]].assign((size_t)c_.NL, {});
         user_vc_[(size_t)slot[m]].assign((size_t)c_.NL, {});
+        user_len_[(size_t)slot[m]] = 0;
     }
     // The pass owns the working caches for its duration: the model's own two are parked and put back whatever happens.
     own_kc_.swap(kcache_);
@@ -4801,6 +4842,10 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
     batch_all_out_ = &logits_all;
     std::vector<float> last;
     const bool ok = step_batch_impl(tokens, 0, last);
+    if (ok) {   // each slot now holds its last row's position + 1 positions
+        for (size_t m = 0; m < M; m++)
+            if (m + 1 == M || slot[m + 1] != slot[m]) user_len_[(size_t)slot[m]] = pos[m] + 1;
+    }
     batch_all_out_ = saved_all;
     rows_pos_ = nullptr;
     rows_slot_ = nullptr;

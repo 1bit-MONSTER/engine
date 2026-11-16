@@ -78,6 +78,57 @@ check "the folded weight has the matmul orientation" "$shape" "3x4"
 rc=0; python3 "$TOOL" --check "$tmp/out.onnx" >/dev/null 2>&1 || rc=$?
 check "check accepts the folded graph" "$rc" 0
 
+# engine#2779: one weight feeding TWO Transposes with different perms used to fold to a single `{src}_t`, so both
+# consumers read the first perm's tensor while the graph declared the second one's shape. `--check` cannot see it
+# (no Transpose is left), so the pack built green and was invalid.
+python3 - "$tmp/two.onnx" "$tmp/square.onnx" <<'PY' || { echo "FAIL could not build the two-perm fixtures"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+
+def two_perm(path, shape, perms):
+    w = numpy_helper.from_array(np.arange(int(np.prod(shape)), dtype=np.float32).reshape(shape), "w")
+    nodes = [helper.make_node("Transpose", ["w"], [f"t{i}"], perm=p) for i, p in enumerate(perms)]
+    nodes += [helper.make_node("Identity", ["t0"], ["y0"]), helper.make_node("Identity", ["t1"], ["y1"])]
+    outs = [helper.make_tensor_value_info("y0", TensorProto.FLOAT, None),
+            helper.make_tensor_value_info("y1", TensorProto.FLOAT, None)]
+    onnx.save(helper.make_model(helper.make_graph(nodes, "g", [], outs, [w]),
+                                opset_imports=[helper.make_opsetid("", 17)]), path)
+
+# Two different orientations of a NON-square weight: (2,3,4) -> (2,4,3) and -> (4,3,2).
+two_perm(sys.argv[1], (2, 3, 4), [[0, 2, 1], [2, 1, 0]])
+# ... and of a SQUARE one: (3,3,3) -> (3,3,3) both ways, so a shape-based discriminator cannot tell them apart.
+two_perm(sys.argv[2], (3, 3, 3), [[1, 0, 2], [0, 2, 1]])
+PY
+
+for m in two square; do
+  python3 "$TOOL" "$tmp/$m.onnx" "$tmp/$m.out.onnx" >"$tmp/$m.log" 2>&1 || { cat "$tmp/$m.log"; fail=$((fail+1)); }
+  check "$m: two different perms fold to two weights" "$(grep -c '^folded ' "$tmp/$m.log")" 2
+  read -r same shapes values <<EOF
+$(python3 - "$tmp/$m.out.onnx" <<'PY'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+after = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in after.graph.initializer}
+reads = [n.input[0] for n in after.graph.node if n.op_type == "Identity"]
+w0, w1 = inits[reads[0]], inits[reads[1]]
+print(int(reads[0] == reads[1]),
+      "x".join(str(d) for d in w0.shape) + "/" + "x".join(str(d) for d in w1.shape),
+      int(np.array_equal(w0, w1)))
+PY
+)
+EOF
+  check "$m: the two consumers read DIFFERENT initializers" "$same" "0"
+  check "$m: and the two tensors differ" "$values" "0"
+  case "$m" in
+    two)    check "two-perm shapes are the two orientations" "$shapes" "2x4x3/4x3x2" ;;
+    square) check "square weight: same shape, still two distinct tensors" "$shapes" "3x3x3/3x3x3" ;;
+  esac
+done
+
 echo "---"
 if [ "$fail" -ne 0 ]; then echo "$fail failed"; exit 1; fi
 echo "fold_initializer_transpose: all checks ok"

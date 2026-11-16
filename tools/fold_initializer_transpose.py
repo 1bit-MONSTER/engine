@@ -45,28 +45,37 @@ def fold(model):
     folded = []
     graph = model.graph
     inits = {i.name: i for i in graph.initializer}
+    by_perm = {}
+    folded_nodes = []
     for node in initializer_transposes(model):
         src = node.input[0]
         perm = [a.ints for a in node.attribute if a.name == "perm"]
         if not perm:
             raise SystemExit(f"{src}: Transpose without a perm attribute cannot be folded")
-        array = numpy_helper.to_array(inits[src])
-        want = np.transpose(array, perm[0])
-        dst = f"{src}_t"
-        # A second reference to the same weight uses the same folded name, so a duplicated Transpose folds once.
-        if dst not in inits:
+        key = (src, tuple(perm[0]))
+        dst = by_perm.get(key)
+        # A second reference to the same weight in the SAME orientation folds once and reuses the name. A different
+        # orientation needs an initializer of its own: one name per weight, keyed by the perm, used to give both
+        # consumers the first perm's tensor while the graph declared the second one's shape (engine#2779) -- and
+        # `--check` could not see it, because no Transpose is left. The key is the PERM, not the shape: on a square
+        # weight the two orientations have the same shape, so a shape test would still collapse them, and that is
+        # the case that validates and computes wrong values with no symptom.
+        if dst is None:
+            taken = any(k[0] == src for k in by_perm)
+            dst = f"{src}_t" if not taken else f"{src}_t_" + "".join(str(p) for p in perm[0])
+            want = np.transpose(numpy_helper.to_array(inits[src]), perm[0])
             new = numpy_helper.from_array(np.ascontiguousarray(want), dst)
             graph.initializer.append(new)
             inits[dst] = new
+            by_perm[key] = dst
+            folded.append((src, dst, list(want.shape)))
         for consumer in graph.node:
             for i, name in enumerate(consumer.input):
                 if name == node.output[0]:
                     consumer.input[i] = dst
-        folded.append((src, dst, list(want.shape)))
-    if folded:
-        gone = {f[1] for f in folded}
-        keep = [n for n in graph.node if not (n.op_type == "Transpose" and n.input[0] in inits
-                                              and f"{n.input[0]}_t" in gone)]
+        folded_nodes.append(node)
+    if folded_nodes:
+        keep = [n for n in graph.node if not any(n is f for f in folded_nodes)]
         del graph.node[:]
         graph.node.extend(keep)
         # An initializer the fold replaced and nothing else reads would otherwise be packed into the container.

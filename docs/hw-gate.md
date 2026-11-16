@@ -415,7 +415,11 @@ is the ancestry between the two commits, past the shallow boundary, and that is 
 row still has not compared this run against a base from this tree, which is the third state `--phases` uses, not a
 failure of the model. So a gate run from a shallow `third_party/llama.cpp` reports INCOMPLETE with the reason on the
 line, and `git -C third_party/llama.cpp fetch --unshallow` makes it answerable: the same goldens then read
-`golden is 227 commits behind the tested tree` and judge on their numbers. `diverged` and `AHEAD` stay relations a
+`golden is 227 commits behind the tested tree` and judge on their numbers. The `hw-gate` workflow now does
+that fetch itself, inside the pair checkout and therefore before the gate takes a GPU ticket (engine#2713): 31 s and
+406 MB against the 37 MB a `--depth 1` pair costs, which is what a gate run that judges costs instead of one that
+reports INCOMPLETE. It unshallows `llama.cpp` only — `hrx-system` is never placed — and skips the fetch when the
+pair is already complete. `diverged` and `AHEAD` stay relations a
 row can be judged on — only a missing relation is INCOMPLETE.
 Their HRX base logits against a CPU run of the same file (`--device none`) give:
 

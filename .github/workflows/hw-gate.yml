@@ -80,6 +80,17 @@ jobs:
           set -euo pipefail
           git submodule sync -- third_party/llama.cpp third_party/hrx-system
           git -c protocol.version=2 submodule update --init --depth 1 third_party/llama.cpp third_party/hrx-system
+          # The KLD rows place their golden by its recorded_at commit AND the ancestry between it and the pin
+          # (tools/hw_gate_manifest.py provenance). Every golden is an ancestor of the pin, so a --depth 1 pair
+          # answers "cannot place (not in this clone)" for all of them and a fully green gate exits 2 INCOMPLETE
+          # (engine#2713). Unshallow llama.cpp only -- hrx-system is never placed -- and do it here, before the
+          # gate takes its GPU ticket, so the fetch is not gate time. Measured on the box from a --depth 1 pair:
+          # 31 s and 406 MB (37 MB before), tags excluded because the gate reads none. Guarded, because
+          # --unshallow fails on a complete repository; the runner keeps the objects, so a later run pays only
+          # the delta.
+          if [ "$(git -C third_party/llama.cpp rev-parse --is-shallow-repository)" = true ]; then
+            git -C third_party/llama.cpp fetch --unshallow --no-tags origin
+          fi
           git submodule status -- third_party/llama.cpp third_party/hrx-system
 
       - name: Pending status

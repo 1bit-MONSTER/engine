@@ -6029,12 +6029,10 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
             sin_[i] = (float)(std::sin(ang) * af);
         }
         auto rot_half = [&](float* x) {
-            // pairs (i, i + half) inside the rotated block; the rest passes through
-            for (int i = 0; i < half; i++) {
-                const float x1 = x[i], x2 = x[i + half];
-                x[i] = x1 * cos_[i] - x2 * sin_[i];
-                x[i + half] = x1 * sin_[i] + x2 * cos_[i];
-            }
+            // engine#2673: consecutive pairs (2i, 2i+1) over the first `rot` channels when the pack says so (chatglm3's
+            // GQO: rotary_interleaved = 1), half-split (i, i + half) otherwise; the rest passes through. Not with
+            // proportional RoPE, whose pairing spans the whole head by definition.
+            q4nx_rope_rotate_pairs(x, half, cos_.data(), sin_.data(), sem_.rope_interleaved && !proportional ? 1 : 0);
         };
         for (int h = 0; h < NH; h++) rot_half(&q[(size_t)h * HD]);
         for (int h = 0; h < NKV; h++) rot_half(&k[(size_t)h * HD]);

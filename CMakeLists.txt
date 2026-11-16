@@ -1963,6 +1963,11 @@ target_include_directories(npu_rope_llama3_test PRIVATE npu/forward/include)
 target_link_libraries(npu_rope_llama3_test PRIVATE m)
 add_test(NAME npu_rope_llama3 COMMAND npu_rope_llama3_test)
 add_dependencies(npu_sampling_test npu_rope_llama3_test)
+# engine#2673: RoPE pair order -- chatglm3's GQO states rotary_interleaved = 1 (pairs (2i, 2i+1)); header + semantics only.
+add_executable(npu_rope_interleave_test tests/npu_rope_interleave_test.c npu/forward/src/q4nx_semantics.c)
+target_include_directories(npu_rope_interleave_test PRIVATE npu/forward/include)
+target_link_libraries(npu_rope_interleave_test PRIVATE m)
+add_test(NAME npu_rope_interleave COMMAND npu_rope_interleave_test)
 # The activation rotation a folded container needs (npu/forward/include/hadamard.h): its SIMD path must be
 # bit-identical to the shipped scalar loop on every shape a container carries, and the scalar loop must still
 # be the Hadamard transform.  Header only, no device, no model: runs in CI.

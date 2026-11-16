@@ -154,6 +154,10 @@ struct OnnxModel {
     // The fused-MLP nodes' (SSMLP / GQO) gate/up/down shapes, from their attributes. Kept apart from `matmuls` because they
     // name no weight tensor: `matmuls` answers "does the graph carry quantised weights", and these must not.
     std::vector<OnnxMatMul> fused_mlp;
+    // engine#2673: the attention nodes' (GQO / GroupQueryAttention) `rotary_interleaved` -- -1 when no node states it, 0 or
+    // 1 when every node that states it agrees, -2 when two disagree. chatglm3 states 1 (consecutive pairs (2i, 2i+1)),
+    // which the forward's half-split rotation does not do unless the config says so.
+    int rotary_interleaved = -1;
     std::map<std::string, size_t> index;
     // `com.ryzenai:MatMulNBitsBf` is the same quantised matmul as `com.microsoft:MatMulNBits`, and on the 1.9
     // blob/external-data packs it is the ONLY one: phi-4's 201 weights are all `MatMulNBitsBf`, so a walker that
@@ -282,6 +286,11 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m, const std::string& bra
         // (K == hidden, N == w) gate/up and (K == w, N == hidden) down triple, w = 12800. Recording them as matmuls lets
         // intermediate_size_from_graph find them by the SAME witness it uses for the separate-node spelling (gate and up
         // reading one activation) rather than adding a second rule that could disagree with the first.
+        if ((op == "GQO" || op == "GroupQueryAttention") && attrs.count("rotary_interleaved")) {
+            const int ri = attrs["rotary_interleaved"] != 0 ? 1 : 0;
+            if (m.rotary_interleaved == -1) m.rotary_interleaved = ri;
+            else if (m.rotary_interleaved >= 0 && m.rotary_interleaved != ri) m.rotary_interleaved = -2;
+        }
         if (op == "SSMLP" || op == "GQO") {
             for (const char* sub : {"gate", "up", "down"}) {
                 const auto k = attrs.find(std::string(sub) + "_K"), n = attrs.find(std::string(sub) + "_N");
@@ -303,6 +312,21 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m, const std::string& bra
                 m.fused_mlp.push_back(std::move(mm));
             }
         }
+    }
+}
+
+// engine#2673: the attention nodes' own statement of their RoPE pair order, into the container config (`rope_interleaved`)
+// unless the pack's config already states one. Nodes that disagree are refused by name: picking either order serves one of
+// them wrong at every position.
+void rope_interleaved_from_graph(const OnnxModel& onnx, json& c) {
+    if (c.contains("rope_interleaved")) return;
+    if (onnx.rotary_interleaved == -2)
+        throw std::runtime_error("the graph's attention nodes disagree on rotary_interleaved, so the RoPE pair order is "
+                                 "unknown (engine#2673)");
+    if (onnx.rotary_interleaved == 1) {
+        c["rope_interleaved"] = true;
+        std::fprintf(stderr, "note: rope_interleaved taken from the graph's attention nodes (rotary_interleaved = 1: "
+                             "pairs (2i, 2i+1), not (i, i + rot/2)) (engine#2673)\n");
     }
 }
 
@@ -5739,6 +5763,7 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     c["head_dim"] = p.dims.head_dim;
     c["vocab_size"] = p.dims.vocab;
     c["rope_theta"] = p.dims.rope_theta;
+    rope_interleaved_from_graph(onnx, c);
     // engine#2561: this genre's config.json can be `{}` (phi-4), so rope_theta above is a default (10000); the graph's
     // GroupQueryAttention reads a precomputed `cos_cache` initializer, which is the pack's own statement of its base.
     if (onnx.index.count("cos_cache")) {
@@ -7217,6 +7242,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // the pack's own statement of its base, so the loader tests candidates against it and adopts the winner:
         // correlation against cos(p * inv_freq_i) over p, which is invariant to the per-pack scaling of the cache
         // (the 1.8 packs store pre-scaled cosines -- pos-0 reads 1.875, not 1.0).
+        rope_interleaved_from_graph(onnx, c);
         if (onnx.index.count("cos_cache")) {
             const OnnxTensor& cc = onnx.tensors[onnx.index.at("cos_cache")];
             if (!cc.dims.empty() && cc.dims.size() == 2 && cc.dims.at(2 % cc.dims.size()) > 0) {
@@ -7947,6 +7973,17 @@ std::string canonical_token_fconst17_exported(const std::string& path, const std
 }
 FconstGeom locate_fconst_with_header_exported(const std::string& tok, const std::string& pack_dir, const Dims& dims) {
     return locate_fconst_with_header(tok, pack_dir, dims);
+}
+// engine#2673: what the graph's attention nodes write into the container config ("{}" when they state nothing), or the
+// refusal's text when they disagree.
+std::string rope_interleaved_exported(const std::string& onnx_path) {
+    json c = json::object();
+    try {
+        rope_interleaved_from_graph(parse_onnx(onnx_path), c);
+    } catch (const std::exception& e) {
+        return std::string("refused: ") + e.what();
+    }
+    return c.dump();
 }
 float graph_norm_eps_exported(const std::string& onnx_path, int* nodes, bool* conflict) {
     const OnnxModel m = parse_onnx(onnx_path);

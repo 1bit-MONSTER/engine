@@ -1009,6 +1009,9 @@ int64_t fconst17_reconcile_exported(int64_t vote, int64_t recorded, std::string*
 int64_t fconst17_known_head_exported(const std::string& pack_dir);
 // Everything after the last layer block (a 64-byte header, the final norm, the head block), measured the same way.
 int64_t fconst17_known_tail_exported(const std::string& pack_dir);
+// engine#2673: the container-config keys the graph's attention nodes (GQO / GroupQueryAttention) state about RoPE pair order,
+// as JSON ("{}" when none), or "refused: ..." when two nodes disagree.
+std::string rope_interleaved_exported(const std::string& onnx_path);
 // The epsilon the graph's RMSNorm nodes state (0 when none), how many state it, and whether two disagree.
 float graph_norm_eps_exported(const std::string& onnx_path, int* nodes, bool* conflict);
 // The rms_norm_eps to serve with: config.json's when it states one, else the graph's when its nodes agree; when they

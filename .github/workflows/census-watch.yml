@@ -49,8 +49,8 @@
 # Permissions (RFC #246): the workflow token is read-only by default. Only the `alert` job holds
 # `issues: write`. It never checks out or runs repository code; it only reads the watch job's
 # filtered output, which carries Hugging Face model ids and class names (untrusted text). Those
-# go into the issue inside a code fence with backticks and '@' stripped, capped at 40 lines, so
-# they cannot close the fence, mention anyone or add links.
+# go into the issue inside a code fence with backticks and '@' stripped, capped at 40 lines (the
+# `!!` alert rows first), so they cannot close the fence, mention anyone or add links.
 
 name: Census watch
 
@@ -104,7 +104,13 @@ jobs:
             echo "  !! UNCOVERED SimulatedForTestingClass (new class): 1 model(s), e.g. example/simulated" >> /tmp/census-watch.log
             rc=1
           fi
-          lines=$(grep -E "UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|NPU FLM|SUPPORT MOVED|kernel-format|Q4NX (NPU)|support_pins" /tmp/census-watch.log | tr -d '`@' | head -n 40 | base64 -w0)
+          # The `!!` rows (the alerts) go first, then the informational ones: the excerpt is capped
+          # at 40 lines, and engine#2677 was filed with 21 `? UNVERIFIABLE` and 19 answered
+          # `. NPU FLM` rows filling all 40, so its only two alerts (`!! SUPPORT MOVED`) never
+          # reached the issue body.
+          pat="UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|NPU FLM|SUPPORT MOVED|kernel-format|Q4NX \(NPU\)|support_pins"
+          lines=$({ grep -E "$pat" /tmp/census-watch.log | grep -F '!!'
+                    grep -E "$pat" /tmp/census-watch.log | grep -vF '!!'; } | tr -d '`@' | head -n 40 | base64 -w0)
           echo "lines=$lines" >> "$GITHUB_OUTPUT"
           # Three outcomes, and the run colour has to mean something (the watcher's contract:
           # 0 quiet, 1 the alert, 2 the watch did not run).

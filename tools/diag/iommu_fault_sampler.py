@@ -29,8 +29,9 @@ Both counts are cumulative since the sampler started, built from the lines that 
 delta between two lines is exactly what the kernel printed, and dropped, in that interval. Counting the
 whole buffer each time instead let a rotation hide new drops (an old suppression line leaving while new
 ones arrive read as "rotated", or as a smaller rise -- review of engine#2580). That needs `dmesg`'s
-default `[ s.us ]` prefix; `dmesg -T` and `journalctl` lines carry none and cannot be ordered, so they are
-counted only in the baseline, and a later interval that holds such fault lines says so.
+default `[ s.us ]` prefix (`dmesg`, `journalctl -k -o short-monotonic`). A source with no stamps at all
+(`journalctl -k`'s default format, `dmesg -T`) cannot be ordered, so it is counted whole each time as
+before, and the baseline line says which mode is in use (see Tally).
 
     # one interval every 5s, forever (root: reading dmesg)
     sudo tools/diag/iommu_fault_sampler.py --interval 5 --out /var/log/iommu-fault-rate.log
@@ -86,34 +87,51 @@ STAMP = re.compile(r"^\[\s*(\d+\.\d+)\]")
 
 
 class Tally:
-    """Cumulative (printed, dropped) since the first snapshot, from the lines each snapshot adds.
+    """Cumulative (printed, dropped) since the first snapshot.
 
-    A line counts once: in the first snapshot (the baseline) every line counts; after that only lines
-    stamped later than the newest stamp seen so far. Lines that fall out of the buffer are simply not
-    seen again, so a rotation can neither subtract from the totals nor mask what arrived meanwhile."""
+    The first snapshot picks the mode, because the two sources on this box differ exactly here:
+      * "cursor" -- the source carries dmesg's `[ s.us ]` stamp (`dmesg`, `journalctl -k -o short-monotonic`).
+        A line counts once: every line in the baseline, after that only lines stamped later than the newest
+        stamp seen. Lines that leave the buffer are not seen again, so a rotation can neither subtract from the
+        totals nor mask what arrived meanwhile. If every stamp in a snapshot is older than the newest one seen,
+        the clock restarted (a reboot under a persistent source): that snapshot is counted as a new buffer, and
+        the interval says so instead of freezing at the old totals.
+      * "buffer" -- no line carries a stamp (`journalctl -k` in its default format, `dmesg -T`). Nothing can be
+        ordered, so each snapshot is counted whole, as before engine#2603: a rotation can hide drops, and the
+        interval says `rotated` when the total falls. The mode is announced on the baseline line, because a
+        cursor that never advances would read `quiet` for ever (review of engine#2603).
+    """
 
     def __init__(self, census, caller=IOMMU_CALLER):
         self.census, self.caller = census, caller
-        self.last = None            # newest kernel stamp counted
+        self.mode = None            # "cursor" or "buffer", set by the first snapshot
+        self.last = None            # newest kernel stamp counted (cursor mode)
         self.printed = self.dropped = 0
-        self.unstamped = 0          # fault/suppression lines after the baseline that could not be ordered
+        self.unstamped = 0          # cursor mode: fault/suppression lines in the last snapshot with no stamp
+        self.event = ""             # what the last add() noticed, for the interval's meaning
 
     def add(self, text):
         lines = text.splitlines()
-        new, last = [], self.last
-        for line in lines:
-            m = STAMP.match(line)
-            if m is None:
-                if self.last is None:
-                    new.append(line)        # baseline: nothing to order against yet
-                elif "IO_PAGE_FAULT" in line or "callbacks suppressed" in line:
-                    self.unstamped += 1
-                continue
-            t = float(m.group(1))
-            if self.last is None or t > self.last:
-                new.append(line)
-                last = t if last is None or t > last else last
-        self.last = last if last is not None else (self.last if self.last is not None else float("-inf"))
+        stamped = [(float(m.group(1)), line) for line in lines for m in [STAMP.match(line)] if m]
+        self.event = ""
+        if self.mode is None:
+            self.mode = "cursor" if stamped else "buffer"
+        if self.mode == "buffer":
+            self.printed, self.dropped = sample(self.census, text, self.caller)
+            return self.printed, self.dropped
+        if self.last is None:
+            new = lines                                   # baseline: nothing to order against yet
+        elif stamped and max(t for t, _ in stamped) < self.last:
+            self.event = "stamps went backwards (reboot?): counted the new buffer"
+            new = [line for _, line in stamped]
+            self.last = None
+        else:
+            new = [line for t, line in stamped if t > self.last]
+        self.unstamped = 0 if self.last is None else sum(
+            1 for line in lines if not STAMP.match(line) and ("IO_PAGE_FAULT" in line or "callbacks suppressed" in line))
+        if stamped:
+            newest = max(t for t, _ in stamped)
+            self.last = newest if self.last is None else max(self.last, newest)
         p, d = sample(self.census, "\n".join(new), self.caller)
         self.printed += p
         self.dropped += d
@@ -126,6 +144,10 @@ def describe(prev, cur):
         return "baseline"
     d_printed = cur[0] - prev[0]
     d_dropped = cur[1] - prev[1]
+    if d_dropped < 0:
+        # buffer mode only (no stamps to order by): the ring buffer discarded earlier suppression lines, so the
+        # total fell. That is not a negative rate; it is the buffer forgetting, and drops in it are unknown.
+        return f"rotated ({d_dropped} from total), re-baselined; drops in this interval unknown"
     if d_dropped > 0:
         # The dropped count is the only quantity that cannot be throttled away.
         return f"FAULTING +{d_dropped} dropped, +{d_printed} printed"
@@ -182,7 +204,27 @@ def self_test():
     assert t.add(S % 7.0 + quiet) == (1, 5611)
     # After the baseline an unstamped fault line cannot be ordered: it is not counted, and it is reported.
     t.add(F.format(addr="4130000"))
-    assert (t.printed, t.unstamped) == (1, 1), (t.printed, t.unstamped)
+    assert (t.mode, t.printed, t.unstamped) == ("cursor", 1, 1), (t.mode, t.printed, t.unstamped)
+
+    # journalctl's default format carries no `[ s.us ]` on any line (0 of 6140 on 11-16). A cursor would never
+    # advance and read "quiet" for ever (review of engine#2603), so a source with no stamps counts the buffer whole.
+    J = "Nov 15 10:00:0%d h kernel: "
+    j0 = J % 0 + F.format(addr="4128000") + J % 1 + ratelimited
+    j1 = j0 + J % 3 + F.format(addr="4129000") + J % 4 + F.format(addr="4129000") + \
+        J % 5 + "kernel: amd_iommu_report_page_fault: 150 callbacks suppressed\n"
+    t = Tally(census)
+    before, after = t.add(j0), t.add(j1)
+    assert t.mode == "buffer" and (before, after) == ((1, 5611), (3, 5761)), (t.mode, before, after)
+    assert describe(before, after) == "FAULTING +150 dropped, +2 printed", describe(before, after)
+    # ... and in that mode a rotation is named, never a negative count or "quiet"
+    assert describe((3, 5761), (2, 150)).startswith("rotated (-5611 from total)"), describe((3, 5761), (2, 150))
+
+    # A clock restart (every stamp older than the newest seen) is counted as a new buffer and named, instead of
+    # freezing the totals at their old values while the new boot faults.
+    t = Tally(census)
+    t.add(S % 500.0 + F.format(addr="4128000") + S % 501.0 + ratelimited)
+    after = t.add(S % 3.0 + F.format(addr="4129000") + S % 4.0 + "kernel: amd_iommu_report_page_fault: 7 callbacks suppressed\n")
+    assert after == (2, 5618) and t.event.startswith("stamps went backwards"), (after, t.event)
 
     # Only the IOMMU reporter's counter is a dropped fault. The 11-15 journal had kauditd (267) and
     # set_capacity (2) suppression lines beside it; summing every caller turned an audit burst into
@@ -221,10 +263,17 @@ def main():
     try:
         while not args.count or n < args.count:
             text = subprocess.run(args.dmesg, shell=True, capture_output=True, text=True).stdout
-            seen = tally.unstamped
             cur = tally.add(text)
-            note = "" if tally.unstamped == seen else f"; {tally.unstamped - seen} unstamped line(s) not counted"
-            print(f"{int(time.time())} {cur[0]} {cur[1]} {describe(prev, cur)}{note}", file=out)
+            meaning = describe(prev, cur)
+            if prev is None:
+                meaning += (" (mode: cursor on kernel stamps)" if tally.mode == "cursor" else
+                            " (mode: whole buffer -- no kernel stamps in this source, so a rotation can hide drops;"
+                            " dmesg or journalctl -k -o short-monotonic carry them)")
+            if tally.event:
+                meaning += "; " + tally.event
+            if tally.mode == "cursor" and tally.unstamped:
+                meaning += f"; {tally.unstamped} unstamped line(s) in the buffer not counted"
+            print(f"{int(time.time())} {cur[0]} {cur[1]} {meaning}", file=out)
             prev, n = cur, n + 1
             if args.count and n >= args.count:
                 break

@@ -175,8 +175,14 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   [ "$ino_before" != "$ino_after" ] || { echo "FAIL: the summary is truncated in place (same inode) -- a reader can see a header with nothing under it"; fail=1; }
   [ -e "$d/sum/summary.txt.tmp" ] && { echo "FAIL: the temp file was left behind"; fail=1; }
   head -1 "$d/sum/summary.txt" | grep -q '^# accel sampler summary ' || { echo "FAIL: the written summary has no header"; fail=1; }
+  # engine#2795: the summary must name the version that wrote it, and the hash must be this file's. Without it a summary is
+  # labelled only by time, which is how a 207-line deployed copy reported for hours as if it were the 253-line repository
+  # version -- missing the GAP records and the nearest-sample attribution it was reporting through.
+  want_sha=$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1)
+  got_sha=$(sed -n '2s/^# script sha256: //p' "$d/sum/summary.txt")
+  [ -n "$want_sha" ] && [ "$got_sha" = "$want_sha" ] || { echo "FAIL: the summary does not name its own version (want $want_sha, got '$got_sha')"; fail=1; }
   rm -rf "$d"
-  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation, summary replaced not truncated)"
+  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation, summary replaced not truncated, summary names its version)"
   return "$fail"
 }
 
@@ -199,6 +205,11 @@ summary() {  # what the run observed, so a 24 h expiry is not silence
   if [ -f "$ATTR" ]; then attr=$(wc -l < "$ATTR"); else attr=0; fi
   {
     echo "# accel sampler summary $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # engine#2795: the summary must name the VERSION that wrote it. The deployed copy is a hand `cp` and drifted by 46 lines
+    # (207 vs 253) without anything noticing, so a summary carrying only a timestamp looked just as authoritative while it
+    # was missing the GAP records and the nearest-sample attribution it reported through. A hash the reader can compare
+    # against `git show <commit>:tools/diag/accel_sampler.sh | sha256sum` turns "which version said this" into a lookup.
+    echo "# script sha256: $(sha256sum "$0" 2>/dev/null | cut -d" " -f1)"
     echo "samples: $n   attributed faults: $attr"
     echo
     echo "## holders seen (pid, cmd, scope, ticket, sample count)"

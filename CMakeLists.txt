@@ -466,6 +466,10 @@ add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py
 # flagged 10 of those on a clean tree), so a separator counts only inside an unterminated conflict block.
 add_python_test(conflict_marker ${CMAKE_SOURCE_DIR}/tools/ci/conflict_marker_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(conflict_marker_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_marker_check.py --self-test)
+# engine#2478: the map side, so the "stale translation" question can be asked of a capture instead of argued about.
+# An unfiltered 795 s capture with 252,704 map/unmap events showed four of eight faults on an IOVA that was never
+# mapped and never unmapped anywhere in the window -- absent and never re-created, not stale.
+add_python_test(iommu_map_side_self ${CMAKE_SOURCE_DIR}/tools/diag/iommu_map_side.py --self-test)
 # engine#803 gate, second half: the comparator that turns two --dump-logits directories into the KLD verdict the
 # P4 gate asks for. No device and no model, so the gate is one command when a ticket is free; the self-test pins
 # the four cases a KLD implementation gets wrong (identical -> exactly 0, a shift is positive and directional, a
@@ -1762,6 +1766,21 @@ add_test(NAME q4nx_vision_pos COMMAND q4nx_vision_pos_test)
 add_executable(npu_pack_import_test tests/npu_pack_import_test.cpp)
 target_link_libraries(npu_pack_import_test PRIVATE onebit_npu)
 add_test(NAME npu_pack_import COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden)
+# engine#2668: an INLINE initializer's OnnxTensor::raw must still be readable after parse_onnx() returns (it used to point
+# into a mapping the parse had already unmapped). Built with AddressSanitizer so a read of freed or unmapped memory is a
+# report, not a lucky pass (the test fails if it was built without the sanitizer). Leak detection is off on purpose: the
+# arm is about a mapping's lifetime, and the library holds some allocations for the process lifetime, which a leak report
+# would list as noise -- do not "fix" detect_leaks=0 into a leak hunt here.
+add_executable(onnx_inline_lifetime_test tests/onnx_inline_lifetime_test.cpp)
+target_link_libraries(onnx_inline_lifetime_test PRIVATE onebit_npu)
+target_include_directories(onnx_inline_lifetime_test PRIVATE npu)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(onnx_inline_lifetime_test PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+    target_link_options(onnx_inline_lifetime_test PRIVATE -fsanitize=address)
+endif()
+add_test(NAME onnx_inline_lifetime COMMAND onnx_inline_lifetime_test ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(onnx_inline_lifetime PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+add_dependencies(onebit onnx_inline_lifetime_test)   # so CI's build list (which builds `onebit`) builds and runs it
 # engine#1726: NPU_INFER_DUMP_DIR's residual write must SAY when it cannot write -- a missing or unwritable directory, or a
 # full disk, used to leave a run that printed it was dumping with no files and no error. Pure stdio, no device, no NPU
 # headers: the arm a version that only checks fopen would pass is the short write, which /dev/full produces for real.
@@ -2183,6 +2202,11 @@ add_executable(tokenizer_replace_meta_test tests/tokenizer_replace_meta_test.cpp
 target_link_libraries(tokenizer_replace_meta_test PRIVATE onebit_npu)
 add_test(NAME tokenizer_replace_meta COMMAND tokenizer_replace_meta_test ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_replace_meta.json)
 add_dependencies(onebit tokenizer_replace_meta_test)
+# engine#1503: a Metaspace PRE-TOKENIZER (no normalizer) is SentencePiece too -- Mistral-7B v0.2/v0.3's shape.
+add_executable(tokenizer_metaspace_test tests/tokenizer_metaspace_test.cpp)
+target_link_libraries(tokenizer_metaspace_test PRIVATE onebit_npu)
+add_test(NAME tokenizer_metaspace COMMAND tokenizer_metaspace_test ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_metaspace.json)
+add_dependencies(onebit tokenizer_metaspace_test)
 # A SentencePiece-shaped vocabulary that KEEPS its merge list (engine#1189): the shape Phi-3.5-mini's
 # pack has, whose ids come from Hugging Face `tokenizers` on the same fixture. No model needed.
 add_test(NAME tokenizer_spm_bpe

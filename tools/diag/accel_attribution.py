@@ -34,6 +34,7 @@ Usage:
 
 import argparse
 import collections
+import datetime
 import os
 import sys
 import shutil
@@ -274,6 +275,11 @@ def self_test():
         assert "fault records: 2 -- 1 on amdxdna, 1 on another device" in out, out[-600:]
         assert "attributions: 1" in out, out[-600:]
         assert "attributions: 2" not in out, "the declined row was counted as an attribution: " + out[-600:]
+        # engine#2542: the counts name the window they were taken over, and the ends are the SAMPLES' own stamps --
+        # a static string here would pass while the window drifted. 1794798800/1794798810 are the fixture's rows.
+        assert "capture window: " in out, "the header does not say which window the counts cover: " + out[:400]
+        assert datetime.datetime.fromtimestamp(1794798800).strftime("%m-%d %H:%M:%S") in out.split("capture window: ")[1][:40], \
+            "the window's start is not the first sample's stamp: " + out[:400]
 
     # A partially written row must not kill the reader.
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
@@ -342,6 +348,13 @@ def main():
     iv = intervals(samples)
     span = max(s[0] for s in samples) - min(s[0] for s in samples)
     med = sorted(iv)[len(iv) // 2] if iv else 0
+    # engine#2542: the count names the WINDOW it was taken over. Without dates a reader compared "0 on amdxdna"
+    # against faults fourteen hours before the sampler started and had to do three steps of arithmetic to find
+    # out that nothing was missed. Two file mtimes are not evidence; the first and last sample are.
+    def _stamp(e):
+        return datetime.datetime.fromtimestamp(e).strftime("%m-%d %H:%M:%S")
+    lo, hi = min(s[0] for s in samples), max(s[0] for s in samples)
+    print(f"capture window: {_stamp(lo)} .. {_stamp(hi)} ({span} s)")
     print(f"samples: {len(samples)} rows over {span} s; effective interval median {med} s, "
           f"min {min(iv) if iv else 0}, max {max(iv) if iv else 0}")
     gaps = [d for d in iv if med and d > 3 * med]

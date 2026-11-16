@@ -725,6 +725,10 @@ if has kat || has needle || has kld || has placement; then
         vrc=$?
         [ $((rc & 8)) = 8 ] && { verdict="llama-perplexity failed: $(tail -n 2 "$OUT/kld-$name.log" | tr '\n' ' ' | cut -c1-200)"; vrc=1; }
         st=PASS; [ $vrc != 0 ] && st=FAIL
+        # engine#2643/#2676: judge exit 2 is INCOMPLETE -- the golden's base cannot be placed against the tested pin
+        # in this clone (third_party/llama.cpp is shallow by .gitmodules), so the numbers were not judged. That is
+        # "could not run", the engine#2522 rule: a SKIP row plus infra=1, never a FAIL row for a clone depth.
+        [ $vrc = 2 ] && { st=SKIP; infra=1; }
         result "kld $name" $st - "$verdict"
       fi
     fi

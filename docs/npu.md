@@ -68,13 +68,19 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
   npu/                   the model's NPU kernels
 ```
 
-The NPU route reads `tokenizer.json` with its own reader (`npu/tokenizer.cpp`). Four vocabulary shapes are handled:
+The NPU route reads `tokenizer.json` with its own reader (`npu/tokenizer.cpp`). Five vocabulary shapes are handled:
 byte-level BPE; SentencePiece pieces with no merges; SentencePiece pieces with merges and a normalizer that prepends
-the word-boundary symbol (Phi-3.5); and BPE with merges whose normalizer only rewrites spaces to that symbol and
+the word-boundary symbol (Phi-3.5); the same pieces declared through a `Metaspace` pre-tokenizer instead of a
+normalizer (Mistral-7B-Instruct v0.2 and v0.3: `prepend_scheme` `first`/`always`, or the older `add_prefix_space`),
+where, as in the reference library, the symbol is prepended only when the text does not already start with a space;
+and BPE with merges whose normalizer only rewrites spaces to that symbol and
 prepends none (the Gemma family, engine#2215). The last one is encoded by rank over the whole run with no prefix, and
 the symbol decodes back to a space. Before that shape was recognised a Gemma4 prompt encoded to 31 ids where the
 reference library gives 21, and replies kept the raw symbols. With `-DONEBIT_GEMMA_TOKENIZER=<tokenizer.json>` ctest
 `tokenizer_gemma4` holds the reader to the 17 reference cases kept for that file (2 of 17 before, 17 of 17 now).
+Before the `Metaspace` pre-tokenizer was read, the Mistral vocabularies fell to the byte-level path ("The capital of
+France is" gave 7 ids where the reference gives 5, and replies kept the raw symbols); ctest `tokenizer_metaspace`
+holds the reader to 7 reference cases on an eleven-token vocabulary of that shape.
 
 **What ends an answer.** The serve stops on every id in `config.json`'s `eos_token_id` (one integer or a list), on
 `<|endoftext|>` when the tokenizer has it, on `tokenizer_config.json`'s `eos_token` when that file is beside the
@@ -1839,6 +1845,18 @@ it must not open with an epsilon header. It then rewrites the file into the 1.8 
 runs unchanged. Rebuilt this way, the Llama file is the 1.8 twin's size. Every tile, gate/up unit and down group is at
 least 96.4 % byte-equal to the twin at its mapped place (a one-unit misplacement scores 8.5 %), and the rest is the two
 exports' re-quantization.
+
+**The 1.7 `Gemma-3-4b-it-mm-onnx-ryzenai-npu` embedding (engine#2663).** `genai_config.json` names the embedding
+graph `gemma-3-embedding.onnx`. It is a `Gather` over **`lm_head.weight` [262208, 2560] f32** (the model is tied; the
+decoder's 238 `MatMulNBitsBf` are exactly 34 layers x 7, with no head), followed by a multiply by the 0-D
+`model.language_model.embed_tokens.embed_scale`. When no `*embed_tokens*` table is named, the reader takes the
+component's only 2-D f32 initializer as the table; with two candidates it guesses neither. A 0-D tensor is never taken
+as the 4-bit table's scales (those are 2-D `[V, groups]`). The container stores a gemma embedding pre-scaled: the
+forward's lookup applies no gemma scale, and its tied head divides sqrt(H) back out. So `embed_scale` is applied to
+the table, and only when it equals sqrt(hidden); any other value is refused by name. A small inline initializer
+payload (64 B or less) is now copied when the graph is parsed, because the graph's mapping is gone by the time the
+reader looks. Inline tables larger than that still point into the unmapped file (engine#2668); the packs measured so far keep
+their tables in external data.
 
 With `config.json` empty, the model's numbers come from the pack itself:
 - **rms_norm_eps** from the graph's RMSNorm nodes (18 nodes state 1e-5). The default was 1e-6. When the nodes state different epsilons nothing is taken, and the import prints a WARNING naming the conflict and the value it keeps (`graph_eps_decision()`).

@@ -429,6 +429,48 @@ kill_tree() {
     kill -KILL -- "-$root" 2> /dev/null
     for p in $tree; do kill -KILL "$p" 2> /dev/null; done
 }
+# engine#2741: the tree is not the ticket. A payload that `setsid`s (or double-forks) leaves the process GROUP and the
+# descendant walk both, and it inherits GPU_HOLD_TICKET when it does -- the environment is the one handle it cannot shed
+# without exec'ing a sanitised copy. Measured on this box 2026-11-16: a `setsid`'d 27B serve outlived its ticket by
+# 64 min carrying 44.4 GiB of GTT, twice, while another copy of the same model ran inside the next ticket (85.6 GiB of
+# GTT on a 122-GiB box, two OOM kills in the hour) -- the shape of the 11-08 incident that took the PR-agent LLM down.
+env_ticket_pids() {   # <exact ticket line> -> pids whose environ still carries it
+    local want=$1 p
+    for p in /proc/[0-9]*; do
+        p=${p#/proc/}
+        [ "$p" = "$$" ] && continue
+        [ -r "/proc/$p/environ" ] || continue
+        tr '\0' '\n' < "/proc/$p/environ" 2> /dev/null | grep -Fxq "GPU_HOLD_TICKET=$want" && printf '%s\n' "$p"
+    done
+}
+kill_ticket_env() {
+    local want=$1 grace=${2:-10} i=0 p list
+    [ -n "$want" ] || return 0
+    list=$(env_ticket_pids "$want")
+    [ -n "$list" ] || return 0
+    log "ending $(printf '%s\n' "$list" | wc -l) process(es) that left the ticket's tree but still carry its GPU_HOLD_TICKET: $(echo $list | tr ' ' ',') (engine#2741)"
+    for p in $list; do kill -TERM "$p" 2> /dev/null; done
+    while [ "$i" -lt "$grace" ]; do
+        list=$(env_ticket_pids "$want")
+        [ -n "$list" ] || return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    for p in $list; do
+        log "  pid $p ignored TERM: $(tr '\0' ' ' < "/proc/$p/cmdline" 2> /dev/null | cut -c1-100)"
+        kill -KILL "$p" 2> /dev/null
+    done
+    sleep 1
+    list=$(env_ticket_pids "$want")
+    [ -n "$list" ] || return 0
+    # durable, not just in a log that scrolls away: the next holder prints this (the same rule as engine#1639's survivors)
+    {
+        for p in $list; do
+            printf 'pid=%s ticket=%s cmd=%s\n' "$p" "$want" \
+                "$(tr '\0' ' ' < "/proc/$p/cmdline" 2> /dev/null | cut -c1-120 || printf unknown)"
+        done
+    } >> "$SURVIVORS" 2> /dev/null || true
+}
 # The payload gets its PROCESS GROUP of its own (`set -m` makes every background job a group leader), because a
 # process group is the one thing a descendant cannot escape: reparenting to init does not change it, and a group
 # outlives its leader, so `kill -- -$child` still reaches the children AFTER the payload's root has gone. Without it
@@ -606,6 +648,8 @@ kill "$watchdog" 2> /dev/null
 wait "$watchdog" 2> /dev/null
 # And end whatever is left from here too, so the promise does not depend on a helper having outlived its parent.
 kill_tree "$child"
+# engine#2741: then anything that left the tree -- `setsid`, a double fork -- but still carries this ticket's line.
+kill_ticket_env "$mine" "${GPU_HOLD_KILL_GRACE:-10}"
 if [ "$rc" = 124 ]; then
     # engine#2542, measured on the NPU: a ticket cut short by the max hold was followed 8m29s later -- with nothing
     # running -- by `Unsupported op 18` and an IO_PAGE_FAULT burst, and the two other bursts of that boot sat 3m26s

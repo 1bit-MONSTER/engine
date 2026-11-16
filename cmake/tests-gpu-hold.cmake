@@ -78,6 +78,10 @@ add_test(NAME gpu_hold_hold_dir COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_
 # for 40 s inside another lane's 45-minute hold. gpu-hold exports the exact token line it wrote (GPU_HOLD_TICKET) and the
 # label, and this asserts the child sees both, on a sandboxed HOME.
 add_test(NAME gpu_hold_child_identity COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_child_identity_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+# engine#2741: a payload that leaves the ticket's tree (setsid / double fork) must still end with the ticket, keyed on
+# the one handle it cannot shed -- the inherited GPU_HOLD_TICKET line in its environment.
+add_test(NAME gpu_hold_escape COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_escape_test.sh)
+set_tests_properties(gpu_hold_escape PROPERTIES SKIP_RETURN_CODE 77)
 
 # engine#2494 (guard-drift class): the guards in scripts/gpu-hold protect the box only once they are INSTALLED, and what
 # runs is ~/.local/bin/gpu-hold -- a copy nothing re-installs on merge. Measured twice: "identical to engine main" after

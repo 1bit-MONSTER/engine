@@ -57,7 +57,8 @@ import sys
 STAMP = re.compile(r"^\[\s*(\d+\.\d+)\]")
 
 
-ACCEL = "amdxdna"   # the driver whose node the sampler's holders describe
+ACCEL  = "amdxdna"
+WEAK_AFTER_S = 5.0   # nearest-sample distance past which an attribution is reported as weak (engine#2627)   # the driver whose node the sampler's holders describe
 
 
 def faults(text):
@@ -130,14 +131,24 @@ def attribute(rows, boots, max_gap, any_device=False):
             # observation, NOT a process called GAP -- attributing a fault here would invent a holder.
             out.append((sec, addr, "NO SAMPLE: the sampler was stalled across this fault (GAP row %s)" % ticket))
             continue
-        who = f"pid {pid} {ticket[:64]}"
+        # How far away the evidence was, on every line: engine#2627 measured nearest-sample distances of median 1 s,
+        # p90 27 s, max 45 s, and a reader cannot judge an attribution without it. With 18 tickets holding the node
+        # per hour (my own measurement) the chance the node changed hands inside 5 s is 2.5 % and inside 27 s is 13.5 %,
+        # so the distance is the difference between strong and weak evidence rather than a detail.
+        age = sec - epoch
+        who = f"pid {pid} {ticket[:64]} (sample {age:.0f}s before)"
         if after and after[0][1] != pid:
             # Name the other side: a window would name both and stop; this says which one is the guess
             # and what the next observation saw. '-' there is "nothing held it", not a process named '-'.
             nxt = "nothing held the node" if after[0][1] == "-" else f"pid {after[0][1]}"
             out.append((sec, addr, f"HANDOVER-ADJACENT: {who} (next sample: {nxt})"))
-        else:
+        elif age <= WEAK_AFTER_S:
             out.append((sec, addr, f"ATTRIBUTED: {who}"))
+        else:
+            # Visible as weak, not dropped and not called strong: with 18 tickets per hour the node changes hands
+            # about every 200 s, so a 27 s-old sample still names the holder ~87 % of the time and a 45 s-old one
+            # ~78 % -- worth reporting, not worth presenting as certain.
+            out.append((sec, addr, f"ATTRIBUTED-WEAK: {who}, the node changes hands every ~200s on this box"))
     return out
 
 
@@ -145,7 +156,8 @@ def yield_line(res):
     """The number that decides whether a sampling run can answer the question at all."""
     # Every verdict must be counted, or the summary says "0 of everything" about a capture full of faults -- the
     # silent-drop class this file exists to avoid. "NOT THE ACCEL NODE" is a fifth outcome, not a footnote.
-    k = {"ATTRIBUTED": 0, "HANDOVER-ADJACENT": 0, "NOTHING HELD": 0, "NO SAMPLE": 0, "NOT THE ACCEL NODE": 0}
+    k = {"ATTRIBUTED-WEAK": 0, "ATTRIBUTED": 0, "HANDOVER-ADJACENT": 0, "NOTHING HELD": 0, "NO SAMPLE": 0,
+         "NOT THE ACCEL NODE": 0}   # WEAK first: the tally prefixes on these keys
     for _, _, v in res:
         for key in k:
             if v.startswith(key):
@@ -153,9 +165,9 @@ def yield_line(res):
                 break
     n = len(res)
     total = sum(k.values())
-    return ("faults: %d; attributable %d, ambiguous %d, nothing-held %d, no-sample %d, other-device %d"
-            % (n, k["ATTRIBUTED"], k["HANDOVER-ADJACENT"], k["NOTHING HELD"], k["NO SAMPLE"],
-               k["NOT THE ACCEL NODE"])) + ("" if total == n else "  !! %d fault(s) uncounted" % (n - total))
+    return ("faults: %d; attributable %d (weak %d), ambiguous %d, nothing-held %d, no-sample %d, other-device %d"
+            % (n, k["ATTRIBUTED"] + k["ATTRIBUTED-WEAK"], k["ATTRIBUTED-WEAK"], k["HANDOVER-ADJACENT"],
+               k["NOTHING HELD"], k["NO SAMPLE"], k["NOT THE ACCEL NODE"])) + ("" if total == n else "  !! %d fault(s) uncounted" % (n - total))
 
 
 def outlook(rows, windows):
@@ -254,11 +266,12 @@ def self_test():
         head = v.split(":")[0]
         return "NO SAMPLE" if head.startswith("NO SAMPLE") else head
     got = [kind(v) for _, _, v in res]
-    assert got == ["ATTRIBUTED", "HANDOVER-ADJACENT", "NOTHING HELD", "ATTRIBUTED", "NO SAMPLE"], res
-    assert "cl-a" in res[0][2] and "pid 111" in res[0][2], res[0]
+    assert got == ["ATTRIBUTED-WEAK", "HANDOVER-ADJACENT", "NOTHING HELD", "ATTRIBUTED", "NO SAMPLE"], res   # 50 s away is WEAK
+    assert "cl-a" in res[0][2] and "pid 111" in res[0][2] and "sample 50s before" in res[0][2], res[0]
     # The handover verdict must NAME both sides: naming one is the failure mode of a window. Here the
     # handover is to 'nobody', which must read as words rather than as a process called '-'.
     assert "pid 111" in res[1][2] and "nothing held the node" in res[1][2], res[1]
+    assert "sample 50s before" in res[1][2], res[1]   # every holder line carries its distance
 
     # And the case that motivates not using a window at all: two real holders either side of the fault.
     hand = attribute([(0, "111", "gpu-hold cl-a pid 1"), (100, "111", "gpu-hold cl-a pid 1"),
@@ -266,7 +279,7 @@ def self_test():
     assert hand[0][2].startswith("HANDOVER-ADJACENT"), hand
     assert "pid 111" in hand[0][2] and "pid 222" in hand[0][2], hand
     assert "no accel client held it" in res[2][2], res[2]      # not "I did not look"
-    assert yield_line(res) == ("faults: 5; attributable 2, ambiguous 1, nothing-held 1, no-sample 1, other-device 0"), yield_line(res)
+    assert yield_line(res) == ("faults: 5; attributable 2 (weak 1), ambiguous 1, nothing-held 1, no-sample 1, other-device 0"), yield_line(res)
 
     # --max-gap decides freshness, and a smaller gap converts ATTRIBUTED into NO SAMPLE rather than
     # silently attributing across a long unobserved stretch.
@@ -336,8 +349,13 @@ def self_test():
     # The summary must account for every fault: a verdict missing from the tally makes "0 of everything" look like
     # an empty capture. This arm would have printed 0/0/0/0 for 137 NVMe faults before the counter was added.
     assert yield_line([(1.0, "0x1", "NOT THE ACCEL NODE: other device")]) == (
-        "faults: 1; attributable 0, ambiguous 0, nothing-held 0, no-sample 0, other-device 1"), \
+        "faults: 1; attributable 0 (weak 0), ambiguous 0, nothing-held 0, no-sample 0, other-device 1"), \
         yield_line([(1.0, "0x1", "NOT THE ACCEL NODE: other device")])
+
+    # A far sample is reported as WEAK rather than dropped or called certain (engine#2627), and the tally splits it.
+    weak = attribute([(1000, "1234", "gpu-hold cl-a pid 9")], [(1030.0, "0x1", True)], 150)
+    assert weak[0][2].startswith("ATTRIBUTED-WEAK"), weak
+    assert yield_line(weak).startswith("faults: 1; attributable 1 (weak 1)"), yield_line(weak)
 
     # Stamps and addresses are parsed, and non-fault lines are ignored.
     text = ("[1234.500000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0007]\n"

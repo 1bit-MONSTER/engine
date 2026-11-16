@@ -67,6 +67,7 @@ import shutil
 import tempfile
 import subprocess
 import sys
+import time
 
 # A line worth looking for: long enough not to be punctuation, and not a brace or a lone keyword.
 # Below this the containment test answers "yes" for `}`, `);` and `#endif` in every file on earth.
@@ -89,11 +90,31 @@ examined = [0]
 unchanged = [0]
 
 
+# `git` is indirected for the same reason `gh` is: an arm has to be able to make one call fail.
+GIT_BIN = "git"
+
+
 def git(repo, *args, check=False):
-    p = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
+    p = subprocess.run([GIT_BIN, *args], cwd=str(repo), capture_output=True, text=True)
     if check and p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {p.stderr.strip()}")
     return p
+
+
+def fetch_retry(repo, *args):
+    """`git fetch`, twice. A transient failure must not become a GAP.
+
+    Measured 2026-11-16: a scan reported `#2719 … could not fetch https://… refs/pull/2719/head`, i.e. a GAP and
+    exit 2 on a clean tree, and the same fetch by hand succeeded seconds later (both transports). The GAP is the safe
+    answer while it is true -- a scan that could not look is not a clean scan -- but a dropped connection is not a
+    finding, and every merged-and-branch-deleted PR goes through this one call, so one flaky minute read as a fault.
+    Two attempts cost a second git call only on the failure path.
+    """
+    r = git(repo, "fetch", *args)
+    if r.returncode == 0:
+        return r
+    time.sleep(2)
+    return git(repo, "fetch", *args)
 
 
 # `gh` may simply not be installed -- the CI container does not have it, and the first version of this
@@ -430,8 +451,7 @@ def scan(repo, days, limit, base_url=None, prs=None):
         url = f"https://github.com/{owner}/{name}.git"
         base_ref = f"refs/mtck/base/{pr['baseRefName']}"
 
-        if git(repo, "fetch", "-q", "--no-tags", "origin",
-               f"{pr['baseRefName']}:{base_ref}").returncode != 0:
+        if fetch_retry(repo, "-q", "--no-tags", "origin", f"{pr['baseRefName']}:{base_ref}").returncode != 0:
             rows.append(("GAP", pr, branch, None, f"could not fetch base {pr['baseRefName']}"))
             continue
 
@@ -464,7 +484,7 @@ def scan(repo, days, limit, base_url=None, prs=None):
             continue  # the branch tip is exactly what merged: nothing was pushed after
 
         ref = f"refs/mtck/{pr['number']}"
-        if git(repo, "fetch", "-q", "--no-tags", url, f"{branch}:{ref}").returncode != 0:
+        if fetch_retry(repo, "-q", "--no-tags", url, f"{branch}:{ref}").returncode != 0:
             rows.append(("GAP", pr, branch, None, f"could not fetch {url} {branch}"))
             continue
 
@@ -885,6 +905,28 @@ def self_test():
     # And the arm CI added: this row FAILED in the build container because `gh` is not installed
     # there, so the call raised FileNotFoundError instead of answering "I could not look". Measured
     # on #2659: 11/11 arms locally, 75 - merged_tail_check_self (Failed) in CI.
+    # engine#2725: a fetch that fails once is retried, because a transient failure used to become a GAP and exit 2 on
+    # a clean tree (measured: #2719's PR-ref fetch failed in one scan and worked by hand seconds later). The stub fails
+    # the FIRST `git fetch` and execs the real git afterwards, so the arm measures the retry rather than the network.
+    d, r = scratch()
+    commit(r, "f.txt", "x\n", "one")
+    subprocess.run(["git", "remote", "add", "origin", str(r)], cwd=r, check=True)   # a real origin to fetch FROM
+    real_git = shutil.which("git")
+    stub = pathlib.Path(d.name) / "git-stub"
+    counter = pathlib.Path(d.name) / "count"
+    stub.write_text('#!/bin/sh\nn=$(cat "' + str(counter) + '" 2>/dev/null || echo 0)\nn=$((n+1))\n'
+                    'echo $n > "' + str(counter) + '"\n[ "$n" -ge 2 ] && exec ' + real_git + ' "$@"\nexit 1\n')
+    stub.chmod(0o755)
+    global GIT_BIN
+    saved_git, GIT_BIN = GIT_BIN, str(stub)
+    try:
+        rc = fetch_retry(r, "origin", "main").returncode
+        attempts = int(counter.read_text()) if counter.is_file() else 0
+    finally:
+        GIT_BIN = saved_git
+    chk(0, rc, "a fetch that fails once is retried and succeeds: a transient failure is not a GAP")
+    chk(2, attempts, "... in exactly two attempts")
+
     global GH_BIN
     saved, GH_BIN = GH_BIN, "gh-that-is-not-installed"
     try:
@@ -935,8 +977,7 @@ def main():
         return self_test()
     if a.branch:
         wt = pathlib.Path(a.worktree)
-        if git(wt, "fetch", "-q", "--no-tags", "origin",
-               a.base.replace("origin/", "")).returncode != 0:
+        if fetch_retry(wt, "-q", "--no-tags", "origin", a.base.replace("origin/", "")).returncode != 0:
             print(f"merged_tail_check: could not fetch {a.base} -- cannot tell, and that is not "
                   f"a pass", file=sys.stderr)
             return 2

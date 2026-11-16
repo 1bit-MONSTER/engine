@@ -132,6 +132,9 @@ struct OnnxTensor {
     std::vector<int64_t> dims;
     std::string location;
     uint64_t offset = 0, length = 0;
+    // An inline initializer's bytes (TensorProto.raw_data): a pointer INTO the graph file's mapping, valid exactly as long
+    // as the OnnxModel that holds the mapping (OnnxModel::mapping) is alive. Read it through that model, or copy it out
+    // before the model goes away (engine#2668: parse_onnx() used to unmap before returning, so every `raw` dangled).
     const uint8_t* raw = nullptr;
     size_t raw_len = 0;
 };
@@ -149,6 +152,10 @@ struct OnnxMatMul {
 };
 
 struct OnnxModel {
+    // The graph file's mapping, which every OnnxTensor::raw points into (engine#2668). Shared, so a copied OnnxModel keeps
+    // it alive too; unmapped when the last copy goes. A graph with external data maps a small file here; one with inline
+    // tables maps them, which is what reading them requires anyway.
+    std::shared_ptr<const uint8_t> mapping;
     std::vector<OnnxTensor> tensors;
     std::vector<OnnxMatMul> matmuls;
     // The fused-MLP nodes' (SSMLP / GQO) gate/up/down shapes, from their attributes. Kept apart from `matmuls` because they
@@ -312,6 +319,10 @@ OnnxModel parse_onnx(const std::string& path) {
     const uint8_t* map = map_file(path, size, &why);
     if (!map) throw std::runtime_error(why);
     OnnxModel m;
+    // The model owns the mapping from here on: the walk below leaves `raw` pointers into it on inline initializers, and
+    // they are read after this function returns (read_embedding_component's f32 table, the per-layer table, the
+    // inline-initializer readers), so it may only be unmapped when the model is gone (engine#2668).
+    m.mapping = std::shared_ptr<const uint8_t>(map, [size](const uint8_t* p) { unmap_file(p, size); });
     try {
         const auto model = pb(map, size);
         const auto* g = field1(model, 7);
@@ -377,10 +388,8 @@ OnnxModel parse_onnx(const std::string& path) {
                                  : "no recognisable If condition, so then_branch is taken as decode by the ONNX convention";
         }
     } catch (...) {
-        unmap_file(map, size);
-        throw;
+        throw;   // `m`, and with it the mapping, is released on the way out
     }
-    unmap_file(map, size);
     // A 1.9 external-data pack names its weights through placeholders: the node's input is
     // `model.layers.0.attn.o_proj.MatMulNBits.qweight.empty`, an initializer with NO dims, while the bytes sit in
     // `...qweight.packed` -- an initializer the node never references (measured on phi-4: 201 of 201 matmuls, and

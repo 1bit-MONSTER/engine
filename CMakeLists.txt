@@ -1762,6 +1762,21 @@ add_test(NAME q4nx_vision_pos COMMAND q4nx_vision_pos_test)
 add_executable(npu_pack_import_test tests/npu_pack_import_test.cpp)
 target_link_libraries(npu_pack_import_test PRIVATE onebit_npu)
 add_test(NAME npu_pack_import COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden)
+# engine#2668: an INLINE initializer's OnnxTensor::raw must still be readable after parse_onnx() returns (it used to point
+# into a mapping the parse had already unmapped). Built with AddressSanitizer so a read of freed or unmapped memory is a
+# report, not a lucky pass (the test fails if it was built without the sanitizer). Leak detection is off on purpose: the
+# arm is about a mapping's lifetime, and the library holds some allocations for the process lifetime, which a leak report
+# would list as noise -- do not "fix" detect_leaks=0 into a leak hunt here.
+add_executable(onnx_inline_lifetime_test tests/onnx_inline_lifetime_test.cpp)
+target_link_libraries(onnx_inline_lifetime_test PRIVATE onebit_npu)
+target_include_directories(onnx_inline_lifetime_test PRIVATE npu)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(onnx_inline_lifetime_test PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+    target_link_options(onnx_inline_lifetime_test PRIVATE -fsanitize=address)
+endif()
+add_test(NAME onnx_inline_lifetime COMMAND onnx_inline_lifetime_test ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(onnx_inline_lifetime PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+add_dependencies(onebit onnx_inline_lifetime_test)   # so CI's build list (which builds `onebit`) builds and runs it
 # engine#1726: NPU_INFER_DUMP_DIR's residual write must SAY when it cannot write -- a missing or unwritable directory, or a
 # full disk, used to leave a run that printed it was dumping with no files and no error. Pure stdio, no device, no NPU
 # headers: the arm a version that only checks fopen would pass is the short write, which /dev/full produces for real.

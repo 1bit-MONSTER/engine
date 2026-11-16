@@ -16,7 +16,7 @@ limitations under the License.
 -->
 # Before you ask for a merge
 
-Eleven commands, all host-side, none needing a device or a build. Every one of them answers a question that
+Every command below, all host-side, none needing a device or a build. Every one of them answers a question that
 `mergeable=true`, a green CI tick and a careful read of your own diff do not.
 
 Run them from the repository root on the branch you are about to hand over.

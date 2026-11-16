@@ -1489,6 +1489,23 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     if (m16_check_ && &kctx != &ctx)
         m16_check_gemm_rows(ctx, kctx, A, M, K, N, slot ? slot_bo(*slot, kctx) : nullptr,
                             ascales);
+    // NPU_W4_CHECK=1: the w4g32 launch against the float reference sum_k A[m][k] * Bmat[k][n] on a sample of rows and
+    // columns, layers 0-1 only; one line per launch with the worst relative error.  A diagnostic, off by default.
+    if (Bmat && ar.layer >= 0 && std::getenv("NPU_W4_CHECK")) {
+        const int astr = (ar.a_k > 0 && ar.a_k < K) ? ar.a_k : K;
+        double worst = 0, refn = 0, errn = 0;
+        for (int m : {0, std::min(5, M - 1), std::min(15, M - 1)}) {
+            for (int n = 0; n < N; n += std::max(1, N / 61)) {
+                double ref = 0;
+                for (int k = 0; k < K; k++) ref += (double)A[(size_t)m * astr + k] * (double)Bmat[(size_t)k * N + n];
+                const double got = out[(size_t)m * N + n];
+                refn += ref * ref; errn += (got - ref) * (got - ref);
+                worst = std::max(worst, std::fabs(got - ref));
+            }
+        }
+        fprintf(stderr, "[w4check] %s layer %d role %d M=%d K=%d N=%d rel-err %.4f worst-abs %.4g (ref rms %.4g)\n", kctx.w4g32 ? "w4" : "i8", ar.layer,
+                ar.role, M, K, N, std::sqrt(errn / std::max(refn, 1e-30)), worst, std::sqrt(refn / 183));
+    }
     if (prof) {
         const double dpk = std::chrono::duration<double, std::milli>(tl - tp).count();
         const double dql = std::chrono::duration<double, std::milli>(tq - tl).count();

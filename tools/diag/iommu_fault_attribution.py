@@ -285,8 +285,9 @@ def distances(rows):
     """How far a fault would be from its nearest sample, predicted from a trace with no faults in it.
 
     A fault lands at a random time, so its nearest-sample distance is distributed like the gaps between samples.
-    engine#2627 measured the real thing (median 1 s, p90 27 s, max 45 s; 24 of 119 beyond 10 s); this prints the same
-    statistic from the samples alone, which is what tells a capture's owner -- before any fault -- whether the
+    engine#2627 measured the real thing on ITS capture (median 1 s, p90 27 s, max 45 s; 24 of 119 beyond 10 s). Those
+    numbers are that hour's load, not this box's: the running sampler here reads median 2 s, p90 3 s, max 93 s, and the
+    max is the same lapse the sampler records as a GAP. So the same statistic computed from the samples alone, which is what tells a capture's owner -- before any fault -- whether the
     sampler is dense enough to attribute one, and whether a run will be dominated by WEAK verdicts.
     """
     ts = [r[0] for r in rows]
@@ -487,20 +488,17 @@ def main():
         return 0
     if not args.samples:
         ap.error("--samples is required unless --self-test")
+    # The modes all print a report and exit, so combining them silently dropped one (review of #2640: `--attributed`
+    # ran first and `return 0`d, so `--distances` printed nothing). Refuse the combination instead of picking one:
+    # a flag that answers a question must never be answered by a different question.
+    modes = [name for name, on in (("--attributed", args.attributed), ("--distances", args.distances),
+                                   ("--outlook", bool(args.outlook))) if on]
+    if len(modes) > 1:
+        ap.error("%s are separate reports: run them one at a time" % " and ".join(modes))
     boot = args.boot_epoch
     if boot is None:
         with open("/proc/stat", encoding="utf-8") as f:
             boot = float(next(int(l.split()[1]) for l in f if l.startswith("btime")))
-    if args.attributed:
-        rows, _ = drop_pre_boot(samples(args.samples), boot)
-        pairs = attributed_rows(open(args.attributed, encoding="utf-8", errors="replace").read())
-        ds = disagreements(rows, pairs, args.max_gap)
-        for epoch, hits, verdict, agree in ds:
-            print(fmt_attr(epoch, hits, verdict, agree))
-        n = len(ds) or 1
-        print("faults: %d; agree %d, disagree %d" % (len(ds), sum(1 for d in ds if d[3]),
-                                                      sum(1 for d in ds if not d[3])))
-        return 0
     if args.distances:
         rows, _ = drop_pre_boot(samples(args.samples), boot)
         d = distances(rows)
@@ -511,6 +509,16 @@ def main():
         print("nearest sample within 2s: %.1f%%, within 5s: %.1f%%, within 10s: %.1f%%"
               % (d["within2"], d["within5"], d["within10"]))
         print("an attribution past %.0fs is reported WEAK (ATTRIBUTED-WEAK)" % WEAK_AFTER_S)
+        return 0
+    if args.attributed:
+        rows, _ = drop_pre_boot(samples(args.samples), boot)
+        pairs = attributed_rows(open(args.attributed, encoding="utf-8", errors="replace").read())
+        ds = disagreements(rows, pairs, args.max_gap)
+        for epoch, hits, verdict, agree in ds:
+            print(fmt_attr(epoch, hits, verdict, agree))
+        n = len(ds) or 1
+        print("faults: %d; agree %d, disagree %d" % (len(ds), sum(1 for d in ds if d[3]),
+                                                      sum(1 for d in ds if not d[3])))
         return 0
     if args.outlook:
         rows, _ = drop_pre_boot(samples(args.samples), boot)

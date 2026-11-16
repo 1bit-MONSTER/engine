@@ -138,7 +138,22 @@ shift $((OPTIND - 1))
 # the same-queue case is refused here rather than left to burn a window. A DIFFERENT queue still runs: npu-hold execs
 # this script with the NPU's queue and the hw-gate takes its own GPU claim inside an NPU ticket, and that is the shape
 # npu-hold documents as required.
-if [ -n "${GPU_HOLD_HELD_QUEUE:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; then
+# engine#2727 review: the two refusals below key off the PRESENCE of an inherited variable, not the LIVENESS of the
+# ticket that exported it. A payload that outlives its ticket -- a daemonised child, which is exactly how the 51 GiB
+# orphan of 11-08 happened -- still carries GPU_HOLD_HELD_* from a parent whose ticket is long gone, and the next
+# gpu-hold inside it would be refused with "the outer ticket already holds the GPU" when it does not. GPU_HOLD_TICKET
+# carries the holder pid ("gpu-hold <label> pid <pid> <ts>"), so a pid that no longer exists means the environment is
+# stale and the hold proceeds. A recycled pid can only make this MORE conservative (it keeps the refusal), never
+# silently drop a real nest -- the refusal exists to protect a window, so erring toward refusing is the right side.
+_held_live=1
+if [ -n "${GPU_HOLD_TICKET:-}" ]; then
+    _held_pid=$(printf '%s' "$GPU_HOLD_TICKET" | sed -n 's/.* pid \([0-9][0-9]*\) .*/\1/p')
+    if [ -n "$_held_pid" ] && ! kill -0 "$_held_pid" 2> /dev/null; then
+        _held_live=0
+        echo "gpu-hold: the inherited ticket is stale -- GPU_HOLD_TICKET names pid $_held_pid, which no longer exists, so label '${GPU_HOLD_HELD_LABEL:-${GPU_HOLD_LABEL:-?}}' is not holding anything and this hold proceeds instead of refusing a nest that is not there (engine#2727 review)" >&2
+    fi
+fi
+if [ "$_held_live" = 1 ] && [ -n "${GPU_HOLD_HELD_QUEUE:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; then
     _nest_here=$(cd "$QUEUE" 2> /dev/null && pwd -P || printf '%s' "$QUEUE")
     _nest_there=$(cd "$GPU_HOLD_HELD_QUEUE" 2> /dev/null && pwd -P || printf '%s' "$GPU_HOLD_HELD_QUEUE")
     if [ "$_nest_here" = "$_nest_there" ]; then
@@ -151,7 +166,7 @@ fi
 # token is the thing it waits on -- gpu-hold's own wait line says so ("first in the queue, waiting for <token> (held by:
 # <label> pid <pid>)") -- so the comparison is on the token too. engine#2727 review, measured: outer on q1, payload
 # running `-q q2` with the inherited token sat 4 s and then reported "queue never came round" (rc 75) with the outer.
-if [ -n "${GPU_HOLD_HELD_TOKEN:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; then
+if [ "$_held_live" = 1 ] && [ -n "${GPU_HOLD_HELD_TOKEN:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; then
     _tok_here=$(cd "$(dirname "$TOKEN")" 2> /dev/null && pwd -P || dirname "$TOKEN")
     _tok_there=$(cd "$(dirname "$GPU_HOLD_HELD_TOKEN")" 2> /dev/null && pwd -P || dirname "$GPU_HOLD_HELD_TOKEN")
     if [ "$_tok_here/$(basename "$TOKEN")" = "$_tok_there/$(basename "$GPU_HOLD_HELD_TOKEN")" ]; then

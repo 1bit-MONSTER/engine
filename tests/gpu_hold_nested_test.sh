@@ -29,6 +29,8 @@
 #   3. the marker is absent for a command started outside any ticket
 #   4. the payload sees GPU_HOLD_HELD_QUEUE and GPU_HOLD_HELD_LABEL
 #   5. GPU_HOLD_ALLOW_NESTED=1 lets a same-queue nest through instead of refusing
+#   6. a STALE inherited ticket (dead pid in GPU_HOLD_TICKET) is not a nest -> the hold proceeds and says so
+#   6b. ...and the same environment with a LIVE pid is still refused (the control for arm 6)
 #
 # usage: gpu_hold_nested_test.sh <path-to-gpu-hold>
 set -u
@@ -92,8 +94,32 @@ inner_rc=$(printf '%s\n' "$out" | sed -n 's/^INNER_RC=//p' | head -1)
 printf '  arm5 inner rc with the override=%s\n' "${inner_rc:-<none>}"
 if [ "${inner_rc:-}" = 2 ]; then echo "  FAIL arm5: GPU_HOLD_ALLOW_NESTED=1 did not lift the refusal"; fails=$((fails+1)); fi
 
+# 6. a STALE inherited ticket is not a nest (engine#2727 review). A payload that outlives its ticket keeps the exported
+#    environment -- a daemonised child is exactly how the 51 GiB orphan of 11-08 happened -- and refusing then blocks a
+#    legitimate run in the name of a ticket that no longer exists. GPU_HOLD_TICKET carries the holder pid.
+DEAD_PID=99999999
+kill -0 "$DEAD_PID" 2> /dev/null && DEAD_PID=9999999
+out=$(env "${env_common[@]}" GPU_HOLD_HELD_QUEUE="$tmp/GPU-QUEUE" GPU_HOLD_HELD_LABEL=ghost \
+        GPU_HOLD_HELD_TOKEN="$tmp/GPU-TOKEN" \
+        GPU_HOLD_TICKET="gpu-hold ghost pid $DEAD_PID 2026-11-16T00:00:00+00:00" \
+        timeout 60 bash "$HOLD" -l stale-arm6 -t 0.05 -- true 2>&1)
+rc=$?
+printf '  arm6 stale env rc=%d (want 0)\n' "$rc"
+if [ "$rc" != 0 ]; then echo "  FAIL arm6: a STALE inherited ticket was refused (rc=$rc) -- the env outlived its ticket and blocks a real run"; fails=$((fails+1)); fi
+printf '%s\n' "$out" | grep -q "is stale" || { echo "  FAIL arm6: the run did not name the inherited ticket as stale"; fails=$((fails+1)); }
+
+# 6b. THE CONTROL: the same environment with a LIVE pid is still refused. Without this arm, "stale means allow" could
+#     just mean "never refuse", and the 764 s window engine#2727 cost would come back.
+out=$(env "${env_common[@]}" GPU_HOLD_HELD_QUEUE="$tmp/GPU-QUEUE" GPU_HOLD_HELD_LABEL=ghost \
+        GPU_HOLD_HELD_TOKEN="$tmp/GPU-TOKEN" \
+        GPU_HOLD_TICKET="gpu-hold ghost pid $$ 2026-11-16T00:00:00+00:00" \
+        timeout 60 bash "$HOLD" -l live-arm6b -t 0.05 -- true 2>&1)
+rc=$?
+printf '  arm6b live env rc=%d (want 2)\n' "$rc"
+if [ "$rc" != 2 ]; then echo "  FAIL arm6b: a LIVE inherited ticket was not refused (rc=$rc, want 2) -- the liveness guard gutted the refusal"; fails=$((fails+1)); fi
+
 if [ "$fails" = 0 ]; then
-    echo "gpu_hold_nested: 6 arms pass"
+    echo "gpu_hold_nested: 8 arms pass (1, 2, 3/4, 4b, 5, 6 stale, 6b live control)"
     exit 0
 fi
 echo "gpu_hold_nested: $fails failure(s)"

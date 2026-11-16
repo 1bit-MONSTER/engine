@@ -1108,8 +1108,23 @@ if(ONEBIT_AUDIO_AVX2)
     endif()
 endif()
 
+# engine#1783: the audio executor is compiled twice and picked at load. The flags effect is a WHOLE-TU one
+# (measured 1.252x TU-wide vs 1.010x for a clone of just the four-row GEMM), and the appliance must keep the
+# baseline, so this is a runtime choice rather than a build-wide -mavx2 (engine#2403).
+add_library(onebit_audio_exec_base OBJECT npu/audio_exec.cpp)
+add_library(onebit_audio_exec_avx2 OBJECT npu/audio_exec.cpp)
+foreach(_f onebit_audio_exec_base onebit_audio_exec_avx2)
+    target_include_directories(${_f} PRIVATE npu)
+endforeach()
+target_compile_definitions(onebit_audio_exec_base PRIVATE ONEBIT_AUDIO_TU_SUFFIX=base)
+target_compile_definitions(onebit_audio_exec_avx2 PRIVATE ONEBIT_AUDIO_TU_SUFFIX=avx2)
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-mavx2" ONEBIT_HAVE_AVX2_TU)
+if(ONEBIT_HAVE_AVX2_TU AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(onebit_audio_exec_avx2 PRIVATE -mavx2)   # NOT -mfma: it breaks the ordered-sum contract
+endif()
 add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp npu/vision_request.cpp
-                            npu/audio_exec.cpp npu/audio_pack.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
+                            $<TARGET_OBJECTS:onebit_audio_exec_base> $<TARGET_OBJECTS:onebit_audio_exec_avx2> npu/audio_exec_dispatch.cpp npu/audio_pack.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json onebit_q4nx_cache PRIVATE PkgConfig::PCRE2)

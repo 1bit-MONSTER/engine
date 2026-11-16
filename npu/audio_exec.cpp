@@ -33,6 +33,16 @@
 #include "file_map.h"
 
 namespace onebit::npu::pack_import {
+// engine#1783: this TU is compiled TWICE -- once at the tree's own flags and once with -mavx2 -- and the two
+// flavours are told apart only by this inline namespace, so every symbol mangles differently and both link.
+// The 1.25x measured on this box is a WHOLE-TU effect (every elementwise/softmax/transpose loop, not just the
+// four-row GEMM: a per-function clone of that alone measured 1.010x). See onebit_audio_exec_* in CMakeLists.
+#ifndef ONEBIT_AUDIO_TU_SUFFIX
+#define ONEBIT_AUDIO_TU_SUFFIX base
+#endif
+#define ONEBIT_JOIN2(a, b) a##b
+#define ONEBIT_JOIN(a, b) ONEBIT_JOIN2(a, b)
+inline namespace ONEBIT_JOIN(tu_, ONEBIT_AUDIO_TU_SUFFIX) {
 namespace {
 
 struct Tensor {
@@ -901,3 +911,5 @@ bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_
 }
 
 }  // namespace onebit::npu::pack_import
+
+}  // inline namespace tu_<suffix>

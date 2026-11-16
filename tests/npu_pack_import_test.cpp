@@ -5479,6 +5479,37 @@ void test_embedding_gemma3mm_component(const std::string& root) {
               "gemma3-mm embedding: two unnamed 2-D f32 tables are not guessed between (" + why + ")");
     }
     fs::remove_all(dir);
+    // #2664 review: at H = 256 the scale the arm quotes (16) IS sqrt(256), so a hardcoded 16 would pass. The real pack's
+    // width, 2560: sqrt(2560) = 50.596... is accepted and applied, and 16 is refused naming the sqrt it wanted.
+    {
+        const int64_t V2 = 4, H2 = 2560;
+        std::vector<float> t2(size_t(V2) * size_t(H2));
+        for (size_t i = 0; i < t2.size(); ++i) t2[i] = float(int(i % 31) - 15) * 0.125f;
+        const float s2 = float(std::sqrt(2560.0));
+        const auto build2 = [&](float scale) {
+            fs::remove_all(dir);
+            fs::create_directories(dir);
+            const std::string data(reinterpret_cast<const char*>(t2.data()), t2.size() * sizeof(float));
+            put_file((dir / "gemma-3-embedding.onnx.data").string(), data);
+            put_file((dir / "gemma-3-embedding.onnx").string(),
+                     pb::model({pb::tensor("lm_head.weight", {V2, H2}, "gemma-3-embedding.onnx.data", 0, data.size(), 1),
+                                scalar("model.language_model.embed_tokens.embed_scale", scale)},
+                               {}));
+            put_file((dir / "genai_config.json").string(),
+                     R"({"model":{"type":"gemma3","embedding":{"filename":"gemma-3-embedding.onnx"}}})");
+        };
+        build2(s2);
+        std::string why;
+        const std::vector<float> got = pi::read_embedding_component(dir.string(), &why);
+        bool ok = got.size() == t2.size();
+        for (size_t i = 0; ok && i < t2.size(); ++i) ok = got[i] == t2[i] * s2;
+        check(ok, "gemma3-mm embedding: at H 2560 the scale sqrt(2560) = 50.596 is accepted and applied (" + why + ")");
+        build2(16.0f);
+        std::string why16;
+        check(pi::read_embedding_component(dir.string(), &why16).empty() && why16.find("50.59") != std::string::npos,
+              "gemma3-mm embedding: at H 2560 a scale of 16 is refused, naming sqrt(hidden) = 50.59 (" + why16 + ")");
+        fs::remove_all(dir);
+    }
 }
 
 

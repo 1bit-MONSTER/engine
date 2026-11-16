@@ -1849,8 +1849,8 @@ as the 4-bit table's scales (those are 2-D `[V, groups]`). The container stores 
 forward's lookup applies no gemma scale, and its tied head divides sqrt(H) back out. So `embed_scale` is applied to
 the table, and only when it equals sqrt(hidden); any other value is refused by name. A small inline initializer
 payload (64 B or less) is now copied when the graph is parsed, because the graph's mapping is gone by the time the
-reader looks. Inline tables larger than that still point into the unmapped file, so they stay unread here; the packs
-measured so far keep their tables in external data.
+reader looks. Inline tables larger than that still point into the unmapped file (engine#2668); the packs measured so far keep
+their tables in external data.
 
 With `config.json` empty, the model's numbers come from the pack itself:
 - **rms_norm_eps** from the graph's RMSNorm nodes (18 nodes state 1e-5). The default was 1e-6. When the nodes state different epsilons nothing is taken, and the import prints a WARNING naming the conflict and the value it keeps (`graph_eps_decision()`).

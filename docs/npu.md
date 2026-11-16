@@ -1841,7 +1841,7 @@ least 96.4 % byte-equal to the twin at its mapped place (a one-unit misplacement
 exports' re-quantization.
 
 With `config.json` empty, the model's numbers come from the pack itself:
-- **rms_norm_eps** from the graph's RMSNorm nodes (18 nodes state 1e-5). The default was 1e-6.
+- **rms_norm_eps** from the graph's RMSNorm nodes (18 nodes state 1e-5). The default was 1e-6. When the nodes state different epsilons nothing is taken, and the import prints a WARNING naming the conflict and the value it keeps (`graph_eps_decision()`).
 - **RoPE** from `cos_cache`. The theta fit (500000) looks only at the first 4,096 positions, where llama3 scaling is
   invisible. So the whole cache is also compared, by max error, with plain RoPE and with llama3 variants:
   - this pack's cache is **factor 32 with original_max_position_embeddings 131072**, max error 0.009, against 1.995

@@ -998,6 +998,9 @@ std::string canonical_token_fconst17_exported(const std::string& path, const std
                                               const std::string& work);
 // The epsilon the graph's RMSNorm nodes state (0 when none), how many state it, and whether two disagree.
 float graph_norm_eps_exported(const std::string& onnx_path, int* nodes, bool* conflict);
+// The rms_norm_eps to serve with: config.json's when it states one, else the graph's when its nodes agree; when they
+// disagree, `current` is kept and `msg` says so (a WARNING, never silence). `msg` is "" when there is nothing to say.
+float graph_eps_decision(bool config_stated, float current, int nodes, bool conflict, float graph_eps, std::string* msg);
 // engine#2634: whether a cos_cache is llama3-scaled RoPE, searched over factor and original window (see the .cpp).
 struct RopeLlama3Fit { bool found = false; double factor = 0, low = 0, high = 0, orig = 0, err = 1e9, plain_err = 1e9; };
 RopeLlama3Fit rope_cache_llama3(const std::vector<float>& cache, int64_t rows, int64_t half, double theta);

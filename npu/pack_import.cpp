@@ -4520,12 +4520,15 @@ Plan plan(const std::string& pack_dir) {
     const OnnxModel onnx = parse_onnx(pack_dir + "/" + graph);
     // engine#2634: a pack that states no rms_norm_eps (config.json `{}`) states it in its graph's RMSNorm nodes. Taken
     // before the layer blocks are located, because the block headers are found by this same epsilon.
-    if (!p.dims.eps_stated && onnx.norm_eps_nodes > 0 && !onnx.norm_eps_conflict && onnx.norm_eps > 0.0f) {
-        if (p.dims.rms_norm_eps != onnx.norm_eps)
-            std::fprintf(stderr, "note: rms_norm_eps %.6g taken from the graph (%d RMSNorm nodes state it; config.json "
-                                 "does not)\n", double(onnx.norm_eps), onnx.norm_eps_nodes);
-        p.dims.rms_norm_eps = onnx.norm_eps;
-        p.dims.eps_bits = bf16_bits_of(onnx.norm_eps);
+    {
+        std::string msg;
+        const float e = graph_eps_decision(p.dims.eps_stated, p.dims.rms_norm_eps, onnx.norm_eps_nodes,
+                                           onnx.norm_eps_conflict, onnx.norm_eps, &msg);
+        if (!msg.empty()) std::fprintf(stderr, "%s\n", msg.c_str());
+        if (e != p.dims.rms_norm_eps) {
+            p.dims.rms_norm_eps = e;
+            p.dims.eps_bits = bf16_bits_of(e);
+        }
     }
     // Census the graph's own weight carrier (see plan_import.h's note): this is what tells a 1.3/1.6/1.7.1 pack
     // (real ONNX initializers) from a 1.8/R1-Distill pack (placeholders, weights in model.bin) without parsing
@@ -7758,6 +7761,30 @@ HeadFit fit_head(const Q4& q, const EmbedTable& embed, int rows, int block) {
     if (sxx > 0) f.scale = sxe / sxx;
     if (see > 0) f.rms_ratio = std::sqrt(sxx / see);
     return f;
+}
+
+// engine#2634: the rms_norm_eps a pack is served with, given what config.json and the graph say. config.json wins when it
+// states one. Otherwise the graph's RMSNorm nodes: taken when they agree, and when they DISAGREE nothing is taken and
+// that is said -- a pack that states two epsilons must not be served at one of them, or at the default, in silence
+// (#2638 review). `msg` is the line to print ("" when there is nothing to say).
+float graph_eps_decision(bool config_stated, float current, int nodes, bool conflict, float graph_eps, std::string* msg) {
+    char buf[320];
+    if (msg) msg->clear();
+    if (config_stated || nodes <= 0) return current;
+    if (conflict) {
+        std::snprintf(buf, sizeof buf,
+                      "WARNING: rms_norm_eps: the graph's %d RMSNorm nodes state DIFFERENT epsilons and config.json states "
+                      "none; keeping %.6g, which may not be this model's", nodes, double(current));
+        if (msg) *msg = buf;
+        return current;
+    }
+    if (!(graph_eps > 0.0f)) return current;
+    if (graph_eps != current) {
+        std::snprintf(buf, sizeof buf, "note: rms_norm_eps %.6g taken from the graph (%d RMSNorm nodes state it; "
+                                       "config.json does not)", double(graph_eps), nodes);
+        if (msg) *msg = buf;
+    }
+    return graph_eps;
 }
 
 // engine#2634: test hooks for the 1.7 headerless Token .fconst and the graph's own epsilon.

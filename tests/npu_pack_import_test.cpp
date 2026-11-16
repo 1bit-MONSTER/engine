@@ -474,6 +474,33 @@ void test_fconst17_rewrite() {
     const float got_eps = pi::graph_norm_eps_exported((dir / "eps.onnx").string(), &n_eps, &conflict);
     check(got_eps == 1e-5f && n_eps == 2 && !conflict, "1.7 fconst: the graph's RMSNorm epsilon is read (" +
                                                            std::to_string(got_eps) + ", " + std::to_string(n_eps) + " nodes)");
+    // #2638 review: two nodes that DISAGREE are a conflict, and the decision says so instead of falling back in silence
+    const auto eps_node = [&](float v) {
+        std::string nd, at;
+        pb::str(nd, 4, "SimplifiedLayerNormalization");
+        pb::str(at, 1, "epsilon");
+        pb::tag(at, 2, 5);
+        char vb[4];
+        std::memcpy(vb, &v, 4);
+        at.append(vb, 4);
+        pb::ints(at, 20, 1);
+        pb::str(nd, 5, at);
+        return nd;
+    };
+    put_file((dir / "eps2.onnx").string(), pb::model({}, {eps_node(1e-5f), eps_node(1e-6f)}));
+    int n2 = 0;
+    bool conflict2 = false;
+    (void)pi::graph_norm_eps_exported((dir / "eps2.onnx").string(), &n2, &conflict2);
+    check(conflict2 && n2 == 2, "1.7 fconst: two RMSNorm nodes stating different epsilons are a conflict");
+    std::string msg;
+    const float kept = pi::graph_eps_decision(false, 1e-6f, 2, true, 1e-5f, &msg);
+    check(kept == 1e-6f && msg.find("WARNING") != std::string::npos && msg.find("DIFFERENT") != std::string::npos,
+          "1.7 fconst: on a conflict the configured eps is kept and a WARNING says why (" + msg + ")");
+    const float taken = pi::graph_eps_decision(false, 1e-6f, 18, false, 1e-5f, &msg);
+    check(taken == 1e-5f && msg.find("taken from the graph") != std::string::npos,
+          "1.7 fconst: agreeing nodes give their eps, with a note");
+    const float stated = pi::graph_eps_decision(true, 1e-6f, 18, false, 1e-5f, &msg);
+    check(stated == 1e-6f && msg.empty(), "1.7 fconst: a stated config.json eps wins, silently");
     fs::remove_all(dir);
 }
 

@@ -121,6 +121,17 @@ sample_once() {  # one line per (moment, holder); "none" when nothing holds the 
   rotate "$SAMP"
 }
 
+nearest() {  # $1 fault epoch -> "<delta>s <holder fields>" for the CLOSEST sample, or "" when there are none
+  # A fixed +-WINDOW_S is the wrong instrument here: the loop measures 0.02 s per sample but at nice 19 on a loaded box it
+  # loses its schedule, and the observed gaps reach 8-13 s (and once 93 s). A window narrow enough to be precise then finds
+  # nothing, and its silence reads as "no holder". So report the nearest sample and its distance instead of pretending to a
+  # resolution the loop does not have.
+  awk -F'\t' -v t="$1" '
+    { d = $1 - t; if (d < 0) d = -d
+      if (best == "" || d < bestd) { bestd = d; best = $2"\t"$4"\t"$5"\t"$6 } }
+    END { if (best != "") printf "%ds\t%s", bestd, best }' "$SAMP" 2>/dev/null
+}
+
 correlate() {  # $1 lo $2 hi -> "pid:cmd:scope" for every sample in [lo,hi], deduplicated
   awk -F'\t' -v lo="$1" -v hi="$2" '$1 >= lo && $1 <= hi' "$SAMP" 2>/dev/null | cut -f2,4,5,6 | sort -u | tr '\n' ';'
 }
@@ -135,6 +146,9 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   # the ticket is the field the whole issue is about -- a record without it cannot say which ticket was live. This arm
   # is here because a refactor dropped exactly that field and the other arms stayed green (review of engine#2591).
   case "$out" in *ticket2*) ;; *) echo "FAIL: the npu-hold ticket was dropped from the record"; fail=1 ;; esac
+  # nearest: with samples at 1000 and 1010, a fault at 1009 must pick 1010 and say "1s"
+  n=$(nearest 1009)
+  case "$n" in 1s*) ;; *) echo "FAIL: nearest did not pick the closer sample (got '$n')"; fail=1 ;; esac
   case "$out" in *111*) echo "FAIL: a sample outside the window was included"; fail=1 ;; esac
   out=$(correlate 2000 2010)
   [ -z "$out" ] || { echo "FAIL: a window with no samples produced '$out'"; fail=1; }
@@ -148,7 +162,7 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   [ -f "$d/rot.log.1" ] || { echo "FAIL: rotation did not keep a previous file"; fail=1; }
   [ "$(stat -c %s "$d/rot.log")" -eq 0 ] || { echo "FAIL: the live file was not truncated"; fail=1; }
   rm -rf "$d"
-  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (window, fields+ticket, empty window, no-holder sample, rotation)"
+  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation)"
   return "$fail"
 }
 
@@ -159,7 +173,7 @@ watch_faults() {  # correlate each fault with the samples around it
     ts=${line%% *}                       # short-unix: "<epoch.frac> host kernel: ..."
     ts=${ts%%.*}
     lo=$((ts - WINDOW_S)); hi=$((ts + WINDOW_S))
-    hits=$(correlate "$lo" "$hi")
+    hits=$(nearest "$ts")
     printf '%s\t%s\t%s\n' "$ts" "${hits:--}" "$(printf '%s' "$line" | cut -c1-200)" >> "$ATTR"
     rotate "$ATTR"
   done

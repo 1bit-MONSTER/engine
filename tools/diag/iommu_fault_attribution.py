@@ -113,8 +113,20 @@ def attribute(rows, boots, max_gap, any_device=False):
         if sec is None:
             out.append((sec, addr, "NO SAMPLE: the line carries no kernel timestamp"))
             continue
-        before = [r for r in rows if r[0] <= sec]
-        after = [r for r in rows if r[0] > sec]
+        # A GAP row is written when the sampler RESUMES (accel_sampler.sh: `printf '%s\tGAP\t%s' "$NOW" "$((NOW - LAST))"`),
+        # so a row at epoch E with length L describes the stall (E-L, E] -- BEFORE its own timestamp. A fault is
+        # "stalled" when such a span covers it; GAP rows are never a sample to attribute to, before or after
+        # (review of engine#2623: reading the row as "the last sample before t" called faults AFTER a stall stalled,
+        # and named "pid GAP" as the next holder for faults INSIDE one).
+        stall = next((r for r in rows if r[1] == "GAP" and _gap_len(r[2]) is not None
+                      and r[0] - _gap_len(r[2]) < sec <= r[0]), None)
+        if stall is not None:
+            out.append((sec, addr, "NO SAMPLE: the sampler was stalled across this fault (a %ss gap ending at %d)"
+                        % (stall[2], stall[0])))
+            continue
+        real = [r for r in rows if r[1] != "GAP"]
+        before = [r for r in real if r[0] <= sec]
+        after = [r for r in real if r[0] > sec]
         if not before:
             out.append((sec, addr, "NO SAMPLE: no sample at or before the fault"))
             continue
@@ -125,11 +137,6 @@ def attribute(rows, boots, max_gap, any_device=False):
         if pid == "-":
             out.append((sec, addr, "NOTHING HELD: sampled at the node, no accel client held it"))
             continue
-        if pid == "GAP":
-            # engine#2624: the sampler writes a GAP row when it slept too long to sample. That is the absence of an
-            # observation, NOT a process called GAP -- attributing a fault here would invent a holder.
-            out.append((sec, addr, "NO SAMPLE: the sampler was stalled across this fault (GAP row %s)" % ticket))
-            continue
         who = f"pid {pid} {ticket[:64]}"
         if after and after[0][1] != pid:
             # Name the other side: a window would name both and stop; this says which one is the guess
@@ -139,6 +146,14 @@ def attribute(rows, boots, max_gap, any_device=False):
         else:
             out.append((sec, addr, f"ATTRIBUTED: {who}"))
     return out
+
+
+def _gap_len(field):
+    """Seconds of a GAP row's length field, or None when it is not a number (a malformed row covers nothing)."""
+    try:
+        return int(field)
+    except (TypeError, ValueError):
+        return None
 
 
 def yield_line(res):
@@ -321,8 +336,19 @@ def self_test():
     gap_log = "1000\t-\t-\t-\t-\t-\n1010\tGAP\t93\t-\t-\t-\n"
     gap_rows = rows_from_text(gap_log)
     assert gap_rows == [(1000, "-", "-"), (1010, "GAP", "93")], gap_rows   # the note carries the gap length
-    assert attribute(gap_rows, [(1015.0, "0x1", True)], 150)[0][2].startswith("NO SAMPLE"), attribute(gap_rows, [(1015.0, "0x1", True)], 150)
-    assert "stalled" in attribute(gap_rows, [(1015.0, "0x1", True)], 150)[0][2]
+    # The GAP row at 1010 with length 93 is the stall (917, 1010], written on RESUME: a fault inside it is stalled,
+    # a fault after it is not (review of engine#2623 -- the first version read it the other way round).
+    inside = attribute(gap_rows, [(1005.0, "0x1", True)], 150)[0][2]
+    assert inside.startswith("NO SAMPLE") and "stalled" in inside, inside
+    after_gap = attribute(gap_rows, [(1015.0, "0x1", True)], 150)[0][2]
+    assert "stalled" not in after_gap, after_gap
+    # and a stall between two holders never names a holder called GAP
+    hand = rows_from_text("900\t111\t1\t/a\ts\tgpu-hold cl-a\n910\tGAP\t10\t-\t-\t-\n912\t222\t1\t/b\ts\tgpu-hold cl-b\n")
+    for t in (899.5, 905.0, 911.0):
+        v = attribute(hand, [(t, "0x1", True)], 15)[0][2]
+        assert "GAP" not in v.replace("a 10s gap", ""), (t, v)
+    assert "stalled" in attribute(hand, [(905.0, "0x1", True)], 15)[0][2]
+    assert attribute(hand, [(911.0, "0x1", True)], 15)[0][2].startswith("HANDOVER-ADJACENT: pid 111")
     # ... and it is not a holder for the outlook either: with a real holder after it, the window still sees one.
     mixed = gap_rows + [(1020, "1234", "gpu-hold cl-a pid 9")]
     assert outlook(mixed, [5])[0][1] > 0.0, outlook(mixed, [5])   # some windows span the real holder

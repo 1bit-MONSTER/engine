@@ -287,6 +287,22 @@ const char* q4nx_i8_sealed_instance(Q4nxDesign role) {
     }
 }
 
+/* engine#2689: the prefill half of a model that shares the NPU lives in the SAME hardware context as its decode
+ * half (hw_context::add_config), and one context cannot hold two instances with the same "kernel:instance" key
+ * (the runtime refuses the second ELF: measured 11-16, "code 501: main:d"). So the sealed M=128 prefill ELF names
+ * its instances after the decode ones with a "p_" prefix: main:p_qkvfa, main:p_o, ... Null where decode has none. */
+const char* q4nx_i8_sealed_prefill_instance(Q4nxDesign role) {
+    switch (role) {
+        case Q4NX_DESIGN_QKVLIN: return "main:p_qkv";
+        case Q4NX_DESIGN_QKV:    return "main:p_qkvfa";
+        case Q4NX_DESIGN_Z:      return "main:p_z";
+        case Q4NX_DESIGN_O:      return "main:p_o";
+        case Q4NX_DESIGN_GU:     return "main:p_gu";
+        case Q4NX_DESIGN_D:      return "main:p_d";
+        default:                 return 0;
+    }
+}
+
 const char* q4nx_design_log_tag(Q4nxDesign role) {
     switch (role) {
         case Q4NX_DESIGN_QKV: return "QKV";

@@ -41,6 +41,21 @@
 #include "quant_i8.h"             // the A-row quantiser: scalar reference + an AVX2 path, byte-identical
 #include <algorithm>
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
+#include "elf_partition.h"   // engine#2689: the column count a full ELF asks the driver for
+
+// engine#2689: a model that SHARES the NPU (two models on 4+4 columns, amdxdna temporal_only=0) must hold exactly one
+// hardware context at one partition width: the driver gives a process's second same-width context the OTHER free half
+// (measured 11-15, arm w44), and refuses a 4-column context next to an 8-column one in one process (arms w48/w84).
+// NPU_PARTITION=<cols> turns that mode on: every ELF must declare <cols> columns, and every ELF after the first is added
+// to the first one's context (hw_context::add_config) instead of opening its own. Unset (the default): unchanged.
+inline int npu_partition_cols() {
+    static const int v = [] {
+        const char* e = std::getenv("NPU_PARTITION");
+        const int c = e ? std::atoi(e) : 0;
+        return (c >= 1 && c <= 8) ? c : 0;
+    }();
+    return v;
+}
 
 
 // One full ELF, one PDI, one hw_context -- and one kernel handle per instance name
@@ -53,7 +68,9 @@
 // artifact (G and U share one pb16i ELF today) also share its context.
 struct ElfHost {
     std::unique_ptr<xrt::elf> elf;
-    std::unique_ptr<xrt::hw_context> hc;
+    // Shared, not owned: in partition mode (engine#2689) every ELF of the model joins ONE hardware context, so several
+    // hosts hold the same one. Outside partition mode each host still has its own, exactly as before.
+    std::shared_ptr<xrt::hw_context> hc;
     std::map<std::string, std::unique_ptr<xrt::ext::kernel>> kernels;
     xrt::ext::kernel* get(const std::string& inst) {
         auto it = kernels.find(inst);
@@ -246,7 +263,31 @@ struct I8Ctx {
                 }
                 fprintf(stderr, "  full ELF ok: uuid=%s\n",
                         h->elf->get_cfg_uuid().to_string().c_str());
-                h->hc = std::make_unique<xrt::hw_context>(d, *h->elf);
+                if (const int want = npu_partition_cols()) {
+                    // engine#2689 partition mode: one width, one context for the whole model.
+                    const uint32_t got = onebit::npu::elf_partition_cols_file(key);
+                    if (got != uint32_t(want)) {
+                        init_error = "NPU_PARTITION=" + std::to_string(want) + ": " + key + " asks for " +
+                                     (got ? std::to_string(got) + " columns" : std::string("no partition note")) +
+                                     "; a model that shares the NPU opens every context at one width";
+                        fprintf(stderr, "  I8Ctx::init_elf: %s\n", init_error.c_str());
+                        return false;
+                    }
+                    static std::shared_ptr<xrt::hw_context> shared;
+                    if (!shared) {
+                        shared = std::make_shared<xrt::hw_context>(d, *h->elf);
+                        fprintf(stderr, "  I8Ctx::init_elf: partition mode, %d columns: %s opens the model's one context\n",
+                                want, key.c_str());
+                    } else {
+                        // Throws when an instance key is already in the context (two `main:seq` per-role ELFs, or a
+                        // prefill ELF named like its decode ELF): caught below and reported as this ELF's failure.
+                        shared->add_config(*h->elf);
+                        fprintf(stderr, "  I8Ctx::init_elf: partition mode: %s joins the model's context\n", key.c_str());
+                    }
+                    h->hc = shared;
+                } else {
+                    h->hc = std::make_shared<xrt::hw_context>(d, *h->elf);
+                }
                 host_ = h;
                 pool.emplace(key, h);
             }

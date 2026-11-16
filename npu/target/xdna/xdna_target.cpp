@@ -148,7 +148,22 @@ bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string&
         // is built from the _pb16i ELF by the caller's twin pass.
         adopt_geometry(i, *g);
         if (role_is_pb16i_split(i)) continue;
-        const std::string elf = w4_rows_ ? w4_elf[(size_t)i] : dir + "/" + g->elf_name;
+        std::string elf = w4_rows_ ? w4_elf[(size_t)i] : dir + "/" + g->elf_name;
+        // engine#2689: NPU_I8_SEALED_PREFILL_ELF names ONE sealed M=128 ELF for a b8 container's prefill roles, each the
+        // instance "main:p_<decode name>" (q4nx_i8_sealed_prefill_instance), so prefill can join the decode context.
+        // In partition mode (NPU_PARTITION) a role it does not cover is refused: its per-role ELF would be a second
+        // `main:seq` and possibly a second width in the model's one context.
+        std::string kname = "main:seq";
+        if (const char* sp = std::getenv("NPU_I8_SEALED_PREFILL_ELF"); sp && *sp && b8 && !w4_rows_ && !host_gemm) {
+            if (const char* inst = q4nx_i8_sealed_prefill_instance(g->role)) {
+                elf = dir + "/" + sp;
+                kname = inst;
+            } else if (npu_partition_cols()) {
+                err = std::string("NPU_PARTITION: the sealed prefill ELF ") + sp + " has no instance for role " +
+                      q4nx_design_log_tag(g->role) + ", and its per-role ELF cannot join the model's one context";
+                return false;
+            }
+        }
         if (host_gemm) {
             // Offline mode: host GEMMs are plain float matmuls over the decoded weights, so no ELF is
             // opened and none is required.  A model whose kernel set is not built yet can still be
@@ -211,7 +226,7 @@ bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string&
         ctx->MD = md; ctx->KD = g->K; ctx->ND = g->N;
         ctx->blocked_b = b8;
         ctx->w4g32 = w4_rows_ > 0;
-        if (!ctx->init_elf(*dev_, elf.c_str(), md, g->K, g->N, 1)) {
+        if (!ctx->init_elf(*dev_, elf.c_str(), md, g->K, g->N, 1, kname.c_str())) {
             // engine#2434: carry the runtime's reason, so a refused context ("code 102 ... No such device") reaches
             // open_with_retry's queue test and the lock-holder note instead of reading as a generic init failure.
             err = "I8Ctx init_elf failed for " + elf + (ctx->init_error.empty() ? "" : ": " + ctx->init_error);

@@ -102,7 +102,7 @@ int main() {
         {
             std::string why;
             std::vector<float> lg;
-            if (batch.prefill(9, {1, 2}, &why)) {
+            if (batch.prefill(9, {1, 2}, nullptr, &why)) {
                 std::printf("FAIL a prefill for an unheld slot was accepted\n");
                 return 1;
             }
@@ -136,7 +136,7 @@ int main() {
         for (int u = 0; u < users; u++) {
             threads.emplace_back([&, u] {
                 std::string why;
-                if (!batch.prefill(slots[(size_t)u], prompts[(size_t)u], &why)) {
+                if (!batch.prefill(slots[(size_t)u], prompts[(size_t)u], nullptr, &why)) {
                     errors[(size_t)u] = "prefill: " + why;
                     return;
                 }
@@ -207,7 +207,7 @@ int main() {
                 std::string why;
                 const int slot = batch.acquire();
                 if (slot < 0) { err2[(size_t)u] = "no slot"; return; }
-                if (!batch.prefill(slot, prompts[(size_t)u], &why)) { err2[(size_t)u] = "prefill: " + why; return; }
+                if (!batch.prefill(slot, prompts[(size_t)u], nullptr, &why)) { err2[(size_t)u] = "prefill: " + why; return; }
                 int token = ref_next[(size_t)u];
                 for (int r = 0; r < kRounds; r++) {
                     std::vector<float> row;
@@ -245,6 +245,57 @@ int main() {
         }
         std::printf("ok: %d staggered requests (prompt arriving mid-decode) stay bit-identical in %ld pass(es)\n", users,
                     batch.rounds());
+    }
+
+    // engine#2738: the refusals a ragged row vector needs, because a wrong answer here is silent. Each row appends its K
+    // at its own position and then reads up to it, so a gap leaves a hole read as zeros and a step back appends over rows
+    // the cache already holds.
+    {
+        Q4nxNpuForward solo;
+        if (!init(solo, d)) return 77;
+        std::string why;
+        std::vector<float> lg;
+        std::vector<int> tok = {5, 6};
+        if (solo.step_users(tok, {5, 7}, {0, 0}, lg)) {
+            std::printf("FAIL a gap between one slot's positions was accepted\n");
+            return 1;
+        }
+        if (std::string(solo.last_error()).find("CONSECUTIVE") == std::string::npos) {
+            std::printf("FAIL the gap refusal does not name the rule: %s\n", solo.last_error());
+            return 1;
+        }
+        if (solo.step_users(tok, {5, 3}, {0, 0}, lg)) {
+            std::printf("FAIL positions that go backwards within one slot were accepted\n");
+            return 1;
+        }
+        // One row per pass (the batcher's own shape) on consecutive positions is fine ...
+        if (!solo.step_users({5}, {0}, {0}, lg) || !solo.step_users({6}, {1}, {0}, lg)) {
+            std::printf("FAIL consecutive rows passed one at a time were refused: %s\n", solo.last_error());
+            return 1;
+        }
+        // ... and a start that is NOT where the slot's sequence ends is refused, because each row reads 0..pos: asking a
+        // slot that holds 2 positions for position 5 used to read past the cache (segfault, measured).
+        if (solo.step_users({7}, {5}, {0}, lg)) {
+            std::printf("FAIL a position past the end of the slot's sequence was accepted\n");
+            return 1;
+        }
+        if (std::string(solo.last_error()).find("holds 2 position(s)") == std::string::npos) {
+            std::printf("FAIL the past-the-end refusal does not say what the slot holds: %s\n", solo.last_error());
+            return 1;
+        }
+        // And the oracle cannot judge a multi-slot pass, so it says so instead of printing a false mismatch.
+        setenv("NPU_BATCH_CHECK", "1", 1);
+        std::vector<float> two_slots;
+        const bool accepted = solo.step_users({5, 6}, {2, 0}, {0, 1}, two_slots);   // slot 0 holds 2, slot 1 starts at 0
+        unsetenv("NPU_BATCH_CHECK");
+        if (accepted) {
+            std::printf("FAIL a multi-slot pass ran with NPU_BATCH_CHECK set (it would print a false mismatch)\n");
+            return 1;
+        }
+        if (std::string(solo.last_error()).find("cannot judge a multi-slot pass") == std::string::npos) {
+            std::printf("FAIL the NPU_BATCH_CHECK refusal does not say why: %s\n", solo.last_error());
+            return 1;
+        }
     }
 
     // A full batch QUEUES a new request rather than failing it: two slots, two holders, a third caller that must wait

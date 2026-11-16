@@ -288,6 +288,7 @@ add_dependencies(onebit npu_decode_note_test)
 # engine#2106: a shipped kernel set's own consistency -- manifest vs bytes, one form or none, name vs directory. The
 # refusal this pre-empts ("differ in size") needed private-repo archaeology to diagnose; the symptom is checkable here.
 add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set_check_test.sh)
+add_test(NAME fold_initializer_transpose COMMAND bash ${CMAKE_SOURCE_DIR}/tests/fold_initializer_transpose_test.sh)
 
 # engine#2186/#2244: `tools/ci/dupdef_check.py`, a check that was only ever run by hand. It is the one
 # that found a shadowed `def self_test()` in tools/hrx_f16_narrowing_check.py -- the surviving copy

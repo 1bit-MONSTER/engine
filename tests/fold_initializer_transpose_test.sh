@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# fold_initializer_transpose_test: the fold must remove the node, rewire the consumer, and refuse a graph that
+# still has one (engine#2366).
+#
+# The case that matters is the whisper head: the lm head is weight-tied to `token_embedding.weight`, so the same
+# 159 MB initializer feeds both an embedding gather (untransposed) and `Transpose -> MatMul`. The fold must add
+# the transposed copy for the matmul and KEEP the original for the gather.
+
+set -uo pipefail
+
+TOOL=${1:-$(dirname "$0")/../tools/fold_initializer_transpose.py}
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/foldtest.XXXXXX") || exit 1
+trap 'rm -rf "$tmp"' EXIT
+fail=0
+check() { if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: want '$3' got '$2'"; fail=$((fail+1)); fi; }
+
+python3 - "$tmp/m.onnx" <<'PY' || { echo "FAIL could not build the fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+
+w = numpy_helper.from_array(np.arange(12, dtype=np.float32).reshape(4, 3), "w")     # 4x3, embedded and transposed
+x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3])
+y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["wt"], perm=[1, 0]),
+     helper.make_node("MatMul", ["x", "wt"], ["y"])],
+    "g", [x], [y], [w])
+# The gather path is what makes the original initializer survive the fold.
+g.output.append(helper.make_tensor_value_info("e", TensorProto.FLOAT, None))
+g.node.append(helper.make_node("Gather", ["w"], ["e"], axis=0))
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY
+
+rc=0; python3 "$TOOL" --check "$tmp/m.onnx" >/dev/null 2>&1 || rc=$?
+check "check refuses a graph with an initializer-fed Transpose" "$rc" 1
+
+python3 "$TOOL" "$tmp/m.onnx" "$tmp/out.onnx" >"$tmp/log" 2>&1 || { cat "$tmp/log"; fail=$((fail+1)); }
+check "fold reports one folded weight" "$(grep -c '^folded ' "$tmp/log")" 1
+
+read -r nodes wt_used w_kept shape <<EOF
+$(python3 - "$tmp/out.onnx" <<'PY'
+import sys
+import onnx
+m = onnx.load(sys.argv[1])
+inits = {i.name: i for i in m.graph.initializer}
+mm = [n for n in m.graph.node if n.op_type == "MatMul"][0]
+print(len(m.graph.node), mm.input[1], "w" in inits,
+      "x".join(str(d) for d in inits.get(mm.input[1]).dims) if mm.input[1] in inits else "-")
+PY
+)
+EOF
+check "the Transpose node is gone" "$nodes" 2      # Transpose + MatMul + Gather -> MatMul + Gather
+check "the matmul reads the transposed initializer" "$wt_used" "w_t"
+check "the gather's untransposed copy is kept" "$w_kept" "True"
+check "the folded weight has the matmul orientation" "$shape" "3x4"
+
+rc=0; python3 "$TOOL" --check "$tmp/out.onnx" >/dev/null 2>&1 || rc=$?
+check "check accepts the folded graph" "$rc" 0
+
+echo "---"
+if [ "$fail" -ne 0 ]; then echo "$fail failed"; exit 1; fi
+echo "fold_initializer_transpose: all checks ok"

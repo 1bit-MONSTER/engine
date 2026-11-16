@@ -192,7 +192,7 @@ def analyse(maps, unmaps, faults, before, after, other=()):
     return rows, hdr
 
 
-def render(maps, unmaps, before, after, faults_rows, header):
+def render(faults_rows, header):
     lines = [header]
     for t, iova, text in faults_rows:
         lines.append(f"  t={t:.3f} iova={iova:#x}: {text}")
@@ -288,6 +288,25 @@ def self_test() -> int:
         # a fault outside the buffered range is named as such, not silently correlated
         rows3, _ = analyse(maps, unmaps, [(9000.0, 0x4128000)], [], [(9000.0, 0x4128000)])
         chk("OUTSIDE the buffered range" in rows3[0][2], "a fault the ring does not cover says so")
+        # 3. the ASSEMBLY: main() is what a lane runs, and until this arm nothing exercised it end to end --
+        #    the exit code and the header shape of a one-sided capture were asserted only piecewise.
+        import contextlib
+        import io
+        one_sided = d / "one_sided.txt"
+        one_sided.write_text(
+            "          <idle>-0       [001] ..s1. 1000.000000: capunm: (iommu_unmap_fast+0x4/0x10) iova=0x4128000 size=0x1000\n"
+            "          <idle>-0       [001] ..s1. 1002.000000: capunm: (iommu_unmap_fast+0x4/0x10) iova=0x5128000 size=0x1000\n")
+        (d / "f.txt").write_text(
+            "[1001.000000] strixhalo kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0xdeadb000 flags=0x0000]\n")
+        (d / "none.txt").write_text("")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_main = main(["--trace", str(one_sided), "--before", str(d / "none.txt"), "--after", str(d / "f.txt")])
+        printed = buf.getvalue()
+        chk(rc_main == 4 and "no map events in this capture" in printed and "not answerable here" in printed,
+            "main() on an unmap-only capture prints the map-side refusal and exits 4 (rc=%d)" % rc_main)
+        chk("NEVER MAPPED OR UNMAPPED" not in printed, "...and main() never prints the absence claim for it")
+
     return 0 if ok else 1
 
 
@@ -315,7 +334,7 @@ def main(argv):
     maps, unmaps, other = parse_events(a.trace)
     rows, header = analyse(maps, unmaps, parse_faults(a.after), parse_faults(a.before), parse_faults(a.after),
                            other)
-    for line in render(maps, unmaps, a.before, a.after, rows, header):
+    for line in render(rows, header):
         print(line)
     return exit_code(maps, unmaps)
 

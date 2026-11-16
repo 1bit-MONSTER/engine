@@ -240,9 +240,18 @@ check_twins() {
         [ -n "$h" ] || continue
         if [ "$h" = "$prev" ]; then
             local base_a=${prevname##*/} base_b=${name##*/}
-            if [ "${base_b%_m16.elf}" = "${base_a%.elf}" ] || [ "${base_a%_m16.elf}" = "${base_b%.elf}" ]; then
+            # Compare the GEOMETRY, not the role or the suffix. Identical content is expected -- and correct --
+            # when two names encode the same design: gate and up are both K5120 x N17408, so one ELF serves both
+            # roles and the stock sets ship it that way (engine#2599 review at 08:51Z). A `_m16` / `_t2s2_m16`
+            # suffix is the same design at a smaller M, which open_prefill reroutes and notes by name. Identical
+            # content under DIFFERENT K or N is the defect: one build copied over another's name, so a 128-row
+            # chunk computes 16 rows.
+            local ga gb
+            ga=$(printf '%s' "$base_a" | grep -oE '_K[0-9]+_N[0-9]+' | head -1)
+            gb=$(printf '%s' "$base_b" | grep -oE '_K[0-9]+_N[0-9]+' | head -1)
+            if [ -n "$ga" ] && [ "$ga" = "$gb" ]; then
                 warn_list="$warn_list
-    $prevname and $name (documented _m16 twin: loader sizes from 16 rows)"
+    $prevname and $name (same geometry: one design under two role/suffix names)"
             else
                 fail_list="$fail_list
     $prevname and $name"
@@ -251,11 +260,11 @@ check_twins() {
         prev=$h; prevname=$name
     done <<< "$dup"
     if [ -n "$warn_list" ]; then
-        printf 'WARN %s: byte-identical ELF twin(s) this build tolerates but does not exploit:%s\n' \
+        printf 'WARN %s: byte-identical ELFs that encode the same geometry (expected: gate and up share one design, and a _m16 twin is the same design at a smaller M):%s\n' \
             "$(basename "$dir")" "$warn_list"
     fi
     if [ -n "$fail_list" ]; then
-        printf 'FAIL %s: ELFs with identical content under names that are NOT a documented _m16 twin:%s\n' \
+        printf 'FAIL %s: ELFs with identical content under names with DIFFERENT geometry (one build copied over another name):%s\n' \
             "$(basename "$dir")" "$fail_list"
         return 1
     fi

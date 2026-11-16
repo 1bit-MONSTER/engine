@@ -246,14 +246,26 @@ check $(has "$tmp/out22" "identical content" && echo ok || echo fail) \
 check $(has "$tmp/out22" "full_i8_O_K768_N768_b8.elf" && has "$tmp/out22" "full_i8_GU_K768_N3072_b8.elf" && echo ok || echo fail) \
       "... and both paths are named"
 
-# engine#2611 tolerates exactly the documented _m16 twin shape at load (16 rows a chunk, correct but slow),
-# so that pair is a WARNING here; refusing it would block a pack the loader runs.
-mkdir -p "$tmp/twin/doc"
-printf 'A' > "$tmp/twin/doc/full_i8_O_K768_N768_b8.elf"
-printf 'A' > "$tmp/twin/doc/full_i8_O_K768_N768_b8_m16.elf"
-"$script" "$tmp/twin/doc" > "$tmp/out23" 2>&1
-check $(has "$tmp/out23" "WARN" && ! has "$tmp/out23" "NOT a documented" && echo ok || echo fail) \
-      "a byte-identical _m16 twin pair is warned about, not refused"
+# engine#2599 review (08:51Z): the real sets ship ONE ELF serving two roles when the geometry matches -- gate
+# and up are both K5120 x N17408 -- and a `_m16` twin is the same design at a smaller M. Both are expected, so
+# both WARN. Identical content under DIFFERENT geometry is the defect and still FAILs.
+mkdir -p "$tmp/twin/real_stock" "$tmp/twin/real_m16" "$tmp/twin/real_cross" "$tmp/twin/real_bad"
+printf 'A' > "$tmp/twin/real_stock/full_i8_G_K5120_N17408.elf"
+printf 'A' > "$tmp/twin/real_stock/full_i8_U_K5120_N17408.elf"
+printf 'A' > "$tmp/twin/real_m16/full_i8_G_K5120_N17408_m16.elf"
+printf 'A' > "$tmp/twin/real_m16/full_i8_U_K5120_N17408_m16.elf"
+printf 'A' > "$tmp/twin/real_cross/full_i8_G_K5120_N17408_m16.elf"
+printf 'A' > "$tmp/twin/real_cross/full_i8_U_K5120_N17408.elf"
+printf 'A' > "$tmp/twin/real_bad/full_i8_G_K5120_N17408.elf"
+printf 'A' > "$tmp/twin/real_bad/full_i8_U_K5120_N5120.elf"
+for d in real_stock real_m16 real_cross; do
+    "$script" "$tmp/twin/$d" > "$tmp/out-$d" 2>&1
+    check $(has "$tmp/out-$d" "WARN" && ! has "$tmp/out-$d" "DIFFERENT geometry" && echo ok || echo fail) \
+          "a real-set shape ($d) is warned about, not refused"
+done
+"$script" "$tmp/twin/real_bad" > "$tmp/out-real_bad" 2>&1
+check $(has "$tmp/out-real_bad" "DIFFERENT geometry" && echo ok || echo fail) \
+      "identical content under different geometry is refused"
 
 if [ "$fails" -ne 0 ]; then
     printf 'kernel_set_check: %d failure(s)\n' "$fails"

@@ -52,14 +52,67 @@ permissions:
   contents: read
 
 jobs:
+  # engine#2757: a pin bump is the change that moves the whole HRX backend under every row on the box, and a lane that bumps
+  # by hand matched neither trigger below -- #2739 and #2748 both merged 11-16 with `hw_gate` skipped, so the weaker check went
+  # unnoticed because a skipped workflow looks like "not applicable". A `paths:` filter on the trigger cannot be the fix on its
+  # own: the job's own `if:` would still refuse (a lane branch has neither the label nor the `bump-hrx/` prefix), and a filter
+  # there would also silently retire the label as a way to gate a PR that touches no pin.
+  #
+  # So the decision moves to a cheap hosted job that can see the diff, and the device job accepts its answer. Cost on an ordinary
+  # PR: one ubuntu runner, a `git diff --name-only`, no checkout of the submodules, no ticket.
+  pin_moved:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      moved: ${{ steps.diff.outputs.moved }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: diff
+        name: Does this PR move a pin?
+        run: |
+          set -uo pipefail
+          # FAIL CLOSED. If this job cannot tell whether a pin moved, it must not answer "no" -- a preflight that dies
+          # (a fetch failure, a base ref this checkout does not have) would otherwise leave the device job SKIPPED on a
+          # pin PR, i.e. the same silent hole this change exists to close, wearing a green tick. So any failure here
+          # says moved=1 with a warning and lets the gate run: the expensive direction is the safe one.
+          fail_closed() { echo "::warning::pin_moved could not compare, treating this PR as pin-moving so the gate runs"; echo "moved=1" >> "$GITHUB_OUTPUT"; exit 0; }
+          base="origin/${{ github.base_ref }}"
+          # NOT --depth=1: a shallow base has no merge base with HEAD, and `A...B` then refuses the very comparison this job is.
+          git fetch --no-tags origin "${{ github.base_ref }}" || fail_closed
+          # `third_party/gpu-kernels` is NOT a submodule: the kernel pin is a file (sha= in config/gpu-kernels.config), so a gk
+          # bump touches that config and never a gitlink (#2753, #2586). A re-recorded golden changes what the gate compares
+          # against (#2502), so it belongs here too.
+          # NOT `changed=$(… || fail_closed)`: a command substitution exits only its own subshell and CAPTURES its stdout,
+          # so the ::warning:: would be swallowed (GitHub reads annotations from the step's stdout) and the captured
+          # warning text would then read as "changed", writing moved=1 a second time -- right answer, invisible reason.
+          if ! changed=$(git diff --name-only "$base...HEAD" -- \
+                  third_party/llama.cpp third_party/hrx-system config/gpu-kernels.config tests/golden/hw-gate); then
+            fail_closed
+          fi
+          if [ -n "$changed" ]; then
+            echo "moved=1" >> "$GITHUB_OUTPUT"
+            echo "this PR moves a pin: the gate runs"
+          else
+            echo "moved=0" >> "$GITHUB_OUTPUT"
+            echo "no pin moved: the gate stays out unless it is labelled or dispatched"
+          fi
+
   hw_gate:
     runs-on: [self-hosted, strixhalo, pr-agent]
+    needs: [pin_moved]
+    # `needs.pin_moved.outputs.moved` is empty when `pin_moved` did not run (a `workflow_dispatch`), which is why the dispatch
+    # case is checked first and the label/branch routes are kept: the gate can still be asked for on a PR that moves no pin.
     if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-       (github.event.action != 'labeled' || github.event.label.name == 'hw-gate') &&
-       (contains(github.event.pull_request.labels.*.name, 'hw-gate') ||
-        startsWith(github.event.pull_request.head.ref, 'bump-hrx/')))
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        (github.event.action != 'labeled' || github.event.label.name == 'hw-gate') &&
+        (contains(github.event.pull_request.labels.*.name, 'hw-gate') ||
+         startsWith(github.event.pull_request.head.ref, 'bump-hrx/') ||
+         needs.pin_moved.outputs.moved == '1')))
     permissions:
       contents: read
       statuses: write   # by-hand runs post the hw-gate status on the commit they checked

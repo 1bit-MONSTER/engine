@@ -173,6 +173,35 @@ Two things to be careful about, both learned the hard way here:
 * **pick the right symbol.** `iommu_unmap` had zero hits in 5 s on a box doing heavy I/O; `iommu_unmap_fast` had 40,510.
   Probe a known-hot function (`ksys_write`) once to prove the plumbing, then argue about symbols.
 
+## Resolution: the fault stream is a residue of a teardown that does not drain
+
+The investigation ends in `npu/` code, not in the IOMMU, and the evidence for that is the one thing no IOMMU-side hypothesis
+could explain: **the faults outlive the process that caused them** (43 faults after the last holder of `/dev/accel/accel0` had
+exited, on addresses never mapped and never unmapped for the 45 minutes they were watched).
+
+```cpp
+// npu/generate.cpp: the decode loop overlaps host work with the run in flight
+if (more) lane.prepare(next, ctx + 1);   // can throw
+lane.wait(cur);
+
+// npu/lane.cpp: …and end() destroys without draining, on a documented assumption
+// "Destroy the hw_context while it is warm (every run completed)"
+void end() { slots[0].rl.reset(); slots[0].runs.clear(); … ctx.reset(); }
+```
+
+`prepare()` → `layer_kernel()` throws when `ctx + 1 > kMaxContext` — *before* `wait(cur)`. The catch-all in `generate()` then
+calls `end()`, which frees the runlists, the kernels and the hw_context **while the current runlist may still be executing**.
+Every BO under that context is released while the controller is still writing it, and the device keeps DMA-ing into IOVAs whose
+mappings were just torn down.
+
+Trigger: **a generation that rolls past `kMaxContext`.** Prediction for the confirming run: the stream appears after the throw
+and not after a clean run. Fix, cheapest first: drain in `end()`; or guard `ctx + 1 > kMaxContext` *before* launching; reordering
+`wait` before `prepare` is correct but costs the overlap that is deliberate.
+
+The lesson this page earned, in one line: **a stream that continues after its only holder has exited is not a concurrency
+problem — it is something the holder left behind**, and no amount of watching the device's mappings during the fault will find
+it, because the mapping was torn down before the observation began.
+
 ## Validating a capture before you believe it
 
 Four failures in one afternoon on this row, and every one was method rather than kernel. The pattern that catches all

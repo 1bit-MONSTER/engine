@@ -4449,6 +4449,64 @@ void test_fconst_block_headers() {
                   g.post_attn_hdr() == 340,
               "block headers: and is set as a 4-header block whose post-attention header is the last one, not k_norm's");
     }
+    // engine#2604: the gemma3 1.8 6-header block, two sizes. A synthetic Token .fconst: 4 layers, kv_heads 2, so the
+    // sliding-window field is 2 x 8 = 16 B; layer 2 is the global one (no field). Headers are the strict 64-byte form.
+    {
+        const unsigned short eps = 0x3586;
+        const int64_t glob[6] = {0, 1000, 1200, 2000, 2200, 3000}, gsize = 3200, field = 16;
+        const bool local[4] = {true, true, false, true};
+        const auto file_of = [&](int drop, int64_t extra_on_l1) {
+            std::vector<int64_t> pos;
+            int64_t at = 0;
+            for (int L = 0; L < 4; ++L) {
+                const int64_t sh = (local[L] ? field : 0) + (L == 1 ? extra_on_l1 : 0);
+                for (int j = 0; j < 6; ++j) pos.push_back(at + glob[j] + (j >= 3 ? sh : 0));
+                at += gsize + sh;
+            }
+            pos.push_back(at);   // the tail's header (final norm)
+            std::string b(size_t(at + 4096), '\0');
+            for (size_t i = 0; i < pos.size(); ++i) {
+                if (int(i) == drop) continue;
+                b[size_t(pos[i])] = char(eps & 0xFF);
+                b[size_t(pos[i]) + 1] = char(eps >> 8);
+            }
+            return b;
+        };
+        const std::string path = (fs::temp_directory_path() / ("six_hdr." + std::to_string(::getpid()))).string();
+        put_file(path, file_of(-1, 0));
+        pi::FconstGeom g;
+        g.hdr = {1000, 1200, 2016, 2216, 3016};   // what the eps vote records from block 0 (a local layer)
+        g.stride = gsize + field;
+        const std::string why = pi::fconst_six_header_blocks(path, eps, 4, 2, g);
+        check(why.empty() && g.six_headers() && g.stride == gsize && g.hdr == std::vector<int64_t>{1000, 1200, 2000, 2200, 3000} &&
+                  g.post_attn_hdr() == 2000,
+              "six-header blocks: the global form -- stride 3,200, post_attention at h3, not the last header (" + why + ")");
+        check(g.base_of(0) == 0 && g.base_of(1) == 3216 && g.base_of(2) == 6432 && g.base_of(3) == 9632 &&
+                  g.base_of(4) == 12848,
+              "six-header blocks: every layer's start from its own header, and the tail's after the last layer");
+        check(g.shift_of(0) == field && g.shift_of(1) == field && g.shift_of(2) == 0 && g.shift_of(3) == field,
+              "six-header blocks: the sliding-window layers shift by the 16-byte field, the global one by 0");
+        pi::FconstGeom g2;
+        put_file(path, file_of(9, 0));
+        check(pi::fconst_six_header_blocks(path, eps, 4, 2, g2).find("epsilon headers") != std::string::npos,
+              "six-header blocks: a missing header refuses by count, it does not shift the blocks after it");
+        pi::FconstGeom g3;
+        put_file(path, file_of(-1, 8));
+        check(pi::fconst_six_header_blocks(path, eps, 4, 2, g3).find("sizes") != std::string::npos,
+              "six-header blocks: a third block size refuses by name");
+        fs::remove(path);
+    }
+    {   // engine#2604: the gemma head pre-scale, to the forward's convention (embedding pre-scaled by sqrt(hidden))
+        pi::Q4 q;
+        q.scale = {1.0f, 2.0f};
+        q.zero = {-1.0f, 0.5f};
+        pi::Q4 r = q;
+        check(pi::gemma_prescale_head(q, "gemma3_text", 2560) && std::fabs(q.scale[1] - 2.0f * std::sqrt(2560.0f)) < 1e-3f &&
+                  std::fabs(q.zero[0] + std::sqrt(2560.0f)) < 1e-3f,
+              "gemma head: scale and zero multiplied by sqrt(hidden)");
+        check(!pi::gemma_prescale_head(r, "qwen2", 2560) && r.scale[1] == 2.0f && r.zero[0] == -1.0f,
+              "gemma head: any other model type is untouched");
+    }
     // engine#1985: the cut has to come from the observed distribution, not from a constant or from a fraction of the window.
     // 16 blocks of a uniform 4-header pack: the three real offsets appear 16 times each, a coincidence appears 3 times.
     // The constant keeps the coincidence -- four offsets, which `fconst_set_block_headers` refuses -- and the observed floor

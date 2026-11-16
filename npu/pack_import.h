@@ -667,6 +667,7 @@ struct Report {
     bool selfcheck_scaled = false;
     double lmhead_corr = 0, lmhead_rel = 0, ctrl_corr_nibble = 0, ctrl_corr_nozp = 0;
     HeadFit head_fit;   // engine#1503: scale, rms ratio and the 4-bit noise floor beside lmhead_rel
+    bool head_prescaled = false;   // engine#2604: a gemma head scaled by sqrt(hidden) to the forward's convention
     std::string model_type;   // the pack's, so the CLI can refuse a known-bad architecture by name
     // The tail (.fconst) path has no MatMulNBits bytes to mis-decode, so its control is an ALIGNMENT one: the same
     // tiles, the same decoder, rows matched against the neighbouring embedding row. A correct decode correlates ~1
@@ -957,9 +958,29 @@ struct FconstGeom {
     // post_attention_layernorm weight and the first byte of the MLP section are read from here, so this is
     // the one rule the two readers share -- reading `h1` unconditionally imported the k_norm section's
     // padding as post_attention_layernorm on every Qwen3 pack (engine#1003).
-    int64_t post_attn_hdr() const { return hdr.empty() ? h1 : hdr.back(); }
+    int64_t post_attn_hdr() const { return hdr.size() == 5 ? hdr[2] : hdr.empty() ? h1 : hdr.back(); }
+    // engine#2604: the gemma3 1.8 block has SIX headers -- input_layernorm, k_norm, q_norm, post_attention_layernorm,
+    // pre_feedforward_layernorm, post_feedforward_layernorm -- and two sizes: a sliding-window layer carries a 4*kv_heads*8
+    // byte field (each 8 B record bf16 0xFF7F then zeros; not a weight) between q_norm's gain and o_proj, a global layer
+    // does not. So a 6-header geometry is stored in its GLOBAL form (`hdr`, `stride` = the shorter block) and every layer
+    // has its own start (`base_of`, from a full-file header scan) and its own shift (`shift_of`: 0, or the field's size),
+    // applied to every offset from o_proj on. Empty `bases` (every other layout) means `L x stride` and shift 0.
+    std::vector<int64_t> bases;   // layers + 1 entries when set: each block's start, then the tail's
+    std::vector<int64_t> shifts;  // layers entries when set
+    int64_t base_of(int L) const { return bases.empty() ? int64_t(L) * stride : bases[size_t(L)]; }
+    int64_t shift_of(int L) const { return shifts.empty() ? 0 : shifts[size_t(L)]; }
+    bool six_headers() const { return hdr.size() == 5; }
     std::string why;      // non-empty when the geometry could not be established
 };
+// engine#2604: a gemma head's scale and zero multiplied by sqrt(hidden), to the forward's pre-scaled-embedding
+// convention; false (and q untouched) for any other model type.
+bool gemma_prescale_head(Q4& q, const std::string& model_type, int64_t hidden);
+// engine#2604: fill `g.bases` / `g.shifts` for a 6-header (gemma3 1.8) geometry from EVERY epsilon header in `path`, and
+// rewrite `g.hdr` / `g.stride` to the global (shorter) form. Empty on success; otherwise why the blocks do not fit (the
+// header count is not 6 x layers + 1, a block's k/q-norm offsets differ from the first's, or the blocks come in more than
+// two sizes, or the size difference is not 4 x kv_heads x 8).
+std::string fconst_six_header_blocks(const std::string& path, unsigned short eps_bits, int layers, int kv_heads,
+                                     FconstGeom& g);
 unsigned short bf16_bits_of(float v);
 
 // engine#1650: config.json may declare an OPTIONAL field as JSON null (AMD's 1.9

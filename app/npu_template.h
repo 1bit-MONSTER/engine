@@ -48,6 +48,8 @@
 // something different from a build that has the renderer.
 #pragma once
 
+#include <cstring>
+#include "npu_stop_tokens.h"
 #include "template_pin.h"  // container_chat_template_text, the same read the pin and the load line use
 
 #include <nlohmann/json.hpp>
@@ -229,6 +231,50 @@ inline std::string render_chat_template(const ChatTemplate& tmpl, const nlohmann
         throw TemplateError(std::string("the container's chat template did not render: ") + e.what() + ident);
     }
 #endif
+}
+
+// engine#2604: the marker a template closes an assistant turn with, found by rendering a two-message exchange and
+// reading what follows the assistant's text (turn_end_marker). The user turn is tried in three shapes, first that
+// renders wins: a plain string, OpenAI-style list content, and translategemma's list content with language codes --
+// its template raises on the other two ("User role must provide `content` as an iterable with exactly one item..."),
+// so with only the plain probe the serve never learned <end_of_turn> and every answer ran on as
+// "Le chat dort sur la table.<end_of_turn><end_of_turn>..." to the token budget (AMD's pack names only eos 1).
+struct TurnEndProbe {
+    std::string marker;   // "" when no shape rendered, or the text after the turn is not a <...> token
+    std::string form;     // which user-content shape rendered: "plain", "list" or "translation"
+    std::string why;      // the first shape's error, when none rendered
+};
+inline TurnEndProbe turn_end_from_template(const ChatTemplate& tmpl, const std::string& bos_token,
+                                           const std::string& eos_token) {
+    static const char* const kProbe = "\xC2\xA4turn-end-probe\xC2\xA4";
+    const std::pair<const char*, nlohmann::ordered_json> shapes[] = {
+        {"plain", "u"},
+        {"list", nlohmann::ordered_json::parse(R"([{"type":"text","text":"u"}])")},
+        {"translation",
+         nlohmann::ordered_json::parse(R"([{"type":"text","source_lang_code":"en","target_lang_code":"fr","text":"u"}])")},
+    };
+    TurnEndProbe r;
+    for (const auto& [name, user] : shapes) {
+        try {
+            nlohmann::ordered_json exchange = nlohmann::ordered_json::array();
+            exchange.push_back({{"role", "user"}, {"content", user}});
+            exchange.push_back({{"role", "assistant"}, {"content", kProbe}});
+            const std::string rendered = render_chat_template(tmpl, exchange, /*add_generation_prompt=*/false,
+                                                              nlohmann::ordered_json::object(), bos_token, eos_token);
+            const size_t at = rendered.find(kProbe);
+            if (at == std::string::npos) {
+                if (r.why.empty()) r.why = std::string("the ") + name + " probe rendered without the assistant's text";
+                continue;
+            }
+            r.marker = turn_end_marker(rendered.substr(at + std::strlen(kProbe)));
+            r.form = name;
+            r.why.clear();
+            return r;
+        } catch (const std::exception& ex) {
+            if (r.why.empty()) r.why = ex.what();
+        }
+    }
+    return r;
 }
 
 }  // namespace onebit::npu

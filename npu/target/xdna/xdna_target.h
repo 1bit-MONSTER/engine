@@ -50,6 +50,10 @@ struct PackedWeight {
     // pb16i: the sidecar's host side table.  Empty eref = an int8 pack.
     std::vector<int16_t>     eref;
     int                      pb16i_mode = 0;
+    // NPU_W4_PREFILL: the same weight as the w4g32 image (the prefill contexts) beside the int8 one (the decode twins).
+    // Both come from the one Bmat a fill sees, so weight_cached() stays true for both families at once.
+    std::unique_ptr<xrt::bo> bo4;
+    std::vector<float>       scales4;
 };
 
 // Per-role dispatch accounting for NPU_PROFILE=1.
@@ -153,6 +157,13 @@ public:
     // the message a user sees is the same one the forward produced before this moved (an empty string
     // means no plan, i.e. a purely derived set).
     bool open_prefill(const Q4nxDesignGeom* designs, int n, std::string& err);
+    int  w4_rows() const { return w4_rows_; }   // 0 unless every prefill role runs the w4g32 tier
+    // A weight-cache fill for the int8 families: the int8 image for the role's int8 context (kctx itself, or its decode
+    // twin when kctx is the w4g32 one) and, with the w4g32 tier on, the w4g32 image for its prefill context.
+    bool fill_int8_and_w4(PackedWeight& pw, I8Ctx& kctx, int role, const float* Bmat, int K, int N, std::string& err);
+    // The image and column scales `kctx` launches on, from a filled slot (nullptr when the slot has none for it).
+    static xrt::bo* slot_bo(PackedWeight& pw, const I8Ctx& kctx);
+    static const std::vector<float>* slot_scales(const PackedWeight& pw, const I8Ctx& kctx);
 
     // The lm-head context (engine#803 A2b, the last setup block): pb16i ternary images first, then the int8
     // ladder, then the q4_1 gemv head -- the body moved verbatim out of Q4nxNpuForward::open_lm_head_context.
@@ -249,6 +260,7 @@ private:
     std::unique_ptr<I8Ctx> ctx16_[Q4NX_MAX_DESIGNS];
     std::unique_ptr<I8Ctx> ctxw_[Q4NX_MAX_DESIGNS];   // the wide pb16i/t2s family (engine#1990)
     int wide_rows_ = 0;                               // 0 = no wide family
+    int w4_rows_ = 0;                                 // NPU_W4_PREFILL: the w4g32 prefill tier's M (0 = off)
     bool prefill_is_decode_design_ = false;           // engine#2599: the prefill ELFs are the _m16 artifacts
     std::unique_ptr<I8Ctx> ctxn_[Q4NX_MAX_DESIGNS];   // the narrow pb16i/t2s family (decode)
     int narrow_rows_ = 0;                             // 0 = no narrow family

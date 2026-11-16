@@ -69,17 +69,22 @@ def faults(text):
     return out
 
 
-def samples(path):
-    """[(epoch, pid, ticket)] from the sampler log; a '-' pid is its 'nothing holds it' row."""
+def rows_from_text(text):
+    """[(epoch, pid, ticket)] from sampler-log text; a '-' pid is its 'nothing holds it' row."""
     rows = []
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) < 6 or not parts[0].strip().isdigit():
-                continue
-            rows.append((int(parts[0]), parts[1].strip(), parts[5].strip()))
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 6 or not parts[0].strip().isdigit():
+            continue
+        rows.append((int(parts[0]), parts[1].strip(), parts[5].strip()))
     rows.sort()
     return rows
+
+
+def samples(path):
+    """[(epoch, pid, ticket)] from the sampler log; a '-' pid is its 'nothing holds it' row."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return rows_from_text(f.read())
 
 
 def attribute(rows, boots, max_gap):
@@ -125,6 +130,86 @@ def yield_line(res):
             % (n, k["ATTRIBUTED"], k["HANDOVER-ADJACENT"], k["NOTHING HELD"], k["NO SAMPLE"]))
 
 
+def outlook(rows, windows):
+    """How many faults a given window COULD attribute, from the holder timeline alone.
+
+    Measured on a 1816-sample hour of this box: +-5 s names two holders for 33 % of samples and
+    widening makes it worse, because 18 tickets held the node in that hour. Printing that before a
+    capture starts is the difference between "run it for a day and hope" and knowing the sampler's
+    window cannot answer the question.
+    """
+    out = []
+    for w in windows:
+        one = amb = nothing = none = 0
+        for epoch, _pid, _ticket in rows:
+            near = [(e, p) for e, p, _t in rows if abs(e - epoch) <= w]
+            holders = {p for _e, p in near if p != "-"}
+            if not near:
+                none += 1
+            elif not holders:
+                nothing += 1
+            elif len(holders) == 1:
+                one += 1
+            else:
+                amb += 1
+        n = len(rows) or 1
+        out.append((w, 100.0 * one / n, 100.0 * amb / n, 100.0 * nothing / n, 100.0 * none / n))
+    return out
+
+
+def attributed_rows(text):
+    """[(epoch, hits)] from the sampler's attributed.log: `<epoch>\t<hits|->\t<raw fault line>`.
+
+    The sampler writes this per fault (accel_sampler.sh: `printf '%s\t%s\t%s\n' "$ts" "$hits" "$line"`),
+    where `hits` is its windowed holder list. So both readers have the same evidence and differ only in
+    which field they trust -- which makes the disagreement set computable.
+    """
+    out = []
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2 or not parts[0].strip().isdigit():
+            continue
+        out.append((int(parts[0]), parts[1].strip()))
+    return out
+
+
+def disagreements(rows, pairs, max_gap):
+    """[(epoch, window_hits, timestamp_verdict, agree)] for each fault in attributed.log."""
+    out = []
+    for epoch, hits in pairs:
+        res = attribute(rows, [(epoch, "-")], max_gap)[0][2]
+        # agreement is not string equality: the window names holders, this names one and says how sure.
+        # A window with two holders and a HANDOVER-ADJACENT verdict AGREE about the situation.
+        win_n = 0 if hits in ("", "-") else len([h for h in hits.replace(",", " ").split() if h])
+        one = res.startswith("ATTRIBUTED")
+        if one and win_n in (0, 1):
+            agree = True
+        elif res.startswith("HANDOVER-ADJACENT") and win_n >= 2:
+            agree = True        # both saw a change; this one names which side is the guess
+        elif res.startswith(("NOTHING HELD", "NO SAMPLE")) and win_n == 0:
+            agree = True
+        else:
+            agree = False
+        out.append((epoch, hits or "-", res, agree))
+    return out
+
+
+def fmt_attr(epoch, hits, verdict, agree):
+    """One --attributed line. A function so the self-test can execute it: a format error here would pass
+    every analysis assertion and crash on the first real log (engine#2602)."""
+    return "%d\twindow=%s\t%s\t%s" % (epoch, hits, "agree" if agree else "DISAGREE", verdict)
+
+
+def fmt_outlook_row(w, one, amb, nothing, none):
+    """One --outlook row, for the same reason."""
+    return "%5.0fs  %9.1f%%  %8.1f%%  %11.1f%%  %8.1f%%" % (w, one, amb, nothing, none)
+
+
+def fmt_fault(sec, addr, verdict):
+    """One per-fault line, for the same reason."""
+    return "%s\t%s\t%s" % ("-" if sec is None else "%.0f" % sec, addr, verdict)
+
+
 def self_test():
     # One hour of holders, one sample per 100 s, handing over at 300.
     rows = [(0, "111", "gpu-hold cl-a pid 1 t0"), (100, "111", "gpu-hold cl-a pid 1 t0"),
@@ -166,10 +251,58 @@ def self_test():
     assert no_stamp == [(None, "0x4128000")], no_stamp
     assert attribute(rows, no_stamp, 150)[0][2].startswith("NO SAMPLE"), attribute(rows, no_stamp, 150)
 
+    # The outlook is computed, not asserted from a constant: a window wide enough to cover two
+    # different holders must report ambiguity, and one narrower than the gap must not.
+    ol = {w: (one, amb) for w, one, amb, _n, _z in outlook(rows, [5, 400])}
+    assert ol[5][0] == 80.0 and ol[5][1] == 0.0, ol   # 4 of 5: the 200s sample IS the "-" row, so it is nothing-held
+    assert ol[400][1] > 0.0, ol                               # 400s spans the handover -> ambiguous
+
+    # THE WRITER/READER CONTRACT. These are the sampler's own fixture lines, copied verbatim from
+    # tools/diag/accel_sampler.sh: if that writer changes its columns, this reader must fail here
+    # rather than silently parse zeros out of a shifted line.
+    contract = ("1000\t111\t1\t/serve A\t/scope/a\tticket1\n"
+                "1010\t222\t2\t/serve B\t/scope/b\tticket2\n")
+    assert rows_from_text(contract) == [(1000, "111", "ticket1"), (1010, "222", "ticket2")], \
+        rows_from_text(contract)
+    assert rows_from_text("1000\t-\t-\t-\t-\t-\n") == [(1000, "-", "-")], "the '-' row shape"
+    # And a line with fewer columns is skipped rather than mis-parsed into a holder.
+    assert rows_from_text("1000\t111\tonly-three\n") == [], "a short row must not become a holder"
+
+    # The disagreement set: the sampler's windowed `hits` beside this tool's per-fault verdict. The
+    # fixture lines are that file's real shape (`<epoch>\t<hits|->\t<raw line>`).
+    attr_text = """105\t111\t[ 105.000000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT address=0x1]
+150\t111 222\t[ 150.000000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT address=0x2]
+250\t-\t[ 250.000000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT address=0x3]
+"""
+    pairs = attributed_rows(attr_text)
+    assert pairs == [(105, "111"), (150, "111 222"), (250, "-")], pairs
+    ds = disagreements(rows, pairs, max_gap=150)
+    # 105 DISAGREES, and that is the useful case: the window names one holder, but the sample AFTER the
+    # fault is the '-' row, so the join says the node changed hands to nobody -- the window omitted a
+    # handover it could not see. 150: window names two, join says HANDOVER-ADJACENT -> agree (same fact,
+    # stated more precisely). 250: window says nobody, join says NOTHING HELD -> agree.
+    assert [d[3] for d in ds] == [False, True, True], ds
+    assert "next sample: nothing held the node" in ds[0][2], ds[0]
+    # And a window that names ONE holder while the join sees a handover is a real disagreement, which is
+    # the case worth printing rather than hiding.
+    one_vs_hand = disagreements(rows, [(150, "111")], max_gap=150)
+    assert one_vs_hand[0][3] is False, one_vs_hand
+
     # Stamps and addresses are parsed, and non-fault lines are ignored.
     text = ("[1234.500000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0007]\n"
             "[1235.000000] unrelated kernel line\n")
     assert faults(text) == [(1234.5, "0x4128000")], faults(text)
+    # EVERY OUTPUT LINE IS EXERCISED. engine#2602 shipped a renderer that crashed on the first real log
+    # because its self-test only asserted the analysis; a tool that cannot print is not a tool that works.
+    assert fmt_attr(105, "111", "ATTRIBUTED: pid 111 x", True).endswith("\tATTRIBUTED: pid 111 x")
+    assert "DISAGREE" in fmt_attr(105, "111", "v", False)
+    # Field ORDER and content, not column widths: a width literal is a brittle assertion that fails on a
+    # cosmetic change and says nothing about a format-string crash, which is the failure worth catching.
+    row = fmt_outlook_row(5, 62.1, 23.1, 14.9, 0.0).split()
+    assert row == ["5s", "62.1%", "23.1%", "14.9%", "0.0%"], row
+    assert fmt_fault(None, "0x1", "v") == "-\t0x1\tv", fmt_fault(None, "0x1", "v")
+    assert fmt_fault(105.4, "0x1", "v") == "105\t0x1\tv", fmt_fault(105.4, "0x1", "v")
+
     print("self-test ok")
 
 
@@ -181,6 +314,10 @@ def main():
                     help="epoch of boot, so kernel stamps become absolute (default: /proc/stat btime)")
     ap.add_argument("--max-gap", type=float, default=15.0,
                     help="oldest usable sample before a fault, in seconds (default 15)")
+    ap.add_argument("--attributed", default=None,
+                    help="sampler attributed.log: print its windowed hits beside this tool's verdict")
+    ap.add_argument("--outlook", type=float, nargs="*", metavar="W",
+                    help="print attributability for these +-W windows and exit (no faults needed)")
     ap.add_argument("--selftest", "--self-test", dest="self_test", action="store_true")
     args = ap.parse_args()
 
@@ -189,6 +326,22 @@ def main():
         return 0
     if not args.samples:
         ap.error("--samples is required unless --self-test")
+    if args.attributed:
+        rows = samples(args.samples)
+        pairs = attributed_rows(open(args.attributed, encoding="utf-8", errors="replace").read())
+        ds = disagreements(rows, pairs, args.max_gap)
+        for epoch, hits, verdict, agree in ds:
+            print(fmt_attr(epoch, hits, verdict, agree))
+        n = len(ds) or 1
+        print("faults: %d; agree %d, disagree %d" % (len(ds), sum(1 for d in ds if d[3]),
+                                                      sum(1 for d in ds if not d[3])))
+        return 0
+    if args.outlook:
+        rows = samples(args.samples)
+        print("window  one-holder  ambiguous  nothing-held  no-sample")
+        for w, one, amb, nothing, none in outlook(rows, args.outlook):
+            print(fmt_outlook_row(w, one, amb, nothing, none))
+        return 0
 
     boot = args.boot_epoch
     if boot is None:
@@ -201,7 +354,7 @@ def main():
     res = attribute(rows, boots, args.max_gap)
     for sec, addr, verdict in res:
         when = "-" if sec is None else "%.0f" % sec
-        print("%s\t%s\t%s" % (when, addr, verdict))
+        print(fmt_fault(sec, addr, verdict))
     print(yield_line(res))
     return 0
 

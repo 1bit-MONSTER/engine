@@ -386,6 +386,20 @@ What the goldens record at the release pin:
 - On `varied-1620w`, the cached path answers differently from a fresh request at a near-tie: top-2 margin 0.19, a WARN.
 - ZAYA1-8B and Qwen3.8-27B answer every case.
 
+The `qwen3.8-27b` row was re-recorded on 2026-11-16, off the release pin by orchestrator decision (UNSLOTH-UD31).
+The reason is that the box moved to the file `models/pins.json` has named since 2026-11-12: unsloth's UD3.1
+`Qwen3.8-27B-UD-Q4_K_XL.gguf`, sha256 `2a5f3565…`, 17,659,407,264 B. The row was previously recorded on the
+pre-UD3.1 file, `3f227079…`, 17,559,178,144 B.
+
+It was recorded at llama.cpp 148e7f329 / hrx-system 7f423692, with the private kernels at gpu-kernels aa5f0e90b. A
+check run straight after it gives:
+
+- kat 9/9 with 0 warnings, and every answer's text identical to the old file's goldens (only the logprobs moved);
+- KLD mean 0.000001, p99 0.00004, same top 100 %.
+
+The A/B measured the new file against the old base: mean KLD 0.0064, p99 0.065, same top 96.2 %, all inside the
+limits. That is the size of the re-quantization, not a kernel change.
+
 The MoE and IQ rows (`qwen3-coder-30b-a3b`, `qwen3-4b-iq4xs`) were recorded on 2026-10-20 at
 llama.cpp 00f2a68d / hrx-system 82804197 (`manifest.json` `recorded_at`; a submodule whose pin could not be read is
 recorded as `null` and named on stderr, never as the string "unknown"). Both answer every kat case.

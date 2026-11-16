@@ -58,24 +58,45 @@ def parse_fault(line, device_prefix="amdxdna"):
 def summarize(events):
     """The burst as one record. Absences are reported, never filled in.
 
-    `stride` is the common step when the addresses form one ascending run, and
-    None otherwise -- a stride invented from two addresses 40 KiB apart would
-    describe a burst that did not happen. `devices` and `flags` are sets for the
-    same reason: a burst on two devices or with two flag words is not one kind of
-    event, and collapsing either hides the distinction the whole tool is for.
+    Address ORDER in the log is not address order on the device: the 12:35 burst
+    today reports 0x63000, 0x68000, 0x64000, 0x69000, ... -- the hardware reports
+    the walking accesses out of sequence. So "is this one ascending run" is the
+    wrong question, and an earlier version of this function answered it anyway and
+    called a real single walk "not a walk".
+
+    What is order-independent, and therefore what this reports:
+
+      * `pages` -- the distinct 4 KiB pages touched;
+      * `repeats` -- accesses beyond one per PAGE (the 12:35 burst is 10 accesses
+        over 7 pages: three pages fault at offset 0 and again at 0x400, so a count
+        of duplicate addresses would report 0 repeats and describe the wrong thing);
+      * `span` -- max minus min address, i.e. the range the submitter walked;
+      * `one_40k_window` -- the whole burst inside one 40 KiB window, which is the
+        shape a single command descriptor block produces.
+
+    `devices` and `flags` stay sets: a burst on two devices or with two flag words
+    is not one kind of event, and collapsing either hides the distinction the tool
+    exists for. `stride` survives only for the all-distinct, evenly spaced case and
+    is None otherwise -- a stride invented from two far-apart addresses would
+    describe a burst that did not happen.
     """
     if not events:
         return {"count": 0, "devices": [], "flags": [], "span": 0, "stride": None,
-                "uniform": False}
+                "pages": 0, "repeats": 0, "one_40k_window": False}
     addrs = [e["address"] for e in events]
-    steps = {b - a for a, b in zip(addrs, addrs[1:])}
+    pages = sorted({a & ~0xFFF for a in addrs})
+    steps = {b - a for a, b in zip(pages, pages[1:])}
+    span = max(addrs) - min(addrs)
     return {
         "count": len(events),
         "devices": sorted({e["device"] for e in events}),
         "flags": sorted({e["flags"] for e in events}),
-        "span": max(addrs) - min(addrs),
-        "stride": steps.pop() if len(steps) == 1 else None,
-        "uniform": addrs == sorted(addrs) and len(set(addrs)) == len(addrs),
+        "span": span,
+        "pages": len(pages),
+        "repeats": len(addrs) - len(pages),
+        "one_40k_window": span < 40 * 1024,
+        "stride": (steps.pop() if len(steps) == 1 and len(addrs) == len(set(addrs))
+                   else None),
     }
 
 
@@ -133,13 +154,17 @@ def describe(pid, proc_root):
 
 def render(summary, snaps):
     """The block a reader gets. Every field that could not be read says so."""
-    stride = ("0x%x" % summary["stride"]) if summary["stride"] is not None else "not uniform"
-    out = ["burst: %d fault(s) on %s, flags %s, span 0x%x, stride %s"
+    stride = ("0x%x across pages" % summary["stride"]) if summary["stride"] is not None \
+        else "no single page stride"
+    out = ["burst: %d access(es) on %s, flags %s, %d page(s), span 0x%x, %s"
            % (summary["count"], ",".join(summary["devices"]) or "none",
               ",".join("0x%04x" % f for f in summary["flags"]) or "none",
-              summary["span"], stride)]
-    if not summary["uniform"]:
-        out.append("  addresses are not one ascending run: the burst is not a single walk")
+              summary["pages"], summary["span"], stride)]
+    if summary["repeats"]:
+        out.append("  %d access(es) repeat a page already faulted in this burst"
+                   % summary["repeats"])
+    if summary["one_40k_window"]:
+        out.append("  the whole burst is inside one 40 KiB window: one descriptor block's walk")
     if len(summary["devices"]) > 1:
         out.append("  MORE THAN ONE DEVICE in this burst: not one client's walk")
     if not snaps:
@@ -169,8 +194,9 @@ def self_test():
     pages = [dict(device="0000:c6:00.1", address=0x7fa381800000 + 0x1000 * i,
                   flags=0x0077) for i in range(10)]
     s = summarize(pages)
-    chk(s["count"] == 10 and s["stride"] == 0x1000 and s["uniform"],
-        "ten consecutive pages summarise as one 0x1000 walk")
+    chk(s["count"] == 10 and s["stride"] == 0x1000 and s["pages"] == 10,
+        "ten consecutive pages summarise as one 0x1000 walk over ten pages")
+    chk(s["one_40k_window"], "ten pages starting at 0x…000 is inside one 40 KiB window")
     chk(s["span"] == 9 * 0x1000, "span is nine strides, not ten")
     chk(summarize(pages[:1])["stride"] is None,
         "a single fault has NO stride (it must not invent one)")
@@ -180,10 +206,23 @@ def self_test():
         "two devices stay two devices in the summary")
     chk(len(summarize(mixed_dev)["flags"]) == 2,
         "two flag words stay two flag words in the summary")
-    chk(summarize(list(reversed(pages)))["uniform"] is False,
-        "a descending burst is not reported as a walk")
-    chk(summarize(pages + [pages[3]])["uniform"] is False,
-        "a repeated address is not reported as a walk")
+    chk(summarize(list(reversed(pages)))["stride"] == 0x1000,
+        "REVERSED log order is still one 0x1000 walk: the device reports out of sequence")
+    chk(summarize(list(reversed(pages)))["count"] == 10,
+        "reversing the log does not change what the burst contains")
+    # the 12:35 burst measured today: 10 accesses, 7 distinct pages, three pages
+    # faulting twice (offset 0 and offset 0x400), reported out of address order
+    mixed = [dict(device="0000:c6:00.1", address=base, flags=0x0007) for base in
+             (0x7f291bd63000, 0x7f291bd68000, 0x7f291bd64000, 0x7f291bd69000,
+              0x7f291bd65000, 0x7f291bd66000, 0x7f291bd67000, 0x7f291bd63400,
+              0x7f291bd64400, 0x7f291bd65400)]
+    m = summarize(mixed)
+    chk(m["count"] == 10 and m["pages"] == 7,
+        "the 12:35 shape is 10 accesses over 7 pages")
+    chk(m["repeats"] == 3, "three of those accesses repeat a page already faulted")
+    chk(m["one_40k_window"], "and the whole 12:35 burst is inside one 40 KiB window")
+    chk(summarize(pages + [pages[3]])["repeats"] == 1,
+        "a repeated address is counted as a repeat, not hidden")
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:

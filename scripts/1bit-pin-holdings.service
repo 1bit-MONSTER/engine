@@ -19,21 +19,24 @@
 # alert; the report is ~/.1bit/logs/pin-holdings-latest.md either way. Hashes are cached by
 # path/size/mtime/inode, so a day where nothing changed reads no model file.
 #
-#     install -m644 scripts/1bit-pin-holdings.{service,timer} ~/.config/systemd/user/
+#     install -m644 scripts/1bit-pin-holdings.{service,timer} ~/.config/systemd/user/   # then set ONEBIT_ENGINE (below)
 #     systemctl --user daemon-reload
 #     systemctl --user enable --now 1bit-pin-holdings.timer
 #
-# %h/1bit-MONSTER must match your checkout (repo root), as in 1bit-census-watch.service.
+# ONEBIT_ENGINE must name a checkout of the ENGINE repository (1bit-MONSTER/engine) that follows main; set it at
+# install. On strixhalo ~/1bit-MONSTER is a different repository (no tools/pin_holdings.py), so it is not the default.
+# A missing checkout exits 2 with a line saying so: "cannot run" must not look like exit 1, "a pin differs".
+# The run goes through ~/lb/thermal-run.sh (the box rule for CPU-heavy jobs): the first run hashes ~70 GB on one core.
 
 [Unit]
 Description=1bit pin holdings: the box's model files match their pins
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/1bit-MONSTER
+Environment=ONEBIT_ENGINE=%h/wt/engine-main
 Nice=19
 IOSchedulingClass=idle
 ExecStartPre=/usr/bin/mkdir -p %h/.1bit/logs
-ExecStart=/usr/bin/python3 -I %h/1bit-MONSTER/tools/pin_holdings.py --out %h/.1bit/logs/pin-holdings-latest.md
+ExecStart=/bin/sh -c 'e="$ONEBIT_ENGINE"; for f in tools/pin_holdings.py models/pins.json models/holdings.json; do [ -f "$e/$f" ] || { echo "pin-holdings: $e/$f is missing: ONEBIT_ENGINE must be an engine checkout that follows main"; exit 2; }; done; cd "$e" && exec %h/lb/thermal-run.sh /usr/bin/python3 -I tools/pin_holdings.py --out %h/.1bit/logs/pin-holdings-latest.md'
 StandardOutput=journal
 StandardError=journal

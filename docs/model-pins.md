@@ -156,14 +156,18 @@ green. That happened: `unsloth/Qwen3.8-27B-GGUF` was pinned at the UD3.1 `Qwen3.
   network (`--rehost-only`, which CI can run), and the box run reports it too. The fix is a re-upload, and
   publishing is the owner's.
 
-| exit | meaning |
-|---|---|
-| 0 | every holding and every re-host matches its pin |
-| 1 | a holding differs from its pin or is missing, or a re-host holds a different file than its upstream pin |
-| 2 | usage, or a holding names a pin or file `models/pins.json` does not have (a wrong map is never clean) |
+Its exit codes are its own, not `pin_watch.py`'s (whose table is above):
 
-On the box it runs daily from `scripts/1bit-pin-holdings.{service,timer}` (05:00 UTC); exit 1 marks the unit
-failed and the report is `~/.1bit/logs/pin-holdings-latest.md`.
+- **0** every holding and every re-host matches its pin;
+- **1** a holding differs from its pin or is missing, or a re-host holds a different file than its upstream pin;
+- **2** it could not run: usage, an unreadable `pins.json`/`holdings.json`, no engine checkout where the unit
+  looks, or a holding naming a pin or file `models/pins.json` does not have (a wrong map is never clean).
+
+On the box it runs daily from `scripts/1bit-pin-holdings.{service,timer}` (05:00 UTC) under `~/lb/thermal-run.sh`,
+from the engine checkout named by `ONEBIT_ENGINE` in the unit (default `%h/wt/engine-main`; set it at install to a
+checkout of this repository that follows `main`, which `~/1bit-MONSTER` on strixhalo is not). A missing checkout
+exits 2 with a line saying so, so "cannot run" never reads as "a pin differs". Exit 1 marks the unit failed and the
+report is `~/.1bit/logs/pin-holdings-latest.md`.
 
 ```bash
 tools/pin_holdings.py                       # both halves; report on stdout

@@ -210,6 +210,31 @@ int main(int argc, char** argv) {
         check(none.device == 0 && none.host == 98 && none.host_why["test: declined"] == 74,
               "a declining device runs all 98 products on the host and names the 74 refusals");
         check(rn.data == r.data, "a declining device is bit-identical to the host run");
+
+        // engine#2366: ONEBIT_AUDIO_FORCE_HOST makes an ACCEPTING device decline everything, so the device's M=1
+        // GEMM (the 1x128x51865 LM head, ~415 MB/s) can be measured against the host on the same graph. The refusal
+        // is counted and named, so it shows in `host: N x <reason>` like any other -- a forced path that reports
+        // nothing would be indistinguishable from a device that took the work.
+        setenv("ONEBIT_AUDIO_FORCE_HOST", "1", 1);
+        // The copy inherits dev's counters from the run above (74 device, 48 attention reasons); a fresh arm has to
+        // start from zero or it reports the previous run's work as its own.
+        AudioGemm accepted = dev;
+        accepted.device = 0;
+        accepted.host = 0;
+        accepted.host_why.clear();
+        AudioRunResult rf;
+        std::string fy;
+        if (!run_audio_graph(g, mel.data(), bins, frames, "", &rf, &fy, &accepted)) {
+            std::printf("FAIL run with ONEBIT_AUDIO_FORCE_HOST: %s\n", fy.c_str());
+            unsetenv("ONEBIT_AUDIO_FORCE_HOST");
+            return 1;
+        }
+        unsetenv("ONEBIT_AUDIO_FORCE_HOST");
+        check(accepted.device == 0 && accepted.host == 98,
+              "ONEBIT_AUDIO_FORCE_HOST stops an accepting device from running anything");
+        check(accepted.host_why["forced host (ONEBIT_AUDIO_FORCE_HOST)"] == 74,
+              "  ... and the forced refusals are counted and named, not silent");
+        check(rf.data == r.data, "  ... and the forced-host run is bit-identical to the host run");
         if (g_failures != 0) {
             std::printf("audio exec: %d failures\n", g_failures);
             return 1;

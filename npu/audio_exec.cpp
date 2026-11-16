@@ -367,9 +367,20 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
 
         // engine#1783: offer one product to the device. True when the device ran it into `c`; false when the host must, with
         // the reason counted. A device without a `gemm` is no device.
+        // engine#2366: the LM head is a 1x128x51865 GEMV issued through the device GEMM, measured at ~415 MB/s
+        // (26.6 MB of weights per token, 512 B of activation). Whether the device beats the host at M=1 is an open
+        // question no switch could ask, so this forces the host path and names itself in `host_why`, which
+        // whisper_transcribe already prints as `host: N x <reason>`.
+        const char* fh = std::getenv("ONEBIT_AUDIO_FORCE_HOST");
+        const bool force_host = fh != nullptr && fh[0] != '\0' && fh[0] != '0';
         auto offer = [&](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
                          std::vector<float>* c) -> bool {
             if (dev == nullptr) return false;
+            if (force_host) {
+                ++dev->host;
+                ++dev->host_why["forced host (ONEBIT_AUDIO_FORCE_HOST)"];
+                return false;
+            }
             std::string reason;
             if (dev->gemm && dev->gemm(key, A, M, K, B, N, c, &reason)) {
                 if (c->size() != size_t(M) * size_t(N))

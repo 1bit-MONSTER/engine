@@ -231,6 +231,21 @@ check $([ $? -eq 0 ] && echo ok || echo fail) "layer directories with a suffix: 
 check $(has "$tmp/out20" "3 layer-indexed" && ! has "$tmp/out20" "other" && echo ok || echo fail) \
       "... all three counted as layer-indexed, none as other"
 
+# engine#2599: two ELFs with identical content under different names must fail, and a clean set must not.
+mkdir -p "$tmp/twin/good" "$tmp/twin/dup"
+printf 'A' > "$tmp/twin/good/full_i8_O_K768_N768_b8.elf"
+printf 'B' > "$tmp/twin/good/full_i8_O_K768_N768_b8_m16.elf"
+printf 'A' > "$tmp/twin/dup/full_i8_O_K768_N768_b8.elf"
+printf 'A' > "$tmp/twin/dup/full_i8_O_K768_N768_b8_m16.elf"
+"$script" "$tmp/twin/good" > "$tmp/out21" 2>&1
+check $([ $? -ne 0 ] || ! has "$tmp/out21" "identical content" && echo ok || echo fail) \
+      "distinct ELFs are not reported as twins"
+"$script" "$tmp/twin/dup" > "$tmp/out22" 2>&1
+check $(has "$tmp/out22" "identical content" && echo ok || echo fail) \
+      "two ELFs with the same content are refused"
+check $(has "$tmp/out22" "full_i8_O_K768_N768_b8.elf" && has "$tmp/out22" "_m16.elf" && echo ok || echo fail) \
+      "... and both paths are named"
+
 if [ "$fails" -ne 0 ]; then
     printf 'kernel_set_check: %d failure(s)\n' "$fails"
     exit 1

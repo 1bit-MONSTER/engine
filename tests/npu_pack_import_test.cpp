@@ -5692,6 +5692,28 @@ void test_external_tile_padded() {
     const pi::Q4 b = pi::decode_external_tile_padded(reinterpret_cast<const uint8_t*>(small.data()), small.size(), 64, 128, 0, 0, e6);
     check(e5 == e6 && a.codes == b.codes && a.scale == b.scale && a.zero == b.zero,
           "padded external tile: a node with no real_* decodes exactly as before");
+    // #2690 review, the negative case: a node that DECLARES itself unpadded (real_* == logical) also decodes exactly as before
+    std::string e7;
+    const pi::Q4 c = pi::decode_external_tile_padded(reinterpret_cast<const uint8_t*>(small.data()), small.size(), 64, 128, 64, 128, e7);
+    check(e7 == e5 && a.codes == c.codes && a.scale == c.scale && a.zero == c.zero,
+          "padded external tile: real_* equal to the logical shape decodes exactly as before");
+    // #2690 review: N padded alone (real_K absent), stored 128 x 128 for the logical 64 x 128 -- the gate/up shape on one axis
+    {
+        const int pt1 = 2 * (1 + 1);
+        std::string nb(size_t(2) * pt1 * 2176, '\0');
+        nb.replace(0, size_t(pt1) * 2176, blob.substr(0, size_t(pt1) * 2176));   // tile 0 = the planted rows 0..63, K block 0
+        std::string e8;
+        const pi::Q4 qn = pi::decode_external_tile_padded(reinterpret_cast<const uint8_t*>(nb.data()), nb.size(), 64, 128, 128, 0, e8);
+        bool okn = e8.empty() && qn.N == 64 && qn.K == 128;
+        for (int row = 0; okn && row < 64; ++row)
+            for (int col = 0; okn && col < 128; ++col) okn = qn.codes[size_t(row) * 128 + col] == code_of(row, col);
+        check(okn, "padded external tile: N padded alone (stored 128 x 128, real_K not stated) is recovered (" + e8 + ")");
+    }
+    // #2690 review: a blob that fits neither shape names both in the refusal
+    std::string e9;
+    (void)pi::decode_external_tile_padded(d, blob.size() - 2176, N, K, RN, RK, e9);
+    check(e9.find("real_N x real_K = 128 x 256") != std::string::npos && e9.find("logical 64 x 128") != std::string::npos,
+          "padded external tile: a size mismatch names the stored and the logical shape (" + e9 + ")");
 }
 
 

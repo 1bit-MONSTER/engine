@@ -1872,7 +1872,9 @@ the seven blobs equals stored N/64 tiles x (2 x stored K/128 + 2) x 2,176 B, to 
 
 The padding is at the end. In `gate_proj`, tiles 0..159 carry data and tiles 160..223 are all zero bytes (read from the
 published file). The reader decodes at the stored shape and crops to the logical one, and refuses the weight by name
-when any padded row or K block has a non-zero scale.
+when any padded row or K block has a non-zero scale. The declaration is per tensor: each node's `real_K`/`real_N` applies to its own blob
+only, so a pack that mixes padded and unpadded tensors reads each at its own stored shape. A node that states no
+`real_*`, or states its logical shape, decodes exactly as before.
 
 With `config.json` empty, the model's numbers come from the pack itself:
 - **rms_norm_eps** from the graph's RMSNorm nodes (18 nodes state 1e-5). The default was 1e-6. When the nodes state different epsilons nothing is taken, and the import prints a WARNING naming the conflict and the value it keeps (`graph_eps_decision()`).

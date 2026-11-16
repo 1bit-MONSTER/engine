@@ -2863,7 +2863,12 @@ Q4 decode_external_tile_padded(const uint8_t* data, size_t bytes, int N, int K, 
         return Q4{};
     }
     const Q4 full = decode_external_tile(data, bytes, int(RN), int(RK), err);
-    if (!err.empty()) return Q4{};
+    if (!err.empty()) {
+        // #2690 review: name both shapes, so a size mismatch reads as a diagnosis -- which shape was expected and why
+        err += "; the node states it is stored at real_N x real_K = " + std::to_string(RN) + " x " + std::to_string(RK) +
+               " for the logical " + std::to_string(N) + " x " + std::to_string(K) + " (engine#2686)";
+        return Q4{};
+    }
     const int64_t gF = RK / 32, gL = K / 32;
     for (int64_t row = 0; row < RN; ++row)
         for (int64_t g = (row < N ? gL : 0); g < gF; ++g)

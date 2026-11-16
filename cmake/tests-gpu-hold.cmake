@@ -79,6 +79,12 @@ add_test(NAME gpu_hold_hold_dir COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_
 # label, and this asserts the child sees both, on a sandboxed HOME.
 add_test(NAME gpu_hold_child_identity COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_child_identity_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 
+# engine#2494 (guard-drift class): the guards in scripts/gpu-hold protect the box only once they are INSTALLED, and what
+# runs is ~/.local/bin/gpu-hold -- a copy nothing re-installs on merge. Measured twice: "identical to engine main" after
+# #2486 (11-15 05:52Z), then 16 h later the pre-#2538 copy with no take-time refusal at all (11-16 03:2xZ). The take line
+# now names the copy by its sha256, so the log answers "which copy ran?" in one field. Two claims, no device.
+add_test(NAME gpu_hold_script_id COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_script_id_test.sh)
+
 # docs/ci-runners.md's exit-code table is a contract (review of engine#2539): every "<script> exits/sets it" in a row
 # must be backed by `exit <rc>` or `rc=<rc>` in that script, and every row must name an emitter.
 add_test(NAME exit_code_table COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tests/exit_code_table_test.py ${CMAKE_SOURCE_DIR})

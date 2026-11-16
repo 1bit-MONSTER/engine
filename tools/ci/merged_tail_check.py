@@ -52,6 +52,12 @@ SIGNIFICANT = 8
 LOST_FRACTION = 0.5
 
 
+# The denominator. A scan that finds nothing and a scan that read nothing print the same
+# "0 findings" without it -- the absent-denominator failure this fleet fixed four times tonight
+# (#2624, #2627, #2645, #2656).
+examined = [0]
+
+
 def git(repo, *args, check=False):
     p = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
     if check and p.returncode != 0:
@@ -225,6 +231,7 @@ def scan(repo, days, limit, base_url=None, prs=None):
                   "not a pass", file=sys.stderr)
             return None
 
+    examined[0] = len(prs)
     for pr in prs:
         owner = (pr.get("headRepositoryOwner") or {}).get("login")
         name = (pr.get("headRepository") or {}).get("name")
@@ -286,6 +293,8 @@ def report(repo, days, limit, base_url):
         if commit:
             head = f"{head} {commit[0]} {commit[1][:56]}"
         print(f"{kind:12s} {head}\n{'':12s} {detail}")
+    print(f"merged_tail_check: examined {examined[0]} PR(s) merged in the last {days} day(s); "
+          f"{examined[0] - counts['GONE']} with a live branch, {counts['GONE']} branch gone")
     print(f"merged_tail_check: {len(rows)} finding(s) over PRs merged in the last {days} day(s) "
           f"-- {counts['LOST']} LOST, {counts['PARTIAL']} partly edited by main, "
           f"{counts['IN-BASE']} already on the base, "

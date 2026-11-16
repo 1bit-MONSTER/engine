@@ -20,6 +20,7 @@
 //
 // docs/npu-p4-target-split.md records what moved in A1 and what A2 (plan-driven setup) still owes.
 #include "target/xdna/xdna_target.h"
+#include "target/xdna/elf_twin.h"   // engine#2599: a prefill ELF that is its own _m16 twin
 #include "target/xdna/launch_fit.h"   // engine#1783: refuse a launch its context cannot hold
 #include "batch_width.h"
 #include "file_create.h"   // dumps are created 0600, never through a symlink
@@ -83,28 +84,6 @@ static const char* role_tag(Q4nxDesign r) {
 // The forward's own probe, kept identical (exists and non-empty): an ELF that is present but zero bytes
 // is the failure this catches, and a target that decided differently from its caller would be a second
 // definition of "the kernel is there".
-// engine#2599: is the prefill ELF the very same artifact as its M=16 decode twin?  bonsai2-27b-NPU ships
-// kernels/full_i8_<ROLE>_K*_N*.elf byte-identical (md5) to the matching _m16.elf, i.e. its "prefill" set IS the
-// 16-row design.  Nothing in the artifact says how many rows it computes (its declared widths are per-tile, and a
-// narrower declared width than the buffer is legal), so a context sized from the design geometry (M=128) chunked the
-// prompt at 128 rows and the kernel computed the first 16 of each: 112 rows of every chunk came back as 0.  Equal size
-// and equal bytes is the evidence; anything else (a real M=128 build, or no twin in the directory) changes nothing.
-static bool same_artifact(const std::string& a, const std::string& b) {
-    std::ifstream fa(a, std::ios::binary | std::ios::ate), fb(b, std::ios::binary | std::ios::ate);
-    if (!fa || !fb) return false;
-    const std::streamoff na = fa.tellg(), nb = fb.tellg();
-    if (na <= 0 || na != nb) return false;
-    fa.seekg(0); fb.seekg(0);
-    std::vector<char> ba(1 << 16), bb(1 << 16);
-    for (std::streamoff left = na; left > 0;) {
-        const std::streamsize n = (std::streamsize)std::min<std::streamoff>(left, (std::streamoff)ba.size());
-        if (!fa.read(ba.data(), n) || !fb.read(bb.data(), n)) return false;
-        if (std::memcmp(ba.data(), bb.data(), (size_t)n) != 0) return false;
-        left -= n;
-    }
-    return true;
-}
-
 static bool elf_present(const std::string& p) {
     FILE* f = std::fopen(p.c_str(), "rb");
     if (!f) return false;
@@ -187,10 +166,8 @@ bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string&
         }
         int md = g->M;
         {
-            std::string twin(g->elf_name);
-            if (twin.size() > 4 && twin.compare(twin.size() - 4, 4, ".elf") == 0) twin.resize(twin.size() - 4);
-            twin = dir + "/" + twin + "_m16.elf";
-            if (md > Q4NX_DESIGN_M_DECODE && same_artifact(elf, twin)) {
+            const std::string twin = onebit::npu::m16_twin_path(dir, g->elf_name);
+            if (md > Q4NX_DESIGN_M_DECODE && onebit::npu::same_artifact(elf, twin)) {
                 md = Q4NX_DESIGN_M_DECODE;
                 prefill_is_decode_design_ = true;
                 std::fprintf(stderr, "  [forward] %-3s %s is byte-identical to its _m16 twin: it is the %d-row design, so "

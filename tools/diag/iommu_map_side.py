@@ -56,6 +56,7 @@ import os
 import collections
 import re
 import sys
+import time
 
 # Anchored on the timestamp, NOT on the task name: a task name can contain a space ("next-server (v1-8386"), and
 # anchoring on `^\s+\S+\s+\[` silently dropped 2,176 of 115,941 map lines on a real capture -- 1.9 %, which is
@@ -531,6 +532,19 @@ def self_test() -> int:
     chk("no map event carried a paddr" in _b3.getvalue() and "later mapping exists" in _b3.getvalue(),
         "...and a fault BEFORE any mapping says so instead of falling forward")
     chk("unavailable" in page_class(0, flags="/nonexistent/kpageflags"), "an unreadable kpageflags says so, not 'none'")
+    # engine#2478: the class is read NOW, so the report must date itself. Without this, an 8-hour-old capture gets
+    # a confident class for whatever owns the frame at analysis time -- a reading with no date.
+    _b0 = _io.StringIO()
+    with _cl.redirect_stdout(_b0):
+        report_page_classes(str(pf), [(1000.5, 0xe3ff5000)])
+    chk("read from /proc/kpageflags NOW" in _b0.getvalue() and "this capture is " in _b0.getvalue(),
+        "the page-class report says the class is read now, and how old the capture is")
+    _oldcap = pathlib.Path(tempfile.mkdtemp()) / "old.txt"
+    _oldcap.write_text(pf.read_text())
+    os.utime(_oldcap, (time.time() - 7200, time.time() - 7200))
+    chk(_fmt_age(capture_age(str(_oldcap))) == "2.0 h old", "a capture written 2 h ago is dated in hours")
+    chk(capture_age("/nonexistent/capture.txt") is None and _fmt_age(None) == "of unknown age",
+        "an unstat'able capture says 'unknown age' instead of inventing one")
     # engine#2765 (1): a page class must not be attributed ACROSS an unmap. The issue's own trace: map, release,
     # then fault 1.5 s later -- the page was gone when the fault happened, so a class there is worse than none.
     pu = pathlib.Path(tempfile.mkdtemp()) / "map-unmap.txt"
@@ -656,6 +670,31 @@ def unmaps_of(trace):
     return out
 
 
+def capture_age(path):
+    """Seconds since the capture file was last written, or None when it cannot be stat'ed.
+
+    `page_class` reads /proc/kpageflags AT ANALYSIS TIME, so on an old capture the class names the frame's CURRENT
+    owner, not the owner at fault time -- the same "a reading with no date" trap as engine#2643's unverified refusal,
+    and engine#2478 measured a page freed and reused inside a 20-minute window. A class is only as good as the gap
+    between the fault and the read, so the report has to say what that gap was.
+    """
+    try:
+        age = time.time() - os.stat(path).st_mtime
+    except (OSError, TypeError, ValueError):
+        return None
+    return age if age >= 0 else None
+
+
+def _fmt_age(sec):
+    if sec is None:
+        return "of unknown age"
+    if sec < 90:
+        return f"{sec:.0f} s old"
+    if sec < 5400:
+        return f"{sec / 60:.1f} min old"
+    return f"{sec / 3600:.1f} h old"
+
+
 def report_page_classes(trace, faults):
     """One line per fault: the paddr of the last mapping of its IOVA at or BEFORE the fault, and that page's class.
 
@@ -665,6 +704,8 @@ def report_page_classes(trace, faults):
     """
     pm = paddrs(trace)
     um = unmaps_of(trace)
+    print(f"  note: page classes are read from /proc/kpageflags NOW; this capture is "
+          f"{_fmt_age(capture_age(trace))}, so a class names the frame's current owner, not its owner at fault time")
     for t, iova in faults:
         cands = [(mt, pa) for mt, pa in pm.get(iova, ()) if mt <= t]
         if not cands:

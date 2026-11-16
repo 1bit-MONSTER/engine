@@ -294,6 +294,7 @@ add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set
 # passed and the shadowed one's arms could never fail. It takes no build input, so a ctest row is the
 # route that needs no ci.yml line (the workflow is not editable from a lane).
 # engine#2246 also added a row for that file's --self-test; `add_python_test(hrx_f16_narrowing ...)`
+
 # at line 418 has run exactly that since #2204, so the row was a duplicate and is gone -- one script
 # gets one row.
 add_test(NAME dupdef_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --check
@@ -502,6 +503,11 @@ add_python_test(conflict_triage_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_triag
 # engine#2643: provenance() tells apart four cases a reader cannot re-check by eye -- same commit, absent
 # object, ancestor at N commits, shallow clone -- and shipped with no arm. Hermetic: throwaway repos, no network.
 add_python_test(hw_gate_manifest_self ${CMAKE_SOURCE_DIR}/tools/hw_gate_manifest.py selftest)
+# engine#2478 review: a tool whose self-test nothing runs is a tool with no arms. The other rows live in
+# cmake/tests-unreferenced-selftest-rows.cmake (engine#2456 made the same point for four of them); the checker
+# below is what stops the next one from going quiet, across all three reference sources.
+add_python_test(tool_selftest_wired ${CMAKE_SOURCE_DIR}/tools/ci/tool_selftest_wired_check.py)
+add_python_test(tool_selftest_wired_self ${CMAKE_SOURCE_DIR}/tools/ci/tool_selftest_wired_check.py --self-test)
 add_python_test(notice_covers_deps_self ${CMAKE_SOURCE_DIR}/tools/ci/notice_covers_deps.py --self-test)
 # `--root` is explicit: add_python_test() sets no WORKING_DIRECTORY, so ctest runs this row in the BUILD
 # directory and a `--root .` default would look for CMakeLists.txt where there is none (review of #2344 --
@@ -625,6 +631,13 @@ add_test(NAME bench_arm_watch COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # 32,032-row head at kpad 4,096). It is header-only (`npu/forward/include/pad_head_rows.h`) precisely so it can live HERE:
 # an earlier version linked `onebit_npu_forward`, which exists only under `if(ONEBIT_NPU)`, so CI -- which configures
 # without the NPU runtime -- never built or ran the arm. `add_dependencies(onebit ...)` keeps it in the build CI runs.
+# engine#2689: a model that shares the NPU opens every context at one partition width and keeps decode and prefill in
+# one hardware context. Host-only: the ELF partition-note reader (elf_partition.h) on crafted ELFs, and the sealed
+# prefill instance table (no key may equal a decode key, since one context refuses a duplicate).
+add_executable(npu_partition_test tests/npu_partition_test.cpp npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
+target_include_directories(npu_partition_test PRIVATE npu/forward/include)
+add_dependencies(onebit npu_partition_test)
+add_test(NAME npu_partition COMMAND npu_partition_test)
 add_executable(npu_pad_head_rows_test tests/npu_pad_head_rows_test.cpp)
 target_include_directories(npu_pad_head_rows_test PRIVATE npu/forward/include)
 add_dependencies(onebit npu_pad_head_rows_test)
@@ -1330,6 +1343,15 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME registry_gaps_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_gaps_test.py)
     # a pin bump that did not regenerate the registry (only the gitlinks: no checkouts)
     add_test(NAME registry_pins COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-pins)
+    # the CONTENT axis, which registry_pins above cannot see: it compares one sha and never reads the fork, so a
+    # hand-edited architecture list or backend -- including `gguf_architectures.hrx`, which CMakeLists.txt compiles
+    # into hrx_archs.h and `serve` refuses architectures against -- passed every PR job (engine#2698). The content
+    # comes from a submodule, so this skips (77) where the fork is not checked out, like hrx_f16_narrowing_check.
+    add_test(NAME registry_content COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check)
+    set_tests_properties(registry_content PROPERTIES SKIP_RETURN_CODE 77)
+    # the row's own mutant: a fake fork and a fake gitlink in a scratch repo, so the content edit that made every
+    # other row green is proved to make this one red, and the no-checkout case is proved to be 77 and not 0.
+    add_test(NAME registry_content_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_content_test.py)
     # engine#1745 review: pin() reads the INDEX (a staged bump) and refuses an UNMERGED index instead of returning the
     # merge base. Hermetic: a scratch git repo and a copy of the tool, git only, ~0.1 s.
     add_test(NAME registry_pin_index COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_pin_index_test.py)
@@ -1982,6 +2004,16 @@ target_include_directories(npu_rope_llama3_test PRIVATE npu/forward/include)
 target_link_libraries(npu_rope_llama3_test PRIVATE m)
 add_test(NAME npu_rope_llama3 COMMAND npu_rope_llama3_test)
 add_dependencies(npu_sampling_test npu_rope_llama3_test)
+# engine#2673: RoPE pair order -- chatglm3's GQO states rotary_interleaved = 1 (pairs (2i, 2i+1)); header + semantics only.
+add_executable(npu_rope_interleave_test tests/npu_rope_interleave_test.c npu/forward/src/q4nx_semantics.c)
+target_include_directories(npu_rope_interleave_test PRIVATE npu/forward/include)
+target_link_libraries(npu_rope_interleave_test PRIVATE m)
+add_test(NAME npu_rope_interleave COMMAND npu_rope_interleave_test)
+# engine#2673: ci.yml builds `onebit`, not this binary, so without this line ctest registers the row and reports
+# `Not Run` (and ci_targets flags it: "add_test names 'npu_rope_interleave_test', and ci.yml never builds
+# npu_rope_interleave"). Same route as npu_pad_head_rows_test and bf16_matrix_test above: a dependency of a target
+# ci.yml already builds, which needs no `.github/workflows/` edit.
+add_dependencies(onebit npu_rope_interleave_test)
 # The activation rotation a folded container needs (npu/forward/include/hadamard.h): its SIMD path must be
 # bit-identical to the shipped scalar loop on every shape a container carries, and the scalar loop must still
 # be the Hadamard transform.  Header only, no device, no model: runs in CI.

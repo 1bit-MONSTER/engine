@@ -49,8 +49,11 @@ unverifiable -- **a scan that could not look is not a scan that found nothing.**
 
 import argparse
 import json
+import os
 import pathlib
 import re
+import shutil
+import tempfile
 import subprocess
 import sys
 
@@ -123,7 +126,7 @@ def same_head(frozen, tip):
     return tip.lower().startswith(frozen.lower()[:7]) or frozen.lower().startswith(tip.lower()[:7])
 
 
-def branch_mode(repo, branch, base_ref):
+def branch_mode(repo, branch, base_ref, merged_head=None):
     """List the commits on `branch` that are not on `base_ref` -- the recovery workflow.
 
     A PR-list scan answers "is anything lost?"; this answers "what of MY branch never landed?",
@@ -131,7 +134,7 @@ def branch_mode(repo, branch, base_ref):
     """
     if git(repo, "rev-parse", "--verify", "-q", branch).returncode != 0:
         return None
-    tail = merge_commits(repo, branch, base_ref)
+    tail = merge_commits(repo, branch, base_ref, merged_head)
     if tail is None:
         return None
     for sha, subject in tail:
@@ -141,9 +144,18 @@ def branch_mode(repo, branch, base_ref):
     return tail
 
 
-def merge_commits(repo, ref, base_ref):
-    """Commits reachable from `ref` and not from `base_ref` -- the branch's tail."""
-    r = git(repo, "rev-list", "--format=%h %s", f"{base_ref}..{ref}")
+def merge_commits(repo, ref, base_ref, merged_head=None):
+    """Commits reachable from `ref` and not from `base_ref` -- the branch's tail.
+
+    `merged_head` (folded in from engine#2683) subtracts the PR's own history rather than replacing the
+    base with it: `base..ref ^merged_head`. Subtracting is the tighter of the two, because a branch
+    rebased onto a newer base after its PR merged carries the base's commits, which `merged_head..ref`
+    would re-examine. For a non-squash merge the frozen head IS an ancestor of the base, so the
+    exclusion removes nothing and every existing LOST keeps its meaning -- a detector fix may only
+    remove false positives.
+    """
+    specs = [f"{base_ref}..{ref}"] + ([f"^{merged_head}"] if merged_head else [])
+    r = git(repo, "rev-list", "--format=%h %s", *specs)
     if r.returncode != 0:
         return None
     lines = [ln for ln in r.stdout.splitlines() if ln and not ln.startswith("commit ")]
@@ -151,7 +163,19 @@ def merge_commits(repo, ref, base_ref):
 
 
 def classify_commit(repo, sha, base_ref):
-    """LOST / IN-BASE / UNVERIFIABLE for one commit, with the missing lines named."""
+    """LOST / IN-BASE / UNVERIFIABLE for one commit, with the missing lines named.
+
+    # engine#2679 asked for a content test here rather than a line subset, and I measured the two
+    # candidates against the real commit rather than choosing one:
+    #   git diff old new | git apply --cached --reverse            -> rc 1  (too strict: rewording)
+    #   … --reverse -C1                                            -> rc 1  (likewise)
+    #   … --reverse --3way                                         -> rc 0  on the true case AND on
+    #                                                                        a genuine loss
+    # So there is no apply test that separates "the base kept this change in other words" from "the
+    # base does not have it": one is too strict, the other too permissive. What the row does instead
+    # is show the evidence -- the fraction and the missing lines -- and say that a reworded
+    # equivalent is the thing to rule out by reading it.
+    """
     names = git(repo, "diff-tree", "-r", "--no-commit-id", "--name-only", sha)
     if names.returncode != 0:
         return "UNVERIFIABLE", "(could not list the commit's files)"
@@ -212,7 +236,8 @@ def classify_commit(repo, sha, base_ref):
             theirs = base_lines.get(f)
             if theirs is None:
                 b = git(repo, "show", f"{base_ref}:{f}")
-                theirs = len(b.stdout.splitlines()) if b.returncode == 0 else 0
+                # still None when the base cannot be read: "unknown size", not "zero lines"
+                theirs = len(b.stdout.splitlines()) if b.returncode == 0 else None
             if theirs is None:
                 superseded = False
                 sizes += f"; {f}: this commit {mine} lines, base size UNREADABLE"
@@ -320,7 +345,18 @@ def scan(repo, days, limit, base_url=None, prs=None):
             rows.append(("GAP", pr, branch, None, f"could not fetch {url} {branch}"))
             continue
 
-        tail = merge_commits(repo, ref, base_ref)
+        # The tail is what the branch gained AFTER the head the PR merged at -- not what `main` is
+        # not an ancestor of. A squash merge rewrites every commit, so `main..branch` is the WHOLE
+        # branch history and every pre-merge commit gets re-litigated against a base that took its
+        # content in other words (engine#2679: #2659's own commits reported LOST at 71 % and 100 %).
+        # Against the frozen head the same question has one answer: what did the push add?
+        frozen = pr.get("headRefOid") or ""
+        if frozen and git(repo, "cat-file", "-e", f"{frozen}^{{commit}}").returncode == 0:
+            tail = merge_commits(repo, ref, base_ref, frozen)
+            origin = f"after the merged head {frozen[:7]}"
+        else:
+            tail = merge_commits(repo, ref, base_ref)
+            origin = "against the base (the frozen head is unavailable)"
         if tail is None:
             rows.append(("GAP", pr, branch, None, "could not list the branch's tail"))
             continue
@@ -449,12 +485,66 @@ def self_test():
         "one line of ten edited away by main is PARTIAL, not LOST")
     d.cleanup()
 
+    # The fifth state. A later commit that REWRITES the file leaves the branch's lines absent and
+    # the base file longer. Measured 2026-11-16: #2504's 15-of-18 "absent" lines, base longer,
+    # and the commit's own subject (`httplib::Server`) on main three times. The evidence was in the
+    # detail string while the verdict said LOST.
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    branch(r, "pr")
+    sup_sha = commit(r, "s.py", "".join(f"branch_line_{i} = {i}\n" for i in range(6)),
+                     "the branch adds six lines")
+    # The rewrite must land on the BASE, not on the branch: branch() moves HEAD, so without this
+    # checkout main never receives s.py and the fixture tests "unreadable base", not "rewritten".
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    commit(r, "s.py", "".join(f"rewritten_{i} = f({i})\n" for i in range(12)),
+           "a later commit rewrites the region and is longer")
+    chk("SUPERSEDED", classify_commit(r, sup_sha, "main")[0],
+        "a base that rewrote every affected file is SUPERSEDED, not LOST")
+    d.cleanup()
+
     # The gate: an unknown frozen head must never skip a branch, and equal heads must skip.
     chk(True, same_head("0193a29e5" + "0" * 31, "0193a29e5" + "9" * 31), "an equal frozen head skips")
     chk(False, same_head("0193a29e5" + "0" * 31, "f7700ba0a" + "1" * 31),
         "a moved branch tip does not skip")
     chk(False, same_head("", "f7700ba0a" + "1" * 31),
         "an unknown frozen head does NOT skip -- not knowing is not a pass")
+
+    # engine#2679: after a SQUASH merge the tail must start at the frozen head, not at "whatever
+    # main is not an ancestor of". This fixture is the measured shape: two commits authored, the
+    # base holding their change in different words, then one push after the merge.
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    branch(r, "pr")
+    c1 = commit(r, "tool.py", "def a():\n    return 1\n", "authored 1")
+    c2 = commit(r, "tool.py", "def a():\n    return 1\n\n\ndef b():\n    return 2\n", "authored 2")
+    branch(r, "main", "pr~2")      # the base, fork point
+    commit(r, "tool.py", "def a():\n    return 1\n\n\ndef b():\n    return 2  # squashed\n",
+           "the squash merge, in other words")
+    branch(r, "pr", c2)            # back on the branch at c2 = the frozen head
+    c3 = commit(r, "tool.py", "def a():\n    return 1\n\n\ndef b():\n    return 2\n\n\n"
+                              "def c():\n    return 3\n", "pushed after the merge")
+    tail = merge_commits(r, "pr", "main", c2)      # the shipped call: base-relative, minus the frozen head
+    chk(1, len(tail), "excluding the frozen head, the tail is the one commit pushed after the merge")
+    chk(True, tail[0][0] and c3.startswith(tail[0][0]),
+        "and it is that commit, not the authored ones")
+    chk(False, any(c1.startswith(sha) or c2.startswith(sha) for sha, _ in tail),
+        "neither authored commit is re-litigated after the squash")
+    chk(3, len(merge_commits(r, "pr", "main")),
+        "without the exclusion the tail is the WHOLE branch history -- the #2679 false positive")
+
+    # The exclusion SUBTRACTS the PR's history rather than replacing the base with it, which is what
+    # makes it right when the branch was rebased onto a newer base after the merge: those base commits
+    # are in `base..ref` and would otherwise be re-examined as if they were post-merge work.
+    branch(r, "main", "pr~1")
+    commit(r, "other.txt", "a commit main gained while the PR sat merged\n", "main moves on")
+    branch(r, "pr", c3)
+    commit(r, "tool.py", "def a():\n    return 1\n\n\ndef b():\n    return 2\n\n\n"
+                         "def c():\n    return 3\n\n\ndef d():\n    return 4\n",
+           "rebased onto the newer base, then pushed")
+    chk(1, len(merge_commits(r, "pr", "main", c3)),
+        "a rebased branch's tail is still only its own new commit, not the base it was rebased onto")
+    d.cleanup()
 
     # The tail set itself: a branch tip equal to the base has no tail.
     d, r = scratch()

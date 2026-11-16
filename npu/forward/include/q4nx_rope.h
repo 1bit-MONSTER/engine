@@ -221,6 +221,18 @@ static inline int q4nx_rope_type_supported(const char* type, const Q4nxRopeLlama
     return 0;                                               /* linear, mrope, ... */
 }
 
+/* engine#2673: rotate the first 2*half channels of one head by the pair angles (cos[i], sin[i]); the rest pass through.
+ * interleaved = 0: pairs (i, i + half), HF rotate_half / NeoX. interleaved = 1: consecutive pairs (2i, 2i+1), GLM /
+ * GPT-J (chatglm3's GQO states rotary_interleaved = 1). Frequency i belongs to pair i in both forms. */
+static inline void q4nx_rope_rotate_pairs(float* x, int half, const float* c, const float* sn, int interleaved) {
+    for (int i = 0; i < half; i++) {
+        const int a = interleaved ? 2 * i : i, b = interleaved ? 2 * i + 1 : i + half;
+        const float x1 = x[a], x2 = x[b];
+        x[a] = x1 * c[i] - x2 * sn[i];
+        x[b] = x1 * sn[i] + x2 * c[i];
+    }
+}
+
 #ifdef __cplusplus
 }
 #endif

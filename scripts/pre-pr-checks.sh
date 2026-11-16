@@ -84,6 +84,11 @@ checks=(
     # repo has no CI -- so it ran when someone remembered. This runs it from the repo that does have CI, over the
     # same discovery as the audit above; 77 when there is no tree, so a plain checkout is a skip, not a failure.
     "tools/ci/kernel_id_selftest.py --check --find ."
+    # engine#2478 review: a self-test that nothing runs rots silently. 72 tools carry one; ten were named by
+    # neither this list nor CMakeLists.txt (four of them found by hand, five more only after comment lines were
+    # excluded from the reference text, and the checker itself). Wired in CMake, and this row keeps the next one
+    # from going quiet.
+    "tools/ci/tool_selftest_wired_check.py"
 )
 
 # The page and this list drift apart, and it has happened twice in one night: the page said the runner "runs the first six"

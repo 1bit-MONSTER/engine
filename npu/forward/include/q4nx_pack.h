@@ -317,6 +317,9 @@ const char* q4nx_pb16i_instance(Q4nxDesign role);
  * declaration that translation unit only compiled because of how the libraries happened to be assembled (a standalone build of
  * the same file, e.g. one that links the target without the forward, fails with "was not declared in this scope"). */
 const char* q4nx_i8_sealed_instance(Q4nxDesign role);
+/* engine#2689: the sealed prefill ELF's instance for a role ("main:p_<decode name>"), so decode and prefill can share one
+ * hardware context; NULL where the decode table has none. */
+const char* q4nx_i8_sealed_prefill_instance(Q4nxDesign role);
 
 /* Look up the entry for a role in a derived set; NULL if absent. */
 const Q4nxDesignGeom* q4nx_find_design(const Q4nxDesignGeom* designs, int count,

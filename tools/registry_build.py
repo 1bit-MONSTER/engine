@@ -34,10 +34,12 @@ Every entry is read from a pinned source, never typed in by hand:
 "Mapped" means the backend's own code accepts the architecture. Whether a model of that
 architecture was run and checked here is recorded separately, in registry/checked.json.
 
---check exits 1 when the file on disk differs from what the pinned sources give.
---check-pins only compares the pins the file records with the gitlinks, so it needs no checkouts (CI and
-ctest `registry_pins` run it): a pin bump must regenerate the registry. "The gitlinks" means the index where it
-has one, so a bump that is staged but not yet committed is checked too, which is when a lane actually runs it.
+--check exits 1 when the file on disk differs from what the pinned sources give, and 77 (CTest's skip) when the
+fork is not checked out: it is the only form that reads the CONTENT, so it is ctest `registry_content`, and a
+skip there must not read as a pass. --check-pins only compares the pins the file records with the gitlinks, so
+it needs no checkouts (CI and ctest `registry_pins` run it): a pin bump must regenerate the registry. "The
+gitlinks" means the index where it has one, so a bump that is staged but not yet committed is checked too,
+which is when a lane actually runs it.
 """
 import argparse
 import ast
@@ -173,7 +175,11 @@ def runtime_archs(tree):
 
 def build():
     if not os.path.isdir(os.path.join(ROOT, HRX, "src")):
-        sys.exit(f"registry_build: {HRX} is not checked out (git submodule update --init {HRX})")
+        # 77, not 1: the content comes from a submodule, so a checkout without it cannot tell, and "cannot tell"
+        # must never read as clean. CTest reports 77 as a skip with this message (engine#2698).
+        print(f"registry_build: {HRX} is not checked out (git submodule update --init {HRX}): the content "
+              f"checks skip here, they do not pass")
+        raise SystemExit(77)
     hrx = os.path.join(ROOT, HRX)
     mapping = hf_to_gguf(hrx)
     run_hrx = runtime_archs(hrx)

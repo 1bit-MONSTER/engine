@@ -1987,6 +1987,11 @@ add_executable(npu_rope_interleave_test tests/npu_rope_interleave_test.c npu/for
 target_include_directories(npu_rope_interleave_test PRIVATE npu/forward/include)
 target_link_libraries(npu_rope_interleave_test PRIVATE m)
 add_test(NAME npu_rope_interleave COMMAND npu_rope_interleave_test)
+# engine#2673: ci.yml builds `onebit`, not this binary, so without this line ctest registers the row and reports
+# `Not Run` (and ci_targets flags it: "add_test names 'npu_rope_interleave_test', and ci.yml never builds
+# npu_rope_interleave"). Same route as npu_pad_head_rows_test and bf16_matrix_test above: a dependency of a target
+# ci.yml already builds, which needs no `.github/workflows/` edit.
+add_dependencies(onebit npu_rope_interleave_test)
 # The activation rotation a folded container needs (npu/forward/include/hadamard.h): its SIMD path must be
 # bit-identical to the shipped scalar loop on every shape a container carries, and the scalar loop must still
 # be the Hadamard transform.  Header only, no device, no model: runs in CI.

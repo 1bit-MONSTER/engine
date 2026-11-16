@@ -132,7 +132,12 @@ ADD_EXE = re.compile(r"^\s*add_executable\s*\(\s*([A-Za-z0-9_.+-]+)", re.IGNOREC
 ADD_TEST = re.compile(r"^\s*add_test\s*\(\s*NAME\s+([A-Za-z0-9_.+-]+)\s+COMMAND\s+(.*)$", re.IGNORECASE)
 BASELINE = "tools/ci/add_test_gaps.txt"
 # `add_dependencies(<target> <dep>…)`: the second way a target gets built (engine#1595 review).
-ADD_DEPS = re.compile(r"add_dependencies\s*\(\s*([A-Za-z0-9_.+-]+)([^)]*)\)", re.IGNORECASE)
+# engine#2700: anchored. Unanchored, this matched a COMMENT that mentions the hook -- a commented-out
+# `# add_dependencies(onebit X)` cleared a drifting test exactly like a live edge (measured: identical
+# closure, no test in the build), and the prose "`add_dependencies(onebit ...)`" in CMakeLists.txt put a
+# phantom target `...` in the closure. Every other directive regex in this file is anchored for the same
+# reason (`ADD`, `ADD_EXE`, `add_test_blocks`).
+ADD_DEPS = re.compile(r"^\s*add_dependencies\s*\(\s*([A-Za-z0-9_.+-]+)([^)]*)\)", re.IGNORECASE)
 
 
 def build_closure(cmake_text, listed, defines=None, defaults=None):
@@ -355,10 +360,6 @@ def scan_guards(cmake_text):
         while line.endswith("\\") and i + 1 < len(lines):
             i += 1
             line = line[:-1].strip() + " " + lines[i].strip()
-        # engine#2700: cut a CMake comment before the directive is recognised. `ADD_DEPS` is an unanchored
-        # search, so a commented-out `# add_dependencies(onebit X)` cleared a drifting test exactly like a live
-        # edge did (measured: same closure, no test in the build), and a trailing comment could name one too.
-        line = line.split("#", 1)[0].strip()
         if line:
             yield i + 1, line, [e["cond"] for e in stack if e["cond"]], any(e["cond"] is None for e in stack)
 

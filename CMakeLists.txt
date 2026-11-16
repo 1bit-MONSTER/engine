@@ -523,6 +523,20 @@ set_tests_properties(hip_f16_audit PROPERTIES SKIP_RETURN_CODE 77)
 # engine#2445 review: the rows run the tool, so CI exercises the flag (a row naming the test file never
 # would). base's own addition here -- guard_loss_check_self -- is kept as it is.
 add_python_test(branch_stale_check_test ${CMAKE_SOURCE_DIR}/tools/ci/branch_stale_check.py --self-test)
+# engine#2652: a commit pushed to a branch AFTER its PR merged is on a branch nothing will ever merge
+# again -- the PR is MERGED, so the gate's reviewed-head rule has already done its job and cannot see
+# the push. #2623 lost two commits that way (recovered by #2640) and #2605 lost one (recovered by
+# #2654). The row below is the hermetic one: the tool builds throwaway repos in a temp dir.
+add_python_test(merged_tail_check_self ${CMAKE_SOURCE_DIR}/tools/ci/merged_tail_check.py --self-test)
+# The live scan needs the network and `gh`, so it is off by default rather than a flaky default row;
+# a scheduled workflow is its proper home, and that file needs the `workflow` token scope a lane does
+# not have. Turn it on with -DMERGED_TAIL_CHECK_LIVE=ON to run it locally or in a job that has gh.
+option(MERGED_TAIL_CHECK_LIVE "run the network merged-branch tail scan (needs gh + network)" OFF)
+if(MERGED_TAIL_CHECK_LIVE)
+  add_test(NAME merged_tail_check_live COMMAND ${Python3_EXECUTABLE}
+           ${CMAKE_SOURCE_DIR}/tools/ci/merged_tail_check.py --days 10 --worktree ${CMAKE_SOURCE_DIR})
+  set_tests_properties(merged_tail_check_live PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 # engine#2429: the guard-loss check declares a self-test, so it needs a row -- tests_referenced_check caught
 # this omission on the PR that added the tool, which is the check doing exactly its job.
 add_python_test(guard_loss_check_self ${CMAKE_SOURCE_DIR}/tools/ci/guard_loss_check.py --self-test)

@@ -31,6 +31,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -57,9 +58,24 @@ int argmax(const std::vector<float>& v) {
     return best;
 }
 
+// Host-GEMM by default (no device, runs anywhere). ONEBIT_TEST_Q4NX_DEVICE=1 runs the SAME comparisons on the array
+// instead, which is the device row #2689 asks for -- and it must be run inside an npu-hold ticket:
+//
+//   npu-hold -l step-users-device -t 12 -- env ONEBIT_TEST_Q4NX=… ONEBIT_TEST_Q4NX_DEVICE=1 ./step_users_test
+//
+bool device_run() {
+    const char* d = std::getenv("ONEBIT_TEST_Q4NX_DEVICE");
+    return d != nullptr && d[0] == '1';
+}
+
 bool init(Q4nxNpuForward& fwd, const std::string& dir) {
-    setenv("NPU_INFER_HOST_GEMM", "1", 1);   // the whole file is device-free
+    if (!device_run()) setenv("NPU_INFER_HOST_GEMM", "1", 1);   // the default: device-free
     return fwd.init_host((dir + "/model.q4nx").c_str(), dir + "/kernels");
+}
+
+double seconds_since(const std::chrono::steady_clock::time_point& t0) {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now() - t0).count();
 }
 
 }  // namespace
@@ -139,17 +155,22 @@ int main() {
             pos.push_back(at_pos[(size_t)u]);
             slot.push_back(u);
         }
+        const auto t_round = std::chrono::steady_clock::now();
         std::vector<float> all;
         if (!fwd.step_users(tokens, pos, slot, all)) {
             std::printf("FAIL step_users round %d: %s\n", round, fwd.last_error());
             return 1;
         }
+        const double round_s = seconds_since(t_round);
+        std::printf("  round %d: %d row(s) in one pass, %.1f ms%s\n", round, users, round_s * 1000.0,
+                    device_run() ? " (device)" : " (host GEMM)");
         if (all.size() != (size_t)users * width) {
             std::printf("FAIL step_users round %d returned %zu logits for %d rows of %zu\n", round, all.size(), users,
                         width);
             return 1;
         }
         std::vector<std::vector<float>> want(users);
+        const auto t_refs = std::chrono::steady_clock::now();
         for (int u = 0; u < users; u++) {
             std::vector<float> mine(all.begin() + (size_t)u * width, all.begin() + (size_t)(u + 1) * width);
             if (!ref[(size_t)u]->step(tokens[(size_t)u], pos[(size_t)u], want[(size_t)u])) {
@@ -163,6 +184,9 @@ int main() {
                 return 1;
             }
         }
+        const double refs_s = seconds_since(t_refs);
+        std::printf("  round %d: %d separate single-user steps, %.1f ms total (%.1f ms per user)\n", round, users,
+                    refs_s * 1000.0, refs_s * 1000.0 / users);
         if (round == 0) {
             // The negative control: if the sequences produced the same logits, every comparison above could pass on a
             // build that served one row to everybody. They do not, so a swapped cache or position cannot hide here.

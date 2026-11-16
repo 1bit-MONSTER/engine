@@ -6676,7 +6676,7 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
         // tiles (lm_head_packed_) are int8 images.  Launching them there multiplies the wrong bytes (every row's logits
         // were garbage while all 368 layer GEMMs checked correct).  The head keeps the int8 decode twin, in chunks of its
         // width; with no twin the batched head is skipped and the per-row fallback below runs on the head context.
-        if (hctx && hctx->w4g32) hctx = xd_->pick_ctx(i_wide, M, /*decode_twin=*/true);
+        if (hctx && hctx->w4g32) hctx = xd_->pick_ctx(i_wide, M, /*decode_twin=*/true, /*int8_only=*/true);
         if (hctx && hctx->w4g32) hctx = nullptr;
         // A verify batch may be wider than the twin's row capacity (mtp_acceptance measures up to 128 rows).
         // The launch is then made in CHUNKS of at most MD rows rather than falling back to one launch per
@@ -6962,7 +6962,8 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     // N, same per-launch cost.
     // The head keeps the int8 family even in a pb16i container: lm_head is not a
     // PTQ1_0 ternary tensor and has no image, and packB below is the int8 packer.
-    I8Ctx& lctx = xd_->head_ctx() ? *xd_->head_ctx() : *xd_->pick_ctx(i_qkv, 1, /*decode_twin=*/xd_->w4_rows() > 0);
+    I8Ctx& lctx = xd_->head_ctx() ? *xd_->head_ctx()
+                                  : *xd_->pick_ctx(i_qkv, 1, /*decode_twin=*/xd_->w4_rows() > 0, /*int8_only=*/true);
     // The head packs and launches int8 images: it must never sit on a w4g32 (NPU_W4_PREFILL) prefill context.
     if (lctx.w4g32) {
         err_ = "lm head: NPU_W4_PREFILL needs an int8 head context (an LMHEAD ELF or the _m16 decode twins); this pack "

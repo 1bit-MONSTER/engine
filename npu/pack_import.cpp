@@ -178,6 +178,12 @@ struct OnnxModel {
     // other branch is diagnosable rather than silently misread.
     std::string decode_branch;
     std::string branch_note;
+    // engine#2634: the epsilon the graph's RMSNorm nodes state (SimplifiedLayerNormalization, SkipSimplified..., SSMLP), and
+    // how many nodes stated it. A pack whose config.json is `{}` (the 1.7 -onnx-ryzenai-npu line) states its epsilon only
+    // here; 0 when no node does, or when two nodes disagree (then nothing is taken from the graph).
+    float norm_eps = 0.0f;
+    int norm_eps_nodes = 0;
+    bool norm_eps_conflict = false;
 };
 
 // A matmul is decode-path when its branch is the decode branch, or when it is in no branch at all (a pack whose graph
@@ -225,6 +231,17 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m, const std::string& bra
             const auto* nm = field1(at, 1);
             if (!nm) continue;
             if (const auto* iv = field1(at, 3)) attrs[pb_str(*nm)] = int64_t(iv->v);
+            // AttributeProto.f (field 2, fixed32): the RMSNorm epsilon (engine#2634)
+            if (pb_str(*nm) == "epsilon" &&
+                (op == "SimplifiedLayerNormalization" || op == "SkipSimplifiedLayerNormalization" || op == "SSMLP"))
+                if (const auto* fv = field1(at, 2); fv && fv->wire == 5) {
+                    const uint32_t bits = uint32_t(fv->v);
+                    float e = 0.0f;
+                    std::memcpy(&e, &bits, 4);
+                    if (m.norm_eps_nodes == 0) m.norm_eps = e;
+                    else if (m.norm_eps != e) m.norm_eps_conflict = true;
+                    ++m.norm_eps_nodes;
+                }
             // AttributeProto.graph is field 6 (a GRAPH), graphs is field 11 (a repeated GRAPH) -- so a branch arrives
             // in field 6 and its name is the attribute's own, `then_branch` / `else_branch`.
             const std::string sub_branch = nm ? pb_str(*nm) : std::string();
@@ -896,6 +913,148 @@ std::string find_token_fconst(const std::string& dir, std::string* why = nullptr
 // .fconst?" predicate, which cost a second full rewrite per `npu-pack` command (measured: two O_TRUNC opens of the same
 // 291 MB file for one `npu-pack info`). Call it ONCE per plan/import and pass the path around. "Is there an .fconst?" is
 // find_token_fconst(), which touches nothing.
+std::vector<uint8_t> as_bf16(const uint8_t* src, int type, size_t count);
+std::string graph_filename(const std::string& pack_dir);
+
+// engine#2634: the Ryzen AI 1.7 `-onnx-ryzenai-npu` Token .fconst (`dd_metastate_Llm_Token_MatMulNBits_2_0.fconst`).
+// Measured on Llama-3.2-1B-Instruct against its 1.8 npu_4K twin: the same tiles in another arrangement, with no norm
+// envelopes. Layer block L (stride S17 below) is
+//     [q, k, v, o tiles -- q FIRST; 1.8 is k, q, v, o][post_attention_layernorm bf16[H], no header]
+//     [MLP: gate/up units, then down groups -- no 64-byte separator between them][layer L+1's input_layernorm bf16[H]]
+// (after the last layer that last gain is the final norm), then the head's tiles, the same as 1.8's after its envelope.
+// Layer 0's input_layernorm is not in the file: it is the graph's fp16 `model.layers.0.input_layernorm.weight`, and
+// every gain the file does carry equals bf16(the graph's fp16) exactly, so it is the same number either way. Rebuilt
+// with this map the file is the 1.8 twin's size, and every tile / unit / group is >= 96.4 % byte-equal to it at its
+// mapped place (a one-unit misplacement scores 8.5 %); the rest is the two exports' re-quantization.
+struct Fconst17Geom {
+    int64_t tile_h = 0, tile_o = 0, n_q = 0, n_kv = 0, n_o = 0, payload = 0, gu = 0, down = 0, stride = 0, head = 0;
+};
+// The arithmetic, and whether `size` is exactly layers x stride + head. Empty when it is; otherwise why not.
+std::string fconst17_geometry(uint64_t size, const Dims& d, Fconst17Geom* g) {
+    const int64_t H = d.hidden, IM = d.intermediate, Nq = int64_t(d.heads) * d.head_dim,
+                  Nkv = int64_t(d.kv_heads) * d.head_dim, V = d.vocab;
+    if (H <= 0 || IM <= 0 || Nq <= 0 || Nkv <= 0 || V <= 0 || d.layers <= 0) return "the geometry is incomplete";
+    if (Nq % 64 || Nkv % 64 || H % 64 || IM % 64) return "a width is not whole 64-row tiles";
+    g->tile_h = attn_tile_bytes(H);
+    g->tile_o = attn_tile_bytes(Nq);
+    if (g->tile_h <= 0 || g->tile_o <= 0) return "hidden or q width is not whole 128-column groups";
+    g->n_q = Nq / 64, g->n_kv = Nkv / 64, g->n_o = H / 64;
+    g->payload = (g->n_q + 2 * g->n_kv) * g->tile_h + g->n_o * g->tile_o;
+    g->gu = (IM / 64) * group_bytes(H, 128);
+    g->down = (H / 64) * group_bytes(IM, 64);
+    if (g->gu <= 0 || g->down <= 0) return "the MLP is not whole groups";
+    g->stride = g->payload + 2 * H + g->gu + g->down + 2 * H;
+    g->head = ((V + 63) / 64) * g->tile_h;
+    const uint64_t want = uint64_t(d.layers) * uint64_t(g->stride) + uint64_t(g->head);
+    if (size != want)
+        return "the file is " + std::to_string(size) + " B, and the 1.7 headerless form of this geometry is " +
+               std::to_string(d.layers) + " x " + std::to_string(g->stride) + " + a " + std::to_string(g->head) +
+               " B head = " + std::to_string(want) + " B";
+    return "";
+}
+
+// Write the 1.8 form of a 1.7 headerless Token .fconst to `work`. Returns `work`, or the source path unchanged when the
+// file is not in that form (so a 1.8 / 1.9 pack is untouched). Throws when it IS that form and the graph does not give
+// layer 0's input norm.
+// engine#2650: the 1.7 rewrite writes every header itself, so the block stride of the copy it produces is known exactly --
+// but it was a local (`Fconst17Geom g`), and the reader downstream had nothing but bytes and asked the epsilon vote, which
+// loses to a 12-byte anchor occurring inside a 4-bit tile. Record what was written, keyed by the PACK (both the rewrite and
+// the reader are looking at the same pack, so no path matching is involved), and let the reader prefer it over the vote.
+namespace {
+struct Geom17Known {
+    int64_t stride = 0;   // bytes per layer block in the canonical copy, measured from the writer's own offsets
+    int64_t head = 0;     // the trailing head block
+    int64_t tail = 0;     // everything after the last layer block: a 64-byte header, the final norm, the head block
+};
+std::map<std::string, Geom17Known> g_geom17_by_pack;
+}  // namespace
+
+std::string canonical_token_fconst17(const std::string& path, const std::string& pack_dir, const Dims& d,
+                                     const std::string& work) {
+    Fconst fc = open_fconst(path);
+    Fconst17Geom g;
+    // A 1.8 file opens with an epsilon header; this form opens with q's first tile. Both checks, so a 1.8 pack whose
+    // size happened to fit the arithmetic is never rewritten.
+    const bool opens_with_eps = fc.size >= 2 && fc.map[0] == uint8_t(d.eps_bits & 0xFF) &&
+                                fc.map[1] == uint8_t(d.eps_bits >> 8);
+    if (opens_with_eps || !fconst17_geometry(fc.size, d, &g).empty()) {
+        unmap_file(fc.map, fc.size);
+        return path;
+    }
+    const int64_t H = d.hidden;
+    // layer 0's input_layernorm, from the graph (either branch: the two copies are one tensor)
+    std::vector<uint8_t> in0;
+    {
+        const OnnxModel m = parse_onnx(pack_dir + "/" + graph_filename(pack_dir));
+        const auto it = m.index.find("model.layers.0.input_layernorm.weight");
+        if (it == m.index.end()) {
+            unmap_file(fc.map, fc.size);
+            throw std::runtime_error(path + ": a Ryzen AI 1.7 headerless Token .fconst (engine#2634), whose layer-0 "
+                                            "input_layernorm is in the graph, and the graph has no "
+                                            "model.layers.0.input_layernorm.weight");
+        }
+        const OnnxTensor& t = m.tensors[it->second];
+        const size_t es = t.type == kF32 ? 4 : 2;
+        const uint8_t* src = t.raw;
+        size_t ext_size = 0;
+        const uint8_t* ext = nullptr;
+        if (!src) {
+            std::string why;
+            ext = map_file(pack_dir + "/" + t.location, ext_size, &why);
+            if (!ext || t.offset + uint64_t(H) * es > ext_size) {
+                if (ext) unmap_file(ext, ext_size);
+                unmap_file(fc.map, fc.size);
+                throw std::runtime_error(path + ": layer-0 input_layernorm: " + (why.empty() ? "past the end" : why));
+            }
+            src = ext + t.offset;
+        }
+        in0 = as_bf16(src, t.type, size_t(H));
+        if (ext) unmap_file(ext, ext_size);
+    }
+    std::ofstream o(work, std::ios::binary | std::ios::trunc);
+    if (!o) {
+        unmap_file(fc.map, fc.size);
+        throw std::runtime_error("cannot write " + work);
+    }
+    char hdr[64] = {0};
+    hdr[0] = char(d.eps_bits & 0xFF), hdr[1] = char(d.eps_bits >> 8);
+    char sep[64] = {0};
+    sep[0] = 1;   // 1.8's gate/up | down separator: 01 then 63 zeros (measured)
+    const auto put = [&](const uint8_t* p, int64_t n) { o.write(reinterpret_cast<const char*>(p), std::streamsize(n)); };
+    std::streampos block0 = 0;
+    for (int L = 0; L < d.layers; ++L) {
+        const uint8_t* b = fc.map + size_t(L) * size_t(g.stride);
+        if (L == 0) block0 = o.tellp();
+        if (L == 1) g_geom17_by_pack[pack_dir].stride = int64_t(o.tellp() - block0);   // measured, not derived
+        o.write(hdr, 64);
+        if (L == 0) put(in0.data(), 2 * H);
+        else put(b - 2 * H, 2 * H);                                              // the previous block's trailing gain
+        put(b + g.n_q * g.tile_h, g.n_kv * g.tile_h);                            // k
+        put(b, g.n_q * g.tile_h);                                                // q
+        put(b + (g.n_q + g.n_kv) * g.tile_h, g.n_kv * g.tile_h);                 // v
+        put(b + (g.n_q + 2 * g.n_kv) * g.tile_h, g.n_o * g.tile_o);              // o
+        o.write(hdr, 64);
+        put(b + g.payload, 2 * H);                                               // post_attention_layernorm
+        put(b + g.payload + 2 * H, g.gu);
+        o.write(sep, 64);
+        put(b + g.payload + 2 * H + g.gu, g.down);
+    }
+    const std::streampos tail0 = o.tellp();
+    o.write(hdr, 64);
+    put(fc.map + size_t(d.layers) * size_t(g.stride) - size_t(2 * H), 2 * H);   // the final norm
+    put(fc.map + size_t(d.layers) * size_t(g.stride), g.head);
+    g_geom17_by_pack[pack_dir].tail = int64_t(o.tellp() - tail0);   // measured, so the test need not model it
+    o.close();
+    unmap_file(fc.map, fc.size);
+    if (!o) throw std::runtime_error("writing " + work + " failed");
+    g_geom17_by_pack[pack_dir].head = g.head;
+    if (g_geom17_by_pack[pack_dir].stride == 0)   // one layer: no second block to measure against
+        g_geom17_by_pack[pack_dir].stride = g.stride + 3 * 64;   // the three 64-byte headers this loop writes per block
+    std::fprintf(stderr, "1bit npu-pack: note: a Ryzen AI 1.7 headerless Token .fconst (engine#2634) was rewritten into its "
+                         "1.8 form at %s (remove it when done)\n", work.c_str());
+    return work;
+}
+
 std::string materialise_token_fconst(const std::string& pack_dir, const Dims& dims) {
     const std::string found = find_token_fconst(pack_dir);
     if (found.empty()) return found;
@@ -983,6 +1142,10 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
                                             "its 1.8 form before it can be read, and no writable directory is available "
                                             "for that copy (tried the temporary directory, /tmp and the current "
                                             "directory)");
+    // engine#2634: the 1.7 headerless form is rewritten first; a file not in that form comes back unchanged and goes on to
+    // the 1.9 check exactly as before.
+    const std::string f17 = canonical_token_fconst17(found, pack_dir, dims, work);
+    if (f17 != found) return f17;
     return canonical_token_fconst(found, dims.hidden, dims.heads, dims.layers, work);
 }
 
@@ -1690,6 +1853,7 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
     d.rope_theta = opt_field<float>(c, "rope_theta", 10000.0f);
     d.model_type = opt_field<std::string>(c, "model_type", "");
     d.rms_norm_eps = opt_field<float>(c, "rms_norm_eps", 1e-6f);
+    d.eps_stated = c.contains("rms_norm_eps") && c["rms_norm_eps"].is_number();
     // engine#1889: the pack's own statement about per-head q/k gains. `opt_field<bool>` because the key is absent on
     // every pack that has no such norm, and absent must mean false rather than a parse error.
     d.use_qk_norm = opt_field<bool>(c, "use_qk_norm", false);
@@ -1795,8 +1959,36 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
 // with "the epsilon headers do not repeat with a single period" while its own header reported the stride exactly.
 // So ask the header first on the SOURCE file (the canonical copy has the 1.9 header removed by construction), and keep the eps
 // vote as the fallback for packs with no 1.9 header -- the 1.8 / R1-Distill line, where it works today.
+// engine#2650 review: the two-witness decision as a pure function, so a test can pin the REFUSAL without a fixture that has
+// to lie about its own geometry. `vote` is the epsilon anchors' stride (0 when they failed); `recorded` is what the 1.7
+// rewrite measured while writing. Returns the stride to use, or 0 with `why` naming both numbers when they disagree -- a
+// wrong stride reads weights from the wrong place instead of failing cleanly, so a disagreement is refused, never tie-broken.
+int64_t fconst17_reconcile(int64_t vote, int64_t recorded, std::string* why) {
+    if (recorded <= 0) return vote;
+    if (vote != 0 && vote != recorded) {
+        *why = "the 1.7 rewrite produced stride " + std::to_string(recorded) + " and the epsilon anchors give " +
+               std::to_string(vote) + "; refusing rather than choosing";
+        return 0;
+    }
+    return recorded;
+}
+
 FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& pack_dir, const Dims& dims) {
     FconstGeom g = locate_fconst(tok, dims.eps_bits);
+    // engine#2650: if this process rewrote the pack from its 1.7 headerless form, the stride of the copy is known from the
+    // writer's own offsets, and the epsilon vote is the weaker witness (a 12-byte anchor occurs inside 4-bit tiles: measured
+    // 16,232,526 B into block 0 of Phi-3-mini-4k, at an offset that is not even 64-aligned, which cost 320 gaps).
+    if (const auto it = g_geom17_by_pack.find(pack_dir); it != g_geom17_by_pack.end() && it->second.stride > 0) {
+        std::string why;
+        const int64_t agreed = fconst17_reconcile(g.stride, it->second.stride, &why);
+        if (agreed == 0) {   // two witnesses that disagree: refuse naming both (see fconst17_reconcile)
+            g.why = why;
+            g.stride = 0;
+            return g;
+        }
+        if (g.stride == 0) g.why.clear();     // the vote failed; the rewrite's own measurement is the answer
+        g.stride = agreed;
+    }
     // engine#2604: the 1.8 gemma3 6-header form -- per-layer starts from every header, not one stride. Only on a file with
     // no 1.9 header (below, a 6-header 1.9 block is refused by name).
     auto six_18 = [&]() -> FconstGeom {
@@ -4375,6 +4567,18 @@ Plan plan(const std::string& pack_dir) {
         throw std::runtime_error("the pack's graph file " + graph + " is not in " + pack_dir +
                                  " (named by genai_config.json's model.decoder.filename)");
     const OnnxModel onnx = parse_onnx(pack_dir + "/" + graph);
+    // engine#2634: a pack that states no rms_norm_eps (config.json `{}`) states it in its graph's RMSNorm nodes. Taken
+    // before the layer blocks are located, because the block headers are found by this same epsilon.
+    {
+        std::string msg;
+        const float e = graph_eps_decision(p.dims.eps_stated, p.dims.rms_norm_eps, onnx.norm_eps_nodes,
+                                           onnx.norm_eps_conflict, onnx.norm_eps, &msg);
+        if (!msg.empty()) std::fprintf(stderr, "%s\n", msg.c_str());
+        if (e != p.dims.rms_norm_eps) {
+            p.dims.rms_norm_eps = e;
+            p.dims.eps_bits = bf16_bits_of(e);
+        }
+    }
     // Census the graph's own weight carrier (see plan_import.h's note): this is what tells a 1.3/1.6/1.7.1 pack
     // (real ONNX initializers) from a 1.8/R1-Distill pack (placeholders, weights in model.bin) without parsing
     // anything outside the pack.
@@ -5182,6 +5386,53 @@ std::string kernel_set_refusal(const std::vector<std::string>& file_names, const
 // shared -- the plan, the geometry, the tile writer, the container metadata.
 // Copies the tokenizer/chat files the container needs beside model.q4nx; defined past kTextFiles' declaration.
 static int copy_text_artifacts(const std::string& pack_dir, const std::string& out_dir);
+
+// engine#2634: whether a cos_cache is llama3-scaled RoPE (Llama-3.1/3.2: rope_scaling {rope_type llama3, factor,
+// low_freq_factor, high_freq_factor, original_max_position_embeddings}). The theta fit above looks at the first 4,096
+// positions, where llama3 scaling -- which only slows the low-frequency columns -- is invisible, so a pack with no
+// config.json (the 1.7 -onnx-ryzenai-npu line) passed that fit at the right theta and was served WITHOUT the scaling.
+// This compares the cache over its whole length, by max |error|, with plain RoPE and with llama3 variants (factor
+// 8/16/32/64, low 1, high 4, original_max_position_embeddings 8192..131072), and returns the best variant only when it
+// clearly explains the cache (err < 0.02, the fp16 cache's own floor at long positions, where plain is > 0.5 and at
+// least 10x worse). The original window is searched, not assumed: Llama-3.2-1B-Instruct-onnx-ryzenai-npu's cache is
+// factor 32 with original_max_position_embeddings 131072 (max error 0.009; plain 1.995; the 8192 the upstream config
+// states fits no better than plain), and running the pack as published means its own cache.
+RopeLlama3Fit rope_cache_llama3(const std::vector<float>& cache, int64_t rows, int64_t half, double theta) {
+    RopeLlama3Fit r;
+    if (rows < 2 || half < 2 || !(theta > 0)) return r;
+    const int64_t HD2 = 2 * half;
+    const double pi = 3.14159265358979323846;
+    const auto max_err = [&](const std::vector<double>& inv) {
+        double e = 0;
+        const int64_t step = std::max<int64_t>(1, rows / 2048);
+        for (int64_t p = 0; p < rows; p += step)
+            for (int64_t i = 0; i < half; ++i)
+                e = std::max(e, std::fabs(double(cache[size_t(p) * size_t(half) + size_t(i)]) - std::cos(double(p) * inv[size_t(i)])));
+        return e;
+    };
+    std::vector<double> base(static_cast<size_t>(half), 0.0);
+    for (int64_t i = 0; i < half; ++i) base[size_t(i)] = 1.0 / std::pow(theta, double(2 * i) / double(HD2));
+    r.plain_err = max_err(base);
+    struct V { double factor, low, high, orig; };
+    std::vector<V> cands;
+    for (double fac : {8.0, 16.0, 32.0, 64.0})
+        for (double orig : {8192.0, 16384.0, 32768.0, 65536.0, 131072.0}) cands.push_back(V{fac, 1, 4, orig});
+    for (const V& v : cands) {
+        std::vector<double> inv(base);
+        const double low_wl = v.orig / v.low, high_wl = v.orig / v.high;
+        for (auto& f : inv) {   // transformers' _compute_llama3_parameters
+            const double wl = 2 * pi / f;
+            if (wl < high_wl) continue;
+            if (wl > low_wl) { f = f / v.factor; continue; }
+            const double smooth = (v.orig / wl - v.low) / (v.high - v.low);
+            f = (1 - smooth) * f / v.factor + smooth * f;
+        }
+        const double e = max_err(inv);
+        if (e < r.err) { r.err = e; r.factor = v.factor; r.low = v.low; r.high = v.high; r.orig = v.orig; }
+    }
+    r.found = r.err < 0.02 && r.plain_err > 0.5 && r.err * 10 < r.plain_err;
+    return r;
+}
 
 double rope_cache_best_theta(const std::vector<float>& cache, int64_t rows, int64_t half,
                              const std::vector<double>& cands, double* best_theta) {
@@ -6989,6 +7240,19 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                      "attention may be wrong from the first token\n",
                                      best_corr, best_theta, (double)p.dims.rope_theta);
                     }
+                    // engine#2634: a stated rope_scaling wins; otherwise the cache over its whole length decides llama3.
+                    if (best_corr > 0.99 && !c.contains("rope_scaling") && c.contains("rope_theta") &&
+                        c["rope_theta"].is_number()) {
+                        const RopeLlama3Fit l3 = rope_cache_llama3(cache, rows, half, c["rope_theta"].get<double>());
+                        if (l3.found) {
+                            c["rope_scaling"] = {{"rope_type", "llama3"}, {"factor", l3.factor},
+                                                 {"low_freq_factor", l3.low}, {"high_freq_factor", l3.high},
+                                                 {"original_max_position_embeddings", l3.orig}};
+                            std::fprintf(stderr, "note: rope_scaling llama3 (factor %g) taken from the pack's cos_cache: "
+                                                 "max error %.2g over its %lld positions, against %.2g for plain RoPE\n",
+                                         l3.factor, l3.err, (long long)rows, l3.plain_err);
+                        }
+                    }
                 }
             }
         }
@@ -7546,6 +7810,64 @@ HeadFit fit_head(const Q4& q, const EmbedTable& embed, int rows, int block) {
     if (sxx > 0) f.scale = sxe / sxx;
     if (see > 0) f.rms_ratio = std::sqrt(sxx / see);
     return f;
+}
+
+// engine#2634: the rms_norm_eps a pack is served with, given what config.json and the graph say. config.json wins when it
+// states one. Otherwise the graph's RMSNorm nodes: taken when they agree, and when they DISAGREE nothing is taken and
+// that is said -- a pack that states two epsilons must not be served at one of them, or at the default, in silence
+// (#2638 review). `msg` is the line to print ("" when there is nothing to say).
+float graph_eps_decision(bool config_stated, float current, int nodes, bool conflict, float graph_eps, std::string* msg) {
+    char buf[320];
+    if (msg) msg->clear();
+    if (config_stated || nodes <= 0) return current;
+    if (conflict) {
+        std::snprintf(buf, sizeof buf,
+                      "WARNING: rms_norm_eps: the graph's %d RMSNorm nodes state DIFFERENT epsilons and config.json states "
+                      "none; keeping %.6g, which may not be this model's", nodes, double(current));
+        if (msg) *msg = buf;
+        return current;
+    }
+    if (!(graph_eps > 0.0f)) return current;
+    if (graph_eps != current) {
+        std::snprintf(buf, sizeof buf, "note: rms_norm_eps %.6g taken from the graph (%d RMSNorm nodes state it; "
+                                       "config.json does not)", double(graph_eps), nodes);
+        if (msg) *msg = buf;
+    }
+    return graph_eps;
+}
+
+// engine#2634: test hooks for the 1.7 headerless Token .fconst and the graph's own epsilon.
+std::string fconst17_geometry_exported(uint64_t size, const Dims& d) {
+    Fconst17Geom g;
+    return fconst17_geometry(size, d, &g);
+}
+// engine#2650: what the 1.7 rewrite recorded for this pack (0 when it did not rewrite one). Exported so a test can check it
+// against the file the writer produced rather than against the same arithmetic that produced it.
+int64_t fconst17_reconcile_exported(int64_t vote, int64_t recorded, std::string* why) {
+    return fconst17_reconcile(vote, recorded, why);
+}
+int64_t fconst17_known_stride_exported(const std::string& pack_dir) {
+    const auto it = g_geom17_by_pack.find(pack_dir);
+    return it == g_geom17_by_pack.end() ? 0 : it->second.stride;
+}
+int64_t fconst17_known_tail_exported(const std::string& pack_dir) {
+    const auto it = g_geom17_by_pack.find(pack_dir);
+    return it == g_geom17_by_pack.end() ? 0 : it->second.tail;
+}
+int64_t fconst17_known_head_exported(const std::string& pack_dir) {
+    const auto it = g_geom17_by_pack.find(pack_dir);
+    return it == g_geom17_by_pack.end() ? 0 : it->second.head;
+}
+
+std::string canonical_token_fconst17_exported(const std::string& path, const std::string& pack_dir, const Dims& d,
+                                              const std::string& work) {
+    return canonical_token_fconst17(path, pack_dir, d, work);
+}
+float graph_norm_eps_exported(const std::string& onnx_path, int* nodes, bool* conflict) {
+    const OnnxModel m = parse_onnx(onnx_path);
+    if (nodes) *nodes = m.norm_eps_nodes;
+    if (conflict) *conflict = m.norm_eps_conflict;
+    return m.norm_eps;
 }
 
 }  // namespace onebit::npu::pack_import

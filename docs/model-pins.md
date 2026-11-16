@@ -166,8 +166,24 @@ Its exit codes are its own, not `pin_watch.py`'s (whose table is above):
 On the box it runs daily from `scripts/1bit-pin-holdings.{service,timer}` (05:00 UTC) under `~/lb/thermal-run.sh`,
 from the engine checkout named by `ONEBIT_ENGINE` in the unit (default `%h/wt/engine-main`; set it at install to a
 checkout of this repository that follows `main`, which `~/1bit-MONSTER` on strixhalo is not). A missing checkout
-exits 2 with a line saying so, so "cannot run" never reads as "a pin differs". Exit 1 marks the unit failed and the
-report is `~/.1bit/logs/pin-holdings-latest.md`.
+exits 2 with a line saying so, so "cannot run" never reads as "a pin differs". Exit 1 marks the unit failed, the
+report is `~/.1bit/logs/pin-holdings-latest.md`, and every run appends one line to `~/briefs/PIN-HOLDINGS.log`
+(`--log`), so the daily result outlives the journal:
+`<utc> ok|drift|error (M/P checked) mapped= checked= drifted= rehost_drifted= map_errors= absent= unmapped=`.
+
+The report also says what it did **not** check:
+
+`Coverage: M of P pinned files checked; U not checked (A not held here, N held and missing from models/holdings.json)`
+
+A pinned file with no holding is one of two opposite things:
+
+- **absent**: the box does not hold it. That is expected; most pins are not on the box.
+- **unmapped**: the box holds a file with that name and size, and the map does not list it. That is the blindness this
+  tool exists to remove.
+
+Only `--scan DIR` (the unit scans `~/models`) can tell them apart. It walks the tree for unmapped pinned files by
+basename **and** size. Each hit is listed as `UNMAPPED:` and fails the run (exit 1). Without `--scan`, the header
+says the split is unknown. On strixhalo (11-16): 9 of 192 checked, 183 absent, 0 unmapped.
 
 ```bash
 tools/pin_holdings.py                       # both halves; report on stdout
@@ -184,6 +200,43 @@ in the table**, under *Published, not pinned*. Such a repo changes no pin, so no
 makes the run's first line say so, and adding it is `--pin` plus a `used_for` that says what published it.
 A repo of `.1bp` packs is not pinned here, and a private repo never is (next section) — both are filtered
 out, so the census cannot go permanently red over something this file must not contain.
+
+## A fallback source: ModelScope
+
+ModelScope (modelscope.cn) mirrors many of the repos we pin, under the same id, and its public file listing
+gives each file's sha256. So a mirror can stand in for Hugging Face exactly when its file carries the pinned oid,
+whatever the file is called. `tools/pin_mirror.py` checks that and fetches through it. It is anonymous:
+the public listing and download need no token, and the tool never sends one. The owner's ModelScope key stays
+off this box, and nothing here uploads.
+
+```bash
+tools/pin_mirror.py --check                       # every pin outside our own orgs: is the mirror the pinned file?
+tools/pin_mirror.py --check --repo unsloth/Qwen3.8-27B-GGUF
+tools/pin_mirror.py --fetch REPO FILE --dest DIR  # download from the mirror; kept only if sha256 == the pin's oid
+```
+
+`--check` reports each pinned file as one of four states:
+
+- `match`: the mirror may serve it.
+- `DIFFERS`: other bytes under the pinned name, so do not use it.
+- `missing`.
+- no mirror under that id.
+
+A non-LFS pin records a git blob id, which a sha256 cannot be compared with. For those, a small text file
+(≤ 1 MiB) is downloaded and its blob id computed. `--fetch` hashes while it streams, resumes a `.part`
+(the hash covers the bytes already on disk), and deletes a file that is not the pinned one rather than moving it
+into place. Exit codes:
+
+- **0** everything compared matches, or the fetch verified.
+- **1** a mirror differs, or the fetch did not verify.
+- **2** usage, or no listing read.
+
+Measured 2026-11-16 against `models/pins.json` (72 pins outside our orgs):
+
+- 63 are mirrored under the same id, and all 76 of their pinned files match, including
+  `unsloth/Qwen3.8-27B-GGUF`'s UD3.1 `Qwen3.8-27B-UD-Q4_K_XL.gguf` (`2a5f3565…`).
+- 9 have no mirror under that id: two RichardErkhov repos, three mradermacher repos, mys, nomic-ai, nvidia and pqnet.
+- One real fetch, `unsloth/Qwen3-0.6B-GGUF` `Qwen3-0.6B-Q4_K_M.gguf` (397 MB, 36 s), verified against its pin.
 
 ## Build inputs
 

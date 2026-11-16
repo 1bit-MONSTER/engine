@@ -460,6 +460,12 @@ add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_or
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
 add_python_test(ci_targets ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#2641: #2625 merged with its own conflict markers still in docs/nvme-iommu-fault-triage.md, inside a ```bash
+# block, so the page did not render and nothing noticed -- the merge kept them because the file was never read back.
+# The check is stateful on purpose: a bare `=======` is a Markdown underline or a shell rule (the first version
+# flagged 10 of those on a clean tree), so a separator counts only inside an unterminated conflict block.
+add_python_test(conflict_marker ${CMAKE_SOURCE_DIR}/tools/ci/conflict_marker_check.py --check --root ${CMAKE_SOURCE_DIR})
+add_python_test(conflict_marker_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_marker_check.py --self-test)
 # engine#803 gate, second half: the comparator that turns two --dump-logits directories into the KLD verdict the
 # P4 gate asks for. No device and no model, so the gate is one command when a ticket is free; the self-test pins
 # the four cases a KLD implementation gets wrong (identical -> exactly 0, a shift is positive and directional, a
@@ -489,6 +495,9 @@ add_python_test(conflict_triage_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_triag
 # maintained by hand and nothing compared it to CMakeLists, so `stb_image` was fetched, compiled and
 # shipped without a licence line until a reviewer noticed. Matched on the GIT_REPOSITORY URL: that is
 # what the two files share (`stb` in CMake is `stb_image (nothings/stb)` in NOTICE, so the name is not).
+# engine#2643: provenance() tells apart four cases a reader cannot re-check by eye -- same commit, absent
+# object, ancestor at N commits, shallow clone -- and shipped with no arm. Hermetic: throwaway repos, no network.
+add_python_test(hw_gate_manifest_self ${CMAKE_SOURCE_DIR}/tools/hw_gate_manifest.py selftest)
 add_python_test(notice_covers_deps_self ${CMAKE_SOURCE_DIR}/tools/ci/notice_covers_deps.py --self-test)
 # `--root` is explicit: add_python_test() sets no WORKING_DIRECTORY, so ctest runs this row in the BUILD
 # directory and a `--root .` default would look for CMakeLists.txt where there is none (review of #2344 --
@@ -1108,8 +1117,23 @@ if(ONEBIT_AUDIO_AVX2)
     endif()
 endif()
 
+# engine#1783: the audio executor is compiled twice and picked at load. The flags effect is a WHOLE-TU one
+# (measured 1.252x TU-wide vs 1.010x for a clone of just the four-row GEMM), and the appliance must keep the
+# baseline, so this is a runtime choice rather than a build-wide -mavx2 (engine#2403).
+add_library(onebit_audio_exec_base OBJECT npu/audio_exec.cpp)
+add_library(onebit_audio_exec_avx2 OBJECT npu/audio_exec.cpp)
+foreach(_f onebit_audio_exec_base onebit_audio_exec_avx2)
+    target_include_directories(${_f} PRIVATE npu)
+endforeach()
+target_compile_definitions(onebit_audio_exec_base PRIVATE ONEBIT_AUDIO_TU_SUFFIX=base)
+target_compile_definitions(onebit_audio_exec_avx2 PRIVATE ONEBIT_AUDIO_TU_SUFFIX=avx2)
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-mavx2" ONEBIT_HAVE_AVX2_TU)
+if(ONEBIT_HAVE_AVX2_TU AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(onebit_audio_exec_avx2 PRIVATE -mavx2)   # NOT -mfma: it breaks the ordered-sum contract
+endif()
 add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp npu/vision_request.cpp
-                            npu/audio_exec.cpp npu/audio_pack.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
+                            $<TARGET_OBJECTS:onebit_audio_exec_base> $<TARGET_OBJECTS:onebit_audio_exec_avx2> npu/audio_exec_dispatch.cpp npu/audio_pack.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json onebit_q4nx_cache PRIVATE PkgConfig::PCRE2)
@@ -1297,6 +1321,9 @@ if(Python3_Interpreter_FOUND)
     # the same check where a lane actually runs it: with the bump staged and HEAD still behind, where a HEAD-only
     # read of the gitlink passed a registry recording the pin being replaced (engine#1738's post-commit failure)
     add_test(NAME registry_pins_staged COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_pin_staged_test.py)
+    # ModelScope as a fallback source for pinned files, against a fake mirror: a same-named file with other bytes is
+    # refused, an unverified fetch never lands, a non-LFS pin is compared by its git blob id, and no request carries a token
+    add_test(NAME pin_mirror COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/pin_mirror_test.py)
     # the 1.9 measurement tool's own paths, on synthetic packs: the "trying next" line it shipped broken (its
     # only real pair verified on the first candidate, so the line never ran) and the residual tolerance it
     # accepts and refuses at. Fixtures are ~200 KB each and built from the rule, so they can be wrong on purpose.

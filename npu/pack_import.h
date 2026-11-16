@@ -71,6 +71,7 @@ struct Dims {
     // packs declare; Llama-3.2-1B declares 1e-5 (28 37) and so had no anchors at all.
     float rms_norm_eps = 1e-6f;
     unsigned short eps_bits = 0x3586;
+    bool eps_stated = false;   // config.json stated rms_norm_eps (else plan() may take it from the graph, engine#2634)
     std::string model_type;
     std::vector<int> eos;
     // config.json's `use_qk_norm` (engine#1889). Hunyuan-7B declares it and puts 32x128 + 8x128 per-head q/k
@@ -988,6 +989,31 @@ unsigned short bf16_bits_of(float v);
 // the default rather than throw. Exported so tests/npu_pack_import_test.cpp can pin it without a
 // pack; `source` names where the geometry came from, for the refusal messages.
 Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
+// engine#2634: the Ryzen AI 1.7 `-onnx-ryzenai-npu` Token .fconst -- no norm envelopes, q first, the MLP without its
+// 64-byte separator, each block ending with the NEXT layer's input_layernorm, layer 0's in the graph. "" when `size` is
+// exactly that form's layers x stride + head for `d`, else why not.
+std::string fconst17_geometry_exported(uint64_t size, const Dims& d);
+// The 1.8 form of such a file written to `work` (returns `work`), or `path` unchanged when it is not in that form.
+std::string canonical_token_fconst17_exported(const std::string& path, const std::string& pack_dir, const Dims& d,
+                                              const std::string& work);
+// engine#2650: the block stride and head size that the 1.7 rewrite above actually WROTE for `pack_dir` (measured from the
+// writer's own offsets), or 0 when this process did not rewrite that pack. The reader prefers these over the epsilon vote,
+// which loses when a 12-byte anchor occurs inside a 4-bit tile.
+int64_t fconst17_known_stride_exported(const std::string& pack_dir);
+// The two-witness decision itself (engine#2650 review): the stride to use, or 0 with `why` naming both when the epsilon
+// anchors and the rewrite's measurement disagree. Pure, so a test pins the refusal directly.
+int64_t fconst17_reconcile_exported(int64_t vote, int64_t recorded, std::string* why);
+int64_t fconst17_known_head_exported(const std::string& pack_dir);
+// Everything after the last layer block (a 64-byte header, the final norm, the head block), measured the same way.
+int64_t fconst17_known_tail_exported(const std::string& pack_dir);
+// The epsilon the graph's RMSNorm nodes state (0 when none), how many state it, and whether two disagree.
+float graph_norm_eps_exported(const std::string& onnx_path, int* nodes, bool* conflict);
+// The rms_norm_eps to serve with: config.json's when it states one, else the graph's when its nodes agree; when they
+// disagree, `current` is kept and `msg` says so (a WARNING, never silence). `msg` is "" when there is nothing to say.
+float graph_eps_decision(bool config_stated, float current, int nodes, bool conflict, float graph_eps, std::string* msg);
+// engine#2634: whether a cos_cache is llama3-scaled RoPE, searched over factor and original window (see the .cpp).
+struct RopeLlama3Fit { bool found = false; double factor = 0, low = 0, high = 0, orig = 0, err = 1e9, plain_err = 1e9; };
+RopeLlama3Fit rope_cache_llama3(const std::vector<float>& cache, int64_t rows, int64_t half, double theta);
 // engine#1503: what the graph walker RECORDED, without exposing its model type. A three-input MatMulNBits (no qzeros,
 // weights spelled `<proj>.MatMul.weight_Q4`) used to be dropped entirely, which is why Qwen3-VL-4B imported one tensor.
 // Returns the matmul count; `without_zeros` counts those that carry no qzeros tensor (the implicit-zero-point case), and

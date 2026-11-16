@@ -29,11 +29,32 @@ tools/diag/iommu_fault_census.py --journal boot-2.txt --journal boot-1.txt --jou
 boot -2  0000:c4:00.0 domain=0x0015: 3800 faults, 10 distinct   x688 top
 boot -1  0000:c4:00.0 domain=0x0015: 2361 faults,  9 distinct   x301 top
 boot  0  0000:c4:00.0 domain=0x0015:  213 faults,  7 distinct   x81 top
-         -> few live mappings faulting over and over -> a stale translation: find the buffer
+         -> few live mappings faulting over and over
+         -> (11-16) NOT a stale translation: the probe below shows those addresses are never unmapped
 
 boot -2  0000:c6:00.1 domain=0x0002:  390 faults, 321 distinct  max 6 each
          -> many distinct pages about once each -> re-allocation: find the race
 ```
+
+**The one hypothesis this file got wrong, and how it was retired.** The shape above ("few live mappings faulting over and
+over") reads as a stale translation — a released buffer still being written, with lazy invalidation deferring the flush. That
+was the working hypothesis for a day. It is false for this stream, and a continuous probe settled it:
+
+```
+armed on iommu_unmap_fast filtered to ALL eight addresses that faulted in the current boot
+window  ~13 minutes, with a real burst underneath it
+faults  30 inside the window, all 30 on filtered addresses, 0 outside
+unmaps  of any of those eight addresses:  0        (fault totals 138 -> 168, unmap_events stayed 0)
+```
+
+**The IOVA is never unmapped while the device writes it.** No released buffer, no stale TLB entry, nothing for lazy
+invalidation to defer: the translation is simply absent when the write arrives. That moves the whole question from the
+*unmap* path to the **map** path — the address was never mapped in that context, or it is mapped with insufficient rights
+(`flags` bit 0 clear argues absent rather than denied), or the device is using an address a descriptor should not carry.
+
+Two method notes from getting this far, both now sections below: **a fixed capture window will keep missing seconds-long
+bursts** (three short windows missed three bursts, the last by seven seconds — the probe has to be armed continuously across
+the whole address set), and **the phenomenon must be live before the capture starts** (step 0).
 
 Four facts that constrain the answer, each of which cost a measurement to learn:
 
@@ -117,6 +138,122 @@ only if you want to confirm that, not as a discriminator.
 # 3. in the same capture window, note the fault timestamps for that iova
 ```
 
+**The interval is seconds, not milliseconds (measured 2026-11-16).** A filtered probe on one faulting IOVA
+(`0xe1e18000`), captured over a boot's first 28 minutes, found **60 unmaps of that page, every one a single 4 KiB
+page, 59 of them from `<idle>` (interrupt context)**: the NVMe completion path repeatedly maps and tears down one
+pooled page. **Three of the four faults on it** followed an unmap of that same page by **5.65 s, 24.66 s and
+24.71 s**, and a correlation window of ±5 ms found none of them. The fourth (boot t=1605.6 s) has **no unmap of that
+page within 60 s** -- the nearest is **+74 s**, after the fault -- so this capture correlates three faults and shows
+the ceiling on the fourth; a wider window does not help it, and the earlier "19.60 s" I quoted for it came from a
+different capture and does not reproduce on this one. So `tools/diag/unmap_fault_order.py` defaults to **30 s** and
+the page's own numbers are **5-25 s on that sparse stream**: a millisecond window reports "nothing correlated" on a
+capture that contains the correlation. Because the same sentence is printed whether the window is too narrow or the
+fault genuinely has no nearby unmap, **the negative names the window it used and the measured interval** -- a default
+alone does not fix the failure, only a negative that says *at what scale* it found nothing does.
+
+**But "seconds" is not the rate of this stream -- it is the rate of that capture.** The same page measured again on a
+busier boot is mapped and unmapped **about 470 times a second**: `nvme_prep_rq` maps it through `dma_map_phys` ->
+`iommu_map`, and `nvme_pci_complete_batch` unmaps it from the completion IRQ through both `dma_unmap_phys` and
+`dma_iova_unlink`/`dma_iova_destroy` (150 s, one IOVA, filtered, counts 27644 / 35907 / 33141). **So a wide window is
+the wrong instrument in the other direction**: at that rate a +/-30 s window holds ~14,000 unmaps of the page and "the
+nearest one was 31 us before the fault" is not evidence of anything. The tool therefore **carries the count** and flags
+a pairing whose window held more than three unmaps of the same IOVA:
+`[1 of N unmaps of this iova in the window -- NOT discriminating, narrow --window]`. On the burst capture above it
+fires on the -5.65 s pairing immediately (`1 of 7`), which is the honest reading: **the interval is real, its precision
+is not.**
+
+**Three ways a filtered kprobe silently measures nothing**, all hit while taking the counts above:
+
+1. **`tracing_on=0` with `enable=1`** records nothing, and the empty buffer reads exactly like "0 events". Check
+   `tracing_on` and `entries-written` on every capture, and run a **positive control** first (30 s of events, abort if
+   zero).
+2. **A `stacktrace` trigger suppresses the event's own line.** The dump is `<stack trace>` blocks with no `iova=` text
+   at all, so a filter that is working perfectly looks like it never applied. Count events *without* the trigger first.
+   And `stacktrace:unlimited` must be cleared (`echo '!stacktrace:0' > .../trigger`) before `-:kprobes/x` will delete
+   the event -- otherwise the delete fails with `echo: I/O error` and the probe stays armed.
+3. **tracefs rejects range filters, and the failed write leaves the probe UNFILTERED.**
+   `(iova + size > 0xX && iova <= 0xX)` gives `parse_error: Invalid operator`; the event then records **every** unmap
+   (1,947 in 20 s, against 18 in 30 s for the working exact filter). **Read the filter file back after writing it**, and
+   keep in mind that an exact-iova filter cannot see a *larger* mapping that covers the page -- for this driver that is
+   tolerable because its unmaps are all 4 KiB (60 of 60 measured), but it is a measured caveat, not a proof.
+4. **An event whose filter file is damaged can never be deleted, and the damage can come from a write you were told
+   failed.** Measured 08:15Z: an event created with a five-term filter (`iova==A || … || iova==E`) recorded and
+   reported correctly. Writing the filter a **second time** (`echo > filter` to clear it, then `printf '1'`) returned
+   `I/O error` and left the filter file holding its own error text:
+
+   ```
+   $ cat .../events/kprobes/b2map/filter
+   1
+    ^
+   parse_error: Field not found
+   ```
+
+   From then on **every** write to that event -- clearing, enabling, and `echo '-:kprobes/b2map'` to delete it --
+   returns `I/O error`, so the probe is **permanently armed and disabled**: it records nothing (`enable=0`), it holds a
+   kprobe slot on `iommu_map`/`iommu_unmap_fast` until the next reboot, and there is no userspace way to remove it. A
+   fresh event created and deleted in the same minute works fine, so the subsystem is not wedged -- only that event is.
+
+5. **Both the rate and the target go stale within minutes, so re-derive them immediately before arming.** Measured
+   on this box: an unfiltered `iommu_map`+`iommu_unmap_fast` pair ran at **~1,000 events/s** at 06:42Z and at
+   **14,449/s** (650,210 in 45 s) at 08:10Z, because another lane started a DMA-heavy build -- a 30-minute unfiltered
+   capture therefore keeps only its **last ~20 s** in the 1,410 KB per-CPU ring, which cannot contain a fault at one
+   per three minutes. And a filter built from the **last 25 faults** recorded 8 events in 30 s, then **0 in 30 s** five
+   minutes later: the faulting IOVAs move on faster than a capture can be planned. Consequence for a capture owner:
+   **refresh the address list and size the window from a positive control taken seconds, not minutes, earlier** -- and
+   let the positive control abort you, which is what it did three times today.
+
+   **Treat each event's `filter` as write-once.** To change a filter, delete the event and recreate it; do not clear or
+   edit one in place. And after deleting, **check `grep -c 'kprobes/' kprobe_events` back to its previous count** --
+   cleanup that fails silently is how a probe outlives the run that armed it, which is the rule this page already has
+   one paragraph up.
+
+**Arm the map side too, unfiltered, and the argument for one address stops being needed (measured 11-16 06:42Z).**
+A filtered capture on five addresses chosen from the fault census recorded **zero events in 30 s** and aborted on its
+own positive control -- because **the fault target moves**: the last three faults were all on an address the list did
+not contain. The capture that worked armed `iommu_map` and `iommu_unmap_fast` with **no filter** for 13 minutes
+(44 unmaps/s is what a quiet minute looks like; a busy one is ~1,000/s, and the per-CPU ring still covered all 795 s).
+Of the 8 faults in that window:
+
+```
+0xebf50000  x4 faults   NO map or unmap of this iova anywhere in the 795 s
+0x6925f000  x1          nearest map +230 ms AFTER the fault
+0xe407f000  x2          nearest map/unmap -58 s
+0xe1d00000  x1          nearest -347 s
+```
+
+**Four of eight faults hit an IOVA that was never mapped and never unmapped at any point in 795 seconds of a capture
+holding 252,704 map/unmap events** -- so the translation is not stale, it is **absent, and nothing re-creates it**. That
+moves the question to the descriptor: the device writes to an address the driver has already finished with, which is a
+DMA-mapping lifetime bug, not a TLB or lazy-invalidation one. `0x6925f000` is the exception and worth separating: it is
+**re-mapped 230 ms after** the fault, the profile of a live pool page faulting before its re-map.
+
+The kprobe recipes, corrected against the kernel's own argument order -- the first one was wrong in this page's tool:
+
+```
+iommu_map(domain, iova, paddr, size, prot)        ->  iova=%si size=%cx    # %dx is PADDR, and a probe
+                                                                          # using it printed size=0x138ec90000
+iommu_unmap_fast(domain, iova, size, ...)        ->  iova=%si size=%dx
+```
+
+**A task name can contain a space** (`next-server (v1-8386`), so a regex anchored with `^\s+\S+\s+\[` silently dropped
+**2,176 of 115,941 map lines** -- 1.9 %, which is exactly the fraction that can contain the event being looked for.
+Anchor on the timestamp instead, and reconcile the parse count against `grep -c` before believing a negative.
+
+**And the reverse is just as wrong: a positive must say whether it discriminates.** The same page's cadence is
+workload-dependent -- a later capture on this box (05:40Z, 150 s, one IOVA filtered) found the NVMe paths mapping it
+from `nvme_prep_rq` through `dma_map_phys` and unmapping it from `nvme_pci_complete_batch` through
+`iommu_unmap_fast`, **about 470 times a second**. At that rate a ±30 s window holds ~14,000 unmaps of the page, so
+"the nearest one was 31 us before the fault" is not evidence of anything. **The tool now carries the count**: a
+pairing whose window held more than three unmaps of the same IOVA is printed with
+`[1 of N unmaps of this iova in the window -- NOT discriminating, narrow --window]`. On the burst capture above that
+fires immediately -- the -5.65 s pairing is `1 of 7` -- which is the honest reading of it.
+
+**One probe owns the shared buffer.** A kprobe on `iommu_unmap_fast` with **no filter** wrote 579,000 events and left
+a filtered probe on the same function with **zero** -- the trace ring buffer is shared, so the *narrow* probe (one
+IOVA, one call site) is the one that should be armed, and checking `grep -c '<probe>:' trace` before trusting a
+capture is the same "prove the plumbing" rule two paragraphs up.
+
+
 The question the ordering answers: does a fault follow an unmap of the *same* address, or does it arrive while the
 address is still mapped? The first is a write-after-unmap — the device dirtying a buffer the CPU released, or the driver
 reusing the IOVA for the next request before the device acknowledged the previous one, both NVMe-side ordering questions
@@ -130,6 +267,35 @@ Two things to be careful about, both learned the hard way here:
   old filter stays). Use `echo 0 > .../filter` and read it back.
 * **pick the right symbol.** `iommu_unmap` had zero hits in 5 s on a box doing heavy I/O; `iommu_unmap_fast` had 40,510.
   Probe a known-hot function (`ksys_write`) once to prove the plumbing, then argue about symbols.
+
+## Resolution: the fault stream is a residue of a teardown that does not drain
+
+The investigation ends in `npu/` code, not in the IOMMU, and the evidence for that is the one thing no IOMMU-side hypothesis
+could explain: **the faults outlive the process that caused them** (43 faults after the last holder of `/dev/accel/accel0` had
+exited, on addresses never mapped and never unmapped for the 45 minutes they were watched).
+
+```cpp
+// npu/generate.cpp: the decode loop overlaps host work with the run in flight
+if (more) lane.prepare(next, ctx + 1);   // can throw
+lane.wait(cur);
+
+// npu/lane.cpp: …and end() destroys without draining, on a documented assumption
+// "Destroy the hw_context while it is warm (every run completed)"
+void end() { slots[0].rl.reset(); slots[0].runs.clear(); … ctx.reset(); }
+```
+
+`prepare()` → `layer_kernel()` throws when `ctx + 1 > kMaxContext` — *before* `wait(cur)`. The catch-all in `generate()` then
+calls `end()`, which frees the runlists, the kernels and the hw_context **while the current runlist may still be executing**.
+Every BO under that context is released while the controller is still writing it, and the device keeps DMA-ing into IOVAs whose
+mappings were just torn down.
+
+Trigger: **a generation that rolls past `kMaxContext`.** Prediction for the confirming run: the stream appears after the throw
+and not after a clean run. Fix, cheapest first: drain in `end()`; or guard `ctx + 1 > kMaxContext` *before* launching; reordering
+`wait` before `prepare` is correct but costs the overlap that is deliberate.
+
+The lesson this page earned, in one line: **a stream that continues after its only holder has exited is not a concurrency
+problem — it is something the holder left behind**, and no amount of watching the device's mappings during the fault will find
+it, because the mapping was torn down before the observation began.
 
 ## Validating a capture before you believe it
 

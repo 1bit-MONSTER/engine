@@ -43,9 +43,10 @@
 //                 even e in the low nibble, two's complement
 //   [8192, 8704)  int8 mag, [nb 8][g 4][16 cc], g = (k%128)/32
 //
-// Activations are int8 with one scale per row, host-packed per 32-row tile (the coalesced design's A):
-//   A_packed[rt][ki][mb][kb][r][cc] = A[rt*32 + mb*4 + r][ki*128 + kb*16 + cc]
-// (rt = m/32, mb = 4-row block, r = row in it, kb = 16-K block, cc = k in it).  C is int32 row-major M x N.
+// Activations are int8 with one scale per row, host-packed per tile of mt = a_tile_rows(M) rows (32 for the
+// prefill designs, 16 for the M=16 decode design):
+//   A_packed[rt][ki][mb][kb][r][cc] = A[rt*mt + mb*4 + r][ki*128 + kb*16 + cc]
+// (rt = m/mt, mb = 4-row block, r = row in it, kb = 16-K block, cc = k in it).  C is int32 row-major M x N.
 //
 // The packer's input is the int8 path's own assembled float B (no second scale stream): factor() finds an exact
 // code x per-32 scale form of it or refuses.
@@ -75,7 +76,11 @@ constexpr int GROUP = 32;          // K rows per magnitude
 constexpr int CODE_BYTES = KT * NT / 2;           // 8192
 constexpr int MAG_BYTES = (KT / GROUP) * NT;      // 512
 constexpr int TILE = CODE_BYTES + MAG_BYTES;      // 8704
-constexpr int MT = 32;             // activation rows per A tile (per core row)
+constexpr int MT = 32;             // activation rows per A tile (per core row) of the M % 128 == 0 designs
+
+// The A tile height of a design: the prefill designs (M % 128 == 0) put 32 rows on each of 4 core rows; the M=16
+// decode design puts all 16 rows on its one core row.  0 for an M no W4-g128 design is built for.
+inline int a_tile_rows(int M) { return M > 0 && M % 128 == 0 ? MT : (M == 16 ? 16 : 0); }
 
 inline bool fits(int K, int N) { return K > 0 && N > 0 && K % KT == 0 && N % NT == 0; }
 inline size_t w_bytes(int K, int N) { return (size_t)(K / KT) * (size_t)(N / NT) * TILE; }
@@ -220,16 +225,18 @@ inline void read(const uint8_t* img, int K, int N, int k, int n, int* c, int* ma
 }
 
 // The design's A: int8 rows a[m][ld] (row-major, the int8 path's own quantised rows) -> the packed tile
-// order above.  M % 32 == 0, K % 128 == 0; `out` holds M*K bytes.
+// order above, with tiles of a_tile_rows(M) rows.  M is a design M (16, or a multiple of 128), K % 128 == 0;
+// `out` holds M*K bytes.
 inline bool pack_a(const int8_t* a, int ld, int M, int K, int8_t* out) {
-    if (!a || !out || M % MT || K % KT || ld < K) return false;
+    const int mt = a_tile_rows(M);
+    if (!a || !out || mt == 0 || K % KT || ld < K) return false;
     size_t o = 0;
-    for (int rt = 0; rt < M / MT; rt++)
+    for (int rt = 0; rt < M / mt; rt++)
         for (int ki = 0; ki < K / KT; ki++)
-            for (int mb = 0; mb < MT / 4; mb++)
+            for (int mb = 0; mb < mt / 4; mb++)
                 for (int kb = 0; kb < KT / 16; kb++)
                     for (int r = 0; r < 4; r++) {
-                        std::memcpy(out + o, a + (size_t)(rt * MT + mb * 4 + r) * ld + (size_t)(ki * KT + kb * 16), 16);
+                        std::memcpy(out + o, a + (size_t)(rt * mt + mb * 4 + r) * ld + (size_t)(ki * KT + kb * 16), 16);
                         o += 16;
                     }
     return true;

@@ -45,7 +45,13 @@ import re
 import sys
 
 FAULT_RE = re.compile(r"IO_PAGE_FAULT domain=\S+ address=(0x[0-9a-fA-F]+)")
+# TWO shapes, because there are two ways to capture an unmap and both are in use:
+#   kprobe      `unm: (iommu_unmap_fast+0x4/0x10) iova=0x35540000 size=0x40000`   <- a format string a lane writes
+#   tracepoint  `unmap: IOMMU: iova=0x00000000e4240000 - 0x00000000e4241000 size=4096`   <- events/iommu/unmap
+# The tracepoint carries the same iova and size with fixed widths and a range end; a reader that knows only the
+# kprobe shape reports "no unmap events" on a tracepoint capture and blames the probe (engine#2478).
 UNMAP_RE = re.compile(r"unm:.*iova=(0x[0-9a-fA-F]+)(?:.*size=(0x[0-9a-fA-F]+))?")
+TP_UNMAP_RE = re.compile(r"\bunmap: IOMMU: iova=(0x[0-9a-fA-F]+) .*?size=(\d+)")
 # tracefs puts the timestamp AFTER the comm/pid/cpu/flags fields (` bash-1 [001] .... 100.000000: ev: ...`),
 # so it is searched mid-line, not anchored -- my first version anchored it and parsed nothing.
 EPOCH_RE = re.compile(r"(\d+\.\d+):")
@@ -53,10 +59,6 @@ EPOCH_RE = re.compile(r"(\d+\.\d+):")
 # and a `dmesg`/trace-style capture writes `[1234.567890]` seconds-since-boot. A fault line is only correlatable
 # when its clock is the trace's, so the seconds form is preferred when both appear.
 ISO_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?)")
-# The kernel pads the stamp to a fixed width: `[  321.308031]`, two spaces here and one for values >= 1000 s.
-# Written without the inner `\s*` the regex only matched the unpadded shape a doc example uses, so EVERY real
-# boot-stamped line parsed as untimed and the tool could not correlate on a capture it produced itself --
-# measured 2026-11-16 on `journalctl -k -o short-monotonic`: `[  321.308031] … IO_PAGE_FAULT …` -> t=None.
 BOOT_RE = re.compile(r"^\s*\[\s*(\d+\.\d+)\]")
 
 
@@ -75,10 +77,13 @@ def parse_trace(lines):
         if not m:
             continue
         mu = UNMAP_RE.search(line)
-        if not mu:
+        if mu:
+            size = int(mu.group(2), 16) if mu.group(2) else 0x1000
+            out.append((float(m.group(1)), int(mu.group(1), 16), size))
             continue
-        size = int(mu.group(2), 16) if mu.group(2) else 0x1000
-        out.append((float(m.group(1)), int(mu.group(1), 16), size))
+        mt = TP_UNMAP_RE.search(line)
+        if mt:
+            out.append((float(m.group(1)), int(mt.group(1), 16), int(mt.group(2))))
     return out
 
 
@@ -100,19 +105,24 @@ def parse_faults(lines, journal_epoch):
 
 
 def correlate(unmaps, faults, window_us):
-    """[(fault, delta_us, unmap)] -- the nearest unmap of the same iova within the window, or None."""
+    """[(fault, delta_us, unmap, n)] -- the nearest unmap of the same iova within the window, or None, and how many
+    unmaps of that iova the window held. `n` is the discriminator: a page recycled ~470 times a second puts thousands
+    of unmaps inside a 30 s window, and then "the nearest one" is not evidence of anything."""
     by_iova = {}
     for t, iova, size in unmaps:
         by_iova.setdefault(iova, []).append((t, size))
     rows = []
     for t, iova, text in faults:
         best = None
+        n = 0
         if t is not None:
             for ut, size in by_iova.get(iova, ()):
                 d = (ut - t) * 1e6   # negative = the unmap came first
-                if abs(d) <= window_us and (best is None or abs(d) < abs(best[1])):
-                    best = ((ut, iova, size), d)
-        rows.append((t, iova, text, best))
+                if abs(d) <= window_us:
+                    n += 1
+                    if best is None or abs(d) < abs(best[1]):
+                        best = ((ut, iova, size), d)
+        rows.append((t, iova, text, best, n))
     return rows
 
 
@@ -130,18 +140,31 @@ def pointer_shaped(unmaps):
     return bool(unmaps) and all(u[1] >= IOVA_MAX for u in unmaps)
 
 
+def _span(window_us):
+    """The window as a reader thinks of it: seconds once it is a second or more. `+-30000000 us` is not readable."""
+    return f"{window_us / 1e6:g} s" if window_us >= 1e6 else f"{window_us:.0f} us"
+
+
 def render(rows, unmaps, window_us):
     lines = [f"unmap events parsed: {len(unmaps)} over {len({u[1] for u in unmaps})} distinct iova(s)"]
     if unmaps:
         lines.append(f"  sizes: {sorted({u[2] for u in unmaps})[0]:#x} .. {sorted({u[2] for u in unmaps})[-1]:#x}")
     hit = [r for r in rows if r[3] is not None]
-    lines.append(f"faults parsed: {len(rows)}; with an unmap of the same iova within +-{window_us:.0f} us: {len(hit)}")
-    for t, iova, _text, best in hit[:20]:
+    lines.append(f"faults parsed: {len(rows)}; with an unmap of the same iova within +-{_span(window_us)}: {len(hit)}")
+    for t, iova, _text, best, n in hit[:20]:
         (ut, _u, size), d = best
         verdict = "unmap BEFORE fault (translation gone)" if d < 0 else "unmap AFTER fault (stale mapping or other cause)"
-        lines.append(f"  iova {iova:#x} size {size:#x}: unmap {d:+.0f} us, {verdict}")
+        # A positive must say whether it discriminates. Measured 2026-11-16: one NVMe pool page is mapped and unmapped
+        # ~470 times a second, so a 30 s window holds thousands of unmaps of it and "the nearest" means nothing.
+        disc = "" if n <= 3 else f"  [1 of {n} unmaps of this iova in the window -- NOT discriminating, narrow --window]"
+        lines.append(f"  iova {iova:#x} size {size:#x}: unmap {d:+.0f} us, {verdict}{disc}")
     if rows and not hit:
-        lines.append("  no fault shares an iova with an unmap inside the window: ordering not shown by this capture")
+        # A negative must name its own condition. The same sentence at a 5 ms window and at 30 s read alike, and the
+        # 5 ms one was simply wrong, so the scale is in the line and the remedy is named with it.
+        lines.append(f"  no fault shares an iova with an unmap inside +-{_span(window_us)}: ordering not shown by "
+                     f"this capture AT THIS WINDOW -- the interval is seconds on a sparse stream and sub-millisecond "
+                     f"where the page is recycled (measured 470/s on one NVMe pool page), "
+                     f"so widen --window before reading this as 'no unmap preceded the fault'")
     return lines
 
 
@@ -170,32 +193,66 @@ def self_test():
     # 5. the parser reads a real tracefs line shape
     got = parse_trace(["    bash-1234 [001] .... 100.000000: unm: (iommu_unmap_fast+0x0/0x20) iova=0x4128000 size=0x1000"])
     chk(len(got) == 1 and got[0][1] == 0x4128000 and got[0][2] == 0x1000, "a tracefs unmap line parses (iova, size)")
+    # engine#2478: the tracepoint shape parses beside the kprobe shape. Both are real captures of the same call,
+    # and a reader that knows only one of them reports "no unmap events" on the other.
+    chk(parse_trace(["          <idle>-0  [030] d.h1.  100.5: unmap: IOMMU: iova=0x00000000e4240000 - "
+         "0x00000000e4241000 size=4096 unmapped_size=4096"])
+         == [(100.5, 0xE4240000, 4096)], "a tracepoint unmap line parses (iova, size)")
+    chk(parse_trace(["   x-1 [0] d.h1. 100.0: unm: (iommu_unmap_fast+0x4) iova=0x35540000 size=0x40000"])
+        == [(100.0, 0x35540000, 0x40000)], "... and the kprobe shape still parses beside it")
+
     # 6. a pointer-shaped iova column is refused, not reported as "nothing correlated". My first recipe named %di/%si
     #    for a (domain, iova, size) function, which put the domain pointer here and made every capture uncorrelatable.
     ptr = parse_trace(["    pi-1-1 [016] d.h.. 358.053875: unm: (iommu_unmap_fast+0x4/0x10) "
                        "iova=0xffff8e83841c3a00 size=0x45ec0"])
     chk(pointer_shaped(ptr), "a pointer-shaped iova column is detected, not read as uncorrelated")
     chk(not pointer_shaped(got), "a real IOVA column is not mistaken for one")
-    # 7. the REAL kernel stamp is PADDED (`[  321.308031]`, two spaces; `[    0.000000]` early in a dmesg). The doc
-    #    example above writes the unpadded `[1234.567890]`, and an arm built only from it passed while every real
-    #    capture parsed as untimed -- the tool then reported "nothing correlated" on data it had just been given.
-    padded = "[  321.308031] strixhalo kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged " \
-             "[IO_PAGE_FAULT domain=0x0015 address=0x4128000]"
-    pf = parse_faults([padded], lambda _s: None)
-    chk(pf and pf[0][0] == 321.308031, "a padded boot stamp parses (measure with journalctl -k -o short-monotonic)")
-    ptr_tr = parse_trace(["   bash-1 [002] .... 321.308000: unm: (iommu_unmap_fast) iova=0x4128000 size=0x1000"])
-    hits = correlate(ptr_tr, pf, 5000)
-    chk(hits and hits[0][3] and hits[0][3][1] < 0,
-        "a padded fault correlates with an unmap 31 us earlier (BEFORE, not an uncorrelated negative)")
+    # 7. the window reads in seconds once it is seconds, and a negative names the window it used. A default alone
+    #    does not fix the failure I am fixing: 30 s finding nothing printed the same sentence 5 ms did.
+    #    The fault is 100 s from any unmap: at 30 s that is still a miss, which is the shape a too-narrow window gives.
+    out = " ".join(render(correlate(unm, [(300.000, 0x4128000, "f5")], 30_000_000), unm, 30_000_000))
+    chk("+-30 s" in out and "30000000 us" not in out, "a 30 s window reads as '+-30 s', not '+-30000000 us'")
+    chk("AT THIS WINDOW" in out and "sparse stream" in out,
+        "a negative names the window it used and the measured interval, not 'nothing correlated' bare")
+    chk("+-5000 us" in " ".join(render(correlate(unm, [(100.500, 0x4128000, "f3")], 5000), unm, 5000)),
+        "a sub-second window still reads in microseconds")
+    # 8. the REAL kernel stamp is PADDED: `[  321.308031]` (two spaces; one at >= 1000 s, four in early dmesg). Written
+    #    without the inner `\s*`, BOOT_RE matched only the unpadded shape the doc example uses, so every real line parsed
+    #    as untimed and nothing could correlate (#2622). #2625 rewrote the arms above and dropped this one, and with it
+    #    the pre-#2622 regex passed every arm again -- so it is pinned here, at both the parse and the correlation.
+    padded = ["[  321.308031] strixhalo kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged "
+              "[IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0000]",
+              "[    0.000000] strixhalo kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged "
+              "[IO_PAGE_FAULT domain=0x0015 address=0x4129000 flags=0x0000]"]
+    pf = parse_faults(padded, lambda _s: None)
+    chk([f[0] for f in pf] == [321.308031, 0.0], "padded boot stamps parse (two- and four-space padding)")
+    near = parse_trace(["   bash-1 [002] .... 321.308000: unm: (iommu_unmap_fast+0x4/0x10) iova=0x4128000 size=0x1000"])
+    hit = correlate(near, pf[:1], 30_000_000)
+    chk(hit and hit[0][3] is not None and hit[0][3][1] < 0,
+        "a padded fault correlates with an unmap 31 us earlier (BEFORE), not an uncorrelated negative")
+    # 9. a POSITIVE must say whether it discriminates: a page recycled hundreds of times a second puts thousands of
+    #    unmaps in a wide window, and then "the nearest one" is not evidence. Measured 2026-11-16: one NVMe pool page
+    #    is mapped and unmapped ~470 times a second (nvme_prep_rq maps it, nvme_pci_complete_batch unmaps it).
+    hot = [(100.0 + i * 0.001, 0x4128000, 0x1000) for i in range(500)]   # 500 unmaps over 0.5 s
+    hr = correlate(hot, [(100.4, 0x4128000, "f6")], 30_000_000)
+    chk(hr[0][4] == 500 and "NOT discriminating" in " ".join(render(hr, hot, 30_000_000)),
+        "a page recycled hundreds of times a second is flagged as not discriminating")
+    chk("NOT discriminating" not in " ".join(render(correlate(unm, [(100.0005, 0x4128000, "f1")], 5000), unm, 5000)),
+        "a lone unmap in the window is not flagged")
     return 0 if ok else 1
-
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--trace", help="a tracefs capture with a kprobe on the unmap path")
     ap.add_argument("--journal", action="append", help="kernel-log lines (repeatable; default stdin)")
-    ap.add_argument("--window", type=float, default=5000.0, help="window in microseconds (default 5000)")
+    # 30 s, not 5 ms: measured on this box 2026-11-16, three of four faults had an unmap of the SAME 4 KiB page
+    # 5.6 s / 24.7 s / 24.7 s earlier, and a 5 ms default answered "no fault shares an iova with an unmap" on the
+    # very capture that contains them. The interval is seconds here; a small default hides the finding.
+    ap.add_argument("--window", type=float, default=30_000_000.0,
+                    help="window in microseconds (default 30,000,000 = 30 s). The interval is seconds on a sparse stream "
+                         "and sub-millisecond on a recycled page (470/s measured), so the count of unmaps in the "
+                         "window is reported: a pairing with many candidates is not evidence")
     ap.add_argument("--epoch-offset", type=float, default=0.0,
                     help="seconds to add to journal stamps to reach the trace's boot clock")
     ap.add_argument("--self-test", action="store_true")
@@ -211,6 +268,18 @@ def main():
         print(f"unmap_fault_order: {e}", file=sys.stderr)
         return 2
     if not unmaps:
+        # "no unmap events" covers two different situations and only one of them is about the probe. A capture with
+        # lines that match neither known shape is a PARSER miss, and telling the reader to check their probe sends
+        # them to the wrong place (engine#2478: a tracepoint capture was reported as "was the probe armed?").
+        try:
+            n_lines = sum(1 for _ in read_lines(args.trace))
+        except OSError:
+            n_lines = 0
+        if n_lines > 1:   # a header line alone is a genuinely empty capture
+            print(f"unmap_fault_order: {n_lines} line(s) in the trace and none of them is an unmap in either known "
+                  "shape (kprobe `unm: ... iova=` or tracepoint `unmap: IOMMU: iova=...`): this is a parser miss, "
+                  "not an empty capture -- show --self-test the line you have", file=sys.stderr)
+            return 3
         print("unmap_fault_order: no unmap events in the trace -- an empty capture is not a negative; was the "
               "probe armed before the load, and did it fire? (see --self-test for the four shapes)", file=sys.stderr)
         return 3

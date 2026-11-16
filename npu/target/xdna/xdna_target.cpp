@@ -339,7 +339,10 @@ bool XdnaTarget::weight_cached(int layer, int key) const {
 bool XdnaTarget::fill_int8_and_w4(PackedWeight& pw, I8Ctx& kctx, int role, const float* Bmat, int K, int N,
                                   std::string& err) {
     const bool in_range = role >= 0 && role < Q4NX_MAX_DESIGNS;
-    I8Ctx* c8 = !kctx.w4g32 ? &kctx : (in_range && ctx16_[role] ? ctx16_[role].get() : nullptr);
+    // The int8 image is needed only by a context that launches this role's layer GEMMs as int8: kctx itself, or the
+    // role's int8 twin while the w4g32 decode family is not adopted (with it, decode runs ctx16w_ and no int8 role image
+    // is ever read).
+    I8Ctx* c8 = !kctx.w4g32 ? &kctx : (in_range && ctx16_[role] && !w4_decode_ ? ctx16_[role].get() : nullptr);
     I8Ctx* c4 = kctx.w4g32 ? &kctx
                            : (w4_rows_ > 0 && in_range && ctx_[role] && ctx_[role]->w4g32 ? ctx_[role].get() : nullptr);
     float sout = 1.0f;
@@ -496,12 +499,12 @@ int XdnaTarget::design_index(I8Ctx* c) const {
     if (!c) return -1;
     for (int i = 0; i < ndesigns_ && i < Q4NX_MAX_DESIGNS; i++)
         if (ctx_[i].get() == c || (ctx16_[i] && ctx16_[i].get() == c) || (ctxw_[i] && ctxw_[i].get() == c) ||
-            (ctxn_[i] && ctxn_[i].get() == c))
+            (ctxn_[i] && ctxn_[i].get() == c) || (ctx16w_[i] && ctx16w_[i].get() == c))
             return i;
     return -1;
 }
 
-I8Ctx* XdnaTarget::ctx_for(I8Ctx* prefill, int rows, bool decode_twin) {
+I8Ctx* XdnaTarget::ctx_for(I8Ctx* prefill, int rows, bool decode_twin, bool int8_only) {
     // Rows that fit one M=16 row-block (decode's 1 row, or a short prompt's
     // prefill chunk of <= 16) run the cheap twin: the M=128 kernel streams the
     // same weights but walks 128 baked MAC rows to deliver <= 16, and a request
@@ -512,8 +515,18 @@ I8Ctx* XdnaTarget::ctx_for(I8Ctx* prefill, int rows, bool decode_twin) {
     // projection that has no M=128 kernel at all.
     if (!m16_) return prefill;
     if (!decode_twin && (rows < 1 || rows > 16)) return prefill;
-    for (int i = 0; i < ndesigns_ && i < Q4NX_MAX_DESIGNS; i++)
-        if (ctx_[i].get() == prefill && ctx16_[i]) return ctx16_[i].get();
+    for (int i = 0; i < ndesigns_ && i < Q4NX_MAX_DESIGNS; i++) {
+        if (ctx_[i].get() != prefill) continue;
+        // NPU_W4_PREFILL: the role's decode-width layer GEMMs run the w4g32 M=16 context.
+        if (!int8_only && w4_decode_ && ctx16w_[i]) return ctx16w_[i].get();
+        if (ctx16_[i]) return ctx16_[i].get();
+        // The LM head (int8_only) on a role whose int8 twin was not opened (the w4g32 decode family keeps only the head
+        // role's): any int8 twin with the same K serves it -- the head launches its own tile images, never this role's.
+        if (int8_only)
+            for (int j = 0; j < ndesigns_ && j < Q4NX_MAX_DESIGNS; j++)
+                if (ctx16_[j] && !ctx16_[j]->w4g32 && ctx16_[j]->KD == prefill->KD) return ctx16_[j].get();
+        return prefill;
+    }
     return prefill;
 }
 
@@ -704,8 +717,14 @@ bool decode_elf_exists(const std::string& p) {
 bool XdnaTarget::open_decode_family(Q4nxDesignGeom* designs16, int n, const std::string& sealed_elf,
                                     int* made, int* skipped, std::string& err) {
     int made_n = 0, skipped_n = 0;
+    // NPU_W4_PREFILL with a w4g32 M=16 ELF for every role: the int8 twins would serve only the LM head (its tile images
+    // are int8), and a process gets 16 hardware contexts on this driver -- 6 w4 prefill + 7 int8 twins + 6 w4 decode is
+    // 19, and the 17th init_elf failed with "device error (code 102): Invalid argument" (2026-11-16, bonsai2-27b-NPU).
+    // So open the int8 twin of the head's role only (the widest K = hidden design); open_w4_decode() opens the rest.
+    const int i_head = w4_decode_head_role(designs16, n);
     for (int i = 0; i < n; i++) {
         if (designs16[i].M <= 0) { ++skipped_n; continue; }
+        if (i_head >= 0 && i != i_head) continue;   // this role's decode runs the w4g32 M=16 context
         std::string elf, kname = "main:seq";
         if ((setup_.pb16i || setup_.b8) && !sealed_elf.empty()) {
             // One ELF for every phase: the file is the same for all roles and only the instance name
@@ -792,6 +811,63 @@ bool XdnaTarget::open_decode_family(Q4nxDesignGeom* designs16, int n, const std:
     note_m16_made(made_n > 0);
     if (made) *made = made_n;
     if (skipped) *skipped = skipped_n;
+    if (w4_rows_ > 0) open_w4_decode(designs16, n);
+    if (w4_decode_) note_m16_made(true);   // ctx_for() routes decode width through m16_
+    return true;
+}
+
+// The head's role when the w4g32 decode family will be opened (every design that can take a decode twin has its
+// "<stem>_w4g32_m16.elf" on disk): the widest K = hidden design, whose int8 twin is then the only int8 decode context.
+// -1 when the family will not be opened, which keeps every int8 twin.
+int XdnaTarget::w4_decode_head_role(const Q4nxDesignGeom* designs16, int n) const {
+    if (w4_rows_ <= 0 || setup_.pb16i || setup_.b8 || setup_.host_gemm) return -1;
+    int i_head = -1;
+    for (int i = 0; i < n && i < Q4NX_MAX_DESIGNS; i++) {
+        if (designs16[i].M <= 0) continue;
+        std::string stem(designs_[i].elf_name);
+        if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, ".elf") == 0) stem.resize(stem.size() - 4);
+        if (!elf_present(setup_.kernels_dir + "/" + stem + "_w4g32_m16.elf")) return -1;
+        if (designs16[i].K == setup_.hidden && (i_head < 0 || designs16[i].N > designs16[i_head].N)) i_head = i;
+    }
+    return i_head;
+}
+
+// NPU_W4_PREFILL, decode width: every role that has an int8 M=16 twin also opens "<its prefill stem>_w4g32_m16.elf" from
+// the kernels directory, all roles or none (otherwise the decode launches would need the int8 images after all).  When
+// adopted, ctx_for() routes the roles' decode-width layer GEMMs to these contexts and a weight-cache fill builds only the
+// w4g32 image -- the int8 role images are never packed, which is what keeps a 27B pack inside the box's memory (both
+// images together OOM-killed it on 2026-11-15).  The int8 twins stay: they are the LM head's context, whose own tile
+// images are int8.
+bool XdnaTarget::open_w4_decode(const Q4nxDesignGeom* designs16, int n) {
+    w4_decode_ = false;
+    std::string why;
+    std::vector<std::string> elfs((size_t)n);
+    for (int i = 0; why.empty() && i < n && i < Q4NX_MAX_DESIGNS; i++) {
+        if (designs16[i].M <= 0 || !ctx_[i]) continue;
+        std::string stem(designs_[i].elf_name);
+        if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, ".elf") == 0) stem.resize(stem.size() - 4);
+        const std::string f = setup_.kernels_dir + "/" + stem + "_w4g32_m16.elf";
+        if (!elf_present(f)) why = "no " + stem + "_w4g32_m16.elf in " + setup_.kernels_dir;
+        else elfs[(size_t)i] = f;
+    }
+    for (int i = 0; why.empty() && i < n && i < Q4NX_MAX_DESIGNS; i++) {
+        if (elfs[(size_t)i].empty()) continue;
+        ctx16w_[i] = std::make_unique<I8Ctx>();
+        I8Ctx* c = ctx16w_[i].get();
+        c->MD = 16; c->KD = designs16[i].K; c->ND = designs16[i].N;
+        c->w4g32 = true;
+        if (!c->init_elf(*dev_, elfs[(size_t)i].c_str(), 16, designs16[i].K, designs16[i].N, 1))
+            why = "init_elf failed for " + elfs[(size_t)i] + (c->init_error.empty() ? "" : ": " + c->init_error);
+    }
+    if (!why.empty()) {
+        for (auto& c : ctx16w_) c.reset();
+        std::fprintf(stderr, "  [forward] w4g32 decode family NOT adopted (%s); decode stays on the int8 twins\n",
+                     why.c_str());
+        return false;
+    }
+    w4_decode_ = true;
+    std::fprintf(stderr, "  [forward] w4g32 decode family: every decode role at M=16 (NPU_W4_PREFILL); "
+                         "int8 role images are not packed\n");
     return true;
 }
 
@@ -1210,7 +1286,7 @@ void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::stri
                 K, N, ar.layer, kctx.short_row_, kctx.canary_retries_);
     }
 
-    if (m16_check_ && &kctx != &ctx)
+    if (m16_check_ && &kctx != &ctx && kctx.w4g32 == ctx.w4g32)
         m16_check_gemm(ctx, kctx, A, K, N, Bmat, slot ? slot_bo(*slot, kctx) : nullptr, as);
 
     if (prof) {
@@ -1502,7 +1578,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
         for (int n = 0; n < N; n++)
             o[n] = (float)cm[n] * asc * (*gs)[(size_t)n];
     }
-    if (m16_check_ && &kctx != &ctx)
+    if (m16_check_ && &kctx != &ctx && kctx.w4g32 == ctx.w4g32)
         m16_check_gemm_rows(ctx, kctx, A, M, K, N, slot ? slot_bo(*slot, kctx) : nullptr,
                             ascales);
     // NPU_W4_CHECK=1: the w4g32 launch against the float reference sum_k A[m][k] * Bmat[k][n] on a sample of rows and

@@ -58,6 +58,7 @@ STAMP = re.compile(r"^\[\s*(\d+\.\d+)\]")
 
 
 ACCEL = "amdxdna"   # the driver whose node the sampler's holders describe
+WEAK_AFTER_S = 5.0    # nearest-sample distance past which an attribution is reported as weak (engine#2627)
 
 
 def faults(text):
@@ -113,8 +114,20 @@ def attribute(rows, boots, max_gap, any_device=False):
         if sec is None:
             out.append((sec, addr, "NO SAMPLE: the line carries no kernel timestamp"))
             continue
-        before = [r for r in rows if r[0] <= sec]
-        after = [r for r in rows if r[0] > sec]
+        # A GAP row is written when the sampler RESUMES (accel_sampler.sh: `printf '%s\tGAP\t%s' "$NOW" "$((NOW - LAST))"`),
+        # so a row at epoch E with length L describes the stall (E-L, E] -- BEFORE its own timestamp. A fault is
+        # "stalled" when such a span covers it; GAP rows are never a sample to attribute to, before or after
+        # (review of engine#2623: reading the row as "the last sample before t" called faults AFTER a stall stalled,
+        # and named "pid GAP" as the next holder for faults INSIDE one).
+        stall = next((r for r in rows if r[1] == "GAP" and _gap_len(r[2]) is not None
+                      and r[0] - _gap_len(r[2]) < sec <= r[0]), None)
+        if stall is not None:
+            out.append((sec, addr, "NO SAMPLE: the sampler was stalled across this fault (a %ss gap ending at %d)"
+                        % (stall[2], stall[0])))
+            continue
+        real = [r for r in rows if r[1] != "GAP"]
+        before = [r for r in real if r[0] <= sec]
+        after = [r for r in real if r[0] > sec]
         if not before:
             out.append((sec, addr, "NO SAMPLE: no sample at or before the fault"))
             continue
@@ -125,27 +138,39 @@ def attribute(rows, boots, max_gap, any_device=False):
         if pid == "-":
             out.append((sec, addr, "NOTHING HELD: sampled at the node, no accel client held it"))
             continue
-        if pid == "GAP":
-            # engine#2624: the sampler writes a GAP row when it slept too long to sample. That is the absence of an
-            # observation, NOT a process called GAP -- attributing a fault here would invent a holder.
-            out.append((sec, addr, "NO SAMPLE: the sampler was stalled across this fault (GAP row %s)" % ticket))
-            continue
-        who = f"pid {pid} {ticket[:64]}"
+        # How far away the evidence was, on every line: engine#2627 measured nearest-sample distances of median 1 s,
+        # p90 27 s, max 45 s on ITS capture (this sampler: median 2 s, p90 3 s, max 93 s). With 18 tickets holding the
+        # node per hour the odds the holder changed inside the gap are 2.5 % at 5 s, 13.5 % at 27 s, 22.5 % at 45 s --
+        # so the distance is the difference between strong and weak evidence rather than a detail.
+        age = sec - epoch
+        who = f"pid {pid} {ticket[:64]} (sample {age:.0f}s before)"
         if after and after[0][1] != pid:
             # Name the other side: a window would name both and stop; this says which one is the guess
             # and what the next observation saw. '-' there is "nothing held it", not a process named '-'.
             nxt = "nothing held the node" if after[0][1] == "-" else f"pid {after[0][1]}"
             out.append((sec, addr, f"HANDOVER-ADJACENT: {who} (next sample: {nxt})"))
-        else:
+        elif age <= WEAK_AFTER_S:
             out.append((sec, addr, f"ATTRIBUTED: {who}"))
+        else:
+            # Visible as weak, not dropped and not called strong (engine#2627: report the distance, do not filter on it).
+            out.append((sec, addr, f"ATTRIBUTED-WEAK: {who}, the node changes hands every ~200s on this box"))
     return out
+
+
+def _gap_len(field):
+    """Seconds of a GAP row's length field, or None when it is not a number (a malformed row covers nothing)."""
+    try:
+        return int(field)
+    except (TypeError, ValueError):
+        return None
 
 
 def yield_line(res):
     """The number that decides whether a sampling run can answer the question at all."""
     # Every verdict must be counted, or the summary says "0 of everything" about a capture full of faults -- the
     # silent-drop class this file exists to avoid. "NOT THE ACCEL NODE" is a fifth outcome, not a footnote.
-    k = {"ATTRIBUTED": 0, "HANDOVER-ADJACENT": 0, "NOTHING HELD": 0, "NO SAMPLE": 0, "NOT THE ACCEL NODE": 0}
+    k = {"ATTRIBUTED-WEAK": 0, "ATTRIBUTED": 0, "HANDOVER-ADJACENT": 0, "NOTHING HELD": 0, "NO SAMPLE": 0,
+         "NOT THE ACCEL NODE": 0}   # WEAK first: the tally prefixes on these keys
     for _, _, v in res:
         for key in k:
             if v.startswith(key):
@@ -153,9 +178,11 @@ def yield_line(res):
                 break
     n = len(res)
     total = sum(k.values())
-    return ("faults: %d; attributable %d, ambiguous %d, nothing-held %d, no-sample %d, other-device %d"
-            % (n, k["ATTRIBUTED"], k["HANDOVER-ADJACENT"], k["NOTHING HELD"], k["NO SAMPLE"],
-               k["NOT THE ACCEL NODE"])) + ("" if total == n else "  !! %d fault(s) uncounted" % (n - total))
+    total = sum(k.values())
+    line = ("faults: %d; attributable %d (weak %d), ambiguous %d, nothing-held %d, no-sample %d, other-device %d"
+            % (n, k["ATTRIBUTED"] + k["ATTRIBUTED-WEAK"], k["ATTRIBUTED-WEAK"], k["HANDOVER-ADJACENT"],
+               k["NOTHING HELD"], k["NO SAMPLE"], k["NOT THE ACCEL NODE"]))
+    return line + ("" if total == n else "  !! %d fault(s) uncounted" % (n - total)) + ("" if total == n else "  !! %d fault(s) uncounted" % (n - total))
 
 
 def outlook(rows, windows):
@@ -238,6 +265,42 @@ def fmt_fault(sec, addr, verdict):
     return "%s\t%s\t%s" % ("-" if sec is None else "%.0f" % sec, addr, verdict)
 
 
+def drop_pre_boot(rows, boot_epoch):
+    """[(epoch, pid, ticket)] with samples from a previous boot removed.
+
+    Kernel stamps are boot-relative, so a fault's absolute time is (this boot's epoch + stamp). A samples.log that
+    straddles a reboot -- kept across one, or copied from an earlier capture -- holds epochs from BEFORE that boot,
+    and the gap test is `fault - sample <= max_gap`, so a fault in the first seconds after a reboot falls within
+    max_gap of a sample taken hours earlier and would be attributed to a holder that cannot have been running.
+
+    This landed on a branch that merged before the commit reached it, so it is restored here (engine#2623).
+    """
+    if boot_epoch is None:
+        return rows, 0
+    kept = [r for r in rows if r[0] >= boot_epoch]
+    return kept, len(rows) - len(kept)
+
+
+def distances(rows):
+    """How far a fault would be from its nearest sample, predicted from a trace with no faults in it.
+
+    A fault lands at a random time, so its nearest-sample distance is distributed like the gaps between samples.
+    engine#2627 measured the real thing on ITS capture (median 1 s, p90 27 s, max 45 s; 24 of 119 beyond 10 s). Those
+    numbers are that hour's load, not this box's: the running sampler here reads median 2 s, p90 3 s, max 93 s, and the
+    max is the same lapse the sampler records as a GAP. So the same statistic computed from the samples alone, which is what tells a capture's owner -- before any fault -- whether the
+    sampler is dense enough to attribute one, and whether a run will be dominated by WEAK verdicts.
+    """
+    ts = [r[0] for r in rows]
+    gaps = sorted(b - a for a, b in zip(ts, ts[1:]) if b >= a)
+    if not gaps:
+        return None
+    n = len(gaps)
+    return {"n": n, "median": gaps[n // 2], "p90": gaps[min(n - 1, n * 9 // 10)], "max": gaps[-1],
+            "within2": 100.0 * sum(1 for g in gaps if g <= 2) / n,
+            "within5": 100.0 * sum(1 for g in gaps if g <= 5) / n,
+            "within10": 100.0 * sum(1 for g in gaps if g <= 10) / n}
+
+
 def self_test():
     # One hour of holders, one sample per 100 s, handing over at 300.
     rows = [(0, "111", "gpu-hold cl-a pid 1 t0"), (100, "111", "gpu-hold cl-a pid 1 t0"),
@@ -254,7 +317,7 @@ def self_test():
         head = v.split(":")[0]
         return "NO SAMPLE" if head.startswith("NO SAMPLE") else head
     got = [kind(v) for _, _, v in res]
-    assert got == ["ATTRIBUTED", "HANDOVER-ADJACENT", "NOTHING HELD", "ATTRIBUTED", "NO SAMPLE"], res
+    assert got == ["ATTRIBUTED-WEAK", "HANDOVER-ADJACENT", "NOTHING HELD", "ATTRIBUTED", "NO SAMPLE"], res   # 50 s is WEAK
     assert "cl-a" in res[0][2] and "pid 111" in res[0][2], res[0]
     # The handover verdict must NAME both sides: naming one is the failure mode of a window. Here the
     # handover is to 'nobody', which must read as words rather than as a process called '-'.
@@ -266,7 +329,7 @@ def self_test():
     assert hand[0][2].startswith("HANDOVER-ADJACENT"), hand
     assert "pid 111" in hand[0][2] and "pid 222" in hand[0][2], hand
     assert "no accel client held it" in res[2][2], res[2]      # not "I did not look"
-    assert yield_line(res) == ("faults: 5; attributable 2, ambiguous 1, nothing-held 1, no-sample 1, other-device 0"), yield_line(res)
+    assert yield_line(res) == ("faults: 5; attributable 2 (weak 1), ambiguous 1, nothing-held 1, no-sample 1, other-device 0"), yield_line(res)
 
     # --max-gap decides freshness, and a smaller gap converts ATTRIBUTED into NO SAMPLE rather than
     # silently attributing across a long unobserved stretch.
@@ -321,8 +384,19 @@ def self_test():
     gap_log = "1000\t-\t-\t-\t-\t-\n1010\tGAP\t93\t-\t-\t-\n"
     gap_rows = rows_from_text(gap_log)
     assert gap_rows == [(1000, "-", "-"), (1010, "GAP", "93")], gap_rows   # the note carries the gap length
-    assert attribute(gap_rows, [(1015.0, "0x1", True)], 150)[0][2].startswith("NO SAMPLE"), attribute(gap_rows, [(1015.0, "0x1", True)], 150)
-    assert "stalled" in attribute(gap_rows, [(1015.0, "0x1", True)], 150)[0][2]
+    # The GAP row at 1010 with length 93 is the stall (917, 1010], written on RESUME: a fault inside it is stalled,
+    # a fault after it is not (review of engine#2623 -- the first version read it the other way round).
+    inside = attribute(gap_rows, [(1005.0, "0x1", True)], 150)[0][2]
+    assert inside.startswith("NO SAMPLE") and "stalled" in inside, inside
+    after_gap = attribute(gap_rows, [(1015.0, "0x1", True)], 150)[0][2]
+    assert "stalled" not in after_gap, after_gap
+    # and a stall between two holders never names a holder called GAP
+    hand = rows_from_text("900\t111\t1\t/a\ts\tgpu-hold cl-a\n910\tGAP\t10\t-\t-\t-\n912\t222\t1\t/b\ts\tgpu-hold cl-b\n")
+    for t in (899.5, 905.0, 911.0):
+        v = attribute(hand, [(t, "0x1", True)], 15)[0][2]
+        assert "GAP" not in v.replace("a 10s gap", ""), (t, v)
+    assert "stalled" in attribute(hand, [(905.0, "0x1", True)], 15)[0][2]
+    assert attribute(hand, [(911.0, "0x1", True)], 15)[0][2].startswith("HANDOVER-ADJACENT: pid 111")
     # ... and it is not a holder for the outlook either: with a real holder after it, the window still sees one.
     mixed = gap_rows + [(1020, "1234", "gpu-hold cl-a pid 9")]
     assert outlook(mixed, [5])[0][1] > 0.0, outlook(mixed, [5])   # some windows span the real holder
@@ -336,8 +410,26 @@ def self_test():
     # The summary must account for every fault: a verdict missing from the tally makes "0 of everything" look like
     # an empty capture. This arm would have printed 0/0/0/0 for 137 NVMe faults before the counter was added.
     assert yield_line([(1.0, "0x1", "NOT THE ACCEL NODE: other device")]) == (
-        "faults: 1; attributable 0, ambiguous 0, nothing-held 0, no-sample 0, other-device 1"), \
+        "faults: 1; attributable 0 (weak 0), ambiguous 0, nothing-held 0, no-sample 0, other-device 1"), \
         yield_line([(1.0, "0x1", "NOT THE ACCEL NODE: other device")])
+
+    # A far sample is reported as WEAK rather than dropped or called certain (engine#2627), and the tally splits it.
+    weak = attribute([(1000, "1234", "gpu-hold cl-a pid 9")], [(1030.0, "0x1", True)], 150)
+    assert weak[0][2].startswith("ATTRIBUTED-WEAK"), weak
+    assert yield_line(weak).startswith("faults: 1; attributable 1 (weak 1)"), yield_line(weak)
+
+    # The distance distribution must be computable from a quiet trace, and must be the same statistic #2627 measured
+    # on real faults. 4 gaps of 1 s and one of 20 s: median 1, p90 20, 80 % within 2 s.
+    dd = distances([(0, "a", ""), (1, "a", ""), (2, "a", ""), (3, "a", ""), (4, "a", ""), (24, "a", "")])
+    assert (dd["n"], dd["median"], dd["p90"], dd["max"]) == (5, 1, 20, 20), dd
+    assert abs(dd["within2"] - 80.0) < 0.01 and dd["within5"] == 80.0, dd
+    assert distances([(0, "a", "")]) is None, "one sample has no gaps"
+
+    # A samples.log from a previous boot must not be joined to this boot's faults (see drop_pre_boot): the gap test
+    # would match a fresh fault against a sample taken hours earlier.
+    assert drop_pre_boot([(100, "111", "old"), (110, "111", "old")], 1000) == ([], 2)
+    assert drop_pre_boot([(100, "111", "old"), (1200, "222", "new")], 1000) == ([(1200, "222", "new")], 1)
+    assert drop_pre_boot([(100, "111", "old")], None) == ([(100, "111", "old")], 0), "no boot epoch: filter nothing"
 
     # Stamps and addresses are parsed, and non-fault lines are ignored.
     text = ("[1234.500000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0007]\n"
@@ -384,6 +476,8 @@ def main():
                          "holders describe /dev/accel, so attributing another device's fault is a category error)")
     ap.add_argument("--attributed", default=None,
                     help="sampler attributed.log: print its windowed hits beside this tool's verdict")
+    ap.add_argument("--distances", action="store_true",
+                    help="print the nearest-sample distance distribution a fault would see (no faults needed)")
     ap.add_argument("--outlook", type=float, nargs="*", metavar="W",
                     help="print attributability for these +-W windows and exit (no faults needed)")
     ap.add_argument("--selftest", "--self-test", dest="self_test", action="store_true")
@@ -394,9 +488,38 @@ def main():
         return 0
     if not args.samples:
         ap.error("--samples is required unless --self-test")
+    # The modes all print a report and exit, so combining them silently dropped one (review of #2640: `--attributed`
+    # ran first and `return 0`d, so `--distances` printed nothing). Refuse the combination instead of picking one:
+    # a flag that answers a question must never be answered by a different question.
+    modes = [name for name, on in (("--attributed", args.attributed), ("--distances", args.distances),
+                                   ("--outlook", bool(args.outlook))) if on]
+    if len(modes) > 1:
+        ap.error("%s are separate reports: run them one at a time" % " and ".join(modes))
+    boot = args.boot_epoch
+    if boot is None:
+        with open("/proc/stat", encoding="utf-8") as f:
+            boot = float(next(int(l.split()[1]) for l in f if l.startswith("btime")))
+    if args.distances:
+        rows, _ = drop_pre_boot(samples(args.samples), boot)
+        d = distances(rows)
+        if d is None:
+            print("no sample gaps in this trace: nothing to measure")
+            return 0
+        print("gaps %d  median %.0fs  p90 %.0fs  max %.0fs" % (d["n"], d["median"], d["p90"], d["max"]))
+        print("nearest sample within 2s: %.1f%%, within 5s: %.1f%%, within 10s: %.1f%%"
+              % (d["within2"], d["within5"], d["within10"]))
+        print("an attribution past %.0fs is reported WEAK (ATTRIBUTED-WEAK)" % WEAK_AFTER_S)
+        return 0
     if args.attributed:
-        rows = samples(args.samples)
+        rows, _ = drop_pre_boot(samples(args.samples), boot)
         pairs = attributed_rows(open(args.attributed, encoding="utf-8", errors="replace").read())
+        # What agree/disagree MEANS, on every run: it compares this tool's verdict against the sampler's own `hits`
+        # LIST, so a window naming two holders is DISAGREE by design -- a window listing two lanes is not
+        # corroboration. That makes the column a measure of HOLDER TURNOVER, not of either rule's correctness: on a
+        # stable holder the nearest sample (either side) and the last preceding sample name the same holder (measured
+        # here: 279 of 281 faults, 99.3 %), so the two rules coincide whenever turnover is low.
+        print("# agree/disagree compares the sampler's windowed hits with this tool's verdict: a window naming two "
+              "holders is DISAGREE by design, so the count measures HOLDER TURNOVER, not rule correctness")
         ds = disagreements(rows, pairs, args.max_gap)
         for epoch, hits, verdict, agree in ds:
             print(fmt_attr(epoch, hits, verdict, agree))
@@ -405,19 +528,19 @@ def main():
                                                       sum(1 for d in ds if not d[3])))
         return 0
     if args.outlook:
-        rows = samples(args.samples)
+        rows, _ = drop_pre_boot(samples(args.samples), boot)
         print("window  one-holder  ambiguous  nothing-held  no-sample")
         for w, one, amb, nothing, none in outlook(rows, args.outlook):
             print(fmt_outlook_row(w, one, amb, nothing, none))
         return 0
 
-    boot = args.boot_epoch
-    if boot is None:
-        with open("/proc/stat", encoding="utf-8") as f:
-            boot = float(next(int(l.split()[1]) for l in f if l.startswith("btime")))
     text = sys.stdin.read() if args.dmesg == "-" else open(args.dmesg, encoding="utf-8", errors="replace").read()
 
     rows = samples(args.samples)
+    rows, dropped = drop_pre_boot(rows, boot)
+    if dropped:
+        print("note: %d sample(s) predate this boot (btime %d) and were ignored: a fault's absolute time is "
+              "boot + kernel stamp, so they cannot describe this boot" % (dropped, boot), file=sys.stderr)
     boots = [(None if s is None else boot + s, a, acc) for s, a, acc in faults(text)]
     res = attribute(rows, boots, args.max_gap, any_device=args.any_device)
     for sec, addr, verdict in res:

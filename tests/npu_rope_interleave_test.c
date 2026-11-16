@@ -27,9 +27,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 static int failures = 0;
+/* write a config owner-only (0600): fopen() would create it 0666 subject to the umask */
+static int write_cfg(const char* path, const char* text) {
+    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -1;
+    FILE* f = fdopen(fd, "w");
+    if (!f) { close(fd); return -1; }
+    fputs(text, f);
+    return fclose(f);
+}
 static void check(int ok, const char* what) {
     if (!ok) { printf("FAIL %s\n", what); ++failures; }
 }
@@ -77,14 +87,16 @@ int main(void) {
     char cfg[512];
     snprintf(cfg, sizeof cfg, "%s/config.json", dir);
     Q4nxSemantics s;
-    FILE* f = fopen(cfg, "w");
-    fputs("{\"model_type\": \"chatglm\", \"hidden_size\": 64, \"num_hidden_layers\": 2, \"rope_interleaved\": true}", f);
-    fclose(f);
+    if (write_cfg(cfg, "{\"model_type\": \"chatglm\", \"hidden_size\": 64, \"num_hidden_layers\": 2, \"rope_interleaved\": true}") != 0) {
+        printf("FAIL write config\n");
+        return 1;
+    }
     q4nx_semantics_from_config(cfg, dir, &s);
     check(s.rope_interleaved == 1, "config rope_interleaved: true -> semantics rope_interleaved = 1");
-    f = fopen(cfg, "w");
-    fputs("{\"model_type\": \"llama\", \"hidden_size\": 64, \"num_hidden_layers\": 2}", f);
-    fclose(f);
+    if (write_cfg(cfg, "{\"model_type\": \"llama\", \"hidden_size\": 64, \"num_hidden_layers\": 2}") != 0) {
+        printf("FAIL write config\n");
+        return 1;
+    }
     q4nx_semantics_from_config(cfg, dir, &s);
     check(s.rope_interleaved == 0, "control: no key -> rope_interleaved = 0 (half-split stays the default)");
     remove(cfg);

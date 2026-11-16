@@ -207,6 +207,20 @@ def self_test():
         "a negative names the window it used and the measured interval, not 'nothing correlated' bare")
     chk("+-5000 us" in " ".join(render(correlate(unm, [(100.500, 0x4128000, "f3")], 5000), unm, 5000)),
         "a sub-second window still reads in microseconds")
+    # 8. the REAL kernel stamp is PADDED: `[  321.308031]` (two spaces; one at >= 1000 s, four in early dmesg). Written
+    #    without the inner `\s*`, BOOT_RE matched only the unpadded shape the doc example uses, so every real line parsed
+    #    as untimed and nothing could correlate (#2622). #2625 rewrote the arms above and dropped this one, and with it
+    #    the pre-#2622 regex passed every arm again -- so it is pinned here, at both the parse and the correlation.
+    padded = ["[  321.308031] strixhalo kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged "
+              "[IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0000]",
+              "[    0.000000] strixhalo kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged "
+              "[IO_PAGE_FAULT domain=0x0015 address=0x4129000 flags=0x0000]"]
+    pf = parse_faults(padded, lambda _s: None)
+    chk([f[0] for f in pf] == [321.308031, 0.0], "padded boot stamps parse (two- and four-space padding)")
+    near = parse_trace(["   bash-1 [002] .... 321.308000: unm: (iommu_unmap_fast+0x4/0x10) iova=0x4128000 size=0x1000"])
+    hit = correlate(near, pf[:1], 30_000_000)
+    chk(hit and hit[0][3] is not None and hit[0][3][1] < 0,
+        "a padded fault correlates with an unmap 31 us earlier (BEFORE), not an uncorrelated negative")
     return 0 if ok else 1
 
 

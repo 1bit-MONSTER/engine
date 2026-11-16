@@ -125,6 +125,33 @@ def yield_line(res):
             % (n, k["ATTRIBUTED"], k["HANDOVER-ADJACENT"], k["NOTHING HELD"], k["NO SAMPLE"]))
 
 
+def outlook(rows, windows):
+    """How many faults a given window COULD attribute, from the holder timeline alone.
+
+    Measured on a 1816-sample hour of this box: +-5 s names two holders for 33 % of samples and
+    widening makes it worse, because 18 tickets held the node in that hour. Printing that before a
+    capture starts is the difference between "run it for a day and hope" and knowing the sampler's
+    window cannot answer the question.
+    """
+    out = []
+    for w in windows:
+        one = amb = nothing = none = 0
+        for epoch, _pid, _ticket in rows:
+            near = [(e, p) for e, p, _t in rows if abs(e - epoch) <= w]
+            holders = {p for _e, p in near if p != "-"}
+            if not near:
+                none += 1
+            elif not holders:
+                nothing += 1
+            elif len(holders) == 1:
+                one += 1
+            else:
+                amb += 1
+        n = len(rows) or 1
+        out.append((w, 100.0 * one / n, 100.0 * amb / n, 100.0 * nothing / n, 100.0 * none / n))
+    return out
+
+
 def self_test():
     # One hour of holders, one sample per 100 s, handing over at 300.
     rows = [(0, "111", "gpu-hold cl-a pid 1 t0"), (100, "111", "gpu-hold cl-a pid 1 t0"),
@@ -166,6 +193,12 @@ def self_test():
     assert no_stamp == [(None, "0x4128000")], no_stamp
     assert attribute(rows, no_stamp, 150)[0][2].startswith("NO SAMPLE"), attribute(rows, no_stamp, 150)
 
+    # The outlook is computed, not asserted from a constant: a window wide enough to cover two
+    # different holders must report ambiguity, and one narrower than the gap must not.
+    ol = {w: (one, amb) for w, one, amb, _n, _z in outlook(rows, [5, 400])}
+    assert ol[5][0] == 80.0 and ol[5][1] == 0.0, ol   # 4 of 5: the 200s sample IS the "-" row, so it is nothing-held
+    assert ol[400][1] > 0.0, ol                               # 400s spans the handover -> ambiguous
+
     # Stamps and addresses are parsed, and non-fault lines are ignored.
     text = ("[1234.500000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0007]\n"
             "[1235.000000] unrelated kernel line\n")
@@ -181,6 +214,8 @@ def main():
                     help="epoch of boot, so kernel stamps become absolute (default: /proc/stat btime)")
     ap.add_argument("--max-gap", type=float, default=15.0,
                     help="oldest usable sample before a fault, in seconds (default 15)")
+    ap.add_argument("--outlook", type=float, nargs="*", metavar="W",
+                    help="print attributability for these +-W windows and exit (no faults needed)")
     ap.add_argument("--selftest", "--self-test", dest="self_test", action="store_true")
     args = ap.parse_args()
 
@@ -189,6 +224,12 @@ def main():
         return 0
     if not args.samples:
         ap.error("--samples is required unless --self-test")
+    if args.outlook:
+        rows = samples(args.samples)
+        print("window  one-holder  ambiguous  nothing-held  no-sample")
+        for w, one, amb, nothing, none in outlook(rows, args.outlook):
+            print("%5.0fs  %9.1f%%  %8.1f%%  %11.1f%%  %8.1f%%" % (w, one, amb, nothing, none))
+        return 0
 
     boot = args.boot_epoch
     if boot is None:

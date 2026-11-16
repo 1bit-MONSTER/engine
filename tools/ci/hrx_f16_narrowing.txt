@@ -114,7 +114,7 @@ loom-libs/ops/mul_mat_symmetric_i8_wmma.loom	1
 loom-libs/ops/rmsnorm_binary_f32.loom	2
 loom-libs/ops/rope_set_rows_f32.loom	2
 loom-libs/ops/rows/get_rows_rmsnorm_binary_q8_1_x4_f16.loom	1
-loom-libs/ops/set_rows.loom	2
+loom-libs/ops/set_rows.loom	3
 loom-libs/ops/small_rows_f32.loom	1
 qwen_moe/ggml/linear_q6k_q8_1_x4.loom	1
 qwen_moe/ggml/quantize_q8_1_x4.loom	2

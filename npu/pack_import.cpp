@@ -5696,8 +5696,45 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
         if (!mul_ok(uint64_t(wt.length ? wt.length : wt.raw_len), 1, need) || need == 0)
             throw std::runtime_error(mm.weight + ": no external length recorded");
         std::string derr;
-        const Q4 pack = decode_external_tile_padded(bytes_of(wt, need), size_t(need), int(mm.N), int(mm.K), mm.real_N,
-                                                    mm.real_K, derr);
+        Q4 pack;
+        // engine#2686: a plain com.microsoft MatMulNBits in this genre -- Gemma-3-4b-it-mm 1.7's decoder head: qweight
+        // [262208, 80, 16] (K/block x block/2 per row, block 32) with real f16 scales and qzeros -- is the standard ONNX
+        // layout, not the packed tile. It is decoded as such; the head then takes the gemma sqrt(H) prescale the
+        // embedding already carries (as import_pack's head path does).
+        const auto si = mm.scales.empty() ? onnx.index.end() : onnx.index.find(mm.scales);
+        const bool standard = wt.dims.size() == 3 && si != onnx.index.end() && !onnx.tensors[si->second].dims.empty() &&
+                              onnx.tensors[si->second].dims[0] > 0;
+        if (standard) {
+            if (mm.bits != 4 || mm.block <= 0 || mm.K % mm.block || mm.K % 32)
+                throw std::runtime_error(mm.weight + ": MatMulNBits geometry this reader does not take (bits " +
+                                         std::to_string(mm.bits) + ", block " + std::to_string(mm.block) + ")");
+            const uint64_t groups = uint64_t(mm.N) * uint64_t(mm.K / mm.block);
+            const OnnxTensor& st = onnx.tensors[si->second];
+            std::vector<float> sc(static_cast<size_t>(groups), 0.0f);
+            if (st.type == kF32) {
+                std::memcpy(sc.data(), bytes_of(st, groups * 4), size_t(groups) * 4);
+            } else if (st.type == kF16 || st.type == kBF16) {
+                const auto* d = reinterpret_cast<const uint16_t*>(bytes_of(st, groups * 2));
+                for (uint64_t i = 0; i < groups; ++i) sc[size_t(i)] = st.type == kF16 ? f16_to_f32(d[i]) : bf16_to_f32(d[i]);
+            } else {
+                throw std::runtime_error(mm.scales + ": scales of dtype " + std::to_string(st.type) + " are not read here");
+            }
+            const uint8_t* zp = nullptr;
+            if (!mm.zeros.empty())
+                if (const auto zi = onnx.index.find(mm.zeros); zi != onnx.index.end() && !onnx.tensors[zi->second].dims.empty())
+                    zp = bytes_of(onnx.tensors[zi->second], uint64_t(mm.N) * uint64_t((mm.K / mm.block + 1) / 2));
+            pack = decode_matmulnbits(bytes_of(wt, groups * uint64_t(mm.block / 2)), sc.data(), zp, int(mm.N), int(mm.K),
+                                      mm.block);
+            if (!zp) implicit_zp_zero(pack, zp_bits_for_spelling(mm.weight, mm.bits));
+            if (std::strcmp(role, "HEAD") == 0 && pack.K == int(p.dims.hidden) &&
+                gemma_prescale_head(pack, p.dims.model_type, p.dims.hidden))
+                std::fprintf(stderr, "note: %s is a standard MatMulNBits (block %d), read as such and prescaled by "
+                                     "sqrt(%lld) for the gemma head (engine#2686)\n",
+                             mm.weight.c_str(), mm.block, (long long)p.dims.hidden);
+        } else {
+            pack = decode_external_tile_padded(bytes_of(wt, need), size_t(need), int(mm.N), int(mm.K), mm.real_N,
+                                               mm.real_K, derr);
+        }
         if (!derr.empty()) throw std::runtime_error(mm.weight + ": " + derr);
         const Q4 conv = container_from_external_q4(pack);
         std::vector<ContainerTensor> outs;

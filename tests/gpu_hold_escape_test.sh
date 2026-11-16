@@ -33,6 +33,9 @@
 #      outside control died too, the run SKIPS (77) instead of claiming a pass.
 #   4. the hold SAYS it did it: the engine#2741 warning names the escaped pid. This is the arm a script without the
 #      detector fails, whatever the box does to sleepers.
+#   5. a NESTED hold is not an escapee (engine#2737): with GPU_HOLD_ALLOW_NESTED=1 the inner gpu-hold runs with the OUTER
+#      ticket line in its environment by design, and killing it would leave its ticket file behind and block the queue.
+#      The detector must leave a process whose own command IS gpu-hold alone.
 #
 # No device: every claim runs on a private queue and a sandboxed HOME.
 set -u
@@ -100,6 +103,22 @@ else
     echo "        its own (MemAvailable $(awk '/MemAvailable/{printf "%.0f MiB", $2/1024}' /proc/meminfo)); arm 4 above is"
     echo "        the decisive one. Re-run on a calm box for the outcome arm."
     kill -KILL ${escaped:-} 2> /dev/null
+fi
+
+# 5. a nested holder survives the outer teardown: it manages its own teardown, and killing it would wedge the queue
+# setsid, because a nested holder in the payload's own group is killed by the group kill and would test that instead
+out5=$(env "${env_common[@]}" timeout 90 bash "$HOLD" -l escape-nest -t 0.5 -- bash -c '
+    setsid bash -c "echo \$\$ > \"$4\"; GPU_HOLD_ALLOW_NESTED=1 GPU_TOKEN_FILE=\"$3\" exec bash \"$1\" -q \"$2\" -l inner-nest -t 3 -- sleep 8" > /dev/null 2>&1 &
+    for _ in 1 2 3 4 5 6; do [ -s "$4" ] && break; sleep 0.5; done
+    echo "INNER=$(cat "$4" 2>/dev/null)"
+    exit 0' _ "$HOLD" "$tmp/inner-queue" "$tmp/inner-token" "$tmp/inner.pid" 2>&1)
+inner=$(printf '%s\n' "$out5" | sed -n 's/^INNER=//p' | head -1)
+if [ -n "$inner" ] && kill -0 "$inner" 2> /dev/null; then
+    echo "  PASS arm5: the nested gpu-hold (pid $inner) was left alone -- it manages its own teardown"
+    kill -KILL "$inner" 2> /dev/null
+else
+    echo "  FAIL arm5: the nested holder (pid ${inner:-<none>}) was killed by the outer teardown, which leaves its ticket file behind and blocks the queue (engine#2737)"
+    fails=$((fails + 1))
 fi
 
 if [ "$fails" = 0 ]; then echo "gpu_hold_escape: pass (arm4 decisive; see arm1/arm3 for the outcome)"; exit 0; fi

@@ -1841,6 +1841,11 @@ add_test(NAME npu_w4g32_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_w4g32_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
                  ${CMAKE_SOURCE_DIR}/tests/npu_w4g32_layout_test.cpp)
+# engine#2599's decision (npu/target/xdna/elf_twin.h): a prefill ELF runs at 16 rows only when it is byte-identical to
+# the _m16 twin of its own stem.  Every arm, on files it writes itself; no device.
+add_executable(npu_elf_twin_test tests/npu_elf_twin_test.cpp)
+target_include_directories(npu_elf_twin_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
+add_test(NAME npu_elf_twin COMMAND npu_elf_twin_test)
 # The t2s weight stream (q4nx_weight_layout "t2s"): the same integer-exact weights at 2.125 b/w,
 # expanded on the core.  Its host-side contract is the file size, so the test pins the tile against
 # the numbers tools/q4nx_t2s.py measured on a real image (50,135,040 -> 23,674,880 B for gate/up).

@@ -20,6 +20,7 @@
 //
 // docs/npu-p4-target-split.md records what moved in A1 and what A2 (plan-driven setup) still owes.
 #include "target/xdna/xdna_target.h"
+#include "target/xdna/elf_twin.h"   // engine#2599: a prefill ELF that is its own _m16 twin
 #include "target/xdna/launch_fit.h"   // engine#1783: refuse a launch its context cannot hold
 #include "batch_width.h"
 #include "file_create.h"   // dumps are created 0600, never through a symlink
@@ -195,7 +196,18 @@ bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string&
             err = "cannot create a context for role " + std::to_string(i);
             return false;
         }
-        const int md = w4_rows_ ? w4_rows_ : g->M;
+        int md = w4_rows_ ? w4_rows_ : g->M;
+        if (!w4_rows_) {
+            // engine#2599 (the w4g32 tier opens its own M=512 ELF instead, so this does not apply to it)
+            const std::string twin = onebit::npu::m16_twin_path(dir, g->elf_name);
+            if (md > Q4NX_DESIGN_M_DECODE && onebit::npu::same_artifact(elf, twin)) {
+                md = Q4NX_DESIGN_M_DECODE;
+                prefill_is_decode_design_ = true;
+                std::fprintf(stderr, "  [forward] %-3s %s is byte-identical to its _m16 twin: it is the %d-row design, so "
+                                     "this role launches %d rows at a time, not %d (engine#2599)\n",
+                             q4nx_design_log_tag(g->role), g->elf_name, md, md, g->M);
+            }
+        }
         ctx->MD = md; ctx->KD = g->K; ctx->ND = g->N;
         ctx->blocked_b = b8;
         ctx->w4g32 = w4_rows_ > 0;
@@ -242,8 +254,12 @@ bool XdnaTarget::open(const onebit::npu::plan::Plan& plan, const std::string& ke
         if (ctx_[i] && ctx_[i]->MD > adopted_prefill) adopted_prefill = ctx_[i]->MD;
         if (ctx16_[i] && ctx16_[i]->MD > adopted_decode) adopted_decode = ctx16_[i]->MD;
     }
-    // The w4g32 tier is a runtime choice (NPU_W4_PREFILL) over the plan's int8 set, at its own M: not a disagreement.
-    if (plan_.prefill_m > 0 && adopted_prefill > 0 && plan_.prefill_m != adopted_prefill && adopted_prefill != w4_rows_)
+    // engine#2599: a pack whose "prefill" ELFs are byte-identical to the decode twins states the design geometry's M in
+    // its plan (bonsai2-27b-NPU: prefill.M = 128) but its kernels compute 16 rows; open_prefill() said so by name, and
+    // launching at the kernel's real width is the fix, not a disagreement with the plan.  The w4g32 tier is a runtime
+    // choice (NPU_W4_PREFILL) over the plan's int8 set, at its own M: not a disagreement either.
+    if (plan_.prefill_m > 0 && adopted_prefill > 0 && plan_.prefill_m != adopted_prefill && !prefill_is_decode_design_ &&
+        adopted_prefill != w4_rows_)
         { err = "plan: prefill M=" + std::to_string(plan_.prefill_m) + " but the adopted kernels run M=" +
                 std::to_string(adopted_prefill); return false; }
     if (plan_.decode_enabled && plan_.decode_m > 0 && adopted_decode > 0 &&

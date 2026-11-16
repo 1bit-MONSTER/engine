@@ -261,6 +261,7 @@ private:
     std::unique_ptr<I8Ctx> ctxw_[Q4NX_MAX_DESIGNS];   // the wide pb16i/t2s family (engine#1990)
     int wide_rows_ = 0;                               // 0 = no wide family
     int w4_rows_ = 0;                                 // NPU_W4_PREFILL: the w4g32 prefill tier's M (0 = off)
+    bool prefill_is_decode_design_ = false;           // engine#2599: the prefill ELFs are the _m16 artifacts
     std::unique_ptr<I8Ctx> ctxn_[Q4NX_MAX_DESIGNS];   // the narrow pb16i/t2s family (decode)
     int narrow_rows_ = 0;                             // 0 = no narrow family
     std::unique_ptr<I8Ctx> ctx_head_;

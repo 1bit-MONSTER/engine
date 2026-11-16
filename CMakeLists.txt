@@ -466,6 +466,10 @@ add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py
 # flagged 10 of those on a clean tree), so a separator counts only inside an unterminated conflict block.
 add_python_test(conflict_marker ${CMAKE_SOURCE_DIR}/tools/ci/conflict_marker_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(conflict_marker_self ${CMAKE_SOURCE_DIR}/tools/ci/conflict_marker_check.py --self-test)
+# engine#2478: the map side, so the "stale translation" question can be asked of a capture instead of argued about.
+# An unfiltered 795 s capture with 252,704 map/unmap events showed four of eight faults on an IOVA that was never
+# mapped and never unmapped anywhere in the window -- absent and never re-created, not stale.
+add_python_test(iommu_map_side_self ${CMAKE_SOURCE_DIR}/tools/diag/iommu_map_side.py --self-test)
 # engine#803 gate, second half: the comparator that turns two --dump-logits directories into the KLD verdict the
 # P4 gate asks for. No device and no model, so the gate is one command when a ticket is free; the self-test pins
 # the four cases a KLD implementation gets wrong (identical -> exactly 0, a shift is positive and directional, a

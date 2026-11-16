@@ -85,8 +85,13 @@ exchange at load. The two files need not agree: FastFlowLM's
 `Qwen3.5-2B-NPU2` container names `<|endoftext|>` in the first and `<|im_end|>` in the second, and the model ends a
 chat turn with the second. And neither file has to name the turn end at all: FastFlowLM's
 `Phi4-mini-Instruct-NPU2` names `<|endoftext|>` in both, its template closes every turn with `<|end|>`, and before
-the template was consulted its answer ran on past `Paris<|end|><|assistant|>` to the token budget. The load prints
-the list (`forward-serve: stops on …`).
+the template was consulted its answer ran on past `Paris<|end|><|assistant|>` to the token budget. The exchange's user
+turn is tried in three shapes, and the first one that renders is used: a plain string, list content
+(`[{"type":"text",...}]`), and translategemma's list content with `source_lang_code` / `target_lang_code`.
+translategemma's template raises on a plain string (engine#2604), and its pack names only `eos_token_id: 1`. With
+only the plain probe, "Le chat dort sur la table." ran on as `<end_of_turn><end_of_turn>…` to the budget; it now
+stops after 7 tokens. The load prints the list (`forward-serve: stops on …`), and names the shape when it was not
+the plain one.
 
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the OpenAI-compatible API
 ([serve.md](serve.md)); inside Lemonade, that is what its `onebit` backend runs (`--onebit npu`).
@@ -1669,6 +1674,42 @@ are `[128]`, i.e. 256 B, which is why the section between them is 320 B on both 
 their hidden sizes differ). `plan()` accepts a block of 2 or 4 headers, checks each section against
 that arithmetic to the byte, and refuses any other count by name. FACTS §7.24 has the tables and
 the checkpoint evidence.
+
+**gemma3 carries six headers, and two block sizes** (engine#2604). The 1.8 gemma3 packs
+(`translategemma-4b-it_rai_1.8.0_npu_4K`, and `Gemma-3-4b_rai_1.8.0_npu_16K`, whose Token `.fconst`
+is the same size, 2,189,399,392 B) are the Qwen3 block plus Gemma-3's two feed-forward norms:
+
+| header | section after it |
+|---|---|
+| h0 `input_layernorm` | k, q, v tiles at K = hidden (k 0-15, q 16-47, v 48-63 at hidden 2560) |
+| h1 `k_norm` | bf16 `[head_dim]` |
+| h2 `q_norm` | bf16 `[head_dim]`, then (sliding-window layers only) `4 x kv_heads` records of 8 B, then o_proj |
+| h3 `post_attention_layernorm` | bf16 `[hidden]` |
+| h4 `pre_feedforward_layernorm` | bf16 `[hidden]`, then the MLP (the Qwen3 format) |
+| h5 `post_feedforward_layernorm` | bf16 `[hidden]` |
+
+The global-attention layers (every sixth: 5, 11, 17, 23, 29 of 34) do not carry the 8-byte records,
+each of which is bf16 `0xFF7F` (about -3.4e38) followed by zeros. Those layers are 32 B shorter, so the
+blocks are not one stride: `fconst_six_header_blocks()` takes each layer's start from its own header
+(all 6 x layers + 1 of them, read in the strict 64-byte form), stores the global form, and gives every
+layer a shift of 0 or the field's size, applied from o_proj on. The import checks the field byte for
+byte before reading past it. The order and contents were checked against an independent reference,
+`amd/Gemma-3-4b-it-mm-onnx-ryzenai-npu`, whose norms are f32 initializers and whose projections are
+`.packed` blobs. All six norms equal it exactly in layers 0, 5 and 33. o_proj is byte-identical to the
+reference's `.packed` at +32 on a local layer and at +0 on a global one, and k and v are tile-for-tile
+identical at tiles 0-15 and 48-63.
+
+**The embedding is pre-scaled.** A gemma pack stores its embedding multiplied by sqrt(hidden), and so
+does the forward (`embed_scale`); on a tied model the LM head divides that factor back out. The pack's
+4-bit head, though, is the raw table: best-fit scale 50.33 against sqrt(2560) = 50.60. So
+`gemma_prescale_head()` multiplies the head's scales and zeros by sqrt(hidden) before it is tiled and
+self-checked, which is exact for an affine code. Every head gate then runs unchanged: on
+translategemma the fit is scale 0.995, rms ratio 1.0014, rel 1.12x its 4-bit floor. Device (chat route, translategemma's own content shape):
+English to French gives "Le chat dort sur la table." (stop, 7 tokens), and English to German gives "Wo ist der
+Bahnhof?" (stop, 5 tokens). In the Gemma turn format, "What is the capital of France?" gives "The capital of France
+is... Paris."
+`Gemma-3-4b_rai_1.8.0_npu_16K` still refuses, because its `config.json` is empty (`{}`) and nothing in
+the pack states `intermediate_size`.
 
 **A 2-header block can carry the gains too, in the other order** (engine#1889, engine#1934). The
 Hunyuan packs declare `use_qk_norm: true` and keep one header per block: the gains are the 640 B

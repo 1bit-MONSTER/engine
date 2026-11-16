@@ -23,12 +23,17 @@
 # This drives the real `summary()` in a subshell with a synthetic sample file and a background reader, and asserts
 # every observation is one of the two complete sizes. Hermetic: temp dir, no device, no sampler.
 #
-# usage: bash tests/accel_sampler_summary_test.sh [tools/diag/accel_sampler.sh]
-#   rc 0 all arms pass, 1 an arm failed
+# usage: bash tests/accel_sampler_summary_test.sh [SOURCE_DIR]
+#   rc 0 all arms pass, 1 an arm failed, 2 cannot tell (no sampler / it does not parse)
+#
+# $1 is the REPO ROOT, not the sampler: that is the convention every registered shell row here uses
+# (`base_modes`, `hw_gate_kept_log`, …), and ctest passes ${CMAKE_SOURCE_DIR}. The first version of this
+# script took the sampler path there and the CI row failed in 0.00 s with `no sampler at /__w/engine/engine`.
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-sampler=${1:-$here/../tools/diag/accel_sampler.sh}
+root=${1:-$here/..}
+sampler=$root/tools/diag/accel_sampler.sh
 [ -f "$sampler" ] || { echo "accel_sampler_summary_test: no sampler at $sampler" >&2; exit 2; }
 bash -n "$sampler" || { echo "accel_sampler_summary_test: $sampler does not parse" >&2; exit 2; }
 

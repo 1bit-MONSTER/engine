@@ -786,6 +786,25 @@ copies the key into `decode.sealed_elf`, and the plan accepts a sealed ELF for `
 well as pb16i. The ELF is built for one model's shapes; naming it for a pack with other shapes is a
 container error, as with pb16i.
 
+**Sharing the NPU: one width, one context per model (#2689).** With the driver's spatial placement
+(`amdxdna temporal_only=0`), two processes can run on separate column halves at the same time. That only
+works if each model holds exactly one hardware context at one width. The driver gives a process's second
+same-width context the other free half, and it refuses a 4-column context next to an 8-column one in the
+same process. Two settings make a model fit that rule:
+- `NPU_PARTITION=<cols>`: partition mode. Every full ELF the model opens must declare `<cols>` columns in
+  its `.note.xrt.configuration` (`elf_partition.h`), or the load is refused naming the file and its width.
+  The first ELF creates the model's one context, and every later ELF is added to it
+  (`hw_context::add_config`) instead of opening its own. Unset, nothing changes.
+- `NPU_I8_SEALED_PREFILL_ELF=<file>`: one sealed M=128 ELF for a b8 container's prefill roles.
+  - Its instances are the decode names with a `p_` prefix (`main:p_qkvfa`, `main:p_o`, `main:p_gu`,
+    `main:p_d`; `q4nx_i8_sealed_prefill_instance`). One context cannot hold two instances with the same
+    key: the runtime refuses the second ELF, measured as `code 501: main:d`.
+  - In partition mode a role this ELF does not cover is refused, because its per-role ELF would be a
+    second `main:seq` in the context.
+
+A model set up this way uses `NPU_I8_SEALED_ELF` (decode) and `NPU_I8_SEALED_PREFILL_ELF` (prefill), both
+built at the same width, e.g. with npu-kernels `sealed/build.sh … -c 4 --partition 4`.
+
 #### The t2s family is M=16 today, and that is what caps prefill (#1416)
 
 Measured, not inferred: a t2s container's kernel set contains **only `*_t2s2_m16.elf`** for 8 of the nine decode roles, and the engine reports the

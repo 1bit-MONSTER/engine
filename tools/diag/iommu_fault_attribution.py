@@ -292,6 +292,20 @@ def self_test():
     text = ("[1234.500000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0007]\n"
             "[1235.000000] unrelated kernel line\n")
     assert faults(text) == [(1234.5, "0x4128000")], faults(text)
+
+    # THE KERNEL PADS THE STAMP, and the unpadded form above is not what it writes: two spaces at 321 s, four below
+    # 10 s (`[    0.000000]`). engine#2622 shipped a reader whose regex required a digit straight after `[`, matched
+    # nothing on real captures, and reported "ordering not shown by this capture" -- a negative for input it should
+    # have matched. `^\[\s*(...)` handles both widths, and this fixture is what keeps that true.
+    padded = ("[  321.308031] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0000]\n"
+              "[    0.000000] amdxdna 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0003 address=0x4130000 flags=0x0007]\n")
+    assert faults(padded) == [(321.308031, "0x4128000"), (0.0, "0x4130000")], faults(padded)
+
+    # A capture in the human-readable form (`dmesg -T`, journalctl default) carries NO stamp this parser can use.
+    # The verdict must say it cannot read the file, not that the kernel showed no ordering.
+    human = "[Sun Nov 15 08:53:39 2026] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT address=0x4128000]\n"
+    assert faults(human) == [(None, "0x4128000")], faults(human)
+    assert attribute(rows, faults(human), 150)[0][2].startswith("NO SAMPLE"), attribute(rows, faults(human), 150)
     # EVERY OUTPUT LINE IS EXERCISED. engine#2602 shipped a renderer that crashed on the first real log
     # because its self-test only asserted the analysis; a tool that cannot print is not a tool that works.
     assert fmt_attr(105, "111", "ATTRIBUTED: pid 111 x", True).endswith("\tATTRIBUTED: pid 111 x")

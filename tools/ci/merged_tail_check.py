@@ -126,7 +126,7 @@ def same_head(frozen, tip):
     return tip.lower().startswith(frozen.lower()[:7]) or frozen.lower().startswith(tip.lower()[:7])
 
 
-def branch_mode(repo, branch, base_ref):
+def branch_mode(repo, branch, base_ref, merged_head=None):
     """List the commits on `branch` that are not on `base_ref` -- the recovery workflow.
 
     A PR-list scan answers "is anything lost?"; this answers "what of MY branch never landed?",
@@ -134,7 +134,7 @@ def branch_mode(repo, branch, base_ref):
     """
     if git(repo, "rev-parse", "--verify", "-q", branch).returncode != 0:
         return None
-    tail = merge_commits(repo, branch, base_ref)
+    tail = merge_commits(repo, branch, base_ref, merged_head)
     if tail is None:
         return None
     for sha, subject in tail:
@@ -144,9 +144,18 @@ def branch_mode(repo, branch, base_ref):
     return tail
 
 
-def merge_commits(repo, ref, base_ref):
-    """Commits reachable from `ref` and not from `base_ref` -- the branch's tail."""
-    r = git(repo, "rev-list", "--format=%h %s", f"{base_ref}..{ref}")
+def merge_commits(repo, ref, base_ref, merged_head=None):
+    """Commits reachable from `ref` and not from `base_ref` -- the branch's tail.
+
+    `merged_head` (folded in from engine#2683) subtracts the PR's own history rather than replacing the
+    base with it: `base..ref ^merged_head`. Subtracting is the tighter of the two, because a branch
+    rebased onto a newer base after its PR merged carries the base's commits, which `merged_head..ref`
+    would re-examine. For a non-squash merge the frozen head IS an ancestor of the base, so the
+    exclusion removes nothing and every existing LOST keeps its meaning -- a detector fix may only
+    remove false positives.
+    """
+    specs = [f"{base_ref}..{ref}"] + ([f"^{merged_head}"] if merged_head else [])
+    r = git(repo, "rev-list", "--format=%h %s", *specs)
     if r.returncode != 0:
         return None
     lines = [ln for ln in r.stdout.splitlines() if ln and not ln.startswith("commit ")]
@@ -342,7 +351,7 @@ def scan(repo, days, limit, base_url=None, prs=None):
         # Against the frozen head the same question has one answer: what did the push add?
         frozen = pr.get("headRefOid") or ""
         if frozen and git(repo, "cat-file", "-e", f"{frozen}^{{commit}}").returncode == 0:
-            tail = merge_commits(repo, ref, frozen)
+            tail = merge_commits(repo, ref, base_ref, frozen)
             origin = f"after the merged head {frozen[:7]}"
         else:
             tail = merge_commits(repo, ref, base_ref)
@@ -496,14 +505,26 @@ def self_test():
     branch(r, "pr", c2)            # back on the branch at c2 = the frozen head
     c3 = commit(r, "tool.py", "def a():\n    return 1\n\n\ndef b():\n    return 2\n\n\n"
                               "def c():\n    return 3\n", "pushed after the merge")
-    tail = merge_commits(r, "pr", c2)
-    chk(1, len(tail), "from the frozen head the tail is the one commit pushed after the merge")
+    tail = merge_commits(r, "pr", "main", c2)      # the shipped call: base-relative, minus the frozen head
+    chk(1, len(tail), "excluding the frozen head, the tail is the one commit pushed after the merge")
     chk(True, tail[0][0] and c3.startswith(tail[0][0]),
         "and it is that commit, not the authored ones")
     chk(False, any(c1.startswith(sha) or c2.startswith(sha) for sha, _ in tail),
         "neither authored commit is re-litigated after the squash")
     chk(3, len(merge_commits(r, "pr", "main")),
-        "against the base the tail is the WHOLE branch history -- the #2679 false positive")
+        "without the exclusion the tail is the WHOLE branch history -- the #2679 false positive")
+
+    # The exclusion SUBTRACTS the PR's history rather than replacing the base with it, which is what
+    # makes it right when the branch was rebased onto a newer base after the merge: those base commits
+    # are in `base..ref` and would otherwise be re-examined as if they were post-merge work.
+    branch(r, "main", "pr~1")
+    commit(r, "other.txt", "a commit main gained while the PR sat merged\n", "main moves on")
+    branch(r, "pr", c3)
+    commit(r, "tool.py", "def a():\n    return 1\n\n\ndef b():\n    return 2\n\n\n"
+                         "def c():\n    return 3\n\n\ndef d():\n    return 4\n",
+           "rebased onto the newer base, then pushed")
+    chk(1, len(merge_commits(r, "pr", "main", c3)),
+        "a rebased branch's tail is still only its own new commit, not the base it was rebased onto")
     d.cleanup()
 
     # The tail set itself: a branch tip equal to the base has no tail.

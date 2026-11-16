@@ -57,6 +57,12 @@ add_test(NAME install_coder_llm_ticketed COMMAND bash ${CMAKE_SOURCE_DIR}/tests/
 # is itself killing sleepers.
 add_test(NAME gpu_hold_escape COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_escape_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 
+# engine#2494: a lane learns AT QUEUE TIME that its take will be refused. Since the shared GPU_FAULT_RE was deployed, an
+# NPU line sat inside the take-time window for 27 % of one day while the GPU logged nothing, so a GPU lane queues, waits,
+# and loses the position to a refusal it could have predicted. The warning is the same pattern read over the same window
+# and decides nothing -- the refusal at take is still the authority, because a queue wait can outlast the condition.
+add_test(NAME gpu_hold_queue_state COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_state_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
 # engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
 # queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
 # Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a

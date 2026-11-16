@@ -298,6 +298,23 @@ while [ "$state" = queued ]; do
         exit 75
     fi
     reap_token
+    # engine#2494: say it AT QUEUE TIME, not only at take. A ticket granted while the last N minutes carry a fault line is
+    # refused (the check below, #2480/#2498), and since the shared pattern covers both devices an NPU burst refuses GPU
+    # tickets too: measured 2026-11-16, an NPU line sat inside that window for **27 % of the day** while the GPU itself
+    # logged nothing. From a queue position a lane cannot see that, so it waits and then loses the position to a refusal
+    # it could have predicted. This is the same PATTERN (GPU_FAULT_RE/GPU_FAULT_SKIP_RE, so the two cannot drift) read
+    # over the same window; it decides nothing -- the refusal still happens at take, when the window is re-read, because
+    # a queue wait can be minutes long and the condition can clear (or arrive) in the meantime.
+    if [ "$waited" = 0 ] && [ "${GPU_HOLD_FAULT_ABORT:-1}" != 0 ] && [ -z "${GPU_HOLD_QUEUE_STATE_OFF:-}" ]; then
+        _qs_window=${GPU_HOLD_RESET_WINDOW_MIN:-10}
+        _qs_hits=$(if [ -n "${GPU_HOLD_KLOG_FILE:-}" ]; then cat "$GPU_HOLD_KLOG_FILE" 2> /dev/null
+                   else journalctl -k --since "-${_qs_window} min" --no-pager -q 2> /dev/null; fi |
+                   grep -iE "$GPU_FAULT_RE" | grep -viE "$GPU_FAULT_SKIP_RE")
+        if [ -n "$_qs_hits" ]; then
+            _qs_dev=GPU; printf '%s\n' "$_qs_hits" | tail -1 | grep -qi amdxdna && _qs_dev=NPU
+            log "::warning::queued while the kernel log carries a ${_qs_dev} fault line in the last ${_qs_window} min - if it is still there when this ticket reaches the front, the take is REFUSED (rc 78) and this queue position is lost; newest: $(printf '%s\n' "$_qs_hits" | tail -1 | cut -c1-160)"
+        fi
+    fi
     cool=$(cool_left)
     head_ticket=$(oldest_ticket)
     if [ "$head_ticket" = "$TICKET_NAME" ]; then

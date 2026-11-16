@@ -223,6 +223,10 @@ def self_test():
     chk(m["one_40k_window"], "and the whole 12:35 burst is inside one 40 KiB window")
     chk(summarize(pages + [pages[3]])["repeats"] == 1,
         "a repeated address is counted as a repeat, not hidden")
+    far = [dict(device="0000:c6:00.1", address=0x100000, flags=0x0007),
+           dict(device="0000:c6:00.1", address=0x200000, flags=0x0007)]
+    chk(summarize(far)["one_40k_window"] is False,
+        "accesses a megabyte apart are NOT one descriptor block's window")
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:

@@ -156,6 +156,31 @@ def describe(prev, cur):
     return "quiet"
 
 
+def step(tally, prev, cmd):
+    """One sample: (the line after the epoch, the totals to carry as `prev`).
+
+    A source that fails is not an empty buffer. `dmesg` as a non-root user on this box exits 1 with
+    `read kernel buffer failed: Operation not permitted` and prints nothing, which counted as a buffer with
+    no faults read "quiet" -- a healthy device from a sampler that read nothing (review of engine#2603). So a
+    non-zero exit is reported as `unreadable: <its first stderr line>`, is not counted, and leaves the
+    tally and `prev` as they were; the next readable sample's interval then spans the gap."""
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if p.returncode != 0:
+        why = (p.stderr.strip().splitlines() or [f"exit {p.returncode}"])[0][:120]
+        return f"- - unreadable: {why} (not counted)", prev
+    cur = tally.add(p.stdout)
+    meaning = describe(prev, cur)
+    if prev is None:
+        meaning += (" (mode: cursor on kernel stamps)" if tally.mode == "cursor" else
+                    " (mode: whole buffer -- no kernel stamps in this source, so a rotation can hide drops;"
+                    " dmesg or journalctl -k -o short-monotonic carry them)")
+    if tally.event:
+        meaning += "; " + tally.event
+    if tally.mode == "cursor" and tally.unstamped:
+        meaning += f"; {tally.unstamped} unstamped line(s) in the buffer not counted"
+    return f"{cur[0]} {cur[1]} {meaning}", cur
+
+
 def self_test():
     census = _load_census()
     F = ("kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 "
@@ -235,6 +260,18 @@ def self_test():
     assert describe(sample(census, burst), sample(census, burst + others)) == "quiet"
     assert sample(census, others, caller="kauditd_printk_skb") == (0, 267)
 
+    # A failing source is "unreadable", never "quiet", and leaves the tally alone; an empty one that succeeded is
+    # a real empty buffer. Both print nothing to stdout -- only the exit status tells them apart (review of #2603).
+    t = Tally(census)
+    line, after = step(t, None, "echo 'dmesg: read kernel buffer failed: Operation not permitted' >&2; exit 1")
+    assert line.startswith("- - unreadable: dmesg: read kernel buffer failed") and after is None, (line, after)
+    assert t.mode is None, t.mode                     # a failed read must not choose the mode either
+    line, after = step(t, (2, 5611), "false")
+    assert line == "- - unreadable: exit 1 (not counted)" and after == (2, 5611), (line, after)
+    line, after = step(t, None, "true")
+    assert line.startswith("0 0 baseline") and after == (0, 0), (line, after)
+    assert step(t, after, "true")[0] == "0 0 quiet", step(t, after, "true")
+
     # The fixture above is the shape that misled engine#2542: two devices, one log format, so the
     # printed count mixes populations. The sampler does not classify by device -- the census does --
     # it only measures rate, which is why it can stay this small.
@@ -262,19 +299,9 @@ def main():
     prev, n = None, 0
     try:
         while not args.count or n < args.count:
-            text = subprocess.run(args.dmesg, shell=True, capture_output=True, text=True).stdout
-            cur = tally.add(text)
-            meaning = describe(prev, cur)
-            if prev is None:
-                meaning += (" (mode: cursor on kernel stamps)" if tally.mode == "cursor" else
-                            " (mode: whole buffer -- no kernel stamps in this source, so a rotation can hide drops;"
-                            " dmesg or journalctl -k -o short-monotonic carry them)")
-            if tally.event:
-                meaning += "; " + tally.event
-            if tally.mode == "cursor" and tally.unstamped:
-                meaning += f"; {tally.unstamped} unstamped line(s) in the buffer not counted"
-            print(f"{int(time.time())} {cur[0]} {cur[1]} {meaning}", file=out)
-            prev, n = cur, n + 1
+            line, prev = step(tally, prev, args.dmesg)
+            print(f"{int(time.time())} {line}", file=out)
+            n += 1
             if args.count and n >= args.count:
                 break
             time.sleep(args.interval)

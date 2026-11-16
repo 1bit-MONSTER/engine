@@ -18,6 +18,13 @@
 #
 #   scripts/kernel-set-check.sh [--pack <model dir>] <set dir> [<set dir> ...]
 #
+#
+# engine#2599: ALSO refuses a set that carries two ELFs with the SAME CONTENT under different names. The
+# bonsai2 pack shipped prefill ELFs byte-identical to their _m16 twins, so a 128-row chunk computed 16 rows
+# and every host-side check passed: the loaded file had the right NAME and the right per-tile widths, and the
+# AIE image carries no readable design M (e_shnum=0, no symtab, no design string -- measured on this lane's
+# packs), so nothing but a hash of the file can tell the two designs apart. A twin inside one pack is either
+# a packaging accident or a design that was never widened; both are refusals, not warnings.
 # Why this exists: the release candidate serves small models at 87-101 tok/s with the set that ships beside it, and a
 # build of current main refused that same set with "layer ELFs: the NB 2 and 3 builds differ in size". Neither the set
 # nor the kernels were wrong — the two sides came from different revisions of the private repository, one on each side of
@@ -219,9 +226,24 @@ if [ $# -eq 0 ]; then
     exit 2
 fi
 
+# engine#2599: two ELFs with the same content under different names is a refusal. See the header for why a
+# hash is the only host-side instrument that can see it.
+check_twins() {
+    local dir=$1 dup
+    dup=$(find "$dir" -maxdepth 2 -name '*.elf' -type f -print0 2>/dev/null |
+          xargs -0 -r md5sum 2>/dev/null | sort | awk '{h=$1; $1=""; if (h==prev) print prevname " and" $0; prev=h; prevname=$0}')
+    if [ -n "$dup" ]; then
+        printf 'FAIL %s: ELFs with identical content under different names (a copied twin computes the wrong M):\n%s\n' \
+            "$(basename "$dir")" "$dup"
+        return 1
+    fi
+    return 0
+}
+
 rc=0
 for dir in "$@"; do
     check_set "$dir" || { rc=$?; [ "$rc" -gt 1 ] && rc=2; }
+    check_twins "$dir" || rc=1
 done
 
 if [ -n "$pack" ]; then

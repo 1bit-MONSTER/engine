@@ -82,12 +82,13 @@ def pins(root):
     return out
 
 
+ABOUT = 'HRX hardware gate KLD bases (docs/hw-gate.md). The .kld files live on the gate box, not in git; this file pins what they are. `recorded_at` names the tree each base was measured at: it is provenance, and it may name a commit that is no longer reachable from the current pin (engine#2643) -- `tools/hw_gate_manifest.py judge` prints how the golden\'s tree relates to the tested one on the verdict line, and says "cannot place" rather than guessing when it cannot.'   # engine#2643: one string for the template and the shipped manifest, so a reader of either learns what recorded_at can and cannot mean.
+
 def load(path):
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
-    return {"about": "HRX hardware gate KLD bases (docs/hw-gate.md). The .kld files live on the gate box, "
-                     "not in git; this file pins what they are.", "kld": {}}
+    return {"about": ABOUT, "kld": {}}
 
 
 def cmd_set(manifest, name, base, model, text):

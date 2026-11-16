@@ -113,6 +113,27 @@ only if you want to confirm that, not as a discriminator.
 
 ```bash
 # 1. pick the top faulting IOVA from the census
+<<<<<<< HEAD
+=======
+**The interval is seconds, not milliseconds (measured 2026-11-16).** A filtered probe on one faulting IOVA
+(`0xe1e18000`), captured over a boot's first 28 minutes, found **60 unmaps of that page, every one a single 4 KiB
+page, 59 of them from `<idle>` (interrupt context)**: the NVMe completion path repeatedly maps and tears down one
+pooled page. **Three of the four faults on it** followed an unmap of that same page by **5.65 s, 24.66 s and
+24.71 s**, and a correlation window of ±5 ms found none of them. The fourth (boot t=1605.6 s) has **no unmap of that
+page within 60 s** -- the nearest is **+74 s**, after the fault -- so this capture correlates three faults and shows
+the ceiling on the fourth; a wider window does not help it, and the earlier "19.60 s" I quoted for it came from a
+different capture and does not reproduce on this one. So `tools/diag/unmap_fault_order.py` defaults to **30 s** and
+the page's own numbers are **5-25 s**: a millisecond window reports "nothing correlated" on a capture that contains
+the correlation. Because the same sentence is printed whether the window is too narrow or the fault genuinely has no
+nearby unmap, **the negative now names the window it used and the measured interval** -- a default alone does not fix
+the failure, only a negative that says *at what scale* it found nothing does.
+
+**One probe owns the shared buffer.** A kprobe on `iommu_unmap_fast` with **no filter** wrote 579,000 events and left
+a filtered probe on the same function with **zero** -- the trace ring buffer is shared, so the *narrow* probe (one
+IOVA, one call site) is the one that should be armed, and checking `grep -c '<probe>:' trace` before trusting a
+capture is the same "prove the plumbing" rule two paragraphs up.
+
+>>>>>>> 2b1faf1b2 (diag: a negative names the window it used, and the window reads in seconds)
 # 2. kprobe iommu_unmap_fast on that iova alone (filter), stacktrace on, capture for minutes in the background
 # 3. in the same capture window, note the fault timestamps for that iova
 ```

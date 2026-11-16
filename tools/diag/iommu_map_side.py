@@ -196,6 +196,25 @@ def address_kind(domain):
     return f"unknown domain {domain}"
 
 
+def unparsed_faults(path):
+    """How many lines of `path` say IO_PAGE_FAULT without the fault parse seeing them, or 0.
+
+    A capture that carries the marker and parses to nothing is not a capture without faults: it is a capture in a form
+    this parser does not read. The FAULT regex wants journalctl -o short-monotonic ("[ 953.381000] amdxdna …"), and the
+    plain -o short form (a date, no bracketed boot seconds) silently yields zero -- measured while diagnosing #2542: a
+    file with ten IO_PAGE_FAULT lines answered "no fault inside the capture window: this capture cannot answer", which
+    reads as "there were none". Saying so is the whole rule this file applies to every other absence.
+    """
+    try:
+        with open(path, errors="replace") as fh:
+            marked = sum(1 for line in fh if "IO_PAGE_FAULT" in line)
+    except OSError:
+        return 0
+    if not marked:
+        return 0
+    return max(0, marked - len(parse_faults(path)))
+
+
 def parse_faults(path, with_domain=False):
     """[(boot_seconds, iova)] (or [(boot_seconds, iova, domain)]) for every IO_PAGE_FAULT line in a
     `journalctl -o short-monotonic` capture."""
@@ -391,6 +410,21 @@ def self_test() -> int:
         chk("no map events in this capture" in hdr5, "...and says it in the header too")
         chk(exit_code([], [(1, 2, 3)]) == 4, "a one-sided capture exits 4, not 0")
         chk(exit_code(maps, unmaps) == 0 and exit_code([], []) == 3, "both sides 0, nothing captured 3")
+
+        # engine#2542: a file that carries the marker and parses to nothing is in the wrong FORM, not empty. Both
+        # directions, because a note that fires on a good capture is noise nobody reads.
+        (d / "short.txt").write_text(
+            "Nov 16 15:42:45 strixhalo kernel: amdxdna 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT "
+            "domain=0x0002 address=0x7fa381807000 flags=0x0077]\n")
+        (d / "mono.txt").write_text(
+            "[ 953.381000] amdxdna 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0002 "
+            "address=0x7fa381807000 flags=0x0077]\n")
+        chk(unparsed_faults(str(d / "short.txt")) == 1,
+            "a capture in the plain -o short form is COUNTED as unparsed, not read as empty")
+        chk(unparsed_faults(str(d / "mono.txt")) == 0,
+            "a short-monotonic capture leaves nothing unparsed")
+        chk(unparsed_faults("/nonexistent/faults.txt") == 0, "an unreadable file claims nothing")
+        chk(unparsed_faults("") == 0, "no path, no claim")
 
         faults = parse_faults(str(d / "after.txt"))
         chk(len(faults) == 2, "two faults parse with their boot stamps")
@@ -800,6 +834,16 @@ def main(argv):
         faults = parse_faults(a.trace, with_domain=True)
         if faults:
             print(f"note: no faults in --after; using the {len(faults)} fault event(s) carried by the trace itself")
+    # engine#2542: a capture that carries the marker and parses to nothing is in the wrong FORM, not empty. Saying which
+    # form the parser reads turns "there were no faults" into "this file is not the shape I read".
+    for src in (a.after, a.trace):
+        if not src:
+            continue
+        n = unparsed_faults(src)
+        if n:
+            print(f"note: {src} carries {n} IO_PAGE_FAULT line(s) this parser did not read; it wants the "
+                  f"short-monotonic form (a bracketed boot second, as in '[ 953.381000] amdxdna ...'), while the plain "
+                  f"-o short form has a date and no boot seconds")
     if a.page_class:
         report_page_classes(a.trace, faults)
     rows, header = analyse(maps, unmaps, faults, parse_faults(a.before), faults, other, widened)

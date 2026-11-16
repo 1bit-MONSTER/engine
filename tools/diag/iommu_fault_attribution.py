@@ -57,15 +57,24 @@ import sys
 STAMP = re.compile(r"^\[\s*(\d+\.\d+)\]")
 
 
+ACCEL = "amdxdna"   # the driver whose node the sampler's holders describe
+
+
 def faults(text):
-    """[(boot_seconds, address)] for every IO_PAGE_FAULT line, in log order."""
+    """[(boot_seconds, address, is_accel)] for every IO_PAGE_FAULT line, in log order.
+
+    `is_accel` matters because the sampler records who holds `/dev/accel`: a fault on another PCI function
+    (the NVMe stream is `nvme 0000:c4:00.0 domain=0x0015`) has nothing to do with those holders, and
+    attributing it to one is a category error rather than a weak answer. Measured on this box: 137 NVMe
+    faults were "attributed" to a `gpu-hold` ticket that was holding the NPU.
+    """
     out = []
     for line in text.splitlines():
         if "IO_PAGE_FAULT" not in line:
             continue
         m = STAMP.match(line)
         addr = re.search(r"address=(0x[0-9a-fA-F]+)", line)
-        out.append((float(m.group(1)) if m else None, addr.group(1) if addr else "?"))
+        out.append((float(m.group(1)) if m else None, addr.group(1) if addr else "?", ACCEL in line))
     return out
 
 
@@ -90,10 +99,17 @@ def samples(path):
         return rows_from_text(f.read())
 
 
-def attribute(rows, boots, max_gap):
+def attribute(rows, boots, max_gap, any_device=False):
     """[(boot_seconds, address, verdict)] — one verdict per fault, decided by its own timestamp."""
     out = []
-    for sec, addr in boots:
+    for sec, addr, is_accel in boots:
+        if not is_accel and not any_device:
+            # The sampler records who holds /dev/accel. A fault on another PCI function has nothing to do with
+            # those holders: measured on this box, 137 NVMe faults were "attributed" to a gpu-hold ticket that was
+            # holding the NPU. A category error is not a weak answer, so refuse it unless asked to proceed.
+            out.append((sec, addr, "NOT THE ACCEL NODE: this fault is on another device, so the sampler's holders "
+                                   "do not describe it (pass --any-device to attribute anyway)"))
+            continue
         if sec is None:
             out.append((sec, addr, "NO SAMPLE: the line carries no kernel timestamp"))
             continue
@@ -127,15 +143,19 @@ def attribute(rows, boots, max_gap):
 
 def yield_line(res):
     """The number that decides whether a sampling run can answer the question at all."""
-    k = {"ATTRIBUTED": 0, "HANDOVER-ADJACENT": 0, "NOTHING HELD": 0, "NO SAMPLE": 0}
+    # Every verdict must be counted, or the summary says "0 of everything" about a capture full of faults -- the
+    # silent-drop class this file exists to avoid. "NOT THE ACCEL NODE" is a fifth outcome, not a footnote.
+    k = {"ATTRIBUTED": 0, "HANDOVER-ADJACENT": 0, "NOTHING HELD": 0, "NO SAMPLE": 0, "NOT THE ACCEL NODE": 0}
     for _, _, v in res:
         for key in k:
             if v.startswith(key):
                 k[key] += 1
                 break
     n = len(res)
-    return ("faults: %d; attributable %d, ambiguous %d, nothing-held %d, no-sample %d"
-            % (n, k["ATTRIBUTED"], k["HANDOVER-ADJACENT"], k["NOTHING HELD"], k["NO SAMPLE"]))
+    total = sum(k.values())
+    return ("faults: %d; attributable %d, ambiguous %d, nothing-held %d, no-sample %d, other-device %d"
+            % (n, k["ATTRIBUTED"], k["HANDOVER-ADJACENT"], k["NOTHING HELD"], k["NO SAMPLE"],
+               k["NOT THE ACCEL NODE"])) + ("" if total == n else "  !! %d fault(s) uncounted" % (n - total))
 
 
 def outlook(rows, windows):
@@ -185,7 +205,7 @@ def disagreements(rows, pairs, max_gap):
     """[(epoch, window_hits, timestamp_verdict, agree)] for each fault in attributed.log."""
     out = []
     for epoch, hits in pairs:
-        res = attribute(rows, [(epoch, "-")], max_gap)[0][2]
+        res = attribute(rows, [(epoch, "-", True)], max_gap)[0][2]   # attributed.log holds accel faults
         # agreement is not string equality: the window names holders, this names one and says how sure.
         # A window with two holders and a HANDOVER-ADJACENT verdict AGREE about the situation.
         win_n = 0 if hits in ("", "-") else len([h for h in hits.replace(",", " ").split() if h])
@@ -223,11 +243,11 @@ def self_test():
     rows = [(0, "111", "gpu-hold cl-a pid 1 t0"), (100, "111", "gpu-hold cl-a pid 1 t0"),
             (200, "-", "-"), (300, "222", "gpu-hold cl-b pid 2 t1"),
             (400, "222", "gpu-hold cl-b pid 2 t1")]
-    boots = [(50.0, "0x1000"),     # held by 111, next sample also 111 -> ATTR
-             (150.0, "0x2000"),    # held by 111, next sample is '-'    -> HANDOVER-ADJACENT
-             (250.0, "0x3000"),    # last sample before is '-'          -> NOTHING HELD
-             (305.0, "0x4000"),    # first sample of 222's tenure       -> ATTR
-             (900.0, "0x5000")]    # 500 s after the last sample        -> NO SAMPLE
+    boots = [(50.0, "0x1000", True),     # held by 111, next sample also 111 -> ATTR
+             (150.0, "0x2000", True),    # held by 111, next sample is '-'    -> HANDOVER-ADJACENT
+             (250.0, "0x3000", True),    # last sample before is '-'          -> NOTHING HELD
+             (305.0, "0x4000", True),    # first sample of 222's tenure       -> ATTR
+             (900.0, "0x5000", True)]    # 500 s after the last sample        -> NO SAMPLE
     res = attribute(rows, boots, max_gap=150)
     def kind(v):
         # the key is the verdict before any detail; "NO SAMPLE within 150s" is still NO SAMPLE
@@ -242,21 +262,21 @@ def self_test():
 
     # And the case that motivates not using a window at all: two real holders either side of the fault.
     hand = attribute([(0, "111", "gpu-hold cl-a pid 1"), (100, "111", "gpu-hold cl-a pid 1"),
-                      (200, "222", "gpu-hold cl-b pid 2")], [(150.0, "0x9000")], max_gap=150)
+                      (200, "222", "gpu-hold cl-b pid 2")], [(150.0, "0x9000", True)], max_gap=150)
     assert hand[0][2].startswith("HANDOVER-ADJACENT"), hand
     assert "pid 111" in hand[0][2] and "pid 222" in hand[0][2], hand
     assert "no accel client held it" in res[2][2], res[2]      # not "I did not look"
-    assert yield_line(res) == ("faults: 5; attributable 2, ambiguous 1, nothing-held 1, no-sample 1"), yield_line(res)
+    assert yield_line(res) == ("faults: 5; attributable 2, ambiguous 1, nothing-held 1, no-sample 1, other-device 0"), yield_line(res)
 
     # --max-gap decides freshness, and a smaller gap converts ATTRIBUTED into NO SAMPLE rather than
     # silently attributing across a long unobserved stretch.
-    tight = [kind(v) for _, _, v in attribute(rows, [(50.0, "0x1")], max_gap=5)]
+    tight = [kind(v) for _, _, v in attribute(rows, [(50.0, "0x1", True)], max_gap=5)]
     assert tight == ["NO SAMPLE"], tight
 
     # The line shape the kernel actually writes: without a leading stamp there is no time to join on,
     # so the verdict is NO SAMPLE and says why -- it must never default to the nearest holder.
-    no_stamp = faults("nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT address=0x4128000]")
-    assert no_stamp == [(None, "0x4128000")], no_stamp
+    no_stamp = faults("amdxdna 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT address=0x4128000]")
+    assert no_stamp == [(None, "0x4128000", True)], no_stamp   # the device check passes; only the stamp is missing
     assert attribute(rows, no_stamp, 150)[0][2].startswith("NO SAMPLE"), attribute(rows, no_stamp, 150)
 
     # The outlook is computed, not asserted from a constant: a window wide enough to cover two
@@ -301,16 +321,28 @@ def self_test():
     gap_log = "1000\t-\t-\t-\t-\t-\n1010\tGAP\t93\t-\t-\t-\n"
     gap_rows = rows_from_text(gap_log)
     assert gap_rows == [(1000, "-", "-"), (1010, "GAP", "93")], gap_rows   # the note carries the gap length
-    assert attribute(gap_rows, [(1015.0, "0x1")], 150)[0][2].startswith("NO SAMPLE"), attribute(gap_rows, [(1015.0, "0x1")], 150)
-    assert "stalled" in attribute(gap_rows, [(1015.0, "0x1")], 150)[0][2]
+    assert attribute(gap_rows, [(1015.0, "0x1", True)], 150)[0][2].startswith("NO SAMPLE"), attribute(gap_rows, [(1015.0, "0x1", True)], 150)
+    assert "stalled" in attribute(gap_rows, [(1015.0, "0x1", True)], 150)[0][2]
     # ... and it is not a holder for the outlook either: with a real holder after it, the window still sees one.
     mixed = gap_rows + [(1020, "1234", "gpu-hold cl-a pid 9")]
     assert outlook(mixed, [5])[0][1] > 0.0, outlook(mixed, [5])   # some windows span the real holder
 
+    # THE CATEGORY ERROR, measured: 137 NVMe faults on this box were "attributed" to a gpu-hold ticket that was
+    # holding the NPU. A fault on another device must be refused, not guessed -- and --any-device must still work.
+    nvme = [(105.0, "0xe1e18000", False)]
+    assert attribute(rows, nvme, 150)[0][2].startswith("NOT THE ACCEL NODE"), attribute(rows, nvme, 150)
+    assert attribute(rows, nvme, 150, any_device=True)[0][2].startswith("HANDOVER-ADJACENT"), attribute(rows, nvme, 150, True)   # --any-device proceeds; this fixture is a handover
+
+    # The summary must account for every fault: a verdict missing from the tally makes "0 of everything" look like
+    # an empty capture. This arm would have printed 0/0/0/0 for 137 NVMe faults before the counter was added.
+    assert yield_line([(1.0, "0x1", "NOT THE ACCEL NODE: other device")]) == (
+        "faults: 1; attributable 0, ambiguous 0, nothing-held 0, no-sample 0, other-device 1"), \
+        yield_line([(1.0, "0x1", "NOT THE ACCEL NODE: other device")])
+
     # Stamps and addresses are parsed, and non-fault lines are ignored.
     text = ("[1234.500000] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0007]\n"
             "[1235.000000] unrelated kernel line\n")
-    assert faults(text) == [(1234.5, "0x4128000")], faults(text)
+    assert faults(text) == [(1234.5, "0x4128000", False)], faults(text)
 
     # THE KERNEL PADS THE STAMP, and the unpadded form above is not what it writes: two spaces at 321 s, four below
     # 10 s (`[    0.000000]`). engine#2622 shipped a reader whose regex required a digit straight after `[`, matched
@@ -318,12 +350,12 @@ def self_test():
     # have matched. `^\[\s*(...)` handles both widths, and this fixture is what keeps that true.
     padded = ("[  321.308031] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x4128000 flags=0x0000]\n"
               "[    0.000000] amdxdna 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0003 address=0x4130000 flags=0x0007]\n")
-    assert faults(padded) == [(321.308031, "0x4128000"), (0.0, "0x4130000")], faults(padded)
+    assert faults(padded) == [(321.308031, "0x4128000", False), (0.0, "0x4130000", True)], faults(padded)
 
     # A capture in the human-readable form (`dmesg -T`, journalctl default) carries NO stamp this parser can use.
     # The verdict must say it cannot read the file, not that the kernel showed no ordering.
-    human = "[Sun Nov 15 08:53:39 2026] nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT address=0x4128000]\n"
-    assert faults(human) == [(None, "0x4128000")], faults(human)
+    human = "[Sun Nov 15 08:53:39 2026] amdxdna 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT address=0x4128000]\n"
+    assert faults(human) == [(None, "0x4128000", True)], faults(human)
     assert attribute(rows, faults(human), 150)[0][2].startswith("NO SAMPLE"), attribute(rows, faults(human), 150)
     # EVERY OUTPUT LINE IS EXERCISED. engine#2602 shipped a renderer that crashed on the first real log
     # because its self-test only asserted the analysis; a tool that cannot print is not a tool that works.
@@ -347,6 +379,9 @@ def main():
                     help="epoch of boot, so kernel stamps become absolute (default: /proc/stat btime)")
     ap.add_argument("--max-gap", type=float, default=15.0,
                     help="oldest usable sample before a fault, in seconds (default 15)")
+    ap.add_argument("--any-device", action="store_true",
+                    help="attribute faults on devices other than the accel node (off by default: the sampler's "
+                         "holders describe /dev/accel, so attributing another device's fault is a category error)")
     ap.add_argument("--attributed", default=None,
                     help="sampler attributed.log: print its windowed hits beside this tool's verdict")
     ap.add_argument("--outlook", type=float, nargs="*", metavar="W",
@@ -383,8 +418,8 @@ def main():
     text = sys.stdin.read() if args.dmesg == "-" else open(args.dmesg, encoding="utf-8", errors="replace").read()
 
     rows = samples(args.samples)
-    boots = [(None if s is None else boot + s, a) for s, a in faults(text)]
-    res = attribute(rows, boots, args.max_gap)
+    boots = [(None if s is None else boot + s, a, acc) for s, a, acc in faults(text)]
+    res = attribute(rows, boots, args.max_gap, any_device=args.any_device)
     for sec, addr, verdict in res:
         when = "-" if sec is None else "%.0f" % sec
         print(fmt_fault(sec, addr, verdict))

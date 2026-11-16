@@ -224,6 +224,9 @@ struct Plan {
     // raw .fconst; the block-128 walk and the canonical copy are not used. `block32_note` is why that file does not
     // fit the layout (empty when it does), and is the refusal every .fconst tensor of the plan then carries.
     bool block32_layers = false;
+    // engine#2594: the 1.8 Token .fconst is the 1.9 block with k_proj before q_proj and no 4*heads sink field. plan()
+    // sets this when only that form fits the file (its size and every envelope); every later reader follows it.
+    bool block32_form18 = false;
     std::string block32_note;
     std::string pack;  // *_rai_1.8.0_npu_4K, from the directory name
     Dims dims;
@@ -816,7 +819,9 @@ Block32GateUp read_block32_gate_up(const uint8_t* p, int64_t avail, int64_t rows
 //     q_off     (Nq/64)  x unit(H)       q_proj [Nq][H]
 //     k_off     (Nkv/64) x unit(H)       k_proj [Nkv][H]
 //     v_off     (Nkv/64) x unit(H)       v_proj [Nkv][H]
-//     sink_off  4*heads bytes            not a weight; skipped (int32 0xFF7F0000 x heads on the measured pack)
+//     sink_off  4*heads bytes            not a weight; skipped (int32 0xFF7F0000 x heads on the measured pack);
+// The 1.8 file (SmolLM2-135M-Instruct 1.8 npu_4K, 90,469,696 B) is this block with k_proj BEFORE q_proj and no sink
+// field: rebuilt into the 1.9 order it equals the 1.9 file byte for byte except 112 code bytes of layer 3's o_proj.
 //     o_off     (H/64)   x unit(Nq)      o_proj [H][Nq]
 //     post_off  64 + 2*H   envelope: eps, zeros, post_attention_layernorm bf16[H]
 //     gu_off    (IM/64)  x mlp_unit(H)   gate_proj + up_proj, [IM][H] each
@@ -833,7 +838,8 @@ struct Block32Layout {
     int64_t tail_off = 0, head_off = 0, head_units = 0;
     int64_t min_size = 0; // head_off + head_units x unit(H); the file is this plus zero padding
 };
-Block32Layout block32_layout(const Dims& d);
+// `form18`: the 1.8 Token .fconst's form of the same block -- k_proj before q_proj, no sink field (engine#2594).
+Block32Layout block32_layout(const Dims& d, bool form18 = false);
 // Empty when a mapped file fits `lay`: it is at least `min_size` long, and every envelope (two per layer and the
 // tail's) opens with the pack's epsilon followed by zeros up to the norm. Otherwise the reason, with the offset. The
 // zero padding after the head is the head reader's check.

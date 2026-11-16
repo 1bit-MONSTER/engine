@@ -59,8 +59,9 @@
 #   GPU_HOLD_IGNORE_THERMAL_HOLD=1  start even while strixhalo-thermal-guard's ~/THERMAL-HOLD is up
 #   GPU_HOLD_ALLOW_NESTED=1  allow a nested gpu-hold on the SAME queue; by default it refuses (rc 2), because a payload
 #                  that wraps itself in another ticket can only wait for the ticket it is already inside (engine#2727).
-#                  The payload gets GPU_HOLD_TICKET, GPU_HOLD_LABEL, GPU_HOLD_HELD_QUEUE and GPU_HOLD_HELD_LABEL, so it
-#                  can ask "am I already inside a ticket, and on which queue" instead of guessing.
+#                  The payload gets GPU_HOLD_TICKET, GPU_HOLD_LABEL, GPU_HOLD_HELD_QUEUE, GPU_HOLD_HELD_LABEL and
+#                  GPU_HOLD_HELD_TOKEN, so it can ask "am I already inside a ticket, and on which queue/token" instead of
+#                  guessing. The token is compared as well as the queue because -q moves the queue but not the token.
 #   GPU_HOLD_COOLDOWN      seconds the WHOLE queue waits after a hold that ended at or above
 #                          GPU_HOLD_COOLDOWN_TCTL, whatever its label; default 180, 0 disables the cool-down
 #   GPU_HOLD_COOLDOWN_TCTL die temperature at release that counts as "ended hot", default 85
@@ -142,6 +143,19 @@ if [ -n "${GPU_HOLD_HELD_QUEUE:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; 
     _nest_there=$(cd "$GPU_HOLD_HELD_QUEUE" 2> /dev/null && pwd -P || printf '%s' "$GPU_HOLD_HELD_QUEUE")
     if [ "$_nest_here" = "$_nest_there" ]; then
         echo "gpu-hold: refusing to queue inside the ticket that is already running this command (label '${GPU_HOLD_HELD_LABEL:-?}', queue $_nest_there, rc 2). The outer ticket already holds the GPU, so this invocation could only wait for its own parent and waste the window (engine#2727). Drop the inner gpu-hold: the outer one is the ticket. A run that really needs a second ticket on the same queue must say so with GPU_HOLD_ALLOW_NESTED=1." >&2
+        exit 2
+    fi
+fi
+# ...and the QUEUE is not the whole key: `-q` moves $QUEUE without moving $TOKEN (a separate option, and the token's own
+# default does not read $QUEUE), so a nested claim on a DIFFERENT queue still waits for the token its parent holds. The
+# token is the thing it waits on -- gpu-hold's own wait line says so ("first in the queue, waiting for <token> (held by:
+# <label> pid <pid>)") -- so the comparison is on the token too. engine#2727 review, measured: outer on q1, payload
+# running `-q q2` with the inherited token sat 4 s and then reported "queue never came round" (rc 75) with the outer.
+if [ -n "${GPU_HOLD_HELD_TOKEN:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; then
+    _tok_here=$(cd "$(dirname "$TOKEN")" 2> /dev/null && pwd -P || dirname "$TOKEN")
+    _tok_there=$(cd "$(dirname "$GPU_HOLD_HELD_TOKEN")" 2> /dev/null && pwd -P || dirname "$GPU_HOLD_HELD_TOKEN")
+    if [ "$_tok_here/$(basename "$TOKEN")" = "$_tok_there/$(basename "$GPU_HOLD_HELD_TOKEN")" ]; then
+        echo "gpu-hold: refusing to queue inside the ticket that is already running this command (label '${GPU_HOLD_HELD_LABEL:-?}', token $_tok_here/$(basename "$TOKEN"), rc 2). -q moves the queue but not the token, so this invocation would wait for the token its own parent holds and waste the window (engine#2727). Drop the inner gpu-hold, or say GPU_HOLD_ALLOW_NESTED=1 if a second ticket on the same token is really wanted." >&2
         exit 2
     fi
 fi
@@ -531,7 +545,8 @@ set -m
 # give it to the child - exact, not a string guess:
 #   GPU_HOLD_TICKET  the exact line in the token file ("gpu-hold <label> pid <pid> <ts>")
 #   GPU_HOLD_LABEL   the label, sanitised, as it appears in that line
-env GPU_HOLD_TICKET="$mine" GPU_HOLD_LABEL="$SAFE" GPU_HOLD_HELD_QUEUE="$QUEUE" GPU_HOLD_HELD_LABEL="$LABEL" "$@" < /dev/null &
+env GPU_HOLD_TICKET="$mine" GPU_HOLD_LABEL="$SAFE" GPU_HOLD_HELD_QUEUE="$QUEUE" GPU_HOLD_HELD_LABEL="$LABEL" \
+        GPU_HOLD_HELD_TOKEN="$TOKEN" "$@" < /dev/null &
 child=$!
 set +m   # job control is needed only to place THIS job in its own group; leaving it on would make every later
          # background job in this shell a background *group*, which is a semantic this script does not want to

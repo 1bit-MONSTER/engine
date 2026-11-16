@@ -71,6 +71,20 @@ plain=$(env -u GPU_HOLD_HELD_QUEUE -u GPU_HOLD_HELD_LABEL bash -c 'printf "%s\n"
 printf '  arm3 outside-ticket marker: %s\n' "$plain"
 if [ "$plain" != "<unset>" ]; then echo "  FAIL arm3: the marker leaks outside a ticket"; fails=$((fails+1)); fi
 
+# 4b. THE TOKEN IS THE KEY TOO (engine#2727 review): `-q` moves the queue without moving the token, so a nest on a
+#     DIFFERENT queue still waits for the token its parent holds. Outer on q1, payload runs `-q q2` with the inherited
+#     token: refused by name, and no ticket is left in q2.
+mkdir -p "$tmp/q1" "$tmp/q2"
+out=$(env "${env_common[@]}" GPU_QUEUE_DIR="$tmp/q1" GPU_TOKEN_FILE="$tmp/q1-token" timeout 60 bash "$HOLD" -l outer-arm4b -- \
+        bash -c '"$1" -l inner-arm4b -q "$2" -t 0.05 -- true; printf "INNER_RC=%s\n" "$?"' _ "$HOLD" "$tmp/q2" 2>&1)
+rc=$?
+inner_rc=$(printf '%s\n' "$out" | sed -n 's/^INNER_RC=//p' | head -1)
+left=$(ls "$tmp/q2" 2>/dev/null | grep -c 'inner-arm4b' || true)
+printf '  arm4b outer rc=%d inner rc=%s tickets-left-in-q2=%s\n' "$rc" "${inner_rc:-<none>}" "$left"
+if [ "${inner_rc:-}" != 2 ]; then echo "  FAIL arm4b: a different-queue nest on the SAME token was not refused (inner rc=${inner_rc:-<none>}, want 2)"; fails=$((fails+1)); fi
+printf '%s\n' "$out" | grep -q "moves the queue but not the token" || { echo "  FAIL arm4b: the refusal does not say why the queue alone is the wrong key"; fails=$((fails+1)); }
+if [ "$left" != 0 ]; then echo "  FAIL arm4b: the refused invocation left a ticket in q2"; fails=$((fails+1)); fi
+
 # 5. the override still refuses to be silent: a same-queue nest with GPU_HOLD_ALLOW_NESTED=1 waits instead of exiting 2
 out=$(env "${env_common[@]}" GPU_HOLD_WAIT=3 timeout 60 bash "$HOLD" -l outer-arm5 -- \
         bash -c 'GPU_HOLD_ALLOW_NESTED=1 "$1" -l inner-arm5 -w 2 -t 0.05 -- true; printf "INNER_RC=%s\n" "$?"' _ "$HOLD" 2>&1)
@@ -79,7 +93,7 @@ printf '  arm5 inner rc with the override=%s\n' "${inner_rc:-<none>}"
 if [ "${inner_rc:-}" = 2 ]; then echo "  FAIL arm5: GPU_HOLD_ALLOW_NESTED=1 did not lift the refusal"; fails=$((fails+1)); fi
 
 if [ "$fails" = 0 ]; then
-    echo "gpu_hold_nested: 5 arms pass"
+    echo "gpu_hold_nested: 6 arms pass"
     exit 0
 fi
 echo "gpu_hold_nested: $fails failure(s)"

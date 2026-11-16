@@ -36,6 +36,7 @@ import time
 FAULT = re.compile(
     r"(?P<dev>[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])[: ].*?"
     r"address=(?P<addr>0x[0-9a-f]+).*?flags=(?P<flags>0x[0-9a-f]+)")
+DOMAIN = re.compile(r"domain=(?P<dom>0x[0-9a-f]+)")
 DEV_ACCEL = "/dev/accel"
 
 
@@ -52,7 +53,8 @@ def parse_fault(line, device_prefix="amdxdna"):
     if m is None:
         return None
     return {"device": m.group("dev"), "address": int(m.group("addr"), 16),
-            "flags": int(m.group("flags"), 16)}
+            "flags": int(m.group("flags"), 16),
+            "domain": (int(d.group("dom"), 16) if (d := DOMAIN.search(line)) else None)}
 
 
 TS = re.compile(r"^\w{3}\s+\d+ (\d\d):(\d\d):(\d\d)")
@@ -127,8 +129,8 @@ def summarize(events):
     describe a burst that did not happen.
     """
     if not events:
-        return {"count": 0, "devices": [], "flags": [], "span": 0, "stride": None,
-                "pages": 0, "repeats": 0, "one_40k_window": False}
+        return {"count": 0, "devices": [], "flags": [], "domains": [], "span": 0,
+                "stride": None, "pages": 0, "repeats": 0, "one_40k_window": False}
     addrs = [e["address"] for e in events]
     pages = sorted({a & ~0xFFF for a in addrs})
     steps = {b - a for a, b in zip(pages, pages[1:])}
@@ -137,6 +139,10 @@ def summarize(events):
         "count": len(events),
         "devices": sorted({e["device"] for e in events}),
         "flags": sorted({e["flags"] for e in events}),
+        # The IOMMU DOMAIN separates a host VA (0x0002 on this box) from a device
+        # aperture (0x0003): a fault in the aperture has no host page behind it, so a
+        # page class read for it would describe a different device's memory (#2777).
+        "domains": sorted({e["domain"] for e in events if e.get("domain") is not None}),
         "span": span,
         "pages": len(pages),
         "repeats": len(addrs) - len(pages),
@@ -202,10 +208,13 @@ def render(summary, snaps):
     """The block a reader gets. Every field that could not be read says so."""
     stride = ("0x%x across pages" % summary["stride"]) if summary["stride"] is not None \
         else "no single page stride"
-    out = ["burst: %d access(es) on %s, flags %s, %d page(s), span 0x%x, %s"
-           % (summary["count"], ",".join(summary["devices"]) or "none",
+    doms = ",".join("0x%04x" % d for d in summary["domains"]) or "none"
+    out = ["burst: %d access(es) on %s, domain %s, flags %s, %d page(s), span 0x%x, %s"
+           % (summary["count"], ",".join(summary["devices"]) or "none", doms,
               ",".join("0x%04x" % f for f in summary["flags"]) or "none",
               summary["pages"], summary["span"], stride)]
+    if len(summary["domains"]) > 1:
+        out.append("  MORE THAN ONE IOMMU DOMAIN in this burst: host VA and aperture mixed")
     if summary["repeats"]:
         out.append("  %d access(es) repeat a page already faulted in this burst"
                    % summary["repeats"])
@@ -233,7 +242,10 @@ def self_test():
     line = ("Nov 16 15:42:45 strixhalo kernel: amdxdna 0000:c6:00.1: AMD-Vi: "
             "Event logged [IO_PAGE_FAULT domain=0x0002 address=0x7fa381807000 flags=0x0077]")
     chk(parse_fault(line) == {"device": "0000:c6:00.1", "address": 0x7fa381807000,
-                              "flags": 0x0077}, "an amdxdna fault line parses")
+                              "flags": 0x0077, "domain": 0x0002},
+        "an amdxdna fault line parses, with its IOMMU domain")
+    chk(parse_fault("amdxdna 0000:c6:00.1 address=0x1000 flags=0x0007")["domain"] is None,
+        "a line with no domain parses with domain None, not a fabricated 0")
     chk(parse_fault(line, device_prefix="nvme") is None,
         "the nvme stream does not parse as an amdxdna fault")
 
@@ -273,6 +285,13 @@ def self_test():
            dict(device="0000:c6:00.1", address=0x200000, flags=0x0007)]
     chk(summarize(far)["one_40k_window"] is False,
         "accesses a megabyte apart are NOT one descriptor block's window")
+    # #2777: the domain separates a host VA (0x0002 here) from a device aperture (0x0003).
+    # Mixing them in one burst is a different finding, not an average.
+    a_v = dict(device="0000:c6:00.1", address=0x7f2900001000, flags=0x0007, domain=0x0002)
+    ap_v = dict(device="0000:c6:00.1", address=0x7f291bd63000, flags=0x0007, domain=0x0003)
+    chk(summarize([a_v, a_v])["domains"] == [0x0002], "one domain stays one domain")
+    chk(summarize([a_v, ap_v])["domains"] == [0x0002, 0x0003],
+        "a burst spanning host VA and aperture reports BOTH domains")
 
     # the split threshold is a CHOICE, and its consequence must be visible:
     # today's nine bursts are separated by >= 17 s while a burst's own accesses are

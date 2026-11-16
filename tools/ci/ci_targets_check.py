@@ -355,6 +355,10 @@ def scan_guards(cmake_text):
         while line.endswith("\\") and i + 1 < len(lines):
             i += 1
             line = line[:-1].strip() + " " + lines[i].strip()
+        # engine#2700: cut a CMake comment before the directive is recognised. `ADD_DEPS` is an unanchored
+        # search, so a commented-out `# add_dependencies(onebit X)` cleared a drifting test exactly like a live
+        # edge did (measured: same closure, no test in the build), and a trailing comment could name one too.
+        line = line.split("#", 1)[0].strip()
         if line:
             yield i + 1, line, [e["cond"] for e in stack if e["cond"]], any(e["cond"] is None for e in stack)
 
@@ -835,6 +839,20 @@ add_executable(live_test live.cpp)
 add_test(NAME live_suite COMMAND live_test)
 add_dependencies(onebit live_test)
 """, 0, baseline="unbuilt_test\n")
+    # engine#2700: the same edge, but only in a comment. `ADD_DEPS` is an unanchored search over lines whose
+    # comments were still attached, so a commented-out line cleared a drifting test exactly like a live one.
+    case("a commented-out add_dependencies does not clear a drifting test",
+         B_CI, B_CMAKE + """
+add_executable(hoisted_test hoisted.cpp)
+add_test(NAME hoisted_suite COMMAND hoisted_test)
+# add_dependencies(onebit hoisted_test)
+""", 1, baseline="unbuilt_test\n")
+    case("a trailing comment that names add_dependencies adds no edge",
+         B_CI, B_CMAKE + """
+add_executable(hoisted_test hoisted.cpp)
+add_test(NAME hoisted_suite COMMAND hoisted_test)
+# the old line was add_dependencies(onebit hoisted_test)
+""", 1, baseline="unbuilt_test\n")
     # engine#1696: a test that lives in an included family file is still ratcheted. `case` writes only
     # .github/workflows/CI and CMakeLists.txt, so this arm builds its tree by hand.
     def family_tree(included):

@@ -105,19 +105,24 @@ def parse_faults(lines, journal_epoch):
 
 
 def correlate(unmaps, faults, window_us):
-    """[(fault, delta_us, unmap)] -- the nearest unmap of the same iova within the window, or None."""
+    """[(fault, delta_us, unmap, n)] -- the nearest unmap of the same iova within the window, or None, and how many
+    unmaps of that iova the window held. `n` is the discriminator: a page recycled ~470 times a second puts thousands
+    of unmaps inside a 30 s window, and then "the nearest one" is not evidence of anything."""
     by_iova = {}
     for t, iova, size in unmaps:
         by_iova.setdefault(iova, []).append((t, size))
     rows = []
     for t, iova, text in faults:
         best = None
+        n = 0
         if t is not None:
             for ut, size in by_iova.get(iova, ()):
                 d = (ut - t) * 1e6   # negative = the unmap came first
-                if abs(d) <= window_us and (best is None or abs(d) < abs(best[1])):
-                    best = ((ut, iova, size), d)
-        rows.append((t, iova, text, best))
+                if abs(d) <= window_us:
+                    n += 1
+                    if best is None or abs(d) < abs(best[1]):
+                        best = ((ut, iova, size), d)
+        rows.append((t, iova, text, best, n))
     return rows
 
 
@@ -146,15 +151,19 @@ def render(rows, unmaps, window_us):
         lines.append(f"  sizes: {sorted({u[2] for u in unmaps})[0]:#x} .. {sorted({u[2] for u in unmaps})[-1]:#x}")
     hit = [r for r in rows if r[3] is not None]
     lines.append(f"faults parsed: {len(rows)}; with an unmap of the same iova within +-{_span(window_us)}: {len(hit)}")
-    for t, iova, _text, best in hit[:20]:
+    for t, iova, _text, best, n in hit[:20]:
         (ut, _u, size), d = best
         verdict = "unmap BEFORE fault (translation gone)" if d < 0 else "unmap AFTER fault (stale mapping or other cause)"
-        lines.append(f"  iova {iova:#x} size {size:#x}: unmap {d:+.0f} us, {verdict}")
+        # A positive must say whether it discriminates. Measured 2026-11-16: one NVMe pool page is mapped and unmapped
+        # ~470 times a second, so a 30 s window holds thousands of unmaps of it and "the nearest" means nothing.
+        disc = "" if n <= 3 else f"  [1 of {n} unmaps of this iova in the window -- NOT discriminating, narrow --window]"
+        lines.append(f"  iova {iova:#x} size {size:#x}: unmap {d:+.0f} us, {verdict}{disc}")
     if rows and not hit:
         # A negative must name its own condition. The same sentence at a 5 ms window and at 30 s read alike, and the
         # 5 ms one was simply wrong, so the scale is in the line and the remedy is named with it.
         lines.append(f"  no fault shares an iova with an unmap inside +-{_span(window_us)}: ordering not shown by "
-                     f"this capture AT THIS WINDOW -- the measured unmap-to-fault interval on this box is 5-25 s, "
+                     f"this capture AT THIS WINDOW -- the interval is seconds on a sparse stream and sub-millisecond "
+                     f"where the page is recycled (measured 470/s on one NVMe pool page), "
                      f"so widen --window before reading this as 'no unmap preceded the fault'")
     return lines
 
@@ -203,7 +212,7 @@ def self_test():
     #    The fault is 100 s from any unmap: at 30 s that is still a miss, which is the shape a too-narrow window gives.
     out = " ".join(render(correlate(unm, [(300.000, 0x4128000, "f5")], 30_000_000), unm, 30_000_000))
     chk("+-30 s" in out and "30000000 us" not in out, "a 30 s window reads as '+-30 s', not '+-30000000 us'")
-    chk("AT THIS WINDOW" in out and "5-25 s" in out,
+    chk("AT THIS WINDOW" in out and "sparse stream" in out,
         "a negative names the window it used and the measured interval, not 'nothing correlated' bare")
     chk("+-5000 us" in " ".join(render(correlate(unm, [(100.500, 0x4128000, "f3")], 5000), unm, 5000)),
         "a sub-second window still reads in microseconds")
@@ -221,6 +230,15 @@ def self_test():
     hit = correlate(near, pf[:1], 30_000_000)
     chk(hit and hit[0][3] is not None and hit[0][3][1] < 0,
         "a padded fault correlates with an unmap 31 us earlier (BEFORE), not an uncorrelated negative")
+    # 9. a POSITIVE must say whether it discriminates: a page recycled hundreds of times a second puts thousands of
+    #    unmaps in a wide window, and then "the nearest one" is not evidence. Measured 2026-11-16: one NVMe pool page
+    #    is mapped and unmapped ~470 times a second (nvme_prep_rq maps it, nvme_pci_complete_batch unmaps it).
+    hot = [(100.0 + i * 0.001, 0x4128000, 0x1000) for i in range(500)]   # 500 unmaps over 0.5 s
+    hr = correlate(hot, [(100.4, 0x4128000, "f6")], 30_000_000)
+    chk(hr[0][4] == 500 and "NOT discriminating" in " ".join(render(hr, hot, 30_000_000)),
+        "a page recycled hundreds of times a second is flagged as not discriminating")
+    chk("NOT discriminating" not in " ".join(render(correlate(unm, [(100.0005, 0x4128000, "f1")], 5000), unm, 5000)),
+        "a lone unmap in the window is not flagged")
     return 0 if ok else 1
 
 
@@ -232,7 +250,9 @@ def main():
     # 5.6 s / 24.7 s / 24.7 s earlier, and a 5 ms default answered "no fault shares an iova with an unmap" on the
     # very capture that contains them. The interval is seconds here; a small default hides the finding.
     ap.add_argument("--window", type=float, default=30_000_000.0,
-                    help="window in microseconds (default 30,000,000 = 30 s; measured interval on this box is 5-25 s)")
+                    help="window in microseconds (default 30,000,000 = 30 s). The interval is seconds on a sparse stream "
+                         "and sub-millisecond on a recycled page (470/s measured), so the count of unmaps in the "
+                         "window is reported: a pairing with many candidates is not evidence")
     ap.add_argument("--epoch-offset", type=float, default=0.0,
                     help="seconds to add to journal stamps to reach the trace's boot clock")
     ap.add_argument("--self-test", action="store_true")

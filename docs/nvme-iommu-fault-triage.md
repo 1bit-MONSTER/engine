@@ -134,8 +134,10 @@ only if you want to confirm that, not as a discriminator.
 
 ```bash
 # 1. pick the top faulting IOVA from the census
-<<<<<<< HEAD
-=======
+# 2. kprobe iommu_unmap_fast on that iova alone (filter), stacktrace on, capture for minutes in the background
+# 3. in the same capture window, note the fault timestamps for that iova
+```
+
 **The interval is seconds, not milliseconds (measured 2026-11-16).** A filtered probe on one faulting IOVA
 (`0xe1e18000`), captured over a boot's first 28 minutes, found **60 unmaps of that page, every one a single 4 KiB
 page, 59 of them from `<idle>` (interrupt context)**: the NVMe completion path repeatedly maps and tears down one
@@ -144,20 +146,83 @@ pooled page. **Three of the four faults on it** followed an unmap of that same p
 page within 60 s** -- the nearest is **+74 s**, after the fault -- so this capture correlates three faults and shows
 the ceiling on the fourth; a wider window does not help it, and the earlier "19.60 s" I quoted for it came from a
 different capture and does not reproduce on this one. So `tools/diag/unmap_fault_order.py` defaults to **30 s** and
-the page's own numbers are **5-25 s**: a millisecond window reports "nothing correlated" on a capture that contains
-the correlation. Because the same sentence is printed whether the window is too narrow or the fault genuinely has no
-nearby unmap, **the negative now names the window it used and the measured interval** -- a default alone does not fix
-the failure, only a negative that says *at what scale* it found nothing does.
+the page's own numbers are **5-25 s on that sparse stream**: a millisecond window reports "nothing correlated" on a
+capture that contains the correlation. Because the same sentence is printed whether the window is too narrow or the
+fault genuinely has no nearby unmap, **the negative names the window it used and the measured interval** -- a default
+alone does not fix the failure, only a negative that says *at what scale* it found nothing does.
+
+**But "seconds" is not the rate of this stream -- it is the rate of that capture.** The same page measured again on a
+busier boot is mapped and unmapped **about 470 times a second**: `nvme_prep_rq` maps it through `dma_map_phys` ->
+`iommu_map`, and `nvme_pci_complete_batch` unmaps it from the completion IRQ through both `dma_unmap_phys` and
+`dma_iova_unlink`/`dma_iova_destroy` (150 s, one IOVA, filtered, counts 27644 / 35907 / 33141). **So a wide window is
+the wrong instrument in the other direction**: at that rate a +/-30 s window holds ~14,000 unmaps of the page and "the
+nearest one was 31 us before the fault" is not evidence of anything. The tool therefore **carries the count** and flags
+a pairing whose window held more than three unmaps of the same IOVA:
+`[1 of N unmaps of this iova in the window -- NOT discriminating, narrow --window]`. On the burst capture above it
+fires on the -5.65 s pairing immediately (`1 of 7`), which is the honest reading: **the interval is real, its precision
+is not.**
+
+**Three ways a filtered kprobe silently measures nothing**, all hit while taking the counts above:
+
+1. **`tracing_on=0` with `enable=1`** records nothing, and the empty buffer reads exactly like "0 events". Check
+   `tracing_on` and `entries-written` on every capture, and run a **positive control** first (30 s of events, abort if
+   zero).
+2. **A `stacktrace` trigger suppresses the event's own line.** The dump is `<stack trace>` blocks with no `iova=` text
+   at all, so a filter that is working perfectly looks like it never applied. Count events *without* the trigger first.
+   And `stacktrace:unlimited` must be cleared (`echo '!stacktrace:0' > .../trigger`) before `-:kprobes/x` will delete
+   the event -- otherwise the delete fails with `echo: I/O error` and the probe stays armed.
+3. **tracefs rejects range filters, and the failed write leaves the probe UNFILTERED.**
+   `(iova + size > 0xX && iova <= 0xX)` gives `parse_error: Invalid operator`; the event then records **every** unmap
+   (1,947 in 20 s, against 18 in 30 s for the working exact filter). **Read the filter file back after writing it**, and
+   keep in mind that an exact-iova filter cannot see a *larger* mapping that covers the page -- for this driver that is
+   tolerable because its unmaps are all 4 KiB (60 of 60 measured), but it is a measured caveat, not a proof.
+
+**Arm the map side too, unfiltered, and the argument for one address stops being needed (measured 11-16 06:42Z).**
+A filtered capture on five addresses chosen from the fault census recorded **zero events in 30 s** and aborted on its
+own positive control -- because **the fault target moves**: the last three faults were all on an address the list did
+not contain. The capture that worked armed `iommu_map` and `iommu_unmap_fast` with **no filter** for 13 minutes
+(44 unmaps/s is what a quiet minute looks like; a busy one is ~1,000/s, and the per-CPU ring still covered all 795 s).
+Of the 8 faults in that window:
+
+```
+0xebf50000  x4 faults   NO map or unmap of this iova anywhere in the 795 s
+0x6925f000  x1          nearest map +230 ms AFTER the fault
+0xe407f000  x2          nearest map/unmap -58 s
+0xe1d00000  x1          nearest -347 s
+```
+
+**Four of eight faults hit an IOVA that was never mapped and never unmapped at any point in 795 seconds of a capture
+holding 252,704 map/unmap events** -- so the translation is not stale, it is **absent, and nothing re-creates it**. That
+moves the question to the descriptor: the device writes to an address the driver has already finished with, which is a
+DMA-mapping lifetime bug, not a TLB or lazy-invalidation one. `0x6925f000` is the exception and worth separating: it is
+**re-mapped 230 ms after** the fault, the profile of a live pool page faulting before its re-map.
+
+The kprobe recipes, corrected against the kernel's own argument order -- the first one was wrong in this page's tool:
+
+```
+iommu_map(domain, iova, paddr, size, prot)        ->  iova=%si size=%cx    # %dx is PADDR, and a probe
+                                                                          # using it printed size=0x138ec90000
+iommu_unmap_fast(domain, iova, size, ...)        ->  iova=%si size=%dx
+```
+
+**A task name can contain a space** (`next-server (v1-8386`), so a regex anchored with `^\s+\S+\s+\[` silently dropped
+**2,176 of 115,941 map lines** -- 1.9 %, which is exactly the fraction that can contain the event being looked for.
+Anchor on the timestamp instead, and reconcile the parse count against `grep -c` before believing a negative.
+
+**And the reverse is just as wrong: a positive must say whether it discriminates.** The same page's cadence is
+workload-dependent -- a later capture on this box (05:40Z, 150 s, one IOVA filtered) found the NVMe paths mapping it
+from `nvme_prep_rq` through `dma_map_phys` and unmapping it from `nvme_pci_complete_batch` through
+`iommu_unmap_fast`, **about 470 times a second**. At that rate a ±30 s window holds ~14,000 unmaps of the page, so
+"the nearest one was 31 us before the fault" is not evidence of anything. **The tool now carries the count**: a
+pairing whose window held more than three unmaps of the same IOVA is printed with
+`[1 of N unmaps of this iova in the window -- NOT discriminating, narrow --window]`. On the burst capture above that
+fires immediately -- the -5.65 s pairing is `1 of 7` -- which is the honest reading of it.
 
 **One probe owns the shared buffer.** A kprobe on `iommu_unmap_fast` with **no filter** wrote 579,000 events and left
 a filtered probe on the same function with **zero** -- the trace ring buffer is shared, so the *narrow* probe (one
 IOVA, one call site) is the one that should be armed, and checking `grep -c '<probe>:' trace` before trusting a
 capture is the same "prove the plumbing" rule two paragraphs up.
 
->>>>>>> 2b1faf1b2 (diag: a negative names the window it used, and the window reads in seconds)
-# 2. kprobe iommu_unmap_fast on that iova alone (filter), stacktrace on, capture for minutes in the background
-# 3. in the same capture window, note the fault timestamps for that iova
-```
 
 The question the ordering answers: does a fault follow an unmap of the *same* address, or does it arrive while the
 address is still mapped? The first is a write-after-unmap — the device dirtying a buffer the CPU released, or the driver

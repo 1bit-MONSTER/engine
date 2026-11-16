@@ -79,8 +79,8 @@ int main() {
     }
     char elf[4096];
     int M = 0, K = 0, N = 0;
-    if (std::sscanf(spec, "%4095s %d %d %d", elf, &M, &K, &N) != 4 || M % 128 || !w::fits(K, N) || N % 1024) {
-        std::printf("npu_w4g32_gate: bad W4G32_GATE \"%s\" (M %% 128, K %% 128, N %% 1024)\n", spec);
+    if (std::sscanf(spec, "%4095s %d %d %d", elf, &M, &K, &N) != 4 || !w::a_tile_rows(M) || !w::fits(K, N) || N % 1024) {
+        std::printf("npu_w4g32_gate: bad W4G32_GATE \"%s\" (M 16 or %% 128, K %% 128, N %% 1024)\n", spec);
         return 1;
     }
     int fails = 0;

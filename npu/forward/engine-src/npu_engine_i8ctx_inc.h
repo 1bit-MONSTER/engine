@@ -218,8 +218,8 @@ struct I8Ctx {
                             "(K=%d N=%d)\n", KD, ND);
             return false;
         }
-        if (w4g32 && (pb16i || t2s || blocked_b || !q4nx_w4g32::fits(KD, ND) || ND % 1024 || MD % 128)) {
-            fprintf(stderr, "  I8Ctx::init_elf: the w4g32 layout needs K%%128==0, N%%1024==0, M%%128==0 and no other "
+        if (w4g32 && (pb16i || t2s || blocked_b || !q4nx_w4g32::fits(KD, ND) || ND % 1024 || !q4nx_w4g32::a_tile_rows(MD))) {
+            fprintf(stderr, "  I8Ctx::init_elf: the w4g32 layout needs K%%128==0, N%%1024==0, M==16 or M%%128==0 and no other "
                             "weight layout (M=%d K=%d N=%d)\n", MD, KD, ND);
             return false;
         }

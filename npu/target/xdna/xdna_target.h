@@ -219,7 +219,12 @@ public:
     // The context a launch of `rows` rows on `role` would use: the M=16 twin when one was adopted and
     // the row count fits, otherwise the M=128 one. The forward needs this where it launches a GEMM
     // itself (the LM head) instead of going through gemv().
-    I8Ctx* pick_ctx(int role, int rows, bool decode_twin = false) { return ctx_for(ctx(role), rows, decode_twin); }
+    // int8_only: the caller launches int8 images of its own (the LM head), so it must get an int8 context even where
+    // the role's layer GEMMs run a w4g32 one.
+    I8Ctx* pick_ctx(int role, int rows, bool decode_twin = false, bool int8_only = false) {
+        return ctx_for(ctx(role), rows, decode_twin, int8_only);
+    }
+    int  w4_decode_rows() const { return w4_decode_ ? 16 : 0; }   // the w4g32 decode family (NPU_W4_PREFILL)
 
     // Profiling / gates, driven from the forward's per-token loop.
     void note_token() { prof_tok_n_++; }
@@ -227,7 +232,9 @@ public:
     void dump_profile();
 
 private:
-    I8Ctx* ctx_for(I8Ctx* prefill, int rows, bool decode_twin);
+    I8Ctx* ctx_for(I8Ctx* prefill, int rows, bool decode_twin, bool int8_only = false);
+    bool   open_w4_decode(const Q4nxDesignGeom* designs16, int n);
+    int    w4_decode_head_role(const Q4nxDesignGeom* designs16, int n) const;
     int    design_index(I8Ctx* c) const;
     void   prof_add(ProfAcc* acc, int design, double pack, double quant, double wait, double rb,
                     double fill = 0.0);
@@ -258,6 +265,8 @@ private:
     std::unique_ptr<I8Ctx> ctx_[Q4NX_MAX_DESIGNS];
     Q4nxDesignGeom designs16_[Q4NX_MAX_DESIGNS];
     std::unique_ptr<I8Ctx> ctx16_[Q4NX_MAX_DESIGNS];
+    std::unique_ptr<I8Ctx> ctx16w_[Q4NX_MAX_DESIGNS];   // NPU_W4_PREFILL: the w4g32 M=16 decode family (layer GEMMs only)
+    bool w4_decode_ = false;
     std::unique_ptr<I8Ctx> ctxw_[Q4NX_MAX_DESIGNS];   // the wide pb16i/t2s family (engine#1990)
     int wide_rows_ = 0;                               // 0 = no wide family
     int w4_rows_ = 0;                                 // NPU_W4_PREFILL: the w4g32 prefill tier's M (0 = off)

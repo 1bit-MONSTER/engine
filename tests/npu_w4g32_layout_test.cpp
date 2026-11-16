@@ -179,8 +179,27 @@ static void test_factor_pack() {
     CHECK(!w::pack(bad.data(), s2.data(), K, N, img.data(), cs.data()), "pack accepted code 8");
 }
 
+static void test_a_pack(int M, int mt) {
+    const int K = 256, ld = K + 32;
+    std::mt19937 rng(13 + M);
+    std::vector<int8_t> a((size_t)M * ld), ap((size_t)M * K);
+    for (auto& x : a) x = (int8_t)((int)(rng() % 255) - 127);
+    CHECK(w::a_tile_rows(M) == mt, "a_tile_rows(%d) = %d, want %d", M, w::a_tile_rows(M), mt);
+    CHECK(w::pack_a(a.data(), ld, M, K, ap.data()), "pack_a M=%d", M);
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < K; k++) {
+            // A.reshape(M/mt, mt/4, 4, K/128, 8, 16).transpose(0, 3, 1, 4, 2, 5)
+            const int rt = m / mt, mb = (m % mt) / 4, r = m % 4, ki = k / 128, kb = (k % 128) / 16, cc = k % 16;
+            const size_t o = (((((size_t)rt * (K / 128) + ki) * (mt / 4) + mb) * 8 + kb) * 4 + r) * 16 + cc;
+            CHECK(ap[o] == a[(size_t)m * ld + k], "pack_a M=%d (%d,%d)", M, m, k);
+        }
+}
+
 static void test_a_and_ref() {
-    const int M = 64, K = 256, N = 128, ld = K + 32;
+    test_a_pack(128, 32);   // the prefill designs: 32 rows per core row
+    test_a_pack(512, 32);
+    test_a_pack(16, 16);    // the M=16 decode design: all 16 rows on one core row
+    const int M = 128, K = 256, N = 128, ld = K + 32;
     std::mt19937 rng(11);
     std::vector<int8_t> a(M * ld), ap(M * K), c(K * N);
     for (auto& x : a) x = (int8_t)((int)(rng() % 255) - 127);
@@ -194,6 +213,7 @@ static void test_a_and_ref() {
             CHECK(ap[o] == a[(size_t)m * ld + k], "pack_a (%d,%d)", m, k);
         }
     CHECK(!w::pack_a(a.data(), ld, 48, K, ap.data()), "pack_a accepted M=48");
+    CHECK(!w::pack_a(a.data(), ld, 64, K, ap.data()), "pack_a accepted M=64 (no design is built at 64)");
     std::vector<float> s((K / 32) * N);
     for (auto& x : s) x = (float)((int)(rng() % 255) - 127);
     std::vector<uint8_t> img(w::w_bytes(K, N));
@@ -234,17 +254,20 @@ static void test_device_vectors() {
     // un-pack A with the restated order, check pack_a gives the file back, then sample C_ref
     std::vector<int8_t> a((size_t)M * K), ap((size_t)M * K);
     size_t o = 0;
-    for (int rt = 0; rt < M / 32; rt++)
+    const int mt = w::a_tile_rows(M);
+    CHECK(mt > 0, "W4G32_VEC M=%d is not a design M", M);
+    if (!mt) return;
+    for (int rt = 0; rt < M / mt; rt++)
         for (int ki = 0; ki < K / 128; ki++)
-            for (int mb = 0; mb < 8; mb++)
+            for (int mb = 0; mb < mt / 4; mb++)
                 for (int kb = 0; kb < 8; kb++)
                     for (int r = 0; r < 4; r++)
-                        for (int cc = 0; cc < 16; cc++) a[(size_t)(rt * 32 + mb * 4 + r) * K + ki * 128 + kb * 16 + cc] = (int8_t)A[o++];
+                        for (int cc = 0; cc < 16; cc++) a[(size_t)(rt * mt + mb * 4 + r) * K + ki * 128 + kb * 16 + cc] = (int8_t)A[o++];
     w::pack_a(a.data(), K, M, K, ap.data());
     CHECK(std::memcmp(ap.data(), A.data(), A.size()) == 0, "pack_a does not reproduce the device's A.bin");
     const int32_t* cr = reinterpret_cast<const int32_t*>(C.data());
     int checked = 0;
-    for (int m = 0; m < M; m += 61)
+    for (int m = 0; m < M; m += (M > 61 ? 61 : 5))
         for (int n = 0; n < N; n += 97) {
             const int64_t v = w::ref_dot(a.data() + (size_t)m * K, reinterpret_cast<const uint8_t*>(W.data()), K, N, n);
             CHECK(v == cr[(size_t)m * N + n], "C_ref (%d,%d): %lld vs %d", m, n, (long long)v, cr[(size_t)m * N + n]);

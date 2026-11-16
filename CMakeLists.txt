@@ -1394,6 +1394,11 @@ if(Python3_Interpreter_FOUND)
     # payloads under tests/fixtures/fflm/ — engine #588), so a regression cannot leave the
     # daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
+    # engine#2710: the WATCHER is tested above; the issue EXCERPT that carries its findings is shell in
+    # .github/workflows/census-watch.yml, and it is capped at 40 lines, so which lines fill it decides whether the
+    # issue says anything. Runs the workflow's own block against a log of the 11-16 13:00Z shape.
+    add_test(NAME census_watch_excerpt COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_excerpt_test.py)
+    set_tests_properties(census_watch_excerpt PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     # an installed package must find its libraries beside itself: the 2026-11-08 incident's rule, from
     # the installed side that no release gate can reach (engine #1411). Skips without patchelf/readelf.
     add_test(NAME installed_rpath COMMAND bash ${CMAKE_SOURCE_DIR}/tests/installed_rpath_test.sh)

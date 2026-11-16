@@ -429,6 +429,51 @@ kill_tree() {
     kill -KILL -- "-$root" 2> /dev/null
     for p in $tree; do kill -KILL "$p" 2> /dev/null; done
 }
+# A payload can leave the process group entirely -- `setsid`, or a double fork -- and then neither the group kill nor
+# the descendant snapshot can see it, because both are anchored on the tree. Measured 2026-11-16: a `1bit serve` took
+# **44.4 GiB of GTT**, its ticket ended, and the serve held the memory for 64 minutes while the box went to 351 MiB
+# available with two OOM kills in the hour (`ps -o ppid=` -> 1, and its own environment still said
+# `GPU_HOLD_TICKET=... pid 3216578`, a pid that no longer existed). engine#1621 fixed grandchildren and engine#1649 the
+# process group; this is the one shape neither reaches.
+#
+# The environment is the detector that does not depend on the tree: every process the payload started INHERITED this
+# ticket's GPU_HOLD_TICKET, whatever it did to its parentage, session or group. So after the teardown, any live process
+# still carrying this exact ticket line is work this ticket started and did not end.
+#
+# This is a detector, not an enforcement of the promise, and the boundary is worth naming: a payload that also scrubs
+# its environment (`env -i`, `unset GPU_HOLD_TICKET`) starts work that carries no ticket line, and nothing here would
+# see it. For that case the `.gpu-hold-survivors` file and the next holder's #1639 warning are the backstop -- so is
+# the memory floor's other side, a lane that reads GTT before it takes a ticket. A reader deciding whether to trust the
+# teardown line should read it as "no escapee that kept its environment", not as "no escapee".
+env_survivors() {   # <exact ticket line> -> pids carrying it, excluding this shell and any nested holder
+    local want=$1 d p line cmd first second
+    ENV_UNREADABLE=0
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [ "$p" = "$$" ] && continue
+        if [ ! -r "$d/environ" ]; then
+            # engine#2744 review: silently skipping an unreadable process makes an escapee invisible and the teardown
+            # line reads clean. Counted and reported by the caller, which is what every other guard in this script does.
+            ENV_UNREADABLE=$((ENV_UNREADABLE + 1))
+            continue
+        fi
+        line=$(tr '\0' '\n' < "$d/environ" 2> /dev/null | grep -m1 -F "GPU_HOLD_TICKET=$want") || continue
+        [ "$line" = "GPU_HOLD_TICKET=$want" ] || continue
+        # engine#2737's override (`GPU_HOLD_ALLOW_NESTED=1`) means an inner gpu-hold runs with the OUTER ticket line in its
+        # environment by design -- env is frozen at exec, and the inner script only exports its own line to its child. That
+        # holder manages its own teardown; killing it here would leave its ticket file behind and block the queue until a
+        # human noticed. So a process whose own command IS gpu-hold is not an escapee.
+        cmd=$(tr '\0' ' ' < "$d/cmdline" 2> /dev/null)
+        first=${cmd%% *}
+        second=${cmd#* }
+        second=${second%% *}
+        if [ "${first##*/}" = "gpu-hold" ] || [ "${second##*/}" = "gpu-hold" ]; then
+            continue
+        fi
+        printf '%s\n' "$p"
+    done
+}
+
 # The payload gets its PROCESS GROUP of its own (`set -m` makes every background job a group leader), because a
 # process group is the one thing a descendant cannot escape: reparenting to init does not change it, and a group
 # outlives its leader, so `kill -- -$child` still reaches the children AFTER the payload's root has gone. Without it
@@ -624,6 +669,31 @@ kill "$watchdog" 2> /dev/null
 wait "$watchdog" 2> /dev/null
 # And end whatever is left from here too, so the promise does not depend on a helper having outlived its parent.
 kill_tree "$child"
+# ...and the part of the tree that left the tree: a process still carrying this ticket's GPU_HOLD_TICKET is work this
+# hold started, wherever it moved itself. TERM, then KILL after the same grace the tree kill uses, then record it, so
+# the next holder is warned even if the KILL somehow failed.
+escaped=$(env_survivors "$mine")
+if [ "${ENV_UNREADABLE:-0}" -gt 0 ]; then
+    log "::warning::${ENV_UNREADABLE} process(es) could not be inspected at teardown (their environment is not readable by this user), so an escapee among them would not be seen here; the tree kill above is the only guard that covers them"
+fi
+if [ -n "$escaped" ]; then
+    log "::warning::$(printf '%s' "$escaped" | tr '\n' ' ') escaped the ticket's process tree but still carry this ticket's GPU_HOLD_TICKET - ending them (engine#2741)"
+    for p in $escaped; do kill -TERM "$p" 2> /dev/null; done
+    i=0
+    while [ "$i" -lt "${GPU_HOLD_KILL_GRACE:-10}" ] && kill -0 $escaped 2> /dev/null; do
+        sleep 1
+        i=$((i + 1))
+    done
+    for p in $escaped; do
+        kill -0 "$p" 2> /dev/null || continue
+        kill -KILL "$p" 2> /dev/null
+        {
+            printf 'pid=%s start=%s cmd=%s\n' "$p" \
+                "$(ps -o lstart= -p "$p" 2> /dev/null | sed 's/^ *//' || printf unknown)" \
+                "$(tr '\0' ' ' < "/proc/$p/cmdline" 2> /dev/null | cut -c1-120 || printf unknown)"
+        } >> "$SURVIVORS" 2> /dev/null || true
+    done
+fi
 if [ "$rc" = 124 ]; then
     # engine#2542, measured on the NPU: a ticket cut short by the max hold was followed 8m29s later -- with nothing
     # running -- by `Unsupported op 18` and an IO_PAGE_FAULT burst, and the two other bursts of that boot sat 3m26s

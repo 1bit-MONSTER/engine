@@ -437,6 +437,36 @@ void test_fconst17_rewrite() {
     std::string got;
     try {
         got = pi::canonical_token_fconst17_exported(tok, dir.string(), d, work);
+
+    // engine#2650: the rewrite records the block stride it WROTE, and the reader must prefer it over the epsilon vote
+    // (a 12-byte anchor occurs inside 4-bit tiles). Checked against the file it produced, not against the arithmetic that
+    // produced it: layers x stride + head has to be the copy's exact size, and an off-by-64 (a header) fails here.
+    {
+        const int64_t st = pi::fconst17_known_stride_exported(dir.string());
+        const int64_t hd = pi::fconst17_known_head_exported(dir.string());
+        check(st > 0, "1.7 rewrite: the block stride it wrote is recorded");
+        const auto sz = std::filesystem::file_size(work);
+        const int64_t tl = pi::fconst17_known_tail_exported(dir.string());
+        check(int64_t(sz) == int64_t(d.layers) * st + tl,
+              "1.7 rewrite: layers x recorded stride + measured tail is the copy's exact size");
+
+        // engine#2650 review: the REFUSAL is the branch a later edit is most likely to relax ("helpfully" preferring the
+        // recorded value would pass every other arm and reintroduce the failure in the other direction), so pin it directly.
+        {
+            std::string why;
+            check(pi::fconst17_reconcile_exported(0, 200, &why) == 200 && why.empty(),
+                  "reconcile: a failed vote yields to the rewrite's measurement");
+            check(pi::fconst17_reconcile_exported(200, 200, &why) == 200 && why.empty(),
+                  "reconcile: two witnesses that agree keep the stride");
+            check(pi::fconst17_reconcile_exported(100, 0, &why) == 100 && why.empty(),
+                  "reconcile: no rewrite record leaves the vote alone (the 1.8 / R1-Distill line)");
+            why.clear();
+            check(pi::fconst17_reconcile_exported(100, 200, &why) == 0,
+                  "reconcile: disagreement REFUSES rather than choosing");
+            check(why.find("100") != std::string::npos && why.find("200") != std::string::npos,
+                  "reconcile: the refusal names both numbers");
+        }
+    }
     } catch (const std::exception& e) {
         said = e.what();
     }

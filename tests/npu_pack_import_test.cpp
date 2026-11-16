@@ -437,6 +437,18 @@ void test_fconst17_rewrite() {
     std::string got;
     try {
         got = pi::canonical_token_fconst17_exported(tok, dir.string(), d, work);
+
+    // engine#2650: the rewrite records the block stride it WROTE, and the reader must prefer it over the epsilon vote
+    // (a 12-byte anchor occurs inside 4-bit tiles). Checked against the file it produced, not against the arithmetic that
+    // produced it: layers x stride + head has to be the copy's exact size, and an off-by-64 (a header) fails here.
+    {
+        const int64_t st = pi::fconst17_known_stride_exported(dir.string());
+        const int64_t hd = pi::fconst17_known_head_exported(dir.string());
+        check(st > 0, "1.7 rewrite: the block stride it wrote is recorded");
+        const auto sz = std::filesystem::file_size(work);
+        check(int64_t(sz) == int64_t(d.layers) * st + hd,
+              "1.7 rewrite: layers x recorded stride + head is the copy's exact size");
+    }
     } catch (const std::exception& e) {
         said = e.what();
     }

@@ -4559,6 +4559,38 @@ void test_embedding_component(const std::string& root) {
     std::string why2;
     check(pi::read_embedding_component(none.string(), &why2).empty() && !why2.empty(),
           "embedding component: absent -> empty with a reason (" + why2 + ")");
+
+    // engine#2663: the table scan is NAME-driven (`embed_tokens`), so a tied-embedding graph -- which ships no such node and
+    // calls its token table `lm_head.weight` -- bound nothing and the refusal read as "no embedding". Both directions:
+    // the tied 2-D f32 table must READ (values exact), and a tied pack whose only candidate is not 2-D must still REFUSE,
+    // because a 4-bit tied table needs `scales` and reading the 0-D `embed_scale` beside it as one is the guess #2663 names.
+    {
+        const fs::path tied = dir / "tied";
+        fs::create_directories(tied);
+        const int64_t TV = 4, TH = 8;
+        std::vector<float> tv(size_t(TV) * TH);
+        for (size_t i = 0; i < tv.size(); ++i) tv[i] = float(i) * 0.25f;
+        put_file((tied / "embedding.onnx.data").string(),
+                 std::string(reinterpret_cast<const char*>(tv.data()), tv.size() * sizeof(float)));
+        put_file((tied / "embedding.onnx").string(),
+                 pb::model({pb::tensor("lm_head.weight", {TV, TH}, "embedding.onnx.data", 0, tv.size() * sizeof(float))}, {}));
+        std::string wt;
+        const std::vector<float> tied_got = pi::read_embedding_component(tied.string(), &wt);
+        bool tied_ok = tied_got.size() == size_t(TV) * size_t(TH);
+        for (size_t i = 0; tied_ok && i < tied_got.size(); ++i) tied_ok = std::fabs(tied_got[i] - tv[i]) < 1e-6f;
+        check(tied_ok, "engine#2663: a tied lm_head.weight IS the token table, values exact (why: " + wt + ")");
+
+        // Same pack, but the tied name is not 2-D: nothing may be read, and the refusal must say so rather than invent a table.
+        const fs::path scalar = dir / "tied_scalar";
+        fs::create_directories(scalar);
+        put_file((scalar / "embedding.onnx.data").string(), std::string(4, '\0'));
+        put_file((scalar / "embedding.onnx").string(),
+                 pb::model({pb::tensor("lm_head.weight", {4}, "embedding.onnx.data", 0, 4),
+                            pb::tensor("embed_scale", {}, "embedding.onnx.data", 0, 4)}, {}));
+        std::string ws;
+        check(pi::read_embedding_component(scalar.string(), &ws).empty() && !ws.empty(),
+              "engine#2663: a 1-D tied table with a 0-D embed_scale beside it is still refused (" + ws + ")");
+    }
     if (!getenv("KEEP_EMBEDCOMP")) fs::remove_all(dir);
 }
 

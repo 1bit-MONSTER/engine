@@ -513,6 +513,36 @@ void test_fconst17_rewrite() {
         check(!pi::fconst17_geometry_exported(f17.size() + 1024 * T, d).empty(),
               "1.7 fconst: padding past 65,536 head rows does not fit");
     }
+    // engine#2658: a tied model's file ends with the last layer (Phi-4-mini: exactly 32 strides). The rewrite is the 1.8
+    // stream without the head -- what that pack's 1.8 twin carries -- and a file one tile short of that is not taken.
+    {
+        const std::string f17n = f17.substr(0, f17.size() - size_t(head));
+        const std::string f18n = f18.substr(0, f18.size() - size_t(head));
+        check(pi::fconst17_geometry_exported(f17n.size(), d).empty(), "1.7 fconst: a file with no head fits");
+        check(!pi::fconst17_geometry_exported(f17n.size() - size_t(T), d).empty(), "1.7 fconst: one tile short of the layers does not");
+        const std::string tokh = (dir / "nohead.fconst").string();
+        put_file(tokh, f17n);
+        std::string outh, saidh;
+        try {
+            check(pi::canonical_token_fconst17_exported(tokh, dir.string(), d, work + ".h") == work + ".h",
+                  "1.7 fconst: a file with no head is rewritten");
+        } catch (const std::exception& e) { saidh = e.what(); }
+        {
+            std::ifstream f(work + ".h", std::ios::binary);
+            outh.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        check(saidh.empty() && outh == f18n, "1.7 fconst: the no-head file rewrites to the 1.8 stream without its head (" +
+                                                 std::to_string(outh.size()) + " vs " + std::to_string(f18n.size()) + " B, " + saidh + ")");
+        // #2666 review, the negative case: the no-head form is NOT a catch-all for a missing head. With no graph matmul of the
+        // head's geometry (N = V, K = H), the reader falls to the tail; the rewritten copy's tail is the envelope alone,
+        // and plan_tail_head() refuses it by name -- so an untied pack without a head anywhere still refuses.
+        const int64_t env18 = 64 + 2 * H, layers_end = int64_t(f18n.size()) - env18;
+        const pi::TailHeadPlacement th = pi::plan_tail_head(int64_t(f18n.size()), layers_end, env18, 1, T, 0);
+        check(!th.why.empty() && th.why.find("shorter") != std::string::npos,
+              "1.7 fconst: with no head in the graph, the no-head copy's tail is refused by name (" + th.why + ")");
+        const pi::TailHeadPlacement th2 = pi::plan_tail_head(int64_t(f18.size()), layers_end, env18, 1, T, 0);
+        check(th2.why.empty(), "1.7 fconst: control -- the copy WITH its head places the head in the tail (" + th2.why + ")");
+    }
     // the graph's RMSNorm epsilon (a node with a float attribute), read back
     std::string node, attr;
     pb::str(node, 4, "SimplifiedLayerNormalization");

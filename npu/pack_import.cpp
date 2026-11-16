@@ -958,6 +958,15 @@ std::string fconst17_geometry(uint64_t size, const Dims& d, Fconst17Geom* g) {
         return "";
     }
     g->pad = 0;
+    // engine#2658: a model that TIES `lm_head` to the embedding exports no head tiles, so its Token file is exactly
+    // layers x stride. The arithmetic above is right and the file is still not this form -- but the refusal used to
+    // fall through to the generic size sentence, and the caller then fell back to the epsilon vote, which reported
+    // "fewer than 6 RMSNorm epsilon headers in the first GiB". Nothing was wrong with the epsilons: the file is short
+    // by exactly its head. Naming that here keeps a reader out of the epsilon machinery (engine#2650, #2651).
+    if (size == uint64_t(d.layers) * uint64_t(g->stride))
+        return "the pack carries no head tiles: the file is exactly " + std::to_string(d.layers) + " x " +
+               std::to_string(g->stride) + " B = " + std::to_string(size) + " B, and this geometry's head would add " +
+               std::to_string(g->head) + " B -- the model ties lm_head to the embedding (engine#2658)";
     if (size != want)
         return "the file is " + std::to_string(size) + " B, and the 1.7 headerless form of this geometry is " +
                std::to_string(d.layers) + " x " + std::to_string(g->stride) + " + a " + std::to_string(g->head) +

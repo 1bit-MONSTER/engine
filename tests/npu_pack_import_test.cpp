@@ -584,6 +584,21 @@ void test_fconst17_known_geometry() {
     f17[1000] = char(d.eps_bits & 0xFF), f17[1001] = char(d.eps_bits >> 8);
     for (int i = 2; i < 12; ++i) f17[size_t(1000 + i)] = '\0';
     check(pi::fconst17_geometry_exported(f17.size(), d).empty(), "known geometry: the synthetic 3-layer stream fits");
+    // engine#2658: a TIED model exports no head tiles, so its Token file is exactly layers x stride. The arithmetic
+    // must say THAT, not fall through to the generic size sentence -- the caller then blames the epsilon vote, which
+    // is where #2658 was pointed before the arithmetic named the real cause.
+    {
+        const std::string tied = pi::fconst17_geometry_exported(uint64_t(f17.size() - head), d);
+        check(tied.find("no head tiles") != std::string::npos,
+              "known geometry: a stream that stops after the layers is named as a TIED head (" + tied + ")");
+        check(tied.find("RMSNorm") == std::string::npos,
+              "  ... and it does not send the reader to the epsilon headers");
+        check(tied.find("ties lm_head") != std::string::npos, "  ... it names the cause");
+        // one byte short of layers x stride is NOT the tied form: it is a truncated file, and must stay generic
+        const std::string short_one = pi::fconst17_geometry_exported(uint64_t(f17.size() - head - 1), d);
+        check(short_one.find("no head tiles") == std::string::npos && short_one.find("the file is") != std::string::npos,
+              "  ... but one byte short of it is a size error, not a tied head");
+    }
     const fs::path dir = fs::temp_directory_path() / ("fconst17kg." + std::to_string(::getpid()));
     fs::remove_all(dir);
     fs::create_directories(dir);

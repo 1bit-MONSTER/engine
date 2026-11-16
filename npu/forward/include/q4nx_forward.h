@@ -294,6 +294,7 @@ private:
     const std::vector<int>* rows_pos_ = nullptr;
     const std::vector<int>* rows_slot_ = nullptr;
     std::vector<std::vector<std::vector<float>>> user_kc_, user_vc_;   // [slot][layer] KV of each served slot
+    std::vector<int> user_len_;                                        // positions each slot holds (see step_users)
     std::vector<std::vector<float>> own_kc_, own_vc_;                  // the model's caches, parked for a pass
     int user_slot_on_ = -1;                                            // which slot kcache_ holds, -1 = the model's
     bool load_user_slot(int s);

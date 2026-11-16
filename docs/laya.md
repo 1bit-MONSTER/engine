@@ -33,8 +33,8 @@ checkpoints and a router that picks between them.
 
 | | Pin | Kept current by |
 |---|---|---|
-| Source | `third_party/laya` = `NandhaKishorM/laya` main **`fe9a6c35`** | `bump-laya.yml` |
-| Checkpoints | `config/laya.json` = Hugging Face `convaiinnovations/laya` at revision **`7b928d82`**: root (842 MB), `multilingual/` (644 MB, 34 MB tokenizer), `typed-decisions/` (842 MB) | `bump-laya.yml` (moves the source and the revision together) |
+| Source | `third_party/laya` = `NandhaKishorM/laya` main **`b1d656952f0f`** | `bump-laya.yml` |
+| Checkpoints | `config/laya.json` = Hugging Face `convaiinnovations/laya` at revision **`e333cb7c823c`**: root (842 MB), `multilingual/` (644 MB, 34 MB tokenizer), `typed-decisions/` (842 MB) | `bump-laya.yml` (moves the source and the revision together) |
 
 ```sh
 scripts/fetch-laya.sh            # into ~/.local/share/1bit/laya, where serve --laya looks

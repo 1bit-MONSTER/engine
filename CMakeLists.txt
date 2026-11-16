@@ -288,6 +288,8 @@ add_dependencies(onebit npu_decode_note_test)
 # engine#2106: a shipped kernel set's own consistency -- manifest vs bytes, one form or none, name vs directory. The
 # refusal this pre-empts ("differ in size") needed private-repo archaeology to diagnose; the symptom is checkable here.
 add_test(NAME kernel_set_check COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_set_check_test.sh)
+add_test(NAME fold_initializer_transpose COMMAND bash ${CMAKE_SOURCE_DIR}/tests/fold_initializer_transpose_test.sh)
+set_tests_properties(fold_initializer_transpose PROPERTIES SKIP_RETURN_CODE 77)
 
 # engine#2186/#2244: `tools/ci/dupdef_check.py`, a check that was only ever run by hand. It is the one
 # that found a shadowed `def self_test()` in tools/hrx_f16_narrowing_check.py -- the surviving copy
@@ -2592,6 +2594,14 @@ endif()
     # bit. Host-GEMM, no device; skips (77) unless ONEBIT_TEST_Q4NX names a causal model with GDN layers.
     # engine#2689 item 3: several sequences in ONE batched pass. Host-GEMM, no device; skips (77) unless
     # ONEBIT_TEST_Q4NX names a container. Each row must be bit-identical to that sequence's own single-sequence run.
+    # engine#2689 item 3b: several in-flight requests share one decode pass. Host-GEMM, no device; skips (77) unless
+    # ONEBIT_TEST_Q4NX names a container. Threads, because a serve runs one worker per request.
+    add_executable(npu_batch_decode_test tests/npu_batch_decode_test.cpp)
+    target_include_directories(npu_batch_decode_test PRIVATE npu/forward/include app)
+    target_link_libraries(npu_batch_decode_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test npu_batch_decode_test)
+    add_test(NAME npu_batch_decode COMMAND npu_batch_decode_test)
+    set_tests_properties(npu_batch_decode PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(step_users_test tests/step_users_test.cpp)
     target_include_directories(step_users_test PRIVATE npu/forward/include)
     target_link_libraries(step_users_test PRIVATE onebit_npu_forward)

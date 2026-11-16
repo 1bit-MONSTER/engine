@@ -1291,6 +1291,9 @@ if(Python3_Interpreter_FOUND)
     # engine#1745 review: pin() reads the INDEX (a staged bump) and refuses an UNMERGED index instead of returning the
     # merge base. Hermetic: a scratch git repo and a copy of the tool, git only, ~0.1 s.
     add_test(NAME registry_pin_index COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_pin_index_test.py)
+    # the box half of the pin watch (UNSLOTH-UD31): a box copy or a re-host that is not the pinned file, on synthetic
+    # pins and files; the cases the daily pin watch stayed green through (same size other bytes, a stale cached hash)
+    add_test(NAME pin_holdings COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/pin_holdings_test.py)
     # the same check where a lane actually runs it: with the bump staged and HEAD still behind, where a HEAD-only
     # read of the gitlink passed a registry recording the pin being replaced (engine#1738's post-commit failure)
     add_test(NAME registry_pins_staged COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_pin_staged_test.py)

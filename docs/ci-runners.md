@@ -304,6 +304,15 @@ the model ticketed, a memory window no longer needs to stop it: it is not reside
 Stopping it would only drop its queued ticket. That happened on 2026-11-15 at 10:00Z, when a window stopped the
 just-switched unit and its place in the queue was lost.
 
+**How long a measurement ticket must be willing to wait: `-w 1800`, not `-w 600`.** The ticketed unit holds with
+`-t 25` and re-queues with `-w 86400`, so a ticket queued *after* it waits out the remainder of a 25-minute hold before
+it becomes head. Measured 2026-11-16: two tickets on this box expired unseen, one at `-w 600` and one at `-w 120`,
+while the holder was mid-hold — and the failure line looks identical to a jammed queue (`queue never came round …
+(head: …coder-llm, token: gpu-hold coder-llm pid …)`), so the honest reading is *"I did not wait long enough"*, not
+*"the queue is broken"*. Queue order is fair: the ticket keeps its place, and the holder's *re-queued* ticket takes a
+later id, so waiting out one hold is enough. **Do not stop the unit to shorten the wait** — it is ticketed, stopping it
+only drops its queued place (2026-11-15 10:00Z).
+
 **Read the window's end line before believing a restart failed.** `scripts/window-run.sh` ends every window with one
 `end` line in `~/briefs/WINDOWS.log`, and the state it names decides whether anything is wrong. Four tokens, four
 meanings — only the last is a fault:

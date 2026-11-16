@@ -79,6 +79,10 @@ checks=(
     # engine#2416: the HIP add-on's f16 audit over $GPU_KERNELS_DIR (or third_party/gpu-kernels) at the pin; with no
     # tree it exits 77 and is listed as `skip`, never `ok`
     "tools/ci/hip_f16_audit.py --find ."
+    # gpu-kernels#99 put check-kernel-ids.py --self-test inside tools/check.sh, and gpu-kernels#102 says that
+    # repo has no CI -- so it ran when someone remembered. This runs it from the repo that does have CI, over the
+    # same discovery as the audit above; 77 when there is no tree, so a plain checkout is a skip, not a failure.
+    "tools/ci/kernel_id_selftest.py --check --find ."
 )
 
 # The page and this list drift apart, and it has happened twice in one night: the page said the runner "runs the first six"

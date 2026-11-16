@@ -37,6 +37,7 @@ import collections
 import os
 import sys
 import shutil
+import contextlib
 import io
 import tempfile
 
@@ -252,6 +253,28 @@ def self_test():
     finally:
         os.unlink(ppath.name)
 
+    # The headline is a claim about how many faults were EXPLAINED, so it may not count the ones the reader
+    # declined. Measured on the 2026-11-16 capture before the split: `attributions: 510` and 510 of 510 rows
+    # were NOT THIS DEVICE -- the count included exactly what it had just refused to attribute.
+    with tempfile.TemporaryDirectory() as _t:
+        with open(os.path.join(_t, "samples.log"), "w") as _f:
+            _f.write("1794798800\t222\t1\t/a serve\tscope\tticket\n")
+        with open(os.path.join(_t, "attributed.log"), "w") as _f:
+            _f.write("1794798810\t215633\t/serve\t-\tscope\tt\t" + A_ + "\n")
+            _f.write("1794798811\t215633\t/serve\t-\tscope\tt\t" + foreign.split("\t")[-1])
+        _argv = sys.argv
+        sys.argv = ["accel_attribution.py", "--dir", _t, "--window", "5"]
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                main()
+        finally:
+            sys.argv = _argv
+        out = buf.getvalue()
+        assert "fault records: 2 -- 1 on amdxdna, 1 on another device" in out, out[-600:]
+        assert "attributions: 1" in out, out[-600:]
+        assert "attributions: 2" not in out, "the declined row was counted as an attribution: " + out[-600:]
+
     # A partially written row must not kill the reader.
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
         f.write("100\t111\t1\t/a serve\tscope\tticket\n")
@@ -343,7 +366,17 @@ def main():
         print("\nholders seen (pid, first..last, samples, ticket):")
         print(render_holders(t))
 
-    print(f"\nattributions: {len(attrs)}")
+    # A fault record is not an attribution. Before this split the headline said "attributions: 510" on the
+    # 2026-11-16 capture and every one of the 510 was an NVMe fault this reader refuses to attribute -- a
+    # count that included the rows it had just declined to explain. Same shape as the denominators the fleet
+    # corrected on engine#2659: name what was actually explained, and name the rest beside it.
+    on_dev = attrs if args.any_device else [a for a in attrs if is_accel_fault(a[2])]
+    if args.any_device:
+        print(f"\nfault records: {len(attrs)} (--any-device: every device counts)")
+    else:
+        print(f"\nfault records: {len(attrs)} -- {len(on_dev)} on {ACCEL_DEVICE}, "
+              f"{len(attrs) - len(on_dev)} on another device (reported below, not attributed)")
+    print(f"attributions: {len(on_dev)}")
     for line in explain(samples, attrs, args.window, args.any_device):
         print(line)
     return 0

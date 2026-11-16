@@ -74,6 +74,49 @@ EOF
 check "the pack's decoder has no initializer-fed Transpose" "$left" 0
 check "and the node was actually removed" "$nodes" 1      # Transpose + MatMul -> MatMul
 
+# A square weight folded under two different perms produces two tensors of the SAME shape with DIFFERENT values.
+# engine#2779: the first fold named its result after the source only, so the second fold collapsed onto the same
+# name, the packed decoder kept one array, `--check` still passed and the build returned 0. This arm runs the
+# collision through the shipped script -- the layer a pack builder meets -- rather than through the tool.
+python3 - "$tmp/sq-dec.onnx" <<'PY2' || { echo "FAIL could not build the square fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+
+w = numpy_helper.from_array(np.arange(9, dtype=np.float32).reshape(3, 3), "w")
+x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3])
+oa = helper.make_tensor_value_info("oa", TensorProto.FLOAT, [1, 3])
+ob = helper.make_tensor_value_info("ob", TensorProto.FLOAT, [1, 3])
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["wt1"], perm=[1, 0]),
+     helper.make_node("MatMul", ["x", "wt1"], ["oa"]),
+     helper.make_node("Transpose", ["w"], ["wt2"], perm=[0, 1]),
+     helper.make_node("MatMul", ["x", "wt2"], ["ob"])],
+    "g", [x], [oa, ob], [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY2
+
+sq=$tmp/sqpack
+"$SCRIPT" --out "$sq" "$tmp/enc.onnx" "$tmp/sq-dec.onnx" >"$tmp/sqlog" 2>&1
+check "a square weight under two perms packs" "$?" 0
+read -r names distinct <<EOF
+$(python3 - "$sq/decoder_model.onnx" <<'PY'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
+mms = [n for n in m.graph.node if n.op_type == "MatMul"]
+a, b = inits[mms[0].input[1]], inits[mms[1].input[1]]
+print(len({mms[0].input[1], mms[1].input[1]}), "different" if not np.array_equal(a, b) else "identical")
+PY
+)
+EOF
+check "each MatMul reads its own folded weight" "$names" 2
+check "and the two folded weights hold different values" "$distinct" different
+
 # The refusal arm: with `onnx` unimportable the script must fail rather than write the unfurled decoder. The
 # stub is a module that raises, so the check is the same one CI would hit with no onnx installed at all.
 mkdir -p "$tmp/stub" && echo 'raise ImportError("no onnx here")' > "$tmp/stub/onnx.py"

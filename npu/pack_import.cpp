@@ -1797,21 +1797,24 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
 // vote as the fallback for packs with no 1.9 header -- the 1.8 / R1-Distill line, where it works today.
 FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& pack_dir, const Dims& dims) {
     FconstGeom g = locate_fconst(tok, dims.eps_bits);
-    if (g.stride != 0 && g.six_headers()) {   // engine#2604: per-layer starts from every header, not one stride
-        if (const std::string why = fconst_six_header_blocks(tok, dims.eps_bits, dims.layers, dims.kv_heads, g);
-            !why.empty()) {
-            g.why = why;
-            g.stride = 0;
-        }
+    // engine#2604: the 1.8 gemma3 6-header form -- per-layer starts from every header, not one stride. Only on a file with
+    // no 1.9 header (below, a 6-header 1.9 block is refused by name).
+    auto six_18 = [&]() -> FconstGeom {
+        if (g.stride != 0 && g.six_headers())
+            if (const std::string why = fconst_six_header_blocks(tok, dims.eps_bits, dims.layers, dims.kv_heads, g);
+                !why.empty()) {
+                g.why = why;
+                g.stride = 0;
+            }
         return g;
-    }
+    };
     const std::string src = find_token_fconst(pack_dir);
-    if (src.empty()) return g;
+    if (src.empty()) return six_18();
     Fconst fc = open_fconst(src);
     int64_t hdr_off = 0, stride9 = 0;
     const bool is19 = fconst19_detect(fc, dims.heads, dims.layers, &hdr_off, &stride9);
     unmap_file(fc.map, fc.size);
-    if (!is19) return g;                                  // no 1.9 header: the eps vote is the only witness, keep it
+    if (!is19) return six_18();                           // no 1.9 header: the eps vote is the only witness, keep it
     const int64_t stride8 = stride9 - int64_t(dims.heads) * 4;
     if (stride8 <= 0) return g;
     if (g.stride != 0 && g.stride != stride8) {
@@ -1819,6 +1822,12 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
         // from the wrong place instead of failing cleanly.
         g.why = "the 1.9 header gives stride " + std::to_string(stride8) + " and the epsilon anchors give " +
                 std::to_string(g.stride) + "; refusing rather than choosing";
+        g.stride = 0;
+        return g;
+    }
+    if (g.six_headers()) {   // engine#2604 review: the 6-header form is measured on 1.8 only
+        g.why = "a 6-header layer block in a file with a 1.9 header; 6-header blocks are read only in the measured 1.8 "
+                "gemma3 form (engine#2604), so refusing";
         g.stride = 0;
         return g;
     }
@@ -1852,9 +1861,19 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
     // only about half the blocks, so neither `pos.size()/4` nor a fixed fraction of the window separates the two cases
     // (review of engine#2021, gaps 1 and 2).
     const std::vector<int64_t> inner = fconst_block_headers_observed(pos, stride8);
+    // engine#2604 review: a 6-header block is read only in its measured 1.8 form, whose per-layer starts come from every
+    // header (fconst_six_header_blocks). On this 1.9 path the stride is the header's and there are no per-layer starts,
+    // so a 6-header block here refuses by name instead of being read at one stride.
+    if (inner.size() == 5) {
+        g.why = "the 1.9 header gives stride " + std::to_string(stride8) + " and the anchors show a 6-header block; "
+                "6-header blocks are read only in the measured 1.8 gemma3 form (engine#2604), so refusing";
+        g.stride = 0;
+        return g;
+    }
     if (!fconst_set_block_headers(g, inner)) {
         g.why = "the 1.9 header gives stride " + std::to_string(stride8) + ", but the epsilon anchors repeat at " +
-                std::to_string(inner.size()) + " in-block offset(s), and a layer block has 1 (2-header) or 3 (4-header); "
+                std::to_string(inner.size()) + " in-block offset(s), and a layer block has 1 (2-header), 3 (4-header) or, "
+                "on the 1.8 gemma3 form only, 5 (6-header); "
                 "refusing rather than guessing the layout";
         g.stride = 0;
     }
@@ -1908,7 +1927,9 @@ std::vector<int64_t> fconst_block_headers(const std::vector<int64_t>& pos, int64
 
 // engine#1831: the fields `locate_fconst()` sets from the same list -- `hdr` (whose SIZE is the block layout), `h1` (its
 // first entry) and `period` (headers per block, counting the block's own). One inner header is a 2-header block
-// (Qwen2.5/Llama), three is a 4-header block (Qwen3); anything else is not a layout this reader knows, so nothing is set.
+// (Qwen2.5/Llama), three is a 4-header block (Qwen3), five is the 6-header gemma3 1.8 block (engine#2604; usable only
+// once fconst_six_header_blocks() has given it per-layer starts); anything else is not a layout this reader knows, so
+// nothing is set.
 bool fconst_set_block_headers(FconstGeom& g, const std::vector<int64_t>& inner) {
     if (inner.size() != 1 && inner.size() != 3 && inner.size() != 5) return false;   // 5: gemma3 1.8 (engine#2604)
     g.hdr = inner;
@@ -4742,8 +4763,9 @@ Plan plan(const std::string& pack_dir) {
                     }
                 } else {
                     refuse("the layer block has " + std::to_string(g.hdr.size() + 1) +
-                           " epsilon headers, and this importer reads blocks of 2 (q/k/v/o in one payload) "
-                           "or 4 (q/k/v, two per-head QK norms, o_proj) -- recorded 2026-11-04 on Qwen3");
+                           " epsilon headers, and this importer reads blocks of 2 (q/k/v/o in one payload), "
+                           "4 (q/k/v, two per-head QK norms, o_proj) or 6 (the 4-header block plus gemma3's "
+                           "pre/post-feedforward norms, engine#2604); any other count is refused");
                 }
                 // the MLP section starts right after the block's post-attention norm -- or, on the gemma3 6-header
                 // block, after pre_feedforward_layernorm, and ends at post_feedforward_layernorm's header (engine#2604)

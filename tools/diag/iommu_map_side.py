@@ -474,6 +474,31 @@ def self_test() -> int:
             "main() on an unmap-only capture prints the map-side refusal and exits 4 (rc=%d)" % rc_main)
         chk("NEVER MAPPED OR UNMAPPED" not in printed, "...and main() never prints the absence claim for it")
 
+        # 3b. the [MIXED: ...] SENTENCE is the point of the change, and arms 8b/8c only assert the counters behind it:
+        #     deleting the append at the end of main() left every arm green (engine#2740, measured on main after #2701
+        #     merged -- "the arm asserts something weaker than the sentence"). So drive main() and read its output,
+        #     both directions: the flag must appear for two names on one class, and must not for one lane's
+        #     map+unmap pair.
+        two_names = d / "two_names.txt"
+        two_names.write_text(
+            "wget-1 [012] .... 1001.000000: fmap: (iommu_map+0x4/0x80) iova=0x3d207000 size=0x1000\n"
+            "wget-1 [012] .... 1001.500000: anothermap: (iommu_map+0x4/0x80) iova=0x4e000000 size=0x1000\n")
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            main(["--trace", str(two_names), "--before", str(d / "f.txt"), "--after", str(d / "f.txt")])
+        chk("[MIXED" in buf2.getvalue(),
+            "the printed header carries the MIXED flag for two names on one class")
+
+        one_lane = d / "onelane_main.txt"
+        one_lane.write_text(
+            "wget-1 [012] .... 1001.000000: fmap: (iommu_map+0x4/0x80) iova=0x3d207000 size=0x1000\n"
+            "wget-1 [012] .... 1001.500000: funm: (iommu_unmap_fast+0x4/0x10) iova=0x3d207000 size=0x1000\n")
+        buf3 = io.StringIO()
+        with contextlib.redirect_stdout(buf3):
+            main(["--trace", str(one_lane), "--before", str(d / "f.txt"), "--after", str(d / "f.txt")])
+        chk("[MIXED" not in buf3.getvalue(),
+            "the printed header does not carry the MIXED flag for one lane's map+unmap")
+
     return 0 if ok else 1
 
 

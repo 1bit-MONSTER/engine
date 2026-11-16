@@ -99,6 +99,13 @@ add_test(NAME gpu_hold_hold_dir COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_
 # label, and this asserts the child sees both, on a sandboxed HOME.
 add_test(NAME gpu_hold_child_identity COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_child_identity_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 
+# engine#2773: a token whose holder is gone must be reaped WHOEVER wrote it. reap_token() gated on `gpu-hold*`,
+# and npu-serve-keeper holds the NPU token by design (npu-hold:22) -- so when the owner stopped that keeper the
+# token it left behind was never reaped: measured 11-16, a ticket queued 246 s behind "npu-serve-keeper pid
+# 298235" whose pid was already gone. Two arms: a dead foreign holder is reaped and the ticket taken; a LIVE
+# foreign holder is left alone, so the fix cannot steal a live lane's token.
+add_test(NAME gpu_hold_stale_token COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_stale_token_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
 # engine#2494 (guard-drift class): the guards in scripts/gpu-hold protect the box only once they are INSTALLED, and what
 # runs is ~/.local/bin/gpu-hold -- a copy nothing re-installs on merge. Measured twice: "identical to engine main" after
 # #2486 (11-15 05:52Z), then 16 h later the pre-#2538 copy with no take-time refusal at all (11-16 03:2xZ). The take line

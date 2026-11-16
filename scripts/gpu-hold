@@ -307,7 +307,12 @@ reap_token() {
     [ -e "$TOKEN" ] || return 0
     local content pid
     content=$(cat "$TOKEN" 2> /dev/null) || return 0
-    case $content in gpu-hold*) ;; *) return 0 ;; esac
+    # Any writer that stamps a pid, not only gpu-hold. `npu-serve-keeper` holds the NPU token while the
+    # owner's serve is up (npu-hold:22), so when the owner stops the keeper -- a normal, sanctioned action --
+    # its token is the one that strands every NPU ticket. The prefix gate here used to be `gpu-hold*`, so that
+    # exact token was never reaped: measured on 2026-11-16, a ticket waited 246 s behind
+    # "npu-serve-keeper pid 298235" whose pid was already gone, and every NPU ticket on the box would have run
+    # to -w the same way. The pid is the identity; the prefix is not.
     pid=$(printf '%s' "$content" | sed -n 's/.* pid \([0-9][0-9]*\) .*/\1/p' | head -n 1)
     if [ -n "$pid" ] && ! kill -0 "$pid" 2> /dev/null; then
         rm -f "$TOKEN"

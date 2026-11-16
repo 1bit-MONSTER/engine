@@ -1851,6 +1851,14 @@ With `config.json` empty, the model's numbers come from the pack itself:
 On the NPU, the result is "The capital of France is Paris.", "12 * 7 = 84" and "Neil Armstrong ... July 20, 1969"
 (all stop, 3.9-5.0 tok/s).
 
+The rewritten copy is then located from the same arithmetic, not by the epsilon vote (engine#2650). The vote's anchor
+is 12 bytes, epsilon then 10 zeros, and that pattern can occur inside 4-bit tiles. On
+`Phi-3-mini-4k-instruct-onnx-ryzenai-npu` one occurs 16,232,526 B into block 0, and the vote took it as the second
+header. The pack was refused on 320 tensors, although its rewrite was right: Phi-3.5-mini and Phi-3-mini-128k have the
+identical layout and read with 0 gaps. Phi-4-mini (320) and Qwen2-7B (280) were refused the same way. The rewrite
+wrote every header, so the locator only checks that each one is where it was put, and refuses the copy by block when
+one is not.
+
 The **gate/up unit** is the head's unit with 64 row *slots* per strip instead of 32 rows: 4,864
 zero bytes, then `2 x (K/32)` strips of 1,216 B. Strip `s` holds K block `s/2`; slots 0..31 are
 `gate_proj` rows `32 x (s%2) .. +31` of the unit and slots 32..63 are the same rows of `up_proj`.

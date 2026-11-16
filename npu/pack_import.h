@@ -996,6 +996,9 @@ std::string fconst17_geometry_exported(uint64_t size, const Dims& d);
 // The 1.8 form of such a file written to `work` (returns `work`), or `path` unchanged when it is not in that form.
 std::string canonical_token_fconst17_exported(const std::string& path, const std::string& pack_dir, const Dims& d,
                                               const std::string& work);
+// engine#2650: where the importer puts the layer blocks of `tok` (the Token .fconst it reads -- for a 1.7 headerless pack,
+// the canonical copy), given the pack directory it came from.
+FconstGeom locate_fconst_with_header_exported(const std::string& tok, const std::string& pack_dir, const Dims& dims);
 // The epsilon the graph's RMSNorm nodes state (0 when none), how many state it, and whether two disagree.
 float graph_norm_eps_exported(const std::string& onnx_path, int* nodes, bool* conflict);
 // The rms_norm_eps to serve with: config.json's when it states one, else the graph's when its nodes agree; when they

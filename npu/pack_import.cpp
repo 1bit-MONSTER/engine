@@ -1939,6 +1939,42 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
 // So ask the header first on the SOURCE file (the canonical copy has the 1.9 header removed by construction), and keep the eps
 // vote as the fallback for packs with no 1.9 header -- the 1.8 / R1-Distill line, where it works today.
 FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& pack_dir, const Dims& dims) {
+    // engine#2650: a 1.7 headerless pack's canonical copy was WRITTEN by canonical_token_fconst17(), so its geometry is
+    // known exactly; the epsilon vote is not asked. The vote takes block 0's first two anchors as the header pair, and its
+    // 12-byte anchor (epsilon + 10 zeros) occurs inside 4-bit tiles: on Phi-3-mini-4k-instruct-onnx-ryzenai-npu one did,
+    // at an odd offset 16,232,526 B into block 0, and the pack was refused on 320 tensors ("attention payload is
+    // 16,226,318 B, not a whole number of 108,800-byte tiles") although the rewrite was right -- the identical layout of
+    // Phi-3.5 and Phi-3-128k read with 0 gaps. Every header the rewrite wrote is still checked to be where it put it.
+    {
+        const std::string src = find_token_fconst(pack_dir);
+        std::error_code ec;
+        const uint64_t src_size = src.empty() ? 0 : uint64_t(fs::file_size(src, ec));
+        Fconst17Geom g17;
+        if (!src.empty() && !ec && tok != src && fconst17_geometry(src_size, dims, &g17).empty()) {
+            const int64_t H = dims.hidden, env = kNormOff + 2 * H;
+            FconstGeom g;
+            g.h1 = env + g17.payload;
+            g.stride = env + g17.payload + env + g17.gu + 64 + g17.down;
+            g.hdr = {g.h1};
+            g.period = 2;
+            g.blocks = dims.layers;
+            Fconst fc = open_fconst(tok);
+            const bool size_ok = uint64_t(fc.size) == uint64_t(dims.layers) * uint64_t(g.stride) + uint64_t(env) +
+                                                          uint64_t(g17.head);
+            int bad = -1;
+            for (int L = 0; size_ok && L <= dims.layers && bad < 0; ++L) {
+                const int64_t b = int64_t(L) * g.stride;
+                if (!eps_at(fc, b, dims.eps_bits) || (L < dims.layers && !eps_at(fc, b + g.h1, dims.eps_bits))) bad = L;
+            }
+            unmap_file(fc.map, fc.size);
+            if (!size_ok || bad >= 0) {
+                g.why = "the 1.7 headerless pack's canonical copy is not where its rewrite put it (" +
+                        (size_ok ? "block " + std::to_string(bad) + "'s headers" : std::string("the size")) + ")";
+                g.stride = 0;
+            }
+            return g;
+        }
+    }
     FconstGeom g = locate_fconst(tok, dims.eps_bits);
     // engine#2604: the 1.8 gemma3 6-header form -- per-layer starts from every header, not one stride. Only on a file with
     // no 1.9 header (below, a 6-header 1.9 block is refused by name).
@@ -7795,6 +7831,9 @@ std::string fconst17_geometry_exported(uint64_t size, const Dims& d) {
 std::string canonical_token_fconst17_exported(const std::string& path, const std::string& pack_dir, const Dims& d,
                                               const std::string& work) {
     return canonical_token_fconst17(path, pack_dir, d, work);
+}
+FconstGeom locate_fconst_with_header_exported(const std::string& tok, const std::string& pack_dir, const Dims& dims) {
+    return locate_fconst_with_header(tok, pack_dir, dims);
 }
 float graph_norm_eps_exported(const std::string& onnx_path, int* nodes, bool* conflict) {
     const OnnxModel m = parse_onnx(onnx_path);

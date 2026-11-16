@@ -158,6 +158,12 @@ e1=$elapsed
 if [ "$rc" != 78 ]; then echo "FAIL arm 1: rc $rc, want 78 (the fault abort)"; fail=1; fi
 if [ "$elapsed" -ge 60 ]; then echo "FAIL arm 1: the hold took ${elapsed}s; the fault was at 5 s and the payload sleeps 600 s"; fail=1; fi
 grep -q "ABORT GPU/NPU fault" "$scratch/log1" || { echo "FAIL arm 1: the log does not say the fault ended the hold"; fail=1; }
+# engine#2494: the abort records what the ticket HELD before it kills it. After kill_tree the numbers are gone, which is
+# why every post-mortem of this class has started by reconstructing them from `ps`. The payload here is a sleep chain
+# with no KFD context, so the arm asserts the "none of ours" line -- the variant that also tells an operator whose fault
+# it was -- and a dump that never runs cannot produce it.
+grep -q "held: no process of this ticket has a KFD context" "$scratch/log1" || {
+    echo "FAIL arm 1: the fault abort did not record what the ticket held on the device (engine#2494)"; fail=1; }
 grep -q "gfxhub" "$scratch/log1" || { echo "FAIL arm 1: the log does not quote the fault line"; fail=1; }
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then echo "FAIL arm 1: the TERM-ignoring grandchild $deep survived"; kill -9 "$deep"; fail=1; fi
 [ -e "$scratch/TOKEN1" ] && { echo "FAIL arm 1: the token is still held"; fail=1; }

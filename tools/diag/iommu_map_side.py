@@ -63,15 +63,29 @@ import sys
 # The map/unmap distinction comes from the PROBED FUNCTION in the event text, not from the event's name: any lane
 # names its probe differently (`capmap`, `unm`, `b2map`, `prs2mp`), and a tool that only reads its own naming
 # cannot read the captures that already exist on the box. The function is the fact; the name is a convention.
-EVENT = re.compile(r"(\d+\.\d+):\s+\S*:\s+\((\w+)\+[^)]*\)\s+iova=(0x[0-9a-f]+)\s+size=(0x[0-9a-f]+)")
+EVENT = re.compile(r"(\d+\.\d+):\s+\S*:\s+\(([\w.]+)\+[^)]*\)\s+iova=(0x[0-9a-f]+)\s+size=(0x[0-9a-f]+)")
+# Any line whose event text names a function and an iova. A function this file cannot classify is COUNTED, not
+# dropped: `__iommu_map`, `iommu_map_pages` and `iommu_map.part.0` are maps the exact-name lists below never held,
+# and a silent drop made a lane's map probe read as "0 map" -- which then produced the unanswerable claim in (1).
+IOVA_LINE = re.compile(r"\(\s*([\w.]+)\+[^)]*\)\s+iova=")
+# Documentation of what is known to exist. NOT the classifier: see classify().
 MAP_FUNCS = ("iommu_map", "iommu_map_sg")
 UNMAP_FUNCS = ("iommu_unmap", "iommu_unmap_fast")
+
+
+def classify(fn):
+    """`unmap` is tested first because every unmap name contains `map`."""
+    if "unmap" in fn:
+        return "unmap"
+    if "map" in fn:
+        return "map"
+    return "other"
 FAULT = re.compile(r"^\[\s*(\d+\.\d+)\].*IO_PAGE_FAULT.*address=(0x[0-9a-f]+)")
 
 
 def parse_events(path):
-    """([(t, iova, size)] maps, [(t, iova, size)] unmaps) -- insertion order, which is log order."""
-    maps, unmaps = [], []
+    """([(t, iova, size)] maps, [...] unmaps, Counter of unrecognised functions) -- in log order."""
+    maps, unmaps, other = [], [], collections.Counter()
     try:
         fh = open(path, errors="replace")
     except OSError as e:
@@ -80,13 +94,19 @@ def parse_events(path):
         for line in fh:
             m = EVENT.search(line)
             if not m:
+                loose = IOVA_LINE.search(line)
+                if loose:
+                    other[loose.group(1)] += 1
                 continue
             t, fn, iova, size = float(m.group(1)), m.group(2), int(m.group(3), 16), int(m.group(4), 16)
-            if fn in MAP_FUNCS:
+            kind = classify(fn)
+            if kind == "map":
                 maps.append((t, iova, size))
-            elif fn in UNMAP_FUNCS:
+            elif kind == "unmap":
                 unmaps.append((t, iova, size))
-    return maps, unmaps
+            else:
+                other[fn] += 1
+    return maps, unmaps, other
 
 
 def parse_faults(path):
@@ -118,7 +138,7 @@ def _nearest(times, t):
     return best, len(times)
 
 
-def analyse(maps, unmaps, faults, before, after):
+def analyse(maps, unmaps, faults, before, after, other=()):
     """[(t, iova, text)] -- one line per fault inside the capture window, in the words the census reads."""
     if not maps and not unmaps:
         return [], "no capture events: the probe recorded nothing, so this file says nothing about the device"
@@ -140,8 +160,19 @@ def analyse(maps, unmaps, faults, before, after):
         dm, nm = _nearest(by_map.get(iova), t)
         du, nu = _nearest(by_unm.get(iova), t)
         if dm is None and du is None:
-            rows.append((t, iova, "NEVER MAPPED OR UNMAPPED in %.0f s of capture: the translation is absent and "
-                                  "nothing re-creates it" % (hi - lo)))
+            # Only a capture that probed BOTH sides may claim absence. A one-sided capture knows nothing about the
+            # other half, and saying "never mapped" from an unmap-only trace is the instrument answering a question
+            # it was never asked -- measured: 579,219 unmaps and 0 maps in scratch-i679/burst.trace read as
+            # "NEVER MAPPED OR UNMAPPED" at rc 0.
+            if not maps:
+                rows.append((t, iova, "not in this capture's map side: no map events in %.0f s of capture, so whether "
+                                      "this iova was ever mapped is not answerable here" % (hi - lo)))
+            elif not unmaps:
+                rows.append((t, iova, "not in this capture's unmap side: no unmap events in %.0f s of capture, so "
+                                      "whether this iova was released is not answerable here" % (hi - lo)))
+            else:
+                rows.append((t, iova, "NEVER MAPPED OR UNMAPPED in %.0f s of capture: the translation is absent and "
+                                      "nothing re-creates it" % (hi - lo)))
             continue
         parts = []
         for label, d, n in (("map", dm, nm), ("unmap", du, nu)):
@@ -150,8 +181,15 @@ def analyse(maps, unmaps, faults, before, after):
             else:
                 parts.append(f"nearest {label} {d * 1e6:+.0f} us (of {n})")
         rows.append((t, iova, " | ".join(parts)))
-    return rows, (f"buffered {lo:.1f}..{hi:.1f} s ({hi - lo:.0f} s); {len(maps)} map, {len(unmaps)} unmap; "
-                  f"{len(rows)} fault(s) in the window")
+    hdr = (f"buffered {lo:.1f}..{hi:.1f} s ({hi - lo:.0f} s); {len(maps)} map, {len(unmaps)} unmap; "
+           f"{len(rows)} fault(s) in the window")
+    if other:
+        hdr += "; %d events with an unrecognised function (e.g. %s)" % (sum(other.values()), next(iter(other)))
+    if not maps:
+        hdr += "; no map events in this capture (the map side is unanswerable)"
+    elif not unmaps:
+        hdr += "; no unmap events in this capture (the unmap side is unanswerable)"
+    return rows, hdr
 
 
 def render(maps, unmaps, before, after, faults_rows, header):
@@ -192,7 +230,7 @@ def self_test() -> int:
         (d / "before.txt").write_text(before)
         (d / "after.txt").write_text(after)
 
-        maps, unmaps = parse_events(str(d / "cap.txt"))
+        maps, unmaps, _other = parse_events(str(d / "cap.txt"))
         chk(len(maps) == 2 and len(unmaps) == 1, "a task name containing a space still parses (2 map, 1 unmap)")
         # 2b. the same events under ANOTHER lane's naming (`unm:`/`map:`/`prs2mp:`) parse identically, because the
         #     class comes from the probed function. A tool that only reads its own event names cannot read the
@@ -200,9 +238,35 @@ def self_test() -> int:
         #     are named `unm:`, and the first version of this file refused them.
         other = pathlib.Path(td) / "other.txt"
         other.write_text(cap.replace("capmap:", "whatever:").replace("capunm:", "unm:"))
-        m2, u2 = parse_events(str(other))
+        m2, u2, _o2 = parse_events(str(other))
         chk((m2, u2) == (maps, unmaps), "event names invented by another lane parse by the probed function, not the name")
         chk(all(e[2] == 0x1000 for e in maps + unmaps), "size parses as 4 KiB")
+
+        # 2c. functions the exact-name lists never held are MAPS, and one this file cannot classify is COUNTED.
+        #     A silent drop made a lane's probe read as "0 map", which is what produced the unanswerable claim below.
+        odd = pathlib.Path(td) / "odd.txt"
+        odd.write_text(
+            "          <idle>-0       [001] ..s1. 1000.000000: p: (__iommu_map+0x4/0x80) iova=0x1000 size=0x1000\n"
+            "          <idle>-0       [001] ..s1. 1001.000000: p: (iommu_map_pages+0x4/0x80) iova=0x2000 size=0x1000\n"
+            "          <idle>-0       [001] ..s1. 1002.000000: p: (iommu_map.part.0+0x4/0x80) iova=0x3000 size=0x1000\n"
+            "          <idle>-0       [001] ..s1. 1003.000000: p: (iommu_tlb_sync+0x4/0x80) iova=0x4000 size=0x1000\n")
+        m4, u4, o4 = parse_events(str(odd))
+        chk(len(m4) == 3, "__iommu_map, iommu_map_pages and iommu_map.part.0 are all counted as maps (3)")
+        chk(u4 == [] and o4 == {"iommu_tlb_sync": 1},
+            "a function with neither word is counted, not dropped: %s" % dict(o4))
+        _r4, hdr4 = analyse(m4, u4, [(1004.0, 0x9999000)], [], [(1004.0, 0x9999000)], o4)
+        chk("1 events with an unrecognised function (e.g. iommu_tlb_sync)" in hdr4,
+            "the unrecognised event is named in the header: %s" % hdr4)
+
+        # 2d. ONE-SIDED captures: an unmap-only trace cannot say a page was never mapped, and says so.
+        rows5, hdr5 = analyse([], [(1000.0, 0x4128000, 0x1000), (1002.0, 0x5128000, 0x1000)],
+                              [(1001.0, 0xdeadb000)], [], [(1001.0, 0xdeadb000)])
+        chk("map side" in rows5[0][2] and "not answerable" in rows5[0][2],
+            "an unmap-only capture refuses the map-side claim: %s" % rows5[0][2][:60])
+        chk("NEVER MAPPED OR UNMAPPED" not in rows5[0][2], "...and does not say NEVER MAPPED")
+        chk("no map events in this capture" in hdr5, "...and says it in the header too")
+        chk(exit_code([], [(1, 2, 3)]) == 4, "a one-sided capture exits 4, not 0")
+        chk(exit_code(maps, unmaps) == 0 and exit_code([], []) == 3, "both sides 0, nothing captured 3")
 
         faults = parse_faults(str(d / "after.txt"))
         chk(len(faults) == 2, "two faults parse with their boot stamps")
@@ -227,6 +291,15 @@ def self_test() -> int:
     return 0 if ok else 1
 
 
+def exit_code(maps, unmaps):
+    """0 both sides probed; 3 nothing captured; 4 ONE side absent, so the missing half cannot be claimed."""
+    if not maps and not unmaps:
+        return 3
+    if not maps or not unmaps:
+        return 4
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--trace")
@@ -239,13 +312,12 @@ def main(argv):
     if not (a.trace and a.before and a.after):
         ap.print_help()
         return 2
-    maps, unmaps = parse_events(a.trace)
-    rows, header = analyse(maps, unmaps, parse_faults(a.after), parse_faults(a.before), parse_faults(a.after))
+    maps, unmaps, other = parse_events(a.trace)
+    rows, header = analyse(maps, unmaps, parse_faults(a.after), parse_faults(a.before), parse_faults(a.after),
+                           other)
     for line in render(maps, unmaps, a.before, a.after, rows, header):
         print(line)
-    if not maps and not unmaps:
-        return 3
-    return 0
+    return exit_code(maps, unmaps)
 
 
 if __name__ == "__main__":

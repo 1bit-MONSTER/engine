@@ -205,6 +205,18 @@ public:
     bool step_batch_all(const std::vector<int>& tokens, int start_pos,
                         std::vector<float>& logits_all);
 
+    // engine#2689 item 3: ONE batched pass for N independent sequences ("users"). `tokens`, `pos` and `slot` are one
+    // entry per row; rows of one slot must be CONTIGUOUS and the slots ascending (a request group per slot). Each
+    // slot carries its own KV cache, so a slot continues from the positions it is given and the model's own
+    // single-sequence cache is untouched -- one launch per projection for the whole batch, which is the whole point:
+    // an M=16 decode step is flat in N (measured 11-16), so 16 users cost about what one does.
+    // Returns M x NV logits, row-major, exactly like step_batch_all().
+    // A model whose state is more than KV is refused by name rather than served wrong: GDN linear attention and MLA
+    // keep a recurrence/absorption state per sequence, a noncausal pack encodes one prompt per pass, and a model that
+    // falls back to per-token step() has no batched body to share.
+    bool step_users(const std::vector<int>& tokens, const std::vector<int>& pos,
+                    const std::vector<int>& slot, std::vector<float>& logits_all);
+
     // Public: a speculative driver outside this class begins a verify batch, then commits a prefix of it.
     void begin_verify(int rows, int start_pos);
     bool commit_verify_rows(int accepted);
@@ -277,6 +289,14 @@ private:
     // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
     // logits there instead of only the last row's.  Null on every other path, so nothing else changes.
     std::vector<float>* batch_all_out_ = nullptr;
+    // engine#2689 item 3: per-row sequence state for step_users(), null on every other path. `load_user_slot()`
+    // swaps a slot's KV into kcache_/vcache_ (which is what attention() and rows_context() read) and back.
+    const std::vector<int>* rows_pos_ = nullptr;
+    const std::vector<int>* rows_slot_ = nullptr;
+    std::vector<std::vector<std::vector<float>>> user_kc_, user_vc_;   // [slot][layer] KV of each served slot
+    std::vector<std::vector<float>> own_kc_, own_vc_;                  // the model's caches, parked for a pass
+    int user_slot_on_ = -1;                                            // which slot kcache_ holds, -1 = the model's
+    bool load_user_slot(int s);
     // engine#803 A2b: the model's half of the decode family (design names, summary lines, the wide and narrow
     // sealed families); the per-role ELF resolution and context creation is XdnaTarget::open_decode_family().
     bool open_decode_family_local(bool want_m16, xrt::device* dev, const std::string& mdir,

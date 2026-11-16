@@ -4715,6 +4715,105 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
     return ok;
 }
 
+// engine#2689 item 3: swap one sequence's KV into the working caches. kcache_/vcache_ are what attention() and
+// rows_context() read, so the pass loads the slot whose rows it is about to run and swaps it back out afterwards.
+bool Q4nxNpuForward::load_user_slot(int s) {
+    if (s < 0 || (size_t)s >= user_kc_.size() || (size_t)s >= user_vc_.size()) {
+        err_ = "step_users: slot " + std::to_string(s) + " is outside the " + std::to_string(user_kc_.size()) +
+               " slot cache(s) this pass prepared";
+        return false;
+    }
+    if (user_slot_on_ == s) return true;
+    if (user_slot_on_ >= 0) {   // put the loaded slot back in its own bank entry
+        kcache_.swap(user_kc_[(size_t)user_slot_on_]);
+        vcache_.swap(user_vc_[(size_t)user_slot_on_]);
+    }
+    kcache_.swap(user_kc_[(size_t)s]);
+    vcache_.swap(user_vc_[(size_t)s]);
+    user_slot_on_ = s;
+    return true;
+}
+
+bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vector<int>& pos,
+                                const std::vector<int>& slot, std::vector<float>& logits_all) {
+    logits_all.clear();
+    if (!ready_) { err_ = "not initialised"; return false; }
+    const size_t M = tokens.size();
+    if (M == 0) { err_ = "step_users: no rows"; return false; }
+    if (pos.size() != M || slot.size() != M) {
+        err_ = "step_users: tokens, pos and slot need one entry per row (" + std::to_string(M) + " rows, " +
+               std::to_string(pos.size()) + " positions, " + std::to_string(slot.size()) + " slots)";
+        return false;
+    }
+    // State that is not KV cache, refused by name instead of served wrong: the recurrence/absorption state is one
+    // sequence's, and one pass cannot hold several.
+    if (lin_kd_ || mla_) {
+        err_ = "step_users: this model keeps per-sequence attention state beside the KV cache (GDN linear attention or "
+               "MLA), which one shared pass would corrupt across users";
+        return false;
+    }
+    if (noncausal_attn_ || bidir_sliding_) {
+        err_ = "step_users: a noncausal pack encodes the whole prompt of ONE sequence per pass, so users cannot share "
+               "a pass on it";
+        return false;
+    }
+    int smax = -1;
+    for (size_t m = 0; m < M; m++) {
+        if (slot[m] < 0 || pos[m] < 0) { err_ = "step_users: negative slot or position"; return false; }
+        if (m > 0 && slot[m] != slot[m - 1]) {
+            if (slot[m] < slot[m - 1]) {
+                err_ = "step_users: rows of one slot must be contiguous and the slots ascending (row " +
+                       std::to_string(m) + " goes back to slot " + std::to_string(slot[m]) + " after slot " +
+                       std::to_string(slot[m - 1]) + ")";
+                return false;
+            }
+            // a new slot starts at its own position; nothing to check beyond the range above
+        }
+        smax = std::max(smax, slot[m]);
+    }
+    // The bank only ever GROWS. A pass that touches slot 0 alone must not shrink a bank that is holding slots 0..3: that
+    // would drop the other sequences' KV and their next row would attend over an empty cache at a position above 0
+    // (found by the serve batcher, engine#2689 item 3b -- a single-user call between multi-user rounds turned the next
+    // row into NaN).
+    if (user_kc_.size() < (size_t)smax + 1) user_kc_.resize((size_t)smax + 1);
+    if (user_vc_.size() < (size_t)smax + 1) user_vc_.resize((size_t)smax + 1);
+    for (size_t s = 0; s <= (size_t)smax; s++) {
+        if (user_kc_[s].empty()) user_kc_[s].assign((size_t)c_.NL, {});
+        if (user_vc_[s].empty()) user_vc_[s].assign((size_t)c_.NL, {});
+    }
+    // A slot whose FIRST row is position 0 starts a NEW sequence, so what the previous conversation left in its caches
+    // is cleared first: pos 0 has to mean here what it means everywhere else in this file (a request that begins at the
+    // start), and a re-used slot that kept the last conversation's K/V would answer from state the request does not own.
+    // (One clear per slot: rows of a slot are contiguous, checked above.)
+    for (size_t m = 0; m < M; m++) {
+        if (m > 0 && slot[m] == slot[m - 1]) continue;
+        if (pos[m] != 0) continue;
+        user_kc_[(size_t)slot[m]].assign((size_t)c_.NL, {});
+        user_vc_[(size_t)slot[m]].assign((size_t)c_.NL, {});
+    }
+    // The pass owns the working caches for its duration: the model's own two are parked and put back whatever happens.
+    own_kc_.swap(kcache_);
+    own_vc_.swap(vcache_);
+    user_slot_on_ = -1;
+    rows_pos_ = &pos;
+    rows_slot_ = &slot;
+    std::vector<float>* saved_all = batch_all_out_;
+    batch_all_out_ = &logits_all;
+    std::vector<float> last;
+    const bool ok = step_batch_impl(tokens, 0, last);
+    batch_all_out_ = saved_all;
+    rows_pos_ = nullptr;
+    rows_slot_ = nullptr;
+    if (user_slot_on_ >= 0) {
+        kcache_.swap(user_kc_[(size_t)user_slot_on_]);
+        vcache_.swap(user_vc_[(size_t)user_slot_on_]);
+        user_slot_on_ = -1;
+    }
+    own_kc_.swap(kcache_);
+    own_vc_.swap(vcache_);
+    return ok;
+}
+
 bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_pos,
                                      std::vector<float>& logits) {
     if (!ready_) { err_ = "not initialised"; return false; }
@@ -4748,7 +4847,9 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
     // visible as cross-request echo (MiniCPM5-1B answered Japan, then echoed
     // "Tokyo" for France/Germany).  forward_serve.cpp's "each request resets it
     // from position 0" only ever held in the NPU_BATCH_CHECK debug path.
-    if (start_pos == 0) reset();
+    // engine#2689: a step_users() pass owns kcache_/vcache_ (it swaps each slot in), so it must not clear anything:
+    // its slots start empty and continue from the positions they are given.
+    if (start_pos == 0 && rows_slot_ == nullptr) reset();
 
     // Anything the batched body does not model falls back to per-token step():
     // MLA/MoE, GDN linear attention, Gemma4 (PLE + per-layer-type attention widths
@@ -4776,6 +4877,11 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
         !mla_ && (ple_dim_ == 0 || !inject_embeds_) && (kv_self || gemma4_layer_) && !sem_.gpt_oss &&
         !(n_expert_ > 0 && leading_dense_ > 0);   // a leading dense layer of a non-MLA MoE runs in step() only
     if (!simple_dense || getenv("NPU_NO_BATCH")) {
+        if (rows_slot_) {
+            err_ = "step_users: this model's batched body falls back to per-token step(), which holds one sequence, "
+                   "so it cannot carry several users in one pass";
+            return false;
+        }
         if (inject_embeds_) {
             err_ = "step_batch_embeds: this model's batched body falls back to per-token step(), which needs "
                    "token ids to look up; precomputed embeddings are refused rather than run on placeholders";
@@ -5044,6 +5150,11 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
             // One row of attention.  `append` is the K/V cache append, `kvlen` is how many cached
             // positions to read (0 = up to and including `pos`, i.e. causal), and `dst` receives the
             // context -- null when the pass only fills the cache (the noncausal first pass below).
+            // engine#2689 item 3: a step_users() pass carries one position per row (rows of different sequences),
+            // every other pass keeps the single-sequence rule the batch was given.
+            auto row_pos = [&](int m) -> int {
+                return rows_pos_ ? (*rows_pos_)[(size_t)m] : start_pos + m;
+            };
             auto row_attn = [&](int m, float* dst, bool append, int kvlen,
                                 std::vector<float>* q_keep = nullptr) -> bool {
                 {
@@ -5078,7 +5189,7 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                     trio[1] = pos3_[pos3_rows_ + m];
                     trio[2] = pos3_[2 * pos3_rows_ + m];
                 }
-                if (!attention(*in, start_pos + m, pos3_ ? trio : nullptr, dst ? ctx_row : ctx_scratch,
+                if (!attention(*in, row_pos(m), pos3_ ? trio : nullptr, dst ? ctx_row : ctx_scratch,
                                l_hd, l_nkv, l_theta,
                                l_rot, l_prop, l_win, kv_layer, append && !kv_shared, kvlen, q_keep)) {
                     err_ = "attention failed"; return false;
@@ -5112,59 +5223,82 @@ bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_p
                 const char* e = getenv("NPU_ATTN_CHECK");
                 return e && e[0] == '1';
             }();
-            if (attn_rows_on && M > 1 && l_hd > 0 && c_.NH % l_nkv == 0) {
-                const bool whole = noncausal_attn_ && (l_full || bidir_sliding_);
-                const size_t qw = (size_t)nhd;
-                std::vector<float> qall((size_t)M * qw), qm;
-                std::vector<int> Tm((size_t)M), t0m((size_t)M);
-                for (int m = 0; m < M; m++) {
-                    if (!row_attn(m, nullptr, true, 0, &qm)) return false;
-                    if (qm.size() != qw) { err_ = "attention rows: q width"; return false; }
-                    memcpy(qall.data() + (size_t)m * qw, qm.data(), qw * sizeof(float));
-                    const int T = whole ? start_pos + M : start_pos + m + 1;
-                    Tm[(size_t)m] = T;
-                    t0m[(size_t)m] = (l_win > 0 && T > l_win) ? T - l_win : 0;
-                }
-                {
-                    LhScope _t_attn(LH_ATTN);
-                    const float scale = sem_.attn_scaling_one ? 1.0f
-                                        : 1.0f / std::sqrt(sem_.query_pre_attn_scalar > 0 ? sem_.query_pre_attn_scalar
-                                                                                         : (float)l_hd);
-                    const int nt = ((long)M * (start_pos + M) * l_hd >= 8192) ? omp_heads_threads() : 1;
-                    q4nx_attn::rows_context(qall.data(), kcache_[kv_layer].data(), vcache_[kv_layer].data(), M, c_.NH, l_nkv,
-                                            l_hd, Tm.data(), t0m.data(), scale, CTX.data(), nt);
-                    if (attn_gate_)
-                        for (int m = 0; m < M; m++) {
-                            const float* gate = QKV.data() + (size_t)m * g->N + nhd;
-                            float* c = CTX.data() + (size_t)m * ctx_w;
-                            for (int i = 0; i < nhd; i++) c[i] *= 1.0f / (1.0f + expf(-gate[i]));
+            // engine#2689 item 3: rows [m0, m1) are ONE sequence's rows, and one pass may carry several sequences
+            // (step_users). Everything below reads the caches of whichever sequence is loaded in kcache_/vcache_,
+            // so a multi-sequence pass runs this block once per slot group -- the GEMMs above and below it are
+            // already row-wise and stay one launch for the whole batch.
+            auto attn_block = [&](int m0, int m1) -> bool {
+                const int rows = m1 - m0;
+                if (attn_rows_on && rows > 1 && l_hd > 0 && c_.NH % l_nkv == 0) {
+                    const bool whole = noncausal_attn_ && (l_full || bidir_sliding_);
+                    const size_t qw = (size_t)nhd;
+                    std::vector<float> qall((size_t)rows * qw), qm;
+                    std::vector<int> Tm((size_t)rows), t0m((size_t)rows);
+                    for (int m = m0; m < m1; m++) {
+                        if (!row_attn(m, nullptr, true, 0, &qm)) return false;
+                        if (qm.size() != qw) { err_ = "attention rows: q width"; return false; }
+                        memcpy(qall.data() + (size_t)(m - m0) * qw, qm.data(), qw * sizeof(float));
+                        // A whole-prompt read (noncausal) covers every row of THIS sequence, so its length is the
+                        // last row's position + 1; a causal row reads up to its own position.
+                        const int T = whole ? row_pos(m1 - 1) + 1 : row_pos(m) + 1;
+                        Tm[(size_t)(m - m0)] = T;
+                        t0m[(size_t)(m - m0)] = (l_win > 0 && T > l_win) ? T - l_win : 0;
+                    }
+                    {
+                        LhScope _t_attn(LH_ATTN);
+                        const float scale = sem_.attn_scaling_one ? 1.0f
+                                            : 1.0f / std::sqrt(sem_.query_pre_attn_scalar > 0 ? sem_.query_pre_attn_scalar
+                                                                                             : (float)l_hd);
+                        const int nt = ((long)rows * (row_pos(m1 - 1) + 1) * l_hd >= 8192) ? omp_heads_threads() : 1;
+                        q4nx_attn::rows_context(qall.data(), kcache_[kv_layer].data(), vcache_[kv_layer].data(), rows,
+                                                c_.NH, l_nkv, l_hd, Tm.data(), t0m.data(), scale,
+                                                CTX.data() + (size_t)m0 * ctx_w, nt);
+                        if (attn_gate_)
+                            for (int m = m0; m < m1; m++) {
+                                const float* gate = QKV.data() + (size_t)m * g->N + nhd;
+                                float* c = CTX.data() + (size_t)m * ctx_w;
+                                for (int i = 0; i < nhd; i++) c[i] *= 1.0f / (1.0f + expf(-gate[i]));
+                            }
+                    }
+                    if (attn_check) {
+                        std::vector<float> ref((size_t)ctx_w);
+                        size_t differing = 0;
+                        for (int m = m0; m < m1; m++) {
+                            if (!row_attn(m, ref.data(), false, Tm[(size_t)(m - m0)])) return false;
+                            const float* c = CTX.data() + (size_t)m * ctx_w;
+                            for (int i = 0; i < ctx_w; i++)
+                                if (memcmp(&c[i], &ref[(size_t)i], sizeof(float)) != 0) differing++;
                         }
-                }
-                if (attn_check) {
-                    std::vector<float> ref((size_t)ctx_w);
-                    size_t differing = 0;
-                    for (int m = 0; m < M; m++) {
-                        if (!row_attn(m, ref.data(), false, Tm[(size_t)m])) return false;
-                        const float* c = CTX.data() + (size_t)m * ctx_w;
-                        for (int i = 0; i < ctx_w; i++)
-                            if (memcmp(&c[i], &ref[(size_t)i], sizeof(float)) != 0) differing++;
+                        fprintf(stderr, "[attncheck] l=%d rows=%d m0=%d first=%d one-team vs per-row: %zu values %s\n", l,
+                                rows, m0, row_pos(m0), (size_t)rows * ctx_w, differing ? "MISMATCH" : "identical");
+                        if (differing) {
+                            err_ = "attention rows: the one-team form differs from the per-row form";
+                            return false;
+                        }
                     }
-                    fprintf(stderr, "[attncheck] l=%d M=%d start=%d one-team vs per-row: %zu values %s\n", l, M,
-                            start_pos, (size_t)M * ctx_w, differing ? "MISMATCH" : "identical");
-                    if (differing) {
-                        err_ = "attention rows: the one-team form differs from the per-row form";
-                        return false;
-                    }
+                } else if (noncausal_attn_ && (l_full || bidir_sliding_)) {
+                    for (int m = m0; m < m1; m++)
+                        if (!row_attn(m, nullptr, true, 0)) return false;
+                    for (int m = m0; m < m1; m++)
+                        if (!row_attn(m, CTX.data() + (size_t)m * ctx_w, false, row_pos(m1 - 1) + 1)) return false;
+                } else {
+                    for (int m = m0; m < m1; m++)
+                        if (!row_attn(m, CTX.data() + (size_t)m * ctx_w, true, 0)) return false;
                 }
-            } else if (noncausal_attn_ && (l_full || bidir_sliding_)) {
-                for (int m = 0; m < M; m++)
-                    if (!row_attn(m, nullptr, true, 0)) return false;
-                for (int m = 0; m < M; m++)
-                    if (!row_attn(m, CTX.data() + (size_t)m * ctx_w, false, start_pos + M))
-                        return false;
+                return true;
+            };
+            if (rows_slot_ == nullptr) {
+                if (!attn_block(0, M)) return false;
             } else {
-                for (int m = 0; m < M; m++)
-                    if (!row_attn(m, CTX.data() + (size_t)m * ctx_w, true, 0)) return false;
+                // engine#2689: one slot's rows are contiguous, so each group loads its own KV and runs the block.
+                for (int g = 0; g < M;) {
+                    const int s = (*rows_slot_)[(size_t)g];
+                    int g1 = g + 1;
+                    while (g1 < M && (*rows_slot_)[(size_t)g1] == s) g1++;
+                    if (!load_user_slot(s)) return false;
+                    if (!attn_block(g, g1)) return false;
+                    g = g1;
+                }
             }
             for (int m = 0; m < M; m++)
                 apply_head_gate(l, XN.data() + (size_t)m * H, CTX.data() + (size_t)m * ctx_w, l_hd);

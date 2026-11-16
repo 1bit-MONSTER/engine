@@ -211,6 +211,20 @@ JLOG
       WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l x -c true >/dev/null 2>&1
     chk "a queued coder-llm is recorded as queued, not failed" "$(grep -c 'restart=queued(WAITING for a GPU ticket when this window ended, not restored)' "$tmp/t.log")" 1
     chk "  ... and it is not reported as a failed restart" "$(grep -c 'restart=FAILED' "$tmp/t.log")" 0
+    # 3w. THE LANE FIELD NAMES THE LANE. WR_LANE used to fall back to this script's own name, so a window logged
+    # `lane=window-run.sh issue=` and `grep 'lane=<lane>'` over WINDOWS.log -- how state files and the gap check find a
+    # lane's windows -- could not see it (measured 2026-11-16: a post-run check missed a window that had just finished).
+    : > "$tmp/t.log"
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token GPU_QUEUE_DIR=$tmp/q \
+      WR_HEALTH_URL=http://127.0.0.1:9/x WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l pi-os3-679-ctl -c true >/dev/null 2>&1
+    chk "the start line names the lane and issue from the label" "$(grep -c 'start lane=pi-os3 issue=679 label=pi-os3-679-ctl' "$tmp/t.log")" 1
+    chk "  ... and not the script's own name" "$(grep -c 'lane=window-run' "$tmp/t.log")" 0
+    # an explicit LANE still wins, so an unusual label can say what it means
+    : > "$tmp/t.log"
+    PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token GPU_QUEUE_DIR=$tmp/q \
+      LANE=cl-explicit WR_HEALTH_URL=http://127.0.0.1:9/x WINDOWS_LOG=$tmp/t.log "$0" -m 1 -l odd-label -c true >/dev/null 2>&1
+    chk "an explicit LANE wins over the label" "$(grep -c 'start lane=cl-explicit' "$tmp/t.log")" 1
+
     # a DEAD pid is a stale entry, which gpu-hold drops -- it must not license "queued" forever
     : > "$tmp/t.log"; printf 'label=coder-llm\npid=999999\n' > "$tmp/q/0179.coder-llm"
     PATH=$tmp/tbin2:$tmp/tbin:$PATH GPU_HOLD=$tmp/tbin/gpu-hold GPU_TOKEN_FILE=$tmp/none-token GPU_QUEUE_DIR=$tmp/q WR_HEALTH_URL=http://127.0.0.1:9/x \
@@ -399,8 +413,34 @@ fi
 # never got that far (refused, killed in the queue, gpu-hold missing) logs nothing and restarts nothing.
 mkdir -p "${WR_TMPDIR:-$HOME/.cache}"   # /tmp is tmpfs on strixhalo and the lane rules keep new files off it
 WR_DIR=$(mktemp -d "${WR_TMPDIR:-$HOME/.cache}/window-run.XXXXXX"); export WR_STARTED=$WR_DIR/started WR_STOPPED=$WR_DIR/stopped
-export WR_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${BASH_SOURCE[0]##*/}" WR_LOG=$LOG WR_LANE=${LANE:-$SELF} \
-       WR_ISSUE=$ISSUE WR_LABEL=$LABEL WR_MINS=$MINS WR_CMD=$CMD WINDOWS_LOG=$LOG
+    # WHO RAN THIS WINDOW. WR_LANE fell back to the script's own name, so every window logged `lane=window-run.sh issue=`
+    # -- and a `grep 'lane=<lane>'` over WINDOWS.log, which is how state files and the gap check find a lane's windows,
+    # could not see them (measured 2026-11-16: a post-run check missed a window that had just completed). The label already
+    # carries `<lane>-<issue>-<tag>`, so derive both: the ISSUE is the last dash-separated field that is all digits, the
+    # LANE is everything before it. `cl-1077-572-pai` -> cl-1077 / 572, `pi-os3-679-ctl` -> pi-os3 / 679. LANE= in the
+    # environment and -i still win, so an unusual label can say what it means.
+    label_lane() {
+        local i n=-1 out="" ref=$1
+        local -a p; IFS=- read -ra p <<< "$ref"
+        for ((i = 0; i < ${#p[@]}; i++)); do [[ ${p[i]} =~ ^[0-9]+$ ]] && n=$i; done
+        if [ "$n" -lt 0 ]; then printf '%s' "$ref"; return; fi
+        for ((i = 0; i < n; i++)); do out=${out:+$out-}${p[i]}; done
+        printf '%s' "${out:-$ref}"
+    }
+    label_issue() {
+        local i n="" ref=$1
+        local -a p; IFS=- read -ra p <<< "$ref"
+        for ((i = 0; i < ${#p[@]}; i++)); do [[ ${p[i]} =~ ^[0-9]+$ ]] && n=${p[i]}; done
+        printf '%s' "$n"
+    }
+    _lane=${LANE:-}; _issue=${ISSUE:-}
+    if [ -n "$LABEL" ]; then
+        [ -n "$_lane" ] || _lane=$(label_lane "$LABEL")
+        [ -n "$_issue" ] || _issue=$(label_issue "$LABEL")
+    fi
+    [ -n "$_lane" ] || _lane=$SELF
+export WR_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${BASH_SOURCE[0]##*/}" WR_LOG=$LOG WR_LANE=$_lane \
+       WR_ISSUE=$_issue WR_LABEL=$LABEL WR_MINS=$MINS WR_CMD=$CMD WINDOWS_LOG=$LOG
 JOB=""
 restore() {
   local rc=${1:-0} i code=000

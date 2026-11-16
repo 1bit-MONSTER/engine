@@ -586,6 +586,28 @@ def self_test():
         "and without after= it is LOST again: the exit-0 path is what after= selects")
     d.cleanup()
 
+    # The per-LINE path (`git log -S <line> <merge>..<base>`) had no arm, because the shape it fires on
+    # is narrow and nobody had a fixture for it. It needs all three of these at once:
+    #   the commit ADDS the line (or it is not in `missing_all` at all),
+    #   the line LANDED via the squash (so it is in the base at the merge, which is what puts a commit
+    #   in the merge..base range that changes its occurrence count), and
+    #   a later commit REMOVED it, while a different line the same commit added never landed.
+    # Written down because two earlier attempts failed on the first condition and one on the second.
+    d, r = scratch()
+    commit(r, "seed.txt", "seed\n", "seed")
+    branch(r, "pr")
+    rep = commit(r, "tool.py", "def landed():\n    return 7\n\n\ndef lost():\n"
+                               "    return 9\n", "adds two lines: one lands, one never does")
+    branch(r, "main", "pr~1")
+    merged_at = commit(r, "tool.py", "def landed():\n    return 7\n",
+                       "the squash: only the first line landed")
+    commit(r, "tool.py", "\n", "after the merge, the base drops the line it had landed")
+    kind, why = classify_commit(r, rep, "main", after=merged_at)
+    chk("SUPERSEDED", kind, "a landed-then-dropped line is SUPERSEDED, not LOST")
+    chk(True, "replaced on the base after this PR merged" in why,
+        "and the reason names the per-line path rather than the length fallback")
+    d.cleanup()
+
     # The same content, already on the base by another commit: not a loss.
     d, r = scratch()
     commit(r, "tool.py", "def kept():\n    return 1\n", "c0")

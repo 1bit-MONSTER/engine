@@ -55,6 +55,52 @@ def parse_fault(line, device_prefix="amdxdna"):
             "flags": int(m.group("flags"), 16)}
 
 
+TS = re.compile(r"^\w{3}\s+\d+ (\d\d):(\d\d):(\d\d)")
+
+
+def seconds_of_day(line):
+    """`Nov 16 12:35:26` -> 45236. None when the line carries no syslog stamp."""
+    m = TS.match(line)
+    if m is None:
+        return None
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+
+def split_by_gap(stamped, gap):
+    """[(seconds, event)] -> [[event, ...]]; a new burst starts when the gap exceeds `gap`.
+
+    A day's log is many bursts, and treating it as one is how the first version of
+    this tool reported 90 accesses in a single "burst" whose span was 800 GiB. A
+    clock that goes backwards is a date rollover in a syslog without a year, so it
+    counts as a large positive gap rather than a negative one.
+    """
+    if not stamped:
+        return []
+    out, cur, prev = [], [stamped[0][1]], stamped[0][0]
+    for ts, ev in stamped[1:]:
+        step = ts - prev
+        if step < 0:
+            step += 24 * 3600
+        if step > gap:
+            out.append(cur)
+            cur = []
+        cur.append(ev)
+        prev = ts
+    out.append(cur)
+    return out
+
+
+def _gaps(stamped):
+    """The inter-access gaps in seconds (rollover-corrected), for showing a split choice."""
+    out = []
+    for (a, _), (b, _) in zip(stamped, stamped[1:]):
+        step = b - a
+        if step < 0:
+            step += 24 * 3600
+        out.append(step)
+    return out
+
+
 def summarize(events):
     """The burst as one record. Absences are reported, never filled in.
 
@@ -228,6 +274,27 @@ def self_test():
     chk(summarize(far)["one_40k_window"] is False,
         "accesses a megabyte apart are NOT one descriptor block's window")
 
+    # the split threshold is a CHOICE, and its consequence must be visible:
+    # today's nine bursts are separated by >= 17 s while a burst's own accesses are
+    # all in the same second, so 5 s and 10 s both separate them and 30 s does not.
+    ev = dict(device="0000:c6:00.1", address=0x1000, flags=0x0007)
+    two = [(0, ev), (0, ev), (17, ev), (17, ev)]
+    chk(len(split_by_gap(two, 5)) == 2, "two bursts 17 s apart split at a 5 s gap")
+    chk(len(split_by_gap(two, 30)) == 1, "the SAME two bursts do NOT split at a 30 s gap")
+    chk([len(b) for b in split_by_gap(two, 5)] == [2, 2], "each burst keeps its own count")
+    # 23:59:58 -> 00:00:03 is a +5 s gap, not a -86395 s one. Without the rollover
+    # correction the second burst would join the first and this arm would pass only
+    # because nothing checked it.
+    # 23:59:50 -> 00:00:10 is a +20 s gap, i.e. a NEW burst. Without the rollover
+    # correction the step is -86380, which reads as "same burst" and merges them.
+    chk(len(split_by_gap([(86390, ev), (10, ev)], 5)) == 2,
+        "a gap that crosses midnight is +20 s (a new burst), not -86380 s")
+    chk(len(split_by_gap([(86398, ev), (3, ev)], 5)) == 1,
+        "and 23:59:58 -> 00:00:03 is +5 s: the same burst, not two")
+    chk(seconds_of_day("Nov 16 12:35:26 x") == 12 * 3600 + 35 * 60 + 26,
+        "the syslog stamp parses to seconds of day (45326, computed here not copied)")
+    chk(seconds_of_day("no stamp here") is None, "a line without a stamp has no time")
+
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         proc = os.path.join(tmp, "proc")
@@ -260,12 +327,15 @@ def main(argv):
     ap.add_argument("--device", default="amdxdna", help="device name the line must carry")
     ap.add_argument("--dev-prefix", default=DEV_ACCEL, help="fd prefix that means 'holds the device'")
     ap.add_argument("--proc-root", default="/proc")
+    ap.add_argument("--split", type=float, default=0.0,
+                    help="replay only: start a new burst when the log gap exceeds this many "
+                         "seconds (0 = treat the whole file as one burst)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
 
-    events, snaps, total = [], [], 0
+    events, snaps, total, stamped = [], [], 0, []
     src = None
     if a.replay:
         src = open(a.replay)
@@ -274,6 +344,9 @@ def main(argv):
         ev = parse_fault(line, a.device)
         if ev is None:
             continue
+        ts = seconds_of_day(line)
+        if ts is not None:
+            stamped.append((ts, ev))
         events.append(ev)
         if len(events) == 1:
             # Taken on the FIRST fault, not after the burst: the client may be gone
@@ -292,6 +365,26 @@ def main(argv):
         print("no %s fault in %d line(s) examined: nothing to capture "
               "(an empty capture is not evidence of no fault)" % (a.device, total))
         return 2
+    bursts = split_by_gap(stamped, a.split) if a.split > 0 else []
+    if bursts:
+        # A replay of a day is many bursts; the per-burst count is the finding, so it
+        # is printed per burst rather than summarised away.
+        counts = [len(b) for b in bursts]
+        for i, b in enumerate(bursts, 1):
+            print("burst %d/%d" % (i, len(bursts)))
+            print(render(summarize(b), []))
+        gaps = []
+        for prev, nxt in zip(bursts, bursts[1:]):
+            gaps.append("--split %.0fs took %d burst(s) >= a %.0fs gap (observed gaps: %s)"
+                        % (a.split, len(bursts), a.split,
+                           ",".join("%.0fs" % g for g in _gaps(stamped))))
+            break
+        print("%d burst(s); access counts %s%s"
+              % (len(bursts), sorted(counts),
+                 " -- all equal" if len(set(counts)) == 1 else " -- NOT all equal"))
+        for line in gaps:
+            print(line)
+        return 0
     print(render(summarize(events), snaps))
     return 0
 

@@ -510,7 +510,6 @@ def self_test() -> int:
     # The capture the review measured: map to A, fault, remap to B. The class must come from A -- the mapping in
     # force when the fault happened -- and NOT from the last one in the file.
     pm = paddrs(str(pf))
-<<<<<<< HEAD
     chk([pa for _t, pa in pm.get(0xe3ff5000, ())] == [0x1e8455000, 0x1dd3de000],
         "paddrs keeps EVERY mapping for an iova, in log order")
     import contextlib as _cl
@@ -530,10 +529,6 @@ def self_test() -> int:
         report_page_classes(str(pf), [(999.0, 0xe3ff5000)])
     chk("no map event carried a paddr" in _b3.getvalue() and "later mapping exists" in _b3.getvalue(),
         "...and a fault BEFORE any mapping says so instead of falling forward")
-=======
-    chk([pa for _, pa in pm.get(0xe3ff5000, [])] == [0x1e8455000, 0x1dd3de000],
-        "paddrs keeps EVERY mapping in log order, so a caller can pick the one before a fault")
->>>>>>> 7f3b650fe (diag: page class comes from the mapping BEFORE the fault, not the last one in the file (engine#2478))
     chk("unavailable" in page_class(0, flags="/nonexistent/kpageflags"), "an unreadable kpageflags says so, not 'none'")
 
     return 0 if ok else 1
@@ -564,7 +559,6 @@ def decode_kpageflags(v):
 
 
 def paddrs(path):
-<<<<<<< HEAD
     """{iova: [(t, paddr), ...]} -- EVERY mapping that carried a paddr, in log order.
 
     It used to keep only the last paddr per IOVA, which answers "what is this IOVA mapped to NOW" and is wrong for
@@ -574,15 +568,6 @@ def paddrs(path):
     BEFORE it). The capture in engine#2478 is 731 s with 403k maps, so a reused IOVA is not a corner case.
     """
     out = {}
-=======
-    """{iova: [(t, paddr)]} from the `map` events that carry both, in log order.
-
-    A list, not one value, because the relevant mapping is the last one BEFORE the fault: an IOVA that keeps
-    being recycled is mapped again after it faults (measured: 28 maps after a single fault on 0xebb3b000), and
-    the last mapping in the file would then describe a later transfer, not the one that faulted.
-    """
-    out = collections.defaultdict(list)
->>>>>>> 7f3b650fe (diag: page class comes from the mapping BEFORE the fault, not the last one in the file (engine#2478))
     rx = re.compile(r"(\d+\.\d+):\s+map:.*?iova=(0x[0-9a-f]+).*?paddr=(0x[0-9a-f]+)")
     try:
         fh = open(path, errors="replace")
@@ -592,11 +577,7 @@ def paddrs(path):
         for line in fh:
             m = rx.search(line)
             if m:
-<<<<<<< HEAD
                 out.setdefault(int(m.group(2), 16), []).append((float(m.group(1)), int(m.group(3), 16)))
-=======
-                out[int(m.group(2), 16)].append((float(m.group(1)), int(m.group(3), 16)))
->>>>>>> 7f3b650fe (diag: page class comes from the mapping BEFORE the fault, not the last one in the file (engine#2478))
     return out
 
 
@@ -614,7 +595,6 @@ def page_class(paddr, flags="/proc/kpageflags"):
 
 
 def report_page_classes(trace, faults):
-<<<<<<< HEAD
     """One line per fault: the paddr of the last mapping of its IOVA at or BEFORE the fault, and that page's class.
 
     `faults` is [(t, iova)], not a set of IOVAs: the question is "what page sat behind THIS fault", so the answer has
@@ -632,20 +612,6 @@ def report_page_classes(trace, faults):
         mt, pa = max(cands)
         print(f"  {hex(iova):>12}  paddr={hex(pa):>14}  pfn={pa // 4096:<9}  {page_class(pa)}"
               f"   (mapped at t={mt:.3f} s{'' if t - mt < 1 else f', {t - mt:.1f} s before the fault'})")
-=======
-    """One line per (fault time, iova): the last mapping BEFORE that fault, and the page class behind it."""
-    pm = paddrs(trace)
-    for t, iova in sorted(faults):
-        prior = [(mt, pa) for mt, pa in pm.get(iova, []) if mt <= t]
-        if not prior:
-            n_after = sum(1 for mt, _ in pm.get(iova, []) if mt > t)
-            print(f"  t={t:8.3f} {hex(iova):>12}  no map before this fault"
-                  + (f" ({n_after} after it, which cannot explain it)" if n_after else ""))
-            continue
-        mt, pa = prior[-1]
-        print(f"  t={t:8.3f} {hex(iova):>12}  mapped {t - mt:+.3f}s before by paddr={hex(pa):>14}  "
-              f"pfn={pa // 4096:<9}  {page_class(pa)}")
->>>>>>> 7f3b650fe (diag: page class comes from the mapping BEFORE the fault, not the last one in the file (engine#2478))
 
 
 def main(argv):

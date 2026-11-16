@@ -99,14 +99,16 @@ class NpuDecodeBatch {
     }
 
     // Run `tokens` as the slot's prompt (position 0 = a new sequence, which the forward clears). Blocking.
-    bool prefill(int slot, const std::vector<int>& tokens, std::string* why) {
+    // `logits`, when given, receives the LAST row -- the answer's first token is drawn from it, exactly as a serve draws
+    // it from the last row of its own prefill pass.
+    bool prefill(int slot, const std::vector<int>& tokens, std::vector<float>* logits, std::string* why) {
         auto j = std::make_shared<Job>();
         j->slot = slot;
         j->prefill = true;
         j->tokens = tokens;
         j->pos.resize(tokens.size());
         for (size_t i = 0; i < tokens.size(); i++) j->pos[i] = int(i);
-        return submit(j, why, nullptr);
+        return submit(j, why, logits);
     }
 
     // Join the next decode round with one token at `pos`; `logits` receives that row. Blocking.
@@ -251,7 +253,11 @@ class NpuDecodeBatch {
                 auto& q = round_jobs[i];
                 if (!err.empty()) {
                     q->err = err;
-                } else if (!q->prefill) {
+                } else if (q->prefill) {
+                    // The request draws its first token from the last row of its own prompt pass.
+                    const size_t pw = tokens.empty() ? 0 : all.size() / tokens.size();
+                    if (pw > 0 && all.size() >= pw) q->out.assign(all.end() - long(pw), all.end());
+                } else {
                     q->out.assign(all.begin() + long(i * width), all.begin() + long((i + 1) * width));
                 }
                 q->done = true;

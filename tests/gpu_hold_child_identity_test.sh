@@ -71,11 +71,13 @@ fi
 # is "another lane holds the token and the guard still passes", so that is the case to drive.
 foreign="gpu-hold another-lane pid 999999 2026-11-14T00:00:00-04:00"
 printf '%s\n' "$foreign" > "$tmp/NPU-TOKEN"
-# The bystander is simulated by EMPTYING the ticket variables -- and `NPU_HOLD_TICKET=` alone is not enough, because the
-# consumer reads GPU_HOLD_TICKET first (that is what npu-hold's chain exports). This test is run by lanes INSIDE a
-# gpu-hold ticket, which exports GPU_HOLD_TICKET to its payload, so the inherited line made the consumer answer "the
-# device ticket is not ours" (rc 2, a different message than this arm asserts) and the arm failed for every lane that
-# followed the one-GPU-job rule (measured 2026-11-16 19:2xZ, the engine suite's only failure of this file). Scrub both.
+# The bystander is simulated by EMPTYING the ticket variables, and `NPU_HOLD_TICKET=` alone cannot do it: the consumer
+# resolves `_want=${NPU_HOLD_TICKET:-${GPU_HOLD_TICKET:-}}` (an explicit NPU_HOLD_TICKET wins, GPU_HOLD_TICKET is the
+# helper path's name), so emptying the first falls through to the second -- which npu-hold's chain exports, because
+# npu-hold EXECS gpu-hold. Lanes run this suite INSIDE a gpu-hold ticket, so the inherited line reached the consumer,
+# which answered "the device ticket is not ours" (rc 2, a different message than this arm asserts) and the arm failed
+# for exactly the lanes that follow the one-GPU-job rule (measured 2026-11-16 19:2xZ). Clear every name the consumer
+# consults, so the fixture simulates absence rather than renaming it.
 out=$(env -u GPU_HOLD_TICKET -u GPU_HOLD_LABEL ONEBIT_BIN=/bin/true NPU_TOKEN_FILE="$tmp/NPU-TOKEN" NPU_HOLD_TICKET= \
       bash "$SRC/scripts/npu-kernel-bitx.sh" /x /y 2>&1)
 rc=$?

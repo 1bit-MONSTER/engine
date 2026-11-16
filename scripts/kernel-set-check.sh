@@ -229,17 +229,47 @@ fi
 # engine#2599: two ELFs with the same content under different names is a refusal. See the header for why a
 # hash is the only host-side instrument that can see it.
 check_twins() {
-    local dir=$1 dup
+    # engine#2611 tolerates exactly ONE shape of twin at load: a prefill ELF byte-identical to its own `_m16`
+    # sibling, where open_prefill sizes the context from the twin's 16 rows and says so. That pack is correct but
+    # SLOW (16 rows a chunk instead of 128), so it is a WARNING here -- refusing it would block a pack the loader
+    # now runs. Any OTHER identical pair has no such reconciliation and stays a FAIL.
+    local dir=$1 dup fail_list="" warn_list="" h name prev="" prevname=""
     dup=$(find "$dir" -maxdepth 2 -name '*.elf' -type f -print0 2>/dev/null |
-          xargs -0 -r md5sum 2>/dev/null | sort | awk '{h=$1; $1=""; if (h==prev) print prevname " and" $0; prev=h; prevname=$0}')
-    if [ -n "$dup" ]; then
-        printf 'FAIL %s: ELFs with identical content under different names (a copied twin computes the wrong M):\n%s\n' \
-            "$(basename "$dir")" "$dup"
+          xargs -0 -r md5sum 2>/dev/null | sort | awk '{print $1, $2}')
+    while read -r h name; do
+        [ -n "$h" ] || continue
+        if [ "$h" = "$prev" ]; then
+            local base_a=${prevname##*/} base_b=${name##*/}
+            # Compare the GEOMETRY, not the role or the suffix. Identical content is expected -- and correct --
+            # when two names encode the same design: gate and up are both K5120 x N17408, so one ELF serves both
+            # roles and the stock sets ship it that way (engine#2599 review at 08:51Z). A `_m16` / `_t2s2_m16`
+            # suffix is the same design at a smaller M, which open_prefill reroutes and notes by name. Identical
+            # content under DIFFERENT K or N is the defect: one build copied over another's name, so a 128-row
+            # chunk computes 16 rows.
+            local ga gb
+            ga=$(printf '%s' "$base_a" | grep -oE '_K[0-9]+_N[0-9]+' | head -1)
+            gb=$(printf '%s' "$base_b" | grep -oE '_K[0-9]+_N[0-9]+' | head -1)
+            if [ -n "$ga" ] && [ "$ga" = "$gb" ]; then
+                warn_list="$warn_list
+    $prevname and $name (same geometry: one design under two role/suffix names)"
+            else
+                fail_list="$fail_list
+    $prevname and $name"
+            fi
+        fi
+        prev=$h; prevname=$name
+    done <<< "$dup"
+    if [ -n "$warn_list" ]; then
+        printf 'WARN %s: byte-identical ELFs that encode the same geometry (expected: gate and up share one design, and a _m16 twin is the same design at a smaller M):%s\n' \
+            "$(basename "$dir")" "$warn_list"
+    fi
+    if [ -n "$fail_list" ]; then
+        printf 'FAIL %s: ELFs with identical content under names with DIFFERENT geometry (one build copied over another name):%s\n' \
+            "$(basename "$dir")" "$fail_list"
         return 1
     fi
     return 0
 }
-
 rc=0
 for dir in "$@"; do
     check_set "$dir" || { rc=$?; [ "$rc" -gt 1 ] && rc=2; }

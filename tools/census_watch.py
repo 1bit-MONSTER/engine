@@ -105,6 +105,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -456,6 +457,40 @@ def get_text(url, tries=3):
     raise last
 
 
+# A GitHub API request without a credential is 60/hour for the whole box, and the FastFlowLM-org,
+# releases and support-pins sweeps all read it: on 2026-11-17 two of the three hit 403 in one run
+# (engine#2812). The workflow's own read-only `github.token` raises that to 1,000/hour per repository.
+GITHUB_API_HOSTS = ("api.github.com", "uploads.github.com")
+
+
+def github_token():
+    """The Actions/GH token to send to GitHub's API, or '' - read per call so a test can set it."""
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        token = os.environ.get(var, "").strip()
+        if token:
+            return token
+    return ""
+
+
+def json_headers(url):
+    """Headers for one JSON fetch, chosen by HOST.
+
+    The HF token must never be sent to api.github.com and the GitHub token is no use to Hugging
+    Face, so the two credentials are picked per host rather than shared. Anything else stays
+    anonymous, which is all a plain GET needs.
+    """
+    host = urllib.parse.urlparse(url).hostname or ""
+    if host in GITHUB_API_HOSTS:
+        token = github_token()
+        headers = {"User-Agent": "1bit-census-watch"}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        return headers
+    if host.endswith("huggingface.co") or host.endswith("hf.co"):
+        return request_headers()
+    return {"User-Agent": "1bit-census-watch"}
+
+
 def get_json(url, tries=3):
     """GET one JSON document: an org listing, a repo detail, a releases page.
 
@@ -466,7 +501,7 @@ def get_json(url, tries=3):
     last = None
     for t in range(tries):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "1bit-census-watch"})
+            req = urllib.request.Request(url, headers=json_headers(url))
             with urllib.request.urlopen(req, timeout=60) as r:
                 return json.load(r)
         except Exception as e:

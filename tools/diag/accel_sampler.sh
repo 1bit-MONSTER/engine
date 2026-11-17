@@ -210,8 +210,17 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   rm -f "$(provenance_file "$d/deployed.sh")"
   [ "$(check_deployed "$d/deployed.sh" >/dev/null 2>&1; echo $?)" = 2 ] \
     || { echo "FAIL: a deployed copy with no provenance must be 'cannot tell' (rc 2), not a pass"; fail=1; }
+  # engine#2478: the per-device split must be in the summary, because a single total is the number that hid 1472 NVMe
+  # records being read as an NPU stream. Fixture: one line of each device, and both must appear as their own row.
+  mkdir -p "$d/dev"
+  printf '%s\t0s\t-\t-\t-\t-\t1.0 host kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x64e44000 flags=0x0000]\n' 1 > "$d/dev/attributed.log"
+  printf '%s\t1s\t-\t-\t-\t-\t2.0 host kernel: amdxdna 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0003 address=0x7f29 flags=0x0007]\n' 2 >> "$d/dev/attributed.log"
+  : > "$d/dev/samples.log"
+  SAMP=$d/dev/samples.log ATTR=$d/dev/attributed.log DIR=$d/dev summary > /dev/null 2>&1
+  grep -qE '^ +1 nvme$' "$d/dev/summary.txt" || { echo "FAIL: the summary does not count the nvme fault as its own device"; fail=1; }
+  grep -qE '^ +1 amdxdna$' "$d/dev/summary.txt" || { echo "FAIL: the summary does not count the amdxdna fault as its own device"; fail=1; }
   rm -rf "$d"
-  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation, summary replaced not truncated)"
+  [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation, summary replaced not truncated, faults split by device)"
   return "$fail"
 }
 
@@ -249,6 +258,16 @@ summary() {  # what the run observed, so a 24 h expiry is not silence
     echo "# accel sampler summary $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "# script sha256 $(script_sha256)"
     echo "samples: $n   attributed faults: $attr"
+    echo
+    # engine#2478 correction: the fault reader greps `IO_PAGE_FAULT` with NO device filter, so this stream carries NVMe
+    # faults on the root SSD and amdxdna faults on the NPU. Measured 2026-11-16: 1472 nvme vs 90 amdxdna in 1562 records --
+    # and a report that treated the total as the NPU stream was wrong by 16x. A single total is the number that hid it, so
+    # the summary splits by device before anything else is read.
+    echo "## faults by device (from the recorded lines)"
+    if [ -f "$ATTR" ]; then
+      awk -F'\t' '{print $NF}' "$ATTR" 2>/dev/null | grep -oE 'kernel: [a-z0-9_]+' | awk '{print $NF}' \
+        | sort | uniq -c | sort -rn | sed 's/^/  /'
+    fi
     echo
     echo "## holders seen (pid, cmd, scope, ticket, sample count)"
     awk -F'\t' '$2 != "-" {print $2"\t"$4"\t"$5"\t"$6}' "$SAMP" 2>/dev/null | sort | uniq -c | sort -rn | head -20

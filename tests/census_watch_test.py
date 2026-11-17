@@ -969,6 +969,32 @@ os.environ.pop(cw.TOKEN_VARS[1], None)
 check("with no token the line stays the plain advice",
       "HF_TOKEN sent" not in text_of([model("gated/one")])[1])
 
+# 18. engine#2812: two credentials, picked by HOST. The HF token must never be sent to
+#     api.github.com, the GitHub token is useless to Hugging Face, and a third-party URL must
+#     get neither. Unauthenticated api.github.com is 60 requests/hour per IP -- shared with every
+#     other job on a hosted runner's egress -- and two of the watch's three sweeps read it.
+for var in ("GITHUB_TOKEN", "GH_TOKEN") + cw.TOKEN_VARS:
+    os.environ.pop(var, None)
+check("no credentials -> api.github.com gets the UA only",
+      cw.json_headers("https://api.github.com/repos/a/b/commits") == {"User-Agent": "1bit-census-watch"})
+os.environ["GITHUB_TOKEN"] = "gh_example"
+check("api.github.com gets the GitHub token",
+      cw.json_headers("https://api.github.com/repos/a/b/commits").get("Authorization") == "Bearer gh_example")
+os.environ[cw.TOKEN_VARS[0]] = "hf_example"
+check("... and never the HF token",
+      "hf_example" not in cw.json_headers("https://api.github.com/repos/a/b/commits").get("Authorization", ""))
+check("huggingface.co gets the HF token",
+      cw.json_headers("https://huggingface.co/api/models/a/b").get("Authorization") == "Bearer hf_example")
+check("... and never the GitHub token",
+      "gh_example" not in cw.json_headers("https://huggingface.co/api/models/a/b").get("Authorization", ""))
+check("a third-party host gets neither credential",
+      cw.json_headers("https://example.com/x") == {"User-Agent": "1bit-census-watch"})
+os.environ.pop("GITHUB_TOKEN", None); os.environ.pop(cw.TOKEN_VARS[0], None)
+os.environ["GH_TOKEN"] = "gh_fallback"
+check("GH_TOKEN is the fallback for GitHub's API",
+      cw.json_headers("https://api.github.com/x").get("Authorization") == "Bearer gh_fallback")
+os.environ.pop("GH_TOKEN", None)
+
 # 17. A rejected token (401) must not cost the whole run: the page comes back anonymously.
 #     Pins the fallback that keeps engine#619's watcher useful on a stale HF_TOKEN.
 seen_auth = []

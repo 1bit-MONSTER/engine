@@ -203,6 +203,54 @@ _age2=$(sed -n 's/.*newest \([0-9]\+\)s ago.*/\1/p' "$scratch/tlogage2" | head -
 if [ -z "$_age2" ]; then echo "FAIL take-time age/skip: the refusal has no age"; fail=1;
 elif [ "$_age2" -lt 300 ]; then echo "FAIL take-time age/skip: age ${_age2}s is the RECOVERY NOTICE's, not the fault's (~600s)"; fail=1; fi
 
+# A BACKTRACE IS ONE EVENT, NOT ELEVEN (measured 2026-11-16 19:33:03Z). The driver's reset path logs a WARN whose stack
+# frames each read `amdgpu_...reset...+0x1a2/0x3b4 [amdgpu]`, and GPU_FAULT_RE (`amdgpu.*(reset|hang)`) matches every one
+# of them: gpu-hold reported "22 fault line(s)" for a log holding 118 matching lines across TWO timestamps. The refusal
+# was correct -- a real reset had happened -- but the count is the number a lane reads when its ticket is thrown away,
+# and 22 sends it hunting a storm. A frame is the WHOLE line (two spaces, symbol, offset, module); a fault line can
+# also carry an offset -- the WARNING/RIP pair of a WARN -- so the arm below is what keeps the skip from swallowing the
+# event it belongs to.
+mkdir -p "$scratch/framebin"; t3=$(( $(date +%s) - 30 ))
+{
+  printf '%s kernel: amdgpu 0000:c5:00.0: GPU reset(2) succeeded!\n' "$t3"
+  printf '%s kernel: amdgpu 0000:c5:00.0: GPU reset: queues of 2 process(es) are no longer usable\n' "$t3"
+  for _f in amdgpu_device_gpu_recover.cold amdgpu_device_asic_reset amdgpu_do_asic_reset \
+            amdgpu_device_reinit_after_reset.cold amdgpu_amdkfd_reset_work amdgpu_dm_atomic_commit_tail \
+            amdgpu_device_gpu_recover amdgpu_amdkfd_reset amdgpu_reset_work amdgpu_sched_reset; do
+    printf '%s kernel:  %s+0x2f54/0x3830 [amdgpu]\n' "$t3" "$_f"
+  done
+} > "$scratch/framelog"
+printf '#!/bin/bash\ncat %s\n' "$scratch/framelog" > "$scratch/framebin/journalctl"
+chmod +x "$scratch/framebin/journalctl"
+env PATH="$scratch/framebin:$PATH" HOME=$scratch ONEBIT_HOLD_DIR="$scratch/framehold" GPU_HOLD_COOLDOWN=0 \
+    GPU_HOLD_WAIT=5 GPU_HOLD_MINUTES=1 GPU_HOLD_THERMAL_FLAG="$scratch/x" GPU_HOLD_RESET_WINDOW_MIN=10 \
+    timeout 60 "$hold" -l takeframe -- true > "$scratch/tlogframe" 2>&1
+frame_rc=$?
+[ "$frame_rc" = 78 ] || { echo "FAIL take-time frames: rc $frame_rc, want 78 (a real reset is still a refusal)"; fail=1; }
+grep -q 'refusing: 2 ' "$scratch/tlogframe" || {
+    echo "FAIL take-time frames: a WARN backtrace was counted as more than the 2 real lines ($(sed -n 's/.*refusing: \([0-9]*\) .*/\1/p' "$scratch/tlogframe" | head -1) counted)"; fail=1; }
+grep -qE '\+0x[0-9a-f]+/0x' "$scratch/tlogframe" && { echo "FAIL take-time frames: a stack frame was printed as a fault line"; fail=1; }
+
+# engine#2799 review, twice: the skip must be a FRAME, not any line that mentions an offset. The event lines of a WARN --
+# `WARNING: CPU: … at …amdgpu_device.c:4521 amdgpu_device_reinit_after_reset+0x15c/0x1ef [amdgpu]` and `RIP: 0010:…` --
+# carry offsets too, so a flat `+0x../0x..` skip counted a WARN-only log as ZERO faults and the guard would grant a
+# ticket onto it. This arm pins the direction that matters: the event line counts.
+mkdir -p "$scratch/warnbin"; t4=$(( $(date +%s) - 20 ))
+{
+  printf '%s kernel: WARNING: CPU: 3 PID: 991 at drivers/gpu/drm/amd/amdgpu/amdgpu_device.c:4521 amdgpu_device_reinit_after_reset+0x15c/0x1ef [amdgpu]\n' "$t4"
+  printf '%s kernel: RIP: 0010:amdgpu_device_reinit_after_reset+0x15c/0x1ef [amdgpu]\n' "$t4"
+  printf '%s kernel:  amdgpu_device_gpu_recover.cold+0x266/0x2e1 [amdgpu]\n' "$t4"
+} > "$scratch/warnlog"
+printf '#!/bin/bash\ncat %s\n' "$scratch/warnlog" > "$scratch/warnbin/journalctl"
+chmod +x "$scratch/warnbin/journalctl"
+env PATH="$scratch/warnbin:$PATH" HOME=$scratch ONEBIT_HOLD_DIR="$scratch/warnhold" GPU_HOLD_COOLDOWN=0 \
+    GPU_HOLD_WAIT=5 GPU_HOLD_MINUTES=1 GPU_HOLD_THERMAL_FLAG="$scratch/x" GPU_HOLD_RESET_WINDOW_MIN=10 \
+    timeout 60 "$hold" -l takewarn -- true > "$scratch/tlogwarn" 2>&1
+warn_rc=$?
+[ "$warn_rc" = 78 ] || { echo "FAIL take-time WARN-only: rc $warn_rc, want 78 (a WARN whose event line carries an offset is still a fault)"; fail=1; }
+grep -q 'refusing: 1 ' "$scratch/tlogwarn" || {
+    echo "FAIL take-time WARN-only: counted $(sed -n 's/.*refusing: \([0-9]*\) .*/\1/p' "$scratch/tlogwarn" | head -1) line(s), want 1 (the WARNING event line; RIP and the frame are skipped)"; fail=1; }
+
 take_run clean clean
 [ "$trc" = 0 ] || { echo "FAIL take-time: a clean log -> rc $trc, want 0 (a healthy hold must still run)"; fail=1; }
 
@@ -253,6 +301,30 @@ if [ "$rc" != 124 ]; then echo "FAIL arm 6: rc $rc for a payload cut by the max 
 grep -q "the max hold cut it short" "$scratch/log6" || { echo "FAIL arm 6: a 124 release does not name the max hold"; fail=1; }
 grep -q "may appear AFTER this release" "$scratch/log6" || { echo "FAIL arm 6: a 124 release does not warn about deferred work"; fail=1; }
 
+# ── arm 7: a BACKTRACE must not hide the event line it belongs to ────────────────────────────────────────────────
+# The frame filter added for the count is read by the during-hold watch too (one skip regex, so they cannot drift), so
+# the question is whether filtering `+0x` frames could make the watch miss a real fault. It cannot while the driver logs
+# an event line, and this arm pins that: a hold whose log carries three frames AND the reset line aborts, and the line
+# it quotes is the event, not a frame.
+q7=$scratch/q7; mkdir -p "$q7"; : > "$scratch/klog7"; rm -f "$scratch/deep.pid"
+printf '%s
+' "kernel: usb 1-1: new device" > "$scratch/klog7"
+( sleep 5
+  printf '%s
+' "kernel:  amdgpu_device_gpu_recover.cold+0x266/0x2e1 [amdgpu]" \
+                "kernel:  amdgpu_device_asic_reset+0x37d/0x43d [amdgpu]" \
+                "kernel:  amdgpu_do_asic_reset+0x102/0x1a0 [amdgpu]" \
+                "kernel: amdgpu 0000:c5:00.0: GPU reset(2) succeeded!" >> "$scratch/klog7" ) &
+env -u GPU_HOLD_FAULT_ABORT GPU_HOLD_FAULT_ABORT=1 GPU_HOLD_KLOG_FILE="$scratch/klog7" \
+    GPU_QUEUE_DIR="$q7" GPU_TOKEN_FILE="$scratch/TOKEN7" GPU_HOLD_LOG="$scratch/log7" \
+    GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 GPU_HOLD_RESET_WINDOW_MIN=0 \
+    GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x" \
+        timeout 120 "$hold" -t 10 -l faulttest7 -- "$scratch/wrapper.sh" "$scratch" 40 > /dev/null 2>&1
+rc=$?
+if [ "$rc" != 78 ]; then echo "FAIL arm 7: rc $rc for a hold whose log carries frames plus a reset line, want 78"; fail=1; fi
+grep -q "GPU reset(2) succeeded" "$scratch/log7" || { echo "FAIL arm 7: the abort does not quote the reset event line"; fail=1; }
+grep -qE '\+0x[0-9a-f]+/0x' "$scratch/log7" && { echo "FAIL arm 7: the abort quoted a stack frame as the fault"; fail=1; }
+
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
@@ -277,5 +349,5 @@ grep -q "newest line is from the NPU" "$scratch/log5" || { echo "FAIL arm 5: the
 grep -q "newest line is from the GPU" "$scratch/log1" || { echo "FAIL arm 1: the abort does not name the GPU as the faulting device"; fail=1; }
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 
-[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on; 124 named -> 78; take-time page fault/MES/ring/hang -> 78; NPU fault in hold -> 78; a recovery notice does NOT abort; a real power-cycling event does)"
+[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on; 124 named -> 78; take-time page fault/MES/ring/hang -> 78; NPU fault in hold -> 78; a recovery notice does NOT abort; a real power-cycling event does; a WARN backtrace counts once; one cannot hide its event line; and a WARN whose event line carries an offset still counts)"
 exit "$fail"

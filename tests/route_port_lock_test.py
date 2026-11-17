@@ -43,7 +43,11 @@ BUILD_DIR = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "build")
 
 # The shapes a route script binds a loopback port in: the freeport helper, the :0 bind it makes,
 # and the fixed 43xxx literals print_backend/lemonade_hrx/template_pin start their servers on.
-BIND_RE = re.compile(r'freeport|free_port|bind\(\s*\("127\.0\.0\.1",\s*0\)\s*\)|--port\s+43\d{3}\b')
+BIND_RE = re.compile(r'freeport|free_port|bind\(\s*\("127\.0\.0\.1",\s*0\)\s*\)|--port\s+43\d{3}\b'
+                      # engine#2826: `PORT=${EMBED_SERVE_PORT:-8247}` is the same choice written as a shell default, and
+                      # it matched none of the three shapes above -- so embed_serve sat unlocked while this census
+                      # reported OK. A 4-5 digit default is a fixed port whatever the variable is called.
+                      r'|PORT=\$\{[A-Z_]+:-[0-9]{4,5}\}')
 
 
 def configured_tests(ctest, build_dir):
@@ -121,6 +125,14 @@ class RoutePortLockTest(unittest.TestCase):
         # shrinking the census below its floor.
         for name in ("pm_route", "print_backend", "smoke_serve", "embed_serve"):
             self.assertIn(name, found, f"{name} starts a server; the census must find it")
+        # engine#2826: a port written as a shell default -- `PORT=${EMBED_SERVE_PORT:-8247}` -- matched none of the
+        # three shapes above, so a fixed-port server test sat unlocked while this census reported OK (embed_serve,
+        # until its port became a freeport). This pins the SHAPE rather than that one script: the next row that writes
+        # a fixed default is caught here instead of by a flake.
+        self.assertTrue(BIND_RE.search("PORT=${EMBED_SERVE_PORT:-8247}"),
+                        "a shell-default fixed port is a fixed port; the census must recognise the shape")
+        self.assertFalse(BIND_RE.search("PORT=${X:-80}"),
+                         "...but a two-digit default is not one (keeps the pattern from matching every shell var)")
         # 5 in a build with no model passed; a model-enabled build configures more (hybrid_e2e,
         # laya_route_e2e, laya_models_e2e, pm_laya_route, hrx_cpu_weight_parity and serve_e2e_<dev>), so the floor is
         # the number the CI build has, not the number a developer's build may have. It counted 15 before engine #1485

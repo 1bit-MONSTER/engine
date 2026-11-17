@@ -207,6 +207,11 @@ jobs:
           FAILURE: ${{ needs.watch.outputs.failure }}
           WATCH_RESULT: ${{ needs.watch.result }}
           SIMULATED: ${{ needs.watch.outputs.simulated }}
+          # engine#2846: the `alert` output was computed and never read, so the coverage body below ran on EVERY
+          # scheduled run whose watch job succeeded -- a quiet run filed a coverage-breach issue whose excerpt was
+          # filler rows and advisory `->` lines, with no finding in it (the #2677 "issue looks empty" shape, made
+          # structural). 2026-11-17 13:42Z is the case: 0 alerts, an issue filed.
+          ALERT: ${{ needs.watch.outputs.alert }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           gh label create census-watch --color B60205 --description "Daily new-model watcher alert" 2>/dev/null || true
@@ -252,6 +257,14 @@ jobs:
               echo "$fail_marker"
             } > /tmp/census_issue.md
             post "census: the daily watch did not run" "$fail_marker" /tmp/census_issue.md
+            exit 0
+          fi
+
+          # A watch that ran, found nothing and alerted on nothing files NOTHING. Without this guard the body below
+          # is assembled for a quiet run too, and `post` then creates an issue whose only content is the per-row
+          # stream (engine#2846).
+          if [ "${ALERT}" != "true" ]; then
+            echo "census-watch: quiet -- no issue filed (alert=${ALERT})"
             exit 0
           fi
 

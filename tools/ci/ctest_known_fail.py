@@ -54,7 +54,19 @@ import sys
 import tempfile
 
 BASELINE = pathlib.Path("tools/ci/ctest_known_fail.txt")
-TOOL_ROOT = pathlib.Path(__file__).resolve().parents[2]
+def _tool_root() -> pathlib.Path:
+    """The tree this tool ships in, or the caller's cwd when it has been copied somewhere else.
+
+    `pathlib.Path(__file__).resolve().parents[2]` raises IndexError for any copy shallow enough to lack three
+    parents (e.g. /tmp/x.py), which is how a relocated copy died before printing anything -- and a raw IndexError
+    reads as a broken tool rather than "this copy is not inside a tree". Collapsing every mutation-test run on this
+    file into that crash is what hid the arms for an hour (engine#2825 review, mine).
+    """
+    here = pathlib.Path(__file__).resolve()
+    return here.parents[2] if len(here.parents) > 2 else pathlib.Path.cwd()
+
+
+TOOL_ROOT = _tool_root()
 # ctest writes the failure list in two places and the second one has the reason:
 #   "\t 18 - test-tokenizers-ggml-vocabs (Failed)"          the numbered list after "The following tests FAILED:"
 #   "\t101 - test-hrx-mul-mat-id-k32 (Subprocess aborted)"
@@ -84,9 +96,21 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def failed(log_text: str):
-    """{test name: ctest's reason} for every test the run reported as failed."""
+    """{name: reason} from ctest's FAILED block -- FAILURES only, never the skip list (engine#2825 review, mine).
+
+    The catch-all alternative in FAILED_LINE (`[A-Z][^)]*`) was written for reason strings ctest may add, and it also
+    matched `(Skipped)`. ctest prints a skipped-tests section in the same `  318 - name (Skipped)` shape, so every
+    skipped row counted as a failure: measured on a real 383-test log the summary said `3 tests failed out of 383`
+    while this function returned 16 names (3 failures + 13 skips), and check() then refused EVERY real log with
+    "one of the two is truncated" -- the ratchet could never answer, which is the failure it exists to prevent.
+    """
     log_text = ANSI.sub("", log_text)
-    return {name: reason for name, reason in FAILED_LINE.findall(log_text)}
+    out = {}
+    for name, reason in FAILED_LINE.findall(log_text):
+        if reason.split()[0].lower() in ("skipped", "not", "disabled"):
+            continue          # a row that did not run is not a failure and must never enter the ratchet
+        out[name] = reason
+    return out
 
 
 def summary(log_text: str):
@@ -193,6 +217,23 @@ Errors while running CTest
     cases += 1
     if (new2, cannot2) != ({"test-kv-zero"}, None):
         print(f"  SELF-TEST FAIL: a baseline missing one failure -> {new2, cannot2}")
+        bad += 1
+    # engine#2825 review (mine): a SKIPPED row is not a failure. ctest prints its skipped rows in the same
+    # `  318 - name (Skipped)` shape, and FAILED_LINE's catch-all counted every one of them, so a real log whose
+    # summary said "3 failed" produced 16 names and check() refused as "truncated". Measured on a real 383-test log.
+    with_skips = """\
+97% tests passed, 4 tests failed out of 112
+The following tests FAILED:
+\t 19 - test-kv-zero (Subprocess aborted)
+\t318 - onnx_graph (Skipped)
+\t319 - audio_exec (Skipped)
+\t326 - whisper_transcribe_jfk (Skipped)
+Errors while running CTest
+"""
+    skips = failed(with_skips)
+    cases += 1
+    if set(skips) != {"test-kv-zero"}:
+        print(f"  SELF-TEST FAIL: a skipped row was counted as a failure -> {sorted(skips)}")
         bad += 1
     # engine#2825 review (mine): the fixture above puts the summary FIRST and ctest puts it LAST. With the summary in
     # its real place a regex without re.MULTILINE cannot see it, so every real log answered "cannot tell" while this

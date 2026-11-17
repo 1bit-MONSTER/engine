@@ -115,6 +115,36 @@ grep -q "the driver last named hrx-ops-test pid 186654" "$scratch/tlogclass" \
 grep -q "the window's first compute marker is a gfxhub page fault" "$scratch/tlogclass" \
     || { echo "FAIL take-time class: the refusal does not quote the window's first compute marker"; fail=1; }
 
+# engine#2851: a BACKTRACE IS ONE EVENT, NOT ELEVEN. Every arm above injects a log with no timestamp in it, so each
+# line is its own event there and the counts read the same as they did before the event count existed -- i.e. the
+# branch that dedupes journal lines had NO arm until this one. Measured on the box 2026-11-16 19:33: the driver's reset
+# path logs a WARN whose every frame matches `amdgpu.*reset`, and the refusal said "22 fault line(s)" for TWO
+# timestamps. Two timestamps, four frames at each: the message must say 2 events and 8 lines, because the number a lane
+# quotes into its state file is the one that sends the next reader hunting (or not).
+q=$scratch/tqevents; mkdir -p "$q"; rm -f "$scratch/TTOKENevents"; : > "$scratch/tklogevents"
+printf '%s\n' "Nov 16 19:33:03 strixhalo kernel: amdgpu_device_reinit_after_reset.cold+0x15c/0x1ef [amdgpu]" \
+              "Nov 16 19:33:03 strixhalo kernel: amdgpu_do_asic_reset+0x102/0x1a0 [amdgpu]" \
+              "Nov 16 19:33:03 strixhalo kernel: amdgpu_device_asic_reset+0x37d/0x43d [amdgpu]" \
+              "Nov 16 19:33:03 strixhalo kernel: amdgpu_amdkfd_reset_work+0x76/0xa0 [amdgpu]" \
+              "Nov 16 20:10:21 strixhalo kernel: [gfxhub] page fault (src_id:0 ring:24 vmid:8 pasid:6840)" \
+              "Nov 16 20:10:21 strixhalo kernel: [gfxhub] page fault (src_id:0 ring:24 vmid:8 pasid:6840)" \
+              "Nov 16 20:10:21 strixhalo kernel: MES failed to respond to msg=REMOVE_QUEUE" \
+              "Nov 16 20:10:21 strixhalo kernel: ring gfx_0.0.0 timeout, signaled seq=1, emitted seq=2" \
+              > "$scratch/tklogevents"
+env GPU_HOLD_KLOG_FILE="$scratch/tklogevents" GPU_QUEUE_DIR="$q" GPU_TOKEN_FILE="$scratch/TTOKENevents" \
+    GPU_HOLD_LOG="$scratch/tlogevents" GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 \
+    GPU_HOLD_RESET_WINDOW_MIN=10 GPU_HOLD_FAULT_ABORT=0 GPU_HOLD_TCTL_START=100 \
+    GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x" \
+    timeout 60 "$hold" -t 1 -l takeevents -- true > /dev/null 2>&1
+erc=$?
+[ "$erc" = 78 ] || { echo "FAIL take-time events: rc $erc, want 78 (the refusal must still fire)"; fail=1; }
+grep -q "2 amdgpu/MES/amdxdna fault event(s)" "$scratch/tlogevents" \
+    || { echo "FAIL take-time events: 8 lines across 2 timestamps must read as 2 events: $(grep -o '[0-9]* amdgpu[^.]*' "$scratch/tlogevents" | head -1)"; fail=1; }
+grep -q "across 8 matching line(s)" "$scratch/tlogevents" \
+    || { echo "FAIL take-time events: the line count must still be printed beside the event count"; fail=1; }
+grep -q "the event count is the one to read" "$scratch/tlogevents" \
+    || { echo "FAIL take-time events: the message must say which of the two numbers to read"; fail=1; }
+
 # the NPU spelling: this is the line the rules say to stop for, and npu-hold has no other take-time check
 take_run npu "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* command timeout: opcode 0x2"
 [ "$trc" = 78 ] || { echo "FAIL take-time: an amdxdna command timeout -> rc $trc, want 78 (the NPU rule)"; fail=1; }

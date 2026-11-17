@@ -116,6 +116,20 @@ def main():
     check("Q4NX (NPU)" in got3 and got3.count("!!") >= 2,
           "the per-row stream is truncated before the alerts or the conclusion", got3[:200])
 
+    # engine#2819 review: the pattern is read by BOTH grep -E and awk, and `\(` is a plain `(` to awk -- a GROUP, so
+    # `Q4NX \(NPU\)` matched "Q4NX NPU" and the Q4NX CLASS row was dropped from the excerpt while its `->` conclusion
+    # survived. The fixture here must therefore be a row whose TEXT carries a literal paren, which none of the arms above
+    # do: their `Q4NX (NPU)` occurrences are all on the `->` conclusion line.
+    def shape_q4nx_row():
+        return ("  -> 3 Q4NX (NPU) pack(s) for a family the NPU route does not serve: gemma4 (3 pack(s))\n"
+                "  ! Q4NX (NPU) gap: quantumchat has 2 classes the registry does not carry\n"
+                "  . NPU FLM FastFlowLM/Family-NPU2  … answered: engine#1786\n")
+
+    got4 = excerpt(block, shape_q4nx_row())
+    check("Q4NX (NPU) gap: quantumchat" in got4,
+          "a class ROW whose text contains a literal paren survives the pattern (the grep/awk dialect difference)",
+          got4[:200])
+
     print(f"census_watch_excerpt: {'ok' if not fails else f'{fails} failure(s)'}")
     return 0 if not fails else 1
 

@@ -424,6 +424,23 @@ def self_test() -> int:
         chk(unparsed_faults(str(d / "mono.txt")) == 0,
             "a short-monotonic capture leaves nothing unparsed")
         chk(unparsed_faults("/nonexistent/faults.txt") == 0, "an unreadable file claims nothing")
+
+        # ...and the WIRING: main() must print the note, and must not print it for a capture it reads. An arm on the
+        # function alone would stay green with the note deleted from main(), which is the one line that turns silence
+        # into a statement about the format (review of engine#2800).
+        import contextlib as _cl, io as _io
+        buf = _io.StringIO()
+        with _cl.redirect_stdout(buf):
+            main(["--trace", str(d / "cap.txt"), "--before", str(d / "mono.txt"),
+                  "--after", str(d / "short.txt")])
+        chk("did not read" in buf.getvalue(),
+            "main() PRINTS the unparsed-fault note for a short-form capture")
+        buf2 = _io.StringIO()
+        with _cl.redirect_stdout(buf2):
+            main(["--trace", str(d / "cap.txt"), "--before", str(d / "mono.txt"),
+                  "--after", str(d / "mono.txt")])
+        chk("did not read" not in buf2.getvalue(),
+            "and does not print it for a capture it reads")
         chk(unparsed_faults("") == 0, "no path, no claim")
 
         faults = parse_faults(str(d / "after.txt"))
@@ -836,9 +853,11 @@ def main(argv):
             print(f"note: no faults in --after; using the {len(faults)} fault event(s) carried by the trace itself")
     # engine#2542: a capture that carries the marker and parses to nothing is in the wrong FORM, not empty. Saying which
     # form the parser reads turns "there were no faults" into "this file is not the shape I read".
+    seen_src = set()   # --trace and --after are often the same file; say it once, not once per scan
     for src in (a.after, a.before, a.trace):   # every source main() reads faults from, before included
-        if not src:
+        if not src or src in seen_src:
             continue
+        seen_src.add(src)
         n = unparsed_faults(src)
         if n:
             print(f"note: {src} carries {n} IO_PAGE_FAULT line(s) this parser did not read; it wants the "

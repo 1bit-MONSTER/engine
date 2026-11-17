@@ -58,7 +58,7 @@ def _tool_root() -> pathlib.Path:
     """The tree this tool ships in, or the caller's cwd when it has been copied somewhere else.
 
     `pathlib.Path(__file__).resolve().parents[2]` raises IndexError for any copy shallow enough to lack three
-    parents (e.g. /tmp/x.py), which is how a relocated copy died before printing anything -- and a raw IndexError
+    parents (a copy dropped in a scratch directory, say), which is how a relocated copy died before printing anything -- and a raw IndexError
     reads as a broken tool rather than "this copy is not inside a tree". Collapsing every mutation-test run on this
     file into that crash is what hid the arms for an hour (engine#2825 review, mine).
     """

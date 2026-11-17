@@ -215,11 +215,6 @@
   "Zarya": {
    "model_type": "zarya",
    "family": "Zarya, diffusion LM sampler"
-  },
-  "SimulatedForTestingClass": {
-   "model_type": "simulated",
-   "family": "Hugging Face's own simulated model for testing Transformers tooling (`example/simulated`, first seen in the 2026-11-17 census with 1 model). Not a family to serve: there is no pretrained weight set behind it and no config a GGUFs converter could map, so a registry entry would be a claim that the engine runs a model only HF's test suite uploads. Reviewed as `watch: report` so a future census that sees it again reports the row without alerting.",
-   "watch": "report"
   }
  }
 }

@@ -230,13 +230,10 @@ endfunction()
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
 # The embedding role served in-process from a 1-bit container (engine#1311): /v1/embeddings for a string and an
 # array, the OpenAI shape, and the refusals named. Device-free on the 32-token fixture.
+# engine#2826 follow-up: it binds a loopback port (now a free one), so it holds the route_ports lock like every other
+# route test. The census could not see it before because its port was a fixed 8247, not one of the shapes
+# tests/route_port_lock_test.py recognises; the script stopped hard-coding a port in the same commit.
 add_test(NAME embed_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/embed_serve.sh $<TARGET_FILE:onebit>)
-# engine#2826 (ORCH 2026-11-17, ctest -j 4): embed_serve starts `1bit serve` on a FIXED port --
-# `PORT=${EMBED_SERVE_PORT:-8247}` in tests/embed_serve.sh -- and held no lock, while every other server row does.
-# It was invisible to the census (tests/route_port_lock_test.py) because that pattern knew `freeport`, the `:0` bind
-# and `--port 43xxx`, and a shell default matched none of them; the pattern now has the shape as well, so this cannot
-# recur silently. Under -j two rows can be handed 8247 between the close and the child's bind, which is the flake the
-# lock exists for (engine#1070).
 set_tests_properties(embed_serve PROPERTIES RESOURCE_LOCK route_ports)
 # serve takes a hung backend down (docs/serve.md, "When a backend hangs"): a fake backend, no GPU.
 add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh $<TARGET_FILE:onebit>)
@@ -602,6 +599,10 @@ add_test(NAME hrx_f16_narrowing_check COMMAND ${Python3_EXECUTABLE}
          ${CMAKE_SOURCE_DIR}/tools/ci/hrx_f16_narrowing.py --check --root ${CMAKE_SOURCE_DIR})
 set_tests_properties(hrx_f16_narrowing_check PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
+# engine#2805: three duplicate PRs on one issue in one night (#2778, #2795, #2779) and a human reviewer noticed each time.
+# The claim is in the title/body (`Fixes #N`), so the self-test is hermetic and the live run is a lane tool: `Refs #N` and a
+# bare mention are deliberately NOT claims, which is the arm below that keeps the detector from firing on every PR.
+add_python_test(tool_selftest_duplicate_fixes ${CMAKE_SOURCE_DIR}/tools/ci/duplicate_fixes_check.py --self-test)
 add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_agree.py --selftest)
 add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
 add_python_test(tool_selftest_spec_decode_acceptance ${CMAKE_SOURCE_DIR}/tools/spec_decode_acceptance.py --selftest)

@@ -81,6 +81,10 @@ jobs:
       alert: ${{ steps.watch.outputs.alert }}
       lines: ${{ steps.watch.outputs.lines }}
       failure: ${{ steps.watch.outputs.failure }}
+      # engine#2816: the simulate path must be unmistakable in the ISSUE, not only in the run. A lane read the
+      # fabricated `!! UNCOVERED SimulatedForTestingClass` / `example/simulated` row as a real finding and reviewed
+      # it into registry/significant.json, where it now claims a class was reviewed that no model has ever had.
+      simulated: ${{ steps.watch.outputs.simulated }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -108,6 +112,7 @@ jobs:
           if [ "$SIMULATE" = "true" ]; then
             echo "  !! UNCOVERED SimulatedForTestingClass (new class): 1 model(s), e.g. example/simulated" >> /tmp/census-watch.log
             rc=1
+            echo "simulated=true" >> "$GITHUB_OUTPUT"
           fi
           # The `!!` rows (the alerts) go first, then the informational ones: the excerpt is capped
           # at 40 lines, and engine#2677 was filed with 21 `? UNVERIFIABLE` and 19 answered
@@ -187,6 +192,7 @@ jobs:
           LINES: ${{ needs.watch.outputs.lines }}
           FAILURE: ${{ needs.watch.outputs.failure }}
           WATCH_RESULT: ${{ needs.watch.result }}
+          SIMULATED: ${{ needs.watch.outputs.simulated }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           gh label create census-watch --color B60205 --description "Daily new-model watcher alert" 2>/dev/null || true
@@ -244,6 +250,15 @@ jobs:
           {
             echo "## Census coverage breach ($(date -u +%Y-%m-%d))"
             echo ""
+            if [ "${SIMULATED}" = "true" ]; then
+              echo "> **This is a SIMULATED alert.** The run was dispatched with \`simulate_alert\`, which appends one"
+              echo "> fabricated row to the watcher's log to exercise this path. \`SimulatedForTestingClass\` and"
+              echo "> \`example/simulated\` are this workflow's own fixtures: no model has that class, nothing needs"
+              echo "> mapping in \`registry/architectures.json\`, and nothing may be reviewed into"
+              echo "> \`registry/significant.json\` (engine#2816 did exactly that, and it had to be removed)."
+              echo "> Close this issue when the dispatch is done."
+              echo ""
+            fi
             echo "The daily new-model watcher found Hugging Face models whose architecture class is not"
             echo "mapped by the engine registry (\`registry/architectures.json\`), a FastFlowLM"
             echo "repo publishing a model family this engine does not serve, a Q4NX (NPU) pack for"

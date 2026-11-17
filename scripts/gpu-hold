@@ -358,14 +358,27 @@ while [ "$state" = queued ]; do
     # it could have predicted. This is the same PATTERN (GPU_FAULT_RE/GPU_FAULT_SKIP_RE, so the two cannot drift) read
     # over the same window; it decides nothing -- the refusal still happens at take, when the window is re-read, because
     # a queue wait can be minutes long and the condition can clear (or arrive) in the meantime.
-    if [ "$waited" = 0 ] && [ "${GPU_HOLD_FAULT_ABORT:-1}" != 0 ] && [ -z "${GPU_HOLD_QUEUE_STATE_OFF:-}" ]; then
+    # ...and it repeats WHILE the lane waits, because the queue-time check alone misses the case that actually happens:
+    # measured on this box after the deploy, all four refusals on the new copy came after waits of 232-296 s and were
+    # triggered by a fault that arrived DURING the wait ("newest 7-12s ago"), with the queue-time warning (correctly)
+    # silent at the first poll. A warning that only fires at second zero describes the one moment a fault is least likely
+    # to matter. Re-checked every 10 s (journalctl is not free every 2 s), logged ONCE per wait so the queue stays
+    # readable, and still deciding nothing: the refusal at take remains the authority.
+    if [ "${GPU_HOLD_FAULT_ABORT:-1}" != 0 ] && [ -z "${GPU_HOLD_QUEUE_STATE_OFF:-}" ] && [ -z "${_qs_warned:-}" ] &&
+       { [ "$waited" = 0 ] || [ $((waited % 10)) -lt "$POLL" ]; }; then
         _qs_window=${GPU_HOLD_RESET_WINDOW_MIN:-10}
         _qs_hits=$(if [ -n "${GPU_HOLD_KLOG_FILE:-}" ]; then cat "$GPU_HOLD_KLOG_FILE" 2> /dev/null
                    else journalctl -k --since "-${_qs_window} min" --no-pager -q 2> /dev/null; fi |
                    grep -iE "$GPU_FAULT_RE" | grep -viE "$GPU_FAULT_SKIP_RE")
         if [ -n "$_qs_hits" ]; then
+            _qs_warned=1
             _qs_dev=GPU; printf '%s\n' "$_qs_hits" | tail -1 | grep -qi amdxdna && _qs_dev=NPU
-            log "::warning::queued while the kernel log carries a ${_qs_dev} fault line in the last ${_qs_window} min - if it is still there when this ticket reaches the front, the take is REFUSED (rc 78) and this queue position is lost; newest: $(printf '%s\n' "$_qs_hits" | tail -1 | cut -c1-160)"
+            if [ "$waited" = 0 ]; then
+                _qs_when="queued while"
+            else
+                _qs_when="still waiting after ${waited}s while"
+            fi
+            log "::warning::${_qs_when} the kernel log carries a ${_qs_dev} fault line in the last ${_qs_window} min - if it is still there when this ticket reaches the front, the take is REFUSED (rc 78) and this queue position is lost; newest: $(printf '%s\n' "$_qs_hits" | tail -1 | cut -c1-160)"
         fi
     fi
     cool=$(cool_left)

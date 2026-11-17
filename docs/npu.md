@@ -4286,6 +4286,42 @@ and `--device hybrid` splits a single request across them ([hybrid.md](hybrid.md
 The NPU needs the `amdxdna` kernel driver. The [1bit OS](os-v3.md) appliance ships a kernel built
 with it, and the [Linux kernel](kernel.md) page covers building your own.
 
+## Building an audio pack: fold the head transpose first (engine#2366)
+
+A Whisper pack is a directory with `encoder_model.onnx` and `decoder_model.onnx` (plus any `.onnx.data` sidecar).
+Build one with `tools/make-audio-pack.sh` rather than copying the graphs by hand:
+
+```
+tools/make-audio-pack.sh --out my-pack encoder_model.onnx decoder_model.onnx [sidecar...]
+```
+
+The script folds the decoder's initializer-fed `Transpose` before writing it: the lm head is tied to
+`token_embedding.weight` (51865x768), and the export reaches the head through `Transpose(val) -> MatMul`, so a
+159 MB weight is transposed on **every** window — `[audio-node] 785 Transpose 768x51865` beside
+`786 MatMul 1x128x51865`, 26 times per transcription. Stored in the orientation the matmul reads, the node
+disappears: `nodes 786 -> 785`, `initializer-fed Transposes 0`.
+
+Measured on this box (host `-5.0 %` wall, device `-1.307 s / -5.9 %`, **encoders flat on both** as the control,
+transcript ids unchanged):
+
+| | unfolded | folded |
+|---|---|---|
+| device wall (30 s window) | 22.015 s | 20.708 s |
+| host wall | 34.394 s | 32.689 s |
+
+The cost is pack size: the untransposed copy still feeds the input gather, so the decoder grows by the weight's
+size (617 MB -> 776 MB for whisper-small). A pack copied by hand keeps the Transpose and pays ~50 ms per window
+forever; `tools/make-audio-pack.sh --check`-style refusal is the guard — the script re-reads the file it wrote and
+fails rather than emitting a pack that silently costs that.
+These device figures are one sample each. The same binary and pack have since produced an encoder of 2.2 s at load ~4
+and 5.0-6.0 s at load ~9 on this box, with **encoders that should be identical between the arms differing by 2.2x** -- so
+a device A/B here is only valid if the encoder control comes out flat within the run, which is why both rows above are
+quoted with it.
+
+`tools/fold_initializer_transpose.py --check <model.onnx>` answers the question on an existing pack. A packed
+decoder that still carries an initializer-fed Transpose prints the node and exits 1; a folded one prints
+`nodes <n>, initializer-fed Transposes 0` and exits 0.
+
 ## The Whisper host chain: threads and per-op times (engine#1783)
 
 `tools/whisper_transcribe` runs a Whisper pack's two ONNX graphs on the host (`npu/audio_exec.cpp`). Two variables

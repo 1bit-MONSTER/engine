@@ -120,13 +120,19 @@ class RoutePortLockTest(unittest.TestCase):
         # recipes_route is no longer here on purpose: it runs `serve --port 0` since engine #1485, so it picks nothing
         # and releases nothing and the lock protects it from nothing. The names below are the ones that still choose
         # their port before launching.
-        for name in ("pm_route", "print_backend", "smoke_serve"):
+        # engine#2826 follow-up: embed_serve bound a fixed 8247, which matches none of BIND_RE's shapes, so the census
+        # was blind to it and it carried no lock. Named here so a revert to a fixed port fails by name instead of
+        # shrinking the census below its floor.
+        for name in ("pm_route", "print_backend", "smoke_serve", "embed_serve"):
             self.assertIn(name, found, f"{name} starts a server; the census must find it")
-        # engine#2826: embed_serve writes its port as a shell default (`PORT=${EMBED_SERVE_PORT:-8247}`), which none
-        # of the three original shapes matched -- the census passed while a fixed-port server test held no lock.
-        # Named here so the pattern cannot quietly stop matching it again.
-        self.assertIn("embed_serve", found,
-                      "embed_serve binds a fixed 8247 through ${EMBED_SERVE_PORT:-8247}; the census must see it")
+        # engine#2826: a port written as a shell default -- `PORT=${EMBED_SERVE_PORT:-8247}` -- matched none of the
+        # three shapes above, so a fixed-port server test sat unlocked while this census reported OK (embed_serve,
+        # until its port became a freeport). This pins the SHAPE rather than that one script: the next row that writes
+        # a fixed default is caught here instead of by a flake.
+        self.assertTrue(BIND_RE.search("PORT=${EMBED_SERVE_PORT:-8247}"),
+                        "a shell-default fixed port is a fixed port; the census must recognise the shape")
+        self.assertFalse(BIND_RE.search("PORT=${X:-80}"),
+                         "...but a two-digit default is not one (keeps the pattern from matching every shell var)")
         # 5 in a build with no model passed; a model-enabled build configures more (hybrid_e2e,
         # laya_route_e2e, laya_models_e2e, pm_laya_route, hrx_cpu_weight_parity and serve_e2e_<dev>), so the floor is
         # the number the CI build has, not the number a developer's build may have. It counted 15 before engine #1485

@@ -1257,18 +1257,15 @@ The one `!! UNCOVERED` line of the 2026-11-14 watcher run. Read from the repo's 
 
 ## 2026-11-17: `SimulatedForTestingClass` — reviewed, not a family (engine#2814)
 
-The `!! UNCOVERED` line of the 2026-11-17 watcher run was a single model, `example/simulated`. That is Hugging
-Face's **own simulated model**, published under the `example/` organisation for testing Transformers tooling — the
-class name says what it is, and there is no pretrained weight set, no `config.json` a converter could map, and no
-family behind it. A registry entry here would be a claim that the engine serves a model only HF's test suite
-uploads.
+**Withdrawn: both the class and the model id are this repository's own fixtures.** `SimulatedForTestingClass` and
+`example/simulated` are the literals `census-watch.yml` appends when it is dispatched with `simulate_alert` to
+exercise the alert path — no model has that class. #2816 reviewed it into `registry/significant.json` as
+`watch: "report"` before that was known, which recorded a decision about a class nobody has; the entry is removed
+(engine#2830), and the workflow now puts a banner at the top of every simulated issue saying the row is a fixture
+that needs no mapping and no review.
 
-* **Not an alias of anything**: there is nothing to be an alias *of* — no published checkpoints, no
-  `architectures` list beyond the synthetic class.
-* **Why this is a review answer and not a mapping**: the census's job is to find families worth serving; the
-  answer for a test fixture is "no", recorded once so the next daily run reports the row instead of alerting on it
-  (`"watch": "report"` in `registry/significant.json`), and `tools/registry_build.py --check-gaps` fails if it ever
-  becomes mapped without a reason here.
-* **The general rule it illustrates**: the watcher alerts on a class it cannot place, and the two wrong reactions
-  are both cheap and both costly — mapping a class nobody asked to serve, or silencing the alert for a class that
-  is a real gap. This one is the first, so it is documented rather than mapped.
+The heading is kept rather than deleted because a section heading is what `tools/ci/doc_section_loss_check.py`
+tracks, and the useful part of this row is the general lesson, not the class:
+
+* **A test path whose output looks exactly like a finding will eventually be answered as one.** The fix belongs in
+  the test path — a banner in the issue — not in the registry, and not in this document.

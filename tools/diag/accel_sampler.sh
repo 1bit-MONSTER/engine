@@ -181,6 +181,27 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   # The arm that must be able to fail: install a copy, modify it behind the provenance, and require DRIFTED.
   printf '#!/bin/bash\necho modified\n' > "$d/deployed.sh"
   install_sampler "$0" "$d/deployed.sh" testcommit >/dev/null 2>&1
+  # engine#2795 follow-up: no destination must REFUSE and write nothing -- the old default was the live path.
+  rm -f "$d/nodefault.sh" "$d/nodefault.sh.provenance"
+  install_sampler "$0" >/dev/null 2>&1 && { echo "FAIL: install with no destination must refuse (it used to write to the live path)"; fail=1; }
+  [ -e "$d/nodefault.sh" ] && { echo "FAIL: install with no destination wrote something anyway"; fail=1; }
+  # ... and a destination that is given gets its commit from the checkout, not `unknown`
+  install_sampler "$0" "$d/derived.sh" >/dev/null 2>&1
+  grep -q '^commit=unknown$' "$(provenance_file "$d/derived.sh")" \
+    && { echo "FAIL: install recorded commit=unknown while running inside a git checkout"; fail=1; }
+  # ask 1 on #2815: `check-deployed` with no argument must look at the DEPLOYED copy, not at the checkout it was run from.
+  # ask 1 on #2815 needs an arm that DISCRIMINATES the two paths: a provenance-less copy is rc 2 either way, so the arm
+  # that pins the fix is one where the deployed copy is valid and `$0` is not. Reverting the default to `$0` fails these.
+  mkdir -p "$d/live" && install_sampler "$0" "$d/live/accel-sampler.sh" testcommit >/dev/null 2>&1
+  ( DIR=$d/live check_deployed >/dev/null 2>&1 ) \
+    || { echo "FAIL: check-deployed with no argument did not resolve the DEPLOYED copy (it looked at \$0 instead)"; fail=1; }
+  printf '# drift\n' >> "$d/live/accel-sampler.sh"
+  ( DIR=$d/live check_deployed >/dev/null 2>&1 ) \
+    && { echo "FAIL: check-deployed with no argument passed a drifted deployed copy"; fail=1; }
+  rm -f "$(provenance_file "$d/live/accel-sampler.sh")"
+  rc_nodef=$( DIR=$d/live check_deployed >/dev/null 2>&1; echo $? )
+  [ "$rc_nodef" = 2 ] \
+    || { echo "FAIL: check-deployed with no argument must be 'cannot tell' (rc 2) for a provenance-less deployed copy, got rc $rc_nodef"; fail=1; }
   check_deployed "$d/deployed.sh" >/dev/null 2>&1 \
     || { echo "FAIL: a freshly installed copy must check clean"; fail=1; }
   printf '# drift\n' >> "$d/deployed.sh"
@@ -270,11 +291,27 @@ summary() {  # what the run observed, so a 24 h expiry is not silence
 # engine#2795: the deployed copy drifted 52 lines from the repo and nothing noticed -- the running instrument was not the
 # instrument in the repository, and every summary it wrote carried a timestamp but no version. `install` records what it
 # deployed; `check-deployed` is the arm that can fail.
-install_sampler() {  # install <repo-root-or-script> [dest] [commit]
-  local src=$1 dest=${2:-$DIR/accel-sampler.sh} commit=${3:-${GIT_COMMIT:-unknown}}
+install_sampler() {  # install <repo-root-or-script> <dest> [commit] -- dest is REQUIRED
+  # The destination used to default to $DIR/accel-sampler.sh, i.e. the LIVE path the unit runs. Measured cost of that
+  # default, twice in one evening: a lane testing a PR branch redeployed the box's instrument with the branch under test,
+  # and the summary it wrote then claimed a provenance the instrument did not have. Deployment writes the bytes a unit
+  # will execute on its next restart, so it is never done by omission: no destination, no write. (engine#2795 follow-up)
+  local src=$1 dest=${2:-} commit=${3:-${GIT_COMMIT:-}}
+  if [ -z "$dest" ]; then
+    echo "install: a destination is required: install <repo-or-script> <dest> [commit]" >&2
+    echo "install: refusing to write, because the old default was the live path ($DIR/accel-sampler.sh) and deploying" >&2
+    echo "install: the running instrument must never happen by omission. Nothing was written." >&2
+    return 2
+  fi
   [ -f "$src" ] || src=$src/tools/diag/accel_sampler.sh
   [ -f "$src" ] || { echo "install: no accel_sampler.sh at $1" >&2; return 2; }
   bash -n "$src" || { echo "install: $src does not parse" >&2; return 2; }
+  # No commit given: read it from the checkout the source came from, if it is one. `unknown` only when neither exists,
+  # because a provenance line that says `unknown` beside a real deployment is a fact nobody can use later.
+  if [ -z "$commit" ]; then
+    commit=$(git -C "$(dirname "$src")" rev-parse --short=12 HEAD 2>/dev/null || true)
+    [ -n "$commit" ] || commit=unknown
+  fi
   mkdir -p "$(dirname "$dest")"
   # copy then rename, so a running sampler never sees a half-written script
   cp "$src" "$dest.tmp" && mv -f "$dest.tmp" "$dest" || return 2
@@ -291,7 +328,10 @@ install_sampler() {  # install <repo-root-or-script> [dest] [commit]
 }
 
 check_deployed() {  # check-deployed [dest] -- rc 0 the deployed copy is the bytes its provenance names, 1 drifted, 2 cannot tell
-  local dest=${1:-$0} prov sha_actual sha_expected
+  # No argument means THE DEPLOYED COPY, not "$0": run from a checkout, `$0` is the repo's copy and the question a reader
+  # is asking ("are the bytes the unit runs the bytes that were deployed?") gets answered about the wrong file. That was
+  # review ask 1 on #2815: the two commands must agree on one path, so both name $DIR/accel-sampler.sh.
+  local dest=${1:-$DIR/accel-sampler.sh} prov sha_actual sha_expected
   prov=$(provenance_file "$dest")
   if [ ! -f "$prov" ]; then
     echo "check-deployed: cannot tell: no provenance beside $dest (run: accel_sampler.sh install <repo> $dest <commit>)" >&2

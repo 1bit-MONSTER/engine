@@ -200,6 +200,50 @@ PY2
 )
 check "an unrelated w_t in the source graph is not reused" "$taken_verdict" "right"
 
+# engine#2769 review: the pack's layout is the export's. `onnx.save()` inlines every external tensor by default, so a
+# decoder whose 159 MB head lived in a `.onnx.data` came out as one giant graph with the copied sidecar dead. Both
+# directions: an external source stays external (sidecar written, `data_location` still EXTERNAL), an inline source
+# stays inline (no sidecar appears).
+python3 - "$tmp/ext.onnx" <<'PY2' || { echo "FAIL could not build the external-data fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+w = numpy_helper.from_array(np.zeros((1024, 1024), dtype=np.float32), "w")     # 4 MiB, over the 1024 B threshold
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[1, 0]),
+     helper.make_node("MatMul", ["x", "a"], ["y"])],
+    "g",
+    [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1024])],
+    [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1024])],
+    [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1],
+          save_as_external_data=True, all_tensors_to_one_file=True,
+          location="ext.onnx.data", size_threshold=0)
+PY2
+python3 "$TOOL" "$tmp/ext.onnx" "$tmp/ext-out.onnx" >"$tmp/ext.log" 2>&1 || { cat "$tmp/ext.log"; fail=$((fail+1)); }
+ext_verdict=$(python3 - "$tmp/ext-out.onnx" <<'PY2'
+import os
+import sys
+import onnx
+m = onnx.load(sys.argv[1], load_external_data=False)
+external = [i for i in m.graph.initializer if i.data_location == onnx.TensorProto.EXTERNAL]
+sidecar = os.path.getsize(sys.argv[1] + ".data") if os.path.exists(sys.argv[1] + ".data") else 0
+print("external" if external and sidecar > 1024 else f"INLINED({len(external)}/{sidecar})")
+PY2
+)
+check "an external source stays external" "$ext_verdict" "external"
+inline_verdict=$(python3 - "$tmp/out.onnx" <<'PY2'
+import os
+import sys
+import onnx
+m = onnx.load(sys.argv[1], load_external_data=False)
+external = [i for i in m.graph.initializer if i.data_location == onnx.TensorProto.EXTERNAL]
+print("no-sidecar" if not external and not os.path.exists(sys.argv[1] + ".data") else "SIDECAR")
+PY2
+)
+check "an inline source stays inline" "$inline_verdict" "no-sidecar"
+
 echo "---"
 if [ "$fail" -ne 0 ]; then echo "$fail failed"; exit 1; fi
 echo "fold_initializer_transpose: all checks ok"

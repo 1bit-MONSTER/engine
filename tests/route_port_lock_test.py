@@ -116,7 +116,10 @@ class RoutePortLockTest(unittest.TestCase):
         # recipes_route is no longer here on purpose: it runs `serve --port 0` since engine #1485, so it picks nothing
         # and releases nothing and the lock protects it from nothing. The names below are the ones that still choose
         # their port before launching.
-        for name in ("pm_route", "print_backend", "smoke_serve"):
+        # engine#2826 follow-up: embed_serve bound a fixed 8247, which matches none of BIND_RE's shapes, so the census
+        # was blind to it and it carried no lock. Named here so a revert to a fixed port fails by name instead of
+        # shrinking the census below its floor.
+        for name in ("pm_route", "print_backend", "smoke_serve", "embed_serve"):
             self.assertIn(name, found, f"{name} starts a server; the census must find it")
         # 5 in a build with no model passed; a model-enabled build configures more (hybrid_e2e,
         # laya_route_e2e, laya_models_e2e, pm_laya_route, hrx_cpu_weight_parity and serve_e2e_<dev>), so the floor is

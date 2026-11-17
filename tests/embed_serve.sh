@@ -21,7 +21,13 @@ set -u
 BIN=${1:?usage: embed_serve.sh <1bit>}
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 FIX=$DIR/tests/fixtures/trit_embed_tiny
-PORT=${EMBED_SERVE_PORT:-8247}
+# engine#2826 follow-up: a FREE port, not 8247. `tests/route_port_lock_test.py` only recognises the port shapes
+# `freeport`/`free_port`, a `bind(("127.0.0.1", 0))`, or a fixed `--port 43xxx`, so a fixed 8247 was invisible to the
+# census that requires RESOURCE_LOCK route_ports on every script that binds a loopback port -- this test had no lock and
+# nothing said so. Two fixed ports cannot collide while one test owns the number; under `ctest -j 4` they can.
+# EMBED_SERVE_PORT still overrides for a debugger run.
+freeport() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+PORT=${EMBED_SERVE_PORT:-$(freeport)}
 LOG=$(mktemp)
 fails=0
 check() { # $1 what, $2 got, $3 want

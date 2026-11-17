@@ -64,7 +64,11 @@ SUMMARY = re.compile(r"^\s*(\d+)% tests passed, (\d+) tests failed out of (\d+)"
 # "You have 3 tests; 2 are known failures" is a state, not an error -- but a summary that says N
 # failed while the FAILED block lists fewer is a truncated log, and answering from it would hide the
 # missing ones. Both numbers are read and compared rather than trusting either alone.
-COMMENT = re.compile(r"\s+#.*$")
+# A comment runs from a `#` at the start of the line too, not only from one preceded by whitespace.
+# The first version required \s+ and so parsed every column-0 `#` header line as a test name; running
+# the real workflow step shape against the real baseline reported the whole licence block as
+# "now passing, remove from". `ctest_skips.py` has the same regex and the same latent defect.
+COMMENT = re.compile(r"^\s*#.*$|\s+#.*$")
 
 
 def failed(log_text: str):
@@ -193,6 +197,25 @@ Errors while running CTest
     if failed(real).get("test-kv-zero") != "Subprocess aborted":
         print(f"  SELF-TEST FAIL: the reason was lost: {failed(real)}")
         bad += 1
+    # baseline() against a real file with a column-0 licence header -- the shape the workflow reads.
+    # This arm was missing, which is why the regex above survived until a human ran the step.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        (root / BASELINE).parent.mkdir(parents=True, exist_ok=True)
+        (root / BASELINE).write_text(
+            "# Copyright 2026 bong-water-water-bong\n# SPDX-License-Identifier: Apache-2.0\n#\n"
+            "# Known failures follow.\n"
+            "test-kv-zero                  # Subprocess aborted -- main\n"
+            "test-hrx-fa-masked-v  # Failed\n")
+        # the value is the NAME: the `# reason` is for humans reading the file, and `--write`
+        # re-derives it from the log, so a round-trip through baseline() loses nothing.
+        want = {"test-kv-zero": "test-kv-zero", "test-hrx-fa-masked-v": "test-hrx-fa-masked-v"}
+        got = baseline(root)
+        cases += 1
+        if got != want:
+            print(f"  SELF-TEST FAIL: baseline() from a file with a licence header -> {sorted(got)}")
+            bad += 1
     print(f"  self-test: {cases} case(s), {bad} failure(s)")
     return bad
 

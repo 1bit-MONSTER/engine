@@ -43,7 +43,15 @@ BUILD_DIR = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "build")
 
 # The shapes a route script binds a loopback port in: the freeport helper, the :0 bind it makes,
 # and the fixed 43xxx literals print_backend/lemonade_hrx/template_pin start their servers on.
-BIND_RE = re.compile(r'freeport|free_port|bind\(\s*\("127\.0\.0\.1",\s*0\)\s*\)|--port\s+43\d{3}\b')
+# The shapes a route script binds a loopback port in: the freeport helper, the :0 bind it makes, and a FIXED literal
+# port. engine#2826 landed `PORT=${VAR:-8247}` first (embed_serve sat unlocked while this census reported OK); a bare
+# `--port 8247` was still invisible, because only the 43xxx literals the neighbouring rows happen to use were matched.
+# A fixed literal is the hazard whatever the number, and `--port 0` / `--port "$VAR"` stay out: those pick a port and
+# read it back (engine#1485). Four digits is the floor for the same reason the PORT= arm on main has one -- a two-digit
+# default like `PORT=${X:-80}` is a shell-idiom coincidence, not a port this suite allocates.
+BIND_RE = re.compile(r'freeport|free_port|bind\(\s*\("127\.0\.0\.1",\s*0\)\s*\)'
+                     r'|--port[ =]+"?[1-9]\d{3,4}\b'
+                     r'|[A-Z_]*PORT=[^:\n]*:-[1-9]\d{3,4}\b')
 
 
 def configured_tests(ctest, build_dir):
@@ -93,6 +101,14 @@ def lock_of(test):
     return None
 
 
+# Rows the widened literal-port test finds that are NOT a route-vs-route hazard. Exemptions live here rather than in
+# the regex, so each one is visible with its reason and the census fails if the reason stops applying.
+NOT_A_ROUTE_ROW = {
+    "install_coder_llm_ticketed": "binds 8090, the port the coder-llm unit uses; route rows allocate a free port or a "
+                                  "43xxx literal, so there is no window where two of them pick 8090",
+}
+
+
 class RoutePortLockTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -116,8 +132,19 @@ class RoutePortLockTest(unittest.TestCase):
         # recipes_route is no longer here on purpose: it runs `serve --port 0` since engine #1485, so it picks nothing
         # and releases nothing and the lock protects it from nothing. The names below are the ones that still choose
         # their port before launching.
-        for name in ("pm_route", "print_backend", "smoke_serve"):
+        # engine#2826 follow-up: embed_serve bound a fixed 8247, which matches none of BIND_RE's shapes, so the census
+        # was blind to it and it carried no lock. Named here so a revert to a fixed port fails by name instead of
+        # shrinking the census below its floor.
+        for name in ("pm_route", "print_backend", "smoke_serve", "embed_serve"):
             self.assertIn(name, found, f"{name} starts a server; the census must find it")
+        # engine#2826: a port written as a shell default -- `PORT=${EMBED_SERVE_PORT:-8247}` -- matched none of the
+        # three shapes above, so a fixed-port server test sat unlocked while this census reported OK (embed_serve,
+        # until its port became a freeport). This pins the SHAPE rather than that one script: the next row that writes
+        # a fixed default is caught here instead of by a flake.
+        self.assertTrue(BIND_RE.search("PORT=${EMBED_SERVE_PORT:-8247}"),
+                        "a shell-default fixed port is a fixed port; the census must recognise the shape")
+        self.assertFalse(BIND_RE.search("PORT=${X:-80}"),
+                         "...but a two-digit default is not one (keeps the pattern from matching every shell var)")
         # 5 in a build with no model passed; a model-enabled build configures more (hybrid_e2e,
         # laya_route_e2e, laya_models_e2e, pm_laya_route, hrx_cpu_weight_parity and serve_e2e_<dev>), so the floor is
         # the number the CI build has, not the number a developer's build may have. It counted 15 before engine #1485
@@ -130,6 +157,14 @@ class RoutePortLockTest(unittest.TestCase):
                       "http_guard starts an httplib::Server from C++; the census must see it (engine#2504)")
         self.assertGreaterEqual(len(found), 5,
                                 "fewer route tests found than the suite has: " + ", ".join(sorted(found)))
+
+    def test_the_not_a_route_row_list_does_not_rot(self):
+        # An exemption is a claim that the row cannot collide with another route row; it has to keep being true or
+        # the exemption is just a hole. A name here that the census no longer finds means the reason changed.
+        found = self.census()
+        for name, why in sorted(NOT_A_ROUTE_ROW.items()):
+            self.assertIn(name, found, f"{name} is exempt ({why}) but the census no longer finds it: drop the entry")
+            self.assertTrue(why.strip(), f"{name} is exempt with no reason")
 
     def test_indirect_server_tests_hold_the_lock_too(self):
         # tools/bench.py starts its servers with its own free_port under this test's name, so the
@@ -150,6 +185,8 @@ class RoutePortLockTest(unittest.TestCase):
     def test_every_route_test_holds_the_route_port_lock(self):
         missing = []
         for name, script in sorted(self.census().items()):
+            if name in NOT_A_ROUTE_ROW:
+                continue
             test = next(t for t in self.tests if t["name"] == name)
             if lock_of(test) != "route_ports":
                 missing.append(f"{name} ({os.path.basename(script)})")

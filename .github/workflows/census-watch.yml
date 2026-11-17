@@ -81,6 +81,10 @@ jobs:
       alert: ${{ steps.watch.outputs.alert }}
       lines: ${{ steps.watch.outputs.lines }}
       failure: ${{ steps.watch.outputs.failure }}
+      # engine#2816: the simulate path must be unmistakable in the ISSUE, not only in the run. A lane read the
+      # fabricated `!! UNCOVERED SimulatedForTestingClass` / `example/simulated` row as a real finding and reviewed
+      # it into registry/significant.json, where it now claims a class was reviewed that no model has ever had.
+      simulated: ${{ steps.watch.outputs.simulated }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -108,6 +112,7 @@ jobs:
           if [ "$SIMULATE" = "true" ]; then
             echo "  !! UNCOVERED SimulatedForTestingClass (new class): 1 model(s), e.g. example/simulated" >> /tmp/census-watch.log
             rc=1
+            echo "simulated=true" >> "$GITHUB_OUTPUT"
           fi
           # The `!!` rows (the alerts) go first, then the informational ones: the excerpt is capped
           # at 40 lines, and engine#2677 was filed with 21 `? UNVERIFIABLE` and 19 answered
@@ -122,7 +127,11 @@ jobs:
           # row words, and on a clean run they reached the issue only by ACCIDENT -- glued onto the end of the last
           # stdout row (#2780). A half-blind watch therefore filed an issue that looked like an ordinary finding, which
           # is the failure this excerpt exists to prevent.
-          pat="UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|NPU FLM|SUPPORT MOVED|kernel-format|Q4NX \(NPU\)|support_pins|WATCH FAILED|PINS MISSING"
+          # The parens are written `[(]NPU[)]` rather than `\(NPU\)`: this pattern is read by BOTH grep -E and awk
+          # (census_excerpt.awk), and awk reads `\(` as a plain `(` -- a GROUP, not a literal paren -- so the Q4NX
+          # class rows stopped matching and were silently dropped from the excerpt (engine#2819 review). A
+          # character class is the same token in both dialects.
+          pat="UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|NPU FLM|SUPPORT MOVED|kernel-format|Q4NX [(]NPU[)]|support_pins|WATCH FAILED|PINS MISSING"
           # A row is an alert only if it IS one: the prefix, not the substring. On 2026-11-16 (#2780) the
           # watcher's last stdout row and a `!! SUPPORT WATCH FAILED` line on stderr were written into the
           # same line (block-buffered stdout, unbuffered stderr, one file), and `grep -F '!!'` promoted that
@@ -130,9 +139,19 @@ jobs:
           # row leading the alerts and eating one of the 21 slots.
           # A failure line is a `census-watch: !! …` line, not a two-space row, so the alert tier matches both shapes.
           alert='^(  !! |census-watch: !! )'
-          lines=$({ grep -E "$pat" /tmp/census-watch.log | grep -E "$alert"
-                    grep -F -- '  -> ' /tmp/census-watch.log
-                    grep -E "$pat" /tmp/census-watch.log | grep -vE "$alert" | grep -vF -- '  -> '; } | tr -d '`@' | head -n 40 | base64 -w0)
+          # engine#2814: rows are emitted as BLOCKS -- a row with the `  -> ` advice that follows it -- because the
+          # old middle tier lifted EVERY `  -> ` line out of its class's block. Five REMOTE-CODE classes share one
+          # advice sentence, so the 11-17 issue showed the `!!` row followed by five identical `-> custom modeling
+          # code …; alerts once 3 uploaders use it` lines with the rows they explained 20 lines below: it reads as a
+          # duplicated emission and as an alert contradicting its own threshold, and neither was true.
+          #
+          # A conclusion must still lead the per-row stream (engine#2711: for the Q4NX gap the `->` line IS the whole
+          # finding), so the blocks are ordered by whether they carry advice -- alerts, rows with advice, rest -- which
+          # keeps both properties. tests/census_watch_excerpt_test.py arms all of them.
+          lines=$({ awk -v pat="$pat" -v alert="$alert" -v want=alert -f tools/ci/census_excerpt.awk /tmp/census-watch.log
+                    awk -v pat="$pat" -v alert="$alert" -v want=concl -f tools/ci/census_excerpt.awk /tmp/census-watch.log
+                    awk -v pat="$pat" -v alert="$alert" -v want=rest  -f tools/ci/census_excerpt.awk /tmp/census-watch.log; } \
+                   | tr -d '`@' | head -n 40 | base64 -w0)
           echo "lines=$lines" >> "$GITHUB_OUTPUT"
           # Three outcomes, and the run colour has to mean something (the watcher's contract:
           # 0 quiet, 1 the alert, 2 the watch did not run).
@@ -187,6 +206,12 @@ jobs:
           LINES: ${{ needs.watch.outputs.lines }}
           FAILURE: ${{ needs.watch.outputs.failure }}
           WATCH_RESULT: ${{ needs.watch.result }}
+          SIMULATED: ${{ needs.watch.outputs.simulated }}
+          # engine#2846: the `alert` output was computed and never read, so the coverage body below ran on EVERY
+          # scheduled run whose watch job succeeded -- a quiet run filed a coverage-breach issue whose excerpt was
+          # filler rows and advisory `->` lines, with no finding in it (the #2677 "issue looks empty" shape, made
+          # structural). 2026-11-17 13:42Z is the case: 0 alerts, an issue filed.
+          ALERT: ${{ needs.watch.outputs.alert }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           gh label create census-watch --color B60205 --description "Daily new-model watcher alert" 2>/dev/null || true
@@ -235,6 +260,14 @@ jobs:
             exit 0
           fi
 
+          # A watch that ran, found nothing and alerted on nothing files NOTHING. Without this guard the body below
+          # is assembled for a quiet run too, and `post` then creates an issue whose only content is the per-row
+          # stream (engine#2846).
+          if [ "${ALERT}" != "true" ]; then
+            echo "census-watch: quiet -- no issue filed (alert=${ALERT})"
+            exit 0
+          fi
+
           # One issue at a time, but a *new* breach must never be swallowed by an issue that is
           # already open - that is what happened on 2026-10-27: #619 stayed open, so
           # FastFlowLM/LFM3-1.7B-NPU2 (10-28) and MiniCPM-V-4.7-35B-A3B-NPU2 (10-30) alerted
@@ -244,6 +277,15 @@ jobs:
           {
             echo "## Census coverage breach ($(date -u +%Y-%m-%d))"
             echo ""
+            if [ "${SIMULATED}" = "true" ]; then
+              echo "> **This is a SIMULATED alert.** The run was dispatched with \`simulate_alert\`, which appends one"
+              echo "> fabricated row to the watcher's log to exercise this path. \`SimulatedForTestingClass\` and"
+              echo "> \`example/simulated\` are this workflow's own fixtures: no model has that class, nothing needs"
+              echo "> mapping in \`registry/architectures.json\`, and nothing may be reviewed into"
+              echo "> \`registry/significant.json\` (engine#2816 did exactly that, and it had to be removed)."
+              echo "> Close this issue when the dispatch is done."
+              echo ""
+            fi
             echo "The daily new-model watcher found Hugging Face models whose architecture class is not"
             echo "mapped by the engine registry (\`registry/architectures.json\`), a FastFlowLM"
             echo "repo publishing a model family this engine does not serve, a Q4NX (NPU) pack for"

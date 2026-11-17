@@ -192,9 +192,17 @@ jobs:
         # One hung test must not hold the job for hours: each test gets 10 minutes.
         # The log is kept for the next step: ctest prints `***Skipped` per skipped test and then counts those skips in
         # `N% tests passed`, so the summary line alone cannot tell a suite that ran from a suite that did not.
+        # -j 4 (ORCH 2026-11-17): the Test step is 14.55 min of a 23 min main build on a 4-vCPU runner, and it was
+        # serial. What makes it safe is already in the tree, not an assumption: every test that binds a port holds
+        # RESOURCE_LOCK route_ports (CMakeLists.txt, the engine#1070 census below the registration glob, enforced by
+        # the route_port_lock row, which fails when a new server test is added without the lock); no test writes a
+        # shared path -- every one that writes uses mktemp -d, and the 45 fixed /tmp sites in tools/ci/tmp_paths.txt
+        # are product code in app/ and npu/ reached only by device rows that skip here; and npu_device_lock is
+        # device-free by design (a forked flock on a temp file). ctest honours RESOURCE_LOCK under -j, so the port
+        # tests serialise against each other and nothing else does.
         run: |
           set +e
-          ctest --test-dir build --output-on-failure --timeout 600 > build/ctest.log 2>&1
+          ctest --test-dir build -j 4 --output-on-failure --timeout 600 > build/ctest.log 2>&1
           rc=$?
           cat build/ctest.log
           exit $rc

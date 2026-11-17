@@ -156,6 +156,17 @@ The watch runs daily at 04:30 UTC (ahead of the 05:17 sweep) in two places:
   the `~/census-main` worktree that tracks `origin/main`), which marks its unit failed and
   logs every run to `~/.1bit/logs/census-watch-*.log`.
 
+Two properties of the issue the Actions run files are worth knowing before reading one, both
+learned by getting them wrong in 2026-11. **It leads with what is broken**: the tool's own
+`census-watch: !! … WATCH FAILED` and `SUPPORT PINS MISSING` lines first, then its `->`
+conclusions, then the per-row stream, capped at 40 lines — a row is an alert only if it *starts*
+as one, so an informational row cannot displace the alert that matters (engine#2677, #2710,
+#2783). And **the `api.github.com` sweeps are authenticated with the workflow's own read-only
+token**: unauthenticated is 60 requests an hour per IP and a hosted runner shares its egress with
+every other job, which had the FastFlowLM and support-pins sweeps answering 403 on a normal run
+while the issue still looked like a quiet night (engine#2812). A watch that cannot read a source
+now says so on the first line of the issue instead of in the job log alone.
+
 A class the watcher flags is one of two things, and the run says which:
 
 - **new class** — map it in `registry/architectures.json`, but only when a pinned

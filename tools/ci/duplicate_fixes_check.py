@@ -30,6 +30,12 @@ It reads the claim from the PR's **title and body** (`Fixes #N`, `Closes #N`, `F
 open PRs with the PRs' age and draft state, so the reader can tell "one is a draft awaiting a
 slot" from "two lanes are both working".
 
+A LIMIT, measured on the fleet: a PR that *works* an issue without a closing keyword is invisible here.
+#2804 worked #2803 with a mention (`engine#2803, measured 2026-11-16 …`) while #2805 claimed it in the
+title, and both were open; this tool reported nothing. The narrowing that causes it is deliberate (see
+CLAIM), and the issue-side join (`gh api repos/O/R/issues/N/timeline`) returns both of those PRs *and*
+mere mentions (#2795's timeline lists #2809 and #2807), so it is an annotation at best, not a trigger.
+
 Usage:
     duplicate_fixes_check.py                    # the fleet's six repos
     duplicate_fixes_check.py --repos engine     # a subset
@@ -173,6 +179,15 @@ def self_test():
                    {'number': 2, 'title': 'b', 'body': 'Refs #5', 'draft': False}]) == [],
        "two PRs that merely REFER to an issue are not a duplicate")
 
+    # review of #2809: a repo that could not be read must not print the clean sentence, and must not be masked by a
+    # duplicate found elsewhere. Both are one-liners that were wrong in the first version.
+    ok(clean_line([], 0) is not None, "with nothing found and every repo read, the clean sentence prints")
+    ok(clean_line([], 1) is None, "... but NOT when a repo could not be read (that repo is where a claimant would hide)")
+    ok(clean_line([{'repo': 'engine'}], 0) is None, "... and not when something was found")
+    ok(exit_code([], 0) == 0 and exit_code([{'repo': 'engine'}], 0) == 1, "0 none / 1 duplicate")
+    ok(exit_code([{'repo': 'engine'}], 1) == 2, "cannot-tell outranks a duplicate rather than being swallowed by it")
+    ok(exit_code([], 2) == 2, "and it is not a pass on its own either")
+
     print("self-test ok" if not fails else f"self-test FAILED ({fails})")
     return 0 if not fails else 1
 
@@ -186,13 +201,13 @@ def main(argv):
     if a.self_test:
         return self_test()
 
-    found, rc = [], 0
+    found, failed = [], 0
     for repo in a.repos:
         try:
             prs = open_prs(repo)
         except (RuntimeError, json.JSONDecodeError) as e:
             print(f"duplicate_fixes: cannot tell for {repo}: {e}", file=sys.stderr)
-            rc = 2
+            failed += 1
             continue
         for issue, group in duplicates(prs):
             found.append({'repo': repo, 'issue': issue,
@@ -203,9 +218,26 @@ def main(argv):
     else:
         for f in found:
             print(f"{f['repo']}: " + describe(f['issue'], f['prs']))
-        if not found:
-            print("duplicate_fixes: no open issue is claimed by more than one open PR")
-    return 1 if found else rc
+        clean = clean_line(found, failed)
+        if clean:
+            print(clean)
+    return exit_code(found, failed)
+
+
+def clean_line(found, failed):
+    """The "nothing claimed twice" sentence, or None.
+
+    It must not print when a repo could not be read: that repo is exactly where the third claimant would be, and the
+    sentence would then be the false negative this tool's docstring forbids in its own words (review of #2809).
+    """
+    return None if found or failed else "duplicate_fixes: no open issue is claimed by more than one open PR"
+
+
+def exit_code(found, failed):
+    """2 beats 1 beats 0. A duplicate in one repo must not mask "cannot tell" in another (review of #2809)."""
+    if failed:
+        return 2
+    return 1 if found else 0
 
 
 if __name__ == '__main__':

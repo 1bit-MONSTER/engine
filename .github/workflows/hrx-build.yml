@@ -154,7 +154,10 @@ jobs:
         if: steps.scope.outputs.build == 'true'
         run: |
           set -euo pipefail
-          scripts/mem-guard.sh --term 12 ~/lb/thermal-run.sh cmake --build "$HRX_BUILD" -j 4
+          # The subproject, not the parent: ctest runs in "$HRX_BUILD/hrx/llama", and building
+          # "$HRX_BUILD" alone left every one of its 112 rows '(Not Run)' for a missing executable --
+          # 5% tests passed, 106 tests failed, and not one of them had been compiled.
+          scripts/mem-guard.sh --term 12 ~/lb/thermal-run.sh cmake --build "$HRX_BUILD/hrx/llama" -j 4
 
       - name: The fork's own ctest suite, against the known-failure baseline
         if: steps.scope.outputs.build == 'true'

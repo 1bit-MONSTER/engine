@@ -69,16 +69,23 @@ SUMMARY = re.compile(r"^\s*(\d+)% tests passed, (\d+) tests failed out of (\d+)"
 # the real workflow step shape against the real baseline reported the whole licence block as
 # "now passing, remove from". `ctest_skips.py` has the same regex and the same latent defect.
 COMMENT = re.compile(r"^\s*#.*$|\s+#.*$")
+# ctest colourises its summary when the log is captured from a terminal, so the byte before "5%" can be
+# an ANSI SGR sequence. `^\s*` cannot match that, and the first CI run of this tool answered "cannot
+# tell: no summary line" from a log that plainly contained "5% tests passed, 106 tests failed out of
+# 112" -- the line was there and the reader could not see it. A log parser has to tolerate colour:
+# strip the escapes before matching rather than trusting the producer to have disabled them.
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def failed(log_text: str):
     """{test name: ctest's reason} for every test the run reported as failed."""
+    log_text = ANSI.sub("", log_text)
     return {name: reason for name, reason in FAILED_LINE.findall(log_text)}
 
 
 def summary(log_text: str):
     """(failed_count, total) from ctest's last summary line, or None."""
-    hits = SUMMARY.findall(log_text)
+    hits = SUMMARY.findall(ANSI.sub("", log_text))
     if not hits:
         return None
     return int(hits[-1][1]), int(hits[-1][2])
@@ -191,6 +198,14 @@ Errors while running CTest
     _, _, cannot4 = check(real, known, want_total=999)
     if not cannot4 or "different suite" not in cannot4:
         print(f"  SELF-TEST FAIL: a 112-test log checked against want_total=999 -> {cannot4}")
+        bad += 1
+    # Colour: the first CI run's log had the summary wrapped in SGR codes and the reader could not see
+    # it. This arm is the one that would have caught that before the run did.
+    ansi = "\x1b[0;32m5% tests passed, 1 tests failed out of 112\x1b[0m\nThe following tests FAILED:\n" \
+           "\x1b[31m\t 19 - test-kv-zero (Subprocess aborted)\x1b[0m\n"
+    cases += 1
+    if summary(ansi) != (1, 112) or failed(ansi).get("test-kv-zero") != "Subprocess aborted":
+        print(f"  SELF-TEST FAIL: an ANSI-coloured log -> {summary(ansi)} {failed(ansi)}")
         bad += 1
     # The reason is kept, because (SEGFAULT) and (Failed) are different bugs.
     cases += 1

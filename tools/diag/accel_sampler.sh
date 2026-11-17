@@ -189,6 +189,19 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   install_sampler "$0" "$d/derived.sh" >/dev/null 2>&1
   grep -q '^commit=unknown$' "$(provenance_file "$d/derived.sh")" \
     && { echo "FAIL: install recorded commit=unknown while running inside a git checkout"; fail=1; }
+  # ask 1 on #2815: `check-deployed` with no argument must look at the DEPLOYED copy, not at the checkout it was run from.
+  # ask 1 on #2815 needs an arm that DISCRIMINATES the two paths: a provenance-less copy is rc 2 either way, so the arm
+  # that pins the fix is one where the deployed copy is valid and `$0` is not. Reverting the default to `$0` fails these.
+  mkdir -p "$d/live" && install_sampler "$0" "$d/live/accel-sampler.sh" testcommit >/dev/null 2>&1
+  ( DIR=$d/live check_deployed >/dev/null 2>&1 ) \
+    || { echo "FAIL: check-deployed with no argument did not resolve the DEPLOYED copy (it looked at \$0 instead)"; fail=1; }
+  printf '# drift\n' >> "$d/live/accel-sampler.sh"
+  ( DIR=$d/live check_deployed >/dev/null 2>&1 ) \
+    && { echo "FAIL: check-deployed with no argument passed a drifted deployed copy"; fail=1; }
+  rm -f "$(provenance_file "$d/live/accel-sampler.sh")"
+  rc_nodef=$( DIR=$d/live check_deployed >/dev/null 2>&1; echo $? )
+  [ "$rc_nodef" = 2 ] \
+    || { echo "FAIL: check-deployed with no argument must be 'cannot tell' (rc 2) for a provenance-less deployed copy, got rc $rc_nodef"; fail=1; }
   check_deployed "$d/deployed.sh" >/dev/null 2>&1 \
     || { echo "FAIL: a freshly installed copy must check clean"; fail=1; }
   printf '# drift\n' >> "$d/deployed.sh"
@@ -296,7 +309,10 @@ install_sampler() {  # install <repo-root-or-script> <dest> [commit] -- dest is 
 }
 
 check_deployed() {  # check-deployed [dest] -- rc 0 the deployed copy is the bytes its provenance names, 1 drifted, 2 cannot tell
-  local dest=${1:-$0} prov sha_actual sha_expected
+  # No argument means THE DEPLOYED COPY, not "$0": run from a checkout, `$0` is the repo's copy and the question a reader
+  # is asking ("are the bytes the unit runs the bytes that were deployed?") gets answered about the wrong file. That was
+  # review ask 1 on #2815: the two commands must agree on one path, so both name $DIR/accel-sampler.sh.
+  local dest=${1:-$DIR/accel-sampler.sh} prov sha_actual sha_expected
   prov=$(provenance_file "$dest")
   if [ ! -f "$prov" ]; then
     echo "check-deployed: cannot tell: no provenance beside $dest (run: accel_sampler.sh install <repo> $dest <commit>)" >&2

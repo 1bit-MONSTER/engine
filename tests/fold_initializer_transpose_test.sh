@@ -75,6 +75,29 @@ check "the matmul reads the transposed initializer" "$wt_used" "w_t"
 check "the gather's untransposed copy is kept" "$w_kept" "True"
 check "the folded weight has the matmul orientation" "$shape" "3x4"
 
+# The orientation check has to be able to FAIL, or `--check` is only proving the node is gone (engine#2779 review).
+# Swap the folded tensor's values for a wrongly-oriented one of the same total size and the check must say so.
+python3 - "$tmp/out.onnx" "$tmp/swapped.onnx" <<'PY3' || { echo "FAIL could not build the swapped fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+for i, t in enumerate(m.graph.initializer):
+    if t.doc_string.startswith("folded:"):
+        # Read the provenance BEFORE CopyFrom: it resets the field, so reading it afterwards yields "" and the
+        # swapped graph would carry no provenance and pass the check -- which is what this arm first did.
+        doc = t.doc_string
+        name = t.name
+        a = numpy_helper.to_array(t)
+        m.graph.initializer[i].CopyFrom(numpy_helper.from_array(np.ascontiguousarray(a.T), name))
+        m.graph.initializer[i].doc_string = doc
+onnx.save(m, sys.argv[2])
+PY3
+rc=0; python3 "$TOOL" --check "$tmp/swapped.onnx" >"$tmp/swaplog" 2>&1 || rc=$?
+check "check refuses a folded weight in the wrong orientation" "$rc" 1
+check "and names the perm it should have" "$(grep -c 'should be' "$tmp/swaplog")" 1
+
 rc=0; python3 "$TOOL" --check "$tmp/out.onnx" >/dev/null 2>&1 || rc=$?
 check "check accepts the folded graph" "$rc" 0
 

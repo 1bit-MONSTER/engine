@@ -230,7 +230,11 @@ endfunction()
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
 # The embedding role served in-process from a 1-bit container (engine#1311): /v1/embeddings for a string and an
 # array, the OpenAI shape, and the refusals named. Device-free on the 32-token fixture.
+# engine#2826 follow-up: it binds a loopback port (now a free one), so it holds the route_ports lock like every other
+# route test. The census could not see it before because its port was a fixed 8247, not one of the shapes
+# tests/route_port_lock_test.py recognises; the script stopped hard-coding a port in the same commit.
 add_test(NAME embed_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/embed_serve.sh $<TARGET_FILE:onebit>)
+set_tests_properties(embed_serve PROPERTIES RESOURCE_LOCK route_ports)
 # serve takes a hung backend down (docs/serve.md, "When a backend hangs"): a fake backend, no GPU.
 add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh $<TARGET_FILE:onebit>)
 # serve's GET /metrics (docs/serve.md, "Metrics"): a fake backend, no GPU.

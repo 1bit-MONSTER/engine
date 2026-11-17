@@ -108,6 +108,17 @@ jobs:
       # build without ever being compiled.
       - name: The llama.cpp sources the chat-template renderer compiles
         run: git submodule update --init --depth 1 third_party/llama.cpp
+      # engine#2774: the recorded-stale expectation table in the fork's tests/hrx-ops-test.cpp is what makes
+      # "the suite is 63 % red" readable, and its own rot detector can only fire on a device run that reaches the
+      # case. The fork's CI has no job that enables GGML_HRX (checked: none of its 50 workflows mentions it), so the
+      # check registered there as `test-hrx-stale-expectations` runs for whoever builds with the backend and for
+      # nobody at PR time. Here it costs a second, needs no SDK and no GPU (it reads source files), and runs against
+      # the same submodule commit the build compiles.
+      - name: The fork's recorded-stale kernel expectations are honest
+        run: |
+          python3 third_party/llama.cpp/ggml/src/ggml-hrx/tools/check_stale_expectations.py --self-test
+          python3 third_party/llama.cpp/ggml/src/ggml-hrx/tools/check_stale_expectations.py --check \
+              --root third_party/llama.cpp
       - name: GGUF -> Q4NX repack, ternary -> Q4_0, MTP draft vocabulary
         run: |
           # Pinned, because the unversioned line resolved differently on different days: these are the versions

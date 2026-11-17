@@ -585,6 +585,14 @@ add_python_test(tool_selftest_hrx_f16_narrowing ${CMAKE_SOURCE_DIR}/tools/ci/hrx
 add_test(NAME hrx_f16_narrowing_check COMMAND ${Python3_EXECUTABLE}
          ${CMAKE_SOURCE_DIR}/tools/ci/hrx_f16_narrowing.py --check --root ${CMAKE_SOURCE_DIR})
 set_tests_properties(hrx_f16_narrowing_check PROPERTIES SKIP_RETURN_CODE 77)
+# engine#2836: the fork's recorded-stale table (the kernel names tests/hrx-ops-test.cpp demands and no matcher selects,
+# engine#2774) checked from the ENGINE's suite. llama.cpp#419 added the tool to the fork and the fork has no CI job that
+# runs any of its 43 `test-hrx-*` rows, so this is the only path that runs it on every PR -- including every pin bump,
+# which is when a recorded-stale entry can start hiding a real mis-selection. The tool comes from the submodule, so the
+# wrapper skips (77) where it is not checked out or at a pin before llama.cpp#419, and keeps the tool's own codes: 1 an
+# entry is wrong, 2 it cannot tell.
+add_test(NAME hrx_stale_expectations COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_stale_expectations.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(hrx_stale_expectations PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
 # engine#2805: three duplicate PRs on one issue in one night (#2778, #2795, #2779) and a human reviewer noticed each time.
 # The claim is in the title/body (`Fixes #N`), so the self-test is hermetic and the live run is a lane tool: `Refs #N` and a

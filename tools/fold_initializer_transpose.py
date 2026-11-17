@@ -115,10 +115,20 @@ def fold(model):
     return folded
 
 
+USAGE = "usage: fold_initializer_transpose.py [--check] <model.onnx> [out.onnx]"
+
+
 def main(argv):
+    # `--help` used to arrive as a filename and die with `FileNotFoundError: '--help'` (tools/ci/tool_help_check.py
+    # exists for exactly this). It only became visible once this tool's dependency, onnx, was installed in CI.
     if len(argv) < 2:
-        print("usage: fold_initializer_transpose.py [--check] <model.onnx> [out.onnx]", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         return 2
+    if argv[1] in ("-h", "--help"):
+        print(USAGE)
+        print("Store an initializer-fed Transpose's weight in the orientation the matmul wants, so the node goes "
+              "away; --check exits 1 if such a Transpose is still in the graph.")
+        return 0
     check = argv[1] == "--check"
     args = argv[2:] if check else argv[1:]
     path = args[0]

@@ -125,6 +125,45 @@ check "a pack that cannot be folded is refused" "$rc" 1
 check "nothing was written" "$([ -e "$tmp/refused" ] && echo written || echo absent)" absent
 check "and the error names the fold command" "$(grep -c 'fold_initializer_transpose.py' "$tmp/log2")" 1
 
+# engine#2779: one weight feeding two Transposes with different perms used to fold to a single `{src}_t`, so the pack
+# declared two shapes and held one tensor -- `--check` passed (no Transpose left) and the builder exited 0 on an
+# invalid model. Asserted here, through the shipped script, because that is the path a pack actually takes.
+python3 - "$tmp/dec2.onnx" <<'PY' || { echo "FAIL could not build the two-perm decoder"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+
+w = numpy_helper.from_array(np.arange(24, dtype=np.float32).reshape(2, 3, 4), "w")
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["t0"], perm=[0, 2, 1]),
+     helper.make_node("Transpose", ["w"], ["t1"], perm=[2, 1, 0]),
+     helper.make_node("Identity", ["t0"], ["y0"]),
+     helper.make_node("Identity", ["t1"], ["y1"])],
+    "g", [],
+    [helper.make_tensor_value_info("y0", TensorProto.FLOAT, None),
+     helper.make_tensor_value_info("y1", TensorProto.FLOAT, None)], [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY
+out2=$tmp/pack-two
+"$SCRIPT" --out "$out2" "$tmp/enc.onnx" "$tmp/dec2.onnx" >"$tmp/log-two" 2>&1
+check "two-perm decoder: the pack is written" "$?" 0
+read -r distinct shapes <<EOF
+$(python3 - "$out2/decoder_model.onnx" <<'PY'
+import sys
+import onnx
+from onnx import numpy_helper
+after = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in after.graph.initializer}
+reads = [n.input[0] for n in after.graph.node if n.op_type == "Identity"]
+print(int(reads[0] != reads[1]),
+      "x".join(str(d) for d in inits[reads[0]].shape) + "/" + "x".join(str(d) for d in inits[reads[1]].shape))
+PY
+)
+EOF
+check "two-perm pack: the two consumers read DIFFERENT initializers" "$distinct" "1"
+check "two-perm pack: the two orientations keep their own shapes" "$shapes" "2x4x3/4x3x2"
+
 echo "---"
 if [ "$fail" -ne 0 ]; then echo "$fail failed"; exit 1; fi
 echo "make_audio_pack: all checks ok"

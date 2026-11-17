@@ -125,12 +125,17 @@ jobs:
           # row leading the alerts and eating one of the 21 slots.
           # A failure line is a `census-watch: !! …` line, not a two-space row, so the alert tier matches both shapes.
           alert='^(  !! |census-watch: !! )'
-          # engine#2814: each row keeps the `  -> ` advice lines that follow it. The old middle tier lifted EVERY
-          # `  -> ` line out of its class's block, so five REMOTE-CODE classes' identical sentence appeared as five
-          # orphans directly under the `!!` row -- reading as a duplicated emission and as an alert contradicting its
-          # own "alerts once 3 uploaders" note, while the rows those arrows belonged to came 20 lines later. Selection
-          # and tier order are unchanged; only the block is no longer split.
+          # engine#2814: rows are emitted as BLOCKS -- a row with the `  -> ` advice that follows it -- because the
+          # old middle tier lifted EVERY `  -> ` line out of its class's block. Five REMOTE-CODE classes share one
+          # advice sentence, so the 11-17 issue showed the `!!` row followed by five identical `-> custom modeling
+          # code …; alerts once 3 uploaders use it` lines with the rows they explained 20 lines below: it reads as a
+          # duplicated emission and as an alert contradicting its own threshold, and neither was true.
+          #
+          # A conclusion must still lead the per-row stream (engine#2711: for the Q4NX gap the `->` line IS the whole
+          # finding), so the blocks are ordered by whether they carry advice -- alerts, rows with advice, rest -- which
+          # keeps both properties. tests/census_watch_excerpt_test.py arms all of them.
           lines=$({ awk -v pat="$pat" -v alert="$alert" -v want=alert -f tools/ci/census_excerpt.awk /tmp/census-watch.log
+                    awk -v pat="$pat" -v alert="$alert" -v want=concl -f tools/ci/census_excerpt.awk /tmp/census-watch.log
                     awk -v pat="$pat" -v alert="$alert" -v want=rest  -f tools/ci/census_excerpt.awk /tmp/census-watch.log; } \
                    | tr -d '`@' | head -n 40 | base64 -w0)
           echo "lines=$lines" >> "$GITHUB_OUTPUT"

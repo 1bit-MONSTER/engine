@@ -175,6 +175,20 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   [ "$ino_before" != "$ino_after" ] || { echo "FAIL: the summary is truncated in place (same inode) -- a reader can see a header with nothing under it"; fail=1; }
   [ -e "$d/sum/summary.txt.tmp" ] && { echo "FAIL: the temp file was left behind"; fail=1; }
   head -1 "$d/sum/summary.txt" | grep -q '^# accel sampler summary ' || { echo "FAIL: the written summary has no header"; fail=1; }
+  # engine#2795: every summary names the bytes that wrote it, and a deployed copy can be told apart from the repo's.
+  grep -q '^# script sha256 [0-9a-f]\{64\}$' "$d/sum/summary.txt" \
+    || { echo "FAIL: the summary does not carry the running script's sha256"; fail=1; }
+  # The arm that must be able to fail: install a copy, modify it behind the provenance, and require DRIFTED.
+  printf '#!/bin/bash\necho modified\n' > "$d/deployed.sh"
+  install_sampler "$0" "$d/deployed.sh" testcommit >/dev/null 2>&1
+  check_deployed "$d/deployed.sh" >/dev/null 2>&1 \
+    || { echo "FAIL: a freshly installed copy must check clean"; fail=1; }
+  printf '# drift\n' >> "$d/deployed.sh"
+  check_deployed "$d/deployed.sh" >/dev/null 2>&1 \
+    && { echo "FAIL: check-deployed passed a copy that had been modified behind its provenance"; fail=1; }
+  rm -f "$(provenance_file "$d/deployed.sh")"
+  [ "$(check_deployed "$d/deployed.sh" >/dev/null 2>&1; echo $?)" = 2 ] \
+    || { echo "FAIL: a deployed copy with no provenance must be 'cannot tell' (rc 2), not a pass"; fail=1; }
   rm -rf "$d"
   [ "$fail" = 0 ] && echo "accel-sampler self-test: ok (nearest+distance, fields+ticket, empty window, no-holder sample, rotation, summary replaced not truncated)"
   return "$fail"
@@ -193,12 +207,26 @@ watch_faults() {  # correlate each fault with the samples around it
   done
 }
 
+script_sha256() {  # the bytes that are RUNNING, so every summary names the version that produced it (engine#2795)
+  # BASH_SOURCE first, $0 second: a summary produced through a SOURCED copy must still name the real file. I hit exactly
+  # that while testing this -- `source fns.sh; summary` wrote `sha256 unavailable` into the live summary, i.e. a provenance
+  # line that was there and useless, which is the shape this issue is about.
+  if [ -n "${SELF_SHA:-}" ]; then printf '%s' "$SELF_SHA"; return; fi
+  command -v sha256sum >/dev/null || { printf 'unavailable'; return; }
+  local f=${BASH_SOURCE[0]:-$0}
+  SELF_SHA=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+  printf '%s' "${SELF_SHA:-unavailable}"
+}
+
+provenance_file() { printf '%s.provenance' "$1"; }
+
 summary() {  # what the run observed, so a 24 h expiry is not silence
   local out=$DIR/summary.txt n attr
   if [ -f "$SAMP" ]; then n=$(wc -l < "$SAMP"); else n=0; fi
   if [ -f "$ATTR" ]; then attr=$(wc -l < "$ATTR"); else attr=0; fi
   {
     echo "# accel sampler summary $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "# script sha256 $(script_sha256)"
     echo "samples: $n   attributed faults: $attr"
     echo
     echo "## holders seen (pid, cmd, scope, ticket, sample count)"
@@ -220,8 +248,53 @@ summary() {  # what the run observed, so a 24 h expiry is not silence
   echo "summary written: $out"
 }
 
+# engine#2795: the deployed copy drifted 52 lines from the repo and nothing noticed -- the running instrument was not the
+# instrument in the repository, and every summary it wrote carried a timestamp but no version. `install` records what it
+# deployed; `check-deployed` is the arm that can fail.
+install_sampler() {  # install <repo-root-or-script> [dest] [commit]
+  local src=$1 dest=${2:-$DIR/accel-sampler.sh} commit=${3:-${GIT_COMMIT:-unknown}}
+  [ -f "$src" ] || src=$src/tools/diag/accel_sampler.sh
+  [ -f "$src" ] || { echo "install: no accel_sampler.sh at $1" >&2; return 2; }
+  bash -n "$src" || { echo "install: $src does not parse" >&2; return 2; }
+  mkdir -p "$(dirname "$dest")"
+  # copy then rename, so a running sampler never sees a half-written script
+  cp "$src" "$dest.tmp" && mv -f "$dest.tmp" "$dest" || return 2
+  chmod +x "$dest"
+  local sha; sha=$(sha256sum "$dest" | cut -d' ' -f1)
+  {
+    echo "commit=$commit"
+    echo "sha256=$sha"
+    echo "source=$src"
+    echo "deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$(provenance_file "$dest").tmp"
+  mv -f "$(provenance_file "$dest").tmp" "$(provenance_file "$dest")"
+  echo "install: $dest sha256 $sha commit $commit"
+}
+
+check_deployed() {  # check-deployed [dest] -- rc 0 the deployed copy is the bytes its provenance names, 1 drifted, 2 cannot tell
+  local dest=${1:-$0} prov sha_actual sha_expected
+  prov=$(provenance_file "$dest")
+  if [ ! -f "$prov" ]; then
+    echo "check-deployed: cannot tell: no provenance beside $dest (run: accel_sampler.sh install <repo> $dest <commit>)" >&2
+    return 2
+  fi
+  sha_expected=$(sed -n 's/^sha256=//p' "$prov")
+  sha_actual=$(sha256sum "$dest" 2>/dev/null | cut -d' ' -f1)
+  if [ -z "$sha_expected" ] || [ -z "$sha_actual" ]; then
+    echo "check-deployed: cannot tell: could not read a sha256 from $prov or $dest" >&2
+    return 2
+  fi
+  if [ "$sha_expected" != "$sha_actual" ]; then
+    echo "check-deployed: DRIFTED $dest: $(sed -n 's/^commit=//p' "$prov") deployed sha256 $sha_expected, on disk $sha_actual" >&2
+    return 1
+  fi
+  echo "check-deployed: ok $dest sha256 $sha_actual commit $(sed -n 's/^commit=//p' "$prov")"
+}
+
 case "${1:-both}" in
   sample) sample_once ;;
+  install) shift; install_sampler "$@" ;;
+  check-deployed) shift; check_deployed "$@" ;;
   watch)  watch_faults ;;
   both)
     # the fault reader first, so no fault is missed between start and the first sample

@@ -49,7 +49,9 @@ elsewhere, which reads exactly like a broken baseline (ctest_skips.py, 2026-11-1
 import argparse
 import pathlib
 import re
+import shutil
 import sys
+import tempfile
 
 BASELINE = pathlib.Path("tools/ci/ctest_known_fail.txt")
 TOOL_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -60,7 +62,11 @@ TOOL_ROOT = pathlib.Path(__file__).resolve().parents[2]
 # are a strictly smaller set, so the FAILED block alone is both sufficient and the honest source.
 FAILED_LINE = re.compile(r"^\s*\d+ - (\S+) \((Failed|SEGFAULT|Subprocess aborted|Timeout|[A-Z][^)]*)\)\s*$",
                          re.MULTILINE)
-SUMMARY = re.compile(r"^\s*(\d+)% tests passed, (\d+) tests failed out of (\d+)")
+# engine#2825 review (mine): NO re.MULTILINE meant `^` matched only at position 0, and a real ctest log puts
+# its summary at the END, after the FAILED block -- so summary() returned None for every real log and check()
+# always answered "cannot tell". The self-test stayed green because its fixture puts the summary FIRST, which
+# is the one shape ctest never emits. The arm below is the real shape, and it fails without this flag.
+SUMMARY = re.compile(r"^\s*(\d+)% tests passed, (\d+) tests failed out of (\d+)", re.MULTILINE)
 # "You have 3 tests; 2 are known failures" is a state, not an error -- but a summary that says N
 # failed while the FAILED block lists fewer is a truncated log, and answering from it would hide the
 # missing ones. Both numbers are read and compared rather than trusting either alone.
@@ -128,19 +134,41 @@ def check(log_text: str, known, want_total=None):
 
 
 def write_baseline(path: pathlib.Path, names, log_text: str):
+    """Rewrite the baseline by MERGING, never regenerating (engine#2825 review).
+
+    Regenerating from `failed(log_text)` alone deleted two things the file must keep: the Apache block, which
+    `tools/copyright.py --check` requires and which this file is registered in LINE_STYLES for, and the hand-written
+    annotations (`-- behavior`, `-- main backend`, the measurement note) that a reader uses to judge whether an entry
+    is still true. Following the file's own documented regeneration command therefore broke CI, and the self-test
+    asserted the opposite ("a round-trip through baseline() loses nothing") because only `baseline()` was armed.
+
+    So: keep the leading comment block verbatim, keep every surviving name's existing line verbatim, and emit a
+    fresh `<name>    # <reason>` only for names the file did not already carry.
+    """
     names = sorted(names or [])
-    body = ["# Known failures of the fork ctest suite at the pinned fork. One per line:",
-            "#   <test name>    # <ctest's reason> -- why it is expected, or engine#N",
-            "# A new failure fails tools/ci/ctest_known_fail.py; a name that starts passing is reported",
-            "# so this list shrinks. Regenerate with --write after a deliberate change.",
-            ""]
     reasons = failed(log_text)
+    existing = {}
+    header = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                if not existing:          # still inside the leading block
+                    header.append(line)
+                continue
+            existing[line.split()[0]] = line
+    while header and not header[-1].strip():
+        header.pop()
+    body = list(header)
+    if body:
+        body.append("")
     for name in names:
-        body.append(f"{name}    # {reasons.get(name, '')}".rstrip())
+        body.append(existing.get(name) or f"{name}    # {reasons.get(name, '')}".rstrip())
     path.write_text("\n".join(body) + "\n")
 
 
 def self_test():
+    import shutil, tempfile   # bound here because a later local import makes the name local to this function
     cases = 0
     bad = 0
     # The suite this baseline exists for, as engine#2761 reported it.
@@ -165,6 +193,37 @@ Errors while running CTest
     cases += 1
     if (new2, cannot2) != ({"test-kv-zero"}, None):
         print(f"  SELF-TEST FAIL: a baseline missing one failure -> {new2, cannot2}")
+        bad += 1
+    # engine#2825 review (mine): the fixture above puts the summary FIRST and ctest puts it LAST. With the summary in
+    # its real place a regex without re.MULTILINE cannot see it, so every real log answered "cannot tell" while this
+    # self-test stayed green -- the arm that was supposed to cover the shape covered the one shape ctest never emits.
+    # Both shapes are pinned now, so neither can regress in silence.
+    real_tail = real.replace("97% tests passed, 4 tests failed out of 112\n", "") + "\n97% tests passed, 4 tests failed out of 112\n"
+    new_t, fixed_t, cannot_t = check(real_tail, known)
+    # ...and --write must MERGE, not regenerate: the licence block and the hand annotations are what a reader and
+    # tools/copyright.py --check rely on, and the first documented regeneration deleted both (engine#2825 review).
+    write_root = pathlib.Path(tempfile.mkdtemp())
+    (write_root / "tools/ci").mkdir(parents=True)
+    seeded = (write_root / "tools/ci/ctest_known_fail.txt")
+    seeded.write_text('# Copyright 2026 x\n# SPDX-License-Identifier: Apache-2.0\n#\n'
+                      'test-kv-zero    # Subprocess aborted -- main\n')
+    write_baseline(seeded, {"test-kv-zero", "brand-new"}, real_tail)
+    kept = seeded.read_text()
+    cases += 1
+    if "SPDX-License-Identifier" not in kept:
+        print("  SELF-TEST FAIL: --write dropped the licence block that copyright.py --check requires")
+        bad += 1
+    elif "Subprocess aborted -- main" not in kept:
+        print("  SELF-TEST FAIL: --write overwrote an existing annotation")
+        bad += 1
+    elif "brand-new" not in kept:
+        print("  SELF-TEST FAIL: --write did not add a newly-failed name")
+        bad += 1
+    shutil.rmtree(write_root, ignore_errors=True)
+
+    cases += 1
+    if (new_t, fixed_t, cannot_t) != (set(), set(), None):
+        print(f"  SELF-TEST FAIL: ctest's real log shape (FAILED block first, summary LAST) -> {new_t, fixed_t, cannot_t}")
         bad += 1
     # A known failure that now passes is reported, not failed.
     green = """\

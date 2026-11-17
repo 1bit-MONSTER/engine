@@ -62,9 +62,17 @@ PAGE = 100
 CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#(\d+)', re.I)
 
 
+# A claim written INSIDE code is documentation, not a claim. The PRs most likely to contain `Fixes #12` are the ones
+# explaining how to write one -- #2809's own body pastes the syntax it looks for -- so without this the detector flags
+# the PR that documents the convention, which is the one reading a lane cannot skip.
+FENCE = re.compile(r"```.*?```", re.S)     # a fenced block
+SPAN = re.compile(r"`[^`\n]*`")            # an inline code span
+
+
 def claims(text):
-    """The issue numbers a PR title+body claims to close."""
-    return sorted({int(n) for n in CLAIM.findall(text or '')})
+    """The issue numbers a PR title+body claims to close, ignoring any claim written inside code."""
+    text = SPAN.sub(" ", FENCE.sub(" ", text or ""))
+    return sorted({int(n) for n in CLAIM.findall(text)})
 
 
 def duplicates(prs):
@@ -157,6 +165,11 @@ def self_test():
     ok(claims("Refs #2779 (the layer its fix does not cover), #2728 (where the defect came from)") == [],
        "a NOUN 'fix' followed by a distant #N is not a claim -- #2793's real body, which the 24-character gap did fire on")
     ok(claims("") == [] and claims(None) == [], "empty and None bodies claim nothing")
+    ok(claims("use `Fixes #12` in your PR body") == [],
+       "a claim inside an inline code span is documentation, not a claim")
+    ok(claims("```\nFixes #12\n```") == [], "a claim inside a fenced block is documentation too")
+    ok(claims("```\nFixes #12\n```\n\nCloses #34") == [34],
+       "...and a real claim beside a fenced one still counts, which is the case a naive strip gets wrong")
 
     # the shape that happened three times tonight
     prs = [

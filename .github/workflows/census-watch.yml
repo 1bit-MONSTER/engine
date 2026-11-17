@@ -95,6 +95,11 @@ jobs:
         id: watch
         env:
           SIMULATE: ${{ github.event_name == 'workflow_dispatch' && inputs.simulate_alert }}
+          # engine#2812: the FastFlowLM and support-pins sweeps read api.github.com, and unauthenticated
+          # that is 60 requests an hour per IP -- on a hosted runner the quota is shared with every other
+          # job on the same egress, so two of the three sweeps hit 403 in a single run (01:17Z, #2811).
+          # The workflow's own read-only token cannot be spent by a read and is 1,000/hour per repository.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set +e
           bash scripts/census-watch.sh --limit 120 > /tmp/census-watch.log 2>&1

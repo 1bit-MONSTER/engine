@@ -249,6 +249,30 @@ if [ "$rc" != 124 ]; then echo "FAIL arm 6: rc $rc for a payload cut by the max 
 grep -q "the max hold cut it short" "$scratch/log6" || { echo "FAIL arm 6: a 124 release does not name the max hold"; fail=1; }
 grep -q "may appear AFTER this release" "$scratch/log6" || { echo "FAIL arm 6: a 124 release does not warn about deferred work"; fail=1; }
 
+# ── arm 7: a BACKTRACE must not hide the event line it belongs to ────────────────────────────────────────────────
+# The frame filter added for the count is read by the during-hold watch too (one skip regex, so they cannot drift), so
+# the question is whether filtering `+0x` frames could make the watch miss a real fault. It cannot while the driver logs
+# an event line, and this arm pins that: a hold whose log carries three frames AND the reset line aborts, and the line
+# it quotes is the event, not a frame.
+q7=$scratch/q7; mkdir -p "$q7"; : > "$scratch/klog7"; rm -f "$scratch/deep.pid"
+printf '%s
+' "kernel: usb 1-1: new device" > "$scratch/klog7"
+( sleep 5
+  printf '%s
+' "kernel:  amdgpu_device_gpu_recover.cold+0x266/0x2e1 [amdgpu]" \
+                "kernel:  amdgpu_device_asic_reset+0x37d/0x43d [amdgpu]" \
+                "kernel:  amdgpu_do_asic_reset+0x102/0x1a0 [amdgpu]" \
+                "kernel: amdgpu 0000:c5:00.0: GPU reset(2) succeeded!" >> "$scratch/klog7" ) &
+env -u GPU_HOLD_FAULT_ABORT GPU_HOLD_FAULT_ABORT=1 GPU_HOLD_KLOG_FILE="$scratch/klog7" \
+    GPU_QUEUE_DIR="$q7" GPU_TOKEN_FILE="$scratch/TOKEN7" GPU_HOLD_LOG="$scratch/log7" \
+    GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 GPU_HOLD_RESET_WINDOW_MIN=0 \
+    GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x" \
+        timeout 120 "$hold" -t 10 -l faulttest7 -- "$scratch/wrapper.sh" "$scratch" 40 > /dev/null 2>&1
+rc=$?
+if [ "$rc" != 78 ]; then echo "FAIL arm 7: rc $rc for a hold whose log carries frames plus a reset line, want 78"; fail=1; fi
+grep -q "GPU reset(2) succeeded" "$scratch/log7" || { echo "FAIL arm 7: the abort does not quote the reset event line"; fail=1; }
+grep -qE '\+0x[0-9a-f]+/0x' "$scratch/log7" && { echo "FAIL arm 7: the abort quoted a stack frame as the fault"; fail=1; }
+
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
@@ -273,5 +297,5 @@ grep -q "newest line is from the NPU" "$scratch/log5" || { echo "FAIL arm 5: the
 grep -q "newest line is from the GPU" "$scratch/log1" || { echo "FAIL arm 1: the abort does not name the GPU as the faulting device"; fail=1; }
 if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 
-[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on; 124 named -> 78; take-time page fault/MES/ring/hang -> 78; NPU fault in hold -> 78; a recovery notice does NOT abort; a real power-cycling event does; a WARN backtrace counts once)"
+[ "$fail" = 0 ] && echo "gpu_hold_fault_abort: ok (fault at 5 s -> rc 78 after ${e1}s; clean -> 0; opt-out -> 0; default on; 124 named -> 78; take-time page fault/MES/ring/hang -> 78; NPU fault in hold -> 78; a recovery notice does NOT abort; a real power-cycling event does; a WARN backtrace counts once; and one cannot hide its event line)"
 exit "$fail"

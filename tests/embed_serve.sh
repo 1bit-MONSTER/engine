@@ -23,11 +23,14 @@ DIR=$(cd "$(dirname "$0")/.." && pwd)
 FIX=$DIR/tests/fixtures/trit_embed_tiny
 PORT=${EMBED_SERVE_PORT:-8247}
 LOG=$(mktemp)
+# engine#2826 (ctest -j 4): the two curl bodies below used fixed /tmp/embed_serve_er{1,2} names, so two runs at once
+# wrote each other's evidence and the grep that follows judged the other run's reply. mktemp keeps them apart.
+ER1=$(mktemp); ER2=$(mktemp)
 fails=0
 check() { # $1 what, $2 got, $3 want
     if [ "$2" = "$3" ]; then echo "  PASS $1 ($2)"; else echo "  FAIL $1: got '$2' want '$3'"; fails=$((fails+1)); fi
 }
-cleanup() { [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; rm -f "$LOG"; }
+cleanup() { [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; rm -f "$LOG" "$ER1" "$ER2"; }
 trap cleanup EXIT
 
 "$BIN" serve --embedding -m "$FIX" --device cpu --port "$PORT" >"$LOG" 2>&1 &
@@ -56,12 +59,12 @@ echo "$body" | grep -q '"index":0' && echo "$body" | grep -q '"index":1' && echo
 echo "$body" | grep -q '"usage":{"prompt_tokens":' && echo "  PASS array: usage" || echo "  NOTE usage only on a single string" 
 
 # refusals, named
-c=$(curl -s -m 30 -o /tmp/embed_serve_er1 -w '%{http_code}' -H 'Content-Type: application/json' -d '{"input":[[1,2,3]]}' "http://127.0.0.1:$PORT/v1/embeddings")
+c=$(curl -s -m 30 -o $ER1 -w '%{http_code}' -H 'Content-Type: application/json' -d '{"input":[[1,2,3]]}' "http://127.0.0.1:$PORT/v1/embeddings")
 check "token-id array: status" "$c" 400
-grep -q "token-id arrays are not served" /tmp/embed_serve_er1 && echo "  PASS token-id array: named refusal" || { echo "  FAIL token-id refusal not named"; fails=$((fails+1)); }
-c=$(curl -s -m 30 -o /tmp/embed_serve_er2 -w '%{http_code}' -H 'Content-Type: application/json' -d '{}' "http://127.0.0.1:$PORT/v1/embeddings")
+grep -q "token-id arrays are not served" $ER1 && echo "  PASS token-id array: named refusal" || { echo "  FAIL token-id refusal not named"; fails=$((fails+1)); }
+c=$(curl -s -m 30 -o $ER2 -w '%{http_code}' -H 'Content-Type: application/json' -d '{}' "http://127.0.0.1:$PORT/v1/embeddings")
 check "missing input: status" "$c" 400
-grep -q "input is required" /tmp/embed_serve_er2 && echo "  PASS missing input: named refusal" || { echo "  FAIL missing input not named"; fails=$((fails+1)); }
+grep -q "input is required" $ER2 && echo "  PASS missing input: named refusal" || { echo "  FAIL missing input not named"; fails=$((fails+1)); }
 
 # concurrency: the route answers from a worker pool, so N simultaneous requests must all be 200 and identical
 # (the NPU path's shared weight cache is the reason this row exists; cpu is the device-free half of it)
@@ -81,7 +84,7 @@ rm -f /tmp/embed_serve_p[0-9]*.json
 # the model list names the role and the device
 body=$(curl -s -m 10 "http://127.0.0.1:$PORT/v1/models")
 echo "$body" | grep -q '"role":"embedding"' && echo "$body" | grep -q '"device":"cpu"' && echo "  PASS /v1/models: role and device" || { echo "  FAIL /v1/models"; fails=$((fails+1)); }
-rm -f /tmp/embed_serve_er1 /tmp/embed_serve_er2
+rm -f $ER1 $ER2
 if [ "$fails" -ne 0 ]; then
     echo "--- server log ---"
     tail -20 "$LOG"

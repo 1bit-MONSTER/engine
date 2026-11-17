@@ -231,6 +231,13 @@ add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TAR
 # The embedding role served in-process from a 1-bit container (engine#1311): /v1/embeddings for a string and an
 # array, the OpenAI shape, and the refusals named. Device-free on the 32-token fixture.
 add_test(NAME embed_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/embed_serve.sh $<TARGET_FILE:onebit>)
+# engine#2826 (ORCH 2026-11-17, ctest -j 4): embed_serve starts `1bit serve` on a FIXED port --
+# `PORT=${EMBED_SERVE_PORT:-8247}` in tests/embed_serve.sh -- and held no lock, while every other server row does.
+# It was invisible to the census (tests/route_port_lock_test.py) because that pattern knew `freeport`, the `:0` bind
+# and `--port 43xxx`, and a shell default matched none of them; the pattern now has the shape as well, so this cannot
+# recur silently. Under -j two rows can be handed 8247 between the close and the child's bind, which is the flake the
+# lock exists for (engine#1070).
+set_tests_properties(embed_serve PROPERTIES RESOURCE_LOCK route_ports)
 # serve takes a hung backend down (docs/serve.md, "When a backend hangs"): a fake backend, no GPU.
 add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh $<TARGET_FILE:onebit>)
 # serve's GET /metrics (docs/serve.md, "Metrics"): a fake backend, no GPU.

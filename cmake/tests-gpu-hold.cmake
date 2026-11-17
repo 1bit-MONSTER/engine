@@ -112,6 +112,12 @@ add_test(NAME gpu_hold_stale_token COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_ho
 # now names the copy by its sha256, so the log answers "which copy ran?" in one field. Two claims, no device.
 add_test(NAME gpu_hold_script_id COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_script_id_test.sh)
 
+# engine#2803: a DRM vblank reset is not a compute fault. Three resets in one boot, each preceded by a drm_vblank
+# warning on a kworker and followed by "device wedged, but no recovery needed", while the GPU sat idle between
+# tickets -- and one refused a hw_gate take after a 794 s queue wait, so a test-only pin bump read as a fault.
+# The classification looks at the BURST: a display marker with no compute marker beside it does not refuse.
+add_test(NAME gpu_hold_display_reset COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_display_reset_test.sh)
+
 # docs/ci-runners.md's exit-code table is a contract (review of engine#2539): every "<script> exits/sets it" in a row
 # must be backed by `exit <rc>` or `rc=<rc>` in that script, and every row must name an emitter.
 add_test(NAME exit_code_table COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tests/exit_code_table_test.py ${CMAKE_SOURCE_DIR})

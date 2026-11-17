@@ -116,6 +116,25 @@ GPU_FAULT_RE='\[gfxhub\] page fault|amdgpu.*(reset|hang)|ring .*timeout|MES.*(re
 # A line that says the driver did NOTHING ("no context touched") is not a fault: it is the throttle that follows
 # one, and it is logged for 60 s after every power-cycle, which is exactly when the next ticket is granted.
 GPU_FAULT_SKIP_RE='aie2_tdr_recover_all: TDR recovery throttled'
+# engine#2803: a DISPLAY reset is not a compute fault. Measured 2026-11-16, three resets in one boot, each preceded by
+# `WARNING: drivers/gpu/drm/drm_vblank.c:{380,1329}` on a kworker and followed by `[drm] device wedged, but no recovery
+# needed`, while the GPU sat idle between tickets -- and one of them refused a `hw_gate` take after a 794 s queue wait,
+# so a test-only pin bump read as "the box is faulting". The clause that matches those is `amdgpu.*(reset|hang)`, which
+# sees the reset line and not the warning above it, so the classification has to look at the BURST:
+#   * a COMPUTE reset logs its cause first -- `gfxhub`, `MES`, `ring .*timeout`, `amdxdna` -- and that is what refuses;
+#   * a DISPLAY reset logs a drm vblank warning and `device wedged, but no recovery needed` and no compute marker.
+# Conservatism is kept deliberately: if the window holds ANY compute marker the refusal stands, and the display form is
+# only ever subtracted when a display marker is present with no compute marker beside it.
+GPU_FAULT_DISPLAY_RE='drm_vblank|drm_crtc_wait_one_vblank|drm_update_vblank_count|device wedged, but no recovery needed|amdgpu.*(vblank|crtc)|\[drm\] .*atomic'
+GPU_FAULT_COMPUTE_RE='\[gfxhub\] page fault|ring .*timeout|MES.*(reset|failure|failed to respond)|amdxdna.*(command timeout|power.?cycl(e|ing)|fault)'
+# 0 -> the matched lines are display resets only (warn, do not refuse); 1 -> a compute fault is present (refuse).
+_fault_is_compute() {  # stdin: the matched kernel-log lines
+    local lines; lines=$(cat)
+    [ -n "$lines" ] || return 1
+    printf '%s\n' "$lines" | grep -qiE "$GPU_FAULT_COMPUTE_RE" && return 0
+    printf '%s\n' "$lines" | grep -qiE "$GPU_FAULT_DISPLAY_RE" && return 1
+    return 0   # neither marker: an unknown reset keeps the refusal
+}
 
 while getopts ":t:l:w:q:h" opt; do
     case $opt in
@@ -413,7 +432,14 @@ while [ "$state" = queued ]; do
                     # take an NPU ticket minutes after the command timeout the rules say to stop for (measured
                     # 2026-11-15: the hold ran on a log whose newest line was an amdxdna command timeout).
                     _reset_re=$GPU_FAULT_RE
-                    _resets=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | grep -c .)
+                    _hit_lines=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE")
+                    _resets=$(printf '%s\n' "$_hit_lines" | grep -c .)
+                    # engine#2803: a display (DRM vblank) reset is not a compute fault and must not refuse a ticket.
+                    # `_fault_is_compute` returns 1 only for a burst that carries a display marker and no compute marker.
+                    if [ "${_resets:-0}" -gt 0 ] && ! printf '%s\n' "$_hit_lines" | _fault_is_compute > /dev/null; then
+                        log "::warning::the last ${_reset_window} min carry ${_resets} DISPLAY reset line(s) and no compute marker - not refusing (engine#2803); newest: $(printf '%s\n' "$_hit_lines" | tail -1 | cut -c1-140)"
+                        _resets=0
+                    fi
                     if [ "${_resets:-0}" -gt 0 ]; then
                         rm -f "$TOKEN"; state=done
                         # HOW OLD is the newest one? "in the last 10 min" cannot tell a wedged device from another lane's

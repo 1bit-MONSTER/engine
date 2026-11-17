@@ -72,21 +72,23 @@ def provenance_mismatches(model):
     """Folded tensors whose shape is not `source dims` permuted by the recorded perm. Returns one line each.
 
     Only initializers the fold produced (their `doc_string` starts `folded:`) are checked, so an unpacked graph answers
-    with an empty list rather than guessing. A missing source is reported too: the provenance says where the tensor came
-    from, and a source that is no longer in the graph means the pack cannot be verified, which is not the same as fine.
+    with an empty list rather than guessing. The source DIMS are recorded with the perm because the fold legitimately
+    prunes a source nothing else reads: keying the check on the source tensor would report every such pack as
+    unverifiable, which is the same failure as a wrong-but-plausible pass in the other direction.
     """
-    inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
     bad = []
     for t in model.graph.initializer:
         if not t.doc_string.startswith("folded:"):
             continue
-        _, src, perm_s = t.doc_string.split(":")
-        perm = [int(d) for d in perm_s.split(",")]
-        if src not in inits:
-            bad.append(f"{t.name}: folded from {src}, which is not in this graph: cannot verify (not a pass)")
+        try:
+            _, src, perm_s, src_dims = t.doc_string.split(":")
+        except ValueError:
+            bad.append(f"{t.name}: provenance '{t.doc_string}' is not readable: cannot verify (not a pass)")
             continue
-        want = list(np.transpose(inits[src], perm).shape)
-        have = list(inits[t.name].shape)
+        perm = [int(d) for d in perm_s.split(",")]
+        dims = [int(d) for d in src_dims.split(",")]
+        want = list(np.transpose(np.zeros(dims, dtype=bool), perm).shape)
+        have = list(t.dims)      # TensorProto.dims is repeated int64, not the value_info form
         if want != have:
             bad.append(f"{t.name}: folded from {src} perm {perm_s} should be {want}, is {have}")
     return bad
@@ -117,7 +119,8 @@ def fold(model):
                 # engine#2779 review: after folding, the perm is gone from the graph, so `--check` could only prove the
                 # NODE was removed -- never that the weight is the right orientation. The provenance makes the check
                 # able to fail: `--check` re-derives the permuted shape from the recorded perm and the source dims.
-                new.doc_string = f"folded:{src}:{','.join(str(d) for d in perm[0])}"
+                src_dims = ",".join(str(d) for d in array.shape)
+                new.doc_string = f"folded:{src}:{','.join(str(d) for d in perm[0])}:{src_dims}"
                 graph.initializer.append(new)
                 inits[dst] = new
                 taken.add(dst)

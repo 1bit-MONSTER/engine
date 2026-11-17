@@ -37,14 +37,5 @@ test-hrx-fa-transposed-value           # Subprocess aborted
 test-hrx-mul-mat-id-k32                # Subprocess aborted
 test-hrx-fa-masked-v                   # Failed
 test-eval-callback                     # SEGFAULT
-test-hrx-pool-refusal-budget          # Failed -- measured 2026-11-17 on ryzen (gfx1201, GTT 22.6 GiB, reserve 1024 MB): the guardrail refusal texts print and the row's own expectation does not match
-test-hrx-loom-jit                     # Subprocess aborted -- measured 2026-11-17, same run
-test-hrx-external-window-view         # Subprocess aborted -- measured 2026-11-17, same run
-test-hrx-hadamard                     # Failed -- measured 2026-11-17: requirement failed: ggml_backend_supports_op (engine#2774, the missing-kernel class)
-test-hrx-mxfp4                        # Subprocess aborted -- ggml_backend_supports_op: the backend claims no MXFP4 row op (engine#2774)
-test-hrx-nvfp4                        # Subprocess aborted -- ggml_backend_supports_op: no NVFP4 row op (engine#2774)
-test-hrx-q2_0                         # Subprocess aborted -- ggml_backend_supports_op: no Q2_0 row op (engine#2774)
-test-hrx-get-rows-iq                  # Subprocess aborted -- ggml_backend_supports_op: no IQ get-rows op (engine#2832's class)
-test-hrx-decode-stride                # Subprocess aborted -- measured 2026-11-17, same run
-test-hrx-attention-q-decode-head-size # Subprocess aborted -- measured 2026-11-17, same run
-test-hrx-routed-down-loom             # Subprocess aborted -- measured 2026-11-17, same run
+test-hrx-decode-stride                 # Subprocess aborted -- measured in hrx-build 2026-11-17 (37 rows, 20 pass); the other 10 supports_op reds there PASS, they only red out under GGML_HRX_GTT_RESERVE_MB=1024
+hrx-backend-test                       # Failed -- hrx; measured in hrx-build 2026-11-17 (the baseline named test-hrx-*-loom but not this one)

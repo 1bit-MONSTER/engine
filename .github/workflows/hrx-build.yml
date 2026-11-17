@@ -154,7 +154,12 @@ jobs:
         run: |
           set -euo pipefail
           fork="$HRX_BUILD/hrx/llama"
-          scripts/mem-guard.sh --term 12 ~/lb/thermal-run.sh cmake --build "$fork" -j 4
+          # -k 0, because one row does NOT build at this pin (test-hrx-host-resident compiles a ggml-hrx source
+          # without ggml/src on its include path) and an aborted build would take the other 33 binaries with it.
+          # The failure is not swallowed: ctest reports that row as `Not Run` and the baseline names it, so the
+          # ratchet answers, and a row that stops building while the baseline says it runs is a new failure.
+          scripts/mem-guard.sh --term 12 ~/lb/thermal-run.sh cmake --build "$fork" -j 4 -- -k 0 \
+            || echo "one or more fork test targets did not build; ctest reports them as Not Run"
           # A ctest row inherits no environment from the engine, and HRX dlopens the HSA runtime itself: the
           # distro's libhsa-runtime64 has no `hsa_amd_queue_create`, so every device row reports
           # "test skipped: no device available" and — because the fork registers that as a failing regex — a

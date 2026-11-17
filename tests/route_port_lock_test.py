@@ -47,10 +47,11 @@ BUILD_DIR = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "build")
 # port. engine#2826 landed `PORT=${VAR:-8247}` first (embed_serve sat unlocked while this census reported OK); a bare
 # `--port 8247` was still invisible, because only the 43xxx literals the neighbouring rows happen to use were matched.
 # A fixed literal is the hazard whatever the number, and `--port 0` / `--port "$VAR"` stay out: those pick a port and
-# read it back (engine#1485).
+# read it back (engine#1485). Four digits is the floor for the same reason the PORT= arm on main has one -- a two-digit
+# default like `PORT=${X:-80}` is a shell-idiom coincidence, not a port this suite allocates.
 BIND_RE = re.compile(r'freeport|free_port|bind\(\s*\("127\.0\.0\.1",\s*0\)\s*\)'
-                     r'|--port[ =]+"?[1-9]\d{1,4}\b'
-                     r'|[A-Z_]*PORT=[^:\n]*:-[1-9]\d{1,4}\b')
+                     r'|--port[ =]+"?[1-9]\d{3,4}\b'
+                     r'|[A-Z_]*PORT=[^:\n]*:-[1-9]\d{3,4}\b')
 
 
 def configured_tests(ctest, build_dir):

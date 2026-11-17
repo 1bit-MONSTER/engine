@@ -62,6 +62,14 @@ jobs:
           python3 tools/registry_build.py
           python3 tools/registry_build.py --check-gaps
           python3 tools/census.py | tee census.txt
+          # engine#2850: two of the snapshot's counters are a function of the TREE, not of the sweep --
+          # declined_architectures (significant.json `watch: report` classes with no backends) and declined_models (the
+          # same classes' counts in this run). 2026-11-17 shipped them as 23/465 while the tree computed 30/1008: a
+          # carried counter, invisible because nothing compared them. This runs HERE and not in PR CI on purpose -- a
+          # PR that reviews a class makes the committed counters stale by definition, so a PR gate would red-light the
+          # one PR that is doing the right thing. The job that regenerates the file is where they can be checked and
+          # fixed in the same run.
+          python3 tools/ci/census_counters_check.py --check --root .
 
       - name: Open the census PR
         env:

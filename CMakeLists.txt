@@ -590,6 +590,16 @@ add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_r
 # The claim is in the title/body (`Fixes #N`), so the self-test is hermetic and the live run is a lane tool: `Refs #N` and a
 # bare mention are deliberately NOT claims, which is the arm below that keeps the detector from firing on every PR.
 add_python_test(tool_selftest_duplicate_fixes ${CMAKE_SOURCE_DIR}/tools/ci/duplicate_fixes_check.py --self-test)
+# engine#2836: the fork registers 48 ctest rows and nothing runs them, because the engine never builds the fork's tests.
+# The host-runnable one that matters is `check_stale_expectations.py` (fork #419): it answers "is a recorded-stale
+# expectation still selectable by no matcher", which is engine#2774's question, in ~1 s, with no device and no fixture.
+# It cannot run at the pin we have -- the script arrived at fork `ddd415f4a` and the engine pins an older commit -- so
+# this row skips (77) and the message names the commit that would turn it on, the same shape as
+# hrx_f16_narrowing_check above. A row that always skipped silently would be a green tick over nothing; a row that
+# failed for want of a file would be red on every PR until the bump.
+add_test(NAME hrx_stale_expectations COMMAND ${Python3_EXECUTABLE}
+         ${CMAKE_SOURCE_DIR}/tools/ci/stale_expectations_check.py --root ${CMAKE_SOURCE_DIR})
+set_tests_properties(hrx_stale_expectations PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_agree.py --selftest)
 add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
 add_python_test(tool_selftest_spec_decode_acceptance ${CMAKE_SOURCE_DIR}/tools/spec_decode_acceptance.py --selftest)

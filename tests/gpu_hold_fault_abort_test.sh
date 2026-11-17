@@ -90,6 +90,26 @@ take_run amdgpu "kernel: amdgpu 0000:c5:00.0: [drm] *ERROR* amdgpu: GPU reset be
 [ "$trc" = 78 ] || { echo "FAIL take-time: an amdgpu reset -> rc $trc, want 78"; fail=1; }
 [ "$ttok" = released ] || { echo "FAIL take-time: the token was still held after a refusal"; fail=1; }
 
+# engine#2803: the refusal must say WHICH KIND of fault it saw, and who the driver named. It used to say only "fault line(s)",
+# and the PR whose hw_gate was refused (2801) spent its time doubting its own pin -- while the log's own "Process <name> pid
+# <n>" line, two lines above the reset, named the other lane's suite. Measured on this box: two of three MODE2 resets in one
+# night were that suite, and the driver writes the process name WITHOUT any reset keyword, so it is not in the matched set.
+q=$scratch/tqclass; mkdir -p "$q"; rm -f "$scratch/TTOKENclass"; : > "$scratch/tklogclass"
+printf '%s\n' "kernel: amdgpu 0000:c5:00.0:  Process hrx-ops-test pid 186654 thread hrx-ops-test pid 186654" \
+              "kernel: amdgpu 0000:c5:00.0: MES failed to respond to msg=REMOVE_QUEUE" \
+              "kernel: amdgpu 0000:c5:00.0: GPU reset(2) succeeded!" > "$scratch/tklogclass"
+env GPU_HOLD_KLOG_FILE="$scratch/tklogclass" GPU_QUEUE_DIR="$q" GPU_TOKEN_FILE="$scratch/TTOKENclass" \
+    GPU_HOLD_LOG="$scratch/tlogclass" GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 \
+    GPU_HOLD_RESET_WINDOW_MIN=10 GPU_HOLD_FAULT_ABORT=0 GPU_HOLD_TCTL_START=100 \
+    GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x" \
+    timeout 60 "$hold" -t 1 -l takeclass -- true > /dev/null 2>&1
+crc=$?
+[ "$crc" = 78 ] || { echo "FAIL take-time class: rc $crc, want 78 (the refusal itself must not change)"; fail=1; }
+grep -q "the newest is a GPU reset/hang" "$scratch/tlogclass" \
+    || { echo "FAIL take-time class: the refusal does not name the class of the newest line"; fail=1; }
+grep -q "the driver last named hrx-ops-test pid 186654" "$scratch/tlogclass" \
+    || { echo "FAIL take-time class: the refusal does not name the process the driver named"; fail=1; }
+
 # the NPU spelling: this is the line the rules say to stop for, and npu-hold has no other take-time check
 take_run npu "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* command timeout: opcode 0x2"
 [ "$trc" = 78 ] || { echo "FAIL take-time: an amdxdna command timeout -> rc $trc, want 78 (the NPU rule)"; fail=1; }

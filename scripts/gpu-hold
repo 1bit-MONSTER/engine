@@ -428,7 +428,30 @@ while [ "$state" = queued ]; do
                                   grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -1 | awk '{print int($1)}')
                         _age=""
                         case "${_newest:-}" in ''|*[!0-9]*) ;; *) _age=", newest $(( $(date +%s) - _newest ))s ago" ;; esac
-                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault line(s) in the last ${_reset_window} min${_age} - the ticket is released unheld. Inspect the kernel log, then retry"
+                        # engine#2803: "fault line(s)" alone reads as "the thing you were about to measure is broken", and the
+                        # PR whose hw_gate was refused spent its time doubting its own pin. Tonight two of three MODE2 resets
+                        # were another lane's suite, and the log says so in the line in front of the reset ("Process
+                        # hrx-ops-test pid 186654"). Name what the newest line is, and who it names when it names someone --
+                        # the refusal itself is unchanged, so a real ring/MES/page fault still refuses exactly as before.
+                        _newest_line=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -1)
+                        case "$_newest_line" in
+                            *"[gfxhub] page fault"*) _what="a gfxhub page fault" ;;
+                            *"ring "*)               _what="a ring timeout" ;;
+                            *MES*)                   _what="an MES failure" ;;
+                            *amdxdna*)               _what="an NPU (amdxdna) fault" ;;
+                            *"GPU reset"*|*"GPU hang"*) _what="a GPU reset/hang" ;;
+                            *)                       _what="a device fault" ;;
+                        esac
+                        # the driver prints "Process <name> pid <n>" on its own interrupt lines, a few lines BEFORE the reset
+                        # line, so look through the last few matching lines rather than only the newest one (measured: the
+                        # 23:33:03 reset's newest matching line is "GPU reset(2) succeeded!", the process is above it).
+                        _who=""
+                        # The driver prints its "Process <name> pid <n>" interrupt lines WITHOUT a reset/hang keyword, so
+                        # they are not in the fault-matched set at all -- search the window's log for the last one and say
+                        # that it is what the driver last named, which is what a reader can check against the log.
+                        _proc=$(printf '%s\n' "$_klog" | sed -n 's/.*Process \([^ ]*\) pid \([0-9]*\).*/\1 pid \2/p' | tail -1)
+                        [ -n "$_proc" ] && _who=", and the driver last named ${_proc}"
+                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault line(s) in the last ${_reset_window} min${_age} - the newest is ${_what}${_who}. The ticket is released unheld; inspect the kernel log, then retry"
                         printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -3
                         exit 78
                     fi

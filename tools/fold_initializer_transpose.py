@@ -68,6 +68,30 @@ def folded_name(src, perm, want, inits, taken):
     raise SystemExit(f"{src}: no free initializer name for perm {perm} near {src}_t (engine#2779)")
 
 
+def provenance_mismatches(model):
+    """Folded tensors whose shape is not `source dims` permuted by the recorded perm. Returns one line each.
+
+    Only initializers the fold produced (their `doc_string` starts `folded:`) are checked, so an unpacked graph answers
+    with an empty list rather than guessing. A missing source is reported too: the provenance says where the tensor came
+    from, and a source that is no longer in the graph means the pack cannot be verified, which is not the same as fine.
+    """
+    inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
+    bad = []
+    for t in model.graph.initializer:
+        if not t.doc_string.startswith("folded:"):
+            continue
+        _, src, perm_s = t.doc_string.split(":")
+        perm = [int(d) for d in perm_s.split(",")]
+        if src not in inits:
+            bad.append(f"{t.name}: folded from {src}, which is not in this graph: cannot verify (not a pass)")
+            continue
+        want = list(np.transpose(inits[src], perm).shape)
+        have = list(inits[t.name].shape)
+        if want != have:
+            bad.append(f"{t.name}: folded from {src} perm {perm_s} should be {want}, is {have}")
+    return bad
+
+
 def fold(model):
     """Rewrite every initializer-fed Transpose in place. Returns [(src, dst, shape)] for what it folded."""
     folded = []
@@ -90,6 +114,10 @@ def fold(model):
             dst = folded_name(src, perm[0], want, inits, taken)
             if dst not in inits:
                 new = numpy_helper.from_array(np.ascontiguousarray(want), dst)
+                # engine#2779 review: after folding, the perm is gone from the graph, so `--check` could only prove the
+                # NODE was removed -- never that the weight is the right orientation. The provenance makes the check
+                # able to fail: `--check` re-derives the permuted shape from the recorded perm and the source dims.
+                new.doc_string = f"folded:{src}:{','.join(str(d) for d in perm[0])}"
                 graph.initializer.append(new)
                 inits[dst] = new
                 taken.add(dst)
@@ -132,8 +160,16 @@ def main(argv):
         bad = initializer_transposes(model)
         for n in bad:
             print(f"{n.name or n.output[0]}: Transpose of initializer {n.input[0]} is still in the graph")
-        print(f"{path}: nodes {before}, initializer-fed Transposes {len(bad)}")
-        return 1 if bad else 0
+        # A folded tensor records its source and perm, so the check can assert the ORIENTATION, not just the absence of
+        # the node (engine#2779 review). A fold with no provenance beside a `<src>_t` name is reported, not ignored.
+        wrong = provenance_mismatches(model)
+        for line in wrong:
+            print(line)
+        inits = {i.name: i for i in model.graph.initializer}
+        folded_marks = [i.name for i in model.graph.initializer if i.doc_string.startswith("folded:")]
+        print(f"{path}: nodes {before}, initializer-fed Transposes {len(bad)}, "
+              f"folded with provenance {len(folded_marks)}, orientation mismatches {len(wrong)}")
+        return 1 if bad or wrong else 0
     folded = fold(model)
     out = args[1] if len(args) > 1 else path
     # engine#2769 review: the pack's layout is the export's, and `onnx.save()` inlines every external tensor by default

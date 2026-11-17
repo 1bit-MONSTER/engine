@@ -65,6 +65,9 @@ LINE_STYLES = [
       # is the notice it would otherwise be asked for. (CI caught this on the PR: the tool refuses an unknown sty
       # than passing it, which is the behaviour worth having.)
       "ctest_skips.txt",
+      # engine#2761: the known-failure baseline for the same suite -- same shape, same reason. CI
+      # caught this on the PR, exactly as the comment above describes, and the refusal is the point.
+      "ctest_known_fail.txt",
       # engine#2018: the test-registration baseline of `tests/*_test.py`, same shape and the same reason -- data,
       "unreferenced_py_tests.txt",
       # Gantt "Kernel 7.4 readiness": the moving-ref baseline, same shape and the same reason -- '#'-comment data.

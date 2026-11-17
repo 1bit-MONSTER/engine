@@ -1,0 +1,39 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Known failures of the fork ctest suite at the fork the tree pins (engine#2761).
+# One per line: <test name>    # <ctest's reason> -- why it is expected here.
+#
+# A NEW failure fails tools/ci/ctest_known_fail.py and therefore ci.yml. A name that starts passing
+# is REPORTED so this list shrinks instead of rotting. Regenerate after a deliberate change with:
+#   tools/ci/ctest_known_fail.py --log build/ctest.log --write
+#
+# Measured 2026-11-17 at fork 52dda9bc, `ctest -j 2 --timeout 600 -E '^(hrx-ops-test|test-hrx-ops|test-hrx-ops-loom)$'`
+# in build/hrx/llama: 87% passed, these 15 failed. 13 of the 15 also fail serially (ctest --rerun-failed
+# -j 1), so they are not -j 2 contention.
+test-tokenizers-ggml-vocabs            # Failed -- behavior
+test-kv-zero                           # Subprocess aborted -- main
+test-llama-archs                       # Failed -- main
+test-speculative-rejection-sampling    # SEGFAULT -- main
+test-llama-context                     # SEGFAULT -- main behavior backend
+test-llama-context-model               # SEGFAULT -- model behavior backend
+test-thread-safety                     # SEGFAULT -- main backend
+test-arg-parser                        # Failed -- behavior
+test-model-resolution                  # SEGFAULT -- behavior
+test-hrx-host-resident                 # Not Run -- the binary is not built in this configuration
+hrx-backend-test-loom                  # Failed -- hrx
+test-hrx-fa-transposed-value           # Subprocess aborted
+test-hrx-mul-mat-id-k32                # Subprocess aborted
+test-hrx-fa-masked-v                   # Failed
+test-eval-callback                     # SEGFAULT

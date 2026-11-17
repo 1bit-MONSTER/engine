@@ -43,11 +43,15 @@ BUILD_DIR = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "build")
 
 # The shapes a route script binds a loopback port in: the freeport helper, the :0 bind it makes,
 # and the fixed 43xxx literals print_backend/lemonade_hrx/template_pin start their servers on.
-BIND_RE = re.compile(r'freeport|free_port|bind\(\s*\("127\.0\.0\.1",\s*0\)\s*\)|--port\s+43\d{3}\b'
-                      # engine#2826: `PORT=${EMBED_SERVE_PORT:-8247}` is the same choice written as a shell default, and
-                      # it matched none of the three shapes above -- so embed_serve sat unlocked while this census
-                      # reported OK. A 4-5 digit default is a fixed port whatever the variable is called.
-                      r'|PORT=\$\{[A-Z_]+:-[0-9]{4,5}\}')
+# The shapes a route script binds a loopback port in: the freeport helper, the :0 bind it makes, and a FIXED literal
+# port. engine#2826 landed `PORT=${VAR:-8247}` first (embed_serve sat unlocked while this census reported OK); a bare
+# `--port 8247` was still invisible, because only the 43xxx literals the neighbouring rows happen to use were matched.
+# A fixed literal is the hazard whatever the number, and `--port 0` / `--port "$VAR"` stay out: those pick a port and
+# read it back (engine#1485). Four digits is the floor for the same reason the PORT= arm on main has one -- a two-digit
+# default like `PORT=${X:-80}` is a shell-idiom coincidence, not a port this suite allocates.
+BIND_RE = re.compile(r'freeport|free_port|bind\(\s*\("127\.0\.0\.1",\s*0\)\s*\)'
+                     r'|--port[ =]+"?[1-9]\d{3,4}\b'
+                     r'|[A-Z_]*PORT=[^:\n]*:-[1-9]\d{3,4}\b')
 
 
 def configured_tests(ctest, build_dir):
@@ -95,6 +99,14 @@ def lock_of(test):
             value = prop.get("value")
             return value[0] if isinstance(value, list) and value else value
     return None
+
+
+# Rows the widened literal-port test finds that are NOT a route-vs-route hazard. Exemptions live here rather than in
+# the regex, so each one is visible with its reason and the census fails if the reason stops applying.
+NOT_A_ROUTE_ROW = {
+    "install_coder_llm_ticketed": "binds 8090, the port the coder-llm unit uses; route rows allocate a free port or a "
+                                  "43xxx literal, so there is no window where two of them pick 8090",
+}
 
 
 class RoutePortLockTest(unittest.TestCase):
@@ -146,6 +158,14 @@ class RoutePortLockTest(unittest.TestCase):
         self.assertGreaterEqual(len(found), 5,
                                 "fewer route tests found than the suite has: " + ", ".join(sorted(found)))
 
+    def test_the_not_a_route_row_list_does_not_rot(self):
+        # An exemption is a claim that the row cannot collide with another route row; it has to keep being true or
+        # the exemption is just a hole. A name here that the census no longer finds means the reason changed.
+        found = self.census()
+        for name, why in sorted(NOT_A_ROUTE_ROW.items()):
+            self.assertIn(name, found, f"{name} is exempt ({why}) but the census no longer finds it: drop the entry")
+            self.assertTrue(why.strip(), f"{name} is exempt with no reason")
+
     def test_indirect_server_tests_hold_the_lock_too(self):
         # tools/bench.py starts its servers with its own free_port under this test's name, so the
         # script text has no bind for the census to find; #1070 still requires the lock, and this is
@@ -165,6 +185,8 @@ class RoutePortLockTest(unittest.TestCase):
     def test_every_route_test_holds_the_route_port_lock(self):
         missing = []
         for name, script in sorted(self.census().items()):
+            if name in NOT_A_ROUTE_ROW:
+                continue
             test = next(t for t in self.tests if t["name"] == name)
             if lock_of(test) != "route_ports":
                 missing.append(f"{name} ({os.path.basename(script)})")

@@ -439,7 +439,22 @@ while [ "$state" = queued ]; do
                     # take an NPU ticket minutes after the command timeout the rules say to stop for (measured
                     # 2026-11-15: the hold ran on a log whose newest line was an amdxdna command timeout).
                     _reset_re=$GPU_FAULT_RE
-                    _resets=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | grep -c .)
+                    # A BACKTRACE IS ONE EVENT, NOT ELEVEN (measured 2026-11-16 19:33:03Z): the driver's reset path logs a
+                    # WARN whose every stack frame reads `amdgpu_device_reinit_after_reset.cold+0x15c/0x1ef [amdgpu]`, and
+                    # `amdgpu.*reset` matches each frame. Counting lines reported "22 amdgpu/MES/amdxdna fault line(s)" for a
+                    # log holding two timestamps, and the count is what every lane reads when its ticket is released unheld.
+                    # The fix is to count EVENTS -- distinct log timestamps -- and print both numbers, so nothing is skipped:
+                    # an event whose only trace is the WARN backtrace (14:24:45 on this box has 113 frames and no page-fault
+                    # line at all) still counts as ONE and still refuses, which skipping frames would not (a skip made that
+                    # event count zero, i.e. it would have granted the ticket after a reset). Synthetic logs in the tests
+                    # carry no timestamp, so there a line is its own event and the old behaviour is reproduced exactly.
+                    _faults=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE")
+                    _reset_lines=$(printf '%s\n' "$_faults" | grep -c .)
+                    _resets=$(printf '%s\n' "$_faults" | awk '
+                        NF == 0 { next }   # an empty capture is ONE BLANK LINE to awk and would count as an event
+                        { if ($0 ~ /^[A-Z][a-z][a-z] +[0-9]+ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) k = $1" "$2" "$3; else k = $0
+                          if (!(k in seen)) { seen[k]; n++ } }
+                        END { printf "%d", n + 0 }')
                     if [ "${_resets:-0}" -gt 0 ]; then
                         rm -f "$TOKEN"; state=done
                         # HOW OLD is the newest one? "in the last 10 min" cannot tell a wedged device from another lane's
@@ -477,7 +492,9 @@ while [ "$state" = queued ]; do
                         # that it is what the driver last named, which is what a reader can check against the log.
                         _proc=$(printf '%s\n' "$_klog" | sed -n 's/.*Process \([^ ]*\) pid \([0-9]*\).*/\1 pid \2/p' | tail -1)
                         [ -n "$_proc" ] && _who=", and the driver last named ${_proc}"
-                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault line(s) in the last ${_reset_window} min${_age} - the newest is ${_what}${_first}${_who}. The ticket is released unheld; inspect the kernel log, then retry"
+                        _lines_note=""
+                        [ "${_reset_lines:-0}" != "${_resets:-0}" ] && _lines_note=" across ${_reset_lines} matching line(s) -- a reset backtrace matches on every frame, so the event count is the one to read"
+                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault event(s) in the last ${_reset_window} min${_lines_note}${_age} - the newest is ${_what}${_first}${_who}. The ticket is released unheld; inspect the kernel log, then retry"
                         printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -3
                         exit 78
                     fi

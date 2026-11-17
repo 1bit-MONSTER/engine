@@ -1443,6 +1443,12 @@ if(Python3_Interpreter_FOUND)
     # issue says anything. Runs the workflow's own block against a log of the 11-16 13:00Z shape.
     add_test(NAME census_watch_excerpt COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_excerpt_test.py)
     set_tests_properties(census_watch_excerpt PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # engine#2846: the alert job computed an `alert` output and nothing read it, so a QUIET scheduled run still filed
+    # a "coverage breach" whose excerpt held no finding. This runs the job's own `run:` block with a stub `gh` and
+    # asserts the three states: quiet files nothing, an alert files one coverage issue, a failed watch still files.
+    # Hermetic -- no network, no token, ~0.2 s -- and it fails on the version that shipped.
+    add_test(NAME census_alert_job COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_alert_job_test.py)
+    set_tests_properties(census_alert_job PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     # an installed package must find its libraries beside itself: the 2026-11-08 incident's rule, from
     # the installed side that no release gate can reach (engine #1411). Skips without patchelf/readelf.
     add_test(NAME installed_rpath COMMAND bash ${CMAKE_SOURCE_DIR}/tests/installed_rpath_test.sh)

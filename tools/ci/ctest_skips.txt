@@ -34,3 +34,4 @@ whisper_transcribe_jfk_lv3   # returns 77: no pack or wav (ONEBIT_TEST_WHISPER_P
 laya_finetune   # returns 77: needs torch + numpy, which the build container does not install (engine#1313 item 3)
 hip_f16_audit   # returns 77: needs a gpu-kernels checkout at the pin; the build job initialises llama.cpp only
 token_rate_floor_device   # returns 77: needs a device, a model and a gpu-hold ticket: it judges a real 1bit serve rate
+hrx_stale_expectations   # returns 77: the engine's pin predates the fork script (ddd415f4a, engine#2836); it goes live on the bump that carries it

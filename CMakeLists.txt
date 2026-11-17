@@ -586,6 +586,10 @@ add_test(NAME hrx_f16_narrowing_check COMMAND ${Python3_EXECUTABLE}
          ${CMAKE_SOURCE_DIR}/tools/ci/hrx_f16_narrowing.py --check --root ${CMAKE_SOURCE_DIR})
 set_tests_properties(hrx_f16_narrowing_check PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
+# engine#2805: three duplicate PRs on one issue in one night (#2778, #2795, #2779) and a human reviewer noticed each time.
+# The claim is in the title/body (`Fixes #N`), so the self-test is hermetic and the live run is a lane tool: `Refs #N` and a
+# bare mention are deliberately NOT claims, which is the arm below that keeps the detector from firing on every PR.
+add_python_test(tool_selftest_duplicate_fixes ${CMAKE_SOURCE_DIR}/tools/ci/duplicate_fixes_check.py --self-test)
 add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_agree.py --selftest)
 add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
 add_python_test(tool_selftest_spec_decode_acceptance ${CMAKE_SOURCE_DIR}/tools/spec_decode_acceptance.py --selftest)

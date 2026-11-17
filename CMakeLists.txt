@@ -545,6 +545,10 @@ add_python_test(branch_stale_check_test ${CMAKE_SOURCE_DIR}/tools/ci/branch_stal
 # the push. #2623 lost two commits that way (recovered by #2640) and #2605 lost one (recovered by
 # #2654). The row below is the hermetic one: the tool builds throwaway repos in a temp dir.
 add_python_test(merged_tail_check_self ${CMAKE_SOURCE_DIR}/tools/ci/merged_tail_check.py --self-test)
+# engine#2761: the known-failure ratchet for the fork's ctest suite. Its --self-test is hermetic
+# (it builds log fixtures in the process), so it is a default row like the one above. The ratchet's
+# LIVE use needs the fork built and is the ci.yml job the issue asks for, not this row.
+add_python_test(ctest_known_fail_self ${CMAKE_SOURCE_DIR}/tools/ci/ctest_known_fail.py --self-test)
 # The live scan needs the network and `gh`, so it is off by default rather than a flaky default row;
 # a scheduled workflow is its proper home, and that file needs the `workflow` token scope a lane does
 # not have. Turn it on with -DMERGED_TAIL_CHECK_LIVE=ON to run it locally or in a job that has gh.

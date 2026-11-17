@@ -334,6 +334,36 @@ def self_test():
     chk("holder: pid 4242" in block, "the block names the holder")
     chk("none" in render(summarize([]), []), "an empty capture says none, not blank")
 
+    # engine#2755 review, twice over: a REPLAY must not present today's /proc as the burst's holders, and a live
+    # capture must end at its window even when nothing else arrives.
+    import subprocess
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = os.path.join(tmp, "proc")
+        os.makedirs(os.path.join(proc, "4242", "fd"))
+        os.symlink(DEV_ACCEL + "/accel0", os.path.join(proc, "4242", "fd", "3"))
+        log = os.path.join(tmp, "burst.txt")
+        with open(log, "w") as fh:
+            fh.write("Nov 16 15:42:45 strixhalo kernel: amdxdna 0000:c6:00.1: AMD-Vi: Event logged "
+                     "[IO_PAGE_FAULT domain=0x0002 address=0x7fa381807000 flags=0x0077]\n")
+        out = subprocess.run([sys.executable, os.path.abspath(__file__), "--replay", log, "--proc-root", proc],
+                             capture_output=True, text=True)
+        chk("pid 4242" not in out.stdout and "not captured" in out.stdout,
+            "a replay does not snapshot today's /proc as the burst's holder: %s" % out.stdout[:120])
+
+        # The window closes with no further fault line: feed one burst down a pipe that stays open.
+        p2 = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--window", "0.5", "--proc-root", proc],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        p2.stdin.write("Nov 16 15:42:45 strixhalo kernel: amdxdna 0000:c6:00.1: AMD-Vi: Event logged "
+                       "[IO_PAGE_FAULT domain=0x0002 address=0x7fa381807000 flags=0x0077]\n")
+        p2.stdin.flush()
+        try:
+            p2.wait(timeout=10)
+            early = p2.returncode == 0
+        except subprocess.TimeoutExpired:
+            p2.kill()
+            early = False
+        chk(early, "a live capture ends at its window instead of waiting for another fault line")
+
     print("%s" % ("ok" if bad == 0 else "%d FAIL" % bad))
     return 1 if bad else 0
 
@@ -355,10 +385,30 @@ def main(argv):
         return self_test()
 
     events, snaps, total, stamped = [], [], 0, []
+    replay_note = [False]   # a replay cannot snapshot holders: /proc is today's
     src = None
     if a.replay:
         src = open(a.replay)
-    for line in src if src is not None else sys.stdin:
+    # engine#2755 review: the window must close even when NOTHING else arrives. Checking the clock at the top of
+    # the loop does not do that -- the read itself blocks -- so a live source is read through select() with the
+    # remaining time, and a quiet window ends the capture instead of sitting on stdin.
+    def live_lines(stream, until):
+        import select
+        while True:
+            left = None if until[0] is None else until[0] - time.time()
+            if left is not None and left <= 0:
+                return
+            ready, _, _ = select.select([stream], [], [], left)
+            if not ready:
+                return                       # the window closed with nothing more to read
+            line = stream.readline()
+            if not line:
+                return
+            yield line
+
+    until = [None]        # set to time()+window when the first fault is seen
+    source = src if src is not None else (sys.stdin if a.replay else live_lines(sys.stdin, until))
+    for line in source:
         total += 1
         ev = parse_fault(line, a.device)
         if ev is None:
@@ -371,10 +421,19 @@ def main(argv):
             # Taken on the FIRST fault, not after the burst: the client may be gone
             # by the time the window closes, and a snapshot of nobody is the
             # reading this tool exists to avoid making the default.
-            for pid in holders(a.proc_root, a.dev_prefix, self_pid=os.getpid()):
-                d = describe(pid, a.proc_root)
-                snaps.append((pid, *(d if d else ("gone", ""))))
+            #
+            # engine#2755 review: NOT in a replay. `/proc` is today's, and the burst is
+            # whatever the file recorded, so a snapshot taken here would name the wrong
+            # process with full confidence -- the exact mis-attribution this tool exists
+            # to prevent. The block says which it is instead of leaving the reader to guess.
+            if a.replay is None:
+                for pid in holders(a.proc_root, a.dev_prefix, self_pid=os.getpid()):
+                    d = describe(pid, a.proc_root)
+                    snaps.append((pid, *(d if d else ("gone", ""))))
+            else:
+                replay_note[0] = True
             deadline = time.time() + a.window
+            until[0] = deadline
         elif a.replay is None and time.time() > deadline:
             break
     if src is not None:
@@ -402,8 +461,15 @@ def main(argv):
         print("%d burst(s); access counts %s%s"
               % (len(bursts), sorted(counts),
                  " -- all equal" if len(set(counts)) == 1 else " -- NOT all equal"))
+        if replay_note[0]:
+            print("  holders: not captured (--replay: /proc is today's, so a snapshot here would name the "
+                  "wrong process for a burst this file recorded)")
         return 0
-    print(render(summarize(events), snaps))
+    for line in render(summarize(events), snaps).splitlines():
+        print(line)
+    if replay_note[0]:
+        print("  holder: not captured (--replay: /proc is today's, so a snapshot here would name the "
+              "wrong process for a burst this file recorded)")
     return 0
 
 

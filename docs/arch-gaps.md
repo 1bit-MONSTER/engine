@@ -1255,20 +1255,3 @@ The one `!! UNCOVERED` line of the 2026-11-14 watcher run. Read from the repo's 
 * **Real support needs**: the architecture itself (attention/FFN/embedding
   layout) plus a converter; nothing to map until that exists.
 
-## 2026-11-17: `SimulatedForTestingClass` — reviewed, not a family (engine#2814)
-
-The `!! UNCOVERED` line of the 2026-11-17 watcher run was a single model, `example/simulated`. That is Hugging
-Face's **own simulated model**, published under the `example/` organisation for testing Transformers tooling — the
-class name says what it is, and there is no pretrained weight set, no `config.json` a converter could map, and no
-family behind it. A registry entry here would be a claim that the engine serves a model only HF's test suite
-uploads.
-
-* **Not an alias of anything**: there is nothing to be an alias *of* — no published checkpoints, no
-  `architectures` list beyond the synthetic class.
-* **Why this is a review answer and not a mapping**: the census's job is to find families worth serving; the
-  answer for a test fixture is "no", recorded once so the next daily run reports the row instead of alerting on it
-  (`"watch": "report"` in `registry/significant.json`), and `tools/registry_build.py --check-gaps` fails if it ever
-  becomes mapped without a reason here.
-* **The general rule it illustrates**: the watcher alerts on a class it cannot place, and the two wrong reactions
-  are both cheap and both costly — mapping a class nobody asked to serve, or silencing the alert for a class that
-  is a real gap. This one is the first, so it is documented rather than mapped.

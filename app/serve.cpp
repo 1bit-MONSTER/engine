@@ -1828,18 +1828,26 @@ static void warm_backend(int port, const std::string& device, bool speculative) 
     httplib::Client c("127.0.0.1", port);
     c.set_connection_timeout(5);
     c.set_read_timeout(600);
+    int failed = 0, sent = 0;
     for (const auto & w : warmup_requests(speculative)) {
+        ++sent;
         const std::string path = w["path"].get<std::string>();
         const auto t0 = std::chrono::steady_clock::now();
         const auto r  = c.Post(path, w["body"].dump(), "application/json");
         const long ms = (long) std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - t0).count();
         if (!r || r->status != 200) {
+            ++failed;
             std::fprintf(stderr, "1bit serve: warm-up request %s on port %d failed (%d)\n", path.c_str(), port,
                          r ? r->status : -1);
         } else {
             std::fprintf(stderr, "1bit serve: warm-up request %s on port %d took %ld ms\n", path.c_str(), port, ms);
         }
+    }
+    if (failed) {
+        std::fprintf(stderr, "1bit serve: warm-up INCOMPLETE -- %d of %d request(s) failed, so the shape each one "
+                             "warms is paid by the first client request instead; check that every path in "
+                             "warmup_requests() is a route this server registers\n", failed, sent);
     }
 }
 
@@ -2068,6 +2076,10 @@ int serve_models(const Options& o) {
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
+    // warmup_requests() posts the short and spec warm-ups to "/completion" with llama.cpp's own field names
+    // (n_predict, cache_prompt). This server registered /v1/completions only, so both got a 404 -- one stderr
+    // line each and nothing warmed -- while docs/serve.md promises the 16-token /completion warm-up.
+    srv.Post("/completion", post);
 
     // --port 0 means "whatever the kernel gives me", and this is the only place that knows which port that was. cpp-httplib's
     // bind_to_port() answers bool; the port comes back from bind_to_any_port(), which is the same bind_internal(host, 0, ...)
@@ -2644,6 +2656,10 @@ int serve_child(const Options& given) {
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
+    // warmup_requests() posts the short and spec warm-ups to "/completion" with llama.cpp's own field names
+    // (n_predict, cache_prompt). This server registered /v1/completions only, so both got a 404 -- one stderr
+    // line each and nothing warmed -- while docs/serve.md promises the 16-token /completion warm-up.
+    srv.Post("/completion", post);
     // The rest of llama-server's API, for the devices that run llama-server (Lemonade's
     // llamacpp backend, which the onebit recipe inherits, forwards these to us). They go to
     // the first backend; the NPU answers 501.

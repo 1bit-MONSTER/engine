@@ -99,7 +99,7 @@ print(f\"{c} tokens\")" >/dev/null 2>&1
       t0=$(date +%s.%N); body=$(curl -s -m 300 "http://127.0.0.1:$3/v1/chat/completions" -H "content-type: application/json" \
         -d "{\"model\":\"p\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a short paragraph about rivers.\"}],\"max_tokens\":$5,\"temperature\":0}"); t1=$(date +%s.%N)
       case "$body" in *'"error"'*) echo "SKIPPED: server returned an error on the measured run $_r"; exit 77;; esac
-      printf '%s %s\n' "$(printf %s "$body" | python3 -c "
+      printf "%s %s\n" "$(printf %s "$body" | python3 -c "
 import json,sys
 d=json.load(sys.stdin); print((d.get(\"usage\") or {}).get(\"completion_tokens\") or 0)")" "$(echo "$t1 - $t0" | bc)" >> "$7.raw"
       _r=$(( _r + 1 ))

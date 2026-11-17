@@ -85,7 +85,12 @@ SUMMARY = re.compile(r"^\s*(\d+)% tests passed, (\d+) tests failed out of (\d+)"
 # A comment runs from a `#` at the start of the line too, not only from one preceded by whitespace.
 # The first version required \s+ and so parsed every column-0 `#` header line as a test name; running
 # the real workflow step shape against the real baseline reported the whole licence block as
-# "now passing, remove from". `ctest_skips.py` has the same regex and the same latent defect.
+# "now passing, remove from".
+# engine#2825 review (mine): this line used to add "`ctest_skips.py` has the same regex and the same latent
+# defect", which is not true of the code as it stands -- that parser strips the line and tests startswith("#"),
+# so a column-0 licence block is handled there. Measured: baseline() over a file whose first two lines are
+# `# Copyright` and `# SPDX-...` returns only the real entry. A note that sends the next reader hunting a bug
+# that is not there costs more than no note.
 COMMENT = re.compile(r"^\s*#.*$|\s+#.*$")
 # ctest colourises its summary when the log is captured from a terminal, so the byte before "5%" can be
 # an ANSI SGR sequence. `^\s*` cannot match that, and the first CI run of this tool answered "cannot

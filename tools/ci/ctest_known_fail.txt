@@ -37,3 +37,5 @@ test-hrx-fa-transposed-value           # Subprocess aborted
 test-hrx-mul-mat-id-k32                # Subprocess aborted
 test-hrx-fa-masked-v                   # Failed
 test-eval-callback                     # SEGFAULT
+test-hrx-decode-stride                 # Subprocess aborted -- measured in hrx-build 2026-11-17 (37 rows, 20 pass); the other 10 supports_op reds there PASS, they only red out under GGML_HRX_GTT_RESERVE_MB=1024
+hrx-backend-test                       # Failed -- hrx; measured in hrx-build 2026-11-17 (the baseline named test-hrx-*-loom but not this one)

@@ -1050,6 +1050,10 @@ endif()
 # (RFC #213 stage 3): what HRX does not run, Lemonade serves with its own llamacpp backends.
 option(ONEBIT_HRX "Build the HRX llama-server and wire it into Lemonade" OFF)
 set(ONEBIT_GPU_PRIVATE "" CACHE PATH "A gpu-kernels checkout whose addons/hip-hrx HIP kernels are built into the HRX llama.cpp (needs ONEBIT_HRX)")
+# engine#2836: the fork registers 43 `test-hrx-*` ctest rows and nothing built or ran them, because the
+# ExternalProject built three targets by name. OFF by default -- a lane build must not pay for 43 extra
+# binaries -- and hrx-build.yml turns it on for the one job that runs them.
+option(ONEBIT_HRX_BUILD_TESTS "Configure the HRX llama.cpp with LLAMA_BUILD_TESTS, so its test-hrx-* rows exist" OFF)
 if(ONEBIT_GPU_PRIVATE AND NOT ONEBIT_HRX)
     message(FATAL_ERROR "ONEBIT_GPU_PRIVATE needs ONEBIT_HRX=ON")
 endif()

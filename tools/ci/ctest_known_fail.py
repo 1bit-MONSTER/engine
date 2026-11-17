@@ -72,7 +72,11 @@ TOOL_ROOT = _tool_root()
 #   "\t101 - test-hrx-mul-mat-id-k32 (Subprocess aborted)"
 # A name can appear in the per-test progress lines too ("***Failed"), but those carry no reason and
 # are a strictly smaller set, so the FAILED block alone is both sufficient and the honest source.
-FAILED_LINE = re.compile(r"^\s*\d+ - (\S+) \((Failed|SEGFAULT|Subprocess aborted|Timeout|[A-Z][^)]*)\)\s*$",
+# engine#2836: ctest pads a LABELS column after the parens (`\t 85 - test-hrx-buffer (Failed)     hrx`), and
+# requiring end-of-line after `)` dropped exactly those rows -- the count then disagreed with the summary and
+# every labelled failure read as a truncated log ("cannot tell", rc 2). A label can be several words
+# (`main behavior backend`), so everything after the parens is ignored, not one token.
+FAILED_LINE = re.compile(r"^\s*\d+ - (\S+) \((Failed|SEGFAULT|Subprocess aborted|Timeout|[A-Z][^)]*)\)(?:[ \t]+.*)?$",
                          re.MULTILINE)
 # engine#2825 review (mine): NO re.MULTILINE meant `^` matched only at position 0, and a real ctest log puts
 # its summary at the END, after the FAILED block -- so summary() returned None for every real log and check()
@@ -112,8 +116,12 @@ def failed(log_text: str):
     log_text = ANSI.sub("", log_text)
     out = {}
     for name, reason in FAILED_LINE.findall(log_text):
-        if reason.split()[0].lower() in ("skipped", "not", "disabled"):
+        if reason.split()[0].lower() in ("skipped", "disabled"):
             continue          # a row that did not run is not a failure and must never enter the ratchet
+        # `Not Run` is NOT in that list, on purpose (engine#2836): ctest puts it in the FAILED block and COUNTS it
+        # in "M tests failed", so dropping it made count != len(names) and every log with an unbuilt binary read
+        # as truncated -- "cannot tell", rc 2, the failure this tool exists to prevent. The baseline carries
+        # `test-hrx-host-resident # Not Run` for exactly this reason: an unbuilt row is a failure to fix, not a skip.
         out[name] = reason
     return out
 

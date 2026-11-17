@@ -49,6 +49,9 @@ limitations under the License.""".split("\n")
 # Comment style by file name pattern.
 LINE_STYLES = [
     (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc", "*.rs", "*.hip"), "//"),
+    # engine#2819: an awk program is a '#'-comment script like a shell one; without this the check refuses to check it
+    # ("no comment style known") and fails the build for a file whose notice is already correct.
+    (("*.awk",), "#"),
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cff", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
       ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment", "*.example",
       "*.service", "*.timer", "*.conf", "*.env", "lemonade-hrx", "packages-extra", "05onboard-data", "10lemonade", "zz-onboard-ports", "20onboard-ssh",

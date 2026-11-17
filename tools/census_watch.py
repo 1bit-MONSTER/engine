@@ -114,6 +114,14 @@ DEFAULT_LIMIT = 120
 DEFAULT_STATE = os.path.join(os.path.expanduser("~"), ".1bit", "census-watch-state.json")
 MAX_SEEN = 5000  # cap state growth; oldest dropped
 REMOTE_CODE_SPREAD = 3  # uploaders before a custom-code class alerts
+
+# engine#2814: Hugging Face carries test fixtures -- `example/simulated` declares the architecture class
+# `SimulatedForTestingClass` -- and the daily watch reported one as `!! UNCOVERED (new class)`, i.e. as a model family
+# the engine should serve. A registry entry is a claim that the engine runs an architecture (#2427); a fixture is a
+# claim that somebody's CI runs. The org and the class name are the two tells, and a fixture is REPORTED (so it is not
+# a silent drop) but never alerts and never makes the run exit 1.
+TEST_FIXTURE_ORGS = ("example", "hf-internal-testing")
+TEST_FIXTURE_CLASS_RE = re.compile(r"(ForTesting|TestModel|DummyModel)", re.I)
 _NEXT = re.compile(r'<([^>]+)>;\s*rel="next"')
 
 # FastFlowLM's HF org and runtime releases (engine#588). The org is small (about 60 repos),
@@ -198,6 +206,7 @@ NON_TRANSFORMERS_LIBRARIES = frozenset((
 _OWN_MODELING = re.compile(r"^modeling_[A-Za-z0-9_]+\.py$")
 
 COVERED, UNCOVERED, UNVERIFIABLE, DERIVATIVE = "covered", "uncovered", "unverifiable", "derivative"
+TEST_FIXTURE = "test-fixture"
 
 
 def hf_get_page(url, tries=4):
@@ -271,6 +280,19 @@ def is_remote_code(model):
     return False
 
 
+def is_test_fixture(model, arch):
+    """Is this HF record a test fixture rather than a model family? (engine#2814)
+
+    The CLASS NAME is the authority, because the class name is what the alert is about: `SimulatedForTestingClass` is
+    not a family anyone can serve, and it was the thing reported.
+
+    The uploader org is NOT enough on its own, and an arm proves it: `example/nimbus` declaring `NimbusMindForCausalLM`
+    is a real coverage breach that happens to come from a fixture org, and suppressing it would let the filter swallow
+    the whole alert. So the org is only used to annotate the row -- the fixture and the alert are decided by the name.
+    """
+    return bool(TEST_FIXTURE_CLASS_RE.search(arch or ""))
+
+
 def is_derivative(model):
     tags = model.get("tags") or []
     return (model.get("library_name") == "peft"
@@ -337,9 +359,10 @@ def classify(models, archs, sig, previously_seen=()):
 
     `previously_seen` suppresses repeat reporting of unverifiable models.
     """
-    out = {COVERED: [], UNCOVERED: [], UNVERIFIABLE: [], DERIVATIVE: []}
+    out = {COVERED: [], UNCOVERED: [], UNVERIFIABLE: [], DERIVATIVE: [], TEST_FIXTURE: []}
     reasons = {}  # model id -> why it could not be classified
     classes = {}  # uncovered class -> [model ids]
+    fixtures = {}  # test-fixture class -> [model ids] (reported, never an alert)
     native = set()  # uncovered classes with at least one model that needs no custom code
     for m in models:
         mid = m.get("id", "")
@@ -356,11 +379,16 @@ def classify(models, archs, sig, previously_seen=()):
         if entry and entry.get("backends"):
             out[COVERED].append(mid)
             continue
+        if is_test_fixture(m, arch):
+            out[TEST_FIXTURE].append(mid)
+            fixtures.setdefault(arch, []).append(mid)
+            continue
         out[UNCOVERED].append(mid)
         classes.setdefault(arch, []).append(mid)
         if not is_remote_code(m):
             native.add(arch)
     out["classes"] = classes
+    out["fixtures"] = fixtures
     out["reasons"] = reasons
     # reviewed classes marked report-only (`"watch": "report"`): reported, no alert
     out["reviewed_report"] = sorted(c for c in classes if c in sig and sig[c].get("watch") == "report")
@@ -914,7 +942,9 @@ def exit_code(arch_rc, flm_rc, flm_ok, support_rc=0):
 
 def report(models, res, previously_seen):
     """Print the run's summary and return the exit code (1 when a class is uncovered)."""
-    in_scope = len(res[COVERED]) + len(res[UNCOVERED])
+    # engine#2814: fixtures have an architecture too, so they belong in the denominator -- otherwise the line reads
+    # "1 checked, 0 with an architecture" while the loop below reports a class for that one model.
+    in_scope = len(res[COVERED]) + len(res[UNCOVERED]) + len(res.get(TEST_FIXTURE, []))
     print(f"census-watch: {len(models)} newest text-generation models checked, "
           f"{in_scope} with an architecture, {len(res[COVERED])} mapped, "
           f"{len(res['classes'])} uncovered class(es), "
@@ -925,6 +955,13 @@ def report(models, res, previously_seen):
               f"({len(previously_seen)} models already classified)")
     reviewed_report = set(res.get("reviewed_report", ()))
     quiet = set(res.get("remote_code", ())) | reviewed_report
+    # engine#2814: reported, but below the alerts and never in `classes` -- the exit code below only looks at
+    # `classes`, so a fixture cannot turn the run red.
+    for cls, ids in sorted(res.get("fixtures", {}).items(), key=lambda kv: kv[0]):
+        org_note = " (an HF fixture org)" if ids[0].split("/")[0].lower() in TEST_FIXTURE_ORGS else ""
+        print(f"  . TEST-FIXTURE {cls}: {len(ids)} model(s), e.g. {ids[0]}{org_note}")
+        print(f"     -> an HF test fixture rather than a family to map (engine#2814): reported for the record, "
+              f"never an alert and never the run's exit code")
     for cls, ids in sorted(res["classes"].items(), key=lambda kv: (-len(kv[1]), kv[0])):
         if cls in reviewed_report:
             print(f"  . REVIEWED {cls}: {len(ids)} model(s), e.g. {ids[0]}")

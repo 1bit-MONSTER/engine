@@ -1222,4 +1222,22 @@ check("a class nobody registers is upstream-only", v["MicroLlamaForCausalLM"] ==
 v = cw.classify_uncovered({"NimbusMindForCausalLM"}, None)
 check("an unavailable converter yields 'unknown', never a guess", v["NimbusMindForCausalLM"] == "unknown")
 
+# engine#2814: an HF test fixture is not a family to map. `example/simulated` declares
+# `SimulatedForTestingClass`, and the daily watch reported it as `!! UNCOVERED (new class)` -- a coverage breach that no
+# registry entry could ever fix. Both tells are armed, and so is the control: a real unmapped class still alerts.
+rc, res = rc_of([model("example/simulated", "SimulatedForTestingClass")])
+check("a fixture's class does not alert (exit 0)", rc == 0 and res[cw.UNCOVERED] == [])
+check("…and it is reported, not dropped", res[cw.TEST_FIXTURE] == ["example/simulated"])
+rc, text = text_of([model("example/simulated", "SimulatedForTestingClass")])
+check("…and the report says TEST-FIXTURE beside the class name", "TEST-FIXTURE SimulatedForTestingClass" in text)
+check("…and never prints it as an alert", "!! UNCOVERED" not in text)
+
+# the second tell proves itself: the class name alone, from a real org
+rc, res = rc_of([model("someone/real-org", "DummyModelForCausalLM")])
+check("a class named for testing does not alert, whatever the org", rc == 0 and res[cw.UNCOVERED] == [])
+
+# control: the same shape without the tell is still the alert, so the filter cannot swallow real coverage
+rc, res = rc_of([model("example/nimbus", "NimbusMindForCausalLM")])
+check("control: a real unmapped class still alerts at exit 1", rc == 1 and res[cw.UNCOVERED] == ["example/nimbus"])
+
 print("\nall checks passed")

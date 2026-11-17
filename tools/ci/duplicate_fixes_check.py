@@ -31,6 +31,11 @@ open PRs with the PRs' age and draft state, so the reader can tell "one is a dra
 slot" from "two lanes are both working".
 
 A LIMIT, measured on the fleet: a PR that *works* an issue without a closing keyword is invisible here.
+`Refs #N` is the keyword lanes actually use for that (a PR fixing part of an issue must not close it), so two open PRs
+can both work #N and this prints "no open issue is claimed by more than one open PR" -- measured on #2839/#2840, both
+`Refs #2836`, both touching CMakeLists.txt (engine#2842). The widening is gated rather than blanket: a `Refs` claim
+counts ONLY when the two PRs touch an overlapping file, because the false claims that killed a naive widening (see
+CLAIM) were all cases where the mention had nothing to do with the diff.
 #2804 worked #2803 with a mention (`engine#2803, measured 2026-11-16 …`) while #2805 claimed it in the
 title, and both were open; this tool reported nothing. The narrowing that causes it is deliberate (see
 CLAIM), and the issue-side join (`gh api repos/O/R/issues/N/timeline`) returns both of those PRs *and*
@@ -61,6 +66,12 @@ PAGE = 100
 #     the real texts of tonight's seven PRs rather than over my own fixtures, which is why that check is in the PR body.
 CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#(\d+)', re.I)
 
+# A *reference* is a weaker claim than a closing keyword: `Refs #N` says "this PR works on N" without promising to close
+# it, and it is what a PR that fixes PART of an issue writes -- the correct convention, and therefore the common case.
+# It is never enough on its own (see duplicates()): it only counts when two PRs that name the same issue also touch an
+# overlapping file, which is the condition that separates "two lanes on one job" from "a mention in passing".
+REFS = re.compile(r'\b(?:refs?|ref)\b\s*:?\s*#(\d+)', re.I)
+
 
 # A claim written INSIDE code is documentation, not a claim. The PRs most likely to contain `Fixes #12` are the ones
 # explaining how to write one -- #2809's own body pastes the syntax it looks for -- so without this the detector flags
@@ -75,6 +86,12 @@ def claims(text):
     return sorted({int(n) for n in CLAIM.findall(text)})
 
 
+def references(text):
+    """The issue numbers a PR title+body *refers* to (`Refs #N`) and does not claim to close."""
+    text = SPAN.sub(" ", FENCE.sub(" ", text or ""))
+    return sorted({int(n) for n in REFS.findall(text)} - {int(n) for n in CLAIM.findall(text)})
+
+
 def duplicates(prs):
     """[(issue, [pr, ...])] for every issue claimed by two or more of `prs`, oldest PR first.
 
@@ -82,15 +99,41 @@ def duplicates(prs):
     that claims an issue is a lane working on it, which is the thing the second lane cannot see.
     """
     by_issue = {}
+    closing = set()          # (issue, pr number) pairs claimed with a closing keyword
     for pr in prs:
-        for issue in claims(f"{pr.get('title') or ''}\n{pr.get('body') or ''}"):
+        text = f"{pr.get('title') or ''}\n{pr.get('body') or ''}"
+        for issue in claims(text):
+            by_issue.setdefault(issue, []).append(pr)
+            closing.add((issue, pr.get('number')))
+        # a reference alone is not a claim; it joins the group only if it overlaps a claim already there. The second
+        # pass below decides that, because overlap needs both PRs' file lists.
+        for issue in references(text):
             by_issue.setdefault(issue, []).append(pr)
     out = []
     for issue in sorted(by_issue):
         group = sorted(by_issue[issue], key=lambda p: p.get('number') or 0)
-        if len(group) > 1:
+        if len(group) < 2:
+            continue
+        closers = [p for p in group if (issue, p.get('number')) in closing]
+        # Two PRs that both promise to close the issue is the original, unambiguous finding.
+        if len(closers) > 1:
+            out.append((issue, group))
+            continue
+        # Otherwise the issue is worked by references. That is a finding only when a pair's DIFFS overlap: `Refs #N` is
+        # also how a PR cites an issue it merely relates to, and the false claims that killed a blanket widening were
+        # all of that kind. With one closer, it must overlap the closer; with none, any overlapping pair will do.
+        pairs = [(a, b) for i, a in enumerate(group) for b in group[i + 1:]]
+        if any(overlap(a.get('files') or [], b.get('files') or []) for a, b in pairs):
             out.append((issue, group))
     return out
+
+
+def overlap(a, b):
+    """True when the two file lists share a path. Empty lists never overlap: unknown is not a claim of sameness."""
+    if not a or not b:
+        return False
+    sb = set(b)
+    return any(f in sb for f in a)
 
 
 def describe(issue, group):
@@ -148,6 +191,18 @@ def open_prs(repo):
     return prs
 
 
+def pr_files(repo, number, cache):
+    """The PR's changed paths, fetched once. Network, so only called for PRs a reference group actually needs."""
+    key = (repo, number)
+    if key not in cache:
+        raw = gh(f"repos/{OWNER}/{repo}/pulls/{number}/files?per_page={PAGE}", paginate=True)
+        try:
+            cache[key] = [f.get('filename') or '' for f in json.loads(raw or '[]')]
+        except json.JSONDecodeError:
+            cache[key] = []
+    return cache[key]
+
+
 def self_test():
     fails = 0
 
@@ -165,6 +220,16 @@ def self_test():
     ok(claims("Refs #2779 (the layer its fix does not cover), #2728 (where the defect came from)") == [],
        "a NOUN 'fix' followed by a distant #N is not a claim -- #2793's real body, which the 24-character gap did fire on")
     ok(claims("") == [] and claims(None) == [], "empty and None bodies claim nothing")
+
+    # engine#2842: `Refs #N` is the keyword a PR that fixes PART of an issue writes, so it is the common case and the
+    # tool used to miss it. A reference is never a claim alone -- it joins a group only when the diff overlaps.
+    ok(references("Refs #2836 (the row half)") == [2836], "Refs #N is read as a reference")
+    ok(references("Fixes #2836 and Refs #2837") == [2837], "an issue that is claimed to close is not also a reference")
+    ok(references("see #2836 for context") == [], "a bare mention is not a reference")
+    ok(overlap(['a.c', 'b.c'], ['b.c', 'c.c']) is True, "two PRs touching one shared path overlap")
+    ok(overlap(['a.c'], ['b.c']) is False, "two PRs touching disjoint paths do not")
+    ok(overlap([], ['b.c']) is False and overlap(['a.c'], []) is False,
+       "an unknown file list never overlaps: unknown is not a claim of sameness")
     ok(claims("use `Fixes #12` in your PR body") == [],
        "a claim inside an inline code span is documentation, not a claim")
     ok(claims("```\nFixes #12\n```") == [], "a claim inside a fenced block is documentation too")
@@ -222,6 +287,18 @@ def main(argv):
             print(f"duplicate_fixes: cannot tell for {repo}: {e}", file=sys.stderr)
             failed += 1
             continue
+        # A PR that only *refers* to an issue needs its file list to be judged, so fetch files for the PRs that sit in
+        # a reference group of two or more. That is the cheap direction: a repo with no such group costs no requests.
+        wanted = {}
+        for pr in prs:
+            for issue in references(f"{pr.get('title') or ''}\n{pr.get('body') or ''}"):
+                wanted.setdefault(issue, []).append(pr)
+        cache = {}
+        for issue, group in wanted.items():
+            if len(group) < 2:
+                continue
+            for pr in group:
+                pr['files'] = pr_files(repo, pr['number'], cache)
         for issue, group in duplicates(prs):
             found.append({'repo': repo, 'issue': issue,
                           'prs': [{'number': p['number'], 'title': p['title'], 'draft': p['draft'],

@@ -29,6 +29,11 @@ say so and skip — never pass, never fail for want of a file — and the messag
 turns it on. At `ddd415f4a` or later the file is there and the row simply runs; that is the state this
 engine is in today, so the skip path is for older checkouts, not for the merged tree.
 
+A skip path must also leave nothing behind: the self-test writes only inside a TemporaryDirectory, and
+nothing here touches the tree it is reading. (A skip that creates files is the same defect as #2830,
+where a self-test wrote into the artefact a human reads; a reader who sees a new file cannot tell
+whether the check produced it or found it.)
+
 Usage:
     stale_expectations_check.py --root <engine checkout>   # rc 0 ok, 1 the fork check failed, 77 the tool is not at this pin
     stale_expectations_check.py --self-test

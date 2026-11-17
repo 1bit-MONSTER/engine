@@ -304,6 +304,24 @@ the model ticketed, a memory window no longer needs to stop it: it is not reside
 Stopping it would only drop its queued ticket. That happened on 2026-11-15 at 10:00Z, when a window stopped the
 just-switched unit and its place in the queue was lost.
 
+**How long a measurement ticket must be willing to wait: `-w` > the holder's remaining hold, not `-w 600`.** The ticketed unit holds with
+`-t 25` and re-queues with `-w 86400`, so a ticket queued *after* it waits out the remainder of a 25-minute hold before
+it becomes head. Measured 2026-11-16: two tickets on this box expired unseen, one at `-w 600` and one at `-w 120`,
+while the holder was mid-hold — and the failure line looks identical to a jammed queue (`queue never came round …
+(head: …coder-llm, token: gpu-hold coder-llm pid …)`), so the honest reading is *"I did not wait long enough"*, not
+*"the queue is broken"*. Queue order is fair: the ticket keeps its place, and the holder's *re-queued* ticket takes a
+later id, so waiting out one hold is enough. **Do not stop the unit to shorten the wait** — it is ticketed, stopping it
+only drops its queued place (2026-11-15 10:00Z).
+
+**It is not only `coder-llm`.** The same arithmetic applies to every long holder, and the worst one is **`hw-gate`**, whose job timeout is **150 minutes** (`hw-gate.yml`'s `timeout-minutes: 150` — the 5-minute one is `pin_moved`, the hosted diff job that never takes the token) -- measured 2026-11-16 20:30Z, a `-w 300` sweep expired behind `hw-gate_run_43983474842_pid_1295035` which had taken the token ten minutes earlier and was still inside its own timeout. The rule is therefore about the **holder**, not about a particular service: read the token's start time, subtract from the holder's timeout, and wait at least that long — or come back later. `-w 600` is shorter than most holds on this box and should be treated as an expired ticket, not a finding -- and behind `hw-gate` the number to beat is up to **9000 s**, not the 1800 that covers `coder-llm`.
+
+**What waits actually look like, from one night's tickets.** Measured 2026-11-16/17 on this box: five tickets that
+reached the device took the token after **686, 734, 910, 1294 and 1840 s**, while three shorter ones **expired** at 120,
+300 and 600 s with a holder mid-hold — including one behind an `hw-gate` run, which is unremarkable once the holder's
+bound is **150 minutes**. The longest wait logged anywhere in that night's task outputs was **10270 s (2 h 51 m)**, so a
+wait of tens of minutes is ordinary and a wait approaching three hours is still not a hang. Size `-w` from the holder's
+own timeout plus a margin, and treat an expiry as *"my number was too small"* until the queue has been inspected.
+
 **Read the window's end line before believing a restart failed.** `scripts/window-run.sh` ends every window with one
 `end` line in `~/briefs/WINDOWS.log`, and the state it names decides whether anything is wrong. Four tokens, four
 meanings — only the last is a fault:

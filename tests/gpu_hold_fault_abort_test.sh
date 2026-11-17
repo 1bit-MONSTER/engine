@@ -95,7 +95,8 @@ take_run amdgpu "kernel: amdgpu 0000:c5:00.0: [drm] *ERROR* amdgpu: GPU reset be
 # <n>" line, two lines above the reset, named the other lane's suite. Measured on this box: two of three MODE2 resets in one
 # night were that suite, and the driver writes the process name WITHOUT any reset keyword, so it is not in the matched set.
 q=$scratch/tqclass; mkdir -p "$q"; rm -f "$scratch/TTOKENclass"; : > "$scratch/tklogclass"
-printf '%s\n' "kernel: amdgpu 0000:c5:00.0:  Process hrx-ops-test pid 186654 thread hrx-ops-test pid 186654" \
+printf '%s\n' "kernel: amdgpu 0000:c5:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:9 pasid:6121)" \
+              "kernel: amdgpu 0000:c5:00.0:  Process hrx-ops-test pid 186654 thread hrx-ops-test pid 186654" \
               "kernel: amdgpu 0000:c5:00.0: MES failed to respond to msg=REMOVE_QUEUE" \
               "kernel: amdgpu 0000:c5:00.0: GPU reset(2) succeeded!" > "$scratch/tklogclass"
 env GPU_HOLD_KLOG_FILE="$scratch/tklogclass" GPU_QUEUE_DIR="$q" GPU_TOKEN_FILE="$scratch/TTOKENclass" \
@@ -109,6 +110,10 @@ grep -q "the newest is a GPU reset/hang" "$scratch/tlogclass" \
     || { echo "FAIL take-time class: the refusal does not name the class of the newest line"; fail=1; }
 grep -q "the driver last named hrx-ops-test pid 186654" "$scratch/tlogclass" \
     || { echo "FAIL take-time class: the refusal does not name the process the driver named"; fail=1; }
+# ... and WHAT that process did: the newest line in every window of this boot is the symptom ("GPU reset(N) succeeded!"), so the
+# window's first compute marker (a gfxhub page fault here) is the datum a reader needs (review ask on #2805).
+grep -q "the window's first compute marker is a gfxhub page fault" "$scratch/tlogclass" \
+    || { echo "FAIL take-time class: the refusal does not quote the window's first compute marker"; fail=1; }
 
 # the NPU spelling: this is the line the rules say to stop for, and npu-hold has no other take-time check
 take_run npu "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* command timeout: opcode 0x2"

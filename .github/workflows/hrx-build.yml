@@ -145,6 +145,17 @@ jobs:
       # A red suite would fail this job on arrival, so the ratchet is what makes it shippable:
       # tools/ci/ctest_known_fail.txt names the failures we have, and a NEW one fails the job. A name
       # that starts passing is reported in the log so the list shrinks instead of rotting.
+      # The suite's rows are `add_test` entries whose binaries the `onebit` target does not build, so
+      # ctest reports all 112 as `(Not Run)` for a missing executable -- and a run where nothing
+      # executed cannot be compared with a baseline, which is why the ratchet answered `cannot tell`
+      # the first time this step was tried. The binaries are the real cost of engine#2761 and this
+      # build step is where it gets paid; the run's duration is the measurement.
+      - name: Build the fork's test binaries
+        if: steps.scope.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          scripts/mem-guard.sh --term 12 ~/lb/thermal-run.sh cmake --build "$HRX_BUILD" -j 4
+
       - name: The fork's own ctest suite, against the known-failure baseline
         if: steps.scope.outputs.build == 'true'
         run: |

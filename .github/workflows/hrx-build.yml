@@ -111,7 +111,7 @@ jobs:
           set -euo pipefail
           ~/lb/thermal-run.sh cmake -S . -B "$HRX_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DONEBIT_HRX=ON
+            -DONEBIT_HRX=ON -DONEBIT_HRX_BUILD_TESTS=ON
 
       - name: Configure only (test registration, no compile)
         if: steps.scope.outputs.build != 'true'
@@ -134,3 +134,31 @@ jobs:
           # the build must have produced the HRX backend and the server onebit runs
           ls -l "$HRX_BUILD"/hrx/llama/bin/llama-server
           find "$HRX_BUILD"/hrx/llama -name 'libggml-hrx.so*' -print -quit | grep .
+
+      - name: Run the fork's own ctest rows
+        if: steps.scope.outputs.build == 'true'
+        # engine#2836: 37 `test-hrx-*` rows are registered in the fork's tests/CMakeLists.txt inside
+        # `if (TARGET ggml-hrx)`, and until now nothing built or ran one of them -- the ExternalProject builds
+        # three binaries by name. ONEBIT_HRX_BUILD_TESTS=ON above is what registers them; this builds the
+        # binaries and runs the row that already exists for them (`fork_ctest_known_fail`, CMakeLists.txt:305),
+        # which skips (77) in ci.yml because there is no HRX tree there and applies the known-failure ratchet
+        # here because there is.
+        #
+        # Measured on ryzen 2026-11-17 (gfx1201, GTT 22.6 GiB): 20 of 37 pass. The rest are named in
+        # tools/ci/ctest_known_fail.txt -- 11 of them are one class, `ggml_backend_supports_op` returning false
+        # for a row op the backend has no kernel for, which is engine#2774/#2832. Two rows cannot be evaluated
+        # yet: test-hrx-host-resident does not compile (its target compiles ggml-hrx/host-weight-placement.cpp
+        # without `ggml/src` on the include path, so `ggml-backend-impl.h` is not found) and is baselined as
+        # `Not Run`; test-hrx-ops/-loom (271 cases, 694 s) stay excluded by the script's -E.
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          fork="$HRX_BUILD/hrx/llama"
+          scripts/mem-guard.sh --term 12 ~/lb/thermal-run.sh cmake --build "$fork" -j 4
+          # A ctest row inherits no environment from the engine, and HRX dlopens the HSA runtime itself: the
+          # distro's libhsa-runtime64 has no `hsa_amd_queue_create`, so every device row reports
+          # "test skipped: no device available" and — because the fork registers that as a failing regex — a
+          # FAIL, not a skip. Pass the runtime this configure resolved (cmake/hrx.cmake:137, engine#1766).
+          export IREE_HAL_AMDGPU_LIBHSA_PATH="$(sed -n 's/^ONEBIT_HRX_LIBHSA:FILEPATH=//p' "$HRX_BUILD/CMakeCache.txt")"
+          echo "fork tests: HSA runtime $IREE_HAL_AMDGPU_LIBHSA_PATH"
+          ctest --test-dir "$HRX_BUILD" -R '^fork_ctest_known_fail$' --output-on-failure

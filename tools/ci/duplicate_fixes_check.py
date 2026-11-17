@@ -47,9 +47,13 @@ DEFAULT_REPOS = ('engine', 'llama.cpp', 'gpu-kernels', 'npu-kernels', 'lemonade'
 OWNER = '1bit-MONSTER'
 PAGE = 100
 
-# `Fixes #12`, `fixes #12`, `Closes #12`, `Fixes and closes #12`. Deliberately NOT a bare `#12` reference: a body that
-# discusses issue 12 is not a claim on it, and widening this would report every PR that mentions an issue as a claimant.
-CLAIM = re.compile(r'\b(?:fix(?:es)?|close[sd]?|resolve[sd]?)\b[^.\n]{0,24}?#(\d+)', re.I)
+# The closing keyword must be IMMEDIATELY followed by the reference (`Fixes #12`, `fixes: #12`, `Closes #12`), which is
+# also GitHub's own rule for closing. Two widenings were tried and both produced false claims on real bodies:
+#   * a bare `#12` -- every PR that discusses an issue became a claimant;
+#   * `keyword ... #12` with up to 24 characters between -- #2793's body says "Refs #2779 (the layer its fix does not
+#     cover), #2728", and the noun "fix" plus a distant `#2728` read as a claim on 2728. Found by running the parser over
+#     the real texts of tonight's seven PRs rather than over my own fixtures, which is why that check is in the PR body.
+CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#(\d+)', re.I)
 
 
 def claims(text):
@@ -144,6 +148,8 @@ def self_test():
     ok(claims("Closes #12 and fixes #13") == [12, 13], "two claims in one body are both read")
     ok(claims("Refs #2778 only") == [], "Refs is not a claim -- the whole point of not matching a bare #N")
     ok(claims("see #2778 for context") == [], "a bare mention is not a claim")
+    ok(claims("Refs #2779 (the layer its fix does not cover), #2728 (where the defect came from)") == [],
+       "a NOUN 'fix' followed by a distant #N is not a claim -- #2793's real body, which the 24-character gap did fire on")
     ok(claims("") == [] and claims(None) == [], "empty and None bodies claim nothing")
 
     # the shape that happened three times tonight

@@ -23,10 +23,11 @@ answers engine#2774's question (*is a recorded-stale expectation still selected 
 without a device.
 
 This wrapper exists rather than an `add_test` pointing straight at the fork's script for one measured
-reason: **the script arrived at fork `ddd415f4a` and the engine pins an earlier commit**, so a direct
-row would fail on every PR with `can't open file` until the pin moves. A check that cannot look must
+reason: **a checkout can be at a pin before `ddd415f4a`**, the fork commit that adds the script, and a
+direct row would fail there with `can't open file` rather than say why. A check that cannot look must
 say so and skip — never pass, never fail for want of a file — and the message names the commit that
-turns it on.
+turns it on. At `ddd415f4a` or later the file is there and the row simply runs; that is the state this
+engine is in today, so the skip path is for older checkouts, not for the merged tree.
 
 Usage:
     stale_expectations_check.py --root <engine checkout>   # rc 0 ok, 1 the fork check failed, 77 the tool is not at this pin
@@ -78,8 +79,8 @@ def run(root):
     tool = os.path.join(root, FORK, TOOL)
     if not os.path.isfile(tool):
         print(f"stale_expectations_check: SKIPPED -- {os.path.join(FORK, TOOL)} is not in this checkout. The fork added "
-              f"it in {ADDED_IN} (engine#2774/#419); this engine pins an older commit, so the row becomes live on the "
-              f"first pin bump that carries {ADDED_IN} or later. A skip is not a pass.")
+              f"it in {ADDED_IN} (engine#2774/#419), so this checkout is at a pin older than that; the row becomes "
+              f"live on the first pin that carries {ADDED_IN} or later. A skip is not a pass.")
         return 77
     r = subprocess.run([sys.executable, tool, "--check", "--root", os.path.join(root, FORK)])
     return 0 if r.returncode == 0 else 1

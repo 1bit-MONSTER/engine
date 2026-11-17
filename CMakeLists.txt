@@ -585,6 +585,15 @@ add_python_test(tool_selftest_hrx_f16_narrowing ${CMAKE_SOURCE_DIR}/tools/ci/hrx
 add_test(NAME hrx_f16_narrowing_check COMMAND ${Python3_EXECUTABLE}
          ${CMAKE_SOURCE_DIR}/tools/ci/hrx_f16_narrowing.py --check --root ${CMAKE_SOURCE_DIR})
 set_tests_properties(hrx_f16_narrowing_check PROPERTIES SKIP_RETURN_CODE 77)
+# engine#2836: the fork's `tests/CMakeLists.txt` registers 48 ctest rows and nothing in CI builds the fork's tests, so
+# a row's presence there means it runs only when a person runs `ctest` in a fork checkout. One of them is host-runnable
+# -- the recorded-stale table check engine#419 added (no device, no fixture, ~1 s) -- so it gets a home here, in the
+# suite CI actually runs, on every PR and on every pin bump. 77 is "this pin predates the tool in the fork", which is
+# a fact about the pin rather than a pass: the wrapper says which, and `ctest_skips` counts the row.
+add_python_test(tool_selftest_hrx_stale_expectations ${CMAKE_SOURCE_DIR}/tools/ci/hrx_stale_expectations.py --self-test)
+add_test(NAME hrx_stale_expectations COMMAND ${Python3_EXECUTABLE}
+         ${CMAKE_SOURCE_DIR}/tools/ci/hrx_stale_expectations.py --root ${CMAKE_SOURCE_DIR}/third_party/llama.cpp)
+set_tests_properties(hrx_stale_expectations PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
 # engine#2805: three duplicate PRs on one issue in one night (#2778, #2795, #2779) and a human reviewer noticed each time.
 # The claim is in the title/body (`Fixes #N`), so the self-test is hermetic and the live run is a lane tool: `Refs #N` and a

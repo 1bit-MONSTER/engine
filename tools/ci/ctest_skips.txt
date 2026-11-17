@@ -33,4 +33,5 @@ whisper_transcribe_jfk   # returns 77: ONEBIT_TEST_WHISPER_PACK and _WAV are uns
 whisper_transcribe_jfk_lv3   # returns 77: no pack or wav (ONEBIT_TEST_WHISPER_PACK_LV3/_WAV_LV3) in CI
 laya_finetune   # returns 77: needs torch + numpy, which the build container does not install (engine#1313 item 3)
 hip_f16_audit   # returns 77: needs a gpu-kernels checkout at the pin; the build job initialises llama.cpp only
+hrx_stale_expectations   # returns 77: the pin (8cb8fb64) predates the fork's check_stale_expectations.py (engine#2836); drop this line with the pin bump that brings it
 token_rate_floor_device   # returns 77: needs a device, a model and a gpu-hold ticket: it judges a real 1bit serve rate

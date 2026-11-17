@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""duplicate_fixes_check.py -- which open PRs claim the same issue.
+
+Three times on 2026-11-16/17 a second PR was opened for an issue another lane had already
+started, and each time a human reviewer noticed rather than an instrument:
+
+    #2778  #2784 / #2786        #2795  #2796 / #2797 / #2798        #2779  #2790 / #2793
+
+The cost is not the duplicate diff, it is the review: two verdicts, a "which one is yours"
+comment thread, and a merge order that nobody chose. The fleet already has the policy
+(`two-open-prs-one-file`); what it lacked is the one-line answer to "does anything else claim
+this issue right now", which is what this prints.
+
+It reads the claim from the PR's **title and body** (`Fixes #N`, `Closes #N`, `Fixes and closes
+#N`), because that is where a claim is made, and it reports every issue claimed by two or more
+open PRs with the PRs' age and draft state, so the reader can tell "one is a draft awaiting a
+slot" from "two lanes are both working".
+
+Usage:
+    duplicate_fixes_check.py                    # the fleet's six repos
+    duplicate_fixes_check.py --repos engine     # a subset
+    duplicate_fixes_check.py --json
+    duplicate_fixes_check.py --self-test        # hermetic: fixtures, no network
+Exit: 0 no issue claimed twice, 1 at least one issue claimed by two or more open PRs, 2 cannot tell.
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+
+DEFAULT_REPOS = ('engine', 'llama.cpp', 'gpu-kernels', 'npu-kernels', 'lemonade', 'site')
+OWNER = '1bit-MONSTER'
+PAGE = 100
+
+# `Fixes #12`, `fixes #12`, `Closes #12`, `Fixes and closes #12`. Deliberately NOT a bare `#12` reference: a body that
+# discusses issue 12 is not a claim on it, and widening this would report every PR that mentions an issue as a claimant.
+CLAIM = re.compile(r'\b(?:fix(?:es)?|close[sd]?|resolve[sd]?)\b[^.\n]{0,24}?#(\d+)', re.I)
+
+
+def claims(text):
+    """The issue numbers a PR title+body claims to close."""
+    return sorted({int(n) for n in CLAIM.findall(text or '')})
+
+
+def duplicates(prs):
+    """[(issue, [pr, ...])] for every issue claimed by two or more of `prs`, oldest PR first.
+
+    `prs` is [{'number', 'title', 'body', 'draft', 'age_hours'}]. A pair where one is a draft is still reported: a draft
+    that claims an issue is a lane working on it, which is the thing the second lane cannot see.
+    """
+    by_issue = {}
+    for pr in prs:
+        for issue in claims(f"{pr.get('title') or ''}\n{pr.get('body') or ''}"):
+            by_issue.setdefault(issue, []).append(pr)
+    out = []
+    for issue in sorted(by_issue):
+        group = sorted(by_issue[issue], key=lambda p: p.get('number') or 0)
+        if len(group) > 1:
+            out.append((issue, group))
+    return out
+
+
+def describe(issue, group):
+    lines = [f"#{issue} is claimed by {len(group)} open PR(s):"]
+    for pr in group:
+        draft = ' [draft]' if pr.get('draft') else ''
+        age = pr.get('age_hours')
+        age_s = f", {age:.1f} h old" if isinstance(age, (int, float)) else ''
+        lines.append(f"  #{pr.get('number')} {pr.get('title') or ''}".rstrip() + f"{draft}{age_s}")
+    lines.append("  one of these should close, or say in both threads which lands first")
+    return "\n".join(lines)
+
+
+def gh(path, paginate=False):
+    """One page, or every page, of a `gh api` list endpoint (the same shape as pr_review_queue.py)."""
+    if not paginate:
+        return subprocess.run(['gh', 'api', path], capture_output=True, text=True).stdout
+    out, page = [], 1
+    while True:
+        sep = '&' if '?' in path else '?'
+        chunk = subprocess.run(['gh', 'api', f"{path}{sep}per_page={PAGE}&page={page}"],
+                               capture_output=True, text=True).stdout
+        try:
+            got = json.loads(chunk or '[]')
+        except json.JSONDecodeError:
+            break
+        if not isinstance(got, list):
+            # A failed read must never read as "nothing claimed twice": that is the false negative this tool exists for.
+            msg = got.get('message', got) if isinstance(got, dict) else got
+            raise RuntimeError(f"gh api {path} did not answer with a list: {msg}")
+        if not got:
+            break
+        out.extend(got)
+        if len(got) < PAGE:
+            break
+        page += 1
+    return json.dumps(out)
+
+
+def open_prs(repo):
+    import datetime
+    raw = gh(f"repos/{OWNER}/{repo}/pulls?state=open&per_page={PAGE}", paginate=True)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    prs = []
+    for p in json.loads(raw or '[]'):
+        created = p.get('created_at')
+        age = None
+        if created:
+            try:
+                age = (now - datetime.datetime.fromisoformat(created.replace('Z', '+00:00'))).total_seconds() / 3600
+            except ValueError:
+                age = None
+        prs.append({'number': p.get('number'), 'title': p.get('title') or '', 'body': p.get('body') or '',
+                    'draft': bool(p.get('draft')), 'age_hours': age})
+    return prs
+
+
+def self_test():
+    fails = 0
+
+    def ok(cond, what):
+        nonlocal fails
+        print(("ok   " if cond else "FAIL ") + what)
+        fails += 0 if cond else 1
+
+    # one claim, in the shapes lanes actually write
+    ok(claims("pins: llama.cpp 1 -> 2 (Fixes #2757)") == [2757], "Fixes #N in a title is a claim")
+    ok(claims("body text\n\nFixes #2778.") == [2778], "Fixes #N in a body is a claim")
+    ok(claims("Closes #12 and fixes #13") == [12, 13], "two claims in one body are both read")
+    ok(claims("Refs #2778 only") == [], "Refs is not a claim -- the whole point of not matching a bare #N")
+    ok(claims("see #2778 for context") == [], "a bare mention is not a claim")
+    ok(claims("") == [] and claims(None) == [], "empty and None bodies claim nothing")
+
+    # the shape that happened three times tonight
+    prs = [
+        {'number': 2784, 'title': 'accel_sampler: write the summary by rename (Fixes #2778)', 'body': '', 'draft': False, 'age_hours': 1.0},
+        {'number': 2786, 'title': 'diag: the sampler summary is renamed into place (engine#2778)', 'body': 'Fixes #2778', 'draft': False, 'age_hours': 0.5},
+        {'number': 2790, 'title': 'unrelated', 'body': 'Fixes #2779', 'draft': False, 'age_hours': 2.0},
+    ]
+    dup = duplicates(prs)
+    ok([i for i, _ in dup] == [2778], "one duplicate is reported, and only the claimed-twice issue")
+    ok([p['number'] for p in dup[0][1]] == [2784, 2786], "the pair is named oldest first")
+    ok('one of these should close' in describe(*dup[0]), "the report says what to do about it")
+
+    # a draft claimant still counts: that is a lane working, which the second lane cannot see
+    prs[1]['draft'] = True
+    ok([p['number'] for p in duplicates(prs)[0][1]] == [2784, 2786], "a draft claimant is reported too")
+    ok('[draft]' in describe(*duplicates(prs)[0]), "... and marked as a draft")
+
+    # no claim, no finding -- the failure mode of a detector that always fires
+    ok(duplicates([{'number': 1, 'title': 'a', 'body': 'Refs #5', 'draft': False},
+                   {'number': 2, 'title': 'b', 'body': 'Refs #5', 'draft': False}]) == [],
+       "two PRs that merely REFER to an issue are not a duplicate")
+
+    print("self-test ok" if not fails else f"self-test FAILED ({fails})")
+    return 0 if not fails else 1
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('--repos', nargs='+', default=list(DEFAULT_REPOS))
+    ap.add_argument('--json', action='store_true')
+    ap.add_argument('--self-test', action='store_true')
+    a = ap.parse_args(argv)
+    if a.self_test:
+        return self_test()
+
+    found, rc = [], 0
+    for repo in a.repos:
+        try:
+            prs = open_prs(repo)
+        except (RuntimeError, json.JSONDecodeError) as e:
+            print(f"duplicate_fixes: cannot tell for {repo}: {e}", file=sys.stderr)
+            rc = 2
+            continue
+        for issue, group in duplicates(prs):
+            found.append({'repo': repo, 'issue': issue,
+                          'prs': [{'number': p['number'], 'title': p['title'], 'draft': p['draft'],
+                                   'age_hours': p['age_hours']} for p in group]})
+    if a.json:
+        print(json.dumps(found, indent=1))
+    else:
+        for f in found:
+            print(f"{f['repo']}: " + describe(f['issue'], f['prs']))
+        if not found:
+            print("duplicate_fixes: no open issue is claimed by more than one open PR")
+    return 1 if found else rc
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

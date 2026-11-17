@@ -4313,6 +4313,10 @@ The cost is pack size: the untransposed copy still feeds the input gather, so th
 size (617 MB -> 776 MB for whisper-small). A pack copied by hand keeps the Transpose and pays ~50 ms per window
 forever; `tools/make-audio-pack.sh --check`-style refusal is the guard — the script re-reads the file it wrote and
 fails rather than emitting a pack that silently costs that.
+These device figures are one sample each. The same binary and pack have since produced an encoder of 2.2 s at load ~4
+and 5.0-6.0 s at load ~9 on this box, with **encoders that should be identical between the arms differing by 2.2x** -- so
+a device A/B here is only valid if the encoder control comes out flat within the run, which is why both rows above are
+quoted with it.
 
 `tools/fold_initializer_transpose.py --check <model.onnx>` answers the question on an existing pack. A packed
 decoder that still carries an initializer-fed Transpose prints the node and exits 1; a folded one prints

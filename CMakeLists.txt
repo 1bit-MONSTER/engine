@@ -296,6 +296,15 @@ add_test(NAME fold_initializer_transpose COMMAND bash ${CMAKE_SOURCE_DIR}/tests/
 set_tests_properties(fold_initializer_transpose PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME make_audio_pack COMMAND bash ${CMAKE_SOURCE_DIR}/tests/make_audio_pack_test.sh)
 set_tests_properties(make_audio_pack PROPERTIES SKIP_RETURN_CODE 77)
+# engine#2761: the fork's own ctest suite against a known-failure baseline. The helper owns the two
+# refusals in its header -- it skips 77 until engine#2825's ratchet tool is on the branch, and it
+# cannot-tell (exit 2) when the llama.cpp submodule is not at the sha the tree pins, because a build
+# tree configured against a different submodule keeps stale include paths and reports a missing
+# header as a suite failure. SKIP_RETURN_CODE 77 is what makes a not-yet-applicable row a SKIP and
+# not a FAIL in the ctest log.
+add_test(NAME fork_ctest_known_fail
+         COMMAND /bin/sh ${CMAKE_SOURCE_DIR}/tools/ci/fork_ctest_known_fail.sh)
+set_tests_properties(fork_ctest_known_fail PROPERTIES SKIP_RETURN_CODE 77)
 
 # engine#2186/#2244: `tools/ci/dupdef_check.py`, a check that was only ever run by hand. It is the one
 # that found a shadowed `def self_test()` in tools/hrx_f16_narrowing_check.py -- the surviving copy

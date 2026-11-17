@@ -17,6 +17,7 @@
 # shrinks rather than rots (the shape of tools/ci/unreferenced_tests.txt, engine#1824).
 # A test whose BINARY is missing is never baselined here: that is a build-list mistake, not a fixture.
 
+fork_ctest_known_fail   # engine#2761: returns 77 until tools/ci/ctest_known_fail.py is on the branch (engine#2825 lands it) and the fork's own build tree exists; the row names the missing piece on stdout
 amdxdna_restart   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
 npu_import_contract   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)
 npu_repack_path   # returns 77: needs a fixture this configuration does not have (see the test's own skip message)

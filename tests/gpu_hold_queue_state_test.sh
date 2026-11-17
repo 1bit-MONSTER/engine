@@ -105,6 +105,28 @@ else
     echo "  PASS arm4: GPU_HOLD_QUEUE_STATE_OFF=1 silences it"
 fi
 
-if [ "$fails" = 0 ]; then echo "gpu_hold_queue_state: 4 arms pass"; exit 0; fi
+# 5. a fault that arrives DURING the wait is reported too -- the case the deploy actually produced: after the new copy
+# went live, all four take-time refusals came after waits of 232-296 s and were triggered by a fault that appeared
+# mid-wait, with the queue-time warning (correctly) silent at second zero. Logged once, and it must say it is a wait.
+mkdir -p "$tmp/mid/queue"
+printf 'kernel: clean at queue time\n' > "$tmp/mid/klog"
+sleep 600 & holder5=$!
+printf 'gpu-hold another-lane pid %s 2026-11-16T00:00:00-04:00\n' "$holder5" > "$tmp/mid/gpu-token"
+( sleep 3; printf 'kernel: amdxdna 0000:c6:00.1: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0002 address=0x1 flags=0x7]\n' >> "$tmp/mid/klog" ) &
+( sleep 12; kill "$holder5" 2> /dev/null ) &
+out5=$(env HOME="$tmp/mid" ONEBIT_HOLD_DIR="$tmp/mid" GPU_HOLD_KLOG_FILE="$tmp/mid/klog" \
+    GPU_HOLD_COOLDOWN=0 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_TCTL_START=999 GPU_HOLD_THERMAL_FLAG="$tmp/none" \
+    timeout 60 bash "$HOLD" -l qs-mid -t 0.1 -w 30 true 2>&1)
+n_mid=$(printf '%s\n' "$out5" | grep -c "still waiting after .* carries a NPU fault line")
+n_queue=$(printf '%s\n' "$out5" | grep -c "queued while the kernel log carries")
+if [ "$n_mid" = 1 ] && [ "$n_queue" = 0 ]; then
+    echo "  PASS arm5: a fault arriving during the wait is reported once, as a wait"
+else
+    echo "  FAIL arm5: want exactly one 'still waiting after Ns ... NPU fault' and no queue-time line; got mid=$n_mid queue=$n_queue"
+    printf '%s\n' "$out5" | grep -E "warning|refusing" | head -3 | sed 's/^/      /'
+    fails=$((fails + 1))
+fi
+
+if [ "$fails" = 0 ]; then echo "gpu_hold_queue_state: 5 arms pass"; exit 0; fi
 echo "gpu_hold_queue_state: $fails failure(s)"
 exit 1

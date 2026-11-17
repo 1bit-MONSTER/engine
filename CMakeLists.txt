@@ -230,7 +230,11 @@ endfunction()
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
 # The embedding role served in-process from a 1-bit container (engine#1311): /v1/embeddings for a string and an
 # array, the OpenAI shape, and the refusals named. Device-free on the 32-token fixture.
+# engine#2826 follow-up: it binds a loopback port (now a free one), so it holds the route_ports lock like every other
+# route test. The census could not see it before because its port was a fixed 8247, not one of the shapes
+# tests/route_port_lock_test.py recognises; the script stopped hard-coding a port in the same commit.
 add_test(NAME embed_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/embed_serve.sh $<TARGET_FILE:onebit>)
+set_tests_properties(embed_serve PROPERTIES RESOURCE_LOCK route_ports)
 # serve takes a hung backend down (docs/serve.md, "When a backend hangs"): a fake backend, no GPU.
 add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh $<TARGET_FILE:onebit>)
 # serve's GET /metrics (docs/serve.md, "Metrics"): a fake backend, no GPU.
@@ -318,6 +322,15 @@ add_test(NAME tool_help_check_onnx COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME tool_help_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/tool_help_check.py --self-test
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# engine#2826 (ORCH 2026-11-17, ctest -j 4): these three rows assert on a GLOBAL fact -- `tree_state()` is taken
+# before and after each tool's `--help`, and any difference is reported as "wrote into the tree while answering
+# --help". That is only a property of the tool when nothing else is writing, so under -j they fail on another row's
+# output rather than on a defect: measured on #2826's first -j 4 build, `tool_help_check_tests` reported
+# `pin_holdings_test.py` and `python_test_order_check.py` as tree-writers because `npu_serve_smoke_self` (below) was
+# creating `npu_serve_smoke_selftest.*` in the checkout at the same moment. RUN_SERIAL runs the test by itself
+# instead of removing it from the parallel batch: the assertion stays exactly as strong as it was, and the rest of
+# the suite keeps its four workers.
+set_tests_properties(tool_help_check tool_help_check_tests tool_help_check_onnx PROPERTIES RUN_SERIAL TRUE)
 
 add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
@@ -586,6 +599,10 @@ add_test(NAME hrx_f16_narrowing_check COMMAND ${Python3_EXECUTABLE}
          ${CMAKE_SOURCE_DIR}/tools/ci/hrx_f16_narrowing.py --check --root ${CMAKE_SOURCE_DIR})
 set_tests_properties(hrx_f16_narrowing_check PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
+# engine#2805: three duplicate PRs on one issue in one night (#2778, #2795, #2779) and a human reviewer noticed each time.
+# The claim is in the title/body (`Fixes #N`), so the self-test is hermetic and the live run is a lane tool: `Refs #N` and a
+# bare mention are deliberately NOT claims, which is the arm below that keeps the detector from firing on every PR.
+add_python_test(tool_selftest_duplicate_fixes ${CMAKE_SOURCE_DIR}/tools/ci/duplicate_fixes_check.py --self-test)
 add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_agree.py --selftest)
 add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
 add_python_test(tool_selftest_spec_decode_acceptance ${CMAKE_SOURCE_DIR}/tools/spec_decode_acceptance.py --selftest)
@@ -663,6 +680,13 @@ add_python_test(ctest_skips_self ${CMAKE_SOURCE_DIR}/tools/ci/ctest_skips.py --s
 # non-empty answer, because a serve on the slow per-op route still answers. --self-test drives the judging on the shape
 # of each failure (the silent fallback at 1.9 tok/s, thinking left on, a degenerate reply); no device, no binary.
 add_python_test(npu_serve_smoke_self ${CMAKE_SOURCE_DIR}/tools/npu_serve_smoke.py --self-test)
+# engine#2826 (ORCH 2026-11-17, ctest -j 4): its self-test writes its scratch INTO THE CHECKOUT --
+# `tempfile.mkdtemp(prefix="npu_serve_smoke_selftest.", dir=os.getcwd())` (tools/npu_serve_smoke.py:338) -- so under
+# `-j` it both perturbs every row that asserts a stable tree (`tool_help_check_tests` read it as two tools writing into
+# the tree) and can itself be disturbed by a concurrent row. RUN_SERIAL makes it run alone, which is the smallest
+# change that makes it safe; the row's own root cause (writing into cwd instead of a scratch dir) is named here so a
+# follow-up can give it a WORKING_DIRECTORY instead, and then this property can go.
+set_tests_properties(npu_serve_smoke_self PROPERTIES RUN_SERIAL TRUE)
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
 # The three ways this corpus loses a value to half precision (engine #1962/#2127/#2186): an input
 # truncated without a prescale, a computed value published to f16, and an f16 accumulator updated by a

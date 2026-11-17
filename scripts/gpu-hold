@@ -117,6 +117,19 @@ GPU_FAULT_RE='\[gfxhub\] page fault|amdgpu.*(reset|hang)|ring .*timeout|MES.*(re
 # one, and it is logged for 60 s after every power-cycle, which is exactly when the next ticket is granted.
 GPU_FAULT_SKIP_RE='aie2_tdr_recover_all: TDR recovery throttled'
 
+# engine#2803: the take-time refusal says WHICH KIND of fault it saw. One name per class, used for the newest matching line and
+# for the window's first compute marker, so the two cannot describe the same fault differently.
+fault_class() {  # $1 = a kernel-log line -> a short class, or "" when the line carries no compute marker
+    case "$1" in
+        *"[gfxhub] page fault"*)     echo "a gfxhub page fault" ;;
+        *"ring "*)                   echo "a ring timeout" ;;
+        *MES*)                       echo "an MES failure" ;;
+        *amdxdna*)                   echo "an NPU (amdxdna) fault" ;;
+        *"GPU reset"*|*"GPU hang"*)  echo "a GPU reset/hang" ;;
+        *)                           echo "" ;;
+    esac
+}
+
 while getopts ":t:l:w:q:h" opt; do
     case $opt in
         t) MINUTES=$OPTARG ;;
@@ -345,14 +358,27 @@ while [ "$state" = queued ]; do
     # it could have predicted. This is the same PATTERN (GPU_FAULT_RE/GPU_FAULT_SKIP_RE, so the two cannot drift) read
     # over the same window; it decides nothing -- the refusal still happens at take, when the window is re-read, because
     # a queue wait can be minutes long and the condition can clear (or arrive) in the meantime.
-    if [ "$waited" = 0 ] && [ "${GPU_HOLD_FAULT_ABORT:-1}" != 0 ] && [ -z "${GPU_HOLD_QUEUE_STATE_OFF:-}" ]; then
+    # ...and it repeats WHILE the lane waits, because the queue-time check alone misses the case that actually happens:
+    # measured on this box after the deploy, all four refusals on the new copy came after waits of 232-296 s and were
+    # triggered by a fault that arrived DURING the wait ("newest 7-12s ago"), with the queue-time warning (correctly)
+    # silent at the first poll. A warning that only fires at second zero describes the one moment a fault is least likely
+    # to matter. Re-checked every 10 s (journalctl is not free every 2 s), logged ONCE per wait so the queue stays
+    # readable, and still deciding nothing: the refusal at take remains the authority.
+    if [ "${GPU_HOLD_FAULT_ABORT:-1}" != 0 ] && [ -z "${GPU_HOLD_QUEUE_STATE_OFF:-}" ] && [ -z "${_qs_warned:-}" ] &&
+       { [ "$waited" = 0 ] || [ $((waited % 10)) -lt "$POLL" ]; }; then
         _qs_window=${GPU_HOLD_RESET_WINDOW_MIN:-10}
         _qs_hits=$(if [ -n "${GPU_HOLD_KLOG_FILE:-}" ]; then cat "$GPU_HOLD_KLOG_FILE" 2> /dev/null
                    else journalctl -k --since "-${_qs_window} min" --no-pager -q 2> /dev/null; fi |
                    grep -iE "$GPU_FAULT_RE" | grep -viE "$GPU_FAULT_SKIP_RE")
         if [ -n "$_qs_hits" ]; then
+            _qs_warned=1
             _qs_dev=GPU; printf '%s\n' "$_qs_hits" | tail -1 | grep -qi amdxdna && _qs_dev=NPU
-            log "::warning::queued while the kernel log carries a ${_qs_dev} fault line in the last ${_qs_window} min - if it is still there when this ticket reaches the front, the take is REFUSED (rc 78) and this queue position is lost; newest: $(printf '%s\n' "$_qs_hits" | tail -1 | cut -c1-160)"
+            if [ "$waited" = 0 ]; then
+                _qs_when="queued while"
+            else
+                _qs_when="still waiting after ${waited}s while"
+            fi
+            log "::warning::${_qs_when} the kernel log carries a ${_qs_dev} fault line in the last ${_qs_window} min - if it is still there when this ticket reaches the front, the take is REFUSED (rc 78) and this queue position is lost; newest: $(printf '%s\n' "$_qs_hits" | tail -1 | cut -c1-160)"
         fi
     fi
     cool=$(cool_left)
@@ -428,7 +454,30 @@ while [ "$state" = queued ]; do
                                   grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -1 | awk '{print int($1)}')
                         _age=""
                         case "${_newest:-}" in ''|*[!0-9]*) ;; *) _age=", newest $(( $(date +%s) - _newest ))s ago" ;; esac
-                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault line(s) in the last ${_reset_window} min${_age} - the ticket is released unheld. Inspect the kernel log, then retry"
+                        # engine#2803: "fault line(s)" alone reads as "the thing you were about to measure is broken", and the
+                        # PR whose hw_gate was refused spent its time doubting its own pin. Tonight two of three MODE2 resets
+                        # were another lane's suite, and the log says so in the line in front of the reset ("Process
+                        # hrx-ops-test pid 186654"). Name what the newest line is, and who it names when it names someone --
+                        # the refusal itself is unchanged, so a real ring/MES/page fault still refuses exactly as before.
+                        _newest_line=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -1)
+                        _what=$(fault_class "$_newest_line"); [ -n "$_what" ] || _what="a device fault"
+                        # The newest line in every one of this boot's reset windows is the SYMPTOM ("GPU reset(N) succeeded!");
+                        # what the client actually did is the window's FIRST compute marker, 6-8 s earlier
+                        # ([gfxhub] page fault / ring timeout / MES). Quoting it turns "the box is faulting" into "this
+                        # suite faulted, here is the fault" (review ask on #2805).
+                        _firstwhat=$(fault_class "$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | head -1)")
+                        _first=""
+                        [ -n "$_firstwhat" ] && [ "$_firstwhat" != "$_what" ] && _first=" (the window's first compute marker is ${_firstwhat})"
+                        # the driver prints "Process <name> pid <n>" on its own interrupt lines, a few lines BEFORE the reset
+                        # line, so look through the last few matching lines rather than only the newest one (measured: the
+                        # 23:33:03 reset's newest matching line is "GPU reset(2) succeeded!", the process is above it).
+                        _who=""
+                        # The driver prints its "Process <name> pid <n>" interrupt lines WITHOUT a reset/hang keyword, so
+                        # they are not in the fault-matched set at all -- search the window's log for the last one and say
+                        # that it is what the driver last named, which is what a reader can check against the log.
+                        _proc=$(printf '%s\n' "$_klog" | sed -n 's/.*Process \([^ ]*\) pid \([0-9]*\).*/\1 pid \2/p' | tail -1)
+                        [ -n "$_proc" ] && _who=", and the driver last named ${_proc}"
+                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault line(s) in the last ${_reset_window} min${_age} - the newest is ${_what}${_first}${_who}. The ticket is released unheld; inspect the kernel log, then retry"
                         printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -3
                         exit 78
                     fi

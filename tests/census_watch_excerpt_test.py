@@ -69,10 +69,20 @@ def excerpt(block, log_text):
     return base64.b64decode(raw).decode() if raw else ""
 
 
-def shape_1116(alerts=True, conclusion=True, n_unverifiable=21, n_answered=19):
+def shape_1116(alerts=True, conclusion=True, n_unverifiable=21, n_answered=19, failures=0, glued=False):
     """The 11-16 13:00Z log: the filler first, the alerts and the summary after it, as the watcher prints them."""
     out = [f"  ? UNVERIFIABLE org/model{i:02d} (no config / no architecture)" for i in range(n_unverifiable)]
     out += [f"  . NPU FLM FastFlowLM/Family{i}-NPU2  … answered: engine#1786" for i in range(n_answered)]
+    if failures:
+        # engine#2812: the tool writes its own failures to stderr as `census-watch: !! …`, which matched none of
+        # the row words and so never reached the excerpt except by accident (engine#2780's glue).
+        out += ["census-watch: !! SUPPORT WATCH FAILED: https://api.github.com/repos/a/b/commits?per_page=1: "
+                "HTTP Error 403: rate limit exceeded"] * failures
+    if glued:
+        # The shape that started this: a stderr line spliced onto the end of the last stdout row, before the
+        # watcher was run unbuffered. It CONTAINS `!!` and must still not be treated as an alert row.
+        out.append("  . NPU FLM FastFlowLM/Translategemma-4B-Instruct-NPU2  … answered: engine#1786"
+                   "census-watch: !! SUPPORT WATCH FAILED: HTTP Error 403: rate limit exceeded")
     if alerts:
         out += ["  !! SUPPORT MOVED ggml-org/llama.cpp  head abc1234  reviewed 2026-11-01",
                 "  !! SUPPORT MOVED lemonade-sdk/lemonade  head def5678  reviewed 2026-11-02"]
@@ -129,6 +139,25 @@ def main():
     check("Q4NX (NPU) gap: quantumchat" in got4,
           "a class ROW whose text contains a literal paren survives the pattern (the grep/awk dialect difference)",
           got4[:200])
+
+    # engine#2812: a watch that could not read its own sources says so, and says it FIRST.
+    got4 = excerpt(block, shape_1116(alerts=False, conclusion=False, failures=2))
+    rows4 = got4.splitlines()
+    check(sum("WATCH FAILED" in r for r in rows4) == 2,
+          "both `census-watch: !! … FAILED` lines reach the excerpt", got4[:240])
+    check(rows4 and rows4[0].startswith("census-watch: !!"),
+          "a failure line leads the excerpt, ahead of the per-row stream", rows4[0] if rows4 else "")
+    check(not any(r.startswith("  ? UNVERIFIABLE") for r in rows4[:2]),
+          "…and the informational rows are still behind it", "; ".join(rows4[:3]))
+
+    # engine#2780: the glued row starts with `  . NPU FLM`, so it is NOT an alert however many `!!` it carries.
+    # A small log, because 40 filler rows would push the glued row past the cap and the arm would then be
+    # reading the cap rather than the tiering.
+    got5 = excerpt(block, shape_1116(alerts=False, conclusion=False, n_unverifiable=5, n_answered=5, glued=True))
+    rows5 = got5.splitlines()
+    check(any("FAILED" in r for r in rows5), "the glued row is still shown (the text is not lost)", got5[:200])
+    check(rows5 and not rows5[0].strip().startswith(". NPU FLM"),
+          "a glued `. NPU FLM … !!` row does not lead the excerpt as an alert", rows5[0] if rows5 else "")
 
     print(f"census_watch_excerpt: {'ok' if not fails else f'{fails} failure(s)'}")
     return 0 if not fails else 1

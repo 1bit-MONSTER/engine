@@ -1254,3 +1254,18 @@ The one `!! UNCOVERED` line of the 2026-11-14 watcher run. Read from the repo's 
   new architecture. Mapping on the name would be guessing at the tensor layout.
 * **Real support needs**: the architecture itself (attention/FFN/embedding
   layout) plus a converter; nothing to map until that exists.
+
+## 2026-11-17: `SimulatedForTestingClass` — reviewed, not a family (engine#2814)
+
+**Withdrawn: both the class and the model id are this repository's own fixtures.** `SimulatedForTestingClass` and
+`example/simulated` are the literals `census-watch.yml` appends when it is dispatched with `simulate_alert` to
+exercise the alert path — no model has that class. #2816 reviewed it into `registry/significant.json` as
+`watch: "report"` before that was known, which recorded a decision about a class nobody has; the entry is removed
+(engine#2830), and the workflow now puts a banner at the top of every simulated issue saying the row is a fixture
+that needs no mapping and no review.
+
+The heading is kept rather than deleted because a section heading is what `tools/ci/doc_section_loss_check.py`
+tracks, and the useful part of this row is the general lesson, not the class:
+
+* **A test path whose output looks exactly like a finding will eventually be answered as one.** The fix belongs in
+  the test path — a banner in the issue — not in the registry, and not in this document.

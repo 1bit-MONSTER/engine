@@ -25,7 +25,13 @@
 # usage: gpu_hold_child_identity_test.sh <path-to-gpu-hold>
 set -u
 HOLD=${1:?usage: gpu_hold_child_identity_test.sh <path-to-gpu-hold>}
-SRC=$(cd "$(dirname "$HOLD")/.." && pwd)   # the tree, for scripts/npu-kernel-bitx.sh
+# The tree that carries scripts/npu-kernel-bitx.sh — resolved from THIS TEST's location, not from the copy under test.
+# Measured 2026-11-16: run against the installed copy (`~/.local/bin/gpu-hold`), `dirname(HOLD)/..` is `~/.local`, so
+# every arm that needs the helper failed with `~/.local/scripts/npu-kernel-bitx.sh: No such file or directory` and the
+# test reported four failures for a copy that is byte-identical to the repo's. Validating the DEPLOYED copy is the
+# point of running it there, so the root has to travel with the test.
+SRC=$(cd "$(dirname "$0")/.." && pwd)
+[ -f "$SRC/scripts/npu-kernel-bitx.sh" ] || SRC=$(cd "$(dirname "$HOLD")/.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/ghid.XXXXXX") || exit 77
 trap 'rm -rf "$tmp"' EXIT
 # The take-time refusal reads the kernel log and refuses a ticket after a recent fault line (#2480/#2498). On a box

@@ -540,6 +540,10 @@ if [ -z "$BIN" ]; then
     # no prebuilt fetch, no npm build.
     ui_flags="-DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF"
     [ "$(cat "$build/.ui-flags" 2>/dev/null)" = "$ui_flags" ] || rm -f "$build/CMakeCache.txt"
+    # A tree that provisioned a dist earlier still embeds and validates it (ui-assets.cmake emit_files only
+    # skips the check when the directory holds nothing), so the downloaded copy goes with the cache.
+    rm -rf "$build/tools/ui/dist"
+    rm -f "$build/tools/ui/dist.tar.gz" "$build/tools/ui/dist.tar.gz.sha256" "$build/tools/ui/.ui-stamp"
     # the same configuration as cmake/hrx.cmake (llama_hrx), plus the two test tools
     : > "$OUT/build.log"
     built=1 guarded=0

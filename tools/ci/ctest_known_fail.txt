@@ -31,7 +31,6 @@ test-llama-context-model               # SEGFAULT -- model behavior backend
 test-thread-safety                     # SEGFAULT -- main backend
 test-arg-parser                        # Failed -- behavior
 test-model-resolution                  # SEGFAULT -- behavior
-test-hrx-host-resident                 # Not Run -- the binary is not built in this configuration
 hrx-backend-test-loom                  # Failed -- hrx
 test-hrx-fa-transposed-value           # Subprocess aborted
 test-hrx-mul-mat-id-k32                # Subprocess aborted

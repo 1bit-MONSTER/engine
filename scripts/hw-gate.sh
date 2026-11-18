@@ -544,6 +544,11 @@ if [ -z "$BIN" ]; then
     # skips the check when the directory holds nothing), so the downloaded copy goes with the cache.
     rm -rf "$build/tools/ui/dist"
     rm -f "$build/tools/ui/dist.tar.gz" "$build/tools/ui/dist.tar.gz.sha256" "$build/tools/ui/.ui-stamp"
+    # scripts/ui-assets.cmake:524 checks the SOURCE tree first -- if ${UI_SOURCE_DIR}/dist/index.html
+    # exists it embeds and validates that copy, and ${UI_SOURCE_DIR} is the checkout, not the build dir.
+    # A checkout that once provisioned a dist therefore still dies on "missing required asset(s)" no
+    # matter what the build dir holds.
+    rm -rf "$src/tools/ui/dist"
     # the same configuration as cmake/hrx.cmake (llama_hrx), plus the two test tools
     : > "$OUT/build.log"
     built=1 guarded=0

@@ -518,6 +518,14 @@ if [ -z "$BIN" ]; then
     export HIP_DEVICE_LIB_PATH=${HIP_DEVICE_LIB_PATH:-$device_lib}
     # a changed flag set must not be read from an existing cache
     [ "$(cat "$build/.hip-flags" 2>/dev/null)" = "$hip_flags" ] || rm -f "$build/CMakeCache.txt"
+    # No embedded Web UI (engine#2865). Every phase drives kernel entry points or llama-server over
+    # HTTP, so the UI is not a gate input, but the prebuilt dist comes from the moving "latest" tag of
+    # the ggml-org/llama-ui bucket and its SvelteKit layout bundles workbox into sw.js, which the fork's
+    # ui_validate_assets (llama.cpp scripts/ui-assets.cmake) rejects - the configure died six times with
+    # "missing required asset(s): workbox[hash].js" before any device phase. Emit an empty table instead:
+    # no prebuilt fetch, no npm build.
+    ui_flags="-DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF"
+    [ "$(cat "$build/.ui-flags" 2>/dev/null)" = "$ui_flags" ] || rm -f "$build/CMakeCache.txt"
     # the same configuration as cmake/hrx.cmake (llama_hrx), plus the two test tools
     : > "$OUT/build.log"
     built=1 guarded=0
@@ -539,8 +547,9 @@ if [ -z "$BIN" ]; then
           -DHRX_SOURCE_DIR="$ROOT/third_party/hrx-system" "${addon_args[@]}" \
           -DGGML_HRX=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=ON -DGGML_CPU=ON \
           -DGGML_HRX_HIP_COMPILER="$TOOLCHAIN/bin/amdclang++" "-DGGML_HRX_HIP_FLAGS=$hip_flags" \
-          -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF >> "$OUT/build.log" 2>&1 &&
-          echo "$addon_pin" > "$build/.gpu-kernels-pin" && echo "$hip_flags" > "$build/.hip-flags"; }; } &&
+          -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF $ui_flags >> "$OUT/build.log" 2>&1 &&
+          echo "$addon_pin" > "$build/.gpu-kernels-pin" && echo "$hip_flags" > "$build/.hip-flags" &&
+          echo "$ui_flags" > "$build/.ui-flags"; }; } &&
       "$ROOT/scripts/mem-guard.sh" --term "$MEM_FLOOR" "$THERMAL" cmake --build "$build" -j "$JOBS" --target "${targets[@]}" >> "$OUT/build.log" 2>&1 && { built=0; break; }
       grep -q "^GUARD:" <(tail -n 40 "$OUT/build.log") && { guarded=1; break; }   # out of memory, not heat
       grep -q "error:" <(tail -n 40 "$OUT/build.log") && break   # a compile error, not heat

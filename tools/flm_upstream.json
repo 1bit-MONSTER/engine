@@ -1,0 +1,22 @@
+{
+ "_about": "Hand-checked upstream GGUF repos per FastFlowLM tag, when search alone would pick a mirror of the wrong family. tools/flm_registry.py prefers these, then FLM's own NPU repo (which has no GGUF), then HF search.",
+ "lfm2:1.2b": "LiquidAI/LFM2-1.2B-GGUF",
+ "lfm2:2.6b": "LiquidAI/LFM2-2.6B-GGUF",
+ "lfm2-trans:2.6b": "LiquidAI/LFM2-2.6B-Transcript-GGUF",
+ "lfm2.5-it:1.2b": "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+ "lfm2.5-tk:1.2b": "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
+ "qwen3:0.6b": "Qwen/Qwen3-0.6B-GGUF",
+ "qwen3:1.7b": "Qwen/Qwen3-1.7B-GGUF",
+ "qwen3:4b": "Qwen/Qwen3-4B-GGUF",
+ "qwen3:8b": "Qwen/Qwen3-8B-GGUF",
+ "qwen3-it:4b": "Qwen/Qwen3-4B-Instruct-2507-GGUF",
+ "qwen3-tk:4b": "Qwen/Qwen3-4B-Thinking-2507-GGUF",
+ "qwen2.5-it:3b": "Qwen/Qwen2.5-3B-Instruct-GGUF",
+ "qwen2.5vl-it:3b": "Qwen/Qwen2.5-VL-3B-Instruct-GGUF",
+ "qwen3vl-it:4b": "Qwen/Qwen3-VL-4B-Instruct-GGUF",
+ "qwen3vl-flash:4b": "Qwen/Qwen3-VL-4B-Instruct-GGUF",
+ "qwen3.8-mtp:27b": "Qwen/Qwen3.8-27B-GGUF",
+ "gpt-oss:20b": "openai/gpt-oss-20b",
+ "gpt-oss-sg:20b": "openai/gpt-oss-safeguard-20b",
+ "phi4-mini-it:4b": "microsoft/Phi-4-mini-instruct-gguf"
+}

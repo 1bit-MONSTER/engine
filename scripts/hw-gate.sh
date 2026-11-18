@@ -540,12 +540,23 @@ if [ -z "$BIN" ]; then
     # no prebuilt fetch, no npm build.
     ui_flags="-DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF"
     [ "$(cat "$build/.ui-flags" 2>/dev/null)" = "$ui_flags" ] || rm -f "$build/CMakeCache.txt"
+    # engine#2868: record what the tree held BEFORE the removals below, so a UI failure in the log names
+    # the tree and the copy to clean. ui-assets.cmake checks ${UI_SOURCE_DIR}/dist (the checkout) before
+    # ${DIST_DIR} (the build tree) and validates whichever exists even with the UI switched off.
+    dist_state() { [ -e "$1/index.html" ] && echo "present($(find "$1" -type f | wc -l) files)" || echo absent; }
+    ui_report="hw-gate: src=$src build=$build ui-checkout-dist=$(dist_state "$src/tools/ui/dist") ui-build-dist=$(dist_state "$build/tools/ui/dist") ui-stamp=$(cat "$build/tools/ui/.ui-stamp" 2>/dev/null || echo none) ui-cache=$(grep -m1 '^LLAMA_USE_PREBUILT_UI:' "$build/CMakeCache.txt" 2>/dev/null || echo none)"
     # A tree that provisioned a dist earlier still embeds and validates it (ui-assets.cmake emit_files only
     # skips the check when the directory holds nothing), so the downloaded copy goes with the cache.
     rm -rf "$build/tools/ui/dist"
     rm -f "$build/tools/ui/dist.tar.gz" "$build/tools/ui/dist.tar.gz.sha256" "$build/tools/ui/.ui-stamp"
+    # scripts/ui-assets.cmake:524 checks the SOURCE tree first -- if ${UI_SOURCE_DIR}/dist/index.html
+    # exists it embeds and validates that copy, and ${UI_SOURCE_DIR} is the checkout, not the build dir.
+    # A checkout that once provisioned a dist therefore still dies on "missing required asset(s)" no
+    # matter what the build dir holds.
+    rm -rf "$src/tools/ui/dist"
     # the same configuration as cmake/hrx.cmake (llama_hrx), plus the two test tools
     : > "$OUT/build.log"
+    echo "$ui_report" >> "$OUT/build.log"
     built=1 guarded=0
     # Memory (engine#1504). On 2026-11-08 this job was handed to a just-restarted runner on a box with 0 swap
     # free and both runners were OOM-killed 76 s later; the compile was the one step here with no memory check.

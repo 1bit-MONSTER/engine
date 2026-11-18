@@ -95,6 +95,39 @@ the int8 variant is an optimisation, not a fix.
 
 The 27B's `pp512 56.58` should follow the same multiplier; re-measure at the end rather than mid-plan.
 
+### What reading the motif changed in Stage A (2026-11-18)
+
+The Stage A bullet list above assumed the tile is a select over `%weight_format` inside the existing publish
+helper. It is not, and the difference is measurable before writing any kernel:
+
+- **the grid can be allocated where it is used.** `buffer.alloca<workgroup>` inside a `func.def inline` is
+  established here (19 occurrences in the corpus, one at `motifs/mul_mat_quantized_f16_prefill.loom:609`
+  inside this very motif), so `@ggml_kquant_iq1s_grid_fill` can be staged from the publish helper. It is a
+  constant 4 KB codebook: fill it once at the top of `@ggml_mul_mat_quantized_f16_prefill_wave32_body`
+  (beside the weight/activation stages, `:609-610`), not per epoch, and take the existing barrier.
+- **the producer geometry differs, and a select would mis-stage.** Q6_K publishes two 16-value windows
+  `%weight_k1 = %weight_k0 + 32` apart, stepping `%weight_k0 = %weight_group*32 + %load_packet*4` in 4s.
+  `@ggml_iq1s_f16_pair` returns lanes `2p`, `2p+1`, i.e. `[32p, 32p+16)` and `[32p+16, 32p+32)` — 16 apart,
+  with `p` a whole 32-value multiple. So IQ1_S needs `k1 = k0 + 16`, `k0 = %weight_group * 32`
+  (`%load_packet` forced to 0), one producer per 32-value packet, and the 16-wide store arm rather than the
+  `%short_weight_packets` 8-value slices. `%groups_per_epoch * %epochs_per_block = 8` already covers all
+  eight packets of a 256-value block, so coverage is complete; the second producer per row rewrites the same
+  values, which is redundant but not wrong — drop `%packed_threads_per_row` to 1 for the IQ1 arm once it
+  measures, not before.
+- **the row stride is the only place the block size enters.** `%native_block_bytes` feeds
+  `%native_row_bytes = %quant_block_count * %native_block_bytes`, so 210 → 50 is safe on its own; every risk
+  sits in which 32-value window each producer fills.
+
+Order of work therefore becomes: producer arm in `@ggml_f16_prefill_publish_weights` (+ grid fill in `_body`)
+→ op `common.mul_mat.iq1_s_prefill_wave32` cloned from `ops/mul_mat_q6_k_packed_f16_wmma.loom` (its
+predicates `multiple_of 256/64` already fit) → engine matcher beside `match_q6_k_prefill_wave32_dispatch`
+(`dispatch-mul-mat.cpp:775`) → `test-hrx-` row at n = 9/64/512 → device bench under `gpu-hold` against the
+56.5 tok/s local baseline, not the shipped tree (#2858).
+
+The corpus side of this is generator-owned where it matters: `motifs/kquant_iq1_s.loom` and the IQ1 region of
+`ops/kquant_decode_f32.loom` come from `tools/generate_iq1_loom.py`, so the reader the tile calls is already
+shared and pinned (engine pins hrx at the fork commit that makes a regeneration a no-op).
+
 ## Order of work, and what each step costs
 
 1. Stage A kernel + `test-hrx` row + bench (one worktree, one PR). This is the bulk: expect the loom kernel

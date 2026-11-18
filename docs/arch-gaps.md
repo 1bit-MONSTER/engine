@@ -1269,3 +1269,38 @@ tracks, and the useful part of this row is the general lesson, not the class:
 
 * **A test path whose output looks exactly like a finding will eventually be answered as one.** The fix belongs in
   the test path — a banner in the issue — not in the registry, and not in this document.
+\n
+## 2026-11-18: `HaruForConditionalGeneration` — reviewed, not an alias (engine#2867)
+
+The `!! UNCOVERED ... (new class)` line of the 2026-11-18 watcher run the issue asked about
+(`tvt76697/Haru-4B-codex`). Read from the model's own `config.json`, its `model.safetensors` tensor
+names and shapes, and the GGUF a third party published of it — not from the class name. The same run's
+other uncovered classes (`HYV4FlashForConditionalGeneration`, `DSpineDraftModel`,
+`MeronNanoMoEForCausalLM`) are not reviewed here.
+
+* `HaruForConditionalGeneration` (`model_type` `haru`, 4 models from 4 uploaders: `higurashi-ai/Haru-4B`,
+  `tvt76697/Haru-4B-codex`, `botp/Haru-4B`, `nano16/Haru-4B-mlx-8bit`) is Haru-4B, a full-duplex
+  speech-to-speech model: every 133 ms frame sums the user's speech latent, the model's previous text
+  token and its previous speech latent into one LM position. The config is composite — `lm` is
+  `qwen3_5_text` (hidden 2560, 32 layers, 16 heads / 4 KV, head_dim 256, `layer_types` 3x
+  `linear_attention` + 1x `full_attention`, `attn_output_gate` true) — and the weights carry what that
+  graph does not: 1022 tensors in all, 424 `lm.*`, 276 `codec.encoder.*` + 276 `codec.decoder.*`
+  (ConvNeXt blocks with `ffn_gamma`), ~30 `head.*` (`head.layers.0.ada.weight [7680, 2560]`,
+  `cond_proj [2560, 2560]`, rank-256 `dt_embed` / `h_embed` / `omega_embed` / `t_embed`) and
+  `user_audio_proj.fc1/fc2` + `model_audio_proj.fc1/fc2` into 2560.
+* **Not an alias of `Qwen3_5ForCausalLM`**: the `qwen35` graph has no audio projections, no MeanFlow head
+  and no codec, so the text trunk alone is not the model — the class predicts audio as well as text.
+* **Not mappable by a pin bump** either: no `haru` in the fork's `conversion/*.py` or
+  `src/llama-arch.cpp` (pin `4df0f3e6cf92`), none in `npu/`, and the published GGUF
+  (`sakasegawa/Haru-4B-GGUF`) declares `general.architecture = haru` with 1035 tensors and
+  `speech.layout` / `speech.requires` beside it, i.e. its own GGUF architecture rather than `qwen35`.
+* **Upstream has no implementation**: no `haru` package in transformers main (554 model dirs, `qwen3_5`
+  and `qwen3_5_moe` present), and the publisher's own card sends you to
+  `github.com/higurashi-ai/Haru` (`pip install -e ./haru`, `HaruModel.from_pretrained`, an MLX
+  implementation and a vLLM-Omni plugin). The repos ship no `auto_map` and no `modeling_*.py`, which is
+  why the watcher read the class as native and alerted instead of printing `. REMOTE-CODE`.
+
+Reported, not alerted (`"watch": "report"`). The one model of the family the watcher calls covered —
+`Jayanth-MKV/Haru-4B-GGUF`, whose `config.json` declares `Qwen3_5ForCausalLM` — is a qwen-trunk re-wrap
+that ships `meanflow-head-f16.safetensors` and `vibevoice-codec-f16.safetensors` beside its GGUF: covered
+for text, not for this class.

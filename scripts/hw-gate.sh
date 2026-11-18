@@ -128,9 +128,23 @@ if [ "${GPU_HOLD:-}" != 1 ] && [ "${HW_GATE_GPU_HOLD:-1}" != 0 ] && [ -z "${HW_G
     hold=$(command -v gpu-hold 2> /dev/null || true)
     if [ -z "$hold" ] && [ -x "$(dirname "$0")/gpu-hold" ]; then hold="$(dirname "$0")/gpu-hold"; fi
     if [ -n "$hold" ]; then
-        GPU_HOLD=1 HW_GATE_TOKEN=none exec "$hold" \
-            -l "hw-gate${GITHUB_RUN_ID:+ run $GITHUB_RUN_ID} pid $$" \
-            -t "${HW_GATE_HOLD_MINUTES:-45}" -w "${HW_GATE_TOKEN_WAIT:-5400}" -- "$0" "$@"
+        # A refused take costs the queue position: gpu-hold exits 78 while ANY lane's kernel log carries a GPU
+        # fault in the last 10 min, so one neighbour that wedges the box every few minutes fails this gate
+        # without a single phase running (2026-11-18: /home/bcloud/hrx-2861/repro page-faulted at 14:11 and
+        # again at 14:21, and three takes in a row were refused). Wait the window out and retake, twice, then
+        # give up with the helper's own status. HW_GATE_FAULT_RETRY_WAIT is the wait before each retake.
+        tries=0
+        while :; do
+            rc=0
+            GPU_HOLD=1 HW_GATE_TOKEN=none "$hold" \
+                -l "hw-gate${GITHUB_RUN_ID:+ run $GITHUB_RUN_ID} pid $$" \
+                -t "${HW_GATE_HOLD_MINUTES:-45}" -w "${HW_GATE_TOKEN_WAIT:-5400}" -- "$0" "$@" || rc=$?
+            [ "$rc" = 78 ] || exit "$rc"
+            tries=$((tries + 1))
+            [ "$tries" -ge 2 ] && exit "$rc"
+            echo "hw-gate: gpu-hold refused the take (a GPU fault in the last 10 min); retry $tries in ${HW_GATE_FAULT_RETRY_WAIT:-660}s"
+            sleep "${HW_GATE_FAULT_RETRY_WAIT:-660}"
+        done
     fi
 fi
 

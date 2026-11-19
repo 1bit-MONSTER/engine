@@ -189,6 +189,7 @@ def main(argv):
         return 2
     total_elfs = total_bad = total_live = 0
     total_build_tree = total_other_live = 0
+    total_rpath = 0
     for root in roots:
         elvs, bad = [], []
         for dirpath, _dirnames, filenames in os.walk(root):
@@ -224,6 +225,14 @@ def main(argv):
                 print(f"  (dead = nothing this sweep can see is needed here; $LIB/$PLATFORM are not "
                       "expanded, so dead is not a promise that the entry can be dropped)")
             total_live += len(live)
+            # engine#2667 classified a sweep by what its LIVE entries resolve through, and left RPATH out of it:
+            # verdict() marks an $ORIGIN-only RPATH as the pseudo-entry "(RPATH, not RUNPATH)" (an empty one as
+            # "(empty RPATH)"), neither has a library to resolve, so live_in() finds nothing and the sweep read as
+            # harmless. An RPATH is not about what resolves today -- it overrides LD_LIBRARY_PATH, which is why
+            # #1411 made it fail -- so it is counted as its own hazard. Found by tests/installed_rpath_test.sh,
+            # whose "RPATH rather than RUNPATH fails" arm was red at main 90210d15.
+            total_rpath += sum(1 for _p, _k, _e, _v, _n in bad
+                               if _e.startswith("(RPATH") or _e.startswith("(empty RPATH"))
             for _p, _e, hits in live:
                 for _soname, _real in hits:
                     _k = resolved_kind(_real)
@@ -234,12 +243,14 @@ def main(argv):
         else:
             print(f"{root}: every RUNPATH is $ORIGIN")
     if total_bad:
-        if hazard_fails(total_build_tree, total_other_live):
+        if hazard_fails(total_build_tree, total_other_live) or total_rpath:
             where = (f"{total_build_tree} through a BUILD TREE (deleting or rebuilding that directory "
                      "stops the installed package starting)")
             if total_other_live:
                 where += f", {total_other_live} through an UNCLASSIFIED absolute path (a dependency this "
                 where += "check cannot vouch for)"
+            if total_rpath:
+                where += f", {total_rpath} RPATH (a baked-in search path wins over LD_LIBRARY_PATH)"
             print(f"FAIL {total_bad} offending RUNPATH entr{'y' if total_bad == 1 else 'ies'} across "
                   f"{total_elfs} ELF(s), {total_live} of them LIVE: {where}")
             return 1

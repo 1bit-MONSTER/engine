@@ -969,6 +969,32 @@ os.environ.pop(cw.TOKEN_VARS[1], None)
 check("with no token the line stays the plain advice",
       "HF_TOKEN sent" not in text_of([model("gated/one")])[1])
 
+# 18. engine#2812: two credentials, picked by HOST. The HF token must never be sent to
+#     api.github.com, the GitHub token is useless to Hugging Face, and a third-party URL must
+#     get neither. Unauthenticated api.github.com is 60 requests/hour per IP -- shared with every
+#     other job on a hosted runner's egress -- and two of the watch's three sweeps read it.
+for var in ("GITHUB_TOKEN", "GH_TOKEN") + cw.TOKEN_VARS:
+    os.environ.pop(var, None)
+check("no credentials -> api.github.com gets the UA only",
+      cw.json_headers("https://api.github.com/repos/a/b/commits") == {"User-Agent": "1bit-census-watch"})
+os.environ["GITHUB_TOKEN"] = "gh_example"
+check("api.github.com gets the GitHub token",
+      cw.json_headers("https://api.github.com/repos/a/b/commits").get("Authorization") == "Bearer gh_example")
+os.environ[cw.TOKEN_VARS[0]] = "hf_example"
+check("... and never the HF token",
+      "hf_example" not in cw.json_headers("https://api.github.com/repos/a/b/commits").get("Authorization", ""))
+check("huggingface.co gets the HF token",
+      cw.json_headers("https://huggingface.co/api/models/a/b").get("Authorization") == "Bearer hf_example")
+check("... and never the GitHub token",
+      "gh_example" not in cw.json_headers("https://huggingface.co/api/models/a/b").get("Authorization", ""))
+check("a third-party host gets neither credential",
+      cw.json_headers("https://example.com/x") == {"User-Agent": "1bit-census-watch"})
+os.environ.pop("GITHUB_TOKEN", None); os.environ.pop(cw.TOKEN_VARS[0], None)
+os.environ["GH_TOKEN"] = "gh_fallback"
+check("GH_TOKEN is the fallback for GitHub's API",
+      cw.json_headers("https://api.github.com/x").get("Authorization") == "Bearer gh_fallback")
+os.environ.pop("GH_TOKEN", None)
+
 # 17. A rejected token (401) must not cost the whole run: the page comes back anonymously.
 #     Pins the fallback that keeps engine#619's watcher useful on a stale HF_TOKEN.
 seen_auth = []
@@ -1221,5 +1247,23 @@ check("a class nobody registers is upstream-only", v["MicroLlamaForCausalLM"] ==
 # the arm that matters: no upstream answer must not become an answer
 v = cw.classify_uncovered({"NimbusMindForCausalLM"}, None)
 check("an unavailable converter yields 'unknown', never a guess", v["NimbusMindForCausalLM"] == "unknown")
+
+# engine#2814: an HF test fixture is not a family to map. `example/simulated` declares
+# `SimulatedForTestingClass`, and the daily watch reported it as `!! UNCOVERED (new class)` -- a coverage breach that no
+# registry entry could ever fix. Both tells are armed, and so is the control: a real unmapped class still alerts.
+rc, res = rc_of([model("example/simulated", "SimulatedForTestingClass")])
+check("a fixture's class does not alert (exit 0)", rc == 0 and res[cw.UNCOVERED] == [])
+check("…and it is reported, not dropped", res[cw.TEST_FIXTURE] == ["example/simulated"])
+rc, text = text_of([model("example/simulated", "SimulatedForTestingClass")])
+check("…and the report says TEST-FIXTURE beside the class name", "TEST-FIXTURE SimulatedForTestingClass" in text)
+check("…and never prints it as an alert", "!! UNCOVERED" not in text)
+
+# the second tell proves itself: the class name alone, from a real org
+rc, res = rc_of([model("someone/real-org", "DummyModelForCausalLM")])
+check("a class named for testing does not alert, whatever the org", rc == 0 and res[cw.UNCOVERED] == [])
+
+# control: the same shape without the tell is still the alert, so the filter cannot swallow real coverage
+rc, res = rc_of([model("example/nimbus", "NimbusMindForCausalLM")])
+check("control: a real unmapped class still alerts at exit 1", rc == 1 and res[cw.UNCOVERED] == ["example/nimbus"])
 
 print("\nall checks passed")

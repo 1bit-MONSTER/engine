@@ -2068,6 +2068,11 @@ int serve_models(const Options& o) {
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
+    // llama.cpp's own path for the same handler, exactly as /embeddings and /rerank are registered beside their /v1
+    // forms below. Two things depend on it: the short and spec warm-ups post here (engine#2853 -- they were 404ing
+    // against a server that never had the route, so the warm-up they promise moved nothing), and a client written
+    // for llama-server uses it.
+    srv.Post("/completion", post);
 
     // --port 0 means "whatever the kernel gives me", and this is the only place that knows which port that was. cpp-httplib's
     // bind_to_port() answers bool; the port comes back from bind_to_any_port(), which is the same bind_internal(host, 0, ...)
@@ -2644,6 +2649,11 @@ int serve_child(const Options& given) {
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
+    // llama.cpp's own path for the same handler, exactly as /embeddings and /rerank are registered beside their /v1
+    // forms below. Two things depend on it: the short and spec warm-ups post here (engine#2853 -- they were 404ing
+    // against a server that never had the route, so the warm-up they promise moved nothing), and a client written
+    // for llama-server uses it.
+    srv.Post("/completion", post);
     // The rest of llama-server's API, for the devices that run llama-server (Lemonade's
     // llamacpp backend, which the onebit recipe inherits, forwards these to us). They go to
     // the first backend; the NPU answers 501.

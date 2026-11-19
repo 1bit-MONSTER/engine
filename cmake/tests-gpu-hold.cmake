@@ -63,6 +63,12 @@ add_test(NAME gpu_hold_escape COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_es
 # and decides nothing -- the refusal at take is still the authority, because a queue wait can outlast the condition.
 add_test(NAME gpu_hold_queue_state COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_state_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 
+# engine#2727: a payload that re-invokes gpu-hold on the queue it is ALREADY inside queues behind its own ticket and
+# waits for it -- 764 s of a 14-minute window with the GPU idle on 2026-11-16, while coder-llm (every PR's pr-agent
+# check) waited 25 min behind it. The queue is now exported to the payload (GPU_HOLD_HELD_QUEUE/LABEL) and a same-queue
+# nest is refused (rc 2); a DIFFERENT queue still runs (npu-hold's documented GPU claim). Five arms, private queue.
+add_test(NAME gpu_hold_nested COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_nested_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
 # engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
 # queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
 # Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a
@@ -92,6 +98,13 @@ add_test(NAME gpu_hold_hold_dir COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_
 # for 40 s inside another lane's 45-minute hold. gpu-hold exports the exact token line it wrote (GPU_HOLD_TICKET) and the
 # label, and this asserts the child sees both, on a sandboxed HOME.
 add_test(NAME gpu_hold_child_identity COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_child_identity_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
+# engine#2773: a token whose holder is gone must be reaped WHOEVER wrote it. reap_token() gated on `gpu-hold*`,
+# and npu-serve-keeper holds the NPU token by design (npu-hold:22) -- so when the owner stopped that keeper the
+# token it left behind was never reaped: measured 11-16, a ticket queued 246 s behind "npu-serve-keeper pid
+# 298235" whose pid was already gone. Two arms: a dead foreign holder is reaped and the ticket taken; a LIVE
+# foreign holder is left alone, so the fix cannot steal a live lane's token.
+add_test(NAME gpu_hold_stale_token COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_stale_token_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 
 # engine#2494 (guard-drift class): the guards in scripts/gpu-hold protect the box only once they are INSTALLED, and what
 # runs is ~/.local/bin/gpu-hold -- a copy nothing re-installs on merge. Measured twice: "identical to engine main" after

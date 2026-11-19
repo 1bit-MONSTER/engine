@@ -26,9 +26,9 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 tool=$root/tools/check-installed-rpath.py
-command -v patchelf >/dev/null || { echo "SKIP check-installed-rpath: no patchelf"; exit 0; }
-command -v readelf  >/dev/null || { echo "SKIP check-installed-rpath: no readelf"; exit 0; }
-[ -x /bin/true ] || { echo "SKIP check-installed-rpath: no /bin/true fixture"; exit 0; }
+command -v patchelf >/dev/null || { echo "SKIP check-installed-rpath: no patchelf"; exit 77; }
+command -v readelf  >/dev/null || { echo "SKIP check-installed-rpath: no readelf"; exit 77; }
+[ -x /bin/true ] || { echo "SKIP check-installed-rpath: no /bin/true fixture"; exit 77; }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -49,14 +49,20 @@ out=$("$tool" "$work/good" 2>&1) && rc=0 || rc=$?
 check "origin-only passes" 0 "$rc"
 case $out in *PASS*) ;; *) echo "FAIL origin-only says: $out"; fails=$((fails + 1)) ;; esac
 
+# engine#2667 decided the exit code by what a LIVE entry resolves THROUGH, so a path nothing resolves is a WARN,
+# not a failure: these two fixtures name directories that do not exist on the box running the test, so they are the
+# dead case. The LIVE build-tree case (which must fail) is the `$work/live` fixture below -- it copies libc.so.6 in
+# so that the entry really is load-bearing. Before this was updated these two arms were red at main 90210d15 and the
+# file only ran on boxes with patchelf, so CI (which installs none) never saw it.
 mk build '/home/x/wt/release-rc/work/build/hrx/llama/bin:/home/x/wt/build/lib'
 out=$("$tool" "$work/build" 2>&1) && rc=0 || rc=$?
-check "a build tree fails" 1 "$rc"
+check "a DEAD build-tree entry warns instead of failing" 0 "$rc"
 case $out in *release-rc/work/build*) ;; *) echo "FAIL build-tree run did not name the path: $out"; fails=$((fails + 1)) ;; esac
+case $out in *WARN*) ;; *) echo "FAIL the dead build tree is not reported as a WARN: $out"; fails=$((fails + 1)) ;; esac
 
 mk mixed '$ORIGIN:/work-c22/hrx-toolchain/lib/llvm/lib/clang/24/lib/x86_64-unknown-linux-gnu'
 out=$("$tool" "$work/mixed" 2>&1) && rc=0 || rc=$?
-check "origin plus a toolchain dir fails" 1 "$rc"
+check "origin plus a DEAD toolchain dir warns" 0 "$rc"
 case $out in *dead*) ;; *) echo "FAIL a directory that holds nothing needed is not called dead: $out"; fails=$((fails + 1)) ;; esac
 # "dead" must not read as "safe to drop": $LIB/$PLATFORM are not expanded, so the report says so.
 case $out in *"not a promise that the entry can be dropped"*) ;; *) echo "FAIL dead is not qualified as sweep-scoped: $out"; fails=$((fails + 1)) ;; esac
@@ -71,7 +77,7 @@ out=$("$tool" "$work/live" 2>&1) && rc=0 || rc=$?
 check "a load-bearing entry still fails" 1 "$rc"
 case $out in *"LIVE libc.so.6"*) ;; *) echo "FAIL the load-bearing entry is not named LIVE with its library: $out"; fails=$((fails + 1)) ;; esac
 case $out in *"1 LIVE, 0 dead"*) ;; *) echo "FAIL the live/dead split is not in the summary: $out"; fails=$((fails + 1)) ;; esac
-case $out in *"cannot start if that directory is rebuilt"*) ;; *) echo "FAIL the FAIL line does not say what the hazard is: $out"; fails=$((fails + 1)) ;; esac
+case $out in *"deleting or rebuilding that directory stops the installed package starting"*) ;; *) echo "FAIL the FAIL line does not say what the hazard is: $out"; fails=$((fails + 1)) ;; esac
 
 mk rpath '$ORIGIN' --force-rpath
 out=$("$tool" "$work/rpath" 2>&1) && rc=0 || rc=$?

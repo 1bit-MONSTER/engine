@@ -60,6 +60,7 @@ loom-libs/motifs/flash_attention/qk_block_wmma.loom	1
 loom-libs/motifs/gated_delta_net/rmsnorm_gate.loom	1
 loom-libs/motifs/gated_delta_net/scan_state_head128.loom	54
 loom-libs/motifs/llm_attention_qkv_matmul_postops.loom	1
+loom-libs/motifs/kquant_iq1_s.loom	2
 loom-libs/motifs/matmul/tiled_input_f32_codebook_dequant_accumulate_f32.loom	2
 loom-libs/motifs/matmul/tiled_input_f32_dequant_accumulate_f32.loom	3
 loom-libs/motifs/matmul/tiled_input_f32_dequant_accumulate_f32_token64.loom	1

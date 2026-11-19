@@ -272,6 +272,13 @@ decode-path logits (`llama-perplexity -c 2049 -b 1 --save-all-logits`) are byte-
 to the previous pin, the buried code word is exact at 4700 tokens, and no GPU faults
 were observed.
 
+Since [engine#679](https://github.com/1bit-MONSTER/engine/issues/679) (llama.cpp `f2c91ccd`) this
+multipass arm is offered only up to 2,944 tokens of padded key-value capacity - the measured point
+where it stops winning against the general `ggml_flash_attention_f32_f16_wmma` - so the 2,100 and
+3,000 rows above describe the band it still serves (2,049-2,944), and the 4,800 row is now above
+the cap and runs the general kernel instead. The crossover measurement and the current limits are
+in the decode-split entry under "Known issues on `HRX0`".
+
 ### Fixed: one-token decode at a head size that is not a power of two ([engine#1926](https://github.com/1bit-MONSTER/engine/issues/1926))
 
 A model whose attention head size is not a power of two (stories15M: 48; Sarashina2.2-3B: 160) and whose
@@ -1320,7 +1327,21 @@ taken hours before a rebuild printed a clean `484/484` from the *pre-change* lib
   | ZAYA1-8B, off | 39–42 | 39–40 | 34–36 |
 
   (llama-bench `-p 0 -n 32/64`, runs interleaved on a shared strixhalo, 2026-09-27.)
-  `ONEBIT_HRX_DECODE_SPLIT=0` turns it off; a `GGML_HRX_DISABLE_DISPATCH` you set yourself wins.
+
+  Since llama.cpp `f2c91ccd` ([engine#679](https://github.com/1bit-MONSTER/engine/issues/679)) the
+  dispatch is offered only up to **2,944 tokens of padded KV capacity** (46 blocks), just below the
+  measured multipass/general crossover, and a longer decode falls through to the general
+  `ggml_flash_attention_f32_f16_wmma`. The multipass reducer folds the per-head partials with one
+  workgroup per KV head, so its cost grows with the context while the general kernel's is
+  context-linear; at 16k it was **2x slower**. Measured on Qwen3-4B-Q4_K_M / `HRX0`, both arms
+  interleaved in one `gpu-hold` claim, split-on vs registration-disabled tok/s: 2,048 59.84/55.87,
+  2,304 57.44/53.63, 3,072 49.10/49.43, 3,584 45.50/46.78, 4,096 40.66/43.96, 8,192 22.25/31.78,
+  16,384 10.41/20.02. The rows above are inside the kept multipass band and still hold.
+  `test-hrx-ops` pins both arms against the CPU reference (kv=2,048 and 2,304 expect the split
+  kernel, kv=4,096 and 16,384 the general one); `hw-gate.sh` does not run that suite, so they gate
+  where the fork's suite is run rather than in the engine gate.
+  `ONEBIT_HRX_DECODE_SPLIT=0` turns the dispatch off entirely; a `GGML_HRX_DISABLE_DISPATCH` you set
+  yourself wins.
 - **The ZAYA1-8B NaN abort does not reproduce (engine#433).** Three aborts were reported on 2026-10-16
   on the then-current pin (`06cc0ef` with llama.cpp `dd74f6bb0`) with a second HRX process on the GPU:
   the sampler guard logged "HRX returned NaN logits" and the server stopped. Re-running that condition

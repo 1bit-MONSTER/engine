@@ -75,8 +75,197 @@ check "the matmul reads the transposed initializer" "$wt_used" "w_t"
 check "the gather's untransposed copy is kept" "$w_kept" "True"
 check "the folded weight has the matmul orientation" "$shape" "3x4"
 
+# The orientation check has to be able to FAIL, or `--check` is only proving the node is gone (engine#2779 review).
+# Swap the folded tensor's values for a wrongly-oriented one of the same total size and the check must say so.
+python3 - "$tmp/out.onnx" "$tmp/swapped.onnx" <<'PY3' || { echo "FAIL could not build the swapped fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+for i, t in enumerate(m.graph.initializer):
+    if t.doc_string.startswith("folded:"):
+        # Read the provenance BEFORE CopyFrom: it resets the field, so reading it afterwards yields "" and the
+        # swapped graph would carry no provenance and pass the check -- which is what this arm first did.
+        doc = t.doc_string
+        name = t.name
+        a = numpy_helper.to_array(t)
+        m.graph.initializer[i].CopyFrom(numpy_helper.from_array(np.ascontiguousarray(a.T), name))
+        m.graph.initializer[i].doc_string = doc
+onnx.save(m, sys.argv[2])
+PY3
+rc=0; python3 "$TOOL" --check "$tmp/swapped.onnx" >"$tmp/swaplog" 2>&1 || rc=$?
+check "check refuses a folded weight in the wrong orientation" "$rc" 1
+check "and names the perm it should have" "$(grep -c 'should be' "$tmp/swaplog")" 1
+
 rc=0; python3 "$TOOL" --check "$tmp/out.onnx" >/dev/null 2>&1 || rc=$?
 check "check accepts the folded graph" "$rc" 0
+
+# engine#2779: ONE weight folded under TWO DIFFERENT perms. The fold used to name the result after the source only, so
+# the second perm reused the first one's tensor and rewired its consumers to the wrong orientation while --check passed.
+python3 - "$tmp/two.onnx" <<'PY2' || { echo "FAIL could not build the two-perm fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+w = numpy_helper.from_array(np.arange(12, dtype=np.float32).reshape(2, 3, 2), "w")     # 2x3x2: two perms differ in shape
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[1, 0, 2]),
+     helper.make_node("Transpose", ["w"], ["b"], perm=[0, 2, 1]),
+     helper.make_node("Identity", ["a"], ["oa"]),
+     helper.make_node("Identity", ["b"], ["ob"])],
+    "g",
+    [],
+    [helper.make_tensor_value_info("oa", TensorProto.FLOAT, None),
+     helper.make_tensor_value_info("ob", TensorProto.FLOAT, None)],
+    [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY2
+
+python3 "$TOOL" "$tmp/two.onnx" "$tmp/two-out.onnx" >"$tmp/two.log" 2>&1 || { cat "$tmp/two.log"; fail=$((fail+1)); }
+check "two perms fold into two weights" "$(grep -c '^folded ' "$tmp/two.log")" 2
+read -r distinct d0 d1 ok_a ok_b <<EOF
+$(python3 - "$tmp/two-out.onnx" <<'PY2'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
+ident = {n.output[0]: n.input[0] for n in m.graph.node if n.op_type == "Identity"}
+a, b = ident["oa"], ident["ob"]
+w = np.arange(12, dtype=np.float32).reshape(2, 3, 2)     # the source is dropped when nothing else reads it
+print(a != b,
+      "x".join(str(d) for d in inits[a].shape), "x".join(str(d) for d in inits[b].shape),
+      np.array_equal(inits[a], np.transpose(w, (1, 0, 2))),
+      np.array_equal(inits[b], np.transpose(w, (0, 2, 1))))
+PY2
+)
+EOF
+check "each perm gets its own name" "$distinct" "True"
+check "perm [1,0,2] tensor has shape" "$d0" "3x2x2"
+check "perm [0,2,1] tensor has shape" "$d1" "2x2x3"
+check "consumer a reads perm [1,0,2]'s values" "$ok_a" "True"
+check "consumer b reads perm [0,2,1]'s values" "$ok_b" "True"
+
+# ...and the case with NO symptom at all: a square weight, where both perms have the same shape and only the values
+# differ. This is the arm that would pass silently on a shape-only check.
+python3 - "$tmp/sq.onnx" <<'PY2' || { echo "FAIL could not build the square fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+w = numpy_helper.from_array(np.arange(4, dtype=np.float32).reshape(2, 2), "w")        # [[0,1],[2,3]]
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[0, 1]),
+     helper.make_node("Transpose", ["w"], ["b"], perm=[1, 0]),
+     helper.make_node("Identity", ["a"], ["oa"]),
+     helper.make_node("Identity", ["b"], ["ob"])],
+    "g",
+    [],
+    [helper.make_tensor_value_info("oa", TensorProto.FLOAT, None),
+     helper.make_tensor_value_info("ob", TensorProto.FLOAT, None)],
+    [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY2
+
+python3 "$TOOL" "$tmp/sq.onnx" "$tmp/sq-out.onnx" >"$tmp/sq.log" 2>&1 || { cat "$tmp/sq.log"; fail=$((fail+1)); }
+same_shape_dir=$(python3 - "$tmp/sq-out.onnx" <<'PY2'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
+ident = {n.output[0]: n.input[0] for n in m.graph.node if n.op_type == "Identity"}
+a, b = ident["oa"], ident["ob"]
+print("different" if not np.array_equal(inits[a], inits[b]) else "same")
+PY2
+)
+check "square weight: the two consumers still read different values" "$same_shape_dir" "different"
+
+# ...and the collision in the other direction: the SOURCE graph already carries an initializer called `w_t` that has
+# nothing to do with the fold. Reusing it because the name matches would be the same silent corruption on a graph that
+# never had two perms at all.
+python3 - "$tmp/taken.onnx" <<'PY2' || { echo "FAIL could not build the taken-name fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+w   = numpy_helper.from_array(np.arange(6, dtype=np.float32).reshape(2, 3), "w")
+# an unrelated tensor that happens to be called w_t, with the RIGHT shape and the WRONG values
+w_t = numpy_helper.from_array(np.full((3, 2), 7.0, dtype=np.float32), "w_t")
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[1, 0]),
+     helper.make_node("Identity", ["a"], ["oa"]),
+     helper.make_node("Identity", ["w_t"], ["keep"])],
+    "g",
+    [],
+    [helper.make_tensor_value_info("oa", TensorProto.FLOAT, None),
+     helper.make_tensor_value_info("keep", TensorProto.FLOAT, None)],
+    [w, w_t])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1])
+PY2
+
+python3 "$TOOL" "$tmp/taken.onnx" "$tmp/taken-out.onnx" >"$tmp/taken.log" 2>&1 || { cat "$tmp/taken.log"; fail=$((fail+1)); }
+taken_verdict=$(python3 - "$tmp/taken-out.onnx" <<'PY2'
+import sys
+import numpy as np
+import onnx
+from onnx import numpy_helper
+m = onnx.load(sys.argv[1])
+inits = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
+ident = {n.output[0]: n.input[0] for n in m.graph.node if n.op_type == "Identity"}
+read = ident.get("oa")
+w = np.arange(6, dtype=np.float32).reshape(2, 3)
+print("right" if read and np.array_equal(inits[read], np.transpose(w, (1, 0))) else f"WRONG({read})")
+PY2
+)
+check "an unrelated w_t in the source graph is not reused" "$taken_verdict" "right"
+
+# engine#2769 review: the pack's layout is the export's. `onnx.save()` inlines every external tensor by default, so a
+# decoder whose 159 MB head lived in a `.onnx.data` came out as one giant graph with the copied sidecar dead. Both
+# directions: an external source stays external (sidecar written, `data_location` still EXTERNAL), an inline source
+# stays inline (no sidecar appears).
+python3 - "$tmp/ext.onnx" <<'PY2' || { echo "FAIL could not build the external-data fixture"; exit 1; }
+import sys
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+w = numpy_helper.from_array(np.zeros((1024, 1024), dtype=np.float32), "w")     # 4 MiB, over the 1024 B threshold
+g = helper.make_graph(
+    [helper.make_node("Transpose", ["w"], ["a"], perm=[1, 0]),
+     helper.make_node("MatMul", ["x", "a"], ["y"])],
+    "g",
+    [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1024])],
+    [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1024])],
+    [w])
+onnx.save(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]), sys.argv[1],
+          save_as_external_data=True, all_tensors_to_one_file=True,
+          location="ext.onnx.data", size_threshold=0)
+PY2
+python3 "$TOOL" "$tmp/ext.onnx" "$tmp/ext-out.onnx" >"$tmp/ext.log" 2>&1 || { cat "$tmp/ext.log"; fail=$((fail+1)); }
+ext_verdict=$(python3 - "$tmp/ext-out.onnx" <<'PY2'
+import os
+import sys
+import onnx
+m = onnx.load(sys.argv[1], load_external_data=False)
+external = [i for i in m.graph.initializer if i.data_location == onnx.TensorProto.EXTERNAL]
+sidecar = os.path.getsize(sys.argv[1] + ".data") if os.path.exists(sys.argv[1] + ".data") else 0
+print("external" if external and sidecar > 1024 else f"INLINED({len(external)}/{sidecar})")
+PY2
+)
+check "an external source stays external" "$ext_verdict" "external"
+inline_verdict=$(python3 - "$tmp/out.onnx" <<'PY2'
+import os
+import sys
+import onnx
+m = onnx.load(sys.argv[1], load_external_data=False)
+external = [i for i in m.graph.initializer if i.data_location == onnx.TensorProto.EXTERNAL]
+print("no-sidecar" if not external and not os.path.exists(sys.argv[1] + ".data") else "SIDECAR")
+PY2
+)
+check "an inline source stays inline" "$inline_verdict" "no-sidecar"
 
 echo "---"
 if [ "$fail" -ne 0 ]; then echo "$fail failed"; exit 1; fi

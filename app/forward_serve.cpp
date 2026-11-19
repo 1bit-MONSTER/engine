@@ -1641,6 +1641,15 @@ int run_forward_serve(int argc, char** argv) {
     // engine#2689 item 3b: one forward, one decode loop, N requests sharing its rows. The batch's thread takes the forward
     // from here on, so the serial path below is only used when --npu-batch-users is 1 (the default).
     if (batch_users > 1) {
+        // engine#2689 item 3b follow-up: a model whose per-sequence state is more than its KV cache cannot share a
+        // pass at all, so the flag is refused HERE -- before /health answers. Measured: --npu-batch-users 8 on
+        // bonsai2-27b-t2s2 (GDN) got a healthy endpoint that returned HTTP 500 to every single request, with the
+        // reason only in the server log.
+        if (!e.fwd->step_users_supported())
+            throw std::runtime_error(
+                "--npu-batch-users " + std::to_string(batch_users) + " refused: this model keeps per-sequence attention "
+                "state beside its KV cache (GDN linear attention or MLA), or is a noncausal pack, so one pass cannot "
+                "carry several sequences; run without --npu-batch-users");
         // The prefix cache is on by default (8 slots) and its snapshots come from the forward, so a batched serve turns it
         // OFF unless the operator asked for it explicitly -- and an explicit one is then refused per request, below, rather
         // than silently ignored.

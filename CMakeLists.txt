@@ -487,6 +487,9 @@ add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_or
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
 add_python_test(ci_targets ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#2878: the parser is the part of the fault-burst capture that has to be right, and it is
+# pure, so its self-test runs here; the capture itself needs the box.
+add_python_test(fault_burst_capture_self ${CMAKE_SOURCE_DIR}/tools/diag/fault_burst_capture.py --self-test)
 # engine#2641: #2625 merged with its own conflict markers still in docs/nvme-iommu-fault-triage.md, inside a ```bash
 # block, so the page did not render and nothing noticed -- the merge kept them because the file was never read back.
 # The check is stateful on purpose: a bare `=======` is a Markdown underline or a shell rule (the first version

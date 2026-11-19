@@ -100,6 +100,11 @@
    "family": "Haru-4B full-duplex speech-to-speech (qwen3_5_text LM trunk + audio codec + MeanFlow head); nothing upstream implements it",
    "watch": "report"
   },
+  "HYV4FlashForConditionalGeneration": {
+   "model_type": "hy_v4_flash",
+   "family": "Hy v4 Flash: vision+text MoE (hidden 3072, 42 layers, 16 experts/token, head_dim 64, vocab 120832, 1M ctx) whose layer_types mix deepseek_sparse_attention with sliding_attention under a compressed indexer; the pinned backend knows only HYV4ForCausalLM -> hy_v4 (text, DeepseekV2Model) and has no hy_v4_vl, so neither the wrapper class nor the Flash trunk name maps",
+   "watch": "report"
+  },
   "HrmTextForCausalLM": {
    "model_type": "hrm_text",
    "family": "HRM-Text hierarchical-reasoning LM (Sapient)",

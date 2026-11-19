@@ -1304,3 +1304,37 @@ Reported, not alerted (`"watch": "report"`). The one model of the family the wat
 `Jayanth-MKV/Haru-4B-GGUF`, whose `config.json` declares `Qwen3_5ForCausalLM` — is a qwen-trunk re-wrap
 that ships `meanflow-head-f16.safetensors` and `vibevoice-codec-f16.safetensors` beside its GGUF: covered
 for text, not for this class.
+
+## 2026-11-19: `HYV4FlashForConditionalGeneration` — reviewed, not an alias (engine#2875)
+
+The 2026-11-19 watcher run alerted `!! UNCOVERED HYV4FlashForConditionalGeneration (new class)`, one model
+from one uploader: `autotrust/hy4-flash-concise` (created 2026-11-19, a re-wrap of `atakans/Hy4-flash-NVFP4`,
+itself a quantisation of `tencent/Hy4-flash`).
+
+* **What it is**: Hy v4 Flash, a vision+text model. `config.json` declares
+  `architectures: ["HYV4FlashForConditionalGeneration"]`, `model_type: hy_v4_flash`, a vision side
+  (`processor_class: HYV4FlashProcessor`, `image_token_id` 120120, `image_start`/`image_end`/`image_newline`
+  120118–120121, `spatial_merge_size` 2), and a `text_config` declaring `HYV4FlashForCausalLM`: hidden 3072,
+  42 layers, 32 heads / 32 KV, **head_dim 64**, vocab 120832, `max_position_embeddings` 1048576,
+  `num_experts_per_tok` 16, `moe_intermediate_size` 1536, `intermediate_size` 13824.
+* **What the trunk adds over anything we run**: `layer_types` alternate `deepseek_sparse_attention` with
+  `sliding_attention` under a compressed indexer (`compressed_indexer_compress_ratio` 4,
+  `compressed_indexer_head_dim` 128, `compressed_indexer_key_pooling: "gated"`,
+  `compressed_indexer_stage2_query_block_size` 8192, `compressed_indexer_use_triton_pooling` true), plus
+  `engram_*` embedding fields (`engram_fp8_embedding`, `engram_layer_head_vocab_sizes`, seed 1234) and
+  `dsa_skip_attn_post_norm` / `enable_ihc` switches. That is a sparse-attention graph, not the dense
+  transformer our `deepseek2`/`qwen3` graphs implement.
+* **Not mappable by name, and not a pin gap**: the pinned backend (pinned fork commit `8d26add2cf9a`) registers exactly one
+  hy class, `HYV4ForCausalLM -> hy_v4` (`conversion/__init__.py:145`, `conversion/hy_v4.py:24`
+  `class HYV4Model(DeepseekV2Model)`, `src/llama-arch.cpp:140`), which is the text-only Deepseek-v2-shaped
+  model. There is no `hy_v4_vl` anywhere in it (`ggml-org/llama.cpp` code search: 0 hits), and the Flash
+  trunk name `HYV4FlashForCausalLM` is unknown to it, so neither the wrapper class nor this trunk converts.
+  Upstream transformers main does ship `hy_v4` and `hy_v4_vl` (557 model dirs), which is why the watcher read
+  the class as native rather than `. REMOTE-CODE` — support in the reference implementation is not support in
+  a backend this engine can call.
+* **What real support requires**: an `hy_v4_vl` multimodal path (vision tower + projector) in the pinned
+  backend, an encoder path in `mtmd`, and a sparse-attention (compressed indexer) attention kernel. None of
+  that is a mapping edit, so mapping the name would advertise a family the engine cannot serve.
+
+Reported, not alerted (`"watch": "report"`). The single model of the family is also an NVFP4/8-bit re-wrap,
+so there is no bf16 checkpoint of it here to measure even if the graph existed.

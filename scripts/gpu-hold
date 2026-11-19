@@ -97,6 +97,8 @@ case $MEM_ABORT_GB in
         ;;
 esac
 POLL=${GPU_HOLD_POLL:-2}
+# How long a token that names no holder must sit unchanged before it is treated as a leftover rather than a claim.
+TOKEN_GRACE=${GPU_HOLD_TOKEN_GRACE:-5}
 LOG=${GPU_HOLD_LOG:-}
 THERMAL_FLAG=${GPU_HOLD_THERMAL_FLAG:-$HOME/THERMAL-HOLD}
 COOLDOWN=${GPU_HOLD_COOLDOWN:-180}
@@ -344,7 +346,7 @@ oldest_ticket() {
 # does not know.
 reap_token() {
     [ -e "$TOKEN" ] || return 0
-    local content pid
+    local content pid age
     content=$(cat "$TOKEN" 2> /dev/null) || return 0
     # Any writer that stamps a pid, not only gpu-hold. `npu-serve-keeper` holds the NPU token while the
     # owner's serve is up (npu-hold:22), so when the owner stops the keeper -- a normal, sanctioned action --
@@ -353,9 +355,25 @@ reap_token() {
     # "npu-serve-keeper pid 298235" whose pid was already gone, and every NPU ticket on the box would have run
     # to -w the same way. The pid is the identity; the prefix is not.
     pid=$(printf '%s' "$content" | sed -n 's/.* pid \([0-9][0-9]*\) .*/\1/p' | head -n 1)
-    if [ -n "$pid" ] && ! kill -0 "$pid" 2> /dev/null; then
+    if [ -n "$pid" ]; then
+        if ! kill -0 "$pid" 2> /dev/null; then
+            rm -f "$TOKEN"
+            log "dropped stale token (holder pid $pid gone): $content"
+        fi
+        return 0
+    fi
+    # A token that names NO holder is invisible to the arm above, and the grant path cannot take it either: the
+    # write is `set -o noclobber`, so it fails silently against the existing file and the poll says nothing, which
+    # leaves every ticket on the box spinning for as long as the file exists. Measured 2026-11-19: a 0-byte
+    # ~/GPU-TOKEN left behind by a crash cycle parked ticket ab2 for 4828 s, and the very next poll after
+    # `rm -f ~/GPU-TOKEN` granted in 0 s. The grace is what keeps a live holder mid-write from being stolen: a
+    # holder writes its token once, so an unreadable token unchanged for $TOKEN_GRACE seconds is a leftover. A
+    # holder that stamps no ` pid N ` at all cannot be told apart from a crash leftover; the grace bounds what
+    # that costs it (one grant), where leaving the file alone costs every later lane the wait it sets.
+    age=$(( $(date +%s) - $(stat -c %Y "$TOKEN" 2> /dev/null || date +%s) ))
+    if [ "$age" -ge "$TOKEN_GRACE" ]; then
         rm -f "$TOKEN"
-        log "dropped stale token (holder pid $pid gone): $content"
+        log "dropped unreadable token (no holder pid, unchanged for ${age}s): ${content:-<empty>}"
     fi
 }
 

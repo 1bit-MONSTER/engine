@@ -1291,7 +1291,7 @@ other uncovered classes (`HYV4FlashForConditionalGeneration`, `DSpineDraftModel`
 * **Not an alias of `Qwen3_5ForCausalLM`**: the `qwen35` graph has no audio projections, no MeanFlow head
   and no codec, so the text trunk alone is not the model — the class predicts audio as well as text.
 * **Not mappable by a pin bump** either: no `haru` in the fork's `conversion/*.py` or
-  `src/llama-arch.cpp` (pin `4df0f3e6cf92`), none in `npu/`, and the published GGUF
+  `src/llama-arch.cpp` (pin `8d26add2cf9a`), none in `npu/`, and the published GGUF
   (`sakasegawa/Haru-4B-GGUF`) declares `general.architecture = haru` with 1035 tensors and
   `speech.layout` / `speech.requires` beside it, i.e. its own GGUF architecture rather than `qwen35`.
 * **Upstream has no implementation**: no `haru` package in transformers main (554 model dirs, `qwen3_5`

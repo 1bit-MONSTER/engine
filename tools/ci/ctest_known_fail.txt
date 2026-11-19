@@ -31,6 +31,8 @@ test-llama-context-model               # SEGFAULT -- model behavior backend
 test-thread-safety                     # SEGFAULT -- main backend
 test-arg-parser                        # Failed -- behavior
 test-model-resolution                  # SEGFAULT -- behavior
+test-hrx-loom-jit                      # Subprocess aborted -- hrx; seen in the 2026-11-17 gfx1201 sweep and on the runner, never listed here
+hrx-loom-jit-test                      # Failed -- hrx; the same row under its other name
 hrx-backend-test-loom                  # Failed -- hrx
 test-hrx-fa-transposed-value           # Subprocess aborted
 test-hrx-mul-mat-id-k32                # Subprocess aborted

@@ -545,6 +545,9 @@ if [ -z "$BIN" ]; then
     # ${DIST_DIR} (the build tree) and validates whichever exists even with the UI switched off.
     dist_state() { [ -e "$1/index.html" ] && echo "present($(find "$1" -type f | wc -l) files)" || echo absent; }
     ui_report="hw-gate: src=$src build=$build ui-checkout-dist=$(dist_state "$src/tools/ui/dist") ui-build-dist=$(dist_state "$build/tools/ui/dist") ui-stamp=$(cat "$build/tools/ui/.ui-stamp" 2>/dev/null || echo none) ui-cache=$(grep -m1 '^LLAMA_USE_PREBUILT_UI:' "$build/CMakeCache.txt" 2>/dev/null || echo none)"
+    # engine#2868: log it on every run, not only when the validation fails -- a cache-hit build
+    # (build PASS 2s) proves nothing about which dist the configure read, and that is the question.
+    echo "$ui_report" >> "$OUT/build.log"
     # A tree that provisioned a dist earlier still embeds and validates it (ui-assets.cmake emit_files only
     # skips the check when the directory holds nothing), so the downloaded copy goes with the cache.
     rm -rf "$build/tools/ui/dist"

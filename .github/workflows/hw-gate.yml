@@ -161,6 +161,15 @@ jobs:
           PHASES: ${{ inputs.phases || 'build,ops,kat,kld,needle,placement' }}
         run: scripts/hw-gate.sh --phases "$PHASES"
 
+      - name: Which trees and ui dist the build read (engine#2868)
+        if: always()
+        env:
+          HW_GATE_OUT: ${{ runner.temp }}/hw-gate
+        run: |
+          # hw-gate.sh records src, build and both ui dists into build.log; that file lives in the
+          # runner's temp dir and dies with the job, so the answer to #2868 was unreadable even on the
+          # run that printed it. Surface the line on stdout while the job is alive.
+          grep -h "hw-gate: src=" "$HW_GATE_OUT/build.log" || echo "hw-gate: no ui/tree report in build.log"
       - name: Logs of failed checks
         if: failure()
         env:

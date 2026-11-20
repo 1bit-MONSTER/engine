@@ -125,6 +125,23 @@ int main() {
         std::printf("SKIP: init_host failed for the batched instance (%s)\n", fwd.last_error());
         return 77;
     }
+    // A container whose per-sequence state is more than its KV cache cannot share a pass, and then the one thing to
+    // check is that step_users() says so by name instead of answering. A model let through by mistake does not crash:
+    // it returns rows that are not that sequence's own (short-convolution layers did, until the review of engine#2978's
+    // fix), which is what the rest of this file fails on when the predicate and the refusal disagree.
+    if (!fwd.step_users_supported()) {
+        std::vector<float> all;
+        if (fwd.step_users({1, 2}, {0, 1}, {0, 0}, all) || !all.empty()) {
+            std::printf("FAIL step_users ran a pass on a container step_users_supported() rules out\n");
+            return 1;
+        }
+        if (std::string(fwd.last_error()).find("step_users: ") != 0) {
+            std::printf("FAIL the refusal does not name step_users: %s\n", fwd.last_error());
+            return 1;
+        }
+        std::printf("ok: this container cannot share a pass and step_users refuses it by name: %s\n", fwd.last_error());
+        return 0;
+    }
     // Prefill through step_users too, one slot at a time: the slot caches must be filled exactly as step_batch fills
     // the model's own cache, or the decode rows below start from the wrong prefix.
     for (int u = 0; u < users; u++) {

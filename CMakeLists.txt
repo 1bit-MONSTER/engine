@@ -2959,6 +2959,13 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:step_users_test>)
     set_tests_properties(step_users PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # The same test on the fabricated LFM2 hybrid: short-convolution layers keep a per-sequence window that is not KV, so
+    # the model must be refused by name. Before the refusal existed this row failed on its first decode row (a slot read
+    # the window another slot's row had left).
+    add_test(NAME step_users_lfm2
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:step_users_test> lfm2)
+    set_tests_properties(step_users_lfm2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     add_executable(npu_batch_slot_reuse_test tests/npu_batch_slot_reuse_test.cpp)
     target_include_directories(npu_batch_slot_reuse_test PRIVATE app)
     target_link_libraries(npu_batch_slot_reuse_test PRIVATE onebit_npu_forward_ci)

@@ -43,6 +43,8 @@ int main() {
                 for (int k = 0; k < K; k++) A[size_t(2) * K + k] = (k & 1) ? -0.0f : 0.0f;
                 A[size_t(3) * K + 0] = std::numeric_limits<float>::quiet_NaN();
                 A[size_t(3) * K + (K - 1)] = -std::numeric_limits<float>::infinity();
+                // -inf in a VECTOR lane (index 8 = 0 mod 8), not only in the scalar tail: |x| = +inf through max_ps
+                if (K >= 16) A[size_t(4) * K + 8] = -std::numeric_limits<float>::infinity();
                 A[0] = 1e-42f;                                                              // denormal
             }
             std::vector<float> ref(static_cast<size_t>(M));
@@ -76,6 +78,12 @@ int main() {
                 }
         }
     }
+    // A decode launch (M = 1 or 16) and anything under kMinRows keeps its serial loop, whatever ONEBIT_NPU_GLUE_THREADS says.
+    for (const int m : {1, 16, 63})
+        if (rh::threads_for(m) != 1) {
+            std::printf("FAIL threads_for(%d) = %d, want 1\n", m, rh::threads_for(m));
+            failures++;
+        }
     // engine#1783: dequant with a folded tail == dequant, then the tail, for every variant (bias + GELU, bias + residual).
     {
         const int M = 1500, N = 768, ldc = 1024, ldo = 768;

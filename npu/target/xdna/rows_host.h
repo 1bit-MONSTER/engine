@@ -23,8 +23,11 @@
 //  * amax: `a > amax ? a : amax` over |a| skips NaN (the comparison is false) and keeps +0 for a zero row. _mm256_max_ps(x, m)
 //    returns its SECOND operand when either is NaN, so max_ps(|x|, acc) skips NaN the same way, and a max is exact whatever
 //    the order, so the lane-wise reduction gives the same float as the serial walk.
-//  * dequant: cvtepi32_ps rounds like the (float) cast, then two separate multiplies in the scalar order (no FMA: the clone
-//    is compiled for avx2 only, so nothing can contract them).
+//  * dequant: cvtepi32_ps rounds like the (float) cast, then two separate multiplies in the scalar order. No add follows
+//    a multiply, so there is nothing an FMA could contract, whatever the TU's -mfma / -ffp-contract setting.
+// What ties the *_base loops to the inline loops they replaced is the device encoder hash: the whisper-small device route
+// printed the same encode-only "output fnv" before and after the move (engine#1783), so the base loops compute what those
+// loops computed; tests/npu_rows_host_test.cpp then holds every other variant to the base loops byte for byte.
 // ONEBIT_NPU_GLUE_AVX2=0 keeps the scalar loops; ONEBIT_NPU_GLUE_THREADS=<n> sets the thread count (1 = serial). Only
 // launches of at least kMinRows rows are threaded; a decode launch (M = 1 or 16) keeps its serial loop.
 #ifndef ONEBIT_NPU_TARGET_XDNA_ROWS_HOST_H

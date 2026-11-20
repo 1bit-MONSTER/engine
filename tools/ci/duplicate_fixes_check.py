@@ -367,6 +367,16 @@ def self_test():
     old_mp = dict(mp, merged_at="2020-01-01T00:00:00Z")
     tw3, nt3 = mended_twins([op], [old_mp], files_of=lambda n: fmap[n], days=2)
     ok(len(tw3) == 0 and len(nt3) == 0, "... and a merge outside the window is not a twin (or a note)")
+    # engine#2991/#2993: 'engine#2987: ...' is neither a claim nor a Refs, and the gate said clean on a real pair
+    a = {'number': 9101, 'title': 'crash after the skip line', 'body': '**engine#9100: a row that crashed**'}
+    b = {'number': 9102, 'title': 'skip line then segfault', 'body': 'Fixes #9100.'}
+    bm = bare_mentions([a, b], files_of=lambda n: ['tools/ci/ctest_known_fail.py'])
+    ok(len(bm) == 1 and bm[0][0] == 9100, "a bare #N plus a shared file is reported when neither names a verb")
+    bm2 = bare_mentions([a, b], files_of=lambda n: ['tools/ci/ctest_known_fail.py'] if n == 9101 else ['x.cpp'])
+    ok(len(bm2) == 0, "... and is silent when the two PRs touch different files")
+    a2 = {'number': 9101, 'title': 'engine#9100 twice', 'body': 'body: engine#9100 again'}
+    bm3 = bare_mentions([a2], files_of=lambda n: ['f.cpp'])
+    ok(len(bm3) == 0, "... and one PR naming the issue twice does not pair with ITSELF")
     # the file is written by a human, who writes `#2797`, not `2797`
     import pathlib
     import tempfile
@@ -526,6 +536,12 @@ def main(argv):
         need = sorted({p['number'] for issue, group in touched.items()
                        if issue not in reported and len(group) > 1 for p in group})
         groups = duplicates(prs, files_of(repo, need) if need else None)
+        # a bare `#N` mention plus a shared file: a NOTE, never a finding (see bare_mentions)
+        try:
+            bm = bare_mentions(prs, lambda n: files_of(repo, [n]).get(n, ()))
+            notes += [(repo,) + t for t in bm]
+        except (RuntimeError, json.JSONDecodeError):
+            pass
         for issue, group in groups:
             found.append({'repo': repo, 'issue': issue,
                           'prs': [{'number': p['number'], 'title': p['title'], 'draft': p['draft'],
@@ -551,9 +567,21 @@ def main(argv):
             print(f"  they touch {', '.join(shared)}" if shared else "")
             print(f"  if this is a follow-up, say `Refs #{issue}` and what differs; if it re-does the work, "
                   f"close it")
-        for repo, issue, op, mp in notes:
-            print(f"duplicate_fixes: {repo} #{op['number']} says `Fixes #{issue}`, which #{mp['number']} already "
-                  f"merged -- `Refs #{issue}` is the verb if this is a follow-up (not a finding)", file=sys.stderr)
+        for note in notes:
+            repo, issue = note[0], note[1]
+            if len(note) == 4:      # (repo, issue, open_pr, merged_pr) -- a follow-up with the wrong verb
+                op, mp = note[2], note[3]
+                print(f"duplicate_fixes: {repo} #{op['number']} says `Fixes #{issue}`, which #{mp['number']} "
+                      f"already merged -- `Refs #{issue}` is the verb if this is a follow-up (not a finding)",
+                      file=sys.stderr)
+            else:                   # (repo, issue, a, b, shared) -- two open PRs, one file, no verb
+                # NOT `a`/`b`: `a` is the argparse Namespace in this function, and rebinding it here made
+                # `if a.gate:` an AttributeError on the first run that printed a note -- a crash that only
+                # fires when the tool has something to say.
+                pa, pb, shared = note[2], note[3], note[4]
+                print(f"duplicate_fixes: {repo} #{pa['number']} and #{pb['number']} both name #{issue} and touch "
+                      f"{', '.join(shared)} -- neither says Fixes/Closes, so this is a note, not a finding",
+                      file=sys.stderr)
         for f in found:
             print(f"{f['repo']}: " + describe(f['issue'], f['prs']))
         clean = clean_line(found, failed)
@@ -572,6 +600,43 @@ def main(argv):
                   file=sys.stderr)
         return 0
     return exit_code(found, failed)
+
+
+def bare_mentions(prs, files_of=None):
+    """[(issue, a, b, shared)] -- two open PRs on one file that name one issue WITHOUT a closing verb.
+
+    Why (found live, 2026-11-20, ninety minutes after the previous hole): #2991 opened with
+    "**engine#2987: a row that crashed after printing the device-skip line is a failure**" and #2993 with
+    "Fixes #2987." -- same file, same issue, same fix. `claims()` did not match the first (no verb) and
+    `references()` did not either (no "Refs"), so the gate reported clean on a real duplicate.
+
+    A bare `#N` is how a lane names an issue it is DESCRIBING rather than closing, so it is evidence of a
+    pair and not a claim about one. It returns notes and never findings: two PRs on one file mention a
+    long-running issue (#2478) in passing all the time, and this tool's worst failure is refusing a
+    legitimate half. The shared-file requirement is what keeps the note worth printing.
+    """
+    MENTION = re.compile(r'#(\d+)')
+    by_issue = {}
+    for p in prs:
+        text = f"{p.get('title') or ''}\n{p.get('body') or ''}"
+        for m in MENTION.finditer(text):
+            # keyed by NUMBER, not appended: a body that names the issue in the title and again in the prose
+            # would otherwise put one PR in the group twice and pair it WITH ITSELF. I recorded exactly this
+            # bug this morning in a throwaway measurement script (17 pairs became 2 after deduping) and then
+            # wrote it again here -- "a duplicate detector that counts one PR as two claimants has the defect
+            # it was built to find, one level down".
+            by_issue.setdefault(int(m.group(1)), {})[p['number']] = p
+    out = []
+    for issue, groupd in sorted(by_issue.items()):
+        group = list(groupd.values())
+        if len(group) < 2 or files_of is None:
+            continue
+        for i, a in enumerate(group):
+            for b in group[i + 1:]:
+                shared = set(files_of(a['number'])) & set(files_of(b['number']))
+                if shared:
+                    out.append((issue, a, b, sorted(shared)))
+    return out
 
 
 def mended_twins(open_prs, merged_prs, files_of=None, days=2):

@@ -159,3 +159,10 @@ python3 tools/ci/hrx_bench_backend_check.py --log bench.log     # 0 initialised,
 
 `2` is not a pass: an empty log, or one with no result row and no runtime verdict, does not say a backend initialised.
 The check exists because the failure is silent in the artefact — the table looks the same either way.
+
+**The JSON says which build it measured, and the tree says which lowering (engine#2858).** `--json` writes a
+`provenance` stanza: `engine_rev`/`engine_dirty` of this checkout, `binary_sha256` of the `--onebit` binary actually run,
+and — when the binary sits in a build tree that carries `bench-stamp.txt` — that tree's own facts, including
+`loom_or_iree_rev` read out of the code objects the build emitted. A tree without a stamp keeps the explicit string
+`unknown` for each one; `stamp_matches_checkout` says whether the tree's recorded engine is this checkout, which is the
+question that could not be asked at all when both sides of an 11.22-vs-56.5 comparison looked like real numbers.

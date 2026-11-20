@@ -102,7 +102,11 @@ public:
     // attention and MLA keep a recurrence/absorption state per sequence, and a noncausal (or bidirectional-sliding)
     // pack encodes one prompt per pass -- a serve that asked for --npu-batch-users on one of those would answer
     // /health and then fail EVERY request inside step_users, so the flag is refused at startup instead.
-    bool step_users_supported() const { return !lin_kd_ && !mla_ && !noncausal_attn_ && !bidir_sliding_; }
+    // A short-convolution layer (LFM2/LFM3) keeps the last taps of its input per sequence, which is state of the same
+    // kind: one window shared by every slot, and not cleared when a slot starts a new sequence (engine#2978 review).
+    bool step_users_supported() const {
+        return !lin_kd_ && !mla_ && !shortconv_ && !noncausal_attn_ && !bidir_sliding_;
+    }
     // engine#2102: what the decode family turned out to be, so a caller can say it out loud. `decode_roles()` is the number of
     // roles that got an M=16 kernel, `design_roles()` the number of roles the model has. 0 of N is the state that serves at a
     // fraction of the fused route's rate while printing nothing an operator would notice at the ready line: every decode step

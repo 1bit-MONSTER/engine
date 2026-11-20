@@ -125,6 +125,23 @@ int main() {
         std::printf("SKIP: init_host failed for the batched instance (%s)\n", fwd.last_error());
         return 77;
     }
+    // A container whose per-sequence state is more than its KV cache cannot share a pass, and then the one thing to
+    // check is that step_users() says so by name instead of answering. A model let through by mistake does not crash:
+    // it returns rows that are not that sequence's own (short-convolution layers did, until the review of engine#2978's
+    // fix), which is what the rest of this file fails on when the predicate and the refusal disagree.
+    if (!fwd.step_users_supported()) {
+        std::vector<float> all;
+        if (fwd.step_users({1, 2}, {0, 1}, {0, 0}, all) || !all.empty()) {
+            std::printf("FAIL step_users ran a pass on a container step_users_supported() rules out\n");
+            return 1;
+        }
+        if (std::string(fwd.last_error()).find("step_users: ") != 0) {
+            std::printf("FAIL the refusal does not name step_users: %s\n", fwd.last_error());
+            return 1;
+        }
+        std::printf("ok: this container cannot share a pass and step_users refuses it by name: %s\n", fwd.last_error());
+        return 0;
+    }
     // Prefill through step_users too, one slot at a time: the slot caches must be filled exactly as step_batch fills
     // the model's own cache, or the decode rows below start from the wrong prefix.
     for (int u = 0; u < users; u++) {
@@ -316,6 +333,88 @@ int main() {
         if (first_difference(fresh_last, stale_last) < 0) {
             std::printf("FAIL the stale conversation answers identically: this container cannot tell a cleared slot "
                         "from a re-used one, pick another ONEBIT_TEST_Q4NX\n");
+            return 1;
+        }
+    }
+
+    // The arm above runs slot 0 ALONE, so on its own it cannot tell "slot 0 was cleared" from "every slot was cleared",
+    // and it never puts a restart in the same pass as a sequence that continues (review of engine#2978's fix). One
+    // pass, three slots, three different things:
+    //   slot 0 continues the sequence it restarted above (position 4 of `second`),
+    //   slot 1 restarts at position 0 while it still holds its first conversation,
+    //   slot 2 continues the conversation it has held since the top of this file.
+    // Every row has its own single-sequence reference, so a clear that reaches a neighbour, or a neighbour's cache
+    // read by the restarted slot, shows as a differing row.
+    {
+        const std::vector<int> second = {21, 22, 23, 24};   // what slot 0 holds now
+        const std::vector<int> third = {31, 32, 33};        // slot 1's new prompt
+        const int tok0 = 25, tok2 = 17;                     // any ids: each reference is fed the same one
+        const int pos0 = int(second.size());
+        const int pos2 = at_pos[2] + 1;   // the single-slot arm advanced slots 1 and 2 (and their references) by one row
+        Q4nxNpuForward cont0, fresh1;
+        std::vector<float> tmp, want0, want1, want2;
+        if (!init(cont0, d) || !cont0.step_batch(second, 0, tmp) || !cont0.step(tok0, pos0, want0)) {
+            std::printf("FAIL reference for the restarted sequence's next row: %s\n", cont0.last_error());
+            return 1;
+        }
+        if (!init(fresh1, d) || !fresh1.step_batch(third, 0, want1) || want1.empty()) {
+            std::printf("FAIL fresh reference for the slot that restarts in a shared pass: %s\n", fresh1.last_error());
+            return 1;
+        }
+        if (!ref[2]->step(tok2, pos2, want2)) {
+            std::printf("FAIL reference for the neighbour that continues: %s\n", ref[2]->last_error());
+            return 1;
+        }
+        const std::vector<int> tokens = {tok0, third[0], third[1], third[2], tok2};
+        const std::vector<int> pos = {pos0, 0, 1, 2, pos2};
+        const std::vector<int> slot = {0, 1, 1, 1, 2};
+        std::vector<float> all;
+        if (!fwd.step_users(tokens, pos, slot, all)) {
+            std::printf("FAIL a pass where one slot restarts and its neighbours continue: %s\n", fwd.last_error());
+            return 1;
+        }
+        if (all.size() != tokens.size() * width) {
+            std::printf("FAIL the mixed pass returned %zu logits, want %zu rows of %zu\n", all.size(), tokens.size(),
+                        width);
+            return 1;
+        }
+        const struct {
+            size_t row;
+            const std::vector<float>* want;
+            const char* what;
+        } rows[] = {
+            {0, &want0, "slot 0 (continuing below a slot that restarts)"},
+            {3, &want1, "slot 1 (restarting between two slots that continue)"},
+            {4, &want2, "slot 2 (continuing above a slot that restarts)"},
+        };
+        for (const auto& r : rows) {
+            const std::vector<float> got(all.begin() + long(r.row * width), all.begin() + long((r.row + 1) * width));
+            const int at = first_difference(got, *r.want);
+            if (at >= 0) {
+                std::printf("FAIL %s differs at logit %d: %.9g, its own single-sequence run says %.9g\n", r.what, at,
+                            got[(size_t)at], (*r.want)[(size_t)at]);
+                return 1;
+            }
+        }
+        // The exemption is for position 0 only. A start INSIDE the sequence a slot holds is still refused (slot 0 holds
+        // 5 positions now), and the refusal leaves the slot as it was: its next row is still its own.
+        std::vector<float> row;
+        if (fwd.step_users({26}, {2}, {0}, row)) {
+            std::printf("FAIL a start inside the slot's sequence (position 2 of 5) was accepted\n");
+            return 1;
+        }
+        if (std::string(fwd.last_error()).find("holds 5 position(s)") == std::string::npos) {
+            std::printf("FAIL the refusal does not say what the slot holds: %s\n", fwd.last_error());
+            return 1;
+        }
+        if (!cont0.step(26, pos0 + 1, want0) || !fwd.step_users({26}, {pos0 + 1}, {0}, row)) {
+            std::printf("FAIL slot 0 after a refused pass: %s / %s\n", cont0.last_error(), fwd.last_error());
+            return 1;
+        }
+        const int at = first_difference(row, want0);
+        if (at >= 0) {
+            std::printf("FAIL a refused pass changed the slot it refused: logit %d is %.9g, its own run says %.9g\n", at,
+                        row[(size_t)at], want0[(size_t)at]);
             return 1;
         }
     }

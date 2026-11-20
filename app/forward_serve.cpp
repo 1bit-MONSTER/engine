@@ -1699,7 +1699,8 @@ int run_forward_serve(int argc, char** argv) {
         if (!e.fwd->step_users_supported())
             throw std::runtime_error(
                 "--npu-batch-users " + std::to_string(batch_users) + " refused: this model keeps per-sequence attention "
-                "state beside its KV cache (GDN linear attention or MLA), or is a noncausal pack, so one pass cannot "
+                "state beside its KV cache (GDN linear attention, MLA or short-convolution layers), or is a noncausal "
+                "pack, so one pass cannot "
                 "carry several sequences; run without --npu-batch-users");
         // The prefix cache is on by default (8 slots) and its snapshots come from the forward, so a batched serve turns it
         // OFF unless the operator asked for it explicitly -- and an explicit one is then refused per request, below, rather

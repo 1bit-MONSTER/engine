@@ -552,13 +552,13 @@ def main():
         env.pop("NPU_INFER_HOST_GEMM", None)   # init_host is host-GEMM already; nothing else should steer it
         r = subprocess.run([sys.argv[1]], env=env, capture_output=True, text=True, timeout=110)
         for line in (r.stdout + r.stderr).splitlines():
-            if (line.startswith(("PASS", "FAIL", "SKIP", "ALL PASS", "FAILED", "[batchcheck]")) or
+            if (line.startswith(("PASS", "FAIL", "SKIP", "ALL PASS", "FAILED", "[batchcheck]", "ok:")) or
                     "short-convolution" in line or "linear/GDN" in line or "linear_attention" in line):
                 print(line)
         if r.returncode == 77:
             # The container is made here, so a skip would mean the test could not load it: that is a failure of this
             # arm, not a reason to skip it.
-            print("FAIL  batch_check_state_test skipped on the fabricated container (init_host refused it)")
+            print(f"FAIL  {os.path.basename(sys.argv[1])} skipped on the fabricated container (init_host refused it)")
             return 1
         if family in ("lfm3", "qwen2", "qwen2vl", "qwen2_untied", "hy_v3", "hy_v3_sgate") and r.returncode == 0:
             ours = np.fromfile(logits_out, dtype=np.float32)[:VOCAB]

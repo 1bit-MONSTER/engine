@@ -815,7 +815,8 @@ model's own single-sequence cache is untouched between calls. A slot whose first
 sequence, so its cache is cleared first -- position 0 means there what it means everywhere else in the engine, and a
 re-used slot never answers from the previous conversation's K/V.
 - A model whose state is more than KV is **refused by name**: GDN linear attention and MLA keep a recurrence or an
-  absorption state per sequence, and a noncausal pack encodes one prompt per pass. A model that falls back to
+  absorption state per sequence, a short-convolution layer (LFM2, LFM3) keeps a window of its last inputs per
+  sequence, and a noncausal pack encodes one prompt per pass. A model that falls back to
   per-token `step()` has no batched body to share and is refused for that reason.
 - The kernel side is unchanged: the projections were already one launch per M rows, and `rows_context` already takes
   the read length and window start per row.

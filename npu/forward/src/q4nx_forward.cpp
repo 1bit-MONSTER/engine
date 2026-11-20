@@ -4752,6 +4752,16 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
                "MLA), which one shared pass would corrupt across users";
         return false;
     }
+    // A short-convolution layer has no KV at all: its state is the window of its last inputs, one per layer for the
+    // whole model. Swapping KV per slot does not touch it, so every slot would run through the window the previous row
+    // left, whoever that row belonged to, and a slot that starts again at position 0 would start inside the last
+    // conversation's window. Measured on the fabricated LFM2 and LFM3 containers before this refusal: accepted, and the
+    // first decode row already differed from the sequence's own run (review of engine#2978's fix).
+    if (shortconv_) {
+        err_ = "step_users: this model has short-convolution layers, whose input window is per-sequence state beside the "
+               "KV cache; one shared pass would run every user through the same window";
+        return false;
+    }
     if (noncausal_attn_ || bidir_sliding_) {
         err_ = "step_users: a noncausal pack encodes the whole prompt of ONE sequence per pass, so users cannot share "
                "a pass on it";

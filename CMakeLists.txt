@@ -2792,6 +2792,15 @@ endif()
     add_dependencies(npu_sampling_test step_users_test)
     add_test(NAME step_users COMMAND step_users_test)
     set_tests_properties(step_users PROPERTIES SKIP_RETURN_CODE 77)
+    # engine#2978: two consecutive requests on ONE slot of the decode batcher, with a neighbour in flight. Host-GEMM, no
+    # device, no threads; skips (77) unless ONEBIT_TEST_Q4NX names a container. A configure without ONEBIT_NPU -- CI's --
+    # registers this and step_users on a fabricated container below.
+    add_executable(npu_batch_slot_reuse_test tests/npu_batch_slot_reuse_test.cpp)
+    target_include_directories(npu_batch_slot_reuse_test PRIVATE npu/forward/include app)
+    target_link_libraries(npu_batch_slot_reuse_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test npu_batch_slot_reuse_test)
+    add_test(NAME npu_batch_slot_reuse COMMAND npu_batch_slot_reuse_test)
+    set_tests_properties(npu_batch_slot_reuse PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(commit_full_accept_test tests/commit_full_accept_test.cpp)
     target_include_directories(commit_full_accept_test PRIVATE npu/forward/include)
     target_link_libraries(commit_full_accept_test PRIVATE onebit_npu_forward)
@@ -2942,6 +2951,32 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:batch_check_state_test> qwen3_5)
     set_tests_properties(batch_check_state_qwen35 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # engine#2978: several sequences in one pass, and a slot handed from one request to the next, on the fabricated
+    # two-layer qwen3 container. Both tests skip (77) without a container, so in CI they never ran: the guard added in
+    # engine#2734 made step_users_test's own re-used-slot arm fail on main and nothing went red for three days. Neither
+    # test depends on how long a row takes, which is what lets them run on a model this small.
+    add_executable(step_users_test tests/step_users_test.cpp)
+    target_link_libraries(step_users_test PRIVATE onebit_npu_forward_ci)
+    add_dependencies(onebit step_users_test)
+    add_test(NAME step_users
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:step_users_test>)
+    set_tests_properties(step_users PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # The same test on the fabricated LFM2 hybrid: short-convolution layers keep a per-sequence window that is not KV, so
+    # the model must be refused by name. Before the refusal existed this row failed on its first decode row (a slot read
+    # the window another slot's row had left).
+    add_test(NAME step_users_lfm2
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:step_users_test> lfm2)
+    set_tests_properties(step_users_lfm2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    add_executable(npu_batch_slot_reuse_test tests/npu_batch_slot_reuse_test.cpp)
+    target_include_directories(npu_batch_slot_reuse_test PRIVATE app)
+    target_link_libraries(npu_batch_slot_reuse_test PRIVATE onebit_npu_forward_ci)
+    add_dependencies(onebit npu_batch_slot_reuse_test)
+    add_test(NAME npu_batch_slot_reuse
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:npu_batch_slot_reuse_test>)
+    set_tests_properties(npu_batch_slot_reuse PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # engine#1786: the bidirectional gemma3 encoder (Embedding-Gemma-300M-NPU2's layout: BF16 projections, unprefixed
     # names, pre-scaled embedding, raw norms, a sliding and a full layer) through embed_pooled(), against a numpy
     # encoder on the same weights, and an over-long input refused by name.

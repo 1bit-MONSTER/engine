@@ -624,7 +624,16 @@ env_survivors() {   # <exact ticket line> -> pids carrying it, excluding this sh
             ENV_UNREADABLE=$((ENV_UNREADABLE + 1))
             continue
         fi
-        line=$(tr '\0' '\n' < "$d/environ" 2> /dev/null | grep -m1 -F "GPU_HOLD_TICKET=$want") || continue
+        # engine#2917: `-r` and the read are two syscalls at two times over a pid list that is being reused, so a pid
+        # can pass the test, exit, and be reused by a root process before the redirect runs. That `EACCES` is a
+        # **redirection** failure -- `2> /dev/null` covers `tr`/`grep`, not the `< "$d/environ"` -- and a redirection
+        # error on a simple command is a shell-level failure that `|| continue` never sees: the sweep aborted and the
+        # ticket's command exited 2 one second after being granted. Grouped so the redirect is inside the pipeline that
+        # `||` guards, the race becomes "this process cannot be inspected", which is what the counter is for.
+        line=$( { tr '\0' '\n' < "$d/environ"; } 2> /dev/null | grep -m1 -F "GPU_HOLD_TICKET=$want" ) || {
+            ENV_UNREADABLE=$((ENV_UNREADABLE + 1))
+            continue
+        }
         [ "$line" = "GPU_HOLD_TICKET=$want" ] || continue
         # engine#2737's override (`GPU_HOLD_ALLOW_NESTED=1`) means an inner gpu-hold runs with the OUTER ticket line in its
         # environment by design -- env is frozen at exec, and the inner script only exports its own line to its child. That

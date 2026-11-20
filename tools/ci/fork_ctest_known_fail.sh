@@ -60,6 +60,18 @@ skip() { echo "fork_ctest_known_fail: SKIP -- $*"; exit 77; }
 
 [ "${ONEBIT_FORK_CTEST:-0}" = 1 ] || skip "opt-in: set ONEBIT_FORK_CTEST=1 to run the fork's suite (a fork build tree plus 112 tests)"
 
+# engine#3000, 2026-11-20: THIS SCRIPT MUST REFUSE TO RUN INSIDE ITSELF. The row it is registered as can live in a
+# ctest tree that this script then ctests, so a caller that exports ONEBIT_FORK_CTEST=1 hands the opt-in to the inner
+# ctest as well, and the row re-enters without end -- measured on strixhalo that evening: ~36,600 ctest/sh/tee
+# processes, swap exhausted, load average 500, first OOM at 17:35:52Z, and the box was force-rebooted. A depth marker
+# is the guard: the second entry refuses (rc 2, "cannot tell"), which is visible in the row's output instead of silent.
+if [ -n "${ONEBIT_FORK_CTEST_DEPTH:-}" ]; then
+    echo "fork_ctest_known_fail: REFUSED: already running inside itself (ONEBIT_FORK_CTEST_DEPTH=$ONEBIT_FORK_CTEST_DEPTH)." >&2
+    echo "  A ctest row whose script runs ctest over a tree holding the same row re-enters without end (engine#3000: 36,600 processes, swap exhausted, force-reboot)." >&2
+    exit 2
+fi
+export ONEBIT_FORK_CTEST_DEPTH=1
+
 NO_DEVICE="${ONEBIT_FORK_CTEST_NO_DEVICE:-fail}"
 case "$NO_DEVICE" in
     fail|skip) : ;;
@@ -134,7 +146,10 @@ rm -f "$OUTPUTS"
 # impossible in a job that has none. The first run of this row in hrx-build surfaced it: `1 row(s) did not run on a
 # device`, on a runner whose every other device row is excluded or baselined. Excluding it keeps the ratchet's real
 # verdict (113 rows, 0 new) instead of converting the whole row to a 77 via ONEBIT_FORK_CTEST_NO_DEVICE=skip.
-ctest -j 4 --timeout 600 -E '^(hrx-ops-test|test-hrx-ops|test-hrx-ops-loom|test-testing-suite-skip)$' 2>&1 | tee ctest.log || true
+# The inner ctest runs WITHOUT the opt-in (so a tree that does contain this row skips it instead of re-entering) and
+# under an outer `timeout` (a wedged suite must not outlive the row). ONEBIT_FORK_CTEST_DEPTH stays exported: if some
+# other path reaches this script again, it refuses with rc 2 rather than recursing.
+env -u ONEBIT_FORK_CTEST timeout 1500 ctest -j 4 --timeout 600 -E '^(hrx-ops-test|test-hrx-ops|test-hrx-ops-loom|test-testing-suite-skip)$' 2>&1 | tee ctest.log || true
 
 exec python3 "$ROOT/tools/ci/ctest_known_fail.py" --log ctest.log --root "$ROOT" \
     --outputs "$OUTPUTS" --no-device "$NO_DEVICE"

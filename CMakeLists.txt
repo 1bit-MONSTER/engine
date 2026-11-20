@@ -349,6 +349,12 @@ add_test(NAME fork_ctest_known_fail
          COMMAND /bin/sh ${CMAKE_SOURCE_DIR}/tools/ci/fork_ctest_known_fail.sh)
 set_tests_properties(fork_ctest_known_fail PROPERTIES SKIP_RETURN_CODE 77)
 
+# engine#3000: the row above must refuse to run inside itself -- a caller that exported ONEBIT_FORK_CTEST=1 handed the
+# opt-in to the inner ctest, the row re-entered, and on 2026-11-20 that reached ~36,600 processes and a force-reboot.
+# Device-free, build-free, fork-free: the refusal happens before anything is read.
+add_test(NAME fork_ctest_nest COMMAND bash ${CMAKE_SOURCE_DIR}/tests/fork_ctest_nest_test.sh
+                                          ${CMAKE_SOURCE_DIR}/tools/ci/fork_ctest_known_fail.sh)
+
 # engine#2186/#2244: `tools/ci/dupdef_check.py`, a check that was only ever run by hand. It is the one
 # that found a shadowed `def self_test()` in tools/hrx_f16_narrowing_check.py -- the surviving copy
 # passed and the shadowed one's arms could never fail. It takes no build input, so a ctest row is the

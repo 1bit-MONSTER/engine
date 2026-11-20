@@ -53,6 +53,7 @@ Exit: 0 no issue claimed twice, 1 at least one issue claimed by two or more open
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -143,6 +144,47 @@ def duplicates(prs, files_of=None):
             if len(linked) > 1:
                 out.append((issue, linked))
     return out
+
+
+ALLOW_FILE = "duplicate_fixes_allow.txt"
+
+
+def read_allow(path):
+    """{issue: reason} from an allow file, one `<issue> <reason>` per line; missing file is an empty allow.
+
+    Why it exists (engine#2797/#2798): two open PRs that BOTH say `Fixes #N` are this tool's strongest signal and
+    also how a legitimate HALF is written -- one PR the behaviour, the second the arm that proves it can fail.
+    Nothing in the PR text separates those shapes, so the separation is declared here, with a reason, and stays
+    visible: an allowed issue is still printed, with its reason, and simply stops counting as a finding. The next
+    failure mode is a stale entry, so every allowed issue that no open pair claims any more is reported too.
+    """
+    out = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # `#2946 behaviour plus arm` is how anyone writes an issue, so a LEADING `#` is the issue, and a
+                # comment only starts at ` #` -- splitting on the first `#` would drop every real entry, which is
+                # exactly what it did until the live run showed an allow file with one line and zero effects.
+                line = re.split(r"\s+#", line, 1)[0].strip()
+                if line.startswith("#"):
+                    line = line[1:]
+                if not line:
+                    continue
+                bits = line.split(None, 1)
+                if not bits[0].isdigit():
+                    continue
+                out[int(bits[0])] = (bits[1] if len(bits) > 1 else "").strip() or "(no reason given)"
+    except FileNotFoundError:
+        return {}
+    return out
+
+
+def apply_allow(found, allow):
+    """(kept, allowed, stale): findings that still count, findings a declared pair exempts, entries nobody claims."""
+    allowed = [f for f in found if f['issue'] in allow]
+    kept = [f for f in found if f['issue'] not in allow]
+    stale = sorted(set(allow) - {f['issue'] for f in allowed})
+    return kept, allowed, stale
 
 
 def describe(issue, group):
@@ -264,6 +306,28 @@ def self_test():
     ok([p['number'] for p in duplicates(prs)[0][1]] == [2784, 2786], "a draft claimant is reported too")
     ok('[draft]' in describe(*duplicates(prs)[0]), "... and marked as a draft")
 
+    # engine#2797/#2798: two PRs that BOTH say `Fixes #N` are the strongest signal and also how a legitimate HALF
+    # is written, and nothing in the text separates them -- so the exemption is declared, with a reason, and the
+    # entry that outlives its pair is reported rather than silently kept.
+    # apply_allow takes the shape main() builds: one dict per finding, not duplicates()'s (issue, group) tuples
+    pairs = [{'repo': 'engine', 'issue': issue, 'prs': group} for issue, group in duplicates(prs)]
+    kept, allowed, stale = apply_allow(pairs, {2778: 'the behaviour plus the arm that proves it'})
+    ok(kept == [] and [f['issue'] for f in allowed] == [2778],
+       "a declared pair stops counting as a finding, and is reported as allowed instead")
+    ok(apply_allow(pairs, {2778: 'x', 9999: 'gone'})[2] == [9999],
+       "an allow entry no open pair claims any more is STALE, so it is reported rather than kept forever")
+    ok(apply_allow(pairs, {})[0] == pairs, "an empty allow changes nothing")
+    # the file is written by a human, who writes `#2797`, not `2797`
+    import pathlib
+    import tempfile
+    d = tempfile.TemporaryDirectory()
+    ap = pathlib.Path(d.name) / "allow.txt"
+    ap.write_text("#2797 the behaviour plus the arm\n\n2950 second entry  # trailing note\n")
+    got = read_allow(str(ap))
+    ok(got.get(2797, "").startswith("the behaviour"), "a leading `#` is the issue number, not a comment")
+    ok(got.get(2950, "") == "second entry", "... and a ` #` starts a trailing comment")
+    d.cleanup()
+
     # no claim, no finding -- the failure mode of a detector that always fires
     ok(duplicates([{'number': 1, 'title': 'a', 'body': 'Refs #5', 'draft': False},
                    {'number': 2, 'title': 'b', 'body': 'Refs #5', 'draft': False}]) == [],
@@ -326,6 +390,7 @@ def main(argv):
     # finding to be printed without the exit status deciding anything. The page-vs-runner comparator in
     # pre-pr-checks.sh only understands rows whose command starts with `python3`, which is why this is a flag
     # here rather than a `sh -c ... || true` wrapper there.
+    ap.add_argument('--allow', help=f'`<issue> <reason>` per line, exempting a declared pair (default: {ALLOW_FILE} beside this tool)')
     ap.add_argument('--advisory', action='store_true',
                     help='print findings but always exit 0 (for the pre-PR gate; see --advisory in docs/pre-pr-checks.md)')
     a = ap.parse_args(argv)
@@ -356,9 +421,17 @@ def main(argv):
             found.append({'repo': repo, 'issue': issue,
                           'prs': [{'number': p['number'], 'title': p['title'], 'draft': p['draft'],
                                    'age_hours': p['age_hours']} for p in group]})
+    allow = read_allow(a.allow or os.path.join(os.path.dirname(os.path.abspath(__file__)), ALLOW_FILE))
+    found, allowed, stale = apply_allow(found, allow)
     if a.json:
         print(json.dumps(found, indent=1))
     else:
+        for f in allowed:
+            print(f"{f['repo']}: #{f['issue']} is claimed twice and ALLOWED ({allow[f['issue']]})\n  "
+                  + describe(f['issue'], f['prs']).replace("\n", "\n  "), file=sys.stderr)
+        for issue in stale:
+            print(f"duplicate_fixes: allow entry #{issue} is STALE -- no open pair claims it any more "
+                  f"({allow[issue]}); delete the line", file=sys.stderr)
         for f in found:
             print(f"{f['repo']}: " + describe(f['issue'], f['prs']))
         clean = clean_line(found, failed)

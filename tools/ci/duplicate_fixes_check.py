@@ -391,6 +391,12 @@ def main(argv):
     # pre-pr-checks.sh only understands rows whose command starts with `python3`, which is why this is a flag
     # here rather than a `sh -c ... || true` wrapper there.
     ap.add_argument('--allow', help=f'`<issue> <reason>` per line, exempting a declared pair (default: {ALLOW_FILE} beside this tool)')
+    # engine#2807/#2842: the gate mode pre-pr-checks.sh uses. Its exit codes are the script's own vocabulary --
+    # 0 clean, 1 a finding, 77 "cannot run here" (the ctest skip code) -- because the script classifies a row by
+    # these three and by nothing else, and the page-vs-runner comparator forbids a `sh -c` wrapper that would
+    # map them outside the tool.
+    ap.add_argument('--gate', action='store_true',
+                    help='pre-pr-checks mode: 0 clean, 1 a duplicate, 77 cannot tell (network/gh unavailable)')
     ap.add_argument('--advisory', action='store_true',
                     help='print findings but always exit 0 (for the pre-PR gate; see --advisory in docs/pre-pr-checks.md)')
     a = ap.parse_args(argv)
@@ -437,6 +443,13 @@ def main(argv):
         clean = clean_line(found, failed)
         if clean:
             print(clean)
+    if a.gate:
+        # cannot-tell is a SKIP here, not a failure: this is the script's only network row and a blip must not red
+        # a gate whose other sixteen rows are offline. A duplicate is a finding and exits 1.
+        if failed:
+            print("duplicate_fixes: cannot tell for at least one repo -- skip, not a pass", file=sys.stderr)
+            return 77
+        return exit_code(found, failed)
     if a.advisory:
         if found or failed:
             print("duplicate_fixes: advisory run -- nothing above changes this run's exit status",

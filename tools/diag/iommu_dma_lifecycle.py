@@ -41,7 +41,7 @@ PAGE = 4096
 ENTRY = 8
 CHUNK = 1 << 20
 
-TRACE = re.compile(r"\s(\d+\.\d+):\s(mp|uf|du|pf):.*?iova=(\d+)")
+TRACE = re.compile(r"\s*(\S+?)-(\d+)\s+\[\d+\].*?\s(\d+\.\d+):\s(mp|uf|du|pf):.*?iova=(\d+)")
 
 
 def load_trace(path):
@@ -51,10 +51,10 @@ def load_trace(path):
         for line in f:
             m = TRACE.search(line)
             if m:
-                ev.setdefault(int(m.group(3)), []).append(
-                    (float(m.group(1)), m.group(2)))
+                ev.setdefault(int(m.group(5)), []).append(
+                    (float(m.group(3)), m.group(4), m.group(1)))
     for v in ev.values():
-        v.sort()
+        v.sort(key=lambda e: e[0])
     return ev
 
 
@@ -65,7 +65,7 @@ def cycles(events):
     twice; only the first unmap of a run opens the interval.
     """
     dwell, unmapped_at = [], None
-    for t, kind in events:
+    for t, kind, _comm in events:
         if kind in ("uf", "du"):
             if unmapped_at is None:
                 unmapped_at = t
@@ -89,8 +89,8 @@ def lifecycle(events):
     state, unmapped_at = None, None
     # With no unmap probe on this page, "no unmap seen" is absence of a PROBE, not
     # presence of a mapping: every fault must report state UNKNOWN, never MAPPED.
-    saw_unmap = any(k in ("uf", "du") for _, k in events)
-    for i, (t, kind) in enumerate(events):
+    saw_unmap = any(k in ("uf", "du") for _, k, _c in events)
+    for i, (t, kind, comm) in enumerate(events):
         if kind == "mp":
             state, unmapped_at = "mapped", None
         elif kind in ("uf", "du"):
@@ -99,9 +99,12 @@ def lifecycle(events):
             state = "unmapped"
         elif kind == "pf":
             after = [e for e in events[i + 1:] if e[1] == "mp"]
+            before = [e for e in events[:i] if e[1] == "mp"]
             faults.append((t, state if saw_unmap else None,
                            t - unmapped_at if state == "unmapped" else None,
-                           after[0][0] - t if after else None))
+                           after[0][0] - t if after else None,
+                           comm, before[-1][2] if before else None,
+                           after[0][2] if after else None))
     return dwell, faults
 
 
@@ -127,7 +130,7 @@ def report_lifecycle(path):
         if dwell:
             print(f"  dwell  p50={pct(dwell, .5)*1000:.0f}ms  "
                   f"p90={pct(dwell, .9)*1000:.0f}ms  max={max(dwell)*1000:.0f}ms")
-        for t, state, unm, nm in faults:
+        for t, state, unm, nm, comm, own_before, own_after in faults:
             if state is None:
                 # no map/unmap for this page in the trace: the question is unanswerable here
                 where = "state UNKNOWN (no map/unmap of this page in the trace)"
@@ -136,7 +139,10 @@ def report_lifecycle(path):
             else:
                 where = "MAPPED at the fault -- not a teardown race"
             nm_s = f"next map +{nm:.2f}s" if nm is not None else "never re-mapped"
-            print(f"  FAULT @{t:.2f}: {where}, {nm_s}")
+            hands = ""
+            if own_before and own_after and own_before != own_after:
+                hands = f" -- CHANGED HANDS {own_before} -> {own_after}"
+            print(f"  FAULT @{t:.2f}: {where}, {nm_s}{hands}")
     return 0 if total_faults else 2
 
 
@@ -248,13 +254,13 @@ def self_test():
         dwell, faults = lifecycle(ev[4096])
         assert len(dwell) == 1 and abs(dwell[0] - 0.5) < 1e-9, f"dwell={dwell}"
         assert len(faults) == 1, f"faults={faults}"
-        t, state, unm, next_map = faults[0]
+        t, state, unm, next_map, comm, own_b, own_a = faults[0]
         assert state == "mapped", \
             f"0x1000 was re-mapped at 10.5 before the 11.0 fault; it must read MAPPED, got {state} (unmapped_for={unm})"
         assert unm is None, f"a mapped page has no unmapped-for interval, got {unm}"
         assert next_map is None, f"no map after the fault, got {next_map}"
         _, f2 = lifecycle(ev[8192])
-        t2, state2, unm2, _ = f2[0]
+        t2, state2, unm2, _, _c2, _ob2, _oa2 = f2[0]
         assert state2 == "unmapped" and abs(unm2 - 0.2) < 1e-9, \
             f"0x2000 is unmapped from 12.0 and faults at 12.2: {f2}"
         # a trace with map+fault but NO unmap probe must report UNKNOWN, not MAPPED

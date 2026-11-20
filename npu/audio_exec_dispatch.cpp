@@ -38,6 +38,8 @@ bool run_audio_graph(const OnnxGraphInfo&, const float*, int64_t, int64_t, const
                      std::string*, AudioGemm*);
 bool run_decoder_graph(const OnnxGraphInfo&, const int64_t*, int64_t, const float*, const std::vector<int64_t>&,
                        const std::string&, AudioRunResult*, std::string*);
+bool run_decoder_graph(const OnnxGraphInfo&, const int64_t*, int64_t, const float*, const std::vector<int64_t>&,
+                       const std::string&, AudioRunResult*, std::string*, DecoderStepCache*);
 int prefill_audio_device(const OnnxGraphInfo&, int64_t, AudioGemm*, std::string*);
 }  // namespace tu_base
 
@@ -49,6 +51,8 @@ bool run_audio_graph(const OnnxGraphInfo&, const float*, int64_t, int64_t, const
                      std::string*, AudioGemm*);
 bool run_decoder_graph(const OnnxGraphInfo&, const int64_t*, int64_t, const float*, const std::vector<int64_t>&,
                        const std::string&, AudioRunResult*, std::string*);
+bool run_decoder_graph(const OnnxGraphInfo&, const int64_t*, int64_t, const float*, const std::vector<int64_t>&,
+                       const std::string&, AudioRunResult*, std::string*, DecoderStepCache*);
 int prefill_audio_device(const OnnxGraphInfo&, int64_t, AudioGemm*, std::string*);
 }  // namespace tu_avx2
 #endif
@@ -96,6 +100,15 @@ bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_
     if (use_avx2_tu()) return tu_avx2::run_decoder_graph(g, tokens, n_tokens, xa, xa_dims, out_name, out, why);
 #endif
     return tu_base::run_decoder_graph(g, tokens, n_tokens, xa, xa_dims, out_name, out, why);
+}
+
+bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_tokens, const float* xa,
+                       const std::vector<int64_t>& xa_dims, const std::string& out_name, AudioRunResult* out,
+                       std::string* why, DecoderStepCache* cache) {
+#if defined(__x86_64__) && defined(__GNUC__)
+    if (use_avx2_tu()) return tu_avx2::run_decoder_graph(g, tokens, n_tokens, xa, xa_dims, out_name, out, why, cache);
+#endif
+    return tu_base::run_decoder_graph(g, tokens, n_tokens, xa, xa_dims, out_name, out, why, cache);
 }
 
 // engine#1783: either copy builds the same keys and the same weights; the pick follows the executor's, for one rule.

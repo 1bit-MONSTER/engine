@@ -21,6 +21,7 @@
 // uncovered shape is declined by name.
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -42,6 +43,23 @@ struct FakeTarget : t::NpuTarget {
     std::vector<t::GemvArgs> seen;
     int with_bmat = 0;
     const char* name() const override { return "fake"; }
+    // engine#1783: the fake's "image" is the staged f32 weight itself
+    bool export_weight(int, int, int wkey, std::vector<uint8_t>* img, std::vector<float>* scales) const override {
+        const auto it = cache.find(wkey);
+        if (it == cache.end()) return false;
+        const auto* p = reinterpret_cast<const uint8_t*>(it->second.data());
+        img->assign(p, p + it->second.size() * sizeof(float));
+        scales->assign(1, 1.0f);
+        return true;
+    }
+    bool import_weight(int, int, int wkey, size_t bytes, const std::function<bool(void*)>& fill, const std::vector<float>&,
+                       std::string& err) override {
+        if (cache.count(wkey) != 0) { err = "slot taken"; return false; }
+        std::vector<float> w(bytes / sizeof(float));
+        if (!fill(w.data())) { err = "fill failed"; return false; }
+        cache[wkey] = std::move(w);
+        return true;
+    }
     bool open(const onebit::npu::plan::Plan&, const std::string&, const char*, std::string&) override { return true; }
     bool load_block(int, int, std::string&) override { return true; }
     t::Caps caps() const override { return t::Caps{}; }
@@ -188,6 +206,39 @@ int main() {
         check(!gw.gemm("w.wide", A3.data(), 2, 512, B3.data(), 1000, &C, &why) &&
                   why.find("no design for staged K512 N1024") != std::string::npos && fw.seen.empty(),
               "a narrower design is never taken: K512 N1024 has only K512 N512, so it is declined: " + why);
+    }
+
+    // 7. engine#1783: export every resident weight, import it into a fresh NpuAudioGemm over a fresh target, and the import
+    // is resident: cached() is true, a product with B = nullptr runs, sends no Bmat, and equals the host GEMM.
+    {
+        struct Saved { std::string key; int role, k, n; std::vector<uint8_t> img; std::vector<float> sc; };
+        std::vector<Saved> saved;
+        const int ne = g.export_weights([&](const std::string& key, int role, int k, int n, const std::vector<uint8_t>& img,
+                                            const std::vector<float>& sc) { saved.push_back({key, role, k, n, img, sc}); });
+        check(ne == 2 && saved.size() == 2, "both resident weights are exported (w.o and conv1#conv)");
+        FakeTarget f2;
+        f2.d = ft.d;
+        f2.d[2].M = 8;
+        NpuAudioGemm g3(f2, f2.d);
+        for (const auto& s : saved) {
+            std::string why;
+            const bool ok = g3.import_weight(s.key, s.role, s.k, s.n, s.img.size(), [&](void* dst) {
+                std::memcpy(dst, s.img.data(), s.img.size());
+                return true;
+            }, s.sc, &why);
+            check(ok, "import " + s.key + ": " + why);
+        }
+        check(g3.cached("w.o") && g3.cached("conv1#conv") && !g3.cached("w.d"), "imported weights are resident, others not");
+        std::string why;
+        check(!g3.import_weight("w.o", 0, 256, 512, 4, [](void*) { return true; }, {1.0f}, &why), "a second import of a key is refused");
+        check(!g3.import_weight("w.x", 0, 256, 1024, 4, [](void*) { return true; }, {1.0f}, &why), "an import for a different design shape is refused");
+        const int M = 4, K = 200, N = 300;
+        const auto A = fill(M * K, 2.1f), B = fill(K * N, 0.7f);
+        std::vector<float> C, R;
+        check(g3.gemm("w.o", A.data(), M, K, nullptr, N, &C, &why), "an imported weight runs with B = nullptr: " + why);
+        host_gemm(A, B, M, K, N, &R);
+        check(f2.with_bmat == 0, "and no Bmat is sent");
+        check(maxdiff(C, R) < 1e-4, "and it equals the host GEMM");
     }
 
     check(g.launches() == 5 && g.products() == 3, "counts: 5 launches, 3 products");

@@ -81,6 +81,10 @@ public:
               const char* family, std::string& err) override;
     bool load_block(int first_layer, int n_layers, std::string& err) override;
     bool gemv(const GemvArgs& a, std::vector<float>& out, std::string& err) override;
+    // engine#1783: plain int8 images only (no w4g32 / pb16i / t2s / gemv layout); see NpuTarget.
+    bool export_weight(int role, int layer, int wkey, std::vector<uint8_t>* img, std::vector<float>* scales) const override;
+    bool import_weight(int role, int layer, int wkey, size_t bytes, const std::function<bool(void*)>& fill,
+                       const std::vector<float>& scales, std::string& err) override;
     bool supports(Op op) const override { return op == Op::gemv; }
     Caps caps() const override;
 

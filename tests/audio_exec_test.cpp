@@ -386,6 +386,40 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 5; ++i) expect_close(dl(ntok - 1, i), last[i], 2e-3, "decoder last row col " + std::to_string(i));
         for (int i = 0; i < 4; ++i) expect_close(dl(3, i), row3[i], 2e-3, "decoder row 3 col " + std::to_string(i));
     }
+    // engine#1783: the decode-step cache. Two steps with a cache (the first fills it, the second skips the step-invariant
+    // nodes) must give the same bytes as the same two windows run without one.
+    {
+        DecoderStepCache sc;
+        std::vector<int64_t> toks2 = toks;
+        toks2[4] = 2564;
+        AudioRunResult c1, c2, u2;
+        const bool ok = run_decoder_graph(dg, toks.data(), ntok, r.data.data(), xad, "", &c1, &why, &sc) &&
+                        run_decoder_graph(dg, toks2.data(), ntok, r.data.data(), xad, "", &c2, &why, &sc) &&
+                        run_decoder_graph(dg, toks2.data(), ntok, r.data.data(), xad, "", &u2, &why);
+        check(ok, "decoder runs with the step cache: " + why);
+        std::printf("decoder step cache: %zu of %zu nodes step-invariant, %zu tensors kept\n", sc.invariant_nodes,
+                    dg.nodes.size(), sc.frontier.size());
+        check(sc.filled && sc.invariant_nodes > 0, "the cache found step-invariant nodes");
+        check(c1.data == dr.data, "the filling step equals the uncached run byte for byte");
+        check(c2.data.size() == u2.data.size() &&
+                  std::memcmp(c2.data.data(), u2.data.data(), u2.data.size() * sizeof(float)) == 0,
+              "the cached step equals the uncached run of the same window byte for byte");
+        check(c2.data != c1.data, "and the second window's logits differ from the first's (the arm is not vacuous)");
+        // one output row: the row read equals the full run's row byte for byte; the rest is 0
+        AudioRunResult c3;
+        sc.output_row = 5;
+        const bool ok3 = run_decoder_graph(dg, toks2.data(), ntok, r.data.data(), xad, "", &c3, &why, &sc);
+        check(ok3 && c3.data.size() == u2.data.size(), "a one-row step runs: " + why);
+        if (ok3 && c3.dims.size() == 3 && c3.data.size() == u2.data.size()) {
+            const size_t V = size_t(c3.dims[2]);
+            check(std::memcmp(c3.data.data() + 5 * V, u2.data.data() + 5 * V, V * sizeof(float)) == 0,
+                  "the one row read equals the full run's row 5 byte for byte");
+            bool rest0 = true;
+            for (size_t i = 0; i < c3.data.size() && rest0; ++i)
+                if ((i / V) / 4 != 1 && c3.data[i] != 0.0f) rest0 = false;   // rows 4..7 are the unit that ran
+            check(rest0, "and the rows outside its four-row unit were not computed");
+        }
+    }
     if (g_failures != 0) {
         std::printf("audio exec: %d failures\n", g_failures);
         return 1;

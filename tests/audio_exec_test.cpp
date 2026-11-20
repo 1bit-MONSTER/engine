@@ -420,6 +420,33 @@ int main(int argc, char** argv) {
             check(rest0, "and the rows outside its four-row unit were not computed");
         }
     }
+    // engine#1783: incremental decode. Seven greedy-shaped steps (each writes one more token position): the cached
+    // incremental run's logits rows 0..pos must equal a full uncached run of the same window byte for byte, every step,
+    // and every step after the first must have taken the one-unit path (incremental_products > 0).
+    {
+        DecoderStepCache ic;
+        std::vector<int64_t> w(size_t(ntok), 50257);
+        const int64_t prompt[4] = {50258, 50259, 50359, 50363};
+        for (int i = 0; i < 4; ++i) w[size_t(i)] = prompt[i];
+        int steps_ok = 0, inc_steps = 0;
+        for (int st = 0; st < 7; ++st) {
+            const int64_t pos = 3 + st;
+            if (st > 0) w[size_t(pos)] = 1000 + 37 * st;
+            ic.changed_row = st == 0 ? -1 : pos;
+            AudioRunResult a1, f1;
+            const bool ok = run_decoder_graph(dg, w.data(), ntok, r.data.data(), xad, "", &a1, &why, &ic) &&
+                            run_decoder_graph(dg, w.data(), ntok, r.data.data(), xad, "", &f1, &why);
+            if (!ok || a1.dims.size() != 3 || a1.data.size() != f1.data.size()) { check(false, "incremental step runs: " + why); break; }
+            const size_t V = size_t(a1.dims[2]);
+            const bool same = std::memcmp(a1.data.data(), f1.data.data(), size_t(pos + 1) * V * sizeof(float)) == 0;
+            if (same) ++steps_ok;
+            if (st > 0 && ic.incremental_products > 0) ++inc_steps;
+        }
+        std::printf("decoder incremental: %d of 7 steps byte-identical over rows 0..pos, %d of 6 took the one-unit path\n",
+                    steps_ok, inc_steps);
+        check(steps_ok == 7, "every incremental step equals the full run over rows 0..pos byte for byte");
+        check(inc_steps == 6, "every step after the first took the incremental path");
+    }
     if (g_failures != 0) {
         std::printf("audio exec: %d failures\n", g_failures);
         return 1;

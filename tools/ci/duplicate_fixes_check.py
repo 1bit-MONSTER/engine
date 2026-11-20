@@ -187,6 +187,20 @@ def apply_allow(found, allow):
     return kept, allowed, stale
 
 
+def finding(repo, issue, group):
+    """One finding, squashed from a duplicate group -- and `body` MUST survive the squash.
+
+    engine#3048: this used to be inline in `main()` and kept four keys, dropping `body`. `describe()` re-derives
+    whether the PRs CLAIM the issue (Fixes/Closes) or merely REFER to it from title+body, so every finding printed its
+    weakest wording -- three PRs that all said `Closes #N` were reported as "referenced ... that touch the same files".
+    It is a function rather than four inline lines because the bug was two functions apart: an arm over `describe()`
+    cannot see what `main()` puts into it, and my first two arms passed against the unfixed code for exactly that reason.
+    """
+    return {'repo': repo, 'issue': issue,
+            'prs': [{'number': p['number'], 'title': p['title'], 'body': p.get('body') or '',
+                     'draft': p['draft'], 'age_hours': p['age_hours']} for p in group]}
+
+
 def describe(issue, group):
     """The report line. `Fixes`/`Closes` is a claim on the issue; `Refs` plus overlapping files is two lanes working the
     same code, which is a different conversation, so the sentence says which one it is (engine#2842)."""
@@ -413,6 +427,21 @@ def self_test():
     ok([p['number'] for p in dup_ref[0][1]] == [2839, 2840], "... naming both PRs, oldest first")
     ok('touch the same files' in describe(*dup_ref[0]),
        "... and the sentence says they touch the same files rather than claiming the issue")
+    # engine#3048: the squash in `main()` dropped `body`, and `describe()` re-derives the claim from title+body -- so
+    # every finding printed its weakest wording even when every PR in it said `Closes #N`. These arms go THROUGH
+    # finding(), because an arm that hand-builds the dict cannot see the squash (mine could not, twice).
+    closed = [{'number': 9101, 'title': 'a', 'body': 'Closes #9100.', 'draft': False, 'age_hours': 1.0},
+              {'number': 9102, 'title': 'b', 'body': 'Fixes #9100.', 'draft': False, 'age_hours': 2.0}]
+    f = finding('engine', 9100, closed)
+    ok(f['prs'][0].get('body') == 'Closes #9100.',
+       "the squash that builds a finding KEEPS the body -- an arm over describe() alone cannot see this (engine#3048)")
+    ok('is claimed by' in describe(f['issue'], f['prs']),
+       "... so a pair that both say Closes is described as a claim, not as a reference")
+    bodyless = [{'number': 9101, 'title': 'a', 'body': '', 'draft': False, 'age_hours': 1.0},
+                {'number': 9102, 'title': 'b', 'body': 'Refs #9100.', 'draft': False, 'age_hours': 2.0}]
+    bf = finding('engine', 9100, bodyless)
+    ok('touch the same files' in describe(bf['issue'], bf['prs']),
+       "... and only a body that does not claim it falls back to the weaker sentence")
     disjoint = {2839: {'tools/ci/check_stale_expectations.py'}, 2840: {'docs/hw-gate.md'}}
     ok(duplicates(ref_prs, disjoint) == [],
        "two `Refs` PRs whose files do not overlap are NOT a duplicate -- the false positive the weaker keyword would add")
@@ -543,9 +572,7 @@ def main(argv):
         except (RuntimeError, json.JSONDecodeError):
             pass
         for issue, group in groups:
-            found.append({'repo': repo, 'issue': issue,
-                          'prs': [{'number': p['number'], 'title': p['title'], 'draft': p['draft'],
-                                   'age_hours': p['age_hours']} for p in group]})
+            found.append(finding(repo, issue, group))
     allow = read_allow(a.allow or os.path.join(os.path.dirname(os.path.abspath(__file__)), ALLOW_FILE))
     for repo, issue, op, mp, shared in mended:
         found.append({'repo': repo, 'issue': issue, 'mended_by': mp['number'],

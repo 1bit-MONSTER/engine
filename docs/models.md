@@ -31,6 +31,7 @@ formats.
 | Microsoft BitNet b1.58 2B-4T | TQ2_0 ternary GGUF (TQ1_0 runs too), 1.11 GiB, 2.06 bits per weight, HRX | end to end on the Radeon 8060S, no CPU fallback; decode tg128 123.4 tok/s after the TQ2_0 load-time repack onto the packed-ternary decode kernel (101.6 before it, same binary); perplexity 102.42 on HRX vs 102.56 on the CPU, same file ([post](https://1bit.gg/blog-bitnet-b158-on-hrx.html)) |
 | Qwen3-0.6B | NPU route | decode 88.6 tok/s in the release gate |
 | gpt-oss-20b | MXFP4, HRX | runs on HRX |
+| Liquid AI LFM3-1.7B | Q4_K_M, 1.02 GiB, HRX | prefill pp512 7,925 tok/s, decode tg128 153.7 tok/s; perplexity 14.05 on HRX vs 14.11 on the CPU, same file; 2.05 GiB of GTT and 1.34 GiB of host RAM at 8k context (engine#2918). Licence: LFM Open License v1.0 - commercial use is licensed only while annual revenue stays below US$10M (its §1 and §5), so it is not an OSI licence |
 
 The numbers move with the pins; a row changes when its measurement is retaken. The Lemonade
 release the engine runs inside is the weekly pin in `third_party/lemonade` ([lemonade.md](lemonade.md)).

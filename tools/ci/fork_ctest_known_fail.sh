@@ -56,7 +56,38 @@ HRX_BUILD="${HRX_BUILD:-$HOME/.cache/hrx-build/bench}"
 FORK="$HRX_BUILD/hrx/llama"
 
 # Not applicable beats failed: say which, on stdout, so the skip is legible in the ctest log.
-skip() { echo "fork_ctest_known_fail: SKIP -- $*"; exit 77; }
+#
+# engine#3000: an OPT-IN skip is not the same silence as a missing dependency, and in CI the difference costs the whole
+# point of the row. `hrx_build` builds every fork test target (`-k 0`, ~34 binaries) and then runs this row; without
+# ONEBIT_FORK_CTEST the row skips (77), ctest counts a skip as not-failed, the step is green and its summary says
+# "100% tests passed". So the targets are compiled by CI and executed by nothing -- the 15 known failures the baseline
+# names cannot fail the job, the rows it lists as now-passing are unverified, and rows merged today are built and never
+# run (measured in run 44737964422: `1/1 Test #21 … ***Skipped   0.00 sec`, `100% tests passed, 0 tests failed out of 1`).
+#
+# The fix that actually runs the suite is a workflow edit and a queue budget (one `env:` line plus the ratchet's
+# runtime), which is the owner's call -- so this does the part a lane can: when the opt-in skip happens UNDER CI, say so
+# as an annotation on the job as well as in the log. 77 stays, because a row that fails until a workflow change lands is
+# worse than a row that is loud about why it did nothing.
+skip() {
+    echo "fork_ctest_known_fail: SKIP -- $*"
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        echo "::warning title=the fork's test rows were built and not run::fork_ctest_known_fail skipped: $* -- ctest counts a skip as not-failed, so this step is green while the fork's ~34 built test binaries ran nothing. To run the ratchet, set ONEBIT_FORK_CTEST=1 on this step (engine#3000)."
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+                echo "### The fork ctest ratchet did NOT run"
+                echo
+                echo "\`fork_ctest_known_fail\` skipped (77): $*."
+                echo
+                echo "The step above builds every fork test target, so **they were compiled and executed by nothing**:"
+                echo "the 15 known failures in \`tools/ci/ctest_known_fail.txt\` cannot fail this job, the rows it lists"
+                echo "as now-passing are unverified, and any row merged since is built and never run."
+                echo
+                echo "Set \`ONEBIT_FORK_CTEST=1\` on this step to run the ratchet (engine#3000)."
+            } >> "$GITHUB_STEP_SUMMARY"
+        fi
+    fi
+    exit 77
+}
 
 [ "${ONEBIT_FORK_CTEST:-0}" = 1 ] || skip "opt-in: set ONEBIT_FORK_CTEST=1 to run the fork's suite (a fork build tree plus 112 tests)"
 

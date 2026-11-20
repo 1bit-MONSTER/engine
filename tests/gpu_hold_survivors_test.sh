@@ -84,9 +84,10 @@ check "arm2: a holder with no record warns about nothing" "$noise" "0"
 c="$work/arm3"; mkdir -p "$c/q" "$work/proc/999998" "$work/proc/999997"
 printf 'GPU_HOLD_TICKET=survivors pid 999998 Thu Nov  9 10:00:00 2026\0PATH=/usr/bin\0' > "$work/proc/999998/environ"
 printf 'gpu-hold\0-l\0survivors\0' > "$work/proc/999998/cmdline"
-printf 'GPU_HOLD_TICKET=survivors pid 999997 Thu Nov  9 10:00:00 2026\0' > "$work/proc/999997/environ"
+# Unopenable for EVERY user: a dangling symlink. `chmod 000` does not do it -- CI's build job runs as root, where a 0000
+# file still opens, and the first version of this arm failed there for that reason alone (measured: `got 0, want 1`).
+ln -s "$work/proc/999997/no-such-environ" "$work/proc/999997/environ"
 printf 'payload\0' > "$work/proc/999997/cmdline"
-chmod 000 "$work/proc/999997/environ"          # unopenable: counted, not fatal
 mkdir -p "$c/q"
 GPU_HOLD_PROC="$work/proc" GPU_QUEUE_DIR="$c/q" GPU_TOKEN_FILE="$c/token" GPU_HOLD_LOG="$c/log" \
 GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=2 \

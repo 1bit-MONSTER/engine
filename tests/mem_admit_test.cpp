@@ -277,6 +277,11 @@ int main() {
                admit::gtt_reserve_bytes(16 * gib) == 4 * gib);
         expect("8 GiB of GTT (a 16 GB machine) keeps a 2 GiB reserve and a usable ceiling",
                admit::gtt_reserve_bytes(8 * gib) == 2 * gib);
+        // engine#2995 review: an UNREADABLE pool is not an empty one. `gtt_total == 0` must keep the measured reserve,
+        // because the alternative is failing open on the input where the answer is unknown.
+        expect("an unreadable pool keeps the measured 16 GiB reserve, not zero",
+               admit::gtt_reserve_bytes(0) == 16 * gib);
+
         expect("a 16 GiB-GTT box now admits a small model where the fixed reserve refused everything",
                ceiling_of(16 * gib).fits || !ceiling_of(16 * gib).over_ceiling);
     }

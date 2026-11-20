@@ -70,6 +70,11 @@ inline uint64_t gtt_reserve_bytes(uint64_t gtt_total) {
         const long long mb = std::atoll(e);
         if (mb >= 0) return uint64_t(mb) * kMiB;
     }
+    // engine#2995 review: `gtt_total == 0` means the pool could not be READ, not that it is empty. Without this line
+    // `quarter` is 0, `0 < cap` is true, and the function returns no reserve at all -- failing open on exactly the input
+    // where the answer is unknown, so a 32 GB box whose GTT read fails would be admitted like a box with an infinite pool.
+    // The measured-safe value is the right answer to "I cannot tell".
+    if (gtt_total == 0) return kGttReserveDefaultMiB * kMiB;
     const uint64_t quarter = gtt_total / 4;
     const uint64_t cap     = kGttReserveDefaultMiB * kMiB;
     return quarter < cap ? quarter : cap;

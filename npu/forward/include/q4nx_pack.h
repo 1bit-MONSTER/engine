@@ -324,6 +324,8 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
  * (engine #1416). Writes Bm at the blocked (or row-major, `blocked == 0`) index for this geometry, per-column scales into
  * col_scales[N], and the sum of the scales into *ssum_out. `KD`/`ND` are the container's padded geometry the layout is
  * defined on. Behaviour-preserving extraction: the body is the class's own, with `bpos()` passed in. */
+int q4nx_pack_B_int4_blocked(uint8_t* Bm, const float* w, int K, int N, int KD, int ND,
+                                        float* col_scales, double* ssum);
 int q4nx_pack_B_int8_blocked(int8_t* Bm, const float* w, int K, int N, int KD, int ND, int blocked,
                              float* col_scales, double* ssum_out);
 

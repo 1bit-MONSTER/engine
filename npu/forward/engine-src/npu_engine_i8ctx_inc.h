@@ -98,6 +98,10 @@ struct I8Ctx {
     // before q4nx_weight_layout "b8"), true = the blocked 8x8-microtile image.
     // Set by Q4nxNpuForward from the container's config before the first pack.
     bool blocked_b = false;
+    // 4-bit weight stream (i4 plan, 2026-11-12): B arrives as two nibbles per
+    // byte in the blocked order and the kernel expands it on-chip. The
+    // per-column scale contract is unchanged, so the read-back is untouched.
+    bool b4 = false;
 
     // Weight image "pb16i" (q4nx_weight_layout "pb16i"): the BO holds a pb16i sidecar
     // unchanged (codes + int16 multipliers), there is no packing and no int8 scale --
@@ -184,6 +188,7 @@ struct I8Ctx {
 
     // Bytes of one weight image: the int8 layouts are KD*ND, pb16i and t2s are their own sizes.
     size_t w_bytes() const {
+        if (b4) return (size_t)KD * (size_t)ND / 2;
         if (gemv) return gemv_w_bytes(KD, ND);
         if (t2s) return q4nx_t2s::w_bytes(KD, ND);
         return pb16i ? q4nx_pb16i::w_bytes(KD, ND) : (size_t)KD * (size_t)ND;
@@ -197,8 +202,9 @@ struct I8Ctx {
     bool init_elf(xrt::device& d, const char* ep, int M, int K, int N,
                   int nlayers, const char* kname = "main:seq") {
         MD = M; KD = K; ND = N; NL = nlayers;
-        fprintf(stderr, "  I8Ctx::init_elf ep=%s M=%d K=%d N=%d nl=%d\n",
-                ep, M, K, N, nlayers);
+        b4 = getenv("NPU_I4") && M <= 16;   // the M=128 prefill ELFs stay int8
+        fprintf(stderr, "  I8Ctx::init_elf ep=%s M=%d K=%d N=%d nl=%d b4=%d\n",
+                ep, M, K, N, nlayers, (int)b4);
         // The blocked image is built from whole 64x128 tiles: a geometry that is
         // not a multiple of those has no blocked mapping, and silently packing it
         // would index outside the tile grid.
@@ -525,6 +531,30 @@ struct I8Ctx {
     void packB_blocked(int8_t* Bm, const float* w, int K, int N,
                        std::vector<float>& col, double& ssum) {
         col.resize((size_t)N);
+        // Step A (plan 9): 4-bit LEVELS through the known-good int8 stream.
+        // Same data path, same packer contract, no 4-bit streaming involved --
+        // decides whether the int4 fault is the packer/scale or the stream.
+        if (getenv("NPU_I4_EMU")) {
+            const float q7 = 7.0f;
+            double acc = 0;
+            for (int j = 0; j < N; ++j) {
+                float amax = 0;
+                for (int i = 0; i < K; ++i) amax = std::max(amax, std::fabs(w[(size_t)i * N + j]));
+                float s4 = amax > 0 ? amax / q7 : 1.0f;
+                col[j] = s4 / 16.0f;      // gs: int8 image carries q4*16
+                acc += col[j];
+                for (int i = 0; i < K; ++i) {
+                    int q = (int)std::lrint(std::max(-7.0f, std::min(q7, w[(size_t)i * N + j] / s4)));
+                    Bm[q4nx_layout::blocked_index((size_t)i, (size_t)j, KD, ND)] = (int8_t)(q * 16);
+                }
+            }
+            ssum = acc;
+            return;
+        }
+        if (b4) {
+            if (!blocked_b) { fprintf(stderr, "  [i4] refusing: NPU_I4 needs the b8 blocked layout\n"); b4 = false; }
+            else { q4nx_pack_B_int4_blocked((uint8_t*)Bm, w, K, N, KD, ND, col.data(), &ssum); return; }
+        }
         q4nx_pack_B_int8_blocked(Bm, w, K, N, KD, ND, blocked_b ? 1 : 0, col.data(), &ssum);
     }
 
@@ -532,7 +562,7 @@ struct I8Ctx {
     void packB_into(xrt::bo& bo, const float* w, int K, int N,
                     float& sout, std::vector<float>& col_out) {
         auto* Bm = (int8_t*)bo.map();
-        memset(Bm, 0, (size_t)KD * ND);
+        memset(Bm, 0, b4 ? (size_t)KD * ND / 2 : (size_t)KD * ND);
         std::vector<float> col(N);
         double ssum = 0;
         packB_blocked(Bm, w, K, N, col, ssum);
@@ -620,7 +650,7 @@ struct I8Ctx {
         // ~0.007 vs q/k ~0.02-0.03) onto ~10 int8 levels -> ~5% output error
         // that compounds over 28 layers and flips the final token.
         auto* Bm = (int8_t*)layerB[l]->map();
-        memset(Bm, 0, (size_t)KD * ND);
+        memset(Bm, 0, b4 ? (size_t)KD * ND / 2 : (size_t)KD * ND);
         std::vector<float> col(N);
         double ssum = 0;
         packB_blocked(Bm, w, K, N, col, ssum);
@@ -815,7 +845,7 @@ struct I8Ctx {
     inline bool pack_qkv_sec(int l, const float* w, int K, int N,
                              int nq, int nk, std::vector<float>& out_scales) {
         auto* Bm = (int8_t*)layerB[l]->map();
-        memset(Bm, 0, (size_t)KD * ND);
+        memset(Bm, 0, b4 ? (size_t)KD * ND / 2 : (size_t)KD * ND);
         auto pack_sec = [&](int j0, int j1, float& ts) {
             float amax = 0;
             for (int j = j0; j < j1; j++)

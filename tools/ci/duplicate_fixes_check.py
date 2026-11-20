@@ -205,15 +205,32 @@ def describe(issue, group):
     return "\n".join(lines)
 
 
+def run_gh(args):
+    """`gh api …` -> stdout, or RuntimeError when gh could not run or did not answer.
+
+    engine#2962 review: a bare `subprocess.run` here made the two shapes that actually happen read as answers.
+    `gh` missing raised `FileNotFoundError` out of `main()` (a traceback, rc 1 -- read as a duplicate finding), and
+    `gh` failing returned EMPTY STDOUT, which `json.loads(raw or '[]')` turned into "no open PRs" -- a silent clean
+    from the row that polices duplicates. Both are failures to look, so both leave as RuntimeError, which the
+    per-repo handler already turns into `failed` and `--gate` into 77.
+    """
+    try:
+        p = subprocess.run(['gh'] + list(args), capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"gh could not run: {e}")
+    if p.returncode != 0:
+        raise RuntimeError(f"gh api exited {p.returncode}: {(p.stderr or '').strip()[:200]}")
+    return p.stdout
+
+
 def gh(path, paginate=False):
     """One page, or every page, of a `gh api` list endpoint (the same shape as pr_review_queue.py)."""
     if not paginate:
-        return subprocess.run(['gh', 'api', path], capture_output=True, text=True).stdout
+        return run_gh(['api', path])
     out, page = [], 1
     while True:
         sep = '&' if '?' in path else '?'
-        chunk = subprocess.run(['gh', 'api', f"{path}{sep}per_page={PAGE}&page={page}"],
-                               capture_output=True, text=True).stdout
+        chunk = run_gh(['api', f"{path}{sep}per_page={PAGE}&page={page}"])
         try:
             got = json.loads(chunk or '[]')
         except json.JSONDecodeError:
@@ -393,6 +410,37 @@ def self_test():
     ok(exit_code([], 0) == 0 and exit_code([{'repo': 'engine'}], 0) == 1, "0 none / 1 duplicate")
     ok(exit_code([{'repo': 'engine'}], 1) == 2, "cannot-tell outranks a duplicate rather than being swallowed by it")
     ok(exit_code([], 2) == 2, "and it is not a pass on its own either")
+
+    # engine#2962 review: both ways of failing to look must be cannot-tell, never a clean and never a traceback.
+    # Driven through a stub on PATH, because that is the state a runner is actually in when gh is absent or 403s.
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as td:
+        stub = pathlib.Path(td) / "gh"
+        stub.write_text("#!/bin/sh\nexit 1\n")
+        stub.chmod(0o755)
+        saved = os.environ.get("PATH", "")
+        os.environ["PATH"] = td + os.pathsep + saved
+        try:
+            try:
+                gh("repos/1bit-MONSTER/engine/pulls?state=open", paginate=False)
+                refused_failing = False
+            except RuntimeError:
+                refused_failing = True
+        finally:
+            os.environ["PATH"] = saved
+        ok(refused_failing, "a gh that exits non-zero is cannot-tell, not empty output ('[]' = no open PRs)")
+
+    saved = os.environ.get("PATH", "")
+    os.environ["PATH"] = "/nonexistent"
+    try:
+        try:
+            gh("repos/1bit-MONSTER/engine/pulls?state=open", paginate=False)
+            refused_missing = False
+        except RuntimeError:
+            refused_missing = True
+    finally:
+        os.environ["PATH"] = saved
+    ok(refused_missing, "a missing gh is cannot-tell too, not a FileNotFoundError out of main()")
 
     print("self-test ok" if not fails else f"self-test FAILED ({fails})")
     return 0 if not fails else 1

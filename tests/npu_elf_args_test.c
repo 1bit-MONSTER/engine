@@ -78,6 +78,51 @@ static unsigned char* build_elf(const uint32_t sizes[3], uint32_t* out_len) {
     return elf;
 }
 
+// engine#1783: a sealed ELF -- two kernel instances, each with its own .ctrltext section in a SHT_GROUP whose signature
+// symbol (.symtab) is the instance name, and each declaring its own "0".."2" argument symbols in its section, the layout
+// aiecc --get-full-elf writes for a design with several runtime sequences.
+static unsigned char* build_sealed_elf(const uint32_t a[3], const uint32_t b[3], uint32_t* out_len) {
+    enum { NDSYM = 7, NSYM = 3, NSH = 9 };
+    const uint32_t off_dyn = 52, off_dstr = off_dyn + NDSYM * 16, off_sym = off_dstr + 8, off_str = off_sym + NSYM * 16;
+    const uint32_t off_ct0 = off_str + 8, off_ct1 = off_ct0 + 16, off_g0 = off_ct1 + 16, off_g1 = off_g0 + 8;
+    const uint32_t off_sht = off_g1 + 8, total = off_sht + NSH * 40;
+    unsigned char* elf = calloc(1, total);
+    if (!elf) return NULL;
+    memcpy(elf, "\x7f" "ELF", 4);
+    elf[4] = 1; elf[5] = 1; elf[6] = 1;
+    put32(elf + 0x20, off_sht); put16(elf + 0x2E, 40); put16(elf + 0x30, NSH); put16(elf + 0x32, 0);
+    memcpy(elf + off_dstr, "\0" "0" "\0" "1" "\0" "2" "\0", 7);    // "0" "1" "2" at 1, 3, 5
+    memcpy(elf + off_str, "\0" "kA" "\0" "kB" "\0", 7);            // "kA" at 1, "kB" at 4
+    for (int i = 1; i < NDSYM; i++) {                                  // 1..3 -> section 5 (kA), 4..6 -> section 6 (kB)
+        unsigned char* sym = elf + off_dyn + i * 16;
+        const int arg = (i - 1) % 3, inst = (i - 1) / 3;
+        put32(sym, (uint32_t)(2 * arg + 1));
+        put32(sym + 8, inst ? b[arg] : a[arg]);
+        sym[12] = 0x11;
+        put16(sym + 14, (uint16_t)(5 + inst));
+    }
+    put32(elf + off_sym + 16, 1); elf[off_sym + 16 + 12] = 0x21;     // WEAK OBJECT "kA"
+    put32(elf + off_sym + 32, 4); elf[off_sym + 32 + 12] = 0x21;     // WEAK OBJECT "kB"
+    put32(elf + off_g0, 1); put32(elf + off_g0 + 4, 5);              // GRP_COMDAT, member .ctrltext.0
+    put32(elf + off_g1, 1); put32(elf + off_g1 + 4, 6);
+    struct { uint32_t type, off, size, link, info, entsize; } sh[NSH] = {
+        {0, 0, 0, 0, 0, 0},
+        {11, off_dyn, NDSYM * 16, 2, 1, 16},   // .dynsym
+        {3, off_dstr, 8, 0, 0, 0},             // .dynstr
+        {2, off_sym, NSYM * 16, 4, 1, 16},     // .symtab
+        {3, off_str, 8, 0, 0, 0},              // .strtab
+        {1, off_ct0, 16, 0, 0, 0},             // .ctrltext.0
+        {1, off_ct1, 16, 0, 0, 0},             // .ctrltext.1
+        {17, off_g0, 8, 3, 1, 4},              // .group.0, signature symtab[1] = kA
+        {17, off_g1, 8, 3, 2, 4}};             // .group.1, signature symtab[2] = kB
+    for (int i = 0; i < NSH; i++) {
+        const uint32_t f[10] = {0, sh[i].type, 0, 0, sh[i].off, sh[i].size, sh[i].link, sh[i].info, 4, sh[i].entsize};
+        memcpy(elf + off_sht + i * 40, f, sizeof f);
+    }
+    *out_len = total;
+    return elf;
+}
+
 int main(void) {
     // the OGA pack's attention ELF: weights, activations, output
     const uint32_t sizes[3] = {163840, 2048, 1024};
@@ -139,6 +184,26 @@ int main(void) {
             }
         }
         printf("gemv family: %zu declarations classified\n", sizeof cases / sizeof cases[0]);
+    }
+
+    // engine#1783: per-instance widths of a sealed ELF. The first declaration is instance A's, so a reader that ignores
+    // the instance would check B's buffers against A's widths (and refuse a valid load, or pass an invalid one).
+    {
+        const uint32_t wa[3] = {147456, 294912, 131072}, wb[3] = {16384, 32768, 131072};
+        uint32_t ls = 0;
+        unsigned char* se = build_sealed_elf(wa, wb, &ls);
+        uint64_t g[3] = {0, 0, 0};
+        check(se && q4nx_elf_arg_sizes_for(se, ls, "main:kB", g) == 3 && g[0] == 16384 && g[1] == 32768 &&
+                  g[2] == 131072, "a sealed ELF's instance kB reads its own widths");
+        check(q4nx_elf_arg_sizes_for(se, ls, "kA", g) == 3 && g[0] == 147456 && g[1] == 294912,
+              "instance kA reads its own widths (with or without the main: prefix)");
+        check(q4nx_elf_arg_sizes(se, ls, g) == 3 && g[0] == 147456, "no instance reads the first declaration");
+        check(q4nx_elf_arg_sizes_for(se, ls, "main:seq", g) == 3 && g[0] == 147456, "main:seq reads the first declaration");
+        check(q4nx_elf_arg_sizes_for(se, ls, "main:kC", g) == 3 && g[0] == 147456,
+              "an instance no group names reads the first declaration");
+        check(q4nx_elf_arg_sizes_for(elf, len, "main:kB", g) == 3 && g[0] == 163840,
+              "a single-sequence ELF (no groups) reads its one declaration whatever the instance");
+        free(se);
     }
 
     free(elf); free(e2); free(bad);

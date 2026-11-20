@@ -826,6 +826,10 @@ int q4nx_gemv_family(const uint64_t declared[3], int K, int N) {
 }
 
 int q4nx_elf_arg_sizes(const void* elf, size_t n, uint64_t out[3]) {
+    return q4nx_elf_arg_sizes_for(elf, n, NULL, out);
+}
+
+int q4nx_elf_arg_sizes_for(const void* elf, size_t n, const char* instance, uint64_t out[3]) {
     if (out) { out[0] = out[1] = out[2] = 0; }
     if (!elf || !out || n < 52) return -1;
     const uint8_t* b = (const uint8_t*)elf;
@@ -848,6 +852,34 @@ int q4nx_elf_arg_sizes(const void* elf, size_t n, uint64_t out[3]) {
         sect[i].entsize = RD32(p + 36);
         if (sect[i].type != 8 /* SHT_NOBITS */ && sect[i].off + sect[i].size > n) return -1;
     }
+    /* engine#1783: one instance of several -- the members of the SHT_GROUP (type 17) whose signature symbol (sh_info, an
+     * index into the group's sh_link symbol table) is named `instance`. members[i] marks the sections to read. */
+    uint8_t members[512];
+    int filtered = 0;
+    if (instance && strncmp(instance, "main:", 5) == 0) instance += 5;
+    if (instance && *instance && strcmp(instance, "seq") != 0) {
+        memset(members, 0, sizeof members);
+        for (uint32_t g = 0; g < shnum && !filtered; g++) {
+            if (sect[g].type != 17 /* SHT_GROUP */ || sect[g].link >= shnum) continue;
+            const uint8_t* gh = b + shoff + (uint64_t)g * shentsize;
+            const uint64_t info = RD32(gh + 28);
+            const struct sh* symtab = &sect[sect[g].link];
+            if (symtab->link >= shnum) continue;
+            const struct sh* strs = &sect[symtab->link];
+            const uint32_t ses = symtab->entsize ? (uint32_t)symtab->entsize : 16;
+            if (ses < 16 || (info + 1) * ses > symtab->size) continue;
+            const uint64_t nm_off = RD32(b + symtab->off + info * ses);
+            if (nm_off >= strs->size) continue;
+            const char* nm = (const char*)(b + strs->off + nm_off);
+            const size_t room = (size_t)(strs->size - nm_off), want = strlen(instance);
+            if (room <= want || strncmp(nm, instance, want) != 0 || nm[want] != 0) continue;
+            for (uint64_t w = 4; w + 4 <= sect[g].size; w += 4) {   /* word 0 is the group flags */
+                const uint64_t m = RD32(b + sect[g].off + w);
+                if (m < shnum) members[m] = 1;
+            }
+            filtered = 1;
+        }
+    }
     int found = 0;
     for (uint32_t i = 0; i < shnum; i++) {
         if (sect[i].type != 11 /* SHT_DYNSYM */ || sect[i].link >= shnum) continue;
@@ -860,6 +892,10 @@ int q4nx_elf_arg_sizes(const void* elf, size_t n, uint64_t out[3]) {
             const uint64_t size = RD32(sym + 8);
             const uint8_t info = sym[12];
             if ((info & 0xF) != 1 /* STT_OBJECT */ || !size) continue;
+            if (filtered) {
+                const uint32_t shndx = RD16(sym + 14);
+                if (shndx >= shnum || !members[shndx]) continue;
+            }
             if (name >= st->size) continue;
             const uint8_t* nm = b + st->off + name;
             const uint64_t room = st->size - name;

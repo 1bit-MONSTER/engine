@@ -321,6 +321,20 @@ detail:
 HW_GATE_NPU_SERVE_BIN=/path/to/1bit HW_GATE_NPU_SERVE_MODEL=/path/to/Qwen3-0.6B scripts/hw-gate.sh --phases npuserve
 ```
 
+**One more variable decides whether that row can pass at all, and it is not a gate variable:** the serve needs to
+resolve the NPU kernel set, so `ONEBIT_NPU_KERNELS=<dir of full_i8_*.elf>` (or a `<pack>/npu` directory, or a build
+configured with `-DONEBIT_NPU_KERNELS_DIR=`) must name a set **whose dims match the pack**. Measured on strixhalo
+2026-11-20 with an `ONEBIT_NPU=ON` binary built against the real `libnpu_rt_api.a`:
+
+| `ONEBIT_NPU_KERNELS` | row | what the serve did |
+|---|---|---|
+| unset, pack has no `npu/` | **FAIL** | per-op route, median **2.5 tok/s** against the 30 floor, first token 850 ms — `content ok, 5 replies` |
+| a 0.6B full-ELF set with a 0.6B pack | `tests/serve_e2e.sh` **PASS**, 20 s | the route's own kernel set, and the gate row passes the same way |
+
+So a red `npuserve` with `route FAIL … the per-op forward` is usually the kernel set, not the binary: the answers are
+right, and only the route/rate assertions say the release would have shipped the slow path — which is exactly what
+this phase is for (engine#2102/#2106).
+
 The three numbers that decide the rate assertion are all passed by the phase, so none is a default
 hidden in another file: `HW_GATE_NPU_SERVE_FLOOR` (tok/s, default **30**), `HW_GATE_NPU_SERVE_MAX_TOKENS`
 (answer length, default 96) and `HW_GATE_NPU_SERVE_REPLIES` (requests, default 5; the rate is their

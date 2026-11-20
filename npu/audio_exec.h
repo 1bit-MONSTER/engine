@@ -81,6 +81,9 @@ bool run_audio_graph(const OnnxGraphInfo& g, const float* mel, int64_t mel_bins,
 
 // The decoder: `tokens` is the int64 token window for the graph's first input; `xa` (the encoder output, row-major f32) is
 // bound to the graph's second input when the graph has one. `xa_dims` may be empty when there is no cross-attention input.
+// engine#1783: offer every weight product of `g` to `dev` once with an all-zero activation of `rows` rows, so the device
+// caches each packed weight before the first window. Returns the number offered, -1 + why on a load failure.
+int prefill_audio_device(const OnnxGraphInfo& g, int64_t rows, AudioGemm* dev, std::string* why);
 bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_tokens, const float* xa,
                        const std::vector<int64_t>& xa_dims, const std::string& out_name, AudioRunResult* out,
                        std::string* why);

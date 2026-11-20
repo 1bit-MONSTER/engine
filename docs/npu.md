@@ -4350,6 +4350,24 @@ control the executor:
 On a loaded box, compare one op with MatMul in the same run rather than across runs: MatMul's share moves with load
 much less than the wall total does.
 
+**The device route (`whisper_transcribe_npu`, `ONEBIT_WHISPER_NPU_KERNELS=<dir>`).** The encoder's projections and
+Conv stems run on the NPU. Each of the following is on by default, can be turned off on its own, and leaves the
+encoder output byte-identical (the encode-only line prints its FNV-1a hash):
+
+- `ONEBIT_AUDIO_SKIP_CACHED_W=0` loads every weight on every pass, even when the device already holds it.
+- `ONEBIT_AUDIO_DIRECT_OUT=0` dequantises into a staged-width buffer and copies the rows out, the old path.
+- `ONEBIT_NPU_GLUE_AVX2=0` and `ONEBIT_NPU_GLUE_THREADS=1` keep the per-row scale and dequant loops scalar and serial
+  (`npu/target/xdna/rows_host.h`; `tests/npu_rows_host_test.cpp` checks every variant byte for byte).
+- `ONEBIT_AUDIO_FUSE_QKV=0` offers q, k and v separately. When on, the three are one product of staged shape K768
+  N2560; a kernel set without that ELF declines it and the three run as separate launches.
+
+`ONEBIT_WHISPER_NPU_PREFILL=1` packs every weight when the device is opened instead of in the first window. It is
+**off** in the one-shot tool: a single transcription pays the same fills either way, so moving them into load (0.77 s
+on whisper-small) makes nothing shorter, and with it on the warm pass measured 0.03-0.05 s slower, which is not
+explained yet. It is meant for a path that keeps the model open across requests.
+`ONEBIT_WHISPER_ENCODE_REPEAT=<n>` runs each window's encoder n extra times and prints each pass, so the first pass's
+one-time costs can be told apart from the per-window ones; `NPU_PROFILE=1` adds the target's per-role launch costs.
+
 **RoPE pair order (engine#2673).** The forward's RoPE rotates half-split pairs (i, i + rot/2), the HF `rotate_half`
 form. chatglm3's attention nodes (28 `com.ryzenai:GQO` in `chatglm3-6b-onnx-ryzenai-npu`'s `fusion.onnx`) state
 `rotary_interleaved = 1` with `rotary_embedding_dim = 64`, meaning consecutive pairs (2i, 2i+1) over the first 64 of

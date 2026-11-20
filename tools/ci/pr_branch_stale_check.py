@@ -43,6 +43,15 @@ def verdict_exit(unreadable, findings):
     return EXIT_FINDING if findings else EXIT_CLEAN
 
 
+def advisory_exit(verdict):
+    """The exit `--advisory` turns a verdict into: a finding becomes 0, cannot-tell becomes 77 (the runner's skip)."""
+    if verdict == EXIT_FINDING:
+        return 0
+    if verdict == EXIT_CANNOT_TELL:
+        return 77
+    return verdict
+
+
 def run(*a, cwd=None):
     r = subprocess.run(a, capture_output=True, text=True, cwd=cwd)
     return r.returncode, r.stdout, r.stderr
@@ -207,6 +216,11 @@ def self_test():
     chk(verdict_exit(unreadable=False, findings=2) == 1, "exit table: a finding is 1")
     chk(verdict_exit(unreadable=True, findings=0) == 2, "exit table: an unreadable queue is 2, not a clean 0")
     chk(verdict_exit(unreadable=True, findings=3) == 2, "exit table: cannot-tell outranks findings -- both need looking, one needs a rerun")
+    # engine#3057: `--advisory` is for a caller that scans OTHER lanes' PRs, so a finding must not fail it -- while
+    # cannot-tell must stay visible as 77 (the runner's skip): a caller that could not look must not look green.
+    chk(advisory_exit(EXIT_FINDING) == 0, "advisory: a finding is reported and exits 0, so it cannot block another lane's gate")
+    chk(advisory_exit(EXIT_CANNOT_TELL) == 77, "advisory: cannot-tell is 77 (a skip), never 0")
+    chk(advisory_exit(EXIT_CLEAN) == 0, "advisory: a clean run stays 0")
     return 0 if ok else 1
 
 
@@ -214,6 +228,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", default="1bit-MONSTER/engine")
     ap.add_argument("--root", default=".")
+    ap.add_argument("--advisory", action="store_true",
+                    help="report every stale branch and exit 0 even with findings -- for a caller that scans OTHER "
+                         "lanes' PRs (scripts/pre-pr-checks.sh), where a hard failure would let one lane's branch "
+                         "block another lane's gate. Cannot-tell still answers 77 (skip), never 0 (engine#3057)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
@@ -249,6 +267,14 @@ def main():
     elif not unreadable:
         print("pr_branch_stale_check: no open PR would revert main (every branch was read)")
     rc = verdict_exit(unreadable, findings)
+    if a.advisory:
+        return advisory_exit(rc)
+    if a.advisory and rc == EXIT_FINDINGS:
+        # advisory: the finding is printed above and this run does not fail -- see the flag's help
+        return 0
+    if a.advisory and rc == EXIT_CANNOT_TELL:
+        # a caller that cannot fail must still not look green: the runner counts 77 as a visible skip (engine#2932)
+        return 77
     if rc == EXIT_CANNOT_TELL:
         print(f"pr_branch_stale_check: {len(unreadable)} of the open PR(s) could not be read, so this is not a clean run",
               file=sys.stderr)

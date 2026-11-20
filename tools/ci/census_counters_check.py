@@ -56,7 +56,14 @@ def load(root: Path):
 
 def declined_classes(sig, archs):
     """tools/census.py:125 exactly: `watch == "report"` and the class has no backend."""
-    return {hf for hf, entry in sig.items() if entry.get("watch") == "report" and not (archs.get(hf) or {}).get("backends")}
+    # engine#3041: the committed file NESTS its classes under "architectures" (`about`, `sources`, `counts`,
+    # `architectures`), so `archs.get(hf)` found nothing for any class and every `watch: "report"` class counted as
+    # declined -- 33/1042 computed against a correct 26/478 snapshot, red every day for days. `tools/census.py` has
+    # always read it through `a_get(table, key)` with the nested table; this follows it, and still accepts a flat file
+    # so an older tree is not a new failure.
+    table = archs.get("architectures", archs) if isinstance(archs, dict) else {}
+    return {hf for hf, entry in sig.items()
+            if entry.get("watch") == "report" and not (table.get(hf) or {}).get("backends")}
 
 
 def check(root: Path):
@@ -112,6 +119,16 @@ def self_test() -> int:
         root = build(tmp, {"declined_architectures": 1, "declined_models": 7}, sig, archs, counts)
         got, why = check(root)
         arm("a consistent snapshot passes", got == [] and why is None, str(why or got))
+
+        # engine#3041: the committed file nests its classes under "architectures", and a flat read sees no class at all,
+        # so every `watch: report` class counts as declined. This arm is built so the two readings DIFFER: one class is
+        # mapped (in the nested table) and one is not, so the correct answer is 1 declined and a flat read says 2.
+        nested_sig = {"ReviewedForCausalLM": {"watch": "report"}, "MappedForCausalLM": {"watch": "report"}}
+        nested_archs = {"about": "census", "architectures": {"MappedForCausalLM": {"backends": ["hrx"]}}}
+        nested = build(tmp, {"declined_architectures": 1, "declined_models": 7}, nested_sig, nested_archs, counts)
+        got, why = check(nested)
+        arm("a class mapped inside the nested table is not counted as declined", got == [] and why is None,
+            str(why or got))
 
         root = build(tmp, {"declined_architectures": 23, "declined_models": 465}, sig, archs, counts)
         got, why = check(root)

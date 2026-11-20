@@ -124,7 +124,29 @@ if [ "${GPU_HOLD:-}" != 1 ] && [ "${HW_GATE_GPU_HOLD:-1}" != 0 ] && [ -z "${HW_G
         GPU_HOLD=1 HW_GATE_TOKEN=none exec "$0" "$@"
     fi
 fi
-if [ "${GPU_HOLD:-}" != 1 ] && [ "${HW_GATE_GPU_HOLD:-1}" != 0 ] && [ -z "${HW_GATE_TOKEN:-}" ]; then
+# engine#3030: a phase set with NO GPU phase in it does not claim the GPU token. Measured 2026-11-20: `--phases npuserve`
+# waited 858 s for /home/bcloud/GPU-TOKEN behind GPU work and then held the GPU for an NPU-only test, which is both a wait
+# nobody explains and a hold another lane pays for. The predicate is on the NAMES, before any phase runs, so it costs
+# nothing when a GPU phase is present (the default set is untouched).
+_npu_only=1
+_seen_phases=0
+_prev=""
+for _a in "$@"; do
+    if [ "$_prev" = "--phases" ]; then
+        _seen_phases=1
+        _set=${_a//,/ }
+        for _p in $_set; do
+            case "$_p" in
+                npu|npuserve) ;;
+                *) _npu_only=0 ;;
+            esac
+        done
+    fi
+    _prev=$_a
+done
+# no --phases named: the default set has GPU phases, so the claim stays
+[ "$_seen_phases" = 1 ] || _npu_only=0
+if [ "${GPU_HOLD:-}" != 1 ] && [ "${HW_GATE_GPU_HOLD:-1}" != 0 ] && [ -z "${HW_GATE_TOKEN:-}" ] && [ "$_npu_only" != 1 ]; then
     hold=$(command -v gpu-hold 2> /dev/null || true)
     if [ -z "$hold" ] && [ -x "$(dirname "$0")/gpu-hold" ]; then hold="$(dirname "$0")/gpu-hold"; fi
     if [ -n "$hold" ]; then

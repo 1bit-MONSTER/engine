@@ -84,6 +84,10 @@ uint64_t bo::address() const { return 0; }
 
 // --- ext::bo
 ext::bo::bo(const device&, size_t) { stub_called("ext::bo::bo"); }
+// engine#3003: the dma-buf constructor the dma-buf import test calls. It is defined by the real runtime
+// (npu_rt_api.cpp), so a stub without it turns a real link failure into "undefined reference" in CI --
+// which is how the two targets below read for a day. The stub is the API surface the tests may use.
+ext::bo::bo(const device&, int, size_t, void*) { stub_called("ext::bo::bo(fd)"); }
 
 // --- elf
 elf::elf() = default;
@@ -94,6 +98,7 @@ elf& elf::operator=(const elf&) { stub_called("elf::operator="); }
 elf::~elf() = default;
 bool elf::is_full_elf() const { return false; }
 uuid elf::get_cfg_uuid() const { return uuid{}; }
+arg_need elf::get_arg_need(const std::string&, int) const { return arg_need{}; }
 
 // --- hw_context
 hw_context::hw_context() = default;

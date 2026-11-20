@@ -455,7 +455,23 @@ Every number in this page came from one host, and on 11-15 that host was **cold-
 ```
 before:  amdxdna srcversion F87D0BDF248067862F83BA3     <- all 740 faults, all six ruled-out workloads
 after:    amdxdna srcversion E48F9326AC573D2E06BC926     <- production, 0 IO_PAGE_FAULT so far
+later:    amdxdna srcversion E81A7B404BCF88 (11-16)      <- stream returns after reboot: 134 NVMe + 90 amdxdna in 1562 records
+fourth:   amdxdna srcversion 9BC1292B784C8D5F40AED02 (11-20) <- see the burst below
 ```
+
+**Fourth build, first burst (2026-11-20, 14:18:53 local = 18:18:53Z, 14 min after a clean reboot).** Ten
+`amdxdna IO_PAGE_FAULT` events in **one second**, `domain=0x0002`, all `flags=0x0007`, ten distinct addresses. The strides are
+**not** page-aligned — 32 bytes (×4), 128 (×2), 320 (x2) — so this is ten *fields* inside one or two pages rather than the ten
+consecutive 4 KiB pages of the 15:42:45 burst on #2542. The two shapes should not be read as one mechanism without more data.
+
+The sampler was running and **attributed all ten at a 1 s distance with no holder**:
+
+```
+1795198733  1s  -  -  -  -  1795198733.430094 strixhalo kernel: amdxdna 0000:c6:00.1: … IO_PAGE_FAULT domain=0x0002 …
+```
+
+No holder at the fault instant is the residue signature this page's resolution section describes, and it is now measured on a
+fourth driver build: **the stream is not a property of the driver version**.
 
 So the observations here describe a build, not a machine. Record the build with the observation, or the next reader will
 compare two different kernels and call the difference a finding:

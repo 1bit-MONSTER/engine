@@ -202,61 +202,6 @@ int main() {
         }
     }
 
-    // A re-used slot starts a NEW sequence at position 0: it must answer from an empty cache, not from the previous
-    // conversation's K/V. Slot 0 above has already served prompts[0] plus kRounds decode rounds, so this is a real
-    // reuse rather than a fresh object.
-    {
-        const std::vector<int> second = {21, 22, 23, 24};
-        // What a FRESH single-sequence run answers for that prompt (the last row).
-        Q4nxNpuForward fresh;
-        std::vector<float> fresh_last;
-        if (!init(fresh, d) || !fresh.step_batch(second, 0, fresh_last) || fresh_last.empty()) {
-            std::printf("FAIL fresh reference for the re-used slot: %s\n", fresh.last_error());
-            return 1;
-        }
-        std::vector<int> pos, slot;
-        for (size_t i = 0; i < second.size(); i++) {
-            pos.push_back(int(i));
-            slot.push_back(0);
-        }
-        std::vector<float> all;
-        if (!fwd.step_users(second, pos, slot, all)) {
-            std::printf("FAIL step_users on the re-used slot: %s\n", fwd.last_error());
-            return 1;
-        }
-        const std::vector<float> got(all.end() - (long)width, all.end());
-        const int at = first_difference(got, fresh_last);
-        if (at >= 0) {
-            std::printf("FAIL a re-used slot did not start clean: logit %d is %.9g, a fresh run says %.9g\n", at,
-                        got[(size_t)at], fresh_last[(size_t)at]);
-            return 1;
-        }
-        // The control: if the stale cache happened to answer the same, this arm could not tell a cleared slot from a
-        // re-used one, so the comparison above would pass on a build that never clears. A separate instance carries
-        // prompts[0] and its decoded rounds, then answers the new prompt's token at the same position -- the wrong
-        // answer this arm exists to exclude.
-        Q4nxNpuForward stale;
-        std::vector<float> tmp;
-        if (!init(stale, d) || !stale.step_batch(prompts[0], 0, tmp)) {
-            std::printf("FAIL stale-instance setup: %s\n", stale.last_error());
-            return 1;
-        }
-        for (int r = 0; r < kRounds; r++)
-            if (!stale.step(argmax(tmp), int(prompts[0].size()) + r, tmp)) {
-                std::printf("FAIL stale-instance continuation %d: %s\n", r, stale.last_error());
-                return 1;
-            }
-        std::vector<float> stale_last;
-        if (!stale.step(second.back(), int(second.size()) - 1, stale_last)) {
-            std::printf("FAIL stale-instance step: %s\n", stale.last_error());
-            return 1;
-        }
-        if (first_difference(fresh_last, stale_last) < 0) {
-            std::printf("FAIL the stale conversation answers identically: this container cannot tell a cleared slot "
-                        "from a re-used one, pick another ONEBIT_TEST_Q4NX\n");
-            return 1;
-        }
-    }
 
     // A pass that touches only slot 0 must not disturb the other slots' caches (engine#2689 item 3b found this: the
     // bank used to be resized to the highest slot of the CURRENT call, so a single-user call between multi-user rounds
@@ -316,6 +261,64 @@ int main() {
         }
     }
 
+    // This arm runs LAST on purpose: it starts a new sequence at position 0 on a slot that already holds one, so
+    // everything after it would be reading a cache the earlier rounds did not build (found by running it before the
+    // single-slot arm: that arm then asked for slot 0's old length and was correctly refused).
+    // A re-used slot starts a NEW sequence at position 0: it must answer from an empty cache, not from the previous
+    // conversation's K/V. Slot 0 above has already served prompts[0] plus kRounds decode rounds, so this is a real
+    // reuse rather than a fresh object.
+    {
+        const std::vector<int> second = {21, 22, 23, 24};
+        // What a FRESH single-sequence run answers for that prompt (the last row).
+        Q4nxNpuForward fresh;
+        std::vector<float> fresh_last;
+        if (!init(fresh, d) || !fresh.step_batch(second, 0, fresh_last) || fresh_last.empty()) {
+            std::printf("FAIL fresh reference for the re-used slot: %s\n", fresh.last_error());
+            return 1;
+        }
+        std::vector<int> pos, slot;
+        for (size_t i = 0; i < second.size(); i++) {
+            pos.push_back(int(i));
+            slot.push_back(0);
+        }
+        std::vector<float> all;
+        if (!fwd.step_users(second, pos, slot, all)) {
+            std::printf("FAIL step_users on the re-used slot: %s\n", fwd.last_error());
+            return 1;
+        }
+        const std::vector<float> got(all.end() - (long)width, all.end());
+        const int at = first_difference(got, fresh_last);
+        if (at >= 0) {
+            std::printf("FAIL a re-used slot did not start clean: logit %d is %.9g, a fresh run says %.9g\n", at,
+                        got[(size_t)at], fresh_last[(size_t)at]);
+            return 1;
+        }
+        // The control: if the stale cache happened to answer the same, this arm could not tell a cleared slot from a
+        // re-used one, so the comparison above would pass on a build that never clears. A separate instance carries
+        // prompts[0] and its decoded rounds, then answers the new prompt's token at the same position -- the wrong
+        // answer this arm exists to exclude.
+        Q4nxNpuForward stale;
+        std::vector<float> tmp;
+        if (!init(stale, d) || !stale.step_batch(prompts[0], 0, tmp)) {
+            std::printf("FAIL stale-instance setup: %s\n", stale.last_error());
+            return 1;
+        }
+        for (int r = 0; r < kRounds; r++)
+            if (!stale.step(argmax(tmp), int(prompts[0].size()) + r, tmp)) {
+                std::printf("FAIL stale-instance continuation %d: %s\n", r, stale.last_error());
+                return 1;
+            }
+        std::vector<float> stale_last;
+        if (!stale.step(second.back(), int(second.size()) - 1, stale_last)) {
+            std::printf("FAIL stale-instance step: %s\n", stale.last_error());
+            return 1;
+        }
+        if (first_difference(fresh_last, stale_last) < 0) {
+            std::printf("FAIL the stale conversation answers identically: this container cannot tell a cleared slot "
+                        "from a re-used one, pick another ONEBIT_TEST_Q4NX\n");
+            return 1;
+        }
+    }
     std::printf("ok: %d sequences x %d rounds, every row bit-identical to its own single-sequence run\n", users, kRounds);
     return 0;
 }

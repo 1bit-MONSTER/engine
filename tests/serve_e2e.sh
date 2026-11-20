@@ -27,9 +27,18 @@ set -uo pipefail
 bin=${1:?usage: serve_e2e.sh path/to/1bit <model> <device> [args]}
 # shellcheck source=tests/serve_port.sh
 . "$(dirname "$0")/serve_port.sh"   # serve_port_wait: read back the port serve bound (engine #1485)
-model=${2:?}
+model=${2-}
 device=${3:?}
 shift 3
+# engine#3023: the NPU route takes a Q4NX PACK DIRECTORY, not a GGUF, so the row is registered with a cache variable of its
+# own (ONEBIT_SERVE_TEST_NPU_PACK). With none given it skips (77) rather than failing, which is what lets the row exist in
+# every configure -- the hrx/cpu rows are registered only inside if(ONEBIT_SERVE_TEST_GGUF), and that is how the NPU serve
+# path came to have no CI row at all (engine#3009 reached main that way).
+if [ "$device" = npu ] && { [ -z "$model" ] || [ ! -d "$model" ]; }; then
+    echo "skip: no NPU pack directory given (ONEBIT_SERVE_TEST_NPU_PACK); the NPU route serves a Q4NX pack, not a GGUF"
+    exit 77
+fi
+[ -n "$model" ] || { echo "usage: serve_e2e.sh path/to/1bit <model> <device> [args]" >&2; exit 2; }
 if [ "$device" = hrx ]; then
     have=$("$(cd "$(dirname "$0")/.." && pwd)/scripts/gpu-targets.sh" 2>/dev/null | tr '\n' ' ')
     want=${ONEBIT_HRX_E2E_TARGETS:-gfx1151}

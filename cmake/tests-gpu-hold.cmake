@@ -63,6 +63,12 @@ add_test(NAME gpu_hold_escape COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_es
 # and decides nothing -- the refusal at take is still the authority, because a queue wait can outlast the condition.
 add_test(NAME gpu_hold_queue_state COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_state_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 
+# engine#2917: `env_has_ticket()` answers 0 / 1 / 2 and the three must stay distinguishable -- the sweep counts an
+# unreadable process (an escapee could hide there) while a plain non-match must not be counted, and neither may abort.
+# The test sources the function out of the installed script, so it tests the real code; the binding arm fails if the
+# redirect is ever un-grouped again, which is what prints "Permission denied" at the reader.
+add_test(NAME gpu_hold_env_has_ticket COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_env_has_ticket_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
 # engine#2727: a payload that re-invokes gpu-hold on the queue it is ALREADY inside queues behind its own ticket and
 # waits for it -- 764 s of a 14-minute window with the GPU idle on 2026-11-16, while coder-llm (every PR's pr-agent
 # check) waited 25 min behind it. The queue is now exported to the payload (GPU_HOLD_HELD_QUEUE/LABEL) and a same-queue

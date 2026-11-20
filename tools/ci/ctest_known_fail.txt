@@ -19,24 +19,16 @@
 # is REPORTED so this list shrinks instead of rotting. Regenerate after a deliberate change with:
 #   tools/ci/ctest_known_fail.py --log build/ctest.log --write
 #
-# Measured 2026-11-17 at fork 52dda9bc, `ctest -j 2 --timeout 600 -E '^(hrx-ops-test|test-hrx-ops|test-hrx-ops-loom)$'`
-# in build/hrx/llama: 87% passed, these 15 failed. 13 of the 15 also fail serially (ctest --rerun-failed
-# -j 1), so they are not -j 2 contention.
-test-tokenizers-ggml-vocabs            # Failed -- behavior
+# Measured 2026-11-20 in hrx-build at fork 47c95e15c, `ctest -j 4 --timeout 600 -E
+# '^(hrx-ops-test|test-hrx-ops|test-hrx-ops-loom|test-testing-suite-skip)$'` in $HRX_BUILD/hrx/llama:
+# `114 row(s): 103 passed, 7 known failure(s), 0 new, 4 skipped, 0 without a device`. Regenerated from that
+# log with the tool's own --write, so this list is what failed on the pin the tree carries, not what failed
+# four pins ago: the ten rows that now pass are gone (a stale entry would hide a later re-introduction of the
+# same failure behind the word "known"), and the paragraph above is the run that produced the seven.
+hrx-backend-test                       # Failed -- hrx; measured in hrx-build 2026-11-17 (the baseline named test-hrx-*-loom but not this one)
+test-hrx-decode-stride                 # Subprocess aborted -- measured in hrx-build 2026-11-17 (37 rows, 20 pass); the other 10 supports_op reds there PASS, they only red out under GGML_HRX_GTT_RESERVE_MB=1024
+test-hrx-mul-mat-id-k32                # Subprocess aborted
 test-kv-zero                           # Subprocess aborted -- main
 test-llama-archs                       # Failed -- main
-test-speculative-rejection-sampling    # SEGFAULT -- main
 test-llama-context                     # SEGFAULT -- main behavior backend
-test-llama-context-model               # SEGFAULT -- model behavior backend
-test-thread-safety                     # SEGFAULT -- main backend
-test-arg-parser                        # Failed -- behavior
-test-model-resolution                  # SEGFAULT -- behavior
-test-hrx-loom-jit                      # Subprocess aborted -- hrx; seen in the 2026-11-17 gfx1201 sweep and on the runner, never listed here
-hrx-loom-jit-test                      # Failed -- hrx; the same row under its other name
-hrx-backend-test-loom                  # Failed -- hrx
-test-hrx-fa-transposed-value           # Subprocess aborted
-test-hrx-mul-mat-id-k32                # Subprocess aborted
-test-hrx-fa-masked-v                   # Failed
-test-eval-callback                     # SEGFAULT
-test-hrx-decode-stride                 # Subprocess aborted -- measured in hrx-build 2026-11-17 (37 rows, 20 pass); the other 10 supports_op reds there PASS, they only red out under GGML_HRX_GTT_RESERVE_MB=1024
-hrx-backend-test                       # Failed -- hrx; measured in hrx-build 2026-11-17 (the baseline named test-hrx-*-loom but not this one)
+test-tokenizers-ggml-vocabs            # Failed -- behavior

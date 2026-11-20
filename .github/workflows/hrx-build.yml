@@ -169,7 +169,45 @@ jobs:
           # FAIL, not a skip. Pass the runtime this configure resolved (cmake/hrx.cmake:137, engine#1766).
           export IREE_HAL_AMDGPU_LIBHSA_PATH="$(sed -n 's/^ONEBIT_HRX_LIBHSA:FILEPATH=//p' "$HRX_BUILD/CMakeCache.txt")"
           echo "fork tests: HSA runtime $IREE_HAL_AMDGPU_LIBHSA_PATH"
-          ctest --test-dir "$HRX_BUILD" -R '^fork_ctest_known_fail$' --output-on-failure
+          # engine#3000: THE ROW IS OPT-IN AND THIS JOB NEVER OPTED IN. `fork_ctest_known_fail` is registered
+          # with SKIP_RETURN_CODE 77 and skips unless ONEBIT_FORK_CTEST=1 (it is opt-in because on a lane box
+          # without a fork tree it must not run), so the step above built 33 test binaries and then ran none of
+          # them: measured in run 44737964422, `1/1 Test #21 ... ***Skipped`, `100% tests passed` -- a green tick
+          # over a suite nothing executed, one layer up from engine#2761's complaint. This job IS the place the
+          # opt-in was written for, so it opts in.
+          #
+          # Cost, measured on the bench tree rather than argued: the ratchet excludes hrx-ops-test/test-hrx-ops/
+          # test-hrx-ops-loom (-E in fork_ctest_known_fail.sh), leaving 113 of 116 rows whose recorded cost sums
+          # to 184 s -> ~46 s wall at the script's -j 4, about 2 % of a 40-minute job.
+          # NOT ONEBIT_FORK_CTEST_NO_DEVICE=skip: that makes the row exit 77, ctest calls it Skipped, and the guard
+          # below -- correctly -- treats a skip in this job as an error. The device-requiring row it was aimed at
+          # (test-testing-suite-skip) is excluded by name in fork_ctest_known_fail.sh instead, which keeps the
+          # ratchet's real verdict (113 rows, 0 new) rather than trading it for a 77.
+          row=$(ONEBIT_FORK_CTEST=1 ctest --test-dir "$HRX_BUILD" -R '^fork_ctest_known_fail$' --output-on-failure 2>&1) \
+            || { printf '%s\n' "$row"; exit 1; }
+          printf '%s\n' "$row"
+          # ... and a SKIP here is a failure too, because this is the one job whose purpose is to run that row:
+          # the tree exists (the build above made it), so there is no legitimate reason to skip -- and ctest
+          # counts a skip as "not failed" ("100% tests passed" with `1/1 ... ***Skipped` is exactly how the suite
+          # ran zero rows for two days, engine#3000).
+          case "$row" in
+            *"fork_ctest_known_fail"*"***Skipped"*)
+              echo "::error::fork_ctest_known_fail SKIPPED in the one job that has an HRX tree -- the ratchet did not run (engine#3000)"
+              exit 1 ;;
+          esac
+          # ... and PRINT WHAT IT READ. ctest shows a test's output only on failure, so a passing run said just
+          # "Passed" -- the evidence would disappear exactly when the row goes green, which is the complaint this
+          # change exists for. The ratchet's own summary is in the log ctest kept for that test.
+          # `grep ... | tail -3 || echo` does NOT fall back: `||` tests the pipeline's status, which is `tail`'s, and
+          # tail succeeds on empty input -- so the note was unreachable in the one case it was written for
+          # (measured: `grep … | tail -3 || echo NOTE` prints nothing on an empty file, while the same grep with
+          # its output redirected returns 1). Test grep's own status instead.
+          log="$HRX_BUILD/Testing/Temporary/LastTest.log"
+          if grep -q "ctest_known_fail:" "$log" 2>/dev/null; then
+            grep -h "ctest_known_fail:" "$log" | tail -3
+          else
+            echo "note: no ctest_known_fail summary in $log -- the row passed without saying what it read"
+          fi
       # engine#2858: a tree that cannot say where it came from is not a measurement. On 11-18 this tree
       # reported IQ1_S prefill at 11.22 tok/s where four local builds of the same source on the same box gave
       # 56.5-56.6, with identical placement, PPL and kernel names -- and nothing recorded which lowering had

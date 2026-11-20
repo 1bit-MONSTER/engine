@@ -68,7 +68,12 @@ PAGE = 100
 #   * `keyword ... #12` with up to 24 characters between -- #2793's body says "Refs #2779 (the layer its fix does not
 #     cover), #2728", and the noun "fix" plus a distant `#2728` read as a claim on 2728. Found by running the parser over
 #     the real texts of tonight's seven PRs rather than over my own fixtures, which is why that check is in the PR body.
-CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#(\d+)', re.I)
+# engine#3060: a MARKED-UP issue number is still a claim. `Closes **#3041**` -- bold, italic, backticked -- is how a large
+# share of this fleet writes it, and the first pattern required `#` immediately after the verb, so `claims()` returned []
+# for those and `describe()` printed "neither says Fixes/Closes" as the reason for a finding whose PRs all said exactly
+# that. The run of markup characters is what was missing, not the verb.
+MARKUP = r'[*_`]{0,3}'
+CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*' + MARKUP + r'#(\d+)', re.I)
 
 # engine#2842: `Refs #N` is a claim too, but a WEAKER one. Almost every PR reviewed on 2026-11-16/17 said `Refs` rather than
 # `Fixes` -- because a PR that fixes part of an issue must not close it -- so reading closing keywords only made the common
@@ -76,7 +81,7 @@ CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#(\d+)
 # other failure: `Refs` is also used for context, and a pair that merely mentions the same issue is not a duplicate. So a
 # ref pair counts only when the two PRs also TOUCH OVERLAPPING FILES -- the same "overlap, not issue-claim" rule the review
 # of #2809 asked for on the false-positive side, which makes one rule serve both directions.
-REF = re.compile(r'\brefs?\b\s*:?\s*#(\d+)', re.I)
+REF = re.compile(r'\brefs?\b\s*:?\s*' + MARKUP + r'#(\d+)', re.I)
 
 
 # A claim written INSIDE code is documentation, not a claim. The PRs most likely to contain `Fixes #12` are the ones
@@ -419,6 +424,16 @@ def self_test():
     ]
     same_files = {2839: {'CMakeLists.txt', 'tools/ci/check_stale_expectations.py'},
                   2840: {'CMakeLists.txt', 'tools/ci/check_stale_expectations.py'}}
+    # engine#3060: A MARKED-UP ISSUE NUMBER IS STILL A CLAIM. `Closes **#N**` is how a large share of this fleet writes
+    # it, and the pattern required `#` immediately after the verb -- so such a PR counted as claiming nothing, and
+    # `describe()` printed "neither says Fixes/Closes" as the reason for a finding whose PRs all said exactly that.
+    ok(claims('Closes **#3041** — the row has been red') == [3041],
+       "a bolded `Closes **#N**` is a claim (engine#3060: it read as no claim, and the report said so)")
+    ok(claims('Fixes *#12* too') == [12], "... and an italic number is a claim (a BACKTICK span is not: the arm below)")
+    # my first version of the line above wrote `Fixes *`#12`*` and failed -- correctly, because that number is inside a
+    # code span and this tool has refused claims inside code since engine#2835. The arm was wrong, not the tool.
+    ok(referenced('Refs **#7** for the context') == [7], "a bolded `Refs **#N**` is a reference")
+    ok(claims('`Closes #9`') == [], "... while a claim inside a code span is still not one")
     ok(referenced(ref_prs[0]['body']) == [2836], "a `Refs #N` body is read as a reference")
     ok(claims(ref_prs[0]['body']) == [], "... and NOT as a closing claim, which is the distinction the fix rests on")
     ok(duplicates(ref_prs) == [], "two `Refs` PRs are not reported when no file list is given (the old meaning is kept)")

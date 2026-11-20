@@ -81,6 +81,8 @@ int onebit_ort_run_main(int argc, char** argv);
 
 namespace {
 
+#include "onebit_build_stamp.h"  // generated: where this binary came from (engine#2858)
+
 constexpr const char* kVersion = "0.0.1";
 
 void usage(FILE* out) {
@@ -421,7 +423,7 @@ int main(int argc, char** argv) {
     }
 #endif
     if (cmd == "version" || cmd == "--version") {
-        std::printf("1bit %s\n", kVersion);
+        std::printf("1bit %s (%s)\n", kVersion, kBuildStamp);
         return 0;
     }
     if (cmd == "help" || cmd == "--help" || cmd == "-h") {

@@ -45,6 +45,12 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include <string>
 #include <vector>
 
@@ -52,6 +58,7 @@
 #include "audio_exec.h"
 #ifdef ONEBIT_WHISPER_NPU
 #include "whisper_npu_device.h"
+#include "whisper_npu_wcache.h"
 #endif
 #include "audio_pack.h"
 #include "whisper_ids.h"
@@ -185,6 +192,19 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "malloc: glibc refused the thresholds; running with its defaults\n");
     }
 #endif
+#if defined(ONEBIT_WHISPER_NPU) && defined(__linux__)
+    // engine#1783: on the device route the host's remaining work is attention, the elementwise tail and the decoder, and
+    // it scales past the library's 8-thread cap (audio_parallel.h, measured on the host route under a 4-CPU cpuset).
+    // Measured here, sealed kernels, jfk one-shot, interleaved at load 4.5-6 (rounds 2-3): 8 -> 16 threads moved the
+    // encoder 0.585-0.587 -> 0.495-0.632 s and the decode 6.45-6.47 -> 5.84-6.81 s, and the warm encoder pass
+    // 0.50-0.52 -> 0.42-0.44 s (5 rounds, load 8.6-9.8; attention 258-270 -> 168-201 ms). Same output bytes at any
+    // count. Only when the process may use at least 24 CPUs; ONEBIT_AUDIO_THREADS still wins.
+    if (std::getenv("ONEBIT_AUDIO_THREADS") == nullptr) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) >= 24) setenv("ONEBIT_AUDIO_THREADS", "16", 0);
+    }
+#endif
     // ctest form: no arguments means "run the reference sentence from the environment", so the chain can be checked by CI or by
     // a lane without remembering the 25 ids. Missing inputs skip with 77, the same convention as every other gated test here.
     if (argc == 1) {
@@ -284,6 +304,10 @@ int main(int argc, char** argv) {
     AudioGemm* dev_hook = nullptr;
 #ifdef ONEBIT_WHISPER_NPU
     whisper_npu::Device npu_dev;
+    // engine#1783: the packed-weight cache (tools/whisper_npu_wcache.h): restored after the device opens, written after the
+    // first window when that window had to pack weights the file did not hold.
+    std::string wc_dir, wc_id, wc_path;
+    int wc_loaded = 0;
     if (const char* kdir = std::getenv("ONEBIT_WHISPER_NPU_KERNELS")) {
         const char* rows_env = std::getenv("ONEBIT_WHISPER_NPU_ROWS");
         const int rows = rows_env != nullptr ? std::atoi(rows_env) : 1536;
@@ -293,11 +317,20 @@ int main(int argc, char** argv) {
         }
         for (const auto& m : npu_dev.missing) std::fprintf(stderr, "npu: no ELF for staged %s -- its products run on the host\n", m.c_str());
         dev_hook = &npu_dev.hook;
+#if defined(_OPENMP)
+        // engine#1783: the weight packer (q4nx_pack_B_int8_blocked) is an OpenMP loop, and libgomp's default is one thread
+        // per logical CPU (32 here), next to the executor's own pool. Measured on whisper-small, one-shot cold pass, sealed
+        // kernel set, 3 runs per arm at load 2.6-10.7: the 50 packs took 271-313 ms at the default, 50-51 ms at 8 threads
+        // and 38-45 ms at 16, and the cold encoder pass 1.03-1.09 s -> 0.73 s. The packer's output does not depend on the
+        // thread count (per-thread column maxima merged exactly, the scale sum is serial). OMP_NUM_THREADS still wins.
+        if (std::getenv("OMP_NUM_THREADS") == nullptr)
+            omp_set_num_threads(int(onebit::npu::pack_import::audio_thread_count()));
+#endif
         // engine#1783: ONEBIT_WHISPER_NPU_PREFILL=1 packs and uploads every weight here, before the first window. OFF by
-        // default in this tool: a one-shot transcription pays the same fills either way, so moving 0.77 s into load makes
-        // the total no shorter, and with it on the warm pass measured 0.03-0.05 s slower (unexplained). It is for a path
-        // that keeps the model open across requests (a serve), where the fills are paid once and every request is a
-        // first window.
+        // default in this tool: a one-shot transcription pays the same fills either way, so moving them into load makes
+        // the total no shorter. (The 0.03-0.05 s warm-pass slowdown it used to show was glibc's dynamic mmap threshold; see
+        // ONEBIT_WHISPER_MALLOPT above.) It is for a path that keeps the model open across requests (a serve), where the
+        // fills are paid once and every request is a first window.
         const char* pf = std::getenv("ONEBIT_WHISPER_NPU_PREFILL");
         if (pf != nullptr && pf[0] == '1') {
             const auto p0 = std::chrono::steady_clock::now();
@@ -308,6 +341,18 @@ int main(int argc, char** argv) {
             }
             std::printf("npu prefill: %d weight(s) packed and resident in %.3f s (load time)\n", nw,
                         secs(p0, std::chrono::steady_clock::now()));
+        }
+        wc_dir = whisper_npu::wcache_dir();
+        if (!wc_dir.empty()) {
+            const auto c0 = std::chrono::steady_clock::now();
+            wc_id = whisper_npu::wcache_identity(enc_path, kdir, rows);
+            wc_path = whisper_npu::wcache_path(wc_dir, wc_id);
+            std::string wwhy;
+            wc_loaded = whisper_npu::wcache_load(wc_path, wc_id, *npu_dev.gemm, &wwhy);
+            if (wc_loaded > 0)
+                std::printf("npu wcache: %d packed weight(s) restored from %s in %.3f s\n", wc_loaded, wc_path.c_str(),
+                            secs(c0, std::chrono::steady_clock::now()));
+            if (!wwhy.empty()) std::fprintf(stderr, "npu wcache: %s\n", wwhy.c_str());
         }
     }
 #endif
@@ -428,6 +473,16 @@ int main(int argc, char** argv) {
                         dev_hook->host);
             if (w == 0)
                 for (const auto& kv : dev_hook->host_why) std::printf("  host: %d x %s\n", kv.second, kv.first.c_str());
+            if (w == 0 && !wc_dir.empty() && npu_dev.gemm->weights() > wc_loaded) {
+                const auto c0 = std::chrono::steady_clock::now();
+                int nw = 0;
+                std::string wwhy;
+                if (whisper_npu::wcache_save(wc_dir, wc_path, wc_id, *npu_dev.gemm, &nw, &wwhy))
+                    std::printf("npu wcache: %d packed weight(s) written to %s in %.3f s\n", nw, wc_path.c_str(),
+                                secs(c0, std::chrono::steady_clock::now()));
+                else
+                    std::fprintf(stderr, "npu wcache: %s\n", wwhy.c_str());
+            }
         }
 #endif
         // engine#2399: stop after the encoder. The issue is scored on the encoder pass, and every whole-tool
@@ -463,12 +518,23 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         }
         bool full = false;
+        // engine#1783: the decoder's step-invariant nodes (every layer's cross-attention K and V of this window's encoder
+        // output) run at the first step only (DecoderStepCache, audio_exec.h); bit-identical. ONEBIT_WHISPER_DECODE_CACHE=0
+        // runs every node at every step.
+        DecoderStepCache dcache;
+        const char* dce = std::getenv("ONEBIT_WHISPER_DECODE_CACHE");
+        DecoderStepCache* dc = (dce != nullptr && dce[0] == '0') ? nullptr : &dcache;
+        // ...and the vocabulary projection runs only the four-row unit holding the row read below.
+        // ONEBIT_WHISPER_DECODE_ONE_ROW=0 computes every row.
+        const char* dor = std::getenv("ONEBIT_WHISPER_DECODE_ONE_ROW");
+        const bool one_row = !(dor != nullptr && dor[0] == '0');
         while (true) {
             if (seq.size() >= size_t(window)) { full = true; break; }
             std::vector<int64_t> toks(size_t(window), kEot);
             for (size_t i = 0; i < seq.size(); ++i) toks[i] = seq[i];
             AudioRunResult y;
-            if (!run_decoder_graph(dec, toks.data(), window, xa.data.data(), xa.dims, "", &y, &why)) {
+            if (dc != nullptr && one_row) dc->output_row = int64_t(seq.size()) - 1;   // the only logits row read below
+            if (!run_decoder_graph(dec, toks.data(), window, xa.data.data(), xa.dims, "", &y, &why, dc)) {
                 std::fprintf(stderr, "decoder at window %zu step %zu: %s\n", w, got, why.c_str());
                 return 1;
             }

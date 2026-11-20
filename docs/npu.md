@@ -4374,6 +4374,25 @@ encoder output byte-identical (the encode-only line prints its FNV-1a hash):
 - `ONEBIT_WHISPER_MALLOPT=0` keeps glibc's dynamic malloc thresholds. When on, the tool fixes the mmap threshold at
   32 MiB and never trims, so a pass's multi-MB buffers are reused instead of being mapped and faulted in again.
 
+**One-shot cost (engine#1783).** A one-shot transcription pays three things a warm encoder pass does not, and each has
+its own switch:
+
+- `ONEBIT_WHISPER_NPU_WCACHE=<dir>` (default `$XDG_CACHE_HOME/onebit/npu-wcache`, else `~/.cache/onebit/npu-wcache`;
+  `0` = off) keeps the packed device weights on disk. The first run writes them after its first window (about 107 MB
+  for whisper-small). Later runs read them straight into the device buffers, and the executor never loads their f32
+  copies. A file serves only the identity it was written for: format version, rows, and name, size and mtime of every
+  file in the encoder graph's directory and in the kernel directory (`tools/whisper_npu_wcache.h`). The images are the
+  bytes the pack wrote, so the encoder output is unchanged.
+- `ONEBIT_WHISPER_DECODE_CACHE=0` runs every decoder node at every step. When on, the decoder's step-invariant nodes,
+  above all each layer's cross-attention K and V projections of the encoder output, run at the first step of a
+  window only (`DecoderStepCache`, `npu/audio_exec.h`; 170 of 786 nodes on whisper-small).
+  `ONEBIT_WHISPER_DECODE_ONE_ROW=0` also computes every row of the vocabulary projection. When on, only the
+  four-row unit holding the row the greedy step reads is computed. Both are bit-identical, and
+  `tests/audio_exec_test.cpp` memcmps the logits.
+- The weight packer's OpenMP pool follows the audio thread count (libgomp's default was one thread per CPU, 32 here).
+  The device-route tool defaults to 16 audio threads when it may use at least 24 CPUs. `OMP_NUM_THREADS` and
+  `ONEBIT_AUDIO_THREADS` still win.
+
 `ONEBIT_WHISPER_NPU_PREFILL=1` packs every weight when the device is opened instead of in the first window. It is
 **off** in the one-shot tool: a single transcription pays the same fills either way, so moving them into load (0.77 s
 on whisper-small) makes nothing shorter. With glibc's dynamic thresholds the warm pass measured 0.03-0.05 s slower

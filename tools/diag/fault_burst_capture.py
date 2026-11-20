@@ -72,6 +72,21 @@ def parse_fault(line, device_prefix="amdxdna"):
 TS = re.compile(r"^\w{3}\s+\d+ (\d\d):(\d\d):(\d\d)")
 
 
+SUPPRESSED_RE = re.compile(r"(\d+) callbacks? suppressed")
+
+
+def suppressed_count(line):
+    """How many callbacks printk folded into one `N callbacks suppressed` line.
+
+    The fault printer is rate limited: after a burst it prints one summary line instead of
+    every event, so a log's IO_PAGE_FAULT count is a LOWER BOUND on what the device did.
+    This boot (2026-11-20) printed 323 faults against 1 761 suppressed -- 5.5x -- and three
+    wrong readings on engine#2478 came from treating the printed count as the event count.
+    """
+    m = SUPPRESSED_RE.search(line)
+    return int(m.group(1)) if m else 0
+
+
 def seconds_of_day(line):
     """`Nov 16 12:35:26` -> 45236. None when the line carries no syslog stamp."""
     m = TS.match(line)
@@ -266,6 +281,16 @@ def describe(pid, proc_root):
     except OSError:
         cmdline = ""
     return (comm, cmdline)
+
+
+def suppressed_note(n):
+    """One line, or nothing. Deliberately NOT per burst: printk's counter is box-wide and
+    the log does not say which burst its folded callbacks belonged to, so attaching them to
+    the nearest burst would invent a per-burst number -- a worse reading than no number."""
+    if not n:
+        return ""
+    return ("  %d callback(s) were suppressed by printk in this log: every count above is a "
+            "LOWER BOUND, not the number of events the device produced" % n)
 
 
 def render(summary, snaps):
@@ -484,6 +509,23 @@ def self_test():
             early = False
         chk(early, "a live capture ends at its window instead of waiting for another fault line")
 
+    # printk folds repeated callback prints into one "N callbacks suppressed" line, so a log's
+    # IO_PAGE_FAULT count is a lower bound. 2026-11-20: 323 printed against 1 761 suppressed (5.5x),
+    # and three readings on engine#2478 treated the printed count as the event count.
+    chk(suppressed_count("… amd_iommu_report_page_fault: 8 callbacks suppressed") == 8,
+        "a suppressed-callback count is read")
+    chk(suppressed_count("… amd_iommu_report_page_fault: 1 callback suppressed") == 1,
+        "the singular 'callback' spelling is read (printk uses it for one)")
+    chk(suppressed_count("nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT …]") == 0,
+        "a fault line is not mistaken for a suppression line")
+    chk(suppressed_note(0) == "", "no suppressed callbacks prints no line")
+    chk("LOWER BOUND" in suppressed_note(19),
+        "a suppression count says the counts are a lower bound, not that they are the total")
+    # It must NOT be attached to a burst: printk's counter is box-wide and the log does not say
+    # which burst its folded callbacks belonged to. A per-burst number would be invented.
+    chk("this log" in suppressed_note(19) and "burst 1" not in suppressed_note(19),
+        "the note is about the whole log, not attributed to one burst (printk's counter is box-wide)")
+
     print("%s" % ("ok" if bad == 0 else "%d FAIL" % bad))
     return 1 if bad else 0
 
@@ -508,6 +550,7 @@ def main(argv):
         return self_test()
 
     events, snaps, total, stamped, obs = [], [], 0, [], []
+    suppressed = [0]          # callbacks printk folded away: a box-wide total, not a per-burst one
     replay_note = [False]   # a replay cannot snapshot holders: /proc is today's
     src = None
     if a.replay:
@@ -533,6 +576,7 @@ def main(argv):
     source = src if src is not None else (sys.stdin if a.replay else live_lines(sys.stdin, until))
     for line in source:
         total += 1
+        suppressed[0] += suppressed_count(line)
         ev = parse_fault(line, a.device)
         if ev is None:
             continue
@@ -566,9 +610,11 @@ def main(argv):
     if not events:
         print("no %s fault in %d line(s) examined: nothing to capture "
               "(an empty capture is not evidence of no fault)" % (a.device, total))
+        print(suppressed_note(suppressed[0]))
         return 2
     if a.timeline:
         print(render_timelines(timelines(obs)))
+        print(suppressed_note(suppressed[0]))
         return 0
     bursts = split_by_gap(stamped, a.split) if a.split > 0 else []
     if bursts:
@@ -591,9 +637,15 @@ def main(argv):
         if replay_note[0]:
             print("  holders: not captured (--replay: /proc is today's, so a snapshot here would name the "
                   "wrong process for a burst this file recorded)")
+        n = suppressed_note(suppressed[0])
+        if n:
+            print(n)
         return 0
     for line in render(summarize(events), snaps).splitlines():
         print(line)
+    n = suppressed_note(suppressed[0])
+    if n:
+        print(n)
     if replay_note[0]:
         print("  holder: not captured (--replay: /proc is today's, so a snapshot here would name the "
               "wrong process for a burst this file recorded)")

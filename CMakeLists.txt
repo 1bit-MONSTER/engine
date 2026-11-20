@@ -534,6 +534,9 @@ add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_te
 # that has none, so the sixth field cannot slip through the same way.
 add_python_test(serve_field_census ${CMAKE_SOURCE_DIR}/tools/ci/serve_field_census.py --root ${CMAKE_SOURCE_DIR})
 add_python_test(serve_field_census_self ${CMAKE_SOURCE_DIR}/tools/ci/serve_field_census.py --self-test)
+# engine#2478: the lifecycle classifier and its cannot-tell exits are the whole
+# point of this tool, so its --self-test runs as a test rather than as a comment.
+add_python_test(iommu_dma_lifecycle_self ${CMAKE_SOURCE_DIR}/tools/diag/iommu_dma_lifecycle.py --self-test)
 # engine#2916: the pair check's self-test, wired because a tool with a --self-test that no
 # runner names is a self-test nobody runs (tool_selftest_wired_check says so, and it said so
 # about this file in the PR's first build).

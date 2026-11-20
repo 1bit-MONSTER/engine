@@ -1573,7 +1573,11 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
                     M, K, N, ar.layer, kctx.short_row_);
     }
     const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    out.resize((size_t)M * N);
+    // engine#1783: the caller's buffer, when it gave one and no diagnostic below needs `out`.
+    const bool to_dst = ar.dst != nullptr && ar.dst_n > 0 && ar.dst_n <= N && ar.dst_ld >= ar.dst_n && !m16_check_ &&
+                        !std::getenv("NPU_W4_CHECK");
+    if (to_dst) out.clear();
+    else out.resize((size_t)M * N);
     // engine#1808: the device's per-column weight scales, KEYED by (layer, N, K) so it can be paired with the host
     // arm's dump exactly. Index pairing was tried first and is meaningless -- the two sides reach the GEMM a
     // different number of times (384 device dumps against 1024 arm dumps on the same request).
@@ -1586,12 +1590,16 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
             std::fclose(f);
         }
     }
-    for (int m = 0; m < M; m++) {
-        const int32_t* cm = kctx.Cm + (size_t)m * kctx.ND;
-        const float asc = ascales[(size_t)m];
-        float* o = out.data() + (size_t)m * N;
-        for (int n = 0; n < N; n++)
-            o[n] = (float)cm[n] * asc * (*gs)[(size_t)n];
+    {
+        float* const obase = to_dst ? ar.dst : out.data();
+        const int oN = to_dst ? ar.dst_n : N, oLD = to_dst ? ar.dst_ld : N;
+        for (int m = 0; m < M; m++) {
+            const int32_t* cm = kctx.Cm + (size_t)m * kctx.ND;
+            const float asc = ascales[(size_t)m];
+            float* o = obase + (size_t)m * oLD;
+            for (int n = 0; n < oN; n++)
+                o[n] = (float)cm[n] * asc * (*gs)[(size_t)n];
+        }
     }
     if (m16_check_ && &kctx != &ctx && kctx.w4g32 == ctx.w4g32)
         m16_check_gemm_rows(ctx, kctx, A, M, K, N, slot ? slot_bo(*slot, kctx) : nullptr,

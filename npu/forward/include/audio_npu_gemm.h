@@ -42,6 +42,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -89,7 +90,14 @@ public:
 
         Weight& w = weight(key, B, K, N, st);
         const auto t0 = std::chrono::steady_clock::now();
-        C->assign(size_t(M) * size_t(N), 0.0f);
+        // engine#1783: with direct output (default) the target dequantises each chunk's rows straight into C, so C is sized
+        // once and nothing is copied; ONEBIT_AUDIO_DIRECT_OUT=0 keeps the staged-width buffer and the per-row copy.
+        static const bool direct = [] {
+            const char* e = std::getenv("ONEBIT_AUDIO_DIRECT_OUT");
+            return e == nullptr || e[0] != '0';
+        }();
+        if (direct) C->resize(size_t(M) * size_t(N));
+        else C->assign(size_t(M) * size_t(N), 0.0f);
         std::vector<float> got;
         for (int64_t r0 = 0; r0 < M; r0 += d.M) {
             const int rows = int(std::min<int64_t>(d.M, M - r0));
@@ -105,19 +113,25 @@ public:
             a.wkey = caches_ ? w.wkey : -1;
             a.rows = true;   // the batched body, whatever the chunk's row count (target.h: M==1 with rows=true is batched)
             a.tag = "audio";
+            if (direct) {
+                a.dst = C->data() + size_t(r0) * size_t(N);
+                a.dst_ld = int(N);
+                a.dst_n = int(N);
+            }
             got.clear();
             std::string err;
             if (!t_.gemv(a, got, err)) {
                 if (why) *why = "role " + std::to_string(role) + " (" + key + "): " + (err.empty() ? "gemv failed" : err);
                 return false;
             }
-            if (got.size() != size_t(rows) * size_t(st.n)) {
+            const bool wrote_c = direct && got.empty();   // the target honoured dst
+            if (!wrote_c && got.size() != size_t(rows) * size_t(st.n)) {
                 if (why)
                     *why = "role " + std::to_string(role) + " wrote " + std::to_string(got.size()) + " floats for " +
                            std::to_string(rows) + " x " + std::to_string(st.n);
                 return false;
             }
-            for (int r = 0; r < rows; ++r)
+            for (int r = 0; !wrote_c && r < rows; ++r)
                 std::copy(got.begin() + size_t(r) * size_t(st.n), got.begin() + size_t(r) * size_t(st.n) + size_t(N),
                           C->begin() + size_t(r0 + r) * size_t(N));
             ++launches_;

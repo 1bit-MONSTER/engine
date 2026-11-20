@@ -55,10 +55,17 @@ arm() {
     fi
 }
 
-arm "no pack configured -> skip" 77 "ONEBIT_SERVE_TEST_NPU_PACK" ""
+# The box decides what a skip may SAY (engine#3049). A `/dev/accel` guard, when it lands, answers 77 before the pack
+# check can -- so on a machine without an NPU the pack sentence is unreachable, and asserting it made three arms go red
+# on the one change this file exists to survive. The probe is the same file such a guard reads, so the arm follows the
+# box rather than a wording.
+dev=0; [ -e /dev/accel/accel0 ] && dev=1
+packmsg="ONEBIT_SERVE_TEST_NPU_PACK"
+[ "$dev" = 1 ] || packmsg=""
+arm "no pack configured -> skip" 77 "$packmsg" ""
 # `main` answers the same message for an empty pack and for a path that is not a directory (one condition, one
 # sentence), so this arm pins the status and not the wording.
-arm "pack is not a directory -> skip" 77 "ONEBIT_SERVE_TEST_NPU_PACK" "$tmp/nope"
+arm "pack is not a directory -> skip" 77 "$packmsg" "$tmp/nope"
 
 # The anti-vacuity arm. `/bin/true` ignores its arguments, so nothing binds a port and the script ends either by
 # noticing the process is gone (rc 1) or on the `timeout` above (rc 124); both mean the pack guard let it through to
@@ -71,10 +78,12 @@ arm "pack is not a directory -> skip" 77 "ONEBIT_SERVE_TEST_NPU_PACK" "$tmp/nope
 # vacuity guarantee this arm gives is about the pack guard only, and a device-less runner cannot give the full one.
 out=$(timeout 5 bash "$e2e" /bin/true "$tmp/withnpu" npu 2>&1)
 rc=$?
-if [ "$rc" = 77 ] && [[ $out != *device* ]]; then
-    fail "a configured pack was skipped for a reason that is not the device -- the row cannot run anywhere: $out"
+if [ "$rc" = 77 ] && [ "$dev" = 1 ]; then
+    fail "a configured pack was skipped on a box that HAS /dev/accel/accel0 -- with the device present the only excuse is the pack: $out"
+elif [ "$rc" = 77 ] && [[ $out == *ONEBIT_SERVE_TEST_NPU_PACK* ]]; then
+    fail "a configured pack was skipped for the PACK reason -- the pack guard is broken: $out"
 elif [ "$rc" = 77 ]; then
-    pass "a configured pack skipped for the device (no NPU here): $out"
+    pass "a configured pack skipped for the device (no /dev/accel here): $out"
 else
     pass "a configured pack is not skipped: rc=$rc (reached the launch)"
 fi

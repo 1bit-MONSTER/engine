@@ -58,18 +58,14 @@ int argmax(const std::vector<float>& v) {
     return best;
 }
 
-// Host-GEMM by default (no device, runs anywhere). ONEBIT_TEST_Q4NX_DEVICE=1 runs the SAME comparisons on the array
-// instead, which is the device row #2689 asks for -- and it must be run inside an npu-hold ticket:
-//
-//   npu-hold -l step-users-device -t 12 -- env ONEBIT_TEST_Q4NX=… ONEBIT_TEST_Q4NX_DEVICE=1 ./step_users_test
-//
-bool device_run() {
-    const char* d = std::getenv("ONEBIT_TEST_Q4NX_DEVICE");
-    return d != nullptr && d[0] == '1';
-}
-
+// Host GEMM, always: init_host() is the host arm whatever the environment says, so this file never touches a device
+// and needs no ticket. It used to read ONEBIT_TEST_Q4NX_DEVICE=1 and print "(device)" on its timing lines, but that
+// switch only stopped it setting NPU_INFER_HOST_GEMM -- init_host() selects the host arm by itself -- so a run "on the
+// array" was a host run with a different label (measured: every design loaded as host-GEMM, no driver activity, the
+// same seconds per pass). The array-side check of several users in one pass is a serve started on the device with
+// --npu-batch-users; a test that cannot run there must not say it did.
 bool init(Q4nxNpuForward& fwd, const std::string& dir) {
-    if (!device_run()) setenv("NPU_INFER_HOST_GEMM", "1", 1);   // the default: device-free
+    setenv("NPU_INFER_HOST_GEMM", "1", 1);
     return fwd.init_host((dir + "/model.q4nx").c_str(), dir + "/kernels");
 }
 
@@ -179,8 +175,7 @@ int main() {
             return 1;
         }
         const double round_s = seconds_since(t_round);
-        std::printf("  round %d: %d row(s) in one pass, %.1f ms%s\n", round, users, round_s * 1000.0,
-                    device_run() ? " (device)" : " (host GEMM)");
+        std::printf("  round %d: %d row(s) in one pass, %.1f ms (host GEMM)\n", round, users, round_s * 1000.0);
         if (all.size() != (size_t)users * width) {
             std::printf("FAIL step_users round %d returned %zu logits for %d rows of %zu\n", round, all.size(), users,
                         width);

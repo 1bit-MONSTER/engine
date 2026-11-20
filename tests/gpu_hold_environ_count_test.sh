@@ -36,11 +36,6 @@ set -u
 fails=0
 note() { printf '  %s\n' "$*"; }
 
-if [ -r /proc/1/environ ]; then
-    note "SKIP /proc/1/environ is readable here (running as root?), so there is no EACCES to measure"
-    exit 77
-fi
-
 # The unreadable target is a DIRECTORY, not /proc/PID/environ: `< dir` fails the same way `< "$d/environ"` does on
 # EACCES, it behaves identically for root and non-root, and the sweep's question -- does the failure get counted, and
 # does its message leak? -- is answerable either way. A /proc/environ arm alone would skip forever in CI, which is a

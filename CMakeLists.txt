@@ -651,6 +651,10 @@ endif()
 # engine#2429: the guard-loss check declares a self-test, so it needs a row -- tests_referenced_check caught
 # this omission on the PR that added the tool, which is the check doing exactly its job.
 add_python_test(guard_loss_check_self ${CMAKE_SOURCE_DIR}/tools/ci/guard_loss_check.py --self-test)
+# engine#2992: the pre-merge twin of merged_tail_check -- a stale open branch deletes main's newer lines when it
+# merges, and the PR page shows a clean additive diff while it would do so. Self-test wired because
+# tools/ci/tool_selftest_wired_check.py requires a tool that carries one to be named here.
+add_python_test(pr_branch_stale_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_branch_stale_check.py --self-test)
 # engine#2445 review: and the flag itself must be load-bearing -- a row that ran the tool but
 # dropped the child's status would stay green while both arms above went red. Measured with a
 # scratch tree whose test file exits 1 (status dropped -> 0 vs 0), and with the flag ignored.

@@ -597,10 +597,24 @@ if [ -z "$BIN" ]; then
     # does not run here. Same check, same place: after the build, before any phase takes a device. It reads the code
     # objects, the embedded table and the library, and lets the library run its own registration check, so a tree
     # whose embedded kernels are not the ones the add-on names fails as `build` instead of as the first model load.
-    if [ $built = 0 ] && ! python3 "$ROOT/tools/ci/hrx_embedded_objects_check.py" --tree "$build" --registration > "$OUT/embedded-objects.txt" 2>&1; then
-      note "::error::the build passed but its embedded HIP code objects do not match the kernels it names (see embedded-objects.txt)"
-      sed -n '1,6p' "$OUT/embedded-objects.txt" | sed 's/^/  /'
-      built=1
+    # The tool's answers are three, and only two of them fail the row: 1 is a mismatch and 2 is "cannot tell" (an
+    # artefact is missing or unreadable, the tool itself included), and neither is a tree to hand to a device. 77 is
+    # "this build directory holds no HRX tree at all" -- nothing was embedded, so there is nothing to mismatch; it is
+    # noted, not failed. The first version of this block failed on any non-zero status and turned that answer into a
+    # failed build row (hw_gate_mem, whose stub build makes bin/ and nothing else).
+    if [ $built = 0 ]; then
+      embedded_rc=0
+      python3 "$ROOT/tools/ci/hrx_embedded_objects_check.py" --tree "$build" --registration > "$OUT/embedded-objects.txt" 2>&1 || embedded_rc=$?
+      case $embedded_rc in
+        0) ;;
+        77) note "embedded code objects: not applicable, $build holds no HRX tree (embedded-objects.txt)" ;;
+        1) note "::error::the build passed but its embedded HIP code objects do not match the kernels it names (see embedded-objects.txt)"
+           sed -n '1,6p' "$OUT/embedded-objects.txt" | sed 's/^/  /'
+           built=1 ;;
+        *) note "::error::the build passed but its embedded HIP code objects could not be checked (rc $embedded_rc, see embedded-objects.txt)"
+           sed -n '1,6p' "$OUT/embedded-objects.txt" | sed 's/^/  /'
+           built=1 ;;
+      esac
     fi
     if [ $built = 0 ]; then
       BUILT=1

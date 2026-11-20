@@ -245,7 +245,8 @@ def judge_registration(rc: int, log: str, expect_addon: bool, names: bool, out=p
             out("hrx_embedded_objects_check: register: " + (line if names else NAME_RE.sub("hip kernel <name> (", line)))
         out(f"hrx_embedded_objects_check: FAIL register: {len(mismatches)} registration(s) do not match the embedded "
             "code objects; this library aborts when a server loads a model (engine#2935)"
-            + ("" if names else "; --names prints the kernel names"))
+            + ("" if names else "; re-run this tool by hand with --registration --names to see the kernel names "
+                                "(no device needed)"))
         return 1
     if rc == 3:
         out("hrx_embedded_objects_check: the library does not export the registry entry point: the register arm cannot run")

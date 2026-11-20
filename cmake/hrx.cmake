@@ -292,7 +292,10 @@ ExternalProject_Add(llama_hrx
 # comparison needs no device: the tool reads the .hsaco symbols, the generated table and the linked library, and with
 # --registration lets the library build its dispatch registries, which runs the add-on's own check of every registered
 # kernel against its code object. Between build and install, so the llama_hrx target cannot complete without it;
-# ALWAYS, because BUILD_ALWAYS above means the tree can change on every build. Measured on Strix Halo: 0.4 s for 63
+# ALWAYS, because BUILD_ALWAYS above means the tree can change on every build. Two limits, said here so nobody
+# assumes more: the step sits on the way to install, so building the inner tree by hand (ninja in hrx/llama) does
+# not run it; and --registration loads libggml-hrx.so with its libhrx and loomc beside it, so a machine where that
+# library cannot be loaded gets "cannot tell" (2) and a failed build, on purpose - an unloadable library is untested. Measured on Strix Halo: 0.4 s for 63
 # code objects (22 MB of table, 25 MB of library).
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
@@ -304,5 +307,5 @@ if(Python3_Interpreter_FOUND)
         DEPENDERS install
         ALWAYS ON)
 else()
-    message(WARNING "ONEBIT_HRX: no Python3 interpreter, so the embedded-code-object check does not run (engine#2935)")
+    message(WARNING "ONEBIT_HRX: no Python3 interpreter: this build's embedded HIP code objects are UNCHECKED (engine#2935)")
 endif()

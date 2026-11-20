@@ -43,6 +43,22 @@ check "serve: a suffixed ready line yields the same field" \
 check "serve: the laya-models suffix does not hide the port" \
       '[ "$(serve_port_from_log "$scratch/serve-layamodels")" = 41237 ]'
 
+# The NPU route (`1bit serve --device npu`, app/forward_serve.cpp) says it in its own words, with the model id between
+# "forward-serve:" and "ready" and the backend, --npu-streams and target as suffixes. Nothing matched this shape
+# before, and the cost was invisible: the line was there, the parser said empty, and every `--port 0` NPU run waited
+# out the 1200-tenths budget serve_e2e.sh passes it, printing nothing while it did.
+printf '1bit forward-serve: e2e-model ready on http://127.0.0.1:41243 (full ELF) [npu-target=xdna]\n' > "$scratch/fwd"
+check "forward-serve: the NPU route's ready line yields its port" \
+      '[ "$(serve_port_from_log "$scratch/fwd")" = 41243 ]'
+printf '1bit forward-serve: bonsai2-27b ready on http://::1:41244 (folded) [npu-streams=2] [npu-target=xdna]\n' \
+    > "$scratch/fwd-suffixed"
+check "forward-serve: an IPv6 host and both suffixes keep the port" \
+      '[ "$(serve_port_from_log "$scratch/fwd-suffixed")" = 41244 ]'
+# ...and the line it prints BEFORE ready is not a port (the warm-up announcement, which a poller must not mistake).
+printf '1bit forward-serve: warming (weight cache; first request would otherwise pay it)\n' > "$scratch/fwd-warming"
+check "forward-serve: the warm-up announcement is not a port" \
+      '[ -z "$(serve_port_from_log "$scratch/fwd-warming")" ]'
+
 # --port 0 with an IPv6 --host: the port is the field after the URL's LAST colon.
 printf '1bit serve: ready on http://::1:41238\n' > "$scratch/serve-ipv6"
 check "serve: an IPv6 host keeps the port (last colon, not first)" \

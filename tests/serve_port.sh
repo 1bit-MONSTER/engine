@@ -32,10 +32,17 @@
 #   ready on http://HOST:PORT (laya-models: model auto is routed ...)  (the laya-models path, always suffixed)
 # so an end-anchored pattern is wrong: it matches only the first, and a helper meant to be shared would hand the next
 # test an empty port, wait out its budget and fail *after* serve had reported one (reviewer's finding on #1523/#1525).
-# Take the URL token (everything between "on " and the first space) and the port is the field after its LAST colon, which
-# also keeps an IPv6 --host right: http://::1:41235 -> 41235.
+# The NPU route (`1bit serve --device npu`, app/forward_serve.cpp) speaks through the same binary in its own words,
+#  1bit forward-serve: MODEL ready on http://HOST:PORT (backend) [npu-streams=N] [npu-target=T]
+# with the model id between "forward-serve:" and "ready", so the URL is not a fixed field: scan the fields for the
+# one that starts with the scheme, as llama_port_from_log below does. A row that only knew the `1bit serve:` prefix
+# waited out its whole 1200-tenths budget on every `--port 0` NPU run and printed nothing while it did.
+# Take the URL token and the port is the field after its LAST colon, which also keeps an IPv6 --host right:
+# http://::1:41235 -> 41235.
 serve_port_from_log() {  # <log> -> the port, empty while serve has not said
-    awk '/^1bit serve: ready on http:\/\//{ n = split($5, a, ":"); if (a[n] ~ /^[0-9]+$/) { print a[n]; exit } }' "$1" 2>/dev/null
+    awk '/^1bit (serve|forward-serve):/ && / ready on http:\/\//{
+             for (i = 1; i <= NF; i++) if ($i ~ /^http:\/\//) { n = split($i, a, ":"); if (a[n] ~ /^[0-9]+$/) { print a[n]; exit } }
+         }' "$1" 2>/dev/null
 }
 
 # The default budget is 90 s, not 30: `forward-serve` warms its weight cache before printing `ready on` (engine#1621),

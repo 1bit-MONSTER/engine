@@ -225,6 +225,11 @@
   "Zarya": {
    "model_type": "zarya",
    "family": "Zarya, diffusion LM sampler"
+  },
+  "HYV4DFlyModel": {
+   "model_type": "hy_v4_dfly",
+   "family": "Hy4-flash DFly2 speculative drafter, five layers (hidden 3072, 32 heads / 32 KV, head_dim 64, intermediate 9216, vocab 120832 = the target's) with compressed-indexer keys and a confidence head; its own card says it needs the target's token embedding, vocabulary head, hidden state, sparse indices and five MLA caches, and must be started through the target recipe (tencent/Hy4-flash DFly2; first seen voodooquant/Hy4-flash-DFly2-PTQR-INT8-W8A8-GS128, 2026-11-20 census, a vllm draft-model repo). Not an alias of anything the engine serves: the repo carries no embedding head and no output layer of its own -- it borrows both from the Hy4-flash target -- so no architecture mapping can load it, and the pinned converter has no hy_v4_dfly config either. Its own trunk also is not the draft family the pinned backend does run (HYV4FlashForConditionalGeneration is recorded separately, and DFlash2DraftModel is the drafter class llama.cpp already registers).",
+   "watch": "report"
   }
  }
 }

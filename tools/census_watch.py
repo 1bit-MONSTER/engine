@@ -1072,10 +1072,18 @@ def sweep_support(pins, fetch=None):
         sha = commit.get("sha") or ""
         pinned = entry.get("commit") or ""
         paths = list(entry.get("paths") or ())
-        moved_paths, dead_paths = [], []
+        moved_paths, dead_paths, pin_gone = [], [], False
         if paths and sha:
             for path in paths:
-                at_pin = (fetch(GH_PATH_HEAD.format(repo=repo, sha=pinned, path=path)) or [{}])[0] or {}
+                try:
+                    at_pin = (fetch(GH_PATH_HEAD.format(repo=repo, sha=pinned, path=path)) or [{}])[0] or {}
+                except Exception:
+                    # engine#2966: this query answers 404 when the PINNED SHA is no longer in the repo (upstream
+                    # rewrote history), which reads exactly like a removed path. It also used to raise out of
+                    # sweep_support, so one re-pinned upstream hid every other repo and the d3 scan behind a single
+                    # "SUPPORT WATCH FAILED" line.
+                    pin_gone = True
+                    break
                 if not at_pin.get("sha"):
                     # no commit at the pin touches it (a typo, or renamed before the pin): it could never move
                     dead_paths.append(path)
@@ -1094,7 +1102,8 @@ def sweep_support(pins, fetch=None):
             "paths": paths,
             "moved_paths": moved_paths,
             "dead_paths": dead_paths,
-            "moved": (bool(moved_paths or dead_paths) if paths else sha != pinned),
+            "pin_gone": pin_gone,
+            "moved": pin_gone or (bool(moved_paths or dead_paths) if paths else sha != pinned),
         }
     sources = pins.get("d3_sources") or {}
     org, prefix = sources.get("org") or "", sources.get("prefix") or ""
@@ -1112,7 +1121,11 @@ def report_support(heads, new_d3, org="", prefix=""):
     """Print the supporting pins; return 1 when one moved or an unpinned d3 repo appeared."""
     moved = [h for h in heads.values() if h["moved"]]
     for h in sorted(heads.values(), key=lambda x: x["repo"]):
-        if h["moved"]:
+        if h.get("pin_gone"):
+            print(f"  !! SUPPORT PIN UNREACHABLE {h['repo']}  pinned {h['pinned'][:12]} reviewed {h['reviewed']}: "
+                  f"that commit is not in the repo any more (upstream history changed), so the watched paths cannot "
+                  f"be compared - re-pin to the current head {h['commit'][:12]} and review it")
+        elif h["moved"]:
             print(f"  !! SUPPORT MOVED {h['repo']}  head {h['commit'][:12]} ({h['date'][:10]})  "
                   f"pinned {h['pinned'][:12]} reviewed {h['reviewed']}"
                   + (f"  watched paths changed: {', '.join(h['moved_paths'])}" if h.get("moved_paths") else "")

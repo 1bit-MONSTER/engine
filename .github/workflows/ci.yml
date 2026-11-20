@@ -212,4 +212,7 @@ jobs:
         # report, and a new skip is worth seeing beside it. rc 1 names the new skip; rc 2 means the log could not be read, and
         # a check that cannot look is not a pass (tools/ci/ctest_skips.py).
         if: always()
-        run: python3 tools/ci/ctest_skips.py --log build/ctest.log
+        run: |
+          # 77 means the build never ran (engine#2876): that step already failed and said why, so this
+          # one must not turn "there was nothing to read" into a second red herring.
+          python3 tools/ci/ctest_skips.py --log build/ctest.log || [ $? -eq 77 ]

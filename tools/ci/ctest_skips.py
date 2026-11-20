@@ -28,7 +28,12 @@ not run, and is that set the set we expect?** -- against a checked-in baseline.
     tools/ci/ctest_skips.py --self-test
 
 Exit: 0 every skip is in the baseline, 1 a test skipped that the baseline does not name (named), 2 cannot tell
-(no log, or no summary line).
+(a log that exists but has no summary line), 77 the build never ran so there is no log at all (engine#2876).
+
+The difference between 2 and 77 is the difference between "the suite ran and I cannot read it" and "the suite never
+ran". The second is a consequence of an earlier failing step, and reporting it as a failure sent a reader down the
+wrong path twice: the copyright step failing left no `build/ctest.log`, and the step below reported that as the
+error.
 
 The baseline is `tools/ci/ctest_skips.txt`: one test name per line with an optional `# reason`. An entry that no longer
 skips is reported so the list shrinks instead of rotting -- the same shape as `unreferenced_tests.txt` (#1824).
@@ -245,8 +250,15 @@ def main() -> int:
         return self_test()
     path = pathlib.Path(a.log)
     if not path.is_file():
-        print(f"ctest_skips: cannot tell: no log at {path}", file=sys.stderr)
-        return 2
+        # No log at all means the build or the test step never ran: an earlier step already failed and
+        # said why, so this one must not add a second, misleading error. 77 is the skip code the rest of
+        # tools/ci uses for "the precondition was not there".
+        print(
+            f"ctest_skips: skipped: no log at {path}, so the suite never ran -- look at the step that "
+            f"failed before this one (engine#2876)",
+            file=sys.stderr,
+        )
+        return 77
     text = path.read_text(encoding="utf-8", errors="replace")
     root = pathlib.Path(a.root).resolve()
     return write_baseline(root, text, a.reason) if a.write else check(root, text)

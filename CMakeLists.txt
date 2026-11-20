@@ -296,6 +296,15 @@ add_test(NAME fold_initializer_transpose COMMAND bash ${CMAKE_SOURCE_DIR}/tests/
 set_tests_properties(fold_initializer_transpose PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME make_audio_pack COMMAND bash ${CMAKE_SOURCE_DIR}/tests/make_audio_pack_test.sh)
 set_tests_properties(make_audio_pack PROPERTIES SKIP_RETURN_CODE 77)
+# engine#2761: the fork's own ctest suite against a known-failure baseline. The helper owns the two
+# refusals in its header -- it skips 77 until engine#2825's ratchet tool is on the branch, and it
+# cannot-tell (exit 2) when the llama.cpp submodule is not at the sha the tree pins, because a build
+# tree configured against a different submodule keeps stale include paths and reports a missing
+# header as a suite failure. SKIP_RETURN_CODE 77 is what makes a not-yet-applicable row a SKIP and
+# not a FAIL in the ctest log.
+add_test(NAME fork_ctest_known_fail
+         COMMAND /bin/sh ${CMAKE_SOURCE_DIR}/tools/ci/fork_ctest_known_fail.sh)
+set_tests_properties(fork_ctest_known_fail PROPERTIES SKIP_RETURN_CODE 77)
 
 # engine#2186/#2244: `tools/ci/dupdef_check.py`, a check that was only ever run by hand. It is the one
 # that found a shadowed `def self_test()` in tools/hrx_f16_narrowing_check.py -- the surviving copy
@@ -476,8 +485,14 @@ endfunction()
 # script turned the row into BAD_COMMAND.
 add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
+# engine#2878: the fold tool is only useful if its output is something llama-hadamard.cpp can run,
+# and that is what this row checks; it had no runner, so tests_referenced named it.
+add_python_test(hadamard_fold_test ${CMAKE_SOURCE_DIR}/tests/hadamard_fold_test.py)
 add_python_test(ci_targets ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#2878: the parser is the part of the fault-burst capture that has to be right, and it is
+# pure, so its self-test runs here; the capture itself needs the box.
+add_python_test(fault_burst_capture_self ${CMAKE_SOURCE_DIR}/tools/diag/fault_burst_capture.py --self-test)
 # engine#2641: #2625 merged with its own conflict markers still in docs/nvme-iommu-fault-triage.md, inside a ```bash
 # block, so the page did not render and nothing noticed -- the merge kept them because the file was never read back.
 # The check is stateful on purpose: a bare `=======` is a Markdown underline or a shell rule (the first version
@@ -558,6 +573,10 @@ add_python_test(branch_stale_check_test ${CMAKE_SOURCE_DIR}/tools/ci/branch_stal
 # the push. #2623 lost two commits that way (recovered by #2640) and #2605 lost one (recovered by
 # #2654). The row below is the hermetic one: the tool builds throwaway repos in a temp dir.
 add_python_test(merged_tail_check_self ${CMAKE_SOURCE_DIR}/tools/ci/merged_tail_check.py --self-test)
+# engine#2761: the known-failure ratchet for the fork's ctest suite. Its --self-test is hermetic
+# (it builds log fixtures in the process), so it is a default row like the one above. The ratchet's
+# LIVE use needs the fork built and is the ci.yml job the issue asks for, not this row.
+add_python_test(ctest_known_fail_self ${CMAKE_SOURCE_DIR}/tools/ci/ctest_known_fail.py --self-test)
 # The live scan needs the network and `gh`, so it is off by default rather than a flaky default row;
 # a scheduled workflow is its proper home, and that file needs the `workflow` token scope a lane does
 # not have. Turn it on with -DMERGED_TAIL_CHECK_LIVE=ON to run it locally or in a job that has gh.
@@ -603,6 +622,17 @@ add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_r
 # The claim is in the title/body (`Fixes #N`), so the self-test is hermetic and the live run is a lane tool: `Refs #N` and a
 # bare mention are deliberately NOT claims, which is the arm below that keeps the detector from firing on every PR.
 add_python_test(tool_selftest_duplicate_fixes ${CMAKE_SOURCE_DIR}/tools/ci/duplicate_fixes_check.py --self-test)
+# engine#2836: the fork registers 48 ctest rows and nothing runs them, because the engine never builds the fork's tests.
+# The host-runnable one that matters is `check_stale_expectations.py` (fork #419): it answers "is a recorded-stale
+# expectation still selectable by no matcher", which is engine#2774's question, in ~1 s, with no device and no fixture.
+# On a pin BEFORE `ddd415f4a` (the fork commit that adds the script) it cannot run, so the row skips (77) and the
+# message names the commit that turns it on, the same shape as hrx_f16_narrowing_check above; on `ddd415f4a` and
+# later -- which is the pin this engine carries today -- it RUNS and passes, so the row is live, not inert. A row
+# that always skipped silently would be a green tick over nothing; a row that failed for want of a file would be
+# red on every PR until the bump.
+add_test(NAME hrx_stale_expectations COMMAND ${Python3_EXECUTABLE}
+         ${CMAKE_SOURCE_DIR}/tools/ci/stale_expectations_check.py --root ${CMAKE_SOURCE_DIR})
+set_tests_properties(hrx_stale_expectations PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_agree.py --selftest)
 add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
 add_python_test(tool_selftest_spec_decode_acceptance ${CMAKE_SOURCE_DIR}/tools/spec_decode_acceptance.py --selftest)
@@ -1027,6 +1057,10 @@ endif()
 # (RFC #213 stage 3): what HRX does not run, Lemonade serves with its own llamacpp backends.
 option(ONEBIT_HRX "Build the HRX llama-server and wire it into Lemonade" OFF)
 set(ONEBIT_GPU_PRIVATE "" CACHE PATH "A gpu-kernels checkout whose addons/hip-hrx HIP kernels are built into the HRX llama.cpp (needs ONEBIT_HRX)")
+# engine#2836: the fork registers 43 `test-hrx-*` ctest rows and nothing built or ran them, because the
+# ExternalProject built three targets by name. OFF by default -- a lane build must not pay for 43 extra
+# binaries -- and hrx-build.yml turns it on for the one job that runs them.
+option(ONEBIT_HRX_BUILD_TESTS "Configure the HRX llama.cpp with LLAMA_BUILD_TESTS, so its test-hrx-* rows exist" OFF)
 if(ONEBIT_GPU_PRIVATE AND NOT ONEBIT_HRX)
     message(FATAL_ERROR "ONEBIT_GPU_PRIVATE needs ONEBIT_HRX=ON")
 endif()
@@ -1435,6 +1469,22 @@ if(Python3_Interpreter_FOUND)
     # issue says anything. Runs the workflow's own block against a log of the 11-16 13:00Z shape.
     add_test(NAME census_watch_excerpt COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_excerpt_test.py)
     set_tests_properties(census_watch_excerpt PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # engine#2846: the alert job computed an `alert` output and nothing read it, so a QUIET scheduled run still filed
+    # a "coverage breach" whose excerpt held no finding. This runs the job's own `run:` block with a stub `gh` and
+    # asserts the three states: quiet files nothing, an alert files one coverage issue, a failed watch still files.
+    # Hermetic -- no network, no token, ~0.2 s -- and it fails on the version that shipped.
+    add_test(NAME census_alert_job COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_alert_job_test.py)
+    set_tests_properties(census_alert_job PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # Source-only, no build and no device: a warm-up path that is not a registered route 404s and warms
+    # nothing (engine#2853 -- /completion was that path for two warm-ups until #2855 registered it).
+    add_test(NAME warmup_route_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/warmup_route_check.py --root ${CMAKE_SOURCE_DIR})
+    set_tests_properties(warmup_route_check PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # engine#2853: `1bit serve`'s short and spec warm-ups posted to /completion, a path it never registered -- 404s that
+    # moved nothing, and no test could see them because a warm-up is a POST the server makes to itself. The route table
+    # and the warm-up list are two literals in app/serve.cpp; this fails when they disagree. Static, ~0.1 s.
+    add_python_test(tool_selftest_serve_routes ${CMAKE_SOURCE_DIR}/tools/ci/serve_routes_check.py --self-test)
+    add_test(NAME serve_warmup_routes COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/serve_routes_check.py ${CMAKE_SOURCE_DIR})
     # an installed package must find its libraries beside itself: the 2026-11-08 incident's rule, from
     # the installed side that no release gate can reach (engine #1411). Skips without patchelf/readelf.
     add_test(NAME installed_rpath COMMAND bash ${CMAKE_SOURCE_DIR}/tests/installed_rpath_test.sh)

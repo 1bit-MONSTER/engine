@@ -97,6 +97,8 @@ case $MEM_ABORT_GB in
         ;;
 esac
 POLL=${GPU_HOLD_POLL:-2}
+# How long a token that names no holder must sit unchanged before it is treated as a leftover rather than a claim.
+TOKEN_GRACE=${GPU_HOLD_TOKEN_GRACE:-5}
 LOG=${GPU_HOLD_LOG:-}
 THERMAL_FLAG=${GPU_HOLD_THERMAL_FLAG:-$HOME/THERMAL-HOLD}
 COOLDOWN=${GPU_HOLD_COOLDOWN:-180}
@@ -115,7 +117,18 @@ COOLDOWN_TCTL=${GPU_HOLD_COOLDOWN_TCTL:-85}
 GPU_FAULT_RE='\[gfxhub\] page fault|amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure|failed to respond)|amdxdna.*(command timeout|power.?cycl(e|ing)|fault)'
 # A line that says the driver did NOTHING ("no context touched") is not a fault: it is the throttle that follows
 # one, and it is logged for 60 s after every power-cycle, which is exactly when the next ticket is granted.
-GPU_FAULT_SKIP_RE='aie2_tdr_recover_all: TDR recovery throttled'
+# A FRAME, not any line that mentions an offset (engine#2799 review, twice): the flat `\+0x../0x..` alternative also
+# matched the event's own lines -- `WARNING: CPU: 3 PID: 991 at ...amdgpu_device.c:4521 amdgpu_device_reinit_after_reset
+# +0x15c/0x1ef [amdgpu]` and `RIP: 0010:...` -- so a WARN-only log counted ZERO faults and the guard would grant a
+# ticket onto it. A stack frame is the WHOLE line: two spaces, a symbol, an offset, a module. RIP is the same event as
+# the WARNING line above it, so it is skipped with the frames; the WARNING line itself is the event and must count.
+GPU_FAULT_SKIP_RE='aie2_tdr_recover_all: TDR recovery throttled|kernel:  [A-Za-z_][A-Za-z0-9_.]*\+0x[0-9a-f]+/0x[0-9a-f]+ \[[a-z0-9_]+\]$|RIP: 0010:[A-Za-z_][A-Za-z0-9_.]*\+0x[0-9a-f]+/0x[0-9a-f]+ \[[a-z0-9_]+\]$'
+# A BACKTRACE IS ONE EVENT, NOT ELEVEN (measured 2026-11-16 19:33:03Z): the driver's reset path logs a WARN whose every
+# stack frame reads `amdgpu_device_reinit_after_reset.cold+0x15c/0x1ef [amdgpu]`, and GPU_FAULT_RE matches each of them
+# (`amdgpu.*reset`). gpu-hold reported "22 amdgpu/MES/amdxdna fault line(s) in the last 10 min" for a kernel log holding
+# 118 matching lines across TWO distinct timestamps, so one event read as twenty-two. The refusal was right -- a real
+# reset had happened -- but the number is what every lane reads when its ticket is released unheld, and an inflated one
+# sends readers looking for a storm that is not there. A stack frame carries a `+0x` offset; a real fault line does not.
 
 # engine#2803: the take-time refusal says WHICH KIND of fault it saw. One name per class, used for the newest matching line and
 # for the window's first compute marker, so the two cannot describe the same fault differently.
@@ -151,7 +164,22 @@ shift $((OPTIND - 1))
 # the same-queue case is refused here rather than left to burn a window. A DIFFERENT queue still runs: npu-hold execs
 # this script with the NPU's queue and the hw-gate takes its own GPU claim inside an NPU ticket, and that is the shape
 # npu-hold documents as required.
-if [ -n "${GPU_HOLD_HELD_QUEUE:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; then
+# engine#2727 review: the two refusals below key off the PRESENCE of an inherited variable, not the LIVENESS of the
+# ticket that exported it. A payload that outlives its ticket -- a daemonised child, which is exactly how the 51 GiB
+# orphan of 11-08 happened -- still carries GPU_HOLD_HELD_* from a parent whose ticket is long gone, and the next
+# gpu-hold inside it would be refused with "the outer ticket already holds the GPU" when it does not. GPU_HOLD_TICKET
+# carries the holder pid ("gpu-hold <label> pid <pid> <ts>"), so a pid that no longer exists means the environment is
+# stale and the hold proceeds. A recycled pid can only make this MORE conservative (it keeps the refusal), never
+# silently drop a real nest -- the refusal exists to protect a window, so erring toward refusing is the right side.
+_held_live=1
+if [ -n "${GPU_HOLD_TICKET:-}" ]; then
+    _held_pid=$(printf '%s' "$GPU_HOLD_TICKET" | sed -n 's/.* pid \([0-9][0-9]*\) .*/\1/p')
+    if [ -n "$_held_pid" ] && ! kill -0 "$_held_pid" 2> /dev/null; then
+        _held_live=0
+        echo "gpu-hold: the inherited ticket is stale -- GPU_HOLD_TICKET names pid $_held_pid, which no longer exists, so label '${GPU_HOLD_HELD_LABEL:-${GPU_HOLD_LABEL:-?}}' is not holding anything and this hold proceeds instead of refusing a nest that is not there (engine#2727 review)" >&2
+    fi
+fi
+if [ "$_held_live" = 1 ] && [ -n "${GPU_HOLD_HELD_QUEUE:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; then
     _nest_here=$(cd "$QUEUE" 2> /dev/null && pwd -P || printf '%s' "$QUEUE")
     _nest_there=$(cd "$GPU_HOLD_HELD_QUEUE" 2> /dev/null && pwd -P || printf '%s' "$GPU_HOLD_HELD_QUEUE")
     if [ "$_nest_here" = "$_nest_there" ]; then
@@ -164,7 +192,7 @@ fi
 # token is the thing it waits on -- gpu-hold's own wait line says so ("first in the queue, waiting for <token> (held by:
 # <label> pid <pid>)") -- so the comparison is on the token too. engine#2727 review, measured: outer on q1, payload
 # running `-q q2` with the inherited token sat 4 s and then reported "queue never came round" (rc 75) with the outer.
-if [ -n "${GPU_HOLD_HELD_TOKEN:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; then
+if [ "$_held_live" = 1 ] && [ -n "${GPU_HOLD_HELD_TOKEN:-}" ] && [ "${GPU_HOLD_ALLOW_NESTED:-0}" != 1 ]; then
     _tok_here=$(cd "$(dirname "$TOKEN")" 2> /dev/null && pwd -P || dirname "$TOKEN")
     _tok_there=$(cd "$(dirname "$GPU_HOLD_HELD_TOKEN")" 2> /dev/null && pwd -P || dirname "$GPU_HOLD_HELD_TOKEN")
     if [ "$_tok_here/$(basename "$TOKEN")" = "$_tok_there/$(basename "$GPU_HOLD_HELD_TOKEN")" ]; then
@@ -318,7 +346,7 @@ oldest_ticket() {
 # does not know.
 reap_token() {
     [ -e "$TOKEN" ] || return 0
-    local content pid
+    local content pid age
     content=$(cat "$TOKEN" 2> /dev/null) || return 0
     # Any writer that stamps a pid, not only gpu-hold. `npu-serve-keeper` holds the NPU token while the
     # owner's serve is up (npu-hold:22), so when the owner stops the keeper -- a normal, sanctioned action --
@@ -327,9 +355,25 @@ reap_token() {
     # "npu-serve-keeper pid 298235" whose pid was already gone, and every NPU ticket on the box would have run
     # to -w the same way. The pid is the identity; the prefix is not.
     pid=$(printf '%s' "$content" | sed -n 's/.* pid \([0-9][0-9]*\) .*/\1/p' | head -n 1)
-    if [ -n "$pid" ] && ! kill -0 "$pid" 2> /dev/null; then
+    if [ -n "$pid" ]; then
+        if ! kill -0 "$pid" 2> /dev/null; then
+            rm -f "$TOKEN"
+            log "dropped stale token (holder pid $pid gone): $content"
+        fi
+        return 0
+    fi
+    # A token that names NO holder is invisible to the arm above, and the grant path cannot take it either: the
+    # write is `set -o noclobber`, so it fails silently against the existing file and the poll says nothing, which
+    # leaves every ticket on the box spinning for as long as the file exists. Measured 2026-11-19: a 0-byte
+    # ~/GPU-TOKEN left behind by a crash cycle parked ticket ab2 for 4828 s, and the very next poll after
+    # `rm -f ~/GPU-TOKEN` granted in 0 s. The grace is what keeps a live holder mid-write from being stolen: a
+    # holder writes its token once, so an unreadable token unchanged for $TOKEN_GRACE seconds is a leftover. A
+    # holder that stamps no ` pid N ` at all cannot be told apart from a crash leftover; the grace bounds what
+    # that costs it (one grant), where leaving the file alone costs every later lane the wait it sets.
+    age=$(( $(date +%s) - $(stat -c %Y "$TOKEN" 2> /dev/null || date +%s) ))
+    if [ "$age" -ge "$TOKEN_GRACE" ]; then
         rm -f "$TOKEN"
-        log "dropped stale token (holder pid $pid gone): $content"
+        log "dropped unreadable token (no holder pid, unchanged for ${age}s): ${content:-<empty>}"
     fi
 }
 
@@ -439,7 +483,22 @@ while [ "$state" = queued ]; do
                     # take an NPU ticket minutes after the command timeout the rules say to stop for (measured
                     # 2026-11-15: the hold ran on a log whose newest line was an amdxdna command timeout).
                     _reset_re=$GPU_FAULT_RE
-                    _resets=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | grep -c .)
+                    # A BACKTRACE IS ONE EVENT, NOT ELEVEN (measured 2026-11-16 19:33:03Z): the driver's reset path logs a
+                    # WARN whose every stack frame reads `amdgpu_device_reinit_after_reset.cold+0x15c/0x1ef [amdgpu]`, and
+                    # `amdgpu.*reset` matches each frame. Counting lines reported "22 amdgpu/MES/amdxdna fault line(s)" for a
+                    # log holding two timestamps, and the count is what every lane reads when its ticket is released unheld.
+                    # The fix is to count EVENTS -- distinct log timestamps -- and print both numbers, so nothing is skipped:
+                    # an event whose only trace is the WARN backtrace (14:24:45 on this box has 113 frames and no page-fault
+                    # line at all) still counts as ONE and still refuses, which skipping frames would not (a skip made that
+                    # event count zero, i.e. it would have granted the ticket after a reset). Synthetic logs in the tests
+                    # carry no timestamp, so there a line is its own event and the old behaviour is reproduced exactly.
+                    _faults=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE")
+                    _reset_lines=$(printf '%s\n' "$_faults" | grep -c .)
+                    _resets=$(printf '%s\n' "$_faults" | awk '
+                        NF == 0 { next }   # an empty capture is ONE BLANK LINE to awk and would count as an event
+                        { if ($0 ~ /^[A-Z][a-z][a-z] +[0-9]+ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) k = $1" "$2" "$3; else k = $0
+                          if (!(k in seen)) { seen[k]; n++ } }
+                        END { printf "%d", n + 0 }')
                     if [ "${_resets:-0}" -gt 0 ]; then
                         rm -f "$TOKEN"; state=done
                         # HOW OLD is the newest one? "in the last 10 min" cannot tell a wedged device from another lane's
@@ -477,7 +536,9 @@ while [ "$state" = queued ]; do
                         # that it is what the driver last named, which is what a reader can check against the log.
                         _proc=$(printf '%s\n' "$_klog" | sed -n 's/.*Process \([^ ]*\) pid \([0-9]*\).*/\1 pid \2/p' | tail -1)
                         [ -n "$_proc" ] && _who=", and the driver last named ${_proc}"
-                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault line(s) in the last ${_reset_window} min${_age} - the newest is ${_what}${_first}${_who}. The ticket is released unheld; inspect the kernel log, then retry"
+                        _lines_note=""
+                        [ "${_reset_lines:-0}" != "${_resets:-0}" ] && _lines_note=" across ${_reset_lines} matching line(s) -- a reset backtrace matches on every frame, so the event count is the one to read"
+                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault event(s) in the last ${_reset_window} min${_lines_note}${_age} - the newest is ${_what}${_first}${_who}. The ticket is released unheld; inspect the kernel log, then retry"
                         printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -3
                         exit 78
                     fi

@@ -128,9 +128,23 @@ if [ "${GPU_HOLD:-}" != 1 ] && [ "${HW_GATE_GPU_HOLD:-1}" != 0 ] && [ -z "${HW_G
     hold=$(command -v gpu-hold 2> /dev/null || true)
     if [ -z "$hold" ] && [ -x "$(dirname "$0")/gpu-hold" ]; then hold="$(dirname "$0")/gpu-hold"; fi
     if [ -n "$hold" ]; then
-        GPU_HOLD=1 HW_GATE_TOKEN=none exec "$hold" \
-            -l "hw-gate${GITHUB_RUN_ID:+ run $GITHUB_RUN_ID} pid $$" \
-            -t "${HW_GATE_HOLD_MINUTES:-45}" -w "${HW_GATE_TOKEN_WAIT:-5400}" -- "$0" "$@"
+        # A refused take costs the queue position: gpu-hold exits 78 while ANY lane's kernel log carries a GPU
+        # fault in the last 10 min, so one neighbour that wedges the box every few minutes fails this gate
+        # without a single phase running (2026-11-18: /home/bcloud/hrx-2861/repro page-faulted at 14:11 and
+        # again at 14:21, and three takes in a row were refused). Wait the window out and retake, twice, then
+        # give up with the helper's own status. HW_GATE_FAULT_RETRY_WAIT is the wait before each retake.
+        tries=0
+        while :; do
+            rc=0
+            GPU_HOLD=1 HW_GATE_TOKEN=none "$hold" \
+                -l "hw-gate${GITHUB_RUN_ID:+ run $GITHUB_RUN_ID} pid $$" \
+                -t "${HW_GATE_HOLD_MINUTES:-45}" -w "${HW_GATE_TOKEN_WAIT:-5400}" -- "$0" "$@" || rc=$?
+            [ "$rc" = 78 ] || exit "$rc"
+            tries=$((tries + 1))
+            [ "$tries" -ge 2 ] && exit "$rc"
+            echo "hw-gate: gpu-hold refused the take (a GPU fault in the last 10 min); retry $tries in ${HW_GATE_FAULT_RETRY_WAIT:-660}s"
+            sleep "${HW_GATE_FAULT_RETRY_WAIT:-660}"
+        done
     fi
 fi
 
@@ -518,8 +532,34 @@ if [ -z "$BIN" ]; then
     export HIP_DEVICE_LIB_PATH=${HIP_DEVICE_LIB_PATH:-$device_lib}
     # a changed flag set must not be read from an existing cache
     [ "$(cat "$build/.hip-flags" 2>/dev/null)" = "$hip_flags" ] || rm -f "$build/CMakeCache.txt"
+    # No embedded Web UI (engine#2865). Every phase drives kernel entry points or llama-server over
+    # HTTP, so the UI is not a gate input, but the prebuilt dist comes from the moving "latest" tag of
+    # the ggml-org/llama-ui bucket and its SvelteKit layout bundles workbox into sw.js, which the fork's
+    # ui_validate_assets (llama.cpp scripts/ui-assets.cmake) rejects - the configure died six times with
+    # "missing required asset(s): workbox[hash].js" before any device phase. Emit an empty table instead:
+    # no prebuilt fetch, no npm build.
+    ui_flags="-DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF"
+    [ "$(cat "$build/.ui-flags" 2>/dev/null)" = "$ui_flags" ] || rm -f "$build/CMakeCache.txt"
+    # engine#2868: record what the tree held BEFORE the removals below, so a UI failure in the log names
+    # the tree and the copy to clean. ui-assets.cmake checks ${UI_SOURCE_DIR}/dist (the checkout) before
+    # ${DIST_DIR} (the build tree) and validates whichever exists even with the UI switched off.
+    dist_state() { [ -e "$1/index.html" ] && echo "present($(find "$1" -type f | wc -l) files)" || echo absent; }
+    ui_report="hw-gate: src=$src build=$build ui-checkout-dist=$(dist_state "$src/tools/ui/dist") ui-build-dist=$(dist_state "$build/tools/ui/dist") ui-stamp=$(cat "$build/tools/ui/.ui-stamp" 2>/dev/null || echo none) ui-cache=$(grep -m1 '^LLAMA_USE_PREBUILT_UI:' "$build/CMakeCache.txt" 2>/dev/null || echo none)"
+    # engine#2868: log it on every run, not only when the validation fails -- a cache-hit build
+    # (build PASS 2s) proves nothing about which dist the configure read, and that is the question.
+    echo "$ui_report" >> "$OUT/build.log"
+    # A tree that provisioned a dist earlier still embeds and validates it (ui-assets.cmake emit_files only
+    # skips the check when the directory holds nothing), so the downloaded copy goes with the cache.
+    rm -rf "$build/tools/ui/dist"
+    rm -f "$build/tools/ui/dist.tar.gz" "$build/tools/ui/dist.tar.gz.sha256" "$build/tools/ui/.ui-stamp"
+    # scripts/ui-assets.cmake:524 checks the SOURCE tree first -- if ${UI_SOURCE_DIR}/dist/index.html
+    # exists it embeds and validates that copy, and ${UI_SOURCE_DIR} is the checkout, not the build dir.
+    # A checkout that once provisioned a dist therefore still dies on "missing required asset(s)" no
+    # matter what the build dir holds.
+    rm -rf "$src/tools/ui/dist"
     # the same configuration as cmake/hrx.cmake (llama_hrx), plus the two test tools
     : > "$OUT/build.log"
+    echo "$ui_report" >> "$OUT/build.log"
     built=1 guarded=0
     # Memory (engine#1504). On 2026-11-08 this job was handed to a just-restarted runner on a box with 0 swap
     # free and both runners were OOM-killed 76 s later; the compile was the one step here with no memory check.
@@ -539,8 +579,9 @@ if [ -z "$BIN" ]; then
           -DHRX_SOURCE_DIR="$ROOT/third_party/hrx-system" "${addon_args[@]}" \
           -DGGML_HRX=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=ON -DGGML_CPU=ON \
           -DGGML_HRX_HIP_COMPILER="$TOOLCHAIN/bin/amdclang++" "-DGGML_HRX_HIP_FLAGS=$hip_flags" \
-          -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF >> "$OUT/build.log" 2>&1 &&
-          echo "$addon_pin" > "$build/.gpu-kernels-pin" && echo "$hip_flags" > "$build/.hip-flags"; }; } &&
+          -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF $ui_flags >> "$OUT/build.log" 2>&1 &&
+          echo "$addon_pin" > "$build/.gpu-kernels-pin" && echo "$hip_flags" > "$build/.hip-flags" &&
+          echo "$ui_flags" > "$build/.ui-flags"; }; } &&
       "$ROOT/scripts/mem-guard.sh" --term "$MEM_FLOOR" "$THERMAL" cmake --build "$build" -j "$JOBS" --target "${targets[@]}" >> "$OUT/build.log" 2>&1 && { built=0; break; }
       grep -q "^GUARD:" <(tail -n 40 "$OUT/build.log") && { guarded=1; break; }   # out of memory, not heat
       grep -q "error:" <(tail -n 40 "$OUT/build.log") && break   # a compile error, not heat

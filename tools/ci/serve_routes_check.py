@@ -39,7 +39,10 @@ import re
 import sys
 
 SOURCE = pathlib.Path("app/serve.cpp")
-ROUTE = re.compile(r'srv\.Post\(\s*"([^"]+)"')
+# A route is registered with srv.Get or srv.Post, as a plain literal or as a raw-string regex (`R"(/slots/(\\d+))"`).
+# The regex form is why `warmup_route_check.py` existed as a second check; both halves live here now, so one file answers
+# "is every warm-up path a route this server registers" and no reviewer has to keep two baselines in step.
+ROUTE = re.compile(r'srv\.(?:Get|Post)\(\s*(?:R"\((.*?)\)"|"([^"]+)")\s*,')
 WARMUP = re.compile(r'\{\s*"path"\s*,\s*"([^"]+)"')
 # The token-limit fields the warm-up bodies set, and the ones the request parser reads (forward_serve.cpp).
 # Both shapes the builders use: `{ "n_predict", 0 }` in an initializer list and `body["n_predict"] = 2`.
@@ -59,7 +62,20 @@ def routes_and_warmups(text):
                 seen.add(s)
                 out.append(s)
         return out
-    return uniq(ROUTE.findall(text)), uniq(WARMUP.findall(text))
+    return uniq([raw if raw else lit for raw, lit in ROUTE.findall(text)]), uniq(WARMUP.findall(text))
+
+
+def route_covers(routes, path):
+    """True when `path` is a registered route: an exact literal, or a full match of a raw-string regex route."""
+    for route in routes:
+        if route == path:
+            return True
+        try:
+            if re.fullmatch(route, path):
+                return True
+        except re.error:
+            continue
+    return False
 
 
 def check(root=None):
@@ -76,7 +92,7 @@ def check(root=None):
         print(f"serve_routes: {path} has {len(routes)} route(s) and {len(warmups)} warm-up path(s): one of the two "
               f"literals moved, so this check is looking at nothing", file=sys.stderr)
         return 77
-    missing = [w for w in warmups if w not in routes]
+    missing = [w for w in warmups if not route_covers(routes, w)]
     for w in missing:
         print(f"serve_routes: warm-up posts to {w}, which {path} never registers "
               f"(routes: {', '.join(routes)})")
@@ -135,6 +151,13 @@ out.push_back(json{ { "path", "/completion" } });'''
     r, w = routes_and_warmups(bad)
     arm("... and the missing route is visible as a subset failure", [x for x in w if x not in r] == ["/completion"])
     arm("no routes parses as nothing", routes_and_warmups("nothing here") == ([], []))
+    # The two capabilities `warmup_route_check.py` had and this file did not, kept here with arms so deleting that
+    # file cannot quietly lose them (engine#2853's own check, folded in rather than maintained twice).
+    regex_route = 'srv.Get("/health", h);\nsrv.Post(R"(/complet[a-z]*)", post);\nout.push_back(json{ { "path", "/completion" } });'
+    r, w = routes_and_warmups(regex_route)
+    arm("a raw-string route registration parses", r == ["/health", "/complet[a-z]*"] and w == ["/completion"])
+    arm("a srv.Get route counts too", routes_and_warmups('srv.Get("/metrics", m);')[0] == ["/metrics"])
+    arm("a regex route covers a warm-up path", route_covers(r, "/completion") and not route_covers(r, "/completions/v1"))
     # engine#2884's half: the limit the body asks for must be one the parser reads.
     body = '{"n_predict", 0}, {"temperature", 0}'
     arm("a body limit is found", BODY_LIMIT.findall(body) == ["n_predict"])

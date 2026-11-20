@@ -82,7 +82,7 @@ checks=(
     # duplicate without the allow-list or the `Refs`+overlap rule that `duplicate_fixes_allow.txt` was written
     # for -- neither is on main yet. A hard row would red the case I have spent the day arguing must pass, so it
     # prints the finding for the lane to read and stays green; make it hard the day the exemption lands.
-    "tools/ci/duplicate_fixes_check.py --advisory"
+    "tools/ci/duplicate_fixes_check.py --gate"
     "tools/ci/tests_referenced_check.py"
     "tools/ci/ci_targets_check.py --check"
     "tools/ci/tmp_path_check.py --check"

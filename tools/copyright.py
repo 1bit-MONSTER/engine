@@ -108,6 +108,12 @@ EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*",
           # engine#315 evidence artefacts that cannot carry a comment: diffs must stay byte-applicable
           # and data files have no comment syntax. Matches the existing "patches/*" exemption.
           "*.patch", "*.csv", "*.cfg",
+          # engine#2807: the duplicate-fix exemption list is one declared pair per line, all of it data. It does
+          # carry '#' comments, so a header would be *legal* -- but every line of this file is meant to be read as
+          # an exemption with its reason, and a five-line copyright banner in front of a file that is usually
+          # empty is noise the reader skips. Exempting the file is narrower than teaching this tool "*.txt",
+          # which would reach CMakeLists.txt and the 30-odd data .txt files this list already excludes one by one.
+          "tools/ci/duplicate_fixes_allow.txt",
           # Gantt "Kernel 7.4 readiness": the kernel config of record is the box's /boot/config-<release> byte for byte,
           # and config/kernel.config pins its sha256 -- a notice would make it a different file from the one that booted.
           "os/kernel/config-*",

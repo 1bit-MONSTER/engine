@@ -29,7 +29,7 @@ below says why. The table's order is the runner's order: cheapest and most commo
 |---|---|
 | `python3 tools/copyright.py --check` | a file has no notice, or has two |
 | `python3 tools/ci/notice_covers_deps.py --check` | a dependency that is fetched and compiled into the binary is not named in `NOTICE` |
-| `python3 tools/ci/duplicate_fixes_check.py --advisory` | two open PRs name one issue — **advisory**: this is the script's only network row, and a legitimate half (a fix plus its arm) is indistinguishable from a duplicate until an exemption exists, so it prints and exits 0 |
+| `python3 tools/ci/duplicate_fixes_check.py --gate` | two open PRs name one issue and neither is declared in `tools/ci/duplicate_fixes_allow.txt` — a legitimate **half** (a fix plus its arm) must be declared there, with its reason; this is the script's only network row, so it **skips** (77) rather than failing when it cannot tell |
 | `python3 tools/ci/tests_referenced_check.py` | a test, tool self-test or python test exists that nothing runs |
 | `python3 tools/ci/ci_targets_check.py --check` | a CI row names a target or path that does not exist |
 | `python3 tools/ci/tmp_path_check.py --check` | a new `/tmp` or `/dev/shm` path, where builds and dumps belong under `~/wt` or `~/.cache/scratch-*` |

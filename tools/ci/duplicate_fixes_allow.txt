@@ -1,0 +1,11 @@
+# Pairs an open issue is legitimately claimed by, one per line: `<issue> <reason>`.
+#
+# A legitimate HALF is a fix plus the arm that proves it can fail (engine#2797/#2798), and nothing in the PR
+# text separates that from two lanes doing the same work. Declaring it here, with a reason, is what lets the
+# pre-PR gate stay a GATE: `tools/ci/duplicate_fixes_check.py --gate` exits 1 on an undeclared pair, and 77
+# (skip) when it cannot read the PR list at all.
+#
+# An entry that no open pair claims any more is reported as STALE, so this file cannot quietly grow.
+# A comment starts at ' #'; a leading '#' is the issue number.
+#
+# (no entries today: every pair this file was written for has closed)

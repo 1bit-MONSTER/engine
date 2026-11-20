@@ -97,4 +97,30 @@ bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_
                        const std::vector<int64_t>& xa_dims, const std::string& out_name, AudioRunResult* out,
                        std::string* why);
 
+// engine#1783: what stays the same across a decoder's steps. A greedy decode runs the whole decoder graph once per token
+// with a new token window and the SAME encoder output, so every node whose inputs are initializers, constants or the
+// encoder output -- above all every layer's cross-attention key and value projections, 1500 x 768 x 768 each -- computes
+// the same tensor at every step. The first run with a cache keeps the step-invariant tensors that a step-dependent node
+// reads; every later run with that cache starts from them and skips the step-invariant nodes. The skipped nodes would
+// have run the same operations on the same inputs, so the output is bit-identical (tests/audio_exec_test.cpp memcmps the
+// logits). A cache belongs to ONE encoder output: use a new one per window. A failed run empties it.
+struct DecoderStepCache {
+    struct Saved {
+        std::vector<int64_t> dims;
+        std::vector<float> data;
+        std::vector<int64_t> i64;
+        std::vector<uint8_t> b;
+    };
+    bool filled = false;
+    std::map<std::string, Saved> frontier;   // step-invariant tensors that step-dependent nodes read
+    size_t invariant_nodes = 0;              // nodes a filled run skips
+    // The one row (position) of the graph output the caller reads, -1 = all. The MatMul that makes the output (whisper's
+    // vocabulary projection, 128 x 768 x 51865) then runs only the four-row unit holding that row: the same unit and the
+    // same code as a full run, so that row's bytes are unchanged. Every other row of the output is left 0.
+    int64_t output_row = -1;
+};
+bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_tokens, const float* xa,
+                       const std::vector<int64_t>& xa_dims, const std::string& out_name, AudioRunResult* out,
+                       std::string* why, DecoderStepCache* cache);
+
 }  // namespace onebit::npu::pack_import

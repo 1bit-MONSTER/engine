@@ -363,7 +363,8 @@ std::string projection_group_key(const OnnxGraphInfo& g, const std::vector<size_
 }
 
 bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, const std::string& out_name, AudioRunResult* out,
-                    std::string* why, AudioGemm* dev = nullptr) {
+                    std::string* why, AudioGemm* dev = nullptr, DecoderStepCache* sc = nullptr,
+                    const std::string& variant_input = std::string()) {
     try {
 
         std::map<std::string, const OnnxInit*> inits;
@@ -492,6 +493,50 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
             if (!o.empty()) ++use_count[o];
         }
         if (!out_name.empty()) ++use_count[out_name];
+        // engine#1783: the decoder's step-invariant nodes (DecoderStepCache, audio_exec.h). A node is invariant when every
+        // input is an initializer, a graph input other than `variant_input` (the token window), or an invariant node's
+        // output; a node with no inputs (Constant) is invariant. The frontier -- invariant node outputs that a variant
+        // node or the fetch reads -- gets one more use, so no consumer moves it out of `t` and it can be kept after the run.
+        std::vector<char> invariant(g.nodes.size(), 0);
+        std::vector<std::string> frontier;
+        const std::string want_name = out_name.empty() ? (g.outputs.empty() ? std::string() : g.outputs[0]) : out_name;
+        const bool step_cache = sc != nullptr && !variant_input.empty();
+        if (step_cache) {
+            std::set<std::string> inv, made;
+            for (const auto& ti : g.init_tensors) inv.insert(ti.name);
+            for (const auto& in : g.inputs)
+                if (in != variant_input) inv.insert(in);
+            for (size_t i = 0; i < g.nodes.size(); ++i) {
+                bool ok = true;
+                for (const auto& in : g.nodes[i].ins)
+                    if (!in.empty() && inv.count(in) == 0) { ok = false; break; }
+                if (!ok) continue;
+                invariant[i] = 1;
+                for (const auto& o : g.nodes[i].outs)
+                    if (!o.empty()) { inv.insert(o); made.insert(o); }
+            }
+            std::set<std::string> fr;
+            for (size_t i = 0; i < g.nodes.size(); ++i)
+                if (!invariant[i])
+                    for (const auto& in : g.nodes[i].ins)
+                        if (!in.empty() && made.count(in) != 0) fr.insert(in);
+            const std::string want_out = out_name.empty() ? (g.outputs.empty() ? std::string() : g.outputs[0]) : out_name;
+            if (made.count(want_out) != 0) fr.insert(want_out);
+            frontier.assign(fr.begin(), fr.end());
+            for (const auto& nm : frontier) ++use_count[nm];
+            if (sc->filled) {
+                // start from the kept tensors: moved in here and back out after the run, never copied
+                for (auto& kv : sc->frontier) {
+                    Tensor x;
+                    x.dims = std::move(kv.second.dims);
+                    x.data = std::move(kv.second.data);
+                    x.i64 = std::move(kv.second.i64);
+                    x.b = std::move(kv.second.b);
+                    t[kv.first] = std::move(x);
+                }
+                sc->frontier.clear();
+            }
+        }
         auto take_if_last = [&](const std::string& name) -> Tensor* {
             const auto c = use_count.find(name);
             const auto it = t.find(name);
@@ -684,8 +729,10 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         };
 
         int node_index = 0;
+        size_t skipped_invariant = 0;
         for (const auto& n : g.nodes) {
             ++node_index;
+            if (step_cache && sc->filled && invariant[size_t(node_index - 1)]) { ++skipped_invariant; continue; }
             if (fused_away[size_t(node_index - 1)]) continue;   // computed inside the fused attention above it
             const auto op_t0 = std::chrono::steady_clock::now();
             if (!n.outs.empty()) {
@@ -889,7 +936,13 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 // change nothing arithmetically, yet the check is on the group so the common case reads one weight row.
                 constexpr size_t kRowGroup = 4;
                 const size_t groups = (rows + kRowGroup - 1) / kRowGroup;
-                parallel_units(batches * groups, [&](size_t u) {
+                // engine#1783: only the unit holding the row the caller reads (DecoderStepCache::output_row)
+                size_t only_unit = size_t(-1);
+                if (sc != nullptr && sc->output_row >= 0 && batches == 1 && !n.outs.empty() && n.outs[0] == want_name &&
+                    size_t(sc->output_row) < rows)
+                    only_unit = size_t(sc->output_row) / kRowGroup;
+                parallel_units(only_unit != size_t(-1) ? size_t(1) : batches * groups, [&](size_t u) {
+                    if (only_unit != size_t(-1)) u = only_unit;
                     const size_t bi = u / groups;
                     const size_t g = u % groups;
                     std::vector<size_t> idx(bp.dims.size(), 0);
@@ -1269,8 +1322,27 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         out->folded_epilogues = folded;
         out->i64 = it->second.i64;
         out->b = it->second.b;
+        if (step_cache) {
+            for (const auto& nm : frontier) {
+                const auto ft = t.find(nm);
+                if (ft == t.end()) fail("step cache: invariant tensor '" + nm + "' was never produced");
+                DecoderStepCache::Saved s;
+                s.dims = std::move(ft->second.dims);
+                s.data = std::move(ft->second.data);
+                s.i64 = std::move(ft->second.i64);
+                s.b = std::move(ft->second.b);
+                sc->frontier[nm] = std::move(s);
+            }
+            if (!sc->filled) {
+                sc->invariant_nodes = 0;
+                for (char c : invariant) sc->invariant_nodes += size_t(c != 0);
+            }
+            sc->filled = true;
+            (void)skipped_invariant;
+        }
         return true;
     } catch (const std::exception& e) {
+        if (sc != nullptr) { sc->filled = false; sc->frontier.clear(); }
         if (why != nullptr) *why = e.what();
         return false;
     }
@@ -1299,7 +1371,7 @@ bool run_audio_graph(const OnnxGraphInfo& g, const float* mel, int64_t mel_bins,
 
 bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_tokens, const float* xa,
                        const std::vector<int64_t>& xa_dims, const std::string& out_name, AudioRunResult* out,
-                       std::string* why) {
+                       std::string* why, DecoderStepCache* cache) {
     if (g.inputs.size() < 1) {
         if (why != nullptr) *why = "graph declares no input";
         return false;
@@ -1319,7 +1391,13 @@ bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_
         x.data.assign(xa, xa + nelem(xa_dims));
         seed[g.inputs[1]] = std::move(x);
     }
-    return run_graph_impl(g, std::move(seed), out_name, out, why);
+    return run_graph_impl(g, std::move(seed), out_name, out, why, nullptr, cache, cache != nullptr ? g.inputs[0] : std::string());
+}
+
+bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_tokens, const float* xa,
+                       const std::vector<int64_t>& xa_dims, const std::string& out_name, AudioRunResult* out,
+                       std::string* why) {
+    return ONEBIT_JOIN(tu_, ONEBIT_AUDIO_TU_SUFFIX)::run_decoder_graph(g, tokens, n_tokens, xa, xa_dims, out_name, out, why, nullptr);
 }
 
 

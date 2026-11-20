@@ -319,6 +319,42 @@ int main() {
     // leaves the reserve free -- and that a pool small enough to be a sixteenth of the load is still refused by it.
     need.gpu   = true;              // the arms below are about the GTT ceiling, and an earlier arm leaves this cleared
     need.total = 60ull << 30;
+    // engine#2986: the knob is the escape hatch for an operator on a small box -- "give me more headroom than a quarter"
+    // -- and the precedence in mem_admit.h states it once ("the explicit knob, then the 16 GiB cap, then a quarter of the
+    // pool") with nothing exercising it. A documented rule with no arm is a rule nobody checks, so: the knob wins over
+    // BOTH the cap and the scaling, on this box's own pool.
+    {
+        const char * old = std::getenv("GGML_HRX_GTT_RESERVE_MB");
+        std::string  keep = old ? old : "";
+        setenv("GGML_HRX_GTT_RESERVE_MB", "524288", 1);   // 512 GiB: larger than the cap AND larger than a quarter of it
+        expect("the explicit knob beats the cap and the quarter (512 GiB asked for)",
+               admit::gtt_reserve_bytes(120ull << 30) == (512ull << 30));
+        setenv("GGML_HRX_GTT_RESERVE_MB", "512", 1);
+        expect("...and a smaller one is taken as given, not raised", admit::gtt_reserve_bytes(120ull << 30) == (1ull << 29));
+        if (old) setenv("GGML_HRX_GTT_RESERVE_MB", keep.c_str(), 1);
+        else     unsetenv("GGML_HRX_GTT_RESERVE_MB");
+        expect("...and unset, the quarter is back", admit::gtt_reserve_bytes(120ull << 30) == (16ull << 30));
+    }
+
+    // The boundary the ceiling is decided by: `v.projected > v.ceiling` is strict, so a load that exactly fills the
+    // ceiling is admitted and one MiB past it is refused. That off-by-one is invisible in a table of GiB-scale rows and
+    // it is the difference between "the reserve is what must stay free" and "the reserve is a suggestion".
+    {
+        sysinfo::Memory edge = box;
+        // Host memory must not be the binding term here, or the free-memory test refuses first and the ceiling never
+        // gets a say -- which is how the first version of this arm failed: 64 GiB of RAM against a 104 GiB ceiling.
+        edge.mem_available = 200ull << 30;
+        edge.gtt_used      = 0;
+        const uint64_t ceiling = admit::gtt_reserve_bytes(edge.gtt_total) ? edge.gtt_total - admit::gtt_reserve_bytes(edge.gtt_total) : 0;
+        need.gpu   = true;
+        need.total = ceiling;
+        v = admit::judge(need, edge);
+        expect("a load that exactly fills the ceiling is admitted", v.fits && !v.over_ceiling);
+        need.total = ceiling + (1ull << 20);
+        v = admit::judge(need, edge);
+        expect("...and one MiB past it is refused", !v.fits && v.over_ceiling);
+    }
+
     sysinfo::Memory small = box;
     small.gtt_total = 8ull << 30;   // was "smaller than the reserve": now 2 GiB reserved, 6 GiB ceiling
     small.gtt_used = 0;

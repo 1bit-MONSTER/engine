@@ -169,6 +169,9 @@ Consequences worth knowing:
 - a box already holding more than the ceiling of GTT (another serve, another agent) refuses even a
   small load - that is the intended behaviour: the wall is the wall, and `GGML_HRX_GTT_RESERVE_MB`
   or freeing the other process is the way out;
+- `GGML_HRX_GTT_RESERVE_MB` must be a whole, non-negative number of MiB (whitespace around it is fine); any
+  other value - empty, `16GiB`, `-1` - is ignored and the default reserve applies, in serve and in ggml-hrx
+  alike. Until engine#2986 an empty or mistyped value silently set the reserve to 0.
 - `--no-mem-check` (or `ONEBIT_MEM_CHECK=0`) still skips all of it, ceiling included.
 
 - `--no-mem-check` (or `ONEBIT_MEM_CHECK=0`) skips the check.

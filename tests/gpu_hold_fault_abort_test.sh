@@ -46,8 +46,12 @@ WRAP
 chmod +x "$scratch/wrapper.sh"
 
 run() {   # $1 arm  $2 payload seconds  $3 inject fault (1/0)  $4 GPU_HOLD_FAULT_ABORT, or "unset" to leave it out
-          # $5 the fault line to inject (default: the 11-13 gfxhub page fault)
-    local q=$scratch/q$1; mkdir -p "$q"; : > "$scratch/klog$1"; rm -f "$scratch/deep.pid"
+          # $5 the fault line to inject (default: the 11-13 gfxhub page fault)  [$6 = npu: an NPU ticket]
+    # engine#2961: the fault is scoped to the ticket's device, declared by its queue (npu-hold passes $HOLD/npu-queue),
+    # so an arm injecting an amdxdna fault must hold an NPU ticket or it is asserting the old behaviour.
+    local q=$scratch/q$1
+    [ "${6:-}" = npu ] && q=$scratch/q$1/npu-queue
+    mkdir -p "$q"; : > "$scratch/klog$1"; rm -f "$scratch/deep.pid"
     printf '%s\n' "kernel: usb 1-1: new device" > "$scratch/klog$1"
     local line=${5:-"kernel: amdgpu 0000:c5:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:9 pasid:26332)"}
     if [ "$3" = 1 ]; then
@@ -72,8 +76,13 @@ echo 40000 > "$scratch/tctl"   # 40 C, in millidegrees
 # script: an NPU ticket's only look at the log before work starts is this check, so `amdxdna` faults have to count.
 # Each arm runs the real hold against a klog file with a 10-minute take-time window and the during-hold watch OFF, so
 # what is being tested is the refusal and nothing else.
-take_run() {   # $1 arm name  $2 the kernel-log line (or "clean")
-    local q=$scratch/tq$1; mkdir -p "$q"; rm -f "$scratch/TTOKEN$1"
+take_run() {   # $1 arm name  $2 the kernel-log line (or "clean")  [$3 = npu, for a fault this ticket should own]
+    # engine#2961: a ticket's device is declared by its queue (npu-hold execs gpu-hold with $HOLD/npu-queue), so an
+    # arm that expects an NPU fault to refuse must queue on an NPU queue. Without that the arm asserts the old
+    # behaviour -- any fault on the box refuses anything -- which is the defect the scoping removed.
+    local q=$scratch/tq$1
+    [ "${3:-}" = npu ] && q=$scratch/tq$1/npu-queue
+    mkdir -p "$q"; rm -f "$scratch/TTOKEN$1"
     : > "$scratch/tklog$1"
     printf '%s\n' "kernel: amdgpu 0000:c5:00.0: [drm] Initialized" > "$scratch/tklog$1"
     [ "$2" = clean ] || printf '%s\n' "$2" >> "$scratch/tklog$1"
@@ -138,7 +147,7 @@ env GPU_HOLD_KLOG_FILE="$scratch/tklogevents" GPU_QUEUE_DIR="$q" GPU_TOKEN_FILE=
     timeout 60 "$hold" -t 1 -l takeevents -- true > /dev/null 2>&1
 erc=$?
 [ "$erc" = 78 ] || { echo "FAIL take-time events: rc $erc, want 78 (the refusal must still fire)"; fail=1; }
-grep -q "2 amdgpu/MES/amdxdna fault event(s)" "$scratch/tlogevents" \
+grep -q "2 GPU fault event(s)" "$scratch/tlogevents" \
     || { echo "FAIL take-time events: 8 lines across 2 timestamps must read as 2 events: $(grep -o '[0-9]* amdgpu[^.]*' "$scratch/tlogevents" | head -1)"; fail=1; }
 grep -q "across 8 matching line(s)" "$scratch/tlogevents" \
     || { echo "FAIL take-time events: the line count must still be printed beside the event count"; fail=1; }
@@ -146,11 +155,11 @@ grep -q "the event count is the one to read" "$scratch/tlogevents" \
     || { echo "FAIL take-time events: the message must say which of the two numbers to read"; fail=1; }
 
 # the NPU spelling: this is the line the rules say to stop for, and npu-hold has no other take-time check
-take_run npu "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* command timeout: opcode 0x2"
+take_run npu "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* command timeout: opcode 0x2" npu
 [ "$trc" = 78 ] || { echo "FAIL take-time: an amdxdna command timeout -> rc $trc, want 78 (the NPU rule)"; fail=1; }
 [ "$ttok" = released ] || { echo "FAIL take-time: the token was still held after an NPU refusal"; fail=1; }
 
-take_run powercycle "kernel: amdxdna 0000:c6:00.1: [drm] power-cycle"
+take_run powercycle "kernel: amdxdna 0000:c6:00.1: [drm] power-cycle" npu
 [ "$trc" = 78 ] || { echo "FAIL take-time: an amdxdna power-cycle -> rc $trc, want 78"; fail=1; }
 
 # engine#2494 (cl-infra 11-15): the take-time pattern was a separate copy that lacked these two, so the ticket after a
@@ -193,7 +202,10 @@ mkdir -p "$scratch/agebin2"; t1=$(( $(date +%s) - 600 )); t2=$(( $(date +%s) - 1
 printf '#!/bin/bash\nprintf "%s kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_error_worker: fault at 0x0\\n" %s\nprintf "%s kernel: amdxdna 0000:c6:00.1: aie2_tdr_recover_all: TDR recovery throttled: last power-cycle 45560 ms ago; no context touched\\n" %s\n' "$t1" "$t1" "$t2" "$t2" > "$scratch/agebin2/journalctl"
 chmod +x "$scratch/agebin2/journalctl"
 rm -f "$scratch/age-token2"
-env PATH="$scratch/agebin2:$PATH" HOME=$scratch ONEBIT_HOLD_DIR="$scratch/agehold2" GPU_HOLD_COOLDOWN=0 \
+# an NPU queue: the arms below are about an amdxdna fault's AGE and the notice beside it, and since engine#2961 a
+# ticket is only refused by a fault on its own device -- declared, as always, by the queue it is queued on.
+env PATH="$scratch/agebin2:$PATH" HOME=$scratch ONEBIT_HOLD_DIR="$scratch/agehold2" \
+    GPU_QUEUE_DIR="$scratch/agehold2/npu-queue" GPU_TOKEN_FILE="$scratch/agehold2/npu-token" GPU_HOLD_COOLDOWN=0 \
     GPU_HOLD_WAIT=5 GPU_HOLD_MINUTES=1 GPU_HOLD_THERMAL_FLAG="$scratch/x" GPU_HOLD_RESET_WINDOW_MIN=10 \
     timeout 60 "$hold" -l takeage2 -- true > "$scratch/tlogage2" 2>&1
 age2_rc=$?
@@ -338,12 +350,12 @@ if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then kill -9 "$deep"; fi
 #   |          retrying on the next watchdog tick; no context touched
 # The line says NO CONTEXT TOUCHED: the fault it refers to was 45 s old, and the hold it ended belonged to another
 # lane's job. A bookkeeping line must not abort a hold; the events it summarises must still abort.
-run 6 600 1 1 "kernel: amdxdna 0000:c6:00.1: [drm] aie2_tdr_recover_all: TDR recovery throttled: last power-cycle 45560 ms ago (< 60000 ms), retrying on the next watchdog tick; no context touched"
+run 6 600 1 1 "kernel: amdxdna 0000:c6:00.1: [drm] aie2_tdr_recover_all: TDR recovery throttled: last power-cycle 45560 ms ago (< 60000 ms), retrying on the next watchdog tick; no context touched" npu
 if [ "$rc" = 78 ]; then echo "FAIL arm 6: a recovery-throttle notice (\"no context touched\") aborted the hold"; fail=1; fi
-run 7 600 1 1 "kernel: amdxdna 0000:c6:00.1: [drm] aie2_tdr_recover_all: Array stopped dispatching, power-cycling NPU to recover"
+run 7 600 1 1 "kernel: amdxdna 0000:c6:00.1: [drm] aie2_tdr_recover_all: Array stopped dispatching, power-cycling NPU to recover" npu
 if [ "$rc" != 78 ]; then echo "FAIL arm 7: a real power-cycle event did not abort (rc $rc)"; fail=1; fi
 
-run 5 600 1 1 "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_error_worker: fault at 0x00000000"
+run 5 600 1 1 "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_error_worker: fault at 0x00000000" npu
 if [ "$rc" != 78 ]; then echo "FAIL arm 5: rc $rc after an amdxdna fault line, want 78"; fail=1; fi
 grep -q "newest line is from the NPU" "$scratch/log5" || { echo "FAIL arm 5: the abort does not name the NPU as the faulting device"; fail=1; }
 grep -q "newest line is from the GPU" "$scratch/log1" || { echo "FAIL arm 1: the abort does not name the GPU as the faulting device"; fail=1; }

@@ -38,6 +38,12 @@ add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold
 # when the token is taken; the 11-13 crash was nine resets inside two tickets. The kernel log is a fixture file.
 add_test(NAME gpu_hold_fault_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_fault_abort_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 
+# engine#2961: one device's fault must not refuse the other device's ticket. Both consumers of the one fault regex (the
+# take-time refusal and the during-hold watch) read every device on the box, so an amdxdna (NPU) fault refused two GPU
+# tickets for ten minutes on 2026-11-20 and neither victim was touching the NPU. The ticket declares its device by the
+# queue it is queued on (npu-hold execs gpu-hold with $HOLD/npu-queue). Kernel log is a fixture file; no device.
+add_test(NAME gpu_hold_device_scope COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_device_scope_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+
 # CODER-LLM-TICKETED 2026-11-15 (engine#2494): the PR-Agent model (coder-llm, :8090) runs only inside a gpu-hold ticket,
 # in on-demand windows. Drives scripts/coder-llm-ticketed with the real scripts/gpu-hold on a private queue and a fake
 # /slots server: no demand -> no ticket, idle -> window closes, busy -> max hold, kernel fault -> rc 78, FIFO with a lane.

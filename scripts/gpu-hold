@@ -115,6 +115,25 @@ COOLDOWN_TCTL=${GPU_HOLD_COOLDOWN_TCTL:-85}
 # lane's hold 493 s in (GPU-HOLD.log:134, rc 78), and a real `Array stopped dispatching, power-cycling NPU to
 # recover` did not abort at all. The event is `power.?cycl(e|ing)`; the recovery notice is excluded by name.
 GPU_FAULT_RE='\[gfxhub\] page fault|amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure|failed to respond)|amdxdna.*(command timeout|power.?cycl(e|ing)|fault)'
+# WHICH DEVICE A FAULT BELONGS TO (engine#2961). Both consumers below read ONE regex over every device on the box, so an
+# amdxdna (NPU) fault refused two GPU tickets for ten minutes on 2026-11-20 -- the PR-agent LLM's own ticket and an
+# orchestrator-granted GPU window -- and neither of them was touching the NPU. The ticket already declares its device:
+# npu-hold execs this script with the NPU's own queue ($HOLD/npu-queue), so the queue path is the declaration and no new
+# option is needed. A fault on the OTHER device is reported and never refuses this ticket.
+# Both spellings npu-hold can produce: the fleet dir gives $HOLD/npu-queue, and the fallback is $HOME/NPU-QUEUE
+# (upper case). A case-sensitive test would classify that fallback as a GPU ticket -- i.e. an NPU fault would stop
+# refusing the very ticket the NPU rule exists for -- so the match is case-insensitive.
+case "$(printf '%s' "$QUEUE" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" in
+    *npu*) HOLD_DEVICE=NPU ;;
+    *)     HOLD_DEVICE=GPU ;;
+esac
+fault_for_this_device() {   # <fault line>; true when it belongs to the device this ticket is queued for
+    case "$1" in
+        *amdxdna*) [ "$HOLD_DEVICE" = NPU ] ;;
+        *)         [ "$HOLD_DEVICE" = GPU ] ;;
+    esac
+}
+
 # A line that says the driver did NOTHING ("no context touched") is not a fault: it is the throttle that follows
 # one, and it is logged for 60 s after every power-cycle, which is exactly when the next ticket is granted.
 # A FRAME, not any line that mentions an offset (engine#2799 review, twice): the flat `\+0x../0x..` alternative also
@@ -493,12 +512,35 @@ while [ "$state" = queued ]; do
                     # event count zero, i.e. it would have granted the ticket after a reset). Synthetic logs in the tests
                     # carry no timestamp, so there a line is its own event and the old behaviour is reproduced exactly.
                     _faults=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE")
+                    # engine#2961: only this ticket's device can refuse it. The OTHER device's faults are counted and
+                    # reported rather than dropped, because "nothing refused you" and "something refused you that was
+                    # not yours" must not read the same in a log -- that confusion is what cost two GPU tickets on
+                    # 2026-11-20 while the NPU recovered.
+                    _other=$(printf '%s\n' "$_faults" | while IFS= read -r _l; do
+                                 [ -n "$_l" ] && ! fault_for_this_device "$_l" && printf '%s\n' "$_l"
+                             done)
+                    _other_n=0
+                    [ -n "$_other" ] && _other_n=$(printf '%s\n' "$_other" | awk '
+                        NF == 0 { next }
+                        { if ($0 ~ /^[A-Z][a-z][a-z] +[0-9]+ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) k = $1" "$2" "$3; else k = $0
+                          if (!(k in seen)) { seen[k]; n++ } }
+                        END { printf "%d", n + 0 }')
+                    _faults=$(printf '%s\n' "$_faults" | while IFS= read -r _l; do
+                                  [ -n "$_l" ] && fault_for_this_device "$_l" && printf '%s\n' "$_l"
+                              done)
                     _reset_lines=$(printf '%s\n' "$_faults" | grep -c .)
                     _resets=$(printf '%s\n' "$_faults" | awk '
                         NF == 0 { next }   # an empty capture is ONE BLANK LINE to awk and would count as an event
                         { if ($0 ~ /^[A-Z][a-z][a-z] +[0-9]+ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) k = $1" "$2" "$3; else k = $0
                           if (!(k in seen)) { seen[k]; n++ } }
                         END { printf "%d", n + 0 }')
+                    _other_note=""
+                    [ "${_other_n:-0}" -gt 0 ] && _other_note=" (${_other_n} fault event(s) for the other device did not refuse this ${HOLD_DEVICE} ticket, engine#2961)"
+                    if [ "${_resets:-0}" = 0 ] && [ "${_other_n:-0}" -gt 0 ]; then
+                        # A GPU ticket granted beside an NPU fault is the whole point of engine#2961, and it must not be
+                        # silent: a reader who later sees the ticket held needs to know the log was not clean.
+                        log "note: ${_other_n} fault event(s) for the other device in the last ${_reset_window} min do not refuse this ${HOLD_DEVICE} ticket (engine#2961)"
+                    fi
                     if [ "${_resets:-0}" -gt 0 ]; then
                         rm -f "$TOKEN"; state=done
                         # HOW OLD is the newest one? "in the last 10 min" cannot tell a wedged device from another lane's
@@ -538,7 +580,7 @@ while [ "$state" = queued ]; do
                         [ -n "$_proc" ] && _who=", and the driver last named ${_proc}"
                         _lines_note=""
                         [ "${_reset_lines:-0}" != "${_resets:-0}" ] && _lines_note=" across ${_reset_lines} matching line(s) -- a reset backtrace matches on every frame, so the event count is the one to read"
-                        log "::error::refusing: ${_resets} amdgpu/MES/amdxdna fault event(s) in the last ${_reset_window} min${_lines_note}${_age} - the newest is ${_what}${_first}${_who}. The ticket is released unheld; inspect the kernel log, then retry"
+                        log "::error::refusing: ${_resets} ${HOLD_DEVICE} fault event(s) in the last ${_reset_window} min${_lines_note}${_age} - the newest is ${_what}${_first}${_who}. The ticket is released unheld; inspect the kernel log, then retry${_other_note}"
                         printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -3
                         exit 78
                     fi
@@ -730,7 +772,11 @@ fault_lines() {
         cat "$GPU_HOLD_KLOG_FILE" 2> /dev/null
     else
         journalctl -k --since "@$started" --no-pager -q 2> /dev/null
-    fi | grep -iE "$FAULT_RE" | grep -viE "$GPU_FAULT_SKIP_RE"
+    fi | grep -iE "$FAULT_RE" | grep -viE "$GPU_FAULT_SKIP_RE" | while IFS= read -r _l; do
+        # engine#2961: a fault on the OTHER device must not end this hold either -- aborting a running GPU ticket
+        # because the NPU power-cycled is the same defect as refusing it before it started, with more work lost.
+        [ -n "$_l" ] && fault_for_this_device "$_l" && printf '%s\n' "$_l"
+    done
 }
 
 # WHAT THE TICKET HELD ON THE DEVICE, recorded at the moment a fault ends it (engine#2494). Every post-mortem of this

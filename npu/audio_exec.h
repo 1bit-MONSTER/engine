@@ -58,6 +58,9 @@ struct AudioRunResult {
     std::vector<float> data;        // row-major f32 payload
     std::vector<int64_t> i64;       // int64 payload, when the requested tensor is an index/token tensor
     std::vector<uint8_t> b;         // bool payload, when it is a mask
+    // engine#1783: how many MatMul -> Softmax -> MatMul groups this run computed fused, so a test or a measurement can
+    // state which attention path it took (0 = node by node, e.g. ONEBIT_AUDIO_FUSED_ATTN=0).
+    size_t fused_attention_groups = 0;
 };
 
 // Two entry points, because a Whisper pack has two graphs: the encoder consumes the mel window as f32, the decoder consumes

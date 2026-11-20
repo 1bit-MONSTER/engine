@@ -36,6 +36,13 @@ set -uo pipefail
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
 
 base=origin/main
+# engine#2902: a removed diagnostic only reddens where the message IS the product. gpu-hold's queue
+# messages are what every lane reads when a ticket is released unheld (a bundled PR removed exactly that
+# in #2825), so a diff touching that script is checked with --strict-warnings; every other diff keeps the
+# default, where a deleted debug print is not a loss. Measured: 0 of 3 removed diagnostic lines were even
+# candidates before the family existed.
+strict=""
+git diff --name-only "$base"...HEAD 2>/dev/null | grep -qx "scripts/gpu-hold" && strict=" --strict-warnings"
 list_only=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -76,7 +83,7 @@ checks=(
     # engine#2429: a refusing/asserting condition deleted in the diff with nothing replacing it. Calibrated on 15
     # open PR heads (one spurious hit, fixed by the head-tree search) and on the real llama.cpp#371 diff; exit 2 when
     # it cannot read the refs, so "cannot tell" is never a pass.
-    "tools/ci/guard_loss_check.py --check --base $base"
+    "tools/ci/guard_loss_check.py --check --base $base$strict"
     # engine#2416: the HIP add-on's f16 audit over $GPU_KERNELS_DIR (or third_party/gpu-kernels) at the pin; with no
     # tree it exits 77 and is listed as `skip`, never `ok`
     "tools/ci/hip_f16_audit.py --find ."

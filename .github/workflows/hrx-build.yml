@@ -169,7 +169,28 @@ jobs:
           # FAIL, not a skip. Pass the runtime this configure resolved (cmake/hrx.cmake:137, engine#1766).
           export IREE_HAL_AMDGPU_LIBHSA_PATH="$(sed -n 's/^ONEBIT_HRX_LIBHSA:FILEPATH=//p' "$HRX_BUILD/CMakeCache.txt")"
           echo "fork tests: HSA runtime $IREE_HAL_AMDGPU_LIBHSA_PATH"
-          ctest --test-dir "$HRX_BUILD" -R '^fork_ctest_known_fail$' --output-on-failure
+          # engine#3000: THE ROW IS OPT-IN AND THIS JOB NEVER OPTED IN. `fork_ctest_known_fail` is registered
+          # with SKIP_RETURN_CODE 77 and skips unless ONEBIT_FORK_CTEST=1 (it is opt-in because on a lane box
+          # without a fork tree it must not run), so the step above built 33 test binaries and then ran none of
+          # them: measured in run 44737964422, `1/1 Test #21 ... ***Skipped`, `100% tests passed` -- a green tick
+          # over a suite nothing executed, one layer up from engine#2761's complaint. This job IS the place the
+          # opt-in was written for, so it opts in.
+          #
+          # Cost, measured on the bench tree rather than argued: the ratchet excludes hrx-ops-test/test-hrx-ops/
+          # test-hrx-ops-loom (-E in fork_ctest_known_fail.sh), leaving 113 of 116 rows whose recorded cost sums
+          # to 184 s -> ~46 s wall at the script's -j 4, about 2 % of a 40-minute job.
+          row=$(ONEBIT_FORK_CTEST=1 ctest --test-dir "$HRX_BUILD" -R '^fork_ctest_known_fail$' --output-on-failure 2>&1) \
+            || { printf '%s\n' "$row"; exit 1; }
+          printf '%s\n' "$row"
+          # ... and a SKIP here is a failure too, because this is the one job whose purpose is to run that row:
+          # the tree exists (the build above made it), so there is no legitimate reason to skip -- and ctest
+          # counts a skip as "not failed" ("100% tests passed" with `1/1 ... ***Skipped` is exactly how the suite
+          # ran zero rows for two days, engine#3000).
+          case "$row" in
+            *"fork_ctest_known_fail"*"***Skipped"*)
+              echo "::error::fork_ctest_known_fail SKIPPED in the one job that has an HRX tree -- the ratchet did not run (engine#3000)"
+              exit 1 ;;
+          esac
       # engine#2858: a tree that cannot say where it came from is not a measurement. On 11-18 this tree
       # reported IQ1_S prefill at 11.22 tok/s where four local builds of the same source on the same box gave
       # 56.5-56.6, with identical placement, PPL and kernel names -- and nothing recorded which lowering had

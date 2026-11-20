@@ -1555,6 +1555,17 @@ if(Python3_Interpreter_FOUND)
     # and carry the padded fixture plus the storage guard. Source only, no device. tests_referenced wants a runner.
     add_test(NAME fa_split_expectation_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/fa_split_expectation_check.py --self-test)
     set_tests_properties(fa_split_expectation_check PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # engine#2925: the row above runs `--self-test`, which proves the tool's fixtures -- so the invariant the tool was
+    # written for ("every decode-split expectation has the padded fixture AND the matcher compares storage against the
+    # padded capacity") was evaluated nowhere on main. This is the real check. `--root` is the FORK, not the engine
+    # tree: both paths it joins are fork-relative (`tests/hrx-ops-test.cpp`, `ggml/src/ggml-hrx/.../dispatch-flash-
+    # attention.cpp`), and at the engine root it answers `cannot tell`. CI checks the fork out (ci.yml:110), so this row
+    # runs there; a lane without the submodule gets the tool's `cannot tell` as a red row, which is the same stance
+    # submodule_pin_check takes and is why no skip code is registered here.
+    add_test(NAME fa_split_expectation COMMAND ${Python3_EXECUTABLE}
+             ${CMAKE_SOURCE_DIR}/tools/ci/fa_split_expectation_check.py --check
+             --root ${CMAKE_SOURCE_DIR}/third_party/llama.cpp)
+    set_tests_properties(fa_split_expectation PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     add_test(NAME serve_warmup_routes COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/serve_routes_check.py ${CMAKE_SOURCE_DIR})
     # an installed package must find its libraries beside itself: the 2026-11-08 incident's rule, from
     # the installed side that no release gate can reach (engine #1411). Skips without patchelf/readelf.

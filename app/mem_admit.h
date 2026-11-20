@@ -366,6 +366,9 @@ struct Verdict {
     bool over_ceiling = false;
     uint64_t ceiling = 0, projected = 0;
     std::string ceiling_note;   // the numbers, for the refusal line
+    // fits AND leaves the HRX graph-program cache its 4 GiB (no "little room left" warning): what a default
+    // context is chosen for (engine#2986)
+    bool roomy = false;
 };
 
 // reserve: kept free for everything else (default 1 GiB)
@@ -391,12 +394,64 @@ inline Verdict judge(const Need& need, const sysinfo::Memory& mem, uint64_t rese
         }
     }
     v.fits = need.total + reserve <= v.free && !v.over_ceiling;
+    v.roomy = v.fits && !(need.gpu && need.total + reserve + 4 * kGiB > v.free);
     if (v.fits && need.gpu && need.total + reserve + 4 * kGiB > v.free)
         v.warnings.push_back("little room left for the HRX graph-program cache (it grows to 2-9 GiB as prompt shapes vary)");
     if (v.fits && need.gpu && mem.has_gtt && mem.gtt_used + need.total >= 95 * kGiB)
         v.warnings.push_back("GTT use after this load (~" + gib(mem.gtt_used + need.total) +
                              " GiB) is in the zone where engine #315's faults were seen (>= 95 GiB)");
     return v;
+}
+
+// engine#2986: the context serve gives an HRX llama-server that has no --ctx-size. llama-server takes the
+// model's own context then (HRX0 reports its whole pool free, so --fit does not shrink it), and a model
+// whose own context is far beyond the machine - LFM3-1.7B's 262,144 on a 16 GB laptop - either does not
+// fit or leaves no room for what grows after load. The rule: the model's own context when its plan is
+// roomy (fits and keeps the graph-program cache's 4 GiB); otherwise the largest context, in 256-token
+// steps, whose plan is roomy; when none is, the floor - the context that leaves the most room - and if
+// even that does not fit, the normal refusal names it. ctx == 0 means "leave the command line alone": an explicit --ctx-size, a CPU backend,
+// a box that does not report its memory, or a model whose own context is roomy or not above the floor.
+constexpr long long kDefaultCtxFloor = 4096;
+
+struct CtxChoice {
+    long long ctx = 0;                // the context to pass, 0 = none
+    long long model_ctx = 0;          // the model's own
+    uint64_t need_model = 0, need_ctx = 0;
+    bool roomy = false;               // the chosen context keeps the program cache's room (false: the floor, which may not even fit)
+};
+
+inline CtxChoice default_ctx(const std::vector<std::string>& argv, const sysinfo::Memory& mem,
+                             long long floor = kDefaultCtxFloor) {
+    CtxChoice c;
+    bool gpu = false;
+    for (size_t i = 0; i < argv.size(); i++) {
+        if (argv[i] == "-c" || argv[i] == "--ctx-size") return c;   // the user's context wins, refused or not
+        if ((argv[i] == "--device" || argv[i] == "-dev") && i + 1 < argv.size() && argv[i + 1].rfind("HRX", 0) == 0) gpu = true;
+    }
+    if (!gpu || !mem.has_meminfo || !mem.has_gtt) return c;
+    auto plan = [&](long long ctx) {
+        Need n;
+        std::vector<std::string> a = argv;
+        if (ctx > 0) { a.push_back("-c"); a.push_back(std::to_string(ctx)); }
+        add_llama_server(n, a);
+        return n;
+    };
+    const Need whole = plan(0);
+    if (whole.parts.empty() || whole.n_ctx <= floor) return c;
+    c.model_ctx = whole.n_ctx;
+    c.need_model = whole.total;
+    if (judge(whole, mem).roomy) return c;
+    // the largest k*256 in [floor, model ctx) whose plan is roomy; the plan grows with the context
+    long long lo = (floor + 255) / 256, hi = (whole.n_ctx - 1) / 256, ctx = 0;
+    while (lo <= hi) {
+        const long long mid = lo + (hi - lo) / 2;
+        if (judge(plan(mid * 256), mem).roomy) { ctx = mid * 256; lo = mid + 1; } else hi = mid - 1;
+    }
+    c.roomy = ctx > 0;
+    if (ctx == 0) ctx = floor;
+    c.ctx = ctx;
+    c.need_ctx = plan(ctx).total;
+    return c;
 }
 
 }  // namespace onebit::admit

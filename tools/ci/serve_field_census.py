@@ -45,10 +45,11 @@ FIELDS = (
 )
 
 # A field that is genuinely accepted and discarded, with the issue that owns the fix. Reported as a warning so a
-# reader sees it and a check stays green only while the debt is named.
-UNOWNED = {
-    "cache_prompt": "engine#2889 (the prefix cache ignores the caller's opt-out)",
-}
+# reader sees it and a check stays green only while the debt is named -- and reported the other way too, because an
+# allowance whose debt is PAID is a lie that costs nothing to keep until someone needs UNOWNED to mean something.
+# `cache_prompt` was the only entry; engine#2889 (merged 11-20 06:22Z) taught the route to read it, so the entry is
+# gone and `stale_allowances()` is what stops the next one from outliving its fix.
+UNOWNED = {}
 
 # Keys that are deliberately not read as body keys, with what reads them instead. Each one is a decision, not an
 # omission, and a reader can check the reason against the source.
@@ -107,6 +108,11 @@ def report(result):
         print(f"{key:22s} {state}{note}")
 
 
+def stale_allowances(result):
+    """UNOWNED keys whose field is no longer `ignored`: the debt was paid and the entry is now a fiction."""
+    return [k for k in UNOWNED if result.get(k) != "ignored"]
+
+
 def check(root):
     route, options = pathlib.Path(root) / ROUTE, pathlib.Path(root) / OPTIONS
     missing = [str(p) for p in (route, options) if not p.is_file()]
@@ -115,6 +121,12 @@ def check(root):
         return 2
     result = census(route.read_text(errors="replace"), options.read_text(errors="replace"))
     report(result)
+    stale = stale_allowances(result)
+    for key in stale:
+        print(f"serve_field_census: the allowance for {key} is no longer needed -- the field is {result[key]} on this "
+              f"tree, so remove it from UNOWNED ({UNOWNED[key]})", file=sys.stderr)
+    if stale:
+        return 1
     escaped = [k for k, v in result.items() if v == "ignored" and k not in UNOWNED]
     if escaped:
         print(f"serve_field_census: {len(escaped)} field(s) accepted and discarded: {', '.join(escaped)}", file=sys.stderr)
@@ -149,6 +161,22 @@ def self_test():
         "a bare assignment is not a read of the request's key")
 
     arm(census("", "", ("anything",))["anything"] == "ignored", "an empty route ignores everything")
+
+    # The allowance mechanism (engine#2889): an entry is for a field that is `ignored`, and it must be reported once
+    # the field is read -- otherwise UNOWNED can only grow, and the next entry inherits a precedent that never expires.
+    saved = dict(UNOWNED)
+    try:
+        UNOWNED.clear()
+        UNOWNED["paid"] = "engine#0000 (a debt that was paid)"
+        arm(stale_allowances({"paid": "read-in-route"}) == ["paid"],
+            "an allowance whose field is now read is reported stale")
+        arm(stale_allowances({"paid": "ignored"}) == [], "...and one still ignored is not")
+        arm(stale_allowances({"paid": "refused"}) == ["paid"],
+            "a field that became a named refusal also pays the debt")
+    finally:
+        UNOWNED.clear()
+        UNOWNED.update(saved)
+
     print("ok" if bad == 0 else f"{bad} FAIL")
     return 1 if bad else 0
 

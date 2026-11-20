@@ -200,6 +200,37 @@ if(ONEBIT_GPU_PRIVATE)
     endif()
     list(APPEND _hrx_gpu_private_args "-DGGML_HRX_HIP_ADDON_DIR=${ONEBIT_GPU_PRIVATE}/addons/hip-hrx")
     message(STATUS "ONEBIT_HRX: private HIP kernels from ${ONEBIT_GPU_PRIVATE}/addons/hip-hrx")
+
+    # engine#2935: the add-on is a SEPARATE checkout, so `config/gpu-kernels.config` does not move it -- a lane can have
+    # `pin_moved` green, a clean configure and a successful build, and still get a binary that refuses to load, because
+    # the kernels compiled are from a different commit than the one this repo pins (measured twice on 2026-11-20: the
+    # add-on sat at 280f2e0037 while the pin expected bc3051d5e9, and every `1bit serve` aborted with 26 ABI mismatches).
+    # Say it at configure time, where the two values are both in hand.
+    if(NOT ONEBIT_GPU_PRIVATE_ALLOW_ANY_PIN)
+        set(_hrx_gpu_kernels_config "${CMAKE_SOURCE_DIR}/config/gpu-kernels.config")
+        set(_hrx_gpu_private_head "")
+        if(EXISTS "${_hrx_gpu_kernels_config}" AND EXISTS "${ONEBIT_GPU_PRIVATE}/.git")
+            execute_process(COMMAND git -C "${ONEBIT_GPU_PRIVATE}" rev-parse HEAD
+                            OUTPUT_VARIABLE _hrx_gpu_private_head
+                            RESULT_VARIABLE _hrx_gpu_private_rc
+                            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+            file(READ "${_hrx_gpu_kernels_config}" _hrx_gpu_kernels_pin)
+            string(REGEX MATCH "sha=([0-9a-f]+)" _hrx_gpu_pin_match "${_hrx_gpu_kernels_pin}")
+            set(_hrx_gpu_pin "${CMAKE_MATCH_1}")
+            if(_hrx_gpu_private_rc EQUAL 0 AND _hrx_gpu_pin AND
+               NOT _hrx_gpu_private_head MATCHES "^${_hrx_gpu_pin}")
+                message(FATAL_ERROR
+                    "ONEBIT_GPU_PRIVATE is not the add-on this repo pins.\n"
+                    "  config/gpu-kernels.config pins ${_hrx_gpu_pin}\n"
+                    "  ${ONEBIT_GPU_PRIVATE} is at      ${_hrx_gpu_private_head}\n"
+                    "The kernels compiled here would be from a different commit than the one the repo ships, and the\n"
+                    "add-on's ABI check refuses to load such a binary at run time (engine#2935). Either\n"
+                    "  git -C ${ONEBIT_GPU_PRIVATE} checkout ${_hrx_gpu_pin}\n"
+                    "or, to build a modified add-on deliberately, configure with -DONEBIT_GPU_PRIVATE_ALLOW_ANY_PIN=ON.")
+            endif()
+            message(STATUS "ONEBIT_HRX: add-on at ${_hrx_gpu_private_head}, matching config/gpu-kernels.config")
+        endif()
+    endif()
 endif()
 
 # engine#315 candidate 1 (docs/hrx.md, "CWSR save-area placement"): serve moves the CWSR save area

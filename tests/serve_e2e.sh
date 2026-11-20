@@ -30,6 +30,19 @@ bin=${1:?usage: serve_e2e.sh path/to/1bit <model> <device> [args]}
 model=${2:?}
 device=${3:?}
 shift 3
+# engine#3030: the NPU route needs a pack AND the device node; on any other box this row is a visible skip (77) rather
+# than an absent test, the same contract the hrx guard below keeps for a machine with no gfx1151.
+if [ "$device" = npu ]; then
+    node=none
+    for n in /dev/accel/accel0 /dev/accel0; do [ -e "$n" ] && { node=$n; break; }; done
+    if [ "$node" = none ]; then
+        echo "skip: no NPU device (/dev/accel/accel0) on this machine"; exit 77
+    fi
+    # the model is a Q4NX pack DIRECTORY, not a GGUF: name what is missing rather than letting serve fail to load it
+    if [ ! -d "$model" ]; then
+        echo "skip: $model is not a Q4NX pack directory (ONEBIT_SERVE_TEST_PACK)"; exit 77
+    fi
+fi
 if [ "$device" = hrx ]; then
     have=$("$(cd "$(dirname "$0")/.." && pwd)/scripts/gpu-targets.sh" 2>/dev/null | tr '\n' ' ')
     want=${ONEBIT_HRX_E2E_TARGETS:-gfx1151}

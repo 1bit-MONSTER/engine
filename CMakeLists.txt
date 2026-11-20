@@ -1188,6 +1188,17 @@ if(ONEBIT_HRX)
 
 endif()
 
+    # engine#3030: the NPU serve route had no row at all, so engine#3009 (`--port 0` announced port 0 on that route,
+    # which made every `npu` row of registry/check_models.tsv time out) could come back with every job green. Registered
+    # outside `if(ONEBIT_HRX)` like the two below, because the NPU lane does not need the HRX route; a Q4NX PACK is a
+    # directory and not a GGUF, hence its own cache var. Only a configure that names a pack ever sees this row, so CI
+    # never does and no tools/ci/ctest_skips.txt entry is implied; a box with a pack but no device skips (77).
+    if(ONEBIT_NPU AND ONEBIT_SERVE_TEST_PACK)
+        add_test(NAME serve_e2e_npu
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_PACK} npu)
+        set_tests_properties(serve_e2e_npu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     # engine#1779: these two are registered OUTSIDE both `if(ONEBIT_SERVE_TEST_GGUF)` and `if(ONEBIT_HRX)` on purpose.
     # Inside the GGUF guard they did not exist in CI at all (a configure-time cache path CI never sets: the build job
     # runs 164 tests and none of the serve_* family is among them, so a gap in the family looked like coverage), and

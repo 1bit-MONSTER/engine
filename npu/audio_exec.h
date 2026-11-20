@@ -116,7 +116,9 @@ struct DecoderStepCache {
     size_t invariant_nodes = 0;              // nodes a filled run skips
     // The one row (position) of the graph output the caller reads, -1 = all. The MatMul that makes the output (whisper's
     // vocabulary projection, 128 x 768 x 51865) then runs only the four-row unit holding that row: the same unit and the
-    // same code as a full run, so that row's bytes are unchanged. Every other row of the output is left 0.
+    // same code as a full run, so that row's bytes are unchanged. PRECONDITION: the caller reads that row only. Every
+    // other row of the output was never computed (left 0 here), so a logits dump, a beam or a sampler over other rows
+    // must leave this at -1.
     int64_t output_row = -1;
 };
 bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_tokens, const float* xa,

@@ -1103,6 +1103,14 @@ add_test(NAME pm_routes COMMAND pm_routes_test)
 # ── `1bit serve` end to end (docs/serve.md) ───────────────────────────────
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.
 set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
+# engine#3023: the NPU route serves a Q4NX PACK DIRECTORY rather than a GGUF, and the row below is registered OUTSIDE the
+# GGUF/HRX guards on purpose. Registering it only where a pack was at hand is how the NPU serve path came to have no row at
+# all, and how engine#3009 (`--port 0` announcing the port it was asked for) reached main on a green CI: the script skips
+# (77) when this is empty, so every configure has the row and every machine says plainly whether it ran.
+set(ONEBIT_SERVE_TEST_NPU_PACK "" CACHE PATH "Q4NX pack directory the serve_e2e_npu row loads")
+add_test(NAME serve_e2e_npu
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> "${ONEBIT_SERVE_TEST_NPU_PACK}" npu)
+set_tests_properties(serve_e2e_npu PROPERTIES SKIP_RETURN_CODE 77)
 
 # ── ONNX Runtime in-process (docs/onnx.md) ───────────────────────────────
 # Off by default: it needs the libonnxruntime 1.23.2 dev package (pkg-config libonnxruntime) and

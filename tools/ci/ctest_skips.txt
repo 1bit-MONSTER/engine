@@ -35,3 +35,4 @@ whisper_transcribe_jfk_lv3   # returns 77: no pack or wav (ONEBIT_TEST_WHISPER_P
 laya_finetune   # returns 77: needs torch + numpy, which the build container does not install (engine#1313 item 3)
 hip_f16_audit   # returns 77: needs a gpu-kernels checkout at the pin; the build job initialises llama.cpp only
 token_rate_floor_device   # returns 77: needs a device, a model and a gpu-hold ticket: it judges a real 1bit serve rate
+serve_e2e_npu   # returns 77: ONEBIT_SERVE_TEST_NPU_PACK is unset in CI. The row exists in EVERY configure on purpose (engine#3023): the hrx/cpu rows are registered only inside if(ONEBIT_SERVE_TEST_GGUF), so a machine without that variable had no row at all, and the NPU serve path was covered by nothing. Measured where a pack and an NPU exist: one npu-hold ticket, `1/1 Test #184: serve_e2e_npu … Passed 38.14 sec`, 0 new IO_PAGE_FAULT lines

@@ -72,7 +72,7 @@ PAGE = 100
 # fleet writes a claim, and the old pattern stopped at the `**` -- so such a PR counted as a bare mention and went
 # missing from "claimed by" lists (measured on #3047: its body reads `Closes **#3041**`). Backticks are deliberately
 # NOT matched: a claim inside a code span is documentation, which `claims()` already strips.
-CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*[*_`]*\s*#(\d+)', re.I)
+CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*[*_]*\s*#(\d+)', re.I)
 
 # engine#2842: `Refs #N` is a claim too, but a WEAKER one. Almost every PR reviewed on 2026-11-16/17 said `Refs` rather than
 # `Fixes` -- because a PR that fixes part of an issue must not close it -- so reading closing keywords only made the common
@@ -80,7 +80,7 @@ CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*[*_`]*
 # other failure: `Refs` is also used for context, and a pair that merely mentions the same issue is not a duplicate. So a
 # ref pair counts only when the two PRs also TOUCH OVERLAPPING FILES -- the same "overlap, not issue-claim" rule the review
 # of #2809 asked for on the false-positive side, which makes one rule serve both directions.
-REF = re.compile(r'\brefs?\b\s*:?\s*[*_`]*\s*#(\d+)', re.I)
+REF = re.compile(r'\brefs?\b\s*:?\s*[*_]*\s*#(\d+)', re.I)
 
 
 # A claim written INSIDE code is documentation, not a claim. The PRs most likely to contain `Fixes #12` are the ones

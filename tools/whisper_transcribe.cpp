@@ -336,7 +336,7 @@ int main(int argc, char** argv) {
         const auto tw_mel = std::chrono::steady_clock::now();
         AudioRunResult xa;
 #ifdef ONEBIT_WHISPER_NPU
-        const double dev_ms0 = dev_hook != nullptr ? npu_dev.gemm->device_ms() : 0.0;
+        double dev_ms0 = 0.0;
 #endif
         // engine#2399: ONEBIT_AUDIO_NODE_TIMES=1 prints per-node lines for the whole run, which is encoder PLUS a
         // 25-token decode -- and the decode's GEMMs are M=1, so their MatMul rows swamp the encoder's. This marker
@@ -347,6 +347,35 @@ int main(int argc, char** argv) {
             std::fprintf(stdout, "[audio-graph] encoder\n");
             std::fflush(stdout);   // the node lines go to stderr; without this they interleave after the marker
         }
+        // engine#1783: ONEBIT_WHISPER_ENCODE_REPEAT=<n> runs this window's encoder n extra times first and prints each
+        // pass, so the one-time costs of the first pass (weight padding, int8 packing and upload into the target's cache)
+        // are told apart from what every later window pays. The pass that feeds the decoder is the last one, and the
+        // encoder time and split below are that pass alone.
+        if (const char* rep = std::getenv("ONEBIT_WHISPER_ENCODE_REPEAT")) {
+            for (int r = 0, n = std::atoi(rep); r < n; ++r) {
+                AudioRunResult tmp;
+                const auto r0 = std::chrono::steady_clock::now();
+                double dev_s = 0.0;
+#ifdef ONEBIT_WHISPER_NPU
+                const double d0 = dev_hook != nullptr ? npu_dev.gemm->device_ms() : 0.0;
+#endif
+                if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &tmp, &why, dev_hook)) {
+                    std::fprintf(stderr, "encoder (window %zu, repeat %d): %s\n", w, r, why.c_str());
+                    return 1;
+                }
+                const double pass_s = secs(r0, std::chrono::steady_clock::now());
+#ifdef ONEBIT_WHISPER_NPU
+                if (dev_hook != nullptr) dev_s = (npu_dev.gemm->device_ms() - d0) / 1000.0;
+                if (dev_hook != nullptr && npu_dev.target->profiling()) npu_dev.target->dump_profile();
+#endif
+                std::printf("encoder repeat %d: %.3f s (device_gemm %.3f s, rest %.3f s)\n", r, pass_s, dev_s, pass_s - dev_s);
+                std::fflush(stdout);
+            }
+        }
+        const auto tw_enc0 = std::chrono::steady_clock::now();
+#ifdef ONEBIT_WHISPER_NPU
+        dev_ms0 = dev_hook != nullptr ? npu_dev.gemm->device_ms() : 0.0;
+#endif
         if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why, dev_hook)) {
             std::fprintf(stderr, "encoder (window %zu): %s\n", w, why.c_str());
             return 1;
@@ -356,8 +385,9 @@ int main(int argc, char** argv) {
         if (dev_hook != nullptr) {
             // The split the issue is scored on, from this run: the wall inside gemv against everything else in this window's
             // encoder pass. device_ms() accumulates over the process, so a window's share is the difference.
-            const double enc_ms = std::chrono::duration<double, std::milli>(tw_enc - tw_mel).count();
+            const double enc_ms = std::chrono::duration<double, std::milli>(tw_enc - tw_enc0).count();
             const double dev_ms = npu_dev.gemm->device_ms() - dev_ms0;
+            if (npu_dev.target->profiling()) npu_dev.target->dump_profile();
             std::printf("encoder split: device_gemm=%.3f s + host_remainder=%.3f s per window (window %zu; %d product(s) on the "
                         "device in %d launch(es) so far, %d on the host)\n",
                         dev_ms / 1000.0, (enc_ms - dev_ms) / 1000.0, w, dev_hook->device, npu_dev.gemm->launches(),
@@ -373,7 +403,12 @@ int main(int argc, char** argv) {
         // It sits AFTER the ONEBIT_WHISPER_NPU block on purpose: the device_gemm/host_remainder split is the number
         // this issue is scored on, so the mode has to return after printing it rather than before.
         if (std::getenv("ONEBIT_WHISPER_ENCODE_ONLY") != nullptr) {
-            std::printf("encode-only: encoder %.3f s (decode skipped)\n", secs(tw_mel, tw_enc));
+            // FNV-1a over the encoder output bytes, so two runs (an A/B, a device and a host arm) can be compared exactly.
+            uint64_t h = 1469598103934665603ULL;
+            const unsigned char* pb = reinterpret_cast<const unsigned char*>(xa.data.data());
+            for (size_t i = 0; i < xa.data.size() * sizeof(float); ++i) h = (h ^ pb[i]) * 1099511628211ULL;
+            std::printf("encode-only: encoder %.3f s (decode skipped), output fnv %016llx\n", secs(tw_enc0, tw_enc),
+                        (unsigned long long)h);
             return 0;
         }
         if (w == 0) {
@@ -414,16 +449,16 @@ int main(int argc, char** argv) {
         }
         const auto tw_dec = std::chrono::steady_clock::now();
         mel_s += secs(tw0, tw_mel);
-        enc_s += secs(tw_mel, tw_enc);
+        enc_s += secs(tw_enc0, tw_enc);
         dec_s += secs(tw_enc, tw_dec);
         if (w == 0) {
             ttft_mel_s = secs(t_start, tw_mel);
-            ttft_enc_s = secs(tw_mel, tw_enc);
+            ttft_enc_s = secs(tw_enc0, tw_enc);
             ttft_s = secs(t_start, tw_enc);
         }
         if (n_windows > 1 || full)
             std::printf("window %zu: mel %.3f s, encoder %.3f s, decode %.3f s for %zu token(s)%s\n", w, secs(tw0, tw_mel),
-                        secs(tw_mel, tw_enc), secs(tw_enc, tw_dec), got,
+                        secs(tw_enc0, tw_enc), secs(tw_enc, tw_dec), got,
                         full ? " -- the token window filled before <|endoftext|>" : "");
     }
     const auto t_dec = std::chrono::steady_clock::now();

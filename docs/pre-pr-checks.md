@@ -30,6 +30,7 @@ below says why. The table's order is the runner's order: cheapest and most commo
 | `python3 tools/copyright.py --check` | a file has no notice, or has two |
 | `python3 tools/ci/notice_covers_deps.py --check` | a dependency that is fetched and compiled into the binary is not named in `NOTICE` |
 | `python3 tools/ci/duplicate_fixes_check.py --gate` | two open PRs name one issue and neither is declared in `tools/ci/duplicate_fixes_allow.txt` — a legitimate **half** (a fix plus its arm) must be declared there, with its reason; this is the script's only network row, so it **skips** (77) rather than failing when it cannot tell |
+| `python3 tools/ci/pr_branch_stale_check.py --repo 1bit-MONSTER/engine` | an open PR's branch is behind `main` **and** merging it would delete lines `main` has gained (measured with `git merge-tree --write-tree`, not a two-dot diff, because a two-dot diff reports main's own additions as the branch's deletions); `2` when the queue cannot be read, so cannot-tell is a skip and not a pass |
 | `python3 tools/ci/tests_referenced_check.py` | a test, tool self-test or python test exists that nothing runs |
 | `python3 tools/ci/ci_targets_check.py --check` | a CI row names a target or path that does not exist |
 | `python3 tools/ci/tmp_path_check.py --check` | a new `/tmp` or `/dev/shm` path, where builds and dumps belong under `~/wt` or `~/.cache/scratch-*` |

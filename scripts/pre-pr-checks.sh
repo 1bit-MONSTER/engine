@@ -85,6 +85,12 @@ checks=(
     # for -- neither is on main yet. A hard row would red the case I have spent the day arguing must pass, so it
     # prints the finding for the lane to read and stays green; make it hard the day the exemption lands.
     "tools/ci/duplicate_fixes_check.py --gate"
+    # engine#3057: the tool from #2996 merged with its SELF-test as its only row, so nothing ever ran the check on a
+    # PR -- the same shape as #3000 (row exists, ratchet skipped) and as tonight's stale-branch damage. This is the
+    # one gate every lane runs before opening, and it is where "would this merge delete main's newer lines?" is
+    # answerable. A stale branch reports rc 1 with the files; an unreadable queue reports 2, which this list shows
+    # as a skip rather than a pass.
+    "tools/ci/pr_branch_stale_check.py --repo 1bit-MONSTER/engine"
     "tools/ci/tests_referenced_check.py"
     "tools/ci/ci_targets_check.py --check"
     "tools/ci/tmp_path_check.py --check"

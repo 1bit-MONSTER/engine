@@ -42,7 +42,6 @@ import tempfile
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "tools" / "ci" / "fork_ctest_known_fail.sh"
 PIN = "d1111111111111111111111111111111111111aa"   # what ROOT's HEAD says the submodule is
-GOT = "e2222222222222222222222222222222222222bb"   # what is actually checked out
 
 
 def git(cwd, *args):
@@ -54,7 +53,7 @@ def git(cwd, *args):
 _cases = 0
 
 
-def fixture(tmp, *, tool=True, build_tree=True, git_root=True, submodule="absent", stale=False):
+def fixture(tmp, *, tool=True, build_tree=True, git_root=True, submodule="absent", stale=False, real_ratchet=False):
     """A ROOT laid out the way the script expects to find itself, plus an HRX_BUILD."""
     global _cases
     _cases += 1
@@ -62,7 +61,10 @@ def fixture(tmp, *, tool=True, build_tree=True, git_root=True, submodule="absent
     root = case / "root"
     (root / "tools" / "ci").mkdir(parents=True)
     shutil.copy2(SCRIPT, root / "tools" / "ci" / SCRIPT.name)
-    if tool:
+    if real_ratchet:                                  # the tool as it ships, so the row's 0/1 is real
+        for name in ("ctest_known_fail.py", "ctest_known_fail.txt"):
+            shutil.copy2(REPO / "tools" / "ci" / name, root / "tools" / "ci" / name)
+    elif tool:
         (root / "tools" / "ci" / "ctest_known_fail.py").write_text("# stub\n")
         (root / "tools" / "ci" / "ctest_known_fail.txt").write_text("# stub\n")
     build = case / "build"
@@ -85,10 +87,28 @@ def fixture(tmp, *, tool=True, build_tree=True, git_root=True, submodule="absent
     return root, build
 
 
+def head_of(repo):
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def stub_ctest(case, body):
+    """A `ctest` that writes `body` and fails, the way a suite with known failures does."""
+    bin_dir = case / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / "log.txt").write_text(body)
+    ctest = bin_dir / "ctest"
+    ctest.write_text(f"#!/bin/sh\ncat {bin_dir / 'log.txt'}\nexit 8\n")
+    ctest.chmod(0o755)
+    return str(bin_dir)
+
+
 def run(root, build, extra_env=None):
     env = {k: v for k, v in os.environ.items() if k not in ("ONEBIT_FORK_CTEST", "HRX_BUILD")}
     env["HRX_BUILD"] = str(build)
     env.update(extra_env or {})
+    if "PATH" in env and "stub" in (extra_env or {}):
+        env["PATH"] = env.pop("stub") + os.pathsep + env["PATH"]
     return subprocess.run([str(root / "tools" / "ci" / SCRIPT.name)], capture_output=True, text=True, env=env)
 
 
@@ -147,6 +167,40 @@ def main():
         p = run(root, build, {"ONEBIT_FORK_CTEST": "1"})
         ok(p.returncode == 2 and PIN in p.stderr and "the tree pins" in p.stderr,
            "opt-in + stale submodule refuses (2) and names the pinned sha", f"rc {p.returncode}: {p.stderr.strip()}")
+
+        # 7-8. Opt-in, build tree, submodule AT the pin, and a stub `ctest`: the row now reaches its two real
+        #    verdicts. These are the only paths that decide pass-vs-fail, and they were the least armed of all --
+        #    the log shape is ctest's (FAILED block, then the summary) because that is what the ratchet parses.
+        case = tmp / "real"
+        case.mkdir()
+        root, build = fixture(case, submodule="present", real_ratchet=True)
+        at = head_of(root / "third_party" / "llama.cpp")
+        git(root, "update-index", "--add", "--cacheinfo", f"160000,{at},third_party/llama.cpp")
+        git(root, "commit", "-qm", "pin at head")      # WANT == GOT: the submodule matches the pin
+        known = "test-kv-zero"
+        body = ("The following tests FAILED:\n"
+                f"\t 19 - {known} (Subprocess aborted)\n"
+                "Errors while running CTest\n"
+                "99% tests passed, 1 tests failed out of 112\n")
+        stub = stub_ctest(case, body)
+        p = run(root, build, {"ONEBIT_FORK_CTEST": "1", "stub": stub})
+        ok(p.returncode == 0, "opt-in + matching submodule + a known failure exits 0 (the ratchet answered)",
+           f"rc {p.returncode}: {p.stdout.strip()[-300:]} {p.stderr.strip()[-300:]}")
+
+        case2 = tmp / "real-new"
+        case2.mkdir()
+        root2, build2 = fixture(case2, submodule="present", real_ratchet=True)
+        at2 = head_of(root2 / "third_party" / "llama.cpp")
+        git(root2, "update-index", "--add", "--cacheinfo", f"160000,{at2},third_party/llama.cpp")
+        git(root2, "commit", "-qm", "pin at head")
+        body2 = ("The following tests FAILED:\n"
+                 "\t 20 - test-brand-new (SEGV)\n"
+                 "Errors while running CTest\n"
+                 "99% tests passed, 1 tests failed out of 112\n")
+        p = run(root2, build2, {"ONEBIT_FORK_CTEST": "1", "stub": stub_ctest(case2, body2)})
+        ok(p.returncode == 1 and "test-brand-new" in p.stderr,
+           "opt-in + matching submodule + a NEW failure exits 1 and names it",
+           f"rc {p.returncode}: {p.stderr.strip()[-300:]}")
 
     print("fork_ctest_row: ok" if not fails else f"fork_ctest_row: {fails} failure(s)")
     return 0 if not fails else 1

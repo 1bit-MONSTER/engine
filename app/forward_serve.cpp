@@ -499,9 +499,14 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // state, not logits, so that token is run again.
         int resume = 0;
         if (!cache_prompt && e.prefix && e.prefix->enabled()) {
-            // A refusal to consult the cache is a decision, so the [prefix] line below says so rather than staying
-            // silent: "no slot" and "you asked for no slot" must not read the same in a log (#650).
+            // A refusal to consult the cache is a decision, and it has to be PRINTED here: the [prefix]
+            // line further down sits inside the branch that requires `cache_prompt`, so before this
+            // print the refusal recorded a reason and emitted nothing -- a log with no [prefix] line at
+            // all, which is indistinguishable from the prefix path not being reached. That is precisely
+            // the pair of states the line exists to separate (#650, engine#2895).
             stats.prefix = npu::PrefixDecision{-1, 0, "cache_prompt: false"};
+            std::fprintf(stderr, "[prefix] slot=%d cached=%d of %zu reason=%s\n", stats.prefix.slot,
+                         stats.prefix.cached_tokens, ids.size(), stats.prefix.reason.c_str());
         }
         if (cache_prompt && e.prefix && e.prefix->enabled()) {
             const npu::PrefixDecision d = e.prefix->lookup(cache_ids);

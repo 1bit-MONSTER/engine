@@ -42,15 +42,27 @@ REG = Path("registry")
 
 
 def load(root: Path):
-    """(census, significant classes, architectures) or (None, reason)."""
+    """(census, significant classes, architectures) or (None, reason).
+
+    engine#3041: `registry/architectures.json` nests its classes under an "architectures" object -- the same key
+    `tools/census.py:80` indexes -- and reading the file flat made `declined_classes()` find no entry for ANY class,
+    so every `watch: "report"` class counted as declined and this row disagreed with a correct snapshot on every run.
+    The self-test missed it because its fixture wrote the flat shape the loader expected: a fixture that mirrors the
+    bug cannot see the bug, which is why the fixture is now nested (see `build()`), and a file without the key is a
+    cannot-tell rather than "everything declined".
+    """
     try:
         census = json.loads((root / REG / "census.json").read_text(encoding="utf-8"))
         sig = json.loads((root / REG / "significant.json").read_text(encoding="utf-8"))["classes"]
-        archs = json.loads((root / REG / "architectures.json").read_text(encoding="utf-8"))
+        payload = json.loads((root / REG / "architectures.json").read_text(encoding="utf-8"))
     except FileNotFoundError as e:
         return None, f"no {e.filename}"
     except (KeyError, ValueError) as e:
         return None, f"cannot read the registry ({e})"
+    archs = payload.get("architectures")
+    if not isinstance(archs, dict):
+        return None, ("registry/architectures.json carries no \"architectures\" object, so the declined classes "
+                      "cannot be recomputed (a flat file is not the shape tools/census.py reads, engine#3041)")
     return (census, sig, archs), None
 
 
@@ -100,7 +112,7 @@ def self_test() -> int:
         (root / "registry" / "census.json").write_text(
             json.dumps({"date": "2026-11-17", "coverage": coverage, "raw": {"counts": counts}}), encoding="utf-8")
         (root / "registry" / "significant.json").write_text(json.dumps({"classes": sig}), encoding="utf-8")
-        (root / "registry" / "architectures.json").write_text(json.dumps(archs), encoding="utf-8")
+        (root / "registry" / "architectures.json").write_text(json.dumps({"architectures": archs}), encoding="utf-8")
         return root
 
     sig = {"ReviewedForCausalLM": {"watch": "report"}}
@@ -139,6 +151,15 @@ def self_test() -> int:
         (root / "registry").mkdir(parents=True)
         got, why = check(root)
         arm("a missing registry file is cannot-tell", got == [] and why is not None, str(why))
+
+        # engine#3041: the bug this tool shipped with was reading architectures.json FLAT while the tree nests its
+        # classes under "architectures". A flat file must be a cannot-tell, never a tree in which every class is
+        # declined -- otherwise the counters are computed from a misreading and the row accuses a correct snapshot.
+        root = build(tmp, {"declined_architectures": 1, "declined_models": 7}, sig, archs, counts)
+        (root / "registry" / "architectures.json").write_text(json.dumps(archs), encoding="utf-8")
+        got, why = check(root)
+        arm("a flat architectures.json is cannot-tell, not everything-declined",
+            got == [] and why is not None and "architectures" in why, str(why or got))
 
     print("self-test ok" if not fails else f"self-test FAILED ({fails})")
     return 0 if not fails else 1

@@ -104,6 +104,11 @@ def measure(port, args, prompt):
 def provenance(binary=None, repo=None):
     """Which build produced these numbers (engine#2858).
 
+    `binary` must be the binary the bench LAUNCHED (args.onebit). Both call sites used to pass the first token of the
+    first --config, which is empty for the documented `--config base=` and a flag otherwise (`--dflash`), so
+    `binary_sha256` was "unknown" in every invocation -- the one field that identifies the artifact, unfillable, while
+    `args.onebit` sat two lines away (engine#2888 review).
+
     A bench table quoting tok/s is comparable to another only if both name the build they came from. The shipped CI artifact
     this issue is about records its build HOST and nothing else -- no git revision in its CMakeCache, no 40-hex commit in the
     binary -- so a 5x discrepancy could not be attributed to anything. The rule here is the one `recorded_at` learned: an
@@ -195,9 +200,9 @@ def main():
             "model": args.model, "configs": {n: shlex.join(a) for n, a in configs}, "baseline": base,
             "rounds": args.rounds, "prompt_chars": len(prompt), "results": results,
             "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "provenance": provenance(configs[0][1][0] if configs and configs[0][1] else None)},
+            "provenance": provenance(args.onebit)},
             indent=1))
-        pv = provenance(configs[0][1][0] if configs and configs[0][1] else None)
+        pv = provenance(args.onebit)
         print(f"provenance: rev {pv['engine_rev']} (dirty {pv['engine_dirty']}), "
               f"binary sha256 {pv['binary_sha256'][:16]}...")
     if lock:

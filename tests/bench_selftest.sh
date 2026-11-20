@@ -32,7 +32,7 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 # provenance stanza, and an unavailable value must be the explicit string "unknown" rather than an empty field a reader would
 # take for a value -- the same rule `recorded_at` learned the hard way. No server needed: this asserts the helper directly.
 python3 - "$here/../tools" <<'INNER'
-import sys, subprocess
+import sys, subprocess, pathlib
 sys.path.insert(0, sys.argv[1])
 import bench
 p = bench.provenance()
@@ -40,6 +40,28 @@ real = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=Tr
 ok = p["engine_rev"] == real and p["engine_dirty"] in ("yes", "no")
 print("ok   bench.py names the build it measured" if ok else
       "FAIL bench.py provenance: engine_rev %r vs git %r, dirty %r" % (p["engine_rev"], real, p["engine_dirty"]))
+# engine#2888 review: the field that IDENTIFIES the artifact has to be fillable. Both call sites passed the first token
+# of the first --config, which is empty for the documented `--config base=` and a flag otherwise, so binary_sha256 was
+# "unknown" in every invocation while `args.onebit` -- the binary the bench launches -- sat two lines away. A real path
+# must yield a real digest; a missing one must still say "unknown", which is the arm below.
+import tempfile, os, re
+with tempfile.NamedTemporaryFile(delete=False) as f:
+    f.write(b"not a real binary, only its bytes matter here")
+    probe = f.name
+try:
+    b = bench.provenance(probe)
+    ok_sha = pathlib.Path(b["binary"]).name == os.path.basename(probe) and re.fullmatch(r"[0-9a-f]{64}", b["binary_sha256"] or "") is not None
+    print("ok   a binary that exists is named and sha256-ed" if ok_sha else
+          "FAIL provenance of an existing binary: binary %r sha256 %r" % (b["binary"], b["binary_sha256"]))
+finally:
+    os.unlink(probe)
+
+# ... and the arm that would have caught the real defect, which was NOT in the helper: the helper always worked when
+# given a path, and the call sites never gave it one. A test of the function cannot see that, so this asserts the SITE.
+src = open(os.path.join(sys.argv[1], "bench.py"), encoding="utf-8").read()
+ok_site = "provenance(args.onebit)" in src and "configs[0][1][0] if configs" not in src
+print("ok   the bench names the binary it LAUNCHES (the call site, not just the helper)" if ok_site else
+      "FAIL the provenance call site does not pass args.onebit: binary_sha256 will be 'unknown' in every JSON")
 q = bench.provenance("/nonexistent/binary-xyz", repo="/tmp")
 ok2 = q["binary_sha256"] == "unknown" and q["engine_rev"] == "unknown"
 print("ok   an unavailable provenance value is the explicit string unknown" if ok2 else

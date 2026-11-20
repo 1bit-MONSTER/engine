@@ -616,6 +616,35 @@ if [ -z "$BIN" ]; then
            built=1 ;;
       esac
     fi
+    # engine#3023: nothing in CI links an NPU target, so two pin moves shipped trees whose NPU tests could not link
+    # (`undefined reference to npu_rt_api::ext::bo::bo(...)`, engine#3003) and every hosted job stayed green. The runtime
+    # is private, so the only place this can be checked is a box that can fetch it -- here. On a runtime pin CHANGE only:
+    # the check is a configure plus two objects, and a box that passes it once will pass it again for the same pin (the
+    # same cache idiom as .gpu-kernels-pin above, and the pin-bump gate the issue asks for rather than a per-run cost).
+    if [ $built = 0 ] && [ "$PRIVATE" = 1 ]; then
+      npu_pin=$(sed -n 's/^sha=//p' "$ROOT/config/npu-runtime.config" | tail -n 1)
+      if [ -n "$npu_pin" ] && [ "$(cat "$build/.npu-runtime-pin" 2>/dev/null)" != "$npu_pin" ]; then
+        if ! npurt=$("$ROOT/scripts/fetch-private.sh" "$ROOT/config/npu-runtime.config" "$STORE/npu-runtime" 2> "$OUT/npu-private.log"); then
+          note "::error::cannot fetch the private NPU runtime at ${npu_pin:0:12} (gh login with read access on this box?): $(tail -n 1 "$OUT/npu-private.log")"
+          built=1
+        else
+          note "private NPU runtime: npu-kernels ${npu_pin:0:12}; linking the NPU test targets against it"
+          { "$THERMAL" cmake -S "$src" -B "$build-npu" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt" && \
+            "$THERMAL" cmake --build "$build-npu" -j "$JOBS" --target npu_rt_shim_test npu_dmabuf_import_test; } > "$OUT/npu-link.log" 2>&1
+          if [ $? -ne 0 ]; then
+            note "::error::the NPU runtime at ${npu_pin:0:12} does not link the engine's NPU targets (npu_rt_shim_test, npu_dmabuf_import_test): see npu-link.log"
+            grep -E "undefined reference|error:" "$OUT/npu-link.log" | head -n 4 | sed 's/^/  /'
+            built=1
+          else
+            echo "$npu_pin" > "$build/.npu-runtime-pin"
+            note "NPU link gate: npu_rt_shim_test and npu_dmabuf_import_test link against ${npu_pin:0:12}"
+          fi
+        fi
+      elif [ -n "$npu_pin" ]; then
+        note "NPU link gate: runtime ${npu_pin:0:12} unchanged since the last pass, not relinked"
+      fi
+    fi
     if [ $built = 0 ]; then
       BUILT=1
       result build PASS $(( $(date +%s) - t0 )) "$build"

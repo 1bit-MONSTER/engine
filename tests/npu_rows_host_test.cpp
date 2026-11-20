@@ -76,6 +76,43 @@ int main() {
                 }
         }
     }
+    // engine#1783: dequant with a folded tail == dequant, then the tail, for every variant (bias + GELU, bias + residual).
+    {
+        const int M = 1500, N = 768, ldc = 1024, ldo = 768;
+        std::vector<int32_t> C(size_t(M) * ldc);
+        for (auto& v : C) v = ui(rng);
+        std::vector<float> sc(static_cast<size_t>(M)), gs(static_cast<size_t>(ldc)), bias(static_cast<size_t>(N)),
+            res(size_t(M) * N);
+        for (auto& v : sc) v = uf(rng) * 1e-6f;
+        for (auto& v : gs) v = uf(rng) * 1e-3f;
+        for (auto& v : bias) v = uf(rng);
+        for (auto& v : res) v = uf(rng);
+        for (int kind = 0; kind < 2; ++kind) {
+            onebit::audio::Epilogue ep;
+            ep.bias = bias.data();
+            if (kind == 0) {
+                ep.gelu = true;
+                ep.gelu_div = 1.4142135381698608f;
+                ep.gelu_one = 1.0f;
+                ep.gelu_half = 0.5f;
+            } else {
+                ep.res = res.data();
+                ep.res_ld = N;
+            }
+            std::vector<float> ref(size_t(M) * ldo);
+            rh::dequant_base(C.data(), ldc, 0, M, N, sc.data(), gs.data(), ref.data(), ldo);
+            onebit::audio::epilogue_rows(ep, 0, M, N, ref.data(), ldo);
+            for (const bool vec : {false, true})
+                for (const int th : {1, 3, 8}) {
+                    std::vector<float> o(size_t(M) * ldo, 7.0f);
+                    rh::dequant(C.data(), ldc, M, N, sc.data(), gs.data(), o.data(), ldo, vec && rh::use_avx2(), th, &ep);
+                    if (std::memcmp(o.data(), ref.data(), o.size() * 4) != 0) {
+                        std::printf("FAIL dequant+epilogue kind=%d vec=%d threads=%d\n", kind, int(vec), th);
+                        failures++;
+                    }
+                }
+        }
+    }
     std::printf("npu rows host: avx2 %s, %s\n", rh::use_avx2() ? "on" : "not available (scalar arms only)",
                 failures == 0 ? "all variants bit-identical" : "FAILED");
     return failures == 0 ? 0 : 1;

@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "audio_epilogue.h"
 #include "onnx_graph.h"
 
 namespace onebit::npu::pack_import {
@@ -52,6 +53,11 @@ struct AudioGemm {
     // B = nullptr and skip loading the f32 initializer (a whisper-small encoder pass re-read ~340 MB of weights the device
     // had cached since the first window). Unset = never cached, the old behaviour.
     std::function<bool(const std::string& key)> cached;
+    // engine#1783: the product with the projection's tail folded in (bias, GELU, residual; audio_epilogue.h). C must come back
+    // with the tail already applied. Unset = the executor runs the tail as nodes, the old behaviour.
+    std::function<bool(const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
+                       std::vector<float>* C, const onebit::audio::Epilogue& ep, std::string* why)>
+        gemm_ep;
     int device = 0;                           // products the device ran
     int host = 0;                             // products the host ran (declined, or not offered)
     std::map<std::string, int> host_why;      // reason -> count
@@ -65,6 +71,9 @@ struct AudioRunResult {
     // engine#1783: how many MatMul -> Softmax -> MatMul groups this run computed fused, so a test or a measurement can
     // state which attention path it took (0 = node by node, e.g. ONEBIT_AUDIO_FUSED_ATTN=0).
     size_t fused_attention_groups = 0;
+    // engine#1783: projections whose bias / GELU / residual nodes ran folded into the product (0 = node by node, e.g.
+    // ONEBIT_AUDIO_FOLD_EPILOGUE=0 or a device without gemm_ep).
+    size_t folded_epilogues = 0;
 };
 
 // Two entry points, because a Whisper pack has two graphs: the encoder consumes the mel window as f32, the decoder consumes

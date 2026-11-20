@@ -38,6 +38,8 @@
 #include <thread>
 #include <vector>
 
+#include "audio_epilogue.h"   // engine#1783: the projection's folded bias / GELU / residual
+
 #if defined(__x86_64__) && defined(__GNUC__)
 #include <immintrin.h>
 #endif
@@ -158,14 +160,19 @@ inline void amax_scales(const float* A, int M, int K, float* scales, bool vec, i
     });
 }
 
+// `ep` (may be null): the projection's folded tail, applied to each block of rows right after its dequant, on the same
+// thread, in the same per-element order as the nodes it replaces (audio_epilogue.h).
 inline void dequant(const int32_t* C, int ldc, int M, int N, const float* scales, const float* gs, float* out, int ldo, bool vec,
-                    int threads) {
+                    int threads, const onebit::audio::Epilogue* ep = nullptr) {
     split_rows(M, threads, [&](int a, int b) {
 #if defined(__x86_64__) && defined(__GNUC__)
-        if (vec) { dequant_avx2(C, ldc, a, b, N, scales, gs, out, ldo); return; }
-#endif
+        if (vec) dequant_avx2(C, ldc, a, b, N, scales, gs, out, ldo);
+        else dequant_base(C, ldc, a, b, N, scales, gs, out, ldo);
+#else
         (void)vec;
         dequant_base(C, ldc, a, b, N, scales, gs, out, ldo);
+#endif
+        if (ep != nullptr) onebit::audio::epilogue_rows(*ep, a, b, N, out, ldo);
     });
 }
 

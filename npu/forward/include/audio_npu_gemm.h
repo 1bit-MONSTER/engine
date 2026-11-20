@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "audio_kernel_roles.h"
+#include "audio_epilogue.h"
 #include "target.h"
 
 namespace onebit::audio {
@@ -69,6 +70,13 @@ public:
     // The AudioGemm::gemm contract: C (M x N) = A (M x K) x B (K x N); false + why to leave it to the host.
     bool gemm(const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
               std::vector<float>* C, std::string* why) {
+        return gemm_ep(key, A, M, K, B, N, C, nullptr, why);
+    }
+
+    // engine#1783: the same product with the projection's tail folded in (bias, GELU, residual; audio_epilogue.h). The target
+    // applies it in its dequant when it can; otherwise it is applied here on the rows the target wrote, same order.
+    bool gemm_ep(const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
+                 std::vector<float>* C, const Epilogue* ep, std::string* why) {
         // B may be null only for a weight the target already holds (cached(key)): the executor then skips loading it.
         if (A == nullptr || (B == nullptr && !cached(key)) || C == nullptr || M <= 0 || K <= 0 || N <= 0) {
             if (why) *why = "empty product";
@@ -118,6 +126,14 @@ public:
                 a.dst_ld = int(N);
                 a.dst_n = int(N);
             }
+            Epilogue chunk_ep;
+            int ep_done = 0;
+            if (ep != nullptr && ep->any()) {
+                chunk_ep = *ep;
+                if (chunk_ep.res != nullptr) chunk_ep.res += size_t(r0) * size_t(chunk_ep.res_ld);
+                a.epilogue = &chunk_ep;
+                a.epilogue_done = &ep_done;
+            }
             got.clear();
             std::string err;
             if (!t_.gemv(a, got, err)) {
@@ -134,6 +150,8 @@ public:
             for (int r = 0; !wrote_c && r < rows; ++r)
                 std::copy(got.begin() + size_t(r) * size_t(st.n), got.begin() + size_t(r) * size_t(st.n) + size_t(N),
                           C->begin() + size_t(r0 + r) * size_t(N));
+            if (ep != nullptr && ep->any() && ep_done == 0)
+                epilogue_rows(chunk_ep, 0, rows, N, C->data() + size_t(r0) * size_t(N), N);   // the target did not
             ++launches_;
             ++per_role_[role];
             // The target now holds the packed weight under (layer 0, wkey): later chunks and later calls send none.

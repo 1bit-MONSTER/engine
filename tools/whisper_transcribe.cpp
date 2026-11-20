@@ -400,8 +400,9 @@ int main(int argc, char** argv) {
                 if (dev_hook != nullptr) dev_s = (npu_dev.gemm->device_ms() - d0) / 1000.0;
                 if (dev_hook != nullptr && npu_dev.target->profiling()) npu_dev.target->dump_profile();
 #endif
-                std::printf("encoder repeat %d: %.3f s (device_gemm %.3f s, rest %.3f s, fused attention groups %zu)\n", r,
-                            pass_s, dev_s, pass_s - dev_s, tmp.fused_attention_groups);
+                std::printf("encoder repeat %d: %.3f s (device_gemm %.3f s, rest %.3f s, fused attention groups %zu, folded "
+                            "epilogues %zu)\n", r, pass_s, dev_s, pass_s - dev_s, tmp.fused_attention_groups,
+                            tmp.folded_epilogues);
                 std::fflush(stdout);
             }
         }
@@ -440,8 +441,9 @@ int main(int argc, char** argv) {
             uint64_t h = 1469598103934665603ULL;
             const unsigned char* pb = reinterpret_cast<const unsigned char*>(xa.data.data());
             for (size_t i = 0; i < xa.data.size() * sizeof(float); ++i) h = (h ^ pb[i]) * 1099511628211ULL;
-            std::printf("encode-only: encoder %.3f s (decode skipped), output fnv %016llx, fused attention groups %zu\n",
-                        secs(tw_enc0, tw_enc), (unsigned long long)h, xa.fused_attention_groups);
+            std::printf("encode-only: encoder %.3f s (decode skipped), output fnv %016llx, fused attention groups %zu, folded "
+                        "epilogues %zu\n", secs(tw_enc0, tw_enc), (unsigned long long)h, xa.fused_attention_groups,
+                        xa.folded_epilogues);
             return 0;
         }
         if (w == 0) {

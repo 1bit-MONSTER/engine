@@ -156,6 +156,70 @@ static bool valid_sidecar_dir(const std::string& d) {
 // derived from data_size rather than the declared shape so a 2-D [ntiles, N]
 // and a 3-D [ntr, ntc, N] tensor both work.  (src/q4nx_dequant.c; the Q4_K/Q8
 // layouts are in docs/qwen35-4b-weight-format.md.)
+/* engine#796 diagnostic (rung 2's attribution): run the device GEMM's arithmetic on the host so a
+ * host-vs-device row differs only by where the GEMM executes.  A: per-row amax/127 int8 (the same
+ * rule as quant_i8.h row(), which I8Ctx::quantize_async_rows calls); B[K][N]: per-column amax_j/127
+ * int8 (q4nx_pack_B_int8); int32 accumulation; readback out = C * ascale[m] * colscale[n].  Off
+ * unless NPU_INFER_HOST_GEMM_INT8 is set, so no arm that exists today changes.  Diagnostic only:
+ * no other caller sets it, and this is not a code path a container is served through. */
+static bool host_i8_env() {
+    static const bool on = getenv("NPU_INFER_HOST_GEMM_INT8") != nullptr;
+    return on;
+}
+
+static void host_gemm_i8(const float* A, int M, int K, const float* Bmat, int N,
+                         std::vector<float>& out) {
+    std::vector<int8_t> ai((size_t)M * (size_t)K), bi((size_t)K * (size_t)N);
+    std::vector<float> asc((size_t)M), bsc((size_t)N);
+    for (int m = 0; m < M; m++) {          // ascales[m] = amax/127, 0 -> 1.0f (npu_gemm/_rows)
+        float amax = 0.0f;
+        for (int k = 0; k < K; k++) {
+            const float a = std::fabs(A[(size_t)m * K + k]);
+            if (a > amax) amax = a;
+        }
+        asc[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
+        const float ais = 1.0f / asc[(size_t)m];   // I8Ctx: quant_i8::row(a, n, 1.0f/ascale, ..)
+        for (int k = 0; k < K; k++) {
+            float v = A[(size_t)m * K + k];
+            if (!std::isfinite(v)) v = 0.0f;
+            int q = (int)roundf(v * ais);   // multiply by the reciprocal, NOT a division: the
+            //                                 engine's aisle is 1.0f/ascale and v*ais != v/ascale in
+            //                                 fp32, which moves the odd round-half element (796)
+            if (q > 127) q = 127;
+            else if (q < -127) q = -127;
+            ai[(size_t)m * K + k] = (int8_t)q;
+        }
+    }
+    for (int n = 0; n < N; n++) {          // q4nx_pack_B_int8: amax_j/127, amax < 1e-12 -> 1.0
+        float amax = 0.0f;
+        for (int k = 0; k < K; k++) {
+            const float a = std::fabs(Bmat[(size_t)k * N + n]);
+            if (std::isfinite(a) && a > amax) amax = a;
+        }
+        if (amax < 1e-12f) amax = 1.0f;
+        bsc[(size_t)n] = amax / 127.0f;
+        const float tis = 127.0f / amax;
+        for (int k = 0; k < K; k++) {
+            float v = Bmat[(size_t)k * N + n];
+            if (!std::isfinite(v)) v = 0.0f;
+            int q = (int)roundf(v * tis);
+            if (q > 127) q = 127;
+            else if (q < -127) q = -127;
+            bi[(size_t)k * N + n] = (int8_t)q;
+        }
+    }
+    out.assign((size_t)M * (size_t)N, 0.0f);
+    for (int m = 0; m < M; m++) {
+        const int8_t* ar = ai.data() + (size_t)m * K;
+        float* o = out.data() + (size_t)m * N;
+        for (int n = 0; n < N; n++) {
+            int32_t acc = 0;
+            for (int k = 0; k < K; k++) acc += (int32_t)ar[k] * (int32_t)bi[(size_t)k * N + n];
+            o[n] = (float)acc * asc[(size_t)m] * bsc[(size_t)n];
+        }
+    }
+}
+
 static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
@@ -2745,6 +2809,7 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
         A = a_pad.data();
     }
     if (host_gemm_) {
+        if (host_i8_env()) { host_gemm_i8(A, 1, K, Bmat, N, out); return; }
         // Bmat is B[K][N] row-major (ld = N); a plain float matvec.
         out.assign((size_t)N, 0.0f);
         for (int k = 0; k < K; k++) {
@@ -3000,6 +3065,7 @@ void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int
         A = a_pad.data();
     }
     if (host_gemm_) {
+        if (host_i8_env()) { host_gemm_i8(A, M, K, Bmat, N, out); return; }
         // Bmat is B[K][N] row-major (ld = N): a plain float matmul of A[M][K].
         out.assign((size_t)M * N, 0.0f);
         for (int m = 0; m < M; m++) {

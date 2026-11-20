@@ -1216,9 +1216,36 @@ check("support paths: the committed router pin watches the d3 family and the Sys
       any("vela3_d3" in x for x in committed["repos"]["vllm-project/semantic-router"].get("paths", []))
       and any("systemone" in x for x in committed["repos"]["vllm-project/semantic-router"].get("paths", [])))
 
-if failures:
-    print(f"\n{len(failures)} check(s) failed")
-    sys.exit(1)
+# engine#2966: a pinned sha that upstream removed (a rewritten history) 404s the path query, which reads exactly like a
+# removed path -- and it used to raise out of sweep_support, hiding every other pinned upstream behind one line.
+def unreachable_pin_fetch(seen=None):
+    """Head commits answer; the path query for the PINNED sha raises 404 the way GitHub does for a gone commit."""
+    def fetch(url, *a, **kw):
+        if "/commits?sha=" in url and "sha=gone" in url:
+            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+        if url.endswith("/commits") or "/commits?" in url:
+            return [{"sha": "head1", "commit": {"committer": {"date": "2026-11-20T00:00:00Z"}}}]
+        return []
+    return fetch
+
+
+pins = {"repos": {
+    "o/gone": {"commit": "gone", "reviewed": "2026-11-19",
+               "paths": ["a/b"]},
+    "o/ok": {"commit": "gone", "reviewed": "2026-11-19",
+             "paths": ["a/b"]},
+}}
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = cw.watch_support(pins, fetch=unreachable_pin_fetch())[0]
+text = buf.getvalue()
+check("an unreachable pin does not abort the sweep", "SUPPORT WATCH FAILED" not in text)
+check("…it is named for what it is, not as a dead path", "SUPPORT PIN UNREACHABLE o/gone" in text)
+check("…and the row says the commit is gone, not the path", "not in the repo any more" in text)
+check("…and it still alerts", rc == 1)
+check("…and the other pinned repo is still reported", "o/ok" in text)
+check("…and no path is called dead when the pin itself is missing", "no commit at the pin" not in text)
+
 # engine#1922: the digest cannot tell "our pin is behind" from "nobody upstream has this class" without asking upstream, and
 # the two need opposite actions (bump a pin vs do nothing here). Settling it by hand took two commands; these arms make the
 # classification testable offline, including the case where the answer is UNKNOWN -- which must not be guessed as either.
@@ -1266,4 +1293,9 @@ check("a class named for testing does not alert, whatever the org", rc == 0 and 
 rc, res = rc_of([model("example/nimbus", "NimbusMindForCausalLM")])
 check("control: a real unmapped class still alerts at exit 1", rc == 1 and res[cw.UNCOVERED] == ["example/nimbus"])
 
+
 print("\nall checks passed")
+# engine#2966: the single exit gate used to sit mid-file, so the sections after it could not fail the build.
+if failures:
+    print(f"\n{len(failures)} check(s) failed")
+    sys.exit(1)

@@ -1338,3 +1338,34 @@ itself a quantisation of `tencent/Hy4-flash`).
 
 Reported, not alerted (`"watch": "report"`). The single model of the family is also an NVFP4/8-bit re-wrap,
 so there is no bf16 checkpoint of it here to measure even if the graph existed.
+
+## 2026-11-20: `HYV4DFlyModel` — reviewed, not an alias (engine#2966)
+
+The 2026-11-20 watcher run alerted `!! UNCOVERED HYV4DFlyModel (new class)`, one model from one uploader:
+`voodooquant/Hy4-flash-DFly2-PTQR-INT8-W8A8-GS128` (created 2026-11-20, 0 downloads). It is the second half
+of the `HYV4Flash` family above, and it is **not a generative architecture at all**.
+
+* **What it is**: the five-layer **DFly2 speculative drafter** for a Hy4-flash target. Its own card says so in
+  one sentence: *"This is the five-layer DFly2 speculative drafter for the matching Hy4-flash NeUQI target. It
+  requires the target's token embedding, vocabulary head, hidden state, sparse indices and five MLA caches.
+  Start it through the target recipe."* `library_name: vllm`, tags `draft-model`, `speculative-decoding`.
+* **Shape**: `architectures: ["HYV4DFlyModel"]`, `model_type: hy_v4_dfly`, 5 layers, hidden 3072, 32 heads /
+  32 KV, head_dim 64, intermediate 9216, vocab 120832 — the target's vocabulary, not its own. The weights are
+  `dfly-0..4.safetensors` plus `dfly-confidence_head.safetensors`; the repo ships no `modeling_*.py` and no
+  `auto_map`, so the class comes from the reference implementation (`transformers_version: 5.9.0`), which is
+  why the watcher read it as native instead of printing `. REMOTE-CODE`.
+* **Why an alias is wrong, and why no mapping can work**: the drafter has **no embedding head and no output
+  layer of its own** — it runs on the target's embeddings and vocabulary head and holds the target's five MLA
+  caches. A mapping would claim the engine can load a checkpoint that cannot produce a single token without a
+  Hy4-flash target beside it, and nothing in the engine has a drafter/target pairing.
+* **Not a pin gap either**: the pinned converter's `configs/*.json` (18 arch configs, gemma3 … qwen3vl) has no
+  `hy_v4_dfly`, and the pinned backend's one hy class is `HYV4ForCausalLM -> hy_v4`. The draft class the pinned
+  backend *does* run is `DFlash2DraftModel` (recorded in `registry/significant.json` with its `mapped_ok`), which
+  is the sibling drafter family, not this trunk.
+* **What real support requires**: speculative decoding wired to a Hy4-flash target — the target's graph first
+  (the section above: an `hy_v4_vl` trunk with a sparse compressed-indexer attention kernel), then a drafter
+  path that accepts these five layers and the confidence head. That is an engine feature, not a registry edit.
+
+Reported, not alerted (`"watch": "report"`, `registry/significant.json`). The checkpoint is an INT8 W8A8/GS128
+re-wrap of a draft that needs a target we do not serve, so there is nothing here to measure even if the graph
+existed.

@@ -1111,6 +1111,9 @@ set(ONEBIT_SERVE_TEST_NPU_PACK "" CACHE PATH "Q4NX pack directory the serve_e2e_
 add_test(NAME serve_e2e_npu
          COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> "${ONEBIT_SERVE_TEST_NPU_PACK}" npu)
 set_tests_properties(serve_e2e_npu PROPERTIES SKIP_RETURN_CODE 77)
+# Its skip contract, asserted without a pack, a device or a built binary: with no pack the row must skip and say why,
+# and with one it must NOT skip (a row that always skips is named in tools/ci/ctest_skips.txt and would be silent).
+add_test(NAME serve_e2e_npu_skip COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e_npu_skip_test.sh)
 
 # ── ONNX Runtime in-process (docs/onnx.md) ───────────────────────────────
 # Off by default: it needs the libonnxruntime 1.23.2 dev package (pkg-config libonnxruntime) and

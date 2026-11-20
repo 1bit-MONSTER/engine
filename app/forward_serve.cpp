@@ -362,12 +362,6 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         opts = npu::options_from_body(body);
         // logprobs is served in the chat shape; the legacy /v1/completions shape is a different
         // object this route does not implement, and a silently dropped field is what it must not do.
-        // engine#2893: this route serves one slot and the prefix cache chooses it by longest shared prefix, so a
-        // caller naming another slot is asking for something that cannot happen. Refused by name rather than served
-        // with slot 0's state and a 200; `id_slot: 0` is the value llama-server clients send, and it is honoured.
-        if (body.contains("id_slot") && npu::int_field(body, "id_slot", 0) != 0)
-            throw std::runtime_error("id_slot: this route serves a single slot (0); the prefix cache chooses it by "
-                                     "longest shared prefix, so another slot cannot be pinned");
         if (!chat && opts.sample.logprobs)
             throw std::runtime_error("logprobs: served on /v1/chat/completions, not on /v1/completions");
         if (opts.json_object || !opts.grammar.empty())

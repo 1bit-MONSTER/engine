@@ -52,12 +52,17 @@ but never fire, so kprobes are required):
     echo 0 > $I/tracing_on; echo 0 > $I/events/kprobes/enable
     rm -rf $I; echo > $T/kprobe_events                    # leave nothing running
 
-Why the snapshot trigger instead of a plain enabled ring (measured on this box, 2026-11-20): the DMA path runs
-about 1 843 `iommu_map` calls per second -- 110 586 per minute -- so a 64 MB ring holds one to two seconds of
-history. A ring read after a burst is therefore looking at the wrong second, and the burst it was meant to
-capture has already been evicted; a 64 MB ring held 223 376 events in a 40 s window. `echo 'snapshot'` (which
-reads back as `snapshot:unlimited`) makes the fault itself freeze the buffer, so the record is the window
-BEFORE it. `snapshot:count=1` is NOT accepted here -- that is `hist`-trigger syntax -- and a `count` would stop
+Why the snapshot trigger instead of a plain enabled ring (measured on this box, 2026-11-20): the DMA path is
+continuously busy -- iommu_map 73 724, iommu_unmap_fast 75 924 and __iommu_dma_unmap 73 728 calls in a 40 s
+window, about 5 584 events/s across the three probes -- while report_iommu_fault fired ZERO times in it. A ring
+that is written at that rate is a ring that has already rolled over by the time anyone reads it, and how much of it
+survives is a function of the record size, which is not a number to guess at. The fault, by contrast, arrives
+about twice a minute: the reader cannot know which second to look at, so a polled ring is always looking at the
+wrong one.
+
+`echo 'snapshot'` (which reads back as `snapshot:unlimited`) removes the question rather than answering it: the
+fault itself freezes the buffer, so the record is the window ENDING at the fault, whatever the ring's retention
+happens to be. `snapshot:count=1` is NOT accepted here -- that is `hist`-trigger syntax -- and a `count` would stop
 snapshotting after the first fault, which is the opposite of what a burst needs.
 
 Why not the kernel log instead: it has two independent truncations, both visible in it. printk folds repeated

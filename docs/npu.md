@@ -4389,6 +4389,12 @@ its own switch:
   `ONEBIT_WHISPER_DECODE_ONE_ROW=0` also computes every row of the vocabulary projection. When on, only the
   four-row unit holding the row the greedy step reads is computed. Both are bit-identical, and
   `tests/audio_exec_test.cpp` memcmps the logits.
+- `ONEBIT_WHISPER_DECODE_KV=0` turns off the incremental decode. When on, every greedy step after the first starts
+  from the previous step's tensors. Every product whose rows are token positions then recomputes only the four-row
+  unit that holds the new token, which is a self-attention KV cache without changing the graph. The decoder's
+  initializers stay loaded for the whole window, and a one-unit product is split over threads by column.
+  `ONEBIT_WHISPER_DECODE_VERIFY=1` also runs every step uncached and memcmps the logits row it reads. It prints
+  `decode window N: <k> incremental step(s) of <n>, verify: <n> step(s) compared, <d> differ`.
 - The weight packer's OpenMP pool follows the audio thread count (libgomp's default was one thread per CPU, 32 here).
   The device-route tool defaults to 16 audio threads when it may use at least 24 CPUs. `OMP_NUM_THREADS` and
   `ONEBIT_AUDIO_THREADS` still win.

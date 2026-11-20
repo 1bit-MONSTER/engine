@@ -528,18 +528,42 @@ int main(int argc, char** argv) {
         // ONEBIT_WHISPER_DECODE_ONE_ROW=0 computes every row.
         const char* dor = std::getenv("ONEBIT_WHISPER_DECODE_ONE_ROW");
         const bool one_row = !(dor != nullptr && dor[0] == '0');
+        // ...and every step after the first recomputes only the new token's row unit in the position-row products
+        // (DecoderStepCache::incremental). ONEBIT_WHISPER_DECODE_KV=0 runs those products in full.
+        // ONEBIT_WHISPER_DECODE_VERIFY=1 also runs every step uncached and compares the logits row it reads, byte for
+        // byte, and reports the count.
+        const char* dkv = std::getenv("ONEBIT_WHISPER_DECODE_KV");
+        dcache.incremental = !(dkv != nullptr && dkv[0] == '0');
+        const char* dvf = std::getenv("ONEBIT_WHISPER_DECODE_VERIFY");
+        const bool verify = dvf != nullptr && dvf[0] == '1';
+        size_t prev_len = 0, verified = 0, verify_bad = 0, inc_steps = 0;
         while (true) {
             if (seq.size() >= size_t(window)) { full = true; break; }
             std::vector<int64_t> toks(size_t(window), kEot);
             for (size_t i = 0; i < seq.size(); ++i) toks[i] = seq[i];
             AudioRunResult y;
             if (dc != nullptr && one_row) dc->output_row = int64_t(seq.size()) - 1;   // the only logits row read below
+            if (dc != nullptr)
+                dc->changed_row = (dc->filled && prev_len > 0 && seq.size() == prev_len + 1) ? int64_t(seq.size()) - 1 : -1;
             if (!run_decoder_graph(dec, toks.data(), window, xa.data.data(), xa.dims, "", &y, &why, dc)) {
                 std::fprintf(stderr, "decoder at window %zu step %zu: %s\n", w, got, why.c_str());
                 return 1;
             }
+            if (dc != nullptr && dc->incremental_products > 0) ++inc_steps;
+            prev_len = seq.size();
             const int64_t out_vocab = y.dims.empty() ? 0 : y.dims.back();
             const size_t row = (seq.size() - 1) * size_t(out_vocab);
+            if (verify) {
+                AudioRunResult yf;
+                if (!run_decoder_graph(dec, toks.data(), window, xa.data.data(), xa.dims, "", &yf, &why)) {
+                    std::fprintf(stderr, "decoder verify at window %zu step %zu: %s\n", w, got, why.c_str());
+                    return 1;
+                }
+                ++verified;
+                if (yf.data.size() != y.data.size() ||
+                    std::memcmp(yf.data.data() + row, y.data.data() + row, size_t(out_vocab) * sizeof(float)) != 0)
+                    ++verify_bad;
+            }
             int64_t best = 0;
             for (int64_t v = 1; v < out_vocab; ++v)
                 if (y.data[row + size_t(v)] > y.data[row + size_t(best)]) best = v;
@@ -549,6 +573,10 @@ int main(int argc, char** argv) {
             ++got;
         }
         const auto tw_dec = std::chrono::steady_clock::now();
+        if (dc != nullptr)
+            std::printf("decode window %zu: %zu incremental step(s) of %zu%s\n", w, inc_steps, got + 1,
+                        verify ? (", verify: " + std::to_string(verified) + " step(s) compared, " +
+                                  std::to_string(verify_bad) + " differ").c_str() : "");
         mel_s += secs(tw0, tw_mel);
         enc_s += secs(tw_enc0, tw_enc);
         dec_s += secs(tw_enc, tw_dec);

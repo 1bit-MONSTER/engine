@@ -298,14 +298,52 @@ void host_gemm_4rows_base(const float* a0, const float* bpp, float* r0, int64_t 
     ONEBIT_HOST_GEMM_4ROWS_BODY
 }
 
+// engine#1783: the same four-row body over columns [0, W) of B and R rows that are S floats apart, so one four-row unit
+// can be split over threads by column (the incremental decode's single unit). Per element it is the body above: the
+// same skip, the same multiply and add, the same k order.
+#define ONEBIT_HOST_GEMM_4ROWS_COLS_BODY \
+    for (int64_t k = 0; k < K; ++k) { \
+        const float v0 = a0[size_t(k)], v1 = a0[size_t(K) + size_t(k)]; \
+        const float v2 = a0[size_t(2 * K) + size_t(k)], v3 = a0[size_t(3 * K) + size_t(k)]; \
+        if ((v0 == 0.0f) && (v1 == 0.0f) && (v2 == 0.0f) && (v3 == 0.0f)) continue; \
+        const float* br = bpp + size_t(k) * size_t(S); \
+        for (int64_t j = 0; j < W; ++j) { \
+            const float bv = br[j]; \
+            r0[j] += v0 * bv; \
+            r0[S + j] += v1 * bv; \
+            r0[2 * S + j] += v2 * bv; \
+            r0[3 * S + j] += v3 * bv; \
+        } \
+    }
+
+void host_gemm_4rows_cols_base(const float* a0, const float* bpp, float* r0, int64_t K, int64_t W, int64_t S) {
+    ONEBIT_HOST_GEMM_4ROWS_COLS_BODY
+}
+
 #if defined(__x86_64__) && defined(__GNUC__)
 #pragma GCC push_options
 #pragma GCC target("avx2")   // NOT fma: a fused multiply-add rounds once, the ordered SSE2 sum rounds twice
 __attribute__((noinline)) void host_gemm_4rows_avx2(const float* a0, const float* bpp, float* r0, int64_t K, int64_t N) {
     ONEBIT_HOST_GEMM_4ROWS_BODY
 }
+__attribute__((noinline)) void host_gemm_4rows_cols_avx2(const float* a0, const float* bpp, float* r0, int64_t K, int64_t W,
+                                                        int64_t S) {
+    ONEBIT_HOST_GEMM_4ROWS_COLS_BODY
+}
 #pragma GCC pop_options
 #endif
+
+void (*host_gemm_4rows())(const float*, const float*, float*, int64_t, int64_t);
+// The column-split body in the same flavour as host_gemm_4rows() picked.
+void (*host_gemm_4rows_cols())(const float*, const float*, float*, int64_t, int64_t, int64_t) {
+#if defined(__x86_64__) && defined(__GNUC__)
+    static void (*pick)(const float*, const float*, float*, int64_t, int64_t, int64_t) =
+        host_gemm_4rows() == &host_gemm_4rows_avx2 ? &host_gemm_4rows_cols_avx2 : &host_gemm_4rows_cols_base;
+    return pick;
+#else
+    return &host_gemm_4rows_cols_base;
+#endif
+}
 
 // The four-row body, if the box can run the fast one. Read once: the answer cannot change inside a process.
 void (*host_gemm_4rows())(const float*, const float*, float*, int64_t, int64_t) {
@@ -524,6 +562,19 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
             if (made.count(want_out) != 0) fr.insert(want_out);
             frontier.assign(fr.begin(), fr.end());
             for (const auto& nm : frontier) ++use_count[nm];
+            // initializers are step-invariant too: kept loaded across steps, so none may be moved into a consumer
+            for (const auto& ti : g.init_tensors) ++use_count[ti.name];
+            sc->incremental_products = 0;
+            if (sc->filled)
+                for (auto& kv : sc->inits) {
+                    Tensor x;
+                    x.dims = std::move(kv.second.dims);
+                    x.data = std::move(kv.second.data);
+                    x.i64 = std::move(kv.second.i64);
+                    x.b = std::move(kv.second.b);
+                    t[kv.first] = std::move(x);
+                }
+            sc->inits.clear();
             if (sc->filled) {
                 // start from the kept tensors: moved in here and back out after the run, never copied
                 for (auto& kv : sc->frontier) {
@@ -537,6 +588,18 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 sc->frontier.clear();
             }
         }
+        // engine#1783 incremental decode: this step's changed row, when the previous step's outputs are there to start from
+        const bool inc_on = step_cache && sc->incremental && sc->filled && sc->changed_row >= 0 && !sc->prev.empty();
+        auto sc_window = [&]() -> int64_t { return inc_on ? sc->window : -1; };
+        auto take_prev = [&](const std::string& name, const std::vector<int64_t>& dims, std::vector<float>* data) {
+            if (!inc_on) return false;
+            const auto pv = sc->prev.find(name);
+            if (pv == sc->prev.end() || pv->second.dims != dims || pv->second.data.size() != nelem(dims)) return false;
+            *data = std::move(pv->second.data);
+            sc->prev.erase(pv);
+            ++sc->incremental_products;
+            return true;
+        };
         auto take_if_last = [&](const std::string& name) -> Tensor* {
             const auto c = use_count.find(name);
             const auto it = t.find(name);
@@ -586,6 +649,21 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                     continue;
                 attn_fuse[i] = AttnFuse{si, pi};
             }
+        }
+
+        // engine#1783 incremental decode: every step-dependent output is kept for the next step, so none may be moved into
+        // its consumer. Bumped after the attention plan above, which needs the single uses of the scores and
+        // probabilities a fused group never materialises (the group's output is kept; its insides need not be).
+        if (step_cache && sc->incremental) {
+            std::set<std::string> fused_inside;
+            for (const auto& kv : attn_fuse) {
+                fused_inside.insert(g.nodes[kv.first].outs[0]);
+                fused_inside.insert(g.nodes[kv.second.softmax].outs[0]);
+            }
+            for (size_t i = 0; i < g.nodes.size(); ++i)
+                if (!invariant[i])
+                    for (const auto& o : g.nodes[i].outs)
+                        if (!o.empty() && fused_inside.count(o) == 0) ++use_count[o];
         }
 
         // engine#1783: projections that read the same activation (whisper's q, k and v all read the LayerNorm output) are
@@ -871,12 +949,17 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                         o.dims = ab;
                         o.dims.push_back(M);
                         o.dims.push_back(D);
-                        o.data.assign(nelem(o.dims), 0.0f);
                         const size_t batches = nelem(ab);
                         constexpr size_t kRowGroup = 4;
                         const size_t rows = size_t(M);
                         const size_t groups = (rows + kRowGroup - 1) / kRowGroup;
-                        parallel_units(batches * groups, [&](size_t u) {
+                        // engine#1783 incremental decode: only the unit holding the changed row, in every head
+                        size_t inc_unit = size_t(-1);
+                        if (M == sc_window() && size_t(sc->changed_row) < rows && take_prev(m2.outs[0], o.dims, &o.data))
+                            inc_unit = size_t(sc->changed_row) / kRowGroup;
+                        if (inc_unit == size_t(-1)) o.data.assign(nelem(o.dims), 0.0f);
+                        parallel_units(inc_unit != size_t(-1) ? batches : batches * groups, [&](size_t u) {
+                            if (inc_unit != size_t(-1)) u = u * groups + inc_unit;
                             const size_t bi = u / groups;
                             const size_t gi = u % groups;
                             const float* qp = a.data.data() + bi * size_t(M * K);
@@ -885,6 +968,8 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                             const int64_t i0 = int64_t(gi * kRowGroup), i1 = std::min<int64_t>(M, i0 + int64_t(kRowGroup));
                             std::vector<float> sc(size_t(i1 - i0) * size_t(N), 0.0f);   // this group's scores, then probabilities
                             float* o0 = o.data.data() + bi * size_t(M * D) + size_t(i0) * size_t(D);
+                            // the bodies accumulate into the output: a unit recomputed over a kept product starts from 0
+                            if (inc_unit != size_t(-1)) std::fill(o0, o0 + size_t(i1 - i0) * size_t(D), 0.0f);
                             // The first product: identical to the unfused MatMul's unit for these rows.
                             if (i1 - i0 == 4) {
                                 host_gemm_4rows()(qp + size_t(i0) * size_t(K), kp, sc.data(), K, N);
@@ -924,10 +1009,14 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                         continue;
                     }
                 }
-                r.data.assign(nelem(r.dims), 0.0f);
                 // Rows are independent, so the work splits over (batch, row) without touching any element's arithmetic.
                 const size_t batches = nelem(bp.dims);
                 const size_t rows = size_t(std::max<int64_t>(M, 1));
+                // engine#1783 incremental decode: start from the previous step's product, recompute one row unit
+                size_t inc_unit = size_t(-1);
+                if (M == sc_window() && size_t(sc->changed_row) < rows && take_prev(oname, r.dims, &r.data))
+                    inc_unit = size_t(sc->changed_row) / 4;
+                if (inc_unit == size_t(-1)) r.data.assign(nelem(r.dims), 0.0f);
                 // engine#2366: one row per unit streams every `b[k]` row once PER output row -- M passes over the whole
                 // weight matrix. Grouping four rows per unit shares that streamed row; measured on a whisper projection
                 // (M=1500 K=768 N=768, best of 3, one process): 189.8 -> 138.7 ms, 9.3 -> 12.8 GFLOP/s, 1.35x, and the
@@ -941,8 +1030,27 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 if (sc != nullptr && sc->output_row >= 0 && batches == 1 && !n.outs.empty() && n.outs[0] == want_name &&
                     size_t(sc->output_row) < rows)
                     only_unit = size_t(sc->output_row) / kRowGroup;
-                parallel_units(only_unit != size_t(-1) ? size_t(1) : batches * groups, [&](size_t u) {
+                // engine#1783: ONE four-row unit left (the logits row read, or the incremental decode's unit in a 2-D
+                // product): split it over threads by column with the column-split body; same arithmetic per element.
+                const size_t one_unit = only_unit != size_t(-1) ? only_unit : (inc_unit != size_t(-1) && batches == 1 ? inc_unit : size_t(-1));
+                if (one_unit != size_t(-1) && batches == 1 && bp.dims.size() == ra - 2 && size_t(M) >= (one_unit + 1) * kRowGroup &&
+                    N >= 2048 && K > 0) {
+                    const float* a0 = a.data.data() + one_unit * kRowGroup * size_t(K);
+                    float* r0 = r.data.data() + one_unit * kRowGroup * size_t(N);
+                    std::fill(r0, r0 + kRowGroup * size_t(N), 0.0f);
+                    constexpr int64_t kCols = 1024;
+                    const size_t chunks = size_t((N + kCols - 1) / kCols);
+                    parallel_units(chunks, [&](size_t c) {
+                        const int64_t j0 = int64_t(c) * kCols, w = std::min<int64_t>(kCols, N - j0);
+                        host_gemm_4rows_cols()(a0, b.data.data() + size_t(j0), r0 + size_t(j0), K, w, N);
+                    });
+                    finish_node(n.op, oname, r, op_t0);
+                    continue;
+                }
+                parallel_units(only_unit != size_t(-1) ? size_t(1) : (inc_unit != size_t(-1) ? batches : batches * groups),
+                               [&](size_t u) {
                     if (only_unit != size_t(-1)) u = only_unit;
+                    else if (inc_unit != size_t(-1)) u = u * groups + inc_unit;
                     const size_t bi = u / groups;
                     const size_t g = u % groups;
                     std::vector<size_t> idx(bp.dims.size(), 0);
@@ -961,6 +1069,8 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                     const float* bpp = b.data.data() + ob * size_t(K * N);
                     const int64_t i0 = int64_t(g * kRowGroup), i1 = std::min<int64_t>(M, i0 + int64_t(kRowGroup));
                     float* r0 = r.data.data() + bi * size_t(M * N) + size_t(i0) * size_t(N);
+                    // the bodies accumulate into the output: a unit recomputed over a kept product starts from 0
+                    if (inc_unit != size_t(-1)) std::fill(r0, r0 + size_t(i1 - i0) * size_t(N), 0.0f);
                     if (i1 - i0 == 4) {
                         const float* a0 = ap + size_t(i0) * size_t(K);
                         host_gemm_4rows()(a0, bpp, r0, K, N);   // engine#1783: baseline or AVX2+FMA, picked once
@@ -1337,12 +1447,36 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 sc->invariant_nodes = 0;
                 for (char c : invariant) sc->invariant_nodes += size_t(c != 0);
             }
+            for (const auto& ti : g.init_tensors) {
+                const auto it2 = t.find(ti.name);
+                if (it2 == t.end()) continue;
+                DecoderStepCache::Saved s;
+                s.dims = std::move(it2->second.dims);
+                s.data = std::move(it2->second.data);
+                s.i64 = std::move(it2->second.i64);
+                s.b = std::move(it2->second.b);
+                sc->inits[ti.name] = std::move(s);
+            }
+            if (sc->incremental) {
+                sc->prev.clear();
+                for (size_t i = 0; i < g.nodes.size(); ++i) {
+                    if (invariant[i]) continue;
+                    for (const auto& o : g.nodes[i].outs) {
+                        const auto ot = t.find(o);
+                        if (o.empty() || ot == t.end() || ot->second.data.empty()) continue;
+                        DecoderStepCache::Saved s;
+                        s.dims = ot->second.dims;
+                        s.data = std::move(ot->second.data);
+                        sc->prev[o] = std::move(s);
+                    }
+                }
+            }
             sc->filled = true;
             (void)skipped_invariant;
         }
         return true;
     } catch (const std::exception& e) {
-        if (sc != nullptr) { sc->filled = false; sc->frontier.clear(); }
+        if (sc != nullptr) { sc->filled = false; sc->frontier.clear(); sc->prev.clear(); sc->inits.clear(); }
         if (why != nullptr) *why = e.what();
         return false;
     }
@@ -1391,6 +1525,7 @@ bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_
         x.data.assign(xa, xa + nelem(xa_dims));
         seed[g.inputs[1]] = std::move(x);
     }
+    if (cache != nullptr) cache->window = n_tokens;
     return run_graph_impl(g, std::move(seed), out_name, out, why, nullptr, cache, cache != nullptr ? g.inputs[0] : std::string());
 }
 

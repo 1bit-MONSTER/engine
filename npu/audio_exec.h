@@ -120,6 +120,20 @@ struct DecoderStepCache {
     // other row of the output was never computed (left 0 here), so a logits dump, a beam or a sampler over other rows
     // must leave this at -1.
     int64_t output_row = -1;
+    // Incremental decode (a self-attention KV cache without changing the graph). Between greedy steps only one token
+    // position changes (`changed_row`, the new token), and causal masking makes every row before it the same as in the
+    // previous step. With `incremental` on and a previous step kept, every product whose rows are the token positions
+    // (A's row count == `window`) starts from its previous output and recomputes only the four-row unit holding
+    // `changed_row`, in every head, with the same code. The rows before it keep their values, which equal a full run's;
+    // the rows after it are pad positions nothing reads. Every other node still runs in full, on rows that are equal
+    // to a full run's up to `changed_row`. Exactness is CHECKED, not argued: whisper_transcribe's
+    // ONEBIT_WHISPER_DECODE_VERIFY=1 and tests/audio_exec_test.cpp memcmp the logits against the full path.
+    bool incremental = true;
+    int64_t changed_row = -1;                // -1 = a full run (and the run whose tensors the next step starts from)
+    int64_t window = 0;                      // the token window (set by run_decoder_graph)
+    std::map<std::string, Saved> prev;       // the previous step's outputs of every step-dependent node
+    std::map<std::string, Saved> inits;      // initializers loaded by earlier steps (loaded once per window)
+    size_t incremental_products = 0;         // products the last run computed for one row unit only
 };
 bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_tokens, const float* xa,
                        const std::vector<int64_t>& xa_dims, const std::string& out_name, AudioRunResult* out,

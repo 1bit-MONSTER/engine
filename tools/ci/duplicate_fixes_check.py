@@ -353,6 +353,20 @@ def self_test():
     ok(normalise_repo('engine') == 'engine', "a bare repo name is accepted")
     ok(normalise_repo('1bit-MONSTER/engine') == 'engine', "... and the owner/name spelling normalises instead of 404ing")
     ok(normalise_repo('1bit-MONSTER/engin') is None, "a name it does not know is refused, not turned into a skip")
+    # engine#2982/#2979: every pass compared OPEN PRs with each other, so when one of a pair merged the pair
+    # stopped existing and the gate said clean. These arms are the three states of that third pass.
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    op = {'number': 9002, 'title': 'fix the thing', 'body': 'Fixes #9001', 'merged_at': None}
+    mp = {'number': 9001, 'title': 'fix the thing', 'body': 'Fixes #9001', 'merged_at': now}
+    fmap = {9002: ['a.cpp'], 9001: ['a.cpp']}
+    tw, nt = mended_twins([op], [mp], files_of=lambda n: fmap[n], days=2)
+    ok(len(tw) == 1 and tw[0][0] == 9001, "an open PR re-doing a just-merged fix is a TWIN when they share a file")
+    tw2, nt2 = mended_twins([op], [mp], files_of=lambda n: ['a.cpp'] if n == 9002 else ['b.cpp'], days=2)
+    ok(len(tw2) == 0 and len(nt2) == 1, "... a follow-up touching other files is a NOTE, not a finding")
+    old_mp = dict(mp, merged_at="2020-01-01T00:00:00Z")
+    tw3, nt3 = mended_twins([op], [old_mp], files_of=lambda n: fmap[n], days=2)
+    ok(len(tw3) == 0 and len(nt3) == 0, "... and a merge outside the window is not a twin (or a note)")
     # the file is written by a human, who writes `#2797`, not `2797`
     import pathlib
     import tempfile
@@ -462,6 +476,8 @@ def main(argv):
     # 0 clean, 1 a finding, 77 "cannot run here" (the ctest skip code) -- because the script classifies a row by
     # these three and by nothing else, and the page-vs-runner comparator forbids a `sh -c` wrapper that would
     # map them outside the tool.
+    ap.add_argument('--mended-days', type=int, default=2,
+                    help='an open PR re-doing work merged in the last N days is a finding (default 2)')
     ap.add_argument('--gate', action='store_true',
                     help='pre-pr-checks mode: 0 clean, 1 a duplicate, 77 cannot tell (network/gh unavailable)')
     ap.add_argument('--advisory', action='store_true',
@@ -477,6 +493,7 @@ def main(argv):
               file=sys.stderr)
         return 2
     found, failed = [], 0
+    mended, notes = [], []
     for repo in (normalise_repo(r) for r in a.repos):
         try:
             prs = open_prs(repo)
@@ -485,6 +502,19 @@ def main(argv):
             failed += 1
             continue
         # first pass without files: closing claims only, as before
+        try:
+            recently = json.loads(gh(f"repos/{OWNER}/{repo}/pulls?state=closed&per_page={PAGE}"
+                                     f"&sort=updated&direction=desc", paginate=False) or '[]')
+            # files_of's real contract is (repo, numbers) -> {number: set(files)}; mended_twins wants a 1-arg
+            # lookup. Calling it directly would be a TypeError on the first twin found -- a latent crash in
+            # exactly the path that matters, invisible until a twin exists.
+            def _files(n, _repo=repo):
+                return files_of(_repo, [n]).get(n, ())
+            twins, nts = mended_twins(prs, [x for x in recently if x.get('merged_at')], _files, a.mended_days)
+            mended += [(repo,) + t for t in twins]
+            notes += [(repo,) + n for n in nts]
+        except (RuntimeError, json.JSONDecodeError):
+            pass          # this pass is extra information; the open-vs-open passes above are the gate
         first = duplicates(prs)
         # second pass: which issues are touched by two or more PRs and were not explained by a closing pair
         touched = {}
@@ -501,6 +531,10 @@ def main(argv):
                           'prs': [{'number': p['number'], 'title': p['title'], 'draft': p['draft'],
                                    'age_hours': p['age_hours']} for p in group]})
     allow = read_allow(a.allow or os.path.join(os.path.dirname(os.path.abspath(__file__)), ALLOW_FILE))
+    for repo, issue, op, mp, shared in mended:
+        found.append({'repo': repo, 'issue': issue, 'mended_by': mp['number'],
+                      'prs': [{'number': op['number'], 'title': op.get('title') or '',
+                               'draft': False, 'age_hours': 0}]})
     found, allowed, stale = apply_allow(found, allow)
     if a.json:
         print(json.dumps(found, indent=1))
@@ -511,6 +545,15 @@ def main(argv):
         for issue in stale:
             print(f"duplicate_fixes: allow entry #{issue} is STALE -- no open pair claims it any more "
                   f"({allow[issue]}); delete the line", file=sys.stderr)
+        for repo, issue, op, mp, shared in mended:
+            print(f"{repo}: #{issue} was already closed by #{mp['number']} "
+                  f"({(mp.get('merged_at') or '')[:16]}), and open #{op['number']} claims it again")
+            print(f"  they touch {', '.join(shared)}" if shared else "")
+            print(f"  if this is a follow-up, say `Refs #{issue}` and what differs; if it re-does the work, "
+                  f"close it")
+        for repo, issue, op, mp in notes:
+            print(f"duplicate_fixes: {repo} #{op['number']} says `Fixes #{issue}`, which #{mp['number']} already "
+                  f"merged -- `Refs #{issue}` is the verb if this is a follow-up (not a finding)", file=sys.stderr)
         for f in found:
             print(f"{f['repo']}: " + describe(f['issue'], f['prs']))
         clean = clean_line(found, failed)
@@ -529,6 +572,47 @@ def main(argv):
                   file=sys.stderr)
         return 0
     return exit_code(found, failed)
+
+
+def mended_twins(open_prs, merged_prs, files_of=None, days=2):
+    """[(issue, open_pr, merged_pr, files)] -- an open PR re-doing work a recently merged PR already claims.
+
+    Why (found live, 2026-11-20): every pass in this tool compared OPEN pull requests with each other. When one
+    of a pair merges, the pair stops existing and the gate reports clean -- so #2982 (`Fixes #2978`, opened 15:09)
+    duplicated #2979, which merged the identical one-line fix at 15:10, and nothing noticed. A gate that only
+    looks at the open half of the population cannot see the case where the answer is already on main.
+
+    A time bound rather than a count: issues like engine#2478 accumulate merged PRs for weeks, and comparing an
+    open claim against ALL history would report every long-running issue as a duplicate.
+
+    It is a *twin* only when the two touch a shared file -- otherwise it is a follow-up that named the wrong
+    verb, which `note` reports and does not fail: `Fixes #N` for an issue already fixed should be `Refs #N`, but
+    a text nit is not worth a red gate (this tool must not refuse what it should accept).
+    """
+    cut = None
+    twins, notes = [], []
+    for p in merged_prs:
+        at = p.get("merged_at") or ""
+        if not at:
+            continue
+        if cut is None:
+            import datetime
+            cut = (datetime.datetime.now(datetime.timezone.utc)
+                   - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if at < cut:
+            continue
+        for op in open_prs:
+            shared = set(claims(f"{op.get('title') or ''}\n{op.get('body') or ''}")) & \
+                     set(claims(f"{p.get('title') or ''}\n{p.get('body') or ''}"))
+            for issue in shared:
+                if files_of is None:
+                    twins.append((issue, op, p, [])); continue
+                a, b = set(files_of(op["number"])), set(files_of(p["number"]))
+                if a and b and a & b:
+                    twins.append((issue, op, p, sorted(a & b)))
+                else:
+                    notes.append((issue, op, p))
+    return twins, notes
 
 
 def clean_line(found, failed):

@@ -73,6 +73,10 @@ TS = re.compile(r"^\w{3}\s+\d+ (\d\d):(\d\d):(\d\d)")
 
 
 SUPPRESSED_RE = re.compile(r"(\d+) callbacks? suppressed")
+# printk's suppression counter is box-wide and the line names only the emitter that folded them, so a
+# `241 callbacks suppressed` from kauditd_printk_skb says nothing about faults. Only a suppression line
+# whose own line names a fault-plane emitter counts towards the lower bound.
+FAULT_EMITTER_RE = re.compile(r"amd_iommu_report_page_fault|amdxdna|amdgpu|AMD-Vi|nvme|IO_PAGE_FAULT")
 
 
 def suppressed_count(line):
@@ -83,6 +87,8 @@ def suppressed_count(line):
     This boot (2026-11-20) printed 323 faults against 1 761 suppressed -- 5.5x -- and three
     wrong readings on engine#2478 came from treating the printed count as the event count.
     """
+    if not FAULT_EMITTER_RE.search(line):
+        return 0
     m = SUPPRESSED_RE.search(line)
     return int(m.group(1)) if m else 0
 
@@ -518,6 +524,16 @@ def self_test():
         "the singular 'callback' spelling is read (printk uses it for one)")
     chk(suppressed_count("nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT …]") == 0,
         "a fault line is not mistaken for a suppression line")
+    # printk's counter is box-wide: any subsystem can print `<emitter>: N callbacks suppressed`. Measured
+    # on the 18:04Z boot, whose only suppression lines were kauditd_printk_skb (241) and
+    # set_capacity_and_notify (3) against 10 real IO_PAGE_FAULT lines -- summing those would have said 248
+    # faults suppressed where the log printed 10 events in total.
+    chk(suppressed_count("[  812.1] kauditd_printk_skb: 241 callbacks suppressed") == 0,
+        "a suppression line from another subsystem is not a fault suppression")
+    chk(suppressed_count("[  812.2] set_capacity_and_notify: 3 callbacks suppressed") == 0,
+        "… and neither is one from the block layer")
+    chk(suppressed_count("… amd_iommu_report_page_fault: 8 callbacks suppressed") == 8,
+        "the fault printer's own suppression line still counts")
     chk(suppressed_note(0) == "", "no suppressed callbacks prints no line")
     chk("LOWER BOUND" in suppressed_note(19),
         "a suppression count says the counts are a lower bound, not that they are the total")

@@ -983,6 +983,13 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         out["object"] = object;
         out["created"] = created;
         out["model"] = e.id;
+        // engine#2893: `id_slot` is accepted by every llama-server client and this route's prefix cache picks the
+        // slot by longest shared prefix, so a caller who pins one would otherwise be served another slot's state with
+        // a 200 and no way to see it. The request's value is not honoured (nothing here can pin); the reply says which
+        // slot was actually used, which is the third option in that issue: never silently discard a field.
+        if (body.is_object() && body.contains("id_slot")) {
+            out["id_slot"] = stats.prefix.slot;
+        }
         if (chat) {
             // (issue #652 item 3) one shared parser splits what the model wrote into OpenAI's three
             // parts; a reply that is only tool calls says content: null.

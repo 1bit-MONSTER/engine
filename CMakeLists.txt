@@ -485,6 +485,12 @@ endfunction()
 # script turned the row into BAD_COMMAND.
 add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
+# engine#2893 counted key-string mentions in one file and read zero as "cannot be reading it", which is how
+# `temperature` and `top_k` were filed as silently dropped when app/npu_sampling.h reads both. This row classifies
+# every request field by where its disposition lives (route parse, options parse, named refusal) and fails on a field
+# that has none, so the sixth field cannot slip through the same way.
+add_python_test(serve_field_census ${CMAKE_SOURCE_DIR}/tools/ci/serve_field_census.py --root ${CMAKE_SOURCE_DIR})
+add_python_test(serve_field_census_self ${CMAKE_SOURCE_DIR}/tools/ci/serve_field_census.py --self-test)
 # engine#2878: the fold tool is only useful if its output is something llama-hadamard.cpp can run,
 # and that is what this row checks; it had no runner, so tests_referenced named it.
 add_python_test(hadamard_fold_test ${CMAKE_SOURCE_DIR}/tests/hadamard_fold_test.py)
@@ -1483,13 +1489,15 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME fork_ctest_row COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/fork_ctest_row_test.py)
     set_tests_properties(fork_ctest_row PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # Source-only, no build and no device: a warm-up path that is not a registered route 404s and warms
-    # nothing (engine#2853 -- /completion was that path for two warm-ups until #2855 registered it).
-    add_test(NAME warmup_route_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/warmup_route_check.py --root ${CMAKE_SOURCE_DIR})
-    set_tests_properties(warmup_route_check PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    # engine#2853: `1bit serve`'s short and spec warm-ups posted to /completion, a path it never registered -- 404s that
-    # moved nothing, and no test could see them because a warm-up is a POST the server makes to itself. The route table
-    # and the warm-up list are two literals in app/serve.cpp; this fails when they disagree. Static, ~0.1 s.
+    # Source-only, no build and no device, ~0.1 s: a warm-up is a POST the server makes to itself, so a path it never
+    # registered 404s and a field its parser never reads runs at the default limit -- and neither shows up on stdout
+    # anyone greps. engine#2853: `/completion` was that path for two warm-ups until #2855 registered it;
+    # engine#2884: their `n_predict` was that field until #2887 taught the parser the alias. The route table and the
+    # warm-up list are two literals in app/serve.cpp, so this fails when they disagree.
+    #
+    # One file, not two: `warmup_route_check.py` (#2883) checked the same route half with raw-string route support,
+    # which `serve_routes_check.py` now carries with arms (a regex route, and srv.Get), so the second check and its
+    # row are gone rather than kept in step by hand.
     add_python_test(tool_selftest_serve_routes ${CMAKE_SOURCE_DIR}/tools/ci/serve_routes_check.py --self-test)
     add_test(NAME serve_warmup_routes COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/serve_routes_check.py ${CMAKE_SOURCE_DIR})
     # an installed package must find its libraries beside itself: the 2026-11-08 incident's rule, from

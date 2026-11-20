@@ -28,6 +28,25 @@ trap 'rm -rf "$scratch"' EXIT
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 
+# engine#2858: a bench table is only comparable to another if both name the build they came from. The JSON must carry a
+# provenance stanza, and an unavailable value must be the explicit string "unknown" rather than an empty field a reader would
+# take for a value -- the same rule `recorded_at` learned the hard way. No server needed: this asserts the helper directly.
+python3 - "$here/../tools" <<'INNER'
+import sys, subprocess
+sys.path.insert(0, sys.argv[1])
+import bench
+p = bench.provenance()
+real = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+ok = p["engine_rev"] == real and p["engine_dirty"] in ("yes", "no")
+print("ok   bench.py names the build it measured" if ok else
+      "FAIL bench.py provenance: engine_rev %r vs git %r, dirty %r" % (p["engine_rev"], real, p["engine_dirty"]))
+q = bench.provenance("/nonexistent/binary-xyz", repo="/tmp")
+ok2 = q["binary_sha256"] == "unknown" and q["engine_rev"] == "unknown"
+print("ok   an unavailable provenance value is the explicit string unknown" if ok2 else
+      "FAIL provenance of a missing binary/absent repo should be 'unknown', got %r" % (q,))
+sys.exit(0 if (ok and ok2) else 1)
+INNER
+
 python3 - "$scratch/plain.gguf" <<'PY'
 import struct, sys
 def s(x): b = x.encode(); return struct.pack("<Q", len(b)) + b

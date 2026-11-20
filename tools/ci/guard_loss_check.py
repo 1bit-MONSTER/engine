@@ -31,15 +31,31 @@ A move only explains a removal when the identifier that turns up elsewhere is RA
 head). `size` appears in most files of a C++ tree and the #371 guard carries it, so an unbounded
 search would report that deletion as "rewritten" - measured on 60f744628, rc 0 instead of 1.
 
-Known blind spots, named rather than implied: GUARD_KEYWORDS is a heuristic, so a refusal phrased
-outside it is invisible; and SKIP_DIRS includes tests/, so a guard deleted from a test file is not
-reported (test asserts are usually fixtures, not the product's refusals - a judgement, not a proof).
+Diagnostics are reported, not gated (engine#2761). A removed line that reports rather than refuses
+(`fprintf(stderr, ...)`, `log "::warning::..."`, `LOG(WARNING)`) is a `WARN-LOST` line in the output
+and counts in the summary, but it does not redden a default run: most deleted diagnostics are
+deliberate debug prints, and a check that fails those is a check lanes learn to skip. `--strict-warnings`
+turns them into rc 1 for the PR class where the message IS the product (gpu-hold's queue messages,
+which is how #2825's bundled removal read). Measured before this family existed: 0 of 3 removed
+diagnostic lines were even candidates.
+
+Known blind spots, named rather than implied: GUARD_KEYWORDS and WARN_KEYWORDS are heuristics, so a
+guard or a diagnostic phrased outside them is invisible; SKIP_DIRS includes tests/, so a guard deleted
+from a test file is not reported (test asserts are usually fixtures, not the product's refusals - a
+judgement, not a proof); and a branch that predates a fix on main reverts it at merge without any diff
+here ever containing the line, which is a merge-tree shape this tool cannot see by construction.
 
 Exit: 0 nothing lost (or only moved), 1 a guard's identifiers are gone, 2 cannot tell.
 """
 import argparse, re, subprocess, sys
 
 GUARD_KEYWORDS = ("refus", "assert", "GGML_ABORT", "!= 0", "== nullptr", "cannot", "must be", "is not set")
+# engine#2761: a *diagnostic* is not a refusal, but losing one is not nothing either. Measured on
+# #2825, where a bundled hunk removed the gpu-hold wait-time re-check -- two lines (the `if` and the
+# `log "::warning::..."` it guarded) -- and this tool found **0 of 3** removed diagnostic lines,
+# because a removal only becomes a candidate when it carries a refusal keyword. A warning that goes
+# away is a lane running without the sentence that told it what it was about to do.
+WARN_KEYWORDS = ("::warning::", "fprintf(stderr", "stderr", "warn(", "LOG(WARNING", "warning:")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]{3,}")
 # engine#2451: `tests/`, not only `tests/data/`. A test's `REQUIRE`/`CHECK` is a fixture, not the
 # product's refusal - and the heuristic cannot see that style anyway (REQUIRE is not a guard keyword),
@@ -53,8 +69,8 @@ def git(*args, cwd=None):
     return subprocess.run(("git",) + args, cwd=cwd, capture_output=True, text=True)
 
 
-def guards_removed(diff_text):
-    """[(path, line)] for removed lines that look like a guard, from a unified diff."""
+def removed_guards(diff_text):
+    """[(path, line, kind)] for removed guard-shaped lines, kind in {"refusal", "warning"}."""
     out, path = [], None
     for line in diff_text.splitlines():
         if line.startswith("+++ b/"):
@@ -67,8 +83,16 @@ def guards_removed(diff_text):
         if stripped.startswith(("//", "*", "/*")):
             continue                      # a comment about a guard is not a guard
         if any(k in body for k in GUARD_KEYWORDS) and ("if" in body or "assert" in body.lower()):
-            out.append((path, body))
+            out.append((path, body, "refusal"))
+        elif any(k in body for k in WARN_KEYWORDS):
+            # not a refusal (nothing is decided by it), but a diagnostic that left the file
+            out.append((path, body, "warning"))
     return out
+
+
+def guards_removed(diff_text):
+    """[(path, line)] for the refusal-shaped removals -- the ones that gate a run."""
+    return [(p, b) for p, b, kind in removed_guards(diff_text) if kind == "refusal"]
 
 
 def identifiers(text):
@@ -102,7 +126,7 @@ def head_mentions(root, head, names):
     return out
 
 
-def check(root, base, head):
+def check(root, base, head, strict_warnings=False):
     mb = git("merge-base", base, head, cwd=root)
     if mb.returncode != 0:
         print(f"guard_loss_check: no merge base for {base} and {head} - cannot tell", file=sys.stderr)
@@ -111,13 +135,14 @@ def check(root, base, head):
     if diff.returncode != 0:
         print(f"guard_loss_check: git diff failed - cannot tell", file=sys.stderr)
         return 2
-    lost, moved = [], []
-    for path, body in guards_removed(diff.stdout):
+    lost, moved, warn_lost, warn_moved = [], [], [], []
+    for path, body, kind in removed_guards(diff.stdout):
         if any(path.startswith(d) for d in SKIP_DIRS):
             continue
+        sink_lost, sink_moved = (lost, moved) if kind == "refusal" else (warn_lost, warn_moved)
         at_head = git("show", f"{head}:{path}", cwd=root)
         if at_head.returncode != 0:
-            lost.append((path, body, "the file is gone too"))
+            sink_lost.append((path, body, "the file is gone too"))
             continue
         missing = [i for i in identifiers(body) if i not in at_head.stdout]
         if missing:
@@ -129,24 +154,33 @@ def check(root, base, head):
             rare = [i for i in missing if 0 < len(mentions.get(i, [])) <= RARE_MAX]
             elsewhere = sorted({p for i in rare for p in mentions[i] if p != path})
             if elsewhere:
-                moved.append((path, body, elsewhere))
+                sink_moved.append((path, body, elsewhere))
             else:
-                lost.append((path, body, "not in this file and not anywhere at head: " + ", ".join(sorted(missing))))
+                sink_lost.append((path, body, "not in this file and not anywhere at head: " + ", ".join(sorted(missing))))
         else:
             # every `moved` entry is a 3-tuple: the print loop unpacks a destination list. This path
             # (guard rewritten in place, identifiers still present) appended 2-tuples and crashed the
             # tool - and Python's traceback exits 1, which a runner reads as "guard LOST". Found by
             # running the row below against a diff that rewrites a guard.
-            moved.append((path, body, []))
+            sink_moved.append((path, body, []))
     for path, body, why in lost:
         print(f"LOST {path}: {body.strip()[:100]}\n     {why}")
-    for path, body, elsewhere in moved:
+    for path, body, why in warn_lost:
+        print(f"WARN-LOST {path}: {body.strip()[:100]}\n     {why}")
+    for path, body, elsewhere in moved + warn_moved:
         dest = f" -> {' '.join(elsewhere[:3])}" if elsewhere else ""
         print(f"note {path}: guard rewritten, identifiers still present in the file or at head: "
               f"{body.strip()[:64]}{dest}")
-    print(f"guard_loss_check: {len(guards_removed(diff.stdout))} removed guard-shaped line(s), "
-          f"{len(lost)} lost, {len(moved)} rewritten")
-    return 1 if lost else 0
+    # A refusal's removal changes what the program does; a diagnostic's removal changes what a lane
+    # can see it doing. Both are reported, but only the first reddens a default run: 60 % of the
+    # diagnostic lines deleted in this repo's history are deliberate (debug prints, a message that
+    # moved), and a check that fails those is a check lanes learn to skip. `--strict-warnings`
+    # exists for the PR class where a warning IS the product -- gpu-hold's queue messages.
+    total = len(removed_guards(diff.stdout))
+    print(f"guard_loss_check: {total} removed guard-shaped line(s), "
+          f"{len(lost)} lost, {len(moved)} rewritten, {len(warn_lost)} diagnostic(s) lost, "
+          f"{len(warn_moved)} diagnostic(s) rewritten")
+    return 1 if (lost or (strict_warnings and warn_lost)) else 0
 
 
 def self_test():
@@ -267,6 +301,43 @@ def self_test():
     chk("a rare identifier found in another file is a rewrite, not a loss", rc_move, 0)
     chk("and the note names where it went", "src/help.h" in buf3.getvalue(), True)
 
+    # 4. THE DIAGNOSTIC FAMILY (engine#2761 / #2825): a removed warning is reported but does not gate a
+    #    default run, and --strict-warnings turns it into rc 1 for the PR class where the message IS the
+    #    product. The corpus is the real shape: #2825's bundled hunk removed gpu-hold's wait-time re-check
+    #    -- `log "::warning::queued while ..."` -- and before this family existed the tool found 0 of the
+    #    3 removed diagnostic lines, because a removal only became a candidate with a refusal keyword.
+    chk("a removed ::warning:: line is a candidate at all",
+        len(removed_guards("+++ b/scripts/gpu-hold\n-    log \"::warning::queued while a fault is in the log\"\n")), 1)
+    chk("and it is classified as a warning, not a refusal",
+        [k for _p, _b, k in removed_guards("+++ b/scripts/gpu-hold\n-    log \"::warning::x\"\n")], ["warning"])
+    chk("the refusal contract is unchanged: guards_removed() still returns only refusals",
+        guards_removed("+++ b/s.sh\n-    log \"::warning::x\"\n"), [])
+    chk("a comment about a warning is not a removed warning",
+        removed_guards("+++ b/a.cpp\n-// stderr is not used here\n"), [])
+    # a line that BOTH refuses and reports is a refusal: removing it changes what the program does, so
+    # the refusal branch wins (measured on this arm's first draft, whose `== nullptr` made it rc 1)
+    chk("a line that refuses AND reports is a refusal, not a warning",
+        [k for _p, _b, k in removed_guards("+++ b/a.cpp\n-  if (p == nullptr) { fprintf(stderr, \"warning: null\"); }\n")], ["refusal"])
+    warn_guard = "int f(void*p,size_t NEEDS_WARN){ if (NEEDS_WARN == 0x2) { fprintf(stderr, \"warning: null\"); } return 0; }\n"
+    td4 = scratch({"src/a.cpp": warn_guard}, {"src/a.cpp": "int f(void*p,size_t NEEDS_WARN){ return 0; }\n"})
+    buf4 = io.StringIO()
+    with contextlib.redirect_stdout(buf4):
+        rc_warn = check(td4, "HEAD^", "HEAD")
+    chk("a removed diagnostic whose identifiers are gone does NOT red a default run", rc_warn, 0)
+    chk("  ... but it is in the output and named",
+        "WARN-LOST" in buf4.getvalue() and "src/a.cpp" in buf4.getvalue(), True)
+    buf4b = io.StringIO()
+    with contextlib.redirect_stdout(buf4b):
+        rc_warn_strict = check(td4, "HEAD^", "HEAD", strict_warnings=True)
+    chk("--strict-warnings makes the same removal rc 1", rc_warn_strict, 1)
+    # and a refusal in the same tree is still rc 1 by default: adding the family must not have moved the gate
+    td5 = scratch({"src/a.cpp": "int f(void*p,size_t n){ if (n % TENSOR_ALIGNMENT != 0) { return -1; } return 0; }\n"},
+                  {"src/a.cpp": "int f(void*p,size_t n){ return 0; }\n"})
+    buf5 = io.StringIO()
+    with contextlib.redirect_stdout(buf5):
+        rc_refusal = check(td5, "HEAD^", "HEAD")
+    chk("a refusal alone is still rc 1 without the new flag", rc_refusal, 1)
+
     print(f"guard_loss_check self-test: {'ok' if fail == 0 else str(fail) + ' failure(s)'}")
     return 0 if fail == 0 else 1
 
@@ -278,12 +349,15 @@ def main():
     ap.add_argument("--base", default="origin/main")
     ap.add_argument("--head", default="HEAD")
     ap.add_argument("--root", default=".")
+    ap.add_argument("--strict-warnings", action="store_true",
+                    help="rc 1 when a removed diagnostic's identifiers are gone too (the gpu-hold "
+                         "queue-message class, engine#2761/#2825)")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
     if not a.check:
         ap.error("one of --check or --self-test is required")
-    return check(a.root, a.base, a.head)
+    return check(a.root, a.base, a.head, a.strict_warnings)
 
 
 if __name__ == "__main__":

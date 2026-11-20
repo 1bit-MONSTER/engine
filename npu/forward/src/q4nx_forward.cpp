@@ -3668,19 +3668,40 @@ bool Q4nxNpuForward::conv_layer_batch(int l, const std::vector<float>& xn, int M
     std::vector<float> Y((size_t)M * ystride, 0.0f);
     std::vector<float>* rec = verify_open_ ? &sc_rows_[(size_t)l] : nullptr;
     if (rec) rec->resize((size_t)M * (size_t)H);
-    onebit::npu::ShortConvState st;
-    st.hidden = H; st.taps = sc_taps_;
-    st.history.swap(conv_state_[(size_t)l]);
-    bool ok = true;
-    for (int m = 0; m < M && ok; m++) {
-        const float* row = BCX.data() + (size_t)m * stride;
-        if (rec) {
-            float* bx = rec->data() + (size_t)m * (size_t)H;
-            for (int h = 0; h < H; h++) bx[h] = row[h] * row[2 * H + h];
+    // Rows [m0, m1) are ONE sequence's rows, in position order, through that sequence's window.
+    auto run_rows = [&](int m0, int m1) -> bool {
+        if ((size_t)l >= conv_state_.size()) return false;
+        onebit::npu::ShortConvState st;
+        st.hidden = H; st.taps = sc_taps_;
+        st.history.swap(conv_state_[(size_t)l]);
+        bool ok = true;
+        for (int m = m0; m < m1 && ok; m++) {
+            const float* row = BCX.data() + (size_t)m * stride;
+            if (rec) {
+                float* bx = rec->data() + (size_t)m * (size_t)H;
+                for (int h = 0; h < H; h++) bx[h] = row[h] * row[2 * H + h];
+            }
+            ok = onebit::npu::shortconv_step(st, row, sc_w_[(size_t)l].data(), Y.data() + (size_t)m * ystride);
         }
-        ok = onebit::npu::shortconv_step(st, row, sc_w_[(size_t)l].data(), Y.data() + (size_t)m * ystride);
+        st.history.swap(conv_state_[(size_t)l]);
+        return ok;
+    };
+    bool ok = true;
+    if (rows_slot_ == nullptr) {
+        ok = run_rows(0, M);
+    } else {
+        // A step_users() pass carries several sequences: the two projections stay one launch for all M rows, and
+        // between them each slot's rows go through that slot's own window (loaded with its KV), exactly as the
+        // attention block runs once per slot group.
+        for (int g = 0; g < M && ok;) {
+            const int s = (*rows_slot_)[(size_t)g];
+            int g1 = g + 1;
+            while (g1 < M && (*rows_slot_)[(size_t)g1] == s) g1++;
+            if (!load_user_slot(s)) return false;
+            ok = run_rows(g, g1);
+            g = g1;
+        }
     }
-    st.history.swap(conv_state_[(size_t)l]);
     if (!ok) { err_ = "short-convolution state of layer " + std::to_string(l) + " is not sized"; return false; }
     {
         Q4nxProjections p{};
@@ -4723,15 +4744,42 @@ bool Q4nxNpuForward::load_user_slot(int s) {
                " slot cache(s) this pass prepared";
         return false;
     }
+    if (shortconv_ && (size_t)s >= user_conv_.size()) {
+        err_ = "step_users: slot " + std::to_string(s) + " has no convolution windows prepared";
+        return false;
+    }
     if (user_slot_on_ == s) return true;
     if (user_slot_on_ >= 0) {   // put the loaded slot back in its own bank entry
         kcache_.swap(user_kc_[(size_t)user_slot_on_]);
         vcache_.swap(user_vc_[(size_t)user_slot_on_]);
+        if (shortconv_) conv_state_.swap(user_conv_[(size_t)user_slot_on_]);
     }
     kcache_.swap(user_kc_[(size_t)s]);
     vcache_.swap(user_vc_[(size_t)s]);
+    // A short-convolution layer's window is this sequence's as much as its K/V are, so it is loaded with them: the
+    // layer reads and advances conv_state_, which is now this slot's.
+    if (shortconv_) conv_state_.swap(user_conv_[(size_t)s]);
     user_slot_on_ = s;
     return true;
+}
+
+// The windows of a sequence that has not started: zeros, sized per layer exactly as init leaves conv_state_ (a conv
+// layer holds (taps - 1) * hidden floats, any other layer none).
+std::vector<std::vector<float>> Q4nxNpuForward::fresh_conv_windows() const {
+    std::vector<std::vector<float>> w((size_t)c_.NL);
+    if (!shortconv_ || sc_taps_ < 2) return w;
+    for (size_t l = 0; l < w.size() && l < sc_layer_.size(); l++)
+        if (sc_layer_[l]) w[l].assign((size_t)(sc_taps_ - 1) * (size_t)c_.H, 0.0f);
+    return w;
+}
+
+// Everything a slot holds of a sequence, gone: its K/V, its convolution windows, its length. The one definition of
+// "this slot starts from nothing", used when a slot restarts at position 0 and when a pass failed part-way.
+void Q4nxNpuForward::empty_user_slot(size_t s) {
+    if (s < user_kc_.size()) user_kc_[s].assign((size_t)c_.NL, {});
+    if (s < user_vc_.size()) user_vc_[s].assign((size_t)c_.NL, {});
+    if (shortconv_ && s < user_conv_.size()) user_conv_[s] = fresh_conv_windows();
+    if (s < user_len_.size()) user_len_[s] = 0;
 }
 
 bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vector<int>& pos,
@@ -4752,16 +4800,8 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
                "MLA), which one shared pass would corrupt across users";
         return false;
     }
-    // A short-convolution layer has no KV at all: its state is the window of its last inputs, one per layer for the
-    // whole model. Swapping KV per slot does not touch it, so every slot would run through the window the previous row
-    // left, whoever that row belonged to, and a slot that starts again at position 0 would start inside the last
-    // conversation's window. Measured on the fabricated LFM2 and LFM3 containers before this refusal: accepted, and the
-    // first decode row already differed from the sequence's own run (review of engine#2978's fix).
-    if (shortconv_) {
-        err_ = "step_users: this model has short-convolution layers, whose input window is per-sequence state beside the "
-               "KV cache; one shared pass would run every user through the same window";
-        return false;
-    }
+    // Short-convolution layers (LFM2, LFM3) are NOT refused: their per-sequence state is the window of the layer's
+    // last inputs, and each slot has its own (user_conv_), loaded with the slot's KV and cleared with it.
     if (noncausal_attn_ || bidir_sliding_) {
         err_ = "step_users: a noncausal pack encodes the whole prompt of ONE sequence per pass, so users cannot share "
                "a pass on it";
@@ -4780,6 +4820,13 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
             return false;
         }
     }
+    // Checked here, before a slot is cleared or a row is run: a pass that fails later empties its slots (below), and a
+    // mistyped token id should cost the caller a refusal, not its sequences.
+    for (size_t m = 0; m < M; m++)
+        if (tokens[m] < 0 || tokens[m] >= c_.NV) {
+            err_ = "step_users: token out of range (row " + std::to_string(m) + ")";
+            return false;
+        }
     int smax = -1;
     for (size_t m = 0; m < M; m++) {
         if (slot[m] < 0 || pos[m] < 0) { err_ = "step_users: negative slot or position"; return false; }
@@ -4816,6 +4863,11 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
         if (user_vc_[s].empty()) user_vc_[s].assign((size_t)c_.NL, {});
     }
     if (user_len_.size() < (size_t)smax + 1) user_len_.resize((size_t)smax + 1, 0);
+    if (shortconv_) {   // a slot's windows start as zeros, which is what a sequence at position 0 convolves over
+        if (user_conv_.size() < (size_t)smax + 1) user_conv_.resize((size_t)smax + 1);
+        for (size_t s = 0; s <= (size_t)smax; s++)
+            if (user_conv_[s].empty()) user_conv_[s] = fresh_conv_windows();
+    }
     // HOW MANY POSITIONS EACH SLOT HOLDS. A row appends its keys at its own position and then reads 0..pos, so a position
     // beyond what the slot holds reads past the cache (a fresh slot asked for position 5 reads an empty array: measured,
     // a segfault in npu_batch_decode_test). The first row of a slot must therefore sit exactly where the slot's sequence
@@ -4841,13 +4893,13 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
     for (size_t m = 0; m < M; m++) {
         if (m > 0 && slot[m] == slot[m - 1]) continue;
         if (pos[m] != 0) continue;
-        user_kc_[(size_t)slot[m]].assign((size_t)c_.NL, {});
-        user_vc_[(size_t)slot[m]].assign((size_t)c_.NL, {});
-        user_len_[(size_t)slot[m]] = 0;
+        empty_user_slot((size_t)slot[m]);   // K/V, the convolution windows of a short-convolution model, the length
     }
     // The pass owns the working caches for its duration: the model's own two are parked and put back whatever happens.
+    // So are the model's convolution windows, for the same reason: a pass must not advance the single-sequence state.
     own_kc_.swap(kcache_);
     own_vc_.swap(vcache_);
+    if (shortconv_) own_conv_.swap(conv_state_);
     user_slot_on_ = -1;
     rows_pos_ = &pos;
     rows_slot_ = &slot;
@@ -4865,10 +4917,23 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
     if (user_slot_on_ >= 0) {
         kcache_.swap(user_kc_[(size_t)user_slot_on_]);
         vcache_.swap(user_vc_[(size_t)user_slot_on_]);
+        if (shortconv_) conv_state_.swap(user_conv_[(size_t)user_slot_on_]);
         user_slot_on_ = -1;
     }
     own_kc_.swap(kcache_);
     own_vc_.swap(vcache_);
+    if (shortconv_) own_conv_.swap(conv_state_);
+    if (!ok) {
+        // A FAILED PASS LEAVES ITS SLOTS EMPTY. The layers run one after another, so a pass that stops part-way has
+        // appended this pass's keys (and advanced the windows) in the layers it reached and not in the rest, while the
+        // slot's length still says what it held before. Continuing from that would be accepted and would read rows
+        // that belong to the failed pass. So every slot that had a row in this pass is emptied, the error says so, and
+        // the only start those slots accept next is position 0. Slots that were not in the pass keep everything.
+        for (size_t m = 0; m < M; m++)
+            if (m == 0 || slot[m] != slot[m - 1]) empty_user_slot((size_t)slot[m]);
+        err_ += " (step_users: the pass did not complete, so the slots it carried were emptied; their sequences start "
+                "again at position 0)";
+    }
     return ok;
 }
 

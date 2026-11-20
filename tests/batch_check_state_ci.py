@@ -560,7 +560,11 @@ def main():
             # arm, not a reason to skip it.
             print(f"FAIL  {os.path.basename(sys.argv[1])} skipped on the fabricated container (init_host refused it)")
             return 1
-        if family in ("lfm3", "qwen2", "qwen2vl", "qwen2_untied", "hy_v3", "hy_v3_sgate") and r.returncode == 0:
+        # Only batch_check_state_test writes the sequential logits the reference is compared with; any other binary
+        # run on the container (step_users_test, npu_batch_slot_reuse_test) is judged by its own exit code.
+        writes_logits = os.path.basename(sys.argv[1]).startswith("batch_check_state_test")
+        if (writes_logits and family in ("lfm3", "qwen2", "qwen2vl", "qwen2_untied", "hy_v3", "hy_v3_sgate")
+                and r.returncode == 0):
             ours = np.fromfile(logits_out, dtype=np.float32)[:VOCAB]
             ref = {"lfm3": lfm3_reference, "hy_v3": hyv3_reference, "hy_v3_sgate": hyv3_reference}.get(family, qwen2_reference)(out, np, [1, 2, 3, 4, 5, 6], shapes)
             corr = float(np.corrcoef(ours, ref)[0, 1])

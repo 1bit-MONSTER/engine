@@ -814,9 +814,14 @@ cache (`load_user_slot()` swaps it into the working pair), so a slot continues f
 model's own single-sequence cache is untouched between calls. A slot whose first row is **position 0** starts a new
 sequence, so its cache is cleared first -- position 0 means there what it means everywhere else in the engine, and a
 re-used slot never answers from the previous conversation's K/V.
-- A model whose state is more than KV is **refused by name**: GDN linear attention and MLA keep a recurrence or an
-  absorption state per sequence, a short-convolution layer (LFM2, LFM3) keeps a window of its last inputs per
-  sequence, and a noncausal pack encodes one prompt per pass. A model that falls back to
+- A short-convolution layer (LFM2, LFM3) has no KV; its per-sequence state is the window of its last inputs. Each
+  slot keeps its own windows beside its KV, loaded and cleared with it, so those models share a pass too. The cost
+  is `(kernel length - 1) x hidden` floats per conv layer per slot.
+- A pass that fails after it started leaves the slots it carried **empty**: the layers it reached have this pass's
+  rows and the others do not, so those sequences start again at position 0 and the error says so. Slots that were
+  not in the pass are untouched.
+- A model whose other state is more than KV is **refused by name**: GDN linear attention and MLA keep a recurrence
+  or an absorption state per sequence, and a noncausal pack encodes one prompt per pass. A model that falls back to
   per-token `step()` has no batched body to share and is refused for that reason.
 - The kernel side is unchanged: the projections were already one launch per M rows, and `rows_context` already takes
   the read length and window start per row.

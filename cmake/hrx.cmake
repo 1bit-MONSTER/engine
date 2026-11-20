@@ -205,7 +205,12 @@ if(ONEBIT_GPU_PRIVATE)
     # `pin_moved` green, a clean configure and a successful build, and still get a binary that refuses to load, because
     # the kernels compiled are from a different commit than the one this repo pins (measured twice on 2026-11-20: the
     # add-on sat at 280f2e0037 while the pin expected bc3051d5e9, and every `1bit serve` aborted with 26 ABI mismatches).
-    # Say it at configure time, where the two values are both in hand.
+    #
+    # A WARNING by default, and that is a correction to the first version of this check (#2957): across this box most
+    # worktrees deliberately hold an add-on that is not the engine pin (a lane mid-experiment, a pin under test), and a
+    # FATAL stops every one of them at configure time. The check's value is the sentence it prints -- both shas, both
+    # remedies -- not the exit status, so -DONEBIT_GPU_PRIVATE_STRICT_PIN=ON is how a release build asks for the hard
+    # failure, and -DONEBIT_GPU_PRIVATE_ALLOW_ANY_PIN=ON silences it entirely.
     if(NOT ONEBIT_GPU_PRIVATE_ALLOW_ANY_PIN)
         set(_hrx_gpu_kernels_config "${CMAKE_SOURCE_DIR}/config/gpu-kernels.config")
         set(_hrx_gpu_private_head "")
@@ -217,18 +222,29 @@ if(ONEBIT_GPU_PRIVATE)
             file(READ "${_hrx_gpu_kernels_config}" _hrx_gpu_kernels_pin)
             string(REGEX MATCH "sha=([0-9a-f]+)" _hrx_gpu_pin_match "${_hrx_gpu_kernels_pin}")
             set(_hrx_gpu_pin "${CMAKE_MATCH_1}")
-            if(_hrx_gpu_private_rc EQUAL 0 AND _hrx_gpu_pin AND
-               NOT _hrx_gpu_private_head MATCHES "^${_hrx_gpu_pin}")
-                message(FATAL_ERROR
+            # Three outcomes, said apart: the check could not look, it looked and they agree, or it looked and they do
+            # not. The first version printed "matching" for the first case too, which is the sentence a reader trusts
+            # most and the one that was least true.
+            if(NOT _hrx_gpu_private_rc EQUAL 0 OR NOT _hrx_gpu_pin)
+                message(STATUS "ONEBIT_HRX: cannot tell whether ${ONEBIT_GPU_PRIVATE} is the pinned add-on "
+                               "(${_hrx_gpu_kernels_config} unreadable or git rev-parse failed), so no comparison was made")
+            elseif(_hrx_gpu_private_head MATCHES "^${_hrx_gpu_pin}")
+                message(STATUS "ONEBIT_HRX: add-on at ${_hrx_gpu_private_head}, matching config/gpu-kernels.config")
+            else()
+                set(_hrx_gpu_pin_problem
                     "ONEBIT_GPU_PRIVATE is not the add-on this repo pins.\n"
                     "  config/gpu-kernels.config pins ${_hrx_gpu_pin}\n"
                     "  ${ONEBIT_GPU_PRIVATE} is at      ${_hrx_gpu_private_head}\n"
                     "The kernels compiled here would be from a different commit than the one the repo ships, and the\n"
                     "add-on's ABI check refuses to load such a binary at run time (engine#2935). Either\n"
                     "  git -C ${ONEBIT_GPU_PRIVATE} checkout ${_hrx_gpu_pin}\n"
-                    "or, to build a modified add-on deliberately, configure with -DONEBIT_GPU_PRIVATE_ALLOW_ANY_PIN=ON.")
+                    "or pass -DONEBIT_GPU_PRIVATE_ALLOW_ANY_PIN=ON if this tree is meant to differ.")
+                if(ONEBIT_GPU_PRIVATE_STRICT_PIN)
+                    message(FATAL_ERROR "${_hrx_gpu_pin_problem}")
+                else()
+                    message(WARNING "${_hrx_gpu_pin_problem}")
+                endif()
             endif()
-            message(STATUS "ONEBIT_HRX: add-on at ${_hrx_gpu_private_head}, matching config/gpu-kernels.config")
         endif()
     endif()
 endif()

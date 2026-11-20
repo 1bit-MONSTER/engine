@@ -1551,6 +1551,10 @@ if(Python3_Interpreter_FOUND)
     # which `serve_routes_check.py` now carries with arms (a regex route, and srv.Get), so the second check and its
     # row are gone rather than kept in step by hand.
     add_python_test(tool_selftest_serve_routes ${CMAKE_SOURCE_DIR}/tools/ci/serve_routes_check.py --self-test)
+    # Hermetic (--self-test over fixtures): every FA decode-split expectation must name a readable matcher
+    # and carry the padded fixture plus the storage guard. Source only, no device. tests_referenced wants a runner.
+    add_test(NAME fa_split_expectation_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/fa_split_expectation_check.py --self-test)
+    set_tests_properties(fa_split_expectation_check PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     add_test(NAME serve_warmup_routes COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/serve_routes_check.py ${CMAKE_SOURCE_DIR})
     # an installed package must find its libraries beside itself: the 2026-11-08 incident's rule, from
     # the installed side that no release gate can reach (engine #1411). Skips without patchelf/readelf.

@@ -38,26 +38,44 @@ def open_prs(repo):
     return [(p["number"], p["headRefName"]) for p in json.loads(out or "[]")]
 
 def stale_finding(repo_dir, branch, base="origin/main"):
-    """(behind, deleted_lines, deleted_files) for `branch` against `base`, or None when the branch is not behind."""
+    """(behind, reverted_lines, files) where the merge deletes lines MAIN gained, or None when nothing is at risk.
+
+    `add == 0` (whole-file removal) was the first filter and it missed the common case: a branch that also edits the file main
+    grew shows `+N/-M` with both non-zero, so the revert of #2789 -- folded_name reverted inside a file it was editing -- counted
+    as zero. The question that separates a revert from a reformat is whether MAIN added lines to that file after the merge-base.
+    """
     rc, out, _ = run("git", "rev-list", "--count", f"{branch}..{base}", cwd=repo_dir)
     if rc != 0:
         return None
     behind = int(out.strip() or 0)
     if behind == 0:
         return None
+    rc, mb, _ = run("git", "merge-base", base, branch, cwd=repo_dir)
+    if rc != 0 or not mb.strip():
+        return None
+    merge_base = mb.strip()
     rc, out, _ = run("git", "diff", "--numstat", base, branch, cwd=repo_dir)
     if rc != 0:
         return None
-    deleted, files = 0, []
+    reverted, files = 0, []
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) != 3:
             continue
-        add, sub, path = parts
-        if sub.isdigit() and int(sub) > 0 and add.isdigit() and int(add) == 0:
-            deleted += int(sub)          # a whole-file removal or a pure deletion hunk
+        _add, sub, path = parts
+        if not sub.isdigit() or int(sub) == 0:
+            continue
+        rc2, g, _ = run("git", "diff", "--numstat", merge_base, base, "--", path, cwd=repo_dir)
+        if rc2 != 0 or not g.strip():
+            continue
+        gained = sum(int(l.split("\t")[0]) for l in g.splitlines() if l.split("\t")[0].isdigit())
+        if gained > 0:
+            reverted += int(sub)
             files.append(path)
-    return behind, deleted, files
+    if not files:
+        return None
+    return behind, reverted, files
+
 
 def self_test():
     ok = True
@@ -90,6 +108,46 @@ def self_test():
         behind, deleted, files = stale_finding(d, "stale") or (0, 0, [])
         chk(behind == 1 and deleted > 0, "a behind branch whose merge deletes lines IS a finding")
         chk("f.txt" in files, "…and names the file it would delete")
+
+    # engine#2992 review: a HUNK-level revert -- the shape seen most often. main gains a line in a file the branch is also
+    # editing, so `numstat` is +N/-M with both non-zero; the old `add == 0` filter called that zero.
+    with tempfile.TemporaryDirectory() as d:
+        g = lambda *a: subprocess.run(("git", *a), cwd=d, capture_output=True, text=True)
+        g("init", "-q"); g("symbolic-ref", "HEAD", "refs/heads/main")
+        g("config", "user.email", "t@e"); g("config", "user.name", "t")
+        pathlib.Path(d, "f.txt").write_text("alpha\nbeta\ngamma\n")
+        g("add", "-A"); g("commit", "-qm", "base")
+        g("branch", "hunk")
+        pathlib.Path(d, "f.txt").write_text("alpha\nbeta\ngamma\nMAIN_GAINED\n")
+        g("add", "-A"); g("commit", "-qm", "main gains a line in f.txt")
+        g("update-ref", "refs/remotes/origin/main", "HEAD")
+        g("checkout", "-q", "hunk")
+        g("update-ref", "refs/remotes/origin/hunk", "HEAD")
+        pathlib.Path(d, "f.txt").write_text("ALPHA\nBETA\ngamma\n")   # branch rewrites the region
+        g("commit", "-qam", "branch edits the same file")
+        f = stale_finding(d, "hunk")
+        chk(f is not None, "a HUNK-level revert (numstat +2/-2, both non-zero) IS a finding -- the case `add == 0` missed")
+        chk(f is not None and "f.txt" in f[2], "…and it names the file main grew and the merge would delete from")
+
+    # …while a branch that is behind but content-identical stays quiet. My first fixture for this ("a reformat behind main")
+    # asserted quiet and FAILED, correctly: a behind branch lacking main's OTHER commits deletes those too, so the reformat was
+    # reverting main's change to a second file. The harmless shape is a branch that carries the same content main gained — behind
+    # by ancestry, identical by tree.
+    with tempfile.TemporaryDirectory() as d:
+        g = lambda *a: subprocess.run(("git", *a), cwd=d, capture_output=True, text=True)
+        g("init", "-q"); g("symbolic-ref", "HEAD", "refs/heads/main")
+        g("config", "user.email", "t@e"); g("config", "user.name", "t")
+        pathlib.Path(d, "shared.txt").write_text("alpha\nbeta\n")
+        g("add", "-A"); g("commit", "-qm", "base")
+        g("branch", "mine")
+        pathlib.Path(d, "shared.txt").write_text("alpha\nbeta\ngamma\n")
+        g("commit", "-qam", "main gains gamma")
+        g("update-ref", "refs/remotes/origin/main", "HEAD")
+        g("checkout", "-q", "mine")
+        pathlib.Path(d, "shared.txt").write_text("alpha\nbeta\ngamma\n")   # same content, independent commit
+        g("commit", "-qam", "the branch already carries gamma")
+        chk(stale_finding(d, "mine") is None,
+            "a branch behind by ancestry but identical in content is NOT a finding -- nothing of main's is deleted")
     return 0 if ok else 1
 
 def main():

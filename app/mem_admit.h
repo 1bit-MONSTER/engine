@@ -71,9 +71,13 @@ constexpr uint64_t kGttReserveDefaultMiB = 16384;
 // GTT, capped at the measured 16 GiB. For GTT >= 64 GiB that is exactly the old number (so #680's headroom is unchanged,
 // bit for bit); below it the box keeps three quarters of its pool usable instead of losing all of it.
 inline uint64_t gtt_reserve_bytes(uint64_t gtt_total) {
+    // engine#2986 follow-up: only a whole, non-negative number of MiB is an override. std::atoll read an empty or mistyped
+    // value ("", "abc") as 0, so GGML_HRX_GTT_RESERVE_MB= removed the reserve outright -- failing open. Anything else is
+    // ignored and the default stands; the fork's pool_reserve_bytes parses it the same way.
     if (const char* e = std::getenv("GGML_HRX_GTT_RESERVE_MB")) {
-        const long long mb = std::atoll(e);
-        if (mb >= 0) return uint64_t(mb) * kMiB;
+        char* end = nullptr;
+        const long long mb = std::strtoll(e, &end, 10);
+        if (end != e && *end == '\0' && mb >= 0 && mb <= (long long)(UINT64_MAX >> 20)) return uint64_t(mb) * kMiB;
     }
     // engine#2995 review: `gtt_total == 0` means the pool could not be READ, not that it is empty. Without this line
     // `quarter` is 0, `0 < cap` is true, and the function returns no reserve at all -- failing open on exactly the input

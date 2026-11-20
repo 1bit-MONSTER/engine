@@ -195,6 +195,11 @@ jobs:
               echo "::error::fork_ctest_known_fail SKIPPED in the one job that has an HRX tree -- the ratchet did not run (engine#3000)"
               exit 1 ;;
           esac
+          # ... and PRINT WHAT IT READ. ctest shows a test's output only on failure, so a passing run said just
+          # "Passed" -- the evidence would disappear exactly when the row goes green, which is the complaint this
+          # change exists for. The ratchet's own summary is in the log ctest kept for that test.
+          grep -h "ctest_known_fail:" "$HRX_BUILD/Testing/Temporary/LastTest.log" | tail -3 \
+            || echo "note: no ctest_known_fail summary in the log -- the row passed without saying what it read"
       # engine#2858: a tree that cannot say where it came from is not a measurement. On 11-18 this tree
       # reported IQ1_S prefill at 11.22 tok/s where four local builds of the same source on the same box gave
       # 56.5-56.6, with identical placement, PPL and kernel names -- and nothing recorded which lowering had

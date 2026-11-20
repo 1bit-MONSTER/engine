@@ -4813,7 +4813,11 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
     for (size_t m = 0; m < M; m++) {
         if (m > 0 && slot[m] == slot[m - 1]) continue;
         const int have = user_len_[(size_t)slot[m]];
-        if (pos[m] != have) {
+        // engine#2978: position 0 is the exception the clearing loop below is written for -- a slot's first row at 0
+        // starts a NEW sequence, and what the previous conversation left in its caches is cleared before the pass. With
+        // no exemption here that path was unreachable, and the refusal message described the very case it refused
+        // ("a re-used slot holds 7 position(s), but this pass starts it at 0").
+        if (pos[m] != have && pos[m] != 0) {
             err_ = "step_users: slot " + std::to_string(slot[m]) + " holds " + std::to_string(have) +
                    " position(s), but this pass starts it at " + std::to_string(pos[m]) +
                    " (each row appends at its own position and reads up to it, so a start that is not the end of the "

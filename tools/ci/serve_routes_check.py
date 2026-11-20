@@ -30,6 +30,10 @@ parser does not read is as silent as a 404 -- the short and spec warm-ups set ll
 `max_completion_tokens`/`max_tokens`, and both requests generated 256 tokens while answering 200. So the same check
 also requires the token limit a warm-up body sets to be a field the request parser actually reads.
 
+Same class, one field type further (engine#2884's `cache_prompt: false`, which the bodies set and nothing read): a
+**boolean** field a warm-up body sets must be a boolean the parser reads, through `bool_field`. The two checks are
+separate on purpose -- a key can be read for one type and ignored for another, and a union would hide it.
+
 Exit: 0 every warm-up path is registered and its token limit is read, 1 one is not (named), 77 a literal could not be
 read.
 """
@@ -48,6 +52,9 @@ BODY_LIMIT = re.compile(r'"(n_predict|max_tokens|max_completion_tokens)"\s*(?:[:
 # only `n_predict` -- which is exactly how engine#2884 stayed invisible through a green check.
 BODY_FN = re.compile(r"static json (warmup_[a-z_]*body)\s*\([^)]*\)\s*\{(.*?)\n\}", re.S)
 READ_LIMIT = re.compile(r'int_field\(\s*body\s*,\s*"(n_predict|max_tokens|max_completion_tokens)"')
+# The boolean half: a field a builder sets to a literal true/false, and the ones the parser reads through bool_field.
+BODY_BOOL = re.compile(r'"([a-z_]+)"\s*,\s*(?:true|false)\b')
+READ_BOOL = re.compile(r'bool_field\(\s*body\s*,\s*"([a-z_]+)"')
 
 
 def routes_and_warmups(text):
@@ -109,6 +116,32 @@ def check(root=None):
         return 1
     print(f"serve_routes: every warm-up body's token limit is read by the parser "
           f"({len(bodies)} builder(s), parser reads {', '.join(read)})")
+
+    # The boolean half (engine#2884's `cache_prompt`): a `false` the body sets and the parser never reads is the same
+    # silence as a 404 -- the request succeeds and does the opposite of what it asked for.
+    try:
+        readers = [(root / "app/forward_serve.cpp").read_text(errors="replace"),
+                   (root / "app/npu_sampling.h").read_text(errors="replace")]
+    except OSError:
+        print("serve_routes: cannot read the parser files, so the boolean half is looking at nothing", file=sys.stderr)
+        return 77
+    bools = {name: sorted(set(BODY_BOOL.findall(src))) for name, src in BODY_FN.findall(text)}
+    read_bools = sorted({k for r in readers for k in READ_BOOL.findall(r)})
+    if not any(bools.values()) or not read_bools:
+        print(f"serve_routes: {sum(len(v) for v in bools.values())} boolean body field(s) and "
+              f"{len(read_bools)} bool_field read(s): one literal moved, so the boolean half is looking at nothing",
+              file=sys.stderr)
+        return 77
+    unread_bools = [(name, keys) for name, keys in bools.items() if keys and not set(keys) & set(read_bools)]
+    for name, keys in unread_bools:
+        print(f"serve_routes: {name}() sets {', '.join(keys)}, and the parser reads only "
+              f"{', '.join(read_bools)} through bool_field -- that request answers 200 and the field does nothing "
+              f"(engine#2884)")
+    if unread_bools:
+        print(f"serve_routes: {len(unread_bools)} warm-up body builder(s) set a boolean the parser never reads")
+        return 1
+    print(f"serve_routes: every warm-up body's boolean field is read by the parser "
+          f"(parser reads {', '.join(read_bools)})")
     return 0
 
 
@@ -141,6 +174,13 @@ out.push_back(json{ { "path", "/completion" } });'''
     arm("a parser read is found", READ_LIMIT.findall('int_field(body, "n_predict"') == ["n_predict"])
     arm("an unrelated field is neither", BODY_LIMIT.findall('{"prompt", s}') == [] and
         READ_LIMIT.findall('int_field(body, "top_k"') == [])
+    # engine#2884's boolean half: `cache_prompt: false` was set by both warm-up bodies and read by nothing.
+    arm("a body boolean is found", BODY_BOOL.findall('{"temperature", 0}, {"cache_prompt", false}') ==
+        ["cache_prompt"])
+    arm("a bool_field read is found", READ_BOOL.findall('bool_field(body, "cache_prompt", true)') == ["cache_prompt"])
+    arm("an int field is not a boolean read",
+        READ_BOOL.findall('int_field(body, "cache_prompt")') == [] and
+        BODY_BOOL.findall('{"n_predict", 0}') == [])
     print(f"serve_routes: {'ok' if not fails else f'{fails} failed'}")
     return 0 if not fails else 1
 

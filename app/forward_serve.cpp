@@ -342,6 +342,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     npu::Options opts;
     std::unique_ptr<npu::Grammar> grammar;
     int max_tokens = 256;
+    bool cache_prompt = true;
     try {
         // Both read here, not before: a wrong type must be the 400 below, not a json::type_error that escapes
         // the guard and answers 500 with an empty body (engine#1106).
@@ -352,6 +353,12 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         max_tokens = npu::int_field(body, "max_completion_tokens",
                                     npu::int_field(body, "n_predict",
                                                    npu::int_field(body, "max_tokens", 256)));
+        // llama.cpp's `cache_prompt` (default true): false means this request neither reuses a cached prefix nor leaves
+        // one behind. The in-process route has the prefix cache ON by default (8 slots) and nothing read this field, so
+        // a client asking not to be cached was served from the cache anyway -- and our own two warm-up bodies
+        // ({"cache_prompt": false}) ask exactly that. Read with bool_field so a wrong type is the route's 400, not the
+        // 500 of engine#1106.
+        cache_prompt = npu::bool_field(body, "cache_prompt", true);
         opts = npu::options_from_body(body);
         // logprobs is served in the chat shape; the legacy /v1/completions shape is a different
         // object this route does not implement, and a silently dropped field is what it must not do.
@@ -389,7 +396,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     // Returns the finish_reason the request earned: "stop" for an end-of-sequence token,
     // a stop sequence or a grammar that allows nothing more, "length" when the token
     // budget ran out.
-    auto run = [&e, &req, prompt, system_prompt, prompt_ids, prompt_is_ids, max_tokens, chat, &opts, gram, &stats, dump_req, bridge, images](
+    auto run = [&e, &req, prompt, system_prompt, prompt_ids, prompt_is_ids, max_tokens, cache_prompt, chat, &opts, gram, &stats, dump_req, bridge, images](
                    const std::function<bool(const std::string&, const std::vector<Emitted>&)>& on_text) {
         std::string finish = "stop";
         // The tokenizer is const and keeps no per-call state, so it runs before the lock.  A caller
@@ -491,7 +498,12 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // full-length hit: the answer is drawn from the last position's logits and a snapshot holds
         // state, not logits, so that token is run again.
         int resume = 0;
-        if (e.prefix && e.prefix->enabled()) {
+        if (!cache_prompt && e.prefix && e.prefix->enabled()) {
+            // A refusal to consult the cache is a decision, so the [prefix] line below says so rather than staying
+            // silent: "no slot" and "you asked for no slot" must not read the same in a log (#650).
+            stats.prefix = npu::PrefixDecision{-1, 0, "cache_prompt: false"};
+        }
+        if (cache_prompt && e.prefix && e.prefix->enabled()) {
             const npu::PrefixDecision d = e.prefix->lookup(cache_ids);
             stats.prefix = d;
             // One token short of both the slot and the prompt: the snapshot stops one token short (see the save
@@ -630,7 +642,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                     off += take - 1;
                     continue;
                 }
-                if (off + take == n && e.prefix && e.prefix->enabled()) {
+                if (off + take == n && cache_prompt && e.prefix && e.prefix->enabled()) {
                     Q4nxNpuForward::StateSnapshot snap;
                     if (e.fwd->snapshot_state(off, snap)) {
                         std::string why;

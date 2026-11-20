@@ -96,5 +96,25 @@ check "arm3: an unreadable environ is its OWN state" "$?" "2"
 check "arm3: and it prints nothing (no shell 'Permission denied' leak)" "${errs:-}" ""
 rm -f "$src"; rm -rf "$d2"
 
+# --- arm 3: an environ the teardown cannot open is COUNTED, and the hold still finishes (engine#2917) ----
+# The count is only worth having if it reaches the warning, and it did not: `escaped=$(env_survivors "$mine")` ran the
+# sweep in a command-substitution subshell, so ENV_UNREADABLE died with it and the `::warning::` read 0 on every run.
+# `GPU_HOLD_PROC` is the sweep's root, so this arm builds the tree instead of racing the real /proc.
+c="$work/arm3"; mkdir -p "$c/q" "$work/proc/999998" "$work/proc/999997"
+printf 'GPU_HOLD_TICKET=survivors pid 999998 Thu Nov  9 10:00:00 2026\0PATH=/usr/bin\0' > "$work/proc/999998/environ"
+printf 'gpu-hold\0-l\0survivors\0' > "$work/proc/999998/cmdline"
+# Unopenable for EVERY user: a dangling symlink. `chmod 000` does not do it -- CI's build job runs as root, where a 0000
+# file still opens, and the first version of this arm failed there for that reason alone.
+ln -s "$work/proc/999997/no-such-environ" "$work/proc/999997/environ"
+printf 'payload\0' > "$work/proc/999997/cmdline"
+GPU_HOLD_PROC="$work/proc" GPU_QUEUE_DIR="$c/q" GPU_TOKEN_FILE="$c/token" GPU_HOLD_LOG="$c/log" \
+GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=2 \
+GPU_HOLD_TCTL_START=999 GPU_HOLD_TCTL_FILE="$work/tctl" GPU_HOLD_THERMAL_FLAG="$c/none" \
+    "$hold" -t 1 -l survivors -- /bin/true > "$c/out" 2>&1
+rc3=$?
+check "arm3: an unopenable environ does not abort the hold" "$rc3" "0"
+counted=$(grep -c 'could not be inspected' "$c/log" 2>/dev/null || true)
+check "arm3: the unreadable process is counted IN THE WARNING, not just in a subshell" "$counted" "1"
+
 [ "$fails" = 0 ] && { echo "gpu_hold_survivors: ok"; exit 0; }
 echo "gpu_hold_survivors: $fails failure(s)"; exit 1

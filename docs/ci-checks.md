@@ -44,6 +44,17 @@ never examined: a fault census counting lines instead of events, a loss check co
 missing, a skip that a baseline made acceptable. Note that `SKIP_RETURN_CODE 77` does **not** convert a `2` into a skip
 (`77` is a skip); a ctest row that wants "cannot tell → skip" needs an explicit mapping.
 
+**A row that did not run is neither a pass nor a failure**, and the exit code alone does not always say so. The fork's
+HRX test runner (`tests/testing_suite.h`) answers `77` for a device case, or a whole run of them, that could not see a
+device — but a run whose host cases ran and whose device cases did not still exits `0`, and the hand-written `test-hrx-*`
+rows exit `1`. What all of them share is one line on their output, `test skipped: no device available`, which is also
+the fork's `FAIL_REGULAR_EXPRESSION` (engine#2393). So `ctest_known_fail` reads ctest's per-row outputs
+(`--outputs <build>/Testing/Temporary/LastTest.log`) and counts those rows in a column of their own: they are not
+known failures, not new failures and not "now passing", and the row `fork_ctest_known_fail` **fails** on them, because
+its subject is the hardware. `ONEBIT_FORK_CTEST_NO_DEVICE=skip` is the explicit skip (`77`) for a box that is allowed to
+have no device. Do not add `SKIP_RETURN_CODE 77` to a row that relies on that regex: on ctest 4.2.3 the skip code wins,
+and the red row becomes a green one (engine#2912).
+
 ## The questions, by family
 
 **Is the thing we shipped the thing we reviewed?** `merged_tail_check` (a commit pushed after its PR merged),

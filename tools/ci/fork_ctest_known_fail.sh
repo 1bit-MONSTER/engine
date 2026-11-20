@@ -38,7 +38,17 @@
 #     how the first attempt died on `ggml-backend-impl.h: file not found` while that header existed at
 #     the pinned sha. The pinned submodule is verified before the suite is believed.
 #
-# Exit: 0 no new failure, 1 a failure the baseline does not name, 2 cannot tell, 77 not applicable.
+#   * It does not count a row that never touched a device (engine#2912). The fork's HRX rows print
+#     "test skipped: no device available" when the GPU is absent, busy or mid-reset, and ctest calls
+#     most of them Failed -- so against the baseline they read as known failures (a green row over
+#     nothing) or as new ones (a regression nobody made). The ratchet is handed ctest's per-row
+#     outputs and reports those rows in their own column. The suite's subject is the hardware, so
+#     that is a FAILURE of this row; a box that is allowed to have no device says so with
+#     ONEBIT_FORK_CTEST_NO_DEVICE=skip and gets 77 instead. A new failure still exits 1 either way.
+#
+# Exit: 0 no new failure and every row that needs a device had one, 1 a failure the baseline does not
+# name or a row that did not run on a device, 2 cannot tell, 77 not applicable (or, with
+# ONEBIT_FORK_CTEST_NO_DEVICE=skip, rows that did not run on a device).
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -49,6 +59,12 @@ FORK="$HRX_BUILD/hrx/llama"
 skip() { echo "fork_ctest_known_fail: SKIP -- $*"; exit 77; }
 
 [ "${ONEBIT_FORK_CTEST:-0}" = 1 ] || skip "opt-in: set ONEBIT_FORK_CTEST=1 to run the fork's suite (a fork build tree plus 112 tests)"
+
+NO_DEVICE="${ONEBIT_FORK_CTEST_NO_DEVICE:-fail}"
+case "$NO_DEVICE" in
+    fail|skip) : ;;
+    *) echo "fork_ctest_known_fail: ONEBIT_FORK_CTEST_NO_DEVICE must be 'fail' or 'skip' (got '$NO_DEVICE')" >&2; exit 2 ;;
+esac
 
 [ -f "$ROOT/tools/ci/ctest_known_fail.py" ] || skip "tools/ci/ctest_known_fail.py is not on this tree (engine#2825 lands it)"
 [ -f "$ROOT/tools/ci/ctest_known_fail.txt" ] || skip "tools/ci/ctest_known_fail.txt is not on this tree"
@@ -106,6 +122,13 @@ esac
 # tee, because the ratchet reads a log and ctest does not write one by itself. `|| true` is
 # load-bearing: under `set -e` a non-zero ctest ends the script HERE, before the ratchet runs, and
 # every known failure would then fail the row -- the one thing the baseline exists to prevent.
+#
+# ctest keeps each row's output in Testing/Temporary/LastTest.log until the next run rewrites it, and that
+# file is how the ratchet tells "did not run on a device" from "failed" (engine#2912). It is removed first:
+# a ctest that dies before writing it must not be judged by the previous run's outputs.
+OUTPUTS=Testing/Temporary/LastTest.log
+rm -f "$OUTPUTS"
 ctest -j 4 --timeout 600 -E '^(hrx-ops-test|test-hrx-ops|test-hrx-ops-loom)$' 2>&1 | tee ctest.log || true
 
-exec python3 "$ROOT/tools/ci/ctest_known_fail.py" --log ctest.log --root "$ROOT"
+exec python3 "$ROOT/tools/ci/ctest_known_fail.py" --log ctest.log --root "$ROOT" \
+    --outputs "$OUTPUTS" --no-device "$NO_DEVICE"

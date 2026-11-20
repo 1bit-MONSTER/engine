@@ -27,8 +27,17 @@ row that only checked "it ran":
     opt-in, build tree, submodule absent   -> 2    cannot tell
     opt-in, build tree, submodule stale    -> 2    cannot tell, and the message names both shas
 
-Every fixture stops before `ctest` runs: the skip branches and the two refusals are all upstream of
+Those fixtures stop before `ctest` runs: the skip branches and the two refusals are all upstream of
 the suite, which is the property that makes this hermetic.
+
+And the state the row was blind to (engine#2912), on a stub `ctest` that writes the log and the per-row
+outputs a real one does:
+
+    a row printed "test skipped: no device available"            -> 1    did not run on a device; not "NEW failure"
+    ...and the baseline names that row                           -> 1    it used to be 0: "known failure, no new ones"
+    the same, with ONEBIT_FORK_CTEST_NO_DEVICE=skip              -> 77   a box that is allowed to have no device
+    ...but a real new failure beside it                          -> 1    77 never hides a red row
+    ctest wrote no outputs (a stale file is left from a run ago) -> 2    cannot tell
 
 Herds nothing: no device, no network, no fork checkout, ~0.1 s.
 """
@@ -94,15 +103,53 @@ def head_of(repo):
                           capture_output=True, text=True).stdout.strip()
 
 
-def stub_ctest(case, body):
-    """A `ctest` that writes `body` and fails, the way a suite with known failures does."""
+NO_DEVICE = "test skipped: no device available"
+
+
+def last_test_log(rows):
+    """ctest's Testing/Temporary/LastTest.log for `rows` ({name: what the row printed}), in ctest 4.2.3's shape."""
+    out = "Start testing: Nov 20 08:33 AST\n----------------------------------------------------------\n"
+    for index, (name, printed) in enumerate(rows.items(), 1):
+        out += (f"{index}/{len(rows)} Testing: {name}\n{index}/{len(rows)} Test: {name}\n"
+                f"Command: \"/b/bin/{name}\"\nDirectory: /b/tests\n\"{name}\" start time: Nov 20 08:33 AST\n"
+                "Output:\n----------------------------------------------------------\n"
+                f"{printed}<end of output>\nTest time =   0.01 sec\n"
+                "----------------------------------------------------------\nTest Failed.\n"
+                f"\"{name}\" end time: Nov 20 08:33 AST\n\"{name}\" time elapsed: 00:00:00\n"
+                "----------------------------------------------------------\n\n")
+    return out + "End testing: Nov 20 08:33 AST\n"
+
+
+def stub_ctest(case, body, printed=None, outputs=True):
+    """A `ctest` that writes `body` and fails, the way a suite with known failures does.
+
+    Like the real one it leaves each row's output in ./Testing/Temporary/LastTest.log (the cwd is the fork build
+    tree). `printed` is {row: its output}; rows of the FAILED block not named there printed an ordinary failure.
+    `outputs=False` is a ctest that died before writing that file.
+    """
     bin_dir = case / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     (bin_dir / "log.txt").write_text(body)
+    rows = {line.split(" - ")[1].split(" (")[0]: "assertion failed\n" for line in body.splitlines() if " - " in line}
+    rows.update(printed or {})
+    (bin_dir / "last.txt").write_text(last_test_log(rows))
+    write = f"mkdir -p Testing/Temporary && cp {bin_dir / 'last.txt'} Testing/Temporary/LastTest.log\n" if outputs else ""
     ctest = bin_dir / "ctest"
-    ctest.write_text(f"#!/bin/sh\ncat {bin_dir / 'log.txt'}\nexit 8\n")
+    ctest.write_text(f"#!/bin/sh\ncat {bin_dir / 'log.txt'}\n{write}exit 8\n")
     ctest.chmod(0o755)
     return str(bin_dir)
+
+
+def pinned_case(tmp, name):
+    """A fixture that reaches `ctest`: opt-in state, the real ratchet and baseline, submodule and stamp at the pin."""
+    case = tmp / name
+    case.mkdir()
+    root, build = fixture(case, submodule="present", real_ratchet=True)
+    at = head_of(root / "third_party" / "llama.cpp")
+    (build / "bench-stamp.txt").write_text(f"engine=deadbeef0000\nllama_cpp={at[:12]}\n")
+    git(root, "update-index", "--add", "--cacheinfo", f"160000,{at},third_party/llama.cpp")
+    git(root, "commit", "-qm", "pin at head")
+    return case, root, build
 
 
 def run(root, build, extra_env=None):
@@ -232,6 +279,76 @@ def main():
         ok(p.returncode == 2 and "0123456789ab" in p.stderr and at4[:12] in p.stderr,
            "a stamp naming another fork is refused, and the message names both revisions",
            f"rc {p.returncode}: {p.stderr.strip()[-240:]}")
+
+        # 13-17. engine#2912: A ROW THAT DID NOT RUN ON A DEVICE IS NOT A RESULT. The fork's HRX rows print one line
+        #     when the GPU is absent, busy or mid-reset, and ctest calls them Failed. `hrx-backend-test` is in the
+        #     checked-in baseline and `hrx-buffer-test` is not, so the same event read as one known failure and one
+        #     new one. Both shapes of the line are here: a whole run skipped (exit 77 since fork #441) and the
+        #     hand-written sibling's bare line.
+        both = ("The following tests FAILED:\n"
+                "\t 86 - hrx-buffer-test (Failed)                          hrx\n"
+                "\t 88 - hrx-backend-test (Failed)                         hrx\n"
+                "Errors while running CTest\n"
+                "98% tests passed, 2 tests failed out of 111\n")
+        printed = {"hrx-buffer-test": f"{NO_DEVICE} for HRX buffer test (11 device case(s) skipped)\n",
+                   "hrx-backend-test": f"{NO_DEVICE} for hrx-backend-test (device half; the host cases above ran)\n"}
+        case, root, build = pinned_case(tmp, "no-device")
+        stub = stub_ctest(case, both, printed)
+        p = run(root, build, {"ONEBIT_FORK_CTEST": "1", "stub": stub})
+        ok(p.returncode == 1 and "DID NOT RUN ON A DEVICE: hrx-buffer-test" in p.stderr
+           and "DID NOT RUN ON A DEVICE: hrx-backend-test" in p.stderr,
+           "rows that never saw a device fail the row (1) and are named as not having run",
+           f"rc {p.returncode}: {p.stderr.strip()[-300:]}")
+        ok("NEW failure" not in p.stderr and "2 without a device" in p.stdout and "0 known failure(s)" in p.stdout,
+           "...in their own column: not a NEW failure, and not one of the known failures",
+           (p.stdout + p.stderr).strip()[-300:])
+
+        p = run(root, build, {"ONEBIT_FORK_CTEST": "1", "ONEBIT_FORK_CTEST_NO_DEVICE": "skip", "stub": stub})
+        ok(p.returncode == 77 and "SKIP (77)" in p.stderr,
+           "ONEBIT_FORK_CTEST_NO_DEVICE=skip turns that into an explicit skip (77), never a pass",
+           f"rc {p.returncode}: {p.stderr.strip()[-300:]}")
+
+        #     The green tick over nothing: ONLY the baselined row is device-less. This exited 0 with
+        #     "known failure(s), no new ones" before the ratchet read the outputs.
+        only_known = ("The following tests FAILED:\n"
+                      "\t 88 - hrx-backend-test (Failed)                         hrx\n"
+                      "Errors while running CTest\n"
+                      "99% tests passed, 1 tests failed out of 111\n")
+        case, root, build = pinned_case(tmp, "no-device-baselined")
+        stub = stub_ctest(case, only_known, {"hrx-backend-test": printed["hrx-backend-test"]})
+        p = run(root, build, {"ONEBIT_FORK_CTEST": "1", "stub": stub})
+        ok(p.returncode == 1 and "no new ones" not in p.stdout,
+           "a device-less row the baseline names is not counted as a known failure (was: exit 0)",
+           f"rc {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}")
+        #     ...and the same row failing for a reason of its own, on a device, is still just a known failure.
+        p = run(root, build, {"ONEBIT_FORK_CTEST": "1", "stub": stub_ctest(case, only_known)})
+        ok(p.returncode == 0 and "no new ones" in p.stdout,
+           "the same baselined row failing ON a device is still a known failure (0)",
+           f"rc {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}")
+
+        #     77 must not hide a red row: a real new failure beside the device-less ones is 1 under either policy.
+        mixed = both.replace("Errors while", "\t 20 - test-brand-new (SEGFAULT)\nErrors while").replace("2 tests", "3 tests")
+        case, root, build = pinned_case(tmp, "no-device-plus-new")
+        p = run(root, build, {"ONEBIT_FORK_CTEST": "1", "ONEBIT_FORK_CTEST_NO_DEVICE": "skip",
+                              "stub": stub_ctest(case, mixed, printed)})
+        ok(p.returncode == 1 and "NEW failure: test-brand-new" in p.stderr,
+           "a new failure beside device-less rows is still 1 under NO_DEVICE=skip",
+           f"rc {p.returncode}: {p.stderr.strip()[-300:]}")
+
+        #     A ctest that wrote no outputs leaves the PREVIOUS run's file in the build tree. Judging by it would
+        #     report last run's devices; the row removes it first and then cannot tell.
+        case, root, build = pinned_case(tmp, "stale-outputs")
+        stale = build / "hrx" / "llama" / "Testing" / "Temporary"
+        stale.mkdir(parents=True)
+        (stale / "LastTest.log").write_text(last_test_log({"hrx-backend-test": "assertion failed\n"}))
+        p = run(root, build, {"ONEBIT_FORK_CTEST": "1", "stub": stub_ctest(case, only_known, outputs=False)})
+        ok(p.returncode == 2 and "no outputs file" in p.stderr,
+           "no outputs from THIS run is 'cannot tell' (2), not last run's answer",
+           f"rc {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}")
+
+        p = run(root, build, {"ONEBIT_FORK_CTEST": "1", "ONEBIT_FORK_CTEST_NO_DEVICE": "maybe"})
+        ok(p.returncode == 2 and "ONEBIT_FORK_CTEST_NO_DEVICE" in p.stderr,
+           "a policy that is neither fail nor skip is refused (2)", f"rc {p.returncode}: {p.stderr.strip()[-200:]}")
 
     print("fork_ctest_row: ok" if not fails else f"fork_ctest_row: {fails} failure(s)")
     return 0 if not fails else 1

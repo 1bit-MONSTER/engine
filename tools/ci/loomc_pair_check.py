@@ -45,6 +45,10 @@ from pathlib import Path
 
 SYMBOL = re.compile(r"\bloomc_[A-Za-z0-9_]+\b")
 
+# The last call's all-conditional uses, so the report can name them without
+# changing the exit code: a guard that is always excluded is not a breakage.
+CONDITIONAL = set()
+
 
 def fork_dir(path: Path) -> Path:
     """The `ggml-hrx` source dir, given either the llama.cpp root or that dir itself.
@@ -64,15 +68,34 @@ def symbols_used(fork: Path):
 
     Comments are stripped first: a symbol named only in a comment is not a link
     dependency, and counting it would invent a breakage.
+
+    Preprocessor conditionals are tracked too (engine#2916, found in use): a use
+    inside `#if defined(SOMETHING)` is not a link dependency when SOMETHING is never
+    defined. Measured here -- `loomc_amdgpu_emit_options_t` and
+    `loomc_amdgpu_runtime_global_flags_t` appear ONLY inside
+    `#if defined(LOOMC_AMDGPU_RUNTIME_GLOBALS_KNOWN)`, which nothing defines, so both
+    were reported as missing until this. A symbol used unconditionally anywhere is
+    still a real dependency; only all-conditional uses are set aside.
     """
-    used = set()
     fork = fork_dir(fork)
+    unconditional, conditional = set(), set()
     for f in sorted(fork.glob("*.cpp")) + sorted(fork.glob("*.h")):
         text = f.read_text(errors="replace")
         text = re.sub(r"//[^\n]*", " ", text)
         text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-        used |= set(SYMBOL.findall(text))
-    return used
+        depth = 0
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                if re.match(r"#\s*if", stripped):
+                    depth += 1
+                elif re.match(r"#\s*endif", stripped):
+                    depth = max(0, depth - 1)
+                continue
+            (conditional if depth else unconditional).update(SYMBOL.findall(line))
+    CONDITIONAL.clear()
+    CONDITIONAL.update(conditional - unconditional)
+    return unconditional
 
 
 def symbols_declared(hrx: Path):
@@ -173,6 +196,26 @@ def self_test():
         missing, _, _ = check(fork, hrx)
         chk(missing == [], "a declaration found in a moved header still counts")
 
+        # a use inside an `#if defined(...)` that nothing defines is not a dependency
+        (fork / "loom-jit.cpp").write_text(
+            "using A = loomc_real_one;\n"
+            "#if defined(NEVER_DEFINED_ANYWHERE)\n"
+            "using G = loomc_guarded_symbol;\n"
+            "#endif\n")
+        (hrx / "loom/binding/c/include/loomc.h").write_text("void loomc_real_one(void);\n")
+        missing, _, _ = check(fork, hrx)
+        chk(missing == [], "a guarded use adds no missing symbol")
+        chk(CONDITIONAL == {"loomc_guarded_symbol"}, "and it is reported separately, by name")
+        # …but an unconditional use of the same symbol is still real
+        (fork / "loom-jit.cpp").write_text(
+            "using A = loomc_real_one;\nusing G = loomc_guarded_symbol;\n"
+            "#if defined(NEVER_DEFINED_ANYWHERE)\nusing H = loomc_guarded_symbol;\n#endif\n")
+        missing, _, _ = check(fork, hrx)
+        chk(missing == ["loomc_guarded_symbol"],
+            "the same symbol used unconditionally IS missing, guard or no guard")
+        chk("loomc_guarded_symbol" not in CONDITIONAL,
+            "…and it is NOT also listed as conditional: one unconditional use decides it")
+
         # the llama.cpp ROOT is as valid an argument as the module dir: this check
         # first failed on the real tree because it accepted only the latter
         root_form = root / "cp"
@@ -201,6 +244,11 @@ def main(argv):
     except CannotTell as e:
         print("loomc_pair_check: cannot tell: %s" % e, file=sys.stderr)
         return 2
+    if CONDITIONAL:
+        print("loomc_pair_check: %d symbol(s) are used only inside a preprocessing guard, so they are "
+              "not counted as missing:" % len(CONDITIONAL))
+        for c in sorted(CONDITIONAL):
+            print("  %s" % c)
     if missing:
         print("loomc_pair_check: %d of %d loomc_* symbol(s) used by the fork are NOT declared by "
               "the pinned hrx-system:" % (len(missing), used), file=sys.stderr)

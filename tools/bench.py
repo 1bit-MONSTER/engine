@@ -101,6 +101,36 @@ def measure(port, args, prompt):
     return {"prompt": pp, **tg}
 
 
+def provenance(binary=None, repo=None):
+    """Which build produced these numbers (engine#2858).
+
+    A bench table quoting tok/s is comparable to another only if both name the build they came from. The shipped CI artifact
+    this issue is about records its build HOST and nothing else -- no git revision in its CMakeCache, no 40-hex commit in the
+    binary -- so a 5x discrepancy could not be attributed to anything. The rule here is the one `recorded_at` learned: an
+    unavailable value is written as the explicit string "unknown", never as an empty field a reader would take for a value.
+    """
+    import hashlib
+    out = {"binary": binary or "unknown", "binary_sha256": "unknown", "engine_rev": "unknown",
+           "engine_dirty": "unknown", "loom_or_iree_rev": "unknown"}
+    if binary:
+        try:
+            out["binary_sha256"] = hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest()
+        except OSError:
+            pass
+    root = repo or str(pathlib.Path(__file__).resolve().parent.parent)
+    def git(*a):
+        import subprocess
+        try:
+            r = subprocess.run(["git", "-C", root] + list(a), capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            return ""
+    if git("rev-parse", "--git-dir"):
+        out["engine_rev"] = git("rev-parse", "HEAD") or "unknown"
+        out["engine_dirty"] = "yes" if git("status", "--porcelain") else "no"
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-m", "--model", required=True, help="the model every config serves")
@@ -164,7 +194,12 @@ def main():
         pathlib.Path(args.json).write_text(json.dumps({
             "model": args.model, "configs": {n: shlex.join(a) for n, a in configs}, "baseline": base,
             "rounds": args.rounds, "prompt_chars": len(prompt), "results": results,
-            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, indent=1))
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "provenance": provenance(shlex.split(configs[base][0])[0] if configs.get(base) else None)},
+            indent=1))
+        pv = provenance(shlex.split(configs[base][0])[0] if configs.get(base) else None)
+        print(f"provenance: rev {pv['engine_rev']} (dirty {pv['engine_dirty']}), "
+              f"binary sha256 {pv['binary_sha256'][:16]}...")
     if lock:
         lock.close()
 

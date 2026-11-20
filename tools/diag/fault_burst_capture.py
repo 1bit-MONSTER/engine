@@ -282,7 +282,13 @@ def render(summary, snaps):
     if summary["repeats"]:
         out.append("  %d access(es) repeat a page already faulted in this burst"
                    % summary["repeats"])
-    if summary["one_40k_window"]:
+    if summary["count"] == 1:
+        # A shape needs at least two points. One access is always "inside one window" and always
+        # a "walk" by the arithmetic, so the sentence below would confirm a structure from a single
+        # datum -- which is how a live 1-access capture (engine#2478, 2026-11-20) read as a
+        # descriptor block's walk with span 0x0 beside it.
+        out.append("  one access: no shape to report (a walk needs at least two)")
+    elif summary["one_40k_window"]:
         out.append("  the whole burst is inside one 40 KiB window: one descriptor block's walk")
     if len(summary["devices"]) > 1:
         out.append("  MORE THAN ONE DEVICE in this burst: not one client's walk")
@@ -347,6 +353,13 @@ def self_test():
         "a repeated address is counted as a repeat, not hidden")
     far = [dict(device="0000:c6:00.1", address=0x100000, flags=0x0007),
            dict(device="0000:c6:00.1", address=0x200000, flags=0x0007)]
+    chk("one descriptor block's walk" not in render(summarize(pages[:1]), []),
+        "a single access reports NO shape, not a one-point walk")
+    chk("no shape to report" in render(summarize(pages[:1]), []),
+        "and it says so explicitly rather than staying silent")
+    chk("one descriptor block's walk" in render(summarize(pages), []),
+        "two or more accesses still get the walk sentence")
+
     chk(summarize(far)["one_40k_window"] is False,
         "accesses a megabyte apart are NOT one descriptor block's window")
     # #2777: the domain separates a host VA (0x0002 here) from a device aperture (0x0003).

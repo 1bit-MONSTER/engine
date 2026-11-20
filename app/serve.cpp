@@ -2356,13 +2356,28 @@ int serve_child(const Options& given) {
     // has no room for, in one line with the numbers, so Lemonade shows why instead of an
     // allocation failure or an OOM minutes later. laya counts its first device.
     if (o.mem_check || o.mem_check_only) {
+        const sysinfo::Memory box_memory = sysinfo::memory();
+        // engine#2986: no --ctx-size on HRX and the model's own context is beyond this machine -> the largest
+        // context that fits with room (app/mem_admit.h, default_ctx), said in one line
+        if (!backends.empty() && backends[0].device.rfind("hrx", 0) == 0) {
+            const admit::CtxChoice c = admit::default_ctx(backends[0].argv, box_memory);
+            if (c.ctx > 0) {
+                backends[0].argv.push_back("-c");
+                backends[0].argv.push_back(std::to_string(c.ctx));
+                std::fprintf(stderr, "1bit serve: memory: no --ctx-size: the model's own ctx %lld needs %.2f GiB, more than this "
+                             "machine has room for; serving ctx %lld (%.2f GiB)%s - pass --ctx-size to choose\n",
+                             c.model_ctx, double(c.need_model) / double(admit::kGiB), c.ctx,
+                             double(c.need_ctx) / double(admit::kGiB),
+                             c.roomy ? "" : ", the smallest it takes: no context leaves the graph-program cache its room");
+            }
+        }
         admit::Need need;
         std::vector<const Launch*> launches;
         if (!backends.empty()) launches.push_back(&backends[0]);
         for (const auto& b : rag) launches.push_back(&b);
         for (const Launch* l : launches)
             if (l->device.rfind("hrx", 0) == 0 || l->device.rfind("cpu", 0) == 0) admit::add_llama_server(need, l->argv);
-        const admit::Verdict v = admit::judge(need, sysinfo::memory());
+        const admit::Verdict v = admit::judge(need, box_memory);
         if (!need.parts.empty() && v.checked) {
             auto gib = [](uint64_t b) { char t[32]; std::snprintf(t, sizeof t, "%.2f", double(b) / double(admit::kGiB)); return std::string(t); };
             std::string parts;

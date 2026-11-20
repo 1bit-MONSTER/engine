@@ -152,25 +152,17 @@ def check(root=None):
     print(f"serve_routes: every warm-up body's token limit is read by the parser "
           f"({len(bodies)} builder(s), parser reads {', '.join(read)})")
 
-    # engine#2897: reading llama.cpp's `n_predict` means owning its sentinel. `-1` is that dialect's "no limit" and
-    # llama-server's own default; clamped to 0 it answers an empty completion with finish_reason "length". So where
-    # the parser reads `n_predict`, the `max_tokens` clamp has to handle a negative value.
+    # engine#2897: the sentinel's *behaviour* is pinned by tests/npu_token_limit_test.cpp (a row CI runs), which is the
+    # right place for it -- this check can only see the shape of an expression. What it can still catch is a call site
+    # that stops using the function every other reader goes through.
     if "n_predict" in read:
-        clamp = [i for i, ln in enumerate(parser.splitlines()) if "std::clamp(max_tokens" in ln]
-        if not clamp:
-            print("serve_routes: no `std::clamp(max_tokens, …)` in app/forward_serve.cpp: that literal moved, so the "
-                  "sentinel half is looking at nothing", file=sys.stderr)
-            return 77
-        lines = parser.splitlines()
-        unguarded = [i + 1 for i in clamp
-                     if "max_tokens < 0" not in "\n".join(lines[max(0, i - 6):i + 1])]
-        for ln in unguarded:
-            print(f"serve_routes: line {ln} clamps max_tokens with no `max_tokens < 0` guard nearby -- llama.cpp's "
-                  f"-1 (no limit) becomes 0 and the request answers empty with finish_reason length (engine#2897)")
-        if unguarded:
-            print(f"serve_routes: {len(unguarded)} max_tokens clamp(s) do not handle the negative sentinel")
+        if "npu::token_limit(" not in parser:
+            print("serve_routes: app/forward_serve.cpp reads `n_predict` and does not call npu::token_limit(...) -- the "
+                  "sentinel's arithmetic is tested (tests/npu_token_limit_test.cpp) but this site bypasses it "
+                  "(engine#2897)")
+            print("serve_routes: 1 call site bypasses the tested token limit")
             return 1
-        print(f"serve_routes: the max_tokens clamp handles llama.cpp's -1 ({len(clamp)} site(s))")
+        print("serve_routes: the token limit is taken from the tested npu::token_limit(...)")
 
     # The boolean half (engine#2884's `cache_prompt`): a `false` the body sets and the parser never reads is the same
     # silence as a 404 -- the request succeeds and does the opposite of what it asked for.

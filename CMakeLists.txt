@@ -835,6 +835,14 @@ add_dependencies(onebit think_template_test)
 add_executable(serve_degenerate_test tests/serve_degenerate_test.cpp)
 target_include_directories(serve_degenerate_test PRIVATE app)
 add_test(NAME serve_degenerate COMMAND serve_degenerate_test)
+
+# engine#2897: the token budget's three cases (-1 is the room, 0 is zero, positive is capped), device-free. Built with
+# `onebit` for the same reason as the target above: a target of its own would need a line in ci.yml, which a lane
+# cannot push.
+add_executable(npu_token_limit_test tests/npu_token_limit_test.cpp)
+target_include_directories(npu_token_limit_test PRIVATE npu)
+add_test(NAME npu_token_limit COMMAND npu_token_limit_test)
+add_dependencies(onebit npu_token_limit_test)
 # Built with `onebit`, which CI's --target list already names: a test target of its own would need a line in
 # .github/workflows/ci.yml, and a PR that edits a workflow cannot be merged by a token without the `workflow` scope.
 add_dependencies(onebit serve_degenerate_test)

@@ -1,0 +1,13 @@
+{
+ "about": "The terms a MODEL WEIGHT FILE is licensed under, recorded per upstream repository, for models whose terms constrain what a user of this engine may do. Not this repository's licence (that is LICENSE, Apache-2.0) and not a software dependency's (those are NOTICE/pyproject). One entry per upstream repo, with the files it covers, because two quantisations of one model share the terms. Read from the upstream LICENSE file, with the date it was read: a licence can change, and a reader needs to know which text the note describes.",
+ "licences": {
+  "LiquidAI/LFM3-1.7B-GGUF": {
+   "licence": "LFM Open License v1.0 (license_name: lfm1.0)",
+   "commercial": "conditional: granted only while annual revenue stays below US$10,000,000 (Threshold, §1 and §5); at or above it, Commercial Use is not licensed under this agreement. Non-profits keep non-commercial and research rights (§5(c)).",
+   "notice": "§4: pass on the licence, retain all notices, and include any NOTICE file. This is not a permissive OSI licence.",
+   "models": ["LFM3-1.7B-Q4_K_M.gguf"],
+   "read_from": "https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF LICENSE, read 2026-11-20",
+   "issue": "engine#2918"
+  }
+ }
+}

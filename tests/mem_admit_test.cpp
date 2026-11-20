@@ -283,13 +283,18 @@ int main() {
                admit::gtt_reserve_bytes(0) == 16 * gib);
 
         // engine#2986 follow-up: the reserve override must be a number, or it is ignored (the fork tests the same arms)
-        for (const char* bad : {"", "abc", "16GiB", "-1"}) {
+        for (const char* bad : {"", "abc", "16GiB", "-1", "\n", "512 MiB"}) {
             ::setenv("GGML_HRX_GTT_RESERVE_MB", bad, 1);
             expect(std::string("GGML_HRX_GTT_RESERVE_MB=\"") + bad + "\" is ignored: an 8 GiB pool keeps its 2 GiB",
                    admit::gtt_reserve_bytes(8ull << 30) == (2ull << 30));
         }
         ::setenv("GGML_HRX_GTT_RESERVE_MB", "0", 1);
         expect("GGML_HRX_GTT_RESERVE_MB=0 is still an override", admit::gtt_reserve_bytes(8ull << 30) == 0);
+        for (const char* spaced : {"512\n", " 512 ", "\t512"}) {
+            ::setenv("GGML_HRX_GTT_RESERVE_MB", spaced, 1);
+            expect("whitespace around the number is accepted on both ends",
+                   admit::gtt_reserve_bytes(8ull << 30) == (512ull << 20));
+        }
         ::setenv("GGML_HRX_GTT_RESERVE_MB", "512", 1);
         expect("GGML_HRX_GTT_RESERVE_MB=512 is still an override", admit::gtt_reserve_bytes(8ull << 30) == (512ull << 20));
         ::unsetenv("GGML_HRX_GTT_RESERVE_MB");

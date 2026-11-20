@@ -335,6 +335,10 @@ def self_test():
     ok(claims("Fixes __#12__") == [12] and claims("Closes *#7*") == [7] and claims("Fixes ~~#9~~") == [9],
        "... and so are underscore, italic and strikethrough markup")
     ok(claims("see `Fixes #99` in the log") == [], "... while a claim inside a code span is still NOT a claim")
+    # The markup class is `*`, `_`, `~` and NOT a backtick: a backticked NUMBER is inside code, and this tool's stated
+    # rule is that a claim written inside code is documentation. `Closes `#12`` is therefore not a claim, and the arm
+    # pins it so a future widening to "any punctuation" has to argue with a failing test (engine#3060 / #3063).
+    ok(claims("Closes `#12` -- quoted in a log line") == [], "... and a backticked NUMBER is inside code, so it is not a claim either")
     ok(claims("Refs #2778 only") == [], "Refs is not a claim -- the whole point of not matching a bare #N")
     ok(claims("see #2778 for context") == [], "a bare mention is not a claim")
     ok(claims("Refs #2779 (the layer its fix does not cover), #2728 (where the defect came from)") == [],

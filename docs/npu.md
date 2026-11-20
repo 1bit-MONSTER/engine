@@ -4363,6 +4363,14 @@ encoder output byte-identical (the encode-only line prints its FNV-1a hash):
 - `ONEBIT_AUDIO_FOLD_EPILOGUE=0` runs a projection's bias, erf-GELU and residual as separate nodes. When on, they are
   applied inside the device dequant, per row block, with the same IEEE operations in the graph's order
   (`npu/audio_epilogue.h`); `AudioRunResult::folded_epilogues` counts them (36 on whisper-small: o, fc1, fc2 x 12).
+- A kernel directory that holds `sealed_i8_b8.elf` and its list `sealed_i8_b8.shapes` (one `K N instance` line per
+  runtime sequence) opens every design on that one ELF, each on its own instance, so they share one hw context.
+  `ONEBIT_WHISPER_NPU_SEALED=0` ignores the sealed files and uses the per-role ELFs. Per-role ELFs each claim the
+  whole array, so a role change between launches is a context switch. On whisper-small that costs about 2.4 ms a
+  launch (an O-shaped launch waited 0.38 ms when every launch stayed on its context and 2.9 ms in the per-role set),
+  and the encoder changes role about 49 times a pass. A staged shape the list does not hold exactly takes the same-K
+  instance with the smallest wider N, so one K768 N3072 instance serves fc1 and the fused q|k|v (staged N2560). The
+  extra weight columns are zero and never copied out.
 - `ONEBIT_WHISPER_MALLOPT=0` keeps glibc's dynamic malloc thresholds. When on, the tool fixes the mmap threshold at
   32 MiB and never trims, so a pass's multi-MB buffers are reused instead of being mapped and faulted in again.
 

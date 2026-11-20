@@ -82,15 +82,17 @@ public:
             if (why) *why = "empty product";
             return false;
         }
-        const ProjectionShape st = staged(ProjectionShape{int(K), int(N)});
-        const int role = role_for(st.k, st.n);
+        const ProjectionShape st0 = staged(ProjectionShape{int(K), int(N)});
+        const int role = role_for(st0.k, st0.n);
         if (role < 0) {
             if (why)
-                *why = "no design for staged K" + std::to_string(st.k) + " N" + std::to_string(st.n) + " (model " +
+                *why = "no design for staged K" + std::to_string(st0.k) + " N" + std::to_string(st0.n) + " (model " +
                        std::to_string(K) + " x " + std::to_string(N) + ")";
             return false;
         }
         const NpuAudioDesign& d = designs_[size_t(role)];
+        // The shape the launch runs at: the design's, which is the staged shape or (role_for's fallback) a wider N.
+        const ProjectionShape st{d.K, d.N};
         if (d.M <= 0) {
             if (why) *why = "design " + std::to_string(role) + " states no rows";
             return false;
@@ -180,10 +182,18 @@ private:
         std::vector<float> padded;   // K_staged x N_staged, until the target has it
     };
 
+    // The design for staged (k, n): the exact one, else the same-K design with the smallest N above n (engine#1783: a sealed
+    // set carries one K768 N3072 instance for both fc1 and the fused q|k|v, whose staged N is 2560). A wider design is
+    // exact too: the weight's extra columns are zero-padded like the staging pad, each output column depends only on its
+    // own weight column and the row's activation scale, and the extra columns are never copied out (dst_n = N).
     int role_for(int k, int n) const {
-        for (size_t i = 0; i < designs_.size(); ++i)
-            if (designs_[i].K == k && designs_[i].N == n) return int(i);
-        return -1;
+        int best = -1;
+        for (size_t i = 0; i < designs_.size(); ++i) {
+            if (designs_[i].K != k || designs_[i].N < n) continue;
+            if (designs_[i].N == n) return int(i);
+            if (best < 0 || designs_[i].N < designs_[size_t(best)].N) best = int(i);
+        }
+        return best;
     }
 
     Weight& weight(const std::string& key, const float* B, int64_t K, int64_t N, const ProjectionShape& st) {

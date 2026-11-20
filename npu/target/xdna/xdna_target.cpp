@@ -155,6 +155,8 @@ bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string&
         // In partition mode (NPU_PARTITION) a role it does not cover is refused: its per-role ELF would be a second
         // `main:seq` and possibly a second width in the model's one context.
         std::string kname = "main:seq";
+        if (size_t(i) < setup_.prefill_kernels.size() && !setup_.prefill_kernels[size_t(i)].empty())
+            kname = setup_.prefill_kernels[size_t(i)];
         if (const char* sp = std::getenv("NPU_I8_SEALED_PREFILL_ELF"); sp && *sp && b8 && !w4_rows_ && !host_gemm) {
             if (const char* inst = q4nx_i8_sealed_prefill_instance(g->role)) {
                 elf = dir + "/" + sp;

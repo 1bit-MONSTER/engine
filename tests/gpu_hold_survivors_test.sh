@@ -73,5 +73,28 @@ check "arm2: the hold succeeds" "$rc2" "0"
 noise=$(grep -c 'previous holder left' "$b/log" 2>/dev/null || true)
 check "arm2: a holder with no record warns about nothing" "$noise" "0"
 
+# engine#2917: the environment sweep reads /proc/<pid>/environ after a separate `-r` test, and a pid can pass `-r` and
+# be reused by another user's process before the open. A granted ticket was lost one second into its hold that way, the
+# command never ran, and the teardown line read clean. So an unreadable environ must be a COUNTED SKIP, a plain
+# non-match must not be counted, and neither may print a shell error or change the sweep's exit status.
+#
+# Driven directly: the helper takes a PATH, so the three states need no /proc and no device. The unreadable case uses a
+# DIRECTORY, which is the deterministic stand-in -- it passes `-r` and fails the read with EISDIR, the same shape as the
+# EACCES the race produces (verified separately against /proc/1/environ, which is unreadable to this user).
+src=$(mktemp); d2=$(mktemp -d)
+sed -n '/^env_has_ticket()/,/^}/p' "$hold" > "$src"
+printf 'A=1\0GPU_HOLD_TICKET=gpu-hold lane pid 42 2026-11-20T00:00:00-04:00\0B=2\0' > "$d2/good"
+printf 'A=1\0B=2\0' > "$d2/none"
+printf 'A=1\0GPU_HOLD_TICKET_SUFFIX=x\0B=2\0' > "$d2/prefixonly"
+mkdir -p "$d2/environ"
+eht() { bash -c 'set -u; source "$1"; env_has_ticket "$2" "$3"' _ "$src" "$1" "$2"; }
+eht "$d2/good" "GPU_HOLD_TICKET=gpu-hold lane pid 42 2026-11-20T00:00:00-04:00"; check "arm3: the exact ticket line is found" "$?" "0"
+eht "$d2/none" "GPU_HOLD_TICKET=x"; check "arm3: no such variable is a plain non-match (not unreadable)" "$?" "1"
+eht "$d2/prefixonly" "GPU_HOLD_TICKET=x"; check "arm3: a longer variable with the same prefix is not a match" "$?" "1"
+errs=$( { eht "$d2/environ" "GPU_HOLD_TICKET=x" 1; } 2>&1 )
+check "arm3: an unreadable environ is its OWN state" "$?" "2"
+check "arm3: and it prints nothing (no shell 'Permission denied' leak)" "${errs:-}" ""
+rm -f "$src"; rm -rf "$d2"
+
 [ "$fails" = 0 ] && { echo "gpu_hold_survivors: ok"; exit 0; }
 echo "gpu_hold_survivors: $fails failure(s)"; exit 1

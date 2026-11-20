@@ -139,3 +139,23 @@ silently shifted pair.
 `-fa 0` is usable only below roughly 5.4k context on this route (it segfaults above that), which is why the default shape
 is pp2048. The self-test (`ctest fa_ratio_estimator`) exercises the estimator without a GPU: it accepts agreement, refuses
 disagreement, and checks that a run whose row failed to parse cannot shift the arms of the pair after it.
+
+**A bench table is only a measurement if its backend initialised (engine#2858).** A `llama-bench` run whose HRX runtime
+failed to initialise still prints a complete results table, labelled `backend HRX`, from whatever path it fell back to.
+Measured on a shipped bench tree on a box it was not built on: IQ1_S `pp512` **11.22** on 2026-11-18 and **73.61** on the
+same tree a day later, while **both** logs carried the runtime's own sentence —
+
+```
+hrx_gpu_initialize(0) failed: … symbol 'hsa_amd_queue_create' not found in library
+ggml_hrx: the HRX runtime did not initialise, so this backend registers no devices
+```
+
+— so neither number was an HRX measurement, and the table is the only artefact anybody keeps. Before a rate from a bench
+log is quoted, check the log:
+
+```
+python3 tools/ci/hrx_bench_backend_check.py --log bench.log     # 0 initialised, 1 it did not, 2 cannot tell
+```
+
+`2` is not a pass: an empty log, or one with no result row and no runtime verdict, does not say a backend initialised.
+The check exists because the failure is silent in the artefact — the table looks the same either way.

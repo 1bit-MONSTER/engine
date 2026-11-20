@@ -62,16 +62,23 @@ def open_prs(repo):
     return prs
 
 def stale_finding(repo_dir, branch, base="origin/main"):
-    """(behind, reverted_lines, files) measuring THE MERGE, or None when the merge removes nothing.
+    """(behind, reverted, carried, files) measuring THE MERGE, or None when the merge removes none of main's lines.
 
-    Two earlier versions measured `git diff base branch`, which is *what base has that the branch lacks* — not what a merge
-    applies. On a branch that only edits `a.txt` while base grew `b.txt`, that diff reports base's own `b.txt` lines as deletions
-    although a three-way merge keeps them; and on a branch that reverts a line inside a file base never touched, it reports the
-    wrong file. engine#2992 review ran both against `git merge` and `git merge --squash`: the diff was wrong in both directions.
+    Three versions of this measurement were wrong before it settled, each caught by a review fixture rather than by reading:
 
-    So measure the merge itself: `merge-tree --write-tree` materialises the merged tree without touching the worktree, and the
-    deletions between base and that tree are exactly what merging removes. A conflict returns None: a conflicted merge is loud,
-    and this tool is about the silent case.
+      1. `git diff base branch` reports what BASE has that the branch lacks, which is not what a merge applies;
+      2. filtering on `add == 0` (whole-file removal) missed a branch that also edits the file -- `+N/-M` looks like a rewrite;
+      3. keeping that filter inside the merge measure missed the same shape again: a branch that removes main's line AND adds
+         something in the same file reads `1  1`, so "add == 0" drops it while the merge does delete the line.
+
+    So nothing is filtered. Every deletion between base and the merged tree is a line the merge removes from main, and the two
+    classes are reported separately because they mean different things to the author:
+
+      * `reverted` -- lines MAIN added after the merge-base (the merge undoes newer work);
+      * `carried`  -- lines main still carries from before (the branch removes work main has).
+
+    Both are findings. A reformat reads as one carried line, which the engine#2992 review accepted explicitly: a file named with a
+    count of 1 against silent loss is the right trade.
     """
     rc, out, _ = run("git", "rev-list", "--count", f"{branch}..{base}", cwd=repo_dir)
     if rc != 0:
@@ -79,27 +86,32 @@ def stale_finding(repo_dir, branch, base="origin/main"):
     behind = int(out.strip() or 0)
     if behind == 0:
         return None
+    rc, mb, _ = run("git", "merge-base", base, branch, cwd=repo_dir)
+    if rc != 0 or not mb.strip():
+        return None
     rc, out, _ = run("git", "merge-tree", "--write-tree", base, branch, cwd=repo_dir)
     if rc != 0 or not out.strip():
-        return None                     # a conflicted merge is visible to the author; not this tool's business
+        return None                     # a conflicted merge is loud; not this tool's business
     merged_tree = out.splitlines()[0].strip()
-    rc, out2, _ = run("git", "diff", "--numstat", base, merged_tree, cwd=repo_dir)
+
+    def texts(args):
+        rc, o, _ = run(*args, cwd=repo_dir)
+        if rc != 0:
+            return []
+        return [l[1:] for l in o.splitlines() if l[:1] in ("+", "-") and not l.startswith(("+++", "---")) and l[1:].strip()]
+
+    gained_since_cut = set(texts(("git", "diff", "-U0", mb.strip(), base)))          # what main added after the branch was cut
+    rc, o, _ = run("git", "diff", "-U0", base, merged_tree, cwd=repo_dir)
     if rc != 0:
         return None
-    reverted, files = 0, []
-    for line in out2.splitlines():
-        parts = line.split("\t")
-        if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit():
-            continue
-        add, sub = int(parts[0]), int(parts[1])
-        # A PURE deletion is the revert; a replacement (add > 0) is the branch editing a line it already had. On the review's
-        # fixture A that is the difference between "the branch edited a.txt" and "the branch removed main's work".
-        if sub > 0 and add == 0:
-            reverted += sub
-            files.append(parts[2])
-    if reverted == 0:
+    deleted = [l[1:] for l in o.splitlines() if l.startswith("-") and not l.startswith("---") and l[1:].strip()]
+    rc, names, _ = run("git", "diff", "--name-only", base, merged_tree, cwd=repo_dir)
+    files = [f for f in names.splitlines() if f.strip()]
+    reverted = sum(1 for l in deleted if l in gained_since_cut)
+    carried = len(deleted) - reverted
+    if reverted + carried == 0:
         return None
-    return behind, reverted, files
+    return behind, reverted, carried, files
 
 
 def self_test():
@@ -139,8 +151,11 @@ def self_test():
     g("checkout", "-q", "feat")
     pathlib.Path(d.name, "a.txt").write_text("a1a\n")
     g("commit", "-qam", "branch edits only a.txt")
-    chk(stale_finding(d.name, "feat") is None,
-        "review fixture A: main grew a file the branch never touched -- the merge keeps it, so NOT a finding")
+    fa = stale_finding(d.name, "feat")
+    chk(fa is not None and fa[1] == 0 and fa[2] == 1,
+        "review fixture A: the branch's own replaced line is CARRIED (1), not a revert of main's newer work (0)")
+    chk(fa is not None and "a.txt" in fa[3] and "b.txt" not in fa[3],
+        "…and b.txt -- which main grew and the merge keeps -- is NOT named")
 
     # Fixture B from the review: the branch reverts a line inside a file MAIN never touched. The merge deletes it, and the two-dot
     # diff named the wrong file (d.txt, which the merge keeps).
@@ -151,9 +166,20 @@ def self_test():
     pathlib.Path(d.name, "c.txt").write_text("L1\nL3\n")          # drops L2
     g("commit", "-qam", "branch reverts L2")
     f = stale_finding(d.name, "revert")
-    chk(f is not None, "review fixture B: a reverted line inside an untouched file IS a finding")
-    chk(f is not None and f[2] == ["c.txt"], "…and names c.txt (the file the merge deletes from), not d.txt")
-    chk(f is not None and f[1] == 1, "…and the count is the one line the merge removes")
+    chk(f is not None, "review fixture B: a line removed from a file main never touched IS a finding")
+    chk(f is not None and f[3] == ["c.txt"], "…and names c.txt (the file the merge deletes from), not d.txt")
+    chk(f is not None and f[1] + f[2] == 1, "…and the count is the one line the merge removes")
+
+    # The shape the filter hid: the branch removes one of main's lines AND adds something in the same file (`+1/-1`).
+    d, g = repo({"mix.txt": "K1\nK2\n"})
+    g("branch", "mix")
+    commit(g, d.name, {"other.txt": "o\n"}, "main moves elsewhere")
+    g("checkout", "-q", "mix")
+    pathlib.Path(d.name, "mix.txt").write_text("K1\nNOTE\n")     # drops K2, adds NOTE
+    g("commit", "-qam", "branch removes K2 and adds NOTE")
+    f = stale_finding(d.name, "mix")
+    chk(f is not None, "a branch that removes main's line AND adds one (+1/-1) IS a finding -- the case `add == 0` hid")
+    chk(f is not None and "mix.txt" in f[3], "…and it names mix.txt")
 
     # A whole-file removal by the branch is still the loudest case.
     d, g = repo({"keep.txt": "k\n", "gone.txt": "g1\ng2\n"})
@@ -163,7 +189,7 @@ def self_test():
     pathlib.Path(d.name, "gone.txt").unlink()
     g("add", "-A"); g("commit", "-qm", "branch deletes gone.txt")
     f = stale_finding(d.name, "drop")
-    chk(f is not None and "gone.txt" in f[2], "a branch that deletes a whole file IS a finding and names it")
+    chk(f is not None and "gone.txt" in f[3], "a branch that deletes a whole file IS a finding and names it")
 
     # A branch behind by ancestry but identical in content removes nothing.
     d, g = repo({"shared.txt": "alpha\nbeta\n"})
@@ -207,10 +233,15 @@ def main():
         if f is None:
             print(f"#{n} {branch}: merging this branch removes nothing main has")
             continue
-        behind, deleted, files = f
+        behind, reverted, carried, files = f
         findings += 1
-        print(f"#{n} {branch}: BEHIND {behind}; merging it DELETES {deleted} line(s) main has, in {len(files)} file(s): "
-              f"{', '.join(files[:3])}{' …' if len(files) > 3 else ''}", file=sys.stderr)
+        parts = []
+        if reverted:
+            parts.append(f"REVERTS {reverted} line(s) main added after the branch was cut")
+        if carried:
+            parts.append(f"removes {carried} line(s) main still carries")
+        print(f"#{n} {branch}: BEHIND {behind}; merging it " + " and ".join(parts) +
+              f" in {len(files)} file(s): {', '.join(files[:3])}{' …' if len(files) > 3 else ''}", file=sys.stderr)
     if findings:
         print(f"pr_branch_stale_check: {findings} open PR(s) would delete lines main has "
               f"(measured with `git merge-tree --write-tree`, not a two-dot diff) -- rebase or re-cut before merging",

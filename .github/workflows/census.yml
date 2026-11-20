@@ -69,7 +69,14 @@ jobs:
           # PR that reviews a class makes the committed counters stale by definition, so a PR gate would red-light the
           # one PR that is doing the right thing. The job that regenerates the file is where they can be checked and
           # fixed in the same run.
-          python3 tools/ci/census_counters_check.py --check --root .
+          # engine#2852 regression: this check FAILED the job here, which skipped the "Open the census PR" step and so
+          # LOST the day's measurement — twice (2026-11-18, 11-19; the snapshot stayed at 11-17 while census-watch kept
+          # reporting success). A check may not cost the thing it checks. It still runs, but its disagreement is an
+          # annotation that travels into the PR body; the PR opens either way, and the numbers are recoverable.
+          if ! python3 tools/ci/census_counters_check.py --check --root . ; then
+            echo "::warning::the counters disagree with the committed snapshot; the fresh file above is still published"
+            python3 tools/ci/census_counters_check.py --check --root . >> census-counters.txt 2>&1 || true
+          fi
 
       - name: Open the census PR
         env:
@@ -83,6 +90,9 @@ jobs:
             echo "$branch already exists"; exit 0
           fi
           summary=$(cat census.txt)
+          if [ -s census-counters.txt ]; then
+            summary=$(printf '%s\n\n## Counters\n\n```\n%s\n```' "$summary" "$(cat census-counters.txt)")
+          fi
           python3 tools/census.py --pr-body > body.md
           git config user.name "census"
           git config user.email "census@users.noreply.github.com"

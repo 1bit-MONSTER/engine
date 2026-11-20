@@ -152,7 +152,12 @@ def check(tree, expect):
         # shas are compared as prefixes: the stamp writes 12 characters, `git rev-parse HEAD` gives 40, and a
         # comparison that says "the field moved" because of the length is the noise rc 1 must never become
         same = got == want
-        if not same and key != "host" and got and (got.startswith(want) or want.startswith(got)):
+        # …but a prefix only says anything if it is long enough to name a revision. `llama_cpp=8` is a prefix of a
+        # pin beginning `8d26add2c…`, and on 2026-11-20 that satisfied the fork-ctest ratchet (engine#2761) well
+        # enough for it to report "18 known failure(s), no new ones" about a build tree nobody could identify.
+        # Seven is git's own floor: a shorter short-sha does not resolve. bench_stamp.py writes 12.
+        if (not same and key != "host" and got and len(got) >= 7
+                and (got.startswith(want) or want.startswith(got))):
             same = True
         if not same:
             differs = True

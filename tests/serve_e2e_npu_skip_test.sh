@@ -61,12 +61,20 @@ arm "no pack configured -> skip" 77 "ONEBIT_SERVE_TEST_NPU_PACK" ""
 arm "pack is not a directory -> skip" 77 "ONEBIT_SERVE_TEST_NPU_PACK" "$tmp/nope"
 
 # The anti-vacuity arm. `/bin/true` ignores its arguments, so nothing binds a port and the script ends either by
-# noticing the process is gone (rc 1) or on the `timeout` above (rc 124); both mean the guard let it through to the
-# launch, which is all this asserts. 77 would mean the row cannot run even when it is configured.
+# noticing the process is gone (rc 1) or on the `timeout` above (rc 124); both mean the pack guard let it through to
+# the launch, which is all this asserts. 77 would mean the row cannot run even when a pack is configured.
+#
+# A skip FOR THE DEVICE is allowed and must stay allowed: `serve_e2e.sh` may grow a "/dev/accel present" guard (it was
+# proposed on engine#3028's review), and on a machine without an NPU that guard must answer 77 rather than red -- a CI
+# runner has no `/dev/accel` at all. So the assertion is "never the PACK reason", not "never 77": that stays true today
+# (no device guard: it proceeds) and after such a guard lands (it skips naming the device). Which also means the
+# vacuity guarantee this arm gives is about the pack guard only, and a device-less runner cannot give the full one.
 out=$(timeout 5 bash "$e2e" /bin/true "$tmp/withnpu" npu 2>&1)
 rc=$?
-if [ "$rc" = 77 ]; then
-    fail "a configured pack was still skipped -- the row cannot run anywhere: $out"
+if [ "$rc" = 77 ] && [[ $out != *device* ]]; then
+    fail "a configured pack was skipped for a reason that is not the device -- the row cannot run anywhere: $out"
+elif [ "$rc" = 77 ]; then
+    pass "a configured pack skipped for the device (no NPU here): $out"
 else
     pass "a configured pack is not skipped: rc=$rc (reached the launch)"
 fi

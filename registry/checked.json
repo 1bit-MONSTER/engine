@@ -11,6 +11,16 @@
    "engine": "b9812e0ca35e"
   },
   {
+   "backend": "npu",
+   "model": "LFM3-1.7B-NPU2",
+   "arch": "lfm3",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-11-20",
+   "engine": "23b75fd69767"
+  },
+  {
    "backend": "hrx",
    "model": "MiniCPM5-1B-Q4_K_M.gguf",
    "arch": "llama",

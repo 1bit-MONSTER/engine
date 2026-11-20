@@ -44,6 +44,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -116,12 +117,52 @@ int main(int argc, char** argv) {
     const std::string elf_path = argv[1];
     std::printf("npu dmabuf import (engine#753): %s\n", elf_path.c_str());
 
+    // What the program transfers through each argument, from its own control code (npu_rt_api.h arg_need).
+    // Buffer sizes come from THIS, not from constants: a "generously sized" 1 MiB argument was 6x too small for
+    // a 2048x3072 int8 design, and the device read past its end -- ten IO_PAGE_FAULTs (flags 0x0007, a device read
+    // of a not-present user page) in one second on 2026-11-20, which is engine#3003. Nothing here may run unless
+    // every argument it binds can be sized, so a stepped/iterated ELF -- including every sealed serve ELF -- skips
+    // (77) instead of guessing.
+    //
+    // The import keeps a floor of 128 KiB (the row payload our generated kvwrite sequence reads from argument 0:
+    // 32 rows x 2048 elements x 2 B); above that it is argument 0's own need, so the buffer is never smaller than
+    // what the device reads through it.
+    const size_t kFloorBytes = 128 * 1024;
+    std::vector<xrt::arg_need> need;
+    need.resize(size_t(n_args));
+    size_t import_bytes = kFloorBytes;
+    try {
+        // A kernel name the ELF does not carry is the caller's error and must read as one: the runtime throws
+        // errc::kernel_missing (502), and left uncaught that aborts with a core instead of failing the row with a message.
+        xrt::elf image(elf_path);
+        for (int i = 0; i < n_args; ++i) {
+            need[size_t(i)] = image.get_arg_need(kernel_name, i);
+            if (!need[size_t(i)].transfers()) continue;
+            if (need[size_t(i)].unchecked) {
+                std::printf("skip: %s argument %d has %u transfer descriptor(s) this ELF does not describe (checked %u, "
+                            "unchecked %u), so a buffer size for it would be a guess; give the test an ELF whose arguments "
+                            "are all linear (engine#3003)\n",
+                            elf_path.c_str(), i, need[size_t(i)].unchecked, need[size_t(i)].checked, need[size_t(i)].unchecked);
+                return 77;
+            }
+            if (!need[size_t(i)].bytes) {
+                std::printf("skip: %s argument %d transfers nothing this test can size (checked %u, bytes 0)\n",
+                            elf_path.c_str(), i, need[size_t(i)].checked);
+                return 77;
+            }
+        }
+        import_bytes = std::max(import_bytes, size_t(need[0].bytes));
+        std::printf("     sizes from the ELF: argument 0 = the imported dma-buf (%zu B); others", import_bytes);
+        for (int i = 1; i < n_args; ++i) std::printf(" %llu", (unsigned long long)need[size_t(i)].bytes);
+        std::printf(" B\n");
+    } catch (const std::exception& e) {
+        std::printf("FAIL %s: %s\n", elf_path.c_str(), e.what());
+        return 1;
+    }
+
     // 1. the exporter half: a dma-buf that exists before the NPU is involved
     UdmaBuf region;
-    // 128 KiB: the row payload our generated kvwrite sequence reads from argument 0 (32 rows x 2048 elements x 2 B). The size only
-    // has to be >= what the kernel reads -- a BO read past its end is a device fault, not a failed check.
-    const size_t kBytes = 128 * 1024;
-    const bool have_region = region.create(kBytes);
+    const bool have_region = region.create(import_bytes);
     check(have_region, "a dma-buf exists with no GPU in the path (udmabuf over a sealed memfd)");
     if (!have_region) return 1;
 
@@ -130,7 +171,7 @@ int main(int argc, char** argv) {
     bool imported = false;
     std::unique_ptr<xrt::ext::bo> bo;
     try {
-        bo = std::make_unique<xrt::ext::bo>(dev, region.fd, kBytes, region.map);
+        bo = std::make_unique<xrt::ext::bo>(dev, region.fd, import_bytes, region.map);
         imported = true;
     } catch (const std::exception& e) {
         std::printf("     import threw: %s\n", e.what());
@@ -138,7 +179,7 @@ int main(int argc, char** argv) {
     check(imported, "ext::bo(dev, fd, size, host) accepts it");
     if (!imported) return 1;
 
-    check(bo->size() == kBytes, "the imported BO is the dma-buf's size");
+    check(bo->size() == import_bytes, "the imported BO is the dma-buf's size");
     check(bo->map() == region.map,
           "map() IS the exporter's mapping (a second mapping puts the BO on the driver's invalid list and the next submit HMM-faults)");
 
@@ -161,7 +202,7 @@ int main(int argc, char** argv) {
         std::string why;
         void* driver_map = nullptr;
         try {
-            xrt::ext::bo driver_mapped(dev, region.fd, kBytes, nullptr);
+            xrt::ext::bo driver_mapped(dev, region.fd, import_bytes, nullptr);
             constructed = true;
             driver_map  = driver_mapped.map();
         } catch (const std::exception& e) {
@@ -171,6 +212,21 @@ int main(int argc, char** argv) {
                                (constructed ? "no throw" : why) + ")");
         check(constructed && driver_map != region.map,
               "and it is a SECOND mapping, not the exporter's -- the state npu_rt.cpp says the next submit faults on");
+
+        // engine#3003: `size` is the caller's claim and the runtime stops taking it on trust -- an import that claims more
+        // than the dma-buf holds is refused (npu-kernels#105, judge_import_size), because b->bytes becomes the `avail` the
+        // argument bounds check compares against and an over-claim would admit a transfer past the mapping's end. This arm
+        // exists so the two halves are tested against each other rather than each against itself (review on engine#3018).
+        bool over_refused = false;
+        std::string over_why;
+        try {
+            xrt::ext::bo over(dev, region.fd, import_bytes + 65536, region.map);
+        } catch (const std::exception& e) {
+            over_refused = true;
+            over_why = e.what();
+        }
+        check(over_refused, std::string("an import claiming 64 KiB more than the dma-buf holds is refused (") +
+                                (over_why.empty() ? "no throw -- the size was taken on trust" : over_why) + ")");
     }
 
     // 5. engine#753's actual claim: bind the imported BO as a kernel ARGUMENT and run. This is the step that failed when the issue
@@ -183,8 +239,8 @@ int main(int argc, char** argv) {
         xrt::ext::kernel k(hc, kernel_name);
         xrt::run r(k);
         r.set_arg(0, *bo);                       // <- the imported dma-buf, as argument 0
-        std::vector<xrt::ext::bo> extra;         // the rest of the signature: plain BOs, sized generously (transport, not semantics)
-        for (int i = 1; i < n_args; ++i) extra.emplace_back(dev, size_t(1) << 20);
+        std::vector<xrt::ext::bo> extra;         // the rest of the signature: sized from the ELF's own transfers
+        for (int i = 1; i < n_args; ++i) extra.emplace_back(dev, need[size_t(i)].bytes);
         for (int i = 1; i < n_args; ++i) r.set_arg(i, extra[size_t(i - 1)]);
         bound = true;
         r.start();

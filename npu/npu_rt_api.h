@@ -116,6 +116,21 @@ public:
 };
 }  // namespace ext
 
+// What a kernel transfers through one argument, as read from the ELF's patch sites (engine#3003,
+// npu_rt_bounds.h in the runtime tree). `bytes` is a LOWER BOUND of what the buffer must hold, and
+// it only covers `checked` descriptors: `unchecked` counts the transfer sites whose reach cannot be
+// read from the ELF (stepped or iterated descriptors, control-packet sites), so a program whose
+// descriptors are all unreadable reports bytes == 0 and checked == 0. A caller that must size a
+// buffer from the program's behaviour can therefore tell the two apart and refuse instead of
+// guessing: a guess is what an imported dma-buf overran on 2026-11-20 (ten IO_PAGE_FAULTs, flags
+// 0x0007, one second).
+struct arg_need {
+    uint64_t bytes = 0;      // the buffer must hold at least this many bytes
+    uint32_t checked = 0;    // transfer descriptors that went into `bytes`
+    uint32_t unchecked = 0;  // transfer descriptors whose reach cannot be read
+    bool transfers() const { return checked || unchecked; }  // the device moves data through this argument
+};
+
 // A configuration UID, as text.
 class uuid {
 public:
@@ -140,6 +155,9 @@ public:
     bool is_full_elf() const;
     uuid get_cfg_uuid() const;
     explicit operator bool() const { return static_cast<bool>(m); }
+    // What kernel `kernel` transfers through argument `index` (arg_need above). A kernel or argument
+    // the program never names yields a need with no transfers, so `transfers()` is the test.
+    arg_need get_arg_need(const std::string& kernel, int index) const;
 
 private:
     friend struct detail::access;

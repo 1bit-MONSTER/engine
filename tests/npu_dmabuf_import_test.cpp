@@ -131,7 +131,9 @@ int main(int argc, char** argv) {
     std::vector<xrt::arg_need> need;
     need.resize(size_t(n_args));
     size_t import_bytes = kFloorBytes;
-    {
+    try {
+        // A kernel name the ELF does not carry is the caller's error and must read as one: the runtime throws
+        // errc::kernel_missing (502), and left uncaught that aborts with a core instead of failing the row with a message.
         xrt::elf image(elf_path);
         for (int i = 0; i < n_args; ++i) {
             need[size_t(i)] = image.get_arg_need(kernel_name, i);
@@ -153,6 +155,9 @@ int main(int argc, char** argv) {
         std::printf("     sizes from the ELF: argument 0 = the imported dma-buf (%zu B); others", import_bytes);
         for (int i = 1; i < n_args; ++i) std::printf(" %llu", (unsigned long long)need[size_t(i)].bytes);
         std::printf(" B\n");
+    } catch (const std::exception& e) {
+        std::printf("FAIL %s: %s\n", elf_path.c_str(), e.what());
+        return 1;
     }
 
     // 1. the exporter half: a dma-buf that exists before the NPU is involved
@@ -207,6 +212,21 @@ int main(int argc, char** argv) {
                                (constructed ? "no throw" : why) + ")");
         check(constructed && driver_map != region.map,
               "and it is a SECOND mapping, not the exporter's -- the state npu_rt.cpp says the next submit faults on");
+
+        // engine#3003: `size` is the caller's claim and the runtime stops taking it on trust -- an import that claims more
+        // than the dma-buf holds is refused (npu-kernels#105, judge_import_size), because b->bytes becomes the `avail` the
+        // argument bounds check compares against and an over-claim would admit a transfer past the mapping's end. This arm
+        // exists so the two halves are tested against each other rather than each against itself (review on engine#3018).
+        bool over_refused = false;
+        std::string over_why;
+        try {
+            xrt::ext::bo over(dev, region.fd, import_bytes + 65536, region.map);
+        } catch (const std::exception& e) {
+            over_refused = true;
+            over_why = e.what();
+        }
+        check(over_refused, std::string("an import claiming 64 KiB more than the dma-buf holds is refused (") +
+                                (over_why.empty() ? "no throw -- the size was taken on trust" : over_why) + ")");
     }
 
     // 5. engine#753's actual claim: bind the imported BO as a kernel ARGUMENT and run. This is the step that failed when the issue

@@ -706,6 +706,7 @@ add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-tes
 # since engine#2730: a workflow edit needed a `workflow`-scoped token over HTTPS OAuth, which this fleet pushes over
 # `ssh://git@github.com/...` instead, so the row is no longer blocked. `--write` stays a manual developer action.
 add_python_test(ctest_skips_self ${CMAKE_SOURCE_DIR}/tools/ci/ctest_skips.py --self-test)
+add_python_test(fork_hrx_rows_self ${CMAKE_SOURCE_DIR}/tools/ci/fork_hrx_rows.py --self-test)
 # engine#2106 / #2102: the release gate's NPU serve check asserts the fast route, a decode floor, the first token and a
 # non-empty answer, because a serve on the slow per-op route still answers. --self-test drives the judging on the shape
 # of each failure (the silent fallback at 1.9 tok/s, thinking left on, a degenerate reply); no device, no binary.
@@ -1481,6 +1482,11 @@ if(Python3_Interpreter_FOUND)
     # an executable here, which is how the python3 shebang it shipped with reads as a SyntaxError.
     add_test(NAME fork_ctest_row COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/fork_ctest_row_test.py)
     set_tests_properties(fork_ctest_row PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # Source-only, no build and no device: a warm-up path that is not a registered route 404s and warms
+    # nothing (engine#2853 -- /completion was that path for two warm-ups until #2855 registered it).
+    add_test(NAME warmup_route_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/warmup_route_check.py --root ${CMAKE_SOURCE_DIR})
+    set_tests_properties(warmup_route_check PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     # engine#2853: `1bit serve`'s short and spec warm-ups posted to /completion, a path it never registered -- 404s that
     # moved nothing, and no test could see them because a warm-up is a POST the server makes to itself. The route table
     # and the warm-up list are two literals in app/serve.cpp; this fails when they disagree. Static, ~0.1 s.

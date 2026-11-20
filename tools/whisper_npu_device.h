@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <dirent.h>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -68,13 +69,28 @@ inline std::vector<std::pair<int, int>> offered_shapes(const onebit::npu::pack_i
             if (t.name == name) return &t.dims;
         return nullptr;
     };
+    std::map<std::string, std::pair<int64_t, int64_t>> by_a;   // activation -> (K, summed N), the executor's fused offer
+    std::map<std::string, int> members;
+    std::map<std::string, bool> same_k;
     for (const auto& n : g.nodes) {
         if (n.ins.size() < 2) continue;
         const std::vector<int64_t>* d = init_dims(n.ins[1]);
         if (d == nullptr) continue;
-        if (n.op == "MatMul" && d->size() == 2) add((*d)[0], (*d)[1]);
+        if (n.op == "MatMul" && d->size() == 2) {
+            add((*d)[0], (*d)[1]);
+            auto& e = by_a[n.ins[0]];
+            if (members[n.ins[0]]++ == 0) { e.first = (*d)[0]; same_k[n.ins[0]] = true; }
+            else if (e.first != (*d)[0]) same_k[n.ins[0]] = false;
+            e.second += (*d)[1];
+        }
         if (n.op == "Conv" && d->size() == 3) add((*d)[1] * (*d)[2], (*d)[0]);
     }
+    // engine#1783: the executor offers projections that share an activation as one product (audio_exec.cpp, the fused
+    // q|k|v), so its staged shape is one the device should open too. ONEBIT_AUDIO_FUSE_QKV=0 means it is never offered.
+    const char* fq = std::getenv("ONEBIT_AUDIO_FUSE_QKV");
+    if (fq == nullptr || fq[0] != '0')
+        for (const auto& kv : by_a)
+            if (members[kv.first] >= 2 && same_k[kv.first]) add(kv.second.first, kv.second.second);
     return out;
 }
 
@@ -165,6 +181,7 @@ inline bool open(const onebit::npu::pack_import::OnnxGraphInfo& enc, const std::
     onebit::audio::NpuAudioGemm* gm = out->gemm.get();
     out->hook.gemm = [gm](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
                           std::vector<float>* C, std::string* w) { return gm->gemm(key, A, M, K, B, N, C, w); };
+    out->hook.cached = [gm](const std::string& key) { return gm->cached(key); };
     return true;
 }
 

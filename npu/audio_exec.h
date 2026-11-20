@@ -48,6 +48,10 @@ struct AudioGemm {
     std::function<bool(const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
                        std::vector<float>* C, std::string* why)>
         gemm;
+    // engine#1783: true when the device already holds `key`'s packed weight, so the executor can offer the product with
+    // B = nullptr and skip loading the f32 initializer (a whisper-small encoder pass re-read ~340 MB of weights the device
+    // had cached since the first window). Unset = never cached, the old behaviour.
+    std::function<bool(const std::string& key)> cached;
     int device = 0;                           // products the device ran
     int host = 0;                             // products the host ran (declined, or not offered)
     std::map<std::string, int> host_why;      // reason -> count
@@ -77,6 +81,9 @@ bool run_audio_graph(const OnnxGraphInfo& g, const float* mel, int64_t mel_bins,
 
 // The decoder: `tokens` is the int64 token window for the graph's first input; `xa` (the encoder output, row-major f32) is
 // bound to the graph's second input when the graph has one. `xa_dims` may be empty when there is no cross-attention input.
+// engine#1783: offer every weight product of `g` to `dev` once with an all-zero activation of `rows` rows, so the device
+// caches each packed weight before the first window. Returns the number offered, -1 + why on a load failure.
+int prefill_audio_device(const OnnxGraphInfo& g, int64_t rows, AudioGemm* dev, std::string* why);
 bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_tokens, const float* xa,
                        const std::vector<int64_t>& xa_dims, const std::string& out_name, AudioRunResult* out,
                        std::string* why);

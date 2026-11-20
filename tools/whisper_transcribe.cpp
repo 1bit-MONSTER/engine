@@ -277,6 +277,22 @@ int main(int argc, char** argv) {
         }
         for (const auto& m : npu_dev.missing) std::fprintf(stderr, "npu: no ELF for staged %s -- its products run on the host\n", m.c_str());
         dev_hook = &npu_dev.hook;
+        // engine#1783: ONEBIT_WHISPER_NPU_PREFILL=1 packs and uploads every weight here, before the first window. OFF by
+        // default in this tool: a one-shot transcription pays the same fills either way, so moving 0.77 s into load makes
+        // the total no shorter, and with it on the warm pass measured 0.03-0.05 s slower (unexplained). It is for a path
+        // that keeps the model open across requests (a serve), where the fills are paid once and every request is a
+        // first window.
+        const char* pf = std::getenv("ONEBIT_WHISPER_NPU_PREFILL");
+        if (pf != nullptr && pf[0] == '1') {
+            const auto p0 = std::chrono::steady_clock::now();
+            const int nw = onebit::npu::pack_import::prefill_audio_device(enc, rows, dev_hook, &why);
+            if (nw < 0) {
+                std::fprintf(stderr, "npu prefill: %s\n", why.c_str());
+                return 1;
+            }
+            std::printf("npu prefill: %d weight(s) packed and resident in %.3f s (load time)\n", nw,
+                        secs(p0, std::chrono::steady_clock::now()));
+        }
     }
 #endif
     const auto t_load = std::chrono::steady_clock::now();

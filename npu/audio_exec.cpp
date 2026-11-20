@@ -330,6 +330,38 @@ void (*host_gemm_4rows())(const float*, const float*, float*, int64_t, int64_t) 
 
 namespace {
 
+
+// engine#1783: MatMuls whose B is a rank-2 initializer and that read the same activation with the same K (whisper's q, k, v),
+// keyed by the first one's 0-based index. The executor offers each group to the device as one product, and the device
+// prefill walks the same groups, so both build the same key. Empty when ONEBIT_AUDIO_FUSE_QKV=0.
+std::map<size_t, std::vector<size_t>> projection_groups(const OnnxGraphInfo& g,
+                                                        const std::map<std::string, const OnnxInit*>& inits) {
+    std::map<size_t, std::vector<size_t>> out;
+    const char* fq = std::getenv("ONEBIT_AUDIO_FUSE_QKV");
+    if (fq != nullptr && fq[0] == '0') return out;
+    std::map<std::string, std::vector<size_t>> by_a;
+    for (size_t i = 0; i < g.nodes.size(); ++i) {
+        const auto& m = g.nodes[i];
+        if (m.op != "MatMul" || m.ins.size() < 2 || m.outs.empty() || inits.count(m.ins[1]) == 0) continue;
+        if (inits.at(m.ins[1])->dims.size() != 2) continue;
+        by_a[m.ins[0]].push_back(i);
+    }
+    for (auto& kv : by_a) {
+        if (kv.second.size() < 2) continue;
+        const int64_t k0 = inits.at(g.nodes[kv.second[0]].ins[1])->dims[0];
+        bool same_k = true;
+        for (size_t i : kv.second) same_k = same_k && inits.at(g.nodes[i].ins[1])->dims[0] == k0;
+        if (same_k) out[kv.second[0]] = kv.second;
+    }
+    return out;
+}
+
+std::string projection_group_key(const OnnxGraphInfo& g, const std::vector<size_t>& members) {
+    std::string key = "fused";
+    for (size_t i : members) key += "|" + g.nodes[i].ins[1];
+    return key;
+}
+
 bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, const std::string& out_name, AudioRunResult* out,
                     std::string* why, AudioGemm* dev = nullptr) {
     try {
@@ -373,6 +405,25 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         // whisper_transcribe already prints as `host: N x <reason>`.
         const char* fh = std::getenv("ONEBIT_AUDIO_FORCE_HOST");
         const bool force_host = fh != nullptr && fh[0] != '\0' && fh[0] != '0';
+        // engine#1783: ONEBIT_AUDIO_SKIP_CACHED_W=0 keeps loading every offered weight even when the device holds it.
+        const char* scw = std::getenv("ONEBIT_AUDIO_SKIP_CACHED_W");
+        const bool skip_cached_w = scw == nullptr || scw[0] != '0';
+        auto device_has = [&](const std::string& key) {
+            return dev != nullptr && !force_host && skip_cached_w && dev->cached && dev->cached(key);
+        };
+        // engine#1783: an offer that, when declined, counts nothing -- the caller then offers the products one by one
+        // through `offer`, which counts each of them once (a fused q|k|v decline must not add a 75th refusal).
+        auto try_device = [&](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
+                              std::vector<float>* c, int products) -> bool {
+            if (dev == nullptr || force_host || !dev->gemm) return false;
+            std::string reason;
+            if (!dev->gemm(key, A, M, K, B, N, c, &reason)) return false;
+            if (c->size() != size_t(M) * size_t(N))
+                fail("device gemm for '" + key + "' wrote " + std::to_string(c->size()) + " floats, not " +
+                     std::to_string(M) + " x " + std::to_string(N));
+            dev->device += products;
+            return true;
+        };
         auto offer = [&](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
                          std::vector<float>* c) -> bool {
             if (dev == nullptr) return false;
@@ -492,15 +543,102 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
             }
         }
 
+        // engine#1783: projections that read the same activation (whisper's q, k and v all read the LayerNorm output) are
+        // offered to the device as ONE product over their weights side by side, [K x (N1+N2+...)], and the result is
+        // split back per node. Each output column depends only on its own weight column and on the row's activation scale,
+        // so the split columns are the ones the separate launches produce (the encoder hash is unchanged). Offered only
+        // with a device; a decline runs the nodes one by one as before. ONEBIT_AUDIO_FUSE_QKV=0 turns it off.
+        std::map<size_t, std::vector<size_t>> proj_groups;   // first node (0-based) -> every node of its group, graph order
+        if (dev != nullptr && !force_host) proj_groups = projection_groups(g, inits);
+        std::map<std::string, Tensor> proj_pending;   // output name -> the result its group's fused product already made
+
         int node_index = 0;
         for (const auto& n : g.nodes) {
             ++node_index;
             if (fused_away[size_t(node_index - 1)]) continue;   // computed inside the fused attention above it
             const auto op_t0 = std::chrono::steady_clock::now();
+            if (!n.outs.empty()) {
+                const auto pend = proj_pending.find(n.outs[0]);
+                if (pend != proj_pending.end()) {   // made by its group's fused product
+                    Tensor r = std::move(pend->second);
+                    proj_pending.erase(pend);
+                    finish_node(n.op, n.outs[0], r, op_t0);
+                    continue;
+                }
+            }
+            const auto grp = proj_groups.find(size_t(node_index - 1));
+            if (grp != proj_groups.end() && t.count(n.ins[0]) != 0) {
+                const Tensor& a = need(n.ins[0]);
+                const auto& members = grp->second;
+                const int64_t K = inits.at(n.ins[1])->dims[0];
+                const std::string key = projection_group_key(g, members);
+                int64_t ntot = 0;
+                for (size_t i : members) ntot += inits.at(g.nodes[i].ins[1])->dims[1];
+                if (a.dims.size() >= 2 && a.dims.back() == K && K > 0) {
+                    std::vector<float> bcat;   // [K x ntot], only when the device does not hold it yet
+                    if (!device_has(key)) {
+                        bcat.assign(size_t(K) * size_t(ntot), 0.0f);
+                        int64_t c0 = 0;
+                        for (size_t i : members) {
+                            const Tensor& w = init_f32(g.nodes[i].ins[1]);
+                            const int64_t ni = w.dims[1];
+                            for (int64_t k = 0; k < K; ++k)
+                                std::copy(w.data.begin() + size_t(k) * size_t(ni), w.data.begin() + size_t(k + 1) * size_t(ni),
+                                          bcat.begin() + size_t(k) * size_t(ntot) + size_t(c0));
+                            c0 += ni;
+                            t.erase(g.nodes[i].ins[1]);   // the per-node copy is not needed once it is in bcat
+                        }
+                    }
+                    std::vector<float> c;
+                    const int64_t rows = int64_t(a.data.size() / size_t(K));
+                    if (try_device(key, a.data.data(), rows, K, bcat.empty() ? nullptr : bcat.data(), ntot, &c,
+                                   int(members.size()))) {   // one launch, but every member is a product the device ran
+                        int64_t c0 = 0;
+                        Tensor mine;
+                        for (size_t i : members) {
+                            const int64_t ni = inits.at(g.nodes[i].ins[1])->dims[1];
+                            Tensor r;
+                            r.dims = a.dims;
+                            r.dims.back() = ni;
+                            r.data.resize(size_t(rows) * size_t(ni));
+                            for (int64_t m = 0; m < rows; ++m)
+                                std::copy(c.begin() + size_t(m) * size_t(ntot) + size_t(c0),
+                                          c.begin() + size_t(m) * size_t(ntot) + size_t(c0 + ni),
+                                          r.data.begin() + size_t(m) * size_t(ni));
+                            c0 += ni;
+                            if (i == size_t(node_index - 1)) mine = std::move(r);
+                            else proj_pending[g.nodes[i].outs[0]] = std::move(r);
+                        }
+                        finish_node(n.op, n.outs[0], mine, op_t0);
+                        continue;
+                    }
+                    // declined: the nodes run one by one below and count themselves
+                }
+            }
             const auto where = [&]() { return "node " + std::to_string(node_index) + " (" + n.op + ")"; };
             if (n.outs.empty()) fail(where() + " has no output");
             const std::string& oname = n.outs[0];
             Tensor r;
+            if (n.op == "MatMul" && n.ins.size() >= 2 && t.count(n.ins[1]) == 0 && inits.count(n.ins[1]) != 0 &&
+                inits.at(n.ins[1])->dims.size() == 2 && device_has(n.ins[1])) {
+                // engine#1783: the device holds this weight, so offer the product without loading the initializer. Same
+                // offer as the branch below (same key, same rows), so the device computes the same thing; a decline falls
+                // through to that branch, which loads the weight and runs it on the host.
+                const Tensor& a = need(n.ins[0]);
+                const std::vector<int64_t>& wd = inits.at(n.ins[1])->dims;
+                const int64_t K = a.dims.empty() ? 0 : a.dims.back(), N = wd[1];
+                if (a.dims.size() >= 2 && K == wd[0] && K > 0) {
+                    std::vector<float> c;
+                    if (try_device(n.ins[1], a.data.data(), int64_t(a.data.size() / size_t(K)), K, nullptr, N, &c, 1)) {
+                        r.dims = a.dims;
+                        r.dims.back() = N;
+                        r.data = std::move(c);
+                        finish_node(n.op, oname, r, op_t0);
+                        continue;
+                    }
+                    // declined: the branch below loads the weight, offers again and counts the outcome once
+                }
+            }
             if (n.op == "MatMul") {
                 const Tensor& a = need(n.ins[0]);
                 const Tensor& b = t.count(n.ins[1]) != 0 ? need(n.ins[1]) : init_f32(n.ins[1]);
@@ -760,16 +898,20 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 }
             } else if (n.op == "Conv") {
                 const Tensor& a = need(n.ins[0]);
-                const Tensor& w = init_f32(n.ins[1]);
+                // engine#1783: a weight the device already holds is not loaded; only its dims are read. The host path
+                // below loads it if the device declines.
+                const bool w_on_dev = t.count(n.ins[1]) == 0 && inits.count(n.ins[1]) != 0 && device_has(n.ins[1] + "#conv");
+                const Tensor* wp = w_on_dev ? nullptr : &init_f32(n.ins[1]);
+                const std::vector<int64_t>& wdims = w_on_dev ? inits.at(n.ins[1])->dims : wp->dims;
                 const Tensor* bias = (n.ins.size() > 2 && !n.ins[2].empty()) ? &init_f32(n.ins[2]) : nullptr;
                 const auto gs = n.attrs_list.find("strides");
                 const auto gp = n.attrs_list.find("pads");
                 const int stride = (gs != n.attrs_list.end() && !gs->second.empty()) ? int(gs->second[0]) : 1;
                 const int pad = (gp != n.attrs_list.end() && !gp->second.empty()) ? int(gp->second[0]) : 0;
-                if (a.dims.size() != 3 || w.dims.size() != 3) fail(where() + ": only 1-D temporal Conv on (N,C,T)");
+                if (a.dims.size() != 3 || wdims.size() != 3) fail(where() + ": only 1-D temporal Conv on (N,C,T)");
                 const int64_t cin = a.dims[1], T = a.dims[2];
-                const int64_t cout = w.dims[0], k = w.dims[2];
-                if (w.dims[1] != cin) fail(where() + ": kernel channels do not match the input");
+                const int64_t cout = wdims[0], k = wdims[2];
+                if (wdims[1] != cin) fail(where() + ": kernel channels do not match the input");
                 const int64_t tout = audio::conv1d_out_len(int(T), int(k), stride, pad);
                 r.dims = {a.dims[0], cout, tout};
                 r.data.resize(size_t(a.dims[0]) * size_t(cout) * size_t(tout));
@@ -778,15 +920,18 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 if (dev != nullptr) {
                     // The im2col GEMM: (tout, cin*k) x (cin*k, cout), then out[co][t] = bias[co] + C[t][co].
                     const int64_t kk = cin * k;
-                    std::vector<float> bkn(size_t(kk) * size_t(cout));
-                    audio::conv1d_weight_as_kn(w.data.data(), int(cout), int(cin), int(k), bkn.data());
+                    std::vector<float> bkn;
+                    if (wp != nullptr) {
+                        bkn.resize(size_t(kk) * size_t(cout));
+                        audio::conv1d_weight_as_kn(wp->data.data(), int(cout), int(cin), int(k), bkn.data());
+                    }
                     std::vector<float> acol(size_t(tout) * size_t(kk));
                     bool all = true;
                     for (int64_t n0 = 0; n0 < a.dims[0] && all; ++n0) {
                         audio::conv1d_im2col(a.data.data() + size_t(n0) * size_t(cin) * size_t(T), int(cin), int(T), int(k),
                                              stride, pad, acol.data());
                         std::vector<float> c;
-                        if (!offer(n.ins[1] + "#conv", acol.data(), tout, kk, bkn.data(), cout, &c)) {
+                        if (!offer(n.ins[1] + "#conv", acol.data(), tout, kk, wp != nullptr ? bkn.data() : nullptr, cout, &c)) {
                             all = false;
                             break;
                         }
@@ -810,6 +955,8 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 // accumulators and measured 2.63x on the [768,768,3] stride-2 stem (N=5 interleaved medians,
                 // 1044 -> 398 ms) with a bit-identical result -- every channel still accumulates ci-outer /
                 // j-inner in conv1d's order. The last 1..3 channels go through conv1d_channels' tail.
+                if (wp == nullptr) wp = &init_f32(n.ins[1]);   // the device declined a weight it held: load it now
+                const Tensor& w = *wp;
                 const size_t co_blocks = (size_t(cout) + 3) / 4;
                 const size_t units = size_t(a.dims[0]) * co_blocks;
                 parallel_units(units, [&](size_t u) {
@@ -1037,6 +1184,72 @@ bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_
         seed[g.inputs[1]] = std::move(x);
     }
     return run_graph_impl(g, std::move(seed), out_name, out, why);
+}
+
+
+// engine#1783: offer every weight product of `g` once, with an all-zero activation of `rows` rows, so the device packs and
+// caches each weight before the first window instead of during it. Same keys and the same B the executor builds (the fused
+// groups, the projections, the Conv stems as im2col weights), so the executor finds every weight cached. The products'
+// results are discarded. Returns the number of weights offered; a decline is not an error (the executor will run that
+// product on the host, as it would have anyway).
+int prefill_audio_device(const OnnxGraphInfo& g, int64_t rows, AudioGemm* dev, std::string* why) {
+    if (dev == nullptr || !dev->gemm || rows <= 0) return 0;
+    try {
+        std::map<std::string, const OnnxInit*> inits;
+        for (const auto& ti : g.init_tensors) inits[ti.name] = &ti;
+        auto load = [&](const std::string& name) {
+            Tensor v;
+            v.dims = dims_of(*inits.at(name));
+            load_init_f32(g, *inits.at(name), &v);
+            return v;
+        };
+        int offered = 0;
+        std::vector<float> zeros, c;
+        auto offer = [&](const std::string& key, int64_t K, const float* B, int64_t N) {
+            zeros.assign(size_t(rows) * size_t(K), 0.0f);
+            std::string w;
+            if (dev->cached && dev->cached(key)) return;
+            if (dev->gemm(key, zeros.data(), rows, K, B, N, &c, &w)) ++offered;
+        };
+        std::vector<char> grouped(g.nodes.size(), 0);
+        for (const auto& kv : projection_groups(g, inits)) {
+            const auto& members = kv.second;
+            const int64_t K = inits.at(g.nodes[members[0]].ins[1])->dims[0];
+            int64_t ntot = 0;
+            for (size_t i : members) ntot += inits.at(g.nodes[i].ins[1])->dims[1];
+            std::vector<float> bcat(size_t(K) * size_t(ntot), 0.0f);
+            int64_t c0 = 0;
+            for (size_t i : members) {
+                const Tensor w = load(g.nodes[i].ins[1]);
+                const int64_t ni = w.dims[1];
+                for (int64_t k = 0; k < K; ++k)
+                    std::copy(w.data.begin() + size_t(k) * size_t(ni), w.data.begin() + size_t(k + 1) * size_t(ni),
+                              bcat.begin() + size_t(k) * size_t(ntot) + size_t(c0));
+                c0 += ni;
+                grouped[i] = 1;
+            }
+            offer(projection_group_key(g, members), K, bcat.data(), ntot);
+        }
+        for (size_t i = 0; i < g.nodes.size(); ++i) {
+            const auto& n = g.nodes[i];
+            if (grouped[i] || n.ins.size() < 2 || inits.count(n.ins[1]) == 0) continue;
+            const auto& d = inits.at(n.ins[1])->dims;
+            if (n.op == "MatMul" && d.size() == 2) {
+                const Tensor w = load(n.ins[1]);
+                offer(n.ins[1], d[0], w.data.data(), d[1]);
+            } else if (n.op == "Conv" && d.size() == 3) {
+                const Tensor w = load(n.ins[1]);
+                const int64_t cout = d[0], cin = d[1], k = d[2];
+                std::vector<float> bkn(size_t(cin * k) * size_t(cout));
+                audio::conv1d_weight_as_kn(w.data.data(), int(cout), int(cin), int(k), bkn.data());
+                offer(n.ins[1] + "#conv", cin * k, bkn.data(), cout);
+            }
+        }
+        return offered;
+    } catch (const std::exception& e) {
+        if (why != nullptr) *why = e.what();
+        return -1;
+    }
 }
 
 }  // namespace onebit::npu::pack_import

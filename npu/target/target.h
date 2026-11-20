@@ -80,6 +80,13 @@ struct GemvArgs {
     using TileFn = bool (*)(void* self, int layer, int role, std::vector<uint8_t>& out, std::string& err);
     TileFn      tiles = nullptr;
     void*       tiles_self = nullptr;
+    // engine#1783: write the dequantised result straight into the caller's buffer -- row m at dst + m * dst_ld, its
+    // first dst_n (<= N) columns -- instead of resizing `out` to M x N and leaving the caller to copy the rows it keeps.
+    // Honoured by the batched int8 body only (rows = true, no pb16i); `out` is left empty when it is. Null = the old
+    // behaviour, so no other caller changes.
+    float*      dst = nullptr;
+    int         dst_ld = 0;
+    int         dst_n = 0;
 };
 
 struct Caps {

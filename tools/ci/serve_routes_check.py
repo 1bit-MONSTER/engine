@@ -152,6 +152,26 @@ def check(root=None):
     print(f"serve_routes: every warm-up body's token limit is read by the parser "
           f"({len(bodies)} builder(s), parser reads {', '.join(read)})")
 
+    # engine#2897: reading llama.cpp's `n_predict` means owning its sentinel. `-1` is that dialect's "no limit" and
+    # llama-server's own default; clamped to 0 it answers an empty completion with finish_reason "length". So where
+    # the parser reads `n_predict`, the `max_tokens` clamp has to handle a negative value.
+    if "n_predict" in read:
+        clamp = [i for i, ln in enumerate(parser.splitlines()) if "std::clamp(max_tokens" in ln]
+        if not clamp:
+            print("serve_routes: no `std::clamp(max_tokens, …)` in app/forward_serve.cpp: that literal moved, so the "
+                  "sentinel half is looking at nothing", file=sys.stderr)
+            return 77
+        lines = parser.splitlines()
+        unguarded = [i + 1 for i in clamp
+                     if "max_tokens < 0" not in "\n".join(lines[max(0, i - 6):i + 1])]
+        for ln in unguarded:
+            print(f"serve_routes: line {ln} clamps max_tokens with no `max_tokens < 0` guard nearby -- llama.cpp's "
+                  f"-1 (no limit) becomes 0 and the request answers empty with finish_reason length (engine#2897)")
+        if unguarded:
+            print(f"serve_routes: {len(unguarded)} max_tokens clamp(s) do not handle the negative sentinel")
+            return 1
+        print(f"serve_routes: the max_tokens clamp handles llama.cpp's -1 ({len(clamp)} site(s))")
+
     # The boolean half (engine#2884's `cache_prompt`): a `false` the body sets and the parser never reads is the same
     # silence as a 404 -- the request succeeds and does the opposite of what it asked for.
     try:

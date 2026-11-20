@@ -449,7 +449,11 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // inside the model's context.
         const int room = e.max_context - int(ids.size());
         if (room < 1) throw ContextOverflow(ids.size(), e.max_context);
-        const int limit = std::clamp(max_tokens, 0, room);
+        // engine#2897: `n_predict: -1` is llama.cpp's "no limit" -- llama-server's own default -- so a negative value
+        // means "as far as the context allows", not zero. Clamping it to 0 (the behaviour the `n_predict` alias
+        // introduced) answered an empty completion with finish_reason "length", which is worse than the 256 the field
+        // used to fall through to: it looks like a successful request that produced nothing.
+        const int limit = max_tokens < 0 ? room : std::clamp(max_tokens, 0, room);
         // engine#2689 item 3b (--npu-batch-users N > 1): this request takes a slot and hands its prompt and each decode
         // step to the batch, whose thread owns the forward. Two consequences, both deliberate:
         //   * it must NOT take e.mu -- holding it for the request's life would serialise exactly what batching exists to

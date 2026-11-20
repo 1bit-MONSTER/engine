@@ -34,8 +34,12 @@ Same class, one field type further (engine#2884's `cache_prompt: false`, which t
 **boolean** field a warm-up body sets must be a boolean the parser reads, through `bool_field`. The two checks are
 separate on purpose -- a key can be read for one type and ignored for another, and a union would hide it.
 
-Exit: 0 every warm-up path is registered and its token limit is read, 1 one is not (named), 77 a literal could not be
-read.
+engine#2895: the same shape one step out. `stats.prefix` records WHY a request was refused the prompt cache, and the
+only `[prefix] slot=` line sat inside the branch that ACCEPTS the cache -- so a refusal logged nothing at all and read
+exactly like "the prefix path was never asked". Every recorded prefix decision must reach the log.
+
+Exit: 0 every warm-up path is registered, its token limit is read, and every recorded prefix decision is logged; 1 one of
+those is not (named); 77 a literal could not be read.
 """
 
 import pathlib
@@ -59,6 +63,9 @@ BODY_LIMIT = re.compile(r'"(n_predict|max_tokens|max_completion_tokens)"\s*(?:[:
 # only `n_predict` -- which is exactly how engine#2884 stayed invisible through a green check.
 BODY_FN = re.compile(r"static json (warmup_[a-z_]*body)\s*\([^)]*\)\s*\{(.*?)\n\}", re.S)
 READ_LIMIT = re.compile(r'int_field\(\s*body\s*,\s*"(n_predict|max_tokens|max_completion_tokens)"')
+# A recorded prefix decision, and the call that surfaces it (engine#2895).
+PREFIX_DECISION = re.compile(r"stats\.prefix\s*=\s*npu::PrefixDecision\{")
+PREFIX_LOG = re.compile(r"log_prefix\(|\[prefix\] slot=")
 # The boolean half: a field a builder sets to a literal true/false, and the ones the parser reads through bool_field.
 BODY_BOOL = re.compile(r'"([a-z_]+)"\s*,\s*(?:true|false)\b')
 READ_BOOL = re.compile(r'bool_field\(\s*body\s*,\s*"([a-z_]+)"')
@@ -189,6 +196,24 @@ def check(root=None):
         return 1
     print(f"serve_routes: every warm-up body's boolean field is read by the parser "
           f"(parser reads {', '.join(read_bools)})")
+
+    # engine#2895: a decision that is recorded must be printed. Each `stats.prefix = npu::PrefixDecision{` needs the log
+    # call near it -- near, because the line that explains a decision belongs beside it.
+    parser_lines = readers[0].splitlines()
+    silent = [i + 1 for i, ln in enumerate(parser_lines)
+              if PREFIX_DECISION.search(ln) and not PREFIX_LOG.search("\n".join(parser_lines[i:i + 12]))]
+    if not PREFIX_DECISION.search(readers[0]):
+        print("serve_routes: app/forward_serve.cpp records no prefix decision: that literal moved, so the log half is "
+              "looking at nothing", file=sys.stderr)
+        return 77
+    for ln in silent:
+        print(f"serve_routes: line {ln} records a prefix decision and nothing in the next 12 lines logs it -- the "
+              f"refusal is invisible in the serve log (engine#2895)")
+    if silent:
+        print(f"serve_routes: {len(silent)} prefix decision(s) recorded and never surfaced")
+        return 1
+    print(f"serve_routes: every recorded prefix decision is logged "
+          f"({len(PREFIX_DECISION.findall(readers[0]))} site(s))")
     return 0
 
 
@@ -240,6 +265,10 @@ out.push_back(json{ { "path", "/completion" } });'''
     arm("a body boolean is found", BODY_BOOL.findall('{"temperature", 0}, {"cache_prompt", false}') ==
         ["cache_prompt"])
     arm("a bool_field read is found", READ_BOOL.findall('bool_field(body, "cache_prompt", true)') == ["cache_prompt"])
+    arm("a recorded prefix decision is found",
+        len(PREFIX_DECISION.findall("stats.prefix = npu::PrefixDecision{-1, 0, x};")) == 1)
+    arm("both log shapes are recognised", bool(PREFIX_LOG.search("log_prefix(stats.prefix);")) and
+        bool(PREFIX_LOG.search('fprintf(stderr, "[prefix] slot=')))
     arm("an int field is not a boolean read",
         READ_BOOL.findall('int_field(body, "cache_prompt")') == [] and
         BODY_BOOL.findall('{"n_predict", 0}') == [])

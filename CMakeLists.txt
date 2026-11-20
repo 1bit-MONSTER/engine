@@ -485,6 +485,12 @@ endfunction()
 # script turned the row into BAD_COMMAND.
 add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
+# engine#2893 counted key-string mentions in one file and read zero as "cannot be reading it", which is how
+# `temperature` and `top_k` were filed as silently dropped when app/npu_sampling.h reads both. This row classifies
+# every request field by where its disposition lives (route parse, options parse, named refusal) and fails on a field
+# that has none, so the sixth field cannot slip through the same way.
+add_python_test(serve_field_census ${CMAKE_SOURCE_DIR}/tools/ci/serve_field_census.py --root ${CMAKE_SOURCE_DIR})
+add_python_test(serve_field_census_self ${CMAKE_SOURCE_DIR}/tools/ci/serve_field_census.py --self-test)
 # engine#2878: the fold tool is only useful if its output is something llama-hadamard.cpp can run,
 # and that is what this row checks; it had no runner, so tests_referenced named it.
 add_python_test(hadamard_fold_test ${CMAKE_SOURCE_DIR}/tests/hadamard_fold_test.py)

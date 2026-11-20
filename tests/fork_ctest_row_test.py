@@ -53,7 +53,7 @@ def git(cwd, *args):
 _cases = 0
 
 
-def fixture(tmp, *, tool=True, build_tree=True, git_root=True, submodule="absent", stale=False, real_ratchet=False):
+def fixture(tmp, *, tool=True, build_tree=True, git_root=True, submodule="absent", stale=False, real_ratchet=False, stamp=None):
     """A ROOT laid out the way the script expects to find itself, plus an HRX_BUILD."""
     global _cases
     _cases += 1
@@ -70,6 +70,8 @@ def fixture(tmp, *, tool=True, build_tree=True, git_root=True, submodule="absent
     build = case / "build"
     if build_tree:
         (build / "hrx" / "llama").mkdir(parents=True)
+    if stamp is not None:
+        (build / "bench-stamp.txt").write_text(f"engine=deadbeef0000\nllama_cpp={stamp}\nhost=box\n")
 
     if git_root:
         git(root, "init", "-q", ".")
@@ -175,6 +177,7 @@ def main():
         case.mkdir()
         root, build = fixture(case, submodule="present", real_ratchet=True)
         at = head_of(root / "third_party" / "llama.cpp")
+        (build / "bench-stamp.txt").write_text(f"engine=deadbeef0000\nllama_cpp={at[:12]}\n")
         git(root, "update-index", "--add", "--cacheinfo", f"160000,{at},third_party/llama.cpp")
         git(root, "commit", "-qm", "pin at head")      # WANT == GOT: the submodule matches the pin
         known = "test-kv-zero"
@@ -191,6 +194,7 @@ def main():
         case2.mkdir()
         root2, build2 = fixture(case2, submodule="present", real_ratchet=True)
         at2 = head_of(root2 / "third_party" / "llama.cpp")
+        (build2 / "bench-stamp.txt").write_text(f"engine=deadbeef0000\nllama_cpp={at2[:12]}\n")
         git(root2, "update-index", "--add", "--cacheinfo", f"160000,{at2},third_party/llama.cpp")
         git(root2, "commit", "-qm", "pin at head")
         body2 = ("The following tests FAILED:\n"
@@ -201,6 +205,33 @@ def main():
         ok(p.returncode == 1 and "test-brand-new" in p.stderr,
            "opt-in + matching submodule + a NEW failure exits 1 and names it",
            f"rc {p.returncode}: {p.stderr.strip()[-300:]}")
+
+        # 11. THE SOURCE TREE IS NOT THE TREE THAT RUNS. ROOT's submodule matches the pin, but the build tree
+        #     under HRX_BUILD is a copy that may have been configured from anything. Measured on 2026-11-20: with
+        #     ROOT aligned to 8d26add2c and a different-pin copy in HRX_BUILD, the row reported 11 NEW failures and
+        #     11 now-passing, none of them about the pinned source. No stamp -> cannot tell.
+        case3 = tmp / "no-stamp"
+        case3.mkdir()
+        root3, build3 = fixture(case3, submodule="present", real_ratchet=True)
+        at3 = head_of(root3 / "third_party" / "llama.cpp")
+        git(root3, "update-index", "--add", "--cacheinfo", f"160000,{at3},third_party/llama.cpp")
+        git(root3, "commit", "-qm", "pin at head")
+        p = run(root3, build3, {"ONEBIT_FORK_CTEST": "1", "stub": stub_ctest(case3, body)})
+        ok(p.returncode == 2 and "bench-stamp.txt" in p.stderr,
+           "a build tree with no stamp is 'cannot tell' (2), not a comparison",
+           f"rc {p.returncode}: {p.stderr.strip()[-220:]}")
+
+        # 12. ...and a stamp that names a DIFFERENT fork is refused by name, with both values printed.
+        case4 = tmp / "wrong-stamp"
+        case4.mkdir()
+        root4, build4 = fixture(case4, submodule="present", real_ratchet=True, stamp="0123456789ab")
+        at4 = head_of(root4 / "third_party" / "llama.cpp")
+        git(root4, "update-index", "--add", "--cacheinfo", f"160000,{at4},third_party/llama.cpp")
+        git(root4, "commit", "-qm", "pin at head")
+        p = run(root4, build4, {"ONEBIT_FORK_CTEST": "1", "stub": stub_ctest(case4, body)})
+        ok(p.returncode == 2 and "0123456789ab" in p.stderr and at4[:12] in p.stderr,
+           "a stamp naming another fork is refused, and the message names both revisions",
+           f"rc {p.returncode}: {p.stderr.strip()[-240:]}")
 
     print("fork_ctest_row: ok" if not fails else f"fork_ctest_row: {fails} failure(s)")
     return 0 if not fails else 1

@@ -70,6 +70,30 @@ if [ "$WANT" != "$GOT" ]; then
     exit 2
 fi
 
+# THE SOURCE TREE IS NOT THE TREE THAT RUNS. The guard above compares ROOT's gitlink with ROOT's submodule, and
+# then this script runs `ctest` in $FORK, which is a COPY under $HRX_BUILD. A source tree aligned to the pin
+# therefore satisfies that guard while the build tree stays whatever it was configured from -- and its
+# failures are then reported as this pin's. Measured on 2026-11-20: with ROOT's submodule at 8d26add2c and
+# $HRX_BUILD a different-pin copy, this row answered "11 NEW failure(s)" and "11 now passing", none of which
+# was about the pinned source. So ask the BUILD tree where it came from, using the stamp bench_stamp.py
+# writes (engine#2882), and refuse to compare when it cannot say.
+STAMP="$HRX_BUILD/bench-stamp.txt"
+if [ ! -f "$STAMP" ]; then
+    echo "fork_ctest_known_fail: cannot tell: $STAMP is absent, so this build tree does not record which source it was built from" >&2
+    echo "  a tree configured against another llama.cpp keeps stale include paths, and its failures are not this pin's" >&2
+    echo "  stamp it with: tools/ci/bench_stamp.py write --tree $HRX_BUILD --root $ROOT" >&2
+    exit 2
+fi
+STAMPED=$(sed -n 's/^llama_cpp=//p' "$STAMP" 2> /dev/null | head -1)
+case "$WANT" in
+    "${STAMPED:-none}"*) : ;;          # the stamp records a short sha; the pin is a full one
+    *)
+        echo "fork_ctest_known_fail: cannot tell: the build tree's stamp says llama_cpp=${STAMPED:-<missing>}, the tree pins $WANT" >&2
+        echo "  the suite would be run against a different fork than the one this tree pins" >&2
+        exit 2 ;;
+esac
+
+
 # tee, because the ratchet reads a log and ctest does not write one by itself. `|| true` is
 # load-bearing: under `set -e` a non-zero ctest ends the script HERE, before the ratchet runs, and
 # every known failure would then fail the row -- the one thing the baseline exists to prevent.

@@ -73,5 +73,29 @@ check "arm2: the hold succeeds" "$rc2" "0"
 noise=$(grep -c 'previous holder left' "$b/log" 2>/dev/null || true)
 check "arm2: a holder with no record warns about nothing" "$noise" "0"
 
+# --- arm 3: an environ the teardown cannot open is COUNTED, and the hold still finishes ------------
+# engine#2917: the sweep used to test `-r` and then open the same path with a redirection, and a redirection's EACCES is
+# not covered by a `2> /dev/null` that applies to `tr`: it aborted the teardown under `set -e`, so a granted ticket
+# reported "command exited 2" after one second. The sweep now opens once and keeps the fd.
+#
+# This cannot reproduce the race itself (a file that is readable at `-r` and not at the open, one syscall later); it
+# pins the behaviour the fix depends on: a directory the sweep cannot open is skipped and counted, and the hold's exit
+# status is untouched. `GPU_HOLD_PROC` is the sweep's root, so the tree is fake and nothing real is read.
+c="$work/arm3"; mkdir -p "$c/q" "$work/proc/999998" "$work/proc/999997"
+printf 'GPU_HOLD_TICKET=survivors pid 999998 Thu Nov  9 10:00:00 2026\0PATH=/usr/bin\0' > "$work/proc/999998/environ"
+printf 'gpu-hold\0-l\0survivors\0' > "$work/proc/999998/cmdline"
+printf 'GPU_HOLD_TICKET=survivors pid 999997 Thu Nov  9 10:00:00 2026\0' > "$work/proc/999997/environ"
+printf 'payload\0' > "$work/proc/999997/cmdline"
+chmod 000 "$work/proc/999997/environ"          # unopenable: counted, not fatal
+mkdir -p "$c/q"
+GPU_HOLD_PROC="$work/proc" GPU_QUEUE_DIR="$c/q" GPU_TOKEN_FILE="$c/token" GPU_HOLD_LOG="$c/log" \
+GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=2 \
+GPU_HOLD_TCTL_START=999 GPU_HOLD_TCTL_FILE="$work/tctl" GPU_HOLD_THERMAL_FLAG="$c/none" \
+    "$hold" -t 1 -l survivors -- /bin/true > "$c/out" 2>&1
+rc3=$?
+check "arm3: an unopenable environ does not abort the hold" "$rc3" "0"
+counted=$(grep -c 'could not be inspected' "$c/log" 2>/dev/null || true)   # the log, not stdout as well
+check "arm3: the unreadable process is counted, not silently skipped" "$counted" "1"
+
 [ "$fails" = 0 ] && { echo "gpu_hold_survivors: ok"; exit 0; }
 echo "gpu_hold_survivors: $fails failure(s)"; exit 1

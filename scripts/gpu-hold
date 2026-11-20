@@ -614,23 +614,37 @@ kill_tree() {
 # teardown line should read it as "no escapee that kept its environment", not as "no escapee".
 env_survivors() {   # <exact ticket line> -> pids carrying it, excluding this shell and any nested holder
     local want=$1 d p line cmd first second
+    local proc=${GPU_HOLD_PROC:-/proc}
     ENV_UNREADABLE=0
-    for d in /proc/[0-9]*; do
-        p=${d#/proc/}
+    for d in "$proc"/[0-9]*; do
+        p=${d##*/}
         [ "$p" = "$$" ] && continue
-        if [ ! -r "$d/environ" ]; then
-            # engine#2744 review: silently skipping an unreadable process makes an escapee invisible and the teardown
-            # line reads clean. Counted and reported by the caller, which is what every other guard in this script does.
+        # engine#2917: this used to be `[ ! -r "$d/environ" ]` followed by `< "$d/environ"` -- two syscalls over a pid
+        # list that is being reused. A pid owned by this user passed `-r`, exited, and was reused by a root process
+        # before the redirect, and the redirect's EACCES is NOT covered by a `2> /dev/null` that applies to `tr`/`grep`:
+        # it aborted the whole teardown under `set -e`, so a hold that had been granted reported "command exited 2"
+        # after one second. One open, kept on an fd, leaves no second syscall to race, and a failure is the unreadable
+        # case #2744 already counts.
+        if ! { exec 9< "$d/environ"; } 2> /dev/null; then
             ENV_UNREADABLE=$((ENV_UNREADABLE + 1))
             continue
         fi
-        line=$(tr '\0' '\n' < "$d/environ" 2> /dev/null | grep -m1 -F "GPU_HOLD_TICKET=$want") || continue
+        line=$(tr '\0' '\n' <&9 2> /dev/null | grep -m1 -F "GPU_HOLD_TICKET=$want")
+        exec 9<&-
+        [ -n "$line" ] || continue
         [ "$line" = "GPU_HOLD_TICKET=$want" ] || continue
         # engine#2737's override (`GPU_HOLD_ALLOW_NESTED=1`) means an inner gpu-hold runs with the OUTER ticket line in its
         # environment by design -- env is frozen at exec, and the inner script only exports its own line to its child. That
         # holder manages its own teardown; killing it here would leave its ticket file behind and block the queue until a
         # human noticed. So a process whose own command IS gpu-hold is not an escapee.
-        cmd=$(tr '\0' ' ' < "$d/cmdline" 2> /dev/null)
+        # engine#2917: same shape, same race as the environ read above -- and here a failed redirection inside a command
+        # substitution is the assignment's status, which is exactly what `set -e` acts on.
+        if { exec 8< "$d/cmdline"; } 2> /dev/null; then
+            cmd=$(tr '\0' ' ' <&8 2> /dev/null)
+            exec 8<&-
+        else
+            cmd=""
+        fi
         first=${cmd%% *}
         second=${cmd#* }
         second=${second%% *}
@@ -840,7 +854,19 @@ kill_tree "$child"
 # ...and the part of the tree that left the tree: a process still carrying this ticket's GPU_HOLD_TICKET is work this
 # hold started, wherever it moved itself. TERM, then KILL after the same grace the tree kill uses, then record it, so
 # the next holder is warned even if the KILL somehow failed.
-escaped=$(env_survivors "$mine")
+# engine#2917: this was `escaped=$(env_survivors "$mine")`, a command substitution, so the function ran in a SUBSHELL and
+# the ENV_UNREADABLE it counts never reached this shell -- the warning below was dead code, and #2744's counter was
+# recorded and never surfaced, the same shape as engine#2895's prefix reason. The sweep writes to a file instead, so it
+# runs in this shell and the count survives. Measured: with an unopenable `/proc/<pid>/environ` the old form printed no
+# warning at all and the hold exited 0.
+survivors_file=$(mktemp "${TMPDIR:-/tmp}/gpu-hold-survivors.XXXXXX" 2> /dev/null || printf '')
+if [ -n "$survivors_file" ]; then
+    env_survivors "$mine" > "$survivors_file"
+    escaped=$(cat "$survivors_file")
+    rm -f "$survivors_file"
+else
+    escaped=$(env_survivors "$mine")
+fi
 if [ "${ENV_UNREADABLE:-0}" -gt 0 ]; then
     log "::warning::${ENV_UNREADABLE} process(es) could not be inspected at teardown (their environment is not readable by this user), so an escapee among them would not be seen here; the tree kill above is the only guard that covers them"
 fi

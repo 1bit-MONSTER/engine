@@ -51,6 +51,7 @@
 #include "npu_prefix_cache.h"
 #include "npu_prompt_ids.h"
 #include "npu_sampling.h"
+#include "token_limit.h"   // engine#2897: -1 is "no limit", not zero
 #include "npu_spec_sampler.h"
 #include "npu_stop_tokens.h"
 #include "stream_bridge.h"
@@ -464,7 +465,10 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // inside the model's context.
         const int room = e.max_context - int(ids.size());
         if (room < 1) throw ContextOverflow(ids.size(), e.max_context);
-        const int limit = std::clamp(max_tokens, 0, room);
+        // engine#2897: `n_predict: -1` is llama.cpp's "no limit" (llama-server's own default), so a negative budget
+        // means "as far as the context allows" rather than zero. `token_limit` owns that sentinel -- 0 still means 0,
+        // which the short warm-up depends on -- and tests/npu_token_limit_test.cpp pins all three cases.
+        const int limit = npu::token_limit(max_tokens, room);
         // engine#2689 item 3b (--npu-batch-users N > 1): this request takes a slot and hands its prompt and each decode
         // step to the batch, whose thread owns the forward. Two consequences, both deliberate:
         //   * it must NOT take e.mu -- holding it for the request's life would serialise exactly what batching exists to

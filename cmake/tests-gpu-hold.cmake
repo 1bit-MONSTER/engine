@@ -68,6 +68,10 @@ add_test(NAME gpu_hold_queue_state COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_ho
 # ENV_UNREADABLE was incremented -- invisible AND uncounted, which is engine#2744's objection one branch short. Three
 # arms, and the second asserts the UNGROUPED form still leaks and counts 0, so removing the grouping cannot pass.
 add_test(NAME gpu_hold_environ_count_test COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_environ_count_test.sh)
+# engine#2917: the arms that need a real EACCES target skip where /proc/1/environ is readable (CI runs as root); the two
+# directory arms always run. Without this property ctest counted the skip as a failure -- the mirror image of engine#2912,
+# where a skip that returns 0 reads as a pass.
+set_tests_properties(gpu_hold_environ_count_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # engine#2727: a payload that re-invokes gpu-hold on the queue it is ALREADY inside queues behind its own ticket and
 # waits for it -- 764 s of a 14-minute window with the GPU idle on 2026-11-16, while coder-llm (every PR's pr-agent

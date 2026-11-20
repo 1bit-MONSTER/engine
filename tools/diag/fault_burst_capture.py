@@ -115,6 +115,52 @@ def _gaps(stamped):
     return out
 
 
+def timelines(observations, gap_seconds=3600):
+    """[(addr, seconds_of_day)] -> {addr: (first, last, count, kept)}, longest-lived first.
+
+    The 2026-11-20 measurement on this box is why this exists: the NVMe fault
+    stream had decayed from 1 303 faults over 91 addresses to 71 over FIVE, and
+    each survivor faulted for HOURS (0xe8940000: 5 h 36 m) with four of the five
+    alive at the same time. A burst summariser answers "what happened in this
+    second"; this answers "which pages are alive, for how long, and do they stop
+    together" -- and a set that stops together points at one owner (a process
+    exiting, an fd closing, a munmap), which independent pages would not.
+    """
+    spans = {}
+    for addr, t in observations:
+        first, last, n = spans.get(addr, (t, t, 0))
+        spans[addr] = (min(first, t), max(last, t), n + 1)
+    out = []
+    for addr, (first, last, n) in spans.items():
+        span = last - first
+        if span < 0:
+            span += 24 * 3600          # a syslog without a year rolls over midnight
+        out.append({"address": addr, "first": first, "last": last,
+                    "count": n, "span_s": span})
+    out.sort(key=lambda r: (-r["span_s"], -r["count"]))
+    return out
+
+
+def render_timelines(rows):
+    if not rows:
+        return "no fault addresses: nothing to time (an empty capture is not evidence of no fault)"
+    width = max(len(r["address"]) for r in rows)
+    lines = ["%d address(es), longest-lived first:" % len(rows)]
+    for r in rows:
+        lines.append("  %-*s %6d fault(s)  %5.1f h  %02d:%02d:%02d -> %02d:%02d:%02d"
+                     % (width, r["address"], r["count"], r["span_s"] / 3600.0,
+                        r["first"] // 3600, r["first"] % 3600 // 60, r["first"] % 60,
+                        r["last"] // 3600, r["last"] % 3600 // 60, r["last"] % 60))
+    # a set that ends together is the signal: report the spread of the last stamps
+    lasts = sorted(r["last"] for r in rows)
+    spread = lasts[-1] - lasts[0]
+    if spread < 0:
+        spread += 24 * 3600
+    lines.append("  last stamps span %.1f min%s" % (spread / 60.0,
+                 " -- the set STOPS TOGETHER (one owner)" if spread <= 120 * 60 and len(rows) > 1 else ""))
+    return "\n".join(lines)
+
+
 def summarize(events):
     """The burst as one record. Absences are reported, never filled in.
 
@@ -326,6 +372,32 @@ def self_test():
         "the syslog stamp parses to seconds of day (45326, computed here not copied)")
     chk(seconds_of_day("no stamp here") is None, "a line without a stamp has no time")
 
+    # The measured shape (2026-11-20): five addresses, four overlapping for hours,
+    # one short. Timelines must report the spans, not an average.
+    obs = ([( "0xe8940000", 14 * 3600 + 17 * 60)] * 2
+           + [("0xe8940000", 19 * 3600 + 53 * 60 + 22)]
+           + [("0xebf48000", 21 * 3600 + 29 * 60)] * 3
+           + [("0xebf48000", 24 * 3600 - 4 * 60 - 3)]
+           + [("0x7f4fe000", (25 * 3600 + 40 * 60) % 86400)])
+    rows = timelines(obs, gap_seconds=0)
+    chk([r["address"] for r in rows][0] == "0xe8940000",
+        "the longest-lived address leads the timeline")
+    chk(len(rows) == 3, "three addresses stay three, not merged")
+    first = next(r for r in rows if r["address"] == "0xe8940000")
+    chk(first["count"] == 3, "each address keeps its own count")
+    chk(first["span_s"] == 5 * 3600 + 36 * 60 + 22, "the span is last minus first, per address")
+    chk(timelines([]) == [], "no observations -> no timeline rows")
+
+    block = render_timelines(rows)
+    chk("address(es), longest-lived first" in block, "the block names its ordering")
+    chk("STOPS TOGETHER" not in block,
+        "a spread of hours is NOT reported as a set that stops together")
+    close = timelines([("0xaa00", 3600), ("0xbb00", 3600 + 600)] * 2)
+    chk("STOPS TOGETHER" in render_timelines(close),
+        "two addresses ending 10 min apart DO read as one owner")
+    chk("not evidence" in render_timelines([]),
+        "an empty timeline says empty, not zero-length")
+
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         proc = os.path.join(tmp, "proc")
@@ -388,6 +460,9 @@ def main(argv):
     ap.add_argument("--device", default="amdxdna", help="device name the line must carry")
     ap.add_argument("--dev-prefix", default=DEV_ACCEL, help="fd prefix that means 'holds the device'")
     ap.add_argument("--proc-root", default="/proc")
+    ap.add_argument("--timeline", action="store_true",
+                    help="replay only: print per-address first/last/span instead of bursts "
+                         "(the shape the 2026-11-20 stream needed: hours per address, not seconds)")
     ap.add_argument("--split", type=float, default=0.0,
                     help="replay only: start a new burst when the log gap exceeds this many "
                          "seconds (0 = treat the whole file as one burst)")
@@ -396,7 +471,7 @@ def main(argv):
     if a.self_test:
         return self_test()
 
-    events, snaps, total, stamped = [], [], 0, []
+    events, snaps, total, stamped, obs = [], [], 0, [], []
     replay_note = [False]   # a replay cannot snapshot holders: /proc is today's
     src = None
     if a.replay:
@@ -428,6 +503,7 @@ def main(argv):
         ts = seconds_of_day(line)
         if ts is not None:
             stamped.append((ts, ev))
+            obs.append(("0x%x" % ev["address"], ts))
         events.append(ev)
         if len(events) == 1:
             # Taken on the FIRST fault, not after the burst: the client may be gone
@@ -455,6 +531,9 @@ def main(argv):
         print("no %s fault in %d line(s) examined: nothing to capture "
               "(an empty capture is not evidence of no fault)" % (a.device, total))
         return 2
+    if a.timeline:
+        print(render_timelines(timelines(obs)))
+        return 0
     bursts = split_by_gap(stamped, a.split) if a.split > 0 else []
     if bursts:
         # A replay of a day is many bursts; the per-burst count is the finding, so it

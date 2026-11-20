@@ -60,12 +60,29 @@ constexpr uint64_t kMiB = 1ull << 20, kGiB = 1ull << 30;
 // backstop cannot disagree about where the wall is.
 constexpr uint64_t kGttReserveDefaultMiB = 16384;
 
-inline uint64_t gtt_reserve_bytes() {
+// PRECEDENCE, stated once so a future change knows what it must match: the explicit knob (GGML_HRX_GTT_RESERVE_MB),
+// then the 16 GiB cap, then a quarter of the pool. The fork's copy of this function carries the same three rules and
+// must keep carrying them -- the planner refuses a load the allocation-time backstop would allow, or the reverse, if
+// the two disagree.
+//
+// engine#2986: the 16 GiB default was sized on a 120 GiB GTT box (#680) and is right there, but it is a *fixed* number:
+// on a machine whose GTT is 16 GiB (a 32 GB box) it leaves a ceiling of zero, so HRX refuses every model -- and on a 16 GB
+// box (about 8 GiB GTT) it refuses before arithmetic. The reserve therefore scales with the pool it protects: a quarter of
+// GTT, capped at the measured 16 GiB. For GTT >= 64 GiB that is exactly the old number (so #680's headroom is unchanged,
+// bit for bit); below it the box keeps three quarters of its pool usable instead of losing all of it.
+inline uint64_t gtt_reserve_bytes(uint64_t gtt_total) {
     if (const char* e = std::getenv("GGML_HRX_GTT_RESERVE_MB")) {
         const long long mb = std::atoll(e);
         if (mb >= 0) return uint64_t(mb) * kMiB;
     }
-    return kGttReserveDefaultMiB * kMiB;
+    // engine#2995 review: `gtt_total == 0` means the pool could not be READ, not that it is empty. Without this line
+    // `quarter` is 0, `0 < cap` is true, and the function returns no reserve at all -- failing open on exactly the input
+    // where the answer is unknown, so a 32 GB box whose GTT read fails would be admitted like a box with an infinite pool.
+    // The measured-safe value is the right answer to "I cannot tell".
+    if (gtt_total == 0) return kGttReserveDefaultMiB * kMiB;
+    const uint64_t quarter = gtt_total / 4;
+    const uint64_t cap     = kGttReserveDefaultMiB * kMiB;
+    return quarter < cap ? quarter : cap;
 }
 
 // The metadata a size estimate needs: integer scalars, integer arrays and general.architecture.
@@ -363,7 +380,7 @@ inline Verdict judge(const Need& need, const sysinfo::Memory& mem, uint64_t rese
         const uint64_t gtt_free = mem.gtt_total > mem.gtt_used ? mem.gtt_total - mem.gtt_used : 0;
         v.free = std::min(v.free, gtt_free);
         v.box = "GTT " + gib(gtt_free) + " of " + gib(mem.gtt_total) + " GiB free, " + v.box;
-        const uint64_t gtt_reserve = gtt_reserve_bytes();
+        const uint64_t gtt_reserve = gtt_reserve_bytes(mem.gtt_total);
         v.ceiling = mem.gtt_total > gtt_reserve ? mem.gtt_total - gtt_reserve : 0;
         v.projected = mem.gtt_used + need.total;
         v.over_ceiling = v.projected > v.ceiling;

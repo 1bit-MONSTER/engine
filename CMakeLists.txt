@@ -831,6 +831,11 @@ add_test(NAME hw_gate_mem COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_mem_tes
 # the first version overwrote the previous run's evidence), and a failed copy names nothing. No GPU, no ticket.
 add_test(NAME hw_gate_kept_log COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_kept_log_test.sh ${CMAKE_SOURCE_DIR})
 add_test(NAME hw_gate_phase_rows COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_phase_rows_test.sh ${CMAKE_SOURCE_DIR})
+# engine#3030: an NPU-only phase set must not claim the GPU token. The gate claims ~/GPU-TOKEN for the whole run, which is
+# right when a GPU phase is named and wrong when only `npu`/`npuserve` are: measured 2026-11-20, `--phases npuserve` waited
+# 858 s behind GPU work and then held the GPU for an NPU-only test. A stub gpu-hold on PATH counts the calls, so this row
+# needs no token, no device and no build.
+add_test(NAME hw_gate_npu_phases COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_npu_phases_test.sh)
 # engine#2542: the accel sampler's self-test -- the correlation and rotation arms must be green before anyone
 # starts a long capture, because a silent correlator loses exactly the event it exists to catch.
 add_test(NAME accel_sampler COMMAND bash ${CMAKE_SOURCE_DIR}/tools/diag/accel_sampler.sh selftest)

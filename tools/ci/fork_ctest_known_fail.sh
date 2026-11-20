@@ -85,6 +85,15 @@ if [ ! -f "$STAMP" ]; then
     exit 2
 fi
 STAMPED=$(sed -n 's/^llama_cpp=//p' "$STAMP" 2> /dev/null | head -1)
+# The comparison below treats the stamp's value as a PREFIX of the pin, because bench_stamp.py writes a `--short=12`
+# revision while the pin is a full one. That makes the length load-bearing: `llama_cpp=8` is a prefix of a pin
+# beginning `8d26add2c…` and satisfied the guard on 2026-11-20 -- the row answered "18 known failure(s), no new ones"
+# about a build tree nobody could identify, which is the same green tick over nothing this guard was added to stop.
+# A stamp that cannot name a revision is not provenance.
+if [ "${#STAMPED}" -lt 7 ]; then
+    echo "fork_ctest_known_fail: cannot tell: the build tree's stamp names llama_cpp='${STAMPED}', shorter than a git short sha (7); bench_stamp.py writes 12" >&2
+    exit 2
+fi
 case "$WANT" in
     "${STAMPED:-none}"*) : ;;          # the stamp records a short sha; the pin is a full one
     *)

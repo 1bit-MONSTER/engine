@@ -49,7 +49,8 @@ Exit: 0 nothing lost (or only moved), 1 a guard's identifiers are gone, 2 cannot
 """
 import argparse, re, subprocess, sys
 
-GUARD_KEYWORDS = ("refus", "assert", "GGML_ABORT", "!= 0", "== nullptr", "cannot", "must be", "is not set")
+GUARD_KEYWORDS = ("refus", "assert", "GGML_ABORT", "!= 0", "== nullptr", "cannot", "must be", "is not set",
+                  "throw ")   # engine#2946: `throw std::runtime_error(...)` is this tree's refusal idiom
 # engine#2761: a *diagnostic* is not a refusal, but losing one is not nothing either. Measured on
 # #2825, where a bundled hunk removed the gpu-hold wait-time re-check -- two lines (the `if` and the
 # `log "::warning::..."` it guarded) -- and this tool found **0 of 3** removed diagnostic lines,
@@ -82,7 +83,13 @@ def removed_guards(diff_text):
         stripped = body.strip()
         if stripped.startswith(("//", "*", "/*")):
             continue                      # a comment about a guard is not a guard
-        if any(k in body for k in GUARD_KEYWORDS) and ("if" in body or "assert" in body.lower()):
+        # engine#2946: the `if`/`assert` half used to gate the keyword half, so adding "throw " alone would have
+        # changed nothing -- a route-level refusal is a bare `throw std::runtime_error(...)` with no `if` on the line.
+        # A throw terminates the path by itself, so it satisfies the gate. A rethrow (`throw e;`) is counted too; the
+        # cost is 0 removed `throw ` lines across the last 30 commits touching app/ and npu/, and a rethrow inside a
+        # catch block is the only shape that noise could take.
+        if any(k in body for k in GUARD_KEYWORDS) and (
+                "throw " in body or "if" in body or "assert" in body.lower()):
             out.append((path, body, "refusal"))
         elif any(k in body for k in WARN_KEYWORDS):
             # not a refusal (nothing is decided by it), but a diagnostic that left the file
@@ -202,6 +209,16 @@ def self_test():
     chk("a plain comment is not guard-shaped", guards_removed("+++ b/a.cpp\n-// the buffer is aligned\n"), [])
     chk("a comment that MENTIONS an assert is not a guard",
         guards_removed("+++ b/a.cpp\n-        // the case must reach a kernel or it asserts nothing\n"), [])
+    # engine#2946: `throw std::runtime_error(...)` is this tree's refusal idiom in app/ and npu/, and it carries no
+    # `if` on the line -- so the keyword alone was not enough, the gate had to let a throw through as well.
+    thrown = guards_removed('+++ b/app/forward_serve.cpp\n-            throw std::runtime_error("logprobs: '
+                            '/v1/chat/completions only");\n')
+    chk("a removed throw is a lost refusal", len(thrown), 1)
+    chk("and it keeps its own line", "logprobs" in thrown[0][1], True)
+    chk("an identifier that merely starts with throw is not a refusal",
+        guards_removed("+++ b/a.cpp\n-int thrower_count = 0;\n"), [])
+    chk("a comment about a throw is still not a guard",
+        guards_removed('+++ b/a.cpp\n-        // throw std::runtime_error("no");\n'), [])
     # engine#2436, measured on a real PR: a guard that moved into a helper is a rewrite, not a loss.
     # Built in a scratch repo because the answer comes from the head tree, not from a string.
     import subprocess, tempfile, os, pathlib

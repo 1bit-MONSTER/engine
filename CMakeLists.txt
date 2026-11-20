@@ -1555,6 +1555,17 @@ if(Python3_Interpreter_FOUND)
     # and carry the padded fixture plus the storage guard. Source only, no device. tests_referenced wants a runner.
     add_test(NAME fa_split_expectation_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/fa_split_expectation_check.py --self-test)
     set_tests_properties(fa_split_expectation_check PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # engine#2925: `--self-test` proves the tool's own fixtures; the invariant is `--check`, the join across the fork's
+    # expectation, its fixture padding and its matcher guard -- and nothing ran it, so a fixture that stops padding (or a
+    # matcher that stops comparing against the padded capacity) went unnoticed. `--root` is the FORK, not the engine.
+    # Exit 2 is "cannot tell" (fork not checked out): the row turns that into a skip rather than a pass, so a missing
+    # submodule cannot read as "the invariant holds".
+    # The wrapper maps the tool's 2 ("cannot tell") to 77: `SKIP_RETURN_CODE 77` does NOT convert a 2, so the row as
+    # the issue proposed it would go red on any tree without the submodule -- and a red "could not look" is a worse
+    # bug than the missing row, because it trains lanes to re-run it.
+    add_test(NAME fa_split_expectation_invariant COMMAND bash ${CMAKE_SOURCE_DIR}/tests/fa_split_expectation_invariant.sh
+             ${CMAKE_SOURCE_DIR}/tools/ci/fa_split_expectation_check.py ${CMAKE_SOURCE_DIR}/third_party/llama.cpp)
+    set_tests_properties(fa_split_expectation_invariant PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME serve_warmup_routes COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/serve_routes_check.py ${CMAKE_SOURCE_DIR})
     # an installed package must find its libraries beside itself: the 2026-11-08 incident's rule, from
     # the installed side that no release gate can reach (engine #1411). Skips without patchelf/readelf.

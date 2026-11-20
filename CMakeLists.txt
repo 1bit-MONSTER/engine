@@ -1474,6 +1474,11 @@ if(Python3_Interpreter_FOUND)
     # Hermetic -- no network, no token, ~0.2 s -- and it fails on the version that shipped.
     add_test(NAME census_alert_job COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_alert_job_test.py)
     set_tests_properties(census_alert_job PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # Source-only, no build and no device: a warm-up path that is not a registered route 404s and warms
+    # nothing (engine#2853 -- /completion was that path for two warm-ups until #2855 registered it).
+    add_test(NAME warmup_route_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/warmup_route_check.py --root ${CMAKE_SOURCE_DIR})
+    set_tests_properties(warmup_route_check PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     # engine#2853: `1bit serve`'s short and spec warm-ups posted to /completion, a path it never registered -- 404s that
     # moved nothing, and no test could see them because a warm-up is a POST the server makes to itself. The route table
     # and the warm-up list are two literals in app/serve.cpp; this fails when they disagree. Static, ~0.1 s.

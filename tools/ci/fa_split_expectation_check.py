@@ -64,26 +64,65 @@ GUARD = ("key->ne[1] < match.key_value_capacity", "value->ne[1] < match.key_valu
 # the first left the rows that actually run unwatched (measured 11-20: hrx-ops-test split=17 padding-hits=2,
 # test-hrx-ops split=45 kPaddedKeyValueCapacity=4 -- and #454 un-pads a row in the second with this row still green).
 TEST_PATH = Path("tests/hrx-ops-test.cpp")
-TEST_PATHS = (TEST_PATH, Path("tests/test-hrx-ops.cpp"))
+# The three suites that carry a decode-split expectation AND the matching capacity, each measured on the pin today:
+#   hrx-ops-test  split=17 padding-hits=2 | test-hrx-ops split=45 kPaddedKeyValueCapacity=4 | hrx-backend-test 4 hits
+# hrx-backend-test asserts the split dispatch and the `decode.key_value_token_capacity` compile parameter, i.e. the
+# same capacity question one layer up -- it pads, so pinning it costs nothing and puts those assertions under this row.
+TEST_PATHS = (TEST_PATH, Path("tests/test-hrx-ops.cpp"), Path("tests/hrx-backend-test.cpp"))
 DISPATCH_PATH = Path("ggml/src/ggml-hrx/dispatch_registration/common/dispatch-flash-attention.cpp")
+
+# Files that MENTION the split kernel without being a fixture for it: the LoomJIT export/reuse cases hand it their own
+# workload (`flash_attention_decode_workload`), so "pads the capacity" is not their invariant. Naming them is the
+# decision the tuple used to make by omission -- and a listed file that stops naming the kernel fails below, because
+# an exemption that outlived its field is indistinguishable from a reviewed one.
+NAMES_WITHOUT_FIXTURE = ("tests/hrx-loom-jit-test.cpp", "tests/test-hrx-loom-jit.cpp")
+
+
+def suites(root: Path):
+    """(carriers, missing, unreviewed): the pinned suites that expect the split kernel, and any file that names it
+    while being neither pinned nor exempt.
+
+    A hand-written tuple is the hole this row already had -- it read one file while the rows that run lived in
+    another, and nobody noticed until #454 edited the unread one. A THIRD copy would be just as unwatched, so every
+    `tests/*hrx*.cpp` is looked at; but a file that merely names the kernel is not a fixture for it (the LoomJIT
+    export/reuse cases feed it through their own workload helpers and pad nothing, by design), so the two ways out
+    are named rather than guessed: pin it as a carrier, or list it as naming the kernel without a fixture.
+    """
+    carriers, missing, unreviewed = [], [], []
+    for rel in TEST_PATHS:
+        try:
+            text = (root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            missing.append(str(root / rel))
+            continue
+        if SPLIT in text:
+            carriers.append((rel, text))
+    for path in sorted((root / "tests").glob("*hrx*.cpp")):
+        rel = path.relative_to(root)
+        if rel in TEST_PATHS:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if str(rel) in NAMES_WITHOUT_FIXTURE:
+            if SPLIT not in text:      # an exemption that outlived its field reads exactly like a reviewed file
+                unreviewed.append((rel, "is exempt from the padded-capacity fixture and no longer names the split "
+                                        "kernel: remove it from NAMES_WITHOUT_FIXTURE"))
+        elif SPLIT in text:
+            unreviewed.append((rel, "names the split kernel and is neither a reviewed suite nor listed as naming it "
+                                    "without a fixture: add it to TEST_PATHS (it must pad the capacity) or to "
+                                    "NAMES_WITHOUT_FIXTURE (say why it does not run the fixture)"))
+    return carriers, missing, unreviewed
 
 
 def check(root: Path):
     """(failures, cannot_tell). A failure is (side, what). Every suite that carries a split expectation is checked."""
     dispatch = root / DISPATCH_PATH
-    carriers, missing = [], []
-    for rel in TEST_PATHS:
-        path = root / rel
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            missing.append(str(path))
-            continue
-        if SPLIT in text:
-            carriers.append((rel, text))
+    carriers, missing, unreviewed = suites(root)
     if not carriers:
         if len(missing) == len(TEST_PATHS):
-            return [], f"no {missing[0]} (and no {missing[1]})"
+            return [], "no " + " (and no ".join(missing)
         return [], None  # nothing expects the split kernel: the invariant is vacuous, and that is not a failure
     try:
         dispatch_text = dispatch.read_text(encoding="utf-8", errors="replace")
@@ -98,6 +137,8 @@ def check(root: Path):
                              f"{rel}: the test expects the split kernel and never computes the padded capacity, so the "
                              "fixture allocates at the token count and the matcher will decline for storage it "
                              "does not have (engine#2870: 65 slots for a 128-slot walk)"))
+    for rel, reason in unreviewed:
+        failures.append(("unreviewed", f"{rel}: {reason}"))
     # both, not either: `any()` passed a matcher that kept the value guard and dropped the key one, which is half of
     # the fault engine#418 removed -- measured on 11-20 by deleting each guard in turn from a copy of the fork's file
     if not all(g in dispatch_text for g in GUARD):
@@ -168,6 +209,34 @@ def self_test() -> int:
         none = build(tmp, "// no split expectation here\n", guard=False)
         got, why = check(none)
         arm("no expectation at all is vacuous, not a failure", got == [] and why is None, str(got))
+
+        # The ask on this PR: a THIRD suite carrying split expectations must not be green by default. It is named
+        # `*hrx*` like both real copies, and it pads nothing -- but it is not yet one of the reviewed suites, so the
+        # verdict is `unreviewed` naming the file, not a silent pass and not a guessed `fixture` verdict. (The first
+        # version of this arm globbed and judged every *hrx* file by the fixture rule; the live tree answered red on
+        # hrx-loom-jit-test.cpp, which names the kernel and pads nothing by design.)
+        third = build(tmp, padded, guard=True)
+        (third / "tests" / "hrx-ops-third.cpp").write_text(expecting, encoding="utf-8")
+        got, why = check(third)
+        arm("a third *hrx* suite is a FAILURE naming the file, not a silent pass",
+            [s for s, _ in got] == ["unreviewed"] and any("hrx-ops-third.cpp" in w for _, w in got), str(got))
+
+        # ...and the exemption cannot rot: a listed file that stops naming the kernel is a failure too, because it
+        # reads exactly like a reviewed one.
+        rotten = build(tmp, padded, guard=True)
+        (rotten / "tests" / "hrx-loom-jit-test.cpp").write_text("// the split case moved elsewhere\n", encoding="utf-8")
+        got, why = check(rotten)
+        arm("an exemption that no longer names the kernel is a FAILURE",
+            [s for s, _ in got] == ["unreviewed"] and any("NAMES_WITHOUT_FIXTURE" in w for _, w in got), str(got))
+
+        # ...and the tree as it stands must be green: every pinned suite pads, and the two LoomJIT files are listed.
+        live = build(tmp, padded, guard=True)
+        for rel in TEST_PATHS[1:]:
+            (live / rel).write_text(padded, encoding="utf-8")
+        for rel in NAMES_WITHOUT_FIXTURE:
+            (live / rel).write_text(f'x("{SPLIT}");\n', encoding="utf-8")
+        got, why = check(live)
+        arm("the three pinned suites plus the two listed LoomJIT files are clean", got == [] and why is None, str(got))
 
         empty = tmp / "empty"
         (empty / TEST_PATH.parent).mkdir(parents=True)

@@ -46,6 +46,7 @@ but never fire, so kprobes are required):
     cat trace > TRACE
 """
 import argparse
+import ctypes
 import os
 import re
 import struct
@@ -221,6 +222,29 @@ def region_of(pid, va):
     return None
 
 
+def pagemap_readable():
+    """A positive control: a page this process knows is resident must have a nonzero PFN in its own pagemap.
+
+    Unprivileged, every entry's PFN word reads 0 (measured 2026-11-20 on this box: same page, `pfn=0x0` as a
+    normal user and `pfn=0x534af4` under sudo), and `scan_proc()` then matches no target at all -- so an owner
+    search would answer "nobody" for a page that is held. That is the failure this file's own header forbids
+    ("a partial answer is exit 2, never exit 1"), one file over from the kpageflags `0x0` reading.
+    """
+    import mmap
+    page = mmap.mmap(-1, PAGE)
+    try:
+        page[0:1] = b"x"                       # fault it in
+        va = ctypes.addressof(ctypes.c_char.from_buffer(page))
+        fd = os.open("/proc/self/pagemap", os.O_RDONLY)
+        try:
+            e = struct.unpack("<Q", os.pread(fd, ENTRY, (va // PAGE) * ENTRY))[0]
+        finally:
+            os.close(fd)
+        return bool(e & (1 << 63)) and (e & ((1 << 55) - 1)) != 0
+    finally:
+        page.close()
+
+
 def report_owners(addrs, per_proc_mb, total_mb):
     targets = {int(a, 16) // PAGE: a for a in addrs}
     tf, hits, scanned, covered, skipped = set(targets), [], 0, 0, 0
@@ -238,6 +262,12 @@ def report_owners(addrs, per_proc_mb, total_mb):
         print(f"OWNER pid={pid} {pfn:#x} ({targets[pfn]}) va={va:#x}  {region_of(pid, va)}")
     if hits:
         return 0
+    if not pagemap_readable():
+        # Nothing in the scan could have matched: without CAP_SYS_ADMIN every PFN reads 0. Saying "nobody"
+        # here is the answer this file exists to refuse.
+        print("cannot tell: pagemap PFNs are not readable as this user (needs CAP_SYS_ADMIN), "
+              "so an owner cannot be found either way")
+        return 2
     if skipped:
         # an unread process may be the owner: this is NOT a negative result
         print(f"cannot tell: {skipped} process(es) were not read")
@@ -288,6 +318,11 @@ def self_test():
         os.unlink(p3)
         # percentiles must not crash or lie on a single sample
         assert pct([0.5], .5) == 0.5 and pct([0.5], .9) == 0.5
+        # engine#2478: the owner search refuses when it cannot read a PFN at all. The control must say so as
+        # a bool on every box (root: True; an ordinary user: False), and `report_owners` returns 2 in that case
+        # -- the end-to-end refusal is measured with the CLI in the PR body, because a full scan is far too slow
+        # for a self-test.
+        assert isinstance(pagemap_readable(), bool), "the pagemap control must decide, not raise"
         # an empty trace is `cannot tell`, not `clean`
         fd2, p2 = tempfile.mkstemp()
         os.close(fd2)

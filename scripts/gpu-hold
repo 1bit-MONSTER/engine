@@ -612,6 +612,24 @@ kill_tree() {
 # see it. For that case the `.gpu-hold-survivors` file and the next holder's #1639 warning are the backstop -- so is
 # the memory floor's other side, a lane that reads GTT before it takes a ticket. A reader deciding whether to trust the
 # teardown line should read it as "no escapee that kept its environment", not as "no escapee".
+# engine#2917: 0 the environ names that ticket, 1 it does not, 2 it could not be read at all. The distinction matters
+# because the sweep has to COUNT an unreadable process (an escapee could be hiding there, engine#2744's review asked for
+# exactly that) while a plain non-match must not be counted -- and neither may abort the sweep. Both redirections are
+# inside a group whose stderr is discarded, because the shell's own "Permission denied" for the `<` is printed before
+# `tr` runs and `2> /dev/null` on `tr` does not reach it.
+env_has_ticket() {   # <environ path> <exact ticket line>
+    local path=$1 want=$2 line
+    line=$( { tr '\0' '\n' < "$path"; } 2> /dev/null | grep -m1 -x -F -- "$want" ) || line=""
+    [ -n "$line" ] && return 0
+    # A one-byte READ, not just an open: `<` succeeds on a directory (the read is what fails, with EISDIR), so an
+    # open-only probe would call a directory readable. `head -c 1` fails for EACCES and for EISDIR, which are the two
+    # ways this path goes unreadable here.
+    if ! { head -c 1 < "$path" > /dev/null; } 2> /dev/null; then
+        return 2
+    fi
+    return 1
+}
+
 env_survivors() {   # <exact ticket line> -> pids carrying it, excluding this shell and any nested holder
     local want=$1 d p line cmd first second
     ENV_UNREADABLE=0
@@ -624,8 +642,16 @@ env_survivors() {   # <exact ticket line> -> pids carrying it, excluding this sh
             ENV_UNREADABLE=$((ENV_UNREADABLE + 1))
             continue
         fi
-        line=$(tr '\0' '\n' < "$d/environ" 2> /dev/null | grep -m1 -F "GPU_HOLD_TICKET=$want") || continue
-        [ "$line" = "GPU_HOLD_TICKET=$want" ] || continue
+        # engine#2917: the `-r` above and this read are two syscalls over a pid list that is being reused, so a pid can
+        # pass `-r` and then be reused by another user's process before the open -- measured on this box: a granted
+        # ticket was lost one second into its hold, the command never ran, and the teardown line read clean. A failed
+        # open must therefore be a SKIP that is counted (like the `-r` case), never an error that reaches the caller.
+        env_has_ticket "$d/environ" "GPU_HOLD_TICKET=$want"
+        case $? in
+            0) line="GPU_HOLD_TICKET=$want" ;;
+            2) ENV_UNREADABLE=$((ENV_UNREADABLE + 1)) ; continue ;;
+            *) continue ;;
+        esac
         # engine#2737's override (`GPU_HOLD_ALLOW_NESTED=1`) means an inner gpu-hold runs with the OUTER ticket line in its
         # environment by design -- env is frozen at exec, and the inner script only exports its own line to its child. That
         # holder manages its own teardown; killing it here would leave its ticket file behind and block the queue until a

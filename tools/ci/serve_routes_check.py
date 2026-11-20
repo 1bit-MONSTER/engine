@@ -43,7 +43,11 @@ SOURCE = pathlib.Path("app/serve.cpp")
 # The regex form is why `warmup_route_check.py` existed as a second check; both halves live here now, so one file answers
 # "is every warm-up path a route this server registers" and no reviewer has to keep two baselines in step.
 ROUTE = re.compile(r'srv\.(?:Get|Post)\(\s*(?:R"\((.*?)\)"|"([^"]+)")\s*,')
-WARMUP = re.compile(r'\{\s*"path"\s*,\s*"([^"]+)"')
+# A warm-up path is either a literal or a named constant (`kWarmupPath`), and the chat warm-up uses the constant. Matching
+# literals only would verify two of the three warm-ups and report ok -- the same shape as the 404 this check exists for,
+# so an identifier is resolved when the file defines it and is `cannot tell` (77) when it does not, never a silent skip.
+WARMUP = re.compile(r'\{\s*"path"\s*,\s*([A-Za-z_]\w*|"[^"]*")')
+CONST_DEF = re.compile(r'const\s+char\s*\*\s*const\s+([A-Za-z_]\w*)\s*=\s*"([^"]+)"')
 # The token-limit fields the warm-up bodies set, and the ones the request parser reads (forward_serve.cpp).
 # Both shapes the builders use: `{ "n_predict", 0 }` in an initializer list and `body["n_predict"] = 2`.
 BODY_LIMIT = re.compile(r'"(n_predict|max_tokens|max_completion_tokens)"\s*(?:[:,]|\])')
@@ -54,7 +58,7 @@ READ_LIMIT = re.compile(r'int_field\(\s*body\s*,\s*"(n_predict|max_tokens|max_co
 
 
 def routes_and_warmups(text):
-    """(registered paths, warm-up paths), each in file order and de-duplicated."""
+    """(registered paths, warm-up paths, identifiers that could not be resolved), warm-ups in file order."""
     def uniq(seq):
         seen, out = set(), []
         for s in seq:
@@ -62,7 +66,18 @@ def routes_and_warmups(text):
                 seen.add(s)
                 out.append(s)
         return out
-    return uniq([raw if raw else lit for raw, lit in ROUTE.findall(text)]), uniq(WARMUP.findall(text))
+
+    consts = dict(CONST_DEF.findall(text))
+    warmups, unresolved = [], []
+    for expr in WARMUP.findall(text):
+        if expr.startswith('"'):
+            warmups.append(expr[1:-1])
+        elif expr in consts:
+            warmups.append(consts[expr])
+        else:
+            unresolved.append(expr)
+    routes = uniq([raw if raw else lit for raw, lit in ROUTE.findall(text)])
+    return routes, uniq(warmups), uniq(unresolved)
 
 
 def route_covers(routes, path):
@@ -86,7 +101,11 @@ def check(root=None):
     except OSError:
         print(f"serve_routes: cannot read {path}", file=sys.stderr)
         return 77
-    routes, warmups = routes_and_warmups(text)
+    routes, warmups, unresolved = routes_and_warmups(text)
+    if unresolved:
+        print(f"serve_routes: {path} posts a warm-up to {', '.join(unresolved)}, and this file defines no string for it: "
+              f"an identifier it cannot resolve is cannot-tell, not a path to skip", file=sys.stderr)
+        return 77
     requests = len(WARMUP.findall(text))   # the postings, not the distinct paths: two requests can share one
     if not routes or not warmups:
         print(f"serve_routes: {path} has {len(routes)} route(s) and {len(warmups)} warm-up path(s): one of the two "
@@ -136,25 +155,33 @@ def self_test():
         print(f"{'ok  ' if ok else 'FAIL'} {name}" + (f": {detail}" if detail and not ok else ""))
         fails += 0 if ok else 1
 
-    good = '''srv.Post("/v1/chat/completions", post);
+    # The chat warm-up names its path through a constant, so the fixtures do too: a fixture that inlines the literal is
+    # easier than the artifact, and passes for the better reason while covering less of it.
+    good = '''static const char* const kWarmupPath = "/v1/chat/completions";
+srv.Post("/v1/chat/completions", post);
 srv.Post("/v1/completions", post);
 srv.Post("/completion", post);
-out.push_back(json{ { "path", "/v1/chat/completions" } });
+out.push_back(json{ { "path", kWarmupPath } });
 out.push_back(json{ { "path", "/completion" } });'''
-    bad = '''srv.Post("/v1/chat/completions", post);
+    bad = '''static const char* const kWarmupPath = "/v1/chat/completions";
 srv.Post("/v1/completions", post);
-out.push_back(json{ { "path", "/v1/chat/completions" } });
+srv.Post("/completion", post);
+out.push_back(json{ { "path", kWarmupPath } });
 out.push_back(json{ { "path", "/completion" } });'''
-    r, w = routes_and_warmups(good)
-    arm("a warm-up whose route exists parses", r == ["/v1/chat/completions", "/v1/completions", "/completion"] and
-        w == ["/v1/chat/completions", "/completion"])
-    r, w = routes_and_warmups(bad)
-    arm("... and the missing route is visible as a subset failure", [x for x in w if x not in r] == ["/completion"])
-    arm("no routes parses as nothing", routes_and_warmups("nothing here") == ([], []))
+    r, w, u = routes_and_warmups(good)
+    arm("a warm-up whose route exists parses, and a named constant is resolved",
+        r == ["/v1/chat/completions", "/v1/completions", "/completion"] and
+        w == ["/v1/chat/completions", "/completion"] and u == [])
+    r, w, u = routes_and_warmups(bad)
+    arm("... and the missing route behind the constant is visible as a subset failure",
+        [x for x in w if not route_covers(r, x)] == ["/v1/chat/completions"])
+    r, w, u = routes_and_warmups('out.push_back(json{ { "path", kUndeclared } });')
+    arm("an identifier this file does not define is cannot-tell, not a skip", (r, w, u) == ([], [], ["kUndeclared"]))
+    arm("no routes parses as nothing", routes_and_warmups("nothing here") == ([], [], []))
     # The two capabilities `warmup_route_check.py` had and this file did not, kept here with arms so deleting that
     # file cannot quietly lose them (engine#2853's own check, folded in rather than maintained twice).
     regex_route = 'srv.Get("/health", h);\nsrv.Post(R"(/complet[a-z]*)", post);\nout.push_back(json{ { "path", "/completion" } });'
-    r, w = routes_and_warmups(regex_route)
+    r, w, u = routes_and_warmups(regex_route)
     arm("a raw-string route registration parses", r == ["/health", "/complet[a-z]*"] and w == ["/completion"])
     arm("a srv.Get route counts too", routes_and_warmups('srv.Get("/metrics", m);')[0] == ["/metrics"])
     arm("a regex route covers a warm-up path", route_covers(r, "/completion") and not route_covers(r, "/completions/v1"))

@@ -165,7 +165,7 @@ def read_allow(path):
                 # `#2946 behaviour plus arm` is how anyone writes an issue, so a LEADING `#` is the issue, and a
                 # comment only starts at ` #` -- splitting on the first `#` would drop every real entry, which is
                 # exactly what it did until the live run showed an allow file with one line and zero effects.
-                line = re.split(r"\s+#", line, 1)[0].strip()
+                line = re.split(r"\s+#", line, maxsplit=1)[0].strip()
                 if line.startswith("#"):
                     line = line[1:]
                 if not line:
@@ -229,6 +229,20 @@ def gh(path, paginate=False):
             break
         page += 1
     return json.dumps(out)
+
+
+def normalise_repo(name):
+    """'engine' or '1bit-MONSTER/engine' -> 'engine'; anything else -> None.
+
+    Why (found by running it): open_prs builds `repos/{OWNER}/{repo}/pulls`, so passing the full `owner/name` -- the
+    natural way to name a repository on a command line -- asked GitHub for `1bit-MONSTER/1bit-MONSTER/engine`, got a
+    404, and reported "cannot tell". In --gate mode cannot-tell is a SKIP, so a typo or the wrong spelling disabled
+    this gate permanently and said nothing. A name it does not know is a usage error and must be named as one.
+    """
+    name = (name or "").strip().strip("/")
+    if name.lower().startswith(OWNER.lower() + "/"):
+        name = name[len(OWNER) + 1:]
+    return name if name in DEFAULT_REPOS else None
 
 
 def open_prs(repo):
@@ -317,6 +331,11 @@ def self_test():
     ok(apply_allow(pairs, {2778: 'x', 9999: 'gone'})[2] == [9999],
        "an allow entry no open pair claims any more is STALE, so it is reported rather than kept forever")
     ok(apply_allow(pairs, {})[0] == pairs, "an empty allow changes nothing")
+    # engine#2962: '1bit-MONSTER/engine' used to ask GitHub for 1bit-MONSTER/1bit-MONSTER/engine, get a 404 and be
+    # reported as "cannot tell" -- which --gate turns into a SKIP, so the gate could be disabled by a spelling.
+    ok(normalise_repo('engine') == 'engine', "a bare repo name is accepted")
+    ok(normalise_repo('1bit-MONSTER/engine') == 'engine', "... and the owner/name spelling normalises instead of 404ing")
+    ok(normalise_repo('1bit-MONSTER/engin') is None, "a name it does not know is refused, not turned into a skip")
     # the file is written by a human, who writes `#2797`, not `2797`
     import pathlib
     import tempfile
@@ -403,8 +422,14 @@ def main(argv):
     if a.self_test:
         return self_test()
 
+    unknown = [r for r in a.repos if normalise_repo(r) is None]
+    if unknown:
+        print(f"duplicate_fixes: --repos {unknown[0]!r} is not a repository this tool reads; "
+              f"use one of {', '.join(DEFAULT_REPOS)} (with or without the '{OWNER}/' prefix)",
+              file=sys.stderr)
+        return 2
     found, failed = [], 0
-    for repo in a.repos:
+    for repo in (normalise_repo(r) for r in a.repos):
         try:
             prs = open_prs(repo)
         except (RuntimeError, json.JSONDecodeError) as e:

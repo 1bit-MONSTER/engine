@@ -128,7 +128,13 @@ esac
 # a ctest that dies before writing it must not be judged by the previous run's outputs.
 OUTPUTS=Testing/Temporary/LastTest.log
 rm -f "$OUTPUTS"
-ctest -j 4 --timeout 600 -E '^(hrx-ops-test|test-hrx-ops|test-hrx-ops-loom)$' 2>&1 | tee ctest.log || true
+# engine#3000: test-testing-suite-skip is excluded for the same reason as the three above -- it cannot run where it
+# runs in CI. It PRINTS "test skipped: no device available" (it is the arm that pins that convention), the ratchet
+# reads that as "did not run on a device", and the default policy is to fail that -- correctly on a box with a GPU,
+# impossible in a job that has none. The first run of this row in hrx-build surfaced it: `1 row(s) did not run on a
+# device`, on a runner whose every other device row is excluded or baselined. Excluding it keeps the ratchet's real
+# verdict (113 rows, 0 new) instead of converting the whole row to a 77 via ONEBIT_FORK_CTEST_NO_DEVICE=skip.
+ctest -j 4 --timeout 600 -E '^(hrx-ops-test|test-hrx-ops|test-hrx-ops-loom|test-testing-suite-skip)$' 2>&1 | tee ctest.log || true
 
 exec python3 "$ROOT/tools/ci/ctest_known_fail.py" --log ctest.log --root "$ROOT" \
     --outputs "$OUTPUTS" --no-device "$NO_DEVICE"

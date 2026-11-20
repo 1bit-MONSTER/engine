@@ -179,14 +179,11 @@ jobs:
           # Cost, measured on the bench tree rather than argued: the ratchet excludes hrx-ops-test/test-hrx-ops/
           # test-hrx-ops-loom (-E in fork_ctest_known_fail.sh), leaving 113 of 116 rows whose recorded cost sums
           # to 184 s -> ~46 s wall at the script's -j 4, about 2 % of a 40-minute job.
-          # ... and this runner has no GPU, so the rows that need one must say so instead of failing the step:
-          # ONEBIT_FORK_CTEST_NO_DEVICE=skip is the explicit "this box is allowed to have none" (fork_ctest_known_fail.sh's
-          # own exit table), and the run below proves it is the narrow case rather than the blanket one -- 101 of 113
-          # rows ran on the CPU, 7 are baselined failures, 0 are new, and device-skipped rows are COUNTED in their own
-          # column. Since engine#2993 a row that crashed after printing the skip line is still a failure under this
-          # policy, so "skip" cannot hide the case the policy was dangerous for.
-          row=$(ONEBIT_FORK_CTEST=1 ONEBIT_FORK_CTEST_NO_DEVICE=skip \
-                ctest --test-dir "$HRX_BUILD" -R '^fork_ctest_known_fail$' --output-on-failure 2>&1) \
+          # NOT ONEBIT_FORK_CTEST_NO_DEVICE=skip: that makes the row exit 77, ctest calls it Skipped, and the guard
+          # below -- correctly -- treats a skip in this job as an error. The device-requiring row it was aimed at
+          # (test-testing-suite-skip) is excluded by name in fork_ctest_known_fail.sh instead, which keeps the
+          # ratchet's real verdict (113 rows, 0 new) rather than trading it for a 77.
+          row=$(ONEBIT_FORK_CTEST=1 ctest --test-dir "$HRX_BUILD" -R '^fork_ctest_known_fail$' --output-on-failure 2>&1) \
             || { printf '%s\n' "$row"; exit 1; }
           printf '%s\n' "$row"
           # ... and a SKIP here is a failure too, because this is the one job whose purpose is to run that row:

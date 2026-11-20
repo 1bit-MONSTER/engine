@@ -46,11 +46,19 @@ def load(root: Path):
     try:
         census = json.loads((root / REG / "census.json").read_text(encoding="utf-8"))
         sig = json.loads((root / REG / "significant.json").read_text(encoding="utf-8"))["classes"]
-        archs = json.loads((root / REG / "architectures.json").read_text(encoding="utf-8"))
+        # engine#3041: the committed file NESTS its classes under "architectures" (tools/census.py:80 reads it that way).
+        # Reading it flat found no entry for ANY class, so every `watch: report` class counted as declined -- 33/1042 against a
+        # correct snapshot of 26/478, rc 1 every day. A file that does not carry the key is a shape this check does not know,
+        # which is a cannot-tell, not a tree full of declined classes.
+        raw_archs = json.loads((root / REG / "architectures.json").read_text(encoding="utf-8"))
+        if not isinstance(raw_archs, dict) or not isinstance(raw_archs.get("architectures"), dict):
+            return None, ("registry/architectures.json does not nest its classes under \"architectures\" -- this check "
+                          "cannot tell which shape it is reading (engine#3041)")
     except FileNotFoundError as e:
         return None, f"no {e.filename}"
     except (KeyError, ValueError) as e:
         return None, f"cannot read the registry ({e})"
+    archs = raw_archs["architectures"]
     return (census, sig, archs), None
 
 
@@ -100,7 +108,8 @@ def self_test() -> int:
         (root / "registry" / "census.json").write_text(
             json.dumps({"date": "2026-11-17", "coverage": coverage, "raw": {"counts": counts}}), encoding="utf-8")
         (root / "registry" / "significant.json").write_text(json.dumps({"classes": sig}), encoding="utf-8")
-        (root / "registry" / "architectures.json").write_text(json.dumps(archs), encoding="utf-8")
+        # the real file nests; a flat fixture is what let engine#3041 live in the self-test
+        (root / "registry" / "architectures.json").write_text(json.dumps({"architectures": archs}), encoding="utf-8")
         return root
 
     sig = {"ReviewedForCausalLM": {"watch": "report"}}
@@ -139,6 +148,20 @@ def self_test() -> int:
         (root / "registry").mkdir(parents=True)
         got, why = check(root)
         arm("a missing registry file is cannot-tell", got == [] and why is not None, str(why))
+
+        # engine#3041: a FLAT architectures.json is a shape this check does not know. Read flat, every `watch: report` class
+        # counted as declined and the row went red on a correct tree every day (33/1042 against a snapshot of 26/478).
+        root = tmp / "flat"
+        (root / "registry").mkdir(parents=True)
+        (root / "registry" / "census.json").write_text(
+            json.dumps({"date": "2026-11-20", "coverage": {"declined_architectures": 0, "declined_models": 0},
+                        "raw": {"counts": {"ReviewedForCausalLM": 7}}}), encoding="utf-8")
+        (root / "registry" / "significant.json").write_text(
+            json.dumps({"classes": {"ReviewedForCausalLM": {"watch": "report"}}}), encoding="utf-8")
+        (root / "registry" / "architectures.json").write_text(
+            json.dumps({"MappedForCausalLM": {"backends": ["hrx"]}}), encoding="utf-8")   # flat on purpose
+        got, why = check(root)
+        arm("a FLAT architectures.json is cannot-tell, not a tree of declined classes", got == [] and why is not None, str(why))
 
     print("self-test ok" if not fails else f"self-test FAILED ({fails})")
     return 0 if not fails else 1

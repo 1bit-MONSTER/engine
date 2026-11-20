@@ -49,7 +49,11 @@ Exit: 0 nothing lost (or only moved), 1 a guard's identifiers are gone, 2 cannot
 """
 import argparse, re, subprocess, sys
 
-GUARD_KEYWORDS = ("refus", "assert", "GGML_ABORT", "!= 0", "== nullptr", "cannot", "must be", "is not set")
+# engine#2946: `throw` is this tree's refusal idiom in `app/` and `npu/` -- every route-level refusal is
+# `throw std::runtime_error(...)`, not an `assert` or a `GGML_ABORT`. It is both a keyword AND a shape below, because a
+# bare throw line carries neither `if` nor `assert`: adding the keyword alone still let a deleted
+# `throw std::runtime_error("logprobs: served on /v1/chat/completions …")` report as "nothing lost" (measured).
+GUARD_KEYWORDS = ("refus", "assert", "GGML_ABORT", "!= 0", "== nullptr", "cannot", "must be", "is not set", "throw ")
 # engine#2761: a *diagnostic* is not a refusal, but losing one is not nothing either. Measured on
 # #2825, where a bundled hunk removed the gpu-hold wait-time re-check -- two lines (the `if` and the
 # `log "::warning::..."` it guarded) -- and this tool found **0 of 3** removed diagnostic lines,
@@ -82,7 +86,9 @@ def removed_guards(diff_text):
         stripped = body.strip()
         if stripped.startswith(("//", "*", "/*")):
             continue                      # a comment about a guard is not a guard
-        if any(k in body for k in GUARD_KEYWORDS) and ("if" in body or "assert" in body.lower()):
+        # `throw` is a refusal shape on its own: nothing else in the line has to say "if" or "assert" for it to end a
+        # request, and requiring one is what made the engine#2946 case invisible to a keyword-only fix.
+        if any(k in body for k in GUARD_KEYWORDS) and ("if" in body or "assert" in body.lower() or "throw " in body):
             out.append((path, body, "refusal"))
         elif any(k in body for k in WARN_KEYWORDS):
             # not a refusal (nothing is decided by it), but a diagnostic that left the file
@@ -198,6 +204,12 @@ def self_test():
     chk("its identifiers are extracted", "TENSOR_ALIGNMENT" in identifiers(g[0][1]), True)
     # the discriminator itself: an identifier present at the head means rewritten, not lost
     chk("an identifier still in the file is not missing", "TENSOR_ALIGNMENT" in "int x = TENSOR_ALIGNMENT;", True)
+    # engine#2946: a deleted `throw` is a lost refusal even though the line has no `if` and no `assert` -- the shape
+    # test used to require one of those, so the keyword alone changed nothing (measured before and after).
+    chk("a removed throw is a lost refusal",
+        len(guards_removed('+++ b/app/forward_serve.cpp\n'
+                           '-            throw std::runtime_error("logprobs: served on /v1/chat/completions, not on /v1/completions");\n')),
+        1)
     # a comment is not a guard
     chk("a plain comment is not guard-shaped", guards_removed("+++ b/a.cpp\n-// the buffer is aligned\n"), [])
     chk("a comment that MENTIONS an assert is not a guard",

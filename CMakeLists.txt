@@ -247,6 +247,12 @@ add_test(NAME bump_hrx_sync COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_sync
 add_executable(npu_decode_note_test tests/npu_decode_note_test.cpp)
 target_include_directories(npu_decode_note_test PRIVATE app)
 add_test(NAME npu_decode_note COMMAND npu_decode_note_test)
+# engine#2897: llama.cpp's `n_predict: -1` is "no limit" and became an empty completion, because the route clamped it
+# through std::clamp(max_tokens, 0, room). Pure function of two ints, so the arms need no device and no server:
+# -1 is the room, 0 is still 0, and a positive budget is capped by the room.
+add_executable(npu_token_limit_test tests/npu_token_limit_test.cpp)
+target_include_directories(npu_token_limit_test PRIVATE npu)
+add_test(NAME npu_token_limit COMMAND npu_token_limit_test)
 # engine#823: tools/xhci_boot_capture.sh's verdict function says of itself "A function, not an inline block, so the
 # three classifications can be driven on a fixture without a device" -- and was never driven. It takes no build input,
 # so a script row is the whole registration.

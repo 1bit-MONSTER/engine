@@ -47,6 +47,7 @@
 #include "npu_chatml.h"
 #include "npu_template.h"  // the container's own chat template (#963 option 2)
 #include "npu_grammar.h"
+#include "token_limit.h"   // engine#2897: -1 is "no limit", not zero
 #include "npu_load_retry.h"  // engine#1241: a refused NPU context names another client, not a dead device
 #include "npu_prefix_cache.h"
 #include "npu_prompt_ids.h"
@@ -449,7 +450,10 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // inside the model's context.
         const int room = e.max_context - int(ids.size());
         if (room < 1) throw ContextOverflow(ids.size(), e.max_context);
-        const int limit = std::clamp(max_tokens, 0, room);
+        // engine#2897: a NEGATIVE budget is llama.cpp's "no limit" (llama-server's own default for `n_predict` is -1),
+        // and std::clamp(max_tokens, 0, room) turned it into 0 -- an empty completion with finish_reason "length".
+        // token_limit answers the negative case before the clamp, so -1 means the room left and 0 still means zero.
+        const int limit = npu::token_limit(max_tokens, room);
         // engine#2689 item 3b (--npu-batch-users N > 1): this request takes a slot and hands its prompt and each decode
         // step to the batch, whose thread owns the forward. Two consequences, both deliberate:
         //   * it must NOT take e.mu -- holding it for the request's life would serialise exactly what batching exists to

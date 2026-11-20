@@ -181,6 +181,38 @@ What is deliberately **not** shared is `~/.cache`, which is `0700` on the owner'
 trees (`~/.cache/hrx-build/bench`, `~/.cache/hw-gate`) and the `pr-agent-venv-*` environments move, so the first
 runs on a fresh install are cold — `hrx-build`'s "rebuild only what changed" starts from zero once.
 
+That persistence is also why the bench tree now **stamps itself** (`bench-stamp.txt`: the engine, llama.cpp and
+hrx-system revisions, the host, and the lowering revision — `unknown` when the build did not record one). A tree
+built on one runner and measured on another is exactly how engine#2858 got an IQ1_S prefill figure of 11.22 tok/s
+standing next to four local builds at 56.5-56.6 on the same box, with nothing in the tree to tell them apart. Before
+quoting a number from a persistent tree, ask it:
+
+```
+python3 tools/ci/bench_stamp.py check --tree ~/.cache/hrx-build/bench \
+    --expect-engine "$(git rev-parse --short=12 HEAD)" --expect-host "$(uname -n)"
+```
+
+rc 0 means comparable, rc 1 names the field that moved, and **rc 2 means cannot tell** — no stamp, or a lowering the
+build did not record. rc 2 is not a pass: `loom=unknown` is the question #2858 is still open on.
+
+In CI the engine field is the **head sha of the commit being built**, not the checkout's `HEAD`: actions/checkout
+gives a PR run a synthetic merge commit, and stamping that (measured on 11-20: `engine 241017c32dbb`) makes every
+`check --expect-engine` answer "the field moved" on a tree that is exactly the pin. `hrx-build` passes the head sha
+both to `bench_stamp.py write` and to `cmake` as `ONEBIT_BUILD_ENGINE`, and then runs `check` in the same job — because
+the first version asked git for one stamp and was handed the sha for the other, and the same job printed
+`engine 2767c7914585` in the tree and `engine 0210b23a669c` from the binary (run 44682796555).
+
+The lowering is not a setting anyone passes: it is **read out of the code objects the build emitted**, from any
+`.hsaco`'s `.comment` section (`AMD clang version 24.0.0git … e095f1b3becf`), so `loom=unknown` now means "this tree
+has no code objects", not "every build". A tree whose objects exist can therefore answer **rc 0, comparable** —
+before this, the decisive field was always unknown and the tool could only ever say 1 or 2.
+
+The same facts travel with a shipped binary: `1bit --version` prints `engine … llama.cpp … hrx-system … built …`,
+generated at configure time. It deliberately carries **no lowering**: at configure time there are no code objects
+yet, so a field there could only say `unknown` and would disagree with the tree stamp about the same build. A submodule that is not checked out prints `unknown`, never the enclosing
+checkout's revision — `git -C <missing dir>` walks up to the parent repository, so the obvious way to write that
+stamp names the engine three times and looks complete.
+
 What it still needs, and the honest price of each:
 
 | grant | why | price |

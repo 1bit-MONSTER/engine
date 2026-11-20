@@ -16,16 +16,18 @@
 #
 # pre-pr-checks.sh [--base REF] [--list]
 #
-# `docs/pre-pr-checks.md` (engine#2311) lists six host-side checks to run before asking for a merge.
-# Asking a lane to type six commands, two of which need an argument, is how one gets skipped: three
+# `docs/pre-pr-checks.md` (engine#2311) lists the host-side checks to run before asking for a merge; `--list`
+# prints the current set, which is the only count worth trusting -- this comment used to say "six" and was
+# still saying it ten checks later, because nothing re-derives a number written in prose.
+# Asking a lane to type them by hand, two of which need an argument, is how one gets skipped: three
 # stale-baseline incidents in two days, each a check that exists and was not run.
 #
-# This runs all six and prints ONE line per check, so the answer is per-check rather than "the paste
+# This runs every row `--list` prints and prints ONE line per check, so the answer is per-check rather than "the paste
 # looked empty". A check that cannot run says `skip` and why -- a skipped check is not a pass, and the
 # summary keeps the count so a green line cannot hide one (the reason `tools/ci/tmp_path_check.py`
 # prints its excluded files instead of excluding them silently).
 #
-# Deliberate: a NEW file must be `git add`ed first. Three of these six read the index or the tracked
+# Deliberate: a NEW file must be `git add`ed first. Three of these rows read the index or the tracked
 # tree, so an unadded file is invisible to them and the run reads green -- the same trap that made
 # `tools/copyright.py --check` skip untracked files by design.
 set -uo pipefail
@@ -49,7 +51,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$base" ] || { echo "pre-pr-checks: --base needs a ref" >&2; exit 2; }
 
-# Run from the toplevel: the six commands name `tools/...` and `config/...` relative to it, so a caller
+# Run from the toplevel: the rows name `tools/...` and `config/...` relative to it, so a caller
 # in scripts/ got twelve `can't open file` lines and rc 1 with every row red for the wrong reason.
 top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "pre-pr-checks: not inside a git work tree" >&2; exit 2; }
 cd "$top" || { echo "pre-pr-checks: cannot enter $top" >&2; exit 2; }

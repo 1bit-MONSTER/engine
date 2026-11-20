@@ -379,6 +379,19 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         auto device_has = [&](const std::string& key) {
             return dev != nullptr && !force_host && skip_cached_w && dev->cached && dev->cached(key);
         };
+        // engine#1783: an offer that, when declined, counts nothing -- the caller then offers the products one by one
+        // through `offer`, which counts each of them once (a fused q|k|v decline must not add a 75th refusal).
+        auto try_device = [&](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
+                              std::vector<float>* c, int products) -> bool {
+            if (dev == nullptr || force_host || !dev->gemm) return false;
+            std::string reason;
+            if (!dev->gemm(key, A, M, K, B, N, c, &reason)) return false;
+            if (c->size() != size_t(M) * size_t(N))
+                fail("device gemm for '" + key + "' wrote " + std::to_string(c->size()) + " floats, not " +
+                     std::to_string(M) + " x " + std::to_string(N));
+            dev->device += products;
+            return true;
+        };
         auto offer = [&](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
                          std::vector<float>* c) -> bool {
             if (dev == nullptr) return false;
@@ -498,11 +511,99 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
             }
         }
 
+        // engine#1783: projections that read the same activation (whisper's q, k and v all read the LayerNorm output) are
+        // offered to the device as ONE product over their weights side by side, [K x (N1+N2+...)], and the result is
+        // split back per node. Each output column depends only on its own weight column and on the row's activation scale,
+        // so the split columns are the ones the separate launches produce (the encoder hash is unchanged). Offered only
+        // with a device; a decline runs the nodes one by one as before. ONEBIT_AUDIO_FUSE_QKV=0 turns it off.
+        std::map<size_t, std::vector<size_t>> proj_groups;   // first node (0-based) -> every node of its group, graph order
+        if (dev != nullptr && !force_host) {
+            const char* fq = std::getenv("ONEBIT_AUDIO_FUSE_QKV");
+            if (fq == nullptr || fq[0] != '0') {
+                std::map<std::string, std::vector<size_t>> by_a;
+                for (size_t i = 0; i < g.nodes.size(); ++i) {
+                    const auto& m = g.nodes[i];
+                    if (m.op != "MatMul" || m.ins.size() < 2 || m.outs.empty() || inits.count(m.ins[1]) == 0) continue;
+                    if (inits.at(m.ins[1])->dims.size() != 2) continue;
+                    by_a[m.ins[0]].push_back(i);
+                }
+                for (auto& kv : by_a) {
+                    if (kv.second.size() < 2) continue;
+                    const int64_t k0 = inits.at(g.nodes[kv.second[0]].ins[1])->dims[0];
+                    bool same_k = true;
+                    for (size_t i : kv.second) same_k = same_k && inits.at(g.nodes[i].ins[1])->dims[0] == k0;
+                    if (same_k) proj_groups[kv.second[0]] = kv.second;
+                }
+            }
+        }
+        std::map<std::string, Tensor> proj_pending;   // output name -> the result its group's fused product already made
+
         int node_index = 0;
         for (const auto& n : g.nodes) {
             ++node_index;
             if (fused_away[size_t(node_index - 1)]) continue;   // computed inside the fused attention above it
             const auto op_t0 = std::chrono::steady_clock::now();
+            if (!n.outs.empty()) {
+                const auto pend = proj_pending.find(n.outs[0]);
+                if (pend != proj_pending.end()) {   // made by its group's fused product
+                    Tensor r = std::move(pend->second);
+                    proj_pending.erase(pend);
+                    finish_node(n.op, n.outs[0], r, op_t0);
+                    continue;
+                }
+            }
+            const auto grp = proj_groups.find(size_t(node_index - 1));
+            if (grp != proj_groups.end() && t.count(n.ins[0]) != 0) {
+                const Tensor& a = need(n.ins[0]);
+                const auto& members = grp->second;
+                const int64_t K = inits.at(n.ins[1])->dims[0];
+                std::string key = "fused";
+                int64_t ntot = 0;
+                for (size_t i : members) {
+                    key += "|" + g.nodes[i].ins[1];
+                    ntot += inits.at(g.nodes[i].ins[1])->dims[1];
+                }
+                if (a.dims.size() >= 2 && a.dims.back() == K && K > 0) {
+                    std::vector<float> bcat;   // [K x ntot], only when the device does not hold it yet
+                    if (!device_has(key)) {
+                        bcat.assign(size_t(K) * size_t(ntot), 0.0f);
+                        int64_t c0 = 0;
+                        for (size_t i : members) {
+                            const Tensor& w = init_f32(g.nodes[i].ins[1]);
+                            const int64_t ni = w.dims[1];
+                            for (int64_t k = 0; k < K; ++k)
+                                std::copy(w.data.begin() + size_t(k) * size_t(ni), w.data.begin() + size_t(k + 1) * size_t(ni),
+                                          bcat.begin() + size_t(k) * size_t(ntot) + size_t(c0));
+                            c0 += ni;
+                            t.erase(g.nodes[i].ins[1]);   // the per-node copy is not needed once it is in bcat
+                        }
+                    }
+                    std::vector<float> c;
+                    const int64_t rows = int64_t(a.data.size() / size_t(K));
+                    if (try_device(key, a.data.data(), rows, K, bcat.empty() ? nullptr : bcat.data(), ntot, &c,
+                                   int(members.size()))) {   // one launch, but every member is a product the device ran
+                        int64_t c0 = 0;
+                        Tensor mine;
+                        for (size_t i : members) {
+                            const int64_t ni = inits.at(g.nodes[i].ins[1])->dims[1];
+                            Tensor r;
+                            r.dims = a.dims;
+                            r.dims.back() = ni;
+                            r.data.resize(size_t(rows) * size_t(ni));
+                            for (int64_t m = 0; m < rows; ++m)
+                                std::copy(c.begin() + size_t(m) * size_t(ntot) + size_t(c0),
+                                          c.begin() + size_t(m) * size_t(ntot) + size_t(c0 + ni),
+                                          r.data.begin() + size_t(m) * size_t(ni));
+                            c0 += ni;
+                            if (i == size_t(node_index - 1)) mine = std::move(r);
+                            else proj_pending[g.nodes[i].outs[0]] = std::move(r);
+                        }
+                        finish_node(n.op, n.outs[0], mine, op_t0);
+                        continue;
+                    }
+                    // declined: the nodes run one by one below and count themselves
+                }
+            }
             const auto where = [&]() { return "node " + std::to_string(node_index) + " (" + n.op + ")"; };
             if (n.outs.empty()) fail(where() + " has no output");
             const std::string& oname = n.outs[0];
@@ -517,14 +618,14 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 const int64_t K = a.dims.empty() ? 0 : a.dims.back(), N = wd[1];
                 if (a.dims.size() >= 2 && K == wd[0] && K > 0) {
                     std::vector<float> c;
-                    if (offer(n.ins[1], a.data.data(), int64_t(a.data.size() / size_t(K)), K, nullptr, N, &c)) {
+                    if (try_device(n.ins[1], a.data.data(), int64_t(a.data.size() / size_t(K)), K, nullptr, N, &c, 1)) {
                         r.dims = a.dims;
                         r.dims.back() = N;
                         r.data = std::move(c);
                         finish_node(n.op, oname, r, op_t0);
                         continue;
                     }
-                    --dev->host;   // the branch below offers again and counts the outcome; count this product once
+                    // declined: the branch below loads the weight, offers again and counts the outcome once
                 }
             }
             if (n.op == "MatMul") {

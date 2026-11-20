@@ -221,6 +221,46 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 4; ++i) expect_close(at2(750, i), p1[i], 2e-3, "offered run: frame 750 col " + std::to_string(i));
             for (int i = 0; i < 4; ++i) expect_close(at2(1499, i), p2[i], 2e-3, "offered run: frame 1499 col " + std::to_string(i));
         }
+        // engine#1783: q, k and v read one activation, so the executor offers them as ONE product ("fused|q|k|v"). A
+        // kernel family without that shape (no K768 N2560 ELF) declines it, and the three projections must then be
+        // offered one by one: same 74 products, same values, nothing counted twice.
+        {
+            int fused_seen = 0;
+            AudioGemm acc;
+            acc.gemm = [&](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
+                           std::vector<float>* C, std::string* w) {
+                if (key.rfind("fused|", 0) == 0) ++fused_seen;
+                return dev.gemm(key, A, M, K, B, N, C, w);
+            };
+            AudioRunResult ra;
+            check(run_audio_graph(g, mel.data(), bins, frames, "", &ra, &why, &acc), "run with a fusing device: " + why);
+            check(fused_seen == 12, "the 12 q|k|v groups are offered as one product each, got " + std::to_string(fused_seen));
+            check(acc.device == 74, "a fusing device still counts 74 products, got " + std::to_string(acc.device));
+            check(ra.data == rd.data, "the fused q|k|v offer is bit-identical to separate offers (per-column GEMM)");
+
+            int fused_declined = 0, single = 0;
+            AudioGemm nofuse;
+            nofuse.gemm = [&](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
+                              std::vector<float>* C, std::string* w) {
+                if (key.rfind("fused|", 0) == 0) {
+                    ++fused_declined;
+                    *w = "test: no design for the fused shape";
+                    return false;
+                }
+                ++single;
+                return dev.gemm(key, A, M, K, B, N, C, w);
+            };
+            AudioRunResult rf;
+            check(run_audio_graph(g, mel.data(), bins, frames, "", &rf, &why, &nofuse), "run without a fused design: " + why);
+            check(fused_declined == 12, "each group is tried fused once, got " + std::to_string(fused_declined));
+            check(single == 74, "then all 74 products are offered one by one, got " + std::to_string(single));
+            check(nofuse.device == 74 && nofuse.host == 24 && nofuse.host_why.count("test: no design for the fused shape") == 0,
+                  "a declined fused offer counts nothing: 74 device, 24 host, no refusal named");
+            check(rf.data == rd.data, "without the fused design the result is the separate-offer result, bit for bit");
+            std::printf("fused q|k|v: %d groups fused; without the design %d declined, %d single offers\n", fused_seen,
+                        fused_declined, single);
+        }
+
         // A device that declines everything is the host run, counted as host.
         AudioGemm none;
         none.gemm = [](const std::string&, const float*, int64_t, int64_t, const float*, int64_t, std::vector<float>*,

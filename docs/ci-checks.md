@@ -17,12 +17,15 @@ limitations under the License.
 
 # The checks in `tools/ci`: what they defend, and how to run them
 
-**43 single-purpose checkers live in `tools/ci/`, and nothing listed them.** A lane that has just been burned by a class
-of mistake — a lost commit, a removed diagnostic, a route nobody registered — has no way to discover that a check for it
-already exists, and writes a forty-fourth. This page is the index. It names the *questions*, not the files, so it does
-not rot when one is added.
+**A directory of single-purpose checkers lives in `tools/ci/` — 44 of them on 2026-11-20 — and nothing listed them.** A
+lane that has just been burned by a class of mistake — a lost commit, a removed diagnostic, a route nobody registered —
+has no way to discover that a check for it already exists, and writes one more. This page is the index. It names the
+*questions*, not the files, so it does not rot when one is added.
 
 ## Run them
+
+The count is deliberately a dated observation, not a maintained number: `ls tools/ci/*.py | wc -l` is the authority, and
+the loop below enumerates the real set on every run. A literal here went stale within the hour it merged.
 
 ```sh
 for f in tools/ci/*.py; do printf '%s: ' "$(basename "$f")"; python3 "$f" --self-test >/dev/null 2>&1 && echo ok || echo FAIL; done
@@ -80,7 +83,7 @@ the port whether it is a `freeport` call, a `--port` literal or a shell default.
 `kernel_id_selftest`, `token_rate_floor`, `medians`, `lane_syntax_check`, `tmp_path_check`, `tool_help_check`,
 `conflict_triage`.
 
-## Adding the forty-fourth
+## Adding the next one
 
 Grep this directory for the question you are about to answer — that is what this page is for. If the question is
 genuinely new, the family asks for three things: a `--self-test` whose fixture **fails** before the fix, a `2` for every

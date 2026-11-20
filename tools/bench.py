@@ -26,7 +26,8 @@ speed on three chat prompts (code, prose, short), greedy, as `serve` reports the
       --config base= --config dflash='--dflash Qwen3.8-27B-DFlash2-q8_0.gguf' \\
       --lock ~/.cache/lax-decode/box.lock --json out.json
 """
-import argparse, contextlib, fcntl, json, os, pathlib, shlex, signal, socket, statistics, subprocess, sys, time
+import argparse
+import os, contextlib, fcntl, json, os, pathlib, shlex, signal, socket, statistics, subprocess, sys, time
 import urllib.error, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -108,10 +109,24 @@ def provenance(binary=None, repo=None):
     this issue is about records its build HOST and nothing else -- no git revision in its CMakeCache, no 40-hex commit in the
     binary -- so a 5x discrepancy could not be attributed to anything. The rule here is the one `recorded_at` learned: an
     unavailable value is written as the explicit string "unknown", never as an empty field a reader would take for a value.
+
+    The build tree's own stamp is the authority for the lowering: `tools/ci/bench_stamp.py` reads it out of the code objects
+    the build emitted, so this stanza carries that field through instead of keeping a second, permanently-unknown notion of
+    it. A tree with no stamp keeps "unknown" -- it is a source tree or a hand-built directory, and saying so is the point.
+
+    **Until that writer exists, the stamp half cannot fire.** engine#2882 is the PR that adds
+    `bench_stamp.py write`; on this tree the only mentions of `bench-stamp.txt` are this reader, a doc, and a test that
+    fabricates the file, so `loom_or_iree_rev` still reads "unknown" for every real bench run -- with a better reason
+    than before ("no stamp in this tree") but the same value. `llama_cpp_rev` is the field a lane can rely on *today*:
+    the fork pin straight out of the engine tree's gitlink, which is the lowering HOST the binary was built against and
+    needs no submodule on disk (`git ls-tree HEAD third_party/llama.cpp` works in a bare checkout, unlike `rev-parse`
+    inside the submodule). So the stanza answers "which fork" always, and "which compiler emitted the code objects"
+    once a stamp is written.
     """
     import hashlib
     out = {"binary": binary or "unknown", "binary_sha256": "unknown", "engine_rev": "unknown",
-           "engine_dirty": "unknown", "loom_or_iree_rev": "unknown"}
+           "engine_dirty": "unknown", "loom_or_iree_rev": "unknown", "llama_cpp_rev": "unknown",
+           "stamp_tree": "unknown", "stamp_built_at": "unknown", "stamp_matches_checkout": "unknown"}
     if binary:
         try:
             out["binary_sha256"] = hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest()
@@ -128,6 +143,41 @@ def provenance(binary=None, repo=None):
     if git("rev-parse", "--git-dir"):
         out["engine_rev"] = git("rev-parse", "HEAD") or "unknown"
         out["engine_dirty"] = "yes" if git("status", "--porcelain") else "no"
+        # the fork pin as the engine records it: the gitlink is the lowering host, and it is readable with the
+        # submodule absent -- `rev-parse` inside third_party/llama.cpp needs the tree, this does not
+        pin = git("ls-tree", "HEAD", "third_party/llama.cpp").split()
+        if len(pin) >= 3 and len(pin[2]) == 40:
+            out["llama_cpp_rev"] = pin[2]
+
+    # The stamp sits at the build tree's root; the binary it describes is inside that tree.
+    tree = None
+    if binary:
+        tree = pathlib.Path(binary).resolve().parent
+        if not (tree / "bench-stamp.txt").is_file():
+            tree = tree.parent if (tree.parent / "bench-stamp.txt").is_file() else None
+    else:
+        env = os.environ.get("HRX_BUILD")
+        if env and (pathlib.Path(env) / "bench-stamp.txt").is_file():
+            tree = pathlib.Path(env)
+    if tree is not None:
+        # The stamp is a `key=value` file, so this reads it directly rather than importing the tool that writes
+        # it: the writer (tools/ci/bench_stamp.py) lands with engine#2882 and a reader that only works after it
+        # merges would be dead code today, and the format is three lines, not an API.
+        try:
+            stamp = {}
+            for line in (tree / "bench-stamp.txt").read_text(errors="replace").splitlines():
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, v = line.split("=", 1)
+                    stamp[k.strip()] = v.strip()
+        except OSError:
+            stamp = {}
+        out["stamp_tree"] = str(tree)
+        if stamp:
+            out["loom_or_iree_rev"] = stamp.get("loom", "unknown")
+            out["stamp_built_at"] = stamp.get("built_at", "unknown")
+            mine, theirs = out["engine_rev"], stamp.get("engine", "")
+            if mine != "unknown" and theirs and theirs != "unknown":
+                out["stamp_matches_checkout"] = "yes" if mine.startswith(theirs) or theirs.startswith(mine) else "no"
     return out
 
 
@@ -195,9 +245,12 @@ def main():
             "model": args.model, "configs": {n: shlex.join(a) for n, a in configs}, "baseline": base,
             "rounds": args.rounds, "prompt_chars": len(prompt), "results": results,
             "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "provenance": provenance(configs[0][1][0] if configs and configs[0][1] else None)},
+            "provenance": provenance(args.onebit)},
             indent=1))
-        pv = provenance(configs[0][1][0] if configs and configs[0][1] else None)
+        # args.onebit, not the first token of the first --config: that token is an option ("--device") in every
+        # framework convention this file accepts, so the stanza hashed the string "--device" and could never find
+        # the build tree's stamp. The binary that was actually measured is the one the JSON must name (engine#2858).
+        pv = provenance(args.onebit)
         print(f"provenance: rev {pv['engine_rev']} (dirty {pv['engine_dirty']}), "
               f"binary sha256 {pv['binary_sha256'][:16]}...")
     if lock:

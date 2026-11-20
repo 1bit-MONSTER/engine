@@ -159,6 +159,18 @@ def check(root=None):
     print(f"serve_routes: every warm-up body's token limit is read by the parser "
           f"({len(bodies)} builder(s), parser reads {', '.join(read)})")
 
+    # engine#2897: the sentinel's *behaviour* is pinned by tests/npu_token_limit_test.cpp (a row CI runs), which is the
+    # right place for it -- this check can only see the shape of an expression. What it can still catch is a call site
+    # that stops using the function every other reader goes through.
+    if "n_predict" in read:
+        if "npu::token_limit(" not in parser:
+            print("serve_routes: app/forward_serve.cpp reads `n_predict` and does not call npu::token_limit(...) -- the "
+                  "sentinel's arithmetic is tested (tests/npu_token_limit_test.cpp) but this site bypasses it "
+                  "(engine#2897)")
+            print("serve_routes: 1 call site bypasses the tested token limit")
+            return 1
+        print("serve_routes: the token limit is taken from the tested npu::token_limit(...)")
+
     # The boolean half (engine#2884's `cache_prompt`): a `false` the body sets and the parser never reads is the same
     # silence as a 404 -- the request succeeds and does the opposite of what it asked for.
     try:

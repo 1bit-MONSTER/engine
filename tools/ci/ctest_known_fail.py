@@ -123,6 +123,11 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # what a reader of the exit code cannot see: a whole-run skip exits 77, but a run whose host cases ran and whose
 # device cases did not still exits 0, and its hand-written siblings (test-hrx-q2_0, ...) exit 1.
 DEVICE_SKIP = "test skipped: no device available"
+# engine#2987: a row that CRASHED is not a row that did not run, whatever it printed first. `failed()` carries
+# ctest's reason per row, and these are the ones that mean the process died rather than answered: the fork's
+# hand-written rows print the device-skip line for their device cases and then exit non-zero for their host half,
+# so a segfault after the line was being filed as "did not run on a device" and masked to 77 under the skip policy.
+HARD_OUTCOMES = ("SEGFAULT", "Subprocess aborted", "Timeout", "Exception")
 # One row's block in ctest's Testing/Temporary/LastTest.log starts `86/111 Testing: hrx-buffer-test`.
 OUTPUT_BLOCK = re.compile(r"^\d+/\d+ Testing: (.+)$", re.MULTILINE)
 SKIP_RC = 77
@@ -188,6 +193,11 @@ def failed(log_text: str):
         # `test-hrx-host-resident # Not Run` for exactly this reason: an unbuilt row is a failure to fix, not a skip.
         out[name] = reason
     return out
+
+
+def hard_failures(log_text: str):
+    """Names whose ctest outcome says the process died: never "did not run", whatever their output says."""
+    return {name for name, reason in failed(log_text).items() if reason.split()[0] in HARD_OUTCOMES}
 
 
 def summary(log_text: str):
@@ -266,7 +276,8 @@ def judge(log_text: str, known, last_test_log=None, want_total=None):
             out["cannot"] = (f"the outputs file has no block for {len(missing)} failed row(s) ({', '.join(missing[:3])}"
                              f"{', ...' if len(missing) > 3 else ''}) -- it is from a different run than the log")
             return out
-        no_device = {n for n, text in seen.items() if DEVICE_SKIP in text}
+        # engine#2987: keep a crash in the failure column even when the row printed the skip line first
+        no_device = {n for n, text in seen.items() if DEVICE_SKIP in text} - hard_failures(log_text)
         out["not_in_run"] = set(known) - set(seen)
     _, total = summary(log_text)
     out["no_device"] = no_device
@@ -614,6 +625,46 @@ Errors while running CTest
         if f'"{DEVICE_SKIP}' not in header.read_text(errors="replace"):
             print(f"  SELF-TEST FAIL: {header} no longer prints '{DEVICE_SKIP}' -- the fork changed its skip line")
             bad += 1
+    # engine#2987: a row that CRASHED after printing the skip line is a failure, not a row that did not run. The fork's
+    # hand-written rows print the skip line for their device cases and then exit non-zero for their host half, so this
+    # shape is one bad assertion away in a row that is already in the log; under the skip policy it would be masked to 77.
+    crash_log = """\
+1/2 Test #1: suite-skipped ...........***Failed  Error regular expression found in output. Regex=[test skipped: no device available]  0.00 sec
+2/2 Test #2: suite-crashed ...........***Exception: SegFault  0.10 sec
+
+50% tests passed, 2 tests failed out of 2
+
+The following tests FAILED:
+\t  1 - suite-skipped (Failed)                           hrx
+\t  2 - suite-crashed (SEGFAULT)                         hrx
+Errors while running CTest
+"""
+    crash_last = "".join((
+        block(1, "suite-skipped", '"/b/bin/suite-a"',
+              "test skipped: no device available for HRX test (3 device case(s) skipped)\n", "Test Failed."),
+        block(2, "suite-crashed", '"/b/bin/suite-b"',
+              "test skipped: no device available for HRX test (2 device case(s) skipped)\n"
+              "FAIL suite-b: an assertion after the skip line\n", "Test Failed.")))
+    cases += 1
+    if hard_failures(crash_log) != {"suite-crashed"}:
+        print(f"  SELF-TEST FAIL: hard outcomes -> {sorted(hard_failures(crash_log))} (want suite-crashed only)")
+        bad += 1
+    crash_got = judge(crash_log, {"suite-crashed"}, crash_last)
+    cases += 1
+    if "suite-crashed" in crash_got["no_device"] or "suite-crashed" not in crash_got["known_failed"]:
+        print(f"  SELF-TEST FAIL: a crashed row was filed as 'did not run' -> {crash_got}")
+        bad += 1
+    cases += 1
+    # ...and the policy cannot mask it: the crash is a new failure, so 1 even where a device-less box may skip.
+    if exit_code({"suite-crashed"}, crash_got["no_device"], "skip") != 1:
+        print("  SELF-TEST FAIL: --no-device skip masked a crashed row")
+        bad += 1
+    cases += 1
+    # The row that only skipped still lands in its own column, so the fix does not make the column useless.
+    if crash_got["no_device"] != {"suite-skipped"}:
+        print(f"  SELF-TEST FAIL: the skipping row left its column -> {sorted(crash_got['no_device'])}")
+        bad += 1
+
     print(f"  self-test: {cases} case(s), {bad} failure(s)")
     return bad
 
@@ -657,7 +708,7 @@ def main(argv=None):
             return 2
         # A row that did not run on a device is not debt: written down, it would make every later device-less run
         # read as "known failures, no new ones". A name the file already carries keeps its line (write merges).
-        absent = (device_skipped(last) if last is not None else set()) - set(known)
+        absent = ((device_skipped(last) if last is not None else set()) - hard_failures(text)) - set(known)
         names = {n for n in failed(text) if n not in absent}
         write_baseline(root / BASELINE, names, text)
         print(f"ctest_known_fail: wrote {len(names)} known failure(s) to {BASELINE}")

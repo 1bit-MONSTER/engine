@@ -41,6 +41,11 @@ fail() { echo "FAIL $*"; fails=$((fails + 1)); }
 root=$scratch/root
 mkdir -p "$root/scripts" "$root/third_party/llama.cpp" "$root/third_party/hrx-system" "$scratch/bin"
 cp "$src"/scripts/hw-gate.sh "$src"/scripts/mem-guard.sh "$src"/scripts/mem-wait.sh "$src"/scripts/hrx-env.sh "$root/scripts/"
+# engine#2935: the gate runs tools/ci/hrx_embedded_objects_check.py after its build. A root without the tool is a
+# check that cannot run, which the gate fails on purpose, so the fixture carries it; the stub build below makes no
+# HRX tree, and the tool's answer for that (77, nothing embedded) must not fail the build row.
+mkdir -p "$root/tools/ci"
+cp "$src"/tools/ci/hrx_embedded_objects_check.py "$root/tools/ci/"
 touch "$root/third_party/llama.cpp/CMakeLists.txt" "$root/third_party/hrx-system/CMakeLists.txt"
 
 sed 's/^MemAvailable:.*/MemAvailable:   900000000 kB/' /proc/meminfo > "$scratch/mem-high"

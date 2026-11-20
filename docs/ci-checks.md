@@ -80,7 +80,7 @@ sends must be fields something reads; a test that starts a server must take the 
 the port whether it is a `freeport` call, a `--port` literal or a shell default.
 
 **Pins, files and containers.** `config_pin_check`, `submodule_pin_check`, `notice_covers_deps`, `hrx_build_scope`,
-`kernel_id_selftest`, `token_rate_floor`, `medians`, `lane_syntax_check`, `tmp_path_check`, `tool_help_check`,
+`hrx_embedded_objects_check`, `kernel_id_selftest`, `token_rate_floor`, `medians`, `lane_syntax_check`, `tmp_path_check`, `tool_help_check`,
 `conflict_triage`.
 
 ## Adding the next one

@@ -1412,6 +1412,11 @@ add_test(NAME route_log COMMAND route_log_test)
 # one every uncertain case must land on, because the build being skipped is the one that catches a
 # broken HRX pin.  Stdlib only: no git needed for the decision itself.
 add_python_test(hrx_build_scope ${CMAKE_SOURCE_DIR}/tools/ci/hrx_build_scope.py --self-test)
+# engine#2935: an HRX build that succeeds and a server that then refuses every model at load ("N HIP kernel registration(s)
+# do not match their compiled code objects"). Everything that refusal compares is in the build tree when the build ends,
+# so cmake/hrx.cmake runs tools/ci/hrx_embedded_objects_check.py as a step of llama_hrx and the BUILD fails instead. This
+# row is the tool's fixtures (every verdict, no build, no device); the real check has no row because it is the build.
+add_python_test(hrx_embedded_objects_check ${CMAKE_SOURCE_DIR}/tools/ci/hrx_embedded_objects_check.py --self-test)
 add_python_test(copyright_check_untracked ${CMAKE_SOURCE_DIR}/tests/copyright_check_untracked_test.py)
 # engine#1517: the prefill flash-attention ratio is measured in adjacent pairs and only quoted when the pairs agree, so a
 # loaded box yields VOID instead of a number.  The self-test is the estimator's own gate and needs no GPU: it accepts

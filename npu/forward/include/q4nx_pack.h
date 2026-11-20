@@ -378,6 +378,11 @@ float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
  * launcher that passed (16,384, 1,048,576, 65,536) B.  Returns the number of widths found (0..3) or
  * -1 when the file is not a 32-bit LE ELF / has no .dynsym; undeclared entries stay 0. */
 int q4nx_elf_arg_sizes(const void* elf, size_t n, uint64_t out[3]);
+/* The same, for ONE kernel instance of an ELF that carries several (a sealed set, engine#1783): each instance's control
+ * code is a .ctrltext section in a SHT_GROUP whose signature symbol is the instance's name, and its argument symbols
+ * live in that section. `instance` is "main:<name>" or "<name>"; null, "main:seq", or a name no group carries reads
+ * the first declaration, as q4nx_elf_arg_sizes() does. */
+int q4nx_elf_arg_sizes_for(const void* elf, size_t n, const char* instance, uint64_t out[3]);
 /* Does a declaration describe the gemv (q4_1 GEMV) family's launch?  Another family, or a
  * declaration that does not fit K/N, is 0.  The per-core split of the .dynsym symbols is handled
  * here: arg0/arg2 are 1/cores of the stream/output, arg1 is the whole activation row. */

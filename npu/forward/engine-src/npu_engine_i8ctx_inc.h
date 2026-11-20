@@ -327,7 +327,7 @@ struct I8Ctx {
         group_scales.resize(NL);   // packB() writes group_scales[l]
         for (int l = 0; l < NL; l++)
             layerB[l] = mkbo(w_bytes());
-        if (!args_fit_elf(ep)) return false;
+        if (!args_fit_elf(ep, kname)) return false;
         initialized = true;
         return true;
     }
@@ -367,7 +367,8 @@ struct I8Ctx {
         return q4nx_gemv_family(declared, KD, ND) != 0;
     }
 
-    bool args_fit_elf(const char* ep) {
+    // `kname`: the instance this context runs; a sealed ELF declares widths per instance (q4nx_elf_arg_sizes_for).
+    bool args_fit_elf(const char* ep, const char* kname = nullptr) {
         std::vector<uint8_t> raw;
         {
             std::FILE* f = std::fopen(ep, "rb");
@@ -382,7 +383,7 @@ struct I8Ctx {
             if (got != raw.size()) return true;
         }
         uint64_t declared[3] = {0, 0, 0};
-        if (q4nx_elf_arg_sizes(raw.data(), raw.size(), declared) < 0) return true;   // not our shape
+        if (q4nx_elf_arg_sizes_for(raw.data(), raw.size(), kname, declared) < 0) return true;   // not our shape
         // passed[] is what this launcher hands the kernel for the family in use: the gemv family takes
         // (weights, activations, outputs) in that order, everything else (activations, weights, outputs).
         uint64_t passed[3] = {

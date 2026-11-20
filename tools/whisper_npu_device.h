@@ -24,12 +24,22 @@
 //
 // A staged shape with no ELF is left out and printed. Its products are declined by NpuAudioGemm and run on the host,
 // counted, so a missing kernel shows in the split instead of as a crash or a silent zero.
+//
+// engine#1783, sealed set: when the directory holds `sealed_i8_b8.elf` and its list `sealed_i8_b8.shapes` (one
+// "K N instance" line per runtime sequence in it), every design opens that ONE ELF, each on its own instance, so all of
+// them share one hw context. Per-role ELFs each claim the whole array, and a role change between launches is then a
+// context switch: measured on the whisper-small encoder at about 2.4 ms per launch (an O-shaped launch waited 0.38 ms
+// when every launch stayed on its context and 2.9 ms in the per-role set). A staged shape the list does not hold
+// exactly takes the same-K instance with the smallest wider N (NpuAudioGemm::role_for). ONEBIT_WHISPER_NPU_SEALED=0
+// ignores the sealed files.
 
 #pragma once
 
 #include <cstdio>
 #include <cstdlib>
 #include <dirent.h>
+#include <fstream>
+#include <sstream>
 #include <map>
 #include <memory>
 #include <string>
@@ -120,6 +130,33 @@ inline std::string find_elf(const std::string& dir, int k, int n, std::string* r
     return hit;
 }
 
+// The sealed set's instance list (see the header): "K N instance" per line, '#' comments. Empty when the directory has
+// no sealed set, when ONEBIT_WHISPER_NPU_SEALED=0, or (with *why set) when the list is malformed.
+struct SealedShape {
+    int k = 0, n = 0;
+    std::string instance;
+};
+inline constexpr const char* kSealedElf = "sealed_i8_b8.elf";
+inline std::vector<SealedShape> sealed_shapes(const std::string& dir, std::string* why) {
+    std::vector<SealedShape> out;
+    if (const char* e = std::getenv("ONEBIT_WHISPER_NPU_SEALED"); e != nullptr && e[0] == '0') return out;
+    std::ifstream elf(dir + "/" + kSealedElf);
+    std::ifstream lst(dir + "/sealed_i8_b8.shapes");
+    if (!elf || !lst) return out;
+    std::string line;
+    while (std::getline(lst, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream is(line);
+        SealedShape s;
+        if (!(is >> s.k >> s.n >> s.instance) || s.k <= 0 || s.n <= 0) {
+            *why = dir + "/sealed_i8_b8.shapes: \"" + line + "\" is not \"K N instance\"";
+            return {};
+        }
+        out.push_back(s);
+    }
+    return out;
+}
+
 inline Q4nxDesign design_enum(const std::string& role) {
     if (role == "QKV") return Q4NX_DESIGN_QKV;
     if (role == "O") return Q4NX_DESIGN_O;
@@ -135,7 +172,39 @@ inline bool open(const onebit::npu::pack_import::OnnxGraphInfo& enc, const std::
                  std::string* why) {
     std::vector<Q4nxDesignGeom> geoms;
     std::vector<onebit::audio::NpuAudioDesign> designs;
+    std::vector<std::string> kernels;   // per design: its instance in the sealed ELF ("" = main:seq)
+    std::string serr;
+    const std::vector<SealedShape> sealed = sealed_shapes(kdir, &serr);
+    if (!serr.empty()) {
+        *why = serr;
+        return false;
+    }
     for (const auto& s : offered_shapes(enc)) {
+        if (!sealed.empty()) {
+            // exact, else the same-K instance with the smallest wider N; each instance is adopted once
+            const SealedShape* hit = nullptr;
+            for (const auto& c : sealed)
+                if (c.k == s.first && c.n >= s.second && (hit == nullptr || c.n < hit->n)) hit = &c;
+            if (hit == nullptr) {
+                out->missing.push_back("K" + std::to_string(s.first) + " N" + std::to_string(s.second));
+                continue;
+            }
+            bool have = false;
+            for (const auto& d : designs) have = have || (d.K == hit->k && d.N == hit->n);
+            if (have) continue;
+            Q4nxDesignGeom g{};
+            g.M = rows;
+            g.K = hit->k;
+            g.N = hit->n;
+            g.role = Q4NX_DESIGN_D;   // the enum only names the log line
+            std::snprintf(g.elf_name, sizeof g.elf_name, "%s", kSealedElf);
+            geoms.push_back(g);
+            designs.push_back(onebit::audio::NpuAudioDesign{rows, hit->k, hit->n});
+            kernels.push_back("main:" + hit->instance);
+            std::fprintf(stderr, "npu: role %zu = %s instance %s (K%d N%d, M=%d; staged K%d N%d)\n", geoms.size() - 1,
+                         kSealedElf, hit->instance.c_str(), hit->k, hit->n, rows, s.first, s.second);
+            continue;
+        }
         std::string role, err;
         const std::string elf = find_elf(kdir, s.first, s.second, &role, &err);
         if (!err.empty()) {
@@ -154,6 +223,7 @@ inline bool open(const onebit::npu::pack_import::OnnxGraphInfo& enc, const std::
         std::snprintf(g.elf_name, sizeof g.elf_name, "%s", elf.c_str());
         geoms.push_back(g);
         designs.push_back(onebit::audio::NpuAudioDesign{rows, s.first, s.second});
+        kernels.emplace_back();
         std::fprintf(stderr, "npu: role %zu = %s (staged K%d N%d, M=%d)\n", geoms.size() - 1, elf.c_str(), s.first, s.second,
                      rows);
     }
@@ -168,6 +238,7 @@ inline bool open(const onebit::npu::pack_import::OnnxGraphInfo& enc, const std::
     x::XdnaTarget::Setup setup;
     setup.kernels_dir = kdir;
     setup.b8 = true;
+    setup.prefill_kernels = kernels;
     out->target->configure(setup);
     // NPU_PROFILE=1: the target's per-role launch accounting (pack / quant / wait / readback, fills apart), dumped by
     // whisper_transcribe after each encoder pass (engine#1783).

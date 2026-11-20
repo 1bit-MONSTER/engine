@@ -166,6 +166,30 @@ int main() {
               "a refused launch names its role and weight: " + why);
     }
 
+    // 6. engine#1783: a staged shape with no exact design runs on the same-K design with the SMALLEST wider N (a sealed set
+    // carries K768 N3072 for both fc1 and the fused q|k|v, staged N2560), and still equals the host GEMM: the extra
+    // weight columns are zero and never copied out.
+    {
+        FakeTarget fw;
+        fw.d = {{8, 256, 2048}, {8, 256, 1024}, {8, 512, 512}};
+        NpuAudioGemm gw(fw, fw.d);
+        const int M = 6, K = 200, N = 400;   // staged K256 N512: no exact design
+        const auto A = fill(M * K, 0.9f), B = fill(K * N, 1.1f);
+        std::vector<float> C, R;
+        std::string why;
+        check(gw.gemm("w.q", A.data(), M, K, B.data(), N, &C, &why), "a shape with only wider designs runs: " + why);
+        host_gemm(A, B, M, K, N, &R);
+        check(fw.seen.size() == 1 && fw.seen[0].role == 1 && fw.seen[0].K == 256 && fw.seen[0].N == 1024,
+              "it takes role 1 (K256 N1024), the narrowest design wider than N512, not role 0 (N2048)");
+        check(maxdiff(C, R) < 1e-4, "and equals the host GEMM (max " + std::to_string(maxdiff(C, R)) + ")");
+        check(C.size() == size_t(M) * size_t(N), "C keeps the model's N columns");
+        fw.seen.clear();
+        const auto A3 = fill(2 * 512, 1.0f), B3 = fill(512 * 1000, 1.0f);
+        check(!gw.gemm("w.wide", A3.data(), 2, 512, B3.data(), 1000, &C, &why) &&
+                  why.find("no design for staged K512 N1024") != std::string::npos && fw.seen.empty(),
+              "a narrower design is never taken: K512 N1024 has only K512 N512, so it is declined: " + why);
+    }
+
     check(g.launches() == 5 && g.products() == 3, "counts: 5 launches, 3 products");
     if (failures) {
         std::printf("audio_npu_gemm: %d failure(s)\n", failures);

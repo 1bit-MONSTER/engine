@@ -138,6 +138,10 @@ public:
         // The head geometry: hidden width, vocabulary, and the container's padded K.
         int hidden = 0, vocab = 0, kpad = 0;
         const onebit::npu::plan::Plan* plan = nullptr;   // copied into plan_ by configure(); null = none
+        // engine#1783: per design index, the kernel instance open_prefill() runs ("" or absent = "main:seq", the per-role
+        // ELF's one sequence). A sealed set names one ELF for several designs, each its own instance, so every role
+        // shares that ELF's one hw context and a role change between launches is not a context switch.
+        std::vector<std::string> prefill_kernels;
     };
     // Setup carries a pointer to the forward's Plan; this copies it, so from here on the target's own
     // plan_ is THE copy the setup side reads (open() no longer has to be the one that filled it).  Two

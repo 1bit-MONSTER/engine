@@ -43,6 +43,7 @@ import sys
 
 STAMP = "bench-stamp.txt"
 FIELDS = ("engine", "llama_cpp", "hrx_system", "loom", "host", "built_at")
+SHORT_SHA = 7  # git will not resolve a shorter revision, so a shorter value names nothing
 
 
 def git_rev(path, *args):
@@ -144,6 +145,16 @@ def check(tree, expect):
     if stamp is None:
         return 2, [f"{tree}: no {STAMP}, so this tree cannot say where it came from (a build tree is not a "
                    f"measurement until it can)"]
+    # A revision field shorter than a git short sha cannot name a revision (`git rev-parse` refuses under 7), so a
+    # stamp carrying one is "cannot tell", not "comparable" and not "the field moved". Measured on main before this:
+    # `engine=8` against `--expect-engine 8d26add2cf9a` answered rc 0, because the prefix rule that exists to stop a
+    # 12-vs-40 false alarm is satisfied by one character (engine#2761, found in the shell guard by #2941).
+    short = [k for k, v in stamp.items()
+             if k in ("engine", "llama_cpp", "hrx_system", "loom")
+             and v and not v.startswith(("unknown", "mixed:")) and len(v) < SHORT_SHA]
+    if short:
+        return 2, [f"{k}: the stamp says {stamp[k]!r}, shorter than a git short sha ({SHORT_SHA}), so it names no "
+                   f"revision and this tree cannot be compared" for k in short]
     reasons, differs = [], False
     for key, want in expect.items():
         if not want:
@@ -187,7 +198,7 @@ def self_test():
     with tempfile.TemporaryDirectory() as td:
         tree = pathlib.Path(td) / "bench"
         tree.mkdir()
-        write_stamp(tree, root=td, loom="c0ffee", host="box-a")
+        write_stamp(tree, root=td, loom="c0ffee00", host="box-a")
         stamped = read_stamp(tree)["engine"]
 
         chk(check(tree, {"host": "box-a"})[0] == 0, "the matching host passes")
@@ -204,7 +215,7 @@ def self_test():
             "one character different is still a moved field")
 
         # an explicit sha wins over the checkout's HEAD: CI's merge commit is not a sha any lane can name
-        write_stamp(tree, root=td, loom="c0ffee", host="box-a", engine="111111111111")
+        write_stamp(tree, root=td, loom="c0ffee00", host="box-a", engine="111111111111")
         chk(check(tree, {"engine": "111111111111"})[0] == 0, "an explicit --engine override is what the stamp records")
         chk(check(tree, {"engine": stamped})[0] == 1 or stamped == "111111111111",
             "and it does NOT silently fall back to the checkout's HEAD")
@@ -231,17 +242,25 @@ def self_test():
             "a moved engine is rc 1 even when the lowering is unknown (knowable beats cannot-tell)")
 
         # a tree holding objects from two compilers is not comparable either, and must not pass as one lowering
-        (tree / STAMP).write_text("engine=abc\nloom=mixed:aaa,bbb\nhost=box-a\n")
+        (tree / STAMP).write_text("engine=abcdef1\nloom=mixed:aaa1111,bbb2222\nhost=box-a\n")
         rc, why = check(tree, {"host": "box-a"})
         chk(rc == 2 and any("more than one lowering" in r for r in why),
             "a mixed-lowering tree is rc 2 and says which lowerings it holds")
+
+        # a revision field too short to name a revision is cannot-tell, not comparable and not "moved"
+        (tree / STAMP).write_text("engine=8\nloom=c0ffee00\nhost=box-a\n")
+        rc, why = check(tree, {"engine": "8d26add2cf9a"})
+        chk(rc == 2 and any("shorter than a git short sha" in r for r in why),
+            "a 1-character engine is cannot-tell against a real sha (it used to answer 0 by prefix)")
+        (tree / STAMP).write_text("engine=8d26add\nloom=c0ffee00\nhost=box-a\n")
+        chk(check(tree, {"engine": "8d26add2cf9a"})[0] == 0, "7 characters is a short sha and still compares")
 
         # a tree with no stamp at all is rc 2 as well
         chk(check(pathlib.Path(td) / "nope", {})[0] == 2, "a tree with no stamp is rc 2, not a pass")
 
         # the stamp is a file the checker reads, so a hand-edited one is read as written
-        (tree / STAMP).write_text("engine=abc\nloom=c0ffee\nhost=box-a\n")
-        chk(check(tree, {"engine": "abc"})[0] == 0, "a hand-written stamp with a known lowering passes")
+        (tree / STAMP).write_text("engine=abcdef1\nloom=c0ffee00\nhost=box-a\n")
+        chk(check(tree, {"engine": "abcdef1"})[0] == 0, "a hand-written stamp with a known lowering passes")
 
     print("ok" if bad == 0 else f"{bad} FAIL")
     return 1 if bad else 0

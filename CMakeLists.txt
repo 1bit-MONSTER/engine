@@ -1481,14 +1481,23 @@ if(Python3_Interpreter_FOUND)
     # Hermetic -- no network, no token, ~0.2 s -- and it fails on the version that shipped.
     add_test(NAME census_alert_job COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_alert_job_test.py)
     set_tests_properties(census_alert_job PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # engine#2848: `tools/ci/fork_ctest_known_fail.sh` shipped with none of its paths armed -- the body verified
+    # them by hand, and the two `cannot tell` paths are exactly what decides whether a PR is red. Nine assertions
+    # over six fixtures (no opt-in, tool absent, no build tree, no git in ROOT, submodule absent, submodule stale),
+    # all upstream of the suite, so the test never runs ctest. It also catches the shebang: an `sh` script is run as
+    # an executable here, which is how the python3 shebang it shipped with reads as a SyntaxError.
+    add_test(NAME fork_ctest_row COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/fork_ctest_row_test.py)
+    set_tests_properties(fork_ctest_row PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # Source-only, no build and no device: a warm-up path that is not a registered route 404s and warms
-    # nothing (engine#2853 -- /completion was that path for two warm-ups until #2855 registered it).
-    add_test(NAME warmup_route_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/warmup_route_check.py --root ${CMAKE_SOURCE_DIR})
-    set_tests_properties(warmup_route_check PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    # engine#2853: `1bit serve`'s short and spec warm-ups posted to /completion, a path it never registered -- 404s that
-    # moved nothing, and no test could see them because a warm-up is a POST the server makes to itself. The route table
-    # and the warm-up list are two literals in app/serve.cpp; this fails when they disagree. Static, ~0.1 s.
+    # Source-only, no build and no device, ~0.1 s: a warm-up is a POST the server makes to itself, so a path it never
+    # registered 404s and a field its parser never reads runs at the default limit -- and neither shows up on stdout
+    # anyone greps. engine#2853: `/completion` was that path for two warm-ups until #2855 registered it;
+    # engine#2884: their `n_predict` was that field until #2887 taught the parser the alias. The route table and the
+    # warm-up list are two literals in app/serve.cpp, so this fails when they disagree.
+    #
+    # One file, not two: `warmup_route_check.py` (#2883) checked the same route half with raw-string route support,
+    # which `serve_routes_check.py` now carries with arms (a regex route, and srv.Get), so the second check and its
+    # row are gone rather than kept in step by hand.
     add_python_test(tool_selftest_serve_routes ${CMAKE_SOURCE_DIR}/tools/ci/serve_routes_check.py --self-test)
     add_test(NAME serve_warmup_routes COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/serve_routes_check.py ${CMAKE_SOURCE_DIR})
     # an installed package must find its libraries beside itself: the 2026-11-08 incident's rule, from

@@ -28,6 +28,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdlib>
 #include <dirent.h>
 #include <memory>
 #include <string>
@@ -152,6 +153,9 @@ inline bool open(const onebit::npu::pack_import::OnnxGraphInfo& enc, const std::
     setup.kernels_dir = kdir;
     setup.b8 = true;
     out->target->configure(setup);
+    // NPU_PROFILE=1: the target's per-role launch accounting (pack / quant / wait / readback, fills apart), dumped by
+    // whisper_transcribe after each encoder pass (engine#1783).
+    out->target->set_profile(std::getenv("NPU_PROFILE") != nullptr);
     std::string err;
     if (!out->target->open_prefill(geoms.data(), int(geoms.size()), err)) {
         *why = "open_prefill: " + err;

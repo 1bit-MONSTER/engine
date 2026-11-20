@@ -115,6 +115,23 @@ The context is `--ctx-size` (or a recipe's `-c`). Without one, llama-server take
 on HRX0 (HRX reports its whole pool free, so `--fit` shrinks nothing), and serve judges that. On the
 CPU `--fit` shrinks an unset context, so serve judges llama.cpp's 4096 floor.
 
+**A default context for the machine (engine#2986).** On HRX with no `--ctx-size`, serve keeps the
+model's own context when its plan fits *with room* - the need plus the 1 GiB reserve plus 4 GiB for
+the graph-program cache. When it does not (LFM3-1.7B's 262,144 tokens on a 16 GB machine), serve
+passes the largest context, in 256-token steps, that does; if none does, the 4096 floor, and the
+usual refusal speaks if even that does not fit. It says so in one line, and an explicit
+`--ctx-size` is never changed (it is judged, and refused, as given):
+
+```
+1bit serve: memory: no --ctx-size: the model's own ctx 262144 needs 5.88 GiB, more than this machine has
+  room for; serving ctx 58112 (2.50 GiB) - pass --ctx-size to choose
+```
+
+That is LFM3-1.7B-Q4_K_M on GTT 8 GiB with 0.5 GiB in use and 11 GiB available, as
+`tests/mem_admit_test.cpp` computes it; the same box with `--ctx-size 262144` is refused (6.38 GiB
+would land past its 6.00 GiB ceiling). With GTT 16 GiB and 26 GiB available the model's own context
+is roomy and stands; on this box nothing changes.
+
 Free is `min(GTT total - GTT used, MemAvailable)` when a backend runs on HRX0, since the GTT pool
 is the same DRAM, and MemAvailable on the CPU. A load is refused only when the need plus 1 GiB is
 more than that. Two things grow after load, so they only warn:
@@ -129,7 +146,8 @@ once the runtime's own allocations landed. So serve refuses a load whose *landin
 ceiling, even when the free-memory test above would admit it:
 
 ```
-ceiling = GTT total - reserve          reserve = 16 GiB (GGML_HRX_GTT_RESERVE_MB)   -> 104 GiB of 120
+ceiling = GTT total - reserve          reserve = min(16 GiB, GTT total / 4)          -> 104 GiB of 120
+                                       (GGML_HRX_GTT_RESERVE_MB wins; an unreadable total keeps 16 GiB)
 refuse  when GTT used now + the estimate > ceiling
 ```
 
@@ -162,7 +180,8 @@ Consequences worth knowing:
 
 ctest `mem_admit` checks the KV and state sizes against HRX0 server logs, and the ceiling arithmetic
 (120 GiB total - 16 GiB reserve = 104 GiB; a load landing at 105 GiB is refused while 60 GiB is still
-free; a pool smaller than the reserve refuses at any size):
+free; since engine#2986 the reserve is a quarter of a pool below 64 GiB, so an 8 GiB pool keeps a 6 GiB
+ceiling instead of none), and the default context above:
 
 | model | ctx | KV/state |
 |---|---|---|

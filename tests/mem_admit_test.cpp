@@ -349,6 +349,86 @@ int main() {
     expect("a 1 GiB pool is still refused: the ceiling cannot grow a load that large",
            !v.fits && v.over_ceiling && v.ceiling == 768ull * (1ull << 20));
 
+    // engine#2986: the default context. LFM3-1.7B-Q4_K_M as its file says: 24 blocks, KV heads only on the 11
+    // attention layers, a 256-token window on 5 of the 24, 262,144 tokens of its own, 1,099,627,808 bytes.
+    {
+        std::vector<int32_t> kv_heads(24, 0);
+        for (int i = 2; i < 24; i += 2) kv_heads[size_t(i)] = 4;
+        std::vector<bool> windowed(24, false);
+        for (int i = 4; i < 24; i += 4) windowed[size_t(i)] = true;
+        const auto lfm3 = Gguf().s("general.architecture", "lfm3").u32("lfm3.block_count", 24)
+            .u32("lfm3.context_length", 262144).u32("lfm3.embedding_length", 2048).u32("lfm3.attention.head_count", 16)
+            .i32s("lfm3.attention.head_count_kv", kv_heads).u32("lfm3.attention.key_length", 128)
+            .u32("lfm3.attention.value_length", 128).u32("lfm3.attention.sliding_window", 256)
+            .bools("lfm3.attention.sliding_window_pattern", windowed).write(d + "/lfm3.gguf", 1099627808ull);
+        const std::vector<std::string> serve_argv = {"llama-server", "-m", lfm3, "--device", "HRX0", "-ngl", "99", "--jinja"};
+        auto gib = [](uint64_t b) { return double(b) / double(admit::kGiB); };
+        auto machine = [&](uint64_t gtt_gib, uint64_t avail_gib) {
+            sysinfo::Memory mm = box;
+            mm.gtt_total = gtt_gib << 30;
+            mm.gtt_used = 512ull << 20;   // a desktop session's share
+            mm.mem_available = avail_gib << 30;
+            return mm;
+        };
+        // the 32 GB machine keeps 262144: 5.88 GiB plus the 1 GiB reserve plus the program cache's 4 GiB fits there
+        expect("32 GB machine (GTT 16 GiB, 26 GiB available): the model's own context stands",
+               admit::default_ctx(serve_argv, machine(16, 26)).ctx == 0);
+        struct Case { const char* what; sysinfo::Memory mm; };
+        const Case cases[] = {
+            { "16 GB machine (GTT 8 GiB, 11 GiB available)", machine(8, 11) },
+        };
+        for (const Case& k : cases) {
+            const admit::CtxChoice c = admit::default_ctx(serve_argv, k.mm);
+            std::printf("     %s: model ctx %lld needs %.2f GiB -> ctx %lld needs %.2f GiB (roomy %d)\n", k.what, c.model_ctx,
+                        gib(c.need_model), c.ctx, gib(c.need_ctx), c.roomy ? 1 : 0);
+            expect(std::string(k.what) + ": the model's own 262144 is not roomy, a smaller context is chosen",
+                   c.model_ctx == 262144 && c.ctx >= admit::kDefaultCtxFloor && c.ctx < 262144 && c.ctx % 256 == 0 && c.roomy);
+            // the chosen context is the largest roomy one: 256 more is not
+            std::vector<std::string> a = serve_argv, b = serve_argv;
+            a.insert(a.end(), {"-c", std::to_string(c.ctx)});
+            b.insert(b.end(), {"-c", std::to_string(c.ctx + 256)});
+            admit::Need na, nb;
+            admit::add_llama_server(na, a);
+            admit::add_llama_server(nb, b);
+            expect(std::string(k.what) + ": the chosen context is roomy and 256 more is not",
+                   admit::judge(na, k.mm).roomy && !admit::judge(nb, k.mm).roomy && na.total == c.need_ctx);
+        }
+        {
+            const admit::CtxChoice busy = admit::default_ctx(serve_argv, machine(8, 6));
+            std::printf("     16 GB machine, busier (GTT 8 GiB, 6 GiB available): -> ctx %lld needs %.2f GiB (roomy %d)\n", busy.ctx,
+                        gib(busy.need_ctx), busy.roomy ? 1 : 0);
+            expect("16 GB machine with 6 GiB available: no context is roomy, the floor is chosen",
+                   busy.ctx == admit::kDefaultCtxFloor && !busy.roomy);
+        }
+        {
+            const sysinfo::Memory mm = machine(8, 11);
+            std::vector<std::string> a = serve_argv;
+            a.insert(a.end(), {"-c", "262144"});
+            expect("an explicit --ctx-size is left alone", admit::default_ctx(a, mm).ctx == 0);
+            admit::Need n;
+            admit::add_llama_server(n, a);
+            const admit::Verdict ev = admit::judge(n, mm);
+            std::printf("     16 GB machine, explicit --ctx-size 262144: need %.2f GiB, ceiling %.2f GiB -> %s\n", gib(n.total),
+                        gib(ev.ceiling), ev.fits ? "fits" : "refused");
+            expect("an explicit --ctx-size 262144 on the 16 GB machine is judged as given (fits only if it fits)",
+                   ev.fits == (n.total + admit::kGiB <= ev.free && !ev.over_ceiling));
+            a = serve_argv;
+            a.insert(a.end(), {"-c", "1000000"});
+            admit::Need big;
+            admit::add_llama_server(big, a);
+            expect("an explicit --ctx-size of 1,000,000 on the 16 GB machine is refused", !admit::judge(big, mm).fits);
+        }
+        // strixhalo-sized: the model's own context is roomy, nothing changes
+        expect("120 GiB box with 60 GiB in use: the model's own context stands",
+               admit::default_ctx(serve_argv, box).ctx == 0);
+        std::vector<std::string> cpu = {"llama-server", "-m", lfm3, "-ngl", "0"};
+        expect("a CPU backend is left alone", admit::default_ctx(cpu, machine(8, 11)).ctx == 0);
+        // nothing fits even at the floor: the floor is passed and the normal refusal speaks
+        const admit::CtxChoice none = admit::default_ctx(serve_argv, machine(2, 2));
+        expect("a 2 GiB pool: nothing fits, the floor is passed for the refusal to name",
+               none.ctx == admit::kDefaultCtxFloor && !none.roomy);
+    }
+
     fs::remove_all(dir);
     if (failures) std::printf("%d FAILED\n", failures);
     else std::printf("PASS\n");

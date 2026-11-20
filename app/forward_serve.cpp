@@ -1699,8 +1699,7 @@ int run_forward_serve(int argc, char** argv) {
         if (!e.fwd->step_users_supported())
             throw std::runtime_error(
                 "--npu-batch-users " + std::to_string(batch_users) + " refused: this model keeps per-sequence attention "
-                "state beside its KV cache (GDN linear attention, MLA or short-convolution layers), or is a noncausal "
-                "pack, so one pass cannot "
+                "state beside its KV cache (GDN linear attention or MLA), or is a noncausal pack, so one pass cannot "
                 "carry several sequences; run without --npu-batch-users");
         // The prefix cache is on by default (8 slots) and its snapshots come from the forward, so a batched serve turns it
         // OFF unless the operator asked for it explicitly -- and an explicit one is then refused per request, below, rather
@@ -1821,7 +1820,12 @@ int run_forward_serve(int argc, char** argv) {
         r.set_content(npu::systemone_models(e.id, systemone_max_input(e)).dump(), "application/json");
     });
 
-    if (!srv.bind_to_port(host, port)) throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
+    // --port 0 asks the kernel for a port (serve's own --port 0, engine #1485): the ready line then has to name the
+    // port that was bound, not the 0 that was asked for, because tests/serve_port.sh reads the port back from this
+    // line. Reporting the request left every `--port 0` caller -- tests/serve_e2e.sh and tools/registry_check.py on
+    // every NPU row -- waiting out its whole budget on a server that was up and answering.
+    const int bound_port = port == 0 ? srv.bind_to_any_port(host) : (srv.bind_to_port(host, port) ? port : -1);
+    if (bound_port < 0) throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
     std::thread listener([&] { srv.listen_after_bind(); });
     struct Stop {
         httplib::Server& s;
@@ -1886,7 +1890,7 @@ int run_forward_serve(int argc, char** argv) {
         }
     }
     ready = true;
-    std::fprintf(stderr, "1bit forward-serve: %s ready on http://%s:%d (%s)", e.id.c_str(), host.c_str(), port,
+    std::fprintf(stderr, "1bit forward-serve: %s ready on http://%s:%d (%s)", e.id.c_str(), host.c_str(), bound_port,
                  e.fwd->backend().c_str());
     if (streams > 1) std::fprintf(stderr, " [npu-streams=%d]", streams);
     // The target that is actually serving, so a log says which one answered rather than leaving it to the build.

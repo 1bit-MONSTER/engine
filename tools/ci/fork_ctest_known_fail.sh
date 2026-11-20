@@ -84,6 +84,24 @@ esac
 
 cd "$FORK"
 
+# WHERE THIS CTEST DIRECTORY CAME FROM (engine#3000). The depth marker below catches a nested run once it starts; this
+# refuses the misconfiguration that causes it. `ctest` here runs every row the tree registers, and an ENGINE build tree
+# registers this very row -- so the ctest directory has to be the FORK's build. CMakeCache.txt records the source it was
+# configured from, and an engine source there is exactly the case that re-entered ~36,600 processes on 2026-11-20.
+_CACHE="$FORK/CMakeCache.txt"
+if [ -f "$_CACHE" ]; then
+    _HOME_DIR=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$_CACHE" | head -n 1)
+    case "${_HOME_DIR:-}" in
+        */third_party/llama.cpp|*/third_party/llama.cpp/) : ;;   # the fork's own build: correct
+        "") skip "no CMAKE_HOME_DIRECTORY in $_CACHE, so which source this ctest directory came from is unknowable" ;;
+        *)
+            echo "fork_ctest_known_fail: cannot tell: $FORK was configured from $_HOME_DIR, which is not a fork source." >&2
+            echo "  Its ctest registers this same row, so running it nests (engine#3000). Point HRX_BUILD at the tree" >&2
+            echo "  cmake/hrx.cmake builds ($HRX_BUILD/hrx/llama), not at the engine build directory." >&2
+            exit 2 ;;
+    esac
+fi
+
 # The submodule this tree was configured against, and the submodule that is actually checked out.
 WANT=$(cd "$ROOT" && git ls-tree HEAD third_party/llama.cpp 2>/dev/null | awk '{print $3}' || true)
 [ -n "$WANT" ] || skip "no git tree at $ROOT, so the pinned submodule cannot be read (an exported source tree)"

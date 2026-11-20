@@ -138,6 +138,30 @@ jobs:
           ls -l "$HRX_BUILD"/hrx/llama/bin/llama-server
           find "$HRX_BUILD"/hrx/llama -name 'libggml-hrx.so*' -print -quit | grep .
 
+      - name: Stamp the tree with its build provenance
+        if: steps.scope.outputs.build == 'true'
+        env:
+          ENGINE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          # --engine, not the checkout's HEAD: actions/checkout gives a PR run a SYNTHETIC merge commit, so deriving
+          # it in here stamped 241017c32dbb on 11-20 -- a sha no lane's `git rev-parse HEAD` can equal, which makes
+          # every `check --expect-engine` answer "the field moved" on a tree that is exactly the pin. The head sha of
+          # the commit being built is the one a lane can name.
+          python3 tools/ci/bench_stamp.py write --tree "$HRX_BUILD" --root "$PWD" \
+              --engine "${ENGINE_SHA:0:12}" | tee -a "$GITHUB_STEP_SUMMARY"
+          # the same file a lane reads before quoting a number from this tree
+          cat "$HRX_BUILD/bench-stamp.txt" >> "$GITHUB_STEP_SUMMARY"
+          # and the copy that travels with the binary: this job has both submodules checked out, so it is the one
+          # place that proves the submodule branch of the stamp -- a lane tree without them prints `unknown`
+          "$HRX_BUILD/1bit" --version | tee -a "$GITHUB_STEP_SUMMARY"
+          # The two artefacts this job produced must agree, and the check is not the stamp comparing itself: the
+          # binary carries its own header, so grep THAT. The lowering is read from the code objects just built, so
+          # after a real build `check` can answer 0 -- the state a tree whose code objects exist deserves.
+          python3 tools/ci/bench_stamp.py check --tree "$HRX_BUILD" --expect-engine "${ENGINE_SHA:0:12}" || \
+              [ $? -eq 2 ] || { echo "::error::the tree stamp does not match this build"; exit 1; }
+          "$HRX_BUILD/1bit" --version | grep -q "engine ${ENGINE_SHA:0:12}" || {
+              echo "::error::1bit --version does not name this build's head sha"; exit 1; }
       - name: Run the fork's own ctest rows
         if: steps.scope.outputs.build == 'true'
         # engine#2836: 37 `test-hrx-*` rows are registered in the fork's tests/CMakeLists.txt inside
@@ -214,27 +238,3 @@ jobs:
       # emitted its code objects, so the number could not be told apart from a real one. The stamp names the
       # three checkouts and the lowering (as `unknown` when the build did not record it, which is itself the
       # finding), and tools/ci/bench_stamp.py check refuses to call a tree comparable unless it matches.
-      - name: Stamp the tree with its build provenance
-        if: steps.scope.outputs.build == 'true'
-        env:
-          ENGINE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          set -euo pipefail
-          # --engine, not the checkout's HEAD: actions/checkout gives a PR run a SYNTHETIC merge commit, so deriving
-          # it in here stamped 241017c32dbb on 11-20 -- a sha no lane's `git rev-parse HEAD` can equal, which makes
-          # every `check --expect-engine` answer "the field moved" on a tree that is exactly the pin. The head sha of
-          # the commit being built is the one a lane can name.
-          python3 tools/ci/bench_stamp.py write --tree "$HRX_BUILD" --root "$PWD" \
-              --engine "${ENGINE_SHA:0:12}" | tee -a "$GITHUB_STEP_SUMMARY"
-          # the same file a lane reads before quoting a number from this tree
-          cat "$HRX_BUILD/bench-stamp.txt" >> "$GITHUB_STEP_SUMMARY"
-          # and the copy that travels with the binary: this job has both submodules checked out, so it is the one
-          # place that proves the submodule branch of the stamp -- a lane tree without them prints `unknown`
-          "$HRX_BUILD/1bit" --version | tee -a "$GITHUB_STEP_SUMMARY"
-          # The two artefacts this job produced must agree, and the check is not the stamp comparing itself: the
-          # binary carries its own header, so grep THAT. The lowering is read from the code objects just built, so
-          # after a real build `check` can answer 0 -- the state a tree whose code objects exist deserves.
-          python3 tools/ci/bench_stamp.py check --tree "$HRX_BUILD" --expect-engine "${ENGINE_SHA:0:12}" || \
-              [ $? -eq 2 ] || { echo "::error::the tree stamp does not match this build"; exit 1; }
-          "$HRX_BUILD/1bit" --version | grep -q "engine ${ENGINE_SHA:0:12}" || {
-              echo "::error::1bit --version does not name this build's head sha"; exit 1; }

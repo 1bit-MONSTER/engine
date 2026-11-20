@@ -38,6 +38,12 @@ add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold
 # when the token is taken; the 11-13 crash was nine resets inside two tickets. The kernel log is a fixture file.
 add_test(NAME gpu_hold_fault_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_fault_abort_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 
+# engine#3000: the fork-ratchet row must refuse the ctest directory that CAUSES a nesting (one configured from the engine,
+# whose ctest registers the same row), and the provenance stamp it reads must be written before it runs -- the depth marker
+# merged in #3004 catches a nested run once it starts; neither of these can. Device-free, no ctest, no fork tree.
+add_test(NAME fork_ctest_engine_cache COMMAND sh ${CMAKE_SOURCE_DIR}/tests/fork_ctest_engine_cache_test.sh
+         ${CMAKE_SOURCE_DIR})
+
 # engine#2961: one device's fault must not refuse the other device's ticket. Both consumers of the one fault regex (the
 # take-time refusal and the during-hold watch) read every device on the box, so an amdxdna (NPU) fault refused two GPU
 # tickets for ten minutes on 2026-11-20 and neither victim was touching the NPU. The ticket declares its device by the

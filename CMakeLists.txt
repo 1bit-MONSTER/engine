@@ -706,6 +706,7 @@ add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-tes
 # since engine#2730: a workflow edit needed a `workflow`-scoped token over HTTPS OAuth, which this fleet pushes over
 # `ssh://git@github.com/...` instead, so the row is no longer blocked. `--write` stays a manual developer action.
 add_python_test(ctest_skips_self ${CMAKE_SOURCE_DIR}/tools/ci/ctest_skips.py --self-test)
+add_python_test(fork_hrx_rows_self ${CMAKE_SOURCE_DIR}/tools/ci/fork_hrx_rows.py --self-test)
 # engine#2106 / #2102: the release gate's NPU serve check asserts the fast route, a decode floor, the first token and a
 # non-empty answer, because a serve on the slow per-op route still answers. --self-test drives the judging on the shape
 # of each failure (the silent fallback at 1.9 tok/s, thinking left on, a degenerate reply); no device, no binary.

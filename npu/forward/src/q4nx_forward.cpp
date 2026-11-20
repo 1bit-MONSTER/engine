@@ -4813,7 +4813,10 @@ bool Q4nxNpuForward::step_users(const std::vector<int>& tokens, const std::vecto
     for (size_t m = 0; m < M; m++) {
         if (m > 0 && slot[m] == slot[m - 1]) continue;
         const int have = user_len_[(size_t)slot[m]];
-        if (pos[m] != have) {
+        // pos 0 is the exception: it means "start a new sequence" and the loop below clears the slot for it, so a
+        // re-used slot legitimately starts at 0 even when it holds positions (engine#2689's reset path). Without this
+        // exemption that path was unreachable and a re-used slot was refused with the message that describes it.
+        if (pos[m] != have && pos[m] != 0) {
             err_ = "step_users: slot " + std::to_string(slot[m]) + " holds " + std::to_string(have) +
                    " position(s), but this pass starts it at " + std::to_string(pos[m]) +
                    " (each row appends at its own position and reads up to it, so a start that is not the end of the "

@@ -25,7 +25,13 @@ The check is static on purpose: the route table and the warm-up list are two lit
 their disagreement. It parses `srv.Post("<path>"` registrations and `{ "path", "<path>" }` warm-up entries out of
 `app/serve.cpp` and requires the second set to be a subset of the first.
 
-Exit: 0 every warm-up path is registered, 1 one is not (named), 77 the file or a literal could not be read.
+engine#2884: the path is only half the request. A warm-up is a request the server makes to ITSELF, so a field the
+parser does not read is as silent as a 404 -- the short and spec warm-ups set llama.cpp's `n_predict`, the parser read
+`max_completion_tokens`/`max_tokens`, and both requests generated 256 tokens while answering 200. So the same check
+also requires the token limit a warm-up body sets to be a field the request parser actually reads.
+
+Exit: 0 every warm-up path is registered and its token limit is read, 1 one is not (named), 77 a literal could not be
+read.
 """
 
 import pathlib
@@ -35,6 +41,13 @@ import sys
 SOURCE = pathlib.Path("app/serve.cpp")
 ROUTE = re.compile(r'srv\.Post\(\s*"([^"]+)"')
 WARMUP = re.compile(r'\{\s*"path"\s*,\s*"([^"]+)"')
+# The token-limit fields the warm-up bodies set, and the ones the request parser reads (forward_serve.cpp).
+# Both shapes the builders use: `{ "n_predict", 0 }` in an initializer list and `body["n_predict"] = 2`.
+BODY_LIMIT = re.compile(r'"(n_predict|max_tokens|max_completion_tokens)"\s*(?:[:,]|\])')
+# Per builder, not the union: the chat warm-up sets `max_tokens`, so a union hides that the short and spec bodies set
+# only `n_predict` -- which is exactly how engine#2884 stayed invisible through a green check.
+BODY_FN = re.compile(r"static json (warmup_[a-z_]*body)\s*\([^)]*\)\s*\{(.*?)\n\}", re.S)
+READ_LIMIT = re.compile(r'int_field\(\s*body\s*,\s*"(n_predict|max_tokens|max_completion_tokens)"')
 
 
 def routes_and_warmups(text):
@@ -73,6 +86,29 @@ def check(root=None):
         return 1
     print(f"serve_routes: all {requests} warm-up request(s) post to registered routes "
           f"({len(warmups)} distinct path(s), {len(routes)} routes)")
+
+    # engine#2884: the limit a warm-up body asks for has to be a limit the parser reads, or the request runs at the
+    # default 256 and the warm-up does the opposite of what it promises.
+    try:
+        parser = (root / "app/forward_serve.cpp").read_text(errors="replace")
+    except OSError:
+        print("serve_routes: cannot read app/forward_serve.cpp, so the body half is looking at nothing", file=sys.stderr)
+        return 77
+    bodies = {name: sorted(set(BODY_LIMIT.findall(src))) for name, src in BODY_FN.findall(text)}
+    read = sorted(set(READ_LIMIT.findall(parser)))
+    if not bodies or not read:
+        print(f"serve_routes: {len(bodies)} body builder(s) and {len(read)} parser read(s): one literal moved, so the "
+              f"body half is looking at nothing", file=sys.stderr)
+        return 77
+    unread = [(name, keys) for name, keys in bodies.items() if keys and not set(keys) & set(read)]
+    for name, keys in unread:
+        print(f"serve_routes: {name}() sets {', '.join(keys)}, and the parser reads only {', '.join(read)} -- that "
+              f"request answers 200 and runs at the default limit (engine#2884)")
+    if unread:
+        print(f"serve_routes: {len(unread)} warm-up body builder(s) set a token limit the parser never reads")
+        return 1
+    print(f"serve_routes: every warm-up body's token limit is read by the parser "
+          f"({len(bodies)} builder(s), parser reads {', '.join(read)})")
     return 0
 
 
@@ -99,6 +135,12 @@ out.push_back(json{ { "path", "/completion" } });'''
     r, w = routes_and_warmups(bad)
     arm("... and the missing route is visible as a subset failure", [x for x in w if x not in r] == ["/completion"])
     arm("no routes parses as nothing", routes_and_warmups("nothing here") == ([], []))
+    # engine#2884's half: the limit the body asks for must be one the parser reads.
+    body = '{"n_predict", 0}, {"temperature", 0}'
+    arm("a body limit is found", BODY_LIMIT.findall(body) == ["n_predict"])
+    arm("a parser read is found", READ_LIMIT.findall('int_field(body, "n_predict"') == ["n_predict"])
+    arm("an unrelated field is neither", BODY_LIMIT.findall('{"prompt", s}') == [] and
+        READ_LIMIT.findall('int_field(body, "top_k"') == [])
     print(f"serve_routes: {'ok' if not fails else f'{fails} failed'}")
     return 0 if not fails else 1
 

@@ -70,6 +70,36 @@ if [ "$WANT" != "$GOT" ]; then
     exit 2
 fi
 
+# engine#2761: the two checks above are about the SOURCE tree, and ctest then runs in the BUILD tree --
+# so a source tree aligned to the pin satisfied every guard while $FORK stayed whatever it was configured
+# from. Measured on the first live run of this row: 11 "NEW failures" and 11 "now passing" in the same
+# answer, which is the signature of a different revision, not of 22 real changes.
+#
+# The build tree has to state its own provenance, and the answer has to be un-tellable when it cannot.
+# CMakeCache.txt records the source directory it was configured from; that directory's HEAD is the
+# revision the binaries under test were compiled from.
+CACHE="$FORK/CMakeCache.txt"
+[ -f "$CACHE" ] || {
+    echo "fork_ctest_known_fail: cannot tell: $FORK has no CMakeCache.txt, so which source it was built from is unknowable" >&2
+    exit 2
+}
+BUILT_FROM=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$CACHE" | head -n 1)
+[ -n "$BUILT_FROM" ] || {
+    echo "fork_ctest_known_fail: cannot tell: $CACHE records no CMAKE_HOME_DIRECTORY, so the build tree names no source" >&2
+    exit 2
+}
+BUILT_SHA=$(cd "$BUILT_FROM" 2>/dev/null && git rev-parse HEAD 2>/dev/null || echo none)
+if [ "$BUILT_SHA" = none ]; then
+    echo "fork_ctest_known_fail: cannot tell: the build tree was configured from $BUILT_FROM, which is not a git tree" >&2
+    echo "  a ratchet that answers from an unknown revision is the failure mode it exists to prevent" >&2
+    exit 2
+fi
+if [ "$BUILT_SHA" != "$WANT" ]; then
+    echo "fork_ctest_known_fail: cannot tell: the build tree was configured from $BUILT_FROM at $BUILT_SHA, the tree pins $WANT" >&2
+    echo "  the suite would answer about a different revision than the one this tree builds; reconfigure" >&2
+    exit 2
+fi
+
 # tee, because the ratchet reads a log and ctest does not write one by itself. `|| true` is
 # load-bearing: under `set -e` a non-zero ctest ends the script HERE, before the ratchet runs, and
 # every known failure would then fail the row -- the one thing the baseline exists to prevent.

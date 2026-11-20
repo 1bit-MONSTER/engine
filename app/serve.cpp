@@ -102,6 +102,7 @@
 
 #include <httplib.h>
 #include "http_guard.h"
+#include "warmup_bodies.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -1705,48 +1706,6 @@ static bool warmup_wanted(const std::string& device) {
 
 static const char* const kWarmupPath = "/v1/chat/completions";
 
-static json warmup_body() {
-    std::string text = "warm up the decode and prefill shapes";
-    for (int i = 0; i < 60; ++i) text += " lorem ipsum dolor sit amet";
-    return json{ { "messages", json::array({ { { "role", "user" }, { "content", text } } }) },
-                 { "temperature", 0 }, { "max_tokens", 8 }, { "cache_prompt", false } };
-}
-
-// The second warm-up request: one 16-token prompt, " a" 16 times (one token each in the byte-level BPE
-// vocabularies of the models we serve; a BOS makes it 17, still inside the range below). n_predict 0: the
-// prompt is the work. (Token ids instead of text ended in a 500 on Qwen3.5-4B: id 100 is a lone UTF-8
-// byte there, which llama-server's output parser rejects.)
-// The first request whose batch holds 13 to 20 tokens takes HRX's small-batch matmul kernels, and they
-// read the weights in a layout ggml-hrx builds on the host the first time it needs it (re-quantizing the
-// affected tensors: 6.1 s of CPU, +1.0 GiB of GTT on Qwen3.8-27B UD-Q4_K_XL). A chat request splits its
-// prompt at the last user message and before its last 4 tokens, so short chats land there: Lemonade's
-// chat-short prompt (67 tokens) runs as 50 + 13 + 4, and its first time after a load cost 2.43 s against
-// 0.53 s later, with lemond on 4 cores. This request moves that build to load time (2.1 s on 4 cores).
-// On a fresh server, 13-20 tokens cost 2.03-2.07 s the first time; 1-12 cost 0.1-0.5 s and 21-512 cost
-// 0.45-1.23 s (docs/serve.md, "Warm-up").
-static constexpr int kWarmupShortTokens = 16;
-
-static json warmup_short_body() {
-    std::string prompt;
-    for (int i = 0; i < kWarmupShortTokens; ++i) prompt += " a";
-    return json{ { "prompt", prompt }, { "n_predict", 0 },
-                 { "temperature", 0 }, { "cache_prompt", false } };
-}
-
-// The third warm-up request, sent only when the backend speculates (--mtp, an own MTP head, --dflash): the same
-// 16-token prompt, n_predict 2. A speculating server decodes the LAST token of a request without a draft
-// (llama-server's get_n_draft_max() is n_remaining - 1 = 0 there), so that step runs the plain one-token decode
-// program, and the first time it runs, ggml-hrx builds the layout that program reads for any weight the verify pass
-// reads in another one. On Qwen3.8-27B Q4_K_M that is the mixed layers' Q6_K ffn weights: 76 host copies, ~5.6 GB,
-// 10.4 s, paid by whichever client request first ends on such a step. With n_predict 2 the second token is that
-// step, so the build happens here instead (DECODE-BW 11-15: the duplicates appeared during this request, and the
-// next perf.py pass decoded 23.55 tok/s instead of absorbing the 10 s).
-static json warmup_spec_body() {
-    json body = warmup_short_body();
-    body["n_predict"] = 2;
-    return body;
-}
-
 static json warmup_requests(bool speculative) {
     // An unrecognised value is the shipped set, not "none": a typo must not quietly disable a warm-up that moves a
     // measured 2 s off the client's first request. Normalised here so a caller cannot see the two states differently.
@@ -1756,9 +1715,9 @@ static json warmup_requests(bool speculative) {
     const bool want_short = sel == "both" || sel == "short";
     const bool want_spec  = speculative && (sel == "both" || sel == "spec");
     json out = json::array();
-    if (want_chat)  out.push_back(json{ { "path", kWarmupPath },    { "body", warmup_body() } });
-    if (want_short) out.push_back(json{ { "path", "/completion" },  { "body", warmup_short_body() } });
-    if (want_spec)  out.push_back(json{ { "path", "/completion" },  { "body", warmup_spec_body() } });
+    if (want_chat)  out.push_back(json{ { "path", kWarmupPath },    { "body", serve_warmup::warmup_body() } });
+    if (want_short) out.push_back(json{ { "path", "/completion" },  { "body", serve_warmup::warmup_short_body() } });
+    if (want_spec)  out.push_back(json{ { "path", "/completion" },  { "body", serve_warmup::warmup_spec_body() } });
     return out;
 }
 

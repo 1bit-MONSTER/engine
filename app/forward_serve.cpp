@@ -345,7 +345,9 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     try {
         // Both read here, not before: a wrong type must be the 400 below, not a json::type_error that escapes
         // the guard and answers 500 with an empty body (engine#1106).
-        max_tokens = npu::int_field(body, "max_completion_tokens", npu::int_field(body, "max_tokens", 256));
+        // Both dialects' cap fields, in one place: `n_predict` is what /completion's clients (and our own warm-up
+        // bodies) send, and reading only the OpenAI pair ran the zero-token warm-up at 256 (engine#2884).
+        max_tokens = npu::request_max_tokens(body);
         opts = npu::options_from_body(body);
         // logprobs is served in the chat shape; the legacy /v1/completions shape is a different
         // object this route does not implement, and a silently dropped field is what it must not do.

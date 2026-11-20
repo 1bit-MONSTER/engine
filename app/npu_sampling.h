@@ -329,6 +329,17 @@ inline int int_field(const nlohmann::json& body, const char* key, int def) {
     return v.get<int>();
 }
 
+// The route's decode cap, from the field name the client's dialect uses (engine#2884). `/completion` is
+// llama.cpp's own endpoint, so `n_predict` is the name a client of it sends and the name our own warm-up
+// bodies send; `max_completion_tokens`/`max_tokens` are the OpenAI names the chat route takes. Reading only
+// the OpenAI pair silently ignored `n_predict`, which turned the zero-token warm-up into a 256-token one
+// and the two-token one into a 256-token one -- a body whose keys nothing reads is indistinguishable from a
+// correct body, so both names are read here and the precedence is explicit: the most specific field wins.
+inline int request_max_tokens(const nlohmann::json& body) {
+    return int_field(body, "max_completion_tokens",
+                     int_field(body, "n_predict", int_field(body, "max_tokens", 256)));
+}
+
 inline bool bool_field(const nlohmann::json& body, const char* key, bool def = false) {
     if (!body.contains(key) || body.at(key).is_null()) return def;
     const auto& v = body.at(key);

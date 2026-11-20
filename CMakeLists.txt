@@ -2195,6 +2195,17 @@ add_executable(npu_answer_parser_test tests/npu_answer_parser_test.cpp)
 target_include_directories(npu_answer_parser_test PRIVATE app)
 target_link_libraries(npu_answer_parser_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME npu_answer_parser COMMAND npu_answer_parser_test)
+# engine#2884: the warm-up bodies and the route's cap parser, in one host test. The bodies are what the server
+# posts, so the arm asserts on them rather than on a copy: a body whose every key the route ignores passes a
+# path-only check exactly as a correct one does, which is how the short warm-up ran 256 tokens instead of 0.
+add_executable(warmup_max_tokens_test tests/warmup_max_tokens_test.cpp)
+target_include_directories(warmup_max_tokens_test PRIVATE app)
+target_link_libraries(warmup_max_tokens_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME warmup_max_tokens COMMAND warmup_max_tokens_test)
+# …and built by a target ci.yml builds: `add_dependencies(onebit ...)` is the hook this tree uses when a row needs no
+# workflow edit (ci_targets_check, engine#1595). Without it the row is registered and never built, so ctest reports it
+# as not run in exactly the configuration that matters.
+add_dependencies(onebit warmup_max_tokens_test)
 # direction B (tools/ci/ci_targets_check.py, engine#1595): a target no ci.yml line names is "never built", and its test
 # then reports "Not Run" instead of running. `ci.yml` is a workflow file no lane can patch, so the documented hook is the
 # one this tree already uses for onebit_npu_forward_syntax: add_dependencies(onebit <target>), which the checker follows.

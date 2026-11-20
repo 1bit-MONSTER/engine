@@ -2358,17 +2358,24 @@ int serve_child(const Options& given) {
     if (o.mem_check || o.mem_check_only) {
         const sysinfo::Memory box_memory = sysinfo::memory();
         // engine#2986: no --ctx-size on HRX and the model's own context is beyond this machine -> the largest
-        // context that fits with room (app/mem_admit.h, default_ctx), said in one line
+        // context that fits with room (app/mem_admit.h, default_ctx), said in one line. Only the chat model's
+        // context is chosen; the embedding / reranking launches keep theirs, and their plans are counted against
+        // the same room, because the ceiling check below sums every launch (#3013 review).
         if (!backends.empty() && backends[0].device.rfind("hrx", 0) == 0) {
-            const admit::CtxChoice c = admit::default_ctx(backends[0].argv, box_memory);
+            admit::Need others;
+            for (const auto& b : rag)
+                if (b.device.rfind("hrx", 0) == 0 || b.device.rfind("cpu", 0) == 0) admit::add_llama_server(others, b.argv);
+            const admit::CtxChoice c = admit::default_ctx(backends[0].argv, box_memory, admit::kDefaultCtxFloor, others.total);
             if (c.ctx > 0) {
                 backends[0].argv.push_back("-c");
                 backends[0].argv.push_back(std::to_string(c.ctx));
-                std::fprintf(stderr, "1bit serve: memory: no --ctx-size: the model's own ctx %lld needs %.2f GiB, more than this "
-                             "machine has room for; serving ctx %lld (%.2f GiB)%s - pass --ctx-size to choose\n",
-                             c.model_ctx, double(c.need_model) / double(admit::kGiB), c.ctx,
+                std::fprintf(stderr, "1bit serve: memory: no --ctx-size: %s's own ctx %lld needs %.2f GiB, more than this "
+                             "machine has room for%s; serving it at ctx %lld (%.2f GiB)%s - pass --ctx-size to choose\n",
+                             fs::path(admit::admit_model_path_of(backends[0].argv)).filename().string().c_str(), c.model_ctx,
+                             double(c.need_model) / double(admit::kGiB), others.total ? " beside the other models" : "", c.ctx,
                              double(c.need_ctx) / double(admit::kGiB),
-                             c.roomy ? "" : ", the smallest it takes: no context leaves the graph-program cache its room");
+                             c.roomy ? "" : ", the smallest it takes: no context leaves the graph-program cache its room, "
+                                            "and the load is refused below if even this does not fit");
             }
         }
         admit::Need need;

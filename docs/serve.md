@@ -127,6 +127,10 @@ usual refusal speaks if even that does not fit. It says so in one line, and an e
   room for; serving ctx 58112 (2.50 GiB) - pass --ctx-size to choose
 ```
 
+Only the chat model's context is chosen; embedding and reranking launches in the same serve keep
+theirs, and their plans count against the same room. The chosen context reaches llama-server as `-c`, so a
+client sees it as `n_ctx` in `/props` - the stderr line is only for whoever started serve.
+
 That is LFM3-1.7B-Q4_K_M on GTT 8 GiB with 0.5 GiB in use and 11 GiB available, as
 `tests/mem_admit_test.cpp` computes it; the same box with `--ctx-size 262144` is refused (6.38 GiB
 would land past its 6.00 GiB ceiling). With GTT 16 GiB and 26 GiB available the model's own context

@@ -403,6 +403,13 @@ inline Verdict judge(const Need& need, const sysinfo::Memory& mem, uint64_t rese
     return v;
 }
 
+// The -m of a llama-server command line ("" when there is none).
+inline std::string admit_model_path_of(const std::vector<std::string>& argv) {
+    for (size_t i = 0; i + 1 < argv.size(); i++)
+        if (argv[i] == "-m" || argv[i] == "--model") return argv[i + 1];
+    return "";
+}
+
 // engine#2986: the context serve gives an HRX llama-server that has no --ctx-size. llama-server takes the
 // model's own context then (HRX0 reports its whole pool free, so --fit does not shrink it), and a model
 // whose own context is far beyond the machine - LFM3-1.7B's 262,144 on a 16 GB laptop - either does not
@@ -420,8 +427,9 @@ struct CtxChoice {
     bool roomy = false;               // the chosen context keeps the program cache's room (false: the floor, which may not even fit)
 };
 
+// `others`: bytes the other launches of the same serve already need (their plans are judged together with this one).
 inline CtxChoice default_ctx(const std::vector<std::string>& argv, const sysinfo::Memory& mem,
-                             long long floor = kDefaultCtxFloor) {
+                             long long floor = kDefaultCtxFloor, uint64_t others = 0) {
     CtxChoice c;
     bool gpu = false;
     for (size_t i = 0; i < argv.size(); i++) {
@@ -434,14 +442,17 @@ inline CtxChoice default_ctx(const std::vector<std::string>& argv, const sysinfo
         std::vector<std::string> a = argv;
         if (ctx > 0) { a.push_back("-c"); a.push_back(std::to_string(ctx)); }
         add_llama_server(n, a);
+        n.total += others;
         return n;
     };
     const Need whole = plan(0);
     if (whole.parts.empty() || whole.n_ctx <= floor) return c;
     c.model_ctx = whole.n_ctx;
-    c.need_model = whole.total;
+    c.need_model = whole.total - others;
     if (judge(whole, mem).roomy) return c;
-    // the largest k*256 in [floor, model ctx) whose plan is roomy; the plan grows with the context
+    // the largest k*256 in [floor, model ctx) whose plan is roomy. A binary search, so it relies on the plan never
+    // shrinking as the context grows (roomy is then true up to one k and false above it); tests/mem_admit_test.cpp
+    // checks that over the whole grid for its fixture, so a step-shaped term added to the plan later fails there.
     long long lo = (floor + 255) / 256, hi = (whole.n_ctx - 1) / 256, ctx = 0;
     while (lo <= hi) {
         const long long mid = lo + (hi - lo) / 2;
@@ -450,7 +461,7 @@ inline CtxChoice default_ctx(const std::vector<std::string>& argv, const sysinfo
     c.roomy = ctx > 0;
     if (ctx == 0) ctx = floor;
     c.ctx = ctx;
-    c.need_ctx = plan(ctx).total;
+    c.need_ctx = plan(ctx).total - others;
     return c;
 }
 

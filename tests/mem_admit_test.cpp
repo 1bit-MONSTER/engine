@@ -401,6 +401,31 @@ int main() {
             admit::add_llama_server(big, a);
             expect("an explicit --ctx-size of 1,000,000 on the 16 GB machine is refused", !admit::judge(big, mm).fits);
         }
+        // #3013 review: the binary search is only right if roomy() is true up to one context and false above it. Check
+        // that over the whole 256-token grid of this fixture on the 16 GB machine: no roomy context above a rejected one.
+        {
+            const sysinfo::Memory mm = machine(8, 11);
+            bool seen_rejected = false, monotone = true;
+            for (long long k = admit::kDefaultCtxFloor; k < 262144; k += 256) {
+                std::vector<std::string> a = serve_argv;
+                a.insert(a.end(), {"-c", std::to_string(k)});
+                admit::Need n;
+                admit::add_llama_server(n, a);
+                const bool roomy = admit::judge(n, mm).roomy;
+                if (!roomy) seen_rejected = true;
+                else if (seen_rejected) monotone = false;
+            }
+            expect("roomy() over the 256-token grid is true up to one context and false above it", monotone && seen_rejected);
+        }
+        // other launches of the same serve count against the room: 512 MiB of them leave the chat model less
+        {
+            const admit::CtxChoice alone = admit::default_ctx(serve_argv, machine(8, 11));
+            const admit::CtxChoice beside = admit::default_ctx(serve_argv, machine(8, 11), admit::kDefaultCtxFloor, 512ull << 20);
+            std::printf("     16 GB machine, 512 MiB of other launches: ctx %lld (%.2f GiB) instead of %lld\n", beside.ctx,
+                        gib(beside.need_ctx), alone.ctx);
+            expect("other launches shrink the chosen context, which stays roomy, and the reported need is the chat model's own",
+                   beside.roomy && beside.ctx < alone.ctx && beside.need_model == alone.need_model);
+        }
         // strixhalo-sized: the model's own context is roomy, nothing changes
         expect("120 GiB box with 60 GiB in use: the model's own context stands",
                admit::default_ctx(serve_argv, box).ctx == 0);

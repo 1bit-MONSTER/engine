@@ -112,9 +112,15 @@ def self_test() -> int:
         (root / "registry" / "architectures.json").write_text(json.dumps({"architectures": archs}), encoding="utf-8")
         return root
 
-    sig = {"ReviewedForCausalLM": {"watch": "report"}}
-    archs = {"MappedForCausalLM": {"backends": ["hrx"]}}
-    counts = {"ReviewedForCausalLM": 7, "MappedForCausalLM": 100}
+    # engine#3046 review: the fixture needs a class that is BOTH `watch: "report"` and mapped. Without one, a flat read finds the
+    # same declined set as a nested read -- `MappedForCausalLM` is mapped but not reported, so it is not a candidate either way,
+    # and the arms stay green under the very bug they are meant to catch. `ReportedButMappedForCausalLM` is the class that makes
+    # the two readings differ: nested -> mapped, not declined; flat -> looks declined, and the count moves from 1 to 2.
+    sig = {"ReviewedForCausalLM": {"watch": "report"},
+           "ReportedButMappedForCausalLM": {"watch": "report"}}
+    archs = {"MappedForCausalLM": {"backends": ["hrx"]},
+             "ReportedButMappedForCausalLM": {"backends": ["hrx"]}}
+    counts = {"ReviewedForCausalLM": 7, "MappedForCausalLM": 100, "ReportedButMappedForCausalLM": 40}
 
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)

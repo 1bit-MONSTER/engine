@@ -2033,7 +2033,7 @@ target_link_libraries(audio_parallel_test PRIVATE onebit_npu Threads::Threads)
 # ci.yml's build list is not ours to edit without `workflow` scope, so these reach CI the way ops_dump_test does: as build
 # dependencies of a target it already builds (tools/ci/ci_targets_check.py follows this edge).
 # One line, deliberately: tools/ci/ci_targets_check.py follows `add_dependencies` line by line.
-add_dependencies(onebit audio_ops_test audio_mel_test onnx_graph_test audio_exec_test audio_parallel_test audio_pack_test audio_kernel_roles_test whisper_ids_test audio_device_gemm_test audio_npu_gemm_test audio_launch_plan_test audio_kernel_shapes whisper_transcribe)
+add_dependencies(onebit audio_ops_test audio_mel_test onnx_graph_test audio_exec_test audio_parallel_test audio_pack_test audio_kernel_roles_test whisper_ids_test audio_device_gemm_test audio_npu_gemm_test npu_rows_host_test audio_launch_plan_test audio_kernel_shapes whisper_transcribe)
 # A DFlash draft package as a model source (engine#1780): config + container -> a checked model whose tensors decode
 # one at a time. The loader is compiled here and not into onebit_npu because it needs the q4_1 tile decoder, which
 # lives with the forward (npu/forward/src/q4nx_dequant.c); it moves there with the draft's forward. Synthetic package,
@@ -2506,6 +2506,10 @@ add_test(NAME audio_kernel_roles COMMAND audio_kernel_roles_test)
 add_test(NAME audio_pack COMMAND audio_pack_test)
 add_test(NAME audio_device_gemm COMMAND audio_device_gemm_test)
 add_test(NAME audio_npu_gemm COMMAND audio_npu_gemm_test)
+# engine#1783: the batched int8 launch's host loops (threaded, AVX2) against the scalar loops they replace, device-free.
+add_executable(npu_rows_host_test tests/npu_rows_host_test.cpp)
+target_include_directories(npu_rows_host_test PRIVATE npu)
+add_test(NAME npu_rows_host COMMAND npu_rows_host_test)
 add_test(NAME audio_launch_plan COMMAND audio_launch_plan_test)
 add_test(NAME whisper_transcribe_jfk COMMAND whisper_transcribe)
 set_tests_properties(whisper_transcribe_jfk PROPERTIES

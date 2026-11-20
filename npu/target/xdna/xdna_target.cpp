@@ -22,6 +22,7 @@
 #include "target/xdna/xdna_target.h"
 #include "target/xdna/elf_twin.h"   // engine#2599: a prefill ELF that is its own _m16 twin
 #include "target/xdna/launch_fit.h"   // engine#1783: refuse a launch its context cannot hold
+#include "target/xdna/rows_host.h"   // engine#1783: the batched launch's host loops, threaded and AVX2, bit-identical
 #include "batch_width.h"
 #include "file_create.h"   // dumps are created 0600, never through a symlink
 
@@ -1363,15 +1364,10 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     // implies the layout -- but the condition names both, because leaving `ascales` at its value-initialised zeros
     // (a `std::vector<float>(M)` is all zeros) on any other path would change numerics silently rather than fail.
     if (!(hadamard_ && pb16i_)) {
-        for (int m = 0; m < M; m++) {
-            const float* row = A + (size_t)m * K;
-            float amax = 0.0f;
-            for (int k = 0; k < K; k++) {
-                const float a = std::fabs(row[k]);
-                if (a > amax) amax = a;
-            }
-            ascales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
-        }
+        // engine#1783: the same per-row scale, rows split over threads and |a| maxed 8 wide (rows_host.h says why the
+        // result is the same float); a decode launch (M < 64) stays serial.
+        namespace rh = npu::target::xdna::rows_host;
+        rh::amax_scales(A, M, K, ascales.data(), rh::use_avx2(), rh::threads_for(M));
     }
     // Rows > 1 is prefill and keeps the M=128 kernel (one launch per chunk); a
     // single row here is a decode step and gets the M=16 twin, exactly like
@@ -1593,13 +1589,8 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     {
         float* const obase = to_dst ? ar.dst : out.data();
         const int oN = to_dst ? ar.dst_n : N, oLD = to_dst ? ar.dst_ld : N;
-        for (int m = 0; m < M; m++) {
-            const int32_t* cm = kctx.Cm + (size_t)m * kctx.ND;
-            const float asc = ascales[(size_t)m];
-            float* o = obase + (size_t)m * oLD;
-            for (int n = 0; n < oN; n++)
-                o[n] = (float)cm[n] * asc * (*gs)[(size_t)n];
-        }
+        namespace rh = npu::target::xdna::rows_host;
+        rh::dequant(kctx.Cm, kctx.ND, M, oN, ascales.data(), gs->data(), obase, oLD, rh::use_avx2(), rh::threads_for(M));
     }
     if (m16_check_ && &kctx != &ctx && kctx.w4g32 == ctx.w4g32)
         m16_check_gemm_rows(ctx, kctx, A, M, K, N, slot ? slot_bo(*slot, kctx) : nullptr,

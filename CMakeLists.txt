@@ -531,6 +531,10 @@ add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_te
 # that has none, so the sixth field cannot slip through the same way.
 add_python_test(serve_field_census ${CMAKE_SOURCE_DIR}/tools/ci/serve_field_census.py --root ${CMAKE_SOURCE_DIR})
 add_python_test(serve_field_census_self ${CMAKE_SOURCE_DIR}/tools/ci/serve_field_census.py --self-test)
+# engine#2916: the pair check's self-test, wired because a tool with a --self-test that no
+# runner names is a self-test nobody runs (tool_selftest_wired_check says so, and it said so
+# about this file in the PR's first build).
+add_python_test(loomc_pair_check_self ${CMAKE_SOURCE_DIR}/tools/ci/loomc_pair_check.py --self-test)
 # engine#2878: the fold tool is only useful if its output is something llama-hadamard.cpp can run,
 # and that is what this row checks; it had no runner, so tests_referenced named it.
 add_python_test(hadamard_fold_test ${CMAKE_SOURCE_DIR}/tests/hadamard_fold_test.py)

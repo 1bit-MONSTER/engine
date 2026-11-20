@@ -125,10 +125,10 @@ int main() {
         std::printf("SKIP: init_host failed for the batched instance (%s)\n", fwd.last_error());
         return 77;
     }
-    // A container whose per-sequence state is more than its KV cache cannot share a pass, and then the one thing to
-    // check is that step_users() says so by name instead of answering. A model let through by mistake does not crash:
-    // it returns rows that are not that sequence's own (short-convolution layers did, until the review of engine#2978's
-    // fix), which is what the rest of this file fails on when the predicate and the refusal disagree.
+    // A container whose per-sequence state is not kept per slot cannot share a pass, and then the one thing to check
+    // is that step_users() says so by name instead of answering. A model let through by mistake does not crash: it
+    // returns rows that are not that sequence's own (short-convolution layers did, before each slot had its own
+    // windows), which is what the rest of this file fails on when the predicate and the pass disagree.
     if (!fwd.step_users_supported()) {
         std::vector<float> all;
         if (fwd.step_users({1, 2}, {0, 1}, {0, 0}, all) || !all.empty()) {
@@ -415,6 +415,97 @@ int main() {
         if (at >= 0) {
             std::printf("FAIL a refused pass changed the slot it refused: logit %d is %.9g, its own run says %.9g\n", at,
                         row[(size_t)at], want0[(size_t)at]);
+            return 1;
+        }
+
+        // A PASS THAT FAILS AFTER IT STARTED leaves the slots it carried empty, and says so. The layers it reached hold
+        // this pass's rows and the others do not, so continuing would read rows of a pass that never completed; the
+        // slot's old length must not survive it. NPU_NO_BATCH makes the batched body refuse a step_users pass after the
+        // entry checks, which is the cheapest failure there is that happens inside the pass. Slot 2 is in the pass;
+        // slot 1 is not and must keep everything.
+        {
+            const int next2 = pos2 + 1;   // where slot 2's sequence ends now
+            const int next1 = int(third.size());
+            setenv("NPU_NO_BATCH", "1", 1);
+            const bool ran = fwd.step_users({27}, {next2}, {2}, row);
+            const std::string said = fwd.last_error();
+            unsetenv("NPU_NO_BATCH");
+            if (ran) {
+                std::printf("FAIL a pass ran with NPU_NO_BATCH set, so this arm has no failing pass to look at\n");
+                return 1;
+            }
+            if (said.find("emptied") == std::string::npos) {
+                std::printf("FAIL a failed pass does not say what it did to its slots: %s\n", said.c_str());
+                return 1;
+            }
+            if (fwd.step_users({27}, {next2}, {2}, row)) {
+                std::printf("FAIL a slot continued from where it was before a pass that failed\n");
+                return 1;
+            }
+            if (std::string(fwd.last_error()).find("holds 0 position(s)") == std::string::npos) {
+                std::printf("FAIL the slot of a failed pass is not empty: %s\n", fwd.last_error());
+                return 1;
+            }
+            // The slot starts again at 0 and answers as a fresh run does ...
+            std::vector<float> all2;
+            if (!fwd.step_users(third, {0, 1, 2}, {2, 2, 2}, all2) || all2.size() != third.size() * width) {
+                std::printf("FAIL the slot of a failed pass did not start again at position 0: %s\n", fwd.last_error());
+                return 1;
+            }
+            const std::vector<float> got2(all2.end() - (long)width, all2.end());
+            int at2 = first_difference(got2, want1);   // want1 is a fresh run of `third`, from above
+            if (at2 >= 0) {
+                std::printf("FAIL the slot of a failed pass did not start clean: logit %d is %.9g, a fresh run says %.9g\n",
+                            at2, got2[(size_t)at2], want1[(size_t)at2]);
+                return 1;
+            }
+            // ... and the slot that was not in the failed pass continues its own sequence.
+            std::vector<float> want_n;
+            if (!fresh1.step(34, next1, want_n) || !fwd.step_users({34}, {next1}, {1}, row)) {
+                std::printf("FAIL a slot outside the failed pass: %s / %s\n", fresh1.last_error(), fwd.last_error());
+                return 1;
+            }
+            at2 = first_difference(row, want_n);
+            if (at2 >= 0) {
+                std::printf("FAIL a failed pass changed a slot it did not carry: logit %d is %.9g, its own run says %.9g\n",
+                            at2, row[(size_t)at2], want_n[(size_t)at2]);
+                return 1;
+            }
+        }
+    }
+
+    // The single-sequence path, for the same question: an instance that has served one conversation and is given a new
+    // prompt at position 0 answers as a fresh instance does -- in one batch, and in two chunks, which is how a serve
+    // sends a prompt longer than one pass. This is what every request of a serve without --npu-batch-users does, and on
+    // a short-convolution model it is the convolution windows that have to be cleared with the K/V.
+    {
+        const std::vector<int> second = {21, 22, 23, 24};
+        Q4nxNpuForward fresh;
+        std::vector<float> want, got;
+        if (!init(fresh, d) || !fresh.step_batch(second, 0, want) || want.empty()) {
+            std::printf("FAIL fresh reference for the single-sequence restart: %s\n", fresh.last_error());
+            return 1;
+        }
+        Q4nxNpuForward& used = *ref[0];   // has served prompts[0] and its decode rounds
+        if (!used.step_batch(second, 0, got)) {
+            std::printf("FAIL a second request on a used instance: %s\n", used.last_error());
+            return 1;
+        }
+        int at = first_difference(got, want);
+        if (at >= 0) {
+            std::printf("FAIL a second request on a used single-sequence instance is not a fresh run: logit %d is %.9g, "
+                        "fresh says %.9g\n", at, got[(size_t)at], want[(size_t)at]);
+            return 1;
+        }
+        const std::vector<int> head(second.begin(), second.begin() + 2), tail(second.begin() + 2, second.end());
+        if (!used.step_batch(head, 0, got) || !used.step_batch(tail, int(head.size()), got)) {
+            std::printf("FAIL a second request sent in two chunks: %s\n", used.last_error());
+            return 1;
+        }
+        at = first_difference(got, want);
+        if (at >= 0) {
+            std::printf("FAIL a second request sent in two chunks is not a fresh run: logit %d is %.9g, fresh says %.9g\n",
+                        at, got[(size_t)at], want[(size_t)at]);
             return 1;
         }
     }

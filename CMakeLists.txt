@@ -2962,13 +2962,23 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:step_users_test>)
     set_tests_properties(step_users PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
-    # The same test on the fabricated LFM2 hybrid: short-convolution layers keep a per-sequence window that is not KV, so
-    # the model must be refused by name. Before the refusal existed this row failed on its first decode row (a slot read
-    # the window another slot's row had left).
+    # The same test on the fabricated LFM2 and LFM3 hybrids: short-convolution layers keep a per-sequence window that is
+    # not KV, and each slot has its own, so every row must be bit-identical to its own single-sequence run here too.
+    # With one window for the whole model these rows fail on their first decode row (a slot reads the window another
+    # slot's row left).
     add_test(NAME step_users_lfm2
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:step_users_test> lfm2)
     set_tests_properties(step_users_lfm2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    add_test(NAME step_users_lfm3
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:step_users_test> lfm3)
+    set_tests_properties(step_users_lfm3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # And on the fabricated qwen3_5 hybrid, whose linear-attention state is NOT per slot: refused by name, no rows.
+    add_test(NAME step_users_refused
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:step_users_test> qwen3_5)
+    set_tests_properties(step_users_refused PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     add_executable(npu_batch_slot_reuse_test tests/npu_batch_slot_reuse_test.cpp)
     target_include_directories(npu_batch_slot_reuse_test PRIVATE app)
     target_link_libraries(npu_batch_slot_reuse_test PRIVATE onebit_npu_forward_ci)
@@ -2977,6 +2987,16 @@ if(ONEBIT_NPU_HOST AND NOT ONEBIT_NPU AND NOT WIN32 AND Python3_Interpreter_FOUN
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
                      $<TARGET_FILE:npu_batch_slot_reuse_test>)
     set_tests_properties(npu_batch_slot_reuse PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # The same hand-over on the short-convolution hybrids: the second request on a slot must not start inside the first
+    # one's convolution window, and the neighbour's window must survive it.
+    add_test(NAME npu_batch_slot_reuse_lfm2
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:npu_batch_slot_reuse_test> lfm2)
+    set_tests_properties(npu_batch_slot_reuse_lfm2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    add_test(NAME npu_batch_slot_reuse_lfm3
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/batch_check_state_ci.py
+                     $<TARGET_FILE:npu_batch_slot_reuse_test> lfm3)
+    set_tests_properties(npu_batch_slot_reuse_lfm3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # engine#1786: the bidirectional gemma3 encoder (Embedding-Gemma-300M-NPU2's layout: BF16 projections, unprefixed
     # names, pre-scaled embedding, raw norms, a sliding and a full layer) through embed_pooled(), against a numpy
     # encoder on the same weights, and an over-long input refused by name.

@@ -63,6 +63,26 @@ def fork_dir(path: Path) -> Path:
     return nested if nested.is_dir() else path
 
 
+def source_files(fork: Path):
+    """Every `*.cpp`/`*.h` under the fork's ggml-hrx, not only the ones directly in it.
+
+    engine#2916 review (mine): the first version globbed one directory, so the 216 sources
+    in `runtime/`, `dispatch_registration/`, `graph/` and `hip/` were never read -- and
+    `runtime/loom-kernel-jit.cpp` is exactly where a `loomc_` call would go next. A tree
+    with a use there answered `ok` about a tree it had not looked at. Dotted and build
+    directories are skipped: an in-tree build writes generated sources, and a census of
+    those is a census of the compiler, not of the fork.
+    """
+    out = []
+    for path in sorted(fork.rglob("*")):
+        if path.suffix not in (".cpp", ".h") or not path.is_file():
+            continue
+        if any(part.startswith(".") or part.startswith("build") for part in path.relative_to(fork).parts[:-1]):
+            continue
+        out.append(path)
+    return out
+
+
 def symbols_used(fork: Path):
     """`loomc_*` names the fork's ggml-hrx sources mention.
 
@@ -88,7 +108,7 @@ def symbols_used(fork: Path):
     """
     fork = fork_dir(fork)
     unconditional, conditional = set(), set()
-    for f in sorted(fork.glob("*.cpp")) + sorted(fork.glob("*.h")):
+    for f in source_files(fork):
         text = f.read_text(errors="replace")
         text = re.sub(r"//[^\n]*", " ", text)
         text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
@@ -276,6 +296,23 @@ def self_test():
         chk(missing == ["loomc_after_the_guard"],
             "a use AFTER #endif is unconditional again, not swallowed by the guard")
         chk(CONDITIONAL == {"loomc_guarded_symbol"}, "…and the conditional list holds only the guarded one")
+
+        # a use one directory down is still a use: the 216 sources in runtime/, graph/,
+        # dispatch_registration/ and hip/ were invisible to the first version (engine#2916
+        # review, mine), and `runtime/loom-kernel-jit.cpp` is where such a call would go next
+        (fork / "runtime").mkdir(exist_ok=True)
+        (fork / "runtime" / "loom-kernel-jit.cpp").write_text("using N = loomc_nested_symbol;\n")
+        (fork / "loom-jit.cpp").write_text("using A = loomc_real_one;\n")
+        missing, _, _ = check(fork, hrx)
+        chk(missing == ["loomc_nested_symbol"], "a use one directory down is read, not skipped")
+        chk(CONDITIONAL == set(), "…and it is not mistaken for a guarded one")
+        # …while an in-tree build's generated sources are not the fork's sources
+        (fork / "build-hip").mkdir(exist_ok=True)
+        (fork / "build-hip" / "generated.cpp").write_text("using B = loomc_generated_symbol;\n")
+        missing, _, _ = check(fork, hrx)
+        chk(missing == ["loomc_nested_symbol"], "a build directory's generated sources are skipped")
+        (fork / "runtime" / "loom-kernel-jit.cpp").unlink()
+        (fork / "build-hip" / "generated.cpp").unlink()
 
         # the llama.cpp ROOT is as valid an argument as the module dir: this check
         # first failed on the real tree because it accepted only the latter

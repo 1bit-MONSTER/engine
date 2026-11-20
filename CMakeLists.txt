@@ -2674,7 +2674,10 @@ if(ONEBIT_NPU)
     # with no ELF registers a skip rather than a red row, the same rule as the other device-dependent rows.
     add_executable(npu_dmabuf_import_test tests/npu_dmabuf_import_test.cpp)
     target_link_libraries(npu_dmabuf_import_test PRIVATE onebit_npu_lane)
-    add_test(NAME npu_dmabuf_import COMMAND npu_dmabuf_import_test "")
+    # No argument, so the row SKIPS (77). It used to be registered with an empty string, which the test's `argc < 2` guard
+    # does not see -- argv[1] was "" and the row failed with `invalid program file (code 401)` instead of skipping, on every
+    # box without an ELF to pass (engine#3003 review).
+    add_test(NAME npu_dmabuf_import COMMAND npu_dmabuf_import_test)
     set_tests_properties(npu_dmabuf_import PROPERTIES SKIP_RETURN_CODE 77)
 
     # The w4g32 prefill kernel (q4nx_w4g32.h, NPU_W4_PREFILL), bit-exact on the device against the CPU reference over a

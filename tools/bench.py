@@ -195,9 +195,9 @@ def main():
             "model": args.model, "configs": {n: shlex.join(a) for n, a in configs}, "baseline": base,
             "rounds": args.rounds, "prompt_chars": len(prompt), "results": results,
             "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "provenance": provenance(shlex.split(configs[base][0])[0] if configs.get(base) else None)},
+            "provenance": provenance(configs[0][1][0] if configs and configs[0][1] else None)},
             indent=1))
-        pv = provenance(shlex.split(configs[base][0])[0] if configs.get(base) else None)
+        pv = provenance(configs[0][1][0] if configs and configs[0][1] else None)
         print(f"provenance: rev {pv['engine_rev']} (dirty {pv['engine_dirty']}), "
               f"binary sha256 {pv['binary_sha256'][:16]}...")
     if lock:

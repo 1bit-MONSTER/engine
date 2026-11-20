@@ -15,6 +15,9 @@
 # limitations under the License.
 """pr_branch_stale_check: an open PR whose branch is behind main would REVERT what landed since it was cut.
 
+Exit: 0 every open PR merges without removing lines main has; 1 at least one would; 2 CANNOT TELL -- an unreadable PR list, a full
+page (truncation), or a branch whose ref could not be fetched. A 0 means every branch was read.
+
 GitHub shows a PR against its merge-base, so a stale branch reads as a clean additive diff on the page while the merge applies
 `git diff origin/main origin/<branch>` — which deletes everything the base gained in between. On 2026-11-20 seven of seven engine
 PRs reviewed carried a stale base; one displayed `+596/-0` and would have deleted 1475 lines, including a copyright exemption and
@@ -24,6 +27,21 @@ The signal is DELETIONS, not distance. `behind 1` with no deletions is the ordin
 not a finding; a branch that is behind AND whose merge deletes lines is the one that reverts a day's work.
 """
 import argparse, json, pathlib, subprocess, sys
+
+EXIT_CLEAN, EXIT_FINDING, EXIT_CANNOT_TELL = 0, 1, 2
+
+def cannot_tell(why):
+    """Exit 2, never 1: an unreadable queue is not a finding and not a pass (engine#2992 review)."""
+    print(f"pr_branch_stale_check: {why} -- cannot tell, not a pass", file=sys.stderr)
+    raise SystemExit(EXIT_CANNOT_TELL)
+
+
+def verdict_exit(unreadable, findings):
+    """The exit code for a finished run, as a pure function so the table can be asserted without a network or a fixture."""
+    if unreadable:
+        return EXIT_CANNOT_TELL
+    return EXIT_FINDING if findings else EXIT_CLEAN
+
 
 def run(*a, cwd=None):
     r = subprocess.run(a, capture_output=True, text=True, cwd=cwd)
@@ -36,12 +54,11 @@ def open_prs(repo):
     rc, out, err = run("gh", "pr", "list", "-R", repo, "--state", "open", "--limit", str(PAGE),
                        "--json", "number,headRefName")
     if rc != 0:
-        raise SystemExit(f"pr_branch_stale_check: cannot list {repo} PRs (rc {rc}): {err.strip()} -- cannot tell, not a pass")
+        cannot_tell(f"cannot list {repo} PRs (rc {rc}): {err.strip()}")
     prs = [(p["number"], p["headRefName"]) for p in json.loads(out or "[]")]
     if len(prs) >= PAGE:
         # engine#2992 review: the queue has run at 20-30, so a full page is close enough that an unchecked PR is plausible.
-        raise SystemExit(f"pr_branch_stale_check: {len(prs)} open PRs is the whole page -- the list may be truncated, so this is "
-                         f"a cannot-tell (raise PAGE) rather than a clean run")
+        cannot_tell(f"{len(prs)} open PRs is the whole page -- the list may be truncated (raise PAGE)")
     return prs
 
 def stale_finding(repo_dir, branch, base="origin/main"):
@@ -157,6 +174,13 @@ def self_test():
     g("commit", "-qam", "the branch already carries gamma")
     chk(stale_finding(d.name, "mine") is None,
         "behind by ancestry but identical in content is NOT a finding")
+
+    # engine#2992 review: no arm exercised the EXIT TABLE, which is how an unreadable queue came to report itself as a finding
+    # (rc 1) and a fetch failure as a clean run (rc 0). These need no git fixture and no network.
+    chk(verdict_exit(unreadable=False, findings=0) == 0, "exit table: clean run is 0")
+    chk(verdict_exit(unreadable=False, findings=2) == 1, "exit table: a finding is 1")
+    chk(verdict_exit(unreadable=True, findings=0) == 2, "exit table: an unreadable queue is 2, not a clean 0")
+    chk(verdict_exit(unreadable=True, findings=3) == 2, "exit table: cannot-tell outranks findings -- both need looking, one needs a rerun")
     return 0 if ok else 1
 
 
@@ -169,26 +193,36 @@ def main():
     if a.self_test:
         return self_test()
     root = pathlib.Path(a.root).resolve()
-    bad = 0
+    findings, unreadable = 0, []
     for n, branch in open_prs(a.repo):
-        run("git", "fetch", "-q", "origin", branch, cwd=root)
-        f = stale_finding(root, f"origin/{branch}")
+        ref = f"origin/{branch}"
+        rc, _out, err = run("git", "fetch", "-q", "origin", branch, cwd=root)
+        if rc != 0:
+            # engine#2992 review: this used to fall through to `stale_finding` returning None, which printed "removes nothing
+            # main has" and exited 0 -- a 0 that meant "could not look". A branch that cannot be fetched is a cannot-tell.
+            unreadable.append(f"#{n} {branch}: cannot fetch the branch ({err.strip().splitlines()[0] if err.strip() else 'fetch failed'})")
+            print(f"#{n} {branch}: CANNOT READ -- the branch could not be fetched, so nothing was measured", file=sys.stderr)
+            continue
+        f = stale_finding(root, ref)
         if f is None:
-            # `stale_finding` returns None both for "not behind" and for "the merge removes nothing"; the second is the ordinary
-            # behind-branch case and needs no row. There is no separate `deleted == 0` case to print (engine#2992 review).
             print(f"#{n} {branch}: merging this branch removes nothing main has")
             continue
         behind, deleted, files = f
-        bad += 1
+        findings += 1
         print(f"#{n} {branch}: BEHIND {behind}; merging it DELETES {deleted} line(s) main has, in {len(files)} file(s): "
               f"{', '.join(files[:3])}{' …' if len(files) > 3 else ''}", file=sys.stderr)
-    if bad:
-        print(f"pr_branch_stale_check: {bad} open PR(s) would delete lines main has "
+    if findings:
+        print(f"pr_branch_stale_check: {findings} open PR(s) would delete lines main has "
               f"(measured with `git merge-tree --write-tree`, not a two-dot diff) -- rebase or re-cut before merging",
               file=sys.stderr)
-        return 1
-    print("pr_branch_stale_check: no open PR would revert main")
-    return 0
+    elif not unreadable:
+        print("pr_branch_stale_check: no open PR would revert main (every branch was read)")
+    rc = verdict_exit(unreadable, findings)
+    if rc == EXIT_CANNOT_TELL:
+        print(f"pr_branch_stale_check: {len(unreadable)} of the open PR(s) could not be read, so this is not a clean run",
+              file=sys.stderr)
+    return rc
+
 
 if __name__ == "__main__":
     sys.exit(main())

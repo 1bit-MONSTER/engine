@@ -345,7 +345,13 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     try {
         // Both read here, not before: a wrong type must be the 400 below, not a json::type_error that escapes
         // the guard and answers 500 with an empty body (engine#1106).
-        max_tokens = npu::int_field(body, "max_completion_tokens", npu::int_field(body, "max_tokens", 256));
+        // engine#2884: `n_predict` is llama.cpp's name for this limit, and `/completion` is llama.cpp's route -- which
+        // this server now registers (#2855). Without the alias a client written for llama-server posts `n_predict`,
+        // gets a 200, and is served 256 tokens; the two warm-ups in app/serve.cpp are exactly that client, so their
+        // 0- and 2-token requests were generating 256. OpenAI's field stays first, so nothing that works today moves.
+        max_tokens = npu::int_field(body, "max_completion_tokens",
+                                    npu::int_field(body, "n_predict",
+                                                   npu::int_field(body, "max_tokens", 256)));
         opts = npu::options_from_body(body);
         // logprobs is served in the chat shape; the legacy /v1/completions shape is a different
         // object this route does not implement, and a silently dropped field is what it must not do.

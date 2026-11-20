@@ -498,30 +498,33 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // full-length hit: the answer is drawn from the last position's logits and a snapshot holds
         // state, not logits, so that token is run again.
         int resume = 0;
-        if (!cache_prompt && e.prefix && e.prefix->enabled()) {
-            // A refusal to consult the cache is a decision, so the [prefix] line below says so rather than staying
-            // silent: "no slot" and "you asked for no slot" must not read the same in a log (#650).
-            stats.prefix = npu::PrefixDecision{-1, 0, "cache_prompt: false"};
-        }
-        if (cache_prompt && e.prefix && e.prefix->enabled()) {
-            const npu::PrefixDecision d = e.prefix->lookup(cache_ids);
-            stats.prefix = d;
-            // One token short of both the slot and the prompt: the snapshot stops one token short (see the save
-            // below), and the last token is run again for the logits the answer is drawn from.
-            const int want = npu::resume_point(d, ids.size());
-            // The forward clears itself only when a batch starts at 0 (step_batch), and a resumed
-            // prefill starts above 0, so the previous request's state has to go first.
-            if (d.slot >= 0 && want > 0) {
-                e.fwd->reset();
-                if (e.fwd->restore_state(e.prefix_state[size_t(d.slot)], want)) {
-                    resume = want;
-                    stats.prefix.cached_tokens = resume;
-                } else {
+        if (e.prefix && e.prefix->enabled()) {
+            if (!cache_prompt) {
+                // A refusal to consult the cache is a decision, and the single line below prints it like any other:
+                // "no slot" and "you asked for no slot" must not read the same in a log (#650).
+                stats.prefix = npu::PrefixDecision{-1, 0, "cache_prompt: false"};
+            } else {
+                const npu::PrefixDecision d = e.prefix->lookup(cache_ids);
+                stats.prefix = d;
+                // One token short of both the slot and the prompt: the snapshot stops one token short (see the save
+                // below), and the last token is run again for the logits the answer is drawn from.
+                const int want = npu::resume_point(d, ids.size());
+                // The forward clears itself only when a batch starts at 0 (step_batch), and a resumed
+                // prefill starts above 0, so the previous request's state has to go first.
+                if (d.slot >= 0 && want > 0) {
                     e.fwd->reset();
-                    stats.prefix = npu::PrefixDecision{-1, 0, "slot has no usable state"};
+                    if (e.fwd->restore_state(e.prefix_state[size_t(d.slot)], want)) {
+                        resume = want;
+                        stats.prefix.cached_tokens = resume;
+                    } else {
+                        e.fwd->reset();
+                        stats.prefix = npu::PrefixDecision{-1, 0, "slot has no usable state"};
+                    }
                 }
             }
-            // One line per decision, as FLM logs it, so the behaviour is checkable without a debugger.
+            // One line per decision, as FLM logs it, so the behaviour is checkable without a debugger. Deliberately
+            // outside the consult branch: the print used to live inside it, so the one decision that most needs
+            // explaining -- the refusal -- was the one that printed nothing (engine#2895).
             std::fprintf(stderr, "[prefix] slot=%d cached=%d of %zu reason=%s\n", stats.prefix.slot,
                          stats.prefix.cached_tokens, ids.size(), stats.prefix.reason.c_str());
         }

@@ -116,7 +116,7 @@ def _gaps(stamped):
 
 
 def timelines(observations, gap_seconds=3600):
-    """[(addr, seconds_of_day)] -> {addr: (first, last, count, kept)}, longest-lived first.
+    """[(addr, seconds_of_day)] -> [(first, last, count, span)], longest-lived first.
 
     The 2026-11-20 measurement on this box is why this exists: the NVMe fault
     stream had decayed from 1 303 faults over 91 addresses to 71 over FIVE, and
@@ -126,17 +126,23 @@ def timelines(observations, gap_seconds=3600):
     together" -- and a set that stops together points at one owner (a process
     exiting, an fd closing, a munmap), which independent pages would not.
     """
+    # engine#2478 review: `min`/`max` on raw seconds-of-day loses the wrap. A stream that starts at 23:00 and ends at
+    # 01:00 is 2 h, but ordering those stamps before differencing reports 22 h -- and the `span < 0` rollover guard
+    # below was unreachable, because `last` was already >= `first` by construction. This log has no year and the stream
+    # is hours wide, so crossing midnight is the ordinary case. Unwrap each stamp against the first one seen for its
+    # address, and keep `last` in unwrapped seconds (a 25 h stream then prints 25:00:00, which is true).
     spans = {}
     for addr, t in observations:
-        first, last, n = spans.get(addr, (t, t, 0))
-        spans[addr] = (min(first, t), max(last, t), n + 1)
-    out = []
-    for addr, (first, last, n) in spans.items():
-        span = last - first
-        if span < 0:
-            span += 24 * 3600          # a syslog without a year rolls over midnight
-        out.append({"address": addr, "first": first, "last": last,
-                    "count": n, "span_s": span})
+        if addr not in spans:
+            spans[addr] = [t, t, 1]                     # first, last, count
+            continue
+        u = spans[addr]
+        while t < u[0]:
+            t += 24 * 3600
+        u[1] = max(u[1], t)
+        u[2] += 1
+    out = [{"address": a, "first": f, "last": l, "count": n, "span_s": l - f}
+           for a, (f, l, n) in spans.items()]
     out.sort(key=lambda r: (-r["span_s"], -r["count"]))
     return out
 
@@ -387,6 +393,23 @@ def self_test():
     chk(first["count"] == 3, "each address keeps its own count")
     chk(first["span_s"] == 5 * 3600 + 36 * 60 + 22, "the span is last minus first, per address")
     chk(timelines([]) == [], "no observations -> no timeline rows")
+
+    # engine#2478 review: a stream that crosses midnight. Ordering raw seconds-of-day before differencing reported the
+    # complement of the span (22 h for a 2 h stream) and made the `span < 0` guard unreachable; the stamps are unwrapped
+    # against the first one per address now.
+    midnight = timelines([("0xaa00", 23 * 3600), ("0xaa00", 1 * 3600)])
+    chk(midnight[0]["span_s"] == 2 * 3600,
+        "23:00 -> 01:00 is a 2 h span, not the 22 h complement")
+    chk(midnight[0]["count"] == 2, "and the wrap does not change the count")
+    # A wrap is only readable from log ORDER: the stamp before midnight is the earlier one. Feeding the post-midnight
+    # stamp first is not a log, and it is read as 22 h -- stated here so the dependency is pinned rather than implied.
+    reversed_order = timelines([("0xaa00", 1 * 3600), ("0xaa00", 23 * 3600)])
+    chk(reversed_order[0]["span_s"] == 22 * 3600,
+        "... and a wrap is read from log order: post-midnight first is 22 h (not a log, but pinned)")
+    # The limit, pinned rather than implied: this log has no year, so a stream wider than a day cannot be expressed.
+    # Two stamps an hour apart are read as one hour -- the next-day reading would fit the same two numbers.
+    chk(timelines([("0xbb00", 2 * 3600), ("0xbb00", 3 * 3600)])[0]["span_s"] == 3600,
+        "a stream wider than 24 h is not expressible in this log, and is read as the shorter span")
 
     block = render_timelines(rows)
     chk("address(es), longest-lived first" in block, "the block names its ordering")

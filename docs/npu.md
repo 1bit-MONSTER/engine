@@ -520,6 +520,19 @@ third, which moves only the probabilities. Any other scale-like key (`*scale*`, 
 `*mup*`) is warned about, not fatal. `scripts/check_repack_config.py` runs the same scan on its
 own, with a negative control.
 
+**The repacked weights are verified, not assumed.** After the write, `scripts/repack_gguf.py` decodes
+what the converter produced and compares it with the GGUF it came from
+(`tools/q4nx_diff.py decode --layout both`, CPU only, no device). A converter that writes tiles in a
+*different order* repacks "successfully", passes every structural check, loads, and answers noise with
+nothing in any log — measured on two checkouts of the same converter, which differ by two orders of
+magnitude at the weight level (4.1e-2 requantization error against the GGUF versus 2.0e0 for the tiles
+that are not these weights). So the repack **fails `rc=1`** when no layout explains the tiles and names
+the converter and its commit from `repack-stamp.txt`; `rc=2` from the checker (an architecture whose
+tensor names it does not know) is a warning, not a failure, and `ONEBIT_REPACK_VERIFY=0` accepts an
+unverified container. Pin the converter by **commit**, not by path: three trees of the same converter
+behaved three different ways on this box on 2026-11-05 (two interchangeable, one writing unusable tiles,
+one failing to import), and `repack-stamp.txt` records which one produced a directory.
+
 A cached directory is checked again on every hit, with the same metadata-only scan, and it is
 rebuilt if the scan fails or if its `repack-stamp.txt` (converter path and commit, architecture,
 repack script) names a different converter than this build would use (`repack_gguf.py

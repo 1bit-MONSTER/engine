@@ -445,6 +445,38 @@ def main():
         return 1
     print("[OK] every known-critical scale-like key the GGUF declares is carried in config.json")
     print(f"config.json: {cfg}")
+
+    # (engine#1109) A wrong Q4NX converter checkout repacks "successfully" and writes tiles in an order
+    # this engine cannot read: the container loads, every structural check above passes, and the model
+    # answers noise with nothing in any log.  Measured on this box: two checkouts of the same converter
+    # (one good, one at d1d5232) differ by two orders of magnitude at the weight level -- 4.1e-2 requant
+    # error against the GGUF versus 2.0e0 noise -- so the honest guard is to decode what we just wrote and
+    # compare it with the GGUF it came from, not to identify the converter.  tools/q4nx_diff.py does
+    # exactly that (CPU only, no device) and its `--layout both` verdict already tolerates requantization.
+    # rc 0 = a layout explains these weights; rc 1 = none does; rc 2 = nothing comparable was found (an
+    # arch whose tensor names the checker does not know), which is "cannot tell" and must not fail a repack.
+    if os.environ.get("ONEBIT_REPACK_VERIFY", "1") not in ("0", "false", "no"):
+        checker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "q4nx_diff.py")
+        if not os.path.exists(checker):
+            print("[WARN] no tools/q4nx_diff.py beside this script: the repacked weights were not verified")
+        else:
+            _v = subprocess.run([sys.executable, checker, "decode", "--gguf", gguf, "--q4nx", out_dir,
+                                 "--layout", "both", "--tensor", "blk.0"],
+                                capture_output=True, text=True)
+            _line = (_v.stdout.strip().splitlines() or [""])[-1]
+            if _v.returncode == 0:
+                print(f"[OK] the container decodes to the GGUF's own weights ({_line})")
+            elif _v.returncode == 2:
+                print("[WARN] the repacked weights could not be verified "
+                      f"({_line or _v.stderr.strip()[:120]}); this is not a failure, but nothing checked them")
+            else:
+                print(f"[FAIL] the container this converter wrote does not decode to the GGUF's weights "
+                      f"({_line}).  The repack 'succeeded' and the tiles are in an order this engine cannot "
+                      f"read: it would load and answer noise with no error.  Converter: {converter_dir} "
+                      f"@ {converter_commit()} (repack-stamp.txt records it).  Use a converter that writes "
+                      f"this engine's q4_1 tile order, or set ONEBIT_REPACK_VERIFY=0 to accept an unverified "
+                      f"container (engine#1109)")
+                return 1
     print("repack complete")
     return 0
 

@@ -56,6 +56,7 @@ import os
 import collections
 import re
 import sys
+import time
 
 # Anchored on the timestamp, NOT on the task name: a task name can contain a space ("next-server (v1-8386"), and
 # anchoring on `^\s+\S+\s+\[` silently dropped 2,176 of 115,941 map lines on a real capture -- 1.9 %, which is
@@ -605,6 +606,17 @@ def self_test() -> int:
     _out = _b.getvalue()
     chk("0x1e8455000" in _out and "0x1dd3de000" not in _out,
         "the page class comes from the mapping BEFORE the fault, not the last one in the file")
+    # engine#2478 / #2703 follow-up: the class is read NOW, so the report must date itself. Without this an old capture
+    # gets a confident class for whatever owns the frame at analysis time -- a reading with no date.
+    chk("read from /proc/kpageflags NOW" in _out and "this capture is" in _out,
+        "the page-class report says the class is read now, and how old its capture is")
+    _oldcap = pathlib.Path(tempfile.mkdtemp()) / "old.txt"
+    _oldcap.write_text(pf.read_text())
+    os.utime(_oldcap, (time.time() - 7200, time.time() - 7200))
+    chk(_fmt_age(capture_age(str(_oldcap))) == "2.0 h old",
+        "a capture written 2 h ago is dated in hours, not '7200 s old'")
+    chk(capture_age("/nonexistent/capture.txt") is None and _fmt_age(None) == "of unknown age",
+        "an unstat'able capture says 'unknown age' instead of inventing one")
     _b2 = _io.StringIO()
     with _cl.redirect_stdout(_b2):
         report_page_classes(str(pf), [(1001.0, 0xe3ff5000)])
@@ -780,6 +792,32 @@ def unmaps_of(trace):
     return out
 
 
+def capture_age(path):
+    """Seconds since the capture file was last written, or None when it cannot be stat'ed.
+
+    `page_class` reads /proc/kpageflags AT ANALYSIS TIME, so on an old capture the class names the frame's CURRENT
+    owner, not the owner at fault time -- engine#2478 measured a page freed and reused inside a 20-minute window, and a
+    class that went from confident to wrong between two re-reads 6 seconds apart. engine#2703 fixed the two attribution
+    bugs (use the mapping BEFORE the fault; refuse a class across an unmap); neither stops a correctly attributed class
+    from being a STALE one. The report therefore has to say how old its own input is.
+    """
+    try:
+        age = time.time() - os.stat(path).st_mtime
+    except (OSError, TypeError, ValueError):
+        return None
+    return age if age >= 0 else None
+
+
+def _fmt_age(sec):
+    if sec is None:
+        return "of unknown age"
+    if sec < 90:
+        return f"{sec:.0f} s old"
+    if sec < 5400:
+        return f"{sec / 60:.1f} min old"
+    return f"{sec / 3600:.1f} h old"
+
+
 def report_page_classes(trace, faults):
     """One line per fault: the paddr of the last mapping of its IOVA at or BEFORE the fault, and that page's class.
 
@@ -789,6 +827,8 @@ def report_page_classes(trace, faults):
     """
     pm = paddrs(trace)
     um = unmaps_of(trace)
+    print(f"  note: page classes are read from /proc/kpageflags NOW; this capture is {_fmt_age(capture_age(trace))},"
+          f" so a class names the frame's current owner, not its owner at fault time")
     for item in faults:
         t, iova = item[0], item[1]
         dom = item[2] if len(item) > 2 else ""

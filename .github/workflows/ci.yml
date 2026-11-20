@@ -101,6 +101,31 @@ jobs:
         run: |
           git fetch -q --depth=1 origin "$BASE"
           python3 tools/check_pins.py "$BASE"
+      # engine#2919 / #2926: **nothing in this repo built the pinned lemonade**, so a pin that does not compile
+      # merged green. Measured 2026-11-20: `cad57fcaebb4` (47.1) inserted a `std::map about` member mid-struct and
+      # the onebit backend's POSITIONAL initialiser kept the old arity; the error surfaces in `router.cpp`, one
+      # layer below the pin, and only for someone who builds lemonade on the device. A revert pin and a recovery
+      # pin followed, each costing a build slot. `scripts/build-lemonade.sh` is manual, so it never ran in CI.
+      #
+      # Only when the pin MOVED: the cost lands on pin bumps, and every other PR skips in two seconds.
+      - name: The pinned lemonade compiles (only when the pin moved)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch -q --depth=1 origin "$BASE"
+          # An unreadable base must BUILD, not skip: a skip on a base we could not read is exactly the
+          # "cannot tell read as a pass" failure this job exists to remove. (An empty $BASE makes `git diff`
+          # fail, which falls through to the build below -- that is the intended direction.)
+          if [ -n "$BASE" ] && git diff --quiet "$BASE" -- third_party/lemonade; then
+            echo "third_party/lemonade unchanged against ${BASE}: skipping the lemonade build"
+            exit 0
+          fi
+          git submodule update --init --depth 1 third_party/lemonade
+          scripts/build-lemonade.sh "$RUNNER_TEMP/lemonade"
+          test -x "$RUNNER_TEMP/lemonade/bin/lemond"
+          echo "the pinned lemonade built: $(git -C third_party/lemonade rev-parse --short HEAD)"
+
       # engine #963 option 2: the NPU chat route renders the container's own chat template with the pinned
       # llama.cpp fork's Jinja engine (app/npu_template.h), so the build needs that submodule's sources —
       # shallow, one checkout, ~180 MB, 8 s, and it is the same commit the release build compiles. Without it

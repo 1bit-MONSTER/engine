@@ -165,6 +165,7 @@ inline bool open(const onebit::npu::pack_import::OnnxGraphInfo& enc, const std::
     onebit::audio::NpuAudioGemm* gm = out->gemm.get();
     out->hook.gemm = [gm](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
                           std::vector<float>* C, std::string* w) { return gm->gemm(key, A, M, K, B, N, C, w); };
+    out->hook.cached = [gm](const std::string& key) { return gm->cached(key); };
     return true;
 }
 

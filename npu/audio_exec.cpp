@@ -373,6 +373,12 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         // whisper_transcribe already prints as `host: N x <reason>`.
         const char* fh = std::getenv("ONEBIT_AUDIO_FORCE_HOST");
         const bool force_host = fh != nullptr && fh[0] != '\0' && fh[0] != '0';
+        // engine#1783: ONEBIT_AUDIO_SKIP_CACHED_W=0 keeps loading every offered weight even when the device holds it.
+        const char* scw = std::getenv("ONEBIT_AUDIO_SKIP_CACHED_W");
+        const bool skip_cached_w = scw == nullptr || scw[0] != '0';
+        auto device_has = [&](const std::string& key) {
+            return dev != nullptr && !force_host && skip_cached_w && dev->cached && dev->cached(key);
+        };
         auto offer = [&](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
                          std::vector<float>* c) -> bool {
             if (dev == nullptr) return false;
@@ -501,6 +507,26 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
             if (n.outs.empty()) fail(where() + " has no output");
             const std::string& oname = n.outs[0];
             Tensor r;
+            if (n.op == "MatMul" && n.ins.size() >= 2 && t.count(n.ins[1]) == 0 && inits.count(n.ins[1]) != 0 &&
+                inits.at(n.ins[1])->dims.size() == 2 && device_has(n.ins[1])) {
+                // engine#1783: the device holds this weight, so offer the product without loading the initializer. Same
+                // offer as the branch below (same key, same rows), so the device computes the same thing; a decline falls
+                // through to that branch, which loads the weight and runs it on the host.
+                const Tensor& a = need(n.ins[0]);
+                const std::vector<int64_t>& wd = inits.at(n.ins[1])->dims;
+                const int64_t K = a.dims.empty() ? 0 : a.dims.back(), N = wd[1];
+                if (a.dims.size() >= 2 && K == wd[0] && K > 0) {
+                    std::vector<float> c;
+                    if (offer(n.ins[1], a.data.data(), int64_t(a.data.size() / size_t(K)), K, nullptr, N, &c)) {
+                        r.dims = a.dims;
+                        r.dims.back() = N;
+                        r.data = std::move(c);
+                        finish_node(n.op, oname, r, op_t0);
+                        continue;
+                    }
+                    --dev->host;   // the branch below offers again and counts the outcome; count this product once
+                }
+            }
             if (n.op == "MatMul") {
                 const Tensor& a = need(n.ins[0]);
                 const Tensor& b = t.count(n.ins[1]) != 0 ? need(n.ins[1]) : init_f32(n.ins[1]);
@@ -760,16 +786,20 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 }
             } else if (n.op == "Conv") {
                 const Tensor& a = need(n.ins[0]);
-                const Tensor& w = init_f32(n.ins[1]);
+                // engine#1783: a weight the device already holds is not loaded; only its dims are read. The host path
+                // below loads it if the device declines.
+                const bool w_on_dev = t.count(n.ins[1]) == 0 && inits.count(n.ins[1]) != 0 && device_has(n.ins[1] + "#conv");
+                const Tensor* wp = w_on_dev ? nullptr : &init_f32(n.ins[1]);
+                const std::vector<int64_t>& wdims = w_on_dev ? inits.at(n.ins[1])->dims : wp->dims;
                 const Tensor* bias = (n.ins.size() > 2 && !n.ins[2].empty()) ? &init_f32(n.ins[2]) : nullptr;
                 const auto gs = n.attrs_list.find("strides");
                 const auto gp = n.attrs_list.find("pads");
                 const int stride = (gs != n.attrs_list.end() && !gs->second.empty()) ? int(gs->second[0]) : 1;
                 const int pad = (gp != n.attrs_list.end() && !gp->second.empty()) ? int(gp->second[0]) : 0;
-                if (a.dims.size() != 3 || w.dims.size() != 3) fail(where() + ": only 1-D temporal Conv on (N,C,T)");
+                if (a.dims.size() != 3 || wdims.size() != 3) fail(where() + ": only 1-D temporal Conv on (N,C,T)");
                 const int64_t cin = a.dims[1], T = a.dims[2];
-                const int64_t cout = w.dims[0], k = w.dims[2];
-                if (w.dims[1] != cin) fail(where() + ": kernel channels do not match the input");
+                const int64_t cout = wdims[0], k = wdims[2];
+                if (wdims[1] != cin) fail(where() + ": kernel channels do not match the input");
                 const int64_t tout = audio::conv1d_out_len(int(T), int(k), stride, pad);
                 r.dims = {a.dims[0], cout, tout};
                 r.data.resize(size_t(a.dims[0]) * size_t(cout) * size_t(tout));
@@ -778,15 +808,18 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 if (dev != nullptr) {
                     // The im2col GEMM: (tout, cin*k) x (cin*k, cout), then out[co][t] = bias[co] + C[t][co].
                     const int64_t kk = cin * k;
-                    std::vector<float> bkn(size_t(kk) * size_t(cout));
-                    audio::conv1d_weight_as_kn(w.data.data(), int(cout), int(cin), int(k), bkn.data());
+                    std::vector<float> bkn;
+                    if (wp != nullptr) {
+                        bkn.resize(size_t(kk) * size_t(cout));
+                        audio::conv1d_weight_as_kn(wp->data.data(), int(cout), int(cin), int(k), bkn.data());
+                    }
                     std::vector<float> acol(size_t(tout) * size_t(kk));
                     bool all = true;
                     for (int64_t n0 = 0; n0 < a.dims[0] && all; ++n0) {
                         audio::conv1d_im2col(a.data.data() + size_t(n0) * size_t(cin) * size_t(T), int(cin), int(T), int(k),
                                              stride, pad, acol.data());
                         std::vector<float> c;
-                        if (!offer(n.ins[1] + "#conv", acol.data(), tout, kk, bkn.data(), cout, &c)) {
+                        if (!offer(n.ins[1] + "#conv", acol.data(), tout, kk, wp != nullptr ? bkn.data() : nullptr, cout, &c)) {
                             all = false;
                             break;
                         }
@@ -810,6 +843,8 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 // accumulators and measured 2.63x on the [768,768,3] stride-2 stem (N=5 interleaved medians,
                 // 1044 -> 398 ms) with a bit-identical result -- every channel still accumulates ci-outer /
                 // j-inner in conv1d's order. The last 1..3 channels go through conv1d_channels' tail.
+                if (wp == nullptr) wp = &init_f32(n.ins[1]);   // the device declined a weight it held: load it now
+                const Tensor& w = *wp;
                 const size_t co_blocks = (size_t(cout) + 3) / 4;
                 const size_t units = size_t(a.dims[0]) * co_blocks;
                 parallel_units(units, [&](size_t u) {

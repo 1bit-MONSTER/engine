@@ -48,6 +48,10 @@ struct AudioGemm {
     std::function<bool(const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
                        std::vector<float>* C, std::string* why)>
         gemm;
+    // engine#1783: true when the device already holds `key`'s packed weight, so the executor can offer the product with
+    // B = nullptr and skip loading the f32 initializer (a whisper-small encoder pass re-read ~340 MB of weights the device
+    // had cached since the first window). Unset = never cached, the old behaviour.
+    std::function<bool(const std::string& key)> cached;
     int device = 0;                           // products the device ran
     int host = 0;                             // products the host ran (declined, or not offered)
     std::map<std::string, int> host_why;      // reason -> count

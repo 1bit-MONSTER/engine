@@ -68,7 +68,8 @@ public:
     // The AudioGemm::gemm contract: C (M x N) = A (M x K) x B (K x N); false + why to leave it to the host.
     bool gemm(const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
               std::vector<float>* C, std::string* why) {
-        if (A == nullptr || B == nullptr || C == nullptr || M <= 0 || K <= 0 || N <= 0) {
+        // B may be null only for a weight the target already holds (cached(key)): the executor then skips loading it.
+        if (A == nullptr || (B == nullptr && !cached(key)) || C == nullptr || M <= 0 || K <= 0 || N <= 0) {
             if (why) *why = "empty product";
             return false;
         }
@@ -127,6 +128,12 @@ public:
         device_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ++products_;
         return true;
+    }
+
+    // True when `key`'s packed weight is in the target's cache, so gemm() needs no B for it (engine#1783).
+    bool cached(const std::string& key) const {
+        const auto it = w_.find(key);
+        return caches_ && it != w_.end() && it->second.padded.empty();
     }
 
     double device_ms() const { return device_ms_; }

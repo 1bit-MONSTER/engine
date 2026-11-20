@@ -344,13 +344,37 @@ lane.wait(cur);
 void end() { slots[0].rl.reset(); slots[0].runs.clear(); … ctx.reset(); }
 ```
 
-`prepare()` → `layer_kernel()` throws when `ctx + 1 > kMaxContext` — *before* `wait(cur)`. The catch-all in `generate()` then
-calls `end()`, which frees the runlists, the kernels and the hw_context **while the current runlist may still be executing**.
+`prepare()` runs **before** `wait(cur)` by design, and it allocates (a new `xrt::runlist`, `runs.emplace_back`, a kernel bind).
+**Any throw from that allocation or bind** unwinds past `wait(cur)`; the catch-all in `generate()` then calls `end()`, which frees
+the runlists, the kernels and the hw_context **while the current runlist may still be executing**.
 Every BO under that context is released while the controller is still writing it, and the device keeps DMA-ing into IOVAs whose
 mappings were just torn down.
 
-Trigger: **a generation that rolls past `kMaxContext`.** Prediction for the confirming run: the stream appears after the throw
-and not after a clean run. Fix, cheapest first: drain in `end()`; or guard `ctx + 1 > kMaxContext` *before* launching; reordering
+**Corrected 2026-11-20 — the trigger is not `kMaxContext`, and this page had it wrong.** An earlier revision of this section
+said `prepare()` throws when `ctx + 1 > kMaxContext`. Read against the source, it cannot: `generate_once()` refuses up front
+
+```cpp
+if (int(prompt.size()) + opt.max_tokens > Lane::kMaxContext) throw std::runtime_error("... exceeds the context limit");
+```
+
+and `layer_kernel()` throws only on `n > kMaxContext`, so the last iteration's `prepare(next, kMaxContext)` is legal. The path this
+page described does not exist, and a run "past kMaxContext" would have tested nothing.
+
+What is left is a **no-exception-safety window**: an allocation or kernel-bind failure inside `prepare()`, or an XRT error in
+`launch()`, is the only way to reach `end()` with a runlist in flight. Two probes were executed on 2026-11-20 to test that
+boundary, both with a **baseline of zero** `amdxdna IO_PAGE_FAULT` on the boot:
+
+| probe | result |
+|---|---|
+| serve → one completion → SIGTERM | **0 faults** during, and 0 five seconds after exit |
+| request rejected by vocabulary validation (`prompt:[…,999999]`) | **0 faults**; the route validates ids at parse, before `prepare` runs |
+
+So ordinary use does not reproduce the residue, and a malformed request cannot either — the exception has to happen *inside*
+`prepare`/`launch`. Reaching it deliberately means fault injection in the binary or a hard kill (SIGKILL leaves the runlist to the
+device and can wedge it until reset, so that probe is a fleet-cost decision rather than an issue-cost one).
+
+The fix is unchanged and is now the only testable target: **drain in `end()`**, or a scope guard that waits the in-flight slot
+on unwind. Both are testable without a device — assert that `end()` waits on a slot whose runlist is still in flight. Fix, cheapest first: drain in `end()`; or guard `ctx + 1 > kMaxContext` *before* launching; reordering
 `wait` before `prepare` is correct but costs the overlap that is deliberate.
 
 The lesson this page earned, in one line: **a stream that continues after its only holder has exited is not a concurrency

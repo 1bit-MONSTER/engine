@@ -284,3 +284,25 @@ ExternalProject_Add(llama_hrx
     INSTALL_COMMAND ""
     BUILD_ALWAYS ON
     USES_TERMINAL_BUILD ON)
+
+# engine#2935: the build ends by checking what it embedded. A code object can be older than the kernel sources it is
+# named after (ninja rebuilds on a NEWER input, and a staged add-on copy keeps old mtimes), the table the library
+# compiles in can be older than the code objects, and the library can be older than the table; every one of those
+# built green and was found by the server's load-time check, on a device, after a lane had spent its turn. The same
+# comparison needs no device: the tool reads the .hsaco symbols, the generated table and the linked library, and with
+# --registration lets the library build its dispatch registries, which runs the add-on's own check of every registered
+# kernel against its code object. Between build and install, so the llama_hrx target cannot complete without it;
+# ALWAYS, because BUILD_ALWAYS above means the tree can change on every build. Measured on Strix Halo: 0.4 s for 63
+# code objects (22 MB of table, 25 MB of library).
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    ExternalProject_Add_Step(llama_hrx embedded_objects_check
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/hrx_embedded_objects_check.py
+                --tree <BINARY_DIR> --registration
+        COMMENT "HRX: the embedded HIP code objects match the kernels this build names"
+        DEPENDEES build
+        DEPENDERS install
+        ALWAYS ON)
+else()
+    message(WARNING "ONEBIT_HRX: no Python3 interpreter, so the embedded-code-object check does not run (engine#2935)")
+endif()

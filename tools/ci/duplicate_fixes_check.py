@@ -68,7 +68,11 @@ PAGE = 100
 #   * `keyword ... #12` with up to 24 characters between -- #2793's body says "Refs #2779 (the layer its fix does not
 #     cover), #2728", and the noun "fix" plus a distant `#2728` read as a claim on 2728. Found by running the parser over
 #     the real texts of tonight's seven PRs rather than over my own fixtures, which is why that check is in the PR body.
-CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#(\d+)', re.I)
+# engine#3060: a claim whose number is marked up is still a claim. `Closes **#3041**` returned [] because the gap
+# between the verb and the `#` allowed whitespace and a colon but not emphasis, so a lane that bolded the issue number
+# silently stopped being a claimant -- and the gate then printed "neither says Fixes/Closes" at a pair that said it
+# twice. `*` and `_` are the emphasis markers, `~` is strikethrough; only contiguous markers just before the `#` count.
+CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*[*_~]*#(\d+)', re.I)
 
 # engine#2842: `Refs #N` is a claim too, but a WEAKER one. Almost every PR reviewed on 2026-11-16/17 said `Refs` rather than
 # `Fixes` -- because a PR that fixes part of an issue must not close it -- so reading closing keywords only made the common
@@ -76,7 +80,7 @@ CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#(\d+)
 # other failure: `Refs` is also used for context, and a pair that merely mentions the same issue is not a duplicate. So a
 # ref pair counts only when the two PRs also TOUCH OVERLAPPING FILES -- the same "overlap, not issue-claim" rule the review
 # of #2809 asked for on the false-positive side, which makes one rule serve both directions.
-REF = re.compile(r'\brefs?\b\s*:?\s*#(\d+)', re.I)
+REF = re.compile(r'\brefs?\b\s*:?\s*[*_~]*#(\d+)', re.I)   # engine#3060: same markup tolerance
 
 
 # A claim written INSIDE code is documentation, not a claim. The PRs most likely to contain `Fixes #12` are the ones
@@ -324,6 +328,13 @@ def self_test():
     ok(claims("pins: llama.cpp 1 -> 2 (Fixes #2757)") == [2757], "Fixes #N in a title is a claim")
     ok(claims("body text\n\nFixes #2778.") == [2778], "Fixes #N in a body is a claim")
     ok(claims("Closes #12 and fixes #13") == [12, 13], "two claims in one body are both read")
+    # engine#3060: a MARKED-UP number is still a claim. `Closes **#3041**` returned [] all night, so a PR that said it
+    # closed the issue was reported as "neither says Fixes/Closes" -- a false reason on the fleet's gate. The code-span
+    # arm right below is the guard: widening the gap must not start reading claims out of quoted text.
+    ok(claims("Closes **#3041** -- the row has been red") == [3041], "a bold claim is a claim (engine#3060)")
+    ok(claims("Fixes __#12__") == [12] and claims("Closes *#7*") == [7] and claims("Fixes ~~#9~~") == [9],
+       "... and so are underscore, italic and strikethrough markup")
+    ok(claims("see `Fixes #99` in the log") == [], "... while a claim inside a code span is still NOT a claim")
     ok(claims("Refs #2778 only") == [], "Refs is not a claim -- the whole point of not matching a bare #N")
     ok(claims("see #2778 for context") == [], "a bare mention is not a claim")
     ok(claims("Refs #2779 (the layer its fix does not cover), #2728 (where the defect came from)") == [],

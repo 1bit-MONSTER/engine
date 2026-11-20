@@ -73,6 +73,16 @@ checks=(
     # engine#2344: NOTICE is hand-maintained, so a dependency compiled into the binary can arrive with no
     # licence line; this is the check that caught it. Registered as a ctest row but not run here until now.
     "tools/ci/notice_covers_deps.py --check"
+    # engine#2807's detector, run at handover: EIGHT same-day collisions (#2796/97/98, #2845/44/43, #2920/21,
+    # #2927/29/32, #2942/43, #2919/26, #2944/45, #2949/52) each cost a review and a merge slot, and the tool
+    # that finds them existed all day -- nobody ran it.
+    #
+    # ADVISORY, not a gate row, and the reason is the tool's own false-positive direction: it flags any two open
+    # PRs naming one issue, and a legitimate HALF (a fix plus its arm, #2797/#2798) is indistinguishable from a
+    # duplicate without the allow-list or the `Refs`+overlap rule that `duplicate_fixes_allow.txt` was written
+    # for -- neither is on main yet. A hard row would red the case I have spent the day arguing must pass, so it
+    # prints the finding for the lane to read and stays green; make it hard the day the exemption lands.
+    "tools/ci/duplicate_fixes_check.py --advisory"
     "tools/ci/tests_referenced_check.py"
     "tools/ci/ci_targets_check.py --check"
     "tools/ci/tmp_path_check.py --check"

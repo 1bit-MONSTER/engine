@@ -46,9 +46,11 @@ FIELDS = (
 
 # A field that is genuinely accepted and discarded, with the issue that owns the fix. Reported as a warning so a
 # reader sees it and a check stays green only while the debt is named.
-UNOWNED = {
-    "cache_prompt": "engine#2889 (the prefix cache ignores the caller's opt-out)",
-}
+# Field -> the issue that owns it, for a field that is genuinely accepted and discarded. An entry here is a claim
+# that the field is still ignored: when the field starts being read, this dict is out of date and the census fails
+# until the entry is removed (engine#2889 made `cache_prompt` read on 11-20, which is how the first version of this
+# list rotted within the hour it was written).
+UNOWNED = {}
 
 # Keys that are deliberately not read as body keys, with what reads them instead. Each one is a decision, not an
 # omission, and a reader can check the reason against the source.
@@ -83,7 +85,10 @@ def census(route_text, options_text, fields=FIELDS):
     for key in fields:
         in_route = mentions(route_text, key)
         in_options = mentions(options_text, key)
-        if in_route["refused"]:
+        if in_route["refused"] and in_route["read"]:
+            # id_slot: honoured when it names the one slot this route has, refused by name otherwise
+            out[key] = "read-and-refused"
+        elif in_route["refused"]:
             out[key] = "refused"
         elif in_route["read"]:
             out[key] = "read-in-route"
@@ -94,6 +99,16 @@ def census(route_text, options_text, fields=FIELDS):
         else:
             out[key] = "ignored"
     return out
+
+
+def stale_entries(result):
+    """Exemptions and read-elsewhere notes that no longer describe the source."""
+    # only keys this run actually censused: an exemption for a field outside --fields is not evidence of anything
+    stale = [f"{k} is now {result[k]}, so its exemption is dead" for k in UNOWNED
+             if k in result and result[k] != "ignored"]
+    stale += [f"{k} is now {result[k]}, so 'read-elsewhere' is out of date" for k in VIA_OTHER
+              if k in result and result[k] != "read-elsewhere"]
+    return stale
 
 
 def report(result):
@@ -119,6 +134,13 @@ def check(root):
     if escaped:
         print(f"serve_field_census: {len(escaped)} field(s) accepted and discarded: {', '.join(escaped)}", file=sys.stderr)
         return 1
+    # the other direction: an exemption that is no longer needed is debt of its own, and a list that only grows is how
+    # a census stops describing the code it reads.
+    stale = stale_entries(result)
+    if stale:
+        for line in stale:
+            print(f"serve_field_census: {line} -- remove the entry", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -143,12 +165,35 @@ def self_test():
 
     refused = 'if (!chat) throw std::runtime_error("logprobs: served on /v1/chat/completions, only");\n'
     arm(census(refused, "", ("logprobs",))["logprobs"] == "refused", "a named refusal counts as a disposition")
+    both = 'if (body.contains("id_slot") && at("id_slot") != 0) throw std::runtime_error("id_slot: one slot");\n'
+    arm(census(both, "", ("id_slot",))["id_slot"] == "read-and-refused",
+        "a key that is read for one value and refused for another says both")
     arm(census('const auto& v = body.at("stop");', "", ("stop",))["stop"] == "read-in-route",
         "body.at() is a read, not a mention")
     arm(census('o.sample.top_k = int(k);', "", ("top_k",))["top_k"] == "ignored",
         "a bare assignment is not a read of the request's key")
 
     arm(census("", "", ("anything",))["anything"] == "ignored", "an empty route ignores everything")
+
+    # both directions: an exemption for a field that is still ignored is fine, one for a field that is now read is not
+    saved_unowned, saved_via = dict(UNOWNED), dict(VIA_OTHER)
+    options_topk = options + 'if (body.contains("top_k")) { o.sample.top_k = 1; }\n'
+    try:
+        UNOWNED.update({"top_k": "engine#0 (fixture)"})
+        arm(stale_entries(census("", "", ("top_k",))) == [],
+            "an exemption for a field that is still ignored is not stale")
+        arm(stale_entries(census(route, options_topk, ("top_k",))) != [],
+            "an exemption for a field the options header now reads IS stale (the engine#2889 case, in miniature)")
+        arm(stale_entries(census(route, options_topk, ("temperature",))) == [],
+            "a field the run did not census is not evidence that its exemption is stale")
+        VIA_OTHER.update({"temperature": "engine#0 (fixture)"})
+        arm(stale_entries(census(route, options, ("temperature",))) != [],
+            "a read-elsewhere note for a field that is read normally is stale too")
+    finally:
+        UNOWNED.clear()
+        UNOWNED.update(saved_unowned)
+        VIA_OTHER.clear()
+        VIA_OTHER.update(saved_via)
     print("ok" if bad == 0 else f"{bad} FAIL")
     return 1 if bad else 0
 

@@ -12,6 +12,16 @@
   },
   {
    "backend": "hrx",
+   "model": "LFM3-1.7B-Q4_K_M.gguf",
+   "arch": "lfm3",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-11-20",
+   "engine": "fa1daa41eec4"
+  },
+  {
+   "backend": "hrx",
    "model": "MiniCPM5-1B-Q4_K_M.gguf",
    "arch": "llama",
    "passed": true,

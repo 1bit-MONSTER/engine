@@ -29,20 +29,32 @@ def run(*a, cwd=None):
     r = subprocess.run(a, capture_output=True, text=True, cwd=cwd)
     return r.returncode, r.stdout, r.stderr
 
+PAGE = 50
+
 def open_prs(repo):
-    """[(number, branch)] from `gh`, or raise SystemExit(2) — an unreadable list is not an empty pass."""
-    rc, out, err = run("gh", "pr", "list", "-R", repo, "--state", "open", "--limit", "50",
+    """[(number, branch)] from `gh`, or raise SystemExit(2) — an unreadable or TRUNCATED list is not a pass."""
+    rc, out, err = run("gh", "pr", "list", "-R", repo, "--state", "open", "--limit", str(PAGE),
                        "--json", "number,headRefName")
     if rc != 0:
         raise SystemExit(f"pr_branch_stale_check: cannot list {repo} PRs (rc {rc}): {err.strip()} -- cannot tell, not a pass")
-    return [(p["number"], p["headRefName"]) for p in json.loads(out or "[]")]
+    prs = [(p["number"], p["headRefName"]) for p in json.loads(out or "[]")]
+    if len(prs) >= PAGE:
+        # engine#2992 review: the queue has run at 20-30, so a full page is close enough that an unchecked PR is plausible.
+        raise SystemExit(f"pr_branch_stale_check: {len(prs)} open PRs is the whole page -- the list may be truncated, so this is "
+                         f"a cannot-tell (raise PAGE) rather than a clean run")
+    return prs
 
 def stale_finding(repo_dir, branch, base="origin/main"):
-    """(behind, reverted_lines, files) where the merge deletes lines MAIN gained, or None when nothing is at risk.
+    """(behind, reverted_lines, files) measuring THE MERGE, or None when the merge removes nothing.
 
-    `add == 0` (whole-file removal) was the first filter and it missed the common case: a branch that also edits the file main
-    grew shows `+N/-M` with both non-zero, so the revert of #2789 -- folded_name reverted inside a file it was editing -- counted
-    as zero. The question that separates a revert from a reformat is whether MAIN added lines to that file after the merge-base.
+    Two earlier versions measured `git diff base branch`, which is *what base has that the branch lacks* — not what a merge
+    applies. On a branch that only edits `a.txt` while base grew `b.txt`, that diff reports base's own `b.txt` lines as deletions
+    although a three-way merge keeps them; and on a branch that reverts a line inside a file base never touched, it reports the
+    wrong file. engine#2992 review ran both against `git merge` and `git merge --squash`: the diff was wrong in both directions.
+
+    So measure the merge itself: `merge-tree --write-tree` materialises the merged tree without touching the worktree, and the
+    deletions between base and that tree are exactly what merging removes. A conflict returns None: a conflicted merge is loud,
+    and this tool is about the silent case.
     """
     rc, out, _ = run("git", "rev-list", "--count", f"{branch}..{base}", cwd=repo_dir)
     if rc != 0:
@@ -50,105 +62,103 @@ def stale_finding(repo_dir, branch, base="origin/main"):
     behind = int(out.strip() or 0)
     if behind == 0:
         return None
-    rc, mb, _ = run("git", "merge-base", base, branch, cwd=repo_dir)
-    if rc != 0 or not mb.strip():
-        return None
-    merge_base = mb.strip()
-    rc, out, _ = run("git", "diff", "--numstat", base, branch, cwd=repo_dir)
+    rc, out, _ = run("git", "merge-tree", "--write-tree", base, branch, cwd=repo_dir)
+    if rc != 0 or not out.strip():
+        return None                     # a conflicted merge is visible to the author; not this tool's business
+    merged_tree = out.splitlines()[0].strip()
+    rc, out2, _ = run("git", "diff", "--numstat", base, merged_tree, cwd=repo_dir)
     if rc != 0:
         return None
     reverted, files = 0, []
-    for line in out.splitlines():
+    for line in out2.splitlines():
         parts = line.split("\t")
-        if len(parts) != 3:
+        if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit():
             continue
-        _add, sub, path = parts
-        if not sub.isdigit() or int(sub) == 0:
-            continue
-        rc2, g, _ = run("git", "diff", "--numstat", merge_base, base, "--", path, cwd=repo_dir)
-        if rc2 != 0 or not g.strip():
-            continue
-        gained = sum(int(l.split("\t")[0]) for l in g.splitlines() if l.split("\t")[0].isdigit())
-        if gained > 0:
-            reverted += int(sub)
-            files.append(path)
-    if not files:
+        add, sub = int(parts[0]), int(parts[1])
+        # A PURE deletion is the revert; a replacement (add > 0) is the branch editing a line it already had. On the review's
+        # fixture A that is the difference between "the branch edited a.txt" and "the branch removed main's work".
+        if sub > 0 and add == 0:
+            reverted += sub
+            files.append(parts[2])
+    if reverted == 0:
         return None
     return behind, reverted, files
 
 
 def self_test():
+    """Arms derived from what `git merge` actually does, not from what a two-dot diff says (engine#2992 review)."""
     ok = True
     def chk(cond, what):
         nonlocal ok
         print(("ok   " if cond else "FAIL ") + what)
         ok = ok and cond
-    import tempfile, os
-    with tempfile.TemporaryDirectory() as d:
-        g = lambda *a: subprocess.run(("git", *a), cwd=d, capture_output=True, text=True)
-        g("init", "-q"); g("symbolic-ref", "HEAD", "refs/heads/main")
-        g("config", "user.email", "t@e"); g("config", "user.name", "t")
-        pathlib.Path(d, "f.txt").write_text("one\ntwo\n")
-        g("add", "-A"); g("commit", "-qm", "base")
-        g("branch", "stale")                                     # branch cut here
-        pathlib.Path(d, "f.txt").write_text("one\ntwo\nthree\n")
-        g("add", "-A"); g("commit", "-qm", "lands after the cut")  # main moves on
-        g("update-ref", "refs/remotes/origin/main", "HEAD")
-        rc_up = stale_finding(d, "main")
-        chk(rc_up is None, "a branch level with main is not a finding at all (no distance, nothing to revert)")
-        behind, deleted, files = stale_finding(d, "stale") or (0, 0, [])
-        chk(behind == 1, "a branch cut before one commit is behind 1")
-        # Any behind branch shows deletions here: main's newer lines are absent from it, so the merge removes them. That
-        # IS the defect — an earlier version of this arm asserted "deletes nothing" and was wrong about the mechanic.
-        chk(deleted == 1, "…and the merge deletes exactly the line main gained, which is the revert")
-        g("checkout", "-q", "stale")
-        pathlib.Path(d, "f.txt").write_text("one\n")             # the stale branch would drop a line
-        g("commit", "-qam", "stale edit")
-        g("checkout", "-q", "main")
-        behind, deleted, files = stale_finding(d, "stale") or (0, 0, [])
-        chk(behind == 1 and deleted > 0, "a behind branch whose merge deletes lines IS a finding")
-        chk("f.txt" in files, "…and names the file it would delete")
 
-    # engine#2992 review: a HUNK-level revert -- the shape seen most often. main gains a line in a file the branch is also
-    # editing, so `numstat` is +N/-M with both non-zero; the old `add == 0` filter called that zero.
-    with tempfile.TemporaryDirectory() as d:
-        g = lambda *a: subprocess.run(("git", *a), cwd=d, capture_output=True, text=True)
+    def repo(files):
+        import tempfile
+        d = tempfile.TemporaryDirectory()
+        g = lambda *a: subprocess.run(("git", *a), cwd=d.name, capture_output=True, text=True)
         g("init", "-q"); g("symbolic-ref", "HEAD", "refs/heads/main")
         g("config", "user.email", "t@e"); g("config", "user.name", "t")
-        pathlib.Path(d, "f.txt").write_text("alpha\nbeta\ngamma\n")
+        for name, text in files.items():
+            pathlib.Path(d.name, name).write_text(text)
         g("add", "-A"); g("commit", "-qm", "base")
-        g("branch", "hunk")
-        pathlib.Path(d, "f.txt").write_text("alpha\nbeta\ngamma\nMAIN_GAINED\n")
-        g("add", "-A"); g("commit", "-qm", "main gains a line in f.txt")
-        g("update-ref", "refs/remotes/origin/main", "HEAD")
-        g("checkout", "-q", "hunk")
-        g("update-ref", "refs/remotes/origin/hunk", "HEAD")
-        pathlib.Path(d, "f.txt").write_text("ALPHA\nBETA\ngamma\n")   # branch rewrites the region
-        g("commit", "-qam", "branch edits the same file")
-        f = stale_finding(d, "hunk")
-        chk(f is not None, "a HUNK-level revert (numstat +2/-2, both non-zero) IS a finding -- the case `add == 0` missed")
-        chk(f is not None and "f.txt" in f[2], "…and it names the file main grew and the merge would delete from")
+        return d, g
 
-    # …while a branch that is behind but content-identical stays quiet. My first fixture for this ("a reformat behind main")
-    # asserted quiet and FAILED, correctly: a behind branch lacking main's OTHER commits deletes those too, so the reformat was
-    # reverting main's change to a second file. The harmless shape is a branch that carries the same content main gained — behind
-    # by ancestry, identical by tree.
-    with tempfile.TemporaryDirectory() as d:
-        g = lambda *a: subprocess.run(("git", *a), cwd=d, capture_output=True, text=True)
-        g("init", "-q"); g("symbolic-ref", "HEAD", "refs/heads/main")
-        g("config", "user.email", "t@e"); g("config", "user.name", "t")
-        pathlib.Path(d, "shared.txt").write_text("alpha\nbeta\n")
-        g("add", "-A"); g("commit", "-qm", "base")
-        g("branch", "mine")
-        pathlib.Path(d, "shared.txt").write_text("alpha\nbeta\ngamma\n")
-        g("commit", "-qam", "main gains gamma")
+    def commit(g, d, files, msg):
+        for name, text in files.items():
+            pathlib.Path(d, name).write_text(text)
+        g("add", "-A"); g("commit", "-qm", msg)
         g("update-ref", "refs/remotes/origin/main", "HEAD")
-        g("checkout", "-q", "mine")
-        pathlib.Path(d, "shared.txt").write_text("alpha\nbeta\ngamma\n")   # same content, independent commit
-        g("commit", "-qam", "the branch already carries gamma")
-        chk(stale_finding(d, "mine") is None,
-            "a branch behind by ancestry but identical in content is NOT a finding -- nothing of main's is deleted")
+
+    # A branch level with main: no distance, nothing to revert.
+    d, g = repo({"a.txt": "a1\n"})
+    chk(stale_finding(d.name, "main") is None, "a branch level with main is not a finding")
+
+    # Fixture A from the review: main gains lines in a file the branch never touches. A three-way merge KEEPS main's version, so
+    # the two-dot diff's "deletions" were main's own lines. Must be quiet.
+    d, g = repo({"a.txt": "a1\n", "b.txt": "b1\nb2\n"})
+    g("branch", "feat")
+    commit(g, d.name, {"b.txt": "b1\nb2\nb3\nb4\nb5\n"}, "main grows b.txt")
+    g("checkout", "-q", "feat")
+    pathlib.Path(d.name, "a.txt").write_text("a1a\n")
+    g("commit", "-qam", "branch edits only a.txt")
+    chk(stale_finding(d.name, "feat") is None,
+        "review fixture A: main grew a file the branch never touched -- the merge keeps it, so NOT a finding")
+
+    # Fixture B from the review: the branch reverts a line inside a file MAIN never touched. The merge deletes it, and the two-dot
+    # diff named the wrong file (d.txt, which the merge keeps).
+    d, g = repo({"c.txt": "L1\nL2\nL3\n", "d.txt": "d0\n"})
+    g("branch", "revert")
+    commit(g, d.name, {"d.txt": "d0\nd1\n"}, "main grows d.txt only")
+    g("checkout", "-q", "revert")
+    pathlib.Path(d.name, "c.txt").write_text("L1\nL3\n")          # drops L2
+    g("commit", "-qam", "branch reverts L2")
+    f = stale_finding(d.name, "revert")
+    chk(f is not None, "review fixture B: a reverted line inside an untouched file IS a finding")
+    chk(f is not None and f[2] == ["c.txt"], "…and names c.txt (the file the merge deletes from), not d.txt")
+    chk(f is not None and f[1] == 1, "…and the count is the one line the merge removes")
+
+    # A whole-file removal by the branch is still the loudest case.
+    d, g = repo({"keep.txt": "k\n", "gone.txt": "g1\ng2\n"})
+    g("branch", "drop")
+    commit(g, d.name, {"added.txt": "x\n"}, "main adds a file")
+    g("checkout", "-q", "drop")
+    pathlib.Path(d.name, "gone.txt").unlink()
+    g("add", "-A"); g("commit", "-qm", "branch deletes gone.txt")
+    f = stale_finding(d.name, "drop")
+    chk(f is not None and "gone.txt" in f[2], "a branch that deletes a whole file IS a finding and names it")
+
+    # A branch behind by ancestry but identical in content removes nothing.
+    d, g = repo({"shared.txt": "alpha\nbeta\n"})
+    g("branch", "mine")
+    commit(g, d.name, {"shared.txt": "alpha\nbeta\ngamma\n"}, "main gains gamma")
+    g("checkout", "-q", "mine")
+    pathlib.Path(d.name, "shared.txt").write_text("alpha\nbeta\ngamma\n")
+    g("commit", "-qam", "the branch already carries gamma")
+    chk(stale_finding(d.name, "mine") is None,
+        "behind by ancestry but identical in content is NOT a finding")
     return 0 if ok else 1
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -164,17 +174,18 @@ def main():
         run("git", "fetch", "-q", "origin", branch, cwd=root)
         f = stale_finding(root, f"origin/{branch}")
         if f is None:
-            print(f"#{n} {branch}: up to date with main")
+            # `stale_finding` returns None both for "not behind" and for "the merge removes nothing"; the second is the ordinary
+            # behind-branch case and needs no row. There is no separate `deleted == 0` case to print (engine#2992 review).
+            print(f"#{n} {branch}: merging this branch removes nothing main has")
             continue
         behind, deleted, files = f
-        if deleted == 0:
-            print(f"#{n} {branch}: behind {behind}, deletes nothing -- fine")
-            continue
         bad += 1
-        print(f"#{n} {branch}: BEHIND {behind} and its merge DELETES {deleted} line(s) in {len(files)} file(s): "
+        print(f"#{n} {branch}: BEHIND {behind}; merging it DELETES {deleted} line(s) main has, in {len(files)} file(s): "
               f"{', '.join(files[:3])}{' …' if len(files) > 3 else ''}", file=sys.stderr)
     if bad:
-        print(f"pr_branch_stale_check: {bad} open PR(s) would revert main -- rebase or re-cut them before merging", file=sys.stderr)
+        print(f"pr_branch_stale_check: {bad} open PR(s) would delete lines main has "
+              f"(measured with `git merge-tree --write-tree`, not a two-dot diff) -- rebase or re-cut before merging",
+              file=sys.stderr)
         return 1
     print("pr_branch_stale_check: no open PR would revert main")
     return 0

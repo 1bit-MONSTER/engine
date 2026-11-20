@@ -60,6 +60,11 @@ constexpr uint64_t kMiB = 1ull << 20, kGiB = 1ull << 30;
 // backstop cannot disagree about where the wall is.
 constexpr uint64_t kGttReserveDefaultMiB = 16384;
 
+// PRECEDENCE, stated once so a future change knows what it must match: the explicit knob (GGML_HRX_GTT_RESERVE_MB),
+// then the 16 GiB cap, then a quarter of the pool. The fork's copy of this function carries the same three rules and
+// must keep carrying them -- the planner refuses a load the allocation-time backstop would allow, or the reverse, if
+// the two disagree.
+//
 // engine#2986: the 16 GiB default was sized on a 120 GiB GTT box (#680) and is right there, but it is a *fixed* number:
 // on a machine whose GTT is 16 GiB (a 32 GB box) it leaves a ceiling of zero, so HRX refuses every model -- and on a 16 GB
 // box (about 8 GiB GTT) it refuses before arithmetic. The reserve therefore scales with the pool it protects: a quarter of

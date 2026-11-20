@@ -36,13 +36,7 @@ set -uo pipefail
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
 
 base=origin/main
-# engine#2902: a removed diagnostic only reddens where the message IS the product. gpu-hold's queue
-# messages are what every lane reads when a ticket is released unheld (a bundled PR removed exactly that
-# in #2825), so a diff touching that script is checked with --strict-warnings; every other diff keeps the
-# default, where a deleted debug print is not a loss. Measured: 0 of 3 removed diagnostic lines were even
-# candidates before the family existed.
 strict=""
-git diff --name-only "$base"...HEAD 2>/dev/null | grep -qx "scripts/gpu-hold" && strict=" --strict-warnings"
 list_only=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -59,6 +53,18 @@ done
 # in scripts/ got twelve `can't open file` lines and rc 1 with every row red for the wrong reason.
 top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "pre-pr-checks: not inside a git work tree" >&2; exit 2; }
 cd "$top" || { echo "pre-pr-checks: cannot enter $top" >&2; exit 2; }
+
+# engine#2902: a removed diagnostic only reddens where the message IS the product. gpu-hold's queue
+# messages are what every lane reads when a ticket is released unheld (a bundled PR removed exactly that
+# in #2825), so a diff touching that script is checked with --strict-warnings; every other diff keeps the
+# default, where a deleted debug print is not a loss. This runs AFTER `--base` is parsed and after the
+# chdir to the toplevel: the first version ran before both, so `--base <ref>` was silently ignored (the
+# decision was made against origin/main) and a --help paid for a git call.
+if ! touches=$(git diff --name-only "$base"...HEAD 2>/dev/null); then
+    echo "pre-pr-checks: cannot diff $base...HEAD, so the gpu-hold --strict-warnings check is OFF for this run" >&2
+    touches=""
+fi
+case "$touches" in *scripts/gpu-hold*) strict=" --strict-warnings" ;; esac
 
 # The checks, in the order docs/pre-pr-checks.md lists them: cheapest and most common first, the two
 # that need a revision last.

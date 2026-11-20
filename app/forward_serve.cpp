@@ -253,6 +253,21 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         res.set_content(R"({"error":{"message":"request body is not JSON"}})", "application/json");
         return;
     }
+    // engine#2893: `id_slot` is one of two body fields nothing in app/ or npu/ ever READS -- the engine only writes it
+    // into bodies it sends TO llama-server (serve_hybrid.h:327,406), which is why it looks implemented from a distance.
+    // This route has exactly one slot, so a caller naming 0 means "the slot" and any other number cannot be honoured:
+    // refuse it by name rather than serve it somewhere else. Silently accepting a field and discarding it is the one
+    // option that is indefensible -- a 400 is a bug report, silence is not.
+    if (body.is_object() && body.contains("id_slot")) {
+        const auto& s = body["id_slot"];
+        if (!(s.is_number_integer() && s.get<long long>() == 0)) {
+            res.status = 400;
+            res.set_content(R"({"error":{"message":"id_slot: this route serves a single slot; only id_slot 0 is valid, "
+                                           "and any other value is refused rather than ignored"}})",
+                            "application/json");
+            return;
+        }
+    }
     std::string prompt;  // the chat template, or a string prompt; documents say nothing for an ids prompt
     // Set when /v1/completions was given the prompt as token ids (llama.cpp's shape): the ids are then
     // the prompt and nothing is tokenized or prepended -- that is what makes a two-engine parity run

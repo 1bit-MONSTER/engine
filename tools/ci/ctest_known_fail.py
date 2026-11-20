@@ -154,9 +154,27 @@ def outputs(last_test_log: str):
     return out
 
 
-def device_skipped(last_test_log: str):
-    """The rows whose own output says they did not run on a device, whatever ctest called them."""
-    return {name for name, text in outputs(last_test_log).items() if DEVICE_SKIP in text}
+# engine#2987: ctest reason prefixes that mean the row stopped abnormally, i.e. it RAN and then died. A row can print
+# the fork's device-skip line for its device cases and still segfault in its host half -- the hand-written rows do
+# exactly that -- so the skip line alone is not evidence that nothing ran.
+HARD_OUTCOMES = ("SEGFAULT", "Subprocess aborted", "Timeout", "Exception")
+
+
+def hard_failures(log_text: str):
+    """The rows ctest says stopped abnormally, whatever their own output printed."""
+    return {n for n, reason in failed(log_text).items() if reason.split()[0] in HARD_OUTCOMES}
+
+
+def device_skipped(last_test_log: str, log_text: str = ""):
+    """The rows whose own output says they did not run on a device, whatever ctest called them.
+
+    A HARD outcome is never "did not run" (engine#2987): the test ran and then crashed. Before this, one `in` test on
+    the output text took such a row out of both the failure and the new-failure columns, and with `--no-device skip`
+    the step then exited 77 -- a segfault reported as "this box has no device". Reachable in this fleet, because the
+    hand-written HRX rows print the skip line for their device cases and exit non-zero for their host half.
+    """
+    return {name for name, text in outputs(last_test_log).items()
+            if DEVICE_SKIP in text and name not in hard_failures(log_text)}
 
 
 def exit_code(new, no_device, policy="fail"):
@@ -266,7 +284,9 @@ def judge(log_text: str, known, last_test_log=None, want_total=None):
             out["cannot"] = (f"the outputs file has no block for {len(missing)} failed row(s) ({', '.join(missing[:3])}"
                              f"{', ...' if len(missing) > 3 else ''}) -- it is from a different run than the log")
             return out
-        no_device = {n for n, text in seen.items() if DEVICE_SKIP in text}
+        # a row that crashed is a failure even if it also printed the device-skip line (engine#2987)
+        hard = hard_failures(log_text)
+        no_device = {n for n, text in seen.items() if DEVICE_SKIP in text} - hard
         out["not_in_run"] = set(known) - set(seen)
     _, total = summary(log_text)
     out["no_device"] = no_device
@@ -530,6 +550,44 @@ Errors while running CTest
         print(f"  SELF-TEST FAIL: rows whose output says no device -> {sorted(device_skipped(nodev_last))} "
               f"(plain-fail only QUOTES the line in its Command)")
         bad += 1
+    # ── engine#2987: a row that printed the skip line and then CRASHED did not "not run" ────────────────────────
+    # ctest 4.2.3's shape for the reachable case: the row prints the device-skip line for its device cases and its
+    # host half segfaults. The skip line is in its output AND the FAILED block carries the outcome.
+    crash_log = (
+        "1/2 Test #1: hrx-crash .......................***Failed    0.10 sec   (SEGFAULT)\n"
+        "2/2 Test #2: hrx-skip ........................***Failed  "
+        "Error regular expression found in output. Regex=[test skipped: no device available]  0.00 sec\n"
+        "\n0% tests passed, 2 tests failed out of 2\n\nThe following tests FAILED:\n"
+        "\t  1 - hrx-crash (SEGFAULT)\n\t  2 - hrx-skip (Failed)\n\nErrors while running CTest\n")
+
+    def block2(index, name, printed, verdict):
+        return (f"{index}/2 Testing: {name}\n{index}/2 Test: {name}\nCommand: \"/b/bin/{name}\"\nDirectory: /b\n"
+                f"\"{name}\" start time: Nov 20 08:33 AST\nOutput:\n"
+                "----------------------------------------------------------\n"
+                f"{printed}<end of output>\nTest time =   0.10 sec\n"
+                "----------------------------------------------------------\n"
+                f"{verdict}\n\"{name}\" end time: Nov 20 08:33 AST\n")
+    crash_last = ("Start testing: Nov 20 08:33 AST\n----------------------------------------------------------\n" + "".join((
+        block2(1, "hrx-crash", "test skipped: no device available\nFAIL hrx-crash: assertion after the skip line\n",
+               "Test Failed.\n\nTest Fail Reason:\nTest Failed."),
+        block2(2, "hrx-skip", "test skipped: no device available\n", "Test Failed.\n\nTest Fail Reason:\n" + regex_hit),
+    )) + "End testing: Nov 20 08:33 AST\n")
+    cases += 1
+    if device_skipped(crash_last, crash_log) != {"hrx-skip"}:
+        print(f"  SELF-TEST FAIL: a row that CRASHED after the skip line was counted as 'did not run' -> "
+              f"{sorted(device_skipped(crash_last, crash_log))} (want ['hrx-skip'])")
+        bad += 1
+    cases += 1
+    got = judge(crash_log, set(), crash_last)
+    if got["new"] != {"hrx-crash"} or got["no_device"] != {"hrx-skip"}:
+        print(f"  SELF-TEST FAIL: a crash after the skip line -> new {sorted(got['new'])}, "
+              f"no_device {sorted(got['no_device'])} (want new ['hrx-crash'], no_device ['hrx-skip'])")
+        bad += 1
+    cases += 1
+    if exit_code(got["new"], got["no_device"], "skip") != 1:
+        print("  SELF-TEST FAIL: --no-device skip swallowed a crash into 77")
+        bad += 1
+
     # THE ARM: a device-less run against a baseline that names one of the device rows. Read from the summary alone
     # suite-mixed is "a known failure" and suite-all-skipped "a NEW failure"; neither ran.
     cases += 1
@@ -657,7 +715,8 @@ def main(argv=None):
             return 2
         # A row that did not run on a device is not debt: written down, it would make every later device-less run
         # read as "known failures, no new ones". A name the file already carries keeps its line (write merges).
-        absent = (device_skipped(last) if last is not None else set()) - set(known)
+        # ... and --write must not drop a crashed row from the baseline either (engine#2987)
+        absent = (device_skipped(last, text) if last is not None else set()) - set(known)
         names = {n for n in failed(text) if n not in absent}
         write_baseline(root / BASELINE, names, text)
         print(f"ctest_known_fail: wrote {len(names)} known failure(s) to {BASELINE}")

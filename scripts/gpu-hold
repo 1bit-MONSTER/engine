@@ -123,10 +123,6 @@ GPU_FAULT_RE='\[gfxhub\] page fault|amdgpu.*(reset|hang)|ring .*timeout|MES.*(re
 # Both spellings npu-hold can produce: the fleet dir gives $HOLD/npu-queue, and the fallback is $HOME/NPU-QUEUE
 # (upper case). A case-sensitive test would classify that fallback as a GPU ticket -- i.e. an NPU fault would stop
 # refusing the very ticket the NPU rule exists for -- so the match is case-insensitive.
-case "$(printf '%s' "$QUEUE" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" in
-    *npu*) HOLD_DEVICE=NPU ;;
-    *)     HOLD_DEVICE=GPU ;;
-esac
 fault_for_this_device() {   # <fault line>; true when it belongs to the device this ticket is queued for
     case "$1" in
         *amdxdna*) [ "$HOLD_DEVICE" = NPU ] ;;
@@ -173,6 +169,14 @@ while getopts ":t:l:w:q:h" opt; do
     esac
 done
 shift $((OPTIND - 1))
+# engine#2961: evaluated AFTER the options, because `-q QUEUE_DIR` is one of the two ways a lane names its queue (the
+# script's own usage line advertises it, and the gpu-hold probes use it). Classifying before getopts read the default
+# and left an `-q` NPU ticket classified as a GPU ticket: `-q <npu dir>` + an NPU fault was GRANTED onto the device that
+# had just power-cycled, and `-q <npu dir>` + a GPU reset was refused. Both directions were measured on main.
+case "$(printf '%s' "$QUEUE" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" in
+    *npu*) HOLD_DEVICE=NPU ;;
+    *)     HOLD_DEVICE=GPU ;;
+esac
 [ $# -gt 0 ] || { echo "gpu-hold: no command given (try -h)" >&2; exit 2; }
 
 # engine#2727: a payload that re-invokes gpu-hold on the queue it is ALREADY inside queues behind its own ticket and then

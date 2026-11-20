@@ -55,6 +55,24 @@ run_arm() {   # <tag> <klog line> <queue-dir> ; echoes the rc
     echo $?
 }
 
+# The same run, but naming the queue with `-q QUEUE_DIR` instead of GPU_QUEUE_DIR -- the form the script's usage line
+# advertises and the one the gpu-hold probes use. engine#2961 classified the device before getopts ran, so this form was
+# classified from the DEFAULT queue: an `-q <npu dir>` ticket with an NPU fault was granted onto the device that had just
+# power-cycled, and the same ticket with a GPU reset was refused.
+run_arm_q() {   # <tag> <klog line> <queue-dir> ; echoes the rc
+    klog="$scratch/klog.$1"
+    printf '%s\n' "$2" > "$klog"
+    q="$scratch/$3"
+    mkdir -p "$q"
+    env -u GPU_HOLD_FAULT_ABORT -u GPU_QUEUE_DIR GPU_HOLD_KLOG_FILE="$klog" \
+        GPU_TOKEN_FILE="$scratch/token.$1" GPU_HOLD_LOG="$scratch/log.$1" \
+        GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_COOLDOWN=0 \
+        GPU_HOLD_MINUTES=1 GPU_HOLD_RESET_WINDOW_MIN=10 \
+        GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x" \
+        timeout 60 "$hold" -t 1 -l scopetestq$1 -q "$q" -- "$scratch/payload.sh" > "$scratch/outq.$1" 2>&1
+    echo $?
+}
+
 npu_fault='[Fri Nov 20 12:59:43 2026] amdxdna 0000:c6:00.1: aie2_tdr_dead_fw_recover_all: Array stopped dispatching, power-cycling NPU to recover'
 gpu_reset='[Fri Nov 20 12:59:43 2026] amdgpu 0000:c5:00.0: [gfxhub] page fault (src_id:0 ring:0 vmid:1 pasid:32769)'
 
@@ -69,6 +87,11 @@ chk "a GPU reset does not refuse an NPU ticket" "$(run_arm d "$gpu_reset" npu-qu
 # the NPU rule exists for.
 chk "an upper-case NPU queue is still an NPU ticket" "$(run_arm f "$npu_fault" NPU-QUEUE)" 78
 chk "a clean log grants either ticket" "$(run_arm e '[Fri Nov 20 12:59:43 2026] usb 1-1: new device' gpu-queue)" 0
+
+chk "an NPU fault still refuses an NPU ticket named with -q (engine#2961)" "$(run_arm_q q1 "$npu_fault" npu-queue)" 78
+chk "and -q does not widen that refusal to a GPU ticket" "$(run_arm_q q2 "$npu_fault" gpu-queue)" 0
+chk "a GPU reset refuses a GPU ticket named with -q" "$(run_arm_q q3 "$gpu_reset" gpu-queue)" 78
+chk "and a GPU reset does not refuse an NPU ticket named with -q" "$(run_arm_q q4 "$gpu_reset" npu-queue)" 0
 
 if [ "$fails" = 0 ]; then echo "gpu_hold_device_scope: all arms ok"; else echo "gpu_hold_device_scope: $fails failure(s)"; fi
 exit $([ "$fails" = 0 ] && echo 0 || echo 1)

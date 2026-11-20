@@ -36,14 +36,43 @@ looked at" is what produced three wrong readings on this issue.
 The probes that produce TRACE (verified on this box: io/iommu tracepoints exist
 but never fire, so kprobes are required):
 
-    echo 0 > tracing_on; echo > trace; echo > kprobe_events
-    echo 'p:mp iommu_map         dom=$arg1 iova=$arg2:u64' >> kprobe_events
-    echo 'p:uf iommu_unmap_fast  dom=$arg1 iova=$arg2:u64' >> kprobe_events
-    echo 'p:du __iommu_dma_unmap dev=$arg1 iova=$arg2:u64' >> kprobe_events
-    echo 'p:pf report_iommu_fault dom=$arg1 dev=$arg2 iova=$arg3:u64' >> kprobe_events
-    echo 65536 > buffer_size_kb; echo 1 > events/kprobes/enable; echo 1 > tracing_on
-    ... window ...
-    cat trace > TRACE
+    mkdir -p /sys/kernel/tracing/instances/iommu-hist     # per instance: buffer, enable and triggers
+    I=/sys/kernel/tracing/instances/iommu-hist
+    T=/sys/kernel/tracing                                 # kprobe_events is GLOBAL, not per instance
+    echo 0 > $I/tracing_on; echo > $I/trace; echo > $T/kprobe_events
+    echo 'p:mp iommu_map         dom=$arg1 iova=$arg2:u64' >> $T/kprobe_events
+    echo 'p:uf iommu_unmap_fast  dom=$arg1 iova=$arg2:u64' >> $T/kprobe_events
+    echo 'p:du __iommu_dma_unmap dev=$arg1 iova=$arg2:u64' >> $T/kprobe_events
+    echo 'p:pf report_iommu_fault dom=$arg1 dev=$arg2 iova=$arg3:u64' >> $T/kprobe_events
+    echo 65536 > $I/buffer_size_kb
+    echo 'snapshot' > $I/events/kprobes/pf/trigger        # a FAULT freezes the buffer (see below)
+    echo 1 > $I/events/kprobes/enable; echo 1 > $I/tracing_on
+    ... wait for the fault ...
+    cat $I/snapshot > TRACE                               # the history ENDING at the fault
+    echo 0 > $I/tracing_on; echo 0 > $I/events/kprobes/enable
+    rm -rf $I; echo > $T/kprobe_events                    # leave nothing running
+
+Why the snapshot trigger instead of a plain enabled ring (measured on this box, 2026-11-20): the DMA path is
+continuously busy -- iommu_map 73 724, iommu_unmap_fast 75 924 and __iommu_dma_unmap 73 728 calls in a 40 s
+window, about 5 584 events/s across the three probes -- while report_iommu_fault fired ZERO times in it. A ring
+that is written at that rate is a ring that has already rolled over by the time anyone reads it, and how much of it
+survives is a function of the record size, which is not a number to guess at. The fault, by contrast, arrives
+about twice a minute: the reader cannot know which second to look at, so a polled ring is always looking at the
+wrong one.
+
+`echo 'snapshot'` (which reads back as `snapshot:unlimited`) removes the question rather than answering it: the
+fault itself freezes the buffer, so the record is the window ENDING at the fault, whatever the ring's retention
+happens to be. `snapshot:count=1` is NOT accepted here -- that is `hist`-trigger syntax -- and a `count` would stop
+snapshotting after the first fault, which is the opposite of what a burst needs.
+
+Why not the kernel log instead: it has two independent truncations, both visible in it. printk folds repeated
+faults into one `amd_iommu_report_page_fault: N callbacks suppressed` line (1 761 suppressed against 323 printed
+on the boot measured), and a large burst ends with `AMD-Vi: IOMMU Event log restarting`, so the readable set
+stops at the driver's log boundary. A kprobe counts before both.
+
+Cost, and why the probes are not left standing: the map/unmap probes above fire ~9 200 times per second, so a
+window is measured in SECONDS and then torn down; the teardown above leaves `kprobe_events` empty. If only the
+WHEN and the address are wanted (not the lifecycle), enable `pf` alone -- it fires about twice a minute.
 """
 import argparse
 import os

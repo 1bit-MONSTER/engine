@@ -498,10 +498,18 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         // full-length hit: the answer is drawn from the last position's logits and a snapshot holds
         // state, not logits, so that token is run again.
         int resume = 0;
+        // engine#2895: the reason a request was refused was recorded and never printed -- the only `[prefix] slot=`
+        // line sat inside the accept branch, so a refusal produced no line at all and read exactly like "the prefix
+        // path was never asked". Both branches log through one function, so a third decision path has to call it.
+        const auto log_prefix = [&ids](const npu::PrefixDecision& d) {
+            std::fprintf(stderr, "[prefix] slot=%d cached=%d of %zu reason=%s\n", d.slot, d.cached_tokens, ids.size(),
+                         d.reason.c_str());
+        };
         if (!cache_prompt && e.prefix && e.prefix->enabled()) {
             // A refusal to consult the cache is a decision, so the [prefix] line below says so rather than staying
             // silent: "no slot" and "you asked for no slot" must not read the same in a log (#650).
             stats.prefix = npu::PrefixDecision{-1, 0, "cache_prompt: false"};
+            log_prefix(stats.prefix);
         }
         if (cache_prompt && e.prefix && e.prefix->enabled()) {
             const npu::PrefixDecision d = e.prefix->lookup(cache_ids);
@@ -522,8 +530,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 }
             }
             // One line per decision, as FLM logs it, so the behaviour is checkable without a debugger.
-            std::fprintf(stderr, "[prefix] slot=%d cached=%d of %zu reason=%s\n", stats.prefix.slot,
-                         stats.prefix.cached_tokens, ids.size(), stats.prefix.reason.c_str());
+            log_prefix(stats.prefix);
         }
         if (img) {
             // Rows from `resume` on are what the prefill reads. The tower runs only when one of them is a picture's: a

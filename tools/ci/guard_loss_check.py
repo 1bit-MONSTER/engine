@@ -49,7 +49,12 @@ Exit: 0 nothing lost (or only moved), 1 a guard's identifiers are gone, 2 cannot
 """
 import argparse, re, subprocess, sys
 
-GUARD_KEYWORDS = ("refus", "assert", "GGML_ABORT", "!= 0", "== nullptr", "cannot", "must be", "is not set")
+# "throw " is in this list because it is the refusal idiom this tree actually uses: every route-level refusal in app/
+# and npu/ is a `throw std::runtime_error(...)`, so leaving it out made the row blind to the form the product relies on
+# (engine#2946, measured by calling removed_guards() on a deleted logprobs refusal in app/forward_serve.cpp: [] before,
+# [('…', 'refusal')] after). The trailing space keeps an identifier like `thrower` out of it. Measured cost before
+# adding it: 0 removed `throw ` lines across the last 25 main commits, so the keyword adds no historical noise.
+GUARD_KEYWORDS = ("refus", "assert", "GGML_ABORT", "!= 0", "== nullptr", "cannot", "must be", "is not set", "throw ")
 # engine#2761: a *diagnostic* is not a refusal, but losing one is not nothing either. Measured on
 # #2825, where a bundled hunk removed the gpu-hold wait-time re-check -- two lines (the `if` and the
 # `log "::warning::..."` it guarded) -- and this tool found **0 of 3** removed diagnostic lines,
@@ -82,7 +87,12 @@ def removed_guards(diff_text):
         stripped = body.strip()
         if stripped.startswith(("//", "*", "/*")):
             continue                      # a comment about a guard is not a guard
-        if any(k in body for k in GUARD_KEYWORDS) and ("if" in body or "assert" in body.lower()):
+        # `throw` is its own refusal shape: the `if`/`assert` test below is there to stop an incidental mention of a
+        # keyword from counting as a guard, but a throw IS the decision, and it is the form this tree's routes use
+        # (engine#2946: adding the keyword alone changed nothing, because a bare `throw std::runtime_error(...)` has no
+        # `if` on its line -- the arm caught that, not the review).
+        refusal_shape = "if" in body or "assert" in body.lower() or "throw" in body
+        if any(k in body for k in GUARD_KEYWORDS) and refusal_shape:
             out.append((path, body, "refusal"))
         elif any(k in body for k in WARN_KEYWORDS):
             # not a refusal (nothing is decided by it), but a diagnostic that left the file
@@ -190,6 +200,15 @@ def self_test():
         ok = got == want
         print(("ok   " if ok else "FAIL ") + label)
         fail += 0 if ok else 1
+
+    # engine#2946: a removed `throw` is a lost refusal. This is the refusal idiom the tree actually uses (every
+    # route-level refusal in app/ and npu/ is a throw), and before the keyword it was invisible: the same one-line
+    # removal below returned [] -- a row that exists to catch a deleted guard, blind to the product's own form.
+    throw_diff = ("+++ b/app/forward_serve.cpp\n"
+                  "-            throw std::runtime_error(\"logprobs: served on /v1/chat/completions\");\n"
+                  "+            // (removed)\n")
+    chk("a removed throw is a removed refusal", len(removed_guards(throw_diff)), 1)
+    chk("and `thrower` is not one", len(removed_guards("+++ b/x.cpp\n-    thrower_count += 1;\n")), 0)
 
     # a deleted guard whose identifier is gone from the file -> lost
     diff = "+++ b/src/a.cpp\n-if (ptr == nullptr || size == 0 || ptr % TENSOR_ALIGNMENT != 0) {\n+// nothing\n"

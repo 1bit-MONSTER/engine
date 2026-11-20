@@ -59,13 +59,25 @@ constexpr uint64_t kMiB = 1ull << 20, kGiB = 1ull << 30;
 // The same knob ggml-hrx reads (fork PR #166), so the pre-launch refusal and the allocation-time
 // backstop cannot disagree about where the wall is.
 constexpr uint64_t kGttReserveDefaultMiB = 16384;
+// engine#2986: the reserve is a CAP, not a constant. It was sized on a 120 GiB GTT (#680), and as a flat 16 GiB it left
+// a 16 GB machine (about 8 GiB of GTT by default) and a 32 GB one (about 16 GiB) with a ceiling of zero -- so ggml-hrx
+// refused the device at registration and `1bit serve` refused every load, whatever the model. The owner's direction is
+// machines with 16 GB or less, which is exactly the range the constant made unusable.
+//
+// 12.5 % of the total, capped at the 16 GiB this box's #680 measurement established. The explicit knob still wins, and
+// "the total is unknown" keeps the old flat value: a caller that cannot measure GTT must not get a smaller reserve than
+// the one that was measured to be safe.
+constexpr uint64_t kGttReservePermille = 125;
 
-inline uint64_t gtt_reserve_bytes() {
+inline uint64_t gtt_reserve_bytes(uint64_t gtt_total = 0) {
     if (const char* e = std::getenv("GGML_HRX_GTT_RESERVE_MB")) {
         const long long mb = std::atoll(e);
         if (mb >= 0) return uint64_t(mb) * kMiB;
     }
-    return kGttReserveDefaultMiB * kMiB;
+    const uint64_t flat = kGttReserveDefaultMiB * kMiB;
+    if (gtt_total == 0) return flat;
+    const uint64_t scaled = gtt_total / 1000 * kGttReservePermille + gtt_total % 1000 * kGttReservePermille / 1000;
+    return scaled < flat ? scaled : flat;
 }
 
 // The metadata a size estimate needs: integer scalars, integer arrays and general.architecture.
@@ -363,7 +375,7 @@ inline Verdict judge(const Need& need, const sysinfo::Memory& mem, uint64_t rese
         const uint64_t gtt_free = mem.gtt_total > mem.gtt_used ? mem.gtt_total - mem.gtt_used : 0;
         v.free = std::min(v.free, gtt_free);
         v.box = "GTT " + gib(gtt_free) + " of " + gib(mem.gtt_total) + " GiB free, " + v.box;
-        const uint64_t gtt_reserve = gtt_reserve_bytes();
+        const uint64_t gtt_reserve = gtt_reserve_bytes(mem.gtt_total);
         v.ceiling = mem.gtt_total > gtt_reserve ? mem.gtt_total - gtt_reserve : 0;
         v.projected = mem.gtt_used + need.total;
         v.over_ceiling = v.projected > v.ceiling;

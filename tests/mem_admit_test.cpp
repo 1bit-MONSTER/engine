@@ -269,14 +269,15 @@ int main() {
     expect("26 GiB with 30 GiB available: fits, with a program-cache warning", v.fits && !v.warnings.empty());
 
     // engine #680: the GTT ceiling refuses a load that would land where the device faulted, even when
-    // the free-memory test alone would admit it. 120 GiB of GTT, 60 GiB in use, 16 GiB reserve.
+    // the free-memory test alone would admit it. 120 GiB of GTT, 60 GiB in use, and since engine#2986 a reserve of
+    // 12.5 % of the total (15 GiB) rather than the flat 16 GiB, so the ceiling is 105 GiB.
     need.gpu = true;
     need.total = 40ull << 30;   // 60 + 40 = 100 GiB after the load
     v = admit::judge(need, box);
-    expect("40 GiB more: fits under the ceiling", v.fits && !v.over_ceiling && v.ceiling == (104ull << 30));
-    need.total = 45ull << 30;   // 60 + 45 = 105 GiB after the load, past the 104 GiB ceiling
+    expect("40 GiB more: fits under the ceiling", v.fits && !v.over_ceiling && v.ceiling == (105ull << 30));
+    need.total = 46ull << 30;   // 60 + 46 = 106 GiB after the load, past the 105 GiB ceiling
     v = admit::judge(need, box);
-    expect("45 GiB more: refused by the ceiling although 60 GiB is free", !v.fits && v.over_ceiling &&
+    expect("46 GiB more: refused by the ceiling although 60 GiB is free", !v.fits && v.over_ceiling &&
                                                                       v.free >= need.total);
     expect("the refusal names the ceiling and the reserve",
            v.ceiling_note.find("ceiling") != std::string::npos &&
@@ -284,11 +285,34 @@ int main() {
     need.total = 1ull << 30;    // 61 GiB after the load: inside the ceiling, and above #315's zone only warns
     v = admit::judge(need, box);
     expect("1 GiB more: fits, no ceiling note", v.fits && v.ceiling_note.empty());
+    // engine#2986: the reserve scales, so a pool SMALLER than the old flat 16 GiB is usable now -- which is the whole
+    // point (a 16 GB machine gets about 8 GiB of GTT). 12.5 % of 8 GiB is 1 GiB, so the ceiling is 7 GiB and a 2 GiB
+    // model fits where the flat reserve answered "no ceiling to fit under" for any size.
     sysinfo::Memory small = box;
-    small.gtt_total = 8ull << 30;   // smaller than the 16 GiB reserve: no ceiling to fit under
+    small.gtt_total = 8ull << 30;
     small.gtt_used = 0;
+    small.mem_available = 32ull << 30;
+    need.total = 2ull << 30;
     v = admit::judge(need, small);
-    expect("a pool smaller than the reserve: refused at any size", !v.fits && v.over_ceiling && v.ceiling == 0);
+    expect("an 8 GiB pool (a 16 GB machine): the ceiling is 7 GiB and a 2 GiB model fits",
+           v.fits && !v.over_ceiling && v.ceiling == (7ull << 30));
+    need.total = 7ull << 30;    // 0 + 7 == the ceiling: allowed, the reserve is what must stay free
+    v = admit::judge(need, small);
+    expect("a model that exactly fills the ceiling fits", v.fits && !v.over_ceiling);
+    need.total = (7ull << 30) + (1ull << 20);   // one MiB past it: refused
+    v = admit::judge(need, small);
+    expect("...and one MiB past the ceiling is refused", !v.fits && v.over_ceiling);
+    // The cap still holds where the flat value was measured: 12.5 % of 120 GiB is 15 GiB, and of 200 GiB it would be 25
+    // GiB without the cap -- so a large pool keeps the 16 GiB reserve #680 established and not more.
+    expect("a 200 GiB pool is capped at the 16 GiB reserve", admit::gtt_reserve_bytes(200ull << 30) == (16ull << 30));
+    setenv("GGML_HRX_GTT_RESERVE_MB", "2048", 1);
+    expect("and an explicit GGML_HRX_GTT_RESERVE_MB still wins over the scaling",
+           admit::gtt_reserve_bytes(8ull << 30) == (2ull << 30));
+    unsetenv("GGML_HRX_GTT_RESERVE_MB");
+    // "the total is unknown" keeps the flat value: a caller that cannot measure GTT must not get a smaller reserve.
+    expect("no GTT total known: the flat 16 GiB reserve", admit::gtt_reserve_bytes(0) == (16ull << 30));
+    need.total = 1ull << 30;
+    v = admit::judge(need, box);
 
     fs::remove_all(dir);
     if (failures) std::printf("%d FAILED\n", failures);

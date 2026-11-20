@@ -132,6 +132,19 @@ GPU_FAULT_SKIP_RE='aie2_tdr_recover_all: TDR recovery throttled|kernel:  [A-Za-z
 
 # engine#2803: the take-time refusal says WHICH KIND of fault it saw. One name per class, used for the newest matching line and
 # for the window's first compute marker, so the two cannot describe the same fault differently.
+# engine#2961: WHICH DEVICE a fault line belongs to. The ticket refusal used to count one regex across every
+# device, so an amdxdna (NPU) recovery refused GPU tickets for ten minutes -- measured on boot 0: an NPU line sat
+# inside the take-time window for 27 % of the boot's minutes (69/252) while the GPU logged zero faults, and on
+# 2026-11-20 that cost coder-llm's own ticket (the PR-agent LLM, :8090 down until the clock cleared) and an
+# orchestrator-granted window for engine#2861 whose ladder never ran. A fault on one device says nothing about
+# the other, so the refusal is scoped and the other device's fault is reported as a note instead.
+fault_device() {  # $1 = a kernel-log line -> NPU | GPU
+    case "$1" in
+        *amdxdna*) echo NPU ;;
+        *)         echo GPU ;;
+    esac
+}
+
 fault_class() {  # $1 = a kernel-log line -> a short class, or "" when the line carries no compute marker
     case "$1" in
         *"[gfxhub] page fault"*)     echo "a gfxhub page fault" ;;
@@ -493,12 +506,38 @@ while [ "$state" = queued ]; do
                     # event count zero, i.e. it would have granted the ticket after a reset). Synthetic logs in the tests
                     # carry no timestamp, so there a line is its own event and the old behaviour is reproduced exactly.
                     _faults=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE")
+                    # engine#2961: which device is THIS ticket for? npu-hold execs this script with the NPU's own
+                    # queue and token, so the queue path answers it; GPU_HOLD_DEVICE overrides for a test or for a
+                    # fleet that names its queues differently. A fault on the other device is reported, never refused.
+                    _ticket_dev=${GPU_HOLD_DEVICE:-}
+                    if [ -z "$_ticket_dev" ]; then
+                        case "$QUEUE" in *npu*) _ticket_dev=NPU ;; *) _ticket_dev=GPU ;; esac
+                    fi
+                    _mine_faults=$(printf '%s\n' "$_faults" | while IFS= read -r _ln; do
+                                       [ -n "$_ln" ] || continue
+                                       [ "$(fault_device "$_ln")" = "$_ticket_dev" ] && printf '%s\n' "$_ln"
+                                   done)
+                    _other_faults=$(printf '%s\n' "$_faults" | while IFS= read -r _ln; do
+                                       [ -n "$_ln" ] || continue
+                                       [ "$(fault_device "$_ln")" != "$_ticket_dev" ] && printf '%s\n' "$_ln"
+                                   done)
                     _reset_lines=$(printf '%s\n' "$_faults" | grep -c .)
-                    _resets=$(printf '%s\n' "$_faults" | awk '
+                    _resets=$(printf '%s\n' "$_mine_faults" | awk '
                         NF == 0 { next }   # an empty capture is ONE BLANK LINE to awk and would count as an event
                         { if ($0 ~ /^[A-Z][a-z][a-z] +[0-9]+ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) k = $1" "$2" "$3; else k = $0
                           if (!(k in seen)) { seen[k]; n++ } }
                         END { printf "%d", n + 0 }')
+                    if [ "${_resets:-0}" -eq 0 ] && [ -n "$(printf '%s' "$_other_faults" | grep -m1 .)" ]; then
+                        # the other device faulted and this ticket is not for it: say so, take the ticket, and let
+                        # the lane decide -- dropping the line silently would hide the box's state from the log
+                        _othern=$(printf '%s\n' "$_other_faults" | awk '
+                            NF == 0 { next }
+                            { if ($0 ~ /^[A-Z][a-z][a-z] +[0-9]+ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) k = $1" "$2" "$3; else k = $0
+                              if (!(k in seen)) { seen[k]; n++ } }
+                            END { printf "%d", n + 0 }')
+                        _otherclass=$(fault_class "$(printf '%s\n' "$_other_faults" | tail -1)")
+                        log "note: ${_othern} fault event(s) for the other device in the last ${_reset_window} min (the newest is ${_otherclass:-a device fault}) - not refusing a ${_ticket_dev} ticket for them (engine#2961)"
+                    fi
                     if [ "${_resets:-0}" -gt 0 ]; then
                         rm -f "$TOKEN"; state=done
                         # HOW OLD is the newest one? "in the last 10 min" cannot tell a wedged device from another lane's
@@ -510,7 +549,9 @@ while [ "$state" = queued ]; do
                         # for 60 s after every power-cycle and says "no context touched", so without this the refusal could
                         # count only real faults and then report the notice's age as if it were the newest fault's.
                         _newest=$(journalctl -k --since "-${_reset_window} min" --no-pager -o short-unix -q 2> /dev/null |
-                                  grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -1 | awk '{print int($1)}')
+                                  grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" |
+                                  while IFS= read -r _ln; do [ "$(fault_device "$_ln")" = "$_ticket_dev" ] && printf '%s\n' "$_ln"; done |
+                                  tail -1 | awk '{print int($1)}')
                         _age=""
                         case "${_newest:-}" in ''|*[!0-9]*) ;; *) _age=", newest $(( $(date +%s) - _newest ))s ago" ;; esac
                         # engine#2803: "fault line(s)" alone reads as "the thing you were about to measure is broken", and the
@@ -518,13 +559,13 @@ while [ "$state" = queued ]; do
                         # were another lane's suite, and the log says so in the line in front of the reset ("Process
                         # hrx-ops-test pid 186654"). Name what the newest line is, and who it names when it names someone --
                         # the refusal itself is unchanged, so a real ring/MES/page fault still refuses exactly as before.
-                        _newest_line=$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | tail -1)
+                        _newest_line=$(printf '%s\n' "$_mine_faults" | tail -1)
                         _what=$(fault_class "$_newest_line"); [ -n "$_what" ] || _what="a device fault"
                         # The newest line in every one of this boot's reset windows is the SYMPTOM ("GPU reset(N) succeeded!");
                         # what the client actually did is the window's FIRST compute marker, 6-8 s earlier
                         # ([gfxhub] page fault / ring timeout / MES). Quoting it turns "the box is faulting" into "this
                         # suite faulted, here is the fault" (review ask on #2805).
-                        _firstwhat=$(fault_class "$(printf '%s\n' "$_klog" | grep -iE "$_reset_re" | grep -viE "$GPU_FAULT_SKIP_RE" | head -1)")
+                        _firstwhat=$(fault_class "$(printf '%s\n' "$_mine_faults" | head -1)")
                         _first=""
                         [ -n "$_firstwhat" ] && [ "$_firstwhat" != "$_what" ] && _first=" (the window's first compute marker is ${_firstwhat})"
                         # the driver prints "Process <name> pid <n>" on its own interrupt lines, a few lines BEFORE the reset

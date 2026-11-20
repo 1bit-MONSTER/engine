@@ -72,12 +72,14 @@ echo 40000 > "$scratch/tctl"   # 40 C, in millidegrees
 # script: an NPU ticket's only look at the log before work starts is this check, so `amdxdna` faults have to count.
 # Each arm runs the real hold against a klog file with a 10-minute take-time window and the during-hold watch OFF, so
 # what is being tested is the refusal and nothing else.
-take_run() {   # $1 arm name  $2 the kernel-log line (or "clean")
+take_run() {   # $1 arm name  $2 the kernel-log line (or "clean")  $3 device the ticket is for (GPU by default)
     local q=$scratch/tq$1; mkdir -p "$q"; rm -f "$scratch/TTOKEN$1"
     : > "$scratch/tklog$1"
     printf '%s\n' "kernel: amdgpu 0000:c5:00.0: [drm] Initialized" > "$scratch/tklog$1"
     [ "$2" = clean ] || printf '%s\n' "$2" >> "$scratch/tklog$1"
-    env GPU_HOLD_KLOG_FILE="$scratch/tklog$1" GPU_QUEUE_DIR="$q" GPU_TOKEN_FILE="$scratch/TTOKEN$1" \
+    # engine#2961: the refusal is scoped to the ticket's own device, so an arm about the NPU RULE has to say that
+    # its ticket is an NPU ticket -- otherwise it is testing a GPU ticket against an NPU fault, which is now a note.
+    env GPU_HOLD_DEVICE="${3:-GPU}" GPU_HOLD_KLOG_FILE="$scratch/tklog$1" GPU_QUEUE_DIR="$q" GPU_TOKEN_FILE="$scratch/TTOKEN$1" \
         GPU_HOLD_LOG="$scratch/tlog$1" GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 \
         GPU_HOLD_RESET_WINDOW_MIN=10 GPU_HOLD_FAULT_ABORT=0 GPU_HOLD_TCTL_START=100 \
         GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x" \
@@ -115,6 +117,48 @@ grep -q "the driver last named hrx-ops-test pid 186654" "$scratch/tlogclass" \
 grep -q "the window's first compute marker is a gfxhub page fault" "$scratch/tlogclass" \
     || { echo "FAIL take-time class: the refusal does not quote the window's first compute marker"; fail=1; }
 
+# engine#2961: THE REFUSAL IS SCOPED TO THE DEVICE THE TICKET IS FOR. Before this, one regex counted every
+# device's faults, so an amdxdna (NPU) recovery refused GPU tickets for ten minutes: on boot 0 an NPU line sat
+# inside the take-time window for 27 % of the boot's minutes while the GPU logged nothing, and on 2026-11-20 that
+# cost coder-llm's own ticket (:8090 down, i.e. every PR's review check) and an orchestrator-granted window for
+# engine#2861 whose ladder never ran. A fault on one device says nothing about the other, so the other device's
+# faults are a NOTE and the ticket is granted.
+qd=$scratch/qdev; mkdir -p "$qd"; rm -f "$qd"/* "$scratch"/Tdev*
+printf '%s\n' "kernel: amdxdna 0000:c6:00.1: aie2_set_cmd_timeout: Fatal error task ID: 0" \
+              "kernel: amdxdna 0000:c6:00.1: aie2_tdr_dead_fw_recover_all: Array stopped dispatching, power-cycling NPU" \
+              > "$scratch/kdev-npu"
+printf '%s\n' "kernel: amdgpu 0000:c5:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:9 pasid:6121)" \
+              "kernel: amdgpu 0000:c5:00.0: MES failed to respond to msg=REMOVE_QUEUE" \
+              > "$scratch/kdev-gpu"
+# $1 = klog fixture, $2 = the device the ticket is for, $3 = expected rc
+take_dev() {
+    rm -f "$qd"/*
+    env GPU_HOLD_KLOG_FILE="$scratch/kdev-$1" GPU_HOLD_DEVICE="$2" GPU_QUEUE_DIR="$qd" GPU_TOKEN_FILE="$scratch/Tdev" \
+        GPU_HOLD_LOG="$scratch/tdevlog" GPU_HOLD_POLL=1 GPU_HOLD_WAIT=1 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 \
+        GPU_HOLD_RESET_WINDOW_MIN=10 GPU_HOLD_FAULT_ABORT=0 GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE="$scratch/xdev" \
+        GPU_HOLD_THERMAL_FLAG="$scratch/xdev" \
+        timeout 60 "$hold" -t 1 -l "t$1$2" -- true > /dev/null 2>&1
+}
+take_dev npu GPU; rc_npu_gpu=$?
+[ "$rc_npu_gpu" = 0 ] || { echo "FAIL device scope: an NPU fault refused a GPU ticket (rc $rc_npu_gpu, want 0)"; fail=1; }
+grep -q "fault event(s) for the other device" "$scratch/tdevlog" \
+    || { echo "FAIL device scope: a granted GPU ticket did not say the NPU had faulted"; fail=1; }
+take_dev npu NPU; rc_npu_npu=$?
+[ "$rc_npu_npu" = 78 ] || { echo "FAIL device scope: an NPU fault did NOT refuse an NPU ticket (rc $rc_npu_npu, want 78)"; fail=1; }
+take_dev gpu GPU; rc_gpu_gpu=$?
+[ "$rc_gpu_gpu" = 78 ] || { echo "FAIL device scope: a GPU fault did NOT refuse a GPU ticket (rc $rc_gpu_gpu, want 78) -- the guard this row exists for"; fail=1; }
+take_dev gpu NPU; rc_gpu_npu=$?
+[ "$rc_gpu_npu" = 0 ] || { echo "FAIL device scope: a GPU fault refused an NPU ticket (rc $rc_gpu_npu, want 0)"; fail=1; }
+# ... and npu-hold's own queue path picks the device with no variable set: *npu* in the queue is the NPU's ticket
+rm -f "$qd"/*; qn=$scratch/npu-queue; mkdir -p "$qn"
+env -u GPU_HOLD_DEVICE GPU_HOLD_KLOG_FILE="$scratch/kdev-npu" GPU_QUEUE_DIR="$qn" GPU_TOKEN_FILE="$scratch/Tdev2" \
+    GPU_HOLD_LOG="$scratch/tdevlog2" GPU_HOLD_POLL=1 GPU_HOLD_WAIT=1 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 \
+    GPU_HOLD_RESET_WINDOW_MIN=10 GPU_HOLD_FAULT_ABORT=0 GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE="$scratch/xdev" \
+    GPU_HOLD_THERMAL_FLAG="$scratch/xdev" \
+    timeout 60 "$hold" -t 1 -l tnpuq -- true > /dev/null 2>&1
+rc_npuq=$?
+[ "$rc_npuq" = 78 ] || { echo "FAIL device scope: a ticket on an *npu* queue did not adopt the NPU device (rc $rc_npuq, want 78)"; fail=1; }
+
 # engine#2851: a BACKTRACE IS ONE EVENT, NOT ELEVEN. Every arm above injects a log with no timestamp in it, so each
 # line is its own event there and the counts read the same as they did before the event count existed -- i.e. the
 # branch that dedupes journal lines had NO arm until this one. Measured on the box 2026-11-16 19:33: the driver's reset
@@ -146,11 +190,11 @@ grep -q "the event count is the one to read" "$scratch/tlogevents" \
     || { echo "FAIL take-time events: the message must say which of the two numbers to read"; fail=1; }
 
 # the NPU spelling: this is the line the rules say to stop for, and npu-hold has no other take-time check
-take_run npu "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* command timeout: opcode 0x2"
+take_run npu "kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* command timeout: opcode 0x2" NPU
 [ "$trc" = 78 ] || { echo "FAIL take-time: an amdxdna command timeout -> rc $trc, want 78 (the NPU rule)"; fail=1; }
 [ "$ttok" = released ] || { echo "FAIL take-time: the token was still held after an NPU refusal"; fail=1; }
 
-take_run powercycle "kernel: amdxdna 0000:c6:00.1: [drm] power-cycle"
+take_run powercycle "kernel: amdxdna 0000:c6:00.1: [drm] power-cycle" NPU
 [ "$trc" = 78 ] || { echo "FAIL take-time: an amdxdna power-cycle -> rc $trc, want 78"; fail=1; }
 
 # engine#2494 (cl-infra 11-15): the take-time pattern was a separate copy that lacked these two, so the ticket after a
@@ -193,8 +237,10 @@ mkdir -p "$scratch/agebin2"; t1=$(( $(date +%s) - 600 )); t2=$(( $(date +%s) - 1
 printf '#!/bin/bash\nprintf "%s kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_error_worker: fault at 0x0\\n" %s\nprintf "%s kernel: amdxdna 0000:c6:00.1: aie2_tdr_recover_all: TDR recovery throttled: last power-cycle 45560 ms ago; no context touched\\n" %s\n' "$t1" "$t1" "$t2" "$t2" > "$scratch/agebin2/journalctl"
 chmod +x "$scratch/agebin2/journalctl"
 rm -f "$scratch/age-token2"
+# engine#2961: this arm's log is an NPU fault, so its ticket must BE an NPU ticket -- the arm is about the age
+# query and the recovery-notice skip, not about which device the refusal applies to.
 env PATH="$scratch/agebin2:$PATH" HOME=$scratch ONEBIT_HOLD_DIR="$scratch/agehold2" GPU_HOLD_COOLDOWN=0 \
-    GPU_HOLD_WAIT=5 GPU_HOLD_MINUTES=1 GPU_HOLD_THERMAL_FLAG="$scratch/x" GPU_HOLD_RESET_WINDOW_MIN=10 \
+    GPU_HOLD_DEVICE=NPU GPU_HOLD_WAIT=5 GPU_HOLD_MINUTES=1 GPU_HOLD_THERMAL_FLAG="$scratch/x" GPU_HOLD_RESET_WINDOW_MIN=10 \
     timeout 60 "$hold" -l takeage2 -- true > "$scratch/tlogage2" 2>&1
 age2_rc=$?
 [ "$age2_rc" = 78 ] || { echo "FAIL take-time age/skip: rc $age2_rc, want 78"; fail=1; }

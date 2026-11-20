@@ -354,6 +354,45 @@ bool XdnaTarget::weight_cached(int layer, int key) const {
            wcache_[(size_t)layer].find(key) != wcache_[(size_t)layer].end();
 }
 
+// engine#1783: persist and restore a weight-cache slot. Only the plain int8 image of a prefill context: that is the one
+// slot_bo() hands the launch for it, and its bytes plus the per-column scales are everything the dequant reads.
+bool XdnaTarget::export_weight(int role, int layer, int wkey, std::vector<uint8_t>* img, std::vector<float>* scales) const {
+    if (img == nullptr || scales == nullptr || role < 0 || role >= Q4NX_MAX_DESIGNS || !ctx_[role]) return false;
+    const I8Ctx& kctx = *ctx_[role];
+    if (kctx.w4g32 || kctx.pb16i || kctx.t2s || kctx.gemv) return false;
+    if (layer < 0 || size_t(layer) >= wcache_.size()) return false;
+    const auto it = wcache_[size_t(layer)].find(wkey);
+    if (it == wcache_[size_t(layer)].end() || !it->second.bo) return false;
+    const void* m = it->second.bo->map();
+    if (m == nullptr) return false;
+    img->assign(static_cast<const uint8_t*>(m), static_cast<const uint8_t*>(m) + kctx.w_bytes());
+    *scales = it->second.scales;
+    return true;
+}
+
+bool XdnaTarget::import_weight(int role, int layer, int wkey, size_t bytes, const std::function<bool(void*)>& fill,
+                               const std::vector<float>& scales, std::string& err) {
+    if (role < 0 || role >= Q4NX_MAX_DESIGNS || !ctx_[role] || !dev_) { err = "import: no context for the role"; return false; }
+    I8Ctx& kctx = *ctx_[role];
+    if (kctx.w4g32 || kctx.pb16i || kctx.t2s || kctx.gemv) { err = "import: not a plain int8 context"; return false; }
+    if (!weight_cache_ || layer < 0 || layer >= n_layers_) { err = "import: no weight cache for the layer"; return false; }
+    if (bytes != kctx.w_bytes() || scales.size() != size_t(kctx.ND)) {
+        err = "import: " + std::to_string(bytes) + " B / " + std::to_string(scales.size()) + " scales for a K" +
+              std::to_string(kctx.KD) + " N" + std::to_string(kctx.ND) + " context";
+        return false;
+    }
+    if (int(wcache_.size()) <= layer) wcache_.resize(size_t(layer) + 1);
+    if (wcache_[size_t(layer)].count(wkey) != 0) { err = "import: the slot is already resident"; return false; }
+    PackedWeight pw;
+    pw.bo = kctx.make_weight_bo(*dev_, /*zero=*/false);
+    void* m = pw.bo->map();
+    if (m == nullptr || !fill(m)) { err = "import: the image could not be read"; return false; }
+    pw.bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    pw.scales = scales;
+    wcache_[size_t(layer)].emplace(wkey, std::move(pw));
+    return true;
+}
+
 bool XdnaTarget::fill_int8_and_w4(PackedWeight& pw, I8Ctx& kctx, int role, const float* Bmat, int K, int N,
                                   std::string& err) {
     const bool in_range = role >= 0 && role < Q4NX_MAX_DESIGNS;

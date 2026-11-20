@@ -43,6 +43,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -99,6 +100,7 @@ public:
         }
 
         Weight& w = weight(key, B, K, N, st);
+        if (w.role < 0) { w.role = role; w.k = st.k; w.n = st.n; }
         const auto t0 = std::chrono::steady_clock::now();
         // engine#1783: with direct output (default) the target dequantises each chunk's rows straight into C, so C is sized
         // once and nothing is copied; ONEBIT_AUDIO_DIRECT_OUT=0 keeps the staged-width buffer and the per-row copy.
@@ -170,6 +172,52 @@ public:
         return caches_ && it != w_.end() && it->second.padded.empty();
     }
 
+    // engine#1783: every weight the target holds, with what it takes to restore it in another process: `out(key, role, staged
+    // K, staged N, image, scales)`. Returns how many were handed out.
+    template <class Out>
+    int export_weights(Out&& out) const {
+        int n = 0;
+        std::vector<uint8_t> img;
+        std::vector<float> sc;
+        for (const auto& kv : w_) {
+            const Weight& w = kv.second;
+            if (!caches_ || !w.padded.empty() || w.role < 0) continue;
+            if (!t_.export_weight(w.role, 0, w.wkey, &img, &sc)) continue;
+            out(kv.first, w.role, w.k, w.n, img, sc);
+            ++n;
+        }
+        return n;
+    }
+
+    // engine#1783: make `key` resident from a persisted image, as if a gemm() had packed it: cached(key) is then true, the
+    // executor skips loading the f32 weight, and gemm() launches with no Bmat. The design must still be role `role` at
+    // the same staged shape; false + why otherwise (the caller then lets the weight be packed as usual).
+    bool import_weight(const std::string& key, int role, int k, int n, size_t bytes, const std::function<bool(void*)>& fill,
+                       const std::vector<float>& scales, std::string* why) {
+        if (!caches_ || w_.count(key) != 0) {
+            if (why) *why = "import: " + key + " is already known";
+            return false;
+        }
+        if (role < 0 || size_t(role) >= designs_.size() || designs_[size_t(role)].K != k || designs_[size_t(role)].N != n) {
+            if (why) *why = "import: " + key + " was saved for a design this set does not have at that role";
+            return false;
+        }
+        std::string err;
+        const int wkey = next_wkey_;
+        if (!t_.import_weight(role, 0, wkey, bytes, fill, scales, err)) {
+            if (why) *why = err;
+            return false;
+        }
+        ++next_wkey_;
+        Weight w;
+        w.wkey = wkey;
+        w.role = role;
+        w.k = k;
+        w.n = n;
+        w_.emplace(key, std::move(w));
+        return true;
+    }
+
     double device_ms() const { return device_ms_; }
     int launches() const { return launches_; }
     int products() const { return products_; }
@@ -180,6 +228,7 @@ private:
     struct Weight {
         int wkey = -1;
         std::vector<float> padded;   // K_staged x N_staged, until the target has it
+        int role = -1, k = 0, n = 0; // the design it launches on, and the staged shape (export_weights)
     };
 
     // The design for staged (k, n): the exact one, else the same-K design with the smallest N above n (engine#1783: a sealed

@@ -27,6 +27,7 @@
 #define ONEBIT_NPU_TARGET_TARGET_H
 
 #include <cstdint>   // uint8_t: TileFn's tile buffer.  Listed rather than relied on from an includer.
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -154,6 +155,22 @@ public:
     virtual bool gdn_step(int /*layer*/, int /*M*/, const float* /*x*/, float* /*y*/) { return false; }
     virtual bool attn_step(int /*layer*/, int /*M*/, const float* /*q*/, float* /*o*/) { return false; }
     virtual bool lm_head(const float* /*h*/, float* /*logits*/) { return false; }
+
+    // engine#1783: a resident (weight-cached) weight's packed image out, and one back in, so a later process can skip the
+    // pack (tools/whisper_npu_wcache.h). export: the image bytes and per-column scales of weight `wkey` at `layer`, as
+    // the role's context launches it; false = not resident, or a layout this target does not persist. import: make
+    // `wkey` resident for `role` from `bytes` image bytes that `fill(dst)` writes, with its scales; the image must be
+    // exactly what the target's own pack wrote, so the launch reads the same bytes either way.
+    virtual bool export_weight(int /*role*/, int /*layer*/, int /*wkey*/, std::vector<uint8_t>* /*img*/,
+                               std::vector<float>* /*scales*/) const {
+        return false;
+    }
+    virtual bool import_weight(int /*role*/, int /*layer*/, int /*wkey*/, size_t /*bytes*/,
+                               const std::function<bool(void*)>& /*fill*/, const std::vector<float>& /*scales*/,
+                               std::string& err) {
+        err = "this target does not import weights";
+        return false;
+    }
 
     virtual bool supports(Op op) const { return op == Op::gemv; }
     virtual Caps caps() const = 0;

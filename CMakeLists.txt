@@ -342,6 +342,9 @@ set_tests_properties(make_audio_pack PROPERTIES SKIP_RETURN_CODE 77)
 # tree configured against a different submodule keeps stale include paths and reports a missing
 # header as a suite failure. SKIP_RETURN_CODE 77 is what makes a not-yet-applicable row a SKIP and
 # not a FAIL in the ctest log.
+# engine#2912: once it does run, a fork row that printed "test skipped: no device available" is counted as
+# not having run -- neither a known failure nor a new one -- and FAILS this row, whose subject is the
+# hardware. ONEBIT_FORK_CTEST_NO_DEVICE=skip is the explicit 77 for a box that is allowed to have none.
 add_test(NAME fork_ctest_known_fail
          COMMAND /bin/sh ${CMAKE_SOURCE_DIR}/tools/ci/fork_ctest_known_fail.sh)
 set_tests_properties(fork_ctest_known_fail PROPERTIES SKIP_RETURN_CODE 77)
@@ -1538,6 +1541,8 @@ if(Python3_Interpreter_FOUND)
     # over six fixtures (no opt-in, tool absent, no build tree, no git in ROOT, submodule absent, submodule stale),
     # all upstream of the suite, so the test never runs ctest. It also catches the shebang: an `sh` script is run as
     # an executable here, which is how the python3 shebang it shipped with reads as a SyntaxError.
+    # engine#2912 added the states past that point, on a stub `ctest`: rows that printed the fork's no-device line
+    # fail the row in their own column (1), or skip it (77) where a box may have no device; never 0.
     add_test(NAME fork_ctest_row COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/fork_ctest_row_test.py)
     set_tests_properties(fork_ctest_row PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 

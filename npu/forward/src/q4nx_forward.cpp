@@ -3518,6 +3518,10 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
     vc.resize((old + 1) * (size_t)NH * vh);
     krc.resize((old + 1) * (size_t)rope_dim_);
     // k_b[h] : [kh][kv_lora] (stored padded to a 32-row tile, so read kh real rows)
+    // The heads are independent (disjoint dk/dv slices of kn/vc, shared read-only kl), so this loop is the
+    // first of the two that parallelise.  Each output element keeps its own k-order, so the result is
+    // bit-identical to the serial loop by construction -- and the arm measures the greedy text anyway.
+#pragma omp parallel for schedule(static)
     for (int h = 0; h < NH; h++) {
         // k_b: Q4NX tile grid [kv_lora][nope padded to 256], indexed flat[n*kv_lora+k].
         // v_b: the Q4NX tiles v_b with cols=256 while its LOGICAL row is 512 wide, so
@@ -3545,11 +3549,22 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
     for (int i = 0; i < rope_dim_; i++) krc[old * (size_t)rope_dim_ + i] = kr[i];
 
     // Scores and softmax over the cache, then the weighted sum of v.
+    //
+    // Cost is O(NH * T * (kh + rope + vh)) per layer per position, i.e. O(T^2) over a prompt, and it is host
+    // scalar work: this is the prefill's own loop, not a projection.  Per head it is independent (its own row
+    // of `score`, its own slice of `ctx`, read-only cache), so it parallelises with the k-order of every dot
+    // untouched -- bit-identical again.
+    //
+    // `if (T >= 64)`: on a cold cache (decode, T = a few hundred at most but one position) the fork/join costs
+    // more than the loop -- parallelising this loop unconditionally was measured *slower* on 2026-11-03
+    // (3.4-4.5 vs 5.5-6.0 tok/s), which is why the gate exists instead of a bare pragma.
     const int T = pos + 1;
     const float scale = 1.0f / std::sqrt((float)(qh));
     std::vector<float> ctx((size_t)NH * vh, 0.0f);
-    std::vector<float> score(T);
+    std::vector<std::vector<float>> score((size_t)NH, std::vector<float>((size_t)T));
+#pragma omp parallel for schedule(static) if (T >= 64)
     for (int h = 0; h < NH; h++) {
+        std::vector<float>& sc = score[(size_t)h];
         const float* qn = &q[(size_t)h * qh];
         const float* qr = qn + qk_nope_;
         float mx = -1e30f;
@@ -3559,15 +3574,15 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
             float s = 0.0f;
             for (int i = 0; i < kh; i++) s += qn[i] * kt[i];
             for (int i = 0; i < rope_dim_; i++) s += qr[i] * rt[i];
-            score[t] = s * scale;
-            if (score[t] > mx) mx = score[t];
+            sc[(size_t)t] = s * scale;
+            if (sc[(size_t)t] > mx) mx = sc[(size_t)t];
         }
         float sum = 0.0f;
-        for (int t = 0; t < T; t++) { score[t] = std::exp(score[t] - mx); sum += score[t]; }
+        for (int t = 0; t < T; t++) { sc[(size_t)t] = std::exp(sc[(size_t)t] - mx); sum += sc[(size_t)t]; }
         const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
         float* out = &ctx[(size_t)h * vh];
         for (int t = 0; t < T; t++) {
-            const float pm = score[t] * inv;
+            const float pm = sc[(size_t)t] * inv;
             const float* vt = &vc[(size_t)t * NH * vh + (size_t)h * vh];
             for (int i = 0; i < vh; i++) out[i] += pm * vt[i];
         }

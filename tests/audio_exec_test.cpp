@@ -102,9 +102,16 @@ int main(int argc, char** argv) {
         for (int t = 0; t < frames; ++t)
             mel[size_t(b) * frames + t] = float(std::sin(0.013 * (b + 1) * (t + 1)) * 0.5 + 0.25);
 
+    // engine#1783: the reference run takes the fused attention, whatever the caller's environment says (an A/B run leaves
+    // ONEBIT_AUDIO_FUSED_ATTN=0 exported, and then the bit-identity arm below would compare unfused with unfused).
+    const char* fused_prev = std::getenv("ONEBIT_AUDIO_FUSED_ATTN");
+    const std::string fused_keep = fused_prev != nullptr ? fused_prev : "";
+    unsetenv("ONEBIT_AUDIO_FUSED_ATTN");
     AudioRunResult r;
     std::string why;
-    if (!run_audio_graph(g, mel.data(), bins, frames, "", &r, &why)) {
+    const bool ref_ok = run_audio_graph(g, mel.data(), bins, frames, "", &r, &why);
+    if (fused_prev != nullptr) setenv("ONEBIT_AUDIO_FUSED_ATTN", fused_keep.c_str(), 1);
+    if (!ref_ok) {
         std::printf("FAIL run: %s\n", why.c_str());
         return 1;
     }
@@ -115,15 +122,16 @@ int main(int argc, char** argv) {
     {
         // engine#1783: the fused attention (MatMul -> Softmax -> MatMul in one pass per four-row group) must be
         // bit-identical to the node-at-a-time path. Same input, fusion off, compare every byte.
-        const char* prev = std::getenv("ONEBIT_AUDIO_FUSED_ATTN");
-        const std::string keep = prev != nullptr ? prev : "";
         setenv("ONEBIT_AUDIO_FUSED_ATTN", "0", 1);
         AudioRunResult u;
         std::string uwhy;
         const bool ok = run_audio_graph(g, mel.data(), bins, frames, "", &u, &uwhy);
-        if (prev != nullptr) setenv("ONEBIT_AUDIO_FUSED_ATTN", keep.c_str(), 1);
+        if (fused_prev != nullptr) setenv("ONEBIT_AUDIO_FUSED_ATTN", fused_keep.c_str(), 1);
         else unsetenv("ONEBIT_AUDIO_FUSED_ATTN");
         check(ok, "unfused encoder run: " + uwhy);
+        std::printf("fused attention groups: reference %zu, control %zu\n", r.fused_attention_groups, u.fused_attention_groups);
+        check(r.fused_attention_groups > 0, "the reference run took the fused attention");
+        check(u.fused_attention_groups == 0, "the control run (ONEBIT_AUDIO_FUSED_ATTN=0) took the node-by-node path");
         const bool same = ok && u.dims == r.dims && u.data.size() == r.data.size() &&
                           std::memcmp(u.data.data(), r.data.data(), r.data.size() * sizeof(float)) == 0;
         check(same, "fused attention is bit-identical to the unfused path");

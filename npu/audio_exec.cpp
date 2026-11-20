@@ -460,6 +460,7 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         struct AttnFuse { size_t softmax = 0, pv = 0; };   // 0-based node indices of the Softmax and the second MatMul
         std::map<size_t, AttnFuse> attn_fuse;              // keyed by the first MatMul's 0-based index
         std::vector<char> fused_away(g.nodes.size(), 0);
+        size_t fused_groups = 0;   // reported in AudioRunResult::fused_attention_groups
         {
             const char* fa = std::getenv("ONEBIT_AUDIO_FUSED_ATTN");
             const bool on = fa == nullptr || fa[0] != '0';
@@ -595,6 +596,7 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                                 }
                             }
                         });
+                        ++fused_groups;
                         fused_away[fz->second.softmax] = 1;
                         fused_away[fz->second.pv] = 1;
                         (void)sm;
@@ -981,6 +983,7 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         if (it == t.end()) fail("output '" + want + "' was never produced");
         out->dims = it->second.dims;
         out->data = it->second.data;
+        out->fused_attention_groups = fused_groups;
         out->i64 = it->second.i64;
         out->b = it->second.b;
         return true;

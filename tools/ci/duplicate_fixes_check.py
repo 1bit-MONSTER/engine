@@ -320,6 +320,14 @@ def main(argv):
     ap.add_argument('--repos', nargs='+', default=list(DEFAULT_REPOS))
     ap.add_argument('--json', action='store_true')
     ap.add_argument('--self-test', action='store_true')
+    # engine#2807 review: `pre-pr-checks.sh` runs this at handover, and it is that script's only NETWORK row.
+    # A network blip must not red a gate whose other sixteen rows are offline, and a legitimate HALF (a fix plus
+    # its arm) is indistinguishable from a duplicate until an exemption exists -- so the caller can ask for the
+    # finding to be printed without the exit status deciding anything. The page-vs-runner comparator in
+    # pre-pr-checks.sh only understands rows whose command starts with `python3`, which is why this is a flag
+    # here rather than a `sh -c ... || true` wrapper there.
+    ap.add_argument('--advisory', action='store_true',
+                    help='print findings but always exit 0 (for the pre-PR gate; see --advisory in docs/pre-pr-checks.md)')
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
@@ -356,6 +364,11 @@ def main(argv):
         clean = clean_line(found, failed)
         if clean:
             print(clean)
+    if a.advisory:
+        if found or failed:
+            print("duplicate_fixes: advisory run -- nothing above changes this run's exit status",
+                  file=sys.stderr)
+        return 0
     return exit_code(found, failed)
 
 

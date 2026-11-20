@@ -64,6 +64,10 @@ chk "and the GPU ticket's log says the NPU fault was seen and did not refuse it"
 chk "an NPU fault still refuses an NPU ticket" "$(run_arm b "$npu_fault" npu-queue)" 78
 chk "a GPU reset still refuses a GPU ticket" "$(run_arm c "$gpu_reset" gpu-queue)" 78
 chk "a GPU reset does not refuse an NPU ticket" "$(run_arm d "$gpu_reset" npu-queue)" 0
+# npu-hold's fallback path is $HOME/NPU-QUEUE -- upper case -- so the device test has to be case-insensitive. A
+# case-sensitive one classified that fallback as a GPU ticket, which would stop an NPU fault refusing the very ticket
+# the NPU rule exists for.
+chk "an upper-case NPU queue is still an NPU ticket" "$(run_arm f "$npu_fault" NPU-QUEUE)" 78
 chk "a clean log grants either ticket" "$(run_arm e '[Fri Nov 20 12:59:43 2026] usb 1-1: new device' gpu-queue)" 0
 
 if [ "$fails" = 0 ]; then echo "gpu_hold_device_scope: all arms ok"; else echo "gpu_hold_device_scope: $fails failure(s)"; fi

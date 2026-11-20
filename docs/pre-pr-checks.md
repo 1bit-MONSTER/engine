@@ -43,6 +43,7 @@ below says why. The table's order is the runner's order: cheapest and most commo
 | `python3 tools/ci/hip_f16_audit.py --find .` | a HIP add-on kernel accumulates in f16, or the gpu-kernels tree is not at the pinned commit; `skip` (the audit did NOT run) when there is no tree: set `GPU_KERNELS_DIR` to a checkout at the pin |
 | `python3 tools/ci/kernel_id_selftest.py --check --find .` | gpu-kernels' own kernel-id self-test (the four fixtures that pin the id reader) failed, or the tree has no `tools/check-kernel-ids.py`. **skipped (77)** when there is no `$GPU_KERNELS_DIR` and no `third_party/gpu-kernels` |
 | `python3 tools/ci/tool_selftest_wired_check.py` | a tool that carries a self-test and is named by neither `CMakeLists.txt` nor this list: nothing runs its arms, so they rot quietly (72 tools carry one; ten were unwired when this row was added) |
+| `python3 tools/ci/pr_branch_stale_check.py --advisory` | an open PR whose branch is behind `main` and whose **merge deletes lines `main` gained** since it was cut: the page shows a clean additive diff against the merge-base while the merge removes a day's work. Advisory here because it scans the whole open-PR set -- one lane's stale branch must not block another lane's gate; cannot-tell answers 77 (a skip), never 0 |
 | `git grep -l -F "$(basename <your new page>)" -- '*.md'` | nothing links to the page you just added — measured tonight: 45 docs, one with no inbound link, and it was the page whose whole subject is pre-merge checks |
 
 Two more, for the moments they are for:

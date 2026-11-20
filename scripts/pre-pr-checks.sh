@@ -114,6 +114,18 @@ checks=(
     # excluded from the reference text, and the checker itself). Wired in CMake, and this row keeps the next one
     # from going quiet.
     "tools/ci/tool_selftest_wired_check.py"
+    # engine#3057: `pr_branch_stale_check` shipped in #2996 with a ctest row for its SELF-TEST and nothing that ran the
+    # check itself, so two PRs tonight (`#3052`, `#3055`) displayed 84 files and `+5993/-373` -- main's work, not theirs
+    # -- and nothing said a word. It is NOT the same question as `branch_stale_check.py` above: that one catches the
+    # two-dot READING of a stale branch (a path the branch never touched looks reverted), this one asks whether the
+    # MERGE deletes lines main gained since the branch was cut. DELETIONS are the signal, not distance.
+    #
+    # ADVISORY, not a gate row, and the reason is scope: it scans the OPEN-PR SET, so a hard row here would block one
+    # lane's pre-PR run for another lane's stale branch. The hard gate belongs where a single PR's branch is known --
+    # a CI job on the PR, which needs a `--pr <n>` mode the tool does not have yet (follow-up, engine#3057). rc 2 is
+    # cannot-tell (unreadable list, truncated page, unfetchable ref) and becomes a skip: a gate that cannot look must
+    # not look green (engine#2932).
+    "tools/ci/pr_branch_stale_check.py --advisory"
 )
 
 # The page and this list drift apart, and it has happened twice in one night: the page said the runner "runs the first six"

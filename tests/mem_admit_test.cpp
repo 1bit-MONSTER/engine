@@ -255,6 +255,31 @@ int main() {
     expect("12 GiB on the CPU: GTT does not count, MemAvailable 50 GiB does", v.fits && v.free == box.mem_available);
     need.total = 60ull << 30;
     expect("60 GiB on the CPU: refused", !admit::judge(need, box).fits);
+
+    // engine#2986: the reserve was a fixed 16 GiB, sized on this 120 GiB box, so a machine whose GTT is 16 GiB had a
+    // ceiling of zero and HRX refused every model. It now scales as a quarter of GTT, capped at 16 GiB -- which is
+    // exactly the old number from 64 GiB up (#680's measured headroom unchanged) and leaves three quarters usable below.
+    {
+        auto ceiling_of = [&](uint64_t gtt_total) {
+            sysinfo::Memory m = box;
+            m.gtt_total = gtt_total;
+            m.gtt_used  = 0;
+            return admit::judge(need, m);
+        };
+        const uint64_t gib = 1ull << 30;
+        expect("120 GiB of GTT keeps the measured 16 GiB reserve (104 GiB ceiling)",
+               admit::gtt_reserve_bytes(120 * gib) == 16 * gib);
+        expect("64 GiB of GTT is the crossover: still a 16 GiB reserve",
+               admit::gtt_reserve_bytes(64 * gib) == 16 * gib);
+        expect("32 GiB of GTT gets an 8 GiB reserve, not 16",
+               admit::gtt_reserve_bytes(32 * gib) == 8 * gib);
+        expect("16 GiB of GTT (a 32 GB machine) gets a 4 GiB reserve, so the ceiling is not zero",
+               admit::gtt_reserve_bytes(16 * gib) == 4 * gib);
+        expect("8 GiB of GTT (a 16 GB machine) keeps a 2 GiB reserve and a usable ceiling",
+               admit::gtt_reserve_bytes(8 * gib) == 2 * gib);
+        expect("a 16 GiB-GTT box now admits a small model where the fixed reserve refused everything",
+               ceiling_of(16 * gib).fits || !ceiling_of(16 * gib).over_ceiling);
+    }
     expect("a box with no /proc/meminfo: not checked", !admit::judge(need, sysinfo::memory(d + "/nowhere")).checked);
 
     // The program-cache warning now needs MemAvailable to be the binding limit: under the ceiling there is
@@ -284,11 +309,23 @@ int main() {
     need.total = 1ull << 30;    // 61 GiB after the load: inside the ceiling, and above #315's zone only warns
     v = admit::judge(need, box);
     expect("1 GiB more: fits, no ceiling note", v.fits && v.ceiling_note.empty());
+    // engine#2986 restated this invariant rather than dropping it: a pool smaller than the *fixed* 16 GiB reserve is no
+    // longer a zero ceiling, because the reserve is now a quarter of the pool. What still has to hold is that the ceiling
+    // leaves the reserve free -- and that a pool small enough to be a sixteenth of the load is still refused by it.
+    need.gpu   = true;              // the arms below are about the GTT ceiling, and an earlier arm leaves this cleared
+    need.total = 60ull << 30;
     sysinfo::Memory small = box;
-    small.gtt_total = 8ull << 30;   // smaller than the 16 GiB reserve: no ceiling to fit under
+    small.gtt_total = 8ull << 30;   // was "smaller than the reserve": now 2 GiB reserved, 6 GiB ceiling
     small.gtt_used = 0;
     v = admit::judge(need, small);
-    expect("a pool smaller than the reserve: refused at any size", !v.fits && v.over_ceiling && v.ceiling == 0);
+    expect("an 8 GiB pool: the ceiling is the pool minus a quarter, not zero",
+           v.ceiling == 6ull * (1ull << 30) && v.over_ceiling);
+    sysinfo::Memory tiny = box;
+    tiny.gtt_total = 1ull << 30;    // 256 MiB reserved, 768 MiB ceiling: still far under a 60 GiB load
+    tiny.gtt_used = 0;
+    v = admit::judge(need, tiny);
+    expect("a 1 GiB pool is still refused: the ceiling cannot grow a load that large",
+           !v.fits && v.over_ceiling && v.ceiling == 768ull * (1ull << 20));
 
     fs::remove_all(dir);
     if (failures) std::printf("%d FAILED\n", failures);

@@ -8,4 +8,8 @@
 # An entry that no open pair claims any more is reported as STALE, so this file cannot quietly grow.
 # A comment starts at ' #'; a leading '#' is the issue number.
 #
-# (no entries today: every pair this file was written for has closed)
+# engine#1783 has one open pair that is a STACK, not two lanes on the same work: #3037's base branch is #3036's head
+# (`cl-1783/cold`), so #3037 cannot exist without #3036 and the overlapping files are the stack itself. The check reads
+# only the open-PR set, the titles/bodies and the file lists, so it cannot see a base branch -- which is why this is
+# declared rather than fixed. #3036 lands first. Remove this line when either closes.
+1783 a stack, not a duplicate: #3037's base is #3036's head branch (cl-1783/cold); #3036 lands first

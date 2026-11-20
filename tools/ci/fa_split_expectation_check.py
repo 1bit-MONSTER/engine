@@ -59,31 +59,45 @@ def _flat(text):
     return " ".join(text.split())
 GUARD = ("key->ne[1] < match.key_value_capacity", "value->ne[1] < match.key_value_capacity")
 
+# Both suites carry the decode-split rows, and they are not the same file: the fork's `test-hrx-ops` is the one a device
+# run quotes and the one #448/#454 edit, while `hrx-ops-test` is a second copy the ratchet excludes by -E. Reading only
+# the first left the rows that actually run unwatched (measured 11-20: hrx-ops-test split=17 padding-hits=2,
+# test-hrx-ops split=45 kPaddedKeyValueCapacity=4 -- and #454 un-pads a row in the second with this row still green).
 TEST_PATH = Path("tests/hrx-ops-test.cpp")
+TEST_PATHS = (TEST_PATH, Path("tests/test-hrx-ops.cpp"))
 DISPATCH_PATH = Path("ggml/src/ggml-hrx/dispatch_registration/common/dispatch-flash-attention.cpp")
 
 
 def check(root: Path):
-    """(failures, cannot_tell). A failure is (side, what)."""
-    test = root / TEST_PATH
+    """(failures, cannot_tell). A failure is (side, what). Every suite that carries a split expectation is checked."""
     dispatch = root / DISPATCH_PATH
-    try:
-        test_text = test.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return [], f"no {test}"
-    if SPLIT not in test_text:
+    carriers, missing = [], []
+    for rel in TEST_PATHS:
+        path = root / rel
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            missing.append(str(path))
+            continue
+        if SPLIT in text:
+            carriers.append((rel, text))
+    if not carriers:
+        if len(missing) == len(TEST_PATHS):
+            return [], f"no {missing[0]} (and no {missing[1]})"
         return [], None  # nothing expects the split kernel: the invariant is vacuous, and that is not a failure
     try:
         dispatch_text = dispatch.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return [], f"no {dispatch} (the test expects the split kernel, so the matcher has to be readable)"
+        return [], f"no {dispatch} (a suite expects the split kernel, so the matcher has to be readable)"
 
-    flat_test = _flat(test_text)
     failures = []
-    if not any(p in flat_test for p in PADDING):
-        failures.append(("fixture", "the test expects the split kernel and never computes the padded capacity, so the "
-                                    "fixture allocates at the token count and the matcher will decline for storage it "
-                                    "does not have (engine#2870: 65 slots for a 128-slot walk)"))
+    for rel, text in carriers:
+        flat_test = _flat(text)
+        if not any(p in flat_test for p in PADDING):
+            failures.append(("fixture",
+                             f"{rel}: the test expects the split kernel and never computes the padded capacity, so the "
+                             "fixture allocates at the token count and the matcher will decline for storage it "
+                             "does not have (engine#2870: 65 slots for a 128-slot walk)"))
     # both, not either: `any()` passed a matcher that kept the value guard and dropped the key one, which is half of
     # the fault engine#418 removed -- measured on 11-20 by deleting each guard in turn from a copy of the fork's file
     if not all(g in dispatch_text for g in GUARD):

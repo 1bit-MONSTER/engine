@@ -84,7 +84,9 @@ def check(root: Path):
         failures.append(("fixture", "the test expects the split kernel and never computes the padded capacity, so the "
                                     "fixture allocates at the token count and the matcher will decline for storage it "
                                     "does not have (engine#2870: 65 slots for a 128-slot walk)"))
-    if not any(g in dispatch_text for g in GUARD):
+    # both, not either: `any()` passed a matcher that kept the value guard and dropped the key one, which is half of
+    # the fault engine#418 removed -- measured on 11-20 by deleting each guard in turn from a copy of the fork's file
+    if not all(g in dispatch_text for g in GUARD):
         failures.append(("matcher", "the test expects the split kernel and the matcher no longer compares storage "
                                     "against the padded capacity, so it may claim a walk past the binding (the fault "
                                     "#418 removed)"))
@@ -107,7 +109,10 @@ def self_test() -> int:
         (root / TEST_PATH.parent).mkdir(parents=True)
         (root / DISPATCH_PATH.parent).mkdir(parents=True)
         (root / TEST_PATH).write_text(test_text, encoding="utf-8")
-        g = "if (key->ne[1] < match.key_value_capacity) { return {}; }\n" if guard else "// no storage guard\n"
+        # both comparisons, because the invariant is both: `any()` used to pass a matcher that kept the value guard and
+        # dropped the key one (measured 11-20 by deleting each in turn from a copy of the fork's dispatch file)
+        g = ("if (key->ne[1] < match.key_value_capacity) { return {}; }\n"
+             "if (value->ne[1] < match.key_value_capacity) { return {}; }\n") if guard else "// no storage guard\n"
         (root / DISPATCH_PATH).write_text("namespace { void f() {\n" + g + "} }\n", encoding="utf-8")
         return root
 
@@ -129,6 +134,17 @@ def self_test() -> int:
         got, why = check(unpadded)
         arm("a fixture that pads nothing is a FAILURE naming the fixture",
             [s for s, _ in got] == ["fixture"], str(got))
+
+        # half the invariant is a failure: this is the arm the old `any()` could not express
+        half = tmp / "half"
+        (half / TEST_PATH.parent).mkdir(parents=True)
+        (half / TEST_PATH).write_text(padded, encoding="utf-8")
+        (half / DISPATCH_PATH.parent).mkdir(parents=True)
+        (half / DISPATCH_PATH).write_text(
+            "namespace { void f() {\nif (key->ne[1] < match.key_value_capacity) { return {}; }\n} }\n", encoding="utf-8")
+        got, _ = check(half)
+        arm("a matcher that kept the key guard and dropped the value one is a FAILURE",
+            [s for s, _ in got] == ["matcher"], str(got))
 
         w = build(tmp, padded, guard=False)
         got, why = check(w)

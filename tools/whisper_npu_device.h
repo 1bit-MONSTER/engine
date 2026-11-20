@@ -182,6 +182,10 @@ inline bool open(const onebit::npu::pack_import::OnnxGraphInfo& enc, const std::
     out->hook.gemm = [gm](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
                           std::vector<float>* C, std::string* w) { return gm->gemm(key, A, M, K, B, N, C, w); };
     out->hook.cached = [gm](const std::string& key) { return gm->cached(key); };
+    out->hook.gemm_ep = [gm](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
+                             std::vector<float>* C, const onebit::audio::Epilogue& ep, std::string* w) {
+        return gm->gemm_ep(key, A, M, K, B, N, C, &ep, w);
+    };
     return true;
 }
 

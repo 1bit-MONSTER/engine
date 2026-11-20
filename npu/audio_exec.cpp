@@ -552,6 +552,137 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         if (dev != nullptr && !force_host) proj_groups = projection_groups(g, inits);
         std::map<std::string, Tensor> proj_pending;   // output name -> the result its group's fused product already made
 
+        // engine#1783: a projection's elementwise tail folded into the device product (audio_epilogue.h). Taken for a MatMul
+        // whose B is a rank-2 initializer, outside a q|k|v group, followed by Add(bias) and then either the five-node erf GELU
+        // or Add(residual). Every intermediate must be used only inside the chain (the GELU input twice, both inside), the
+        // constants must be scalar initializers, and the bias a 1-D initializer as wide as the product. The chain's nodes
+        // are then skipped and its last output is the product's. ONEBIT_AUDIO_FOLD_EPILOGUE=0 turns it off.
+        struct EpiPlan {
+            std::string bias, res, out;   // bias initializer, residual tensor ("" = none), the chain's last output
+            bool gelu = false;
+            float gdiv = 0, gone = 0, ghalf = 0;
+            std::vector<size_t> skip;     // 0-based nodes the fold replaces
+        };
+        std::map<size_t, EpiPlan> epi_plan;
+        size_t folded = 0;   // reported in AudioRunResult::folded_epilogues
+        if (dev != nullptr && !force_host && dev->gemm_ep) {
+            const char* fe = std::getenv("ONEBIT_AUDIO_FOLD_EPILOGUE");
+            if (fe == nullptr || fe[0] != '0') {
+                std::map<std::string, std::vector<size_t>> users;
+                for (size_t i = 0; i < g.nodes.size(); ++i)
+                    for (const auto& in : g.nodes[i].ins)
+                        if (!in.empty()) users[in].push_back(i);
+                auto uses = [&](const std::string& nm) {
+                    const auto c = use_count.find(nm);
+                    return c == use_count.end() ? 0 : c->second;
+                };
+                auto only = [&](const std::string& nm, size_t* at) {
+                    const auto it = users.find(nm);
+                    if (uses(nm) != 1 || it == users.end() || it->second.size() != 1) return false;
+                    *at = it->second[0];
+                    return true;
+                };
+                auto scalar = [&](const std::string& nm, float* v) {
+                    const auto ii = inits.find(nm);
+                    if (ii == inits.end() || nelem(ii->second->dims) != 1) return false;
+                    *v = init_f32(nm).data.at(0);
+                    return true;
+                };
+                // the operand of a two-input node that is not `x`, or "" when `x` is not exactly one of them
+                auto other = [](const OnnxNodeInfo& m, const std::string& x) -> std::string {
+                    if (m.ins.size() != 2) return {};
+                    if (m.ins[0] == x && m.ins[1] != x) return m.ins[1];
+                    if (m.ins[1] == x && m.ins[0] != x) return m.ins[0];
+                    return {};
+                };
+                std::vector<char> grouped(g.nodes.size(), 0);
+                for (const auto& kv : proj_groups)
+                    for (size_t i : kv.second) grouped[i] = 1;
+                for (size_t i = 0; i < g.nodes.size(); ++i) {
+                    const auto& m = g.nodes[i];
+                    if (grouped[i] || m.op != "MatMul" || m.ins.size() < 2 || m.outs.empty() || inits.count(m.ins[1]) == 0) continue;
+                    const auto& wd = inits.at(m.ins[1])->dims;
+                    if (wd.size() != 2) continue;
+                    EpiPlan ep;
+                    size_t j = 0;
+                    if (!only(m.outs[0], &j) || g.nodes[j].op != "Add" || g.nodes[j].outs.empty()) continue;
+                    const std::string b = other(g.nodes[j], m.outs[0]);
+                    if (b.empty() || inits.count(b) == 0 || inits.at(b)->dims != std::vector<int64_t>{wd[1]}) continue;
+                    ep.bias = b;
+                    ep.skip.push_back(j);
+                    const std::string y = g.nodes[j].outs[0];
+                    ep.out = y;
+                    const auto uy = users.find(y);
+                    if (uses(y) == 2 && uy != users.end() && uy->second.size() == 2) {
+                        // GELU: Div(y, c) -> Erf -> Add(., one) -> Mul(half, .) -> Mul(y, .)
+                        size_t d = uy->second[0], mu = uy->second[1];
+                        if (g.nodes[d].op != "Div") std::swap(d, mu);
+                        const auto& nd = g.nodes[d];
+                        size_t e = 0, a1 = 0, h = 0, last = 0;
+                        if (nd.op == "Div" && nd.ins.size() == 2 && nd.ins[0] == y && scalar(nd.ins[1], &ep.gdiv) &&
+                            only(nd.outs[0], &e) && g.nodes[e].op == "Erf" && only(g.nodes[e].outs[0], &a1) &&
+                            g.nodes[a1].op == "Add" && scalar(other(g.nodes[a1], g.nodes[e].outs[0]), &ep.gone) &&
+                            only(g.nodes[a1].outs[0], &h) && g.nodes[h].op == "Mul" &&
+                            scalar(other(g.nodes[h], g.nodes[a1].outs[0]), &ep.ghalf) && only(g.nodes[h].outs[0], &last) &&
+                            last == mu && g.nodes[mu].op == "Mul" && other(g.nodes[mu], g.nodes[h].outs[0]) == y) {
+                            ep.gelu = true;
+                            for (size_t k : {d, e, a1, h, mu}) ep.skip.push_back(k);
+                            ep.out = g.nodes[mu].outs[0];
+                        } else {
+                            continue;   // y is used twice but not as this GELU: leave the whole chain alone
+                        }
+                    } else if (uses(y) == 1 && uy != users.end() && uy->second.size() == 1) {
+                        const auto& na = g.nodes[uy->second[0]];
+                        const std::string rr = na.op == "Add" ? other(na, y) : std::string();
+                        if (!rr.empty() && inits.count(rr) == 0 && !na.outs.empty()) {
+                            ep.res = rr;
+                            ep.skip.push_back(uy->second[0]);
+                            ep.out = na.outs[0];
+                        }
+                    } else {
+                        continue;   // the biased output is used outside a chain this fold knows
+                    }
+                    epi_plan[i] = ep;
+                }
+            }
+        }
+        // Runs plan `pl` for the product A x B (B may be null when the device holds it) and, on success, writes the chain's
+        // last output. False = the device declined or the residual is not ready; the caller then runs the plain product.
+        auto try_fold = [&](const EpiPlan& pl, const std::string& key, const Tensor& a, int64_t K, const float* B, int64_t N,
+                            std::chrono::steady_clock::time_point t0) -> bool {
+            onebit::audio::Epilogue e;
+            const Tensor& bias = init_f32(pl.bias);
+            e.bias = bias.data.data();
+            e.gelu = pl.gelu;
+            e.gelu_div = pl.gdiv;
+            e.gelu_one = pl.gone;
+            e.gelu_half = pl.ghalf;
+            const int64_t rows = int64_t(a.data.size() / size_t(K));
+            if (!pl.res.empty()) {
+                if (t.count(pl.res) == 0) return false;
+                const Tensor& rt = need(pl.res);
+                std::vector<int64_t> want = a.dims;
+                want.back() = N;
+                if (rt.dims != want || rt.data.size() != size_t(rows) * size_t(N)) return false;
+                e.res = rt.data.data();
+                e.res_ld = N;
+            }
+            std::vector<float> c;
+            std::string w;
+            if (!dev->gemm_ep(key, a.data.data(), rows, K, B, N, &c, e, &w)) return false;
+            if (c.size() != size_t(rows) * size_t(N))
+                fail("device gemm_ep for '" + key + "' wrote " + std::to_string(c.size()) + " floats");
+            ++dev->device;
+            ++folded;
+            Tensor out_t;
+            out_t.dims = a.dims;
+            out_t.dims.back() = N;
+            out_t.data = std::move(c);
+            for (size_t k : pl.skip) fused_away[k] = 1;
+            finish_node("MatMul+epilogue", pl.out, out_t, t0);
+            return true;
+        };
+
         int node_index = 0;
         for (const auto& n : g.nodes) {
             ++node_index;
@@ -628,6 +759,8 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 const std::vector<int64_t>& wd = inits.at(n.ins[1])->dims;
                 const int64_t K = a.dims.empty() ? 0 : a.dims.back(), N = wd[1];
                 if (a.dims.size() >= 2 && K == wd[0] && K > 0) {
+                    const auto fp = epi_plan.find(size_t(node_index - 1));
+                    if (fp != epi_plan.end() && try_fold(fp->second, n.ins[1], a, K, nullptr, N, op_t0)) continue;
                     std::vector<float> c;
                     if (try_device(n.ins[1], a.data.data(), int64_t(a.data.size() / size_t(K)), K, nullptr, N, &c, 1)) {
                         r.dims = a.dims;
@@ -656,6 +789,8 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 // A projection (B a rank-2 weight) is one GEMM over every row of A, whatever A's leading axes are.
                 if (dev != nullptr) {
                     if (rb == 2 && inits.count(n.ins[1]) != 0) {
+                        const auto fp = epi_plan.find(size_t(node_index - 1));
+                        if (fp != epi_plan.end() && try_fold(fp->second, n.ins[1], a, K, b.data.data(), N, op_t0)) continue;
                         std::vector<float> c;
                         if (offer(n.ins[1], a.data.data(), int64_t(a.data.size() / size_t(K)), K, b.data.data(), N, &c)) {
                             r.dims = a.dims;
@@ -1131,6 +1266,7 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         out->dims = it->second.dims;
         out->data = it->second.data;
         out->fused_attention_groups = fused_groups;
+        out->folded_epilogues = folded;
         out->i64 = it->second.i64;
         out->b = it->second.b;
         return true;

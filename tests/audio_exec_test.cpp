@@ -261,6 +261,46 @@ int main(int argc, char** argv) {
                         fused_declined, single);
         }
 
+        // engine#1783: the projections' bias / GELU / residual tails folded into the product (audio_epilogue.h). The fake
+        // device runs the plain product and then the shared epilogue; the result must equal the node-by-node run byte for
+        // byte, and the counter must say which path ran: 12 x (o, fc1, fc2) = 36 folded, 0 with the switch off.
+        {
+            AudioGemm fold = dev;
+            fold.device = 0;
+            fold.host = 0;
+            fold.host_why.clear();
+            fold.gemm_ep = [&](const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
+                               std::vector<float>* C, const onebit::audio::Epilogue& ep, std::string* w) {
+                if (!dev.gemm(key, A, M, K, B, N, C, w)) return false;
+                onebit::audio::epilogue_rows(ep, 0, M, N, C->data(), N);
+                return true;
+            };
+            const char* fprev = std::getenv("ONEBIT_AUDIO_FOLD_EPILOGUE");
+            const std::string fkeep = fprev != nullptr ? fprev : "";
+            unsetenv("ONEBIT_AUDIO_FOLD_EPILOGUE");
+            AudioRunResult rfo;
+            const bool ok1 = run_audio_graph(g, mel.data(), bins, frames, "", &rfo, &why, &fold);
+            setenv("ONEBIT_AUDIO_FOLD_EPILOGUE", "0", 1);
+            AudioGemm fold_off = fold;
+            fold_off.device = 0;
+            fold_off.host = 0;
+            fold_off.host_why.clear();
+            AudioRunResult rfx;
+            const bool ok2 = run_audio_graph(g, mel.data(), bins, frames, "", &rfx, &why, &fold_off);
+            if (fprev != nullptr) setenv("ONEBIT_AUDIO_FOLD_EPILOGUE", fkeep.c_str(), 1);
+            else unsetenv("ONEBIT_AUDIO_FOLD_EPILOGUE");
+            check(ok1 && ok2, "folded and unfolded runs: " + why);
+            std::printf("folded epilogues: folded run %zu, switch-off run %zu\n", rfo.folded_epilogues, rfx.folded_epilogues);
+            check(rfo.folded_epilogues == 36, "36 tails folded (o, fc1, fc2 x 12), got " + std::to_string(rfo.folded_epilogues));
+            check(rfx.folded_epilogues == 0, "ONEBIT_AUDIO_FOLD_EPILOGUE=0 folds nothing");
+            check(fold.device == 74 && fold.host == 24, "folding still counts 74 device and 24 host products");
+            const bool same = rfo.dims == rfx.dims && rfo.data.size() == rfx.data.size() &&
+                              std::memcmp(rfo.data.data(), rfx.data.data(), rfx.data.size() * sizeof(float)) == 0;
+            check(same, "the folded tails are bit-identical to the node-by-node tails");
+            check(rfx.data == rd.data, "the switch-off run is the plain device run");
+            if (same) std::printf("folded epilogues: encoder output bit-identical to the node-by-node tails\n");
+        }
+
         // A device that declines everything is the host run, counted as host.
         AudioGemm none;
         none.gemm = [](const std::string&, const float*, int64_t, int64_t, const float*, int64_t, std::vector<float>*,

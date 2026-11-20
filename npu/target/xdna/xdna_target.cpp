@@ -1590,7 +1590,9 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
         float* const obase = to_dst ? ar.dst : out.data();
         const int oN = to_dst ? ar.dst_n : N, oLD = to_dst ? ar.dst_ld : N;
         namespace rh = npu::target::xdna::rows_host;
-        rh::dequant(kctx.Cm, kctx.ND, M, oN, ascales.data(), gs->data(), obase, oLD, rh::use_avx2(), rh::threads_for(M));
+        const auto* ep = to_dst ? static_cast<const onebit::audio::Epilogue*>(ar.epilogue) : nullptr;
+        rh::dequant(kctx.Cm, kctx.ND, M, oN, ascales.data(), gs->data(), obase, oLD, rh::use_avx2(), rh::threads_for(M), ep);
+        if (ep != nullptr && ar.epilogue_done != nullptr) *ar.epilogue_done = 1;
     }
     if (m16_check_ && &kctx != &ctx && kctx.w4g32 == ctx.w4g32)
         m16_check_gemm_rows(ctx, kctx, A, M, K, N, slot ? slot_bo(*slot, kctx) : nullptr,

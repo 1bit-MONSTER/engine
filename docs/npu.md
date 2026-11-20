@@ -4360,11 +4360,18 @@ encoder output byte-identical (the encode-only line prints its FNV-1a hash):
   (`npu/target/xdna/rows_host.h`; `tests/npu_rows_host_test.cpp` checks every variant byte for byte).
 - `ONEBIT_AUDIO_FUSE_QKV=0` offers q, k and v separately. When on, the three are one product of staged shape K768
   N2560; a kernel set without that ELF declines it and the three run as separate launches.
+- `ONEBIT_AUDIO_FOLD_EPILOGUE=0` runs a projection's bias, erf-GELU and residual as separate nodes. When on, they are
+  applied inside the device dequant, per row block, with the same IEEE operations in the graph's order
+  (`npu/audio_epilogue.h`); `AudioRunResult::folded_epilogues` counts them (36 on whisper-small: o, fc1, fc2 x 12).
+- `ONEBIT_WHISPER_MALLOPT=0` keeps glibc's dynamic malloc thresholds. When on, the tool fixes the mmap threshold at
+  32 MiB and never trims, so a pass's multi-MB buffers are reused instead of being mapped and faulted in again.
 
 `ONEBIT_WHISPER_NPU_PREFILL=1` packs every weight when the device is opened instead of in the first window. It is
 **off** in the one-shot tool: a single transcription pays the same fills either way, so moving them into load (0.77 s
-on whisper-small) makes nothing shorter, and with it on the warm pass measured 0.03-0.05 s slower, which is not
-explained yet. It is meant for a path that keeps the model open across requests.
+on whisper-small) makes nothing shorter. With glibc's dynamic thresholds the warm pass measured 0.03-0.05 s slower
+with it on: no pass then frees a large block, so the mmap threshold stays low and every pass re-faults its buffers
+(about 510k minor faults per run against 350k). With fixed thresholds (`ONEBIT_WHISPER_MALLOPT`, on by default) both
+arms measured the same. It is meant for a path that keeps the model open across requests.
 `ONEBIT_WHISPER_ENCODE_REPEAT=<n>` runs each window's encoder n extra times and prints each pass, so the first pass's
 one-time costs can be told apart from the per-window ones; `NPU_PROFILE=1` adds the target's per-role launch costs.
 

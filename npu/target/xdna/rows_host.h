@@ -23,8 +23,11 @@
 //  * amax: `a > amax ? a : amax` over |a| skips NaN (the comparison is false) and keeps +0 for a zero row. _mm256_max_ps(x, m)
 //    returns its SECOND operand when either is NaN, so max_ps(|x|, acc) skips NaN the same way, and a max is exact whatever
 //    the order, so the lane-wise reduction gives the same float as the serial walk.
-//  * dequant: cvtepi32_ps rounds like the (float) cast, then two separate multiplies in the scalar order (no FMA: the clone
-//    is compiled for avx2 only, so nothing can contract them).
+//  * dequant: cvtepi32_ps rounds like the (float) cast, then two separate multiplies in the scalar order. No add follows
+//    a multiply, so there is nothing an FMA could contract, whatever the TU's -mfma / -ffp-contract setting.
+// What ties the *_base loops to the inline loops they replaced is the device encoder hash: the whisper-small device route
+// printed the same encode-only "output fnv" before and after the move (engine#1783), so the base loops compute what those
+// loops computed; tests/npu_rows_host_test.cpp then holds every other variant to the base loops byte for byte.
 // ONEBIT_NPU_GLUE_AVX2=0 keeps the scalar loops; ONEBIT_NPU_GLUE_THREADS=<n> sets the thread count (1 = serial). Only
 // launches of at least kMinRows rows are threaded; a decode launch (M = 1 or 16) keeps its serial loop.
 #ifndef ONEBIT_NPU_TARGET_XDNA_ROWS_HOST_H
@@ -37,6 +40,8 @@
 #include <cstdlib>
 #include <thread>
 #include <vector>
+
+#include "audio_epilogue.h"   // engine#1783: the projection's folded bias / GELU / residual
 
 #if defined(__x86_64__) && defined(__GNUC__)
 #include <immintrin.h>
@@ -158,14 +163,19 @@ inline void amax_scales(const float* A, int M, int K, float* scales, bool vec, i
     });
 }
 
+// `ep` (may be null): the projection's folded tail, applied to each block of rows right after its dequant, on the same
+// thread, in the same per-element order as the nodes it replaces (audio_epilogue.h).
 inline void dequant(const int32_t* C, int ldc, int M, int N, const float* scales, const float* gs, float* out, int ldo, bool vec,
-                    int threads) {
+                    int threads, const onebit::audio::Epilogue* ep = nullptr) {
     split_rows(M, threads, [&](int a, int b) {
 #if defined(__x86_64__) && defined(__GNUC__)
-        if (vec) { dequant_avx2(C, ldc, a, b, N, scales, gs, out, ldo); return; }
-#endif
+        if (vec) dequant_avx2(C, ldc, a, b, N, scales, gs, out, ldo);
+        else dequant_base(C, ldc, a, b, N, scales, gs, out, ldo);
+#else
         (void)vec;
         dequant_base(C, ldc, a, b, N, scales, gs, out, ldo);
+#endif
+        if (ep != nullptr) onebit::audio::epilogue_rows(*ep, a, b, N, out, ldo);
     });
 }
 

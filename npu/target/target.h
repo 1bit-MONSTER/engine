@@ -87,6 +87,10 @@ struct GemvArgs {
     float*      dst = nullptr;
     int         dst_ld = 0;
     int         dst_n = 0;
+    // engine#1783: a projection's folded tail (onebit::audio::Epilogue, npu/audio_epilogue.h), applied in the dequant of
+    // a `dst` launch. The target sets *epilogue_done = 1 when it applied it; a caller that finds 0 applies it itself.
+    const void* epilogue = nullptr;
+    int*        epilogue_done = nullptr;
 };
 
 struct Caps {

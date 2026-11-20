@@ -2479,7 +2479,7 @@ target_link_libraries(audio_device_gemm_test PRIVATE nlohmann_json::nlohmann_jso
 # engine#1783: the encoder's products on an NpuTarget (routing by staged shape, M-row chunks, padded weight sent once,
 # de-pad), against a fake target.
 add_executable(audio_npu_gemm_test tests/audio_npu_gemm_test.cpp)
-target_include_directories(audio_npu_gemm_test PRIVATE npu/forward/include npu/target npu/plan)
+target_include_directories(audio_npu_gemm_test PRIVATE npu npu/forward/include npu/target npu/plan)
 target_link_libraries(audio_npu_gemm_test PRIVATE nlohmann_json::nlohmann_json)
 add_executable(audio_launch_plan_test tests/audio_launch_plan_test.cpp)
 # engine#2399: apply the ISA flags to the audio targets only (see the option above). Placed here, after those targets are

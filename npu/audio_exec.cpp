@@ -449,9 +449,52 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
             return &it->second;
         };
 
+        // engine#1783: attention as one pass per (head, four-row group). The export spells it MatMul(q, k^T) -> Softmax ->
+        // MatMul(p, v), and run one node at a time that materialises two 12 x 1500 x 1500 f32 tensors per encoder layer
+        // (108 MB each: allocated, zero-filled, copied by Softmax, read back by the second product). Fused, a four-row group
+        // computes its 4 x N scores with the SAME four-row body, runs the SAME softmax_row on each row, and accumulates p.v
+        // with the SAME body again, so every output element sees the identical operations in the identical order: the
+        // result is bit-identical to the unfused path (tests/audio_exec_test.cpp asserts it). Taken only when the scores and
+        // the probabilities each have exactly one use, the batch axes match exactly (no broadcast), and Softmax is over the
+        // last axis. ONEBIT_AUDIO_FUSED_ATTN=0 turns it off, for the A/B.
+        struct AttnFuse { size_t softmax = 0, pv = 0; };   // 0-based node indices of the Softmax and the second MatMul
+        std::map<size_t, AttnFuse> attn_fuse;              // keyed by the first MatMul's 0-based index
+        std::vector<char> fused_away(g.nodes.size(), 0);
+        {
+            const char* fa = std::getenv("ONEBIT_AUDIO_FUSED_ATTN");
+            const bool on = fa == nullptr || fa[0] != '0';
+            std::map<std::string, size_t> consumer;   // tensor -> its only consumer (meaningful when use_count == 1)
+            for (size_t i = 0; i < g.nodes.size(); ++i)
+                for (const auto& in : g.nodes[i].ins)
+                    if (!in.empty()) consumer[in] = i;
+            auto only_use = [&](const std::string& name, size_t* at) {
+                const auto c = use_count.find(name);
+                const auto it = consumer.find(name);
+                if (c == use_count.end() || c->second != 1 || it == consumer.end()) return false;
+                *at = it->second;
+                return true;
+            };
+            for (size_t i = 0; on && i < g.nodes.size(); ++i) {
+                const auto& m1 = g.nodes[i];
+                if (m1.op != "MatMul" || m1.ins.size() < 2 || m1.outs.empty() || inits.count(m1.ins[1]) != 0) continue;
+                size_t si = 0, pi = 0;
+                if (!only_use(m1.outs[0], &si) || si <= i) continue;
+                const auto& sm = g.nodes[si];
+                if (sm.op != "Softmax" || sm.ins.empty() || sm.ins[0] != m1.outs[0] || sm.outs.empty()) continue;
+                if (sm.attrs.count("axis") != 0 && sm.attrs.at("axis") != -1) continue;   // rank checked at run time
+                if (!only_use(sm.outs[0], &pi) || pi <= si) continue;
+                const auto& m2 = g.nodes[pi];
+                if (m2.op != "MatMul" || m2.ins.size() < 2 || m2.ins[0] != sm.outs[0] || m2.outs.empty() ||
+                    inits.count(m2.ins[1]) != 0)
+                    continue;
+                attn_fuse[i] = AttnFuse{si, pi};
+            }
+        }
+
         int node_index = 0;
         for (const auto& n : g.nodes) {
             ++node_index;
+            if (fused_away[size_t(node_index - 1)]) continue;   // computed inside the fused attention above it
             const auto op_t0 = std::chrono::steady_clock::now();
             const auto where = [&]() { return "node " + std::to_string(node_index) + " (" + n.op + ")"; };
             if (n.outs.empty()) fail(where() + " has no output");
@@ -485,6 +528,78 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                     } else {
                         ++dev->host;
                         ++dev->host_why["MatMul with an activation as B (attention product): not offered"];
+                    }
+                }
+                const auto fz = attn_fuse.find(size_t(node_index - 1));
+                if (fz != attn_fuse.end()) {
+                    const auto& sm = g.nodes[fz->second.softmax];
+                    const auto& m2 = g.nodes[fz->second.pv];
+                    const Tensor& v = need(m2.ins[1]);
+                    const size_t rv = v.dims.size();
+                    // Only the exact shape family the plan was written for: equal batch axes on all three, v rows = N.
+                    const bool fits = rb == ra && rv == ra && ab == bb &&
+                                      std::vector<int64_t>(v.dims.begin(), v.dims.end() - 2) == ab && v.dims[rv - 2] == N &&
+                                      M > 0 && N > 0 && v.dims.back() > 0 && K > 0;
+                    if (fits) {
+                        const int64_t D = v.dims.back();
+                        if (dev != nullptr) {   // the second product is an activation-B MatMul too; count it as the unfused path does
+                            ++dev->host;
+                            ++dev->host_why["MatMul with an activation as B (attention product): not offered"];
+                        }
+                        Tensor o;
+                        o.dims = ab;
+                        o.dims.push_back(M);
+                        o.dims.push_back(D);
+                        o.data.assign(nelem(o.dims), 0.0f);
+                        const size_t batches = nelem(ab);
+                        constexpr size_t kRowGroup = 4;
+                        const size_t rows = size_t(M);
+                        const size_t groups = (rows + kRowGroup - 1) / kRowGroup;
+                        parallel_units(batches * groups, [&](size_t u) {
+                            const size_t bi = u / groups;
+                            const size_t gi = u % groups;
+                            const float* qp = a.data.data() + bi * size_t(M * K);
+                            const float* kp = b.data.data() + bi * size_t(K * N);
+                            const float* vp = v.data.data() + bi * size_t(N * D);
+                            const int64_t i0 = int64_t(gi * kRowGroup), i1 = std::min<int64_t>(M, i0 + int64_t(kRowGroup));
+                            std::vector<float> sc(size_t(i1 - i0) * size_t(N), 0.0f);   // this group's scores, then probabilities
+                            float* o0 = o.data.data() + bi * size_t(M * D) + size_t(i0) * size_t(D);
+                            // The first product: identical to the unfused MatMul's unit for these rows.
+                            if (i1 - i0 == 4) {
+                                host_gemm_4rows()(qp + size_t(i0) * size_t(K), kp, sc.data(), K, N);
+                            } else {
+                                for (int64_t i = i0; i < i1; ++i) {
+                                    float* rr = sc.data() + size_t(i - i0) * size_t(N);
+                                    for (int64_t k = 0; k < K; ++k) {
+                                        const float av = qp[size_t(i) * size_t(K) + size_t(k)];
+                                        if (av == 0.0f) continue;
+                                        const float* br = kp + size_t(k) * size_t(N);
+                                        for (int64_t j = 0; j < N; ++j) rr[j] += av * br[j];
+                                    }
+                                }
+                            }
+                            // Softmax: the unfused node's per-row call, on the same row.
+                            for (int64_t i = i0; i < i1; ++i) audio::softmax_row(sc.data() + size_t(i - i0) * size_t(N), int(N));
+                            // The second product: identical to the unfused MatMul's unit for these rows (K = N here).
+                            if (i1 - i0 == 4) {
+                                host_gemm_4rows()(sc.data(), vp, o0, N, D);
+                            } else {
+                                for (int64_t i = i0; i < i1; ++i) {
+                                    float* rr = o0 + size_t(i - i0) * size_t(D);
+                                    for (int64_t k = 0; k < N; ++k) {
+                                        const float av = sc[size_t(i - i0) * size_t(N) + size_t(k)];
+                                        if (av == 0.0f) continue;
+                                        const float* br = vp + size_t(k) * size_t(D);
+                                        for (int64_t j = 0; j < D; ++j) rr[j] += av * br[j];
+                                    }
+                                }
+                            }
+                        });
+                        fused_away[fz->second.softmax] = 1;
+                        fused_away[fz->second.pv] = 1;
+                        (void)sm;
+                        finish_node("MatMul+Softmax+MatMul", m2.outs[0], o, op_t0);
+                        continue;
                     }
                 }
                 r.data.assign(nelem(r.dims), 0.0f);

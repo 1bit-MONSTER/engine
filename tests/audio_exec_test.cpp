@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -111,6 +112,23 @@ int main(int argc, char** argv) {
     for (int64_t d : r.dims) std::printf(" %lld", (long long)d);
     std::printf("\n");
     check(r.dims.size() == 3 && r.dims[0] == 1 && r.dims[1] == 1500, "encoder output is [1,1500,hidden]");
+    {
+        // engine#1783: the fused attention (MatMul -> Softmax -> MatMul in one pass per four-row group) must be
+        // bit-identical to the node-at-a-time path. Same input, fusion off, compare every byte.
+        const char* prev = std::getenv("ONEBIT_AUDIO_FUSED_ATTN");
+        const std::string keep = prev != nullptr ? prev : "";
+        setenv("ONEBIT_AUDIO_FUSED_ATTN", "0", 1);
+        AudioRunResult u;
+        std::string uwhy;
+        const bool ok = run_audio_graph(g, mel.data(), bins, frames, "", &u, &uwhy);
+        if (prev != nullptr) setenv("ONEBIT_AUDIO_FUSED_ATTN", keep.c_str(), 1);
+        else unsetenv("ONEBIT_AUDIO_FUSED_ATTN");
+        check(ok, "unfused encoder run: " + uwhy);
+        const bool same = ok && u.dims == r.dims && u.data.size() == r.data.size() &&
+                          std::memcmp(u.data.data(), r.data.data(), r.data.size() * sizeof(float)) == 0;
+        check(same, "fused attention is bit-identical to the unfused path");
+        if (same) std::printf("fused attention: encoder output bit-identical to the unfused path (%zu floats)\n", r.data.size());
+    }
     if (r.dims.size() != 3 || r.dims[2] != 768) {
         // A larger encoder: the point of this run is that the graph executed (including external_data weights), not the
         // small model's numbers.

@@ -68,7 +68,10 @@ PAGE = 100
 #   * `keyword ... #12` with up to 24 characters between -- #2793's body says "Refs #2779 (the layer its fix does not
 #     cover), #2728", and the noun "fix" plus a distant `#2728` read as a claim on 2728. Found by running the parser over
 #     the real texts of tonight's seven PRs rather than over my own fixtures, which is why that check is in the PR body.
-CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#(\d+)', re.I)
+# engine#3048: markdown emphasis around the NUMBER (`Closes **#3041**`, `Fixes _#7_`, ``Closes `#9` ``) is how half
+# this fleet writes a claim, and the old pattern stopped at the `**` and reported the PR as a bare mention. The
+# emphasis run is matched between the verb and the number, not inside it.
+CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*[*_`]*\s*#(\d+)', re.I)
 
 # engine#2842: `Refs #N` is a claim too, but a WEAKER one. Almost every PR reviewed on 2026-11-16/17 said `Refs` rather than
 # `Fixes` -- because a PR that fixes part of an issue must not close it -- so reading closing keywords only made the common
@@ -76,7 +79,7 @@ CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#(\d+)
 # other failure: `Refs` is also used for context, and a pair that merely mentions the same issue is not a duplicate. So a
 # ref pair counts only when the two PRs also TOUCH OVERLAPPING FILES -- the same "overlap, not issue-claim" rule the review
 # of #2809 asked for on the false-positive side, which makes one rule serve both directions.
-REF = re.compile(r'\brefs?\b\s*:?\s*#(\d+)', re.I)
+REF = re.compile(r'\brefs?\b\s*:?\s*[*_`]*\s*#(\d+)', re.I)
 
 
 # A claim written INSIDE code is documentation, not a claim. The PRs most likely to contain `Fixes #12` are the ones
@@ -185,6 +188,18 @@ def apply_allow(found, allow):
     kept = [f for f in found if f['issue'] not in allow]
     stale = sorted(set(allow) - {f['issue'] for f in allowed})
     return kept, allowed, stale
+
+
+def report_pr(p):
+    """The PR shape a finding carries into `describe()`: number, title, BODY, draft, age.
+
+    engine#3048: `describe()` decides its sentence from the body ("claimed by" vs "referenced"), and main() used to
+    drop that key when it built the finding -- so the strong branch was dead code in the only path anyone runs, and
+    three PRs all saying `Closes #N` were reported as "referenced ... that touch the same files". One transform, so
+    the arm asserting the sentence runs the same squash the run does.
+    """
+    return {'number': p['number'], 'title': p.get('title') or '', 'body': p.get('body') or '',
+            'draft': p.get('draft'), 'age_hours': p.get('age_hours')}
 
 
 def describe(issue, group):
@@ -423,6 +438,26 @@ def self_test():
     ok([i for i, _ in duplicates(mixed, same_files)] == [2836], "... but IS reported once the files overlap")
     ok('is claimed by' in describe(*duplicates(mixed, same_files)[0]),
        "... and reads as a claim, because one of the two closes it")
+    # engine#3048: main() squashes each PR before describe() sees it, and the squash used to drop `body` -- so the
+    # arm above passed (it calls describe() on the FULL dicts) while every real run printed the weaker sentence.
+    # These two arms run the transform, which is the only way to see it.
+    ok('is claimed by' in describe(2836, [report_pr(p) for p in mixed]),
+       "... and it still reads as a claim through the shape a finding actually carries (engine#3048)")
+    ok('touch the same files' in describe(2836, [report_pr(p) for p in ref_prs]),
+       "... while a pair that only references it still reads as a reference after the same transform")
+    # engine#3048, the note half: a pair where BOTH claim the issue is a finding, so the note must be suppressed
+    # rather than restated with a reason that is false ("neither says Fixes/Closes" about two `Closes #N`).
+    both_claim = [dict(ref_prs[0], body='Fixes #2836'), dict(ref_prs[1], body='Closes #2836')]
+    ok(note_line(2836, *[report_pr(p) for p in both_claim], ['f.cpp']) is None,
+       "two PRs that both claim the issue print no note -- the finding above is the report")
+    one_claim = note_line(2836, report_pr(dict(ref_prs[1])), report_pr(dict(ref_prs[0], body='Fixes #2836')), ['f.cpp'])
+    ok(one_claim is not None and 'only names it' in one_claim,
+       "... but one claimer plus one mention still prints a note, and it says which is which")
+    # engine#3048: the fleet writes `Closes **#N**`, and the emphasis used to hide the number from CLAIM
+    ok(claims("Closes **#3041** — the row has been red") == [3041],
+       "a claim whose issue number is bolded/marked up is still a claim")
+    ok(referenced("Refs **#7**") == [7] and claims("Fixes _#7_") == [7],
+       "... and the same for a reference and for underline emphasis (backticks stay excluded: a code span is not a claim)")
     # a reference inside code is documentation, like a claim inside code
     ok(referenced("use `Refs #12` next to the PR body") == [], "a `Refs` inside an inline code span is not a reference")
 
@@ -543,14 +578,11 @@ def main(argv):
         except (RuntimeError, json.JSONDecodeError):
             pass
         for issue, group in groups:
-            found.append({'repo': repo, 'issue': issue,
-                          'prs': [{'number': p['number'], 'title': p['title'], 'draft': p['draft'],
-                                   'age_hours': p['age_hours']} for p in group]})
+            found.append({'repo': repo, 'issue': issue, 'prs': [report_pr(p) for p in group]})
     allow = read_allow(a.allow or os.path.join(os.path.dirname(os.path.abspath(__file__)), ALLOW_FILE))
     for repo, issue, op, mp, shared in mended:
         found.append({'repo': repo, 'issue': issue, 'mended_by': mp['number'],
-                      'prs': [{'number': op['number'], 'title': op.get('title') or '',
-                               'draft': False, 'age_hours': 0}]})
+                      'prs': [report_pr(dict(op, draft=False, age_hours=0))]})
     found, allowed, stale = apply_allow(found, allow)
     if a.json:
         print(json.dumps(found, indent=1))
@@ -579,9 +611,9 @@ def main(argv):
                 # `if a.gate:` an AttributeError on the first run that printed a note -- a crash that only
                 # fires when the tool has something to say.
                 pa, pb, shared = note[2], note[3], note[4]
-                print(f"duplicate_fixes: {repo} #{pa['number']} and #{pb['number']} both name #{issue} and touch "
-                      f"{', '.join(shared)} -- neither says Fixes/Closes, so this is a note, not a finding",
-                      file=sys.stderr)
+                line = note_line(issue, pa, pb, shared)
+                if line is not None:      # None = the pair is already a finding; do not restate it with a false reason
+                    print(f"duplicate_fixes: {line}", file=sys.stderr)
         for f in found:
             print(f"{f['repo']}: " + describe(f['issue'], f['prs']))
         clean = clean_line(found, failed)
@@ -600,6 +632,31 @@ def main(argv):
                   file=sys.stderr)
         return 0
     return exit_code(found, failed)
+
+
+def claims_issue(p, issue):
+    """Does this PR CLOSE the issue? `describe()` and the note line must agree on the answer (engine#3048)."""
+    return issue in claims(f"{p.get('title') or ''}\n{p.get('body') or ''}")
+
+
+def note_line(issue, pa, pb, shared):
+    """The sentence for a bare-mention pair, or None when the strong pass already reports the pair.
+
+    engine#3048: the note used to say "neither says Fixes/Closes" for every pair -- including two PRs that both say
+    `Closes #N`, because the population is a bare `#N` scan and never asked. Worse, that pair is a FINDING, so the
+    run printed a finding and then a quieter restatement of it whose reason was false. Now: two claimers are
+    suppressed (the finding above says what to do), one claimer names which, and the original sentence is kept only
+    for the case that makes it true -- the #2991 shape, where one PR only names the issue.
+    """
+    ca, cb = claims_issue(pa, issue), claims_issue(pb, issue)
+    if ca and cb:
+        return None
+    if ca or cb:
+        claimer, other = (pa, pb) if ca else (pb, pa)
+        return (f"#{claimer['number']} says it closes #{issue} and #{other['number']} only names it, "
+                f"and they touch {', '.join(shared)} -- a note, not a finding")
+    return (f"#{pa['number']} and #{pb['number']} both name #{issue} and touch {', '.join(shared)} "
+            f"-- neither says Fixes/Closes, so this is a note, not a finding")
 
 
 def bare_mentions(prs, files_of=None):

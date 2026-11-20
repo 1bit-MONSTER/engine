@@ -42,6 +42,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <string>
 #include <vector>
 
@@ -169,6 +172,19 @@ static bool read_ids_file(const char* path, std::vector<std::string>* out, std::
 }
 
 int main(int argc, char** argv) {
+#if defined(__GLIBC__)
+    // engine#1783: fixed malloc thresholds. glibc raises its mmap threshold only after a large block is freed, so a run that
+    // never frees one (the device route with ONEBIT_WHISPER_NPU_PREFILL=1) kept mmapping, and faulting in, every pass's
+    // multi-MB activation buffers. Measured on whisper-small, jfk, 3 runs per arm: about 510k minor faults per run with
+    // prefill and 350k without, against about 180k for both with these thresholds; the warm pass was then the same in both
+    // arms. ONEBIT_WHISPER_MALLOPT=0 keeps glibc's defaults.
+    if (const char* mo = std::getenv("ONEBIT_WHISPER_MALLOPT"); mo == nullptr || mo[0] != '0') {
+        // 32 MiB is glibc's ceiling for the mmap threshold on 64-bit (a larger value is refused); every buffer of a
+        // whisper-small pass (the largest is fc1's 1500 x 3072 f32, 18 MiB) is under it.
+        if (mallopt(M_MMAP_THRESHOLD, 32 << 20) == 0 || mallopt(M_TRIM_THRESHOLD, 0x7fffffff) == 0)
+            std::fprintf(stderr, "malloc: glibc refused the thresholds; running with its defaults\n");
+    }
+#endif
     // ctest form: no arguments means "run the reference sentence from the environment", so the chain can be checked by CI or by
     // a lane without remembering the 25 ids. Missing inputs skip with 77, the same convention as every other gated test here.
     if (argc == 1) {

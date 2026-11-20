@@ -229,6 +229,13 @@ ExternalProject_Add(llama_hrx
         -DGGML_HRX_HIP_COMPILER=${ONEBIT_HRX_HIP_COMPILER}
         "-DGGML_HRX_HIP_FLAGS=${ONEBIT_HRX_HIP_FLAGS}"
         -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF
+        # The fork's embedded Web UI is not built here: the engine serves its own API in front of this binary, so the
+        # UI is dead weight -- and on 2026-11-20 it was worse than weight. `LLAMA_BUILD_UI` defaults ON in the fork, so
+        # this sub-build fetched a UI asset bundle from HF and then refused to build when the local asset hashes did not
+        # match the stamp ("UI: current asset files: ..."), which is a network-dependent failure in a build that has no
+        # use for the result. Every lane configuring ONEBIT_HRX on this box hit it; CI never does, because CI has no HRX
+        # toolchain, so nothing was going to report it.
+        -DLLAMA_BUILD_UI=OFF
         -DLLAMA_BUILD_TESTS=${ONEBIT_HRX_BUILD_TESTS}
         "-DCMAKE_C_FLAGS=${ONEBIT_HRX_PATH_MAP_FLAGS}${ONEBIT_HRX_EXTRA_FLAGS}"
         "-DCMAKE_CXX_FLAGS=${ONEBIT_HRX_PATH_MAP_FLAGS}${ONEBIT_HRX_EXTRA_FLAGS}"

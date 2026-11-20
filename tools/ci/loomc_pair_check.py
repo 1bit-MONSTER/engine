@@ -76,6 +76,15 @@ def symbols_used(fork: Path):
     `#if defined(LOOMC_AMDGPU_RUNTIME_GLOBALS_KNOWN)`, which nothing defines, so both
     were reported as missing until this. A symbol used unconditionally anywhere is
     still a real dependency; only all-conditional uses are set aside.
+
+    `#else`/`#elif` are the other half (engine#2916 review, mine): a conditional with
+    an alternate branch always compiles one of its sides, so a use in it is a
+    dependency whatever the macro is. Treating the whole block as guarded hid
+    `loomc_artifact_kind_t` -- used only in the `#else` of
+    `#if defined(LOOMC_ARTIFACT_ROLE_COMPILE_REPORT)` at loom-jit.cpp:380, which is the
+    side the compiler reads -- and made this check answer `ok` about a symbol it had
+    stopped counting. So a use is set aside only when some enclosing guard has NO
+    alternate branch; that is the shape `LOOMC_AMDGPU_RUNTIME_GLOBALS_KNOWN` really is.
     """
     fork = fork_dir(fork)
     unconditional, conditional = set(), set()
@@ -83,16 +92,33 @@ def symbols_used(fork: Path):
         text = f.read_text(errors="replace")
         text = re.sub(r"//[^\n]*", " ", text)
         text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-        depth = 0
+        # One frame per open conditional: True once it has an `#else`/`#elif`, because
+        # then one of its branches is compiled whatever the condition says.
+        guards = []
         for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith("#"):
-                if re.match(r"#\s*if", stripped):
-                    depth += 1
-                elif re.match(r"#\s*endif", stripped):
-                    depth = max(0, depth - 1)
+                directive = re.match(r"#\s*(\w+)", stripped)
+                keyword = directive.group(1) if directive else ""
+                if keyword in ("if", "ifdef", "ifndef"):
+                    guards.append(False)
+                elif keyword in ("elif", "else"):
+                    if guards:
+                        guards[-1] = True
+                elif keyword == "endif":
+                    if guards:
+                        guards.pop()
                 continue
-            (conditional if depth else unconditional).update(SYMBOL.findall(line))
+            names = SYMBOL.findall(line)
+            if not names:
+                continue
+            # Set a use aside only when an enclosing guard cannot compile any branch
+            # (`False` = no alternate). A guard with an alternate always compiles one
+            # side, so its uses are dependencies.
+            if any(closed is False for closed in guards):
+                conditional.update(names)
+            else:
+                unconditional.update(names)
     CONDITIONAL.clear()
     CONDITIONAL.update(conditional - unconditional)
     return unconditional
@@ -215,6 +241,41 @@ def self_test():
             "the same symbol used unconditionally IS missing, guard or no guard")
         chk("loomc_guarded_symbol" not in CONDITIONAL,
             "…and it is NOT also listed as conditional: one unconditional use decides it")
+
+        # an `#else` branch always compiles one of the two sides, so a use in it is a
+        # dependency whatever the macro is (engine#2916 review, mine: this is
+        # `loomc_artifact_kind_t` at loom-jit.cpp:380, the `#else` of
+        # `#if defined(LOOMC_ARTIFACT_ROLE_COMPILE_REPORT)`, and the tool answered `ok`
+        # about it while it had stopped counting it)
+        (fork / "loom-jit.cpp").write_text(
+            "using A = loomc_real_one;\n"
+            "#if defined(NEVER_DEFINED_ANYWHERE)\nusing G = loomc_guarded_symbol;\n"
+            "#else\nusing E = loomc_else_symbol;\n#endif\n")
+        missing, _, _ = check(fork, hrx)
+        chk(missing == ["loomc_else_symbol"],
+            "a use in an #else branch is missing when it is undeclared: that branch compiles")
+        chk(CONDITIONAL == {"loomc_guarded_symbol"},
+            "…and only the no-alternate side is set aside")
+
+        # an `#elif` chain too: the elif branch compiles when the first condition does not
+        (fork / "loom-jit.cpp").write_text(
+            "using A = loomc_real_one;\n"
+            "#if defined(NEVER_DEFINED_ANYWHERE)\nusing G = loomc_guarded_symbol;\n"
+            "#elif defined(ALSO_NEVER)\nusing L = loomc_elif_symbol;\n#endif\n")
+        missing, _, _ = check(fork, hrx)
+        chk(missing == ["loomc_elif_symbol"], "an #elif branch compiles too")
+        chk(CONDITIONAL == {"loomc_guarded_symbol"}, "…and the branch with no alternate is still the guarded one")
+
+        # and the guard has to END: a use after `#endif` is unconditional (a counter that
+        # never decrements passed the old arms; measured, this arm fails without the pop)
+        (fork / "loom-jit.cpp").write_text(
+            "using A = loomc_real_one;\n"
+            "#if defined(NEVER_DEFINED_ANYWHERE)\nusing G = loomc_guarded_symbol;\n#endif\n"
+            "using T = loomc_after_the_guard;\n")
+        missing, _, _ = check(fork, hrx)
+        chk(missing == ["loomc_after_the_guard"],
+            "a use AFTER #endif is unconditional again, not swallowed by the guard")
+        chk(CONDITIONAL == {"loomc_guarded_symbol"}, "…and the conditional list holds only the guarded one")
 
         # the llama.cpp ROOT is as valid an argument as the module dir: this check
         # first failed on the real tree because it accepted only the latter

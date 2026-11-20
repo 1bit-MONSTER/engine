@@ -44,7 +44,17 @@ q = bench.provenance("/nonexistent/binary-xyz", repo="/tmp")
 ok2 = q["binary_sha256"] == "unknown" and q["engine_rev"] == "unknown"
 print("ok   an unavailable provenance value is the explicit string unknown" if ok2 else
       "FAIL provenance of a missing binary/absent repo should be 'unknown', got %r" % (q,))
-sys.exit(0 if (ok and ok2) else 1)
+# The fork pin is the lowering HOST and it must be READ, not a placeholder (engine#2888: the stanza's only other
+# provenance field could not be filled by anything before engine#2882 merges, so this is the one a lane can rely on
+# today). Asserted against the gitlink itself rather than against a literal, so a pin bump moves this arm with it.
+pin = subprocess.run(["git", "ls-tree", "HEAD", "third_party/llama.cpp"], capture_output=True, text=True).stdout.split()
+ok3 = len(pin) >= 3 and p["llama_cpp_rev"] == pin[2]
+print("ok   the fork pin is read out of the gitlink" if ok3 else
+      "FAIL llama_cpp_rev %r vs gitlink %r" % (p.get("llama_cpp_rev"), pin[2] if len(pin) >= 3 else None))
+ok5 = q["llama_cpp_rev"] == "unknown"
+print("ok   an absent repo leaves the fork pin unknown too" if ok5 else
+      "FAIL llama_cpp_rev should be unknown outside a checkout, got %r" % (q.get("llama_cpp_rev"),))
+sys.exit(0 if (ok and ok2 and ok3 and ok5) else 1)
 INNER
 
 # engine#2858: the lowering is the field that made an 11.22 tok/s artifact read as a real measurement beside 56.5, and the
@@ -80,7 +90,15 @@ print("ok   a tree with no stamp says unknown rather than guessing" if ok2 else
 ok3 = q["stamp_matches_checkout"] == "unknown"
 print("ok   and it does not claim a match it cannot check" if ok3 else
       "FAIL a stamp-less tree claimed a match: %r" % (q["stamp_matches_checkout"],))
-sys.exit(0 if (ok and ok2 and ok3) else 1)
+# The stamp half and the pin half are independent: the pin is the lowering HOST (a gitlink, always readable) and the
+# stamp is the emitting COMPILER (written by engine#2882's job, so "unknown" until that merges). This arm exists
+# because the first resolution of the merge conflict put the pin read INSIDE `if tree is not None`, so every
+# unstamped tree silently lost it -- the "a field that only fires in one branch" shape this stanza keeps fixing.
+real = bench.provenance(repo=sys.argv[1].rsplit("/tools", 1)[0])
+ok4 = real["llama_cpp_rev"] != "unknown"
+print("ok   the fork pin is read without a stamp" if ok4 else
+      "FAIL a checkout with no stamp dropped its fork pin: %r" % (real.get("llama_cpp_rev"),))
+sys.exit(0 if (ok and ok2 and ok3 and ok4) else 1)
 INNER
 
 python3 - "$scratch/plain.gguf" <<'PY'

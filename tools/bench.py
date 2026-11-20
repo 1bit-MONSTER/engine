@@ -113,10 +113,19 @@ def provenance(binary=None, repo=None):
     The build tree's own stamp is the authority for the lowering: `tools/ci/bench_stamp.py` reads it out of the code objects
     the build emitted, so this stanza carries that field through instead of keeping a second, permanently-unknown notion of
     it. A tree with no stamp keeps "unknown" -- it is a source tree or a hand-built directory, and saying so is the point.
+
+    **Until that writer exists, the stamp half cannot fire.** engine#2882 is the PR that adds
+    `bench_stamp.py write`; on this tree the only mentions of `bench-stamp.txt` are this reader, a doc, and a test that
+    fabricates the file, so `loom_or_iree_rev` still reads "unknown" for every real bench run -- with a better reason
+    than before ("no stamp in this tree") but the same value. `llama_cpp_rev` is the field a lane can rely on *today*:
+    the fork pin straight out of the engine tree's gitlink, which is the lowering HOST the binary was built against and
+    needs no submodule on disk (`git ls-tree HEAD third_party/llama.cpp` works in a bare checkout, unlike `rev-parse`
+    inside the submodule). So the stanza answers "which fork" always, and "which compiler emitted the code objects"
+    once a stamp is written.
     """
     import hashlib
     out = {"binary": binary or "unknown", "binary_sha256": "unknown", "engine_rev": "unknown",
-           "engine_dirty": "unknown", "loom_or_iree_rev": "unknown",
+           "engine_dirty": "unknown", "loom_or_iree_rev": "unknown", "llama_cpp_rev": "unknown",
            "stamp_tree": "unknown", "stamp_built_at": "unknown", "stamp_matches_checkout": "unknown"}
     if binary:
         try:
@@ -134,6 +143,11 @@ def provenance(binary=None, repo=None):
     if git("rev-parse", "--git-dir"):
         out["engine_rev"] = git("rev-parse", "HEAD") or "unknown"
         out["engine_dirty"] = "yes" if git("status", "--porcelain") else "no"
+        # the fork pin as the engine records it: the gitlink is the lowering host, and it is readable with the
+        # submodule absent -- `rev-parse` inside third_party/llama.cpp needs the tree, this does not
+        pin = git("ls-tree", "HEAD", "third_party/llama.cpp").split()
+        if len(pin) >= 3 and len(pin[2]) == 40:
+            out["llama_cpp_rev"] = pin[2]
 
     # The stamp sits at the build tree's root; the binary it describes is inside that tree.
     tree = None

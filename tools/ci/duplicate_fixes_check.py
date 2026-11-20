@@ -330,6 +330,17 @@ def self_test():
     dup = duplicates(prs)
     ok([i for i, _ in dup] == [2778], "one duplicate is reported, and only the claimed-twice issue")
     ok([p['number'] for p in dup[0][1]] == [2784, 2786], "the pair is named oldest first")
+    # engine#3048: THE BODY HAS TO SURVIVE main()'s REBUILD. `describe()` picks between "claimed by" and "referenced
+    # … touch the same files" by re-reading closing claims, and `main()` used to rebuild each PR without its body --
+    # so every real finding printed with the weakest wording ("three PRs that all said Closes #3041" read as
+    # "referenced"), and the "claimed by" branch was dead code here: the fixtures build their own dicts, so no arm
+    # ever went through the rebuild. This arm reproduces the rebuild and asserts the strong wording survives it.
+    _rebuilt = [{'number': p['number'], 'title': p['title'], 'body': p.get('body') or '',
+                 'draft': p['draft'], 'age_hours': p['age_hours']}
+                for p in [{'number': 1, 'title': 'a', 'body': 'Closes #3041', 'draft': False, 'age_hours': 1.0},
+                          {'number': 2, 'title': 'b', 'body': 'Fixes #3041', 'draft': False, 'age_hours': 0.5}]]
+    ok('is claimed by 2 open PR(s)' in describe(3041, _rebuilt),
+       "a finding whose PRs all CLOSE the issue says 'claimed by', not 'referenced' (engine#3048: main() dropped the body)")
     ok('one of these should close' in describe(*dup[0]), "the report says what to do about it")
 
     # a draft claimant still counts: that is a lane working, which the second lane cannot see
@@ -543,14 +554,19 @@ def main(argv):
         except (RuntimeError, json.JSONDecodeError):
             pass
         for issue, group in groups:
+            # engine#3048: KEEP THE BODY. `describe()` decides between "claimed by" and "referenced … that touch the same
+            # files" by re-reading each PR's closing claims, so dropping the body here made every finding use the weakest
+            # wording: three PRs that all said "Closes #3041" were printed as "referenced … touch the same files", and the
+            # "claimed by N" branch was dead code that no fixture drove -- the self-test builds its own PR dicts, so it
+            # never saw main()'s rebuild. The fields below are what the report prints; the body is what it reasons with.
             found.append({'repo': repo, 'issue': issue,
-                          'prs': [{'number': p['number'], 'title': p['title'], 'draft': p['draft'],
-                                   'age_hours': p['age_hours']} for p in group]})
+                          'prs': [{'number': p['number'], 'title': p['title'], 'body': p.get('body') or '',
+                                   'draft': p['draft'], 'age_hours': p['age_hours']} for p in group]})
     allow = read_allow(a.allow or os.path.join(os.path.dirname(os.path.abspath(__file__)), ALLOW_FILE))
     for repo, issue, op, mp, shared in mended:
         found.append({'repo': repo, 'issue': issue, 'mended_by': mp['number'],
                       'prs': [{'number': op['number'], 'title': op.get('title') or '',
-                               'draft': False, 'age_hours': 0}]})
+                               'body': op.get('body') or '', 'draft': False, 'age_hours': 0}]})
     found, allowed, stale = apply_allow(found, allow)
     if a.json:
         print(json.dumps(found, indent=1))

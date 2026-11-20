@@ -55,8 +55,15 @@ def load(root: Path):
 
 
 def declined_classes(sig, archs):
-    """tools/census.py:125 exactly: `watch == "report"` and the class has no backend."""
-    return {hf for hf, entry in sig.items() if entry.get("watch") == "report" and not (archs.get(hf) or {}).get("backends")}
+    """tools/census.py:124-125 exactly: `watch == "report"` and the class has no backend.
+
+    The committed registry/architectures.json nests its classes under "architectures" (tools/census.py:80 unwraps it
+    before the same predicate, as do tools/census_watch.py:249 and tools/registry_build.py:223); a flat lookup here
+    found no entry for ANY class, so every `watch: report` class counted as declined and the row disagreed with a
+    correct snapshot every day (engine#3041). Both shapes are accepted so a fixture and the committed file can differ.
+    """
+    table = archs.get("architectures") or archs
+    return {hf for hf, entry in sig.items() if entry.get("watch") == "report" and not (table.get(hf) or {}).get("backends")}
 
 
 def check(root: Path):
@@ -100,18 +107,29 @@ def self_test() -> int:
         (root / "registry" / "census.json").write_text(
             json.dumps({"date": "2026-11-17", "coverage": coverage, "raw": {"counts": counts}}), encoding="utf-8")
         (root / "registry" / "significant.json").write_text(json.dumps({"classes": sig}), encoding="utf-8")
-        (root / "registry" / "architectures.json").write_text(json.dumps(archs), encoding="utf-8")
+        # the committed file nests its classes; the fixture has to, or the row cannot see a lookup that forgets it
+        (root / "registry" / "architectures.json").write_text(json.dumps({"architectures": archs}), encoding="utf-8")
         return root
 
-    sig = {"ReviewedForCausalLM": {"watch": "report"}}
-    archs = {"MappedForCausalLM": {"backends": ["hrx"]}}
-    counts = {"ReviewedForCausalLM": 7, "MappedForCausalLM": 100}
+    # ReportedButMappedForCausalLM is the arm for engine#3041: a class that IS reviewed-for-report but HAS a backend.
+    # It is not declined, and only a lookup that unwraps architectures.json can tell -- a flat lookup counts it, which
+    # is what the committed file did to every class for as long as the row existed.
+    sig = {"ReviewedForCausalLM": {"watch": "report"}, "ReportedButMappedForCausalLM": {"watch": "report"}}
+    archs = {"MappedForCausalLM": {"backends": ["hrx"]}, "ReportedButMappedForCausalLM": {"backends": ["hrx"]}}
+    counts = {"ReviewedForCausalLM": 7, "MappedForCausalLM": 100, "ReportedButMappedForCausalLM": 5}
 
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         root = build(tmp, {"declined_architectures": 1, "declined_models": 7}, sig, archs, counts)
         got, why = check(root)
         arm("a consistent snapshot passes", got == [] and why is None, str(why or got))
+
+        # A flat file (no "architectures" level) is still read: the tolerance is one expression, and a fixture that
+        # predates the nesting should not start failing.
+        root = build(tmp, {"declined_architectures": 1, "declined_models": 7}, sig, archs, counts)
+        (root / "registry" / "architectures.json").write_text(json.dumps(archs), encoding="utf-8")
+        got, why = check(root)
+        arm("a flat architectures.json is read too", got == [] and why is None, str(why or got))
 
         root = build(tmp, {"declined_architectures": 23, "declined_models": 465}, sig, archs, counts)
         got, why = check(root)

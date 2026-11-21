@@ -59,6 +59,13 @@ announced=$(printf '%s\n' "$out" | grep -cE '^skip +(tools/ci/duplicate_fixes_ch
 noted=$(printf '%s\n' "$out" | sed -n 's/.*, \([0-9][0-9]*\) open-PR row(s) not run (--tree-only).*/\1/p')
 check "each open-PR row is announced with the tree-only reason" '[ "$announced" -eq 2 ]'
 check "every announced row is counted in the summary (printed == counted)" '[ -n "$noted" ] && [ "$announced" -eq "$noted" ]'
+# engine#3131: the TOTAL, which no per-row arm can see. `pre-pr-checks.sh` has two `continue` filters (`--tree-only`
+# and the one `--base-optional` adds); a filter that drops a row it did not announce changes this number and nothing
+# else in this file notices. The announced open-PR skips are printed as `skip` lines, so a correct run prints exactly
+# one line per `--list` row -- and it fails if a row ever prints two, which is the invariant judge_row promises.
+listed=$(bash scripts/pre-pr-checks.sh --list | wc -l)
+check "every listed row produces exactly one line (no filter swallowed a row)" \
+      '[ "$(printf "%s\n" "$out" | grep -cE "^(ok|FAIL|skip|cannot-tell) ")" -eq "$listed" ]'
 check "the open-PR rows are not claimed as ordinary skips" \
       '! grep -qE "^skip +(tools/ci/(duplicate_fixes_check|pr_branch_stale_check)\.py) +(nothing compared|SKIPPED)" <<<"$out"'
 for row in $base_rows; do

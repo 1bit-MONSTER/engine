@@ -87,17 +87,33 @@ rm -rf "$out"; mkdir -p "$out/dev" "$out/host"
 
 serve() {   # <dir> <port> [env ...]
     local dir=$1 port=$2; shift 2
+    # engine#3194: 60 s is a whisper-sized budget. A 14B host-GEMM arm spends minutes warming first
+    # (`forward-total` pays the weight cache up front: "forward-serve: warming (weight cache; first request would
+    # otherwise pay it)"), so a fixed 60 s kills it mid-warm and files the result as a failure. The budget is
+    # configurable, defaults to something a 14B arm survives, and the failure message below always names it.
+    local budget=${BITX_SERVE_WAIT_S:-300}
+    case "$budget" in
+        ''|*[!0-9]*|0) echo "  $dir: BITX_SERVE_WAIT_S must be a positive integer of seconds (got '$budget')" >&2; return 2 ;;
+    esac
     env "$@" "$bin" forward-serve -m "$container" --kernels "$kernels" --prefix-slots 0 \
         -p "$port" --dump-logits "$dir" > "$dir.log" 2>&1 &
     local pid=$!
     local up=0
-    for _ in $(seq 1 60); do
+    for _ in $(seq 1 "$budget"); do
         curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1 && { up=1; break; }
         kill -0 "$pid" 2>/dev/null || break
         sleep 1
     done
     if [ "$up" = 0 ]; then
-        echo "  $dir: serve did not come up -- $(grep -E 'init_elf failed|missing|error' "$dir.log" | tail -1)" >&2
+        # engine#3194: the old line grepped only `init_elf failed|missing|error`, so the most common real reason --
+        # a log ending in "warming (weight cache ...)" -- printed as `serve did not come up -- ` with nothing after it,
+        # and the reader was left to guess. Print the matched error when there is one, and otherwise (or as well) the
+        # child's own last line, plus the budget that expired.
+        local why last
+        why=$(grep -E 'init_elf failed|missing|error' "$dir.log" 2>/dev/null | tail -1)
+        last=$(tail -1 "$dir.log" 2>/dev/null)
+        echo "  $dir: serve did not come up within ${budget}s${why:+ -- $why}" >&2
+        [ -n "$last" ] && [ "$last" != "$why" ] && echo "  $dir: last line of $dir.log: $last" >&2
         kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 1
     fi
     local i=0 rc=0

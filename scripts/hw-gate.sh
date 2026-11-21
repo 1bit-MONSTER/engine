@@ -651,12 +651,26 @@ if [ -z "$BIN" ]; then
           built=1
         else
           note "private NPU runtime: npu-kernels ${npu_pin:0:12}; linking the NPU test targets against it"
-          { "$THERMAL" cmake -S "$src" -B "$build-npu" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-              -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt" && \
-            "$THERMAL" cmake --build "$build-npu" -j "$JOBS" --target npu_rt_shim_test npu_dmabuf_import_test; } > "$OUT/npu-link.log" 2>&1
-          if [ $? -ne 0 ]; then
-            note "::error::the NPU runtime at ${npu_pin:0:12} does not link the engine's NPU targets (npu_rt_shim_test, npu_dmabuf_import_test): see npu-link.log"
-            grep -E "undefined reference|error:" "$OUT/npu-link.log" | head -n 4 | sed 's/^/  /'
+          # engine#3079: configure the ENGINE root, not $src. $src is llama.cpp's tree (it is what the main build
+          # configures), and llama.cpp has no npu_rt_shim_test -- so ninja answered "unknown target" and the sentence
+          # below reported that as "the runtime does not link", the opposite of what happened. The gate had never run:
+          # its build dir carried `CMAKE_HOME_DIRECTORY=…/third_party/llama.cpp` and `grep -c npu_rt_shim_test
+          # build.ninja` was 0.
+          { "$THERMAL" cmake -S "$ROOT" -B "$build-npu" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt"; } > "$OUT/npu-link.log" 2>&1
+          npu_rc=$?
+          if [ $npu_rc -eq 0 ] && ! grep -q "npu_rt_shim_test" "$build-npu/build.ninja" 2>/dev/null; then
+            # the two failures mean different things and used to share one sentence: a configured tree WITHOUT the
+            # target is "the gate looked at the wrong tree", which is a bug in this script, not in the runtime.
+            note "::error::the NPU link gate configured a tree with no npu_rt_shim_test target ($ROOT) -- that is this script pointing at the wrong source, not a runtime failure: see npu-link.log"
+            npu_rc=1
+          elif [ $npu_rc -eq 0 ]; then
+            "$THERMAL" cmake --build "$build-npu" -j "$JOBS" --target npu_rt_shim_test npu_dmabuf_import_test >> "$OUT/npu-link.log" 2>&1
+            npu_rc=$?
+          fi
+          if [ $npu_rc -ne 0 ]; then
+            note "::error::the NPU link gate FAILED at ${npu_pin:0:12} (npu_rt_shim_test, npu_dmabuf_import_test): see npu-link.log"
+            grep -E "undefined reference|error:|unknown target" "$OUT/npu-link.log" | head -n 4 | sed 's/^/  /'
             built=1
           else
             echo "$npu_pin" > "$build/.npu-runtime-pin"

@@ -37,16 +37,13 @@ What already catches this, and why none of it does:
     a diagnosis cycle (#1979 covered the stale-hunk cousin of this, which a rebase shows you as a conflict; this
     one shows up as a CMake error).
 
-So: intersect the row names a branch **adds** with the names present in the base tree -- the base
+So: intersect the row names a branch **adds** with the names present in `<base>:CMakeLists.txt` -- the base
 **tip**, because that is where the duplicate appears. Rebased, the diff stops adding the row and this goes quiet,
 which is the fix.
 
-Narrow on purpose: the namespace is exactly what the registration glob at the end of `CMakeLists.txt` `include()`s
--- the top-level file plus `cmake/tests-*.cmake` -- and only the two registration spellings this tree uses
-(`add_test(NAME X` and `add_python_test(X`). A row in any other `cmake/*.cmake` file is NOT seen: the glob is the
-definition of the namespace, not a sample of it (and it is a different CMake directory scope, `add_subdirectory`,
-that makes `onnx/`'s rows a separate namespace). A name computed from a variable is not compared (the arms pin
-that), because a check that guesses at expansion is a check that reports names it did not read.
+Narrow on purpose: CMakeLists.txt only, and only the two registration spellings this tree uses
+(`add_test(NAME X` and `add_python_test(X`). A name computed from a variable is not compared (the arms pin that),
+because a check that guesses at expansion is a check that reports names it did not read.
 
 Two shapes that are NOT duplicates, both measured on `main`'s own history before this row landed: a row REWRITTEN
 in place (engine#3018 removed and re-added the name in one diff), and the same name registered inside a **different
@@ -56,8 +53,7 @@ configure takes.
 
 Exit: 0 no collision, 1 the branch adds a name the base already registers (and the diff does not remove it),
 2 cannot tell (no git, an unresolvable base, a shallow clone where `base...HEAD` is not a real comparison, or a
-collision where BOTH sides sit inside an `if()` block -- an unconditional registration at either end collides
-whenever the other side's guard is on, so one guarded side is a collision, not a cannot-tell).
+collision where either side sits inside an `if()` block).
 
   tools/ci/ctest_row_name_check.py --check [--base origin/main] [--root .]
   tools/ci/ctest_row_name_check.py --self-test
@@ -202,14 +198,26 @@ def check(root: pathlib.Path, base: str) -> tuple[int, list[str]]:
     # Counted before the dict above collapses the repeat; nothing here needs the base or the tree, so it is a hard
     # collision rather than a cannot-tell (measured: rc 0 before, `cmake -S . -B` rc 1 "already exists").
     counts = counted_row_names(added)
-    # An ADDITION is never cancelled by a removal: a removal only cancels the base's copy, which is what `freed` and
-    # `clashes` below are for. Sharing `freed` here forgave -1/+2 of one name in one diff (a row moved into a family
-    # file and written twice), which leaves two copies in the tree and stops Configure.
     doubled = sorted(n for n, count in counts.items() if count > 1)
     if doubled:
-        return 1, ([f"{len(doubled)} ctest row name(s) this branch registers MORE THAN ONCE:"]
-                   + [f"  {n}: registered {counts[n]}x by this branch" for n in doubled]
-                   + ["  two registrations of one name fail Configure whatever the base holds: drop one"])
+        # A doubled name with ANY sighting outside an `if()` collides whatever the base holds. When every sighting sits
+        # inside an `if()`, the pair can be mutually exclusive (`engine#2989`), which a name-and-depth comparison cannot
+        # settle -- so it is cannot-tell, the same answer the `guarded` rule below gives for the same reason. The depth
+        # is the shallowest sighting in the tree this branch lands (see tree_rows), so "all guarded" is min-depth > 0.
+        unguarded = [n for n in doubled if not head.get(n, ("", 0))[1]]
+        if unguarded:
+            # The runner labels a red row with the LAST stdout line, so the summary carries the names: otherwise the
+            # visible reason for a red gate is the fix-it sentence, not the row that collided (review of #3243).
+            return 1, ([f"{len(unguarded)} ctest row name(s) this branch registers MORE THAN ONCE: "
+                        f"{', '.join(unguarded)}"]
+                       + [f"  {n}: registered {counts[n]}x by this branch" for n in unguarded]
+                       + ["  at least one registration is outside any if(), so it collides whatever the base holds: "
+                          "drop one"])
+        return 2, ([f"{len(doubled)} ctest row name(s) this branch registers more than once, but every registration "
+                    f"sits inside an `if()` block, which can make them mutually exclusive: {', '.join(doubled)}"]
+                   + [f"  {n}: registered {counts[n]}x by this branch (if-depth {head.get(n, ('', 0))[1]})"
+                      for n in doubled]
+                   + ["  configure the tree to find out (cannot tell, not a pass), or drop one"])
     if not taken:
         return 0, []
     clashes = sorted(n for n in taken if n in known and n not in freed)
@@ -230,7 +238,8 @@ def check(root: pathlib.Path, base: str) -> tuple[int, list[str]]:
             + [f"  {n}: branch -> {taken[n][0][:90]} (if-depth {taken[n][1]}); {base} -> {known[n][0][:90]} "
                f"(if-depth {known[n][1]})" for n in guarded]
             + ["  configure the tree to find out (cannot tell, not a pass), or rename one of the two rows"])
-    msgs = [f"{len(clashes)} ctest row name(s) this branch ADDS are already registered at {base}:"]
+    msgs = [f"{len(clashes)} ctest row name(s) this branch ADDS are already registered at {base}: "
+            f"{', '.join(clashes)}"]
     for n in clashes:
         msgs.append(f"  {n}")
         msgs.append(f"    this branch: {taken[n][0]}")
@@ -303,9 +312,27 @@ def self_test() -> int:
         chk(1, got, "a name the branch adds TWICE is a collision with no base involved")
         chk(True, any("new_dup" in m for m in msgs), "...and the message names the doubled row")
 
-        # 3e. a row REMOVED here and written TWICE in a new family file: `-1/+2` of one name leaves two copies in the
-        # tree, and a set of freed NAMES forgives it (measured: the tree holds 2 copies while the added-lines
-        # comparison, the `n not in freed` suppression and `freed` itself all answer clean).
+        # 3e. two registrations of one name in DIFFERENT `if()` branches: Configure is fine when only one guard is on,
+        # so it is cannot-tell, not a collision (the same doctrine as the `guarded` rule; measured on a real tree:
+        # `cmake -S . -B -DFOO=ON -DBAR=OFF` configures clean).
+        d = repo(tmpd, "doubled_in_two_guards")
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text()
+                                  + "if(ENABLE_FOO)\n    add_python_test(gx ${CMAKE_SOURCE_DIR}/x.py)\nendif()\n"
+                                  + "if(ENABLE_BAR)\n    add_python_test(gx ${CMAKE_SOURCE_DIR}/x.py)\nendif()\n")
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "one name, two guards"], check=True)
+        chk(2, check(d, "main")[0], "a name registered twice, both inside an if(), is cannot-tell (mutually exclusive)")
+
+        # 3f. …but one sighting outside any guard collides whatever the base holds, so the pair is a hard 1.
+        d = repo(tmpd, "doubled_one_guarded")
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text()
+                                  + "if(ENABLE_FOO)\n    add_python_test(gy ${CMAKE_SOURCE_DIR}/x.py)\nendif()\n"
+                                  + "add_python_test(gy ${CMAKE_SOURCE_DIR}/x.py)\n")
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "one name, guarded and not"], check=True)
+        chk(1, check(d, "main")[0], "a name registered twice where one sighting is unguarded is a hard collision")
+
+        # 3g. a row REMOVED here and written TWICE in a new family file: `-1/+2` of one name leaves two copies in the
+        # tree, and a `freed` set of NAMES forgives it (an addition is never cancelled by a removal -- a removal only
+        # cancels the BASE's copy, which is `clashes`' job).
         d = repo(tmpd, "moved_and_doubled")
         (d / "cmake").mkdir()
         (d / ROW_FILE).write_text("# base\n")
@@ -317,9 +344,9 @@ def self_test() -> int:
         chk(1, got, "a row REMOVED here and registered twice in a new family file is a collision (a freed NAME forgives it)")
         chk(True, any("taken_row" in m for m in msgs), "...and the message names the moved row")
 
-        # 3f. a row PARKED as a comment beside its live copy is one registration, not two -- `main` carries four such
+        # 3h. a row PARKED as a comment beside its live copy is one registration, not two -- `main` carries four such
         # comments (CMakeLists.txt:383, 649, 2354, 3230). Without the `#` skip in counted_row_names this is a false
-        # collision on a tree that configures, which is the phantom-duplicate trap this file's own docstring names.
+        # collision on a tree that configures.
         d = repo(tmpd, "commented_duplicate")
         (d / ROW_FILE).write_text((d / ROW_FILE).read_text()
                                   + "# add_python_test(parked_row ${CMAKE_SOURCE_DIR}/x.py)  -- parked until x exists\n"
@@ -425,6 +452,18 @@ def self_test() -> int:
     return rc
 
 
+def _emit_order(msgs: list[str]) -> list[str]:
+    """The indented detail first and the one-line summary LAST.
+
+    The runner labels a red row with the last line it printed, so with the summary first the visible reason for a red
+    gate was the fix-it sentence ("... drop one" / "rebase onto the base ...") rather than the row that collided. The
+    summary also names the rows, so the label names what broke (review of engine#3243).
+    """
+    detail = [m for m in msgs if m.startswith("  ")]
+    summary = [m for m in msgs if not m.startswith("  ")]
+    return detail + summary
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true")
@@ -437,7 +476,7 @@ def main(argv=None) -> int:
     if not a.check:
         ap.error("--check or --self-test")
     rc, msgs = check(pathlib.Path(a.root), a.base)
-    for m in msgs:
+    for m in _emit_order(msgs):
         print(f"ctest_row_names: {m}", file=sys.stderr if rc else sys.stdout)
     if rc == 0:
         print(f"ctest_row_names: no row name the branch adds is already registered at {a.base}")

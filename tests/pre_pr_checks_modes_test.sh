@@ -47,10 +47,12 @@ open_rows="tools/ci/duplicate_fixes_check.py tools/ci/pr_branch_stale_check.py"
 out=$(timeout 900 scripts/pre-pr-checks.sh --base "$bogus" --base-optional --tree-only 2>&1); rc=$?
 
 check "the run completes (rc=0) with no base and --base-optional" '[ $rc -eq 0 ]'
-# 4 is the four `--base` rows; 5 is those plus `loom_pin_check`, whose answer is a fact about the MACHINE rather than about this
-# runner (it is cannot-tell when no local clone carries the Loom pin, green when one does -- and it says which). Accepting both
-# keeps this arm's teeth on the four rows it is actually about.
-check "the summary counts them as cannot-tell, not as a pass" 'grep -qE "pre-pr-checks: .*, (4|5) could not be told" <<<"$out"'
+# 4 is the four `--base` rows. The rows above that are facts about the MACHINE rather than about this runner, and each says
+# which: `loom_pin_check` is cannot-tell when no local clone carries the Loom pin and green when one does (5), and
+# `loom_coverage_check` is cannot-tell when the card trees are absent -- CI's normal state -- and green where they exist (6).
+# Accepting the range keeps this arm's teeth on the four rows it is actually about; a machine-dependent row must not be able
+# to satisfy it by itself.
+check "the summary counts them as cannot-tell, not as a pass" 'grep -qE "pre-pr-checks: .*, (4|5|6) could not be told" <<<"$out"'
 check "the summary says how many open-PR rows it did not run" \
       'grep -q "pre-pr-checks: .*2 open-PR row(s) not run (--tree-only)" <<<"$out"'
 # engine#3138 review (cl-1077, whose #3137 the orchestrator closed as this PR's duplicate): the run path is a DIFFERENT

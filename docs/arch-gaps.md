@@ -986,6 +986,10 @@ in `registry/significant.json`.
 | `MiniCPMOcrForConditionalGeneration` | FastFlowLM pack only | **declined for now** — custom `minicpm-ocr` library, nothing at the pin reads it |
 | `DFlash2DraftModel` | — | already declined (`significant.json`, `watch: report`) |
 | `Lfm3ForCausalLM` | — | already declined (`significant.json`, `watch: report`) |
+| `Inkling2LoopForConditionalGeneration` | 5 | **declined** — relative-position attention + looped blocks, nothing at the pin registers it (`significant.json`, `watch: report`) |
+| `SageLmForCausalLM` | 1 | **declined** — Qwen2.5-7B geometry but the config omits rope_theta/activation (`significant.json`, `watch: report`) |
+| `VantageTitanForCausalLM` | 1 | **declined** — the declared dims contradict each other; no graph to map (`significant.json`, `watch: report`) |
+| `Edge0ForCausalLM` | 1 | **not declined** — `model_type: qwen4_exp_text`, i.e. the mapped `qwen4exp` family under a private class name, one converter registration away |
 
 * `GRTForCausalLM` (`MatterWaveAI/grt-30m-code` and 7 others) is **not an alias**. Its config was read on
   2026-11-07: `model_type: grt`, `n_qkv_rotations: 11`, `n_mixer_rotations: 1`, `mor_router_mode: rotational`,
@@ -1369,3 +1373,74 @@ of the `HYV4Flash` family above, and it is **not a generative architecture at al
 Reported, not alerted (`"watch": "report"`, `registry/significant.json`). The checkpoint is an INT8 W8A8/GS128
 re-wrap of a draft that needs a target we do not serve, so there is nothing here to measure even if the graph
 existed.
+
+## 2026-11-21: `Inkling2LoopForConditionalGeneration`, `SageLmForCausalLM`, `VantageTitanForCausalLM` declined, `Edge0ForCausalLM` is a renamed `qwen4exp` (engine#3181)
+
+The 2026-11-21 watcher run alerted four `!! UNCOVERED` classes — `Inkling2LoopForConditionalGeneration` (5
+models from 4 uploaders), `Edge0ForCausalLM`, `SageLmForCausalLM` and `VantageTitanForCausalLM` (one each) —
+with the same note on all four: *could not tell whether upstream has it (converter unavailable)*. The pinned
+backend was `third_party/llama.cpp 3514f3a840` when the classes were reviewed and is `a87cc5a74` after #3169
+merged; `git grep` over **both** for `inkling`, `edge0`, `sagelm` and `vantage` returns **nothing** in either
+`src/llama-arch.cpp` or the converter, so the bump did not change the answer, so the generated registry has
+no entry for any of these names and a mapping would have to be typed in by hand — the one thing the registry
+forbids. Each config was read through the HF API on 2026-11-21 (metadata only, no weights).
+
+Three are **declined** and carry `"watch": "report"` in `registry/significant.json` (the census prints
+`. REVIEWED` instead of alerting). One is **not a gap at all** and is recorded here rather than in
+`significant.json`, because it belongs to a family we already serve.
+
+### `inkling2_loop` — `shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB`
+
+* **Class / model_type**: `Inkling2LoopForConditionalGeneration` / `inkling2_loop` (its `text_config`:
+  `inkling2_loop_text`). No `auto_map`, no modelling code shipped.
+* **Shape**: hidden 2304, 24 layers, 24 heads / 8 KV, `head_dim` 128, vocab 201024, **`d_rel` 16 and
+  `rel_extent` 1024** — i.e. attention over learned **relative** position offsets, not RoPE — with
+  `model_max_length` 1048576. The "Loop" in the name is a looped/recurrent block schedule.
+* **Why an alias is wrong**: every mapped family uses RoPE (or a mapped variant of it). Loading this through
+  llama/qwen would apply rotary embeddings where the model applies relative offsets, and the loop schedule has
+  no equivalent in a mapped graph: it would produce tokens from the wrong attention entirely. That is the
+  silent-substitution case this page exists for.
+* **Real support needs**: an architecture with relative-position attention and a looped block graph in the
+  pinned backend, validated against HF logits. 5 models from 4 uploaders already, so it is worth watching.
+
+### `Edge0ForCausalLM` — `andynoodles/Edge0-145B-NVFP4-vLLM` (not declined: same family as a mapped class)
+
+* **What it is**: the architecture string is a private rename, but its `config.json` says
+  **`model_type: qwen4_exp_text`**, and its `layer_types` are the qwen4exp hybrid — three
+  `linear_attention` layers per `indexed_attention` one — with `vocab_size` 248320, hidden 2560, 48 layers.
+  The registry **already serves that family**: `Qwen4ExpForCausalLM` / `Qwen4ExpForConditionalGeneration` ->
+  `qwen4exp`, and the pinned backend registers `LLM_ARCH_QWEN4EXP` (`src/llama-arch.cpp`), which is the
+  Qwen3.8-Flash-Next route.
+* **So this is a naming gap, not an architecture gap**: nothing at the pin maps `Edge0ForCausalLM`, because
+  the converter has no `@ModelBase.register` for that class name. It is one converter registration away —
+  the same disposition as `MiniCPMV4_7ForConditionalGeneration` in the table below.
+* **Left alerting on purpose** (not in `significant.json`): it is a real, cheap fix for whoever touches the
+  fork's converter next, and silencing it with a `watch: report` entry would be the review saying "nothing to
+  do" about a class we could serve tomorrow.
+* **One caveat for that someone**: the repo is an **NVFP4** quant (`-NVFP4-vLLM`). Mapping the class makes the
+  *architecture* known; whether the quant format loads is a separate question the mapping does not answer.
+
+### `sagelm` — `SOTAagi2030/SageLM-Support-7B-v2`
+
+* **Class / model_type**: `SageLmForCausalLM` / `sagelm`. No `auto_map`, no modelling code.
+* **Shape**: hidden 4096, intermediate 11008, 32 heads / 8 KV, vocab 152064, `tie_word_embeddings: false`,
+  4096 positions — the **Qwen2.5-7B geometry exactly** (`_name_or_path: sagelm-support-7b/step_1800`,
+  `release_channel: candidate`).
+* **Why an alias is still wrong**: the config states neither `rope_theta`, `rms_norm_eps` nor the activation.
+  Qwen2.5 is `rope_theta` 1e6; the llama-family default is 1e4, so an alias would compute attention at a
+  different frequency and serve a different model while reporting the same name. "Same shape" is not "same
+  model", and the fields that would settle it are absent.
+* **What would unblock it**: the uploader publishing those three fields (or a config naming the family it was
+  fine-tuned from). Then it is a one-line converter registration, like `Edge0ForCausalLM`.
+
+### `vantage-titan` — `Anh1hoa/VANTAGE-TITAN-1`
+
+* **Class / model_type**: `VantageTitanForCausalLM` / `vantage-titan`. No `auto_map`, no modelling code.
+* **Why there is nothing to map**: the config contradicts itself — `hidden_size` 4096 with
+  `num_attention_heads` 64 x `head_dim` 128 = 8192 — and declares fields no mapped backend has:
+  `latent_dim` 512 (an MLA-style latent), `holographic_state_dim` 1024, `kv_cache_quantization`
+  `2-bit-ternary-tla`, `zero_multiply_gemm` true, dynamic `rope_scaling` factor 32, 2097152 positions.
+  `version` is `1.0.0-SINGULARITY`.
+* **Why an alias would be a fabrication**: with no tensor shapes that agree with each other and no code
+  anywhere that defines the extra state, a mapping would have to invent the graph. If the uploader later ships
+  weights whose shapes agree with a real family, this entry is the place to say so.

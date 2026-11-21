@@ -30,8 +30,14 @@ Also reported, not judged: whether the recorded commit is an **ancestor of the e
 gitlink**. Today it is not (measured 2026-11-21), which means the engine tree cannot build this toolchain and it has
 to come from a separate clone; that is the state LOOM-GPU-SWITCH.md condition 1 leaves the fallback route in.
 
+`--loom-serve PATH|auto` also checks the **file that gets launched**, because none of the three facts above can:
+`1bit serve` launches `loom-serve` by PATH, and the binary cannot say which toolchain it is (`--version` prints
+"development (commit unknown)" at 0.2.0 and is rejected outright by 0.1.0), while package metadata answers "what does
+interpreter X have installed" -- two different questions when an activated venv puts another `loom-serve` ahead of the
+pin's one. So the pin records that binary's sha256 and this compares it.
+
 Usage:
-    loom_pin_check.py --check [--source DIR] [--python PYTHON] [--config PATH]
+    loom_pin_check.py --check [--source DIR] [--python PYTHON] [--config PATH] [--loom-serve PATH|auto]
     loom_pin_check.py --self-test
 
 Exit: 0 the pin agrees, 1 a finding, 2 cannot tell (no clone, or no installed package to compare).
@@ -107,7 +113,7 @@ def installed_version(python):
     return p.stdout.strip(), None
 
 
-def check(cfg_path, source=None, python=None, wheel=None):
+def check(cfg_path, source=None, python=None, wheel=None, loom_serve=None):
     findings, notes = [], []
     cfg = read_config(cfg_path)
     for key in ('repo', 'sha', 'package', 'version', 'version_file', 'model_catalog_repo', 'model_catalog_sha'):
@@ -172,6 +178,33 @@ def check(cfg_path, source=None, python=None, wheel=None):
                 findings.append(f'{wheel} has sha256 {got[:16]}…, the pin says {want[:16]}…')
             else:
                 notes.append(f'{pathlib.Path(wheel).name} sha256 matches the pin')
+
+    # The launchable binary (see the docstring): the one fact none of the above can establish.
+    binpath = None
+    if loom_serve == 'auto':
+        binpath = shutil.which('loom-serve')
+        if not binpath:
+            findings.append('--loom-serve auto: no loom-serve on PATH')
+    elif loom_serve:
+        binpath = loom_serve
+    if binpath:
+        import hashlib
+        want = cfg.get('loom_serve_sha256')
+        p = pathlib.Path(binpath).expanduser()
+        if not p.is_file():
+            findings.append(f'no loom-serve at {binpath}')
+        elif not want:
+            findings.append(f'{cfg_path} records no loom_serve_sha256, so {binpath} cannot be checked against the pin')
+        else:
+            got = hashlib.sha256(p.read_bytes()).hexdigest()
+            if got != want:
+                findings.append(f'{binpath} has sha256 {got[:16]}…, the pin says {want[:16]}…'
+                                f'{" (a venv ahead of it on PATH?)" if ".venv" in str(p) else ""}')
+            else:
+                notes.append(f'{binpath} sha256 matches the pin')
+    else:
+        notes.append('the launchable loom-serve was not identified (--loom-serve PATH|auto), so nothing here says '
+                     'which binary a route would start')
     for n in notes:
         print(f'loom_pin: {n}')
     for f in findings:
@@ -240,6 +273,23 @@ def self_test():
         'a wheel whose sha256 is the pinned one is accepted')
     chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.2.0', wheel_sha256='0' * 64), source=str(src), wheel=str(whl)) == 1,
         '...and a wheel with any other sha256 is a finding')
+
+    # The launchable binary: the artefact a route starts. Same "identify the file" reasoning as the wheel, and the same
+    # two ways to get it wrong (an unpinned binary, and a binary that is not the pinned one).
+    binf = tmp / 'loom-serve'
+    binf.write_bytes(b'\x7fELF not really, but its hash is what the pin names')
+    bdig = hashlib.sha256(binf.read_bytes()).hexdigest()
+    rel = dict(sha=rsha, version='0.2.0', model_catalog_ref='v0.2.0')
+    chk(check(cfg(loom_serve_sha256=bdig, **rel), source=str(src), loom_serve=str(binf)) == 0,
+        'a loom-serve whose sha256 is the pinned one is accepted')
+    chk(check(cfg(loom_serve_sha256='0' * 64, **rel), source=str(src), loom_serve=str(binf)) == 1,
+        '...and any other loom-serve binary is a finding')
+    chk(check(cfg(**rel), source=str(src), loom_serve=str(binf)) == 1,
+        'a binary pin missing from the config is a finding, not a silence')
+    chk(check(cfg(loom_serve_sha256=bdig, **rel), source=str(src), loom_serve=str(tmp / 'nope')) == 1,
+        'a loom-serve that is not there is a finding')
+    chk(check(cfg(loom_serve_sha256=bdig, **rel), source=str(src)) == 0,
+        'not identifying a binary is a note, not a finding (a runner has none installed)')
     print(f'loom_pin_check self-test: {ok[0]} ok, {ok[1]} failed')
     return 0 if ok[1] == 0 else 1
 
@@ -252,12 +302,15 @@ def main(argv=None):
     ap.add_argument('--source', default=None, help='a clone of the repo in config/loom.config')
     ap.add_argument('--python', default=sys.executable, help='interpreter to ask for the installed hrx_loom')
     ap.add_argument('--wheel', default=None, help='a hrx_loom wheel whose sha256 must match config/loom.config')
+    ap.add_argument('--loom-serve', default=None, metavar='PATH|auto',
+                    help='the loom-serve binary a route would launch (auto = the first on PATH); its sha256 must match '
+                         'config/loom.config, because the binary cannot report its own toolchain')
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
     if not a.check:
         ap.error('one of --check or --self-test')
-    return check(a.config, a.source, a.python, a.wheel)
+    return check(a.config, a.source, a.python, a.wheel, a.loom_serve)
 
 
 if __name__ == '__main__':

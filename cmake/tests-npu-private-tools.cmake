@@ -20,3 +20,8 @@ add_executable(npu_private_route_tools_test tests/npu_private_route_tools_test.c
 target_include_directories(npu_private_route_tools_test PRIVATE app)
 target_link_libraries(npu_private_route_tools_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME npu_private_route_tools COMMAND npu_private_route_tools_test)
+# engine#3193 CI: `ci_targets` refuses a row whose target nothing in ci.yml's build list reaches -- the row is
+# registered and the executable is never built, so CI reports "Could not find executable" instead of running it.
+# This is the documented second route: make it a build dependency of `onebit`, which ci.yml does build. The cases
+# are pure header logic, so the edge costs a test-rule compile and no NPU runtime.
+add_dependencies(onebit npu_private_route_tools_test)

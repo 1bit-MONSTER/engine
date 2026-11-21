@@ -654,6 +654,11 @@ add_python_test(guard_loss_check_self ${CMAKE_SOURCE_DIR}/tools/ci/guard_loss_ch
 # engine#3106: the shallow-clone guard those tools ask first. Its arms include a real `git clone --depth 1`, because the
 # whole point is a fact about git that a table cannot establish.
 add_python_test(git_shallow_self ${CMAKE_SOURCE_DIR}/tools/ci/git_shallow.py --self-test)
+# engine#3106: the guard's --self-test pins the decision table; this pins the WIRING by running the instruments in a real
+# `git clone --depth 1` with the files they parse present, and requires each to name the shallow clone rather than
+# answering cannot-tell for some other reason (a thin fixture is how an audit certifies safety it never tested -- the
+# finding cl-hrxnan made while auditing this issue; the test is theirs, handed over when #3109 closed naming this PR).
+add_test(NAME git_shallow_instruments COMMAND bash ${CMAKE_SOURCE_DIR}/tests/git_shallow_instruments_test.sh)
 # engine#2992: the pre-merge twin of merged_tail_check -- a stale open branch deletes main's newer lines when it
 # merges, and the PR page shows a clean additive diff while it would do so. Self-test wired because
 # tools/ci/tool_selftest_wired_check.py requires a tool that carries one to be named here.

@@ -70,32 +70,36 @@ def read_kv(path):
         return None
 
 
-def supported_from_starter(root):
-    """Architecture names the starter's sources mention, or None when the tree is unreadable.
+def starter_names(root):
+    """(mentioned, supported): string literals the starter's sources contain, and the subset the snapshot claims.
 
-    The constant below is a snapshot, and a snapshot that drifts re-creates the failure this tool exists to prevent in
-    the opposite direction: a *supported* architecture reported unsupported. So the list can be read from the source it
-    is a claim about - `starter/*.py` mentions each architecture it handles by name (engine#3221 review).
+    engine#3221 review: the first version filtered every name through SUPPORTED, so the "derived" set was
+    SUPPORTED ∩ starter - it could notice a name **disappearing** and could never notice one **appearing**, which
+    is the half of the staleness risk the docstring records ("a supported architecture reported unsupported"). So
+    the derivation now returns the raw mentions and lets the caller show the difference: names the starter mentions
+    that the snapshot does not are printed as "unrecognised", which is the addition signal without pretending the
+    prober knows they are architectures (the starter's architecture knowledge is spread over code paths -
+    `cfg.get("arch") == "gemma4"`, `hf_names/*.json` - not one greppable table).
     """
     import pathlib
     import re
-    found = set()
+    mentioned = set()
     try:
-        files = list(pathlib.Path(root).glob("*.py"))
+        files = sorted(pathlib.Path(root).glob("*.py"))
     except OSError:
-        return None
+        return None, None
     if not files:
-        return None
+        return None, None
     pattern = re.compile(r"[\"']([a-z][a-z0-9_]{1,15})[\"']")
     for path in files:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for name in pattern.findall(text):
-            if name in SUPPORTED:
-                found.add(name)
-    return found or None
+        mentioned.update(pattern.findall(text))
+    if not mentioned:
+        return None, None
+    return mentioned, mentioned & set(SUPPORTED)
 
 
 def probe(kv, supported=SUPPORTED, source="built-in list"):
@@ -173,13 +177,20 @@ def main():
     if not args.gguf:
         parser.error("a GGUF path is required (or --self-test)")
     supported, source = SUPPORTED, "built-in list"
+    extra = []
     if args.starter:
-        derived = supported_from_starter(args.starter)
-        if derived is None:
+        mentioned, supported = starter_names(args.starter)
+        if mentioned is None:
             print(f"loom_arch_probe: cannot read the starter at {args.starter} - cannot tell, and that is not a pass")
             return 2
-        supported, source = derived, f"read from {args.starter}"
+        source = (f"snapshot confirmed against {args.starter}: {len(supported)} of the {len(SUPPORTED)} names the "
+                  f"snapshot claims are mentioned there")
+        extra = sorted(mentioned - set(SUPPORTED))
     rc, lines = probe(read_kv(args.gguf), supported, source)
+    if args.starter and extra:
+        lines.append(f"  the starter also mentions {len(extra)} name(s) the snapshot does not claim - if one of them is "
+                     f"an architecture, the snapshot is stale and this file's SUPPORTED needs it: "
+                     f"{', '.join(extra[:12])}{' …' if len(extra) > 12 else ''}")
     print("\n".join(lines))
     return rc
 

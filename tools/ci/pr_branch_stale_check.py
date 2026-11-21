@@ -95,6 +95,27 @@ def open_prs(repo):
         cannot_tell(f"{len(prs)} open PRs is the whole page -- the list may be truncated (raise PAGE)")
     return prs
 
+def fetch_pr_ref(root, pr, base="main"):
+    """Fetch PR <pr> and its base, returning (pr_ref, base_ref). Raises CannotTell.
+
+    engine#3095: the per-PR mode fetched `refs/heads/<branch>`, which stops existing as soon as a PR's branch is deleted or
+    rewritten after the PR was opened -- 3 of the 4 PRs open on 2026-11-21 answered cannot-tell for exactly that reason,
+    while `refs/pull/<N>/head` existed for all four. The pull ref is the one git keeps for the life of the PR.
+
+    The destination is FORCED (`+...`): a rebased or force-pushed branch is precisely the case this gate exists to judge,
+    and a named destination without `+` is refused as non-fast-forward (the half tracked as engine#3076/#3094). One `+`
+    serves both halves, which is why this function is shared by both modes rather than duplicated.
+    """
+    pr_ref, base_ref = f"origin/pr-{pr}", f"origin/{base}"
+    rc, _o, err = run("git", "fetch", "-q", "origin", f"+refs/pull/{pr}/head:refs/remotes/{pr_ref}", cwd=root)
+    if rc != 0:
+        raise CannotTell(f"cannot fetch refs/pull/{pr}/head (rc {rc}): {err.strip()[:120]}")
+    rc, _o, err = run("git", "fetch", "-q", "origin", f"+refs/heads/{base}:refs/remotes/{base_ref}", cwd=root)
+    if rc != 0:
+        raise CannotTell(f"cannot fetch its base {base} (rc {rc}): {err.strip()[:120]}")
+    return pr_ref, base_ref
+
+
 def stale_finding(repo_dir, branch, base="origin/main"):
     """(behind, reverted, carried, files) measuring THE MERGE, or None when the merge removes none of main's lines.
 
@@ -276,6 +297,45 @@ def self_test():
     chk(advisory_exit(EXIT_FINDING) == 0, "advisory: a finding is reported and exits 0, so it cannot block another lane's gate")
     chk(advisory_exit(EXIT_CANNOT_TELL) == 77, "advisory: cannot-tell is 77 (a skip), never 0")
     chk(advisory_exit(EXIT_CLEAN) == 0, "advisory: a clean run stays 0")
+
+    # engine#3095: the fetch source. The fixture owns BOTH sides -- a bare origin whose PR exists only as
+    # `refs/pull/7/head` -- so the arm can distinguish "the pull-ref fetch worked" from "a fetch of any kind worked". The
+    # old path (branch name) must FAIL on this fixture, or the fixture is not the shape the defect needs.
+    import tempfile as _tf
+    bo = _tf.TemporaryDirectory()
+    bare = pathlib.Path(bo.name, "origin.git")
+    subprocess.run(("git", "init", "-q", "--bare", str(bare)), capture_output=True, text=True)
+    work = pathlib.Path(bo.name, "work")
+    work.mkdir()
+    gb = lambda *a: subprocess.run(("git", *a), cwd=str(work), capture_output=True, text=True)
+    gb("init", "-q"); gb("config", "user.email", "t@e"); gb("config", "user.name", "t")
+    gb("remote", "add", "origin", str(bare))
+    (work / "a.txt").write_text("a1\na2\n")
+    gb("add", "-A"); gb("commit", "-qm", "main"); gb("push", "-q", "origin", "HEAD:refs/heads/main")
+    gb("checkout", "-q", "-b", "gone-branch")
+    (work / "a.txt").write_text("a2\n")          # the PR's branch deletes a1
+    gb("commit", "-qam", "pr7"); gb("push", "-q", "origin", "HEAD:refs/pull/7/head")
+    # main must move AHEAD of the branch, or the merge is a fast-forward and "removes nothing" is the correct (and
+    # useless) answer -- the first version of this fixture made that mistake and the arm failed for the right reason.
+    gb("checkout", "-q", "main")
+    (work / "c.txt").write_text("c1\n")
+    gb("add", "-A"); gb("commit", "-qm", "main moves on"); gb("push", "-q", "origin", "HEAD:refs/heads/main")
+    rc_branch = gb("fetch", "-q", "origin", "gone-branch").returncode
+    chk(rc_branch != 0, "engine#3095 fixture: the BRANCH-name fetch fails when only the pull ref exists (the old path)")
+    try:
+        pr_ref, base_ref = fetch_pr_ref(str(work), 7, "main")
+        chk(pr_ref == "origin/pr-7" and base_ref == "origin/main", "engine#3095: the PULL ref fetch succeeds where the branch fetch failed")
+        f7 = stale_finding(str(work), pr_ref, base_ref)
+        chk(f7 is not None and f7[2] >= 1, "engine#3095: and the verdict is MEASURED (a carried line), not cannot-tell")
+    except CannotTell as e:
+        chk(False, f"engine#3095: fetch_pr_ref refused a pull ref that exists ({e})")
+    # ... and a PR number that has no pull ref must still be cannot-tell, not a silent pass
+    try:
+        fetch_pr_ref(str(work), 999, "main")
+        chk(False, "engine#3095: a missing pull ref must raise cannot-tell")
+    except CannotTell:
+        chk(True, "engine#3095: a missing pull ref is cannot-tell")
+    bo.cleanup()
     return 0 if ok else 1
 
 
@@ -306,12 +366,10 @@ def main():
             cannot_tell(f"cannot read PR #{a.pr} (rc {rc}): {err.strip()[:200]}")
         info = json.loads(out)
         branch, base = info["headRefName"], info.get("baseRefName") or "main"
-        for ref in (f"{branch}:refs/remotes/origin/{branch}", f"{base}:refs/remotes/origin/{base}"):
-            rc, _o, err = run("git", "fetch", "-q", "origin", ref, cwd=root)
-            if rc != 0:
-                cannot_tell(f"cannot fetch {ref.split(':')[0]} (rc {rc}): {err.strip()[:120]}")
+        # engine#3095: by PULL ref, not branch name -- the branch name is only used in the message now.
         try:
-            found = stale_finding(root, f"origin/{branch}", f"origin/{base}")
+            pr_ref, base_ref = fetch_pr_ref(root, a.pr, base)
+            found = stale_finding(root, pr_ref, base_ref)
         except CannotTell as e:
             pr_cannot_tell(a.pr, branch, str(e))
         if found is None:
@@ -324,21 +382,13 @@ def main():
         return 1
 
     for n, branch, base in open_prs(a.repo):
-        ref = f"origin/{branch}"
-        rc, _out, err = run("git", "fetch", "-q", "origin", branch, cwd=root)
-        if rc != 0:
-            # engine#2992 review: this used to fall through to `stale_finding` returning None, which printed "removes nothing
-            # main has" and exited 0 -- a 0 that meant "could not look". A branch that cannot be fetched is a cannot-tell.
-            unreadable.append(f"#{n} {branch}: cannot fetch the branch ({err.strip().splitlines()[0] if err.strip() else 'fetch failed'})")
-            print(f"#{n} {branch}: CANNOT READ -- the branch could not be fetched, so nothing was measured", file=sys.stderr)
-            continue
-        # the base is the PR's target: `origin/<baseRefName>`, fetched too, so a fork PR measured against its pin
-        # branch cannot report clean while deleting that branch's newer lines (engine#3071)
-        base_ref = f"origin/{base}"
-        rc, _o, err = run("git", "fetch", "-q", "origin", f"{base}:refs/remotes/{base_ref}", cwd=root)
-        if rc != 0:
-            unreadable.append(f"#{n} {branch}: cannot fetch its base {base} ({err.strip()[:80]})")
-            print(f"#{n} {branch}: CANNOT READ -- its base {base} could not be fetched", file=sys.stderr)
+        # engine#3095: the pull ref, for the same reason as the single-PR mode -- a branch ref can be gone while the PR is
+        # still open. engine#2992 review: a fetch that fails is a cannot-tell, never a clean "removes nothing".
+        try:
+            ref, base_ref = fetch_pr_ref(root, n, base)
+        except CannotTell as e:
+            unreadable.append(f"#{n} {branch}: {e}")
+            print(f"#{n} {branch}: CANNOT READ -- {e}", file=sys.stderr)
             continue
         try:
             f = stale_finding(root, ref, base_ref)

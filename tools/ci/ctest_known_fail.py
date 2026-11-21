@@ -217,23 +217,66 @@ def summary(log_text: str):
 
 
 def baseline(root: pathlib.Path):
-    """{test name: reason} from the checked-in baseline."""
+    """{test name: the entry as written} from the checked-in baseline.
+
+    The value keeps the row's whole line, comment included, because the `# reason` after the name is where the
+    recorded CLASS lives (`# Failed` vs `# Not Run`) and `reason_class` reads it from there (engine#3129). The name
+    is still the key, so every caller that only asks "is this row known" is unaffected.
+    """
     path = root / BASELINE
     if not path.exists():
         return {}
     out = {}
     for line in path.read_text().splitlines():
-        line = COMMENT.sub("", line).strip()
-        if line:
-            out[line.split()[0]] = line
+        stripped = COMMENT.sub("", line).strip()
+        if stripped:
+            out[stripped.split()[0]] = line.strip()
     return out
 
 
-def check(log_text: str, known, want_total=None):
+def reason_class(reason: str) -> str:
+    """What KIND of failure the FAILED block reports: 'not-run' when there was no executable, else 'failed'.
+
+    ctest puts `Not Run` -- the binary was never built -- in the same FAILED block as assertion failures (see
+    failed()), and the baseline was compared by NAME only, so a baselined `Failed` row whose target stopped compiling
+    moved class and stayed "known": engine#3129 was that month. `hrx-backend-test` was baselined `Failed` on
+    2026-11-17, stopped compiling with fork #438 (one stale call, `moe_router_descriptor_layout`), and its
+    `Not Run` never printed a new failure anywhere. The reason after `#` is free text, so only its first words are
+    read; everything that is not `Not Run` is the assertion-failure class.
+    """
+    text = reason or ""
+    if "#" in text:
+        # a baseline line is "<name>    # <reason>"; the name is not the reason (and is never "Not Run")
+        text = text.split("#", 1)[1]
+    return "not-run" if text.strip().lower().startswith("not run") else "failed"
+
+
+def class_changes(names, known):
+    """{name: (baseline_class, log_class)} for baselined rows whose class changed.
+
+    Empty when `known` is a set of names: the self-test's shorthand, and any caller with no baseline file, records no
+    reason -- so nothing is compared and the answer is exactly what it was before this existed. Treating a set as
+    "every class unknown" would make every arm a class change, which is the opposite of safe.
+    """
+    if not isinstance(known, dict):
+        return {}
+    out = {}
+    for name in names:
+        if name in known:
+            was, now = reason_class(known[name]), reason_class(names[name])
+            if was != now:
+                out[name] = (was, now)
+    return out
+
+
+def check(log_text: str, known, want_total=None, changed=None):
     """(new_failures, fixed, cannot) -- cannot is a string when the log cannot answer at all.
 
     `fixed` is "in the baseline and did not fail", minus the rows ctest skipped (engine#2912): a baselined row
     that did not run was printed as "now passing, remove from the baseline", which is a pass nobody measured.
+
+    A baselined row whose FAILED-block CLASS changed is a new failure too (engine#3129) -- pass a dict as `changed`
+    to receive {name: (baseline_class, log_class)} for the report.
     """
     if not log_text.strip():
         return set(), set(), "the log is empty"
@@ -251,7 +294,10 @@ def check(log_text: str, known, want_total=None):
     if count != len(names):
         return set(), set(), (f"the summary says {count} failed, the FAILED block lists {len(names)} -- "
                              f"one of the two is truncated")
-    new = {n for n in names if n not in known}
+    classes = class_changes(names, known)
+    if changed is not None:
+        changed.update(classes)
+    new = {n for n in names if n not in known} | set(classes)
     did_not_run = skipped(log_text)
     fixed = {n for n in known if n not in names and n not in did_not_run}
     return new, fixed, None
@@ -266,9 +312,10 @@ def judge(log_text: str, known, last_test_log=None, want_total=None):
     `last_test_log` is the text of ctest's LastTest.log, or None when the caller has no outputs to offer -- then
     no_device is empty and this is check() with the columns counted.
     """
-    new, fixed, cannot = check(log_text, known, want_total)
+    changed = {}
+    new, fixed, cannot = check(log_text, known, want_total, changed)
     out = {"new": new, "fixed": fixed, "known_failed": set(), "skipped": set(), "no_device": set(),
-           "not_in_run": set(), "passed": 0, "total": 0, "cannot": cannot}
+           "not_in_run": set(), "passed": 0, "total": 0, "cannot": cannot, "class_changed": changed}
     if cannot:
         return out
     names = set(failed(log_text))
@@ -293,7 +340,8 @@ def judge(log_text: str, known, last_test_log=None, want_total=None):
     out["new"] = new - no_device
     # a row that exits 0 while printing the skip line did not pass, and neither did one that was never started
     out["fixed"] = fixed - no_device - out["not_in_run"]
-    out["known_failed"] = (names & set(known)) - no_device
+    # a row that changed class is a NEW failure, so it must not also be counted as a known one (engine#3129)
+    out["known_failed"] = (names & set(known)) - no_device - set(new)
     out["skipped"] = did_not_run - no_device
     out["total"] = total
     out["passed"] = total - len(names | did_not_run | no_device)
@@ -418,6 +466,61 @@ Errors while running CTest
     if (new3, fixed3, cannot3) != (set(), known, None):
         print(f"  SELF-TEST FAIL: all-green vs a stale baseline -> {new3, fixed3, cannot3}")
         bad += 1
+    # engine#3129: the baseline was compared by NAME only, so a baselined `Failed` row whose target stopped
+    # compiling moved to `Not Run` and stayed "known" -- `hrx-backend-test` did exactly that for a month. The class is
+    # now part of the comparison, in both directions, and a set of names (how every arm above passes `known`) is
+    # deliberately unaffected.
+    not_built = """\
+95% tests passed, 4 tests failed out of 112
+The following tests FAILED:
+\t 18 - test-tokenizers-ggml-vocabs (Failed)
+\t 19 - test-kv-zero (Subprocess aborted)
+\t 37 - test-speculative-rejection-sampling (SEGFAULT)
+\t101 - test-hrx-mul-mat-id-k32 (Not Run)
+Errors while running CTest
+"""
+    base_dict = {n: n + "    # Failed -- measured in a real run" for n in known}
+    changed = {}
+    new_c, fixed_c, cannot_c = check(not_built, base_dict, None, changed)
+    cases += 1
+    if (new_c, cannot_c) != ({"test-hrx-mul-mat-id-k32"}, None) or \
+            changed.get("test-hrx-mul-mat-id-k32") != ("failed", "not-run"):
+        print(f"  SELF-TEST FAIL: a baselined failure that stopped building is not a new failure -> {new_c, changed}")
+        bad += 1
+    # the row a baseline RECORDS as `Not Run` keeps working (#2836/#3129: `test-hrx-host-resident` really does not
+    # build at this pin, and a guard that fired on it would be the same bug pointing the other way)
+    recorded_not_run = dict(base_dict, **{"test-hrx-mul-mat-id-k32": "test-hrx-mul-mat-id-k32  # Not Run -- #2836"})
+    new_n, _, cannot_n = check(not_built, recorded_not_run, None, {})
+    cases += 1
+    if (new_n, cannot_n) != (set(), None):
+        print(f"  SELF-TEST FAIL: a row baselined AS Not Run is not a class change -> {new_n, cannot_n}")
+        bad += 1
+    # ... and the reverse direction: a row baselined "did not build" that now RUNS and fails is not covered by that
+    # baseline either, so it is new (otherwise "we knew it could not build" silently becomes "we accept it failing")
+    runs_again = not_built.replace("101 - test-hrx-mul-mat-id-k32 (Not Run)",
+                                  "101 - test-hrx-mul-mat-id-k32 (Subprocess aborted)")
+    new_r, _, cannot_r = check(runs_again, recorded_not_run, None, changed_r := {})
+    cases += 1
+    if (new_r, cannot_r) != ({"test-hrx-mul-mat-id-k32"}, None) or \
+            changed_r.get("test-hrx-mul-mat-id-k32") != ("not-run", "failed"):
+        print(f"  SELF-TEST FAIL: a row baselined Not Run that now fails is not a new failure -> {new_r, changed_r}")
+        bad += 1
+    # a SET of names carries no recorded reason, so nothing is compared: this is the behaviour every arm above uses,
+    # and it must stay byte-for-byte what it was (a set read as "class unknown" would turn every arm into a change)
+    new_set, _, cannot_set = check(not_built, known, None, {})
+    cases += 1
+    if (new_set, cannot_set) != (set(), None):
+        print(f"  SELF-TEST FAIL: a set of known names must not be class-compared -> {new_set, cannot_set}")
+        bad += 1
+    # the report half: judge() carries the detail and does not double-count the row as a known failure
+    got_c = judge(not_built, base_dict)
+    cases += 1
+    if sorted(got_c["new"]) != ["test-hrx-mul-mat-id-k32"] or \
+            got_c["class_changed"].get("test-hrx-mul-mat-id-k32") != ("failed", "not-run") or \
+            "test-hrx-mul-mat-id-k32" in got_c["known_failed"]:
+        print(f"  SELF-TEST FAIL: judge() does not report the class change once -> "
+              f"{sorted(got_c['new'])}, {got_c['class_changed']}, {sorted(got_c['known_failed'])}")
+        bad += 1
     # THE case this tool exists to get right: a log that cannot answer must not read as clean.
     for log, why in (("", "the log is empty"),
                      ("-- Configuring done\n-- Generating done\n", "tests passed"),
@@ -466,9 +569,13 @@ Errors while running CTest
             "# Known failures follow.\n"
             "test-kv-zero                  # Subprocess aborted -- main\n"
             "test-hrx-fa-masked-v  # Failed\n")
-        # the value is the NAME: the `# reason` is for humans reading the file, and `--write`
-        # re-derives it from the log, so a round-trip through baseline() loses nothing.
-        want = {"test-kv-zero": "test-kv-zero", "test-hrx-fa-masked-v": "test-hrx-fa-masked-v"}
+        # The value now KEEPS the row's own line, because the recorded class (`# Failed` vs `# Not Run`) after the
+        # name is what engine#3129 showed the ratchet could not see -- and it is stripped before this function used
+        # to store it. The NAME is still the key, so "is this row known" is unchanged, and the property this arm was
+        # written for -- a column-0 licence block is not read as names -- is still what it asserts: two rows, not
+        # four comment lines.
+        want = {"test-kv-zero": "test-kv-zero                  # Subprocess aborted -- main",
+                "test-hrx-fa-masked-v": "test-hrx-fa-masked-v  # Failed"}
         got = baseline(root)
         cases += 1
         if got != want:
@@ -593,7 +700,8 @@ Errors while running CTest
     cases += 1
     got = judge(nodev_log, {"plain-fail", "not-built", "suite-mixed"}, nodev_last)
     want = {"new": set(), "fixed": set(), "known_failed": {"plain-fail", "not-built"}, "skipped": {"model-skip"},
-            "no_device": absent, "not_in_run": set(), "passed": 1, "total": 8, "cannot": None}
+            "no_device": absent, "not_in_run": set(), "passed": 1, "total": 8, "cannot": None,
+            "class_changed": {}}
     if got != want:
         print(f"  SELF-TEST FAIL: a device-less run, by column -> {got}")
         bad += 1
@@ -737,7 +845,12 @@ def main(argv=None):
     for name in sorted(no_device):
         print(f"  DID NOT RUN ON A DEVICE: {name} -- it printed '{DEVICE_SKIP}'; not a pass, not a failure",
               file=sys.stderr)
+    for name, (was, now) in sorted(got.get("class_changed", {}).items()):
+        print(f"  CLASS CHANGED: {name} -- {BASELINE} records {was!r}, this run says {now!r}: a row that stopped "
+              f"building is not the failure the baseline recorded (engine#3129)", file=sys.stderr)
     for name in sorted(new):
+        if name in got.get("class_changed", {}):
+            continue      # the CLASS CHANGED line above states it; "not in the baseline" would be untrue
         print(f"  NEW failure: {name} -- not in {BASELINE}", file=sys.stderr)
     print(f"ctest_known_fail: {got['total']} row(s): {got['passed']} passed, {len(got['known_failed'])} known "
           f"failure(s), {len(new)} new, {len(got['skipped'])} skipped, {len(no_device)} without a device")

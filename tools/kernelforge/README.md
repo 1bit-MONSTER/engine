@@ -39,6 +39,11 @@ standalone HIP kernels, so they still run; a kept kernel's destination is now an
 dispatched through HRX in our llama.cpp fork, not the ROCm backend. The results below were
 measured on the ROCmFPX build and are kept as the record.
 
+Since 2026-11-21 the engine's GPU route is moving to Loom programs on HRX, and the llama.cpp route
+these kernels belong to is the fallback, with no new kernel work
+([docs/hrx.md](../../docs/hrx.md#direction-loom-on-the-gpu)). The tasks stay runnable as a record
+and for fixes; new GPU optimization work goes into Loom programs instead.
+
 ## Run one
 
 You need three things on the machine with the GPU:

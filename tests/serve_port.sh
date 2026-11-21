@@ -39,8 +39,15 @@
 # waited out its whole 1200-tenths budget on every `--port 0` NPU run and printed nothing while it did.
 # Take the URL token and the port is the field after its LAST colon, which also keeps an IPv6 --host right:
 # http://::1:41235 -> 41235.
-serve_port_from_log() {  # <log> -> the port, empty while serve has not said
-    awk '/^1bit (serve|forward-serve):/ && / ready on http:\/\//{
+serve_port_from_log() {  # <log> [extra-match] -> the port, empty while serve has not said
+    # engine#3130: a `1bit serve` that spawns backends which are THEMSELVES `1bit serve` (--laya-models, and every
+    # wrapper that nests) prints this same line once per child, and the children come up before the parent does -- so
+    # "the first line" can be a child's port, and a test that trusts it talks to a backend and asserts front-end
+    # behaviour against it. `extra-match`, where given, is an ERE the line must also carry (the parent's line carries
+    # `(laya-models: model auto is routed per request)`); without it the old first-match behaviour is unchanged, so
+    # the single-process callers (route tests, hybrid e2e, mem_admit) keep working untouched.
+    awk -v extra="${2:-}" '/^1bit (serve|forward-serve):/ && / ready on http:\/\//{
+             if (extra != "" && $0 !~ extra) next;
              for (i = 1; i <= NF; i++) if ($i ~ /^http:\/\//) { n = split($i, a, ":"); if (a[n] ~ /^[0-9]+$/) { print a[n]; exit } }
          }' "$1" 2>/dev/null
 }
@@ -70,10 +77,10 @@ serve_port_wait_any() {  # <log> <pid> [tenths] -> the port, preferring serve's 
     printf '%s\n' "$port"
 }
 
-serve_port_wait() {  # <log> <pid> [tenths-of-a-second, default 900 = 90 s] -> the port, non-zero if it never came
-    local log=$1 pid=$2 tries=${3:-900} port=
+serve_port_wait() {  # <log> <pid> [tenths-of-a-second, default 900 = 90 s] [extra-match] -> the port
+    local log=$1 pid=$2 tries=${3:-900} extra=${4:-} port=
     for _ in $(seq 1 "$tries"); do
-        port=$(serve_port_from_log "$log")
+        port=$(serve_port_from_log "$log" "$extra")
         if [ -n "$port" ]; then printf '%s\n' "$port"; return 0; fi
         # serve died: no readiness line is ever coming, so stop waiting rather than sleeping out the whole budget
         kill -0 "$pid" 2>/dev/null || break

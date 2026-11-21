@@ -52,7 +52,14 @@ check "the run completes (rc=0) with no base and --base-optional" '[ $rc -eq 0 ]
 # `loom_coverage_check` is cannot-tell when the card trees are absent -- CI's normal state -- and green where they exist (6).
 # Accepting the range keeps this arm's teeth on the four rows it is actually about; a machine-dependent row must not be able
 # to satisfy it by itself.
-check "the summary counts them as cannot-tell, not as a pass" 'grep -qE "pre-pr-checks: .*, (4|5|6) could not be told" <<<"$out"'
+# engine#3222: derived rather than enumerated. A count in a test is only as good as the set of worlds it was taken
+# in, and this line has now needed three numbers in one evening (4, then 5 for a machine-dependent row, now 6 for the
+# collision row that also takes --base). The invariant is that the column and the summary agree, which does not need
+# a number at all; the four base rows are still named individually just below.
+told=$(printf '%s\n' "$out" | grep -c '^cannot-tell ')
+check "the summary counts every cannot-tell row (derived, not enumerated)" \
+      'grep -qE "pre-pr-checks: .*, $told could not be told" <<<"$out"'
+check "...and at least the four base rows are among them" '[ "$told" -ge 4 ]'
 check "the summary says how many open-PR rows it did not run" \
       'grep -q "pre-pr-checks: .*2 open-PR row(s) not run (--tree-only)" <<<"$out"'
 # engine#3138 review (cl-1077, whose #3137 the orchestrator closed as this PR's duplicate): the run path is a DIFFERENT
@@ -79,8 +86,8 @@ check "every row --list --tree-only names actually ran (a swallowed row is not a
 # applied verbatim) made this file report `ok` while one check had vanished from the run. So the expected SIZE is a
 # literal, taken from the repository the way the runner's own self-test takes 19/17: a dropped row cannot hide behind a
 # second reading of the same broken function.
-check "--list --tree-only still names 17 rows (a literal, not a second reading of this code)" \
-      '[ "$(printf "%s\n" "$listed" | grep -c .)" -eq 17 ]'
+check "--list --tree-only still names 18 rows (a literal, not a second reading of this code)" \
+      '[ "$(printf "%s\n" "$listed" | grep -c .)" -eq 18 ]'
 # ...and the TOTAL, which is the arm #3145 arrived at independently 24 seconds after this branch (crediting it here
 # because its reasoning is the better statement of the same property, and it catches one thing mine does not): a filter
 # that drops a row it never announced changes this number and nothing else; a row that prints TWO lines changes it too.

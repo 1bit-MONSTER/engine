@@ -1660,6 +1660,12 @@ if(Python3_Interpreter_FOUND)
     # slug, a cache entry that is not the fork's tree), and a self-test no runner names is a self-test nobody runs --
     # tool_selftest_wired_check counted it as wired through the other three rows, which is why this was easy to miss.
     add_python_test(registry_build_self ${CMAKE_SOURCE_DIR}/tools/registry_build.py --self-test)
+    # engine#3222: a branch that adds a ctest row NAME the base already has merges into a CMake error at Configure,
+    # which reads as a defect in a correct branch (two instances on 2026-11-21). Arms: a collide, a rebased clean, and
+    # a genuinely new name. Also a pre-PR row, so a lane learns before pushing rather than from another lane's build.
+    add_test(NAME add_test_collision COMMAND ${Python3_EXECUTABLE}
+             ${CMAKE_SOURCE_DIR}/tools/ci/add_test_collision_check.py --check --base origin/main)
+    add_python_test(add_test_collision_self ${CMAKE_SOURCE_DIR}/tools/ci/add_test_collision_check.py --self-test)
     # the row's own mutant: a fake fork and a fake gitlink in a scratch repo, so the content edit that made every
     # other row green is proved to make this one red, and the no-checkout case is proved to be 77 and not 0.
     add_test(NAME registry_content_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_content_test.py)

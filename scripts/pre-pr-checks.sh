@@ -156,10 +156,10 @@ if [ "${1:-}" = "--self-test" ]; then
     tree=$(bash "$0" --list --tree-only 2>/dev/null | sed 's|^python3 ||')
     nfull=$(printf '%s\n' "$full" | grep -c .)
     ntree=$(printf '%s\n' "$tree" | grep -c .)
-    if [ "$nfull" = 19 ] && [ "$ntree" = 17 ]; then
+    if [ "$nfull" = 20 ] && [ "$ntree" = 18 ]; then
         echo "  [PASS] --list $nfull rows, --list --tree-only $ntree"
     else
-        echo "  [FAIL] --list $nfull rows, --list --tree-only $ntree (want 19 / 17)"
+        echo "  [FAIL] --list $nfull rows, --list --tree-only $ntree (want 20 / 18)"
         fails=$((fails + 1))
     fi
     if [ "$(printf '%s\n' "$full" | grep -cE 'duplicate_fixes_check|pr_branch_stale_check')" = 2 ] &&
@@ -278,6 +278,12 @@ checks=(
     # open PR heads (one spurious hit, fixed by the head-tree search) and on the real llama.cpp#371 diff; exit 2 when
     # it cannot read the refs, so "cannot tell" is never a pass.
     "tools/ci/guard_loss_check.py --check --base $base$strict"
+    # engine#3222: a branch that adds a ctest row NAME the base tip already registers merges into a CMake error at
+    # Configure -- "add_test given test NAME … already exists" -- which reads as a defect in the branch and is not:
+    # the row is correct, the base got the same name from another lane. Rebased, the diff stops adding it and this
+    # row goes quiet, which is the fix. NAMES are the signal: branch_stale_check measures deletions and
+    # duplicate_fixes_check groups claims by ISSUE, so neither sees this. Needs the base TIP, so it takes --base.
+    "tools/ci/add_test_collision_check.py --check --base $base"
     # engine#2416: the HIP add-on's f16 audit over $GPU_KERNELS_DIR (or third_party/gpu-kernels) at the pin; with no
     # tree it exits 77 and is listed as `skip`, never `ok`
     "tools/ci/hip_f16_audit.py --find ."

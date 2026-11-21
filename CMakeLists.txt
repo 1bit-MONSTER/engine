@@ -2702,6 +2702,11 @@ if(ONEBIT_NPU)
     add_executable(npu_rt_shim_test tests/npu_rt_shim_test.cpp)
     target_link_libraries(npu_rt_shim_test PRIVATE onebit_npu_lane)
     add_test(NAME npu_rt_shim COMMAND npu_rt_shim_test)
+    # xdna-driver#3: how long after a client dies does the next hardware context create succeed? `hold` is the victim a
+    # SIGKILL is aimed at, `wait` measures the recovery through npu_rt's own create path (npu_rt_retry.h). Not a ctest
+    # row: it needs a device and a deliberate kill, so it is a tool a lane runs under an npu-hold ticket.
+    add_executable(npu_ctx_create_probe tools/npu_ctx_create_probe.cpp)
+    target_link_libraries(npu_ctx_create_probe PRIVATE onebit_npu_lane)
     # engine#753: does the engine EXECUTE on a dma-buf it did not allocate? This one does open the device (it imports a udmabuf and
     # hands the exporter's mapping to the runtime), so it takes the kernel ELF as an argument and SKIPS (77) without one -- a box
     # with no ELF registers a skip rather than a red row, the same rule as the other device-dependent rows.

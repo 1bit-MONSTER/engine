@@ -118,7 +118,11 @@ mm=${MOK_MANAGER:-/usr/lib/shim/mmx64.efi}
 [ -f "$mm" ] && cp -L "$mm" "$esp/EFI/BOOT/mmx64.efi"
 # The kernel and initrd are on the data partition, not on the ESP: grub reads ext4, and the frugal
 # install has to sit next to its save folder. search --label is why the label matters.
-setcmd="pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0 log_buf_len=32M"
+# engine#3088: `nvme.quirks=1e49:1081:dmapool_align_512` covers the YMTC PC41Q-2TB (the DRAM-less M.2 this box ships)
+# whose 32-entry PRP list the driver over-reads: on this box that was 2-83 IO_PAGE_FAULTs/h, and 0 after 7 h with the
+# quirk (engine#2478). It belongs in the kernel's `nvme_id_table`; until that kernel build carries the entry, the boot
+# line is what makes any machine with this SSD quiet, and an image without it faults on its own hardware.
+setcmd="pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0 log_buf_len=32M nvme.quirks=1e49:1081:dmapool_align_512"
 cat > "$esp/EFI/BOOT/grub.cfg" <<GRUBCFG
 set timeout=8
 set default=0
@@ -176,6 +180,10 @@ grep -q 'ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable
 # what an hour of this boot writes; a missing parameter is refused here rather than discovered on the stick.
 grep -q 'log_buf_len=32M' "$esp/EFI/BOOT/grub.cfg" || {
     echo "$prog: REFUSED: no log_buf_len=32M in grub.cfg (the kernel ring would wrap and lose the evidence)" >&2; exit 1; }
+# engine#3088: the quirk is the only thing standing between this image and #2478's fault stream on the SSD it ships with.
+# Same shape as the two guards above: the artifact is refused, not the stick found faulty later.
+grep -q 'nvme.quirks=1e49:1081:dmapool_align_512' "$esp/EFI/BOOT/grub.cfg" || {
+    echo "$prog: REFUSED: no nvme.quirks=1e49:1081:dmapool_align_512 in grub.cfg (the shipped YMTC PC41Q faults without it, engine#3088)" >&2; exit 1; }
 grep -q 'menuentry "1bit OS - install to a disk (1bit.installer=1)"' "$esp/EFI/BOOT/grub.cfg" || {
     echo "$prog: REFUSED: grub.cfg has no install-to-a-disk entry" >&2; exit 1; }
 grep -q 'set default=0' "$esp/EFI/BOOT/grub.cfg" || {

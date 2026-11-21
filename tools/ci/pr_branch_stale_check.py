@@ -265,6 +265,57 @@ def self_test():
     except SystemExit as e:
         chk(e.code == EXIT_CANNOT_TELL, "the per-PR cannot-tell channel exits 2 (a skip), not 0 (a clean merge)")
 
+    # engine#3095: the HEAD must come from `refs/pull/<N>/head`, which exists for every PR; `refs/heads/<branch>` does
+    # not exist once the branch is deleted (every merged PR's is). Fixture: a bare remote with ONLY a pull ref, no
+    # refs/heads at all -- the shape of a merged PR -- and the fetch must still produce a usable local ref.
+    import subprocess as _sp, tempfile as _tf, os as _os
+    with _tf.TemporaryDirectory() as td:
+        bare = _os.path.join(td, "rem.git"); work = _os.path.join(td, "w"); clone = _os.path.join(td, "c")
+        _sp.run(("git", "init", "-q", "--bare", bare), check=True)
+        _sp.run(("git", "init", "-q", work), check=True)
+        for k in ("user.email", "user.name"):
+            _sp.run(("git", "-C", work, "config", k, "t@t" if k == "user.email" else "t"), check=True)
+        pathlib.Path(work, "f.txt").write_text("x\n")
+        _sp.run(("git", "-C", work, "add", "-A"), check=True)
+        _sp.run(("git", "-C", work, "commit", "-qm", "head"), check=True)
+        _sp.run(("git", "-C", work, "push", "-q", bare, "HEAD:refs/pull/7/head"), check=True)
+        _sp.run(("git", "-C", work, "push", "-q", bare, "HEAD:refs/heads/main"), check=True)
+        want = _sp.run(("git", "-C", work, "rev-parse", "HEAD"), capture_output=True, text=True).stdout.strip()
+        _sp.run(("git", "clone", "-q", bare, clone), check=True)
+        try:
+            ref = fetch_pr_head(clone, 7)
+            got = _sp.run(("git", "-C", clone, "rev-parse", ref), capture_output=True, text=True).stdout.strip()
+            chk(got == want, "the per-PR head is fetched from refs/pull/<N>/head when no branch ref exists (engine#3095)")
+        except CannotTell as e:
+            chk(False, "the per-PR head must come from the pull ref, but the fetch failed: " + str(e)[:70])
+        # ... and a REWRITTEN pull ref must still fetch. --amend, not a new commit: an amended commit is NOT a descendant of
+        # the one the clone holds, which is the non-fast-forward shape a rebase/force-push produces (a child commit is a
+        # fast-forward, and my first version of this arm used one -- the mutant passed, so the arm was vacuous).
+        _sp.run(("git", "-C", work, "commit", "-q", "--amend", "-m", "rewritten"), check=True)
+        _sp.run(("git", "-C", work, "push", "-qf", bare, "HEAD:refs/pull/7/head"), check=True)
+        _sp.run(("git", "-C", work, "push", "-qf", bare, "HEAD:refs/heads/main"), check=True)   # the base is rewritten too
+        want2 = _sp.run(("git", "-C", work, "rev-parse", "HEAD"), capture_output=True, text=True).stdout.strip()
+        try:
+            ref2 = fetch_pr_head(clone, 7)
+            got2 = _sp.run(("git", "-C", clone, "rev-parse", ref2), capture_output=True, text=True).stdout.strip()
+            chk(got2 == want2, "... and a force-updated pull ref re-fetches (dropping +/--force would make the gate skip every rebased PR)")
+        except CannotTell as e:
+            chk(False, "a rewritten pull ref must re-fetch; without + the gate skips every rebased PR: " + str(e)[:60])
+        # ... and the BASE is mirrored too. The clone fetched origin/main before the amend above, so the remote's main is
+        # now a non-fast-forward tip: without the `+` #3076/#3094 added, this fetch is rejected and the gate answers
+        # cannot-tell on a tree it is meant to measure. That property had no arm until now.
+        try:
+            bref = fetch_base(clone, "main")
+            got_b = _sp.run(("git", "-C", clone, "rev-parse", bref), capture_output=True, text=True).stdout.strip()
+            chk(got_b == want2, "the base is fetched by name and MIRRORED, so a rewritten base still measures (engine#3076/#3094)")
+        except CannotTell as e:
+            chk(False, "a rewritten base must re-fetch; without the `+` the gate skips: " + str(e)[:60])
+        try:
+            fetch_pr_head(clone, 8)
+            chk(False, "a missing pull ref must raise CannotTell")
+        except CannotTell:
+            chk(True, "... and a PR with no pull ref is cannot-tell, not a clean answer (engine#3095)")
+
     # engine#2992 review: no arm exercised the EXIT TABLE, which is how an unreadable queue came to report itself as a finding
     # (rc 1) and a fetch failure as a clean run (rc 0). These need no git fixture and no network.
     chk(verdict_exit(unreadable=False, findings=0) == 0, "exit table: clean run is 0")
@@ -308,6 +359,38 @@ def self_test():
     return 0 if ok else 1
 
 
+def fetch_pr_head(root, pr):
+    """The local ref holding PR <pr>'s head, fetched from `refs/pull/<pr>/head` (engine#3095).
+
+    The per-PR mode fetched the PR's BRANCH NAME (`refs/heads/<branch>`), which stops existing the moment a branch is
+    deleted after its PR opens -- and every merged PR's branch is deleted in this fleet. Measured on `main` 2026-11-22:
+    3 of the 4 open PRs answered cannot-tell (rc 2, a skip under `--advisory`) for that reason, while
+    `refs/pull/<N>/head` existed for all four.
+
+    The `+` is required for this ref as well: a pull ref is force-updated on every push (including a force-push), so an
+    update without force is rejected as non-fast-forward -- the wall #3076/#3094 describe for the branch refs, arriving
+    through the pull ref instead.
+    """
+    ref = f"refs/remotes/origin/pr-{pr}-head"
+    rc, _o, err = run("git", "fetch", "-q", "--force", "origin", f"+refs/pull/{pr}/head:{ref}", cwd=root)
+    if rc != 0:
+        raise CannotTell(f"cannot fetch refs/pull/{pr}/head (rc {rc}): {err.strip()[:160]}")
+    return ref
+
+
+def fetch_base(root, base):
+    """The local ref for PR <base>, MIRRORED (engine#3076/#3094): `+` is required because a base branch that was rebased
+    or force-pushed is not a fast-forward update of our remote-tracking ref, and the tool would answer cannot-tell on the
+    tree it is meant to measure. Named and separate from `fetch_pr_head` so both fetches have an arm: the `+` here had
+    none until this change, and dropping it passes every other test in this file.
+    """
+    ref = f"refs/remotes/origin/{base}"
+    rc, _o, err = run("git", "fetch", "-q", "origin", f"+refs/heads/{base}:{ref}", cwd=root)
+    if rc != 0:
+        raise CannotTell(f"cannot fetch the base {base} (rc {rc}): {err.strip()[:120]}")
+    return ref
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", default="1bit-MONSTER/engine")
@@ -339,13 +422,18 @@ def main():
         # git refuses the update as non-fast-forward whenever the branch was rebased or force-pushed -- normal life in this
         # repo -- and the tool answers cannot-tell on exactly the branches it exists to catch. Measured on #3074
         # (`pkg-sampler-liveguard`, 3360ccd) and controlled before/after on #3080 (see the regression arm).
-        for name in (branch, base):
-            ref = f"refs/heads/{name}:refs/remotes/origin/{name}"
-            rc, _o, err = run("git", "fetch", "-q", "origin", "+" + ref, cwd=root)
-            if rc != 0:
-                cannot_tell(f"cannot fetch {name} (rc {rc}): {err.strip()[:120]}")
+        # engine#3095: the HEAD comes from the pull ref, which exists for the PR's whole life; the BASE is a branch and is
+        # fetched by name with the `+` #3076/#3094 added (a rebased branch is not a fast-forward update of our ref).
         try:
-            found = stale_finding(root, f"origin/{branch}", f"origin/{base}")
+            head_ref = fetch_pr_head(root, a.pr)
+        except CannotTell as e:
+            pr_cannot_tell(a.pr, branch, str(e))
+        try:
+            base_ref = fetch_base(root, base)
+        except CannotTell as e:
+            cannot_tell(str(e))
+        try:
+            found = stale_finding(root, head_ref, base_ref)
         except CannotTell as e:
             pr_cannot_tell(a.pr, branch, str(e))
         if found is None:

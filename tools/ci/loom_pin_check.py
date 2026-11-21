@@ -141,8 +141,11 @@ def check(cfg_path, source=None, python=None):
     if have != version:
         findings.append(f'{cfg_path} says version={version} but {sha[:10]} declares package-version={have!r}')
     catalog = data.get('model-catalog') or ''
-    if not catalog.endswith('@' + cat):
-        findings.append(f'{cfg_path} says model_catalog_sha={cat[:12]} but {sha[:10]} names {catalog or "<none>"}')
+    cat_ref = cfg.get('model_catalog_ref')
+    if not (catalog.endswith('@' + cat) or (cat_ref and catalog.endswith('@' + cat_ref))):
+        findings.append(f'{cfg_path} says model_catalog_sha={cat[:12]}'
+                        f'{" / model_catalog_ref=" + cat_ref if cat_ref else ""}'
+                        f' but {sha[:10]} names {catalog or "<none>"}')
     notes.append(f'{cfg["package"]} {have} at {sha[:10]} in {src}')
 
     gitlink = git(src, 'rev-parse', 'HEAD').stdout.strip()
@@ -204,6 +207,16 @@ def self_test():
     chk(check(cfg(sha='f' * 40), source=str(src)) == 2, 'a commit the clone does not have is cannot-tell, not a pass')
     chk(check(cfg(), source=str(tmp / 'nope')) == 2, 'no clone at all is cannot-tell')
     chk(check(cfg(sha='abc'), source=str(src)) == 1, 'a short sha is a finding (the shape check that config_pin_check also does)')
+
+    # a RELEASE names its catalog by tag, not by sha (`model-catalog: github:ROCm/hrx-loom-library@v0.2.0`): the ref form must
+    # be accepted, or every release pin would report a finding it does not have.
+    (vf / 'version.json').write_text(json.dumps({'package-version': '0.2.0', 'model-catalog': 'github:ROCm/hrx-loom-library@v0.2.0'}))
+    subprocess.run(['git', '-C', str(src), 'commit', '-qam', 'release'], check=True)
+    rsha = subprocess.run(['git', '-C', str(src), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
+    chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.2.0'), source=str(src)) == 0,
+        'a catalog named by TAG is accepted when model_catalog_ref names it')
+    chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.1.0'), source=str(src)) == 1,
+        '...and a ref the release does not name is still a finding')
     print(f'loom_pin_check self-test: {ok[0]} ok, {ok[1]} failed')
     return 0 if ok[1] == 0 else 1
 

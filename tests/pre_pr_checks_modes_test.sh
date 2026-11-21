@@ -109,5 +109,20 @@ check "...and the message says how to run it deliberately" 'grep -q -- "--base-o
 check "...and no row ran, and no summary was printed" \
       '! grep -qE "^(ok|FAIL|cannot-tell) +tools/" <<<"$out2" && ! grep -qE "^pre-pr-checks: (all|[0-9]+ failed)" <<<"$out2"'
 
+# engine#3150 review: the gpu-hold --strict-warnings decision is computed FROM $base, so `--fetch-base` has to run
+# before it or the one run that made the base available still decides that arm against a ref that did not exist yet --
+# measured in a faithful shallow checkout: the OFF line printed *before* the fetch and the arm stayed off on exactly the
+# PRs that touch `scripts/gpu-hold`. A move, so the arm is about ORDER, and it is a source-order check on purpose: the
+# behavioural version needs a clone of this repository with a `main` branch on its remote, which a unit test cannot have
+# without the network. (A local `--depth 1` clone of a worktree does NOT substitute: measured, its remote has no `main`
+# branch, so `--unshallow` can never produce `origin/main` and the arm would pass for the wrong reason.)
+fetch_line=$(grep -n 'fetch-base: %s does not resolve in this shallow clone' scripts/pre-pr-checks.sh | head -1 | cut -d: -f1)
+touches_line=$(grep -n '^if ! touches=' scripts/pre-pr-checks.sh | head -1 | cut -d: -f1)
+check "--fetch-base is placed before the strict-warnings decision (order is the fix)" \
+      '[ -n "$fetch_line" ] && [ -n "$touches_line" ] && [ "$fetch_line" -lt "$touches_line" ]'
+# ...and with a base that resolves, the flag changes nothing: the control for the control.
+check "--fetch-base on a full clone with a real base prints no fetch line" \
+      '! grep -q "fetch-base:" <<<"$(bash scripts/pre-pr-checks.sh --base origin/main --base-optional --fetch-base --list --tree-only 2>&1)"'
+
 if [ $fail -eq 0 ]; then echo "pre_pr_checks_modes: ok"; fi
 exit $fail

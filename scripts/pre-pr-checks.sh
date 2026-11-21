@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# pre-pr-checks.sh [--base REF] [--list] [--tree-only] [--base-optional]
+# pre-pr-checks.sh [--base REF] [--list] [--tree-only] [--base-optional] [--fetch-base]
 #
 # `docs/pre-pr-checks.md` (engine#2311) lists the host-side checks to run before asking for a merge; `--list`
 # prints the current set, which is the only count worth trusting -- this comment used to say "six" and was
@@ -40,6 +40,7 @@ usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
 base=origin/main
 strict=""
 base_optional=""
+fetch_base=""
 # engine#3116: ONE place that maps a row's exit code to a verdict line, so the table can be asserted without running the
 # whole list -- and so the runner cannot drift from what it promises. The two "could not look" codes are different
 # events with the same meaning for the reader:
@@ -181,6 +182,7 @@ while [ $# -gt 0 ]; do
         --list) list_only=1; shift ;;
         --tree-only) tree_only=1; shift ;;
         --base-optional) base_optional=1; shift ;;
+        --fetch-base) fetch_base=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "pre-pr-checks: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
     esac
@@ -191,6 +193,33 @@ done
 # in scripts/ got twelve `can't open file` lines and rc 1 with every row red for the wrong reason.
 top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "pre-pr-checks: not inside a git work tree" >&2; exit 2; }
 cd "$top" || { echo "pre-pr-checks: cannot enter $top" >&2; exit 2; }
+
+# ORDER MATTERS (engine#3150 review): this block must run BEFORE the `touches`/`strict` decision below, because that
+# decision is computed from `$base`. Placed after it, the one run that resolves `origin/main` still printed *"cannot diff
+# origin/main...HEAD, so the gpu-hold --strict-warnings check is OFF for this run"* -- i.e. the answer to the arm that
+# guards `scripts/gpu-hold` depended on WHEN the base arrived rather than on the diff, which is the class this suite
+# exists to remove and it bites hardest on the PRs that touch gpu-hold (engine#2902's own case).
+# `--fetch-base` (engine#3131): the second half of the same story. `--base-optional` reports the four merge-base rows as
+# cannot-tell, which is honest and is not a measurement -- and they are the rows that caught last week's incidents. In a
+# default-depth checkout the history is one `git fetch --unshallow` away, measured on this repo: +33 MB and 3.89 s took
+# the suite from `8 green, 4 could not be told` to `12 green, 0 could not be told`. So the caller can ask for the fetch.
+#
+# It fetches; it does not judge. If the fetch fails, nothing here changes the answer -- #3106's shallow guard still
+# refuses those four rows with its own sentence, and `--base-optional` still reports them as cannot-tell rather than as
+# passes. `--filter=blob:none` is deliberately NOT used: measured at +15 MB but 9.8 s, i.e. six seconds spent to save
+# eighteen megabytes on a runner where wall time is the scarce resource.
+if [ "$list_only" = 0 ] && [ -n "$fetch_base" ] && ! git rev-parse --verify -q "$base^{commit}" >/dev/null; then
+    if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+        printf 'pre-pr-checks: --fetch-base: %s does not resolve in this shallow clone, fetching history so the four loss rows can measure\n' "$base" >&2
+        if git fetch --unshallow --no-tags origin >/dev/null 2>&1; then
+            printf 'pre-pr-checks: --fetch-base: fetched (measured on engine: +33 MB, 3.89 s)\n' >&2
+        else
+            printf 'pre-pr-checks: --fetch-base: the fetch failed, so the loss rows stay cannot-tell (nothing here turns that into a pass)\n' >&2
+        fi
+    else
+        printf 'pre-pr-checks: --fetch-base: %s does not resolve and this clone is already full, so a fetch would not help\n' "$base" >&2
+    fi
+fi
 
 # engine#2902: a removed diagnostic only reddens where the message IS the product. gpu-hold's queue
 # messages are what every lane reads when a ticket is released unheld (a bundled PR removed exactly that

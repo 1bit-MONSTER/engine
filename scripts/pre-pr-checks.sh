@@ -50,10 +50,17 @@ strict=""
 #   *   FAIL
 # A row's 2 is NOT this script's own usage error: `--base` that does not resolve exits 2 *before* the loop (see below),
 # so mapping a row's code here cannot mask a caller's mistake.
-classify() {  # <rc> <name> <last line> -> prints the verdict line, echoes the bucket
+classify() {  # <rc> <name> <last line> <whole output> -> prints the verdict line, echoes the bucket
     case "$1" in
         77) printf 'skip  %-42s %s\n' "$2" "$3"; printf 'skip\n' ;;
-        2)  printf 'skip  %-42s %s\n' "$2" "$3"; printf 'cannot-tell\n' ;;
+        2)
+            # EXCEPT argparse: a wrong flag in a row here also exits 2, and a broken row must stay red. Matched on the
+            # tool's own usage-error shape, which is the one thing `2` means that is NOT "cannot tell" (cl-infra's catch
+            # on #3117). Everything else that exits 2 refused to judge -- shallow clone, no merge base, unreadable ref.
+            case "$4" in
+                *usage:*error:*) printf 'FAIL  %-42s %s\n' "$2" "$3"; printf 'fail\n' ;;
+                *)               printf 'skip  %-42s %s\n' "$2" "$3"; printf 'cannot-tell\n' ;;
+            esac ;;
         0)  printf 'ok    %-42s %s\n' "$2" "$3"; printf 'ok\n' ;;
         *)  printf 'FAIL  %-42s %s\n' "$2" "$3"; printf 'fail\n' ;;
     esac
@@ -67,7 +74,7 @@ if [ "${1:-}" = "--self-test" ]; then
     fails=0
     arm() {  # <rc> <want-bucket> <want-word-in-line>
         local got line
-        line=$(classify "$1" "stub_row" "stub: something happened" 2>/dev/null)
+        line=$(classify "$1" "stub_row" "stub: something happened" "${4:-stub: something happened}" 2>/dev/null)
         got=$(printf '%s\n' "$line" | tail -1)
         local words
         words=$(printf '%s\n' "$line" | head -1)
@@ -81,9 +88,14 @@ if [ "${1:-}" = "--self-test" ]; then
     arm 0  ok          "ok    stub_row"
     arm 77 skip        "skip  stub_row"
     arm 2  cannot-tell "skip  stub_row"
+    # ... and a row that exits 2 because its OWN invocation is wrong stays red (argparse), which is the one 2 that is
+    # not "cannot tell": a broken row must not read as a skip (cl-infra's catch on #3117).
+    usage_line=$(classify 2 "stub_row" "stub.py: error: the following arguments are required: --base" "usage: stub.py [-h] --check\nstub.py: error: the following arguments are required: --base" 2>/dev/null | tail -1)
+    if [ "$usage_line" = "fail" ]; then echo "  [PASS] rc 2 with an argparse usage error -> fail"; else
+        echo "  [FAIL] rc 2 with an argparse usage error -> '$usage_line', want fail"; fails=$((fails + 1)); fi
     arm 1  fail        "FAIL  stub_row"
     arm 130 fail       "FAIL  stub_row"
-    echo "pre-pr-checks self-test: $((5-fails))/5 arms passed"
+    echo "pre-pr-checks self-test: $((6-fails))/6 arms passed"
     [ "$fails" -eq 0 ]
     exit $?
 fi
@@ -234,7 +246,7 @@ for c in "${checks[@]}"; do
     # engine#3116: classify() is the ONLY place a row's exit code becomes a verdict, so the table the self-test asserts
     # is the table the run uses. It used to be an `if 77 / elif 0 / else FAIL` chain here, which is why 2 fell through to
     # FAIL and a shallow clone read as a verdict on the PR.
-    case "$(classify "$rc" "$name" "$last")" in
+    case "$(classify "$rc" "$name" "$last" "$out")" in
         ok) ok=$((ok + 1)) ;;
         skip|cannot-tell) skipped=$((skipped + 1)) ;;
         *)

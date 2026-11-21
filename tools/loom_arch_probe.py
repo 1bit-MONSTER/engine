@@ -70,16 +70,44 @@ def read_kv(path):
         return None
 
 
-def probe(kv):
+def supported_from_starter(root):
+    """Architecture names the starter's sources mention, or None when the tree is unreadable.
+
+    The constant below is a snapshot, and a snapshot that drifts re-creates the failure this tool exists to prevent in
+    the opposite direction: a *supported* architecture reported unsupported. So the list can be read from the source it
+    is a claim about - `starter/*.py` mentions each architecture it handles by name (engine#3221 review).
+    """
+    import pathlib
+    import re
+    found = set()
+    try:
+        files = list(pathlib.Path(root).glob("*.py"))
+    except OSError:
+        return None
+    if not files:
+        return None
+    pattern = re.compile(r"[\"']([a-z][a-z0-9_]{1,15})[\"']")
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for name in pattern.findall(text):
+            if name in SUPPORTED:
+                found.add(name)
+    return found or None
+
+
+def probe(kv, supported=SUPPORTED, source="built-in list"):
     """(exit status, lines). Pure: the tests below feed it synthetic kv dicts."""
     if kv is None:
         return 2, ["loom_arch_probe: not a readable GGUF - cannot tell, and that is not a pass"]
     arch = kv.get("general.architecture")
     if not arch:
         return 2, ["loom_arch_probe: no general.architecture - cannot tell, and that is not a pass"]
-    if arch in SUPPORTED:
-        return 0, [f"loom_arch_probe: {arch} is in the port starter's supported list"]
-    lines = [f"loom_arch_probe: {arch} is NOT in the port starter ({', '.join(SUPPORTED)})",
+    if arch in supported:
+        return 0, [f"loom_arch_probe: {arch} is in the port starter's supported list ({source})"]
+    lines = [f"loom_arch_probe: {arch} is NOT in the port starter ({', '.join(sorted(supported))}; {source})",
              "  a `weaver port` of this checkpoint cannot succeed as the starter stands"]
     need = NEEDS.get(arch)
     if need:
@@ -137,13 +165,21 @@ def self_test():
 def main():
     parser = argparse.ArgumentParser(description="Does the Loom port starter support this GGUF's architecture?")
     parser.add_argument("gguf", nargs="?", help="path to a .gguf")
+    parser.add_argument("--starter", help="the starter directory to read the supported list from (default: built-in)")
     parser.add_argument("--self-test", action="store_true", help="run the arms and exit")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
     if not args.gguf:
         parser.error("a GGUF path is required (or --self-test)")
-    rc, lines = probe(read_kv(args.gguf))
+    supported, source = SUPPORTED, "built-in list"
+    if args.starter:
+        derived = supported_from_starter(args.starter)
+        if derived is None:
+            print(f"loom_arch_probe: cannot read the starter at {args.starter} - cannot tell, and that is not a pass")
+            return 2
+        supported, source = derived, f"read from {args.starter}"
+    rc, lines = probe(read_kv(args.gguf), supported, source)
     print("\n".join(lines))
     return rc
 

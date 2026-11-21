@@ -185,10 +185,26 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   rm -f "$d/nodefault.sh" "$d/nodefault.sh.provenance"
   install_sampler "$0" >/dev/null 2>&1 && { echo "FAIL: install with no destination must refuse (it used to write to the live path)"; fail=1; }
   [ -e "$d/nodefault.sh" ] && { echo "FAIL: install with no destination wrote something anyway"; fail=1; }
-  # ... and a destination that is given gets its commit from the checkout, not `unknown`
-  install_sampler "$0" "$d/derived.sh" >/dev/null 2>&1
+  # ... and a destination that is given gets its commit from the checkout the SOURCE came from, not `unknown`.
+  # engine#3069: this arm used to install from `$0` and then assert a commit was found -- which asserts a fact about where
+  # the CALLER happens to sit. The deployed copy lives in ~/.cache/accel-sampler, not in a checkout, so `commit=unknown`
+  # is the right answer there and `selftest` failed on the one copy lanes are told to run. The fixture now owns its
+  # source: a throwaway repo under $d, the script committed into it, installed from there.
+  fixture_repo() {  # <dir> -- a repo holding a copy of this script, so provenance has a commit to find
+    mkdir -p "$1/tools/diag" && cp "${0}" "$1/tools/diag/accel_sampler.sh" &&
+      git -C "$1" init -q && git -C "$1" -c user.email=t@t -c user.name=t add -A &&
+      git -C "$1" -c user.email=t@t -c user.name=t commit -qm fixture
+  }
+  mkdir -p "$d/repo" && fixture_repo "$d/repo" \
+    && install_sampler "$d/repo/tools/diag/accel_sampler.sh" "$d/derived.sh" >/dev/null 2>&1
   grep -q '^commit=unknown$' "$(provenance_file "$d/derived.sh")" \
-    && { echo "FAIL: install recorded commit=unknown while running inside a git checkout"; fail=1; }
+    && { echo "FAIL: install recorded commit=unknown for a source inside its own git checkout"; fail=1; }
+  # the mirror arm: a source that is inside NO checkout must record `unknown`, because that is what it can know. Without
+  # this half, "install finds a commit" could be satisfied by inventing one.
+  mkdir -p "$d/bare" && cp "${0}" "$d/bare/accel_sampler.sh" \
+    && install_sampler "$d/bare/accel_sampler.sh" "$d/bare-installed.sh" >/dev/null 2>&1
+  grep -q '^commit=unknown$' "$(provenance_file "$d/bare-installed.sh")" \
+    || { echo "FAIL: a source outside any checkout must record commit=unknown"; fail=1; }
   # ask 1 on #2815: `check-deployed` with no argument must look at the DEPLOYED copy, not at the checkout it was run from.
   # ask 1 on #2815 needs an arm that DISCRIMINATES the two paths: a provenance-less copy is rc 2 either way, so the arm
   # that pins the fix is one where the deployed copy is valid and `$0` is not. Reverting the default to `$0` fails these.

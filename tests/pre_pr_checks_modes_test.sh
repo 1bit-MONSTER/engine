@@ -50,6 +50,17 @@ check "the run completes (rc=0) with no base and --base-optional" '[ $rc -eq 0 ]
 check "the summary counts them as cannot-tell, not as a pass" 'grep -qE "pre-pr-checks: .*, 4 could not be told" <<<"$out"'
 check "the summary says how many open-PR rows it did not run" \
       'grep -q "pre-pr-checks: .*2 open-PR row(s) not run (--tree-only)" <<<"$out"'
+# engine#3138 review (cl-1077, whose #3137 the orchestrator closed as this PR's duplicate): the run path is a DIFFERENT
+# branch from the `--list` path the self-test asserts, so pin the announcement itself and, above all, that the number of
+# rows ANNOUNCED is the number the summary counts. A skip that is printed but not counted is the failure this script
+# exists to prevent, and it is invisible to `--list` -- which is why the count below is compared against the lines rather
+# than against a literal.
+announced=$(printf '%s\n' "$out" | grep -cE '^skip +(tools/ci/duplicate_fixes_check|tools/ci/pr_branch_stale_check)\.py +--tree-only: this row reads the open-PR set')
+noted=$(printf '%s\n' "$out" | sed -n 's/.*, \([0-9][0-9]*\) open-PR row(s) not run (--tree-only).*/\1/p')
+check "each open-PR row is announced with the tree-only reason" '[ "$announced" -eq 2 ]'
+check "every announced row is counted in the summary (printed == counted)" '[ -n "$noted" ] && [ "$announced" -eq "$noted" ]'
+check "the open-PR rows are not claimed as ordinary skips" \
+      '! grep -qE "^skip +(tools/ci/(duplicate_fixes_check|pr_branch_stale_check)\.py) +(nothing compared|SKIPPED)" <<<"$out"'
 for row in $base_rows; do
     check "$row is reported cannot-tell, with its own line" \
           "grep -q '^cannot-tell  $row .*--base $bogus does not resolve' <<<\"\$out\""

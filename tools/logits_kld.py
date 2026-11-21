@@ -92,7 +92,14 @@ def log_softmax(x: list[float]) -> list[float]:
 
 
 def kl(p_logits: list[float], q_logits: list[float]) -> float:
-    """KL(p || q) with p as the reference: the candidate's mass that the baseline would not have put there."""
+    """KL(p || q), the first argument being the distribution the divergence is measured *of*.
+
+    The gate calls this as `kl(candidate, baseline)`, so the reported number is **KL(candidate || baseline)** --
+    "how much the test run's distribution differs from the baseline's", which is what an accuracy row means by
+    "vs CPU" and the same direction `tools/logprob_agree.py` reports (`KL(route || reference)`). KL is not
+    symmetric, so the argument order is the meaning: engine#3158 review found this function called the other way
+    round while its docstring described this one. `self_test()` pins the direction against a hand-computed value.
+    """
     lp = log_softmax(p_logits)
     lq = log_softmax(q_logits)
     total = 0.0
@@ -101,6 +108,22 @@ def kl(p_logits: list[float], q_logits: list[float]) -> float:
         if pr > 0.0:
             total += pr * (a - b)
     return total
+
+
+def per_position(base: dict, cand: dict, keys: list[tuple[int, int]]) -> list[float]:
+    """One KL per position, **candidate first** so the number is KL(candidate || baseline).
+
+    engine#3158 review: this ordering used to be the other way round while `kl()`'s docstring described this one, and
+    the self-test only asserted that the two directions *differ* -- which either order satisfies. A named function is
+    what makes the call site assertable: `self_test()` compares it against a hand-computed value.
+    """
+    return [kl(cand[k], base[k]) for k in keys]
+
+
+def mean_kld(base: dict, cand: dict, keys: list[tuple[int, int]]) -> float:
+    """The single number the gate quotes: mean KL(candidate || baseline) over the matched steps."""
+    klds = per_position(base, cand, keys)
+    return sum(klds) / len(klds)
 
 
 def main(argv: list[str]) -> int:
@@ -130,11 +153,11 @@ def main(argv: list[str]) -> int:
         print(f"logits_kld: {e}", file=sys.stderr)
         return 2
 
-    klds = [kl(base[k], cand[k]) for k in keys]
-    mean = sum(klds) / len(klds)
+    klds = per_position(base, cand, keys)
+    mean = mean_kld(base, cand, keys)
     ordered = sorted(klds)
     p99 = ordered[min(len(ordered) - 1, int(math.ceil(0.99 * len(ordered))) - 1)]
-    print(f"logits_kld: {len(keys)} position(s); mean KLD {mean:.6f}; p99 {p99:.6f}; "
+    print(f"logits_kld: {len(keys)} position(s); mean KL(candidate || baseline) {mean:.6f}; p99 {p99:.6f}; "
           f"max KLD {ordered[-1]:.6f} (step_{keys[klds.index(ordered[-1])][0]}_"
           f"{keys[klds.index(ordered[-1])][1]})")
     over = []
@@ -190,6 +213,27 @@ def self_test() -> int:
         check(kl(base[k0], cand[k0]) > 0.0, "a shifted distribution gives a positive KLD")
         check(kl(base[k0], cand[k0]) != kl(cand[k0], base[k0]),
               "KL is directional: swapping baseline and candidate changes the number")
+        # 2b. WHICH direction (engine#3158 review). "the two numbers differ" is satisfied by either call order, so
+        #     it let the tool report KL(baseline || candidate) while its own docstring described KL(candidate ||
+        #     baseline). Anchor the direction on a pair whose two values are computed here, independently of kl().
+        sharp_p, flat_q = [1.0, 0.0], [0.0, 0.0]          # a sharp distribution vs a flat one
+        def _softmax(z):
+            m = max(z); ex = [math.exp(v - m) for v in z]; s = sum(ex)
+            return [v / s for v in ex]
+        def _kl_dir(ref, cand):                            # KL(cand || ref), written out
+            a, b = _softmax(ref), _softmax(cand)
+            return sum(y * math.log(y / x) for x, y in zip(a, b))
+        want_cand_first = _kl_dir(flat_q, sharp_p)          # ~0.1112: sharper candidate vs flat baseline
+        want_base_first = _kl_dir(sharp_p, flat_q)          # ~0.1200: the other direction
+        check(abs(kl(sharp_p, flat_q) - want_cand_first) < 1e-12,
+              f"kl(candidate, baseline) is KL(candidate || baseline) = {want_cand_first:.6f}")
+        check(abs(kl(flat_q, sharp_p) - want_base_first) < 1e-12,
+              f"kl(baseline, candidate) is the other direction = {want_base_first:.6f}")
+        # ... and the TOOL's own call site must use the first of those. Pinning `kl()`'s argument order alone would
+        # leave `main()` free to call it the other way round, which is the defect this came from -- so the mean the
+        # tool reports comes from `mean_kld()`, and that is what is asserted here.
+        check(abs(mean_kld({0: flat_q}, {0: sharp_p}, [0]) - want_cand_first) < 1e-12,
+              f"the reported mean is KL(candidate || baseline) = {want_cand_first:.6f}, not the reverse")
 
         # 3. a UNIFORM shift is distribution-preserving: every logit +4 moves max|d| by 4 and the KLD stays
         #    exactly 0, because softmax(v + c) == softmax(v). This is the arm that documents what the gate

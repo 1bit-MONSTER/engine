@@ -403,6 +403,14 @@ def self_test():
     old_mp = dict(mp, merged_at="2020-01-01T00:00:00Z")
     tw3, nt3 = mended_twins([op], [old_mp], files_of=lambda n: fmap[n], days=2)
     ok(len(tw3) == 0 and len(nt3) == 0, "... and a merge outside the window is not a twin (or a note)")
+    # engine#3252: a merged PR saying it closes #N does not close #N. #3243 said `Closes #3235` and merged while #3235
+    # stayed OPEN, and the gate then told every open PR in the repo it was re-doing merged work.
+    tw4, _ = mended_twins([op], [mp], files_of=lambda n: fmap[n], days=2, open_issues={9001})
+    ok(len(tw4) == 0, "an issue still OPEN is not 'already closed by' a merged PR that says it closed it (engine#3252)")
+    tw5, _ = mended_twins([op], [mp], files_of=lambda n: fmap[n], days=2, open_issues={1234})
+    ok(len(tw5) == 1, "... and the same twin is still reported when the issue really is closed (the open set is the test)")
+    tw6, _ = mended_twins([op], [mp], files_of=lambda n: fmap[n], days=2, open_issues=None)
+    ok(len(tw6) == 1, "... and an unreadable issue list changes nothing (strictness kept, as `open_issue_numbers` None)")
     # engine#2991/#2993: 'engine#2987: ...' is neither a claim nor a Refs, and the gate said clean on a real pair
     a = {'number': 9101, 'title': 'crash after the skip line', 'body': '**engine#9100: a row that crashed**'}
     b = {'number': 9102, 'title': 'skip line then segfault', 'body': 'Fixes #9100.'}
@@ -593,7 +601,12 @@ def main(argv):
             # exactly the path that matters, invisible until a twin exists.
             def _files(n, _repo=repo):
                 return files_of(_repo, [n]).get(n, ())
-            twins, nts = mended_twins(prs, [x for x in recently if x.get('merged_at')], _files, a.mended_days)
+            still_open = open_issue_numbers(repo)
+            if still_open is None:
+                print(f"duplicate_fixes: {repo}: could not read the OPEN issue list, so a merged PR's "
+                      f"'closes #N' is taken at its word below (cannot tell)", file=sys.stderr)
+            twins, nts = mended_twins(prs, [x for x in recently if x.get('merged_at')], _files,
+                                      a.mended_days, open_issues=still_open)
             mended += [(repo,) + t for t in twins]
             notes += [(repo,) + n for n in nts]
         except (RuntimeError, json.JSONDecodeError):
@@ -736,7 +749,22 @@ def bare_mentions(prs, files_of=None):
     return out
 
 
-def mended_twins(open_prs, merged_prs, files_of=None, days=2):
+def open_issue_numbers(repo):
+    """The issue numbers GitHub reports as OPEN, or None when they cannot be read.
+
+    engine#3252: `mended_twins` inferred "already closed" from a merged PR's closing keyword. A keyword is a claim by a
+    PR author, not a fact about the issue -- measured 2026-11-21: #3243 said it closed #3235 and merged, #3235 stayed
+    OPEN, and the gate then told every open PR in the repo that it was re-doing merged work. The issue's own state is
+    the fact, so ask for it once per repo.
+    """
+    try:
+        raw = gh(f"repos/{OWNER}/{repo}/issues?state=open&per_page={PAGE}", paginate=True)
+        return {i["number"] for i in json.loads(raw or '[]') if "pull_request" not in i}
+    except (RuntimeError, json.JSONDecodeError):
+        return None
+
+
+def mended_twins(open_prs, merged_prs, files_of=None, days=2, open_issues=None):
     """[(issue, open_pr, merged_pr, files)] -- an open PR re-doing work a recently merged PR already claims.
 
     Why (found live, 2026-11-20): every pass in this tool compared OPEN pull requests with each other. When one
@@ -767,6 +795,10 @@ def mended_twins(open_prs, merged_prs, files_of=None, days=2):
             shared = set(claims(f"{op.get('title') or ''}\n{op.get('body') or ''}")) & \
                      set(claims(f"{p.get('title') or ''}\n{p.get('body') or ''}"))
             for issue in shared:
+                # A merged PR saying it closes #N does not close #N (engine#3252). If #N is still open, an open PR
+                # claiming it is ordinary work on an unresolved issue, not a re-do.
+                if open_issues is not None and issue in open_issues:
+                    continue
                 if files_of is None:
                     twins.append((issue, op, p, [])); continue
                 a, b = set(files_of(op["number"])), set(files_of(p["number"]))

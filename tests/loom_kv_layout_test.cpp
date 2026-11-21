@@ -123,13 +123,15 @@ int main() {
     check(L::gdn_layer_offset(1) % 256 == 0 && L::gdn_layer_offset(46) % 256 == 0, "every gdn block offset is aligned");
 
     // ---- who owns the packet's capacity (open question 2) --------------------------------------------
-    // epoch.loom:91-92 infers capacity from the caller's allocation, so the packet is caller-sized; the card's encoder
-    // caps it at 524288 (control.loom:2519,2551,3215), which is the binding limit because the motif allows far more.
-    check_eq(L::kPacketCapacityCeiling, 524288, "the shipped encoder's packet ceiling");
-    check_eq(L::kPacketCapacityCeiling % 2, 0, "…and it satisfies the motif's multiple_of(2), so one bound serves both");
-    check_eq(L::packet_bytes(L::kPacketCapacityCeiling), 58720296,
+    // epoch.loom:91-92 infers capacity from the caller's allocation, so the packet is caller-sized; packet.loom:96 bounds
+    // it at 2..2147483646 for the library, and the shipped card's bundled encoder is tighter at 524288
+    // (<card>/program/control.loom:2519,2551,3215). The card's number is the binding one for us.
+    check_eq(L::kCardPacketCapacityCeiling, 524288, "the shipped card's packet ceiling (library allows far more)");
+    check(L::kCardPacketCapacityCeiling >= 2 && L::kCardPacketCapacityCeiling % 2 == 0,
+          "…and it satisfies packet.loom:96's range(2, …) and multiple_of(2), so one bound serves both");
+    check_eq(L::packet_bytes(L::kCardPacketCapacityCeiling), 58720296,
              "the largest packet an exporter must budget for is 58 720 296 B (~56 MiB)");
-    check_eq(L::packet_capacity(L::packet_bytes(L::kPacketCapacityCeiling)), L::kPacketCapacityCeiling,
+    check_eq(L::packet_capacity(L::packet_bytes(L::kCardPacketCapacityCeiling)), L::kCardPacketCapacityCeiling,
              "the ceiling round-trips through the allocation-length inverse, as epoch.loom:92 does it");
 
     // ---- the control header: the position that advances the cache -----------------------------------

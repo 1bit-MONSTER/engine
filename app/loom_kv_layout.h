@@ -172,14 +172,19 @@ inline constexpr uint64_t kControlEosOffset       = 8;  // eos_token, or the sam
 // WHO OWNS THE PACKET'S CAPACITY (open question 2, answered from the shipped sources rather than by preference): the
 // packet's capacity is NOT a specialization. `program/text/qwen3_8/epoch.loom:91-92` computes
 // `%metadata_bytes = buffer.length %metadata` and then `qwen38_packet_capacity(%metadata_bytes)`, i.e. the encode step
-// INFERS capacity from the allocation the caller passed, and the card's own encoder bounds it at
-// `range(%packet_capacity, 1, 524288)` (control.loom:2519,2551,3215). So the packet is caller-sized per request -- up to
-// the shipped ceiling -- while the ATTENTION CACHE capacity is a specialization fixed at materialization. The two roots
-// therefore do not have to move together: one attention-cache class can serve requests with different packet sizes.
+// INFERS capacity from the allocation the caller passed, and `packet.loom:96` bounds what it recovers at
+// `range(2, 2147483646), multiple_of(2)`. So the packet is caller-sized per request, while the ATTENTION CACHE capacity
+// is a specialization fixed at materialization: the two roots do not have to move together, and one attention-cache
+// class can serve requests with different packet sizes.
 //
-// The motif's own bound is `range(2, 2147483646), multiple_of(2)`, so the binding limit is the shipped encoder's 524288,
-// which fixes the largest packet at 58 720 296 B (~56 MiB) -- the number an exporter budgets for.
-inline constexpr uint64_t kPacketCapacityCeiling = 524288;
+// THE CEILING BELOW IS THE CARD'S, NOT THE LIBRARY'S -- a distinction an earlier revision of this comment blurred. The
+// library admits up to 2147483646. The shipped Qwen3.8-27B card does not: its own bundled encoder
+// (`<card>/program/control.loom`, one of the input files the card's `model.json` lists) assumes
+// `range(%packet_capacity, 1, 524288)` three times (`:2519`, `:2551`, `:3215`), beside the same 524288 bound on its input
+// count. That file lives in the card, not in hrx-loom-library, so it is not searchable there -- which is why the bound is
+// named after its real owner here. It is the binding limit FOR US because it is the artifact we run, and it fixes the
+// largest packet at 58 720 296 B (~56 MiB), the number an exporter budgets.
+inline constexpr uint64_t kCardPacketCapacityCeiling = 524288;
 inline constexpr uint64_t kPacketFixedBytes  = 40;  // two mixed-input capacities after the shape block
 inline constexpr uint64_t kPacketStrideBytes = 112;
 inline constexpr uint64_t kPolicyRecordBytes = 24;  // f32 temperature, f32 top_p, i32 top_k, i32 flags, i64 seed

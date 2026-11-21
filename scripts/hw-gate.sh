@@ -657,29 +657,29 @@ if [ -z "$BIN" ]; then
           # PR with a `build` phase got a permanent false red, it merged red on a pin bump, and each attempt spent a
           # gpu-hold wait configuring the wrong tree.
           { "$THERMAL" cmake -S "$ROOT" -B "$build-npu" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-              -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt" && \
-            "$THERMAL" cmake --build "$build-npu" -j "$JOBS" --target npu_rt_shim_test npu_dmabuf_import_test; } > "$OUT/npu-link.log" 2>&1
-          if [ $? -ne 0 ]; then
-            # ... and "did not run" is a different outcome from "does not link", or the next variant of this reads
-            # exactly like a real regression. A missing target means the configure did not reach the NPU block (wrong
-            # tree, a configure error, an option that did not take); a link error means the runtime and the targets
-            # disagree, which is the thing #3003/#3029 were about.
-            if grep -q "unknown target" "$OUT/npu-link.log"; then
-              note "::error::the NPU link gate did not run: the NPU test targets are not in the tree this configured ($ROOT). That is a defect in this gate, not in the runtime -- see npu-link.log"
-              grep -E "unknown target|CMake Error" "$OUT/npu-link.log" | head -n 4 | sed 's/^/  /'
-              built=1
-            elif grep -qE "CMake Error" "$OUT/npu-link.log"; then
-              note "::error::the NPU link gate could not configure the engine against the runtime at ${npu_pin:0:12} -- see npu-link.log"
-              grep -E "CMake Error" -A3 "$OUT/npu-link.log" | head -n 6 | sed 's/^/  /'
+              -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt"; } > "$OUT/npu-link.log" 2>&1
+          # The graph check comes first, and it is the one that catches a wrong `-S` even when the configure succeeds
+          # (the shape of this bug): a configured tree with no `npu_rt_shim_test` is this script pointing at another
+          # source, not a runtime failure. Then configure-vs-link, because "could not configure" (#3029's own class) and
+          # "does not link" produce different diagnosis and used to share a sentence.
+          if [ $? -eq 0 ] && ! grep -q "npu_rt_shim_test" "$build-npu/build.ninja" 2>/dev/null; then
+            note "::error::the NPU link gate did not run: the tree configured from $ROOT has no npu_rt_shim_test target, so this script is pointing at the wrong source -- a defect in the gate, not in the runtime: see npu-link.log"
+            built=1
+          else
+            "$THERMAL" cmake --build "$build-npu" -j "$JOBS" --target npu_rt_shim_test npu_dmabuf_import_test >> "$OUT/npu-link.log" 2>&1
+            if [ $? -ne 0 ]; then
+              if grep -qE "CMake Error" "$OUT/npu-link.log"; then
+                note "::error::the NPU link gate could not configure the engine against the runtime at ${npu_pin:0:12}: see npu-link.log"
+                grep -E "CMake Error" -A3 "$OUT/npu-link.log" | head -n 6 | sed 's/^/  /'
+              else
+                note "::error::the NPU runtime at ${npu_pin:0:12} does not link the engine's NPU targets (npu_rt_shim_test, npu_dmabuf_import_test): see npu-link.log"
+                grep -E "undefined reference|error:" "$OUT/npu-link.log" | head -n 4 | sed 's/^/  /'
+              fi
               built=1
             else
-              note "::error::the NPU runtime at ${npu_pin:0:12} does not link the engine's NPU targets (npu_rt_shim_test, npu_dmabuf_import_test): see npu-link.log"
-              grep -E "undefined reference|error:" "$OUT/npu-link.log" | head -n 4 | sed 's/^/  /'
-              built=1
+              echo "$npu_pin" > "$build/.npu-runtime-pin"
+              note "NPU link gate: npu_rt_shim_test and npu_dmabuf_import_test link against ${npu_pin:0:12}"
             fi
-          else
-            echo "$npu_pin" > "$build/.npu-runtime-pin"
-            note "NPU link gate: npu_rt_shim_test and npu_dmabuf_import_test link against ${npu_pin:0:12}"
           fi
         fi
       elif [ -n "$npu_pin" ]; then

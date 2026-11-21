@@ -52,6 +52,19 @@ def advisory_exit(verdict):
     return verdict
 
 
+def single_pr_exit(behind, found):
+    """The exit code for `--pr`, as a pure function so its table is assertable without a network (engine#3076).
+
+    `stale_finding` returns None for TWO different situations -- the branch is level with its base, and the merge could not be
+    measured (no merge base, or a conflicted tree) -- and the `--pr` path used to answer 0 for both. `0` is documented as "every
+    branch was read", so a CONFLICTING branch was being reported as a clean one: a false clean in the instrument that exists to
+    catch false cleans. The distance decides which None this is.
+    """
+    if found is not None:
+        return EXIT_FINDING
+    return EXIT_CLEAN if behind == 0 else EXIT_CANNOT_TELL
+
+
 def run(*a, cwd=None):
     r = subprocess.run(a, capture_output=True, text=True, cwd=cwd)
     return r.returncode, r.stdout, r.stderr
@@ -225,6 +238,41 @@ def self_test():
     chk(advisory_exit(EXIT_FINDING) == 0, "advisory: a finding is reported and exits 0, so it cannot block another lane's gate")
     chk(advisory_exit(EXIT_CANNOT_TELL) == 77, "advisory: cannot-tell is 77 (a skip), never 0")
     chk(advisory_exit(EXIT_CLEAN) == 0, "advisory: a clean run stays 0")
+    # engine#3076: a conflicted branch is not a clean branch. `stale_finding` answers None for "level with the base" and for
+    # "the merge could not be measured", and the `--pr` path answered 0 for both until this table existed.
+    chk(single_pr_exit(0, None) == EXIT_CLEAN, "--pr: level with its base -> 0")
+    chk(single_pr_exit(3, (3, 1, 1, ["f"])) == EXIT_FINDING, "--pr: the merge deletes the base's lines -> 1")
+    chk(single_pr_exit(3, None) == EXIT_CANNOT_TELL, "--pr: behind, but the merge could not be measured -> 2, never 0")
+    # engine#3076: a rebased branch is a NON-FAST-FORWARD update of the remote-tracking ref, and the plain refspec refuses it,
+    # so the tool answered cannot-tell on exactly the branches it exists to catch. Proved against a real (local) origin rather
+    # than asserted: build one, force-push a branch, leave the tracking ref behind, and require the mirroring spec to work
+    # while the plain one does not.
+    import tempfile
+    d2 = tempfile.TemporaryDirectory()
+    def gg(*a, cwd=None):
+        return subprocess.run(("git", *a), cwd=cwd, capture_output=True, text=True)
+    origin = str(pathlib.Path(d2.name, "origin.git"))
+    work = str(pathlib.Path(d2.name, "w"))
+    gg("init", "-q", "--bare", origin)
+    gg("clone", "-q", origin, work)
+    for k, v in (("user.email", "t@e"), ("user.name", "t")):
+        gg("config", k, v, cwd=work)
+    pathlib.Path(work, "a.txt").write_text("a\n")
+    gg("add", "-A", cwd=work); gg("commit", "-qm", "base", cwd=work)
+    gg("branch", "-M", "main", cwd=work); gg("push", "-q", "origin", "main", cwd=work)
+    gg("checkout", "-q", "-b", "rebased", cwd=work)
+    pathlib.Path(work, "a.txt").write_text("a\nb\n")
+    gg("commit", "-qam", "first attempt", cwd=work); gg("push", "-q", "origin", "rebased", cwd=work)
+    first = gg("rev-parse", "HEAD", cwd=work).stdout.strip()
+    gg("checkout", "-q", "main", cwd=work); gg("checkout", "-q", "-B", "rebased", cwd=work)   # rewrite the branch
+    pathlib.Path(work, "a.txt").write_text("a\nb\nc\n")
+    gg("commit", "-qam", "rebased", cwd=work); gg("push", "-q", "-f", "origin", "rebased", cwd=work)
+    gg("update-ref", "refs/remotes/origin/rebased", first, cwd=work)      # what a worktree that missed the force-push holds
+    plain = gg("fetch", "-q", "origin", "refs/heads/rebased:refs/remotes/origin/rebased", cwd=work)
+    forced = gg("fetch", "-q", "origin", "+refs/heads/rebased:refs/remotes/origin/rebased", cwd=work)
+    chk(plain.returncode != 0, "the plain refspec cannot mirror a REBASED branch (non-fast-forward) -- the bug")
+    chk(forced.returncode == 0, "the mirroring refspec keeps the fix: a rebased branch is fetched, so it can be measured")
+
     return 0 if ok else 1
 
 
@@ -255,14 +303,28 @@ def main():
             cannot_tell(f"cannot read PR #{a.pr} (rc {rc}): {err.strip()[:200]}")
         info = json.loads(out)
         branch, base = info["headRefName"], info.get("baseRefName") or "main"
-        for ref in (f"{branch}:refs/remotes/origin/{branch}", f"{base}:refs/remotes/origin/{base}"):
+        # engine#3076: the dest ref is OUR remote-tracking ref, so it is mirrored, never fast-forwarded. Without the `+` a
+        # branch that was REBASED (force-pushed) makes this fetch fail `non-fast-forward` and the tool answers cannot-tell --
+        # measured on #3074 (`pkg-sampler-liveguard` at 3360ccd, rejected against the older ref still in the worktree). A tool
+        # whose whole subject is rebased branches cannot refuse to fetch one.
+        for name in (branch, base):
+            ref = f"+refs/heads/{name}:refs/remotes/origin/{name}"
             rc, _o, err = run("git", "fetch", "-q", "origin", ref, cwd=root)
             if rc != 0:
-                cannot_tell(f"cannot fetch {ref.split(':')[0]} (rc {rc}): {err.strip()[:120]}")
+                cannot_tell(f"cannot fetch {name} (rc {rc}): {err.strip()[:120]}")
         found = stale_finding(root, f"origin/{branch}", f"origin/{base}")
         if found is None:
-            print(f"#{a.pr} {branch}: merging it removes nothing {base} has")
-            return 0
+            rc, out, _ = run("git", "rev-list", "--count", f"origin/{branch}..origin/{base}", cwd=root)
+            behind = -1 if rc != 0 else int(out.strip() or 0)
+            if behind == 0:
+                print(f"#{a.pr} {branch}: merging it removes nothing {base} has")
+            code = single_pr_exit(behind, found)
+            if code == EXIT_CANNOT_TELL:
+                if behind < 0:
+                    cannot_tell(f"#{a.pr} {branch}: cannot compare it with {base} (git rev-list failed)")
+                cannot_tell(f"#{a.pr} {branch}: BEHIND {behind} {base}, but the merge could not be measured "
+                            f"(no merge base, or a conflicted tree) -- that is not a clean branch")
+            return code
         behind, reverted, carried, files = found
         print(f"#{a.pr} {branch}: BEHIND {behind} {base}; merging it reverts {reverted} line(s) {base} added and "
               f"removes {carried} line(s) it still carries, in {len(files)} file(s): {', '.join(files[:3])}",
@@ -271,7 +333,7 @@ def main():
 
     for n, branch, base in open_prs(a.repo):
         ref = f"origin/{branch}"
-        rc, _out, err = run("git", "fetch", "-q", "origin", branch, cwd=root)
+        rc, _out, err = run("git", "fetch", "-q", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", cwd=root)
         if rc != 0:
             # engine#2992 review: this used to fall through to `stale_finding` returning None, which printed "removes nothing
             # main has" and exited 0 -- a 0 that meant "could not look". A branch that cannot be fetched is a cannot-tell.
@@ -281,7 +343,7 @@ def main():
         # the base is the PR's target: `origin/<baseRefName>`, fetched too, so a fork PR measured against its pin
         # branch cannot report clean while deleting that branch's newer lines (engine#3071)
         base_ref = f"origin/{base}"
-        rc, _o, err = run("git", "fetch", "-q", "origin", f"{base}:refs/remotes/{base_ref}", cwd=root)
+        rc, _o, err = run("git", "fetch", "-q", "origin", f"+refs/heads/{base}:refs/remotes/{base_ref}", cwd=root)
         if rc != 0:
             unreadable.append(f"#{n} {branch}: cannot fetch its base {base} ({err.strip()[:80]})")
             print(f"#{n} {branch}: CANNOT READ -- its base {base} could not be fetched", file=sys.stderr)

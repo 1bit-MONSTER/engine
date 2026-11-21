@@ -29,6 +29,7 @@
 #include "loom_epoch_driver.h"
 
 #include <cstdio>
+#include <initializer_list>
 
 namespace L = onebit::loom;
 
@@ -55,7 +56,10 @@ static void check_eq(uint64_t got, uint64_t want, const char* what) {
 int main() {
     // The two bounds the driver inherits from the card, quoted as literals.
     check_eq(L::kEpochTokenLimit, 8192, "the card's per-epoch token ceiling (llm.tokens range 1..8192)");
-    check_eq(L::kContextCeiling, 262144, "the card's context ceiling (llm.context range 16..262144)");
+    check_eq(L::kContextCeiling, 262144, "the common context ceiling (llm.context 16..262144 on 54 of 55 llm.* cards)");
+    // …and not the only one: unsloth-Inkling-2-Mini-loom admits range(16, 1048576) and ships a preset at that capacity.
+    check_eq(L::kInklingContextCeiling, 1048576, "Inkling-2-Mini's context ceiling (llm.context 16..1048576)");
+    check_eq(L::epoch_count(L::kInklingContextCeiling), 128, "…which is 128 epochs at the default 8192-token bound");
     check_eq(L::kContextCeiling / L::kEpochTokenLimit, 32, "so a full-context prompt is 32 epochs, not one");
 
     // Epoch counting: exact multiples, remainders, one token, and the zero-token finish.
@@ -66,6 +70,26 @@ int main() {
     check_eq(L::epoch_count(262144), 32, "a 262144-token prompt");
     check_eq(L::epoch_count(18432), 3, "18.8k context class -> 3 epochs");
     check_eq(L::epoch_count(0, 0), 0, "a zero limit is a caller error, not an infinite loop");
+
+    // The OTHER family: Qwen3.8-Flash-Next declares `flash_next.token_count` range(1, 32768) in its own epoch program and
+    // has no `llm.loom`. The driver must work at that bound too, so the default is a default and not the only case.
+    check_eq(L::kFlashNextEpochTokenLimit, 32768, "the Flash-Next epoch bound (flash_next.token_count, epoch.loom:11)");
+    check_eq(L::epoch_count(262144, L::kFlashNextEpochTokenLimit), 8, "a full context is 8 epochs at Flash-Next's bound");
+    check_eq(L::epoch_at(7, 0, 262144, L::kFlashNextEpochTokenLimit).position_base, 7ull * 32768ull,
+             "…and the last epoch starts at 7 * 32768, so the base rule holds for the other family too");
+    {
+        // coverage holds at both shipped bounds, with the same properties the sweep asserts at 8192
+        bool ok = true;
+        for (uint64_t limit : {L::kEpochTokenLimit, L::kFlashNextEpochTokenLimit}) {
+            for (uint64_t tokens = 0; tokens <= 100000; tokens += 997) {
+                const uint64_t n = L::epoch_count(tokens, limit);
+                uint64_t sum = 0;
+                for (uint64_t i = 0; i < n; ++i) { sum += L::epoch_at(i, 0, tokens, limit).token_count; }
+                if (sum != tokens) { ok = false; }
+            }
+        }
+        check(ok, "coverage holds at both shipped epoch bounds (8192 and 32768)");
+    }
 
     // Epoch shapes: base advances by the full limit, the last epoch is short, positions are absolute.
     const L::Epoch e0 = L::epoch_at(0, 0, 18432);

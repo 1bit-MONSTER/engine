@@ -61,10 +61,14 @@ PAGE = 50
 def open_prs(repo):
     """[(number, branch)] from `gh`, or raise SystemExit(2) — an unreadable or TRUNCATED list is not a pass."""
     rc, out, err = run("gh", "pr", "list", "-R", repo, "--state", "open", "--limit", str(PAGE),
-                       "--json", "number,headRefName")
+                       "--json", "number,headRefName,baseRefName")
     if rc != 0:
         cannot_tell(f"cannot list {repo} PRs (rc {rc}): {err.strip()}")
-    prs = [(p["number"], p["headRefName"]) for p in json.loads(out or "[]")]
+    # engine#3071: the base is the PR's OWN target, not `main`. Where every PR targets a pin branch (the llama.cpp
+    # fork targets `1bit/hrx-vulkan-patched`), measuring against origin/main printed "removes nothing main has" while
+    # the merge into the real target deleted lines -- the false clean this tool exists to prevent. Measured on fork
+    # #457: against origin/master nothing, against its own base 64 lines of common/sampling.cpp alone.
+    prs = [(p["number"], p["headRefName"], p.get("baseRefName") or "main") for p in json.loads(out or "[]")]
     if len(prs) >= PAGE:
         # engine#2992 review: the queue has run at 20-30, so a full page is close enough that an unchecked PR is plausible.
         cannot_tell(f"{len(prs)} open PRs is the whole page -- the list may be truncated (raise PAGE)")
@@ -232,13 +236,40 @@ def main():
                     help="report every stale branch and exit 0 even with findings -- for a caller that scans OTHER "
                          "lanes' PRs (scripts/pre-pr-checks.sh), where a hard failure would let one lane's branch "
                          "block another lane's gate. Cannot-tell still answers 77 (skip), never 0 (engine#3057)")
+    ap.add_argument("--pr", type=int, default=0,
+                    help="check ONE pull request: its head against ITS OWN base, without reading the open-PR set. This is "
+                         "the mode a per-PR gate needs (engine#3076) -- the open-PR-set mode is advisory by construction, "
+                         "because one lane's stale branch must not fail another lane's handover")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
     root = pathlib.Path(a.root).resolve()
     findings, unreadable = 0, []
-    for n, branch in open_prs(a.repo):
+
+    if a.pr:
+        # engine#3076: one PR, its own base. `gh pr view` for the two refs, then the same `stale_finding` the set mode
+        # uses -- the verdict logic exists once, so this mode cannot drift from the other.
+        rc, out, err = run("gh", "pr", "view", str(a.pr), "-R", a.repo, "--json", "headRefName,baseRefName")
+        if rc != 0:
+            cannot_tell(f"cannot read PR #{a.pr} (rc {rc}): {err.strip()[:200]}")
+        info = json.loads(out)
+        branch, base = info["headRefName"], info.get("baseRefName") or "main"
+        for ref in (f"{branch}:refs/remotes/origin/{branch}", f"{base}:refs/remotes/origin/{base}"):
+            rc, _o, err = run("git", "fetch", "-q", "origin", ref, cwd=root)
+            if rc != 0:
+                cannot_tell(f"cannot fetch {ref.split(':')[0]} (rc {rc}): {err.strip()[:120]}")
+        found = stale_finding(root, f"origin/{branch}", f"origin/{base}")
+        if found is None:
+            print(f"#{a.pr} {branch}: merging it removes nothing {base} has")
+            return 0
+        behind, reverted, carried, files = found
+        print(f"#{a.pr} {branch}: BEHIND {behind} {base}; merging it reverts {reverted} line(s) {base} added and "
+              f"removes {carried} line(s) it still carries, in {len(files)} file(s): {', '.join(files[:3])}",
+              file=sys.stderr)
+        return 1
+
+    for n, branch, base in open_prs(a.repo):
         ref = f"origin/{branch}"
         rc, _out, err = run("git", "fetch", "-q", "origin", branch, cwd=root)
         if rc != 0:
@@ -247,25 +278,33 @@ def main():
             unreadable.append(f"#{n} {branch}: cannot fetch the branch ({err.strip().splitlines()[0] if err.strip() else 'fetch failed'})")
             print(f"#{n} {branch}: CANNOT READ -- the branch could not be fetched, so nothing was measured", file=sys.stderr)
             continue
-        f = stale_finding(root, ref)
+        # the base is the PR's target: `origin/<baseRefName>`, fetched too, so a fork PR measured against its pin
+        # branch cannot report clean while deleting that branch's newer lines (engine#3071)
+        base_ref = f"origin/{base}"
+        rc, _o, err = run("git", "fetch", "-q", "origin", f"{base}:refs/remotes/{base_ref}", cwd=root)
+        if rc != 0:
+            unreadable.append(f"#{n} {branch}: cannot fetch its base {base} ({err.strip()[:80]})")
+            print(f"#{n} {branch}: CANNOT READ -- its base {base} could not be fetched", file=sys.stderr)
+            continue
+        f = stale_finding(root, ref, base_ref)
         if f is None:
-            print(f"#{n} {branch}: merging this branch removes nothing main has")
+            print(f"#{n} {branch}: merging this branch removes nothing {base} has")
             continue
         behind, reverted, carried, files = f
         findings += 1
         parts = []
         if reverted:
-            parts.append(f"REVERTS {reverted} line(s) main added after the branch was cut")
+            parts.append(f"REVERTS {reverted} line(s) {base} added after the branch was cut")
         if carried:
-            parts.append(f"removes {carried} line(s) main still carries")
+            parts.append(f"removes {carried} line(s) {base} still carries")
         print(f"#{n} {branch}: BEHIND {behind}; merging it " + " and ".join(parts) +
               f" in {len(files)} file(s): {', '.join(files[:3])}{' …' if len(files) > 3 else ''}", file=sys.stderr)
     if findings:
-        print(f"pr_branch_stale_check: {findings} open PR(s) would delete lines main has "
+        print(f"pr_branch_stale_check: {findings} open PR(s) would delete lines their base has "
               f"(measured with `git merge-tree --write-tree`, not a two-dot diff) -- rebase or re-cut before merging",
               file=sys.stderr)
     elif not unreadable:
-        print("pr_branch_stale_check: no open PR would revert main (every branch was read)")
+        print("pr_branch_stale_check: no open PR would revert its base (every branch was read)")
     rc = verdict_exit(unreadable, findings)
     if a.advisory:
         return advisory_exit(rc)

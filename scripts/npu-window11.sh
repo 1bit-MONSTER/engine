@@ -451,12 +451,25 @@ NPU_PROFILE=1 NPU_NO_DEVICE_LOCK=1 env "${TAPENV[@]}" "$BIN" forward-serve -m "$
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT INT TERM
 
-for _ in $(seq 1 600); do
+# engine#3200: the budget is a number the caller owns, defaulting to today's 600 s so nothing changes unless asked. A 14B
+# host-GEMM arm warms its weight cache for minutes (measured: 193 503 ms in the sibling script, #3194), and a constant is
+# the wrong thing to make a caller guess when the number that matters is on the box in front of them.
+wait_s=${NPU_WINDOW11_SERVE_WAIT_S:-600}
+waited=0
+for _ in $(seq 1 "$wait_s"); do
     curl -sf -m 2 "localhost:$PORT/health" >/dev/null 2>&1 && break
-    kill -0 $SPID 2>/dev/null || { echo "serve died; see $OUT.serve" >&2; tail -5 "$OUT.serve" >&2; exit 1; }
+    kill -0 $SPID 2>/dev/null || { echo "serve died after ${waited}s; see $OUT.serve" >&2; tail -5 "$OUT.serve" >&2; exit 1; }
     sleep 1
+    waited=$((waited + 1))
 done
-curl -sf -m 2 "localhost:$PORT/health" >/dev/null 2>&1 || { echo "serve never became ready" >&2; exit 1; }
+# engine#3200: the arm that used to say nothing. When the serve is ALIVE and has not bound, it is almost always warming
+# (`forward-serve: warming (weight cache; …)`), and that line is the reason -- printing the sentence alone is what made a
+# 14B arm look like a dead server. Same two facts as the dying arm above: how long, and the log.
+if ! curl -sf -m 2 "localhost:$PORT/health" >/dev/null 2>&1; then
+    echo "serve never became ready after ${waited}s (the process is alive, so this is the warming window, not a dead server); raise NPU_WINDOW11_SERVE_WAIT_S if the log shows it was still warming" >&2
+    tail -5 "$OUT.serve" >&2
+    exit 1
+fi
 
 # Three fixed greedy prompts (no temperature field = greedy), fixed token budget: the same three every run.
 PROMPTS=(

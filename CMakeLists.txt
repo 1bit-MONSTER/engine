@@ -1531,7 +1531,28 @@ endif()
 if(ONEBIT_LAYA_TYPED_ROOT AND ONEBIT_LAYA_TYPED_GOLDEN)
     add_test(NAME laya_gate_typed_decisions COMMAND laya_gate ${ONEBIT_LAYA_TYPED_ROOT} ${ONEBIT_LAYA_TYPED_GOLDEN})
 endif()
-set(ONEBIT_LAYA_ROUTE_MODEL "" CACHE PATH "Laya checkpoint dir for the per-request routing e2e test")
+# engine#3161: this used to default to "" and nothing (not CI, not a default configure) ever set it, so the rows below
+# -- laya_route_e2e, laya_models_e2e, laya_eval_e2e, laya_route_serve, laya_checkpoint, laya_classify -- have never run
+# anywhere. They do not need a GOOD scorer, only a loadable one (tests/laya_models_e2e.sh pins min_confidence 1.01 so
+# every request lands on its default class while Laya is still asked), so the default is now a checkpoint generated at
+# configure time from the head's real tensor names at d=32 -- the same fixture shape tests/laya_finetune_test.py uses,
+# written with struct+json so a build box needs no numpy. A real checkpoint still overrides it with -D.
+set(ONEBIT_LAYA_ROUTE_MODEL "${CMAKE_BINARY_DIR}/laya-checkpoint" CACHE PATH
+    "Laya checkpoint dir for the routing e2e rows (default: a synthetic one generated at configure time)")
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(ONEBIT_LAYA_ROUTE_MODEL STREQUAL "${CMAKE_BINARY_DIR}/laya-checkpoint")
+    if(NOT Python3_Interpreter_FOUND)
+        message(FATAL_ERROR "ONEBIT_LAYA_ROUTE_MODEL is the generated default but no Python3 interpreter was found: "
+                            "pass -DONEBIT_LAYA_ROUTE_MODEL=<real checkpoint> (engine#3161)")
+    endif()
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/laya_synthetic_checkpoint.py "${ONEBIT_LAYA_ROUTE_MODEL}"
+        RESULT_VARIABLE _laya_ck_rc OUTPUT_VARIABLE _laya_ck_out ERROR_VARIABLE _laya_ck_err)
+    if(NOT _laya_ck_rc EQUAL 0)
+        message(FATAL_ERROR "cannot generate the synthetic Laya checkpoint in ${ONEBIT_LAYA_ROUTE_MODEL}: ${_laya_ck_err}")
+    endif()
+    message(STATUS "${_laya_ck_out}")
+endif()
 if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_route_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # --laya-models: model auto picked per request among the table's rows (docs/laya-models.md)

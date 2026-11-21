@@ -234,9 +234,14 @@ identical, the head must change, the temperature must land in its bucket, an exi
 `tests/laya_models_test.cpp` (ctest `laya_models`, no checkpoint): parsing, the question, the pick and
 its fallback, aliases, shared backends, the size gate, the refusals, and the shipped game table.
 `tests/laya_eval_test.cpp` (ctest `laya_eval`, no checkpoint): the eval's arithmetic on hand-computed cases.
-`tests/laya_eval_e2e.sh` (ctest `laya_eval_e2e`, with `ONEBIT_LAYA_ROUTE_MODEL`): `--eval` and `--dump-encoder`
+`ONEBIT_LAYA_ROUTE_MODEL` **defaults to a synthetic checkpoint generated at configure time**
+(`${CMAKE_BINARY_DIR}/laya-checkpoint`, the head's real tensor names at d=32, written by
+`tests/laya_synthetic_checkpoint.py`), so the five rows below register and run in every configuration including CI;
+pass `-DONEBIT_LAYA_ROUTE_MODEL=<dir>` for a real one (engine#3161).
+
+`tests/laya_eval_e2e.sh` (ctest `laya_eval_e2e`): `--eval` and `--dump-encoder`
 on the real scorer, the report's counts, the dump's files against each other, the refusals.
-`tests/laya_models_e2e.sh` (ctest `laya_models_e2e`, with `ONEBIT_LAYA_ROUTE_MODEL`): two rows on fake
+`tests/laya_models_e2e.sh` (ctest `laya_models_e2e`): two rows on fake
 llama-servers behind real `1bit serve` children; the reply comes from the row the headers name, pinned and
 cached requests, the decisions log, the table, `/v1/models` and `/metrics`, and the refusals.
 

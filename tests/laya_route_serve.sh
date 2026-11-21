@@ -32,6 +32,15 @@ set -uo pipefail
 
 bin=${1:?usage: laya_route_serve.sh path/to/1bit path/to/laya-model-dir}
 laya_model=${2:?usage: laya_route_serve.sh path/to/1bit path/to/laya-model-dir}
+
+# engine#3161: a ctest row with a missing fixture must FAIL, not skip -- "not run" dressed as green is the shape this
+# issue exists for. The default is now generated at configure time (CMakeLists.txt), so reaching this line with no
+# checkpoint means the caller passed a path that is not one.
+[ -e "$laya_model/model.safetensors" ] || {
+    echo "laya: no checkpoint at $laya_model (model.safetensors missing): pass a real dir, or configure without" >&2
+    echo "laya: -DONEBIT_LAYA_ROUTE_MODEL so CMake generates the synthetic one (engine#3161)" >&2
+    exit 2
+}
 here=$(cd "$(dirname "$0")" && pwd)
 policy="$here/route-policy-e2e.json"
 # the candidate devices serve offers Laya for a .gguf in this build (tests/laya_route_e2e.sh)

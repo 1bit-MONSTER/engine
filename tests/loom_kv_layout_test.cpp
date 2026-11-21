@@ -15,7 +15,7 @@
 //
 // loom_kv_layout_test.cpp -- the Loom hybrid handover's state arithmetic (app/loom_kv_layout.h, engine#3157).
 //
-// Every expected number here is read out of the MIT Loom sources (hrx-loom-library ba7abef, Qwen/Qwen3.8-27B), not
+// Every expected number here is read out of the MIT Loom sources (hrx-loom-library cb9ae9e, Qwen/Qwen3.8-27B), not
 // produced by the header, so this is a check on the arithmetic rather than a snapshot of it:
 //
 //   attention_layer_decode.loom:75  %cache_token_bytes = 2048        (1024 f16 per token, per K and per V)

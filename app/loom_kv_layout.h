@@ -25,9 +25,11 @@
 //   epoch.loom:16          prefill body                                          launch(%parameters, %residual, %control,
 //                                                                                        %gdn_state, %attention_cache, …)
 //
-// measured from hrx-loom-library ba7abef (MIT, (c) 2026 AMD ROCm Software), model Qwen/Qwen3.8-27B -- a hybrid like
+// measured from hrx-loom-library cb9ae9e (MIT, (c) 2026 AMD ROCm Software), model Qwen/Qwen3.8-27B -- a hybrid like
 // ours: 64 layers, 16 full-attention ordinals (0..15) and 48 gated-delta-net ordinals (0..47). The arithmetic below is
-// that file's, not an interpretation: attention_layer_decode.loom:73-83 and gdn_layer_decode.loom:69-76.
+// that file's, not an interpretation: attention_layer_decode.loom:74-83 and gdn_layer_decode.loom:69-76. Re-read after
+// the pin moved ba7abef -> cb9ae9e (132 commits): not one of these constants changed, and the sampling fixture's own
+// literals below still agree, so the arithmetic survived the refresh unchanged.
 //
 // CARDINALITY, because the declarations read one short if you take a range as exclusive. model_decode.loom unrolls 16
 // groups of 3 GDN layers + 1 attention layer (`:26-27`), launches gdn ordinals `3*group + {0,1,2}` (`:48-50`) and the
@@ -135,9 +137,14 @@ inline constexpr uint64_t attention_element_index(uint64_t position, uint64_t j,
 // zero-token finish that only establishes the position. The public prefill commands are stricter (range 1..512), so the
 // kernel is the only zero-length path in the library.
 //
-// Caveat a writer must carry: word 2 is EOS to the commit kernels and the LIVE ROW COUNT to the samplers
-// (kernel/sampling.loom:45,92) and to kernel/output_spans.loom:35. Nothing in the sampled path writes that count, so the
-// caller owns which meaning is in place at each call site. An eos id smaller than the row count would silently drop rows.
+// Caveat a writer must carry, and the packet half of it changed meaning at cb9ae9e. Word 2 is `eos_token` to the commit
+// kernels (decode_control.loom:19,51) and the **output count** to the packet: `qwen38_packet_compact_prefix`
+// (motif/sequence/qwen3_8/packet.loom, added after ba7abef) stores `[token_count, span_count, output_count]` across words
+// 0/1/2, and the samplers read word 2 as an ABSOLUTE packet-row bound against `first + row` (kernel/sampling.loom:45,93),
+// as does kernel/output_spans.loom:35. So the two roles live in two ABIs rather than one reuse: the commit kernels' word 2
+// is EOS on the decode-only control block, and the packet's word 2 is a count written by compaction. At ba7abef nothing
+// wrote the count and the sampler's meaning was purely caller-owned; that is no longer true, and a writer that conflates
+// the two still fails silently -- an eos smaller than the output count drops rows without an error.
 inline constexpr uint64_t kControlWordBytes  = 4;
 inline constexpr uint64_t kControlHeaderBytes = 12;
 inline constexpr uint64_t kControlPositionOffset  = 0;  // decode: KV position; prefill: token_count
@@ -166,7 +173,7 @@ inline constexpr uint64_t packet_identity_origin(uint64_t capacity) { return 32 
 inline constexpr uint64_t packet_sources_origin(uint64_t capacity)  { return 32 + capacity * 108; }
 inline constexpr uint64_t packet_shape_origin(uint64_t capacity)    { return 32 + capacity * 112; }
 
-// Inverse of packet_bytes, the way packet.loom:90-97 recovers capacity from an allocation's length.
+// Inverse of packet_bytes, the way packet.loom:92-99 recovers capacity from an allocation's length.
 inline constexpr uint64_t packet_capacity(uint64_t bytes) { return (bytes - kPacketFixedBytes) / kPacketStrideBytes; }
 
 }  // namespace onebit::loom

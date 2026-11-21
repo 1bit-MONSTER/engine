@@ -1130,6 +1130,9 @@ add_test(NAME gguf_meta COMMAND gguf_meta_test)
 add_executable(serve_foreign_ready_test tests/serve_foreign_ready_test.cpp)
 target_include_directories(serve_foreign_ready_test PRIVATE app)
 add_test(NAME serve_foreign_ready COMMAND serve_foreign_ready_test)
+# engine#3171: a row whose target CI never builds never reaches ctest. ci.yml builds `onebit`, so the test is a build
+# dependency of it -- the second supported way (tools/ci/ci_targets_check.py names both).
+add_dependencies(onebit serve_foreign_ready_test)
 add_executable(mem_admit_test tests/mem_admit_test.cpp)
 target_include_directories(mem_admit_test PRIVATE app)
 add_test(NAME mem_admit COMMAND mem_admit_test)

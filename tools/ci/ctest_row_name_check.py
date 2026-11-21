@@ -198,7 +198,11 @@ def check(root: pathlib.Path, base: str) -> tuple[int, list[str]]:
     # Counted before the dict above collapses the repeat; nothing here needs the base or the tree, so it is a hard
     # collision rather than a cannot-tell (measured: rc 0 before, `cmake -S . -B` rc 1 "already exists").
     counts = counted_row_names(added)
-    doubled = sorted(n for n, count in counts.items() if count > 1 and n not in freed)
+    # engine#3242: `freed` is the BASE's copy, not the branch's second registration. A lane that moves a row
+    # into its family file (`CONTRIBUTING.md:103`) deletes it here and writes it there -- and if it writes it
+    # TWICE the tree holds two copies while `freed` silenced the finding (measured on main e02ae4586: rc 0,
+    # `cmake -S . -B` then refuses the duplicate). A removal never cancels an addition.
+    doubled = sorted(n for n, count in counts.items() if count > 1)
     if doubled:
         return 1, ([f"{len(doubled)} ctest row name(s) this branch registers MORE THAN ONCE:"]
                    + [f"  {n}: registered {counts[n]}x by this branch" for n in doubled]
@@ -295,6 +299,20 @@ def self_test() -> int:
         got, msgs = check(d, "main")
         chk(1, got, "a name the branch adds TWICE is a collision with no base involved")
         chk(True, any("new_dup" in m for m in msgs), "...and the message names the doubled row")
+
+        # 3e. engine#3242: MOVED and doubled -- the branch removes the base's copy and registers the name twice in a
+        # family file. `freed` used to silence this (rc 0) while the tree holds two copies; a removal frees the
+        # BASE's copy only, so the doubled finding must stand.
+        d = repo(tmpd, "moved_and_doubled")
+        (d / "cmake").mkdir(exist_ok=True)
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text().replace("add_test(NAME taken_row COMMAND true)\n", ""))
+        (d / "cmake" / "tests-family.cmake").write_text(
+            "add_test(NAME taken_row COMMAND true)\nadd_test(NAME taken_row COMMAND true)\n")
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(d), "commit", "-qm", "moved into a family file, written twice"], check=True)
+        got, msgs = check(d, "main")
+        chk(1, got, "a row MOVED and registered twice is a collision, not a clean move (engine#3242)")
+        chk(True, any("taken_row" in m for m in msgs), "...and the message names it")
 
         # 4. a name computed from a variable is not compared
         d = repo(tmpd, "variable_name")

@@ -84,9 +84,25 @@ prompts=(${args[@]+"${args[@]}"})
 
 out=${BITX_OUT:-$HOME/.cache/scratch-bitx/$(basename "$container" .q4nx)}
 rm -rf "$out"; mkdir -p "$out/dev" "$out/host"
+# engine#3196: logits alone cannot say whether two arms differ in the BODY or in the HEAD. On a container whose
+# `lm_head` the device does not claim, the device falls through to an f32 host matvec while the integer arm takes its
+# int8 ladder, so a logits verdict there is about two heads. The residual stream (`NPU_INFER_DUMP_DIR`, one
+# `layer_<ll>.f32` per layer) is taken before the head, so the same runs can answer the body question too.
+# (the per-run dump directory is created in serve(), which covers dev, dev1..R and host alike)
 
 serve() {   # <dir> <port> [env ...]
     local dir=$1 port=$2; shift 2
+    # engine#3196 review: the dump directory has to exist for the CHILD (`docs/npu.md`: "The directory must exist"),
+    # and `$dir` is not always `$out/dev` -- `--repeats R` runs the device into `$out/dev1..R`, where nothing created
+    # it, so the device arm dumped nothing and the arm that exists to measure determinism lost the comparison.
+    # The residual comparison reads ONE device run (`$first`) and the host arm, so `--repeats R>1` arms the dump only
+    # on the first: the repeats exist to test logit determinism, and that needs no residuals -- arming them there
+    # would write ~1.1 GB per extra run on the 14B family for data nothing reads.
+    local dumpargs=()
+    if [ "${dump_layers:-1}" = 1 ]; then
+        mkdir -p "$dir/layers"
+        dumpargs=(NPU_INFER_DUMP_DIR="$dir/layers")
+    fi
     # engine#3194: 60 s is a whisper-sized budget. A 14B host-GEMM arm spends minutes warming first
     # (`forward-total` pays the weight cache up front: "forward-serve: warming (weight cache; first request would
     # otherwise pay it)"), so a fixed 60 s kills it mid-warm and files the result as a failure. The budget is
@@ -95,7 +111,7 @@ serve() {   # <dir> <port> [env ...]
     case "$budget" in
         ''|*[!0-9]*|0) echo "  $dir: BITX_SERVE_WAIT_S must be a positive integer of seconds (got '$budget')" >&2; return 2 ;;
     esac
-    env "$@" "$bin" forward-serve -m "$container" --kernels "$kernels" --prefix-slots 0 \
+    env "$@" ${dumpargs[@]+"${dumpargs[@]}"} "$bin" forward-serve -m "$container" --kernels "$kernels" --prefix-slots 0 \
         -p "$port" --dump-logits "$dir" > "$dir.log" 2>&1 &
     local pid=$!
     local up=0
@@ -132,6 +148,8 @@ echo "device :"
 for r in $(seq 1 "$repeats"); do
     d=$( [ "$repeats" = 1 ] && printf '%s' "$out/dev" || printf '%s/dev%s' "$out" "$r" )
     mkdir -p "$d"
+    # only the first device run's residuals are compared, so only it pays the dump
+    dump_layers=$([ "$r" = 1 ] && echo 1 || echo 0)
     serve "$d" $((18150 + r - 1)) || exit 1
 done
 # engine#3196: the integer arm's head is its own ladder (int8 activations, 8192-wide vocabulary blocks,
@@ -144,6 +162,7 @@ done
 head_off=''
 grep -q 'lm head: on the host' "$out"/dev*.log 2>/dev/null && head_off=NPU_I8_HEAD_OFF=1
 [ -n "$head_off" ] && echo "  note: the device's head runs on the host, so both arms use it and this run says nothing about the int8 head ladder (NPU_I8_HEAD_OFF=1)"
+dump_layers=1   # the host arm always dumps: it is the reference the comparison reads
 echo "host   :"; serve "$out/host" 18151 NPU_INFER_HOST_GEMM=i8 ${head_off:+"$head_off"} || exit 1
 
 bad=0 n=0
@@ -177,5 +196,25 @@ if [ "$repeats" -gt 1 ]; then
                      || { echo "npu-kernel-bitx: $drift of $total position(s) differ between repeats" >&2; bad=$((bad + drift)); }
 fi
 [ "$n" -gt 0 ] || { echo "npu-kernel-bitx: no logits were dumped -- the run proved nothing" >&2; exit 1; }
+# engine#3196 fix 2: WHERE the two arms part, on the same runs and before the head. ADVISORY on purpose -- the
+# threshold at which a body counts as agreeing is a decision #3196 has not made yet, and turning it into a second
+# gate criterion here would red the arm for a difference the issue is still measuring. What it does settle is the
+# question the logits verdict cannot: a logits difference with the residuals inside the band is a HEAD difference.
+residual_tool="$(dirname "$0")/../tools/ci/npu_residual_diff.py"
+if [ ! -f "$residual_tool" ]; then
+    echo "  residuals: not compared (no tools/ci/npu_residual_diff.py beside this script)"
+elif ! command -v python3 >/dev/null 2>&1; then
+    echo "  residuals: not compared (no python3)"
+else
+    # `$first` is the first device run's directory (`--repeats R` writes dev1..R, and `$out/dev` exists only at R=1).
+    python3 "$residual_tool" "$first/layers" "$out/host/layers" 2>&1 | sed 's/^/  /'
+    # The dumps are M x H x 4 B per layer per arm: 1366 tokens x 5120 f32 x 4 B = 28.0 MB per layer, so ~1.1 GB per
+    # arm over 40 layers and ~2.2 GB for the pair. BITX_KEEP_DUMPS=0 drops them after the comparison, as the logits
+    # dumps are dropped by the next run of the same container.
+    if [ "${BITX_KEEP_DUMPS:-1}" = 0 ]; then
+        rm -rf "$out"/dev*/layers "$out/host/layers"   # `dev*` also matches plain `dev` at --repeats 1
+        echo "  residuals: layer dumps removed (BITX_KEEP_DUMPS=0)"
+    fi
+fi
 if [ "$bad" = 0 ]; then echo "npu-kernel-bitx: $n/$n prompt(s) bit-exact against the host integer arm"; exit 0; fi
 echo "npu-kernel-bitx: $bad of $n prompt(s) differ from the host" >&2; exit 1

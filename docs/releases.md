@@ -38,6 +38,17 @@ release in the same week gets `.1`.
 
 ## v2026.44 (1 Nov 2026) — the first release, a draft
 
+> **2026-11-21: the GPU route is moving to Loom.** The owner moved the engine's GPU route to Loom: AMD's
+> Loom model programs on the HRX runtime, served by `loom-serve` behind `1bit serve`. Each model moves only
+> after an interleaved A/B and accuracy check against the current route
+> ([#3158](https://github.com/1bit-MONSTER/engine/issues/3158)); coverage is
+> [#3156](https://github.com/1bit-MONSTER/engine/issues/3156) and the hybrid KV handover
+> [#3157](https://github.com/1bit-MONSTER/engine/issues/3157). No model has moved yet, so a build today still
+> serves every GPU model on the llama.cpp fork with ggml-hrx and the private HIP kernels; that route stays as
+> the fallback with no new kernel work ([#679](https://github.com/1bit-MONSTER/engine/issues/679) and
+> [#3103](https://github.com/1bit-MONSTER/engine/issues/3103) are parked). The NPU engine and the 1bit OS image
+> do not change. The records below describe the builds as they were made.
+
 > **The candidate has moved on since this section was written.** Everything below to the end of this section is the
 > **1 Nov 2026 record** of c19 (software-gated, never booted on hardware) and c20, and stays as that record. What
 > has happened since, as of 2026-11-05 23:1x:
@@ -347,7 +358,7 @@ native packages and the tarball are the same tree for a machine that installs Le
 (`scripts/pack-distro.sh` wraps one payload; only the packaging differs). The engine's build-tree
 tarball (`1bit-<tag>-linux-x86_64.tar.zst`) is still not published on its own. There is no Windows
 package (Lemonade has its own Windows build). On the GPU the engine
-is pure HRX with HIP kernels: no Vulkan, ROCm backend, Metal, ZINC or CUDA. Lemonade serves those
+is pure HRX (the llama.cpp route with HIP kernels today, moving to Loom per model): no Vulkan, ROCm backend, Metal, ZINC or CUDA. Lemonade serves those
 with its own backends.
 
 The image is hosted on **[Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS)**, not among the
@@ -379,7 +390,9 @@ that is what the box has; the NPU needs the `amdxdna` kernel driver. The closed 
 
 ### The NPU engine
 
-The release is the HRX runtime with our HIP kernels and the NPU engine, all inside Lemonade. The
+The release is the HRX runtime with our HIP kernels and the NPU engine, all inside Lemonade; on the GPU,
+Loom programs take over model by model once each passes the gate ([hrx.md](hrx.md#direction-loom-on-the-gpu)),
+and the HIP-kernel route stays as the fallback. The
 release carries the NPU runtime, compiled into `1bit`, and the `onebit` recipe's `npu` backend.
 The NPU kernels are closed too: they ship as sealed artifacts that `1bit` verifies and opens in
 memory at load, failing cleanly on a

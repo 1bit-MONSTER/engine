@@ -23,10 +23,19 @@ limitations under the License.
 [![Discord](https://img.shields.io/badge/chat-Discord-5865F2)](https://discord.gg/fa5m4Vawpa)
 
 One binary to rule them all: the 1bit engine is a model-agnostic local LLM inference engine for the
-AMD Ryzen AI MAX+ 395 (Strix Halo) on Linux. It serves any GGUF on the Radeon 8060S iGPU (`gfx1151`)
-through HRX with our own HIP kernels, and models on the XDNA 2 NPU through our own NPU runtime, as a
+AMD Ryzen AI MAX+ 395 (Strix Halo) on Linux. It serves models on the Radeon 8060S iGPU (`gfx1151`)
+through AMD's HRX runtime, and models on the XDNA 2 NPU through our own NPU runtime, as a
 backend of AMD's [Lemonade Server](https://github.com/lemonade-sdk/lemonade) and its OpenAI-compatible API.
 Boot a USB stick, and the machine serves local LLMs on its GPU and NPU. That is the whole setup.
+
+**GPU direction (2026-11-21): the GPU route is moving to Loom.** That is AMD's Loom model programs
+on the HRX runtime, served by `loom-serve` behind `1bit serve`. On our Strix Halo box, straight Loom
+beat our llama.cpp fork with its HIP kernels on every model we compared. A model moves only once it
+passes the Loom gate: an interleaved A/B and an accuracy check against the current route
+([#3158](https://github.com/1bit-MONSTER/engine/issues/3158)). No model has moved yet; the
+integration is in progress; which models have a Loom program is tracked in [#3156](https://github.com/1bit-MONSTER/engine/issues/3156). Until a
+model moves, and for models with no Loom program, the llama.cpp fork with ggml-hrx and our HIP
+kernels serves it as the fallback. The NPU engine does not change ([docs/hrx.md](docs/hrx.md#direction-loom-on-the-gpu)).
 
 ## Get started
 
@@ -67,7 +76,7 @@ Already running Lemonade on Ubuntu? The `lemonade-onebit` package from the [rele
 
 ## What it is: one model-agnostic binary for the GPU and the NPU
 
-One binary to rule them all. The 1bit engine is model agnostic: any Hugging Face architecture, any GGUF quantization, Ryzen AI NPU packs and ONNX graphs, served by one Lemonade backend on the AMD Ryzen AI MAX+ 395 (Strix Halo). It runs the Radeon 8060S iGPU through HRX with our own HIP kernels, and the XDNA 2 NPU through our own NPU runtime, behind the OpenAI-compatible API Lemonade already gives you. Every model is checked on the hardware before it ships; the models and their measured numbers are one page: [docs/models.md](docs/models.md).
+One binary to rule them all. The 1bit engine is model agnostic: any Hugging Face architecture, any GGUF quantization, Ryzen AI NPU packs and ONNX graphs, served by one Lemonade backend on the AMD Ryzen AI MAX+ 395 (Strix Halo). It runs the Radeon 8060S iGPU through AMD's HRX runtime (today the llama.cpp fork with ggml-hrx and our HIP kernels; moving to Loom programs per model, once each passes the gate), and the XDNA 2 NPU through our own NPU runtime, behind the OpenAI-compatible API Lemonade already gives you. Every model is checked on the hardware before it ships; the models and their measured numbers are one page: [docs/models.md](docs/models.md).
 
 ## Milestones
 
@@ -82,6 +91,7 @@ One binary to rule them all. The 1bit engine is model agnostic: any Hugging Face
 | 2026-11-01 | **v2026.44 is a draft**: candidate 19 is gated in software (1959/1959 kernel ops, NPU 82.03 tok/s, `VMTEST` pass through install and installed-disk boot, `VMTEST-RELEASE` 10 pass / 9 skip / 0 fail) but has **not** been booted or installed on hardware; candidate 20 takes the full gate, hardware boot and install included, before it is published ([docs/releases.md](docs/releases.md)) |
 | 2026-11-02 | **1bit OS becomes a Puppy Linux appliance**: `ResolutePup64` (woof-CE, Ubuntu 26.04 base) with our MOK-signed kernel, Lemonade and the engine embedded, headless by default with a `desktop` boot entry, `apt` and a persistent `1BIT-DATA`; it boots on the board with Secure Boot on ([docs/os-v3.md](docs/os-v3.md), [os/README.md](os/README.md)) |
 | 2026-11-14 | The Bosgame BeyondMax's rear USB-A and Type-C ports work under Linux: a plug test on every external port passed once the keep-awake rule holds the xHCI controllers awake (USB4 devices still untested). The MTP drafter no longer crashes on a model's first request, and the HIP kernel and HRX pins moved forward through the hardware gate ([docs/axb35-usb-ports.md](docs/axb35-usb-ports.md), [#2431](https://github.com/1bit-MONSTER/engine/pull/2431), [#2453](https://github.com/1bit-MONSTER/engine/pull/2453), [#2461](https://github.com/1bit-MONSTER/engine/pull/2461)) |
+| 2026-11-21 | The GPU route starts moving to Loom: AMD's Loom model programs on HRX, served by `loom-serve` behind `1bit serve`, one model at a time once each passes an A/B and accuracy gate. The llama.cpp fork with our HIP kernels stays as the fallback; the NPU engine does not change ([#3156](https://github.com/1bit-MONSTER/engine/issues/3156), [#3157](https://github.com/1bit-MONSTER/engine/issues/3157), [#3158](https://github.com/1bit-MONSTER/engine/issues/3158)) |
 
 The release goes out when every item on the release checklist is done ([docs/releases.md](docs/releases.md)); the weekly Lemonade pin moves with Lemonade's releases.
 
@@ -104,7 +114,8 @@ The release binaries (the Linux package and 1bit OS) also contain two proprietar
 compiled in: the 1bit NPU runtime and the 1bit HIP kernels for HRX. They are not in this
 repository, their source is not published, and they are not under Apache-2.0: they ship under the
 [1bit Binary License](LICENSE-BINARY) (free to use for any purpose and to pass on unmodified;
-third-party parts in [NOTICE-BINARY](NOTICE-BINARY)). A build from this
+third-party parts in [NOTICE-BINARY](NOTICE-BINARY)). The HIP kernels serve the fallback GPU route
+(the llama.cpp fork) and get no new work now that the GPU route is moving to Loom. A build from this
 repository without them has no NPU engine and runs HRX on the public kernels only
 ([NOTICE](NOTICE), [docs/releases.md](docs/releases.md#private-components)).
 
@@ -128,8 +139,10 @@ vibecoding, and that is where all of this started. Without it, this engine would
 
 **The Lemonade team and AMD's developers.** [Lemonade](https://github.com/lemonade-sdk/lemonade)
 is where this engine runs. AMD's developers left breadcrumbs all over the place: the XDNA driver
-and XRT, IRON and Peano, HRX, their tested llama.cpp integration, their issues, their examples.
-This engine is what following those breadcrumbs built.
+and XRT, IRON and Peano, HRX and Loom, their tested llama.cpp integration, their issues, their examples.
+This engine is what following those breadcrumbs built. The GPU route's move to Loom follows the Loom
+model programs that [loom-fun](https://github.com/loom-fun) (Jeremy Fowers and Daniel Holanda)
+publish for Strix Halo.
 
 The repositories this engine is built on, in order of importance:
 
@@ -140,12 +153,13 @@ The repositories this engine is built on, in order of importance:
 | 3 | [Xilinx/mlir-aie](https://github.com/Xilinx/mlir-aie) | IRON and aiecc: how our own NPU kernels are written and compiled | Apache-2.0 WITH LLVM-exception |
 | 4 | [Xilinx/llvm-aie](https://github.com/Xilinx/llvm-aie) | Peano, the C++ compiler for the NPU's AI Engine cores | Apache-2.0 WITH LLVM-exception |
 | 5 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | GGUF inference on the Radeon iGPU through HRX (AMD's tested pair), and on the CPU | MIT |
-| 6 | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) (our fork [1bit-MONSTER/hrx-system](https://github.com/1bit-MONSTER/hrx-system) carries two commits) | HRX, AMD's HIP Runtime Extended, behind the HRX0 device |
-| 7 | [torvalds/linux](https://github.com/torvalds/linux) | The kernel, with `amdxdna` and `amdgpu` in-tree | GPL-2.0 WITH Linux-syscall-note |
-| 8 | [huggingface/tokenizers](https://github.com/huggingface/tokenizers) | Every model's `tokenizer.json`, byte-exact, behind our C ABI | Apache-2.0 |
-| 9 | [NandhaKishorM/laya](https://github.com/NandhaKishorM/laya) | The router that decides where each request runs | Apache-2.0 |
-| 10 | [ROCm/FastFlowLM](https://github.com/ROCm/FastFlowLM) | The Q4NX NPU model format and its models on Hugging Face (`FastFlowLM/*-NPU2`), which the engine's NPU route runs on its own kernels | MIT |
-| 11 | [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) | **removed from the engine** (owner 2026-11-01, out of the tree 2026-11-02): antirez's CUDA kernels through a HIP shim plus hipBLAS are not our HIP kernels, and `--device ds4` now says it is gone. The fork [1bit-MONSTER/ds4](https://github.com/1bit-MONSTER/ds4) stays in the open as the reference for that work | MIT |
+| 6 | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) (our fork [1bit-MONSTER/hrx-system](https://github.com/1bit-MONSTER/hrx-system) carries two commits) | HRX, AMD's HIP Runtime Extended, behind the HRX0 device, and its Loom compiler | Apache-2.0 |
+| 7 | [ROCm/hrx-loom-library](https://github.com/ROCm/hrx-loom-library), [loom-fun/loom-skills](https://github.com/loom-fun/loom-skills), [loom-fun/weaver](https://github.com/loom-fun/weaver) | Loom: the kernel corpus for the HRX Loom compiler, and the tools and model cards for writing, tuning and serving Loom model programs on Strix Halo, where the GPU route is moving (in progress, [#3156](https://github.com/1bit-MONSTER/engine/issues/3156)) | MIT |
+| 8 | [torvalds/linux](https://github.com/torvalds/linux) | The kernel, with `amdxdna` and `amdgpu` in-tree | GPL-2.0 WITH Linux-syscall-note |
+| 9 | [huggingface/tokenizers](https://github.com/huggingface/tokenizers) | Every model's `tokenizer.json`, byte-exact, behind our C ABI | Apache-2.0 |
+| 10 | [NandhaKishorM/laya](https://github.com/NandhaKishorM/laya) | The router that decides where each request runs | Apache-2.0 |
+| 11 | [ROCm/FastFlowLM](https://github.com/ROCm/FastFlowLM) | The Q4NX NPU model format and its models on Hugging Face (`FastFlowLM/*-NPU2`), which the engine's NPU route runs on its own kernels | MIT |
+| 12 | [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) | **removed from the engine** (owner 2026-11-01, out of the tree 2026-11-02): antirez's CUDA kernels through a HIP shim plus hipBLAS are not our HIP kernels, and `--device ds4` now says it is gone. The fork [1bit-MONSTER/ds4](https://github.com/1bit-MONSTER/ds4) stays in the open as the reference for that work | MIT |
 
 Also built on [nlohmann/json](https://github.com/nlohmann/json) (MIT)
 and [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT).

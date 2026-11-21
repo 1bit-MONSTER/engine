@@ -1563,6 +1563,11 @@ add_test(NAME laya_eval_e2e COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/lay
 add_test(NAME laya_route_serve COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
 # One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).
 add_test(NAME laya_checkpoint COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_checkpoint.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+# engine#3171: `--laya-models` is the only rail that launches its child with `--port 0`, so it is the only one
+# where the foreign-format readiness guard can fire -- and that child is always a nested `1bit serve`, whose own
+# child announces a llama-server-format port across the child's stderr tee. This row is that guard's test: the
+# launch must survive its grandchild's line and still route a request.
+add_test(NAME serve_nested_foreign COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/serve_nested_foreign.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
 # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
 if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
@@ -1574,7 +1579,8 @@ add_test(NAME pm_laya_route COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/pm_
 
 # engine#3161: no checkpoint (the default) -> 77 with the scripts' own reason, never a green pass. A path that is
 # given and wrong exits 2 from the scripts, which ctest reports as a failure, not a skip.
-foreach(_laya_row laya_route_e2e laya_models_e2e laya_eval_e2e laya_route_serve laya_checkpoint pm_laya_route)
+foreach(_laya_row laya_route_e2e laya_models_e2e laya_eval_e2e laya_route_serve laya_checkpoint pm_laya_route
+                  serve_nested_foreign)
     set_tests_properties(${_laya_row} PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
 

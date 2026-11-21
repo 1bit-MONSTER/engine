@@ -683,7 +683,7 @@ public:
             ::close(err[1]);
             // detached: a backend stuck in the kernel keeps the pipe open, and serve must still exit
             std::thread([fd = err[0], tail = tail_, on_line = std::move(on_line), learned = learned_port_,
-                         last_line = last_line_ns_, foreign = foreign_ready_] {
+                         last_line = last_line_ns_, foreign = foreign_ready_, own = own_line_] {
                 char buf[4096];
                 for (;;) {
                     const ssize_t n = ::read(fd, buf, sizeof buf);
@@ -700,10 +700,21 @@ public:
                         // engine#3130 part 2: the port only this thread can see -- the child's own readiness line.
                         last_line->store(std::chrono::steady_clock::now().time_since_epoch().count(),
                                          std::memory_order_relaxed);
+                        // engine#3171: our own format is what separates a NESTED `1bit serve` from the
+                        // `--llama-server llama-server` mistake. serve prints "<model> on <device> (<backend>)" before it
+                        // launches anything, so a nested child has its own line in this stream before its child's
+                        // llama-server line arrives -- and every `1bit serve` in a stack tees its child's stderr on
+                        // unchanged, so that grandchild line is read here as if it were the child's. Deciding here, where
+                        // that order is still visible, is what keeps the judgement out of a race: at the refusal the
+                        // question is only "did the child ever speak our format", which a genuinely foreign server
+                        // never does.
+                        const bool own_line = line.compare(0, 5, "1bit ") == 0;
+                        if (own_line) own->store(true, std::memory_order_relaxed);
                         int parsed_port = 0;
                         if (parse_backend_ready_port(line, parsed_port)) learned->store(parsed_port);
                         // engine#3130 follow-up: a child that is talking is not the mistake the grace is for.
-                        else if (looks_like_foreign_ready(line)) foreign->store(true, std::memory_order_relaxed);
+                        else if (!own->load(std::memory_order_relaxed) && looks_like_foreign_ready(line))
+                            foreign->store(true, std::memory_order_relaxed);
                     }
                 }
                 ::close(fd);
@@ -892,6 +903,11 @@ private:
     // from a binary that will never print one. Both are written by the detached thread, hence shared and atomic.
     std::shared_ptr<std::atomic<long long>> last_line_ns_ = std::make_shared<std::atomic<long long>>(0);
     std::shared_ptr<std::atomic<bool>> foreign_ready_ = std::make_shared<std::atomic<bool>>(false);
+    // engine#3171: has this child printed a line in OUR format yet? A foreign-format readiness line only counts while it
+    // has not, because on the one rail that launches a child with `--port 0` (`--laya-models`) that child is a nested
+    // `1bit serve`, and the llama-server line arriving in this stream is its GRANDCHILD's. Written by the same detached
+    // thread as foreign_ready_, hence shared and atomic.
+    std::shared_ptr<std::atomic<bool>> own_line_ = std::make_shared<std::atomic<bool>>(false);
     int port_;
     std::string ready_path_;
     std::shared_ptr<LineTail> tail_ = std::make_shared<LineTail>();

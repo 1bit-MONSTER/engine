@@ -352,6 +352,32 @@ def tok_key(tok, by="id"):
     return i
 
 
+def route_has_token_ids(per_prompt):
+    """Whether this route reports an `id` on its generated tokens at all.
+
+    Measured on the two arms of engine#3158's gate: llama.cpp's chat logprobs carry `id`, and our own serve does not --
+    `app/forward_serve.cpp`'s `logprob_json` emits `token`, `logprob` and `top_logprobs` and no id, on every backend.
+    """
+    for pp in per_prompt:
+        for run in pp["runs"]:
+            for tok in run["tokens"]:
+                if tok.get("id") is None:
+                    return False
+    return bool(per_prompt)
+
+
+def effective_match_by(requested, a_has_ids, b_has_ids):
+    """The key one pair can actually be compared on.
+
+    `--match-by id` against a pair where only one side carries ids compares an integer with a string at every
+    position, so every position "differs" -- measured: `token-id match 0.000`, `token divergence` on all prompts and
+    `mean KLD cannot tell`, i.e. a complete-disagreement report for two routes that are token-for-token identical
+    under text. That is a wrong number in the most expensive direction (it reads as an accuracy failure and sends a
+    model back to the fallback), so the pair degrades to the one key both sides have, and says so.
+    """
+    return "text" if requested == "id" and not (a_has_ids and b_has_ids) else requested
+
+
 def first_divergence(a, b, by="id"):
     """Index of the first token position whose log-prob bits differ, else the length mismatch."""
     n = min(len(a), len(b))
@@ -634,6 +660,16 @@ def selftest():
        "no_logprobs_fails: fatal by default, declared-and-accepted with --text-only")
     ok(not missing_kld_fails(True, True) and missing_kld_fails(True, False) and missing_kld_fails(False, True),
        "missing_kld_fails: --text-only excuses a KLD that had no log-probs to compute, never a diverged-everywhere one")
+    # effective_match_by: the mixed-ids trap. Measured on the gate's own two arms -- llama.cpp emits `id`, our serve
+    # does not -- where `--match-by id` reported 0.000 token-id match and "diverged on all 8 prompts" for two routes
+    # that are identical under text.
+    ok(effective_match_by("id", True, True) == "id" and effective_match_by("text", True, True) == "text",
+       "effective_match_by: an id-vs-id pair keeps the id key, and an explicit text request is untouched")
+    ok(effective_match_by("id", True, False) == "text" and effective_match_by("id", False, False) == "text",
+       "effective_match_by: one route without ids degrades the pair to text instead of reporting total divergence")
+    ok(not route_has_token_ids([{"runs": [{"tokens": [{"id": None, "token": "a"}]}]}])
+       and route_has_token_ids([{"runs": [{"tokens": [{"id": 7, "token": "a"}]}]}]),
+       "route_has_token_ids: our serve's id-less entries are detected, a fork-style entry is not flagged")
     print(f"logprob_agree selftest: {named[0]} ok, {named[1]} failed (KLD arms named; the rest assert)")
 
 
@@ -768,14 +804,20 @@ def main(argv=None):
                 print(f"{la} vs {lb:<6} NO DATA")
                 failed = True
                 continue
-            gs = [agreement(x["runs"][0], y["runs"][0], a.match_by) for x, y in zip(pa, pb)]
+            mb = effective_match_by(a.match_by, route_has_token_ids(pa), route_has_token_ids(pb))
+            gs = [agreement(x["runs"][0], y["runs"][0], mb) for x, y in zip(pa, pb)]
             g = pair_summary(gs)
+            g["match_by_effective"] = mb
             report["agreement"][f"{la}|{lb}"] = g
             if (g["exact_bit_match_rate"] is not None and g["exact_bit_match_rate"] < 1.0) \
                     or g["text_prompt_divergence"]:
                 failed = True
             fmt = lambda v, spec: "cannot tell" if v is None else format(v, spec)  # noqa: E731
             print(f"{la} vs {lb}")
+            if mb != a.match_by:
+                lacking = [n for n, p in ((la, pa), (lb, pb)) if not route_has_token_ids(p)]
+                print(f"  match key         {mb}, not {a.match_by}: {', '.join(lacking)} reports no token ids, and an "
+                      f"id-vs-text comparison would report every position as differing")
             print(f"  token-id match    {fmt(g['token_id_match_rate'], '.3f')} over {g['positions']} positions")
             print(f"  max|dlogp|        {fmt(g['max_abs_dlogp'], '.6e')}  (common positions only)")
             print(f"  mean|dlogp|       {fmt(g['mean_abs_dlogp'], '.6e')}  over {g['common_token_positions']} tokens")
@@ -798,7 +840,7 @@ def main(argv=None):
             # holds each route to repeating itself, and the row's claim is about the route, so a mean over
             # the repeats is what it implies. Weighted by positions, so a run that produced fewer shared
             # positions does not count as much as one that produced more.
-            ks = [kld(rx, ry, a.match_by) for x, y in zip(pa, pb)
+            ks = [kld(rx, ry, mb) for x, y in zip(pa, pb)
                   for rx, ry in zip(x["runs"], y["runs"])]
             k = kld_summary(ks)
             k.update({"reference": la, "candidate": lb})

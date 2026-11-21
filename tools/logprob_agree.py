@@ -43,8 +43,9 @@ wire. Each log-prob is cast to float32 and compared as bits, which is exact for 
 server promoted to a double for serialisation — the tool asserts that round trip holds for every
 value it compares and reports how many values had to be dropped as non-float32.
 
-Exit code: 0 all routes deterministic and all pairs exactly equal, 1 a route is non-deterministic
-or a pair differs, 2 a route is unreachable or a request failed.
+Exit code: 0 all routes deterministic and all pairs exactly equal, 1 a route is non-deterministic or a
+pair differs -- including a pair that had no position to compare, which prints *cannot tell* rather than
+"0.000000 nats", 2 a route is unreachable or a request failed.
 """
 import argparse
 import json

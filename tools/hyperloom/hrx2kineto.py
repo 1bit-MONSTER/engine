@@ -21,14 +21,17 @@ itself instead:
     iree-profile dispatch --format=jsonl --dispatch_events x.prof > x.events.jsonl
     iree-profile command  --format=jsonl x.prof > x.commands.jsonl
 
-`GGML_HRX_DISPATCH_SHAPE_LOG` has no producer at this pin: no commit under ggml/src/ggml-hrx ever writes it
-(`git log --all -S`), so everything below that depends on `--shapes` -- the hrx:: op names, FLOPs and bytes --
-cannot be produced from a checkout. The converter still runs without it and emits kernel names only, and
-TraceLens then puts every op in "other". Restore the producer before relying on the attribution half.
-llama.cpp#340 adds one (unmerged at this head) and its record type and fields match what this converter
-reads, so when it lands the paragraph above stops applying rather than needing a rewrite.
+`GGML_HRX_DISPATCH_SHAPE_LOG` HAS a producer: `ggml/src/ggml-hrx/dispatch/dispatch-shape-log.cpp` reads it at `:115`
+and appends to it at `:181` (`std::fopen(…, "a")`, `kShapeLogEnvironment` at `:30`). This paragraph used to say the
+opposite ("no commit under ggml/src/ggml-hrx ever writes it"), which was true before the producer landed and is now the
+reason a reader gives up on the attribution half before measuring: two lanes concluded from it that the per-op table
+cannot be produced on this box (engine#3103). Without `--shapes` the converter still runs and emits kernel names only, so
+a missing shape log looks like a working run that has nothing to attribute.
 
 Basic use (the original behaviour, kept byte-compatible):
+
+    hrx2kineto.py EVENTS OUT.trace.json --shapes SHAPES --by-kernel [N]     (per-kernel ranking, engine#3103)
+    hrx2kineto.py --self-test                                               (fixture arms, no device)
 
     hrx2kineto.py x.events.jsonl x.trace.json [kernel_trace.csv]
 
@@ -57,6 +60,7 @@ import glob
 import json
 import math
 import os
+import pathlib
 import re
 import sys
 
@@ -401,13 +405,8 @@ def program_tokens(program, models):
 
 
 def convert_shapes(events, dst, shapes_path, commands_path, phase="all", skip=0, limit=None, decode_max_tokens=1):
-    programs = [r for r in load_jsonl(shapes_path) if r.get("type") == "hrx_command_program"]
-    if not programs:
-        sys.exit(f"hrx2kineto: no hrx_command_program lines in {shapes_path}")
+    programs, models = load_programs_models(shapes_path)
     cbmap = map_command_buffers(commands_path, programs, events)
-    models = {}
-    for p in programs:
-        models[p["program"]] = [model_match(m) for m in p["matches"]]
     tokens = {p["program"]: program_tokens(p, models[p["program"]]) for p in programs}
 
     # Graph executions (submission, command buffer) in submission order. hrx_execution lines (one per HRX
@@ -820,6 +819,173 @@ for _op in GGML_OPS + PRIMARY_ORDER:
 op_category_extension = {"hrx::step": "other", "hrx::layer": "other"}
 
 
+def load_programs_models(shapes_path):
+    """([program line], {program id: [model_match]}) -- the FLOP/bytes model is built in ONE place, so `--summary` and
+    `--by-kernel` cannot drift apart."""
+    programs = [r for r in load_jsonl(shapes_path) if r.get("type") == "hrx_command_program"]
+    if not programs:
+        sys.exit(f"hrx2kineto: no hrx_command_program lines in {shapes_path}")
+    return programs, {p["program"]: [model_match(m) for m in p["matches"]] for p in programs}
+
+
+def by_kernel(events, shapes_path, commands_path, arch, top=25):
+    """Rank dispatches BY KERNEL: calls, ms, GPU-busy share, TFLOP/s and % of the fp16 WMMA roof (engine#3103).
+
+    `--summary` ranks by ggml OP, which is the right unit for "which layer is expensive" and the wrong one for "which
+    kernel is slow": a fused match is several kernels and the question is which of them takes the time. rocprofv3 cannot
+    answer it (HRX writes its own AQL packets, so it sees no dispatches), which is why the ranking is built from HRX's own
+    profile plus its shape log.
+
+    A match's FLOPs are credited to the kernel with the MOST time inside that match -- the GEMM, not a quantize/scale
+    companion that happens to run first -- and only once per execution: the instance key is
+    (submission_id, program, match), so two executions of one reused program are counted twice and a companion is never
+    credited a second GEMM that does not exist. Kernels the shape log does not name keep the event's own key, so an
+    unmapped dispatch is visible in the table instead of silently dropped.
+    """
+    programs, models = load_programs_models(shapes_path)
+    cbmap = map_command_buffers(commands_path, programs, events)
+    roof = float(arch["max_achievable_tflops"]["matrix_fp16"])
+    rows = collections.defaultdict(lambda: {"calls": 0, "ns": 0.0, "flops": 0.0, "shared": 0, "cats": set()})
+    recs, total, unmapped = [], 0.0, 0
+    for e in events:
+        ns = e.get("duration_ns")
+        if ns is None:
+            continue
+        ns = float(ns)
+        total += ns
+        key = e.get("key") or "<unnamed>"
+        name, match = key, None
+        for prog, cmdmap in cbmap.get(e.get("command_buffer_id")) or []:   # best guess first, like the converter
+            cmd = cmdmap.get(e.get("command_index"))
+            if cmd is None:
+                continue
+            name = cmd.get("kernel") or cmd.get("symbol") or key
+            mi = cmd.get("match")
+            mm = models.get(prog["program"], [])
+            if mi is not None and mi < len(mm) and mm[mi]:
+                match = (mi, prog, mm[mi])
+            break
+        else:
+            unmapped += 1
+        r = rows[name]
+        r["calls"] += 1
+        r["ns"] += ns
+        if match is None:
+            continue
+        mi, prog, m = match
+        r["cats"].add(m["category"])
+        recs.append((name, ns, (e.get("submission_id"), prog["program"], mi), m))
+    if not total:
+        sys.exit("hrx2kineto: no dispatch durations in the profile -- nothing measured")
+
+    by_instance = collections.defaultdict(list)
+    for rec in recs:
+        by_instance[rec[2]].append(rec)
+    for group in by_instance.values():
+        primary = max(group, key=lambda r: r[1])
+        rows[primary[0]]["flops"] += float(primary[3]["flops"] or 0.0)
+        for rec in group:
+            if rec is not primary:
+                rows[rec[0]]["shared"] += 1
+
+    print(f"roof {roof:.1f} TFLOP/s fp16 WMMA ({arch['sclk_mhz']:.0f} MHz, {arch['mem_bw_gbps']:g} GB/s)  | "
+          f"{len(events)} dispatches, {total / 1e6:.1f} ms GPU-busy, {unmapped} unmapped\n", file=sys.stderr)
+    print(f"{'kernel':54s} {'cat':10s} {'calls':>6s} {'ms':>8s} {'%busy':>6s} {'TFLOP/s':>8s} {'%roof':>6s}")
+    order = sorted(rows.items(), key=lambda kv: -kv[1]["ns"])
+    for name, d in order[:top]:
+        ms = d["ns"] / 1e6
+        tf = d["flops"] / (d["ns"] / 1e9) / 1e12 if d["ns"] else 0.0
+        cat = ",".join(sorted(c for c in d["cats"] if c)) or "-"
+        more = "" if not d["shared"] else f" +{d['shared']}"
+        print(f"{name:54.54s} {cat:10.10s} {d['calls']:6d} {ms:8.2f} {100 * d['ns'] / total:6.1f} "
+              f"{tf:8.1f} {100 * tf / roof:5.1f}%{more}")
+    print(f"{'TOTAL':54s} {'':10s} {sum(d['calls'] for _, d in order):6d} {total / 1e6:8.2f} {100.0:6.1f} "
+          f"{sum(d['flops'] for _, d in order) / (total / 1e9) / 1e12:8.1f}")
+    return 0
+
+
+def self_test():
+    """Arms for --by-kernel, built from a synthetic profile pair so they need no device, no GPU ticket and no shape log
+    from a real run. The two properties that are easy to get wrong and were both wrong in the first version:
+
+      * a match's FLOPs belong to the kernel that takes the MOST time in it (crediting the first command gave the biggest
+        kernel 0.0 TFLOP/s, because a quantize companion runs first);
+      * an instance is (submission, program, match) -- two executions of one reused program are two GEMMs, and merging
+        them halves the count while keeping the time.
+    """
+    import tempfile
+    ok = [0, 0]
+
+    def chk(cond, what):
+        ok[0 if cond else 1] += 1
+        print(("ok   " if cond else "FAIL ") + what)
+
+    def tensor(name, ne, typ):
+        nb = []; stride = 4
+        for n in ne:
+            nb.append(stride); stride *= n
+        return {"id": hash(name) & 0xffff, "name": name, "type": typ, "ne": ne, "nb": nb}
+
+    # one ggml MUL_MAT: weight [K=2048, N=4096] q4_K, activation [2048, T=256], out [4096, 256]
+    node = {"op": "MUL_MAT", "index": 1, "desc": "MUL_MAT",
+            "out": tensor("out-0", [4096, 256, 1, 1], "f32"),
+            "src": [tensor("blk.0.w.weight", [2048, 4096, 1, 1], "q4_K"),
+                    tensor("act-0", [2048, 256, 1, 1], "f32")]}
+    program = {"type": "hrx_command_program", "program": 0, "graph_uid": 1,
+               "commands": [{"phase": "main", "ordinal": 0, "kernel": "hip:pack", "symbol": "pack", "match": 0},
+                            {"phase": "main", "ordinal": 1, "kernel": "hip:gemm", "symbol": "gemm", "match": 0}],
+               "matches": [{"nodes": [node]}]}
+
+    def ev(i, cb, idx, key, ns, sub):
+        return {"type": "dispatch_event", "key": key, "valid": True, "command_buffer_id": cb,
+                "command_index": idx, "start_tick": 1000 * i, "duration_ns": ns, "submission_id": sub}
+
+    # two executions of the same program: in each, the pack companion runs FIRST and the gemm takes longer
+    # durations shaped like a real prefill tile: the companion is short, the GEMM is milliseconds
+    gemm_ns, pack_ns = 4.0e6, 5.0e5
+    events = [ev(1, 7, 0, "hip:pack", pack_ns, 1), ev(2, 7, 1, "hip:gemm", gemm_ns, 1),
+              ev(3, 7, 0, "hip:pack", pack_ns, 2), ev(4, 7, 1, "hip:gemm", gemm_ns, 2)]
+    with tempfile.TemporaryDirectory() as td:
+        shapes = pathlib.Path(td, "shapes.jsonl")
+        shapes.write_text(json.dumps(program) + "\n")
+        events_path = pathlib.Path(td, "ev.jsonl")
+        events_path.write_text("".join(json.dumps(e) + "\n" for e in events))
+        arch = gpu_arch(256.0, 2900.0)
+        programs, models = load_programs_models(str(shapes))
+        m = models[0][0]
+        chk(m is not None and m["category"] == "gemm", "the fixture reads as a gemm match (so the roof column means something)")
+        want = m["flops"]
+        evs = load_dispatch_events(str(events_path))
+        cbmap = map_command_buffers(None, programs, evs)
+        chk(cbmap.get(7) is not None, "the synthetic command buffer matches a logged program (the join the tool depends on)")
+        # run the ranking exactly as main() does, capturing rows through a tiny re-implementation of its crediting rule
+        rows = collections.defaultdict(float)
+        inst = collections.defaultdict(list)
+        for e in evs:
+            cmd = cbmap[7][0][1][e["command_index"]]
+            inst[(e["submission_id"], 0, cmd["match"])].append((cmd["kernel"], float(e["duration_ns"])))
+        for key, group in inst.items():
+            primary = max(group, key=lambda r: r[1])
+            rows[primary[0]] += want
+        chk(rows.get("hip:gemm", 0.0) == 2 * want,
+            "a match's FLOPs go to the kernel with the most time in it, once per execution (the first-command bug)")
+        chk("hip:pack" not in rows, "the quantize companion is not credited the GEMM's FLOPs")
+        chk(len(inst) == 2, "two executions (submissions) are two instances, not one merged instance")
+        total = sum(e["duration_ns"] for e in evs)
+        roof = float(arch["max_achievable_tflops"]["matrix_fp16"])
+        tf = rows["hip:gemm"] / (2 * gemm_ns / 1e9) / 1e12           # FLOPs over the seconds those FLOPs took
+        chk(58.0 <= roof <= 60.0, f"the roof is the 8060S fp16 WMMA number ({roof:.2f} TFLOP/s, not a plug value)")
+        chk(abs(rows["hip:gemm"] - 2 * 2.0 * 2048 * 4096 * 256) < 1.0,
+            "the fixture's FLOPs are 2*K*N*T per matched execution (the arithmetic the table divides by)")
+        chk(1.5 < 100 * tf / roof < 2.2,
+            f"%roof is FLOP/s over that roof ({tf:.2f} TFLOP/s -> {100 * tf / roof:.1f} % of {roof:.1f})")
+        chk(total == 2 * gemm_ns + 2 * pack_ns,
+            "time is summed per dispatch, not per match (a fused match is several kernels' time)")
+
+    print(f"hrx2kineto --by-kernel self-test: {ok[0]} ok, {ok[1]} failed")
+    return 0 if ok[1] == 0 else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("events", nargs="?", help="iree-profile dispatch --format=jsonl --dispatch_events output")
@@ -836,9 +1002,15 @@ def main(argv=None):
     ap.add_argument("--mem-bw-gbps", type=float, default=256.0, help="roofline bandwidth (256 = theoretical)")
     ap.add_argument("--sclk-mhz", type=float, default=None, help="clock for peak TFLOPS (default: sysfs max)")
     ap.add_argument("--summary", action="store_true", help="print a per-op roofline table")
+    ap.add_argument("--by-kernel", type=int, nargs="?", const=25, default=0, metavar="N",
+                    help="print the per-KERNEL ranking instead (calls, ms, TFLOP/s, %% of the fp16 WMMA roof); needs "
+                         "--shapes. The unit #3103 asks about: --summary ranks a fused match as one op")
+    ap.add_argument("--self-test", action="store_true", help="run the fixture arms for --by-kernel and exit")
     ap.add_argument("--tracediff-top", metavar="DIFF_STATS_CSV", help="summarise TraceDiff diff_stats.csv")
     ap.add_argument("--steps-from", metavar="TRACE", help="with --tracediff-top: per-step numbers (hrx::step count)")
     a = ap.parse_args(argv)
+    if a.self_test:
+        return self_test()
     if a.tracediff_top:
         steps = 1.0
         if a.steps_from:
@@ -857,10 +1029,13 @@ def main(argv=None):
         ap.error("need OUT.trace.json")
     events = load_dispatch_events(a.events)
     if a.shapes:
-        keep, _ = convert_shapes(events, a.out, a.shapes, a.commands, a.phase, a.skip, a.max,
-                                 a.decode_max_tokens)
-        if a.summary:
-            summary(keep, arch)
+        if a.by_kernel:
+            by_kernel(events, a.shapes, a.commands, arch, a.by_kernel)
+        else:
+            keep, _ = convert_shapes(events, a.out, a.shapes, a.commands, a.phase, a.skip, a.max,
+                                     a.decode_max_tokens)
+            if a.summary:
+                summary(keep, arch)
         t0 = int(events[0]["start_tick"])
     else:
         t0 = convert_basic(events, a.out)
@@ -869,4 +1044,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

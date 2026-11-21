@@ -162,4 +162,26 @@ inline std::string tool_call_gbnf(const nlohmann::json& tools, const nlohmann::j
     return "root ::= " + root + "\n" + sink + json_shared_rules();
 }
 
+
+// engine#3193: a request that carries `tools` cannot be honoured on a PRIVATE route, and used to be answered
+// anyway. `npu/private_route.h`'s PrivateRequest carries {max_tokens, repetition_penalty, penalty_window,
+// on_token} and nothing else, so a route's session generates its tokens with no grammar to constrain -- the
+// request arrives, the grammar is never installed, and the model answers prose where the per-op forward emits a
+// proper `tool_calls`. Measured on the dx route: `tool_calls: NONE` even with `tool_choice: "required"`, while the
+// same request on the per-op forward returns `get_weather{"city":"Vienna"}`. A silent wrong-shaped answer is the
+// worst outcome for an agent app, so this refuses with a message that names the way out, exactly as the
+// over-context refusal does. Empty string = nothing to refuse.
+//
+// `route` names what the model is running on, for the message (the model id is enough).
+inline std::string private_route_tools_refusal(const nlohmann::json& body, const std::string& route) {
+    const bool has_tools = body.contains("tools") && !body["tools"].is_null();
+    const bool has_choice = body.contains("tool_choice") && !body["tool_choice"].is_null();
+    if (!has_tools && !has_choice) return "";
+    return "this model runs on " + route + ", a private NPU route whose session cannot carry a tool grammar "
+           "(npu/private_route.h:PrivateRequest has no constraint hook), so `" +
+           std::string(has_tools ? "tools" : "tool_choice") +
+           "` could not be honoured and the reply would silently be prose instead of a tool call. Drop it, or "
+           "serve this model through the per-op forward (unset ONEBIT_NPU_DX_KERNELS).";
+}
+
 }  // namespace onebit::npu

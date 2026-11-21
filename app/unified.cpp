@@ -33,6 +33,7 @@
 #include "generate.h"
 #include "model.h"
 #include "private_route.h"
+#include "npu_tool_grammar.h"  // engine#3193: the private-route tools refusal
 #include "tokenizer.h"
 
 #include <httplib.h>
@@ -200,6 +201,17 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         res.status = 400;
         res.set_content(R"({"error":{"message":"request body is not JSON"}})", "application/json");
         return;
+    }
+    // engine#3193: a private route's session generates its own tokens and cannot carry a tool grammar, so a
+    // request with `tools`/`tool_choice` used to be answered as prose -- silently the wrong shape, where the
+    // per-op forward emits a real tool_calls. Refused rather than ignored, like the over-context case below.
+    if (chat) {
+        const std::string why = npu::private_route_tools_refusal(body, e.id);
+        if (!why.empty()) {
+            res.status = 400;
+            res.set_content(json{{"error", {{"message", why}}}}.dump(), "application/json");
+            return;
+        }
     }
     std::string prompt;
     bool split_reasoning = false, think_opened = false;

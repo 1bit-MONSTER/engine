@@ -1131,6 +1131,9 @@ add_test(NAME mem_admit COMMAND mem_admit_test)
 # read out of the MIT loom sources, so it checks the arithmetic rather than snapshotting it.
 add_executable(loom_kv_layout_test tests/loom_kv_layout_test.cpp)
 target_include_directories(loom_kv_layout_test PRIVATE app)
+# ci.yml builds `onebit`, not this target, so without the dependency the test is registered and never built there -- the
+# same gap npu_partition_test documents at the top of this file. Header-only, so it needs no device and no Loom.
+add_dependencies(onebit loom_kv_layout_test)
 add_test(NAME loom_kv_layout COMMAND loom_kv_layout_test)
 # engine #390's load-time placement report and --strict-device (app/serve_metrics.h, docs/serve.md
 # "Off-HRX placement"): the backend's placement line in, serve's line and the refusal out; header

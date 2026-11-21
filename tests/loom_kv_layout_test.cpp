@@ -58,7 +58,9 @@ int main() {
     check_eq(L::kGdnRecurrentBytes % 256, 0, "the recurrent state is 256-aligned (so the pack adds no padding)");
     check_eq(L::kGdnConvBytes % 256, 0, "the conv history is 256-aligned (same reason)");
 
-    // Qwen3.8-27B's shape: 1024 f16 per token per side, 15 attention ordinals, 47 gdn ordinals.
+    // Qwen3.8-27B's shape: 1024 f16 per token per side, 16 attention ordinals (0..15), 48 gdn ordinals (0..47). Loom's
+    // `range(lo, hi)` is inclusive (docs/src/guide/facts-and-specialization.md:88), and group 15 of the decode body uses
+    // gdn ordinal 47 and attention ordinal 15, so 16 + 48 = the model's 64 layers is the count that matches the body.
     const uint64_t kv = 1024;
 
     check_eq(kv * L::kF16Bytes, 2048, "one token of key storage is 2048 B (Loom's %cache_token_bytes)");
@@ -77,14 +79,15 @@ int main() {
     // GDN: per-ordinal block and offsets, from the two constants Loom packs.
     check_eq(L::gdn_conv_offset(), L::kGdnRecurrentBytes, "conv history follows the recurrent state with no padding");
     check_eq(L::gdn_layer_bytes(), 3145728ull + 122880ull, "one gdn ordinal is recurrent + conv = 3268608 B");
-    check_eq(L::gdn_layer_offset(47 - 1), 46ull * 3268608ull, "the last gdn ordinal's block offset");
+    check_eq(L::gdn_layer_offset(47), 47ull * 3268608ull, "the last gdn ordinal's block offset (ordinals are 0-based)");
 
-    // The whole state for that model at 4096 context: 15 attention blocks + 47 gdn blocks.
-    const uint64_t attn = L::attention_total_bytes(4096, kv, 15);
-    const uint64_t gdn  = L::gdn_total_bytes(47);
-    check_eq(attn, 15ull * 2ull * 4096ull * 2048ull, "15 attention ordinals at 4096 tokens");
-    check_eq(gdn, 47ull * 3268608ull, "47 gdn ordinals (capacity-independent)");
-    check_eq(L::state_total_bytes(4096, kv, 15, 47), attn + gdn, "the two roots add up to what the exporter allocates");
+    // The whole state for that model at 4096 context: 16 attention blocks + 48 gdn blocks.
+    const uint64_t attn = L::attention_total_bytes(4096, kv, 16);
+    const uint64_t gdn  = L::gdn_total_bytes(48);
+    check_eq(attn, 16ull * 2ull * 4096ull * 2048ull, "16 attention ordinals at 4096 tokens (268 435 456 B)");
+    check_eq(gdn, 48ull * 3268608ull, "48 gdn ordinals, capacity-independent (156 893 184 B)");
+    check_eq(L::state_total_bytes(4096, kv, 16, 48), 425328640ull, "the two roots are 425 328 640 B at 4096 context");
+    check_eq(L::state_total_bytes(4096, kv, 16, 48), attn + gdn, "…and that is attention + gdn, not a third number");
 
     // Sizing sanity against the number this lane already measures on the other route: docs/zero-copy.md:197 records the
     // GDN sweep as 604 MB read+written = 48 layers x 3.14 MB x ~4 passes. Loom's per-ordinal state is the same 3.14 MB
@@ -97,7 +100,7 @@ int main() {
     check_eq(4ull * 48ull * L::gdn_layer_bytes(),
              4ull * 48ull * L::kGdnRecurrentBytes + 4ull * 48ull * L::kGdnConvBytes,
              "the gap is exactly the conv history (23 592 960 B), so neither figure is a rounding of the other");
-    check_eq(47ull * L::gdn_layer_bytes(), 153624576ull, "47 ordinals -- what an exporter allocates for gdn");
+    check_eq(48ull * L::gdn_layer_bytes(), 156893184ull, "48 ordinals -- what an exporter allocates for gdn");
 
     // Token-major indexing: position p, element j inside one side.
     check_eq(L::attention_element_index(7, 0, kv), 7ull * kv, "element 0 of position 7 is at 7 * kv");

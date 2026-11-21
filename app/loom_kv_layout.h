@@ -26,8 +26,15 @@
 //                                                                                        %gdn_state, %attention_cache, …)
 //
 // measured from hrx-loom-library ba7abef (MIT, (c) 2026 AMD ROCm Software), model Qwen/Qwen3.8-27B -- a hybrid like
-// ours: 64 layers, 15 full-attention ordinals, 47 gated-delta-net ordinals. The arithmetic below is that file's, not an
-// interpretation: attention_layer_decode.loom:73-83 and gdn_layer_decode.loom:69-76.
+// ours: 64 layers, 16 full-attention ordinals (0..15) and 48 gated-delta-net ordinals (0..47). The arithmetic below is
+// that file's, not an interpretation: attention_layer_decode.loom:73-83 and gdn_layer_decode.loom:69-76.
+//
+// CARDINALITY, because the declarations read one short if you take a range as exclusive. model_decode.loom unrolls 16
+// groups of 3 GDN layers + 1 attention layer (`:26-27`), launches gdn ordinals `3*group + {0,1,2}` (`:48-50`) and the
+// attention ordinal `%group` (`:54`), so group 15 uses gdn ordinal 47 and attention ordinal 15. Loom's `range(lo, hi)` is
+// INCLUSIVE -- docs/src/guide/facts-and-specialization.md:88, "`range(%value, lo, hi)` is inclusive" -- so the decls'
+// `range(..., 0, 47)` and `range(..., 0, 15)` admit 48 and 16 ordinals, and a root sized for 47 or 15 would let the decode
+// body run off the end of both. 16 + 48 = 64 layers, which is the model's own depth.
 //
 // This header is arithmetic only: no device, no runtime, no Loom. It exists so the NPU writer and the tests agree on
 // one set of offsets before any of it touches memory, the same way app/mem_admit.h carries the admission arithmetic.
@@ -74,7 +81,8 @@ inline constexpr uint64_t attention_layer_bytes(uint64_t capacity, uint64_t kv_e
     return attention_side_bytes(capacity, kv_elements) * 2;
 }
 
-// First byte of that ordinal's block inside the shared root.
+// First byte of that ordinal's block inside the shared root. Ordinals are 0-based and there are 16 of them here, so the
+// last block starts at attention_layer_offset(15, …) and the root needs attention_total_bytes(…, 16).
 inline constexpr uint64_t attention_layer_offset(uint64_t ordinal, uint64_t capacity, uint64_t kv_elements) {
     return ordinal * attention_layer_bytes(capacity, kv_elements);
 }
@@ -89,6 +97,8 @@ inline constexpr uint64_t gdn_conv_offset() { return align_up(kGdnRecurrentBytes
 inline constexpr uint64_t gdn_layer_bytes() { return gdn_conv_offset() + align_up(kGdnConvBytes, kStateAlign); }
 
 inline constexpr uint64_t gdn_layer_offset(uint64_t ordinal) { return ordinal * gdn_layer_bytes(); }
+
+// 48 blocks for this model: the last one starts at gdn_layer_offset(47).
 
 inline constexpr uint64_t gdn_total_bytes(uint64_t ordinals) { return ordinals * gdn_layer_bytes(); }
 

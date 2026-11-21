@@ -198,7 +198,10 @@ def check(root: pathlib.Path, base: str) -> tuple[int, list[str]]:
     # Counted before the dict above collapses the repeat; nothing here needs the base or the tree, so it is a hard
     # collision rather than a cannot-tell (measured: rc 0 before, `cmake -S . -B` rc 1 "already exists").
     counts = counted_row_names(added)
-    doubled = sorted(n for n, count in counts.items() if count > 1 and n not in freed)
+    # An ADDITION is never cancelled by a removal: a removal only cancels the base's copy, which is what `freed` and
+    # `clashes` below are for. Sharing `freed` here forgave -1/+2 of one name in one diff (a row moved into a family
+    # file and written twice), which leaves two copies in the tree and stops Configure.
+    doubled = sorted(n for n, count in counts.items() if count > 1)
     if doubled:
         return 1, ([f"{len(doubled)} ctest row name(s) this branch registers MORE THAN ONCE:"]
                    + [f"  {n}: registered {counts[n]}x by this branch" for n in doubled]
@@ -295,6 +298,30 @@ def self_test() -> int:
         got, msgs = check(d, "main")
         chk(1, got, "a name the branch adds TWICE is a collision with no base involved")
         chk(True, any("new_dup" in m for m in msgs), "...and the message names the doubled row")
+
+        # 3e. a row REMOVED here and written TWICE in a new family file: `-1/+2` of one name leaves two copies in the
+        # tree, and a set of freed NAMES forgives it (measured: the tree holds 2 copies while the added-lines
+        # comparison, the `n not in freed` suppression and `freed` itself all answer clean).
+        d = repo(tmpd, "moved_and_doubled")
+        (d / "cmake").mkdir()
+        (d / ROW_FILE).write_text("# base\n")
+        (d / "cmake/tests-family.cmake").write_text(
+            "add_test(NAME taken_row COMMAND true)\nadd_test(NAME taken_row COMMAND true)\n")
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(d), "commit", "-qm", "the row moves to a family file, written twice"], check=True)
+        got, msgs = check(d, "main")
+        chk(1, got, "a row REMOVED here and registered twice in a new family file is a collision (a freed NAME forgives it)")
+        chk(True, any("taken_row" in m for m in msgs), "...and the message names the moved row")
+
+        # 3f. a row PARKED as a comment beside its live copy is one registration, not two -- `main` carries four such
+        # comments (CMakeLists.txt:383, 649, 2354, 3230). Without the `#` skip in counted_row_names this is a false
+        # collision on a tree that configures, which is the phantom-duplicate trap this file's own docstring names.
+        d = repo(tmpd, "commented_duplicate")
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text()
+                                  + "# add_python_test(parked_row ${CMAKE_SOURCE_DIR}/x.py)  -- parked until x exists\n"
+                                  + "add_python_test(parked_row ${CMAKE_SOURCE_DIR}/x.py)\n")
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "a parked row and its live copy"], check=True)
+        chk(0, check(d, "main")[0], "a commented-out copy beside the live row is not a second registration")
 
         # 4. a name computed from a variable is not compared
         d = repo(tmpd, "variable_name")

@@ -578,6 +578,17 @@ add_python_test(iommu_dma_lifecycle_self ${CMAKE_SOURCE_DIR}/tools/diag/iommu_dm
 # runner names is a self-test nobody runs (tool_selftest_wired_check says so, and it said so
 # about this file in the PR's first build).
 add_python_test(loomc_pair_check_self ${CMAKE_SOURCE_DIR}/tools/ci/loomc_pair_check.py --self-test)
+# engine#3216: four tools carried a `--self-test` that no row ran, and the check that exists to catch exactly
+# that said green. It matched the tool's NAME anywhere in a reference source without requiring the self-test
+# marker on the same line, so `registry_build.py` read as wired off its `--check-gaps` rows while the eight arms
+# #3214 added ran nowhere; `census_counters_check.py` (wired only in census.yml for `--check`), `dupdef_check.py`
+# and `stale_expectations_check.py` were in the same state. Each row below is the missing half, and
+# tool_selftest_wired_check now reports "named only for ANOTHER flag" as its own class instead of counting it as
+# wired.
+add_python_test(registry_build_self ${CMAKE_SOURCE_DIR}/tools/registry_build.py --self-test)
+add_python_test(dupdef_check_self ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --self-test)
+add_python_test(stale_expectations_check_self ${CMAKE_SOURCE_DIR}/tools/ci/stale_expectations_check.py --self-test)
+add_python_test(census_counters_check_self ${CMAKE_SOURCE_DIR}/tools/ci/census_counters_check.py --self-test)
 # engine#2878: the fold tool is only useful if its output is something llama-hadamard.cpp can run,
 # and that is what this row checks; it had no runner, so tests_referenced named it.
 add_python_test(hadamard_fold_test ${CMAKE_SOURCE_DIR}/tests/hadamard_fold_test.py)

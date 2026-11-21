@@ -685,6 +685,11 @@ add_test(NAME pre_pr_checks_tree COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/pre-pr
 # cwd, and an out-of-tree build (`-B ~/.cache/…`) is then outside the work tree, where the runner exits 2 with "not
 # inside a git work tree" -- measured on a build dir under ~/.cache, where it took the two rows above down with it.
 set_tests_properties(pre_pr_checks_tree PROPERTIES RUN_SERIAL TRUE WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# ... and the two modes that row depends on are a contract, not prose: `--tree-only` must drop exactly the open-PR rows,
+# and `--base-optional` must turn a missing base into cannot-tell while still counting it. Two runs, ~2 s total on a
+# cached configure check (the tools are the cost, and they run either way in the row above).
+add_test(NAME pre_pr_checks_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pre_pr_checks_modes_test.sh)
+set_tests_properties(pre_pr_checks_modes PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 # engine#2992: the pre-merge twin of merged_tail_check -- a stale open branch deletes main's newer lines when it
 # merges, and the PR page shows a clean additive diff while it would do so. Self-test wired because
 # tools/ci/tool_selftest_wired_check.py requires a tool that carries one to be named here.

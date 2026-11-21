@@ -263,6 +263,12 @@ endif()
 message(STATUS "ONEBIT_HRX: HRX_ALLOW_NO_SVM gate in hrx-system: ${ONEBIT_HRX_ALLOW_NO_SVM}")
 
 set(ONEBIT_HRX_SERVER "${CMAKE_BINARY_DIR}/hrx/llama/bin/llama-server")
+# engine#3085: the suites' targets, empty unless the option is on (see BUILD_COMMAND below).
+set(_hrx_test_targets "")
+if(ONEBIT_HRX_BUILD_TESTS)
+    set(_hrx_test_targets test-hrx-ops hrx-ops-test)
+endif()
+
 ExternalProject_Add(llama_hrx
     SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/llama.cpp
     BINARY_DIR ${CMAKE_BINARY_DIR}/hrx/llama
@@ -280,7 +286,14 @@ ExternalProject_Add(llama_hrx
         "-DCMAKE_C_FLAGS=${ONEBIT_HRX_PATH_MAP_FLAGS}${ONEBIT_HRX_EXTRA_FLAGS}"
         "-DCMAKE_CXX_FLAGS=${ONEBIT_HRX_PATH_MAP_FLAGS}${ONEBIT_HRX_EXTRA_FLAGS}"
         ${_hrx_gpu_private_args}
-    BUILD_COMMAND ${_hrx_toolchain_env} ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-server llama-bench llama-perplexity
+    # engine#3085: ONEBIT_HRX_BUILD_TESTS=ON passes -DLLAMA_BUILD_TESTS=ON into the fork's configure, and that alone
+    # builds NOTHING -- BUILD_COMMAND names three targets and the suites are configured and never compiled, so the rows
+    # a lane is told to run ("build the HRX llama.cpp with its tests") do not exist after a successful build. The two
+    # suites are added here only when the option is on, so the default build is byte-for-byte the same work as before.
+    # They are separate executables from separate sources (`tests/test-hrx-ops.cpp` and `tests/hrx-ops-test.cpp` are
+    # different suites), which is why both are named.
+    BUILD_COMMAND ${_hrx_toolchain_env} ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-server llama-bench
+                  llama-perplexity ${_hrx_test_targets}
     INSTALL_COMMAND ""
     BUILD_ALWAYS ON
     USES_TERMINAL_BUILD ON)

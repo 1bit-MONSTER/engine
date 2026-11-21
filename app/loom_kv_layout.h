@@ -163,8 +163,19 @@ inline constexpr uint64_t kControlPositionOffset  = 0;  // decode: KV position; 
 inline constexpr uint64_t kControlGeneratedOffset = 4;  // decode: generated_count; prefill: position_base
 inline constexpr uint64_t kControlEosOffset       = 8;  // eos_token, or the sampling live-row count
 
-// Packet geometry, from packet.loom: the bank pair, then indices / policies / identities / sources / shape. Capacity is
-// a Loom SPECIALIZATION (range 2..2147483646, multiple of 2), so the allocation is fixed when the program is materialized.
+// Packet geometry, from packet.loom: the bank pair, then indices / policies / identities / sources / shape.
+//
+// WHO OWNS THE PACKET'S CAPACITY (open question 2, answered from the shipped sources rather than by preference): the
+// packet's capacity is NOT a specialization. `program/text/qwen3_8/epoch.loom:91-92` computes
+// `%metadata_bytes = buffer.length %metadata` and then `qwen38_packet_capacity(%metadata_bytes)`, i.e. the encode step
+// INFERS capacity from the allocation the caller passed, and the card's own encoder bounds it at
+// `range(%packet_capacity, 1, 524288)` (control.loom:2519,2551,3215). So the packet is caller-sized per request -- up to
+// the shipped ceiling -- while the ATTENTION CACHE capacity is a specialization fixed at materialization. The two roots
+// therefore do not have to move together: one attention-cache class can serve requests with different packet sizes.
+//
+// The motif's own bound is `range(2, 2147483646), multiple_of(2)`, so the binding limit is the shipped encoder's 524288,
+// which fixes the largest packet at 58 720 296 B (~56 MiB) -- the number an exporter budgets for.
+inline constexpr uint64_t kPacketCapacityCeiling = 524288;
 inline constexpr uint64_t kPacketFixedBytes  = 40;  // two mixed-input capacities after the shape block
 inline constexpr uint64_t kPacketStrideBytes = 112;
 inline constexpr uint64_t kPolicyRecordBytes = 24;  // f32 temperature, f32 top_p, i32 top_k, i32 flags, i64 seed

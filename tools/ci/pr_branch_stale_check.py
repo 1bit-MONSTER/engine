@@ -73,6 +73,20 @@ def advisory_exit(verdict):
     return verdict
 
 
+def pr_refs(pr, branch, base):
+    """[(remote ref to fetch, local ref to measure, label)] for ONE pull request: (head, base).
+
+    engine#3095: the head is fetched as `refs/pull/<N>/head`, not `refs/heads/<branch>`. A PR whose branch was deleted or
+    renamed after it was opened has no `refs/heads/<branch>` any more, while `refs/pull/<N>/head` exists for as long as the
+    PR does -- measured on main (`735a47a`) against the four PRs open at the time: three of four had `refs/heads` absent and
+    `refs/pull` present, so the gate answered cannot-tell (a 77 skip) for most of what it was asked to gate.
+    """
+    return [
+        (f"refs/pull/{int(pr)}/head:refs/remotes/origin/pr-{int(pr)}", f"origin/pr-{int(pr)}", "head"),
+        (f"{base}:refs/remotes/origin/{base}", f"origin/{base}", "base"),
+    ]
+
+
 def run(*a, cwd=None):
     r = subprocess.run(a, capture_output=True, text=True, cwd=cwd)
     return r.returncode, r.stdout, r.stderr
@@ -243,6 +257,18 @@ def self_test():
     chk(stale_finding(d.name, "mine") is None,
         "behind by ancestry but identical in content is NOT a finding")
 
+    # engine#3095: the per-PR gate fetched `refs/heads/<branch>`, which a PR whose branch was deleted or renamed no longer
+    # has -- three of the four PRs open on 2026-11-21 had `refs/heads` absent and `refs/pull` present, so the gate answered
+    # cannot-tell (77) for most of what it was asked to gate. `refs/pull/<N>/head` exists for the PR's whole life.
+    refs = pr_refs(42, "some-branch", "main")
+    chk(refs[0][0] == "refs/pull/42/head:refs/remotes/origin/pr-42",
+        "the head is fetched from refs/pull/<N>/head, which outlives the branch (engine#3095)")
+    chk(refs[0][1] == "origin/pr-42", "…and measured at the local ref it was fetched to")
+    chk(refs[1][0] == "main:refs/remotes/origin/main" and refs[1][1] == "origin/main",
+        "the base is still fetched and measured by name")
+    chk("refs/heads" not in refs[0][0],
+        "…and the branch name is NOT used as a fetch ref (the defect)")
+
     # engine#3082: a CONFLICTED merge cannot be measured, and the per-PR gate used to answer "removes nothing, rc 0" for
     # it -- because `stale_finding` returned None both for "level with the base" and for "could not look", and every
     # caller read None as clean. The two branches below edit the same line of the same file, one commit apart, so the
@@ -306,12 +332,17 @@ def main():
             cannot_tell(f"cannot read PR #{a.pr} (rc {rc}): {err.strip()[:200]}")
         info = json.loads(out)
         branch, base = info["headRefName"], info.get("baseRefName") or "main"
-        for ref in (f"{branch}:refs/remotes/origin/{branch}", f"{base}:refs/remotes/origin/{base}"):
-            rc, _o, err = run("git", "fetch", "-q", "origin", ref, cwd=root)
+        head_local = base_local = ""
+        for spec, local, label in pr_refs(a.pr, branch, base):
+            rc, _o, err = run("git", "fetch", "-q", "origin", spec, cwd=root)
             if rc != 0:
-                cannot_tell(f"cannot fetch {ref.split(':')[0]} (rc {rc}): {err.strip()[:120]}")
+                cannot_tell(f"cannot fetch the PR's {label} ({spec.split(':')[0]}, rc {rc}): {err.strip()[:120]}")
+            if label == "head":
+                head_local = local
+            else:
+                base_local = local
         try:
-            found = stale_finding(root, f"origin/{branch}", f"origin/{base}")
+            found = stale_finding(root, head_local, base_local)
         except CannotTell as e:
             pr_cannot_tell(a.pr, branch, str(e))
         if found is None:

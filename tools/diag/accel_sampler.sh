@@ -265,6 +265,17 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   ( unset ACCEL_SAMPLER_REPO; check_deployed "$d/cmp/live.sh" --against HEAD >/dev/null 2>&1 ); rc_norepo=$?
   [ "$rc_norepo" = 2 ] \
     || { echo "FAIL: --against with no ACCEL_SAMPLER_REPO must be 'cannot tell' (rc 2), got rc $rc_norepo -- a check that passes without a checkout is the bug"; fail=1; }
+  # ... and a WORKTREE is a checkout: `.git` is a file there, so a check that tests `-d $repo/.git` (my first version
+  # did) answers "cannot tell" for every lane that runs from a worktree -- which is the fleet's normal shape. Found by
+  # running the feature on this box, where the engine tree is a worktree.
+  if git -C "$d/cmp/repo" worktree add -q "$d/cmp/wt" HEAD 2>/dev/null; then
+    ( ACCEL_SAMPLER_REPO=$d/cmp/wt check_deployed "$d/cmp/live.sh" --against HEAD >/dev/null 2>&1 ); rc_wt=$?
+    [ "$rc_wt" = 1 ] \
+      || { echo "FAIL: --against must work from a WORKTREE ('.git' is a file there), got rc $rc_wt"; fail=1; }
+  else
+    echo "FAIL: could not create the worktree fixture for the --against arm"; fail=1
+  fi
+
   # ... and the no-argument contract is untouched: still a clean pass for a freshly installed copy.
   ( unset ACCEL_SAMPLER_REPO; check_deployed "$d/cmp/live.sh" >/dev/null 2>&1 ) \
     || { echo "FAIL: the no-argument check-deployed must keep its old contract (engine#3087 changed nothing by default)"; fail=1; }
@@ -485,7 +496,10 @@ check_deployed() {  # check-deployed [dest] [--against <ref>] -- rc 0 current, 1
     # The repo is named, never guessed: a checkout found by accident is the guess this lane keeps having to retract. Absent
     # `ACCEL_SAMPLER_REPO` the honest answer is "cannot tell", which is what a reader can act on.
     local repo=${ACCEL_SAMPLER_REPO:-}
-    if [ -z "$repo" ] || [ ! -d "$repo/.git" ]; then
+    # `[ -d "$repo/.git" ]` is wrong for the two shapes the fleet actually runs from: a WORKTREE and a submodule both
+    # have `.git` as a FILE pointing at the real gitdir, and this check would answer "cannot tell" on exactly those.
+    # Ask git instead -- it is the thing that knows whether a directory is a checkout.
+    if [ -z "$repo" ] || ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
       echo "check-deployed: cannot tell: --against $against needs ACCEL_SAMPLER_REPO to name a git checkout (got '${repo:-unset}')" >&2
       return 2
     fi

@@ -152,8 +152,18 @@ for r in $(seq 1 "$repeats"); do
     dump_layers=$([ "$r" = 1 ] && echo 1 || echo 0)
     serve "$d" $((18150 + r - 1)) || exit 1
 done
+# engine#3196: the integer arm's head is its own ladder (int8 activations, 8192-wide vocabulary blocks,
+# q4nx_forward.cpp's lm_head_i8_), and that ladder is only a like-for-like twin of a DEVICE head. On a target that
+# does not claim `lm_head` the device computes it in f32 on the host -- its own log says so -- and then the logit
+# comparison is about the two HEADS, not the body (measured on a 14B container, npu-kernels#115: the integer arm's
+# logit vector was ~0.3x the other two and its argmax flipped on the shortest prompt, while a third f32 arm agreed
+# with the device). So take the ladder out only in that case; where the device does have a head, the ladder stays and
+# the run still compares the device's head against its integer twin (engine#1808's subject).
+head_off=''
+grep -q 'lm head: on the host' "$out"/dev*.log 2>/dev/null && head_off=NPU_I8_HEAD_OFF=1
+[ -n "$head_off" ] && echo "  note: the device's head runs on the host, so both arms use it and this run says nothing about the int8 head ladder (NPU_I8_HEAD_OFF=1)"
 dump_layers=1   # the host arm always dumps: it is the reference the comparison reads
-echo "host   :"; serve "$out/host" 18151 NPU_INFER_HOST_GEMM=i8 || exit 1
+echo "host   :"; serve "$out/host" 18151 NPU_INFER_HOST_GEMM=i8 ${head_off:+"$head_off"} || exit 1
 
 bad=0 n=0
 # Every device run must match the host; then the repeats must match each other. Comparison loops over the run dirs actually made.

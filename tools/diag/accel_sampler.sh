@@ -185,10 +185,28 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   rm -f "$d/nodefault.sh" "$d/nodefault.sh.provenance"
   install_sampler "$0" >/dev/null 2>&1 && { echo "FAIL: install with no destination must refuse (it used to write to the live path)"; fail=1; }
   [ -e "$d/nodefault.sh" ] && { echo "FAIL: install with no destination wrote something anyway"; fail=1; }
-  # ... and a destination that is given gets its commit from the checkout, not `unknown`
-  install_sampler "$0" "$d/derived.sh" >/dev/null 2>&1
-  grep -q '^commit=unknown$' "$(provenance_file "$d/derived.sh")" \
-    && { echo "FAIL: install recorded commit=unknown while running inside a git checkout"; fail=1; }
+  # ... and a destination that is given gets its commit from the checkout ITS SOURCE is in, not `unknown` (engine#3069).
+  # The source has to be a path this fixture OWNS. The original arm installed from `$0`, so it passed inside a repo checkout
+  # and FAILED on the deployed copy in ~/.cache -- where `unknown` is the correct answer and where a lane is most likely to
+  # run this at all. A test may not assert anything about where its caller happens to be standing.
+  mkdir -p "$d/repo"
+  git -C "$d/repo" init -q
+  git -C "$d/repo" -c user.email=selftest@example.invalid -c user.name=selftest commit -q --allow-empty -m fixture
+  cp "$0" "$d/repo/accel-sampler.sh"
+  install_sampler "$d/repo/accel-sampler.sh" "$d/derived.sh" >/dev/null 2>&1
+  grep -qE '^commit=[0-9a-f]{7,}$' "$(provenance_file "$d/derived.sh")" \
+    || { echo "FAIL: install did not take the commit from the checkout its source lives in (got '$(sed -n 's/^commit=//p' "$(provenance_file "$d/derived.sh")" 2>/dev/null)')"; fail=1; }
+  # The mirror, so both directions are pinned: a source outside any checkout records `unknown`, because that IS the truth
+  # there -- the failing line above used to be this case, misread as a defect.
+  mkdir -p "$d/plain"
+  cp "$0" "$d/plain/accel-sampler.sh"
+  if git -C "$d/plain" rev-parse --short=12 HEAD >/dev/null 2>&1; then
+    echo "SKIP: $d/plain resolves as a checkout, so the mirror arm cannot discriminate here"
+  else
+    install_sampler "$d/plain/accel-sampler.sh" "$d/plain-derived.sh" >/dev/null 2>&1
+    grep -q '^commit=unknown$' "$(provenance_file "$d/plain-derived.sh")" \
+      || { echo "FAIL: a source outside any checkout must record commit=unknown"; fail=1; }
+  fi
   # ask 1 on #2815: `check-deployed` with no argument must look at the DEPLOYED copy, not at the checkout it was run from.
   # ask 1 on #2815 needs an arm that DISCRIMINATES the two paths: a provenance-less copy is rc 2 either way, so the arm
   # that pins the fix is one where the deployed copy is valid and `$0` is not. Reverting the default to `$0` fails these.

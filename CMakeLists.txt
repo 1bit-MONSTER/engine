@@ -1127,6 +1127,9 @@ target_include_directories(gguf_meta_test PRIVATE app)
 add_test(NAME gguf_meta COMMAND gguf_meta_test)
 # serve's memory admission (app/mem_admit.h, docs/serve.md "Will it fit?"): KV/state sizes against
 # HRX0 logs, the box readings on a fake /proc and /sys; header only, runs in CI.
+add_executable(serve_foreign_ready_test tests/serve_foreign_ready_test.cpp)
+target_include_directories(serve_foreign_ready_test PRIVATE app)
+add_test(NAME serve_foreign_ready COMMAND serve_foreign_ready_test)
 add_executable(mem_admit_test tests/mem_admit_test.cpp)
 target_include_directories(mem_admit_test PRIVATE app)
 add_test(NAME mem_admit COMMAND mem_admit_test)

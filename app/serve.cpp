@@ -61,6 +61,7 @@
 // no Vulkan, ROCm, Metal/MLX, ZINC or CUDA route: on the GPU it is HRX with HIP kernels.
 // What HRX does not run, serve declines with a clear message, and Lemonade serves it with
 // its own backends.
+#include "serve_foreign.h"
 #include "serve.h"
 
 #include "built_path.h"
@@ -559,10 +560,11 @@ static bool parse_backend_ready_port(const std::string& line, int& port) {
 // announces itself in llama.cpp's own words ("listening on http://..."), while a `1bit serve` child prints the format
 // parse_backend_ready_port reads. Recognizing the former lets the wait refuse at once, instead of waiting out a grace
 // sized for a child that is loading.
-static bool looks_like_foreign_ready(const std::string& line) {
-    if (line.compare(0, 5, "1bit ") == 0) return false;  // our own line, handled by parse_backend_ready_port
-    return line.find("listening on") != std::string::npos && line.find("http://") != std::string::npos;
-}
+// engine#3171: the predicate and the "is this line ours" rule live in app/serve_foreign.h so the nested case can be
+// pinned by a device-free test; this TU keeps only the wiring.
+using onebit::serve::foreign_refuses;
+using onebit::serve::is_own_line;
+using onebit::serve::looks_like_foreign_ready;
 
 #ifdef _WIN32
 // Windows: CreateProcess into a job object that kills its processes when its last handle
@@ -701,7 +703,7 @@ public:
                         last_line->store(std::chrono::steady_clock::now().time_since_epoch().count(),
                                          std::memory_order_relaxed);
                         int parsed_port = 0;
-                        if (line.compare(0, 5, "1bit ") == 0) own->store(true, std::memory_order_relaxed);
+                        if (is_own_line(line)) own->store(true, std::memory_order_relaxed);
                         if (parse_backend_ready_port(line, parsed_port)) learned->store(parsed_port);
                         // engine#3130 follow-up: a child that is talking is not the mistake the grace is for.
                         else if (looks_like_foreign_ready(line)) foreign->store(true, std::memory_order_relaxed);
@@ -796,7 +798,7 @@ public:
                 // grace exists for, and it says so at once; (b) a child that has printed NOTHING for the grace is not a
                 // server; (c) a child that is printing lines is loading, and wait_ready's own timeout (900 s for a model
                 // load) is the budget for it -- a number sized for (a) must not kill a 27B mid-load.
-                if (foreign_ready_->load() && !own_line_->load()) {
+                if (foreign_refuses(foreign_ready_->load(), own_line_->load())) {
                     std::fprintf(stderr,
                                  "1bit serve: pid %d announced a port in a format `1bit serve` does not print; this launch "
                                  "was given `--port 0`, so the child must report the port it bound (engine#3130)\n",

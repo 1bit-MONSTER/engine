@@ -113,6 +113,14 @@ if start "$scratch/name.log" -m "$scratch/plain.gguf" --loom-routes "$scratch/by
     code=$(curl -s -o /dev/null -w '%{http_code}' "$api/v1/chat/completions" -H 'Content-Type: application/json' \
         -d '{"model": "plain", "messages": [{"role": "user", "content": "hi"}], "mirostat": 2}')
     check "a field loom-serve does not know gets loom-serve's own 400 ($code)" '[ "$code" = 400 ]'
+    # engine#3254: the same refusal on a STREAMED request. loom-serve answers a refused request as one plain-JSON
+    # object; the streamed path used to re-frame that as `data: {"error": …}` under serve's own 200, so a delta parser
+    # counted zero pieces and the message was unreadable (this is what the gate's proxy arm reported as `pieces=0`).
+    code=$(curl -s -o "$scratch/mirostream.json" -w '%{http_code}' "$api/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d '{"model": "plain", "stream": true, "messages": [{"role": "user", "content": "hi"}], "mirostat": 2}')
+    check "a streamed request loom-serve refuses keeps loom-serve's status, not serve's 200 ($code)" '[ "$code" = 400 ]'
+    check "and the refusal is the JSON body, not an SSE event no client reads" \
+        'grep -q "unsupported chat field" "$scratch/mirostream.json" && ! grep -q "^data:" "$scratch/mirostream.json"'
     code=$(curl -s -o /dev/null -w '%{http_code}' "$api/v1/completions" -H 'Content-Type: application/json' -d '{"prompt": "hi"}')
     check "/v1/completions answers 501 on the Loom route ($code)" '[ "$code" = 501 ]'
     check "the entry's environment reached loom-serve" \

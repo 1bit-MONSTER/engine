@@ -700,6 +700,10 @@ add_python_test(pr_branch_stale_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_branc
 add_python_test(self_test_flag ${CMAKE_SOURCE_DIR}/tests/self_test_flag_test.py)
 
 add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
+# engine#L5 (LOOM-GPU-SWITCH): the Loom toolchain pin is three facts that are only true together -- the hrx-system
+# commit, the hrx_loom version that commit declares, and the hrx-loom-library catalog commit the same file names.
+# The self-test arms the agreement and the cannot-tell; the live check runs where a clone of the repo exists.
+add_python_test(loom_pin_check_self ${CMAKE_SOURCE_DIR}/tools/ci/loom_pin_check.py --self-test)
 # engine#3103: hrx2kineto.py gained a --self-test (its per-kernel ranking's FLOP attribution and its shape-log join),
 # and a self-test no runner names is a self-test nobody runs -- tool_selftest_wired_check and tests_referenced both said
 # so on the PR's first build, which is the same failure the loomc pair check above records.

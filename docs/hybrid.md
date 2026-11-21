@@ -29,6 +29,11 @@ repository (docs/npu.md). Without a provider, `--device hybrid` is `--device hrx
 In a build without HRX the decoder is the same llama-server on the CPU, so the route runs (and is
 tested) on any machine.
 
+The GPU route is moving to Loom per model ([hrx.md](hrx.md#direction-loom-on-the-gpu)). Handing
+the provider's KV cache to Loom decode instead of the HRX llama-server is tracked in
+[#3157](https://github.com/1bit-MONSTER/engine/issues/3157); until that lands, hybrid decodes on the
+llama-server as described here.
+
 ## What happens per request
 
 1. **Template and tokenize on the backend.** For `/v1/chat/completions` serve asks the llama-server

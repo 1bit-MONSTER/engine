@@ -108,7 +108,8 @@ llama.cpp libraries, which link it when TheRock's amdclang builds them)
 HRX, HIP Runtime Extended (third_party/hrx-system)
   https://github.com/ROCm/hrx-system
   Copyright the HRX authors (Advanced Micro Devices, Inc.)
-  License: Apache-2.0
+  License: Apache-2.0. It also carries Loom, the HRX kernel and model-program compiler (loomc),
+  which the GPU route is moving to (see "Loom" below).
 
 Lemonade (third_party/lemonade)
   https://github.com/1bit-MONSTER/lemonade
@@ -252,3 +253,29 @@ Hyperloom (hyperloom-inference-optimizer 1.0.0, AMD's agentic inference optimize
   Copyright (c) 2026 Advanced Micro Devices, Inc.
   License: MIT. tools/hyperloom/ patches a local install (adds a gfx1151 GPU type,
   lets agents use the claude CLI login) by matching short lines of its source.
+
+-------------------------------------------------------------------------------
+Loom on the GPU (in progress; not built into or shipped with any release yet)
+-------------------------------------------------------------------------------
+
+The engine's GPU route is moving to Loom model programs on HRX, served by loom-serve
+behind 1bit serve, one model at a time once it passes the gate in engine#3158
+(docs/hrx.md, "Direction: Loom on the GPU"). Thanks to AMD's HRX and Loom developers,
+and to loom-fun (Jeremy Fowers and Daniel Holanda) for the model programs and cards.
+
+hrx-loom-library (https://github.com/ROCm/hrx-loom-library)
+  Copyright (c) 2026 AMD ROCm(TM) Software
+  License: MIT. The example kernel corpus for the HRX Loom compiler.
+
+loom-skills (https://github.com/loom-fun/loom-skills)
+  Copyright (c) 2026 Loom Fun contributors
+  License: MIT. Skills to build, optimize, run and share Loom programs for LLMs on Strix Halo;
+  used to write Loom programs for models that have no loom-fun card.
+
+weaver (https://github.com/loom-fun/weaver)
+  Copyright (c) 2026 loom-fun contributors
+  License: MIT. A CLI that ports, optimizes and serves Hugging Face LLMs on Loom.
+
+loom-fun model cards (https://github.com/loom-fun, https://huggingface.co/loom-fun)
+  The Loom programs published per model; each model's weights keep their own licenses.
+  They are downloaded by the user, not redistributed.

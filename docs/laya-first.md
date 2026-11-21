@@ -20,6 +20,11 @@ Owner (2026-11-03): Lemonade starts with no model loaded, and "when we send the 
 laya router making that decision and picking our specific models that we have on hf. we need to own that space
 completely hip kernels and our npu engine."
 
+GPU update (owner, 2026-11-21): the GPU route moves to Loom, per model, once a model passes the
+Loom gate ([#3158](https://github.com/1bit-MONSTER/engine/issues/3158),
+[hrx.md](hrx.md#direction-loom-on-the-gpu)); the NPU engine stays. The `hrx` device below still
+names the GPU, whichever route serves the model on it. No model has moved yet.
+
 **Answer in one paragraph.** Our Lemonade fork already routes a request through a policy engine
 ([`collection.router`](https://github.com/1bit-MONSTER/lemonade/blob/main/docs/dev/router-policy.md)): ordered rules over conditions pick a candidate model, and the
 decision is reported on the response. What is missing for the cold first request is four things, and none of them is a
@@ -145,7 +150,7 @@ with `--laya-first FILE`:
 |---|---|
 | `model` | the catalogue id the router's `route_to` names (so a pulled row is an ordinary Lemonade model) |
 | `hf_repo` + `file` | what to pull when the row is not on disk; a Q4NX row names no `file` and pulls the whole directory (`1bit-MONSTER/Qwen3.6-35B-A3B-NPU`) |
-| `device` | `hrx` (our HIP kernels), `npu` (our NPU engine, Q4NX), `hybrid` (`--device hybrid --prefill-provider <NPU route>`, [hybrid.md](hybrid.md)), or `auto`; it becomes the candidate's `recipe_options.onebit_backend`, so `1bit serve` still makes the final check |
+| `device` | `hrx` (the GPU: the llama.cpp route with our HIP kernels today, Loom per model once it passes the gate), `npu` (our NPU engine, Q4NX), `hybrid` (`--device hybrid --prefill-provider <NPU route>`, [hybrid.md](hybrid.md)), or `auto`; it becomes the candidate's `recipe_options.onebit_backend`, so `1bit serve` still makes the final check |
 | `on_busy` | optional: the device to fall back to when the GPU is saturated or hot, with the condition that triggers it (see "Device: HRX by default" below). Absent means never fall back |
 | `ctx` | the candidate's `ctx_size` |
 

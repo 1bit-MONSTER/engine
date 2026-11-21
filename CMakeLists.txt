@@ -973,6 +973,16 @@ add_dependencies(onebit npu_token_limit_test)
 # .github/workflows/ci.yml, and a PR that edits a workflow cannot be merged by a token without the `workflow` scope.
 add_dependencies(onebit serve_degenerate_test)
 
+# engine#3171: what one line of a backend's stderr means to wait_ready, as a table. The decision only runs for a
+# backend launched with `--port 0` (the `--laya-models` rail, whose e2e rows skip in CI without a checkpoint), so no
+# e2e row can reach it -- and both of this week's serve.cpp regressions were in this decision with no row that could
+# fail. Built with `onebit` for the same reason serve_degenerate_test is: a test target of its own would need a line in
+# ci.yml's --target list, and a workflow edit cannot be pushed by a token without the `workflow` scope (engine#3131).
+add_executable(serve_backend_ready_test tests/serve_backend_ready_test.cpp)
+target_include_directories(serve_backend_ready_test PRIVATE app)
+add_dependencies(onebit serve_backend_ready_test)
+add_test(NAME serve_backend_ready COMMAND serve_backend_ready_test)
+
 add_executable(http_guard_test tests/http_guard_test.cpp)
 target_include_directories(http_guard_test PRIVATE app)
 # engine#2482: the test starts a real httplib server on loopback, the entry point the 413 came through.

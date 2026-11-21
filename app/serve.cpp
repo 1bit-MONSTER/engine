@@ -62,6 +62,7 @@
 // What HRX does not run, serve declines with a clear message, and Lemonade serves it with
 // its own backends.
 #include "serve.h"
+#include "serve_backend_ready.h"
 
 #include "built_path.h"
 
@@ -554,14 +555,14 @@ static bool parse_backend_ready_port(const std::string& line, int& port) {
     return true;
 }
 
-// engine#3130 (follow-up to #3164): a readiness line in ANOTHER server's format. The grace that bounds a silent child
-// must not bound a child that is talking: `--llama-server llama-server` is the mistake the grace exists for, and it
-// announces itself in llama.cpp's own words ("listening on http://..."), while a `1bit serve` child prints the format
-// parse_backend_ready_port reads. Recognizing the former lets the wait refuse at once, instead of waiting out a grace
-// sized for a child that is loading.
-static bool looks_like_foreign_ready(const std::string& line) {
-    if (line.compare(0, 5, "1bit ") == 0) return false;  // our own line, handled by parse_backend_ready_port
-    return line.find("listening on") != std::string::npos && line.find("http://") != std::string::npos;
+// engine#3130 (follow-up to #3164): a readiness line in ANOTHER server's format. The decision moved to
+// app/serve_backend_ready.h for engine#3171, because it needs one fact this function cannot see on its own -- whether
+// the child has ALREADY spoken in `1bit`'s format. A `--laya-models` backend is a `1bit serve`, every Child passes its
+// child's stderr through unchanged, so the outer serve sees its grandchild's llama.cpp line BEFORE the nested child
+// prints its own; refusing on the foreign line alone refused a working launch.
+static bool looks_like_foreign_ready(const std::string& line, bool own_seen) {
+    return onebit::serve::backend_ready::verdict(line, own_seen) ==
+           onebit::serve::backend_ready::Verdict::ForeignReady;
 }
 
 #ifdef _WIN32
@@ -683,7 +684,7 @@ public:
             ::close(err[1]);
             // detached: a backend stuck in the kernel keeps the pipe open, and serve must still exit
             std::thread([fd = err[0], tail = tail_, on_line = std::move(on_line), learned = learned_port_,
-                         last_line = last_line_ns_, foreign = foreign_ready_] {
+                         last_line = last_line_ns_, foreign = foreign_ready_, own = own_line_] {
                 char buf[4096];
                 for (;;) {
                     const ssize_t n = ::read(fd, buf, sizeof buf);
@@ -702,8 +703,12 @@ public:
                                          std::memory_order_relaxed);
                         int parsed_port = 0;
                         if (parse_backend_ready_port(line, parsed_port)) learned->store(parsed_port);
+                        // engine#3171: remember that this child speaks our format, so its GRANDCHILD's line is not
+                        // mistaken for a foreign backend. Set before the foreign check below, so a readiness line in
+                        // the same read is not misread as foreign.
+                        if (line.compare(0, 5, "1bit ") == 0) own->store(true, std::memory_order_relaxed);
                         // engine#3130 follow-up: a child that is talking is not the mistake the grace is for.
-                        else if (looks_like_foreign_ready(line)) foreign->store(true, std::memory_order_relaxed);
+                        else if (looks_like_foreign_ready(line, own->load())) foreign->store(true, std::memory_order_relaxed);
                     }
                 }
                 ::close(fd);
@@ -795,7 +800,9 @@ public:
                 // grace exists for, and it says so at once; (b) a child that has printed NOTHING for the grace is not a
                 // server; (c) a child that is printing lines is loading, and wait_ready's own timeout (900 s for a model
                 // load) is the budget for it -- a number sized for (a) must not kill a 27B mid-load.
-                if (foreign_ready_->load()) {
+                // engine#3171: only while the child has never spoken our format -- a nested `1bit serve` does, and its
+                // grandchild's llama.cpp line arrives first (measured: see app/serve_backend_ready.h).
+                if (foreign_ready_->load() && !own_line_->load()) {
                     std::fprintf(stderr,
                                  "1bit serve: pid %d announced a port in a format `1bit serve` does not print; this launch "
                                  "was given `--port 0`, so the child must report the port it bound (engine#3130)\n",
@@ -892,6 +899,9 @@ private:
     // from a binary that will never print one. Both are written by the detached thread, hence shared and atomic.
     std::shared_ptr<std::atomic<long long>> last_line_ns_ = std::make_shared<std::atomic<long long>>(0);
     std::shared_ptr<std::atomic<bool>> foreign_ready_ = std::make_shared<std::atomic<bool>>(false);
+    // engine#3171: has this child spoken in `1bit`'s format at all? A nested `1bit serve` does (its own readiness
+    // line), and then a later llama.cpp-format line can only be its grandchild's, not this child's format.
+    std::shared_ptr<std::atomic<bool>> own_line_ = std::make_shared<std::atomic<bool>>(false);
     int port_;
     std::string ready_path_;
     std::shared_ptr<LineTail> tail_ = std::make_shared<LineTail>();

@@ -20,7 +20,9 @@ The models the engine is checked against, with the number each one measured on t
 at the current pins. One row is one model file on one route; the standard each number was taken in
 is in [bench.md](bench.md), and the routes are described in [hrx.md](hrx.md) and [npu.md](npu.md).
 Every ggml weight type runs on HRX, including NVFP4, Q2_0, MXFP4 and the ternary TQ, PTQ and PQ
-formats.
+formats. Every HRX row below is the llama.cpp route. The GPU route is moving to Loom one model at a
+time, once a model passes an A/B and accuracy gate; no model has moved yet
+([hrx.md](hrx.md#direction-loom-on-the-gpu)).
 
 | model | file, route | measured |
 |---|---|---|

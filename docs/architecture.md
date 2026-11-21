@@ -25,8 +25,13 @@ the README is the short version.
 
 ## Routes
 
-- **HRX on the Radeon iGPU** ([hrx.md](hrx.md)): AMD's ggml-hrx with its Loom kernels and our HIP
-  kernels, the engine's one GPU route. Every ggml weight type runs on HRX, including NVFP4, Q2_0,
+- **HRX on the Radeon iGPU** ([hrx.md](hrx.md)): the engine's one GPU runtime. The GPU route is
+  moving to **Loom**: AMD's Loom model programs on HRX, served by `loom-serve` behind `1bit serve`,
+  one model at a time once it passes an A/B and accuracy gate
+  ([#3158](https://github.com/1bit-MONSTER/engine/issues/3158),
+  [hrx.md](hrx.md#direction-loom-on-the-gpu)). No model has moved yet. Today every GPU model runs on
+  the llama.cpp route: AMD's ggml-hrx with its Loom kernels and our HIP kernels, which stays as the
+  fallback for models without a Loom program and gets no new kernel work. On that route, every ggml weight type runs on HRX, including NVFP4, Q2_0,
   MXFP4 and the ternary TQ, PTQ and PQ formats. For a GGUF, Lemonade starts the engine's
   `llama-server` directly, one HTTP hop
   ([#475](https://github.com/1bit-MONSTER/engine/pull/475),
@@ -38,7 +43,8 @@ the README is the short version.
 - **The NPU engine** on the XDNA 2 NPU, on our own NPU runtime with full-ELF kernel sets:
   correctness first, speed next ([npu.md](npu.md)).
 - **Hybrid**: the prompt on the NPU engine, the tokens on HRX. `1bit serve --device hybrid` hands
-  the prompt's KV cache from a prefill provider to the HRX llama-server ([hybrid.md](hybrid.md)).
+  the prompt's KV cache from a prefill provider to the HRX llama-server ([hybrid.md](hybrid.md));
+  handing it to Loom decode instead is [#3157](https://github.com/1bit-MONSTER/engine/issues/3157).
   The NPU and the GPU run at the same time; the measured cost of a busy GPU to the NPU's weight
   stream is recorded there.
 - **ONNX Runtime**, linked in-process behind `-DONEBIT_ORT`, with our own execution provider that
@@ -59,7 +65,7 @@ Lemonade serves them with its own backends and builds ([lemonade.md](lemonade.md
 ## Checked on the hardware
 
 Every HRX pin change and every PR labelled `hw-gate` passes the hardware gate on Strix Halo before
-merge: it builds our HIP kernels into the server as the release does, runs kernel tests, known
+merge: it builds our HIP kernels into the fallback llama.cpp server as the release does, runs kernel tests, known
 answers, KLD against the release pin and long-prompt needles, and checks that every graph of every
 gate model is on the GPU ([#478](https://github.com/1bit-MONSTER/engine/pull/478),
 [#484](https://github.com/1bit-MONSTER/engine/pull/484), [hw-gate.md](hw-gate.md)). The runtime
@@ -83,8 +89,14 @@ carries the branch name and the derived data the checks expect ([releases.md](re
 
 ## Direction
 
-HRX with our HIP kernels, plus the NPU engine, embedded into Lemonade rather than Lemonade embedded
-into the engine.[^geramyl] HRX met the decode gates in
+HRX on the GPU, moving to Loom model programs, plus the NPU engine, embedded into Lemonade rather
+than Lemonade embedded into the engine.[^geramyl] On 2026-11-21 the owner moved the GPU route to
+Loom, because straight Loom beat our llama.cpp fork with its HIP kernels on every model compared on
+strixhalo (Ryzen AI MAX+ 395, `gfx1151`). Each model moves only after the gate in
+[#3158](https://github.com/1bit-MONSTER/engine/issues/3158); coverage is
+[#3156](https://github.com/1bit-MONSTER/engine/issues/3156). The llama.cpp fork and the HIP kernels
+stay as the fallback, with no new kernel work. The NPU engine, the hybrid route and the one-binary
+image do not change. HRX met the decode gates in
 [RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213), which removed the engine's
 Vulkan and ROCm builds. ZAYA1-8B (Zyphra) runs from our llama.cpp on HRX at about 90 tok/s decode
 in Q4_K_M, matching transformers. Zyphra's Zamba, Zamba2 and BlackMamba ran only on the removed

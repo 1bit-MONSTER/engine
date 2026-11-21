@@ -75,10 +75,10 @@ check "every row --list --tree-only names actually ran (a swallowed row is not a
 # ...and the set comparison above is SELF-CONSISTENT with the code under test: a `continue` that swallows a row drops it
 # from `--list` too, so `listed` and `seen` shrink together and the two arms stay green. Measured: that mutant (cl-review's,
 # applied verbatim) made this file report `ok` while one check had vanished from the run. So the expected SIZE is a
-# literal, taken from the repository the way the runner's own self-test takes 17/15: a dropped row cannot hide behind a
+# literal, taken from the repository the way the runner's own self-test takes 19/17: a dropped row cannot hide behind a
 # second reading of the same broken function.
-check "--list --tree-only still names 16 rows (a literal, not a second reading of this code)" \
-      '[ "$(printf "%s\n" "$listed" | grep -c .)" -eq 16 ]'
+check "--list --tree-only still names 17 rows (a literal, not a second reading of this code)" \
+      '[ "$(printf "%s\n" "$listed" | grep -c .)" -eq 17 ]'
 # ...and the TOTAL, which is the arm #3145 arrived at independently 24 seconds after this branch (crediting it here
 # because its reasoning is the better statement of the same property, and it catches one thing mine does not): a filter
 # that drops a row it never announced changes this number and nothing else; a row that prints TWO lines changes it too.

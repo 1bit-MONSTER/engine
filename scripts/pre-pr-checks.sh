@@ -173,13 +173,27 @@ for c in "${checks[@]}"; do
         printf 'skip  %-42s %s\n' "$name" "$last"
         skipped=$((skipped + 1)); continue
     fi
+    if [ $rc -eq 2 ]; then
+        # 2 is the repo's other cannot-tell code, and the loss checks answer it in a shallow clone (engine#3107
+        # makes `guard_loss_check` and `registration_loss_check` refuse rather than false-green). A row that
+        # cannot look is a skip with its own reason, not this PR's failure -- the same rule as 77 above.
+        # EXCEPT argparse: a wrong flag in a row here also exits 2, and a broken row must stay red, so the
+        # usage-error shape is matched on the tool's own output and left to the FAIL branch below.
+        case "$out" in
+            *usage:*error:*) ;;
+            *)
+                printf 'skip  %-42s %s\n' "$name" "$last"
+                skipped=$((skipped + 1)); continue ;;
+        esac
+    fi
     if [ $rc -eq 0 ]; then
         # `submodule_pin_check --check` exits 0 having compared NOTHING when submodules are declared but
         # none is checked out -- `0 submodule(s) at their pinned commit, N not initialised` -- which would
         # print `ok` for a check that ran no comparison, the shape this script exists to stop. Matched on
         # the tool's own summary rather than re-deriving the condition, because the tool is the thing that
         # knows. Its OTHER "nothing to compare" case, `no submodules reported - cannot tell, and that is not
-        # a pass`, exits 2 and is left to fail: the tool already refuses to call that a pass.
+        # a pass`, exits 2 -- and since engine#3116 that is a skip with the tool's own reason (it still does
+        # not read as a pass; the summary counts it).
         # `--require-initialised` is where a release build turns this one into a failure.
         case "$last" in
             "submodule_pin: 0 submodule(s) at their pinned commit, "*)

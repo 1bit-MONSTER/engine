@@ -49,7 +49,7 @@ def cannot_tell(why):
     """Exit 2, never 1: an unreadable queue is not a finding and not a pass (engine#2992 review).
 
     Under `--advisory` it exits 77 instead, which is what the caller counts as a visible SKIP. The flag's own help and
-    `scripts/pre-pr-checks.sh` (which maps 77 to `skip` and everything else to a failure) both promise that, but every
+    `scripts/pre-pr-checks.sh` (which maps 77 -- and, since engine#3116, 2 -- to `skip`) both promise that, but every
     `cannot_tell` raised early used to bypass the end-of-run mapping and fail a lane's pre-PR gate for a condition it
     could not see -- a truncated list, an unfetchable ref, or (engine#3076) a shallow clone. One place decides it now.
     """

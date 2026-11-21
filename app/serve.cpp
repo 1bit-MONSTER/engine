@@ -2322,6 +2322,14 @@ int serve_models(const Options& o) {
 #endif
 
 int serve_child(const Options& given) {
+    // engine#3130: which binary is US. Our own serve reports the port it bound (`--port 0`), a foreign child cannot, so
+    // only our own child is asked to (engine#3171's refusal covers a launch that gets that wrong).
+    std::string self_path;
+    {
+        std::error_code ec;
+        self_path = fs::read_symlink("/proc/self/exe", ec).string();
+        if (ec) self_path.clear();
+    }
     Options o = given;
     if (hadamard_q4_0(o.model))
         throw std::runtime_error(o.model + " is an H32 file (onebit.hadamard_q4_0, a Hadamard-rotated Q4_0): the engine "
@@ -2421,7 +2429,14 @@ int serve_child(const Options& given) {
         if (laya) {
             for (const std::string& dev : gguf_devices()) {
                 try {
-                    backends.push_back(launch_for(o, dev, free_port()));
+                    // engine#3130: no port is chosen and released before our own serve binds (engine#1070's race); a
+                    // foreign child keeps free_port(), because it cannot tell us what it bound.
+                    Launch launched = launch_for(o, dev, self_path.empty() ? free_port() : 0);
+                    if (!self_path.empty() && launched.argv[0] != self_path) {
+                        launched.port = free_port();
+                        set_port_arg(launched.argv, launched.port);
+                    }
+                    backends.push_back(std::move(launched));
                     laya_devices.push_back(dev);
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "1bit serve: laya: %s is not a candidate: %s\n", dev.c_str(), e.what());
@@ -3047,6 +3062,8 @@ int serve_child(const Options& given) {
                 std::fprintf(stderr, "1bit serve: backend %zu did not become ready\n", i);
             return 1;
         }
+        // engine#3130: a launch that passed `--port 0` learns the row's port from the child once it is ready.
+        if (i < backends.size() && backends[i].port == 0) backends[i].port = children[i]->port();
     }
     // one synthetic request per backend, now that it is ready: the first client request would otherwise pay
     // the one-time per-shape cost (see warm_backend)

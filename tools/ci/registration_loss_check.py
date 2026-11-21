@@ -153,6 +153,18 @@ def check(root: pathlib.Path, base: str, head: str | None = None) -> int:
     base_sha = subprocess.run(["git", "-C", str(root), "merge-base", base, head or "HEAD"],
                               capture_output=True, text=True, check=False).stdout.strip()
     at_base = at_rev(root, base_sha) if base_sha else {}
+    # engine#3114: NO merge base is a cannot-tell, not "everything is stale". The classification below is BY the merge base
+    # -- its own comment says a row at the merge base and not at the head was deleted, and anything else is stale -- so with
+    # an empty one every lost row lands in `stale` and the run says "nothing is at risk". Measured in a FULL clone with two
+    # orphan roots: `git merge-base base other` is empty, `--is-shallow-repository` is false (so the shallow guard #3107
+    # added does not fire), and the tool printed "they are absent from its merge base too" -- a statement about a
+    # measurement that never happened -- with rc 1 only because that merge happened to conflict. A clean one would have
+    # answered 0. The histories are unrelated; a rebase is not even the remedy.
+    if not base_sha:
+        print(f"registration_loss: no merge base between {base} and {head or 'the working tree'}: the histories are "
+              f"unrelated, so a row that is missing cannot be classified as deleted by this branch or as stale -- "
+              f"cannot tell, and that is not a pass", file=sys.stderr)
+        return 2
     added = sorted(set(after) - set(before))
     for kind, name in lost:
         print(f"registration_loss: {kind} {name} ({before[(kind, name)]}) exists at {base} and NOT at {head or 'the working tree'}")
@@ -231,6 +243,26 @@ def self_test() -> int:
             shas.append(subprocess.run(["git", "-C", str(d), "rev-parse", "HEAD"],
                                        capture_output=True, text=True).stdout.strip())
         return d, shas
+
+    # engine#3114: NO merge base is cannot-tell, not "everything is stale". Two ORPHAN roots (no common ancestor) in a
+    # full clone, so the shallow guard #3107 added cannot be what answers: the head is missing a row the base has, and the
+    # tool used to classify it as "stale -- nothing at risk" (and assert a merge-base fact that was never measured).
+    # Measured before the fix: rc 1 with "they are absent from its merge base too", the merge having happened to conflict.
+    import tempfile as _tf3
+    _o = pathlib.Path(_tf3.mkdtemp())
+    _g = lambda *a: subprocess.run(["git", "-C", str(_o), *a], capture_output=True, text=True, check=False)
+    _g("init", "-q"); _g("config", "user.email", "t@t"); _g("config", "user.name", "t")
+    (_o / "CMakeLists.txt").write_text("add_test(NAME alpha COMMAND a)\nadd_test(NAME beta COMMAND b)\n")
+    _g("add", "-A"); _g("commit", "-qm", "root1"); _g("tag", "base")
+    _g("checkout", "-q", "--orphan", "other"); _g("rm", "-qrf", ".")
+    (_o / "CMakeLists.txt").write_text("add_test(NAME alpha COMMAND a)\n")
+    _g("add", "-A"); _g("commit", "-qm", "root2")
+    check_that(_g("merge-base", "base", "other").stdout.strip() == "",
+               "orphan fixture: the two roots genuinely share no ancestor (engine#3114)")
+    check_that(_g("rev-parse", "--is-shallow-repository").stdout.strip() == "false",
+               "…and it is a FULL clone, so the shallow guard is not what answers here (engine#3114)")
+    check_that(check(_o, "base", "other") == 2,
+               "no merge base => cannot tell (rc 2), not 'stale, nothing is at risk' (engine#3114)")
 
     # 1. the #2183 shape: main has a row the branch never had -> failure, and the row is named
     d, shas = repo([{"CMakeLists.txt": "add_test(NAME keep COMMAND x)\n"},

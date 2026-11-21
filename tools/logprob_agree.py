@@ -46,6 +46,14 @@ value it compares and reports how many values had to be dropped as non-float32.
 Exit code: 0 all routes deterministic and all pairs exactly equal, 1 a route is non-deterministic or a
 pair differs -- including a pair that had no position to compare, which prints *cannot tell* rather than
 "0.000000 nats", 2 a route is unreachable or a request failed.
+
+A route that carries no log-probs **at all** is a cannot-tell on both the bit question and the KLD, and by
+default that is exit 1 like any other unanswered question. `--text-only` says the caller knows: the route's
+shape is not a finding, so those two halves read *cannot tell* and no longer fail the run, while a route whose
+log-probs ARE present is still held to them and two routes that both have them but diverge at every position
+still fail. That is what makes an A/B against a route like loom-serve -- whose chat response emits the literal
+`"logprobs":null` (hrx_loom pin 0cd370f2ba, `chat.c:1743`) -- exit 0 on a correct run, which a gate reading
+the exit code needs.
 """
 import argparse
 import json
@@ -182,6 +190,73 @@ def kld(ref_tokens, cand_tokens, by="id", eps=1e-12):
             "positions_with_unseen_entries": truncated}
 
 
+def pair_summary(per_prompt):
+    """Aggregate one route pair's per-prompt agreement() dicts into the numbers a row quotes.
+
+    Two rules live here rather than in the print statement, both because a rule written at a print site has
+    no arm (the KLD aggregate moved here for the same reason):
+
+      * a rate whose denominator is zero is **None**, never 0.0. `exact-bit match 0.000` and
+        `token-id match 0.000 over 0 positions` are the cannot-tell-rendered-as-zero shape this tool has
+        already been sent back for twice -- and they are what a route with no log-probs on the wire (Looms'
+        chat response returns `logprobs:null` at hrx_loom pin 0cd370f2ba) produces on every prompt;
+      * **greedy agreement is over prompts, on generated text**, because it is the only half of the gate's
+        accuracy clause that survives a route which emits no log-probs. It is deliberately weaker than the
+        token comparison above -- a whitespace or detokenisation difference counts as a disagreement -- and
+        it is reported with its own denominator so it cannot be read as a token-level number.
+    """
+    n = len(per_prompt)
+    positions = sum(p["positions"] for p in per_prompt)
+    common = sum(p["common_token_positions"] for p in per_prompt)
+    top1_n = sum(p["top1_positions"] for p in per_prompt)
+
+    def rate(total, denom):
+        return (total / denom) if denom else None
+
+    out = {
+        "prompts": n,
+        "positions": positions,
+        "common_token_positions": common,
+        "token_id_match_rate": rate(sum(p["token_id_match_rate"] * p["positions"] for p in per_prompt),
+                                    positions),
+        "top1_agreement_rate": rate(sum(p["top1_agreement_rate"] * p["top1_positions"] for p in per_prompt),
+                                    top1_n),
+        "exact_bit_match_rate": rate(sum(p["exact_bit_match_rate"] * p["common_token_positions"]
+                                         for p in per_prompt), common),
+        "max_abs_dlogp": max((p["max_abs_dlogp"] for p in per_prompt), default=None) if common else None,
+        "mean_abs_dlogp": rate(sum(p["mean_abs_dlogp"] * p["common_token_positions"] for p in per_prompt),
+                               common),
+        "prompts_with_token_divergence": [k for k, p in enumerate(per_prompt)
+                                          if p["first_token_divergence"] is not None],
+        "same_text_prompts": sum(1 for p in per_prompt if p["same_text"]),
+        "greedy_agreement_pct": (100.0 * sum(1 for p in per_prompt if p["same_text"]) / n) if n else None,
+        "text_prompt_divergence": [k for k, p in enumerate(per_prompt) if not p["same_text"]],
+    }
+    return out
+
+
+def no_logprobs_fails(text_only):
+    """Whether a route that carries **no log-probs at all** fails the run.
+
+    It cannot answer the bit question, which is cannot-tell by this tool's own contract -- but it is the *expected*
+    shape of a route that never puts log-probs on the wire (loom-serve at hrx_loom pin 0cd370f2ba emits the literal
+    `"logprobs":null`), and a gate reading this tool's exit code cannot use the text half if a correct run always
+    exits non-zero. So the caller declares it with `--text-only`; without the flag the old behaviour stands.
+    """
+    return not text_only
+
+
+def missing_kld_fails(text_only, any_no_logprobs):
+    """Whether a `mean_kld` of None fails the run.
+
+    Two different states produce that None and only one of them is the caller's to accept: a route that carries no
+    log-probs (declared with `--text-only`, and then the KLD was never answerable) versus two routes that both have
+    them and diverged at every position (a finding, which fails with or without the flag). The distinction is read
+    from the determinism section, not assumed from the flag.
+    """
+    return not (text_only and any_no_logprobs)
+
+
 def kld_summary(per_pair):
     """Aggregate pairwise kld() results into the number a row quotes.
 
@@ -204,9 +279,21 @@ def kld_summary(per_pair):
     return out
 
 
-def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False):
-    """One greedy request; returns the generated token ids with their log-probs."""
-    body = {
+def request_body(model, prompt, max_tokens, top_logprobs, thinking=False, minimal=False):
+    """The chat request. `minimal` sends only the fields the strictest route accepts.
+
+    A route that validates its body against an OpenAI subset refuses the whole request on any field it does not
+    know, so a full body is not a superset a strict server tolerates -- it is a 400 before any comparison happens.
+    Measured on this box against loom-serve (the Loom arm of engine#3158's gate): `chat_template_kwargs` and `seed`
+    alone were enough to answer `400 invalid model selector or request body`, and `/v1/completions` is refused
+    outright, so the arm is chat-only. Hence an explicit switch rather than a silent downgrade: the run has to say
+    which body it sent, because `--body minimal` cannot ask for log-probs and its cannot-tell KLD is then
+    *unasked*, not *unavailable*.
+    """
+    if minimal:
+        return {"model": model, "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens, "temperature": 0, "stream": False}
+    return {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
@@ -218,11 +305,22 @@ def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False):
         "top_logprobs": top_logprobs,
         "chat_template_kwargs": {"enable_thinking": thinking},
     }
+
+
+def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False, minimal=False):
+    """One greedy request; returns the generated token ids with their log-probs."""
+    body = request_body(model, prompt, max_tokens, top_logprobs, thinking, minimal)
     t = time.time()
     try:
         r = post(bare(url) + "/v1/chat/completions", body, timeout)
     except urllib.error.HTTPError as e:
-        return {"error": f"HTTP {e.code}: {e.read()[:300].decode(errors='replace')}"}
+        detail = e.read()[:300].decode(errors="replace")
+        if e.code == 400 and not minimal:
+            # The useful half of a strict-route 400 is the remedy, not the status.
+            return {"error": f"HTTP 400: {detail} -- a route that validates strictly refuses unknown fields; "
+                             f"re-run with --body minimal (it cannot ask for log-probs, so the KLD half reads "
+                             f"cannot tell because it was unasked)"}
+        return {"error": f"HTTP {e.code}: {detail}"}
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return {"error": f"{type(e).__name__}: {e}"}
     ch = (r.get("choices") or [{}])[0]
@@ -351,6 +449,7 @@ def agreement(a, b, by="id"):
         "common_token_positions": common,
         "token_id_match_rate": id_match / n if n else 0.0,
         "first_token_divergence": first_tok,
+        "top1_positions": top1_n,
         "top1_agreement_rate": top1_match / top1_n if top1_n else 0.0,
         "exact_bit_match_rate": bit_match / common if common else 0.0,
         "max_abs_dlogp": max(deltas) if deltas else 0.0,
@@ -502,6 +601,39 @@ def selftest():
     # truncation is carried through to the summary, because the printed line shows it from here
     sm = kld_summary([kld(ref, wider)])
     ok(sm["positions_with_unseen_entries"] == 1, "kld_summary: truncation is carried through")
+    # pair_summary: the same rule for the agreement rates, and the one half that survives a route with no
+    # log-probs. Both are live shapes: Loom's chat response is `logprobs:null` for every token, so a Loom arm
+    # produces zero positions on every prompt while still producing text.
+    no_lp = {"positions": 0, "common_token_positions": 0, "top1_positions": 0, "token_id_match_rate": 0.0,
+             "top1_agreement_rate": 0.0, "exact_bit_match_rate": 0.0, "max_abs_dlogp": 0.0,
+             "mean_abs_dlogp": 0.0, "first_token_divergence": 0, "same_text": True}
+    ps = pair_summary([no_lp, dict(no_lp, same_text=False)])
+    ok(ps["token_id_match_rate"] is None and ps["exact_bit_match_rate"] is None
+       and ps["max_abs_dlogp"] is None and ps["mean_abs_dlogp"] is None,
+       "pair_summary: a rate with no denominator is None, never 0.000")
+    ok(ps["greedy_agreement_pct"] == 50.0 and ps["text_prompt_divergence"] == [1],
+       "pair_summary: greedy agreement is over prompts, so it answers where the rates cannot (50 %)")
+    had = {"positions": 2, "common_token_positions": 1, "top1_positions": 2, "token_id_match_rate": 0.5,
+           "top1_agreement_rate": 0.5, "exact_bit_match_rate": 1.0, "max_abs_dlogp": 0.25,
+           "mean_abs_dlogp": 0.25, "first_token_divergence": 1, "same_text": True}
+    ps = pair_summary([had, had])
+    ok(ps["token_id_match_rate"] == 0.5 and ps["exact_bit_match_rate"] == 1.0
+       and ps["max_abs_dlogp"] == 0.25 and ps["greedy_agreement_pct"] == 100.0,
+       "pair_summary: a real rate is unchanged, and identical text is 100 % greedy agreement")
+    # --body minimal: measured against loom-serve, which 400s on `chat_template_kwargs` or `seed` alone and is
+    # chat-only. The switch must drop every field it does not know AND say so, because its KLD is unasked.
+    full = request_body("m", "p", 8, 5, thinking=True, minimal=False)
+    ok({"logprobs", "top_logprobs", "seed", "top_k", "cache_prompt", "chat_template_kwargs"} <= set(full),
+       "request_body: the full body is the OpenAI shape (log-probs and sampling pinning included)")
+    bare = request_body("m", "p", 8, 5, thinking=True, minimal=True)
+    ok(set(bare) == {"model", "messages", "max_tokens", "temperature", "stream"},
+       "request_body: the minimal body is exactly the fields a strictly-validating route accepts")
+    # --text-only: the exit contract for a route that carries no log-probs. A Loom A/B is exactly that route, and a
+    # correct run of it used to exit 1 -- so a gate reading the exit code could not use the text half at all.
+    ok(no_logprobs_fails(False) and not no_logprobs_fails(True),
+       "no_logprobs_fails: fatal by default, declared-and-accepted with --text-only")
+    ok(not missing_kld_fails(True, True) and missing_kld_fails(True, False) and missing_kld_fails(False, True),
+       "missing_kld_fails: --text-only excuses a KLD that had no log-probs to compute, never a diverged-everywhere one")
     print(f"logprob_agree selftest: {named[0]} ok, {named[1]} failed (KLD arms named; the rest assert)")
 
 
@@ -513,6 +645,13 @@ def main(argv=None):
     p.add_argument("--repeat", type=int, default=5, help="identical requests per prompt (default 5)")
     p.add_argument("--max-tokens", type=int, default=64, help="tokens per prompt (default 64)")
     p.add_argument("--top-logprobs", type=int, default=5, help="alternatives per token (default 5)")
+    p.add_argument("--text-only", action="store_true",
+                   help="accept a route that carries no log-probs: the bit question and the KLD are then reported as "
+                        "cannot tell and do not fail the run (a route whose log-probs are present is still held to "
+                        "them, and diverged-everywhere still fails)")
+    p.add_argument("--body", choices=["full", "minimal"], default="full",
+                   help="chat body to send: `minimal` is the four fields a strict route accepts (no log-probs, so "
+                        "the KLD half reads cannot tell because it was unasked); default full")
     p.add_argument("--thinking", choices=["on", "off"], default="off",
                    help="enable_thinking sent to every route (default off); a route that ignores it "
                         "has to be measured with on, and then every route must run with it on")
@@ -554,10 +693,11 @@ def main(argv=None):
                 model = "default"
     model = model or "default"
     print(f"model {model!r}, {len(routes)} route(s), {len(PROMPTS)} prompts, "
-          f"{a.max_tokens} tokens, {a.repeat} repeats, greedy")
+          f"{a.max_tokens} tokens, {a.repeat} repeats, greedy, body={a.body}")
 
     report = {"model": model, "max_tokens": a.max_tokens, "repeat": a.repeat,
               "top_logprobs": a.top_logprobs, "thinking": a.thinking, "match_by": a.match_by,
+              "body": a.body, "logprobs_requested": a.body == "full", "text_only": a.text_only,
               "time": time.strftime("%FT%T%z"),
               "routes": {}, "determinism": {}, "agreement": {}, "errors": []}
     thinking = a.thinking == "on"
@@ -567,7 +707,8 @@ def main(argv=None):
         for pi, prompt in enumerate(PROMPTS):
             runs = []
             for _ in range(a.repeat):
-                r = ask(url, model, prompt, a.max_tokens, a.top_logprobs, a.timeout, thinking)
+                r = ask(url, model, prompt, a.max_tokens, a.top_logprobs, a.timeout, thinking,
+                        a.body == "minimal")
                 if "error" in r:
                     report["errors"].append(f"{label} prompt {pi}: {r['error']}")
                     break
@@ -600,10 +741,14 @@ def main(argv=None):
         }
         report["determinism"][label] = d
         if not have_lp:
-            # No log-probabilities on this route: only the text can be held to repetition.
-            failed = True
+            # No log-probabilities on this route: only the text can be held to repetition. cannot-tell -- fatal
+            # unless the caller declared the route with --text-only, because then it is the route's shape and not
+            # an unanswered question.
+            if no_logprobs_fails(a.text_only):
+                failed = True
             print(f"{label:<6} NO LOGPROBS      text_stable={d['text_stable']} "
-                  f"(cannot answer the bit question on this route)")
+                  f"(cannot answer the bit question on this route"
+                  f"{'' if no_logprobs_fails(a.text_only) else '; accepted with --text-only'})")
         else:
             verdict = "bitwise-identical" if d["bit_identical"] else "DIVERGES"
             print(f"{label:<6} {verdict:<17} tokens={d['tokens']:<5} max|d|={d['max_abs_delta']:.3e} "
@@ -624,33 +769,27 @@ def main(argv=None):
                 failed = True
                 continue
             gs = [agreement(x["runs"][0], y["runs"][0], a.match_by) for x, y in zip(pa, pb)]
-            tot_common = sum(g["common_token_positions"] for g in gs)
-            tot_pos = sum(g["positions"] for g in gs)
-            g = {
-                "positions": tot_pos,
-                "common_token_positions": tot_common,
-                "token_id_match_rate": (sum(g["token_id_match_rate"] * g["positions"] for g in gs)
-                                        / tot_pos) if tot_pos else 0.0,
-                "top1_agreement_rate": (sum(g["top1_agreement_rate"] * g["positions"] for g in gs)
-                                        / tot_pos) if tot_pos else 0.0,
-                "exact_bit_match_rate": (sum(g["exact_bit_match_rate"] * g["common_token_positions"]
-                                             for g in gs) / tot_common) if tot_common else 0.0,
-                "max_abs_dlogp": max((g["max_abs_dlogp"] for g in gs), default=0.0),
-                "mean_abs_dlogp": (sum(g["mean_abs_dlogp"] * g["common_token_positions"] for g in gs)
-                                   / tot_common) if tot_common else 0.0,
-                "prompts_with_token_divergence": [k for k, g in enumerate(gs)
-                                                  if g["first_token_divergence"] is not None],
-                "same_text_all": all(g["same_text"] for g in gs),
-            }
+            g = pair_summary(gs)
             report["agreement"][f"{la}|{lb}"] = g
-            if g["exact_bit_match_rate"] < 1.0:
+            if (g["exact_bit_match_rate"] is not None and g["exact_bit_match_rate"] < 1.0) \
+                    or g["text_prompt_divergence"]:
                 failed = True
+            fmt = lambda v, spec: "cannot tell" if v is None else format(v, spec)  # noqa: E731
             print(f"{la} vs {lb}")
-            print(f"  token-id match    {g['token_id_match_rate']:.3f} over {tot_pos} positions")
-            print(f"  max|dlogp|        {g['max_abs_dlogp']:.6e}  (common positions only)")
-            print(f"  mean|dlogp|       {g['mean_abs_dlogp']:.6e}  over {tot_common} tokens")
-            print(f"  top-1 agreement   {g['top1_agreement_rate']:.3f}")
-            print(f"  exact-bit match   {g['exact_bit_match_rate']:.3f}")
+            print(f"  token-id match    {fmt(g['token_id_match_rate'], '.3f')} over {g['positions']} positions")
+            print(f"  max|dlogp|        {fmt(g['max_abs_dlogp'], '.6e')}  (common positions only)")
+            print(f"  mean|dlogp|       {fmt(g['mean_abs_dlogp'], '.6e')}  over {g['common_token_positions']} tokens")
+            print(f"  top-1 agreement   {fmt(g['top1_agreement_rate'], '.3f')}")
+            print(f"  exact-bit match   {fmt(g['exact_bit_match_rate'], '.3f')}")
+            # engine#3158: the clause's *other* half, and the only half a route that emits no log-probs can
+            # answer -- Loom's chat response returns logprobs:null at the pinned hrx_loom, so the whole
+            # comparison above is unanswerable there while this one is not. Text-level on purpose: it counts
+            # a whitespace or detokenisation difference as a disagreement, which is why it is reported with
+            # its own denominator rather than folded into the token rates.
+            print(f"  greedy agreement  {fmt(g['greedy_agreement_pct'], '.1f')} % over {g['prompts']} prompt(s) "
+                  f"(generated text)")
+            if g["text_prompt_divergence"]:
+                print(f"  text divergence   prompts {g['text_prompt_divergence']}")
             # engine#3158: the accuracy row asks for a mean KLD against CPU, which none of the above
             # answers -- they are all comparisons of the tokens the two routes DID emit. `--route` order
             # is the direction: the first route is the reference, so `--route cpu=… --route hrx=…` gives
@@ -666,9 +805,12 @@ def main(argv=None):
             g["kld"] = k
             if k["mean_kld"] is None:
                 # cannot-tell, and it must read as one: this is the diverged-everywhere case.
+                any_no_lp = not all(report["determinism"].get(x, {}).get("logprobs_available", True)
+                                    for x in (la, lb))
+                if missing_kld_fails(a.text_only, any_no_lp):
+                    failed = True
                 print(f"  mean KLD          cannot tell -- no position had both routes on the same token with a "
                       f"top-N (KL direction {lb} || {la}, {k['runs_compared']} run pair(s))")
-                failed = True
             else:
                 unseen_note = (f", {k['positions_with_unseen_entries']} with entries below top-N"
                                if k["positions_with_unseen_entries"] else "")
@@ -678,6 +820,13 @@ def main(argv=None):
             if g["prompts_with_token_divergence"]:
                 print(f"  token divergence  prompts {g['prompts_with_token_divergence']}")
 
+    if a.text_only:
+        excused = [label for label in labels
+                   if not report["determinism"].get(label, {}).get("logprobs_available", True)]
+        if excused:
+            print(f"\n--text-only: {', '.join(excused)} carried no log-probs, so the bit question and the KLD are "
+                  f"cannot tell BY THE ROUTE'S SHAPE, not because the routes agreed; the text comparison above is what "
+                  f"decided this run")
     if report["errors"]:
         print("\nerrors:")
         for e in report["errors"][:20]:

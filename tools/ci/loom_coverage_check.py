@@ -74,16 +74,15 @@ def _quant_token(t):
     return bool(re.fullmatch(r"i?q\d+([_-][a-z0-9]+)*|f16|bf16|mxfp4|awq", t))
 
 
-def _tokens(name, drop_vendor=False):
+def _tokens(name):
     """Distinctive tokens of a model name: family, size, and qualifiers, with quant tokens removed.
 
-    The vendor prefix is dropped for CARD names (the convention is <vendor>-<model>-loom), because
-    `bartowski-` is not part of the model's identity.
+    Vendor and organisation tokens (`bartowski`, `ggml`, `org`, …) are filtered by VENDOR rather than by
+    position, because a card directory may carry one or two of them (`ggml-org-Foo-loom`).
     """
     stem = re.sub(r"\.gguf$", "", name).split("/")[-1].lower()
     # single letters are quant suffixes split apart (`Q4_K_M` -> q4, k, m); they are never identity
-    toks = [t for t in re.split(r"[^a-z0-9.]+", stem) if len(t) > 1 and not _quant_token(t)]
-    return toks[1:] if drop_vendor and len(toks) > 1 else toks
+    return [t for t in re.split(r"[^a-z0-9.]+", stem) if len(t) > 1 and not _quant_token(t)]
 
 
 def same_model(row_name, card_dir, card_id):
@@ -102,21 +101,14 @@ def same_model(row_name, card_dir, card_id):
     return row <= card and (card - row) <= (NON_DISTINCTIVE | VENDOR)
 
 
-def size_class(name):
-    """'8b' from 'MiniCPM4-8B', or None when the name carries no size."""
-    m = re.search(r"(\d+(?:\.\d+)?)[bB](?![a-zA-Z])", name)
-    return m.group(1).lower() if m else None
-
-
 def quant_of(name):
     m = QUANTS.search(name.replace("-", "_"))
-    return m.group(0).upper().replace("_", "_") if m else None
+    return m.group(0).upper() if m else None
 
 
 def classify(row, cards):
     """(verdict, detail) for one shipped model against the card list."""
     stem = re.sub(r"\.gguf$", "", row)
-    size = size_class(stem)
     want_q = quant_of(stem)
     hits = []
     for d, ident, quants in cards:
@@ -124,7 +116,7 @@ def classify(row, cards):
             continue
         hits.append((d, ident, quants))
     if not hits:
-        return "UNCOVERED", "no card names this size class"
+        return "UNCOVERED", "no card names this model"
     same_quant = [h for h in hits if want_q and want_q in h[2]]
     if same_quant:
         return "COVERED", f"{same_quant[0][0].name} ({want_q})"
@@ -151,20 +143,21 @@ def cards_of(roots):
 
 
 def check(tsv, roots):
+    """(rc, lines): rc as documented, lines the report. Returned rather than printed so the self-test can assert
+    the VERDICT a row got -- COVERED, UNCOVERED, REQUANT are three different answers and two of them share an rc."""
     cards = cards_of(roots)
     if not cards:
-        print("loom_coverage: no card tree found (pass --cards); the cards are ~GB downloads, so this is "
-              "cannot tell, not a pass", file=sys.stderr)
-        return 2
-    bad = 0
+        return 2, ["loom_coverage: no card tree found (pass --cards); the cards are ~GB downloads, so this is "
+                   "cannot tell, not a pass"]
+    lines, bad = [], 0
     for device, model in read_rows(tsv):
         if device != "hrx":
             continue
         verdict, detail = classify(model, cards)
-        print(f"{verdict:9s} {model:46s} {detail}")
+        lines.append(f"{verdict:9s} {model:46s} {detail}")
         if verdict != "COVERED":
             bad += 1
-    return 0 if bad == 0 else 1
+    return (0 if bad == 0 else 1), lines
 
 
 def self_test():
@@ -173,6 +166,9 @@ def self_test():
     fails = 0
 
     def arm(name, want, rows, cards, expect_rc):
+        """Assert the VERDICT, not only the exit code: COVERED (0), UNCOVERED and REQUANT (both 1) are three
+        answers and two of them share an rc, so an rc-only arm cannot tell them apart -- which is the one
+        distinction the tool exists to make."""
         nonlocal fails
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td) / "cards"
@@ -183,9 +179,13 @@ def self_test():
                 (d / "model.json").write_text(json.dumps({"model": {"id": ident}, "quants": quants}))
             tsv = pathlib.Path(td) / "models.tsv"
             tsv.write_text("\n".join(f"{dev}\t{m}" for dev, m in rows) + "\n")
-            rc = check(tsv, [root])
-            ok = rc == expect_rc
-            print(f"  {'ok  ' if ok else 'FAIL'} {name} (rc {rc}, want {expect_rc})")
+            rc, lines = check(tsv, [root])
+            verdicts = [line.split()[0] for line in lines] if rc != 2 else ["cannot-tell"]
+            # "no-verdict-at-all" is the arm for a row class that must not be reported (`npu`): it passes only
+            # when nothing was said, so a tool that skipped nothing cannot satisfy it.
+            ok = rc == expect_rc and ((want == "no-verdict-at-all" and not lines) or want in verdicts)
+            detail = f"verdicts {verdicts}, want {want!r}"
+            print(f"  {'ok  ' if ok else 'FAIL'} {name} (rc {rc} want {expect_rc}; {detail})")
             fails += 0 if ok else 1
 
     # a card for the model on the quant we ship
@@ -208,7 +208,7 @@ def self_test():
     arm("no cards is cannot tell", "cannot-tell",
         [("hrx", "Qwen3-0.6B-Q4_K_M.gguf")], [], 2)
     # non-GPU rows are not this map's business
-    arm("npu rows are ignored", "npu-ignored",
+    arm("npu rows are ignored (nothing is reported for them)", "no-verdict-at-all",
         [("npu", "Qwen3-0.6B")], [("unsloth-Qwen3-0.6B-loom", "Qwen/Qwen3-0.6B", ["Q4_K_M"])], 0)
     print(f"loom_coverage_check self-test: {6 - fails} ok, {fails} failed")
     return 0 if fails == 0 else 1
@@ -219,12 +219,24 @@ def main():
     ap.add_argument("--registry", default="registry/check_models.tsv")
     ap.add_argument("--cards", action="append", default=None,
                     help="a card tree (repeatable); default ~/amd-oss/loom-fun/{cards,cards-staging}")
+    ap.add_argument("--check", action="store_true", help="run the live check (the default)")
+    ap.add_argument("--advisory", action="store_true",
+                    help="report the map but never fail for it: which models have a card is the STATE of the world, "
+                         "not a defect in the PR that happens to be running the gate")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
     roots = card_roots(a.cards or ["~/amd-oss/loom-fun/cards", "~/amd-oss/loom-fun/cards-staging"])
-    return check(a.registry, roots)
+    rc, lines = check(a.registry, roots)
+    for line in lines:
+        print(line, file=sys.stderr if rc == 2 else sys.stdout)
+    if a.advisory and rc == 1:
+        # the map is reported, the gate stays green: an uncovered row is a plan item (the issue's second half), and
+        # a PR gate that reds for it would block every lane for something no PR can change.
+        print("loom_coverage: advisory row -- the map is above, and being uncovered is not this PR's defect")
+        return 0
+    return rc
 
 
 if __name__ == "__main__":

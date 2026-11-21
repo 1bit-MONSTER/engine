@@ -72,7 +72,7 @@ PAGE = 100
 # fleet writes a claim, and the old pattern stopped at the `**` -- so such a PR counted as a bare mention and went
 # missing from "claimed by" lists (measured on #3047: its body reads `Closes **#3041**`). Backticks are deliberately
 # NOT matched: a claim inside a code span is documentation, which `claims()` already strips.
-CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*[*_]*\s*#(\d+)', re.I)
+CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*[*_~]*#(\d+)', re.I)
 
 # engine#2842: `Refs #N` is a claim too, but a WEAKER one. Almost every PR reviewed on 2026-11-16/17 said `Refs` rather than
 # `Fixes` -- because a PR that fixes part of an issue must not close it -- so reading closing keywords only made the common
@@ -80,7 +80,7 @@ CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*[*_]*\
 # other failure: `Refs` is also used for context, and a pair that merely mentions the same issue is not a duplicate. So a
 # ref pair counts only when the two PRs also TOUCH OVERLAPPING FILES -- the same "overlap, not issue-claim" rule the review
 # of #2809 asked for on the false-positive side, which makes one rule serve both directions.
-REF = re.compile(r'\brefs?\b\s*:?\s*[*_]*\s*#(\d+)', re.I)
+REF = re.compile(r'\brefs?\b\s*:?\s*[*_~]*#(\d+)', re.I)
 
 
 # A claim written INSIDE code is documentation, not a claim. The PRs most likely to contain `Fixes #12` are the ones
@@ -468,8 +468,15 @@ def self_test():
     ok('neither says Fixes/Closes' in note_line(2836, ref_prs[0], ref_prs[1], ['f.cpp']),
        "... and the old sentence is kept only where it is true: two PRs that both merely name the issue")
     # engine#3060: a claim whose issue number is marked up is still a claim
-    ok(claims("Closes **#3041** -- the row has been red") == [3041] and claims("Fixes _#7_") == [7],
-       "a claim whose issue number is bolded/underlined parses (backticks stay excluded: a code span is not a claim)")
+    # engine#3060 / review of #3064 (pi-i679): the markup set is *, _ and ~ (strikethrough) -- contiguous markers only,
+    # directly before the number. A BACKTICKED number stays a non-claim: it is inside code, and this tool's stated rule
+    # is that a claim written inside code is documentation. Both directions are pinned so a later widening to "any
+    # punctuation" has to argue with a failing test.
+    ok(claims("Closes **#3041** -- the row has been red") == [3041], "a bold claim is a claim (engine#3060)")
+    ok(claims("Fixes __#12__") == [12] and claims("Closes *#7*") == [7] and claims("Fixes ~~#9~~") == [9],
+       "... and so are underscore, italic and strikethrough markup")
+    ok(claims("Closes `#12` -- quoted in a log line") == [],
+       "... while a backticked NUMBER is inside code and is not a claim")
     ok(referenced("Refs **#7**") == [7], "... and so does a marked-up reference")
     # a reference inside code is documentation, like a claim inside code
     ok(referenced("use `Refs #12` next to the PR body") == [], "a `Refs` inside an inline code span is not a reference")

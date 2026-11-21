@@ -149,7 +149,7 @@ if start "$scratch/noloom.log" -m "$scratch/plain.gguf" --loom-routes "$scratch/
 fi
 if start "$scratch/nocard.log" -m "$scratch/plain.gguf" --loom-routes "$scratch/no-card.json" "${loom[@]}"; then
     check "a missing card falls back, and says why" \
-        'grep -q "loom route plain-gone matches .*, but its card is not usable (cannot read .*cards/gone): serving on the llama.cpp route" "$scratch/nocard.log" && ! grep -q "on loom" "$scratch/nocard.log"'
+        'grep -q "loom route plain-gone matches .*, but its card is not usable (card path gone is not a model.json inside the cards directory): serving on the llama.cpp route" "$scratch/nocard.log" && ! grep -q "on loom" "$scratch/nocard.log"'
     stop
 fi
 touch "$scratch/head.gguf"

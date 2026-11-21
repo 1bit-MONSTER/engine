@@ -356,7 +356,28 @@ def map_command_buffers(commands_path, programs, events):
             cb_ops[cb].append((idx, key))
 
     def names(cmd):
-        return {cmd.get("kernel"), cmd.get("symbol")}
+        return {n for n in (cmd.get("kernel"), cmd.get("symbol")) if n}
+
+    def align(keys, seq):
+        """(ok, tolerated, first_bad) aligning the profile's keys to a program's command sequence.
+
+        Exact names first, then a key that is the PREFIX of exactly one command name in that program. Measured need: the
+        30B-MoE pp512 profile keys one command `ggml_linear_q6k_q8_1_x4` while the shape log records symbol
+        `ggml_linear_q6k_q8_1_x4_wave64_block4` -- the profile drops a specialization suffix -- and because the old test was
+        all-or-nothing, that single entry made 872 dispatches match no program, i.e. the whole model ranked as unmapped and
+        the run looked like a profile with nothing to attribute. Uniqueness is required so an ambiguous prefix still fails.
+        """
+        all_names = [names(c) for c in seq]
+        tolerated = 0
+        for i, (k, ns) in enumerate(zip(keys, all_names)):
+            if k in ns:
+                continue
+            hits = [j for j, other in enumerate(all_names) if any(n.startswith(k) for n in other)]
+            if len(hits) == 1 and hits[0] == i:
+                tolerated += 1
+                continue
+            return False, tolerated, i
+        return True, tolerated, None
 
     result = {}
     used = set()
@@ -364,16 +385,24 @@ def map_command_buffers(commands_path, programs, events):
     for cb in sorted(cb_ops):
         ops = sorted(cb_ops[cb])
         keys = [k for _, k in ops]
-        candidates = []
+        candidates, best_matched = [], 0
         for p in programs:
             main = [c for c in p["commands"] if c["phase"] == "main"]
             init = [c for c in p["commands"] if c["phase"] == "init"]
             for seq in (main, init + main):
-                if len(seq) == len(keys) and all(k in names(c) for k, c in zip(keys, seq)):
+                if len(seq) != len(keys):
+                    continue
+                best_matched = max(best_matched, sum(1 for k, c in zip(keys, seq) if k in names(c)))
+                ok, tolerated, _bad = align(keys, seq)
+                if ok:
+                    if tolerated:
+                        print(f"hrx2kineto: command buffer {cb}: {tolerated} of {len(keys)} keys matched by prefix "
+                              f"(the profile shortened a specialization suffix)", file=sys.stderr)
                     candidates.append((p, seq))
                     break
         if not candidates:
-            print(f"hrx2kineto: command buffer {cb} ({len(keys)} dispatches) matches no logged program",
+            print(f"hrx2kineto: command buffer {cb} ({len(keys)} dispatches) matches no logged program"
+                  + (f" (the closest program matches {best_matched}/{len(keys)} keys)" if best_matched else ""),
                   file=sys.stderr)
             continue
         cands = [(p, {idx: seq[i] for i, (idx, _) in enumerate(ops)}) for p, seq in candidates]
@@ -981,6 +1010,29 @@ def self_test():
             f"%roof is FLOP/s over that roof ({tf:.2f} TFLOP/s -> {100 * tf / roof:.1f} % of {roof:.1f})")
         chk(total == 2 * gemm_ns + 2 * pack_ns,
             "time is summed per dispatch, not per match (a fused match is several kernels' time)")
+
+    # engine#3103: a key the profile SHORTENED must not cost the whole command buffer. Both halves are pinned: the real
+    # pair (871 exact + 1 prefix) joins, and a program where two commands share the prefix must still refuse to guess.
+    def cb_fixture(second_symbol):
+        prog = {"type": "hrx_command_program", "program": 1, "graph_uid": 1,
+                "commands": [{"phase": "main", "ordinal": 0, "kernel": "qwen3_moe:ggml_linear_q6k_q8_1_x4",
+                              "symbol": "ggml_linear_q6k_q8_1_x4_wave64_block4", "match": 0},
+                             {"phase": "main", "ordinal": 1, "kernel": "qwen3_moe:other",
+                              "symbol": second_symbol, "match": 0}],
+                "matches": [{"nodes": [node]}]}
+        evs = [{"type": "dispatch_event", "key": "ggml_linear_q6k_q8_1_x4", "valid": True, "command_buffer_id": 9,
+                "command_index": 1, "start_tick": 1000, "duration_ns": 100.0, "submission_id": 1},
+               {"type": "dispatch_event", "key": "other", "valid": True, "command_buffer_id": 9,
+                "command_index": 2, "start_tick": 2000, "duration_ns": 100.0, "submission_id": 1}]
+        return prog, evs
+
+    prog, evs = cb_fixture("other_symbol")                                  # unique prefix -> resolves
+    joined = map_command_buffers(None, [prog], evs)
+    chk(9 in joined, "a key the profile shortened (prefix of exactly one command) still joins the program (engine#3103)")
+
+    prog, evs = cb_fixture("ggml_linear_q6k_q8_1_x4_wave32_block2")         # both share the prefix -> refuse
+    chk(9 not in map_command_buffers(None, [prog], evs),
+        "... but an AMBIGUOUS prefix joins nothing: the tool refuses to guess which command a dispatch was")
 
     print(f"hrx2kineto --by-kernel self-test: {ok[0]} ok, {ok[1]} failed")
     return 0 if ok[1] == 0 else 1

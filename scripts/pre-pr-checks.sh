@@ -260,7 +260,7 @@ checks=(
     # merged (only its --self-test had a ctest row), so a lane got it only by remembering to type it; this is that row. Safe to
     # gate on: it answers **2 (cannot tell)** when no local clone carries the pin (`loom_pin: no local clone carries …`), which
     # the runner reports as cannot-tell rather than green, and 0 only when the three facts agree.
-    "tools/ci/loom_pin_check.py --check"
+    "tools/ci/loom_pin_check.py --check --no-installed"
     # engine#3156: which shipped GPU models have a Loom card, and on which quant -- the switch's plan. ADVISORY, because
     # being uncovered is the state of the world, not a defect of the PR running this: four shipped rows have no card
     # today and a hard row would red every lane's run for it. It prints the map and answers 2 (cannot tell) on a box

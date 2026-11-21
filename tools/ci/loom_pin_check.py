@@ -113,7 +113,7 @@ def installed_version(python):
     return p.stdout.strip(), None
 
 
-def check(cfg_path, source=None, python=None, wheel=None, loom_serve=None):
+def check(cfg_path, source=None, python=None, wheel=None, loom_serve=None, installed=True):
     findings, notes = [], []
     cfg = read_config(cfg_path)
     for key in ('repo', 'sha', 'package', 'version', 'version_file', 'model_catalog_repo', 'model_catalog_sha'):
@@ -154,11 +154,30 @@ def check(cfg_path, source=None, python=None, wheel=None, loom_serve=None):
                         f' but {sha[:10]} names {catalog or "<none>"}')
     notes.append(f'{cfg["package"]} {have} at {sha[:10]} in {src}')
 
+    # A `ref=`/`branch=` beside the sha must name the SAME commit in THIS clone. That is how this pin went wrong once:
+    # `v0.2.0` is a May tag of our fork (12f2db54, and it carries no version.json) while the sha is upstream's SDK-0.2.0
+    # commit, so a reader who trusted the tag fetched the wrong history. A ref the clone does not carry is a note (a
+    # partial clone is legitimate); a ref that resolves to a different commit is a finding.
+    for key in ('ref', 'branch'):
+        want_ref = cfg.get(key)
+        if not want_ref:
+            continue
+        got = git(src, 'rev-parse', '--verify', '--quiet', want_ref + '^{commit}')
+        if got.returncode != 0:
+            notes.append(f'{key}={want_ref} does not resolve in {src}: not compared against the pinned sha')
+        elif got.stdout.strip() != sha:
+            findings.append(f'{cfg_path} says {key}={want_ref}, which is {got.stdout.strip()[:10]} in {src}, but sha= is '
+                            f'{sha[:10]} -- one name, two histories')
+        else:
+            notes.append(f'{key}={want_ref} resolves to the pinned {sha[:10]}')
+
     gitlink = git(src, 'rev-parse', 'HEAD').stdout.strip()
     inside = git(src, 'merge-base', '--is-ancestor', sha, 'HEAD').returncode == 0 if gitlink else False
     notes.append(f'{sha[:10]} is {"an ancestor of" if inside else "NOT an ancestor of"} the local clone head {gitlink[:10]}')
     have_inst, why = installed_version(python)
-    if have_inst is None:
+    if not installed:
+        notes.append('this box\'s installed package was NOT compared (--no-installed): the pin is a claim about the tree')
+    elif have_inst is None:
         notes.append(f'installed package not compared: {why}')
     elif have_inst != version:
         findings.append(f'the installed hrx_loom is {have_inst}, the pin says {version}')
@@ -264,6 +283,17 @@ def self_test():
     chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.1.0'), source=str(src)) == 1,
         '...and a ref the release does not name is still a finding')
 
+    # refs for the ref-vs-sha guard below: one honest, one the trap (a name that means another commit)
+    subprocess.run(['git', '-C', str(src), 'branch', '-f', 'release-tag', rsha], check=True)
+    dev = subprocess.run(['git', '-C', str(src), 'rev-parse', 'HEAD~1'], capture_output=True, text=True).stdout.strip()
+    subprocess.run(['git', '-C', str(src), 'branch', '-f', 'dev-tag', dev], check=True)
+    chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.2.0', ref='release-tag'), source=str(src)) == 0,
+        'a ref= that resolves to the pinned commit is accepted')
+    chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.2.0', branch='no-such-branch'), source=str(src)) == 0,
+        'a ref the clone does not carry is a note, not a finding')
+    chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.2.0', ref='dev-tag'), source=str(src)) == 1,
+        '...and a ref= resolving to a DIFFERENT commit is a finding (the v0.2.0 trap: one name, two histories)')
+
     # The shipped ARTEFACT: a release is a wheel with a hash, not just a version string.
     whl = tmp / 'hrx_loom-0.2.0-py3-none-any.whl'
     whl.write_bytes(b'PK\x03\x04 not really a wheel, but its hash is what the pin names')
@@ -290,6 +320,8 @@ def self_test():
         'a loom-serve that is not there is a finding')
     chk(check(cfg(loom_serve_sha256=bdig, **rel), source=str(src)) == 0,
         'not identifying a binary is a note, not a finding (a runner has none installed)')
+    chk(check(cfg(loom_serve_sha256=bdig, **rel), source=str(src), python=str(tmp / 'no-such-python'), installed=False) == 0,
+        '--no-installed never consults this box, so a broken or foreign interpreter cannot make the row fail')
     print(f'loom_pin_check self-test: {ok[0]} ok, {ok[1]} failed')
     return 0 if ok[1] == 0 else 1
 
@@ -302,6 +334,9 @@ def main(argv=None):
     ap.add_argument('--source', default=None, help='a clone of the repo in config/loom.config')
     ap.add_argument('--python', default=sys.executable, help='interpreter to ask for the installed hrx_loom')
     ap.add_argument('--wheel', default=None, help='a hrx_loom wheel whose sha256 must match config/loom.config')
+    ap.add_argument('--no-installed', dest='installed', action='store_false',
+                    help='check the pin\'s facts about the TREE only; do not compare this box\'s installed package '
+                         '(a pre-PR row must not fail a lane for another lane\'s venv)')
     ap.add_argument('--loom-serve', default=None, metavar='PATH|auto',
                     help='the loom-serve binary a route would launch (auto = the first on PATH); its sha256 must match '
                          'config/loom.config, because the binary cannot report its own toolchain')
@@ -310,7 +345,7 @@ def main(argv=None):
         return self_test()
     if not a.check:
         ap.error('one of --check or --self-test')
-    return check(a.config, a.source, a.python, a.wheel, a.loom_serve)
+    return check(a.config, a.source, a.python, a.wheel, a.loom_serve, a.installed)
 
 
 if __name__ == '__main__':

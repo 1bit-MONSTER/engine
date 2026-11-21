@@ -515,6 +515,27 @@ int foreign_port_grace_s() {
     return 10;
 }
 
+// engine#3130 (part 2): a backend launched with `--port 0` prints the port it bound, and that line is the only place
+// the number exists -- `tests/serve_port.sh`'s `serve_port_from_log` parses the same line from shell, so the format is
+// already a contract here ("1bit serve: ready on http://127.0.0.1:PORT"). Learning it is what lets a launch stop
+// choosing a port and releasing it before the child binds, which is free_port()'s release-then-bind race (engine#1070).
+// False when the line is not that line, or carries no usable port.
+static bool parse_backend_ready_port(const std::string& line, int& port) {
+    static const char kMarker[] = " ready on http://";
+    if (line.compare(0, 5, "1bit ") != 0) return false;   // the backend's own line, not model log chatter
+    const size_t at = line.find(kMarker);
+    if (at == std::string::npos) return false;
+    const size_t colon = line.find(':', at + sizeof kMarker - 1);
+    if (colon == std::string::npos) return false;
+    size_t end = colon + 1;
+    while (end < line.size() && std::isdigit(static_cast<unsigned char>(line[end]))) end++;
+    if (end == colon + 1) return false;
+    const int parsed = std::atoi(line.substr(colon + 1, end - colon - 1).c_str());
+    if (parsed <= 0 || parsed > 65535) return false;
+    port = parsed;
+    return true;
+}
+
 #ifdef _WIN32
 // Windows: CreateProcess into a job object that kills its processes when its last handle
 // closes, so the backend dies with `1bit serve` for any reason (Linux: PR_SET_PDEATHSIG).
@@ -523,7 +544,8 @@ public:
     Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
           std::string ready_path = "/health", std::function<void(const std::string&)> on_line = nullptr,
           const std::vector<std::string>& env_override = {})
-        : port_(port), ready_path_(std::move(ready_path)) {
+        : port_(port), learned_port_(std::make_shared<std::atomic<int>>(port)),
+          ready_path_(std::move(ready_path)) {
         (void)on_line;  // the backend's stderr is its own on Windows
         // the command line, each argument quoted the way CommandLineToArgvW reads it back
         std::string cmd;
@@ -601,7 +623,8 @@ public:
     Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
           std::string ready_path = "/health", std::function<void(const std::string&)> on_line = nullptr,
           const std::vector<std::string>& env_override = {})
-        : port_(port), ready_path_(std::move(ready_path)) {
+        : port_(port), learned_port_(std::make_shared<std::atomic<int>>(port)),
+          ready_path_(std::move(ready_path)) {
         std::vector<char*> args;
         for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
         args.push_back(nullptr);
@@ -631,7 +654,7 @@ public:
         if (tee) {
             ::close(err[1]);
             // detached: a backend stuck in the kernel keeps the pipe open, and serve must still exit
-            std::thread([fd = err[0], tail = tail_, on_line = std::move(on_line)] {
+            std::thread([fd = err[0], tail = tail_, on_line = std::move(on_line), learned = learned_port_] {
                 char buf[4096];
                 for (;;) {
                     const ssize_t n = ::read(fd, buf, sizeof buf);
@@ -643,8 +666,12 @@ public:
                         if (w <= 0) break;
                         done += w;
                     }
-                    for (const std::string& line : tail->feed(buf, size_t(n)))
+                    for (const std::string& line : tail->feed(buf, size_t(n))) {
                         if (on_line) on_line(line);
+                        // engine#3130 part 2: the port only this thread can see -- the child's own readiness line.
+                        int parsed_port = 0;
+                        if (parse_backend_ready_port(line, parsed_port)) learned->store(parsed_port);
+                    }
                 }
                 ::close(fd);
             }).detach();
@@ -714,8 +741,10 @@ public:
     // Polls the child's ready path (/health; /v1/models for servers without one, which answer
     // only once the model is loaded) until it answers 200, it exits, or time runs out.
     bool wait_ready(std::chrono::seconds timeout, const std::atomic<bool>& stop) const {
-        httplib::Client c("127.0.0.1", port_);
-        c.set_connection_timeout(1);
+        // engine#3130 (part 2): a backend launched with `--port 0` has no port until it prints one, so the client is
+        // built when the port appears rather than before the loop; `client_port` tracks which port `c` talks to.
+        int                              client_port = -1;
+        std::unique_ptr<httplib::Client> c;
         const auto end = std::chrono::steady_clock::now() + timeout;
         const auto foreign_grace = std::chrono::seconds(foreign_port_grace_s());
         // A previous call already spent the grace on this child (the relaunch loop calls wait_ready again after it
@@ -724,9 +753,19 @@ public:
         auto       foreign_since = std::chrono::steady_clock::time_point{};
         while (std::chrono::steady_clock::now() < end) {
             if (!alive() || stop) return false;
-            if (auto r = c.Get(ready_path_); r && r->status == 200) {
+            if (port() <= 0) {
+                // nothing to poll yet, and that is the launch's starting state, not a failure
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                continue;
+            }
+            if (port() != client_port) {
+                client_port = port();
+                c = std::make_unique<httplib::Client>("127.0.0.1", client_port);
+                c->set_connection_timeout(1);
+            }
+            if (auto r = c->Get(ready_path_); r && r->status == 200) {
 #if defined(__linux__)
-                if (port_owner(pid_, port_) == PortOwner::kOther) {
+                if (port_owner(pid_, port()) == PortOwner::kOther) {
                     // engine#3130: something else owns this port. Two cases, one answer each: our child may still bind it
                     // (or die with EADDRINUSE and let #2537's relaunch fire) -- so keep polling -- but a port held for
                     // good must be refused, so the wait is bounded by ONEBIT_FOREIGN_PORT_GRACE_S. Printed on the first
@@ -738,13 +777,13 @@ public:
                         std::fprintf(stderr,
                                      "1bit serve: port %d answers, but not from the backend serve started (pid %d); waiting "
                                      "up to %d s for it (engine#3130)\n",
-                                     port_, int(pid_), int(foreign_grace.count()));
+                                     port(), int(pid_), int(foreign_grace.count()));
                     }
                     if (waited_before || now - foreign_since >= foreign_grace) {
                         std::fprintf(stderr,
                                      "1bit serve: port %d is still not the backend serve started (pid %d) after %d s; "
                                      "refusing to use it\n",
-                                     port_, int(pid_), int(foreign_grace.count()));
+                                     port(), int(pid_), int(foreign_grace.count()));
                         return false;
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -758,7 +797,7 @@ public:
         return false;
     }
 
-    int port() const { return port_; }
+    int port() const { return learned_port_->load(); }
 
 private:
 #ifdef _WIN32
@@ -785,6 +824,10 @@ private:
     // at once -- both because a port that is held for good must still fail fast with the message smoke_serve greps for.
     mutable bool port_foreign_ = false;
 #endif
+    // engine#3130 (part 2): the port this child actually bound. Written by the detached stderr drain thread (which
+    // cannot capture `this`), read by wait_ready()/port(); shared and atomic for that reason. Equal to the launch
+    // port unless the launch passed 0 and the child reported its own.
+    std::shared_ptr<std::atomic<int>> learned_port_ = std::make_shared<std::atomic<int>>(0);
     int port_;
     std::string ready_path_;
     std::shared_ptr<LineTail> tail_ = std::make_shared<LineTail>();
@@ -1977,7 +2020,10 @@ int serve_models(const Options& o) {
         if (!r.bin.empty() && !fs::exists(r.bin)) throw std::runtime_error("--laya-models: " + r.alias + ": no such binary " + r.bin);
         Backend b;
         b.row = r;
-        b.port = free_port();
+        // engine#3130 (part 2): ask the child for the port it bound instead of choosing one here and releasing it before
+        // the child can take it (free_port()'s release-then-bind race, engine#1070). The child prints it on its own
+        // readiness line, which Child learns (parse_backend_ready_port) and wait_ready() polls.
+        b.port = 0;
         b.argv = {r.bin.empty() ? self : r.bin, "serve", "-m", r.model, "--device", r.device, "--port", std::to_string(b.port),
                   "--host", "127.0.0.1", "--alias", r.alias};
         b.argv.insert(b.argv.end(), r.args.begin(), r.args.end());
@@ -2173,12 +2219,16 @@ int serve_models(const Options& o) {
                      b.port, b.row.bin.empty() ? "" : ", ", b.row.bin.c_str());
         children.push_back(std::make_unique<Child>(b.argv, std::vector<std::string>{}, b.port, "/health", line));
     }
-    for (size_t i = 0; i < children.size(); ++i)
+    for (size_t i = 0; i < children.size(); ++i) {
         if (!children[i]->wait_ready(std::chrono::seconds(900), g_stop)) {
             if (g_stop) return 0;
             std::fprintf(stderr, "1bit serve: laya-models: %s did not become ready\n", backends[i].row.alias.c_str());
             return 1;
         }
+        // engine#3130 (part 2): this launch passed `--port 0`, so the row's port is the one the child printed, not the 0
+        // it was started with -- every forward below reads `backends[i].port`.
+        backends[i].port = children[i]->port();
+    }
     ready = true;
     lifecycle.count_start();
     std::fprintf(stderr, "1bit serve: ready on http://%s:%d (laya-models: model auto is routed per request)\n", o.host.c_str(),

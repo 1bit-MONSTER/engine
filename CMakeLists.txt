@@ -659,6 +659,10 @@ add_python_test(git_shallow_self ${CMAKE_SOURCE_DIR}/tools/ci/git_shallow.py --s
 # answering cannot-tell for some other reason (a thin fixture is how an audit certifies safety it never tested -- the
 # finding cl-hrxnan made while auditing this issue; the test is theirs, handed over when #3109 closed naming this PR).
 add_test(NAME git_shallow_instruments COMMAND bash ${CMAKE_SOURCE_DIR}/tests/git_shallow_instruments_test.sh)
+# engine#3116: the pre-PR runner's verdict table (0 ok / 77 skip / 2 cannot-tell / * fail), asserted without running the
+# list. It exists because 2 fell through to FAIL: after #3107 the loss checks answer cannot-tell on a shallow clone, and
+# `actions/checkout` is shallow by default, so a correct refusal read as a verdict on the PR.
+add_test(NAME pre_pr_checks_self COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/pre-pr-checks.sh --self-test)
 # engine#2992: the pre-merge twin of merged_tail_check -- a stale open branch deletes main's newer lines when it
 # merges, and the PR page shows a clean additive diff while it would do so. Self-test wired because
 # tools/ci/tool_selftest_wired_check.py requires a tool that carries one to be named here.

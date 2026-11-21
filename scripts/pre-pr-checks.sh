@@ -39,7 +39,55 @@ usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
 
 base=origin/main
 strict=""
+# engine#3116: ONE place that maps a row's exit code to a verdict line, so the table can be asserted without running the
+# whole list -- and so the runner cannot drift from what it promises. The two "could not look" codes are different
+# events with the same meaning for the reader:
+#   77  the repo's "cannot run here" (ctest SKIP_RETURN_CODE)                        -> skip
+#   2   cannot tell: the tool refused to judge (shallow clone, no merge base, an      -> skip, printed as `cannot-tell`
+#       unreadable ref). Four rows speak this code and #3107 made it common: on a
+#       shallow tree they used to land in the FAIL branch and read as a verdict on the PR.
+#   0   ok (with the submodule_pin_check vacuity case handled by the caller)         -> ok
+#   *   FAIL
+# A row's 2 is NOT this script's own usage error: `--base` that does not resolve exits 2 *before* the loop (see below),
+# so mapping a row's code here cannot mask a caller's mistake.
+classify() {  # <rc> <name> <last line> -> prints the verdict line, echoes the bucket
+    case "$1" in
+        77) printf 'skip  %-42s %s\n' "$2" "$3"; printf 'skip\n' ;;
+        2)  printf 'skip  %-42s %s\n' "$2" "$3"; printf 'cannot-tell\n' ;;
+        0)  printf 'ok    %-42s %s\n' "$2" "$3"; printf 'ok\n' ;;
+        *)  printf 'FAIL  %-42s %s\n' "$2" "$3"; printf 'fail\n' ;;
+    esac
+}
+
 list_only=0
+
+# engine#3116: the mapping table, asserted directly. Five codes, one line each, and the two "could not look" codes are
+# told apart in the bucket even though both print as a skip -- so a later edit that folds 2 back into FAIL fails here.
+if [ "${1:-}" = "--self-test" ]; then
+    fails=0
+    arm() {  # <rc> <want-bucket> <want-word-in-line>
+        local got line
+        line=$(classify "$1" "stub_row" "stub: something happened" 2>/dev/null)
+        got=$(printf '%s\n' "$line" | tail -1)
+        local words
+        words=$(printf '%s\n' "$line" | head -1)
+        if [ "$got" = "$2" ] && case "$words" in *"$3"*) true ;; *) false ;; esac; then
+            echo "  [PASS] rc $1 -> $got"
+        else
+            echo "  [FAIL] rc $1 -> '$got' ('$words'), want bucket $2 with '$3'"
+            fails=$((fails + 1))
+        fi
+    }
+    arm 0  ok          "ok    stub_row"
+    arm 77 skip        "skip  stub_row"
+    arm 2  cannot-tell "skip  stub_row"
+    arm 1  fail        "FAIL  stub_row"
+    arm 130 fail       "FAIL  stub_row"
+    echo "pre-pr-checks self-test: $((5-fails))/5 arms passed"
+    [ "$fails" -eq 0 ]
+    exit $?
+fi
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --base) base=${2:-}; shift 2 || { usage >&2; exit 2; } ;;
@@ -163,40 +211,41 @@ git rev-parse --verify -q "$base^{commit}" >/dev/null || {
 }
 
 ok=0; failed=0; skipped=0; detail=""
+
 for c in "${checks[@]}"; do
     name=${c%% *}
     out=$(python3 $c 2>&1); rc=$?
     last=$(printf '%s\n' "$out" | grep -v '^$' | tail -1)
-    if [ $rc -eq 77 ]; then
-        # 77 is the repo's "cannot run here" (ctest SKIP_RETURN_CODE): counted as a skip with the tool's own
-        # reason, so the summary still says something did not run
-        printf 'skip  %-42s %s\n' "$name" "$last"
-        skipped=$((skipped + 1)); continue
-    fi
     if [ $rc -eq 0 ]; then
         # `submodule_pin_check --check` exits 0 having compared NOTHING when submodules are declared but
         # none is checked out -- `0 submodule(s) at their pinned commit, N not initialised` -- which would
         # print `ok` for a check that ran no comparison, the shape this script exists to stop. Matched on
         # the tool's own summary rather than re-deriving the condition, because the tool is the thing that
         # knows. Its OTHER "nothing to compare" case, `no submodules reported - cannot tell, and that is not
-        # a pass`, exits 2 and is left to fail: the tool already refuses to call that a pass.
+        # a pass`, exits 2 and is now a cannot-tell skip (engine#3116): the tool already refuses to call that
+        # a pass, and this runner's job is to not call it a verdict on the PR either.
         # `--require-initialised` is where a release build turns this one into a failure.
         case "$last" in
             "submodule_pin: 0 submodule(s) at their pinned commit, "*)
                 printf 'skip  %-42s nothing compared: %s\n' "$name" "${last#submodule_pin: }"
                 skipped=$((skipped + 1)); continue ;;
         esac
-        printf 'ok    %-42s %s\n' "$name" "$last"
-        ok=$((ok + 1))
-    else
-        printf 'FAIL  %-42s %s\n' "$name" "$last"
-        failed=$((failed + 1))
-        # The whole output, not its last line: the case that matters is a checker whose summary is
-        # generic and whose detail line names the commit or file (`submodule_pin_check` prints "NOT the
-        # commit this tree pins" above a summary that only counts), and the last line sends the reader
-        # to the wrong place.
-        detail="$detail$name:"$'\n'"$out"$'\n'
     fi
+    # engine#3116: classify() is the ONLY place a row's exit code becomes a verdict, so the table the self-test asserts
+    # is the table the run uses. It used to be an `if 77 / elif 0 / else FAIL` chain here, which is why 2 fell through to
+    # FAIL and a shallow clone read as a verdict on the PR.
+    case "$(classify "$rc" "$name" "$last")" in
+        ok) ok=$((ok + 1)) ;;
+        skip|cannot-tell) skipped=$((skipped + 1)) ;;
+        *)
+            failed=$((failed + 1))
+            # The whole output, not its last line: the case that matters is a checker whose summary is
+            # generic and whose detail line names the commit or file (`submodule_pin_check` prints "NOT the
+            # commit this tree pins" above a summary that only counts), and the last line sends the reader
+            # to the wrong place.
+            detail="$detail$name:"$'\n'"$out"$'\n'
+            ;;
+    esac
 done
 
 echo

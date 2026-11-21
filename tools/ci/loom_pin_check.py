@@ -154,6 +154,23 @@ def check(cfg_path, source=None, python=None, wheel=None, loom_serve=None, insta
                         f' but {sha[:10]} names {catalog or "<none>"}')
     notes.append(f'{cfg["package"]} {have} at {sha[:10]} in {src}')
 
+    # A `ref=`/`branch=` beside the sha must name the SAME commit in THIS clone. That is how this pin went wrong once:
+    # `v0.2.0` is a May tag of our fork (12f2db54, and it carries no version.json) while the sha is upstream's SDK-0.2.0
+    # commit, so a reader who trusted the tag fetched the wrong history. A ref the clone does not carry is a note (a
+    # partial clone is legitimate); a ref that resolves to a different commit is a finding.
+    for key in ('ref', 'branch'):
+        want_ref = cfg.get(key)
+        if not want_ref:
+            continue
+        got = git(src, 'rev-parse', '--verify', '--quiet', want_ref + '^{commit}')
+        if got.returncode != 0:
+            notes.append(f'{key}={want_ref} does not resolve in {src}: not compared against the pinned sha')
+        elif got.stdout.strip() != sha:
+            findings.append(f'{cfg_path} says {key}={want_ref}, which is {got.stdout.strip()[:10]} in {src}, but sha= is '
+                            f'{sha[:10]} -- one name, two histories')
+        else:
+            notes.append(f'{key}={want_ref} resolves to the pinned {sha[:10]}')
+
     gitlink = git(src, 'rev-parse', 'HEAD').stdout.strip()
     inside = git(src, 'merge-base', '--is-ancestor', sha, 'HEAD').returncode == 0 if gitlink else False
     notes.append(f'{sha[:10]} is {"an ancestor of" if inside else "NOT an ancestor of"} the local clone head {gitlink[:10]}')
@@ -265,6 +282,17 @@ def self_test():
         'a catalog named by TAG is accepted when model_catalog_ref names it')
     chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.1.0'), source=str(src)) == 1,
         '...and a ref the release does not name is still a finding')
+
+    # refs for the ref-vs-sha guard below: one honest, one the trap (a name that means another commit)
+    subprocess.run(['git', '-C', str(src), 'branch', '-f', 'release-tag', rsha], check=True)
+    dev = subprocess.run(['git', '-C', str(src), 'rev-parse', 'HEAD~1'], capture_output=True, text=True).stdout.strip()
+    subprocess.run(['git', '-C', str(src), 'branch', '-f', 'dev-tag', dev], check=True)
+    chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.2.0', ref='release-tag'), source=str(src)) == 0,
+        'a ref= that resolves to the pinned commit is accepted')
+    chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.2.0', branch='no-such-branch'), source=str(src)) == 0,
+        'a ref the clone does not carry is a note, not a finding')
+    chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.2.0', ref='dev-tag'), source=str(src)) == 1,
+        '...and a ref= resolving to a DIFFERENT commit is a finding (the v0.2.0 trap: one name, two histories)')
 
     # The shipped ARTEFACT: a release is a wheel with a hash, not just a version string.
     whl = tmp / 'hrx_loom-0.2.0-py3-none-any.whl'

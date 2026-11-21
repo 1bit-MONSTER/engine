@@ -679,12 +679,18 @@ add_test(NAME pre_pr_checks_self COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/pre-pr
 # Measured on main at 7f8613b4c, full clone, under thermal-run.sh: 12 green / 3 skipped / 0 could not be told, wall 19.18 s.
 # RUN_SERIAL because one row (`cmake_configure_check`) runs a CMake configure: a configure racing another row that reads the
 # build tree is a race, not a check.
-add_test(NAME pre_pr_checks_tree COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/pre-pr-checks.sh --base origin/main
-         --base-optional --tree-only)
+# engine#3131 (follow-up to #3138): `--base-optional` made the row runnable in a shallow checkout, but it also meant the
+# four `--base` rows answered cannot-tell there -- so the incident-catching half was reported, not enforced. The wrapper
+# asks for the history first (`git fetch --unshallow`, 4.9 s measured on this repository) and keeps `--base-optional` only
+# for the case where that fetch cannot happen, where eight enforced rows beat twelve red for an environment no PR chose.
+add_test(NAME pre_pr_checks_tree COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pre_pr_checks_ci.sh)
 # WORKING_DIRECTORY for the reason the other git-reading rows set it: ctest runs a test with the BUILD directory as its
 # cwd, and an out-of-tree build (`-B ~/.cache/…`) is then outside the work tree, where the runner exits 2 with "not
 # inside a git work tree" -- measured on a build dir under ~/.cache, where it took the two rows above down with it.
 set_tests_properties(pre_pr_checks_tree PROPERTIES RUN_SERIAL TRUE WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# ... and the wrapper's three decisions get the same treatment the modes test gives the runner: driven through the state
+# they decide on (a real `--depth 1` clone, one with its remote removed, one complete), never asserted from prose.
+add_test(NAME pre_pr_checks_ci_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pre_pr_checks_ci_test.sh)
 # ... and the two modes that row depends on are a contract, not prose: `--tree-only` must drop exactly the open-PR rows,
 # and `--base-optional` must turn a missing base into cannot-tell while still counting it. Two runs, ~2 s total on a
 # cached configure check (the tools are the cost, and they run either way in the row above).

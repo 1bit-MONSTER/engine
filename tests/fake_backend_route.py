@@ -43,7 +43,10 @@ for i, a in enumerate(argv):
     if a in ("--port", "-p") and i + 1 < len(argv):
         port = int(argv[i + 1])
         break
-assert port, "no port in " + " ".join(argv)
+# engine#3130: `--port 0` REQUESTS an ephemeral port, it does not omit one. `assert port` is falsy for 0, so a launch
+# that hands this fake `--port 0` (what a rail doing `serve --port 0` looks like once its children follow) died here
+# before it could report anything, and the failure read as "the fake never started".
+assert port is not None, "no port in " + " ".join(argv)
 
 
 class H(BaseHTTPRequestHandler):
@@ -84,4 +87,8 @@ class H(BaseHTTPRequestHandler):
 
 
 time.sleep(0.5)  # a real backend takes a moment to load; serve must answer 503 meanwhile
-ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+_srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+# the line llama-server prints (tools/server/server.cpp:339), so a launcher that passed `--port 0` can read back the
+# port this fake actually bound -- i.e. the fake behaves like the real backend one level down (engine#3130).
+print("listening on http://127.0.0.1:%d" % _srv.server_address[1], file=sys.stderr, flush=True)
+_srv.serve_forever()

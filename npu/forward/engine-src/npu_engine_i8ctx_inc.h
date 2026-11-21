@@ -82,6 +82,13 @@ struct ElfHost {
     }
 };
 
+// The process-wide pool init_elf() fills, keyed by the ELF's canonical path. engine#1783: also read by
+// XdnaTarget::shared_instance(), which hands out a further instance of an ELF a design already opened, on its context.
+inline std::map<std::string, std::shared_ptr<ElfHost>>& elf_host_pool() {
+    static std::map<std::string, std::shared_ptr<ElfHost>> pool;
+    return pool;
+}
+
 struct I8Ctx {
     int MD, KD, ND, NL;
     // Consume a `aiecc --generate-full-elf` artifact directly: the ELF bundles
@@ -250,7 +257,7 @@ struct I8Ctx {
             // going from one role to another inside that ELF does not pay a switch.
             char canon[PATH_MAX];
             const std::string key = realpath(ep, canon) ? std::string(canon) : std::string(ep);
-            static std::map<std::string, std::shared_ptr<ElfHost>> pool;
+            auto& pool = elf_host_pool();
             auto it = pool.find(key);
             if (it != pool.end()) {
                 host_ = it->second;

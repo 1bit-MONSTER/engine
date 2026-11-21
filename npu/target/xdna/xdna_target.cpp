@@ -101,6 +101,23 @@ XdnaTarget::~XdnaTarget() = default;
 // probe, the same two refusals, the same per-role log line, and the same adopt-then-open order.  What
 // changed is who owns it -- a missing or unloadable artifact is now refused by the target that would
 // launch it, instead of by a caller that then hands it a context.
+xrt::ext::kernel* XdnaTarget::shared_instance(const std::string& elf_path, const std::string& inst, std::string* why) {
+    char canon[PATH_MAX];
+    const std::string key = realpath(elf_path.c_str(), canon) ? std::string(canon) : elf_path;
+    auto& pool = elf_host_pool();
+    const auto it = pool.find(key);
+    if (it == pool.end()) {
+        *why = key + " is not open in this process";
+        return nullptr;
+    }
+    try {
+        return it->second->get(inst);
+    } catch (std::exception& ex) {
+        *why = key + " " + inst + ": " + ex.what();
+        return nullptr;
+    }
+}
+
 bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string& err) {
     const std::string& dir = setup_.kernels_dir;
     const bool b8 = setup_.b8;

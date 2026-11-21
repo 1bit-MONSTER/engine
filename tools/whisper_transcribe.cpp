@@ -62,6 +62,7 @@
 #endif
 #include "audio_pack.h"
 #include "whisper_ids.h"
+#include "file_create.h"   // ONEBIT_WHISPER_ENC_SAVE writes 0600 files
 #include "audio_parallel.h"
 #include "audio_mel.h"
 #include "onnx_graph.h"
@@ -446,8 +447,17 @@ int main(int argc, char** argv) {
                 if (dev_hook != nullptr && npu_dev.target->profiling()) npu_dev.target->dump_profile();
 #endif
                 std::printf("encoder repeat %d: %.3f s (device_gemm %.3f s, rest %.3f s, fused attention groups %zu, folded "
-                            "epilogues %zu)\n", r, pass_s, dev_s, pass_s - dev_s, tmp.fused_attention_groups,
-                            tmp.folded_epilogues);
+                            "epilogues %zu, npu attention groups %zu)\n", r, pass_s, dev_s, pass_s - dev_s,
+                            tmp.fused_attention_groups, tmp.folded_epilogues, tmp.npu_attention_groups);
+#ifdef ONEBIT_WHISPER_NPU
+                if (npu_dev.attn) {   // engine#1783: the attention launches so far (accumulated over the process)
+                    const auto& at = *npu_dev.attn;
+                    std::printf("npu attention: %d launch(es), pack %.1f ms, wait %.1f ms, unpack %.1f ms (per launch %.2f / "
+                                "%.2f / %.2f ms)\n", at.launches, at.ms_pack, at.ms_wait, at.ms_unpack,
+                                at.launches ? at.ms_pack / at.launches : 0.0, at.launches ? at.ms_wait / at.launches : 0.0,
+                                at.launches ? at.ms_unpack / at.launches : 0.0);
+                }
+#endif
                 std::fflush(stdout);
             }
         }
@@ -455,9 +465,45 @@ int main(int argc, char** argv) {
 #ifdef ONEBIT_WHISPER_NPU
         dev_ms0 = dev_hook != nullptr ? npu_dev.gemm->device_ms() : 0.0;
 #endif
-        if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why, dev_hook)) {
+        // engine#1783 accuracy harness: ONEBIT_WHISPER_ENC_SAVE=<file> writes this window's encoder output (int64 rank, the
+        // dims, then the f32 data) and ONEBIT_WHISPER_ENC_LOAD=<file> decodes from such a file instead of running the
+        // encoder, so a dataset's encoder passes can run on the device in one short ticket and the host-only decode
+        // afterwards (the decoder never uses the device). One window only: a longer file is refused.
+        const char* enc_load = std::getenv("ONEBIT_WHISPER_ENC_LOAD");
+        const char* enc_save = std::getenv("ONEBIT_WHISPER_ENC_SAVE");
+        if ((enc_load != nullptr || enc_save != nullptr) && n_windows != 1) {
+            std::fprintf(stderr, "ONEBIT_WHISPER_ENC_LOAD/_SAVE take one 30 s window; this file has %zu\n", n_windows);
+            return 1;
+        }
+        if (enc_load != nullptr) {
+            std::FILE* f = std::fopen(enc_load, "rb");
+            int64_t rank = 0;
+            bool ok = f != nullptr && std::fread(&rank, sizeof rank, 1, f) == 1 && rank > 0 && rank <= 8;
+            xa.dims.assign(ok ? size_t(rank) : 0, 0);
+            ok = ok && std::fread(xa.dims.data(), sizeof(int64_t), size_t(rank), f) == size_t(rank);
+            size_t n = 1;
+            for (int64_t d : xa.dims) n *= size_t(d > 0 ? d : 0);
+            xa.data.resize(ok ? n : 0);
+            ok = ok && n > 0 && std::fread(xa.data.data(), sizeof(float), n, f) == n;
+            if (f != nullptr) std::fclose(f);
+            if (!ok) {
+                std::fprintf(stderr, "ONEBIT_WHISPER_ENC_LOAD: %s is not an encoder output file\n", enc_load);
+                return 1;
+            }
+        } else if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why, dev_hook)) {
             std::fprintf(stderr, "encoder (window %zu): %s\n", w, why.c_str());
             return 1;
+        }
+        if (enc_save != nullptr) {
+            std::FILE* f = onebit_fopen_private_wb(enc_save);   // 0600, never through a symlink
+            const int64_t rank = int64_t(xa.dims.size());
+            const bool ok = f != nullptr && std::fwrite(&rank, sizeof rank, 1, f) == 1 &&
+                            std::fwrite(xa.dims.data(), sizeof(int64_t), xa.dims.size(), f) == xa.dims.size() &&
+                            std::fwrite(xa.data.data(), sizeof(float), xa.data.size(), f) == xa.data.size();
+            if (f == nullptr || std::fclose(f) != 0 || !ok) {
+                std::fprintf(stderr, "ONEBIT_WHISPER_ENC_SAVE: cannot write %s\n", enc_save);
+                return 1;
+            }
         }
         const auto tw_enc = std::chrono::steady_clock::now();
 #ifdef ONEBIT_WHISPER_NPU
@@ -497,8 +543,8 @@ int main(int argc, char** argv) {
             const unsigned char* pb = reinterpret_cast<const unsigned char*>(xa.data.data());
             for (size_t i = 0; i < xa.data.size() * sizeof(float); ++i) h = (h ^ pb[i]) * 1099511628211ULL;
             std::printf("encode-only: encoder %.3f s (decode skipped), output fnv %016llx, fused attention groups %zu, folded "
-                        "epilogues %zu\n", secs(tw_enc0, tw_enc), (unsigned long long)h, xa.fused_attention_groups,
-                        xa.folded_epilogues);
+                        "epilogues %zu, npu attention groups %zu\n", secs(tw_enc0, tw_enc), (unsigned long long)h,
+                        xa.fused_attention_groups, xa.folded_epilogues, xa.npu_attention_groups);
             return 0;
         }
         if (w == 0) {

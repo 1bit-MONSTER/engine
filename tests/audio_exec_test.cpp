@@ -301,6 +301,91 @@ int main(int argc, char** argv) {
             if (same) std::printf("folded epilogues: encoder output bit-identical to the node-by-node tails\n");
         }
 
+        // engine#1783: the attention offer (ONEBIT_AUDIO_NPU_ATTN=1, AudioGemm::attn). Checks the OFFER, not a kernel:
+        // (a) with the switch unset a set hook is never called and nothing changes; (b) a hook that declines leaves every
+        // group to the host's fused path, bit for bit, and names its reason; (c) a hook that computes the attention itself
+        // (an exact f32 softmax(q kt) v in its own loop order) receives the 12 groups as [H][S][D] / [H][D][S] / [H][S][D],
+        // its output is what flows on (within 5e-3 of the host run), and both products of each group count as device ones.
+        {
+            const char* aprev = std::getenv("ONEBIT_AUDIO_NPU_ATTN");
+            const std::string akeep = aprev != nullptr ? aprev : "";
+            int calls = 0, bad_shape = 0;
+            auto fresh = [&]() {
+                AudioGemm a = dev;
+                a.device = 0;
+                a.host = 0;
+                a.host_why.clear();
+                return a;
+            };
+            AudioGemm off = fresh();
+            off.attn = [&](const float*, const float*, const float*, int64_t, int64_t, int64_t, float*, std::string*) {
+                ++calls;
+                return true;
+            };
+            unsetenv("ONEBIT_AUDIO_NPU_ATTN");
+            AudioRunResult r_off;
+            const bool ok_a = run_audio_graph(g, mel.data(), bins, frames, "", &r_off, &why, &off);
+            check(ok_a && calls == 0 && r_off.npu_attention_groups == 0 && r_off.data == rd.data,
+                  "switch unset: the attention hook is never called and the run is the plain device run");
+
+            setenv("ONEBIT_AUDIO_NPU_ATTN", "1", 1);
+            AudioGemm decl = fresh();
+            decl.attn = [&](const float*, const float*, const float*, int64_t, int64_t, int64_t, float*, std::string* w) {
+                ++calls;
+                *w = "test: declined";
+                return false;
+            };
+            AudioRunResult r_decl;
+            const bool ok_b = run_audio_graph(g, mel.data(), bins, frames, "", &r_decl, &why, &decl);
+            check(ok_b && calls == 12 && r_decl.npu_attention_groups == 0 && r_decl.fused_attention_groups == 12,
+                  "switch on, hook declines: 12 offers, all 12 groups fused on the host");
+            check(r_decl.data == rd.data, "a declined attention offer leaves the run bit-identical to the plain device run");
+            check(decl.device == 74 && decl.host == 24 &&
+                      decl.host_why.count("attention offered to the device, declined: test: declined") == 1,
+                  "a declined attention offer counts 74 device and 24 host products and names its reason");
+
+            AudioGemm took = fresh();
+            calls = 0;
+            took.attn = [&](const float* q, const float* kt, const float* v, int64_t Hh, int64_t S, int64_t D, float* out,
+                            std::string*) {
+                ++calls;
+                if (Hh != 12 || S != 1500 || D != 64) ++bad_shape;
+                parallel_units(size_t(Hh * S), [&](size_t u) {
+                    const size_t h = u / size_t(S), i = u % size_t(S);
+                    std::vector<float> sc(static_cast<size_t>(S));
+                    float mx = -INFINITY;
+                    for (int64_t j = 0; j < S; ++j) {
+                        float a = 0.0f;
+                        for (int64_t d = 0; d < D; ++d)
+                            a += q[(h * size_t(S) + i) * size_t(D) + size_t(d)] * kt[(h * size_t(D) + size_t(d)) * size_t(S) + size_t(j)];
+                        sc[size_t(j)] = a;
+                        mx = std::max(mx, a);
+                    }
+                    float l = 0.0f;
+                    for (auto& x : sc) l += (x = std::exp(x - mx));
+                    float* o = out + (h * size_t(S) + i) * size_t(D);
+                    for (int64_t d = 0; d < D; ++d) o[d] = 0.0f;
+                    for (int64_t j = 0; j < S; ++j)
+                        for (int64_t d = 0; d < D; ++d) o[d] += sc[size_t(j)] / l * v[(h * size_t(S) + size_t(j)) * size_t(D) + size_t(d)];
+                });
+                return true;
+            };
+            AudioRunResult r_took;
+            const bool ok_c = run_audio_graph(g, mel.data(), bins, frames, "", &r_took, &why, &took);
+            if (aprev != nullptr) setenv("ONEBIT_AUDIO_NPU_ATTN", akeep.c_str(), 1);
+            else unsetenv("ONEBIT_AUDIO_NPU_ATTN");
+            double maxa = 0.0;
+            for (size_t i = 0; i < r_took.data.size() && i < rd.data.size(); ++i)
+                maxa = std::max(maxa, std::fabs(double(r_took.data[i]) - double(rd.data[i])));
+            std::printf("attention offer: unset 0 calls; declined 12 -> host; taken %d groups (%zu reported), %d device / %d "
+                        "host products, max |host - taken| %.3g\n", calls, r_took.npu_attention_groups, took.device,
+                        took.host, maxa);
+            check(ok_c && calls == 12 && bad_shape == 0 && r_took.npu_attention_groups == 12,
+                  "switch on: the 12 groups go to the hook as 12 heads x 1500 x 64");
+            check(took.device == 98 && took.host == 0, "a taken group counts both products on the device: 98 device, 0 host");
+            check(r_took.dims == rd.dims && maxa < 5e-3, "the hook's attention is what flows on (within 5e-3 of the host run)");
+        }
+
         // A device that declines everything is the host run, counted as host.
         AudioGemm none;
         none.gemm = [](const std::string&, const float*, int64_t, int64_t, const float*, int64_t, std::vector<float>*,

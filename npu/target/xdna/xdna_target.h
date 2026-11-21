@@ -165,6 +165,9 @@ public:
     // the message a user sees is the same one the forward produced before this moved (an empty string
     // means no plan, i.e. a purely derived set).
     bool open_prefill(const Q4nxDesignGeom* designs, int n, std::string& err);
+    // engine#1783: instance `inst` ("main:<name>") of an ELF a design of this process already opened, on that ELF's
+    // hardware context, so launching it costs no context switch. Null + why when no design opened the ELF.
+    static xrt::ext::kernel* shared_instance(const std::string& elf_path, const std::string& inst, std::string* why);
     int  w4_rows() const { return w4_rows_; }   // 0 unless every prefill role runs the w4g32 tier
     // A weight-cache fill for the int8 families: the int8 image for the role's int8 context (kctx itself, or its decode
     // twin when kctx is the w4g32 one) and, with the w4g32 tier on, the w4g32 image for its prefill context.

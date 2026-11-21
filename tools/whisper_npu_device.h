@@ -46,7 +46,9 @@
 #include <utility>
 #include <vector>
 
+#include "audio_attn_pack.h"
 #include "audio_exec.h"
+#include "audio_parallel.h"
 #include "audio_kernel_roles.h"
 #include "audio_npu_gemm.h"
 #include "onnx_graph.h"
@@ -57,12 +59,25 @@ namespace whisper_npu {
 
 namespace x = ::npu::target::xdna;
 
+// engine#1783, ONEBIT_AUDIO_NPU_ATTN=1: the sealed set's attention instance, named by `sealed_i8_b8.attn` in the kernel
+// directory ("instance heads seq"), launched on the sealed ELF's own hardware context. Its three buffers are allocated
+// once; each call packs q, k^T and v (npu/audio_attn_pack.h), launches, and unpacks the output. The arithmetic is bf16,
+// so the encoder output differs from the host route's (off by default; see docs/npu.md).
+struct NpuAttn {
+    xrt::ext::kernel* k = nullptr;
+    std::unique_ptr<xrt::bo> q, kv, o;
+    onebit::audio::attn_pack::Geom g;
+    int launches = 0;
+    double ms_pack = 0, ms_wait = 0, ms_unpack = 0;   // accumulated over the process
+};
+
 struct Device {
     std::unique_ptr<xrt::device> dev;
     std::unique_ptr<x::XdnaTarget> target;
     std::unique_ptr<onebit::audio::NpuAudioGemm> gemm;
     onebit::npu::pack_import::AudioGemm hook;
     std::vector<std::string> missing;   // staged shapes with no ELF, "K<k> N<n>"
+    std::unique_ptr<NpuAttn> attn;      // null unless ONEBIT_AUDIO_NPU_ATTN=1 found an attention instance
 };
 
 // The staged (K, N) of every product the executor will offer, in graph order, without repeats.
@@ -166,6 +181,93 @@ inline Q4nxDesign design_enum(const std::string& role) {
     return Q4NX_DESIGN_D;   // the conv stems are filed as D; the enum only names the log line
 }
 
+// The attention instance of a sealed set: false + why when the list is missing or malformed.
+inline bool sealed_attn(const std::string& dir, std::string* name, int* H, int* S, std::string* why) {
+    std::ifstream f(dir + "/sealed_i8_b8.attn");
+    if (!f) {
+        *why = dir + "/sealed_i8_b8.attn not found (a kernel set without the attention instance)";
+        return false;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream is(line);
+        if (!(is >> *name >> *H >> *S) || *H <= 0 || *S <= 0) {
+            *why = dir + "/sealed_i8_b8.attn: \"" + line + "\" is not \"instance heads seq\"";
+            return false;
+        }
+        return true;
+    }
+    *why = dir + "/sealed_i8_b8.attn names no instance";
+    return false;
+}
+
+inline void open_attn(const std::string& kdir, Device* out) {
+    std::string name, why;
+    int H = 0, S = 0;
+    if (!sealed_attn(kdir, &name, &H, &S, &why)) {
+        std::fprintf(stderr, "npu attention: off: %s\n", why.c_str());
+        return;
+    }
+    auto a = std::make_unique<NpuAttn>();
+    a->g.H = H;
+    a->g.S = S;
+    if (!a->g.fits()) {
+        std::fprintf(stderr, "npu attention: off: %d heads x %d positions does not fit the instance's tiling\n", H, S);
+        return;
+    }
+    a->k = x::XdnaTarget::shared_instance(kdir + "/" + kSealedElf, "main:" + name, &why);
+    if (a->k == nullptr) {
+        std::fprintf(stderr, "npu attention: off: %s\n", why.c_str());
+        return;
+    }
+    a->q = std::make_unique<xrt::bo>(xrt::ext::bo(*out->dev, a->g.q_bytes()));
+    a->kv = std::make_unique<xrt::bo>(xrt::ext::bo(*out->dev, a->g.kv_bytes()));
+    a->o = std::make_unique<xrt::bo>(xrt::ext::bo(*out->dev, a->g.o_words() * 4));
+    std::fprintf(stderr, "npu attention: %s instance main:%s (%d heads x %d positions, bf16), ONEBIT_AUDIO_NPU_ATTN=1\n",
+                 kSealedElf, name.c_str(), H, S);
+    NpuAttn* ap = a.get();
+    out->attn = std::move(a);
+    out->hook.attn = [ap](const float* q, const float* kt, const float* v, int64_t H, int64_t S, int64_t D, float* o,
+                          std::string* w) {
+        namespace pk = onebit::audio::attn_pack;
+        using onebit::npu::pack_import::parallel_units;
+        const pk::Geom& g = ap->g;
+        if (H != g.H || S != g.S || D != g.D) {
+            *w = "the instance takes " + std::to_string(g.H) + " heads x " + std::to_string(g.S) + " x " +
+                 std::to_string(g.D) + ", this group is " + std::to_string(H) + " x " + std::to_string(S) + " x " +
+                 std::to_string(D);
+            return false;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        uint16_t* Q = ap->q->map<uint16_t*>();
+        uint16_t* KV = ap->kv->map<uint16_t*>();
+        parallel_units(size_t(g.tasks() * g.cols), [&](size_t u) { pk::pack_q_col(g, q, int(u) / g.cols, int(u) % g.cols, Q); });
+        parallel_units(size_t(g.H * g.chunks()),
+                       [&](size_t u) { pk::pack_kv_chunk(g, kt, v, int(u) / g.chunks(), int(u) % g.chunks(), KV); });
+        ap->q->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        ap->kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        const auto t1 = std::chrono::steady_clock::now();
+        xrt::run r = (*ap->k)(*ap->q, *ap->kv, *ap->o);
+        const int state = int(r.wait());
+        const auto t2 = std::chrono::steady_clock::now();
+        if (state != 4) {   // ERT_CMD_STATE_COMPLETED
+            *w = "launch ended in state " + std::to_string(state);
+            return false;
+        }
+        ap->o->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        const int32_t* O = ap->o->map<int32_t*>();
+        parallel_units(size_t(g.tasks() * g.cols), [&](size_t u) { pk::unpack_o_col(g, O, int(u) / g.cols, int(u) % g.cols, o); });
+        const auto t3 = std::chrono::steady_clock::now();
+        using ms = std::chrono::duration<double, std::milli>;
+        ap->ms_pack += ms(t1 - t0).count();
+        ap->ms_wait += ms(t2 - t1).count();
+        ap->ms_unpack += ms(t3 - t2).count();
+        ++ap->launches;
+        return true;
+    };
+}
+
 // Opens device 0, adopts one design per offered shape that has an ELF (M = `rows`, the ELFs' generated M), and wires the
 // executor hook. False + why when the device or an ELF cannot be opened.
 inline bool open(const onebit::npu::pack_import::OnnxGraphInfo& enc, const std::string& kdir, int rows, Device* out,
@@ -257,6 +359,13 @@ inline bool open(const onebit::npu::pack_import::OnnxGraphInfo& enc, const std::
                              std::vector<float>* C, const onebit::audio::Epilogue& ep, std::string* w) {
         return gm->gemm_ep(key, A, M, K, B, N, C, &ep, w);
     };
+    if (const char* na = std::getenv("ONEBIT_AUDIO_NPU_ATTN"); na != nullptr && na[0] == '1') {
+        if (sealed.empty())
+            std::fprintf(stderr, "npu attention: off: it lives in the sealed set (sealed_i8_b8.elf), and %s has none\n",
+                         kdir.c_str());
+        else
+            open_attn(kdir, out);
+    }
     return true;
 }
 

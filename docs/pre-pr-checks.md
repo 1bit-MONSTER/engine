@@ -25,7 +25,13 @@ Run them from the repository root on the branch you are about to hand over.
 commands; a check that cannot run says `skip` and why — `77` (cannot run here) or `2` (cannot tell, e.g. the loss
 checks in a shallow clone — counted separately as "could not be told", never as a skip), both named in the summary with
 the tool's own reason; a row whose own invocation is wrong
-still fails, and an unresolvable `--base` is a usage error rather than a skip). One further check is an **author's check**, true or false exactly once — when you add a page — so it is not in the runner, and the section
+still fails, and an unresolvable `--base` is a usage error rather than a skip).
+
+**Which rows can answer `2`**: the four that classify against a merge base — `registration_loss_check`, `guard_loss_check`,
+`doc_section_loss_check` (all three name a shallow clone) and `branch_stale_check` (no merge base) — plus
+`pr_branch_stale_check` under `--advisory`, which converts its own cannot-tell to `77` and therefore reports as a skip.
+So `could not be told: 3` on a `--depth 1` tree is the guards working, not a breakage; on a full clone it means the merge
+base is missing (unrelated histories), which is a different thing and also not this PR's fault. One further check is an **author's check**, true or false exactly once — when you add a page — so it is not in the runner, and the section
 below says why. The table's order is the runner's order: cheapest and most common first, and last the checks that need a revision (`--base`) or a fetched tree.
 
 | command | red means |

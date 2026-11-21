@@ -66,7 +66,11 @@ classify() {  # <rc> <name> <last line> <whole output> -> prints the verdict lin
             # on #3117). Everything else that exits 2 refused to judge -- shallow clone, no merge base, unreadable ref.
             case "$4" in
                 *usage:*error:*) printf 'FAIL  %-42s %s\n' "$2" "$3"; BUCKET=fail ;;
-                *)               printf 'skip  %-42s %s\n' "$2" "$3"; BUCKET=cannot-tell ;;
+                # engine#3116 review: print `cannot-tell`, not `skip`. The summary counts this bucket separately
+                # ("N could not be told"), so a `skip` label left the column and the summary disagreeing -- six `skip`
+                # lines above "4 skipped, 2 could not be told", which is precisely the distinction this change exists to
+                # make visible. It also makes `grep '^cannot-tell'` answer "which rows could not look?" directly.
+                *)               printf 'cannot-tell  %-34s %s\n' "$2" "$3"; BUCKET=cannot-tell ;;
             esac ;;
         0)  printf 'ok    %-42s %s\n' "$2" "$3"; BUCKET=ok ;;
         *)  printf 'FAIL  %-42s %s\n' "$2" "$3"; BUCKET=fail ;;
@@ -131,7 +135,9 @@ if [ "${1:-}" = "--self-test" ]; then
     }
     arm 0  ok          "ok    stub_row"
     arm 77 skip        "skip  stub_row"
-    arm 2  cannot-tell "skip  stub_row"
+    # ... and the expected LABEL moves with it: this arm used to pin "skip  stub_row", i.e. the defect, in the test
+    # written to catch it (engine#3116 review).
+    arm 2  cannot-tell "cannot-tell  stub_row"
     # ... and a row that exits 2 because its OWN invocation is wrong stays red (argparse), which is the one 2 that is
     # not "cannot tell": a broken row must not read as a skip (cl-infra's catch on #3117).
     classify 2 "stub_row" "stub.py: error: the following arguments are required: --base" "usage: stub.py [-h] --check\nstub.py: error: the following arguments are required: --base" >/dev/null

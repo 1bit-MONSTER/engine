@@ -244,6 +244,31 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   rm -f "$(provenance_file "$d/deployed.sh")"
   [ "$(check_deployed "$d/deployed.sh" >/dev/null 2>&1; echo $?)" = 2 ] \
     || { echo "FAIL: a deployed copy with no provenance must be 'cannot tell' (rc 2), not a pass"; fail=1; }
+  # engine#3087: `--against <ref>` must say whether the deployed copy is CURRENT, not merely that it matches its own label.
+  # Three arms, and the third is the one that matters: absent a named repo the answer is "cannot tell", never a pass -- a
+  # check that silently passes on a box with no checkout is how a stale instrument runs for a week.
+  rm -rf "$d/cmp" && mkdir -p "$d/cmp/repo" && fixture_repo "$d/cmp/repo" \
+    && install_sampler "$d/cmp/repo/tools/diag/accel_sampler.sh" "$d/cmp/live.sh" "$(git -C "$d/cmp/repo" rev-parse HEAD)" >/dev/null 2>&1
+  ( ACCEL_SAMPLER_REPO=$d/cmp/repo check_deployed "$d/cmp/live.sh" --against HEAD >/dev/null 2>&1 ) \
+    || { echo "FAIL: a deployed copy identical to the ref must be rc 0 under --against (engine#3087)"; fail=1; }
+  printf '# one more line\n' >> "$d/cmp/repo/tools/diag/accel_sampler.sh" \
+    && git -C "$d/cmp/repo" -c user.email=t@t -c user.name=t commit -qam forward
+  stale_out=$( ACCEL_SAMPLER_REPO=$d/cmp/repo check_deployed "$d/cmp/live.sh" --against HEAD 2>&1 ); stale_rc=$?
+  [ "$stale_rc" = 1 ] \
+    || { echo "FAIL: a deployed copy one commit behind the ref must be rc 1 under --against, got rc $stale_rc"; fail=1; }
+  case "$stale_out" in
+    *STALE*) ;;
+    *) echo "FAIL: a stale deployed copy must say STALE, said: $stale_out"; fail=1 ;;
+  esac
+  printf '%s\n' "$stale_out" | grep -q "$(sha256sum "$d/cmp/live.sh" | cut -d' ' -f1)" \
+    || { echo "FAIL: the STALE message must print the deployed sha, so a reader can compare"; fail=1; }
+  ( unset ACCEL_SAMPLER_REPO; check_deployed "$d/cmp/live.sh" --against HEAD >/dev/null 2>&1 ); rc_norepo=$?
+  [ "$rc_norepo" = 2 ] \
+    || { echo "FAIL: --against with no ACCEL_SAMPLER_REPO must be 'cannot tell' (rc 2), got rc $rc_norepo -- a check that passes without a checkout is the bug"; fail=1; }
+  # ... and the no-argument contract is untouched: still a clean pass for a freshly installed copy.
+  ( unset ACCEL_SAMPLER_REPO; check_deployed "$d/cmp/live.sh" >/dev/null 2>&1 ) \
+    || { echo "FAIL: the no-argument check-deployed must keep its old contract (engine#3087 changed nothing by default)"; fail=1; }
+
   # engine#2478: the per-device split must be in the summary, because a single total is the number that hid 1472 NVMe
   # records being read as an NPU stream. Fixture: one line of each device, and both must appear as their own row.
   mkdir -p "$d/dev"
@@ -423,11 +448,22 @@ install_sampler() {  # install <repo-root-or-script> <dest> [commit] -- dest is 
   echo "install: $dest sha256 $sha commit $commit"
 }
 
-check_deployed() {  # check-deployed [dest] -- rc 0 the deployed copy is the bytes its provenance names, 1 drifted, 2 cannot tell
+check_deployed() {  # check-deployed [dest] [--against <ref>] -- rc 0 current, 1 drifted/behind, 2 cannot tell
   # No argument means THE DEPLOYED COPY, not "$0": run from a checkout, `$0` is the repo's copy and the question a reader
   # is asking ("are the bytes the unit runs the bytes that were deployed?") gets answered about the wrong file. That was
   # review ask 1 on #2815: the two commands must agree on one path, so both name $DIR/accel-sampler.sh.
-  local dest=${1:-$DIR/accel-sampler.sh} prov sha_actual sha_expected
+  # engine#3087: `--against <ref>` answers the question a lane actually asks -- "is the deployed copy CURRENT with <ref>?"
+  # The no-argument contract is untouched: by default this still compares the deployed bytes to their own provenance, which
+  # says the bytes match their label and says nothing about the label's age. On 2026-11-21 that printed `ok` all night for a
+  # sampler one commit behind main, and only a hand diff against `git show origin/main:…` showed it.
+  local dest=$DIR/accel-sampler.sh against=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --against) against=${2:-}; shift 2 || shift ;;
+      *) dest=$1; shift ;;
+    esac
+  done
+  local prov sha_actual sha_expected
   prov=$(provenance_file "$dest")
   if [ ! -f "$prov" ]; then
     echo "check-deployed: cannot tell: no provenance beside $dest (run: accel_sampler.sh install <repo> $dest <commit>)" >&2
@@ -443,7 +479,35 @@ check_deployed() {  # check-deployed [dest] -- rc 0 the deployed copy is the byt
     echo "check-deployed: DRIFTED $dest: $(sed -n 's/^commit=//p' "$prov") deployed sha256 $sha_expected, on disk $sha_actual" >&2
     return 1
   fi
-  echo "check-deployed: ok $dest sha256 $sha_actual commit $(sed -n 's/^commit=//p' "$prov")"
+  local deployed_commit
+  deployed_commit=$(sed -n 's/^commit=//p' "$prov")
+  if [ -n "$against" ]; then
+    # The repo is named, never guessed: a checkout found by accident is the guess this lane keeps having to retract. Absent
+    # `ACCEL_SAMPLER_REPO` the honest answer is "cannot tell", which is what a reader can act on.
+    local repo=${ACCEL_SAMPLER_REPO:-}
+    if [ -z "$repo" ] || [ ! -d "$repo/.git" ]; then
+      echo "check-deployed: cannot tell: --against $against needs ACCEL_SAMPLER_REPO to name a git checkout (got '${repo:-unset}')" >&2
+      return 2
+    fi
+    local sha_ref
+    sha_ref=$(git -C "$repo" show "$against:tools/diag/accel_sampler.sh" 2>/dev/null | sha256sum | cut -d' ' -f1)
+    if [ -z "$sha_ref" ]; then
+      echo "check-deployed: cannot tell: $repo has no tools/diag/accel_sampler.sh at $against" >&2
+      return 2
+    fi
+    if [ "$sha_ref" != "$sha_actual" ]; then
+      local behind=""
+      if [ -n "$deployed_commit" ] && [ "$deployed_commit" != unknown ]; then
+        behind=$(git -C "$repo" rev-list --count "$deployed_commit..$against" -- tools/diag/accel_sampler.sh 2>/dev/null)
+        [ -n "$behind" ] && behind=", $behind commit(s) behind"
+      fi
+      echo "check-deployed: STALE $dest: deployed sha256 $sha_actual (commit $deployed_commit${behind}); $against has $sha_ref -- run install + restart accel-sampler.service" >&2
+      return 1
+    fi
+    echo "check-deployed: ok $dest is $against's copy (sha256 $sha_actual, commit $deployed_commit) -- current"
+    return 0
+  fi
+  echo "check-deployed: ok $dest sha256 $sha_actual commit $deployed_commit"
 }
 
 # engine#3072: a run that resolves to the unit's own directory overwrites what the fleet reads. NOT called by `selftest`,

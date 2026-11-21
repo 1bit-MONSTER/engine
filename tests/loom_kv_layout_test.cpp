@@ -15,8 +15,9 @@
 //
 // loom_kv_layout_test.cpp -- the Loom hybrid handover's state arithmetic (app/loom_kv_layout.h, engine#3157).
 //
-// Every expected number here is read out of the MIT Loom sources (hrx-loom-library cb9ae9e, Qwen/Qwen3.8-27B), not
-// produced by the header, so this is a check on the arithmetic rather than a snapshot of it:
+// Every expected number here is read out of the MIT Loom sources (hrx-loom-library v0.2.0, the tag a shipped card's
+// `model-catalog` names; Qwen/Qwen3.8-27B), not produced by the header, so this is a check on the arithmetic rather
+// than a snapshot of it. Every one of them is identical on upstream HEAD, so the values are not a property of the tag:
 //
 //   attention_layer_decode.loom:75  %cache_token_bytes = 2048        (1024 f16 per token, per K and per V)
 //   attention_layer_decode.loom:77  buffer.pack [align(256) cache_bytes, align(256) cache_bytes]

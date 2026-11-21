@@ -25,11 +25,16 @@
 //   epoch.loom:16          prefill body                                          launch(%parameters, %residual, %control,
 //                                                                                        %gdn_state, %attention_cache, …)
 //
-// measured from hrx-loom-library cb9ae9e (MIT, (c) 2026 AMD ROCm Software), model Qwen/Qwen3.8-27B -- a hybrid like
-// ours: 64 layers, 16 full-attention ordinals (0..15) and 48 gated-delta-net ordinals (0..47). The arithmetic below is
-// that file's, not an interpretation: attention_layer_decode.loom:74-83 and gdn_layer_decode.loom:69-76. Re-read after
-// the pin moved ba7abef -> cb9ae9e (132 commits): not one of these constants changed, and the sampling fixture's own
-// literals below still agree, so the arithmetic survived the refresh unchanged.
+// measured from hrx-loom-library **v0.2.0** (`1fd6bd23`, MIT, (c) 2026 AMD ROCm Software), model Qwen/Qwen3.8-27B -- a
+// hybrid like ours: 64 layers, 16 full-attention ordinals (0..15) and 48 gated-delta-net ordinals (0..47). The arithmetic
+// below is that file's, not an interpretation: attention_layer_decode.loom:74-83 and gdn_layer_decode.loom:69-76.
+//
+// WHY v0.2.0 AND NOT HEAD. A shipped card records the exact toolchain it was built with, and the Qwen3.8-27B card's
+// `llm_config.json`/`info.json` pair names hrx_loom 0.2.0 from PyPI, hrx_system v0.2.0, and its
+// `loom/packaging/python/version.json` names `model-catalog: github:ROCm/hrx-loom-library@v0.2.0` — so the programs a
+// card runs are the tag's, and the tag is what this file is measured against. Upstream HEAD (`cb9ae9e`) is NOT an
+// ancestor of v0.2.0: the lines diverged. Every constant below is identical on both, so the layout reading is stable
+// across the divergence; the packet's word-2 contract is not, and it is described per revision below.
 //
 // CARDINALITY, because the declarations read one short if you take a range as exclusive. model_decode.loom unrolls 16
 // groups of 3 GDN layers + 1 attention layer (`:26-27`), launches gdn ordinals `3*group + {0,1,2}` (`:48-50`) and the
@@ -137,14 +142,21 @@ inline constexpr uint64_t attention_element_index(uint64_t position, uint64_t j,
 // zero-token finish that only establishes the position. The public prefill commands are stricter (range 1..512), so the
 // kernel is the only zero-length path in the library.
 //
-// Caveat a writer must carry, and the packet half of it changed meaning at cb9ae9e. Word 2 is `eos_token` to the commit
-// kernels (decode_control.loom:19,51) and the **output count** to the packet: `qwen38_packet_compact_prefix`
-// (motif/sequence/qwen3_8/packet.loom, added after ba7abef) stores `[token_count, span_count, output_count]` across words
-// 0/1/2, and the samplers read word 2 as an ABSOLUTE packet-row bound against `first + row` (kernel/sampling.loom:45,93),
-// as does kernel/output_spans.loom:35. So the two roles live in two ABIs rather than one reuse: the commit kernels' word 2
-// is EOS on the decode-only control block, and the packet's word 2 is a count written by compaction. At ba7abef nothing
-// wrote the count and the sampler's meaning was purely caller-owned; that is no longer true, and a writer that conflates
-// the two still fails silently -- an eos smaller than the output count drops rows without an error.
+// Caveat a writer must carry: word 2 means different things on the two revisions, and neither meaning is the other's.
+// To the commit kernels it is `eos_token` on the decode-only control block (decode_control.loom:19,51) — that is true on
+// both revisions.
+//
+//   v0.2.0 (the shipped cards): in the PACKET, the samplers read word 2 as the live row count
+//   (kernel/sampling.loom:45,92), as does kernel/output_spans.loom:35, and NOTHING in the library writes it — so it is a
+//   caller-owned convention: whoever fills the packet must store the count.
+//   HEAD (cb9ae9e): `qwen38_packet_compact_prefix` (motif/sequence/qwen3_8/packet.loom, absent at v0.2.0) writes
+//   `[token_count, span_count, output_count]` across words 0/1/2, and the samplers take a `%first` window and bound on
+//   `first + row < word 2` (kernel/sampling.loom:45,93) — an ABSOLUTE output count.
+//
+// So on the release a handover writer MUST store the count itself; on HEAD compaction owns it and the count is absolute.
+// A writer that mixes the two revisions' conventions fails silently in both directions: an eos id smaller than the row
+// count drops sampled rows on v0.2.0, and a per-call count written where HEAD expects an absolute one drops rows past
+// the window.
 inline constexpr uint64_t kControlWordBytes  = 4;
 inline constexpr uint64_t kControlHeaderBytes = 12;
 inline constexpr uint64_t kControlPositionOffset  = 0;  // decode: KV position; prefill: token_count
@@ -173,7 +185,8 @@ inline constexpr uint64_t packet_identity_origin(uint64_t capacity) { return 32 
 inline constexpr uint64_t packet_sources_origin(uint64_t capacity)  { return 32 + capacity * 108; }
 inline constexpr uint64_t packet_shape_origin(uint64_t capacity)    { return 32 + capacity * 112; }
 
-// Inverse of packet_bytes, the way packet.loom:92-99 recovers capacity from an allocation's length.
+// Inverse of packet_bytes, the way packet.loom:90-97 recovers capacity from an allocation's length (HEAD's copy is at
+// :92-99; the file gained a header comment after the tag).
 inline constexpr uint64_t packet_capacity(uint64_t bytes) { return (bytes - kPacketFixedBytes) / kPacketStrideBytes; }
 
 }  // namespace onebit::loom

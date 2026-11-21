@@ -4408,6 +4408,18 @@ arms measured the same. It is meant for a path that keeps the model open across 
 `ONEBIT_WHISPER_ENCODE_REPEAT=<n>` runs each window's encoder n extra times and prints each pass, so the first pass's
 one-time costs can be told apart from the per-window ones; `NPU_PROFILE=1` adds the target's per-role launch costs.
 
+**Transcript accuracy on a speech set (engine#1783).** Four fixtures cannot tell a small accuracy change from none, so
+the device route has a word-error-rate harness. `tools/whisper_ls_subset.py <dir>` writes a fixed LibriSpeech
+test-clean subset (CC BY 4.0; 305 utterances, 24 speakers, 37.7 min, 6,227 words, one 30 s window each) as wav files
+plus `manifest.json`, reading only the needed parts of the Hugging Face parquet conversion. `ONEBIT_WHISPER_ENC_SAVE=<file>`
+writes a window's encoder output (rank, dims, f32 data; one-window files only) and `ONEBIT_WHISPER_ENC_LOAD=<file>`
+decodes from such a file instead of running the encoder, so a set's encoder passes can run on the device in short
+launches of the tool and the host-only decode afterwards (the decoder never uses the device; the ids match the
+in-process decode). `tools/whisper_wer.py <manifest> <arm dir> [<reference arm dir>]` reads each `<id>.log`'s `ids:`
+line, detokenises with the multilingual Whisper tokenizer, applies Whisper's English normalizer to both sides and
+prints the corpus WER; against a reference arm it also prints the WER difference, the utterances with identical token
+sequences and the token edit distance.
+
 **RoPE pair order (engine#2673).** The forward's RoPE rotates half-split pairs (i, i + rot/2), the HF `rotate_half`
 form. chatglm3's attention nodes (28 `com.ryzenai:GQO` in `chatglm3-6b-onnx-ryzenai-npu`'s `fusion.onnx`) state
 `rotary_interleaved = 1` with `rotary_embedding_dim = 64`, meaning consecutive pairs (2i, 2i+1) over the first 64 of

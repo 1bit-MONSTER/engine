@@ -370,6 +370,13 @@ rows = [
     ("boot gtt",     "tr ' ' '\\n' < /proc/cmdline | grep -E '^(ttm\\.|amdgpu\\.)'; "
                      "tr ' ' '\\n' < /proc/cmdline | grep -c '^ttm.pages_limit=31457280$'",
                      "ttm.pages_limit=31457280"),
+    # engine#3088: the YMTC PC41Q-2TB this box ships is DRAM-less and the driver over-reads its 32-entry PRP list; with
+    # `nvme.quirks=1e49:1081:dmapool_align_512` the fault stream stops (engine#2478: 2-83 IO_PAGE_FAULTs/h -> 0 over
+    # 7 h). Read off the RUNNING boot like `boot gtt`, so a stick that lost the parameter is caught after the fact and
+    # not by trusting the builder that would have written it.
+    ("boot nvme quirk", "tr ' ' '\\n' < /proc/cmdline | grep -E '^nvme\\.'; "
+                     "tr ' ' '\\n' < /proc/cmdline | grep -c '^nvme.quirks=1e49:1081:dmapool_align_512$'",
+                     "nvme.quirks=1e49:1081:dmapool_align_512"),
     # Cycle 14, item 2: who owns tty1. `U2 tty1` reads what a person sees; this says which process put it
     # there, because the board run had a prompt in QEMU and none on the hardware and only this line names the
     # difference. 1bit-console is the appliance's own entry (inittab), plogin is what it replaced.

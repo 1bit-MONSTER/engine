@@ -320,6 +320,10 @@ add_test(NAME kernel_pin COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_pin_test.
 # The budget is `BITX_SERVE_WAIT_S` and the message carries the child's own last line; both are checked here with a stub
 # binary under a fake ticket, so this runs in CI with no NPU, no container and no device.
 add_test(NAME npu_kernel_bitx_wait COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_kernel_bitx_wait_test.sh ${CMAKE_SOURCE_DIR}/scripts/npu-kernel-bitx.sh)
+# engine#3200: the same two defects in npu-window11.sh, which has the mirror of that readiness arm. Device-free for the
+# same reason -- a stub binary that never binds, so no NPU, container or ticket is involved. Kept as its own row rather
+# than folded into the one above so it can fail on its own file.
+add_test(NAME npu_window11_wait COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_window11_wait_test.sh ${CMAKE_SOURCE_DIR}/scripts/npu-window11.sh)
 # engine#2183: the lost-update class has a second medium. `registration_loss_check` covers what a branch removes
 # from the BUILD; this covers what it removes from the DOCS -- a rebase that resolved `docs/npu.md` by taking the
 # branch's side dropped a section that had merged that morning (#2314). Offline, git-only, no build input.

@@ -446,17 +446,29 @@ if [ "$FOLDED" = 1 ]; then
 fi
 # `env` and not a bare array expansion: in command position bash reads `NPU_PB16I_TRACE=0` as the command name
 # (measured: every arm "served" for 0 s and the log said `NPU_PB16I_TRACE=0: command not found`).
+# WAIT BUDGET (engine#3200): `seq 1 600` was a constant, so the never-binds path could not be exercised by a test
+# without waiting ten minutes, and the failure said nothing about the budget that expired. Validated BEFORE the spawn
+# so a bad value exits 2 without starting a serve. Same knob shape as `BITX_SERVE_WAIT_S` in npu-kernel-bitx.sh
+# (engine#3194/#3195), so the two arms fail the same way.
+SERVE_WAIT_S=${NPU_WINDOW11_SERVE_WAIT_S:-600}
+case "$SERVE_WAIT_S" in
+    ''|*[!0-9]*|0) echo "npu-window11: NPU_WINDOW11_SERVE_WAIT_S must be a positive integer of seconds (got '$SERVE_WAIT_S')" >&2; exit 2 ;;
+esac
 NPU_PROFILE=1 NPU_NO_DEVICE_LOCK=1 env "${TAPENV[@]}" "$BIN" forward-serve -m "$MODEL" --kernels "$KERNELS" \
     -p "$PORT" > "$OUT.serve" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT INT TERM
 
-for _ in $(seq 1 600); do
+for _ in $(seq 1 "$SERVE_WAIT_S"); do
     curl -sf -m 2 "localhost:$PORT/health" >/dev/null 2>&1 && break
     kill -0 $SPID 2>/dev/null || { echo "serve died; see $OUT.serve" >&2; tail -5 "$OUT.serve" >&2; exit 1; }
     sleep 1
 done
-curl -sf -m 2 "localhost:$PORT/health" >/dev/null 2>&1 || { echo "serve never became ready" >&2; exit 1; }
+# The OTHER way to fail, and the one that used to say nothing (engine#3200): a serve that stays alive and never binds
+# looks exactly like a 14B host arm warming its weight cache. Mirror the death arm above -- name the budget, name the
+# log file, show its tail -- so "never became ready" is never again the whole diagnosis.
+curl -sf -m 2 "localhost:$PORT/health" >/dev/null 2>&1 || {
+    echo "serve never became ready within ${SERVE_WAIT_S}s; see $OUT.serve" >&2; tail -5 "$OUT.serve" >&2; exit 1; }
 
 # Three fixed greedy prompts (no temperature field = greedy), fixed token budget: the same three every run.
 PROMPTS=(

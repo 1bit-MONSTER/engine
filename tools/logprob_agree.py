@@ -43,8 +43,9 @@ wire. Each log-prob is cast to float32 and compared as bits, which is exact for 
 server promoted to a double for serialisation — the tool asserts that round trip holds for every
 value it compares and reports how many values had to be dropped as non-float32.
 
-Exit code: 0 all routes deterministic and all pairs exactly equal, 1 a route is non-deterministic
-or a pair differs, 2 a route is unreachable or a request failed.
+Exit code: 0 all routes deterministic and all pairs exactly equal, 1 a route is non-deterministic or a
+pair differs -- including a pair that had no position to compare, which prints *cannot tell* rather than
+"0.000000 nats", 2 a route is unreachable or a request failed.
 """
 import argparse
 import json
@@ -98,6 +99,109 @@ def bits(x):
 
 def usable(x):
     return x is not None and isinstance(x, (int, float)) and not (math.isnan(x) or math.isinf(x))
+
+
+def _position_distribution(tok, by="id"):
+    """One position's next-token distribution from its top-N, renormalised over what it carries.
+
+    Two approximations, both stated rather than hidden: the entries below top-N are not on the
+    wire, so their mass is dropped and the rest renormalised; and a log-prob the server sent as a
+    non-finite value is skipped rather than guessed.
+    """
+    top = tok.get("top") or []
+    ps = {}
+    for t in top:
+        lp = t.get("lp")
+        if lp is None or not math.isfinite(lp):
+            continue
+        ps[tok_key({"id": t.get("id"), "token": t.get("token")}, by)] = math.exp(lp)
+    z = sum(ps.values())
+    return {k: v / z for k, v in ps.items()} if z > 0 else {}
+
+
+def kld(ref_tokens, cand_tokens, by="id", eps=1e-12):
+    """Mean KL(candidate || reference) in nats, over positions where both routes emitted the same token,
+    plus the share of positions whose top-1 the two routes agree on.
+
+    THE FORMULA, because a KLD whose direction is inferred from prose can be flipped by accident and the
+    number then looks plausible forever:
+
+        mean_kld = SUM_k p_cand(k) * ln( p_cand(k) / p_ref(k) )       over the union of the two top-N sets,
+                                                                     each renormalised to that union
+
+    i.e. **KL(candidate || reference)**: `kld(cpu, hrx)` is the mass the hybrid route puts somewhere CPU
+    would not -- the direction the gate clause "mean KLD ... vs CPU" names, and the direction
+    `tools/logits_kld.py`'s own docstring states ("the candidate's mass that the baseline would not have
+    put there") even though its current call site returns the opposite. L2 owns that discrepancy and the
+    fix (`~/.briefs` #3158, 18:40Z); this function implements the stated intent, and the arm below
+    compares against `logits_kld.kl(cand, base)` so it keeps holding when the call site is corrected.
+
+    This was flipped once already: the first version computed KL(candidate || reference), a review asked
+    for the formula in the source rather than in a comment, and the flip to the sibling's *call site*
+    direction was reverted when the sibling turned out to disagree with its own docstring. Which is the
+    argument for the formula being on this line rather than in a review thread.
+
+    Positions where the routes emitted DIFFERENT tokens are excluded rather than scored: a different
+    token is a divergence the agreement section already reports, and folding it in would make one number
+    answer two questions.
+    """
+    # Accepts a run dict (`{"tokens": [...]}`, what ask() returns and what the caller has) or a bare token
+    # list (what the self-test has). The dict form is not a convenience: the first wiring of this function
+    # passed the run dicts straight through and iterated their KEYS, which the fake-route end-to-end test
+    # caught as `AttributeError: 'str' object has no attribute 'get'` and no self-test arm could see.
+    if isinstance(ref_tokens, dict):
+        ref_tokens = ref_tokens.get("tokens") or []
+    if isinstance(cand_tokens, dict):
+        cand_tokens = cand_tokens.get("tokens") or []
+    n = same_top = truncated = 0
+    total = 0.0
+    for a, b in zip(ref_tokens, cand_tokens):
+        if tok_key(a, by) != tok_key(b, by):
+            continue
+        pa, pb = _position_distribution(a, by), _position_distribution(b, by)
+        if not pa or not pb:
+            continue
+        union = set(pa) | set(pb)
+        za = sum(pa.get(k, 0.0) for k in union)
+        zb = sum(pb.get(k, 0.0) for k in union)
+        if za <= 0 or zb <= 0:
+            continue
+        if len(union) > len(pa) or len(union) > len(pb):
+            truncated += 1
+        for k in union:
+            p = pb.get(k, 0.0) / zb          # candidate  (see the formula above)
+            q = pa.get(k, 0.0) / za          # reference
+            if p > eps:
+                total += p * math.log(p / max(q, eps))
+        n += 1
+        if max(pb, key=pb.get) == max(pa, key=pa.get):
+            same_top += 1
+    return {"positions": n,
+            "mean_kld": (total / n) if n else 0.0,
+            "same_top_token_pct": (100.0 * same_top / n) if n else 0.0,
+            "positions_with_unseen_entries": truncated}
+
+
+def kld_summary(per_pair):
+    """Aggregate pairwise kld() results into the number a row quotes.
+
+    `mean_kld` and `same_top_token_pct` are **None** when no pair contributed a position -- which is
+    exactly the case when the two routes diverged at every position, i.e. the case the accuracy row
+    exists to catch. Reporting 0.0 there would be a cannot-tell rendered as a pass: "0.000000 nats"
+    is what a reader and a JSON consumer quote as "the routes agree". The reviewer of the first
+    version of this function caught that; the helper exists so the rule has an arm instead of living
+    in a print statement.
+    """
+    positions = sum(k["positions"] for k in per_pair)
+    unseen = sum(k["positions_with_unseen_entries"] for k in per_pair)
+    out = {"positions": positions, "runs_compared": len(per_pair),
+           "mean_kld": None, "same_top_token_pct": None,
+           "positions_with_unseen_entries": unseen}
+    if positions:
+        out["mean_kld"] = sum(k["mean_kld"] * k["positions"] for k in per_pair) / positions
+        out["same_top_token_pct"] = (sum(k["same_top_token_pct"] * k["positions"] for k in per_pair)
+                                     / positions)
+    return out
 
 
 def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False):
@@ -256,7 +360,18 @@ def agreement(a, b, by="id"):
 
 
 def selftest():
-    """The comparison logic on synthetic runs: the checks a bug in it would silently pass."""
+    """The comparison logic on synthetic runs: the checks a bug in it would silently pass.
+
+    The KLD arms below are named and counted, because an auditor reading `selftest: ok` cannot see which
+    properties are covered -- the sibling tools print `7 ok, 0 failed` and `10 ok, 0 failed`, and a gate
+    is only as legible as its instruments (raised on #3225).
+    """
+    named = [0, 0]
+
+    def ok(cond, name):
+        named[0 if cond else 1] += 1
+        print(f"{'ok  ' if cond else 'FAIL'} {name}")
+        assert cond, name
     t = lambda i, lp, top=1: {"id": i, "token": f"t{i}", "lp": lp,  # noqa: E731
                               "top": [{"id": top, "token": f"t{top}", "lp": lp}]}
     # identical runs -> deterministic, no divergence
@@ -305,7 +420,89 @@ def selftest():
     assert first_divergence(noid_a["tokens"], id_only["tokens"], "text") is None
     assert first_divergence(noid_a["tokens"], id_only["tokens"], "id") == 0
     assert agreement(noid_a, id_only, "text")["exact_bit_match_rate"] == 1.0
-    print("logprob_agree selftest: ok")
+    # --- KLD (engine#3158): the accuracy row's number, which no arm above computes ---
+    def dist_tok(i, pairs):
+        """One position carrying a full top-N: pairs = [(id, logprob), ...]."""
+        return {"id": i, "token": f"t{i}", "lp": pairs[0][1],
+                "top": [{"id": k, "token": f"t{k}", "lp": lp} for k, lp in pairs]}
+
+    # identical distributions -> exactly zero, and every top-1 agrees
+    same = [dist_tok(1, [(1, math.log(0.5)), (2, math.log(0.5))])]
+    k = kld(same, same)
+    ok(k["positions"] == 1 and k["mean_kld"] == 0.0 and k["same_top_token_pct"] == 100.0,
+       "identical distributions -> exactly 0.0 nats and 100 % same-top")
+    # hand-computed, in the formula's direction: ref {A .5, B .5} vs cand {A .75, B .25}
+    #   KL(cand || ref) = .75*ln(.75/.5) + .25*ln(.25/.5) = 0.1013663 - 0.1732868 -> 0.1308120 nats
+    # (the reverse, KL(ref || cand), is .5*ln(.5/.75) + .5*ln(.5/.25) = 0.1438410 -- the arm below)
+    ref = [dist_tok(1, [(1, math.log(0.5)), (2, math.log(0.5))])]
+    cand = [dist_tok(1, [(1, math.log(0.75)), (2, math.log(0.25))])]
+    k = kld(ref, cand)
+    ok(abs(k["mean_kld"] - 0.1308120) < 1e-6,
+       f"a hand-computed KL(cand||ref) is 0.1308120 nats (got {k['mean_kld']:.7f})")
+    ok(k["same_top_token_pct"] == 100.0, "top-1 unchanged while the mass moves under it -> same-top 100 %")
+    # KL is not symmetric and the reverse direction is asserted SEPARATELY, at its own value, so a flip
+    # cannot be absorbed by a tolerance: .5*ln(.5/.75) + .5*ln(.5/.25) = 0.1438410
+    ok(abs(kld(cand, ref)["mean_kld"] - 0.1438410) < 1e-6,
+       f"…and the reverse direction is its own number, 0.1438410 (got {kld(cand, ref)['mean_kld']:.7f})")
+    # the docstring IS the direction spec, so it is pinned like one: this PR has already had it read
+    # `KL(reference || reference)` (zero by definition) after a flip, and once been `None` because code
+    # was inserted above the prose. A stale first line is exactly what a reviewer skims and trusts.
+    ok(bool(kld.__doc__) and "KL(candidate || reference)" in kld.__doc__.splitlines()[0],
+       "kld's docstring first line names the direction the arithmetic computes")
+    # CROSS-TOOL: the same two distributions through the sibling KLD already in the tree, which the P4
+    # gate thresholds at --max-mean-kld. Two instruments feeding one gate must agree on which argument
+    # is p; this arm is what makes that a test instead of a claim. (logits_kld.kl takes LOGITS, so the
+    # log-probabilities are fed straight in: log_softmax of a normalised log-distribution is itself.)
+    import importlib.util as _ilu, pathlib as _pl
+    _spec = _ilu.spec_from_file_location("logits_kld", _pl.Path(__file__).with_name("logits_kld.py"))
+    _lk = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_lk)
+    _ref_logits = [math.log(0.5), math.log(0.5)]
+    _cand_logits = [math.log(0.75), math.log(0.25)]
+    # The sibling's CALL SITE is kl(base, cand) and returns KL(base||cand); its DOCSTRING describes
+    # KL(cand||base) -- "the candidate's mass that the baseline would not have put there" -- which is the
+    # direction the gate clause names and the one this function implements. L2 owns fixing the call site,
+    # so this compares against kl(cand, base): correct today, and still correct after that fix, because
+    # kl(p, q) is KL(p||q) either way.
+    # …and the sibling IS direction-sensitive, so "they agree" cannot be an accident of a symmetric fixture
+    ok(abs(_lk.kl(_ref_logits, _cand_logits) - 0.1438410362258905) < 1e-9,
+       "cross-tool: swapping the pair changes logits_kld's number (0.1438410, its other direction)")
+    _sibling = _lk.kl(_cand_logits, _ref_logits)
+    ok(abs(_sibling - k["mean_kld"]) < 1e-9,
+       f"cross-tool: logits_kld.kl(cand, base) agrees to 1e-9 ({_sibling:.7f} vs {k['mean_kld']:.7f})")
+    # a position where the routes emitted DIFFERENT tokens is excluded, not scored
+    other = [dist_tok(2, [(2, math.log(0.5)), (1, math.log(0.5))])]
+    k = kld(ref, other)
+    ok(k["positions"] == 0 and k["mean_kld"] == 0.0,
+       "a position with a different emitted token is excluded, not scored")
+    # an entry one route carries and the other does not is counted, and renormalisation is what makes
+    # the number finite -- the truncation is reported rather than silently absorbed
+    wider = [dist_tok(1, [(1, math.log(0.5)), (2, math.log(0.25)), (3, math.log(0.25))])]
+    k = kld(ref, wider)
+    ok(k["positions"] == 1 and k["positions_with_unseen_entries"] == 1 and k["mean_kld"] > 0.0,
+       "an entry only one route carries is counted, and renormalisation keeps the number finite")
+    # the ENTRY SHAPE: a run dict, which is what the caller has, must give the same answer as its token list
+    ok(kld({"tokens": ref}, {"tokens": cand})["mean_kld"] == kld(ref, cand)["mean_kld"] > 0.0,
+       "a run dict and its token list give the same answer")
+    # a missing or non-finite log-prob is skipped, not turned into a probability
+    broken = [{"id": 1, "token": "t1", "lp": None, "top": [{"id": 1, "token": "t1", "lp": None}]}]
+    ok(kld(broken, broken)["positions"] == 0, "a non-finite log-prob is skipped, not a probability")
+    # --- kld_summary: a cannot-tell must never print as 0.0 (the review of #3225) ---
+    # the diverged-everywhere case: kld() already returns positions 0 for it, and the summary must
+    # carry that through as "no answer" rather than averaging an empty set into a perfect score
+    zero = kld(ref, other)                      # different emitted tokens -> positions 0
+    sm = kld_summary([zero])
+    ok(sm["positions"] == 0 and sm["mean_kld"] is None and sm["same_top_token_pct"] is None,
+       "kld_summary: no positions -> None, never 0.0")
+    # an empty pair list is the same state, not a different one
+    ok(kld_summary([])["mean_kld"] is None, "kld_summary: an empty pair list is the same cannot-tell")
+    # and a real list aggregates weighted by positions, not by pair
+    sm = kld_summary([kld(ref, cand), zero])
+    ok(sm["positions"] == 1 and abs(sm["mean_kld"] - 0.1308120) < 1e-6 and sm["runs_compared"] == 2,
+       "kld_summary: weighted by positions, and runs_compared counts the pairs")
+    # truncation is carried through to the summary, because the printed line shows it from here
+    sm = kld_summary([kld(ref, wider)])
+    ok(sm["positions_with_unseen_entries"] == 1, "kld_summary: truncation is carried through")
+    print(f"logprob_agree selftest: {named[0]} ok, {named[1]} failed (KLD arms named; the rest assert)")
 
 
 def main(argv=None):
@@ -454,6 +651,30 @@ def main(argv=None):
             print(f"  mean|dlogp|       {g['mean_abs_dlogp']:.6e}  over {tot_common} tokens")
             print(f"  top-1 agreement   {g['top1_agreement_rate']:.3f}")
             print(f"  exact-bit match   {g['exact_bit_match_rate']:.3f}")
+            # engine#3158: the accuracy row asks for a mean KLD against CPU, which none of the above
+            # answers -- they are all comparisons of the tokens the two routes DID emit. `--route` order
+            # is the direction: the first route is the reference, so `--route cpu=… --route hrx=…` gives
+            # KL(hrx || cpu). Truncated to the top-N both routes carry; see _position_distribution.
+            # EVERY run of both routes, paired run-with-run, not `runs[0]`: the determinism section above
+            # holds each route to repeating itself, and the row's claim is about the route, so a mean over
+            # the repeats is what it implies. Weighted by positions, so a run that produced fewer shared
+            # positions does not count as much as one that produced more.
+            ks = [kld(rx, ry, a.match_by) for x, y in zip(pa, pb)
+                  for rx, ry in zip(x["runs"], y["runs"])]
+            k = kld_summary(ks)
+            k.update({"reference": la, "candidate": lb})
+            g["kld"] = k
+            if k["mean_kld"] is None:
+                # cannot-tell, and it must read as one: this is the diverged-everywhere case.
+                print(f"  mean KLD          cannot tell -- no position had both routes on the same token with a "
+                      f"top-N (KL direction {lb} || {la}, {k['runs_compared']} run pair(s))")
+                failed = True
+            else:
+                unseen_note = (f", {k['positions_with_unseen_entries']} with entries below top-N"
+                               if k["positions_with_unseen_entries"] else "")
+                print(f"  mean KLD          {k['mean_kld']:.6f} nats  (KL({lb} || {la}), "
+                      f"{k['positions']} positions{unseen_note})")
+                print(f"  same top token    {k['same_top_token_pct']:.1f} %")
             if g["prompts_with_token_divergence"]:
                 print(f"  token divergence  prompts {g['prompts_with_token_divergence']}")
 

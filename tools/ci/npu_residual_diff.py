@@ -151,10 +151,17 @@ def self_test():
         chk(v is not None and not v['over'], 'identical dumps are within the threshold')
         v2, _ = compare(a, c)
         chk(v2 is not None and v2['over'], 'a 10 % scale difference is over the threshold, and named')
-        # a layer outside the band does not decide the verdict
+        # a layer outside the band does not decide the verdict. TWO arms, because the first one alone cannot fail:
+        # layer 40 exists only in `c`, so the intersection drops it before `band` is ever consulted and the arm passes
+        # with or without the band (`if band[0] <= l <= band[1]:` -> `if True:` left it green, measured on main
+        # 8aaf864c2). The difference has to land in a layer BOTH arms carry and that sits BELOW the band.
         dump(c, 40, [x * 5 for x in base])
         v3, _ = compare(a, c)
         chk(v3 is not None and all(l <= 7 for l, _ in v3['over']), 'layers outside the band are not in the band verdict')
+        dump(c, 0, [x * 5 for x in base])
+        v4, _ = compare(a, c)
+        chk(v4 is not None and v4['over'] and 0 not in [l for l, _ in v4['over']],
+            'a large difference BELOW the band is not in the band verdict (this is the arm that fails if the band is ignored)')
         # cannot-tell cases
         chk(compare(a, pathlib.Path(tmp) / 'nope')[0] is None, 'a missing directory is cannot-tell')
         (pathlib.Path(tmp) / 'short').mkdir()

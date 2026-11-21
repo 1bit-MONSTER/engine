@@ -119,6 +119,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1714,20 +1715,103 @@ void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& o
     }
     const size_t prompt_bytes = req.body.size();
     const bool client_usage = lr.client_usage;
+    // engine#3254: the upstream STATUS decides whether there is a stream at all, and a content provider runs after
+    // this handler's status is already sent -- so the first body bytes are read here, synchronously. loom-serve
+    // answers a refused request as one small plain-JSON object; that used to leave this process answering 200 with
+    // the refusal re-framed as an SSE event no delta parser reads, which is why the gate's proxy arm reported
+    // `pieces=0` and never saw the message. A JSON body is now this handler's status and body; only a real SSE
+    // reply installs the provider, which drains the same pump.
+    struct Pump {
+        std::mutex m;
+        std::condition_variable cv;
+        std::deque<std::string> q;
+        bool done = false, failed = false;
+        int status = 0;
+    };
+    auto pump = std::make_shared<Pump>();
+    auto first = std::make_shared<std::string>();
+    auto upstream = std::make_shared<std::future<void>>(std::async(std::launch::async, [&, pump] {
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(3600);
+        auto r = c.Post(path, httplib::Headers{}, payload, "application/json", [pump](const char* data, size_t n) {
+            {
+                std::lock_guard<std::mutex> g(pump->m);
+                pump->q.emplace_back(data, n);
+            }
+            pump->cv.notify_all();
+            return true;
+        });
+        {
+            std::lock_guard<std::mutex> g(pump->m);
+            pump->failed = !r;
+            pump->status = r ? r->status : 502;
+            pump->done = true;
+        }
+        pump->cv.notify_all();
+    }));
+    {
+        std::unique_lock<std::mutex> g(pump->m);
+        pump->cv.wait(g, [&] { return !pump->q.empty() || pump->done; });
+        if (!pump->q.empty()) {
+            *first = std::move(pump->q.front());
+            pump->q.pop_front();
+        }
+    }
+    const size_t nb = first->find_first_not_of(" \t\r\n");
+    if (nb == std::string::npos || (*first)[nb] == '{') {
+        // not a stream: loom-serve refused the request (or ignored `stream`). Answer with its status and body.
+        upstream->wait();
+        std::string all = *first;
+        {
+            std::lock_guard<std::mutex> g(pump->m);
+            for (const auto& c : pump->q) all += c;
+            pump->q.clear();
+        }
+        if (pump->failed) {
+            res.status = 502;
+            res.set_content(R"({"error":{"message":"loom-serve did not answer"}})", "application/json");
+            return;
+        }
+        res.status = pump->status;
+        try {
+            json out = json::parse(all);
+            loom::loom_reply(out, our_id);
+            res.set_content(out.dump(), "application/json");
+        } catch (const std::exception&) {
+            res.set_content(all, "application/json");
+        }
+        return;
+    }
     res.set_chunked_content_provider("text/event-stream", [port, path, payload, held, watch, prompt_bytes, our_id,
-                                                           client_usage](size_t, httplib::DataSink& sink) {
+                                                           client_usage, pump, first,
+                                                           upstream](size_t, httplib::DataSink& sink) {
         const auto tracked = watch ? watch->begin(port, "POST " + path + " (streamed)", prompt_bytes, false) : nullptr;
         const auto t0 = std::chrono::steady_clock::now();
         loom::LoomSse sse(our_id, client_usage, [t0] {
             return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         });
-        httplib::Client c("127.0.0.1", port);
-        c.set_read_timeout(3600);
-        c.Post(path, httplib::Headers{}, payload, "application/json", [&](const char* data, size_t n) {
-            if (tracked) ProgressWatch::progress(*tracked, n);
-            const std::string out = sse.feed(data, n);
+        auto push = [&](const std::string& bytes) {
+            if (bytes.empty()) return true;
+            if (tracked) ProgressWatch::progress(*tracked, bytes.size());
+            const std::string out = sse.feed(bytes.data(), bytes.size());
             return out.empty() || sink.write(out.data(), out.size());
-        });
+        };
+        if (!push(*first)) return false;
+        std::unique_lock<std::mutex> g(pump->m);
+        for (;;) {
+            if (!pump->q.empty()) {
+                std::string c = std::move(pump->q.front());
+                pump->q.pop_front();
+                g.unlock();
+                const bool ok = push(c);
+                g.lock();
+                if (!ok) return false;
+                continue;
+            }
+            if (pump->done) break;
+            pump->cv.wait_for(g, std::chrono::milliseconds(100));
+        }
+        g.unlock();
         const std::string tail = sse.finish();
         if (!tail.empty()) sink.write(tail.data(), tail.size());
         sink.done();

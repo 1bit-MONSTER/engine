@@ -172,8 +172,13 @@ inline std::string tool_call_gbnf(const nlohmann::json& tools, const nlohmann::j
 // worst outcome for an agent app, so this refuses with a message that names the way out, exactly as the
 // over-context refusal does. Empty string = nothing to refuse.
 //
-// `route` names what the model is running on, for the message (the model id is enough).
-inline std::string private_route_tools_refusal(const nlohmann::json& body, const std::string& route) {
+// `route` names what the model is running on, for the message (the model id is enough). `private_route` says which
+// of the two NPU paths it is on. Both lack a constraint hook, so the refusal is right for both -- but the sentence
+// must name the struct the caller actually used: `1bit unified` serves lane models through the SAME handler
+// (app/unified.cpp, Engine::generate dispatches `if (lane)` first), and telling that reader about `PrivateRequest`
+// sends them to code their request never touched, with a way out (an env var `unified.cpp` never reads) that does
+// nothing for the process that just refused them.
+inline std::string npu_constraint_refusal(const nlohmann::json& body, const std::string& route, bool private_route) {
     // `tools: []` is not a constraint: many clients send the key with an empty list on every request, and refusing
     // those would break ordinary chats. Only a non-empty list (or a real tool_choice) asks for something the route
     // cannot honour.
@@ -187,14 +192,22 @@ inline std::string private_route_tools_refusal(const nlohmann::json& body, const
     bool has_schema = false;
     if (body.contains("response_format") && body["response_format"].is_object()) {
         const auto& rf = body["response_format"];
-        has_schema = rf.value("type", std::string()) == "json_schema";
+        // `value("type", "")` tolerates a MISSING key only: a present non-string (a sloppy SDK's `"type": null`,
+        // or an enum sent as a number) threw `json.exception.type_error.302` out of the request handler, which is
+        // past the try that answers 400 -- measured: httplib 0.47.0 turns the escape into a bare 500, so a client
+        // mistake was reported as a server fault. Test the type, do not convert it.
+        has_schema = rf.contains("type") && rf["type"].is_string() && rf["type"].get<std::string>() == "json_schema";
     }
     if (!has_tools && !has_choice && !has_schema) return "";
     const std::string what = has_tools ? "tools" : (has_choice ? "tool_choice" : "response_format json_schema");
-    return "this model runs on " + route + ", a private NPU route whose session cannot carry a tool grammar "
-           "(npu/private_route.h:PrivateRequest has no constraint hook), so `" + what +
+    const std::string path = private_route
+        ? "a private NPU route whose session cannot carry a tool grammar "
+          "(npu/private_route.h:PrivateRequest has no constraint hook)"
+        : "the NPU layer lane, whose generator cannot carry a tool grammar "
+          "(npu/generate.h:GenerateOptions has no constraint hook)";
+    return "this model runs on " + route + ", " + path + ", so `" + what +
            "` could not be honoured and the reply would silently ignore it. Drop it, or serve this model through "
-           "the per-op forward (unset ONEBIT_NPU_DX_KERNELS).";
+           "the per-op forward (`1bit forward-serve`), which installs a grammar.";
 }
 
 }  // namespace onebit::npu

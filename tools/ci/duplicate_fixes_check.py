@@ -219,7 +219,8 @@ def describe(issue, group):
         age = pr.get('age_hours')
         age_s = f", {age:.1f} h old" if isinstance(age, (int, float)) else ''
         lines.append(f"  #{pr.get('number')} {pr.get('title') or ''}".rstrip() + f"{draft}{age_s}")
-    lines.append("  one of these should close, or say in both threads which lands first")
+    lines.append("  exactly one must CLOSE: this row is computed from OPEN pull requests only, so agreeing in the "
+                 "threads cannot clear it")
     return "\n".join(lines)
 
 
@@ -348,7 +349,16 @@ def self_test():
     dup = duplicates(prs)
     ok([i for i, _ in dup] == [2778], "one duplicate is reported, and only the claimed-twice issue")
     ok([p['number'] for p in dup[0][1]] == [2784, 2786], "the pair is named oldest first")
-    ok('one of these should close' in describe(*dup[0]), "the report says what to do about it")
+    ok('must CLOSE' in describe(*dup[0]), "the report says what to do about it")
+    # engine#3205: the old sentence offered "or say in both threads which lands first" as an equal alternative, and it
+    # cannot clear this row -- `duplicates()` groups OPEN pull requests, so a thread agreement changes nothing it reads.
+    # Measured: three PRs on engine#3200, the threads agreed in 12 minutes, and the row stayed red repo-wide for another
+    # 25 minutes because the only action that clears it is `gh pr close`. An arm that only asserts the sentence's
+    # presence passes exactly that unhelpful sentence, so assert the distinction too.
+    ok('cannot clear it' in describe(*dup[0]),
+       "...and that a thread comment does not, which is the mistake this cost a lane 25 min to find")
+    ok('both threads' not in describe(*dup[0]),
+       "...and the unactionable alternative is gone, not merely qualified")
 
     # a draft claimant still counts: that is a lane working, which the second lane cannot see
     prs[1]['draft'] = True

@@ -180,12 +180,21 @@ inline std::string private_route_tools_refusal(const nlohmann::json& body, const
     const bool has_tools = body.contains("tools") && body["tools"].is_array() && !body["tools"].empty();
     const bool has_choice = body.contains("tool_choice") && !body["tool_choice"].is_null() &&
                             !(body["tool_choice"].is_string() && body["tool_choice"].get<std::string>() == "none");
-    if (!has_tools && !has_choice) return "";
+    // A caller's JSON SCHEMA is the same class of promise: the per-op forward installs a grammar for it
+    // (app/forward_serve.cpp:383-384), a private route installs nothing, and a reply that violates the caller's
+    // schema would come back looking like a normal answer. `json_object` is deliberately NOT refused: it is
+    // advisory (the model fenced its object in my probe), while a schema is a contract.
+    bool has_schema = false;
+    if (body.contains("response_format") && body["response_format"].is_object()) {
+        const auto& rf = body["response_format"];
+        has_schema = rf.value("type", std::string()) == "json_schema";
+    }
+    if (!has_tools && !has_choice && !has_schema) return "";
+    const std::string what = has_tools ? "tools" : (has_choice ? "tool_choice" : "response_format json_schema");
     return "this model runs on " + route + ", a private NPU route whose session cannot carry a tool grammar "
-           "(npu/private_route.h:PrivateRequest has no constraint hook), so `" +
-           std::string(has_tools ? "tools" : "tool_choice") +
-           "` could not be honoured and the reply would silently be prose instead of a tool call. Drop it, or "
-           "serve this model through the per-op forward (unset ONEBIT_NPU_DX_KERNELS).";
+           "(npu/private_route.h:PrivateRequest has no constraint hook), so `" + what +
+           "` could not be honoured and the reply would silently ignore it. Drop it, or serve this model through "
+           "the per-op forward (unset ONEBIT_NPU_DX_KERNELS).";
 }
 
 }  // namespace onebit::npu

@@ -87,6 +87,19 @@ int main() {
         check(private_route_tools_refusal(body, route).empty(), "tool_choice: none asks for no call, so it is not refused");
     }
     {
+        json body = {{"messages", json::array()},
+                     {"response_format", {{"type", "json_schema"},
+                                          {"json_schema", {{"name", "w"}, {"schema", {{"type", "object"}}}}}}}};
+        const std::string why = private_route_tools_refusal(body, route);
+        check(!why.empty(), "a JSON SCHEMA from the caller is refused too (a private route installs no grammar)");
+        check(mentions(why, "json_schema"), "and the message names response_format json_schema");
+    }
+    {
+        json body = {{"messages", json::array()}, {"response_format", {{"type", "json_object"}}}};
+        check(private_route_tools_refusal(body, route).empty(),
+              "json_object is advisory, not a contract, so it is not refused");
+    }
+    {
         json body = {{"messages", json::array({{{"role", "user"}, {"content", "hello"}}})}};
         check(private_route_tools_refusal(body, route).empty(), "an ordinary chat request is not refused");
     }

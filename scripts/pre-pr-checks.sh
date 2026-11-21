@@ -78,6 +78,7 @@ classify() {  # <rc> <name> <last line> <whole output> -> prints the verdict lin
 }
 
 list_only=0
+tree_only=0
 
 # engine#3116 review (cl-review): the loop's half is a function too, because "the arms tested classify() and never the
 # wiring" is exactly how a two-line return shipped: `case "$(classify …)" in` captured the verdict line *and* the bucket,
@@ -146,7 +147,28 @@ if [ "${1:-}" = "--self-test" ]; then
         echo "  [FAIL] rc 2 with an argparse usage error -> '$usage_line', want fail"; fails=$((fails + 1)); fi
     arm 1  fail        "FAIL  stub_row"
     arm 130 fail       "FAIL  stub_row"
-    echo "pre-pr-checks self-test: $((6-fails))/6 arms passed"
+    # engine#3131: `--tree-only` must drop EXACTLY the open-PR rows and keep the rest in the same order. Asserted by
+    # running the list twice rather than by reading the arrays: the defect this guards is a filter that silently drops
+    # one row too many (a gate row stops running, and the summary still says green).
+    full=$(bash "$0" --list 2>/dev/null | sed 's|^python3 ||')
+    tree=$(bash "$0" --list --tree-only 2>/dev/null | sed 's|^python3 ||')
+    nfull=$(printf '%s\n' "$full" | grep -c .)
+    ntree=$(printf '%s\n' "$tree" | grep -c .)
+    if [ "$nfull" = 17 ] && [ "$ntree" = 15 ]; then
+        echo "  [PASS] --list $nfull rows, --list --tree-only $ntree"
+    else
+        echo "  [FAIL] --list $nfull rows, --list --tree-only $ntree (want 17 / 15)"
+        fails=$((fails + 1))
+    fi
+    if [ "$(printf '%s\n' "$full" | grep -cE 'duplicate_fixes_check|pr_branch_stale_check')" = 2 ] &&
+       [ "$(printf '%s\n' "$tree" | grep -cE 'duplicate_fixes_check|pr_branch_stale_check')" = 0 ] &&
+       diff <(printf '%s\n' "$full" | grep -vE 'duplicate_fixes_check|pr_branch_stale_check') <(printf '%s\n' "$tree") >/dev/null; then
+        echo "  [PASS] --tree-only drops exactly the two open-PR rows and keeps the other 15 in order"
+    else
+        echo "  [FAIL] --tree-only did not drop exactly the two open-PR rows (or reordered the rest)"
+        fails=$((fails + 1))
+    fi
+    echo "pre-pr-checks self-test: $((8-fails))/8 arms passed"
     [ "$fails" -eq 0 ]
     exit $?
 fi
@@ -156,6 +178,7 @@ while [ $# -gt 0 ]; do
         --base) base=${2:-}; shift 2 || { usage >&2; exit 2; } ;;
         --base=*) base=${1#--base=}; shift ;;
         --list) list_only=1; shift ;;
+        --tree-only) tree_only=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "pre-pr-checks: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
     esac
@@ -258,6 +281,34 @@ else
     echo "pre-pr-checks: no $page to cross-check against; the page/runner agreement is unchecked" >&2
 fi
 
+# engine#3131: two rows answer a question about the whole OPEN-PR QUEUE, not about this tree. They cannot gate a shared
+# CI job: run there, one lane's duplicate or one lane's behind branch reds every author's run. Measured 2026-11-21:
+# `duplicate_fixes_check --gate` was red for roughly an hour while #3106 and #3116 each had several claiming PRs, and
+# every lane's pre-PR run printed `FAIL duplicate_fixes_check: one of these should close` for a pair it had nothing to do
+# with. `--tree-only` (used by the CI job) drops exactly these two, with a named skip so the summary still says what did
+# not run. A list, not a heuristic: a row added later must be classified on purpose.
+open_pr_rows=(
+    "tools/ci/duplicate_fixes_check.py --gate"
+    "tools/ci/pr_branch_stale_check.py --advisory"
+)
+tree_only_skipped=0
+if [ "$tree_only" = 1 ]; then
+    kept=()
+    for c in "${checks[@]}"; do
+        is_open_pr=0
+        for o in "${open_pr_rows[@]}"; do [ "$c" = "$o" ] && is_open_pr=1; done
+        if [ "$is_open_pr" = 1 ]; then
+            # the skip line belongs to a RUN, not to --list (a caller parsing `--list --tree-only` must see only the
+            # rows that will run; the count of dropped rows is in the summary of a real run)
+            [ "$list_only" = 0 ] && printf 'skip  %-42s --tree-only: this row reads the open-PR set, so it is not a gate on this tree\n' "${c%% *}"
+            tree_only_skipped=$((tree_only_skipped + 1))
+            continue
+        fi
+        kept+=("$c")
+    done
+    checks=("${kept[@]}")
+fi
+
 if [ "$list_only" = 1 ]; then
     for c in "${checks[@]}"; do echo "python3 $c"; done
     exit 0
@@ -274,6 +325,8 @@ git rev-parse --verify -q "$base^{commit}" >/dev/null || {
 }
 
 ok=0; failed=0; skipped=0; untold=0; detail=""
+tree_note=""
+[ "$tree_only_skipped" -gt 0 ] && tree_note=", $tree_only_skipped open-PR row(s) not run (--tree-only)"
 
 for c in "${checks[@]}"; do
     name=${c%% *}
@@ -309,9 +362,9 @@ done
 
 echo
 if [ $failed -gt 0 ]; then
-    echo "pre-pr-checks: $failed failed, $ok ok, $skipped skipped, $untold could not be told"
+    echo "pre-pr-checks: $failed failed, $ok ok, $skipped skipped, $untold could not be told${tree_note}"
     printf '%s' "$detail"
     exit 1
 fi
-echo "pre-pr-checks: all $ok check(s) green, $skipped skipped, $untold could not be told"
+echo "pre-pr-checks: all $ok check(s) green, $skipped skipped, $untold could not be told${tree_note}"
 exit 0

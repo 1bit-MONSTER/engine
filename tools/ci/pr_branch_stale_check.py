@@ -151,6 +151,25 @@ def stale_finding(repo_dir, branch, base="origin/main"):
     return behind, reverted, carried, files
 
 
+def pr_head_ref(root, pr, branch):
+    """The ref to measure for PR <pr>: `refs/pull/<N>/head` when it exists, else the branch, else None.
+
+    engine#3095: `--pr` fetched the PR's **branch name**. A branch deleted or rewritten after the PR opened has no
+    `refs/heads/<branch>` any more -- measured on `main` 735a47a, 3 of the 4 open PRs -- while `refs/pull/<N>/head`
+    exists for as long as the PR does. So the gate answered cannot-tell (77/skip under --advisory) on most of the
+    queue: a gate whose answer nobody can act on, the same shape as #3082. A closed PR whose refs GitHub has pruned
+    falls back to the branch name, and both missing is a real cannot-tell.
+    """
+    head_ref = f"refs/pr/{pr}/head"
+    rc, _o, _e = run("git", "fetch", "-q", "origin", f"+refs/pull/{pr}/head:{head_ref}", cwd=root)
+    if rc == 0:
+        return head_ref
+    rc, _o, _e = run("git", "fetch", "-q", "origin", f"+{branch}:refs/remotes/origin/{branch}", cwd=root)
+    if rc == 0:
+        return f"origin/{branch}"
+    return None
+
+
 def self_test():
     """Arms derived from what `git merge` actually does, not from what a two-dot diff says (engine#2992 review)."""
     ok = True
@@ -276,6 +295,26 @@ def self_test():
     chk(advisory_exit(EXIT_FINDING) == 0, "advisory: a finding is reported and exits 0, so it cannot block another lane's gate")
     chk(advisory_exit(EXIT_CANNOT_TELL) == 77, "advisory: cannot-tell is 77 (a skip), never 0")
     chk(advisory_exit(EXIT_CLEAN) == 0, "advisory: a clean run stays 0")
+    # engine#3095: which ref the --pr gate measures. A branch deleted after the PR opened has no refs/heads entry,
+    # so the old code answered cannot-tell on most of the queue; refs/pull/<N>/head always exists while the PR does.
+    import tempfile as _tf
+    w = _tf.TemporaryDirectory()
+    g = lambda *a, cwd=None: subprocess.run(("git", *a), cwd=cwd or w.name, capture_output=True, text=True)
+    g("init", "-q", "--bare", "origin.git")
+    g("clone", "-q", "origin.git", "work")
+    work = pathlib.Path(w.name, "work")
+    (work / "f.txt").write_text("L1\n")
+    g("-C", str(work), "add", "-A"); g("-C", str(work), "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-qm", "c")
+    sha = g("-C", str(work), "rev-parse", "HEAD").stdout.strip()
+    g("-C", str(work), "push", "-q", "origin", f"{sha}:refs/pull/1/head")
+    chk(pr_head_ref(str(work), 1, "deleted-branch") == "refs/pr/1/head",
+        "engine#3095: the pull ref is measured when the branch name is gone")
+    chk(pr_head_ref(str(work), 2, "deleted-branch") is None,
+        "engine#3095: neither ref present is a cannot-tell, not a clean answer")
+    g("-C", str(work), "push", "-q", "origin", f"{sha}:refs/heads/live-branch")
+    chk(pr_head_ref(str(work), 3, "live-branch") == "origin/live-branch",
+        "engine#3095: a live branch still works when no pull ref exists (the fallback)")
+
     return 0 if ok else 1
 
 
@@ -306,12 +345,15 @@ def main():
             cannot_tell(f"cannot read PR #{a.pr} (rc {rc}): {err.strip()[:200]}")
         info = json.loads(out)
         branch, base = info["headRefName"], info.get("baseRefName") or "main"
-        for ref in (f"{branch}:refs/remotes/origin/{branch}", f"{base}:refs/remotes/origin/{base}"):
-            rc, _o, err = run("git", "fetch", "-q", "origin", ref, cwd=root)
-            if rc != 0:
-                cannot_tell(f"cannot fetch {ref.split(':')[0]} (rc {rc}): {err.strip()[:120]}")
+        # engine#3095: measure the PR's head REF, not its branch name (see pr_head_ref).
+        branch_ref = pr_head_ref(root, a.pr, branch)
+        if branch_ref is None:
+            cannot_tell(f"cannot fetch PR #{a.pr}: neither refs/pull/{a.pr}/head nor {branch} exists on origin")
+        rc, _o, err = run("git", "fetch", "-q", "origin", f"+{base}:refs/remotes/origin/{base}", cwd=root)
+        if rc != 0:
+            cannot_tell(f"cannot fetch its base {base} (rc {rc}): {err.strip()[:120]}")
         try:
-            found = stale_finding(root, f"origin/{branch}", f"origin/{base}")
+            found = stale_finding(root, branch_ref, f"origin/{base}")
         except CannotTell as e:
             pr_cannot_tell(a.pr, branch, str(e))
         if found is None:

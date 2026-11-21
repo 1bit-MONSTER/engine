@@ -4027,6 +4027,14 @@ int run_serve(int argc, char** argv) {
                 std::fprintf(stderr,
                              "1bit serve: %s is a model-generic container: serving it through the per-op forward "
                              "(kernels %s)\n", o.model.c_str(), kernels.c_str());
+                // engine#3193: without the private add-on, the packs a release build serves on its private route (dense
+                // Qwen3 of a shipped shape) reach this line, and the log said only "per-op forward" -- so a measurement
+                // of such a build read as the release's speed. Say which build it is.
+                if (!npu::private_routes_available())
+                    std::fprintf(stderr,
+                                 "1bit serve: this build links no private NPU route (-DONEBIT_NPU_PRIVATE, "
+                                 "docs/releases.md \"Private components\"): a pack a release build serves on one is "
+                                 "served here on the per-op forward instead\n");
                 std::vector<std::string> fargs = {"-m", (fs::path(o.model) / "model.q4nx").string(),
                                                   "--kernels", kernels, "-p", std::to_string(o.port),
                                                   "--host", o.host};

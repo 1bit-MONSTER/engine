@@ -147,8 +147,19 @@ def check(root: pathlib.Path, base: str, head: str | None = None) -> int:
     # Which of the missing rows did this branch DELETE, and which did it never have? The merge base answers it: a row that
     # exists at the merge base and not at the head was removed by the branch (deliberate or accidental, and the merge will
     # honour that); a row the merge base never had is stale -- main's, and a clean merge keeps it.
-    base_sha = subprocess.run(["git", "-C", str(root), "merge-base", base, head or "HEAD"],
-                              capture_output=True, text=True, check=False).stdout.strip()
+    # engine#3106: the merge base tells a DELETION from a stale row, and in a SHALLOW clone it cannot be computed BY
+    # CONSTRUCTION -- the two grafted histories share no visible ancestor, so this fails every time rather than rarely.
+    # Dropping the rc made `at_base` empty, which turned every lost row into "it simply never had", and the tool then
+    # printed "none of them is deleted by this branch" about a row the branch really deletes. Measured in a --depth 1
+    # clone of a fixture whose branch deletes one row: full clone "1 deleted by this branch"; shallow "0 deleted … 2 it
+    # simply never had". Its siblings guard_loss_check and doc_section_loss_check already answer 2 here.
+    mb = subprocess.run(["git", "-C", str(root), "merge-base", base, head or "HEAD"],
+                        capture_output=True, text=True, check=False)
+    if mb.returncode != 0:
+        print(f"registration_loss: no merge base for {base} and {head or 'HEAD'} "
+              f"({mb.stderr.strip()[:120]}) - cannot tell, and that is not a pass", file=sys.stderr)
+        return 2
+    base_sha = mb.stdout.strip()
     at_base = at_rev(root, base_sha) if base_sha else {}
     added = sorted(set(after) - set(before))
     for kind, name in lost:
@@ -262,6 +273,21 @@ def self_test() -> int:
     d7, shas7 = repo([{"CMakeLists.txt": "add_test(NAME a COMMAND x)\n"}])
     check_that(check(d7, shas7[0], "no-such-rev") == 2, "an unreadable --head is exit 2, not 'everything is missing'")
     check_that(check(d7, "no-such-rev", shas7[0]) == 2, "an unreadable --base is exit 2 too")
+
+    # 5d. engine#3106: a merge base that cannot be computed is 'cannot tell' -- never "the branch never had those rows".
+    # The shape is an UNRELATED history (`git checkout --orphan`), which is what a shallow clone's graft looks like to
+    # `git merge-base`; reproduced without a clone so the arm is deterministic and needs no network. Before the fix this
+    # returned 1 with "none of them is deleted by this branch" while the branch really did delete the row.
+    d8, shas8 = repo([{"CMakeLists.txt": "add_test(NAME a COMMAND x)\nadd_test(NAME b COMMAND y)\n"}])
+    g8 = lambda *a: subprocess.run(["git", "-C", str(d8), *a], capture_output=True, text=True)
+    g8("checkout", "-q", "--orphan", "unrelated")
+    (d8 / "CMakeLists.txt").write_text("add_test(NAME a COMMAND x)\n")
+    g8("add", "-A"); g8("commit", "-qm", "unrelated root")
+    chk_mb = subprocess.run(["git", "-C", str(d8), "merge-base", shas8[0], "unrelated"],
+                            capture_output=True, text=True)
+    check_that(chk_mb.returncode != 0, "fixture: git merge-base really fails between the two histories (the shallow graft shape)")
+    check_that(check(d8, shas8[0], "unrelated") == 2,
+               "engine#3106 a merge base that cannot be computed is exit 2 (cannot tell), not a deletion verdict")
 
     # 6. nothing parsed at the base is 'cannot tell', not a pass
     d3, shas3 = repo([{"CMakeLists.txt": "# nothing\n"}])

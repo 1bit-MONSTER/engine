@@ -187,16 +187,10 @@ case "$lm" in
     none|mmap|mlock|mmap+mlock|dio) ;;
     *) fatal "PREFLIGHT_LM='$lm' is not a llama-bench load mode (none|mmap|mlock|mmap+mlock|dio); the mode is part of the measurement, so it is not guessed (engine #1668)" ;;
 esac
-GGML_HRX_LOG_DISPATCH=1 "$bench" -m "$model" -p "$tokens" -n 0 -ngl 99 --device HRX0 -r 3 -lm "$lm" \
-    >/dev/null 2>"$log" &
-bench_pid=$!
-# The bench is a background child from here on, so nothing ends it when this script ends unless the script does: a
-# signalled preflight (a ticket that ends, Ctrl-C, an operator's kill) or a refusal below would otherwise leave it on the
-# GPU with no owner. Every way out goes through EXIT, and EXIT stops the bench and waits for it before the log goes.
-# TERM first, at most 5 s for the bench to go, then KILL, then reap: a bench that ignores TERM (wedged in the device) must
-# not hang this trap, because a ticket that then kills the shell leaves the same orphan. A child that has exited stays a
-# zombie until it is waited for and still answers `kill -0`, so "gone" is read from its state. bench_pid is emptied once
-# the bench is reaped, here or below, so a pid the system has handed to another process is never signalled.
+# engine#3149: the traps are installed BEFORE the bench exists. The bench can write its pidfile within
+# milliseconds of the launch, so a ticket or an operator signalling the preflight in that window used to hit the
+# default disposition -- the shell died, stop_bench never ran, and the bench was left on the GPU. stop_bench
+# returns early while bench_pid is empty, so installing these first is safe and closes the window.
 stop_bench() {
     [ -n "${bench_pid:-}" ] || return 0
     kill "$bench_pid" 2>/dev/null
@@ -214,6 +208,17 @@ trap 'stop_bench; rm -f "$log"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+GGML_HRX_LOG_DISPATCH=1 "$bench" -m "$model" -p "$tokens" -n 0 -ngl 99 --device HRX0 -r 3 -lm "$lm" \
+    >/dev/null 2>"$log" &
+bench_pid=$!
+# The bench is a background child from here on, so nothing ends it when this script ends unless the script does: a
+# signalled preflight (a ticket that ends, Ctrl-C, an operator's kill) or a refusal below would otherwise leave it on the
+# GPU with no owner. Every way out goes through EXIT, and EXIT stops the bench and waits for it before the log goes.
+# TERM first, at most 5 s for the bench to go, then KILL, then reap: a bench that ignores TERM (wedged in the device) must
+# not hang this trap, because a ticket that then kills the shell leaves the same orphan. A child that has exited stays a
+# zombie until it is waited for and still answers `kill -0`, so "gone" is read from its state. bench_pid is emptied once
+# the bench is reaped, here or below, so a pid the system has handed to another process is never signalled.
 # The mode is REQUESTED above and OBSERVED here (engine #1668): llama.cpp puts a model it mmaps in `/proc/<pid>/maps` and a
 # model it only reads is not there, so the run can be checked against the flag instead of trusted to honour it. A bench that
 # ignores `-lm` yields a number the header mislabels, which is the same defect as an unstated mode -- one variable measured,

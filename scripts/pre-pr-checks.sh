@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# pre-pr-checks.sh [--base REF] [--list]
+# pre-pr-checks.sh [--base REF] [--list] [--tree-only] [--base-optional]
 #
 # `docs/pre-pr-checks.md` (engine#2311) lists the host-side checks to run before asking for a merge; `--list`
 # prints the current set, which is the only count worth trusting -- this comment used to say "six" and was
@@ -39,6 +39,7 @@ usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
 
 base=origin/main
 strict=""
+base_optional=""
 # engine#3116: ONE place that maps a row's exit code to a verdict line, so the table can be asserted without running the
 # whole list -- and so the runner cannot drift from what it promises. The two "could not look" codes are different
 # events with the same meaning for the reader:
@@ -179,6 +180,7 @@ while [ $# -gt 0 ]; do
         --base=*) base=${1#--base=}; shift ;;
         --list) list_only=1; shift ;;
         --tree-only) tree_only=1; shift ;;
+        --base-optional) base_optional=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "pre-pr-checks: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
     esac
@@ -318,15 +320,45 @@ fi
 # cannot happen, and a run that prints "all 5 check(s) green, 1 skipped" then exits 0 is the shape this
 # script exists to stop (review of engine#2313). A skip is for a check that cannot run in this
 # environment; an argument that cannot be resolved is the caller's to fix.
-git rev-parse --verify -q "$base^{commit}" >/dev/null || {
-    echo "pre-pr-checks: --base '$base' does not resolve to a commit here" >&2
-    echo "  the registration check compares against it; pass a ref that exists (default: origin/main)" >&2
-    exit 2
-}
+#
+# `--base-optional` (engine#3131) is the one exception, and it has to be ASKED for: an automated run in a checkout that
+# has no history -- `actions/checkout` at its default depth fetches ONE ref, measured here: a `--depth 1` clone of a
+# single branch has `refs/remotes/origin/<branch>` and nothing else, so neither `origin/main` nor `HEAD~1` resolves --
+# cannot be a usage error, because the caller did not mistype anything and there is no ref it could have passed instead.
+# Those four rows are then reported as `cannot-tell` with their own line and counted in the summary, so the run still
+# executes the eleven rows that read files and the index instead of refusing to run any of them.
+base_missing=""
+if ! git rev-parse --verify -q "$base^{commit}" >/dev/null; then
+    if [ -n "$base_optional" ]; then
+        base_missing=1
+    else
+        echo "pre-pr-checks: --base '$base' does not resolve to a commit here" >&2
+        echo "  the registration check compares against it; pass a ref that exists (default: origin/main)" >&2
+        echo "  (or --base-optional for an automated run in a checkout with no history)" >&2
+        exit 2
+    fi
+fi
 
 ok=0; failed=0; skipped=0; untold=0; detail=""
 tree_note=""
 [ "$tree_only_skipped" -gt 0 ] && tree_note=", $tree_only_skipped open-PR row(s) not run (--tree-only)"
+
+# The rows that name --base in `checks` are the only ones an absent base makes unanswerable. They are counted and
+# printed HERE rather than run and classified, because running them would print a tool's own cannot-tell sentence about
+# a ref this script already knows is absent -- two lines saying the same thing in different words.
+if [ -n "$base_missing" ]; then
+    kept=()
+    for c in "${checks[@]}"; do
+        case "$c" in
+            *" --base $base"*)
+                printf 'cannot-tell  %-34s --base %s does not resolve in this checkout, so this row cannot look\n' \
+                    "${c%% *}" "$base"
+                untold=$((untold + 1)) ;;
+            *) kept+=("$c") ;;
+        esac
+    done
+    checks=("${kept[@]}")
+fi
 
 for c in "${checks[@]}"; do
     name=${c%% *}

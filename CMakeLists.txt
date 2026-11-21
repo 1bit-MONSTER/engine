@@ -667,6 +667,24 @@ set_tests_properties(git_shallow_instruments PROPERTIES SKIP_RETURN_CODE 77)
 # list. It exists because 2 fell through to FAIL: after #3107 the loss checks answer cannot-tell on a shallow clone, and
 # `actions/checkout` is shallow by default, so a correct refusal read as a verdict on the PR.
 add_test(NAME pre_pr_checks_self COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/pre-pr-checks.sh --self-test)
+# engine#3131: nothing in CI ran the checks themselves -- only a lane that remembered, and two of that page's own recorded
+# incidents are "a check that exists and was not run". The WORKFLOW half of #3131 cannot land from this box (the token has
+# `gist, read:org, repo`, no `workflow`: every `git push` and `gh api contents` is refused on `.github/workflows/*`), but
+# the execution half does not need a workflow file: ci.yml runs the whole `ctest`, and rows live here. `--tree-only` drops
+# the two rows that read the OPEN-PR SET (they would red every PR for a condition no author can fix -- #3131's own reason
+# for not wiring those), and `--base-optional` is what makes it runnable in `actions/checkout`'s default depth: a `--depth 1`
+# clone of one branch has that branch's remote ref and nothing else (measured), so `origin/main` does not resolve and the
+# four `--base` rows are reported as `cannot-tell` -- counted and printed apart since engine#3116 -- instead of the run
+# refusing with "--base does not resolve", which is right for a person and wrong for a checkout with no history.
+# Measured on main at 7f8613b4c, full clone, under thermal-run.sh: 12 green / 3 skipped / 0 could not be told, wall 19.18 s.
+# RUN_SERIAL because one row (`cmake_configure_check`) runs a CMake configure: a configure racing another row that reads the
+# build tree is a race, not a check.
+add_test(NAME pre_pr_checks_tree COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/pre-pr-checks.sh --base origin/main
+         --base-optional --tree-only)
+# WORKING_DIRECTORY for the reason the other git-reading rows set it: ctest runs a test with the BUILD directory as its
+# cwd, and an out-of-tree build (`-B ~/.cache/…`) is then outside the work tree, where the runner exits 2 with "not
+# inside a git work tree" -- measured on a build dir under ~/.cache, where it took the two rows above down with it.
+set_tests_properties(pre_pr_checks_tree PROPERTIES RUN_SERIAL TRUE WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 # engine#2992: the pre-merge twin of merged_tail_check -- a stale open branch deletes main's newer lines when it
 # merges, and the PR page shows a clean additive diff while it would do so. Self-test wired because
 # tools/ci/tool_selftest_wired_check.py requires a tool that carries one to be named here.

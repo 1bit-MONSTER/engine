@@ -271,12 +271,21 @@ inline const LoomRoute* match_loom_route(const LoomRoutes& t, const std::string&
 }
 
 // The card file an entry names: absolute as written, else under `cards_dir`; a directory means its model.json.
+// The card path is checked before anything opens it (CodeQL cpp/path-injection: the cards directory
+// can come from ONEBIT_LOOM_CARDS): a relative card may not climb out of the cards directory with
+// "..", and the result must be a regular file named model.json. "" when the path is refused.
 inline std::string loom_card_path(const LoomRoute& r, const std::string& cards_dir) {
     namespace fs = std::filesystem;
-    fs::path p(r.card);
-    if (p.is_relative() && !cards_dir.empty()) p = fs::path(cards_dir) / p;
+    fs::path card = fs::path(r.card).lexically_normal();
+    if (card.empty()) return "";
+    if (card.is_relative())
+        for (const auto& part : card)
+            if (part == "..") return "";
+    fs::path p = card;
+    if (p.is_relative() && !cards_dir.empty()) p = (fs::path(cards_dir) / p).lexically_normal();
     std::error_code ec;
     if (fs::is_directory(p, ec)) p /= "model.json";
+    if (p.filename() != "model.json" || !fs::is_regular_file(p, ec)) return "";
     return p.string();
 }
 

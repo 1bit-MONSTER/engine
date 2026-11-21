@@ -1589,8 +1589,8 @@ std::optional<Launch> loom_launch_for(const Options& o, int child_port) {
         return std::nullopt;
     }
     const std::string card = loom::loom_card_path(*r, loom_cards_dir(o));
-    std::string why;
-    const std::string loom_model = loom::loom_card_model_id(card, why);
+    std::string why = "card path " + r->card + " is not a model.json inside the cards directory";
+    const std::string loom_model = card.empty() ? std::string() : loom::loom_card_model_id(card, why);
     if (loom_model.empty()) {
         std::fprintf(stderr, "1bit serve: loom route %s matches %s, but its card is not usable (%s): serving on the "
                              "llama.cpp route (docs/loom-route.md)\n", r->id.c_str(), o.model.c_str(), why.c_str());

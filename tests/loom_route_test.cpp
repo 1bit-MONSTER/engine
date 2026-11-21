@@ -122,6 +122,16 @@ int main() {
         check("a relative card directory resolves to its model.json under the cards dir",
               card == (dir / "card" / "model.json").string());
         check("the card's model.id is read", loom::loom_card_model_id(card, why) == "Org/Model-1");
+        loom::LoomRoute up;
+        up.card = "../card";
+        check("a relative card that climbs out of the cards dir is refused", loom::loom_card_path(up, (dir / "sub").string()).empty());
+        std::ofstream(dir / "card" / "other.json") << "{}";
+        loom::LoomRoute wrong;
+        wrong.card = "card/other.json";
+        check("a card file that is not model.json is refused", loom::loom_card_path(wrong, dir.string()).empty());
+        loom::LoomRoute gone;
+        gone.card = "nope";
+        check("a card that does not exist is refused", loom::loom_card_path(gone, dir.string()).empty());
         check("a missing card says so", loom::loom_card_model_id((dir / "none.json").string(), why).empty() &&
                                             why.find("cannot read") != std::string::npos);
         fs::remove_all(dir);

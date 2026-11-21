@@ -435,6 +435,19 @@ if [ "$FOLDED" = 1 ] && [ "$TOKSET" = 0 ]; then MAXTOK=32; fi
 BIN="${ONEBIT_BIN:-$(dirname "$0")/../1bit}"
 [ -x "$BIN" ] || { echo "no 1bit at $BIN (set ONEBIT_BIN)" >&2; exit 2; }
 
+# The readiness budget is a knob for the same reason scripts/npu-kernel-bitx.sh's is (engine#3194): a 14B arm spends
+# minutes warming before it binds, and a budget that is a constant cannot be shortened for the failure path either --
+# which is why the "never became ready" arm below could not be tested until it was one.
+#
+# VALIDATED HERE, above every side effect (engine#3200 review): a bad value that exits 2 after the spawn still starts a
+# 14B forward-serve, begins its weight load and creates the log, and only then has the EXIT trap kill it -- the exit code
+# was right and the work happened anyway. Placing it above `: > "$OUT"` also makes the ordering observable, which a check
+# after the spawn cannot be (the child is killed before it opens its own redirect, so an absent serve log proves nothing).
+WINDOW11_WAIT=${NPU_WINDOW11_SERVE_WAIT_S:-600}
+case "$WINDOW11_WAIT" in
+    ''|*[!0-9]*|0) echo "npu-window11: NPU_WINDOW11_SERVE_WAIT_S must be a positive integer of seconds (got '$WINDOW11_WAIT')" >&2; exit 2 ;;
+esac
+
 : > "$OUT"
 # --folded: the container's own debug taps, so the row compares numbers and not just plausible text.  Both
 # taps already exist in the forward; setting them here means neither arm of a comparison is instrumented
@@ -450,13 +463,38 @@ NPU_PROFILE=1 NPU_NO_DEVICE_LOCK=1 env "${TAPENV[@]}" "$BIN" forward-serve -m "$
     -p "$PORT" > "$OUT.serve" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT INT TERM
-
-for _ in $(seq 1 600); do
+# engine#3200 review (#3203): the ELAPSED time is a fact about the run and the budget is only the limit -- a 14B arm that
+# bound at 380 s and one killed at 600 s read identically when only the budget was printed, so both are printed now.
+waited=0
+for _ in $(seq 1 "$WINDOW11_WAIT"); do
     curl -sf -m 2 "localhost:$PORT/health" >/dev/null 2>&1 && break
-    kill -0 $SPID 2>/dev/null || { echo "serve died; see $OUT.serve" >&2; tail -5 "$OUT.serve" >&2; exit 1; }
+    kill -0 $SPID 2>/dev/null || {
+        echo "serve died after ${waited}s; see $OUT.serve" >&2
+        tail -5 "$OUT.serve" >&2
+        exit 1
+    }
+    waited=$((waited + 1))
     sleep 1
 done
-curl -sf -m 2 "localhost:$PORT/health" >/dev/null 2>&1 || { echo "serve never became ready" >&2; exit 1; }
+# engine#3196: the sibling arm above prints the log when the serve DIES; this one did not, so a serve that stays alive
+# and never binds -- exactly what a warm-killed arm looks like -- reported "serve never became ready" with no reason, and
+# the log that had the reason was named nowhere. Same shape as the arm above, plus the elapsed time, the budget, and the
+# one sentence that says which of the two failures this is (engine#3200 review, #3203).
+# engine#3200 review, second round: the sentence below used to ASSERT that the process was alive. It is not always --
+# the window between the loop's last `kill -0` and this `curl` is where a child killed at the budget boundary lands (the
+# OOM reaper, a driver reset, its own abort), and then "the process is alive, so this is the warming window" tells the
+# reader the opposite of what happened. That is the old defect reversed: a warm arm read as dead became a dead arm read
+# as warming. So the liveness is CHECKED here rather than claimed, and each of the two outcomes prints its own sentence.
+curl -sf -m 2 "localhost:$PORT/health" >/dev/null 2>&1 || {
+    if kill -0 $SPID 2>/dev/null; then
+        echo "serve never became ready after ${waited}s (budget ${WINDOW11_WAIT}s); see $OUT.serve" >&2
+        echo "  the process is alive, so this is the warming window, not a dead server: raise NPU_WINDOW11_SERVE_WAIT_S if the log below shows it was still warming" >&2
+    else
+        echo "serve died after ${waited}s; see $OUT.serve" >&2
+    fi
+    tail -5 "$OUT.serve" >&2
+    exit 1
+}
 
 # Three fixed greedy prompts (no temperature field = greedy), fixed token budget: the same three every run.
 PROMPTS=(

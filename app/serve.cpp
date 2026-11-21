@@ -484,6 +484,20 @@ void merge_env(std::vector<std::string>& env_store, const std::vector<std::strin
     }
 }
 
+// ONEBIT_BACKEND_PORT_GRACE_S: how long a backend launched with `--port 0` may stay silent before serve calls it a
+// defect (default 60 s). A child that never prints its readiness line is indistinguishable from a slow one, and the
+// two need different answers: one waits, the other is a launch that asked for a port it will never be told
+// (engine#3130 -- a child that is not `1bit serve`, e.g. `--llama-server llama-server`, prints its own format).
+static int backend_port_grace_s() {
+    if (const char* e = std::getenv("ONEBIT_BACKEND_PORT_GRACE_S"); e && *e) {
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (end != e && *end == '\0' && v >= 1 && v <= 86400) return int(v);
+        std::fprintf(stderr, "1bit serve: ONEBIT_BACKEND_PORT_GRACE_S=%s ignored (whole seconds, 1..86400); using 60\n", e);
+    }
+    return 60;
+}
+
 // ONEBIT_BACKEND_STOP_GRACE_S: how long Child::stop waits after SIGTERM before SIGKILL (default 30 s).
 int stop_grace_s() {
     if (const char* e = std::getenv("ONEBIT_BACKEND_STOP_GRACE_S"); e && *e) {
@@ -745,6 +759,8 @@ public:
         // built when the port appears rather than before the loop; `client_port` tracks which port `c` talks to.
         int                              client_port = -1;
         std::unique_ptr<httplib::Client> c;
+        // when this wait first found no port at all (engine#3130): 0 until then
+        std::chrono::steady_clock::time_point silent_since{};
         const auto end = std::chrono::steady_clock::now() + timeout;
         const auto foreign_grace = std::chrono::seconds(foreign_port_grace_s());
         // A previous call already spent the grace on this child (the relaunch loop calls wait_ready again after it
@@ -754,7 +770,18 @@ public:
         while (std::chrono::steady_clock::now() < end) {
             if (!alive() || stop) return false;
             if (port() <= 0) {
-                // nothing to poll yet, and that is the launch's starting state, not a failure
+                // engine#3130: nothing to poll yet -- that is the launch's starting state. But a child that NEVER prints a
+                // port is a different thing from a slow one, and only one of them is worth waiting for: a launch that
+                // passed `--port 0` to a binary which does not report one (llama-server prints its own format) would
+                // otherwise sit here for the full wait_ready timeout and look like a slow model load.
+                if (silent_since.time_since_epoch().count() == 0) silent_since = std::chrono::steady_clock::now();
+                if (std::chrono::steady_clock::now() - silent_since >= std::chrono::seconds(backend_port_grace_s())) {
+                    std::fprintf(stderr,
+                                 "1bit serve: pid %d has printed no listening port after %d s; this launch was given "
+                                 "`--port 0`, so the child must report the port it bound (ONEBIT_BACKEND_PORT_GRACE_S "
+                                 "sets this wait)\n", int(pid_), backend_port_grace_s());
+                    return false;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 continue;
             }

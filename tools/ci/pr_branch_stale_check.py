@@ -52,6 +52,20 @@ def advisory_exit(verdict):
     return verdict
 
 
+def single_branch_exit(fetch_ok, behind, finding):
+    """The exit code for ONE named branch (engine#3076), as a pure function so its table is assertable without a network.
+
+    The hard gate needs a distinction the open-PR path never had to draw: `stale_finding` returns None both when the branch is
+    LEVEL with main (clean) and when the merge could not be measured (cannot tell). Advisory may treat both as "nothing to say";
+    a gate that blocks a merge may not, so `behind` decides between them here.
+    """
+    if not fetch_ok:
+        return EXIT_CANNOT_TELL
+    if finding is not None:
+        return EXIT_FINDING
+    return EXIT_CLEAN if behind == 0 else EXIT_CANNOT_TELL
+
+
 def run(*a, cwd=None):
     r = subprocess.run(a, capture_output=True, text=True, cwd=cwd)
     return r.returncode, r.stdout, r.stderr
@@ -221,6 +235,15 @@ def self_test():
     chk(advisory_exit(EXIT_FINDING) == 0, "advisory: a finding is reported and exits 0, so it cannot block another lane's gate")
     chk(advisory_exit(EXIT_CANNOT_TELL) == 77, "advisory: cannot-tell is 77 (a skip), never 0")
     chk(advisory_exit(EXIT_CLEAN) == 0, "advisory: a clean run stays 0")
+    # engine#3076: the single-branch table, which is the whole difference between an advisory row and a gate
+    chk(single_branch_exit(False, 0, None) == EXIT_CANNOT_TELL,
+        "--branch: a branch that cannot be fetched is cannot-tell (2), not clean")
+    chk(single_branch_exit(True, 3, (3, 1, 1, ["f"])) == EXIT_FINDING,
+        "--branch: the merge deletes main's lines -> 1")
+    chk(single_branch_exit(True, 0, None) == EXIT_CLEAN,
+        "--branch: level with main -> 0")
+    chk(single_branch_exit(True, 3, None) == EXIT_CANNOT_TELL,
+        "--branch: behind but the merge could not be measured -> 2, never 0")
     return 0 if ok else 1
 
 
@@ -232,11 +255,51 @@ def main():
                     help="report every stale branch and exit 0 even with findings -- for a caller that scans OTHER "
                          "lanes' PRs (scripts/pre-pr-checks.sh), where a hard failure would let one lane's branch "
                          "block another lane's gate. Cannot-tell still answers 77 (skip), never 0 (engine#3057)")
+    ap.add_argument("--branch", default=None, metavar="NAME",
+                    help="evaluate ONE named branch as a hard gate: 0 clean, 1 its merge deletes lines main has, 2 cannot tell. "
+                         "Takes the ref directly, so it needs no `gh` call and no token -- which is what lets a pull_request job "
+                         "run it (engine#3076). The open-PR scan stays advisory; this mode is never advisory")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
     root = pathlib.Path(a.root).resolve()
+    if a.branch:
+        ref = f"origin/{a.branch}"
+        rc, _out, err = run("git", "fetch", "-q", "origin", a.branch, cwd=root)
+        fetch_ok, behind, finding = rc == 0, 0, None
+        if fetch_ok:
+            rc, out, _ = run("git", "rev-list", "--count", f"{ref}..origin/main", cwd=root)
+            if rc != 0:
+                behind = -1                  # distance unknown: cannot_tell, never a clean 0
+            else:
+                behind = int(out.strip() or 0)
+                if behind:
+                    finding = stale_finding(root, ref)
+        # The exit code FIRST, then the message: a run that could not look must not print a verdict at all. The first draft
+        # printed "removes nothing main has" for an unfetchable branch before exiting 2 -- a green line in a red run, which is
+        # the exact failure this tool exists to prevent (engine#3076 review).
+        code = single_branch_exit(fetch_ok, behind, finding)
+        if code == EXIT_CANNOT_TELL:
+            if not fetch_ok:
+                cannot_tell(f"{a.branch}: cannot fetch the branch "
+                            f"({err.strip().splitlines()[0] if err.strip() else 'fetch failed'})")
+            if behind < 0:
+                cannot_tell(f"{a.branch}: cannot compare with origin/main (git rev-list failed)")
+            cannot_tell(f"{a.branch}: BEHIND {behind}, but the merge could not be measured "
+                        f"(no merge base, or the tree could not be written)")
+        if finding is None:
+            print(f"{a.branch}: level with main; merging this branch removes nothing main has")
+            return code
+        _b, reverted, carried, files = finding
+        parts = []
+        if reverted:
+            parts.append(f"REVERTS {reverted} line(s) main added after the branch was cut")
+        if carried:
+            parts.append(f"removes {carried} line(s) main still carries")
+        print(f"{a.branch}: BEHIND {finding[0]}; merging it " + " and ".join(parts) +
+              f" in {len(files)} file(s): {', '.join(files[:3])}{' …' if len(files) > 3 else ''}", file=sys.stderr)
+        return code
     findings, unreadable = 0, []
     for n, branch in open_prs(a.repo):
         ref = f"origin/{branch}"

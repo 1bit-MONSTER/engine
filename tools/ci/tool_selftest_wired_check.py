@@ -74,9 +74,14 @@ def discover(root: pathlib.Path, tool_dirs=("tools",)) -> list[pathlib.Path]:
     return found
 
 
-def references(root: pathlib.Path, sources=REFERENCE_SOURCES) -> str | None:
-    """The concatenated text of every reference source, or None when one cannot be read."""
-    parts = []
+def references(root: pathlib.Path, sources=REFERENCE_SOURCES) -> list[str] | None:
+    """The non-comment lines of every reference source, or None when one cannot be read.
+
+    Lines rather than one joined blob, because engine#3216 has to ask whether a self-test MARKER is on the same
+    line as the tool's name: a concatenated string cannot tell `foo.py --check` from `foo.py --check` followed on
+    the next line by `bar.py --self-test`.
+    """
+    parts: list[str] = []
     paths = [root / rel for rel in sources]
     for g in REFERENCE_GLOBS:
         paths += sorted(root.glob(g))
@@ -87,25 +92,55 @@ def references(root: pathlib.Path, sources=REFERENCE_SOURCES) -> str | None:
             return None
         # A COMMENT is not a wiring: this file's own fix mentions the four tools it wired, and a mention in
         # prose would otherwise mark a tool wired the moment someone wrote a note about it. Only code counts.
-        parts.append("\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#")))
-    return "\n".join(parts)
+        parts += [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+    return parts
 
 
-def unwired(tools: list[pathlib.Path], refs: str) -> list[pathlib.Path]:
-    """Tools whose basename is named by no reference source.
+def name_re(name: str) -> re.Pattern:
+    """A reference is a path, so the character before the basename is usually `/`: the lookbehind must not exclude
+    it. It must exclude `_`, `.` and `-`, so `pre_check.py` is not read as a reference to `check.py`."""
+    return re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w-])")
 
-    `--self-test` alone is not a reference: the tool's own flag spelling appears in every file that has one,
-    so matching it would mark the whole tree wired.
+
+def classify(tools: list[pathlib.Path],
+             refs: list[str]) -> tuple[list[pathlib.Path], list[pathlib.Path], list[pathlib.Path]]:
+    """Split the tools into (wired, named for another flag, named by nothing).
+
+    engine#3216: a NAME is not a wiring. `registry_build.py` was named in `CMakeLists.txt` for `--check-gaps` and
+    `--check-pins`, so this checker called it wired while its eight self-test arms ran nowhere — the rule was "the
+    basename appears somewhere", so the subcommand that actually runs the arms was never looked at. A tool is wired
+    only when one reference LINE names it **and** carries a self-test marker **after** that name:
+
+      `add_python_test(x ${CMAKE_SOURCE_DIR}/tools/foo.py --self-test)`          wired
+      `add_test(NAME y COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/foo.py --check)` named for another flag
+      `add_test(NAME z COMMAND tools/bar.py --self-test tools/foo.py)`            named for another flag — the
+                                                                                 marker belongs to bar.py
+
+    The after-the-name half is what the third case needs, and it is free on this tree: measured 2026-11-21 over the
+    94 self-test-carrying tools, both spellings give 91 wired / 3 named-for-another-flag / 0 named by nothing.
     """
-    out = []
+    wired, named_other, missing = [], [], []
     for t in tools:
-        name = t.name
-        # A reference is a path, so the character before the basename is usually `/`: the lookbehind must not
-        # exclude it. It must exclude `_`, `.` and `-`, so `pre_check.py` is not read as a reference to `check.py`.
-        if re.search(r"(?<![\w.-])" + re.escape(name) + r"(?![\w-])", refs):
-            continue
-        out.append(t)
-    return out
+        rx = name_re(t.name)
+        pairs = [(l, m) for l in refs for m in rx.finditer(l)]
+        if not pairs:
+            missing.append(t)
+        elif any(MARKER_RE.search(l, m.end()) for l, m in pairs):
+            wired.append(t)
+        else:
+            named_other.append(t)
+    return wired, named_other, missing
+
+
+def unwired(tools: list[pathlib.Path], refs: list[str]) -> list[pathlib.Path]:
+    """Tools no reference source names at all.
+
+    `--self-test` alone is not a reference: the tool's own flag spelling appears in every file that has one, so
+    matching it would mark the whole tree wired. A tool that IS named, but only for another subcommand, is the
+    separate class above: tightening this one into a hard failure would red three rows the day it landed, so the
+    count is reported instead — visible, and not a wall on day one.
+    """
+    return classify(tools, refs)[2]
 
 
 def self_test() -> int:
@@ -134,18 +169,43 @@ def self_test() -> int:
         (root / "tools" / "only_a_function.py").write_text('def self_test(): pass\n')
         # and one whose only mention of the flag is its own definition -- not a wiring
         (root / "tools" / "selfonly.py").write_text('SPELLING = "--self-test"\n')
-        (root / "CMakeLists.txt").write_text("add_python_test(x ${CMAKE_SOURCE_DIR}/tools/by_cmake.py --self-test)\n")
+        # engine#3216: two more tools WITH an entry point that are named by a reference line but not wired --
+        # `by_other_flag.py` is named for a different subcommand, and `marker_before.py` shares a line whose marker
+        # belongs to another tool. Both must land in the "named for another flag" class, not in `unwired` and not
+        # in `wired`; the second is what the after-the-name half of the rule exists for.
+        (root / "tools" / "by_other_flag.py").write_text('if "--self-test" in sys.argv: pass\n')
+        (root / "tools" / "marker_before.py").write_text('if "--self-test" in sys.argv: pass\n')
+        (root / "tools" / "marker_owner.py").write_text('if "--self-test" in sys.argv: pass\n')
+        (root / "CMakeLists.txt").write_text(
+            "add_python_test(x ${CMAKE_SOURCE_DIR}/tools/by_cmake.py --self-test)\n"
+            "add_test(NAME other COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/by_other_flag.py --check)\n"
+            "add_test(NAME owner COMMAND tools/marker_owner.py --self-test tools/marker_before.py)\n")
         (root / "scripts" / "pre-pr-checks.sh").write_text('checks=(\n    "tools/by_prepr.py --selftest"\n)\n')
 
         tools = discover(root)
         names = sorted(p.name for p in tools)
-        chk(["by_cmake.py", "by_prepr.py", "orphan.py", "selfonly.py"], names,
-            "four tools carry a runnable self-test (and one that only defines the function does not)")
+        # the fixture's tool set is a literal (engine#3216 added three: two for the named-for-another-flag class and
+        # one to own the marker in the shared-line arm), so this arm names all seven rather than counting them --
+        # a count would agree with itself after any edit that adds one tool and removes another.
+        chk(["by_cmake.py", "by_other_flag.py", "by_prepr.py", "marker_before.py", "marker_owner.py", "orphan.py",
+             "selfonly.py"], names,
+            "seven tools carry a runnable self-test (and the one that only defines the function does not)")
 
         refs = references(root)
         got = sorted(str(p.relative_to(root)) for p in unwired(tools, refs))
         chk(["tools/diag/orphan.py", "tools/selfonly.py"], got,
             "a tool no source names is reported (and a tool that only spells the flag is NOT wired)")
+
+        # engine#3216, the arm for the class that was invisible: a name without a marker beside it is not a wiring.
+        wired, named_other, _ = classify(tools, refs)
+        chk(["by_cmake.py", "by_prepr.py", "marker_owner.py"], sorted(p.name for p in wired),
+            "a name WITH a self-test marker after it on the same line is wired (three of the six)")
+        chk(["by_other_flag.py", "marker_before.py"], sorted(p.name for p in named_other),
+            "a tool named only for another flag is reported as such, and a marker belonging to another tool on the "
+            "same line does not vouch for it")
+        # ... and the class must be counted without failing the run: the fixture's only unwired tool is selfonly.py.
+        chk(0, sum(1 for t in named_other if t.name in ("selfonly.py", "only_a_function.py")),
+            "a tool named for another flag is not silently promoted into the unwired class")
 
         # engine#2675 review: `.github/workflows/` is a fourth place, and it is the one where two of the four tools
         # already ran. A `run:` line is a wiring; a YAML comment naming the tool is not, exactly as for CMakeLists.
@@ -181,11 +241,22 @@ def main(argv=None) -> int:
         print("tool_selftest_wired_check: cannot read a reference source (CMakeLists.txt or "
               "scripts/pre-pr-checks.sh): a scan that could not look is not a clean scan", file=sys.stderr)
         return 2
-    bad = unwired(tools, refs)
+    wired, named_other, bad = classify(tools, refs)
     if a.list:
         for t in tools:
-            print(f"{'UNWIRED' if t in bad else 'wired  '} {t.relative_to(root)}")
+            cls = "UNWIRED " if t in bad else "OTHERFLG" if t in named_other else "wired   "
+            print(f"{cls} {t.relative_to(root)}")
         return 0
+    # engine#3216: a tool named only for another subcommand is reported, counted and NOT fatal on its own -- the
+    # three rows that shape today were each wired for a `--check`, which is a real reference to the file and not a
+    # wiring of its arms, and turning that into a red row the day the rule tightened would have taught lanes to
+    # silence the check rather than wire the tool.
+    if named_other:
+        print(f"tool_selftest_wired_check: {len(named_other)} of {len(tools)} self-test-carrying tool(s) are named "
+              f"only for another flag, so their arms still run nowhere (reported, not failed):", file=sys.stderr)
+        for t in named_other:
+            print(f"  {t.as_posix()}  (wire it: add_python_test(<name> ${{CMAKE_SOURCE_DIR}}/{t.as_posix()} --self-test))",
+                  file=sys.stderr)
     if bad:
         print(f"tool_selftest_wired_check: {len(bad)} of {len(tools)} self-test-carrying tool(s) are named by "
               f"neither CMakeLists.txt nor scripts/pre-pr-checks.sh, so nothing ever runs their arms:", file=sys.stderr)
@@ -193,7 +264,8 @@ def main(argv=None) -> int:
             print(f"  {t.as_posix()}  (wire it: add_python_test(<name> ${{CMAKE_SOURCE_DIR}}/{t.as_posix()} --self-test))",
                   file=sys.stderr)
         return 1
-    print(f"tool_selftest_wired_check: {len(tools)} self-test-carrying tool(s), all referenced")
+    print(f"tool_selftest_wired_check: {len(tools)} self-test-carrying tool(s): {len(wired)} wired, "
+          f"{len(named_other)} named for another flag")
     return 0
 
 

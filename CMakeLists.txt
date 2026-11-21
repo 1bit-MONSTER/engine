@@ -721,6 +721,11 @@ add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_ben
 # commit, the hrx_loom version that commit declares, and the hrx-loom-library catalog commit the same file names.
 # The self-test arms the agreement and the cannot-tell; the live check runs where a clone of the repo exists.
 add_python_test(loom_pin_check_self ${CMAKE_SOURCE_DIR}/tools/ci/loom_pin_check.py --self-test)
+# engine#3156: the Loom coverage map is the switch's plan (one model at a time), and a hand-written table is how the row
+# that matters gets missed -- `Qwen2.5-VL-7B-Instruct` and `Qwen3-30B-A3B-Instruct-2507` match a shipped row on family
+# and size and are different models. The self-test arms that trap and the cannot-tell; the live check needs the card
+# tree, which is a ~GB download, so it is a lane command and not a CI row.
+add_python_test(loom_coverage_check_self ${CMAKE_SOURCE_DIR}/tools/ci/loom_coverage_check.py --self-test)
 # engine#3103: hrx2kineto.py gained a --self-test (its per-kernel ranking's FLOP attribution and its shape-log join),
 # and a self-test no runner names is a self-test nobody runs -- tool_selftest_wired_check and tests_referenced both said
 # so on the PR's first build, which is the same failure the loomc pair check above records.

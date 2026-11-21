@@ -656,17 +656,30 @@ if [ -z "$BIN" ]; then
           # "unknown target", which this block then reported as "the runtime does not link". The check never ran: every
           # PR with a `build` phase got a permanent false red, it merged red on a pin bump, and each attempt spent a
           # gpu-hold wait configuring the wrong tree.
-          { "$THERMAL" cmake -S "$ROOT" -B "$build-npu" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          # A cache configured against the submodule cannot be re-homed: CMake refuses a -S that differs from the one
+          # that generated the cache in that directory, so a box that ran the old gate keeps its poisoned cache forever.
+          # Hence a directory of its own (cl-hrxnan's finding on #3079).
+          npu_build="${build}-npu-engine"
+          { "$THERMAL" cmake -S "$ROOT" -B "$npu_build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
               -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt"; } > "$OUT/npu-link.log" 2>&1
+          npu_rc=$?
           # The graph check comes first, and it is the one that catches a wrong `-S` even when the configure succeeds
           # (the shape of this bug): a configured tree with no `npu_rt_shim_test` is this script pointing at another
           # source, not a runtime failure. Then configure-vs-link, because "could not configure" (#3029's own class) and
           # "does not link" produce different diagnosis and used to share a sentence.
-          if [ $? -eq 0 ] && ! grep -q "npu_rt_shim_test" "$build-npu/build.ninja" 2>/dev/null; then
-            note "::error::the NPU link gate did not run: the tree configured from $ROOT has no npu_rt_shim_test target, so this script is pointing at the wrong source -- a defect in the gate, not in the runtime: see npu-link.log"
+          if ! grep -q "npu_rt_shim_test" "$npu_build/build.ninja" 2>/dev/null; then
+            # No graph at all is also this branch, and the two causes are worth separating: a configure that FAILED gets
+            # its own sentence below, because "the runtime is broken" and "the gate could not configure the engine" are
+            # different findings -- folding them together is exactly what #3079 was about.
+            if [ $npu_rc -ne 0 ]; then
+              note "::error::the NPU link gate could not configure the engine against the runtime at ${npu_pin:0:12}: see npu-link.log"
+              grep -E "CMake Error" -A3 "$OUT/npu-link.log" | head -n 6 | sed 's/^/  /'
+            else
+              note "::error::the NPU link gate did not run: the tree configured from $ROOT has no npu_rt_shim_test target, so this script is pointing at the wrong source -- a defect in the gate, not in the runtime: see npu-link.log"
+            fi
             built=1
           else
-            "$THERMAL" cmake --build "$build-npu" -j "$JOBS" --target npu_rt_shim_test npu_dmabuf_import_test >> "$OUT/npu-link.log" 2>&1
+            "$THERMAL" cmake --build "$npu_build" -j "$JOBS" --target npu_rt_shim_test npu_dmabuf_import_test >> "$OUT/npu-link.log" 2>&1
             if [ $? -ne 0 ]; then
               if grep -qE "CMake Error" "$OUT/npu-link.log"; then
                 note "::error::the NPU link gate could not configure the engine against the runtime at ${npu_pin:0:12}: see npu-link.log"

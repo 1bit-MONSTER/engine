@@ -836,6 +836,10 @@ add_test(NAME hw_gate_phase_rows COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_
 # 858 s behind GPU work and then held the GPU for an NPU-only test. A stub gpu-hold on PATH counts the calls, so this row
 # needs no token, no device and no build.
 add_test(NAME hw_gate_npu_phases COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_npu_phases_test.sh)
+# engine#3079: the NPU link gate configured third_party/llama.cpp -- a tree that defines no npu_rt_shim_test -- so it
+# could never pass and said "the runtime does not link" about a configure that never read the engine. Text-level arms
+# pin the tree, the two targets, and the order that makes "did not run" distinct from "does not link".
+add_test(NAME hw_gate_npu_link_src COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_npu_link_src_test.sh)
 # engine#2542: the accel sampler's self-test -- the correlation and rotation arms must be green before anyone
 # starts a long capture, because a silent correlator loses exactly the event it exists to catch.
 add_test(NAME accel_sampler COMMAND bash ${CMAKE_SOURCE_DIR}/tools/diag/accel_sampler.sh selftest)

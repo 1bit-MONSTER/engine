@@ -68,25 +68,6 @@ arm "placement still claims the GPU"    placement       1
 arm "build,ops still claim the GPU"     "build,ops"     1
 arm "a mixed set still claims the GPU"  "npu,placement" 1
 
-# engine#3079: the NPU link gate must configure the ENGINE root. It used $src, which is llama.cpp's tree (that is what
-# the main build configures), and llama.cpp has no npu_rt_shim_test -- so ninja answered "unknown target" and the gate
-# reported it as "the runtime does not link". It had never run: the target lives at CMakeLists.txt:2698, in this repo.
-# Two arms, because the failure that mattered was both halves: the wrong tree AND a sentence that said otherwise.
-if grep -q 'cmake -S "\$ROOT" -B "\$build-npu"' scripts/hw-gate.sh \
-   && ! grep -q 'cmake -S "\$src" -B "\$build-npu"' scripts/hw-gate.sh; then
-    echo "ok   the NPU link gate configures the engine root, not third_party/llama.cpp (engine#3079)"
-else
-    echo "FAIL the NPU link gate does not configure \$ROOT -- it would answer 'unknown target' again (engine#3079)"
-    fails=$((fails + 1))
-fi
-if grep -q 'npu_rt_shim_test" "$build-npu/build.ninja"' scripts/hw-gate.sh \
-   && grep -q 'did not run: the tree configured from' scripts/hw-gate.sh; then
-    echo "ok   ... and a configured tree without the target says 'did not run', not 'does not link' (engine#3079)"
-else
-    echo "FAIL a missing npu_rt_shim_test in the configured tree still reads as a link failure (engine#3079)"
-    fails=$((fails + 1))
-fi
-
 [ "$fails" = 0 ] && { echo "hw_gate_npu_phases_test: pass"; exit 0; }
 echo "hw_gate_npu_phases_test: $fails failure(s)"
 exit 1

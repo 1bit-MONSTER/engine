@@ -115,6 +115,24 @@ def row_names(text: str) -> dict[str, tuple[str, int]]:
     return out
 
 
+def counted_row_names(lines: list[str]) -> dict[str, int]:
+    """name -> how many times these lines register it.
+
+    `row_names()` is a dict on purpose (a name is either taken or not), so it collapses exactly the case this is for:
+    a branch that registers the SAME name twice collides with itself, and no base entry has to exist for Configure
+    to fail (`add_test given test NAME "x" which already exists in this directory`).
+    """
+    out: dict[str, int] = {}
+    for line in lines:
+        if line.lstrip().startswith("#"):
+            continue
+        for rx in ROW_RES:
+            m = rx.search(line)
+            if m:
+                out[m.group(1)] = out.get(m.group(1), 0) + 1
+    return out
+
+
 def changed_row_lines(root: pathlib.Path, base: str):
     """(added, removed) registration lines of this branch's diff, or (None, None) when git cannot answer.
 
@@ -176,6 +194,15 @@ def check(root: pathlib.Path, base: str) -> tuple[int, list[str]]:
     taken = {n: head.get(n, (line, 0)) for n, line in
              ((n, v[0]) for n, v in row_names("\n".join(added)).items())}
     freed = set(row_names("\n".join(removed)))
+    # A name this branch registers TWICE collides with itself: no base entry, no guard, and Configure stops on it.
+    # Counted before the dict above collapses the repeat; nothing here needs the base or the tree, so it is a hard
+    # collision rather than a cannot-tell (measured: rc 0 before, `cmake -S . -B` rc 1 "already exists").
+    counts = counted_row_names(added)
+    doubled = sorted(n for n, count in counts.items() if count > 1 and n not in freed)
+    if doubled:
+        return 1, ([f"{len(doubled)} ctest row name(s) this branch registers MORE THAN ONCE:"]
+                   + [f"  {n}: registered {counts[n]}x by this branch" for n in doubled]
+                   + ["  two registrations of one name fail Configure whatever the base holds: drop one"])
     if not taken:
         return 0, []
     clashes = sorted(n for n in taken if n in known and n not in freed)
@@ -256,6 +283,18 @@ def self_test() -> int:
         (d / ROW_FILE).write_text((d / ROW_FILE).read_text() + "add_python_test(brand_new_self ${CMAKE_SOURCE_DIR}/y.py --self-test)\n")
         subprocess.run(["git", "-C", str(d), "commit", "-qam", "a new row"], check=True)
         chk(0, check(d, "main")[0], "a row with a name the base does not have is quiet")
+
+        # 3d. the branch registers ONE NEW NAME TWICE: no base entry needed, no guard involved, and Configure fails
+        # on it (measured: `cmake -S . -B` -> `add_test given test NAME "new_dup" which already exists in this
+        # directory` while the added-lines comparison answered "no row name the branch adds is already registered").
+        d = repo(tmpd, "added_twice")
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text()
+                                  + "add_python_test(new_dup ${CMAKE_SOURCE_DIR}/x.py)\n"
+                                  + "add_python_test(new_dup ${CMAKE_SOURCE_DIR}/x.py)\n")
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "one new name, registered twice"], check=True)
+        got, msgs = check(d, "main")
+        chk(1, got, "a name the branch adds TWICE is a collision with no base involved")
+        chk(True, any("new_dup" in m for m in msgs), "...and the message names the doubled row")
 
         # 4. a name computed from a variable is not compared
         d = repo(tmpd, "variable_name")

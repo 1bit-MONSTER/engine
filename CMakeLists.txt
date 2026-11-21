@@ -174,6 +174,13 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/template_pins_default.h
      "// generated from config/template-pins.json by CMakeLists.txt\n#pragma once\n"
      "static const char kDefaultTemplatePinsJson[] = R\"ONEBITTEMPLATE(${ONEBIT_TEMPLATE_PINS_JSON})ONEBITTEMPLATE\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/template-pins.json)
+# config/loom-routes.json (model -> Loom card for the GPU route, docs/loom-route.md) is compiled in the same way;
+# `serve --loom-routes FILE` replaces it. Shipped empty: every model takes the llama.cpp route until it passes the gate.
+file(READ ${CMAKE_SOURCE_DIR}/config/loom-routes.json ONEBIT_LOOM_ROUTES_JSON)
+file(WRITE ${CMAKE_BINARY_DIR}/generated/loom_routes_default.h
+     "// generated from config/loom-routes.json by CMakeLists.txt\n#pragma once\n"
+     "static const char kDefaultLoomRoutesJson[] = R\"ONEBITLOOM(${ONEBIT_LOOM_ROUTES_JSON})ONEBITLOOM\";\n")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/loom-routes.json)
 target_include_directories(onebit PRIVATE ${CMAKE_BINARY_DIR}/generated)
 # The GGUF architectures the pinned llama.cpp fork builds a model for (registry/architectures.json,
 # gguf_architectures.hrx, from tools/registry_build.py): serve refuses any other on hrx and cpu.
@@ -433,6 +440,16 @@ add_test(NAME server_launch_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/t
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
+# The Loom GPU route (app/loom_route.h, docs/loom-route.md): the table, the match, readiness and the request/reply
+# normalisation as pure functions, then `1bit serve` end to end against tests/fake_loom_serve.py (route chosen,
+# fallback with no entry, a card that fails to prepare, a foreign process on the port, the normalised fields).
+add_executable(loom_route_test tests/loom_route_test.cpp)
+target_include_directories(loom_route_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
+target_link_libraries(loom_route_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME loom_route_unit COMMAND loom_route_test)
+# built with onebit, so the configuration CI builds has it (tools/ci/ci_targets_check.py)
+add_dependencies(onebit loom_route_test)
+add_test(NAME loom_route COMMAND ${CMAKE_SOURCE_DIR}/tests/loom_route.sh $<TARGET_FILE:onebit>)
 # os/mini/release-check.sh --self-test: the shipped release gate's own verdict rows, asserted (engine#1596). It needs no
 # build and no device - the subject is the row functions - so it is the one test here that takes no $<TARGET_FILE>, and
 # it is here because nothing else runs it: the rows had 128 assertions and no runner. It names no add_executable, so it

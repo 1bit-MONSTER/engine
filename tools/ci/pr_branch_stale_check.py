@@ -276,6 +276,35 @@ def self_test():
     chk(advisory_exit(EXIT_FINDING) == 0, "advisory: a finding is reported and exits 0, so it cannot block another lane's gate")
     chk(advisory_exit(EXIT_CANNOT_TELL) == 77, "advisory: cannot-tell is 77 (a skip), never 0")
     chk(advisory_exit(EXIT_CLEAN) == 0, "advisory: a clean run stays 0")
+    # engine#3076: a rebased branch is a NON-FAST-FORWARD update of the remote-tracking ref, and a plain refspec refuses it, so
+    # the tool answered cannot-tell on exactly the branches it exists to catch. Proved against a real (local) origin rather than
+    # asserted: build one, force-push a branch, leave the tracking ref behind, and require the mirroring spec to work while the
+    # plain one does not -- so a revert of the `+` is caught instead of rediscovered.
+    import tempfile
+    d2 = tempfile.TemporaryDirectory()
+    def gg(*a, cwd=None):
+        return subprocess.run(("git", *a), cwd=cwd, capture_output=True, text=True)
+    origin, work = str(pathlib.Path(d2.name, "origin.git")), str(pathlib.Path(d2.name, "w"))
+    gg("init", "-q", "--bare", origin)
+    gg("clone", "-q", origin, work)
+    for k, v in (("user.email", "t@e"), ("user.name", "t")):
+        gg("config", k, v, cwd=work)
+    pathlib.Path(work, "a.txt").write_text("a\n")
+    gg("add", "-A", cwd=work); gg("commit", "-qm", "base", cwd=work)
+    gg("branch", "-M", "main", cwd=work); gg("push", "-q", "origin", "main", cwd=work)
+    gg("checkout", "-q", "-b", "rebased", cwd=work)
+    pathlib.Path(work, "a.txt").write_text("a\nb\n")
+    gg("commit", "-qam", "first attempt", cwd=work); gg("push", "-q", "origin", "rebased", cwd=work)
+    first = gg("rev-parse", "HEAD", cwd=work).stdout.strip()
+    gg("checkout", "-q", "main", cwd=work); gg("checkout", "-q", "-B", "rebased", cwd=work)
+    pathlib.Path(work, "a.txt").write_text("a\nb\nc\n")
+    gg("commit", "-qam", "rebased", cwd=work); gg("push", "-q", "-f", "origin", "rebased", cwd=work)
+    gg("update-ref", "refs/remotes/origin/rebased", first, cwd=work)   # what a worktree that missed the force-push holds
+    plain = gg("fetch", "-q", "origin", "refs/heads/rebased:refs/remotes/origin/rebased", cwd=work)
+    forced = gg("fetch", "-q", "origin", "+refs/heads/rebased:refs/remotes/origin/rebased", cwd=work)
+    chk(plain.returncode != 0, "the plain refspec cannot mirror a REBASED branch (non-fast-forward) -- the bug")
+    chk(forced.returncode == 0, "the mirroring refspec keeps the fix: a rebased branch is fetched, so it can be measured")
+
     return 0 if ok else 1
 
 
@@ -306,10 +335,15 @@ def main():
             cannot_tell(f"cannot read PR #{a.pr} (rc {rc}): {err.strip()[:200]}")
         info = json.loads(out)
         branch, base = info["headRefName"], info.get("baseRefName") or "main"
-        for ref in (f"{branch}:refs/remotes/origin/{branch}", f"{base}:refs/remotes/origin/{base}"):
-            rc, _o, err = run("git", "fetch", "-q", "origin", ref, cwd=root)
+        # engine#3076: the destination is OUR remote-tracking ref, so it is MIRRORED, never fast-forwarded. Without the `+`
+        # git refuses the update as non-fast-forward whenever the branch was rebased or force-pushed -- normal life in this
+        # repo -- and the tool answers cannot-tell on exactly the branches it exists to catch. Measured on #3074
+        # (`pkg-sampler-liveguard`, 3360ccd) and controlled before/after on #3080 (see the regression arm).
+        for name in (branch, base):
+            ref = f"refs/heads/{name}:refs/remotes/origin/{name}"
+            rc, _o, err = run("git", "fetch", "-q", "origin", "+" + ref, cwd=root)
             if rc != 0:
-                cannot_tell(f"cannot fetch {ref.split(':')[0]} (rc {rc}): {err.strip()[:120]}")
+                cannot_tell(f"cannot fetch {name} (rc {rc}): {err.strip()[:120]}")
         try:
             found = stale_finding(root, f"origin/{branch}", f"origin/{base}")
         except CannotTell as e:
@@ -325,7 +359,8 @@ def main():
 
     for n, branch, base in open_prs(a.repo):
         ref = f"origin/{branch}"
-        rc, _out, err = run("git", "fetch", "-q", "origin", branch, cwd=root)
+        rc, _out, err = run("git", "fetch", "-q", "origin",
+                            f"+refs/heads/{branch}:refs/remotes/origin/{branch}", cwd=root)
         if rc != 0:
             # engine#2992 review: this used to fall through to `stale_finding` returning None, which printed "removes nothing
             # main has" and exited 0 -- a 0 that meant "could not look". A branch that cannot be fetched is a cannot-tell.
@@ -335,7 +370,7 @@ def main():
         # the base is the PR's target: `origin/<baseRefName>`, fetched too, so a fork PR measured against its pin
         # branch cannot report clean while deleting that branch's newer lines (engine#3071)
         base_ref = f"origin/{base}"
-        rc, _o, err = run("git", "fetch", "-q", "origin", f"{base}:refs/remotes/{base_ref}", cwd=root)
+        rc, _o, err = run("git", "fetch", "-q", "origin", f"+refs/heads/{base}:refs/remotes/{base_ref}", cwd=root)
         if rc != 0:
             unreadable.append(f"#{n} {branch}: cannot fetch its base {base} ({err.strip()[:80]})")
             print(f"#{n} {branch}: CANNOT READ -- its base {base} could not be fetched", file=sys.stderr)

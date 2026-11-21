@@ -31,6 +31,7 @@ a missing shape log looks like a working run that has nothing to attribute.
 Basic use (the original behaviour, kept byte-compatible):
 
     hrx2kineto.py EVENTS OUT.trace.json --shapes SHAPES --by-kernel [N]     (per-kernel ranking, engine#3103)
+    hrx2kineto.py EVENTS OUT.trace.json --shapes SHAPES --by-shape  [N]     (per-(op,K,N) ranking, engine#3103)
     hrx2kineto.py --self-test                                               (fixture arms, no device)
 
     hrx2kineto.py x.events.jsonl x.trace.json [kernel_trace.csv]
@@ -56,7 +57,9 @@ and pass --write-arch's JSON as --gpu_arch_json_path for roofline columns.
 import argparse
 import bisect
 import collections
+import contextlib
 import glob
+import io
 import json
 import math
 import os
@@ -857,24 +860,22 @@ def load_programs_models(shapes_path):
     return programs, {p["program"]: [model_match(m) for m in p["matches"]] for p in programs}
 
 
-def by_kernel(events, shapes_path, commands_path, arch, top=25):
-    """Rank dispatches BY KERNEL: calls, ms, GPU-busy share, TFLOP/s and % of the fp16 WMMA roof (engine#3103).
+def rank_dispatches(events, shapes_path, commands_path, key_of):
+    """([(key, row)], total_ns, unmapped) -- the aggregation `--by-kernel` and `--by-shape` share.
 
-    `--summary` ranks by ggml OP, which is the right unit for "which layer is expensive" and the wrong one for "which
-    kernel is slow": a fused match is several kernels and the question is which of them takes the time. rocprofv3 cannot
-    answer it (HRX writes its own AQL packets, so it sees no dispatches), which is why the ranking is built from HRX's own
-    profile plus its shape log.
+    `key_of(name, match, event)` decides the row a dispatch lands in, so the two rankings differ only in that function and
+    cannot drift in how they credit FLOPs. rocprofv3 sees no HRX dispatches (HRX writes its own AQL packets), so this is
+    built from HRX's own profile plus its shape log.
 
     A match's FLOPs are credited to the kernel with the MOST time inside that match -- the GEMM, not a quantize/scale
-    companion that happens to run first -- and only once per execution: the instance key is
-    (submission_id, program, match), so two executions of one reused program are counted twice and a companion is never
-    credited a second GEMM that does not exist. Kernels the shape log does not name keep the event's own key, so an
-    unmapped dispatch is visible in the table instead of silently dropped.
+    companion that happens to run first -- once per execution: the instance key is (submission_id, program, match), so two
+    executions of one reused program are counted twice and a companion is never credited a GEMM that does not exist.
+    Dispatches the shape log does not name stay visible under the event's own key instead of being dropped.
     """
     programs, models = load_programs_models(shapes_path)
     cbmap = map_command_buffers(commands_path, programs, events)
-    roof = float(arch["max_achievable_tflops"]["matrix_fp16"])
-    rows = collections.defaultdict(lambda: {"calls": 0, "ns": 0.0, "flops": 0.0, "shared": 0, "cats": set()})
+    rows = collections.defaultdict(lambda: {"calls": 0, "ns": 0.0, "flops": 0.0, "shared": 0, "cats": set(),
+                                            "params": None})
     recs, total, unmapped = [], 0.0, 0
     for e in events:
         ns = e.get("duration_ns")
@@ -896,14 +897,16 @@ def by_kernel(events, shapes_path, commands_path, arch, top=25):
             break
         else:
             unmapped += 1
-        r = rows[name]
-        r["calls"] += 1
-        r["ns"] += ns
+        rk = key_of(name, match[2] if match else None, e)
+        rows[rk]["calls"] += 1
+        rows[rk]["ns"] += ns
+        if rows[rk]["params"] is None and match:
+            rows[rk]["params"] = match[2]["params"]
         if match is None:
             continue
         mi, prog, m = match
-        r["cats"].add(m["category"])
-        recs.append((name, ns, (e.get("submission_id"), prog["program"], mi), m))
+        rows[rk]["cats"].add(m["category"])
+        recs.append((rk, ns, (e.get("submission_id"), prog["program"], mi), m))
     if not total:
         sys.exit("hrx2kineto: no dispatch durations in the profile -- nothing measured")
 
@@ -916,11 +919,25 @@ def by_kernel(events, shapes_path, commands_path, arch, top=25):
         for rec in group:
             if rec is not primary:
                 rows[rec[0]]["shared"] += 1
+    return sorted(rows.items(), key=lambda kv: -kv[1]["ns"]), total, unmapped
 
-    print(f"roof {roof:.1f} TFLOP/s fp16 WMMA ({arch['sclk_mhz']:.0f} MHz, {arch['mem_bw_gbps']:g} GB/s)  | "
+
+def _roof_line(arch, events, total, unmapped):
+    print(f"roof {float(arch['max_achievable_tflops']['matrix_fp16']):.1f} TFLOP/s fp16 WMMA "
+          f"({arch['sclk_mhz']:.0f} MHz, {arch['mem_bw_gbps']:g} GB/s)  | "
           f"{len(events)} dispatches, {total / 1e6:.1f} ms GPU-busy, {unmapped} unmapped\n", file=sys.stderr)
+
+
+def by_kernel(events, shapes_path, commands_path, arch, top=25):
+    """Rank dispatches BY KERNEL: calls, ms, GPU-busy share, TFLOP/s and % of the fp16 WMMA roof (engine#3103).
+
+    `--summary` ranks by ggml OP, which is the right unit for "which layer is expensive" and the wrong one for "which
+    kernel is slow": a fused match is several kernels and the question is which of them takes the time.
+    """
+    roof = float(arch["max_achievable_tflops"]["matrix_fp16"])
+    order, total, unmapped = rank_dispatches(events, shapes_path, commands_path, lambda name, m, e: name)
+    _roof_line(arch, events, total, unmapped)
     print(f"{'kernel':54s} {'cat':10s} {'calls':>6s} {'ms':>8s} {'%busy':>6s} {'TFLOP/s':>8s} {'%roof':>6s}")
-    order = sorted(rows.items(), key=lambda kv: -kv[1]["ns"])
     for name, d in order[:top]:
         ms = d["ns"] / 1e6
         tf = d["flops"] / (d["ns"] / 1e9) / 1e12 if d["ns"] else 0.0
@@ -930,6 +947,40 @@ def by_kernel(events, shapes_path, commands_path, arch, top=25):
               f"{tf:8.1f} {100 * tf / roof:5.1f}%{more}")
     print(f"{'TOTAL':54s} {'':10s} {sum(d['calls'] for _, d in order):6d} {total / 1e6:8.2f} {100.0:6.1f} "
           f"{sum(d['flops'] for _, d in order) / (total / 1e9) / 1e12:8.1f}")
+    return 0
+
+
+def by_shape(events, shapes_path, commands_path, arch, top=25):
+    """Rank a profile by ggml op AND SHAPE: (op, K, N), with the launch width the shape implies (engine#3103).
+
+    A per-kernel average can hide a bimodal population. On Qwen3-4B pp512 the same `q4_k_f16_wmma_prefill` kernel runs at
+    54 % of roof where N is wide and at 18 % where N is 1024, and the average (40 %) belongs to neither -- which shape you
+    are looking at is the difference between "the tile is fine" and "this launch uses a fifth of the machine".
+
+    `workgroups` is the packed prefill schedule's only parallel axis: `kernel-corpus/kernels/loom-libs/ops/
+    mul_mat_f32_f32_wmma.loom` launches `workgroups(token_tiles = 1, output_size/64, 1)`, so a narrow N means few
+    workgroups on a 40-CU part. It is printed for the reader to check against %roof -- not asserted as a law: the same
+    table at M=2048 has 64 workgroups below 40, so N is one of two terms (the other is the K-work per wave).
+    """
+    def key_of(name, m, e):
+        if not m:
+            return (name, None, None)
+        pr = m["params"]
+        return (m["name"], pr.get("K"), pr.get("N"))
+
+    roof = float(arch["max_achievable_tflops"]["matrix_fp16"])
+    order, total, unmapped = rank_dispatches(events, shapes_path, commands_path, key_of)
+    _roof_line(arch, events, total, unmapped)
+    print(f"{'op':16s} {'K':>7s} {'N':>8s} {'workgroups':>10s} {'calls':>6s} {'ms':>8s} {'%busy':>6s} "
+          f"{'TFLOP/s':>8s} {'%roof':>6s}")
+    for (name, k_dim, n_dim), d in order[:top]:
+        ms = d["ns"] / 1e6
+        tf = d["flops"] / (d["ns"] / 1e9) / 1e12 if d["ns"] else 0.0
+        wg = str(n_dim // 64) if isinstance(n_dim, int) and n_dim else "-"
+        print(f"{name.replace('hrx::', ''):16.16s} {str(k_dim or '-'):>7s} {str(n_dim or '-'):>8s} {wg:>10s} "
+              f"{d['calls']:6d} {ms:8.2f} {100 * d['ns'] / total:6.1f} {tf:8.1f} {100 * tf / roof:5.1f}%")
+    print(f"{'TOTAL':16s} {'':7s} {'':8s} {'':10s} {sum(d['calls'] for _, d in order):6d} {total / 1e6:8.2f} "
+          f"{100.0:6.1f} {sum(d['flops'] for _, d in order) / (total / 1e9) / 1e12:8.1f}")
     return 0
 
 
@@ -1038,6 +1089,41 @@ def self_test():
     chk(9 not in map_command_buffers(None, [prog], evs),
         "... but an AMBIGUOUS prefix joins nothing: the tool refuses to guess which command a dispatch was")
 
+    # engine#3103: the by-shape ranking must split one op into its shapes (the average hides a bimodal population), and the
+    # workgroup column must be the packed schedule's own `output_size/64`, not a guess.
+    n_wide = {"op": "MUL_MAT", "index": 1, "desc": "MUL_MAT",
+              "out": tensor("out-0", [4096, 256, 1, 1], "f32"),
+              "src": [tensor("blk.0.q.weight", [2048, 4096, 1, 1], "q4_K"), tensor("act-0", [2048, 256, 1, 1], "f32")]}
+    n_narrow = {"op": "MUL_MAT", "index": 2, "desc": "MUL_MAT",
+                "out": tensor("out-1", [512, 256, 1, 1], "f32"),
+                "src": [tensor("blk.0.k.weight", [2048, 512, 1, 1], "q4_K"), tensor("act-1", [2048, 256, 1, 1], "f32")]}
+    prog2 = {"type": "hrx_command_program", "program": 2, "graph_uid": 2,
+             "commands": [{"phase": "main", "ordinal": 0, "kernel": "hip:wide", "symbol": "wide", "match": 0},
+                          {"phase": "main", "ordinal": 1, "kernel": "hip:narrow", "symbol": "narrow", "match": 1}],
+             "matches": [{"nodes": [n_wide]}, {"nodes": [n_narrow]}]}
+    evs2 = [{"type": "dispatch_event", "key": "wide", "valid": True, "command_buffer_id": 11,
+             "command_index": 1, "start_tick": 1000, "duration_ns": 2000000.0, "submission_id": 1},
+            {"type": "dispatch_event", "key": "narrow", "valid": True, "command_buffer_id": 11,
+             "command_index": 2, "start_tick": 3000, "duration_ns": 4000000.0, "submission_id": 1}]
+    with tempfile.TemporaryDirectory() as td:
+        sp = pathlib.Path(td, "shapes.jsonl"); sp.write_text(json.dumps(prog2) + "\n")
+        ep = pathlib.Path(td, "ev.jsonl"); ep.write_text("".join(json.dumps(e) + "\n" for e in evs2))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            by_shape(load_dispatch_events(str(ep)), str(sp), None, arch)
+        out = buf.getvalue()
+        chk(" 512" in out and "4096" in out, "by-shape splits one op into its shapes (K2048/N4096 and K2048/N512 are two rows)")
+        rows = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 9 and parts[0] == "mul_mat":
+                rows[parts[2]] = {"workgroups": parts[3], "pct": float(parts[-1].rstrip("%"))}
+        chk(rows.get("512", {}).get("workgroups") == "8",
+            "by-shape prints the packed schedule's workgroup count for N=512 (output_size/64 = 8), not a guess")
+        chk("512" in rows and "4096" in rows and rows["512"]["pct"] < rows["4096"]["pct"] / 5,
+            "by-shape reports %roof per SHAPE: the narrow launch is far below the wide one at the same K "
+            f"({rows.get('512', {}).get('pct')}% vs {rows.get('4096', {}).get('pct')}%)")
+
     print(f"hrx2kineto --by-kernel self-test: {ok[0]} ok, {ok[1]} failed")
     return 0 if ok[1] == 0 else 1
 
@@ -1061,6 +1147,9 @@ def main(argv=None):
     ap.add_argument("--by-kernel", type=int, nargs="?", const=25, default=0, metavar="N",
                     help="print the per-KERNEL ranking instead (calls, ms, TFLOP/s, %% of the fp16 WMMA roof); needs "
                          "--shapes. The unit #3103 asks about: --summary ranks a fused match as one op")
+    ap.add_argument("--by-shape", type=int, nargs="?", const=25, default=0, metavar="N",
+                    help="rank by ggml op AND shape, (op, K, N), with the launch width that shape implies; needs --shapes. "
+                         "The unit a per-kernel average hides: one kernel, one roof, two populations")
     ap.add_argument("--self-test", action="store_true", help="run the fixture arms for --by-kernel and exit")
     ap.add_argument("--tracediff-top", metavar="DIFF_STATS_CSV", help="summarise TraceDiff diff_stats.csv")
     ap.add_argument("--steps-from", metavar="TRACE", help="with --tracediff-top: per-step numbers (hrx::step count)")
@@ -1087,6 +1176,8 @@ def main(argv=None):
     if a.shapes:
         if a.by_kernel:
             by_kernel(events, a.shapes, a.commands, arch, a.by_kernel)
+        elif a.by_shape:
+            by_shape(events, a.shapes, a.commands, arch, a.by_shape)
         else:
             keep, _ = convert_shapes(events, a.out, a.shapes, a.commands, a.phase, a.skip, a.max,
                                      a.decode_max_tokens)

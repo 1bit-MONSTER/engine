@@ -232,7 +232,7 @@ Release sha and pins (the submodules this candidate is built from):
 | hrx-system | `82804197bcbe` |
 | Lemonade (fork) | `f44ff953` (the fork's `main` tip, and the sha `bump-lemonade`'s PR #1126 pinned; re-read this row from `git ls-tree third_party/lemonade` at cut time, because the workflow follows the tip) |
 | private kernel add-on (HIP) | `744bd713d968` |
-| private NPU kernel set | `17ed5be7a28a` |
+| private NPU kernel set | `3949f18e826e` |
 | private NPU runtime | `ce9fa59adf95` |
 | Laya | source `6f0496f797dc`, model `7b928d828b7b` |
 | amdxdna (out-of-tree NPU driver) | `526c608197` |

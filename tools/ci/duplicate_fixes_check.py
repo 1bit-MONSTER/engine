@@ -219,7 +219,13 @@ def describe(issue, group):
         age = pr.get('age_hours')
         age_s = f", {age:.1f} h old" if isinstance(age, (int, float)) else ''
         lines.append(f"  #{pr.get('number')} {pr.get('title') or ''}".rstrip() + f"{draft}{age_s}")
-    lines.append("  one of these should close, or say in both threads which lands first")
+    # engine#3205: the old sentence offered two remedies, and the second one cannot work -- `duplicates()` groups
+    # `gh api …/pulls`, so this row is computed from OPEN pull requests only and no amount of agreeing in the
+    # threads changes what it reads. Measured tonight: three lanes opened #3201/#3203/#3204 for one fix, all
+    # three threads agreed within 12 minutes that #3201 lands first, and the row stayed red repo-wide for the
+    # 25 minutes #3203 remained open. Say the action that clears it, or a lane follows the sentence and waits.
+    lines.append("  exactly one must CLOSE: this row is computed from OPEN pull requests, so agreeing in the "
+                 "threads cannot clear it")
     return "\n".join(lines)
 
 
@@ -348,7 +354,14 @@ def self_test():
     dup = duplicates(prs)
     ok([i for i, _ in dup] == [2778], "one duplicate is reported, and only the claimed-twice issue")
     ok([p['number'] for p in dup[0][1]] == [2784, 2786], "the pair is named oldest first")
-    ok('one of these should close' in describe(*dup[0]), "the report says what to do about it")
+    # engine#3205: this arm used to assert the first clause only, so a report whose advice could not clear the
+    # row still passed it (mutation: '… or reconsider the weather' left the self-test green). Assert the
+    # contract instead: the action that clears the row, and the fact that a thread comment is not one.
+    ok('must CLOSE' in describe(*dup[0]), "the report names the action that clears the row")
+    ok('cannot clear it' in describe(*dup[0]),
+       "…and says a thread comment is not it, because the row reads open PRs only")
+    ok('say in both threads' not in describe(*dup[0]),
+       "…and no longer offers the remedy that cannot work")
 
     # a draft claimant still counts: that is a lane working, which the second lane cannot see
     prs[1]['draft'] = True

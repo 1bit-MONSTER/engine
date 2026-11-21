@@ -7101,7 +7101,19 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         if (npu::model::run_lm_head(*xd_, h.data(), via_target.data())) { logits = std::move(via_target); return true; }
     }
     if (!host_gemm_ && xd_ && xd_->head_ctx() && xd_->head_ctx()->gemv) return run_lm_head_gemv(h, logits);
-    if (host_gemm_ && host_gemm_i8_) {
+    // engine#3196: the integer arm's head ladder is only a like-for-like twin of a DEVICE head that claimed the op. On a
+    // target whose `lm_head` the device does not support (`supports(Op::lm_head)` false), the device falls through to the
+    // f32 host matvec and logs "lm head: on the host" -- so comparing that device against this int8 ladder compares two
+    // different heads, and the gate's verdict on such a container is decided by the heads rather than by the kernel
+    // family (measured: device vs f32 max|d| 6.58 same argmax; device vs i8 max|d| 16.35, argmax flipped; i8's whole
+    // logit vector ~0.3x the others). NPU_I8_HEAD_OFF=1 takes the ladder out of the comparison so the arm's documented
+    // claim ("int8 x int4 accumulates in exact int32") is measured on the BODY, where it belongs. Off by default: the
+    // ladder is still what engine#1808 built it for wherever the device does run its own head.
+    static const bool i8_head_off = [] {
+        const char* e = std::getenv("NPU_I8_HEAD_OFF");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    if (host_gemm_ && host_gemm_i8_ && !i8_head_off) {
         // engine#1808: the head's integer twin. Without this the arm's head is a plain f32 matvec ("No I8Ctx is
         // touched" below) while the device's head reads a packed quantised table, which is exactly the 0.30 max|d|
         // that was left once every body GEMM had been shown bit-exact. The device packs its head tiles with

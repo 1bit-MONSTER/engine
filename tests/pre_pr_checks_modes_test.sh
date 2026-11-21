@@ -61,6 +61,32 @@ check "each open-PR row is announced with the tree-only reason" '[ "$announced" 
 check "every announced row is counted in the summary (printed == counted)" '[ -n "$noted" ] && [ "$announced" -eq "$noted" ]'
 check "the open-PR rows are not claimed as ordinary skips" \
       '! grep -qE "^skip +(tools/ci/(duplicate_fixes_check|pr_branch_stale_check)\.py) +(nothing compared|SKIPPED)" <<<"$out"'
+# engine#3142 review (cl-review's mutant): the arms above are all about the OPEN-PR rows, so a `continue` that swallows
+# the open-PR row AND the next one leaves every one of them green -- it was measured: 7 green where the tree gives 8,
+# announced == noted still true, rc 0. So pin the other direction too: every row `--list --tree-only` names must appear
+# in the run with a verdict, which is a statement about the rows that SHOULD have run rather than the two that should not.
+listed=$(scripts/pre-pr-checks.sh --list --tree-only | awk '{print $2}' | sort -u)
+seen=$(printf '%s\n' "$out" | awk '/^(ok|FAIL|cannot-tell|skip) +tools\// {print $2}' | sort -u)
+missing=$(comm -23 <(printf '%s\n' "$listed") <(printf '%s\n' "$seen") | tr '\n' ' ')
+check "every row --list --tree-only names actually ran (a swallowed row is not a clean run)" '[ -z "$missing" ]'
+# ...and the set comparison above is SELF-CONSISTENT with the code under test: a `continue` that swallows a row drops it
+# from `--list` too, so `listed` and `seen` shrink together and the two arms stay green. Measured: that mutant (cl-review's,
+# applied verbatim) made this file report `ok` while one check had vanished from the run. So the expected SIZE is a
+# literal, taken from the repository the way the runner's own self-test takes 17/15: a dropped row cannot hide behind a
+# second reading of the same broken function.
+check "--list --tree-only still names 15 rows (a literal, not a second reading of this code)" \
+      '[ "$(printf "%s\n" "$listed" | grep -c .)" -eq 15 ]'
+# ...and the TOTAL, which is the arm #3145 arrived at independently 24 seconds after this branch (crediting it here
+# because its reasoning is the better statement of the same property, and it catches one thing mine does not): a filter
+# that drops a row it never announced changes this number and nothing else; a row that prints TWO lines changes it too.
+# `--list` WITHOUT `--tree-only` is the correct baseline precisely because it never enters the filter under test -- that
+# is what makes the expectation independent rather than a second reading of the same broken function.
+listed_total=$(bash scripts/pre-pr-checks.sh --list | wc -l)
+check "every listed row produces exactly one line (no filter swallowed or doubled a row)" \
+      '[ "$(printf "%s\n" "$out" | grep -cE "^(ok|FAIL|skip|cannot-tell) ")" -eq "$listed_total" ]'
+extra=$(comm -13 <(printf '%s\n' "$listed") <(printf '%s\n' "$seen") | sort -u | tr '\n' ' ')
+want_extra=$(printf '%s\n' $open_rows | sort -u | tr '\n' ' ')
+check "...and the only names outside --list are the two open-PR rows it announced" '[ "$extra" = "$want_extra" ]'
 for row in $base_rows; do
     check "$row is reported cannot-tell, with its own line" \
           "grep -q '^cannot-tell  $row .*--base $bogus does not resolve' <<<\"\$out\""

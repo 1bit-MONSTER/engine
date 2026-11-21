@@ -122,7 +122,11 @@ def checkpoint_shas(card_dir, lock):
                         names.add(n)
     for n in names:
         shas |= lock[n]
-    return shas or {sha for v in lock.values() for sha in v}
+    # engine#3156 review: the old fallback returned EVERY file the lock binds when the checkpoint file names could
+    # not be read, which compares our bytes against the DRAFTER's (three files for Qwen3-Coder-30B-A3B). An
+    # unreadable checkpoint is cannot-tell for the bytes arm, so return nothing and let the caller report
+    # COVERED-UNPINNED rather than a fabricated DIFFERENT-UPLOAD.
+    return shas
 
 
 def lock_bytes(card_dir):
@@ -244,7 +248,7 @@ def check(tsv, roots, ours=None):
     if not cards:
         return 2, ["loom_coverage: no card tree found (pass --cards); the cards are ~GB downloads, so this is "
                    "cannot tell, not a pass"]
-    lines, bad = [], 0
+    lines, bad, unpinned_bytes = [], 0, 0
     for device, model in read_rows(tsv):
         if device != "hrx":
             continue
@@ -252,21 +256,33 @@ def check(tsv, roots, ours=None):
         lines.append(f"{verdict:9s} {model:46s} {detail}")
         # COVERED-UNPINNED is covered on name+quant with no pin of ours to compare, which is a bookkeeping gap
         # rather than a finding; DIFFERENT-UPLOAD and NO-LOCK are findings and fail the row.
-        if verdict not in ("COVERED", "COVERED-UNPINNED"):
+        # engine#3156 review: COVERED-NOBYTES means we have no pins file at all, so the bytes arm cannot run --
+        # that is cannot tell (rc 2), not a finding against whichever PR happens to run the gate. It is counted
+        # separately and reported in the summary so the label and the exit code agree.
+        if verdict == "COVERED-NOBYTES":
+            unpinned_bytes += 1
+        elif verdict not in ("COVERED", "COVERED-UNPINNED"):
             bad += 1
-    return (0 if bad == 0 else 1), lines
+    if unpinned_bytes:
+        lines.append(f"loom_coverage: {unpinned_bytes} row(s) could not be compared: no pins file "
+                     f"(pass --pins); the name+quant arm ran, the bytes arm did not -- cannot tell, not a pass")
+    if bad:
+        return 1, lines
+    return (2 if unpinned_bytes else 0), lines
 
 
 def self_test():
     """Hermetic: a synthetic registry and card tree, with the two traps the map has to get right."""
     import tempfile
     fails = 0
+    total = 0   # engine#3156 review: count the arms instead of a hand-moved literal that drifted 7 -> 11 for 10 arms
 
     def arm(name, want, rows, cards, expect_rc, pins=None):
         """Assert the VERDICT, not only the exit code: COVERED (0), UNCOVERED and REQUANT (both 1) are three
         answers and two of them share an rc, so an rc-only arm cannot tell them apart -- which is the one
         distinction the tool exists to make."""
-        nonlocal fails
+        nonlocal fails, total
+        total += 1
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td) / "cards"
             root.mkdir()
@@ -353,7 +369,7 @@ def self_test():
     # non-GPU rows are not this map's business
     arm("npu rows are ignored (nothing is reported for them)", "no-verdict-at-all",
         [("npu", "Qwen3-0.6B")], [("unsloth-Qwen3-0.6B-loom", "Qwen/Qwen3-0.6B", ["Q4_K_M"])], 0)
-    print(f"loom_coverage_check self-test: {11 - fails} ok, {fails} failed")
+    print(f"loom_coverage_check self-test: {total - fails} ok, {fails} failed")
     return 0 if fails == 0 else 1
 
 

@@ -1659,6 +1659,10 @@ if(Python3_Interpreter_FOUND)
     # comes from a submodule, so this skips (77) where the fork is not checked out, like hrx_f16_narrowing_check.
     add_test(NAME registry_content COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check)
     set_tests_properties(registry_content PROPERTIES SKIP_RETURN_CODE 77)
+    # engine#3212 follow-up: `--from-tarball` brought a `--self-test` whose arms are all offline (no pinned sha, no repo
+    # slug, a cache entry that is not the fork's tree), and a self-test no runner names is a self-test nobody runs --
+    # tool_selftest_wired_check counted it as wired through the other three rows, which is why this was easy to miss.
+    add_python_test(registry_build_self ${CMAKE_SOURCE_DIR}/tools/registry_build.py --self-test)
     # the row's own mutant: a fake fork and a fake gitlink in a scratch repo, so the content edit that made every
     # other row green is proved to make this one red, and the no-checkout case is proved to be 77 and not 0.
     add_test(NAME registry_content_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_content_test.py)

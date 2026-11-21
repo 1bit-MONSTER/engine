@@ -46,6 +46,7 @@ import ast
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -210,12 +211,34 @@ def fetch_tree(url, sha, cache=None):
     import tarfile
     import tempfile
     import urllib.request
-    dest = os.path.join(cache or os.path.join(os.path.expanduser("~"), ".cache", "registry_build"), sha)
+    root = cache or os.path.join(os.path.expanduser("~"), ".cache", "registry_build")
+    dest = os.path.join(root, sha)
     marker = os.path.join(dest, ".complete")
+
+    def prune(note):
+        """Drop the previous pin's extracted tree, unless ONEBIT_REGISTRY_TARBALL_KEEP=all (engine#3212).
+
+        An extracted tree is ~200 MB and nothing here is shared between pins, so an unbounded cache grows by that on
+        every bump -- and a bump is exactly when this runs. Called on BOTH paths: a cache HIT can be the run that
+        should prune the sibling, which a version that only pruned after extracting would walk straight past.
+        """
+        if os.environ.get("ONEBIT_REGISTRY_TARBALL_KEEP", "1") == "all":
+            return note
+        dropped = []
+        for name in sorted(os.listdir(root)):
+            path = os.path.join(root, name)
+            if name == sha or not os.path.isdir(path):
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            dropped.append(name[:9])
+        if dropped:
+            note += (f"; pruned the previous pin(s) {', '.join(dropped)} (ONEBIT_REGISTRY_TARBALL_KEEP=all keeps them)")
+        return note
+
     if os.path.isfile(marker):
         trees = [d for d in os.listdir(dest) if os.path.isdir(os.path.join(dest, d))]
         if len(trees) == 1:
-            return os.path.join(dest, trees[0]), f"cached at {dest}"
+            return os.path.join(dest, trees[0]), prune(f"cached at {dest}")
     os.makedirs(dest, exist_ok=True)
     tgz = os.path.join(dest, "src.tgz")
     try:
@@ -236,7 +259,7 @@ def fetch_tree(url, sha, cache=None):
     if len(trees) != 1:
         return None, f"{url} did not extract to exactly one directory ({len(trees)} found)"
     open(marker, "w").close()
-    return os.path.join(dest, trees[0]), f"fetched {url} into {dest}"
+    return os.path.join(dest, trees[0]), prune(f"fetched {url} into {dest}")
 
 
 def build(tree=None):

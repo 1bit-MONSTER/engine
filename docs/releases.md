@@ -112,6 +112,7 @@ DeepSeek V4.x, GLM 5.x and Qwen3.8-Flash-Next run on **HRX** here, and the catal
 | HRX (llama.cpp fork, ggml-hrx) | `4a58da9b087d` |
 | hrx-system | `82804197bcbe` |
 | HRX toolchain (ROCm/TheRock SDK) | `10.3.0a20261031`, `gfx1151` (`config/hrx-toolchain.config`), HSA runtime `21a6682452e159cf…` |
+| Loom toolchain (GPU cards) | `hrx_loom 0.2.0` (PyPI, 2026-11-16) from `hrx-system v0.2.0` @ `0cd370f2baaa` on `release/v0.2` + catalog `hrx-loom-library v0.2.0` @ `1fd6bd23279e` (`config/loom.config`) |
 | Lemonade Server | `2026.46.0~1.ef0f3b49` (our fork, the `onebit` recipe) |
 | kernel in the image | `7.4.0-rc1-1bit` (Linux `v7.4-rc1`, IOMMU PerfOpt upstream, MOK-signed) |
 | NPU kernel sets | 3 sealed sets, 30 kernels, every manifest signed |

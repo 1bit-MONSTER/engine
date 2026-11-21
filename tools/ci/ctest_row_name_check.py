@@ -37,13 +37,16 @@ What already catches this, and why none of it does:
     a diagnosis cycle (#1979 covered the stale-hunk cousin of this, which a rebase shows you as a conflict; this
     one shows up as a CMake error).
 
-So: intersect the row names a branch **adds** with the names present in `<base>:CMakeLists.txt` -- the base
+So: intersect the row names a branch **adds** with the names present in the base tree -- the base
 **tip**, because that is where the duplicate appears. Rebased, the diff stops adding the row and this goes quiet,
 which is the fix.
 
-Narrow on purpose: CMakeLists.txt only, and only the two registration spellings this tree uses
-(`add_test(NAME X` and `add_python_test(X`). A name computed from a variable is not compared (the arms pin that),
-because a check that guesses at expansion is a check that reports names it did not read.
+Narrow on purpose: the namespace is exactly what the registration glob at the end of `CMakeLists.txt` `include()`s
+-- the top-level file plus `cmake/tests-*.cmake` -- and only the two registration spellings this tree uses
+(`add_test(NAME X` and `add_python_test(X`). A row in any other `cmake/*.cmake` file is NOT seen: the glob is the
+definition of the namespace, not a sample of it (and it is a different CMake directory scope, `add_subdirectory`,
+that makes `onnx/`'s rows a separate namespace). A name computed from a variable is not compared (the arms pin
+that), because a check that guesses at expansion is a check that reports names it did not read.
 
 Two shapes that are NOT duplicates, both measured on `main`'s own history before this row landed: a row REWRITTEN
 in place (engine#3018 removed and re-added the name in one diff), and the same name registered inside a **different
@@ -53,7 +56,8 @@ configure takes.
 
 Exit: 0 no collision, 1 the branch adds a name the base already registers (and the diff does not remove it),
 2 cannot tell (no git, an unresolvable base, a shallow clone where `base...HEAD` is not a real comparison, or a
-collision where either side sits inside an `if()` block).
+collision where BOTH sides sit inside an `if()` block -- an unconditional registration at either end collides
+whenever the other side's guard is on, so one guarded side is a collision, not a cannot-tell).
 
   tools/ci/ctest_row_name_check.py --check [--base origin/main] [--root .]
   tools/ci/ctest_row_name_check.py --self-test

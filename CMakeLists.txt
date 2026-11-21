@@ -320,6 +320,15 @@ add_test(NAME kernel_pin COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_pin_test.
 # The budget is `BITX_SERVE_WAIT_S` and the message carries the child's own last line; both are checked here with a stub
 # binary under a fake ticket, so this runs in CI with no NPU, no container and no device.
 add_test(NAME npu_kernel_bitx_wait COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_kernel_bitx_wait_test.sh ${CMAKE_SOURCE_DIR}/scripts/npu-kernel-bitx.sh)
+# engine#3196: the sibling arm. `npu-window11.sh` reported a serve that DIED with its log tail but a serve that stayed
+# alive and never bound with nothing at all -- which is what a warm-killed 14B arm looks like. Both arms now print the
+# log and the budget, and both are checked here with a stub under a 1 s budget: no NPU, no container, no device.
+add_test(NAME npu_window11_wait COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_window11_wait_test.sh ${CMAKE_SOURCE_DIR}/scripts/npu-window11.sh)
+# engine#3200 review: the test frees a loopback port (free_port) and curls it, so it holds the same RESOURCE_LOCK as the
+# route rows -- route_port_lock_test.py's BIND_RE matches `free_port` by design, and without the lock a concurrent route
+# test's server could be handed that number: the "never binds" arm would then see a stranger's /health and post the
+# fixture prompts at it. The guard is what caught this, not a reviewer.
+set_tests_properties(npu_window11_wait PROPERTIES RESOURCE_LOCK route_ports)
 # engine#2183: the lost-update class has a second medium. `registration_loss_check` covers what a branch removes
 # from the BUILD; this covers what it removes from the DOCS -- a rebase that resolved `docs/npu.md` by taking the
 # branch's side dropped a section that had merged that morning (#2314). Offline, git-only, no build input.

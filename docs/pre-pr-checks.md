@@ -51,6 +51,7 @@ below says why. The table's order is the runner's order: cheapest and most commo
 | `python3 tools/ci/tmp_path_check.py --check` | a new `/tmp` or `/dev/shm` path, where builds and dumps belong under `~/wt` or `~/.cache/scratch-*` |
 | `python3 tools/ci/conflict_marker_check.py --check` | a merge-conflict marker committed at the start of a line -- #2625 shipped `<<<<<<< HEAD` inside a ```bash block and the page stopped rendering, and nothing read it back |
 | `python3 tools/ci/submodule_pin_check.py --check` | a submodule's checkout is not the commit the tree pins |
+| `python3 tools/ci/loom_pin_check.py --check` | the Loom toolchain pin's three facts disagree -- `config/loom.config` records a commit, a version and a model catalog, and nothing generic reads a version file (LOOM-GPU-SWITCH L5, engine#3160); answers cannot-tell when no local clone carries the pin |
 | `python3 tools/ci/cmake_configure_check.py --check` | `CMakeLists.txt` no longer configures -- CI's Configure step would fail, and no text check can see a line that starts correctly and ends wrong |
 | `python3 tools/ci/registration_loss_check.py --check --base origin/main` | your branch would drop rows `main` has |
 | `python3 tools/ci/registry_loss_check.py --base origin/main` | a reviewed class, a `coverage` counter or a test's mention of a class that the base has is gone at the merge, not only at the endpoint (engine#2385, #2391) |

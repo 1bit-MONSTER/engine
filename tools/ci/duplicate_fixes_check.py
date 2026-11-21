@@ -219,7 +219,15 @@ def describe(issue, group):
         age = pr.get('age_hours')
         age_s = f", {age:.1f} h old" if isinstance(age, (int, float)) else ''
         lines.append(f"  #{pr.get('number')} {pr.get('title') or ''}".rstrip() + f"{draft}{age_s}")
-    lines.append("  one of these should close, or say in both threads which lands first")
+    # engine#3205: the second half of this sentence used to be "say in both threads which lands first", and that cannot
+    # clear the row -- `duplicates()` reads OPEN PULL REQUESTS, so a decision posted in two threads changes nothing it
+    # looks at. Measured on engine#3200: three PRs, all three threads agreeing which one lands, one closed, and the third
+    # stayed open with `pre-pr-checks` red on every lane's PR for 25 minutes because the sentence offered an alternative
+    # that reads as equally valid. Both named actions below are ones this file actually reads: a close removes the PR
+    # from `duplicates()`, and the allow file (`read_allow`/`apply_allow`) declares a legitimate pair with a reason.
+    lines.append("  one of these should close (`gh pr close <n> --delete-branch`), or declare the pair in "
+                 f"{ALLOW_FILE} with a reason -- this row is computed from OPEN pull requests only, so a decision "
+                 "in the threads does not clear it")
     return "\n".join(lines)
 
 
@@ -349,6 +357,16 @@ def self_test():
     ok([i for i, _ in dup] == [2778], "one duplicate is reported, and only the claimed-twice issue")
     ok([p['number'] for p in dup[0][1]] == [2784, 2786], "the pair is named oldest first")
     ok('one of these should close' in describe(*dup[0]), "the report says what to do about it")
+    # engine#3205: presence was never the problem -- the sentence also offered "say in both threads which lands first",
+    # which the checker cannot read, and an arm that only asks for the first half stayed green through that. Both halves
+    # are pinned now: the two actions `duplicates()`/`read_allow()` actually honour, and the absence of the one they do not.
+    _msg = describe(*dup[0])
+    ok('gh pr close' in _msg, "the advice names the command that clears it")
+    ok('duplicate_fixes_allow.txt' in _msg, "... and the allow file, which read_allow() honours")
+    ok('say in both threads' not in _msg,
+       "... and does not offer the thread decision, which duplicates() never reads (engine#3205)")
+    ok('OPEN pull requests only' in _msg,
+       "... and says WHY the threads cannot clear it, rather than only asserting that they cannot (#3208)")
 
     # a draft claimant still counts: that is a lane working, which the second lane cannot see
     prs[1]['draft'] = True

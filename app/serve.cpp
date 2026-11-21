@@ -702,9 +702,20 @@ public:
             if (auto r = c.Get(ready_path_); r && r->status == 200) {
 #if defined(__linux__)
                 if (port_owner(pid_, port_) == PortOwner::kOther) {
-                    std::fprintf(stderr, "1bit serve: port %d answers, but not from the backend serve started (pid %d); "
-                                         "refusing to use it\n", port_, int(pid_));
-                    return false;
+                    // engine#3130: this is not a reason to stop. The port answers, but not from the backend this
+                    // handle started -- i.e. something else took the port serve picked before our child bound it. Keep
+                    // polling, say it once, and let the child reach its own EADDRINUSE: #2537's relaunch is driven by
+                    // that (the child dies, its stderr carries the cause) and it cannot fire behind a bare `return
+                    // false` here. Printed once so a 600 s wait does not flood serve's log with it.
+                    if (!port_foreign_) {
+                        port_foreign_ = true;
+                        std::fprintf(stderr,
+                                     "1bit serve: port %d answers, but not from the backend serve started (pid %d); waiting "
+                                     "for the backend to report the bind failure so it can be relaunched on a free port\n",
+                                     port_, int(pid_));
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    continue;
                 }
 #endif
                 return true;
@@ -736,6 +747,12 @@ private:
     mutable pid_t pid_ = -1;      // the running child; -1 once reaped (or never started)
     mutable bool exited_ = false; // reaped with a status (status_)
     mutable int status_ = 0;
+    // engine#3130: answered at least once by a process that is NOT this child. Recorded rather than acted on here,
+    // because the right response is to keep waiting: our child has not bound the port yet (it is still loading when a
+    // concurrent run's server, or a leftover, answers it first), so it is on its way to EADDRINUSE, and that is the
+    // cause engine#2537's relaunch already handles -- returning a bare false here made the failure terminal and serve
+    // exited 1 with "backend 0 did not become ready" instead of retrying on a fresh port.
+    mutable bool port_foreign_ = false;
 #endif
     int port_;
     std::string ready_path_;

@@ -45,6 +45,14 @@
 #
 # Inputs (env, all optional): ACCEL_SAMPLER_DIR, SAMPLE_S (2), WINDOW_S (5), MAX_BYTES (50 MB), ACCEL_NODE.
 set -u
+# engine#3072: `DIR=` is not this script's knob (ACCEL_SAMPLER_DIR is), and it looks exactly like one. Measured cost: a 25 s
+# smoke run with `DIR=<scratch>` was silently ignored, so it wrote the LIVE summary while the unit was writing it too, and
+# the operator believed the run went to scratch. Honour the near-miss and say so -- a silent no-op in the unsafe direction
+# is the one outcome worth spending three lines on.
+if [ -z "${ACCEL_SAMPLER_DIR:-}" ] && [ -n "${DIR:-}" ]; then
+  ACCEL_SAMPLER_DIR=$DIR
+  echo "note: DIR= is not this script's knob; reading it as ACCEL_SAMPLER_DIR=$DIR (the knob is ACCEL_SAMPLER_DIR)." >&2
+fi
 DIR=${ACCEL_SAMPLER_DIR:-$HOME/.cache/accel-sampler}
 SAMPLE_S=${SAMPLE_S:-2}
 FULL_SCAN_S=${FULL_SCAN_S:-30}   # a full /proc sweep every 2 s cost 62% of a core (measured); holders are long-lived
@@ -164,6 +172,19 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   # engine#2778: the summary must be REPLACED, not truncated in place. The observable is the inode: `> "$out"` keeps it
   # (truncate + fill, so a reader inside the window sees a valid header and nothing else), `> "$out.tmp" && mv -f` changes it
   # (rename over the old entry). This arm is deterministic -- no reader race -- and it fails on the truncating line.
+  # engine#3072: the live-write policy, every combination, no systemd and no live path touched
+  L=$HOME/.cache/accel-sampler
+  should_refuse_live both "$L" "$L" 0 0 0; [ "$?" = 3 ] \
+    || { echo "FAIL: a capture against the LIVE dir while the unit runs it must refuse"; fail=1; }
+  should_refuse_live both "$L" "$L" 1 0 0 || { echo "FAIL: a caller that named a directory must not be refused"; fail=1; }
+  should_refuse_live both "$L" "$L" 0 1 0 || { echo "FAIL: the unit itself is the legitimate live writer"; fail=1; }
+  should_refuse_live both "$L" "$L" 0 0 1 || { echo "FAIL: ACCEL_SAMPLER_LIVE_OK must override the refusal"; fail=1; }
+  should_refuse_live sample "$d" "$L" 0 0 0 || { echo "FAIL: a scratch directory must never be refused"; fail=1; }
+  should_refuse_live summary "$L" "$L" 0 0 0 || { echo "FAIL: summary must stay runnable against the live dir"; fail=1; }
+  should_refuse_live selftest "$L" "$L" 0 0 0 || { echo "FAIL: selftest must stay runnable"; fail=1; }
+  # ... and the near-miss that produced #3072: DIR= must reach a directory, not be silently dropped onto the live one.
+  DIR="$d/dirvar" "${BASH_SOURCE[0]:-$0}" holders >/dev/null 2>&1
+  [ -d "$d/dirvar" ] || { echo "FAIL: DIR= was ignored (the near-miss that let a smoke run write the live summary)"; fail=1; }
   mkdir -p "$d/sum"
   : > "$d/sum/samples.log"
   SAMP=$d/sum/samples.log ATTR=$d/sum/attributed.log DIR=$d/sum
@@ -427,6 +448,37 @@ check_deployed() {  # check-deployed [dest] -- rc 0 the deployed copy is the byt
   fi
   echo "check-deployed: ok $dest sha256 $sha_actual commit $(sed -n 's/^commit=//p' "$prov")"
 }
+
+# engine#3072: WRITING THE LIVE DIRECTORY BY OMISSION. `install` refuses without an explicit destination (#2795) because
+# deploying the instrument must never happen by accident. Running a CAPTURE against the live directory while the unit runs
+# it is the same hazard one step out: a branch under test replaces the fleet's fault summary, and `check-deployed` still
+# says ok because the deployed bytes never changed. The policy is one pure function so the arm can exercise every
+# combination without a fake systemd; only in_unit_cgroup() touches the system.
+should_refuse_live() {  # <mode> <dir> <live-dir> <named-a-dir:0|1> <in-unit-cgroup:0|1> <override:0|1>
+  case "$1" in both|sample|watch) ;; *) return 0 ;; esac   # summary/holders/selftest only read, or write their own scratch
+  [ "$2" = "$3" ] || return 0      # not the live directory: this is a test, let it run
+  [ "$4" = 1 ] && return 0         # the caller named a directory on purpose, including the live one
+  [ "$6" = 1 ] && return 0         # ACCEL_SAMPLER_LIVE_OK=1: deliberate, and documented in the refusal below
+  [ "$5" = 1 ] && return 0         # we ARE the unit -- the one legitimate live writer
+  return 3
+}
+in_unit_cgroup() {  # the unit's own processes carry its name; an interactive lane runs in a session scope
+  grep -q 'accel-sampler\.service' /proc/self/cgroup 2>/dev/null
+}
+
+_live_named=0; [ -n "${ACCEL_SAMPLER_DIR:-}" ] && _live_named=1
+_live_inunit=0; in_unit_cgroup && _live_inunit=1
+_live_override=0; [ -n "${ACCEL_SAMPLER_LIVE_OK:-}" ] && _live_override=1
+# The rc is the verdict (0 = allowed, 3 = refused), compared explicitly -- `if ! fn` here would read as "allowed" and mean
+# "refused", which is the kind of inversion that turns a guard into its own negation (and every arm below would still pass).
+should_refuse_live "${1:-both}" "$DIR" "$HOME/.cache/accel-sampler" "$_live_named" "$_live_inunit" "$_live_override"
+case "$?" in
+  3)
+    echo "refusing '${1:-both}': it would write the LIVE directory ($DIR) while accel-sampler.service is running it." >&2
+    echo "          For a test: ACCEL_SAMPLER_DIR=<scratch dir> $0 ${1:-both}" >&2
+    echo "          To write there anyway: ACCEL_SAMPLER_LIVE_OK=1 $0 ${1:-both}" >&2
+    exit 3 ;;
+esac
 
 case "${1:-both}" in
   sample) sample_once ;;

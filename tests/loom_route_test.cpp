@@ -62,16 +62,18 @@ int main() {
         check("a table without routes is refused", !t.parse(R"({"about":"x"})", err) && err.find("routes") != std::string::npos);
         check("an entry without gate is refused",
               !t.parse(R"({"routes":[{"id":"a","card":"c","match":{"model":["m"]}}]})", err) && err.find("gate") != std::string::npos);
+        check("an entry without preset is refused (a card with several presets will not start without one)",
+              !t.parse(R"({"routes":[{"id":"a","card":"c","gate":"g","match":{"model":["m"]}}]})", err) && err.find("preset") != std::string::npos);
         check("an entry without match is refused",
-              !t.parse(R"({"routes":[{"id":"a","card":"c","gate":"g"}]})", err) && err.find("match") != std::string::npos);
+              !t.parse(R"({"routes":[{"id":"a","card":"c","gate":"g","preset":"chat"}]})", err) && err.find("match") != std::string::npos);
         check("an unknown key is refused (a typo would silently match everything)",
-              !t.parse(R"({"routes":[{"id":"a","card":"c","gate":"g","match":{"modle":["m"]}}]})", err) &&
+              !t.parse(R"({"routes":[{"id":"a","card":"c","gate":"g","preset":"chat","match":{"modle":["m"]}}]})", err) &&
                   err.find("modle") != std::string::npos);
         check("a sha256 without its size is refused",
-              !t.parse(R"({"routes":[{"id":"a","card":"c","gate":"g","match":{"gguf_sha256":")" + std::string(64, 'a') +
+              !t.parse(R"({"routes":[{"id":"a","card":"c","gate":"g","preset":"chat","match":{"gguf_sha256":")" + std::string(64, 'a') +
                        R"("}}]})", err) && err.find("gguf_size") != std::string::npos);
         check("a bad sha256 is refused",
-              !t.parse(R"({"routes":[{"id":"a","card":"c","gate":"g","match":{"gguf_sha256":"xyz","gguf_size":3}}]})", err));
+              !t.parse(R"({"routes":[{"id":"a","card":"c","gate":"g","preset":"chat","match":{"gguf_sha256":"xyz","gguf_size":3}}]})", err));
         check("a full entry parses",
               t.parse(R"({"routes":[{"id":"a","card":"c","gate":"g","preset":"chat","device":"amdgpu://",
                           "args":["--memory_bytes=1"],"env":{"K":"V"},
@@ -92,9 +94,9 @@ int main() {
         loom::LoomRoutes t;
         std::string err;
         t.parse(R"({"routes":[
-            {"id":"other-size","card":"c","gate":"g","match":{"gguf_sha256":")" + abc_sha + R"(","gguf_size":4}},
-            {"id":"by-name","card":"c","gate":"g","match":{"model":["named"]}},
-            {"id":"by-sha","card":"c","gate":"g","match":{"gguf_sha256":")" + abc_sha + R"(","gguf_size":3}}]})", err);
+            {"id":"other-size","card":"c","gate":"g","preset":"chat","match":{"gguf_sha256":")" + abc_sha + R"(","gguf_size":4}},
+            {"id":"by-name","card":"c","gate":"g","preset":"chat","match":{"model":["named"]}},
+            {"id":"by-sha","card":"c","gate":"g","preset":"chat","match":{"gguf_sha256":")" + abc_sha + R"(","gguf_size":3}}]})", err);
         const loom::LoomRoute* r = loom::match_loom_route(t, file, {"", "tiny", "tiny.gguf"}, sha);
         check("the checkpoint's sha256 + size selects its entry", r && r->id == "by-sha");
         check("and the file was hashed once", hashed == 1);
@@ -102,7 +104,7 @@ int main() {
         r = loom::match_loom_route(t, file, {"named", "tiny", "tiny.gguf"}, sha);
         check("a model name selects its entry (first match wins)", r && r->id == "by-name" && hashed == 0);
         loom::LoomRoutes none;
-        none.parse(R"({"routes":[{"id":"x","card":"c","gate":"g","match":{"gguf_sha256":")" + std::string(64, 'b') +
+        none.parse(R"({"routes":[{"id":"x","card":"c","gate":"g","preset":"chat","match":{"gguf_sha256":")" + std::string(64, 'b') +
                        R"(","gguf_size":3}}]})", err);
         hashed = 0;
         check("another checkpoint of the same size is no match", !loom::match_loom_route(none, file, {"tiny"}, sha) && hashed == 1);

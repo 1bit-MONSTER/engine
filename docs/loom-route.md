@@ -50,8 +50,11 @@ The shipped table is empty, so nothing changes until a model passes the gate bel
   first, so a file of another size is never hashed; an empty table never reads the model.
 - `card`: a fetched Loom package (`loom-fetch`), as a `model.json` or the directory that holds it. A
   relative path resolves under `--loom-cards DIR`, `ONEBIT_LOOM_CARDS`, else `~/.cache/1bit/loom-cards`.
-- `device`, `preset`, `args`, `env`: passed to `loom-serve` (`--device=`, `--preset=`, as written, and
-  its environment; a variable the user set wins).
+- `preset`: required. Passed as `--preset=`. `loom-serve` refuses a card with several presets unless one
+  is named ("select a preset explicitly (N choices)"), and most cards have several (55 of the 59 loom-fun
+  cards on 21 Nov); the gate measured one preset, so the entry names it.
+- `device`, `args`, `env`: passed to `loom-serve` (`--device=`, as written, and its environment; a
+  variable the user set wins).
 - `gate`: required. Where the result that admitted the model is recorded.
 
 `--loom-routes FILE` replaces the built-in table, `--loom-serve PATH` (or `ONEBIT_LOOM_SERVE`) names the

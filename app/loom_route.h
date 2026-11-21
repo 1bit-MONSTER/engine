@@ -192,7 +192,7 @@ struct LoomRoutes {
                 return true;
             };
             if (!str("id", out.id, true) || !str("card", out.card, true) || !str("gate", out.gate, true) ||
-                !str("preset", out.preset, false) || !str("device", out.device, false))
+                !str("preset", out.preset, true) || !str("device", out.device, false))
                 return false;
             if (r.contains("args") && !strings(r["args"], "args", out.args)) return false;
             if (r.contains("env")) {

@@ -1641,7 +1641,7 @@ std::optional<Launch> loom_launch_for(const Options& o, int child_port) {
     l.ready_path = "/v1/status";
     l.argv = {default_loom_serve(o), "--model=" + card, "--device=" + (r->device.empty() ? std::string("amdgpu://") : r->device),
               loom_listen_arg(child_port), "--heartbeat_ms=0"};
-    if (!r->preset.empty()) l.argv.push_back("--preset=" + r->preset);
+    l.argv.push_back("--preset=" + r->preset);  // required by the table: a card with several presets refuses to start without one
     for (const auto& a : r->args) l.argv.push_back(a);
     // the same ROCr HRX gets (a distro libhsa rejects gfx1151's probe, docs/hrx.md); the entry's own variables after it
     if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) l.env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);

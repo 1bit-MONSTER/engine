@@ -57,15 +57,15 @@ echo '{"schema_version": 1, "model": {"id": "Org/Plain-Loom"}}' >"$scratch/cards
 size=$(stat -c %s "$scratch/plain.gguf")
 sha=$(sha256sum "$scratch/plain.gguf" | cut -d' ' -f1)
 cat >"$scratch/by-name.json" <<EOF
-{"routes": [{"id": "plain-by-name", "card": "q", "gate": "test", "match": {"model": ["plain"]},
+{"routes": [{"id": "plain-by-name", "card": "q", "gate": "test", "preset": "chat", "match": {"model": ["plain"]},
              "args": ["--memory_bytes=1000"], "env": {"FAKE_LOOM_ROUTE_ENV": "1"}}]}
 EOF
 cat >"$scratch/by-sha.json" <<EOF
-{"routes": [{"id": "plain-by-sha", "card": "$scratch/cards/q", "gate": "test",
+{"routes": [{"id": "plain-by-sha", "card": "$scratch/cards/q", "gate": "test", "preset": "chat",
              "match": {"gguf_sha256": "$sha", "gguf_size": $size}}]}
 EOF
 cat >"$scratch/no-card.json" <<EOF
-{"routes": [{"id": "plain-gone", "card": "gone", "gate": "test", "match": {"model": ["plain"]}}]}
+{"routes": [{"id": "plain-gone", "card": "gone", "gate": "test", "preset": "chat", "match": {"model": ["plain"]}}]}
 EOF
 
 loom=(--loom-serve "$here/fake_loom_serve.py" --llama-server "$here/fake_backend.py" --loom-cards "$scratch/cards")

@@ -200,9 +200,21 @@ def check(root: pathlib.Path, base: str) -> tuple[int, list[str]]:
     counts = counted_row_names(added)
     doubled = sorted(n for n, count in counts.items() if count > 1 and n not in freed)
     if doubled:
-        return 1, ([f"{len(doubled)} ctest row name(s) this branch registers MORE THAN ONCE:"]
-                   + [f"  {n}: registered {counts[n]}x by this branch" for n in doubled]
-                   + ["  two registrations of one name fail Configure whatever the base holds: drop one"])
+        # A doubled name with ANY sighting outside an `if()` collides whatever the base holds. When every sighting sits
+        # inside an `if()`, the pair can be mutually exclusive (`engine#2989`), which a name-and-depth comparison cannot
+        # settle -- so it is cannot-tell, the same answer the `guarded` rule below gives for the same reason. The depth
+        # is the shallowest sighting in the tree this branch lands (see tree_rows), so "all guarded" is min-depth > 0.
+        unguarded = [n for n in doubled if not head.get(n, ("", 0))[1]]
+        if unguarded:
+            return 1, ([f"{len(unguarded)} ctest row name(s) this branch registers MORE THAN ONCE:"]
+                       + [f"  {n}: registered {counts[n]}x by this branch" for n in unguarded]
+                       + ["  at least one registration is outside any if(), so it collides whatever the base holds: "
+                          "drop one"])
+        return 2, ([f"{len(doubled)} ctest row name(s) this branch registers more than once, but every registration "
+                    f"sits inside an `if()` block, which can make them mutually exclusive:"]
+                   + [f"  {n}: registered {counts[n]}x by this branch (if-depth {head.get(n, ('', 0))[1]})"
+                      for n in doubled]
+                   + ["  configure the tree to find out (cannot tell, not a pass), or drop one"])
     if not taken:
         return 0, []
     clashes = sorted(n for n in taken if n in known and n not in freed)
@@ -295,6 +307,24 @@ def self_test() -> int:
         got, msgs = check(d, "main")
         chk(1, got, "a name the branch adds TWICE is a collision with no base involved")
         chk(True, any("new_dup" in m for m in msgs), "...and the message names the doubled row")
+
+        # 3e. two registrations of one name in DIFFERENT `if()` branches: Configure is fine when only one guard is on,
+        # so it is cannot-tell, not a collision (the same doctrine as the `guarded` rule; measured on a real tree:
+        # `cmake -S . -B -DFOO=ON -DBAR=OFF` configures clean).
+        d = repo(tmpd, "doubled_in_two_guards")
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text()
+                                  + "if(ENABLE_FOO)\n    add_python_test(gx ${CMAKE_SOURCE_DIR}/x.py)\nendif()\n"
+                                  + "if(ENABLE_BAR)\n    add_python_test(gx ${CMAKE_SOURCE_DIR}/x.py)\nendif()\n")
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "one name, two guards"], check=True)
+        chk(2, check(d, "main")[0], "a name registered twice, both inside an if(), is cannot-tell (mutually exclusive)")
+
+        # 3f. …but one sighting outside any guard collides whatever the base holds, so the pair is a hard 1.
+        d = repo(tmpd, "doubled_one_guarded")
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text()
+                                  + "if(ENABLE_FOO)\n    add_python_test(gy ${CMAKE_SOURCE_DIR}/x.py)\nendif()\n"
+                                  + "add_python_test(gy ${CMAKE_SOURCE_DIR}/x.py)\n")
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "one name, guarded and not"], check=True)
+        chk(1, check(d, "main")[0], "a name registered twice where one sighting is unguarded is a hard collision")
 
         # 4. a name computed from a variable is not compared
         d = repo(tmpd, "variable_name")

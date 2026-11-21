@@ -205,7 +205,9 @@ def pair_summary(per_prompt):
         token comparison above -- a whitespace or detokenisation difference counts as a disagreement -- and
         it is reported with its own denominator so it cannot be read as a token-level number.
     """
-    n = len(per_prompt)
+    empty = [k for k, p in enumerate(per_prompt) if p.get("both_empty")]
+    comparable = [p for p in per_prompt if not p.get("both_empty")]
+    n = len(comparable)
     positions = sum(p["positions"] for p in per_prompt)
     common = sum(p["common_token_positions"] for p in per_prompt)
     top1_n = sum(p["top1_positions"] for p in per_prompt)
@@ -214,7 +216,7 @@ def pair_summary(per_prompt):
         return (total / denom) if denom else None
 
     out = {
-        "prompts": n,
+        "prompts": len(per_prompt),
         "positions": positions,
         "common_token_positions": common,
         "token_id_match_rate": rate(sum(p["token_id_match_rate"] * p["positions"] for p in per_prompt),
@@ -228,9 +230,12 @@ def pair_summary(per_prompt):
                                common),
         "prompts_with_token_divergence": [k for k, p in enumerate(per_prompt)
                                           if p["first_token_divergence"] is not None],
-        "same_text_prompts": sum(1 for p in per_prompt if p["same_text"]),
-        "greedy_agreement_pct": (100.0 * sum(1 for p in per_prompt if p["same_text"]) / n) if n else None,
-        "text_prompt_divergence": [k for k, p in enumerate(per_prompt) if not p["same_text"]],
+        "same_text_prompts": sum(1 for p in comparable if p["same_text"]),
+        "prompts_compared": n,
+        "prompts_both_empty": empty,
+        "greedy_agreement_pct": (100.0 * sum(1 for p in comparable if p["same_text"]) / n) if n else None,
+        "text_prompt_divergence": [k for k, p in enumerate(per_prompt)
+                                   if not p.get("both_empty") and not p["same_text"]],
     }
     return out
 
@@ -481,6 +486,10 @@ def agreement(a, b, by="id"):
         "max_abs_dlogp": max(deltas) if deltas else 0.0,
         "mean_abs_dlogp": (sum(deltas) / len(deltas)) if deltas else 0.0,
         "same_text": a["text"] == b["text"],
+        # engine#3158: two empty answers are identical strings and compare equal, which is not a measurement. With
+        # thinking on and a small --max-tokens a route can spend the whole budget on reasoning and return no content
+        # at all -- measured against two routes that answer exactly that way: `greedy agreement 100.0 %`, rc 0.
+        "both_empty": a["text"] == "" and b["text"] == "",
     }
 
 
@@ -667,6 +676,17 @@ def selftest():
        "effective_match_by: an id-vs-id pair keeps the id key, and an explicit text request is untouched")
     ok(effective_match_by("id", True, False) == "text" and effective_match_by("id", False, False) == "text",
        "effective_match_by: one route without ids degrades the pair to text instead of reporting total divergence")
+    # both routes answering with NO content is not agreement: with thinking on and a small --max-tokens a route can
+    # spend the budget on reasoning and return "". Two of those are identical strings, and an earlier version scored
+    # them 100 % with rc 0 -- the rubber stamp this arm exists to stop.
+    blank = {"positions": 0, "common_token_positions": 0, "top1_positions": 0, "token_id_match_rate": 0.0,
+             "top1_agreement_rate": 0.0, "exact_bit_match_rate": 0.0, "max_abs_dlogp": 0.0,
+             "mean_abs_dlogp": 0.0, "first_token_divergence": None, "same_text": True, "both_empty": True}
+    ok(pair_summary([blank, blank])["greedy_agreement_pct"] is None,
+       "pair_summary: two routes that both answered with no content are cannot-tell, not 100 %")
+    ok(pair_summary([blank, dict(blank, both_empty=False, same_text=True)])["greedy_agreement_pct"] == 100.0
+       and pair_summary([blank, dict(blank, both_empty=False, same_text=True)])["prompts_compared"] == 1,
+       "pair_summary: an empty-on-both-sides prompt leaves the denominator instead of counting as agreement")
     ok(not route_has_token_ids([{"runs": [{"tokens": [{"id": None, "token": "a"}]}]}])
        and route_has_token_ids([{"runs": [{"tokens": [{"id": 7, "token": "a"}]}]}]),
        "route_has_token_ids: our serve's id-less entries are detected, a fork-style entry is not flagged")
@@ -810,7 +830,7 @@ def main(argv=None):
             g["match_by_effective"] = mb
             report["agreement"][f"{la}|{lb}"] = g
             if (g["exact_bit_match_rate"] is not None and g["exact_bit_match_rate"] < 1.0) \
-                    or g["text_prompt_divergence"]:
+                    or g["text_prompt_divergence"] or g["greedy_agreement_pct"] is None:
                 failed = True
             fmt = lambda v, spec: "cannot tell" if v is None else format(v, spec)  # noqa: E731
             print(f"{la} vs {lb}")
@@ -828,8 +848,16 @@ def main(argv=None):
             # comparison above is unanswerable there while this one is not. Text-level on purpose: it counts
             # a whitespace or detokenisation difference as a disagreement, which is why it is reported with
             # its own denominator rather than folded into the token rates.
-            print(f"  greedy agreement  {fmt(g['greedy_agreement_pct'], '.1f')} % over {g['prompts']} prompt(s) "
-                  f"(generated text)")
+            if g["greedy_agreement_pct"] is None:
+                print(f"  greedy agreement  cannot tell -- no prompt was answered with content on both routes "
+                      f"({len(g['prompts_both_empty'])} of {g['prompts']} had none on either)")
+            else:
+                print(f"  greedy agreement  {g['greedy_agreement_pct']:.1f} % over {g['prompts_compared']} "
+                      f"prompt(s) (generated text)")
+            if g["prompts_both_empty"]:
+                # Both arms said nothing: identical strings, no comparison. Counted, never scored.
+                print(f"  empty answers     prompts {g['prompts_both_empty']} answered with no content on EITHER "
+                      f"route -- not comparable, excluded from the percentage")
             if g["text_prompt_divergence"]:
                 print(f"  text divergence   prompts {g['text_prompt_divergence']}")
             # engine#3158: the accuracy row asks for a mean KLD against CPU, which none of the above

@@ -680,7 +680,7 @@ add_test(NAME pre_pr_checks_self COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/pre-pr
 # RUN_SERIAL because one row (`cmake_configure_check`) runs a CMake configure: a configure racing another row that reads the
 # build tree is a race, not a check.
 add_test(NAME pre_pr_checks_tree COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/pre-pr-checks.sh --base origin/main
-         --base-optional --tree-only)
+         --base-optional --fetch-base --tree-only)
 # WORKING_DIRECTORY for the reason the other git-reading rows set it: ctest runs a test with the BUILD directory as its
 # cwd, and an out-of-tree build (`-B ~/.cache/…`) is then outside the work tree, where the runner exits 2 with "not
 # inside a git work tree" -- measured on a build dir under ~/.cache, where it took the two rows above down with it.

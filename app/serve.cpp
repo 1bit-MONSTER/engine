@@ -2020,7 +2020,10 @@ int serve_models(const Options& o) {
         if (!r.bin.empty() && !fs::exists(r.bin)) throw std::runtime_error("--laya-models: " + r.alias + ": no such binary " + r.bin);
         Backend b;
         b.row = r;
-        b.port = free_port();
+        // engine#3130 (part 2): ask the child for the port it bound instead of choosing one here and releasing it before
+        // the child can take it (free_port()'s release-then-bind race, engine#1070). The child prints it on its own
+        // readiness line, which Child learns (parse_backend_ready_port) and wait_ready() polls.
+        b.port = 0;
         b.argv = {r.bin.empty() ? self : r.bin, "serve", "-m", r.model, "--device", r.device, "--port", std::to_string(b.port),
                   "--host", "127.0.0.1", "--alias", r.alias};
         b.argv.insert(b.argv.end(), r.args.begin(), r.args.end());
@@ -2216,12 +2219,16 @@ int serve_models(const Options& o) {
                      b.port, b.row.bin.empty() ? "" : ", ", b.row.bin.c_str());
         children.push_back(std::make_unique<Child>(b.argv, std::vector<std::string>{}, b.port, "/health", line));
     }
-    for (size_t i = 0; i < children.size(); ++i)
+    for (size_t i = 0; i < children.size(); ++i) {
         if (!children[i]->wait_ready(std::chrono::seconds(900), g_stop)) {
             if (g_stop) return 0;
             std::fprintf(stderr, "1bit serve: laya-models: %s did not become ready\n", backends[i].row.alias.c_str());
             return 1;
         }
+        // engine#3130 (part 2): this launch passed `--port 0`, so the row's port is the one the child printed, not the 0
+        // it was started with -- every forward below reads `backends[i].port`.
+        backends[i].port = children[i]->port();
+    }
     ready = true;
     lifecycle.count_start();
     std::fprintf(stderr, "1bit serve: ready on http://%s:%d (laya-models: model auto is routed per request)\n", o.host.c_str(),

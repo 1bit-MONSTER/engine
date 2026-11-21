@@ -18,8 +18,17 @@
 `hrx-build.yml` triggers on `CMakeLists.txt`, which is right: an `ONEBIT_HRX=ON` build reads it. But a PR whose only change
 there is a ctest *registration* -- `add_test(...)`, `set_tests_properties(...)` -- creates no target and sets no flag, so it
 cannot change what compiles; it can still break the **configure** (those lines are evaluated at configure time, including
-inside `if(ONEBIT_HRX)` blocks that `ci.yml` never enters). Such a PR should pay a configure, not an eight-minute compile on
-the bench runner.
+inside `if(ONEBIT_HRX)` blocks that `ci.yml` never enters). Such a PR should pay a configure, not a compile on the bench
+runner.
+
+What the compile costs, measured rather than quoted (engine#3243): over the last 30 `hrx_build` runs the successes are
+**median 2.0 min, max 5.4**, and a `configure-only` run is **0.2 min** -- so the saving is ~1.8 min of the single build
+runner per registration-only PR. This docstring said "an eight-minute compile" until 2026-11-21, a figure nobody had
+measured; a lane quoted it in a public issue body before checking, which is the reason the number lives here with its
+unit and its method now. Re-measure with:
+
+    gh run list --workflow hrx-build.yml --limit 30 --json createdAt,updatedAt,conclusion
+
 
 This decides that, and it is deliberately **conservative**: anything it is not certain about is `full`. The build it is
 skipping is the one that catches a broken HRX pin, so a wrong `configure-only` costs more than a slow PR.
@@ -250,7 +259,8 @@ def self_test():
          "+++ b/CMakeLists.txt\n@@ -1,1 +1,2 @@\n+# note\n\n", "full"),
         # engine#3228: `add_python_test(...)` is the wrapper every new python row in this repo uses, and it creates no
         # target -- before this arm, #3219 and b299efbc both came out `full` because the line "is not a ctest
-        # registration", i.e. a pure registration PR paid the eight-minute HRX compile.
+        # registration", i.e. a pure registration PR paid a full HRX compile it could not need -- 2.0 min median of
+        # the single runner, on 12 of the 80 merged commits replayed in engine#3228.
         ("the repo's own add_python_test wrapper, alone",
          ["CMakeLists.txt"],
          "+++ b/CMakeLists.txt\n@@ -1,1 +1,2 @@\n"

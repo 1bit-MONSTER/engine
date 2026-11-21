@@ -162,4 +162,39 @@ inline std::string tool_call_gbnf(const nlohmann::json& tools, const nlohmann::j
     return "root ::= " + root + "\n" + sink + json_shared_rules();
 }
 
+
+// engine#3193: a request that carries `tools` cannot be honoured on a PRIVATE route, and used to be answered
+// anyway. `npu/private_route.h`'s PrivateRequest carries {max_tokens, repetition_penalty, penalty_window,
+// on_token} and nothing else, so a route's session generates its tokens with no grammar to constrain -- the
+// request arrives, the grammar is never installed, and the model answers prose where the per-op forward emits a
+// proper `tool_calls`. Measured on the dx route: `tool_calls: NONE` even with `tool_choice: "required"`, while the
+// same request on the per-op forward returns `get_weather{"city":"Vienna"}`. A silent wrong-shaped answer is the
+// worst outcome for an agent app, so this refuses with a message that names the way out, exactly as the
+// over-context refusal does. Empty string = nothing to refuse.
+//
+// `route` names what the model is running on, for the message (the model id is enough).
+inline std::string private_route_tools_refusal(const nlohmann::json& body, const std::string& route) {
+    // `tools: []` is not a constraint: many clients send the key with an empty list on every request, and refusing
+    // those would break ordinary chats. Only a non-empty list (or a real tool_choice) asks for something the route
+    // cannot honour.
+    const bool has_tools = body.contains("tools") && body["tools"].is_array() && !body["tools"].empty();
+    const bool has_choice = body.contains("tool_choice") && !body["tool_choice"].is_null() &&
+                            !(body["tool_choice"].is_string() && body["tool_choice"].get<std::string>() == "none");
+    // A caller's JSON SCHEMA is the same class of promise: the per-op forward installs a grammar for it
+    // (app/forward_serve.cpp:383-384), a private route installs nothing, and a reply that violates the caller's
+    // schema would come back looking like a normal answer. `json_object` is deliberately NOT refused: it is
+    // advisory (the model fenced its object in my probe), while a schema is a contract.
+    bool has_schema = false;
+    if (body.contains("response_format") && body["response_format"].is_object()) {
+        const auto& rf = body["response_format"];
+        has_schema = rf.value("type", std::string()) == "json_schema";
+    }
+    if (!has_tools && !has_choice && !has_schema) return "";
+    const std::string what = has_tools ? "tools" : (has_choice ? "tool_choice" : "response_format json_schema");
+    return "this model runs on " + route + ", a private NPU route whose session cannot carry a tool grammar "
+           "(npu/private_route.h:PrivateRequest has no constraint hook), so `" + what +
+           "` could not be honoured and the reply would silently ignore it. Drop it, or serve this model through "
+           "the per-op forward (unset ONEBIT_NPU_DX_KERNELS).";
+}
+
 }  // namespace onebit::npu

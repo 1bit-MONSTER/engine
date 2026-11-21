@@ -27,6 +27,12 @@ it starts the engine's HRX `llama-server` directly, one HTTP hop
 the other routes it starts `1bit serve` ([serve.md](serve.md)), waits for `/health`, and forwards
 OpenAI requests to it. The engine exposes nothing but that OpenAI-compatible API.
 
+The GPU route is moving to Loom: AMD's Loom model programs on HRX, served by `loom-serve` behind
+`1bit serve`, one model at a time once each passes an A/B and accuracy gate
+([#3158](https://github.com/1bit-MONSTER/engine/issues/3158)). No model has moved yet. When one
+does, Lemonade still starts `1bit serve` or the backend it names, so the recipe and the API do not
+change; the HRX `llama-server` stays as the fallback ([hrx.md](hrx.md#direction-loom-on-the-gpu)).
+
 Recovery stays Lemonade's: when a backend hangs, `1bit serve` answers `/health` with 503 and, once
 a request has had no progress for `--watchdog` seconds, kills its backend and exits non-zero
 ([serve.md, "When a backend hangs"](serve.md#when-a-backend-hangs)). Lemonade's BackendWatchdog
@@ -177,7 +183,8 @@ on `libcpp-httplib0.41`, which 26.04 does not have. So on 26.04 the engine plugs
   ([config/lemonade/1bit-hrx.conf](../config/lemonade/1bit-hrx.conf)), sets
   `LEMONADE_HRX_HRX_BIN` to `lemonade-hrx` in the package.
 - `lemonade-hrx` ([scripts/lemonade-hrx](../scripts/lemonade-hrx)) runs the package's HRX
-  `llama-server`, with our HIP kernels, on Lemonade's arguments. First it runs
+  `llama-server`, with our HIP kernels (the GPU route today, and the fallback once a model moves to
+  Loom, [hrx.md](hrx.md#direction-loom-on-the-gpu)), on Lemonade's arguments. First it runs
   `1bit serve --print-backend-env`, which makes serve's load-time checks (architecture, memory)
   and prints the environment serve gives an HRX backend: strict placement (`GGML_HRX_STRICT=1`),
   TheRock's HSA runtime, CWSR placement (engine#315) and the ternary decode. It also fills in
@@ -248,7 +255,7 @@ scripts/check-ubuntu-2604-lemond.sh out/1bit-<version>-linux-x86_64.tar.zst ~/mo
 
 ## Vulkan, ROCm, Metal and CUDA are Lemonade's
 
-On the GPU the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, 2026-10-01: HRX + NPU only; the
+On the GPU the engine is pure HRX (the llama.cpp route today, moving to Loom per model); no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, 2026-10-01: HRX + NPU only; the
 core strip, 2026-10-04: no ZINC, so no CUDA; 2026-10-12: no MLX/Metal route and no Windows
 package). Lemonade ships its own backends for Vulkan, ROCm, CUDA, the CPU, MLX on Apple Silicon and
 Windows, so a model, feature or platform the engine does not run on HRX or the NPU is Lemonade's to

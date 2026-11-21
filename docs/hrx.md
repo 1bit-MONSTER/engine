@@ -19,9 +19,12 @@ limitations under the License.
 HRX runs every graph node of every model and mode we test on the Strix Halo GPU: 43 of 43
 configurations, with 0 nodes on the CPU. That is the 2026-10-20 census (#476, #480, #481). HRX is
 AMD's ggml-hrx with its Loom kernels, plus our HIP kernels. Qwen3.8-27B with MTP decodes at 36.0 / 26.8 / 29.9 tok/s on code / prose /
-short chats (#487), and ZAYA1-8B at about 90 tok/s. HRX is the engine's one GPU route.
+short chats (#487), and ZAYA1-8B at about 90 tok/s. HRX is the engine's one GPU runtime. The
+GPU route on it is moving from this llama.cpp build to Loom model programs, one model at a time
+(see [Direction: Loom on the GPU](#direction-loom-on-the-gpu)); until a model moves, this page's
+llama.cpp route serves it, and it stays as the fallback after.
 
-It is one llama.cpp build with one GPU backend, ggml-hrx, and the CPU: the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, the core strip). What HRX does not run, Lemonade serves with its own
+It is one llama.cpp build with one GPU backend, ggml-hrx, and the CPU: the engine's GPU is pure HRX; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, the core strip). What HRX does not run, Lemonade serves with its own
 backends ([lemonade.md](lemonade.md)). Its `llama-server` exposes on Strix Halo:
 
 ```
@@ -32,7 +35,7 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 
 | `--device` | Device | Serves |
 |---|---|---|
-| `hrx` (and `auto` for GGUF) | `HRX0` | AMD's ggml-hrx: the engine's GPU route |
+| `hrx` (and `auto` for GGUF) | `HRX0` | AMD's ggml-hrx: the engine's GPU route today, and the fallback once a model moves to Loom |
 | `cpu` | the CPU | the same llama-server with no GPU layers |
 
 On `hrx` the whole graph runs on HRX0 or the model does not load. Since the HRX census closed on
@@ -42,6 +45,40 @@ graph has it) with the node's name, op, type and shape, instead of running slowe
 `--no-strict-device` (or `ONEBIT_STRICT_DEVICE=0`) restores the CPU fallback
 ([serve.md](serve.md#off-hrx-placement-strict-by-default)), and the [hardware gate](hw-gate.md)
 fails a pin that leaves a gate model's node off HRX.
+
+## Direction: Loom on the GPU
+
+Owner decision, 2026-11-21: the GPU route moves to **Loom**, and the NPU engine work goes on as
+before. Loom here means AMD's Loom model programs running on the HRX runtime
+([ROCm/hrx-system](https://github.com/ROCm/hrx-system), whose Loom compiler `loomc` the engine
+already builds, and [ROCm/hrx-loom-library](https://github.com/ROCm/hrx-loom-library)), with the
+model cards published by [loom-fun](https://github.com/loom-fun) (Jeremy Fowers and Daniel
+Holanda). `loom-serve` serves them, behind `1bit serve`, so Lemonade and clients see no change.
+
+Why: on strixhalo (Ryzen AI MAX+ 395, `gfx1151`) straight Loom beat the llama.cpp fork with our
+HIP kernels on every model we compared.
+
+How a model moves:
+
+- **Per model, behind a gate** ([#3158](https://github.com/1bit-MONSTER/engine/issues/3158)). A
+  model switches to Loom only after an interleaved A/B against the current route and an accuracy
+  check: greedy agreement, and KL divergence where the Loom side can give logits.
+- **Coverage** ([#3156](https://github.com/1bit-MONSTER/engine/issues/3156)). Models with a
+  loom-fun card are measured first. Models without one get Loom programs written for them with
+  [loom-skills](https://github.com/loom-fun/loom-skills) and
+  [weaver](https://github.com/loom-fun/weaver).
+- **Hybrid** ([#3157](https://github.com/1bit-MONSTER/engine/issues/3157)). The NPU-prefill route
+  ([hybrid.md](hybrid.md)) hands its KV cache to the HRX llama-server today; handing it to Loom
+  decode is tracked there.
+
+State on 2026-11-21: **no model has moved yet**; `loom-serve` behind `1bit serve` is in progress.
+Every model on this page still runs on the llama.cpp route below.
+
+The llama.cpp route (the fork with ggml-hrx, plus the private HIP kernels) **stays as the
+fallback** for every model without a Loom program that passed the gate. It keeps its pins, its
+hardware gate and its fixes, but gets no new kernel work: [#679](https://github.com/1bit-MONSTER/engine/issues/679)
+and [#3103](https://github.com/1bit-MONSTER/engine/issues/3103) are parked. The rest of this page
+describes that route.
 
 ## Pinned sources, kept current
 
@@ -1747,6 +1784,9 @@ cmake --build build --target onebit
   digest.
 
 ### Private HIP kernels
+
+These kernels belong to the llama.cpp fallback route; they get fixes but no new kernel work while
+the GPU route moves to Loom ([Direction](#direction-loom-on-the-gpu)).
 
 Our own HIP kernels for HRX are closed source, like the NPU kernels: they live in a private
 repository, as an add-on (`addons/hip-hrx`). The llama.cpp fork keeps only the

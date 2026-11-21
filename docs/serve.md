@@ -23,6 +23,13 @@ On HRX the whole graph runs on the GPU or the model does not load: 43 of 43 conf
 2026-10-20 census had 0 nodes off HRX. `1bit serve` exposes nothing but an OpenAI-compatible API,
 so it also works on its own with any OpenAI client.
 
+> **GPU direction (2026-11-21).** The GPU route is moving to Loom: AMD's Loom model programs on
+> HRX, served by `loom-serve` behind `1bit serve`, one model at a time once it passes an A/B and
+> accuracy gate ([#3158](https://github.com/1bit-MONSTER/engine/issues/3158),
+> [hrx.md](hrx.md#direction-loom-on-the-gpu)). That integration is in progress and no model has
+> moved yet, so every GPU row on this page is still the llama.cpp route, which stays as the
+> fallback for models without a Loom program.
+
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
            [--device auto|npu|hrx|hybrid|cpu] [--ctx-size N] [--alias NAME]
@@ -443,7 +450,7 @@ without a GPU.
 |---|---|---|
 | NPU model directory (`model.q4nx` + `npu/`, docs/npu.md) | `auto`, `npu` | the NPU engine, in process (in progress) |
 | Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | a closed NPU add-on route, in process, in builds with `-DONEBIT_NPU_PRIVATE` ([npu.md](npu.md#add-on-routes)) |
-| `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` with our HIP kernels (docs/hrx.md), `--mtp` included; every node on HRX in all 43 configurations of the 2026-10-20 census (#476, #480, #481). `auto` exceptions: below |
+| `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` with our HIP kernels (docs/hrx.md; the fallback route once a model moves to Loom), `--mtp` included; every node on HRX in all 43 configurations of the 2026-10-20 census (#476, #480, #481). `auto` exceptions: below |
 | `.gguf` | `cpu` | the same llama-server with no GPU layers; `auto` in a build without HRX |
 | `.gguf` | `hybrid` | the HRX llama-server decodes, one slot, from a KV cache a prefill provider computed for the prompt (the NPU engine, named by `--prefill-provider` / `ONEBIT_HYBRID_PREFILL`) and serve restored into the slot; without a provider, HRX prefills too ([hybrid.md](hybrid.md)) |
 
@@ -528,7 +535,7 @@ off HRX.
 
 ### Removed devices and flags
 
-On the GPU the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, 2026-10-01: HRX + NPU, zero Vulkan, zero ROCm; the core strip,
+On the GPU the engine is pure HRX; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, 2026-10-01: HRX + NPU, zero Vulkan, zero ROCm; the core strip,
 2026-10-04: no ZINC, so no CUDA; 2026-10-12: no MLX/Metal route). Lemonade ships its own backends for those
 ([lemonade.md](lemonade.md#vulkan-rocm-metal-and-cuda-are-lemonades)). `serve` exits at once, with the reason,
 when asked for any of these:

@@ -19,6 +19,8 @@ limitations under the License.
 `ci.yml` runs on a GitHub runner with no GPU, so it cannot see an HRX kernel or pin that computes
 the wrong thing. Eight HRX correctness bugs were found by hand within ten days: #308, #309, #310, #313, #318, #319, #369
 and #370. The hardware gate checks every HRX pin bump, and every PR that asks for it, on the Strix Halo box before merge.
+It gates the llama.cpp route, which stays as the GPU fallback while models move to Loom; a model's move to Loom
+has its own gate ([#3158](https://github.com/1bit-MONSTER/engine/issues/3158)).
 
 ## When it runs
 

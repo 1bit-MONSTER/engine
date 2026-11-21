@@ -58,6 +58,14 @@ struct AudioGemm {
     std::function<bool(const std::string& key, const float* A, int64_t M, int64_t K, const float* B, int64_t N,
                        std::vector<float>* C, const onebit::audio::Epilogue& ep, std::string* why)>
         gemm_ep;
+    // engine#1783, ONEBIT_AUDIO_NPU_ATTN=1 (default off): one layer's attention, out = softmax(q kt) v for every head,
+    // offered by the fused attention path with q [H][S][D], kt [H][D][S], v [H][S][D] and out [H][S][D]. The device
+    // computes it in bf16, so the encoder output is NOT bit-identical to the host's; the switch exists for the accuracy
+    // gate and the A/B. False + why leaves the group to the host's fused path. Unset = never offered.
+    std::function<bool(const float* q, const float* kt, const float* v, int64_t H, int64_t S, int64_t D, float* out,
+                       std::string* why)>
+        attn;
+    int attn_groups = 0;                      // attention groups the device ran (each is two products)
     int device = 0;                           // products the device ran
     int host = 0;                             // products the host ran (declined, or not offered)
     std::map<std::string, int> host_why;      // reason -> count
@@ -74,6 +82,8 @@ struct AudioRunResult {
     // engine#1783: projections whose bias / GELU / residual nodes ran folded into the product (0 = node by node, e.g.
     // ONEBIT_AUDIO_FOLD_EPILOGUE=0 or a device without gemm_ep).
     size_t folded_epilogues = 0;
+    // engine#1783: of the fused attention groups, how many the device ran (ONEBIT_AUDIO_NPU_ATTN=1; 0 = all on the host).
+    size_t npu_attention_groups = 0;
 };
 
 // Two entry points, because a Whisper pack has two graphs: the encoder consumes the mel window as f32, the decoder consumes

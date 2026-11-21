@@ -447,8 +447,17 @@ int main(int argc, char** argv) {
                 if (dev_hook != nullptr && npu_dev.target->profiling()) npu_dev.target->dump_profile();
 #endif
                 std::printf("encoder repeat %d: %.3f s (device_gemm %.3f s, rest %.3f s, fused attention groups %zu, folded "
-                            "epilogues %zu)\n", r, pass_s, dev_s, pass_s - dev_s, tmp.fused_attention_groups,
-                            tmp.folded_epilogues);
+                            "epilogues %zu, npu attention groups %zu)\n", r, pass_s, dev_s, pass_s - dev_s,
+                            tmp.fused_attention_groups, tmp.folded_epilogues, tmp.npu_attention_groups);
+#ifdef ONEBIT_WHISPER_NPU
+                if (npu_dev.attn) {   // engine#1783: the attention launches so far (accumulated over the process)
+                    const auto& at = *npu_dev.attn;
+                    std::printf("npu attention: %d launch(es), pack %.1f ms, wait %.1f ms, unpack %.1f ms (per launch %.2f / "
+                                "%.2f / %.2f ms)\n", at.launches, at.ms_pack, at.ms_wait, at.ms_unpack,
+                                at.launches ? at.ms_pack / at.launches : 0.0, at.launches ? at.ms_wait / at.launches : 0.0,
+                                at.launches ? at.ms_unpack / at.launches : 0.0);
+                }
+#endif
                 std::fflush(stdout);
             }
         }
@@ -534,8 +543,8 @@ int main(int argc, char** argv) {
             const unsigned char* pb = reinterpret_cast<const unsigned char*>(xa.data.data());
             for (size_t i = 0; i < xa.data.size() * sizeof(float); ++i) h = (h ^ pb[i]) * 1099511628211ULL;
             std::printf("encode-only: encoder %.3f s (decode skipped), output fnv %016llx, fused attention groups %zu, folded "
-                        "epilogues %zu\n", secs(tw_enc0, tw_enc), (unsigned long long)h, xa.fused_attention_groups,
-                        xa.folded_epilogues);
+                        "epilogues %zu, npu attention groups %zu\n", secs(tw_enc0, tw_enc), (unsigned long long)h,
+                        xa.fused_attention_groups, xa.folded_epilogues, xa.npu_attention_groups);
             return 0;
         }
         if (w == 0) {

@@ -4420,6 +4420,24 @@ line, detokenises with the multilingual Whisper tokenizer, applies Whisper's Eng
 prints the corpus WER; against a reference arm it also prints the WER difference, the utterances with identical token
 sequences and the token edit distance.
 
+**Encoder attention on the NPU in bf16: `ONEBIT_AUDIO_NPU_ATTN=1` (off by default; engine#1783).** With a sealed kernel
+set whose directory also lists an attention instance (`sealed_i8_b8.attn`: "instance heads seq"), each encoder layer's
+fused attention (softmax(q k^T) v for every head) runs as one launch of that instance on the sealed ELF's own hardware
+context, so it adds no context switch. The device computes in bf16 with f32 accumulation, so the encoder output is
+**not** bit-identical to the host route's; the switch stays off by default and is held to an accuracy gate instead:
+on the LibriSpeech subset above the device route measured 3.512 % WER with the switch off and 3.496 % with it on
+(-0.016 points; 299 of 305 utterances with identical token sequences, 12 token edits in 7,708 tokens), and the four
+fixtures (jfk, fx-short, fx-silence, test_speech) gave identical ids x3 on both arms. Against the host's f32 path the
+device attention measured a per-layer NMSE of 1.2e-5 to 1.1e-4 (20 utterances x 12 layers). Warm encoder pass on jfk
+(one binary, arms interleaved x6, load 17-20): 0.40-0.59 s with the switch on against 0.62-0.88 s off; one layer
+costs 3.7-5.4 ms of device wait plus 1.8-2.6 ms of host packing (strixhalo, 2026-11-21).
+Anything the instance does not take (another head count or length, a set without the list, a launch that does not
+complete) runs on the host's fused path as before and is counted in the `host:` lines.
+`ONEBIT_AUDIO_NPU_ATTN_CHECK=1` also runs the host's f32 fused path for every device group and prints the difference
+per layer on stderr (`npu attention check: <node>: max abs err, max |host|, rel, NMSE`; the device result is the one
+kept). The tool prints `npu attention groups N` per pass and the launch costs (pack / wait / unpack) under
+`ONEBIT_WHISPER_ENCODE_REPEAT`.
+
 **RoPE pair order (engine#2673).** The forward's RoPE rotates half-split pairs (i, i + rot/2), the HF `rotate_half`
 form. chatglm3's attention nodes (28 `com.ryzenai:GQO` in `chatglm3-6b-onnx-ryzenai-npu`'s `fusion.onnx`) state
 `rotary_interleaved = 1` with `rotary_embedding_dim = 64`, meaning consecutive pairs (2i, 2i+1) over the first 64 of

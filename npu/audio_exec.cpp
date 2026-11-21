@@ -620,6 +620,19 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         std::map<size_t, AttnFuse> attn_fuse;              // keyed by the first MatMul's 0-based index
         std::vector<char> fused_away(g.nodes.size(), 0);
         size_t fused_groups = 0;   // reported in AudioRunResult::fused_attention_groups
+        size_t npu_attn_groups = 0;   // of those, the ones the device ran (AudioRunResult::npu_attention_groups)
+        // engine#1783: ONEBIT_AUDIO_NPU_ATTN=1 offers each fused group of batch 1 to dev->attn (bf16 on the device: not
+        // bit-identical to the host's arithmetic, hence off by default; a decline runs the host's fused path).
+        const bool npu_attn_on = [] {
+            const char* e = std::getenv("ONEBIT_AUDIO_NPU_ATTN");
+            return e != nullptr && e[0] == '1';
+        }();
+        // ONEBIT_AUDIO_NPU_ATTN_CHECK=1: every device group is also computed by the host's fused path and the two are
+        // compared on stderr (max abs error, max |host|, NMSE); the device's output is the one kept.
+        const bool npu_attn_check = [] {
+            const char* e = std::getenv("ONEBIT_AUDIO_NPU_ATTN_CHECK");
+            return e != nullptr && e[0] == '1';
+        }();
         {
             const char* fa = std::getenv("ONEBIT_AUDIO_FUSED_ATTN");
             const bool on = fa == nullptr || fa[0] != '0';
@@ -949,6 +962,38 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                         o.dims = ab;
                         o.dims.push_back(M);
                         o.dims.push_back(D);
+                        std::vector<float> npu_out;   // ONEBIT_AUDIO_NPU_ATTN_CHECK: the device's result, kept past the host's
+                        if (npu_attn_on && dev != nullptr && dev->attn && !step_cache && ab.size() == 2 && ab[0] == 1 &&
+                            M == N && K == D) {
+                            std::string aw;
+                            o.data.resize(nelem(o.dims));
+                            const bool ran = dev->attn(a.data.data(), b.data.data(), v.data.data(), ab[1], M, D,
+                                                       o.data.data(), &aw);
+                            if (ran && npu_attn_check) {
+                                npu_out = std::move(o.data);
+                                o.data.clear();
+                                ++npu_attn_groups;
+                            } else if (ran) {
+                                // both products were counted as host ones above (the first by the MatMul, the second
+                                // by this group); both ran on the device
+                                const char* kWhy = "MatMul with an activation as B (attention product): not offered";
+                                dev->host -= 2;
+                                const auto hw = dev->host_why.find(kWhy);
+                                if (hw != dev->host_why.end() && (hw->second -= 2) <= 0) dev->host_why.erase(hw);
+                                dev->device += 2;
+                                ++dev->attn_groups;
+                                ++npu_attn_groups;
+                                ++fused_groups;
+                                fused_away[fz->second.softmax] = 1;
+                                fused_away[fz->second.pv] = 1;
+                                finish_node("MatMul+Softmax+MatMul@npu", m2.outs[0], o, op_t0);
+                                continue;
+                            }
+                            if (!ran) {
+                                ++dev->host_why["attention offered to the device, declined: " + aw];
+                                o.data.clear();
+                            }
+                        }
                         const size_t batches = nelem(ab);
                         constexpr size_t kRowGroup = 4;
                         const size_t rows = size_t(M);
@@ -1005,6 +1050,20 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                         fused_away[fz->second.softmax] = 1;
                         fused_away[fz->second.pv] = 1;
                         (void)sm;
+                        if (!npu_out.empty()) {
+                            double se = 0, sr = 0, mx = 0, mr = 0;
+                            for (size_t x = 0; x < npu_out.size(); ++x) {
+                                const double d = double(npu_out[x]) - double(o.data[x]);
+                                se += d * d;
+                                sr += double(o.data[x]) * double(o.data[x]);
+                                mx = std::max(mx, std::fabs(d));
+                                mr = std::max(mr, std::fabs(double(o.data[x])));
+                            }
+                            std::fprintf(stderr, "npu attention check: %s: max abs err %.3e, max |host| %.3e, rel %.3e, "
+                                         "NMSE %.3e\n", m2.outs[0].c_str(), mx, mr, mr > 0 ? mx / mr : 0.0,
+                                         sr > 0 ? se / sr : 0.0);
+                            o.data = std::move(npu_out);
+                        }
                         finish_node("MatMul+Softmax+MatMul", m2.outs[0], o, op_t0);
                         continue;
                     }
@@ -1430,6 +1489,7 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
         out->data = it->second.data;
         out->fused_attention_groups = fused_groups;
         out->folded_epilogues = folded;
+        out->npu_attention_groups = npu_attn_groups;
         out->i64 = it->second.i64;
         out->b = it->second.b;
         if (step_cache) {

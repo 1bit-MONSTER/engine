@@ -173,14 +173,80 @@ def runtime_archs(tree):
     return {n for e, n in names.items() if e in built} - {"clip"}
 
 
-def build():
-    if not os.path.isdir(os.path.join(ROOT, HRX, "src")):
+def submodule_url(path, root=ROOT):
+    """The submodule's clone url from .gitmodules, or '' when it names none.
+
+    engine#3212: the content axis asks "did the fork's architecture tables move with this pin?", and the inputs that
+    answer it are all already known to this tool -- the sha from `pin(path)` and the repo slug from here. Reading the
+    slug from .gitmodules rather than a constant is what keeps this honest when a submodule is re-homed.
+    """
+    import configparser
+    cfg = configparser.ConfigParser()
+    try:
+        cfg.read(os.path.join(root, ".gitmodules"))
+    except (OSError, configparser.Error):
+        return ""
+    return (cfg.get(f'submodule "{path}"', 'url', fallback='') or "").strip()
+
+
+def tarball_url(url, sha):
+    """codeload tarball for one commit of a github clone url, or '' for anything that is not github https.
+
+    Pure, so the arm can assert it without a network: a wrong slug or a short sha is the failure mode that would
+    otherwise surface as a 404 thirty seconds into a fetch.
+    """
+    m = re.match(r'^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$', (url or '').strip())
+    if not m or not re.fullmatch(r'[0-9a-f]{40}', sha or ''):
+        return ''
+    return f'https://codeload.github.com/{m.group(1)}/{m.group(2)}/tar.gz/{sha}'
+
+
+def fetch_tree(url, sha, cache=None):
+    """(tree dir, note) for a source tarball at `sha`, or (None, why). Cached by sha, extracted once.
+
+    engine#3212: opt-in only -- the ctest row stays offline, because a deterministic gate must not depend on the
+    network. A failure returns why, and every caller treats that as cannot-tell rather than as agreement.
+    """
+    import tarfile
+    import tempfile
+    import urllib.request
+    dest = os.path.join(cache or os.path.join(os.path.expanduser("~"), ".cache", "registry_build"), sha)
+    marker = os.path.join(dest, ".complete")
+    if os.path.isfile(marker):
+        trees = [d for d in os.listdir(dest) if os.path.isdir(os.path.join(dest, d))]
+        if len(trees) == 1:
+            return os.path.join(dest, trees[0]), f"cached at {dest}"
+    os.makedirs(dest, exist_ok=True)
+    tgz = os.path.join(dest, "src.tgz")
+    try:
+        with urllib.request.urlopen(url, timeout=120) as r, open(tgz, "wb") as fh:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                fh.write(chunk)
+        with tarfile.open(tgz) as tf:
+            tf.extractall(dest, filter="data")  # noqa: S202 -- a pinned public sha, into our own cache
+    except Exception as e:  # noqa: BLE001 -- any failure here is cannot-tell, never a pass
+        return None, f"could not fetch {url}: {type(e).__name__}: {e}"
+    finally:
+        if os.path.exists(tgz):
+            os.remove(tgz)
+    trees = [d for d in os.listdir(dest) if os.path.isdir(os.path.join(dest, d))]
+    if len(trees) != 1:
+        return None, f"{url} did not extract to exactly one directory ({len(trees)} found)"
+    open(marker, "w").close()
+    return os.path.join(dest, trees[0]), f"fetched {url} into {dest}"
+
+
+def build(tree=None):
+    if tree is None and not os.path.isdir(os.path.join(ROOT, HRX, "src")):
         # 77, not 1: the content comes from a submodule, so a checkout without it cannot tell, and "cannot tell"
         # must never read as clean. CTest reports 77 as a skip with this message (engine#2698).
         print(f"registry_build: {HRX} is not checked out (git submodule update --init {HRX}): the content "
               f"checks skip here, they do not pass")
         raise SystemExit(77)
-    hrx = os.path.join(ROOT, HRX)
+    hrx = tree or os.path.join(ROOT, HRX)
     mapping = hf_to_gguf(hrx)
     run_hrx = runtime_archs(hrx)
 
@@ -233,6 +299,41 @@ def report_gaps(registry):
     return bad
 
 
+def self_test():
+    """The tarball path's pure parts (engine#3212). No network: `fetch_tree` is exercised only on failure."""
+    fail = 0
+
+    def ok(cond, what):
+        nonlocal fail
+        print(("ok   " if cond else "FAIL ") + what)
+        if not cond:
+            fail += 1
+
+    url = submodule_url(HRX)
+    ok(url.startswith('https://github.com/') and url.endswith('.git'),
+       f"the pinned submodule's clone url is read from .gitmodules ({url})")
+    ok(submodule_url('third_party/not-a-submodule') == '', "a path that is not a submodule yields no url")
+
+    sha = 'a' * 40
+    ok(tarball_url(url, sha) == f'https://codeload.github.com/1bit-MONSTER/llama.cpp/tar.gz/{sha}',
+       "a github clone url and a full sha give that sha's codeload tarball")
+    ok(tarball_url('git@github.com:1bit-MONSTER/llama.cpp.git', sha) == '',
+       "an ssh remote is not a tarball url, rather than a guess")
+    ok(tarball_url(url, sha[:9]) == '', "a short sha is refused here, not thirty seconds into a 404")
+    ok(tarball_url('https://gitlab.com/a/b', sha) == '', "a non-github host is refused")
+
+    # The rule that matters (engine#3212): a fetch that fails is CANNOT TELL. Nothing is extracted and no marker is
+    # written, so the next run tries again instead of trusting a partial tree.
+    import tempfile
+    cache = tempfile.mkdtemp()
+    tree, why = fetch_tree('https://127.0.0.1:9/none.tgz', 'b' * 40, cache=cache)
+    ok(tree is None and 'could not fetch' in why, "an unreachable tarball is cannot-tell, not an empty tree")
+    ok(not os.path.exists(os.path.join(cache, 'b' * 40, '.complete')), "...and it leaves no completion marker behind")
+
+    print(f"registry_build --self-test: {'ok' if not fail else f'{fail} failure(s)'}")
+    return 0 if not fail else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=os.path.join(ROOT, "registry/architectures.json"))
@@ -241,7 +342,13 @@ def main():
                     help="only check the committed registry against registry/significant.json (no pins needed)")
     ap.add_argument("--check-pins", action="store_true",
                     help="only check that the registry records the committed pins (no checkouts needed)")
+    ap.add_argument("--from-tarball", action="store_true",
+                    help="derive from the PINNED sha's source tarball when the submodule is not checked out "
+                         "(opt-in: the ctest row stays offline, engine#3212)")
+    ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
+    if a.self_test:
+        return self_test()
     if a.check_pins:
         recorded = json.load(open(a.out))["sources"]
         stale = [(name, recorded.get(name, ""), pin(path)) for name, path in
@@ -261,14 +368,31 @@ def main():
             n = len(json.load(open(os.path.join(ROOT, "registry/significant.json")))["classes"])
             print(f"none of the {n} reviewed significant classes is mapped without a reason")
         return 1 if bad else 0
-    text = json.dumps(build(), indent=1, sort_keys=False) + "\n"
+    tree = None
+    if a.from_tarball and not os.path.isdir(os.path.join(ROOT, HRX, "src")):
+        # engine#3212: the content question is asked on every pin bump, and answering it by hand cost three tarball
+        # fetches in one session. The pin still comes from the INDEX (`pin(HRX)`), not from the tree we fetch, so this
+        # cannot launder a bump that is staged but not committed.
+        sha = pin(HRX)
+        url = tarball_url(submodule_url(HRX), sha)
+        if not url:
+            print(f"registry_build: cannot tell -- no usable github url in .gitmodules for {HRX} "
+                  f"(got {submodule_url(HRX)!r}) or the pin is not a full sha ({sha!r})")
+            return 2
+        tree, note = fetch_tree(url, sha)
+        if not tree:
+            # cannot-tell, not clean: the same rule the ctest row's 77 follows.
+            print(f"registry_build: cannot tell -- {note}")
+            return 2
+        print(f"registry_build: deriving from {sha[:12]} ({note})")
+    text = json.dumps(build(tree=tree), indent=1, sort_keys=False) + "\n"
     report_gaps(json.loads(text))
     if a.check:
         # The registry's content comes from the checked-out sources, so those must BE the pinned ones: with the pin
         # read from the index (above) a bump staged against a submodule left at the old commit would record the new
         # pin beside the old architecture list and pass.
-        head = subprocess.run(["git", "-C", os.path.join(ROOT, HRX), "rev-parse", "HEAD"],
-                              capture_output=True, text=True).stdout.strip()
+        head = "" if tree else subprocess.run(["git", "-C", os.path.join(ROOT, HRX), "rev-parse", "HEAD"],
+                                              capture_output=True, text=True).stdout.strip()
         if head and head != pin(HRX):
             print(f"{HRX} is checked out at {head[:9]}, the pin is {pin(HRX)[:9] or 'unset'}: "
                   "run git submodule update --init before regenerating")

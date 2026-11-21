@@ -222,7 +222,7 @@ git rev-parse --verify -q "$base^{commit}" >/dev/null || {
     exit 2
 }
 
-ok=0; failed=0; skipped=0; detail=""
+ok=0; failed=0; skipped=0; untold=0; detail=""
 
 for c in "${checks[@]}"; do
     name=${c%% *}
@@ -248,7 +248,12 @@ for c in "${checks[@]}"; do
     # FAIL and a shallow clone read as a verdict on the PR.
     case "$(classify "$rc" "$name" "$last" "$out")" in
         ok) ok=$((ok + 1)) ;;
-        skip|cannot-tell) skipped=$((skipped + 1)) ;;
+        skip) skipped=$((skipped + 1)) ;;
+        # engine#3116 / cl-prs' #3118: cannot-tell is NOT a skip. A skip says "this did not apply here"; cannot-tell says
+        # "this could not look", and folding the two would let a shallow clone read as a skipped row rather than as an
+        # unanswered question. It gets its own counter and its own word in every summary line, so it can neither go red
+        # for a reason that is not the PR nor go green by silence.
+        cannot-tell) untold=$((untold + 1)) ;;
         *)
             failed=$((failed + 1))
             # The whole output, not its last line: the case that matters is a checker whose summary is
@@ -262,9 +267,9 @@ done
 
 echo
 if [ $failed -gt 0 ]; then
-    echo "pre-pr-checks: $failed failed, $ok ok, $skipped skipped"
+    echo "pre-pr-checks: $failed failed, $ok ok, $skipped skipped, $untold could not be told"
     printf '%s' "$detail"
     exit 1
 fi
-echo "pre-pr-checks: all $ok check(s) green, $skipped skipped"
+echo "pre-pr-checks: all $ok check(s) green, $skipped skipped, $untold could not be told"
 exit 0

@@ -23,7 +23,8 @@ Run them from the repository root on the branch you are about to hand over.
 
 **`scripts/pre-pr-checks.sh` runs every command in the table below**, one line each (`--base <ref>` for the registration check, `--list` to see the
 commands; a check that cannot run says `skip` and why — `77` (cannot run here) or `2` (cannot tell, e.g. the loss
-checks in a shallow clone), both counted in the summary with the tool's own reason; a row whose own invocation is wrong
+checks in a shallow clone — counted separately as "could not be told", never as a skip), both named in the summary with
+the tool's own reason; a row whose own invocation is wrong
 still fails, and an unresolvable `--base` is a usage error rather than a skip). One further check is an **author's check**, true or false exactly once — when you add a page — so it is not in the runner, and the section
 below says why. The table's order is the runner's order: cheapest and most common first, and last the checks that need a revision (`--base`) or a fetched tree.
 

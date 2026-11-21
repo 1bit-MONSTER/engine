@@ -237,8 +237,8 @@ def check(root: pathlib.Path, base: str) -> tuple[int, list[str]]:
         # because the branches are mutually exclusive, and a name-only diff cannot see that. cannot-tell, with the
         # one action that answers it, rather than a red row on a merge that was correct.
         return 2, (
-            [f"{len(guarded)} ctest row name(s) this branch adds are also registered at {base}, but at least one side "
-             f"sits inside an `if()` block, which can make the registrations mutually exclusive:"]
+            [f"{len(guarded)} ctest row name(s) this branch adds are also registered at {base}, and BOTH sides sit "
+             f"inside an `if()` block, which can make the registrations mutually exclusive:"]
             + [f"  {n}: branch -> {taken[n][0][:90]} (if-depth {taken[n][1]}); {base} -> {known[n][0][:90]} "
                f"(if-depth {known[n][1]})" for n in guarded]
             + ["  configure the tree to find out (cannot tell, not a pass), or rename one of the two rows"])

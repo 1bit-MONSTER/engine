@@ -74,6 +74,25 @@ def open_prs(repo):
         cannot_tell(f"{len(prs)} open PRs is the whole page -- the list may be truncated (raise PAGE)")
     return prs
 
+def merge_conflicts(repo_dir, base, branch):
+    """[(path, ...)] when merging `branch` into `base` CONFLICTS, [] when it merges cleanly, or None when the merge
+    could not be attempted at all. engine#3082: `stale_finding` returns None both for "level" and for "could not
+    measure", so a gate that reads None as clean gives 0 to a pull request whose merge conflicts -- the one answer a
+    merge-time gate must not give. The conflict is visible to its author on the PR page, which is why the open-PR
+    set mode may leave it alone; a per-PR gate may not.
+    """
+    rc, out, _ = run("git", "merge-tree", "--write-tree", base, branch, cwd=repo_dir)
+    if rc == 0:
+        return []
+    if rc != 1 or not out:
+        return None                     # not a conflict this tool can read (bad ref, unreadable tree)
+    seen = []
+    for line in out.splitlines():
+        if line.startswith("CONFLICT (") and line.rstrip().endswith(")"):
+            seen.append(line.rstrip())
+    return seen or [l for l in out.splitlines() if "Merge conflict in " in l]
+
+
 def stale_finding(repo_dir, branch, base="origin/main"):
     """(behind, reverted, carried, files) measuring THE MERGE, or None when the merge removes none of main's lines.
 
@@ -204,6 +223,27 @@ def self_test():
     f = stale_finding(d.name, "drop")
     chk(f is not None and "gone.txt" in f[3], "a branch that deletes a whole file IS a finding and names it")
 
+    # engine#3082: a CONFLICTING merge is a third answer, and the gate must not read it as "removes nothing".
+    # Two branches editing the same line, one commit apart: behind 1, and the merge conflicts.
+    d, g = repo({"shared.txt": "alpha\nbeta\ngamma\n"})
+    g("branch", "mine")
+    commit(g, d.name, {"shared.txt": "alpha\nMAIN\ngamma\n"}, "main edits line 2")
+    g("checkout", "-q", "mine")
+    pathlib.Path(d.name, "shared.txt").write_text("alpha\nBRANCH\ngamma\n")
+    g("commit", "-qam", "the branch edits the same line")
+    conflicts = merge_conflicts(d.name, "master" if False else "main", "mine")
+    chk(conflicts is not None and len(conflicts) >= 1,
+        "a conflicting merge is reported as a conflict, not as None (engine#3082)")
+    chk(stale_finding(d.name, "mine", "main") is None,
+        "…and stale_finding still returns None for it, which is exactly why the gate has to ask")
+    # a clean merge is not a conflict
+    d2, g2 = repo({"shared.txt": "alpha\n"})
+    g2("branch", "clean")
+    g2("checkout", "-q", "clean")
+    pathlib.Path(d2.name, "new.txt").write_text("added by the branch\n")
+    g2("add", "-A"); g2("commit", "-qm", "the branch adds a file")
+    chk(merge_conflicts(d2.name, "main", "clean") == [], "a clean merge is [], not a conflict")
+
     # A branch behind by ancestry but identical in content removes nothing.
     d, g = repo({"shared.txt": "alpha\nbeta\n"})
     g("branch", "mine")
@@ -259,6 +299,14 @@ def main():
             rc, _o, err = run("git", "fetch", "-q", "origin", ref, cwd=root)
             if rc != 0:
                 cannot_tell(f"cannot fetch {ref.split(':')[0]} (rc {rc}): {err.strip()[:120]}")
+        # engine#3082: a conflicted merge is cannot-tell here, not "removes nothing". `stale_finding` cannot tell a
+        # conflict from a level branch (both None), so the gate asks the merge first.
+        conflicts = merge_conflicts(root, f"origin/{base}", f"origin/{branch}")
+        if conflicts is None:
+            cannot_tell(f"#{a.pr} {branch}: the merge into {base} could not be attempted, so nothing was measured")
+        if conflicts:
+            cannot_tell(f"#{a.pr} {branch}: merging it into {base} CONFLICTS ({len(conflicts)} conflict line(s), "
+                        f"first: {conflicts[0][:120]}) -- rebase, then measure")
         found = stale_finding(root, f"origin/{branch}", f"origin/{base}")
         if found is None:
             print(f"#{a.pr} {branch}: merging it removes nothing {base} has")

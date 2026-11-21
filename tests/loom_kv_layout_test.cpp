@@ -110,6 +110,44 @@ int main() {
     check(aligned, "every attention block and value offset is 256-aligned over a capacity/row sweep");
     check(L::gdn_layer_offset(1) % 256 == 0 && L::gdn_layer_offset(46) % 256 == 0, "every gdn block offset is aligned");
 
+    // ---- the control header: the position that advances the cache -----------------------------------
+    // attention_layer_decode.loom:104 loads it as view<1xi32> at offset 0, so the handover establishes the decode
+    // position by writing word 0. Nothing else has to be taught anything.
+    check_eq(L::kControlPositionOffset, 0, "the KV position is word 0 of the control buffer");
+    check_eq(L::kControlGeneratedOffset, 4, "generated_count / position_base is word 1");
+    check_eq(L::kControlEosOffset, 8, "eos / live row count is word 2");
+    check_eq(L::kControlHeaderBytes, 3 * L::kControlWordBytes, "the header is three words");
+    check(L::kControlHeaderBytes + 4 == 16, "3 words plus the pad are the bank's fixed 16 bytes");
+
+    // ---- packet geometry, checked against Loom's own sampling fixture -------------------------------
+    // test/sampling_test.loom fills a tensor<3594xi32> epoch and hardcodes policy_origin 9760 and identity_origin
+    // 12832 with 128 identity rows and 16 policy rows. Those literals are independent of packet.loom's arithmetic,
+    // so agreeing with them checks the geometry rather than restating it.
+    const uint64_t cap = 128;
+    check_eq(L::packet_policy_origin(cap), 9760, "policy origin at capacity 128 matches the sampling fixture");
+    check_eq(L::packet_identity_origin(cap), 12832, "identity origin at capacity 128 matches the sampling fixture");
+    check_eq(L::packet_bytes(cap), 3594 * 4, "capacity 128 is 3594 words -- the fixture's epoch tensor");
+    check_eq(L::packet_capacity(3594 * 4), 128, "capacity recovered from the allocation length");
+    check_eq(L::packet_bank_bytes(cap), 16 + cap * 36, "a bank is a 3-word header plus 9 words per token");
+    check_eq(2 * L::packet_bank_bytes(cap), L::packet_indices_origin(cap), "the second bank ends where the indices begin");
+
+    // The banks and the tail regions must tile the packet exactly: any gap is a region a writer can corrupt, and any
+    // overlap is two regions fighting over the same bytes.
+    bool tiles = true;
+    for (uint64_t c = 2; c <= 2048; c += 2) {
+        const bool exact = L::packet_policy_origin(c) + c * L::kPolicyRecordBytes == L::packet_identity_origin(c) &&
+                           L::packet_identity_origin(c) + c * L::kIdentityRecordBytes == L::packet_sources_origin(c) &&
+                           L::packet_sources_origin(c) + c * L::kControlWordBytes == L::packet_shape_origin(c) &&
+                           L::packet_shape_origin(c) + L::kMixedInputCapacitiesBytes == L::packet_bytes(c) &&
+                           L::packet_capacity(L::packet_bytes(c)) == c;
+        if (!exact) { tiles = false; }
+    }
+    check(tiles, "banks, indices, policies, identities, sources and shape tile the packet with no gap or overlap");
+
+    // The policy and identity records are what the sampler and the attention writer index into.
+    check_eq(L::kPolicySeedOffset + 8, L::kPolicyRecordBytes, "a policy record ends with its i64 seed");
+    check_eq(L::kIdentityPositionOffset + 4, L::kIdentityRecordBytes, "an identity record is (owner, position)");
+
     if (failures == 0) {
         std::printf("loom_kv_layout_test: pass\n");
         return 0;

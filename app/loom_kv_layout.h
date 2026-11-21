@@ -105,4 +105,58 @@ inline constexpr uint64_t attention_element_index(uint64_t position, uint64_t j,
     return position * kv_elements + j;
 }
 
+// ---- the sequence packet: `%control`, the third caller-owned root -----------------------------------
+// `%control` looked opaque in the .loom because the files pass it straight to kernels. It is not: it is the sequence
+// packet, its geometry is the function bodies in motif/sequence/qwen3_8/packet.loom, and its first word is the position
+// that advances the attention cache -- read directly by every attention layer:
+//
+//   attention_decode.loom:104   %position_i32 = view.load %control_view[0] : view<1xi32> -> i32
+//   attention_decode.loom:108   %token_cache_base = index.mul %position, %c1024
+//
+// So the handover WRITES this header; it does not negotiate an interface. The three words carry two ABIs over the same
+// storage, and which one is live depends only on which command runs next:
+//
+//   decode  (decode_control.loom:17-19)          [ position,      generated_count, eos_token ]
+//   prefill (decode_control.loom:49-51)          [ token_count,   position_base,   eos_token ]
+//
+// qwen38_prefill_finish_control converts the second into the first: position := position_base + token_count,
+// generated_count := 1 (decode_control.loom:54-59, fixtures in test/decode_control_test.loom:53-71). That kernel is the
+// handover's landing point, and it reads token_count with no range assumption -- so token_count == 0 is a legal
+// zero-token finish that only establishes the position. The public prefill commands are stricter (range 1..512), so the
+// kernel is the only zero-length path in the library.
+//
+// Caveat a writer must carry: word 2 is EOS to the commit kernels and the LIVE ROW COUNT to the samplers
+// (kernel/sampling.loom:45,92) and to kernel/output_spans.loom:35. Nothing in the sampled path writes that count, so the
+// caller owns which meaning is in place at each call site. An eos id smaller than the row count would silently drop rows.
+inline constexpr uint64_t kControlWordBytes  = 4;
+inline constexpr uint64_t kControlHeaderBytes = 12;
+inline constexpr uint64_t kControlPositionOffset  = 0;  // decode: KV position; prefill: token_count
+inline constexpr uint64_t kControlGeneratedOffset = 4;  // decode: generated_count; prefill: position_base
+inline constexpr uint64_t kControlEosOffset       = 8;  // eos_token, or the sampling live-row count
+
+// Packet geometry, from packet.loom: the bank pair, then indices / policies / identities / sources / shape. Capacity is
+// a Loom SPECIALIZATION (range 2..2147483646, multiple of 2), so the allocation is fixed when the program is materialized.
+inline constexpr uint64_t kPacketFixedBytes  = 40;  // two mixed-input capacities after the shape block
+inline constexpr uint64_t kPacketStrideBytes = 112;
+inline constexpr uint64_t kPolicyRecordBytes = 24;  // f32 temperature, f32 top_p, i32 top_k, i32 flags, i64 seed
+inline constexpr uint64_t kPolicySeedOffset  = 16;
+inline constexpr uint64_t kIdentityRecordBytes = 8;  // i32 owner, i32 position -- the per-row position to fill
+inline constexpr uint64_t kIdentityPositionOffset = 4;
+inline constexpr uint64_t kMixedInputCapacitiesBytes = 8;
+
+inline constexpr uint64_t packet_bytes(uint64_t capacity) { return kPacketFixedBytes + capacity * kPacketStrideBytes; }
+
+// One of the two identical banks: 3-word header + 4 bytes of pad, then 6 descriptor words, 1 selection word, 2 option
+// words and one EOS word per token.
+inline constexpr uint64_t packet_bank_bytes(uint64_t capacity) { return 16 + capacity * 36; }
+
+inline constexpr uint64_t packet_indices_origin(uint64_t capacity)  { return 32 + capacity * 72; }
+inline constexpr uint64_t packet_policy_origin(uint64_t capacity)   { return 32 + capacity * 76; }
+inline constexpr uint64_t packet_identity_origin(uint64_t capacity) { return 32 + capacity * 100; }
+inline constexpr uint64_t packet_sources_origin(uint64_t capacity)  { return 32 + capacity * 108; }
+inline constexpr uint64_t packet_shape_origin(uint64_t capacity)    { return 32 + capacity * 112; }
+
+// Inverse of packet_bytes, the way packet.loom:90-97 recovers capacity from an allocation's length.
+inline constexpr uint64_t packet_capacity(uint64_t bytes) { return (bytes - kPacketFixedBytes) / kPacketStrideBytes; }
+
 }  // namespace onebit::loom

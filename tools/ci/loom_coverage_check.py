@@ -52,16 +52,26 @@ def read_rows(tsv):
 
 
 def identity(card_dir):
-    """(model id, quants named) from a card's model.json, or (None, set()) when unreadable."""
+    """(model id, quants of the CHECKPOINT files) from a card's model.json, or (None, set()) when unreadable.
+
+    The checkpoint is what the card serves, and it is the only thing a coverage claim may rest on. A card may also
+    name files that are NOT the checkpoint -- Qwen3.6-35B-A3B ships a DFlash drafter whose files carry their own
+    quantisation -- and reading `model.json` as text counted those too, which made that row read COVERED on Q8_0
+    when its checkpoint is Q4_K_M (engine#3156 review). So walk the variant/service/checkpoint-file paths only.
+    """
     f = card_dir / "model.json"
     try:
-        text = f.read_text()
-        doc = json.loads(text)
+        doc = json.loads(f.read_text())
     except Exception:
         return None, set()
     model = doc.get("model") if isinstance(doc, dict) else None
     ident = model.get("id") if isinstance(model, dict) else None
-    return ident, {q.upper() for q in QUANTS.findall(text)}
+    quants = set()
+    for variant in ((doc.get("variants") or {}) if isinstance(doc, dict) else {}).values():
+        for svc in (variant.get("services") or {}).values():
+            for entry in (((svc.get("parameters") or {}).get("model") or {}).get("files") or []):
+                quants |= {q.upper() for q in QUANTS.findall(entry.get("path", ""))}
+    return ident, quants
 
 
 NON_DISTINCTIVE = {"loom", "gguf", "merged"}
@@ -173,10 +183,23 @@ def self_test():
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td) / "cards"
             root.mkdir()
-            for cname, ident, quants in cards:
+            for card in cards:
+                cname, ident, quants = card[0], card[1], card[2]
+                drafter = card[3] if len(card) > 3 else ()
                 d = root / cname
                 d.mkdir()
-                (d / "model.json").write_text(json.dumps({"model": {"id": ident}, "quants": quants}))
+                # the shape a real card has: the checkpoint is a file path under a variant's service parameters
+                files = [{"path": f"parameter/M-{q}.gguf"} for q in quants]
+                doc = {"model": {"id": ident},
+                       "variants": {"gguf": {"services": {"chat": {"parameters": {"model": {"files": files}}}}}}}
+                # ...and a card may carry a DRAFTER beside the checkpoint, under the SAME service's `draft`
+                # parameter -- which is where the real Qwen3.6-35B-A3B card keeps its Q8_0 DFlash file
+                # (`variants.gguf.services.chat.parameters.draft.files[0].path`). The coverage claim must not read
+                # those, which is the defect this arm exists for (engine#3156 review).
+                if drafter:
+                    chat = doc["variants"]["gguf"]["services"]["chat"]
+                    chat["parameters"]["draft"] = {"files": [{"path": f"parameter/D-{q}.gguf"} for q in drafter]}
+                (d / "model.json").write_text(json.dumps(doc))
             tsv = pathlib.Path(td) / "models.tsv"
             tsv.write_text("\n".join(f"{dev}\t{m}" for dev, m in rows) + "\n")
             rc, lines = check(tsv, [root])
@@ -204,13 +227,18 @@ def self_test():
     arm("a VL sibling does not cover", "UNCOVERED",
         [("hrx", "qwen2.5-7b-instruct-q4_k_m-merged.gguf")],
         [("ggml-org-Qwen2.5-VL-7B-Instruct-loom", "ggml-org/Qwen2.5-VL-7B-Instruct", ["Q4_K_M"])], 1)
+    # a card whose DRAFTER carries our quant while the checkpoint does not is REQUANT, not covered: this is exactly
+    # Qwen3.6-35B-A3B, whose checkpoint is Q4_K_M and whose Q8_0 is the DFlash drafter (engine#3156 review).
+    arm("a drafter's quant does not cover the checkpoint", "REQUANT",
+        [("hrx", "Qwen3.6-35B-A3B-Q8_0.gguf")],
+        [("ggml-org-Qwen3.6-35B-A3B-loom", "Qwen/Qwen3.6-35B-A3B", ["Q4_K_M"], ["Q8_0"])], 1)
     # no card tree at all is cannot-tell
     arm("no cards is cannot tell", "cannot-tell",
         [("hrx", "Qwen3-0.6B-Q4_K_M.gguf")], [], 2)
     # non-GPU rows are not this map's business
     arm("npu rows are ignored (nothing is reported for them)", "no-verdict-at-all",
         [("npu", "Qwen3-0.6B")], [("unsloth-Qwen3-0.6B-loom", "Qwen/Qwen3-0.6B", ["Q4_K_M"])], 0)
-    print(f"loom_coverage_check self-test: {6 - fails} ok, {fails} failed")
+    print(f"loom_coverage_check self-test: {7 - fails} ok, {fails} failed")
     return 0 if fails == 0 else 1
 
 

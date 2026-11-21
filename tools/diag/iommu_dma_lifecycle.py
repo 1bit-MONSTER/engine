@@ -50,7 +50,7 @@ but never fire, so kprobes are required):
     ... wait for the fault ...
     cat $I/snapshot > TRACE                               # the history ENDING at the fault
     echo 0 > $I/tracing_on; echo 0 > $I/events/kprobes/enable
-    rm -rf $I; echo > $T/kprobe_events                    # leave nothing running
+    rmdir $I; echo > $T/kprobe_events                     # leave nothing running (rmdir, not rm -rf: see below)
 
 Why the snapshot trigger instead of a plain enabled ring (measured on this box, 2026-11-20): the DMA path is
 continuously busy -- iommu_map 73 724, iommu_unmap_fast 75 924 and __iommu_dma_unmap 73 728 calls in a 40 s
@@ -69,6 +69,12 @@ Why not the kernel log instead: it has two independent truncations, both visible
 faults into one `amd_iommu_report_page_fault: N callbacks suppressed` line (1 761 suppressed against 323 printed
 on the boot measured), and a large burst ends with `AMD-Vi: IOMMU Event log restarting`, so the readable set
 stops at the driver's log boundary. A kprobe counts before both.
+
+`rmdir $I`, not `rm -rf $I`: an instance directory holds kernel pseudo-files (`show_event_filters`, `set_event`,
+...), so `rm -rf` fails on the first of them, leaves the directory in place, and then `kprobe_events` refuses the
+truncation with `Device or resource busy` because a probe is still referenced by it. The busy error reads like a
+permission problem; it is a surviving instance. rmdir removes it and the truncation then succeeds -- measured on
+this box after a teardown wrote `rm -rf`, failing exactly this way.
 
 Cost, and why the probes are not left standing: the map/unmap probes above fire ~9 200 times per second, so a
 window is measured in SECONDS and then torn down; the teardown above leaves `kprobe_events` empty. If only the

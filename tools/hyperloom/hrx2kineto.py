@@ -1014,6 +1014,10 @@ def self_test():
     # engine#3103: a key the profile SHORTENED must not cost the whole command buffer. Both halves are pinned: the real
     # pair (871 exact + 1 prefix) joins, and a program where two commands share the prefix must still refuse to guess.
     def cb_fixture(second_symbol):
+        # Both event keys are the shapes they claim to be: key 0 is a PREFIX of command 0's symbol (the measured defect),
+        # key 1 is command 1's symbol EXACTLY. My first version keyed the second dispatch "other", which matches no
+        # command name at all -- so align() refused at position 1 whatever the uniqueness rule did, and the ambiguity
+        # arm passed while proving nothing (review, 03:36Z: the mutant `len(hits) >= 1` stayed green).
         prog = {"type": "hrx_command_program", "program": 1, "graph_uid": 1,
                 "commands": [{"phase": "main", "ordinal": 0, "kernel": "qwen3_moe:ggml_linear_q6k_q8_1_x4",
                               "symbol": "ggml_linear_q6k_q8_1_x4_wave64_block4", "match": 0},
@@ -1022,7 +1026,7 @@ def self_test():
                 "matches": [{"nodes": [node]}]}
         evs = [{"type": "dispatch_event", "key": "ggml_linear_q6k_q8_1_x4", "valid": True, "command_buffer_id": 9,
                 "command_index": 1, "start_tick": 1000, "duration_ns": 100.0, "submission_id": 1},
-               {"type": "dispatch_event", "key": "other", "valid": True, "command_buffer_id": 9,
+               {"type": "dispatch_event", "key": second_symbol, "valid": True, "command_buffer_id": 9,
                 "command_index": 2, "start_tick": 2000, "duration_ns": 100.0, "submission_id": 1}]
         return prog, evs
 

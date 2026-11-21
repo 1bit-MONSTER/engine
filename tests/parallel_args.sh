@@ -84,9 +84,9 @@ check "--parallel 4 starts llama-server with -np 4" '[ "$(np "$scratch/four.json
 kv() { python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["argv"]; print("yes" if "-kvu" in a else "no")' "$1"; }
 disable() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hrx_disable"] or "")' "$1"; }
 run --hrx --gdn "$scratch/gdn_unset.json"
-check "engine#3125: an unasked qwen35 server is NOT clamped to one slot" '[ "$(np "$scratch/gdn_unset.json")" = none ]'
-check "engine#3125: ...and it gets the shared KV cache (-kvu)" '[ "$(kv "$scratch/gdn_unset.json")" = yes ]'
-check "engine#3125: ...with qwen.attention turned off under that cache" 'case "$(disable "$scratch/gdn_unset.json")" in *qwen.attention*) true;; *) false;; esac'
+check "engine#3125: an unasked qwen35 server asks for 4 slots (-np 4), it is not left at one" '[ "$(np "$scratch/gdn_unset.json")" = 4 ]'
+check "engine#3125: ...which is the measured configuration, so it gets -kvu" '[ "$(kv "$scratch/gdn_unset.json")" = yes ]'
+check "engine#3125: ...and qwen.attention off under that unified cache" 'case "$(disable "$scratch/gdn_unset.json")" in *qwen.attention*) true;; *) false;; esac'
 run --hrx --gdn "$scratch/gdn_four.json" --parallel 4
 check "engine#3125: --parallel 4 on qwen35 still passes -np 4 and -kvu" '[ "$(np "$scratch/gdn_four.json")" = 4 ] && [ "$(kv "$scratch/gdn_four.json")" = yes ]'
 run --hrx "$scratch/llama_unset.json"

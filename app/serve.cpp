@@ -1142,10 +1142,15 @@ bool delta_net_arch(const std::string& arch) {
 // for these servers.
 //
 // It used to be applied only when `--parallel` was given explicitly, because the unasked case was
-// clamped to one slot for gated delta-net models. That clamp is gone (see serve_child), and the auto
-// case reaches 4 unified slots too (`tools/server/server.cpp:128-130`: `n_parallel < 0` resolves to
-// 4 with `kv_unified = true`), so the treatment has to cover it or a GDN model gets a unified cache
-// with `qwen.attention` still on -- the bleed this function exists to prevent.
+// clamped to one slot for gated delta-net models. That clamp is replaced by an explicit `-np 4` (see
+// serve_child), so the treatment has to cover the unasked case too: a multi-slot server with
+// `qwen.attention` still on is the bleed this function exists to prevent.
+//
+// Correcting an earlier claim in this comment: llama-server's default is NOT several slots --
+// `common/common.h:477` is `n_parallel = 1`, and the 4-slot + `kv_unified = true` resolution in
+// `tools/server/server.cpp:126-131` fires only for `n_parallel < 0`, i.e. an explicit `-np -1`, which
+// `serve` never passes. So an unasked server that passes no `-np` gets ONE slot; that is why the
+// unasked gated delta-net case has to choose its slot count rather than simply stop clamping.
 void apply_shared_kv(std::vector<std::string>& argv, std::vector<std::string>& env) {
     argv.push_back("-kvu");
     bool merged = false;
@@ -1286,16 +1291,22 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         // engine#3125: Qwen3.5 / Qwen3.8 (gated delta net) used to be clamped to one slot here unless `--parallel` was
         // given, on the recorded reason that a second concurrent request failed (HTTP 500) at the multi-sequence
         // softplus / GATED_DELTA_NET. Measured 2026-11-21 through this gate on Qwen3.8-27B (arch `qwen35`), two
-        // simultaneous requests with distinct expected words, `--device hrx --no-strict-device`: `--parallel 4` ->
-        // `n_slots = 4, kv_unified = true`, both requests 200, each its own answer, no cross-talk; `--parallel 2` the
-        // same; the old one-slot default answered the second request only after the first (1.1 s, then 2.0 s). The
-        // matcher side agrees and always did: `kMaximumSequences = 8`
-        // (`dispatch_registration/llm/dispatch-gated-delta-net.cpp:53`) and the 2- and 3-sequence ops rows pass. So the
-        // unasked case takes llama-server's own slot count like every other model -- and it needs the shared-KV
-        // treatment, because auto resolves to 4 slots with `kv_unified = true` and leaving `qwen.attention` on under a
-        // unified cache is what bleeds answers between requests.
-        if (device == "hrx" && o.parallel == 0 && delta_net_arch(gguf_architecture(o.model)))
+        // simultaneous requests with distinct expected words, `--device hrx --no-strict-device`:
+        //   `--parallel 4` -> `n_slots = 4, kv_unified = true`, both 200, each its own answer, no cross-talk, 1.1 s each
+        //   `--parallel 2` -> the same at 2 slots
+        //   one slot (the old clamp) -> the second request took 2.0 s against the first's 1.1 s, i.e. queueing
+        // and the matcher side agrees and always did: `kMaximumSequences = 8`
+        // (`dispatch_registration/llm/dispatch-gated-delta-net.cpp:53`), with the 2- and 3-sequence ops rows passing.
+        //
+        // So the unasked case CHOOSES several slots rather than merely dropping the clamp: an unpassed `-np` is one
+        // slot (`common/common.h:477`), which would have left #3125's symptom -- a second request queued -- exactly as
+        // it was while still turning a fused dispatch off. 4 is llama-server's own auto value
+        // (`tools/server/server.cpp:128-131`, `n_parallel < 0`), and `-np 4 -kvu` with `qwen.attention` off is the
+        // configuration measured above, so the default path is the measured path.
+        if (device == "hrx" && o.parallel == 0 && delta_net_arch(gguf_architecture(o.model))) {
+            argv.insert(argv.end(), {"-np", "4"});
             apply_shared_kv(argv, env);
+        }
     } else {
         refuse_removed_device(device);
         throw std::runtime_error("--device " + device + " cannot run a .gguf (hrx or cpu)");

@@ -87,17 +87,29 @@ rm -rf "$out"; mkdir -p "$out/dev" "$out/host"
 
 serve() {   # <dir> <port> [env ...]
     local dir=$1 port=$2; shift 2
+    # WAIT: a 60 s budget was enough for the 768 whisper families and 3.2x short for a 14B host arm, which spent
+    # 193.5 s warming before `/health` answered (engine#3194, measured on a 12.05 GB b8 container). Named `wait_s`
+    # because `wait` is the builtin this function uses on the failure path.
+    local wait_s=${BITX_SERVE_WAIT_S:-300}
     env "$@" "$bin" forward-serve -m "$container" --kernels "$kernels" --prefix-slots 0 \
         -p "$port" --dump-logits "$dir" > "$dir.log" 2>&1 &
     local pid=$!
     local up=0
-    for _ in $(seq 1 60); do
+    for _ in $(seq 1 "$wait_s"); do
         curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1 && { up=1; break; }
         kill -0 "$pid" 2>/dev/null || break
         sleep 1
     done
     if [ "$up" = 0 ]; then
-        echo "  $dir: serve did not come up -- $(grep -E 'init_elf failed|missing|error' "$dir.log" | tail -1)" >&2
+        # WHY: the grep knows three shapes -- a wrong artifact, a missing ELF, an error. A slow warm-up matches none,
+        # so the old message printed "did not come up -- " with nothing after the dash, and a timeout read exactly like
+        # the defect this script exists to catch (engine#3194). Fall back to the log's own last lines, and say so when
+        # there are none rather than leaving the field empty.
+        local why
+        why=$(grep -E 'init_elf failed|missing|error' "$dir.log" 2>/dev/null | tail -1)
+        [ -n "$why" ] || why=$(tail -n 3 -- "$dir.log" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')
+        [ -n "$why" ] || why="$dir.log is empty -- the binary said nothing at all"
+        echo "  $dir: serve did not come up in ${wait_s}s -- $why" >&2
         kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 1
     fi
     local i=0 rc=0

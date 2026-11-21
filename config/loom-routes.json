@@ -1,0 +1,4 @@
+{
+ "about": "Model -> Loom card for 1bit serve's GPU route (docs/loom-route.md). A .gguf served on the GPU (--device auto or hrx) whose entry matches runs on loom-serve (AMD's Loom programs on the HRX runtime); every other model runs on the llama.cpp fork's llama-server as before. An entry is added only after the model passed the Loom-vs-fallback gate (interleaved A/B speed and accuracy on strixhalo, docs/loom-route.md \"Gate\"), with the gate's result linked in `gate`. Empty until a model passes.",
+ "routes": []
+}

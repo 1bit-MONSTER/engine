@@ -1,0 +1,605 @@
+// Copyright 2026 bong-water-water-bong
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// The Loom GPU route (docs/loom-route.md): `1bit serve` serves a .gguf on the GPU through `loom-serve`
+// (AMD's Loom programs on the HRX runtime) when config/loom-routes.json has an entry for that model, and
+// through the llama.cpp fork's llama-server (the frozen fallback) when it has none. A model gets an entry
+// only after it passed the Loom-vs-fallback gate (speed and accuracy, docs/loom-route.md "Gate"), so the
+// shipped table starts empty and serve behaves exactly as before.
+//
+// Everything here is a pure function of its inputs (the table text, a reply body, a byte stream), so
+// tests/loom_route_test.cpp checks it without a GPU or a server:
+//   - LoomRoutes::parse / match_loom_route: the table, and which entry (if any) a model file matches;
+//   - loom_ready: what loom-serve's GET /v1/status says about the card serve registered;
+//   - loom_request: a llama-server-shaped request made acceptable to loom-serve, which rejects every
+//     field it does not implement (HTTP 400) instead of ignoring it;
+//   - loom_reply / LoomSse: loom-serve's replies made to look like llama-server's where clients read
+//     them (the `model` name, a `timings` object Lemonade's telemetry reads, usage in the final chunk).
+#pragma once
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace onebit::loom {
+
+using json = nlohmann::json;
+
+// ---------------------------------------------------------------------------------------------------
+// SHA-256 over a stream (a GGUF is gigabytes; app/hrx_runtime.h's helper reads its input whole).
+
+class Sha256 {
+public:
+    void update(const uint8_t* p, size_t n) {
+        len_ += n;
+        while (n > 0) {
+            const size_t take = std::min(n, size_t(64) - fill_);
+            std::copy(p, p + take, buf_ + fill_);
+            fill_ += take;
+            p += take;
+            n -= take;
+            if (fill_ == 64) { block(buf_); fill_ = 0; }
+        }
+    }
+    std::string hex() {
+        const uint64_t bits = len_ * 8;
+        const uint8_t one = 0x80, zero = 0;
+        update(&one, 1);
+        while (fill_ != 56) update(&zero, 1);
+        uint8_t tail[8];
+        for (int i = 0; i < 8; i++) tail[i] = uint8_t(bits >> (8 * (7 - i)));
+        update(tail, 8);
+        char out[65];
+        for (int i = 0; i < 8; i++) std::snprintf(out + 8 * i, 9, "%08x", h_[i]);
+        return out;
+    }
+
+private:
+    static uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+    void block(const uint8_t* m) {
+        static const uint32_t K[64] = {
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+        uint32_t w[64];
+        for (int i = 0; i < 16; i++)
+            w[i] = uint32_t(m[4 * i]) << 24 | uint32_t(m[4 * i + 1]) << 16 | uint32_t(m[4 * i + 2]) << 8 | m[4 * i + 3];
+        for (int i = 16; i < 64; i++) {
+            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3], e = h_[4], f = h_[5], g = h_[6], hh = h_[7];
+        for (int i = 0; i < 64; i++) {
+            const uint32_t t1 = hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i];
+            const uint32_t t2 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        h_[0] += a; h_[1] += b; h_[2] += c; h_[3] += d; h_[4] += e; h_[5] += f; h_[6] += g; h_[7] += hh;
+    }
+    uint32_t h_[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    uint8_t buf_[64] = {};
+    size_t fill_ = 0;
+    uint64_t len_ = 0;
+};
+
+// sha256 of a whole file, read in 4 MiB pieces; "" when it cannot be read.
+inline std::string sha256_of_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return "";
+    Sha256 s;
+    std::vector<char> buf(size_t(4) << 20);
+    while (f) {
+        f.read(buf.data(), std::streamsize(buf.size()));
+        const std::streamsize n = f.gcount();
+        if (n > 0) s.update(reinterpret_cast<const uint8_t*>(buf.data()), size_t(n));
+    }
+    if (f.bad()) return "";
+    return s.hex();
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The table (config/loom-routes.json, compiled in; `serve --loom-routes FILE` replaces it).
+
+struct LoomRoute {
+    std::string id;                    // a name for logs ("qwen3-0.6b-q4_k_m")
+    std::vector<std::string> models;   // match.model: served ids / file names (serve's model id or the file name)
+    std::string sha256;                // match.gguf_sha256: the exact checkpoint the gate measured
+    uint64_t size = 0;                 // match.gguf_size: its size in bytes (checked first, so a miss costs no hash)
+    std::string card;                  // the fetched Loom package: a model.json, or the directory holding it
+    std::string preset;                // --preset=NAME, for a card with several presets
+    std::string device;                // loom-serve --device URI (default amdgpu://)
+    std::vector<std::string> args;     // more loom-serve flags, as written (--memory_bytes=..., ...)
+    std::vector<std::string> env;      // NAME=VALUE for loom-serve's environment (a value the user set wins)
+    std::string gate;                  // where the gate's result is recorded (an issue link); required
+};
+
+struct LoomRoutes {
+    std::vector<LoomRoute> routes;
+
+    bool parse(const std::string& text, std::string& err) {
+        routes.clear();
+        json j;
+        try {
+            j = json::parse(text);
+        } catch (const std::exception& e) {
+            err = std::string("not JSON: ") + e.what();
+            return false;
+        }
+        if (!j.is_object() || !j.contains("routes") || !j["routes"].is_array()) {
+            err = "expected an object with a \"routes\" array";
+            return false;
+        }
+        static const char* kKeys[] = {"id", "match", "card", "preset", "device", "args", "env", "gate", "why", "measured"};
+        static const char* kMatch[] = {"model", "gguf_sha256", "gguf_size"};
+        for (size_t i = 0; i < j["routes"].size(); ++i) {
+            const json& r = j["routes"][i];
+            const std::string at = "routes[" + std::to_string(i) + "]";
+            if (!r.is_object()) { err = at + ": expected an object"; return false; }
+            for (const auto& [k, v] : r.items()) {
+                (void)v;
+                if (std::find(std::begin(kKeys), std::end(kKeys), k) == std::end(kKeys)) {
+                    err = at + ": unknown key \"" + k + "\"";
+                    return false;
+                }
+            }
+            LoomRoute out;
+            auto str = [&](const char* key, std::string& dst, bool required) {
+                if (!r.contains(key)) {
+                    if (required) err = at + ": \"" + key + "\" is required";
+                    return !required;
+                }
+                if (!r[key].is_string() || r[key].get<std::string>().empty()) {
+                    err = at + ": \"" + key + "\" must be a non-empty string";
+                    return false;
+                }
+                dst = r[key].get<std::string>();
+                return true;
+            };
+            auto strings = [&](const json& v, const std::string& name, std::vector<std::string>& dst) {
+                if (!v.is_array()) { err = at + ": \"" + name + "\" must be a list of strings"; return false; }
+                for (const auto& s : v) {
+                    if (!s.is_string()) { err = at + ": \"" + name + "\" must be a list of strings"; return false; }
+                    dst.push_back(s.get<std::string>());
+                }
+                return true;
+            };
+            if (!str("id", out.id, true) || !str("card", out.card, true) || !str("gate", out.gate, true) ||
+                !str("preset", out.preset, true) || !str("device", out.device, false))
+                return false;
+            if (r.contains("args") && !strings(r["args"], "args", out.args)) return false;
+            if (r.contains("env")) {
+                if (!r["env"].is_object()) { err = at + ": \"env\" must be an object of strings"; return false; }
+                for (const auto& [k, v] : r["env"].items()) {
+                    if (!v.is_string()) { err = at + ": \"env\" must be an object of strings"; return false; }
+                    out.env.push_back(k + "=" + v.get<std::string>());
+                }
+            }
+            if (!r.contains("match") || !r["match"].is_object()) { err = at + ": \"match\" is required (an object)"; return false; }
+            const json& m = r["match"];
+            for (const auto& [k, v] : m.items()) {
+                (void)v;
+                if (std::find(std::begin(kMatch), std::end(kMatch), k) == std::end(kMatch)) {
+                    err = at + ".match: unknown key \"" + k + "\"";
+                    return false;
+                }
+            }
+            if (m.contains("model") && !strings(m["model"], "match.model", out.models)) return false;
+            if (m.contains("gguf_sha256")) {
+                if (!m["gguf_sha256"].is_string()) { err = at + ".match.gguf_sha256 must be a string"; return false; }
+                out.sha256 = m["gguf_sha256"].get<std::string>();
+                std::transform(out.sha256.begin(), out.sha256.end(), out.sha256.begin(),
+                               [](unsigned char c) { return char(std::tolower(c)); });
+                if (out.sha256.size() != 64 || out.sha256.find_first_not_of("0123456789abcdef") != std::string::npos) {
+                    err = at + ".match.gguf_sha256 is not a sha256 (64 hex)";
+                    return false;
+                }
+                if (!m.contains("gguf_size") || !m["gguf_size"].is_number_unsigned() || m["gguf_size"].get<uint64_t>() == 0) {
+                    err = at + ".match.gguf_sha256 needs gguf_size (bytes): the size is compared first, so a "
+                               "model that is not this checkpoint is never hashed";
+                    return false;
+                }
+                out.size = m["gguf_size"].get<uint64_t>();
+            } else if (m.contains("gguf_size")) {
+                err = at + ".match.gguf_size without gguf_sha256: a size alone does not name a checkpoint";
+                return false;
+            }
+            if (out.models.empty() && out.sha256.empty()) {
+                err = at + ".match names nothing: give \"model\" and/or \"gguf_sha256\" + \"gguf_size\"";
+                return false;
+            }
+            routes.push_back(std::move(out));
+        }
+        return true;
+    }
+};
+
+// The entry a model matches, or none. Every condition an entry names must hold: its model names (any
+// one of them equals one of `names`) and its checkpoint (the file's size, then its sha256). `sha_of`
+// is called at most once, and only for a file whose size equals an entry's, so an empty table or a
+// table of other checkpoints never reads the model.
+inline const LoomRoute* match_loom_route(const LoomRoutes& t, const std::string& model_path,
+                                         const std::vector<std::string>& names,
+                                         const std::function<std::string(const std::string&)>& sha_of,
+                                         std::string* sha_out = nullptr) {
+    std::optional<std::string> sha;
+    std::error_code ec;
+    const uint64_t size = std::filesystem::file_size(model_path, ec);
+    for (const LoomRoute& r : t.routes) {
+        if (!r.models.empty()) {
+            bool named = false;
+            for (const auto& m : r.models)
+                for (const auto& n : names) named = named || (!n.empty() && m == n);
+            if (!named) continue;
+        }
+        if (!r.sha256.empty()) {
+            if (ec || size != r.size) continue;
+            if (!sha) sha = sha_of(model_path);
+            if (*sha != r.sha256) continue;
+            if (sha_out) *sha_out = *sha;
+        }
+        return &r;
+    }
+    return nullptr;
+}
+
+// The card file an entry names: absolute as written, else under `cards_dir`; a directory means its model.json.
+// The card path is checked before anything opens it (CodeQL cpp/path-injection: the cards directory
+// can come from ONEBIT_LOOM_CARDS): a relative card may not climb out of the cards directory with
+// "..", and the result must be a regular file named model.json. "" when the path is refused.
+inline std::string loom_card_path(const LoomRoute& r, const std::string& cards_dir) {
+    namespace fs = std::filesystem;
+    fs::path card = fs::path(r.card).lexically_normal();
+    if (card.empty()) return "";
+    if (card.is_relative())
+        for (const auto& part : card)
+            if (part == "..") return "";
+    fs::path p = card;
+    if (p.is_relative() && !cards_dir.empty()) p = (fs::path(cards_dir) / p).lexically_normal();
+    std::error_code ec;
+    if (fs::is_directory(p, ec)) p /= "model.json";
+    if (p.filename() != "model.json" || !fs::is_regular_file(p, ec)) return "";
+    return p.string();
+}
+
+// The model id a card registers under (model.id): what a request's `model` must name. "" when the
+// card cannot be read; `why` then says what is wrong.
+inline std::string loom_card_model_id(const std::string& card, std::string& why) {
+    std::ifstream in(card, std::ios::binary);
+    if (!in) { why = "cannot read " + card; return ""; }
+    try {
+        const json j = json::parse(in);
+        if (j.contains("model") && j["model"].is_object() && j["model"].contains("id") && j["model"]["id"].is_string() &&
+            !j["model"]["id"].get<std::string>().empty())
+            return j["model"]["id"].get<std::string>();
+        why = card + " has no model.id";
+    } catch (const std::exception& e) {
+        why = card + " is not JSON: " + e.what();
+    }
+    return "";
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Readiness: loom-serve answers /healthz and /v1/models as soon as it listens, with the card still
+// preparing; GET /v1/status names every registration and its state (registered, preparing, ready,
+// retiring, failed, release_failed). A failed card leaves the server running, so serve has to read
+// the failure there instead of waiting out its load timeout.
+
+enum class LoomReady { kWaiting, kReady, kFailed };
+
+inline LoomReady loom_ready(const std::string& status_body, const std::string& model_id, std::string& why) {
+    json j;
+    try {
+        j = json::parse(status_body);
+    } catch (const std::exception&) {
+        return LoomReady::kWaiting;
+    }
+    if (!j.is_object() || !j.contains("data") || !j["data"].is_array()) return LoomReady::kWaiting;
+    for (const json& m : j["data"]) {
+        if (!m.is_object() || m.value("id", "") != model_id || !m.contains("loom") || !m["loom"].is_object()) continue;
+        const json& l = m["loom"];
+        const std::string state = l.value("registration", "");
+        if (state == "ready") return LoomReady::kReady;
+        if (state == "failed" || state == "release_failed") {
+            why = "loom-serve: " + model_id + " " + state;
+            if (l.contains("error") && l["error"].is_object() && l["error"].contains("message") && l["error"]["message"].is_string())
+                why += ": " + l["error"]["message"].get<std::string>().substr(0, 400);
+            return LoomReady::kFailed;
+        }
+    }
+    return LoomReady::kWaiting;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Requests. What loom-serve does with a field it does not interpret changed between releases:
+// hrx-loom 0.1.0 answers 400 for any field outside a fixed set (model, messages, stream, stream_options,
+// max_tokens, max_completion_tokens, temperature, top_p, top_k, seed, tools, tool_choice, store,
+// enable_thinking, reasoning_effort, preserve_thinking, chat_template_kwargs, model_options,
+// media_io_kwargs); hrx-loom 0.2.0 accepts every field and hands it to the model program, which
+// ignores what it does not consume -- `stop`, the penalties and `response_format` included. Under
+// 0.1.0 an unknown field is an error, under 0.2.0 it is silently without effect; serve handles both
+// the same way. A client written for llama-server sends three kinds of extra field:
+//   - llama-server's own serving hints, which have no meaning on another server: dropped;
+//   - llama-server's spelling of a field loom-serve has (n_predict): renamed;
+//   - an OpenAI sampling/output field loom-serve does not implement: dropped when it holds the value
+//     that means "off" (a client that sends every field with its default), refused with a 400 that
+//     names it otherwise -- serving `stop` or a penalty as if it applied (0.2.0 accepts it, and a card
+//     whose program does not consume it ignores it) would be a wrong answer.
+
+inline const std::vector<std::string>& loom_dropped_hints() {
+    static const std::vector<std::string> k = {"cache_prompt", "id_slot", "timings_per_token", "return_progress",
+                                               "speculative.n_max", "speculative.n_min", "speculative.p_min"};
+    return k;
+}
+
+struct LoomRequest {
+    bool ok = true;
+    std::string error;                // why serve refused it (HTTP 400), when !ok
+    std::vector<std::string> dropped; // the fields removed, for the request line
+    bool stream = false;
+    bool client_usage = false;        // the client asked for stream_options.include_usage itself
+};
+
+inline LoomRequest loom_request(json& body, const std::string& loom_model) {
+    LoomRequest r;
+    if (!body.is_object()) {
+        r.ok = false;
+        r.error = "request body is not a JSON object";
+        return r;
+    }
+    for (const auto& k : loom_dropped_hints())
+        if (body.contains(k)) { body.erase(k); r.dropped.push_back(k); }
+    if (body.contains("n_predict")) {
+        const json v = body["n_predict"];
+        body.erase("n_predict");
+        if (!body.contains("max_tokens") && !body.contains("max_completion_tokens") && v.is_number_integer() &&
+            v.get<long long>() > 0)
+            body["max_tokens"] = v;
+        r.dropped.push_back("n_predict");
+    }
+    // llama-server reads a negative output limit as "until the context is full"; loom-serve takes 1..16384 or its
+    // deployment default, which is the nearest meaning
+    for (const char* k : {"max_tokens", "max_completion_tokens"})
+        if (body.contains(k) && body[k].is_number() && body[k].get<double>() < 0) { body.erase(k); r.dropped.push_back(k); }
+    // OpenAI fields loom-serve does not implement, with the value that means "not used"
+    auto neutral = [](const std::string& k, const json& v) {
+        if (v.is_null()) return true;
+        if (k == "n") return v.is_number() && v.get<double>() == 1;
+        if (k == "presence_penalty" || k == "frequency_penalty" || k == "min_p")
+            return v.is_number() && v.get<double>() == 0;
+        if (k == "repeat_penalty" || k == "typical_p") return v.is_number() && v.get<double>() == 1;
+        if (k == "logprobs") return v.is_boolean() && !v.get<bool>();
+        if (k == "stop") return (v.is_array() && v.empty()) || (v.is_string() && v.get<std::string>().empty());
+        if (k == "response_format") return v.is_object() && v.value("type", "") == "text";
+        if (k == "user" || k == "parallel_tool_calls") return true;   // client metadata / a hint with no effect here
+        return false;
+    };
+    for (const char* k : {"n", "presence_penalty", "frequency_penalty", "repeat_penalty", "min_p", "typical_p", "logprobs",
+                          "top_logprobs", "stop", "response_format", "logit_bias", "grammar", "json_schema", "user",
+                          "parallel_tool_calls"}) {
+        if (!body.contains(k)) continue;
+        if (neutral(k, body[k])) {
+            body.erase(k);
+            r.dropped.push_back(k);
+            continue;
+        }
+        r.ok = false;
+        r.error = std::string("\"") + k + "\" is not supported on the Loom route (loom-serve does not implement it); "
+                  "drop it, or serve this model with --no-loom (docs/loom-route.md)";
+        return r;
+    }
+    body["model"] = loom_model;
+    r.stream = body.contains("stream") && body["stream"].is_boolean() && body["stream"].get<bool>();
+    if (r.stream) {
+        // usage arrives in a final chunk only when asked for; serve always asks, so the reply can carry it
+        // (and the timings) the way llama-server's last chunk does
+        r.client_usage = body.contains("stream_options") && body["stream_options"].is_object() &&
+                         body["stream_options"].value("include_usage", false);
+        if (!body.contains("stream_options") || !body["stream_options"].is_object()) body["stream_options"] = json::object();
+        body["stream_options"]["include_usage"] = true;
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Replies. loom-serve reports no `timings`; Lemonade's telemetry reads prompt_n, predicted_n,
+// prompt_ms, predicted_per_second and cache_n from it (streaming_proxy.cpp). serve fills the object
+// from the reply's usage and from its own clock, and says so in `measured_by`: prompt_ms is the time
+// from serve sending the request to the first generated text (it includes the HTTP hop), predicted_ms
+// the time from there to the last chunk. A non-streamed reply has no first-token time, so it carries
+// the counts only.
+
+constexpr const char* kLoomMeasuredBy = "1bit serve: counts from loom-serve usage, times from serve's own clock";
+
+inline json loom_timings(const json& usage, double first_ms, double end_ms) {
+    json t = json::object();
+    if (!usage.is_object()) return t;
+    const long long prompt = usage.value("prompt_tokens", 0LL), completion = usage.value("completion_tokens", 0LL);
+    long long cached = 0;
+    if (usage.contains("prompt_tokens_details") && usage["prompt_tokens_details"].is_object())
+        cached = usage["prompt_tokens_details"].value("cached_tokens", 0LL);
+    t["prompt_n"] = prompt - cached;
+    t["cache_n"] = cached;
+    t["predicted_n"] = completion;
+    if (first_ms >= 0 && end_ms >= first_ms) {
+        t["prompt_ms"] = first_ms;
+        t["predicted_ms"] = end_ms - first_ms;
+        if (first_ms > 0) t["prompt_per_second"] = double(prompt - cached) * 1000.0 / first_ms;
+        // the first token comes out of the prompt pass; the rest are decode steps
+        if (completion > 1 && end_ms > first_ms) t["predicted_per_second"] = double(completion - 1) * 1000.0 / (end_ms - first_ms);
+    }
+    t["measured_by"] = kLoomMeasuredBy;
+    return t;
+}
+
+// A non-streamed reply: the served id in `model`, the timings beside usage.
+inline void loom_reply(json& out, const std::string& our_id) {
+    if (!out.is_object()) return;
+    if (out.contains("model")) out["model"] = our_id;
+    if (out.contains("usage") && out["usage"].is_object() && !out.contains("timings"))
+        out["timings"] = loom_timings(out["usage"], -1, -1);
+}
+
+// A streamed reply, as bytes in and bytes out. Each SSE event is rewritten: `model` becomes the served
+// id; the chunk that carries finish_reason is held until the usage chunk serve asked for arrives, and
+// leaves with usage and timings in it (llama-server's shape: one final chunk with both). A client that
+// asked for include_usage itself gets the usage chunk as OpenAI sends it, with timings added. A reply
+// that is not SSE (loom-serve answered an error as plain JSON) becomes one SSE error event and [DONE].
+class LoomSse {
+public:
+    LoomSse(std::string our_id, bool client_usage, std::function<double()> now_ms)
+        : id_(std::move(our_id)), client_usage_(client_usage), now_(std::move(now_ms)) {}
+
+    std::string feed(const char* data, size_t n) {
+        buf_.append(data, n);
+        std::string out;
+        if (!decided_) {
+            const size_t first = buf_.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos) return out;
+            raw_ = buf_[first] == '{';
+            decided_ = true;
+        }
+        if (raw_) return out;   // a plain JSON body: kept whole for finish()
+        for (size_t end; (end = event_end()) != std::string::npos;) {
+            const size_t sep = buf_.compare(end, 4, "\r\n\r\n") == 0 ? 4 : 2;
+            std::string ev = buf_.substr(0, end);
+            buf_.erase(0, end + sep);
+            out += event(ev);
+        }
+        return out;
+    }
+
+    std::string finish() {
+        std::string out;
+        if (raw_) {
+            json err;
+            try {
+                err = json::parse(buf_);
+            } catch (const std::exception&) {
+                err = json{{"error", {{"message", buf_.substr(0, 400)}, {"type", "loom_output_error"}}}};
+            }
+            buf_.clear();
+            return "data: " + err.dump() + "\n\ndata: [DONE]\n\n";
+        }
+        if (!buf_.empty()) { out += event(buf_); buf_.clear(); }
+        if (held_) { out += emit(*held_); held_.reset(); }
+        return out;
+    }
+
+    bool saw_done() const { return done_; }
+
+private:
+    size_t event_end() const {
+        const size_t a = buf_.find("\n\n"), b = buf_.find("\r\n\r\n");
+        return std::min(a, b);
+    }
+    static std::string emit(const json& j) { return "data: " + j.dump() + "\n\n"; }
+
+    std::string event(const std::string& ev) {
+        // the data lines of one event (usually one); other fields (event:, id:, comments) pass through
+        std::string data, rest;
+        size_t pos = 0;
+        while (pos <= ev.size()) {
+            size_t nl = ev.find('\n', pos);
+            if (nl == std::string::npos) nl = ev.size();
+            std::string line = ev.substr(pos, nl - pos);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("data:", 0) == 0) {
+                std::string v = line.substr(5);
+                if (!v.empty() && v[0] == ' ') v.erase(0, 1);
+                data += (data.empty() ? "" : "\n") + v;
+            } else if (!line.empty()) {
+                rest += line + "\n";
+            }
+            pos = nl + 1;
+        }
+        if (data.empty()) return rest.empty() ? "" : rest + "\n";
+        if (data == "[DONE]") {
+            done_ = true;
+            std::string out;
+            if (held_) { out += emit(*held_); held_.reset(); }
+            return out + rest + "data: [DONE]\n\n";
+        }
+        json j;
+        try {
+            j = json::parse(data);
+        } catch (const std::exception&) {
+            return rest + "data: " + data + "\n\n";
+        }
+        if (!j.is_object()) return rest + "data: " + data + "\n\n";
+        if (j.contains("model")) j["model"] = id_;
+        const bool has_choices = j.contains("choices") && j["choices"].is_array() && !j["choices"].empty();
+        if (has_choices && first_ms_ < 0) {
+            const json& c = j["choices"][0];
+            if (c.contains("delta") && c["delta"].is_object()) {
+                const json& d = c["delta"];
+                for (const char* k : {"content", "reasoning_content"})
+                    if (d.contains(k) && d[k].is_string() && !d[k].get<std::string>().empty()) first_ms_ = now_();
+                if (d.contains("tool_calls")) first_ms_ = now_();
+            }
+        }
+        const bool usage_only = j.contains("usage") && j["usage"].is_object() && !has_choices;
+        if (usage_only) {
+            const json t = loom_timings(j["usage"], first_ms_, now_());
+            if (client_usage_) {
+                j["timings"] = t;
+                std::string out;
+                if (held_) { out += emit(*held_); held_.reset(); }
+                return out + rest + emit(j);
+            }
+            if (held_) {
+                json h = *held_;
+                held_.reset();
+                h["usage"] = j["usage"];
+                h["timings"] = t;
+                return rest + emit(h);
+            }
+            return rest;   // a usage chunk the client did not ask for, with no final chunk to carry it
+        }
+        if (has_choices && !client_usage_ && j["choices"][0].contains("finish_reason") &&
+            !j["choices"][0]["finish_reason"].is_null()) {
+            std::string out;
+            if (held_) out += emit(*held_);
+            held_ = j;
+            return out + rest;
+        }
+        return rest + emit(j);
+    }
+
+    std::string id_;
+    bool client_usage_;
+    std::function<double()> now_;
+    std::string buf_;
+    bool decided_ = false, raw_ = false, done_ = false;
+    double first_ms_ = -1;
+    std::optional<json> held_;
+};
+
+}  // namespace onebit::loom

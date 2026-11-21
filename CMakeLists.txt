@@ -1532,7 +1532,7 @@ if(ONEBIT_LAYA_TYPED_ROOT AND ONEBIT_LAYA_TYPED_GOLDEN)
     add_test(NAME laya_gate_typed_decisions COMMAND laya_gate ${ONEBIT_LAYA_TYPED_ROOT} ${ONEBIT_LAYA_TYPED_GOLDEN})
 endif()
 # engine#3161: this used to default to "" and nothing (not CI, not a default configure) ever set it, so the rows below
-# -- laya_route_e2e, laya_models_e2e, laya_eval_e2e, laya_route_serve, laya_checkpoint, laya_classify -- have never run
+# -- laya_route_e2e, laya_models_e2e, laya_eval_e2e, laya_route_serve, laya_checkpoint -- have never run
 # anywhere. They do not need a GOOD scorer, only a loadable one (tests/laya_models_e2e.sh pins min_confidence 1.01 so
 # every request lands on its default class while Laya is still asked), so the default is now a checkpoint generated at
 # configure time from the head's real tensor names at d=32 -- the same fixture shape tests/laya_finetune_test.py uses,
@@ -1563,9 +1563,13 @@ if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_route_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).
     add_test(NAME laya_checkpoint COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_checkpoint.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
-    # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
-    add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
-             ${CMAKE_SOURCE_DIR}/tests/laya_route_cases.json --min-accuracy 90)
+    # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90% -- against the REAL
+    # head, so it stays behind a real `-DONEBIT_LAYA_ROUTE_MODEL`: the generated fixture cannot reach 90 % accuracy and
+    # a row that fails because its fixture is synthetic teaches nothing about the rail (engine#3161 review).
+    if(NOT ONEBIT_LAYA_ROUTE_MODEL STREQUAL "${CMAKE_BINARY_DIR}/laya-checkpoint")
+        add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
+                 ${CMAKE_SOURCE_DIR}/tests/laya_route_cases.json --min-accuracy 90)
+    endif()
     # `--pm-router laya` end to end without a GPU: the same classifier decides the class of two
     # labelled requests and the engine's table decides whether the PM delegates (docs/pm.md).
     add_test(NAME pm_laya_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_laya_route.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})

@@ -651,6 +651,9 @@ endif()
 # engine#2429: the guard-loss check declares a self-test, so it needs a row -- tests_referenced_check caught
 # this omission on the PR that added the tool, which is the check doing exactly its job.
 add_python_test(guard_loss_check_self ${CMAKE_SOURCE_DIR}/tools/ci/guard_loss_check.py --self-test)
+# engine#3106: the shallow-clone guard those tools ask first. Its arms include a real `git clone --depth 1`, because the
+# whole point is a fact about git that a table cannot establish.
+add_python_test(git_shallow_self ${CMAKE_SOURCE_DIR}/tools/ci/git_shallow.py --self-test)
 # engine#2992: the pre-merge twin of merged_tail_check -- a stale open branch deletes main's newer lines when it
 # merges, and the PR page shows a clean additive diff while it would do so. Self-test wired because
 # tools/ci/tool_selftest_wired_check.py requires a tool that carries one to be named here.

@@ -40,9 +40,12 @@ Usage:
 import argparse
 import json
 import pathlib
+import sys as _sys_shallow; _sys_shallow.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # git_shallow is a sibling module
+import git_shallow  # engine#3106: the shallow-clone guard
 import re
 import subprocess
 import sys
+
 
 HEADING = re.compile(r'^\s{0,3}(#{2,4})\s+(.*?)\s*#*\s*$')
 
@@ -181,6 +184,13 @@ def main(argv):
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
+    # engine#3106: this tool's answer is "nothing was lost", derived from a distance or merge-base that collapses to 0
+    # in a shallow clone (git rev-list returns 0 for a behind branch at the graft). Answer cannot-tell, never a false
+    # "nothing lost" -- measured on pr_branch_stale_check in a --depth 1 clone (engine#3076/#3105).
+    _shallow = git_shallow.probe(a.root)
+    if _shallow:
+        print(f"{__file__.rsplit('/', 1)[-1]}: {_shallow}", file=sys.stderr)
+        return 2
     if not a.base:
         ap.error('--base is required')
     return check(a.root, a.base, a.head)

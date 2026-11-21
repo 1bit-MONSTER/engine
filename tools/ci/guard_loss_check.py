@@ -42,12 +42,15 @@ diagnostic lines were even candidates.
 Known blind spots, named rather than implied: GUARD_KEYWORDS and WARN_KEYWORDS are heuristics, so a
 guard or a diagnostic phrased outside them is invisible; SKIP_DIRS includes tests/, so a guard deleted
 from a test file is not reported (test asserts are usually fixtures, not the product's refusals - a
+
 judgement, not a proof); and a branch that predates a fix on main reverts it at merge without any diff
 here ever containing the line, which is a merge-tree shape this tool cannot see by construction.
 
 Exit: 0 nothing lost (or only moved), 1 a guard's identifiers are gone, 2 cannot tell.
 """
 import argparse, re, subprocess, sys
+import sys as _sys_shallow; _sys_shallow.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # git_shallow is a sibling module
+import git_shallow  # engine#3106: the shallow-clone guard
 
 # engine#2946: `throw` is this tree's refusal idiom in `app/` and `npu/` -- every route-level refusal is
 # `throw std::runtime_error(...)`, not an `assert` or a `GGML_ABORT`. It is both a keyword AND a shape below, because a
@@ -369,6 +372,13 @@ def main():
         return self_test()
     if not a.check:
         ap.error("one of --check or --self-test is required")
+    # engine#3106: this tool's answer is "nothing was lost", derived from a distance or merge-base that collapses to 0
+    # in a shallow clone (git rev-list returns 0 for a behind branch at the graft). Answer cannot-tell, never a false
+    # "nothing lost" -- measured on pr_branch_stale_check in a --depth 1 clone (engine#3076/#3105).
+    _shallow = git_shallow.probe(a.root)
+    if _shallow:
+        print(f"{__file__.rsplit('/', 1)[-1]}: {_shallow}", file=sys.stderr)
+        return 2
     return check(a.root, a.base, a.head, a.strict_warnings)
 
 

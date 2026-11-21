@@ -44,9 +44,12 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import sys as _sys_shallow; _sys_shallow.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # git_shallow is a sibling module
+import git_shallow  # engine#3106: the shallow-clone guard
 import re
 import subprocess
 import sys
+
 
 # The three shapes that create something runnable, and their names. `add_executable` is included because a target without a
 # row is still a build product other rows depend on (`add_dependencies`).
@@ -282,6 +285,13 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     if args.self_test:
         return self_test()
+    # engine#3106: this tool's answer is "nothing was lost", derived from a distance or merge-base that collapses to 0
+    # in a shallow clone (git rev-list returns 0 for a behind branch at the graft). Answer cannot-tell, never a false
+    # "nothing lost" -- measured on pr_branch_stale_check in a --depth 1 clone (engine#3076/#3105).
+    _shallow = git_shallow.probe(args.root)
+    if _shallow:
+        print(f"{__file__.rsplit('/', 1)[-1]}: {_shallow}", file=sys.stderr)
+        return 2
     if not args.base:
         ap.error("--check needs --base")
     return check(pathlib.Path(args.root).resolve(), args.base, args.head)

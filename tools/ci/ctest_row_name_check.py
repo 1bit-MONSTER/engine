@@ -392,7 +392,13 @@ def self_test() -> int:
         subprocess.run(["git", "-C", str(d), "checkout", "-q", "-B", "feature2", "base-if"], check=True)
         (d / ROW_FILE).write_text((d / ROW_FILE).read_text() + "if(ENABLE_Y)\n    add_test(NAME step_users COMMAND true)\nendif()\n")
         subprocess.run(["git", "-C", str(d), "commit", "-qam", "second branch, same name"], check=True)
-        chk(2, check(d, "base-if")[0], "the same name in a different if() branch is cannot-tell, not a red row")
+        got, msgs = check(d, "base-if")
+        chk(2, got, "the same name in a different if() branch is cannot-tell, not a red row")
+        # ...and the MESSAGE must say BOTH sides. The `guarded` rule is an `and`, and this sentence said "at least one
+        # side" for an hour after the rule changed and then again by accident (engine#3247's whole subject): nothing
+        # asserted the text, so only a reviewer reading the emitted string caught it. A prose claim in output is a
+        # claim like any other, and this is the arm that pins it.
+        chk(True, any("BOTH sides" in m for m in msgs), "...and the cannot-tell message says BOTH sides, not 'at least one side'")
 
         # 4d. the namespace is CMakeLists.txt PLUS cmake/tests-*.cmake, both directions (CONTRIBUTING.md sends a
         # family's row to its family file; the glob at the end of CMakeLists.txt include()s them). Measured on the

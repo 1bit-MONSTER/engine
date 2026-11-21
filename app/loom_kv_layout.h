@@ -32,9 +32,10 @@
 // WHY v0.2.0 AND NOT HEAD. A shipped card records the exact toolchain it was built with, and the Qwen3.8-27B card's
 // `llm_config.json`/`info.json` pair names hrx_loom 0.2.0 from PyPI, hrx_system v0.2.0, and its
 // `loom/packaging/python/version.json` names `model-catalog: github:ROCm/hrx-loom-library@v0.2.0` — so the programs a
-// card runs are the tag's, and the tag is what this file is measured against. Upstream HEAD (`cb9ae9e`) is NOT an
-// ancestor of v0.2.0: the lines diverged. Every constant below is identical on both, so the layout reading is stable
-// across the divergence; the packet's word-2 contract is not, and it is described per revision below.
+// card runs are the tag's, and the tag is what this file is measured against. HEAD is not a different branch: `v0.2.0`
+// (`1fd6bd23`) is an ANCESTOR of `cb9ae9e`, 85 commits back (`git rev-list --count 1fd6bd23..cb9ae9e`), so the tag is a
+// subset of HEAD and anything verified at HEAD holds at the tag. The anchor is the tag because a card names it, and the
+// one thing that does NOT hold across the 85 commits is the packet's word-2 contract, described per revision below.
 //
 // CARDINALITY, because the declarations read one short if you take a range as exclusive. model_decode.loom unrolls 16
 // groups of 3 GDN layers + 1 attention layer (`:26-27`), launches gdn ordinals `3*group + {0,1,2}` (`:48-50`) and the
@@ -147,8 +148,11 @@ inline constexpr uint64_t attention_element_index(uint64_t position, uint64_t j,
 // both revisions.
 //
 //   v0.2.0 (the shipped cards): in the PACKET, the samplers read word 2 as the live row count
-//   (kernel/sampling.loom:45,92), as does kernel/output_spans.loom:35, and NOTHING in the library writes it — so it is a
-//   caller-owned convention: whoever fills the packet must store the count.
+//   (kernel/sampling.loom:45,92), as does kernel/output_spans.loom:35, and NOTHING IN THE LIBRARY WRITES THE PACKET'S
+//   EPOCH HEADER at this revision — so it is a caller-owned convention: whoever fills the packet must store the count.
+//   (Word 2 of *other* three-word headers does have writers — kernel/dflash_proposal.loom:108,111 store a selection into
+//   the draft and selection headers — so a grep for `[2]` alone will not settle this; it is the epoch bank's header that
+//   the samplers bound on, and that one is the caller's.)
 //   HEAD (cb9ae9e): `qwen38_packet_compact_prefix` (motif/sequence/qwen3_8/packet.loom, absent at v0.2.0) writes
 //   `[token_count, span_count, output_count]` across words 0/1/2, and the samplers take a `%first` window and bound on
 //   `first + row < word 2` (kernel/sampling.loom:45,93) — an ABSOLUTE output count.

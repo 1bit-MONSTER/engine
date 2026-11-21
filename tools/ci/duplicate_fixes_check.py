@@ -402,6 +402,28 @@ def self_test():
     ok(len(tw2) == 0 and len(nt2) == 1, "... a follow-up touching other files is a NOTE, not a finding")
     old_mp = dict(mp, merged_at="2020-01-01T00:00:00Z")
     tw3, nt3 = mended_twins([op], [old_mp], files_of=lambda n: fmap[n], days=2)
+
+    # engine#3252: the twin message asserts a CLOSURE, so the issue's state decides whether there is one. Measured
+    # live: #3239 merged with `Fixes #3235` at 20:54:45Z and `gh issue view 3235` answered state=OPEN closedAt=null,
+    # while the gate printed "was already closed by #3239".
+    def _state_open(repo, issue):
+        return "open"
+
+    def _state_closed(repo, issue):
+        return "closed"
+
+    def _state_unknown(repo, issue):
+        return None
+
+    row = ('engine', 3235, op, mp, [])
+    so, kept = drop_mended_where_open([row], _state_open)
+    ok(len(so) == 1 and len(kept) == 0,
+       "an issue still OPEN is not mended: the twin becomes a note, with no finding")
+    so, kept = drop_mended_where_open([row], _state_closed)
+    ok(len(so) == 0 and len(kept) == 1, "an issue the merged PR really closed keeps the finding")
+    so, kept = drop_mended_where_open([row], _state_unknown)
+    ok(len(so) == 0 and len(kept) == 1,
+       "cannot-tell about the issue state does NOT clear a red -- an unknown is not a closure either")
     ok(len(tw3) == 0 and len(nt3) == 0, "... and a merge outside the window is not a twin (or a note)")
     # engine#2991/#2993: 'engine#2987: ...' is neither a claim nor a Refs, and the gate said clean on a real pair
     a = {'number': 9101, 'title': 'crash after the skip line', 'body': '**engine#9100: a row that crashed**'}
@@ -618,6 +640,13 @@ def main(argv):
         for issue, group in groups:
             found.append(finding(repo, issue, group))
     allow = read_allow(a.allow or os.path.join(os.path.dirname(os.path.abspath(__file__)), ALLOW_FILE))
+    def _issue_state(repo, issue):
+        try:
+            d = json.loads(gh(f"repos/{OWNER}/{repo}/issues/{issue}") or "{}")
+        except (RuntimeError, json.JSONDecodeError):
+            return None
+        return (d.get("state") or "").lower() or None
+    still_open, mended = drop_mended_where_open(mended, _issue_state)
     for repo, issue, op, mp, shared in mended:
         found.append({'repo': repo, 'issue': issue, 'mended_by': mp['number'],
                       'prs': [{'number': op['number'], 'title': op.get('title') or '',
@@ -632,6 +661,9 @@ def main(argv):
         for issue in stale:
             print(f"duplicate_fixes: allow entry #{issue} is STALE -- no open pair claims it any more "
                   f"({allow[issue]}); delete the line", file=sys.stderr)
+        for repo, issue, op, mp, shared in still_open:
+            print(f"duplicate_fixes: {repo}: merged #{mp['number']} claims #{issue} and the issue is STILL OPEN -- "
+                  f"a claim is not a closure, so #{op['number']} is not a re-do (note, not a finding)", file=sys.stderr)
         for repo, issue, op, mp, shared in mended:
             print(f"{repo}: #{issue} was already closed by #{mp['number']} "
                   f"({(mp.get('merged_at') or '')[:16]}), and open #{op['number']} claims it again")
@@ -775,6 +807,24 @@ def mended_twins(open_prs, merged_prs, files_of=None, days=2):
                 else:
                     notes.append((issue, op, p))
     return twins, notes
+
+
+def drop_mended_where_open(mended, state_of):
+    """Split mended twins by whether the issue is ACTUALLY closed: (still_open, really_mended).
+
+    `mended_twins` compares an open PR's claim with a merged PR's claim and never asks the issue, so this tool
+    printed *"#3235 was already closed by #3239"* while `gh issue view 3235` answered `state=OPEN closedAt=null`
+    (engine#3252, 2026-11-21): one `Fixes #N` that did not close #N is a claim, not a closure. Reported as a
+    duplicate, it tells the open PR's lane its work re-does a fix that does not exist, offers remedies that do not
+    fit ("say `Refs #N` and what differs", "close it"), and reddens the gate for every PR with no PR-side fix.
+
+    `state_of(repo, issue)` returns "open", "closed", or None for cannot-tell -- and only "open" demotes: an
+    unknown state must not clear a red, because the gate's job is to refuse what it cannot see.
+    """
+    still_open, mended_ok = [], []
+    for row in mended:
+        (still_open if state_of(row[0], row[1]) == "open" else mended_ok).append(row)
+    return still_open, mended_ok
 
 
 def clean_line(found, failed):

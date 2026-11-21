@@ -206,7 +206,9 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
     // request with `tools`/`tool_choice` used to be answered as prose -- silently the wrong shape, where the
     // per-op forward emits a real tool_calls. Refused rather than ignored, like the over-context case below.
     if (chat) {
-        const std::string why = npu::private_route_tools_refusal(body, e.id);
+        // engine#3193: which NPU path this model is on decides the sentence, because the two have different
+        // (equally real) reasons and different ways out -- e.priv is set only on the private route.
+        const std::string why = npu::npu_constraint_refusal(body, e.id, e.priv != nullptr);
         if (!why.empty()) {
             res.status = 400;
             res.set_content(json{{"error", {{"message", why}}}}.dump(), "application/json");

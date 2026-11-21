@@ -683,7 +683,7 @@ public:
             ::close(err[1]);
             // detached: a backend stuck in the kernel keeps the pipe open, and serve must still exit
             std::thread([fd = err[0], tail = tail_, on_line = std::move(on_line), learned = learned_port_,
-                         last_line = last_line_ns_, foreign = foreign_ready_] {
+                         last_line = last_line_ns_, foreign = foreign_ready_, own = own_line_] {
                 char buf[4096];
                 for (;;) {
                     const ssize_t n = ::read(fd, buf, sizeof buf);
@@ -701,6 +701,7 @@ public:
                         last_line->store(std::chrono::steady_clock::now().time_since_epoch().count(),
                                          std::memory_order_relaxed);
                         int parsed_port = 0;
+                        if (line.compare(0, 5, "1bit ") == 0) own->store(true, std::memory_order_relaxed);
                         if (parse_backend_ready_port(line, parsed_port)) learned->store(parsed_port);
                         // engine#3130 follow-up: a child that is talking is not the mistake the grace is for.
                         else if (looks_like_foreign_ready(line)) foreign->store(true, std::memory_order_relaxed);
@@ -795,7 +796,7 @@ public:
                 // grace exists for, and it says so at once; (b) a child that has printed NOTHING for the grace is not a
                 // server; (c) a child that is printing lines is loading, and wait_ready's own timeout (900 s for a model
                 // load) is the budget for it -- a number sized for (a) must not kill a 27B mid-load.
-                if (foreign_ready_->load()) {
+                if (foreign_ready_->load() && !own_line_->load()) {
                     std::fprintf(stderr,
                                  "1bit serve: pid %d announced a port in a format `1bit serve` does not print; this launch "
                                  "was given `--port 0`, so the child must report the port it bound (engine#3130)\n",
@@ -892,6 +893,11 @@ private:
     // from a binary that will never print one. Both are written by the detached thread, hence shared and atomic.
     std::shared_ptr<std::atomic<long long>> last_line_ns_ = std::make_shared<std::atomic<long long>>(0);
     std::shared_ptr<std::atomic<bool>> foreign_ready_ = std::make_shared<std::atomic<bool>>(false);
+    // engine#3171: a child that has printed a `1bit ` line IS our own format, whatever else reaches the pipe. A nested
+    // `1bit serve` child tees its own child's lines unchanged, so llama-server's "listening on http://..." arrives in
+    // THIS reader -- and on the `--laya-models` rail, which is the one that launches its child with `--port 0`, that
+    // grandchild line was taken for a foreign backend and the launch was refused while it was working.
+    std::shared_ptr<std::atomic<bool>> own_line_ = std::make_shared<std::atomic<bool>>(false);
     int port_;
     std::string ready_path_;
     std::shared_ptr<LineTail> tail_ = std::make_shared<LineTail>();

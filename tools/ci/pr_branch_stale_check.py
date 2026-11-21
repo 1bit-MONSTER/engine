@@ -127,6 +127,31 @@ def stale_finding(repo_dir, branch, base="origin/main"):
     return behind, reverted, carried, files
 
 
+def merge_conflicts(repo_dir, branch, base="origin/main"):
+    """Paths the merge cannot apply, [] when it applies cleanly, None when the question could not be asked.
+
+    engine#3082: `stale_finding()` returns None both for "level with the base" and for "could not measure", and
+    `--pr` read that None as clean -- so a PR whose merge **conflicts** was reported "merging it removes nothing"
+    and exited 0, which is the one answer a merge-time gate must not give. A conflict is not a cannot-tell: it is
+    the most decisive thing this tool can say about a merge, so it gets its own answer here and its own exit (1).
+    """
+    rc, out, err = run("git", "merge-tree", "--write-tree", base, branch, cwd=repo_dir)
+    if rc == 0:
+        return []
+    if rc == 1 and "CONFLICT" in out:
+        paths = []
+        for line in out.splitlines():
+            if line.startswith("CONFLICT"):
+                for marker in (" in ", " at "):
+                    if marker in line:
+                        p = line.split(marker, 1)[1].strip()
+                        if p and p not in paths:
+                            paths.append(p)
+                        break
+        return paths or ["<conflicted>"]      # a conflict with no named path is still a conflict
+    return None                                # git refused to answer: cannot-tell, never clean
+
+
 def self_test():
     """Arms derived from what `git merge` actually does, not from what a two-dot diff says (engine#2992 review)."""
     ok = True
@@ -225,6 +250,38 @@ def self_test():
     chk(advisory_exit(EXIT_FINDING) == 0, "advisory: a finding is reported and exits 0, so it cannot block another lane's gate")
     chk(advisory_exit(EXIT_CANNOT_TELL) == 77, "advisory: cannot-tell is 77 (a skip), never 0")
     chk(advisory_exit(EXIT_CLEAN) == 0, "advisory: a clean run stays 0")
+    # engine#3082: the case that shipped. Two branches edit the SAME line, so the merge conflicts -- and
+    # `stale_finding()` answers None for that, exactly as it does for a branch level with the base. `--pr` read
+    # that None as clean and exited 0 on a PR that cannot merge. These two arms are the pair that made it silent,
+    # so they are asserted together: the ambiguity is the bug, and `merge_conflicts()` is the way out of it.
+    d, g = repo({"f.txt": "L1\nL2\nL3\n"})
+    g("branch", "other")
+    commit(g, d.name, {"f.txt": "L1\nMAIN\nL3\n"}, "main edits line 2")
+    g("checkout", "-q", "other")
+    pathlib.Path(d.name, "f.txt").write_text("L1\nOTHER\nL3\n")
+    g("commit", "-qam", "branch edits line 2 too")
+    chk(stale_finding(d.name, "other") is None,
+        "engine#3082: stale_finding() is None for a CONFLICTING branch (the ambiguity -- not a pass)")
+    conflicts = merge_conflicts(d.name, "other")
+    chk(conflicts is not None and len(conflicts) > 0,
+        "engine#3082: merge_conflicts() names the conflict, so the caller cannot read it as clean")
+    chk(conflicts is not None and all(isinstance(c, str) and c.strip() for c in conflicts),
+        "engine#3082: the conflicted paths are non-empty strings")
+
+    # And the other half: a branch that DOES merge is not reported as a conflict, so the new answer is not a
+    # blanket "everything conflicts".
+    d, g = repo({"g.txt": "L1\nL2\n"})
+    g("branch", "clean")
+    commit(g, d.name, {"g.txt": "L1\nL2\nL3\n"}, "main appends")
+    g("checkout", "-q", "clean")
+    pathlib.Path(d.name, "h.txt").write_text("h1\n")
+    g("add", "-A"); g("commit", "-qm", "branch adds its own file")
+    chk(merge_conflicts(d.name, "clean") == [], "engine#3082: a branch that merges cleanly returns no conflict")
+
+    # A ref that does not exist is cannot-tell (None), never a conflict and never clean.
+    chk(merge_conflicts(d.name, "no-such-branch") is None,
+        "engine#3082: an unanswerable merge is None, which the callers turn into exit 2")
+
     return 0 if ok else 1
 
 
@@ -259,6 +316,17 @@ def main():
             rc, _o, err = run("git", "fetch", "-q", "origin", ref, cwd=root)
             if rc != 0:
                 cannot_tell(f"cannot fetch {ref.split(':')[0]} (rc {rc}): {err.strip()[:120]}")
+        # engine#3082: ask about the merge ITSELF before asking what it deletes. `stale_finding()` answers None
+        # for a conflict as well as for a clean level branch, and reading that None as clean is how a conflicting
+        # PR came back "removes nothing" with exit 0.
+        conflicts = merge_conflicts(root, f"origin/{branch}", f"origin/{base}")
+        if conflicts is None:
+            cannot_tell(f"cannot measure the merge of {branch} into {base} (git merge-tree gave no answer)")
+        if conflicts:
+            print(f"#{a.pr} {branch}: DOES NOT MERGE into {base} -- {len(conflicts)} conflicted path(s): "
+                  f"{', '.join(conflicts[:3])}{' …' if len(conflicts) > 3 else ''}. Rebase or re-cut before merging",
+                  file=sys.stderr)
+            return EXIT_FINDING
         found = stale_finding(root, f"origin/{branch}", f"origin/{base}")
         if found is None:
             print(f"#{a.pr} {branch}: merging it removes nothing {base} has")
@@ -285,6 +353,17 @@ def main():
         if rc != 0:
             unreadable.append(f"#{n} {branch}: cannot fetch its base {base} ({err.strip()[:80]})")
             print(f"#{n} {branch}: CANNOT READ -- its base {base} could not be fetched", file=sys.stderr)
+            continue
+        # engine#3082: a conflict is a finding, not a clean branch (see merge_conflicts).
+        conflicts = merge_conflicts(root, ref, base_ref)
+        if conflicts is None:
+            unreadable.append(f"#{n} {branch}: cannot measure its merge into {base}")
+            print(f"#{n} {branch}: CANNOT READ -- its merge into {base} could not be measured", file=sys.stderr)
+            continue
+        if conflicts:
+            findings += 1
+            print(f"#{n} {branch}: DOES NOT MERGE into {base} -- {len(conflicts)} conflicted path(s): "
+                  f"{', '.join(conflicts[:3])}{' …' if len(conflicts) > 3 else ''}", file=sys.stderr)
             continue
         f = stale_finding(root, ref, base_ref)
         if f is None:

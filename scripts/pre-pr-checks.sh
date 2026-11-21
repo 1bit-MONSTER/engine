@@ -156,10 +156,10 @@ if [ "${1:-}" = "--self-test" ]; then
     tree=$(bash "$0" --list --tree-only 2>/dev/null | sed 's|^python3 ||')
     nfull=$(printf '%s\n' "$full" | grep -c .)
     ntree=$(printf '%s\n' "$tree" | grep -c .)
-    if [ "$nfull" = 19 ] && [ "$ntree" = 17 ]; then
+    if [ "$nfull" = 20 ] && [ "$ntree" = 18 ]; then
         echo "  [PASS] --list $nfull rows, --list --tree-only $ntree"
     else
-        echo "  [FAIL] --list $nfull rows, --list --tree-only $ntree (want 19 / 17)"
+        echo "  [FAIL] --list $nfull rows, --list --tree-only $ntree (want 20 / 18)"
         fails=$((fails + 1))
     fi
     if [ "$(printf '%s\n' "$full" | grep -cE 'duplicate_fixes_check|pr_branch_stale_check')" = 2 ] &&
@@ -278,6 +278,13 @@ checks=(
     # open PR heads (one spurious hit, fixed by the head-tree search) and on the real llama.cpp#371 diff; exit 2 when
     # it cannot read the refs, so "cannot tell" is never a pass.
     "tools/ci/guard_loss_check.py --check --base $base$strict"
+    # engine#3223: `CMakeLists.txt` is where every lane appends its registration row, so a merged row's NAME is a
+    # namespace nobody reserves. Two lanes fixing one hole each add the same row; the branch rebased second dies in
+    # Configure with `add_test given test NAME "registry_build_self" which already exists` -- measured twice on
+    # 2026-11-21 (engine#3220 against engine#3217's row). Nothing else catches it: the stale check measures
+    # deletions, duplicate_fixes_check groups by issue, and CMake only complains after a push. 2 when the base or the
+    # clone cannot answer, so a shallow clone is cannot-tell rather than a pass.
+    "tools/ci/ctest_row_name_check.py --check --base $base"
     # engine#2416: the HIP add-on's f16 audit over $GPU_KERNELS_DIR (or third_party/gpu-kernels) at the pin; with no
     # tree it exits 77 and is listed as `skip`, never `ok`
     "tools/ci/hip_f16_audit.py --find ."

@@ -45,6 +45,14 @@
 #
 # Inputs (env, all optional): ACCEL_SAMPLER_DIR, SAMPLE_S (2), WINDOW_S (5), MAX_BYTES (50 MB), ACCEL_NODE.
 set -u
+# engine#3072: `DIR=` looks as deliberate as `ACCEL_SAMPLER_DIR=` and does NOTHING, so a smoke run wrote the LIVE summary
+# while the operator believed it went to scratch (measured: a 22 s smoke replaced the fleet's fault summary with a branch's
+# numbers, and `check-deployed` stayed ok because the deployed bytes never changed). Refuse it by name.
+if [ -n "${DIR:-}" ] && [ -z "${ACCEL_SAMPLER_DIR:-}" ]; then
+  echo "accel-sampler: DIR is not a knob -- the sampler reads ACCEL_SAMPLER_DIR. Nothing was written." >&2
+  echo "accel-sampler: use ACCEL_SAMPLER_DIR=<scratch dir> for a smoke run (ACCEL_SAMPLER_LIVE_OK=1 for the live one)." >&2
+  exit 2
+fi
 DIR=${ACCEL_SAMPLER_DIR:-$HOME/.cache/accel-sampler}
 SAMPLE_S=${SAMPLE_S:-2}
 FULL_SCAN_S=${FULL_SCAN_S:-30}   # a full /proc sweep every 2 s cost 62% of a core (measured); holders are long-lived
@@ -205,6 +213,16 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
     && install_sampler "$d/bare/accel_sampler.sh" "$d/bare-installed.sh" >/dev/null 2>&1
   grep -q '^commit=unknown$' "$(provenance_file "$d/bare-installed.sh")" \
     || { echo "FAIL: a source outside any checkout must record commit=unknown"; fail=1; }
+  # engine#3072: `DIR=` is the near-miss -- it looks like a knob and does nothing, so a smoke run silently used the LIVE
+  # directory and replaced the fleet's fault summary with a branch's numbers. It must refuse BY NAME and write nothing.
+  mkdir -p "$d/wrongknob"
+  knob_out=$(DIR="$d/wrongknob" bash "$0" sample 2>&1); knob_rc=$?
+  [ "$knob_rc" = 2 ] || { echo "FAIL: DIR= gave rc $knob_rc, want 2: it is not a knob and the run must refuse (engine#3072)"; fail=1; }
+  case "$knob_out" in
+    *"DIR is not a knob"*) ;;
+    *) echo "FAIL: a refused DIR= run must NAME the variable it wants; said: $knob_out"; fail=1 ;;
+  esac
+  [ -s "$d/wrongknob/samples.log" ] && { echo "FAIL: a refused DIR= run wrote samples anyway"; fail=1; }
   # ask 1 on #2815: `check-deployed` with no argument must look at the DEPLOYED copy, not at the checkout it was run from.
   # ask 1 on #2815 needs an arm that DISCRIMINATES the two paths: a provenance-less copy is rc 2 either way, so the arm
   # that pins the fix is one where the deployed copy is valid and `$0` is not. Reverting the default to `$0` fails these.
@@ -365,6 +383,32 @@ check_deployed() {  # check-deployed [dest] -- rc 0 the deployed copy is the byt
   fi
   echo "check-deployed: ok $dest sha256 $sha_actual commit $(sed -n 's/^commit=//p' "$prov")"
 }
+
+# engine#3072: a run that resolves to the unit's own directory overwrites what the fleet reads. NOT called by `selftest`,
+# which writes only under its own mktemp dir ($DIR/selftest.XXXXXX) and is the instrument's own verification -- gating it
+# would stop the tool from checking itself on the box where it matters (engine#3069).
+live_dir_guard() {
+  # The unit itself runs exactly this file from the live directory with no variables set, so a guard refusing every writer
+  # of $DIR would stop the fleet's summary from ever being refreshed. `INVOCATION_ID` is systemd's marker for "started by a
+  # unit" and "$0 under $DIR" is that unit's ExecStart; both, and only that pair, pass.
+  local is_the_unit=0
+  if [ -n "${INVOCATION_ID:-}" ] && [ "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")" = "$DIR/accel-sampler.sh" ]; then
+    is_the_unit=1
+  fi
+  if [ -z "${ACCEL_SAMPLER_LIVE_OK:-}" ] && [ "$is_the_unit" = 0 ] && [ "$DIR" = "$HOME/.cache/accel-sampler" ] &&
+     systemctl --user is-active --quiet accel-sampler.service 2>/dev/null; then
+    echo "accel-sampler: DIR resolves to the LIVE directory ($DIR) and accel-sampler.service is active -- refusing to write it." >&2
+    echo "accel-sampler: use ACCEL_SAMPLER_DIR=<scratch dir>, or set ACCEL_SAMPLER_LIVE_OK=1 if you mean the live one." >&2
+    return 2
+  fi
+  return 0
+}
+
+# the modes that WRITE into $DIR (samples, attribution, or the summary the unit publishes); `selftest` writes only under its
+# own mktemp dir and `holders`/`check-deployed` write nothing there.
+case "${1:-both}" in
+  sample|watch|both|summary) live_dir_guard || exit $? ;;
+esac
 
 case "${1:-both}" in
   sample) sample_once ;;

@@ -18,8 +18,9 @@
 The registry files are append-mostly: a class in `registry/significant.json` is a reviewed decision, and a
 counter in `registry/census.json` is a measurement. Neither is ever meant to lose a row because a branch was
 cut before the row landed. `tools/registry_build.py --check-gaps` cannot see that: it iterates the classes
-that are *present* and reports "none of the 41 reviewed significant classes is mapped without a reason",
-which is equally true of a file with 41 classes and one with 40.
+that are *present* and reports "none of the N reviewed significant classes is mapped without a reason",
+which is equally true of a file with 51 classes and one with 50. (The N is written as N here on purpose: an
+earlier revision of this line named a literal, and it was two reviews out of date the next time anyone read it.)
 
 Measured on engine#2021 (`ac36bd0`): main has 23 `*ForCausalLM` classes and the branch 22, `Skylar2` is gone
 from both `registry/significant.json` (2 mentions -> 0) and `tests/census_watch_test.py` (5 -> 0), and

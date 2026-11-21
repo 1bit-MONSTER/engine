@@ -336,6 +336,23 @@ with open(os.path.join(ROOT, "docs", "arch-gaps.md")) as f:
 check("reviewed non-alias classes are documented",
       all(cls in gap_docs for cls in reviewed_gaps)
       and "not an alias" in gap_docs)
+
+# 13b. The engine#3181 arrivals. `family` is deliberately NOT compared to a literal here: the entries carry the
+# measurements (tensor names, config keys, an upload's byte count), so a copy of that prose in this file would make
+# a wording edit break a test -- two copies of one fact. What is asserted is the thing the census acts on: the class
+# is recorded with a reason, stays out of the runtime registry, and is REPORTED rather than ALERTED.
+for cls, model_type in (("Edge0ForCausalLM", "qwen4_exp_text"),
+                        ("Inkling2LoopForConditionalGeneration", "inkling2_loop"),
+                        ("SageLmForCausalLM", "sagelm"),
+                        ("VantageTitanForCausalLM", "vantage-titan")):
+    entry = sig.get(cls, {})
+    check(f"{cls} is recorded as reviewed, not an alias",
+          entry.get("model_type") == model_type and entry.get("watch") == "report"
+          and len(entry.get("family") or "") > 100 and cls not in archs)
+    rc, res = rc_of([model(f"reviewed/{model_type}", cls)], archs, sig)
+    check(f"{cls} is reported, not alerted",
+          rc == 0 and res["reviewed_report"] == [cls] and res["significant"] == []
+          and res[cw.UNCOVERED] == [f"reviewed/{model_type}"])
 # engine#2014 review: the list above is hand-written and names three classes, so it keeps covering those three
 # while the file it is about grows (37 entries today) -- a fourth, fifth and thirty-seventh class can be added
 # with no row in docs/arch-gaps.md and this file stays green. significant.json's own `about` says its classes

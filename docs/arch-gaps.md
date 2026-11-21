@@ -1369,3 +1369,83 @@ of the `HYV4Flash` family above, and it is **not a generative architecture at al
 Reported, not alerted (`"watch": "report"`, `registry/significant.json`). The checkpoint is an INT8 W8A8/GS128
 re-wrap of a draft that needs a target we do not serve, so there is nothing here to measure even if the graph
 existed.
+
+## 2026-11-21: `qwen4_exp_text` (`Edge0ForCausalLM`) — reviewed, not an alias at this pin (engine#3181)
+
+* **Class / model_type**: `Edge0ForCausalLM` / `qwen4_exp_text`; example
+  `andynoodles/Edge0-145B-NVFP4-vLLM`.
+* **Shape**: 48 layers, hidden 2560, 24 heads / 2 kv heads, head_dim 128,
+  512 experts, vocab 248320, ctx 262144, with `layer_types` and the
+  `linear_*` dims. Shipped as an NVFP4 repack with its own quant config
+  (`quant_method: edge0`, `dense_format: ggml_q8_0`).
+* **This one looks like an alias and is not**: `model_type` is literally the
+  qwen4exp trunk, which the engine serves (`Qwen4ExpForCausalLM` →
+  `qwen4exp`, hrx). What makes the class un-mappable at `3514f3a84` is in the
+  weights, not the config: every layer of the repo's 7673-tensor index carries
+  `attn_hyper_connection.{hc_norm, block_inject_weight, input_mix_weight_up,
+  input_mix_weight_down}`, and `conversion/qwen4exp.py` knows hyper connections
+  only on the **MTP head** (`hyper_connection_mixer` → `nextn_hc_head`). It
+  never matches those per-layer names, so mapping the class would load the
+  trunk and silently drop the hyper-connection path on all 48 layers — the
+  substitution this page exists to prevent, not a crash.
+* **Why it is not mapped**: the pin registers no `Edge0ForCausalLM` converter
+  class (`grep -c Edge0` over the whole tree at `3514f3a84085` is 0), so
+  `tools/registry_build.py` has nothing to map from.
+* **What real support requires**: registering the class *and* teaching the
+  converter and the graph the per-layer `attn_hyper_connection` branch. The pin
+  already writes `hyper_connection.*` KVs (`src/llama-model-saver.cpp`, from the
+  dsv4 path), so the plumbing exists — the per-layer hc tensors are what is
+  missing. That is engine work, not a one-line alias.
+
+## 2026-11-21: `inkling2_loop` (`Inkling2LoopForConditionalGeneration`) — reviewed, not an alias (engine#3181)
+
+* **Class / model_type**: `Inkling2LoopForConditionalGeneration` /
+  `inkling2_loop`; example `shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB`
+  (5 models from 4 uploaders in the 2026-11-21 census).
+* **Shape**: an NVFP4 (`modelopt`) vision+text+MTP wrapper — the config carries
+  `text_config`, `vision_config` and `mtp_config`. The text trunk
+  (`inkling2_loop_text`) is hidden 2304, 24 layers, 24 heads / 8 kv heads,
+  head_dim 128, vocab 201024, 1M ctx.
+* **Keys no pinned arch has**: `d_rel` 16, `rel_extent` 1024,
+  `log_scaling_n_floor` 8192 (a relative-position scheme with a logarithmic
+  scaling floor), plus the MTP head.
+* **Why it is not mapped**: `gguf-py/gguf/constants.py` at `3514f3a84085` has
+  169 arch names and none contains `inkling` or `loop`; there is no
+  `conversion/` module and no registered class, so neither the wrapper nor the
+  trunk has anything to map to.
+* **What real support requires**: a relative-position path of its own, then the
+  vision projector and the MTP head — an engine feature set, not a registry
+  edit.
+
+## 2026-11-21: `sagelm` (`SageLmForCausalLM`) — reviewed, and the upload has no weights (engine#3181)
+
+* **Class / model_type**: `SageLmForCausalLM` / `sagelm`; example
+  `SOTAagi2030/SageLM-Support-7B-v2`.
+* **What is actually uploaded**: `model.safetensors` is **672 bytes** — a
+  152-byte safetensors header naming only `model.embed_tokens.weight` and
+  `lm_head.weight`, with no data region behind it, and the Hub's `usedStorage`
+  is the same 672 bytes. The config claims hidden 4096, 32 layers, 32 heads /
+  8 kv heads, vocab 152064, tied embeddings — none of which is in the file.
+* **Why it is not mapped**: there is no trunk to convert or to compare against a
+  served family, and the pin has no `sagelm` arch, `conversion/` module or
+  registered class.
+* **Review condition**: re-review when an upload carries layer 0..31. Until
+  then a mapping would advertise support for an empty container, and a shape
+  match from `config.json` alone would be a claim about tensors nobody has
+  published.
+
+## 2026-11-21: `vantage-titan` (`VantageTitanForCausalLM`) — reviewed, not an alias (engine#3181)
+
+* **Class / model_type**: `VantageTitanForCausalLM` / `vantage-titan`; example
+  `Anh1hoa/VANTAGE-TITAN-1`.
+* **Shape**: hidden 4096, 64 heads / 8 kv heads, head_dim 128, intermediate
+  11008, ctx 2097152, dynamic rope factor 32 — and **no `num_hidden_layers` key
+  at all**, so even the layer count is absent from the config.
+* **Keys that define the architecture**: `holographic_state_dim` 1024,
+  `kv_cache_quantization: "2-bit-ternary-tla"`, `zero_multiply_gemm: true`,
+  `latent_dim` 512, plus a non-standard `architect` / `version` block.
+* **Why it is not mapped**: the pin has no `vantage` or `titan` architecture, no
+  `conversion/` module and no registered class; nothing in `llama_model_mapping`
+  could build a graph for a holographic state or a ternary KV cache.
+* **What real support requires**: new kernels for the holographic state and the
+  2-bit ternary KV path before a converter is even meaningful.

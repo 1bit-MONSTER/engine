@@ -8,7 +8,7 @@
    "with_architecture": "models whose HF card names an architecture this census can look up; models with no architecture are excluded from every percentage above"
   },
   "declined_models": 478,
-  "declined_architectures": 26,
+  "declined_architectures": 30,
   "models": 440583,
   "with_architecture": 346341,
   "architectures_seen": 3083,

@@ -231,6 +231,33 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
   printf '%s\n' '1795195844.0 host kernel: nvme 0000:c4:00.0: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0015 address=0x64e44000 flags=0x0000]' \
     | grep -qE "$FAULT_RE" \
     || { echo "FAIL: widening the stream dropped the NVMe page-fault class it used to carry"; fail=1; }
+  # One line per class the GATE acts on, because the NVMe line above is the sampler's own extra and proves nothing about
+  # them: a GPU take refused for a gfxhub fault or a ring timeout is exactly the case this record is asked about.
+  printf '%s\n' \
+    '1795195850.0 host kernel: amdgpu 0000:0c:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:6)' \
+    '1795195851.0 host kernel: amdgpu 0000:0c:00.0: amdgpu: GPU reset begin!' \
+    '1795195852.0 host kernel: amdgpu 0000:0c:00.0: ring gfx_0.0.0 timeout' \
+    > "$d/gpu.txt"
+  [ "$(grep -cE "$FAULT_RE" "$d/gpu.txt")" = 3 ] \
+    || { echo "FAIL: a fault class the gate refuses on does not reach the stream (gfxhub page fault / amdgpu reset / ring timeout)"; fail=1; }
+  # ... and the superset property STRUCTURALLY, read out of the gate rather than trusted: every alternative in its
+  # GPU_FAULT_RE must appear verbatim in FAULT_RE, so a class added to the gate fails this arm until the sampler has it.
+  gate_src=$(dirname "$(dirname "$(dirname "${BASH_SOURCE[0]:-$0}")")")/scripts/gpu-hold
+  if [ -r "$gate_src" ]; then
+    gate_re=$(sed -n "s/^GPU_FAULT_RE='\(.*\)'$/\1/p" "$gate_src")
+    if [ -n "$gate_re" ]; then
+      while IFS= read -r alt; do
+        case "$FAULT_RE" in
+          *"$alt"*) ;;
+          *) echo "FAIL: the gate refuses on '$alt' and FAULT_RE does not carry it -- the superset claim is false"; fail=1 ;;
+        esac
+      done < <(printf '%s\n' "$gate_re" | tr '|' '\n')
+    else
+      echo "SKIP: no GPU_FAULT_RE line found in $gate_src, so containment was not checked"
+    fi
+  else
+    echo "SKIP: $gate_src is not readable (a deployed copy has no gate beside it), so containment was not checked"
+  fi
   # ... and the device split still names amdxdna for a TDR line, through the same token the summary's awk reads.
   printf '1795195843\t-\t-\t-\t-\t-\t1795195843.4 host kernel: amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_tdr_dead_fw_detect: TDR timeout detected\n' > "$d/dev/attributed.log"
   SAMP=$d/dev/samples.log ATTR=$d/dev/attributed.log DIR=$d/dev summary > /dev/null 2>&1
@@ -242,14 +269,22 @@ selftest() {  # prove the correlation before an event needs it: the window, the 
 }
 
 # WHICH LINES REACH THE FAULT STREAM. This instrument exists to say whether a fault is inside a window, so its pattern
-# must be a SUPERSET of the one the gate refuses takes on (`scripts/gpu-hold` GPU_FAULT_RE: page fault, amdgpu/MES reset,
-# `power-cycling NPU`, amdxdna command timeout) -- it may record a line the gate ignores, never miss one the gate acts on.
+# must be a SUPERSET of the one the gate refuses takes on: it may record a line the gate ignores, never miss one the gate
+# acts on. So the gate's five alternatives (`scripts/gpu-hold` GPU_FAULT_RE) are copied here VERBATIM and first -- a
+# `[gfxhub]` page fault, an `amdgpu` reset/hang, a ring timeout, an MES reset/failure, an amdxdna command-timeout,
+# power-cycle or fault -- and the sampler's own extras follow. Verbatim matters: the self-test reads that pattern out of
+# the gate and asserts each of its alternatives appears in this line, so a class added to the gate fails the arm until the
+# sampler carries it, instead of the two lists agreeing by luck (the #3042 shape: several readers, one of them wrong).
+# The gate's SKIP list is deliberately NOT shared: it exists to stop one reset counting many times, and a recorder keeps
+# the lines. Consequence, stated because it is real: `attributed faults:` counts matching LINES, so an amdgpu reset that
+# re-logs ~20 stack frames now counts ~20. Grouping those into events is a change to the summary; importing the skip would
+# silently drop the TDR lines this pattern exists to add.
 # It used to grep `IO_PAGE_FAULT` alone. Measured 2026-11-20 on strixhalo: an NPU TDR + power-cycle at 18:10:43 AST
 # (22:10:43Z) logged four lines (`aie2_tdr_dead_fw_detect: TDR timeout detected`, `aie2_tdr_work_func`, ...`recover_all:
 # ... power-cycling NPU`, `aie2_hw_reset: NPU firmware unhealthy: power-cycling NPU`) while this sampler was RUNNING, and
 # none of them matched: attributed.log gained nothing and the summary for that window read clean. The device split below
 # needed no change -- a TDR line's token after `kernel: ` is still `amdxdna`, which is the token the awk reads.
-FAULT_RE='IO_PAGE_FAULT|aie2_tdr|aie2_hw_reset|amdxdna.*(command timeout|power.?cycl(e|ing)|fault)|MES.*(reset|failure|failed to respond)'
+FAULT_RE='\[gfxhub\] page fault|amdgpu.*(reset|hang)|ring .*timeout|MES.*(reset|failure|failed to respond)|amdxdna.*(command timeout|power.?cycl(e|ing)|fault)|IO_PAGE_FAULT|aie2_tdr|aie2_hw_reset'
 
 watch_faults() {  # correlate each fault with the samples around it
   local line ts lo hi hits

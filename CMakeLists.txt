@@ -1139,6 +1139,14 @@ target_include_directories(loom_kv_layout_test PRIVATE app)
 # same gap npu_partition_test documents at the top of this file. Header-only, so it needs no device and no Loom.
 add_dependencies(onebit loom_kv_layout_test)
 add_test(NAME loom_kv_layout COMMAND loom_kv_layout_test)
+# engine#3157 (L4), part 2: how the handover is DRIVEN -- the per-epoch chunking the card's config contract forces
+# (llm.spans/llm.tokens range 1..8192) and the control words that carry the absolute position between epochs
+# (app/loom_epoch_driver.h). Header only, no device, no Loom; the same dependency line as the layout test, because ci.yml
+# builds `onebit` and an add_test alone never reaches ctest there.
+add_executable(loom_epoch_driver_test tests/loom_epoch_driver_test.cpp)
+target_include_directories(loom_epoch_driver_test PRIVATE app)
+add_dependencies(onebit loom_epoch_driver_test)
+add_test(NAME loom_epoch_driver COMMAND loom_epoch_driver_test)
 # engine #390's load-time placement report and --strict-device (app/serve_metrics.h, docs/serve.md
 # "Off-HRX placement"): the backend's placement line in, serve's line and the refusal out; header
 # only, no GPU, no backend.

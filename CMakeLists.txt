@@ -655,6 +655,9 @@ add_python_test(guard_loss_check_self ${CMAKE_SOURCE_DIR}/tools/ci/guard_loss_ch
 # merges, and the PR page shows a clean additive diff while it would do so. Self-test wired because
 # tools/ci/tool_selftest_wired_check.py requires a tool that carries one to be named here.
 add_python_test(pr_branch_stale_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_branch_stale_check.py --self-test)
+# engine#3131: `--tree-only` is the mode a CI job would gate on, so its contract gets a row: exactly the two open-PR-set
+# rows are skipped, by name, and the skips are counted. A rename is the way this silently stops being safe.
+add_test(NAME pre_pr_checks_tree_only COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pre_pr_checks_tree_only_test.sh)
 # engine#2445 review: and the flag itself must be load-bearing -- a row that ran the tool but
 # dropped the child's status would stay green while both arms above went red. Measured with a
 # scratch tree whose test file exits 1 (status dropped -> 0 vs 0), and with the flag ignored.

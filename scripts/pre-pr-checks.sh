@@ -40,11 +40,17 @@ usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
 base=origin/main
 strict=""
 list_only=0
+tree_only=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --base) base=${2:-}; shift 2 || { usage >&2; exit 2; } ;;
         --base=*) base=${1#--base=}; shift ;;
         --list) list_only=1; shift ;;
+        # engine#3131: two rows answer a question about the OPEN-PR QUEUE, not about this branch. Run as a required
+        # check they turn every PR red for a condition no author can fix (measured: `duplicate_fixes_check --gate` was
+        # red for an hour tonight while three PRs each claimed one issue). `--tree-only` skips exactly those two and
+        # PRINTS the skip, so the summary still says what did not run.
+        --tree-only) tree_only=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "pre-pr-checks: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
     esac
@@ -163,8 +169,19 @@ git rev-parse --verify -q "$base^{commit}" >/dev/null || {
 }
 
 ok=0; failed=0; skipped=0; detail=""
+# The rows that read the open-PR set (engine#3131). Named here, not guessed from their flags: a row that starts
+# touching the API must be added by hand, which is the point -- this list is the claim "--tree-only is safe".
+open_pr_rows="tools/ci/duplicate_fixes_check.py tools/ci/pr_branch_stale_check.py"
 for c in "${checks[@]}"; do
     name=${c%% *}
+    if [ "$tree_only" = 1 ]; then
+        for r in $open_pr_rows; do
+            if [ "$name" = "$r" ]; then
+                printf 'skip  %-42s tree-only: this row reads the open-PR set\n' "$name"
+                skipped=$((skipped + 1)); continue 2
+            fi
+        done
+    fi
     out=$(python3 $c 2>&1); rc=$?
     last=$(printf '%s\n' "$out" | grep -v '^$' | tail -1)
     if [ $rc -eq 77 ]; then

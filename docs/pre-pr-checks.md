@@ -22,7 +22,7 @@ Every command below, all host-side, none needing a device or a build. Every one 
 Run them from the repository root on the branch you are about to hand over.
 
 **`scripts/pre-pr-checks.sh` runs every command in the table below**, one line each (`--base <ref>` for the registration check, `--list` to see the
-commands; a check that cannot run says `skip` and why, and an unresolvable `--base` is a usage error rather than a skip). One further check is an **author's check**, true or false exactly once — when you add a page — so it is not in the runner, and the section
+commands; a check that cannot run says `skip` and why, and an unresolvable `--base` is a usage error rather than a skip). **`--tree-only`** runs the same list minus the two rows that read the **open-PR queue** (`duplicate_fixes_check --gate`, `pr_branch_stale_check --advisory`) and prints them as counted skips: those two answer a question about other lanes' branches, so run as a required check they turn every PR red for a condition no author can fix — this is the mode a CI job can gate on, and `tests/pre_pr_checks_tree_only_test.sh` pins that it skips exactly those two, by name (engine#3131). One further check is an **author's check**, true or false exactly once — when you add a page — so it is not in the runner, and the section
 below says why. The table's order is the runner's order: cheapest and most common first, and last the checks that need a revision (`--base`) or a fetched tree.
 
 | command | red means |

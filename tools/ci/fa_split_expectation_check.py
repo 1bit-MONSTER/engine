@@ -34,6 +34,7 @@ A check that only looked at one side would pass in both of those states, which i
 Exit: 0 the expectation is satisfiable, 1 one side is missing (named), 2 cannot tell (a file this needs is absent).
 """
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -76,6 +77,47 @@ DISPATCH_PATH = Path("ggml/src/ggml-hrx/dispatch_registration/common/dispatch-fl
 # decision the tuple used to make by omission -- and a listed file that stops naming the kernel fails below, because
 # an exemption that outlived its field is indistinguishable from a reviewed one.
 NAMES_WITHOUT_FIXTURE = ("tests/hrx-loom-jit-test.cpp", "tests/test-hrx-loom-jit.cpp")
+# engine#3085: `fa_decode_split.1.3008` exists to be the SMALLEST 64-token multiple past the decode-split cap, and it
+# asserts the general kernel -- i.e. it is the only row that proves the fallback is reachable. Its premise is a join of
+# the row's literal and the cap inside the matcher (`ceil_div(mask->ne[0], 64) * 64 > kDecodeSplitMaxKeyValueTokenCapacity`,
+# dispatch-flash-attention.cpp:382-383), so a cap move turns it into an ordinary split row that still passes, and nothing
+# pins the fallback any more. Measured 11-21 at pin 5abb405c7: cap 2944 = 46*64, so 3008 = 47*64 is the boundary.
+CAP_RE = re.compile(r"kDecodeSplitMaxKeyValueTokenCapacity\s*=\s*(\d+)")
+ROW_RE = re.compile(r'"fa_decode_split\.(\d+)\.(\d+)"\s*,\s*\[=\]\s*\{\s*'
+                    r"run_qwen_decode_split_flash_attention_scheduling_case\((\d+)\s*,\s*(\d+)\s*\)")
+
+
+def fallback_cap(root: Path):
+    """(failures, cannot_tell) for the row that must sit exactly one 64-block past the split cap."""
+    try:
+        cap_text = _flat((root / DISPATCH_PATH).read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return [], f"no {root / DISPATCH_PATH} (the fallback row's premise is the cap in that file)"
+    cap_match = CAP_RE.search(cap_text)
+    if cap_match is None:
+        return [], f"no kDecodeSplitMaxKeyValueTokenCapacity in {DISPATCH_PATH} (the cap moved or was renamed)"
+    cap = int(cap_match.group(1))
+    try:
+        rows = ROW_RE.findall(_flat((root / TEST_PATHS[1]).read_text(encoding="utf-8", errors="replace")))
+    except OSError:
+        return [], f"no {root / TEST_PATHS[1]} (the fallback row lives there)"
+    if not rows:
+        return [("fallback", f"{TEST_PATHS[1]} registers no fa_decode_split.<q>.<kv> row: nothing pins the general "
+                             "fallback any more (engine#3085)")], None
+    failures = []
+    for named_q, named_kv, call_q, call_kv in rows:
+        if named_q != call_q or named_kv != call_kv:
+            failures.append(("fallback", f"fa_decode_split.{named_q}.{named_kv}: the row's NAME disagrees with the "
+                                          f"case it calls ({call_q}, {call_kv}), so neither can be trusted"))
+    biggest = max(int(r[3]) for r in rows)
+    smallest_past_cap = (cap // 64 + 1) * 64
+    if biggest <= cap:
+        failures.append(("fallback", f"the largest fa_decode_split row is kv={biggest}, at or below the split cap {cap}: "
+                                      f"it selects the split kernel, so NO row pins the general fallback (engine#3085)"))
+    elif biggest != smallest_past_cap:
+        failures.append(("fallback", f"the largest fa_decode_split row is kv={biggest}; the smallest 64-multiple past "
+                                      f"the cap {cap} is {smallest_past_cap} -- move the row (or the cap moved under it)"))
+    return failures, None
 
 
 def suites(root: Path):
@@ -145,7 +187,10 @@ def check(root: Path):
         failures.append(("matcher", "the test expects the split kernel and the matcher no longer compares storage "
                                     "against the padded capacity, so it may claim a walk past the binding (the fault "
                                     "#418 removed)"))
-    return failures, None
+    fallback_failures, fallback_why = fallback_cap(root)
+    if fallback_why is not None:
+        return [], fallback_why
+    return failures + fallback_failures, None
 
 
 def self_test() -> int:
@@ -159,7 +204,14 @@ def self_test() -> int:
         if not ok:
             fails += 1
 
-    def build(tmp, test_text, guard: bool):
+    def fallback_row(kv: int, name_kv: int = -1, cap: int = 2944):
+        """The pair the #3085 check reads: the cap in the matcher, and the row that has to sit one block past it."""
+        named = kv if name_kv < 0 else name_kv
+        return (f'static constexpr int64_t kDecodeSplitMaxKeyValueTokenCapacity = {cap};\n',
+                f'add(suite, "fa_decode_split.1.{named}",\n'
+                f'    [=] {{ run_qwen_decode_split_flash_attention_scheduling_case(1, {kv}); }});\n')
+
+    def build(tmp, test_text, guard: bool, cap_text=None, rows_text=None):
         root = tmp / f"r{len(list(tmp.iterdir()))}"
         (root / TEST_PATH.parent).mkdir(parents=True)
         (root / DISPATCH_PATH.parent).mkdir(parents=True)
@@ -168,7 +220,11 @@ def self_test() -> int:
         # dropped the key one (measured 11-20 by deleting each in turn from a copy of the fork's dispatch file)
         g = ("if (key->ne[1] < match.key_value_capacity) { return {}; }\n"
              "if (value->ne[1] < match.key_value_capacity) { return {}; }\n") if guard else "// no storage guard\n"
-        (root / DISPATCH_PATH).write_text("namespace { void f() {\n" + g + "} }\n", encoding="utf-8")
+        default_cap, default_rows = fallback_row(3008)
+        (root / DISPATCH_PATH).write_text("namespace { void f() {\n" + g + "} }\n"
+                                          + (default_cap if cap_text is None else cap_text), encoding="utf-8")
+        # the suite that carries the fallback row, so a tree is only "clean" when BOTH halves of #3085's join hold
+        (root / TEST_PATHS[1]).write_text(default_rows if rows_text is None else rows_text, encoding="utf-8")
         return root
 
     expecting = f'require_kernel_subsequence(s, {{ "{SPLIT}" }});\n'
@@ -196,7 +252,9 @@ def self_test() -> int:
         (half / TEST_PATH).write_text(padded, encoding="utf-8")
         (half / DISPATCH_PATH.parent).mkdir(parents=True)
         (half / DISPATCH_PATH).write_text(
-            "namespace { void f() {\nif (key->ne[1] < match.key_value_capacity) { return {}; }\n} }\n", encoding="utf-8")
+            "namespace { void f() {\nif (key->ne[1] < match.key_value_capacity) { return {}; }\n} }\n"
+            + fallback_row(3008)[0], encoding="utf-8")
+        (half / TEST_PATHS[1]).write_text(fallback_row(3008)[1], encoding="utf-8")
         got, _ = check(half)
         arm("a matcher that kept the key guard and dropped the value one is a FAILURE",
             [s for s, _ in got] == ["matcher"], str(got))
@@ -233,10 +291,42 @@ def self_test() -> int:
         live = build(tmp, padded, guard=True)
         for rel in TEST_PATHS[1:]:
             (live / rel).write_text(padded, encoding="utf-8")
+        # ...and the fallback row is part of a clean tree now (engine#3085), so put it back
+        (live / TEST_PATHS[1]).write_text(padded + fallback_row(3008)[1], encoding="utf-8")
         for rel in NAMES_WITHOUT_FIXTURE:
             (live / rel).write_text(f'x("{SPLIT}");\n', encoding="utf-8")
         got, why = check(live)
         arm("the three pinned suites plus the two listed LoomJIT files are clean", got == [] and why is None, str(got))
+
+        # engine#3085: the fallback row's premise is a JOIN of the row's literal and the cap inside the matcher. Each arm
+        # moves ONE side, so a check that read only one of them passes none of these.
+        cap_ok, rows_ok = fallback_row(3008)
+        got, why = check(build(tmp, padded, guard=True, cap_text=cap_ok, rows_text=rows_ok))
+        arm("the fallback row sits exactly one 64-block past the cap", got == [] and why is None, str(why or got))
+
+        _cap, rows_at = fallback_row(2944)             # the row is AT the cap, so it selects the split kernel
+        got, _ = check(build(tmp, padded, guard=True, rows_text=rows_at))
+        arm("a fallback row at or below the cap is a FAILURE naming the row",
+            [s for s, _ in got] == ["fallback"] and any("NO row pins the general fallback" in w for _, w in got), str(got))
+
+        cap_moved, rows_keep = fallback_row(3008, cap=2500)   # the cap moved under the row: 2500 -> 2560 is the boundary
+        got, _ = check(build(tmp, padded, guard=True, cap_text=cap_moved, rows_text=rows_keep))
+        arm("a cap that moved under the row is a FAILURE naming the new boundary",
+            [s for s, _ in got] == ["fallback"] and any("2560" in w for _, w in got), str(got))
+
+        disagree = ('add(suite, "fa_decode_split.1.3008",\n'
+                    '    [=] { run_qwen_decode_split_flash_attention_scheduling_case(1, 2944); });\n')
+        got, _ = check(build(tmp, padded, guard=True, rows_text=disagree))
+        arm("a row whose name disagrees with the case it calls is a FAILURE",
+            any("disagrees" in w for _, w in got), str(got))
+
+        got, _ = check(build(tmp, padded, guard=True, rows_text="// no fallback row here\n"))
+        arm("a suite with no fallback row is a FAILURE, not a vacuous pass",
+            [s for s, _ in got] == ["fallback"] and any("registers no" in w for _, w in got), str(got))
+
+        got, why = check(build(tmp, padded, guard=True, cap_text="// the cap constant was renamed away\n"))
+        arm("a tree without the cap constant is cannot-tell, not a pass",
+            got == [] and why is not None and "kDecodeSplitMaxKeyValueTokenCapacity" in why, str(why))
 
         empty = tmp / "empty"
         (empty / TEST_PATH.parent).mkdir(parents=True)
@@ -249,7 +339,6 @@ def self_test() -> int:
 
     print("self-test ok" if not fails else f"self-test FAILED ({fails})")
     return 0 if not fails else 1
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])

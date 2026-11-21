@@ -32,3 +32,4 @@ test-kv-zero                           # Subprocess aborted -- main
 test-llama-archs                       # Failed -- main
 test-llama-context                     # SEGFAULT -- main behavior backend
 test-tokenizers-ggml-vocabs            # Failed -- behavior
+hrx_backend_get_rows_capacity        # Failed -- hrx; the hrx_build runner's HRX runtime does not initialise there (`hrx_gpu_initialize(0) failed ... symbol 'hsa_amd_queue_create' not found`, the same line `hrx-backend-test` hits), so `scheduler.schedule_graph(gfx1151)` has no kernels and the case fails at `hrx-backend-test.cpp:16186`. Device-free only where the runtime initialises: it passes on a lane box, and this row is #481's because the same case inside `hrx-backend-test` is already baselined above, so a regression there could not redden CI. Un-baseline when the runner's libhsa carries `hsa_amd_queue_create` (engine#3126).

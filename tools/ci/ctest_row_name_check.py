@@ -67,6 +67,12 @@ import subprocess
 import sys
 
 ROW_FILE = "CMakeLists.txt"
+# Everything that registers into the ONE ctest namespace: the top-level list plus the family files its glob at the end
+# include()s (engine#1979; CONTRIBUTING.md, "A new test's registration goes in its own file").
+ROW_PATHS = (ROW_FILE, "cmake/tests-*.cmake")
+# `git diff` matches that glob in a pathspec and `git ls-tree` does not (measured), so the tree side lists `cmake/`
+# and filters on the prefix/suffix.
+ROW_GLOB_PREFIX, ROW_GLOB_SUFFIX = "cmake/tests-", ".cmake"
 # The two spellings this tree registers a test with. `add_python_test` is the repo's own wrapper (it calls
 # `add_test(NAME ...)`), so both create the same namespace and both must be read.
 ROW_RES = (
@@ -96,7 +102,11 @@ def row_names(text: str) -> dict[str, tuple[str, int]]:
         for rx in ROW_RES:
             m = rx.search(line)
             if m:
-                out.setdefault(m.group(1), (stripped.strip(), depth))
+                # Shallowest sighting wins: a name registered twice in ONE file (once outside a guard, once inside)
+                # is a duplicate that does not depend on the guard, so the pair is not "guarded".
+                prev = out.get(m.group(1))
+                if prev is None or depth < prev[1]:
+                    out[m.group(1)] = (stripped.strip(), depth)
         # `if(`…`endif()` nesting, counted after the row so a registration inside a block is seen at that depth
         if re.match(r"(?i)if\s*\(", stripped):
             depth += 1
@@ -106,12 +116,12 @@ def row_names(text: str) -> dict[str, tuple[str, int]]:
 
 
 def changed_row_lines(root: pathlib.Path, base: str):
-    """(added, removed) lines of this branch's CMakeLists.txt diff, or (None, None) when git cannot answer.
+    """(added, removed) registration lines of this branch's diff, or (None, None) when git cannot answer.
 
     BOTH sides, since engine#3018: `-add_test(NAME X COMMAND t "")` / `+add_test(NAME X COMMAND t)` is one row
     rewritten in place -- a name the same diff also removes is not a duplicate, after a rebase or before it.
     """
-    p = git(root, "diff", "--unified=0", f"{base}...HEAD", "--", ROW_FILE)
+    p = git(root, "diff", "--unified=0", f"{base}...HEAD", "--", *ROW_PATHS)
     if p.returncode != 0:
         return None, None
     added = [l[1:] for l in p.stdout.splitlines() if l.startswith("+") and not l.startswith("+++")]
@@ -119,11 +129,31 @@ def changed_row_lines(root: pathlib.Path, base: str):
     return added, removed
 
 
-def base_rows(root: pathlib.Path, base: str) -> dict[str, str] | None:
-    p = git(root, "show", f"{base}:{ROW_FILE}")
-    if p.returncode != 0:
+def tree_rows(root: pathlib.Path, rev: str) -> dict[str, tuple[str, int]] | None:
+    """Every name registered anywhere in the namespace at `rev`, with the if-depth it really has in that tree.
+
+    Read from the FILES at `rev`, never from the diff: a row added inside an `if()` block that already existed has no
+    `if(` line in its diff, so a depth taken from the added lines reads 0 and calls a mutually exclusive pair a
+    collision (measured: the #2989 shape with the guard already on the base).
+    """
+    p = git(root, "ls-tree", "-r", "--name-only", rev, "--", ROW_FILE, "cmake/")
+    if p.returncode != 0 or ROW_FILE not in p.stdout.split():
         return None
-    return row_names(p.stdout)  # name -> (line, if-depth)
+    out: dict[str, tuple[str, int]] = {}
+    for path in [q for q in p.stdout.split() if q == ROW_FILE or _family_file(q)]:
+        q = git(root, "show", f"{rev}:{path}")
+        if q.returncode != 0:
+            return None
+        for name, seen in row_names(q.stdout).items():
+            # Lowest depth wins, and a name registered twice in one tree takes the shallower of the two: a single
+            # UNCONDITIONAL sighting means the collision does not depend on a guard, so the pair is not "guarded".
+            if name not in out or seen[1] < out[name][1]:
+                out[name] = seen
+    return out
+
+
+def _family_file(path: str) -> bool:
+    return path.startswith(ROW_GLOB_PREFIX) and path.endswith(ROW_GLOB_SUFFIX) and "/" not in path[len(ROW_GLOB_PREFIX):]
 
 
 def check(root: pathlib.Path, base: str) -> tuple[int, list[str]]:
@@ -138,10 +168,13 @@ def check(root: pathlib.Path, base: str) -> tuple[int, list[str]]:
     if git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}").returncode != 0:
         return 2, [f"--base {base} does not resolve: fetch it, then re-run (cannot tell, not a pass)"]
     added, removed = changed_row_lines(root, base)
-    known = base_rows(root, base)
-    if added is None or known is None:
-        return 2, [f"cannot read {ROW_FILE} from {base} or diff against it (cannot tell, not a pass)"]
-    taken = row_names("\n".join(added))
+    known, head = tree_rows(root, base), tree_rows(root, "HEAD")
+    if added is None or known is None or head is None:
+        return 2, [f"cannot read the row namespace at {base} or diff against it (cannot tell, not a pass)"]
+    # Which names the diff adds/removes, from the diff; the SHAPE of a registration (its if-depth) from the tree it
+    # lands in, because that is what Configure sees.
+    taken = {n: head.get(n, (line, 0)) for n, line in
+             ((n, v[0]) for n, v in row_names("\n".join(added)).items())}
     freed = set(row_names("\n".join(removed)))
     if not taken:
         return 0, []
@@ -149,7 +182,10 @@ def check(root: pathlib.Path, base: str) -> tuple[int, list[str]]:
     if not clashes:
         # Either a fresh name, or a row REWRITTEN in place (the same diff removed it) -- engine#3018's shape.
         return 0, []
-    guarded = [n for n in clashes if taken[n][1] or known[n][1]]
+    # Mutual exclusion is only possible when BOTH sides are guarded: an unconditional registration at either end is
+    # a duplicate whenever the other side's guard is on, which is a Configure failure, not a cannot-tell (measured
+    # both directions on the real tree: `or` answered 2 while `cmake -S . -B` died on the duplicate).
+    guarded = [n for n in clashes if taken[n][1] and known[n][1]]
     if guarded:
         # engine#2989 registered a name a second time inside a DIFFERENT `if()` branch; both are green at Configure
         # because the branches are mutually exclusive, and a name-only diff cannot see that. cannot-tell, with the
@@ -245,6 +281,61 @@ def self_test() -> int:
         (d / ROW_FILE).write_text((d / ROW_FILE).read_text() + "if(ENABLE_Y)\n    add_test(NAME step_users COMMAND true)\nendif()\n")
         subprocess.run(["git", "-C", str(d), "commit", "-qam", "second branch, same name"], check=True)
         chk(2, check(d, "base-if")[0], "the same name in a different if() branch is cannot-tell, not a red row")
+
+        # 4d. the namespace is CMakeLists.txt PLUS cmake/tests-*.cmake, both directions (CONTRIBUTING.md sends a
+        # family's row to its family file; the glob at the end of CMakeLists.txt include()s them). Measured on the
+        # real tree: the tool said clean while `cmake -S . -B` died with `add_test given test NAME ... already exists`.
+        d = repo(tmpd, "family_file_branch")
+        (d / "cmake").mkdir()
+        (d / "cmake/tests-pre-pr-checks.cmake").write_text("add_python_test(taken_row ${CMAKE_SOURCE_DIR}/x.py)\n")
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(d), "commit", "-qm", "duplicate row in a family file"], check=True)
+        got, msgs = check(d, "main")
+        chk(1, got, "a duplicate name registered in a cmake/tests-*.cmake family file is reported (one namespace)")
+        chk(True, any("taken_row" in m for m in msgs), "...and the family-file message names the row")
+
+        d = repo(tmpd, "family_file_base")
+        subprocess.run(["git", "-C", str(d), "checkout", "-q", "main"], check=True)
+        (d / "cmake").mkdir()
+        (d / "cmake/tests-gpu-hold.cmake").write_text("add_test(NAME family_row COMMAND true)\n")
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(d), "commit", "-qm", "a family row on the base"], check=True)
+        subprocess.run(["git", "-C", str(d), "checkout", "-q", "feature"], check=True)
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text() + "add_test(NAME family_row COMMAND true)\n")
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "re-registers a family row in CMakeLists.txt"], check=True)
+        chk(1, check(d, "main")[0], "a name the BASE's family file registers, re-added in CMakeLists.txt, is reported")
+
+        # 4e. ONE unconditional side is a duplicate, not cannot-tell: the guarded registration collides whenever that
+        # guard is on. Measured on the real tree in both directions (`cmake -S . -B` rc 1 on the duplicate while the
+        # `or` rule answered 2), so the guard test is `and`, not `or`.
+        d = repo(tmpd, "base_unconditional")
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text()
+                                  + "if(ENABLE_Y)\n    add_test(NAME taken_row COMMAND true)\nendif()\n")
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "a guarded duplicate of an unconditional row"], check=True)
+        chk(1, check(d, "main")[0], "a guarded duplicate of an UNCONDITIONAL base row is a collision, not cannot-tell")
+        subprocess.run(["git", "-C", str(d), "checkout", "-q", "main"], check=True)
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text().replace(
+            "add_test(NAME taken_row COMMAND true)", "if(ENABLE_X)\n    add_test(NAME taken_row COMMAND true)\nendif()"))
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "the base row is guarded too"], check=True)
+        subprocess.run(["git", "-C", str(d), "branch", "-f", "guarded-base", "HEAD"], check=True)
+        subprocess.run(["git", "-C", str(d), "checkout", "-q", "-B", "feature3", "guarded-base"], check=True)
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text() + "add_test(NAME taken_row COMMAND true)\n")
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "an unconditional duplicate of a GUARDED base row"], check=True)
+        chk(1, check(d, "guarded-base")[0], "an UNCONDITIONAL duplicate of a guarded base row is a collision, not cannot-tell")
+
+        # 4f. and the depth is the one the TREE has, not the one its diff shows: a row added inside an `if()` block
+        # that already exists has no `if(` line in its diff, so a diff-read depth calls this pair a collision.
+        d = repo(tmpd, "preexisting_guard")
+        (d / ROW_FILE).write_text("# base\nif(ENABLE_X)\n    add_test(NAME taken_row COMMAND true)\nendif()\n"
+                                  "if(ENABLE_Y)\n    add_test(NAME other_row COMMAND true)\nendif()\n")
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "both guards exist on the base"], check=True)
+        subprocess.run(["git", "-C", str(d), "branch", "-f", "guarded", "HEAD"], check=True)
+        subprocess.run(["git", "-C", str(d), "checkout", "-q", "-B", "feature4", "guarded"], check=True)
+        (d / ROW_FILE).write_text((d / ROW_FILE).read_text().replace(
+            "if(ENABLE_Y)\n    add_test(NAME other_row COMMAND true)",
+            "if(ENABLE_Y)\n    add_test(NAME other_row COMMAND true)\n    add_test(NAME taken_row COMMAND true)"))
+        subprocess.run(["git", "-C", str(d), "commit", "-qam", "the same name inside a pre-existing second guard"], check=True)
+        chk(2, check(d, "guarded")[0], "a row added inside an EXISTING if() reads its real depth (cannot-tell, not a collision)")
 
         # 5. an unresolvable base is cannot-tell, not a pass
         d = repo(tmpd, "no_base")

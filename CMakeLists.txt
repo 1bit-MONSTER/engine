@@ -1552,24 +1552,39 @@ endif()
 if(ONEBIT_LAYA_TYPED_ROOT AND ONEBIT_LAYA_TYPED_GOLDEN)
     add_test(NAME laya_gate_typed_decisions COMMAND laya_gate ${ONEBIT_LAYA_TYPED_ROOT} ${ONEBIT_LAYA_TYPED_GOLDEN})
 endif()
-set(ONEBIT_LAYA_ROUTE_MODEL "" CACHE PATH "Laya checkpoint dir for the per-request routing e2e test")
+# engine#3161: these five rows used to exist only when ONEBIT_LAYA_ROUTE_MODEL was set, and neither ci.yml nor a default
+# configure sets it -- so the whole `--laya-models` rail ran in NO job at all, and it changed tonight with nothing testing
+# it (#3130 part 2, #3155). They are registered unconditionally now (as #3162 proposed) and a checkpoint that is not
+# there is a 77 skip with a reason naming the variable, the same contract serve_e2e_npu and hip_f16_audit use.
+# A GENERATED checkpoint was tried (#3163) and is not possible: the loader is a whole encoder, not a head --
+# laya/scorer.cpp hard-codes D=1024, NLAYER=28, UP=5248, which is 46.8 MB per encoder layer and ~1.4 GiB in total.
+# The rows genuinely run where a checkpoint exists: scripts/fetch-laya.sh installs the pinned public one
+# (convaiinnovations/laya; its typed-decisions/ subtree is 808 MiB), which is what a job would cache to run them.
+set(ONEBIT_LAYA_ROUTE_MODEL "" CACHE PATH "Laya checkpoint dir for the per-request routing e2e test (empty: those rows skip)")
+set(_laya_guard ${CMAKE_SOURCE_DIR}/tests/laya_e2e_guard.sh)
+add_test(NAME laya_route_e2e COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+# --laya-models: model auto picked per request among the table's rows (docs/laya-models.md)
+add_test(NAME laya_models_e2e COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_models_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+# `1bit route --laya-models --eval / --dump-encoder`: the table's routing measured, the head's input written
+add_test(NAME laya_eval_e2e COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_eval_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+# `1bit route --serve`, the resident form the fork calls per request (docs/laya-first.md §8).
+add_test(NAME laya_route_serve COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+# One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).
+add_test(NAME laya_checkpoint COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_checkpoint.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+# the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
 if(ONEBIT_LAYA_ROUTE_MODEL)
-    add_test(NAME laya_route_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
-    # --laya-models: model auto picked per request among the table's rows (docs/laya-models.md)
-    add_test(NAME laya_models_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_models_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
-    # `1bit route --laya-models --eval / --dump-encoder`: the table's routing measured, the head's input written
-    add_test(NAME laya_eval_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_eval_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
-    # `1bit route --serve`, the resident form the fork calls per request (docs/laya-first.md §8).
-    add_test(NAME laya_route_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
-    # One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).
-    add_test(NAME laya_checkpoint COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_checkpoint.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
-    # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
     add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
              ${CMAKE_SOURCE_DIR}/tests/laya_route_cases.json --min-accuracy 90)
-    # `--pm-router laya` end to end without a GPU: the same classifier decides the class of two
-    # labelled requests and the engine's table decides whether the PM delegates (docs/pm.md).
-    add_test(NAME pm_laya_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_laya_route.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
 endif()
+# `--pm-router laya` end to end without a GPU: the same classifier decides the class of two
+# labelled requests and the engine's table decides whether the PM delegates (docs/pm.md).
+add_test(NAME pm_laya_route COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/pm_laya_route.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+
+# engine#3161: no checkpoint (the default) -> 77 with the scripts' own reason, never a green pass. A path that is
+# given and wrong exits 2 from the scripts, which ctest reports as a failure, not a skip.
+foreach(_laya_row laya_route_e2e laya_models_e2e laya_eval_e2e laya_route_serve laya_checkpoint pm_laya_route)
+    set_tests_properties(${_laya_row} PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
 
 # The registry against the reviewed not-an-alias list (docs/arch-gaps.md) and the committed pins:
 # no checkouts or network. (The interpreter is found once, at :287: engine#1864.)

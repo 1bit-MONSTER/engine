@@ -186,8 +186,23 @@ def main():
         source = (f"snapshot confirmed against {args.starter}: {len(supported)} of the {len(SUPPORTED)} names the "
                   f"snapshot claims are mentioned there")
         extra = sorted(mentioned - set(SUPPORTED))
-    rc, lines = probe(read_kv(args.gguf), supported, source)
-    if args.starter and extra:
+    kv = read_kv(args.gguf)
+    rc, lines = probe(kv, supported, source)
+    # engine#3221 review: a name the starter mentions but the snapshot does not is exactly the case --starter exists
+    # to catch, and answering "cannot succeed" contradicts the next line. It is cannot tell: the snapshot may be
+    # stale, so the prober has no basis for a no. (The regex has no notion of context, so the mentions include
+    # non-architectures like "f16" - harmless, because only the GGUF's own architecture is ever compared here.)
+    if args.starter and kv and kv.get("general.architecture") in extra:
+        # Replace the verdict rather than prepend to it: "cannot succeed" followed by "that name may be an
+        # architecture" is two answers, and the reader takes the first one.
+        arch = kv["general.architecture"]
+        lines = [f"loom_arch_probe: {arch} is not in this tool's snapshot, but the starter at {args.starter} mentions "
+                 f"that name - the snapshot may be stale, so this is cannot tell, not a \"no\""]
+        need = NEEDS.get(arch)
+        if need:
+            lines.append(f"  if it is an architecture, a starter entry would need: {need}")
+        rc = 2
+    if args.starter and extra and rc != 2:
         lines.append(f"  the starter also mentions {len(extra)} name(s) the snapshot does not claim - if one of them is "
                      f"an architecture, the snapshot is stale and this file's SUPPORTED needs it: "
                      f"{', '.join(extra[:12])}{' …' if len(extra) > 12 else ''}")

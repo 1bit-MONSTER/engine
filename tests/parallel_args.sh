@@ -32,8 +32,11 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 python3 - "$scratch" <<'PY'
 import struct, sys
 def s(x): b = x.encode(); return struct.pack("<Q", len(b)) + b
-kv = [s("general.architecture") + struct.pack("<I", 8) + s("llama")]
-open(sys.argv[1] + "/m.gguf", "wb").write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv))
+def write(path, arch):
+    kv = [s("general.architecture") + struct.pack("<I", 8) + s(arch)]
+    open(path, "wb").write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv))
+write(sys.argv[1] + "/m.gguf", "llama")
+write(sys.argv[1] + "/gdn.gguf", "qwen35")   # a gated delta-net arch, for the engine#3125 arms
 PY
 
 # a backend that records how it was started, then answers /health
@@ -43,7 +46,8 @@ import json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 argv = sys.argv[1:]
 port = int(argv[argv.index("--port") + 1])
-open(os.environ["RECORD"], "w").write(json.dumps({"argv": argv}))
+record = {"argv": argv, "hrx_disable": os.environ.get("GGML_HRX_DISABLE_DISPATCH")}
+open(os.environ["RECORD"], "w").write(json.dumps(record))
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
@@ -53,11 +57,13 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
 PY
 chmod +x "$scratch/backend.py"
 
-run() {  # <record> [serve args]: serve until the backend has recorded its start
-    local port
+run() {  # [--hrx] [--gdn] <record> [serve args]: serve until the backend has recorded its start
+    local port model="$scratch/m.gguf" device=cpu
+    if [ "${1:-}" = "--hrx" ]; then device=hrx; shift; fi
+    if [ "${1:-}" = "--gdn" ]; then model="$scratch/gdn.gguf"; shift; fi
     # --port 0: the kernel picks and serve reports the port it bound, so nothing here picks a port and releases
     # it before serve binds (engine #1444/#1485). A bind failure can no longer be our own port collision.
-    RECORD="$1" "$bin" serve -m "$scratch/m.gguf" --device cpu --port 0 --llama-server "$scratch/backend.py" "${@:2}" >"$1.log" 2>&1 &
+    RECORD="$1" "$bin" serve -m "$model" --device "$device" --port 0 --llama-server "$scratch/backend.py" "${@:2}" >"$1.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 100); do [ -s "$1" ] && break; sleep 0.1; done
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
@@ -70,6 +76,21 @@ run "$scratch/unset.json"
 check "no --parallel leaves -np out" '[ "$(np "$scratch/unset.json")" = none ]'
 run "$scratch/four.json" --parallel 4
 check "--parallel 4 starts llama-server with -np 4" '[ "$(np "$scratch/four.json")" = 4 ]'
+
+# engine#3125: the unasked gated delta-net case is no longer clamped to one slot, so it takes llama-server's own slot
+# count and therefore needs the shared-KV treatment the explicit --parallel path gets. `serve` does not open a device on
+# this path -- it names the HSA runtime it would dlopen and reads the GTT counters from sysfs, then forks the child -- so
+# these arms stay device-free and run in the same row as the three above.
+kv() { python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["argv"]; print("yes" if "-kvu" in a else "no")' "$1"; }
+disable() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hrx_disable"] or "")' "$1"; }
+run --hrx --gdn "$scratch/gdn_unset.json"
+check "engine#3125: an unasked qwen35 server asks for 4 slots (-np 4), it is not left at one" '[ "$(np "$scratch/gdn_unset.json")" = 4 ]'
+check "engine#3125: ...which is the measured configuration, so it gets -kvu" '[ "$(kv "$scratch/gdn_unset.json")" = yes ]'
+check "engine#3125: ...and qwen.attention off under that unified cache" 'case "$(disable "$scratch/gdn_unset.json")" in *qwen.attention*) true;; *) false;; esac'
+run --hrx --gdn "$scratch/gdn_four.json" --parallel 4
+check "engine#3125: --parallel 4 on qwen35 still passes -np 4 and -kvu" '[ "$(np "$scratch/gdn_four.json")" = 4 ] && [ "$(kv "$scratch/gdn_four.json")" = yes ]'
+run --hrx "$scratch/llama_unset.json"
+check "engine#3125: a non-delta-net arch is untouched (no -kvu, no -np)" '[ "$(kv "$scratch/llama_unset.json")" = no ] && [ "$(np "$scratch/llama_unset.json")" = none ]'
 
 if [ $fail -ne 0 ]; then for f in "$scratch"/*.log; do echo "--- $f"; cat "$f"; done; echo FAIL; exit 1; fi
 echo PASS

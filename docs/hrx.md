@@ -1307,10 +1307,14 @@ taken hours before a rebuild printed a clean `484/484` from the *pre-change* lib
 
 ### Known issues on `HRX0`
 
-- **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
-  unsupported 3-D MUL_MAT; use `-b 512`. On Qwen3.5 / Qwen3.8 (Bonsai too) the gated delta net runs
-  one sequence per batch, so `serve` gives these models one slot on HRX and refuses `--parallel`
-  (`--parallel N` under "Not yet" below).
+- **Several sequences per batch fail in `llama-perplexity`.** `n_seq` > 1 stops on an
+  unsupported 3-D MUL_MAT; use `-b 512`. This is a perplexity-tool limitation, not a kernel one:
+  `serve` on HRX takes up to 8 sequences per batch (the fork's gated delta-net matchers declare
+  `kMaximumSequences = 8`), and `1bit serve --device hrx --parallel 4` was measured on 2026-11-21
+  serving two simultaneous requests with 200s, each its own answer and no cross-talk, over one
+  unified KV cache (engine#3125). Before that measurement `serve` clamped these models to one slot
+  unless `--parallel` was given, so older notes that say it refuses `--parallel` describe the engine
+  before it.
 - **`-fa off` fails.** A SET_ROWS into the non-flash-attention V cache is rejected.
 - **Decode-split flash attention is on.** `flash_attention_decode_split_next_q8` used to give
   nondeterministic attention on HRX0 ([#140](https://github.com/1bit-MONSTER/engine/issues/140)) and

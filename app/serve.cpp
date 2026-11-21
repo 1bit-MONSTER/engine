@@ -1133,6 +1133,32 @@ bool delta_net_arch(const std::string& arch) {
     return arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next";
 }
 
+// The shared-KV treatment every HRX server with more than one slot needs (engine#3125).
+//
+// HRX runs attention on the GPU only with one KV stream: `-kvu` shares one cache across the slots
+// (per-slot streams are 4-D and its flash attention falls back to the CPU: Qwen3-4B, 4 slots,
+// 39 -> 153 tok/s). AMD's Qwen attention path (`qwen.attention`) builds its mask from positions and
+// ignores the other sequences, so under `-kvu` the answers bleed into each other; it is turned off
+// for these servers.
+//
+// It used to be applied only when `--parallel` was given explicitly, because the unasked case was
+// clamped to one slot for gated delta-net models. That clamp is replaced by an explicit `-np 4` (see
+// serve_child), so the treatment has to cover the unasked case too: a multi-slot server with
+// `qwen.attention` still on is the bleed this function exists to prevent.
+//
+// Correcting an earlier claim in this comment: llama-server's default is NOT several slots --
+// `common/common.h:477` is `n_parallel = 1`, and the 4-slot + `kv_unified = true` resolution in
+// `tools/server/server.cpp:126-131` fires only for `n_parallel < 0`, i.e. an explicit `-np -1`, which
+// `serve` never passes. So an unasked server that passes no `-np` gets ONE slot; that is why the
+// unasked gated delta-net case has to choose its slot count rather than simply stop clamping.
+void apply_shared_kv(std::vector<std::string>& argv, std::vector<std::string>& env) {
+    argv.push_back("-kvu");
+    bool merged = false;
+    for (std::string& e : env)
+        if (e.rfind("GGML_HRX_DISABLE_DISPATCH=", 0) == 0) { e += ",qwen.attention"; merged = true; }
+    if (!merged) env.push_back("GGML_HRX_DISABLE_DISPATCH=qwen.attention");
+}
+
 std::string auto_gguf_device(const Options& o);
 
 Launch launch_for(const Options& o, const std::string& device, int child_port) {
@@ -1262,44 +1288,40 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         const char* keep_split = std::getenv("ONEBIT_HRX_DECODE_SPLIT");
         if (device == "hrx" && keep_split && std::string(keep_split) == "0")
             env.push_back("GGML_HRX_DISABLE_DISPATCH=decode_split");
-        // Qwen3.5 / Qwen3.8 (gated delta net): one slot unless --parallel says otherwise. This override predates
-        // G9 and its justification no longer reproduces: at the pin, the fork's matcher accepts up to 8 sequences
-        // (`dispatch_registration/llm/dispatch-gated-delta-net.cpp:53` `kMaximumSequences = 8`, checked at :294 and
-        // :633) and that file's own comment says the Loom kernel declares sequence_count up to 4096, "so the limit is
-        // only what serve offers". What is NOT established is that the engine path is correct at >1 slot — the old
-        // failure was a 500 at multi-sequence softplus, which is a kernel-behaviour claim, not a matcher-capability
-        // one. Removing this override needs a serve through this gate at -np 4+ inside a gpu-hold ticket (engine#3125).
-        if (device == "hrx" && o.parallel == 0) {
-            const std::string arch = gguf_architecture(o.model);
-            if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next") argv.insert(argv.end(), {"-np", "1"});
+        // engine#3125: Qwen3.5 / Qwen3.8 (gated delta net) used to be clamped to one slot here unless `--parallel` was
+        // given, on the recorded reason that a second concurrent request failed (HTTP 500) at the multi-sequence
+        // softplus / GATED_DELTA_NET. Measured 2026-11-21 through this gate on Qwen3.8-27B (arch `qwen35`), two
+        // simultaneous requests with distinct expected words, `--device hrx --no-strict-device`:
+        //   `--parallel 4` -> `n_slots = 4, kv_unified = true`, both 200, each its own answer, no cross-talk, 1.1 s each
+        //   `--parallel 2` -> the same at 2 slots
+        //   one slot (the old clamp) -> the second request took 2.0 s against the first's 1.1 s, i.e. queueing
+        // and the matcher side agrees and always did: `kMaximumSequences = 8`
+        // (`dispatch_registration/llm/dispatch-gated-delta-net.cpp:53`), with the 2- and 3-sequence ops rows passing.
+        //
+        // So the unasked case CHOOSES several slots rather than merely dropping the clamp: an unpassed `-np` is one
+        // slot (`common/common.h:477`), which would have left #3125's symptom -- a second request queued -- exactly as
+        // it was while still turning a fused dispatch off. 4 is llama-server's own auto value
+        // (`tools/server/server.cpp:128-131`, `n_parallel < 0`), and `-np 4 -kvu` with `qwen.attention` off is the
+        // configuration measured above, so the default path is the measured path.
+        if (device == "hrx" && o.parallel == 0 && delta_net_arch(gguf_architecture(o.model))) {
+            argv.insert(argv.end(), {"-np", "4"});
+            apply_shared_kv(argv, env);
         }
     } else {
         refuse_removed_device(device);
         throw std::runtime_error("--device " + device + " cannot run a .gguf (hrx or cpu)");
     }
     if (o.parallel == 1) {
-        // one slot: llama-server's own default is several, and a second slot can share a batch. (Gated delta net on
-        // HRX is capped by this override, not by the matcher -- see the note above and engine#3125.)
+        // one slot, asked for explicitly: llama-server's own default is several (auto resolves to 4 + unified KV).
         argv.insert(argv.end(), {"-np", "1"});
     }
     if (o.parallel > 1) {
         // continuous batching: N requests decode together, one read of the weights per step
         // for all of them; llama-server splits --ctx-size across the slots
         argv.insert(argv.end(), {"-np", std::to_string(o.parallel)});
-        if (device == "hrx") {
-            // HRX runs attention on the GPU only with one KV stream: -kvu shares one cache across
-            // the slots (per-slot streams are 4-D and its flash attention falls back to the CPU:
-            // Qwen3-4B, 4 slots, 39 -> 153 tok/s). AMD's Qwen attention path (qwen.attention) builds
-            // its mask from positions and ignores the other sequences, so under -kvu the answers
-            // bleed into each other; it is turned off for these servers.
-            // G9: multi-sequence gated delta net - the HRX matchers hold kMaximumSequences 8 now, so these
-            // architectures take --parallel like every other llama.cpp model
-            argv.push_back("-kvu");
-            bool merged = false;
-            for (std::string& e : env)
-                if (e.rfind("GGML_HRX_DISABLE_DISPATCH=", 0) == 0) { e += ",qwen.attention"; merged = true; }
-            if (!merged) env.push_back("GGML_HRX_DISABLE_DISPATCH=qwen.attention");
-        }
+        // G9: multi-sequence gated delta net - the HRX matchers hold kMaximumSequences 8 now, so these architectures
+        // take --parallel like every other llama.cpp model
+        if (device == "hrx") apply_shared_kv(argv, env);
     }
     if (!o.mtp.empty() && !o.dflash.empty()) throw std::runtime_error("--mtp and --dflash are two drafters; pick one");
     const bool own_mtp = own_mtp_head(o, device);
@@ -1365,9 +1387,10 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
 
 // A small llama-server for one RAG role: --embedding for /v1/embeddings, --reranking for
 // /v1/rerank. Batch = ubatch: an embedding or rerank input is one pass. On HRX where the build has
-// it (docs/hrx.md), else the CPU. HRX runs one sequence per batch (docs/hrx.md, "Several sequences
-// per batch fail"), so its server takes one slot and 2048-token inputs, the largest prompt chunk
-// its matmul kernels take in one pass.
+// it (docs/hrx.md), else the CPU. HRX serves 2048-token sequences (the largest prompt chunk its
+// matmul kernels take in one pass); more than one per batch works on the matcher side up to
+// `kMaximumSequences = 8` and was measured through `1bit serve` on 2026-11-21 (engine#3125), so a
+// multi-sequence batch is a server setting now rather than a capability limit.
 std::string rag_device() {
 #if defined(ONEBIT_HRX_SERVER)
     return "hrx";

@@ -119,7 +119,7 @@ def _position_distribution(tok, by="id"):
 
 
 def kld(ref_tokens, cand_tokens, by="id", eps=1e-12):
-    """Mean KL(reference || reference) in nats, over positions where both routes emitted the same token,
+    """Mean KL(candidate || reference) in nats, over positions where both routes emitted the same token,
     plus the share of positions whose top-1 the two routes agree on.
 
     THE FORMULA, because a KLD whose direction is inferred from prose can be flipped by accident and the
@@ -431,7 +431,8 @@ def selftest():
     ok(k["positions"] == 1 and k["mean_kld"] == 0.0 and k["same_top_token_pct"] == 100.0,
        "identical distributions -> exactly 0.0 nats and 100 % same-top")
     # hand-computed, in the formula's direction: ref {A .5, B .5} vs cand {A .75, B .25}
-    #   KL(ref || cand) = .5*ln(.5/.75) + .5*ln(.5/.25) = -0.2027326 + 0.3465736 = 0.1438410 nats
+    #   KL(cand || ref) = .75*ln(.75/.5) + .25*ln(.25/.5) = 0.1013663 - 0.1732868 -> 0.1308120 nats
+    # (the reverse, KL(ref || cand), is .5*ln(.5/.75) + .5*ln(.5/.25) = 0.1438410 -- the arm below)
     ref = [dist_tok(1, [(1, math.log(0.5)), (2, math.log(0.5))])]
     cand = [dist_tok(1, [(1, math.log(0.75)), (2, math.log(0.25))])]
     k = kld(ref, cand)
@@ -442,6 +443,11 @@ def selftest():
     # cannot be absorbed by a tolerance: .5*ln(.5/.75) + .5*ln(.5/.25) = 0.1438410
     ok(abs(kld(cand, ref)["mean_kld"] - 0.1438410) < 1e-6,
        f"…and the reverse direction is its own number, 0.1438410 (got {kld(cand, ref)['mean_kld']:.7f})")
+    # the docstring IS the direction spec, so it is pinned like one: this PR has already had it read
+    # `KL(reference || reference)` (zero by definition) after a flip, and once been `None` because code
+    # was inserted above the prose. A stale first line is exactly what a reviewer skims and trusts.
+    ok(bool(kld.__doc__) and "KL(candidate || reference)" in kld.__doc__.splitlines()[0],
+       "kld's docstring first line names the direction the arithmetic computes")
     # CROSS-TOOL: the same two distributions through the sibling KLD already in the tree, which the P4
     # gate thresholds at --max-mean-kld. Two instruments feeding one gate must agree on which argument
     # is p; this arm is what makes that a test instead of a claim. (logits_kld.kl takes LOGITS, so the

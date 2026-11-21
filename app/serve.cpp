@@ -1725,17 +1725,21 @@ void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& o
         std::mutex m;
         std::condition_variable cv;
         std::deque<std::string> q;
-        bool done = false, failed = false;
+        bool done = false, failed = false, abort = false;
         int status = 0;
     };
     auto pump = std::make_shared<Pump>();
     auto first = std::make_shared<std::string>();
-    auto upstream = std::make_shared<std::future<void>>(std::async(std::launch::async, [&, pump] {
+    // Everything the task needs is copied in: `path`/`payload` are this function's locals and the frame is gone by the
+    // time the task can still be inside Post() on the streamed path, so a reference capture here was a use-after-return
+    // that "usually" won the race (review, #3255).
+    auto upstream = std::make_shared<std::future<void>>(std::async(std::launch::async, [port, path, payload, pump] {
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
         auto r = c.Post(path, httplib::Headers{}, payload, "application/json", [pump](const char* data, size_t n) {
             {
                 std::lock_guard<std::mutex> g(pump->m);
+                if (pump->abort) return false;   // the client is gone: stop reading the upstream
                 pump->q.emplace_back(data, n);
             }
             pump->cv.notify_all();
@@ -1749,16 +1753,51 @@ void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& o
         }
         pump->cv.notify_all();
     }));
+    // A proxy whose client has gone away must stop the upstream too: the provider sets `abort` when a write fails, and
+    // that is what makes the receive callback return false so httplib aborts the POST (review, #3255).
+    auto abort_upstream = [pump] {
+        {
+            std::lock_guard<std::mutex> g(pump->m);
+            pump->abort = true;
+        }
+        pump->cv.notify_all();
+    };
+    // What a stream looks like, rather than "anything that is not JSON". An SSE body starts with `data:` (possibly
+    // after `event:`/`id:`/`:` lines); an HTML error page or a plain-text message does not, and that case now keeps the
+    // upstream status instead of being handed to a client as a stream it cannot read (review, #3255).
+    auto looks_sse = [](const std::string& s) {
+        size_t pos = s.find_first_not_of(" \t\r\n");
+        while (pos != std::string::npos) {
+            const size_t eol = s.find('\n', pos);
+            const std::string line = s.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+            if (line.rfind("data:", 0) == 0) return true;
+            if (line.rfind("event:", 0) != 0 && line.rfind("id:", 0) != 0 && line.rfind(":", 0) != 0) return false;
+            pos = eol == std::string::npos ? std::string::npos : s.find_first_not_of(" \t\r\n", eol);
+        }
+        return false;
+    };
+    // The first-byte wait is BOUNDED: a loom-serve that accepts the POST and then says nothing must not hold the client's
+    // connection with no status line sent, which is worse than the 200 it used to get (review, #3255).
+    constexpr int kLoomFirstByteSecs = 60;
     {
         std::unique_lock<std::mutex> g(pump->m);
-        pump->cv.wait(g, [&] { return !pump->q.empty() || pump->done; });
+        const bool answered = pump->cv.wait_for(g, std::chrono::seconds(kLoomFirstByteSecs),
+                                                [&] { return !pump->q.empty() || pump->done; });
+        if (!answered) {
+            g.unlock();
+            abort_upstream();
+            res.status = 504;
+            res.set_content(json{{"error", {{"message", "loom-serve accepted the request and sent nothing within " +
+                                                        std::to_string(kLoomFirstByteSecs) + " s"}}}}.dump(),
+                            "application/json");
+            return;
+        }
         if (!pump->q.empty()) {
             *first = std::move(pump->q.front());
             pump->q.pop_front();
         }
     }
-    const size_t nb = first->find_first_not_of(" \t\r\n");
-    if (nb == std::string::npos || (*first)[nb] == '{') {
+    if (!looks_sse(*first)) {
         // not a stream: loom-serve refused the request (or ignored `stream`). Answer with its status and body.
         upstream->wait();
         std::string all = *first;
@@ -1783,8 +1822,8 @@ void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& o
         return;
     }
     res.set_chunked_content_provider("text/event-stream", [port, path, payload, held, watch, prompt_bytes, our_id,
-                                                           client_usage, pump, first,
-                                                           upstream](size_t, httplib::DataSink& sink) {
+                                                           client_usage, pump, first, upstream,
+                                                           abort_upstream](size_t, httplib::DataSink& sink) {
         const auto tracked = watch ? watch->begin(port, "POST " + path + " (streamed)", prompt_bytes, false) : nullptr;
         const auto t0 = std::chrono::steady_clock::now();
         loom::LoomSse sse(our_id, client_usage, [t0] {
@@ -1796,7 +1835,10 @@ void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& o
             const std::string out = sse.feed(bytes.data(), bytes.size());
             return out.empty() || sink.write(out.data(), out.size());
         };
-        if (!push(*first)) return false;
+        if (!push(*first)) {
+            abort_upstream();
+            return false;
+        }
         std::unique_lock<std::mutex> g(pump->m);
         for (;;) {
             if (!pump->q.empty()) {
@@ -1805,7 +1847,11 @@ void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& o
                 g.unlock();
                 const bool ok = push(c);
                 g.lock();
-                if (!ok) return false;
+                if (!ok) {
+                    g.unlock();
+                    abort_upstream();
+                    return false;
+                }
                 continue;
             }
             if (pump->done) break;

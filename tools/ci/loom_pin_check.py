@@ -107,7 +107,7 @@ def installed_version(python):
     return p.stdout.strip(), None
 
 
-def check(cfg_path, source=None, python=None):
+def check(cfg_path, source=None, python=None, wheel=None):
     findings, notes = [], []
     cfg = read_config(cfg_path)
     for key in ('repo', 'sha', 'package', 'version', 'version_file', 'model_catalog_repo', 'model_catalog_sha'):
@@ -159,6 +159,19 @@ def check(cfg_path, source=None, python=None):
     else:
         notes.append(f'installed hrx_loom {have_inst} matches the pin')
 
+    if wheel:
+        import hashlib
+        want = cfg.get('wheel_sha256')
+        if not want:
+            findings.append(f'{cfg_path} records no wheel_sha256, so {wheel} cannot be checked against the shipped artefact')
+        elif not pathlib.Path(wheel).is_file():
+            findings.append(f'no wheel at {wheel}')
+        else:
+            got = hashlib.sha256(pathlib.Path(wheel).read_bytes()).hexdigest()
+            if got != want:
+                findings.append(f'{wheel} has sha256 {got[:16]}…, the pin says {want[:16]}…')
+            else:
+                notes.append(f'{pathlib.Path(wheel).name} sha256 matches the pin')
     for n in notes:
         print(f'loom_pin: {n}')
     for f in findings:
@@ -217,6 +230,16 @@ def self_test():
         'a catalog named by TAG is accepted when model_catalog_ref names it')
     chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.1.0'), source=str(src)) == 1,
         '...and a ref the release does not name is still a finding')
+
+    # The shipped ARTEFACT: a release is a wheel with a hash, not just a version string.
+    whl = tmp / 'hrx_loom-0.2.0-py3-none-any.whl'
+    whl.write_bytes(b'PK\x03\x04 not really a wheel, but its hash is what the pin names')
+    import hashlib
+    digest = hashlib.sha256(whl.read_bytes()).hexdigest()
+    chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.2.0', wheel_sha256=digest), source=str(src), wheel=str(whl)) == 0,
+        'a wheel whose sha256 is the pinned one is accepted')
+    chk(check(cfg(sha=rsha, version='0.2.0', model_catalog_ref='v0.2.0', wheel_sha256='0' * 64), source=str(src), wheel=str(whl)) == 1,
+        '...and a wheel with any other sha256 is a finding')
     print(f'loom_pin_check self-test: {ok[0]} ok, {ok[1]} failed')
     return 0 if ok[1] == 0 else 1
 
@@ -228,12 +251,13 @@ def main(argv=None):
     ap.add_argument('--config', default=str(pathlib.Path(__file__).resolve().parents[2] / 'config/loom.config'))
     ap.add_argument('--source', default=None, help='a clone of the repo in config/loom.config')
     ap.add_argument('--python', default=sys.executable, help='interpreter to ask for the installed hrx_loom')
+    ap.add_argument('--wheel', default=None, help='a hrx_loom wheel whose sha256 must match config/loom.config')
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
     if not a.check:
         ap.error('one of --check or --self-test')
-    return check(a.config, a.source, a.python)
+    return check(a.config, a.source, a.python, a.wheel)
 
 
 if __name__ == '__main__':

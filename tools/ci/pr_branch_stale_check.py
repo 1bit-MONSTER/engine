@@ -42,10 +42,19 @@ class CannotTell(Exception):
     """
 
 
+ADVISORY = False
+
+
 def cannot_tell(why):
-    """Exit 2, never 1: an unreadable queue is not a finding and not a pass (engine#2992 review)."""
+    """Exit 2, never 1: an unreadable queue is not a finding and not a pass (engine#2992 review).
+
+    Under `--advisory` it exits 77 instead, which is what the caller counts as a visible SKIP. The flag's own help and
+    `scripts/pre-pr-checks.sh` (which maps 77 to `skip` and everything else to a failure) both promise that, but every
+    `cannot_tell` raised early used to bypass the end-of-run mapping and fail a lane's pre-PR gate for a condition it
+    could not see -- a truncated list, an unfetchable ref, or (engine#3076) a shallow clone. One place decides it now.
+    """
     print(f"pr_branch_stale_check: {why} -- cannot tell, not a pass", file=sys.stderr)
-    raise SystemExit(EXIT_CANNOT_TELL)
+    raise SystemExit(77 if ADVISORY else EXIT_CANNOT_TELL)
 
 
 def pr_cannot_tell(pr, branch, why):
@@ -71,6 +80,28 @@ def advisory_exit(verdict):
     if verdict == EXIT_CANNOT_TELL:
         return 77
     return verdict
+
+
+def shallow_problem(is_shallow, rc):
+    """The shallow decision as a pure function (engine#3076), so its table is assertable without building a shallow clone."""
+    if rc != 0:
+        return "cannot tell whether this is a shallow clone (git rev-parse failed)"
+    if str(is_shallow).strip() == "true":
+        return ("ran in a SHALLOW clone, where the distance to the base is not knowable, so a stale branch would read as "
+                "level -- fetch full history (`git fetch --unshallow`) and run again")
+    return None
+
+
+def shallow_guard(root, mode):
+    """Refuse to answer in a SHALLOW clone (engine#3076): history is truncated, so `rev-list --count A..B` returns 0 for a
+    branch that is in fact behind, and the distance is what decides every verdict in this file. Measured on a `--depth 1`
+    clone of this repo: `--pr 3098` printed "merging it removes nothing main has" and exited 0, where a full clone reported
+    that the merge conflicts and could not be measured. A 0 must mean every branch was read, and in a shallow clone none was.
+    """
+    rc, out, _ = run("git", "rev-parse", "--is-shallow-repository", cwd=root)
+    problem = shallow_problem(out, rc)
+    if problem:
+        cannot_tell(f"{mode} {problem}")
 
 
 def run(*a, cwd=None):
@@ -300,6 +331,14 @@ def self_test():
     pathlib.Path(work, "a.txt").write_text("a\nb\nc\n")
     gg("commit", "-qam", "rebased", cwd=work); gg("push", "-q", "-f", "origin", "rebased", cwd=work)
     gg("update-ref", "refs/remotes/origin/rebased", first, cwd=work)   # what a worktree that missed the force-push holds
+    # engine#3076: the shallow decision, as a table. The git plumbing is one `rev-parse` line; what needs pinning is which
+    # answer it produces, because a shallow clone makes a branch that IS behind read as level (`rev-list --count A..B` cannot
+    # see past the graft) -- measured on a `--depth 1` clone of this repo, where `--pr` exited 0 for a branch whose merge
+    # conflicts. So: shallow -> a reason, not shallow -> None, and an unreadable probe -> a reason (never "probably fine").
+    chk(shallow_problem("true", 0) is not None, "a shallow clone yields a cannot-tell reason, not a pass")
+    chk(shallow_problem("false", 0) is None, "a full clone yields no reason (the happy path stays quiet)")
+    chk(shallow_problem("", 1) is not None, "a failed shallow probe is cannot-tell, never an assumed full clone")
+
     plain = gg("fetch", "-q", "origin", "refs/heads/rebased:refs/remotes/origin/rebased", cwd=work)
     forced = gg("fetch", "-q", "origin", "+refs/heads/rebased:refs/remotes/origin/rebased", cwd=work)
     chk(plain.returncode != 0, "the plain refspec cannot mirror a REBASED branch (non-fast-forward) -- the bug")
@@ -324,7 +363,10 @@ def main():
     a = ap.parse_args()
     if a.self_test:
         return self_test()
+    global ADVISORY
+    ADVISORY = a.advisory
     root = pathlib.Path(a.root).resolve()
+    shallow_guard(root, "--pr" if a.pr else "the open-PR scan")
     findings, unreadable = 0, []
 
     if a.pr:

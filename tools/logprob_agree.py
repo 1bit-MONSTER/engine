@@ -100,6 +100,63 @@ def usable(x):
     return x is not None and isinstance(x, (int, float)) and not (math.isnan(x) or math.isinf(x))
 
 
+def _position_distribution(tok, by="id"):
+    """One position's next-token distribution from its top-N, renormalised over what it carries.
+
+    Two approximations, both stated rather than hidden: the entries below top-N are not on the
+    wire, so their mass is dropped and the rest renormalised; and a log-prob the server sent as a
+    non-finite value is skipped rather than guessed.
+    """
+    top = tok.get("top") or []
+    ps = {}
+    for t in top:
+        lp = t.get("lp")
+        if lp is None or not math.isfinite(lp):
+            continue
+        ps[tok_key({"id": t.get("id"), "token": t.get("token")}, by)] = math.exp(lp)
+    z = sum(ps.values())
+    return {k: v / z for k, v in ps.items()} if z > 0 else {}
+
+
+def kld(ref_tokens, cand_tokens, by="id", eps=1e-12):
+    """Mean KL(candidate || reference) in nats over the positions where both routes emitted the same
+    token, plus the share of positions whose top-1 the two routes agree on.
+
+    `ref` is the route treated as the reference, so `kld(cpu, hrx)` is "how much the hybrid route's
+    distribution differs from CPU's" -- the direction an accuracy row usually reports. Positions
+    where the routes emitted DIFFERENT tokens are excluded rather than scored: a different token is
+    a divergence the agreement section already reports, and folding it in here would make one number
+    answer two questions.
+    """
+    n = same_top = truncated = 0
+    total = 0.0
+    for a, b in zip(ref_tokens, cand_tokens):
+        if tok_key(a, by) != tok_key(b, by):
+            continue
+        pa, pb = _position_distribution(a, by), _position_distribution(b, by)
+        if not pa or not pb:
+            continue
+        union = set(pa) | set(pb)
+        za = sum(pa.get(k, 0.0) for k in union)
+        zb = sum(pb.get(k, 0.0) for k in union)
+        if za <= 0 or zb <= 0:
+            continue
+        if len(union) > len(pa) or len(union) > len(pb):
+            truncated += 1
+        for k in union:
+            p = pb.get(k, 0.0) / zb          # candidate
+            q = pa.get(k, 0.0) / za          # reference
+            if p > eps:
+                total += p * math.log(p / max(q, eps))
+        n += 1
+        if max(pb, key=pb.get) == max(pa, key=pa.get):
+            same_top += 1
+    return {"positions": n,
+            "mean_kld": (total / n) if n else 0.0,
+            "same_top_token_pct": (100.0 * same_top / n) if n else 0.0,
+            "positions_with_unseen_entries": truncated}
+
+
 def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False):
     """One greedy request; returns the generated token ids with their log-probs."""
     body = {
@@ -305,6 +362,38 @@ def selftest():
     assert first_divergence(noid_a["tokens"], id_only["tokens"], "text") is None
     assert first_divergence(noid_a["tokens"], id_only["tokens"], "id") == 0
     assert agreement(noid_a, id_only, "text")["exact_bit_match_rate"] == 1.0
+    # --- KLD (engine#3158): the accuracy row's number, which no arm above computes ---
+    def dist_tok(i, pairs):
+        """One position carrying a full top-N: pairs = [(id, logprob), ...]."""
+        return {"id": i, "token": f"t{i}", "lp": pairs[0][1],
+                "top": [{"id": k, "token": f"t{k}", "lp": lp} for k, lp in pairs]}
+
+    # identical distributions -> exactly zero, and every top-1 agrees
+    same = [dist_tok(1, [(1, math.log(0.5)), (2, math.log(0.5))])]
+    k = kld(same, same)
+    assert k["positions"] == 1 and k["mean_kld"] == 0.0 and k["same_top_token_pct"] == 100.0, k
+    # hand-computed: ref {A .5, B .5} vs cand {A .75, B .25}
+    #   KL = .75*ln(1.5) + .25*ln(0.5) = 0.3040988 - 0.1732868 = 0.1308120 nats
+    ref = [dist_tok(1, [(1, math.log(0.5)), (2, math.log(0.5))])]
+    cand = [dist_tok(1, [(1, math.log(0.75)), (2, math.log(0.25))])]
+    k = kld(ref, cand)
+    assert abs(k["mean_kld"] - 0.1308120) < 1e-6, k["mean_kld"]
+    assert k["same_top_token_pct"] == 100.0         # top-1 is the same token, mass moved under it
+    # the direction matters: KL is not symmetric, and reversing the arguments must differ
+    assert abs(kld(cand, ref)["mean_kld"] - 0.1438410) < 1e-6     # .25*ln(2) + .75*ln(2/3)…
+    # a position where the routes emitted DIFFERENT tokens is excluded, not scored
+    other = [dist_tok(2, [(2, math.log(0.5)), (1, math.log(0.5))])]
+    k = kld(ref, other)
+    assert k["positions"] == 0 and k["mean_kld"] == 0.0, k
+    # an entry one route carries and the other does not is counted, and renormalisation is what makes
+    # the number finite -- the truncation is reported rather than silently absorbed
+    wider = [dist_tok(1, [(1, math.log(0.5)), (2, math.log(0.25)), (3, math.log(0.25))])]
+    k = kld(ref, wider)
+    assert k["positions"] == 1 and k["positions_with_unseen_entries"] == 1, k
+    assert k["mean_kld"] > 0.0
+    # a missing or non-finite log-prob is skipped, not turned into a probability
+    broken = [{"id": 1, "token": "t1", "lp": None, "top": [{"id": 1, "token": "t1", "lp": None}]}]
+    assert kld(broken, broken)["positions"] == 0
     print("logprob_agree selftest: ok")
 
 
@@ -454,6 +543,22 @@ def main(argv=None):
             print(f"  mean|dlogp|       {g['mean_abs_dlogp']:.6e}  over {tot_common} tokens")
             print(f"  top-1 agreement   {g['top1_agreement_rate']:.3f}")
             print(f"  exact-bit match   {g['exact_bit_match_rate']:.3f}")
+            # engine#3158: the accuracy row asks for a mean KLD against CPU, which none of the above
+            # answers -- they are all comparisons of the tokens the two routes DID emit. `--route` order
+            # is the direction: the first route is the reference, so `--route cpu=… --route hrx=…` gives
+            # KL(hrx || cpu). Truncated to the top-N both routes carry; see _position_distribution.
+            ks = [kld(x["runs"][0], y["runs"][0], a.match_by) for x, y in zip(pa, pb)]
+            kpos = sum(k["positions"] for k in ks)
+            g["kld"] = {
+                "reference": la, "candidate": lb,
+                "positions": kpos,
+                "mean_kld": (sum(k["mean_kld"] * k["positions"] for k in ks) / kpos) if kpos else 0.0,
+                "same_top_token_pct": (sum(k["same_top_token_pct"] * k["positions"] for k in ks) / kpos)
+                                      if kpos else 0.0,
+                "positions_with_unseen_entries": sum(k["positions_with_unseen_entries"] for k in ks),
+            }
+            print(f"  mean KLD          {g['kld']['mean_kld']:.6f} nats  (KL({lb} || {la}), {kpos} positions)")
+            print(f"  same top token    {g['kld']['same_top_token_pct']:.1f} %")
             if g["prompts_with_token_divergence"]:
                 print(f"  token divergence  prompts {g['prompts_with_token_divergence']}")
 

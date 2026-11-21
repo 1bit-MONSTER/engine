@@ -30,10 +30,31 @@ import argparse, json, pathlib, subprocess, sys
 
 EXIT_CLEAN, EXIT_FINDING, EXIT_CANNOT_TELL = 0, 1, 2
 
+
+class CannotTell(Exception):
+    """The measurement could not be made -- which is NOT the same answer as "level with the base" (engine#3082).
+
+    `stale_finding` returns `None` for a clean answer, so every "could not look" case used to return `None` too, and both
+    call sites read that as clean. In `--pr` mode -- the per-PR gate #3076 added -- that printed *"merging it removes
+    nothing <base> has"* and exited **0 for a CONFLICTED pull request**, which is the one answer a merge gate must never
+    give. The tool's own rule for its other mode says it: *"cannot-tell still answers 77 (skip), never 0"*. So the
+    unmeasurable cases raise this, and the callers map it to their own cannot-tell channel (2 / skip).
+    """
+
+
 def cannot_tell(why):
     """Exit 2, never 1: an unreadable queue is not a finding and not a pass (engine#2992 review)."""
     print(f"pr_branch_stale_check: {why} -- cannot tell, not a pass", file=sys.stderr)
     raise SystemExit(EXIT_CANNOT_TELL)
+
+
+def pr_cannot_tell(pr, branch, why):
+    """The per-PR mode's channel for "could not measure": exit 2, never 0 (engine#3082).
+
+    Named rather than inlined so an arm can assert it: the defect was exactly this mapping, and an arm that needs `gh`
+    and a real PR to run would not have been written.
+    """
+    cannot_tell(f"#{pr} {branch}: {why}")
 
 
 def verdict_exit(unreadable, findings):
@@ -95,16 +116,19 @@ def stale_finding(repo_dir, branch, base="origin/main"):
     """
     rc, out, _ = run("git", "rev-list", "--count", f"{branch}..{base}", cwd=repo_dir)
     if rc != 0:
-        return None
+        raise CannotTell(f"cannot count the commits {branch} is behind {base} (git rc {rc})")
     behind = int(out.strip() or 0)
     if behind == 0:
         return None
     rc, mb, _ = run("git", "merge-base", base, branch, cwd=repo_dir)
     if rc != 0 or not mb.strip():
-        return None
+        raise CannotTell(f"no merge base between {base} and {branch}")
     rc, out, _ = run("git", "merge-tree", "--write-tree", base, branch, cwd=repo_dir)
     if rc != 0 or not out.strip():
-        return None                     # a conflicted merge is loud; not this tool's business
+        # A conflicted merge cannot be measured. It used to `return None` -- "not this tool's business" was right when the
+        # tool only reported on other lanes' PRs, and is exactly wrong in the per-PR gate: the gate answered "removes
+        # nothing, rc 0" for a PR whose merge does not apply (engine#3082).
+        raise CannotTell(f"the merge of {branch} into {base} conflicts, so what it would delete cannot be measured")
     merged_tree = out.splitlines()[0].strip()
 
     def texts(args):
@@ -116,7 +140,7 @@ def stale_finding(repo_dir, branch, base="origin/main"):
     gained_since_cut = set(texts(("git", "diff", "-U0", mb.strip(), base)))          # what main added after the branch was cut
     rc, o, _ = run("git", "diff", "-U0", base, merged_tree, cwd=repo_dir)
     if rc != 0:
-        return None
+        raise CannotTell(f"cannot diff {base} against the merged tree (git rc {rc})")
     deleted = [l[1:] for l in o.splitlines() if l.startswith("-") and not l.startswith("---") and l[1:].strip()]
     rc, names, _ = run("git", "diff", "--name-only", base, merged_tree, cwd=repo_dir)
     files = [f for f in names.splitlines() if f.strip()]
@@ -144,6 +168,11 @@ def self_test():
         for name, text in files.items():
             pathlib.Path(d.name, name).write_text(text)
         g("add", "-A"); g("commit", "-qm", "base")
+        # engine#3082: `origin/main` has to exist from the start, or the FIRST arm ("a branch level with main is not a
+        # finding") measures nothing: rev-list fails, and under the old code that failure returned None -- which is the
+        # clean answer -- so the arm passed while testing nothing. This change surfaced it; the base commit now sets the
+        # remote ref the same way every later `commit()` does.
+        g("update-ref", "refs/remotes/origin/main", "HEAD")
         return d, g
 
     def commit(g, d, files, msg):
@@ -214,6 +243,28 @@ def self_test():
     chk(stale_finding(d.name, "mine") is None,
         "behind by ancestry but identical in content is NOT a finding")
 
+    # engine#3082: a CONFLICTED merge cannot be measured, and the per-PR gate used to answer "removes nothing, rc 0" for
+    # it -- because `stale_finding` returned None both for "level with the base" and for "could not look", and every
+    # caller read None as clean. The two branches below edit the same line of the same file, one commit apart, so the
+    # merge genuinely conflicts (the same fixture the issue reports).
+    d, g = repo({"clash.txt": "one\ntwo\n"})
+    g("branch", "clash")
+    commit(g, d.name, {"clash.txt": "one\nMAIN\n"}, "main edits line 2")
+    g("checkout", "-q", "clash")
+    pathlib.Path(d.name, "clash.txt").write_text("one\nBRANCH\n")
+    g("commit", "-qam", "the branch edits the same line")
+    try:
+        f = stale_finding(d.name, "clash")
+        chk(False, "a conflicted merge is CANNOT-TELL, not a clean None (engine#3082)")
+    except CannotTell as e:
+        chk("conflict" in str(e), "a conflicted merge is CANNOT-TELL, and says why: " + str(e)[:60])
+    # ... and the per-PR mode's channel for it is 2 (skip), never 0 (clean) -- the mapping the defect was in.
+    try:
+        pr_cannot_tell(7, "feat", "the merge conflicts")
+        chk(False, "the per-PR cannot-tell channel exits")
+    except SystemExit as e:
+        chk(e.code == EXIT_CANNOT_TELL, "the per-PR cannot-tell channel exits 2 (a skip), not 0 (a clean merge)")
+
     # engine#2992 review: no arm exercised the EXIT TABLE, which is how an unreadable queue came to report itself as a finding
     # (rc 1) and a fetch failure as a clean run (rc 0). These need no git fixture and no network.
     chk(verdict_exit(unreadable=False, findings=0) == 0, "exit table: clean run is 0")
@@ -259,7 +310,10 @@ def main():
             rc, _o, err = run("git", "fetch", "-q", "origin", ref, cwd=root)
             if rc != 0:
                 cannot_tell(f"cannot fetch {ref.split(':')[0]} (rc {rc}): {err.strip()[:120]}")
-        found = stale_finding(root, f"origin/{branch}", f"origin/{base}")
+        try:
+            found = stale_finding(root, f"origin/{branch}", f"origin/{base}")
+        except CannotTell as e:
+            pr_cannot_tell(a.pr, branch, str(e))
         if found is None:
             print(f"#{a.pr} {branch}: merging it removes nothing {base} has")
             return 0
@@ -286,7 +340,12 @@ def main():
             unreadable.append(f"#{n} {branch}: cannot fetch its base {base} ({err.strip()[:80]})")
             print(f"#{n} {branch}: CANNOT READ -- its base {base} could not be fetched", file=sys.stderr)
             continue
-        f = stale_finding(root, ref, base_ref)
+        try:
+            f = stale_finding(root, ref, base_ref)
+        except CannotTell as e:
+            unreadable.append(f"#{n} {branch}: {e}")
+            print(f"#{n} {branch}: CANNOT READ -- {e}", file=sys.stderr)
+            continue
         if f is None:
             print(f"#{n} {branch}: merging this branch removes nothing {base} has")
             continue

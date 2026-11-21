@@ -68,7 +68,11 @@ PAGE = 100
 #   * `keyword ... #12` with up to 24 characters between -- #2793's body says "Refs #2779 (the layer its fix does not
 #     cover), #2728", and the noun "fix" plus a distant `#2728` read as a claim on 2728. Found by running the parser over
 #     the real texts of tonight's seven PRs rather than over my own fixtures, which is why that check is in the PR body.
-CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#(\d+)', re.I)
+# engine#3060: markdown emphasis around the NUMBER (`Closes **#3041**`, `Fixes _#7_`) is how a large share of this
+# fleet writes a claim, and the old pattern stopped at the `**` -- so such a PR counted as a bare mention and went
+# missing from "claimed by" lists (measured on #3047: its body reads `Closes **#3041**`). Backticks are deliberately
+# NOT matched: a claim inside a code span is documentation, which `claims()` already strips.
+CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*[*_~]*#(\d+)', re.I)
 
 # engine#2842: `Refs #N` is a claim too, but a WEAKER one. Almost every PR reviewed on 2026-11-16/17 said `Refs` rather than
 # `Fixes` -- because a PR that fixes part of an issue must not close it -- so reading closing keywords only made the common
@@ -76,7 +80,7 @@ CLAIM = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#(\d+)
 # other failure: `Refs` is also used for context, and a pair that merely mentions the same issue is not a duplicate. So a
 # ref pair counts only when the two PRs also TOUCH OVERLAPPING FILES -- the same "overlap, not issue-claim" rule the review
 # of #2809 asked for on the false-positive side, which makes one rule serve both directions.
-REF = re.compile(r'\brefs?\b\s*:?\s*#(\d+)', re.I)
+REF = re.compile(r'\brefs?\b\s*:?\s*[*_~]*#(\d+)', re.I)
 
 
 # A claim written INSIDE code is documentation, not a claim. The PRs most likely to contain `Fixes #12` are the ones
@@ -452,6 +456,28 @@ def self_test():
     ok([i for i, _ in duplicates(mixed, same_files)] == [2836], "... but IS reported once the files overlap")
     ok('is claimed by' in describe(*duplicates(mixed, same_files)[0]),
        "... and reads as a claim, because one of the two closes it")
+    # engine#3060: the sentence is decided from the BODY, and the finding carries the body (engine#3048/#3052) -- so the
+    # note must ask the same question. A pair where BOTH claim is a finding; the note must not restate it with the
+    # opposite reason, which is what it did for seven pairs on the 23:5xZ queue.
+    both_claim = [dict(ref_prs[0], body='Fixes #2836'), dict(ref_prs[1], body='Closes #2836')]
+    ok(note_line(2836, both_claim[0], both_claim[1], ['f.cpp']) is None,
+       "two PRs that both claim the issue print no note -- the finding above is the report")
+    one_claim = note_line(2836, ref_prs[0], dict(ref_prs[1], body='Fixes #2836'), ['f.cpp'])
+    ok(one_claim is not None and 'only names it' in one_claim,
+       "... but one claimer plus one mention still prints a note, and it says which is which")
+    ok('neither says Fixes/Closes' in note_line(2836, ref_prs[0], ref_prs[1], ['f.cpp']),
+       "... and the old sentence is kept only where it is true: two PRs that both merely name the issue")
+    # engine#3060: a claim whose issue number is marked up is still a claim
+    # engine#3060 / review of #3064 (pi-i679): the markup set is *, _ and ~ (strikethrough) -- contiguous markers only,
+    # directly before the number. A BACKTICKED number stays a non-claim: it is inside code, and this tool's stated rule
+    # is that a claim written inside code is documentation. Both directions are pinned so a later widening to "any
+    # punctuation" has to argue with a failing test.
+    ok(claims("Closes **#3041** -- the row has been red") == [3041], "a bold claim is a claim (engine#3060)")
+    ok(claims("Fixes __#12__") == [12] and claims("Closes *#7*") == [7] and claims("Fixes ~~#9~~") == [9],
+       "... and so are underscore, italic and strikethrough markup")
+    ok(claims("Closes `#12` -- quoted in a log line") == [],
+       "... while a backticked NUMBER is inside code and is not a claim")
+    ok(referenced("Refs **#7**") == [7], "... and so does a marked-up reference")
     # a reference inside code is documentation, like a claim inside code
     ok(referenced("use `Refs #12` next to the PR body") == [], "a `Refs` inside an inline code span is not a reference")
 
@@ -606,9 +632,9 @@ def main(argv):
                 # `if a.gate:` an AttributeError on the first run that printed a note -- a crash that only
                 # fires when the tool has something to say.
                 pa, pb, shared = note[2], note[3], note[4]
-                print(f"duplicate_fixes: {repo} #{pa['number']} and #{pb['number']} both name #{issue} and touch "
-                      f"{', '.join(shared)} -- neither says Fixes/Closes, so this is a note, not a finding",
-                      file=sys.stderr)
+                line = note_line(issue, pa, pb, shared)
+                if line is not None:      # None = already a finding; do not restate it with a false reason
+                    print(f"duplicate_fixes: {line}", file=sys.stderr)
         for f in found:
             print(f"{f['repo']}: " + describe(f['issue'], f['prs']))
         clean = clean_line(found, failed)
@@ -627,6 +653,32 @@ def main(argv):
                   file=sys.stderr)
         return 0
     return exit_code(found, failed)
+
+
+def claims_issue(p, issue):
+    """Does this PR CLOSE the issue? `describe()` and the note line must agree on the answer (engine#3060)."""
+    return issue in claims(f"{p.get('title') or ''}\n{p.get('body') or ''}")
+
+
+def note_line(issue, pa, pb, shared):
+    """The sentence for a bare-mention pair, or None when the strong pass already reports the pair.
+
+    engine#3060: the note said "neither says Fixes/Closes" for every pair -- including two PRs that both say
+    `Closes #N`, because the population is a bare `#N` scan and nothing asked. That pair is a FINDING, so the run
+    printed the finding and then a quieter restatement of it whose reason was false (seven such lines on the
+    2026-11-21 23:5xZ queue, all of them #3058/#3059-shaped: both bodies said `Fixes #3057.`). Now: two claimers are
+    suppressed, one claimer names which is which, and the original sentence is kept only for the case that makes it
+    true -- the #2991 shape, where one PR only names the issue and the note is the only detector.
+    """
+    ca, cb = claims_issue(pa, issue), claims_issue(pb, issue)
+    if ca and cb:
+        return None
+    if ca or cb:
+        claimer, other = (pa, pb) if ca else (pb, pa)
+        return (f"#{claimer['number']} says it closes #{issue} and #{other['number']} only names it, "
+                f"and they touch {', '.join(shared)} -- a note, not a finding")
+    return (f"#{pa['number']} and #{pb['number']} both name #{issue} and touch {', '.join(shared)} "
+            f"-- neither says Fixes/Closes, so this is a note, not a finding")
 
 
 def bare_mentions(prs, files_of=None):

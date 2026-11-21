@@ -8,11 +8,8 @@
 # An entry that no open pair claims any more is reported as STALE, so this file cannot quietly grow.
 # A comment starts at ' #'; a leading '#' is the issue number.
 #
-# engine#1783 has one open pair that is a STACK, not two lanes on the same work: PR3037's base branch is PR3036's head
-# (cl-1783/cold), so it cannot exist without PR3036 and the overlapping files are the stack itself. The check reads only
-# the open-PR set, the titles/bodies and the file lists, so it cannot see a base branch -- which is why this is declared
-# rather than fixed. PR3036 lands first. Remove the line below when either closes.
-# NOTE for the next entry: a `#` preceded by whitespace starts a comment, so the reason is cut there. That is why the
-# reason below writes "PR3037" and not " #3037" -- the first version of this line was truncated to "a stack, not a
-# duplicate:" in the gate's report, and a declaration whose justification never prints is a silence (engine#3040 review).
-1783 a stack, not a duplicate: PR3037's base is PR3036's head branch (cl-1783/cold); PR3036 lands first
+# NOTE for the next entry (engine#3040/#1783): a `#` preceded by whitespace starts a comment, so a reason that writes
+# " #3037" is cut there -- the first version of the one entry this file has carried was reported as the bare phrase "a
+# stack, not a duplicate:", i.e. a declaration whose justification never printed. Write "PR3037" instead, or drop the
+# entry when the pair it declares closes: a stale entry prints a STALE line on every run and exempts every future pair
+# for that issue, which is a hole with no upside (engine#1783's pair ended when #3036 and #3037 merged).

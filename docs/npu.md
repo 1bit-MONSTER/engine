@@ -3750,6 +3750,13 @@ The files these dumps write (`NPU_INFER_DUMP_DIR`'s `layer_<ll>.f32`, `NPU_I8_GS
 created owner-only (0600) and never through a symlink at the final path component, whatever the umask, and a dump file
 an older build left at 0666 is narrowed to 0600 when it is rewritten; the head-image cache's files are at most 0644. Both go through `npu/forward/include/file_create.h`, so no write site uses `fopen(…, "w")`,
 which creates with 0666 under the umask and follows a planted link (CodeQL `cpp/world-writable-file-creation`).
+`scripts/npu-kernel-bitx.sh` runs both arms with `NPU_INFER_DUMP_DIR` set and compares the two residual streams
+with `tools/ci/npu_residual_diff.py`: those files are taken **before** the head, so they answer whether the two
+bodies parted, separately from a logits verdict that a differing head can decide on its own (engine#3196 — on a
+container whose `lm_head` the device does not claim, the device runs an f32 host matvec while the integer arm runs
+its int8 ladder). The comparison is advisory: the threshold at which two bodies count as agreeing is a decision the
+issue has not made, and the tool answers `cannot tell` (exit 2) when the band has no comparable layer.
+
 `tools/ci/file_create_check.py` refuses a new `fopen(…, "w")` or `"a"` anywhere in the tree unless the line says why
 (`file-create-ok: <reason>`), and `tests/file_create_test.c` pins the modes.
 

@@ -84,6 +84,11 @@ prompts=(${args[@]+"${args[@]}"})
 
 out=${BITX_OUT:-$HOME/.cache/scratch-bitx/$(basename "$container" .q4nx)}
 rm -rf "$out"; mkdir -p "$out/dev" "$out/host"
+# engine#3196: logits alone cannot say whether two arms differ in the BODY or in the HEAD. On a container whose
+# `lm_head` the device does not claim, the device falls through to an f32 host matvec while the integer arm takes its
+# int8 ladder, so a logits verdict there is about two heads. The residual stream (`NPU_INFER_DUMP_DIR`, one
+# `layer_<ll>.f32` per layer) is taken before the head, so the same runs can answer the body question too.
+mkdir -p "$out/dev/layers" "$out/host/layers"
 
 serve() {   # <dir> <port> [env ...]
     local dir=$1 port=$2; shift 2
@@ -95,7 +100,7 @@ serve() {   # <dir> <port> [env ...]
     case "$budget" in
         ''|*[!0-9]*|0) echo "  $dir: BITX_SERVE_WAIT_S must be a positive integer of seconds (got '$budget')" >&2; return 2 ;;
     esac
-    env "$@" "$bin" forward-serve -m "$container" --kernels "$kernels" --prefix-slots 0 \
+    env "$@" NPU_INFER_DUMP_DIR="$dir/layers" "$bin" forward-serve -m "$container" --kernels "$kernels" --prefix-slots 0 \
         -p "$port" --dump-logits "$dir" > "$dir.log" 2>&1 &
     local pid=$!
     local up=0
@@ -167,5 +172,13 @@ if [ "$repeats" -gt 1 ]; then
                      || { echo "npu-kernel-bitx: $drift of $total position(s) differ between repeats" >&2; bad=$((bad + drift)); }
 fi
 [ "$n" -gt 0 ] || { echo "npu-kernel-bitx: no logits were dumped -- the run proved nothing" >&2; exit 1; }
+# engine#3196 fix 2: WHERE the two arms part, on the same runs and before the head. ADVISORY on purpose -- the
+# threshold at which a body counts as agreeing is a decision #3196 has not made yet, and turning it into a second
+# gate criterion here would red the arm for a difference the issue is still measuring. What it does settle is the
+# question the logits verdict cannot: a logits difference with the residuals inside the band is a HEAD difference.
+residual_tool="$(dirname "$0")/../tools/ci/npu_residual_diff.py"
+if [ -f "$residual_tool" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$residual_tool" "$out/dev/layers" "$out/host/layers" 2>&1 | sed 's/^/  /'
+fi
 if [ "$bad" = 0 ]; then echo "npu-kernel-bitx: $n/$n prompt(s) bit-exact against the host integer arm"; exit 0; fi
 echo "npu-kernel-bitx: $bad of $n prompt(s) differ from the host" >&2; exit 1

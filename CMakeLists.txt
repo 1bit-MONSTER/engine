@@ -731,6 +731,11 @@ add_python_test(loom_pin_check_self ${CMAKE_SOURCE_DIR}/tools/ci/loom_pin_check.
 # and size and are different models. The self-test arms that trap and the cannot-tell; the live check needs the card
 # tree, which is a ~GB download, so it is a lane command and not a CI row.
 add_python_test(loom_coverage_check_self ${CMAKE_SOURCE_DIR}/tools/ci/loom_coverage_check.py --self-test)
+# engine#3196 fix 2: two arms' per-layer residual dumps compared on their own, so a bit-exactness verdict can
+# say whether the BODY or the HEAD differs. Self-test only in CI: the live comparison needs two NPU runs that
+# dumped `layer_<ll>.f32` (`NPU_INFER_DUMP_DIR`), and `scripts/npu-kernel-bitx.sh` calls the tool on the runs it
+# already makes.
+add_python_test(npu_residual_diff_self ${CMAKE_SOURCE_DIR}/tools/ci/npu_residual_diff.py --self-test)
 # engine#3103: hrx2kineto.py gained a --self-test (its per-kernel ranking's FLOP attribution and its shape-log join),
 # and a self-test no runner names is a self-test nobody runs -- tool_selftest_wired_check and tests_referenced both said
 # so on the PR's first build, which is the same failure the loomc pair check above records.

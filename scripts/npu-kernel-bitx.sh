@@ -134,7 +134,13 @@ for r in $(seq 1 "$repeats"); do
     mkdir -p "$d"
     serve "$d" $((18150 + r - 1)) || exit 1
 done
-echo "host   :"; serve "$out/host" 18151 NPU_INFER_HOST_GEMM=i8 || exit 1
+# engine#3196: the integer arm's head is its own ladder (int8 activations, 8192-wide vocabulary blocks,
+# q4nx_forward.cpp's lm_head_i8_), while a device whose head runs on the host computes it in f32 ("lm head: on the
+# host (default...)" in the serve log). Comparing those two logits compares the HEADS: measured on a 14B container
+# (npu-kernels#115) the integer arm's whole logit vector was ~0.3x the other two arms and its argmax flipped on the
+# shortest prompt, while the device agreed with the f32 arm. NPU_I8_HEAD_OFF=1 (engine#3197) takes the ladder out so
+# both arms run the same head; the body GEMMs stay int8 x int4 in exact int32, which is what this gate is about.
+echo "host   :"; serve "$out/host" 18151 NPU_INFER_HOST_GEMM=i8 NPU_I8_HEAD_OFF=1 || exit 1
 
 bad=0 n=0
 # Every device run must match the host; then the repeats must match each other. Comparison loops over the run dirs actually made.

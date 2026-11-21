@@ -39,7 +39,7 @@ fail=0
 check() { if eval "$2"; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s\n' "$1"; fail=1; fi; }
 
 bogus="origin/this-ref-does-not-exist"
-base_rows="tools/ci/registration_loss_check.py tools/ci/registry_loss_check.py tools/ci/branch_stale_check.py tools/ci/guard_loss_check.py"
+base_rows="tools/ci/registration_loss_check.py tools/ci/registry_loss_check.py tools/ci/branch_stale_check.py tools/ci/guard_loss_check.py tools/ci/ctest_row_name_check.py"
 open_rows="tools/ci/duplicate_fixes_check.py tools/ci/pr_branch_stale_check.py"
 
 # A checkout with no history is the case the flag exists for, and a ref that cannot resolve is the same event: neither
@@ -47,12 +47,12 @@ open_rows="tools/ci/duplicate_fixes_check.py tools/ci/pr_branch_stale_check.py"
 out=$(timeout 900 scripts/pre-pr-checks.sh --base "$bogus" --base-optional --tree-only 2>&1); rc=$?
 
 check "the run completes (rc=0) with no base and --base-optional" '[ $rc -eq 0 ]'
-# 4 is the four `--base` rows. The rows above that are facts about the MACHINE rather than about this runner, and each says
+# 5 is the five `--base` rows (the fifth, `ctest_row_name_check`, arrived with engine#3223). The rows above that are facts about the MACHINE rather than about this runner, and each says
 # which: `loom_pin_check` is cannot-tell when no local clone carries the Loom pin and green when one does (5), and
 # `loom_coverage_check` is cannot-tell when the card trees are absent -- CI's normal state -- and green where they exist (6).
 # Accepting the range keeps this arm's teeth on the four rows it is actually about; a machine-dependent row must not be able
 # to satisfy it by itself.
-check "the summary counts them as cannot-tell, not as a pass" 'grep -qE "pre-pr-checks: .*, (4|5|6) could not be told" <<<"$out"'
+check "the summary counts them as cannot-tell, not as a pass" 'grep -qE "pre-pr-checks: .*, (5|6|7) could not be told" <<<"$out"'
 check "the summary says how many open-PR rows it did not run" \
       'grep -q "pre-pr-checks: .*2 open-PR row(s) not run (--tree-only)" <<<"$out"'
 # engine#3138 review (cl-1077, whose #3137 the orchestrator closed as this PR's duplicate): the run path is a DIFFERENT
@@ -79,8 +79,8 @@ check "every row --list --tree-only names actually ran (a swallowed row is not a
 # applied verbatim) made this file report `ok` while one check had vanished from the run. So the expected SIZE is a
 # literal, taken from the repository the way the runner's own self-test takes 19/17: a dropped row cannot hide behind a
 # second reading of the same broken function.
-check "--list --tree-only still names 17 rows (a literal, not a second reading of this code)" \
-      '[ "$(printf "%s\n" "$listed" | grep -c .)" -eq 17 ]'
+check "--list --tree-only still names 18 rows (a literal, not a second reading of this code)" \
+      '[ "$(printf "%s\n" "$listed" | grep -c .)" -eq 18 ]'
 # ...and the TOTAL, which is the arm #3145 arrived at independently 24 seconds after this branch (crediting it here
 # because its reasoning is the better statement of the same property, and it catches one thing mine does not): a filter
 # that drops a row it never announced changes this number and nothing else; a row that prints TWO lines changes it too.

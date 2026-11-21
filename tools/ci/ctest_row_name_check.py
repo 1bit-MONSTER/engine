@@ -110,7 +110,7 @@ def check(root: pathlib.Path, base: str) -> tuple[int, list[str]]:
         # diff that looks clean proves nothing. cannot-tell, not a pass (engine#3106's rule).
         return 2, [f"{root}: a shallow clone, so `{base}...HEAD` is not a comparison the base register was read from"]
     if git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}").returncode != 0:
-        return 2, [f"cannot resolve --base {base}: fetch it, then re-run (cannot tell, not a pass)"]
+        return 2, [f"--base {base} does not resolve: fetch it, then re-run (cannot tell, not a pass)"]
     added, known = added_row_lines(root, base), base_rows(root, base)
     if added is None or known is None:
         return 2, [f"cannot read {ROW_FILE} from {base} or diff against it (cannot tell, not a pass)"]

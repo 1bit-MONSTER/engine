@@ -35,7 +35,10 @@ Rules -- `configure-only` (alias `ctest-only`) requires ALL of:
    must not force a compile here either. Without it, no real registration PR would ever skip: replayed over main, the
    four registration-only commits and #1491 each carried their test file and were all `full` (engine#1500). If the
    workflow's list cannot be read, every changed path counts, as before;
-2. every added and removed line in those files matches `add_test(`, `set_tests_properties(` or `set_property(TEST ... `,
+2. every added and removed line in those files matches `add_test(`, `add_python_test(` (this repo's single
+   registration wrapper, `CMakeLists.txt:552`, which calls `add_test` and creates no target), `set_tests_properties(` or
+   `set_property(TEST ... ` — unless a `add_python_test` row hands ctest a built binary through `$<TARGET_FILE:...>`,
+   which does need the compile that produces it;
    or is blank/comment -- a balance check then requires the removed and added lines to agree in kind, so a registration
    cannot be swapped for a `target_link_libraries`;
 3. the registrations do not sit inside a `foreach`/`function`/`macro` block, because a registration emitted from a loop or a
@@ -84,6 +87,13 @@ def is_trigger(path, triggers):
         _glob_re(t).match(path) if "*" in t else (path == t or path.startswith(t.rstrip("/") + "/")) for t in triggers)
 
 REGISTRATION = re.compile(r"^\s*(add_test\s*\(|set_tests_properties\s*\(|set_property\s*\(\s*TEST\b)")
+# engine#3228: `add_python_test(...)` is the repo's single registration wrapper -- it calls add_test through
+# ${Python3_EXECUTABLE} and creates no target -- so a row of them cannot change what compiles. It was missing from the
+# list, so every PR adding a python row (the commonest registration in this repo) paid the full HRX compile: #3219 and
+# b299efbc both came out `full` with "added line is not a ctest registration: 'add_python_test(census_counters_self …'".
+# A row that hands ctest a built binary (`$<TARGET_FILE:…>`) is NOT one: that row needs the compile it names.
+PYTHON_ROW = re.compile(r"^\s*add_python_test\s*\(")
+TARGET_FILE = re.compile(r"\$<TARGET_FILE:")
 BENIGN = re.compile(r"^\s*(#|$)")
 BLOCK_OPEN = re.compile(r"^\s*(foreach|function|macro)\s*\(", re.IGNORECASE)
 
@@ -93,6 +103,8 @@ def classify_line(line):
     if BENIGN.match(line):
         return "benign"
     if REGISTRATION.match(line):
+        return "registration"
+    if PYTHON_ROW.match(line) and not TARGET_FILE.search(line):
         return "registration"
     return "other"
 
@@ -236,6 +248,27 @@ def self_test():
         ("only a comment and a blank line",
          ["CMakeLists.txt"],
          "+++ b/CMakeLists.txt\n@@ -1,1 +1,2 @@\n+# note\n\n", "full"),
+        # engine#3228: `add_python_test(...)` is the wrapper every new python row in this repo uses, and it creates no
+        # target -- before this arm, #3219 and b299efbc both came out `full` because the line "is not a ctest
+        # registration", i.e. a pure registration PR paid the eight-minute HRX compile.
+        ("the repo's own add_python_test wrapper, alone",
+         ["CMakeLists.txt"],
+         "+++ b/CMakeLists.txt\n@@ -1,1 +1,2 @@\n"
+         "+add_python_test(census_counters_self ${CMAKE_SOURCE_DIR}/tools/ci/census_counters_check.py --self-test)\n",
+         "configure-only"),
+        # ... but a row that hands ctest a built binary needs the compile that produces it, so it must not be waved
+        # through: the exclusion that keeps the arm above from being a blanket yes.
+        ("an add_python_test row that names a built target ($<TARGET_FILE:...>)",
+         ["CMakeLists.txt"],
+         "+++ b/CMakeLists.txt\n@@ -1,1 +1,2 @@\n"
+         "+add_python_test(serve_smoke ${CMAKE_SOURCE_DIR}/tools/ci/serve_smoke.py $<TARGET_FILE:onebit>)\n",
+         "full"),
+        # the balance check still applies to the wrapper: swapping a row for a flag change is not a registration
+        ("an add_python_test row swapped for a flag change",
+         ["CMakeLists.txt"],
+         "+++ b/CMakeLists.txt\n@@ -1,2 +1,2 @@\n"
+         "-add_python_test(a ${CMAKE_SOURCE_DIR}/tools/ci/a.py)\n"
+         "+option(ONEBIT_NEW \"x\" OFF)\n", "full"),
         # set_tests_properties creates no target either, so a pure addition of one is configure-only too
         ("set_tests_properties alone",
          ["CMakeLists.txt"],

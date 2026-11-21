@@ -2557,14 +2557,6 @@ int serve_models(const Options& o) {
 #endif
 
 int serve_child(const Options& given) {
-    // engine#3130: which binary is US. Our own serve reports the port it bound (`--port 0`), a foreign child cannot, so
-    // only our own child is asked to (engine#3171's refusal covers a launch that gets that wrong).
-    std::string self_path;
-    {
-        std::error_code ec;
-        self_path = fs::read_symlink("/proc/self/exe", ec).string();
-        if (ec) self_path.clear();
-    }
     Options o = given;
     if (hadamard_q4_0(o.model))
         throw std::runtime_error(o.model + " is an H32 file (onebit.hadamard_q4_0, a Hadamard-rotated Q4_0): the engine "
@@ -2664,14 +2656,13 @@ int serve_child(const Options& given) {
         if (laya) {
             for (const std::string& dev : gguf_devices()) {
                 try {
-                    // engine#3130: no port is chosen and released before our own serve binds (engine#1070's race); a
-                    // foreign child keeps free_port(), because it cannot tell us what it bound.
-                    Launch launched = launch_for(o, dev, self_path.empty() ? free_port() : 0);
-                    if (!self_path.empty() && launched.argv[0] != self_path) {
-                        launched.port = free_port();
-                        set_port_arg(launched.argv, launched.port);
-                    }
-                    backends.push_back(std::move(launched));
+                    // engine#3130: a `--laya` child is llama-server on every branch of launch_for (`gguf_devices()` is
+                    // hrx/cpu only), so it cannot tell us the port it bound and keeps free_port() -- a llama-server
+                    // handed `--port 0` is what engine#3171's refusal refuses. The rail that does pass `--port 0` to our
+                    // own serve is `--laya-models`, which reads the port back once the child is ready (engine#3168).
+                    // An earlier version of this line read /proc/self/exe and passed 0 whenever this process could be
+                    // resolved; that branch never fired, so it is deleted rather than repaired (engine#3130).
+                    backends.push_back(launch_for(o, dev, free_port()));
                     laya_devices.push_back(dev);
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "1bit serve: laya: %s is not a candidate: %s\n", dev.c_str(), e.what());

@@ -88,10 +88,14 @@ rm -rf "$out"; mkdir -p "$out/dev" "$out/host"
 # `lm_head` the device does not claim, the device falls through to an f32 host matvec while the integer arm takes its
 # int8 ladder, so a logits verdict there is about two heads. The residual stream (`NPU_INFER_DUMP_DIR`, one
 # `layer_<ll>.f32` per layer) is taken before the head, so the same runs can answer the body question too.
-mkdir -p "$out/dev/layers" "$out/host/layers"
+# (the per-run dump directory is created in serve(), which covers dev, dev1..R and host alike)
 
 serve() {   # <dir> <port> [env ...]
     local dir=$1 port=$2; shift 2
+    # engine#3196 review: the dump directory has to exist for the CHILD (`docs/npu.md`: "The directory must exist"),
+    # and `$dir` is not always `$out/dev` -- `--repeats R` runs the device into `$out/dev1..R`, where nothing created
+    # it, so the device arm dumped nothing and the arm that exists to measure determinism lost the comparison.
+    mkdir -p "$dir/layers"
     # engine#3194: 60 s is a whisper-sized budget. A 14B host-GEMM arm spends minutes warming first
     # (`forward-total` pays the weight cache up front: "forward-serve: warming (weight cache; first request would
     # otherwise pay it)"), so a fixed 60 s kills it mid-warm and files the result as a failure. The budget is
@@ -177,8 +181,20 @@ fi
 # gate criterion here would red the arm for a difference the issue is still measuring. What it does settle is the
 # question the logits verdict cannot: a logits difference with the residuals inside the band is a HEAD difference.
 residual_tool="$(dirname "$0")/../tools/ci/npu_residual_diff.py"
-if [ -f "$residual_tool" ] && command -v python3 >/dev/null 2>&1; then
-    python3 "$residual_tool" "$out/dev/layers" "$out/host/layers" 2>&1 | sed 's/^/  /'
+if [ ! -f "$residual_tool" ]; then
+    echo "  residuals: not compared (no tools/ci/npu_residual_diff.py beside this script)"
+elif ! command -v python3 >/dev/null 2>&1; then
+    echo "  residuals: not compared (no python3)"
+else
+    # `$first` is the first device run's directory (`--repeats R` writes dev1..R, and `$out/dev` exists only at R=1).
+    python3 "$residual_tool" "$first/layers" "$out/host/layers" 2>&1 | sed 's/^/  /'
+    # The dumps are M x H x 4 B per layer per arm (5120 f32 per layer on the 14B family, ~450 MB per arm at 1366
+    # tokens and 40 layers); BITX_KEEP_DUMPS=0 drops them after the comparison, as the logits dumps are dropped by the
+    # next run of the same container.
+    if [ "${BITX_KEEP_DUMPS:-1}" = 0 ]; then
+        rm -rf "$first/layers" "$out/host/layers"
+        echo "  residuals: layer dumps removed (BITX_KEEP_DUMPS=0)"
+    fi
 fi
 if [ "$bad" = 0 ]; then echo "npu-kernel-bitx: $n/$n prompt(s) bit-exact against the host integer arm"; exit 0; fi
 echo "npu-kernel-bitx: $bad of $n prompt(s) differ from the host" >&2; exit 1

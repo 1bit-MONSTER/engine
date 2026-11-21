@@ -3755,7 +3755,10 @@ with `tools/ci/npu_residual_diff.py`: those files are taken **before** the head,
 bodies parted, separately from a logits verdict that a differing head can decide on its own (engine#3196 — on a
 container whose `lm_head` the device does not claim, the device runs an f32 host matvec while the integer arm runs
 its int8 ladder). The comparison is advisory: the threshold at which two bodies count as agreeing is a decision the
-issue has not made, and the tool answers `cannot tell` (exit 2) when the band has no comparable layer.
+issue has not made, and the tool answers `cannot tell` (exit 2) when the band has no comparable layer. The dumps
+cost `M x H x 4 B` per layer per arm (5120 f32 per layer on the 14B family, so ~450 MB per arm at 1366 tokens over
+40 layers, and several GB at a long prompt) under `~/.cache/scratch-bitx/<container>`; `BITX_KEEP_DUMPS=0` drops
+them once the comparison has run, and the next run of the same container clears the directory either way.
 
 `tools/ci/file_create_check.py` refuses a new `fopen(…, "w")` or `"a"` anywhere in the tree unless the line says why
 (`file-create-ok: <reason>`), and `tests/file_create_test.c` pins the modes.

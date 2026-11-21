@@ -495,6 +495,26 @@ int stop_grace_s() {
     return 30;
 }
 
+// engine#3130 / ONEBIT_FOREIGN_PORT_GRACE_S: how long a backend port answered by a FOREIGN process is tolerated before
+// serve refuses it (default 10 s). Both halves of that answer are real and they pull in opposite directions:
+//   * a concurrent run's server (or a leftover) can answer the port serve picked for this backend *before* our child has
+//     bound it. Our child is then on its way to EADDRINUSE, which is the cause engine#2537's relaunch handles -- refusing
+//     at once made that failure terminal and serve exited 1 on a port it picked itself (main red at 44161f231);
+//   * a port held for good must still be refused, promptly and with the same message -- `tests/smoke_serve.sh` pins
+//     "a port held by another process is refused (rc 1)" and its own 30 s timeout is what caught an unbounded version of
+//     this change (the build job of engine#3135).
+// So the wait is bounded: inside the grace we keep polling (the child may bind and become the owner, or die and let the
+// relaunch run), and at the end of it we refuse exactly as before.
+int foreign_port_grace_s() {
+    if (const char* e = std::getenv("ONEBIT_FOREIGN_PORT_GRACE_S"); e && *e) {
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (end && *end == '\0' && v >= 0 && v <= 86400) return int(v);
+        std::fprintf(stderr, "1bit serve: ONEBIT_FOREIGN_PORT_GRACE_S=%s ignored (whole seconds, 0..86400); using 10\n", e);
+    }
+    return 10;
+}
+
 #ifdef _WIN32
 // Windows: CreateProcess into a job object that kills its processes when its last handle
 // closes, so the backend dies with `1bit serve` for any reason (Linux: PR_SET_PDEATHSIG).
@@ -697,14 +717,38 @@ public:
         httplib::Client c("127.0.0.1", port_);
         c.set_connection_timeout(1);
         const auto end = std::chrono::steady_clock::now() + timeout;
+        const auto foreign_grace = std::chrono::seconds(foreign_port_grace_s());
+        // A previous call already spent the grace on this child (the relaunch loop calls wait_ready again after it
+        // breaks), so the second refusal is immediate: the smoke case must exit well inside its 30 s budget.
+        const bool waited_before = port_foreign_;
+        auto       foreign_since = std::chrono::steady_clock::time_point{};
         while (std::chrono::steady_clock::now() < end) {
             if (!alive() || stop) return false;
             if (auto r = c.Get(ready_path_); r && r->status == 200) {
 #if defined(__linux__)
                 if (port_owner(pid_, port_) == PortOwner::kOther) {
-                    std::fprintf(stderr, "1bit serve: port %d answers, but not from the backend serve started (pid %d); "
-                                         "refusing to use it\n", port_, int(pid_));
-                    return false;
+                    // engine#3130: something else owns this port. Two cases, one answer each: our child may still bind it
+                    // (or die with EADDRINUSE and let #2537's relaunch fire) -- so keep polling -- but a port held for
+                    // good must be refused, so the wait is bounded by ONEBIT_FOREIGN_PORT_GRACE_S. Printed on the first
+                    // sighting and again at the refusal, not every 250 ms.
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!port_foreign_) {
+                        port_foreign_ = true;
+                        foreign_since = now;
+                        std::fprintf(stderr,
+                                     "1bit serve: port %d answers, but not from the backend serve started (pid %d); waiting "
+                                     "up to %d s for it (engine#3130)\n",
+                                     port_, int(pid_), int(foreign_grace.count()));
+                    }
+                    if (waited_before || now - foreign_since >= foreign_grace) {
+                        std::fprintf(stderr,
+                                     "1bit serve: port %d is still not the backend serve started (pid %d) after %d s; "
+                                     "refusing to use it\n",
+                                     port_, int(pid_), int(foreign_grace.count()));
+                        return false;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    continue;
                 }
 #endif
                 return true;
@@ -736,6 +780,10 @@ private:
     mutable pid_t pid_ = -1;      // the running child; -1 once reaped (or never started)
     mutable bool exited_ = false; // reaped with a status (status_)
     mutable int status_ = 0;
+    // engine#3130: answered at least once by a process that is NOT this child. Such an answer is tolerated for
+    // ONEBIT_FOREIGN_PORT_GRACE_S (see foreign_port_grace_s) and then refused, and a second call to wait_ready refuses
+    // at once -- both because a port that is held for good must still fail fast with the message smoke_serve greps for.
+    mutable bool port_foreign_ = false;
 #endif
     int port_;
     std::string ready_path_;

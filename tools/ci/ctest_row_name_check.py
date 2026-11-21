@@ -37,13 +37,16 @@ What already catches this, and why none of it does:
     a diagnosis cycle (#1979 covered the stale-hunk cousin of this, which a rebase shows you as a conflict; this
     one shows up as a CMake error).
 
-So: intersect the row names a branch **adds** with the names present in `<base>:CMakeLists.txt` -- the base
+So: intersect the row names a branch **adds** with the names present in the base tree -- the base
 **tip**, because that is where the duplicate appears. Rebased, the diff stops adding the row and this goes quiet,
 which is the fix.
 
-Narrow on purpose: CMakeLists.txt only, and only the two registration spellings this tree uses
-(`add_test(NAME X` and `add_python_test(X`). A name computed from a variable is not compared (the arms pin that),
-because a check that guesses at expansion is a check that reports names it did not read.
+Narrow on purpose: the namespace is exactly what the registration glob at the end of `CMakeLists.txt` `include()`s
+-- the top-level file plus `cmake/tests-*.cmake` -- and only the two registration spellings this tree uses
+(`add_test(NAME X` and `add_python_test(X`). A row in any other `cmake/*.cmake` file is NOT seen: the glob is the
+definition of the namespace, not a sample of it (and it is a different CMake directory scope, `add_subdirectory`,
+that makes `onnx/`'s rows a separate namespace). A name computed from a variable is not compared (the arms pin
+that), because a check that guesses at expansion is a check that reports names it did not read.
 
 Two shapes that are NOT duplicates, both measured on `main`'s own history before this row landed: a row REWRITTEN
 in place (engine#3018 removed and re-added the name in one diff), and the same name registered inside a **different
@@ -53,7 +56,8 @@ configure takes.
 
 Exit: 0 no collision, 1 the branch adds a name the base already registers (and the diff does not remove it),
 2 cannot tell (no git, an unresolvable base, a shallow clone where `base...HEAD` is not a real comparison, or a
-collision where either side sits inside an `if()` block).
+collision where BOTH sides sit inside an `if()` block -- an unconditional registration at either end collides
+whenever the other side's guard is on, so one guarded side is a collision, not a cannot-tell).
 
   tools/ci/ctest_row_name_check.py --check [--base origin/main] [--root .]
   tools/ci/ctest_row_name_check.py --self-test
@@ -353,6 +357,17 @@ def self_test() -> int:
                                   + "add_python_test(parked_row ${CMAKE_SOURCE_DIR}/x.py)\n")
         subprocess.run(["git", "-C", str(d), "commit", "-qam", "a parked row and its live copy"], check=True)
         chk(0, check(d, "main")[0], "a commented-out copy beside the live row is not a second registration")
+
+        # 3i. the LEGAL cross-file MOVE: the row leaves `CMakeLists.txt` and arrives once in a family file -- one
+        # registration in the tree, so it is quiet. This is the negative control for 3g: it is the arm that reds if
+        # `freed` and `added` are ever read from different file sets, or if the #3018 subtraction is dropped.
+        d = repo(tmpd, "moved_to_family")
+        (d / "cmake").mkdir()
+        (d / ROW_FILE).write_text("# base\n")
+        (d / "cmake/tests-family.cmake").write_text("add_test(NAME taken_row COMMAND true)\n")
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(d), "commit", "-qm", "the row moves to a family file, once"], check=True)
+        chk(0, check(d, "main")[0], "a row MOVED to a family file (removed here, added once there) is not a collision")
 
         # 4. a name computed from a variable is not compared
         d = repo(tmpd, "variable_name")

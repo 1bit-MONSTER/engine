@@ -25,7 +25,7 @@ correctness gate supplied by the operator. Upstream also knows this board now
 | Path | What it is |
 | --- | --- |
 | `custom/` | The adapter: entrypoint, measurement, lever grid, launch line. Start at [`custom/README.md`](custom/README.md). |
-| `hrx2kineto.py` | Converts an HRX dispatch profile to a Kineto trace (Hyperloom's profile step, TraceLens, rocprof studio). With the fork's shape log it names every dispatch by its ggml op, shapes and layer, and doubles as a TraceLens extension (roofline, categories, TraceDiff). |
+| `hrx2kineto.py` | Converts an HRX dispatch profile to a Kineto trace (Hyperloom's profile step, TraceLens, rocprof studio). With the fork's shape log it names every dispatch by its ggml op, shapes and layer, and doubles as a TraceLens extension (roofline, categories, TraceDiff). `--summary` ranks by ggml op; `--by-kernel` ranks the same profile by **kernel** with TFLOP/s and % of this box's fp16 WMMA roof, which is the question a kernel-lane asks (engine#3103) — `--self-test` runs its fixture arms. |
 | `hrx-tracelens.sh <model> <prompt\|decode> [VAR=value ...]` | Profiles one run, converts it, and writes a TraceLens report (optionally with TraceDiff against another run). |
 
 ## History

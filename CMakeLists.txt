@@ -669,6 +669,10 @@ add_python_test(pr_branch_stale_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_branc
 add_python_test(self_test_flag ${CMAKE_SOURCE_DIR}/tests/self_test_flag_test.py)
 
 add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
+# engine#3103: hrx2kineto.py gained a --self-test (its per-kernel ranking's FLOP attribution and its shape-log join),
+# and a self-test no runner names is a self-test nobody runs -- tool_selftest_wired_check and tests_referenced both said
+# so on the PR's first build, which is the same failure the loomc pair check above records.
+add_python_test(hrx2kineto_self ${CMAKE_SOURCE_DIR}/tools/hyperloom/hrx2kineto.py --self-test)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
 # `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and
 # tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.

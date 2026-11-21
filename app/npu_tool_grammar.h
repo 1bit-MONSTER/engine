@@ -174,8 +174,12 @@ inline std::string tool_call_gbnf(const nlohmann::json& tools, const nlohmann::j
 //
 // `route` names what the model is running on, for the message (the model id is enough).
 inline std::string private_route_tools_refusal(const nlohmann::json& body, const std::string& route) {
-    const bool has_tools = body.contains("tools") && !body["tools"].is_null();
-    const bool has_choice = body.contains("tool_choice") && !body["tool_choice"].is_null();
+    // `tools: []` is not a constraint: many clients send the key with an empty list on every request, and refusing
+    // those would break ordinary chats. Only a non-empty list (or a real tool_choice) asks for something the route
+    // cannot honour.
+    const bool has_tools = body.contains("tools") && body["tools"].is_array() && !body["tools"].empty();
+    const bool has_choice = body.contains("tool_choice") && !body["tool_choice"].is_null() &&
+                            !(body["tool_choice"].is_string() && body["tool_choice"].get<std::string>() == "none");
     if (!has_tools && !has_choice) return "";
     return "this model runs on " + route + ", a private NPU route whose session cannot carry a tool grammar "
            "(npu/private_route.h:PrivateRequest has no constraint hook), so `" +

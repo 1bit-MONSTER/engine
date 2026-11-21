@@ -77,6 +77,16 @@ int main() {
               "tools: null is not a request for a tool call, so it is not refused");
     }
     {
+        // a client that always sends the key with an empty list must not lose every chat to the refusal
+        json body = {{"messages", json::array()}, {"tools", json::array()}};
+        check(private_route_tools_refusal(body, route).empty(),
+              "tools: [] carries no constraint, so it is not refused (clients send it on every request)");
+    }
+    {
+        json body = {{"messages", json::array()}, {"tool_choice", "none"}};
+        check(private_route_tools_refusal(body, route).empty(), "tool_choice: none asks for no call, so it is not refused");
+    }
+    {
         json body = {{"messages", json::array({{{"role", "user"}, {"content", "hello"}}})}};
         check(private_route_tools_refusal(body, route).empty(), "an ordinary chat request is not refused");
     }

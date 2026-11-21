@@ -40,12 +40,42 @@ usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
 base=origin/main
 strict=""
 list_only=0
+# engine#3116: which rc means what, in ONE place. Two cannot-tell codes exist in this repo -- ctest's 77 ("cannot run
+# here") and the tools' 2 ("could not measure") -- and the runner honoured only the first, so four of its own rows
+# (`registration_loss_check`, `registry_loss_check`, `branch_stale_check`, `guard_loss_check`) went to FAIL on a shallow
+# clone with a tool line that said "cannot tell". After #3107 the three guarded loss checks exit 2 whenever the clone is
+# shallow, and `actions/checkout` is shallow by default, so the shape was live: a gate printing red for a reason that is not
+# the PR, which is the failure this script's own header exists to prevent. A skip is counted in the summary either way, so
+# nothing hides.
+row_status() {  # <rc> -> ok | skip | fail
+    case "$1" in
+        0)  echo ok ;;
+        77) echo skip ;;   # ctest's "cannot run here": the tool said why
+        2)  echo skip ;;   # the repo's cannot-tell: the tool said why, and a skip is not a pass
+        *)  echo fail ;;
+    esac
+}
+
+selftest() {
+    local bad=0 got
+    for pair in "0:ok" "77:skip" "2:skip" "1:fail" "128:fail"; do
+        got=$(row_status "${pair%%:*}")
+        [ "$got" = "${pair#*:}" ] || { echo "FAIL row_status(${pair%%:*}) = $got, want ${pair#*:}"; bad=$((bad+1)); }
+    done
+    # the specific regression: a cannot-tell must not read as a finding
+    [ "$(row_status 2)" = skip ] || { echo "FAIL a row that answers 2 (cannot tell) must skip, not fail"; bad=$((bad+1)); }
+    [ "$(row_status 2)" = ok ] && { echo "FAIL a cannot-tell was read as a pass"; bad=$((bad+1)); }
+    [ "$bad" = 0 ] && echo "pre-pr-checks self-test: ok (rc map: 0 ok, 77 skip, 2 skip, else fail)"
+    return "$bad"
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --base) base=${2:-}; shift 2 || { usage >&2; exit 2; } ;;
         --base=*) base=${1#--base=}; shift ;;
         --list) list_only=1; shift ;;
         -h|--help) usage; exit 0 ;;
+        --self-test) selftest; exit $? ;;
         *) echo "pre-pr-checks: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
     esac
 done
@@ -167,13 +197,14 @@ for c in "${checks[@]}"; do
     name=${c%% *}
     out=$(python3 $c 2>&1); rc=$?
     last=$(printf '%s\n' "$out" | grep -v '^$' | tail -1)
-    if [ $rc -eq 77 ]; then
-        # 77 is the repo's "cannot run here" (ctest SKIP_RETURN_CODE): counted as a skip with the tool's own
-        # reason, so the summary still says something did not run
+    if [ "$(row_status "$rc")" = skip ]; then
+        # skip = 77 (ctest's "cannot run here") or 2 (the repo's cannot-tell), both from `row_status`. Counted with the
+        # tool's own reason, so the summary still says something did not run -- engine#3116 added the 2 that used to fall
+        # through to FAIL while the tool line read "cannot tell".
         printf 'skip  %-42s %s\n' "$name" "$last"
         skipped=$((skipped + 1)); continue
     fi
-    if [ $rc -eq 0 ]; then
+    if [ "$(row_status "$rc")" = ok ]; then
         # `submodule_pin_check --check` exits 0 having compared NOTHING when submodules are declared but
         # none is checked out -- `0 submodule(s) at their pinned commit, N not initialised` -- which would
         # print `ok` for a check that ran no comparison, the shape this script exists to stop. Matched on

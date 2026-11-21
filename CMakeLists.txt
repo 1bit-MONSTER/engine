@@ -635,6 +635,10 @@ add_python_test(branch_stale_check_test ${CMAKE_SOURCE_DIR}/tools/ci/branch_stal
 # the push. #2623 lost two commits that way (recovered by #2640) and #2605 lost one (recovered by
 # #2654). The row below is the hermetic one: the tool builds throwaway repos in a temp dir.
 add_python_test(merged_tail_check_self ${CMAKE_SOURCE_DIR}/tools/ci/merged_tail_check.py --self-test)
+# engine#3116: the pre-PR runner's own rc->status map. It is the one place that decides whether a row is ok / skip / fail,
+# so the map gets arms rather than a reading: the defect was a cannot-tell (rc 2) landing in FAIL. Hermetic, no build, no
+# network -- and it is here because a self-test nothing runs is the thing tool_selftest_wired_check exists to catch.
+add_test(NAME pre_pr_checks_self COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/pre-pr-checks.sh --self-test)
 # engine#2761: the known-failure ratchet for the fork's ctest suite. Its --self-test is hermetic
 # (it builds log fixtures in the process), so it is a default row like the one above. The ratchet's
 # LIVE use needs the fork built and is the ci.yml job the issue asks for, not this row.

@@ -563,6 +563,14 @@ endfunction()
 # engine#1864: the ordering rule itself, checked on the file (no configure, no build): every ${Python3_EXECUTABLE} use has
 # to follow the find_package above. The nine that did not ran through their exec bit, and a mode-only rewrite of one
 # script turned the row into BAD_COMMAND.
+# engine#3216: four tools carried a `--self-test` that nothing invoked, and `tool_selftest_wired_check` called them
+# wired because their NAME appeared in a row for another subcommand (`registry_build.py` had --check-gaps/-check-pins/
+# --check and an eight-arm --self-test that ran nowhere). The checker now requires the marker on the same line as the
+# name; these are the rows that make that rule true instead of merely strict. `registry_build_self` is not among them
+# because #3212/#3217 already wired it above.
+add_python_test(census_counters_self ${CMAKE_SOURCE_DIR}/tools/ci/census_counters_check.py --self-test)
+add_python_test(dupdef_check_self ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --self-test)
+add_python_test(stale_expectations_self ${CMAKE_SOURCE_DIR}/tools/ci/stale_expectations_check.py --self-test)
 add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
 # engine#2893 counted key-string mentions in one file and read zero as "cannot be reading it", which is how

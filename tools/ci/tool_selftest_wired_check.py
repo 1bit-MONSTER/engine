@@ -91,21 +91,34 @@ def references(root: pathlib.Path, sources=REFERENCE_SOURCES) -> str | None:
     return "\n".join(parts)
 
 
-def unwired(tools: list[pathlib.Path], refs: str) -> list[pathlib.Path]:
-    """Tools whose basename is named by no reference source.
+def reference_lines(refs: str) -> list[str]:
+    """The reference sources, one line at a time, comments dropped.
 
-    `--self-test` alone is not a reference: the tool's own flag spelling appears in every file that has one,
-    so matching it would mark the whole tree wired.
+    engine#3216: the rule is about a LINE, not about the concatenated text. A tool named by one row and mentioned
+    beside `--self-test` in a different one is not wired: `registry_build.py` had `--check-gaps`, `--check-pins` and
+    `--check` rows and an eight-arm `--self-test` that nothing invoked, and the whole-file match called it wired.
     """
-    out = []
-    for t in tools:
-        name = t.name
-        # A reference is a path, so the character before the basename is usually `/`: the lookbehind must not
-        # exclude it. It must exclude `_`, `.` and `-`, so `pre_check.py` is not read as a reference to `check.py`.
-        if re.search(r"(?<![\w.-])" + re.escape(name) + r"(?![\w-])", refs):
-            continue
-        out.append(t)
-    return out
+    return [l for l in refs.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+
+def named_beside_marker(tool: pathlib.Path, lines: list[str]) -> bool:
+    """True when some reference line names this tool AND carries a self-test marker."""
+    name = tool.name
+    # A reference is a path, so the character before the basename is usually `/`: the lookbehind must not
+    # exclude it. It must exclude `_`, `.` and `-`, so `pre_check.py` is not read as a reference to `check.py`.
+    rx = re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w-])")
+    return any(rx.search(l) and MARKER_RE.search(l) for l in lines)
+
+
+def unwired(tools: list[pathlib.Path], refs: str) -> list[pathlib.Path]:
+    """Tools whose arms nothing runs: no reference LINE names them beside a self-test marker.
+
+    `--self-test` alone is not a reference: the tool's own flag spelling appears in every file that has one, so
+    matching the marker anywhere would mark the whole tree wired. The marker has to sit on the line that names the
+    tool (engine#3216).
+    """
+    lines = reference_lines(refs)
+    return [t for t in tools if not named_beside_marker(t, lines)]
 
 
 def self_test() -> int:
@@ -146,6 +159,16 @@ def self_test() -> int:
         got = sorted(str(p.relative_to(root)) for p in unwired(tools, refs))
         chk(["tools/diag/orphan.py", "tools/selfonly.py"], got,
             "a tool no source names is reported (and a tool that only spells the flag is NOT wired)")
+
+        # engine#3216: a row for ANOTHER subcommand is not a wiring. The live case was `registry_build.py` with
+        # `--check-gaps`/`--check-pins`/`--check` rows and an eight-arm `--self-test` nothing invoked, reported wired.
+        chk([], unwired([pathlib.Path("registry_build.py")],
+                        "add_python_test(registry_build_self tools/registry_build.py --self-test)"),
+            "a tool named beside a --self-test is wired")
+        chk([pathlib.Path("registry_build.py")],
+            unwired([pathlib.Path("registry_build.py")],
+                    "add_test(NAME registry_gaps COMMAND tools/registry_build.py --check-gaps)"),
+            "a tool named ONLY for another flag is unwired (engine#3216)")
 
         # engine#2675 review: `.github/workflows/` is a fourth place, and it is the one where two of the four tools
         # already ran. A `run:` line is a wiring; a YAML comment naming the tool is not, exactly as for CMakeLists.

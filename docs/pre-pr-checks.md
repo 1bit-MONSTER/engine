@@ -21,11 +21,15 @@ Every command below, all host-side, none needing a device or a build. Every one 
 
 Run them from the repository root on the branch you are about to hand over.
 
-**`scripts/pre-pr-checks.sh` runs every command in the table below**, one line each (`--base <ref>` for the registration check, `--tree-only` to drop the two rows that read the whole open-PR set — this is what the `pre_pr_checks` CI job runs, so a duplicate PR opened by one lane cannot red every other lane's job — `--list` to see the
+**`scripts/pre-pr-checks.sh` runs every command in the table below**, one line each (`--base <ref>` for the registration check, `--tree-only` to drop the two rows that read the whole open-PR set — this is what the `pre_pr_checks_tree` ctest row runs, so a duplicate PR opened by one lane cannot red every other lane's job — `--list` to see the
 commands; a check that cannot run says `skip` and why — `77` (cannot run here) or `2` (cannot tell, e.g. the loss
 checks in a shallow clone — counted separately as "could not be told", never as a skip), both named in the summary with
 the tool's own reason; a row whose own invocation is wrong
-still fails, and an unresolvable `--base` is a usage error rather than a skip).
+still fails, and an unresolvable `--base` is a usage error rather than a skip — except under
+**`--base-optional`**, which exists for an automated run in a checkout with no history: `actions/checkout` at its default
+depth fetches one ref, so `origin/main` does not resolve and the four `--base` rows are reported as `cannot-tell` (with
+their own lines, counted in "could not be told") while the rows that read files and the index still run. A person who
+mistypes a ref still gets the usage error; nothing gets it by accident (engine#3131).
 
 **Which rows can answer `2`** (measured in a `--depth 1` clone and in an orphan-root tree, 2026-11-21):
 `registration_loss_check` and `guard_loss_check` (the shallow-clone guard), `branch_stale_check` (`no merge base for … ()`),

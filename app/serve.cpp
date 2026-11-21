@@ -74,6 +74,8 @@
 #include "mem_admit.h"
 #include "pm.h"
 #include "laya_checkpoint.h"
+#include "loom_route.h"
+#include "loom_routes_default.h"  // generated from config/loom-routes.json
 #include "recipes.h"
 #include "route_log.h"
 #include "serve_metrics.h"
@@ -118,6 +120,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include <deque>
@@ -194,6 +197,11 @@ struct Options {
     std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
     std::string laya_models;             // --laya-models FILE: model auto routed per request (docs/laya-models.md)
     std::string recipes;                 // --recipes FILE: tuned backend settings (default: built in, docs/recipes.md)
+    // The Loom GPU route (app/loom_route.h, docs/loom-route.md): --loom-routes FILE replaces the built-in table
+    // (config/loom-routes.json), --loom-serve PATH (or ONEBIT_LOOM_SERVE) names the server, --loom-cards DIR (or
+    // ONEBIT_LOOM_CARDS) is where a relative card resolves, --no-loom (or ONEBIT_NO_LOOM=1) keeps the llama.cpp route
+    std::string loom_routes, loom_serve, loom_cards;
+    bool no_loom = false;
     bool no_recipes = false;             // --no-recipes: the backend gets serve's own flags only
     // --template-pin FILE: expected chat-template sha256 per model (default: config/template-pins.json,
     // built in); --no-template-pin logs the sha without comparing it; --template-pin-strict (or
@@ -710,6 +718,15 @@ public:
     // the backend's last stderr lines (empty where serve does not pass its stderr through)
     std::vector<std::string> last_lines(size_t n) const { return tail_->last(n); }
     const std::string& ready_path() const { return ready_path_; }
+    // A backend whose ready path answers 200 before its model is loaded (loom-serve: GET /v1/status lists the card
+    // while it prepares) also says, in that body, whether the model is ready yet: `check` reads it and answers 1
+    // (ready), 0 (not yet) or -1 (failed for good, with the reason in its second argument). `health` is then the
+    // path serve's /health probes once the model is up, where the ready path is not the cheap one.
+    void set_ready_check(std::function<int(const std::string&, std::string&)> check, std::string health = "") {
+        ready_check_ = std::move(check);
+        health_path_ = std::move(health);
+    }
+    const std::string& health_path() const { return health_path_.empty() ? ready_path_ : health_path_; }
 
     // Polls the child's ready path (/health; /v1/models for servers without one, which answer
     // only once the model is loaded) until it answers 200, it exits, or time runs out.
@@ -751,6 +768,18 @@ public:
                     continue;
                 }
 #endif
+                if (ready_check_) {
+                    std::string why;
+                    const int state = ready_check_(r->body, why);
+                    if (state < 0) {
+                        std::fprintf(stderr, "1bit serve: %s\n", why.c_str());
+                        return false;
+                    }
+                    if (state == 0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                        continue;
+                    }
+                }
                 return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -787,6 +816,8 @@ private:
 #endif
     int port_;
     std::string ready_path_;
+    std::function<int(const std::string&, std::string&)> ready_check_;
+    std::string health_path_;
     std::shared_ptr<LineTail> tail_ = std::make_shared<LineTail>();
 };
 
@@ -971,16 +1002,24 @@ void relay(int port, const httplib::Request& req, httplib::Response& res) {
 }
 
 // engine#2537: the line a backend prints when its listening port is already bound. Python's socketserver
-// ("OSError: [Errno 98] Address already in use") and llama-server ("couldn't bind HTTP server socket").
+// ("OSError: [Errno 98] Address already in use"), llama-server ("couldn't bind HTTP server socket") and
+// loom-serve ("socket.c:195: FAILED_PRECONDITION; bind failed (errno 98)", hrx-loom 0.1.0).
 inline bool port_in_use_line(const std::string& line) {
     return line.find("Address already in use") != std::string::npos ||
-           line.find("couldn't bind HTTP server socket") != std::string::npos;
+           line.find("couldn't bind HTTP server socket") != std::string::npos ||
+           line.find("bind failed (errno 98)") != std::string::npos;
 }
 
-// Rewrite the value after "--port" in a backend's argv; the launch built it with the port serve first picked.
+// loom-serve's listen flag for a loopback port (it takes --listen=HOST:PORT, not --port)
+inline std::string loom_listen_arg(int port) { return "--listen=127.0.0.1:" + std::to_string(port); }
+
+// Rewrite the value after "--port" in a backend's argv (or loom-serve's --listen=127.0.0.1:PORT); the launch
+// built it with the port serve first picked.
 inline void set_port_arg(std::vector<std::string>& argv, int port) {
-    for (size_t k = 0; k + 1 < argv.size(); ++k)
-        if (argv[k] == "--port") { argv[k + 1] = std::to_string(port); return; }
+    for (size_t k = 0; k < argv.size(); ++k) {
+        if (k + 1 < argv.size() && argv[k] == "--port") { argv[k + 1] = std::to_string(port); return; }
+        if (argv[k].rfind("--listen=127.0.0.1:", 0) == 0) { argv[k] = loom_listen_arg(port); return; }
+    }
 }
 
 constexpr int kPortTakenRetries = 2;
@@ -996,7 +1035,27 @@ struct Launch {
     std::vector<std::string> env_override;  // set in place of the inherited value (Child)
     bool hybrid = false;     // --device hybrid: the prompt's KV comes from the prefill provider (app/serve_hybrid.h)
     std::string slot_dir;    // hybrid: the backend's --slot-save-path, where the handoff files go
+    bool loom = false;       // the Loom GPU route: loom-serve, not llama-server (app/loom_route.h)
+    std::string loom_model;  // loom: the card's model.id, which every request must name
 };
+
+// A Child for this launch, with the launch's readiness rule: loom-serve answers /v1/status at once and lists the
+// card while it prepares, so the card's registration state decides (app/loom_route.h, loom_ready).
+template <class OnLine>
+std::unique_ptr<Child> start_child(const Launch& b, OnLine&& on_line) {
+    auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, std::forward<OnLine>(on_line), b.env_override);
+    if (b.loom)
+        c->set_ready_check(
+            [id = b.loom_model](const std::string& body, std::string& why) {
+                switch (loom::loom_ready(body, id, why)) {
+                    case loom::LoomReady::kReady: return 1;
+                    case loom::LoomReady::kFailed: return -1;
+                    default: return 0;
+                }
+            },
+            "/readyz");
+    return c;
+}
 
 // One line per request, from the values this process actually has. `tokens` comes from the response's `usage` object,
 // which llama-server sends for a non-streamed reply; a streamed reply carries it only in its final SSE chunk, and parsing
@@ -1383,6 +1442,182 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             std::fprintf(stderr, "1bit serve: recipe %s\n", line.c_str());
     }
     return l;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The Loom GPU route (app/loom_route.h, docs/loom-route.md). A .gguf served on the GPU whose entry in the route
+// table matches is served by loom-serve with the entry's card; anything else takes the llama.cpp route above,
+// unchanged. With the shipped (empty) table nothing here prints or reads the model.
+
+std::string default_loom_serve(const Options& o) {
+    if (!o.loom_serve.empty()) return o.loom_serve;
+    if (const char* e = std::getenv("ONEBIT_LOOM_SERVE"); e && *e) return e;
+    return "loom-serve";
+}
+
+std::string loom_cards_dir(const Options& o) {
+    if (!o.loom_cards.empty()) return o.loom_cards;
+    if (const char* e = std::getenv("ONEBIT_LOOM_CARDS"); e && *e) return e;
+    if (const char* x = std::getenv("XDG_CACHE_HOME"); x && *x) return (fs::path(x) / "1bit" / "loom-cards").string();
+    if (const char* h = std::getenv("HOME"); h && *h) return (fs::path(h) / ".cache" / "1bit" / "loom-cards").string();
+    return "";
+}
+
+loom::LoomRoutes load_loom_routes(const Options& o) {
+    std::string text = kDefaultLoomRoutesJson, err;
+    if (!o.loom_routes.empty()) {
+        std::ifstream in(o.loom_routes, std::ios::binary);
+        if (!in) throw std::runtime_error("--loom-routes: cannot read " + o.loom_routes);
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    loom::LoomRoutes t;
+    if (!t.parse(text, err))
+        throw std::runtime_error((o.loom_routes.empty() ? std::string("built-in loom routes") : o.loom_routes) + ": " + err);
+    return t;
+}
+
+// What a matched entry cannot carry: the llama.cpp route's own options. The ones that change what is served
+// (another drafter, a projector, a role, expert streaming) keep the model on that route; the ones that only
+// tune llama-server are named and left out (the card sets context, rows and drafting itself).
+std::string loom_blocker(const Options& o) {
+    if (!o.mtp.empty()) return "--mtp";
+    if (!o.dflash.empty()) return "--dflash";
+    if (!o.mmproj.empty()) return "--mmproj";
+    if (o.moe_slots != 0) return "--moe-slots";
+    if (!o.role.empty()) return "--" + o.role;
+    if (!o.embed.empty() || !o.rerank.empty()) return "--embed/--rerank";
+    if (o.pm) return "--pm";
+    if (o.laya_auto || !o.laya_model.empty()) return "--laya";
+    return "";
+}
+
+// The Loom launch for this model, or nothing (the llama.cpp route serves it). Only for the GPU route: --device auto
+// or hrx, a .gguf, no --no-loom / ONEBIT_NO_LOOM=1.
+std::optional<Launch> loom_launch_for(const Options& o, int child_port) {
+    if (o.device != "auto" && o.device != "hrx") return std::nullopt;
+    if (fs::path(o.model).extension() != ".gguf") return std::nullopt;
+    if (o.no_loom) return std::nullopt;
+    if (const char* e = std::getenv("ONEBIT_NO_LOOM"); e && *e && std::string(e) != "0") return std::nullopt;
+    const loom::LoomRoutes table = load_loom_routes(o);
+    if (table.routes.empty()) return std::nullopt;
+    const std::vector<std::string> names = {o.alias, fs::path(o.model).stem().string(), fs::path(o.model).filename().string()};
+    std::string sha;
+    const loom::LoomRoute* r = loom::match_loom_route(
+        table, o.model, names,
+        [](const std::string& path) {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::string h = loom::sha256_of_file(path);
+            std::fprintf(stderr, "1bit serve: loom route: sha256 of %s (size matches an entry) in %.1f s\n", path.c_str(),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            return h;
+        },
+        &sha);
+    if (!r) return std::nullopt;
+    if (const std::string b = loom_blocker(o); !b.empty()) {
+        std::fprintf(stderr, "1bit serve: loom route %s matches %s, but %s is a llama.cpp-route option: serving on the "
+                             "llama.cpp route (docs/loom-route.md)\n", r->id.c_str(), o.model.c_str(), b.c_str());
+        return std::nullopt;
+    }
+    const std::string card = loom::loom_card_path(*r, loom_cards_dir(o));
+    std::string why;
+    const std::string loom_model = loom::loom_card_model_id(card, why);
+    if (loom_model.empty()) {
+        std::fprintf(stderr, "1bit serve: loom route %s matches %s, but its card is not usable (%s): serving on the "
+                             "llama.cpp route (docs/loom-route.md)\n", r->id.c_str(), o.model.c_str(), why.c_str());
+        return std::nullopt;
+    }
+    Launch l;
+    l.device = "loom";
+    l.loom = true;
+    l.port = child_port;
+    l.loom_model = loom_model;
+    l.ready_path = "/v1/status";
+    l.argv = {default_loom_serve(o), "--model=" + card, "--device=" + (r->device.empty() ? std::string("amdgpu://") : r->device),
+              loom_listen_arg(child_port), "--heartbeat_ms=0"};
+    if (!r->preset.empty()) l.argv.push_back("--preset=" + r->preset);
+    for (const auto& a : r->args) l.argv.push_back(a);
+    // the same ROCr HRX gets (a distro libhsa rejects gfx1151's probe, docs/hrx.md); the entry's own variables after it
+    if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) l.env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+    for (const auto& e : r->env) l.env.push_back(e);
+    std::string ignored;
+    if (o.ctx_size > 0) ignored += " --ctx-size";
+    if (!o.flash_attn.empty()) ignored += " -fa";
+    if (o.parallel > 0) ignored += " --parallel";
+    if (o.mtp_max > 0 || !o.mtp_p_min.empty()) ignored += " --mtp-max/--mtp-p-min";
+    std::fprintf(stderr, "1bit serve: loom route %s: %s%s%s -> loom-serve card %s (model %s; gate %s)%s%s\n", r->id.c_str(),
+                 o.model.c_str(), sha.empty() ? "" : " sha256 ", sha.c_str(), card.c_str(), loom_model.c_str(), r->gate.c_str(),
+                 ignored.empty() ? "" : "; the card sets these, not applied:", ignored.c_str());
+    return l;
+}
+
+// One request to loom-serve (POST /v1/chat/completions; the route serves no other generation path). The body is
+// made acceptable to loom-serve and the reply made to read like llama-server's (app/loom_route.h).
+void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& our_id, const std::string& loom_model,
+                  const httplib::Request& req, httplib::Response& res, ProgressWatch* watch) {
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const std::exception&) {
+        res.status = 400;
+        res.set_content(R"({"error":{"message":"request body is not JSON"}})", "application/json");
+        return;
+    }
+    const loom::LoomRequest lr = loom::loom_request(body, loom_model);
+    if (!lr.ok) {
+        res.status = 400;
+        res.set_content(json{{"error", {{"message", lr.error}, {"type", "invalid_request_error"}}}}.dump(), "application/json");
+        return;
+    }
+    const std::string payload = body.dump();
+    const std::string path = req.path;
+    if (!lr.stream) {
+        const auto tracked = watch ? watch->begin(port, "POST " + path, req.body.size(), true) : nullptr;
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(3600);
+        auto pending = std::async(std::launch::async, [&] { return c.Post(path, payload, "application/json"); });
+        bool closed = false;
+        while (pending.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready)
+            if (!closed && req.is_connection_closed()) {
+                closed = true;
+                c.stop();
+            }
+        auto r = pending.get();
+        if (!r) {
+            res.status = 502;
+            res.set_content(R"({"error":{"message":"backend did not answer"}})", "application/json");
+            return;
+        }
+        res.status = r->status;
+        try {
+            json out = json::parse(r->body);
+            loom::loom_reply(out, our_id);
+            res.set_content(out.dump(), "application/json");
+        } catch (const std::exception&) {
+            res.set_content(r->body, r->get_header_value("Content-Type"));
+        }
+        return;
+    }
+    const size_t prompt_bytes = req.body.size();
+    const bool client_usage = lr.client_usage;
+    res.set_chunked_content_provider("text/event-stream", [port, path, payload, held, watch, prompt_bytes, our_id,
+                                                           client_usage](size_t, httplib::DataSink& sink) {
+        const auto tracked = watch ? watch->begin(port, "POST " + path + " (streamed)", prompt_bytes, false) : nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        loom::LoomSse sse(our_id, client_usage, [t0] {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        });
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(3600);
+        c.Post(path, httplib::Headers{}, payload, "application/json", [&](const char* data, size_t n) {
+            if (tracked) ProgressWatch::progress(*tracked, n);
+            const std::string out = sse.feed(data, n);
+            return out.empty() || sink.write(out.data(), out.size());
+        });
+        const std::string tail = sse.finish();
+        if (!tail.empty()) sink.write(tail.data(), tail.size());
+        sink.done();
+        return true;
+    });
 }
 
 // A small llama-server for one RAG role: --embedding for /v1/embeddings, --reranking for
@@ -2359,6 +2594,9 @@ int serve_child(const Options& given) {
             l.argv.push_back(a);
         l.device = dev + " " + o.role;
         backends.push_back(std::move(l));
+    } else if (auto loom_launch = loom_launch_for(o, o.print_backend ? o.port : free_port())) {
+        // the Loom GPU route: this model has an entry in config/loom-routes.json (it passed the gate)
+        backends.push_back(std::move(*loom_launch));
     } else {
         backends.push_back(launch_for(o, o.device == "auto" ? auto_gguf_device(o) : o.device,
                                       o.print_backend ? o.port : free_port()));
@@ -2550,7 +2788,7 @@ int serve_child(const Options& given) {
             if (lock.owns_lock())
                 for (const auto& c : children) {
                     if (!c->alive()) return fail("backend on port " + std::to_string(c->port()) + " exited");
-                    probes.emplace_back(c->port(), c->ready_path());
+                    probes.emplace_back(c->port(), c->health_path());
                 }
         }
         for (const auto& [port, path] : probes) {
@@ -2730,6 +2968,19 @@ int serve_child(const Options& given) {
         }
         const bool req_stream = request_is_stream(q.body);
         const auto t_req = std::chrono::steady_clock::now();
+        if (backends[pick].loom) {
+            // loom-serve serves chat completions only (hrx-loom 0.1.0 has no text-completion endpoint)
+            if (q.path != "/v1/chat/completions") {
+                r.status = 501;
+                r.set_content(json{{"error", {{"message", q.path + " is not available on the Loom route (loom-serve serves "
+                                                          "/v1/chat/completions); --no-loom serves this model on llama-server"},
+                                              {"type", "not_implemented"}}}}.dump(), "application/json");
+                return;
+            }
+            forward_loom(backends[pick].port, held, id, backends[pick].loom_model, q, r, &watch);
+            log_request_line(q.path, backends[pick], r, t_req, "loom", req_stream);
+            return;
+        }
         forward(backends[pick].port, held, -1, id, drop_model, set_model, o.precise, q, r, &watch);
         // Cycle 25, TOS3-C25-VERBOSE item 3: one line per request with what THIS process can see - the backend it went to
         // and that backend's device, the status, the wall time, and the token counts when the backend reported them.
@@ -2883,7 +3134,7 @@ int serve_child(const Options& given) {
         for (size_t k = 0; k < backends.size(); ++k) {
             const auto& b = backends[k];
             std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-            children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, line_for(k), b.env_override));
+            children.push_back(start_child(b, line_for(k)));
         }
     }
     for (const auto& b : rag) {
@@ -2908,8 +3159,7 @@ int serve_child(const Options& given) {
             // cleared only here, before the relaunch: a backend can print its EADDRINUSE while serve is still waiting on an
             // earlier backend, and clearing the flag before this backend's wait would drop that line
             *port_taken[i] = false;
-            children[i] = std::make_unique<Child>(backends[i].argv, backends[i].env, backends[i].port, backends[i].ready_path,
-                                                  line_for(i), backends[i].env_override);
+            children[i] = start_child(backends[i], line_for(i));
         }
         if (!children[i]->wait_ready(std::chrono::seconds(600), g_stop)) {
             if (g_stop) return 0;
@@ -3367,6 +3617,11 @@ void usage(FILE* out) {
                  "                  [--laya-models FILE (no -m) --laya]   several models behind one port: Laya picks\n"
                  "                  the model and its device for each request with model auto (docs/laya-models.md)\n"                 "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
                  "                  (default: config/recipes.json, built in; docs/recipes.md)\n"
+                 "                  [--loom-routes FILE] [--loom-serve PATH] [--loom-cards DIR] [--no-loom]   the GPU\n"
+                 "                  route per model: a .gguf with an entry (default: config/loom-routes.json, built in,\n"
+                 "                  empty until a model passes the gate) is served by loom-serve (ONEBIT_LOOM_SERVE) with\n"
+                 "                  its Loom card (relative cards under ONEBIT_LOOM_CARDS); any other model, or --no-loom\n"
+                 "                  (ONEBIT_NO_LOOM=1), takes the llama.cpp route (docs/loom-route.md)\n"
                  "                  [--template-pin FILE | --no-template-pin] [--template-pin-strict]   a GGUF's\n"
                  "                  tokenizer.chat_template is a program that runs on every request: the load logs\n"
                  "                  its sha256, and a pin (default: config/template-pins.json, built in) is compared\n"
@@ -3483,6 +3738,10 @@ int run_serve(int argc, char** argv) {
         else if (a == "--laya-models") o.laya_models = next();
         else if (a == "--recipes") o.recipes = next();
         else if (a == "--no-recipes") o.no_recipes = true;
+        else if (a == "--loom-routes") o.loom_routes = next();
+        else if (a == "--loom-serve") o.loom_serve = next();
+        else if (a == "--loom-cards") o.loom_cards = next();
+        else if (a == "--no-loom") o.no_loom = true;
         else if (a == "--template-pin") o.template_pin = next();
         else if (a == "--no-template-pin") o.no_template_pin = true;
         else if (a == "--template-pin-strict") o.template_pin_strict = true;

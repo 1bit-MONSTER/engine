@@ -1,0 +1,106 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+# The Loom GPU route
+
+`1bit serve` can serve a `.gguf` on the GPU through **loom-serve** (AMD's Loom programs on the HRX
+runtime, the `hrx-loom` package) instead of the llama.cpp fork's `llama-server`. Which one serves a
+model is decided per model by a route table, `config/loom-routes.json`:
+
+- a model with an entry is served by `loom-serve`, with the entry's Loom card;
+- every other model takes the llama.cpp route exactly as before (the fallback).
+
+The shipped table is empty, so nothing changes until a model passes the gate below.
+
+## The table
+
+```json
+{
+ "routes": [
+  {
+   "id": "qwen3-0.6b-q4_k_m",
+   "match": {"gguf_sha256": "<64 hex>", "gguf_size": 396705472, "model": ["Qwen3-0.6B-Q4_K_M"]},
+   "card": "unsloth-Qwen3-0.6B-loom",
+   "preset": "chat",
+   "device": "amdgpu://",
+   "args": ["--memory_bytes=8000000000"],
+   "env": {},
+   "gate": "<link to the issue that holds the gate table>"
+  }
+ ]
+}
+```
+
+- `match`: every key given must hold. `model` compares with serve's model id (`--alias`) and the file
+  name; `gguf_sha256` + `gguf_size` name the exact checkpoint the gate measured. The size is compared
+  first, so a file of another size is never hashed; an empty table never reads the model.
+- `card`: a fetched Loom package (`loom-fetch`), as a `model.json` or the directory that holds it. A
+  relative path resolves under `--loom-cards DIR`, `ONEBIT_LOOM_CARDS`, else `~/.cache/1bit/loom-cards`.
+- `device`, `preset`, `args`, `env`: passed to `loom-serve` (`--device=`, `--preset=`, as written, and
+  its environment; a variable the user set wins).
+- `gate`: required. Where the result that admitted the model is recorded.
+
+`--loom-routes FILE` replaces the built-in table, `--loom-serve PATH` (or `ONEBIT_LOOM_SERVE`) names the
+server binary, and `--no-loom` (or `ONEBIT_NO_LOOM=1`) keeps every model on the llama.cpp route.
+
+The table is consulted only for the GPU route (`--device auto` or `hrx`). An entry is skipped, with one
+line naming why, when the load asks for something only the llama.cpp route has (`--mtp`, `--dflash`,
+`--mmproj`, `--moe-slots`, a role, `--embed`/`--rerank`, `--pm`, `--laya`) or when its card cannot be
+read. `--ctx-size`, `-fa`, `--parallel` and the draft-length options are not applied on the Loom route:
+the card sets context, rows and drafting.
+
+## Lifecycle
+
+Written against hrx-loom 0.2.0; the CLI and HTTP surface serve uses is the same in 0.1.0.
+`loom-serve` is a child of serve like `llama-server`: a free loopback port (`--listen=127.0.0.1:PORT`),
+`--heartbeat_ms=0`, the same stop rules (SIGTERM, then SIGKILL after `ONEBIT_BACKEND_STOP_GRACE_S`; it
+dies with serve), the same refusal of a port answered by a process serve did not start, and the same
+relaunch on a fresh port when the first one was taken before the child bound it.
+
+Readiness differs: `loom-serve` answers as soon as it listens and prepares the card in the background,
+so serve reads `GET /v1/status` and waits for the card's registration to be `ready`. A card that
+`failed` (the server keeps running) ends serve at once with `loom-serve`'s message. Once ready, serve's
+`/health` probes `loom-serve`'s `/readyz`.
+
+## Requests and replies
+
+`loom-serve` serves `POST /v1/chat/completions`. hrx-loom 0.1.0 rejects any field outside its set
+(HTTP 400); hrx-loom 0.2.0 accepts every field and passes it to the model program, which ignores what it
+does not consume (`stop`, penalties and `response_format` among them). serve therefore, on this route,
+under either release:
+
+- sends the card's model id as `model`, and renames it back to the served id in every reply and chunk;
+- drops llama-server's serving hints (`cache_prompt`, `id_slot`, `speculative.*`, `timings_per_token`,
+  `return_progress`) and renames `n_predict` to `max_tokens`;
+- drops an OpenAI field `loom-serve` lacks when it holds the value that means "off" (`n: 1`, zero
+  penalties, empty `stop`, ...), and answers 400 naming the field when it does not;
+- adds a `timings` object (`prompt_n`, `cache_n`, `predicted_n`; on a stream also `prompt_ms`,
+  `predicted_ms`, `predicted_per_second`), from the reply's usage and serve's own clock, marked
+  `measured_by`. On a stream, serve asks `loom-serve` for usage and returns it in the final chunk with
+  `finish_reason`, as llama-server does (a client that asked for `include_usage` gets OpenAI's separate
+  usage chunk);
+- answers 501 for `/v1/completions`, `/completion`, `/tokenize`, `/slots` and the other llama-server
+  routes.
+
+## Gate
+
+A model gets an entry only after an interleaved A/B on strixhalo under one `gpu-hold` ticket: Loom
+against the llama.cpp route, at least four rounds per arm, the same GGUF where the card allows, the same
+prompts, load and power mode recorded; and accuracy (greedy agreement on fixed prompts, mean KLD and
+same-top-token % against the CPU on wiki.test.raw 8x512). It routes to Loom only when Loom is not worse
+on accuracy and is faster, or equal on speed and better on accuracy. The result table goes on the
+model's issue, and the entry's `gate` links it.

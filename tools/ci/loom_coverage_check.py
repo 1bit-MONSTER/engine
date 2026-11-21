@@ -249,6 +249,7 @@ def check(tsv, roots, ours=None):
         return 2, ["loom_coverage: no card tree found (pass --cards); the cards are ~GB downloads, so this is "
                    "cannot tell, not a pass"]
     lines, bad, unpinned_bytes = [], 0, 0
+    compared = unpinned_rows = 0
     for device, model in read_rows(tsv):
         if device != "hrx":
             continue
@@ -261,8 +262,21 @@ def check(tsv, roots, ours=None):
         # separately and reported in the summary so the label and the exit code agree.
         if verdict == "COVERED-NOBYTES":
             unpinned_bytes += 1
+        elif verdict == "COVERED":
+            compared += 1
+        elif verdict == "COVERED-UNPINNED":
+            unpinned_rows += 1
         elif verdict not in ("COVERED", "COVERED-UNPINNED"):
             bad += 1
+    # The count of rows whose BYTES were actually compared, always printed (engine#3156 review: `COVERED-UNPINNED`
+    # exits 0 -- the row IS covered on name+quant and failing it would be a bookkeeping red -- but a map where every
+    # row is unpinned then reads as "every shipped row covered" with zero byte comparisons behind it. The number is
+    # what makes the label and the exit code honest, so it is emitted even when it is 0 of N.)
+    if compared + unpinned_rows + unpinned_bytes:
+        # Not printed for a tree with no `hrx` row at all: "nothing is reported for the rows this map does not
+        # cover" is its own arm, and a summary line would be a report about nothing.
+        lines.append(f"loom_coverage: {compared} of {compared + unpinned_rows + unpinned_bytes} row(s) compared on "
+                     f"BYTES; {unpinned_rows} covered on name+quant only (we pin no file named for them)")
     if unpinned_bytes:
         lines.append(f"loom_coverage: {unpinned_bytes} row(s) could not be compared: no pins file "
                      f"(pass --pins); the name+quant arm ran, the bytes arm did not -- cannot tell, not a pass")
@@ -277,10 +291,14 @@ def self_test():
     fails = 0
     total = 0   # engine#3156 review: count the arms instead of a hand-moved literal that drifted 7 -> 11 for 10 arms
 
-    def arm(name, want, rows, cards, expect_rc, pins=None):
+    def arm(name, want, rows, cards, expect_rc, pins=None, says=None):
         """Assert the VERDICT, not only the exit code: COVERED (0), UNCOVERED and REQUANT (both 1) are three
         answers and two of them share an rc, so an rc-only arm cannot tell them apart -- which is the one
-        distinction the tool exists to make."""
+        distinction the tool exists to make.
+
+        `says` additionally requires a substring in some report line, for the arms whose subject IS a sentence: a
+        summary that reports a count has to be asserted by its count, or the arm passes on any line that starts
+        with the tool's name."""
         nonlocal fails, total
         total += 1
         with tempfile.TemporaryDirectory() as td:
@@ -319,6 +337,8 @@ def self_test():
             # "no-verdict-at-all" is the arm for a row class that must not be reported (`npu`): it passes only
             # when nothing was said, so a tool that skipped nothing cannot satisfy it.
             ok = rc == expect_rc and ((want == "no-verdict-at-all" and not lines) or want in verdicts)
+            if ok and says is not None:
+                ok = any(says in line for line in lines)
             detail = f"verdicts {verdicts}, want {want!r}"
             print(f"  {'ok  ' if ok else 'FAIL'} {name} (rc {rc} want {expect_rc}; {detail})")
             fails += 0 if ok else 1
@@ -346,6 +366,15 @@ def self_test():
         [("hrx", "qwen2.5-7b-instruct-q4_k_m-merged.gguf")],
         [("bartowski-Qwen2.5-7B-Instruct-loom", "Qwen/Qwen2.5-7B-Instruct", ["Q4_K_M"], (),
           [("Q4_K_M", SHA_A)])], 0, pins={})
+    # engine#3156 review: the map must state how many rows had their BYTES compared, because COVERED-UNPINNED exits 0
+    # by design and a map where every row is unpinned otherwise reads as "every shipped row covered". Two rows, no
+    # pins at all -> rc 0 still (the rows are covered on name+quant), but the summary must say 0 of 2.
+    arm("every row unpinned still prints how many were compared on bytes", "loom_coverage:",
+        [("hrx", "qwen2.5-7b-instruct-q4_k_m-merged.gguf"), ("hrx", "Qwen3-0.6B-Q4_K_M.gguf")],
+        [("bartowski-Qwen2.5-7B-Instruct-loom", "Qwen/Qwen2.5-7B-Instruct", ["Q4_K_M"], (),
+          [("Q4_K_M", SHA_A)]),
+         ("unsloth-Qwen3-0.6B-loom", "Qwen/Qwen3-0.6B", ["Q4_K_M"], (), [("Q4_K_M", SHA_A)])], 0,
+        pins={}, says="0 of 2 row(s) compared on BYTES")
     # a card for the model on ANOTHER quant is a finding, not covered
     arm("card on another quant is not covered", "REQUANT",
         [("hrx", "Qwen3.6-35B-A3B-Q8_0.gguf")],

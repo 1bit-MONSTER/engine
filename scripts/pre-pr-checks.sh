@@ -156,16 +156,16 @@ if [ "${1:-}" = "--self-test" ]; then
     tree=$(bash "$0" --list --tree-only 2>/dev/null | sed 's|^python3 ||')
     nfull=$(printf '%s\n' "$full" | grep -c .)
     ntree=$(printf '%s\n' "$tree" | grep -c .)
-    if [ "$nfull" = 18 ] && [ "$ntree" = 16 ]; then
+    if [ "$nfull" = 19 ] && [ "$ntree" = 17 ]; then
         echo "  [PASS] --list $nfull rows, --list --tree-only $ntree"
     else
-        echo "  [FAIL] --list $nfull rows, --list --tree-only $ntree (want 18 / 16)"
+        echo "  [FAIL] --list $nfull rows, --list --tree-only $ntree (want 19 / 17)"
         fails=$((fails + 1))
     fi
     if [ "$(printf '%s\n' "$full" | grep -cE 'duplicate_fixes_check|pr_branch_stale_check')" = 2 ] &&
        [ "$(printf '%s\n' "$tree" | grep -cE 'duplicate_fixes_check|pr_branch_stale_check')" = 0 ] &&
        diff <(printf '%s\n' "$full" | grep -vE 'duplicate_fixes_check|pr_branch_stale_check') <(printf '%s\n' "$tree") >/dev/null; then
-        echo "  [PASS] --tree-only drops exactly the two open-PR rows and keeps the other 15 in order"
+        echo "  [PASS] --tree-only drops exactly the two open-PR rows and keeps the rest in order"
     else
         echo "  [FAIL] --tree-only did not drop exactly the two open-PR rows (or reordered the rest)"
         fails=$((fails + 1))
@@ -260,7 +260,12 @@ checks=(
     # merged (only its --self-test had a ctest row), so a lane got it only by remembering to type it; this is that row. Safe to
     # gate on: it answers **2 (cannot tell)** when no local clone carries the pin (`loom_pin: no local clone carries …`), which
     # the runner reports as cannot-tell rather than green, and 0 only when the three facts agree.
-    "tools/ci/loom_pin_check.py --check"
+    "tools/ci/loom_pin_check.py --check --no-installed"
+    # engine#3156: which shipped GPU models have a Loom card, and on which quant -- the switch's plan. ADVISORY, because
+    # being uncovered is the state of the world, not a defect of the PR running this: four shipped rows have no card
+    # today and a hard row would red every lane's run for it. It prints the map and answers 2 (cannot tell) on a box
+    # without the card trees, which is CI's normal state.
+    "tools/ci/loom_coverage_check.py --check --advisory"
     # engine#2445: the tree must CONFIGURE, not just parse as text. A rebase resolution left one line
     # ending `…_test.py)ms)` and every check above stayed green -- they read files, run Python and diff
     # refs, and none asks CMake to read CMakeLists.txt the way CI's Configure step does. That step caught

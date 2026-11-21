@@ -35,12 +35,31 @@
 
 namespace onebit::loom {
 
-// The per-epoch token ceiling the shipped cards declare (see the header comment). Pass a smaller limit only when the
-// caller knows the card's schema says so; the ceiling is a property of the artifact, not a preference.
+// The per-epoch token ceiling of the `llm.*` card family, which is every text card we ship except one: 55 of the 59
+// cards in the corpus declare it and **all 55 agree on 8192** (`llm.tokens`/`llm.spans` `range(1, 8192)`, checked across
+// the corpus, not sampled).
+//
+// IT IS NOT UNIVERSAL, and a driver must read the limit from its card rather than assume this default. The exception is
+// Qwen3.8-Flash-Next, which has no `llm.loom` at all: its epoch command declares `flash_next.token_count`
+// (`program/epoch.loom:11`) with `range(1, 32768)` -- **four times** the `llm.*` bound, under a different config prefix.
+// So the two families are 8192 and 32768, both are shipped, and passing the wrong one is a real failure mode: too small
+// only costs extra epochs, too large asks the program for more tokens in one epoch than its own schema admits.
 inline constexpr uint64_t kEpochTokenLimit = 8192;
+inline constexpr uint64_t kFlashNextEpochTokenLimit = 32768;
 
-// The capacity class a card may be materialized at (llm.context range). Not our choice: it comes from the card's preset.
+// The capacity class a card may be materialized at -- ALSO PER CARD, for the same reason. 54 of the 55 `llm.*` cards bound
+// `llm.context` at `range(16, 262144)`; **unsloth-Inkling-2-Mini-loom bounds it at `range(16, 1048576)`** and ships a single
+// preset at that full capacity. So this ceiling is the common one, not the only one, and a driver sizing a cache must use
+// the card's own bound.
+//
+// AND A CAPACITY IS NOT A RESIDENCY, which is why no sizing formula belongs in this header. Inkling's cache is PAGED:
+// `program/llm.loom:8-32` maps `position / 16` through a per-session page map into a `pool` of physical slots
+// (`plane_slot = plane * pool + physical * 16 + within`), and `llm.pool` is a separate config the card's preset does not
+// set. app/loom_kv_layout.h models the CONTIGUOUS cache (the 27B's `%token_cache_base = position * 1024`), so its totals
+// and its element indexing describe the contiguous-class cards and not the paged ones; for a paged card the resident size
+// is 2 * pool * 2048 * layers, which needs the program, not the preset.
 inline constexpr uint64_t kContextCeiling = 262144;
+inline constexpr uint64_t kInklingContextCeiling = 1048576;
 
 struct Epoch {
     uint64_t position_base;  // absolute position of this epoch's first token -- control word 0 of the prefill form

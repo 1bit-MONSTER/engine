@@ -116,6 +116,11 @@
    "family": "Liwet (fadhilahkhairogi, a from-scratch Indonesian coursework MoE: Liwet-400M-A188M-id-{base,instruct,chat}). Not an alias of anything mapped. The repo ships config.json, model.safetensors and a tokenizer but no modeling code and no auto_map, and the class is not registered at the pin (conversion/ has no module for it, src/llama-arch.cpp has no arch). Its tensors are read from the safetensors header: no 'model.' prefix; per layer, q/k/v/o (16Q/4KV, head_dim 64, no q/k norm), a fused gate_up_proj [8, 1024, 720] and down_proj [8, 360, 1024] over 8 experts top-2, a router.weight [8, 1024], and two non-standard buffers, expert_bias [8] and load_ema [8], alongside router_bias_update_speed / router_load_decay / moe_capacity_factor in the config. Whether expert_bias enters the selection only (aux-loss-free balancing) or also the weights, and whether routing is softmax or sigmoid, is defined nowhere the engine can read, and the config's intermediate_size 2880 has no tensor behind it. Mapping it to a Mixtral/Qwen-MoE family would claim a routing rule the uploader never published. Declined on 2026-11-09 under engine #1667; the census reports it as . REVIEWED. Remove this entry if the uploader publishes modeling code a backend ports.",
    "watch": "report"
   },
+  "Inkling2LoopForConditionalGeneration": {
+   "model_type": "inkling2_loop",
+   "family": "Inkling-2 (a Loop-style decoder: relative-position attention instead of RoPE, d_rel 16 over rel_extent 1024; its text_config is hidden 2304 / 24 layers / 24 heads / 8 kv / head_dim 128 / vocab 201024 with a 1048576-token context. First seen 2026-11-21 as shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB, 5 models from 4 uploaders). Not an alias of anything mapped: no mapped family uses relative position embeddings, so loading it as llama/qwen would apply RoPE where the model applies learned relative offsets and still produce tokens. Nothing at the pin registers it (no conversion module, no LLM_ARCH_*). Declined 2026-11-21 under engine #3181; the census reports it as . REVIEWED.",
+   "watch": "report"
+  },
   "KairoForCausalLM": {
    "model_type": "kairo",
    "family": "Kairo (crypto-model research)"
@@ -199,6 +204,11 @@
    "watch": "report",
    "checked": "2026-11-17"
   },
+  "SageLmForCausalLM": {
+   "model_type": "sagelm",
+   "family": "SageLM-Support-7B-v2 (SOTAagi2030). Its config declares the Qwen2.5-7B geometry exactly -- hidden 4096, intermediate 11008, 32 heads / 8 kv, vocab 152064, untied embeddings, 4096 positions -- but states neither rope_theta, rms_norm_eps nor the activation, ships no modeling code and no auto_map, and nothing at the pin registers the class. An alias to qwen2 would therefore serve it on llama-family defaults (rope_theta 1e4 rather than Qwen2.5's 1e6, unstated activation): a different model, not the same one renamed. Declined 2026-11-21 under engine #3181 until the uploader publishes those fields; the census reports it as . REVIEWED.",
+   "watch": "report"
+  },
   "SegaForCausalLM": {
    "model_type": "sega_tot_moe",
    "family": "Sega 7.0 'Singularity-Infinity' (the123manaic) - 40 layers, hidden 4096, 64 heads. Reviewed as NOT an alias of a family we serve: model_type `sega_tot_moe` is not supported, the config carries non-standard `reasoning_passes` / `reasoning_speed_*` keys, and there is no auto_map (so it is not the remote-code case either - it is a custom architecture with a plain config).",
@@ -216,6 +226,11 @@
   "Skylar2ForCausalLM": {
    "model_type": "skylar2",
    "family": "Skylar 2 (first seen: Skyl4r-Ai/Skylar2-1B-Instruct, the 2026-11-13 census), a from-scratch 1B hybrid that loads through its own `skylar` pip package (no auto_map, no modelling code in the repo). 36 layers, hidden 1536, vocab 64000: 27 KDA linear-attention layers (A_log, dt_bias, per-q/k/v short conv, low-rank f_a/f_b and g_a/g_b gates) and 9 GQA layers (12 heads / 4 KV, qk_norm, a per-head output gate W_gate) in a 3:1 pattern; every norm is a gated RMSNorm with rank-16 gate_up/gate_down, every sublayer has an attention-residual mixer (res_attn/res_ffn query + key_weight), and the FFN uses a situ_glu activation. Not an alias of KimiLinearForCausalLM (different KDA gate, norms and residual mixers) nor of Kimi K3 in llama.cpp #327, which shares situ and attention residuals but uses MLA attention, a full-rank KDA gate and a latent MoE. No pinned graph has these tensors.",
+   "watch": "report"
+  },
+  "VantageTitanForCausalLM": {
+   "model_type": "vantage-titan",
+   "family": "VANTAGE-TITAN-1 (Anh1hoa). The config contradicts itself -- hidden_size 4096 with num_attention_heads 64 x head_dim 128 = 8192 -- and declares fields no mapped backend has (latent_dim 512, holographic_state_dim 1024, kv_cache_quantization 2-bit-ternary-tla, zero_multiply_gemm true, dynamic rope_scaling factor 32, 2097152 positions). No auto_map, no modeling code, nothing at the pin under this name: there is no graph to map it to, and an alias would have to invent the missing tensor shapes. Declined 2026-11-21 under engine #3181; the census reports it as . REVIEWED.",
    "watch": "report"
   },
   "VaporForCausalLM": {

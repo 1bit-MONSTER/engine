@@ -659,6 +659,10 @@ add_python_test(git_shallow_self ${CMAKE_SOURCE_DIR}/tools/ci/git_shallow.py --s
 # answering cannot-tell for some other reason (a thin fixture is how an audit certifies safety it never tested -- the
 # finding cl-hrxnan made while auditing this issue; the test is theirs, handed over when #3109 closed naming this PR).
 add_test(NAME git_shallow_instruments COMMAND bash ${CMAKE_SOURCE_DIR}/tests/git_shallow_instruments_test.sh)
+# ... and its documented 77 (not applicable here) has to be a skip rather than a failure: #3113 landed the row without
+# this property, and a tree with no registry/*.json showed it as `git_shallow_instruments (Failed)` -- measured on merged
+# main by the reviewer of #3116 (cl-review). The test's header says 77 = not applicable; ctest needs to be told.
+set_tests_properties(git_shallow_instruments PROPERTIES SKIP_RETURN_CODE 77)
 # engine#3116: the pre-PR runner's verdict table (0 ok / 77 skip / 2 cannot-tell / * fail), asserted without running the
 # list. It exists because 2 fell through to FAIL: after #3107 the loss checks answer cannot-tell on a shallow clone, and
 # `actions/checkout` is shallow by default, so a correct refusal read as a verdict on the PR.

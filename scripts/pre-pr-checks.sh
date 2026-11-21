@@ -50,34 +50,78 @@ strict=""
 #   *   FAIL
 # A row's 2 is NOT this script's own usage error: `--base` that does not resolve exits 2 *before* the loop (see below),
 # so mapping a row's code here cannot mask a caller's mistake.
-classify() {  # <rc> <name> <last line> <whole output> -> prints the verdict line, echoes the bucket
+classify() {  # <rc> <name> <last line> <whole output> -> prints the verdict line, sets BUCKET
+    # engine#3116 review (cl-review): this used to *echo* the bucket, and the loop called it as
+    # `case "$(classify ...)" in` -- which captures the verdict LINE **and** the bucket as one two-line string, so no
+    # case arm matched and every row fell into `*)` = FAIL. Measured on this head: `--base origin/main` printed
+    # "16 failed, 0 ok, 1 skipped". The bucket is a variable now, which cannot be captured by accident, and the arms
+    # below assert it directly (the previous arms called classify() and read its last line -- they tested the function
+    # and never the wiring, which is why they all stayed green while the runner failed every row).
+    BUCKET=""            # set on every path (`set -u` is on: an arm that reads it before a call must not abort the run)
     case "$1" in
-        77) printf 'skip  %-42s %s\n' "$2" "$3"; printf 'skip\n' ;;
+        77) printf 'skip  %-42s %s\n' "$2" "$3"; BUCKET=skip ;;
         2)
             # EXCEPT argparse: a wrong flag in a row here also exits 2, and a broken row must stay red. Matched on the
             # tool's own usage-error shape, which is the one thing `2` means that is NOT "cannot tell" (cl-infra's catch
             # on #3117). Everything else that exits 2 refused to judge -- shallow clone, no merge base, unreadable ref.
             case "$4" in
-                *usage:*error:*) printf 'FAIL  %-42s %s\n' "$2" "$3"; printf 'fail\n' ;;
-                *)               printf 'skip  %-42s %s\n' "$2" "$3"; printf 'cannot-tell\n' ;;
+                *usage:*error:*) printf 'FAIL  %-42s %s\n' "$2" "$3"; BUCKET=fail ;;
+                *)               printf 'skip  %-42s %s\n' "$2" "$3"; BUCKET=cannot-tell ;;
             esac ;;
-        0)  printf 'ok    %-42s %s\n' "$2" "$3"; printf 'ok\n' ;;
-        *)  printf 'FAIL  %-42s %s\n' "$2" "$3"; printf 'fail\n' ;;
+        0)  printf 'ok    %-42s %s\n' "$2" "$3"; BUCKET=ok ;;
+        *)  printf 'FAIL  %-42s %s\n' "$2" "$3"; BUCKET=fail ;;
     esac
 }
 
 list_only=0
 
+# engine#3116 review (cl-review): the loop's half is a function too, because "the arms tested classify() and never the
+# wiring" is exactly how a two-line return shipped: `case "$(classify …)" in` captured the verdict line *and* the bucket,
+# no arm matched, and every row fell into `*)` = FAIL (measured: "16 failed, 0 ok, 1 skipped"). judge_row() decides and
+# counts in one place; the arms below call it and assert the counters, not just the word.
+judge_row() {  # <rc> <name> <last> <whole output> -> prints the verdict line, sets BUCKET, bumps one counter
+    classify "$1" "$2" "$3" "$4"
+    case "$BUCKET" in
+        ok) ok=$((ok + 1)) ;;
+        skip) skipped=$((skipped + 1)) ;;
+        cannot-tell) untold=$((untold + 1)) ;;
+        *) failed=$((failed + 1)); return 1 ;;
+    esac
+    return 0
+}
+
 # engine#3116: the mapping table, asserted directly. Five codes, one line each, and the two "could not look" codes are
 # told apart in the bucket even though both print as a skip -- so a later edit that folds 2 back into FAIL fails here.
 if [ "${1:-}" = "--self-test" ]; then
     fails=0
+    # the counters judge_row() bumps (`set -u`: an arm reads them before the run's own initialisation, which is later)
+    ok=0; failed=0; skipped=0; untold=0
     arm() {  # <rc> <want-bucket> <want-word-in-line>
         local got line
-        line=$(classify "$1" "stub_row" "stub: something happened" "${4:-stub: something happened}" 2>/dev/null)
-        got=$(printf '%s\n' "$line" | tail -1)
-        local words
-        words=$(printf '%s\n' "$line" | head -1)
+        # engine#3116 review: call it the way the loop does -- NO command substitution -- and assert the variable.
+        # The old arms captured stdout and read the last line, which is what let a two-line return ship.
+        local words tf
+        # NOT `words=$(classify ...)`: that is a subshell, so BUCKET would be set in the child and be unbound here --
+        # which is the same mistake one layer down from the one this fix is about. Call it in this shell, capture its
+        # stdout through a file.
+        tf=$(mktemp)
+        classify "$1" "stub_row" "stub: something happened" "${4:-stub: something happened}" > "$tf"
+        got=${BUCKET:-}
+        words=$(cat "$tf"); rm -f "$tf"
+        # ... and the wiring is asserted with it: judge_row() must bump the counter for this bucket, which is the half
+        # the old arms never touched (they called classify() and read its stdout).
+        # ... and WHICH counter moves is the assertion, not just that one did: a bucket that fell through to `*` still
+        # bumps a counter, which is how the two-line capture failed every row while looking counted.
+        local b_ok=$ok b_sk=$skipped b_un=$untold b_fa=$failed want
+        case "$2" in ok) want=ok ;; skip) want=skipped ;; cannot-tell) want=untold ;; *) want=failed ;; esac
+        judge_row "$1" "stub_row" "${words}" "${4:-stub: something happened}" >/dev/null
+        if [ $((ok - b_ok)) -ne "$([ "$want" = ok ] && echo 1 || echo 0)" ] ||
+           [ $((skipped - b_sk)) -ne "$([ "$want" = skipped ] && echo 1 || echo 0)" ] ||
+           [ $((untold - b_un)) -ne "$([ "$want" = untold ] && echo 1 || echo 0)" ] ||
+           [ $((failed - b_fa)) -ne "$([ "$want" = failed ] && echo 1 || echo 0)" ]; then
+            echo "  [FAIL] rc $1: judge_row counted it as ok+$((ok-b_ok)) skipped+$((skipped-b_sk)) untold+$((untold-b_un)) failed+$((failed-b_fa)), want $want+1"
+            fails=$((fails + 1))
+        fi
         if [ "$got" = "$2" ] && case "$words" in *"$3"*) true ;; *) false ;; esac; then
             echo "  [PASS] rc $1 -> $got"
         else
@@ -90,7 +134,8 @@ if [ "${1:-}" = "--self-test" ]; then
     arm 2  cannot-tell "skip  stub_row"
     # ... and a row that exits 2 because its OWN invocation is wrong stays red (argparse), which is the one 2 that is
     # not "cannot tell": a broken row must not read as a skip (cl-infra's catch on #3117).
-    usage_line=$(classify 2 "stub_row" "stub.py: error: the following arguments are required: --base" "usage: stub.py [-h] --check\nstub.py: error: the following arguments are required: --base" 2>/dev/null | tail -1)
+    classify 2 "stub_row" "stub.py: error: the following arguments are required: --base" "usage: stub.py [-h] --check\nstub.py: error: the following arguments are required: --base" >/dev/null
+    usage_line=${BUCKET:-}
     if [ "$usage_line" = "fail" ]; then echo "  [PASS] rc 2 with an argparse usage error -> fail"; else
         echo "  [FAIL] rc 2 with an argparse usage error -> '$usage_line', want fail"; fails=$((fails + 1)); fi
     arm 1  fail        "FAIL  stub_row"
@@ -246,23 +291,14 @@ for c in "${checks[@]}"; do
     # engine#3116: classify() is the ONLY place a row's exit code becomes a verdict, so the table the self-test asserts
     # is the table the run uses. It used to be an `if 77 / elif 0 / else FAIL` chain here, which is why 2 fell through to
     # FAIL and a shallow clone read as a verdict on the PR.
-    case "$(classify "$rc" "$name" "$last" "$out")" in
-        ok) ok=$((ok + 1)) ;;
-        skip) skipped=$((skipped + 1)) ;;
-        # engine#3116 / cl-prs' #3118: cannot-tell is NOT a skip. A skip says "this did not apply here"; cannot-tell says
-        # "this could not look", and folding the two would let a shallow clone read as a skipped row rather than as an
-        # unanswered question. It gets its own counter and its own word in every summary line, so it can neither go red
-        # for a reason that is not the PR nor go green by silence.
-        cannot-tell) untold=$((untold + 1)) ;;
-        *)
-            failed=$((failed + 1))
-            # The whole output, not its last line: the case that matters is a checker whose summary is
-            # generic and whose detail line names the commit or file (`submodule_pin_check` prints "NOT the
-            # commit this tree pins" above a summary that only counts), and the last line sends the reader
-            # to the wrong place.
-            detail="$detail$name:"$'\n'"$out"$'\n'
-            ;;
-    esac
+    # engine#3116: judge_row() is the only place a row is decided and counted, and it sets BUCKET -- nothing here
+    # captures stdout, which is what shipped a two-line return and failed every row.
+    if ! judge_row "$rc" "$name" "$last" "$out"; then
+        # The whole output, not its last line: the case that matters is a checker whose summary is generic and whose
+        # detail line names the commit or file (`submodule_pin_check` prints "NOT the commit this tree pins" above a
+        # summary that only counts), and the last line sends the reader to the wrong place.
+        detail="$detail$name:"$'\n'"$out"$'\n'
+    fi
 done
 
 echo

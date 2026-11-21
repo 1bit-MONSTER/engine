@@ -67,8 +67,10 @@ int main() {
     check_eq(L::attention_layer_bytes(4096, kv), 2ull * 4096ull * 2048ull, "a layer block is key + value");
     check_eq(L::attention_layer_offset(3, 4096, kv), 3ull * 2ull * 4096ull * 2048ull, "ordinal 3's block offset");
 
-    // A capacity whose sides are not 256-aligned must be padded, not overlapped: kv=1023 f16 = 2046 B/token.
-    check_eq(L::attention_side_bytes(5, 1023), L::align_up(5 * 1023 * 2, 256), "a ragged side is aligned up");
+    // A capacity whose sides are not 256-aligned must be padded, not overlapped: kv=1023 f16 = 2046 B/token. The literal
+    // is computed here rather than by calling align_up on the other side, so this arm fails if the arithmetic is wrong and
+    // not merely if the call disappears (5 * 1023 * 2 = 10230 -> 10240).
+    check_eq(L::attention_side_bytes(5, 1023), 10240, "a ragged side is padded up to the next 256 (10230 -> 10240)");
     check_eq(L::attention_side_bytes(5, 1023) % 256, 0, "…so every value offset stays 256-aligned");
     check_eq(L::attention_value_offset(1, 1) % 256, 0, "the smallest possible side is still aligned");
 
@@ -87,9 +89,15 @@ int main() {
     // Sizing sanity against the number this lane already measures on the other route: docs/zero-copy.md:197 records the
     // GDN sweep as 604 MB read+written = 48 layers x 3.14 MB x ~4 passes. Loom's per-ordinal state is the same 3.14 MB
     // object, so the two routes hold the same state -- which is the fact that makes a handover a re-layout, not a
-    // re-computation.
-    check_eq(L::gdn_layer_bytes() / 100000, 32ull, "one gdn block is ~3.27 MB (~3.14 MB of recurrent state)");
-    check(L::gdn_layer_bytes() < 4ull * 1024ull * 1024ull, "…and fits comfortably under the 3.14 MB x 4 figure");
+    // re-computation. The two are NOT interchangeable, and the difference is the conv history: the documented 604 MB is
+    // four passes of the recurrent block only (603 979 776 B), while four passes of a whole Loom block are 627 572 736 B.
+    // A writer comparing its sweep against 604 MB must know which of the two it is moving.
+    check_eq(4ull * 48ull * L::kGdnRecurrentBytes, 603979776ull, "48 layers x 4 passes of the recurrent block is the docs' 604 MB");
+    check_eq(4ull * 48ull * L::gdn_layer_bytes(), 627572736ull, "…while the whole Loom block sweeps 627 572 736 B, 3.9 % more");
+    check_eq(4ull * 48ull * L::gdn_layer_bytes(),
+             4ull * 48ull * L::kGdnRecurrentBytes + 4ull * 48ull * L::kGdnConvBytes,
+             "the gap is exactly the conv history (23 592 960 B), so neither figure is a rounding of the other");
+    check_eq(47ull * L::gdn_layer_bytes(), 153624576ull, "47 ordinals -- what an exporter allocates for gdn");
 
     // Token-major indexing: position p, element j inside one side.
     check_eq(L::attention_element_index(7, 0, kv), 7ull * kv, "element 0 of position 7 is at 7 * kv");

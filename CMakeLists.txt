@@ -1532,16 +1532,25 @@ if(ONEBIT_LAYA_TYPED_ROOT AND ONEBIT_LAYA_TYPED_GOLDEN)
     add_test(NAME laya_gate_typed_decisions COMMAND laya_gate ${ONEBIT_LAYA_TYPED_ROOT} ${ONEBIT_LAYA_TYPED_GOLDEN})
 endif()
 set(ONEBIT_LAYA_ROUTE_MODEL "" CACHE PATH "Laya checkpoint dir for the per-request routing e2e test")
+# engine#3161: these five rows used to exist only when ONEBIT_LAYA_ROUTE_MODEL was set, and neither ci.yml nor a
+# default configure sets it -- so the whole --laya-models rail ran in no job at all, and it changed tonight with
+# nothing testing it. They are registered unconditionally now and a missing checkpoint is a SKIP (77) with a reason
+# naming the variable, which is the same contract every other un-runnable row on this box uses (serve_e2e_npu,
+# installed_rpath). A configured checkpoint still runs them exactly as before.
+set(_laya_guard ${CMAKE_SOURCE_DIR}/tests/laya_e2e_guard.sh)
+add_test(NAME laya_route_e2e COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+# --laya-models: model auto picked per request among the table's rows (docs/laya-models.md)
+add_test(NAME laya_models_e2e COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_models_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+# `1bit route --laya-models --eval / --dump-encoder`: the table's routing measured, the head's input written
+add_test(NAME laya_eval_e2e COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_eval_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+# `1bit route --serve`, the resident form the fork calls per request (docs/laya-first.md §8).
+add_test(NAME laya_route_serve COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+# One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).
+add_test(NAME laya_checkpoint COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_checkpoint.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+foreach(_laya_row laya_route_e2e laya_models_e2e laya_eval_e2e laya_route_serve laya_checkpoint)
+    set_tests_properties(${_laya_row} PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
 if(ONEBIT_LAYA_ROUTE_MODEL)
-    add_test(NAME laya_route_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
-    # --laya-models: model auto picked per request among the table's rows (docs/laya-models.md)
-    add_test(NAME laya_models_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_models_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
-    # `1bit route --laya-models --eval / --dump-encoder`: the table's routing measured, the head's input written
-    add_test(NAME laya_eval_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_eval_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
-    # `1bit route --serve`, the resident form the fork calls per request (docs/laya-first.md §8).
-    add_test(NAME laya_route_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
-    # One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).
-    add_test(NAME laya_checkpoint COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_checkpoint.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
     add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
              ${CMAKE_SOURCE_DIR}/tests/laya_route_cases.json --min-accuracy 90)

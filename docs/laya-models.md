@@ -234,11 +234,17 @@ identical, the head must change, the temperature must land in its bucket, an exi
 `tests/laya_models_test.cpp` (ctest `laya_models`, no checkpoint): parsing, the question, the pick and
 its fallback, aliases, shared backends, the size gate, the refusals, and the shipped game table.
 `tests/laya_eval_test.cpp` (ctest `laya_eval`, no checkpoint): the eval's arithmetic on hand-computed cases.
-`tests/laya_eval_e2e.sh` (ctest `laya_eval_e2e`, with `ONEBIT_LAYA_ROUTE_MODEL`): `--eval` and `--dump-encoder`
-on the real scorer, the report's counts, the dump's files against each other, the refusals.
-`tests/laya_models_e2e.sh` (ctest `laya_models_e2e`, with `ONEBIT_LAYA_ROUTE_MODEL`): two rows on fake
-llama-servers behind real `1bit serve` children; the reply comes from the row the headers name, pinned and
-cached requests, the decisions log, the table, `/v1/models` and `/metrics`, and the refusals.
+`tests/laya_eval_e2e.sh` (ctest `laya_eval_e2e`, **always registered**, needs `ONEBIT_LAYA_ROUTE_MODEL` to run):
+`--eval` and `--dump-encoder` on the real scorer, the report's counts, the dump's files against each other, the
+refusals.
+`tests/laya_models_e2e.sh` (ctest `laya_models_e2e`, **always registered**, needs `ONEBIT_LAYA_ROUTE_MODEL` to run):
+two rows on fake llama-servers behind real `1bit serve` children; the reply comes from the row the headers name,
+pinned and cached requests, the decisions log, the table, `/v1/models` and `/metrics`, and the refusals.
+
+Both rows (and `laya_route_e2e` / `laya_route_serve` / `laya_checkpoint`) are registered in **every** configure
+since engine#3161, and a missing checkpoint is a **SKIP** with a reason naming the variable
+(`tests/laya_e2e_guard.sh`). They used to be registered only when `ONEBIT_LAYA_ROUTE_MODEL` was set, which no CI job
+and no default configure sets — so the whole rail ran in no job at all while it was changing.
 
 ## Measured
 

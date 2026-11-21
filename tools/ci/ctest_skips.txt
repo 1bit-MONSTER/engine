@@ -36,3 +36,8 @@ laya_finetune   # returns 77: needs torch + numpy, which the build container doe
 hip_f16_audit   # returns 77: needs a gpu-kernels checkout at the pin; the build job initialises llama.cpp only
 token_rate_floor_device   # returns 77: needs a device, a model and a gpu-hold ticket: it judges a real 1bit serve rate
 serve_e2e_npu   # returns 77: ONEBIT_SERVE_TEST_NPU_PACK is unset in CI. The row exists in EVERY configure on purpose (engine#3023): the hrx/cpu rows are registered only inside if(ONEBIT_SERVE_TEST_GGUF), so a machine without that variable had no row at all, and the NPU serve path was covered by nothing. Measured where a pack and an NPU exist: one npu-hold ticket, `1/1 Test #184: serve_e2e_npu … Passed 38.14 sec`, 0 new IO_PAGE_FAULT lines
+laya_route_e2e   # returns 77: ONEBIT_LAYA_ROUTE_MODEL is unset, so there is no converted Laya checkpoint to route against. The row exists in EVERY configure on purpose (engine#3161): it used to be registered only when the variable was set, and neither ci.yml nor a default configure sets it, so the whole --laya-models rail ran in no job while it changed (#3155) with nothing testing it. Verified: `ctest -N` lists it, `ctest -R '^laya_models_e2e$' -V` reports "Skipped" with the reason naming the variable
+laya_models_e2e   # returns 77, same cause and same engine#3161 measurement as the row above
+laya_eval_e2e   # returns 77, same cause (engine#3161)
+laya_route_serve   # returns 77, same cause (engine#3161)
+laya_checkpoint   # returns 77, same cause (engine#3161)

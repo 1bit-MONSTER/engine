@@ -582,6 +582,10 @@ add_python_test(serve_field_census_self ${CMAKE_SOURCE_DIR}/tools/ci/serve_field
 # engine#2478: the lifecycle classifier and its cannot-tell exits are the whole
 # point of this tool, so its --self-test runs as a test rather than as a comment.
 add_python_test(iommu_dma_lifecycle_self ${CMAKE_SOURCE_DIR}/tools/diag/iommu_dma_lifecycle.py --self-test)
+# engine#3223: the ctest-row NAME collision checker. Its own arms run here because the checker that catches an
+# unwired self-test (tool_selftest_wired_check, tightened in #3219) said so about this file on the first build --
+# which is the rule working on the lane that wrote it.
+add_python_test(ctest_row_name_self ${CMAKE_SOURCE_DIR}/tools/ci/ctest_row_name_check.py --self-test)
 # engine#2916: the pair check's self-test, wired because a tool with a --self-test that no
 # runner names is a self-test nobody runs (tool_selftest_wired_check says so, and it said so
 # about this file in the PR's first build).

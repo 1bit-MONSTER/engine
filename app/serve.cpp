@@ -1214,9 +1214,13 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         const char* keep_split = std::getenv("ONEBIT_HRX_DECODE_SPLIT");
         if (device == "hrx" && keep_split && std::string(keep_split) == "0")
             env.push_back("GGML_HRX_DISABLE_DISPATCH=decode_split");
-        // Qwen3.5 / Qwen3.8 (gated delta net) decode one sequence per batch on HRX0. Without
-        // --parallel, llama-server's own default opens several slots, and a second concurrent
-        // request then fails (HTTP 500) at the multi-sequence softplus / GATED_DELTA_NET: one slot.
+        // Qwen3.5 / Qwen3.8 (gated delta net): one slot unless --parallel says otherwise. This override predates
+        // G9 and its justification no longer reproduces: at the pin, the fork's matcher accepts up to 8 sequences
+        // (`dispatch_registration/llm/dispatch-gated-delta-net.cpp:53` `kMaximumSequences = 8`, checked at :294 and
+        // :633) and that file's own comment says the Loom kernel declares sequence_count up to 4096, "so the limit is
+        // only what serve offers". What is NOT established is that the engine path is correct at >1 slot — the old
+        // failure was a 500 at multi-sequence softplus, which is a kernel-behaviour claim, not a matcher-capability
+        // one. Removing this override needs a serve through this gate at -np 4+ inside a gpu-hold ticket (engine#3125).
         if (device == "hrx" && o.parallel == 0) {
             const std::string arch = gguf_architecture(o.model);
             if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next") argv.insert(argv.end(), {"-np", "1"});
@@ -1226,8 +1230,8 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         throw std::runtime_error("--device " + device + " cannot run a .gguf (hrx or cpu)");
     }
     if (o.parallel == 1) {
-        // one slot: llama-server's own default is several, and a second slot can share a batch
-        // (Qwen3.5 / Qwen3.8 on HRX0 cannot run a multi-sequence gated delta net yet)
+        // one slot: llama-server's own default is several, and a second slot can share a batch. (Gated delta net on
+        // HRX is capped by this override, not by the matcher -- see the note above and engine#3125.)
         argv.insert(argv.end(), {"-np", "1"});
     }
     if (o.parallel > 1) {
@@ -1367,8 +1371,9 @@ std::vector<std::string> gguf_devices() {
 // without HRX). What used to fall back to Vulkan (engine #271) has no GPU route left:
 //  - an architecture our llama.cpp does not map (hrx_missing_arch): refused, on every device;
 //  - --moe-slots: refused (launch_for) until expert streaming moves to HRX with Flash-Next;
-//  - --parallel N > 1 on a gated delta-net model (no multi-sequence delta-net on HRX): HRX0 with
-//    one slot and a warning (serve_child);
+//  - --parallel N > 1 on a gated delta-net model: HRX0 with one slot and a warning (serve_child). The
+//    matcher takes up to 8 sequences at the pin, so that clamp is the limit rather than the kernel --
+//    recorded as engine#3125 with what still needs measuring.
 //  - --mmproj: HRX0. UNVERIFIED: HRX vision is an open RFC #213 gate, to be checked on ZAYA1-VL;
 //    if it fails there, this goes back to the CPU.
 // --mtp now runs on HRX0 (it drafts slower there than Vulkan did: verify batches of 2-4 tokens).
@@ -2130,11 +2135,12 @@ int serve_child(const Options& given) {
                                  "dropped that format; use the model's UD-Q4_K_XL (or another standard) GGUF instead");
     if (o.device == "auto" && o.parallel > 1 && delta_net_arch(gguf_architecture(o.model)) &&
         auto_gguf_device(o) == "hrx") {
-        // HRX0 decodes one gated delta-net sequence at a time (no multi-sequence delta-net kernel yet),
-        // and auto has no other GPU route since the Vulkan build left: one slot on HRX0, said aloud.
-        // --device cpu still honors --parallel.
-        std::fprintf(stderr, "1bit serve: --parallel %d on %s: HRX0 runs one gated delta-net sequence at a time "
-                             "(no multi-sequence delta-net on HRX yet), so --device auto serves it with one slot; "
+        // One slot on HRX0 for a gated delta-net model on the auto path, said aloud -- but the reason is no longer
+        // "no multi-sequence kernel": the fork's matcher accepts up to 8 sequences at the pin and the Loom kernel
+        // declares more, so this clamp is what limits it. Kept until the engine path is measured at >1 slot
+        // (engine#3125); --device cpu still honors --parallel.
+        std::fprintf(stderr, "1bit serve: --parallel %d on %s: HRX0 is served with one slot (the gated delta-net "
+                             "matcher takes up to 8 sequences at the pin, so this clamp is the limiter); "
                              "--device cpu keeps --parallel %d\n",
                      o.parallel, gguf_architecture(o.model).c_str(), o.parallel);
         o.parallel = 1;

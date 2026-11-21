@@ -113,7 +113,7 @@ def installed_version(python):
     return p.stdout.strip(), None
 
 
-def check(cfg_path, source=None, python=None, wheel=None, loom_serve=None):
+def check(cfg_path, source=None, python=None, wheel=None, loom_serve=None, installed=True):
     findings, notes = [], []
     cfg = read_config(cfg_path)
     for key in ('repo', 'sha', 'package', 'version', 'version_file', 'model_catalog_repo', 'model_catalog_sha'):
@@ -158,7 +158,9 @@ def check(cfg_path, source=None, python=None, wheel=None, loom_serve=None):
     inside = git(src, 'merge-base', '--is-ancestor', sha, 'HEAD').returncode == 0 if gitlink else False
     notes.append(f'{sha[:10]} is {"an ancestor of" if inside else "NOT an ancestor of"} the local clone head {gitlink[:10]}')
     have_inst, why = installed_version(python)
-    if have_inst is None:
+    if not installed:
+        notes.append('this box\'s installed package was NOT compared (--no-installed): the pin is a claim about the tree')
+    elif have_inst is None:
         notes.append(f'installed package not compared: {why}')
     elif have_inst != version:
         findings.append(f'the installed hrx_loom is {have_inst}, the pin says {version}')
@@ -290,6 +292,8 @@ def self_test():
         'a loom-serve that is not there is a finding')
     chk(check(cfg(loom_serve_sha256=bdig, **rel), source=str(src)) == 0,
         'not identifying a binary is a note, not a finding (a runner has none installed)')
+    chk(check(cfg(loom_serve_sha256=bdig, **rel), source=str(src), python=str(tmp / 'no-such-python'), installed=False) == 0,
+        '--no-installed never consults this box, so a broken or foreign interpreter cannot make the row fail')
     print(f'loom_pin_check self-test: {ok[0]} ok, {ok[1]} failed')
     return 0 if ok[1] == 0 else 1
 
@@ -302,6 +306,9 @@ def main(argv=None):
     ap.add_argument('--source', default=None, help='a clone of the repo in config/loom.config')
     ap.add_argument('--python', default=sys.executable, help='interpreter to ask for the installed hrx_loom')
     ap.add_argument('--wheel', default=None, help='a hrx_loom wheel whose sha256 must match config/loom.config')
+    ap.add_argument('--no-installed', dest='installed', action='store_false',
+                    help='check the pin\'s facts about the TREE only; do not compare this box\'s installed package '
+                         '(a pre-PR row must not fail a lane for another lane\'s venv)')
     ap.add_argument('--loom-serve', default=None, metavar='PATH|auto',
                     help='the loom-serve binary a route would launch (auto = the first on PATH); its sha256 must match '
                          'config/loom.config, because the binary cannot report its own toolchain')
@@ -310,7 +317,7 @@ def main(argv=None):
         return self_test()
     if not a.check:
         ap.error('one of --check or --self-test')
-    return check(a.config, a.source, a.python, a.wheel, a.loom_serve)
+    return check(a.config, a.source, a.python, a.wheel, a.loom_serve, a.installed)
 
 
 if __name__ == '__main__':

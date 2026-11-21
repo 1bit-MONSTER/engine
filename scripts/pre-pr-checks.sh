@@ -260,7 +260,7 @@ checks=(
     # merged (only its --self-test had a ctest row), so a lane got it only by remembering to type it; this is that row. Safe to
     # gate on: it answers **2 (cannot tell)** when no local clone carries the pin (`loom_pin: no local clone carries …`), which
     # the runner reports as cannot-tell rather than green, and 0 only when the three facts agree.
-    "tools/ci/loom_pin_check.py --check"
+    "tools/ci/loom_pin_check.py --check --no-installed"
     # engine#2445: the tree must CONFIGURE, not just parse as text. A rebase resolution left one line
     # ending `…_test.py)ms)` and every check above stayed green -- they read files, run Python and diff
     # refs, and none asks CMake to read CMakeLists.txt the way CI's Configure step does. That step caught

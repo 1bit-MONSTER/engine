@@ -180,6 +180,9 @@ def main(argv):
     ap.add_argument('--base', help='the revision this branch should still contain')
     ap.add_argument('--head', default='HEAD')
     ap.add_argument('--root', default='.')
+    ap.add_argument('--allow-shallow', action='store_true',
+                    help='report anyway in a shallow clone: distances read 0 at the graft, so a behind branch '
+                         "reads as level and a 'nothing lost' answer can be a false green (engine#3106)")
     ap.add_argument('--self-test', action='store_true')
     a = ap.parse_args(argv)
     if a.self_test:
@@ -187,7 +190,8 @@ def main(argv):
     # engine#3106: this tool's answer is "nothing was lost", derived from a distance or merge-base that collapses to 0
     # in a shallow clone (git rev-list returns 0 for a behind branch at the graft). Answer cannot-tell, never a false
     # "nothing lost" -- measured on pr_branch_stale_check in a --depth 1 clone (engine#3076/#3105).
-    _shallow = git_shallow.probe(a.root)
+    ALLOW_SHALLOW = getattr(a, 'allow_shallow', False)
+    _shallow = git_shallow.refusal(a.root, ALLOW_SHALLOW)
     if _shallow:
         print(f"{__file__.rsplit('/', 1)[-1]}: {_shallow}", file=sys.stderr)
         return 2

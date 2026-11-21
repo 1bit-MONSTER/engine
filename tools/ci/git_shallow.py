@@ -59,6 +59,18 @@ def decide(rc, out):
     return None
 
 
+def refusal(root=".", allow_shallow=False):
+    """`probe()` plus the escape hatch: an explicit --allow-shallow buys the answer anyway.
+
+    `merged_tail_check` has carried `--allow-shallow` since engine#2659, and it is the right shape: the guard exists to
+    stop an ACCIDENTAL shallow run from answering green, not to make a deliberate one impossible. The reason text names
+    the flag, so a caller who wants the number through a shallow clone is told how to say so.
+    """
+    if allow_shallow:
+        return None
+    return probe(root)
+
+
 def probe(root="."):
     """`decide()` over the real repository: None, or the reason this tool cannot measure in it."""
     try:
@@ -84,6 +96,8 @@ def self_test():
         "a failed probe is cannot-tell, not an assumed full clone (engine#2932)")
     chk(decide(0, "\n") is None, "empty output is not 'true' (only the literal true means shallow)")
     chk(decide(0, "True") is None, "the check is on git's own spelling, not a case-insensitive guess")
+    chk(refusal("/nonexistent-would-fail", allow_shallow=True) is None,
+        "--allow-shallow buys the answer anyway, even when the probe would refuse (merged_tail_check's engine#2659 shape)")
 
     # ... and the probe against a real depth-1 clone, so the trigger is not only a table.
     import tempfile

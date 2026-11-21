@@ -162,7 +162,7 @@ git rev-parse --verify -q "$base^{commit}" >/dev/null || {
     exit 2
 }
 
-ok=0; failed=0; skipped=0; detail=""
+ok=0; failed=0; skipped=0; untold=0; detail=""
 for c in "${checks[@]}"; do
     name=${c%% *}
     out=$(python3 $c 2>&1); rc=$?
@@ -172,6 +172,15 @@ for c in "${checks[@]}"; do
         # reason, so the summary still says something did not run
         printf 'skip  %-42s %s\n' "$name" "$last"
         skipped=$((skipped + 1)); continue
+    fi
+    if [ $rc -eq 2 ]; then
+        # engine#3116: 2 is the repo's OTHER cannot-tell code -- `registration_loss_check`, `registry_loss_check`,
+        # `branch_stale_check` and `guard_loss_check` all answer it when the merge base cannot be computed, which is the
+        # normal state of a shallow clone. It is not a pass and it is not this PR's fault, so it is neither `ok` nor
+        # `FAIL`: counted on its own line and always printed, so a shallow clone stops going red for a reason that is
+        # not the change -- and still cannot go green by silence, because the summary names the count in every case.
+        printf 'tell  %-42s %s\n' "$name" "cannot tell: ${last:-no output}"
+        untold=$((untold + 1)); continue
     fi
     if [ $rc -eq 0 ]; then
         # `submodule_pin_check --check` exits 0 having compared NOTHING when submodules are declared but
@@ -201,9 +210,9 @@ done
 
 echo
 if [ $failed -gt 0 ]; then
-    echo "pre-pr-checks: $failed failed, $ok ok, $skipped skipped"
+    echo "pre-pr-checks: $failed failed, $ok ok, $skipped skipped, $untold could not be told"
     printf '%s' "$detail"
     exit 1
 fi
-echo "pre-pr-checks: all $ok check(s) green, $skipped skipped"
+echo "pre-pr-checks: all $ok check(s) green, $skipped skipped, $untold could not be told"
 exit 0

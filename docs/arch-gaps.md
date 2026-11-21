@@ -1379,8 +1379,9 @@ existed.
 The 2026-11-21 watcher run alerted four `!! UNCOVERED` classes — `Inkling2LoopForConditionalGeneration` (5
 models from 4 uploaders), `Edge0ForCausalLM`, `SageLmForCausalLM` and `VantageTitanForCausalLM` (one each) —
 with the same note on all four: *could not tell whether upstream has it (converter unavailable)*. The pinned
-backend is `third_party/llama.cpp 3514f3a840`; `git grep` over it for `inkling`, `edge0`, `sagelm` and
-`vantage` returns **nothing** in either `src/llama-arch.cpp` or the converter, so the generated registry has
+backend was `third_party/llama.cpp 3514f3a840` when the classes were reviewed and is `a87cc5a74` after #3169
+merged; `git grep` over **both** for `inkling`, `edge0`, `sagelm` and `vantage` returns **nothing** in either
+`src/llama-arch.cpp` or the converter, so the bump did not change the answer, so the generated registry has
 no entry for any of these names and a mapping would have to be typed in by hand — the one thing the registry
 forbids. Each config was read through the HF API on 2026-11-21 (metadata only, no weights).
 

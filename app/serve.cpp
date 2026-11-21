@@ -496,14 +496,18 @@ void merge_env(std::vector<std::string>& env_store, const std::vector<std::strin
 // defect (default 60 s). A child that never prints its readiness line is indistinguishable from a slow one, and the
 // two need different answers: one waits, the other is a launch that asked for a port it will never be told
 // (engine#3130 -- a child that is not `1bit serve`, e.g. `--llama-server llama-server`, prints its own format).
+// 0 means "no silence limit" and is the DEFAULT: a child in another server's format is now caught at once by
+// looks_like_foreign_ready(), and a child that IS `1bit serve` prints its memory line within a second or two and then
+// spends as long as the model needs loading -- a 27B can be quiet for minutes, and killing it there is the failure this
+// knob would cause rather than prevent. Set it to bound a launch whose child is expected to be silent.
 static int backend_port_grace_s() {
     if (const char* e = std::getenv("ONEBIT_BACKEND_PORT_GRACE_S"); e && *e) {
         char* end = nullptr;
         const long v = std::strtol(e, &end, 10);
-        if (end != e && *end == '\0' && v >= 1 && v <= 86400) return int(v);
-        std::fprintf(stderr, "1bit serve: ONEBIT_BACKEND_PORT_GRACE_S=%s ignored (whole seconds, 1..86400); using 60\n", e);
+        if (end != e && *end == '\0' && v >= 0 && v <= 86400) return int(v);
+        std::fprintf(stderr, "1bit serve: ONEBIT_BACKEND_PORT_GRACE_S=%s ignored (whole seconds, 0..86400); no silence limit\n", e);
     }
-    return 60;
+    return 0;
 }
 
 // ONEBIT_BACKEND_STOP_GRACE_S: how long Child::stop waits after SIGTERM before SIGKILL (default 30 s).
@@ -556,6 +560,16 @@ static bool parse_backend_ready_port(const std::string& line, int& port) {
     if (parsed <= 0 || parsed > 65535) return false;
     port = parsed;
     return true;
+}
+
+// engine#3130 (follow-up to #3164): a readiness line in ANOTHER server's format. The grace that bounds a silent child
+// must not bound a child that is talking: `--llama-server llama-server` is the mistake the grace exists for, and it
+// announces itself in llama.cpp's own words ("listening on http://..."), while a `1bit serve` child prints the format
+// parse_backend_ready_port reads. Recognizing the former lets the wait refuse at once, instead of waiting out a grace
+// sized for a child that is loading.
+static bool looks_like_foreign_ready(const std::string& line) {
+    if (line.compare(0, 5, "1bit ") == 0) return false;  // our own line, handled by parse_backend_ready_port
+    return line.find("listening on") != std::string::npos && line.find("http://") != std::string::npos;
 }
 
 #ifdef _WIN32
@@ -676,7 +690,8 @@ public:
         if (tee) {
             ::close(err[1]);
             // detached: a backend stuck in the kernel keeps the pipe open, and serve must still exit
-            std::thread([fd = err[0], tail = tail_, on_line = std::move(on_line), learned = learned_port_] {
+            std::thread([fd = err[0], tail = tail_, on_line = std::move(on_line), learned = learned_port_,
+                         last_line = last_line_ns_, foreign = foreign_ready_] {
                 char buf[4096];
                 for (;;) {
                     const ssize_t n = ::read(fd, buf, sizeof buf);
@@ -691,8 +706,12 @@ public:
                     for (const std::string& line : tail->feed(buf, size_t(n))) {
                         if (on_line) on_line(line);
                         // engine#3130 part 2: the port only this thread can see -- the child's own readiness line.
+                        last_line->store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                         std::memory_order_relaxed);
                         int parsed_port = 0;
                         if (parse_backend_ready_port(line, parsed_port)) learned->store(parsed_port);
+                        // engine#3130 follow-up: a child that is talking is not the mistake the grace is for.
+                        else if (looks_like_foreign_ready(line)) foreign->store(true, std::memory_order_relaxed);
                     }
                 }
                 ::close(fd);
@@ -778,6 +797,7 @@ public:
         std::unique_ptr<httplib::Client> c;
         // when this wait first found no port at all (engine#3130): 0 until then
         std::chrono::steady_clock::time_point silent_since{};
+        const long long                          start_ns = std::chrono::steady_clock::now().time_since_epoch().count();
         const auto end = std::chrono::steady_clock::now() + timeout;
         const auto foreign_grace = std::chrono::seconds(foreign_port_grace_s());
         // A previous call already spent the grace on this child (the relaunch loop calls wait_ready again after it
@@ -787,16 +807,29 @@ public:
         while (std::chrono::steady_clock::now() < end) {
             if (!alive() || stop) return false;
             if (port() <= 0) {
-                // engine#3130: nothing to poll yet -- that is the launch's starting state. But a child that NEVER prints a
-                // port is a different thing from a slow one, and only one of them is worth waiting for: a launch that
-                // passed `--port 0` to a binary which does not report one (llama-server prints its own format) would
-                // otherwise sit here for the full wait_ready timeout and look like a slow model load.
-                if (silent_since.time_since_epoch().count() == 0) silent_since = std::chrono::steady_clock::now();
-                if (std::chrono::steady_clock::now() - silent_since >= std::chrono::seconds(backend_port_grace_s())) {
+                // engine#3130: nothing to poll yet -- that is the launch's starting state. Two things are worth refusing
+                // here and a third is not: (a) a child announcing a port in another server's format is the mistake this
+                // grace exists for, and it says so at once; (b) a child that has printed NOTHING for the grace is not a
+                // server; (c) a child that is printing lines is loading, and wait_ready's own timeout (900 s for a model
+                // load) is the budget for it -- a number sized for (a) must not kill a 27B mid-load.
+                if (foreign_ready_->load()) {
                     std::fprintf(stderr,
-                                 "1bit serve: pid %d has printed no listening port after %d s; this launch was given "
-                                 "`--port 0`, so the child must report the port it bound (ONEBIT_BACKEND_PORT_GRACE_S "
-                                 "sets this wait)\n", int(pid_), backend_port_grace_s());
+                                 "1bit serve: pid %d announced a port in a format `1bit serve` does not print; this launch "
+                                 "was given `--port 0`, so the child must report the port it bound (engine#3130)\n",
+                                 int(pid_));
+                    return false;
+                }
+                const long long last = last_line_ns_->load();
+                const auto      now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+                const auto      quiet_s = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::duration(now_ns - (last != 0 ? last : start_ns))).count();
+                if (silent_since.time_since_epoch().count() == 0) silent_since = std::chrono::steady_clock::now();
+                const int grace_s = backend_port_grace_s();
+                if (grace_s > 0 && quiet_s >= grace_s) {
+                    std::fprintf(stderr,
+                                 "1bit serve: pid %d has printed nothing for %lld s and has not reported a port; this "
+                                 "launch was given `--port 0`, so the child must report the port it bound "
+                                 "(ONEBIT_BACKEND_PORT_GRACE_S sets this wait)\n", int(pid_), (long long)quiet_s);
                     return false;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -884,6 +917,10 @@ private:
     // cannot capture `this`), read by wait_ready()/port(); shared and atomic for that reason. Equal to the launch
     // port unless the launch passed 0 and the child reported its own.
     std::shared_ptr<std::atomic<int>> learned_port_ = std::make_shared<std::atomic<int>>(0);
+    // engine#3130 follow-up: what the drain thread has seen, so wait_ready can tell a loading child (lines, no port yet)
+    // from a binary that will never print one. Both are written by the detached thread, hence shared and atomic.
+    std::shared_ptr<std::atomic<long long>> last_line_ns_ = std::make_shared<std::atomic<long long>>(0);
+    std::shared_ptr<std::atomic<bool>> foreign_ready_ = std::make_shared<std::atomic<bool>>(false);
     int port_;
     std::string ready_path_;
     std::function<int(const std::string&, std::string&)> ready_check_;

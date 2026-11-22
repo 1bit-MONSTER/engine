@@ -366,6 +366,27 @@ def self_test() -> int:
         (sealed / "manifest.json").write_text(json.dumps({"files": {}}), encoding="utf-8")
         arm("a format-1 manifest.json is the sealed scheme", "sealed1", detect(sealed))
 
+        # engine#3237 review: the sealed path carries its OWN digest comparison (`if want and digest != want`), and the
+        # detection arm above pins the scheme, not a tampered file -- measured: neutering that comparison left 13 ok /
+        # 0 failed. A fixture that satisfies every other rule and differs only in the bytes makes it discriminating.
+        def format1_set(root: pathlib.Path, *, tampered: bool):
+            root.mkdir(parents=True, exist_ok=True)
+            good = SEALED_MAGIC + b"ciphertext"
+            (root / "65").mkdir(exist_ok=True)
+            (root / "65" / "layer1.elf").write_bytes(good if not tampered else SEALED_MAGIC + b"ciphertexT")
+            (root / "manifest.json").write_text(json.dumps({"files": [
+                {"path": "65/layer1.elf", "size": len(good), "sha256": hashlib.sha256(good).hexdigest()}]}),
+                encoding="utf-8")
+            (root / SIG).write_bytes(b"\x00" * SIG_BYTES)
+            return root
+
+        clean1 = format1_set(base / "sealed-clean", tampered=False)
+        arm("a well-formed format-1 set checks clean", 0, check(clean1))
+        rc, err = problems_of(format1_set(base / "sealed-tampered", tampered=True))
+        arm("a format-1 set whose bytes changed after signing is a finding", 1, rc)
+        arm("…and it is the DIGEST that names it, not a missing file or signature", True,
+            "digest mismatch" in err and "missing" not in err and SIG not in err)
+
         # the writer emits `file <sha> <size> <path>`; both spellings must parse or the check reads an empty manifest
         prefixed = kset(base / "prefixed")
         (prefixed / "manifest").write_text(

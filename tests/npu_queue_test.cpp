@@ -23,6 +23,7 @@
 #include <chrono>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -96,6 +97,82 @@ int main() {
         mu.unlock();
         CHECK(ticks == 0);
         CHECK(ms < 100);
+    }
+    // engine#3318: DeviceSlots, the admission when a model serves several requests at once.
+    // Capacity 1 behaves as the timed mutex it replaces: a second taker is refused at once and waits like one.
+    {
+        onebit::DeviceSlots s(1);
+        CHECK(s.try_lock());
+        CHECK(!s.try_lock());
+        int ticks = 0;
+        CHECK(!onebit::wait_for_device(s, 0, [&] { ticks++; }));
+        CHECK(ticks == 0);
+        CHECK(!onebit::wait_for_device(s, 150, [&] { ticks++; }));
+        CHECK(ticks >= 1);
+        s.unlock();
+        CHECK(s.in_use() == 0);
+        CHECK(onebit::wait_for_device(s, 0, nullptr));
+        s.unlock();
+    }
+    // Capacity 3: three requests are admitted at once, without a tick (nobody queued); the fourth queues and is
+    // admitted the moment one of the three leaves.
+    {
+        onebit::DeviceSlots s(3);
+        int ticks = 0;
+        for (int i = 0; i < 3; i++) CHECK(onebit::wait_for_device(s, 5000, [&] { ticks++; }));
+        CHECK(ticks == 0);
+        CHECK(s.in_use() == 3);
+        std::thread t([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            s.unlock();
+        });
+        const auto t0 = clock_now::now();
+        CHECK(onebit::wait_for_device(s, 5000, [&] { ticks++; }));
+        const long ms = ms_since(t0);
+        t.join();
+        CHECK(ticks >= 1);
+        CHECK(ms >= 250 && ms < 3000);
+        CHECK(s.in_use() == 3);
+        for (int i = 0; i < 3; i++) s.unlock();
+        CHECK(s.in_use() == 0);
+    }
+    // Many threads against capacity 2: never more than two inside at once, and every one of them gets in.
+    {
+        onebit::DeviceSlots s(2);
+        std::atomic<int> inside{0}, peak{0}, served{0};
+        std::vector<std::thread> ts;
+        for (int i = 0; i < 8; i++)
+            ts.emplace_back([&] {
+                if (!onebit::wait_for_device(s, 10000, nullptr)) return;
+                const int n = ++inside;
+                int p = peak.load();
+                while (n > p && !peak.compare_exchange_weak(p, n)) {}
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                --inside;
+                served++;
+                s.unlock();
+            });
+        for (auto& t : ts) t.join();
+        CHECK(served == 8);
+        CHECK(peak <= 2);
+        CHECK(peak == 2);   // and the second place was really used
+    }
+    // Raising the capacity at load wakes a waiter (the serve sets it once the model says how many it serves).
+    {
+        onebit::DeviceSlots s(1);
+        CHECK(s.try_lock());
+        std::thread t([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            s.set_capacity(2);
+        });
+        CHECK(onebit::wait_for_device(s, 5000, nullptr));
+        t.join();
+        CHECK(s.in_use() == 2);
+        s.unlock();
+        s.unlock();
+        bool threw = false;
+        try { s.set_capacity(0); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
     }
     std::puts("npu_queue: ok");
     return 0;

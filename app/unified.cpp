@@ -85,7 +85,9 @@ struct Engine {
     // and on Qwen3-1.7B that five-token difference turns "the first five primes" into "3, 5, 7, 11, 13".
     npu::ChatTemplate tmpl;
     std::string bos_text, eos_text;
-    std::timed_mutex mu;  // timed: the wait for the device is bounded (engine#911)
+    // Admission to the device: one request at a time, or a private route's max_concurrent() (engine#3318). Timed: the
+    // wait for it is bounded (engine#911).
+    DeviceSlots mu;
     // How long a STREAMED request may wait for the device before it is told the device is busy (engine#1024).
     // The one-device lock below serialises generations, and an *unbounded, silent* wait is what made a
     // second request look like a hung answer: measured on this box, a 48-token probe queued 10.04 s with
@@ -287,8 +289,11 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         if (ids.empty()) throw std::runtime_error("empty prompt");
         const int room = e.max_context - int(ids.size());
         if (room < 1) throw std::runtime_error("prompt longer than the context");
-        if (!wait_for_device(e.mu, wait_ms, on_queue)) throw DeviceBusy("the NPU is busy with another request");
-        std::unique_lock<std::timed_mutex> lock(e.mu, std::adopt_lock);
+        if (!wait_for_device(e.mu, wait_ms, on_queue))
+            throw DeviceBusy(e.mu.capacity() == 1 ? "the NPU is busy with another request"
+                                                  : "the NPU is busy with " + std::to_string(e.mu.capacity()) +
+                                                        " other requests");
+        std::unique_lock<DeviceSlots> lock(e.mu, std::adopt_lock);
         opt.max_tokens = std::min(opt.max_tokens, room);
         std::string pending;
         opt.on_token = [&](int t) {
@@ -638,6 +643,9 @@ int run_unified(int argc, char** argv) {
         open_with_retry(load_policy, "opening the private route's NPU context",
                         [&] { e.priv = route.open(*e.model, *e.tok, model_dir, opts); });
         e.max_context = e.priv->max_context();
+        // engine#3318: a route whose session serves several requests at once admits that many (before `ready`, so no
+        // request has been admitted at the old capacity).
+        e.mu.set_capacity(std::max(1, e.priv->max_concurrent()));
         e.default_penalty = e.priv->default_repetition_penalty();
         e.open_think = e.priv->opens_think();
         e.think_tmpl = think_template_of(read_chat_template(model_dir));

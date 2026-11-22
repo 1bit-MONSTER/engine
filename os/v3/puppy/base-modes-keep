@@ -32,6 +32,11 @@ run/
 dev/
 proc/
 sys/
+# engine#3287: written at boot, measured on the AI MAX+ 395 from a c35 stick whose base layers ship both as 0755 root:root
+# (the writable copies exist only in pup_rw): Puppy's rc.sysinit runs `mkdir -p /var/local/shared; chmod 777` on every
+# boot (its shared folder), and CUPS makes its cache 0770/0775 root:lp when it starts.
+var/local/shared/
+var/cache/cups/
 # The payload is NOT this list's business: it has its own normaliser (pack_normalise_modes) and its own release row,
 # and since c33 it ships 0 group/other-writable files (engine#1352). Keeping it here means the base row can be read as
 # "the base layer outside the payload", which is the number engine#1474 is about.

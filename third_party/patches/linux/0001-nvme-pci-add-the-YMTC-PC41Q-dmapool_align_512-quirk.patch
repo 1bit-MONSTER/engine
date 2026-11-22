@@ -1,0 +1,29 @@
+From: bong-water-water-bong <bong-water-water-bong@1bit.gg>
+Subject: [PATCH] nvme-pci: add NVME_QUIRK_DMAPOOL_ALIGN_512 for the YMTC PC41Q
+
+The YMTC PC41Q (1e49:1081, DRAM-less, firmware YM11D343) reads past the end
+of a full 32-entry PRP list on write commands. When that 256-byte list is
+the last block of its DMA-pool page, the read lands on the next page and the
+IOMMU logs an IO_PAGE_FAULT (AMD-Vi, flags 0x0000). A full list needs a
+transfer that spans 33 controller pages, which became reachable when the
+request ceiling went from 128 KiB to 256 KiB.
+
+Measured on a Ryzen AI MAX+ 395 with this drive: thousands of faults per
+boot on 7.4-rc1 (2361 on one boot), each at a small-pool page + 0x1000, and
+0 faults over 7 h with nvme.quirks=1e49:1081:dmapool_align_512 on the
+command line, the same flag this table entry sets.
+
+Signed-off-by: bong-water-water-bong <bong-water-water-bong@1bit.gg>
+---
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -4491,6 +4491,8 @@
+ 		.driver_data = NVME_QUIRK_NO_DEEPEST_PS, },
+ 	{ PCI_DEVICE(0x1e49, 0x0041),   /* ZHITAI TiPro7000 NVMe SSD */
+ 		.driver_data = NVME_QUIRK_NO_DEEPEST_PS, },
++	{ PCI_DEVICE(0x1e49, 0x1081),   /* YMTC PC41Q (DRAM-less): reads past a full 32-entry PRP list */
++		.driver_data = NVME_QUIRK_DMAPOOL_ALIGN_512, },
+ 	{ PCI_DEVICE(0x1fa0, 0x2283),   /* Wodposit WPBSNM8-256GTP */
+ 		.driver_data = NVME_QUIRK_NO_SECONDARY_TEMP_THRESH, },
+ 	{ PCI_DEVICE(0x025e, 0xf1ac),   /* SOLIDIGM  P44 pro SSDPFKKW020X7  */

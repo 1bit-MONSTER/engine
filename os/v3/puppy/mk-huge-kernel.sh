@@ -45,8 +45,8 @@
 # on 2 Nov ("error: bad shim lock signature"). Nothing else in the chain checks this, and a `-kernel` QEMU
 # boot cannot show it, so it is refused here.
 #
-# Exit: 0 ok, 1 usage, 2 refused (a module for another kernel, an unsigned one, or an unsigned kernel
-# image), 3 a tool is missing.
+# Exit: 0 ok, 1 usage, 2 refused (a module for another kernel, an unsigned one, an unsigned kernel image, or a
+# kernel without the device-table rows of third_party/patches/linux), 3 a tool is missing.
 set -euo pipefail
 prog=mk-huge-kernel
 die() { printf '%s: REFUSED: %s\n' "$prog" "$*" >&2; exit 2; }
@@ -109,6 +109,11 @@ if [ -d "$updates" ]; then
 fi
 [ -z "$mismatch" ] || die "modules for another kernel:$mismatch"
 [ -z "$unsigned" ] || die "unsigned modules:$unsigned (Secure Boot refuses them at load)"
+
+# the device-table rows the 1bit kernel carries (third_party/patches/linux): a kernel built without them boots
+# fine and brings back the fault they fix (engine#2478: the YMTC PC41Q's PRP over-read), so it is refused here
+bash "$(dirname "$0")/kernel-quirks-check.sh" "$stage" "$kver" ||
+    die "the kernel lacks a device-table row from third_party/patches/linux (kernel-quirks-check.sh)"
 
 mkdir -p "$out"
 out=$(cd "$out" && pwd)

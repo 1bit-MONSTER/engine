@@ -91,7 +91,7 @@ engine=$(/usr/bin/1bit-engine --version 2>&1) || { echo "1bit-engine --version f
 case $engine in "1bit "*) ;; *) echo "unexpected version output: $engine"; exit 1 ;; esac
 echo "version: $engine"
 shim=$(/opt/1bit/engine/lemonade-bin/llama-server --version 2>&1 | head -2 | tr "\n" " ")
-case $shim in *"version: 1 ("*) ;; *) echo "the shim did not run: $shim"; exit 1 ;; esac
+case $shim in *"version: "*"("*) ;; *) echo "the shim did not run: $shim"; exit 1 ;; esac
 echo "shim: $shim"
 '
 

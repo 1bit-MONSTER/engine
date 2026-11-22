@@ -178,6 +178,12 @@ struct Options {
     std::string mmproj;  // a vision (or audio) projector: image parts in chat messages
     int mtp_max = 0;
     std::string mtp_p_min;
+    // engine#679: the KV cache type. serve passed none, so every HRX serve ran llama-server's f16 default and the one
+    // lever that matters most at long context (the KV read dominates decode past a few thousand tokens) could not be
+    // asked for at all. Passed through verbatim; the DEFAULT is unchanged, because a quantised cache is an accuracy
+    // decision that has to clear the KLD/top-token gate rather than a throughput one (docs/bench.md).
+    std::string ctk;
+    std::string ctv;
     int parallel = 0;
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
     std::string role;            // "embedding" or "reranking": the model itself is served in that role
@@ -1490,6 +1496,9 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         // one slot, asked for explicitly: llama-server's own default is several (auto resolves to 4 + unified KV).
         argv.insert(argv.end(), {"-np", "1"});
     }
+    // engine#679: the KV cache type, independent of the slot count (see Options::ctk: passed through, never defaulted).
+    if (!o.ctk.empty()) { argv.push_back("-ctk"); argv.push_back(o.ctk); }
+    if (!o.ctv.empty()) { argv.push_back("-ctv"); argv.push_back(o.ctv); }
     if (o.parallel > 1) {
         // continuous batching: N requests decode together, one read of the weights per step
         // for all of them; llama-server splits --ctx-size across the slots
@@ -1510,8 +1519,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (!o.mtp.empty()) argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         else if (own_mtp) argv.insert(argv.end(), {"--spec-type", "draft-mtp"});  // the head is in -m (own_mtp_head)
         else argv.insert(argv.end(), {"--spec-type", "draft-dflash", "-md", o.dflash, "-ngld", "99"});
-        if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
-        // DFlash drafts a whole block per step and only pays with full blocks; llama-server's
+        if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }        // DFlash drafts a whole block per step and only pays with full blocks; llama-server's
         // default draft length is 3. The longest draft is the drafter's block minus its anchor
         // token, and the draft length also sets how many recurrent states a hybrid model keeps
         // for rollback: asking for 16 against DFlash2's block of 8 made every prompt write 16
@@ -3873,6 +3881,8 @@ void usage(FILE* out) {
                  "                                    device). Only with --moe-slots. Default off\n"
                  "                  [--mmproj MMPROJ.gguf]   images in chat messages (hrx, cpu)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
+                 "                  [--ctk T] [--ctv T]   KV cache types (f16 default; q8_0 halves the KV read at long context —\n"
+                 "                                    an accuracy decision, so it is asked for and never defaulted)\n"
 
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
                  "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
@@ -3992,6 +4002,9 @@ int run_serve(int argc, char** argv) {
         else if (a == "--mmproj") o.mmproj = next();
         else if (a == "--mtp-max") o.mtp_max = std::stoi(next());
         else if (a == "--mtp-p-min") o.mtp_p_min = next();
+        // engine#679: the KV cache type, passed straight to llama-server (see Options::ctk for why it is not a default).
+        else if (a == "--ctk") o.ctk = next();
+        else if (a == "--ctv") o.ctv = next();
         else if (a == "--parallel") o.parallel = std::stoi(next());
         else if (a == "--embed") o.embed = next();
         else if (a == "--embedding" || a == "--embeddings") o.role = "embedding";

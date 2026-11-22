@@ -71,8 +71,10 @@ How a model moves:
   ([hybrid.md](hybrid.md)) hands its KV cache to the HRX llama-server today; handing it to Loom
   decode is tracked there.
 
-State on 2026-11-21: **no model has moved yet**; `loom-serve` behind `1bit serve` is in progress.
-Every model on this page still runs on the llama.cpp route below.
+State on 2026-11-21: `loom-serve` behind `1bit serve` is merged
+([#3166](https://github.com/1bit-MONSTER/engine/pull/3166), [loom-route.md](loom-route.md)), and
+`config/loom-routes.json` decides per model which route serves it. The table ships empty, so **no
+model has moved yet**: every model on this page still runs on the llama.cpp route below.
 
 The llama.cpp route (the fork with ggml-hrx, plus the private HIP kernels) **stays as the
 fallback** for every model without a Loom program that passed the gate. It keeps its pins, its
@@ -1200,7 +1202,7 @@ tools/hrx_gtt_split.py parse split-4b/split.log --samples split-4b/gtt.txt     #
 ```
 
 `run` adds `-v`, sets `GGML_HRX_HOST_WEIGHT_TRACE=1`, and samples `drm-total-gtt` with each DRM client counted once. On the
-#1351 pin (llama.cpp `40f58efe1`, the same command):
+PR #1351 pin (llama.cpp `40f58efe1`, the same command):
 
 | part | Qwen3-4B Q4_K_M | Qwen3.8-27B UD-Q4_K_XL |
 |---|---:|---:|

@@ -25,11 +25,16 @@ the README is the short version.
 
 ## Routes
 
-- **HRX on the Radeon iGPU** ([hrx.md](hrx.md)): the engine's one GPU runtime. The GPU route is
-  moving to **Loom**: AMD's Loom model programs on HRX, served by `loom-serve` behind `1bit serve`,
-  one model at a time once it passes an A/B and accuracy gate
+- **HRX on the Radeon iGPU** ([hrx.md](hrx.md)): every model is served through `1bit serve`, one
+  binary; on the GPU it runs on HRX using AMD's Loom kernels in ggml-hrx, with our own kernels for the
+  ops Loom does not cover (on the NPU it runs on our NPU engine, below). HRX is the engine's one GPU
+  runtime. Models move to whole-model Loom programs one by one as they pass the speed + accuracy
+  gate: AMD's Loom model programs on HRX, served by `loom-serve` behind `1bit serve`
   ([#3158](https://github.com/1bit-MONSTER/engine/issues/3158),
-  [hrx.md](hrx.md#direction-loom-on-the-gpu)). No model has moved yet. Today every GPU model runs on
+  [hrx.md](hrx.md#direction-loom-on-the-gpu)). The route is in `1bit serve`, chosen per model by
+  `config/loom-routes.json` ([loom-route.md](loom-route.md),
+  [#3166](https://github.com/1bit-MONSTER/engine/pull/3166)); the table ships empty until a model
+  passes the gate, so no model has moved yet. Today every GPU model runs on
   the llama.cpp route: AMD's ggml-hrx with its Loom kernels and our HIP kernels, which stays as the
   fallback for models without a Loom program and gets no new kernel work. On that route, every ggml weight type runs on HRX, including NVFP4, Q2_0,
   MXFP4 and the ternary TQ, PTQ and PQ formats. For a GGUF, Lemonade starts the engine's
@@ -94,7 +99,9 @@ than Lemonade embedded into the engine.[^geramyl] On 2026-11-21 the owner moved 
 Loom, because straight Loom beat our llama.cpp fork with its HIP kernels on every model compared on
 strixhalo (Ryzen AI MAX+ 395, `gfx1151`). Each model moves only after the gate in
 [#3158](https://github.com/1bit-MONSTER/engine/issues/3158); coverage is
-[#3156](https://github.com/1bit-MONSTER/engine/issues/3156). The llama.cpp fork and the HIP kernels
+[#3156](https://github.com/1bit-MONSTER/engine/issues/3156). The serving half landed on 2026-11-21
+([#3166](https://github.com/1bit-MONSTER/engine/pull/3166), [loom-route.md](loom-route.md)); the
+route table ships empty, so a build today serves every GPU model on the llama.cpp route. The llama.cpp fork and the HIP kernels
 stay as the fallback, with no new kernel work. The NPU engine, the hybrid route and the one-binary
 image do not change. HRX met the decode gates in
 [RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213), which removed the engine's

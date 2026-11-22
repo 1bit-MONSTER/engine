@@ -2595,7 +2595,7 @@ weights; it has not been separated into quantisation and anything else.
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU
-kernels (dense Qwen3: 0.6B, 1.7B and 4B):
+kernels (Qwen3-0.6B and Qwen3-4B; Qwen3-1.7B follows in the next release):
 
 ```
 ./1bit serve -m <Qwen3 NPU model dir> --port 8000

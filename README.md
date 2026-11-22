@@ -32,10 +32,12 @@ Boot a USB stick, and the machine serves local LLMs on its GPU and NPU. That is 
 on the HRX runtime, served by `loom-serve` behind `1bit serve`. On our Strix Halo box, straight Loom
 beat our llama.cpp fork with its HIP kernels on every model we compared. A model moves only once it
 passes the Loom gate: an interleaved A/B and an accuracy check against the current route
-([#3158](https://github.com/1bit-MONSTER/engine/issues/3158)). No model has moved yet; the
-integration is in progress; which models have a Loom program is tracked in [#3156](https://github.com/1bit-MONSTER/engine/issues/3156). Until a
-model moves, and for models with no Loom program, the llama.cpp fork with ggml-hrx and our HIP
-kernels serves it as the fallback. The NPU engine does not change ([docs/hrx.md](docs/hrx.md#direction-loom-on-the-gpu)).
+([#3158](https://github.com/1bit-MONSTER/engine/issues/3158)). The Loom route is in `1bit serve`
+([#3166](https://github.com/1bit-MONSTER/engine/pull/3166), [docs/loom-route.md](docs/loom-route.md)):
+a model listed in `config/loom-routes.json` is served by `loom-serve`. That table ships empty, so no
+model has moved yet; which models have a Loom program is tracked in [#3156](https://github.com/1bit-MONSTER/engine/issues/3156). Until a
+model moves, and for models with no Loom program, the llama.cpp fork with ggml-hrx (its Loom kernels)
+and our HIP kernels serves it as the fallback. The NPU engine does not change ([docs/hrx.md](docs/hrx.md#direction-loom-on-the-gpu)).
 
 ## Get started
 
@@ -44,7 +46,7 @@ kernels serves it as the fallback. The NPU engine does not change ([docs/hrx.md]
    it. The image is served from Hugging Face because a GitHub release asset is capped at 2 GiB; the
    [releases page](https://github.com/1bit-MONSTER/engine/releases) stays the home of the
    `lemonade-onebit` package, the release notes and the release `SHA256SUMS`, and links there for the
-   image. The Hugging Face repository is private until v2026.44 is published, so until then that link
+   image. The Hugging Face repository is private until the release is published, so until then that link
    answers 401; from publication day this step is the download.
 2. Verify it, then write it to a USB stick (16 GB or more):
 
@@ -90,8 +92,11 @@ One binary to rule them all. The 1bit engine is model agnostic: any Hugging Face
 | 2026-10-30 | The HRX pin carries the DeepSeek-V4.1 port; ONNX Runtime runs in-process with our own execution provider on the NPU; the NPU and the GPU are measured running at the same time ([#672](https://github.com/1bit-MONSTER/engine/pull/672), [#647](https://github.com/1bit-MONSTER/engine/pull/647), [docs/hybrid.md](docs/hybrid.md)) |
 | 2026-11-01 | **v2026.44 is a draft**: candidate 19 is gated in software (1959/1959 kernel ops, NPU 82.03 tok/s, `VMTEST` pass through install and installed-disk boot, `VMTEST-RELEASE` 10 pass / 9 skip / 0 fail) but has **not** been booted or installed on hardware; candidate 20 takes the full gate, hardware boot and install included, before it is published ([docs/releases.md](docs/releases.md)) |
 | 2026-11-02 | **1bit OS becomes a Puppy Linux appliance**: `ResolutePup64` (woof-CE, Ubuntu 26.04 base) with our MOK-signed kernel, Lemonade and the engine embedded, headless by default with a `desktop` boot entry, `apt` and a persistent `1BIT-DATA`; it boots on the board with Secure Boot on ([docs/os-v3.md](docs/os-v3.md), [os/README.md](os/README.md)) |
+| 2026-11-06 | The installed appliance is a persistent system on the disk, not the live RAM image; it gets a normal account with `sudo` and takes the next appliance without losing its state ([#1291](https://github.com/1bit-MONSTER/engine/pull/1291), [#1302](https://github.com/1bit-MONSTER/engine/pull/1302), [#1334](https://github.com/1bit-MONSTER/engine/pull/1334)) |
+| 2026-11-08 | A release installs every package it publishes before it is released ([#1368](https://github.com/1bit-MONSTER/engine/pull/1368)) |
 | 2026-11-14 | The Bosgame BeyondMax's rear USB-A and Type-C ports work under Linux: a plug test on every external port passed once the keep-awake rule holds the xHCI controllers awake (USB4 devices still untested). The MTP drafter no longer crashes on a model's first request, and the HIP kernel and HRX pins moved forward through the hardware gate ([docs/axb35-usb-ports.md](docs/axb35-usb-ports.md), [#2431](https://github.com/1bit-MONSTER/engine/pull/2431), [#2453](https://github.com/1bit-MONSTER/engine/pull/2453), [#2461](https://github.com/1bit-MONSTER/engine/pull/2461)) |
-| 2026-11-21 | The GPU route starts moving to Loom: AMD's Loom model programs on HRX, served by `loom-serve` behind `1bit serve`, one model at a time once each passes an A/B and accuracy gate. The llama.cpp fork with our HIP kernels stays as the fallback; the NPU engine does not change ([#3156](https://github.com/1bit-MONSTER/engine/issues/3156), [#3157](https://github.com/1bit-MONSTER/engine/issues/3157), [#3158](https://github.com/1bit-MONSTER/engine/issues/3158)) |
+| 2026-11-20 | Liquid AI LFM3-1.7B on HRX for smaller machines: prefill 7,925 tok/s, decode 153.7 tok/s, 2.05 GiB of GTT at 8k context; its NPU pack passes the registry check on the NPU ([docs/models.md](docs/models.md), [#2956](https://github.com/1bit-MONSTER/engine/pull/2956), [#3016](https://github.com/1bit-MONSTER/engine/pull/3016)) |
+| 2026-11-21 | The GPU route starts moving to Loom: AMD's Loom model programs on HRX, served by `loom-serve` behind `1bit serve`, one model at a time once each passes an A/B and accuracy gate. The route is in `1bit serve`, chosen per model by `config/loom-routes.json`, which ships empty until a model passes. The llama.cpp fork with our HIP kernels stays as the fallback; the NPU engine does not change ([#3166](https://github.com/1bit-MONSTER/engine/pull/3166), [docs/loom-route.md](docs/loom-route.md), [#3156](https://github.com/1bit-MONSTER/engine/issues/3156), [#3157](https://github.com/1bit-MONSTER/engine/issues/3157), [#3158](https://github.com/1bit-MONSTER/engine/issues/3158)) |
 
 The release goes out when every item on the release checklist is done ([docs/releases.md](docs/releases.md)); the weekly Lemonade pin moves with Lemonade's releases.
 
@@ -101,6 +106,7 @@ The release goes out when every item on the release checklist is done ([docs/rel
 - [HRX on the Radeon 8060S](https://1bit.gg/hrx.html) and [the NPU engine](https://1bit.gg/npu.html): the two device routes, on the site.
 - [docs/architecture.md](docs/architecture.md): how the engine is built, what runs where, the hardware gate, the kernel, the direction.
 - [docs/serve.md](docs/serve.md): `1bit serve` and its options.
+- [docs/loom-route.md](docs/loom-route.md): the Loom GPU route behind `1bit serve`, its route table and its gate.
 - [docs/zero-copy.md](docs/zero-copy.md): the copies left on the serving paths, what each one costs per token, and why it stays.
 - [docs/lora.md](docs/lora.md): adapters (LoRA), changing a live adapter's factors in place, and the two traps around them.
 - [Measured results](https://github.com/1bit-MONSTER/engine/wiki): every number with how it was taken.

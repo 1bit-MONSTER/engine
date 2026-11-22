@@ -123,6 +123,10 @@ scripts/config --file .config --set-str LOCALVERSION "-1bit-perfopt"
 # '+', and the release string becomes -1bit-perfopt++):
 sed -n '/^diff --git /,$p' iommu-amd-perfopt.patch | git apply -
 git commit -qam "iommu/amd: the IOMMU PerfOpt backports"
+# always: the device-table rows the 1bit kernel carries (third_party/patches/linux/README.md; engine#3088 -
+# the YMTC PC41Q's NVME_QUIRK_DMAPOOL_ALIGN_512). mk-huge-kernel.sh refuses a kernel built without them.
+for p in <engine>/third_party/patches/linux/*.patch; do sed -n '/^diff --git /,$p' "$p" | git apply -; done
+git commit -qam "1bit: third_party/patches/linux"
 make LLVM=1 olddefconfig
 export LLVM=1                    # dpkg-buildpackage re-enters make: export it, do not just pass it
 nice -n 19 make LLVM=1 -j12 bindeb-pkg
@@ -245,6 +249,9 @@ or moves a node off HRX fails there rather than in a customer's run. Details:
   `os/v3/puppy/build.sh` builds the Puppy appliance with it inside, so the appliance boots our kernel
   with Secure Boot left on instead of asking for it to be switched off
   ([os/v3/puppy/README.md](../os/v3/puppy/README.md)).
+  It refuses a kernel stage whose `nvme` driver does not list the devices `third_party/patches/linux`
+  adds (`os/v3/puppy/kernel-quirks-check.sh`): a kernel without the YMTC PC41Q row boots fine and brings
+  the engine#2478 fault stream back, so nothing else would notice.
 - The BusyBox `os/mini` image is separate and is **not** 1bit OS (it is the CI/VM target):
   `os/mini/mkimage.sh` builds its unified kernel image from the same `vmlinuz`, and with `MOK_KEY` +
   `MOK_CERT` signs that UKI with the same kernel key.

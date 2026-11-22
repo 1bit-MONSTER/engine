@@ -315,6 +315,9 @@ add_test(NAME kernel_id_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/ke
 # os/kernel/config-<release> is the config of record itself. Offline: the hash and the config's own LOCALVERSION /
 # CC_VERSION_TEXT agree with the pin (`--box`, run by hand, compares the running kernel too).
 add_test(NAME kernel_pin COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_pin_test.sh ${CMAKE_SOURCE_DIR})
+# engine#3088: the 1bit kernel's device-table rows (third_party/patches/linux; the YMTC PC41Q's dmapool_align_512) and
+# os/v3/puppy/kernel-quirks-check.sh, which mk-huge-kernel.sh runs on a kernel stage. Offline, fixture stages.
+add_test(NAME kernel_quirks COMMAND bash ${CMAKE_SOURCE_DIR}/tests/kernel_quirks_test.sh ${CMAKE_SOURCE_DIR})
 # engine#3194: `scripts/npu-kernel-bitx.sh` gave a serve a fixed 60 s and then reported `serve did not come up -- `
 # with the reason grepped away, so a 14B host-GEMM arm that spends minutes warming was filed as a device failure.
 # The budget is `BITX_SERVE_WAIT_S` and the message carries the child's own last line; both are checked here with a stub

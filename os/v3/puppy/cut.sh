@@ -38,6 +38,7 @@
 # Env: ESP=<dir with BOOTX64.EFI grubx64.efi mmx64.efi> (the signed shim chain mkimage.sh embeds; required),
 #      BASE=<osfiles dir> | WOOF=<woof-CE dir> KERNEL_DIR=<mk-huge-kernel out> [LIBHSA_DIR=<HSA runtime set>],
 #      LEMONADE=<an already-built lemonade dir> (skip step 2; its lemond must report this tree's lemonade pin),
+#      NODE_TARBALL=<the pinned Node.js tarball> (BASE cut: use a local copy instead of downloading pin.txt's node_url),
 #      ONEBIT_IMAGE_ARCHIVE=<archive root>, NO_ARCHIVE=1 (a dry cut: probe, no archive).
 # Needs passwordless sudo for the root steps (patch-sfs, base-modes, mkimage), as the release host has.
 # Nothing here writes a stick, tags, uploads or publishes.
@@ -163,12 +164,25 @@ EOF
         sudo -n install -D -m $md -o root -g root "$src" "$F/$dst"
         printf '%s\t%s\n' "$dst" "$F/$dst"
     done < "$M.os" > "$M.staged"
-    # patch-sfs refuses a target whose bytes the base already has: keep only what differs
+    # Node.js + npm (engine#3310), as container-build.sh stages them: the pinned release, sha256-checked, with its exec
+    # wrappers. stage-node.sh --manifest prints the patch-sfs rows (the tree, and the wrappers with their mode). A base
+    # cut before #3311 has no Node.js, and without these rows the image fails release-check's `node` row.
+    # NODE_TARBALL=<file> uses a local copy of the pinned tarball instead of downloading it (it must match the pin).
+    N=$out/node-root; sudo -n rm -rf "$N"; mkdir -p "$N"
+    sh "$here/stage-node.sh" "$N" ${NODE_TARBALL:+--tarball "$NODE_TARBALL"} --manifest > "$out/node.manifest" \
+        2> "$logs/stage-node.log" || { cat "$logs/stage-node.log" >&2; die "Node.js could not be staged (stage-node.sh)"; }
+    [ "$(wc -l < "$out/node.manifest")" -ge 2 ] || die "stage-node.sh printed no manifest rows"
+    sudo -n chown -R root:root "$N"
+    cat "$out/node.manifest" >> "$M.staged"
+    # patch-sfs refuses a target whose bytes the base already has: keep only what differs (a tree is compared whole)
     X=$out/base-x; sudo -n rm -rf "$X"; cut -f1 "$M.staged" > "$out/os-paths.txt"
     sudo -n unsquashfs -q -n -d "$X" -ef "$out/os-paths.txt" "$bsfs" > /dev/null 2>&1 || true
     same=0
-    while IFS=$'\t' read -r dst src; do
-        if sudo -n cmp -s "$src" "$X/$dst"; then same=$((same + 1)); else printf '%s\t%s\n' "$dst" "$src" >> "$M"; fi
+    while IFS=$'\t' read -r dst src md; do
+        if [ -d "$src" ]; then
+            sudo -n diff -r --no-dereference -q "$src" "$X/$dst" > /dev/null 2>&1 && { same=$((same + 1)); continue; }
+        elif sudo -n cmp -s "$src" "$X/$dst"; then same=$((same + 1)); continue; fi
+        printf '%s\t%s%s\n' "$dst" "$src" "${md:+$'\t'$md}" >> "$M"
     done < "$M.staged"
     sudo -n rm -rf "$X"; rm -f "$M.os" "$M.staged"
     say "  $same OS file(s) already identical in the base; patching $(($(wc -l < "$M") - 1)) + the payload"

@@ -279,3 +279,5 @@ weaver (https://github.com/loom-fun/weaver)
 loom-fun model cards (https://github.com/loom-fun, https://huggingface.co/loom-fun)
   The Loom programs published per model; each model's weights keep their own licenses.
   They are downloaded by the user, not redistributed.
+  config/loom-cards.json names the card each catalogue model maps to, pinned at its commit,
+  with that card's license (MIT for the LLM cards it lists) next to the weights' own license.

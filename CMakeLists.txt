@@ -305,6 +305,12 @@ add_test(NAME config_pin_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/conf
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME config_pin_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/config_pin_check.py --self-test
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# config/loom-cards.json (catalogue model -> loom-fun Loom card, pinned; docs/loom-route.md "Card map"): every
+# `exact` claim is re-checked against models/pins.json, every card pinned at a commit, every weights licence present.
+add_test(NAME loom_cards_check COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/loom_cards.py --check
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME loom_cards_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/loom_cards.py --self-test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 # Gantt "Kernel 7.4 readiness": the inputs written inline in workflows and build scripts (a container image, a
 # `uses:` ref, a raw download, a pip requirement) name a commit or a digest. CI's `ubuntu:26.04` changed digest between
 # 2026-11-09 and 2026-11-13 with no change in this tree. Offline, reads the tree only.

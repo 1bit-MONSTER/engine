@@ -50,6 +50,16 @@ if ! id "$USER_NAME" > /dev/null 2>&1; then
 fi
 GRP=$(id -gn "$USER_NAME")
 
+# engine#3310: the npm global prefix on /data (05onboard-data makes it) belongs to this account, so `npm i -g <agent>`
+# works without sudo; root installs too (root writes anywhere), and the chown at every boot hands anything root installed
+# back to the account. Not world-writable: /data/npm-global/bin is on root's PATH, and a directory any account could
+# write there would be a way to root. The account has sudo already, so owning it gives it nothing it lacked.
+if [ -d "$DATA/npm-global" ]; then
+    chown -R "$USER_NAME:$GRP" "$DATA/npm-global"
+    h=/home/$USER_NAME/.npm-global
+    if [ ! -e "$h" ] || [ -L "$h" ]; then ln -sfn "$DATA/npm-global" "$h"; chown -h "$USER_NAME:$GRP" "$h"; fi
+fi
+
 # the keys: /data's copy is the source of truth (the stick was prepped with it), root's file is the fallback for a
 # machine keyed before /data carried one
 src=$DATA/ssh/authorized_keys

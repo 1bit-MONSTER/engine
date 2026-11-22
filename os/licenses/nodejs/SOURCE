@@ -1,0 +1,15 @@
+Node.js and npm: the JavaScript runtime `lemonade launch <agent>` needs to install and run the npm-distributed agents
+Ship: yes (1bit OS, os/v3/puppy; not os/mini)
+Project: Node.js, https://nodejs.org/ (OpenJS Foundation); npm, https://github.com/npm/cli (bundled in the release)
+Release: v24.22.3 "Krypton" LTS, the official linux-x64 build node-v24.22.3-linux-x64.tar.xz,
+          sha256 4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb (os/v3/puppy/pin.txt)
+License: MIT (Node.js contributors), with the licences of every dependency the release bundles (V8, libuv, OpenSSL,
+          ICU, zlib, npm Artistic-2.0 and its dependencies, and the rest) - all in LICENSE here, the release's own file,
+          unmodified; the image keeps the same file at /usr/local/lib/nodejs/LICENSE
+Packaged: not built here - os/v3/puppy/stage-node.sh downloads the release, refuses it unless the sha256 matches the pin,
+          and unpacks it into /usr/local/lib/nodejs, leaving out include/ (C headers for native addons), CHANGELOG.md,
+          README.md and share/doc. Nothing in the tree is patched; the one file added is etc/npmrc (prefix=/data/npm-global).
+Source: https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz (the release's source tarball), https://github.com/nodejs/node
+          at tag v24.22.3
+Not shipped: the agents themselves. `npm i -g <agent>` downloads them from the npm registry at the user's request,
+          under their own licences; the image carries none of them.

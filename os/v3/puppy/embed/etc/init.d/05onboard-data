@@ -63,6 +63,15 @@ mount -o rw "$part" "$DATA" 2> /dev/null || {
 mkdir -p "$DATA/models" "$DATA/lemonade/cache" "$DATA/lemonade/config" "$DATA/ssh" \
     "$DATA/npu/kernels" "$DATA/cache/hrx-jit"
 
+# engine#3310: npm's global prefix (the image's /usr/local/lib/nodejs/etc/npmrc says prefix=/data/npm-global), so an agent
+# installed with the command `lemonade launch` prints (`npm i -g <agent>`) survives a reboot on a live stick, whose root
+# is RAM, and on an installed disk. bin/ is on PATH from /etc/profile.d/91onboard-npm. ~/.npm-global is the path
+# Lemonade's agent finder also tries when PATH does not have the agent (a non-login shell), so root's points here too;
+# 07onboard-user gives the installed machine's normal account the same link and ownership of the tree.
+mkdir -p "$DATA/npm-global/bin" "$DATA/npm-global/lib/node_modules"
+chmod 755 "$DATA/npm-global" "$DATA/npm-global/bin" "$DATA/npm-global/lib" "$DATA/npm-global/lib/node_modules"
+if [ ! -e /root/.npm-global ] || [ -L /root/.npm-global ]; then ln -sfn "$DATA/npm-global" /root/.npm-global; fi
+
 # The API key has to outlive the boot: when a person turns one on (console menu item 1) it is written to
 # /etc/1bit/lemond.conf, and with this symlink in place that write lands in lemonade/lemond.conf on the partition.
 # Blank is the shipped mode (cycle 20), so in the default state the symlink dangles and nothing reads it.

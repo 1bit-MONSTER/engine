@@ -101,6 +101,17 @@ limits. Both are shipped with their licences, and the driver also with its sourc
 | `ec_su_axb35` (fan curve, EC temperature, EC power mode on the AXB35-02 board) | commit `f62c2c228959a08683273a26ef3afd8991e69f6d`, built for the image kernel by `os/mini/mkimage.sh` | GPL-2.0-only | `os/licenses/ec_su_axb35/` in this repository; the same source is installed in the image at `/usr/share/licenses/1bit-os/ec_su_axb35/src`; upstream https://github.com/cmetz/ec-su_axb35-linux |
 | `ryzenadj` (sets the SMU power limits; `/opt/1bit/ryzenadj` in the image) | **pinned v0.19.0**, commit `ea71739b4a3e1a0a624dfd1c9c268a31cb2a4182`, built by `os/mini/mkimage.sh` from the source in `os/licenses/ryzenadj` | LGPL-3.0, Copyright Jiaxun Yang and the RyzenAdj contributors | `os/licenses/ryzenadj/` in this repository (LICENSE, SOURCE, and the tag's source verbatim); the same source is installed in the image at `/usr/share/licenses/1bit-os/ryzenadj/src`; upstream https://github.com/FlyGoat/RyzenAdj |
 
+## Node.js (1bit OS only)
+
+1bit OS carries Node.js and npm so that `lemonade launch <agent>` can follow the install hint it prints
+(`npm i -g <agent>`) for the agents that are distributed through npm (engine#3310). The release is the
+official build, unmodified apart from npm's global config; the agents themselves are not in the image (a
+user downloads them from the npm registry, with network, under their own licences).
+
+| Component | Release | License | Source |
+|---|---|---|---|
+| Node.js with npm (`/usr/local/lib/nodejs`, wrappers `node`, `npm`, `npx`, `corepack` in `/usr/local/bin`) | **pinned v24.22.3** LTS, `node-v24.22.3-linux-x64.tar.xz` sha256 `4f2b175a6d53a5c6...` (`os/v3/puppy/pin.txt`), staged by `os/v3/puppy/stage-node.sh` | MIT (Node.js contributors); the bundled dependencies' licences (V8, libuv, OpenSSL, ICU, npm Artistic-2.0, and the rest) are in the release's LICENSE | `os/licenses/nodejs/` (LICENSE, SOURCE); the same LICENSE is in the image at `/usr/local/lib/nodejs/LICENSE`; https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz |
+
 ## System software from Ubuntu
 
 mkimage.sh copies these from the build machine (Ubuntu 26.04), unmodified, and records the exact

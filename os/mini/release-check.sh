@@ -978,6 +978,29 @@ xhci_capture_verdict() {   # <1 when /bin/1bit-xhci-capture is present and execu
     esac
 }
 
+# engine#3310: node_verdict <puppy 1/0> <node --version> <npm --version> <npm prefix -g> <prefix's mount point> [<data mount>]
+# 1bit OS ships Node.js so `lemonade launch <agent>` can follow its own `npm i -g <agent>` hint, and the global prefix has
+# to be ON the data partition: the live stick's root is RAM, so a prefix anywhere else loses the agent at the next boot.
+# The prefix's mount point is what df says for it, so a /data that is only a directory on the root (no partition mounted)
+# fails rather than passing on its name. os/mini does not ship Node.js: there it is a SKIP.
+node_verdict() {
+    _pup=${1:-} _nv=${2:-} _pv=${3:-} _pre=${4:-} _mnt=${5:-} _data=${6:-/data}
+    case "$_nv" in v[0-9]*) ;; *)
+        [ "$_pup" = 1 ] || { printf 'SKIP this image does not ship Node.js (1bit OS does, engine#3310)'; return 0; }
+        printf 'FAIL node --version printed %s: `lemonade launch <agent>` cannot install an npm-distributed agent (pi, claude, codex, opencode)' "'${_nv:-nothing}'"; return 0 ;;
+    esac
+    case "$_pv" in [0-9]*.[0-9]*) ;; *)
+        printf 'FAIL node %s runs but npm --version printed %s: the agents install through npm' "$_nv" "'${_pv:-nothing}'"; return 0 ;;
+    esac
+    case "$_pre" in
+        "$_data"/*) ;;
+        *) printf 'FAIL npm %s global prefix is %s, not on %s: an agent installed with npm i -g is gone after a reboot' "$_pv" "'${_pre:-unset}'" "$_data"; return 0 ;;
+    esac
+    [ "$_mnt" = "$_data" ] || {
+        printf 'FAIL npm global prefix %s is on %s, not on the mounted data partition %s: it would not survive a reboot' "$_pre" "'${_mnt:-unknown}'" "$_data"; return 0; }
+    printf 'PASS node %s, npm %s, global prefix %s on the data partition (installing an agent needs the network; offline, lemonade launch prints its own hint)' "$_nv" "$_pv" "$_pre"
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -1032,6 +1055,12 @@ if [ "${1:-}" = --self-test ]; then
     check PASS "$(xhci_capture_verdict 1)"
     check FAIL "$(xhci_capture_verdict 0)"
     check FAIL "$(xhci_capture_verdict '')"
+    check PASS "$(node_verdict 1 v24.22.3 11.19.1 /data/npm-global /data)"
+    check SKIP "$(node_verdict 0 '' '' '' '')"                                   # os/mini: no Node.js
+    check FAIL "$(node_verdict 1 '' '' '' '')"                                   # 1bit OS without Node.js
+    check FAIL "$(node_verdict 1 v24.22.3 '' /data/npm-global /data)"            # node but no npm
+    check FAIL "$(node_verdict 1 v24.22.3 11.19.1 /usr/local /)"                 # npm's default prefix: RAM on a stick
+    check FAIL "$(node_verdict 1 v24.22.3 11.19.1 /data/npm-global /)"           # /data is only a directory on the root
     check PASS "$(payload_runpath_verdict 0)"
     check FAIL "$(payload_runpath_verdict 3 '/opt/1bit-package/1bit/1bit runs /home/x/wt/release-rc/work/build')"
     check FAIL "$(payload_runpath_verdict 1)"
@@ -2555,6 +2584,22 @@ fi
 case "$XC" in
     PASS*) pass xhci-capture "${XC#PASS }" ;;
     *)     fail xhci-capture "${XC#FAIL }" ;;
+esac
+
+# engine#3310: Node.js + npm for `lemonade launch <agent>`, with npm's global prefix on the data partition.
+_nd_pup=0; [ -f /etc/rc.d/PUPSTATE ] && _nd_pup=1
+_nd_v=$(node --version 2> /dev/null | head -1)
+_nd_pv= _nd_pre= _nd_mnt=
+if [ -n "$_nd_v" ]; then
+    _nd_pv=$(npm --version 2> /dev/null | head -1)
+    _nd_pre=$(npm prefix -g 2> /dev/null | head -1)
+    [ -n "$_nd_pre" ] && [ -d "$_nd_pre" ] && _nd_mnt=$(df -P "$_nd_pre" 2> /dev/null | awk 'NR == 2 {print $6}')
+fi
+ND=$(node_verdict "$_nd_pup" "$_nd_v" "$_nd_pv" "$_nd_pre" "$_nd_mnt")
+case "$ND" in
+    PASS*) pass node "${ND#PASS }" ;;
+    SKIP*) skip node "${ND#SKIP }" ;;
+    *)     fail node "${ND#FAIL }" ;;
 esac
 
 # ── the NPU's locked memory in force (the driver asks for unlimited; this fleet's own 99- file can override ours) ──

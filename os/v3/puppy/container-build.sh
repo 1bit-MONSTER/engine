@@ -299,6 +299,10 @@ if [ -n "${PAYLOAD:-}" ]; then
     # run failed that row with "not installed". Same file both images ship.
     install -D -m 755 /repo/tools/xhci_boot_capture.sh "$skeleton/bin/1bit-xhci-capture"
     install -D -m 755 /recipe/1bit-install.sh "$skeleton/usr/local/bin/1bit-install"
+    # engine#3310: Node.js + npm, so `lemonade launch <agent>` can follow its own install hint (`npm i -g <agent>`). The
+    # pinned official release (pin.txt node_*), sha256-checked before it is unpacked, into /usr/local/lib/nodejs with exec
+    # wrappers in /usr/local/bin; npm's global prefix is /data/npm-global (05onboard-data, /etc/profile.d/91onboard-npm).
+    sh /recipe/stage-node.sh "$skeleton" || { echo "build: REFUSED: Node.js could not be staged (stage-node.sh)" >&2; exit 1; }
     # the board service the `fans` row of release-check reads (os/mini has shipped it all along), and the guarded
     # console installer the "Install 1bit OS to a disk" entry runs
     install -D -m 755 /repo/os/mini/board.sh "$skeleton/usr/sbin/1bit-board"
@@ -698,7 +702,9 @@ if [ -n "${PAYLOAD:-}" ]; then
              etc/xdg/autostart/1bit-lemonade-webapp.desktop \
              etc/init.d/27onboard-installer \
              usr/lib/1bit/seal_manifest.py etc/1bit/seal-pub.txt etc/1bit/onebit-models.txt \
-             etc/1bit/release-identity etc/keymap etc/localtime etc/timezone; do
+             etc/1bit/release-identity etc/keymap etc/localtime etc/timezone \
+             usr/local/lib/nodejs/bin/node usr/local/lib/nodejs/etc/npmrc usr/local/lib/nodejs/LICENSE \
+             usr/local/bin/node usr/local/bin/npm usr/local/bin/npx etc/profile.d/91onboard-npm; do
         in_image "$b" || miss="$miss $b"
     done
     [ -z "${LIBHSA_DIR:-}" ] || { in_image opt/rocm-therock/lib/libhsa-runtime64.so.1 || miss="$miss the HRX libhsa"; \

@@ -61,8 +61,14 @@ n=$(pack_origin_rpath "$d") || no "pack_origin_rpath returned non-zero"
 for f in libtherock.so.1 librunpath.so.1; do
     r=$(rpath_of "$d/$f"); [ "$r" = '$ORIGIN' ] && ok "$f: RPATH is \$ORIGIN" || no "$f: RPATH is '$r'"
     # loads its sibling through $ORIGIN alone, with nothing else on the search path
-    if env -u LD_LIBRARY_PATH ldd "$d/$f" 2>/dev/null | grep -q "libdep.so.1 => $d/libdep.so.1"; then ok "$f resolves libdep beside itself"
-    else no "$f does not resolve libdep.so.1 beside itself"; fi
+    out=$(env -u LD_LIBRARY_PATH -u LD_PRELOAD ldd "$d/$f" 2>&1)
+    got=$(printf '%s\n' "$out" | awk '$1 == "libdep.so.1" && $2 == "=>" {print $3}')
+    if [ -n "$got" ] && [ "$(realpath "$got" 2>/dev/null)" = "$(realpath "$d/libdep.so.1")" ]; then ok "$f resolves libdep beside itself"
+    else
+        no "$f does not resolve libdep.so.1 beside itself (resolved: '${got:-none}')"
+        printf '%s\n' "$out" | sed 's/^/       ldd: /'
+        readelf -d "$d/$f" 2>&1 | grep -E 'NEEDED|PATH' | sed 's/^/       readelf: /'
+    fi
 done
 [ "$(sha256sum "$d/liborigin.so.1" | cut -c1-64)" = "$before_origin" ] && ok "a library already at \$ORIGIN is untouched" ||
     no "a library already at \$ORIGIN was rewritten"

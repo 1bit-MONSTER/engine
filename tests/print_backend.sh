@@ -169,6 +169,12 @@ kv() { get '" ".join(d["argv"][i+1] for i, a in enumerate(d["argv"]) if a in ("-
 out=$(mplan mtp hrx --ctk q8_0 --ctv q8_0); rc=$?
 check "hrx plan: --ctk/--ctv reach llama-server as -ctk/-ctv (exit $rc, $(kv))" \
     '[ "$rc" = 0 ] && [ "$(kv)" = "q8_0 q8_0" ]'
+out=$(mplan mtp hrx --ctk q8_0); rc=$?
+check "hrx plan: a quantised cache warns that FA takes f16 K/V, so attention runs on the CPU" \
+    '[ "$rc" = 0 ] && grep -q "take f16 K/V only, so attention will run on the CPU" "$scratch/err"'
+out=$(mplan mtp hrx --ctk f16); rc=$?
+check "hrx plan: f16 asked for explicitly warns about nothing" \
+    '[ "$rc" = 0 ] && ! grep -q "attention will run on the CPU" "$scratch/err"'
 out=$(mplan mtp hrx); rc=$?
 check "hrx plan: no KV type asked for, none passed (the default stays llama-server's f16)" \
     '[ "$rc" = 0 ] && [ "$(kv)" = "-" ] && [ "$(get "\"-ctk\" in d[\"argv\"] or \"-ctv\" in d[\"argv\"]")" = False ]'

@@ -119,7 +119,8 @@
   "Inkling2LoopForConditionalGeneration": {
    "model_type": "inkling2_loop",
    "family": "Inkling-2 (a Loop-style decoder: relative-position attention instead of RoPE, d_rel 16 over rel_extent 1024; its text_config is hidden 2304 / 24 layers / 24 heads / 8 kv / head_dim 128 / vocab 201024 with a 1048576-token context. First seen 2026-11-21 as shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB, 5 models from 4 uploaders). Not an alias of anything mapped: no mapped family uses relative position embeddings, so loading it as llama/qwen would apply RoPE where the model applies learned relative offsets and still produce tokens. Nothing at the pin registers it (no conversion module, no LLM_ARCH_*). Declined 2026-11-21 under engine #3181; the census reports it as . REVIEWED.",
-   "watch": "report"
+   "watch": "report",
+   "mapped_ok": "the pinned backend now implements it, which docs/arch-gaps.md set as the condition: the llama.cpp pin is the Inkling 2 / Inkling 2 Mini port of upstream ggml-org (#32217, #32429, #32694, #32704) on fork branch 1bit/inkling2-port (1bit-MONSTER/llama.cpp#489): LLM_ARCH_INKLING2_LOOP with the relative-position bias (d_rel/rel_extent, gathered by query-to-cell distance) instead of RoPE, and the looped core (loop.start/end/count, separate KV/conv slots per pass), plus conversion/inkling2.py registering the class. Checked: test-llama-archs inkling2_loop NMSE 0 on CPU; CPU perplexity within the fork-vs-upstream drift of a Qwen3-0.6B control; on strixhalo `1bit serve --device cpu` answers the known-answer probe (42, Paris). The llama.cpp HRX route is refused by GGML_HRX_STRICT (457 of 12018 nodes off HRX: the non-flash-attention path the bias takes), so on the GPU this class is served by its Loom card (loom-fun/unsloth-Inkling-2-Mini-loom), not by this mapping. HF-logits validation: engine#3328."
   },
   "KairoForCausalLM": {
    "model_type": "kairo",

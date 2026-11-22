@@ -986,7 +986,7 @@ in `registry/significant.json`.
 | `MiniCPMOcrForConditionalGeneration` | FastFlowLM pack only | **declined for now** — custom `minicpm-ocr` library, nothing at the pin reads it |
 | `DFlash2DraftModel` | — | already declined (`significant.json`, `watch: report`) |
 | `Lfm3ForCausalLM` | — | already declined (`significant.json`, `watch: report`) |
-| `Inkling2LoopForConditionalGeneration` | 5 | **declined** — relative-position attention + looped blocks, nothing at the pin registers it (`significant.json`, `watch: report`) |
+| `Inkling2LoopForConditionalGeneration` | 5 | **mapped since the Inkling pin (engine#3332)** — was declined: relative-position attention + looped blocks; the port implements both (`significant.json` `mapped_ok`, below) |
 | `SageLmForCausalLM` | 1 | **declined** — Qwen2.5-7B geometry but the config omits rope_theta/activation (`significant.json`, `watch: report`) |
 | `VantageTitanForCausalLM` | 1 | **declined** — the declared dims contradict each other; no graph to map (`significant.json`, `watch: report`) |
 | `Edge0ForCausalLM` | 1 | **not declined** — `model_type: qwen4_exp_text`, i.e. the mapped `qwen4exp` family under a private class name, one converter registration away |
@@ -1402,6 +1402,16 @@ Three are **declined** and carry `"watch": "report"` in `registry/significant.js
   silent-substitution case this page exists for.
 * **Real support needs**: an architecture with relative-position attention and a looped block graph in the
   pinned backend, validated against HF logits. 5 models from 4 uploaders already, so it is worth watching.
+* **Mapped since the Inkling pin (2026-11-22, engine#3332, fork 1bit-MONSTER/llama.cpp#489)**: the pinned
+  backend implements the architecture, ported from upstream ggml-org (#32217, #32429, #32694, #32704):
+  `LLM_ARCH_INKLING2_LOOP` with the relative-position bias gathered by query-to-cell distance (no RoPE), the
+  looped core with its own KV/conv slots per pass, and `conversion/inkling2.py` registering the class.
+  Checked so far: `test-llama-archs` NMSE 0 (CPU), CPU perplexity within the fork-vs-upstream drift of a
+  Qwen3-0.6B control, and the known-answer probe on strixhalo through `1bit serve --device cpu`. The
+  llama.cpp HRX route is refused by strict placement (the bias takes the non-flash-attention path), so on the
+  GPU the model is served by its Loom card. The HF-logits check this section asked for is engine#3328's
+  next measurement. Only the root unsloth GGUFs use a different (unmerged) layout; ggml-org's and unsloth's
+  `Mainline_Support/` files load.
 
 ### `Edge0ForCausalLM` — `andynoodles/Edge0-145B-NVFP4-vLLM` (not declined: same family as a mapped class)
 

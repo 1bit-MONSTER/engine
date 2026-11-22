@@ -73,6 +73,12 @@ start() {
         echo "10lemonade: no /data partition: Lemonade state is in RAM, nothing persists"
     fi
     mkdir -p "$LEM/cache" "$LEM/config" "$MODELS"
+    # engine#3287: models go where the rest of Lemonade's state goes. Lemonade downloads through the Hugging Face cache, and with
+    # no HF_HOME that is $HOME/.cache/huggingface - HOME=/ here, so on the live stick it was RAM: the v2026.47 board run
+    # downloaded the demo models and a reboot would have erased them (the release check's hrx-placement row looks for them
+    # under /data/lemonade/huggingface). A value set in $CONF (sourced above) still wins.
+    export HF_HOME="${HF_HOME:-$LEM/huggingface}"
+    mkdir -p "$HF_HOME"
     # Cycle 25, owner: "log verbose it all for proof". lemond's verbosity is a config.json key, NOT a flag and NOT an
     # env var (measured on the pinned build: `lemond --help` has only -v/--version, and the accepted strings come from
     # AixLog::to_severity in runtime_config.cpp: trace|debug|info|warning|error|fatal|none, default info).

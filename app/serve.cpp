@@ -1497,6 +1497,18 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         argv.insert(argv.end(), {"-np", "1"});
     }
     // engine#679: the KV cache type, independent of the slot count (see Options::ctk: passed through, never defaulted).
+    // ... and on hrx it is a foot-gun rather than a lever, because both HRX flash-attention matchers require f16 K/V
+    // (dispatch-flash-attention.cpp:247 and :332) and no registration accepts a quantised K or V. A quantised cache
+    // therefore does not read less -- it makes the matchers DECLINE and attention runs on the CPU. Warn once, in the
+    // same voice as the other placement warnings, rather than let a "smaller KV" flag turn into a large slowdown with
+    // no reason printed. Not refused: the cpu route serves quantised caches legitimately, and a future HRX K/V-quant
+    // matcher should not need this warning edited to become reachable.
+    if (device == "hrx" && ((!o.ctk.empty() && o.ctk != "f16") || (!o.ctv.empty() && o.ctv != "f16"))) {
+        std::fprintf(stderr,
+                     "1bit serve: --ctk %s / --ctv %s on --device hrx: the HRX flash-attention matchers take f16 K/V "
+                     "only, so attention will run on the CPU (slower, not faster)\n",
+                     o.ctk.empty() ? "f16" : o.ctk.c_str(), o.ctv.empty() ? "f16" : o.ctv.c_str());
+    }
     if (!o.ctk.empty()) { argv.push_back("-ctk"); argv.push_back(o.ctk); }
     if (!o.ctv.empty()) { argv.push_back("-ctv"); argv.push_back(o.ctv); }
     if (o.parallel > 1) {

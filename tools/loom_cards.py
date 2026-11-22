@@ -56,7 +56,7 @@ SHA64 = re.compile(r"^[0-9a-f]{64}$")
 # and what a port needs. Kept here (not guessed by the build) so each line is a reviewed claim.
 NOTES = {
     "MiniCPM5-1B-1bit": ("llama", "unsloth-Llama-3.2-3B-Instruct-loom",
-                         "llama geometry: starter programs cover it with config only; package + gate in engine#3320"),
+                         "llama geometry, but the chat block is hand-written (BOS <s> + thinking toggle; without them it decodes garbage); the v2 package fails the gate (engine#3320)"),
     "MiniCPM-V-4.6-1bit": ("minicpmv (qwen3 text + vision tower)", "unsloth-Qwen3-VL-4B-Instruct-loom",
                            "text half = qwen3; needs the MiniCPM-V vision encoder + resampler programs"),
     "LFM2-1.2B-1bit": ("lfm2", "bartowski-LFM3-1.7B-loom",
@@ -76,7 +76,7 @@ NOTES = {
     "Qwen2.5-Coder-7B-Instruct-1bit": ("qwen2", "bartowski-Qwen2.5-7B-Instruct-loom",
                                        "same qwen2 geometry as Qwen2.5-7B: programs cover it with config only"),
     "Qwen2.5-Coder-1.5B-Instruct-1bit": ("qwen2", "bartowski-Qwen2.5-1.5B-Instruct-loom",
-                                         "same qwen2 geometry as Qwen2.5-1.5B: programs cover it with config only"),
+                                         "qwen2 like Qwen2.5-1.5B, but NOT config only: our GGUF has an untied Q6_K output.weight + Q4_K token_embd and the card's programs are generated for tied embeddings; rerun the generator"),
 }
 
 

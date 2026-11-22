@@ -10,7 +10,7 @@
    "weights_licence": "apache-2.0",
    "match": "none",
    "arch": "llama",
-   "gap": "llama geometry: starter programs cover it with config only; package + gate in engine#3320",
+   "gap": "llama geometry, but the chat block is hand-written (BOS <s> + thinking toggle; without them it decodes garbage); the v2 package fails the gate (engine#3320)",
    "nearest": {
     "repo": "loom-fun/unsloth-Llama-3.2-3B-Instruct-loom",
     "revision": "c6defa4cd5a8764b2cd8d4c14cb81ca0f118a76c"
@@ -322,7 +322,7 @@
    "weights_licence": "apache-2.0",
    "match": "none",
    "arch": "qwen2",
-   "gap": "same qwen2 geometry as Qwen2.5-1.5B: programs cover it with config only",
+   "gap": "qwen2 like Qwen2.5-1.5B, but NOT config only: our GGUF has an untied Q6_K output.weight + Q4_K token_embd and the card's programs are generated for tied embeddings; rerun the generator",
    "nearest": {
     "repo": "loom-fun/bartowski-Qwen2.5-1.5B-Instruct-loom",
     "revision": "a78f4fd5b9cda2a40ce321c2f60ea09228ca9950"

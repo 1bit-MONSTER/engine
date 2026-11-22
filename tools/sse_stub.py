@@ -46,12 +46,16 @@ class H(BaseHTTPRequestHandler):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Stream the same three words in one SSE shape, for a parser under test.")
-    ap.add_argument("port", type=int, help="loopback port to listen on")
+    ap.add_argument("port", type=int, help="loopback port to listen on; 0 = let the kernel pick a free one")
     ap.add_argument("shape", choices=sorted(SHAPES), help="which envelope each chunk uses")
     a = ap.parse_args(argv)
     global SHAPE
     SHAPE = a.shape
-    HTTPServer(("127.0.0.1", a.port), H).serve_forever()
+    srv = HTTPServer(("127.0.0.1", a.port), H)
+    # The bound port is the first line on stdout, so a caller that asked for port 0 reads it back instead of
+    # guessing one: a fixed port collides when two runs overlap on a shared box (engine#3193).
+    print(srv.server_address[1], flush=True)
+    srv.serve_forever()
 
 
 if __name__ == "__main__":

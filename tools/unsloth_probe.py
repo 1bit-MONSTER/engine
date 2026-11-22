@@ -127,16 +127,20 @@ def self_test():
     the check that separates "the server sent nothing my client reads" from "my client cannot read what it sent" -
     the distinction that cost a retracted measurement row when FLM streamed `delta.reasoning_content`
     (engine#3193). Exit 0 = every shape read, 1 = a shape was lost."""
-    import os, subprocess, sys, time
+    import os, subprocess, sys
     here = os.path.dirname(os.path.abspath(__file__))
     bad = 0
     for shape in ("delta.content", "delta.reasoning_content", "message.content"):
-        port = 53990 + len(shape)
-        srv = subprocess.Popen([sys.executable, os.path.join(here, "sse_stub.py"), str(port), shape],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Port 0: the stub binds a free port and prints it first. A derived fixed port (it was 53990 + len(shape))
+        # made two overlapping runs collide, and the loser reported "Connection refused" - a symptom that reads
+        # like a parser failure (engine#3193).
+        srv = subprocess.Popen([sys.executable, os.path.join(here, "sse_stub.py"), "0", shape],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         try:
-            time.sleep(0.6)
-            res, _ = call(f"http://127.0.0.1:{port}", "/v1/chat/completions", {"stream": True}, stream=True)
+            line = srv.stdout.readline().strip()
+            if not line.isdigit():
+                raise RuntimeError(f"stub did not report its port (got {line!r})")
+            res, _ = call(f"http://127.0.0.1:{line}", "/v1/chat/completions", {"stream": True}, stream=True)
         except Exception as e:                     # a stub that will not start is a failure, not a skip
             print(f"FAIL {shape}: {e}")
             bad += 1

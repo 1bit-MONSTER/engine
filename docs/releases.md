@@ -36,6 +36,27 @@ everything from scratch at the current pins, so each release carries that week's
 Releases are tagged `v<ISO year>.<ISO week>` (`v2026.40`), like Lemonade's `2026.39.1`; a second
 release in the same week gets `.1`.
 
+## Candidate c34 (22 Nov 2026) — on the hardware
+
+c34 is built from engine `7b534949` and measured on the Ryzen AI MAX+ 395 box on 2026-11-22, with
+Secure Boot on. The owner picks the release tag.
+
+| what | result |
+|---|---|
+| live USB boot | Lemonade serving about 74 s after power-on (fresh boot); `1bit-release-check` 33 of 38 rows pass |
+| install to the internal NVMe | `1bit-install` to the internal NVMe, then the disk boots on its own with the stick out; `1bit-release-check` 33 of 38 rows pass |
+| NPU, Qwen3-0.6B | chat 96.6-98.2 tok/s; bench time to first token 315 ms, prefill 85.7 tok/s, decode 91.7 tok/s; long turns to 1,000 tokens, streaming, reload and queued chats with zero NPU timeouts |
+| NPU, Qwen3-4B | ships; 5 of 5 on the known-answer gate |
+| NPU, Qwen3-1.7B | not in this release; it follows in the next one |
+| GPU (HRX), Qwen3-4B-Instruct-2507 | 46.5-50.0 tok/s |
+| image generation | SD-Turbo, 512x512, 17 s on the iGPU |
+| GPU and NPU together | both serve at the same time |
+| offline | models and backends live on the data partition; no network is needed after the first download |
+
+The five rows that do not pass are the same on the stick and on the installed disk, and each one is
+named for the next release: two stale NPU-set checks, a library RUNPATH cleanup, a USB-capture tool,
+and a queued non-streamed NPU chat case.
+
 ## v2026.44 (1 Nov 2026) — the first release, a draft
 
 > **2026-11-21: the GPU route is moving to Loom.** The owner moved the engine's GPU route to Loom: AMD's

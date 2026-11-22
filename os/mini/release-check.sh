@@ -888,6 +888,31 @@ payload_runpath_verdict() {
 # /opt/1bit and had to move this link with it; a link left behind (or a guard that skips because the engine dir is
 # absent) is not cosmetic: the engine finds no set, registers no device, and the boot is otherwise green.
 # Pure, so --self-test drives it: <sets present 0|1> <link target or empty>
+# engine#3287: where this boot's NPU sets are. v2026.47 (os/v3) ships them INSIDE the payload, beside the engine
+# (<engine dir>/npu/kernels is a real directory), and signs them with a signed manifest (`manifest`, first line
+# `npumanifest 2`) that carries no layout.json. The rows below used to look only at /data/npu/kernels for layout.json,
+# so they failed on a boot whose NPU chat passed at ~98 tok/s. A set = a directory holding a manifest of either scheme
+# (or the dev shape's layout.json); the engine dir is the first launcher found, as the identity row finds it.
+npu_engine_dir() {
+    if [ -n "${ENGINE_DIR:-}" ]; then printf '%s\n' "$ENGINE_DIR"; return 0; fi
+    for _e in /opt/1bit-package/1bit /opt/1bit-engine /opt/1bit; do
+        [ -x "$_e/1bit" ] && { printf '%s\n' "$_e"; return 0; }
+    done
+    printf '/opt/1bit\n'
+}
+npu_set_dirs() {  # <root>: one set directory per line, nothing when there is none
+    [ -d "${1:-}" ] || return 0
+    find "$1" -mindepth 2 -maxdepth 2 -type f \( -name layout.json -o -name manifest -o -name manifest.json \) 2>/dev/null |
+        sed 's|/[^/]*$||' | sort -u
+}
+npu_sets_root() {  # the directory that holds this boot's sets: in the payload beside the engine, else the data partition
+    _ed=$(npu_engine_dir)
+    if [ -d "$_ed/npu/kernels" ] && [ ! -L "$_ed/npu/kernels" ] && [ -n "$(npu_set_dirs "$_ed/npu/kernels")" ]; then
+        printf '%s\n' "$_ed/npu/kernels"
+    else
+        printf '%s\n' "${NPU_SETS_DIR:-/data/npu/kernels}"
+    fi
+}
 npu_link_verdict() {
     _sets=${1:-} _link=${2:-}
     case "$_sets" in
@@ -1187,6 +1212,20 @@ next')
     rm -f "$ST/set/manifest.json"
     st FAIL "a sealed set with no manifest at all" "$ST/set"
     rm -rf "$ST"
+    # engine#3287: the sets are found beside the engine (os/v3 payload) before the data partition
+    NT=$(mktemp -d); mkdir -p "$NT/eng/npu/kernels/1024x3072x16x8/38bf" "$NT/data/npu/kernels"
+    printf 'npumanifest 2\nset 1024x3072x16x8\n' > "$NT/eng/npu/kernels/1024x3072x16x8/manifest"
+    _r=$(ENGINE_DIR="$NT/eng" NPU_SETS_DIR="$NT/data/npu/kernels" npu_sets_root)
+    if [ "$_r" = "$NT/eng/npu/kernels" ]; then printf 'ok   a signed-manifest set inside the payload is the set root\n'
+    else printf 'FAIL want the payload set root, got %s\n' "$_r"; rc=1; fi
+    _n=$(npu_set_dirs "$NT/eng/npu/kernels" | grep -c . || true)
+    if [ "$_n" = 1 ]; then printf 'ok   a set with a signed manifest and no layout.json is one set\n'
+    else printf 'FAIL want 1 set, got %s\n' "$_n"; rc=1; fi
+    rm -rf "$NT/eng/npu"
+    _r=$(ENGINE_DIR="$NT/eng" NPU_SETS_DIR="$NT/data/npu/kernels" npu_sets_root)
+    if [ "$_r" = "$NT/data/npu/kernels" ]; then printf 'ok   no sets in the payload falls back to the data partition\n'
+    else printf 'FAIL want the data partition, got %s\n' "$_r"; rc=1; fi
+    rm -rf "$NT"
     # docs/laya-first.md §7: the laya-auto row. The second case is the one a status-only row misses - the
     # request answered 200 on default_model, which looks like a healthy route until you read the decision.
     LV='{"x_lemonade_route":{"route_to":"Qwen3-Coder-30B-A3B-Instruct-1bit","matched_rule":"laya-code","default_used":false,"trace":[{"condition":"classifier:laya","label":"code","score":0.46}]}}'
@@ -2095,26 +2134,32 @@ else
 fi
 
 # ── sealed NPU sets: the method never ships in the clear, and every file is in its set's manifest ────────
-SETS=$(find /data/npu/kernels -name layout.json 2>/dev/null | wc -l)
+NPUROOT=$(npu_sets_root)
+SETDIRS=$(npu_set_dirs "$NPUROOT")
+SETS=$(printf '%s\n' "$SETDIRS" | grep -c . || true)
 if [ "$SETS" = 0 ]; then
-    fail sealed "no NPU kernel set on the data partition (find /data/npu/kernels -name layout.json)"
+    fail sealed "no NPU kernel set beside the engine or on the data partition (looked in $NPUROOT)"
 else
-    BAD=0
-    for f in $(find /data/npu/kernels -type f 2>/dev/null); do
-        case "${f##*/}" in layout.json|manifest.json|manifest.sig) continue ;; esac
-        [ "$(head -c 8 "$f" 2>/dev/null)" = 1BPKCRYP ] && continue
-        BAD=$((BAD + 1)); say "      not sealed: $f"
-    done
-    [ "$(find /data/npu/kernels -name '*.mlir' -o -name 'layer1.work' 2>/dev/null | wc -l)" = 0 ] || { BAD=$((BAD + 1)); say "      plaintext build tree on the data partition"; }
-    # engine #574: sealing is confidentiality, the manifest is authenticity. Every set has to carry a
-    # manifest listing every file it ships with the sha256 of its ciphertext, and a signature over it.
-    for d in $(find /data/npu/kernels -name layout.json 2>/dev/null | sed 's|/layout.json$||'); do
+    BAD=0; K2=0
+    for d in $SETDIRS; do
+        if [ "$(head -c 13 "$d/manifest" 2>/dev/null)" = "npumanifest 2" ]; then
+            # signed-manifest sets ship plain ELFs by design (integrity, not secrecy): the manifest check below is the test
+            K2=$((K2 + 1))
+        else
+            for f in $(find "$d" -type f 2>/dev/null); do
+                case "${f##*/}" in layout.json|manifest.json|manifest.sig) continue ;; esac
+                [ "$(head -c 8 "$f" 2>/dev/null)" = 1BPKCRYP ] && continue
+                BAD=$((BAD + 1)); say "      not sealed: $f"
+            done
+        fi
+        # engine #574: every set carries a manifest listing every file it ships with its sha256, and a signature over it
         P=$(seal_manifest_problems "$d") && continue
         BAD=$((BAD + 1))
-        printf '%s\n' "$P" | sed "s|^|      ${d#/data/npu/kernels/}: |" | while IFS= read -r l; do say "$l"; done
+        printf '%s\n' "$P" | sed "s|^|      ${d#"$NPUROOT"/}: |" | while IFS= read -r l; do say "$l"; done
     done
-    if [ "$BAD" = 0 ]; then pass sealed "$SETS sealed sets, $PLAIN_TOTAL kernels, none in the clear, every file in its set's manifest"
-    else fail sealed "$BAD problem(s) under /data/npu/kernels: not sealed, or not in the set's manifest"; fi
+    [ "$(find "$NPUROOT" -name '*.mlir' -o -name 'layer1.work' 2>/dev/null | wc -l)" = 0 ] || { BAD=$((BAD + 1)); say "      plaintext build tree under $NPUROOT"; }
+    if [ "$BAD" = 0 ]; then pass sealed "$SETS NPU sets under $NPUROOT ($K2 signed-manifest, $((SETS - K2)) sealed), every file in its set's manifest, no build tree"
+    else fail sealed "$BAD problem(s) under $NPUROOT: a sealed set in the clear, a file not in its set's manifest, or a build tree"; fi
 fi
 
 # ── the signatures over those manifests (engine #574): the release public key is the only thing needed ──
@@ -2129,7 +2174,7 @@ for t in "$(dirname "$0")/../../tools/seal_manifest.py" "$(dirname "$0")/../lib/
     [ -f "$t" ] && { SEALTOOL=$t; break; }
 done
 if [ "$SETS" = 0 ]; then
-    skip sealed-sig "no NPU kernel set on the data partition, so there is no manifest to verify"
+    skip sealed-sig "no NPU kernel set beside the engine or on the data partition, so there is no manifest to verify"
 elif ! command -v python3 >/dev/null 2>&1; then
     skip sealed-sig "no python3 in this image, so the signatures can only be verified by the loader (the private NPU runtime holds the release public key)"
 elif [ -z "$SEALTOOL" ]; then
@@ -2138,13 +2183,16 @@ elif [ ! -f "$SEALPUB" ]; then
     skip sealed-sig "no release public key at $SEALPUB: install the key the loader was built with to check the signatures here"
 else
     SIGBAD=0; SIGS=0
-    for d in $(find /data/npu/kernels -name layout.json 2>/dev/null | sed 's|/layout.json$||'); do
+    for d in $SETDIRS; do
+        # a signed-manifest set is verified by the loader against the key built into it, not by seal_manifest.py
+        [ "$(head -c 13 "$d/manifest" 2>/dev/null)" = "npumanifest 2" ] && continue
         SIGS=$((SIGS + 1))
         _o=$(python3 "$SEALTOOL" verify "$d" --pub "$SEALPUB" 2>&1) || {
-            SIGBAD=$((SIGBAD + 1)); say "      ${d#/data/npu/kernels/}: $(printf '%s\n' "$_o" | head -1)"
+            SIGBAD=$((SIGBAD + 1)); say "      ${d#"$NPUROOT"/}: $(printf '%s\n' "$_o" | head -1)"
         }
     done
-    if [ "$SIGBAD" = 0 ]; then pass sealed-sig "$SIGS manifest.sig verified with the release public key ($SEALPUB)"
+    if [ "$SIGS" = 0 ]; then skip sealed-sig "every set here uses the signed manifest, which the loader verifies with the key built into it; no older sealed set to verify with $SEALPUB"
+    elif [ "$SIGBAD" = 0 ]; then pass sealed-sig "$SIGS manifest.sig verified with the release public key ($SEALPUB)"
     else fail sealed-sig "$SIGBAD of $SIGS set manifests are not signed by the release public key"; fi
 fi
 
@@ -2462,9 +2510,13 @@ fi
 # ── the NPU sets are linked BESIDE the engine (engine#1543's coupling) ──────────────────────────────
 # init.sh links the stick's /data/npu/kernels to <engine dir>/npu/kernels at boot, because that is where the
 # engine looks. The failure this row exists for is silent: the boot is green and no NPU device registers.
+_npu_ed=$(npu_engine_dir)
 _npu_sets=0; [ -d "${NPU_SETS_DIR:-/data/npu/kernels}" ] && _npu_sets=1
-_npu_link=$(readlink "${ENGINE_DIR:-/opt/1bit}/npu/kernels" 2>/dev/null || true)
-if [ "$_npu_sets" = 1 ]; then
+_npu_link=$(readlink "$_npu_ed/npu/kernels" 2>/dev/null || true)
+if [ -d "$_npu_ed/npu/kernels" ] && [ ! -L "$_npu_ed/npu/kernels" ] && [ -n "$(npu_set_dirs "$_npu_ed/npu/kernels")" ]; then
+    # engine#3287: os/v3 ships the sets inside the payload, so they are beside the engine by construction
+    pass npu-kernels-beside-engine "the NPU sets ship beside the engine in the payload ($_npu_ed/npu/kernels, $(npu_set_dirs "$_npu_ed/npu/kernels" | grep -c .) sets)"
+elif [ "$_npu_sets" = 1 ]; then
     _nv=$(npu_link_verdict 1 "${_npu_link:-}")
     case "$_nv" in PASS*) pass npu-kernels-beside-engine "${_nv#PASS }" ;; *) fail npu-kernels-beside-engine "${_nv#FAIL }" ;; esac
 else

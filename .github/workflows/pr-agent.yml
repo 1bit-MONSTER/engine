@@ -108,7 +108,7 @@ jobs:
           # PR-Agent from https://github.com/The-PR-Agent/pr-agent (PyPI pr-agent), one venv per version on the
           # runner so a version bump installs fresh instead of reusing the old one. Since 0.49 the GitHub provider
           # is an extra: without [github] every command fails with "Git provider 'github' could not be loaded".
-          PRA_VERSION=0.49.0
+          PRA_VERSION=0.50.0
           venv="$HOME/pr-agent-venv-$PRA_VERSION"
           export PATH="$venv/bin:$PATH"
           if ! "$venv/bin/pr-agent" --help > /dev/null 2>&1; then

@@ -66,7 +66,7 @@ _pack_matches() {  # <name> <patterns>
 }
 
 pack_localize() {
-    local stage=$1 build=$2 item f orig keep e dep dest
+    local stage=$1 build=$2 item f orig dep dest
     local queue=()
     while IFS= read -r -d '' f; do
         # NPU kernel sets are NOT host ELFs: an AIE kernel carries a .dynamic section, so pack_is_dynelf calls it
@@ -79,7 +79,7 @@ pack_localize() {
     done < <(find "$stage" -mindepth 2 -type f -print0)
     while [ ${#queue[@]} -gt 0 ]; do
         item=${queue[0]}; queue=("${queue[@]:1}")
-        f=${item%%|*} orig=${item#*|} keep=""
+        f=${item%%|*} orig=${item#*|}
         while read -r dep; do
             dest=$(dirname "$f")/$(basename "$dep")
             [ -e "$dest" ] && continue
@@ -90,10 +90,12 @@ pack_localize() {
             cp -L "$dep" "$dest"
             queue+=("$dest|$dep")
         done < <(ldd "$orig" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// {print $3}')
-        for e in $(readelf -d "$orig" | sed -n 's/.*R\(UN\)\{0,1\}PATH.*\[\(.*\)\]/\2/p' | tr ':' ' '); do
-            case "$e" in '$ORIGIN'*|"$build"*|"$HOME"*|'') ;; *) keep="$keep:$e" ;; esac
-        done
-        patchelf --set-rpath "\$ORIGIN$keep" "$f"
+        # engine#3287: $ORIGIN only. The SDK entries this used to keep (TheRock's LLVM runtime dirs under /opt/rocm-therock)
+        # name directories that exist on the BUILD host only: measured on the installed v2026.47 appliance, neither
+        # .../_rocm_sdk_core/lib/llvm/lib/... path exists, and the release check's payload-runpath row failed 40 entries
+        # for it. Everything those dirs could provide is copied beside the library above (PACK_BUNDLE_LIBS: libomp), and
+        # pack_unresolved_needed (plain ldd, no LD_LIBRARY_PATH) refuses a package whose NEEDED no longer resolves.
+        patchelf --set-rpath '$ORIGIN' "$f"
     done
 }
 

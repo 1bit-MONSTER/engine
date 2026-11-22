@@ -125,7 +125,7 @@ provenance_bad=$(pack_require_provenance "$stage" "$build" || true)
 # Every program and library finds its libraries beside itself (scripts/pack-elf.sh): a library it
 # loads from elsewhere in the build tree (HRX's libhrx, libloomc) or LLVM's OpenMP runtime
 # (libomp.so, which ggml's CPU code links when TheRock's amdclang builds llama.cpp) is copied beside
-# it; RUNPATH entries outside the build tree (TheRock in /opt) stay, since HRX needs TheRock anyway.
+# it; every RUNPATH becomes $ORIGIN alone (engine#3287: the SDK entries named build-host-only dirs).
 pack_localize "$stage" "$build"
 # pack_localize gives every program and library $ORIGIN plus whatever SDK entries its link needed; the
 # engine binary at the top of the tree is the one it does not visit (depth 1), so drop its rpath here.

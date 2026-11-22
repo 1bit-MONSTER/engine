@@ -165,7 +165,7 @@ EOF
     done < "$M.os" > "$M.staged"
     # patch-sfs refuses a target whose bytes the base already has: keep only what differs
     X=$out/base-x; sudo -n rm -rf "$X"; cut -f1 "$M.staged" > "$out/os-paths.txt"
-    sudo -n unsquashfs -q -d "$X" -ef "$out/os-paths.txt" "$bsfs" > /dev/null 2>&1 || true
+    sudo -n unsquashfs -q -n -d "$X" -ef "$out/os-paths.txt" "$bsfs" > /dev/null 2>&1 || true
     same=0
     while IFS=$'\t' read -r dst src; do
         if sudo -n cmp -s "$src" "$X/$dst"; then same=$((same + 1)); else printf '%s\t%s\n' "$dst" "$src" >> "$M"; fi
@@ -178,7 +178,7 @@ EOF
     # the other layers get the engine#1474 normalisation (go-w only, no byte changes), each its own compression
     for l in bdrv fdrv zdrv; do
         src=$(ls "$BASE"/${l}_*.sfs | head -1); t=$out/layer-$l; sudo -n rm -rf "$t"
-        sudo -n unsquashfs -q -d "$t" "$src"
+        sudo -n unsquashfs -q -n -d "$t" "$src"
         sudo -n bash "$T/scripts/base-modes.sh" "$t" --keep "$here/base-modes-keep" > "$logs/base-modes-$l.log" 2>&1 ||
             die "base-modes failed on $l"
         case $l in zdrv) opts="-comp xz -b 128K" ;; *) opts="-comp zstd -Xcompression-level 19 -b 256K" ;; esac

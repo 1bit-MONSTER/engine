@@ -219,4 +219,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # engine#3193: the row ctest runs is `--self-test`, and add_python_test judges it by EXIT STATUS. self_test()
+    # returns 1 for a shape the parser could not read, and main() propagates it, so discarding that value makes the
+    # row green no matter what the parser does -- measured: with the `reasoning_content` branch removed it prints
+    # "FAIL (2 of 3 stream shapes read)" and exits 0 without this line, and 1 with it.
+    sys.exit(main())

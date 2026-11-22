@@ -366,6 +366,48 @@ def self_test() -> int:
         (sealed / "manifest.json").write_text(json.dumps({"files": {}}), encoding="utf-8")
         arm("a format-1 manifest.json is the sealed scheme", "sealed1", detect(sealed))
 
+        # engine#3237 review: the sealed path carries its OWN digest comparison (`if want and digest != want`), and the
+        # detection arm above pins the scheme, not a tampered file -- measured: neutering that comparison left 13 ok /
+        # 0 failed. A fixture that satisfies every other rule and differs only in the bytes makes it discriminating.
+        def format1_set(root: pathlib.Path, *, tampered: bool):
+            root.mkdir(parents=True, exist_ok=True)
+            good = SEALED_MAGIC + b"ciphertext"
+            (root / "65").mkdir(exist_ok=True)
+            (root / "65" / "layer1.elf").write_bytes(good if not tampered else SEALED_MAGIC + b"ciphertexT")
+            (root / "manifest.json").write_text(json.dumps({"files": [
+                {"path": "65/layer1.elf", "size": len(good), "sha256": hashlib.sha256(good).hexdigest()}]}),
+                encoding="utf-8")
+            (root / SIG).write_bytes(b"\x00" * SIG_BYTES)
+            return root
+
+        clean1 = format1_set(base / "sealed-clean", tampered=False)
+        arm("a well-formed format-1 set checks clean", 0, check(clean1))
+        rc, err = problems_of(format1_set(base / "sealed-tampered", tampered=True))
+        arm("a format-1 set whose bytes changed after signing is a finding", 1, rc)
+        arm("…and it is the DIGEST that names it, not a missing file or signature", True,
+            "digest mismatch" in err and "missing" not in err and SIG not in err)
+
+        # engine#3237 review, second pass: the PER-KERNEL manifests (each <hex>/ carries its own) are a third family of
+        # checks, and they had no arm either -- a set whose kernel manifest disagrees with the kernel beside it is the
+        # shape a re-sealed kernel produces when only the set-level pair is regenerated.
+        def per_kernel_set(root: pathlib.Path, *, kdigest=None, ksig=True):
+            root = kset(root)
+            kern = root / "65"
+            (kern / "manifest").write_text(
+                f"{KMANIFEST_MAGIC}\nset 1024x3072x16x8\n"
+                f"{kdigest or hashlib.sha256(b'\x7fELFkernel').hexdigest()} 10 layer1.elf\n", encoding="utf-8")
+            if ksig:
+                (kern / SIG).write_bytes(b"\x00" * SIG_BYTES)
+            return root
+
+        arm("a kernel whose own manifest agrees with it checks clean", 0, check(per_kernel_set(base / "kern-ok")))
+        rc, err = problems_of(per_kernel_set(base / "kern-baddigest", kdigest="0" * 64))
+        arm("a kernel manifest that disagrees with the kernel beside it is a finding", 1, rc)
+        arm("…and it names the kernel's manifest, not the set's", True, "does not list this layer1.elf" in err)
+        rc, err = problems_of(per_kernel_set(base / "kern-nosig", ksig=False))
+        arm("a kernel manifest with no signature beside it is a finding", 1, rc)
+        arm("…and it names the missing signature for that kernel", True, "has a manifest but no" in err)
+
         # the writer emits `file <sha> <size> <path>`; both spellings must parse or the check reads an empty manifest
         prefixed = kset(base / "prefixed")
         (prefixed / "manifest").write_text(

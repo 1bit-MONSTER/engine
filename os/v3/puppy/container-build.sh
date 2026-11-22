@@ -276,6 +276,10 @@ if [ -n "${PAYLOAD:-}" ]; then
     # both images ship, like release-check.sh above: its /data paths and its engine-log path are layout-aware
     # rather than forked here.
     install -D -m 755 /repo/os/mini/selftest.sh "$skeleton/usr/local/bin/1bit-selftest"
+    # engine#3287: the release check's xhci-capture row (engine#823) runs /bin/1bit-xhci-capture to ask whether a rear USB-A
+    # or Type-C port sees a device. os/mini/mkimage.sh has installed it all along; the Puppy image never did, so every v3 board
+    # run failed that row with "not installed". Same file both images ship.
+    install -D -m 755 /repo/tools/xhci_boot_capture.sh "$skeleton/bin/1bit-xhci-capture"
     install -D -m 755 /recipe/1bit-install.sh "$skeleton/usr/local/bin/1bit-install"
     # the board service the `fans` row of release-check reads (os/mini has shipped it all along), and the guarded
     # console installer the "Install 1bit OS to a disk" entry runs

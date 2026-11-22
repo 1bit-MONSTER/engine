@@ -397,8 +397,8 @@ release carries the NPU runtime, compiled into `1bit`, and the `onebit` recipe's
 The NPU kernels are closed too: they ship as sealed artifacts that `1bit` verifies and opens in
 memory at load, failing cleanly on a
 wrong key with no network callback of any kind; a lifted kernel file is ciphertext and does not run
-([npu.md](npu.md)). The release package carries them, and serves dense Qwen3 (0.6B, 1.7B, 4B)
-on the NPU.
+([npu.md](npu.md)). The release package carries them, and serves Qwen3-0.6B and Qwen3-4B on the NPU;
+Qwen3-1.7B follows in the next release.
 
 `scripts/weekly.sh` packs them by default (`WEEKLY_NPU_KERNELS=0` builds without): the sealed
 kernel sets go beside `1bit` in `npu/kernels`, the build loads sealed kernels only

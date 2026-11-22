@@ -1797,8 +1797,24 @@ void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& o
         }
     }
     if (shape != loom::StreamShape::Sse) {
-        // not a stream: loom-serve refused the request (or ignored `stream`). Answer with its status and body.
-        upstream->wait();
+        // not a stream: loom-serve refused the request (or ignored `stream`). Answer with its status and body. The
+        // status is settled here, but the BODY can still stall: an upstream that sends one complete non-SSE line and
+        // then goes quiet without terminating the body would hold this handler with no status line sent, and the only
+        // bound left on that path is the client's 3600 s read timeout -- the same failure the first-byte bound above
+        // exists to remove, one branch over. So bound the body with the same constant and the same cancellation path
+        // (`abort_upstream` shares the Client, so `stop()` makes an in-flight Post() return instead of waiting for bytes
+        // that will never come; measured on a stalling stub upstream: 60.0 s to a 504 instead of 70.0 s of silence for
+        // a 70 s stall, i.e. the bound instead of the stall) -- engine#3268.
+        if (upstream->wait_for(std::chrono::seconds(kLoomFirstByteSecs)) != std::future_status::ready) {
+            abort_upstream();
+            res.status = 504;
+            res.set_content(json{{"error", {{"message", "loom-serve sent " + std::to_string(first->size()) +
+                                                        " bytes of a non-stream body and neither finished nor closed "
+                                                        "it within " +
+                                                        std::to_string(kLoomFirstByteSecs) + " s"}}}}.dump(),
+                            "application/json");
+            return;
+        }
         std::string all = *first;
         {
             std::lock_guard<std::mutex> g(pump->m);

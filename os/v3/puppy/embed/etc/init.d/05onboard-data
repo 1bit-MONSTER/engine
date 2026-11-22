@@ -57,6 +57,9 @@ mount -o rw "$part" "$DATA" 2> /dev/null || {
     echo "05onboard-data: cannot mount $part at $DATA: nothing on this boot persists" >&2
     exit 0
 }
+# engine#3287: a written stick keeps the image's 8 GB data partition; the first boot that finds room grows it to the end
+# of the medium, online (it is mounted: it is also the boot medium). Removable USB only, once, never fatal.
+[ -x /usr/local/sbin/1bit-grow-data ] && /usr/local/sbin/1bit-grow-data "$part" "$DATA"
 mkdir -p "$DATA/models" "$DATA/lemonade/cache" "$DATA/lemonade/config" "$DATA/ssh" \
     "$DATA/npu/kernels" "$DATA/cache/hrx-jit"
 

@@ -1,0 +1,75 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-grow-data <data partition node> <data mountpoint>
+#
+# engine#3287: a written stick keeps the image's 8 GB 1BIT-DATA partition, which the demo models alone nearly fill
+# (measured on v2026.47: 64 GB stick, 8 GB /data). os/mini grows at prepare time (prepare-stick.sh), but the Puppy
+# image is written with dd and booted, so it grows here, once, on the first boot that finds room.
+#
+# On this image the data partition is ALSO the boot medium (the SFS set and the save layer live on it) and is mounted
+# before init runs, so the grow is the online one cloud images use (growpart): the GPT entry is rewritten without a
+# re-read, the kernel is told the new size with partx (BLKPG resize works on a mounted partition), and ext4 grows in
+# place with resize2fs. Nothing is unmounted and no data moves: the start sector never changes.
+#
+# It acts only when every one of these holds, and otherwise says why and exits 0 (a stick that is not grown still works):
+#   * the partition sits on a removable USB disk (an installed disk was created full-size by 1bit-install);
+#   * it is the LAST partition and at least 1 GiB is free after it;
+#   * the filesystem is ext4 and mounted at <data mountpoint>;
+#   * <data mountpoint>/.grown does not exist (the marker this writes on success, so later boots do nothing).
+# ONEBIT_GROW_ANY_DISK=1 drops the removable-USB condition (the loop-device test, tests/grow_data_test.sh).
+set -u
+part=${1:?usage: 1bit-grow-data <partition> <mountpoint>}
+mnt=${2:?usage: 1bit-grow-data <partition> <mountpoint>}
+say() { echo "1bit-grow-data: $*"; }
+[ -f "$mnt/.grown" ] && exit 0
+pname=${part##*/}
+sys=/sys/class/block/$pname
+[ -e "$sys/partition" ] || { say "$part is not a partition: left as it is"; exit 0; }
+pn=$(cat "$sys/partition")
+disk=$(basename "$(readlink -f "$sys/..")")
+[ -b "/dev/$disk" ] || { say "no parent disk for $part: left as it is"; exit 0; }
+if [ "${ONEBIT_GROW_ANY_DISK:-0}" != 1 ]; then
+    tran=$(lsblk -dno TRAN "/dev/$disk" 2> /dev/null | tr -d ' ')
+    rem=$(cat "/sys/block/$disk/removable" 2> /dev/null || echo 0)
+    [ "$tran" = usb ] || [ "$rem" = 1 ] || { say "/dev/$disk is not removable USB storage: an installed disk is not grown"; exit 0; }
+fi
+grep -q "^$part $mnt ext4 " /proc/mounts || { say "$part is not mounted at $mnt as ext4: left as it is"; exit 0; }
+for t in sfdisk partx resize2fs; do
+    command -v $t > /dev/null 2>&1 || { say "$t is missing: $part keeps its image size"; exit 0; }
+done
+start=$(cat "$sys/start"); size=$(cat "$sys/size"); total=$(cat "/sys/block/$disk/size")
+for p in /sys/block/$disk/${disk}*; do
+    [ -e "$p/start" ] || continue
+    [ "$(cat "$p/start")" -gt "$start" ] && { say "$part is not the last partition on /dev/$disk: left as it is"; exit 0; }
+done
+# 34 sectors at the end hold the backup GPT; anything under 1 GiB is not worth a partition-table write
+free=$((total - start - size - 34))
+[ "$free" -ge 2097152 ] || { say "$part already fills /dev/$disk ($((free / 2048)) MiB free): nothing to grow"; exit 0; }
+say "growing $part from $((size / 2048)) MiB by $((free / 2048)) MiB to the end of /dev/$disk (online, start sector $start unchanged)"
+# a dd-written image's backup GPT sits at the end of the IMAGE, not of the disk: move it first, or the entry cannot grow
+sfdisk --relocate gpt-bak-std "/dev/$disk" > /dev/null 2>&1 || say "could not relocate the backup GPT (continuing)"
+if ! echo ", +" | sfdisk --no-reread --no-tell-kernel --force -N "$pn" "/dev/$disk" > /dev/null 2>&1; then
+    say "sfdisk could not rewrite partition $pn: $part keeps its image size"; exit 0
+fi
+partx -u -n "$pn" "/dev/$disk" 2> /dev/null || { say "the kernel did not take the new size (partx): it applies after a reboot"; exit 0; }
+if resize2fs "$part" > /dev/null 2>&1; then
+    : > "$mnt/.grown"
+    say "done: $(df -h "$mnt" | awk 'NR == 2 {print $2 " filesystem, " $4 " free"}')"
+else
+    say "resize2fs did not grow the filesystem: the partition is larger, the filesystem keeps its size until the next try"
+fi
+exit 0

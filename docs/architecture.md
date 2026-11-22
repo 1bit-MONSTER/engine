@@ -25,9 +25,11 @@ the README is the short version.
 
 ## Routes
 
-- **HRX on the Radeon iGPU** ([hrx.md](hrx.md)): the engine's one GPU runtime. The GPU route is
-  moving to **Loom**: AMD's Loom model programs on HRX, served by `loom-serve` behind `1bit serve`,
-  one model at a time once it passes an A/B and accuracy gate
+- **HRX on the Radeon iGPU** ([hrx.md](hrx.md)): every model is served through `1bit serve`, one
+  binary; on the GPU it runs on HRX using AMD's Loom kernels in ggml-hrx, with our own kernels for the
+  ops Loom does not cover (on the NPU it runs on our NPU engine, below). HRX is the engine's one GPU
+  runtime. Models move to whole-model Loom programs one by one as they pass the speed + accuracy
+  gate: AMD's Loom model programs on HRX, served by `loom-serve` behind `1bit serve`
   ([#3158](https://github.com/1bit-MONSTER/engine/issues/3158),
   [hrx.md](hrx.md#direction-loom-on-the-gpu)). The route is in `1bit serve`, chosen per model by
   `config/loom-routes.json` ([loom-route.md](loom-route.md),

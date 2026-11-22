@@ -48,11 +48,15 @@ struct PrivateResult {
     std::string cache;   // where the reused tokens came from ("live", ...); empty when none
 };
 
-// A model loaded on a private route. `1bit unified` runs one request at a time.
+// A model loaded on a private route. `1bit unified` runs at most max_concurrent() requests at a time.
 class PrivateSession {
 public:
     virtual ~PrivateSession() = default;
     virtual PrivateResult generate(const std::vector<int>& prompt, const PrivateRequest& req) = 0;
+    // engine#3318: how many generate() calls may run at once, each on its own thread. 1 (the default) keeps the old
+    // contract: one request at a time, the rest queue in `1bit unified`. A route returning more must make generate()
+    // safe for that many concurrent callers.
+    virtual int max_concurrent() const { return 1; }
     virtual int max_context() const = 0;
     virtual float default_repetition_penalty() const { return 1.0f; }
     // The model's chat template opens "<think>\n" itself when thinking is on.

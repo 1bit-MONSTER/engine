@@ -1796,6 +1796,20 @@ void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& o
             *first = std::move(pump->q.front());
             pump->q.pop_front();
         }
+        // The first byte is not the first TOKEN: a TCP read can hand us `da` or `data` with the rest still in flight, and
+        // classifying on that would call a real stream an error body. Wait (still inside the same bound) until the
+        // buffer carries a line break, which is what makes `data:`/`event:` decidable -- or until the upstream finishes.
+        auto undecided = [](const std::string& s) {
+            return s.find('\n') == std::string::npos && s.size() < 64;
+        };
+        while (undecided(*first) && !pump->done) {
+            if (!pump->cv.wait_for(g, std::chrono::milliseconds(100), [&] { return !pump->q.empty() || pump->done; }))
+                continue;
+            if (!pump->q.empty()) {
+                first->append(pump->q.front());
+                pump->q.pop_front();
+            }
+        }
     }
     if (!looks_sse(*first)) {
         // not a stream: loom-serve refused the request (or ignored `stream`). Answer with its status and body.

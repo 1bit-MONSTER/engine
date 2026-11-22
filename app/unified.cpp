@@ -591,8 +591,26 @@ int run_unified(int argc, char** argv) {
     // engine#3193: the container's template (config.json's chat_template, chat_template.jinja, tokenizer_config), the
     // same loader and renderer the per-op forward uses, so both routes ask the model the same question.
     e.tmpl = npu::load_chat_template(model_dir);
-    if (const int eos = e.tok->token_id("<|im_end|>"); eos >= 0) e.eos_text = e.tok->decode(eos);
-    e.bos_text = e.tok->token_id("<|im_start|>") >= 0 ? "" : "";  // these packs render an empty bos
+    // engine#3193: the bos/eos STRINGS the template renders ({{ bos_token }}/{{ eos_token }}), taken the way
+    // `1bit forward-serve` takes them -- config.json's bos_token_id, else tokenizer_config.json's bos_token text. A hard
+    // "" here was wrong for the Qwen3-0.6B pack (bos_token_id 151643): it flipped p3 from 391 to 409 on the release
+    // gate, which is a prompt difference the per-op route does not have.
+    {
+        int bos = -1, eos = -1;
+        if (const auto cfg = npu::read_json_or_null(model_dir + "/config.json"); cfg.is_object()) {
+            bos = cfg.value("bos_token_id", -1);
+            eos = cfg.value("eos_token_id", -1);
+        }
+        const nlohmann::json tc = npu::read_json_or_null(model_dir + "/tokenizer_config.json");
+        if (bos < 0 || eos < 0) {
+            const std::string bt = npu::special_token_text(tc, "bos_token");
+            const std::string et = npu::special_token_text(tc, "eos_token");
+            if (bos < 0 && !bt.empty()) bos = e.tok->token_id(bt);
+            if (eos < 0 && !et.empty()) eos = e.tok->token_id(et);
+        }
+        if (bos >= 0) e.bos_text = e.tok->decode(bos);
+        if (eos >= 0) e.eos_text = e.tok->decode(eos);
+    }
     std::fprintf(stderr, "1bit unified: template sha256=%s (%s)\n",
                  e.tmpl.sha256.empty() ? "none" : e.tmpl.sha256.c_str(),
                  e.tmpl.present() ? e.tmpl.source.c_str() : "no template: the chat route renders ChatML");

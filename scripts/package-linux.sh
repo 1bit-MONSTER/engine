@@ -72,31 +72,35 @@ put hrx/llama/bin llama-server llama-bench llama-perplexity
 # somebody else re-sealed.
 if [ -d "$build/npu/kernels" ]; then
     mkdir -p "$stage/npu/kernels"
+    # Two schemes ship (tools/npu_set_scheme.py owns the difference): the older sealed one, whose kernels are
+    # 1BPKCRYP ciphertext at <set>/layer1_*/layer1.elf with a format-1 manifest.json, and the newer one, plain ELFs at
+    # <set>/<id>/layer1.elf carrying a signed manifest (`manifest`, first line npumanifest 2, plus manifest.sig). Both
+    # are staged by the tool, which copies exactly what the scheme ships and nothing else -- the set directory also
+    # holds build products, and shipping those would carry the kernel method.
     for set in "$build"/npu/kernels/*/; do
         setname=$(basename "$set")   # not $name: that is the package name tar uses below
         [ -f "$set/layout.json" ] || continue
-        [ -f "$set/manifest.json" ] || { echo "sealed set $setname has no manifest.json: it was never signed (tools/seal_manifest.py write $set --key <release key>)"; exit 1; }
-        [ -f "$set/manifest.sig" ] || { echo "sealed set $setname has no manifest.sig: its manifest is not signed (tools/seal_manifest.py write)"; exit 1; }
-        mkdir -p "$stage/npu/kernels/$setname"
-        cp -a "$set/layout.json" "$set/manifest.json" "$set/manifest.sig" "$stage/npu/kernels/$setname/"
-        for layer in "$set"/layer1_*/; do
-            [ -f "$layer/layer1.elf" ] || continue
-            mkdir -p "$stage/npu/kernels/$setname/$(basename "$layer")"
-            cp -a "$layer/layer1.elf" "$stage/npu/kernels/$setname/$(basename "$layer")/"
-        done
+        python3 "$src/tools/npu_set_scheme.py" stage "$set" "$stage/npu/kernels/$setname" || {
+            echo "set $setname: no signed manifest (or no readable scheme), so it cannot be packed"; exit 1; }
     done
     # the manifest has to describe the bytes that were just staged, not the ones in the build tree:
     # check the staged copy, which is what the tarball carries. With the release public key in
     # ONEBIT_SEAL_PUB the signature is verified too; without it the digests are all a package can say.
     command -v python3 >/dev/null 2>&1 || { echo "no python3: the sealed sets' manifests cannot be verified (tools/seal_manifest.py)"; exit 1; }
+    # The staged copy is what the tarball carries, so that is what is checked. A sealed set is verified through
+    # tools/seal_manifest.py (signature included, when the release public key is here); a npumanifest 2 set is checked
+    # for its digests here, because its signature is over the manifest and the engine verifies it at load.
     for set in "$stage"/npu/kernels/*/; do
-        if [ -n "${ONEBIT_SEAL_PUB:-}" ]; then
+        scheme=$(python3 "$src/tools/npu_set_scheme.py" detect "$set")
+        if [ "$scheme" = sealed1 ] && [ -n "${ONEBIT_SEAL_PUB:-}" ]; then
             python3 "$src/tools/seal_manifest.py" verify "$set" --pub "$ONEBIT_SEAL_PUB" || exit 1
-        else
+        elif [ "$scheme" = sealed1 ]; then
             python3 "$src/tools/seal_manifest.py" check "$set" || exit 1
+        else
+            python3 "$src/tools/npu_set_scheme.py" check "$set" || exit 1
         fi
     done
-    echo "  npu/kernels: $(ls "$stage/npu/kernels" | wc -l) sets, $(find "$stage/npu/kernels" -name layer1.elf | wc -l) sealed kernels, $(find "$stage/npu/kernels" -name manifest.json | wc -l) signed manifests$([ -n "${ONEBIT_SEAL_PUB:-}" ] || echo ' (digests only: no ONEBIT_SEAL_PUB, so no release public key to verify the signature with)')"
+    echo "  npu/kernels: $(ls "$stage/npu/kernels" | wc -l) sets, $(find "$stage/npu/kernels" -name layer1.elf | wc -l) kernels, $(find "$stage/npu/kernels" -name manifest.json -o -name manifest -type f | wc -l) signed manifests"
 fi
 
 # The NPU lane's GGUF path runs public helper scripts (the repack, its declared-scale guard and the

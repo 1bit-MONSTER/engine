@@ -60,8 +60,18 @@ fail=0
 check_set() {
     local dir=${1%/} name
     name=$(basename "$dir")
+    # Two set schemes ship. The older one is judged here; a signed-manifest (npumanifest 2) set is judged by
+    # tools/npu_set_scheme.py, which owns the difference, including the <id>/layer1.elf naming this script's form
+    # classifier would otherwise read as "other".
+    if [ -f "$dir/manifest" ] || [ ! -f "$dir/manifest.json" ]; then
+        if [ "$(python3 "$(dirname "$0")/../tools/npu_set_scheme.py" detect "$dir" 2>/dev/null)" = kmanifest2 ]; then
+            python3 "$(dirname "$0")/../tools/npu_set_scheme.py" check "$dir" || return 1
+            printf 'OK   %s: signed manifest (manifest + manifest.sig), digests match\n' "$name"
+            return 0
+        fi
+    fi
     if [ ! -f "$dir/manifest.json" ]; then
-        printf 'FAIL %s: no manifest.json, so this is not a set this script can judge\n' "$dir"
+        printf 'FAIL %s: no signed manifest, so this is not a set this script can judge\n' "$dir"
         return 2
     fi
 

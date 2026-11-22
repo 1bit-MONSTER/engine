@@ -294,8 +294,27 @@ models_list() {
 # same set of files. Pure, so --self-test drives it and the row below uses the same code.
 seal_manifest_problems() {  # <set dir>: one line per problem, nothing and status 0 when sound
     _sd=$1 _bad=0 _rel= _f= _sz= _h= _m=0 _n=
+    # Two schemes ship: a signed manifest whose first line is `npumanifest 2` (one "<sha256> <size> <path>" line per
+    # kernel, ELFs at <id>/layer1.elf) and the older format-1 manifest.json over 1BPKCRYP ciphertext. The newer one is
+    # checked by matching each listed triple against the bytes on disk; its signature is over the manifest and the
+    # engine verifies that at load, so this half needs no key either way.
+    if [ -f "$_sd/manifest" ] && [ "$(head -c 13 "$_sd/manifest" 2>/dev/null)" = "npumanifest 2" ]; then
+        [ -f "$_sd/manifest.sig" ] || { printf 'no manifest.sig: the manifest is not signed\n'; _bad=1; }
+        [ "$(wc -c <"$_sd/manifest.sig" 2>/dev/null | tr -d ' ')" = 64 ] || { printf 'manifest.sig is not a 64-byte signature\n'; _bad=1; }
+        while read -r _h _sz _rel; do
+            case "$_h" in *[!0-9a-f]*|"") continue ;; esac
+            [ "${#_h}" = 64 ] || continue
+            [ -f "$_sd/$_rel" ] || { printf '%s is listed but absent\n' "$_rel"; _bad=1; continue; }
+            [ "$(wc -c <"$_sd/$_rel" | tr -d ' ')" = "$_sz" ] || { printf '%s is not the size the manifest lists\n' "$_rel"; _bad=1; }
+            [ "$(sha256sum "$_sd/$_rel" | cut -c1-64)" = "$_h" ] || { printf '%s is not the sha256 the manifest lists\n' "$_rel"; _bad=1; }
+            _m=$((_m + 1))
+        done <"$_sd/manifest"
+        _n=$(grep -cE '^[0-9a-f]{64} [0-9]+ ' "$_sd/manifest" 2>/dev/null || true)
+        [ "${_n:-0}" = "$_m" ] || { printf 'the manifest lists %s file(s), %s matched\n' "${_n:-0}" "$_m"; _bad=1; }
+        return $_bad
+    fi
     if [ ! -f "$_sd/manifest.json" ]; then
-        printf 'no manifest.json: the set was never signed\n'
+        printf 'no signed manifest: the set was never signed\n'
         return 1
     fi
     [ -f "$_sd/manifest.sig" ] || { printf 'no manifest.sig: the manifest is not signed\n'; _bad=1; }

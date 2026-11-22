@@ -1,25 +1,4 @@
 {
  "about": "Model -> Loom card for 1bit serve's GPU route (docs/loom-route.md). A .gguf served on the GPU (--device auto or hrx) whose entry matches runs on loom-serve (AMD's Loom programs on the HRX runtime); every other model runs on the llama.cpp fork's llama-server as before. An entry is added only after the model passed the Loom-vs-fallback gate (interleaved A/B speed and accuracy on strixhalo, docs/loom-route.md \"Gate\"), with the gate's result linked in `gate`. Empty until a model passes.",
- "routes": [
-  {
-   "id": "qwen38-27b-ud-q4-k-xl",
-   "match": {
-    "gguf_sha256": "2a5f3565f39cf885103da591182c1266da64745737b42b452fd3e675369f1211",
-    "gguf_size": 17659407264,
-    "model": [
-     "Qwen3.8-27B-UD-Q4_K_XL"
-    ]
-   },
-   "card": "unsloth-Qwen3.8-27B-UD-Q4_K_XL",
-   "preset": "chat",
-   "device": "amdgpu://?completion_spin_ns=4294967295",
-   "args": [
-    "--pool_backing=fixed",
-    "--parameter_mode=preload"
-   ],
-   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7070923290",
-   "why": "The card's own Strix Halo quick start, measured as shipped against our fallback on the same file: 2.132x prefill / 1.86x decode, greedy agreement 5/5 = 100 %, fallback bit-identical and Loom text-stable across repeats. Held back from merge-ready until Loom through 1bit serve stops returning an empty stream (the loom-proxy arm: pieces=0, cl-1077 on engine#3254/#3255) and that arm is measured on this row.",
-   "measured": "unsloth Qwen3.8-27B UD-Q4_K_XL (2a5f3565), strixhalo, 2026-11-21/22, 4 rounds with round 1 discarded, 8000-char prompts, 256-token greedy decodes: fallback (recipe qwen35-mtp-max-3 applied) 295.4 prefill / 15.4 decode (code/prose/short 15.4/13.9/17.7); loom-shipped 629.1 / 28.7 (28.7/25.1/30.9) = 2.132x prefill, 1.86x decode. engine#3158#issuecomment-7070923290"
-  }
- ]
+ "routes": []
 }

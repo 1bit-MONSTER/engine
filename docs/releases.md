@@ -42,7 +42,7 @@ release in the same week gets `.1`.
 and measured on the Ryzen AI MAX+ 395 box on 2026-11-22 with Secure Boot on. The stick image is
 assembled from the exact files that passed on the hardware: the kernel, the initrd and the OS
 filesystems are verified by checksum against the tested candidate, and the image is boot-checked with
-Secure Boot on. Release post: [https://1bit.gg/blog-v2026.47-release.html](https://1bit.gg/blog-v2026.47-release.html).
+Secure Boot on. v2026.47 carries the Loom route in `1bit serve` and its first gated entry (Qwen3.8-27B UD-Q4_K_XL, [#3261](https://github.com/1bit-MONSTER/engine/pull/3261)). It activates only when that model's Loom card and `loom-serve` are installed, which this release does not ship, so every GPU model runs on HRX (with AMD's Loom kernels in ggml-hrx) by default; whole-model Loom programs arrive model by model. Release post: [https://1bit.gg/blog-v2026.47-release.html](https://1bit.gg/blog-v2026.47-release.html).
 
 | what | result |
 |---|---|

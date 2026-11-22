@@ -78,6 +78,26 @@ PROMPTS = [
 ]
 
 
+def parse_route(spec):
+    """`LABEL=URL[:minimal|:full]` -> (label, url, body-or-None).
+
+    The two arms of the Loom gate need DIFFERENT bodies for the same meaning, and that is not a shortcut: our serve
+    reads thinking only from `chat_template_kwargs.enable_thinking` (app/unified.cpp:222-223, default true) and
+    loom-serve takes `enable_thinking` top level and 400s on `chat_template_kwargs` (app/loom_route.h:340-346). So one
+    body cannot pin thinking on both -- measured: an empty answer on both arms, 5/5 "identical", 100 % (engine#3158,
+    row27b-ud-v8 and row27b-bart). A per-route body lets each arm be told in its own dialect, which is the only shape
+    in which the comparison measures the engines rather than the configuration.
+    """
+    label, _, rest = spec.partition("=")
+    if not rest:
+        return label, "", None
+    body = None
+    for suffix in (":minimal", ":full"):
+        if rest.endswith(suffix):
+            return label, rest[:-len(suffix)], suffix[1:]
+    return label, rest, None
+
+
 def bare(url):
     return url.rstrip("/")
 
@@ -699,6 +719,14 @@ def selftest():
     ok(pair_summary([blank, dict(blank, both_empty=False, same_text=True)])["greedy_agreement_pct"] == 100.0
        and pair_summary([blank, dict(blank, both_empty=False, same_text=True)])["prompts_compared"] == 1,
        "pair_summary: an empty-on-both-sides prompt leaves the denominator instead of counting as agreement")
+    # per-route body: the two arms of the Loom gate need different spellings of the same setting
+    ok(parse_route("loom=http://127.0.0.1:8080:minimal")[:2] == ("loom", "http://127.0.0.1:8080")
+       and parse_route("loom=http://127.0.0.1:8080:minimal")[2] == "minimal",
+       "parse_route: a :minimal suffix sets the body WITHOUT eating the port or the path")
+    ok(parse_route("cpu=http://h:1/v1/x")[2] is None and parse_route("cpu=http://h:1/v1/x")[1] == "http://h:1/v1/x",
+       "parse_route: no suffix leaves the url alone, so a plain --route is unchanged")
+    ok(parse_route("a=u:full")[2] == "full" and parse_route("a=u:minimal")[2] == "minimal",
+       "parse_route: both bodies can be named per route")
     ok(not route_has_token_ids([{"runs": [{"tokens": [{"id": None, "token": "a"}]}]}])
        and route_has_token_ids([{"runs": [{"tokens": [{"id": 7, "token": "a"}]}]}]),
        "route_has_token_ids: our serve's id-less entries are detected, a fork-style entry is not flagged")
@@ -739,16 +767,16 @@ def main(argv=None):
 
     routes = []
     for spec in a.route:
-        label, _, url = spec.partition("=")
+        label, url, mode = parse_route(spec)
         if not url:
-            p.error(f"--route needs LABEL=URL, got {spec!r}")
-        routes.append((label, url))
+            p.error(f"--route needs LABEL=URL[:minimal|:full], got {spec!r}")
+        routes.append((label, url, mode))
 
     # /v1/models is the liveness probe, not /v1/health: an idle llama-server reports
     # {"status":"stalled"} on /health (503) and clears it on the next request, so the health
     # route fails an endpoint that is perfectly usable.  503 there is not a hung backend.
     model = a.model
-    for label, url in routes:
+    for label, url, _ in routes:
         try:
             models = get(bare(url) + "/v1/models", 10)
         except Exception as e:  # noqa: BLE001
@@ -766,17 +794,19 @@ def main(argv=None):
     report = {"model": model, "max_tokens": a.max_tokens, "repeat": a.repeat,
               "top_logprobs": a.top_logprobs, "thinking": a.thinking, "match_by": a.match_by,
               "body": a.body, "logprobs_requested": a.body == "full", "text_only": a.text_only,
+              "routes_body": {},
               "time": time.strftime("%FT%T%z"),
               "routes": {}, "determinism": {}, "agreement": {}, "errors": []}
     thinking = a.thinking == "on"
 
-    for label, url in routes:
+    for label, url, mode in routes:
+        minimal = (mode or a.body) == "minimal"
+        report["routes_body"][label] = "minimal" if minimal else "full"
         per_prompt = []
         for pi, prompt in enumerate(PROMPTS):
             runs = []
             for _ in range(a.repeat):
-                r = ask(url, model, prompt, a.max_tokens, a.top_logprobs, a.timeout, thinking,
-                        a.body == "minimal")
+                r = ask(url, model, prompt, a.max_tokens, a.top_logprobs, a.timeout, thinking, minimal)
                 if "error" in r:
                     report["errors"].append(f"{label} prompt {pi}: {r['error']}")
                     break
@@ -788,7 +818,7 @@ def main(argv=None):
 
     failed = False
     print("\n--- determinism (one route, identical request repeated) ---")
-    for label, _ in routes:
+    for label, _, _ in routes:
         per_prompt = report["routes"][label]
         if not per_prompt:
             print(f"{label:<6} NO DATA")
@@ -827,7 +857,7 @@ def main(argv=None):
                     print(f"       prompt {i}: first divergence at {agg[i]['first_divergence_per_repeat']}")
 
     print("\n--- agreement (two routes, same prompts, greedy) ---")
-    labels = [label for label, _ in routes]
+    labels = [label for label, _, _ in routes]
     for i in range(len(labels)):
         for j in range(i + 1, len(labels)):
             la, lb = labels[i], labels[j]

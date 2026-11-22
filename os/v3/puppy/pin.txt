@@ -26,3 +26,10 @@ build_image=ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c
 # (2025-12-27). The sha256 is checked before the file is compiled.
 vercmp_url=https://raw.githubusercontent.com/puppylinux-woof-CE/initrd_progs/176c2df25840dbe1bb34fa9f71e9a7b6904ec9e7/pkg/w_apps_static/w_apps/vercmp.c
 vercmp_sha256=271fe14a033714ccdc48b186527b0ee78b2c5e4b775aebe7f9a9a1d1ecd24a9e
+# Node.js (engine#3310): the runtime `lemonade launch <agent>` needs for the npm-distributed agents (pi, claude, codex,
+# opencode). Official linux-x64 build of the v24 "Krypton" LTS line, the 2026-11-10 security release; v24 is the line
+# the owner ran `lemonade launch pi` on by hand (24.22.1). The sha256 is the one nodejs.org/dist/v24.22.3/SHASUMS256.txt
+# lists for this file, re-measured on the download. stage-node.sh checks it before anything is unpacked.
+node_version=v24.22.3
+node_url=https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-x64.tar.xz
+node_sha256=4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb

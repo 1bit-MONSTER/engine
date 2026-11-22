@@ -577,6 +577,9 @@ add_python_test(census_counters_self ${CMAKE_SOURCE_DIR}/tools/ci/census_counter
 # `check` verb needs a staged set plus a release key). The arms are hermetic: two schemes and the three failure
 # shapes, all built from bytes in a temp dir, so they run wherever ctest does.
 add_python_test(npu_set_scheme_self ${CMAKE_SOURCE_DIR}/tools/npu_set_scheme.py --self-test)
+# engine#3310: os/v3/puppy/stage-node.sh on a fake Node.js release (77 = skip without xz)
+add_test(NAME stage_node COMMAND sh ${CMAKE_SOURCE_DIR}/tests/stage_node_test.sh)
+set_tests_properties(stage_node PROPERTIES SKIP_RETURN_CODE 77)
 # engine#3287: the stick's online data-partition grow, on a loop-device stick mounted while it grows (root + loop devices;
 # 77 = skip where the runner has neither, so a skip is recorded as a skip, never as a pass)
 add_test(NAME grow_data COMMAND sh ${CMAKE_SOURCE_DIR}/tests/grow_data_test.sh)

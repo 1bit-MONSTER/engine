@@ -162,6 +162,17 @@ EOF
     { echo "payload=lemonade-onebit-$tag"; echo "payload_lemond=$plem"; echo "engine_sha256=$esha"
       echo "$hsa"; echo "built=$(date -u +%FT%TZ)"; } > "$out/release-identity"
     printf 'etc/1bit/release-identity\t%s\n' "$out/release-identity" >> "$M.os"
+    # the base's rc.country, with the RTC read as UTC, as container-build.sh does (engine#3308). rc.country is a base
+    # file, not an embed/ one: without this a BASE cut ships the base's `set_hwclock_type --hctosys` under
+    # HWCLOCKTIME=localtime, every boot runs 4 h ahead on an RTC that holds UTC, and 1bit-logs prunes the real boots
+    sudo -n unsquashfs -q -cat "$bsfs" etc/rc.d/rc.country > "$out/rc.country" || die "the base SFS has no etc/rc.d/rc.country"
+    sed -i -e "s|/usr/sbin/set_hwclock_type -q --hctosys|/usr/sbin/set_hwclock_type -q utc --hctosys|" \
+        -e "s|/usr/sbin/set_hwclock_type cli --hctosys|/usr/sbin/set_hwclock_type cli utc --hctosys|" "$out/rc.country"
+    grep -q '/usr/sbin/set_hwclock_type -q utc --hctosys' "$out/rc.country" &&
+        ! grep -qE 'set_hwclock_type [a-z-]* *--hctosys' "$out/rc.country" ||
+        die "REFUSED: rc.country still reads the RTC as local time (engine#3308)"
+    chmod 755 "$out/rc.country"
+    printf 'etc/rc.d/rc.country\t%s\n' "$out/rc.country" >> "$M.os"
     # stage root-owned with the install mode (755 executable, else 644)
     while IFS=$'\t' read -r dst src; do
         [ -f "$src" ] || die "manifest source $src is missing"

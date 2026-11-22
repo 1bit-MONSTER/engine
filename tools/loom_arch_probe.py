@@ -19,9 +19,16 @@ import json
 import struct
 import sys
 
-# starter/loom-port-llm/starter/{build.py,attn_rules.py}, read 2026-11-21. A name here means the generator has an
-# attention shape for it; it does NOT mean any particular checkpoint of that family ports cleanly.
-SUPPORTED = ("llama", "qwen2", "qwen3", "qwen35", "gemma3", "gemma4", "phi3", "glm")
+# starter/loom-port-llm/starter/inspect_gguf.py, read 2026-11-22. A name here means the generator has an attention
+# shape for it; it does NOT mean any particular checkpoint of that family ports cleanly.
+#
+# `glm` was in this tuple and is NOT an architecture: in the starter it is a chat CALL FORMAT, not an attention shape --
+# `build.py: CALL_FORMATS = {"none": 0, "hermes": 1, "qwen_xml": 2, "glm": 3, "pythonic": 4, "json": 5}` and
+# `chat_probe.py: chat["call_format"] = "glm"`. Listing it here made the probe answer rc 0 ("supported, go ahead") for a
+# GGUF whose `general.architecture` is "glm", which is the 1056-second doomed `weaver port` this tool exists to prevent,
+# one architecture over. Measured on the previous revision with a synthetic GGUF: rc 0, and `--starter` could not catch it
+# because the name is in this tuple rather than in the starter's "extra mentions". (engine#3238 review)
+SUPPORTED = ("llama", "qwen2", "qwen3", "qwen35", "gemma3", "gemma4", "phi3")
 
 # What a starter entry needs for the families whose shape is not plain attention. Printed so the answer is
 # actionable rather than "unsupported".
@@ -162,6 +169,9 @@ def self_test():
     arm("a file that is not a GGUF is cannot-tell, not a pass", b"NOPE" + b"\0" * 32, 2)
     arm("a GGUF with no architecture key is cannot-tell",
         _gguf_bytes([("general.name", "x")]), 2)
+    # `glm` is a chat call format in the starter (build.py CALL_FORMATS), not an attention shape: a checkpoint whose
+    # architecture is "glm" must not get a green light (engine#3238 review).
+    arm("a starter CALL FORMAT name is not an architecture", _gguf_bytes([("general.architecture", "glm")]), 1, "NOT in")
     print(f"loom_arch_probe self-test: {ok + bad} arms, {ok} ok, {bad} failed")
     return 0 if bad == 0 else 1
 

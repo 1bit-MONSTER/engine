@@ -4149,6 +4149,17 @@ int run_serve(int argc, char** argv) {
     // value won and the runtime line named a file the backend never opened. Put in serve's own environment, every
     // child inherits it however it is spawned. Not in the --print-backend modes, which start nothing here: there the
     // printed plan carries it (print_backend below).
+    // A user value that user_libhsa() rejects is not used (it says so) - so it must not reach a child either: inherited, it
+    // would beat the runtime serve chose and names in its log, exactly the mismatch above. Drop it from serve's own
+    // environment, in every mode: then the launch paths' IREE_HAL_AMDGPU_LIBHSA_PATH (merge_env's env_extra) is the one
+    // a backend gets, and --print-backend-env prints it, because the variable is no longer set here.
+    if (const char* v = std::getenv("IREE_HAL_AMDGPU_LIBHSA_PATH"); v && *v && o.hrx_libhsa.empty() && user_libhsa().empty()) {
+#ifdef _WIN32
+        (void) _putenv_s("IREE_HAL_AMDGPU_LIBHSA_PATH", "");
+#else
+        (void) ::unsetenv("IREE_HAL_AMDGPU_LIBHSA_PATH");
+#endif
+    }
     if (!o.hrx_libhsa.empty() && !o.print_backend) {
 #ifdef _WIN32
         (void) _putenv_s("IREE_HAL_AMDGPU_LIBHSA_PATH", o.hrx_libhsa.c_str());

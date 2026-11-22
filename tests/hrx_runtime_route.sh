@@ -21,7 +21,8 @@
 #   - --hrx-libhsa FILE: the line carries FILE and sha256sum(FILE), the backend's env carries FILE;
 #   - announced exactly once, whatever else the route prints;
 #   - a FILE that cannot be read: still named, with no digest, instead of a silent success;
-#   - a user-set IREE_HAL_AMDGPU_LIBHSA_PATH is kept, and --hrx-libhsa beats it (engine#3314);
+#   - a user-set IREE_HAL_AMDGPU_LIBHSA_PATH is kept, and --hrx-libhsa beats it (engine#3314); a rejected one reaches
+#     neither the log nor the backend;
 #   - --device cpu: no runtime line at all (HRX is never initialised).
 #
 # usage: tests/hrx_runtime_route.sh path/to/1bit
@@ -121,7 +122,21 @@ for bad in "user/libhsa-runtime64.so.1" "$scratch/user/../user/libhsa-runtime64.
     check "user env '$bad': not used" '! grep -q "HSA runtime $bad" "$scratch/bad.json.log"'
     check "user env '$bad': serve says it is not used" \
         'grep -q "IREE_HAL_AMDGPU_LIBHSA_PATH=$bad is not used" "$scratch/bad.json.log"'
+    # ...and the backend does not get it either: inherited, it would beat serve's choice (merge_env) and the backend
+    # would open a file the log says is not used. Which runtime serve falls back to depends on the build machine (the
+    # build's copy, the /opt/rocm-therock scan, or none), so the row asserts that the backend gets the one the log names.
+    named=$(sed -n 's/^1bit serve: HRX: HSA runtime \(.*\) \(sha256 [0-9a-f]*\|(unreadable.*\)$/\1/p' "$scratch/bad.json.log" | head -n 1)
+    check "user env '$bad': the backend gets the runtime the log names, not the rejected value" \
+        'env_is "$scratch/bad.json" "{\"libhsa\": \"$named\"}"'
 done
+# The plan --print-backend-env hands a caller with a rejected value in its environment: the runtime line serve would
+# print with no user value at all (the control), so the caller's rejected value is replaced, not kept.
+plan() { "$bin" serve -m "$scratch/plain.gguf" --device hrx --hrx-cwsr-placement off --no-mem-check --print-backend-env 2>/dev/null |
+    grep '^IREE_HAL_AMDGPU_LIBHSA_PATH=' || true; }
+want_plan=$(ONEBIT_HRX_NO_TRIO_OK=1 plan)
+got_plan=$(IREE_HAL_AMDGPU_LIBHSA_PATH=user/libhsa-runtime64.so.1 ONEBIT_HRX_NO_TRIO_OK=1 plan)
+check "--print-backend-env: a rejected user value gets serve's own runtime line (${want_plan:-none on this machine})" \
+    '[ "$got_plan" = "$want_plan" ]'
 
 # The plan --print-backend-env hands a caller (scripts/lemonade-hrx) carries the option's runtime too: that caller
 # starts the backend with its own environment plus these lines, so a user value dropped here would win there.

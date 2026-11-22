@@ -38,6 +38,25 @@ namespace fs = std::filesystem;
 }  // namespace
 
 int main() {
+    using onebit::loom::StreamShape;
+    using onebit::loom::loom_stream_shape;
+    {   // engine#3254 review: the shape decides whether the client gets a stream or a status, so a partial line must
+        // not be guessed. `"da"` is a prefix of `data:` and used to be classified as "not a stream" -- which handed the
+        // client an SSE body under `application/json`, the exact symptom the status pass exists to remove.
+        check("a SSE data line is a stream", loom_stream_shape("data: {\"x\":1}\n\n") == StreamShape::Sse);
+        check("a half-read marker asks for more bytes", loom_stream_shape("da") == StreamShape::NeedMore);
+        check("...and a complete marker with no payload is still a stream",
+              loom_stream_shape("data:") == StreamShape::Sse);
+        check("event:/id:/comment lines before data: are a stream",
+              loom_stream_shape("event: m\nid: 7\n: keepalive\ndata: {}\n\n") == StreamShape::Sse);
+        check("a partial event line asks for more bytes", loom_stream_shape("eve") == StreamShape::NeedMore);
+        check("a JSON refusal is not a stream", loom_stream_shape("{\"error\":{\"message\":\"no\"}}") == StreamShape::NotSse);
+        check("...even when it is split after one brace", loom_stream_shape("{") == StreamShape::NotSse);
+        check("an HTML error page is not a stream", loom_stream_shape("<html><body>502</body></html>") == StreamShape::NotSse);
+        check("whitespace only says nothing yet", loom_stream_shape("\r\n") == StreamShape::NeedMore);
+        check("an empty body says nothing yet", loom_stream_shape("") == StreamShape::NeedMore);
+    }
+
     // sha256 over a stream: the FIPS 180-2 vectors, and one fed in odd-sized pieces across block boundaries
     {
         loom::Sha256 a;

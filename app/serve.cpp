@@ -1730,13 +1730,18 @@ void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& o
     };
     auto pump = std::make_shared<Pump>();
     auto first = std::make_shared<std::string>();
+    // The client is SHARED so `abort_upstream` can interrupt it: a flag alone is only observed when bytes arrive, and a
+    // "sent nothing" upstream never sends any, which would leave the task inside Post() for the 3600 s read timeout --
+    // and the 504 path's `return` blocks in the future's destructor until exactly that task finishes (engine#3254
+    // review, measured: the status was decided at 60 s and delivered up to an hour later). `Client::stop()` is
+    // httplib's own cancellation path for this.
+    auto client = std::make_shared<httplib::Client>("127.0.0.1", port);
     // Everything the task needs is copied in: `path`/`payload` are this function's locals and the frame is gone by the
     // time the task can still be inside Post() on the streamed path, so a reference capture here was a use-after-return
     // that "usually" won the race (review, #3255).
-    auto upstream = std::make_shared<std::future<void>>(std::async(std::launch::async, [port, path, payload, pump] {
-        httplib::Client c("127.0.0.1", port);
-        c.set_read_timeout(3600);
-        auto r = c.Post(path, httplib::Headers{}, payload, "application/json", [pump](const char* data, size_t n) {
+    auto upstream = std::make_shared<std::future<void>>(std::async(std::launch::async, [client, path, payload, pump] {
+        client->set_read_timeout(3600);
+        auto r = client->Post(path, httplib::Headers{}, payload, "application/json", [pump](const char* data, size_t n) {
             {
                 std::lock_guard<std::mutex> g(pump->m);
                 if (pump->abort) return false;   // the client is gone: stop reading the upstream
@@ -1754,50 +1759,44 @@ void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& o
         pump->cv.notify_all();
     }));
     // A proxy whose client has gone away must stop the upstream too: the provider sets `abort` when a write fails, and
-    // that is what makes the receive callback return false so httplib aborts the POST (review, #3255).
-    auto abort_upstream = [pump] {
+    // `stop()` is what makes an in-flight Post() return instead of waiting for bytes that will never come.
+    auto abort_upstream = [pump, client] {
         {
             std::lock_guard<std::mutex> g(pump->m);
             pump->abort = true;
         }
+        client->stop();
         pump->cv.notify_all();
     };
-    // What a stream looks like, rather than "anything that is not JSON". An SSE body starts with `data:` (possibly
-    // after `event:`/`id:`/`:` lines); an HTML error page or a plain-text message does not, and that case now keeps the
-    // upstream status instead of being handed to a client as a stream it cannot read (review, #3255).
-    auto looks_sse = [](const std::string& s) {
-        size_t pos = s.find_first_not_of(" \t\r\n");
-        while (pos != std::string::npos) {
-            const size_t eol = s.find('\n', pos);
-            const std::string line = s.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
-            if (line.rfind("data:", 0) == 0) return true;
-            if (line.rfind("event:", 0) != 0 && line.rfind("id:", 0) != 0 && line.rfind(":", 0) != 0) return false;
-            pos = eol == std::string::npos ? std::string::npos : s.find_first_not_of(" \t\r\n", eol);
-        }
-        return false;
-    };
+    // What a stream looks like, decided from COMPLETE lines (app/loom_route.h): a first chunk can end mid-marker, and
+    // guessing from `"da"` is how a stream became a "refusal" and got handed back as an unreadable non-stream body.
     // The first-byte wait is BOUNDED: a loom-serve that accepts the POST and then says nothing must not hold the client's
     // connection with no status line sent, which is worse than the 200 it used to get (review, #3255).
     constexpr int kLoomFirstByteSecs = 60;
+    loom::StreamShape shape = loom::StreamShape::NeedMore;
     {
         std::unique_lock<std::mutex> g(pump->m);
-        const bool answered = pump->cv.wait_for(g, std::chrono::seconds(kLoomFirstByteSecs),
-                                                [&] { return !pump->q.empty() || pump->done; });
-        if (!answered) {
-            g.unlock();
-            abort_upstream();
-            res.status = 504;
-            res.set_content(json{{"error", {{"message", "loom-serve accepted the request and sent nothing within " +
-                                                        std::to_string(kLoomFirstByteSecs) + " s"}}}}.dump(),
-                            "application/json");
-            return;
-        }
-        if (!pump->q.empty()) {
-            *first = std::move(pump->q.front());
-            pump->q.pop_front();
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kLoomFirstByteSecs);
+        while (true) {
+            if (!pump->cv.wait_until(g, deadline, [&] { return !pump->q.empty() || pump->done; })) {
+                g.unlock();
+                abort_upstream();
+                res.status = 504;
+                res.set_content(json{{"error", {{"message", "loom-serve accepted the request and sent nothing "
+                                                             "readable within " +
+                                                             std::to_string(kLoomFirstByteSecs) + " s"}}}}.dump(),
+                                "application/json");
+                return;
+            }
+            while (!pump->q.empty()) {
+                *first += std::move(pump->q.front());
+                pump->q.pop_front();
+            }
+            shape = loom::loom_stream_shape(*first);
+            if (shape != loom::StreamShape::NeedMore || pump->done) break;
         }
     }
-    if (!looks_sse(*first)) {
+    if (shape != loom::StreamShape::Sse) {
         // not a stream: loom-serve refused the request (or ignored `stream`). Answer with its status and body.
         upstream->wait();
         std::string all = *first;

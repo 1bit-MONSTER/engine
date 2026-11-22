@@ -16,9 +16,10 @@
 """Device-free check of the probe's stream parser: a stub OpenAI-compatible server that streams the same words in
 three different shapes (delta.content, delta.reasoning_content, message.content), plus a tools reply. If the probe
 reports first_token_s and text for all three, the parser is right and any failure against FLM is FLM's shape, not mine."""
-import json, sys
+import argparse, json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+SHAPE = "delta.content"
 SHAPES = {"delta.content": lambda w: {"choices": [{"delta": {"content": w}}]},
           "delta.reasoning_content": lambda w: {"choices": [{"delta": {"reasoning_content": w}}]},
           "message.content": lambda w: {"choices": [{"message": {"content": w}}]}}
@@ -38,9 +39,20 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
         self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
         for w in ["one ", "two ", "three"]:
-            chunk = json.dumps(SHAPES[sys.argv[2]](w)).encode()
+            chunk = json.dumps(SHAPES[SHAPE](w)).encode()
             self.wfile.write(b"data: " + chunk + b"\n\n"); self.wfile.flush()
         self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
 
 
-HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Stream the same three words in one SSE shape, for a parser under test.")
+    ap.add_argument("port", type=int, help="loopback port to listen on")
+    ap.add_argument("shape", choices=sorted(SHAPES), help="which envelope each chunk uses")
+    a = ap.parse_args(argv)
+    global SHAPE
+    SHAPE = a.shape
+    HTTPServer(("127.0.0.1", a.port), H).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

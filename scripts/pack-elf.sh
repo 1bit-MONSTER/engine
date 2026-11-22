@@ -178,6 +178,10 @@ pack_prune_unloadable() {
 pack_strip() {
     local f
     while IFS= read -r -d '' f; do
+        # engine#3287: an NPU kernel is an AIE ELF in a signed set, not a host ELF - host strip cannot read it ("Unable to
+        # recognise the architecture") and, if it ever could, would change bytes the set's manifest signs. #3281 skipped
+        # these in pack_localize; the c34 cut only passed this loop through a local edit that never reached main.
+        case "$f" in */npu/kernels/*) continue ;; esac
         if pack_is_elf "$f"; then
             strip --strip-unneeded "$f"
             # .comment names the compiler and its version; it is not needed to load or link

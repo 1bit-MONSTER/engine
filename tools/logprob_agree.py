@@ -296,8 +296,16 @@ def request_body(model, prompt, max_tokens, top_logprobs, thinking=False, minima
     *unasked*, not *unavailable*.
     """
     if minimal:
+        # `enable_thinking` is a TOP-LEVEL field on a strictly-validating route, not a chat_template_kwargs member:
+        # loom-serve's serving docs pass "the boolean `enable_thinking`, string `reasoning_effort`, and
+        # `model_options` object ... to source chat policy", and its chat response returns `reasoning_content`
+        # separately from answer `content` (hrx_loom pin 0cd370f2ba, http-profiles.md:263-270). Dropping thinking
+        # control from the minimal body is what made a real row read as a perfect match: the card defaults to
+        # `reasoning_effort: "xhigh"`, the whole 16-token budget went to reasoning, `content` came back empty on BOTH
+        # arms, and two empty strings compared identical (engine#3158, row27b-ud-v8).
         return {"model": model, "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens, "temperature": 0, "stream": False}
+                "max_tokens": max_tokens, "temperature": 0, "stream": False,
+                "enable_thinking": bool(thinking)}
     return {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -661,8 +669,12 @@ def selftest():
     ok({"logprobs", "top_logprobs", "seed", "top_k", "cache_prompt", "chat_template_kwargs"} <= set(full),
        "request_body: the full body is the OpenAI shape (log-probs and sampling pinning included)")
     bare = request_body("m", "p", 8, 5, thinking=True, minimal=True)
-    ok(set(bare) == {"model", "messages", "max_tokens", "temperature", "stream"},
-       "request_body: the minimal body is exactly the fields a strictly-validating route accepts")
+    ok(set(bare) == {"model", "messages", "max_tokens", "temperature", "stream", "enable_thinking"},
+       "request_body: the minimal body is the strict route's documented field set")
+    ok(bare["enable_thinking"] is True and request_body("m", "p", 8, 5, thinking=False, minimal=True)
+       ["enable_thinking"] is False,
+       "request_body: --thinking is carried TOP-LEVEL in the minimal body, because dropping it is how the Loom "
+       "arm answered with empty content and scored 100 %")
     # --text-only: the exit contract for a route that carries no log-probs. A Loom A/B is exactly that route, and a
     # correct run of it used to exit 1 -- so a gate reading the exit code could not use the text half at all.
     ok(no_logprobs_fails(False) and not no_logprobs_fails(True),

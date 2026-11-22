@@ -239,9 +239,11 @@ struct Options {
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
 // PM4-emulation probe, so HRX registers no device (docs/hrx.md). Use, in order:
-// --hrx-libhsa, the build's TheRock copy, or the first one under /opt/rocm-therock.
+// --hrx-libhsa, a user-set IREE_HAL_AMDGPU_LIBHSA_PATH (docs/serve.md: serve keeps it, engine#3314),
+// the build's TheRock copy, or the first one under /opt/rocm-therock.
 std::string hrx_libhsa(const std::string& option) {
     if (!option.empty()) return option;
+    if (const char* user = std::getenv("IREE_HAL_AMDGPU_LIBHSA_PATH"); user && *user) return user;
 #ifdef ONEBIT_HRX_LIBHSA
     if (fs::exists(ONEBIT_HRX_LIBHSA)) return ONEBIT_HRX_LIBHSA;
 #endif
@@ -288,7 +290,7 @@ void announce_hrx_runtime(const Options& o) {
     const std::string path = hrx_libhsa(o.hrx_libhsa);
     if (path.empty()) {
         std::fprintf(stderr,
-                     "1bit serve: HRX: no HSA runtime found (--hrx-libhsa, the build's pinned toolchain, "
+                     "1bit serve: HRX: no HSA runtime found (--hrx-libhsa, IREE_HAL_AMDGPU_LIBHSA_PATH, the build's pinned toolchain, "
                      "/opt/rocm-therock); HRX will not register a device (docs/hrx.md)\n");
         return;
     }
@@ -2376,7 +2378,9 @@ int print_backend(const Options& o, const Launch& l) {
         const auto eq = e.find('=');
         if (eq == std::string::npos) continue;
         const std::string key = e.substr(0, eq);
-        if (!std::getenv(key.c_str())) env[key] = e.substr(eq + 1);
+        // a value the user set wins, except the HSA runtime when --hrx-libhsa named one (engine#3314)
+        const bool owned = key == "IREE_HAL_AMDGPU_LIBHSA_PATH" && !o.hrx_libhsa.empty();
+        if (owned || !std::getenv(key.c_str())) env[key] = e.substr(eq + 1);
     }
     if (o.print_backend_env) {
         // --print-backend-env: the same environment as NAME=VALUE lines, for a caller that starts the
@@ -4119,6 +4123,18 @@ int run_serve(int argc, char** argv) {
                     + "faulting on the first graph replay (engine#715, docs/hrx.md), because you asked for it with "
                     + "--hrx-cwsr-placement=off or HRX_SVM=1: either drop that, or set " + kCwsrRecipe
                     + " yourself, or set ONEBIT_HRX_NO_TRIO_OK=1 if this box's ROCr does not need them.");
+    }
+    // --hrx-libhsa names the runtime even when the user's environment names another (engine#3314): a backend gets
+    // serve's environment plus the variables it does not already have (merge_env), so without this the inherited
+    // value won and the runtime line named a file the backend never opened. Put in serve's own environment, every
+    // child inherits it however it is spawned. Not in the --print-backend modes, which start nothing here: there the
+    // printed plan carries it (print_backend below).
+    if (!o.hrx_libhsa.empty() && !o.print_backend) {
+#ifdef _WIN32
+        (void) _putenv_s("IREE_HAL_AMDGPU_LIBHSA_PATH", o.hrx_libhsa.c_str());
+#else
+        (void) ::setenv("IREE_HAL_AMDGPU_LIBHSA_PATH", o.hrx_libhsa.c_str(), 1);
+#endif
     }
     if (cwsr_route && !o.print_backend) {
         // silent on purpose: the decision line announce_cwsr_env() prints at the first HRX backend already tells the

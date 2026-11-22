@@ -597,7 +597,8 @@ device for every request with `"model": "auto"` ([laya-models.md](laya-models.md
 HRX needs TheRock's HSA runtime: the distro `libhsa` rejects gfx1151's
 PM4-emulation probe, and then HRX registers no device. `serve` sets
 `IREE_HAL_AMDGPU_LIBHSA_PATH` itself unless you did. It uses `--hrx-libhsa`,
-else the build's copy, else the first one under `/opt/rocm-therock`.
+else your `IREE_HAL_AMDGPU_LIBHSA_PATH`, else the build's copy, else the first
+one under `/opt/rocm-therock`. The log names the one it chose, with its sha256.
 
 The child binaries default to this build's (`-DONEBIT_HRX`), then `$ONEBIT_LLAMA_SERVER`,
 then `llama-server` on PATH.

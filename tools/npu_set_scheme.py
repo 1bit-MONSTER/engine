@@ -270,7 +270,121 @@ def check(set_dir: Path, pub: str | None = None) -> int:
     return 0
 
 
+def self_test() -> int:
+    """Hermetic arms for the two schemes and the three failure shapes (engine#3237).
+
+    Every arm builds its kernel set from bytes in a temp dir: no device, no release key, no network. The arms exist
+    because this tool decides which NPU kernel set an image ships and had none -- measured before this commit:
+    `--self-test` was not a verb, so nothing that runs without a staged set and a public key verified it, while every
+    other release-path tool carried arms.
+    """
+    import pathlib
+    import tempfile
+    ok = fail = 0
+
+    def arm(name, want, got):
+        nonlocal ok, fail
+        if want == got:
+            ok += 1
+            print(f"  ok   {name}")
+        else:
+            fail += 1
+            print(f"  FAIL {name}: got {got!r}, want {want!r}")
+
+    def kset(root: pathlib.Path, *, magic=KMANIFEST_MAGIC, entries=None, sig_bytes=SIG_BYTES,
+             set_header="set 1024x3072x16x8", elf=b"\x7fELFkernel", extra_files=None, write_elf=True):
+        """A kernel set built from bytes: one hex kernel dir, a kmanifest naming it, and its signature."""
+        root.mkdir(parents=True, exist_ok=True)
+        kern = root / "65"
+        kern.mkdir(exist_ok=True)
+        if write_elf:
+            (kern / "layer1.elf").write_bytes(elf)
+        digest = hashlib.sha256(elf).hexdigest()
+        lines = [magic]
+        if set_header:
+            lines.append(set_header)
+        for sha, size, rel in (entries if entries is not None else [(digest, len(elf), "65/layer1.elf")]):
+            lines.append(f"{sha} {size} {rel}")
+        (root / "manifest").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        (root / SIG).write_bytes(b"\x00" * sig_bytes)
+        for name, data in (extra_files or {}).items():
+            (root / name).write_bytes(data)
+        return root
+
+    with tempfile.TemporaryDirectory() as td:
+        base = pathlib.Path(td)
+
+        # the positive control: a set that is right in every particular must be rc 0, or every arm below is vacuous
+        good = kset(base / "good")
+        arm("a well-formed kmanifest2 set checks clean", 0, check(good))
+        arm("…and its scheme is detected from the manifest HEAD, not layout.json", "kmanifest2", detect(good))
+
+        # engine#3237's actual failure family: the manifest names bytes the set does not carry, or carries different ones.
+        # Each fixture is built so that ONE thing is wrong: a set that also tripped the exact-allowlist would pass this
+        # arm for the wrong reason, which is the defect this self-test exists to prevent in other tools.
+        import contextlib
+        import io
+
+        def problems_of(d):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = check(d)
+            return rc, err.getvalue()
+
+        # the manifest lists a kernel and the set carries no kernel at all: the allowlist cannot fire, so "missing" is
+        # the only problem, and the arm can actually distinguish it from a digest or size defect
+        missing = base / "missing"
+        kset(missing, entries=[("0" * 64, 8, "65/gone.elf")], write_elf=False)
+        rc, err = problems_of(missing)
+        arm("a manifest naming a file the set does not contain is a finding", 1, rc)
+        arm("…and that is the ONLY problem (the arm cannot pass for another reason)", True,
+            "listed file is missing" in err and "unexpected file" not in err)
+
+        rc, err = problems_of(kset(base / "wrong", entries=[("0" * 64, len(b"\x7fELFkernel"), "65/layer1.elf")]))
+        arm("a digest that does not match the bytes is a finding", 1, rc)
+        arm("…and the message names the digest, not the file", True,
+            "digest mismatch" in err and "missing" not in err)
+
+        sized = kset(base / "sized", entries=[(hashlib.sha256(b"\x7fELFkernel").hexdigest(), 11, "65/layer1.elf")])
+        arm("a size that does not match the bytes is a finding", 1, check(sized))
+
+        unsigned = kset(base / "unsigned")
+        (unsigned / SIG).unlink()
+        arm("a set with no signature is a finding", 1, check(unsigned))
+
+        short_sig = kset(base / "shortsig", sig_bytes=32)
+        arm("a signature that is not 64 B is a finding", 1, check(short_sig))
+
+        # cannot-tell: nothing to judge must not read as either pass or finding
+        empty = base / "empty"
+        empty.mkdir()
+        arm("a directory with no manifest is cannot tell", 2, check(empty))
+
+        # the sealed scheme is detected by its format-1 manifest.json and delegated, not reimplemented
+        sealed = base / "sealed"
+        sealed.mkdir()
+        (sealed / "manifest.json").write_text(json.dumps({"files": {}}), encoding="utf-8")
+        arm("a format-1 manifest.json is the sealed scheme", "sealed1", detect(sealed))
+
+        # the writer emits `file <sha> <size> <path>`; both spellings must parse or the check reads an empty manifest
+        prefixed = kset(base / "prefixed")
+        (prefixed / "manifest").write_text(
+            f"{KMANIFEST_MAGIC}\nset 1024x3072x16x8\nfile {hashlib.sha256(b'\x7fELFkernel').hexdigest()} "
+            f"{len(b'\x7fELFkernel')} 65/layer1.elf\n", encoding="utf-8")
+        arm("the writer's `file <sha> <size> <path>` form parses", 1, len(_kmanifest_files(prefixed)[0]))
+        arm("…and that set checks clean", 0, check(prefixed))
+
+    print(f"npu_set_scheme self-test: {ok} ok, {fail} failed")
+    return 0 if fail == 0 else 1
+
+
+
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # `--self-test` is a verb of its own: the subparsers are `required=True`, and the arms must run on a box with no
+    # kernel set at all (ci.yml's own row), so it is read before argparse sees the subcommand.
+    if argv[:1] == ["--self-test"]:
+        return self_test()
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("detect")

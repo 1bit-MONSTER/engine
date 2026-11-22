@@ -602,4 +602,35 @@ private:
     std::optional<json> held_;
 };
 
+// What the FIRST BYTES of an upstream reply say about its shape, decided without guessing. loom-serve answers a
+// refused request as one small JSON object and a streamed answer as SSE, whose first line is `data:` (possibly after
+// `event:`/`id:`/`:` lines). Deciding from a PARTIAL line is how a fragmented read turns a stream into a "refusal":
+// `"da"` is a prefix of `data:` but matches none of the markers, so a two-way classifier has to pick one and gets it
+// wrong -- and the cost is the exact bug the status pass exists to fix, since the answer is then handed to the client
+// as an unreadable non-stream body (engine#3254 review). `NeedMore` is the third answer: the bytes are a prefix of a
+// marker and the caller must wait for the rest of the line.
+enum class StreamShape { Sse, NotSse, NeedMore };
+
+inline bool loom_is_sse_marker_prefix(const std::string& piece) {
+    for (const char* marker : {"data:", "event:", "id:", ":"})
+        if (std::string(marker).compare(0, piece.size(), piece) == 0) return true;
+    return false;
+}
+
+inline StreamShape loom_stream_shape(const std::string& bytes) {
+    size_t pos = bytes.find_first_not_of(" \t\r\n");
+    while (pos != std::string::npos) {
+        const size_t eol = bytes.find('\n', pos);
+        const bool complete = eol != std::string::npos;
+        const std::string line = bytes.substr(pos, complete ? eol - pos : std::string::npos);
+        if (line.rfind("data:", 0) == 0) return StreamShape::Sse;
+        const bool other = line.rfind("event:", 0) == 0 || line.rfind("id:", 0) == 0 || line.rfind(":", 0) == 0;
+        if (!complete) return other || loom_is_sse_marker_prefix(line) ? StreamShape::NeedMore : StreamShape::NotSse;
+        if (!other) return StreamShape::NotSse;
+        pos = bytes.find_first_not_of(" \t\r\n", eol);
+    }
+    // whitespace only so far: nothing has been said yet, so nothing can be decided
+    return StreamShape::NeedMore;
+}
+
 }  // namespace onebit::loom

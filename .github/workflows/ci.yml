@@ -72,7 +72,10 @@ jobs:
                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git \
                  python3 python3-venv curl jq file procps make gcc-16 g++-16 cmake ninja-build libcurl4-openssl-dev \
                  libzstd-dev libssl-dev libdrm-dev libpcre2-dev \
-                 binutils patchelf; then
+                 binutils patchelf squashfs-tools e2fsprogs fdisk; then
+              # `squashfs-tools`, `e2fsprogs` and `fdisk` are for `image_probe` (engine#3287): it builds a miniature
+              # appliance image (mksquashfs, mkfs.ext4 -d, sfdisk on a file) and reads it back with debugfs/unsquashfs,
+              # all unprivileged - no loop device, no mount - so it runs here instead of being baselined as a skip.
               # `patchelf` and `readelf` are installed for one test: `installed_rpath` builds ELFs with a chosen RUNPATH
               # and checks that a path leaving $ORIGIN is caught. It exits 77 without them and `ctest_skips.py` then
               # reports it as a NEW SKIP -- which is how this became visible: before #2758 the skip exited 0, i.e. it

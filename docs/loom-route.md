@@ -66,6 +66,25 @@ line naming why, when the load asks for something only the llama.cpp route has (
 read. `--ctx-size`, `-fa`, `--parallel` and the draft-length options are not applied on the Loom route:
 the card sets context, rows and drafting.
 
+## Card map
+
+`config/loom-cards.json` lists every onebit model in the shipped Lemonade catalogue with its
+[loom-fun](https://huggingface.co/loom-fun) Loom card (by Jeremy Fowers and Daniel Holanda), pinned at
+the card repository's commit, or `none`. It is data, not routing: a model enters the route table above
+only after it passed the gate. `match` says how close the card is:
+
+- `exact`: the card's checkpoint (its `model.json.lock`: repository, revision, sha256) is byte-identical
+  to the file our catalogue serves (`models/pins.json`), so the card runs our weights unchanged;
+- `same-model`: same upstream model from another GGUF (other packager or quant): the gate measures the
+  card's bytes, and serving our file needs the card's programs pointed at our checkpoint and a new gate row;
+- `none`: no card; `arch`, `nearest` and `gap` say what a port needs (engine#3156);
+- `npu`: NPU entries, which never take the GPU route.
+
+Each entry keeps the card's licence (the Loom programs) and the weights' licence apart; the weights
+licence is read from the weights repository at our pinned commit, never taken from a sibling model.
+Rebuild with `tools/loom_cards.py --build` from freshly fetched card locks; CI runs `--check`
+(offline: every `exact` claim against `models/pins.json`) and `--self-test`.
+
 ## Lifecycle
 
 Written against hrx-loom 0.2.0; the CLI and HTTP surface serve uses is the same in 0.1.0.

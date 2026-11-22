@@ -191,13 +191,15 @@ auth_post() {  # <json body> <url> [slow] -> the reply
 post_watch_once() {  # <json body> <url> <file for the body>
     : > "$3"
     if command -v curl >/dev/null 2>&1; then
+        # engine#3287: curl's own options. This branch had wget's (--header=, --post-data=), which curl rejects before it
+        # sends anything, so every curl image reported "no HTTP status at all" for a serve that answered 503 in 5 s.
         if [ -n "$KEY" ]; then
             curl -s -m 200 -D "$3.headers" -o "$3" -w '%{http_code}' \
-                 --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" \
-                 --post-data="$1" "$2" 2>/dev/null
+                 -H 'Content-Type: application/json' -H "Authorization: Bearer $KEY" \
+                 --data-binary "$1" "$2" 2>/dev/null
         else
             curl -s -m 200 -D "$3.headers" -o "$3" -w '%{http_code}' \
-                 --header='Content-Type: application/json' --post-data="$1" "$2" 2>/dev/null
+                 -H 'Content-Type: application/json' --data-binary "$1" "$2" 2>/dev/null
         fi
     else
         # No curl on this image: wget can still prove a refusal, but it discards the body, so say what is missing.

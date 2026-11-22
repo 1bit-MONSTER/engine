@@ -238,10 +238,32 @@ struct Options {
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
+// A user-set IREE_HAL_AMDGPU_LIBHSA_PATH, when it names an HSA runtime: an absolute path with no "..", to a regular
+// file whose name is libhsa-runtime64.so*. serve hashes the file it names (announce_hrx_runtime), so the value is
+// checked before anything opens it (CodeQL cpp/path-injection); any other value is not used, and said so once.
+std::string user_libhsa() {
+    const char* v = std::getenv("IREE_HAL_AMDGPU_LIBHSA_PATH");
+    if (!v || !*v) return "";
+    const fs::path p = fs::path(v).lexically_normal();
+    bool ok = p.is_absolute() && p.filename().string().rfind("libhsa-runtime64.so", 0) == 0;
+    for (const auto& part : fs::path(v)) ok = ok && part != "..";   // as written, before normalising it away
+    std::error_code ec;
+    if (ok && fs::is_regular_file(p, ec)) return p.string();
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        std::fprintf(stderr, "1bit serve: HRX: IREE_HAL_AMDGPU_LIBHSA_PATH=%s is not used: it must be the absolute path "
+                             "of an existing libhsa-runtime64.so* file\n", v);
+    }
+    return "";
+}
+
 // PM4-emulation probe, so HRX registers no device (docs/hrx.md). Use, in order:
-// --hrx-libhsa, the build's TheRock copy, or the first one under /opt/rocm-therock.
+// --hrx-libhsa, a user-set IREE_HAL_AMDGPU_LIBHSA_PATH (docs/serve.md: serve keeps it, engine#3314),
+// the build's TheRock copy, or the first one under /opt/rocm-therock.
 std::string hrx_libhsa(const std::string& option) {
     if (!option.empty()) return option;
+    if (std::string user = user_libhsa(); !user.empty()) return user;
 #ifdef ONEBIT_HRX_LIBHSA
     if (fs::exists(ONEBIT_HRX_LIBHSA)) return ONEBIT_HRX_LIBHSA;
 #endif
@@ -288,7 +310,7 @@ void announce_hrx_runtime(const Options& o) {
     const std::string path = hrx_libhsa(o.hrx_libhsa);
     if (path.empty()) {
         std::fprintf(stderr,
-                     "1bit serve: HRX: no HSA runtime found (--hrx-libhsa, the build's pinned toolchain, "
+                     "1bit serve: HRX: no HSA runtime found (--hrx-libhsa, IREE_HAL_AMDGPU_LIBHSA_PATH, the build's pinned toolchain, "
                      "/opt/rocm-therock); HRX will not register a device (docs/hrx.md)\n");
         return;
     }
@@ -2376,7 +2398,9 @@ int print_backend(const Options& o, const Launch& l) {
         const auto eq = e.find('=');
         if (eq == std::string::npos) continue;
         const std::string key = e.substr(0, eq);
-        if (!std::getenv(key.c_str())) env[key] = e.substr(eq + 1);
+        // a value the user set wins, except the HSA runtime when --hrx-libhsa named one (engine#3314)
+        const bool owned = key == "IREE_HAL_AMDGPU_LIBHSA_PATH" && !o.hrx_libhsa.empty();
+        if (owned || !std::getenv(key.c_str())) env[key] = e.substr(eq + 1);
     }
     if (o.print_backend_env) {
         // --print-backend-env: the same environment as NAME=VALUE lines, for a caller that starts the
@@ -4119,6 +4143,18 @@ int run_serve(int argc, char** argv) {
                     + "faulting on the first graph replay (engine#715, docs/hrx.md), because you asked for it with "
                     + "--hrx-cwsr-placement=off or HRX_SVM=1: either drop that, or set " + kCwsrRecipe
                     + " yourself, or set ONEBIT_HRX_NO_TRIO_OK=1 if this box's ROCr does not need them.");
+    }
+    // --hrx-libhsa names the runtime even when the user's environment names another (engine#3314): a backend gets
+    // serve's environment plus the variables it does not already have (merge_env), so without this the inherited
+    // value won and the runtime line named a file the backend never opened. Put in serve's own environment, every
+    // child inherits it however it is spawned. Not in the --print-backend modes, which start nothing here: there the
+    // printed plan carries it (print_backend below).
+    if (!o.hrx_libhsa.empty() && !o.print_backend) {
+#ifdef _WIN32
+        (void) _putenv_s("IREE_HAL_AMDGPU_LIBHSA_PATH", o.hrx_libhsa.c_str());
+#else
+        (void) ::setenv("IREE_HAL_AMDGPU_LIBHSA_PATH", o.hrx_libhsa.c_str(), 1);
+#endif
     }
     if (cwsr_route && !o.print_backend) {
         // silent on purpose: the decision line announce_cwsr_env() prints at the first HRX backend already tells the

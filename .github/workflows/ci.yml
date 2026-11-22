@@ -112,6 +112,10 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
+          # the image installs versioned compilers only (no gcc/cc on PATH), and build-lemonade.sh lets CMake pick;
+          # without these the first pin move since the image switched failed at project(): "No CMAKE_C_COMPILER"
+          CC: gcc-16
+          CXX: g++-16
         run: |
           git fetch -q --depth=1 origin "$BASE"
           # An unreadable base must BUILD, not skip: a skip on a base we could not read is exactly the

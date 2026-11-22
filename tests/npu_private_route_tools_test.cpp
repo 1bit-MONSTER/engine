@@ -36,6 +36,7 @@
 #include <string>
 
 using onebit::npu::npu_constraint_refusal;
+using onebit::npu::npu_drop_offered_tools;
 using json = nlohmann::json;
 
 namespace {
@@ -130,6 +131,61 @@ int main() {
     {
         json body = {{"messages", json::array({{{"role", "user"}, {"content", "hello"}}})}};
         check(npu_constraint_refusal(body, route, true).empty(), "an ordinary chat request is not refused");
+    }
+
+    // engine#3287: what the HANDLER does first. Tools that are only offered are dropped, so the request reaches the
+    // route as an ordinary chat; a demanded call keeps its tools and the refusal above still answers it.
+    {
+        json body = {{"messages", json::array()}, {"tools", tools}};
+        check(npu_drop_offered_tools(body) == 1, "tools with no tool_choice are offered, so they are dropped (count 1)");
+        check(!body.contains("tools") && npu_constraint_refusal(body, route, true).empty(),
+              "and the dropped request is an ordinary chat: no refusal");
+    }
+    {
+        json body = {{"messages", json::array()}, {"tools", tools}, {"tool_choice", "auto"}, {"parallel_tool_calls", true}};
+        check(npu_drop_offered_tools(body) == 1, "tool_choice auto offers, so the tools are dropped");
+        check(!body.contains("tool_choice") && !body.contains("parallel_tool_calls"),
+              "and tool_choice and parallel_tool_calls go with them");
+        check(npu_constraint_refusal(body, route, true).empty(), "leaving nothing to refuse");
+    }
+    {
+        json body = {{"messages", json::array()}, {"tools", tools}, {"tool_choice", "none"}};
+        check(npu_drop_offered_tools(body) == 1 && npu_constraint_refusal(body, route, true).empty(),
+              "tool_choice none asks for no call: dropped, and not refused");
+    }
+    {
+        json body = {{"messages", json::array()}, {"tools", tools}, {"tool_choice", "required"}};
+        check(npu_drop_offered_tools(body) == 0 && body.contains("tools"),
+              "tool_choice required DEMANDS a call, so the tools are kept");
+        check(!npu_constraint_refusal(body, route, true).empty(), "and the request is still refused (#3193)");
+    }
+    {
+        json body = {{"messages", json::array()}, {"tools", tools},
+                     {"tool_choice", {{"type", "function"}, {"function", {{"name", "get_weather"}}}}}};
+        check(npu_drop_offered_tools(body) == 0 && !npu_constraint_refusal(body, route, true).empty(),
+              "a named function is demanded too: kept and refused");
+    }
+    {
+        json body = {{"messages", json::array()}, {"tools", tools}, {"tool_choice", "whatever"}};
+        check(npu_drop_offered_tools(body) == 0, "an unknown tool_choice string is not treated as an offer");
+    }
+    {
+        json body = {{"messages", json::array()}, {"tools", json::array()}};
+        check(npu_drop_offered_tools(body) == 0 && body.contains("tools"), "tools: [] is left alone (nothing to drop)");
+    }
+    {
+        json body = {{"messages", json::array()}, {"tools", tools},
+                     {"response_format", {{"type", "json_schema"},
+                                          {"json_schema", {{"name", "w"}, {"schema", {{"type", "object"}}}}}}}};
+        check(npu_drop_offered_tools(body) == 1 && !npu_constraint_refusal(body, route, true).empty(),
+              "dropping offered tools does not excuse a caller's json_schema: still refused");
+    }
+    {
+        // the handler drops on a second, ORDERED parse for the template; the same function must work there
+        nlohmann::ordered_json body = nlohmann::ordered_json::parse(R"({"messages":[],"tools":[{"type":"function",
+            "function":{"name":"a"}},{"type":"function","function":{"name":"b"}}],"tool_choice":"auto"})");
+        check(npu_drop_offered_tools(body) == 2 && !body.contains("tools"),
+              "on the ordered copy the template renders, too (count 2, tools gone)");
     }
 
     std::printf("npu_private_route_tools: %s\n", bad ? "FAIL" : "ok");

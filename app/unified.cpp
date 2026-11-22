@@ -212,6 +212,18 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
     // engine#3193: a private route's session generates its own tokens and cannot carry a tool grammar, so a
     // request with `tools`/`tool_choice` used to be answered as prose -- silently the wrong shape, where the
     // per-op forward emits a real tool_calls. Refused rather than ignored, like the over-context case below.
+    // engine#3287: except tools that are only OFFERED (tool_choice absent/"auto"/"none"), which are dropped first: a plain
+    // answer is a correct reply to those on every route (npu_tool_grammar.h), and the Lemonade page offers 19 of them
+    // with every chat. A demanded call ("required", a named function) still reaches the refusal.
+    std::size_t tools_ignored = 0;
+    if (chat) {
+        tools_ignored = npu::npu_drop_offered_tools(body);
+        if (tools_ignored) {
+            res.set_header("X-1bit-Tools-Ignored", std::to_string(tools_ignored));
+            std::fprintf(stderr, "1bit unified: %s: ignored %zu offered tool(s) (tool_choice auto/none): this route answers "
+                                 "without tool calls (engine#3287)\n", e.id.c_str(), tools_ignored);
+        }
+    }
     if (chat) {
         // engine#3193: which NPU path this model is on decides the sentence, because the two have different
         // (equally real) reasons and different ways out -- e.priv is set only on the private route.
@@ -234,7 +246,9 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         if (chat && e.tmpl.present() && npu::renderer_built()) {
             // engine#3193: the container's template, not ChatML. `request_template_vars` carries the request's
             // enable_thinking/tools exactly as the per-op forward passes them, so the two routes agree token for token.
-            const nlohmann::ordered_json ordered = nlohmann::ordered_json::parse(req.body);
+            nlohmann::ordered_json ordered = nlohmann::ordered_json::parse(req.body);
+            // the same drop as above, on the copy the template sees: dropped tools must not reach the prompt
+            if (tools_ignored) npu::npu_drop_offered_tools(ordered);
             prompt = npu::render_chat_template(e.tmpl, npu::messages_for_template(ordered.at("messages")),
                                                /*add_generation_prompt=*/true,
                                                npu::request_template_vars(ordered, thinking), e.bos_text, e.eos_text);

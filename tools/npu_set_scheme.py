@@ -146,6 +146,9 @@ def stage(src: Path, dst: Path) -> int:
         for layer in sorted(src.iterdir()):
             if layer.is_dir() and _is_hex(layer.name) and (layer / "layer1.elf").is_file():
                 take(f"{layer.name}/layer1.elf")
+                # each kernel carries its own signed manifest beside it; the set-level pair covers the set
+                for name in ("manifest", "manifest.sig"):
+                    take(f"{layer.name}/{name}")
     print(f"npu_set_scheme: staged {files} file(s) from a {scheme} set into {dst}")
     return 0
 
@@ -220,6 +223,25 @@ def check(set_dir: Path, pub: str | None = None) -> int:
             problems.append(f"no {SIG}: the manifest is not signed")
         elif sig.stat().st_size != SIG_BYTES:
             problems.append(f"{SIG} is {sig.stat().st_size} B, not an Ed25519 signature ({SIG_BYTES} B)")
+        # Per-kernel manifests: each kernel directory that carries one must carry its signature too, and the kernel it
+        # names must be the file beside it (the set manifest covers the set; these cover a single kernel).
+        for kern in sorted(p for p in set_dir.iterdir() if p.is_dir() and _is_hex(p.name)):
+            kman = kern / "manifest"
+            if not kman.is_file():
+                continue
+            ksig = kern / SIG
+            if not ksig.is_file():
+                problems.append(f"kernel {kern.name}: has a manifest but no {SIG}")
+            elif ksig.stat().st_size != SIG_BYTES:
+                problems.append(f"kernel {kern.name}: {SIG} is {ksig.stat().st_size} B, not an Ed25519 signature")
+            kentries, _ = _kmanifest_files(kern)
+            elf = kern / "layer1.elf"
+            if not kentries:
+                problems.append(f"kernel {kern.name}: its manifest lists no files")
+            elif elf.is_file():
+                digest = hashlib.sha256(elf.read_bytes()).hexdigest()
+                if not any(d == digest and rel.endswith("layer1.elf") for d, _sz, rel in kentries):
+                    problems.append(f"kernel {kern.name}: its manifest does not list this layer1.elf's digest")
         # Exact allowlist: what the scheme ships is what goes in the package.
         try:
             for entry in sorted(set_dir.rglob("*")):
@@ -227,6 +249,11 @@ def check(set_dir: Path, pub: str | None = None) -> int:
                     continue
                 rel = entry.relative_to(set_dir).as_posix()
                 if rel in (LAYOUT, "manifest", "manifest.json", SIG) or rel in seen:
+                    continue
+                parts = rel.split("/")
+                if len(parts) == 2 and _is_hex(parts[0]) and parts[1] in ("manifest", SIG):
+                    continue  # the kernel's own signed manifest, shipped beside it
+                if len(parts) == 2 and _is_hex(parts[0]) and parts[1] in ("manifest", SIG):
                     continue
                 problems.append(f"unexpected file in the set (it ships layout.json + manifest + manifest.sig + "
                                 f"<hex>/layer1.elf only): {rel}")

@@ -370,7 +370,7 @@ package_checks() {  # package_checks <linux tarball>
     [ "$n" = 0 ] || { echo "FAIL source files in the tarball"; bad=1; }
     # ... and a tarball that carries the NPU kernels must carry all three, or its GGUF-on-NPU path
     # dies at the first GGUF with "repack script not found" (the bug this list exists to prevent)
-    if [ -n "$(find "$t" -path '*/npu/kernels/*/layout.json' -type f -print -quit)" ]; then
+    if [ -n "$(find "$t" \( -path '*/npu/kernels/*/manifest' -o -path '*/npu/kernels/*/manifest.json' \) -type f -print -quit)" ]; then
         for h in $helpers; do
             [ "$(find "$t" -path "*/$h" -type f | wc -l)" = 1 ] || { echo "FAIL the NPU package is missing $h"; bad=1; }
         done
@@ -390,11 +390,14 @@ package_checks() {  # package_checks <linux tarball>
     # source file and no build-machine home.
     local nk=0 m privsrc
     if [ "${WEEKLY_NPU_KERNELS:-1}" = 1 ]; then
-        n=$(find "$t" -path '*/npu/kernels/*/layout.json' -type f | wc -l)
+        # one set = one signed manifest: a signed-manifest set carries no layout.json, and counting that file said
+        # "0 NPU kernel sets" for a package full of them.
+        n=$(find "$t" \( -path '*/npu/kernels/*/manifest' -o -path '*/npu/kernels/*/manifest.json' \) -type f | wc -l)
         [ "$n" -ge 3 ] || { echo "FAIL WEEKLY_NPU_KERNELS=1 but $(basename "$1") carries $n NPU kernel sets (want the 0.6B, 1.7B and 4B sets)"; bad=1; }
     fi
-    # The shipped npu tree is an exact allowlist: <set>/layout.json, <set>/layer1_*/layer1.elf, and
-    # the set's signed manifest. Anything else is the kernel method in the clear - layer1.work/
+    # The shipped npu tree is an exact allowlist: the set's signed manifest, its layout.json when the scheme has one,
+    # and its kernels -- sealed 1BPKCRYP at <set>/layer1_*/layer1.elf, or plain ELFs at <set>/<id>/layer1.elf described
+    # by a signed manifest. Anything else is the kernel method in the clear - layer1.work/
     # carries plaintext MLIR, object files and intermediate ELFs - so a stray file is a leak, not
     # just a wrong shape.
     while IFS= read -r -d '' f; do
@@ -448,7 +451,7 @@ package_checks() {  # package_checks <linux tarball>
                 # over those bytes, verified by the engine at load; the digests the packager can check are checked here.
                 python3 "$SRC/tools/npu_set_scheme.py" check "$sd" || seal=$((seal + 1))
             fi
-        done < <(find "$t" -path '*/npu/kernels/*/layout.json' -type f -print0)
+        done < <(find "$t" \( -path '*/npu/kernels/*/manifest' -o -path '*/npu/kernels/*/manifest.json' \) -type f -print0)
     fi
     if [ "$seal" = 0 ]; then
         n=$(find "$t" -path '*/npu/kernels/*/manifest.json' -o -path '*/npu/kernels/*/manifest' -type f | wc -l)

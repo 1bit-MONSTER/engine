@@ -60,8 +60,8 @@ put hrx/llama/bin llama-server llama-bench llama-perplexity
 
 # the sealed NPU kernel sets (scripts/weekly.sh, WEEKLY_NPU_KERNELS): encrypted artifacts, packed
 # beside 1bit in npu/kernels, where it looks for them
-# Only the artifact surface is shipped: <set>/layout.json, <set>/layer1_*/layer1.elf and the set's
-# signed manifest. The set directory also holds layer1.work/ (plaintext MLIR, object files,
+# Only the artifact surface is shipped: the set's signed manifest, layout.json when the scheme has one, and its
+# kernels (<set>/layer1_*/layer1.elf sealed, or <set>/<id>/layer1.elf with a signed manifest). The set directory also holds layer1.work/ (plaintext MLIR, object files,
 # intermediate ELFs) because that is where it was built; copying the tree would ship the kernel
 # method and feed those static ELFs to patchelf. package_checks asserts this allowlist on the
 # tarball.
@@ -79,7 +79,9 @@ if [ -d "$build/npu/kernels" ]; then
     # holds build products, and shipping those would carry the kernel method.
     for set in "$build"/npu/kernels/*/; do
         setname=$(basename "$set")   # not $name: that is the package name tar uses below
-        [ -f "$set/layout.json" ] || continue
+        # A set is recognised by its signed manifest, not by layout.json: the signed-manifest scheme ships no
+        # layout.json, and gating on it here shipped a package with zero kernel sets while reporting success.
+        if [ ! -f "$set/manifest" ] && [ ! -f "$set/manifest.json" ] && [ ! -f "$set/layout.json" ]; then continue; fi
         python3 "$src/tools/npu_set_scheme.py" stage "$set" "$stage/npu/kernels/$setname" || {
             echo "set $setname: no signed manifest (or no readable scheme), so it cannot be packed"; exit 1; }
     done

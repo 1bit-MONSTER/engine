@@ -20,9 +20,9 @@ limitations under the License.
 Lemonade and the engine embedded, our MOK-signed kernel, headless by default and a `desktop` boot
 entry): [os/README.md](../os/README.md), [docs/os-v3.md](os-v3.md). The candidates below shipped the
 BusyBox `os/mini` image under the name `1bit-os-<tag>.img.zst`; that image is the CI/VM target now, not
-1bit OS. **Nothing here is published**: v2026.44 is a draft, and the next release carries the Puppy
-appliance. Every release is **held until every open engine issue is fixed** (owner, 2026-11-11), so no
-release date is set.
+1bit OS. **[v2026.47](https://github.com/1bit-MONSTER/engine/releases/tag/v2026.47) (22 Nov 2026) is the first published release**, and it carries the
+Puppy appliance ([v2026.47](#v202647-22-nov-2026--the-first-published-release)); v2026.44 stays a draft.
+Every release is **held until every open engine issue is fixed** (owner, 2026-11-11).
 
 The first release, **v2026.44**, is a **draft**: it is not published, and nothing is tagged — see
 [v2026.44](#v202644-1-nov-2026--the-first-release-a-draft) for why, and for the candidate that replaces the one it was
@@ -35,6 +35,30 @@ everything from scratch at the current pins, so each release carries that week's
 
 Releases are tagged `v<ISO year>.<ISO week>` (`v2026.40`), like Lemonade's `2026.39.1`; a second
 release in the same week gets `.1`.
+
+## v2026.47 (22 Nov 2026) — the first published release
+
+[v2026.47](https://github.com/1bit-MONSTER/engine/releases/tag/v2026.47) is tagged at engine `31a7a523be0c`. It is candidate c34, built from engine `7b534949`
+and measured on the Ryzen AI MAX+ 395 box on 2026-11-22 with Secure Boot on. The stick image is
+assembled from the exact files that passed on the hardware: the kernel, the initrd and the OS
+filesystems are verified by checksum against the tested candidate, and the image is boot-checked with
+Secure Boot on. v2026.47 carries the Loom route in `1bit serve` and its first gated entry (Qwen3.8-27B UD-Q4_K_XL, [#3261](https://github.com/1bit-MONSTER/engine/pull/3261)). It activates only when that model's Loom card and `loom-serve` are installed, which this release does not ship, so every GPU model runs on HRX (with AMD's Loom kernels in ggml-hrx) by default; whole-model Loom programs arrive model by model. Release post: [https://1bit.gg/blog-v2026.47-release.html](https://1bit.gg/blog-v2026.47-release.html).
+
+| what | result |
+|---|---|
+| live USB boot | Lemonade serving about 74 s after power-on (fresh boot); `1bit-release-check` 33 of 38 rows pass |
+| install to the internal NVMe | `1bit-install` to the internal NVMe, then the disk boots on its own with the stick out; `1bit-release-check` 33 of 38 rows pass |
+| NPU, Qwen3-0.6B | chat 96.6-98.2 tok/s; bench time to first token 315 ms, prefill 85.7 tok/s, decode 91.7 tok/s; long turns to 1,000 tokens, streaming, reload and queued chats with zero NPU timeouts |
+| NPU, Qwen3-4B | ships; 5 of 5 on the known-answer gate |
+| NPU, Qwen3-1.7B | not in this release; it follows in the next one |
+| GPU (HRX), Qwen3-4B-Instruct-2507 | 46.5-50.0 tok/s |
+| image generation | SD-Turbo, 512x512, 17 s on the iGPU |
+| GPU and NPU together | both serve at the same time |
+| offline | models and backends live on the data partition; no network is needed after the first download |
+
+The five rows that do not pass are the same on the stick and on the installed disk, and each one is
+named for the next release: two stale NPU-set checks, a library RUNPATH cleanup, a USB-capture tool,
+and a queued non-streamed NPU chat case.
 
 ## v2026.44 (1 Nov 2026) — the first release, a draft
 

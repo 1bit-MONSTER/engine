@@ -21,8 +21,9 @@ at the current pins. One row is one model file on one route; the standard each n
 is in [bench.md](bench.md), and the routes are described in [hrx.md](hrx.md) and [npu.md](npu.md).
 Every ggml weight type runs on HRX, including NVFP4, Q2_0, MXFP4 and the ternary TQ, PTQ and PQ
 formats. Every HRX row below is the llama.cpp route. The GPU route is moving to Loom one model at a
-time, once a model passes an A/B and accuracy gate; no model has moved yet
-([hrx.md](hrx.md#direction-loom-on-the-gpu)).
+time, once a model passes an A/B and accuracy gate. The first entry (Qwen3.8-27B UD-Q4_K_XL) is in
+the route table and activates only with its Loom card and `loom-serve` installed, which v2026.47 does
+not ship ([hrx.md](hrx.md#direction-loom-on-the-gpu)).
 
 | model | file, route | measured |
 |---|---|---|

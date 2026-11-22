@@ -73,8 +73,8 @@ How a model moves:
 
 State on 2026-11-21: `loom-serve` behind `1bit serve` is merged
 ([#3166](https://github.com/1bit-MONSTER/engine/pull/3166), [loom-route.md](loom-route.md)), and
-`config/loom-routes.json` decides per model which route serves it. The table ships empty, so **no
-model has moved yet**: every model on this page still runs on the llama.cpp route below.
+`config/loom-routes.json` decides per model which route serves it. v2026.47 carries the Loom route in `1bit serve` and its first gated entry (Qwen3.8-27B UD-Q4_K_XL, [#3261](https://github.com/1bit-MONSTER/engine/pull/3261)). It activates only when that model's Loom card and `loom-serve` are installed, which this release does not ship, so every GPU model runs on HRX (with AMD's Loom kernels in ggml-hrx) by default; whole-model Loom programs arrive model by model. Every model on this
+page runs on the llama.cpp route below.
 
 The llama.cpp route (the fork with ggml-hrx, plus the private HIP kernels) **stays as the
 fallback** for every model without a Loom program that passed the gate. It keeps its pins, its

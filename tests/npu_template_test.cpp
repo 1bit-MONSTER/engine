@@ -75,6 +75,24 @@ nlohmann::ordered_json extra_of(const nlohmann::ordered_json& request) {
     return extra;
 }
 
+// engine#3193: the FLM Qwen3 template opens with an EMPTY SYSTEM TURN ("<|im_start|>system\n<|im_end|>\n"). The private
+// route's hand-rolled ChatML omitted it -- five tokens -- and Qwen3-1.7B then answered "the first five prime numbers" with
+// "3, 5, 7, 11, 13" (5/5, greedy). Asserted on BYTES, not on an answer: 0.6B and 4B answered the wrong prompt "correctly",
+// which is exactly why the defect survived. engine#3193 / #963 / #3272.
+void check_empty_system_turn(const std::string& path) {
+    const nlohmann::ordered_json fixture = nlohmann::ordered_json::parse(read_file(path));
+    const onebit::npu::ChatTemplate tmpl = template_of(fixture);
+    const std::string bos = fixture.at("provenance").value("bos_token", std::string());
+    const std::string eos = fixture.at("provenance").value("eos_token", std::string());
+    nlohmann::ordered_json messages = nlohmann::ordered_json::array();
+    messages.push_back({{"role", "user"}, {"content", "List the first five prime numbers, comma-separated:"}});
+    nlohmann::ordered_json extra = nlohmann::ordered_json::object();
+    extra["enable_thinking"] = true;
+    const std::string rendered = onebit::npu::render_chat_template(tmpl, messages, true, extra, bos, eos);
+    check(rendered.find("<|im_start|>system\n<|im_end|>\n") != std::string::npos,
+          "engine#3193 the FLM Qwen3 template renders an EMPTY SYSTEM TURN (the five tokens ChatML omitted; #3272)");
+}
+
 void run_fixture(const std::string& path) {
     // ordered: the fixtures carry the request order a caller sends, and `tojson` renders it
     const nlohmann::ordered_json fixture = nlohmann::ordered_json::parse(read_file(path));
@@ -119,6 +137,7 @@ int main(int argc, char** argv) {
             continue;
         }
         run_fixture(a);
+        if (a.find("qwen3_flm") != std::string::npos) check_empty_system_turn(a);
     }
 
     // engine#2604: the turn-end probe takes the first user-content shape a template renders. A template that refuses a

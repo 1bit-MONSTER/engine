@@ -128,7 +128,15 @@ mm=${MOK_MANAGER:-/usr/lib/shim/mmx64.efi}
 # layer with only /data on the stick (/etc/rc.d/PUPSTATE: PUPSFS='nvme0n1p2,...'). The UUID is chosen here, given to mkfs.ext4
 # below, and pinned in grub's search and on the command line, the same form 1bit-install writes for an installed disk.
 datauuid=${ONEBIT_STICK_DATA_UUID:-$(python3 -c 'import uuid; print(uuid.uuid4())')}
-setcmd="pmedia=usbhd pupsfs=UUID=$datauuid 1bit.data=UUID=$datauuid psubdir=1bit ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0 log_buf_len=32M nvme.quirks=1e49:1081:dmapool_align_512"
+# engine#3286: `scsi_mod.scan=sync` - a USB mass-storage device that does not answer (a JetKVM's virtual media, measured
+# on the AI MAX+ 395) kept every boot waiting about 40 s. With async SCSI scanning its stuck scan sits in the kernel's
+# global async queue, and every module load waits for that queue to drain before modprobe returns (do_init_module ->
+# async_synchronize_full): rc.sysinit's `udevadm settle -t 20` ran into its cap because udev's module loads were stuck,
+# then `modprobe ec_su_axb35` (ADDLIST) waited another 20 s. Measured with trace points on the board: settle 5.0 -> 25.3 s,
+# the EC modprobe 25.3 -> 45.4 s, both ending on the device's resets. With the scan synchronous, usb-storage scans each
+# device in its own worker, nothing waits on it, and the same boot is 8.8 s (installed) / 23.5 s (live stick, which also
+# copies the SFS set to RAM), down from 45.6 / 51.6 s; the stick and the NVMe are found exactly as before.
+setcmd="pmedia=usbhd pupsfs=UUID=$datauuid 1bit.data=UUID=$datauuid psubdir=1bit ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0 log_buf_len=32M nvme.quirks=1e49:1081:dmapool_align_512 scsi_mod.scan=sync"
 cat > "$esp/EFI/BOOT/grub.cfg" <<GRUBCFG
 set timeout=8
 set default=0
@@ -188,6 +196,8 @@ grep -q 'log_buf_len=32M' "$esp/EFI/BOOT/grub.cfg" || {
     echo "$prog: REFUSED: no log_buf_len=32M in grub.cfg (the kernel ring would wrap and lose the evidence)" >&2; exit 1; }
 # engine#3088: the quirk is the only thing standing between this image and #2478's fault stream on the SSD it ships with.
 # Same shape as the two guards above: the artifact is refused, not the stick found faulty later.
+grep -q 'scsi_mod.scan=sync' "$esp/EFI/BOOT/grub.cfg" || {
+    echo "$prog: REFUSED: no scsi_mod.scan=sync in grub.cfg (a stalled USB storage device then holds the boot ~40 s, engine#3286)" >&2; exit 1; }
 grep -q 'nvme.quirks=1e49:1081:dmapool_align_512' "$esp/EFI/BOOT/grub.cfg" || {
     echo "$prog: REFUSED: no nvme.quirks=1e49:1081:dmapool_align_512 in grub.cfg (the shipped YMTC PC41Q faults without it, engine#3088)" >&2; exit 1; }
 grep -q 'menuentry "1bit OS - install to a disk (1bit.installer=1)"' "$esp/EFI/BOOT/grub.cfg" || {

@@ -71,7 +71,7 @@ check_set() {
         fi
     fi
     if [ ! -f "$dir/manifest.json" ]; then
-        printf 'FAIL %s: no signed manifest, so this is not a set this script can judge\n' "$dir"
+        printf 'FAIL %s: no manifest.json and no signed manifest (manifest + manifest.sig), so this is not a set this script can judge\n' "$dir"
         return 2
     fi
 

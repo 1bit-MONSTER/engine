@@ -186,9 +186,16 @@ if [ -f "$stage/hrx/llama/bin/llama-server" ]; then
             rt=$((rt + 1))
         done < <(LD_LIBRARY_PATH=$search ldd "$f" 2>/dev/null | awk '/=> \// {print $3}' | sort -u)
     done
+    # TheRock links the set with RPATHs into its own pip tree ($ORIGIN/../../_rocm_sdk_core/lib/llvm/lib, ...), which
+    # the payload does not have, and the release check's payload-runpath row refuses anything but $ORIGIN (engine#3287: a
+    # cut packaged from the pinned toolchain failed it on all 11 files of the set). The set sits flat in this one directory
+    # beside the backend, which pack_localize already gave $ORIGIN, so this changes only the set's dynamic sections.
+    # Measured 2026-11-22: the result is byte-for-byte what the tested c35 payload shipped (libhsa-runtime64.so.1 sha256
+    # f5462dc3..., from the pin's 21a66824...), every one of the 11 files.
+    n_origin=$(pack_origin_rpath "$stage/hrx/llama/bin") || exit 1
     missing_set=$(LD_LIBRARY_PATH=$stage/hrx/llama/bin ldd "$stage/hrx/llama/bin/libhsa-runtime64.so.1" 2>/dev/null | awk '/not found/ {print $1}' | tr '\n' ' ')
     [ -z "${missing_set// /}" ] || { echo "the staged HSA runtime still needs $missing_set beside it (engine #1411)" >&2; exit 1; }
-    echo "  hrx/llama/bin: + the HSA runtime set ($rt files: the runtime, its aqlprofile agent, the profiling shim and rocm_sysdeps)"
+    echo "  hrx/llama/bin: + the HSA runtime set ($rt files: the runtime, its aqlprofile agent, the profiling shim and rocm_sysdeps; $n_origin RUNPATH(s) set to \$ORIGIN)"
 fi
 
 cp "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$stage/"

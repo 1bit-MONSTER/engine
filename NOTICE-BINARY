@@ -34,8 +34,9 @@ hrx/llama/bin)
 HRX reaches the GPU through this set. The engine's backend opens the runtime BY NAME at run time
 (ggml-hrx-dmabuf.cpp:29, dlopen("libhsa-runtime64.so.1")), and the runtime in turn opens the aqlprofile
 agent by name, so ldd never sees either: the whole set ships in the payload, beside the backend, and the
-payload's RUNPATH is $ORIGIN - nothing resolves out of the install (engine #1411). Shipped unmodified, as
-built by TheRock; the release refuses a payload that carries the set incompletely.
+payload's RUNPATH is $ORIGIN - nothing resolves out of the install (engine #1411). Shipped as built by
+TheRock, except that each file's RUNPATH is set to $ORIGIN (TheRock's points into its own pip tree, which the
+payload does not have; engine#3287); the release refuses a payload that carries the set incompletely.
 
 - libhsa-runtime64.so.1 (ROCr). Upstream https://github.com/ROCm/rocr-runtime, built by TheRock
   (https://github.com/ROCm/TheRock). Copyright (c) 2014-2025 Advanced Micro Devices, Inc.

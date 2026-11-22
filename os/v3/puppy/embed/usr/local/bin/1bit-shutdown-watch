@@ -1,0 +1,100 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-shutdown-watch <pid of rc.shutdown>
+#
+# engine#3287: says in the kernel log which step a shutdown is in, so a reboot that stalls shows where. rc.shutdown
+# starts it in the background (hook-rc-shutdown.sh puts the line in). Once a second it walks the process tree below
+# <pid> to the deepest descendant (the command rc.shutdown is waiting for) and, when that changes, writes one line:
+#
+#   1bit-shutdown: step 1234 modprobe -r mt7925e
+#
+# A step that is still running after 10 s, 20 s, 40 s, ... gets its state, its wchan and its kernel stack:
+#
+#   1bit-shutdown: still in 1234 modprobe -r mt7925e after 20 s, state D, wchan mt7925_pci_remove
+#   1bit-shutdown: stack 1234 [<0>] ...
+#
+# Why the kernel log and not a file: a file on /data would hold the file system rc.shutdown is about to unmount, and
+# the kernel log reaches every place that can still be read after a stall - the screen and the serial console (the
+# console log level is raised to 7 for the rest of the shutdown), the next shutdown's `1bit-logs snap` (a stalled
+# shutdown that is restarted with Ctrl-Alt-Del files this boot's dmesg), and the EFI pstore record kernel_restart()
+# writes with printk.always_kmsg_dump=1. Each line is ONE write to /dev/kmsg, so one record (busybox ash's `set -x`
+# writes a trace line in pieces). The walk uses builtins (only `sleep`, and `tr` when the step changes, are forked);
+# it never blocks rc.shutdown and ends when <pid> does.
+#
+# ONEBIT_KMSG=<file> and ONEBIT_PROC=<dir> point it at a fake kernel log and /proc (the test); with ONEBIT_KMSG set
+# it leaves the printk settings alone. ONEBIT_WATCH_TICKS=<n> stops it after n seconds, ONEBIT_WATCH_FIRST=<s> reports
+# a step still running after s seconds instead of 10 (the test).
+set -u
+root=${1:?usage: 1bit-shutdown-watch <pid>}
+K=${ONEBIT_KMSG:-/dev/kmsg}
+P=${ONEBIT_PROC:-/proc}
+ticks=${ONEBIT_WATCH_TICKS:-0}
+first=${ONEBIT_WATCH_FIRST:-10}
+if [ -z "${ONEBIT_KMSG:-}" ]; then
+    echo on > /proc/sys/kernel/printk_devkmsg 2> /dev/null   # userspace kmsg is rate-limited to 10 lines a burst
+    echo 7 > /proc/sys/kernel/printk 2> /dev/null            # the appliance boots with console log level 1
+fi
+say() { printf '1bit-shutdown: %s\n' "$*" >> "$K" 2> /dev/null; }
+
+# kid=<the child of $1 to follow>: the newest (highest pid) one, the command a script is waiting on. Sets a variable
+# instead of printing, so the once-a-second walk forks no subshell (a short-lived zombie child is what rc.shutdown's
+# killzombies answers with kill -9 of its parent)
+child_of() {
+    kid=
+    for st in "$P"/[0-9]*/stat; do
+        [ -r "$st" ] || continue
+        IFS= read -r line < "$st" 2> /dev/null || continue
+        rest=${line##*) }                 # "S ppid ..." (comm may hold spaces and parentheses)
+        pp=${rest#* }; pp=${pp%% *}
+        [ "$pp" = "$1" ] || continue
+        c=${st%/stat}; c=${c##*/}
+        if [ -z "$kid" ] || [ "$c" -gt "$kid" ]; then kid=$c; fi
+    done
+}
+# cmd=<the command line of $1>, or [comm] for a kernel thread; only run when the step changes
+cmd_of() {
+    cmd=$(tr '\0' ' ' < "$P/$1/cmdline" 2> /dev/null)
+    cmd=${cmd% }
+    [ -n "$cmd" ] || { IFS= read -r cmd < "$P/$1/comm" 2> /dev/null || cmd='?'; cmd="[$cmd]"; }
+}
+
+say "watching rc.shutdown $root"
+last= since=0 next=$first n=0
+while [ -d "$P/$root" ]; do
+    leaf=$root
+    while :; do child_of "$leaf"; [ -n "$kid" ] || break; leaf=$kid; done
+    if [ "$leaf" != "$last" ]; then
+        cmd_of "$leaf"; say "step $leaf $cmd"
+        last=$leaf since=0 next=$first
+    else
+        since=$((since + 1))
+        if [ "$since" -ge "$next" ]; then
+            s=?; w=?
+            IFS= read -r line < "$P/$leaf/stat" 2> /dev/null && { s=${line##*) }; s=${s%% *}; }
+            w=; IFS= read -r w < "$P/$leaf/wchan" 2> /dev/null || [ -n "$w" ] || w=?   # wchan has no newline
+            cmd_of "$leaf"; say "still in $leaf $cmd after $since s, state $s, wchan ${w:-0}"
+            if [ -r "$P/$leaf/stack" ]; then
+                while IFS= read -r l; do say "stack $leaf $l"; done < "$P/$leaf/stack" 2> /dev/null
+            fi
+            next=$((next * 2))
+        fi
+    fi
+    n=$((n + 1)); [ "$ticks" -gt 0 ] && [ "$n" -ge "$ticks" ] && exit 0
+    sleep 1
+done
+say "rc.shutdown $root finished"
+exit 0

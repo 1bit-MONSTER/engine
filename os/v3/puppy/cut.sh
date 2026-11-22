@@ -152,6 +152,11 @@ EOF
     python3 "$here/catalogue-manifest.py" "$P/bin/resources/server_models.json" "$out/onebit-models.txt" ||
         die "could not write onebit-models.txt from the payload catalogue"
     printf 'etc/1bit/onebit-models.txt\t%s\n' "$out/onebit-models.txt" >> "$M.os"
+    # the base's rc.shutdown with the 1bit-shutdown-watch hook, as container-build.sh does (engine#3287)
+    sudo -n unsquashfs -q -cat "$bsfs" etc/rc.d/rc.shutdown > "$out/rc.shutdown" || die "the base SFS has no etc/rc.d/rc.shutdown"
+    sh "$here/hook-rc-shutdown.sh" "$out/rc.shutdown" || die "could not hook 1bit-shutdown-watch into rc.shutdown"
+    chmod 755 "$out/rc.shutdown"
+    printf 'etc/rc.d/rc.shutdown\t%s\n' "$out/rc.shutdown" >> "$M.os"
     baseid=$(sudo -n unsquashfs -q -cat "$bsfs" etc/1bit/release-identity) || die "the base SFS has no etc/1bit/release-identity"
     hsa=$(echo "$baseid" | grep '^libhsa_sha256=') || die "the base identity names no libhsa_sha256"
     { echo "payload=lemonade-onebit-$tag"; echo "payload_lemond=$plem"; echo "engine_sha256=$esha"

@@ -209,6 +209,14 @@ grep -q "/usr/sbin/set_hwclock_type -q utc --hctosys" "$skeleton/etc/rc.d/rc.cou
     echo "build: REFUSED: an rc.country set_hwclock_type call still leaves the clock type to /etc/clock" >&2; exit 1; }
 echo "   ok: rc.country reads the hardware clock as UTC"
 
+# engine#3287: a reboot that stalls has to say where. The 22 Nov plain reboot of the installed c35 sat 3 min 24 s in
+# rc.shutdown with nothing in the kernel log after `eno1: Link is Down`; the hook starts 1bit-shutdown-watch, which
+# names each rc.shutdown step (and the kernel stack of one that hangs) in the kernel log: screen, serial console, the
+# next shutdown's dmesg snap and the efi-pstore record all carry it.
+sh /recipe/hook-rc-shutdown.sh "$skeleton/etc/rc.d/rc.shutdown" || {
+    echo "build: REFUSED: could not hook 1bit-shutdown-watch into rc.shutdown" >&2; exit 1; }
+echo "   ok: rc.shutdown names each step in the kernel log (1bit-shutdown-watch)"
+
 # tty1 login: inittab respawns `plogin`, whose tail is `exec getty -n -l /bin/autologin`. On the
 # 2026-11-02 board boot that chain left no prompt on tty1 while the same image gave one in QEMU, and a
 # console-only machine whose console has nothing to log into is unreachable rather than headless. The entry
@@ -669,6 +677,8 @@ fi
 # reported success).
 packed_logsvc=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/init.d/06onboard-logs 2> /dev/null || true)
 packed_logs=$(unsquashfs -cat sandbox3/build/puppy_*.sfs usr/local/bin/1bit-logs 2> /dev/null || true)
+unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/rc.shutdown 2> /dev/null | grep -q '1bit-shutdown-watch \$\$' || {
+    echo "build: REFUSED: the packed rc.shutdown does not start 1bit-shutdown-watch (engine#3287)" >&2; exit 1; }
 case $packed_logsvc in *"this boot's logs stay in RAM"*)
     echo "build: REFUSED: the packed 06onboard-logs gives up when /data is not mounted yet, so those boots keep no log" >&2
     exit 1;; esac
@@ -704,7 +714,8 @@ if [ -n "${PAYLOAD:-}" ]; then
              usr/lib/1bit/seal_manifest.py etc/1bit/seal-pub.txt etc/1bit/onebit-models.txt \
              etc/1bit/release-identity etc/keymap etc/localtime etc/timezone \
              usr/local/lib/nodejs/bin/node usr/local/lib/nodejs/etc/npmrc usr/local/lib/nodejs/LICENSE \
-             usr/local/bin/node usr/local/bin/npm usr/local/bin/npx etc/profile.d/91onboard-npm; do
+             usr/local/bin/node usr/local/bin/npm usr/local/bin/npx etc/profile.d/91onboard-npm \
+             usr/local/bin/1bit-shutdown-watch; do
         in_image "$b" || miss="$miss $b"
     done
     [ -z "${LIBHSA_DIR:-}" ] || { in_image opt/rocm-therock/lib/libhsa-runtime64.so.1 || miss="$miss the HRX libhsa"; \

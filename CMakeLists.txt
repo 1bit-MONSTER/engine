@@ -574,6 +574,11 @@ add_python_test(dupdef_check_self ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py -
 add_python_test(stale_expectations_self ${CMAKE_SOURCE_DIR}/tools/ci/stale_expectations_check.py --self-test)
 add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
+# engine#3193: the harness both arms of the Unsloth comparison are measured with. Its --self-test drives the stub in
+# tools/sse_stub.py, which streams the same words in each shape a server may use - the check that separates "the
+# backend returned nothing my client reads" from "my client cannot read what it returned". Wired here because
+# tool_selftest_wired refuses a tool whose arms nothing ever runs.
+add_python_test(unsloth_probe_self ${CMAKE_SOURCE_DIR}/tools/unsloth_probe.py --self-test)
 # engine#2893 counted key-string mentions in one file and read zero as "cannot be reading it", which is how
 # `temperature` and `top_k` were filed as silently dropped when app/npu_sampling.h reads both. This row classifies
 # every request field by where its disposition lives (route parse, options parse, named refusal) and fails on a field

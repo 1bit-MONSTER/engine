@@ -617,6 +617,10 @@ stage_package() {
     "$SRC/scripts/pack-proof.sh" "$OUT" "$tag" > "$LOGS/pack-proof.log" 2>&1 ||
         { cat "$LOGS/pack-proof.log"; return 1; }
     install -m 755 "$SRC/scripts/lemond-onebit.sh" "$W/lemonade/lemond-onebit"
+    # engine#3287: the catalogue offers only the NPU models whose kernel set this payload carries (v2026.47 listed
+    # Qwen3-1.7B-NPU-1bit with no set; loading it was a 500 that blamed the NPU array)
+    python3 "$SRC/tools/npu_catalogue_filter.py" "$W/lemonade/bin/resources/server_models.json" "$W/lemonade/1bit/npu/kernels" \
+        "$SRC/config/npu-catalogue-sets.json" || return 1
     # links out of the tree (the web app's KaTeX fonts -> the build machine's fonts-katex) become
     # copies of their targets; the links inside it stay links
     pack_localize_links "$W/lemonade/bin"

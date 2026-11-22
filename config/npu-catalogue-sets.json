@@ -1,0 +1,9 @@
+{
+ "about": "Lemonade catalogue entry -> the NPU kernel set it needs (engine#3287). Sets are named by geometry (hidden x ffn x heads x kv_heads) under the package's 1bit/npu/kernels. tools/npu_catalogue_filter.py drops every onebit NPU entry whose set the payload does not carry, and every onebit NPU entry not listed here, so the catalogue never offers a model that cannot load (v2026.47 listed Qwen3-1.7B-NPU-1bit with no set; loading it ended in a 500 that blamed the NPU array). null = the entry needs a route this payload does not ship. Add a row when a set for a new geometry ships.",
+ "sets": {
+  "Qwen3-0.6B-NPU-1bit": "1024x3072x16x8",
+  "Qwen3-1.7B-NPU-1bit": "2048x6144x16x8",
+  "Qwen3-4B-NPU-1bit": "2560x9728x32x8",
+  "Qwen3.6-35B-A3B-NPU-1bit": null
+ }
+}

@@ -50,6 +50,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -178,6 +179,33 @@ inline std::string tool_call_gbnf(const nlohmann::json& tools, const nlohmann::j
 // (app/unified.cpp, Engine::generate dispatches `if (lane)` first), and telling that reader about `PrivateRequest`
 // sends them to code their request never touched, with a way out (an env var `unified.cpp` never reads) that does
 // nothing for the process that just refused them.
+//
+// engine#3287: tools that are only OFFERED are dropped, not refused. A request whose `tool_choice` is absent, "auto" or
+// "none" asks for "a call, or a plain answer", and this file's own header says what that is worth on any route: "auto"
+// installs no grammar even on the per-op forward, so a plain answer is a correct reply to it, not the silently wrong
+// shape #3193 was about. Clients send tools that way on every message (the Lemonade web app offers its 19 tools with
+// every chat), so refusing them made the NPU unusable from the Lemonade page, and the appliance needed a proxy that
+// stripped them in front of lemond. The tools are removed BEFORE the prompt is rendered, so the template does not spend
+// prefill on definitions the route cannot act on (19 of them are thousands of tokens). A request that DEMANDS a call
+// (tool_choice "required" or a named function) keeps its tools and is still refused by npu_constraint_refusal below,
+// as is a caller's json_schema. Returns how many tools were dropped (0: the body is unchanged); the handler says so in
+// the X-1bit-Tools-Ignored response header and on stderr, so the drop is visible rather than silent.
+template <class Json>
+inline std::size_t npu_drop_offered_tools(Json& body) {
+    if (!body.is_object() || !body.contains("tools") || !body["tools"].is_array() || body["tools"].empty()) return 0;
+    if (body.contains("tool_choice") && !body["tool_choice"].is_null()) {
+        const auto& c = body["tool_choice"];
+        if (!c.is_string()) return 0;  // {"type": "function", ...}: a named call is demanded
+        const std::string s = c.template get<std::string>();
+        if (s != "auto" && s != "none") return 0;  // "required", or a value this code does not know: left to the refusal
+    }
+    const std::size_t n = body["tools"].size();
+    body.erase("tools");
+    body.erase("tool_choice");
+    body.erase("parallel_tool_calls");
+    return n;
+}
+
 inline std::string npu_constraint_refusal(const nlohmann::json& body, const std::string& route, bool private_route) {
     // `tools: []` is not a constraint: many clients send the key with an empty list on every request, and refusing
     // those would break ordinary chats. Only a non-empty list (or a real tool_choice) asks for something the route

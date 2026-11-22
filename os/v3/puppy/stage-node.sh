@@ -72,7 +72,7 @@ got=$(sha256sum "$tarball" | cut -d' ' -f1)
 [ "$got" = "$sha" ] || { echo "$prog: REFUSED: ${tarball##*/} is sha256 $got, the pin says $sha" >&2; exit 2; }
 
 mkdir -p "$work/x"
-tar -xJf "$tarball" -C "$work/x" --no-same-owner
+tar -xf "$tarball" -C "$work/x" --no-same-owner      # GNU tar reads the compression from the file (the release is .xz)
 top=$work/x/node-$ver-linux-x64
 [ -x "$top/bin/node" ] && [ -f "$top/lib/node_modules/npm/bin/npm-cli.js" ] && [ -f "$top/LICENSE" ] || {
     echo "$prog: REFUSED: the tarball has no node-$ver-linux-x64/{bin/node,lib/node_modules/npm,LICENSE}" >&2; exit 2; }

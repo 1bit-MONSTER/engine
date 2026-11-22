@@ -14,10 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# engine#3310: os/v3/puppy/stage-node.sh on a FAKE release tarball (same layout as node-vX-linux-x64.tar.xz, a shell
-# script standing in for bin/node), so it needs no network and no 32 MB download: the sha256 refusal, the tree and what
-# is left out, npm's global prefix, the exec wrappers, the modes, and the patch-sfs manifest lines. Also checks that
-# pin.txt's real Node pin is complete.
+# engine#3310: os/v3/puppy/stage-node.sh on a FAKE release tarball: the node-vX-linux-x64 layout, gzip-compressed (the CI
+# container has gzip and no xz; stage-node.sh lets tar read the compression, so the real .xz goes the same path), with a
+# shell script standing in for bin/node. No network, no 32 MB download: the sha256 refusal, the tree and what is left
+# out, npm's global prefix, the exec wrappers, the modes, and the patch-sfs manifest lines. Also checks that pin.txt's
+# real Node pin is complete.
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 stage=$here/os/v3/puppy/stage-node.sh
@@ -25,7 +26,7 @@ t=$(mktemp -d) || exit 1
 bad=0
 trap 'rm -rf "${t:?}"' EXIT
 check() { if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; bad=$((bad + 1)); fi; }
-command -v xz > /dev/null || { echo "stage_node_test: no xz: skipped"; exit 77; }
+command -v gzip > /dev/null || { echo "stage_node_test: no gzip: skipped"; exit 77; }
 
 ver=v0.0.1
 r=$t/node-$ver-linux-x64
@@ -38,17 +39,17 @@ ln -s ../lib/node_modules/npm/bin/npm-cli.js "$r/bin/npm"; ln -s ../lib/node_mod
 ln -s ../lib/node_modules/corepack/dist/corepack.js "$r/bin/corepack"
 printf 'MIT\n' > "$r/LICENSE"; printf 'x\n' > "$r/CHANGELOG.md"; printf 'x\n' > "$r/README.md"; printf 'h\n' > "$r/include/node/v8.h"
 chmod 775 "$r/lib"                                         # a group-writable directory the stage must normalise
-tar -cJf "$t/node.tar.xz" -C "$t" "node-$ver-linux-x64"
-sha=$(sha256sum "$t/node.tar.xz" | cut -d' ' -f1)
+tar -czf "$t/node.tar.gz" -C "$t" "node-$ver-linux-x64"
+sha=$(sha256sum "$t/node.tar.gz" | cut -d' ' -f1)
 printf 'node_version=%s\nnode_url=https://invalid.example/node.tar.xz\nnode_sha256=%s\n' "$ver" "$sha" > "$t/pin.txt"
 printf 'node_version=%s\nnode_url=https://invalid.example/node.tar.xz\nnode_sha256=%s\n' "$ver" \
     0000000000000000000000000000000000000000000000000000000000000000 > "$t/badpin.txt"
 
-ONEBIT_NODE_PIN=$t/badpin.txt sh "$stage" "$t/root0" --tarball "$t/node.tar.xz" > "$t/out0" 2>&1
+ONEBIT_NODE_PIN=$t/badpin.txt sh "$stage" "$t/root0" --tarball "$t/node.tar.gz" > "$t/out0" 2>&1
 [ $? = 2 ]; check $? "a tarball whose sha256 is not the pin's is refused (exit 2)"
 [ ! -e "$t/root0/usr/local/lib/nodejs" ]; check $? "nothing is staged from a refused tarball"
 
-ONEBIT_NODE_PIN=$t/pin.txt sh "$stage" "$t/root" --tarball "$t/node.tar.xz" --manifest > "$t/man" 2> "$t/err"
+ONEBIT_NODE_PIN=$t/pin.txt sh "$stage" "$t/root" --tarball "$t/node.tar.gz" --manifest > "$t/man" 2> "$t/err"
 check $? "the pinned tarball stages (exit 0)"
 n=$t/root/usr/local/lib/nodejs
 [ -x "$n/bin/node" ] && [ -L "$n/bin/npm" ] && [ -f "$n/lib/node_modules/npm/bin/npm-cli.js" ] && [ -f "$n/LICENSE" ]

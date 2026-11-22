@@ -387,6 +387,27 @@ def self_test() -> int:
         arm("…and it is the DIGEST that names it, not a missing file or signature", True,
             "digest mismatch" in err and "missing" not in err and SIG not in err)
 
+        # engine#3237 review, second pass: the PER-KERNEL manifests (each <hex>/ carries its own) are a third family of
+        # checks, and they had no arm either -- a set whose kernel manifest disagrees with the kernel beside it is the
+        # shape a re-sealed kernel produces when only the set-level pair is regenerated.
+        def per_kernel_set(root: pathlib.Path, *, kdigest=None, ksig=True):
+            root = kset(root)
+            kern = root / "65"
+            (kern / "manifest").write_text(
+                f"{KMANIFEST_MAGIC}\nset 1024x3072x16x8\n"
+                f"{kdigest or hashlib.sha256(b'\x7fELFkernel').hexdigest()} 10 layer1.elf\n", encoding="utf-8")
+            if ksig:
+                (kern / SIG).write_bytes(b"\x00" * SIG_BYTES)
+            return root
+
+        arm("a kernel whose own manifest agrees with it checks clean", 0, check(per_kernel_set(base / "kern-ok")))
+        rc, err = problems_of(per_kernel_set(base / "kern-baddigest", kdigest="0" * 64))
+        arm("a kernel manifest that disagrees with the kernel beside it is a finding", 1, rc)
+        arm("…and it names the kernel's manifest, not the set's", True, "does not list this layer1.elf" in err)
+        rc, err = problems_of(per_kernel_set(base / "kern-nosig", ksig=False))
+        arm("a kernel manifest with no signature beside it is a finding", 1, rc)
+        arm("…and it names the missing signature for that kernel", True, "has a manifest but no" in err)
+
         # the writer emits `file <sha> <size> <path>`; both spellings must parse or the check reads an empty manifest
         prefixed = kset(base / "prefixed")
         (prefixed / "manifest").write_text(

@@ -292,12 +292,13 @@ def self_test() -> int:
             print(f"  FAIL {name}: got {got!r}, want {want!r}")
 
     def kset(root: pathlib.Path, *, magic=KMANIFEST_MAGIC, entries=None, sig_bytes=SIG_BYTES,
-             set_header="set 1024x3072x16x8", elf=b"\x7fELFkernel", extra_files=None):
+             set_header="set 1024x3072x16x8", elf=b"\x7fELFkernel", extra_files=None, write_elf=True):
         """A kernel set built from bytes: one hex kernel dir, a kmanifest naming it, and its signature."""
         root.mkdir(parents=True, exist_ok=True)
         kern = root / "65"
         kern.mkdir(exist_ok=True)
-        (kern / "layer1.elf").write_bytes(elf)
+        if write_elf:
+            (kern / "layer1.elf").write_bytes(elf)
         digest = hashlib.sha256(elf).hexdigest()
         lines = [magic]
         if set_header:
@@ -318,19 +319,31 @@ def self_test() -> int:
         arm("a well-formed kmanifest2 set checks clean", 0, check(good))
         arm("…and its scheme is detected from the manifest HEAD, not layout.json", "kmanifest2", detect(good))
 
-        # engine#3237's actual failure family: the manifest names bytes the set does not carry, or carries different ones
-        missing = kset(base / "missing", entries=[("0" * 64, 8, "65/gone.elf")])
-        arm("a manifest naming a file the set does not contain is a finding", 1, check(missing))
-
-        wrong = kset(base / "wrong", entries=[("0" * 64, len(b"\x7fELFkernel"), "65/layer1.elf")])
-        arm("a digest that does not match the bytes is a finding", 1, check(wrong))
-        # the message has to name the cause: three different defects with one message is how the diagnosis regresses
+        # engine#3237's actual failure family: the manifest names bytes the set does not carry, or carries different ones.
+        # Each fixture is built so that ONE thing is wrong: a set that also tripped the exact-allowlist would pass this
+        # arm for the wrong reason, which is the defect this self-test exists to prevent in other tools.
         import contextlib
         import io
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            check(wrong)
-        arm("…and the message names the digest, not the file", True, "digest mismatch" in err.getvalue())
+
+        def problems_of(d):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = check(d)
+            return rc, err.getvalue()
+
+        # the manifest lists a kernel and the set carries no kernel at all: the allowlist cannot fire, so "missing" is
+        # the only problem, and the arm can actually distinguish it from a digest or size defect
+        missing = base / "missing"
+        kset(missing, entries=[("0" * 64, 8, "65/gone.elf")], write_elf=False)
+        rc, err = problems_of(missing)
+        arm("a manifest naming a file the set does not contain is a finding", 1, rc)
+        arm("…and that is the ONLY problem (the arm cannot pass for another reason)", True,
+            "listed file is missing" in err and "unexpected file" not in err)
+
+        rc, err = problems_of(kset(base / "wrong", entries=[("0" * 64, len(b"\x7fELFkernel"), "65/layer1.elf")]))
+        arm("a digest that does not match the bytes is a finding", 1, rc)
+        arm("…and the message names the digest, not the file", True,
+            "digest mismatch" in err and "missing" not in err)
 
         sized = kset(base / "sized", entries=[(hashlib.sha256(b"\x7fELFkernel").hexdigest(), 11, "65/layer1.elf")])
         arm("a size that does not match the bytes is a finding", 1, check(sized))

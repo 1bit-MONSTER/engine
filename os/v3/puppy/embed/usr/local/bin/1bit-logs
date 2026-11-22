@@ -28,12 +28,15 @@
 #   webapp.log               /var/log/1bit-webapp.log
 #   thermal.log              Tctl / fan rpm / package W every 10 s, but ONLY while a model is loaded (cycle 25)
 #   BOOT                     date, kernel command line, uptime, release - what machine and entry this was
+#   pstore/                  the kernel's own records of the PREVIOUS shutdown or crash, from the board's EFI pstore
+#                            (engine#3287), plus a `pstore` line in markers saying what they show
 #
 # Usage:
 #   1bit-logs dir            print (and create) this boot's directory
 #   1bit-logs snap [why]     append what is new in every source; `why` is written to the directory as a marker
 #   1bit-logs daemon         snap every 15 s and prune to the last five boots (that is what /etc/init.d/06onboard-logs runs)
 #   1bit-logs prune          keep only the five newest boot directories
+#   1bit-logs pstore [dir]   file the pstore records into this boot's directory (or dir) and clear them
 #
 # Exit: 0 ok, 1 nothing persists (no /data) or the directory cannot be made.
 set -u
@@ -202,6 +205,56 @@ snap() {
     return 0
 }
 
+# engine#3287: the c35 installer's reboot froze the board and no log on /data could say where, because everything here is
+# copied by userspace and the last copy is the `shutdown` snap. The kernel can write past that point: with
+# printk.always_kmsg_dump=1 on the boot line, kernel_restart()/kernel_power_off() dump the log tail into the persistent
+# store (efi_pstore on the AI MAX+ 395) after "reboot: Restarting system" / "reboot: Power down", and an oops or panic
+# lands there regardless. That store is NVRAM, so this copies each record into the boot directory and only then removes
+# it (removing a pstore file deletes its EFI variable): a full NVRAM is a firmware problem of its own. The markers line is
+# the answer someone reads first:
+#   "ends in Restarting system"   the previous boot's kernel finished its reboot; a hang after that is the firmware's
+#   "no record"                   with the parameter on, the previous shutdown never reached the kernel's reset (or the
+#                                 power was cut), so the hang is in userspace shutdown or a driver's .shutdown
+PSTORE=${ONEBIT_PSTORE:-/sys/fs/pstore}
+pstore() {
+    d=${1:-}
+    [ -n "$d" ] || d=$(dir) || return 1
+    if [ "$PSTORE" = /sys/fs/pstore ] && ! grep -q " /sys/fs/pstore pstore " /proc/mounts 2> /dev/null; then
+        mount -t pstore pstore /sys/fs/pstore 2> /dev/null || {
+            printf '%s pstore: not readable (mount -t pstore failed)\n' "$(date -u +%FT%TZ 2> /dev/null)" >> "$d/markers"
+            return 0; }
+    fi
+    dumpall=$(cat /sys/module/printk/parameters/always_kmsg_dump 2> /dev/null || echo "?")
+    n=0 last=
+    for f in "$PSTORE"/*; do
+        [ -f "$f" ] || continue
+        mkdir -p "$d/pstore" 2> /dev/null || return 1
+        b=${f##*/}
+        # copy, compare, then delete: a record is never removed unless the copy reads back the same
+        cp -p "$f" "$d/pstore/$b" 2> /dev/null && cmp -s "$f" "$d/pstore/$b" || continue
+        rm -f "$f" 2> /dev/null
+        n=$((n + 1))
+        case $b in dmesg-*) last=$d/pstore/$b ;; esac
+    done
+    if [ "$n" = 0 ]; then
+        why="no record from the previous shutdown"
+        [ "$dumpall" = Y ] && why="$why (always_kmsg_dump=Y: it did not reach the kernel's reset, or the power was cut)"
+    else
+        why="$n record(s) from the previous boot"
+        if [ -n "$last" ]; then
+            # efi_pstore splits one dump into parts; the reset line is in whichever part holds the log's end
+            if grep -qs -e 'reboot: Restarting system' -e 'reboot: Power down' -e 'reboot: System halted' "$d"/pstore/dmesg-*; then
+                why="$why, ends in the kernel's own reset line ($(grep -hs -o -e 'reboot: [A-Za-z ]*' "$d"/pstore/dmesg-* | tail -1))"
+            elif grep -qs -e 'Kernel panic' -e 'Oops' -e 'BUG:' "$d"/pstore/dmesg-*; then
+                why="$why, a CRASH: $(grep -hs -m1 -o -e 'Kernel panic.*' -e 'BUG:.*' -e 'Oops.*' "$d"/pstore/dmesg-* | head -1)"
+            fi
+        fi
+    fi
+    printf '%s pstore: %s\n' "$(date -u +%FT%TZ 2> /dev/null)" "$why" >> "$d/markers" 2> /dev/null
+    say "1bit-logs: pstore: $why"
+    return 0
+}
+
 prune() {
     [ -d "$ROOT" ] || return 0
     # shellcheck disable=SC2046  # the boot directories ARE the words, oldest first
@@ -226,6 +279,7 @@ daemon() {
     done
     [ -n "$waited" ] && say "1bit-logs: $DATA is mounted after waiting, this boot's logs go to $d"
     prune
+    pstore "$d" || say "1bit-logs: pstore records not filed"
     # Cycle 25: the boot's identity is written once, as soon as the partition is there. It lives here rather than in
     # 06onboard-logs because this loop is the one that has already waited for the mount (and the one that knows the
     # directory), so the proof cannot land in RAM and disappear.
@@ -250,5 +304,6 @@ dir)          dir ;;
 snap)         shift; snap "${1:-}" ;;
 daemon)       daemon ;;
 prune)        prune ;;
-*)            say "usage: $0 [dir|snap [why]|daemon|prune]"; exit 2 ;;
+pstore)       shift; pstore "${1:-}" ;;
+*)            say "usage: $0 [dir|snap [why]|daemon|prune|pstore [dir]]"; exit 2 ;;
 esac

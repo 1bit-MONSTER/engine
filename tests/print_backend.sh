@@ -164,6 +164,14 @@ check "hrx plan: --no-mtp leaves it out (exit $rc)" '[ "$rc" = 0 ] && [ "$(spec)
 out=$(ONEBIT_NO_MTP=1 "$bin" serve -m "$scratch/mtp.gguf" --device hrx --llama-server "$here/fake_backend.py" \
       --no-mem-check --port 43131 --print-backend 2>"$scratch/err"); rc=$?
 check "hrx plan: ONEBIT_NO_MTP=1 leaves it out (exit $rc)" '[ "$rc" = 0 ] && [ "$(spec)" = - ]'
+# engine#679: the KV cache type, passed through and never defaulted (a quantised cache is an accuracy decision)
+kv() { get '" ".join(d["argv"][i+1] for i, a in enumerate(d["argv"]) if a in ("-ctk", "-ctv")) or "-"'; }
+out=$(mplan mtp hrx --ctk q8_0 --ctv q8_0); rc=$?
+check "hrx plan: --ctk/--ctv reach llama-server as -ctk/-ctv (exit $rc, $(kv))" \
+    '[ "$rc" = 0 ] && [ "$(kv)" = "q8_0 q8_0" ]'
+out=$(mplan mtp hrx); rc=$?
+check "hrx plan: no KV type asked for, none passed (the default stays llama-server's f16)" \
+    '[ "$rc" = 0 ] && [ "$(kv)" = "-" ] && [ "$(get "\"-ctk\" in d[\"argv\"] or \"-ctv\" in d[\"argv\"]")" = False ]'
 out=$(mplan small hrx); rc=$?
 check "hrx plan: no MTP head, no drafter (exit $rc)" '[ "$rc" = 0 ] && [ "$(spec)" = - ]'
 out=$(mplan mtp cpu); rc=$?

@@ -136,7 +136,14 @@ datauuid=${ONEBIT_STICK_DATA_UUID:-$(python3 -c 'import uuid; print(uuid.uuid4()
 # the EC modprobe 25.3 -> 45.4 s, both ending on the device's resets. With the scan synchronous, usb-storage scans each
 # device in its own worker, nothing waits on it, and the same boot is 8.8 s (installed) / 23.5 s (live stick, which also
 # copies the SFS set to RAM), down from 45.6 / 51.6 s; the stick and the NVMe are found exactly as before.
-setcmd="pmedia=usbhd pupsfs=UUID=$datauuid 1bit.data=UUID=$datauuid psubdir=1bit ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0 log_buf_len=32M nvme.quirks=1e49:1081:dmapool_align_512 scsi_mod.scan=sync"
+# engine#3287 (the c35 installer's reboot froze the AI MAX+ 395 and left no log): `printk.always_kmsg_dump=1` makes every
+# reboot and power-off leave its kernel log tail in the board's EFI pstore, written by kernel_restart() AFTER
+# "reboot: Restarting system", so the record survives a power-cycle. efi_pstore is loaded on this board (registered at
+# 4.2 s) but without the parameter it records only oopses and panics, and the frozen boot left nothing. With it, the next
+# boot's 1bit-logs files the record as pstore/ in the boot directory (and clears it, so NVRAM never fills): a record
+# that ends in "Restarting system" means the kernel finished and the hang is in the firmware; no record means the
+# shutdown never reached the kernel's reset.
+setcmd="pmedia=usbhd pupsfs=UUID=$datauuid 1bit.data=UUID=$datauuid psubdir=1bit ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0 log_buf_len=32M nvme.quirks=1e49:1081:dmapool_align_512 scsi_mod.scan=sync printk.always_kmsg_dump=1"
 cat > "$esp/EFI/BOOT/grub.cfg" <<GRUBCFG
 set timeout=8
 set default=0
@@ -198,6 +205,8 @@ grep -q 'log_buf_len=32M' "$esp/EFI/BOOT/grub.cfg" || {
 # Same shape as the two guards above: the artifact is refused, not the stick found faulty later.
 grep -q 'scsi_mod.scan=sync' "$esp/EFI/BOOT/grub.cfg" || {
     echo "$prog: REFUSED: no scsi_mod.scan=sync in grub.cfg (a stalled USB storage device then holds the boot ~40 s, engine#3286)" >&2; exit 1; }
+grep -q 'printk.always_kmsg_dump=1' "$esp/EFI/BOOT/grub.cfg" || {
+    echo "$prog: REFUSED: no printk.always_kmsg_dump=1 in grub.cfg (a reboot that hangs would leave no pstore record, engine#3287)" >&2; exit 1; }
 grep -q 'nvme.quirks=1e49:1081:dmapool_align_512' "$esp/EFI/BOOT/grub.cfg" || {
     echo "$prog: REFUSED: no nvme.quirks=1e49:1081:dmapool_align_512 in grub.cfg (the shipped YMTC PC41Q faults without it, engine#3088)" >&2; exit 1; }
 grep -q 'menuentry "1bit OS - install to a disk (1bit.installer=1)"' "$esp/EFI/BOOT/grub.cfg" || {

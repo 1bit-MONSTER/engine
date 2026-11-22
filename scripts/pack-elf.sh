@@ -27,6 +27,10 @@
 #                                   and its RUNPATH becomes $ORIGIN plus the entries outside the
 #                                   build tree and $HOME (TheRock in /opt, which HRX needs anyway)
 #   pack_strip <dir>                strips symbol tables and debug info from every ELF under <dir>
+#   pack_origin_rpath <dir>         every dynamic ELF directly in <dir> (no recursion) that carries an
+#                                   RPATH/RUNPATH gets $ORIGIN alone; one without keeps none. For a set of
+#                                   libraries that sits flat in one directory and was linked elsewhere -
+#                                   TheRock's HSA runtime set, staged unmodified otherwise (engine#3287)
 #   pack_normalise_base_modes <tree> <keeplist>
 #                                   the BASE layer's modes: dirs 0755, executables 0755, other files 0644, keeping the
 #                                   paths in <keeplist> (engine#1474). Prints what it changed, by class
@@ -173,6 +177,19 @@ pack_prune_unloadable() {
         dropped=$((dropped+1))
     done < <(pack_unresolved_needed "$stage")
     [ "$dropped" = 0 ] || echo "  $dropped program(s) dropped as unloadable"
+}
+
+pack_origin_rpath() {  # <dir>
+    local d=$1 f rp n=0
+    for f in "$d"/*; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        pack_is_dynelf "$f" || continue
+        rp=$(readelf -d "$f" 2>/dev/null | sed -n 's/.*(R\(UN\)\{0,1\}PATH).*path: \[\(.*\)\]/\2/p' | head -1)
+        [ -n "$rp" ] && [ "$rp" != '$ORIGIN' ] || continue   # none, or already $ORIGIN: the bytes stay as they are
+        patchelf --set-rpath '$ORIGIN' "$f" || { echo "pack_origin_rpath: cannot set the RUNPATH of $f" >&2; return 1; }
+        n=$((n + 1))
+    done
+    echo "$n"
 }
 
 pack_strip() {

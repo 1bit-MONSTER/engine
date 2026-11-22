@@ -33,7 +33,7 @@ import sys
 
 # starter/loom-port-llm/starter/{build.py,attn_rules.py}, read 2026-11-21. A name here means the generator has an
 # attention shape for it; it does NOT mean any particular checkpoint of that family ports cleanly.
-SUPPORTED = ("llama", "qwen2", "qwen3", "qwen35", "gemma3", "gemma4", "phi3", "glm")
+SUPPORTED = ("llama", "qwen2", "qwen3", "qwen35", "gemma3", "gemma4", "phi3")
 
 # What a starter entry needs for the families whose shape is not plain attention. Printed so the answer is
 # actionable rather than "unsupported".
@@ -174,6 +174,9 @@ def self_test():
     arm("a file that is not a GGUF is cannot-tell, not a pass", b"NOPE" + b"\0" * 32, 2)
     arm("a GGUF with no architecture key is cannot-tell",
         _gguf_bytes([("general.name", "x")]), 2)
+    # `glm` is a chat call format in the starter (build.py CALL_FORMATS), not an attention shape: a checkpoint whose
+    # architecture is "glm" must not get a green light (engine#3238 review, engine#3221).
+    arm("a starter CALL FORMAT name is not an architecture", _gguf_bytes([("general.architecture", "glm")]), 1, "NOT in")
     print(f"loom_arch_probe self-test: {ok + bad} arms, {ok} ok, {bad} failed")
     return 0 if bad == 0 else 1
 

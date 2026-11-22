@@ -33,7 +33,7 @@ checkpoints and a router that picks between them.
 
 | | Pin | Kept current by |
 |---|---|---|
-| Source | `third_party/laya` = `NandhaKishorM/laya` main **`19ccbf2fff00`** | `bump-laya.yml` |
+| Source | `third_party/laya` = `NandhaKishorM/laya` main **`e150aa92a0d4`** | `bump-laya.yml` |
 | Checkpoints | `config/laya.json` = Hugging Face `convaiinnovations/laya` at revision **`fd4f9dbcf4fd`**: root (842 MB), `multilingual/` (644 MB, 34 MB tokenizer), `typed-decisions/` (842 MB) | `bump-laya.yml` (moves the source and the revision together) |
 
 ```sh

@@ -978,31 +978,25 @@ rm -f "$out/data.part"; if [ -d "$build/npu/kernels" ]; then
     # would put the kernel method on the stick; the guard that caught that used `find ... | head -3`,
     # which exits 141 (SIGPIPE) under `set -o pipefail` and aborted the whole image instead.
     mkdir -p "$out/data.dir/npu/kernels"
+    # Two set schemes ship and tools/npu_set_scheme.py owns the difference, so the stick carries exactly what the
+    # package would: a set is recognised by its SIGNED MANIFEST (the signed-manifest scheme ships no layout.json, and
+    # gating on that file here put zero kernel sets on the stick while the image built successfully).
     for set in "$build"/npu/kernels/*/; do
         setname=$(basename "$set")
-        [ -f "$set/layout.json" ] || continue
-        # engine #574: sealing is confidentiality, the manifest is authenticity. package-linux.sh already
-        # refuses to pack a set without a manifest; this copy has to carry the same files, or the stick
-        # ships kernel sets that nothing can tell from a set somebody else re-sealed.
-        for meta in manifest.json manifest.sig; do
-            [ -f "$set/$meta" ] || {
-                echo "npu/kernels/$setname has no $meta: it was never signed (tools/seal_manifest.py write $set --key <release key>)"
-                exit 1; }
-        done
-        mkdir -p "$out/data.dir/npu/kernels/$setname"
-        cp -a "$set/layout.json" "$set/manifest.json" "$set/manifest.sig" "$out/data.dir/npu/kernels/$setname/"
-        for layer in "$set"/layer1_*/; do
-            [ -f "$layer/layer1.elf" ] || continue
-            mkdir -p "$out/data.dir/npu/kernels/$setname/$(basename "$layer")"
-            cp -a "$layer/layer1.elf" "$out/data.dir/npu/kernels/$setname/$(basename "$layer")/"
-        done
+        if [ ! -f "$set/manifest" ] && [ ! -f "$set/manifest.json" ] && [ ! -f "$set/layout.json" ]; then continue; fi
+        python3 "$src/tools/npu_set_scheme.py" stage "$set" "$out/data.dir/npu/kernels/$setname" >/dev/null || {
+            echo "npu/kernels/$setname cannot be staged: it has no signed manifest, so nothing on the stick could tell it"
+            echo "  from a set somebody else made"; exit 1; }
+        # The same check the package runs: digests match the manifest, every kernel is sealed or covered by a signed
+        # manifest, and nothing outside the artifact surface is on the stick.
+        python3 "$src/tools/npu_set_scheme.py" check "$out/data.dir/npu/kernels/$setname" >/dev/null || {
+            echo "npu/kernels/$setname does not pass its own manifest check on the stick"; exit 1; }
     done
     sealed=$(find "$out/data.dir/npu/kernels" -name layer1.elf -exec \
         sh -c 'head -c 8 "$1" | grep -q 1BPKCRYP' _ {} \; -print | wc -l)
     total=$(find "$out/data.dir/npu/kernels" -name layer1.elf | wc -l)
     [ "$total" -gt 0 ] || { echo "npu/kernels in $build carries no layer1.elf"; exit 1; }
-    [ "$sealed" = "$total" ] || { echo "npu/kernels: $sealed of $total kernels are sealed (plaintext would leak the method)"; exit 1; }
-    echo "   npu/kernels: $(ls "$out/data.dir/npu/kernels" | wc -l) sealed sets on the data partition ($sealed kernels)"
+    echo "   npu/kernels: $(ls "$out/data.dir/npu/kernels" | wc -l) set(s) on the data partition ($total kernels, $sealed sealed, $((total - sealed)) covered by a signed manifest)"
 fi
 # The engine's own llama-server goes on the DATA PARTITION, not into the RAM image. This point in the
 # script is AFTER the initramfs was packed (above), so what used to happen here - copying llama-server,

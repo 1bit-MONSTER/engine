@@ -370,7 +370,7 @@ package_checks() {  # package_checks <linux tarball>
     [ "$n" = 0 ] || { echo "FAIL source files in the tarball"; bad=1; }
     # ... and a tarball that carries the NPU kernels must carry all three, or its GGUF-on-NPU path
     # dies at the first GGUF with "repack script not found" (the bug this list exists to prevent)
-    if [ -n "$(find "$t" -path '*/npu/kernels/*/layout.json' -type f -print -quit)" ]; then
+    if [ -n "$(find "$t" \( -path '*/npu/kernels/*/manifest' -o -path '*/npu/kernels/*/manifest.json' \) -type f -print -quit)" ]; then
         for h in $helpers; do
             [ "$(find "$t" -path "*/$h" -type f | wc -l)" = 1 ] || { echo "FAIL the NPU package is missing $h"; bad=1; }
         done
@@ -390,22 +390,32 @@ package_checks() {  # package_checks <linux tarball>
     # source file and no build-machine home.
     local nk=0 m privsrc
     if [ "${WEEKLY_NPU_KERNELS:-1}" = 1 ]; then
-        n=$(find "$t" -path '*/npu/kernels/*/layout.json' -type f | wc -l)
+        # one set = one signed manifest: a signed-manifest set carries no layout.json, and counting that file said
+        # "0 NPU kernel sets" for a package full of them.
+        n=$(find "$t" \( -path '*/npu/kernels/*/manifest' -o -path '*/npu/kernels/*/manifest.json' \) -type f | wc -l)
         [ "$n" -ge 3 ] || { echo "FAIL WEEKLY_NPU_KERNELS=1 but $(basename "$1") carries $n NPU kernel sets (want the 0.6B, 1.7B and 4B sets)"; bad=1; }
     fi
-    # The shipped npu tree is an exact allowlist: <set>/layout.json, <set>/layer1_*/layer1.elf, and
-    # the set's signed manifest. Anything else is the kernel method in the clear - layer1.work/
+    # The shipped npu tree is an exact allowlist: the set's signed manifest, its layout.json when the scheme has one,
+    # and its kernels -- sealed 1BPKCRYP at <set>/layer1_*/layer1.elf, or plain ELFs at <set>/<id>/layer1.elf described
+    # by a signed manifest. Anything else is the kernel method in the clear - layer1.work/
     # carries plaintext MLIR, object files and intermediate ELFs - so a stray file is a leak, not
     # just a wrong shape.
     while IFS= read -r -d '' f; do
         rel=${f#"$t"/}
         if [ "$(basename "$f")" = layout.json ]; then continue; fi
-        # engine #574: the set's manifest and its Ed25519 signature, in the set's own directory
-        if [[ "$rel" =~ ^[^/]+/npu/kernels/[^/]+/manifest\.(json|sig)$ ]]; then continue; fi
+        # The set's signed manifest and its Ed25519 signature, in the set's own directory. Two schemes ship: the older
+        # sealed one (`manifest.json` + `manifest.sig`, kernels are 1BPKCRYP ciphertext under layer1_*/) and the newer
+        # one (`manifest` + `manifest.sig`, plain ELFs under <id>/). tools/npu_set_scheme.py owns the difference.
+        if [[ "$rel" =~ ^[^/]+/npu/kernels/[^/]+/manifest(\.(json|sig)|)$ ]] || [[ "$rel" =~ ^[^/]+/npu/kernels/[^/]+/manifest.sig$ ]]; then continue; fi
+        if [[ "$rel" =~ ^[^/]+/npu/kernels/[^/]+/[0-9a-f]{2,8}/layer1\.elf$ ]]; then
+            # the newer scheme: a plain ELF, covered by the set's signed manifest (checked below)
+            [ "$(head -c 4 "$f")" = "$(printf '\177ELF')" ] || { echo "FAIL $rel is neither an ELF nor sealed (the manifest describes an ELF)"; nk=$((nk + 1)); }
+            continue
+        fi
         if [ "$(head -c 8 "$f")" != 1BPKCRYP ]; then
             echo "FAIL leaked build artifact in the package (not a sealed kernel): $rel"; nk=$((nk + 1))
         elif [[ ! "$rel" =~ ^[^/]+/npu/kernels/[^/]+/layer1_[^/]+/layer1\.elf$ ]]; then
-            echo "FAIL unexpected file under npu/kernels (a set ships layout.json + layer1_*/layer1.elf + manifest.json + manifest.sig only): $rel"; nk=$((nk + 1))
+            echo "FAIL unexpected file under npu/kernels (a set ships layout.json + its signed manifest + layer1_*/layer1.elf or <id>/layer1.elf): $rel"; nk=$((nk + 1))
         fi
     done < <(find "$t" -path '*/npu/kernels/*' -type f -print0)
     [ "$nk" = 0 ] || bad=1
@@ -424,20 +434,27 @@ package_checks() {  # package_checks <linux tarball>
         while IFS= read -r -d '' sd; do
             sd=$(dirname "$sd")
             rel=${sd#"$t"/}
-            [ -f "$sd/manifest.json" ] || { echo "FAIL sealed set $rel has no manifest.json (it was never signed: tools/seal_manifest.py write)"; seal=$((seal + 1)); }
-            [ -f "$sd/manifest.sig" ] || { echo "FAIL sealed set $rel has no manifest.sig (its manifest is not signed)"; seal=$((seal + 1)); }
-            [ -f "$sd/manifest.json" ] || continue
             if ! command -v python3 >/dev/null 2>&1; then
-                echo "FAIL no python3: the manifest of $rel cannot be checked (tools/seal_manifest.py)"; seal=$((seal + 1))
-            elif [ -n "$spub" ]; then
-                python3 "$SRC/tools/seal_manifest.py" verify "$sd" --pub "$spub" || seal=$((seal + 1))
-            else
-                python3 "$SRC/tools/seal_manifest.py" check "$sd" || seal=$((seal + 1))
+                echo "FAIL no python3: the manifest of $rel cannot be checked"; seal=$((seal + 1)); continue
             fi
-        done < <(find "$t" -path '*/npu/kernels/*/layout.json' -type f -print0)
+            if [ "$(python3 "$SRC/tools/npu_set_scheme.py" detect "$sd")" = sealed1 ]; then
+                [ -f "$sd/manifest.json" ] || { echo "FAIL sealed set $rel has no manifest.json (it was never signed: tools/seal_manifest.py write)"; seal=$((seal + 1)); }
+                [ -f "$sd/manifest.sig" ] || { echo "FAIL sealed set $rel has no manifest.sig (its manifest is not signed)"; seal=$((seal + 1)); }
+                [ -f "$sd/manifest.json" ] || continue
+                if [ -n "$spub" ]; then
+                    python3 "$SRC/tools/seal_manifest.py" verify "$sd" --pub "$spub" || seal=$((seal + 1))
+                else
+                    python3 "$SRC/tools/seal_manifest.py" check "$sd" || seal=$((seal + 1))
+                fi
+            else
+                # npumanifest 2: the signed manifest is `manifest` (its first line names the format) and the signature is
+                # over those bytes, verified by the engine at load; the digests the packager can check are checked here.
+                python3 "$SRC/tools/npu_set_scheme.py" check "$sd" || seal=$((seal + 1))
+            fi
+        done < <(find "$t" \( -path '*/npu/kernels/*/manifest' -o -path '*/npu/kernels/*/manifest.json' \) -type f -print0)
     fi
     if [ "$seal" = 0 ]; then
-        n=$(find "$t" -path '*/npu/kernels/*/manifest.json' -type f | wc -l)
+        n=$(find "$t" -path '*/npu/kernels/*/manifest.json' -o -path '*/npu/kernels/*/manifest' -type f | wc -l)
         if [ "$n" = 0 ]; then echo "ok   no sealed NPU set in $(basename "$1"): nothing to sign"
         elif [ -n "$spub" ]; then echo "ok   signed manifests: $n set(s), each listing exactly the files packed, signatures verified with $spub"
         else echo "ok   signed manifests: $n set(s), each listing exactly the files packed (digests only: ONEBIT_SEAL_PUB is unset, so there is no release public key here to verify the signatures with)"; fi

@@ -20,9 +20,9 @@ limitations under the License.
 Lemonade and the engine embedded, our MOK-signed kernel, headless by default and a `desktop` boot
 entry): [os/README.md](../os/README.md), [docs/os-v3.md](os-v3.md). The candidates below shipped the
 BusyBox `os/mini` image under the name `1bit-os-<tag>.img.zst`; that image is the CI/VM target now, not
-1bit OS. **Nothing here is published**: v2026.44 is a draft, and the next release carries the Puppy
-appliance. Every release is **held until every open engine issue is fixed** (owner, 2026-11-11), so no
-release date is set.
+1bit OS. **[v2026.47](https://github.com/1bit-MONSTER/engine/releases/tag/v2026.47) (22 Nov 2026) is the first published release**, and it carries the
+Puppy appliance ([v2026.47](#v202647-22-nov-2026--the-first-published-release)); v2026.44 stays a draft.
+Every release is **held until every open engine issue is fixed** (owner, 2026-11-11).
 
 The first release, **v2026.44**, is a **draft**: it is not published, and nothing is tagged — see
 [v2026.44](#v202644-1-nov-2026--the-first-release-a-draft) for why, and for the candidate that replaces the one it was
@@ -36,10 +36,13 @@ everything from scratch at the current pins, so each release carries that week's
 Releases are tagged `v<ISO year>.<ISO week>` (`v2026.40`), like Lemonade's `2026.39.1`; a second
 release in the same week gets `.1`.
 
-## Candidate c34 (22 Nov 2026) — on the hardware
+## v2026.47 (22 Nov 2026) — the first published release
 
-c34 is built from engine `7b534949` and measured on the Ryzen AI MAX+ 395 box on 2026-11-22, with
-Secure Boot on. The owner picks the release tag.
+[v2026.47](https://github.com/1bit-MONSTER/engine/releases/tag/v2026.47) is tagged at engine `31a7a523be0c`. It is candidate c34, built from engine `7b534949`
+and measured on the Ryzen AI MAX+ 395 box on 2026-11-22 with Secure Boot on. The stick image is
+assembled from the exact files that passed on the hardware: the kernel, the initrd and the OS
+filesystems are verified by checksum against the tested candidate, and the image is boot-checked with
+Secure Boot on. Release post: [https://1bit.gg/blog-v2026.47-release.html](https://1bit.gg/blog-v2026.47-release.html).
 
 | what | result |
 |---|---|

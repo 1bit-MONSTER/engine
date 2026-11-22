@@ -41,21 +41,17 @@ and our HIP kernels serves it as the fallback. The NPU engine does not change ([
 
 ## Get started
 
-1. Download the 1bit OS image from [Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS):
-   `1bit-os-puppy.img.xz` (about 2.2 GB compressed, 9,128,902,656 B written) with the `SHA256SUMS` beside
-   it. The image is served from Hugging Face because a GitHub release asset is capped at 2 GiB; the
-   [releases page](https://github.com/1bit-MONSTER/engine/releases) stays the home of the
-   `lemonade-onebit` package, the release notes and the release `SHA256SUMS`, and links there for the
-   image. The Hugging Face repository is private until the release is published, so until then that link
-   answers 401; from publication day this step is the download.
-2. Verify it, then write it to a USB stick (16 GB or more):
+1. Download `1bit-os-v2026.47.img.zst` and `SHA256SUMS` from the
+   [v2026.47 release](https://github.com/1bit-MONSTER/engine/releases/tag/v2026.47), which also carries the `lemonade-onebit` package and the release notes.
+2. Verify it, unpack it, and write it to the whole USB disk (16 GB or more; `/dev/sdX` is the stick,
+   not a partition):
 
    ```sh
    sha256sum -c SHA256SUMS --ignore-missing
-   xz -dc 1bit-os-puppy.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
+   zstd -d 1bit-os-v2026.47.img.zst
+   sudo dd if=1bit-os-v2026.47.img of=/dev/sdX bs=4M conv=fsync status=progress
    ```
 
-   balenaEtcher and Rufus (DD mode) write the `.img.xz` directly.
 3. Boot the machine from the stick. Where our key is already enrolled, Secure Boot can stay on: the chain
    is a Microsoft-signed shim → our MOK-signed grub → our MOK-signed kernel → our signed modules. A
    machine that has never trusted our key refuses the kernel, and the certificates are not on the stick,
@@ -97,7 +93,7 @@ One binary to rule them all. The 1bit engine is model agnostic: any Hugging Face
 | 2026-11-14 | The Bosgame BeyondMax's rear USB-A and Type-C ports work under Linux: a plug test on every external port passed once the keep-awake rule holds the xHCI controllers awake (USB4 devices still untested). The MTP drafter no longer crashes on a model's first request, and the HIP kernel and HRX pins moved forward through the hardware gate ([docs/axb35-usb-ports.md](docs/axb35-usb-ports.md), [#2431](https://github.com/1bit-MONSTER/engine/pull/2431), [#2453](https://github.com/1bit-MONSTER/engine/pull/2453), [#2461](https://github.com/1bit-MONSTER/engine/pull/2461)) |
 | 2026-11-20 | Liquid AI LFM3-1.7B on HRX for smaller machines: prefill 7,925 tok/s, decode 153.7 tok/s, 2.05 GiB of GTT at 8k context; its NPU pack passes the registry check on the NPU ([docs/models.md](docs/models.md), [#2956](https://github.com/1bit-MONSTER/engine/pull/2956), [#3016](https://github.com/1bit-MONSTER/engine/pull/3016)) |
 | 2026-11-21 | The GPU route starts moving to Loom: AMD's Loom model programs on HRX, served by `loom-serve` behind `1bit serve`, one model at a time once each passes an A/B and accuracy gate. The route is in `1bit serve`, chosen per model by `config/loom-routes.json`, which ships empty until a model passes. The llama.cpp fork with our HIP kernels stays as the fallback; the NPU engine does not change ([#3166](https://github.com/1bit-MONSTER/engine/pull/3166), [docs/loom-route.md](docs/loom-route.md), [#3156](https://github.com/1bit-MONSTER/engine/issues/3156), [#3157](https://github.com/1bit-MONSTER/engine/issues/3157), [#3158](https://github.com/1bit-MONSTER/engine/issues/3158)) |
-| 2026-11-22 | The release build, c34, boots from the stick and installs to the internal NVMe on the board with Secure Boot on (33 of 38 release-check rows on each, the five open rows named for the next release); Qwen3-0.6B decodes at 91.7 tok/s on the NPU and Qwen3-4B ships on the NPU; the NPU and the GPU serve at the same time ([docs/releases.md](docs/releases.md#candidate-c34-22-nov-2026--on-the-hardware)) |
+| 2026-11-22 | **[v2026.47](https://github.com/1bit-MONSTER/engine/releases/tag/v2026.47) is the first published release** ([release post](https://1bit.gg/blog-v2026.47-release.html)). The release build, c34, boots from the stick and installs to the internal NVMe on the board with Secure Boot on (33 of 38 release-check rows on each, the five open rows named for the next release); Qwen3-0.6B decodes at 91.7 tok/s on the NPU and Qwen3-4B ships on the NPU; the NPU and the GPU serve at the same time ([docs/releases.md](docs/releases.md#v202647-22-nov-2026--the-first-published-release)) |
 
 The release goes out when every item on the release checklist is done ([docs/releases.md](docs/releases.md)); the weekly Lemonade pin moves with Lemonade's releases.
 

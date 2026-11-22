@@ -222,6 +222,18 @@ grep -Eq '^[[:space:]]*linux .*pfix=copy([ ,]|$)' "$gcfg" && fail "grub.cfg stil
 n=$(grep -Ec '^[[:space:]]*linux .*pfix=nocopy([ ,]|$)' "$gcfg")
 [ "$n" -ge 1 ] || fail "no boot line in grub.cfg carries pfix=nocopy, so the SFS would be copied into RAM"
 say "   $n boot line(s) mount the SFS from this disk (pfix=nocopy), no RAM copy"
+# engine#3088: `nvme.quirks=1e49:1081:dmapool_align_512` is what keeps this box's DRAM-less YMTC PC41Q-2TB from
+# over-reading its 32-entry PRP list (2-83 IO_PAGE_FAULTs/h -> 0 over 7 h, engine#2478). mkimage.sh writes it into
+# the stick's boot line and REFUSES a grub.cfg that lost it, and vm-check.sh reads it off a RUNNING boot -- but the
+# installed disk is the machine that runs for months, and until now nothing checked that the rewrites above left the
+# parameter in place. Every `linux` line, not one: a mixed ESP would fault on the entries that lack it, and an
+# installer run from an image built before the parameter existed would otherwise report a clean install.
+quirk=nvme.quirks=1e49:1081:dmapool_align_512
+nl=$(grep -Ec '^[[:space:]]*linux ' "$gcfg")
+nq=$(grep -Ec "^[[:space:]]*linux .*$quirk([ ,]|$)" "$gcfg")
+[ "$nl" -ge 1 ] || fail "grub.cfg has no linux line at all, so nothing boots"
+[ "$nq" -eq "$nl" ] || fail "$((nl - nq)) of $nl boot line(s) in grub.cfg lack $quirk: this disk's YMTC SSD faults without it (engine#2478/#3088)"
+say "   $nq/$nl boot line(s) carry $quirk"
 
 say "== 6/7 read back"
 sync

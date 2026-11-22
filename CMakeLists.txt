@@ -569,6 +569,7 @@ endfunction()
 # name; these are the rows that make that rule true instead of merely strict. `registry_build_self` is not among them
 # because #3212/#3217 already wired it above.
 add_python_test(census_counters_self ${CMAKE_SOURCE_DIR}/tools/ci/census_counters_check.py --self-test)
+add_python_test(loom_arch_probe ${CMAKE_SOURCE_DIR}/tools/loom_arch_probe.py --self-test)  # engine#3221: arms only, no GGUF needed
 add_python_test(dupdef_check_self ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --self-test)
 add_python_test(stale_expectations_self ${CMAKE_SOURCE_DIR}/tools/ci/stale_expectations_check.py --self-test)
 add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --check --root ${CMAKE_SOURCE_DIR})

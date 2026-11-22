@@ -51,6 +51,12 @@ cmake --build "$prefix/build" --target $targets
 # its line, so an anchored grep reports 145 of 146), and this line exists to be able to fail
 echo "build-machine paths left in lemond: $(strings -a "$prefix/build/lemond" | grep -o -E '/home/|/wt/' | wc -l) occurrence(s)"
 cp "$prefix/build/lemond" "$prefix/build/lemonade" "$prefix/bin/"
+# engine#3287: Lemonade's CMake gives both binaries RUNPATH /usr/local/lib, a build-host directory the appliance does not
+# use (it links its libraries statically or from the distro), and the release check's payload-runpath row fails on it.
+# Measured on the AI MAX+ 395: lemond with the runpath removed serves the release check 38/38.
+for b in lemond lemonade; do
+    if readelf -d "$prefix/bin/$b" 2>/dev/null | grep -qE 'R(UN)?PATH'; then patchelf --remove-rpath "$prefix/bin/$b"; fi
+done
 # lemond reads resources/ (defaults.json, the model list) beside itself
 rm -rf "$prefix/bin/resources" && cp -r "$prefix/build/resources" "$prefix/bin/"
 echo "built $prefix/bin/lemond (lemonade $(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || echo unknown))"

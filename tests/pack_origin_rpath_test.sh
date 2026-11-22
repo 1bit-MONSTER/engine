@@ -26,9 +26,14 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=../scripts/pack-elf.sh
 . "$here/../scripts/pack-elf.sh"
-cc=$(command -v cc || command -v gcc || command -v clang || true)
-[ -n "$cc" ] || { echo "pack_origin_rpath_test: skip (no C compiler)"; exit 77; }
-for t in patchelf readelf; do command -v "$t" > /dev/null || { echo "pack_origin_rpath_test: skip (no $t)"; exit 77; }; done
+# the CI build job compiles with gcc-16 and has no bare `cc` (the same probe as pack_check_test.sh); it installs patchelf
+# and binutils for installed_rpath, so every tool this needs is in the container and a missing one is a failure, not a skip
+cc=${CC:-}
+if [ -z "$cc" ]; then
+    for cand in cc gcc gcc-16 gcc-15 clang; do command -v "$cand" > /dev/null 2>&1 && { cc=$cand; break; }; done
+fi
+[ -n "$cc" ] || { echo "pack_origin_rpath_test: no C compiler found (tried \$CC, cc, gcc, gcc-16, gcc-15, clang)"; exit 2; }
+for t in patchelf readelf ldd; do command -v "$t" > /dev/null || { echo "pack_origin_rpath_test: no $t"; exit 2; }; done
 w=$(mktemp -d); trap 'rm -rf "$w"' EXIT
 fails=0
 ok() { echo "  ok   $*"; }

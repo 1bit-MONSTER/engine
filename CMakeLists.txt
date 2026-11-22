@@ -2446,7 +2446,6 @@ add_test(NAME pack_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_modes_test.
 # The HSA runtime set's RUNPATH (engine#3287): TheRock links it into its own pip tree, so package-linux.sh gives every
 # file of the set $ORIGIN alone (pack_origin_rpath) - what the tested c35 payload shipped. Compiled fixtures, no build.
 add_test(NAME pack_origin_rpath COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_origin_rpath_test.sh)
-set_tests_properties(pack_origin_rpath PROPERTIES SKIP_RETURN_CODE 77)
 # patch-sfs must not destroy the artifact it was asked to replace (#1491: two pre-pack refusals did `rm -f "$out"` before the
 # output had been reassigned to its .partial name, so a failed cut deleted the previous good SFS). Skips without root, since
 # patch-sfs needs uid/gid and setuid bits - this is the only test here that does, hence the property.

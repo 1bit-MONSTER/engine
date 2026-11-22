@@ -104,6 +104,23 @@ else
     bad "manifest: no output"; sed -n 1,10p "$work/two.log"
 fi
 
+# --- case 2b: an addition under a NEW directory below the root (engine#3287: usr/local/sbin/1bit-grow-data) ----------
+# `diff -rq` reports it as `Only in <tree>/new/usr/local: sbin` - the new directory, named under its PARENT - and that
+# record has to count as part of the declared file, or every addition that brings its own directory below / is refused.
+[ ! -e "$base_unpack/usr/local/sbin" ] || bad "fixture: usr/local/sbin already exists, case 2b would prove nothing"
+printf 'grow data\n' > "$work/new-grow"
+printf 'usr/local/sbin/1bit-grow-data\t%s\t0755\n' "$work/new-grow" > "$work/manifest-2b"
+"$tool" --manifest "$work/manifest-2b" "$work/base.sfs" "$work/twob.sfs" >"$work/twob.log" 2>&1
+is "nested new dir: rc" "$?" "0"
+if [ -s "$work/twob.sfs" ]; then
+    u=$work/twob-unpack; unsquashfs -q -n -d "$u" "$work/twob.sfs" >/dev/null 2>&1
+    is "nested new dir: file added" "$(cat "$u/usr/local/sbin/1bit-grow-data" 2>/dev/null)" "grow data"
+    is "nested new dir: file mode" "$(stat -c%a "$u/usr/local/sbin/1bit-grow-data" 2>/dev/null)" "755"
+    is "nested new dir: directory owner" "$(stat -c%u:%g "$u/usr/local/sbin" 2>/dev/null)" "0:0"
+else
+    bad "nested new dir: no output"; sed -n 1,10p "$work/twob.log"
+fi
+
 # --- case 3: refusals. Each must fail AND leave no output file ------------------------------------------------------
 refuse() { # <label> <expected-text> <args...>
     local label=$1 want=$2; shift 2

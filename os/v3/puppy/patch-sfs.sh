@@ -147,13 +147,16 @@ only_in_path() {
             dir=${pre%: *}
             name=${pre##*: }
             [ "$dir" = "$2" ] && { printf '%s\n' "$name"; return 0; }
+            # a new directory BELOW the root is named under its parent: `Only in <tree>/new/usr/local: sbin` is
+            # usr/local/sbin (engine#3287: a cut adding usr/local/sbin/1bit-grow-data was refused on exactly this line)
+            case $dir in "$2"/*) printf '%s/%s\n' "${dir#"$2"/}" "$name"; return 0 ;; esac
             return 1 ;;
     esac
     return 1
 }
 # Three record shapes reach this matcher and each names a path differently:
 #   `Files <a>/x and <b>/x differ`                 - two absolute paths, the target is in both
-#   `Only in <tree>/new: NEWDIR`                   - a DIRECTORY, tree-relative, when a declared file brings a new one
+#   `Only in <tree>/new[/<parent>]: NEWDIR`         - a DIRECTORY, tree-relative, when a declared file brings a new one
 #   `755 root root d - ./NEWDIR`                    - the metadata pass, path in the LAST field, tree-relative
 # The old substring test only understood the first, which is why a manifest adding a file under a new directory was refused
 # in both later directions (pi-release reproduced it on 2026-11-08: 'Only in ...: NEWDIR' -> "outside the declared set", and

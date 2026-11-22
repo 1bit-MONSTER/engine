@@ -69,6 +69,12 @@ pack_localize() {
     local stage=$1 build=$2 item f orig keep e dep dest
     local queue=()
     while IFS= read -r -d '' f; do
+        # NPU kernel sets are NOT host ELFs: an AIE kernel carries a .dynamic section, so pack_is_dynelf calls it
+        # dynamic and localization tries to rewrite its RUNPATH. Measured 2026-11-21 on the c34 cut: patchelf aborts
+        # on npu/kernels/<set>/<id>/layer1.elf ("PHDR segment is not covered by a LOAD segment"), and if it ever
+        # succeeded it would rewrite signed kernel bytes -- the manifest digests shipped beside them would stop
+        # matching and the runtime, which verifies the manifest at load, would refuse the set.
+        case "$f" in */npu/kernels/*) continue ;; esac
         pack_is_dynelf "$f" && queue+=("$f|$build/${f#"$stage"/}")
     done < <(find "$stage" -mindepth 2 -type f -print0)
     while [ ${#queue[@]} -gt 0 ]; do

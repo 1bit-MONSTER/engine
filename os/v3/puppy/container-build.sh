@@ -191,6 +191,24 @@ grep -q "^if false ; then # 1bit: a headless boot must not ask (cycle 13)" "$ske
     echo "build: REFUSED: could not stop rc.country from asking on the console" >&2; exit 1; }
 echo "   ok: rc.country asks nothing on the console (the keymap and timezone it reads are checked with the embed)"
 
+# engine#3287: the hardware clock is UTC, and rc.country has to be told. Its quiet path is `set_hwclock_type -q
+# --hctosys`, which takes the RTC's meaning from /etc/clock, and the base SFS ships HWCLOCKTIME=localtime. With the
+# embed's /etc/localtime -> America/Moncton that read the UTC RTC as Atlantic time: measured on the AI MAX+ 395 (c35
+# installed, 22 Nov) every boot ran 4 h AHEAD until NTP caught up (`hwclock -r` 14:57 vs `hwclock -r -u` 10:57 at
+# 10:57 AST), so /data/logs named the 14:12-14:25Z boots 18:12-18:25Z and 1bit-logs' prune, which keeps the five
+# newest NAMES, evicted the real newer boots - among them the directories from around the c35 installer's reboot
+# freeze. Passing `utc` makes set_hwclock_type use it and write HWCLOCKTIME='utc' to /etc/clock, which also corrects an
+# installed system whose save layer kept the old 'localtime' copy (set_hwclock_type rewrites it on every boot).
+sed -i -e "s|/usr/sbin/set_hwclock_type -q --hctosys|/usr/sbin/set_hwclock_type -q utc --hctosys|" \
+    -e "s|/usr/sbin/set_hwclock_type cli --hctosys|/usr/sbin/set_hwclock_type cli utc --hctosys|" \
+    "$skeleton/etc/rc.d/rc.country"
+grep -q "/usr/sbin/set_hwclock_type -q utc --hctosys" "$skeleton/etc/rc.d/rc.country" || {
+    echo "build: REFUSED: rc.country still reads the hardware clock as local time (set_hwclock_type -q without utc)" >&2
+    exit 1; }
+! grep -q "set_hwclock_type [a-z-]* *--hctosys" "$skeleton/etc/rc.d/rc.country" || {
+    echo "build: REFUSED: an rc.country set_hwclock_type call still leaves the clock type to /etc/clock" >&2; exit 1; }
+echo "   ok: rc.country reads the hardware clock as UTC"
+
 # tty1 login: inittab respawns `plogin`, whose tail is `exec getty -n -l /bin/autologin`. On the
 # 2026-11-02 board boot that chain left no prompt on tty1 while the same image gave one in QEMU, and a
 # console-only machine whose console has nothing to log into is unreachable rather than headless. The entry

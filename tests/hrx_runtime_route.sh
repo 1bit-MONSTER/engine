@@ -98,24 +98,34 @@ check "missing: no fabricated digest" '! grep -Eq "sha256 [0-9a-f]{64}" "$scratc
 
 # engine#3314: a runtime the user named with IREE_HAL_AMDGPU_LIBHSA_PATH is kept (docs/serve.md), and
 # --hrx-libhsa still beats it. A second fake with its own bytes, so the digest says which file won.
-printf 'the user'"'"'s HSA runtime\n' > "$scratch/user-libhsa-runtime64.so.1"
-want_user=$(sha256sum "$scratch/user-libhsa-runtime64.so.1" | cut -d' ' -f1)
-IREE_HAL_AMDGPU_LIBHSA_PATH=$scratch/user-libhsa-runtime64.so.1 ONEBIT_HRX_NO_TRIO_OK=1 \
+mkdir -p "$scratch/user"
+printf 'the user'"'"'s HSA runtime\n' > "$scratch/user/libhsa-runtime64.so.1"
+want_user=$(sha256sum "$scratch/user/libhsa-runtime64.so.1" | cut -d' ' -f1)
+IREE_HAL_AMDGPU_LIBHSA_PATH=$scratch/user/libhsa-runtime64.so.1 ONEBIT_HRX_NO_TRIO_OK=1 \
     run "$scratch/user.json" --device hrx --hrx-cwsr-placement off
 check "user env: the backend gets the runtime the user named" \
-    'env_is "$scratch/user.json" "{\"libhsa\": \"$scratch/user-libhsa-runtime64.so.1\"}"'
+    'env_is "$scratch/user.json" "{\"libhsa\": \"$scratch/user/libhsa-runtime64.so.1\"}"'
 check "user env: serve names that runtime and its sha256" \
-    'grep -qx "1bit serve: HRX: HSA runtime $scratch/user-libhsa-runtime64.so.1 sha256 $want_user" "$scratch/user.json.log"'
-IREE_HAL_AMDGPU_LIBHSA_PATH=$scratch/user-libhsa-runtime64.so.1 ONEBIT_HRX_NO_TRIO_OK=1 \
+    'grep -qx "1bit serve: HRX: HSA runtime $scratch/user/libhsa-runtime64.so.1 sha256 $want_user" "$scratch/user.json.log"'
+IREE_HAL_AMDGPU_LIBHSA_PATH=$scratch/user/libhsa-runtime64.so.1 ONEBIT_HRX_NO_TRIO_OK=1 \
     run "$scratch/both.json" --device hrx --hrx-cwsr-placement off --hrx-libhsa "$scratch/fake-libhsa-runtime64.so.1"
 check "--hrx-libhsa beats the user's env" \
     'env_is "$scratch/both.json" "{\"libhsa\": \"$scratch/fake-libhsa-runtime64.so.1\"}"'
 check "--hrx-libhsa beats the user's env: the log names the option's file" \
     'grep -qx "1bit serve: HRX: HSA runtime $scratch/fake-libhsa-runtime64.so.1 sha256 $want" "$scratch/both.json.log"'
 
+# A value that is not the absolute path of a libhsa-runtime64.so* file is not used (serve hashes the file the variable
+# names, so it is checked first: CodeQL cpp/path-injection), and serve says so instead of ignoring it silently.
+for bad in "user/libhsa-runtime64.so.1" "$scratch/user/../user/libhsa-runtime64.so.1" "$scratch/plain.gguf" "$scratch/nope/libhsa-runtime64.so.1"; do
+    IREE_HAL_AMDGPU_LIBHSA_PATH=$bad ONEBIT_HRX_NO_TRIO_OK=1 run "$scratch/bad.json" --device hrx --hrx-cwsr-placement off
+    check "user env '$bad': not used" '! grep -q "HSA runtime $bad" "$scratch/bad.json.log"'
+    check "user env '$bad': serve says it is not used" \
+        'grep -q "IREE_HAL_AMDGPU_LIBHSA_PATH=$bad is not used" "$scratch/bad.json.log"'
+done
+
 # The plan --print-backend-env hands a caller (scripts/lemonade-hrx) carries the option's runtime too: that caller
 # starts the backend with its own environment plus these lines, so a user value dropped here would win there.
-IREE_HAL_AMDGPU_LIBHSA_PATH=$scratch/user-libhsa-runtime64.so.1 ONEBIT_HRX_NO_TRIO_OK=1 "$bin" serve -m "$scratch/plain.gguf" \
+IREE_HAL_AMDGPU_LIBHSA_PATH=$scratch/user/libhsa-runtime64.so.1 ONEBIT_HRX_NO_TRIO_OK=1 "$bin" serve -m "$scratch/plain.gguf" \
     --device hrx --hrx-cwsr-placement off --no-mem-check --print-backend-env \
     --hrx-libhsa "$scratch/fake-libhsa-runtime64.so.1" > "$scratch/plan.env" 2>&1
 check "--print-backend-env: --hrx-libhsa is in the plan despite the user's env" \

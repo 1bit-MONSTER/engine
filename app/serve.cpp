@@ -238,12 +238,32 @@ struct Options {
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
+// A user-set IREE_HAL_AMDGPU_LIBHSA_PATH, when it names an HSA runtime: an absolute path with no "..", to a regular
+// file whose name is libhsa-runtime64.so*. serve hashes the file it names (announce_hrx_runtime), so the value is
+// checked before anything opens it (CodeQL cpp/path-injection); any other value is not used, and said so once.
+std::string user_libhsa() {
+    const char* v = std::getenv("IREE_HAL_AMDGPU_LIBHSA_PATH");
+    if (!v || !*v) return "";
+    const fs::path p = fs::path(v).lexically_normal();
+    bool ok = p.is_absolute() && p.filename().string().rfind("libhsa-runtime64.so", 0) == 0;
+    for (const auto& part : fs::path(v)) ok = ok && part != "..";   // as written, before normalising it away
+    std::error_code ec;
+    if (ok && fs::is_regular_file(p, ec)) return p.string();
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        std::fprintf(stderr, "1bit serve: HRX: IREE_HAL_AMDGPU_LIBHSA_PATH=%s is not used: it must be the absolute path "
+                             "of an existing libhsa-runtime64.so* file\n", v);
+    }
+    return "";
+}
+
 // PM4-emulation probe, so HRX registers no device (docs/hrx.md). Use, in order:
 // --hrx-libhsa, a user-set IREE_HAL_AMDGPU_LIBHSA_PATH (docs/serve.md: serve keeps it, engine#3314),
 // the build's TheRock copy, or the first one under /opt/rocm-therock.
 std::string hrx_libhsa(const std::string& option) {
     if (!option.empty()) return option;
-    if (const char* user = std::getenv("IREE_HAL_AMDGPU_LIBHSA_PATH"); user && *user) return user;
+    if (std::string user = user_libhsa(); !user.empty()) return user;
 #ifdef ONEBIT_HRX_LIBHSA
     if (fs::exists(ONEBIT_HRX_LIBHSA)) return ONEBIT_HRX_LIBHSA;
 #endif

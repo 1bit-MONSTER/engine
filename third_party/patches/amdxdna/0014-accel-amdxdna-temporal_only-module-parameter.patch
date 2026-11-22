@@ -1,0 +1,64 @@
+From 5ef46abc06f716332f5515ceea2c61f98239a525 Mon Sep 17 00:00:00 2001
+From: bong-water-water-bong <bong-water-water-bong@1bit.gg>
+Date: Sun, 22 Nov 2026 12:59:31 -0400
+Subject: [PATCH] accel/amdxdna: temporal_only module parameter (default
+ unchanged)
+
+On firmware protocol >= 6.12 the NPU4/NPU5 feature table sets AIE2_TEMPORAL_ONLY, and
+aie2_alloc_resource() then turns every hardware context into a full-array partition at column 0
+whatever num_tiles it asked for, so two processes can never use the NPU at once (a second
+client is refused by 0003's owner check).
+
+temporal_only (int, 0400): -1 = follow the firmware feature table (default: the module behaves
+exactly as before), 0 = place each context on its own naturally aligned column range (spatial
+partitions), 1 = always full array. 0003's owner check ("never share an array partition between
+two clients") is kept: with spatial placement a second client gets a free disjoint range from
+get_free_partition(), and only sharing another client's tiles stays refused.
+
+Port of 1bit-MONSTER/xdna-driver pin/ca385d85-1bit 3449dd8d (the change measured on the old
+strixhalo dev box: 1 h two-process 4+4 soak, 37/37 rounds, 2026-11-16) onto pin 526c6081 +
+0001-0009. Same logic; the parameter is declared next to aie2_alloc_resource() instead of after
+tdr_timeout_ms, so test-only/restart-fault-injection.patch, which adds its own parameters there,
+still applies on top of the series.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/amdxdna/aie2_ctx.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/accel/amdxdna/aie2_ctx.c b/drivers/accel/amdxdna/aie2_ctx.c
+index 6b8653a7..d902de07 100644
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -653,6 +653,18 @@ static int aie2_hwctx_col_list(struct amdxdna_hwctx *hwctx)
+ 	return 0;
+ }
+ 
++/*
++ * Firmware protocol >= 6.12 on NPU4/NPU5 sets AIE2_TEMPORAL_ONLY, which makes every hardware context a
++ * full-array partition at column 0 whatever num_tiles it asked for, so contexts can only time-share the
++ * array. temporal_only overrides that per load: -1 follows the firmware feature table (default, unchanged
++ * behaviour), 0 places each context on its own naturally aligned column range (spatial partitions: two
++ * 4-column contexts can run side by side), 1 forces full-array placement on any firmware.
++ * Cross-client sharing of one partition stays forbidden either way (allocate_partition() owner check).
++ */
++static int temporal_only = -1;
++module_param(temporal_only, int, 0400);
++MODULE_PARM_DESC(temporal_only, "-1: per firmware feature table (default), 0: spatial column partitions, 1: always full array");
++
+ static int aie2_alloc_resource(struct amdxdna_hwctx *hwctx)
+ {
+ 	struct amdxdna_dev *xdna = hwctx->client->xdna;
+@@ -664,7 +676,8 @@ static int aie2_alloc_resource(struct amdxdna_hwctx *hwctx)
+ 	if (!xrs_req)
+ 		return -ENOMEM;
+ 
+-	if (AIE_FEATURE_ON(&xdna->dev_handle->aie, AIE2_TEMPORAL_ONLY)) {
++	if (temporal_only > 0 ||
++	    (temporal_only < 0 && AIE_FEATURE_ON(&xdna->dev_handle->aie, AIE2_TEMPORAL_ONLY))) {
+ 		xrs_req->cdo.start_cols = &temporal_only_col;
+ 		xrs_req->cdo.cols_len = 1;
+ 		xrs_req->cdo.ncols = xdna->dev_handle->total_col;
+-- 
+2.53.0
+

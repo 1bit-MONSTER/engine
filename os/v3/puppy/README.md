@@ -153,6 +153,28 @@ os/v3/puppy/build.sh resolute64 <kernel-out-dir> <puppy-out-dir> [woof-CE-dir]
 os/v3/puppy/sb-vars.sh <work>/vars.fd    # what vm-check.sh runs for itself
 ```
 
+## Cutting a release image (`cut.sh`, engine#3287)
+
+`os/v3/puppy/cut.sh <engine build dir> <tag> <out dir>`, run from the engine tree that configured the build, is the cut:
+it re-packages the engine from that build (and refuses a build whose `1bit version` names another commit - reconfigure
+after a checkout), rebuilds Lemonade at the tree's pin, and assembles `lemonade-onebit-<tag>/` from those two **in the
+same run**, so a re-roll cannot leave a stale staged payload behind. The image is built from woof-CE
+(`WOOF=<woof-CE> KERNEL_DIR=<dir>`, through `build.sh`) or, without woof-CE, by patching a released base
+(`BASE=<osfiles dir>`, through `patch-sfs.sh`; `BUILT-FROM.txt` then says the base layers were not rebuilt). `ESP=`
+names the signed shim chain mkimage embeds.
+
+Before anything is kept, `image-probe.sh <img> --payload <dir> --tag <tag>` opens the image's **own** filesystem
+(debugfs at the partition's byte offset and unsquashfs on the SFS file - no mount, no root, so "could not mount" is not a
+way to skip), checks `/1bit` against its `SHA256SUMS`, and compares `opt/1bit-package` with the payload tree byte for
+byte plus the release identity. Exit 0 pass, 1 mismatch, 2 could not look; the cut stops on anything but 0. Then
+`archive-image.sh` copies that exact image to `$ONEBIT_IMAGE_ARCHIVE/<tag>/` (default `~/release-archive`) with its
+sha256, the probe log and `BUILT-FROM.txt`, verifies the copy, and never overwrites a tag. Write the stick from the
+archived path; `image-probe.sh <archived img> --engine-sha <sha> --tag <tag>` re-checks it at any time.
+
+Measured 2026-11-22 on ryzen (engine main + #3313 + #3315, base v2026.47): the whole cut takes about 4 minutes from a
+built engine tree, the probe passes the result (130 payload files byte for byte), and against the tested c35 image
+(sha256 `562dd9b6...`) it passes c35's payload and fails (exit 1) a fresh build's.
+
 ## What runs in the image at boot
 
 PID 1 is not systemd: `/etc/rc.d/rc.services` runs every **executable** script in `/etc/init.d` with

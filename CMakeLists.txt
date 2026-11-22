@@ -2455,6 +2455,11 @@ add_test(NAME pack_origin_rpath COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_orig
 # patch-sfs needs uid/gid and setuid bits - this is the only test here that does, hence the property.
 add_test(NAME patch_sfs_atomic COMMAND ${CMAKE_SOURCE_DIR}/tests/patch_sfs_atomic_test.sh)
 set_tests_properties(patch_sfs_atomic PROPERTIES SKIP_RETURN_CODE 77)
+# The pre-write probe and the image archive (engine#3287): image-probe.sh passes only an image whose own filesystem
+# carries the payload just built, fails a stale one, and refuses (non-zero) whenever it cannot look; archive-image.sh
+# keeps the exact bytes with their hash and never overwrites a tag. A miniature image, built as an ordinary user.
+add_test(NAME image_probe COMMAND bash ${CMAKE_SOURCE_DIR}/tests/image_probe_test.sh)
+set_tests_properties(image_probe PROPERTIES SKIP_RETURN_CODE 77)
 # build-static.sh must never print a quotable artifact hash for a tree that is not a commit (engine#1326, from
 # engine#1323's mis-quoted hash). The toolchain is stubbed inside the test - it is the provenance line under test,
 # not the compile - so this costs milliseconds and needs no rustup, no musl target and no network.

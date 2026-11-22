@@ -63,6 +63,19 @@ for b in node npm npx corepack; do
     [ -f "$w" ] && [ ! -L "$w" ] && [ "$(stat -c %a "$w")" = 755 ] && grep -qx "exec /usr/local/lib/nodejs/bin/$b \"\$@\"" "$w" || ok=1
 done
 check $ok "node, npm, npx, corepack are 0755 exec wrappers (regular files) into the tree"
+# engine#3310 follow-up: Puppy's /etc/profile exports PREFIX=/usr, which moves npm's global config to /usr/etc/npmrc and
+# its global prefix to /usr (RAM on a stick). npm and npx name the global config themselves, a caller's own wins.
+ok=0
+for b in npm npx; do
+    g=$(PREFIX=/usr; unset npm_config_globalconfig; eval "$(grep '^export npm_config_globalconfig=' "$t/root/usr/local/bin/$b")"; echo "${npm_config_globalconfig:-}")
+    [ "$g" = /usr/local/lib/nodejs/etc/npmrc ] || ok=1
+    g=$(npm_config_globalconfig=/elsewhere/npmrc; eval "$(grep '^export npm_config_globalconfig=' "$t/root/usr/local/bin/$b")"; echo "$npm_config_globalconfig")
+    [ "$g" = /elsewhere/npmrc ] || ok=1
+done
+check $ok "npm and npx name /usr/local/lib/nodejs/etc/npmrc as the global config (PREFIX=/usr cannot move it), a caller's own wins"
+! grep -q npm_config_globalconfig "$t/root/usr/local/bin/node" "$t/root/usr/local/bin/corepack"
+check $? "node and corepack wrappers stay plain exec wrappers"
+sh -n "$t/root/usr/local/bin/npm" && sh -n "$t/root/usr/local/bin/npx"; check $? "the npm and npx wrappers parse as sh"
 [ -z "$(find "$t/root" \( -perm -0020 -o -perm -0002 \) ! -type l)" ]; check $? "nothing staged is group- or other-writable"
 [ "$(wc -l < "$t/man")" = 5 ] && grep -q "^usr/local/lib/nodejs	$n\$" "$t/man" && grep -q "^usr/local/bin/npm	.*	755\$" "$t/man"
 check $? "--manifest prints the five patch-sfs lines (the tree, four wrappers with mode 755)"

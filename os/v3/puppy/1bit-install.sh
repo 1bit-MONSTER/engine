@@ -204,7 +204,9 @@ gcfg=$ESP_MOUNT/EFI/BOOT/grub.cfg
 [ -f "$gcfg" ] || fail "the copied ESP has no EFI/BOOT/grub.cfg"
 sed -i \
     -e "s|search --no-floppy --label 1BIT-DATA --set=root|search --no-floppy --fs-uuid $datauuid --set=root|" \
+    -e "s|search --no-floppy --fs-uuid [0-9a-fA-F-]* --set=root|search --no-floppy --fs-uuid $datauuid --set=root|" \
     -e "s|pupsfs=1BIT-DATA|pupsfs=UUID=$datauuid 1bit.data=UUID=$datauuid|g" \
+    -e "s|pupsfs=UUID=[0-9a-fA-F-]* 1bit.data=UUID=[0-9a-fA-F-]*|pupsfs=UUID=$datauuid 1bit.data=UUID=$datauuid|g" \
     -e "s|pfix=copy|pfix=nocopy|g" \
     "$gcfg" >> "$LOG" 2>&1 || fail "could not point grub.cfg at this disk"
 grep -q "search --no-floppy --fs-uuid $datauuid --set=root" "$gcfg" || fail "grub.cfg does not search this disk's UUID"

@@ -122,7 +122,13 @@ mm=${MOK_MANAGER:-/usr/lib/shim/mmx64.efi}
 # whose 32-entry PRP list the driver over-reads: on this box that was 2-83 IO_PAGE_FAULTs/h, and 0 after 7 h with the
 # quirk (engine#2478). It belongs in the kernel's `nvme_id_table`; until that kernel build carries the entry, the boot
 # line is what makes any machine with this SSD quiet, and an image without it faults on its own hardware.
-setcmd="pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0 log_buf_len=32M nvme.quirks=1e49:1081:dmapool_align_512"
+# engine#3287: the stick finds ITS OWN data partition by UUID, never by label. A machine that already runs an installed
+# 1bit OS has a second 1BIT-DATA partition (the installed disk); measured on the AI MAX+ 395 (22 Nov), `search --label` and
+# pupsfs=1BIT-DATA resolved to the NVMe first, so a v2026.47-fixes stick booted the INSTALLED system's kernel, SFS and save
+# layer with only /data on the stick (/etc/rc.d/PUPSTATE: PUPSFS='nvme0n1p2,...'). The UUID is chosen here, given to mkfs.ext4
+# below, and pinned in grub's search and on the command line, the same form 1bit-install writes for an installed disk.
+datauuid=${ONEBIT_STICK_DATA_UUID:-$(python3 -c 'import uuid; print(uuid.uuid4())')}
+setcmd="pmedia=usbhd pupsfs=UUID=$datauuid 1bit.data=UUID=$datauuid psubdir=1bit ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0 log_buf_len=32M nvme.quirks=1e49:1081:dmapool_align_512"
 cat > "$esp/EFI/BOOT/grub.cfg" <<GRUBCFG
 set timeout=8
 set default=0
@@ -131,7 +137,7 @@ set default=0
 serial --unit=0 --speed=115200
 terminal_input serial console
 terminal_output serial console
-search --no-floppy --label 1BIT-DATA --set=root
+search --no-floppy --fs-uuid $datauuid --set=root
 # The boot media is PINNED on the kernel command line: pupsfs=1BIT-DATA sets Puppy's PDRV, and with PDRV set
 # the init does not scan any drive at all (measured in the initrd: LOOK_PUP stays empty). Before this, the
 # 2 Nov board boot scanned the JetKVM's USB mass storage and the internal NVMe's ESP and could not settle on
@@ -239,7 +245,7 @@ need_mb=$(du -sm "$d" | cut -f1)
 [ "$need_mb" -lt "$data_mb" ] || {
     echo "$prog: REFUSED: the data partition would need ${need_mb} MB of ${data_mb} MB (raise data-mb)" >&2; exit 1; }
 rm -f "$work/data.part"
-mkfs.ext4 -q -F -L 1BIT-DATA -d "$d" "$work/data.part" $((data_mb))M
+mkfs.ext4 -q -F -L 1BIT-DATA -U "$datauuid" -d "$d" "$work/data.part" $((data_mb))M
 
 img=$out/1bit-os-puppy.img
 rm -f "$img"

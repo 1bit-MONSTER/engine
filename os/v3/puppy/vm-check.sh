@@ -938,14 +938,15 @@ rows = [
                      "n=$(wc -l < \"$p\" 2>/dev/null); echo \"proof-lines=${n:-0} missing=${miss:-none}\"; "
                      "[ -z \"$miss\" ] && [ \"${n:-0}\" -ge 20 ] && echo boot-proof-complete",
                      "boot-proof-complete"),
-    # (3) thermals are sampled ONLY while something is serving - so the two files must agree, and an idle box must
-    # not be writing a power log all day. Both directions are failures the row names.
-    ("U5 thermal gate", "eng=$(pgrep -f '/opt/1bit-package/1bit/1bit' 2>/dev/null | wc -l); "
-                     "d=$(1bit-logs dir 2>/dev/null); n=$(wc -l < \"$d/thermal.log\" 2>/dev/null || echo 0); "
-                     "echo \"engine-children=$eng thermal-lines=$n\"; "
-                     "if [ \"$eng\" -gt 0 ]; then [ \"$n\" -gt 0 ] && echo thermal-gate-consistent; "
-                     "else [ \"$n\" -eq 0 ] && echo thermal-gate-consistent; fi",
-                     "thermal-gate-consistent"),
+    # (3) engine#3421: the thermal log never goes dark - every 10 s while any process holds the GPU or NPU open
+    # (busy=<comm,...>), every 60 s when none does (busy=-). So a booted image has at least one line, and every line
+    # names its busy state; an empty log, or lines without busy=, is the old engine-only gate (blind to loom-serve,
+    # llama-server and /data/dev builds).
+    ("U5 thermal log", "d=$(1bit-logs dir 2>/dev/null); n=$(wc -l < \"$d/thermal.log\" 2>/dev/null || echo 0); "
+                     "nb=$(grep -vc ' busy=' \"$d/thermal.log\" 2>/dev/null); "
+                     "echo \"thermal-lines=$n without-busy=${nb:-0} last=$(tail -1 \"$d/thermal.log\" 2>/dev/null)\"; "
+                     "[ \"$n\" -gt 0 ] && [ \"${nb:-0}\" = 0 ] && echo thermal-log-alive",
+                     "thermal-log-alive"),
     # (4) the artifact a release is attached to: the bundle exists, names this boot, and lists the boot proof inside
     # it. tar -tf through zstd is the only proof that the archive is readable rather than merely present.
     ("U5 proof bundle", "o=$(1bit-proof 2>&1); printf '%s\\n' \"$o\" | tail -3; "

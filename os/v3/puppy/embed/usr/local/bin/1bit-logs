@@ -26,7 +26,8 @@
 #   xerrs.log                /tmp/xerrs.log, xwin's own capture of the X server
 #   lemond.log               /var/log/lemond-onebit.log
 #   webapp.log               /var/log/1bit-webapp.log
-#   thermal.log              Tctl / fan rpm / package W every 10 s, but ONLY while a model is loaded (cycle 25)
+#   thermal.log              Tctl / fan rpm / package W: every 10 s while the GPU or NPU is in use (any process with
+#                            /dev/kfd, /dev/accel/* or a DRI render node open, named in busy=), every 60 s otherwise
 #   BOOT                     date, kernel command line, uptime, release - what machine and entry this was
 #   pstore/                  the kernel's own records of the PREVIOUS shutdown or crash, from the board's EFI pstore
 #                            (engine#3287), plus a `pstore` line in markers saying what they show
@@ -34,6 +35,7 @@
 # Usage:
 #   1bit-logs dir            print (and create) this boot's directory
 #   1bit-logs snap [why]     append what is new in every source; `why` is written to the directory as a marker
+#   1bit-logs thermal <dir>  append one thermal.log line to <dir> (when the GPU/NPU is in use, or the first idle one)
 #   1bit-logs daemon         snap every 15 s and prune to the last five boots (that is what /etc/init.d/06onboard-logs runs)
 #   1bit-logs prune          keep only the five newest boot directories
 #   1bit-logs pstore [dir]   file the pstore records into this boot's directory (or dir) and clear them
@@ -180,13 +182,42 @@ model_loaded() {
     pgrep -f '/opt/1bit-package/1bit/1bit' > /dev/null 2>&1
 }
 
+# device_users: "comm,comm" of the processes holding the GPU or NPU open (/dev/kfd, /dev/accel/*, /dev/dri/renderD*),
+# empty when none. engine#3421: "a model is loaded" used to mean ONLY /opt/1bit-package/1bit/1bit running, so the board's
+# heaviest work - loom-serve, Lemonade's own llama-server backends, every test build under /data/dev - left no thermal
+# line (23 Nov: thermal.log stopped at 19:08Z while the box ran to 19:57Z with lane jobs on both devices). One ls over
+# /proc/*/fd, about 60 ms on the box; the daemon runs as root, so it sees every process. ONEBIT_PROC=<dir> reads another tree (the test).
+PROC=${ONEBIT_PROC:-/proc}
+device_users() {
+    # one `ls -l` over every fd directory (GNU and busybox alike; busybox find has no -lname). The extra /dev/null makes
+    # ls head each directory with "<dir>:" even when only one matches; awk turns a device link back into its pid.
+    users=
+    for pid in $(ls -l /dev/null "$PROC"/[0-9]*/fd 2> /dev/null | awk '
+            /:$/ { d = $0; sub(/\/fd:$/, "", d); sub(/.*\//, "", d); next }
+            / -> \/dev\/(kfd|accel\/|dri\/renderD)/ { if (d != "" && !(d in seen)) { seen[d] = 1; print d } }'); do
+        c=$(cat "$PROC/$pid/comm" 2> /dev/null) || continue
+        case ",$users," in *",$c,"*) ;; *) users=${users:+$users,}$c ;; esac
+    done
+    printf '%s' "$users"
+}
+
+# thermal_snap <dir>: a line every call (10 s) while something uses the GPU or NPU, else every 6th call (60 s), so the
+# record never goes dark: an idle hour is 60 lines, not a gap that looks like a dead logger.
+th_idle=0
 thermal_snap() {
     d=$1
-    model_loaded || return 0
+    b=$(device_users)
+    [ -z "$b" ] && model_loaded && b=1bit
+    if [ -z "$b" ]; then
+        th_idle=$((th_idle + 1))
+        [ $(( (th_idle - 1) % 6 )) = 0 ] || return 0
+    else
+        th_idle=0
+    fi
     t=$(tctl_c) || t="n/a"
     f=$(fan_rpm) || f="n/a"
     w=$(pkg_watts) || w="n/a"
-    printf '%s tctl_c=%s fan_rpm=%s pkg_w=%s\n' "$(date -u +%FT%TZ 2> /dev/null)" "$t" "$f" "$w" \
+    printf '%s tctl_c=%s fan_rpm=%s pkg_w=%s busy=%s\n' "$(date -u +%FT%TZ 2> /dev/null)" "$t" "$f" "$w" "${b:--}" \
         >> "$d/thermal.log" 2> /dev/null
     return 0
 }
@@ -302,6 +333,7 @@ case ${1:-} in
 '')           snap ;;
 dir)          dir ;;
 snap)         shift; snap "${1:-}" ;;
+thermal)      shift; thermal_snap "${1:?usage: 1bit-logs thermal <dir>}" ;;
 daemon)       daemon ;;
 prune)        prune ;;
 pstore)       shift; pstore "${1:-}" ;;

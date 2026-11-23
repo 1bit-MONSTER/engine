@@ -66,7 +66,7 @@ export HL_STATE=${HL_STATE:-$HL_BOX_DIR/state/hrx-$(basename "$MODEL" .gguf)}
 
 hl_levers
 hl_ship box_bench.sh benchmark.py
-hl_ticket bash "$RDIR/box_bench.sh" "$ROUT"
+hl_ticket --sudo bash "$RDIR/box_bench.sh" "$ROUT"   # sudo: on the appliance /dev/kfd is root:root 0600
 hl_fetch
 hl_exit_if_unreachable
 if [ -f "$RESULT_DIR/box/inferencex_result.json" ]; then

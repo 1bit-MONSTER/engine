@@ -17,9 +17,20 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <string>
+
+#if !defined(_WIN32)
+#include <spawn.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -30,6 +41,37 @@
 
 namespace onebit {
 namespace {
+
+// engine#3350 part 1 (option C): the appliance ships no Laya checkpoint and pulls it the first time a request is routed.
+// lemond starts this daemon with ONEBIT_LAYA_FETCH=<a fetcher> (10lemonade: /usr/local/bin/1bit-laya); when the
+// checkpoint is not there yet, the fetcher is run with `fetch <dir>` before the scorer loads. Its stdout goes to our
+// stderr: stdout is the one-JSON-line protocol lemond reads, and a stray line from curl would break the first answer.
+void fetch_laya_if_missing(const std::string& laya_model_arg) {
+    const char* fetcher = std::getenv("ONEBIT_LAYA_FETCH");
+    if (!fetcher || !*fetcher) return;
+    const std::string dir = laya_home(laya_model_arg);
+    if (dir.empty() || std::filesystem::exists(std::filesystem::path(dir) / "typed-decisions" / "model.safetensors")) return;
+#if !defined(_WIN32)
+    std::fprintf(stderr, "1bit route --serve: no Laya checkpoint in %s yet; pulling it with %s\n", dir.c_str(), fetcher);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, 2, 1);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    const std::string verb = "fetch";
+    char* argv[] = {const_cast<char*>(fetcher), const_cast<char*>(verb.c_str()), const_cast<char*>(dir.c_str()), nullptr};
+    pid_t pid = 0;
+    const int rc = posix_spawn(&pid, fetcher, &fa, nullptr, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) {
+        std::fprintf(stderr, "1bit route --serve: could not start %s: %s\n", fetcher, std::strerror(rc));
+        return;
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        std::fprintf(stderr, "1bit route --serve: %s fetch %s did not complete (status %d)\n", fetcher, dir.c_str(), status);
+#endif
+}
 
 double ms_between(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -53,6 +95,7 @@ std::string route_json_line(const std::string& cls, float confidence, const std:
 
 int run_route_serve(const std::string& laya_model_arg, const std::vector<std::string>& devices,
                     const std::string& policy_path) {
+    fetch_laya_if_missing(laya_model_arg);
     // Same resolution chain as the one-shot command and `serve --laya` (app/laya_checkpoint.h).
     const std::string laya_model = laya_checkpoint(laya_model_arg);
 

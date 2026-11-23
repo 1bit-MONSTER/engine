@@ -35,6 +35,7 @@ etc/sysctl.d/*-1bit-*
 etc/udev/rules.d/*-1bit-*
 etc/xdg/autostart/1bit-*
 etc/1bit/release-owned
+etc/1bit/laya-files
 etc/1bit/release-identity
 etc/1bit/onebit-models.txt
 etc/1bit/base-modes-keep

@@ -1,0 +1,111 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-laya fetch [<dir>]     pull the pinned Laya checkpoint (/etc/1bit/laya-files) into <dir> (default /data/laya)
+# 1bit-laya register          register the router collection `1bit laya-first` emits (user.Laya-First) with Lemonade
+# 1bit-laya status [<dir>]    say whether the checkpoint is complete and the router registered
+#
+# engine#3350 part 1, option C (orchestrator, 23 Nov): the image does not carry Laya (808 MB, +776 MB on the SFS);
+# the appliance pulls it the first time a request is routed. 10lemonade sets LEMONADE_LAYA_MODEL=/data/laya and
+# ONEBIT_LAYA_FETCH=this script, so lemond's Laya daemon (`1bit route --serve`) runs `1bit-laya fetch` when the
+# checkpoint is not there yet, and registers the router once lemond answers. Until the pull is done, routed requests
+# fall through to the policy's default model, as a scorer that is down does.
+#
+# fetch: one lock, so a restarted daemon waits for the running pull instead of starting a second one; each file is
+# downloaded to <file>.partial (resumed after an interruption), checked against its sha256 and size, and only then
+# moved into place; a file already present and correct is not downloaded again. Nothing outside <dir> is written.
+#
+# ONEBIT_LAYA_URL=<base> fetches from <base>/<path> instead of https://huggingface.co/<repo>/resolve/<revision>
+# (the test uses file://), ONEBIT_LAYA_FILES=<list> reads another list, ONEBIT_LEMONADE_URL / LEMONADE_API_KEY as
+# 1bit-heavy. Exit: 0 done, 1 failed (said why), 64 usage.
+set -u
+prog=1bit-laya
+list=${ONEBIT_LAYA_FILES:-/etc/1bit/laya-files}
+cmd=${1:-}; [ $# -gt 0 ] && shift
+
+repo() { sed -n 's/^repo //p' "$list" | head -1; }
+revision() { sed -n 's/^revision //p' "$list" | head -1; }
+files() { grep -E '^[0-9a-f]{64} [0-9]+ [^ ]+$' "$list"; }
+
+complete() {  # <dir>: 0 when every listed file is present with its size (the cheap check status uses)
+    files | while read -r sha size path; do
+        [ "$(stat -c %s "$1/$path" 2> /dev/null)" = "$size" ] || { echo missing; break; }
+    done | grep -q missing && return 1
+    return 0
+}
+
+fetch() {
+    dir=${1:-/data/laya}
+    [ -r "$list" ] || { echo "$prog: no pinned file list $list" >&2; return 1; }
+    command -v curl > /dev/null || { echo "$prog: needs curl" >&2; return 1; }
+    base=${ONEBIT_LAYA_URL:-https://huggingface.co/$(repo)/resolve/$(revision)}
+    mkdir -p "$dir" || return 1
+    exec 9> "$dir/.fetch.lock"
+    flock 9 || { echo "$prog: cannot lock $dir/.fetch.lock" >&2; return 1; }
+    n=0 got=0
+    while read -r sha size path; do
+        n=$((n + 1))
+        f=$dir/$path
+        if [ "$(stat -c %s "$f" 2> /dev/null)" = "$size" ] && [ "$(sha256sum "$f" | cut -c1-64)" = "$sha" ]; then continue; fi
+        mkdir -p "$(dirname "$f")"
+        echo "$prog: pulling $path ($size B) from $base" >&2
+        if ! curl -fsSL --retry 3 -C - -o "$f.partial" "$base/$path"; then
+            # a finished .partial makes curl's resume answer 416: that is not a failure, the checksum decides
+            [ "$(stat -c %s "$f.partial" 2> /dev/null)" = "$size" ] || { echo "$prog: FAILED to download $path" >&2; return 1; }
+        fi
+        if [ "$(sha256sum "$f.partial" | cut -c1-64)" != "$sha" ]; then
+            rm -f "$f.partial"
+            echo "$prog: FAILED: $path does not match its pinned sha256 ($sha); removed, nothing put in place" >&2
+            return 1
+        fi
+        mv -f "$f.partial" "$f" && got=$((got + 1))
+    done << EOF
+$(files)
+EOF
+    echo "$prog: $dir holds the pinned Laya checkpoint ($(repo)@$(revision | cut -c1-12), $n files, $got pulled now)" >&2
+    return 0
+}
+
+register() {
+    url=${ONEBIT_LEMONADE_URL:-http://127.0.0.1:${LEMONADE_PORT:-13300}}
+    bin=${ONEBIT_BIN:-$(command -v 1bit 2> /dev/null || echo /opt/1bit-package/1bit/1bit)}
+    auth=; [ -n "${LEMONADE_API_KEY:-}" ] && auth="Authorization: Bearer $LEMONADE_API_KEY"
+    policy=$("$bin" laya-first 2> /dev/null) || { echo "$prog: $bin laya-first printed no policy" >&2; return 1; }
+    name=$(printf '%s' "$policy" | sed -n 's/.*"model_name": *"\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$name" ] || { echo "$prog: the policy names no model_name" >&2; return 1; }
+    w=0
+    until curl -sf -m 3 ${auth:+-H "$auth"} "$url/api/v1/health" > /dev/null 2>&1; do
+        w=$((w + 2)); [ "$w" -gt "${ONEBIT_LAYA_WAIT:-180}" ] && { echo "$prog: Lemonade did not answer at $url" >&2; return 1; }
+        sleep 2
+    done
+    if curl -sf -m 10 ${auth:+-H "$auth"} "$url/api/v1/models?show_all=true" 2> /dev/null | grep -q "\"$name\""; then
+        echo "$prog: $name is already registered" >&2; return 0
+    fi
+    code=$(printf '%s' "$policy" | curl -s -m 30 -o /dev/null -w '%{http_code}' ${auth:+-H "$auth"} \
+        -H 'Content-Type: application/json' --data-binary @- "$url/api/v1/models/register")
+    [ "$code" = 200 ] || { echo "$prog: registering $name answered $code" >&2; return 1; }
+    echo "$prog: registered $name" >&2
+}
+
+case $cmd in
+    fetch) fetch "$@" ;;
+    register) register ;;
+    status)
+        d=${1:-/data/laya}
+        if complete "$d"; then echo "checkpoint: complete in $d"; else echo "checkpoint: not (fully) pulled into $d"; fi ;;
+    -h|--help|'') sed -n '/^# 1bit-laya fetch/,/^# 1bit-laya status/p' "$0" | sed 's/^# \{0,1\}//'; [ -n "$cmd" ] || exit 64 ;;
+    *) echo "$prog: unknown command $cmd" >&2; exit 64 ;;
+esac

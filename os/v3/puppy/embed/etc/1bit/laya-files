@@ -1,0 +1,27 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# engine#3350 part 1 (option C): the Laya checkpoint the appliance pulls on its first routed request. Exactly the
+# files `1bit route --serve` loads (laya::Scorer: typed-decisions/{model.safetensors, rl_agent_config.json,
+# tokenizer/tokenizer.json}, plus the two small configs beside them), at config/laya.json's revision, checked by
+# sha256 before they are put in place. tests/laya_fetch_test.sh fails when repo/revision drift from config/laya.json.
+# 808 MB; Apache-2.0 (the checkpoint's own licence).
+repo convaiinnovations/laya
+revision fd4f9dbcf4fde222fd43174bdd4c3b08b789e4e1
+5268d24ad3b77c8151de5dcb0762ba4391619aad9ab0bda33e36fb083cfeae6d 2084 typed-decisions/encoder/config.json
+4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e 842609220 typed-decisions/model.safetensors
+ebf0cd524d92342a6be5e48e9fca3d7c2babfb5a56ccd79d2171ef5d8c7f7be8 847 typed-decisions/rl_agent_config.json
+6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30 3583228 typed-decisions/tokenizer/tokenizer.json
+08d4cf3ac4dca381759441b85b91a6d40e688471dcd33d15d6649eb0a9a854d1 337 typed-decisions/tokenizer/tokenizer_config.json

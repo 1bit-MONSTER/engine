@@ -35,9 +35,14 @@
 # writes a trace line in pieces). The walk uses builtins (only `sleep`, and `tr` when the step changes, are forked);
 # it never blocks rc.shutdown and ends when <pid> does.
 #
+# v2 (engine#3287, after the 23 Nov reboot went silent for 233 s): the step's name comes from /proc/<pid>/comm (no lock
+# on the target) with its arguments only if they read within a second, the wait between scans is a shell builtin,
+# every 15 s it says it is alive and where rc.shutdown is, and a SIGTERM/SIGHUP/SIGINT (rc.shutdown's kill loop) is
+# logged before it exits - so the next stall shows whether the step, the watcher or both stopped.
+#
 # ONEBIT_KMSG=<file> and ONEBIT_PROC=<dir> point it at a fake kernel log and /proc (the test); with ONEBIT_KMSG set
 # it leaves the printk settings alone. ONEBIT_WATCH_TICKS=<n> stops it after n seconds, ONEBIT_WATCH_FIRST=<s> reports
-# a step still running after s seconds instead of 10 (the test).
+# a step still running after s seconds instead of 10, ONEBIT_WATCH_HEARTBEAT=<s> the heartbeat period (the test).
 set -u
 root=${1:?usage: 1bit-shutdown-watch <pid>}
 K=${ONEBIT_KMSG:-/dev/kmsg}
@@ -65,15 +70,38 @@ child_of() {
         if [ -z "$kid" ] || [ "$c" -gt "$kid" ]; then kid=$c; fi
     done
 }
-# cmd=<the command line of $1>, or [comm] for a kernel thread; only run when the step changes
+# cmd=<what $1 runs>: its comm (a builtin read, no lock on the target), then its arguments when they can be read in a
+# second. Reading /proc/<pid>/cmdline takes the target's mmap lock, so a process stuck in exit would block a plain read
+# - and with it this watcher, which is how the 23 Nov stall went silent for 233 s (engine#3287).
 cmd_of() {
-    cmd=$(tr '\0' ' ' < "$P/$1/cmdline" 2> /dev/null)
-    cmd=${cmd% }
-    [ -n "$cmd" ] || { IFS= read -r cmd < "$P/$1/comm" 2> /dev/null || cmd='?'; cmd="[$cmd]"; }
+    cmd='?'; IFS= read -r cmd < "$P/$1/comm" 2> /dev/null || cmd='?'
+    if [ -n "$tmo" ]; then
+        _a=$(timeout 1 tr '\0' ' ' < "$P/$1/cmdline" 2> /dev/null); _a=${_a% }
+        [ -n "$_a" ] && cmd=$_a
+    fi
 }
+# tick: wait a second with a shell builtin where the shell has one (busybox ash: `read -t` on a pipe nobody writes),
+# so a stalled exec cannot stop the watcher too; else (dash, the test) `sleep 1`.
+tmo=; command -v timeout > /dev/null 2>&1 && tmo=1
+tick() { sleep 1; }
+( read -t 0 _x < /dev/null ) 2> /dev/null
+if [ $? -ne 2 ]; then
+    _f=${TMPDIR:-/tmp}/1bit-shutdown-watch.$$
+    if mkfifo "$_f" 2> /dev/null && exec 3<> "$_f"; then
+        rm -f "$_f"
+        tick() { read -t 1 _x <&3 2> /dev/null; return 0; }
+    fi
+fi
 
+# rc.shutdown's last loop kills every process using the save partition, and this is one: say so, so a silence after
+# this line is the stall and not the watcher's death
+cmd='?'
+trap 'say "watcher got SIGTERM while rc.shutdown was in ${last:-?} ($cmd)"; exit 0' TERM
+trap 'say "watcher got SIGHUP while rc.shutdown was in ${last:-?} ($cmd)"; exit 0' HUP
+trap 'say "watcher got SIGINT while rc.shutdown was in ${last:-?} ($cmd)"; exit 0' INT
+hb=${ONEBIT_WATCH_HEARTBEAT:-15}
 say "watching rc.shutdown $root"
-last= since=0 next=$first n=0
+last= since=0 next=$first n=0 beat=0
 while [ -d "$P/$root" ]; do
     leaf=$root
     while :; do child_of "$leaf"; [ -n "$kid" ] || break; leaf=$kid; done
@@ -93,8 +121,16 @@ while [ -d "$P/$root" ]; do
             next=$((next * 2))
         fi
     fi
+    beat=$((beat + 1))
+    if [ "$beat" -ge "$hb" ]; then
+        s=?; IFS= read -r line < "$P/$leaf/stat" 2> /dev/null && { s=${line##*) }; s=${s%% *}; }
+        w=; IFS= read -r w < "$P/$leaf/wchan" 2> /dev/null || [ -n "$w" ] || w=?
+        c=?; IFS= read -r c < "$P/$leaf/comm" 2> /dev/null || c=?
+        say "alive: rc.shutdown in $leaf [$c], state $s, wchan ${w:-0}"
+        beat=0
+    fi
     n=$((n + 1)); [ "$ticks" -gt 0 ] && [ "$n" -ge "$ticks" ] && exit 0
-    sleep 1
+    tick
 done
 say "rc.shutdown $root finished"
 exit 0

@@ -31,6 +31,7 @@ The shipped table holds only models that passed the gate below (each entry's `ga
 | `qwen2.5-coder-1.5b-instruct-q4_k_m` | [1bit-MONSTER/Qwen2.5-Coder-1.5B-Instruct-GGUF-loom](https://huggingface.co/1bit-MONSTER/Qwen2.5-Coder-1.5B-Instruct-GGUF-loom) | engine#3158 |
 | `qwen2.5-coder-7b-instruct-q4_k_m` | [1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom](https://huggingface.co/1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom) | engine#3158 |
 | `qwen38-27b-ud-q4-k-xl` | [loom-fun/unsloth-Qwen3.8-27B-UD-Q4_K_XL](https://huggingface.co/loom-fun/unsloth-Qwen3.8-27B-UD-Q4_K_XL) @ `3e43d41d` | engine#3158 |
+| `inkling-2-mini-ud-q4_k_xl` | [loom-fun/unsloth-Inkling-2-Mini-loom](https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom) @ `4e018e88` (r8) | engine#3158 (no fallback arm: Loom vs the CPU arbiter). On 1bit OS the payload carries the card (`os/v3/puppy/loom-cards.pin`) and the catalogue entry `Inkling-2-Mini-1bit` pulls the model plus the DSpark drafter as `dspark-Inkling-2-Mini-Q8_0_Old.gguf`, which serve links by the card lock's sha256 |
 
 An entry takes effect only where its card is installed (below) and `loom-serve` is available (hrx-loom; on PATH,
 or `--loom-serve PATH` / `ONEBIT_LOOM_SERVE`); without the card the entry is skipped, with one line naming why, and

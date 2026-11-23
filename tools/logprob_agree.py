@@ -344,6 +344,30 @@ def request_body(model, prompt, max_tokens, top_logprobs, thinking=False, minima
 REASONING_SEP = "\n<<answer>>\n"
 
 
+def reply_reasoning(message):
+    """The reply's reasoning, from either field name a server uses (one helper, so the JSON records what was compared)."""
+    return message.get("reasoning_content") or message.get("reasoning") or ""
+
+
+def reasoning_one_sided(routes):
+    """--with-reasoning: the prompts where some routes carry reasoning and others carry none.
+
+    Such a pair cannot be scored by joined text. If one server parses the thinking out (`reasoning_content`) and the
+    other leaves it inline in `content`, the joined texts differ at character 0, a split that never happened. If one
+    model simply did not think, the turns differ (docs/loom-route.md: that voids a thinking-on row). Either way the
+    run reports it as an error instead of a score (cl-nvfp4 review, #3386).
+    """
+    out = []
+    labels = sorted(routes)
+    n = min((len(routes[l]) for l in labels), default=0)
+    for k in range(n):
+        has = {l: any(r.get("reasoning") for r in routes[l][k]["runs"]) for l in labels}
+        if len(set(has.values())) > 1:
+            out.append("prompt %d: reasoning from %s only (none from %s): not scored by joined text"
+                       % (k, ", ".join(l for l in labels if has[l]), ", ".join(l for l in labels if not has[l])))
+    return out
+
+
 def reply_text(message, with_reasoning=False):
     """The text a run is compared on: the answer `content`, or with --with-reasoning the reasoning, then the answer.
 
@@ -355,7 +379,7 @@ def reply_text(message, with_reasoning=False):
     content = message.get("content") or ""
     if not with_reasoning:
         return content
-    return (message.get("reasoning_content") or message.get("reasoning") or "") + REASONING_SEP + content
+    return reply_reasoning(message) + REASONING_SEP + content
 
 
 def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False, minimal=False, with_reasoning=False):
@@ -383,7 +407,7 @@ def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False, m
         toks.append({"id": tk.get("id"), "token": tk.get("token"), "lp": tk.get("logprob"), "top": top})
     return {
         "text": reply_text(ch.get("message") or {}, with_reasoning),
-        "reasoning": (ch.get("message") or {}).get("reasoning_content") or "",
+        "reasoning": reply_reasoning(ch.get("message") or {}),
         "tokens": toks,
         "have_logprobs": bool(toks),
         "secs": round(time.time() - t, 3),
@@ -734,6 +758,15 @@ def selftest():
     ok(reply_text({"content": "same", "reasoning_content": "a"}, True)
        != reply_text({"content": "same", "reasoning_content": "b"}, True),
        "reply_text: two equal answers after different reasoning differ under --with-reasoning")
+    # reasoning_one_sided: one route parsed the thinking out, the other returned none -> an error, never a score
+    run = lambda r: {"runs": [{"reasoning": r}]}
+    ok(reasoning_one_sided({"loom": [run("t"), run("")], "cpu": [run("t"), run("t")]})
+       == ["prompt 1: reasoning from cpu only (none from loom): not scored by joined text"]
+       and reasoning_one_sided({"loom": [run("a")], "cpu": [run("b")]}) == []
+       and reasoning_one_sided({"loom": [run("")], "cpu": [run("")]}) == [],
+       "reasoning_one_sided: flags only the prompts where the routes disagree on carrying reasoning")
+    ok(reply_reasoning({"reasoning": "r"}) == "r" and reply_reasoning({"reasoning_content": "c", "reasoning": "r"}) == "c",
+       "reply_reasoning: reasoning_content first, then reasoning (the same field the JSON records)")
     ok(effective_match_by("id", True, False) == "text" and effective_match_by("id", False, False) == "text",
        "effective_match_by: one route without ids degrades the pair to text instead of reporting total divergence")
     # both routes answering with NO content is not agreement: with thinking on and a small --max-tokens a route can
@@ -785,7 +818,9 @@ def main(argv=None):
     p.add_argument("--with-reasoning", action="store_true",
                    help="compare each reply's reasoning_content followed by its answer, not the answer alone: with "
                         "thinking on, two routes can give the same answer in different words after splitting inside "
-                        "the thinking, and only the joined text shows where")
+                        "the thinking, and only the joined text shows where. It changes the TEXT comparison only: "
+                        "two routes that both return log-probs under --match-by id are still decided by their id "
+                        "streams. A prompt where some routes return reasoning and others none is an error, not a score")
     p.add_argument("--timeout", type=float, default=300.0)
     p.add_argument("--json", default=None, help="write the full report here")
     p.add_argument("--selftest", action="store_true", help="check the comparison logic and exit")
@@ -848,6 +883,8 @@ def main(argv=None):
                 break
             per_prompt.append({"prompt": prompt, "runs": runs})
         report["routes"][label] = per_prompt
+    if a.with_reasoning:
+        report["errors"].extend(reasoning_one_sided(report["routes"]))
 
     failed = False
     print("\n--- determinism (one route, identical request repeated) ---")

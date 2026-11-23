@@ -286,6 +286,15 @@ find_save_layer "$DATA" "$active"
 run_base=/initrd/pup_ro2
 [ -d "$run_base/etc" ] || run_base=$(ls "$DATA/$active"/puppy_*.sfs 2> /dev/null | head -1)
 run_owned=$run_base/etc/1bit/release-owned
+# when the lower is not mounted, run_base is the slot's .sfs FILE: read the list out of it, not from a path under a file
+# (that path cannot exist, so the check fell through to /etc - where a save-layer copy of the list would win - and
+# --shadowed refused on a machine whose release does carry the list; found by tests/update_e2e_loop_test.sh)
+if [ -f "$run_base" ] && [ ! -d "$run_base" ]; then
+    run_owned=$(mktemp); run_owned_tmp=$run_owned
+    trap 'rm -f "$run_owned_tmp"' EXIT
+    unsquashfs -q -cat "$run_base" etc/1bit/release-owned > "$run_owned" 2> /dev/null && [ -s "$run_owned" ] ||
+        run_owned=/etc/1bit/release-owned
+fi
 [ -f "$run_owned" ] || run_owned=/etc/1bit/release-owned
 # ONEBIT_RELEASE_OWNED=<file>: check against another list (a release that predates the list, or a test)
 [ -n "${ONEBIT_RELEASE_OWNED:-}" ] && run_owned=$ONEBIT_RELEASE_OWNED
@@ -404,6 +413,7 @@ done
 
 srcimg=
 cleanup() {
+    [ -n "${run_owned_tmp:-}" ] && rm -f "$run_owned_tmp"
     [ -n "$srcimg" ] && { umount "$srcimg" 2> /dev/null; [ -n "${srcloop:-}" ] && losetup -d "$srcloop" 2> /dev/null; }
     unmount_esp
 }

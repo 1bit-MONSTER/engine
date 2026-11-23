@@ -336,6 +336,18 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
         bool climbs = false;
         for (const auto& part : fs::path(rel)) climbs = climbs || part == "..";
         if (name.empty() || climbs) continue;
+        // the link must stay inside the card: an ABSOLUTE path replaces card_dir in `card_dir / rel` (std::filesystem), and
+        // serve runs as root, so a card naming "/etc/resolv.conf" would have it deleted and re-pointed; a symlinked
+        // directory inside the card would lead out the same way. A card is downloaded content, so neither is trusted.
+        const fs::path relp(rel);
+        if (relp.is_absolute() || relp.has_root_name() || relp.has_root_directory()) continue;
+        {
+            std::error_code cec;
+            const fs::path base = fs::weakly_canonical(card_dir, cec), parent = fs::weakly_canonical(link.parent_path(), cec);
+            if (cec) continue;
+            const fs::path inside = parent.lexically_relative(base);
+            if (inside.empty() || *inside.begin() == "..") continue;
+        }
         std::error_code ec;
         const fs::path target = model_dir / name;
         if (!fs::is_regular_file(target, ec)) continue;

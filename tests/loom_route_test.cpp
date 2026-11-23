@@ -164,7 +164,14 @@ int main() {
             R"("model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"}]},)"
             R"("draft":{"files":[{"path":"parameter/d.gguf","origin":"@checkpoint/d.gguf"}]},)"
             R"("tok":{"files":[{"path":"tokenizer.json","origin":"tokenizer.json"}]},)"
-            R"("bad":{"files":[{"path":"../escape.gguf","origin":"@checkpoint/x.gguf"}]}}}}}}})";
+            R"("bad":{"files":[{"path":"../escape.gguf","origin":"@checkpoint/x.gguf"}]},)"
+            R"("abs":{"files":[{"path":")" + (dir / "victim-link").string() + R"(","origin":"@checkpoint/x.gguf"}]},)"
+            R"("via":{"files":[{"path":"outdir/v.gguf","origin":"@checkpoint/x.gguf"}]}}}}}}})";
+        // a symlink the machine owns, outside the card: an absolute card path must not delete and re-point it
+        fs::create_directories(dir / "elsewhere");
+        fs::create_symlink(dir / "elsewhere" / "real-target", dir / "victim-link");
+        // a symlinked directory inside the card that leads out of it
+        fs::create_directory_symlink(dir / "elsewhere", dir / "lc" / "outdir");
         std::ofstream(dir / "snap" / "m.gguf") << "m";
         std::ofstream(dir / "snap" / "d.gguf") << "d";
         std::ofstream(dir / "snap" / "x.gguf") << "x";
@@ -175,6 +182,10 @@ int main() {
               fs::read_symlink(dir / "lc" / "parameter" / "m.gguf") == dir / "snap" / "m.gguf" &&
               fs::read_symlink(dir / "lc" / "parameter" / "d.gguf") == dir / "snap" / "d.gguf");
         check("a path that climbs out of the card is not linked", !fs::exists(fs::symlink_status(dir / "escape.gguf")));
+        check("an ABSOLUTE card path does not re-point a symlink outside the card (serve runs as root)",
+              fs::read_symlink(dir / "victim-link") == dir / "elsewhere" / "real-target");
+        check("a symlinked directory in the card does not lead a link out of it",
+              !fs::exists(fs::symlink_status(dir / "elsewhere" / "v.gguf")));
         check("a second call changes nothing",
               loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(), lwhy) == 0);
         fs::remove(dir / "lc" / "parameter" / "d.gguf");

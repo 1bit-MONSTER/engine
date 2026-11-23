@@ -77,6 +77,16 @@ for f in files(model):
     if key not in origins or not all(origins[key]) or not name:
         sys.exit("origin %s names no pinned Hugging Face checkpoint in model.json.lock" % origin)
     rev, repo = origins[key]
+    # the card is downloaded content and this runs as root at boot: a parameter path must stay inside the card (an
+    # absolute path makes os.path.join drop `out`; a `..` or a symlinked directory leads out), or nothing is made for it
+    rel = f["path"]
+    if os.path.isabs(rel) or ".." in rel.replace("\\", "/").split("/"):
+        sys.exit("parameter path %r is not inside the card" % rel)
+    real_out = os.path.realpath(out)
+    if os.path.commonpath([real_out, os.path.realpath(os.path.dirname(os.path.join(out, rel)) or out)]) != real_out:
+        sys.exit("parameter path %r leads out of the card" % rel)
+    if "/" in repo.strip("/").split("/", 1)[-1] or ".." in repo.split("/") or "/" in rev or rev in (".", ".."):
+        sys.exit("checkpoint %r@%r is not a plain repository and revision" % (repo, rev))
     base = os.path.join(hf, "hub", "models--" + repo.replace("/", "--"))
     try:
         head = open(os.path.join(base, "refs", "main")).read().strip()

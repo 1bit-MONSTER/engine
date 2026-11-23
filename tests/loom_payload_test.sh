@@ -88,6 +88,30 @@ sh "$boot" "$t/broken" "$t/data2" "$HF" 2> "$t/err"; [ $? = 1 ] && grep -q "coul
 check $? "a card whose weights' origin is not pinned is refused, and not half-built"
 sh "$boot" "$t/none" "$t/data3" "$HF"; check $? "no payload cards is not an error"
 
+# hostile cards (a card is downloaded content; the helper runs as root at boot): nothing outside the card is touched
+for shape in abs climb dirlink; do
+    hc=$t/hostile-$shape/evil; rm -rf "${t:?}/hostile-$shape" "${t:?}/data-$shape" "${t:?}/victim-$shape"; mkdir -p "$hc" "$t/victim-$shape"
+    ln -s "$t/victim-$shape/real-target" "$t/victim-$shape/link"     # a link the machine owns, outside the card
+    case $shape in
+        abs)     p="$t/victim-$shape/link" ;;
+        climb)   p="../../victim-$shape/link" ;;
+        dirlink) p="out/link" ;;
+    esac
+    printf '{"model":{"files":[{"path":"%s","origin":"@checkpoint/m.gguf"}]}}\n' "$p" > "$hc/model.json"
+    printf '%s\n' '{"origins":{"checkpoint":{"requested":{"kind":"hf","repository":"org/M","revision":"r1"}}}}' > "$hc/model.json.lock"
+    [ "$shape" = dirlink ] && ln -s "$t/victim-$shape" "$hc/out"
+    sh "$boot" "$t/hostile-$shape" "$t/data-$shape" "$HF" 2> "$t/err.$shape"; rc=$?
+    [ "$(readlink "$t/victim-$shape/link")" = "$t/victim-$shape/real-target" ] && [ "$(ls "$t/victim-$shape")" = link ]
+    check $? "a card whose parameter path is $shape touches nothing outside the card"
+    if [ "$shape" = dirlink ]; then
+        # only regular files are carried over, so the card's directory link never reaches /data: out/ is made inside
+        [ $rc = 0 ] && [ -d "$t/data-$shape/evil/out" ] && [ ! -L "$t/data-$shape/evil/out" ]
+        check $? "a symlinked directory in a card is not carried over: its parameter/ entry lands inside the card"
+    else
+        [ $rc = 1 ] && [ ! -e "$t/data-$shape/evil" ]; check $? "a card whose parameter path is $shape is refused, not half-built"
+    fi
+done
+
 # the shipped pin
 pin=$here/os/v3/puppy/loom-cards.pin
 ok=0

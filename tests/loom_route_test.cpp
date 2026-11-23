@@ -17,6 +17,7 @@
 // loom-serve's /v1/status means for readiness, and the request/reply normalisation between a llama-server
 // client and loom-serve. Header only: no server, no model, no device. tests/loom_route.sh runs `1bit serve`.
 #include "loom_route.h"
+#include "loom_routes_default.h"  // generated from config/loom-routes.json (the table serve ships)
 
 #include <cstdio>
 #include <filesystem>
@@ -295,6 +296,22 @@ int main() {
         check("a plain JSON error becomes an SSE error event and [DONE]",
               out.rfind("data: {\"error\"", 0) == 0 && out.find("unsupported chat field") != std::string::npos &&
                   out.find("data: [DONE]") != std::string::npos);
+    }
+
+    // the SHIPPED table (config/loom-routes.json, compiled into serve): it parses, and every entry names the exact
+    // checkpoint the gate measured (sha256 + size, so a different upload never takes the route) and its gate record
+    {
+        loom::LoomRoutes shipped;
+        std::string err;
+        const bool ok = shipped.parse(kDefaultLoomRoutesJson, err);
+        check("the shipped table parses" + (ok ? std::string() : ": " + err), ok);
+        bool pinned = true, gated = true;
+        for (const loom::LoomRoute& r : shipped.routes) {
+            pinned = pinned && r.sha256.size() == 64 && r.size > 0 && !r.card.empty() && !r.preset.empty();
+            gated = gated && r.gate.find("issues/3158") != std::string::npos;
+        }
+        check("every shipped entry pins a sha256 + size, a card and a preset", pinned);
+        check("every shipped entry links its #3158 gate record", gated);
     }
 
     std::printf("%s\n", failures ? "FAIL" : "PASS");

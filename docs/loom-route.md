@@ -24,7 +24,24 @@ model is decided per model by a route table, `config/loom-routes.json`:
 - a model with an entry is served by `loom-serve`, with the entry's Loom card;
 - every other model takes the llama.cpp route exactly as before (the fallback).
 
-The shipped table is empty, so nothing changes until a model passes the gate below.
+The shipped table holds only models that passed the gate below (each entry's `gate` links its rows):
+
+| entry | card (published) | gate |
+|---|---|---|
+| `qwen2.5-coder-1.5b-instruct-q4_k_m` | [1bit-MONSTER/Qwen2.5-Coder-1.5B-Instruct-GGUF-loom](https://huggingface.co/1bit-MONSTER/Qwen2.5-Coder-1.5B-Instruct-GGUF-loom) | engine#3158 |
+| `qwen2.5-coder-7b-instruct-q4_k_m` | [1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom](https://huggingface.co/1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom) | engine#3158 |
+
+An entry takes effect only where its card is installed (below) and `loom-serve` is available (hrx-loom; on PATH,
+or `--loom-serve PATH` / `ONEBIT_LOOM_SERVE`); without the card the entry is skipped, with one line naming why, and
+the model keeps the llama.cpp route. To install a card where serve looks for it:
+
+```sh
+loom-fetch huggingface:1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom:chat --materialize=copy \
+  --output ~/.cache/1bit/loom-cards/Qwen2.5-Coder-7B-Instruct-GGUF-loom
+```
+
+`tools/loom_cards.py --check` (CI) refuses an entry whose `gguf_sha256` + `gguf_size` is not a file
+`models/pins.json` pins, and `loom_route_test` checks the compiled-in table parses with every entry pinned and gated.
 
 ## The table
 

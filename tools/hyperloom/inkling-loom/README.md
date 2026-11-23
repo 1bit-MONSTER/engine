@@ -84,5 +84,19 @@ python -m hyperloom optimize -v --framework custom \
     --extra-env HL_STATE=<state dir> --extra-env HL_RUNS=3
 ```
 
+### Orchestration-host notes (1.2.0, measured on ryzen 22-23 Nov 2026)
+
+* Run Hyperloom under its own account (home 0700) with a public-only workspace; only specialists are bwrap-sandboxed.
+* Preflight exits 2 unless a credential is in the environment (a bare `claude` login is not accepted). A
+  subscription token (`claude setup-token`) read into the launch environment only leaves `~/.claude/config.json`
+  alone. `install.sh` also refuses without one and persists whatever it is given into `.env` and the kernel-agent env
+  file, so run it with a placeholder and delete that line afterwards.
+* With `--framework custom`, the benchmark interpreter is `/opt/venv/bin/python` whenever that file exists; only a
+  `vllm` on `PATH` takes precedence (its sibling `python` is used). On a host whose `/opt/venv` belongs to someone else,
+  put a refusing `vllm` shim in the run's venv `bin/` (first on `PATH`) and pre-install `ray[default]>=2.44.1` there
+  (Python 3.14 has no 2.44.1 wheel; 2.55.0 passes the probe).
+* The box is reached with a key restricted by `command=` to `../box_gate.sh`, so the agents' account can run tickets
+  of allowlisted box sides and nothing else.
+
 Run the entrypoint by hand once first (`RESULT_DIR=/some/dir bash custom_radeon8060s.sh`) and read
 `inferencex_result.json`.

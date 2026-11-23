@@ -31,6 +31,9 @@ shims that record they were used, and loom-serve is a fake OpenAI server that st
     and a patched framework checkout each give a failing report naming why; a clean checkout still measures;
   * an unreachable box (ssh exits 255 every time) is retried, then the round exits 75 with NO report -- infrastructure,
     never a graded measurement;
+  * the box's RAM guard stops the SERVER while the gauntlet is still running: MemAvailable (a fake /proc/meminfo,
+    HL_MEMINFO) drops under the floor mid-gauntlet and the server's process group is gone within seconds, not after the
+    gauntlet's foreground python returns (bash defers a trapped signal until then);
   * custom/ (the HRX route): a bad lever is refused before ssh, a ticket above the fleet's 45-minute cap is refused,
     and the box side refuses a job whose declared RAM need does not fit -- each as a failing report.
 
@@ -71,7 +74,7 @@ class H(http.server.BaseHTTPRequestHandler):
         import time
         for p in pieces:
             self.wfile.write(("data: " + json.dumps({"choices": [{"delta": {"content": p}}]}) + "\n\n").encode()); self.wfile.flush()
-            time.sleep(0.002)
+            time.sleep(float(os.environ.get("FAKE_TOKEN_SLEEP", "0.002")))
         self.wfile.write(("data: " + json.dumps({"choices": [], "usage": {"prompt_tokens": pt, "completion_tokens": n}}) + "\n\n").encode())
         self.wfile.write(b"data: [DONE]\n\n")
 http.server.ThreadingHTTPServer((host, int(port)), H).serve_forever()
@@ -164,6 +167,47 @@ def main():
         p, rep, rd = round_(dict(env, FAKE_NEVER_REGISTER="1"), td, "noreg")
         check("a model that never registers is a failing report", p.returncode == 0 and rep and not rep["quality_gate"]["passed"]
               and rep["output_throughput"] == 0.0, json.dumps(rep)[:400])
+        # the RAM guard during the gauntlet: the server must go when MemAvailable drops, not when python returns
+        import time
+        mi = td / "meminfo"
+        mi.write_text("MemAvailable:   104857600 kB\n")   # 100 GB at the start: passes need 0 + floor 16
+        rd = td / "ramguard"
+        rd.mkdir()
+        e = dict(env, RESULT_DIR=str(rd), RESULT_FILENAME="inferencex_result", HL_MEMINFO=str(mi), HL_RAM_FLOOR_GB="16",
+                 FAKE_TOKEN_SLEEP="0.4")
+        t0 = time.time()
+        gp = subprocess.Popen(["bash", str(WL / "custom_radeon8060s.sh")], env=e, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+        spid = None
+        while time.time() - t0 < 90 and spid is None:
+            for f in (td / "box" / "out").glob("*/serve.pid"):
+                if f.stat().st_mtime >= t0 - 1:
+                    try:
+                        spid = int(f.read_text().strip())
+                    except ValueError:
+                        pass
+            time.sleep(0.2)
+        check("ram guard: the server started", spid is not None)
+        alive = lambda: os.path.exists("/proc/%d" % spid) and "zombie" not in open("/proc/%d/status" % spid).read().lower()
+        if spid:
+            while time.time() - t0 < 90 and not (td / "box" / "out").glob("*/gauntlet.log"):
+                time.sleep(0.2)
+            time.sleep(2)                                       # well into the gauntlet's foreground python
+            mi.write_text("MemAvailable:    1048576 kB\n")      # 1 GB: under the 16 GB floor
+            t1 = time.time()
+            while time.time() - t1 < 30 and alive():
+                time.sleep(0.2)
+            gone = time.time() - t1
+            check("ram guard: the server is stopped within 10 s of the drop (not after the gauntlet)", gone < 10,
+                  "server still alive after %.1f s" % gone)
+        try:
+            gp.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            gp.kill()
+            check("ram guard: the round ends", False)
+        ram = (rd / "box" / "ram.txt").read_text() if (rd / "box" / "ram.txt").exists() else ""
+        check("ram guard: ram.txt records the guard", "RAM-GUARD" in ram, ram[-300:])
+
         # box_gate.sh: the same round, every ssh command routed through the gate as sshd's command= would
         gate = ROOT / "tools/hyperloom/box_gate.sh"
         gbin = td / "gbin"

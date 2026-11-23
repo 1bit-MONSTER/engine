@@ -76,13 +76,17 @@ if [ $((ROWS * CTX)) -gt $((2 * 4 * 262144)) ]; then status "refused: rows*conte
 # --- RAM: the job states its need; refuse below need + 16 GB, kill the job if MemAvailable falls under 16 GB --------
 NEED=${HL_RAM_NEED_GB:-40}; num HL_RAM_NEED_GB "$NEED"
 FLOOR=${HL_RAM_FLOOR_GB:-16}; num HL_RAM_FLOOR_GB "$FLOOR"   # the fleet's 16 GB; only the device-free test lowers it
-mem_avail_gb() { awk '/MemAvailable/{printf "%d", $2/1048576}' /proc/meminfo; }
+mem_avail_gb() { awk '/MemAvailable/{printf "%d", $2/1048576}' "${HL_MEMINFO:-/proc/meminfo}"; }   # HL_MEMINFO: the test's fake
 have=$(mem_avail_gb)
 echo "ram: need ${NEED} GB (+${FLOOR} floor), MemAvailable ${have} GB at start" > "$OUT/ram.txt"
 if [ "$have" -lt $((NEED + FLOOR)) ]; then status "refused: RAM need $NEED + $FLOOR GB, MemAvailable $have GB"; exit 3; fi
 me=$$
 ( low=999; while kill -0 "$me" 2>/dev/null; do a=$(mem_avail_gb); [ "$a" -lt "$low" ] && { low=$a; echo "$low" > "$OUT/ram.low"; }
-    if [ "$a" -lt "$FLOOR" ]; then echo "RAM-GUARD: MemAvailable $a GB < $FLOOR at $(date -u +%T)" >> "$OUT/ram.txt"; kill -TERM "$me"; exit; fi
+    if [ "$a" -lt "$FLOOR" ]; then echo "RAM-GUARD: MemAvailable $a GB < $FLOOR at $(date -u +%T)" >> "$OUT/ram.txt"
+        # stop the SERVER here, not only this script: bash runs the TERM trap only after its foreground command (the
+        # gauntlet's python, minutes) returns, and the server would keep growing until then
+        sp=$(cat "$OUT/serve.pid" 2>/dev/null) && { kill -TERM -"$sp" 2>/dev/null; sleep 3; kill -KILL -"$sp" 2>/dev/null; }
+        kill -TERM "$me"; exit; fi
     sleep 2; done ) &
 guard=$!
 

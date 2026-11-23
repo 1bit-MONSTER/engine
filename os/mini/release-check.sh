@@ -23,7 +23,8 @@
 #
 # Rows that cannot PASS without the hardware are marked SKIP in a VM (Lemonade hides its onebit
 # entries on a machine with no AMD GPU or NPU, and there is no HRX or NPU device to run them on):
-# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder, chat-npu-queue, chat-npu-queue-plain. Everything else - mode, kernel,
+# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder, chat-npu-queue, chat-npu-queue-plain,
+# chat-npu-concurrent. Everything else - mode, kernel,
 # Secure Boot, Lemonade up with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU
 # sets and the signed manifests over them, the licences and the image identity - is checked in the VM as well.
 set -u
@@ -40,7 +41,7 @@ fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
 skip() {
     ROWS=$((ROWS + 1)); SKIPS=$((SKIPS + 1)); SKIPPED="${SKIPPED:+$SKIPPED,}$1"
-    case "$1" in gpu|npu|npu-power|hrx-placement|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
+    case "$1" in gpu|npu|npu-power|hrx-placement|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain|chat-npu-concurrent) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
 # A check that DIES must not take the evidence - or the NPU - with it. Measured on the c27 board (5 Nov 2026 21:52Z):
@@ -449,7 +450,7 @@ queue_verdict() {
 # REFUSED at its own short bound (`--queue-ms-plain`, 5000 ms on the appliance) with `503 + Retry-After` - not parked
 # silently for the whole queue. Without this arm the row cannot see the path the fix's second half is about, because
 # both of its chats stream. Pure, so --self-test drives it: <long chat body> <status> <refusal body> <Retry-After>
-# <TDRs before> <TDRs after>.
+# <TDRs before> <TDRs after> [<1 if the long chat was still running when this one came back>].
 plain_queue_verdict() {
     _p1=$1 _ps=$2 _pb=$3 _pr=$4 _t0=$5 _t1=$6
     case "$_p1" in
@@ -461,7 +462,24 @@ plain_queue_verdict() {
         503) ;;
         000|'') printf 'FAIL the non-streamed chat got no HTTP status at all, so nothing can be said about its bound'
                 return 0 ;;
-        200) printf 'FAIL the non-streamed chat was ANSWERED while the device was still busy: the short bound did not apply'
+        200) # engine#3318: a route that serves several requests at once answers this one ALONGSIDE the long chat. That
+             # is a pass only when the answer is right and came back while the long chat was still running (arg 7 = 1);
+             # a 200 after the long chat had finished is the old defect, a non-streamed request parked silently.
+             if [ "${7:-0}" != 1 ]; then
+                 printf 'FAIL the non-streamed chat was ANSWERED while the device was still busy: the short bound did not apply'
+                 return 0
+             fi
+             case "$_pb" in
+                 *'1BIT OK'*) ;;
+                 *) printf 'FAIL the non-streamed chat was served alongside the long one but did not answer 1BIT OK: %.120s' "${_pb:-empty body}"
+                    return 0 ;;
+             esac
+             if [ -n "$_t0" ] && [ -n "$_t1" ] && [ "$_t1" -gt "$_t0" ]; then
+                 printf 'FAIL the NPU logged a TDR during the non-streamed arm (%s -> %s): see dmesg' "$_t0" "$_t1"
+                 return 0
+             fi
+             printf 'PASS the non-streamed chat was served alongside the long one (200, 1BIT OK, before the long chat ended): the NPU route serves requests concurrently (engine#3318)%s' \
+                    "$([ -n "$_t0" ] && [ -n "$_t1" ] && printf ', no TDR (still %s)' "$_t1" || printf '; the kernel log was not readable, so no TDR was ruled out')"
              return 0 ;;
         *) printf 'FAIL the non-streamed chat answered %s, not the 503 + Retry-After a client can act on' "$_ps"
            return 0 ;;
@@ -482,6 +500,43 @@ plain_queue_verdict() {
     [ "$_t1" -gt "$_t0" ] && { printf 'FAIL the NPU logged a TDR during the non-streamed arm (%s -> %s): see dmesg' "$_t0" "$_t1"
                                return 0; }
     printf 'PASS the non-streamed chat was refused at its short bound (503, Retry-After %s) instead of waiting silently, no TDR (still %s)' "$_pr" "$_t1"
+}
+
+# engine#3318: N chats at once on the NPU entry, each a known-answer question, all streamed. Every one must end in
+# data: [DONE], carry no error frame, and contain its own answer: the gate for a route that serves several requests
+# at once (a mixed-up slot answers another user's question, or nothing). A serve that runs one request at a time still
+# passes - the others queue and answer - so the row is about correctness under concurrency, not speed; the wall time
+# it prints is the number to compare. Pure over files, so --self-test drives it: <dir with u<i>.sse + u<i>.want> <n>
+# <TDRs before> <TDRs after>.
+concurrent_verdict() {
+    _cd=$1 _cn=$2 _c0=$3 _c1=$4 _ci=0 _cok=""
+    while [ "$_ci" -lt "$_cn" ]; do
+        _cb=$(cat "$_cd/u$_ci.sse" 2>/dev/null) _cw=$(cat "$_cd/u$_ci.want" 2>/dev/null)
+        case "$_cb" in
+            '') printf 'FAIL chat %s of %s came back empty' "$((_ci + 1))" "$_cn"; return 0 ;;
+            *'"error"'*) printf 'FAIL chat %s of %s answered an error: %.120s' "$((_ci + 1))" "$_cn" \
+                              "$(printf '%s' "$_cb" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+                         return 0 ;;
+        esac
+        case "$_cb" in
+            *'data: '[[[]DONE]*) ;;
+            *) printf 'FAIL chat %s of %s ended without data: [DONE]: %.80s' "$((_ci + 1))" "$_cn" "$_cb"; return 0 ;;
+        esac
+        _ct=$(printf '%s' "$_cb" | grep -oE '"content":"[^"]*"' | sed 's/^"content":"//; s/"$//' | tr -d '\n')
+        case "$_ct" in
+            *"$_cw"*) _cok="$_cok $((_ci + 1))" ;;
+            *) printf 'FAIL chat %s of %s did not answer %s (said: %.80s)' "$((_ci + 1))" "$_cn" "$_cw" "${_ct:-nothing}"
+               return 0 ;;
+        esac
+        _ci=$((_ci + 1))
+    done
+    if [ -z "$_c0" ] || [ -z "$_c1" ]; then
+        printf 'PASS %s chats at once, every one answered its own question; the kernel log was not readable, so no TDR was ruled out' "$_cn"
+        return 0
+    fi
+    [ "$_c1" -gt "$_c0" ] && { printf 'FAIL the NPU logged a TDR during %s concurrent chats (%s -> %s): see dmesg' "$_cn" "$_c0" "$_c1"
+                               return 0; }
+    printf 'PASS %s chats at once, every one answered its own question, no TDR (still %s)' "$_cn" "$_c1"
 }
 
 # The first value of a JSON key - quoted or not, since usage counts are bare numbers - for the row's
@@ -1309,6 +1364,36 @@ data: [DONE]' '' '')"                                                           
     check FAIL "$(plain_queue_verdict 'data: {"choices":[{"delta":{"content":"long"}}]}' 503 '{"type":"device_busy"}' 1 0 0)"                           # long chat cut
     check FAIL "$(plain_queue_verdict 'data: [DONE]' 503 '{"type":"device_busy"}' 1 0 1)"                                                               # a TDR
     check PASS "$(plain_queue_verdict 'data: [DONE]' 503 '{"type":"device_busy"}' 1 '' '')"                                                             # dmesg unreadable
+    # engine#3318: a route serving several requests at once answers the non-streamed chat alongside the long one
+    check PASS "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"1BIT OK"}}]}' '' 0 0 1)"
+    check PASS "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"1BIT OK"}}]}' '' '' '' 1)"                                # dmesg unreadable
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"1BIT OK"}}]}' '' 0 0 0)"                                  # after the long one ended
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"OK"}}]}' '' 0 0 1)"                                       # wrong answer
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"1BIT OK"}}]}' '' 0 1 1)"                                  # a TDR
+    check FAIL "$(plain_queue_verdict 'data: {"choices":[{"delta":{"content":"long"}}]}' 200 '{"choices":[{"message":{"content":"1BIT OK"}}]}' '' 0 0 1)"   # long chat cut
+    # engine#3318: N concurrent chats, each must answer its own question
+    CT=$(mktemp -d)
+    _cset() {  # <i> <want> <sse body>
+        printf '%s' "$2" > "$CT/u$1.want"; printf '%s\n' "$3" > "$CT/u$1.sse"
+    }
+    _cset 0 42 'data: {"choices":[{"delta":{"content":"4"}}]}
+data: {"choices":[{"delta":{"content":"2"}}]}
+data: [DONE]'
+    _cset 1 Paris 'data: {"choices":[{"delta":{"content":"Paris"}}]}
+data: [DONE]'
+    check PASS "$(concurrent_verdict "$CT" 2 0 0)"                                                       # answers split over chunks
+    check PASS "$(concurrent_verdict "$CT" 2 '' '')"                                                     # dmesg unreadable
+    check FAIL "$(concurrent_verdict "$CT" 2 0 1)"                                                       # a TDR
+    check FAIL "$(concurrent_verdict "$CT" 3 0 0)"                                                       # a chat with no body
+    _cset 1 Paris 'data: {"choices":[{"delta":{"content":"42"}}]}
+data: [DONE]'
+    check FAIL "$(concurrent_verdict "$CT" 2 0 0)"                                                       # another user's answer
+    _cset 1 Paris 'data: {"choices":[{"delta":{"content":"Paris"}}]}'
+    check FAIL "$(concurrent_verdict "$CT" 2 0 0)"                                                       # cut: no [DONE]
+    _cset 1 Paris 'data: {"error":{"message":"the NPU is busy with another request"}}
+data: [DONE]'
+    check FAIL "$(concurrent_verdict "$CT" 2 0 0)"                                                       # refused
+    rm -rf "$CT"
     # the history that goes back into the request has to survive a JSON string
     jt=$(json_text 'a "quoted" \\ line
 next')
@@ -2279,11 +2364,12 @@ if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     QPLPID=$!
     sleep 1
     PW=$(auth_post_watch "$PSHORT" "$API/api/v1/chat/completions" "$PDIR/short.json")
+    kill -0 "$QPLPID" 2>/dev/null && PALIVE=1 || PALIVE=0   # engine#3318: was it served alongside the long chat?
     wait "$QPLPID" 2>/dev/null
     PLONG_BODY=$(cat "$PDIR/long.sse" 2>/dev/null)
     PSHORT_BODY=$(cat "$PDIR/short.json" 2>/dev/null)
     TDRP1=$(tdr_count)
-    VP=$(plain_queue_verdict "$PLONG_BODY" "${PW%% *}" "$PSHORT_BODY" "${PW#* }" "$TDRP0" "$TDRP1")
+    VP=$(plain_queue_verdict "$PLONG_BODY" "${PW%% *}" "$PSHORT_BODY" "${PW#* }" "$TDRP0" "$TDRP1" "$PALIVE")
     rm -rf "$PDIR"
     case "$VP" in
         PASS*) pass chat-npu-queue-plain "$NPU: $VP" ;;
@@ -2293,6 +2379,42 @@ elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
     skip chat-npu-queue-plain "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
 else
     skip chat-npu-queue-plain "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
+fi
+
+# ── NPU chats from several users at once (engine#3318) ─────────────────────────────────────────────────────────────
+# Four streamed known-answer chats are sent together (questions Qwen3-0.6B answers reliably: measured on strixhalo 23 Nov,
+# the earlier "largest planet" question got "Earth" from it, which is the model, not the route). Every one must come back whole and with ITS OWN answer: the
+# check for a route that serves several requests at once on one model (one decoder slot per request), where a slot
+# mix-up would hand one user another's text. A route that serves one request at a time queues the other three and
+# passes too; the wall time says which kind ran.
+if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    TDRC0=$(tdr_count)
+    CDIR=$(mktemp -d /tmp/npu-concurrent.XXXXXX)
+    CN=0
+    CPIDS=""
+    CT0=$(date +%s)
+    for cq in "What is 17 + 25? Reply with the number only.|42" "What is the capital of France? Reply with one word.|Paris" \
+              "What is the chemical symbol for gold? Reply with the symbol only.|Au" \
+              "What is 3 times 3? Reply with the number only.|9"; do
+        printf '%s' "${cq#*|}" > "$CDIR/u$CN.want"
+        CB="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think ${cq%|*}\"}],\"max_tokens\":64,\"temperature\":0,\"stream\":true}"
+        ( auth_post "$CB" "$API/api/v1/chat/completions" slow > "$CDIR/u$CN.sse" 2>&1 ) &
+        CPIDS="$CPIDS $!"
+        CN=$((CN + 1))
+    done
+    for cp in $CPIDS; do wait "$cp" 2>/dev/null; done
+    CWALL=$(( $(date +%s) - CT0 ))
+    TDRC1=$(tdr_count)
+    VC=$(concurrent_verdict "$CDIR" "$CN" "$TDRC0" "$TDRC1")
+    rm -rf "$CDIR"
+    case "$VC" in
+        PASS*) pass chat-npu-concurrent "$NPU: $VC (all $CN in ${CWALL} s)" ;;
+        *)     fail chat-npu-concurrent "$NPU: $VC" ;;
+    esac
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu-concurrent "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
+else
+    skip chat-npu-concurrent "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────

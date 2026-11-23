@@ -995,6 +995,34 @@ shadow_verdict() {
     esac
 }
 
+# engine#3350: hold_verdict <puppy 1/0> <GET /api/v1/hold status> <its body> <loaded models> <cycle outcome>
+# `1bit-heavy -- <command>` frees every model slot around heavy work through Lemonade's hold (1bit-MONSTER/lemonade#58);
+# without the endpoint it can only warn and run the command next to the loaded models, the shape that ran the box out of
+# memory on 22 Nov. The row never takes a user's model away: with a model loaded it reads the endpoint only, and with
+# none it runs the full hold -> active -> release -> inactive cycle (<cycle outcome>: "ok" or "fail <why>").
+hold_verdict() {
+    _pup=${1:-} _hs=${2:-} _hb=${3:-} _nl=${4:-0} _cy=${5:-}
+    [ "$_pup" = 1 ] || { printf 'SKIP this image has no 1bit-heavy (os/mini)'; return 0; }
+    case "$_hs" in
+        200) ;;
+        404) printf 'FAIL Lemonade has no hold endpoint (GET /api/v1/hold is 404): 1bit-heavy cannot free the models before heavy work (it needs 1bit-MONSTER/lemonade#58)'; return 0 ;;
+        *)   printf 'FAIL GET /api/v1/hold answered %s: 1bit-heavy cannot tell whether it can hold the models' "${_hs:-nothing}"; return 0 ;;
+    esac
+    case "$_hb" in *'"active":true'*)
+        printf 'SKIP a hold is active (%s): heavy work is running, so the cycle is not run over it' \
+            "$(printf '%s' "$_hb" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')"; return 0 ;;
+    esac
+    if [ "$_nl" -gt 0 ] 2> /dev/null; then
+        printf 'PASS GET /api/v1/hold answers (no hold); the hold/release cycle was not run because %s model(s) are loaded and would be unloaded' "$_nl"
+        return 0
+    fi
+    case "$_cy" in
+        ok) printf 'PASS hold -> active -> release -> inactive: 1bit-heavy can free the model slots around heavy work' ;;
+        fail*) printf 'FAIL the hold cycle failed: %s' "${_cy#fail }" ;;
+        *) printf 'FAIL no model is loaded but the hold cycle did not run' ;;
+    esac
+}
+
 # engine#3310: node_verdict <puppy 1/0> <node --version> <npm --version> <npm prefix -g> <prefix's mount point> [<data mount>]
 # 1bit OS ships Node.js so `lemonade launch <agent>` can follow its own `npm i -g <agent>` hint, and the global prefix has
 # to be ON the data partition: the live stick's root is RAM, so a prefix anywhere else loses the agent at the next boot.
@@ -1078,6 +1106,14 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(node_verdict 1 v24.22.3 '' /data/npm-global /data)"            # node but no npm
     check FAIL "$(node_verdict 1 v24.22.3 11.19.1 /usr/local /)"                 # npm's default prefix: RAM on a stick
     check FAIL "$(node_verdict 1 v24.22.3 11.19.1 /data/npm-global /)"           # /data is only a directory on the root
+    check PASS "$(hold_verdict 1 200 '{"active":false}' 0 ok)"
+    check FAIL "$(hold_verdict 1 404 '' 0 '')"                                  # the v2026.48 Lemonade
+    check FAIL "$(hold_verdict 1 000 '' 0 '')"
+    check SKIP "$(hold_verdict 1 200 '{"active":true,"hold_id":"hold-3","reason":"build"}' 0 '')"
+    check PASS "$(hold_verdict 1 200 '{"active":false}' 2 '')"                  # a loaded model is not taken away
+    check FAIL "$(hold_verdict 1 200 '{"active":false}' 0 'fail release answered 500')"
+    check FAIL "$(hold_verdict 1 200 '{"active":false}' 0 '')"
+    check SKIP "$(hold_verdict 0 '' '' 0 '')"
     check PASS "$(shadow_verdict 1 1 0 '1bit-update: 0 release-owned path(s) shadowed')"
     check FAIL "$(shadow_verdict 1 1 1 '   shadowed /etc/init.d/05onboard-data (file; differs)')"   # the v2026.48 case
     check SKIP "$(shadow_verdict 1 0 0 '')"                                     # a live stick
@@ -2625,6 +2661,35 @@ case "$ND" in
     PASS*) pass node "${ND#PASS }" ;;
     SKIP*) skip node "${ND#SKIP }" ;;
     *)     fail node "${ND#FAIL }" ;;
+esac
+
+# engine#3350: Lemonade can hold the models for heavy work (1bit-heavy); the cycle runs only when nothing is loaded
+_hd_body=/tmp/1bit-hold-body.$$
+_hd_s=$(auth_status "$API/api/v1/hold"); _hd_b=$(auth_get "$API/api/v1/hold")
+_hd_n=$(auth_get "$API/api/v1/health" | tr -d ' \n' | sed -n 's/.*"all_models_loaded":\[\([^]]*\)\].*/\1/p' | grep -o '"model_name"' | wc -l)
+_hd_c=
+if [ "$_nd_pup" = 1 ] && [ "$_hd_s" = 200 ] && [ "${_hd_n:-0}" = 0 ]; then
+    case "$_hd_b" in *'"active":true'*) ;; *)
+        _st=$(post_watch_once '{"reason":"release-check hold row","max_seconds":30}' "$API/api/v1/hold" "$_hd_body")
+        _id=$(sed -n 's/.*"hold_id":"\([^"]*\)".*/\1/p' "$_hd_body" 2>/dev/null)
+        if [ "$_st" != 200 ] || [ -z "$_id" ]; then _hd_c="fail POST /api/v1/hold answered ${_st:-nothing}"
+        else
+            case "$(auth_get "$API/api/v1/hold")" in *'"active":true'*) _act=1 ;; *) _act=0 ;; esac
+            _rs=$(post_watch_once "{\"hold_id\":\"$_id\"}" "$API/api/v1/hold/release" "$_hd_body")
+            case "$(auth_get "$API/api/v1/hold")" in *'"active":false'*) _gone=1 ;; *) _gone=0 ;; esac
+            if [ "$_act" != 1 ]; then _hd_c="fail GET /api/v1/hold did not show the hold while it was taken"
+            elif [ "$_rs" != 200 ]; then _hd_c="fail POST /api/v1/hold/release answered ${_rs:-nothing}"
+            elif [ "$_gone" != 1 ]; then _hd_c="fail the hold was still active after its release"
+            else _hd_c=ok; fi
+        fi
+        rm -f "$_hd_body" "$_hd_body.headers" ;;
+    esac
+fi
+HD=$(hold_verdict "$_nd_pup" "$_hd_s" "$_hd_b" "${_hd_n:-0}" "$_hd_c")
+case "$HD" in
+    PASS*) pass hold "${HD#PASS }" ;;
+    SKIP*) skip hold "${HD#SKIP }" ;;
+    *)     fail hold "${HD#FAIL }" ;;
 esac
 
 # engine#3342: no release file shadowed by the save layer (the old code would run over this release)

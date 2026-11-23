@@ -592,6 +592,7 @@ add_test(NAME grow_data COMMAND sh ${CMAKE_SOURCE_DIR}/tests/grow_data_test.sh)
 set_tests_properties(grow_data PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(npu_catalogue_filter_self ${CMAKE_SOURCE_DIR}/tools/npu_catalogue_filter.py --self-test)  # engine#3287
 add_test(NAME pstore_harvest COMMAND sh ${CMAKE_SOURCE_DIR}/tests/pstore_harvest_test.sh)
+add_test(NAME heavy_wrapper COMMAND sh ${CMAKE_SOURCE_DIR}/tests/heavy_wrapper_test.sh)
 add_test(NAME shutdown_watch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/shutdown_watch_test.sh)
 add_test(NAME update_shadow COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_shadow_test.sh)
 add_python_test(loom_arch_probe ${CMAKE_SOURCE_DIR}/tools/loom_arch_probe.py --self-test)  # engine#3221: arms only, no GGUF needed

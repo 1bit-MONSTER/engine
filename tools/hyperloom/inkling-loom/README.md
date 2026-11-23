@@ -80,7 +80,7 @@ python -m hyperloom optimize -v --framework custom \
     --framework-path <disposable public engine checkout> \
     --benchmark-scripts-dir <tracked checkout>/tools/hyperloom/inkling-loom \
     --model /data/dev/cl-hyperloom/cards/inkling2-mini-a8354e77 \
-    --gpu-type radeon8060s --tp 1 --max-hours 4 --no-framework-agent \
+    --gpu-type radeon8060s --tp 1 --max-hours 4 --no-kernel --no-enable-roofline \
     --extra-env HL_STATE=<state dir> --extra-env HL_RUNS=3
 ```
 
@@ -97,6 +97,10 @@ python -m hyperloom optimize -v --framework custom \
   (Python 3.14 has no 2.44.1 wheel; 2.55.0 passes the probe).
 * The box is reached with a key restricted by `command=` to `../box_gate.sh`, so the agents' account can run tickets
   of allowlisted box sides and nothing else.
+
+Keep the framework agent ON: in 1.2.0 `levers.json` is seeded only by EXPLORE, which is part of the optimize
+(framework-agent) phase; `--no-framework-agent --no-kernel` together collapse the run to baseline -> SWEEP and sweep
+nothing (the CLI prints that warning). `--no-kernel` alone keeps EXPLORE and drops kernel rewrites.
 
 Run the entrypoint by hand once first (`RESULT_DIR=/some/dir bash custom_radeon8060s.sh`) and read
 `inferencex_result.json`.

@@ -30,6 +30,7 @@ The shipped table holds only models that passed the gate below (each entry's `ga
 |---|---|---|
 | `qwen2.5-coder-1.5b-instruct-q4_k_m` | [1bit-MONSTER/Qwen2.5-Coder-1.5B-Instruct-GGUF-loom](https://huggingface.co/1bit-MONSTER/Qwen2.5-Coder-1.5B-Instruct-GGUF-loom) | engine#3158 |
 | `qwen2.5-coder-7b-instruct-q4_k_m` | [1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom](https://huggingface.co/1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom) | engine#3158 |
+| `qwen38-27b-ud-q4-k-xl` | [loom-fun/unsloth-Qwen3.8-27B-UD-Q4_K_XL](https://huggingface.co/loom-fun/unsloth-Qwen3.8-27B-UD-Q4_K_XL) @ `3e43d41d` | engine#3158 |
 
 An entry takes effect only where its card is installed (below) and `loom-serve` is available (hrx-loom; on PATH,
 or `--loom-serve PATH` / `ONEBIT_LOOM_SERVE`); without the card the entry is skipped, with one line naming why, and

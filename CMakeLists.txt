@@ -598,6 +598,7 @@ add_test(NAME grow_data COMMAND sh ${CMAKE_SOURCE_DIR}/tests/grow_data_test.sh)
 set_tests_properties(grow_data PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(npu_catalogue_filter_self ${CMAKE_SOURCE_DIR}/tools/npu_catalogue_filter.py --self-test)  # engine#3287
 add_test(NAME pstore_harvest COMMAND sh ${CMAKE_SOURCE_DIR}/tests/pstore_harvest_test.sh)
+add_test(NAME thermal_log COMMAND sh ${CMAKE_SOURCE_DIR}/tests/thermal_log_test.sh)
 add_test(NAME heavy_wrapper COMMAND sh ${CMAKE_SOURCE_DIR}/tests/heavy_wrapper_test.sh)
 add_test(NAME laya_fetch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/laya_fetch_test.sh)
 add_test(NAME loom_payload COMMAND sh ${CMAKE_SOURCE_DIR}/tests/loom_payload_test.sh)

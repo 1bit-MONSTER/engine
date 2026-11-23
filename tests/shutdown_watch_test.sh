@@ -102,6 +102,14 @@ grep -q "got SIGTERM, ignored" "$t/kmsg4" && grep -q "^1bit-shutdown-hb: rc.shut
 check $? "SIGTERM (rc.shutdown's kill passes) is ignored: it runs on to rc.shutdown's end"
 [ "$(grep -c "^1bit-shutdown-hb: alive:" "$t/kmsg4")" -le 8 ]
 check $? "it ticks once a second, it does not spin (a 13 s shutdown, a 2 s period: at most 8 heartbeats)"
+# a tick that returns at once (here: a fake `sleep` that does not sleep) is caught and replaced
+mkdir -p "$t/fastbin"; printf '#!/bin/sh\nexit 0\n' > "$t/fastbin/sleep"; chmod +x "$t/fastbin/sleep"
+printf '#!/bin/sh\n/bin/sleep 3\n' > "$t/rc5"; sh "$t/rc5" & rc5=$!
+( PATH="$t/fastbin:$PATH" ONEBIT_KMSG="$t/kmsg5" ONEBIT_SYSRQ="$t/sysrq5" ONEBIT_HB_DIR="$t/hbdir5" ONEBIT_HB_PERIOD=100 \
+    sh "$hb" $rc5 < /dev/null > /dev/null 2>&1 & )
+wait $rc5; sleep 2
+[ "$(grep -c "tick returned at once; falling back to /bin/sleep" "$t/kmsg5")" = 1 ] && grep -q "rc.shutdown $rc5 finished" "$t/kmsg5"
+check $? "a tick that returns at once is caught ONCE (more than 3 in a second -> /bin/sleep) and it still ends with rc.shutdown"
 [ -f "$t/hbdir/hb" ] && grep -q "as $hbpid (parent 1" "$t/kmsg4"
 check $? "it runs from its tmpfs copy, as init's child (detached)"
 

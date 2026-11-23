@@ -56,8 +56,19 @@ tick() { sleep 1; }
 ( read -t 0 _x < /dev/null ) 2> /dev/null
 if [ $? -ne 2 ]; then
     f=$dir/tick.$$
-    if mkfifo "$f" 2> /dev/null && exec 3<> "$f"; then rm -f "$f"; tick() { read -t 1 _x <&3 2> /dev/null; return 0; }; fi
+    if mkfifo "$f" 2> /dev/null && exec 3<> "$f"; then
+        tick() { read -t 1 _x <&3 2> /dev/null; return 0; }
+    fi
+    rm -f "$f"
 fi
+# a guard all the same: more than 3 ticks inside one second of uptime (read -t returning at once) -> sleep instead
+_sec= _same=0
+guard() {
+    IFS=' .' read -r _now _x < "$P/uptime" 2> /dev/null || return 0
+    if [ "$_now" = "$_sec" ]; then _same=$((_same + 1)); else _sec=$_now _same=0; fi
+    [ "$_same" -gt 3 ] && { say "tick returned at once; falling back to /bin/sleep"; tick() { /bin/sleep 1 2> /dev/null || sleep 1; }; _same=0; }
+    return 0
+}
 
 st_of() {   # s=<state> pp=<ppid> c=<comm> of $1, builtins only
     s=? pp=? c=?
@@ -116,7 +127,7 @@ while [ -d "$P/$root" ]; do
             _r=${_l##*) }; case ${_r%% *} in D|R) _c=${_st%/stat}; _c=${_c##*/}; st_of "$_c"; say "task $_c [$c] state $s"; stacks "$_c" ;; esac
         done
     fi
-    tick
+    tick; guard
 done
 say "rc.shutdown $root finished"
 exit 0

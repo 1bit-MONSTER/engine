@@ -47,6 +47,7 @@ declare -A LEVERS=(
     [HL_RUNS]='^[1-5]$'
     [HL_GAUNTLET_ROWS]='^[a-z0-9,]+$'
     [HL_RAM_NEED_GB]='^[0-9]{1,3}$'
+    [HL_CARD_NAME]='^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$'   # a card under the box's cl-hyperloom/cards, by name
 )
 . "$HERE/../box_ticket.sh"
 HL_STATE=${HL_STATE:-$HOME/hyperloom-ws/state/inkling-loom}

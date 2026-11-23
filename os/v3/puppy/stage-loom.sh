@@ -38,7 +38,10 @@ set -eu
 umask 022
 prog=$(basename "$0")
 here=$(cd "$(dirname "$0")" && pwd)
-pin=${ONEBIT_LOOM_PIN:-$here/../../config/loom.config}
+# the repository's config/ is three levels up from os/v3/puppy (it read os/config/loom.config, which does not exist, so every
+# cut.sh from main failed here with a misleading "has no wheel": the test always set ONEBIT_LOOM_PIN and never ran this path)
+pin=${ONEBIT_LOOM_PIN:-$here/../../../config/loom.config}
+[ -f "$pin" ] || { echo "$prog: REFUSED: no Loom pin file at $pin (ONEBIT_LOOM_PIN names another)" >&2; exit 2; }
 cards=${ONEBIT_LOOM_CARDS_PIN:-$here/loom-cards.pin}
 
 payload= wheel= cards_from=

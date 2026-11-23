@@ -600,6 +600,7 @@ add_python_test(npu_catalogue_filter_self ${CMAKE_SOURCE_DIR}/tools/npu_catalogu
 add_test(NAME pstore_harvest COMMAND sh ${CMAKE_SOURCE_DIR}/tests/pstore_harvest_test.sh)
 add_test(NAME heavy_wrapper COMMAND sh ${CMAKE_SOURCE_DIR}/tests/heavy_wrapper_test.sh)
 add_test(NAME laya_fetch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/laya_fetch_test.sh)
+add_test(NAME loom_payload COMMAND sh ${CMAKE_SOURCE_DIR}/tests/loom_payload_test.sh)
 add_test(NAME shutdown_watch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/shutdown_watch_test.sh)
 add_test(NAME update_shadow COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_shadow_test.sh)
 # engine#3342 end to end: the real `1bit-update` against a loop-mounted installed disk, then the new release booted as an

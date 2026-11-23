@@ -1,0 +1,36 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# The Loom cards the 1bit OS payload carries (stage-loom.sh), each pinned to a revision with every file's sha256 and
+# size. A card is its programs and metadata (Apache-2.0, loom-fun); its weights are NOT here: the card's own
+# model.json.lock names them, the catalogue pulls them into Lemonade's Hugging Face cache, and 1bit-loom-cards links
+# the card's parameter/ files there at boot (engine#3350 rc1, orchestrator 23 Nov).
+#
+# card <directory name> <hf repo> <revision>, then that card's files: <sha256> <size> <path>
+card unsloth-Inkling-2-Mini-loom loom-fun/unsloth-Inkling-2-Mini-loom 4e018e88a3aa9826286c71dfe2f6c905a491659b
+746132fc59c158cd5d6b43a57275b023280675d97c1c477e1ec3b41ed7f66ded 3846 head_weights.loom
+eaaeee9924e11613816970ecc33d55fdc73c006fd193e65f41f51747a72dba81 24680 info.json
+1f26dc55da0bb31d8ac1ae02b5ddaa686192e1a68d41ae7d41983ec68febaf52 4459 llm_config.json
+384039ebd9a67ed5ec5e94bb895a1731d5ebbb78dbee864c370819a7a1b93f2e 1658 model.json
+79ed20d4ebcbb79a79228304bda0780e983d2fa6527f752a3c7614ff99fdf565 892 model.json.lock
+aea2fa34d530ed7254228cde4ed067f4c9a4df7ecb90661a59b04de868654c5c 232520 program/control.loom
+01c6d4dbdcae6bc43b21f750879fd8f6603ca9f4b81340e0a5c2bf07b22314ea 8007606 program/llm.loom
+3450779e6f3517edbaa01927edea53a9581d3ac2c75e68adfa48dd6f08dc1cfb 19508 program/prepare.loom
+5dcd083b26d98f39b3215f9f47b9acfaa08e62df406718cdb92aa0684323f7db 26042 program/service.loom
+d1b75d6420b892c6b297ed3f73331faa349f0f0f4f514e7a450d8f9327ebc666 12748 program/storage.loom
+3ab7cee720fefafc5bbec76a7f9a48b152b13b3f6f658c67c2f350925aad3584 11481 README.md
+e61a87d5181154d17e9e3f6a7e02028e6ce6f7a4973dbd1afa561c769a7a6f01 19256 REPORT.md
+a45fdc4e7e66a035de236d2694742fed5645327051caace5f8312013a879f9b1 12242935 tokenizer.json
+9f1aa250572ffb5dd047e0d3b3209d008c2c85d2aec9f9fc394f758b2fb215e0 101936 weights.loom

@@ -112,6 +112,17 @@ user downloads them from the npm registry, with network, under their own licence
 |---|---|---|---|
 | Node.js with npm (`/usr/local/lib/nodejs`, wrappers `node`, `npm`, `npx`, `corepack` in `/usr/local/bin`) | **pinned v24.22.3** LTS, `node-v24.22.3-linux-x64.tar.xz` sha256 `4f2b175a6d53a5c6...` (`os/v3/puppy/pin.txt`), staged by `os/v3/puppy/stage-node.sh` | MIT (Node.js contributors); the bundled dependencies' licences (V8, libuv, OpenSSL, ICU, npm Artistic-2.0, and the rest) are in the release's LICENSE | `os/licenses/nodejs/` (LICENSE, SOURCE); the same LICENSE is in the image at `/usr/local/lib/nodejs/LICENSE`; https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz |
 
+## The Loom route (1bit OS only)
+
+1bit OS carries the Loom route's server and the Loom cards for the models whose route is gated
+(`config/loom-routes.json`, engine#3350). The weights are not in the image: a card names them, and the catalogue
+pull downloads them on the user's request.
+
+| Component | Release | License | Source |
+|---|---|---|---|
+| hrx-loom: `loom-serve`, `libiree.so`, `libloomc.so` (`/opt/1bit-package/loom`) | the wheel `config/loom.config` pins (hrx_loom 0.3.0 for rc1, sha256 `6252bb0df2623511...`), staged by `os/v3/puppy/stage-loom.sh` | Apache-2.0 WITH LLVM-exception (AMD ROCm hrx-system) | `os/licenses/hrx-loom/` (LICENSE, SOURCE); https://github.com/ROCm/hrx-system at v0.3.0 |
+| Loom card `unsloth-Inkling-2-Mini-loom` (`/opt/1bit-package/loom-cards`) | loom-fun's card at `4e018e88` (r8), 14 files pinned in `os/v3/puppy/loom-cards.pin` | Apache-2.0 (loom-fun) | `os/licenses/loom-cards/` (SOURCE, the card's README); https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom |
+
 ## System software from Ubuntu
 
 mkimage.sh copies these from the build machine (Ubuntu 26.04), unmodified, and records the exact

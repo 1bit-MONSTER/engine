@@ -1494,7 +1494,11 @@ fi
 # prints the MiB of own GTT for the pids given), HRXP_MODEL (a model path), HRXP_WAIT (seconds to wait for /health).
 hrxp_model() {  # the staged 4B GGUF, if this medium has one
     if [ -n "${HRXP_MODEL:-}" ]; then printf '%s' "$HRXP_MODEL"; return 0; fi
-    for _g in /data/lemonade/huggingface/models--unsloth--Qwen3-4B-Instruct-2507-GGUF/snapshots/*/Qwen3-4B-Instruct-2507-Q4_K_M.gguf; do
+    # engine#3353: Lemonade's Hugging Face cache keeps repos under $HF_HOME/hub/ (10lemonade: HF_HOME=/data/lemonade/huggingface);
+    # the flat $HF_HOME/models--* path this looked in alone never existed on an appliance, so the row skipped with the model there
+    _hf=${HF_HOME:-/data/lemonade/huggingface}
+    for _g in "$_hf"/hub/models--unsloth--Qwen3-4B-Instruct-2507-GGUF/snapshots/*/Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
+              "$_hf"/models--unsloth--Qwen3-4B-Instruct-2507-GGUF/snapshots/*/Qwen3-4B-Instruct-2507-Q4_K_M.gguf; do
         [ -f "$_g" ] && { printf '%s' "$_g"; return 0; }
     done
     return 1
@@ -1513,7 +1517,7 @@ hrxp_fetch() {
     HRXP_FETCH_WHY="lemonade pull exited $_prc: $(tail -n 1 /tmp/1bit-hrxp-pull.$$ 2> /dev/null)"
     rm -f /tmp/1bit-hrxp-pull.$$
     [ "$_prc" = 0 ] || return 1
-    HRXP_MODEL_PATH=$(hrxp_model) || { HRXP_FETCH_WHY="the pull finished but no Qwen3-4B-Instruct-2507-Q4_K_M.gguf is under /data/lemonade/huggingface"; return 1; }
+    HRXP_MODEL_PATH=$(hrxp_model) || { HRXP_FETCH_WHY="the pull finished but no Qwen3-4B-Instruct-2507-Q4_K_M.gguf is under ${HF_HOME:-/data/lemonade/huggingface}/hub"; return 1; }
     say "info  fetch : pulled Qwen3-4B-Instruct-2507-1bit for hrx-placement in $(( $(date +%s) - _t0 )) s"
     return 0
 }
@@ -1581,7 +1585,7 @@ hrxp_arm() {  # <port> <optin 0|1> -> "<own GTT MiB>" on stdout; non-zero when t
 if [ ! -e "${HRXP_KFD:-/dev/kfd}" ]; then
     skip hrx-placement "no /dev/kfd: this machine has no AMD GPU, so there is no HRX placement to measure"
 elif ! HRXP_MODEL_PATH=$(hrxp_model) && [ -z "$FETCH" ]; then
-    skip hrx-placement "no staged Qwen3-4B-Instruct-2507-Q4_K_M.gguf under /data/lemonade/huggingface: the row measures one named model twice and will not substitute another (1bit-release-check --fetch pulls it)"
+    skip hrx-placement "no staged Qwen3-4B-Instruct-2507-Q4_K_M.gguf under ${HF_HOME:-/data/lemonade/huggingface}/hub: the row measures one named model twice and will not substitute another (1bit-release-check --fetch pulls it)"
 elif [ -z "${HRXP_MODEL_PATH:-}" ] && ! hrxp_fetch; then
     fail hrx-placement "--fetch asked for Qwen3-4B-Instruct-2507-1bit and it could not be pulled: $HRXP_FETCH_WHY"
 else

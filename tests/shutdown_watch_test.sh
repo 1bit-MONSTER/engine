@@ -110,6 +110,25 @@ printf '#!/bin/sh\n/bin/sleep 3\n' > "$t/rc5"; sh "$t/rc5" & rc5=$!
 wait $rc5; sleep 2
 [ "$(grep -c "tick returned at once; falling back to /bin/sleep" "$t/kmsg5")" = 1 ] && grep -q "rc.shutdown $rc5 finished" "$t/kmsg5"
 check $? "a tick that returns at once is caught ONCE (more than 3 in a second -> /bin/sleep) and it still ends with rc.shutdown"
+# engine#3361: timer wakeups STOP (here: a `sleep` that never returns). The default tick then makes no progress at all
+# (the control: the stall would silence it), and the timer-free spin tick keeps beating and still fires sysrq w.
+mkdir -p "$t/stuckbin"; printf '#!/bin/sh\nexec /bin/sleep 100000\n' > "$t/stuckbin/sleep"; chmod +x "$t/stuckbin/sleep"
+printf '#!/bin/sh\n/bin/sleep 7\n' > "$t/rc6"; sh "$t/rc6" & rc6=$!
+( PATH="$t/stuckbin:$PATH" ONEBIT_HB_SPIN_FLAG="$t/none" ONEBIT_KMSG="$t/kmsg6" ONEBIT_SYSRQ="$t/sysrq6" ONEBIT_HB_DIR="$t/hbdir6" \
+    ONEBIT_HB_PERIOD=2 ONEBIT_HB_W=3 sh "$hb" $rc6 < /dev/null > /dev/null 2>&1 & )
+( PATH="$t/stuckbin:$PATH" ONEBIT_HB_SPIN=1 ONEBIT_KMSG="$t/kmsg7" ONEBIT_SYSRQ="$t/sysrq7" ONEBIT_HB_DIR="$t/hbdir7" \
+    ONEBIT_HB_PERIOD=2 ONEBIT_HB_W=3 sh "$hb" $rc6 < /dev/null > /dev/null 2>&1 & )
+wait $rc6; sleep 3
+! grep -q "alive:" "$t/kmsg6" && [ ! -s "$t/sysrq6" ]
+check $? "the control: with timer wakeups stopped, the default tick makes no progress (no heartbeat, no sysrq)"
+grep -q "timer-free tick: spinning on" "$t/kmsg7" && [ "$(grep -c "^1bit-shutdown-hb: alive:" "$t/kmsg7")" -ge 2 ] && [ "$(cat "$t/sysrq7" 2> /dev/null)" = w ]
+check $? "ONEBIT_HB_SPIN=1: the timer-free tick still beats and fires sysrq w with timers stopped"
+grep -q "^1bit-shutdown-hb: rc.shutdown $rc6 finished" "$t/kmsg7"
+check $? "and it ends with rc.shutdown (the spin stops with it)"
+# the control is stuck in its fake sleep by design: stop it by its own pid (never by a name pattern, which could match
+# the shell that runs this test) and the sleep it is waiting on
+cp6=$(sed -n 's/^1bit-shutdown-hb: watching rc.shutdown [0-9]* as \([0-9]*\) .*/\1/p' "$t/kmsg6")
+if [ -n "$cp6" ]; then pkill -KILL -P "$cp6" 2> /dev/null; kill -KILL "$cp6" 2> /dev/null; fi
 [ -f "$t/hbdir/hb" ] && grep -q "as $hbpid (parent 1" "$t/kmsg4"
 check $? "it runs from its tmpfs copy, as init's child (detached)"
 

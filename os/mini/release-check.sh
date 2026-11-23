@@ -978,6 +978,23 @@ xhci_capture_verdict() {   # <1 when /bin/1bit-xhci-capture is present and execu
     esac
 }
 
+# engine#3342: shadow_verdict <puppy 1/0> <installed 1/0> <exit code of `1bit-update --shadowed`> <its output>
+# A save-layer copy of a release file wins over the release's SFS, so after an update the machine runs the OLD code of
+# that path and nothing says so (v2026.48 kept c35's 05onboard-data). 1bit-update --shadowed lists those copies (exit 0
+# none, 1 some, other = it could not look); `1bit-update <release>` moves them out. A live stick is not updated in place
+# (the next image replaces it), and os/mini has no 1bit-update: SKIP there.
+shadow_verdict() {
+    _pup=${1:-} _inst=${2:-} _rc=${3:-} _out=${4:-}
+    [ "$_pup" = 1 ] || { printf 'SKIP this image has no Puppy save layer (os/mini)'; return 0; }
+    [ "$_inst" = 1 ] || { printf 'SKIP a live stick is replaced by the next image, not updated over a save layer'; return 0; }
+    case "$_rc" in
+        0) printf 'PASS no release file is shadowed by the save layer: the running release'"'"'s own code runs' ;;
+        1) printf 'FAIL the save layer holds copies of release files, which keep the OLD code over this release:%s - `1bit-update <next release>` moves them out, or move them by hand' \
+               "$(printf '%s\n' "$_out" | sed -n 's|^ *shadowed \(/[^ ]*\) .*|\1|p' | head -5 | tr '\n' ' ' | sed 's/^/ /; s/ $//')" ;;
+        *) printf 'SKIP 1bit-update --shadowed could not look (exit %s): %s' "${_rc:-none}" "$(printf '%s' "$_out" | tail -1)" ;;
+    esac
+}
+
 # engine#3310: node_verdict <puppy 1/0> <node --version> <npm --version> <npm prefix -g> <prefix's mount point> [<data mount>]
 # 1bit OS ships Node.js so `lemonade launch <agent>` can follow its own `npm i -g <agent>` hint, and the global prefix has
 # to be ON the data partition: the live stick's root is RAM, so a prefix anywhere else loses the agent at the next boot.
@@ -1061,6 +1078,14 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(node_verdict 1 v24.22.3 '' /data/npm-global /data)"            # node but no npm
     check FAIL "$(node_verdict 1 v24.22.3 11.19.1 /usr/local /)"                 # npm's default prefix: RAM on a stick
     check FAIL "$(node_verdict 1 v24.22.3 11.19.1 /data/npm-global /)"           # /data is only a directory on the root
+    check PASS "$(shadow_verdict 1 1 0 '1bit-update: 0 release-owned path(s) shadowed')"
+    check FAIL "$(shadow_verdict 1 1 1 '   shadowed /etc/init.d/05onboard-data (file; differs)')"   # the v2026.48 case
+    check SKIP "$(shadow_verdict 1 0 0 '')"                                     # a live stick
+    check SKIP "$(shadow_verdict 0 0 '' '')"                                    # os/mini
+    check SKIP "$(shadow_verdict 1 1 2 '1bit-update: REFUSED: run as root')"   # could not look: not a silent PASS
+    _g=$(shadow_verdict 1 1 1 '   shadowed /etc/init.d/05onboard-data (file; differs)')
+    case "$_g" in *'copies of release files, which keep the OLD code over this release: /etc/init.d/05onboard-data - '*)
+        check FAIL "$_g" ;; *) check 'FAIL naming /etc/init.d/05onboard-data' "$_g" ;; esac     # it names the path
     check PASS "$(payload_runpath_verdict 0)"
     check FAIL "$(payload_runpath_verdict 3 '/opt/1bit-package/1bit/1bit runs /home/x/wt/release-rc/work/build')"
     check FAIL "$(payload_runpath_verdict 1)"
@@ -2600,6 +2625,19 @@ case "$ND" in
     PASS*) pass node "${ND#PASS }" ;;
     SKIP*) skip node "${ND#SKIP }" ;;
     *)     fail node "${ND#FAIL }" ;;
+esac
+
+# engine#3342: no release file shadowed by the save layer (the old code would run over this release)
+_sh_inst=0; [ -e /data/.installed ] && _sh_inst=1
+_sh_rc= _sh_out=
+if [ "$_nd_pup" = 1 ] && [ "$_sh_inst" = 1 ] && [ -x /usr/local/bin/1bit-update ]; then
+    _sh_out=$(/usr/local/bin/1bit-update --shadowed 2>&1); _sh_rc=$?
+fi
+SH=$(shadow_verdict "$_nd_pup" "$_sh_inst" "$_sh_rc" "$_sh_out")
+case "$SH" in
+    PASS*) pass shadow "${SH#PASS }" ;;
+    SKIP*) skip shadow "${SH#SKIP }" ;;
+    *)     fail shadow "${SH#FAIL }" ;;
 esac
 
 # ── the NPU's locked memory in force (the driver asks for unlimited; this fleet's own 99- file can override ours) ──

@@ -18,6 +18,7 @@
 # 1bit-update --no-verify <release>         the same, for a release that carries no SHA256SUMS
 # 1bit-update --rollback                    boot the other slot next (both sets stay on the disk)
 # 1bit-update --status                      which slot is active, what each slot holds, which one GRUB boots
+# 1bit-update --shadowed                    the release files the save layer holds a copy of (exit 1 when any)
 #
 # An installed 1bit OS is a frugal set (kernel, initrd, SFS) plus ONE save layer, and the only way to change the OS
 # used to be "write a new image", which throws the layer's machine away with it. So an installed machine carries TWO
@@ -111,6 +112,73 @@ link_target_layer() {
     ln -sfn "../$save_slot/$savename" "$1/$2/$savename"
 }
 
+# ── release code the save layer shadows (engine#3342) ───────────────────────────────────────────────────────────
+# An overlay's upper copy wins over every lower layer, so a release file that the save layer holds a copy of keeps the
+# OLD bytes after an update, silently: v2026.48 kept c35's hand-edited /etc/init.d/05onboard-data and never made
+# /data/npm-global. etc/1bit/release-owned names the paths the release owns (its code, never the machine's state); an
+# upper entry on one of them is release code in the wrong place, identical to the new bytes or not (an identical copy
+# shadows the NEXT release instead).
+#
+# owned_pats FILE: the patterns of a release-owned list, one per line (comments and blanks dropped)
+owned_pats() { sed -e 's/[[:space:]]*#.*//' -e '/^[[:space:]]*$/d' "$1" 2> /dev/null; }
+# shadow_scan UPPER PATTERNS: one line per upper entry on a release-owned path, "<kind><TAB><path>", kind = file, link
+# or whiteout (a 0/0 character device: the overlay's record that the path was DELETED, which hides the release's file)
+shadow_scan() {
+    [ -d "$1" ] || return 0
+    ( cd "$1" && find . -xdev \( -type f -o -type l -o -type c \) -print 2> /dev/null ) | sed 's|^\./||' | sort |
+    while IFS= read -r p; do
+        hit=
+        set -f
+        for pat in $2; do
+            # shellcheck disable=SC2254
+            case $p in $pat) hit=1; break ;; esac
+        done
+        set +f
+        [ -n "$hit" ] || continue
+        if [ -L "$1/$p" ]; then echo "link	$p"
+        elif [ -c "$1/$p" ]; then
+            [ "$(stat -c %t:%T "$1/$p" 2> /dev/null)" = 0:0 ] && echo "whiteout	$p"
+        else echo "file	$p"; fi
+    done
+}
+# shadow_kind BASE PATH UPPER: how the upper copy compares with the release - "differs", "identical" or "not in the
+# release". BASE is a directory (the release's tree, e.g. /initrd/pup_ro2) or a .sfs file (read with unsquashfs).
+shadow_kind() {
+    if [ -d "$1" ]; then
+        [ -e "$1/$2" ] || [ -L "$1/$2" ] || { echo "not in the release"; return; }
+        if [ -L "$3/$2" ] || [ -L "$1/$2" ]; then
+            [ "$(readlink "$3/$2")" = "$(readlink "$1/$2")" ] && echo identical || echo differs
+        else cmp -s "$3/$2" "$1/$2" && echo identical || echo differs; fi
+    elif [ -f "$1" ]; then
+        k=$(mktemp) || { echo unknown; return; }
+        if unsquashfs -q -cat "$1" "$2" > "$k" 2> /dev/null; then
+            cmp -s "$3/$2" "$k" && echo identical || echo differs
+        else echo "not in the release"; fi
+        rm -f "$k"
+    else
+        echo "unknown"
+    fi
+}
+# shadow_move UPPER PATTERNS DEST: takes every release-owned upper entry OUT of the overlay, into DEST at the same
+# relative path (DEST is beside upper/ in the save folder, so nothing there is seen by the system: a moved init script
+# left in /etc/init.d would still be RUN at boot), and drops whiteouts (listed in DEST/whiteouts). Prints one line per
+# entry; returns 0 when every one moved.
+shadow_move() {
+    rc=0 list=$(mktemp) || return 1
+    shadow_scan "$1" "$2" > "$list"
+    while IFS='	' read -r kind p; do
+        if [ "$kind" = whiteout ]; then
+            mkdir -p "$3" && echo "$p" >> "$3/whiteouts" && rm -f "$1/$p" && echo "   dropped the whiteout that hid /$p" ||
+                { echo "   FAILED to drop the whiteout on /$p"; rc=1; }
+        else
+            mkdir -p "$3/$(dirname "$p")" && mv "$1/$p" "$3/$p" && echo "   moved /$p ($kind) out of the save layer" ||
+                { echo "   FAILED to move /$p"; rc=1; }
+        fi
+    done < "$list"
+    rm -f "$list"
+    return $rc
+}
+
 # sourced by tests/one_bit_update_slots_test.sh with ONEBIT_UPDATE_LIB=1: the functions above, nothing below
 if [ "${ONEBIT_UPDATE_LIB:-}" = 1 ]; then return 0 2> /dev/null || exit 0; fi
 
@@ -121,6 +189,7 @@ while [ $# -gt 0 ]; do
     case $1 in
         -h|--help) usage; exit 0 ;;
         --status) mode=status ;;
+        --shadowed) mode=shadowed ;;
         --rollback) mode=rollback ;;
         --no-verify) novfy=1 ;;
         /*) src=$1 ;;
@@ -159,6 +228,39 @@ for p in /sys/block/"$bootdisk"/"$bootdisk"*; do
 done
 [ -n "$esp" ] || die "no 1BIT-OS partition on $bootdisk: this machine did not boot from an installed disk"
 find_save_layer "$DATA" "$active"
+
+# ── release code the save layer shadows, on the RUNNING system (engine#3342) ────────────────────────────────────
+# the running release's own tree is the SFS lower Puppy mounted (/initrd/pup_ro2); its release-owned list is read from
+# there, not from /etc, where a save-layer copy of that list would itself win
+run_base=/initrd/pup_ro2
+[ -d "$run_base/etc" ] || run_base=$(ls "$DATA/$active"/puppy_*.sfs 2> /dev/null | head -1)
+run_owned=$run_base/etc/1bit/release-owned
+[ -f "$run_owned" ] || run_owned=/etc/1bit/release-owned
+# ONEBIT_RELEASE_OWNED=<file>: check against another list (a release that predates the list, or a test)
+[ -n "${ONEBIT_RELEASE_OWNED:-}" ] && run_owned=$ONEBIT_RELEASE_OWNED
+upper=
+[ -n "$savename" ] && upper=$DATA/$save_slot/$savename/upper
+# shadow_report BASE PATTERNS: one line per shadowed path, how it compares with BASE; sets nshadow
+shadow_report() {
+    nshadow=0 l=$(mktemp) || return 1
+    shadow_scan "$upper" "$2" > "$l"
+    while IFS='	' read -r kind p; do
+        nshadow=$((nshadow + 1))
+        if [ "$kind" = whiteout ]; then k="a whiteout hides the release's file"; else k=$(shadow_kind "$1" "$p" "$upper"); fi
+        echo "   shadowed /$p ($kind; $k)"
+    done < "$l"
+    rm -f "$l"
+}
+if [ "$mode" = shadowed ]; then
+    [ -n "$upper" ] && [ -d "$upper" ] || { echo "1bit-update: no save layer upper dir: nothing can shadow the release"; exit 0; }
+    pats=$(owned_pats "$run_owned")
+    [ -n "$pats" ] || die "the running release has no etc/1bit/release-owned list: release code cannot be told from machine state"
+    shadow_report "$run_base" "$pats"
+    echo "1bit-update: $nshadow release-owned path(s) shadowed by the save layer $upper"
+    [ "$nshadow" = 0 ] && exit 0
+    echo "   these keep the OLD bytes over the running release; the next 1bit-update moves them to $DATA/$save_slot/$savename/1bit-shadowed/"
+    exit 1
+fi
 
 # ── GRUB: read the config, find a slot's entries, write the default ──────────────────────────────────────────
 esp_mount=/tmp/1bit-update/esp
@@ -206,6 +308,9 @@ if [ "$mode" = status ]; then
         fi
     done
     [ -n "$savename" ] && say "  save layer: $DATA/$save_slot/$savename (one layer, shared by both slots)"
+    if [ -n "$upper" ] && pats=$(owned_pats "$run_owned") && [ -n "$pats" ]; then
+        say "  release files the save layer shadows: $(shadow_scan "$upper" "$pats" | grep -c .) (1bit-update --shadowed lists them)"
+    fi
     if mount_esp; then
         say "  GRUB: default index $(sed -n 's/^set default=//p' "$cfg" | head -1) of $(grep -c '^[[:space:]]*menuentry' "$cfg") entries" \
             "| $active headless = $(slot_index "$active" headless), $target headless = $(slot_index "$target" headless)"
@@ -363,6 +468,43 @@ awk -v want="$idx" -v slot="$target" '
 unmount_esp || fail "cannot flush the ESP"
 sync
 say "   GRUB: entry $idx = /$target headless, first (set default=$idx); the /$active entries stay, so the previous appliance is the rollback"
+
+# ── the save layer's copies of release files: out of the overlay, so the new release's code runs (engine#3342) ──
+# Done last, once the slot is written and GRUB boots it, so a refused or failed update leaves the layer as it was. The
+# list of what the release owns is the NEW release's own; an older image without one falls back to the running list.
+# This edits the overlay's upper dir while it is mounted: the kernel calls that undefined (never a crash or a
+# deadlock); the moved files are renamed, not deleted, so open ones stay readable, and the next boot - the reboot
+# into the new slot - mounts the layer afresh. Machine state is not on the list and is never touched.
+nsfs=$(ls "$DATA/$target"/puppy_*.sfs 2> /dev/null | head -1)
+pf=$(mktemp)
+if [ -n "$nsfs" ] && unsquashfs -q -cat "$nsfs" etc/1bit/release-owned > "$pf" 2> /dev/null && [ -s "$pf" ]; then
+    owned_from="the new release's etc/1bit/release-owned"
+else
+    cp "$run_owned" "$pf" 2> /dev/null; owned_from="the RUNNING release's list (the new one carries none)"
+fi
+pats=$(owned_pats "$pf"); rm -f "$pf"
+if [ -z "$upper" ] || [ ! -d "$upper" ]; then
+    say "   save layer: no upper dir, nothing shadows the new release"
+elif [ -z "$pats" ]; then
+    say "   WARNING: no release-owned list in either release: save-layer copies of release files were NOT checked (engine#3342)"
+else
+    shadow_report "$nsfs" "$pats" | tee -a "$LOG"
+    n=$(shadow_scan "$upper" "$pats" | grep -c .)
+    if [ "$n" = 0 ]; then
+        say "   save layer: no copy of a release file (checked against $owned_from)"
+    else
+        ntag=$(unsquashfs -q -cat "$nsfs" etc/1bit/release-identity 2> /dev/null | sed -n 's/^payload=lemonade-onebit-//p' | head -1)
+        dest=$DATA/$save_slot/$savename/1bit-shadowed/${ntag:-new}-$(date -u +%Y%m%dT%H%M%SZ)
+        say "   save layer: $n copy(ies) of release files would keep the OLD code over the new release; moving them to $dest"
+        mv_out=$(mktemp)
+        shadow_move "$upper" "$pats" "$dest" > "$mv_out" 2>&1; mv_rc=$?
+        tee -a "$LOG" < "$mv_out"; rm -f "$mv_out"
+        if [ "$mv_rc" != 0 ]; then
+            say "   WARNING: not every copy moved (above): the new release runs the old bytes of those paths until they are moved by hand"
+        fi
+        say "   (a hand edit among them is kept there: compare it with the new file and re-apply it if it is still wanted)"
+    fi
+fi
 
 say ""
 say "UPDATED: /$target now holds the new appliance set. Reboot to run it."

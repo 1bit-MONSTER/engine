@@ -205,7 +205,28 @@ int main() {
         check("a weight whose size differs from the card's lock is not linked and the card is refused",
               sm == 1 && refused && fs::is_symlink(fs::symlink_status(dir / "lc" / "parameter" / "m.gguf")) &&
               !fs::exists(fs::symlink_status(dir / "lc" / "parameter" / "d.gguf")) &&
-              swhy.find("the card's lock says 99 for @checkpoint/d.gguf") != std::string::npos);
+              swhy.find("size (99) and sha256 the card's lock gives for @checkpoint/d.gguf") != std::string::npos);
+        // option (b): the lock's sha256 finds the right bytes under ANOTHER name (unsloth's dspark-..._Old.gguf), and
+        // the file under the card's name (replaced, another size) is not used
+        {
+            std::ofstream(dir / "snap" / "d.gguf") << "a new layout";
+            std::ofstream(dir / "snap" / "d_Old.gguf") << "dd";
+            std::ofstream(dir / "snap" / "z_same_size.gguf") << "zz";   // same size, other bytes: must lose on sha
+            std::ofstream(dir / "lc" / "model.json.lock") << R"({"files":[{"origin":"@checkpoint/m.gguf","size":1},)"
+                R"({"origin":"@checkpoint/d.gguf","size":2,"sha256":")" + loom::sha256_of_file((dir / "snap" / "d_Old.gguf").string()) +
+                R"("}]})";
+            bool r2 = false;
+            std::string w2;
+            const int n2 = loom::loom_link_card_parameters((dir / "lc" / "model.json").string(),
+                                                           (dir / "snap" / "m.gguf").string(), w2, &r2);
+            check("a drafter replaced under the card's name is found by the lock's sha under its other name",
+                  n2 == 1 && !r2 && w2.empty() &&
+                  fs::read_symlink(dir / "lc" / "parameter" / "d.gguf") == dir / "snap" / "d_Old.gguf");
+            std::string w3;
+            check("a link that already resolves to a file of the lock's size is kept (no re-hash, no change)",
+                  loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(), w3) == 0 &&
+                  fs::read_symlink(dir / "lc" / "parameter" / "d.gguf") == dir / "snap" / "d_Old.gguf");
+        }
         fs::remove_all(dir);
     }
 

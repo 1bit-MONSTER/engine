@@ -123,6 +123,24 @@
     "--pool_backing=fixed"
    ],
    "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7109544282 (hrx-loom 0.3.0: ids MATCH thinking off / EXPLAINED thinking on (#3376), accuracy near-ties 0.022-0.351 nats, faster on every axis through serve: decode 76.2 -> 100.6 / 65.5 -> 105.6 tok/s); card huggingface.co/1bit-MONSTER/Qwen3-4B-GGUF-loom @ c6e13152 (ours: loom-fun/ggml-org-Qwen3-4B-loom@b0944ed9 re-pointed to the unsloth checkpoint)"
+  },
+  {
+   "id": "qwen3-4b-instruct-2507-q4_k_m",
+   "match": {
+    "gguf_sha256": "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
+    "gguf_size": 2497281120,
+    "model": [
+     "Qwen3-4B-Instruct-2507-1bit",
+     "Qwen3-4B-Instruct-2507-Q4_K_M"
+    ]
+   },
+   "card": "unsloth-Qwen3-4B-Instruct-2507-loom",
+   "preset": "chat",
+   "device": "amdgpu://",
+   "args": [
+    "--pool_backing=fixed"
+   ],
+   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7113644328 (hrx-loom 0.3.0: ids MATCH, accuracy = fallback at near-ties 0.579/0.297 nats, prefill + decode faster through serve); card loom-fun/unsloth-Qwen3-4B-Instruct-2507-loom @ d0df214d (stock)"
   }
  ]
 }

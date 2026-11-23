@@ -141,6 +141,24 @@
     "--pool_backing=fixed"
    ],
    "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7113644328 (hrx-loom 0.3.0: ids MATCH, accuracy = fallback at near-ties 0.579/0.297 nats, prefill + decode faster through serve); card loom-fun/unsloth-Qwen3-4B-Instruct-2507-loom @ d0df214d (stock)"
+  },
+  {
+   "id": "qwen3.5-4b-ud-q4_k_xl",
+   "match": {
+    "gguf_sha256": "b252c5610a42ca82d20fe2a12813e9d069eed89292907e26c783eeb0bc961bc7",
+    "gguf_size": 2912109728,
+    "model": [
+     "Qwen3.5-4B-1bit",
+     "Qwen3.5-4B-UD-Q4_K_XL"
+    ]
+   },
+   "card": "Qwen3.5-4B-GGUF-loom",
+   "preset": "chat",
+   "device": "amdgpu://",
+   "args": [
+    "--pool_backing=fixed"
+   ],
+   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7115828650 (hrx-loom 0.3.0: ids MATCH thinking off + on; accuracy 37.5 % vs fallback 25.0 % with the reasoning's edge whitespace ignored (#3433), other splits near-ties 0.065-0.397 nats; via serve decode 61.5 -> 103.0 / 59.0 -> 107.9 tok/s (DFlash drafter), prefill 262 -> 1,249 / 2,156 -> 3,295); card huggingface.co/1bit-MONSTER/Qwen3.5-4B-GGUF-loom @ 96c2f2f7 (ours: loom-skills port of loom-fun/unsloth-Qwen3.5-4B-loom@64bf4025 for the unsloth UD-Q4_K_XL, z-lab-derived DFlash drafter, mmproj)"
   }
  ]
 }

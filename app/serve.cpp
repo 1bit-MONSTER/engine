@@ -1605,7 +1605,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
 // ---------------------------------------------------------------------------------------------------
 // The Loom GPU route (app/loom_route.h, docs/loom-route.md). A .gguf served on the GPU whose entry in the route
 // table matches is served by loom-serve with the entry's card; anything else takes the llama.cpp route above,
-// unchanged. With the shipped (empty) table nothing here prints or reads the model.
+// unchanged. A model whose file size matches no entry is never read (the size is compared before any hash).
 
 std::string default_loom_serve(const Options& o) {
     if (!o.loom_serve.empty()) return o.loom_serve;
@@ -1656,7 +1656,25 @@ std::optional<Launch> loom_launch_for(const Options& o, int child_port) {
     if (fs::path(o.model).extension() != ".gguf") return std::nullopt;
     if (o.no_loom) return std::nullopt;
     if (const char* e = std::getenv("ONEBIT_NO_LOOM"); e && *e && std::string(e) != "0") return std::nullopt;
-    const loom::LoomRoutes table = load_loom_routes(o);
+    loom::LoomRoutes table = load_loom_routes(o);
+    // An entry whose card is not installed can only fall back, so it is dropped before matching: the sha256 of a
+    // multi-GB file (3.3 s for a 1.1 GB GGUF on ryzen) is then paid only when the route could actually be taken.
+    {
+        std::error_code ec;
+        const uint64_t model_size = fs::file_size(o.model, ec);
+        std::vector<loom::LoomRoute> usable;
+        for (const auto& r : table.routes) {
+            const std::string c = loom::loom_card_path(r, loom_cards_dir(o));
+            std::string why = "card path " + r.card + " is not a model.json inside the cards directory";
+            if (!c.empty() && !loom::loom_card_model_id(c, why).empty()) {
+                usable.push_back(r);
+            } else if (!ec && r.size == model_size) {  // the one line the skip owes the user (docs/loom-route.md), no hash
+                std::fprintf(stderr, "1bit serve: loom route %s has the size of %s, but its card is not usable (%s): serving on "
+                                     "the llama.cpp route (docs/loom-route.md)\n", r.id.c_str(), o.model.c_str(), why.c_str());
+            }
+        }
+        table.routes = std::move(usable);
+    }
     if (table.routes.empty()) return std::nullopt;
     const std::vector<std::string> names = {o.alias, fs::path(o.model).stem().string(), fs::path(o.model).filename().string()};
     std::string sha;
@@ -3939,8 +3957,8 @@ void usage(FILE* out) {
                  "                  the model and its device for each request with model auto (docs/laya-models.md)\n"                 "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
                  "                  (default: config/recipes.json, built in; docs/recipes.md)\n"
                  "                  [--loom-routes FILE] [--loom-serve PATH] [--loom-cards DIR] [--no-loom]   the GPU\n"
-                 "                  route per model: a .gguf with an entry (default: config/loom-routes.json, built in,\n"
-                 "                  empty until a model passes the gate) is served by loom-serve (ONEBIT_LOOM_SERVE) with\n"
+                 "                  route per model: a .gguf with an entry (default: config/loom-routes.json, built in: the\n"
+                 "                  models that passed the gate) is served by loom-serve (ONEBIT_LOOM_SERVE) with\n"
                  "                  its Loom card (relative cards under ONEBIT_LOOM_CARDS); any other model, or --no-loom\n"
                  "                  (ONEBIT_NO_LOOM=1), takes the llama.cpp route (docs/loom-route.md)\n"
                  "                  [--template-pin FILE | --no-template-pin] [--template-pin-strict]   a GGUF's\n"

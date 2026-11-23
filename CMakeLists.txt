@@ -473,7 +473,7 @@ add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $
 # normalisation as pure functions, then `1bit serve` end to end against tests/fake_loom_serve.py (route chosen,
 # fallback with no entry, a card that fails to prepare, a foreign process on the port, the normalised fields).
 add_executable(loom_route_test tests/loom_route_test.cpp)
-target_include_directories(loom_route_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
+target_include_directories(loom_route_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(loom_route_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME loom_route_unit COMMAND loom_route_test)
 # built with onebit, so the configuration CI builds has it (tools/ci/ci_targets_check.py)

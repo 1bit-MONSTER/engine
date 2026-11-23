@@ -35,8 +35,9 @@ Usage:
       DIR holds <card>.model.json and <card>.lock (model.json.lock) fetched at each card's pinned commit;
       hf-list is the HF API listing of author=loom-fun (id, sha, cardData); catalogue-hf has the weights repos'
       cardData at our pinned commit. Network fetching is done by the caller (see docs/loom-route.md).
-  loom_cards.py --check [--map config/loom-cards.json] [--pins models/pins.json]
-      Offline: shape, pins, licences, and every `exact` claim re-checked against models/pins.json.
+  loom_cards.py --check [--map config/loom-cards.json] [--routes config/loom-routes.json] [--pins models/pins.json]
+      Offline: shape, pins, licences, and every `exact` claim re-checked against models/pins.json; every
+      config/loom-routes.json entry must name a pinned file (sha256 + size).
   loom_cards.py --self-test
 """
 import argparse
@@ -234,6 +235,28 @@ def check(doc, pins):
     return errs
 
 
+def check_routes(routes_doc, pins):
+    """config/loom-routes.json: every entry's gguf_sha256 + gguf_size must be a file models/pins.json pins (a route
+    names only bytes we ship; a gate row on another upload measures a model we do not serve, engine#3158)."""
+    errs = []
+    pinned = {}
+    for repo, p in pins.items():
+        for fname, f in (p.get("files") or {}).items():
+            if f.get("oid"):
+                pinned[f["oid"]] = (repo, fname, f.get("size"))
+    for i, r in enumerate(routes_doc.get("routes", [])):
+        m = r.get("match") or {}
+        sha, size = m.get("gguf_sha256", ""), m.get("gguf_size")
+        where = "route %r" % r.get("id", i)
+        if not sha:
+            errs.append(where + ": no match.gguf_sha256 (a shipped route must name the exact checkpoint)")
+        elif sha.lower() not in pinned:
+            errs.append(where + ": gguf_sha256 is not a file models/pins.json pins")
+        elif pinned[sha.lower()][2] is not None and pinned[sha.lower()][2] != size:
+            errs.append(where + ": gguf_size %s != the pinned size %s" % (size, pinned[sha.lower()][2]))
+    return errs
+
+
 def self_test():
     sha_a, sha_b = "a" * 64, "b" * 64
     pins = {"o/M-GGUF": {"commit": "1" * 40, "files": {"M-Q4_K_M.gguf": {"oid": sha_a}}},
@@ -289,9 +312,19 @@ def self_test():
     ok(any("not one of" in x for x in check(bad, pins)), "unknown match kind is caught")
     ok(norm_name("rippertnt/HyperCLOVAX-SEED-Text-Instruct-1.5B-Q4_K_M-GGUF") == "hyperclovax-seed-text-instruct-1.5b",
        "norm_name drops quant suffix")
+    rt = {"routes": [{"id": "ok", "match": {"gguf_sha256": sha_a, "gguf_size": 7}}]}
+    pins_sz = copy.deepcopy(pins)
+    pins_sz["o/M-GGUF"]["files"]["M-Q4_K_M.gguf"]["size"] = 7
+    ok(check_routes(rt, pins_sz) == [], "a route on a pinned file (sha + size) passes")
+    ok(any("not a file" in x for x in check_routes({"routes": [{"id": "x", "match": {"gguf_sha256": "c" * 64, "gguf_size": 7}}]}, pins_sz)),
+       "a route on an unpinned upload is caught")
+    ok(any("gguf_size" in x for x in check_routes({"routes": [{"id": "x", "match": {"gguf_sha256": sha_a, "gguf_size": 8}}]}, pins_sz)),
+       "a route whose size disagrees with the pin is caught")
+    ok(any("no match.gguf_sha256" in x for x in check_routes({"routes": [{"id": "x", "match": {"model": ["m"]}}]}, pins_sz)),
+       "a route without a sha256 is caught")
     for f in fails:
         print("FAIL:", f)
-    print("loom_cards self-test: %d checks, %d failed" % (17, len(fails)))
+    print("loom_cards self-test: %d checks, %d failed" % (21, len(fails)))
     return 1 if fails else 0
 
 
@@ -306,6 +339,7 @@ def main():
     ap.add_argument("--catalogue-hf")
     ap.add_argument("--pins", default=os.path.join(ROOT, "models", "pins.json"))
     ap.add_argument("--map", default=os.path.join(ROOT, "config", "loom-cards.json"))
+    ap.add_argument("--routes", default=os.path.join(ROOT, "config", "loom-routes.json"))
     ap.add_argument("-o", "--output")
     a = ap.parse_args()
     if a.self_test:
@@ -328,6 +362,7 @@ def main():
         return 1 if errs else 0
     if a.check:
         errs = check(json.load(open(a.map)), pins)
+        errs += ["loom-routes: " + x for x in check_routes(json.load(open(a.routes)), pins)]
         for x in errs:
             print("loom-cards:", x, file=sys.stderr)
         print("loom-cards check: %d errors" % len(errs))

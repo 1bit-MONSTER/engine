@@ -584,7 +584,7 @@ hrx_placement_verdict() {
     if [ "$_m" -gt 0 ] && { [ $(( _d * 2 )) -lt "$_m" ] || [ $(( _u * 2 )) -lt "$_m" ]; }; then
         printf 'FAIL an arm held %s / %s MiB of own GTT for a %s MiB model: less than half of it, so that process never had the model on the GPU and this is not a measurement of the placement' "$_d" "$_u" "$_m"; return 0
     fi
-    # docs/hrx.md's own pair is 1.76x; 15 % is a floor noise cannot reach, and being relative it needs no absolute MiB
+    # docs/hrx.md's own pair is 1.76x; 15 % is a floor that cannot be reached by noise, and being relative it needs no absolute MiB
     # threshold to drift with ctx or slots
     if [ "$_u" -ge $(( _d + _d * _f / 100 )) ]; then
         printf 'PASS the shipped default (the loader'"'"'s mapping, #304) costs %s MiB of its own GTT against %s MiB with GGML_HRX_MODEL_BUFFER_COPY=1 (the upload costs at least %s%% more)' "$_d" "$_u" "$_f"

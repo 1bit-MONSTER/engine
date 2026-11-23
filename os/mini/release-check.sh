@@ -450,7 +450,7 @@ queue_verdict() {
 # REFUSED at its own short bound (`--queue-ms-plain`, 5000 ms on the appliance) with `503 + Retry-After` - not parked
 # silently for the whole queue. Without this arm the row cannot see the path the fix's second half is about, because
 # both of its chats stream. Pure, so --self-test drives it: <long chat body> <status> <refusal body> <Retry-After>
-# <TDRs before> <TDRs after> [<1 if the long chat was still running when this one came back>].
+# <TDRs before> <TDRs after> [<1 if the long chat was still running when this one came back>] [<timing text>].
 plain_queue_verdict() {
     _p1=$1 _ps=$2 _pb=$3 _pr=$4 _t0=$5 _t1=$6
     case "$_p1" in
@@ -466,7 +466,9 @@ plain_queue_verdict() {
              # is a pass only when the answer is right and came back while the long chat was still running (arg 7 = 1);
              # a 200 after the long chat had finished is the old defect, a non-streamed request parked silently.
              if [ "${7:-0}" != 1 ]; then
-                 printf 'FAIL the non-streamed chat was ANSWERED while the device was still busy: the short bound did not apply'
+                 # the timings tell a parked request from a slow box (review of #3381): seconds from the long chat's start
+                 printf 'FAIL the non-streamed chat was ANSWERED while the device was still busy: the short bound did not apply%s' \
+                        "${8:+ ($8)}"
                  return 0
              fi
              case "$_pb" in
@@ -523,11 +525,12 @@ concurrent_verdict() {
             *) printf 'FAIL chat %s of %s ended without data: [DONE]: %.80s' "$((_ci + 1))" "$_cn" "$_cb"; return 0 ;;
         esac
         _ct=$(printf '%s' "$_cb" | grep -oE '"content":"[^"]*"' | sed 's/^"content":"//; s/"$//' | tr -d '\n')
-        case "$_ct" in
-            *"$_cw"*) _cok="$_cok $((_ci + 1))" ;;
-            *) printf 'FAIL chat %s of %s did not answer %s (said: %.80s)' "$((_ci + 1))" "$_cn" "$_cw" "${_ct:-nothing}"
-               return 0 ;;
-        esac
+        # whole word, not substring: this row is the check for a slot handing a user the wrong text, so "Au" must not
+        # pass inside "August" nor "42" inside "142" (review of #3381)
+        if printf '%s' "$_ct" | grep -qw -- "$_cw"; then _cok="$_cok $((_ci + 1))"
+        else printf 'FAIL chat %s of %s did not answer %s (said: %.80s)' "$((_ci + 1))" "$_cn" "$_cw" "${_ct:-nothing}"
+             return 0
+        fi
         _ci=$((_ci + 1))
     done
     if [ -z "$_c0" ] || [ -z "$_c1" ]; then
@@ -1368,6 +1371,10 @@ data: [DONE]' '' '')"                                                           
     check PASS "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"1BIT OK"}}]}' '' 0 0 1)"
     check PASS "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"1BIT OK"}}]}' '' '' '' 1)"                                # dmesg unreadable
     check FAIL "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"1BIT OK"}}]}' '' 0 0 0)"                                  # after the long one ended
+    case "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"1BIT OK"}}]}' '' 0 0 0 'short chat back at 41 s, long chat ended at 38 s')" in
+        *'(short chat back at 41 s, long chat ended at 38 s)') printf 'ok   plain_queue_verdict puts the measured timings in its FAIL text\n' ;;
+        *) printf 'FAIL plain_queue_verdict dropped the timings from its FAIL text\n'; rc=1 ;;
+    esac
     check FAIL "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"OK"}}]}' '' 0 0 1)"                                       # wrong answer
     check FAIL "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"1BIT OK"}}]}' '' 0 1 1)"                                  # a TDR
     check FAIL "$(plain_queue_verdict 'data: {"choices":[{"delta":{"content":"long"}}]}' 200 '{"choices":[{"message":{"content":"1BIT OK"}}]}' '' 0 0 1)"   # long chat cut
@@ -1393,6 +1400,16 @@ data: [DONE]'
     _cset 1 Paris 'data: {"error":{"message":"the NPU is busy with another request"}}
 data: [DONE]'
     check FAIL "$(concurrent_verdict "$CT" 2 0 0)"                                                       # refused
+    # whole word (review of #3381): a substring of a longer word is not the answer, punctuation around it is fine
+    _cset 1 Au 'data: {"choices":[{"delta":{"content":"August"}}]}
+data: [DONE]'
+    check FAIL "$(concurrent_verdict "$CT" 2 0 0)"                                                       # "Au" inside "August"
+    _cset 1 42 'data: {"choices":[{"delta":{"content":"142"}}]}
+data: [DONE]'
+    check FAIL "$(concurrent_verdict "$CT" 2 0 0)"                                                       # "42" inside "142"
+    _cset 1 Paris 'data: {"choices":[{"delta":{"content":"**Paris**."}}]}
+data: [DONE]'
+    check PASS "$(concurrent_verdict "$CT" 2 0 0)"                                                       # markdown + punctuation
     rm -rf "$CT"
     # the history that goes back into the request has to survive a JSON string
     jt=$(json_text 'a "quoted" \\ line
@@ -2356,6 +2373,7 @@ if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     PDIR=$(mktemp -d /tmp/npu-queue-plain.XXXXXX)
     PLONG="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Write a long essay about the history of cartography, and about what map-making changed in how people understood the world.\"}],\"max_tokens\":1000,\"temperature\":0,\"stream\":true}"
     PSHORT="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":16,\"temperature\":0}"
+    PT0=$(date +%s)
     ( auth_post "$PLONG" "$API/api/v1/chat/completions" slow > "$PDIR/long.sse" 2>&1 ) &
     # NOT `PPID=$!`: PPID is a readonly bash builtin, so this line was a fatal error in the image's own shell (it
     # printed "PPID: readonly variable" and exited 1, with no RESULT line - measured on the c27 board, and the row
@@ -2365,11 +2383,13 @@ if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     sleep 1
     PW=$(auth_post_watch "$PSHORT" "$API/api/v1/chat/completions" "$PDIR/short.json")
     kill -0 "$QPLPID" 2>/dev/null && PALIVE=1 || PALIVE=0   # engine#3318: was it served alongside the long chat?
+    PTS=$(($(date +%s) - PT0))
     wait "$QPLPID" 2>/dev/null
+    PTL=$(($(date +%s) - PT0))
     PLONG_BODY=$(cat "$PDIR/long.sse" 2>/dev/null)
     PSHORT_BODY=$(cat "$PDIR/short.json" 2>/dev/null)
     TDRP1=$(tdr_count)
-    VP=$(plain_queue_verdict "$PLONG_BODY" "${PW%% *}" "$PSHORT_BODY" "${PW#* }" "$TDRP0" "$TDRP1" "$PALIVE")
+    VP=$(plain_queue_verdict "$PLONG_BODY" "${PW%% *}" "$PSHORT_BODY" "${PW#* }" "$TDRP0" "$TDRP1" "$PALIVE" "short chat back at ${PTS} s, long chat ended at ${PTL} s")
     rm -rf "$PDIR"
     case "$VP" in
         PASS*) pass chat-npu-queue-plain "$NPU: $VP" ;;

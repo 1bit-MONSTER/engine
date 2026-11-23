@@ -22,7 +22,7 @@
 # shipped to the box, box_bench.sh checks RAM and GTT room and runs benchmark.py, and the report benchmark.py wrote on
 # the box becomes $RESULT_DIR/$RESULT_FILENAME.json here.
 #
-# MODEL (Hyperloom's --model) is a path ON THE BOX. The gate's references live on the box too (HL_STATE, default
+# MODEL (Hyperloom's --model, or HL_BOX_MODEL when --model is a local stand-in) is a path ON THE BOX. The gate's references live on the box too (HL_STATE, default
 # $HL_BOX_DIR/state/hrx-<model file name>), because the KLD base logits are recorded and compared where they are made.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -49,12 +49,16 @@ declare -A LEVERS=(
     [ONEBIT_HRX_DECODE_SPLIT]='^[0-9]{1,3}$'
     # pins, not levers: where the box keeps the build, the weights, the wiki text and the references; the job's RAM need
     [MODEL]=$BOXPATH
+    [HL_BOX_MODEL]=$BOXPATH
     [HL_PACKAGE]=$BOXPATH
     [HL_WIKI]=$BOXPATH
     [HL_STATE]=$BOXPATH
     [HL_RAM_NEED_GB]='^[0-9]{1,3}$'
     [HL_GTT_NEED_GIB]='^[0-9]{1,3}$'
 )
+# HL_BOX_MODEL (a pin) names the GGUF on the box when Hyperloom's --model is a local stand-in: 1.2.0 resolves --model
+# on the orchestration host (precision, serving path), where the weights are not.
+[ -n "${HL_BOX_MODEL:-}" ] && export MODEL=$HL_BOX_MODEL
 . "$HERE/../box_ticket.sh"
 : "${MODEL:?Hyperloom sets MODEL (--model): a GGUF path on the box}"
 export HL_WIKI=${HL_WIKI:-$HL_BOX_DIR/wiki.test.raw}

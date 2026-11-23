@@ -340,25 +340,7 @@ def request_body(model, prompt, max_tokens, top_logprobs, thinking=False, minima
     }
 
 
-# --with-reasoning joins a reply's reasoning and its answer with this line, so the two halves cannot run together
-REASONING_SEP = "\n<<answer>>\n"
-
-
-def reply_text(message, with_reasoning=False):
-    """The text a run is compared on: the answer `content`, or with --with-reasoning the reasoning, then the answer.
-
-    engine#3158, Inkling-2-Mini thinking on: both arms answered every prompt correctly but in different words
-    ("2, 3, 5, 7, 11" vs "2,3,5,7,11"), because they split somewhere INSIDE the thinking. The answer alone says that
-    they diverged, not where, so whether the split was a near-tie could not be told. Both loom-serve and llama-server
-    return the thinking as `reasoning_content` beside `content`.
-    """
-    content = message.get("content") or ""
-    if not with_reasoning:
-        return content
-    return (message.get("reasoning_content") or message.get("reasoning") or "") + REASONING_SEP + content
-
-
-def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False, minimal=False, with_reasoning=False):
+def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False, minimal=False):
     """One greedy request; returns the generated token ids with their log-probs."""
     body = request_body(model, prompt, max_tokens, top_logprobs, thinking, minimal)
     t = time.time()
@@ -382,8 +364,7 @@ def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False, m
             top.append({"id": x.get("id"), "token": x.get("token"), "lp": x.get("logprob")})
         toks.append({"id": tk.get("id"), "token": tk.get("token"), "lp": tk.get("logprob"), "top": top})
     return {
-        "text": reply_text(ch.get("message") or {}, with_reasoning),
-        "reasoning": (ch.get("message") or {}).get("reasoning_content") or "",
+        "text": (ch.get("message") or {}).get("content") or "",
         "tokens": toks,
         "have_logprobs": bool(toks),
         "secs": round(time.time() - t, 3),
@@ -725,15 +706,6 @@ def selftest():
     # that are identical under text.
     ok(effective_match_by("id", True, True) == "id" and effective_match_by("text", True, True) == "text",
        "effective_match_by: an id-vs-id pair keeps the id key, and an explicit text request is untouched")
-    # reply_text: --with-reasoning puts the thinking first, so a split inside it is a text difference; without the
-    # flag only the answer counts (the default every earlier row was measured with)
-    m = {"content": "2,3,5", "reasoning_content": "primes: 2 then 3"}
-    ok(reply_text(m) == "2,3,5" and reply_text(m, True) == "primes: 2 then 3" + REASONING_SEP + "2,3,5"
-       and reply_text({"content": "x"}, True) == REASONING_SEP + "x",
-       "reply_text: answer alone by default; reasoning + separator + answer with --with-reasoning")
-    ok(reply_text({"content": "same", "reasoning_content": "a"}, True)
-       != reply_text({"content": "same", "reasoning_content": "b"}, True),
-       "reply_text: two equal answers after different reasoning differ under --with-reasoning")
     ok(effective_match_by("id", True, False) == "text" and effective_match_by("id", False, False) == "text",
        "effective_match_by: one route without ids degrades the pair to text instead of reporting total divergence")
     # both routes answering with NO content is not agreement: with thinking on and a small --max-tokens a route can
@@ -782,10 +754,6 @@ def main(argv=None):
     p.add_argument("--match-by", choices=["id", "text"], default="id",
                    help="compare tokens by id (default) or by text, which is the only field the "
                         "NPU forward path shares with the llama-server routes")
-    p.add_argument("--with-reasoning", action="store_true",
-                   help="compare each reply's reasoning_content followed by its answer, not the answer alone: with "
-                        "thinking on, two routes can give the same answer in different words after splitting inside "
-                        "the thinking, and only the joined text shows where")
     p.add_argument("--timeout", type=float, default=300.0)
     p.add_argument("--json", default=None, help="write the full report here")
     p.add_argument("--selftest", action="store_true", help="check the comparison logic and exit")
@@ -825,7 +793,6 @@ def main(argv=None):
 
     report = {"model": model, "max_tokens": a.max_tokens, "repeat": a.repeat,
               "top_logprobs": a.top_logprobs, "thinking": a.thinking, "match_by": a.match_by,
-              "with_reasoning": a.with_reasoning,
               "body": a.body, "logprobs_requested": a.body == "full", "text_only": a.text_only,
               "routes_body": {},
               "time": time.strftime("%FT%T%z"),
@@ -839,7 +806,7 @@ def main(argv=None):
         for pi, prompt in enumerate(PROMPTS):
             runs = []
             for _ in range(a.repeat):
-                r = ask(url, model, prompt, a.max_tokens, a.top_logprobs, a.timeout, thinking, minimal, a.with_reasoning)
+                r = ask(url, model, prompt, a.max_tokens, a.top_logprobs, a.timeout, thinking, minimal)
                 if "error" in r:
                     report["errors"].append(f"{label} prompt {pi}: {r['error']}")
                     break

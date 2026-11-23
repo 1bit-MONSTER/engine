@@ -121,6 +121,11 @@ def main():
         env, log = setup(td)
 
         p, rep, rd = round_(env, td, "baseline")
+        if not (rep and rep.get("quality_gate", {}).get("passed")):
+            for f in ("status", "ticket.log", "ram.txt", "gauntlet.log", "serve.log"):
+                q = rd / "box" / f
+                print("== baseline box/%s: %s" % (f, q.read_text()[-800:] if q.exists() else "(absent)"))
+            print("== entrypoint stdout/stderr:", p.stdout[-800:], p.stderr[-800:])
         check("baseline exits 0", p.returncode == 0, p.stderr[-800:])
         check("baseline writes a report", rep is not None, p.stdout[-800:] + p.stderr[-800:])
         if rep:
@@ -131,7 +136,8 @@ def main():
             check("baseline has a positive score", rep["output_throughput"] > 0, str(rep.get("bench_summary", {}).get("metrics")))
             check("the report says no KLD was measured", g.get("kld") is None and "logits" in g.get("kld_note", ""))
             check("provenance names the card revision",
-                  rep["bench_summary"]["provenance"]["card_revision"] == "a8354e77test")
+                  rep["bench_summary"].get("provenance", {}).get("card_revision") == "a8354e77test",
+                  "status: %s" % rep["bench_summary"].get("status"))
         shims = log.read_text() if log.exists() else ""
         check("the measurement ran through box-hold gpu", "box-hold gpu" in shims, shims)
 

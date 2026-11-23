@@ -105,10 +105,18 @@ json.dump(doc, open(dst, "w"), indent=1)
 EOF
 
 DEV='amdgpu://'; [ "$SPIN" = default ] || DEV="amdgpu://?completion_spin_ns=$SPIN"
-PORT=$((18400 + $$ % 90))
+# A port nothing is bound to (another lane's CPU-side server, or a parallel test, may hold one in the range).
+PORT=$(python3 -c '
+import socket, sys
+for p in range(18400, 18490):
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", p)); s.close(); print(p); sys.exit(0)
+    except OSError:
+        s.close()
+sys.exit(1)') || { status "refused: no free port in 18400-18489"; exit 3; }
 CMD=("$LS" "--model=$OV/model.json" --preset=chat "--device=$DEV" "--pool_backing=$POOL" "--workers=$WORKERS" "--listen=127.0.0.1:$PORT")
 [ -n "$WAIT" ] && CMD+=("--wait_mode=$WAIT")
-if curl -s -m 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then status "refused: port $PORT already serves"; exit 3; fi
 
 hw() { for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name" 2>/dev/null)" = "$1" ] && { echo "$h"; return; }; done; }
 K=$(hw k10temp)
@@ -134,6 +142,7 @@ while [ $i -lt 600 ]; do
 done
 echo "$i" > "$OUT/register_s"
 if [ $ok != 1 ]; then
+    kill -TERM -- -"$pid" 2>/dev/null   # its process group: setsid made the server a session leader
     curl -s -m 5 "http://127.0.0.1:$PORT/v1/status" 2>/dev/null | head -c 2000 > "$OUT/status.json"
     status "failed: the model did not register in ${i}s (serve.log)"; exit 1
 fi

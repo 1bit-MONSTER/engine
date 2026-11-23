@@ -91,7 +91,7 @@ python -m hyperloom optimize -v --framework custom \
   subscription token (`claude setup-token`) read into the launch environment only leaves `~/.claude/config.json`
   alone. `install.sh` also refuses without one and persists whatever it is given into `.env` and the kernel-agent env
   file, so run it with a placeholder and delete that line afterwards.
-* With `--framework custom`, the benchmark interpreter is `/opt/venv/bin/python` whenever that file exists; only a
+* `../host_venv_fixup.sh VENV` applies the fix below. With `--framework custom`, the benchmark interpreter is `/opt/venv/bin/python` whenever that file exists; only a
   `vllm` on `PATH` takes precedence (its sibling `python` is used). On a host whose `/opt/venv` belongs to someone else,
   put a refusing `vllm` shim in the run's venv `bin/` (first on `PATH`) and pre-install `ray[default]>=2.44.1` there
   (Python 3.14 has no 2.44.1 wheel; 2.55.0 passes the probe).

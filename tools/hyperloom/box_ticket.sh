@@ -22,6 +22,7 @@
 #   hl_ticket   `box-hold gpu [sudo -n] timeout -k 30 <HL_TICKET_MIN*60> env <levers> <command>` over ssh; a signal to
 #               the entrypoint kills the remote ticket by its id, so no measurement outlives its round
 #   hl_fetch    bring the ticket's output directory back into $RESULT_DIR/box
+#   hl_exit_if_unreachable  the box never answered: exit 75 with no report (infrastructure, not a measurement)
 #
 # Caller sets HERE, LOG_TAG and LEVERS (declare -A) before sourcing; exports TICKET, ROUT, RDIR, PASS, LEVERS_JSON.
 : "${RESULT_DIR:?Hyperloom sets RESULT_DIR}"
@@ -31,6 +32,8 @@ HL_BOX_DIR=${HL_BOX_DIR:-/data/dev/cl-hyperloom}
 HL_SSH=${HL_SSH:-ssh}
 HL_TICKET_MIN=${HL_TICKET_MIN:-40}      # the fleet's ticket cap is 45 minutes
 HL_HOLD_WAIT=${HL_HOLD_WAIT:-3600}
+HL_SSH_RETRIES=${HL_SSH_RETRIES:-2}     # ssh failures (rc 255) retried before the round is given up as unreachable
+HL_SSH_RETRY_SEC=${HL_SSH_RETRY_SEC:-60}
 case "$HL_TICKET_MIN" in ''|*[!0-9]*) echo "[$LOG_TAG] HL_TICKET_MIN must be minutes" >&2; exit 1 ;; esac
 [ "$HL_TICKET_MIN" -le 45 ] || { echo "[$LOG_TAG] HL_TICKET_MIN=$HL_TICKET_MIN is above the fleet's 45-minute ticket cap" >&2; exit 1; }
 mkdir -p "$RESULT_DIR/box" || exit 1
@@ -69,15 +72,31 @@ hl_ship() {  # hl_ship FILE... (relative to $HERE)
     local rev
     rev=$(cd "$HERE" && cat "$@" | sha256sum | cut -c1-12)
     RDIR=$HL_BOX_DIR/hl/$rev
-    tar -C "$HERE" -cf - "$@" | $HL_SSH "$HL_BOX" "mkdir -p $RDIR $HL_BOX_DIR/out && tar -C $RDIR -xf -" \
-        || { echo "[$LOG_TAG] cannot copy the box side to $HL_BOX:$RDIR" >&2; exit 1; }
+    local attempt=0 rc
+    while :; do
+        tar -C "$HERE" -cf - "$@" | $HL_SSH -o ConnectTimeout=20 "$HL_BOX" "mkdir -p $RDIR $HL_BOX_DIR/out && tar -C $RDIR -xf -"
+        rc=${PIPESTATUS[1]}
+        [ "$rc" = 0 ] && return 0
+        if [ "$rc" = 255 ] && [ "$attempt" -lt "$HL_SSH_RETRIES" ]; then
+            attempt=$((attempt + 1))
+            echo "[$LOG_TAG] ship: ssh failed (rc 255); retry $attempt of $HL_SSH_RETRIES in ${HL_SSH_RETRY_SEC}s" >&2
+            sleep "$HL_SSH_RETRY_SEC"
+            continue
+        fi
+        if [ "$rc" = 255 ]; then
+            echo "[$LOG_TAG] box $HL_BOX unreachable while shipping (ssh rc 255, $HL_SSH_RETRIES retries): no report, exit 75" >&2
+            exit 75
+        fi
+        echo "[$LOG_TAG] cannot copy the box side to $HL_BOX:$RDIR (rc $rc)" >&2
+        exit 1
+    done
 }
 
 # The pattern is bracketed so it does not match the shell that runs this very pkill (its command line holds the pattern
 # text, and "[o]ut/..." as text does not match "[o]ut/..." as a regex). serve.pid is the process group a box script
 # started its server in, if it wrote one.
 hl_kill_remote() {
-    $HL_SSH "$HL_BOX" "sudo -n pkill -TERM -f -- '[o]ut/$TICKET'; sleep 5; p=\$(cat $ROUT/serve.pid 2>/dev/null) && sudo -n kill -KILL -\$p 2>/dev/null; true" \
+    $HL_SSH -o ConnectTimeout=20 "$HL_BOX" "sudo -n pkill -TERM -f -- '[o]ut/$TICKET'; sleep 5; p=\$(cat $ROUT/serve.pid 2>/dev/null) && sudo -n kill -KILL -\$p 2>/dev/null; true" \
         </dev/null >/dev/null 2>&1
 }
 
@@ -86,14 +105,38 @@ hl_ticket() {  # hl_ticket [--sudo] COMMAND...  (COMMAND words are box-side; ROU
     [ "${1:-}" = --sudo ] && { sudo='sudo -n'; shift; }
     trap 'echo "[$LOG_TAG] stopped: killing ticket $TICKET" >&2; hl_kill_remote; exit 143' TERM INT
     echo "[$LOG_TAG] ticket $TICKET on $HL_BOX (box-hold gpu, held part <= ${HL_TICKET_MIN} min)"
-    $HL_SSH -o ServerAliveInterval=30 "$HL_BOX" \
-        "mkdir -p $ROUT && BOX_HOLD_WHO='cl-hyperloom $TICKET' BOX_HOLD_WAIT=$HL_HOLD_WAIT box-hold gpu $sudo timeout -k 30 $((HL_TICKET_MIN * 60)) env ${PASS[*]} $*" \
-        </dev/null > "$RESULT_DIR/box/ticket.log" 2>&1 &
-    local sp=$!
-    wait $sp
-    TICKET_RC=$?
+    local attempt=0 sp
+    : > "$RESULT_DIR/box/ticket.log"
+    while :; do
+        $HL_SSH -o ConnectTimeout=20 -o ServerAliveInterval=30 "$HL_BOX" \
+            "mkdir -p $ROUT && BOX_HOLD_WHO='cl-hyperloom $TICKET' BOX_HOLD_WAIT=$HL_HOLD_WAIT box-hold gpu $sudo timeout -k 30 $((HL_TICKET_MIN * 60)) env ${PASS[*]} $*" \
+            </dev/null >> "$RESULT_DIR/box/ticket.log" 2>&1 &
+        sp=$!
+        wait $sp
+        TICKET_RC=$?
+        # 255 is ssh's own failure (box unreachable, connection lost). Retry a few times: on 23 Nov 04:29Z the box's NIC
+        # vanished mid-ticket, and a round must not be graded on a measurement that never ran.
+        [ "$TICKET_RC" = 255 ] && [ "$attempt" -lt "$HL_SSH_RETRIES" ] || break
+        attempt=$((attempt + 1))
+        echo "[$LOG_TAG] ssh failed (rc 255); retry $attempt of $HL_SSH_RETRIES in ${HL_SSH_RETRY_SEC}s" | tee -a "$RESULT_DIR/box/ticket.log"
+        hl_kill_remote
+        sleep "$HL_SSH_RETRY_SEC" &
+        wait $!
+    done
     trap - TERM INT
     echo "[$LOG_TAG] ticket rc=$TICKET_RC"
+}
+
+# The box could not be reached at all (ssh rc 255 after the retries): that is infrastructure, not a measurement. Exit
+# EX_TEMPFAIL WITHOUT a report, so Hyperloom records the round as a failed run (client_failed) instead of grading a
+# quality gate on numbers that do not exist -- on 23 Nov a failing report sent a run into ENABLEMENT to "fix" the
+# workload. Call after hl_fetch.
+hl_exit_if_unreachable() {
+    if [ "$TICKET_RC" = 255 ] && ! grep -qxE 'ok|failed:.*|refused:.*|killed.*' "$RESULT_DIR/box/status" 2>/dev/null; then
+        rm -f "$RESULT_DIR/$RESULT_FILENAME.json"
+        echo "[$LOG_TAG] box $HL_BOX unreachable (ssh rc 255, $HL_SSH_RETRIES retries): no report, exit 75" >&2
+        exit 75
+    fi
 }
 
 hl_fetch() {  # hl_fetch [tar --exclude patterns...]

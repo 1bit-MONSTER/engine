@@ -27,6 +27,8 @@ shims that record they were used, and loom-serve is a fake OpenAI server that st
   * a model that never registers is a failing report, not a crash and not a pass;
   * box_gate.sh (the restricted key's forced command): a full Inkling round passes through it once the box side is
     allowlisted; it refuses a shell, a ship of new scripts, a non-allowlisted or tampered rev, and a name outside its list;
+  * an unreachable box (ssh exits 255 every time) is retried, then the round exits 75 with NO report -- infrastructure,
+    never a graded measurement;
   * custom/ (the HRX route): a bad lever is refused before ssh, a ticket above the fleet's 45-minute cap is refused,
     and the box side refuses a job whose declared RAM need does not fit -- each as a failing report.
 
@@ -198,6 +200,22 @@ def main():
         with open(td / "box" / "hl" / rev / "box_inkling.sh", "a") as f:
             f.write("\n# tampered\n")
         check("gate: a tampered allowlisted rev is refused", gated(base % ("HL_RUNS=1", rev)).returncode == 126)
+
+        # an unreachable box: ssh always fails with 255 (the 23 Nov NIC loss)
+        dbin = td / "deadbin"
+        dbin.mkdir()
+        write_exe(dbin / "ssh", '#!/bin/bash\necho "ssh: connect to host fakebox port 22: No route to host" >&2\nexit 255\n')
+        p, rep, rd = round_(dict(env, PATH="%s:%s" % (dbin, env["PATH"]), HL_SSH_RETRY_SEC="0"), td, "unreachable")
+        check("an unreachable box: retried, then exit 75 and no report", p.returncode == 75 and rep is None
+              and p.stderr.count("retry") == 2 and "unreachable" in p.stderr, "rc=%s rep=%s %s" % (p.returncode, rep, p.stderr[-300:]))
+
+        # reachable for the ship, lost for the ticket: the ticket's own retry path
+        write_exe(dbin / "ssh", '#!/bin/bash\nwhile [ "${1:-}" = -o ]; do shift 2; done\nshift\n'
+                  'case "$*" in *box-hold*) echo "Timeout, server fakebox not responding." >&2; exit 255;; esac\n'
+                  'exec bash -c "$*"\n')
+        p, rep, rd = round_(dict(env, PATH="%s:%s" % (dbin, env["PATH"]), HL_SSH_RETRY_SEC="0"), td, "lost-mid-ticket")
+        check("box lost during the ticket: retried, then exit 75 and no report", p.returncode == 75 and rep is None
+              and (rd / "box" / "ticket.log").read_text().count("retry") == 2, "rc=%s %s" % (p.returncode, p.stderr[-300:]))
 
         # custom/: the HRX route over the same ticket library
         hrx = ROOT / "tools/hyperloom/custom"

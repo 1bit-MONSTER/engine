@@ -68,6 +68,7 @@ hl_levers
 hl_ship box_bench.sh benchmark.py
 hl_ticket bash "$RDIR/box_bench.sh" "$ROUT"
 hl_fetch
+hl_exit_if_unreachable
 if [ -f "$RESULT_DIR/box/inferencex_result.json" ]; then
     cp "$RESULT_DIR/box/inferencex_result.json" "$RESULT_DIR/$RESULT_FILENAME.json"
 else

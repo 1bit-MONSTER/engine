@@ -29,6 +29,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -94,6 +96,35 @@ inline const char* npu_contexts_refused_hint() {
            "else is serving, reload the driver (modprobe -r amdxdna && modprobe amdxdna)";
 }
 
+// engine#3318 item 3: in partition mode (NPU_PARTITION=<cols>, docs/npu.md "Sharing the NPU") a refused context is
+// most often the driver keeping a SECOND model off the free columns: two processes on 4+4 columns need amdxdna's
+// spatial placement, temporal_only=0 (third_party/patches/amdxdna/0014). Without it the second client gets the same
+// "code 102 / No such device" a dead array gives, which sends the operator to the device instead of the driver
+// setting. `partition` is $NPU_PARTITION, `temporal_only` the module parameter's text ("" when it cannot be read),
+// `module_present` whether /sys/module/amdxdna exists: an empty read only means "no parameter" when the module is there.
+inline std::string npu_partition_refusal_note(const char* partition, const std::string& temporal_only,
+                                              bool module_present = true) {
+    if (!partition || !*partition) return "";
+    std::string t = temporal_only;
+    while (!t.empty() && (t.back() == '\n' || t.back() == ' ')) t.pop_back();
+    std::string s = std::string("partition mode (NPU_PARTITION=") + partition +
+                    "): a second model on the free columns needs amdxdna's spatial placement, temporal_only=0";
+    if (t.empty() && !module_present)
+        s += "; /sys/module/amdxdna is not there (driver not loaded, or /sys not readable here), so its temporal_only "
+             "could not be read";
+    else if (t.empty())
+        s += "; this amdxdna has no temporal_only parameter (it predates third_party/patches/amdxdna/0014), so only "
+             "one client can hold the array at a time";
+    else if (t == "0")
+        s += "; this amdxdna has temporal_only=0, so placement is spatial and another client holds the columns this "
+             "model asks for";
+    else
+        s += "; this amdxdna has temporal_only=" + t + ", and a plain reload brings the same placement back: reload it "
+             "with spatial placement for two models side by side (modprobe -r amdxdna && modprobe amdxdna "
+             "temporal_only=0)";
+    return s;
+}
+
 // Run `open` until it succeeds, the window closes, or it has thrown `max_attempts` times. A caller that wants the log
 // silent can pass a no-op `report`; the default names each attempt with its own reason, which is the whole point.
 template <class Open, class Report, class Sleep>
@@ -126,6 +157,10 @@ void open_with_retry(const LoadRetryPolicy& p, const char* what, Open&& open, Re
                     // reload advice, which is the wrong first move while a live holder exists.
                     const std::string held = npu_lock_refusal_note();
                     if (!held.empty()) report(held);
+                    const std::string part = npu_partition_refusal_note(
+                        std::getenv("NPU_PARTITION"), npu_read_small_file("/sys/module/amdxdna/parameters/temporal_only"),
+                        ::access("/sys/module/amdxdna", F_OK) == 0);
+                    if (!part.empty()) report(part);
                     report(npu_contexts_refused_hint());
                 }
                 throw;   // the caller's own error path; the reasons above are the evidence the appliance lacked

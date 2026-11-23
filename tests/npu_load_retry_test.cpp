@@ -23,6 +23,7 @@
 #include "npu_load_retry.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -163,6 +164,51 @@ int main() {
         for (const auto& line : said)
             if (line.find("modprobe -r amdxdna") != std::string::npos) hinted = true;
         expect(hinted, "the give-up path prints the operator hint for a refused context");
+    }
+
+    // 5b. engine#3318 item 3: in partition mode a refused context names the driver setting two models need
+    //     (amdxdna temporal_only=0, patch 0014). Two processes on 4+4 columns are refused by a driver without spatial
+    //     placement with the same code 102 / No such device a dead array gives (cl-npurt, 2026-11-15, docs/npu.md).
+    {
+        using onebit::npu_partition_refusal_note;
+        expect(npu_partition_refusal_note(nullptr, "").empty() && npu_partition_refusal_note("", "0").empty(),
+               "no partition mode, no note");
+        const std::string none = npu_partition_refusal_note("4", "");
+        expect(none.find("NPU_PARTITION=4") != std::string::npos && none.find("temporal_only=0") != std::string::npos &&
+                   none.find("no temporal_only parameter") != std::string::npos && none.find("0014") != std::string::npos &&
+                   none.find("modprobe") == std::string::npos,
+               "a module without the parameter is named as predating 0014: " + none);
+        const std::string gone = npu_partition_refusal_note("4", "", false);
+        expect(gone.find("not there") != std::string::npos && gone.find("predates") == std::string::npos &&
+                   gone.find("modprobe") == std::string::npos,
+               "an unreadable module is not claimed to predate 0014: " + gone);
+        const std::string tmp = npu_partition_refusal_note("4", "1\n");
+        expect(tmp.find("temporal_only=1,") != std::string::npos &&
+                   tmp.find("modprobe amdxdna temporal_only=0") != std::string::npos,
+               "a temporal module gets the exact reload that changes the placement (sysfs newline trimmed): " + tmp);
+        const std::string sp = npu_partition_refusal_note("4", "0\n");
+        expect(sp.find("placement is spatial") != std::string::npos && sp.find("modprobe") == std::string::npos,
+               "a spatial module points at the other client, not at the module: " + sp);
+
+        LoadRetryPolicy p;
+        p.first_delay_s = 0.01;
+        p.max_delay_s = 0.02;
+        auto run = [&] {
+            std::vector<std::string> said;
+            try {
+                open_with_retry(p, "opening",
+                                [] { throw std::runtime_error("npu runtime: device error (code 102): No such device"); },
+                                [&](const std::string& line) { said.push_back(line); }, [](double) {});
+            } catch (const std::exception&) {
+            }
+            for (const auto& line : said)
+                if (line.find("partition mode (NPU_PARTITION=") != std::string::npos) return true;
+            return false;
+        };
+        ::setenv("NPU_PARTITION", "4", 1);
+        expect(run(), "the give-up path names the partition-mode driver setting when NPU_PARTITION is set");
+        ::unsetenv("NPU_PARTITION");
+        expect(!run(), "and says nothing about it when NPU_PARTITION is unset");
     }
 
     // 6. A zero window means one attempt: an operator who wants no retry gets none.

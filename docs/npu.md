@@ -805,6 +805,12 @@ same process. Two settings make a model fit that rule:
 A model set up this way uses `NPU_I8_SEALED_ELF` (decode) and `NPU_I8_SEALED_PREFILL_ELF` (prefill), both
 built at the same width, e.g. with npu-kernels `sealed/build.sh … -c 4 --partition 4`.
 
+Both serves also need `--npu-streams 2`: without it each takes the engine's device lock exclusively, and the second
+waits on the first instead of reaching the driver. When the driver refuses the second model's context anyway (the
+same `code 102 / No such device` a dead array gives), a serve in partition mode adds what this box's amdxdna has:
+no `temporal_only` parameter (a module that predates `third_party/patches/amdxdna/0014`), `temporal_only=1`, or
+`temporal_only=0` (spatial, so another client holds the columns) (engine#3318).
+
 **Several users in one decode pass (#2689 item 3).** A decode step is M rows of the M=16 design, and one user fills
 one of them: the step costs the same from 1 to 16 rows (measured 11-16: Llama-3.2-1B about 146 ms, Qwen3-1.7B about
 214 ms, exact at every N), so 16 users of one model cost about what one does. `Q4nxNpuForward::step_users(tokens,

@@ -871,6 +871,7 @@ add_python_test(tool_selftest_qwen35_to_q4nx ${CMAKE_SOURCE_DIR}/tools/qwen35_to
 add_python_test(qwen35_to_q4nx ${CMAKE_SOURCE_DIR}/tests/qwen35_to_q4nx_test.py)
 # engine#1777: the release row's own arm, which merged unregistered -- this sweep is what found it (engine#1820).
 add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
+add_test(NAME release_check_hold_cycle COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hold_cycle_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three
 # orphans of that shape landed in two days (51 GiB of GTT for 14 h; an NPU server 70 min past a 6-min ticket;
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the

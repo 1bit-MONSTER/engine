@@ -52,6 +52,7 @@ declare -A LEVERS=(
 HL_STATE=${HL_STATE:-$HOME/hyperloom-ws/state/inkling-loom}
 mkdir -p "$HL_STATE" || exit 1
 
+hl_refuse_unservable
 hl_levers
 hl_ship box_inkling.sh gauntlet.py
 hl_ticket --sudo bash "$RDIR/box_inkling.sh" "$ROUT"   # sudo: loom-serve's fixed pools need ulimit -l unlimited

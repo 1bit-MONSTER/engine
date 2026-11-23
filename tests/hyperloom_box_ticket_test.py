@@ -27,6 +27,8 @@ shims that record they were used, and loom-serve is a fake OpenAI server that st
   * a model that never registers is a failing report, not a crash and not a pass;
   * box_gate.sh (the restricted key's forced command): a full Inkling round passes through it once the box side is
     allowlisted; it refuses a shell, a ship of new scripts, a non-allowlisted or tampered rev, and a name outside its list;
+  * a round the box cannot serve is refused before any ticket: server args from a model proposal (EXTRA_CUSTOM_ARGS)
+    and a patched framework checkout each give a failing report naming why; a clean checkout still measures;
   * an unreachable box (ssh exits 255 every time) is retried, then the round exits 75 with NO report -- infrastructure,
     never a graded measurement;
   * custom/ (the HRX route): a bad lever is refused before ssh, a ticket above the fleet's 45-minute cap is refused,
@@ -200,6 +202,29 @@ def main():
         with open(td / "box" / "hl" / rev / "box_inkling.sh", "a") as f:
             f.write("\n# tampered\n")
         check("gate: a tampered allowlisted rev is refused", gated(base % ("HL_RUNS=1", rev)).returncode == 126)
+
+        # rounds the box cannot serve: refused before any ticket, as a failing report that says why
+        before = log.read_text().count("box-hold")
+        p, rep, rd = round_(env, td, "server-args", EXTRA_CUSTOM_ARGS="--model /x/model-d0.json --preset chat")
+        check("server args are refused, not measured", p.returncode == 0 and rep and not rep["quality_gate"]["passed"]
+              and "EXTRA_CUSTOM_ARGS" in rep["quality_gate"]["reason"] and log.read_text().count("box-hold") == before,
+              json.dumps(rep)[:300])
+        repo = td / "fw"
+        repo.mkdir()
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                        check=True, capture_output=True)
+        git("init", "-q")
+        (repo / "f.txt").write_text("base\n")
+        git("add", "f.txt")
+        git("commit", "-q", "-m", "base")
+        p, rep, rd = round_(env, td, "clean-repo", FRAMEWORK_REPO_PATH=str(repo))
+        check("a clean framework checkout still measures", rep and rep["quality_gate"]["passed"], json.dumps(rep)[:300])
+        (repo / "f.txt").write_text("patched by a specialist\n")
+        before = log.read_text().count("box-hold")
+        p, rep, rd = round_(env, td, "patched-repo", FRAMEWORK_REPO_PATH=str(repo))
+        check("a patched framework checkout is refused, not measured", p.returncode == 0 and rep
+              and not rep["quality_gate"]["passed"] and "uncommitted changes" in rep["quality_gate"]["reason"]
+              and log.read_text().count("box-hold") == before, json.dumps(rep)[:300])
 
         # an unreachable box: ssh always fails with 255 (the 23 Nov NIC loss)
         dbin = td / "deadbin"

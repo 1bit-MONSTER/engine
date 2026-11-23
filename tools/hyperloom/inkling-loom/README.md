@@ -98,6 +98,11 @@ python -m hyperloom optimize -v --framework custom \
 * The box is reached with a key restricted by `command=` to `../box_gate.sh`, so the agents' account can run tickets
   of allowlisted box sides and nothing else.
 
+Rounds the box cannot serve are **refused, not measured** (`hl_refuse_unservable` in `../box_ticket.sh`): a model
+proposal that carries server arguments (`EXTRA_CUSTOM_ARGS`; there is no server) and a round whose framework checkout
+has uncommitted changes (the box serves the Loom card / the installed payload, not that checkout). Before this, five
+such rounds of the first run measured the baseline and read as ties. Only the `HL_*` levers reach the box.
+
 Keep the framework agent ON: in 1.2.0 `levers.json` is seeded only by EXPLORE, which is part of the optimize
 (framework-agent) phase; `--no-framework-agent --no-kernel` together collapse the run to baseline -> SWEEP and sweep
 nothing (the CLI prints that warning). `--no-kernel` alone keeps EXPLORE and drops kernel rewrites.

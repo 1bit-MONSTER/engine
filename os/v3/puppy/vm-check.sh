@@ -335,8 +335,16 @@ rows = [
     #     carries the rescue guard, so a failed boot writes /init-fail.log to 1BIT-DATA and keeps a console
     #     instead of exiting PID 1 (kernel panic, "Attempted to kill init! exitcode=0x00000000"). init copies
     #     /init* into /pup_new/initrd before switch_root, so /initrd/init is the file that actually ran.
+    #     Since #3295 the pin is the boot medium's OWN data partition by filesystem UUID (pupsfs=UUID=<1BIT-DATA's UUID>),
+    #     so a stick never boots the installed disk's 1BIT-DATA; the row reads the UUID of the device mounted at /data (blkid),
+    #     which is right with a second 1BIT-DATA disk present too
+    #     (it used to expect pupsfs=1BIT-DATA, the label form #3295 replaced, and failed every image since).
     ("boot pin",     "tr ' ' '\\n' < /proc/cmdline | grep '^pupsfs='; "
-                     "tr ' ' '\\n' < /proc/cmdline | grep -c '^pupsfs=1BIT-DATA$'", "pupsfs=1BIT-DATA"),
+                     "d=$(awk '$2==\"/data\" {print $1; exit}' /proc/mounts); "
+                     "u=$(blkid \"${d:-/nonexistent}\" 2>/dev/null | sed -n 's/.* UUID=\"\\([^\"]*\\)\".*/\\1/p' | head -1); "
+                     "echo data-dev=${d:-none} data-uuid=${u:-none}; "
+                     "[ -n \"$u\" ] && tr ' ' '\\n' < /proc/cmdline | grep -qx \"pupsfs=UUID=$u\" && echo boot-pin-uuid",
+                     "boot-pin-uuid"),
     ("init guard",   "grep -c 'one_rescue' /initrd/init 2>/dev/null; "
                      "grep -c '1bit: PID 1 must never exit' /initrd/init 2>/dev/null; "
                      "n=$(grep -c 'one_rescue 1' /initrd/init); echo paths-guarded=$n; "

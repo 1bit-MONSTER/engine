@@ -46,10 +46,9 @@
    },
    "card": "unsloth-Qwen3.8-27B-UD-Q4_K_XL",
    "preset": "chat",
-   "device": "amdgpu://?completion_spin_ns=4294967295",
+   "device": "amdgpu://",
    "args": [
-    "--pool_backing=fixed",
-    "--parameter_mode=preload"
+    "--pool_backing=fixed"
    ],
    "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7102169544"
   }

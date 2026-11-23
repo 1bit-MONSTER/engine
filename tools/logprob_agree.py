@@ -346,7 +346,10 @@ REASONING_SEP = "\n<<answer>>\n"
 
 def reply_reasoning(message):
     """The reply's reasoning, from either field name a server uses (one helper, so the JSON records what was compared)."""
-    return message.get("reasoning_content") or message.get("reasoning") or ""
+    # whitespace at the thinking's edges is the server's parse, not the model's tokens: loom-serve keeps the newline before
+    # the closing tag, llama.cpp's reasoning parser strips it (engine#3158, Qwen3.5-4B 23 Nov: 3 of 8 identical replies
+    # differed by that one character and scored as divergences)
+    return (message.get("reasoning_content") or message.get("reasoning") or "").strip()
 
 
 def reasoning_one_sided(routes):
@@ -840,6 +843,8 @@ def selftest():
        and reasoning_one_sided({"loom": [run("a")], "cpu": [run("b")]}) == []
        and reasoning_one_sided({"loom": [run("")], "cpu": [run("")]}) == [],
        "reasoning_one_sided: flags only the prompts where the routes disagree on carrying reasoning")
+    ok(reply_text({"content": "x", "reasoning_content": "think.\n"}, True) == reply_text({"content": "x", "reasoning_content": "think."}, True),
+       "reply_text: a trailing newline inside the reasoning (loom-serve keeps it, llama.cpp strips it) is not a divergence")
     ok(reply_reasoning({"reasoning": "r"}) == "r" and reply_reasoning({"reasoning_content": "c", "reasoning": "r"}) == "c",
        "reply_reasoning: reasoning_content first, then reasoning (the same field the JSON records)")
     # near-tie rule (engine#3158, 23 Nov ~21:1xZ): the gap from the reference's top token to the ROUTE's token decides

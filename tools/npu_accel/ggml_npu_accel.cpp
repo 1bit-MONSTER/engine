@@ -56,6 +56,7 @@
 #include "rt.h"
 #include "q4nx_pack.h"
 #include "q4nx_weight_layout.h"
+#include "file_create.h"
 #include "npu_accel_ext.h"
 
 #include <atomic>
@@ -164,7 +165,16 @@ bool scan_dir(Accel& a) {
     a.check_every = std::getenv("ONEBIT_NPU_ACCEL_CHECK") ? std::atoi(std::getenv("ONEBIT_NPU_ACCEL_CHECK")) : 0;
     a.stats = std::getenv("ONEBIT_NPU_ACCEL_STATS") != nullptr;
     a.bo_cap = (size_t)(std::getenv("ONEBIT_NPU_ACCEL_MAX_GB") ? std::atof(std::getenv("ONEBIT_NPU_ACCEL_MAX_GB")) : 20.0) << 30;
-    if (const char* f = std::getenv("ONEBIT_NPU_ACCEL_IDS")) a.ids_out = std::fopen(f, "a");
+    if (const char* f = std::getenv("ONEBIT_NPU_ACCEL_IDS")) {
+        // a dump log several runs append to: 0600, no symlink following (file_create.h); the path is the operator's,
+        // taken only when absolute and free of "..", so a relative or climbing value cannot land it somewhere else
+        const std::string path = f;
+        if (!path.empty() && path[0] == '/' && path.find("..") == std::string::npos)
+            a.ids_out = onebit_fopen_private_ab(path.c_str());
+        else
+            std::fprintf(stderr, "npu-accel: ONEBIT_NPU_ACCEL_IDS must be an absolute path without \"..\"; not used\n");
+        if (!a.ids_out && !path.empty()) std::fprintf(stderr, "npu-accel: cannot open the ids dump %s\n", path.c_str());
+    }
     if ((!d || !*d) && a.host) { a.any_shape = true; a.dir = "(host, every shape)"; return true; }
     if (!d || !*d) { a.why = "ONEBIT_NPU_ACCEL_KERNELS is not set"; return false; }
     a.dir = d;

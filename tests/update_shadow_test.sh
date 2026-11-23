@@ -19,7 +19,8 @@
 # dir and a fake release tree laid out like the c35 -> v2026.48 machine: they must find the release code, leave the
 # machine's state alone, and move the code OUT of the overlay. Also: every code file the image ships from
 # os/v3/puppy/embed is on etc/1bit/release-owned, so a new script cannot be added without the list knowing it.
-# No root, no overlay, no device. (A whiteout is a 0/0 character device, which only root can make; it is not built here.)
+# No root, no overlay, no device. (A whiteout is a 0/0 character device, which only root can make; it is not built here.
+# An opaque directory is a trusted.* attribute, which only root can set: the test stands in for the read and the clear.)
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 script=$here/os/v3/puppy/embed/usr/local/bin/1bit-update
@@ -30,6 +31,10 @@ trap 'rm -rf "${t:?}"' EXIT
 check() { if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; bad=$((bad + 1)); fi; }
 ONEBIT_UPDATE_LIB=1 . "$script"
 check $? "1bit-update sources as a library (ONEBIT_UPDATE_LIB=1)"
+# the file rows below run with "attribute tools present, nothing opaque", whatever this runner has installed; the opaque
+# rows further down stand in for both (only root can set trusted.* attributes)
+shadow_have_attr_tools() { return 0; }
+shadow_is_opaque() { return 1; }
 
 pats=$(owned_pats "$owned")
 printf '%s\n' "$pats" | grep -qx 'etc/init.d/\[0-9\]\[0-9\]onboard-\*' && ! printf '%s\n' "$pats" | grep -q '#'
@@ -82,6 +87,50 @@ grep -vxF -f "$t/after" "$t/before" | sort > "$t/gone"
 check $? "every machine-state file is still in upper/, byte for byte untouched"
 [ "$(cat "$U/etc/passwd")" = "machine state: etc/passwd" ]; check $? "accounts are not touched"
 shadow_move "$U" "$pats" "$D" > /dev/null; check $? "a second move finds nothing and succeeds"
+
+# Opaque directories: an upper dir with trusted.overlay.opaque=y hides the release's WHOLE directory, so moving the files
+# out of it would leave it empty and still opaque. Only root can set trusted.* attributes, so the test stands in for
+# the two functions that read and clear the attribute, with a list of "opaque" dirs - the scan and the move are real.
+U2=$t/save2/upper OPQ=$t/opaque-dirs
+mk "$U2/opt/1bit-package/1bit/npu/kernels/old.elf" "a kernel set someone re-copied by hand"
+mk "$U2/etc/passwd" "machine state under an opaque /etc"
+mkdir -p "$U2/root/.cache/pip" "$U2/usr/local/lib/nodejs"
+printf '%s\n' "$U2/opt/1bit-package/1bit/npu" "$U2/etc" "$U2/root/.cache/pip" > "$OPQ"
+shadow_have_attr_tools() { return 0; }
+shadow_is_opaque() { grep -qxF "$1" "$OPQ"; }
+shadow_clear_opaque() { grep -vxF "$1" "$OPQ" > "$OPQ.n"; mv "$OPQ.n" "$OPQ"; }
+shadow_scan "$U2" "$pats" > "$t/scan2"
+cat "$t/scan2"
+grep -qx "opaque	opt/1bit-package/1bit/npu" "$t/scan2" && grep -qx "opaque	etc" "$t/scan2"
+check $? "an opaque release-owned directory, and an opaque /etc that would hide release scripts, are both reported"
+! grep -q "root/.cache" "$t/scan2" && ! grep -q "opaque	usr/local/lib/nodejs" "$t/scan2"
+check $? "an opaque directory no release path can sit under is not, and a transparent owned one is not"
+[ "$(tail -n 2 "$t/scan2" | cut -f1 | tr '\n' ' ')" = "opaque opaque " ]
+check $? "opaque directories are listed after the files, so a move empties them first"
+D2=$t/save2/1bit-shadowed/v2026.49-test
+shadow_move "$U2" "$pats" "$D2" > "$t/moved2"; rc=$?
+cat "$t/moved2"
+check $rc "shadow_move returns 0 when every opaque directory was cleared"
+! grep -qxF "$U2/opt/1bit-package/1bit/npu" "$OPQ" && ! grep -qxF "$U2/etc" "$OPQ" && grep -qxF "$U2/root/.cache/pip" "$OPQ"
+check $? "the two owned directories are transparent again; the unrelated opaque one is left as it was"
+[ "$(cat "$U2/etc/passwd")" = "machine state under an opaque /etc" ] && [ -d "$U2/etc" ] && [ -d "$U2/opt/1bit-package/1bit/npu" ]
+check $? "clearing does not move the directory: machine state inside it stays in place"
+grep -qx "opt/1bit-package/1bit/npu" "$D2/opaque" && grep -qx "etc" "$D2/opaque"
+check $? "the cleared directories are recorded beside the moved files"
+shadow_clear_opaque() { return 1; }
+printf '%s\n' "$U2/opt/1bit-package/1bit/npu" > "$OPQ"
+shadow_move "$U2" "$pats" "$t/save2/again" > "$t/moved3"; rc=$?
+[ $rc != 0 ] && grep -q "FAILED to clear the opaque directory /opt/1bit-package/1bit/npu" "$t/moved3"
+check $? "a directory that cannot be cleared is a failure that names it, not a silent success"
+
+# without getfattr/setfattr opacity cannot be read: that must be reported and fail the move, never pass as transparent
+shadow_have_attr_tools() { return 1; }
+shadow_scan "$U2" "$pats" > "$t/scan4"
+[ "$(cut -f1 "$t/scan4" | grep -c unchecked)" = 1 ] && ! grep -q "^opaque" "$t/scan4"
+check $? "with no attribute tools the scan reports one 'unchecked' line instead of calling every directory transparent"
+shadow_move "$U2" "$pats" "$t/save2/noattr" > "$t/moved4"; rc=$?
+[ $rc != 0 ] && grep -q "could NOT check for opaque directories" "$t/moved4"
+check $? "and the move fails, naming why"
 
 # the shipped list covers every code file the image takes from embed/ (machine defaults the machine may change are not code)
 miss=

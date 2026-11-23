@@ -715,7 +715,7 @@ if [ -n "${PAYLOAD:-}" ]; then
              etc/1bit/release-identity etc/keymap etc/localtime etc/timezone \
              usr/local/lib/nodejs/bin/node usr/local/lib/nodejs/etc/npmrc usr/local/lib/nodejs/LICENSE \
              usr/local/bin/node usr/local/bin/npm usr/local/bin/npx etc/profile.d/91onboard-npm \
-             usr/local/bin/1bit-shutdown-watch; do
+             usr/local/bin/1bit-shutdown-watch etc/1bit/release-owned; do
         in_image "$b" || miss="$miss $b"
     done
     [ -z "${LIBHSA_DIR:-}" ] || { in_image opt/rocm-therock/lib/libhsa-runtime64.so.1 || miss="$miss the HRX libhsa"; \

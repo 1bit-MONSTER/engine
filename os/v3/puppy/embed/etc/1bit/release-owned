@@ -1,0 +1,61 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# engine#3342: the paths the RELEASE owns - its code, never this machine's state. A copy of one of these in the save
+# layer (upup64rsave/upper) wins over the SFS of every later release and keeps the old code running without a word
+# (v2026.48: a hand-edited /etc/init.d/05onboard-data from c35 shadowed the new one, so /data/npm-global was never
+# made). `1bit-update` moves such copies out of the overlay into <save layer>/1bit-shadowed/ when it installs a release,
+# `1bit-update --shadowed` lists them, and release-check's `shadow` row fails while one is there.
+#
+# One shell pattern per line, relative to /, matched with `case` (so `*` also crosses `/`). Machine state is NOT here
+# and is never touched: accounts (passwd, shadow, group, sudoers), network (connman, hosts.allow, resolv.conf), keys
+# (etc/ssh, root/.ssh), keymap, clock, localtime, etc/1bit/lemond.conf, rc.local, the caches the system writes.
+#
+# 1bit's own code (os/v3/puppy/embed, os/mini, the payload, Node.js)
+etc/init.d/[0-9][0-9]onboard-*
+etc/init.d/10lemonade
+etc/init.d/21serial-console
+etc/init.d/zz-onboard-*
+etc/profile.d/[0-9][0-9]onboard-*
+etc/modprobe.d/1bit-*
+etc/modprobe.d/amdxdna.conf
+etc/sysctl.d/*-1bit-*
+etc/udev/rules.d/*-1bit-*
+etc/xdg/autostart/1bit-*
+etc/1bit/release-owned
+etc/1bit/release-identity
+etc/1bit/onebit-models.txt
+etc/1bit/base-modes-keep
+etc/1bit/seal-pub.txt
+etc/1bit/libhsa.env
+etc/1bit/palemoon-prefs.js
+usr/local/bin/1bit*
+usr/local/sbin/1bit*
+usr/sbin/1bit-*
+bin/1bit-*
+usr/lib/1bit/*
+opt/1bit-package/*
+opt/1bit/*
+usr/local/lib/nodejs/*
+usr/local/bin/node
+usr/local/bin/npm
+usr/local/bin/npx
+usr/local/bin/corepack
+# the base system's boot code the release ships (and, for rc.country and rc.shutdown, patches)
+etc/rc.d/rc.country
+etc/rc.d/rc.shutdown
+etc/rc.d/rc.sysinit
+etc/rc.d/rc.services
+etc/DISTRO_SPECS

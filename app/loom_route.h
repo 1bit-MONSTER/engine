@@ -397,7 +397,11 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
                     for (const auto& de : fs::directory_iterator(model_dir, ec))
                         if (fits(de.path()) && sha256_of_file(de.path().string()) == sh->second) { found = de.path(); break; }
                 if (found.empty()) {
-                    if (fs::exists(target, ec) || lock_sha.count(origin)) {
+                    // refuse only when a file of the card's name IS there with other bytes (the checkpoint changed under
+                    // the card). A file that is simply absent is left as before: a card may list variants its preset never
+                    // loads (loom-fun's Inkling r9700 card also names a UD-Q8_K_XL file), and loom-serve reports a missing
+                    // file of the selected variant itself, by name, at registration.
+                    if (fs::exists(target, ec)) {
                         why += std::string(why.empty() ? "" : "; ") + "no file beside the model has the size (" +
                                std::to_string(want) + ") and sha256 the card's lock gives for " + origin +
                                ": the checkpoint changed under the card, not linked";

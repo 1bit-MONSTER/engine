@@ -121,9 +121,31 @@ under either release:
 
 ## Gate
 
-A model gets an entry only after an interleaved A/B on strixhalo under one `gpu-hold` ticket: Loom
-against the llama.cpp route, at least four rounds per arm, the same GGUF where the card allows, the same
-prompts, load and power mode recorded; and accuracy (greedy agreement on fixed prompts, mean KLD and
-same-top-token % against the CPU on wiki.test.raw 8x512). It routes to Loom only when Loom is not worse
-on accuracy and is faster, or equal on speed and better on accuracy. The result table goes on the
-model's issue, and the entry's `gate` links it.
+A model gets an entry only after a gate row on strixhalo (engine#3158) on **the bytes we ship**: the
+card's `model.json.lock` checkpoint is the file `models/pins.json` pins (`config/loom-cards.json`
+`exact`). A row run on another upload measures a model we do not serve and does not count.
+
+**Accuracy.** Three arms on the same GGUF and prompts, greedy, thinking off, `tools/logprob_agree.py`:
+Loom, the llama.cpp route (the fallback), and the CPU route as the arbiter. Loom routes only when
+
+- **agree(Loom, CPU) >= agree(fallback, CPU)** in greedy text agreement over the fixed prompts
+  (owner-approved 2026-11-23; it replaces "Loom vs fallback >= 95 %", which fails Loom whenever the
+  fallback itself is the arm that is wrong, as on MiniCPM4, engine#3340), **and**
+- accuracy holds: every prompt answered (no empty-vs-empty rows), and each Loom/CPU divergence a
+  near-tie on the CPU arm (the first differing token's top-2 margin is reported, so a near-tie is told
+  from a confident error). Loom returns no logprobs, so KLD on the Loom arm is reported as "cannot
+  tell", never filled in.
+
+A row is valid only when Loom's prompt token count (`/v1/chat/completions/input_tokens`) equals ours
+(`/apply-template` + `/tokenize` with `add_special`), with thinking on and off where the template
+toggles: a card whose chat block drops BOS or misrenders thinking answers a different prompt.
+
+**Speed.** Interleaved on strixhalo, at least four rounds, each round running every arm once, one
+server at a time: the fallback, raw loom-serve, and Loom through `1bit serve --loom-routes` (the route
+users get), with the same prompts, a discarded warm-up per arm, and load, memory and Tctl recorded per
+round. Loom routes only when it is faster through `1bit serve` (or equal on speed and better on
+accuracy).
+
+The box runs device arms only: the CPU arbiter and the comparison run on another machine, and each
+`box-hold` ticket (at most 45 minutes) states its RAM need and leaves at least 16 GB free. The result
+tables go on the model's issue, and the entry's `gate` links them.

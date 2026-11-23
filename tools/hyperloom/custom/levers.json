@@ -13,5 +13,8 @@
   {"name": "parallel_2", "extra_envs": {"HL_PARALLEL": "2"}},
   {"name": "parallel_4", "extra_envs": {"HL_PARALLEL": "4"}},
   {"name": "q8_prefill_relax_off", "extra_envs": {"GGML_HRX_Q8_PREFILL_RELAX": "0"}},
-  {"name": "graph_cache_unbounded", "extra_envs": {"GGML_HRX_GRAPH_PROGRAM_CACHE": "0"}}
+  {"name": "graph_cache_unbounded", "extra_envs": {"GGML_HRX_GRAPH_PROGRAM_CACHE": "0"}},
+  {"name": "ub1024_b2048", "extra_envs": {"HL_UB": "1024", "HL_B": "2048"}},
+  {"name": "dflash_ub1024", "extra_envs": {"HL_DFLASH": "1", "HL_UB": "1024"}},
+  {"name": "dflash_ub1024_b2048", "extra_envs": {"HL_DFLASH": "1", "HL_UB": "1024", "HL_B": "2048"}}
 ]

@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The Hyperloom 1.2.0 Inkling-on-Loom workload, end to end without the box (tools/hyperloom/inkling-loom).
+"""The Hyperloom 1.2.0 box-ticket workloads without the box (tools/hyperloom/box_ticket.sh, inkling-loom/, custom/).
 
 One Hyperloom round is: custom_radeon8060s.sh validates the levers, ships box_inkling.sh + gauntlet.py over ssh, runs
 ONE `box-hold gpu sudo -n timeout ... env <levers> bash box_inkling.sh` ticket, fetches the output and lets hl_score.py
@@ -23,9 +23,11 @@ shims that record they were used, and loom-serve is a fake OpenAI server that st
   * a baseline round writes a passing report with the five scored medians and establishes the text reference;
   * a lever reaches the box as the overlay model.json's draft_depth, and through box-hold (never around it);
   * a lever outside its allowed values is refused BEFORE anything crosses ssh, as a failing report (exit 0);
-  * a model that never registers is a failing report, not a crash and not a pass.
+  * a model that never registers is a failing report, not a crash and not a pass;
+  * custom/ (the HRX route): a bad lever is refused before ssh, a ticket above the fleet's 45-minute cap is refused,
+    and the box side refuses a job whose declared RAM need does not fit -- each as a failing report.
 
-Run directly (`python3 tests/hyperloom_inkling_loom_test.py`) or through ctest.
+Run directly (`python3 tests/hyperloom_box_ticket_test.py`) or through ctest.
 """
 import json
 import os
@@ -96,11 +98,11 @@ def setup(td):
     return env, log
 
 
-def round_(env, td, name, **levers):
+def round_(env, td, name, wl=WL, **levers):
     rd = td / name
     rd.mkdir()
     e = dict(env, RESULT_DIR=str(rd), RESULT_FILENAME="inferencex_result", **levers)
-    p = subprocess.run(["bash", str(WL / "custom_radeon8060s.sh")], env=e, capture_output=True, text=True, timeout=300)
+    p = subprocess.run(["bash", str(wl / "custom_radeon8060s.sh")], env=e, capture_output=True, text=True, timeout=300)
     rep = rd / "inferencex_result.json"
     return p, (json.loads(rep.read_text()) if rep.exists() else None), rd
 
@@ -149,9 +151,24 @@ def main():
         p, rep, rd = round_(dict(env, FAKE_NEVER_REGISTER="1"), td, "noreg")
         check("a model that never registers is a failing report", p.returncode == 0 and rep and not rep["quality_gate"]["passed"]
               and rep["output_throughput"] == 0.0, json.dumps(rep)[:400])
+        # custom/: the HRX route over the same ticket library
+        hrx = ROOT / "tools/hyperloom/custom"
+        henv = dict(env, MODEL="/data/dev/x/Qwen3.8-27B-UD-Q4_K_XL.gguf")
+        henv.pop("HL_RAM_NEED_GB")
+        before = log.read_text().count("box-hold")
+        p, rep, rd = round_(henv, td, "hrx-bad", wl=hrx, HL_UB="1024 -m /etc/passwd")
+        check("custom/: a bad lever is a failing report and no ticket", p.returncode == 0 and rep
+              and not rep["quality_gate"]["passed"] and log.read_text().count("box-hold") == before, p.stderr[-300:])
+        p, rep, rd = round_(henv, td, "hrx-long", wl=hrx, HL_TICKET_MIN="60")
+        check("custom/: a ticket above 45 minutes is refused", p.returncode != 0 and "45" in p.stderr, p.stderr[-300:])
+        p, rep, rd = round_(henv, td, "hrx-ram", wl=hrx, HL_RAM_NEED_GB="999")
+        check("custom/: the box refuses a RAM need that does not fit, as a failing report",
+              p.returncode == 0 and rep and not rep["quality_gate"]["passed"]
+              and "RAM need 999" in (rd / "box" / "status").read_text(), json.dumps(rep)[:300])
+        check("custom/: the refused job still went through box-hold", log.read_text().count("box-hold") == before + 1)
     for f in fails:
         print("FAIL:", f)
-    print("hyperloom_inkling_loom_test: %d failed" % len(fails) if fails else "hyperloom_inkling_loom_test: ok")
+    print("hyperloom_box_ticket_test: %d failed" % len(fails) if fails else "hyperloom_box_ticket_test: ok")
     return 1 if fails else 0
 
 

@@ -118,9 +118,9 @@ sys.exit(1)') || { status "refused: no free port in 18400-18489"; exit 3; }
 CMD=("$LS" "--model=$OV/model.json" --preset=chat "--device=$DEV" "--pool_backing=$POOL" "--workers=$WORKERS" "--listen=127.0.0.1:$PORT")
 [ -n "$WAIT" ] && CMD+=("--wait_mode=$WAIT")
 
-hw() { for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name" 2>/dev/null)" = "$1" ] && { echo "$h"; return; }; done; }
+hw() { for h in "${HL_HWMON_ROOT:-/sys/class/hwmon}"/hwmon*; do [ "$(cat "$h/name" 2>/dev/null)" = "$1" ] && { echo "$h"; return; }; done; }
 K=$(hw k10temp)
-tctl() { [ -n "$K" ] && [ -r "$K/temp1_input" ] && echo $(( $(cat "$K/temp1_input") / 1000 )) || echo null; }
+tctl() { [ -n "$K" ] && [ -r "$K/temp1_input" ] && echo $(( $(cat "$K/temp1_input") / 1000 )) || echo None; }  # None: spliced into Python below
 sha_cached() {  # sha256 of a big file, cached by device+inode+size+mtime so 17 GB is hashed once, not per measurement
     local f; f=$(readlink -f "$1"); local key; key=$(stat -Lc '%d-%i-%s-%Y' "$f")
     local c=$B/state/sha-cache; mkdir -p "$c"
@@ -168,7 +168,7 @@ $(for f in "$CARD"/parameter/*.gguf; do echo "        \"$(basename "$f")\": \"$(
     "runs": $RUNS, "gauntlet_rows": "$GROWS", "register_s": $i,
     "kernel": "$(uname -r)", "power_mode_log_last": "$MODE",
     "tctl_c_start": $T0, "tctl_c_end": $T1, "loadavg_start": "$L0",
-    "mem_available_gib_start": $have, "mem_available_gib_low": $(cat "$OUT/ram.low" 2>/dev/null || echo null),
+    "mem_available_gib_start": $have, "mem_available_gib_low": $(cat "$OUT/ram.low" 2>/dev/null || echo None),
     "ram_need_gb": $NEED, "amdgpu_fault_or_reset_lines_60min": $FAULTS,
 }, open(sys.argv[1], "w"), indent=1)
 EOF

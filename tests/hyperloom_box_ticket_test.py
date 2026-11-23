@@ -23,6 +23,7 @@ shims that record they were used, and loom-serve is a fake OpenAI server that st
   * a baseline round writes a passing report with the five scored medians and establishes the text reference;
   * a lever reaches the box as the overlay model.json's draft_depth, and through box-hold (never around it);
   * a lever outside its allowed values is refused BEFORE anything crosses ssh, as a failing report (exit 0);
+  * a box without the temperature sensor (CI: no k10temp) still writes provenance (its fields are null);
   * a model that never registers is a failing report, not a crash and not a pass;
   * box_gate.sh (the restricted key's forced command): a full Inkling round passes through it once the box side is
     allowlisted; it refuses a shell, a ship of new scripts, a non-allowlisted or tampered rev, and a name outside its list;
@@ -96,7 +97,7 @@ def setup(td):
     write_exe(serve, FAKE_SERVE)
     env = dict(os.environ, PATH="%s:%s" % (bindir, os.environ["PATH"]), HL_BOX="fakebox", HL_BOX_DIR=str(td / "box"),
                HL_BOX_ROOT=str(td / "box"), HL_CARD=str(card), HL_LOOM_SERVE=str(serve), HL_STATE=str(td / "state"),
-               HL_RAM_NEED_GB="0", HL_RAM_FLOOR_GB="0", HL_RUNS="1", HL_OUT_OWNER=str(os.getuid()), FAKE_ARGS=str(td / "args.json"))
+               HL_RAM_NEED_GB="0", HL_RAM_FLOOR_GB="0", HL_HWMON_ROOT=str(td / "no-hwmon"), HL_RUNS="1", HL_OUT_OWNER=str(os.getuid()), FAKE_ARGS=str(td / "args.json"))
     return env, log
 
 

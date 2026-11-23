@@ -121,8 +121,39 @@ link_target_layer() {
 #
 # owned_pats FILE: the patterns of a release-owned list, one per line (comments and blanks dropped)
 owned_pats() { sed -e 's/[[:space:]]*#.*//' -e '/^[[:space:]]*$/d' "$1" 2> /dev/null; }
-# shadow_scan UPPER PATTERNS: one line per upper entry on a release-owned path, "<kind><TAB><path>", kind = file, link
-# or whiteout (a 0/0 character device: the overlay's record that the path was DELETED, which hides the release's file)
+# An OPAQUE upper directory (trusted.overlay.opaque=y, set when a lower directory is removed and made again through
+# the merged view) hides EVERYTHING the release has under that path, not one file. Moving the files out of it would
+# leave it empty and still opaque - the new release's whole directory gone after the reboot, and nothing saying why.
+# shadow_is_opaque DIR: 0 when DIR is an opaque overlay directory. shadow_clear_opaque DIR: make it transparent again,
+# so the release's files show through and whatever else the machine keeps there stays. Both are functions so a test
+# can stand in for them: only root can set trusted.* attributes.
+# shadow_have_attr_tools: getfattr and setfattr are on PATH. Without them opacity cannot be read, and "cannot tell" must
+# not read as "transparent" - that would bring back the silent hidden directory - so the scan says so instead.
+shadow_have_attr_tools() {
+    command -v getfattr > /dev/null 2>&1 && command -v setfattr > /dev/null 2>&1
+}
+shadow_is_opaque() {
+    [ "$(getfattr -h --only-values -n trusted.overlay.opaque "$1" 2> /dev/null)" = y ]
+}
+shadow_clear_opaque() {
+    setfattr -h -x trusted.overlay.opaque "$1" 2> /dev/null
+}
+# shadow_dir_owned DIR PATTERNS: 0 when a release-owned path can sit at or under DIR (a pattern starts with DIR/, or
+# DIR/<anything> matches one) - so an opaque /etc or /etc/init.d counts, not only /opt/1bit-package itself
+shadow_dir_owned() {
+    set -f
+    for pat in $2; do
+        case $pat in "$1"/*) set +f; return 0 ;; esac
+        # shellcheck disable=SC2254
+        case "$1/x" in $pat) set +f; return 0 ;; esac
+    done
+    set +f
+    return 1
+}
+# shadow_scan UPPER PATTERNS: one line per upper entry on a release-owned path, "<kind><TAB><path>", kind = file, link,
+# whiteout (a 0/0 character device: the overlay's record that the path was DELETED, which hides the release's file)
+# opaque (a directory that hides the release's whole directory; listed after every file, so a move empties it first),
+# or unchecked (no getfattr/setfattr, so opacity could not be read: reported, never taken as "transparent")
 shadow_scan() {
     [ -d "$1" ] || return 0
     ( cd "$1" && find . -xdev \( -type f -o -type l -o -type c \) -print 2> /dev/null ) | sed 's|^\./||' | sort |
@@ -140,6 +171,19 @@ shadow_scan() {
             [ "$(stat -c %t:%T "$1/$p" 2> /dev/null)" = 0:0 ] && echo "whiteout	$p"
         else echo "file	$p"; fi
     done
+    if ! shadow_have_attr_tools; then
+        # one line, only when a directory the release owns is in the upper layer at all
+        ( cd "$1" && find . -xdev -mindepth 1 -type d -print 2> /dev/null ) | sed 's|^\./||' | sort |
+        while IFS= read -r d; do
+            shadow_dir_owned "$d" "$2" && { echo "unchecked	$d"; break; }
+        done
+        return 0
+    fi
+    ( cd "$1" && find . -xdev -mindepth 1 -type d -print 2> /dev/null ) | sed 's|^\./||' | sort |
+    while IFS= read -r d; do
+        shadow_dir_owned "$d" "$2" && shadow_is_opaque "$1/$d" && echo "opaque	$d"
+    done
+    return 0
 }
 # shadow_kind BASE PATH UPPER: how the upper copy compares with the release - "differs", "identical" or "not in the
 # release". BASE is a directory (the release's tree, e.g. /initrd/pup_ro2) or a .sfs file (read with unsquashfs).
@@ -167,7 +211,14 @@ shadow_move() {
     rc=0 list=$(mktemp) || return 1
     shadow_scan "$1" "$2" > "$list"
     while IFS='	' read -r kind p; do
-        if [ "$kind" = whiteout ]; then
+        if [ "$kind" = unchecked ]; then
+            echo "   could NOT check for opaque directories (no getfattr/setfattr): one under /$p would hide the release's files"
+            rc=1
+        elif [ "$kind" = opaque ]; then
+            mkdir -p "$3" && echo "$p" >> "$3/opaque" && shadow_clear_opaque "$1/$p" &&
+                echo "   made /$p transparent again (an opaque directory hid the release's)" ||
+                { echo "   FAILED to clear the opaque directory /$p: the release's /$p stays hidden"; rc=1; }
+        elif [ "$kind" = whiteout ]; then
             mkdir -p "$3" && echo "$p" >> "$3/whiteouts" && rm -f "$1/$p" && echo "   dropped the whiteout that hid /$p" ||
                 { echo "   FAILED to drop the whiteout on /$p"; rc=1; }
         else
@@ -246,7 +297,12 @@ shadow_report() {
     shadow_scan "$upper" "$2" > "$l"
     while IFS='	' read -r kind p; do
         nshadow=$((nshadow + 1))
-        if [ "$kind" = whiteout ]; then k="a whiteout hides the release's file"; else k=$(shadow_kind "$1" "$p" "$upper"); fi
+        case $kind in
+            whiteout) k="a whiteout hides the release's file" ;;
+            opaque) k="an opaque directory hides the release's whole directory" ;;
+            unchecked) k="getfattr/setfattr missing: opaque directories under it were NOT checked" ;;
+            *) k=$(shadow_kind "$1" "$p" "$upper") ;;
+        esac
         echo "   shadowed /$p ($kind; $k)"
     done < "$l"
     rm -f "$l"

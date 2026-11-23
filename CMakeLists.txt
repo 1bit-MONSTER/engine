@@ -601,6 +601,10 @@ add_test(NAME pstore_harvest COMMAND sh ${CMAKE_SOURCE_DIR}/tests/pstore_harvest
 add_test(NAME heavy_wrapper COMMAND sh ${CMAKE_SOURCE_DIR}/tests/heavy_wrapper_test.sh)
 add_test(NAME shutdown_watch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/shutdown_watch_test.sh)
 add_test(NAME update_shadow COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_shadow_test.sh)
+# engine#3342 end to end: the real `1bit-update` against a loop-mounted installed disk, then the new release booted as an
+# overlay and what the machine sees checked. Needs root + loop devices + getfattr/setfattr: returns 77 in CI.
+add_test(NAME update_e2e_loop COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_e2e_loop_test.sh)
+set_tests_properties(update_e2e_loop PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(loom_arch_probe ${CMAKE_SOURCE_DIR}/tools/loom_arch_probe.py --self-test)  # engine#3221: arms only, no GGUF needed
 add_python_test(dupdef_check_self ${CMAKE_SOURCE_DIR}/tools/ci/dupdef_check.py --self-test)
 add_python_test(stale_expectations_self ${CMAKE_SOURCE_DIR}/tools/ci/stale_expectations_check.py --self-test)

@@ -1,11 +1,13 @@
 Loom cards: Loom programs and model cards for the models the Loom route serves (os/v3/puppy/loom-cards.pin)
 Ship: yes (1bit OS payload, /opt/1bit-package/loom-cards; engine#3350 rc1)
-Card: unsloth-Inkling-2-Mini-loom, https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom
-          revision 4e018e88a3aa9826286c71dfe2f6c905a491659b (r8: fixes a DSpark concurrency hang), 14 files, each pinned by sha256 and size
-          by loom-fun (Jeremy Fowers, Daniel Holanda), generated with https://github.com/loom-fun/loom-skills
-License: Apache-2.0 (the card repository's licence: README front matter `license: apache-2.0`, kept here as
-          unsloth-Inkling-2-Mini-loom.README.md)
+Card: unsloth-Inkling-2-Mini-loom-r9700, https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom-r9700
+          revision 6213fd3ce3a15ea2bab98d4adf09ec783c5ad5dc, 79 files (its dev/ benchmark records are not shipped),
+          each pinned by sha256 and size; by Geramy Loveless (loom-fun)
+License: MIT (the card's LICENSE, shipped with it; kept here as unsloth-Inkling-2-Mini-loom-r9700.LICENSE). Its
+          NOTICE (shipped with it) lists the MIT projects its program/lib/ files and dense kernel motifs derive from
+          (ROCm/hrx-loom-library v0.2.0 among them).
 Not shipped: the model weights. The card's model.json.lock names them (unsloth/Inkling-2-Mini-GGUF at
-          ea0c79b2ecd73669e774c8519b79bfabfddbc027: Inkling-2-Mini-UD-Q4_K_XL.gguf and dspark-Inkling-2-Mini-Q8_0.gguf,
-          Apache-2.0, Thinking Machines / unsloth); Lemonade's catalogue pull downloads them on the user's request, and
-          1bit-loom-cards links the card's parameter/ files to them on the data partition.
+          ea0c79b2ecd73669e774c8519b79bfabfddbc027: Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf, the mainline layout,
+          sha256 e6427665..., Apache-2.0, Thinking Machines / unsloth; the same bytes are the repo root file since
+          unsloth's 23 Nov restructure); Lemonade's catalogue pull downloads them on the user's request, and `1bit serve`
+          links the card's parameter/ file to the pulled model by the lock's sha256.

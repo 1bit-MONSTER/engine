@@ -121,7 +121,7 @@ pull downloads them on the user's request.
 | Component | Release | License | Source |
 |---|---|---|---|
 | hrx-loom: `loom-serve`, `libiree.so`, `libloomc.so` (`/opt/1bit-package/loom`) | the wheel `config/loom.config` pins (hrx_loom 0.3.0 for rc1, sha256 `6252bb0df2623511...`), staged by `os/v3/puppy/stage-loom.sh` | Apache-2.0 WITH LLVM-exception (AMD ROCm hrx-system) | `os/licenses/hrx-loom/` (LICENSE, SOURCE); https://github.com/ROCm/hrx-system at v0.3.0 |
-| Loom card `unsloth-Inkling-2-Mini-loom` (`/opt/1bit-package/loom-cards`) | loom-fun's card at `4e018e88` (r8), 14 files pinned in `os/v3/puppy/loom-cards.pin` | Apache-2.0 (loom-fun) | `os/licenses/loom-cards/` (SOURCE, the card's README); https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom |
+| Loom card `unsloth-Inkling-2-Mini-loom-r9700` (`/opt/1bit-package/loom-cards`) | loom-fun's card at `6213fd3c`, 79 files pinned in `os/v3/puppy/loom-cards.pin` | MIT (Geramy Loveless; the card's LICENSE and NOTICE ship with it); the weights it names (Apache-2.0) are downloaded, not shipped |
 
 ## System software from Ubuntu
 

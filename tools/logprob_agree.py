@@ -581,7 +581,14 @@ def split_margin(text, ref_run):
     The route returns text only, so its token at the split is read from the reference's candidates: the longest of the
     reference's top-N tokens that the route's text continues with from that token's start. When one text is a prefix of
     the other the split is at the end of the shorter one; if the reference ended first, its token there is the
-    end-of-turn token (an empty string) and the route's is a candidate that matches its continuation.
+    end-of-turn token (an empty string) and the route's is a candidate that matches its continuation. Only that end
+    position takes an empty-string token: an empty special token inside the stream (a reasoning or tool marker that
+    renders as "") is never read as the token at the split (engine#3423 review, cl-npuconc).
+
+    The longest-match reading is the most favourable one (engine#3429 review, cl-hyperloom): a route token that is NOT
+    in the reference's top-N but begins with a shorter candidate's text (route " reasonable", candidate " reason") is
+    scored as that candidate. A same-tokenizer route at T=0 could have emitted it that way, so it is not wrong, only
+    optimistic; longest-match keeps it rare.
 
     Returns (char index, gap or None, reference token, route token or None, top-2 margin or None). gap is None when the
     route's token is not among the reference's top-N (the split then counts)."""
@@ -614,7 +621,7 @@ def split_margin(text, ref_run):
     acc = 0
     for t, w in zip(toks, widths):
         s = t.get("token") or ""
-        if (w and acc + w > i) or (s == "" and acc == i):
+        if (w and acc + w > i) or (s == "" and acc == i == len(rt)):
             cands = [x for x in (t.get("top") or []) if usable(x.get("lp"))]
             lps = sorted((f32(x["lp"]) for x in cands), reverse=True)
             margin = (lps[0] - lps[1]) if len(lps) > 1 else None
@@ -637,13 +644,17 @@ def split_margin(text, ref_run):
 def near_tie_score(cand_runs, ref_runs, nats=1.0):
     """Over prompts: identical text, near-tie splits (the route's token within `nats` of the reference's top token),
     truncated prompts and counted splits (further, or the route's token not among the reference's top-N).
-    Score = identical + near-tie + truncated, out of the prompts both routes answered.
+    Score = identical + near-tie + truncated, out of every prompt at least one route answered: two empty replies are
+    skipped (not comparable), one empty reply against a non-empty one is a split like any other. The two lists must
+    hold the same prompts: a length mismatch raises (an arm with fewer prompts must not score over a common prefix).
 
     Truncated: one text is a prefix of the other and the shorter run stopped on its token budget (finish "length").
     Neither route chose a different token; one ran out of tokens. Counting it would charge the budget to the model:
     with thinking on, Inkling's replies routinely end inside the thinking at max_tokens (engine#3423 review)."""
     out = {"threshold_nats": nats, "identical": 0, "near_tie": 0, "truncated": 0, "counted": 0, "unreadable": 0,
            "splits": []}
+    if len(cand_runs) != len(ref_runs):
+        raise ValueError(f"near_tie_score: {len(cand_runs)} route prompts vs {len(ref_runs)} reference prompts")
     n = 0
     for p, (c, r) in enumerate(zip(cand_runs, ref_runs)):
         c, r = c["runs"][0], r["runs"][0]
@@ -929,7 +940,29 @@ def selftest():
     i, gap, rt, wt, m2 = split_margin("\u00e9X", ub)
     ok(wt == "X" and abs(gap - 0.2) < 1e-6,
        "split_margin: a character split across byte tokens is aligned from their bytes (the row stays readable)")
+    # an empty special token mid-stream is not the token at the split; only the reference's end-of-turn is (#3423 review)
+    mk = {"text": "aXb", "tokens": [
+        {"token": "a", "lp": -0.1, "top": []},
+        {"token": "", "lp": -0.1, "top": [{"token": "", "lp": -0.1}, {"token": "Y", "lp": -0.2}]},
+        {"token": "X", "lp": -0.1, "top": [{"token": "X", "lp": -0.1}, {"token": "Y", "lp": -3.1}]},
+        {"token": "b", "lp": -0.1, "top": []}]}
+    i, gap, rt, wt, m2 = split_margin("aYb", mk)
+    ok(rt == "X" and wt == "Y" and abs(gap - 3.0) < 1e-6,
+       "split_margin: an empty marker token mid-stream is skipped; the diverging token's candidates decide (counted)")
+    eot = {"text": "a", "tokens": [{"token": "a", "lp": -0.1, "top": []},
+                                   {"token": "", "lp": -0.1, "top": [{"token": "", "lp": -0.1}, {"token": "b", "lp": -0.4}]}]}
+    i, gap, rt, wt, m2 = split_margin("ab", eot)
+    ok(rt == "" and wt == "b" and abs(gap - 0.3) < 1e-6,
+       "split_margin: the reference's end-of-turn token (empty, at its text's end) is still read at the split")
     runs = lambda *texts_refs: [{"runs": [x]} for x in texts_refs]
+    try:
+        near_tie_score(runs({"text": "a"}), runs(ref, ref), 1.0)
+        ok(False, "near_tie_score: arms with different prompt counts must raise")
+    except ValueError:
+        ok(True, "near_tie_score: arms with different prompt counts raise (no scoring over a common prefix)")
+    sc = near_tie_score(runs({"text": ""}, {"text": "", "finish": "stop"}), runs(ref, {"text": "", "tokens": []}), 1.0)
+    ok(sc["prompts"] == 1 and sc["counted"] == 1 and sc["score"] == 0,
+       "near_tie_score: one empty reply is a counted split; two empty replies are skipped")
     sc = near_tie_score(runs({"text": "aX"}, {"text": "ab"}, {"text": "aZ"}, {"text": "aW"}), runs(ref, ref, ref, ref), 1.0)
     ok(sc["identical"] == 1 and sc["near_tie"] == 1 and sc["counted"] == 2 and sc["score"] == 2 and sc["prompts"] == 4,
        "near_tie_score: identical + near-tie; a far choice and an out-of-top-N token are counted")
@@ -1161,7 +1194,9 @@ def main(argv=None):
             # arbiter top-2 margin exceeds --near-tie-nats; report the near-tie count beside the score
             if a.arbiter in (la, lb) and la != lb:
                 cand, ref = (pb, pa) if la == a.arbiter else (pa, pb)
-                if all(x["runs"][0].get("tokens") for x in ref):
+                if len(cand) != len(ref):   # an arm that answered fewer prompts is not scored over a common prefix
+                    print(f"  near-tie rule     cannot tell -- {len(cand)} route prompts vs {len(ref)} {a.arbiter} prompts")
+                elif all(x["runs"][0].get("tokens") for x in ref):
                     nt = near_tie_score(cand, ref, a.near_tie_nats)
                     g["near_tie"] = nt
                     det = ", ".join(f"p{x['prompt']}@{x['char']}:" + (f"cut({x['cut']})" if x["kind"] == "truncated" else

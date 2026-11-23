@@ -410,6 +410,7 @@ def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False, m
         "reasoning": reply_reasoning(ch.get("message") or {}),
         "tokens": toks,
         "have_logprobs": bool(toks),
+        "finish": ch.get("finish_reason"),
         "secs": round(time.time() - t, 3),
     }
 
@@ -600,9 +601,15 @@ def split_margin(text, ref_run):
 
 
 def near_tie_score(cand_runs, ref_runs, nats=1.0):
-    """Over prompts: identical text, near-tie splits (the route's token within `nats` of the reference's top token) and
-    counted splits (further, or the route's token not among the reference's top-N). Score = identical + near-tie, out of the prompts both routes answered."""
-    out = {"threshold_nats": nats, "identical": 0, "near_tie": 0, "counted": 0, "unreadable": 0, "splits": []}
+    """Over prompts: identical text, near-tie splits (the route's token within `nats` of the reference's top token),
+    truncated prompts and counted splits (further, or the route's token not among the reference's top-N).
+    Score = identical + near-tie + truncated, out of the prompts both routes answered.
+
+    Truncated: one text is a prefix of the other and the shorter run stopped on its token budget (finish "length").
+    Neither route chose a different token; one ran out of tokens. Counting it would charge the budget to the model:
+    with thinking on, Inkling's replies routinely end inside the thinking at max_tokens (engine#3423 review)."""
+    out = {"threshold_nats": nats, "identical": 0, "near_tie": 0, "truncated": 0, "counted": 0, "unreadable": 0,
+           "splits": []}
     n = 0
     for p, (c, r) in enumerate(zip(cand_runs, ref_runs)):
         c, r = c["runs"][0], r["runs"][0]
@@ -612,6 +619,14 @@ def near_tie_score(cand_runs, ref_runs, nats=1.0):
         if c["text"] == r["text"]:
             out["identical"] += 1
             continue
+        short = c if len(c["text"]) < len(r["text"]) else r
+        other = r if short is c else c
+        if other["text"].startswith(short["text"]) and short.get("finish") == "length":
+            out["truncated"] += 1
+            out["splits"].append({"prompt": p, "char": len(short["text"]), "margin": None, "top2_margin": None,
+                                  "ref_token": None, "route_token": None, "kind": "truncated",
+                                  "cut": "route" if short is c else "reference"})
+            continue
         i, gap, tok, rtok, margin = split_margin(c["text"], r)
         kind = "counted" if (gap is None or gap > nats) else "near_tie"
         out[kind] += 1
@@ -620,7 +635,7 @@ def near_tie_score(cand_runs, ref_runs, nats=1.0):
         out["splits"].append({"prompt": p, "char": i, "margin": gap, "top2_margin": margin, "ref_token": tok,
                               "route_token": rtok, "kind": kind})
     out["prompts"] = n
-    out["score"] = out["identical"] + out["near_tie"]
+    out["score"] = out["identical"] + out["near_tie"] + out["truncated"]
     return out
 
 
@@ -848,6 +863,16 @@ def selftest():
     sc = near_tie_score(runs({"text": "aX"}, {"text": "ab"}, {"text": "aZ"}, {"text": "aW"}), runs(ref, ref, ref, ref), 1.0)
     ok(sc["identical"] == 1 and sc["near_tie"] == 1 and sc["counted"] == 2 and sc["score"] == 2 and sc["prompts"] == 4,
        "near_tie_score: identical + near-tie; a far choice and an out-of-top-N token are counted")
+    # a reply cut by max_tokens (finish "length") that agrees up to its cut is truncated, not a disagreement, either way
+    cut_ref = dict(ref, text="a", finish="length")
+    sc = near_tie_score(runs({"text": "ab", "finish": "stop"}, {"text": "a", "finish": "length"}, {"text": "aX", "finish": "length"}),
+                        runs(cut_ref, ref, ref), 1.0)
+    ok(sc["truncated"] == 2 and sc["counted"] == 0 and sc["near_tie"] == 1 and sc["score"] == 3
+       and [x.get("cut") for x in sc["splits"] if x["kind"] == "truncated"] == ["reference", "route"],
+       "near_tie_score: a reference or a route cut by its token budget at an agreeing prefix is truncated, not counted")
+    sc = near_tie_score(runs({"text": "a", "finish": "stop"}), runs(ref), 1.0)
+    ok(sc["truncated"] == 0 and sc["near_tie"] + sc["counted"] == 1,
+       "near_tie_score: a route that STOPPED early (finish stop) is still judged at the reference's token, not excused")
     ok(effective_match_by("id", True, False) == "text" and effective_match_by("id", False, False) == "text",
        "effective_match_by: one route without ids degrades the pair to text instead of reporting total divergence")
     # both routes answering with NO content is not agreement: with thinking on and a small --max-tokens a route can
@@ -1064,10 +1089,11 @@ def main(argv=None):
                 if all(x["runs"][0].get("tokens") for x in ref):
                     nt = near_tie_score(cand, ref, a.near_tie_nats)
                     g["near_tie"] = nt
-                    det = ", ".join(f"p{x['prompt']}@{x['char']}:{'?' if x['margin'] is None else round(x['margin'], 3)}"
-                                    f"{'' if x['kind'] == 'near_tie' else '*'}" for x in nt["splits"])
+                    det = ", ".join(f"p{x['prompt']}@{x['char']}:" + (f"cut({x['cut']})" if x["kind"] == "truncated" else
+                                    f"{'?' if x['margin'] is None else round(x['margin'], 3)}{'*' if x['kind'] == 'counted' else ''}")
+                                    for x in nt["splits"])
                     print(f"  near-tie rule     {nt['score']}/{nt['prompts']} (identical {nt['identical']}, near-tie splits "
-                          f"{nt['near_tie']}, counted {nt['counted']}; {a.arbiter} log-prob gap to the route's token > {a.near_tie_nats} nat counts)"
+                          f"{nt['near_tie']}, truncated {nt['truncated']}, counted {nt['counted']}; {a.arbiter} log-prob gap to the route's token > {a.near_tie_nats} nat counts)"
                           + (f"  [{det}]  (* = counted)" if det else ""))
                 else:
                     print(f"  near-tie rule     cannot tell -- {a.arbiter} carried no tokens with log-probs")

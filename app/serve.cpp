@@ -1715,10 +1715,17 @@ std::optional<Launch> loom_launch_for(const Options& o, int child_port) {
     }
     {
         std::string lwhy;
-        if (const int n = loom::loom_link_card_parameters(card, o.model, lwhy); n > 0)
+        bool refused = false;
+        if (const int n = loom::loom_link_card_parameters(card, o.model, lwhy, &refused); n > 0)
             std::fprintf(stderr, "1bit serve: loom route %s: %d card weight link(s) now point beside %s\n", r->id.c_str(), n,
                          o.model.c_str());
         if (!lwhy.empty()) std::fprintf(stderr, "1bit serve: loom route %s: %s\n", r->id.c_str(), lwhy.c_str());
+        if (refused) {
+            std::fprintf(stderr, "1bit serve: loom route %s matches %s, but its card is not usable (a weight file beside the "
+                                 "model is not the one the card was built for): serving on the llama.cpp route "
+                                 "(docs/loom-route.md)\n", r->id.c_str(), o.model.c_str());
+            return std::nullopt;
+        }
     }
     Launch l;
     l.device = "loom";

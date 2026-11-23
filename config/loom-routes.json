@@ -12,12 +12,12 @@
    },
    "card": "Qwen2.5-Coder-1.5B-Instruct-GGUF-loom",
    "preset": "chat",
-   "device": "amdgpu://?completion_spin_ns=4294967295",
+   "device": "amdgpu://",
    "args": [
     "--pool_backing=fixed",
     "--parameter_mode=preload"
    ],
-   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7094317837 (accuracy, split layout) + https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7092325966 (precondition + speed through 1bit serve); card huggingface.co/1bit-MONSTER/Qwen2.5-Coder-1.5B-Instruct-GGUF-loom"
+   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7094317837 (accuracy, split layout) + https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7092325966 (precondition + speed through 1bit serve); card huggingface.co/1bit-MONSTER/Qwen2.5-Coder-1.5B-Instruct-GGUF-loom; device = the default completion spin per the spin A/B (https://github.com/1bit-MONSTER/engine/pull/3369)"
   },
   {
    "id": "qwen2.5-coder-7b-instruct-q4_k_m",
@@ -30,12 +30,12 @@
    },
    "card": "Qwen2.5-Coder-7B-Instruct-GGUF-loom",
    "preset": "chat",
-   "device": "amdgpu://?completion_spin_ns=4294967295",
+   "device": "amdgpu://",
    "args": [
     "--pool_backing=fixed",
     "--parameter_mode=preload"
    ],
-   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7094317837 (accuracy, split layout) + https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7092784868 (precondition + speed through 1bit serve); card huggingface.co/1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom"
+   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7094317837 (accuracy, split layout) + https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7092784868 (precondition + speed through 1bit serve); card huggingface.co/1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom; device = the default completion spin per the spin A/B (https://github.com/1bit-MONSTER/engine/pull/3369)"
   }
  ]
 }

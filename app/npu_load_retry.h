@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -99,14 +100,19 @@ inline const char* npu_contexts_refused_hint() {
 // most often the driver keeping a SECOND model off the free columns: two processes on 4+4 columns need amdxdna's
 // spatial placement, temporal_only=0 (third_party/patches/amdxdna/0014). Without it the second client gets the same
 // "code 102 / No such device" a dead array gives, which sends the operator to the device instead of the driver
-// setting. `partition` is $NPU_PARTITION, `temporal_only` the module parameter's text ("" when the module has none).
-inline std::string npu_partition_refusal_note(const char* partition, const std::string& temporal_only) {
+// setting. `partition` is $NPU_PARTITION, `temporal_only` the module parameter's text ("" when it cannot be read),
+// `module_present` whether /sys/module/amdxdna exists: an empty read only means "no parameter" when the module is there.
+inline std::string npu_partition_refusal_note(const char* partition, const std::string& temporal_only,
+                                              bool module_present = true) {
     if (!partition || !*partition) return "";
     std::string t = temporal_only;
     while (!t.empty() && (t.back() == '\n' || t.back() == ' ')) t.pop_back();
     std::string s = std::string("partition mode (NPU_PARTITION=") + partition +
                     "): a second model on the free columns needs amdxdna's spatial placement, temporal_only=0";
-    if (t.empty())
+    if (t.empty() && !module_present)
+        s += "; /sys/module/amdxdna is not there (driver not loaded, or /sys not readable here), so its temporal_only "
+             "could not be read";
+    else if (t.empty())
         s += "; this amdxdna has no temporal_only parameter (it predates third_party/patches/amdxdna/0014), so only "
              "one client can hold the array at a time";
     else if (t == "0")
@@ -150,7 +156,8 @@ void open_with_retry(const LoadRetryPolicy& p, const char* what, Open&& open, Re
                     const std::string held = npu_lock_refusal_note();
                     if (!held.empty()) report(held);
                     const std::string part = npu_partition_refusal_note(
-                        std::getenv("NPU_PARTITION"), npu_read_small_file("/sys/module/amdxdna/parameters/temporal_only"));
+                        std::getenv("NPU_PARTITION"), npu_read_small_file("/sys/module/amdxdna/parameters/temporal_only"),
+                        ::access("/sys/module/amdxdna", F_OK) == 0);
                     if (!part.empty()) report(part);
                     report(npu_contexts_refused_hint());
                 }

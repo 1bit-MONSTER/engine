@@ -63,6 +63,15 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    # The pinned loom-serve (hrx-loom 0.2.0) answers a request carrying "Expect: 100-continue" by closing the
+    # connection without any response (measured: curl gets nothing in 0.7 ms; the same body without the header is
+    # 200). cpp-httplib's client adds that header to every body >= 1024 bytes unless CPPHTTPLIB_EXPECT_100_THRESHOLD
+    # is 0, so serve's Loom route answered 502 to every real prompt (engine#3158). http.server would send
+    # "100 Continue" by default and hide that; behave like loom-serve instead.
+    def handle_expect_100(self):
+        self.close_connection = True
+        return False
+
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
         self.send_response(code)

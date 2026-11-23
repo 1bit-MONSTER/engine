@@ -97,6 +97,9 @@ if start "$scratch/name.log" -m "$scratch/plain.gguf" --loom-routes "$scratch/by
     check "and none of llama-server's hints" '[[ "$sent" != *cache_prompt* && "$sent" != *id_slot* && "$sent" != *n_predict* ]]'
     check "n_predict arrived as max_tokens" '[[ "$sent" == *"\"max_tokens\": 16"* ]]'
     check "and no top_k serve did not get from the client (no greedy shortcut on loom)" '[[ "$sent" != *top_k* ]]'
+    long_text=$(python3 -c 'print("The quick brown fox jumps over the lazy dog. " * 60)')
+    reply=$(chat "{\"model\": \"plain\", \"messages\": [{\"role\": \"user\", \"content\": \"$long_text\"}], \"temperature\": 0}")
+    check "a request body over 1 KB reaches loom-serve (no Expect: 100-continue, which loom-serve drops)" '[[ "$reply" == *Paris* ]]'
     stream=$(curl -sN "$api/v1/chat/completions" -H 'Content-Type: application/json' \
         -d '{"model": "plain", "stream": true, "messages": [{"role": "user", "content": "hi"}]}')
     check "a streamed reply comes through ($(grep -c '^data: {' <<<"$stream") chunks)" '[ "$(grep -c "^data: {" <<<"$stream")" = 9 ]'

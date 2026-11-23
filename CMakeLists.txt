@@ -99,6 +99,12 @@ FetchContent_MakeAvailable(json httplib stb)
 # 100 MiB). 16 MiB keeps that peak near 48 MiB and is far above any real request (long prompts, base64 images).
 # On the INTERFACE target, so every translation unit that includes httplib.h through it gets the same value.
 target_compile_definitions(httplib INTERFACE CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH=16777216)
+# engine#3158: httplib's client adds "Expect: 100-continue" to every request body >= 1024 bytes
+# (CPPHTTPLIB_EXPECT_100_THRESHOLD, default 1024). The pinned loom-serve closes such a connection without answering,
+# so the Loom route answered 502 "backend did not answer" to every real prompt (measured: a 1067-byte chat request
+# fails in 0.2 ms, 1059 bytes is served). 0 turns the header off. Every backend serve talks to (llama-server,
+# loom-serve) is on loopback, where a 100-continue round trip saves nothing.
+target_compile_definitions(httplib INTERFACE CPPHTTPLIB_EXPECT_100_THRESHOLD=0)
 
 # config/laya-first.json (the routing table, docs/laya-first.md §4) is compiled in like
 # config/recipes.json; `1bit laya-first --laya-first FILE` replaces it at run time.

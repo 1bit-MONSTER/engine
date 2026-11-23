@@ -653,11 +653,14 @@ def near_tie_score(cand_runs, ref_runs, nats=1.0):
         if c["text"] == r["text"]:
             out["identical"] += 1
             continue
-        short = c if len(c["text"]) < len(r["text"]) else r
+        # --with-reasoning texts end "<reasoning>" + REASONING_SEP + "<answer>": a reply cut inside its thinking ends in the
+        # separator, so the prefix test runs on the texts without it
+        bare = lambda x: x["text"].replace(REASONING_SEP, "")
+        short = c if len(bare(c)) < len(bare(r)) else r
         other = r if short is c else c
-        if other["text"].startswith(short["text"]) and short.get("finish") == "length":
+        if bare(other).startswith(bare(short)) and short.get("finish") == "length":
             out["truncated"] += 1
-            out["splits"].append({"prompt": p, "char": len(short["text"]), "margin": None, "top2_margin": None,
+            out["splits"].append({"prompt": p, "char": len(bare(short)), "margin": None, "top2_margin": None,
                                   "ref_token": None, "route_token": None, "kind": "truncated",
                                   "cut": "route" if short is c else "reference"})
             continue
@@ -940,6 +943,11 @@ def selftest():
     sc = near_tie_score(runs({"text": "a", "finish": "stop"}), runs(ref), 1.0)
     ok(sc["truncated"] == 0 and sc["near_tie"] + sc["counted"] == 1,
        "near_tie_score: a route that STOPPED early (finish stop) is still judged at the reference's token, not excused")
+    # with --with-reasoning a reply cut inside its thinking ends in the separator and is still truncated (Inkling rows)
+    sc = near_tie_score(runs({"text": "think a b c" + REASONING_SEP + "ans", "finish": "stop"}),
+                        runs({"text": "think a" + REASONING_SEP, "finish": "length", "tokens": []}), 1.0)
+    ok(sc["truncated"] == 1 and sc["counted"] == 0,
+       "near_tie_score: a reply cut inside its reasoning (text ends in the separator) is truncated, not counted")
     ok(effective_match_by("id", True, False) == "text" and effective_match_by("id", False, False) == "text",
        "effective_match_by: one route without ids degrades the pair to text instead of reporting total divergence")
     # both routes answering with NO content is not agreement: with thinking on and a small --max-tokens a route can

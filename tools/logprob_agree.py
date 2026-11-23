@@ -56,6 +56,7 @@ still fail. That is what makes an A/B against a route like loom-serve -- whose c
 the exit code needs.
 """
 import argparse
+import codecs
 import json
 import math
 import struct
@@ -404,7 +405,10 @@ def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False, m
         top = []
         for x in tk.get("top_logprobs") or []:
             top.append({"id": x.get("id"), "token": x.get("token"), "lp": x.get("logprob")})
-        toks.append({"id": tk.get("id"), "token": tk.get("token"), "lp": tk.get("logprob"), "top": top})
+        tok = {"id": tk.get("id"), "token": tk.get("token"), "lp": tk.get("logprob"), "top": top}
+        if isinstance(tk.get("bytes"), list):   # llama-server's per-token UTF-8 bytes: split_margin decodes them
+            tok["bytes"] = tk["bytes"]
+        toks.append(tok)
     return {
         "text": reply_text(ch.get("message") or {}, with_reasoning),
         "reasoning": reply_reasoning(ch.get("message") or {}),
@@ -586,9 +590,19 @@ def split_margin(text, ref_run):
     text, rt = (x.replace(REASONING_SEP, "", 1) for x in (text, ref_run.get("text") or ""))
     i = next((j for j in range(min(len(text), len(rt))) if text[j] != rt[j]), min(len(text), len(rt)))
     toks, widths, pos = ref_run.get("tokens") or [], [], 0
-    for t in toks:
-        s = t.get("token") or ""
+    # The text each token adds: decoded from its bytes when every token carries them, so a character split across
+    # byte-level tokens is spelled by the token that completes it (review of #3432); else the token string.
+    if toks and all(isinstance(t.get("bytes"), list) for t in toks):
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        emitted = [dec.decode(bytes(t["bytes"])) for t in toks]
+    else:
+        emitted = [t.get("token") or "" for t in toks]
+    for k, s in enumerate(emitted):
         w = len(s) if s and rt.startswith(s, pos) else 0
+        # two equal adjacent pieces that both fit (a template newline beside the reply's own): the LATER one is the
+        # reply's, so the earlier gets no width and each character stays with the token that produced it
+        if w and k + 1 < len(emitted) and emitted[k + 1] == s and not rt.startswith(s + s, pos):
+            w = 0
         widths.append(w)
         pos += w
     if pos != len(rt):
@@ -877,6 +891,21 @@ def selftest():
        "split_margin: a candidate both texts share ('He' before the split) does not explain it: counted")
     i, gap, rt, wt, m2 = split_margin("x", {"text": "abc", "tokens": [{"token": "ab", "lp": -0.1, "top": []}]})
     ok(gap is None, "split_margin: tokens that do not spell the reference text are unreadable (counted)")
+    nl = {"text": "\nHi", "tokens": [
+        {"token": "<|m|>", "lp": -0.01, "top": []},
+        {"token": "\n", "lp": -0.1, "top": [{"token": "\n", "lp": -0.1}, {"token": "x", "lp": -5.1}]},
+        {"token": "\n", "lp": -0.1, "top": [{"token": "\n", "lp": -0.1}, {"token": "x", "lp": -0.5}]},
+        {"token": "Hi", "lp": -0.1, "top": []}]}
+    i, gap, rt, wt, m2 = split_margin("xHi", nl)
+    ok(wt == "x" and abs(gap - 0.4) < 1e-6,
+       "split_margin: of two equal adjacent newline tokens the later one owns the reply's newline (its margin is read)")
+    ub = {"text": "\u00e9!", "tokens": [
+        {"token": "\ufffd", "bytes": [0xc3], "lp": -0.1, "top": []},
+        {"token": "\ufffd", "bytes": [0xa9], "lp": -0.1, "top": []},
+        {"token": "!", "bytes": [0x21], "lp": -0.1, "top": [{"token": "!", "lp": -0.1}, {"token": "X", "lp": -0.3}]}]}
+    i, gap, rt, wt, m2 = split_margin("\u00e9X", ub)
+    ok(wt == "X" and abs(gap - 0.2) < 1e-6,
+       "split_margin: a character split across byte tokens is aligned from their bytes (the row stays readable)")
     runs = lambda *texts_refs: [{"runs": [x]} for x in texts_refs]
     sc = near_tie_score(runs({"text": "aX"}, {"text": "ab"}, {"text": "aZ"}, {"text": "aW"}), runs(ref, ref, ref, ref), 1.0)
     ok(sc["identical"] == 1 and sc["near_tie"] == 1 and sc["counted"] == 2 and sc["score"] == 2 and sc["prompts"] == 4,

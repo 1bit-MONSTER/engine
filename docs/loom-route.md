@@ -170,10 +170,6 @@ decodes slower than the fallback is not routed, because chat users feel decode (
 2026-11-23: Qwen3.8-27B UD-Q4_K_XL and ZAYA1-8B). Such a model is re-gated when a Loom card decodes at
 least as fast as the fallback.
 
-**Thinking on.** Where a row also compares thinking-on output (the Qwen3 cards), an explained
-difference passes only when the one difference is the `think_open` text the template pre-fills
-(orchestrator ruling, 2026-11-23).
-
 The box runs device arms only: the CPU arbiter and the comparison run on another machine, and each
 `box-hold` ticket (at most 45 minutes) states its RAM need and leaves at least 16 GB free. The result
 tables go on the model's issue, and the entry's `gate` links them.

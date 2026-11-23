@@ -56,6 +56,7 @@ hl_levers
 hl_ship box_inkling.sh gauntlet.py
 hl_ticket --sudo bash "$RDIR/box_inkling.sh" "$ROUT"   # sudo: loom-serve's fixed pools need ulimit -l unlimited
 hl_fetch card
+hl_exit_if_unreachable
 python3 "$HERE/hl_score.py" --box "$RESULT_DIR/box" --state "$HL_STATE" --levers "$LEVERS_JSON" \
     --out "$RESULT_DIR/$RESULT_FILENAME.json" || exit 1
 exit 0

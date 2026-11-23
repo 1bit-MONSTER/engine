@@ -161,7 +161,10 @@ toggles: a card whose chat block drops BOS or misrenders thinking answers a diff
 the model's opening `think_open` (e.g. Qwen3's `<think>\n`) after the generation prompt, while the model's
 own template leaves it for the model to emit. That is a pass, not a mismatch, **iff** (a) the token **ids**
 match exactly apart from it: Loom's prompt ids equal ours followed by the ids of the card's `chat.think_open`,
-and thinking off the ids are equal (a count that merely comes out right is not enough), **and** (b) the
+and thinking off the ids are equal (a count that merely comes out right is not enough; loom-serve's
+`input_tokens` returns a count only, so Loom's ids are the card's chat block rendered by loom-port-llm's
+`chat_probe.py` and encoded with the card's `tokenizer.json`, and that many ids must equal the server's count),
+**and** (b) the
 greedy continuation after the prefill matches: on the gate's prompts with thinking on, the fallback's (or CPU
 arbiter's) reply begins with `think_open` and Loom's reply equals the rest of it, held to the same agreement
 rule as above. A prompt where the fallback's reply does **not** begin with `think_open` (the model chose not to

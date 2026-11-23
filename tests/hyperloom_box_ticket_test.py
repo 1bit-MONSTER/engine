@@ -24,6 +24,8 @@ shims that record they were used, and loom-serve is a fake OpenAI server that st
   * a lever reaches the box as the overlay model.json's draft_depth, and through box-hold (never around it);
   * a lever outside its allowed values is refused BEFORE anything crosses ssh, as a failing report (exit 0);
   * a model that never registers is a failing report, not a crash and not a pass;
+  * box_gate.sh (the restricted key's forced command): a full Inkling round passes through it once the box side is
+    allowlisted; it refuses a shell, a ship of new scripts, a non-allowlisted or tampered rev, and a name outside its list;
   * custom/ (the HRX route): a bad lever is refused before ssh, a ticket above the fleet's 45-minute cap is refused,
     and the box side refuses a job whose declared RAM need does not fit -- each as a failing report.
 
@@ -151,6 +153,45 @@ def main():
         p, rep, rd = round_(dict(env, FAKE_NEVER_REGISTER="1"), td, "noreg")
         check("a model that never registers is a failing report", p.returncode == 0 and rep and not rep["quality_gate"]["passed"]
               and rep["output_throughput"] == 0.0, json.dumps(rep)[:400])
+        # box_gate.sh: the same round, every ssh command routed through the gate as sshd's command= would
+        gate = ROOT / "tools/hyperloom/box_gate.sh"
+        gbin = td / "gbin"
+        gbin.mkdir()
+        write_exe(gbin / "ssh", '#!/bin/bash\nwhile [ "${1:-}" = -o ]; do shift 2; done\nshift\n'
+                  'SSH_ORIGINAL_COMMAND="$*" exec bash %s\n' % gate)
+        genv = dict(env, PATH="%s:%s" % (gbin, env["PATH"]), HL_GATE_ROOT=env["HL_BOX_DIR"],
+                    HL_GATE_DIR=str(td / "gate"))
+        (td / "gate").mkdir()
+        p, rep, rd = round_(genv, td, "gate-unlisted")
+        check("gate: a ship of a rev that is not allowlisted is refused", p.returncode != 0 and "refused" in p.stderr,
+              p.stderr[-300:])
+        rev = [d.name for d in (td / "box" / "hl").iterdir() if (d / "box_inkling.sh").exists()][0]
+        (td / "gate" / "allowed-revs").write_text(rev + "\n")
+        p, rep, rd = round_(genv, td, "gate-round", HL_DRAFT_DEPTH="4")
+        check("gate: an allowlisted round runs end to end through the gate", p.returncode == 0 and rep
+              and rep["quality_gate"]["passed"], p.stderr[-400:] + json.dumps(rep)[:300])
+        glog = (td / "gate" / "gate.log").read_text()
+        check("gate: the round used ship(no-op), ticket and fetch", all(w in glog for w in ("ship(no-op)", "ticket", "fetch")),
+              glog[-500:])
+
+        def gated(cmd):
+            return subprocess.run(["bash", str(gate)], env=dict(genv, SSH_ORIGINAL_COMMAND=cmd), capture_output=True,
+                                  text=True, timeout=60)
+        bd = env["HL_BOX_DIR"]
+        tk = "hl-20261123T000000Z-1"
+        base = ("mkdir -p %s/out/%s && BOX_HOLD_WHO='cl-hyperloom %s' BOX_HOLD_WAIT=10 box-hold gpu sudo -n timeout -k 30 60 "
+                "env %%s bash %s/hl/%%s/box_inkling.sh %s/out/%s" % (bd, tk, tk, bd, bd, tk))
+        check("gate: a shell is refused", gated("bash -i").returncode == 126)
+        check("gate: chained commands are refused", gated("tar -C %s/out/%s -cf - . 2>/dev/null; id" % (bd, tk)).returncode == 126)
+        check("gate: a name outside the list is refused",
+              gated(base % ("HL_LOOM_SERVE=/bin/sh", rev)).returncode == 126)
+        check("gate: a ticket above 45 minutes is refused",
+              gated(base.replace("timeout -k 30 60", "timeout -k 30 3600") % ("HL_RUNS=1", rev)).returncode == 126)
+        check("gate: a rev that is not allowlisted is refused", gated(base % ("HL_RUNS=1", "0" * 12)).returncode == 126)
+        with open(td / "box" / "hl" / rev / "box_inkling.sh", "a") as f:
+            f.write("\n# tampered\n")
+        check("gate: a tampered allowlisted rev is refused", gated(base % ("HL_RUNS=1", rev)).returncode == 126)
+
         # custom/: the HRX route over the same ticket library
         hrx = ROOT / "tools/hyperloom/custom"
         henv = dict(env, MODEL="/data/dev/x/Qwen3.8-27B-UD-Q4_K_XL.gguf")

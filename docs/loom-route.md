@@ -191,6 +191,13 @@ decodes slower than the fallback is not routed, because chat users feel decode (
 2026-11-23: Qwen3.8-27B UD-Q4_K_XL and ZAYA1-8B). Such a model is re-gated when a Loom card decodes at
 least as fast as the fallback.
 
+**No fallback.** When the llama.cpp route cannot serve the model at all (Inkling-2-Mini on rc1, orchestrator
+option A, 23 Nov ~19:3xZ, engine#3412), there is nothing to compare against: the row is accuracy only, against
+the CPU arbiter. It passes when every prompt is answered, every Loom/CPU divergence is a near-tie (the CPU's
+top-2 margin at the first differing token is reported), the known-answer checks pass (17 x 23, the long-context
+needle), and the prompt-count precondition holds. The speed row is measured and recorded but not compared.
+The table says which text was compared (answer only, or reasoning + answer with thinking on).
+
 The box runs device arms only: the CPU arbiter and the comparison run on another machine, and each
 `box-hold` ticket (at most 45 minutes) states its RAM need and leaves at least 16 GB free. The result
 tables go on the model's issue, and the entry's `gate` links them.

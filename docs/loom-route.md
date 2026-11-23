@@ -159,12 +159,14 @@ toggles: a card whose chat block drops BOS or misrenders thinking answers a diff
 
 **One explained difference** (orchestrator for the owner, 23 Nov): with thinking **on**, a card may pre-fill
 the model's opening `think_open` (e.g. Qwen3's `<think>\n`) after the generation prompt, while the model's
-own template leaves it for the model to emit. That is a pass, not a mismatch, **iff** (a) Loom's count
-exceeds ours by exactly the card's `chat.think_open` tokens and every other rendering matches (thinking off
-equal), **and** (b) the greedy continuation after the prefill matches: on the gate's prompts with thinking
-on, the fallback's (or CPU arbiter's) reply begins with `think_open` and Loom's reply equals the rest of it,
-held to the same agreement rule as above. Anything else is a mismatch and voids the row. A thinking-off
-difference is never explained this way (the card renders a different prompt).
+own template leaves it for the model to emit. That is a pass, not a mismatch, **iff** (a) the token **ids**
+match exactly apart from it: Loom's prompt ids equal ours followed by the ids of the card's `chat.think_open`,
+and thinking off the ids are equal (a count that merely comes out right is not enough), **and** (b) the
+greedy continuation after the prefill matches: on the gate's prompts with thinking on, the fallback's (or CPU
+arbiter's) reply begins with `think_open` and Loom's reply equals the rest of it, held to the same agreement
+rule as above. A prompt where the fallback's reply does **not** begin with `think_open` (the model chose not to
+think) voids the row, because the forced prefill answered a different turn. Anything else is a mismatch and
+voids the row. A thinking-off difference is never explained this way (the card renders a different prompt).
 
 **Speed.** Interleaved on strixhalo, at least four rounds, each round running every arm once, one
 server at a time: the fallback, raw loom-serve, and Loom through `1bit serve --loom-routes` (the route

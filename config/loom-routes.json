@@ -51,6 +51,24 @@
     "--pool_backing=fixed"
    ],
    "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7102169544"
+  },
+  {
+   "id": "inkling-2-mini-ud-q4_k_xl",
+   "match": {
+    "gguf_sha256": "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15",
+    "gguf_size": 17629759456,
+    "model": [
+     "Inkling-2-Mini-1bit",
+     "Inkling-2-Mini-UD-Q4_K_XL"
+    ]
+   },
+   "card": "unsloth-Inkling-2-Mini-loom",
+   "preset": "chat",
+   "device": "amdgpu://",
+   "args": [
+    "--pool_backing=fixed"
+   ],
+   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7106859133 (Loom vs the CPU arbiter, thinking on, near-ties; payload path on main d64d4916: route taken, drafter by lock sha, 17*23 = 391); card loom-fun/unsloth-Inkling-2-Mini-loom r8 4e018e88 (stock, orchestrator 23 Nov rc1); no fallback arm exists (the llama.cpp-HRX port is refused under strict placement)"
   }
  ]
 }

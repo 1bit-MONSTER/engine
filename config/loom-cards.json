@@ -407,6 +407,27 @@
      "sha256": "c3c4d93f9db92627a2fc47ea8fe8c64a094cabd3549db544bcdd2c00e9a9a347"
     }
    }
+  },
+  {
+   "id": "Inkling-2-Mini-1bit",
+   "checkpoint": "unsloth/Inkling-2-Mini-GGUF:Inkling-2-Mini-UD-Q4_K_XL.gguf",
+   "weights_revision": "800c946d7b9c830c86290df49afbbe91db8455f5",
+   "weights_file": "Inkling-2-Mini-UD-Q4_K_XL.gguf",
+   "weights_sha256": "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15",
+   "weights_licence": "apache-2.0",
+   "match": "exact",
+   "arch": "inkling2",
+   "card": {
+    "repo": "loom-fun/unsloth-Inkling-2-Mini-loom",
+    "revision": "4e018e88a3aa9826286c71dfe2f6c905a491659b",
+    "licence": "apache-2.0",
+    "checkpoint": {
+     "repo": "unsloth/Inkling-2-Mini-GGUF",
+     "revision": "ea0c79b2ecd73669e774c8519b79bfabfddbc027",
+     "file": "Inkling-2-Mini-UD-Q4_K_XL.gguf",
+     "sha256": "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15"
+    }
+   }
   }
  ]
 }

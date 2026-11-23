@@ -154,9 +154,17 @@ PY
     # are the two clients the owner demos, and neither asks for a key on stock Lemonade. The console's CONNECT block
     # says so in those words, and menu item 1 is the way to close it.
     host=0.0.0.0
+    # engine#3350 part 1 (option C): the image carries no Laya checkpoint (808 MB). lemond's Laya daemon (`1bit route
+    # --serve --laya-model $LEMONADE_LAYA_MODEL`) pulls the pinned, sha256-checked files with ONEBIT_LAYA_FETCH the first
+    # time a request is routed; until then the router's requests fall through to its default model. A value set in
+    # $CONF (sourced above) wins.
+    export LEMONADE_LAYA_MODEL="${LEMONADE_LAYA_MODEL:-/data/laya}"
+    export ONEBIT_LAYA_FETCH="${ONEBIT_LAYA_FETCH:-/usr/local/bin/1bit-laya}"
     "$LEMONADE_ONEBIT" "$LEM/cache" "$LEM/config" --port "$PORT" --host "$host" >> "$LOG" 2>&1 &
     echo $! > "$PIDFILE"
     echo "10lemonade: started (pid $(cat "$PIDFILE"), :$PORT, log $LOG)"
+    # the router collection (user.Laya-First) is registered once lemond answers; a registered one is left as it is
+    [ -x /usr/local/bin/1bit-laya ] && LEMONADE_PORT=$PORT /usr/local/bin/1bit-laya register >> "$LOG" 2>&1 &
 }
 
 stop() {

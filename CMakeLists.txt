@@ -599,6 +599,7 @@ set_tests_properties(grow_data PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(npu_catalogue_filter_self ${CMAKE_SOURCE_DIR}/tools/npu_catalogue_filter.py --self-test)  # engine#3287
 add_test(NAME pstore_harvest COMMAND sh ${CMAKE_SOURCE_DIR}/tests/pstore_harvest_test.sh)
 add_test(NAME heavy_wrapper COMMAND sh ${CMAKE_SOURCE_DIR}/tests/heavy_wrapper_test.sh)
+add_test(NAME laya_fetch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/laya_fetch_test.sh)
 add_test(NAME shutdown_watch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/shutdown_watch_test.sh)
 add_test(NAME update_shadow COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_shadow_test.sh)
 # engine#3342 end to end: the real `1bit-update` against a loop-mounted installed disk, then the new release booted as an
@@ -1682,6 +1683,8 @@ add_test(NAME laya_eval_e2e COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/lay
 add_test(NAME laya_route_serve COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
 # One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).
 add_test(NAME laya_checkpoint COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_checkpoint.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+# engine#3350: route --serve pulls a missing checkpoint with ONEBIT_LAYA_FETCH, keeping the fetcher off its stdout
+add_test(NAME laya_fetch_hook COMMAND sh ${CMAKE_SOURCE_DIR}/tests/laya_fetch_hook.sh $<TARGET_FILE:onebit>)
 # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
 if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions

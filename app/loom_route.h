@@ -39,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -313,13 +314,36 @@ inline std::string loom_card_model_id(const std::string& card, std::string& why)
 // route matched its sha256), so each such parameter/ entry that is a link, or missing, is pointed at the file of the same
 // name beside the model. A regular file (a card fetched with --materialize=copy) is never touched, and an entry whose
 // sibling is not there is left as it is. Returns how many links were (re)made; `why` names a failure.
-inline int loom_link_card_parameters(const std::string& card_model_json, const std::string& model_path, std::string& why) {
+//
+// A sibling whose size differs from the card's own model.json.lock entry for that origin is NOT linked, and `refused`
+// is set: the checkpoint repo changed under the card. Measured 23 Nov: unsloth/Inkling-2-Mini-GGUF added
+// dspark-Inkling-2-Mini-Q8_0_Old.gguf "a copy of the current DSpark drafter (padded-vocab layout)", i.e. the drafter at
+// the card's name is about to be replaced, and a catalogue pull takes the repo's head. The route's sha256 match covers
+// the main model only; loom-fetch would check the lock, but the appliance links instead of fetching. Size only (no
+// hashing at serve start): a different layout is a different size.
+inline int loom_link_card_parameters(const std::string& card_model_json, const std::string& model_path, std::string& why,
+                                     bool* refused = nullptr) {
     namespace fs = std::filesystem;
     std::ifstream in(card_model_json, std::ios::binary);
     if (!in) { why = "cannot read " + card_model_json; return 0; }
     json j;
     try { j = json::parse(in); } catch (const std::exception& e) { why = card_model_json + " is not JSON: " + e.what(); return 0; }
     const fs::path card_dir = fs::path(card_model_json).parent_path(), model_dir = fs::path(model_path).parent_path();
+    std::map<std::string, std::uintmax_t> lock_size;   // origin -> size, from the card's own lock (absent lock: no check)
+    {
+        std::ifstream lin(card_dir / "model.json.lock", std::ios::binary);
+        if (lin) {
+            try {
+                const json lk = json::parse(lin);
+                if (lk.contains("files") && lk["files"].is_array())
+                    for (const auto& f : lk["files"])
+                        if (f.is_object() && f.contains("origin") && f["origin"].is_string() && f.contains("size") &&
+                            f["size"].is_number_unsigned())
+                            lock_size[f["origin"].get<std::string>()] = f["size"].get<std::uintmax_t>();
+            } catch (const std::exception&) {
+            }
+        }
+    }
     int made = 0;
     std::vector<const json*> stack = {&j};
     while (!stack.empty()) {
@@ -351,6 +375,16 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
         std::error_code ec;
         const fs::path target = model_dir / name;
         if (!fs::is_regular_file(target, ec)) continue;
+        if (const auto it = lock_size.find(origin); it != lock_size.end()) {
+            const std::uintmax_t have = fs::file_size(target, ec);
+            if (ec || have != it->second) {
+                why += std::string(why.empty() ? "" : "; ") + target.string() + " has " + std::to_string(have) +
+                       " bytes, the card's lock says " + std::to_string(it->second) + " for " + origin +
+                       ": the checkpoint changed under the card, not linked";
+                if (refused) *refused = true;
+                continue;
+            }
+        }
         const fs::file_status st = fs::symlink_status(link, ec);
         if (fs::exists(st) && !fs::is_symlink(st)) continue;
         if (fs::is_symlink(st) && fs::read_symlink(link, ec) == target) continue;

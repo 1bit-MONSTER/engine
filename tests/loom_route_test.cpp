@@ -192,6 +192,20 @@ int main() {
         std::ofstream(dir / "lc" / "parameter" / "d.gguf") << "a real copy";                      // --materialize=copy
         loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(), lwhy);
         check("a real file in parameter/ is never replaced", !fs::is_symlink(fs::symlink_status(dir / "lc" / "parameter" / "d.gguf")));
+        // the card's lock names a size per weight file: a sibling of another size (the repo replaced the file under the
+        // card's name, as unsloth/Inkling-2-Mini-GGUF is about to do with its DSpark drafter) is refused, not linked
+        fs::remove(dir / "lc" / "parameter" / "d.gguf");
+        fs::remove(dir / "lc" / "parameter" / "m.gguf");
+        std::ofstream(dir / "lc" / "model.json.lock") << R"({"files":[{"origin":"@checkpoint/m.gguf","size":1},)"
+            R"({"origin":"@checkpoint/d.gguf","size":99}]})";
+        bool refused = false;
+        std::string swhy;
+        const int sm = loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(),
+                                                       swhy, &refused);
+        check("a weight whose size differs from the card's lock is not linked and the card is refused",
+              sm == 1 && refused && fs::is_symlink(fs::symlink_status(dir / "lc" / "parameter" / "m.gguf")) &&
+              !fs::exists(fs::symlink_status(dir / "lc" / "parameter" / "d.gguf")) &&
+              swhy.find("the card's lock says 99 for @checkpoint/d.gguf") != std::string::npos);
         fs::remove_all(dir);
     }
 

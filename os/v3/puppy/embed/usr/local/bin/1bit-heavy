@@ -52,16 +52,21 @@ command -v curl > /dev/null || { echo "$prog: needs curl" >&2; [ -n "$require" ]
 url=${ONEBIT_LEMONADE_URL:-http://127.0.0.1:${LEMONADE_PORT:-13300}}
 key=${LEMONADE_API_KEY:-}
 conf=${ONEBIT_LEMOND_CONF:-/etc/1bit/lemond.conf}
-[ -n "$key" ] || { [ -r "$conf" ] && key=$(sed -n 's/^LEMONADE_API_KEY=//p' "$conf" | tail -n 1); }
+# the FIRST key line, as /etc/init.d/10lemonade reads it (a second appended line must not make this wrapper send another)
+[ -n "$key" ] || { [ -r "$conf" ] && key=$(sed -n 's/^LEMONADE_API_KEY=//p' "$conf" | head -n 1); }
 json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 tmp=$(mktemp) || exit 2
+hdr=
+# every exit before the hold's own trap takes over (a --require refusal, a failed mktemp) removes both files: the header
+# file holds the key
+trap 'rm -f "$tmp" ${hdr:+"$hdr"}' EXIT
+# The key goes to curl from a 0600 header file (-H @file), never on its command line: argv is world-readable in ps and
+# /proc/<pid>/cmdline, and the key is what keeps the LAN out. An empty file adds no header (a blank-key appliance).
+hdr=$(mktemp) || exit 2
+[ -z "$key" ] || printf 'Authorization: Bearer %s\n' "$key" > "$hdr"
 post() {  # <path> <timeout s> <json> -> sets $code (HTTP status) and $body; runs in this shell, not a subshell
-    if [ -n "$key" ]; then
-        code=$(curl -sS -m "$2" -o "$tmp" -w '%{http_code}' -H 'Content-Type: application/json' \
-            -H "Authorization: Bearer $key" -d "$3" "$url/api/v1/$1" 2> /dev/null)
-    else
-        code=$(curl -sS -m "$2" -o "$tmp" -w '%{http_code}' -H 'Content-Type: application/json' -d "$3" "$url/api/v1/$1" 2> /dev/null)
-    fi
+    code=$(curl -sS -m "$2" -o "$tmp" -w '%{http_code}' -H 'Content-Type: application/json' -H @"$hdr" \
+        -d "$3" "$url/api/v1/$1" 2> /dev/null)
     body=$(cat "$tmp" 2> /dev/null)
 }
 
@@ -81,7 +86,7 @@ if [ -z "$hold_id" ]; then
     esac
     if [ -n "$require" ]; then echo "$prog: REFUSED: could not hold the models: $why" >&2; exit 2; fi
     echo "$prog: WARNING: running without a hold - $why; the loaded models stay next to the command" >&2
-    rm -f "$tmp"; exec "$@"
+    rm -f "$tmp" "$hdr"; exec "$@"
 fi
 unloaded=$(printf '%s' "$body" | sed -n 's/.*"unloaded" *: *\[\([^]]*\)\].*/\1/p' | tr -d '"')
 echo "$prog: $hold_id: models unloaded (${unloaded:-none were loaded}); requests wait until the command ends" >&2
@@ -99,14 +104,25 @@ release() {
     else
         echo "$prog: WARNING: releasing $hold_id answered $code: $rb (Lemonade ends it by itself after $maxs s)" >&2
     fi
-    rm -f "$tmp"
+    rm -f "$tmp" "$hdr"
 }
+# The command runs in the background so a TERM or HUP sent to THIS process reaches it: run in the foreground, the
+# shell defers a trapped signal until the command has finished, so `kill <wrapper pid>` left the command running and
+# the hold taken (engine#3352 review, measured in dash). Its stdin is the wrapper's: a non-interactive shell gives an
+# asynchronous command /dev/null BEFORE explicit redirections, so a plain `<&0` would copy /dev/null - stdin is saved
+# on fd 8 first and handed back from there. INT is not forwarded: Ctrl-C already reaches the whole foreground group, and
+# a second INT can derail a program's own cleanup. The wrapper waits until the command has really exited, then releases.
+exec 8<&0
+"$@" <&8 8<&- &
+child=$!
+exec 8<&-
 trap 'release' EXIT
-trap 'release; trap - INT; kill -INT $$' INT
-trap 'release; trap - TERM; kill -TERM $$' TERM
-trap 'release; trap - HUP; kill -HUP $$' HUP
-
-"$@"
-rc=$?
+trap 'kill -TERM "$child" 2> /dev/null' TERM
+trap 'kill -HUP "$child" 2> /dev/null' HUP
+trap ':' INT
+while :; do
+    wait "$child"; rc=$?
+    kill -0 "$child" 2> /dev/null || break   # wait returns early when a trapped signal arrives; the command may still run
+done
 release
 exit $rc

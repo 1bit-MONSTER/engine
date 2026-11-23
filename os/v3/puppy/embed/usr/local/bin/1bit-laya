@@ -62,7 +62,9 @@ fetch() {
         if [ "$(stat -c %s "$f" 2> /dev/null)" = "$size" ] && [ "$(sha256sum "$f" | cut -c1-64)" = "$sha" ]; then continue; fi
         mkdir -p "$(dirname "$f")"
         echo "$prog: pulling $path ($size B) from $base" >&2
-        if ! curl -fsSL --retry 3 -C - -o "$f.partial" "$base/$path"; then
+        # a connection that stops delivering must END: without a speed floor curl waits for ever, --retry never fires,
+        # and `1bit route --serve` (which waits for this fetch) holds every routed request behind it
+        if ! curl -fsSL --retry 3 --connect-timeout 20 --speed-limit 10000 --speed-time 60 -C - -o "$f.partial" "$base/$path"; then
             # a finished .partial makes curl's resume answer 416: that is not a failure, the checksum decides
             [ "$(stat -c %s "$f.partial" 2> /dev/null)" = "$size" ] || { echo "$prog: FAILED to download $path" >&2; return 1; }
         fi
@@ -79,22 +81,30 @@ EOF
     return 0
 }
 
+# the key reaches curl from a 0600 header file, never its command line (argv is world-readable in ps); an empty file
+# adds no header (a blank-key appliance). register_ uses it; register removes it on every path, since it holds the key.
 register() {
+    hdr=$(mktemp) || return 1
+    [ -z "${LEMONADE_API_KEY:-}" ] || printf 'Authorization: Bearer %s\n' "$LEMONADE_API_KEY" > "$hdr"
+    register_; rc=$?
+    rm -f "$hdr"
+    return $rc
+}
+register_() {
     url=${ONEBIT_LEMONADE_URL:-http://127.0.0.1:${LEMONADE_PORT:-13300}}
     bin=${ONEBIT_BIN:-$(command -v 1bit 2> /dev/null || echo /opt/1bit-package/1bit/1bit)}
-    auth=; [ -n "${LEMONADE_API_KEY:-}" ] && auth="Authorization: Bearer $LEMONADE_API_KEY"
     policy=$("$bin" laya-first 2> /dev/null) || { echo "$prog: $bin laya-first printed no policy" >&2; return 1; }
     name=$(printf '%s' "$policy" | sed -n 's/.*"model_name": *"\([^"]*\)".*/\1/p' | head -1)
     [ -n "$name" ] || { echo "$prog: the policy names no model_name" >&2; return 1; }
     w=0
-    until curl -sf -m 3 ${auth:+-H "$auth"} "$url/api/v1/health" > /dev/null 2>&1; do
+    until curl -sf -m 3 -H @"$hdr" "$url/api/v1/health" > /dev/null 2>&1; do
         w=$((w + 2)); [ "$w" -gt "${ONEBIT_LAYA_WAIT:-180}" ] && { echo "$prog: Lemonade did not answer at $url" >&2; return 1; }
         sleep 2
     done
-    if curl -sf -m 10 ${auth:+-H "$auth"} "$url/api/v1/models?show_all=true" 2> /dev/null | grep -q "\"$name\""; then
+    if curl -sf -m 10 -H @"$hdr" "$url/api/v1/models?show_all=true" 2> /dev/null | grep -q "\"$name\""; then
         echo "$prog: $name is already registered" >&2; return 0
     fi
-    code=$(printf '%s' "$policy" | curl -s -m 30 -o /dev/null -w '%{http_code}' ${auth:+-H "$auth"} \
+    code=$(printf '%s' "$policy" | curl -s -m 30 -o /dev/null -w '%{http_code}' -H @"$hdr" \
         -H 'Content-Type: application/json' --data-binary @- "$url/api/v1/models/register")
     [ "$code" = 200 ] || { echo "$prog: registering $name answered $code" >&2; return 1; }
     echo "$prog: registered $name" >&2

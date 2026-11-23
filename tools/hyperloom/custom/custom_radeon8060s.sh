@@ -64,6 +64,7 @@ declare -A LEVERS=(
 export HL_WIKI=${HL_WIKI:-$HL_BOX_DIR/wiki.test.raw}
 export HL_STATE=${HL_STATE:-$HL_BOX_DIR/state/hrx-$(basename "$MODEL" .gguf)}
 
+hl_refuse_unservable
 hl_levers
 hl_ship box_bench.sh benchmark.py
 hl_ticket bash "$RDIR/box_bench.sh" "$ROUT"

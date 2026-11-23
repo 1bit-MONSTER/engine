@@ -50,6 +50,25 @@ json.dump({"framework": "custom", "workload_kind": "scriptable", "output_through
 EOF
 }
 
+# A round whose change cannot reach the box is refused, not measured: the box serves the installed payload / the Loom
+# card, never the framework checkout, and a scriptable workload has no server to take arguments. Measured 23 Nov
+# (run 20261123T050743Z-8a3ee737): five rounds -- model proposals carrying server args in EXTRA_CUSTOM_ARGS
+# (`--model .../model-d0.json --preset chat`) and a framework-agent patch -- all ran the baseline and read as ties
+# (a "draft off" proposal scored 131.2 while the real HL_DRAFT_DEPTH=0 scored 94.0). Call before hl_levers.
+hl_refuse_unservable() {
+    if [ -n "${EXTRA_CUSTOM_ARGS:-}" ]; then
+        hl_fail_report "refused, not measured: this workload takes only the HL_* levers in levers.json (environment); server arguments cannot reach the box (EXTRA_CUSTOM_ARGS=${EXTRA_CUSTOM_ARGS:0:200})"
+        echo "[$LOG_TAG] refused: EXTRA_CUSTOM_ARGS set (server args cannot reach the box)" >&2
+        exit 0
+    fi
+    local repo=${FRAMEWORK_REPO_PATH:-}
+    if [ -n "$repo" ] && [ -d "$repo/.git" ] && [ -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+        hl_fail_report "refused, not measured: the framework checkout $repo has uncommitted changes, and the box serves the installed payload / Loom card, not this checkout -- a source patch here is a proposal for a PR, not a measurable candidate"
+        echo "[$LOG_TAG] refused: $repo is patched (the box does not serve it)" >&2
+        exit 0
+    fi
+}
+
 hl_levers() {
     local k v j='{'
     for k in $(printf '%s\n' "${!LEVERS[@]}" | sort); do

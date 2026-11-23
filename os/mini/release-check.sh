@@ -2382,7 +2382,8 @@ else
 fi
 
 # ── NPU chats from several users at once (engine#3318) ─────────────────────────────────────────────────────────────
-# Four streamed known-answer chats are sent together. Every one must come back whole and with ITS OWN answer: the
+# Four streamed known-answer chats are sent together (questions Qwen3-0.6B answers reliably: measured on strixhalo 23 Nov,
+# the earlier "largest planet" question got "Earth" from it, which is the model, not the route). Every one must come back whole and with ITS OWN answer: the
 # check for a route that serves several requests at once on one model (one decoder slot per request), where a slot
 # mix-up would hand one user another's text. A route that serves one request at a time queues the other three and
 # passes too; the wall time says which kind ran.
@@ -2394,7 +2395,7 @@ if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     CT0=$(date +%s)
     for cq in "What is 17 + 25? Reply with the number only.|42" "What is the capital of France? Reply with one word.|Paris" \
               "What is the chemical symbol for gold? Reply with the symbol only.|Au" \
-              "Which planet is the largest in the solar system? Reply with one word.|Jupiter"; do
+              "What is 3 times 3? Reply with the number only.|9"; do
         printf '%s' "${cq#*|}" > "$CDIR/u$CN.want"
         CB="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think ${cq%|*}\"}],\"max_tokens\":64,\"temperature\":0,\"stream\":true}"
         ( auth_post "$CB" "$API/api/v1/chat/completions" slow > "$CDIR/u$CN.sse" 2>&1 ) &

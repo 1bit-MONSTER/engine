@@ -564,6 +564,47 @@ def agreement(a, b, by="id"):
     }
 
 
+def split_margin(text, ref_run):
+    """engine#3158 near-tie rule (orchestrator 23 Nov ~20:2xZ): where `text` first leaves `ref_run`'s text, the reference
+    route's top-2 log-prob margin at that token, or None when the reference carries no usable top-2 there.
+    Returns (char index, margin, ref token). When one text is a prefix of the other, the split is at the end of the
+    shorter one; if the reference is the shorter, its next token is the end-of-turn token (an empty string)."""
+    rt = ref_run.get("text") or ""
+    i = next((j for j in range(min(len(text), len(rt))) if text[j] != rt[j]), min(len(text), len(rt)))
+    acc = 0
+    for t in ref_run.get("tokens") or []:
+        s = t.get("token") or ""
+        if acc + len(s) > i or (s == "" and acc == i):
+            tops = sorted(f32(x["lp"]) for x in (t.get("top") or []) if usable(x.get("lp")))
+            return i, (tops[-1] - tops[-2]) if len(tops) > 1 else None, t.get("token")
+        acc += len(s)
+    return i, None, None
+
+
+def near_tie_score(cand_runs, ref_runs, nats=1.0):
+    """Over prompts: identical text, near-tie splits (reference margin <= nats) and counted splits (> nats, or no
+    margin readable). Score = identical + near-tie, out of the prompts both routes answered."""
+    out = {"threshold_nats": nats, "identical": 0, "near_tie": 0, "counted": 0, "unreadable": 0, "splits": []}
+    n = 0
+    for p, (c, r) in enumerate(zip(cand_runs, ref_runs)):
+        c, r = c["runs"][0], r["runs"][0]
+        if not c.get("text") and not r.get("text"):
+            continue
+        n += 1
+        if c["text"] == r["text"]:
+            out["identical"] += 1
+            continue
+        i, m, tok = split_margin(c["text"], r)
+        kind = "counted" if (m is None or m > nats) else "near_tie"
+        out[kind] += 1
+        if m is None:
+            out["unreadable"] += 1
+        out["splits"].append({"prompt": p, "char": i, "margin": m, "ref_token": tok, "kind": kind})
+    out["prompts"] = n
+    out["score"] = out["identical"] + out["near_tie"]
+    return out
+
+
 def selftest():
     """The comparison logic on synthetic runs: the checks a bug in it would silently pass.
 
@@ -767,6 +808,18 @@ def selftest():
        "reasoning_one_sided: flags only the prompts where the routes disagree on carrying reasoning")
     ok(reply_reasoning({"reasoning": "r"}) == "r" and reply_reasoning({"reasoning_content": "c", "reasoning": "r"}) == "c",
        "reply_reasoning: reasoning_content first, then reasoning (the same field the JSON records)")
+    # near-tie rule (engine#3158, 23 Nov): the reference's top-2 margin at the first differing token decides
+    tk = lambda s, lp1, lp2: {"id": 0, "token": s, "lp": lp1, "top": [{"id": 0, "token": s, "lp": lp1}, {"id": 1, "token": "x", "lp": lp2}]}
+    ref = {"text": "ab", "tokens": [tk("a", -0.1, -5.0), tk("b", -0.3, -0.9), tk("", -0.2, -1.0)]}
+    i, m, _ = split_margin("aX", ref)
+    ok(i == 1 and abs(m - 0.6) < 1e-6, "split_margin: the reference token at the first differing character (0.6 nat)")
+    i, m, tok = split_margin("abc", ref)
+    ok(i == 2 and tok == "" and abs(m - 0.8) < 1e-6, "split_margin: a reference that ends first splits at its end-of-turn token")
+    ref_big = {"text": "ab", "tokens": [tk("a", -0.1, -5.0), tk("b", -0.1, -3.0), tk("", -0.2, -1.0)]}
+    runs = lambda *texts_refs: [{"runs": [x]} for x in texts_refs]
+    sc = near_tie_score(runs({"text": "aX"}, {"text": "ab"}, {"text": "aY"}), runs(ref, ref, ref_big), 1.0)
+    ok(sc["identical"] == 1 and sc["near_tie"] == 1 and sc["counted"] == 1 and sc["score"] == 2 and sc["prompts"] == 3,
+       "near_tie_score: identical + near-tie count, a split over the threshold is counted")
     ok(effective_match_by("id", True, False) == "text" and effective_match_by("id", False, False) == "text",
        "effective_match_by: one route without ids degrades the pair to text instead of reporting total divergence")
     # both routes answering with NO content is not agreement: with thinking on and a small --max-tokens a route can
@@ -821,6 +874,10 @@ def main(argv=None):
                         "the thinking, and only the joined text shows where. It changes the TEXT comparison only: "
                         "two routes that both return log-probs under --match-by id are still decided by their id "
                         "streams. A prompt where some routes return reasoning and others none is an error, not a score")
+    p.add_argument("--arbiter", default="cpu",
+                   help="route whose log-probs score the near-tie rule (engine#3158): default cpu, when such a route is given")
+    p.add_argument("--near-tie-nats", type=float, default=1.0,
+                   help="a split counts as a disagreement only when the arbiter's top-2 margin there exceeds this")
     p.add_argument("--timeout", type=float, default=300.0)
     p.add_argument("--json", default=None, help="write the full report here")
     p.add_argument("--selftest", action="store_true", help="check the comparison logic and exit")
@@ -972,6 +1029,20 @@ def main(argv=None):
                       f"route -- not comparable, excluded from the percentage")
             if g["text_prompt_divergence"]:
                 print(f"  text divergence   prompts {g['text_prompt_divergence']}")
+            # engine#3158 near-tie rule (orchestrator 23 Nov ~20:2xZ): against the arbiter, count only splits whose
+            # arbiter top-2 margin exceeds --near-tie-nats; report the near-tie count beside the score
+            if a.arbiter in (la, lb) and la != lb:
+                cand, ref = (pb, pa) if la == a.arbiter else (pa, pb)
+                if all(x["runs"][0].get("tokens") for x in ref):
+                    nt = near_tie_score(cand, ref, a.near_tie_nats)
+                    g["near_tie"] = nt
+                    det = ", ".join(f"p{x['prompt']}@{x['char']}:{'?' if x['margin'] is None else round(x['margin'], 3)}"
+                                    f"{'' if x['kind'] == 'near_tie' else '*'}" for x in nt["splits"])
+                    print(f"  near-tie rule     {nt['score']}/{nt['prompts']} (identical {nt['identical']}, near-tie splits "
+                          f"{nt['near_tie']}, counted {nt['counted']}; {a.arbiter} margin > {a.near_tie_nats} nat counts)"
+                          + (f"  [{det}]  (* = counted)" if det else ""))
+                else:
+                    print(f"  near-tie rule     cannot tell -- {a.arbiter} carried no tokens with log-probs")
             # engine#3158: the accuracy row asks for a mean KLD against CPU, which none of the above
             # answers -- they are all comparisons of the tokens the two routes DID emit. `--route` order
             # is the direction: the first route is the reference, so `--route cpu=… --route hrx=…` gives

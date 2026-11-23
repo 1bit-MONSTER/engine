@@ -562,28 +562,34 @@ npu_power_verdict() {
     esac
 }
 
-# The HRX weight placement (engine #1339's mitigation), decided from two measurements of the same model.
-# Importing the loader's mapping instead of copying it to the device (fork #226, engine #856) saves GTT - Qwen3-4B goes
-# from 3925 to 1243 MiB of the process's own GTT - but on large files the import never finishes: a dense 16.4 GiB 27B and
-# a 76.3 GiB Flash-Next sat in it for 72 minutes with no error, while the device copy loads in 20-75 s (#1339). Fork
-# #231 (pinned since engine #1343) makes the import OPT-IN: `GGML_HRX_WEIGHT_HOST_PLACEMENT=1` asks for it, unset or 0
-# keeps the device copy, which is what a stick needs. Nothing prints that switch - not `--list-devices` (name and size
-# only), not the backend (no log at the decision), not `1bit serve --print-backend-env` - so the row measures the thing
-# itself, the way the issue did: load one model twice and weigh each serve process's own GTT.
-# Pure, so --self-test drives it: <default arm MiB> <opt-in arm MiB> [required % more].
+# The HRX weight placement (engine#856 / llama.cpp #304, the mechanism that replaced #1339's), decided from two
+# measurements of the same model. With the default `-lm mmap` the loader no longer uploads the model into a device buffer:
+# it wraps its file mapping as a host buffer and HRX makes its own device copy of each weight it runs, at the first prompt.
+# `GGML_HRX_MODEL_BUFFER_COPY=1` brings the upload back. Measured (docs/hrx.md, Qwen3-4B Q4_K_M, 5-token prompt, -n 64):
+# 5,665.3 MiB of the process's own GTT with the upload, 3,225.3 MiB with #304 - the upload costs 1.76x. Nothing prints which
+# path a server took, so the row measures the thing itself: load the model twice, ask each one short question (the copies
+# are made then), and weigh each serve process's own GTT. (engine#3353: the row used to compare the long-gone weight-
+# mapping import, GGML_HRX_WEIGHT_HOST_PLACEMENT, so it skipped on every build after fork #234.)
+# Pure, so --self-test drives it: <default arm MiB> <upload arm MiB> [required % more] [model file MiB].
+# With the model's size given, an arm below half of it never held the model on the GPU (the 23 Nov first run weighed the
+# `1bit` wrapper, 3 and 4 MiB, instead of the HRX server it starts - and the relative test alone called that a PASS).
 hrx_placement_verdict() {
-    _d=${1:-} _i=${2:-} _f=${3:-15}
+    _d=${1:-} _u=${2:-} _f=${3:-15} _m=${4:-0}
     case "$_d" in ''|*[!0-9]*) printf 'FAIL the default arm'"'"'s own GTT is unreadable (%s)' "${_d:-empty}"; return 0 ;; esac
-    case "$_i" in ''|*[!0-9]*) printf 'FAIL the opt-in arm'"'"'s own GTT is unreadable (%s)' "${_i:-empty}"; return 0 ;; esac
-    if [ "$_d" -le 0 ] || [ "$_i" -le 0 ]; then
-        printf 'FAIL an arm reported %s / %s MiB of own GTT: that is not a measurement' "$_d" "$_i"; return 0
+    case "$_u" in ''|*[!0-9]*) printf 'FAIL the upload arm'"'"'s own GTT is unreadable (%s)' "${_u:-empty}"; return 0 ;; esac
+    if [ "$_d" -le 0 ] || [ "$_u" -le 0 ]; then
+        printf 'FAIL an arm reported %s / %s MiB of own GTT: that is not a measurement' "$_d" "$_u"; return 0
     fi
-    # the issue's own arms are 1.89x (4B, 5692 -> 3010 MiB) and 3.16x (4B, docs); 15 % is a conservative floor that
-    # cannot be reached by noise, and being relative it needs no absolute MiB threshold to drift with ctx or slots.
-    if [ "$_d" -ge $(( _i + _i * _f / 100 )) ]; then
-        printf 'PASS the default arm costs %s MiB of its own GTT against %s MiB with GGML_HRX_WEIGHT_HOST_PLACEMENT=1 (%s%% more): the shipped default takes the device copy, and the import still works when it is asked for' "$_d" "$_i" "$_f"
+    case "$_m" in ''|*[!0-9]*) _m=0 ;; esac
+    if [ "$_m" -gt 0 ] && { [ $(( _d * 2 )) -lt "$_m" ] || [ $(( _u * 2 )) -lt "$_m" ]; }; then
+        printf 'FAIL an arm held %s / %s MiB of own GTT for a %s MiB model: less than half of it, so that process never had the model on the GPU and this is not a measurement of the placement' "$_d" "$_u" "$_m"; return 0
+    fi
+    # docs/hrx.md's own pair is 1.76x; 15 % is a floor that cannot be reached by noise, and being relative it needs no absolute MiB
+    # threshold to drift with ctx or slots
+    if [ "$_u" -ge $(( _d + _d * _f / 100 )) ]; then
+        printf 'PASS the shipped default (the loader'"'"'s mapping, #304) costs %s MiB of its own GTT against %s MiB with GGML_HRX_MODEL_BUFFER_COPY=1 (the upload costs at least %s%% more)' "$_d" "$_u" "$_f"
     else
-        printf 'FAIL the default arm used %s MiB and the opt-in arm %s MiB - the default is not the device copy that loads a large model (#1339); check that this build carries fork #231' "$_d" "$_i"
+        printf 'FAIL the default arm used %s MiB and the upload arm %s MiB - the default is not the mapped path that saves the model'"'"'s device copy (engine#856, llama.cpp #304)' "$_d" "$_u"
     fi
 }
 
@@ -1233,15 +1239,25 @@ if [ "${1:-}" = --self-test ]; then
     # split is not mistaken for a gap)
     # c32: the HRX weight placement. The measured arms from #1339 are the first two; the failure shapes are a default
     # that already imported (2), an unreadable arm, and a zero.
-    check PASS "$(hrx_placement_verdict 5692 3010)"        # 4B perplexity, #1339
-    check PASS "$(hrx_placement_verdict 3925 1243)"        # 4B, docs/hrx.md
-    check FAIL "$(hrx_placement_verdict 3010 5692)"        # default imported: the wrong way round
+    check PASS "$(hrx_placement_verdict 3225 5665)"        # 4B, docs/hrx.md (#304 vs the upload)
+    check FAIL "$(hrx_placement_verdict 6055 6311)"        # 4B, a 1,282-word prompt: 1.04x - why the row asks a SHORT question
+    check FAIL "$(hrx_placement_verdict 5665 3225)"        # the default uploads: the wrong way round
     check FAIL "$(hrx_placement_verdict 1000 1000)"        # no difference at all
     check FAIL "$(hrx_placement_verdict 0 3010)"           # a zero is not a measurement
     check FAIL "$(hrx_placement_verdict '' 3010)"          # unreadable default
-    check FAIL "$(hrx_placement_verdict 5692 '')"          # unreadable opt-in
-    check PASS "$(hrx_placement_verdict 2000 1000)"        # exactly the floor is enough
-    check FAIL "$(hrx_placement_verdict 1140 1000)"        # just under it is not
+    check FAIL "$(hrx_placement_verdict 3225 '')"          # unreadable upload
+    check PASS "$(hrx_placement_verdict 1000 1150)"        # exactly the floor is enough
+    check FAIL "$(hrx_placement_verdict 1000 1140)"        # just under it is not
+    check FAIL "$(hrx_placement_verdict 3 4 15 2384)"      # 23 Nov: the wrapper weighed, not the server - never a PASS
+    check PASS "$(hrx_placement_verdict 3225 5665 15 2384)"  # the docs pair over the 4B's 2,384 MiB file
+    # hrxp_gtt reads the key's UNIT: 7.4 prints KiB, and dividing it as bytes made 3.2 GiB read "3 MiB" (23 Nov)
+    _hp=$(mktemp -d); mkdir -p "$_hp/11/fdinfo" "$_hp/12/fdinfo"
+    printf 'drm-driver:\tamdgpu\ndrm-total-gtt:\t3281620 KiB\n' > "$_hp/12/fdinfo/7"
+    printf 'drm-driver:\tamdgpu\ndrm-total-gtt:\t2 MiB\n' > "$_hp/11/fdinfo/3"
+    eval "$(sed -n '/^hrxp_gtt() {/,/^}/p' "$0")"   # defined with its row, after this self-test returns
+    _hg=$(HRXP_PROC=$_hp hrxp_gtt 11 12); rm -rf "${_hp:?}"
+    if [ "$_hg" = 3206 ]; then check PASS "PASS hrxp_gtt sums KiB and MiB lines to 3206 MiB"
+    else check PASS "FAIL hrxp_gtt read $_hg MiB, want 3206 (the fdinfo unit is not read)"; fi
     # c30 (owner decision 2026-11-05): the NPU's power state. The c29 take's shape is the second case - the array was
     # allowed to suspend between requests, and the prompt turn that followed it came back `code 614`.
     check PASS "$(npu_power_verdict on active)"
@@ -1557,17 +1573,38 @@ hrxp_fetch() {
     say "info  fetch : pulled Qwen3-4B-Instruct-2507-1bit for hrx-placement in $(( $(date +%s) - _t0 )) s"
     return 0
 }
-hrxp_gtt() {  # <pid>... -> that process tree's own drm-total-gtt, in MiB
-    if [ -n "${HRXP_GTT:-}" ]; then "$HRXP_GTT" "$@"; return 0; fi
-    _k=0
-    for _p in "$@"; do
-        for _fd in /proc/"$_p"/fdinfo/*; do
-            [ -r "$_fd" ] || continue
-            _b=$(sed -n 's/^drm-total-gtt:[[:space:]]*\([0-9]*\).*/\1/p' "$_fd" 2>/dev/null | head -1)
-            [ -n "$_b" ] && _k=$((_k + _b))
+hrxp_tree() {  # <pid> -> it and every descendant, space-separated
+    _t=" $1 " _grew=1
+    while [ "$_grew" = 1 ]; do
+        _grew=0
+        for _s in /proc/[0-9]*/stat; do
+            IFS= read -r _l 2> /dev/null < "$_s" || continue
+            _r=${_l##*) }; _pp=${_r#* }; _pp=${_pp%% *}; _c=${_s%/stat}; _c=${_c##*/}
+            case "$_t" in *" $_pp "*) case "$_t" in *" $_c "*) ;; *) _t="$_t$_c "; _grew=1 ;; esac ;; esac
         done
     done
-    [ "$_k" -gt 0 ] && printf '%s' $(( _k / 1024 / 1024 )) || printf '0'
+    printf '%s' "$_t"
+}
+hrxp_gtt() {  # <pid>... -> that process tree's own drm-total-gtt, in MiB
+    if [ -n "${HRXP_GTT:-}" ]; then "$HRXP_GTT" "$@"; return 0; fi
+    # engine#3353: the key carries its unit (`drm-total-gtt:\t3281620 KiB` on 7.4; MiB or bare bytes elsewhere). This summed
+    # the number and divided by 1024*1024 as if it were bytes, so 3.2 GiB read as "3 MiB" and the 23 Nov runs looked empty
+    _k=0
+    for _p in "$@"; do
+        for _fd in "${HRXP_PROC:-/proc}/$_p"/fdinfo/*; do
+            [ -r "$_fd" ] || continue
+            _v=$(sed -n 's/^drm-total-gtt:[[:space:]]*\([0-9]*\)[[:space:]]*\([A-Za-z]*\).*/\1 \2/p' "$_fd" 2>/dev/null | head -1)
+            [ -n "$_v" ] || continue
+            _n=${_v%% *} _u=${_v#* }; [ "$_u" = "$_v" ] && _u=
+            case "$_u" in
+                KiB) _k=$((_k + _n)) ;;
+                MiB) _k=$((_k + _n * 1024)) ;;
+                GiB) _k=$((_k + _n * 1048576)) ;;
+                *)   _k=$((_k + _n / 1024)) ;;          # no unit: bytes
+            esac
+        done
+    done
+    [ "$_k" -gt 0 ] && printf '%s' $(( _k / 1024 )) || printf '0'
 }
 # Which mechanism does the SHIPPED engine have? Fork #231 (engine #1343) added the import switch and made it opt-in;
 # fork #234 (engine #1351, which also closed #1339) REMOVED it - that build reads the weights into their buffers and drops
@@ -1576,17 +1613,17 @@ hrxp_gtt() {  # <pid>... -> that process tree's own drm-total-gtt, in MiB
 # when the switch is not in it: a gate that fails a correct build is its own defect. Measuring the read+DONTNEED mechanism
 # needs its own row (#1351 measured page-cache residency 16.5 GiB -> nothing, peak RSS 16.4 -> 2.9 GiB, load 14.3 -> 18.6 s),
 # and it must be built and measured on a pin that has it before it can gate one.
-hrxp_has_switch() {  # <engine binary> -> 0 when the shipped libs carry GGML_HRX_WEIGHT_HOST_PLACEMENT
+hrxp_has_switch() {  # <engine binary> -> 0 when the shipped libs carry GGML_HRX_MODEL_BUFFER_COPY (the upload arm's switch)
     case "${HRXP_SWITCH:-}" in 1) return 0 ;; 0) return 1 ;; esac
     _d=$(dirname "${1:-}" 2>/dev/null) _l=
     for _cand in "$_d/libggml-hrx.so" "$_d"/libggml-hrx.so.* "$_d/../lib/ggml/libggml-hrx.so" "$_d"/../lib/ggml/libggml-hrx.so.* "$_d"/hrx/llama/bin/libggml-hrx.so; do
         [ -f "$_cand" ] || continue
-        if grep -q 'GGML_HRX_WEIGHT_HOST_PLACEMENT' "$_cand" 2>/dev/null; then _l=$_cand; break; fi
+        if grep -aq 'GGML_HRX_MODEL_BUFFER_COPY' "$_cand" 2>/dev/null; then _l=$_cand; break; fi
     done
     [ -n "$_l" ]
 }
 
-hrxp_arm() {  # <port> <optin 0|1> -> "<own GTT MiB>" on stdout; non-zero when the arm did not come up
+hrxp_arm() {  # <port> <upload 0|1> -> "<own GTT MiB>" on stdout; non-zero when the arm did not come up
     if [ -n "${HRXP_SERVE:-}" ]; then
         _g=$($HRXP_SERVE "$1" "$2" 2>/dev/null | tail -1)
         case "${_g:-}" in ''|*[!0-9]*) return 1 ;; esac
@@ -1594,7 +1631,7 @@ hrxp_arm() {  # <port> <optin 0|1> -> "<own GTT MiB>" on stdout; non-zero when t
     fi
     set -- "$1" "$2"
     _port=$1 _optin=$2
-    if [ "$_optin" = 1 ]; then export GGML_HRX_WEIGHT_HOST_PLACEMENT=1; else unset GGML_HRX_WEIGHT_HOST_PLACEMENT; fi
+    if [ "$_optin" = 1 ]; then export GGML_HRX_MODEL_BUFFER_COPY=1; else unset GGML_HRX_MODEL_BUFFER_COPY; fi
     setsid "$ONEBIT_BIN" serve -m "$HRXP_MODEL_PATH" --device hrx --ctx-size 512 --host 127.0.0.1 --port "$_port" \
         >/tmp/1bit-hrxp-$_port.log 2>&1 &
     _pgid=$!
@@ -1611,9 +1648,29 @@ hrxp_arm() {  # <port> <optin 0|1> -> "<own GTT MiB>" on stdout; non-zero when t
     if ! kill -0 "$_pgid" 2>/dev/null; then
         kill -TERM -- -"$_pgid" 2>/dev/null; return 1
     fi
-    # the child (llama-server) holds the device; sample the group, then stop it and let the GTT go
-    _pids=$(pgrep -g "$_pgid" 2>/dev/null | tr '\n' ' ')
-    _g=$(hrxp_gtt "$_pgid" $_pids)
+    # #304 makes HRX's device copies at the first prompt, so an idle server would weigh nothing: one SHORT question first
+    # (a long prompt shrinks the difference to 1.04x, docs/hrx.md), the measured shape's 5 tokens and -n 64
+    _q='{"messages":[{"role":"user","content":"Hello there, how are you?"}],"max_tokens":64,"temperature":0}'
+    # `1bit serve` answers /health while its llama-server still loads, and a request in that window is a quick 503 (the
+    # 23 Nov runs weighed a server that had not loaded, 3 MiB): ask until the question is ANSWERED, within HRXP_WAIT
+    _ok=0 _j=0
+    while [ "$_j" -lt "$_w" ]; do
+        if command -v curl >/dev/null 2>&1; then
+            curl -sf -m 120 -H 'Content-Type: application/json' -d "$_q" "http://127.0.0.1:$_port/v1/chat/completions" >/dev/null 2>&1 && { _ok=1; break; }
+        else
+            wget -q -O /dev/null --timeout=120 -t 1 --header='Content-Type: application/json' --post-data="$_q" \
+                "http://127.0.0.1:$_port/v1/chat/completions" 2>/dev/null && { _ok=1; break; }
+        fi
+        kill -0 "$_pgid" 2>/dev/null || break
+        sleep 2; _j=$((_j + 2))
+    done
+    if [ "$_ok" != 1 ]; then
+        kill -TERM -- -"$_pgid" 2>/dev/null; sleep 2; kill -KILL -- -"$_pgid" 2>/dev/null; return 1
+    fi
+    # the HRX server holds the device, and `1bit serve` may start it in a process group of its own: weigh the whole TREE
+    # under the arm (parent links in /proc), not just setsid's group, then stop it and let the GTT go
+    _pids=$(hrxp_tree "$_pgid")
+    _g=$(hrxp_gtt $_pids)
     kill -TERM -- -"$_pgid" 2>/dev/null; sleep 2; kill -KILL -- -"$_pgid" 2>/dev/null
     case "${_g:-}" in ''|*[!0-9]*) return 1 ;; esac
     printf '%s' "$_g"
@@ -1634,23 +1691,24 @@ else
     if [ -z "$ONEBIT_BIN" ] && [ -z "${HRXP_SERVE:-}" ]; then
         skip hrx-placement "no 1bit engine binary in the image, so the two arms cannot be started"
     elif ! hrxp_has_switch "$ONEBIT_BIN"; then
-        skip hrx-placement "this build does not carry the weight-mapping import switch (fork #234 / engine #1351 removed it: weights are read into their buffers and their page cache is dropped), so both arms would take the same path and the two-arm GTT measurement cannot distinguish anything - #1339's current mechanism needs its own row, measured on a pin that has it"
+        skip hrx-placement "this build's libggml-hrx does not carry GGML_HRX_MODEL_BUFFER_COPY (llama.cpp #304), so both arms would take the same path and the two-arm GTT measurement cannot distinguish anything"
     else
         export HRXP_MODEL_PATH
         DFLT=$(hrxp_arm 18301 0) || _drc=$?
-        OPTIN=$(hrxp_arm 18302 1) || _orc=$?
+        UPLOAD=$(hrxp_arm 18302 1) || _orc=$?
         if [ -n "${_drc:-}" ] || [ -n "${_orc:-}" ]; then
             # an arm that never answered /health is not a measurement of the placement: name which one, and why, rather
             # than reporting "unreadable GTT" and sending the reader after the wrong fault
-            VM="FAIL an arm did not come up (default${_drc:+ rc=$_drc} ${DFLT:-no-answer} / opt-in${_orc:+ rc=$_orc} ${OPTIN:-no-answer}); see /tmp/1bit-hrxp-1830{1,2}.log"
+            VM="FAIL an arm did not come up (default${_drc:+ rc=$_drc} ${DFLT:-no-answer} / upload${_orc:+ rc=$_orc} ${UPLOAD:-no-answer}); see /tmp/1bit-hrxp-1830{1,2}.log"
         else
-            VM=$(hrx_placement_verdict "${DFLT:-}" "${OPTIN:-}")
+            _hm=$(( $(stat -c %s "$HRXP_MODEL_PATH" 2> /dev/null || echo 0) / 1048576 ))
+            VM=$(hrx_placement_verdict "${DFLT:-}" "${UPLOAD:-}" 15 "$_hm")
         fi
         case "$VM" in
             PASS*) pass hrx-placement "$(basename "$HRXP_MODEL_PATH") (untied): ${VM#PASS }" ;;
             *)     fail hrx-placement "$(basename "$HRXP_MODEL_PATH"): ${VM#FAIL }" ;;
         esac
-        unset HRXP_MODEL_PATH GGML_HRX_WEIGHT_HOST_PLACEMENT
+        unset HRXP_MODEL_PATH GGML_HRX_MODEL_BUFFER_COPY
     fi
 fi
 

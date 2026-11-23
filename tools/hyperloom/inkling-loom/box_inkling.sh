@@ -146,9 +146,19 @@ while [ $i -lt 600 ]; do
 done
 echo "$i" > "$OUT/register_s"
 if [ $ok != 1 ]; then
+    # Ask the server why BEFORE stopping it (a stopped server answers nothing: the 23 Nov prefill_16384 round's status
+    # came back empty for exactly that reason).
+    curl -s -m 5 "http://127.0.0.1:$PORT/v1/status" 2>/dev/null > "$OUT/status.json"
     kill -TERM -- -"$pid" 2>/dev/null   # its process group: setsid made the server a session leader
-    curl -s -m 5 "http://127.0.0.1:$PORT/v1/status" 2>/dev/null | head -c 2000 > "$OUT/status.json"
-    status "failed: the model did not register in ${i}s (serve.log)"; exit 1
+    # loom-serve keeps running when a model fails to register; its own reason is in /v1/status (e.g. a preset value
+    # outside the program's declared range: SYMBOL/008 '@llm.tokens' value 16384 violates range(1, 8192)).
+    why=$(python3 -c 'import json,sys
+try:
+    for m in json.load(open(sys.argv[1])).get("data", []):
+        e = (m.get("loom") or {}).get("error") or {}
+        if e.get("message"): print(e["message"].rsplit(": ", 1)[-1][:300]); break
+except Exception: pass' "$OUT/status.json" 2>/dev/null)
+    status "failed: the model did not register in ${i}s${why:+: $why}"; exit 1
 fi
 python3 -u "$HERE/gauntlet.py" --url "http://127.0.0.1:$PORT" --arm hyperloom --runs "$RUNS" --rows "$GROWS" \
     --json "$OUT/gauntlet.json" > "$OUT/gauntlet.log" 2>&1

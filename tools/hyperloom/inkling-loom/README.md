@@ -50,7 +50,7 @@ The device-free test is `tests/hyperloom_inkling_loom_test.py` (stub ssh/box-hol
    | --- | --- | --- |
    | `HL_DRAFT_DEPTH` | 0-8 | preset `draft_depth` (DSpark; card default 3) |
    | `HL_ROWS`, `HL_CONTEXT` | 1-16, tokens | preset `rows` x `context_capacity` (the slots/context preset; card 4 x 262144; refused above 2x the card's pool) |
-   | `HL_PREFILL_CAP` | tokens | preset `prefill_capacity` (card 4096) |
+   | `HL_PREFILL_CAP` | tokens | preset `prefill_capacity` (card 4096; at most **8192**: the card's `llm.loom` declares `@llm.tokens` in `range(1, 8192)` and refuses to register above it) |
    | `HL_MAX_TOKENS` | tokens | preset `max_tokens` (card 4096) |
    | `HL_SPIN_NS` | ns or `default` | amdgpu `completion_spin_ns` (the card's flags use 4294967295) |
    | `HL_WAIT_MODE` | `active`/`blocking` | `--wait_mode` |

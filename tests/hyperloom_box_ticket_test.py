@@ -24,7 +24,8 @@ shims that record they were used, and loom-serve is a fake OpenAI server that st
   * a lever reaches the box as the overlay model.json's draft_depth, and through box-hold (never around it);
   * a lever outside its allowed values is refused BEFORE anything crosses ssh, as a failing report (exit 0);
   * a box without the temperature sensor (CI: no k10temp) still writes provenance (its fields are null);
-  * a model that never registers is a failing report, not a crash and not a pass;
+  * a model that never registers is a failing report, not a crash and not a pass; when loom-serve refuses the
+    registration (it stays up), its own reason reaches the round's status;
   * box_gate.sh (the restricted key's forced command): a full Inkling round passes through it once the box side is
     allowlisted; it refuses a shell, a ship of new scripts, a non-allowlisted or tampered rev, and a name outside its list;
   * a round the box cannot serve is refused before any ticket: server args from a model proposal (EXTRA_CUSTOM_ARGS)
@@ -61,7 +62,15 @@ host, port = listen.rsplit(":", 1)
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
-        body = json.dumps({"data": [{"id": "Inkling-2-Mini"}]}).encode() if self.path == "/v1/models" else b"{}"
+        fail = os.environ.get("FAKE_REG_FAIL")
+        if fail and self.path == "/v1/status":
+            body = json.dumps({"data": [{"id": "Inkling-2-Mini", "loom": {"registration": "failed",
+                                "error": {"code": 3, "message": "card/program/llm.loom:67719:1: " + fail}}}]},
+                              separators=(",", ":")).encode()   # loom-serve's own compact JSON
+        elif fail:
+            body = json.dumps({"data": []}).encode()
+        else:
+            body = json.dumps({"data": [{"id": "Inkling-2-Mini"}]}).encode() if self.path == "/v1/models" else b"{}"
         self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -269,6 +278,12 @@ def main():
         check("a patched framework checkout is refused, not measured", p.returncode == 0 and rep
               and not rep["quality_gate"]["passed"] and "uncommitted changes" in rep["quality_gate"]["reason"]
               and log.read_text().count("box-hold") == before, json.dumps(rep)[:300])
+
+        msg = "SYMBOL/008: symbol '@llm.tokens' value 16384 of type index violates constraint 'range'"
+        p, rep, rd = round_(dict(env, FAKE_REG_FAIL=msg), td, "regfail", HL_PREFILL_CAP="16384")
+        st = (rd / "box" / "status").read_text()
+        check("a refused registration names loom-serve's reason", rep and not rep["quality_gate"]["passed"]
+              and "violates constraint 'range'" in st and "violates" in json.dumps(rep), st)
 
         # an unreachable box: ssh always fails with 255 (the 23 Nov NIC loss)
         dbin = td / "deadbin"

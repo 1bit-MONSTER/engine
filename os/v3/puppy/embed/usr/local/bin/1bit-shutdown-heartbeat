@@ -1,0 +1,122 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#
+# 1bit-shutdown-heartbeat <rc.shutdown pid>
+#
+# engine#3361: the shutdown stall's second witness. 1bit-shutdown-watch (#3362) says each rc.shutdown step, but in all
+# three stalls it went silent right after the post-NIC `sleep 2` (rc.shutdown l.169) and said nothing for 258 s - so
+# it was killed (no trap fired: SIGKILL) or stopped too. This one is built so rc.shutdown cannot stop it:
+#   - it runs from a copy in tmpfs (/dev/shm), cwd /, stdio /dev/null: nothing open on the save partition, so the
+#     `fuser -k -m` passes skip it;
+#   - its loop forks NOTHING (builtins only: a zombie child is what killzombies answers with kill -9 of the parent);
+#   - TERM, HUP and INT are ignored (and said).
+#   - the hook starts it DETACHED (`( ... & )`), so it is init's child, not rc.shutdown's: watcher v2 follows
+#     rc.shutdown's newest child and must not mistake this for a step, and killzombies cannot reach it as a parent.
+# Every ONEBIT_HB_PERIOD (10) s it says where rc.shutdown is (deepest child: pid, comm, state, wchan) and whether the
+# step watcher still runs. When the same step sits still for ONEBIT_HB_W (30) s it writes sysrq `w` (the blocked
+# tasks' stacks into the kernel log); after ONEBIT_HB_STACKS (60) s it writes the kernel stack of rc.shutdown's chain and
+# of every task in state D or R. The kernel log is what /data/logs/<boot>/dmesg.log keeps.
+# Tests: ONEBIT_KMSG=<file> ONEBIT_PROC=<dir> ONEBIT_SYSRQ=<file> ONEBIT_HB_DIR=<dir>.
+set -u
+root=${1:?usage: 1bit-shutdown-heartbeat <rc.shutdown pid>}
+K=${ONEBIT_KMSG:-/dev/kmsg}; P=${ONEBIT_PROC:-/proc}; SQ=${ONEBIT_SYSRQ:-/proc/sysrq-trigger}
+dir=${ONEBIT_HB_DIR:-/dev/shm/1bit-hb}
+period=${ONEBIT_HB_PERIOD:-10}; wafter=${ONEBIT_HB_W:-30}; safter=${ONEBIT_HB_STACKS:-60}
+say() { printf '1bit-shutdown-hb: %s\n' "$*" >> "$K" 2> /dev/null; }
+
+# 1. move into tmpfs once (forks here are before rc.shutdown's kill passes, and this shell has no zombie yet)
+if [ "${ONEBIT_HB_MOVED:-}" != 1 ]; then
+    mkdir -p "$dir" 2> /dev/null && cp "$0" "$dir/hb" 2> /dev/null && cd / &&
+        ONEBIT_HB_MOVED=1 exec /bin/sh "$dir/hb" "$@" < /dev/null > /dev/null 2>&1
+    say "could not move into $dir; running in place"
+fi
+cd / 2> /dev/null
+trap 'say "got SIGTERM, ignored (rc.shutdown in ${leaf:-?})"' TERM
+trap 'say "got SIGHUP, ignored"' HUP
+trap 'say "got SIGINT, ignored"' INT
+[ -z "${ONEBIT_KMSG:-}" ] && echo on > /proc/sys/kernel/printk_devkmsg 2> /dev/null
+
+# a one-second wait without a fork: read -t on a fifo nobody writes (busybox ash); else sleep (dash, the test)
+# (only where `read -t` exists: dash has none, and a read that fails at once would make this loop spin)
+tick() { sleep 1; }
+( read -t 0 _x < /dev/null ) 2> /dev/null
+if [ $? -ne 2 ]; then
+    f=$dir/tick.$$
+    if mkfifo "$f" 2> /dev/null && exec 3<> "$f"; then rm -f "$f"; tick() { read -t 1 _x <&3 2> /dev/null; return 0; }; fi
+fi
+
+st_of() {   # s=<state> pp=<ppid> c=<comm> of $1, builtins only
+    s=? pp=? c=?
+    IFS= read -r _l < "$P/$1/stat" 2> /dev/null || return 1
+    c=${_l#*(}; c=${c%)*}; _r=${_l##*) }; s=${_r%% *}; _r=${_r#* }; pp=${_r%% *}
+}
+deepest() { # leaf = the newest child chain from $root
+    leaf=$root
+    while :; do
+        kid=
+        for _st in "$P"/[0-9]*/stat; do
+            IFS= read -r _l < "$_st" 2> /dev/null || continue
+            _r=${_l##*) }; _r=${_r#* }; [ "${_r%% *}" = "$leaf" ] || continue
+            case $_l in *"(1bit-shutdown-"*) continue ;; esac        # the step watcher is not a step
+            _c=${_st%/stat}; _c=${_c##*/}; [ "$_c" = "$$" ] && continue
+            { [ -z "$kid" ] || [ "$_c" -gt "$kid" ]; } && kid=$_c
+        done
+        [ -n "$kid" ] || break
+        leaf=$kid
+    done
+}
+watcher() { # wpid = the step watcher (comm 1bit-shutdown-w), empty when none; a zombie (killed, not reaped by
+            # rc.shutdown, which never waits for it) is gone
+    wpid=
+    for _st in "$P"/[0-9]*/stat; do
+        IFS= read -r _l < "$_st" 2> /dev/null || continue
+        case $_l in *"(1bit-shutdown-w) Z "*) continue ;; *"(1bit-shutdown-w)"*) _c=${_st%/stat}; wpid=${_c##*/}; return ;; esac
+    done
+}
+stacks() { # the kernel stack of $1, one kmsg line per frame
+    [ -r "$P/$1/stack" ] || return 0
+    while IFS= read -r _f; do say "stack $1 [$c] $_f"; done < "$P/$1/stack" 2> /dev/null
+}
+
+say "watching rc.shutdown $root as $$ (parent ${PPID:-?}; period ${period}s, sysrq w after ${wafter}s, stacks after ${safter}s)"
+watcher; had=$wpid; [ -n "$had" ] && say "step watcher is $had"
+last= since=0 n=0 wdone= sdone=
+while [ -d "$P/$root" ]; do
+    deepest
+    if [ "$leaf" != "$last" ]; then last=$leaf since=0 wdone= sdone=; else since=$((since + 1)); fi
+    if [ -n "$had" ]; then watcher; [ -n "$wpid" ] || { st_of "$leaf"; say "step watcher $had is GONE (rc.shutdown in $leaf [$c] $s)"; had=; }; fi
+    n=$((n + 1))
+    if [ "$n" -ge "$period" ]; then
+        n=0; w=; IFS= read -r w < "$P/$leaf/wchan" 2> /dev/null; st_of "$leaf"
+        say "alive: rc.shutdown in $leaf [$c] state $s wchan ${w:-0}, same step ${since}s, step watcher ${had:-none}"
+    fi
+    if [ "$since" -ge "$wafter" ] && [ -z "$wdone" ]; then
+        wdone=1; st_of "$leaf"; say "rc.shutdown has been in $leaf [$c] for ${since}s: sysrq w"
+        echo w > "$SQ" 2> /dev/null || say "sysrq w could not be written"
+    fi
+    if [ "$since" -ge "$safter" ] && [ -z "$sdone" ]; then
+        sdone=1; say "rc.shutdown has been in $leaf for ${since}s: stacks of its chain and of every D/R task"
+        p=$leaf; while [ -n "$p" ] && [ "$p" != 1 ] && st_of "$p"; do stacks "$p"; [ "$p" = "$root" ] && break; p=$pp; done
+        for _st in "$P"/[0-9]*/stat; do
+            IFS= read -r _l < "$_st" 2> /dev/null || continue
+            _r=${_l##*) }; case ${_r%% *} in D|R) _c=${_st%/stat}; _c=${_c##*/}; st_of "$_c"; say "task $_c [$c] state $s"; stacks "$_c" ;; esac
+        done
+    fi
+    tick
+done
+say "rc.shutdown $root finished"
+exit 0

@@ -22,6 +22,7 @@ set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 watch=$here/os/v3/puppy/embed/usr/local/bin/1bit-shutdown-watch
 hook=$here/os/v3/puppy/hook-rc-shutdown.sh
+hb=$here/os/v3/puppy/embed/usr/local/bin/1bit-shutdown-heartbeat
 t=$(mktemp -d) || exit 1
 bad=0
 trap 'rm -rf "${t:?}"' EXIT
@@ -72,6 +73,38 @@ check $? "right after the Executing banner, backgrounded on rc.shutdown's own pi
 cp "$t/rc.shutdown" "$t/once"; sh "$hook" "$t/rc.shutdown"
 cmp -s "$t/rc.shutdown" "$t/once"; check $? "a second run changes nothing"
 sh -n "$t/rc.shutdown"; check $? "the hooked script still parses"
+sed -n 6p "$t/rc.shutdown" | grep -q '^# 1bit engine#3361' &&
+    sed -n 7p "$t/rc.shutdown" | grep -qF '[ -x /usr/local/bin/1bit-shutdown-heartbeat ] && ( /usr/local/bin/1bit-shutdown-heartbeat $$ < /dev/null > /dev/null 2>&1 & )'
+check $? "the heartbeat line follows the watcher line, started detached (init's child, not a step)"
+printf '#!/bin/ash\necho "Executing /etc/rc.d/rc.shutdown..."\n# 1bit engine#3287: say each shutdown step in the kernel log\n[ -x /usr/local/bin/1bit-shutdown-watch ] && /usr/local/bin/1bit-shutdown-watch $$ < /dev/null > /dev/null 2>&1 &\nsync\n' > "$t/old"
+sh "$hook" "$t/old"; [ "$(grep -c '1bit-shutdown-heartbeat \$\$' "$t/old")" = 1 ] && [ "$(grep -c '1bit-shutdown-watch \$\$' "$t/old")" = 1 ]
+check $? "an rc.shutdown hooked before #3361 gets the heartbeat too, and keeps one watcher line"
+
+# 3. engine#3361: the heartbeat on a stand-in rc.shutdown that loses its step watcher, then stalls in `sleep 9`
+printf '#!/bin/sh\nsleep 30\n' > "$t/1bit-shutdown-watch"; chmod +x "$t/1bit-shutdown-watch"
+printf '#!/bin/sh\n"%s" & w=$!\nsleep 3\nkill $w\nsleep 9\n' "$t/1bit-shutdown-watch" > "$t/rc4"
+sh "$t/rc4" & rc4=$!
+sleep 1
+( ONEBIT_KMSG="$t/kmsg4" ONEBIT_SYSRQ="$t/sysrq" ONEBIT_HB_DIR="$t/hbdir" ONEBIT_HB_PERIOD=2 ONEBIT_HB_W=3 ONEBIT_HB_STACKS=5 \
+    sh "$hb" $rc4 < /dev/null > /dev/null 2>&1 & )
+sleep 2
+hbpid=$(sed -n 's/^1bit-shutdown-hb: watching rc.shutdown [0-9]* as \([0-9]*\) .*/\1/p' "$t/kmsg4")
+[ -n "$hbpid" ] && kill -TERM "$hbpid" 2> /dev/null
+wait $rc4
+for i in 1 2 3 4 5 6; do grep -q "finished" "$t/kmsg4" 2> /dev/null && break; sleep 1; done
+grep -q "^1bit-shutdown-hb: step watcher [0-9]* is GONE (rc.shutdown in [0-9]* " "$t/kmsg4"
+check $? "it says when the step watcher disappears, and where rc.shutdown was then"
+grep -qE "^1bit-shutdown-hb: alive: rc.shutdown in [0-9]+ \[sleep\] state S" "$t/kmsg4" && ! grep -q "alive: .*\[1bit-shutdown-w\]" "$t/kmsg4"
+check $? "its heartbeat names rc.shutdown's step (never the step watcher)"
+[ "$(cat "$t/sysrq" 2> /dev/null)" = w ] && grep -q "for [0-9]*s: sysrq w" "$t/kmsg4" && grep -q "stacks of its chain and of every D/R task" "$t/kmsg4"
+check $? "a step that sits still gets sysrq w, then the stack dump"
+grep -q "got SIGTERM, ignored" "$t/kmsg4" && grep -q "^1bit-shutdown-hb: rc.shutdown $rc4 finished" "$t/kmsg4"
+check $? "SIGTERM (rc.shutdown's kill passes) is ignored: it runs on to rc.shutdown's end"
+[ "$(grep -c "^1bit-shutdown-hb: alive:" "$t/kmsg4")" -le 8 ]
+check $? "it ticks once a second, it does not spin (a 13 s shutdown, a 2 s period: at most 8 heartbeats)"
+[ -f "$t/hbdir/hb" ] && grep -q "as $hbpid (parent 1" "$t/kmsg4"
+check $? "it runs from its tmpfs copy, as init's child (detached)"
+
 printf '#!/bin/ash\nsync\n' > "$t/other"
 sh "$hook" "$t/other" 2> /dev/null; [ $? = 1 ]; check $? "an rc.shutdown without the banner is refused (exit 1)"
 

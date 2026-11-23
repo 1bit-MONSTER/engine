@@ -610,6 +610,14 @@ rehearsal found these only after the build) and stops with a message naming what
   1bit OS itself is the Puppy appliance (`os/v3/puppy/build.sh`, [os/README.md](../os/README.md)), built
   from the same engine package.
 
+### The release check on the board
+
+Run `1bit-release-check --fetch` on the live stick, and again on the installed disk. `--fetch` pulls what a row needs
+and cannot find: today the `hrx-placement` row's named 4B GGUF. Without it that row skips on every release, as on
+v2026.48. The release note takes its numbers from the check's `SUMMARY:` line
+(`SUMMARY: rows=39 pass=33 skip=6 fail=0 skipped=…`). It names every skipped row with the reason its `SKIP` line gives.
+A SKIP is not a pass: v2026.48's notes said "39 of 39" over 33 PASS and 6 SKIP, and were corrected on 23 Nov (engine#3353).
+
 ### Bumps
 
 | PR | check beyond build + ctest |

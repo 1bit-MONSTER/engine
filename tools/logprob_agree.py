@@ -577,12 +577,26 @@ def split_margin(text, ref_run):
 
     Returns (char index, gap or None, reference token, route token or None, top-2 margin or None). gap is None when the
     route's token is not among the reference's top-N (the split then counts)."""
-    rt = ref_run.get("text") or ""
+    # Align the reference's token stream to the compared text first (engine#3158, cl-nvfp4 on the rc2 Inkling row):
+    # with --with-reasoning the text is reasoning + REASONING_SEP + answer, while the token stream has no separator
+    # and carries the model's own markers (Inkling: <|message_model|>, <|content_thinking|>, <|end_message|>, ...),
+    # which reasoning_content/content drop. Measured: 88 characters off on every Inkling run, so offsets read the
+    # wrong token. Drop the separator from both texts; a token the reference text does not continue with at that
+    # point has zero width. If the tokens then do not spell the text exactly, the split is unreadable (it counts).
+    text, rt = (x.replace(REASONING_SEP, "", 1) for x in (text, ref_run.get("text") or ""))
     i = next((j for j in range(min(len(text), len(rt))) if text[j] != rt[j]), min(len(text), len(rt)))
-    acc = 0
-    for t in ref_run.get("tokens") or []:
+    toks, widths, pos = ref_run.get("tokens") or [], [], 0
+    for t in toks:
         s = t.get("token") or ""
-        if acc + len(s) > i or (s == "" and acc == i):
+        w = len(s) if s and rt.startswith(s, pos) else 0
+        widths.append(w)
+        pos += w
+    if pos != len(rt):
+        return i, None, None, None, None
+    acc = 0
+    for t, w in zip(toks, widths):
+        s = t.get("token") or ""
+        if (w and acc + w > i) or (s == "" and acc == i):
             cands = [x for x in (t.get("top") or []) if usable(x.get("lp"))]
             lps = sorted((f32(x["lp"]) for x in cands), reverse=True)
             margin = (lps[0] - lps[1]) if len(lps) > 1 else None
@@ -590,12 +604,15 @@ def split_margin(text, ref_run):
             if rest == "":   # the route ended here: its token is the end-of-turn token
                 match = [x for x in cands if (x.get("token") or "") == ""]
             else:
-                match = [x for x in cands if (x.get("token") or "") and rest.startswith(x["token"])]
+                # the route's token must explain the split: it continues the route's text AND covers the first
+                # differing character (a shorter candidate both texts share would score a near-tie on a shared token)
+                match = [x for x in cands if (x.get("token") or "") and rest.startswith(x["token"])
+                         and acc + len(x["token"]) > i]
             match.sort(key=lambda x: -len(x.get("token") or ""))
             if not match or not lps:
                 return i, None, t.get("token"), None, margin
             return i, lps[0] - f32(match[0]["lp"]), t.get("token"), match[0].get("token"), margin
-        acc += len(s)
+        acc += w
     return i, None, None, None, None
 
 
@@ -844,6 +861,22 @@ def selftest():
     i, gap, rt, wt, m2 = split_margin("ab.", ref)
     ok(i == 2 and rt == "" and wt == "." and abs(gap - 0.8) < 1e-6,
        "split_margin: the reference ended first: its end-of-turn token vs the route's continuation token (0.8 nat)")
+    # --with-reasoning on a model whose token stream carries markers the text drops (Inkling): aligned, not offset
+    mk = {"text": "think" + REASONING_SEP + "Hello", "tokens": [
+        {"token": "<|m|>", "lp": -0.01, "top": []}, {"token": "think", "lp": -0.1, "top": []},
+        {"token": "<|end|>", "lp": -0.01, "top": []}, {"token": "<|c|>", "lp": -0.01, "top": []},
+        {"token": "Hello", "lp": -0.2, "top": [{"token": "Hello", "lp": -0.2}, {"token": "Help", "lp": -0.5},
+                                              {"token": "He", "lp": -0.3}]}]}
+    i, gap, rt, wt, m2 = split_margin("think" + REASONING_SEP + "Helpful", mk)
+    ok(rt == "Hello" and wt == "Help" and abs(gap - 0.3) < 1e-6,
+       "split_margin: marker tokens and the reasoning separator are aligned out (the split reads the answer's token)")
+    mk2 = dict(mk, tokens=[t if t["token"] != "Hello" else dict(t, top=[{"token": "Hello", "lp": -0.2},
+                                                                         {"token": "He", "lp": -0.3}]) for t in mk["tokens"]])
+    i, gap, rt, wt, m2 = split_margin("think" + REASONING_SEP + "Help", mk2)
+    ok(gap is None and wt is None,
+       "split_margin: a candidate both texts share ('He' before the split) does not explain it: counted")
+    i, gap, rt, wt, m2 = split_margin("x", {"text": "abc", "tokens": [{"token": "ab", "lp": -0.1, "top": []}]})
+    ok(gap is None, "split_margin: tokens that do not spell the reference text are unreadable (counted)")
     runs = lambda *texts_refs: [{"runs": [x]} for x in texts_refs]
     sc = near_tie_score(runs({"text": "aX"}, {"text": "ab"}, {"text": "aZ"}, {"text": "aW"}), runs(ref, ref, ref, ref), 1.0)
     ok(sc["identical"] == 1 and sc["near_tie"] == 1 and sc["counted"] == 2 and sc["score"] == 2 and sc["prompts"] == 4,

@@ -69,6 +69,42 @@
     "--pool_backing=fixed"
    ],
    "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7106859133 (Loom vs the CPU arbiter, thinking on, near-ties; payload path on main d64d4916: route taken, drafter by lock sha, 17*23 = 391); card loom-fun/unsloth-Inkling-2-Mini-loom r8 4e018e88 (stock, orchestrator 23 Nov rc1); no fallback arm exists (the llama.cpp-HRX port is refused under strict placement)"
+  },
+  {
+   "id": "qwen3-0.6b-q4_k_m",
+   "match": {
+    "gguf_sha256": "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a",
+    "gguf_size": 396705472,
+    "model": [
+     "Qwen3-0.6B-1bit",
+     "Qwen3-0.6B-Q4_K_M"
+    ]
+   },
+   "card": "unsloth-Qwen3-0.6B-loom",
+   "preset": "chat",
+   "device": "amdgpu://",
+   "args": [
+    "--pool_backing=fixed"
+   ],
+   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7109544282 (hrx-loom 0.3.0: ids MATCH thinking off / EXPLAINED thinking on (#3376), accuracy near-ties, prefill 2-5x through serve, decode even (307.0 vs 310.3 short, 208.2 vs 207.9 at 2K)); card loom-fun/unsloth-Qwen3-0.6B-loom @ 564d578f (stock)"
+  },
+  {
+   "id": "qwen3-8b-q4_k_m",
+   "match": {
+    "gguf_sha256": "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4",
+    "gguf_size": 5027784512,
+    "model": [
+     "Qwen3-8B-1bit",
+     "Qwen3-8B-Q4_K_M"
+    ]
+   },
+   "card": "unsloth-Qwen3-8B-loom",
+   "preset": "chat",
+   "device": "amdgpu://",
+   "args": [
+    "--pool_backing=fixed"
+   ],
+   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7109544282 (hrx-loom 0.3.0: ids MATCH thinking off / EXPLAINED thinking on (#3376), accuracy near-ties, faster on every axis through serve; decode 1.35-1.6x (the card's DFlash drafter)); card loom-fun/unsloth-Qwen3-8B-loom @ 35d393f3 (stock)"
   }
  ]
 }

@@ -157,12 +157,14 @@ import socket, sys, time, os, re, subprocess, shutil
 # is; #1111 is the bug that came from having it here alone (a `*-skip-*` marker contains the row's own want string).
 sys.path.insert(0, os.environ["VMCHECK_DIR"])
 import vm_check_verdict as V
-# The shipping driver's srcversion for the MEDIUM this harness is checking. Cycle 26 carries 0011v2: 0008+0009+0011+0011v2,
-# built WITHOUT the 0010 debugfs hook (srcversion EE1F36A2B9BA294CE11AD80, verified: no `tdr_test` string). This box also
-# holds the 0010 hook build for testing, and the two are indistinguishable by vermagic, signer or filename - only
-# srcversion separates them, so the medium has to answer for the build it is meant to carry.
-# Another cycle's medium: AMDXDNA_SRCVERSION=<its value> vm-check.sh <img> <work>.
-WANT_SV = os.environ.get("AMDXDNA_SRCVERSION", "EE1F36A2B9BA294CE11AD80")
+# The shipping driver's srcversion for the MEDIUM this harness is checking: F87D0BDF248067862F83BA3, the amdxdna in the
+# v2026.47 base's zdrv, which every release since carries unchanged (a BASE cut cannot rebuild modules) and which passed
+# on the board in v2026.47 and v2026.48 (orchestrator decision, 23 Nov: releases carry F87D0BDF). It predates patch 0014
+# (temporal_only), so partition mode needs a zdrv rebuild, not this constant. Builds that share vermagic, signer and
+# filename are told apart only by srcversion (cycle 26's EE1F36A2B9BA294CE11AD80 = 0008+0009+0011+0011v2 without the
+# 0010 debugfs hook; the 0010 hook build for testing), so the medium has to answer for the build it is meant to carry.
+# Another medium: AMDXDNA_SRCVERSION=<its value> vm-check.sh <img> <work>.
+WANT_SV = os.environ.get("AMDXDNA_SRCVERSION", "F87D0BDF248067862F83BA3")
 work = sys.argv[1]
 artifact = sys.argv[2]
 log = open(os.path.join(work, "serial.log"), "ab", buffering=0)

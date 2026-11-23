@@ -43,6 +43,13 @@ g=$([ -r "$f" ] && echo $(( $(cat "$f") / 1073741824 )) || echo 0)
 [ $((g + GTT_NEED)) -le "$GTT_RULE" ] || { status "refused: GTT $g GiB in use + $GTT_NEED GiB > $GTT_RULE GiB"; exit 3; }
 echo "gtt: ${g} GiB in use + ${GTT_NEED} GiB needed <= ${GTT_RULE} GiB" >> "$OUT/ram.txt"
 
+# Root, via the caller's `sudo -n`: the 1bit OS appliance has /dev/kfd root:root 0600 (Lemonade runs as root), and as
+# bcloud hsa_init fails with HSA_STATUS_ERROR_OUT_OF_RESOURCES -> HRX registers no device -> `-dev HRX0` is rejected
+# (measured 23 Nov, ticket hl-20261123T044207Z-2210413). The output and the gate's state go back to the box user.
+OWNER=${HL_OUT_OWNER:-bcloud}
+ulimit -l unlimited 2>/dev/null
+give_back() { chown -R "$OWNER:$OWNER" "$OUT" 2>/dev/null; [ -n "${HL_STATE:-}" ] && chown -R "$OWNER:$OWNER" "$HL_STATE" 2>/dev/null; }
+trap give_back EXIT
 PKG=${HL_PACKAGE:-/opt/1bit-package/1bit}
 export HL_BUILD=${HL_BUILD:-$PKG}
 LIBHSA=$PKG/hrx/llama/bin/libhsa-runtime64.so.1
@@ -60,7 +67,7 @@ echo "$job" > "$OUT/serve.pid"
         kill -TERM -"$job"; exit; fi
     sleep 2; done ) &
 guard=$!
-trap 'status "killed (signal)"; kill -TERM -"$job" 2>/dev/null; sleep 5; kill -KILL -"$job" 2>/dev/null; kill "$guard" 2>/dev/null; rm -f "$OUT/serve.pid"; exit 143' TERM INT
+trap 'status "killed (signal)"; kill -TERM -"$job" 2>/dev/null; sleep 5; kill -KILL -"$job" 2>/dev/null; kill "$guard" 2>/dev/null; rm -f "$OUT/serve.pid"; give_back; exit 143' TERM INT
 wait "$job"; rc=$?
 kill "$guard" 2>/dev/null
 kill -KILL -"$job" 2>/dev/null   # anything the measurement left in its group

@@ -56,6 +56,10 @@ conf=${ONEBIT_LEMOND_CONF:-/etc/1bit/lemond.conf}
 [ -n "$key" ] || { [ -r "$conf" ] && key=$(sed -n 's/^LEMONADE_API_KEY=//p' "$conf" | head -n 1); }
 json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 tmp=$(mktemp) || exit 2
+hdr=
+# every exit before the hold's own trap takes over (a --require refusal, a failed mktemp) removes both files: the header
+# file holds the key
+trap 'rm -f "$tmp" ${hdr:+"$hdr"}' EXIT
 # The key goes to curl from a 0600 header file (-H @file), never on its command line: argv is world-readable in ps and
 # /proc/<pid>/cmdline, and the key is what keeps the LAN out. An empty file adds no header (a blank-key appliance).
 hdr=$(mktemp) || exit 2
@@ -102,12 +106,23 @@ release() {
     fi
     rm -f "$tmp" "$hdr"
 }
+# The command runs in the background so a TERM or HUP sent to THIS process reaches it: run in the foreground, the
+# shell defers a trapped signal until the command has finished, so `kill <wrapper pid>` left the command running and
+# the hold taken (engine#3352 review, measured in dash). Its stdin is the wrapper's: a non-interactive shell gives an
+# asynchronous command /dev/null BEFORE explicit redirections, so a plain `<&0` would copy /dev/null - stdin is saved
+# on fd 8 first and handed back from there. INT is not forwarded: Ctrl-C already reaches the whole foreground group, and
+# a second INT can derail a program's own cleanup. The wrapper waits until the command has really exited, then releases.
+exec 8<&0
+"$@" <&8 8<&- &
+child=$!
+exec 8<&-
 trap 'release' EXIT
-trap 'release; trap - INT; kill -INT $$' INT
-trap 'release; trap - TERM; kill -TERM $$' TERM
-trap 'release; trap - HUP; kill -HUP $$' HUP
-
-"$@"
-rc=$?
+trap 'kill -TERM "$child" 2> /dev/null' TERM
+trap 'kill -HUP "$child" 2> /dev/null' HUP
+trap ':' INT
+while :; do
+    wait "$child"; rc=$?
+    kill -0 "$child" 2> /dev/null || break   # wait returns early when a trapped signal arrives; the command may still run
+done
 release
 exit $rc

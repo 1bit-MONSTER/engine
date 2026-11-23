@@ -87,6 +87,23 @@ sh "$heavy" -- sh -c 'exit 7' 2> /dev/null; rc=$?
 sh "$heavy" -- sh -c 'kill -INT $PPID; sleep 1' 2> /dev/null
 [ "$(calls)" = "/api/v1/hold /api/v1/hold/release " ]; check $? "an interrupted wrapper still releases ($(calls))"
 
+# 3b. TERM sent to the wrapper's own pid reaches the command (it used to wait for the command to end, hold still taken)
+: > "$t/calls"
+sh "$heavy" -- sh -c "echo started > '$t/started'; sleep 30; echo finished > '$t/finished'" 2> /dev/null & wp=$!
+for _ in $(seq 1 50); do [ -f "$t/started" ] && break; sleep 0.1; done
+t0=$(date +%s); kill -TERM "$wp"; wait "$wp"; wrc=$?; t1=$(date +%s)
+[ $((t1 - t0)) -lt 10 ] && [ ! -f "$t/finished" ] && [ "$(calls)" = "/api/v1/hold /api/v1/hold/release " ]
+check $? "TERM to the wrapper ends the command and releases ($((t1 - t0)) s, rc $wrc, $(calls))"
+# 3c. the command still reads the wrapper's stdin (a background command would otherwise get /dev/null)
+: > "$t/calls"
+out=$(printf 'from-stdin\n' | sh "$heavy" -- sh -c 'read -r l; echo "$l"' 2> /dev/null)
+[ "$out" = from-stdin ]; check $? "the command reads the wrapper's stdin"
+# 3d. a --require refusal leaves no temp file (the header file holds the key)
+mkdir -p "$t/tmp3"; echo old > "$t/mode"
+TMPDIR=$t/tmp3 LEMONADE_API_KEY=k123 sh "$heavy" --require -- true 2> /dev/null; rrc=$?
+echo ok > "$t/mode"
+[ $rrc = 2 ] && [ -z "$(ls -A "$t/tmp3")" ]; check $? "a --require refusal exits 2 and leaves no temp file"
+
 # 4. the key is sent when set
 : > "$t/calls"
 LEMONADE_API_KEY=k123 sh "$heavy" -- true 2> /dev/null

@@ -158,6 +158,13 @@ PY
     # --serve --laya-model $LEMONADE_LAYA_MODEL`) pulls the pinned, sha256-checked files with ONEBIT_LAYA_FETCH the first
     # time a request is routed; until then the router's requests fall through to its default model. A value set in
     # $CONF (sourced above) wins.
+    # engine#3350 rc1: the Loom route. loom-serve ships in the payload; the cards it carries are assembled on /data with
+    # their weights linked into the Hugging Face cache above (1bit-loom-cards), and `1bit serve` (a child of lemond) finds
+    # both through these two variables. A value set in $CONF wins.
+    [ -x /usr/local/bin/1bit-loom-cards ] && /usr/local/bin/1bit-loom-cards /opt/1bit-package/loom-cards \
+        "${ONEBIT_LOOM_CARDS:-/data/loom-cards}" "$HF_HOME" >> "$LOG" 2>&1
+    [ -x /opt/1bit-package/loom/loom-serve ] && export ONEBIT_LOOM_SERVE="${ONEBIT_LOOM_SERVE:-/opt/1bit-package/loom/loom-serve}"
+    export ONEBIT_LOOM_CARDS="${ONEBIT_LOOM_CARDS:-/data/loom-cards}"
     export LEMONADE_LAYA_MODEL="${LEMONADE_LAYA_MODEL:-/data/laya}"
     export ONEBIT_LAYA_FETCH="${ONEBIT_LAYA_FETCH:-/usr/local/bin/1bit-laya}"
     "$LEMONADE_ONEBIT" "$LEM/cache" "$LEM/config" --port "$PORT" --host "$host" >> "$LOG" 2>&1 &

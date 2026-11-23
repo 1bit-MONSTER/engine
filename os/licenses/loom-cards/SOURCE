@@ -1,0 +1,11 @@
+Loom cards: Loom programs and model cards for the models the Loom route serves (os/v3/puppy/loom-cards.pin)
+Ship: yes (1bit OS payload, /opt/1bit-package/loom-cards; engine#3350 rc1)
+Card: unsloth-Inkling-2-Mini-loom, https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom
+          revision a8354e77a701cd71f749e0a41ce0c41e33799156, 14 files, each pinned by sha256 and size
+          by loom-fun (Jeremy Fowers, Daniel Holanda), generated with https://github.com/loom-fun/loom-skills
+License: Apache-2.0 (the card repository's licence: README front matter `license: apache-2.0`, kept here as
+          unsloth-Inkling-2-Mini-loom.README.md)
+Not shipped: the model weights. The card's model.json.lock names them (unsloth/Inkling-2-Mini-GGUF at
+          ea0c79b2ecd73669e774c8519b79bfabfddbc027: Inkling-2-Mini-UD-Q4_K_XL.gguf and dspark-Inkling-2-Mini-Q8_0.gguf,
+          Apache-2.0, Thinking Machines / unsloth); Lemonade's catalogue pull downloads them on the user's request, and
+          1bit-loom-cards links the card's parameter/ files to them on the data partition.

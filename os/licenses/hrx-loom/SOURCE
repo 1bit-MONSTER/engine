@@ -1,0 +1,11 @@
+hrx-loom: the Loom route's server, loom-serve, and the two libraries it loads (libiree.so, libloomc.so)
+Ship: yes (1bit OS payload, /opt/1bit-package/loom; engine#3350 rc1)
+Project: AMD ROCm hrx-system (Loom), https://github.com/ROCm/hrx-system ; the wheel is published on PyPI as hrx-loom
+Release: the wheel config/loom.config pins (wheel=, wheel_sha256=, loom_serve_sha256=) - hrx_loom 0.3.0 for rc1:
+          hrx_loom-0.3.0-py3-none-manylinux_2_39_x86_64.whl, sha256 6252bb0df262351175bdb2c4aaca22ffa63d80d791659aa4d2fa5c92a0af426f,
+          built from ROCm/hrx-system tag v0.3.0 = e2c41a720363911c04606ce0f4417e2d55630352 (loom-serve --version says so)
+License: Apache-2.0 WITH LLVM-exception (LICENSE here, the wheel's own dist-info/licenses/LICENSE, unmodified)
+Packaged: not built here - os/v3/puppy/stage-loom.sh downloads the pinned wheel, refuses it unless its sha256 and the
+          sha256 of its loom-serve match the pin, and copies loom-serve, libiree.so and libloomc.so (loom-serve's RUNPATH is
+          $ORIGIN) and this LICENSE; nothing is patched, the rest of the wheel (compiler, benchmark, tests) is not shipped
+Source: https://github.com/ROCm/hrx-system at the tag above; https://pypi.org/project/hrx-loom/

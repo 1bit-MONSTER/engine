@@ -39,6 +39,7 @@
 #      BASE=<osfiles dir> | WOOF=<woof-CE dir> KERNEL_DIR=<mk-huge-kernel out> [LIBHSA_DIR=<HSA runtime set>],
 #      LEMONADE=<an already-built lemonade dir> (skip step 2; its lemond must report this tree's lemonade pin),
 #      NODE_TARBALL=<the pinned Node.js tarball> (BASE cut: use a local copy instead of downloading pin.txt's node_url),
+#      LOOM_WHEEL=<the pinned hrx-loom wheel>, LOOM_CARDS_FROM=<dir of the pinned cards> (local copies for stage-loom.sh),
 #      ONEBIT_IMAGE_ARCHIVE=<archive root>, NO_ARCHIVE=1 (a dry cut: probe, no archive).
 # Needs passwordless sudo for the root steps (patch-sfs, base-modes, mkimage), as the release host has.
 # Nothing here writes a stick, tags, uploads or publishes.
@@ -116,6 +117,12 @@ plem=$("$P/lemond-onebit" --version 2> /dev/null | sed -n 's/^lemond version //p
 case "$plem" in *"${lpin:0:8}"*) ;; *) die "the payload's lemond is $plem, the tree pins lemonade ${lpin:0:8}" ;; esac
 bad=$(find "$P" -type f -exec sh -c 'readelf -d "$1" 2>/dev/null | grep -E "R(UN)?PATH" | grep -v "\[\$ORIGIN\]"' _ {} \; | wc -l)
 [ "$bad" = 0 ] || die "the payload has $bad RUNPATH(s) other than \$ORIGIN"
+# engine#3350 rc1: the Loom route's server (the hrx-loom wheel config/loom.config pins) and the Loom cards
+# os/v3/puppy/loom-cards.pin lists, each file sha256-checked; the cards' weights stay out (1bit-loom-cards links them on
+# /data at boot). LOOM_WHEEL=<file> / LOOM_CARDS_FROM=<dir> use local copies instead of downloading.
+sh "$here/stage-loom.sh" "$P" ${LOOM_WHEEL:+--wheel "$LOOM_WHEEL"} ${LOOM_CARDS_FROM:+--cards-from "$LOOM_CARDS_FROM"} \
+    2> "$logs/stage-loom.log" || { cat "$logs/stage-loom.log"; die "stage-loom.sh failed"; }
+say "  $(tail -1 "$logs/stage-loom.log")"
 # the rest of scripts/weekly.sh stage_package's payload steps, in its order, on THIS copy (a LEMONADE= dir is never
 # written): the catalogue offers only the NPU models whose kernel set the payload carries (engine#3287: v2026.47 listed
 # Qwen3-1.7B-NPU-1bit with no set), links out of the tree (the web app's KaTeX fonts) become copies, then the modes

@@ -1,0 +1,88 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-loom-cards [<payload cards dir> [<cards dir> [<HF_HOME>]]]
+#
+# engine#3350 rc1: makes the Loom cards the payload carries usable, at boot (10lemonade runs it before lemond). The
+# payload holds each card's programs and metadata (stage-loom.sh) but not its weights: a card names them in its own
+# model.json (`parameter/<file>`, origin `@checkpoint/<file>`) and model.json.lock (the checkpoint's Hugging Face
+# repository and revision), and Lemonade's catalogue pull puts them in its Hugging Face cache. The payload may not hold
+# a link that leaves it, so the card is assembled HERE, on the data partition, every boot:
+#
+#   <cards dir>/<card>/<file>            a link to the payload's copy (a new release takes effect at its first boot)
+#   <cards dir>/<card>/parameter/<file>  a link to <HF_HOME>/hub/models--<org>--<repo>/snapshots/<revision>/<file>,
+#                                        which is dangling until the model is pulled and right from then on
+#
+# Defaults: /opt/1bit-package/loom-cards, /data/loom-cards (10lemonade's ONEBIT_LOOM_CARDS), $HF_HOME or
+# /data/lemonade/huggingface. A card directory is rebuilt whole, so nothing a previous release left survives.
+# Exit: 0 done (no payload cards is not an error), 1 a card could not be assembled (said which).
+set -u
+prog=1bit-loom-cards
+src=${1:-/opt/1bit-package/loom-cards}
+dst=${2:-/data/loom-cards}
+hf=${3:-${HF_HOME:-/data/lemonade/huggingface}}
+[ -d "$src" ] || exit 0
+command -v python3 > /dev/null || { echo "$prog: needs python3 to read a card's model.json" >&2; exit 1; }
+mkdir -p "$dst" || exit 1
+rc=0
+for card in "$src"/*/; do
+    card=${card%/}; name=${card##*/}
+    [ -f "$card/model.json" ] && [ -f "$card/model.json.lock" ] || { echo "$prog: $name has no model.json + model.json.lock" >&2; rc=1; continue; }
+    out=$dst/$name
+    rm -rf "${out:?}.new"; mkdir -p "$out.new"
+    (cd "$card" && find . -type f | sed 's|^\./||') | while IFS= read -r f; do
+        mkdir -p "$out.new/$(dirname "$f")"; ln -s "$card/$f" "$out.new/$f"
+    done
+    if ! python3 -I - "$card" "$out.new" "$hf" > /dev/null << 'PY'
+import json, os, sys
+card, out, hf = sys.argv[1:4]
+model = json.load(open(os.path.join(card, "model.json")))
+lock = json.load(open(os.path.join(card, "model.json.lock")))
+origins = {k: ((v.get("resolved") or {}).get("revision") or (v.get("requested") or {}).get("revision"),
+               (v.get("requested") or {}).get("repository"))
+           for k, v in (lock.get("origins") or {}).items() if (v.get("requested") or {}).get("kind") == "hf"}
+made = 0
+def files(o):
+    if isinstance(o, dict):
+        if isinstance(o.get("path"), str) and isinstance(o.get("origin"), str):
+            yield o
+        for v in o.values():
+            yield from files(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from files(v)
+for f in files(model):
+    origin = f["origin"]
+    if not origin.startswith("@"):
+        continue
+    key, _, name = origin[1:].partition("/")
+    if key not in origins or not all(origins[key]) or not name:
+        sys.exit("origin %s names no pinned Hugging Face checkpoint in model.json.lock" % origin)
+    rev, repo = origins[key]
+    target = os.path.join(hf, "hub", "models--" + repo.replace("/", "--"), "snapshots", rev, name)
+    link = os.path.join(out, f["path"])
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    if os.path.lexists(link):
+        os.remove(link)
+    os.symlink(target, link)
+    made += 1
+print(made)
+PY
+    then rm -rf "${out:?}.new"; echo "$prog: $name: could not link its weights" >&2; rc=1; continue; fi
+    rm -rf "${out:?}"; mv "$out.new" "$out"
+    echo "$prog: $name assembled in $out (weights from $hf/hub)" >&2
+done
+exit $rc

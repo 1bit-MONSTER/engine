@@ -147,6 +147,17 @@ config/laya.json; compiled by ggmlc from convaiinnovations/laya-typed-decisions)
 Shipped in the 1bit OS image only (built outside this repository)
 -------------------------------------------------------------------------------
 
+hrx-loom (the Loom route's loom-serve, libiree.so, libloomc.so; the PyPI wheel config/loom.config
+pins, staged unmodified by os/v3/puppy/stage-loom.sh)
+  https://github.com/ROCm/hrx-system
+  Copyright Advanced Micro Devices, Inc. and the IREE / hrx-system authors
+  License: Apache-2.0 WITH LLVM-exception (os/licenses/hrx-loom/LICENSE)
+
+Loom card unsloth-Inkling-2-Mini-loom (loom-fun, Jeremy Fowers and Daniel Holanda; pinned in
+os/v3/puppy/loom-cards.pin; the model weights it names are downloaded, not shipped)
+  https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom
+  License: Apache-2.0
+
 Linux kernel
   https://github.com/torvalds/linux
   Copyright Linus Torvalds and the Linux kernel contributors

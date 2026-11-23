@@ -13,14 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Run the fork's recorded-stale expectation check from the engine's suite (engine#2836).
+"""Run the fork's expectation-literal check from the engine's suite (engine#2836, engine#2774).
 
 The fork registers 48 ctest rows and **no engine job runs any of them**: the engine never builds the
 fork's tests, so a row's presence in `third_party/llama.cpp/tests/CMakeLists.txt` means it runs only
 when a person types `ctest` in a fork checkout. Most of those rows need a device and are right to be
 absent; `check_stale_expectations.py` (fork #419) is not — it is pure python, about a second, and it
-answers engine#2774's question (*is a recorded-stale expectation still selected by no matcher?*)
-without a device.
+answers engine#2774's question without a device. Since fork #490 (`5957ffd49`) that question is *does every
+`<corpus>:<kernel>` name `tests/hrx-ops-test.cpp` expects have a `GGML_HRX_KERNEL_REF`, and is the old
+`kRecordedStaleExpectations` suppression table still gone?* (Before #490 it checked that table's entries
+instead; the script's path and CLI did not change, so this wrapper did not either.)
 
 This wrapper exists rather than an `add_test` pointing straight at the fork's script for one measured
 reason: **a checkout can be at a pin before `ddd415f4a`**, the fork commit that adds the script, and a
@@ -73,7 +75,7 @@ def self_test():
         ok(run(root) == 0, "the tool present and green passes (rc 0)")
         write(tool, "import sys; sys.exit(1)\n")
         ok(run(root) == 1, "the tool present and red fails (rc 1) -- the row can report a real finding")
-        write(tool, "import sys; print('stale-expectations: 31 recorded')\n")
+        write(tool, "import sys; print('stale-expectations: 192 expectation literal(s), every one selectable')\n")
         ok(run(root) == 0, "and a tool that prints and exits 0 passes")
     with tempfile.TemporaryDirectory() as tmp:
         bare = os.path.join(tmp, "engine")

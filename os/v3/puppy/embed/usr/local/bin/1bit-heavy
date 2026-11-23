@@ -1,0 +1,112 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-heavy [--reason TEXT] [--max-seconds N] [--require] -- <command> [args...]
+#
+# engine#3350: run heavy work - a build, a quantization, a benchmark, a second large model - without the loaded model
+# next to it. Lemonade is asked to HOLD (POST /api/v1/hold, 1bit-MONSTER/lemonade#58): in-flight answers finish, every
+# loaded model is unloaded, and requests that arrive meanwhile wait instead of loading one. The command runs, and on
+# ANY exit (success, failure, Ctrl-C, kill) the hold is released (POST /api/v1/hold/release), which brings the same
+# models back with the same options before the waiting requests run. The memory the command gets back is the models'.
+# On 22 Nov the box ran out of memory (123/124 GB) with heavy jobs next to loaded models; this is the user's guard.
+#
+#   --reason TEXT      shown in `GET /api/v1/hold` and lemond's log (default: the command's name)
+#   --max-seconds N    Lemonade releases the hold by itself after N seconds even if this wrapper died (default 3600)
+#   --require          refuse (exit 2, command not run) when the hold cannot be taken; without it the command runs
+#                      anyway, with a warning, next to whatever is loaded
+#
+# Lemonade: http://127.0.0.1:${LEMONADE_PORT:-13300}, or ONEBIT_LEMONADE_URL. Key: $LEMONADE_API_KEY, else the
+# appliance's /etc/1bit/lemond.conf when this user can read it (root); a blank-key appliance needs none.
+# Exit: the command's own status; 2 refused (--require), 64 usage.
+set -u
+prog=1bit-heavy
+reason= maxs=3600 require=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --reason) reason=${2:-}; shift 2 || exit 64 ;;
+        --max-seconds) maxs=${2:-}; shift 2 || exit 64 ;;
+        --require) require=1; shift ;;
+        -h|--help) sed -n '/^# 1bit-heavy /,/^# Exit:/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+[ $# -gt 0 ] || { echo "usage: $prog [--reason TEXT] [--max-seconds N] [--require] -- <command> [args...]" >&2; exit 64; }
+case $maxs in ''|*[!0-9]*) echo "$prog: --max-seconds wants a whole number of seconds" >&2; exit 64 ;; esac
+[ -n "$reason" ] || reason="1bit-heavy: $(basename "$1")"
+command -v curl > /dev/null || { echo "$prog: needs curl" >&2; [ -n "$require" ] && exit 2; exec "$@"; }
+
+url=${ONEBIT_LEMONADE_URL:-http://127.0.0.1:${LEMONADE_PORT:-13300}}
+key=${LEMONADE_API_KEY:-}
+conf=${ONEBIT_LEMOND_CONF:-/etc/1bit/lemond.conf}
+[ -n "$key" ] || { [ -r "$conf" ] && key=$(sed -n 's/^LEMONADE_API_KEY=//p' "$conf" | tail -n 1); }
+json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+tmp=$(mktemp) || exit 2
+post() {  # <path> <timeout s> <json> -> sets $code (HTTP status) and $body; runs in this shell, not a subshell
+    if [ -n "$key" ]; then
+        code=$(curl -sS -m "$2" -o "$tmp" -w '%{http_code}' -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $key" -d "$3" "$url/api/v1/$1" 2> /dev/null)
+    else
+        code=$(curl -sS -m "$2" -o "$tmp" -w '%{http_code}' -H 'Content-Type: application/json' -d "$3" "$url/api/v1/$1" 2> /dev/null)
+    fi
+    body=$(cat "$tmp" 2> /dev/null)
+}
+
+# Taking the hold waits for in-flight answers, so it may take a while: allow up to 10 minutes.
+post hold 600 "{\"reason\":\"$(json_str "$reason")\",\"max_seconds\":$maxs}"
+hold_id=
+if [ "$code" = 200 ]; then
+    hold_id=$(printf '%s' "$body" | sed -n 's/.*"hold_id" *: *"\([^"]*\)".*/\1/p')
+fi
+if [ -z "$hold_id" ]; then
+    case $code in
+        404) why="this Lemonade has no hold endpoint (it needs 1bit-MONSTER/lemonade#58)" ;;
+        409) why="another hold is active: $(printf '%s' "$body" | sed -n 's/.*"error" *: *"\([^"]*\)".*/\1/p')" ;;
+        401|403) why="Lemonade refused the key (set LEMONADE_API_KEY, or run as root on the appliance)" ;;
+        000|'') why="Lemonade does not answer at $url" ;;
+        *) why="Lemonade answered $code: $body" ;;
+    esac
+    if [ -n "$require" ]; then echo "$prog: REFUSED: could not hold the models: $why" >&2; exit 2; fi
+    echo "$prog: WARNING: running without a hold - $why; the loaded models stay next to the command" >&2
+    rm -f "$tmp"; exec "$@"
+fi
+unloaded=$(printf '%s' "$body" | sed -n 's/.*"unloaded" *: *\[\([^]]*\)\].*/\1/p' | tr -d '"')
+echo "$prog: $hold_id: models unloaded (${unloaded:-none were loaded}); requests wait until the command ends" >&2
+
+released=
+release() {
+    [ -n "$released" ] && return 0
+    released=1
+    post hold/release 900 "{\"hold_id\":\"$hold_id\"}"; rb=$body
+    if [ "$code" = 200 ]; then
+        back=$(printf '%s' "$rb" | sed -n 's/.*"reloaded" *: *\[\([^]]*\)\].*/\1/p' | tr -d '"')
+        lost=
+        printf '%s' "$rb" | grep -q '"failed" *: *\[ *{' && lost="; SOME MODELS DID NOT COME BACK (they load on the next request)"
+        echo "$prog: $hold_id released: ${back:-nothing to reload}$lost" >&2
+    else
+        echo "$prog: WARNING: releasing $hold_id answered $code: $rb (Lemonade ends it by itself after $maxs s)" >&2
+    fi
+    rm -f "$tmp"
+}
+trap 'release' EXIT
+trap 'release; trap - INT; kill -INT $$' INT
+trap 'release; trap - TERM; kill -TERM $$' TERM
+trap 'release; trap - HUP; kill -HUP $$' HUP
+
+"$@"
+rc=$?
+release
+exit $rc

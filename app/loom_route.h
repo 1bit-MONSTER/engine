@@ -330,6 +330,7 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
     try { j = json::parse(in); } catch (const std::exception& e) { why = card_model_json + " is not JSON: " + e.what(); return 0; }
     const fs::path card_dir = fs::path(card_model_json).parent_path(), model_dir = fs::path(model_path).parent_path();
     std::map<std::string, std::uintmax_t> lock_size;   // origin -> size, from the card's own lock (absent lock: no check)
+    std::map<std::string, std::string> lock_sha;        // origin -> sha256, same lock
     {
         std::ifstream lin(card_dir / "model.json.lock", std::ios::binary);
         if (lin) {
@@ -339,7 +340,11 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
                     for (const auto& f : lk["files"])
                         if (f.is_object() && f.contains("origin") && f["origin"].is_string() && f.contains("size") &&
                             f["size"].is_number_unsigned())
+                        {
                             lock_size[f["origin"].get<std::string>()] = f["size"].get<std::uintmax_t>();
+                            if (f.contains("sha256") && f["sha256"].is_string())
+                                lock_sha[f["origin"].get<std::string>()] = f["sha256"].get<std::string>();
+                        }
             } catch (const std::exception&) {
             }
         }
@@ -373,17 +378,37 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
             if (inside.empty() || *inside.begin() == "..") continue;
         }
         std::error_code ec;
-        const fs::path target = model_dir / name;
-        if (!fs::is_regular_file(target, ec)) continue;
+        fs::path target = model_dir / name;
         if (const auto it = lock_size.find(origin); it != lock_size.end()) {
-            const std::uintmax_t have = fs::file_size(target, ec);
-            if (ec || have != it->second) {
-                why += std::string(why.empty() ? "" : "; ") + target.string() + " has " + std::to_string(have) +
-                       " bytes, the card's lock says " + std::to_string(it->second) + " for " + origin +
-                       ": the checkpoint changed under the card, not linked";
-                if (refused) *refused = true;
-                continue;
+            const std::uintmax_t want = it->second;
+            auto fits = [&](const fs::path& p) {
+                std::error_code e;
+                return fs::is_regular_file(p, e) && fs::file_size(p, e) == want && !e;
+            };
+            // a link that already resolves to a file of the lock's size is kept: a normal start hashes nothing
+            if (fs::is_symlink(fs::symlink_status(link, ec)) && fits(fs::canonical(link, ec)) && !ec) continue;
+            if (!fits(target)) {
+                // engine#3394 + orchestrator 23 Nov (option b): the file under the card's name is missing or another size
+                // (unsloth keeps the old DSpark drafter as dspark-Inkling-2-Mini-Q8_0_Old.gguf and the Lemonade entry
+                // pulls that name), so the lock's sha256 picks the file: every same-size file beside the model is hashed
+                // once, when the link is made
+                fs::path found;
+                if (const auto sh = lock_sha.find(origin); sh != lock_sha.end())
+                    for (const auto& de : fs::directory_iterator(model_dir, ec))
+                        if (fits(de.path()) && sha256_of_file(de.path().string()) == sh->second) { found = de.path(); break; }
+                if (found.empty()) {
+                    if (fs::exists(target, ec) || lock_sha.count(origin)) {
+                        why += std::string(why.empty() ? "" : "; ") + "no file beside the model has the size (" +
+                               std::to_string(want) + ") and sha256 the card's lock gives for " + origin +
+                               ": the checkpoint changed under the card, not linked";
+                        if (refused) *refused = true;
+                    }
+                    continue;
+                }
+                target = found;
             }
+        } else if (!fs::is_regular_file(target, ec)) {
+            continue;
         }
         const fs::file_status st = fs::symlink_status(link, ec);
         if (fs::exists(st) && !fs::is_symlink(st)) continue;

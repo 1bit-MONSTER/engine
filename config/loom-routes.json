@@ -105,6 +105,24 @@
     "--pool_backing=fixed"
    ],
    "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7109544282 (hrx-loom 0.3.0: ids MATCH thinking off / EXPLAINED thinking on (#3376), accuracy near-ties, faster on every axis through serve; decode 1.35-1.6x (the card's DFlash drafter)); card loom-fun/unsloth-Qwen3-8B-loom @ 35d393f3 (stock)"
+  },
+  {
+   "id": "qwen3-4b-q4_k_m",
+   "match": {
+    "gguf_sha256": "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a",
+    "gguf_size": 2497281312,
+    "model": [
+     "Qwen3-4B-1bit",
+     "Qwen3-4B-Q4_K_M"
+    ]
+   },
+   "card": "Qwen3-4B-GGUF-loom",
+   "preset": "chat",
+   "device": "amdgpu://",
+   "args": [
+    "--pool_backing=fixed"
+   ],
+   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7109544282 (hrx-loom 0.3.0: ids MATCH thinking off / EXPLAINED thinking on (#3376), accuracy near-ties 0.022-0.351 nats, faster on every axis through serve: decode 76.2 -> 100.6 / 65.5 -> 105.6 tok/s); card huggingface.co/1bit-MONSTER/Qwen3-4B-GGUF-loom @ c6e13152 (ours: loom-fun/ggml-org-Qwen3-4B-loom@b0944ed9 re-pointed to the unsloth checkpoint)"
   }
  ]
 }

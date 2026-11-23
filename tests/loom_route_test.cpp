@@ -202,6 +202,20 @@ int main() {
         std::string swhy;
         const int sm = loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(),
                                                        swhy, &refused);
+        // a file the card lists but nothing beside the model provides (an unused variant) does not refuse the card
+        {
+            fs::create_directories(dir / "lc2" / "parameter");
+            std::ofstream(dir / "lc2" / "model.json") << R"({"model":{"id":"M2"},"variants":{"q4":{"services":{"chat":{"parameters":{)"
+                R"("model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"}]}}}}},)"
+                R"("q8":{"services":{"chat":{"parameters":{"model":{"files":[{"path":"parameter/q8.gguf","origin":"@checkpoint/q8.gguf"}]}}}}}}})";
+            std::ofstream(dir / "lc2" / "model.json.lock") << R"({"files":[{"origin":"@checkpoint/m.gguf","size":1},)"
+                R"({"origin":"@checkpoint/q8.gguf","size":7,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]})";
+            bool r4 = false;
+            std::string w4;
+            const int n4 = loom::loom_link_card_parameters((dir / "lc2" / "model.json").string(), (dir / "snap" / "m.gguf").string(), w4, &r4);
+            check("an unused variant's absent file does not refuse the card (the used file is linked)",
+                  n4 == 1 && !r4 && fs::read_symlink(dir / "lc2" / "parameter" / "m.gguf") == dir / "snap" / "m.gguf");
+        }
         check("a weight whose size differs from the card's lock is not linked and the card is refused",
               sm == 1 && refused && fs::is_symlink(fs::symlink_status(dir / "lc" / "parameter" / "m.gguf")) &&
               !fs::exists(fs::symlink_status(dir / "lc" / "parameter" / "d.gguf")) &&

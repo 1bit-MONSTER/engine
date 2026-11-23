@@ -57,6 +57,10 @@ The device-free test is `tests/hyperloom_inkling_loom_test.py` (stub ssh/box-hol
    | `HL_POOL_BACKING` | `fixed`/`elastic` | `--pool_backing` (card flags: fixed) |
    | `HL_WORKERS` | 1-32 | `--workers` (default 8) |
    | `HL_RUNS`, `HL_GAUNTLET_ROWS`, `HL_RAM_NEED_GB` | | repetitions (3), rows, the job's declared RAM need (40 GB) -- pins, not levers |
+   | `HL_CARD_NAME` | a name | which card under the box's `cl-hyperloom/cards/` (default the Inkling card; `../loom-qwen38/` pins the 27B) -- a pin, a name only, never a path |
+
+   An unset preset lever keeps the **card's own** value, and spin defaults to none: the baseline is exactly the
+   shipped route (preset `chat`, `amdgpu://`, `--pool_backing=fixed`).
 
    **KV format is not a lever here**: this card's `llm.loom` stores KV as f16 in its kernels; another format is a Loom
    program change, not a config value.

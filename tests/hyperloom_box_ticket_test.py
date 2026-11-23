@@ -108,7 +108,7 @@ def setup(td):
     (card / "CARD_REVISION").write_text("a8354e77test\n")
     (card / "parameter" / "m.gguf").write_text("weights")
     (card / "model.json").write_text(json.dumps({"presets": {"chat": {"execution": {
-        "rows": 4, "context_capacity": 262144, "prefill_capacity": 4096, "max_tokens": 4096, "draft_depth": 3}}}}))
+        "rows": 4, "context_capacity": 262144, "prefill_capacity": 1024, "max_tokens": 4096, "draft_depth": 3}}}}))
     serve = td / "loom-serve"
     write_exe(serve, FAKE_SERVE)
     env = dict(os.environ, PATH="%s:%s" % (bindir, os.environ["PATH"]), HL_BOX="fakebox", HL_BOX_DIR=str(td / "box"),
@@ -157,6 +157,17 @@ def main():
                   "status: %s" % rep["bench_summary"].get("status"))
         shims = log.read_text() if log.exists() else ""
         check("the measurement ran through box-hold gpu", "box-hold gpu" in shims, shims)
+        # unset levers keep the CARD's preset (the shipped route serves it as it is), and no spin by default (#3395)
+        args = json.loads((td / "args.json").read_text())
+        ex = args["model_json"]["presets"]["chat"]["execution"]
+        check("an unset lever keeps the card's own value (prefill_capacity 1024, not a script default)",
+              ex["prefill_capacity"] == 1024 and ex["draft_depth"] == 3 and ex["rows"] == 4, json.dumps(ex))
+        dev = [a for a in args["argv"] if a.startswith("--device=")]
+        check("the default device is plain amdgpu:// (no completion spin), as the shipped routes",
+              dev == ["--device=amdgpu://"], str(dev))
+        if rep:
+            check("provenance records the effective preset values",
+                  rep["bench_summary"]["provenance"]["levers"]["prefill_capacity"] == 1024, json.dumps(rep["bench_summary"]["provenance"]["levers"]))
 
         p, rep, rd = round_(env, td, "depth5", HL_DRAFT_DEPTH="5")
         args = json.loads((td / "args.json").read_text())
@@ -170,6 +181,10 @@ def main():
         p, rep, rd = round_(env, td, "refused", HL_DRAFT_DEPTH="3; rm -rf /")
         check("a bad lever value exits 0 with a failing report", p.returncode == 0 and rep and not rep["quality_gate"]["passed"],
               p.stderr[-400:])
+        before_cn = log.read_text().count("box-hold")
+        p, rep, rd = round_(env, td, "bad-card-name", HL_CARD_NAME="../../etc")
+        check("a card name with a path in it is refused before the box", p.returncode == 0 and rep
+              and not rep["quality_gate"]["passed"] and log.read_text().count("box-hold") == before_cn, p.stderr[-300:])
         check("a bad lever never reaches the box", log.read_text().count("box-hold") == before
               and not (rd / "box" / "ticket.log").exists())
 

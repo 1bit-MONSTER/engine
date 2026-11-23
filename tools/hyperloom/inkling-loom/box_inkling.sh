@@ -37,7 +37,11 @@ set -u
 OUT=${1:?usage: box_inkling.sh OUT}
 HERE=$(cd "$(dirname "$0")" && pwd)
 B=${HL_BOX_ROOT:-/data/dev/cl-hyperloom}
-CARD=${HL_CARD:-$B/cards/inkling2-mini-a8354e77}
+# The card, by NAME under $B/cards (never a path: the restricted ssh key may pass HL_CARD_NAME, so it cannot point at
+# an arbitrary directory). HL_CARD (a path) stays for the device-free test only and does not cross the gate.
+CARD_NAME=${HL_CARD_NAME:-inkling2-mini-a8354e77}
+case "$CARD_NAME" in ''|*[!A-Za-z0-9._-]*|.*) echo "[box_inkling] refused: HL_CARD_NAME=$CARD_NAME"; exit 2 ;; esac
+CARD=${HL_CARD:-$B/cards/$CARD_NAME}
 LS=${HL_LOOM_SERVE:-$B/hrxloom030/hrx_loom-0.3.0.data/scripts/loom-serve}
 OWNER=${HL_OUT_OWNER:-bcloud}
 mkdir -p "$OUT" || exit 2
@@ -55,13 +59,16 @@ trap 'status "killed (signal)"; cleanup; exit 143' TERM INT
 trap cleanup EXIT
 
 num() { case "$2" in ''|*[!0-9]*) status "refused: $1=$2 is not a whole number"; exit 2 ;; esac; }
-DEPTH=${HL_DRAFT_DEPTH:-3};   num HL_DRAFT_DEPTH "$DEPTH"
-ROWS=${HL_ROWS:-4};           num HL_ROWS "$ROWS"
-CTX=${HL_CONTEXT:-262144};    num HL_CONTEXT "$CTX"
-PCAP=${HL_PREFILL_CAP:-4096}; num HL_PREFILL_CAP "$PCAP"
-MAXT=${HL_MAX_TOKENS:-4096};  num HL_MAX_TOKENS "$MAXT"
+# Preset levers: unset = the CARD's own value (the shipped route serves the card's preset as it is), so the baseline is
+# exactly what users get; set = that value in the overlay model.json.
+DEPTH=${HL_DRAFT_DEPTH:-};   [ -z "$DEPTH" ] || num HL_DRAFT_DEPTH "$DEPTH"
+ROWS=${HL_ROWS:-};           [ -z "$ROWS" ] || num HL_ROWS "$ROWS"
+CTX=${HL_CONTEXT:-};         [ -z "$CTX" ] || num HL_CONTEXT "$CTX"
+PCAP=${HL_PREFILL_CAP:-};    [ -z "$PCAP" ] || num HL_PREFILL_CAP "$PCAP"
+MAXT=${HL_MAX_TOKENS:-};     [ -z "$MAXT" ] || num HL_MAX_TOKENS "$MAXT"
 WORKERS=${HL_WORKERS:-8};     num HL_WORKERS "$WORKERS"
-SPIN=${HL_SPIN_NS:-4294967295}; [ "$SPIN" = default ] || num HL_SPIN_NS "$SPIN"
+# Spin: the shipped routes use plain amdgpu:// (no completion_spin_ns) since engine#3395; "default" = that.
+SPIN=${HL_SPIN_NS:-default}; [ "$SPIN" = default ] || num HL_SPIN_NS "$SPIN"
 WAIT=${HL_WAIT_MODE:-};       case "$WAIT" in ''|active|blocking) ;; *) status "refused: HL_WAIT_MODE=$WAIT"; exit 2 ;; esac
 POOL=${HL_POOL_BACKING:-fixed}; case "$POOL" in fixed|elastic) ;; *) status "refused: HL_POOL_BACKING=$POOL"; exit 2 ;; esac
 RUNS=${HL_RUNS:-3};           num HL_RUNS "$RUNS"
@@ -69,7 +76,6 @@ GROWS=${HL_GAUNTLET_ROWS:-k391,code,reasoning,sustained,needle16k}
 case "$GROWS" in *[!a-z0-9,]*) status "refused: HL_GAUNTLET_ROWS=$GROWS"; exit 2 ;; esac
 # The KV pool is rows x context; the card's 4 x 262144 is the measured point (cl-loomfun 22 Nov: 31 GB used at
 # low-water, fixed backing). Anything above twice that is refused rather than measured into the RAM guard.
-if [ $((ROWS * CTX)) -gt $((2 * 4 * 262144)) ]; then status "refused: rows*context $((ROWS * CTX)) > 2x the card's 4x262144"; exit 2; fi
 [ -x "$LS" ] || { status "refused: no loom-serve at $LS"; exit 2; }
 [ -f "$CARD/model.json" ] || { status "refused: no card at $CARD"; exit 2; }
 
@@ -99,14 +105,25 @@ for f in "$CARD"/* "$CARD"/.[!.]*; do
     [ "$(basename "$f")" = model.json ] && continue
     ln -sfn "$f" "$OV/$(basename "$f")"
 done
-python3 - "$CARD/model.json" "$OV/model.json" "$DEPTH" "$ROWS" "$CTX" "$PCAP" "$MAXT" <<'EOF' || { status "refused: cannot write the overlay model.json"; exit 2; }
+eff=$(python3 - "$CARD/model.json" "$OV/model.json" "$DEPTH" "$ROWS" "$CTX" "$PCAP" "$MAXT" <<'EOF'
 import json, sys
 src, dst, depth, rows, ctx, pcap, maxt = sys.argv[1:]
 doc = json.load(open(src))
 ex = doc["presets"]["chat"]["execution"]
-ex.update(draft_depth=int(depth), rows=int(rows), context_capacity=int(ctx), prefill_capacity=int(pcap), max_tokens=int(maxt))
+for key, val in (("draft_depth", depth), ("rows", rows), ("context_capacity", ctx), ("prefill_capacity", pcap),
+                 ("max_tokens", maxt)):
+    if val:
+        ex[key] = int(val)
 json.dump(doc, open(dst, "w"), indent=1)
+print(ex.get("draft_depth", 0), ex["rows"], ex["context_capacity"], ex["prefill_capacity"], ex["max_tokens"])
 EOF
+) || { status "refused: cannot write the overlay model.json"; exit 2; }
+read -r DEPTH ROWS CTX PCAP MAXT <<EOF2
+$eff
+EOF2
+# The KV pool is rows x context; 4 x 262144 is the measured point (31 GB RAM with fixed backing, #3366). Anything above
+# twice that is refused rather than measured into the RAM guard.
+if [ $((ROWS * CTX)) -gt $((2 * 4 * 262144)) ]; then status "refused: rows*context $((ROWS * CTX)) > 2x 4x262144"; exit 2; fi
 
 DEV='amdgpu://'; [ "$SPIN" = default ] || DEV="amdgpu://?completion_spin_ns=$SPIN"
 # A port nothing is bound to (another lane's CPU-side server, or a parallel test, may hold one in the range).
@@ -170,7 +187,7 @@ FAULTS=$(journalctl -k --since -60min 2>/dev/null | grep -c -E 'amdgpu.*(fault|r
 python3 - "$OUT/provenance.json" <<EOF
 import json, sys
 json.dump({
-    "card": "$CARD", "card_revision": open("$CARD/CARD_REVISION").read().strip(),
+    "card": "$CARD", "card_name": "$CARD_NAME", "card_revision": open("$CARD/CARD_REVISION").read().strip(),
     "loom_serve": "$LS", "loom_serve_sha256": "$(sha256sum "$LS" | cut -c1-64)",
     "gguf_sha256": {
 $(for f in "$CARD"/parameter/*.gguf; do echo "        \"$(basename "$f")\": \"$(sha_cached "$f")\","; done)

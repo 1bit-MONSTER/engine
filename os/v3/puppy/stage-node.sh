@@ -92,10 +92,17 @@ fund=false
 NPMRC
 chmod 644 "$dest/etc/npmrc"
 
+# npm finds its GLOBAL config at <global prefix>/etc/npmrc, and takes the global prefix from $PREFIX when that is set.
+# Puppy's /etc/profile exports PREFIX=/usr, so in a login shell npm read /usr/etc/npmrc (absent), never saw
+# prefix=/data/npm-global, and `npm i -g` wrote to /usr - RAM on a live stick (measured in the v2026.48 QEMU boot:
+# `npm prefix -g` = /usr, release-check `node` FAIL). The npm and npx wrappers therefore name the global config
+# file itself; PREFIX stays as Puppy set it for everything else, and a caller's own npm_config_globalconfig wins.
+gcfg='export npm_config_globalconfig="${npm_config_globalconfig:-/usr/local/lib/nodejs/etc/npmrc}"'
 for b in node npm npx corepack; do
     t=/usr/local/lib/nodejs/bin/$b
     [ -e "$dest/bin/$b" ] || { echo "$prog: REFUSED: the release has no bin/$b" >&2; exit 2; }
-    printf '#!/bin/sh\n# engine#3310: Node.js %s, staged by os/v3/puppy/stage-node.sh\nexec %s "$@"\n' "$ver" "$t" \
+    case $b in npm|npx) env_line="$gcfg\n" ;; *) env_line= ;; esac
+    printf "#!/bin/sh\n# engine#3310: Node.js %s, staged by os/v3/puppy/stage-node.sh\n${env_line}exec %s \"\$@\"\n" "$ver" "$t" \
         > "$root/usr/local/bin/$b"
     chmod 755 "$root/usr/local/bin/$b"
 done

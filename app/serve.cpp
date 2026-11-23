@@ -1668,7 +1668,18 @@ std::optional<Launch> loom_launch_for(const Options& o, int child_port) {
             std::string why = "card path " + r.card + " is not a model.json inside the cards directory";
             if (!c.empty() && !loom::loom_card_model_id(c, why).empty()) {
                 usable.push_back(r);
-            } else if (!ec && r.size == model_size) {  // the one line the skip owes the user (docs/loom-route.md), no hash
+                continue;
+            }
+            // the one line the skip owes the user (docs/loom-route.md), still without a hash: an entry with no sha256 is
+            // matched for real (by name; the matcher hashes nothing for it), one with a sha256 is only said to share the size
+            if (r.sha256.empty()) {
+                loom::LoomRoutes one;
+                one.routes = {r};
+                const std::vector<std::string> names = {o.alias, fs::path(o.model).stem().string(), fs::path(o.model).filename().string()};
+                if (loom::match_loom_route(one, o.model, names, [](const std::string&) { return std::string(); }, nullptr))
+                    std::fprintf(stderr, "1bit serve: loom route %s matches %s, but its card is not usable (%s): serving on the "
+                                         "llama.cpp route (docs/loom-route.md)\n", r.id.c_str(), o.model.c_str(), why.c_str());
+            } else if (!ec && r.size == model_size) {
                 std::fprintf(stderr, "1bit serve: loom route %s has the size of %s, but its card is not usable (%s): serving on "
                                      "the llama.cpp route (docs/loom-route.md)\n", r.id.c_str(), o.model.c_str(), why.c_str());
             }

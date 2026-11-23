@@ -157,6 +157,15 @@ A row is valid only when Loom's prompt token count (`/v1/chat/completions/input_
 (`/apply-template` + `/tokenize` with `add_special`), with thinking on and off where the template
 toggles: a card whose chat block drops BOS or misrenders thinking answers a different prompt.
 
+**One explained difference** (orchestrator for the owner, 23 Nov): with thinking **on**, a card may pre-fill
+the model's opening `think_open` (e.g. Qwen3's `<think>\n`) after the generation prompt, while the model's
+own template leaves it for the model to emit. That is a pass, not a mismatch, **iff** (a) Loom's count
+exceeds ours by exactly the card's `chat.think_open` tokens and every other rendering matches (thinking off
+equal), **and** (b) the greedy continuation after the prefill matches: on the gate's prompts with thinking
+on, the fallback's (or CPU arbiter's) reply begins with `think_open` and Loom's reply equals the rest of it,
+held to the same agreement rule as above. Anything else is a mismatch and voids the row. A thinking-off
+difference is never explained this way (the card renders a different prompt).
+
 **Speed.** Interleaved on strixhalo, at least four rounds, each round running every arm once, one
 server at a time: the fallback, raw loom-serve, and Loom through `1bit serve --loom-routes` (the route
 users get), with the same prompts, a discarded warm-up per arm, and load, memory and Tctl recorded per

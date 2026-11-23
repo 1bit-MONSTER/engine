@@ -43,6 +43,25 @@ grep -q "^1bit-shutdown: rc.shutdown $rc finished\$" "$t/kmsg"; check $? "the en
 [ "$(grep -c 'step [0-9]* sleep 4$' "$t/kmsg")" = 1 ]; check $? "a step is named once, not every second"
 ! grep -qv '^1bit-shutdown: ' "$t/kmsg"; check $? "every record is one whole line (one write each)"
 
+# 1b. v2: a heartbeat while rc.shutdown waits, and a SIGTERM (rc.shutdown's kill loop) is said before the watcher exits
+printf 'sleep 5\n' > "$t/rc2"
+sh "$t/rc2" & rc2=$!
+ONEBIT_KMSG=$t/kmsg2 ONEBIT_WATCH_FIRST=60 ONEBIT_WATCH_HEARTBEAT=2 sh "$watch" "$rc2" & w2=$!
+sleep 3
+kill -TERM "$w2"; wait "$w2" 2> /dev/null; wait "$rc2" 2> /dev/null
+cat "$t/kmsg2"
+grep -qE '^1bit-shutdown: alive: rc.shutdown in [0-9]+ \[sleep\], state [A-Z], wchan ' "$t/kmsg2"
+check $? "a heartbeat names where rc.shutdown is (comm, state, wchan) while nothing changes"
+grep -qE '^1bit-shutdown: watcher got SIGTERM while rc.shutdown was in [0-9]+ \(sleep 5\)$' "$t/kmsg2"
+check $? "a SIGTERM to the watcher is logged with the step it was watching"
+if command -v busybox > /dev/null 2>&1; then
+    printf 'sleep 2\n' > "$t/rc3"
+    busybox ash "$t/rc3" & rc3=$!
+    ONEBIT_KMSG=$t/kmsg3 busybox ash "$watch" "$rc3"; wait "$rc3" 2> /dev/null
+    grep -q "^1bit-shutdown: rc.shutdown $rc3 finished\$" "$t/kmsg3" && grep -qE "step [0-9]+ sleep 2$" "$t/kmsg3"
+    check $? "under busybox ash (the appliance's shell, builtin wait) the watcher still follows and ends"
+fi
+
 # 2. the hook, on the banner lines of woof-CE's rc.shutdown
 printf '#!/bin/ash\necho "${DISTRO_NAME} is now shutting down..." > /dev/console\necho "Executing /etc/rc.d/rc.shutdown..."\nsync\n' \
     > "$t/rc.shutdown"

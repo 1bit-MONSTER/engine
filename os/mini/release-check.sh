@@ -31,12 +31,15 @@ set -u
 LOG=/data/release-check.log
 FAILS=0
 ROWS=0
+PASSES=0
+SKIPS=0
+SKIPPED=      # every row that skipped, for the footer: a SKIP is not a pass (engine#3353)
 say() { printf '%s\n' "$*"; [ -w /data ] 2>/dev/null && printf '%s\n' "$*" >> "$LOG" 2>/dev/null; return 0; }
-pass() { ROWS=$((ROWS + 1)); say "PASS  $1 : $2"; }
+pass() { ROWS=$((ROWS + 1)); PASSES=$((PASSES + 1)); say "PASS  $1 : $2"; }
 fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
 skip() {
-    ROWS=$((ROWS + 1))
+    ROWS=$((ROWS + 1)); SKIPS=$((SKIPS + 1)); SKIPPED="${SKIPPED:+$SKIPPED,}$1"
     case "$1" in gpu|npu|npu-power|hrx-placement|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
@@ -50,7 +53,7 @@ skip() {
 RC_FOOTER=
 rc_on_exit() {
     [ -n "$RC_FOOTER" ] && return 0        # a normal run already printed its RESULT and owns the device state
-    say "RESULT: FAIL (this check died before its footer: $ROWS row(s) ran, $FAILS failed - read the line above)"
+    say "RESULT: FAIL (this check died before its footer: $ROWS row(s) ran - $PASSES PASS, $SKIPS SKIP, $FAILS FAIL - read the line above)"
     [ -n "${NPU:-}" ] && [ -n "${API:-}" ] || return 0
     got --header='Content-Type: application/json' --post-data='{}' "$API/api/v1/unload" >/dev/null 2>&1
     return 0
@@ -741,7 +744,10 @@ payload_name_from_image() {  # <identity file> <payload dir>
     _pval=$(sed -n 's/^payload=//p' "$_pi" 2>/dev/null | head -1)
     _ptag=
     if [ -n "$_pd" ] && [ -f "$_pd/1bit/README.txt" ]; then
+        # an rc-YYYY-MM-DD-cNN cut tag, or a release's vYYYY.WW tag (engine#3353: v2026.48's README says
+        # "1bit engine v2026.48 ..." and the old pattern skipped it)
         _ptag=$(sed -n '1s/.*\(rc-[0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*-c[0-9][0-9]*[a-z]*\).*/\1/p' "$_pd/1bit/README.txt" 2>/dev/null)
+        [ -n "$_ptag" ] || _ptag=$(sed -n '1s/.*\(v[0-9][0-9][0-9][0-9]\.[0-9][0-9]*[a-z]*\).*/\1/p' "$_pd/1bit/README.txt" 2>/dev/null)
     fi
     payload_name_verdict "$_pval" "$_ptag"
 }
@@ -1021,6 +1027,11 @@ node_verdict() {
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
+# --fetch (or ONEBIT_CHECK_FETCH=1): pull what a row needs and cannot find, instead of skipping it - today the hrx-placement
+# row's named 4B GGUF (2.5 GB, through this machine's own `lemonade pull`). The release run uses it (docs/releases.md,
+# engine#3353); a user's run does not download gigabytes unasked.
+FETCH=${ONEBIT_CHECK_FETCH:-}
+for _a in "$@"; do [ "$_a" = --fetch ] && FETCH=1; done
 if [ "${1:-}" = --self-test ]; then
     API=http://127.0.0.1:13305
     rc=0
@@ -1125,6 +1136,14 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33x rc-2026-11-08-c33)"        # the token must END there, not continue
     check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33.tar rc-2026-11-08-c33)"    # a non-alphanumeric after it is fine
     check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26c rc-2026-11-05-c26c)"      # the real c26c pair still passes
+    check PASS "$(payload_name_verdict lemonade-onebit-v2026.48 v2026.48)"                          # engine#3353: a release tag
+    check FAIL "$(payload_name_verdict lemonade-onebit-v2026.47 v2026.48)"                          # the other release's payload
+    check FAIL "$(payload_name_verdict lemonade-onebit-v2026.48 v2026.4)"                           # v2026.4 must not match v2026.48
+    _pt_dir=$(mktemp -d); mkdir -p "$_pt_dir/1bit"
+    printf '1bit engine v2026.48 for Linux x86_64 (Strix Halo / Ryzen AI): https://1bit.gg/\n' > "$_pt_dir/1bit/README.txt"
+    printf 'payload=lemonade-onebit-v2026.48\n' > "$_pt_dir/id"
+    check PASS "$(payload_name_from_image "$_pt_dir/id" "$_pt_dir")"                                # v2026.48's own README line
+    rm -rf "${_pt_dir:?}"
     check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33 rc-2026-11-08-c33)"        # the label CONTAINS the token
     check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26c rc-2026-11-08-c33)"        # the c26 incident: must red
     check SKIP "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33 '')"                        # no README tag: not a pass by absence
@@ -1480,6 +1499,24 @@ hrxp_model() {  # the staged 4B GGUF, if this medium has one
     done
     return 1
 }
+# --fetch: pull the row's named model through this machine's Lemonade; sets HRXP_MODEL_PATH, or HRXP_FETCH_WHY on failure
+hrxp_fetch() {
+    _lc=$(command -v lemonade 2> /dev/null); [ -n "$_lc" ] || _lc=/opt/1bit-package/bin/lemonade
+    [ -x "$_lc" ] || { HRXP_FETCH_WHY="no lemonade CLI on this image"; return 1; }
+    _t0=$(date +%s)
+    if [ -n "$KEY" ]; then
+        LEMONADE_API_KEY=$KEY "$_lc" --port "$PORT" pull Qwen3-4B-Instruct-2507-1bit > /tmp/1bit-hrxp-pull.$$ 2>&1
+    else
+        "$_lc" --port "$PORT" pull Qwen3-4B-Instruct-2507-1bit > /tmp/1bit-hrxp-pull.$$ 2>&1
+    fi
+    _prc=$?
+    HRXP_FETCH_WHY="lemonade pull exited $_prc: $(tail -n 1 /tmp/1bit-hrxp-pull.$$ 2> /dev/null)"
+    rm -f /tmp/1bit-hrxp-pull.$$
+    [ "$_prc" = 0 ] || return 1
+    HRXP_MODEL_PATH=$(hrxp_model) || { HRXP_FETCH_WHY="the pull finished but no Qwen3-4B-Instruct-2507-Q4_K_M.gguf is under /data/lemonade/huggingface"; return 1; }
+    say "info  fetch : pulled Qwen3-4B-Instruct-2507-1bit for hrx-placement in $(( $(date +%s) - _t0 )) s"
+    return 0
+}
 hrxp_gtt() {  # <pid>... -> that process tree's own drm-total-gtt, in MiB
     if [ -n "${HRXP_GTT:-}" ]; then "$HRXP_GTT" "$@"; return 0; fi
     _k=0
@@ -1543,8 +1580,10 @@ hrxp_arm() {  # <port> <optin 0|1> -> "<own GTT MiB>" on stdout; non-zero when t
 }
 if [ ! -e "${HRXP_KFD:-/dev/kfd}" ]; then
     skip hrx-placement "no /dev/kfd: this machine has no AMD GPU, so there is no HRX placement to measure"
-elif ! HRXP_MODEL_PATH=$(hrxp_model); then
-    skip hrx-placement "no staged Qwen3-4B-Instruct-2507-Q4_K_M.gguf under /data/lemonade/huggingface: the row measures one named model twice and will not substitute another"
+elif ! HRXP_MODEL_PATH=$(hrxp_model) && [ -z "$FETCH" ]; then
+    skip hrx-placement "no staged Qwen3-4B-Instruct-2507-Q4_K_M.gguf under /data/lemonade/huggingface: the row measures one named model twice and will not substitute another (1bit-release-check --fetch pulls it)"
+elif [ -z "${HRXP_MODEL_PATH:-}" ] && ! hrxp_fetch; then
+    fail hrx-placement "--fetch asked for Qwen3-4B-Instruct-2507-1bit and it could not be pulled: $HRXP_FETCH_WHY"
 else
     ONEBIT_BIN=${ONEBIT_BIN:-}
     if [ -z "$ONEBIT_BIN" ]; then
@@ -2314,11 +2353,21 @@ if [ -f "$ID" ]; then
         SKIP*) skip payload-identity "${PLV#SKIP }" ;;
         *)     fail payload-identity "${PLV#FAIL } (label: ${_id_name:-?})" ;;
     esac
-    if [ -f /data/SHA256SUMS ]; then
-        if (cd /data && sha256sum -c SHA256SUMS >/dev/null 2>&1); then pass sha256sums "/data/SHA256SUMS verifies"
-        else fail sha256sums "/data/SHA256SUMS does not verify (cd /data && sha256sum -c SHA256SUMS)"; fi
+    # engine#3353: mkimage.sh writes SHA256SUMS beside the boot set, in the psubdir= slot (/1bit on a stick, /1bit or
+    # /1bit-alt on an installed disk, which 1bit-update copies with the set) - not at the partition's root, where this
+    # row used to look and skipped on every release.
+    _ss_sub=$(tr ' ' '\n' < /proc/cmdline 2> /dev/null | sed -n 's/^psubdir=//p' | head -1); _ss_sub=${_ss_sub#/}
+    _ss=
+    for _c in ${_ss_sub:+/data/$_ss_sub/SHA256SUMS} /data/SHA256SUMS; do [ -f "$_c" ] && { _ss=$_c; break; }; done
+    if [ -n "$_ss" ]; then
+        _ssd=$(dirname "$_ss"); _ssn=$(grep -c . "$_ss")
+        if (cd "$_ssd" && sha256sum -c SHA256SUMS > /dev/null 2>&1); then
+            pass sha256sums "$_ss verifies: the $_ssn file(s) of the set this machine booted are the release's bytes"
+        else fail sha256sums "$_ss does not verify (cd $_ssd && sha256sum -c SHA256SUMS)"; fi
+    elif [ -f /etc/rc.d/PUPSTATE ]; then
+        fail sha256sums "no SHA256SUMS beside the boot set (${_ss_sub:+/data/$_ss_sub, }/data): every 1bit OS image writes one there (mkimage.sh), so nothing proves this set is the release's"
     else
-        skip sha256sums "no /data/SHA256SUMS on the data partition; the image hash lives in the release table beside the .img.zst"
+        skip sha256sums "no SHA256SUMS on the data partition (this image is not a 1bit OS Puppy set)"
     fi
 else
     skip identity "no /etc/1bit/release-identity in this image build; the tag and the image sha256 are in the release table beside the .img.zst"
@@ -2725,12 +2774,16 @@ say ""
 NPU_WAITED=$(awk '{s += $1} END {print s + 0}' "$NPU_WAITFILE" 2>/dev/null)
 [ "${NPU_WAITED:-0}" -gt 0 ] 2>/dev/null && say "info  npu-wait : $NPU_WAITED s spent backing off on code 102 (a client had just released the partition; the window is ~2 s)"
 RC_FOOTER=1
+# engine#3353: the footer states all three counts, and SUMMARY is the line a release note copies. v2026.48's footer said
+# "RESULT: PASS (39 checks, no failures)" over 33 PASS / 6 SKIP, and the release notes repeated it as "39 of 39".
+say "SUMMARY: rows=$ROWS pass=$PASSES skip=$SKIPS fail=$FAILS${SKIPPED:+ skipped=$SKIPPED}"
 if [ "$FAILS" = 0 ]; then
-    say "RESULT: PASS ($ROWS checks, no failures)"
+    say "RESULT: PASS ($ROWS rows: $PASSES PASS, $SKIPS SKIP, 0 FAIL)"
+    [ "$SKIPS" = 0 ] || say "Not passed, skipped: $(printf '%s' "$SKIPPED" | sed 's/,/, /g') - each SKIP line above says why; a release note counts $PASSES of $ROWS as passing"
     # Name only the rows that actually skipped. On the 2026-11-02 live boot four of these five PASSED on the board and
     # this line still listed all five as skipped "here", which puts a false statement in the release evidence file.
     [ -z "$HW_SKIPPED" ] || say "Hardware-only rows (SKIP here): $HW_SKIPPED - they need the Strix Halo GPU and NPU."
     exit 0
 fi
-say "RESULT: FAIL ($FAILS of $ROWS checks failed)"
+say "RESULT: FAIL ($FAILS of $ROWS rows failed: $PASSES PASS, $SKIPS SKIP, $FAILS FAIL)"
 exit 1

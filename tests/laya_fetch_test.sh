@@ -79,6 +79,45 @@ for f in typed-decisions/model.safetensors typed-decisions/rl_agent_config.json 
     grep -qE "^[0-9a-f]{64} [0-9]+ $f\$" "$shipped" || ok=1
 done
 check $ok "it lists the three files laya::Scorer loads, each with a sha256 and a size"
+# a stalled connection must end the transfer, so --retry and the resume take over (`1bit route --serve` waits on fetch)
+grep -q -- '--speed-limit [0-9][0-9]* --speed-time [0-9][0-9]*' "$laya" && grep -q -- '--connect-timeout [0-9]' "$laya"
+check $? "the download has a connect timeout and a speed floor (a stall becomes an error, not a hang)"
+
+# register: the key reaches Lemonade but is on no curl command line (argv is world-readable), and its header file goes
+if command -v python3 > /dev/null; then
+    cat > "$t/lemond.py" << 'PY'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+log = sys.argv[1]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, code, body):
+        b = json.dumps(body).encode(); self.send_response(code); self.send_header("Content-Length", str(len(b)))
+        self.end_headers(); self.wfile.write(b)
+    def do_GET(self):
+        self.reply(200, {"status": "ok"} if self.path.startswith("/api/v1/health") else {"data": []})
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0); self.rfile.read(n)
+        open(log, "a").write(json.dumps({"path": self.path, "auth": self.headers.get("Authorization")}) + "\n")
+        self.reply(200, {"ok": True})
+s = HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[2], "w").write(str(s.server_address[1]))
+s.serve_forever()
+PY
+    python3 "$t/lemond.py" "$t/reg.log" "$t/port" & srv=$!
+    for _ in $(seq 1 50); do [ -s "$t/port" ] && break; sleep 0.1; done
+    printf '#!/bin/sh\necho %s\n' "'{\"model_name\": \"user.Laya-First\", \"recipe\": \"router\"}'" > "$t/1bit"; chmod +x "$t/1bit"
+    real_curl=$(command -v curl); mkdir -p "$t/shim" "$t/tmp"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexec "%s" "$@"\n' "$t/argv" "$real_curl" > "$t/shim/curl"
+    chmod +x "$t/shim/curl"; : > "$t/argv"
+    PATH=$t/shim:$PATH TMPDIR=$t/tmp ONEBIT_BIN=$t/1bit ONEBIT_LEMONADE_URL="http://127.0.0.1:$(cat "$t/port")" \
+        LEMONADE_API_KEY=k456 ONEBIT_LAYA_WAIT=10 sh "$laya" register 2> "$t/err"; rc=$?
+    kill "$srv" 2> /dev/null; wait "$srv" 2> /dev/null
+    [ $rc = 0 ] && grep -q '"auth": "Bearer k456"' "$t/reg.log"; check $? "register sends the key to Lemonade ($(tail -1 "$t/err"))"
+    [ -s "$t/argv" ] && ! grep -q k456 "$t/argv"; check $? "and the key is in no curl argv"
+    [ -z "$(ls -A "$t/tmp")" ]; check $? "and no temp file holding it is left"
+fi
+
 sh "$laya" bogus 2> /dev/null; [ $? = 64 ]; check $? "an unknown command is a usage error"
 
 echo "laya_fetch_test: $([ $bad = 0 ] && echo ok || echo FAIL)"

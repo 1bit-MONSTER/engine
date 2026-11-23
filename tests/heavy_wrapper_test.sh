@@ -91,6 +91,14 @@ sh "$heavy" -- sh -c 'kill -INT $PPID; sleep 1' 2> /dev/null
 : > "$t/calls"
 LEMONADE_API_KEY=k123 sh "$heavy" -- true 2> /dev/null
 [ "$(grep -c '"auth": "Bearer k123"' "$t/calls")" = 2 ]; check $? "LEMONADE_API_KEY is sent on the hold and the release"
+# ... but never on curl's command line (argv is world-readable in ps), and no file holding it is left behind
+real_curl=$(command -v curl); mkdir -p "$t/shim" "$t/tmp"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexec "%s" "$@"\n' "$t/argv" "$real_curl" > "$t/shim/curl"; chmod +x "$t/shim/curl"
+: > "$t/calls"; : > "$t/argv"
+PATH=$t/shim:$PATH TMPDIR=$t/tmp LEMONADE_API_KEY=k123 sh "$heavy" -- true 2> /dev/null
+[ -s "$t/argv" ] && ! grep -q k123 "$t/argv" && [ "$(grep -c '"auth": "Bearer k123"' "$t/calls")" = 2 ]
+check $? "the key reaches Lemonade but is in no curl argv"
+[ -z "$(ls -A "$t/tmp")" ]; check $? "the wrapper leaves no temp file (the header file holds the key)"
 
 # 5. an old Lemonade without the endpoint: the command runs with a warning; --require refuses and does not run it
 echo old > "$t/mode"; : > "$t/calls"

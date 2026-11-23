@@ -52,16 +52,17 @@ command -v curl > /dev/null || { echo "$prog: needs curl" >&2; [ -n "$require" ]
 url=${ONEBIT_LEMONADE_URL:-http://127.0.0.1:${LEMONADE_PORT:-13300}}
 key=${LEMONADE_API_KEY:-}
 conf=${ONEBIT_LEMOND_CONF:-/etc/1bit/lemond.conf}
-[ -n "$key" ] || { [ -r "$conf" ] && key=$(sed -n 's/^LEMONADE_API_KEY=//p' "$conf" | tail -n 1); }
+# the FIRST key line, as /etc/init.d/10lemonade reads it (a second appended line must not make this wrapper send another)
+[ -n "$key" ] || { [ -r "$conf" ] && key=$(sed -n 's/^LEMONADE_API_KEY=//p' "$conf" | head -n 1); }
 json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 tmp=$(mktemp) || exit 2
+# The key goes to curl from a 0600 header file (-H @file), never on its command line: argv is world-readable in ps and
+# /proc/<pid>/cmdline, and the key is what keeps the LAN out. An empty file adds no header (a blank-key appliance).
+hdr=$(mktemp) || exit 2
+[ -z "$key" ] || printf 'Authorization: Bearer %s\n' "$key" > "$hdr"
 post() {  # <path> <timeout s> <json> -> sets $code (HTTP status) and $body; runs in this shell, not a subshell
-    if [ -n "$key" ]; then
-        code=$(curl -sS -m "$2" -o "$tmp" -w '%{http_code}' -H 'Content-Type: application/json' \
-            -H "Authorization: Bearer $key" -d "$3" "$url/api/v1/$1" 2> /dev/null)
-    else
-        code=$(curl -sS -m "$2" -o "$tmp" -w '%{http_code}' -H 'Content-Type: application/json' -d "$3" "$url/api/v1/$1" 2> /dev/null)
-    fi
+    code=$(curl -sS -m "$2" -o "$tmp" -w '%{http_code}' -H 'Content-Type: application/json' -H @"$hdr" \
+        -d "$3" "$url/api/v1/$1" 2> /dev/null)
     body=$(cat "$tmp" 2> /dev/null)
 }
 
@@ -81,7 +82,7 @@ if [ -z "$hold_id" ]; then
     esac
     if [ -n "$require" ]; then echo "$prog: REFUSED: could not hold the models: $why" >&2; exit 2; fi
     echo "$prog: WARNING: running without a hold - $why; the loaded models stay next to the command" >&2
-    rm -f "$tmp"; exec "$@"
+    rm -f "$tmp" "$hdr"; exec "$@"
 fi
 unloaded=$(printf '%s' "$body" | sed -n 's/.*"unloaded" *: *\[\([^]]*\)\].*/\1/p' | tr -d '"')
 echo "$prog: $hold_id: models unloaded (${unloaded:-none were loaded}); requests wait until the command ends" >&2
@@ -99,7 +100,7 @@ release() {
     else
         echo "$prog: WARNING: releasing $hold_id answered $code: $rb (Lemonade ends it by itself after $maxs s)" >&2
     fi
-    rm -f "$tmp"
+    rm -f "$tmp" "$hdr"
 }
 trap 'release' EXIT
 trap 'release; trap - INT; kill -INT $$' INT

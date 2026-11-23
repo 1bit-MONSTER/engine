@@ -392,8 +392,22 @@ package_checks() {  # package_checks <linux tarball>
     if [ "${WEEKLY_NPU_KERNELS:-1}" = 1 ]; then
         # one set = one signed manifest: a signed-manifest set carries no layout.json, and counting that file said
         # "0 NPU kernel sets" for a package full of them.
-        n=$(find "$t" \( -path '*/npu/kernels/*/manifest' -o -path '*/npu/kernels/*/manifest.json' \) -type f | wc -l)
-        [ "$n" -ge 3 ] || { echo "FAIL WEEKLY_NPU_KERNELS=1 but $(basename "$1") carries $n NPU kernel sets (want the 0.6B, 1.7B and 4B sets)"; bad=1; }
+        # engine#3287: which sets ship is config/npu-catalogue-sets.json's business (the catalogue offers only the models
+        # whose set is packed, tools/npu_catalogue_filter.py). Here: at least one set, and none the catalogue cannot use.
+        # This used to demand "the 0.6B, 1.7B and 4B sets" - stale since 1.7B stopped shipping, so every release package
+        # failed the row, including the c35 payload that was tested on the board.
+        local sets set known
+        sets=$(find "$t" \( -path '*/npu/kernels/*/manifest' -o -path '*/npu/kernels/*/manifest.json' \) -type f \
+            -exec dirname {} \; | xargs -r -n1 basename | LC_ALL=C sort -u)
+        n=$(printf '%s' "$sets" | grep -c . || true)
+        [ "$n" -ge 1 ] || { echo "FAIL WEEKLY_NPU_KERNELS=1 but $(basename "$1") carries no signed NPU kernel set"; bad=1; }
+        known=$(python3 -c 'import json,sys; print("\n".join(v for v in json.load(open(sys.argv[1]))["sets"].values() if v))' \
+            "$SRC/config/npu-catalogue-sets.json" 2>/dev/null || true)
+        for set in $sets; do
+            printf '%s\n' "$known" | grep -qxF "$set" ||
+                { echo "FAIL NPU kernel set $set is not in config/npu-catalogue-sets.json: no catalogue entry can load it"; bad=1; }
+        done
+        [ "$n" -ge 1 ] && echo "ok   NPU kernel sets: $n ($(echo $sets)), each one config/npu-catalogue-sets.json names"
     fi
     # The shipped npu tree is an exact allowlist: the set's signed manifest, its layout.json when the scheme has one,
     # and its kernels -- sealed 1BPKCRYP at <set>/layer1_*/layer1.elf, or plain ELFs at <set>/<id>/layer1.elf described
@@ -462,6 +476,9 @@ package_checks() {  # package_checks <linux tarball>
     nk=0
     while IFS= read -r -d '' f; do
         pack_is_elf "$f" || continue
+        # a signed-manifest set's kernels are AIE ELFs by design (the allowlist above admits them at exactly this path and
+        # the manifest check covers their digests); every OTHER ELF must be a host program or library
+        [[ "${f#"$t"/}" =~ ^[^/]+/npu/kernels/[^/]+/[0-9a-f]{2,8}/layer1\.elf$ ]] && [ -f "$(dirname "$(dirname "$f")")/manifest" ] && continue
         m=$(od -An -t u2 -j 18 -N 2 "$f" | tr -d ' ')
         [ "$m" = 62 ] || { echo "FAIL $f is an ELF for machine $m, not the host (x86-64)"; nk=$((nk + 1)); }
     done < <(find "$t" -type f -print0)
@@ -479,7 +496,9 @@ package_checks() {  # package_checks <linux tarball>
             # nothing to look for is not a pass: say so instead of an `ok` that reads as a search (engine#2469)
             echo "skip the packed 1bit vs private source names: the npu pins track no .c/.h/.py here, nothing to look for"
         else
-            n=$(strings -a "$f" | grep -c -F -f <(printf '%s\n' "$privsrc") || true)
+            # -w: a private file NAME, not any string that contains it - a private basename matched inside a longer public
+            # engine path that ends with it, in a message the public engine prints, and failed every package (v2026.48)
+            n=$(strings -a "$f" | grep -c -w -F -f <(printf '%s\n' "$privsrc") || true)
             [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a private source file ($n strings)"; b1=1; }
         fi
         if [ $b1 = 0 ]; then echo "ok   the packed 1bit: no symbol table${privsrc:+, no private source names}"; else bad=1; fi

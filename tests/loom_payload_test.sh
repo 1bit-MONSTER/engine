@@ -119,5 +119,11 @@ grep -qE '^card [A-Za-z0-9._-]+ [A-Za-z0-9._-]+/[A-Za-z0-9._-]+ [0-9a-f]{40}$' "
 for f in model.json model.json.lock; do grep -qE "^[0-9a-f]{64} [0-9]+ $f\$" "$pin" || ok=1; done
 check $ok "the shipped loom-cards.pin names each card at a 40-hex revision, with model.json and its lock"
 
+# the DEFAULT pin path is the repository's own config/loom.config (every other row sets ONEBIT_LOOM_PIN, which is how a
+# path pointing at os/config/ shipped and failed every cut.sh from main). A wheel that is not the pinned one must be
+# refused for its sha256 - which only happens when the real pin file was found and read.
+mkdir -p "$t/Pdef"; ONEBIT_LOOM_CARDS_PIN=$t/cards.pin sh "$stage" "$t/Pdef" --wheel "$t/w.whl" --cards-from "$t/cardsrc" 2> "$t/errdef"; rc=$?
+[ $rc = 2 ] && ! grep -q "no Loom pin file" "$t/errdef" && ! grep -q "has no wheel" "$t/errdef" && grep -qi "sha256" "$t/errdef"
+check $? "with no ONEBIT_LOOM_PIN it reads the repository's config/loom.config ($(head -1 "$t/errdef" | cut -c1-90))"
 echo "loom_payload_test: $([ $bad = 0 ] && echo ok || echo FAIL)"
 [ $bad = 0 ]

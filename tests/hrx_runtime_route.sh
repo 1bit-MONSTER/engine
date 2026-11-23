@@ -66,6 +66,10 @@ chmod +x "$scratch/backend.py"
 
 run() {  # <record> [serve args]: the backend's env, as JSON, in <record>; serve's log in <record>.log
     local port
+    # a fresh record per run: the wait below ends on a non-empty <record>, and the bad-value loop reuses one name,
+    # so a stale record from the previous value ended the wait at once and serve was killed before its log line
+    # (CI flake on #3424: "user env '.../plain.gguf': serve says it is not used")
+    rm -f "$1" "$1.log"
     # --port 0: the kernel picks and serve reports the port it bound, so nothing here picks a port and releases
     # it before serve binds (engine #1444/#1485). A bind failure can no longer be our own port collision.
     RECORD="$1" "$bin" serve -m "$scratch/plain.gguf" --port 0 --llama-server "$scratch/backend.py" \

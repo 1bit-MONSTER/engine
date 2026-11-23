@@ -119,7 +119,9 @@ inline std::string npu_partition_refusal_note(const char* partition, const std::
         s += "; this amdxdna has temporal_only=0, so placement is spatial and another client holds the columns this "
              "model asks for";
     else
-        s += "; this amdxdna has temporal_only=" + t + " (load it with temporal_only=0 for two models side by side)";
+        s += "; this amdxdna has temporal_only=" + t + ", and a plain reload brings the same placement back: reload it "
+             "with spatial placement for two models side by side (modprobe -r amdxdna && modprobe amdxdna "
+             "temporal_only=0)";
     return s;
 }
 

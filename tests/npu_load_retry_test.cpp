@@ -175,16 +175,19 @@ int main() {
                "no partition mode, no note");
         const std::string none = npu_partition_refusal_note("4", "");
         expect(none.find("NPU_PARTITION=4") != std::string::npos && none.find("temporal_only=0") != std::string::npos &&
-                   none.find("no temporal_only parameter") != std::string::npos && none.find("0014") != std::string::npos,
+                   none.find("no temporal_only parameter") != std::string::npos && none.find("0014") != std::string::npos &&
+                   none.find("modprobe") == std::string::npos,
                "a module without the parameter is named as predating 0014: " + none);
         const std::string gone = npu_partition_refusal_note("4", "", false);
-        expect(gone.find("not there") != std::string::npos && gone.find("predates") == std::string::npos,
+        expect(gone.find("not there") != std::string::npos && gone.find("predates") == std::string::npos &&
+                   gone.find("modprobe") == std::string::npos,
                "an unreadable module is not claimed to predate 0014: " + gone);
         const std::string tmp = npu_partition_refusal_note("4", "1\n");
-        expect(tmp.find("temporal_only=1 (load it with temporal_only=0") != std::string::npos,
-               "a temporal module is told to load with temporal_only=0 (the sysfs newline trimmed): " + tmp);
+        expect(tmp.find("temporal_only=1,") != std::string::npos &&
+                   tmp.find("modprobe amdxdna temporal_only=0") != std::string::npos,
+               "a temporal module gets the exact reload that changes the placement (sysfs newline trimmed): " + tmp);
         const std::string sp = npu_partition_refusal_note("4", "0\n");
-        expect(sp.find("placement is spatial") != std::string::npos && sp.find("load it with") == std::string::npos,
+        expect(sp.find("placement is spatial") != std::string::npos && sp.find("modprobe") == std::string::npos,
                "a spatial module points at the other client, not at the module: " + sp);
 
         LoadRetryPolicy p;

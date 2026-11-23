@@ -820,8 +820,9 @@ add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_r
 # bare mention are deliberately NOT claims, which is the arm below that keeps the detector from firing on every PR.
 add_python_test(tool_selftest_duplicate_fixes ${CMAKE_SOURCE_DIR}/tools/ci/duplicate_fixes_check.py --self-test)
 # engine#2836: the fork registers 48 ctest rows and nothing runs them, because the engine never builds the fork's tests.
-# The host-runnable one that matters is `check_stale_expectations.py` (fork #419): it answers "is a recorded-stale
-# expectation still selectable by no matcher", which is engine#2774's question, in ~1 s, with no device and no fixture.
+# The host-runnable one that matters is `check_stale_expectations.py` (fork #419): since fork #490 it answers "does
+# every kernel name hrx-ops-test expects have a registration, and is the suppression table still gone", engine#2774's
+# question, in ~1 s, with no device and no fixture.
 # On a pin BEFORE `ddd415f4a` (the fork commit that adds the script) it cannot run, so the row skips (77) and the
 # message names the commit that turns it on, the same shape as hrx_f16_narrowing_check above; on `ddd415f4a` and
 # later -- which is the pin this engine carries today -- it RUNS and passes, so the row is live, not inert. A row

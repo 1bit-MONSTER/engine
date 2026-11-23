@@ -156,6 +156,31 @@ int main() {
         check("a card that does not exist is refused", loom::loom_card_path(gone, dir.string()).empty());
         check("a missing card says so", loom::loom_card_model_id((dir / "none.json").string(), why).empty() &&
                                             why.find("cannot read") != std::string::npos);
+
+        // engine#3350: a card's parameter/ links follow the model serve was given (whatever snapshot the pull made)
+        fs::create_directories(dir / "lc" / "parameter");
+        fs::create_directories(dir / "snap");
+        std::ofstream(dir / "lc" / "model.json") << R"({"model":{"id":"M"},"variants":{"gguf":{"services":{"chat":{"parameters":{)"
+            R"("model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"}]},)"
+            R"("draft":{"files":[{"path":"parameter/d.gguf","origin":"@checkpoint/d.gguf"}]},)"
+            R"("tok":{"files":[{"path":"tokenizer.json","origin":"tokenizer.json"}]},)"
+            R"("bad":{"files":[{"path":"../escape.gguf","origin":"@checkpoint/x.gguf"}]}}}}}}})";
+        std::ofstream(dir / "snap" / "m.gguf") << "m";
+        std::ofstream(dir / "snap" / "d.gguf") << "d";
+        std::ofstream(dir / "snap" / "x.gguf") << "x";
+        fs::create_symlink(dir / "old-rev" / "m.gguf", dir / "lc" / "parameter" / "m.gguf");   // the lock's revision: dangling
+        std::string lwhy;
+        const int made = loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(), lwhy);
+        check("a dangling weight link and a missing one are pointed beside the served model", made == 2 && lwhy.empty() &&
+              fs::read_symlink(dir / "lc" / "parameter" / "m.gguf") == dir / "snap" / "m.gguf" &&
+              fs::read_symlink(dir / "lc" / "parameter" / "d.gguf") == dir / "snap" / "d.gguf");
+        check("a path that climbs out of the card is not linked", !fs::exists(fs::symlink_status(dir / "escape.gguf")));
+        check("a second call changes nothing",
+              loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(), lwhy) == 0);
+        fs::remove(dir / "lc" / "parameter" / "d.gguf");
+        std::ofstream(dir / "lc" / "parameter" / "d.gguf") << "a real copy";                      // --materialize=copy
+        loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(), lwhy);
+        check("a real file in parameter/ is never replaced", !fs::is_symlink(fs::symlink_status(dir / "lc" / "parameter" / "d.gguf")));
         fs::remove_all(dir);
     }
 

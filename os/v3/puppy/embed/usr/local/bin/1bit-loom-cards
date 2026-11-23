@@ -23,8 +23,13 @@
 # a link that leaves it, so the card is assembled HERE, on the data partition, every boot:
 #
 #   <cards dir>/<card>/<file>            a link to the payload's copy (a new release takes effect at its first boot)
-#   <cards dir>/<card>/parameter/<file>  a link to <HF_HOME>/hub/models--<org>--<repo>/snapshots/<revision>/<file>,
-#                                        which is dangling until the model is pulled and right from then on
+#   <cards dir>/<card>/parameter/<file>  a link to <HF_HOME>/hub/models--<org>--<repo>/snapshots/<rev>/<file>, <rev>
+#                                        being what the repo's refs/main names when it is already pulled, else the card
+#                                        lock's revision. Lemonade writes real files into the revision it pulled (no
+#                                        blobs/), and the catalogue pulls the repo's head (the Inkling card's lock says
+#                                        ea0c79b2, the head moved to 800c946d), so this is a first guess: `1bit serve`
+#                                        points these links at the file beside the model it was given, the moment the
+#                                        Loom route matches it (app/loom_route.h loom_link_card_parameters)
 #
 # Defaults: /opt/1bit-package/loom-cards, /data/loom-cards (10lemonade's ONEBIT_LOOM_CARDS), $HF_HOME or
 # /data/lemonade/huggingface. A card directory is rebuilt whole, so nothing a previous release left survives.
@@ -72,7 +77,14 @@ for f in files(model):
     if key not in origins or not all(origins[key]) or not name:
         sys.exit("origin %s names no pinned Hugging Face checkpoint in model.json.lock" % origin)
     rev, repo = origins[key]
-    target = os.path.join(hf, "hub", "models--" + repo.replace("/", "--"), "snapshots", rev, name)
+    base = os.path.join(hf, "hub", "models--" + repo.replace("/", "--"))
+    try:
+        head = open(os.path.join(base, "refs", "main")).read().strip()
+        if head and "/" not in head and head not in (".", ".."):
+            rev = head
+    except OSError:
+        pass
+    target = os.path.join(base, "snapshots", rev, name)
     link = os.path.join(out, f["path"])
     os.makedirs(os.path.dirname(link), exist_ok=True)
     if os.path.lexists(link):

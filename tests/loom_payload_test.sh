@@ -46,7 +46,7 @@ printf 'version=9.9.9\nwheel=w.whl\nwheel_sha256=%s\nloom_serve_sha256=%s\n' "$(
 c=$t/cardsrc/fake-loom
 mkdir -p "$c/program"
 printf '%s\n' '{"variants":{"gguf":{"services":{"chat":{"parameters":{"model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"}]},"draft":{"files":[{"path":"parameter/d.gguf","origin":"@checkpoint/d.gguf"}]}}}}}}}' > "$c/model.json"
-printf '%s\n' '{"origins":{"checkpoint":{"requested":{"kind":"hf","repository":"org/Model-GGUF","revision":"abc123"},"resolved":{"revision":"abc123"}}}}' > "$c/model.json.lock"
+printf '%s\n' '{"origins":{"checkpoint":{"requested":{"kind":"hf","repository":"org/Model-GGUF","revision":"abc123"},"resolved":{"revision":"abc123"}}},"files":[{"origin":"@checkpoint/m.gguf","size":1,"sha256":"1111111111111111111111111111111111111111111111111111111111111111"},{"origin":"@checkpoint/d.gguf","size":1,"sha256":"2222222222222222222222222222222222222222222222222222222222222222"}]}' > "$c/model.json.lock"
 printf 'prog\n' > "$c/program/llm.loom"
 { echo "card fake-loom org/fake-loom r1"
   for f in model.json model.json.lock program/llm.loom; do echo "$(sha256sum "$c/$f" | cut -c1-64) $(stat -c %s "$c/$f") $f"; done; } > "$t/cards.pin"
@@ -74,7 +74,11 @@ D=$t/data/loom-cards; HF=$t/hf
 sh "$boot" "$P/loom-cards" "$D" "$HF" 2> "$t/err"; check $? "1bit-loom-cards assembles the card (exit 0)"
 [ "$(readlink "$D/fake-loom/parameter/m.gguf")" = "$HF/hub/models--org--Model-GGUF/snapshots/abc123/m.gguf" ] &&
     [ "$(readlink "$D/fake-loom/parameter/d.gguf")" = "$HF/hub/models--org--Model-GGUF/snapshots/abc123/d.gguf" ]
-check $? "parameter/ links point at the checkpoint's Hugging Face cache snapshot (model and draft)"
+check $? "before any pull, parameter/ links point at the lock's snapshot (model and draft)"
+mkdir -p "$HF/hub/models--org--Model-GGUF/refs"; echo def456 > "$HF/hub/models--org--Model-GGUF/refs/main"
+sh "$boot" "$P/loom-cards" "$D" "$HF" 2> /dev/null
+[ "$(readlink "$D/fake-loom/parameter/m.gguf")" = "$HF/hub/models--org--Model-GGUF/snapshots/def456/m.gguf" ]
+check $? "after a pull, they follow the revision refs/main names (the catalogue pulls the repo head)"
 [ "$(readlink "$D/fake-loom/program/llm.loom")" = "$P/loom-cards/fake-loom/program/llm.loom" ]
 check $? "the card's own files are links to the payload's copy"
 touch "$D/fake-loom/stale"; sh "$boot" "$P/loom-cards" "$D" "$HF" 2> /dev/null

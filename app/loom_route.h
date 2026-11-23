@@ -306,6 +306,51 @@ inline std::string loom_card_model_id(const std::string& card, std::string& why)
     return "";
 }
 
+// engine#3350: a card assembled on the appliance's data partition (1bit-loom-cards) names its weights in model.json
+// (`parameter/<file>`, origin `@checkpoint/<file>`) and links them into Lemonade's Hugging Face cache - but which
+// snapshot revision a pull lands in is only known after the pull (the catalogue pulls the repo's head: the Inkling card's
+// lock says ea0c79b2, the head moved to 800c946d with the same files). The model serve was given IS that checkpoint (the
+// route matched its sha256), so each such parameter/ entry that is a link, or missing, is pointed at the file of the same
+// name beside the model. A regular file (a card fetched with --materialize=copy) is never touched, and an entry whose
+// sibling is not there is left as it is. Returns how many links were (re)made; `why` names a failure.
+inline int loom_link_card_parameters(const std::string& card_model_json, const std::string& model_path, std::string& why) {
+    namespace fs = std::filesystem;
+    std::ifstream in(card_model_json, std::ios::binary);
+    if (!in) { why = "cannot read " + card_model_json; return 0; }
+    json j;
+    try { j = json::parse(in); } catch (const std::exception& e) { why = card_model_json + " is not JSON: " + e.what(); return 0; }
+    const fs::path card_dir = fs::path(card_model_json).parent_path(), model_dir = fs::path(model_path).parent_path();
+    int made = 0;
+    std::vector<const json*> stack = {&j};
+    while (!stack.empty()) {
+        const json* o = stack.back();
+        stack.pop_back();
+        if (o->is_array()) { for (const auto& v : *o) stack.push_back(&v); continue; }
+        if (!o->is_object()) continue;
+        for (const auto& kv : o->items()) stack.push_back(&kv.value());
+        if (!o->contains("path") || !o->contains("origin") || !(*o)["path"].is_string() || !(*o)["origin"].is_string()) continue;
+        const std::string origin = (*o)["origin"].get<std::string>(), rel = (*o)["path"].get<std::string>();
+        const std::string pre = "@checkpoint/";
+        if (origin.compare(0, pre.size(), pre) != 0) continue;
+        const fs::path name = fs::path(origin.substr(pre.size())).filename(), link = (card_dir / rel).lexically_normal();
+        bool climbs = false;
+        for (const auto& part : fs::path(rel)) climbs = climbs || part == "..";
+        if (name.empty() || climbs) continue;
+        std::error_code ec;
+        const fs::path target = model_dir / name;
+        if (!fs::is_regular_file(target, ec)) continue;
+        const fs::file_status st = fs::symlink_status(link, ec);
+        if (fs::exists(st) && !fs::is_symlink(st)) continue;
+        if (fs::is_symlink(st) && fs::read_symlink(link, ec) == target) continue;
+        fs::create_directories(link.parent_path(), ec);
+        fs::remove(link, ec);
+        fs::create_symlink(target, link, ec);
+        if (ec) { why = "cannot link " + link.string() + " -> " + target.string() + ": " + ec.message(); continue; }
+        ++made;
+    }
+    return made;
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Readiness: loom-serve answers /healthz and /v1/models as soon as it listens, with the card still
 // preparing; GET /v1/status names every registration and its state (registered, preparing, ready,

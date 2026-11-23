@@ -36,8 +36,9 @@
 //   ONEBIT_NPU_ACCEL_CHECK=<n>      compare every n-th launch against a host int32 GEMM of the same codes (0 = off)
 //   ONEBIT_NPU_ACCEL_STATS=1        print per-shape launch counts and times at exit
 //   ONEBIT_NPU_ACCEL_SKIP=<list>    comma list of tensor-name substrings to leave on the CPU (e.g. "ffn_" or "attn_q")
-//   ONEBIT_NPU_ACCEL_IDS=<file>     append the expert ids of every MUL_MAT_ID on a *gate_up* / *_gate_* weight, one
-//                                   line per op: "<weight> <n_tok> <n_used> ids..." (the routing-agreement gate)
+//   ONEBIT_NPU_ACCEL_IDS=1          append the expert ids of every MUL_MAT_ID on a *gate_up* / *_gate_* weight to
+//                                   ./npu-accel-ids.txt (working directory), one line per op:
+//                                   "<weight> <n_tok> <n_used> ids..." (the routing-agreement gate)
 //   (a private add-on can claim matmuls first through npu_accel_ext.h)
 //   ONEBIT_NPU_ACCEL_MAX_GB=<n>     ceiling on NPU weight-buffer bytes (default 20): packing past it aborts with a message
 //                                   instead of growing until the box runs out of memory (22 Nov: the box OOMed)
@@ -85,6 +86,8 @@ using clk = std::chrono::steady_clock;
 inline double ms_since(clk::time_point t) { return std::chrono::duration<double, std::milli>(clk::now() - t).count(); }
 
 inline int pad_to(int v, int m) { return (v + m - 1) / m * m; }
+
+constexpr const char* kIdsFile = "npu-accel-ids.txt";   // ONEBIT_NPU_ACCEL_IDS=1 appends here
 
 // One ELF of the int8 family: its own hardware context and the activation/result buffers it launches with.
 struct Kern {
@@ -165,15 +168,11 @@ bool scan_dir(Accel& a) {
     a.check_every = std::getenv("ONEBIT_NPU_ACCEL_CHECK") ? std::atoi(std::getenv("ONEBIT_NPU_ACCEL_CHECK")) : 0;
     a.stats = std::getenv("ONEBIT_NPU_ACCEL_STATS") != nullptr;
     a.bo_cap = (size_t)(std::getenv("ONEBIT_NPU_ACCEL_MAX_GB") ? std::atof(std::getenv("ONEBIT_NPU_ACCEL_MAX_GB")) : 20.0) << 30;
-    if (const char* f = std::getenv("ONEBIT_NPU_ACCEL_IDS")) {
-        // a dump log several runs append to: 0600, no symlink following (file_create.h); the path is the operator's,
-        // taken only when absolute and free of "..", so a relative or climbing value cannot land it somewhere else
-        const std::string path = f;
-        if (!path.empty() && path[0] == '/' && path.find("..") == std::string::npos)
-            a.ids_out = onebit_fopen_private_ab(path.c_str());
-        else
-            std::fprintf(stderr, "npu-accel: ONEBIT_NPU_ACCEL_IDS must be an absolute path without \"..\"; not used\n");
-        if (!a.ids_out && !path.empty()) std::fprintf(stderr, "npu-accel: cannot open the ids dump %s\n", path.c_str());
+    if (const char* f = std::getenv("ONEBIT_NPU_ACCEL_IDS"); f && *f && std::strcmp(f, "0") != 0) {
+        // a dump log several runs append to, at a FIXED name in the working directory (no path is taken from the
+        // environment): 0600, no symlink following (file_create.h)
+        a.ids_out = onebit_fopen_private_ab(kIdsFile);
+        if (!a.ids_out) std::fprintf(stderr, "npu-accel: cannot open the ids dump ./%s\n", kIdsFile);
     }
     if ((!d || !*d) && a.host) { a.any_shape = true; a.dir = "(host, every shape)"; return true; }
     if (!d || !*d) { a.why = "ONEBIT_NPU_ACCEL_KERNELS is not set"; return false; }

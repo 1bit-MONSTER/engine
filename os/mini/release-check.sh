@@ -2923,12 +2923,14 @@ _hd_n=$(auth_get "$API/api/v1/health" | tr -d ' \n' | sed -n 's/.*"all_models_lo
 _hd_c=
 if [ "$_nd_pup" = 1 ] && [ "$_hd_s" = 200 ] && [ "${_hd_n:-0}" = 0 ]; then
     case "$_hd_b" in *'"active":true'*) ;; *)
-        _st=$(post_watch_once '{"reason":"release-check hold row","max_seconds":30}' "$API/api/v1/hold" "$_hd_body")
+        # post_watch_once prints "<status> <Retry-After>" (the NPU rows need both), so take the status field: comparing the
+        # whole string to 200 read "200 " as a refusal and FAILed every hold cycle, the v2026.49-rc1 QEMU run included
+        _st=$(post_watch_once '{"reason":"release-check hold row","max_seconds":30}' "$API/api/v1/hold" "$_hd_body"); _st=${_st%% *}
         _id=$(sed -n 's/.*"hold_id":"\([^"]*\)".*/\1/p' "$_hd_body" 2>/dev/null)
         if [ "$_st" != 200 ] || [ -z "$_id" ]; then _hd_c="fail POST /api/v1/hold answered ${_st:-nothing}"
         else
             case "$(auth_get "$API/api/v1/hold")" in *'"active":true'*) _act=1 ;; *) _act=0 ;; esac
-            _rs=$(post_watch_once "{\"hold_id\":\"$_id\"}" "$API/api/v1/hold/release" "$_hd_body")
+            _rs=$(post_watch_once "{\"hold_id\":\"$_id\"}" "$API/api/v1/hold/release" "$_hd_body"); _rs=${_rs%% *}
             case "$(auth_get "$API/api/v1/hold")" in *'"active":false'*) _gone=1 ;; *) _gone=0 ;; esac
             if [ "$_act" != 1 ]; then _hd_c="fail GET /api/v1/hold did not show the hold while it was taken"
             elif [ "$_rs" != 200 ]; then _hd_c="fail POST /api/v1/hold/release answered ${_rs:-nothing}"

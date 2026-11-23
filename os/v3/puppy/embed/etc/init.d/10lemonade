@@ -158,6 +158,11 @@ PY
     # --serve --laya-model $LEMONADE_LAYA_MODEL`) pulls the pinned, sha256-checked files with ONEBIT_LAYA_FETCH the first
     # time a request is routed; until then the router's requests fall through to its default model. A value set in
     # $CONF (sourced above) wins.
+    # engine#3437: idle eviction ON for every NPU model before lemond reads recipe_options.json. Lemonade ships it off
+    # (auto_evict=false), so a model loaded from the web UI and left idle held the NPU for ~2 h on 23 Nov and blocked a
+    # box-hold ticket. 10 min idle, then it is evicted; a value a person set in recipe_options.json is kept.
+    [ -x /usr/local/bin/1bit-npu-idle-evict ] && LEM=$LEM /usr/local/bin/1bit-npu-idle-evict \
+        /opt/1bit-package/bin/resources/server_models.json "$LEM/config" >> "$LOG" 2>&1
     # engine#3350 rc1: the Loom route. loom-serve ships in the payload; the cards it carries are assembled on /data with
     # their weights linked into the Hugging Face cache above (1bit-loom-cards), and `1bit serve` (a child of lemond) finds
     # both through these two variables. A value set in $CONF wins.

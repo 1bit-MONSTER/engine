@@ -1,0 +1,88 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-npu-idle-evict [<catalogue server_models.json> [<lemonade config dir>]]
+#
+# engine#3437: an idle Lemonade model held the NPU for ~2 h (23 Nov: Qwen3-0.6B-NPU-1bit loaded from the web UI at
+# 21:50Z, one chat, evicted only by an unload-all at 23:44Z) and blocked a box-hold ticket. Lemonade's idle eviction is
+# OFF by default: server/eviction_engine.cpp skips a model unless auto_evict is true for it (a per-model recipe option
+# wins, else the global, which resources/defaults.json ships false), and only then reads evict_idle_timeout.
+# So at boot (10lemonade, before lemond) this turns idle eviction ON for every NPU model, in recipe_options.json
+# (keyed by Lemonade's canonical id: builtin.<name> for a catalogue entry, user.<name> for a pulled one):
+#     {"auto_evict": true, "evict_idle_timeout": 600}
+# NPU model = a catalogue entry of recipe onebit whose id or checkpoint names the NPU (-NPU-, FastFlowLM/), or a
+# user_models.json entry of recipe onebit with onebit_backend npu. GPU models are left alone (a 17 GB reload is not
+# free; the owner decides about the global switch). A key a person set is never changed: theirs wins.
+# Defaults: /opt/1bit-package/bin/resources/server_models.json, $LEM/config (LEM=/data/lemonade).
+# Exit: 0 done (also: nothing to do, no catalogue), 1 recipe_options.json could not be written.
+set -u
+prog=1bit-npu-idle-evict
+cat=${1:-/opt/1bit-package/bin/resources/server_models.json}
+cfg=${2:-${LEM:-/data/lemonade}/config}
+timeout=${ONEBIT_NPU_IDLE_EVICT_S:-600}
+[ -f "$cat" ] || exit 0
+command -v python3 > /dev/null || { echo "$prog: needs python3" >&2; exit 1; }
+mkdir -p "$cfg" || exit 1
+python3 -I - "$cat" "$cfg" "$timeout" << 'PY'
+import json, os, sys
+cat, cfg, timeout = sys.argv[1], sys.argv[2], int(sys.argv[3])
+def load(p, default):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+def is_npu(name, v):
+    if not isinstance(v, dict) or v.get("recipe") != "onebit":
+        return False
+    ck = v.get("checkpoint") or ""
+    if isinstance(v.get("checkpoints"), dict):
+        ck = " ".join(str(x) for x in v["checkpoints"].values())
+    ro = v.get("recipe_options") or {}
+    return ("-npu-" in name.lower() or name.lower().endswith("-npu") or "fastflowlm/" in ck.lower()
+            or str(ro.get("onebit_backend", "")).lower() == "npu")
+p = os.path.join(cfg, "recipe_options.json")
+ro = load(p, {})
+if not isinstance(ro, dict):
+    sys.exit("recipe_options.json is not an object; left as it is")
+# Lemonade keys recipe_options.json by CANONICAL id: builtin.<name> for a catalogue entry, user.<name> for a pulled one
+# (canonical_id.h; RecipeOptionsStore::migrate renames an old bare key). A bare key someone wrote and Lemonade has not
+# migrated yet is the same model, so it is the one extended.
+def key(n):
+    return n if ("builtin." + n) not in ro and n in ro else "builtin." + n
+names = [key(k) for k, v in load(cat, {}).items() if is_npu(k, v)]
+names += ["user." + k for k, v in load(os.path.join(cfg, "user_models.json"), {}).items() if is_npu(k, v)]
+changed = []
+for n in names:
+    e = ro.setdefault(n, {})
+    if not isinstance(e, dict):
+        continue
+    before = dict(e)
+    e.setdefault("auto_evict", True)
+    e.setdefault("evict_idle_timeout", timeout)
+    if e != before:
+        changed.append(n)
+if changed:
+    tmp = p + ".1bit"
+    with open(tmp, "w") as f:
+        json.dump(ro, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, p)
+print("%d NPU model(s) evict after %d s idle%s" % (len(names), timeout, (": set for " + ", ".join(changed)) if changed else " (already set)"))
+PY
+rc=$?
+[ $rc = 0 ] || { echo "$prog: could not write $cfg/recipe_options.json" >&2; exit 1; }
+exit 0

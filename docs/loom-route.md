@@ -106,7 +106,9 @@ Rebuild with `tools/loom_cards.py --build` from freshly fetched card locks; CI r
 
 ## Lifecycle
 
-Written against hrx-loom 0.2.0; the CLI and HTTP surface serve uses is the same in 0.1.0.
+Written against hrx-loom 0.2.0 and checked on 0.3.0, the version `config/loom.config` pins; the CLI and HTTP surface
+serve uses is the same in 0.1.0, except that 0.3.0 removed `--parameter_mode=preload` (it takes `file` or `direct`),
+so no route entry carries it.
 `loom-serve` is a child of serve like `llama-server`: a free loopback port (`--listen=127.0.0.1:PORT`),
 `--heartbeat_ms=0`, the same stop rules (SIGTERM, then SIGKILL after `ONEBIT_BACKEND_STOP_GRACE_S`; it
 dies with serve), the same refusal of a port answered by a process serve did not start, and the same

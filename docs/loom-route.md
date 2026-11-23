@@ -160,8 +160,15 @@ toggles: a card whose chat block drops BOS or misrenders thinking answers a diff
 **Speed.** Interleaved on strixhalo, at least four rounds, each round running every arm once, one
 server at a time: the fallback, raw loom-serve, and Loom through `1bit serve --loom-routes` (the route
 users get), with the same prompts, a discarded warm-up per arm, and load, memory and Tctl recorded per
-round. Loom routes only when it is faster through `1bit serve` (or equal on speed and better on
-accuracy).
+round. **Decode is timed on a streamed request**, (completion tokens - 1) / (last token - first token), the way
+`loom-benchmark` measures every engine, so prefill and any prompt cache stay out of it; for the llama.cpp arm the
+server's own `print_timing` eval rate is recorded beside it. Never take decode as the difference of two
+requests: llama.cpp reuses cached prompt chunks even behind a leading nonce, and that overstated its decode by up
+to 2x (engine#3158, 23 Nov). Loom routes only when it is faster through `1bit serve` (or equal on speed and better on
+accuracy). **Decode counts on its own:** a Loom route that wins prefill and time to first token but
+decodes slower than the fallback is not routed, because chat users feel decode (orchestrator ruling,
+2026-11-23: Qwen3.8-27B UD-Q4_K_XL and ZAYA1-8B). Such a model is re-gated when a Loom card decodes at
+least as fast as the fallback.
 
 The box runs device arms only: the CPU arbiter and the comparison run on another machine, and each
 `box-hold` ticket (at most 45 minutes) states its RAM need and leaves at least 16 GB free. The result

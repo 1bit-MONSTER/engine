@@ -1,0 +1,20 @@
+[
+  {"name": "dspark_d0", "extra_envs": {"HL_DRAFT_DEPTH": "0"}},
+  {"name": "dspark_d1", "extra_envs": {"HL_DRAFT_DEPTH": "1"}},
+  {"name": "dspark_d2", "extra_envs": {"HL_DRAFT_DEPTH": "2"}},
+  {"name": "dspark_d4", "extra_envs": {"HL_DRAFT_DEPTH": "4"}},
+  {"name": "dspark_d5", "extra_envs": {"HL_DRAFT_DEPTH": "5"}},
+  {"name": "dspark_d6", "extra_envs": {"HL_DRAFT_DEPTH": "6"}},
+  {"name": "slots_1x1m", "extra_envs": {"HL_ROWS": "1", "HL_CONTEXT": "1048576"}},
+  {"name": "slots_2x512k", "extra_envs": {"HL_ROWS": "2", "HL_CONTEXT": "524288"}},
+  {"name": "slots_1x256k", "extra_envs": {"HL_ROWS": "1", "HL_CONTEXT": "262144"}},
+  {"name": "slots_8x128k", "extra_envs": {"HL_ROWS": "8", "HL_CONTEXT": "131072"}},
+  {"name": "prefill_2048", "extra_envs": {"HL_PREFILL_CAP": "2048"}},
+  {"name": "prefill_8192", "extra_envs": {"HL_PREFILL_CAP": "8192"}},
+  {"name": "prefill_16384", "extra_envs": {"HL_PREFILL_CAP": "16384"}},
+  {"name": "spin_device_default", "extra_envs": {"HL_SPIN_NS": "default"}},
+  {"name": "wait_blocking", "extra_envs": {"HL_WAIT_MODE": "blocking", "HL_SPIN_NS": "default"}},
+  {"name": "pool_elastic", "extra_envs": {"HL_POOL_BACKING": "elastic"}},
+  {"name": "workers_4", "extra_envs": {"HL_WORKERS": "4"}},
+  {"name": "workers_16", "extra_envs": {"HL_WORKERS": "16"}}
+]

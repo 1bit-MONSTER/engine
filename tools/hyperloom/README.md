@@ -16,15 +16,18 @@ limitations under the License.
 -->
 # Hyperloom on Strix Halo (gfx1151)
 
-[Hyperloom](https://github.com/AMD-AGI/Hyperloom) (MIT) is AMD's agentic inference optimizer. Since
-1.1 it has a supported route for a workload that is not one of its shipped frameworks:
+[Hyperloom](https://github.com/AMD-AGI/Hyperloom) (MIT) is AMD's agentic inference optimizer. This
+directory targets **1.2.0** (21 Nov 2026: InferenceSuite measures every round; bypass/Magpie and the
+single-node Ray layer are gone; the custom script is found by board name). Since 1.1 it has a supported route for a workload that is not one of its shipped frameworks:
 `--framework custom` on the scriptable path, with the entrypoint, the lever grid and the
 correctness gate supplied by the operator. Upstream also knows this board now
 (`--gpu-type radeon8060s` = gfx1151, 40 CU), so nothing here patches Hyperloom itself.
 
 | Path | What it is |
 | --- | --- |
-| `custom/` | The adapter: entrypoint, measurement, lever grid, launch line. Start at [`custom/README.md`](custom/README.md). |
+| `custom/` | The engine's HRX route (Qwen3.8-27B and other GGUFs on the installed payload): entrypoint, measurement, lever grid, launch line. Start at [`custom/README.md`](custom/README.md). |
+| `inkling-loom/` | Inkling-2-Mini on the Loom route (loom-serve, hrx-loom 0.3.0, the loom-fun card): entrypoint, gauntlet, score + gate, lever grid. [`inkling-loom/README.md`](inkling-loom/README.md). |
+| `box_ticket.sh` | Shared by both entrypoints (Hyperloom **1.2.0**): Hyperloom runs on the orchestration host, and each round validates its levers and runs as ONE `box-hold gpu` ticket on the Strix Halo box over ssh, killed by id if the round is stopped. |
 | `hrx2kineto.py` | Converts an HRX dispatch profile to a Kineto trace (Hyperloom's profile step, TraceLens, rocprof studio). With the fork's shape log it names every dispatch by its ggml op, shapes and layer, and doubles as a TraceLens extension (roofline, categories, TraceDiff). `--summary` ranks by ggml op; `--by-kernel` ranks the same profile by **kernel** with TFLOP/s and % of this box's fp16 WMMA roof, and `--by-shape` by (op, K, N) with the launch width that shape implies — the shape view is what separates "the tile is fine" from "this launch uses a fifth of the machine" (engine#3103). `--self-test` runs both rankings' fixture arms. |
 | `hrx-tracelens.sh <model> <prompt\|decode> [VAR=value ...]` | Profiles one run, converts it, and writes a TraceLens report (optionally with TraceDiff against another run). |
 

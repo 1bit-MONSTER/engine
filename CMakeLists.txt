@@ -3246,6 +3246,7 @@ endif()
 # the private npu-kernels repository. Its addons/ directory defines the target
 # onebit_npu_private, which holds register_private_addon() (npu/private_route.h) and brings
 # its own options and tests.
+include(cmake/npu-accel.cmake)   # llama-npu-server (ONEBIT_NPU_ACCEL), before the add-on so it can see the option
 set(ONEBIT_NPU_PRIVATE "" CACHE PATH "An npu-kernels checkout whose addons/ are built into 1bit (needs ONEBIT_NPU)")
 if(ONEBIT_NPU_PRIVATE)
     if(NOT ONEBIT_NPU)
@@ -3260,6 +3261,11 @@ if(ONEBIT_NPU_PRIVATE)
     endif()
     target_link_libraries(onebit PRIVATE onebit_npu_private)
     target_compile_definitions(onebit PRIVATE ONEBIT_NPU_PRIVATE)
+    # The add-on's ACCEL extension (cmake/npu-accel.cmake): linked whole into llama-npu-server, which then claims the
+    # matmuls the add-on has kernels for before the public int8 path.
+    if(ONEBIT_NPU_ACCEL AND TARGET onebit_npu_accel_ext)
+        target_sources(llama-npu-server PRIVATE $<TARGET_OBJECTS:onebit_npu_accel_ext>)
+    endif()
     # Make the dx kernels' build default visible to app/serve.cpp's GGUF -> fused dx
     # routing branch too (the add-on compiles it only onto onebit_npu_dx, PRIVATE).
     if(ONEBIT_NPU_DX_KERNELS)

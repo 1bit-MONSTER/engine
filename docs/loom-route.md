@@ -210,6 +210,8 @@ top-2 margin at the first differing token is reported), the known-answer checks 
 needle), and the prompt-count precondition holds. The speed row is measured and recorded but not compared.
 The table says which text was compared (answer only, or reasoning + answer with thinking on).
 
-The box runs device arms only: the CPU arbiter and the comparison run on another machine, and each
-`box-hold` ticket (at most 45 minutes) states its RAM need and leaves at least 16 GB free. The result
+The CPU arbiter (llama.cpp at the engine pin, CPU only) runs on the box's CPU inside the same `box-hold`
+ticket as the device arms (orchestrator 23 Nov, after ryzen's lock-up: no model loads on ryzen that the box
+can do); the comparison itself runs on another machine over ssh tunnels. Each ticket (at most 45 minutes)
+states its RAM need, arbiter included, and leaves at least 16 GB free. The result
 tables go on the model's issue, and the entry's `gate` links them.

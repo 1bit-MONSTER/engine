@@ -23,7 +23,7 @@
 #
 # Rows that cannot PASS without the hardware are marked SKIP in a VM (Lemonade hides its onebit
 # entries on a machine with no AMD GPU or NPU, and there is no HRX or NPU device to run them on):
-# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder, chat-npu-queue, chat-npu-queue-plain,
+# gpu, npu, models, chat-hrx, chat-loom, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder, chat-npu-queue, chat-npu-queue-plain,
 # chat-npu-concurrent. Everything else - mode, kernel,
 # Secure Boot, Lemonade up with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU
 # sets and the signed manifests over them, the licences and the image identity - is checked in the VM as well.
@@ -41,7 +41,7 @@ fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
 skip() {
     ROWS=$((ROWS + 1)); SKIPS=$((SKIPS + 1)); SKIPPED="${SKIPPED:+$SKIPPED,}$1"
-    case "$1" in gpu|npu|npu-power|hrx-placement|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain|chat-npu-concurrent) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
+    case "$1" in gpu|npu|npu-power|hrx-placement|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-loom|chat-npu-queue|chat-npu-queue-plain|chat-npu-concurrent) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
 # A check that DIES must not take the evidence - or the NPU - with it. Measured on the c27 board (5 Nov 2026 21:52Z):
@@ -1065,6 +1065,32 @@ shadow_verdict() {
     esac
 }
 
+# engine#3350 rc1: loom_verdict <gpu 1/0> <state: listed | absent | fetchfail:<why>> <reply> <serve's loom lines> <loom-serve
+# processes> - the Loom route row. A known answer is not enough: `1bit serve` falls back to the llama.cpp route on
+# purpose when a card is missing or a weight beside the model is not the card's (#3394/#3396), and that fallback answers
+# 391 too. So the row passes only when serve said it routed the model to loom-serve, did not say it fell back, a
+# loom-serve process ran, and the answer is right. Pure, so --self-test drives it and the row below uses the same code.
+loom_verdict() {
+    _g=${1:-0} _st=${2:-absent} _rp=${3:-} _ll=${4:-} _np=${5:-0} _m=${LOOM_MODEL:-Inkling-2-Mini-1bit}
+    [ "$_g" = 1 ] || { printf 'SKIP no /dev/kfd or no /dev/dri/renderD*: this machine has no AMD GPU, so no Loom route can run'; return 0; }
+    case "$_st" in
+        listed) ;;
+        absent) printf 'SKIP %s is not downloaded (--fetch pulls it: about 17.6 GB)' "$_m"; return 0 ;;
+        fetchfail:*) printf 'FAIL --fetch asked for %s and it could not be pulled: %s' "$_m" "${_st#fetchfail:}"; return 0 ;;
+        *) printf 'FAIL unknown state %s' "$_st"; return 0 ;;
+    esac
+    _fb=$(printf '%s\n' "$_ll" | grep -m1 'serving on the llama.cpp route')
+    [ -z "$_fb" ] || { printf 'FAIL %s fell back to the llama.cpp route: %s' "$_m" "$(printf '%s' "$_fb" | sed 's/^.*1bit serve: //' | cut -c1-200)"; return 0; }
+    _rt=$(printf '%s\n' "$_ll" | grep -m1 -- '-> loom-serve card ')
+    [ -n "$_rt" ] || { printf 'FAIL serve never said it routed %s to loom-serve (no "-> loom-serve card" line in the Lemonade log), so the answer did not come from the Loom route' "$_m"; return 0; }
+    [ "$_np" -gt 0 ] 2> /dev/null || { printf 'FAIL serve routed %s to loom-serve but no loom-serve process ran while it was loaded' "$_m"; return 0; }
+    case "$_rp" in
+        *391*) printf 'PASS %s answered 391 on loom-serve (%s)' "$_m" "$(printf '%s' "$_rt" | sed -n 's/.*1bit serve: loom route \([^:]*\):.*-> loom-serve card \([^ ]*\).*/route \1, card \2/p')" ;;
+        '') printf 'FAIL %s went through loom-serve but gave no reply' "$_m" ;;
+        *)  printf 'FAIL %s went through loom-serve but did not answer 391: %s' "$_m" "$(printf '%s' "$_rp" | tr '\n' ' ' | cut -c1-160)" ;;
+    esac
+}
+
 # engine#3350: hold_verdict <puppy 1/0> <GET /api/v1/hold status> <its body> <loaded models> <cycle outcome>
 # `1bit-heavy -- <command>` frees every model slot around heavy work through Lemonade's hold (1bit-MONSTER/lemonade#58);
 # without the endpoint it can only warn and run the command next to the loaded models, the shape that ran the box out of
@@ -1187,6 +1213,15 @@ if [ "${1:-}" = --self-test ]; then
     check SKIP "$(hold_verdict 1 200 '{"active":true,"hold_id":"hold-3","reason":"build"}' 0 '')"
     check PASS "$(hold_verdict 1 200 '{"active":false}' 2 '')"                  # a loaded model is not taken away
     check FAIL "$(hold_verdict 1 200 '{"active":false}' 0 'fail release answered 500')"
+    # chat-loom (engine#3350 rc1): the answer alone never passes - the fallback answers 391 too
+    check PASS "$(loom_verdict 1 listed '{"content":"391"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl: Inkling-2-Mini-1bit -> loom-serve card unsloth-Inkling-2-Mini-loom-r9700 (model x; gate y)' 1)"
+    check FAIL "$(loom_verdict 1 listed '{"content":"391"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl matches /m.gguf, but its card is not usable (no model.json): serving on the llama.cpp route (docs/loom-route.md)' 1)"                       # fell back, right answer
+    check FAIL "$(loom_verdict 1 listed '{"content":"391"}' '' 0)"                           # no route line at all
+    check FAIL "$(loom_verdict 1 listed '{"content":"391"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl: Inkling-2-Mini-1bit -> loom-serve card unsloth-Inkling-2-Mini-loom-r9700 (model x; gate y)' 0)"                       # routed, no loom-serve ran
+    check FAIL "$(loom_verdict 1 listed '{"content":"392"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl: Inkling-2-Mini-1bit -> loom-serve card unsloth-Inkling-2-Mini-loom-r9700 (model x; gate y)' 1)"                       # Loom, wrong answer
+    check SKIP "$(loom_verdict 0 listed '' '' 0)"
+    check SKIP "$(loom_verdict 1 absent '' '' 0)"
+    check FAIL "$(loom_verdict 1 'fetchfail:lemonade pull exited 1' '' '' 0)"
     check FAIL "$(hold_verdict 1 200 '{"active":false}' 0 '')"
     check SKIP "$(hold_verdict 0 '' '' 0 '')"
     check PASS "$(shadow_verdict 1 1 0 '1bit-update: 0 release-owned path(s) shadowed')"
@@ -2119,6 +2154,46 @@ elif [ ! -e /dev/kfd ]; then
 else
     skip chat-hrx "no onebit HRX entry is listed by Lemonade, so there is nothing to ask"
 fi
+
+# ── chat-loom: one model on the Loom route, proved by serve's own log (engine#3350 rc1) ─────────────────────────
+# The rc1 test build exists to serve Inkling-2-Mini on loom-serve. `1bit serve` falls back to the llama.cpp route when
+# the card is not usable (and that answers too), so the row reads the Lemonade log lines written DURING it and counts the
+# loom-serve processes while the model is loaded (loom_verdict). --fetch pulls the model (about 17.6 GB, ~48 GB RAM
+# with the chat preset). The model is unloaded after. ONEBIT_CHECK_LOOM_MODEL / ONEBIT_LEMOND_LOG override.
+LOOM_MODEL=${ONEBIT_CHECK_LOOM_MODEL:-Inkling-2-Mini-1bit}
+LEMLOG=${ONEBIT_LEMOND_LOG:-/var/log/lemond-onebit.log}
+_lg=0; [ -e /dev/kfd ] && ls /dev/dri/renderD* > /dev/null 2>&1 && _lg=1
+_ls=absent _lr= _ll= _lp=0
+if [ "$_lg" = 1 ]; then
+    if listed "$LOOM_MODEL" | grep -qx "$LOOM_MODEL"; then _ls=listed
+    elif [ -n "$FETCH" ]; then
+        _lc=$(command -v lemonade 2> /dev/null); [ -n "$_lc" ] || _lc=/opt/1bit-package/bin/lemonade
+        if [ ! -x "$_lc" ]; then _ls="fetchfail:no lemonade CLI on this image"
+        else
+            _t0=$(date +%s)
+            if [ -n "$KEY" ]; then LEMONADE_API_KEY=$KEY "$_lc" --port "$PORT" pull "$LOOM_MODEL" > /tmp/1bit-loom-pull.$$ 2>&1
+            else "$_lc" --port "$PORT" pull "$LOOM_MODEL" > /tmp/1bit-loom-pull.$$ 2>&1; fi
+            _prc=$?
+            if [ "$_prc" = 0 ]; then _ls=listed; say "info  fetch : pulled $LOOM_MODEL for chat-loom in $(( $(date +%s) - _t0 )) s"
+            else _ls="fetchfail:lemonade pull exited $_prc: $(tail -n 1 /tmp/1bit-loom-pull.$$ 2> /dev/null)"; fi
+            rm -f /tmp/1bit-loom-pull.$$
+        fi
+    fi
+fi
+if [ "$_ls" = listed ]; then
+    _off=$(wc -c < "$LEMLOG" 2> /dev/null || echo 0)
+    _lr=$(auth_post "{\"model\":\"$LOOM_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 17 * 23? Reply with the number only.\"}],\"max_tokens\":1024,\"temperature\":0}" \
+          "$API/api/v1/chat/completions" slow)
+    _lp=$(pgrep -f '/loom-serve' 2> /dev/null | wc -l)
+    _ll=$(tail -c +$((_off + 1)) "$LEMLOG" 2> /dev/null | grep -a '1bit serve: loom route')
+    got --header='Content-Type: application/json' --post-data="{\"model_name\":\"$LOOM_MODEL\"}" "$API/api/v1/unload" > /dev/null 2>&1
+fi
+_lv=$(loom_verdict "$_lg" "$_ls" "$_lr" "$_ll" "$_lp")
+case "$_lv" in
+    PASS*) pass chat-loom "${_lv#PASS }" ;;
+    SKIP*) skip chat-loom "${_lv#SKIP }" ;;
+    *)     fail chat-loom "${_lv#FAIL }" ;;
+esac
 NPU=$(listed '[^"]*-1bit' | grep -i 'npu' | head -1)
 [ -n "$NPU" ] || NPU=$(pick '[^"]*-NPU-1bit')
 if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then

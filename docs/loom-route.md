@@ -156,9 +156,13 @@ Loom, the llama.cpp route (the fallback), and the CPU route as the arbiter. Loom
 - **agree(Loom, CPU) >= agree(fallback, CPU)** in greedy text agreement over the fixed prompts
   (owner-approved 2026-11-23; it replaces "Loom vs fallback >= 95 %", which fails Loom whenever the
   fallback itself is the arm that is wrong, as on MiniCPM4, engine#3340), **counting only splits that are
-  not near-ties**: a route's prompt counts as a disagreement when, at the first token where its text leaves
-  the CPU's, the CPU arm's top-2 log-prob margin exceeds **1.0 nat**; a split at or under 1.0 nat is a
-  near-tie, and the row reports the near-tie count beside the score, per arm (orchestrator, 23 Nov ~20:2xZ).
+  not near-ties**: at the first token where a route's text leaves the CPU's, the split is a near-tie only
+  when the **route's own token** is within **1.0 nat** of the CPU arm's top token there (the CPU's log-prob gap
+  from its top choice to the token the route emitted). A route token further down, or not among the CPU's
+  top-N at all, counts as a disagreement, however small the CPU's own top-2 margin is: a drifting kernel that
+  picks the CPU's Nth choice at a small-margin split must not pass (orchestrator, 23 Nov ~20:2xZ, tightened
+  ~21:1xZ after the #3420 reviews). The row reports the near-tie count beside the score, per arm, and
+  `tools/logprob_agree.py` prints both (its `near-tie rule` line).
   With 8 prompts one near-tie flip, such as an end-of-turn decision, moved the plain score by 12.5 points
   (ZAYA1-8B, engine#3158), **and**
 - accuracy holds: every prompt answered (no empty-vs-empty rows), and each Loom/CPU divergence a

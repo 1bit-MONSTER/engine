@@ -565,25 +565,43 @@ def agreement(a, b, by="id"):
 
 
 def split_margin(text, ref_run):
-    """engine#3158 near-tie rule (orchestrator 23 Nov ~20:2xZ): where `text` first leaves `ref_run`'s text, the reference
-    route's top-2 log-prob margin at that token, or None when the reference carries no usable top-2 there.
-    Returns (char index, margin, ref token). When one text is a prefix of the other, the split is at the end of the
-    shorter one; if the reference is the shorter, its next token is the end-of-turn token (an empty string)."""
+    """engine#3158 near-tie rule (orchestrator 23 Nov ~20:2xZ, tightened ~21:1xZ after the #3420 reviews): where `text`
+    (the route's reply) first leaves `ref_run`'s (the CPU arbiter's), the reference's log-prob gap from its own top token
+    to the token the ROUTE emitted there. A small top-2 margin alone is not enough: a drifting kernel that picks the
+    CPU's Nth choice at a small-margin split must still count.
+
+    The route returns text only, so its token at the split is read from the reference's candidates: the longest of the
+    reference's top-N tokens that the route's text continues with from that token's start. When one text is a prefix of
+    the other the split is at the end of the shorter one; if the reference ended first, its token there is the
+    end-of-turn token (an empty string) and the route's is a candidate that matches its continuation.
+
+    Returns (char index, gap or None, reference token, route token or None, top-2 margin or None). gap is None when the
+    route's token is not among the reference's top-N (the split then counts)."""
     rt = ref_run.get("text") or ""
     i = next((j for j in range(min(len(text), len(rt))) if text[j] != rt[j]), min(len(text), len(rt)))
     acc = 0
     for t in ref_run.get("tokens") or []:
         s = t.get("token") or ""
         if acc + len(s) > i or (s == "" and acc == i):
-            tops = sorted(f32(x["lp"]) for x in (t.get("top") or []) if usable(x.get("lp")))
-            return i, (tops[-1] - tops[-2]) if len(tops) > 1 else None, t.get("token")
+            cands = [x for x in (t.get("top") or []) if usable(x.get("lp"))]
+            lps = sorted((f32(x["lp"]) for x in cands), reverse=True)
+            margin = (lps[0] - lps[1]) if len(lps) > 1 else None
+            rest = text[acc:]
+            if rest == "":   # the route ended here: its token is the end-of-turn token
+                match = [x for x in cands if (x.get("token") or "") == ""]
+            else:
+                match = [x for x in cands if (x.get("token") or "") and rest.startswith(x["token"])]
+            match.sort(key=lambda x: -len(x.get("token") or ""))
+            if not match or not lps:
+                return i, None, t.get("token"), None, margin
+            return i, lps[0] - f32(match[0]["lp"]), t.get("token"), match[0].get("token"), margin
         acc += len(s)
-    return i, None, None
+    return i, None, None, None, None
 
 
 def near_tie_score(cand_runs, ref_runs, nats=1.0):
-    """Over prompts: identical text, near-tie splits (reference margin <= nats) and counted splits (> nats, or no
-    margin readable). Score = identical + near-tie, out of the prompts both routes answered."""
+    """Over prompts: identical text, near-tie splits (the route's token within `nats` of the reference's top token) and
+    counted splits (further, or the route's token not among the reference's top-N). Score = identical + near-tie, out of the prompts both routes answered."""
     out = {"threshold_nats": nats, "identical": 0, "near_tie": 0, "counted": 0, "unreadable": 0, "splits": []}
     n = 0
     for p, (c, r) in enumerate(zip(cand_runs, ref_runs)):
@@ -594,12 +612,13 @@ def near_tie_score(cand_runs, ref_runs, nats=1.0):
         if c["text"] == r["text"]:
             out["identical"] += 1
             continue
-        i, m, tok = split_margin(c["text"], r)
-        kind = "counted" if (m is None or m > nats) else "near_tie"
+        i, gap, tok, rtok, margin = split_margin(c["text"], r)
+        kind = "counted" if (gap is None or gap > nats) else "near_tie"
         out[kind] += 1
-        if m is None:
+        if gap is None:
             out["unreadable"] += 1
-        out["splits"].append({"prompt": p, "char": i, "margin": m, "ref_token": tok, "kind": kind})
+        out["splits"].append({"prompt": p, "char": i, "margin": gap, "top2_margin": margin, "ref_token": tok,
+                              "route_token": rtok, "kind": kind})
     out["prompts"] = n
     out["score"] = out["identical"] + out["near_tie"]
     return out
@@ -808,18 +827,27 @@ def selftest():
        "reasoning_one_sided: flags only the prompts where the routes disagree on carrying reasoning")
     ok(reply_reasoning({"reasoning": "r"}) == "r" and reply_reasoning({"reasoning_content": "c", "reasoning": "r"}) == "c",
        "reply_reasoning: reasoning_content first, then reasoning (the same field the JSON records)")
-    # near-tie rule (engine#3158, 23 Nov): the reference's top-2 margin at the first differing token decides
-    tk = lambda s, lp1, lp2: {"id": 0, "token": s, "lp": lp1, "top": [{"id": 0, "token": s, "lp": lp1}, {"id": 1, "token": "x", "lp": lp2}]}
-    ref = {"text": "ab", "tokens": [tk("a", -0.1, -5.0), tk("b", -0.3, -0.9), tk("", -0.2, -1.0)]}
-    i, m, _ = split_margin("aX", ref)
-    ok(i == 1 and abs(m - 0.6) < 1e-6, "split_margin: the reference token at the first differing character (0.6 nat)")
-    i, m, tok = split_margin("abc", ref)
-    ok(i == 2 and tok == "" and abs(m - 0.8) < 1e-6, "split_margin: a reference that ends first splits at its end-of-turn token")
-    ref_big = {"text": "ab", "tokens": [tk("a", -0.1, -5.0), tk("b", -0.1, -3.0), tk("", -0.2, -1.0)]}
+    # near-tie rule (engine#3158, 23 Nov ~21:1xZ): the gap from the reference's top token to the ROUTE's token decides
+    cand = lambda *pairs: [{"id": k, "token": tt, "lp": lp} for k, (tt, lp) in enumerate(pairs)]
+    tok3 = lambda s, top: {"id": 0, "token": s, "lp": top[0]["lp"], "top": top}
+    ref = {"text": "ab", "tokens": [tok3("a", cand(("a", -0.1), ("q", -5.0))),
+                                    tok3("b", cand(("b", -0.3), ("X", -0.9), ("Z", -3.5))),
+                                    tok3("", cand(("", -0.2), (".", -1.0)))]}
+    i, gap, rt, wt, m2 = split_margin("aX", ref)
+    ok(i == 1 and wt == "X" and abs(gap - 0.6) < 1e-6 and abs(m2 - 0.6) < 1e-6,
+       "split_margin: the route took the reference's 2nd choice, 0.6 nat below its top: a near-tie")
+    i, gap, rt, wt, m2 = split_margin("aZ", ref)
+    ok(wt == "Z" and abs(gap - 3.2) < 1e-6 and abs(m2 - 0.6) < 1e-6,
+       "split_margin: a 3rd choice 3.2 nat down counts, though the top-2 margin there is only 0.6 (the drifting-kernel case)")
+    i, gap, rt, wt, m2 = split_margin("aW", ref)
+    ok(gap is None and wt is None, "split_margin: a route token outside the reference's top-N has no gap (it counts)")
+    i, gap, rt, wt, m2 = split_margin("ab.", ref)
+    ok(i == 2 and rt == "" and wt == "." and abs(gap - 0.8) < 1e-6,
+       "split_margin: the reference ended first: its end-of-turn token vs the route's continuation token (0.8 nat)")
     runs = lambda *texts_refs: [{"runs": [x]} for x in texts_refs]
-    sc = near_tie_score(runs({"text": "aX"}, {"text": "ab"}, {"text": "aY"}), runs(ref, ref, ref_big), 1.0)
-    ok(sc["identical"] == 1 and sc["near_tie"] == 1 and sc["counted"] == 1 and sc["score"] == 2 and sc["prompts"] == 3,
-       "near_tie_score: identical + near-tie count, a split over the threshold is counted")
+    sc = near_tie_score(runs({"text": "aX"}, {"text": "ab"}, {"text": "aZ"}, {"text": "aW"}), runs(ref, ref, ref, ref), 1.0)
+    ok(sc["identical"] == 1 and sc["near_tie"] == 1 and sc["counted"] == 2 and sc["score"] == 2 and sc["prompts"] == 4,
+       "near_tie_score: identical + near-tie; a far choice and an out-of-top-N token are counted")
     ok(effective_match_by("id", True, False) == "text" and effective_match_by("id", False, False) == "text",
        "effective_match_by: one route without ids degrades the pair to text instead of reporting total divergence")
     # both routes answering with NO content is not agreement: with thinking on and a small --max-tokens a route can
@@ -877,7 +905,7 @@ def main(argv=None):
     p.add_argument("--arbiter", default="cpu",
                    help="route whose log-probs score the near-tie rule (engine#3158): default cpu, when such a route is given")
     p.add_argument("--near-tie-nats", type=float, default=1.0,
-                   help="a split counts as a disagreement only when the arbiter's top-2 margin there exceeds this")
+                   help="a split counts as a disagreement when the arbiter's log-prob gap from its top token to the route's token there exceeds this, or the route's token is not in its top-N")
     p.add_argument("--timeout", type=float, default=300.0)
     p.add_argument("--json", default=None, help="write the full report here")
     p.add_argument("--selftest", action="store_true", help="check the comparison logic and exit")
@@ -1039,7 +1067,7 @@ def main(argv=None):
                     det = ", ".join(f"p{x['prompt']}@{x['char']}:{'?' if x['margin'] is None else round(x['margin'], 3)}"
                                     f"{'' if x['kind'] == 'near_tie' else '*'}" for x in nt["splits"])
                     print(f"  near-tie rule     {nt['score']}/{nt['prompts']} (identical {nt['identical']}, near-tie splits "
-                          f"{nt['near_tie']}, counted {nt['counted']}; {a.arbiter} margin > {a.near_tie_nats} nat counts)"
+                          f"{nt['near_tie']}, counted {nt['counted']}; {a.arbiter} log-prob gap to the route's token > {a.near_tie_nats} nat counts)"
                           + (f"  [{det}]  (* = counted)" if det else ""))
                 else:
                     print(f"  near-tie rule     cannot tell -- {a.arbiter} carried no tokens with log-probs")

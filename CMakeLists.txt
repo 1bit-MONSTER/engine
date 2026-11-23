@@ -774,6 +774,11 @@ add_python_test(pr_branch_stale_check_self ${CMAKE_SOURCE_DIR}/tools/ci/pr_branc
 add_python_test(self_test_flag ${CMAKE_SOURCE_DIR}/tests/self_test_flag_test.py)
 
 add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
+# Hyperloom 1.2.0 Inkling-on-Loom workload (tools/hyperloom/inkling-loom): Hyperloom runs on ryzen and every round is ONE
+# box-hold ticket on strixhalo over ssh. The end-to-end test stubs ssh/box-hold/sudo and loom-serve, so the lever
+# validation, the ticket wiring, the gauntlet and the fail-closed gate are all exercised without a device.
+add_python_test(hyperloom_inkling_loom_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_inkling_loom_test.py)
+add_python_test(hyperloom_inkling_score_self ${CMAKE_SOURCE_DIR}/tools/hyperloom/inkling-loom/hl_score.py --self-test)
 # engine#L5 (LOOM-GPU-SWITCH): the Loom toolchain pin is three facts that are only true together -- the hrx-system
 # commit, the hrx_loom version that commit declares, and the hrx-loom-library catalog commit the same file names.
 # The self-test arms the agreement and the cannot-tell; the live check runs where a clone of the repo exists.

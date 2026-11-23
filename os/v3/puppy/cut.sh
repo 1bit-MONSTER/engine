@@ -116,6 +116,17 @@ plem=$("$P/lemond-onebit" --version 2> /dev/null | sed -n 's/^lemond version //p
 case "$plem" in *"${lpin:0:8}"*) ;; *) die "the payload's lemond is $plem, the tree pins lemonade ${lpin:0:8}" ;; esac
 bad=$(find "$P" -type f -exec sh -c 'readelf -d "$1" 2>/dev/null | grep -E "R(UN)?PATH" | grep -v "\[\$ORIGIN\]"' _ {} \; | wc -l)
 [ "$bad" = 0 ] || die "the payload has $bad RUNPATH(s) other than \$ORIGIN"
+# the rest of scripts/weekly.sh stage_package's payload steps, in its order, on THIS copy (a LEMONADE= dir is never
+# written): the catalogue offers only the NPU models whose kernel set the payload carries (engine#3287: v2026.47 listed
+# Qwen3-1.7B-NPU-1bit with no set), links out of the tree (the web app's KaTeX fonts) become copies, then the modes
+# fold. Both helpers are idempotent, so a LEMONADE= dir that already had them applied comes out the same.
+python3 "$T/tools/npu_catalogue_filter.py" "$P/bin/resources/server_models.json" "$P/1bit/npu/kernels" \
+    "$T/config/npu-catalogue-sets.json" > "$logs/npu-catalogue-filter.log" 2>&1 ||
+    { cat "$logs/npu-catalogue-filter.log"; die "npu_catalogue_filter failed"; }
+say "  $(tail -1 "$logs/npu-catalogue-filter.log")"
+bash -c 'source "$1/scripts/pack-elf.sh"; pack_localize_links "$2"' _ "$T" "$P/bin" || die "pack_localize_links failed"
+out_links=$(bash -c 'source "$1/scripts/pack-elf.sh"; pack_outside_links "$2"' _ "$T" "$P")
+[ -z "$out_links" ] || die "the payload has links that leave it: $out_links"
 bash -c 'source "$1/scripts/pack-elf.sh"; pack_normalise_modes "$2"' _ "$T" "$P"
 [ "$(find "$P" \( -perm -0020 -o -perm -0002 \) ! -type l | wc -l)" = 0 ] || die "the payload has group/other-writable paths"
 (cd "$P" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$out/payload.sha256"

@@ -73,7 +73,8 @@ loom-fetch huggingface:1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom:chat --m
   name; `gguf_sha256` + `gguf_size` name the exact checkpoint the gate measured. The size is compared
   first, so a file of another size is never hashed; an empty table never reads the model.
 - `card`: a fetched Loom package (`loom-fetch`), as a `model.json` or the directory that holds it. A
-  relative path resolves under `--loom-cards DIR`, `ONEBIT_LOOM_CARDS`, else `~/.cache/1bit/loom-cards`.
+  relative path resolves under `--loom-cards DIR`, `ONEBIT_LOOM_CARDS`, else `~/.cache/1bit/loom-cards`. Where the
+  card came from is not part of the entry: see [Card sources](#card-sources).
 - `preset`: required. Passed as `--preset=`. `loom-serve` refuses a card with several presets unless one
   is named ("select a preset explicitly (N choices)"), and most cards have several (55 of the 59 loom-fun
   cards on 21 Nov); the gate measured one preset, so the entry names it.
@@ -109,6 +110,157 @@ Each entry keeps the card's licence (the Loom programs) and the weights' licence
 licence is read from the weights repository at our pinned commit, never taken from a sibling model.
 Rebuild with `tools/loom_cards.py --build` from freshly fetched card locks; CI runs `--check`
 (offline: every `exact` claim against `models/pins.json`) and `--self-test`.
+
+## Card sources
+
+**Design note for engine#3385: no code implements it, no pin is moved, and the decision at the end is the
+owner's.**
+
+A route entry names a card by **name**; the entry says nothing about where the card came from, and no route entry,
+parser, tool or config names a source kind — `card_source` was a name in this note only when it landed (measured
+2026-11-24: `git grep card_source` matched nothing outside `third_party`). A card reaches the directory serve
+reads — `--loom-cards DIR`, `ONEBIT_LOOM_CARDS`, else `~/.cache/1bit/loom-cards` (`app/serve.cpp:1616-1622`) — one
+of two ways today:
+
+- `loom-fetch` on a published Hugging Face repo: every shipped entry's card is one (the table above),
+  pinned at the card repository's revision.
+- The 1bit OS payload: `os/v3/puppy/stage-loom.sh:96-111` downloads each file from
+  `https://huggingface.co/<repo>/resolve/<rev>/<path>` and refuses one that is not its pinned sha256 and size
+  (`os/v3/puppy/loom-cards.pin:21-101`); at boot `1bit-loom-cards` assembles it into `/data/loom-cards`, the
+  `ONEBIT_LOOM_CARDS` 10lemonade exports (`os/v3/puppy/embed/etc/init.d/10lemonade:170-172`). The download has no
+  credential path, so only public repositories are reachable through it.
+
+serve resolves the name and checks no provenance: a card in the directory routes, and one that is not there is skipped
+with one line while the model keeps the llama.cpp route (`app/serve.cpp:1662-1688`, `:1708-1712`). Two consequences
+bound the design: a private card is servable today on a box where it is installed, with no route-table change, so the
+decision is which installer may install it and which build or image may carry it; and a missing card is a skip, never
+a failure, so a build that is supposed to carry one has to assert that itself.
+
+### Why a private card is not the published case
+
+A card is `model.json`, its metadata and its `program/*.loom` sources (`os/v3/puppy/loom-cards.pin:21-101` lists one
+card's files). `loom-serve` registers it from those sources at load, and at the pin a deployment that is missing a leaf
+registers as `failed` with the missing-file diagnostic rather than being satisfied from anywhere else: "no alternate
+source directory or precompiled artifact can satisfy a missing leaf" (hrx-system `e2c41a72`, the
+`config/loom.config:61` pin, `loom/src/loom/serve/fixture/README.md:206-210`). So a package
+that carries a card carries our programs in readable form, the opposite of the house rule for our closed-source
+kernels: those ship only as compiled code objects and their source stays private (`docs/hrx.md:1794-1803`,
+`docs/releases.md:472-503`, `config/gpu-kernels.config:16-21`). The issue records the stronger claim for hrx-loom
+0.2.0 (no precompiled-artifact input at all); this note did not re-measure it beyond the reading above, and the pin has
+since moved to 0.3.0, so the option that waits for one starts by confirming it there.
+
+ZAYA1-8B (engine#3322) is the model that motivates this, and it is measured-only on two independent grounds: its card
+is the private one, and its row did not clear the decode bar the gate applies (the gate's speed rule below names
+Qwen3.8-27B UD-Q4_K_XL and ZAYA1-8B). A private source removes the distribution blocker only; the entry still needs a
+gate row. Its weights are public and pinned (`1bit-MONSTER/ZAYA1-8B-GGUF` in `models/pins.json`, apache-2.0), so only
+the card's programs are private.
+
+### Where a private card could be carried
+
+1. **Private builds only.** A build made for us fetches the card into the cards directory of the box it is installed
+   on; the public release and the 1bit OS payload omit it, so their copy of the entry is skipped with the existing one
+   line, and nothing distributed carries the card. Cost: no engine build is "not distributed" today — the release
+   machine's products are the release packages and the 1bit OS image (`docs/releases.md:472-503`), the packages carry
+   no card, and the image's payload carries the public Inkling card (`os/v3/puppy/loom-cards.pin`) — so this option
+   needs a build or install channel defined by its non-distribution, which is the owner's call rather than code.
+   Verification: the pin is checked by us, on the machine with the credentials; nobody outside can check it.
+2. **A compiled card.** A card that `loom-serve` accepts as compiled code objects, the shape the engine already
+   uses for the private HIP kernels, shipped under `LICENSE-BINARY`/`NOTICE-BINARY` with the source in the private
+   repository. This is the only option that puts ZAYA on Loom for a public-release user while the source stays private,
+   and it needs the vendor path the pin does not have today (see above); the gate would then measure the compiled
+   artifact. Verification: the pin identifies a binary, and a user's trust is the release chain, not this pin.
+3. **Server-side only.** The card lives on a box we run and never in a distributed package or image. The cheapest of
+   the three — no artifact, no build class — and a public-release user gets nothing from it.
+
+None of the three changes serve's lookup; they differ in where the pin lives, who can verify it, and what a leak looks
+like. In all three, a card inside a package or image that leaves us is a publication, which is why only (2) can ship
+one on purpose.
+
+### Naming the source in the table
+
+The proposed shape is a per-entry `card_source` (`kind`, `repo`, `path`, `commit`, `tree_sha256`) beside `card`.
+Three shapes, ordered by how much of the source they put in the public tree:
+
+1. **No field.** The installer owns provenance and the entry keeps naming a card, as today; a box whose table the
+   public tree must not carry runs `--loom-routes FILE` (`app/serve.cpp:1624-1634`). Zero schema change, nothing about
+   the private repository in the public tree, and the private table is checked by the same
+   `tools/loom_cards.py --check --routes FILE` wherever it is run. Cost: the skip line cannot name the source that is
+   missing, and the public check tools see a plain entry.
+2. **`card_source` per entry**, as proposed. It puts the private repository's name and the pinned commit in a public
+   file, which is a disclosure decision of its own: the tree already keeps private repositories out of the public pins
+   file for that reason (`tools/pin_watch.py:285-296`, `docs/model-pins.md:200-202`). It also needs both gates
+   changed in one commit: `app/loom_route.h:161` refuses a route key it does not know (`:164-171`, held by
+   `tests/loom_route_test.cpp:89-91`), so a table carrying `card_source` makes serve refuse the whole table at startup
+   while `tools/loom_cards.py --check` passes it today (measured 2026-11-24: a copy of `config/loom-routes.json` with
+   `card_source` added answers `loom-cards check: 0 errors`).
+3. **A source map** beside `config/loom-cards.json` (card name -> kind + pin). Same publication question as (2),
+   routing and provenance stay apart, and one file is validated instead of every entry.
+
+### How a pin is verified
+
+The published case pins two things: the card repository's revision (`config/loom-cards.json`, `revision`) and, at OS
+staging, every file's sha256 and size (`os/v3/puppy/loom-cards.pin:21-101`, refused file by file at
+`os/v3/puppy/stage-loom.sh:106-107`). A private card's pins are the same two ideas with a path:
+
+- **`commit` + `path` already fixes the content in git's object model**: the tree at `path` in `commit` names every
+  entry by mode, name and blob hash, and `scripts/fetch-private.sh:52-56` refuses a checkout whose HEAD is not the
+  pinned commit. For a fetch that goes through git, that is the whole pin.
+- **`tree_sha256`** as proposed is a second identifier over the installed files, and it is not git's tree hash (that
+  also covers modes and object names), so its definition has to be written down exactly: sha256 over the sorted
+  `<path> <sha256>` lines of the regular files under `path`, symlinks refused. The existing shape is the OS payload's
+  per-file `<sha256> <size> <path>` (`loom-cards.pin:21-101`), which names the file that mismatched where a single
+  digest names nothing, and `stage-loom.sh` already verifies it. A single digest earns its keep only where the files
+  are copied rather than checked out (`stage-loom.sh --cards-from DIR`, `:102-103`).
+
+What a pin of either shape does not establish, and this design must not present as established:
+
+- that anyone reviewed the content — only that it is the content that was pinned;
+- the weights: the card's own `model.json.lock` and the entry's `match.gguf_sha256` do that, and the lock binds the
+  weights' repositories and revisions, not the card's own programs (`tools/ci/loom_coverage_check.py:132`);
+- that a build carries the card: a missing card is a skip (`app/serve.cpp:1680-1684`), so a build that is supposed to
+  carry one needs its own assertion, the shape `scripts/fetch-private.sh:56-57` already performs with `require=`;
+- anything to a user of a distributed build. Only we hold the private repository, so a private pin is a
+  reproducibility device for us; a user's trust in a shipped card is the release chain, which is the (2) argument.
+
+### What the code would need
+
+If the answer is "introduce it", the work is small and the first item is the one that fails closed:
+
+1. `app/loom_route.h:161`: the source key in `kKeys` and its fields in `LoomRoute`, in the same change that adds the
+   key to the table — otherwise serve refuses every table that carries it. The parse also has to refuse a source kind
+   the build cannot use, not fall back to the published path.
+2. `config/loom-routes.json` (or the private table) and this doc: the schema, with the source present only where the
+   build that ships the table may carry the card.
+3. `app/serve.cpp:1616-1622`, `:1708-1712`: unchanged lookup. The source drives the skip line and the fetch, not the
+   load; a card installed in the directory routes exactly as it does now.
+4. The installer. `scripts/fetch-private.sh:40-56` is the only fetch with credentials and a fail-closed checkout, and
+   its pin shape (`repo=`, `sha=`, `path=`, `require=`) is `config/gpu-kernels.config:24-27`; it prints
+   `<dest>/<path>` for a build to consume and does not install a card, so a card install adds the copy step plus the
+   no-link-out property serve enforces on a card (`app/loom_route.h:368-379`). The card's own files are small — the
+   one the OS payload carries is 79 files, 13,147,388 bytes (`os/v3/puppy/loom-cards.pin:22-101`), 12.2 MB of it one
+   `tokenizer.json`, so ~0.9 MB of programs and metadata — and the weights stay the public GGUF.
+5. `tools/loom_cards.py`: `--check` lets a route key the runtime refuses pass CI (measured above), so it gains the
+   arm that refuses it, plus a shape-only or refused private source in a public tree; `--self-test` grows the arm. The
+   card map cannot describe a private card as it stands either — a card's `repo` must be `loom-fun/`
+   (`tools/loom_cards.py:214`) — so the `none`/`gap` row for ZAYA1-8B (`config/loom-cards.json`) needs a fifth kind or
+   the card stays out of the map. `tools/ci/loom_coverage_check.py` reads card trees and stays advisory.
+6. Distribution. Under (1) and (3) nothing ships: `NOTICE` is unchanged, and the new row is the negative one — a
+   release/OS check that a public package or image does not carry the private card, which no row asserts today. Under
+   (2) the compiled card is a private component: `NOTICE-BINARY` and `LICENSE-BINARY` beside the existing two
+   (`docs/releases.md:472-503`), and `os/v3/puppy/stage-loom.sh:102-105`, which can stage only from a public URL or a
+   local directory today.
+7. Gate. The rule is unchanged; a row can only be produced on a machine that holds the card, and the entry's `gate`
+   link is public.
+
+### The open decision
+
+**Which builds may carry a private Loom card.** That is the owner's, and it is RFC-gated before code: CONTRIBUTING puts
+"a change to how pins move" in Discussions, with a maintainer recording accept or decline in the thread
+(`CONTRIBUTING.md:51-70`). The three options are above; (2) is the only one that reaches a public-release user with the
+source still private, and its first step is confirming the premise at the pinned 0.3.0. Until the owner answers,
+nothing in this section is implemented: no `card_source` key, no parser change, no pin moved. If the answer is
+"declined", the reason is recorded here; if "accepted", the chosen option and the list above are the implementation and
+the RFC is its link.
 
 ## Lifecycle
 

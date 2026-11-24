@@ -17,6 +17,32 @@ limitations under the License.
 
 # Known issues
 
+## engine#3372 — strixhalo hard reset (reset reason 0x00800800, internal CPU shutdown event): not reproduced in any arm
+
+**Status: CLOSED 2026-11-24 — closed as not reproducible, not as fixed at source** (the same disposition as engine#370).
+The box was reset from firmware with `reset reason 0x00800800` (internal CPU shutdown event) on 2026-11-23 06:29Z while
+a GPU ticket and an NPU ticket were running in separate lanes. The controlled series that followed did not reproduce
+it, and it corrected the premise:
+
+| arm | workload (one `box-hold both` ticket each) | result |
+|---|---|---|
+| **T1** GPU alone | installed `1bit` e697c40a, Qwen3.8-27B UD-Q4_K_XL sha `2a5f3565`, `--device hrx`, **20 full 16.0–16.8k-token prefills** (nonce-led, `cache_prompt:false`) | clean: 0 faults, 379–415 tok/s, Tctl 43 → 69.5 °C |
+| **T3** NPU refusal storm then GPU | 75 `aie2_alloc_resource … ret -19` lines (the same count as 05:13Z), then the same 20 prefills | clean |
+| **T4** concurrent GPU + NPU | NPU partition `forward-serve` 64/64 known answers **while** the GPU ran the same 20 prefills | clean; fclk mostly 1.6 GHz |
+
+**The premise was wrong:** the reset did not require overlapping GPU and NPU work — the two were serialised by
+`box-hold` in the reset window. The precaution that came out of it is in `box-hold` itself: every ticket takes **both**
+locks (GPU and NPU) rather than one, so no two jobs can hold the two devices at once. That rule stays.
+
+**Not established:** the firmware-side meaning of `0x00800800`. That is a vendor question, not an in-tree fix, and
+nothing in this repository changed for it.
+
+**Diagnosis assets if it recurs:** the passive 1 Hz sampler data and the 7-day capture live on strixhalo under
+`/data/dev/cl-kernel/r3372/`; T1/T3/T4's exact commands and numbers are in the closed issue's thread.
+
+**Release notes:** no code change. A recurrence should reopen engine#3372 with the capture path and the boot's
+kernel log.
+
 ## engine#3157 — the NPU-prefill -> Loom-decode KV handover: retired, measured to save nothing
 
 **Status: RETIRED — no hybrid shape is scheduled, and `--device hybrid` keeps decoding on the HRX

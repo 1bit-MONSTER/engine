@@ -17,7 +17,7 @@ limitations under the License.
 # Laya
 
 Laya picks where each request runs: it sorts each conversation into code, prose, short answer
-or long document (95.5% right), and a measured policy picks the device. The test set is 200
+or long document (96.5% right), and a measured policy picks the device. The test set is 200
 labelled requests. This is step 4 of the port (docs/PORTING.md).
 [Laya first](laya-first.md) is what comes next: Laya deciding the first request on a cold
 Lemonade, and which of our models answers it.
@@ -121,13 +121,73 @@ hand-labelled requests, 50 per class; ctest `laya_classify` fails below 90%):
 
 | Checkpoint, question | Accuracy | code | prose | short | long_doc | ms per decision |
 |---|---|---|---|---|---|---|
-| **`typed-decisions/`, size gate + three-way question** | **95.5%** | 100% | 82% | 100% | 100% | 588 |
-| root, size gate + three-way question | 92.0% | 94% | 74% | 100% | 100% | 401 |
+| **`typed-decisions/`, size gate + three-way question, after the #3355 boundary wording** | **96.5%** | 100% | 100% | 86% | 100% | 255 (ryzen) |
+| `typed-decisions/`, size gate + three-way question, before #3355 | 95.5% | 100% | 82% | 100% | 100% | 588 (Strix Halo) |
+| root, size gate + three-way question, before #3355 | 92.0% | 94% | 74% | 100% | 100% | 401 |
 | `typed-decisions/`, four-way question, no size gate | 80.5% | 100% | 62% | 90% | 70% | 1,739 |
 | root, four-way question, no size gate | 64.0% | 98% | 30% | 96% | 32% | 1,379 |
 
-Prose is the class Laya misses most, reading it as short. Confidence tracks accuracy: the least
-confident quarter is right 84% of the time, the rest 98-100%.
+The boundary rows are the ones #3355 changed: the prose option now says "even when it is only one or
+two sentences", so prose is no longer read as short, and the one-line lookups that are now read as
+prose are the 14% short miss. See "The short/prose boundary" below. Everything measured against the
+pre-#3355 wording is kept as measured, marked above.
+
+Confidence tracks accuracy: after the boundary change the least confident quarter is right 90% of
+the time and the rest 96-100%.
+
+### The short/prose boundary (engine#3355)
+
+Release-check's prose probe, `Summarise what tides are and why they happen, in two sentences.`
+(63 characters, 18 tokens), came out **short 0.62 / prose 0.31** (confidence 0.23) on the shipped
+`typed-decisions/` checkpoint, so the `laya-auto` row would route it to the short row's
+Qwen3-0.6B instead of the prose row's ZAYA1-8B and fail 1 of 3 (docs/laya-first.md §7).
+
+The class descriptions, not the model weights, caused it: prose said "several paragraphs of
+explanation, writing, advice or a story" and short said "one word, one number or one sentence", so
+a request for a two-sentence explanation matched neither and landed in short.
+
+**It cannot be a size threshold.** On the 200 labelled requests prose is 34-79 characters / 10-19
+tokens (median 55 / 14) and short is 2-55 characters / 3-18 tokens (median 26 / 9); the probe (63
+characters, 18 tokens) sits inside both ranges. Length does not separate the two classes, so the
+class descriptions have to say where the boundary is.
+
+**Decision.** A request that asks for something composed — an explanation, summary, piece of
+writing, advice or a story — is `prose` even when it asks for only a sentence or two; `short`
+stays a one-line lookup (a word, number, name, date, definition, translation or greeting).
+`request_class_question()` in `laya/route.cpp` (variant 0, the wording `serve` asks) now names
+that case in the prose option:
+
+- prose: "an explanation or summary, or a piece of writing, advice or a story, even when it is only
+  one or two sentences"
+- short, code and long_doc: unchanged.
+
+Measured on ryzen with the CPU scorer on the `typed-decisions/` safetensors (2026-11-24):
+
+| | before #3355 | after |
+|---|---|---|
+| release-check prose probe | short 0.62 / prose 0.31, confidence 0.23 | **prose 0.53** / short 0.40, confidence 0.20 |
+| 200 labelled requests | 191/200 = 95.5% | 193/200 = **96.5%** |
+| prose | 41/50 = 82% | **50/50 = 100%** |
+| short | 50/50 = 100% | 43/50 = 86% |
+| code, long_doc | 50/50, 50/50 | 50/50, 50/50 |
+
+The nine prose cases that used to read as short all moved to prose (every prose miss is gone); the
+seven that moved the other way are one-line lookups ("Who wrote Hamlet?", "Define 'ephemeral'.", "Is
+a tomato a fruit?", "What does GPU stand for?" and three more). They still get an answer — from the
+prose row's ZAYA1-8B instead of the short row's Qwen3-0.6B — so the trade is cost, not correctness.
+Nothing else moved: code and long_doc are unchanged, and the other two release-check probes are
+unchanged (code 0.47, short 0.54).
+
+**Regression.** `tests/laya_class_boundary_cases.json` holds the three release-check probes plus the
+one- and two-sentence explanation asks this decision covers, run by ctest `laya_class_boundary` at a
+100% floor (`laya_classify_eval --min-accuracy 100 --per-case`). It is a separate file on purpose:
+the 200-case corpus's 90% floor cannot see one case move, which is how this shipped — the probe was
+one of the nine prose misses and `laya_classify` stayed green. It needs the same checkpoint as
+`laya_classify` and skips without `ONEBIT_LAYA_ROUTE_MODEL`.
+
+**Known limit.** The paraphrase "Explain what tides are and why they happen, in two sentences." is
+still a near-tie under this wording (prose 0.46 / short 0.47), so it is not in the fixture: the
+change moves the release-check probe and the one-sentence variants, not every paraphrase of it.
 
 **Why every class goes to one device.** The policy may only change a row for a measured net
 gain, and on Strix Halo none exists yet. When this was written (2026-09-28) the one device was
@@ -241,6 +301,13 @@ once. Next is the NPU.
 Answers match Vulkan's probabilities within about 1e-3. Asked directly on Vulkan: typed-decisions
 F16 95.5% at 36 ms; the English GGUF 93.0% (Q8_0) and 91.5% (F16), so the typed-decisions
 checkpoint stays the router's. `tests/laya_gguf_route.sh` covers the daemon wiring without a GPU.
+
+These numbers are from before #3355's short/prose boundary wording and were not re-measured. The
+GGUF daemon is asked the engine's own question (`classify_request_gguf` in `app/serve.cpp`, the
+same `request_class_question()`), so the boundary change applies to it too. The appliance image as
+shipped does not carry the GGUF: `/etc/1bit/laya-files` names the five checkpoint files and no
+GGUF, and the image has no ggmlc `laya` daemon binary, so `serve --laya` there runs the C++ scorer
+this section's first row measures.
 
 **Other languages.** The 150 model-decided cases machine-translated into Spanish, German,
 Japanese, Chinese, Hindi and Russian (Qwen3-Coder-30B-A3B, greedy; 682 kept after dropping replies

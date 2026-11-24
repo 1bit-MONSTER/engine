@@ -1,0 +1,55 @@
+{
+ "about": "The short/prose boundary the release-check laya-auto row depends on (engine#3355): a request that asks for an explanation, summary or piece of writing is prose even when it asks for only a sentence or two, while short is a one-line lookup (a word, number, name, date, definition, translation or greeting). The three release-check probes are here too, so a wording or checkpoint change that moves one of them is caught by name.",
+ "classes": [
+  "code",
+  "prose",
+  "short",
+  "long_doc"
+ ],
+ "cases": [
+  {
+   "class": "prose",
+   "text": "Summarise what tides are and why they happen, in two sentences."
+  },
+  {
+   "class": "prose",
+   "text": "Summarise the causes of inflation in one sentence."
+  },
+  {
+   "class": "prose",
+   "text": "Describe how rainbows form, in two sentences."
+  },
+  {
+   "class": "prose",
+   "text": "Write two sentences about why the sky is blue."
+  },
+  {
+   "class": "prose",
+   "text": "Explain photosynthesis in simple terms."
+  },
+  {
+   "class": "short",
+   "text": "Say hello in five words."
+  },
+  {
+   "class": "short",
+   "text": "What's 17*23?"
+  },
+  {
+   "class": "short",
+   "text": "Translate 'good morning' to Japanese."
+  },
+  {
+   "class": "short",
+   "text": "What is the boiling point of water in Fahrenheit?"
+  },
+  {
+   "class": "short",
+   "text": "hi"
+  },
+  {
+   "class": "code",
+   "text": "Write a Python function that reverses a linked list."
+  }
+ ]
+}

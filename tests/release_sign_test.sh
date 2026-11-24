@@ -39,11 +39,17 @@ py sign "$t/SHA256SUMS" --key "$t/seed.raw" --key-id test-v1 > /dev/null 2>&1; c
 py verify "$t/SHA256SUMS" "$t/SHA256SUMS.sig" --pub "$t/pub.raw" > /dev/null 2>&1; check $? "verify: exit 0 with the release key (raw)"
 py verify-image "$t/1bit-os-puppy-vT.img" "$t/SHA256SUMS" "$t/SHA256SUMS.sig" --pub "$t/pub.hex" > /dev/null 2>&1
 check $? "verify-image: exit 0 for the released image (hex key)"
-cp "$t/1bit-os-puppy-vT.img" "$t/x.img"; printf 'X' | dd of="$t/1bit-os-puppy-vT.img" bs=1 seek=4096 conv=notrunc 2> /dev/null
+# flip one byte (XOR 0xff): writing a fixed 'X' left the random image unchanged whenever byte 4096 already was 'X'
+cp "$t/1bit-os-puppy-vT.img" "$t/x.img"
+python3 -I -c 'import sys; f = open(sys.argv[1], "r+b"); f.seek(4096); b = f.read(1); f.seek(4096); f.write(bytes([b[0] ^ 0xff]))' "$t/1bit-os-puppy-vT.img"
+cmp -s "$t/x.img" "$t/1bit-os-puppy-vT.img" && { echo "FAIL the tampered image is not changed"; bad=$((bad + 1)); }
 py verify-image "$t/1bit-os-puppy-vT.img" "$t/SHA256SUMS" "$t/SHA256SUMS.sig" --pub "$t/pub.raw" > /dev/null 2> "$t/err"
 [ $? = 1 ] && grep -q "not the released image" "$t/err"; check $? "verify-image: exit 1 for a tampered image, and says so"
 mv "$t/x.img" "$t/1bit-os-puppy-vT.img"
-sed 's/^\(.\)/0/' "$t/SHA256SUMS" > "$t/SUMS2"; cp "$t/SHA256SUMS.sig" "$t/SUMS2.sig"
+# change the digest so it ALWAYS differs: replacing the first character with a fixed "0" left the file identical (and
+# its signature valid) whenever the random image's sha256 already began with 0 - 1 run in 16 (CI run 45317846195)
+sed 's/^0/1/;t;s/^./0/' "$t/SHA256SUMS" > "$t/SUMS2"; cp "$t/SHA256SUMS.sig" "$t/SUMS2.sig"
+cmp -s "$t/SHA256SUMS" "$t/SUMS2" && { echo "FAIL the changed SHA256SUMS is not changed"; bad=$((bad + 1)); }
 py verify "$t/SUMS2" "$t/SUMS2.sig" --pub "$t/pub.raw" > /dev/null 2>&1; [ $? = 1 ]; check $? "verify: exit 1 for a SHA256SUMS changed after signing"
 printf '%064x\n' 1 > "$t/other.hex"
 py verify "$t/SHA256SUMS" "$t/SHA256SUMS.sig" --pub "$t/other.hex" > /dev/null 2>&1; [ $? = 1 ]; check $? "verify: exit 1 against another public key"

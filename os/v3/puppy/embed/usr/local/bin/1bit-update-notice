@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 #
-# 1bit-update-notice [--once]
+# 1bit-update-notice [--once | --boot-once]
 #
 # OS updater U6 (brief OS-UPDATER.md item 6): say that a newer 1bit OS is published - NEVER install it. At most once a
 # day (a stamp on /data, so a reboot does not ask again) it runs `1bit-update --check` and writes ONE line to
@@ -23,11 +23,17 @@
 # console's status block and the web page read that file; installing stays a person's choice (console item 5).
 # notice=off in /data/1bit/update.conf turns it off. --once: one check now if the day has passed, then exit (the test);
 # without it: wait for the network, then look once an hour whether a day has passed.
+# At boot the daemon first checks the previous boot's notice: /run is NOT a tmpfs on 1bit OS (it is a directory on the
+# root overlay, whose upper is the persistent save layer in PUPMODE 12), so the file survives reboots - and after
+# installing the release it named, the console still said "update <that release>" for up to a day (the stamp is younger
+# than a day, so no look) or for good when offline. So a notice whose release is no longer newer than the running one
+# is dropped (boot_reset); one still waiting stays. --boot-once: that boot step plus one look, then exit (the test).
 set -u
 UPDATE=${ONEBIT_UPDATE:-/usr/local/bin/1bit-update}
 CONF=${ONEBIT_UPDATE_CONF:-/data/1bit/update.conf}
 STAMP=${ONEBIT_UPDATE_NOTICE_STAMP:-/data/1bit/update-notice.stamp}
 OUT=${ONEBIT_UPDATE_NOTICE_OUT:-/run/1bit-update-available}
+IDENTITY=${ONEBIT_UPDATE_IDENTITY:-/etc/1bit/release-identity}
 DAY=${ONEBIT_UPDATE_NOTICE_DAY:-86400}
 on() { [ "$(sed -n 's/^notice=//p' "$CONF" 2> /dev/null | tr -d ' \r' | head -1)" != off ]; }
 due() {
@@ -39,6 +45,9 @@ look() {
     if ! on; then rm -f "$OUT"; return 0; fi
     due || return 0
     _o=$("$UPDATE" --check 2>&1) || true
+    # no answer (no network yet, a rate limit): change nothing - neither the stamp (so the next hourly look asks again
+    # instead of a day later) nor the notice (an offline box keeps telling what it last knew). Review of #3457.
+    printf '%s\n' "$_o" | grep -q '^running:' || return 0
     mkdir -p "$(dirname "$STAMP")" 2> /dev/null && touch "$STAMP"
     if printf '%s\n' "$_o" | grep -q '^an update is available'; then
         # "<channel>: <tag> (<date>[, pre-release])" -> "<tag> <channel> <date>"; only the safe charset reaches the file
@@ -48,5 +57,25 @@ look() {
     rm -f "$OUT"
 }
 if [ "${1:-}" = --once ]; then look; exit 0; fi
+# boot_reset: the last boot's notice is kept only while the release it names is still newer than the one running.
+# After installing it (or anything later) the running tag has caught up and the line is dropped - the bug (see the
+# header); after a plain reboot the update is still waiting, so the line stays. Review of #3457 (six lanes): an
+# unconditional drop hid a still-true notice for up to a day, or for good offline. Same order as 1bit-update's
+# update_ver_gt: vYYYY.WW[-rcN], a final after its own rcs; a tag that cannot be read is dropped.
+boot_reset() {
+    [ -f "$OUT" ] || return 0
+    _nt=$(awk '{ print $1; exit }' "$OUT" 2> /dev/null)
+    _rt=$(sed -n 's/^payload=lemonade-onebit-//p' "$IDENTITY" 2> /dev/null | head -1)
+    python3 -I -c '
+import re, sys
+def ver(t):
+    m = re.fullmatch(r"v(\d{4})\.(\d{1,2})(?:-rc(\d+))?", t)
+    return None if not m else (int(m.group(1)), int(m.group(2)), 1 if m.group(3) is None else 0, int(m.group(3) or 0))
+a, b = ver(sys.argv[1]), ver(sys.argv[2])
+sys.exit(0 if a is not None and b is not None and a > b else 1)
+' "$_nt" "$_rt" 2> /dev/null || rm -f "$OUT"
+}
+boot_reset
+if [ "${1:-}" = --boot-once ]; then look; exit 0; fi
 i=0; while [ $i -lt 60 ] && ! ip -4 route 2> /dev/null | grep -q '^default'; do sleep 10; i=$((i + 1)); done
 while :; do look; sleep 3600; done

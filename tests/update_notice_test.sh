@@ -43,6 +43,29 @@ go "$t/none"; [ "$(wc -l < "$t/calls")" = 1 ] && [ -f "$t/notice" ]; check $? "w
 go "$t/none" 0; [ ! -e "$t/notice" ]; check $? "a day later, up to date: the notice is removed"
 go "$t/hostile" 0; [ ! -e "$t/notice" ]; check $? "a tag outside the safe charset never reaches the notice file"
 go "$t/avail" 0; echo 'notice=off' > "$t/update.conf"; go "$t/avail" 0; [ ! -e "$t/notice" ]; check $? "notice=off removes the notice and writes nothing"
+# a new boot (#3449 review, then #3457's six reviews): /run is not a tmpfs on 1bit OS, so the last boot's notice is
+# still there and the day-stamp is fresh (no look due). The boot step drops it only once the release it names is no
+# longer newer than the running one; a plain reboot keeps a notice that is still true.
+gob() { CALLS=$t/calls ANSWER=$1 ONEBIT_UPDATE=$t/up ONEBIT_UPDATE_CONF=$t/update.conf ONEBIT_UPDATE_NOTICE_STAMP=$t/stamp \
+        ONEBIT_UPDATE_NOTICE_OUT=$t/notice ONEBIT_UPDATE_NOTICE_DAY=${2:-86400} ONEBIT_UPDATE_IDENTITY=$t/identity sh "$n" --boot-once; }
+running() { printf 'payload=lemonade-onebit-%s\n' "$1" > "$t/identity"; }
+rm -f "$t/update.conf"
+printf 'v2026.50 stable 2026-12-07\n' > "$t/notice"; touch "$t/stamp"; : > "$t/calls"; running v2026.50
+gob "$t/avail"; [ ! -e "$t/notice" ] && [ ! -s "$t/calls" ]
+check $? "a boot INTO the release the notice named drops it (stamp fresh: no look, no stale 'update' line)"
+printf 'v2026.50 stable 2026-12-07\n' > "$t/notice"; touch "$t/stamp"; : > "$t/calls"; running v2026.48
+gob "$t/avail"; [ "$(cat "$t/notice" 2> /dev/null)" = "v2026.50 stable 2026-12-07" ] && [ ! -s "$t/calls" ]
+check $? "a plain reboot (the update not installed) keeps the notice"
+printf 'v2026.50 stable 2026-12-07\n' > "$t/notice"; running v2026.48; printf 'garbage\n' > "$t/identity"
+gob "$t/avail"; [ ! -e "$t/notice" ]; check $? "no readable running release: the notice is dropped (it cannot be told to be newer)"
+running v2026.48; rm -f "$t/notice"
+gob "$t/avail" 0; [ "$(cat "$t/notice" 2> /dev/null)" = "v2026.50 stable 2026-12-07" ]; check $? "a boot whose day has passed writes a fresh notice"
+# offline (no network yet, a rate limit): the look changes neither the stamp nor the notice
+printf '1bit-update: could not reach GitHub (timeout): no update check now (running v2026.48)\n' > "$t/offline"
+touch -t "$(date -d "@$(( $(date +%s) - 172800 ))" +%Y%m%d%H%M.%S)" "$t/stamp"; s0=$(stat -c %Y "$t/stamp"); : > "$t/calls"
+go "$t/offline" 86400; [ "$(cat "$t/notice" 2> /dev/null)" = "v2026.50 stable 2026-12-07" ] && [ "$(stat -c %Y "$t/stamp")" = "$s0" ] &&
+    [ "$(cat "$t/calls")" = "--check" ]   # the look really ran (a fresh stamp would pass this row without asking)
+check $? "an offline look keeps the notice and leaves the stamp (the next hourly look asks again)"
 rm -f "$t/update.conf"; go "$t/avail" 0
 h=$(ONEBIT_MENU_LIB=1 ONEBIT_UPDATE_NOTICE_OUT=$t/notice sh -c '. "$1"; release_tag() { echo v2026.48; }; hostname_now() { echo box; }; first_ip() { echo 10.0.0.2; }; header_line' _ "$m")
 [ "$h" = "1bit OS v2026.48   box   10.0.0.2   update v2026.50: item 5" ]; check $? "the console header carries the notice ($h)"

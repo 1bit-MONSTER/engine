@@ -10,7 +10,7 @@
    "weights_licence": "apache-2.0",
    "match": "none",
    "arch": "llama",
-   "gap": "llama geometry, but the chat block is hand-written (BOS <s> + thinking toggle; without them it decodes garbage); the v2 package fails the gate (engine#3320)",
+   "gap": "llama geometry; the chat block is hand-written (BOS <s> + thinking toggle; without them it decodes garbage). Needs no new code: the private v2 package passes the accuracy gate on 24 prompts (engine#3320), so a published card (engine#3385) and a speed row are what a card entry needs",
    "nearest": {
     "repo": "loom-fun/unsloth-Llama-3.2-3B-Instruct-loom",
     "revision": "c6defa4cd5a8764b2cd8d4c14cb81ca0f118a76c"

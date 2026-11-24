@@ -217,6 +217,12 @@ sh /recipe/hook-rc-shutdown.sh "$skeleton/etc/rc.d/rc.shutdown" || {
     echo "build: REFUSED: could not hook 1bit-shutdown-watch into rc.shutdown" >&2; exit 1; }
 echo "   ok: rc.shutdown names each step in the kernel log (1bit-shutdown-watch)"
 
+# Puppy adds its desktop user spot to disk and kmem: raw disks and kernel memory, root in all but name, which would undercut
+# the signed updater. Only root stays in the root-equivalent groups; the desktop groups are left as they are.
+sh /recipe/harden-groups.sh "$skeleton/etc/group" || {
+    echo "build: REFUSED: could not take the non-root users out of the root-equivalent groups" >&2; exit 1; }
+echo "   ok: only root is in disk, kmem, shadow, root, sudo, wheel"
+
 # tty1 login: inittab respawns `plogin`, whose tail is `exec getty -n -l /bin/autologin`. On the
 # 2026-11-02 board boot that chain left no prompt on tty1 while the same image gave one in QEMU, and a
 # console-only machine whose console has nothing to log into is unreachable rather than headless. The entry

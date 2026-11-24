@@ -32,6 +32,16 @@ so every round is exactly one ticket on its device lock.
 
 The device-free test is `tests/hyperloom_inkling_loom_test.py` (stub ssh/box-hold/sudo and a fake loom-serve).
 
+## Measured (run (a), 23 Nov 2026)
+
+One run, **no lever kept**: 18 declared levers, and the card's own preset was best or tied on every one
+([#3366](https://github.com/1bit-MONSTER/engine/issues/3366#issuecomment-7094773570)). The two slots
+rounds that read as losses were another lane's NPU activity in that window; re-measured under the
+both-locks ticket they are ties, 130.22 (-0.7 %) and 131.39 (+0.2 %) against a fresh 131.18 baseline. The
+one invalid lever, `prefill_capacity` 16384, is above this card's `@llm.tokens` `range(1, 8192)` and was
+dropped in #3371. The record, with run (b) and the slow-window lesson, is
+[`../README.md`](../README.md#measured-runs-120-23-nov-2026).
+
 ## What changed from the 1.1.x adapter (`../custom/`)
 
 * No `HYPERLOOM_BENCHMARK_BACKEND=bypass`, no Magpie, no Ray port: 1.2.0 removed them and measures every round

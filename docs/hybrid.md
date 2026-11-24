@@ -29,10 +29,36 @@ repository (docs/npu.md). Without a provider, `--device hybrid` is `--device hrx
 In a build without HRX the decoder is the same llama-server on the CPU, so the route runs (and is
 tested) on any machine.
 
-The GPU route is moving to Loom per model ([hrx.md](hrx.md#direction-loom-on-the-gpu)). Handing
-the provider's KV cache to Loom decode instead of the HRX llama-server is tracked in
-[#3157](https://github.com/1bit-MONSTER/engine/issues/3157); until that lands, hybrid decodes on the
-llama-server as described here.
+## Loom: the handover is retired
+
+The GPU route is moving to Loom per model ([hrx.md](hrx.md#direction-loom-on-the-gpu)), but handing
+the provider's KV cache to Loom decode instead of the HRX llama-server is **retired**, and hybrid
+decodes on the llama-server as described here. Two measurements recorded in
+[#3157](https://github.com/1bit-MONSTER/engine/issues/3157) closed it:
+
+- **A Loom model re-prefills its own prompt, and there is no way to hand it one.** At the pinned
+  loom-serve (ROCm/hrx-system `e2c41a720363`, hrx-loom 0.3.0 — `config/loom.config`; the same
+  check at 0.2.0's `0cd370f2baaa`) a *generative* Loom model takes its prompt only as chat text:
+  `/v1/sequences` is accepted only in ENCODE mode, and a generative request to it is answered
+  `404 ... use the model's declared endpoint or /v1/checkpoints/NAME`
+  (`loom/src/loom/serve/service/text/service.c:244-261`). So a prefilled KV cache cannot be
+  delivered to Loom: an NPU prefill in front of it adds its own time and Loom still prefills the
+  prompt. Measured on strixhalo 2026-11-22: replaying a 780-token prompt as text costs 62-65 ms on
+  Qwen3-0.6B, and Loom's own prefill is 8.1-15.2k tok/s on that card and 362-576 tok/s on
+  Qwen3.8-27B — the handover can save none of it.
+- **The co-execution re-scope failed its accuracy gate.** [#3157](https://github.com/1bit-MONSTER/engine/issues/3157)
+  was re-scoped on 2026-11-23 to NPU + GPU *co-execution* for the 27B's prefill, against a public
+  1,335 tok/s-at-8K bar. Its GPU half, [#3349](https://github.com/1bit-MONSTER/engine/issues/3349)
+  (int4 x int4 on the GPU matrix units), closed **NOT_PLANNED** the same day: the weight-only mean
+  KLD was 0.0678 (int4-k128 RTN) and 0.0499 (AMD Quark AWQ int4-k128) against the 0.01 gate and the
+  shipped UD-Q4_K_XL's 0.0052, before the activations a real iu4 x iu4 kernel also needs. The
+  baseline that bar was set against, measured at 8,205 prompt tokens: 396-451 tok/s on the fallback
+  and 524-537 tok/s on Loom.
+
+No hybrid shape is scheduled. `--device hybrid` still serves as this page describes and is the only
+handover that exists; Loom stays a whole-model GPU route ([loom-route.md](loom-route.md)) and the
+NPU stays its own route ([npu.md](npu.md)). The decision is recorded in
+[KNOWN-ISSUES.md](../KNOWN-ISSUES.md), under engine#3157.
 
 ## What happens per request
 

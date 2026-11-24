@@ -301,10 +301,11 @@ update_check() {   # [channel]: prints the answer; always exit 0 (an update chec
     _ch=$(update_channel "${1:-}") _run=$(update_running)
     _j=${ONEBIT_UPDATE_API_JSON:-}
     if [ -z "$_j" ]; then
-        mkdir -p /tmp/1bit-update; _j=/tmp/1bit-update/releases.json
+        [ -n "${WORK:-}" ] || work_dir
+        _j=$WORK/releases.json
         if ! curl -sS --proto =https --tlsv1.2 -m 20 -H 'Accept: application/vnd.github+json' -o "$_j" "$UPDATE_API" \
-                2> /tmp/1bit-update/check.err; then
-            say "1bit-update: could not reach GitHub ($(head -c 160 /tmp/1bit-update/check.err)): no update check now (running ${_run:-unknown})"
+                2> "$WORK/check.err"; then
+            say "1bit-update: could not reach GitHub ($(head -c 160 "$WORK/check.err")): no update check now (running ${_run:-unknown})"
             return 0
         fi
     fi
@@ -324,6 +325,39 @@ update_check() {   # [channel]: prints the answer; always exit 0 (an update chec
     esac
     [ -n "$(_v sig_url)" ] || say "note: $(_v tag) carries no SHA256SUMS.sig, so --latest will refuse it (only signed images are installed)"
     return 0
+}
+
+# ── the private work dir (security review, 24 Nov) ────────────────────────────────────────────────────────────────
+# Everything this run writes, mounts or reads back lives in ONE directory made fresh for it: `mktemp -d` creates a new
+# random name atomically with mode 0700, so nothing planted in advance - a pre-created /tmp/1bit-update, a symlink in
+# it - is ever followed. Root (an install) works under /run (root's own tmpfs; /tmp is world-writable and on Puppy a
+# symlink); a person's --check under $TMPDIR. WORK= is set by work_dir; work_done removes it only after the mounts in
+# it are gone (the ESP is mounted there: an rm -rf over a live mount would empty the ESP).
+work_dir() {
+    _base=${TMPDIR:-/tmp}
+    [ "$(id -u)" = 0 ] && [ -d /run ] && [ ! -L /run ] && _base=/run
+    WORK=$(mktemp -d "$_base/1bit-update.XXXXXX") || { echo "1bit-update: cannot make a private work dir in $_base" >&2; exit 2; }
+    chmod 700 "$WORK"
+}
+work_done() {
+    [ -n "${WORK:-}" ] && [ -d "$WORK" ] || return 0
+    _w=$(readlink -f "$WORK")
+    if awk -v w="$_w/" 'index($2, w) == 1 { found = 1 } END { exit !found }' /proc/mounts 2> /dev/null; then
+        echo "1bit-update: $WORK still has a mount in it: left in place" >&2; return 0
+    fi
+    rm -rf "${WORK:?}"
+}
+# safe_dir <dir>: create it 0700, or accept an existing one only when it is a real directory (not a link), owned by
+# root and not group/other-writable: /data is shared with people's files, and a planted /data/updates would otherwise
+# receive (and serve back) what root downloads and decompresses
+safe_dir() {
+    [ -L "$1" ] && { say "1bit-update: REFUSED: $1 is a symbolic link"; return 1; }
+    if [ ! -e "$1" ]; then mkdir -m 700 "$1" || return 1; fi
+    [ -d "$1" ] || { say "1bit-update: REFUSED: $1 is not a directory"; return 1; }
+    _o=$(stat -c %u "$1") _m=$(stat -c %a "$1")
+    [ "$_o" = 0 ] || { say "1bit-update: REFUSED: $1 is owned by uid $_o, not root"; return 1; }
+    case $_m in *[2367]?|*[2367]) say "1bit-update: REFUSED: $1 is writable by others (mode $_m)"; return 1 ;; esac
+    chmod 700 "$1"
 }
 
 # ── --latest (OS updater U2): a SIGNED download, then the same slot install ──────────────────────────────────────
@@ -358,7 +392,8 @@ update_prune() {
 }
 update_latest() {   # <channel> <download-only 1/''>: sets src= to the verified .img for the install below, or exits
     _ch=$(update_channel "${1:-}") _run=$(update_running)
-    _j=$UPDATE_DIR/releases.json; mkdir -p "$UPDATE_DIR" || die "cannot create $UPDATE_DIR"
+    safe_dir "$UPDATE_DIR" || die "$UPDATE_DIR is not a private root directory"
+    _j=$WORK/releases.json
     if [ -n "${ONEBIT_UPDATE_API_JSON:-}" ]; then cp "$ONEBIT_UPDATE_API_JSON" "$_j"
     else update_get "$UPDATE_API" "$_j" || die "could not reach GitHub for the release list (no update now)"; fi
     _a=$(update_pick "$_j" "$_ch" "$_run")
@@ -373,7 +408,7 @@ update_latest() {   # <channel> <download-only 1/''>: sets src= to the verified 
     [ -n "$(_v sig_url)" ] && [ -n "$(_v sums_url)" ] || die "$_tag carries no signed SHA256SUMS (SHA256SUMS + SHA256SUMS.sig): only signed releases are installed"
     _img=$(_v image) _size=$(_v size)
     case $_img in 1bit-os-v*.img.zst) ;; *) die "unexpected image name" ;; esac
-    _d=$UPDATE_DIR/$_tag; mkdir -p "$_d" || die "cannot create $_d"
+    _d=$UPDATE_DIR/$_tag; safe_dir "$_d" || die "$_d is not a private root directory"
     # room for the compressed download, its decompressed image (about 7x) and 2 GiB of margin, before any byte moves
     _have=$(df -Pk "$UPDATE_DIR" | awk 'NR==2 {print $4}')
     _need=$(( (_size / 1024) * 8 + 2097152 ))
@@ -420,7 +455,8 @@ while [ $# -gt 0 ]; do
     shift
 done
 [ -n "$src" ] || [ "$mode" != install ] || { usage >&2; exit 1; }
-mkdir -p /tmp/1bit-update 2> /dev/null
+work_dir
+trap 'work_done' EXIT
 ( : >> "$LOG" ) 2> /dev/null || LOG=/dev/null   # a subshell: in dash a failed redirect on the special builtin `:` exits the shell, braces or not
 # --check needs no root and no installed disk: a live stick may ask too
 if [ "$mode" = check ]; then update_check "$channel"; exit 0; fi
@@ -503,7 +539,7 @@ if [ "$mode" = shadowed ]; then
 fi
 
 # ── GRUB: read the config, find a slot's entries, write the default ──────────────────────────────────────────
-esp_mount=/tmp/1bit-update/esp
+esp_mount=$WORK/esp
 # Is it mounted? Compare against /proc/mounts' OWN spelling of the path, not the one we used: Puppy's /tmp is a
 # symlink to /initrd/mnt/tmpfs/tmp, so `/proc/mounts` says /initrd/mnt/tmpfs/tmp/1bit-update/esp while the guard looked
 # for /tmp/1bit-update/esp, missed, and the second `mount` died with "already mounted" - which is how a `--status` call
@@ -591,6 +627,7 @@ cleanup() {
     [ -n "${run_owned_tmp:-}" ] && rm -f "$run_owned_tmp"
     [ -n "$srcimg" ] && { umount "$srcimg" 2> /dev/null; [ -n "${srcloop:-}" ] && losetup -d "$srcloop" 2> /dev/null; }
     unmount_esp
+    work_done
 }
 trap 'cleanup' EXIT INT TERM
 
@@ -612,7 +649,7 @@ if [ ! -d "$src" ]; then
     [ -n "$dataoff" ] || die "$src has no 1BIT-DATA partition (not a 1bit OS image)"
     srcloop=$(losetup -f --show -r -o $((dataoff * 512)) "$src" 2> /dev/null) \
         || die "cannot loop-mount $src's data partition (offset ${dataoff} sectors)"
-    srcimg=/tmp/1bit-update/src
+    srcimg=$WORK/src
     mkdir -p "$srcimg"
     mount -t ext4 -o ro "$srcloop" "$srcimg" >> "$LOG" 2>&1 || {
         logtail; die "cannot mount the data partition in $src"; }
@@ -624,7 +661,7 @@ for f in $need; do
     [ -s "$src/$f" ] || die "$src does not carry $f, which the running image is built from ($need)"
 done
 if [ -s "$src/SHA256SUMS" ]; then
-    sums=/tmp/1bit-update/sums
+    sums=$WORK/sums
     : > "$sums"
     for f in $need; do
         # strip a leading "./": `sha256sum ./*.sfs` writes "./name", and a membership test on the bare name then

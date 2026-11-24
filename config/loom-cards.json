@@ -285,7 +285,7 @@
    "weights_licence": "apache-2.0",
    "match": "none",
    "arch": "zaya",
-   "gap": "new arch (CCA attention, router, residual scales): engine#3322"
+   "gap": "zaya geometry (CCA conv attention, 17-way MLP router, learned residual scales); the port exists only in the private kit, whose package registers and answers on the shipped loom-serve 0.3.0, but the gate row on the pinned bytes does not route it (engine#3322): accuracy is a tie (near-tie rule 23/24 vs the fallback's 23/24; the one counted split is both arms' at CPU-p20, 1.111 nats), prompt tokens 24/24 MATCH, and decode through 1bit serve is not faster (short prompt 140 vs 150 tok/s, slower in every round; 2k 121 vs 123, Loom ahead 1 of 4; prefill 5.5x/2.2x and TTFT 43 vs 86 ms), so a published card (engine#3385) that decodes at least as fast is what a card entry needs"
   },
   {
    "id": "ZAYA1-8B-PM-1bit",
@@ -296,7 +296,7 @@
    "weights_licence": "apache-2.0",
    "match": "none",
    "arch": "zaya",
-   "gap": "same weights as ZAYA1-8B-1bit: engine#3322"
+   "gap": "same weights as ZAYA1-8B-1bit, so the same measured row (engine#3322): accuracy is a tie (near-tie rule 23/24 = 23/24) and decode through 1bit serve is not faster than the fallback (short 140 vs 150 tok/s, 2k 121 vs 123), so a published card (engine#3385) that decodes at least as fast is what a card entry needs"
   },
   {
    "id": "Qwen2.5-Coder-7B-Instruct-1bit",

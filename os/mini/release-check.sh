@@ -997,11 +997,15 @@ npu_dx4k6_verdict() {
         if [ ! -d "$_d" ]; then _miss="${_miss:+$_miss; }$_s-dx4k6 is missing"; continue; fi
         [ "$(head -c 13 "$_d/manifest" 2>/dev/null)" = "npumanifest 2" ] || { _miss="${_miss:+$_miss; }$_s-dx4k6 has no signed manifest"; continue; }
         { [ -f "$_d/manifest.sig" ] && [ "$(wc -c <"$_d/manifest.sig" | tr -d ' ')" = 64 ]; } || { _miss="${_miss:+$_miss; }$_s-dx4k6 has no 64-byte manifest.sig"; continue; }
-        [ -d "$_root/$_s" ] || { _miss="${_miss:+$_miss; }$_s-dx4k6 ships without its Q4NX twin $_s (it must be beside, not instead)"; continue; }
+        # the 4B ships BOTH packs, so its Q4_K set must sit beside the Q4NX one, not replace it; the 1.7B ships only the
+        # Q4_K pack (its Q4NX set is unverified, engine#3400, and was never shipped), so its dx4k6 set stands alone
+        case " ${ONEBIT_DX4K6_TWINS:-2560x9728x32x8} " in *" $_s "*)
+            [ -d "$_root/$_s" ] || { _miss="${_miss:+$_miss; }$_s-dx4k6 ships without its Q4NX twin $_s (it must be beside, not instead)"; continue; } ;;
+        esac
         _ok=$((_ok + 1))
     done
     if [ -z "$_miss" ]; then
-        printf 'PASS the Q4_K NPU sets ship signed beside their Q4NX twins (2048x6144x16x8-dx4k6, 2560x9728x32x8-dx4k6)'
+        printf 'PASS the Q4_K NPU sets ship signed (2048x6144x16x8-dx4k6; 2560x9728x32x8-dx4k6 beside its Q4NX twin)'
     else
         printf 'FAIL Q4_K NPU sets (%s of 2 good): %s' "$_ok" "$_miss"
     fi
@@ -1559,7 +1563,10 @@ next')
     rm -f "$QT/2560x9728x32x8-dx4k6/manifest.sig"
     check FAIL "$(npu_dx4k6_verdict "$QT")"
     head -c 64 /dev/zero > "$QT/2560x9728x32x8-dx4k6/manifest.sig"; rm -rf "$QT/2048x6144x16x8"
-    check FAIL "$(npu_dx4k6_verdict "$QT")"
+    check PASS "$(npu_dx4k6_verdict "$QT")"     # rc2's layout: no 1.7B Q4NX set (never shipped, #3400) - the 1.7B Q4_K set stands alone
+    rm -rf "$QT/2560x9728x32x8"
+    check FAIL "$(npu_dx4k6_verdict "$QT")"     # the 4B Q4_K set without its Q4NX twin
+    mkdir -p "$QT/2560x9728x32x8"
     rm -rf "$QT/2048x6144x16x8-dx4k6"; mkdir -p "$QT/2048x6144x16x8"
     check FAIL "$(npu_dx4k6_verdict "$QT")"
     rm -rf "$QT"

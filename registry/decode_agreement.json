@@ -1,0 +1,40 @@
+{
+ "about": "Decode correctness measured against the CPU arbiter, for a checked row a one-prompt serve check cannot clear: tests/serve_e2e.sh asks one question, and a route can answer it while its decode is wrong (engine#3340: hrx's MiniCPM4-8B said 'Paris' on an engine that dropped the last layer's attention term, while agreeing with the CPU on 2 of 8 prompts). Each entry is one tools/logprob_agree.py run -- Loom, the llama.cpp fallback and the CPU arbiter, the same GGUF and prompts, greedy, thinking off -- recording the greedy agreement, the token-id match, the KLD and the answers the model committed to. tools/registry_check.py copies the entry into the model's registry/checked.json row as its \"decode\" object, so the row states what was measured rather than only what it said; --annotate-decode re-applies them without a model run, and tools/registry_check.py --check-decode (ctest registry_decode) fails when a row loses one or claims one that is not here. The numbers are recorded from the run named in \"source\", not re-measured by CI: CI has no device and the GGUF is not in the tree.",
+ "results": [
+  {
+   "backend": "hrx",
+   "model": "MiniCPM4-8B-Q4_K_M.gguf",
+   "gguf": "openbmb/MiniCPM4-8B-GGUF@5e4751f5, MiniCPM4-8B-Q4_K_M.gguf, sha256 80b99ec4...",
+   "arbiter": "cpu",
+   "check": "tools/logprob_agree.py --thinking off --text-only --match-by text --max-tokens 64 --repeat 1",
+   "arms": {
+    "hrx": {
+     "greedy_agreement": 0.75,
+     "token_id_match": 0.649,
+     "mean_kld_nats": 0.0266,
+     "same_top_token": 1.0
+    },
+    "loom": {
+     "greedy_agreement": 0.75,
+     "mean_kld_nats": null
+    }
+   },
+   "before_fix": {
+    "greedy_agreement": 0.25,
+    "token_id_match": 0.252,
+    "mean_kld_nats": 0.305
+   },
+   "known_answers": {
+    "What is 17 * 23? Answer with the number only.": "391",
+    "List the first five prime numbers, comma separated.": "2, 3, 5, 7, 11"
+   },
+   "remaining_splits": "2 of 8 prompts still differ, at wording level (the run's own report); no confident top-1 split is left",
+   "kld": "KL(arm || cpu), over positions both arms emitted the same token; loom-serve returns no log-probs, so the Loom KLD is cannot tell -- never 0 (docs/loom-route.md)",
+   "measured": "2026-11-23",
+   "engine": "1c195c45",
+   "llama_cpp": "edf7f11bc",
+   "source": "https://github.com/1bit-MONSTER/engine/issues/3340#issuecomment-7093204931",
+   "why": "the checked row recorded a serve_e2e pass ('said Paris', engine b9812e0ca35e) on the one prompt that agreed before the fix too, so it cannot catch this class. common.get_rows_scale.f32 compiled its scale through an int64_t-only to_config_value, turning miniCPM's residual_scale 0.2475 into 0 and dropping layer 31's attention term from the residual; fixed in llama.cpp#493 (fork commit edf7f11bc was the llama.cpp in this run), carried onto main by the pin bump engine#3407 (0dcf0647: llama.cpp be41cdd60 -> 5776842df). After it, hrx and loom agree with the CPU on 6 of 8 prompts, share the CPU's top token everywhere, and both multiply 17 x 23 correctly. The before_fix column is the v2026.47 run in the same issue (engine 31a7a523be0c, llama.cpp 7737fa364bd4)."
+  }
+ ]
+}

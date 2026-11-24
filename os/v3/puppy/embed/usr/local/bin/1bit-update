@@ -426,6 +426,36 @@ update_latest() {   # <channel> <download-only 1/''>: sets src= to the verified 
     _raw=$_d/${_img%.zst}
     zstd -d -q -f -o "$_raw" "$_d/$_img" || { rm -f "$_raw"; die "could not decompress $_img"; }
     src=$_raw
+    # what was asked for: the install below checks it against the identity INSIDE the verified image
+    expect_tag=$_tag expect_ch=$_ch expect_run=$_run
+}
+
+# ── rollback protection (security review, 24 Nov): the release a --latest installs is the one it ASKED for ──────────
+# GitHub's tag_name is not signed: an old, genuinely signed image re-published under a newer tag would verify and
+# install (a rollback to a release with known holes). So --latest records what it asked for, and once the image's own
+# files are verified the install reads the tag the IMAGE carries (etc/1bit/release-identity inside its puppy_*.sfs)
+# and update_identity_check decides - before a byte is written to the other slot.
+# update_ver_gt <a> <b>: 0 when vYYYY.WW[-rcN] a is strictly newer than b (a final sorts after its own rcs)
+update_ver_gt() {
+    python3 -I -c '
+import re, sys
+def ver(t):
+    m = re.fullmatch(r"v(\d{4})\.(\d{1,2})(?:-rc(\d+))?", t)
+    return None if not m else (int(m.group(1)), int(m.group(2)), 1 if m.group(3) is None else 0, int(m.group(3) or 0))
+a, b = ver(sys.argv[1]), ver(sys.argv[2])
+sys.exit(0 if a is not None and b is not None and a > b else 1)
+' "$1" "$2"
+}
+# update_identity_check <tag in the verified image> <tag asked for> <running tag> <channel>: prints why and returns 1
+# when the image must not be installed by --latest
+update_identity_check() {
+    _it=$1 _ask=$2 _run=$3 _ch=$4
+    case $_it in v[0-9]*) ;; *) echo "the verified image carries no release identity (etc/1bit/release-identity): it cannot be checked against what was asked for"; return 1 ;; esac
+    [ "$_it" = "$_ask" ] || { echo "the verified image is $_it, but GitHub's release is named $_ask: a re-published older image is not installed"; return 1; }
+    [ -n "$_run" ] || { echo "the running release has no identity to compare with: use 1bit-update <image> deliberately"; return 1; }
+    update_ver_gt "$_it" "$_run" || { echo "$_it is not newer than the running $_run: --latest never installs an older or equal release (1bit-update <image> or --rollback do that on purpose)"; return 1; }
+    case $_ch:$_it in stable:*-rc*) echo "$_it is a release candidate and the channel is stable"; return 1 ;; esac
+    return 0
 }
 
 # sourced by tests/one_bit_update_slots_test.sh with ONEBIT_UPDATE_LIB=1: the functions above, nothing below
@@ -436,6 +466,7 @@ mode=install
 novfy=
 channel=
 dlonly=
+expect_tag= expect_ch= expect_run=   # only --latest sets these (never the environment)
 while [ $# -gt 0 ]; do
     case $1 in
         -h|--help) usage; exit 0 ;;
@@ -678,6 +709,15 @@ if [ -s "$src/SHA256SUMS" ]; then
     fi
 else
     [ -n "$novfy" ] || die "$src carries no SHA256SUMS: nothing proves the bytes are the release's own. Every 1bit OS image writes one beside the set (engine#1385: mkimage does), so this is a hand-made release directory - pass --no-verify only if you trust the copy"
+fi
+
+# --latest: the image must be the release that was asked for, newer than this one (rollback protection)
+if [ -n "${expect_tag:-}" ]; then
+    isfs=$(ls "$src"/puppy_*.sfs 2> /dev/null | head -1)
+    itag=
+    [ -n "$isfs" ] && itag=$(unsquashfs -q -cat "$isfs" etc/1bit/release-identity 2> /dev/null | sed -n 's/^payload=lemonade-onebit-//p' | head -1)
+    why=$(update_identity_check "$itag" "$expect_tag" "$expect_run" "$expect_ch") || die "$why"
+    say "identity: the verified image is $itag, as asked for, newer than the running $expect_run ($expect_ch channel)"
 fi
 
 # space: the new set, with room for the checksums and the GRUB rewrite

@@ -2601,7 +2601,8 @@ weights; it has not been separated into quantisation and anything else.
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU
-kernels (Qwen3-0.6B and Qwen3-4B; Qwen3-1.7B follows in the next release):
+kernels (the Qwen3-0.6B and Qwen3-4B Q4NX sets, and from rc2, the next release, the Qwen3-1.7B
+and 4B Q4_K `dx4k6` sets — see "Q4_K (dx4k6) packs" below):
 
 ```
 ./1bit serve -m <Qwen3 NPU model dir> --port 8000
@@ -2618,6 +2619,50 @@ token was the whole request. A request that fails before producing anything (a p
 malformed field) still gets its own status code, not a 200 stream; one that fails later reports the error as a
 last `data:` frame. A client that disconnects stops the generation at the next token, which frees the device for
 the next request. The streamed reply and the non-streamed one are the same text.
+
+### Q4_K (dx4k6) packs: Qwen3-1.7B and 4B in rc2 (npu-kernels#132)
+
+A dense GEMV on this route is bound by the weight bytes it streams, not by its arithmetic, so rc2
+adds Q4_K weights at llama.cpp's 4.5 bits per weight beside the q4_1 Q4NX ones: packs built from the
+HF checkpoint with an importance matrix (`--pure --imatrix`) and repacked losslessly into the DX4k6
+tile order. They serve from their own kernel sets, `2048x6144x16x8-dx4k6` (Qwen3-1.7B) and
+`2560x9728x32x8-dx4k6` (Qwen3-4B), which ship signed beside the Q4NX ones; the route picks the set
+from the pack's tile bytes and refuses a pack/set mismatch by name. The 4B keeps its Q4NX set beside
+them; the 1.7B's Q4NX set (`2048x6144x16x8`) has never shipped (engine#3460), so its Q4_K set
+stands alone.
+
+Measured on Strix Halo under `box-hold` with both box locks and EC balanced (npu-kernels#132, three
+alternating runs, dev sets built from the same kernels):
+
+| | imatrix Q4_K (dx4k6) | Q4NX (FastFlowLM pack) |
+|---|---|---|
+| Qwen3-1.7B, AIR verify-model top-5 vs HF BF16 | **8/8** | 7/8 |
+| Qwen3-4B, AIR verify-model top-5 vs HF BF16 | **8/8** | 8/8 |
+| Qwen3-1.7B decode | 23.1-23.2 ms/step (~43 tok/s) | 24.8-24.9 ms/step |
+| Qwen3-4B decode | 54.6-54.7 ms/step (~18.3 tok/s) | 58.6-58.9 ms/step |
+
+The gate is the one engine#3400 ran against the third-party packs: AIR's `prompts/instruct.txt`,
+8 prompts raw, 32 greedy tokens with no EOS stop, the HF BF16 `Qwen/Qwen3-1.7B@70d244cc` reference,
+and each side's token in the other's top 5 at the first divergence. On the Q4_K weights the 1.7B is
+8/8; engine#3400's two failing runs were FastFlowLM's Q4NX pack on the dx route and an import of
+AMD's `rai` 1.9.0 pack on the forward route, both 7/8 at prompt 4, step 5, where the reference is
+itself a near-tie between " specific" and " character". Plain, non-imatrix Q4_K fails the 1.7B at
+6/8, which is why the packs use an importance matrix. The 8/8 is the dev-set measurement recorded in
+npu-kernels#132; the serve-level run on rc2's signed sets is still listed there as the remaining gate.
+
+A dx4k6 set carries no `layerm`, because the batched GEMV has no DX4k6 variant yet. Concurrent
+requests on these packs therefore get slot interleaving, not batched decode; the Q4NX packs keep their
+4-user batching. That is a missing kernel, not a property of Q4_K.
+
+**What a release carries, and what the catalogue offers.** The release check fails any release
+without both signed dx4k6 sets (`os/mini/release-check.sh`, row `npu-dx4k6`); no 1.7B Q4NX set was
+ever signed, so the 1.7B ships only in its Q4_K form. The Lemonade catalogue entry `Qwen3-1.7B-NPU-1bit`
+still names FastFlowLM's Q4NX pack, and `config/npu-catalogue-sets.json` still names the Q4NX
+geometry for it, so `tools/npu_catalogue_filter.py` drops that entry from a dx4k6-only payload ("no
+kernel set 2048x6144x16x8 in the payload"): the release catalogue offers 0.6B and 4B. Switching the
+entries to our Q4_K packs (and the map to `2048x6144x16x8-dx4k6`) is a separate, pending change;
+until it lands a 1.7B Q4_K pack serves on the route (`1bit serve -m <pack dir>`) but is not offered
+by the catalogue.
 
 ### FastFlowLM's NPU2 drops: the families the route does not serve
 
@@ -2930,6 +2975,13 @@ Measured on Strix Halo, 90 W cap, PCM pad (23 Oct). Decode tok/s is the gate pha
 model's size for the two larger ones. `chat-short` is `lemonade bench --scenarios chat-short --runs
 3` (mean of three runs, 0 failed) on a private server with one model loaded at a time. The checker
 that runs the phase is private, like the kernels it runs.
+
+One row is not what a current release ships: the 1.7B was measured on its Q4NX set
+(`2048x6144x16x8`, 23 Oct), which no release has shipped, and since engine#3300 the catalogue offers
+only an NPU model whose set the payload carries, so `Qwen3-1.7B-NPU-1bit` is dropped from a release
+that carries the Q4_K set instead. rc2's 1.7B set is the Q4_K `dx4k6` one, measured 8/8 on AIR's
+top-5 gate with our imatrix pack ("Q4_K (dx4k6) packs" above); these `npu` phase numbers stay the
+Q4NX set's.
 
 - **Tokenizer:** `npu/tokenizer.cpp` reads `tokenizer.json` directly (PCRE2 for the
   pre-tokenizer regex). Added tokens with `special: false`, such as Qwen3's `<think>` and

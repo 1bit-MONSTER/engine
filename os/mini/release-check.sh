@@ -986,10 +986,12 @@ npu_sets_root() {  # the directory that holds this boot's sets: in the payload b
     fi
 }
 # rc2 (npu-kernels#132): Qwen3-1.7B and 4B also ship as Q4_K packs, served by their own sets <shape>-dx4k6 BESIDE the
-# Q4NX <shape> sets (the route picks the set by the pack's tile format and refuses a mismatch). The catalogue's
-# Qwen3-1.7B-NPU-1bit / Qwen3-4B-NPU-1bit map to the dx4k6 sets (config/npu-catalogue-sets.json), so a release that
-# lost one would have the catalogue filter drop that model without a word. Each dx4k6 set must be there, signed
-# (npumanifest 2 + a 64-byte manifest.sig), with its Q4NX twin beside it. Pure, so --self-test drives it: <sets root>
+# Q4NX <shape> sets (the route picks the set by the pack's tile format and refuses a mismatch). The 4B keeps its Q4NX
+# twin; the 1.7B's set stands alone, because its Q4NX set was never signed (engine#3400). The release carries the Q4_K
+# sets ahead of the catalogue switch: the catalogue entries still name FastFlowLM's Q4NX packs and
+# config/npu-catalogue-sets.json still names the Q4NX geometry, so tools/npu_catalogue_filter.py drops the 1.7B entry
+# from a dx4k6-only payload until those entries switch to our Q4_K packs (a separate, pending change). AIR top-5 on the
+# 1.7B Q4_K pack: 8/8 (npu-kernels#132). Pure, so --self-test drives it: <sets root>
 npu_dx4k6_verdict() {
     _root=${1:-} _miss="" _ok=0
     for _s in 2048x6144x16x8 2560x9728x32x8; do
@@ -1587,7 +1589,7 @@ next')
     if [ "$_r" = "$NT/data/npu/kernels" ]; then printf 'ok   no sets in the payload falls back to the data partition\n'
     else printf 'FAIL want the data partition, got %s\n' "$_r"; rc=1; fi
     rm -rf "$NT"
-    # rc2: the Q4_K (dx4k6) sets beside their Q4NX twins
+    # rc2: the Q4_K (dx4k6) sets, the 4B's beside its Q4NX twin, the 1.7B's alone (no 1.7B Q4NX set was signed)
     QT=$(mktemp -d)
     for _s in 2048x6144x16x8 2560x9728x32x8; do
         mkdir -p "$QT/$_s" "$QT/$_s-dx4k6"
@@ -2713,7 +2715,7 @@ else
     else fail sealed "$BAD problem(s) under $NPUROOT: a sealed set in the clear, a file not in its set's manifest, or a build tree"; fi
 fi
 
-# ── rc2: the Q4_K (dx4k6) NPU sets for Qwen3-1.7B / 4B, signed, beside the Q4NX ones (npu-kernels#132) ────────
+# ── rc2: the Q4_K (dx4k6) NPU sets for Qwen3-1.7B / 4B, signed, beside the Q4NX ones where they ship (npu-kernels#132) ──
 _v=$(npu_dx4k6_verdict "$NPUROOT")
 case "$_v" in PASS*) pass npu-dx4k6 "${_v#PASS }" ;; *) fail npu-dx4k6 "${_v#FAIL }" ;; esac
 

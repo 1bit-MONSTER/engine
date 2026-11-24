@@ -31,3 +31,17 @@ here. This directory reuses `../inkling-loom/` entirely (ticket, `box_inkling.sh
   and #3395 ships it off.
 - **Gate:** as inkling-loom: needle recall + 17*23 + greedy-text agreement (>= 80 % of replies identical over 160
   characters vs the baseline). No KLD half: loom-serve 0.3.0 exposes no logits.
+
+## Measured (run (b), 23 Nov 2026)
+
+One run, **no lever kept**, though Hyperloom's own verdict was two KEEPs -- both read against a baseline
+(54.5) measured in a slow window: the 16.8k needle prefilled at ~506 tok/s there against ~576 tok/s in every
+explore round and in the later no-lever re-measure (~12 %), and the no-lever config itself read 54.5 in that
+window and **56.09** later (+2.9 %). Against the same-window reference MTP depth 4's KEEP is **-0.7 %** --
+the window, not the lever -- and depth 5 reads **+2.0 %** (its +2.7 % was the step over depth 4, measured in
+the same later window): one single-arm comparison with no interleaved A/C/A/C and mixed rows, so it is not a
+recorded gain and the route kept the card preset (MTP depth 3, prefill 1024). Depths 0/1/2, prefill
+2048/4096/8192 and the slots presets measured below the 1 % bar; elastic pool, workers 4/16 and depth 6/7
+are unmeasured (exit 75, #3363), not losses. Per-round tables:
+[#3366](https://github.com/1bit-MONSTER/engine/issues/3366#issuecomment-7118818084); the record and the
+window lesson are [`../README.md`](../README.md#measured-runs-120-23-nov-2026).

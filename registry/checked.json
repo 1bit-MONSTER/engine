@@ -52,16 +52,16 @@
    "decode": {
     "gguf": "openbmb/MiniCPM4-8B-GGUF@5e4751f5, MiniCPM4-8B-Q4_K_M.gguf, sha256 80b99ec4...",
     "arbiter": "cpu",
-    "check": "tools/logprob_agree.py --thinking off --text-only --match-by text --max-tokens 64 --repeat 1",
+    "check": "tools/logprob_agree.py --thinking off --text-only --match-by text --max-tokens 64 --repeat 1 --prompts-file prompts24.json (the tool's built-in 8 + 16 added; set sha256 e1bb3f0a52a56f84158491fef3c03ed55fda18560c99c0c9e7af68180a40aaec)",
     "arms": {
      "hrx": {
-      "greedy_agreement": 0.75,
-      "token_id_match": 0.649,
-      "mean_kld_nats": 0.0266,
+      "greedy_agreement": 0.7917,
+      "token_id_match": 0.646,
+      "mean_kld_nats": 0.087612,
       "same_top_token": 1.0
      },
      "loom": {
-      "greedy_agreement": 0.75,
+      "greedy_agreement": 0.7917,
       "mean_kld_nats": null
      }
     },
@@ -74,13 +74,13 @@
      "What is 17 * 23? Answer with the number only.": "391",
      "List the first five prime numbers, comma separated.": "2, 3, 5, 7, 11"
     },
-    "remaining_splits": "2 of 8 prompts still differ, at wording level (the run's own report); no confident top-1 split is left",
+    "remaining_splits": "5 of 24 prompts differ at wording level (the run's own report). Near-tie rule against the CPU (1.0 nat, the CPU's top-5): the fallback arm 24/24 (identical 19 + near-tie 5, counted 0), so the shipped route still leaves no confident top-1 split; the Loom arm of the same run 23/24 (identical 19 + near-tie 4, counted 1) -- prompt 23, the CPU's top ' my' 1.544 nats above Loom's ' its'. Plain greedy agreement 79.2 % on both arms.",
     "kld": "KL(arm || cpu), over positions both arms emitted the same token; loom-serve returns no log-probs, so the Loom KLD is cannot tell -- never 0 (docs/loom-route.md)",
-    "measured": "2026-11-23",
-    "engine": "1c195c45",
-    "llama_cpp": "edf7f11bc",
-    "source": "https://github.com/1bit-MONSTER/engine/issues/3340#issuecomment-7093204931",
-    "why": "the checked row recorded a serve_e2e pass ('said Paris', engine b9812e0ca35e) on the one prompt that agreed before the fix too, so it cannot catch this class. common.get_rows_scale.f32 compiled its scale through an int64_t-only to_config_value, turning miniCPM's residual_scale 0.2475 into 0 and dropping layer 31's attention term from the residual; fixed in llama.cpp#493 (fork commit edf7f11bc was the llama.cpp in this run), carried onto main by the pin bump engine#3407 (0dcf0647: llama.cpp be41cdd60 -> 5776842df). After it, hrx and loom agree with the CPU on 6 of 8 prompts, share the CPU's top token everywhere, and both multiply 17 x 23 correctly. The before_fix column is the v2026.47 run in the same issue (engine 31a7a523be0c, llama.cpp 7737fa364bd4)."
+    "measured": "2026-11-24",
+    "engine": "0a0e550a5f2a",
+    "llama_cpp": "5776842df369",
+    "source": "https://github.com/1bit-MONSTER/engine/issues/3321#issuecomment-7134738267",
+    "why": "the 2026-11-23 8-prompt row is replaced by this 24-prompt re-run on the shipped package and the pinned bytes (engine#3321): same 24-prompt set as engine#3320 (the tool's built-in 8 + 16 added), greedy, thinking off, same GGUF, Loom on the shipped loom-serve 0.3.0 e2c41a72 with the private minicpm card (its publication is engine#3385). It is the decode half of that gate row, not a routing claim: the gate's accuracy clause fails on the Loom arm (23/24 vs the fallback 24/24 under the near-tie rule). The row exists because of engine#3340: the checked row recorded a serve_e2e pass ('said Paris', engine b9812e0ca35e) on the one prompt that agreed before the fix too, so it cannot catch this class. common.get_rows_scale.f32 compiled its scale through an int64_t-only to_config_value, turning miniCPM's residual_scale 0.2475 into 0 and dropping layer 31's attention term from the residual; fixed in llama.cpp#493 (fork commit edf7f11bc was the llama.cpp in that run), carried onto main by the pin bump engine#3407 (0dcf0647: llama.cpp be41cdd60 -> 5776842df). The before_fix column is that v2026.47 run (engine 31a7a523be0c, llama.cpp 7737fa364bd4) on the 8 built-in prompts, kept as history and not on the 24-prompt basis of the arms above. On the shipped package both llama.cpp arms agree with the CPU on 19 of 24 prompts, share the CPU's top token at every position, and both multiply 17 x 23 correctly."
    }
   },
   {

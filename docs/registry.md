@@ -90,8 +90,11 @@ the record onto the row and runs no model; `--check-decode` (ctest `registry_dec
 checked row loses its measurement or states one nothing recorded, and its `--self-test` (ctest
 `registry_check_self`) drives a scratch registry through the stale-row, annotation and refusal arms.
 The numbers are reviewed data, not re-measured by CI: CI has no device and no GGUF. MiniCPM4-8B's row
-states 75 % greedy agreement / 0.649 token-id match / 0.0266 nats mean KLD (25 % / 0.252 / 0.305 before
-the fix, llama.cpp#493, carried on main by pin `0dcf0647`).
+states 79.2 % greedy agreement / 0.646 token-id match / 0.0876 nats mean KLD on the 24-prompt set
+(engine#3321), on which the shipped route still leaves no counted split against the CPU under the gate's
+near-tie rule (24/24) while the Loom arm of the same run has one (23/24); the row is the decode half of
+that gate row, not a routing claim (25 % / 0.252 / 0.305 before the fix, llama.cpp#493, carried on main by
+pin `0dcf0647`, on the 8-prompt run the row was created from).
 
 GLM-4.7-Flash and Qwen3-Coder-30B-A3B failed on HRX until the llama.cpp pin `96f6b89` (#95).
 The pin fixes four things:

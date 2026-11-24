@@ -611,6 +611,7 @@ add_test(NAME loom_payload COMMAND sh ${CMAKE_SOURCE_DIR}/tests/loom_payload_tes
 add_test(NAME shutdown_watch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/shutdown_watch_test.sh)
 add_test(NAME update_shadow COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_shadow_test.sh)
 add_test(NAME update_check COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_check_test.sh)
+add_test(NAME update_latest COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_latest_test.sh)
 # engine#3342 end to end: the real `1bit-update` against a loop-mounted installed disk, then the new release booted as an
 # overlay and what the machine sees checked. Needs root + loop devices + getfattr/setfattr: returns 77 in CI.
 add_test(NAME update_e2e_loop COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_e2e_loop_test.sh)

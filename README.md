@@ -61,6 +61,13 @@ and our HIP kernels serves it as the fallback. The NPU engine does not change ([
    one erases and the Secure Boot notes are [docs/install.md](docs/install.md); connecting a client —
    `curl`, the web app, the phone app, the OpenAI SDKs — is [docs/clients.md](docs/clients.md).
 
+**Updating an installed machine.** `sudo 1bit-update --check` says whether a newer release is published (add
+`--channel test` for pre-releases), and `sudo 1bit-update --latest` downloads it, checks the release key's signature,
+and installs it into the other slot; the running version stays as the rollback (`sudo 1bit-update --rollback`). The
+console's item 5 does the same with a confirm, and the console header says when an update is available. These arrive
+with the first release cut after v2026.49-rc1; on an earlier machine, run `sudo 1bit-update ./<image>.img` with the
+unpacked image instead. How it decides what to trust: [docs/os-v3.md](docs/os-v3.md#in-system-updates-1bit-update---check-and---latest).
+
 **1bit OS is a Puppy Linux appliance**: `ResolutePup64`, built with woof-CE on the Ubuntu 26.04
 "resolute" base, with Lemonade Server and this engine embedded in it, running our MOK-signed
 `7.4.0-rc1-1bit` kernel rather than the distribution's. It boots **headless** by default, to a

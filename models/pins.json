@@ -1309,6 +1309,22 @@
     }
    }
   },
+  "OpenBMB/MiniCPM4-8B-GGUF": {
+   "commit": "5e4751f57b110a0318cee65ec82109bad89c12b8",
+   "pinned": "2026-11-24",
+   "used_for": [
+    "stick: Lemonade catalogue (MiniCPM4-8B-Q4_K_M.gguf)",
+    "loom: the bytes the MiniCPM4-8B port binds (engine#3321)"
+   ],
+   "files": {
+    "MiniCPM4-8B-Q4_K_M.gguf": {
+     "oid": "80b99ec4ceac302e7d474c8659e96b9f6c3bbeb73c41b2ef841c7fcb6d8250f3",
+     "size": 4965526048,
+     "lfs": true,
+     "template_sha256": "153280e3ff55d19da1398bdb3914ee2a51b80429bfaedde11d7d216c39db80f3"
+    }
+   }
+  },
   "OpenBMB/MiniCPM5-1B-GGUF": {
    "commit": "3d55fac80935ae6456986ad2384b5cbcc4d6c948",
    "pinned": "2026-11-05",

@@ -199,7 +199,11 @@ models_line() {
     fi
 }
 
-header_line() { say "1bit OS $(release_tag)   $(hostname_now)   $(first_ip)"; }
+# OS updater U6: 1bit-update-notice writes "<tag> <channel> <date>" to this file when a newer release is published;
+# the notice rides on the header line (one more status line would push item 9 off a 24-row screen, cycle 14)
+UPDATE_NOTICE=${ONEBIT_UPDATE_NOTICE_OUT:-/run/1bit-update-available}
+update_notice() { _n=$(head -c 64 "$UPDATE_NOTICE" 2> /dev/null | tr -cd 'A-Za-z0-9._ -' | awk '{print $1}'); [ -n "$_n" ] && printf '   update %s: item 5' "$_n"; }
+header_line() { say "1bit OS $(release_tag)   $(hostname_now)   $(first_ip)$(update_notice)"; }
 first_ip() { ips | awk '{print $1}'; }
 # The block is SEVEN lines on purpose: tty1 is an 80x25 text console, and a dialog that needs more room than
 # that clips its own menu (measured here: at 22 rows with a 12-line prompt, item 9 "Reboot / power off" was

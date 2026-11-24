@@ -1,0 +1,26 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#
+# 31onboard-update-notice - OS updater U6: the daily "a newer 1bit OS is published" check (1bit-update-notice), notice
+# only. rc.services waits for each init.d script, so the loop is detached; notice=off in /data/1bit/update.conf stops it
+# writing anything.
+N=/usr/local/bin/1bit-update-notice
+[ -x "$N" ] || exit 0
+case "${1:-start}" in
+    start) ( "$N" > /dev/null 2>&1 & ); echo "31onboard-update-notice: daily update check started (notice only)" ;;
+    stop) : ;;
+esac

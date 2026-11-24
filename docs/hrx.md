@@ -68,8 +68,14 @@ How a model moves:
   [loom-skills](https://github.com/loom-fun/loom-skills) and
   [weaver](https://github.com/loom-fun/weaver).
 - **Hybrid** ([#3157](https://github.com/1bit-MONSTER/engine/issues/3157)). The NPU-prefill route
-  ([hybrid.md](hybrid.md)) hands its KV cache to the HRX llama-server today; handing it to Loom
-  decode is tracked there.
+  ([hybrid.md](hybrid.md)) hands its KV cache to the HRX llama-server, and that is the only
+  handover. Handing it to Loom decode was designed and is **retired**: a generative Loom model
+  takes its prompt only as chat text and re-prefills it (`/v1/sequences` is ENCODE-only at the
+  pinned loom-serve, so a prefilled KV cannot be delivered — `service/text/service.c:244-261` in
+  ROCm/hrx-system `e2c41a720363`), and the NPU+GPU co-execution re-scope's GPU
+  half ([#3349](https://github.com/1bit-MONSTER/engine/issues/3349)) closed not-planned on a
+  measured KLD miss (0.0499 AMD Quark AWQ / 0.0678 RTN vs the 0.01 gate). Recorded in
+  [KNOWN-ISSUES.md](../KNOWN-ISSUES.md).
 
 State on 2026-11-21: `loom-serve` behind `1bit serve` is merged
 ([#3166](https://github.com/1bit-MONSTER/engine/pull/3166), [loom-route.md](loom-route.md)), and

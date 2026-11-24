@@ -17,6 +17,52 @@ limitations under the License.
 
 # Known issues
 
+## engine#3157 — the NPU-prefill -> Loom-decode KV handover: retired, measured to save nothing
+
+**Status: RETIRED — no hybrid shape is scheduled, and `--device hybrid` keeps decoding on the HRX
+llama-server ([docs/hybrid.md](docs/hybrid.md)). The issue is closed; this entry is the design
+record, and the docs point at it.**
+
+The design was L4 of the Loom GPU switch: the NPU prefills a prompt and hands its KV cache to Loom's
+decode instead of the HRX llama-server. Two measurements, both recorded in
+[#3157](https://github.com/1bit-MONSTER/engine/issues/3157), removed it.
+
+1. **A Loom model re-prefills its own prompt, and there is no way to hand it one.** At the pinned
+   loom-serve — ROCm/hrx-system `e2c41a720363` (hrx-loom 0.3.0, `config/loom.config`), and the same
+   at 0.2.0's `0cd370f2baaa` — the text service accepts a *generative* model's prompt only as chat
+   text: `loom/src/loom/serve/service/text/service.c:244-261` accepts `/v1/sequences` only in
+   ENCODE mode, and a generative request to it gets `404 Not Found`, "use the model's declared
+   endpoint or /v1/checkpoints/NAME; generative models also support
+   /v1/chat/completions/input_tokens" (the 0.2.0 file is `:247-265`). The enqueue path otherwise
+   takes only `/v1/chat/completions`, `/v1/chat/completions/input_tokens` (a count) and
+   `/v1/checkpoints/NAME` (a pin on a session Loom itself ran), so the text service has no HTTP
+   surface that takes KV or activations: an NPU prefill in front of Loom adds its own time and Loom
+   still prefills the prompt. Measured on strixhalo 2026-11-22 (the numbers are in the #3157
+   thread): replaying a 780-token prompt as text costs **62-65 ms** on Qwen3-0.6B, and Loom's own
+   prefill is **8.1-15.2k tok/s** on that card and **362-576 tok/s** on Qwen3.8-27B. A handover
+   saves none of it.
+2. **The re-scope to NPU + GPU co-execution failed its accuracy gate.** On 2026-11-23 #3157 was
+   re-scoped (orchestrator, owner-approved) to concurrent NPU + GPU prefill for Qwen3.8-27B, against
+   a public 1,335 tok/s-at-8K bar. Its GPU half,
+   [#3349](https://github.com/1bit-MONSTER/engine/issues/3349) (int4 x int4 on the GPU matrix
+   units), closed **NOT_PLANNED** the same day: the weight-only mean KLD was **0.0678 ± 0.0020**
+   (int4-k128 RTN) and **0.0499 ± 0.0013** (AMD Quark AWQ int4-k128) against the **0.01** gate and
+   the shipped UD-Q4_K_XL's **0.0052 ± 0.0002** — before the activations a real iu4 x iu4 kernel also
+   needs. The arms that bar was set against, at 8,205 prompt tokens: **396-451 tok/s** on the
+   fallback and **524-537 tok/s** on Loom. Most of the 2.5x had to come from the GPU half, so the
+   NPU half had nothing to close.
+
+**What a hybrid would need before it can be designed again:** a Loom API that imports externally
+computed KV/state — a Loom-side feature request for the owner to pass upstream, as the #3157 thread
+records — and a measured NPU prefill rate at the bar's length while the GPU runs. Neither exists at
+the pin; until they do there is nothing to build.
+
+**Docs corrected with this entry:** [docs/hybrid.md](docs/hybrid.md),
+[docs/hrx.md](docs/hrx.md) (Direction: Loom on the GPU), [docs/architecture.md](docs/architecture.md)
+and [docs/PORTING.md](docs/PORTING.md) (step 2L) described the handover as coming until this entry
+landed. The dated records in [docs/releases.md](docs/releases.md) and the README keep their entries
+as the record of what was said then.
+
 ## engine#823 — Bosgame BeyondMax board: the USB ports need the xHCI keep-awake rule
 
 **Status: MITIGATED — the ports work; the fix is a udev rule, not a driver. Verified on a host with the rule, not yet on

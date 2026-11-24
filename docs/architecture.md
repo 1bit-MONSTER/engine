@@ -47,10 +47,14 @@ the README is the short version.
 - **The NPU engine** on the XDNA 2 NPU, on our own NPU runtime with full-ELF kernel sets:
   correctness first, speed next ([npu.md](npu.md)).
 - **Hybrid**: the prompt on the NPU engine, the tokens on HRX. `1bit serve --device hybrid` hands
-  the prompt's KV cache from a prefill provider to the HRX llama-server ([hybrid.md](hybrid.md));
-  handing it to Loom decode instead is [#3157](https://github.com/1bit-MONSTER/engine/issues/3157).
-  The NPU and the GPU run at the same time; the measured cost of a busy GPU to the NPU's weight
-  stream is recorded there.
+  the prompt's KV cache from a prefill provider to the HRX llama-server ([hybrid.md](hybrid.md)).
+  Handing it to Loom decode was designed and is **retired**
+  ([#3157](https://github.com/1bit-MONSTER/engine/issues/3157)): the pinned loom-serve re-prefills
+  a generative prompt as chat text and accepts no KV import, and the NPU+GPU co-execution re-scope's
+  GPU half ([#3349](https://github.com/1bit-MONSTER/engine/issues/3349)) closed not-planned on a
+  measured KLD miss ([KNOWN-ISSUES.md](../KNOWN-ISSUES.md)). The NPU and the GPU run at the same
+  time; the measured cost of a busy GPU to the NPU's weight stream is recorded in
+  [hybrid.md](hybrid.md).
 - **ONNX Runtime**, linked in-process behind `-DONEBIT_ORT`, with our own execution provider that
   claims MatMul and runs it on the NPU runtime ([onnx.md](onnx.md), [onnx-pack.md](onnx-pack.md)).
 - ~~**DwarfStar**~~ — **removed** (owner decision 2026-11-01, out of the tree 2026-11-02): its DeepSeek V4 Flash /

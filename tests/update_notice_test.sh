@@ -43,6 +43,14 @@ go "$t/none"; [ "$(wc -l < "$t/calls")" = 1 ] && [ -f "$t/notice" ]; check $? "w
 go "$t/none" 0; [ ! -e "$t/notice" ]; check $? "a day later, up to date: the notice is removed"
 go "$t/hostile" 0; [ ! -e "$t/notice" ]; check $? "a tag outside the safe charset never reaches the notice file"
 go "$t/avail" 0; echo 'notice=off' > "$t/update.conf"; go "$t/avail" 0; [ ! -e "$t/notice" ]; check $? "notice=off removes the notice and writes nothing"
+# a new boot (cl-kernel, review of #3449): /run is not a tmpfs on 1bit OS, so the last boot's notice is still there.
+# The day-stamp is fresh (no look is due), as right after installing the release the notice named: the boot step
+# must drop it, without asking GitHub again; and at a boot whose day HAS passed, a fresh notice is written.
+gob() { CALLS=$t/calls ANSWER=$1 ONEBIT_UPDATE=$t/up ONEBIT_UPDATE_CONF=$t/update.conf ONEBIT_UPDATE_NOTICE_STAMP=$t/stamp \
+        ONEBIT_UPDATE_NOTICE_OUT=$t/notice ONEBIT_UPDATE_NOTICE_DAY=${2:-86400} sh "$n" --boot-once; }
+rm -f "$t/update.conf"; printf 'v2026.50 stable 2026-12-07\n' > "$t/notice"; touch "$t/stamp"; : > "$t/calls"
+gob "$t/avail"; [ ! -e "$t/notice" ] && [ ! -s "$t/calls" ]; check $? "a boot drops the previous boot's notice (stamp fresh: no look, no stale 'update' line)"
+gob "$t/avail" 0; [ "$(cat "$t/notice" 2> /dev/null)" = "v2026.50 stable 2026-12-07" ]; check $? "a boot whose day has passed writes a fresh notice"
 rm -f "$t/update.conf"; go "$t/avail" 0
 h=$(ONEBIT_MENU_LIB=1 ONEBIT_UPDATE_NOTICE_OUT=$t/notice sh -c '. "$1"; release_tag() { echo v2026.48; }; hostname_now() { echo box; }; first_ip() { echo 10.0.0.2; }; header_line' _ "$m")
 [ "$h" = "1bit OS v2026.48   box   10.0.0.2   update v2026.50: item 5" ]; check $? "the console header carries the notice ($h)"

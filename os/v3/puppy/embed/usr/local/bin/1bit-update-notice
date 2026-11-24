@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 #
-# 1bit-update-notice [--once]
+# 1bit-update-notice [--once | --boot-once]
 #
 # OS updater U6 (brief OS-UPDATER.md item 6): say that a newer 1bit OS is published - NEVER install it. At most once a
 # day (a stamp on /data, so a reboot does not ask again) it runs `1bit-update --check` and writes ONE line to
@@ -23,6 +23,10 @@
 # console's status block and the web page read that file; installing stays a person's choice (console item 5).
 # notice=off in /data/1bit/update.conf turns it off. --once: one check now if the day has passed, then exit (the test);
 # without it: wait for the network, then look once an hour whether a day has passed.
+# At boot the daemon first drops the previous boot's notice: /run is NOT a tmpfs on 1bit OS (it is a directory on the
+# root overlay, whose upper is the persistent save layer in PUPMODE 12), so the file survived reboots - after installing
+# the release it named, the console still said "update <that release>" for up to a day (the stamp is younger than a
+# day, so no look) or for good when offline. --boot-once: that boot step plus one look, then exit (the test).
 set -u
 UPDATE=${ONEBIT_UPDATE:-/usr/local/bin/1bit-update}
 CONF=${ONEBIT_UPDATE_CONF:-/data/1bit/update.conf}
@@ -48,5 +52,8 @@ look() {
     rm -f "$OUT"
 }
 if [ "${1:-}" = --once ]; then look; exit 0; fi
+# a new boot: no notice carries over from the last one (see the header); the first look below writes a fresh one
+rm -f "$OUT"
+if [ "${1:-}" = --boot-once ]; then look; exit 0; fi
 i=0; while [ $i -lt 60 ] && ! ip -4 route 2> /dev/null | grep -q '^default'; do sleep 10; i=$((i + 1)); done
 while :; do look; sleep 3600; done

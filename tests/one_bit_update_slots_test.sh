@@ -18,7 +18,11 @@
 # real functions over fake /data layouts. No root, no mounts, no device, no VM: the script is sourced with
 # ONEBIT_UPDATE_LIB=1, which defines its functions and returns before it touches anything.
 #
-# The case this exists for is the SECOND update (engine#1334 review): after update 1 the machine runs from /1bit-alt,
+# The boot-line rows at the end are engine#3374: the other slot's entry is built from the NEW release's own line
+# (/1bit/cmdline, which mkimage.sh writes) with only this machine's keys from the running entry - not the running
+# entry's line copied, which is what froze a release's kernel parameters at whatever the machine was installed with.
+#
+# The case the slots exist for is the SECOND update (engine#1334 review): after update 1 the machine runs from /1bit-alt,
 # the save layer still lives in /1bit (the alt slot only links to it), so update 2 targets /1bit and must keep that
 # layer as the machine's own, not refuse it as "another machine's state". update-gate.sh proves the boots on a VM;
 # this proves the decision on every CI run.
@@ -105,6 +109,53 @@ rm -rf "$DATA"; mkdir -p "$DATA/1bit"
 active=1bit
 find_save_layer "$DATA" "$active"
 [ -z "$savename" ]; check "a set with no real layer is found as none" $?
+
+# 8. engine#3374: the other slot's boot line comes from the NEW release's own parameters, not from the running entry.
+# The running entry is what 1bit-install wrote for the INSTALLED release: no printk.always_kmsg_dump=1, no pfix=, and
+# this disk's UUID pin. The release carries the image's own line, whose UUIDs name the release stick's partition.
+has() { case " $1 " in *" $2 "*) return 0 ;; esac; return 1; }
+run='pmedia=usbhd pupsfs=UUID=disk 1bit.data=UUID=disk psubdir=1bit ttm.pages_limit=31457280 nvme.quirks=1e49:1081:dmapool_align_512 pfix=nocopy,nox console=ttyS0,115200 console=tty0'
+rel='pmedia=usbhd pupsfs=UUID=stick 1bit.data=UUID=stick psubdir=1bit ttm.pages_limit=31457280 nvme.quirks=1e49:1081:dmapool_align_512 printk.always_kmsg_dump=1 pfix=copy,nox console=ttyS0,115200 console=tty0'
+got=$(slot_params "$rel" "$run" 1bit-alt); rc=$?
+[ "$rc" = 0 ] && has "$got" printk.always_kmsg_dump=1
+check "the new release's ADDED parameter arrives on the other slot's line (printk.always_kmsg_dump=1)" $?
+has "$got" pupsfs=UUID=disk && has "$got" 1bit.data=UUID=disk && ! has "$got" pupsfs=UUID=stick
+check "and the machine's UUID pin replaces the release image's [$got]" $?
+has "$got" psubdir=1bit-alt && ! has "$got" psubdir=1bit
+check "and psubdir is the slot being written" $?
+has "$got" pfix=nocopy,nox && ! has "$got" pfix=copy,nox
+check "and pfix=copy (the live stick's) becomes pfix=nocopy, as 1bit-install writes for an installed disk" $?
+has "$got" console=ttyS0,115200 && has "$got" console=tty0
+check "the release's console order is taken as it is (the LAST console= is /dev/console)" $?
+
+# a parameter a release DROPS must go: the running line still has ttm.pages_limit=31457280, the release's line does not
+got=$(slot_params 'pmedia=usbhd psubdir=1bit nvme.quirks=1e49:1081:dmapool_align_512 pfix=copy,nox console=tty0' "$run" 1bit-alt)
+! has "$got" ttm.pages_limit
+check "a parameter the release DROPS does not survive from the running entry (no ttm.pages_limit) [$got]" $?
+
+# the release's line may be the whole grub line, which is what a person copies out of an image's grub.cfg
+printf 'linux /1bit/vmlinuz pmedia=usbhd psubdir=1bit log_buf_len=64M\r\n' > "$t/cmdline-full"
+[ "$(release_headless "$t/cmdline-full")" = "pmedia=usbhd psubdir=1bit log_buf_len=64M" ]
+check "release_headless reads a grub 'linux <kernel> <params>' line (CRLF included)" $?
+printf '# the release'"'"'s boot line\n\npmedia=usbhd psubdir=1bit log_buf_len=64M\n' > "$t/cmdline-bare"
+[ "$(release_headless "$t/cmdline-bare")" = "pmedia=usbhd psubdir=1bit log_buf_len=64M" ]
+check "and a bare parameters line (blank and # lines skipped)" $?
+[ -z "$(release_headless "$t/no-such-file")" ] && [ -z "$(release_headless "$t")" ]
+check "a release that carries no /1bit/cmdline reads as no line" $?
+
+# no release line: the running entry's parameters are copied (the pre-#3374 behaviour), and the update warns
+[ "$(slot_params '' "$run" 1bit-alt)" = "pmedia=usbhd pupsfs=UUID=disk 1bit.data=UUID=disk psubdir=1bit-alt ttm.pages_limit=31457280 nvme.quirks=1e49:1081:dmapool_align_512 pfix=nocopy,nox console=ttyS0,115200 console=tty0" ]
+check "a release with no line falls back to the running entry's parameters, psubdir rewritten" $?
+
+# a release that pins the data partition and a running line without the pin: refused, with the reason named
+why=$(slot_params 'pmedia=usbhd pupsfs=UUID=stick 1bit.data=UUID=stick psubdir=1bit console=tty0' 'pmedia=usbhd psubdir=1bit' 1bit-alt); rc=$?
+[ "$rc" -ne 0 ] && case $why in *pupsfs=*) true ;; *) false ;; esac
+check "a release pin naming a key the running entry cannot fill in is refused, by name [$why]" $?
+
+# a release that drops the pin still gets this machine's (an installed disk boots by it)
+got=$(slot_params 'pmedia=usbhd psubdir=1bit log_buf_len=64M console=tty0' "$run" 1bit-alt)
+has "$got" pupsfs=UUID=disk && has "$got" 1bit.data=UUID=disk
+check "a release that drops the pin still gets this machine's (the installed disk boots by it) [$got]" $?
 
 [ $fail = 0 ] && echo "one_bit_update_slots: ok" || echo "one_bit_update_slots: FAILED"
 exit $fail

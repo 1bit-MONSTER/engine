@@ -112,11 +112,22 @@ An installed machine carries **two slots** on its data partition and **one** sav
 
 `1bit-update <release-dir | image.img>` writes the next appliance into the slot that is **not** running. It checks the
 release first (it must carry the running set's own file names, and a `SHA256SUMS` is verified for those files when the
-release has one), copies, then compares every byte, links the save layer, adds that slot's GRUB entries built from the
-running entry's own boot line, and flips `set default` to the new headless entry — re-reading the config the way GRUB
-counts entries before it reports success. The running set is never touched, so the previous appliance stays bootable:
+release has one), copies, then compares every byte, links the save layer, writes that slot's two GRUB entries (the
+headless default and the serial root shell) from the **new release's own** boot line, and flips `set default` to the new
+headless entry — re-reading the config the way GRUB counts entries before it reports success, and refusing a line that
+does not carry the parameters it just wrote. The running set is never touched, so the previous appliance stays bootable:
 that is the rollback. `1bit-update --rollback` flips `set default` back; `1bit-update --status` says which slot is
 running, what each holds, and which entry GRUB boots.
+
+The new release's line is `/1bit/cmdline` on the set it ships — `mkimage.sh` writes it from the same variable that
+builds the image's `grub.cfg` entry, so the two cannot disagree, and a release directory carries it too (engine#3374).
+Only the keys that name **this machine** are taken from the running entry, because the release's own values name the
+release image's disk: `pupsfs=UUID=`, `1bit.data=UUID=` (the pin an installed disk boots its own data partition by)
+and `psubdir=` (the slot), plus `pfix=copy` → `pfix=nocopy`, exactly as `1bit-install` rewrites the image's line for
+an installed disk. An update therefore delivers a parameter a release added, dropped or changed, to the entries that
+already exist as well as to the ones it adds; the image's other menu entries (desktop, install-to-disk) are its own boot
+modes and keep the line their image was installed with. A release that carries no `/1bit/cmdline` (anything cut before
+engine#3374) is updated the old way, with the running entry's parameters, and the update says so.
 
 #### In-system updates: `1bit-update --check` and `--latest`
 

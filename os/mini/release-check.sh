@@ -1341,6 +1341,32 @@ else:
 PY
 }
 
+# engine#3399: the running lemond's environment and the payload's own HRX backend, for the *-HRX catalogue rows.
+# Lemonade's stock llamacpp-hrx recipe installs upstream's hrx-b99 bundle when nothing points it at a local build, and
+# that bundle registers no HRX0 on 1bit OS (--list-devices -> "Available devices: (none)"), so every -HRX row fails
+# with `--device: invalid device: HRX0`. The release package's launcher (scripts/lemond-onebit.sh) names the package's
+# own 1bit/lemonade-hrx in LEMONADE_HRX_HRX_BIN. This verdict judges what the RUNNING lemond's environment says: a path
+# that exists and is executable passes; a value that is not a path makes Lemonade install its own build again;
+# `builtin` is the documented opt-out and is a SKIP, not a pass. Pure, so --self-test drives it.
+hrx_recipe_verdict() {  # <LEMONADE_HRX_HRX_BIN from lemond's environ, or empty> <exists 1/0> <executable 1/0>
+    case "${1:-}" in
+        '')
+            printf 'FAIL lemond has no LEMONADE_HRX_HRX_BIN: its llamacpp-hrx recipe would install upstream hrx-b99, which registers no HRX0 on this GPU'
+            return 0 ;;
+        builtin)
+            printf "SKIP LEMONADE_HRX_HRX_BIN=builtin: this image deliberately uses Lemonade's own HRX download"
+            return 0 ;;
+    esac
+    case "$1" in
+        /*) ;;
+        *)  printf 'FAIL LEMONADE_HRX_HRX_BIN=%s is not a path, so Lemonade installs its own HRX build instead' "$1"
+            return 0 ;;
+    esac
+    [ "${2:-0}" = 1 ] || { printf 'FAIL LEMONADE_HRX_HRX_BIN=%s does not exist' "$1"; return 0; }
+    [ "${3:-0}" = 1 ] || { printf 'FAIL LEMONADE_HRX_HRX_BIN=%s is not executable, so lemond cannot start it' "$1"; return 0; }
+    printf "PASS lemond runs the payload's own HRX backend for its llamacpp-hrx recipe: %s" "$1"
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -1835,6 +1861,15 @@ next')
         *) printf 'ok   a GPU model, the ryzenai-llm entry and a person entry are not judged by the row\n' ;; esac
     fi
     rm -rf "$IE"
+    # engine#3399: the *-HRX recipe's backend, as the running lemond's environment names it. The empty value is
+    # v2026.48's state - the one every -HRX row failed in - and is deliberately the arm a "row exists" check misses.
+    check PASS "$(hrx_recipe_verdict /opt/1bit-package/1bit/lemonade-hrx 1 1)"
+    check FAIL "$(hrx_recipe_verdict '' 0 0)"
+    check FAIL "$(hrx_recipe_verdict /opt/1bit-package/1bit/lemonade-hrx 0 0)"     # named, absent
+    check FAIL "$(hrx_recipe_verdict /opt/1bit-package/1bit/lemonade-hrx 1 0)"     # present, not executable
+    check FAIL "$(hrx_recipe_verdict hrx-b99 0 0)"                                  # a release tag: Lemonade installs its own
+    check SKIP "$(hrx_recipe_verdict builtin 0 0)"                                  # the documented opt-out
+
     [ $rc = 0 ] && echo "release-check self-test PASS" || echo "release-check self-test FAIL"
     # ── kernel_cve_verdict: the CVE-2026-98432 fix standing of a kernel release ──────────────────────────
     # The advisory's own spelling, `X.Y-rcN` and `X.Y` with no patch component, is driven first: the first
@@ -1892,6 +1927,21 @@ lemond_key() {
     done
     return 1
 }
+# The running lemond's whole environment, for the rows that judge what its backend children inherit (hrx-recipe,
+# engine#3399). Same process lookup as lemond_key: the listener on the Lemonade port, found by its socket inode, so a
+# second lemond or a launcher shell beside it is not mistaken for the server. Nothing printed when it cannot be read.
+lemond_environ() {
+    _le_ino=$(awk -v p="$(printf ':%04X' "$PORT")" '$2 ~ p"$" && $4 == "0A" { print $10; exit }' /proc/net/tcp 2>/dev/null)
+    [ -n "$_le_ino" ] || return 1
+    for _le_d in /proc/[0-9]*; do
+        if ls -l "$_le_d/fd" 2> /dev/null | grep -q "socket:\[$_le_ino\]"; then
+            tr '\0' '\n' < "$_le_d/environ" 2> /dev/null
+            return 0
+        fi
+    done
+    return 1
+}
+
 KEY=$(lemond_key)
 [ -n "$KEY" ] || KEY=$(sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf 2>/dev/null | tail -n 1)
 # Cycle 20, the owner's "blank key": blank mode is the SHIPPED state. Cycle 21: a request in blank mode carries no
@@ -3163,6 +3213,33 @@ else
     else
         pass payload-backend "llama-server and libggml-hrx are both in the payload beside the catalog that needs them"
     fi
+fi
+
+# ── hrx-recipe: the *-HRX catalogue rows run the payload's own HRX backend (engine#3399) ─────────────────────────
+# The payload-backend row above asks whether the payload carries a backend. This one asks whether the RUNNING lemond
+# knows to use it: Lemonade's stock llamacpp-hrx recipe installs upstream's hrx-b99 bundle when nothing points it at a
+# local build, and that bundle registers no HRX0 on 1bit OS, so every -HRX row fails to load. The question is the
+# server's environment, not a config file, because the environment is what its backend children inherit - and it is
+# read from the lemond that listens on the Lemonade port, the same process every other row talks to.
+if [ ! -x "$LEMDIR/lemond-onebit" ]; then
+    skip hrx-recipe "no $LEMDIR/lemond-onebit on this image: Lemonade is not started through the release package's launcher"
+elif ! grep -qE '"recipe"[[:space:]]*:[[:space:]]*"llamacpp-hrx"' "$CATALOG" 2> /dev/null; then
+    skip hrx-recipe "the catalogue ships no *-HRX row (recipe llamacpp-hrx), so no upstream HRX recipe is offered"
+elif ! _hrx_all=$(lemond_environ) || [ -z "$_hrx_all" ]; then
+    skip hrx-recipe "cannot read the running lemond's environment (no Lemonade listener on $PORT, or this check is not root): run it as root on the booted image"
+else
+    _hrx_val=$(printf '%s\n' "$_hrx_all" | sed -n 's/^LEMONADE_HRX_HRX_BIN=//p' | head -1)
+    _hrx_exists=0 _hrx_exec=0
+    case "$_hrx_val" in
+        /*) [ -e "$_hrx_val" ] && _hrx_exists=1
+            [ -x "$_hrx_val" ] && _hrx_exec=1 ;;
+    esac
+    _hrx_v=$(hrx_recipe_verdict "$_hrx_val" "$_hrx_exists" "$_hrx_exec")
+    case "$_hrx_v" in
+        PASS*) pass hrx-recipe "${_hrx_v#PASS }" ;;
+        SKIP*) skip hrx-recipe "${_hrx_v#SKIP }" ;;
+        *)     fail hrx-recipe "${_hrx_v#FAIL }" ;;
+    esac
 fi
 
 # ── the BASE layer's modes (engine#1474) ────────────────────────────────────────────────────────────────────────

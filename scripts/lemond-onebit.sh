@@ -24,6 +24,21 @@
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 export LEMONADE_ONEBIT_BIN=${LEMONADE_ONEBIT_BIN:-$here/1bit/1bit}
+# engine#3399: Lemonade has a second HRX recipe, upstream's llamacpp-hrx, and the *-HRX catalogue rows name it.
+# Left alone, lemond downloads upstream's manylinux hrx-b99 bundle on first use and runs THAT. On 1bit OS that
+# bundle registers no GPU: issue #3399 measured `llama-server --list-devices` -> "Available devices: (none)" under
+# lemond's environment, and "--device: invalid device: HRX0" when a -HRX model is loaded. Its recipe adds only
+# GGML_DISABLE_VULKAN to the child (Lemonade's hrx_server.cpp build_server_environment), and lemond's environment
+# carries the save-area trio but names no HSA runtime to the HRX HAL (no IREE_HAL_AMDGPU_LIBHSA_PATH) - the state
+# scripts/hrx-env.sh and docs/hrx.md measure as
+# "the system ROCr, which with HSA_USE_SVM=0 registers no HRX0" (engine#674/#715). The package ships an HRX
+# llama-server of its own beside the engine, and 1bit/lemonade-hrx (scripts/lemonade-hrx) starts it in the
+# environment `1bit serve --print-backend-env` builds for an HRX backend (strict placement, the TheRock runtime,
+# CWSR placement, the trio) - the combination that works on this board. A path here also skips the download: lemond's
+# find_external_backend_binary returns it, so install_from_github never runs. The engine's own onebit recipe is not
+# affected. `LEMONADE_HRX_HRX_BIN=builtin` keeps Lemonade's own download deliberately (get_bin_config_value's
+# reserved keywords).
+export LEMONADE_HRX_HRX_BIN=${LEMONADE_HRX_HRX_BIN:-$here/1bit/lemonade-hrx}
 # the NPU engine loads sealed kernels only, always: no opt-out (the release 1bit refuses plain
 # kernel sets on its own too)
 export ONEBIT_KCRYPT_REQUIRE_SEALED=1

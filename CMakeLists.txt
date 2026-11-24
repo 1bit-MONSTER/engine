@@ -467,6 +467,11 @@ add_test(NAME unmap_fault_order_selftest
 add_test(NAME server_launch_check_selftest COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/ci/server_launch_check.py --self-test)
 # scripts/lemonade-hrx: the PPA lemond's HRX recipe runs our llama-server (docs/lemonade.md): no GPU.
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)
+# scripts/lemond-onebit.sh: the release package's launcher points Lemonade's stock llamacpp-hrx recipe at the
+# package's own HRX llama-server, so the *-HRX catalogue rows run the engine instead of upstream's hrx-b99
+# bundle, which finds no GPU on 1bit OS (engine#3399). No build, no device: bin/lemond is a stub that records
+# its environment.
+add_test(NAME lemond_onebit COMMAND ${CMAKE_SOURCE_DIR}/tests/lemond_onebit.sh)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
 # The Loom GPU route (app/loom_route.h, docs/loom-route.md): the table, the match, readiness and the request/reply

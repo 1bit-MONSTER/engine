@@ -144,6 +144,12 @@ datauuid=${ONEBIT_STICK_DATA_UUID:-$(python3 -c 'import uuid; print(uuid.uuid4()
 # that ends in "Restarting system" means the kernel finished and the hang is in the firmware; no record means the
 # shutdown never reached the kernel's reset.
 setcmd="pmedia=usbhd pupsfs=UUID=$datauuid 1bit.data=UUID=$datauuid psubdir=1bit ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0 log_buf_len=32M nvme.quirks=1e49:1081:dmapool_align_512 scsi_mod.scan=sync printk.always_kmsg_dump=1"
+# engine#3374: the headless entry's parameters are ALSO carried on the set, in /1bit/cmdline, because an update builds
+# the other slot's GRUB line from the NEW release's own line instead of copying the running slot's - a release that
+# adds, drops or changes a kernel parameter then delivers it by update, without a reinstall. ONE variable builds the
+# entry and the file, so the two cannot disagree; 1bit-update merges this machine's keys into it (the data partition's
+# UUID pin, the slot) and writes pfix=nocopy for an installed disk, exactly as 1bit-install rewrites the image's line.
+headless="$setcmd pfix=copy,nox console=ttyS0,115200 console=tty0"
 cat > "$esp/EFI/BOOT/grub.cfg" <<GRUBCFG
 set timeout=8
 set default=0
@@ -175,7 +181,7 @@ search --no-floppy --fs-uuid $datauuid --set=root
 # out to every registered console. The VM rows are unaffected: they drive the guest through
 # /etc/init.d/21serial-console, which opens /dev/ttyS0 explicitly.
 menuentry "1bit OS (headless console, ${kver})" {
-    linux /1bit/vmlinuz $setcmd pfix=copy,nox console=ttyS0,115200 console=tty0
+    linux /1bit/vmlinuz $headless
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS (desktop, JWM)" {
@@ -187,7 +193,7 @@ menuentry "1bit OS - install to a disk (1bit.installer=1)" {
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS - serial root shell (1bit.serial=1)" {
-    linux /1bit/vmlinuz $setcmd pfix=copy,nox console=ttyS0,115200 console=tty0 1bit.serial=1
+    linux /1bit/vmlinuz $headless 1bit.serial=1
     initrd /1bit/initrd.gz
 }
 GRUBCFG
@@ -231,6 +237,12 @@ d=$work/data; mkdir -p "$d/1bit" "$d/models" "$d/ssh" "$d/lemonade/cache" "$d/le
     "$d/npu/kernels" "$d/cache/hrx-jit"
 cp -L "$work/vmlinuz" "$work/initrd.gz" "$d/1bit/"
 for f in puppy zdrv fdrv bdrv; do cp -L "$src"/${f}_*.sfs "$d/1bit/"; done
+# engine#3374: the release's own headless boot line, beside the set an update copies (the same line as the image's
+# grub.cfg entry, from $headless above). /1bit/cmdline is what 1bit-update reads to build the other slot's entry; a
+# release directory made from this /1bit carries it too. Not in SHA256SUMS: the set's hashes name the bootable files an
+# update installs, and this is a line of text an update only reads.
+printf '%s\n' "$headless" > "$d/1bit/cmdline" || {
+    echo "$prog: REFUSED: could not write $d/1bit/cmdline (an update then keeps the installed boot parameters)" >&2; exit 1; }
 # The set's own hashes, ON the set (engine#1385 review): `1bit-update <image.img>` installs from the /1bit of the
 # image's data partition and verifies exactly these files, so an image that carries no SHA256SUMS could only ever be
 # updated with --no-verify - every weekly image would have needed it. Written here, out of the bytes just copied, so

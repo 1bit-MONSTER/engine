@@ -42,8 +42,9 @@
 # upperdir), so both sets share one machine's worth of state - home, services, /etc - instead of forking it.
 #
 # What an update writes is the slot that is NOT running, so the running set is never touched and the previous
-# appliance stays bootable: that is the rollback. GRUB's `set default` is the switch, and both slots' entries carry
-# the same UUID-pinned boot line, so nothing else about the disk changes.
+# appliance stays bootable: that is the rollback. GRUB's `set default` is the switch; the new slot's entries carry the
+# NEW release's own boot parameters, merged with the two keys that name this machine (the data partition's UUID pin and
+# the slot), so a release that adds, drops or changes a kernel parameter delivers it by update (engine#3374).
 #
 # Refusals are the point of this script: a half-written slot that GRUB then boots is worse than no update at all. It
 # refuses a source that does not carry the set the running image is made of, a source whose SHA256SUMS does not
@@ -471,6 +472,72 @@ update_identity_check() {
     return 0
 }
 
+# ── the other slot's boot line: the NEW release's parameters, this MACHINE's keys (engine#3374) ──────────────────
+# Until #3374 the update built the other slot's GRUB `linux` line by copying the RUNNING slot's and replacing psubdir=,
+# so a kernel parameter a release added, dropped or changed after the machine was installed never arrived by update
+# (measured: an installed v2026.48 that had been updated from c35 booted without printk.always_kmsg_dump=1, although
+# mkimage.sh puts it on every image's line and refuses an image without it - so that boot left no pstore record).
+#
+# The release carries its own headless parameters beside the set it ships, in /1bit/cmdline: mkimage.sh writes it from
+# the same variable that builds the image's grub.cfg, so the two cannot disagree, and the file is on the set an update
+# already copies (an image's mounted data partition, or a release directory). The release forms the line; only the keys
+# that name THIS MACHINE are taken from the running entry, because the release's own values name the release image's
+# disk: pupsfs=UUID= and 1bit.data=UUID= (the pin an installed disk boots its own data partition by, engine#539/#3287)
+# and psubdir= (the slot). pfix=copy is the live stick's trick and becomes pfix=nocopy, exactly as 1bit-install
+# rewrites it for an installed disk.
+#
+# boot_param LINE KEY: the value of KEY= on a kernel boot line (the first one), or empty. KEY is a sed pattern.
+boot_param() {
+    printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1
+}
+# release_headless FILE: the headless kernel parameters a release carries, or empty when it carries none. The file may
+# hold the bare parameters or the whole grub `linux <kernel> <parameters>` line (what a person copies out of an image's
+# grub.cfg); a `#` comment line and a blank line are skipped, CRLF is read as one line.
+release_headless() {
+    [ -f "$1" ] && [ -r "$1" ] || return 0
+    _rh=$(sed -n '/^[[:space:]]*#/d; /^[[:space:]]*$/d; {p;q;}' "$1" | tr -d '\r')
+    printf '%s' "$_rh" | sed 's|^[[:space:]]*linux[[:space:]][[:space:]]*[^[:space:]][^[:space:]]*[[:space:]]*||'
+}
+# slot_params RELEASE RUNNING TARGET: the kernel parameters TARGET's headless entry gets. RELEASE is the new release's
+# own line (empty: the release carries none, so the RUNNING line's parameters are copied - the pre-#3374 behaviour, and
+# the caller says so in the log), RUNNING the running slot's headless line (the machine's keys), TARGET the slot name.
+# Prints the parameters; on a release that names a machine key the running machine cannot fill in it prints why and
+# returns 1 - an image's own UUID would point the new slot at the release stick's data partition.
+slot_params() {
+    _sp_rel=${1:-} _sp_run=$2 _sp_tgt=$3
+    [ -n "$_sp_rel" ] || _sp_rel=$_sp_run
+    _sp_pin=$(boot_param "$_sp_run" pupsfs) _sp_data=$(boot_param "$_sp_run" '1bit\.data')
+    _sp_out= _sp_p= _sp_d= _sp_s=
+    set -f   # the line is data: a `*` in a parameter is not a glob (this runs in a $(...) subshell, so the caller's own globbing stays)
+    for _sp_t in $_sp_rel; do
+        case $_sp_t in
+            psubdir=*) _sp_out="$_sp_out psubdir=$_sp_tgt"; _sp_s=1 ;;
+            pupsfs=*)
+                if [ -z "$_sp_pin" ]; then
+                    echo "the release's boot line pins the data partition (pupsfs=...), and the running boot line has no pupsfs= to take this disk's value from: the image's own UUID would point /$_sp_tgt at the release stick's partition"
+                    set +f; return 1
+                fi
+                _sp_out="$_sp_out pupsfs=$_sp_pin"; _sp_p=1 ;;
+            1bit.data=*)
+                if [ -z "$_sp_data" ]; then
+                    echo "the release's boot line pins the data partition (1bit.data=...), and the running boot line has no 1bit.data= to take this disk's value from: the image's own UUID would point /$_sp_tgt at the release stick's partition"
+                    set +f; return 1
+                fi
+                _sp_out="$_sp_out 1bit.data=$_sp_data"; _sp_d=1 ;;
+            pfix=*) case $_sp_t in *pfix=copy*) _sp_t=$(printf '%s' "$_sp_t" | sed 's|pfix=copy|pfix=nocopy|') ;; esac
+                    _sp_out="$_sp_out $_sp_t" ;;
+            *) _sp_out="$_sp_out $_sp_t" ;;
+        esac
+    done
+    set +f
+    # the machine's keys are on the line exactly once, whatever the release's own line carries: a release that dropped
+    # one does not get to drop the pin an installed disk boots by
+    [ -n "$_sp_s" ] || _sp_out="$_sp_out psubdir=$_sp_tgt"
+    [ -n "$_sp_p" ] || [ -z "$_sp_pin" ] || _sp_out="$_sp_out pupsfs=$_sp_pin"
+    [ -n "$_sp_d" ] || [ -z "$_sp_data" ] || _sp_out="$_sp_out 1bit.data=$_sp_data"
+    printf '%s\n' "${_sp_out# }"
+}
+
 # sourced by tests/one_bit_update_slots_test.sh with ONEBIT_UPDATE_LIB=1: the functions above, nothing below
 if [ "${ONEBIT_UPDATE_LIB:-}" = 1 ]; then return 0 2> /dev/null || exit 0; fi
 
@@ -766,39 +833,83 @@ sync
 if [ "$target" = "$save_slot" ]; then layer_note="held here (both slots share it)"; else layer_note="-> $(readlink "$DATA/$target/$savename")"; fi
 say "   $(ls "$DATA/$target"/*.sfs | wc -l) SFS, kernel and initrd in /$target; save layer $layer_note"
 
-# ── GRUB: the other slot needs its entries, and they become the default ─────────────────────────────────────
+# ── GRUB: the other slot's entries carry the NEW release's boot parameters, and they become the default ───────
 mount_esp || fail "cannot mount the ESP $esp"
 [ -f "$cfg" ] || { unmount_esp; fail "no EFI/BOOT/grub.cfg on $esp"; }
 # (the ESP's free space is checked before the copy, next to the data partition's own check)
 cp -p "$cfg" "$cfg.pre-1bit-update" 2> /dev/null || { unmount_esp; fail "cannot back up $cfg"; }
+# the running slot's headless line: this machine's two keys come from it (the data partition's UUID pin and the slot)
+# and never from the release, whose own line names the release image's disk (engine#3374)
 tmpl=$(awk -v slot="$active" '$1 == "linux" && $0 ~ ("psubdir=" slot "([[:space:]]|$)") && $0 !~ /1bit\.serial=1/ {
                                   sub(/^[[:space:]]*linux[[:space:]]+[^[:space:]]+[[:space:]]+/, ""); print; exit }' "$cfg")
-[ -n "$tmpl" ] || { unmount_esp; fail "no headless linux line for the running slot ($active) in $cfg to copy the boot parameters from"; }
-params=$(printf '%s' "$tmpl" | sed "s|psubdir=[^ ]*|psubdir=$target|")
-if [ -z "$(slot_index "$target" headless)" ]; then
-    {
-        printf 'menuentry "1bit OS (headless console, %s)" {\n' "$target"
-        printf '    linux /%s/vmlinuz %s\n' "$target" "$params"
-        printf '    initrd /%s/initrd.gz\n}\n' "$target"
-        printf 'menuentry "1bit OS (%s - serial root shell, 1bit.serial=1)" {\n' "$target"
-        printf '    linux /%s/vmlinuz %s 1bit.serial=1\n' "$target" "$params"
-        printf '    initrd /%s/initrd.gz\n}\n' "$target"
-    } >> "$cfg" || { unmount_esp; fail "cannot append the /$target entries to $cfg"; }
-    sync
-    say "   GRUB: added the /$target entries"
+[ -n "$tmpl" ] || { unmount_esp; fail "no headless linux line for the running slot ($active) in $cfg to take this machine's boot keys from"; }
+# the NEW release's own headless parameters: /1bit/cmdline on the set this run read (an image's mounted data partition,
+# or a release directory). A release that carries none gets the running line's parameters, and the update says so.
+rel=$(release_headless "$src/cmdline")
+params=$(slot_params "$rel" "$tmpl" "$target"); rc=$?
+[ "$rc" = 0 ] || { unmount_esp; fail "$params"; }
+[ -n "$params" ] || { unmount_esp; fail "no boot parameters to write the /$target entries with"; }
+if [ -n "$rel" ]; then
+    pfrom="the NEW release's own (/1bit/cmdline)"
+else
+    pfrom="the RUNNING release's (it carries no /1bit/cmdline)"
+    say "   WARNING: the release carries no /1bit/cmdline beside its set: /$target keeps the RUNNING release's boot parameters, so a parameter this release changed does not arrive (engine#3374)"
+fi
+hidx=$(slot_index "$target" headless)
+sidx=$(slot_index "$target" serial)
+# The target slot's TWO entries are written from the new release's line: the headless one that becomes the default, and
+# the serial root shell. An entry that is already there keeps its own kernel path and only its parameters are replaced,
+# so a slot written by an earlier update (or by 1bit-install, whose menu also carries the desktop and install-to-disk
+# entries) does not accumulate entries; a missing one is appended. Those other menu entries are the image's own boot
+# modes, not this script's, and keep the line their image was installed with.
+newcfg=$WORK/grub.cfg.new
+awk -v h="${hidx:-none}" -v s="${sidx:-none}" -v hp="$params" -v sp="$params 1bit.serial=1" -v tgt="$target" '
+    BEGIN { n = 0; i = 0 }
+    /^[[:space:]]*menuentry/ { i = n; n++ }
+    /^[[:space:]]*linux / && (i "" == h || i "" == s) {
+        p = $0
+        sub(/^[[:space:]]*linux[[:space:]]+/, "", p)
+        k = p; sub(/[[:space:]].*/, "", k)          # the kernel path the entry already boots: kept, not rebuilt
+        print "    linux " k " " (i "" == s ? sp : hp)
+        next
+    }
+    { print }
+    END {
+        if (h == "none") {
+            print "menuentry \"1bit OS (headless console, " tgt ")\" {"
+            print "    linux /" tgt "/vmlinuz " hp
+            print "    initrd /" tgt "/initrd.gz"
+            print "}"
+        }
+        if (s == "none") {
+            print "menuentry \"1bit OS (" tgt " - serial root shell, 1bit.serial=1)\" {"
+            print "    linux /" tgt "/vmlinuz " sp
+            print "    initrd /" tgt "/initrd.gz"
+            print "}"
+        }
+    }' "$cfg" > "$newcfg" || { unmount_esp; fail "cannot build the /$target entries for $cfg"; }
+[ -s "$newcfg" ] || { unmount_esp; fail "the rewritten GRUB config is empty: $cfg is untouched"; }
+cp "$newcfg" "$cfg" || { cp -p "$cfg.pre-1bit-update" "$cfg" 2> /dev/null; unmount_esp; fail "cannot write the /$target entries to $cfg"; }
+sync
+if [ "$hidx" = "" ]; then
+    say "   GRUB: added the /$target entries (boot parameters from $pfrom)"
+else
+    say "   GRUB: /$target's entries now carry the new release's boot parameters (from $pfrom)"
+    [ "$sidx" = "" ] && say "   GRUB: added the /$target serial entry"
 fi
 idx=$(slot_index "$target" headless)
 [ -n "$idx" ] || { unmount_esp; fail "the /$target headless entry is not in $cfg after writing it"; }
 set_default "$idx" || { unmount_esp; fail "could not set default=$idx in $cfg"; }
-# read it back the way GRUB counts: the Nth menuentry line must be the one carrying /$target's boot line
-awk -v want="$idx" -v slot="$target" '
+# read it back the way GRUB counts: the Nth menuentry must be the one carrying /$target's boot line, and it must carry
+# the parameters this run wrote - the boot after the update is the whole point of them (engine#3374)
+got=$(awk -v want="$idx" -v slot="$target" '
     BEGIN { n = 0; i = 0 }
     /^[[:space:]]*menuentry/ { i = n; n++ }
-    /^[[:space:]]*linux / && i == want { if ($0 ~ ("psubdir=" slot "([[:space:]]|$)") && $0 !~ /1bit\.serial=1/) ok = 1 }
-    END { exit(ok ? 0 : 1) }' "$cfg" || { cp -p "$cfg.pre-1bit-update" "$cfg"; unmount_esp; fail "entry $idx is not /$target's headless boot line; $cfg restored"; }
-unmount_esp || fail "cannot flush the ESP"
-sync
-say "   GRUB: entry $idx = /$target headless, first (set default=$idx); the /$active entries stay, so the previous appliance is the rollback"
+    /^[[:space:]]*linux / && i == want && $0 ~ ("psubdir=" slot "([[:space:]]|$)") && $0 !~ /1bit\.serial=1/ {
+        sub(/^[[:space:]]*linux[[:space:]]+[^[:space:]]+[[:space:]]*/, ""); print; exit }
+' "$cfg")
+[ -n "$got" ] || { cp -p "$cfg.pre-1bit-update" "$cfg"; unmount_esp; fail "entry $idx is not /$target's headless boot line; $cfg restored"; }
+[ "$got" = "$params" ] || { cp -p "$cfg.pre-1bit-update" "$cfg"; unmount_esp; fail "entry $idx does not carry the /$target boot parameters this run wrote (got: $got); $cfg restored"; }
 
 # ── the save layer's copies of release files: out of the overlay, so the new release's code runs (engine#3342) ──
 # Done last, once the slot is written and GRUB boots it, so a refused or failed update leaves the layer as it was. The

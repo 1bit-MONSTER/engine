@@ -18,6 +18,15 @@
 # release "booted" as Puppy boots it (its SFS as the overlay's lower, the save layer's upper on top), and what the
 # machine then sees is checked - not the shadow_* functions on their own (tests/update_shadow_test.sh does that).
 #
+# engine#3374 is the same harness's second job: the NEW slot's GRUB line must carry the NEW release's own kernel
+# parameters, with only this machine's keys (the data partition's UUID pin and the slot) from the running entry. The
+# installed disk's line carries neither printk.always_kmsg_dump=1 nor log_buf_len=64M; release A's /1bit/cmdline adds
+# the first (a parameter a release ADDED), release B's changes log_buf_len 32M -> 64M (a parameter a release CHANGED,
+# on entries that already exist - the second update writes over the slot 1bit-install laid down).
+# The ESP carries the image's real FOUR-entry menu (headless, desktop, install-to-disk, serial), so the entries the
+# script rewrites are found by the index the artifact actually has, and the two modes it does not own are asserted
+# untouched: 1bit-update writes a slot's headless and serial entries, not the image's desktop/installer modes.
+#
 # The disk: GPT, ESP labelled 1BIT-OS with EFI/BOOT/grub.cfg (one slot, /1bit), ext4 1BIT-DATA with /.installed, /1bit
 # (vmlinuz, initrd.gz, the OLD release's puppy SFS) and the save layer /1bit/upup64rsave/upper, seeded with what a
 # c35 -> v2026.48 machine carried (engine#3342): a hand-edited release script, a whiteout over a release tool, an
@@ -57,6 +66,17 @@ trap cleanup EXIT
 bad=0
 check() { if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; bad=$((bad + 1)); fi; }
 mk() { mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" > "$1"; }
+# grub_line CFG INDEX: the `linux` line of GRUB entry INDEX (0-based, the way `set default` counts)
+grub_line() { awk -v want="$2" 'BEGIN { n = 0; i = 0 } /^[[:space:]]*menuentry/ { i = n; n++ }
+                                /^[[:space:]]*linux / && i == want' "$1"; }
+# has_tok LINE TOKEN: TOKEN is one of LINE's whitespace-separated kernel parameters
+has_tok() { printf '%s\n' "$1" | tr ' ' '\n' | grep -qxF -- "$2"; }
+# slot_head CFG SLOT: the `linux` line of the entry slot_index calls SLOT's headless one - the FIRST one, which is
+# the entry the update rewrites (the image's desktop entry also carries psubdir= and no 1bit.serial=1)
+slot_head() { awk -v slot="$2" '/^[[:space:]]*linux / && $0 ~ ("psubdir=" slot "([[:space:]]|$)") && $0 !~ /1bit\.serial=1/ { print; exit }' "$1"; }
+# entry_line CFG TITLE: the `linux` line of the menuentry whose title contains TITLE (the image's own modes)
+entry_line() { awk -v t="$2" 'BEGIN { on = 0 } /^[[:space:]]*menuentry/ { on = (index($0, t) > 0) }
+                               /^[[:space:]]*linux / && on { print; exit }' "$1"; }
 
 # ── two releases: the same layout, the code changed ─────────────────────────────────────────────────────────────
 release_tree() {  # <dir> <tag>
@@ -79,7 +99,16 @@ mksquashfs "$w/new" "$w/new.sfs" -noappend -no-progress -all-root > /dev/null ||
 mkdir -p "$w/release"
 cp "$w/new.sfs" "$w/release/puppy_test.sfs"
 echo "kernel of v2026.99" > "$w/release/vmlinuz"; echo "initrd of v2026.99" > "$w/release/initrd.gz"
+# engine#3374: the release's own headless boot line, beside the set it ships (mkimage.sh writes /1bit/cmdline). It is
+# what the update builds the new slot's entry from; the UUIDs in it are the release image's own and must NOT arrive.
+echo "linux /1bit/vmlinuz pmedia=usbhd pupsfs=UUID=release 1bit.data=UUID=release psubdir=1bit log_buf_len=32M printk.always_kmsg_dump=1 pfix=copy,nox console=ttyS0,115200 console=tty0" > "$w/release/cmdline"
 ( cd "$w/release" && sha256sum vmlinuz initrd.gz puppy_test.sfs > SHA256SUMS )
+# release B: the same set with a CHANGED parameter, for the second update (the target slot's entries already exist)
+mkdir -p "$w/release2"
+cp "$w/new.sfs" "$w/release2/puppy_test.sfs"
+echo "kernel of v2026.98" > "$w/release2/vmlinuz"; echo "initrd of v2026.98" > "$w/release2/initrd.gz"
+echo "linux /1bit/vmlinuz pmedia=usbhd pupsfs=UUID=release2 1bit.data=UUID=release2 psubdir=1bit log_buf_len=64M printk.always_kmsg_dump=1 pfix=copy,nox console=ttyS0,115200 console=tty0" > "$w/release2/cmdline"
+( cd "$w/release2" && sha256sum vmlinuz initrd.gz puppy_test.sfs > SHA256SUMS )
 
 # ── the installed disk ───────────────────────────────────────────────────────────────────────────────────────────
 disk() {  # <name>: an installed c35 machine, returns its loop device in $dev
@@ -97,14 +126,24 @@ disk() {  # <name>: an installed c35 machine, returns its loop device in $dev
 set default=0
 set timeout=3
 menuentry "1bit OS (headless console)" {
-    linux /1bit/vmlinuz pmedia=atahd pupsfs=UUID=x psubdir=1bit nvme.quirks=1e49:1081:dmapool_align_512
+    linux /1bit/vmlinuz pmedia=atahd pupsfs=UUID=x 1bit.data=UUID=x psubdir=1bit nvme.quirks=1e49:1081:dmapool_align_512 log_buf_len=32M pfix=nocopy,nox console=ttyS0,115200 console=tty0
     initrd /1bit/initrd.gz
 }
-menuentry "1bit OS (serial root shell, 1bit.serial=1)" {
-    linux /1bit/vmlinuz pmedia=atahd pupsfs=UUID=x psubdir=1bit nvme.quirks=1e49:1081:dmapool_align_512 1bit.serial=1
+menuentry "1bit OS (desktop, JWM)" {
+    linux /1bit/vmlinuz pmedia=atahd pupsfs=UUID=x 1bit.data=UUID=x psubdir=1bit nvme.quirks=1e49:1081:dmapool_align_512 log_buf_len=32M pfix=nocopy console=ttyS0,115200 console=tty0
+    initrd /1bit/initrd.gz
+}
+menuentry "1bit OS - install to a disk (1bit.installer=1)" {
+    linux /1bit/vmlinuz pmedia=atahd pupsfs=UUID=x 1bit.data=UUID=x psubdir=1bit nvme.quirks=1e49:1081:dmapool_align_512 log_buf_len=32M pfix=nocopy,nox console=ttyS0,115200 console=tty0 1bit.installer=1
+    initrd /1bit/initrd.gz
+}
+menuentry "1bit OS - serial root shell (1bit.serial=1)" {
+    linux /1bit/vmlinuz pmedia=atahd pupsfs=UUID=x 1bit.data=UUID=x psubdir=1bit nvme.quirks=1e49:1081:dmapool_align_512 log_buf_len=32M pfix=nocopy,nox console=ttyS0,115200 console=tty0 1bit.serial=1
     initrd /1bit/initrd.gz
 }
 EOF
+    # what the firmware will read before the update: the four lines 1bit-install wrote, for the "untouched" rows below
+    cp "$w/esp/EFI/BOOT/grub.cfg" "$w/$1.grub.installed"
     umount "$w/esp"
     mkdir -p /data && mount "${dev}p2" /data || exit 1
     touch /data/.installed
@@ -135,11 +174,12 @@ boot() {
     mount -t overlay overlay -o "lowerdir=$w/bl,upperdir=$U,workdir=/data/1bit/upup64rsave/work" "$w/b"
 }
 
-run_update() {  # <script>: the real script, as a booted /1bit would run it
-    echo "BOOT_IMAGE=/1bit/vmlinuz pmedia=atahd psubdir=1bit" > "$w/cmdline"
+run_update() {  # <script> [slot] [release dir]: the real script, as a booted /1bit (or /1bit-alt) would run it
+    _slot=${2:-1bit}
+    echo "BOOT_IMAGE=/$_slot/vmlinuz pmedia=atahd psubdir=$_slot" > "$w/cmdline"
     mount --bind "$w/cmdline" /proc/cmdline
     mkdir -p "$w/log"; mount -t tmpfs tmpfs /var/log
-    sh "$1" "$w/release" > "$w/update.out" 2>&1; rc=$?
+    sh "$1" "${3:-$w/release}" > "$w/update.out" 2>&1; rc=$?
     cp /var/log/1bit-update.log "$w/update.log" 2> /dev/null
     umount /var/log; umount /proc/cmdline
     return $rc
@@ -169,9 +209,36 @@ check $rc "1bit-update <release> exits 0 on a loop-mounted installed disk"
 [ -s /data/1bit-alt/puppy_test.sfs ] && cmp -s /data/1bit-alt/puppy_test.sfs "$w/release/puppy_test.sfs" &&
     [ "$(readlink /data/1bit-alt/upup64rsave)" = ../1bit/upup64rsave ]
 check $? "the new set is in /1bit-alt and links the shared save layer"
-mount "${dev}p1" "$w/esp" && d=$(sed -n 's/^set default=//p' "$w/esp/EFI/BOOT/grub.cfg") &&
-    awk -v want="$d" '/^[[:space:]]*menuentry/{i=n++} /^[[:space:]]*linux / && i==want' "$w/esp/EFI/BOOT/grub.cfg" | grep -q "psubdir=1bit-alt"
-check $? "GRUB's default is the /1bit-alt headless entry (the boot line kept its parameters)"
+mount "${dev}p1" "$w/esp" || exit 1
+g=$w/esp/EFI/BOOT/grub.cfg
+d=$(sed -n 's/^set default=//p' "$g")
+line=$(grub_line "$g" "$d")
+has_tok "$line" psubdir=1bit-alt && ! has_tok "$line" 1bit.serial=1
+check $? "GRUB's default is the /1bit-alt headless entry"
+echo "   /1bit-alt headless entry: $(printf '%s' "$line" | sed 's/^[[:space:]]*//')"
+# engine#3374: the line is the NEW release's own, not the running entry's copy
+has_tok "$line" printk.always_kmsg_dump=1
+check $? "the /1bit-alt boot line carries the NEW release's added parameter (printk.always_kmsg_dump=1; the installed line had none)"
+has_tok "$line" pupsfs=UUID=x && has_tok "$line" 1bit.data=UUID=x && ! has_tok "$line" pupsfs=UUID=release &&
+    ! has_tok "$line" 1bit.data=UUID=release
+check $? "and THIS machine's data-partition pin (UUID=x), not the release image's own UUID"
+has_tok "$line" pfix=nocopy,nox && ! has_tok "$line" pfix=copy,nox
+check $? "pfix=copy from the image's line becomes nocopy, as 1bit-install writes for an installed disk"
+has_tok "$line" log_buf_len=32M && has_tok "$line" "console=ttyS0,115200"
+check $? "the release's unchanged parameters are there too (log_buf_len=32M, console=)"
+sline=$(awk -v slot=1bit-alt '/^[[:space:]]*linux / && $0 ~ ("psubdir=" slot "([[:space:]]|$)") && /1bit\.serial=1/' "$g")
+has_tok "$sline" printk.always_kmsg_dump=1 && has_tok "$sline" 1bit.serial=1
+check $? "the /1bit-alt serial root shell entry carries it too"
+rline=$(slot_head "$g" 1bit)
+! has_tok "$rline" printk.always_kmsg_dump=1 && has_tok "$rline" psubdir=1bit
+check $? "the RUNNING /1bit entry was not touched (the rollback keeps its own boot line)"
+grep -q "boot parameters from the NEW release's own (/1bit/cmdline)" "$w/update.out"
+check $? "the update says where the /1bit-alt line came from"
+# the image's own modes are not this script's entries: only the slot's headless and serial lines are rewritten
+[ "$(entry_line "$g" 'desktop, JWM')" = "$(entry_line "$w/machine.grub.installed" 'desktop, JWM')" ]
+check $? "the /1bit desktop entry keeps the installed line (1bit-update writes a slot's headless and serial entries only)"
+[ "$(entry_line "$g" 'install to a disk')" = "$(entry_line "$w/machine.grub.installed" 'install to a disk')" ]
+check $? "and the /1bit install-to-disk entry does too"
 umount "$w/esp"
 
 S=$(ls -d /data/1bit/upup64rsave/1bit-shadowed/*/ 2> /dev/null | head -1)
@@ -205,6 +272,46 @@ boot 1bit
 [ "$(sed -n 2p "$w/b/etc/init.d/05onboard-data")" = "# 05onboard-data of c35" ]
 check $? "the rollback slot boots its own release's code (the hand edit is in 1bit-shadowed/, not on it)"
 umount "$w/b" "$w/bl"
+
+# ── the SECOND update: the target slot's entries already exist, and a CHANGED parameter must still arrive ─────────
+# The machine now runs /1bit-alt, so the next update targets /1bit - the slot 1bit-install laid down, whose headless and
+# serial entries are already in the config. Writing entries only when they are missing would leave that slot on the
+# INSTALLED release's line for ever; release B changes log_buf_len 32M -> 64M and that value must arrive.
+mount "${dev}p1" "$w/esp" || exit 1
+alt_before=$(awk '/^[[:space:]]*linux / && $0 ~ ("psubdir=1bit-alt([[:space:]]|$)")' "$g" | sort)
+one_before=$(slot_head "$g" 1bit)
+umount "$w/esp"
+run_update "$upd" 1bit-alt "$w/release2"; rc=$?
+sed 's/^/   | /' "$w/update.out"
+check $rc "1bit-update from /1bit-alt into the existing /1bit slot exits 0"
+[ -s /data/1bit/puppy_test.sfs ] && cmp -s /data/1bit/puppy_test.sfs "$w/release2/puppy_test.sfs"
+check $? "the second release's set is in /1bit"
+mount "${dev}p1" "$w/esp" || exit 1
+d=$(sed -n 's/^set default=//p' "$g")
+line=$(grub_line "$g" "$d")
+has_tok "$line" psubdir=1bit && has_tok "$line" log_buf_len=64M && ! has_tok "$line" log_buf_len=32M
+check $? "GRUB's default is /1bit and its line carries the parameter release B CHANGED (log_buf_len=64M, not 32M)"
+echo "   /1bit headless entry: $(printf '%s' "$line" | sed 's/^[[:space:]]*//')"
+has_tok "$line" pupsfs=UUID=x && has_tok "$line" 1bit.data=UUID=x && ! has_tok "$line" pupsfs=UUID=release2 &&
+    has_tok "$line" printk.always_kmsg_dump=1
+check $? "with this machine's UUID pin (not release B's) and release B's added parameter"
+case $line in *"linux /1bit/vmlinuz "*) true ;; *) false ;; esac
+check $? "the existing entry kept its own kernel path (/1bit/vmlinuz)"
+sline=$(awk -v slot=1bit '/^[[:space:]]*linux / && $0 ~ ("psubdir=" slot "([[:space:]]|$)") && /1bit\.serial=1/' "$g")
+has_tok "$sline" log_buf_len=64M && has_tok "$sline" 1bit.serial=1
+check $? "the /1bit serial entry got the changed value too"
+[ "$(awk '/^[[:space:]]*linux / && $0 ~ ("psubdir=1bit-alt([[:space:]]|$)")' "$g" | sort)" = "$alt_before" ]
+check $? "the RUNNING /1bit-alt entries are untouched (the rollback keeps release A's line)"
+[ "$line" != "$one_before" ]
+check $? "the /1bit line is not the one 1bit-install wrote any more"
+grep -q "now carry the new release's boot parameters" "$w/update.out"
+check $? "the update says it rewrote the existing entries"
+[ "$(entry_line "$g" 'desktop, JWM')" = "$(entry_line "$w/machine.grub.installed" 'desktop, JWM')" ] &&
+    [ "$(entry_line "$g" 'install to a disk')" = "$(entry_line "$w/machine.grub.installed" 'install to a disk')" ]
+check $? "the /1bit desktop and installer entries still carry the installed line after the second update"
+[ "$(grep -c '^[[:space:]]*menuentry' "$g")" = 6 ]
+check $? "the existing entries were rewritten in place: still 6 menu entries, none duplicated"
+umount "$w/esp"
 
 echo "update_e2e_loop: $([ $bad = 0 ] && echo ok || echo FAIL)"
 [ $bad = 0 ]

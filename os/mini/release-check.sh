@@ -27,6 +27,9 @@
 # chat-npu-concurrent. Everything else - mode, kernel,
 # Secure Boot, Lemonade up with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU
 # sets and the signed manifests over them, the licences and the image identity - is checked in the VM as well.
+# npu-idle-evict reads the file the v3 appliance's boot step writes, so it needs no hardware: on a 1bit OS boot (and
+# any v3 VM) it is PASS or FAIL, while on the os/mini CI/VM target it is a SKIP because that image starts lemond
+# without the step (engine#3437).
 set -u
 
 LOG=/data/release-check.log
@@ -1217,6 +1220,125 @@ node_verdict() {
     printf 'PASS node %s, npm %s, global prefix %s on the data partition (installing an agent needs the network; offline, lemonade launch prints its own hint)' "$_nv" "$_pv" "$_pre"
 }
 
+# engine#3437: the NPU's idle eviction, read from the recipe options 10lemonade writes. 23 Nov (strixhalo, v2026.48):
+# Qwen3-0.6B-NPU-1bit was loaded from the web UI at 21:50Z, answered one chat, and held the NPU for 1 h 54 min until an
+# unload-all. Lemonade ships idle eviction OFF: resources/defaults.json has "auto_evict": false, and
+# src/cpp/server/eviction_engine.cpp:84-91 skips a model unless its recipe options carry auto_evict: true (a JSON
+# boolean; a string "true" is ignored), so evict_idle_timeout - 300 s by default - is never consulted. The v3
+# appliance's 10lemonade runs /usr/local/bin/1bit-npu-idle-evict before lemond; for every onebit NPU model it writes
+# {"auto_evict": true, "evict_idle_timeout": 600} under Lemonade's canonical id (builtin.<name> for a catalogue entry,
+# user.<name> for a pulled one; an old bare key is the same model and is extended in place). The NPU test below is the
+# helper's own and so is the canonical-id resolution, so the row and the boot step cannot drift into two definitions.
+# This reads the file, not the device: a VM checks it as well as the board.
+#   PASS  every NPU model the image knows has auto_evict true; the idle timeout each one will use is printed
+#   FAIL  an NPU model has no entry / auto_evict is false or not a boolean / its entry is not an object / the file is
+#         missing or not JSON - in every one of those Lemonade skips it and the NPU stays held. A user model pulled
+#         since the last boot has no entry yet; the boot step sets it at the next boot
+#   SKIP  no catalogue to read, or a catalogue with no onebit NPU model in it
+# The timeout alone is not a FAIL: with auto_evict on, a missing or non-integer value falls back to Lemonade's 300 s
+# and the model is still evicted. The row prints the effective value, so a 24 h timeout is visible in the transcript.
+# The engine also skips a pinned model (eviction_engine.cpp:81-82), a person's deliberate "keep this one resident": the
+# boot step still writes the option for it and the image ships none pinned, so the row asks for it on every NPU model
+# and does not try to interpret a pin.
+# npu_idle_evict_verdict <catalogue> <user_models.json or ''> <recipe_options.json>
+npu_idle_evict_verdict() {
+    python3 -I - "$1" "$2" "$3" <<'PY'
+import json, sys
+cat, user, ro = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def load(p):
+    try:
+        with open(p) as f:
+            return json.load(f), None
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "unreadable"
+    except ValueError:
+        return None, "not-json"
+
+def is_npu(name, v):
+    # The boot step's own test (/usr/local/bin/1bit-npu-idle-evict), kept identical on purpose.
+    if not isinstance(v, dict) or v.get("recipe") != "onebit":
+        return False
+    ck = v.get("checkpoint") or ""
+    if isinstance(v.get("checkpoints"), dict):
+        ck = " ".join(str(x) for x in v["checkpoints"].values())
+    opts = v.get("recipe_options")
+    if not isinstance(opts, dict):
+        opts = {}
+    return ("-npu-" in name.lower() or name.lower().endswith("-npu")
+            or "fastflowlm/" in ck.lower()
+            or str(opts.get("onebit_backend", "")).lower() == "npu")
+
+c, _ = load(cat)
+if not isinstance(c, dict):
+    print("SKIP no readable catalogue at %s: nothing in this image names its NPU models" % cat)
+    sys.exit(0)
+want = [("builtin", k) for k, v in c.items() if is_npu(k, v)]
+u, _ = load(user)
+if isinstance(u, dict):
+    want += [("user", k) for k, v in u.items() if is_npu(k, v)]
+if not want:
+    print("SKIP the catalogue at %s ships no onebit NPU model: nothing to set idle eviction for" % cat)
+    sys.exit(0)
+r, why = load(ro)
+if r is None:
+    if why == "not-json":
+        print("FAIL %s is not valid JSON: lemond cannot read it either, so no NPU model has auto_evict on" % ro)
+    elif why == "unreadable":
+        print("FAIL %s cannot be read: nothing there turns Lemonade's idle eviction on for %s" % (ro, ", ".join(n for _, n in want)))
+    else:
+        print("FAIL no recipe_options.json at %s: nothing there turns auto_evict on, and Lemonade ships it off "
+              "(defaults.json), so an idle load of %s is never evicted" % (ro, ", ".join(n for _, n in want)))
+    sys.exit(0)
+if not isinstance(r, dict):
+    print("FAIL %s is not a JSON object: lemond reads recipe options from it, so every NPU model stays unevictable" % ro)
+    sys.exit(0)
+
+def canonical(src, name):
+    if src == "user":
+        return "user." + name
+    # The boot step extends an old bare key in place; Lemonade's store migrates it to builtin.<name> at startup.
+    return name if ("builtin." + name) not in r and name in r else "builtin." + name
+
+good, bad = [], []
+for src, name in want:
+    k = canonical(src, name)
+    e = r.get(k)
+    if not isinstance(e, dict):
+        if k in r:
+            bad.append("%s (its entry is not an object)" % k)
+        elif src == "user":
+            bad.append("%s (no entry; a user model pulled since the last boot is set at the next boot)" % k)
+        else:
+            bad.append("%s (no entry)" % k)
+        continue
+    ae = e.get("auto_evict")
+    if ae is not True:
+        if "auto_evict" not in e:
+            bad.append("%s (auto_evict not set)" % k)
+        elif isinstance(ae, str):
+            bad.append('%s (auto_evict is the string "%s", not a JSON boolean)' % (k, ae))
+        elif isinstance(ae, bool):
+            bad.append("%s (auto_evict is false)" % k)
+        else:
+            bad.append("%s (auto_evict is %s, not true)" % (k, json.dumps(ae)))
+        continue
+    to = e.get("evict_idle_timeout")
+    if isinstance(to, int) and not isinstance(to, bool) and to > 0:
+        good.append("%s (%d s)" % (k, to))
+    else:
+        good.append("%s (300 s, Lemonade's default)" % k)
+
+if bad:
+    print("FAIL %d of %d NPU model(s) would not be evicted when idle (%s): %s - Lemonade's eviction_engine.cpp:84-91 "
+          "skips a model unless a per-model auto_evict is true" % (len(bad), len(want), ro, "; ".join(bad)))
+else:
+    print("PASS %d NPU model(s) evict when idle: %s" % (len(good), ", ".join(good)))
+PY
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -1631,6 +1753,65 @@ next')
     # a body with the answer text in front of the decision still decides on the decision
     check PASS "$(laya_verdict '{"choices":[{"message":{"content":"Here you go"}}],"x_lemonade_route":{"route_to":"m","matched_rule":"laya-prose","default_used":false,"trace":[{"condition":"classifier:laya","score":0.77}]}}' prose m)"
 
+    # engine#3437: the NPU's idle eviction. The first case is the 23 Nov box's own shape - the person's user entry
+    # only, nothing for either catalogue NPU model - and the case after it is what the boot step's helper leaves on the
+    # same catalogue. The rest pin the parts of eviction_engine.cpp a naive row would miss: a string "true" is not a
+    # JSON boolean (the engine ignores it), an old bare key is the canonical entry before Lemonade migrates it, and a
+    # GPU onebit model or the Windows-only ryzenai-llm NPU entry must not be demanded.
+    IE=$(mktemp -d)
+    printf '%s\n' '{"Qwen3-0.6B-NPU-1bit": {"checkpoint": "FastFlowLM/Qwen3-0.6B-NPU2", "recipe": "onebit"}, "Qwen3-4B-NPU-1bit": {"checkpoint": "FastFlowLM/Qwen3-4B-NPU2", "recipe": "onebit"}, "Qwen3-4B-Instruct-2507-1bit": {"checkpoint": "unsloth/Qwen3-4B-Instruct-2507-GGUF:x.gguf", "recipe": "onebit"}, "Llama-3.1-8B-NPU": {"checkpoint": "amd/Llama-3.1-8B-onnx-ryzenai-npu", "recipe": "ryzenai-llm"}}' > "$IE/cat.json"
+    _ie_both='{"builtin.Qwen3-0.6B-NPU-1bit": {"auto_evict": true, "evict_idle_timeout": 600}, "builtin.Qwen3-4B-NPU-1bit": {"auto_evict": true, "evict_idle_timeout": 600}}'
+    printf '%s\n' "$_ie_both" > "$IE/ok.json"
+    printf '%s\n' '{"user.Qwen3.8-27B-ThinkingCoder": {"ctx_size": 0}}' > "$IE/pre.json"
+    _ieg=$(npu_idle_evict_verdict "$IE/cat.json" '' "$IE/pre.json")
+    check FAIL "$_ieg"
+    case "$_ieg" in *Qwen3-0.6B-NPU-1bit*Qwen3-4B-NPU-1bit*)
+        printf 'ok   the pre-fix config names both NPU models it leaves unevictable\n' ;;
+    *) printf 'FAIL the pre-fix FAIL did not name both NPU models: %s\n' "$_ieg"; rc=1 ;; esac
+    check PASS "$(npu_idle_evict_verdict "$IE/cat.json" '' "$IE/ok.json")"
+    printf '%s\n' '{"builtin.Qwen3-0.6B-NPU-1bit": {"auto_evict": true, "evict_idle_timeout": 1200}, "builtin.Qwen3-4B-NPU-1bit": {"auto_evict": true, "evict_idle_timeout": 600}}' > "$IE/person.json"
+    _ieg=$(npu_idle_evict_verdict "$IE/cat.json" '' "$IE/person.json")
+    check PASS "$_ieg"
+    case "$_ieg" in *'1200 s'*)
+        printf 'ok   the row reports the timeout a value a person set will use\n' ;;
+    *) printf 'FAIL the row hid the person-set 1200 s: %s\n' "$_ieg"; rc=1 ;; esac
+    printf '%s\n' '{"builtin.Qwen3-0.6B-NPU-1bit": {"auto_evict": false}, "builtin.Qwen3-4B-NPU-1bit": {"auto_evict": true}}' > "$IE/off.json"
+    check FAIL "$(npu_idle_evict_verdict "$IE/cat.json" '' "$IE/off.json")"
+    printf '%s\n' '{"builtin.Qwen3-0.6B-NPU-1bit": {"auto_evict": "true"}, "builtin.Qwen3-4B-NPU-1bit": {"auto_evict": true}}' > "$IE/str.json"
+    check FAIL "$(npu_idle_evict_verdict "$IE/cat.json" '' "$IE/str.json")"      # the engine's is_boolean() gate
+    printf '%s\n' '{"builtin.Qwen3-0.6B-NPU-1bit": "auto_evict", "builtin.Qwen3-4B-NPU-1bit": {"auto_evict": true}}' > "$IE/obj.json"
+    check FAIL "$(npu_idle_evict_verdict "$IE/cat.json" '' "$IE/obj.json")"
+    printf '%s\n' '{"Qwen3-0.6B-NPU-1bit": {"auto_evict": true, "evict_idle_timeout": 600}, "builtin.Qwen3-4B-NPU-1bit": {"auto_evict": true}}' > "$IE/bare.json"
+    check PASS "$(npu_idle_evict_verdict "$IE/cat.json" '' "$IE/bare.json")"    # an un-migrated bare key, and the 300 s default
+    check FAIL "$(npu_idle_evict_verdict "$IE/cat.json" '' "$IE/none.json")"
+    printf '%s\n' 'not json' > "$IE/bad.json"
+    check FAIL "$(npu_idle_evict_verdict "$IE/cat.json" '' "$IE/bad.json")"
+    printf '%s\n' '[]' > "$IE/arr.json"
+    check FAIL "$(npu_idle_evict_verdict "$IE/cat.json" '' "$IE/arr.json")"
+    check SKIP "$(npu_idle_evict_verdict "$IE/none.json" '' "$IE/ok.json")"
+    printf '%s\n' '{"Qwen3-4B-Instruct-2507-1bit": {"checkpoint": "unsloth/x.gguf", "recipe": "onebit"}}' > "$IE/gpu.json"
+    check SKIP "$(npu_idle_evict_verdict "$IE/gpu.json" '' "$IE/ok.json")"
+    # the boot step's other half: a user model with onebit_backend npu in user_models.json
+    printf '%s\n' '{"Big-1bit": {"recipe": "onebit", "recipe_options": {"onebit_backend": "npu"}}, "Coder": {"recipe": "llamacpp"}}' > "$IE/user.json"
+    printf '%s\n' '{"builtin.Qwen3-0.6B-NPU-1bit": {"auto_evict": true}, "builtin.Qwen3-4B-NPU-1bit": {"auto_evict": true}, "user.Big-1bit": {"auto_evict": true, "evict_idle_timeout": 600}}' > "$IE/uok.json"
+    check PASS "$(npu_idle_evict_verdict "$IE/cat.json" "$IE/user.json" "$IE/uok.json")"
+    check FAIL "$(npu_idle_evict_verdict "$IE/cat.json" "$IE/user.json" "$IE/ok.json")"
+    # the row and the boot step must agree: drive the real helper over the pre-fix config and read its file back
+    _ih=$(dirname "$0")/../v3/puppy/embed/usr/local/bin/1bit-npu-idle-evict
+    [ -x "$_ih" ] || _ih=/usr/local/bin/1bit-npu-idle-evict
+    if [ -x "$_ih" ]; then
+        printf '%s\n' '{"user.Qwen3.8-27B-ThinkingCoder": {"ctx_size": 0}}' > "$IE/recipe_options.json"
+        sh "$_ih" "$IE/cat.json" "$IE" > "$IE/helper.log" 2>&1
+        _ieg=$(npu_idle_evict_verdict "$IE/cat.json" '' "$IE/recipe_options.json")
+        check PASS "$_ieg"
+        case "$_ieg" in *'600 s'*'600 s'*)
+            printf 'ok   the boot step 1bit-npu-idle-evict leaves exactly what this row passes\n' ;;
+        *) printf 'FAIL the boot step and the row disagree: %s\n' "$_ieg"; rc=1 ;; esac
+        case "$_ieg" in *user.Qwen3.8-27B-ThinkingCoder*|*Instruct-2507*|*Llama-3.1-8B-NPU*)
+            printf 'FAIL the row judged a model the boot step must leave alone: %s\n' "$_ieg"; rc=1 ;;
+        *) printf 'ok   a GPU model, the ryzenai-llm entry and a person entry are not judged by the row\n' ;; esac
+    fi
+    rm -rf "$IE"
     [ $rc = 0 ] && echo "release-check self-test PASS" || echo "release-check self-test FAIL"
     # ── kernel_cve_verdict: the CVE-2026-98432 fix standing of a kernel release ──────────────────────────
     # The advisory's own spelling, `X.Y-rcN` and `X.Y` with no patch component, is driven first: the first
@@ -2110,6 +2291,33 @@ else
     else
         fail models "$HRX_REG/$HRX_WANT HRX and $NPU_REG/$NPU_WANT NPU entries found in the shipped catalogue; not in it:$NOTCAT"
     fi
+fi
+
+# ── the NPU's idle eviction, from the recipe options the boot step writes (engine#3437) ──────────────────────────
+# 23 Nov (strixhalo, v2026.48): Qwen3-0.6B-NPU-1bit was loaded from the web UI at 21:50Z, answered one chat, and held
+# the NPU for 1 h 54 min until an unload-all. Lemonade ships idle eviction OFF (resources/defaults.json
+# "auto_evict": false) and eviction_engine.cpp:84-91 skips a model unless its recipe options carry auto_evict: true,
+# so the per-model 300 s timeout was never consulted. The v3 appliance's 10lemonade runs 1bit-npu-idle-evict before
+# lemond, which writes auto_evict true + a 600 s timeout for every NPU model; this row reads that file the way lemond
+# does (npu_idle_evict_verdict above). os/mini starts lemond from os/mini/init.sh and has no such step, and that image
+# is the CI/VM target rather than 1bit OS, so that artifact gets a SKIP that names the gap instead of a red row - the
+# 1bit OS board (and any future v3 VM) gets the PASS or the FAIL that closes engine#3437's regression.
+if [ "$LEMDIR" != /opt/1bit-package ]; then
+    skip npu-idle-evict "not the v3 appliance (no /opt/1bit-package here): os/mini starts lemond from os/mini/init.sh, which does not set NPU idle eviction - engine#3437's fix is os/v3/puppy's 10lemonade"
+elif ! command -v python3 > /dev/null 2>&1; then
+    fail npu-idle-evict "no python3 to read $CATALOG and recipe_options.json (the boot step that writes it needs python3 too)"
+else
+    # 10lemonade keeps Lemonade's state on the data partition and falls back to /var/lib/lemonade when there is none.
+    _ie_ro=/data/lemonade/config/recipe_options.json
+    if [ ! -f "$_ie_ro" ] && [ -f /var/lib/lemonade/config/recipe_options.json ]; then
+        _ie_ro=/var/lib/lemonade/config/recipe_options.json
+    fi
+    _ie_v=$(npu_idle_evict_verdict "$CATALOG" "$(dirname "$_ie_ro")/user_models.json" "$_ie_ro")
+    case "$_ie_v" in
+        PASS*) pass npu-idle-evict "${_ie_v#PASS }" ;;
+        SKIP*) skip npu-idle-evict "${_ie_v#SKIP }" ;;
+        *) fail npu-idle-evict "${_ie_v#FAIL }" ;;
+    esac
 fi
 # Three different situations used to share one message. On candidate 10's first hardware run the gguf row
 # said "no /data/models/*.gguf on the data partition" while `ls /data/models/*.gguf` plainly found the

@@ -451,8 +451,11 @@ release carries the NPU runtime, compiled into `1bit`, and the `onebit` recipe's
 The NPU kernels are closed too: they ship as sealed artifacts that `1bit` verifies and opens in
 memory at load, failing cleanly on a
 wrong key with no network callback of any kind; a lifted kernel file is ciphertext and does not run
-([npu.md](npu.md)). The release package carries them, and serves Qwen3-0.6B and Qwen3-4B on the NPU;
-Qwen3-1.7B follows in the next release.
+([npu.md](npu.md)). The release package carries them. The catalogue serves Qwen3-0.6B and Qwen3-4B on
+the NPU; the next release (rc2) also carries the Qwen3-1.7B Q4_K set, measured at 8/8 on AMD's
+verify-model top-5 gate with our imatrix pack (npu-kernels#132), whose catalogue entry switches to
+that pack in a separate, pending change
+([npu.md](npu.md#q4_k-dx4k6-packs-qwen3-17b-and-4b-in-rc2-npu-kernels132)).
 
 `scripts/weekly.sh` packs them by default (`WEEKLY_NPU_KERNELS=0` builds without): the sealed
 kernel sets go beside `1bit` in `npu/kernels`, the build loads sealed kernels only

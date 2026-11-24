@@ -289,6 +289,10 @@ print("tag=" + safe(r.get("tag_name")))
 print("published=" + safe(r.get("published_at", ""))[:10])
 print("prerelease=" + ("yes" if r.get("prerelease") else "no"))
 print("newer=" + ("unknown" if cur is None else ("yes" if best[0] > cur else "no")))
+# ahead=: the RUNNING release is newer than the newest release of the channel - a final against its own -rcs, or a
+# channel that has not caught up. Folding it into newer=no printed "up to date" for a case where the list held nothing to
+# compare against, and the two answers are not the same statement: see the note --check prints (engine#3448).
+print("ahead=" + ("unknown" if cur is None else ("yes" if best[0] < cur else "no")))
 if img:
     print("image=" + safe(img[0]["name"])); print("size=%d" % int(img[0].get("size") or 0))
     print("image_url=" + safe(img[0].get("browser_download_url", "")))
@@ -321,7 +325,15 @@ update_check() {   # [channel]: prints the answer; always exit 0 (an update chec
     printf '%s\n' "$_a" | sed -n 's/^note=/  | /p'
     case $(_v newer) in
         yes) say "an update is available: 1bit-update --latest${1:+ --channel $_ch} installs it into the other slot" ;;
-        no)  say "up to date" ;;
+        no)  if [ "$(_v ahead)" = yes ]; then
+                 say "up to date: running ${_run} is newer than the $_ch channel's newest $(_v tag)"
+             else
+                 say "up to date"
+             fi
+             # "up to date" is what GITHUB'S RELEASE LIST says, and that list is not signed: a release host that keeps
+             # serving the current release makes an older one newest. The whole statement of what that leaves open, and the
+             # design options, are docs/update-trust.md (engine#3448).
+             say "note: the release list is not signed, so a host that hides a newer release is not detectable (engine#3448)" ;;
         *)   say "the running release (${_run:-none}) has no version to compare with" ;;
     esac
     [ -n "$(_v sig_url)" ] || say "note: $(_v tag) carries no SHA256SUMS.sig, so --latest will refuse it (only signed images are installed)"
@@ -416,7 +428,13 @@ update_latest() {   # <channel> <download-only 1/''>: sets src= to the verified 
     _tag=$(_v tag)
     case $_tag in v[0-9]*) ;; *) die "the $_ch channel named no usable release" ;; esac
     if [ "$(_v newer)" != yes ] && [ -z "${ONEBIT_UPDATE_ANY:-}" ]; then
-        say "up to date: running ${_run:-unknown}, the $_ch channel's newest is $_tag"; exit 0
+        if [ "$(_v ahead)" = yes ]; then
+            say "up to date: running $_run is newer than the $_ch channel's newest $_tag"
+        else
+            say "up to date: running ${_run:-unknown}, the $_ch channel's newest is $_tag"
+        fi
+        say "note: the release list is not signed, so a host that hides a newer release is not detectable (engine#3448)"
+        exit 0
     fi
     [ -n "$(_v image_url)" ] || die "$_tag has no 1bit-os image asset"
     [ -n "$(_v sig_url)" ] && [ -n "$(_v sums_url)" ] || die "$_tag carries no signed SHA256SUMS (SHA256SUMS + SHA256SUMS.sig): only signed releases are installed"

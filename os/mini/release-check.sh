@@ -1440,6 +1440,10 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(update_tools_verdict 1 1 0 1111111111111111111111111111111111111111111111111111111111111111)"   # another key
     check PASS "$(update_check_verdict "$(printf 'running:  v2026.50\nstable: v2026.50 (2026-12-07)\nup to date\n')")"
     check PASS "$(update_check_verdict "$(printf 'running:  v2026.49\nstable: v2026.50 (2026-12-07)\nan update is available: x\n')")"
+    # engine#3448: a running release ahead of the channel is still a PASS (the check answered), and the note line after
+    # "up to date" must not turn the row into "no answer" on the board.
+    _uo=$(printf '%s\n' 'running:  v2026.49' 'stable: v2026.48 (2026-11-23)' "up to date: running v2026.49 is newer than the stable channel's newest v2026.48" 'note: the release list is not signed, so a host that hides a newer release is not detectable (engine#3448)')
+    check PASS "$(update_check_verdict "$_uo")"
     check SKIP "$(update_check_verdict '1bit-update: could not reach GitHub (timeout): no update check now (running v2026.50)')"
     check SKIP "$(update_check_verdict '1bit-update: no answer from the stable channel: API rate limit exceeded (running v2026.50)')"
     check FAIL "$(update_check_verdict 'sh: 1bit-update: not found')"

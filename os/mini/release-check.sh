@@ -985,6 +985,27 @@ npu_sets_root() {  # the directory that holds this boot's sets: in the payload b
         printf '%s\n' "${NPU_SETS_DIR:-/data/npu/kernels}"
     fi
 }
+# rc2 (npu-kernels#132): Qwen3-1.7B and 4B also ship as Q4_K packs, served by their own sets <shape>-dx4k6 BESIDE the
+# Q4NX <shape> sets (the route picks the set by the pack's tile format and refuses a mismatch). The catalogue's
+# Qwen3-1.7B-NPU-1bit / Qwen3-4B-NPU-1bit map to the dx4k6 sets (config/npu-catalogue-sets.json), so a release that
+# lost one would have the catalogue filter drop that model without a word. Each dx4k6 set must be there, signed
+# (npumanifest 2 + a 64-byte manifest.sig), with its Q4NX twin beside it. Pure, so --self-test drives it: <sets root>
+npu_dx4k6_verdict() {
+    _root=${1:-} _miss="" _ok=0
+    for _s in 2048x6144x16x8 2560x9728x32x8; do
+        _d="$_root/$_s-dx4k6"
+        if [ ! -d "$_d" ]; then _miss="${_miss:+$_miss; }$_s-dx4k6 is missing"; continue; fi
+        [ "$(head -c 13 "$_d/manifest" 2>/dev/null)" = "npumanifest 2" ] || { _miss="${_miss:+$_miss; }$_s-dx4k6 has no signed manifest"; continue; }
+        { [ -f "$_d/manifest.sig" ] && [ "$(wc -c <"$_d/manifest.sig" | tr -d ' ')" = 64 ]; } || { _miss="${_miss:+$_miss; }$_s-dx4k6 has no 64-byte manifest.sig"; continue; }
+        [ -d "$_root/$_s" ] || { _miss="${_miss:+$_miss; }$_s-dx4k6 ships without its Q4NX twin $_s (it must be beside, not instead)"; continue; }
+        _ok=$((_ok + 1))
+    done
+    if [ -z "$_miss" ]; then
+        printf 'PASS the Q4_K NPU sets ship signed beside their Q4NX twins (2048x6144x16x8-dx4k6, 2560x9728x32x8-dx4k6)'
+    else
+        printf 'FAIL Q4_K NPU sets (%s of 2 good): %s' "$_ok" "$_miss"
+    fi
+}
 npu_link_verdict() {
     _sets=${1:-} _link=${2:-}
     case "$_sets" in
@@ -1494,6 +1515,20 @@ next')
     if [ "$_r" = "$NT/data/npu/kernels" ]; then printf 'ok   no sets in the payload falls back to the data partition\n'
     else printf 'FAIL want the data partition, got %s\n' "$_r"; rc=1; fi
     rm -rf "$NT"
+    # rc2: the Q4_K (dx4k6) sets beside their Q4NX twins
+    QT=$(mktemp -d)
+    for _s in 2048x6144x16x8 2560x9728x32x8; do
+        mkdir -p "$QT/$_s" "$QT/$_s-dx4k6"
+        printf 'npumanifest 2\nset x\n' > "$QT/$_s-dx4k6/manifest"; head -c 64 /dev/zero > "$QT/$_s-dx4k6/manifest.sig"
+    done
+    check PASS "$(npu_dx4k6_verdict "$QT")"
+    rm -f "$QT/2560x9728x32x8-dx4k6/manifest.sig"
+    check FAIL "$(npu_dx4k6_verdict "$QT")"
+    head -c 64 /dev/zero > "$QT/2560x9728x32x8-dx4k6/manifest.sig"; rm -rf "$QT/2048x6144x16x8"
+    check FAIL "$(npu_dx4k6_verdict "$QT")"
+    rm -rf "$QT/2048x6144x16x8-dx4k6"; mkdir -p "$QT/2048x6144x16x8"
+    check FAIL "$(npu_dx4k6_verdict "$QT")"
+    rm -rf "$QT"
     # docs/laya-first.md §7: the laya-auto row. The second case is the one a status-only row misses - the
     # request answered 200 on default_model, which looks like a healthy route until you read the decision.
     LV='{"x_lemonade_route":{"route_to":"Qwen3-Coder-30B-A3B-Instruct-1bit","matched_rule":"laya-code","default_used":false,"trace":[{"condition":"classifier:laya","label":"code","score":0.46}]}}'
@@ -2587,6 +2622,10 @@ else
     if [ "$BAD" = 0 ]; then pass sealed "$SETS NPU sets under $NPUROOT ($K2 signed-manifest, $((SETS - K2)) sealed), every file in its set's manifest, no build tree"
     else fail sealed "$BAD problem(s) under $NPUROOT: a sealed set in the clear, a file not in its set's manifest, or a build tree"; fi
 fi
+
+# ── rc2: the Q4_K (dx4k6) NPU sets for Qwen3-1.7B / 4B, signed, beside the Q4NX ones (npu-kernels#132) ────────
+_v=$(npu_dx4k6_verdict "$NPUROOT")
+case "$_v" in PASS*) pass npu-dx4k6 "${_v#PASS }" ;; *) fail npu-dx4k6 "${_v#FAIL }" ;; esac
 
 # ── the signatures over those manifests (engine #574): the release public key is the only thing needed ──
 # The loader - the private NPU runtime - holds the same key and verifies the signature before it opens

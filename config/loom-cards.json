@@ -196,7 +196,7 @@
    "weights_licence": "mit",
    "match": "none",
    "arch": "deepseek2 (MLA + MoE)",
-   "gap": "absorbed-MLA attention + MoE kernels in progress (engine#3221)"
+   "gap": "deepseek2/MLA: the public port starter has no MLA path (head_dim 576 vs 64/128/256), so the port path is the private Loom kernel kit, whose package registers on loom-serve 0.3.0 after a chat-block terminal-marker fix; no published card and no gate row (engine#3221, KNOWN-ISSUES.md)"
   },
   {
    "id": "Qwen3-4B-Instruct-2507-1bit",

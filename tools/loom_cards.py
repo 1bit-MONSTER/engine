@@ -69,7 +69,7 @@ NOTES = {
     "Qwen3-Reranker-0.6B-1bit": ("qwen3 (reranker)", "unsloth-Qwen3-0.6B-loom",
                                  "same blocks as Qwen3-0.6B; needs a rerank service (yes/no logit score)"),
     "GLM-4.7-Flash-1bit": ("deepseek2 (MLA + MoE)", None,
-                           "absorbed-MLA attention + MoE kernels in progress (engine#3221)"),
+                           "deepseek2/MLA: the public port starter has no MLA path (head_dim 576 vs 64/128/256), so the port path is the private Loom kernel kit, whose package registers on loom-serve 0.3.0 after a chat-block terminal-marker fix; no published card and no gate row (engine#3221, KNOWN-ISSUES.md)"),
     "nomic-embed-text-v2-moe-1bit": ("nomic-bert-moe", None, "encoder-only MoE; no encoder card"),
     "jina-reranker-v1-tiny-en-1bit": ("jina-bert", None, "encoder-only (ALiBi); no encoder card"),
     "ZAYA1-8B-1bit": ("zaya", None, "new arch (CCA attention, router, residual scales): engine#3322"),

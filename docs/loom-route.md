@@ -103,7 +103,9 @@ only after it passed the gate. `match` says how close the card is:
 - `same-model`: same upstream model from another GGUF (other packager or quant). Not gateable as it
   stands: a gate row is valid only on the bytes we ship (engine#3158), so the card is first rebuilt or
   pointed at our pinned checkpoint, and the gate row is run on that card;
-- `none`: no card; `arch`, `nearest` and `gap` say what a port needs (engine#3156);
+- `none`: no card; `arch`, `nearest` and `gap` say what a port needs (engine#3156) — and, for an
+  architecture the public port starter cannot express (deepseek2/MLA today), that the port path is the private
+  Loom kernel kit ([KNOWN-ISSUES.md](../KNOWN-ISSUES.md), engine#3221);
 - `npu`: NPU entries, which never take the GPU route.
 
 Each entry keeps the card's licence (the Loom programs) and the weights' licence apart; the weights

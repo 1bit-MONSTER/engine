@@ -1081,11 +1081,14 @@ loom_verdict() {
     esac
     _fb=$(printf '%s\n' "$_ll" | grep -m1 'serving on the llama.cpp route')
     [ -z "$_fb" ] || { printf 'FAIL %s fell back to the llama.cpp route: %s' "$_m" "$(printf '%s' "$_fb" | sed 's/^.*1bit serve: //' | cut -c1-200)"; return 0; }
-    _rt=$(printf '%s\n' "$_ll" | grep -m1 -- '-> loom-serve card ')
+    # main's serve says "-> loom-serve card <card>", the rc1 build "<model> on loom (<loom-serve>)": either is the routing
+    _rt=$(printf '%s\n' "$_ll" | grep -m1 -E -- '-> loom-serve card | on loom \(')
     [ -n "$_rt" ] || { printf 'FAIL serve never said it routed %s to loom-serve (no "-> loom-serve card" line in the Lemonade log), so the answer did not come from the Loom route' "$_m"; return 0; }
     [ "$_np" -gt 0 ] 2> /dev/null || { printf 'FAIL serve routed %s to loom-serve but no loom-serve process ran while it was loaded' "$_m"; return 0; }
     case "$_rp" in
-        *391*) printf 'PASS %s answered 391 on loom-serve (%s)' "$_m" "$(printf '%s' "$_rt" | sed -n 's/.*1bit serve: loom route \([^:]*\):.*-> loom-serve card \([^ ]*\).*/route \1, card \2/p')" ;;
+        *391*) _how=$(printf '%s' "$_rt" | sed -n 's/.*1bit serve: loom route \([^:]*\):.*-> loom-serve card \([^ ]*\).*/route \1, card \2/p')
+               [ -n "$_how" ] || _how=$(printf '%s' "$_rt" | sed -n 's/.*1bit serve: \(.*\) on loom (\([^)]*\)).*/\1 on \2/p')
+               printf 'PASS %s answered 391 on loom-serve (%s)' "$_m" "$_how" ;;
         '') printf 'FAIL %s went through loom-serve but gave no reply' "$_m" ;;
         *)  printf 'FAIL %s went through loom-serve but did not answer 391: %s' "$_m" "$(printf '%s' "$_rp" | tr '\n' ' ' | cut -c1-160)" ;;
     esac
@@ -1219,6 +1222,7 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(loom_verdict 1 listed '{"content":"391"}' '' 0)"                           # no route line at all
     check FAIL "$(loom_verdict 1 listed '{"content":"391"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl: Inkling-2-Mini-1bit -> loom-serve card unsloth-Inkling-2-Mini-loom-r9700 (model x; gate y)' 0)"                       # routed, no loom-serve ran
     check FAIL "$(loom_verdict 1 listed '{"content":"392"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl: Inkling-2-Mini-1bit -> loom-serve card unsloth-Inkling-2-Mini-loom-r9700 (model x; gate y)' 1)"                       # Loom, wrong answer
+    check PASS "$(loom_verdict 1 listed '{"content":"391"}' '1bit serve: Inkling-2-Mini-1bit on loom (/opt/1bit-package/loom/loom-serve)' 1)"                       # the rc1 build's wording
     check SKIP "$(loom_verdict 0 listed '' '' 0)"
     check SKIP "$(loom_verdict 1 absent '' '' 0)"
     check FAIL "$(loom_verdict 1 'fetchfail:lemonade pull exited 1' '' '' 0)"
@@ -2182,10 +2186,22 @@ if [ "$_lg" = 1 ]; then
 fi
 if [ "$_ls" = listed ]; then
     _off=$(wc -c < "$LEMLOG" 2> /dev/null || echo 0)
+    # load FIRST, with a long cap: the rc1 board run (24 Nov) took 153 s to load Inkling (45 s hashing the 17.6 GB GGUF
+    # for the route match, then loom-serve), the chat's own cap ran out first, the row read the log before serve said
+    # where it routed, and the next row's model evicted Inkling from Lemonade's one llm slot
+    _lt0=$(date +%s)
+    if command -v curl > /dev/null 2>&1; then
+        curl -s -m "${LOOM_LOAD_WAIT:-900}" -X POST ${KEY:+-H "Authorization: Bearer $KEY"} -H 'Content-Type: application/json' \
+             -d "{\"model_name\":\"$LOOM_MODEL\"}" "$API/api/v1/load" > /dev/null 2>&1
+    else
+        wget -q -T "${LOOM_LOAD_WAIT:-900}" -t 1 -O /dev/null --header='Content-Type: application/json' \
+             --post-data="{\"model_name\":\"$LOOM_MODEL\"}" "$API/api/v1/load" 2> /dev/null
+    fi
+    say "info  loom  : $LOOM_MODEL loaded in $(( $(date +%s) - _lt0 )) s"
     _lr=$(auth_post "{\"model\":\"$LOOM_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 17 * 23? Reply with the number only.\"}],\"max_tokens\":1024,\"temperature\":0}" \
           "$API/api/v1/chat/completions" slow)
     _lp=$(pgrep -f '/loom-serve' 2> /dev/null | wc -l)
-    _ll=$(tail -c +$((_off + 1)) "$LEMLOG" 2> /dev/null | grep -a '1bit serve: loom route')
+    _ll=$(tail -c +$((_off + 1)) "$LEMLOG" 2> /dev/null | grep -a -E '1bit serve: loom route|1bit serve: .* on loom \(')
     got --header='Content-Type: application/json' --post-data="{\"model_name\":\"$LOOM_MODEL\"}" "$API/api/v1/unload" > /dev/null 2>&1
 fi
 _lv=$(loom_verdict "$_lg" "$_ls" "$_lr" "$_ll" "$_lp")

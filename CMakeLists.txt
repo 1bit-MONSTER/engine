@@ -532,6 +532,9 @@ add_test(NAME release_check_row COMMAND ${CMAKE_SOURCE_DIR}/os/mini/release-chec
 # the handoff driver must not orphan its server on SIGKILL (PR_SET_PDEATHSIG); no GPU, no model
 add_test(NAME kvshare_orphan COMMAND ${CMAKE_SOURCE_DIR}/tests/kvshare_orphan_test.sh)
 add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test.sh)
+# OS-UPDATER item 3: the signed SHA256SUMS of a 1bit OS release (tools/release_sign.py), the in-system updater's check
+add_test(NAME release_sign COMMAND sh ${CMAKE_SOURCE_DIR}/tests/release_sign_test.sh)
+set_tests_properties(release_sign PROPERTIES SKIP_RETURN_CODE 77)
 # engine#1564: which files the copyright gate looks at -- a staged file is seen, an untracked one is seen (that is why
 # running it before `git add` is useful), an ignored one is not. A throwaway repo in a temp dir: no build, no device.
 add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_test.sh)

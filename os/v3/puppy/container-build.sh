@@ -381,6 +381,7 @@ if [ -n "${PAYLOAD:-}" ]; then
     install -D -m 644 /recipe/embed/etc/xdg/autostart/1bit-lemonade-webapp.desktop \
         "$skeleton/etc/xdg/autostart/1bit-lemonade-webapp.desktop"
     install -D -m 644 /repo/tools/seal_manifest.py "$skeleton/usr/lib/1bit/seal_manifest.py"
+    install -D -m 644 /repo/tools/release_sign.py "$skeleton/usr/lib/1bit/release_sign.py"   # OS-UPDATER item 3 (key: cut.sh RELEASE_PUB)
     install -D -m 644 /seal.pub "$skeleton/etc/1bit/seal-pub.txt"
     ln -sfn /usr/local/bin/1bit-release-check "$skeleton/bin/1bit-release-check"
     ln -sfn /usr/local/bin/1bit-install "$skeleton/bin/1bit-install"

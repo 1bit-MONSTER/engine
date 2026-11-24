@@ -40,7 +40,10 @@
 #      LEMONADE=<an already-built lemonade dir> (skip step 2; its lemond must report this tree's lemonade pin),
 #      NODE_TARBALL=<the pinned Node.js tarball> (BASE cut: use a local copy instead of downloading pin.txt's node_url),
 #      LOOM_WHEEL=<the pinned hrx-loom wheel>, LOOM_CARDS_FROM=<dir of the pinned cards> (local copies for stage-loom.sh),
-#      ONEBIT_IMAGE_ARCHIVE=<archive root>, NO_ARCHIVE=1 (a dry cut: probe, no archive).
+#      ONEBIT_IMAGE_ARCHIVE=<archive root>, NO_ARCHIVE=1 (a dry cut: probe, no archive),
+#      RELEASE_PUB=<the release public key: 32 raw bytes or 64 hex> (BASE cut: baked as /etc/1bit/release-pub, the key
+#      the in-system updater verifies SHA256SUMS.sig with, tools/release_sign.py; without it the image carries no key
+#      and the updater refuses every download).
 # Needs passwordless sudo for the root steps (patch-sfs, base-modes, mkimage), as the release host has.
 # Nothing here writes a stick, tags, uploads or publishes.
 set -euo pipefail
@@ -167,11 +170,28 @@ usr/local/bin/1bit-install os/v3/puppy/1bit-install.sh
 usr/sbin/1bit-board os/mini/board.sh
 etc/1bit/base-modes-keep os/v3/puppy/base-modes-keep
 usr/lib/1bit/seal_manifest.py tools/seal_manifest.py
+usr/lib/1bit/release_sign.py tools/release_sign.py
 EOF
     # generated from the payload, as container-build.sh does: the catalogue list and the identity
     python3 "$here/catalogue-manifest.py" "$P/bin/resources/server_models.json" "$out/onebit-models.txt" ||
         die "could not write onebit-models.txt from the payload catalogue"
     printf 'etc/1bit/onebit-models.txt\t%s\n' "$out/onebit-models.txt" >> "$M.os"
+    # OS-UPDATER item 3: the release PUBLIC key the in-system updater verifies SHA256SUMS.sig with (tools/release_sign.py),
+    # as one line of hex. It is a public key: nothing secret enters the image.
+    if [ -n "${RELEASE_PUB:-}" ]; then
+        python3 -I - "$RELEASE_PUB" "$out/release-pub" << 'PY' || die "RELEASE_PUB=$RELEASE_PUB is not a 32-byte Ed25519 public key (raw or hex)"
+import sys
+d = open(sys.argv[1], "rb").read(200)
+k = d if len(d) == 32 else bytes.fromhex(d.decode("ascii").strip())
+if len(k) != 32:
+    raise SystemExit(1)
+open(sys.argv[2], "w").write(k.hex() + "\n")
+PY
+        printf 'etc/1bit/release-pub\t%s\n' "$out/release-pub" >> "$M.os"
+        say "  release public key baked: $(cut -c1-16 "$out/release-pub")... (/etc/1bit/release-pub)"
+    else
+        say "  NOTE: no RELEASE_PUB: this image carries no release public key, so its updater refuses every download"
+    fi
     # the base's rc.shutdown with the 1bit-shutdown-watch hook, as container-build.sh does (engine#3287)
     sudo -n unsquashfs -q -cat "$bsfs" etc/rc.d/rc.shutdown > "$out/rc.shutdown" || die "the base SFS has no etc/rc.d/rc.shutdown"
     sh "$here/hook-rc-shutdown.sh" "$out/rc.shutdown" || die "could not hook 1bit-shutdown-watch into rc.shutdown"

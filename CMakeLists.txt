@@ -472,6 +472,10 @@ add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<T
 # bundle, which finds no GPU on 1bit OS (engine#3399). No build, no device: bin/lemond is a stub that records
 # its environment.
 add_test(NAME lemond_onebit COMMAND ${CMAKE_SOURCE_DIR}/tests/lemond_onebit.sh)
+# RESOURCE_LOCK route_ports: the stub binds nothing, but the census (tests/route_port_lock_test.py) reads the
+# script and sees the fixed --port literal this row feeds the stub, so the row is a route row to it -- and the
+# lock costs nothing here (engine#3399).
+set_tests_properties(lemond_onebit PROPERTIES RESOURCE_LOCK route_ports)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
 # The Loom GPU route (app/loom_route.h, docs/loom-route.md): the table, the match, readiness and the request/reply

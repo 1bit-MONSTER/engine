@@ -34,7 +34,37 @@ runs inside Lemonade, which releases on Fridays. The release run (`scripts/weekl
 everything from scratch at the current pins, so each release carries that week's upstreams.
 
 Releases are tagged `v<ISO year>.<ISO week>` (`v2026.40`), like Lemonade's `2026.39.1`; a second
-release in the same week gets `.1`.
+release in the same week gets `.1`. A test build is a GitHub **pre-release** tagged `v<year>.<week>-rc<N>` (`v2026.49-rc1`); it is never
+marked latest, and `1bit-update --check --channel test` finds it.
+
+## v2026.49-rc1 (24 Nov 2026) — a test build: Inkling-2-Mini on the Loom route
+
+[v2026.49-rc1](https://github.com/1bit-MONSTER/engine/releases/tag/v2026.49-rc1) is a **GitHub pre-release**, not the
+latest release: v2026.48 stays the recommended image. It is tagged at engine `0a0e550a`, image only (no distro packages),
+and carries Inkling-2-Mini on the GPU through the Loom route (loom-serve on hrx-loom 0.3.0 and the
+`unsloth-Inkling-2-Mini-loom-r9700` card ship in the image, [#3412](https://github.com/1bit-MONSTER/engine/pull/3412)),
+Lemonade `aa6c7520` with the hold endpoint for `1bit-heavy`, and the NPU kernel sets re-signed at npu-kernels `0e3017a8`.
+
+| what | result (Ryzen AI MAX+ 395, Secure Boot on, image sha256 `4b7c2aa6…`) |
+|---|---|
+| live USB stick | `1bit-release-check`: 42 rows, 30 pass, 12 skip, 0 fail |
+| installed (`1bit-update` from v2026.48) | 36 pass, 4 skip, 2 fail; both fails are the test machine's own save-layer state, not the image |
+| Inkling-2-Mini on the Loom route | loaded in 93 s (stick) / 154 s (disk, first load); `17 * 23` -> 391 in 2 s |
+| GPU (HRX) Qwen3-0.6B / NPU Qwen3-0.6B | 309 / 99 tok/s |
+| reboots with the shutdown watcher + heartbeat | 4, none stalled |
+
+Its assets carry the first **signed** checksums: `SHA256SUMS.sig` signs `SHA256SUMS` with the release key
+(`tools/release_sign.py`, [#3442](https://github.com/1bit-MONSTER/engine/pull/3442)), which the in-system updater checks
+before it installs an image. Known limit: Inkling runs undrafted on this card, about half the speed of the full card.
+
+## v2026.48 (23 Nov 2026)
+
+[v2026.48](https://github.com/1bit-MONSTER/engine/releases/tag/v2026.48) is tagged at engine `e697c40a` (release branch
+`1bit/release-v2026.48`), Lemonade `4bd453a0`: the follow-up to v2026.47, with every problem found taking v2026.47 through a
+live boot, an install and a week of use fixed and measured on the AI MAX+ 395. The stick boots its own system by data-partition
+UUID, a USB device that does not answer no longer holds the boot (about 40 s faster), the NPU route answers chats that
+offer tools, and Node.js ships for `lemonade launch <agent>`. Release check on the stick and on the installed disk:
+39 rows, 33 pass, 6 skip, 0 fail. The release page lists every change.
 
 ## v2026.47 (22 Nov 2026) — the first published release
 

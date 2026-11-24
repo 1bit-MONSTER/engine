@@ -48,5 +48,14 @@ sd "$t/updates-mine"; rc=$?
 [ $rc = 1 ] && grep -q "owned by uid" "$t/sd"; check $? "safe_dir refuses a directory not owned by root"
 : > "$t/updates-file"; sd "$t/updates-file"; [ $? = 1 ] && grep -q "not a directory" "$t/sd"; check $? "safe_dir refuses a file in place of the directory"
 
+# work_sweep: a crashed run's dir (older than a day) is removed at the next start; a fresh one, a symlink, and one
+# with a mount inside are not (/run is not a tmpfs on 1bit OS: a leftover would stay in the save layer, #3457)
+mkdir -p "$t/sw/1bit-update.old/x" "$t/sw/1bit-update.new" "$t/victim2"; ln -s "$t/victim2" "$t/sw/1bit-update.link"
+touch -t 202001010000 "$t/sw/1bit-update.old"   # an old fixed date (busybox touch has no -d 'N days ago')
+touch "$t/victim2/keep"
+( ONEBIT_UPDATE_LIB=1 LOG=/dev/null; . "$u"; work_sweep "$t/sw" ) > /dev/null 2>&1
+[ ! -e "$t/sw/1bit-update.old" ] && [ -d "$t/sw/1bit-update.new" ] && [ -L "$t/sw/1bit-update.link" ] && [ -e "$t/victim2/keep" ]
+check $? "work_sweep removes a crashed run's day-old dir, keeps a fresh one, never follows a link"
+
 echo "update_workdir_test: $([ $bad = 0 ] && echo ok || echo FAIL)"
 [ $bad = 0 ]

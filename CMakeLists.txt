@@ -1735,6 +1735,12 @@ if(Python3_Interpreter_FOUND)
     # slug, a cache entry that is not the fork's tree), and a self-test no runner names is a self-test nobody runs --
     # tool_selftest_wired_check counted it as wired through the other three rows, which is why this was easy to miss.
     add_python_test(registry_build_self ${CMAKE_SOURCE_DIR}/tools/registry_build.py --self-test)
+    # engine#3340: a checked-model row states what was MEASURED, not only what a one-prompt serve check said. The
+    # decode record is reviewed data copied onto the row (--annotate-decode), so this row compares two files: no
+    # device, no GGUF. It fails on the checked.json that has no decode block, which is the control the tool's
+    # --self-test arm pins on a scratch registry, so the check cannot be weakened into paper again.
+    add_python_test(registry_decode ${CMAKE_SOURCE_DIR}/tools/registry_check.py --check-decode)
+    add_python_test(registry_check_self ${CMAKE_SOURCE_DIR}/tools/registry_check.py --self-test)
     # the row's own mutant: a fake fork and a fake gitlink in a scratch repo, so the content edit that made every
     # other row green is proved to make this one red, and the no-checkout case is proved to be 77 and not 0.
     add_test(NAME registry_content_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_content_test.py)

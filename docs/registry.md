@@ -78,6 +78,21 @@ included. The architecture recorded is the one the backend loads: the GGUF
 `registry/checked.json` with the Vulkan build, as were the Zyphra Zamba rows, which ran on Vulkan
 only. The zinc rows went with ZINC in the core strip.)
 
+**What a pass does and does not clear.** A `passed` row records that `tests/serve_e2e.sh` answered
+one fixed question under temperature 0 and streamed; a route can answer it while its decode is wrong
+(engine#3340: hrx's MiniCPM4-8B said "Paris" on an engine whose `common.get_rows_scale.f32` compiled
+MiniCPM's `residual_scale` 0.2475 to 0 and dropped the last layer's attention term, while agreeing with
+the CPU on 2 of 8 prompts). A row may therefore also carry a `decode` object: the CPU-arbiter agreement
+measurement for that model, recorded in `registry/decode_agreement.json` from one `tools/logprob_agree.py`
+run (the Loom and llama.cpp arms against the CPU arbiter on the same GGUF, greedy, thinking off) with
+its engine, llama.cpp commit, date and source link. `tools/registry_check.py --annotate-decode` copies
+the record onto the row and runs no model; `--check-decode` (ctest `registry_decode`) fails when a
+checked row loses its measurement or states one nothing recorded, and its `--self-test` (ctest
+`registry_check_self`) drives a scratch registry through the stale-row, annotation and refusal arms.
+The numbers are reviewed data, not re-measured by CI: CI has no device and no GGUF. MiniCPM4-8B's row
+states 75 % greedy agreement / 0.649 token-id match / 0.0266 nats mean KLD (25 % / 0.252 / 0.305 before
+the fix, llama.cpp#493, carried on main by pin `0dcf0647`).
+
 GLM-4.7-Flash and Qwen3-Coder-30B-A3B failed on HRX until the llama.cpp pin `96f6b89` (#95).
 The pin fixes four things:
 - HRX0 now claims flash attention for MLA heads (576) and at full context (262144).
@@ -209,6 +224,8 @@ quiet day — but an alert from the other watch still wins the exit code.
 tools/registry_build.py            # rebuild registry/architectures.json from the pins
 tools/registry_build.py --check    # exit 1 if it is stale; rc 77 (a skip) without the llama.cpp submodule
 tools/registry_check.py build/1bit --models ~/models   # run the checks on Strix Halo
+tools/registry_check.py --annotate-decode   # copy registry/decode_agreement.json onto the checked rows
+tools/registry_check.py --check-decode      # exit 1 unless every row states exactly what is recorded
 tools/census.py                    # full HF sweep (about 420 pages)
 tools/census.py --report           # recompute coverage from the saved counts
 tools/census_watch.py              # newest models vs the registry, plus FastFlowLM's org and

@@ -19,6 +19,10 @@
 # 1bit-update --rollback                    boot the other slot next (both sets stay on the disk)
 # 1bit-update --status                      which slot is active, what each slot holds, which one GRUB boots
 # 1bit-update --shadowed                    the release files the save layer holds a copy of (exit 1 when any)
+# 1bit-update --check [--channel stable|test]   is a newer release published? (GitHub releases of 1bit-MONSTER/engine;
+#                                           stable = the newest full release, test = the newest including pre-releases
+#                                           such as v2026.49-rc1). Channel default from /data/1bit/update.conf
+#                                           (channel=stable|test). No network or a rate limit is said, exit 0.
 #
 # An installed 1bit OS is a frugal set (kernel, initrd, SFS) plus ONE save layer, and the only way to change the OS
 # used to be "write a new image", which throws the layer's machine away with it. So an installed machine carries TWO
@@ -230,15 +234,107 @@ shadow_move() {
     return $rc
 }
 
+# ── --check (OS updater U1): what is published, against what is running ─────────────────────────────────────────
+# update_running: the release this system runs, from /etc/1bit/release-identity (payload=lemonade-onebit-<tag>)
+UPDATE_IDENTITY=${ONEBIT_UPDATE_IDENTITY:-/etc/1bit/release-identity}
+UPDATE_CONF=${ONEBIT_UPDATE_CONF:-/data/1bit/update.conf}
+UPDATE_API=${ONEBIT_UPDATE_API:-https://api.github.com/repos/1bit-MONSTER/engine/releases?per_page=30}
+update_running() { sed -n 's/^payload=lemonade-onebit-//p' "$UPDATE_IDENTITY" 2> /dev/null | head -1; }
+update_channel() {   # $1 = an explicit --channel, else update.conf, else stable
+    _c=${1:-}
+    [ -n "$_c" ] || _c=$(sed -n 's/^channel=//p' "$UPDATE_CONF" 2> /dev/null | tr -d ' \r' | head -1)
+    case $_c in stable|test) printf '%s' "$_c" ;; *) printf stable ;; esac
+}
+# update_pick <api json file> <channel> <running tag>: key=value lines about the newest release of the channel. The JSON
+# is remote data: python3 -I reads it as data, the shell never evaluates any of it, and every value printed is reduced
+# to a safe charset first.
+update_pick() {
+    python3 -I -c '
+import json, re, sys
+path, channel, running = sys.argv[1:4]
+def ver(tag):   # vYYYY.WW[-rcN]: a final release sorts after its own release candidates
+    m = re.fullmatch(r"v(\d{4})\.(\d{1,2})(?:-rc(\d+))?", tag or "")
+    return None if not m else (int(m.group(1)), int(m.group(2)), 1 if m.group(3) is None else 0, int(m.group(3) or 0))
+# printable ASCII only: remote text never reaches a shell, so the danger is a terminal escape, not a quote
+safe = lambda v: re.sub(r"[^\x20-\x7e]", "", str(v))[:200]
+try:
+    rel = json.load(open(path))
+except (OSError, ValueError):
+    print("error=the release list could not be read"); sys.exit(0)
+if isinstance(rel, dict):   # GitHub sends an error object (rate limit, not found)
+    print("error=" + safe(rel.get("message", "unexpected answer"))); sys.exit(0)
+best = None
+for r in rel if isinstance(rel, list) else []:
+    if not isinstance(r, dict) or r.get("draft"):
+        continue
+    if channel == "stable" and r.get("prerelease"):
+        continue
+    v = ver(r.get("tag_name"))
+    if v and (best is None or v > best[0]):
+        best = (v, r)
+if best is None:
+    print("error=no %s release is published" % channel); sys.exit(0)
+r = best[1]
+assets = [a for a in r.get("assets") or [] if isinstance(a, dict)]
+img = [a for a in assets if re.fullmatch(r"1bit-os-v[0-9.]+(-rc[0-9]+)?\.img\.zst", str(a.get("name", "")))]
+named = lambda n: [a for a in assets if a.get("name") == n]
+cur = ver(running)
+print("tag=" + safe(r.get("tag_name")))
+print("published=" + safe(r.get("published_at", ""))[:10])
+print("prerelease=" + ("yes" if r.get("prerelease") else "no"))
+print("newer=" + ("unknown" if cur is None else ("yes" if best[0] > cur else "no")))
+if img:
+    print("image=" + safe(img[0]["name"])); print("size=%d" % int(img[0].get("size") or 0))
+    print("image_url=" + safe(img[0].get("browser_download_url", "")))
+print("sums_url=" + (safe(named("SHA256SUMS")[0].get("browser_download_url", "")) if named("SHA256SUMS") else ""))
+print("sig_url=" + (safe(named("SHA256SUMS.sig")[0].get("browser_download_url", "")) if named("SHA256SUMS.sig") else ""))
+for line in [l.strip() for l in (r.get("body") or "").splitlines() if l.strip() and not l.strip().startswith("|")][:4]:
+    print("note=" + safe(line.lstrip("#*- ")))
+' "$1" "$2" "$3"
+}
+update_check() {   # [channel]: prints the answer; always exit 0 (an update check is information, never a failure)
+    _ch=$(update_channel "${1:-}") _run=$(update_running)
+    _j=${ONEBIT_UPDATE_API_JSON:-}
+    if [ -z "$_j" ]; then
+        mkdir -p /tmp/1bit-update; _j=/tmp/1bit-update/releases.json
+        if ! curl -sS --proto =https --tlsv1.2 -m 20 -H 'Accept: application/vnd.github+json' -o "$_j" "$UPDATE_API" \
+                2> /tmp/1bit-update/check.err; then
+            say "1bit-update: could not reach GitHub ($(head -c 160 /tmp/1bit-update/check.err)): no update check now (running ${_run:-unknown})"
+            return 0
+        fi
+    fi
+    _a=$(update_pick "$_j" "$_ch" "$_run")
+    _v() { printf '%s\n' "$_a" | sed -n "s/^$1=//p" | head -1; }
+    if [ -n "$(_v error)" ]; then
+        say "1bit-update: no answer from the $_ch channel: $(_v error) (running ${_run:-unknown})"; return 0
+    fi
+    say "running:  ${_run:-unknown}"
+    say "$_ch: $(_v tag) ($(_v published)$( [ "$(_v prerelease)" = yes ] && echo ', pre-release'))"
+    [ -n "$(_v image)" ] && say "image:    $(_v image), $(( $(_v size) / 1048576 )) MiB"
+    printf '%s\n' "$_a" | sed -n 's/^note=/  | /p'
+    case $(_v newer) in
+        yes) say "an update is available: 1bit-update --latest${1:+ --channel $_ch} installs it into the other slot" ;;
+        no)  say "up to date" ;;
+        *)   say "the running release (${_run:-none}) has no version to compare with" ;;
+    esac
+    [ -n "$(_v sig_url)" ] || say "note: $(_v tag) carries no SHA256SUMS.sig, so --latest will refuse it (only signed images are installed)"
+    return 0
+}
+
 # sourced by tests/one_bit_update_slots_test.sh with ONEBIT_UPDATE_LIB=1: the functions above, nothing below
 if [ "${ONEBIT_UPDATE_LIB:-}" = 1 ]; then return 0 2> /dev/null || exit 0; fi
 
 src=''
 mode=install
 novfy=
+channel=
 while [ $# -gt 0 ]; do
     case $1 in
         -h|--help) usage; exit 0 ;;
+        --check) mode=check ;;
+        --channel) channel=${2:-}
+                   case $channel in stable|test) ;; *) echo "1bit-update: --channel takes stable or test" >&2; exit 1 ;; esac
+                   shift ;;
         --status) mode=status ;;
         --shadowed) mode=shadowed ;;
         --rollback) mode=rollback ;;
@@ -250,7 +346,9 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$src" ] || [ "$mode" != install ] || { usage >&2; exit 1; }
 mkdir -p /tmp/1bit-update 2> /dev/null
-: >> "$LOG" 2> /dev/null || LOG=/dev/null
+( : >> "$LOG" ) 2> /dev/null || LOG=/dev/null   # a subshell: in dash a failed redirect on the special builtin `:` exits the shell, braces or not
+# --check needs no root and no installed disk: a live stick may ask too
+if [ "$mode" = check ]; then update_check "$channel"; exit 0; fi
 
 [ "$(id -u)" = 0 ] || die "run as root (it writes the other slot and the ESP)"
 [ -d "$DATA" ] && grep -q " $DATA " /proc/mounts 2> /dev/null || die "no $DATA: this is not an installed system"

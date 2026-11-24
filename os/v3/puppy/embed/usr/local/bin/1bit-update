@@ -23,6 +23,11 @@
 #                                           stable = the newest full release, test = the newest including pre-releases
 #                                           such as v2026.49-rc1). Channel default from /data/1bit/update.conf
 #                                           (channel=stable|test). No network or a rate limit is said, exit 0.
+# 1bit-update --latest [--channel ..] [--download-only]   fetch the channel's newest release into /data/updates/<tag>/,
+#                                           verify its SIGNED SHA256SUMS (release key, /etc/1bit/release-pub) and the
+#                                           image's sha256, then install it into the other slot like an image path.
+#                                           Unsigned, unverifiable or not-newer releases are refused. --download-only
+#                                           stops after the verified download (the console and web UI install later).
 #
 # An installed 1bit OS is a frugal set (kernel, initrd, SFS) plus ONE save layer, and the only way to change the OS
 # used to be "write a new image", which throws the layer's machine away with it. So an installed machine carries TWO
@@ -321,6 +326,73 @@ update_check() {   # [channel]: prints the answer; always exit 0 (an update chec
     return 0
 }
 
+# ── --latest (OS updater U2): a SIGNED download, then the same slot install ──────────────────────────────────────
+UPDATE_DIR=${ONEBIT_UPDATE_DIR:-/data/updates}
+UPDATE_VERIFIER=${ONEBIT_UPDATE_VERIFIER:-/usr/lib/1bit/release_sign.py}
+UPDATE_PUB=${ONEBIT_UPDATE_PUB:-/etc/1bit/release-pub}
+# update_verify <image.img.zst> <SHA256SUMS> <SHA256SUMS.sig>: 0 = the release key signed SHA256SUMS and the image is
+# the file it names; anything else refuses (the verifier says why on stderr). No verifier or no public key = refuse:
+# a self-updating OS installs nothing it cannot check.
+update_verify() {
+    [ -f "$UPDATE_VERIFIER" ] || { say "1bit-update: REFUSED: no release verifier at $UPDATE_VERIFIER"; return 2; }
+    [ -s "$UPDATE_PUB" ] || { say "1bit-update: REFUSED: no release public key at $UPDATE_PUB"; return 2; }
+    [ -s "$3" ] || { say "1bit-update: REFUSED: ${1##*/} has no SHA256SUMS.sig: only signed releases are installed"; return 2; }
+    _vo=$(python3 -I "$UPDATE_VERIFIER" verify-image "$1" "$2" "$3" --pub "$UPDATE_PUB" 2>&1); _vr=$?
+    if [ "$_vr" = 0 ]; then say "verified: $_vo"; return 0; fi
+    say "1bit-update: REFUSED: $(printf '%s' "$_vo" | tr '\n' ' ' | cut -c1-300)"
+    return 2
+}
+# update_get <https url> <file>: resumable (-C -), HTTPS only, also across GitHub's redirect to its asset host
+update_get() {
+    curl -fsSL --proto =https --proto-redir =https --tlsv1.2 --retry 3 --connect-timeout 20 -C - -o "$2" "$1"
+}
+# update_prune: /data/updates keeps the release just fetched and ONE previous (the rollback's image), nothing older
+update_prune() {
+    _keep=$1 _n=0
+    for _d in $(ls -1td "$UPDATE_DIR"/v*/ 2> /dev/null); do
+        _d=${_d%/}
+        [ "${_d##*/}" = "$_keep" ] && continue
+        _n=$((_n + 1)); [ "$_n" -le 1 ] && continue
+        rm -rf "${_d:?}" && say "removed the older download ${_d##*/}"
+    done
+}
+update_latest() {   # <channel> <download-only 1/''>: sets src= to the verified .img for the install below, or exits
+    _ch=$(update_channel "${1:-}") _run=$(update_running)
+    _j=$UPDATE_DIR/releases.json; mkdir -p "$UPDATE_DIR" || die "cannot create $UPDATE_DIR"
+    if [ -n "${ONEBIT_UPDATE_API_JSON:-}" ]; then cp "$ONEBIT_UPDATE_API_JSON" "$_j"
+    else update_get "$UPDATE_API" "$_j" || die "could not reach GitHub for the release list (no update now)"; fi
+    _a=$(update_pick "$_j" "$_ch" "$_run")
+    _v() { printf '%s\n' "$_a" | sed -n "s/^$1=//p" | head -1; }
+    [ -z "$(_v error)" ] || die "no answer from the $_ch channel: $(_v error)"
+    _tag=$(_v tag)
+    case $_tag in v[0-9]*) ;; *) die "the $_ch channel named no usable release" ;; esac
+    if [ "$(_v newer)" != yes ] && [ -z "${ONEBIT_UPDATE_ANY:-}" ]; then
+        say "up to date: running ${_run:-unknown}, the $_ch channel's newest is $_tag"; exit 0
+    fi
+    [ -n "$(_v image_url)" ] || die "$_tag has no 1bit-os image asset"
+    [ -n "$(_v sig_url)" ] && [ -n "$(_v sums_url)" ] || die "$_tag carries no signed SHA256SUMS (SHA256SUMS + SHA256SUMS.sig): only signed releases are installed"
+    _img=$(_v image) _size=$(_v size)
+    case $_img in 1bit-os-v*.img.zst) ;; *) die "unexpected image name" ;; esac
+    _d=$UPDATE_DIR/$_tag; mkdir -p "$_d" || die "cannot create $_d"
+    # room for the compressed download, its decompressed image (about 7x) and 2 GiB of margin, before any byte moves
+    _have=$(df -Pk "$UPDATE_DIR" | awk 'NR==2 {print $4}')
+    _need=$(( (_size / 1024) * 8 + 2097152 ))
+    [ "${_have:-0}" -ge "$_need" ] || die "$UPDATE_DIR has $((_have / 1048576)) GiB free, $_tag needs about $((_need / 1048576)) GiB"
+    say "downloading $_tag ($((_size / 1048576)) MiB) into $_d"
+    rm -f "$_d/SHA256SUMS" "$_d/SHA256SUMS.sig"   # small: always fresh, so a changed signature is never mixed with an old file
+    update_get "$(_v sums_url)" "$_d/SHA256SUMS" && update_get "$(_v sig_url)" "$_d/SHA256SUMS.sig" \
+        || die "could not download $_tag's SHA256SUMS / SHA256SUMS.sig"
+    update_get "$(_v image_url)" "$_d/$_img" || die "could not download $_img (run again: the download resumes)"
+    if ! update_verify "$_d/$_img" "$_d/SHA256SUMS" "$_d/SHA256SUMS.sig"; then
+        rm -f "$_d/$_img"; die "$_tag NOT installed: its image did not verify, and the download was removed"
+    fi
+    update_prune "$_tag"
+    if [ -n "${2:-}" ]; then say "downloaded and verified: $_d/$_img (install it with 1bit-update --latest)"; exit 0; fi
+    _raw=$_d/${_img%.zst}
+    zstd -d -q -f -o "$_raw" "$_d/$_img" || { rm -f "$_raw"; die "could not decompress $_img"; }
+    src=$_raw
+}
+
 # sourced by tests/one_bit_update_slots_test.sh with ONEBIT_UPDATE_LIB=1: the functions above, nothing below
 if [ "${ONEBIT_UPDATE_LIB:-}" = 1 ]; then return 0 2> /dev/null || exit 0; fi
 
@@ -328,10 +400,13 @@ src=''
 mode=install
 novfy=
 channel=
+dlonly=
 while [ $# -gt 0 ]; do
     case $1 in
         -h|--help) usage; exit 0 ;;
         --check) mode=check ;;
+        --latest) mode=latest ;;
+        --download-only) dlonly=1 ;;
         --channel) channel=${2:-}
                    case $channel in stable|test) ;; *) echo "1bit-update: --channel takes stable or test" >&2; exit 1 ;; esac
                    shift ;;
@@ -353,6 +428,8 @@ if [ "$mode" = check ]; then update_check "$channel"; exit 0; fi
 [ "$(id -u)" = 0 ] || die "run as root (it writes the other slot and the ESP)"
 [ -d "$DATA" ] && grep -q " $DATA " /proc/mounts 2> /dev/null || die "no $DATA: this is not an installed system"
 [ -e "$DATA/.installed" ] || die "no $DATA/.installed: this is a live stick, not an installed machine (a stick is replaced by writing the next image, it is not updated in place)"
+# --latest: the verified download becomes the image path of an ordinary install (the running slot is never touched)
+if [ "$mode" = latest ]; then update_latest "$channel" "$dlonly"; mode=install; fi
 
 # ── which slot is running, and where the disk and its ESP are ────────────────────────────────────────────────
 psub=$(tr ' ' '\n' < /proc/cmdline | sed -n 's/^psubdir=//p' | head -1)

@@ -47,6 +47,20 @@ HOP = ("connection", "keep-alive", "transfer-encoding", "content-length", "host"
 # A request with no Origin at all is not a browser (curl, this image's own rows, Lemonade Mobile) and is served as
 # before - the surface that stays closed is the one a hostile page in the box's own browser would use.
 ALLOWED_ORIGINS = {"http://localhost:%d" % PORT, "http://127.0.0.1:%d" % PORT}
+# engine#3478: a held turn waits inside Lemonade (the hold is taken by 1bit-heavy, POST /api/v1/hold) with NO bytes on
+# the wire until the hold ends, and the page's own fetch has no timeout (embed/opt/1bit/webapp/index.html:232) - so the
+# upstream socket timeout below is the only deadline a held turn has. It was a hardcoded 900 s while 1bit-heavy's
+# default hold window is 3600 s: a hold between 15 and 60 minutes cut the page's turn (a 502 that reads as "Lemonade is
+# not answering") while the hold was healthy. The bound is the hold window plus the resume every request had to allow
+# anyway: when the hold ends the captured models reload before the waiting request runs (measured first loads: 93 s on
+# a stick, 154 s on an installed disk, docs/releases.md), then it prefills and answers. 900 s is that old, previously
+# allowed silence, so a request that used to fit inside one socket timeout still fits after a hold.
+HOLD_WINDOW = 3600            # 1bit-heavy's --max-seconds default; tests/webapp_proxy_hold_timeout_test.sh fails if the two differ
+RESUME_GRACE = 900            # the whole-request socket timeout this proxy used to allow: kept for the reload after a hold
+# ONEBIT_WEBAPP_UPSTREAM_TIMEOUT scales the bound (the test drives it in seconds; an operator can raise it for a slower
+# box). A hold taken with a --max-seconds above the window can still outlast it, and the page's turn is cut at this
+# bound; os/v3/puppy/README.md states both numbers next to the wrapper.
+UPSTREAM_TIMEOUT = int(os.environ.get("ONEBIT_WEBAPP_UPSTREAM_TIMEOUT") or HOLD_WINDOW + RESUME_GRACE)
 
 
 def api_key():
@@ -88,7 +102,7 @@ class Handler(SimpleHTTPRequestHandler):
         if key:
             headers["Authorization"] = "Bearer " + key
         try:
-            conn = http.client.HTTPConnection(*UPSTREAM, timeout=900)
+            conn = http.client.HTTPConnection(*UPSTREAM, timeout=UPSTREAM_TIMEOUT)
             conn.request(self.command, self.path, body=body, headers=headers)
             resp = conn.getresponse()
         except OSError as e:

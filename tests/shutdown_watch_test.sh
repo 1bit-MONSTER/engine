@@ -63,8 +63,8 @@ if command -v busybox > /dev/null 2>&1; then
     check $? "under busybox ash (the appliance's shell, builtin wait) the watcher still follows and ends"
 fi
 
-# 2. the hook, on the banner lines of woof-CE's rc.shutdown
-printf '#!/bin/ash\necho "${DISTRO_NAME} is now shutting down..." > /dev/console\necho "Executing /etc/rc.d/rc.shutdown..."\nsync\n' \
+# 2. the hook, on the banner lines of woof-CE's rc.shutdown and the stray-unmount loop's kill line (engine#3361)
+printf '#!/bin/ash\necho "${DISTRO_NAME} is now shutting down..." > /dev/console\necho "Executing /etc/rc.d/rc.shutdown..."\nsync\n  xFUSER=`busybox fuser -m "$MOUNT_POINT" 2>/dev/null`\n  [ "$xFUSER" ] && busybox fuser -k -m "$MOUNT_POINT"\n' \
     > "$t/rc.shutdown"
 sh "$hook" "$t/rc.shutdown"; check $? "the hook goes in (exit 0)"
 sed -n 4p "$t/rc.shutdown" | grep -q '^# 1bit engine#3287' &&
@@ -76,7 +76,7 @@ sh -n "$t/rc.shutdown"; check $? "the hooked script still parses"
 sed -n 6p "$t/rc.shutdown" | grep -q '^# 1bit engine#3361' &&
     sed -n 7p "$t/rc.shutdown" | grep -qF '[ -x /usr/local/bin/1bit-shutdown-heartbeat ] && ( /usr/local/bin/1bit-shutdown-heartbeat $$ < /dev/null > /dev/null 2>&1 & )'
 check $? "the heartbeat line follows the watcher line, started detached (init's child, not a step)"
-printf '#!/bin/ash\necho "Executing /etc/rc.d/rc.shutdown..."\n# 1bit engine#3287: say each shutdown step in the kernel log\n[ -x /usr/local/bin/1bit-shutdown-watch ] && /usr/local/bin/1bit-shutdown-watch $$ < /dev/null > /dev/null 2>&1 &\nsync\n' > "$t/old"
+printf '#!/bin/ash\necho "Executing /etc/rc.d/rc.shutdown..."\n# 1bit engine#3287: say each shutdown step in the kernel log\n[ -x /usr/local/bin/1bit-shutdown-watch ] && /usr/local/bin/1bit-shutdown-watch $$ < /dev/null > /dev/null 2>&1 &\nsync\n  xFUSER=`busybox fuser -m "$MOUNT_POINT" 2>/dev/null`\n  [ "$xFUSER" ] && busybox fuser -k -m "$MOUNT_POINT"\n' > "$t/old"
 sh "$hook" "$t/old"; [ "$(grep -c '1bit-shutdown-heartbeat \$\$' "$t/old")" = 1 ] && [ "$(grep -c '1bit-shutdown-watch \$\$' "$t/old")" = 1 ]
 check $? "an rc.shutdown hooked before #3361 gets the heartbeat too, and keeps one watcher line"
 

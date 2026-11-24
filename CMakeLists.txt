@@ -2511,6 +2511,7 @@ add_test(NAME build_static_provenance COMMAND ${CMAKE_SOURCE_DIR}/tests/build_st
 # prompt; nothing tested it. Same shape as the test above - the script is copied and its absolute paths rewritten into
 # a temp tree, so every branch (installer, desktop, TUI-then-menu, no-TUI) is reachable without root or a build.
 add_test(NAME console_chain COMMAND ${CMAKE_SOURCE_DIR}/tests/console_chain_test.sh)
+add_test(NAME console_update COMMAND sh ${CMAKE_SOURCE_DIR}/tests/console_update_test.sh)
 # build_path_strings must see compiler output, not only ELFs: a shipped devicetable-offsets.s with 449 build-tree paths
 # passed the row that exists to stop that (engine#1487). No root, no fixture beyond two text files.
 add_test(NAME pack_check_generated_text COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_check_generated_text_test.sh)

@@ -1086,6 +1086,29 @@ shadow_verdict() {
     esac
 }
 
+# OS updater U7: update_tools_verdict <installed 1/0> <1bit-update has --check+--latest 1/0> <verifier self-test rc>
+# <sha256 of /etc/1bit/release-pub, or empty> - the pieces a signed in-system update needs are in this image, and the
+# baked public key IS the release key (pinned: a key baked by mistake would make every update refuse, or worse, trust
+# someone else). update_check_verdict <1bit-update --check output>: it answered, or the network did not. Pure, so
+# --self-test drives them and the rows below use the same code.
+RELEASE_PUB_SHA256=0db13630603b2e07795b2074f73a6890a68251d30e757da9cbbdc7394c8607b6   # npu-v2, the release key
+update_tools_verdict() {
+    _in=${1:-0} _up=${2:-0} _st=${3:-1} _ph=${4:-}
+    [ "$_up" = 1 ] || { printf 'FAIL 1bit-update has no --check / --latest: this image cannot update itself'; return 0; }
+    [ "$_st" = 0 ] || { printf 'FAIL the release verifier (/usr/lib/1bit/release_sign.py --self-test) did not pass: no update can be verified'; return 0; }
+    [ -n "$_ph" ] || { printf 'FAIL no /etc/1bit/release-pub: --latest refuses every update (the image was cut without RELEASE_PUB)'; return 0; }
+    [ "$_ph" = "$RELEASE_PUB_SHA256" ] || { printf 'FAIL /etc/1bit/release-pub is not the release key (sha256 %.16s..., want %.16s...)' "$_ph" "$RELEASE_PUB_SHA256"; return 0; }
+    printf 'PASS 1bit-update --check/--latest, the verifier self-test and the release key (%.16s...) are in this image' "$_ph"
+}
+update_check_verdict() {
+    case "${1:-}" in
+        *"could not reach GitHub"*|*"no answer from the"*"channel"*) printf 'SKIP %s' "$(printf '%s' "$1" | head -1 | cut -c1-160)" ;;
+        *"running:"*"up to date"*|*"running:"*"an update is available"*|*"running:"*"has no version to compare"*)
+            printf 'PASS %s' "$(printf '%s' "$1" | grep -E '^(running|stable|test):' | tr '\n' ' ' | sed 's/  */ /g' | cut -c1-160)" ;;
+        *) printf 'FAIL 1bit-update --check gave no answer: %s' "$(printf '%s' "$1" | head -2 | tr '\n' ' ' | cut -c1-160)" ;;
+    esac
+}
+
 # engine#3350 rc1: loom_verdict <gpu 1/0> <state: listed | absent | fetchfail:<why>> <reply> <serve's loom lines> <loom-serve
 # processes> - the Loom route row. A known answer is not enough: `1bit serve` falls back to the llama.cpp route on
 # purpose when a card is missing or a weight beside the model is not the card's (#3394/#3396), and that fallback answers
@@ -1281,6 +1304,17 @@ if [ "${1:-}" = --self-test ]; then
     check SKIP "$(loom_verdict 0 listed '' '' 0)"
     check SKIP "$(loom_verdict 1 absent '' '' 0)"
     check FAIL "$(loom_verdict 1 'fetchfail:lemonade pull exited 1' '' '' 0)"
+    # OS updater U7: the update rows
+    check PASS "$(update_tools_verdict 1 1 0 0db13630603b2e07795b2074f73a6890a68251d30e757da9cbbdc7394c8607b6)"
+    check FAIL "$(update_tools_verdict 1 0 0 0db13630603b2e07795b2074f73a6890a68251d30e757da9cbbdc7394c8607b6)"   # no --latest
+    check FAIL "$(update_tools_verdict 1 1 1 0db13630603b2e07795b2074f73a6890a68251d30e757da9cbbdc7394c8607b6)"   # verifier broken
+    check FAIL "$(update_tools_verdict 1 1 0 '')"                                                                 # no key baked
+    check FAIL "$(update_tools_verdict 1 1 0 1111111111111111111111111111111111111111111111111111111111111111)"   # another key
+    check PASS "$(update_check_verdict "$(printf 'running:  v2026.50\nstable: v2026.50 (2026-12-07)\nup to date\n')")"
+    check PASS "$(update_check_verdict "$(printf 'running:  v2026.49\nstable: v2026.50 (2026-12-07)\nan update is available: x\n')")"
+    check SKIP "$(update_check_verdict '1bit-update: could not reach GitHub (timeout): no update check now (running v2026.50)')"
+    check SKIP "$(update_check_verdict '1bit-update: no answer from the stable channel: API rate limit exceeded (running v2026.50)')"
+    check FAIL "$(update_check_verdict 'sh: 1bit-update: not found')"
     check FAIL "$(hold_verdict 1 200 '{"active":false}' 0 '')"
     check SKIP "$(hold_verdict 0 '' '' 0 '')"
     check PASS "$(shadow_verdict 1 1 0 '1bit-update: 0 release-owned path(s) shadowed')"
@@ -2279,6 +2313,21 @@ case "$_lv" in
     SKIP*) skip chat-loom "${_lv#SKIP }" ;;
     *)     fail chat-loom "${_lv#FAIL }" ;;
 esac
+
+# ── the in-system updater (OS updater U7): its pieces are in the image, and it can ask ──────────────────────────────
+_ut_in=0; [ -e /data/.installed ] && _ut_in=1
+_ut_up=0; _ub=$(command -v 1bit-update 2> /dev/null || echo /usr/local/bin/1bit-update)
+[ -r "$_ub" ] && grep -q -- '--latest)' "$_ub" && grep -q -- '--check)' "$_ub" && _ut_up=1
+_ut_st=1; [ -r /usr/lib/1bit/release_sign.py ] && python3 -I /usr/lib/1bit/release_sign.py --self-test > /dev/null 2>&1 && _ut_st=0
+_ut_ph=$(sha256sum /etc/1bit/release-pub 2> /dev/null | cut -c1-64)
+_uv=$(update_tools_verdict "$_ut_in" "$_ut_up" "$_ut_st" "$_ut_ph")
+case "$_uv" in PASS*) pass update-tools "${_uv#PASS }" ;; *) fail update-tools "${_uv#FAIL }" ;; esac
+if [ "$_ut_up" = 1 ]; then
+    _uv=$(update_check_verdict "$("$_ub" --check 2>&1)")
+    case "$_uv" in PASS*) pass update-check "${_uv#PASS }" ;; SKIP*) skip update-check "${_uv#SKIP }" ;; *) fail update-check "${_uv#FAIL }" ;; esac
+else
+    skip update-check "this image's 1bit-update has no --check (update-tools says why)"
+fi
 NPU=$(listed '[^"]*-1bit' | grep -i 'npu' | head -1)
 [ -n "$NPU" ] || NPU=$(pick '[^"]*-NPU-1bit')
 if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then

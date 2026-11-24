@@ -1122,6 +1122,30 @@ hold_verdict() {
     esac
 }
 
+# privileged_groups_verdict <group file> <passwd file>: no user but root may be in a group whose members are root in all
+# but name - disk (raw block devices), kmem (kernel memory), shadow (password hashes), root, sudo, wheel - as a listed
+# member or by primary gid. Puppy's base put its desktop user spot (uid 502) in disk and kmem, which undercuts the
+# signed in-system updater (cl-npuconc, v2026.49-rc1); os/v3/puppy/harden-groups.sh takes them out at build time.
+privileged_groups_verdict() {
+    _gf=${1:-/etc/group} _pf=${2:-/etc/passwd}
+    [ -r "$_gf" ] || { printf 'FAIL %s cannot be read, so who is in disk/kmem/shadow cannot be told' "$_gf"; return 0; }
+    _bad=$(awk -F: -v PF="$_pf" '
+        BEGIN { split("disk kmem shadow root sudo wheel", g, " "); for (i in g) priv[g[i]] = 1 }
+        FILENAME == PF { if ($1 != "root" && $3 != 0) pgid[$4] = pgid[$4] " " $1; next }
+        ($1 in priv) {
+            n = split($4, m, ",")
+            for (i = 1; i <= n; i++) if (m[i] != "" && m[i] != "root") out = out " " m[i] "(" $1 ")"
+            if ($3 in pgid) { k = split(pgid[$3], u, " "); for (j = 1; j <= k; j++) if (u[j] != "") out = out " " u[j] "(" $1 ", primary)" }
+        }
+        END { print out }' "$_pf" "$_gf" 2>/dev/null)
+    _bad=$(printf '%s' "$_bad" | sed 's/^ *//')
+    if [ -n "$_bad" ]; then
+        printf 'FAIL a user other than root is in a root-equivalent group: %s - raw disk or kernel memory access is root in all but name (os/v3/puppy/harden-groups.sh)' "$_bad"
+    else
+        printf 'PASS only root is in disk, kmem, shadow, root, sudo, wheel'
+    fi
+}
+
 # engine#3310: node_verdict <puppy 1/0> <node --version> <npm --version> <npm prefix -g> <prefix's mount point> [<data mount>]
 # 1bit OS ships Node.js so `lemonade launch <agent>` can follow its own `npm i -g <agent>` hint, and the global prefix has
 # to be ON the data partition: the live stick's root is RAM, so a prefix anywhere else loses the agent at the next boot.
@@ -1206,6 +1230,16 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(xhci_capture_verdict '')"
     check PASS "$(node_verdict 1 v24.22.3 11.19.1 /data/npm-global /data)"
     check SKIP "$(node_verdict 0 '' '' '' '')"                                   # os/mini: no Node.js
+    _pg=$(mktemp -d)
+    printf 'root:x:0:\ndisk:x:6:root\nkmem:x:15:root\nshadow:x:42:\naudio:x:29:root,spot\nspot:x:502:spot\n' > "$_pg/g"
+    printf 'root:x:0:0::/root:/bin/sh\nspot:x:502:502::/home/spot:/bin/bash\n' > "$_pg/p"
+    check PASS "$(privileged_groups_verdict "$_pg/g" "$_pg/p")"                     # the hardened group file
+    sed 's/^disk:x:6:root$/disk:x:6:root,spot/' "$_pg/g" > "$_pg/g2"
+    check FAIL "$(privileged_groups_verdict "$_pg/g2" "$_pg/p")"                    # Puppy's base: spot in disk
+    printf 'root:x:0:0::/root:/bin/sh\neve:x:600:15::/home/eve:/bin/sh\n' > "$_pg/p2"
+    check FAIL "$(privileged_groups_verdict "$_pg/g" "$_pg/p2")"                    # kmem as a primary group
+    check FAIL "$(privileged_groups_verdict "$_pg/missing" "$_pg/p")"
+    rm -rf "$_pg"
     check FAIL "$(node_verdict 1 '' '' '' '')"                                   # 1bit OS without Node.js
     check FAIL "$(node_verdict 1 v24.22.3 '' /data/npm-global /data)"            # node but no npm
     check FAIL "$(node_verdict 1 v24.22.3 11.19.1 /usr/local /)"                 # npm's default prefix: RAM on a stick
@@ -3000,6 +3034,11 @@ if [ -n "$_nd_v" ]; then
     _nd_pre=$(npm prefix -g 2> /dev/null | head -1)
     [ -n "$_nd_pre" ] && [ -d "$_nd_pre" ] && _nd_mnt=$(df -P "$_nd_pre" 2> /dev/null | awk 'NR == 2 {print $6}')
 fi
+PG=$(privileged_groups_verdict /etc/group /etc/passwd)
+case "$PG" in
+    PASS*) pass privileged-groups "${PG#PASS }" ;;
+    *)     fail privileged-groups "${PG#FAIL }" ;;
+esac
 ND=$(node_verdict "$_nd_pup" "$_nd_v" "$_nd_pv" "$_nd_pre" "$_nd_mnt")
 case "$ND" in
     PASS*) pass node "${ND#PASS }" ;;

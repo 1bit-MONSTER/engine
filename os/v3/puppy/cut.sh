@@ -197,6 +197,11 @@ PY
     sh "$here/hook-rc-shutdown.sh" "$out/rc.shutdown" || die "could not hook 1bit-shutdown-watch into rc.shutdown"
     chmod 755 "$out/rc.shutdown"
     printf 'etc/rc.d/rc.shutdown\t%s\n' "$out/rc.shutdown" >> "$M.os"
+    # the base's /etc/group without the desktop user in the root-equivalent groups (disk, kmem, ...), as container-build.sh does
+    sudo -n unsquashfs -q -cat "$bsfs" etc/group > "$out/group" || die "the base SFS has no etc/group"
+    sh "$here/harden-groups.sh" "$out/group" || die "could not take the non-root users out of the root-equivalent groups"
+    chmod 644 "$out/group"
+    printf 'etc/group\t%s\n' "$out/group" >> "$M.os"
     baseid=$(sudo -n unsquashfs -q -cat "$bsfs" etc/1bit/release-identity) || die "the base SFS has no etc/1bit/release-identity"
     hsa=$(echo "$baseid" | grep '^libhsa_sha256=') || die "the base identity names no libhsa_sha256"
     { echo "payload=lemonade-onebit-$tag"; echo "payload_lemond=$plem"; echo "engine_sha256=$esha"

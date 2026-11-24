@@ -196,7 +196,7 @@
    "weights_licence": "mit",
    "match": "none",
    "arch": "deepseek2 (MLA + MoE)",
-   "gap": "absorbed-MLA attention + MoE kernels in progress (engine#3221)"
+   "gap": "deepseek2/MLA: the public port starter has no MLA path (head_dim 576 vs 64/128/256), so the port path is the private Loom kernel kit, whose package registers on loom-serve 0.3.0 after a chat-block terminal-marker fix; no published card and no gate row (engine#3221, KNOWN-ISSUES.md)"
   },
   {
    "id": "Qwen3-4B-Instruct-2507-1bit",
@@ -418,13 +418,13 @@
    "match": "exact",
    "arch": "inkling2",
    "card": {
-    "repo": "loom-fun/unsloth-Inkling-2-Mini-loom-r9700",
-    "revision": "6213fd3ce3a15ea2bab98d4adf09ec783c5ad5dc",
-    "licence": "mit",
+    "repo": "1bit-MONSTER/Inkling-2-Mini-loom",
+    "revision": "afcb64b0cbf3e3eba1c9eb30cba8871acc9992d5",
+    "licence": "apache-2.0",
     "checkpoint": {
      "repo": "unsloth/Inkling-2-Mini-GGUF",
-     "revision": "ea0c79b2ecd73669e774c8519b79bfabfddbc027",
-     "file": "Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file",
+     "revision": "8078d149286eec7193795413b9e0643da6d11fa1",
+     "file": "Inkling-2-Mini-UD-Q4_K_XL.gguf",
      "sha256": "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3"
     }
    }

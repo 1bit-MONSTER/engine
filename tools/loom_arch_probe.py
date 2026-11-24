@@ -25,6 +25,10 @@ supported list, and print the parameters a starter entry would need. No model do
 only), no device, no weaver.
 
 Exit: 0 supported, 1 not supported by the starter, 2 cannot tell (unreadable or missing architecture key).
+
+engine#3221 (decided 2026-11-24): for an architecture whose port path is decided, the verdict also says where
+that path lives — the private Loom kernel kit, not this starter — because the starter's gap is not on a delivery
+schedule. KNOWN-ISSUES.md is the record; this probe stays the check of the public starter.
 """
 import argparse
 import json
@@ -40,6 +44,13 @@ SUPPORTED = ("llama", "qwen2", "qwen3", "qwen35", "gemma3", "gemma4", "phi3")
 NEEDS = {
     "deepseek2": "MLA: q_lora_rank, kv_lora_rank, key_length (kv_lora + rope), key_length_mla/value_length_mla, "
                  "head_count_kv = 1, plus routed-expert params (expert_count/used/shared/group, group_used)",
+}
+
+# Architectures whose port path is decided rather than pending: printed so "not in the starter" is not read as
+# "wait for the starter". engine#3221's record is KNOWN-ISSUES.md.
+DECIDED = {
+    "deepseek2": "the port path recorded for this architecture is the private Loom kernel kit, not this starter "
+                 "(KNOWN-ISSUES.md, engine#3221)",
 }
 
 _T = {0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2), 4: ("<I", 4), 5: ("<i", 4), 6: ("<f", 4),
@@ -128,6 +139,9 @@ def probe(kv, supported=SUPPORTED, source="built-in list"):
     need = NEEDS.get(arch)
     if need:
         lines.append(f"  it would need: {need}")
+    decided = DECIDED.get(arch)
+    if decided:
+        lines.append(f"  {decided}")
     params = sorted(k for k in kv if k.startswith(arch + "."))
     if params:
         lines.append(f"  the GGUF carries {len(params)} {arch}.* key(s), so the parameters a starter entry needs are "
@@ -171,6 +185,8 @@ def self_test():
     arm("an unsupported one lists the keys the file already carries",
         _gguf_bytes([("general.architecture", "deepseek2"), ("deepseek2.attention.q_lora_rank", 768)]), 1,
         "q_lora_rank")
+    arm("a decided architecture says where its port path lives",
+        _gguf_bytes([("general.architecture", "deepseek2")]), 1, "private Loom kernel kit")
     arm("a file that is not a GGUF is cannot-tell, not a pass", b"NOPE" + b"\0" * 32, 2)
     arm("a GGUF with no architecture key is cannot-tell",
         _gguf_bytes([("general.name", "x")]), 2)

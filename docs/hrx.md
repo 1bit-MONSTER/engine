@@ -66,7 +66,11 @@ How a model moves:
 - **Coverage** ([#3156](https://github.com/1bit-MONSTER/engine/issues/3156)). Models with a
   loom-fun card are measured first. Models without one get Loom programs written for them with
   [loom-skills](https://github.com/loom-fun/loom-skills) and
-  [weaver](https://github.com/loom-fun/weaver).
+  [weaver](https://github.com/loom-fun/weaver) — when the public starter can express the architecture. A new
+  architecture it cannot (deepseek2/MLA is the measured case) is ported from the private Loom kernel kit
+  instead; the decision and the starter gap are recorded in [KNOWN-ISSUES.md](../KNOWN-ISSUES.md)
+  (engine#3221), and `tools/loom_arch_probe.py` answers the same question from a GGUF header before a port is
+  attempted.
 - **Hybrid** ([#3157](https://github.com/1bit-MONSTER/engine/issues/3157)). The NPU-prefill route
   ([hybrid.md](hybrid.md)) hands its KV cache to the HRX llama-server, and that is the only
   handover. Handing it to Loom decode was designed and is **retired**: a generative Loom model

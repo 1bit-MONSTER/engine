@@ -33,7 +33,8 @@ Usage:
   loom_cards.py --build --catalogue server_models.json --cards-meta DIR --hf-list hf-loomfun.json
                 --catalogue-hf catalogue-hf.json [--pins models/pins.json] [-o config/loom-cards.json]
       DIR holds <card>.model.json and <card>.lock (model.json.lock) fetched at each card's pinned commit;
-      hf-list is the HF API listing of author=loom-fun (id, sha, cardData); catalogue-hf has the weights repos'
+      hf-list is the HF API listing of author=loom-fun (id, sha, cardData) plus author=1bit-MONSTER (our re-cards,
+      which name their loom-fun base in PROVENANCE.json); catalogue-hf has the weights repos'
       cardData at our pinned commit. Network fetching is done by the caller (see docs/loom-route.md).
   loom_cards.py --check [--map config/loom-cards.json] [--routes config/loom-routes.json] [--pins models/pins.json]
       Offline: shape, pins, licences, and every `exact` claim re-checked against models/pins.json; every
@@ -69,7 +70,7 @@ NOTES = {
     "Qwen3-Reranker-0.6B-1bit": ("qwen3 (reranker)", "unsloth-Qwen3-0.6B-loom",
                                  "same blocks as Qwen3-0.6B; needs a rerank service (yes/no logit score)"),
     "GLM-4.7-Flash-1bit": ("deepseek2 (MLA + MoE)", None,
-                           "absorbed-MLA attention + MoE kernels in progress (engine#3221)"),
+                           "deepseek2/MLA: the public port starter has no MLA path (head_dim 576 vs 64/128/256), so the port path is the private Loom kernel kit, whose package registers on loom-serve 0.3.0 after a chat-block terminal-marker fix; no published card and no gate row (engine#3221, KNOWN-ISSUES.md)"),
     "nomic-embed-text-v2-moe-1bit": ("nomic-bert-moe", None, "encoder-only MoE; no encoder card"),
     "jina-reranker-v1-tiny-en-1bit": ("jina-bert", None, "encoder-only (ALiBi); no encoder card"),
     "ZAYA1-8B-1bit": ("zaya", None, "new arch (CCA attention, router, residual scales): engine#3322"),
@@ -210,8 +211,12 @@ def check(doc, pins):
             continue
         if m in ("exact", "same-model"):
             c = e.get("card") or {}
-            if not str(c.get("repo", "")).startswith("loom-fun/"):
-                errs.append(where + ": card.repo must be a loom-fun repo")
+            # A card is loom-fun's, or our own re-card of one (1bit-MONSTER/...-loom): a re-card keeps the base
+            # card's programs and names its base revision in its PROVENANCE.json, and is what mainline-layout weights
+            # need when the upstream card binds the other layout (Inkling-2-Mini). --build must be given that
+            # repository's listing too (author=1bit-MONSTER) or the entry is dropped on the next build.
+            if not str(c.get("repo", "")).startswith(("loom-fun/", "1bit-MONSTER/")):
+                errs.append(where + ": card.repo must be a loom-fun repo or 1bit-MONSTER's re-card of one")
             if not SHA40.match(str(c.get("revision", ""))):
                 errs.append(where + ": card.revision must be a 40-hex commit")
             if not c.get("licence"):

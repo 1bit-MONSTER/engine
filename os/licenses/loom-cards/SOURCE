@@ -1,13 +1,16 @@
 Loom cards: Loom programs and model cards for the models the Loom route serves (os/v3/puppy/loom-cards.pin)
 Ship: yes (1bit OS payload, /opt/1bit-package/loom-cards; engine#3350 rc1)
-Card: unsloth-Inkling-2-Mini-loom-r9700, https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom-r9700
-          revision 6213fd3ce3a15ea2bab98d4adf09ec783c5ad5dc, 79 files (its dev/ benchmark records are not shipped),
-          each pinned by sha256 and size; by Geramy Loveless (loom-fun)
-License: MIT (the card's LICENSE, shipped with it; kept here as unsloth-Inkling-2-Mini-loom-r9700.LICENSE). Its
-          NOTICE (shipped with it) lists the MIT projects its program/lib/ files and dense kernel motifs derive from
-          (ROCm/hrx-loom-library v0.2.0 among them).
-Not shipped: the model weights. The card's model.json.lock names them (unsloth/Inkling-2-Mini-GGUF at
-          ea0c79b2ecd73669e774c8519b79bfabfddbc027: Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf, the mainline layout,
-          sha256 e6427665..., Apache-2.0, Thinking Machines / unsloth; the same bytes are the repo root file since
-          unsloth's 23 Nov restructure); Lemonade's catalogue pull downloads them on the user's request, and `1bit serve`
-          links the card's parameter/ file to the pulled model by the lock's sha256.
+Card: Inkling-2-Mini-loom (1bit-MONSTER), https://huggingface.co/1bit-MONSTER/Inkling-2-Mini-loom
+          revision afcb64b0cbf3e3eba1c9eb30cba8871acc9992d5, 17 files, each pinned by sha256 and size. A re-card of
+          loom-fun/unsloth-Inkling-2-Mini-loom @ 4e018e88 (r8, Apache-2.0, Geramy Loveless): 48 loop-control tensors
+          renamed and the 12 per-block blk.N.loop_msg_query tensors substituted so the same weights run from unsloth's
+          mainline GGUF; no weight or kernel bytes changed (PROVENANCE.json in the card lists every change).
+License: Apache-2.0 (the card's LICENSE and NOTICE ship with it; kept here as Inkling-2-Mini-loom.LICENSE / .NOTICE).
+          The programs derive from Loom and hrx-loom-library (MIT, AMD and the IREE / hrx-system authors).
+Not shipped: the model weights and the card's DSpark drafter. The card's model.json.lock names them
+          (unsloth/Inkling-2-Mini-GGUF at 8078d149286eec7193795413b9e0643da6d11fa1: Inkling-2-Mini-UD-Q4_K_XL.gguf, the
+          mainline layout, sha256 e6427665..., 17629760736 B, and dspark-Inkling-2-Mini-Q8_0_Old.gguf, the model's own draft
+          head in the older format, sha256 2ec78510..., 402278560 B; both Apache-2.0, Thinking Machines / unsloth). The repo
+          head also carries the newer mainline-format drafter (503889952 B, 3da00cf7), which this card does not bind.
+          Lemonade's catalogue pull downloads the named files on the user's request, and serve links the card's
+          parameter/ files to the pulled model by the lock's sha256.

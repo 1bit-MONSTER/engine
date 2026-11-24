@@ -1701,10 +1701,17 @@ add_test(NAME laya_route_serve COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/
 add_test(NAME laya_checkpoint COMMAND ${_laya_guard} ${CMAKE_SOURCE_DIR}/tests/laya_checkpoint.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
 # engine#3350: route --serve pulls a missing checkpoint with ONEBIT_LAYA_FETCH, keeping the fetcher off its stdout
 add_test(NAME laya_fetch_hook COMMAND sh ${CMAKE_SOURCE_DIR}/tests/laya_fetch_hook.sh $<TARGET_FILE:onebit>)
-# the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
+# the request classifier on the 200 labelled requests (RFC #186): 96.5% measured, floor 90%
 if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
              ${CMAKE_SOURCE_DIR}/tests/laya_route_cases.json --min-accuracy 90)
+    # The short/prose boundary the release-check laya-auto row depends on (engine#3355): its three probes
+    # plus the one- and two-sentence explanation asks the boundary decision covers, in its own file with a
+    # 100% floor. The 200-case corpus's 90% floor cannot see one case move -- the "Summarise what tides
+    # are..." probe was one of the 9 prose misses and stayed under it, which is how it shipped as a FAIL
+    # waiting for the laya-auto row. --per-case names the request that moved.
+    add_test(NAME laya_class_boundary COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
+             ${CMAKE_SOURCE_DIR}/tests/laya_class_boundary_cases.json --min-accuracy 100 --per-case)
 endif()
 # `--pm-router laya` end to end without a GPU: the same classifier decides the class of two
 # labelled requests and the engine's table decides whether the PM delegates (docs/pm.md).

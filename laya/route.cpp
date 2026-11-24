@@ -78,7 +78,7 @@ Question request_class_question(int variant) {
     default:
         q.instructions = "What kind of answer does this request need?";
         q.criteria = {{"code", "source code, a script, a fix to a program, or an explanation of code"},
-                      {"prose", "several paragraphs of explanation, writing, advice or a story"},
+                      {"prose", "an explanation or summary, or a piece of writing, advice or a story, even when it is only one or two sentences"},
                       {"short", "one word, one number or one sentence"},
                       {"long_doc", "reading a long pasted document, log, transcript, table or file"}};
     }

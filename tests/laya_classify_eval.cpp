@@ -13,10 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// laya_classify_eval <checkpoint_dir> <cases.json> [--limit N] [--min-accuracy PERCENT]
+// laya_classify_eval <checkpoint_dir> <cases.json> [--limit N] [--min-accuracy PERCENT] [--per-case]
 // Scores every labelled request (tests/laya_route_cases.json) with the request-class question
 // (laya/route.h, request_class_question) and prints accuracy, the confusion matrix, per-class
-// accuracy and accuracy by confidence band, plus the decision time. RFC #186.
+// accuracy and accuracy by confidence band, plus the decision time. --per-case also prints every
+// case's decision and probabilities, so a failing row names the request that moved. RFC #186.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -32,14 +33,32 @@
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: laya_classify_eval <checkpoint_dir> <cases.json> [--limit N]\n");
+        std::fprintf(stderr, "usage: laya_classify_eval <checkpoint_dir> <cases.json> [--limit N] [--min-accuracy PERCENT] [--per-case]\n");
         return 2;
     }
     int limit = 1 << 30;
     double min_accuracy = 0;  // ctest laya_classify fails below it
-    for (int i = 3; i + 1 < argc; ++i) {
-        if (std::string(argv[i]) == "--limit") limit = std::atoi(argv[i + 1]);
-        if (std::string(argv[i]) == "--min-accuracy") min_accuracy = std::atof(argv[i + 1]);
+    bool per_case = false;
+    for (int i = 3; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto next = [&]() -> const char* {
+            if (i + 1 >= argc) return nullptr;
+            return argv[++i];
+        };
+        if (a == "--limit") {
+            const char* v = next();
+            if (!v) { std::fprintf(stderr, "--limit needs a value\n"); return 2; }
+            limit = std::atoi(v);
+        } else if (a == "--min-accuracy") {
+            const char* v = next();
+            if (!v) { std::fprintf(stderr, "--min-accuracy needs a value\n"); return 2; }
+            min_accuracy = std::atof(v);
+        } else if (a == "--per-case") {
+            per_case = true;
+        } else {
+            std::fprintf(stderr, "unknown option %s\n", a.c_str());
+            return 2;
+        }
     }
     onebit::laya::Scorer scorer;
     if (!scorer.load(argv[1])) {
@@ -71,6 +90,19 @@ int main(int argc, char** argv) {
         right[want] += hit;
         ok += hit;
         conf.emplace_back(got.confidence, hit);
+        if (per_case) {
+            auto prob = [&](const char* key) {
+                for (const auto& [k, v] : got.probabilities)
+                    if (k == key) return v;
+                return 0.0f;
+            };
+            std::string t = text.substr(0, 70);
+            for (char& ch : t)
+                if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+            std::fprintf(stderr, "per-case: want=%-8s got=%-8s conf=%.2f code=%.2f prose=%.2f short=%.2f | %s%s\n",
+                         want.c_str(), got.label.c_str(), got.confidence, prob("code"), prob("prose"),
+                         prob("short"), t.c_str(), text.size() > t.size() ? "..." : "");
+        }
     }
     std::printf("accuracy %d/%d = %.1f%%, %.0f ms per decision\n", ok, n, 100.0 * ok / std::max(1, n), ms / std::max(1, n));
     std::printf("%-10s", "want\\got");

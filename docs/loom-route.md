@@ -163,7 +163,7 @@ Loom, the llama.cpp route (the fallback), and the CPU route as the arbiter. Loom
   top-N at all, counts as a disagreement, however small the CPU's own top-2 margin is: a drifting kernel that
   picks the CPU's Nth choice at a small-margin split must not pass (orchestrator, 23 Nov ~20:2xZ, tightened
   ~21:1xZ after the #3420 reviews). The row reports the near-tie count beside the score, per arm, and
-  `tools/logprob_agree.py` prints both (its `near-tie rule` line). A prompt where one reply is a prefix of
+  `tools/logprob_agree.py` prints both (its `near-tie rule` line). The route's token is read from its text as the longest of the CPU's top-N candidates that the text continues with: the most favourable reading, so a route token outside the top-N that begins with a shorter candidate's text scores as that candidate (rare under longest-match). A prompt where one reply is a prefix of
   the other and the shorter one stopped on its token budget (`finish_reason: "length"`) is **truncated**,
   reported beside the score and not counted: neither route chose another token, one ran out of tokens.
   With 8 prompts one near-tie flip, such as an end-of-turn decision, moved the plain score by 12.5 points

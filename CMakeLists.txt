@@ -535,7 +535,6 @@ add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test
 # OS-UPDATER item 3: the signed SHA256SUMS of a 1bit OS release (tools/release_sign.py), the in-system updater's check
 add_test(NAME release_sign COMMAND sh ${CMAKE_SOURCE_DIR}/tests/release_sign_test.sh)
 set_tests_properties(release_sign PROPERTIES SKIP_RETURN_CODE 77)
-add_python_test(release_sign_self ${CMAKE_SOURCE_DIR}/tools/release_sign.py --self-test)
 # engine#1564: which files the copyright gate looks at -- a staged file is seen, an untracked one is seen (that is why
 # running it before `git add` is useful), an ignored one is not. A throwaway repo in a temp dir: no build, no device.
 add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_test.sh)
@@ -593,6 +592,8 @@ add_python_test(census_counters_self ${CMAKE_SOURCE_DIR}/tools/ci/census_counter
 # `check` verb needs a staged set plus a release key). The arms are hermetic: two schemes and the three failure
 # shapes, all built from bytes in a temp dir, so they run wherever ctest does.
 add_python_test(npu_set_scheme_self ${CMAKE_SOURCE_DIR}/tools/npu_set_scheme.py --self-test)
+# OS-UPDATER item 3: the release signature tool's own arms (RFC 8032 key, tampered image/SUMS, foreign key)
+add_python_test(release_sign_self ${CMAKE_SOURCE_DIR}/tools/release_sign.py --self-test)
 # engine#3310: os/v3/puppy/stage-node.sh on a fake Node.js release (gzip, so it runs in the CI container; 77 = skip without gzip)
 add_test(NAME stage_node COMMAND sh ${CMAKE_SOURCE_DIR}/tests/stage_node_test.sh)
 set_tests_properties(stage_node PROPERTIES SKIP_RETURN_CODE 77)

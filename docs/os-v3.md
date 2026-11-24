@@ -151,6 +151,18 @@ An installed machine can find and install the next release itself, signed:
    not signed, so an old signed image re-published under a newer name is refused (`--latest` never downgrades;
    `1bit-update <image>` and `--rollback` do that on purpose).
 
+**What that order does not prove: freshness.** Every step starts from the release GitHub's list named: `update_pick`
+decides which release is the channel's newest and whether it is newer than the running one from that list
+(`os/v3/puppy/embed/usr/local/bin/1bit-update:257-302`), and the list is **not signed** — the first signature is
+checked after the "is it newer" decision. A release host that keeps serving the current release (a compromised token
+with `contents: write`, a newer release deleted or turned into a draft, or a mirror if one is ever added) makes the
+machine say "up to date" and the daily notice stay silent for as long as it keeps doing it. That is the **freeze** half
+of engine [#3448](https://github.com/1bit-MONSTER/engine/issues/3448): the rollback half is closed (item 4 reads the
+identity from inside the verified image), the freeze half needs a signed, expiring "latest per channel" statement that
+does not exist yet, so `--check`/`--latest` say what the list says and no more — the "up to date" answer now names the
+unsigned list it rests on. The threat model, the design options with their trust assumptions and the open owner decision
+are in [update-trust.md](update-trust.md).
+
 A refusal deletes the download and installs nothing. Downloads are HTTPS only and resume; `/data/updates` keeps the
 release just fetched and one previous, and must be a root-only directory. Every run works in its own private directory
 (`mktemp -d`, 0700, under `/run`).

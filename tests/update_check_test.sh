@@ -49,9 +49,15 @@ o=$(run v2026.48); echo "$o" | grep -q '^up to date$' && ! echo "$o" | grep -q '
 check $? "running the newest stable: up to date; a markdown table row is not a note"
 echo 'channel=test' > "$t/update.conf"; o=$(run v2026.49-rc1); echo "$o" | grep -q '^test: v2026.49-rc1' && echo "$o" | grep -q '^up to date$'
 check $? "the channel comes from update.conf; the same rc is up to date"
-o=$(run v2026.49 --channel test); echo "$o" | grep -q '^up to date$'
+o=$(run v2026.49 --channel test); echo "$o" | grep -q "^up to date: running v2026.49 is newer than the test channel's newest v2026.49-rc1$"
 check $? "a final release sorts after its own release candidates (v2026.49 > v2026.49-rc1)"
 rm -f "$t/update.conf"
+# engine#3448: "up to date" is the unsigned release list's word, and a running release AHEAD of the channel is a
+# different answer from "the list has nothing newer". Both are said, so the tool stops claiming a freshness it cannot prove.
+o=$(run v2026.49); echo "$o" | grep -q "^up to date: running v2026.49 is newer than the stable channel's newest v2026.48$" && ! echo "$o" | grep -qx 'up to date'
+check $? "a running release newer than the channel's newest is said as ahead, not as a flat 'up to date'"
+o=$(run v2026.48); echo "$o" | grep -q '^note: the release list is not signed, so a host that hides a newer release is not detectable (engine#3448)$'
+check $? "the up-to-date answer names the unsigned release list it rests on, and what that cannot detect"
 printf '%s\n' '{"message":"API rate limit exceeded for 1.2.3.4.","documentation_url":"https://docs.github.com"}' > "$t/rl.json"
 o=$(printf 'payload=lemonade-onebit-v2026.48\n' > "$t/id"; ONEBIT_UPDATE_IDENTITY=$t/id ONEBIT_UPDATE_API_JSON=$t/rl.json sh "$u" --check 2>&1); rc=$?
 [ $rc = 0 ] && echo "$o" | grep -q 'no answer from the stable channel: API rate limit exceeded'

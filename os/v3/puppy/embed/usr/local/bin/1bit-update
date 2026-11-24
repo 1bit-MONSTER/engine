@@ -330,14 +330,27 @@ update_check() {   # [channel]: prints the answer; always exit 0 (an update chec
 # ── the private work dir (security review, 24 Nov) ────────────────────────────────────────────────────────────────
 # Everything this run writes, mounts or reads back lives in ONE directory made fresh for it: `mktemp -d` creates a new
 # random name atomically with mode 0700, so nothing planted in advance - a pre-created /tmp/1bit-update, a symlink in
-# it - is ever followed. Root (an install) works under /run (root's own tmpfs; /tmp is world-writable and on Puppy a
-# symlink); a person's --check under $TMPDIR. WORK= is set by work_dir; work_done removes it only after the mounts in
+# it - is ever followed. Root (an install) works under /run (root-only; /tmp is world-writable and on Puppy a symlink);
+# a person's --check under $TMPDIR. /run is NOT a tmpfs on 1bit OS (a directory on the root overlay, whose upper is the
+# persistent save layer in PUPMODE 12, cl-kernel on #3457), so a run that dies before work_done leaves its dir in the
+# save layer: work_sweep removes such leftovers (older than a day, root's own, no mount inside) at the next start. WORK= is set by work_dir; work_done removes it only after the mounts in
 # it are gone (the ESP is mounted there: an rm -rf over a live mount would empty the ESP).
 work_dir() {
     _base=${TMPDIR:-/tmp}
     [ "$(id -u)" = 0 ] && [ -d /run ] && [ ! -L /run ] && _base=/run
+    work_sweep "$_base"
     WORK=$(mktemp -d "$_base/1bit-update.XXXXXX") || { echo "1bit-update: cannot make a private work dir in $_base" >&2; exit 2; }
     chmod 700 "$WORK"
+}
+work_sweep() {   # <base>: leftover 1bit-update.* work dirs of crashed runs
+    for _o in "$1"/1bit-update.*; do
+        [ -d "$_o" ] && [ ! -L "$_o" ] || continue
+        [ "$(stat -c %u "$_o" 2> /dev/null)" = "$(id -u)" ] || continue
+        [ -n "$(find "$_o" -maxdepth 0 -mmin +1440 2> /dev/null)" ] || continue
+        _ow=$(readlink -f "$_o")
+        awk -v w="$_ow/" 'index($2, w) == 1 { f = 1 } END { exit !f }' /proc/mounts 2> /dev/null && continue
+        rm -rf "${_o:?}"
+    done
 }
 work_done() {
     [ -n "${WORK:-}" ] && [ -d "$WORK" ] || return 0

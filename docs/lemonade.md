@@ -92,6 +92,22 @@ The recipe lives in our Lemonade fork,
 Lemonade plus the `onebit` backend (fork PR #1). Build `lemond` from the fork and
 put `1bit` on PATH (or set `$LEMONADE_ONEBIT_BIN`).
 
+Lemonade has a second HRX recipe — upstream's `llamacpp-hrx`, which the `*-HRX` catalogue rows name — and
+the release package serves that one too, with the same build. `lemond-onebit`
+([scripts/lemond-onebit.sh](../scripts/lemond-onebit.sh)) sets `LEMONADE_HRX_HRX_BIN` to the package's
+`1bit/lemonade-hrx` unless the caller already set it, so Lemonade starts the package's HRX
+`llama-server` through the environment `1bit serve` builds for an HRX backend ([the Ubuntu section
+below](#ubuntu-2604-the-ppas-lemond) has the mechanism) instead of downloading its own. Without that
+path the first `-HRX` load downloads upstream's `hrx-b99` manylinux bundle, and on 1bit OS that
+bundle registers no GPU: `llama-server --list-devices` prints `Available devices: (none)` and the load
+fails with `--device: invalid device: HRX0` ([engine#3399](https://github.com/1bit-MONSTER/engine/issues/3399)).
+Its recipe adds only `GGML_DISABLE_VULKAN` to the child, and lemond's environment names no HSA runtime to the
+HRX HAL (`IREE_HAL_AMDGPU_LIBHSA_PATH` is unset), which is the state
+[scripts/hrx-env.sh](../scripts/hrx-env.sh) measures as "the system ROCr, which with `HSA_USE_SVM=0`
+registers no HRX0"; `lemonade-hrx` names it through `1bit serve --print-backend-env`, and that is the path
+the board runs. The package launcher only sets a default: `LEMONADE_HRX_HRX_BIN=builtin` in lemond's
+environment keeps Lemonade's own download.
+
 Without the engine the recipe is still listed, but its models are not: `/api/v1/models?show_all=true`
 answers **180 rows, 0 of them `onebit`**, against **207 rows, 27 `onebit` (4 of them `*-NPU-1bit`) with
 `LEMONADE_ONEBIT_BIN` set** — measured on the packaged `lemond` of `lemonade-onebit-rc-2026-11-02`, the

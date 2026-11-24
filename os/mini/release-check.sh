@@ -1448,6 +1448,23 @@ if [ "${1:-}" = --self-test ]; then
     _hg=$(HRXP_PROC=$_hp hrxp_gtt 11 12); rm -rf "${_hp:?}"
     if [ "$_hg" = 3206 ]; then check PASS "PASS hrxp_gtt sums KiB and MiB lines to 3206 MiB"
     else check PASS "FAIL hrxp_gtt read $_hg MiB, want 3206 (the fdinfo unit is not read)"; fi
+    # engine#3353: hrxp_has_switch looks for the lib BESIDE THE LAUNCHER, and the shipped launcher is a symlink
+    # (/usr/local/bin/1bit -> /opt/1bit-package/1bit/1bit), so the lib is under the payload the link points at. Taking
+    # dirname of the link missed it, and the rc1 board run SKIPped hrx-placement "this build's libggml-hrx does not carry
+    # GGML_HRX_MODEL_BUFFER_COPY" over an image whose lib carries it (grep -ac on rc1's payload: 1). Two arms: the
+    # release image's layout must be FOUND, and a lib without the switch must still be ABSENT (the check stays a check).
+    eval "$(sed -n '/^hrxp_has_switch() {/,/^}/p' "$0")"   # defined with its row, after this self-test returns
+    _hsw=$(mktemp -d)
+    mkdir -p "$_hsw/usr/local/bin" "$_hsw/opt/1bit-package/1bit/hrx/llama/bin"
+    printf 'GGML_HRX_MODEL_BUFFER_COPY\n' > "$_hsw/opt/1bit-package/1bit/hrx/llama/bin/libggml-hrx.so.0.28.0"
+    ln -s libggml-hrx.so.0.28.0 "$_hsw/opt/1bit-package/1bit/hrx/llama/bin/libggml-hrx.so"   # as shipped: the soname link the row looks for
+    printf '#!/bin/sh\n' > "$_hsw/opt/1bit-package/1bit/1bit"; chmod +x "$_hsw/opt/1bit-package/1bit/1bit"
+    ln -s ../../../opt/1bit-package/1bit/1bit "$_hsw/usr/local/bin/1bit"
+    check found "$(hrxp_has_switch "$_hsw/usr/local/bin/1bit" && echo 'found it through the symlink launcher: /usr/local/bin/1bit -> the payload' || echo absent)"   # the release image's layout
+    check found "$(hrxp_has_switch "$_hsw/opt/1bit-package/1bit/1bit" && echo 'found it beside the payload launcher' || echo absent)"                             # given the payload path
+    rm -f "$_hsw/opt/1bit-package/1bit/hrx/llama/bin/libggml-hrx.so" "$_hsw/opt/1bit-package/1bit/hrx/llama/bin/libggml-hrx.so.0.28.0"
+    check absent "$(hrxp_has_switch "$_hsw/usr/local/bin/1bit" && echo found || echo 'absent: a lib without the switch is not claimed')"                          # the check stays a check
+    rm -rf "$_hsw"
     # c30 (owner decision 2026-11-05): the NPU's power state. The c29 take's shape is the second case - the array was
     # allowed to suspend between requests, and the prompt turn that followed it came back `code 614`.
     check PASS "$(npu_power_verdict on active)"
@@ -1866,7 +1883,16 @@ hrxp_gtt() {  # <pid>... -> that process tree's own drm-total-gtt, in MiB
 # and it must be built and measured on a pin that has it before it can gate one.
 hrxp_has_switch() {  # <engine binary> -> 0 when the shipped libs carry GGML_HRX_MODEL_BUFFER_COPY (the upload arm's switch)
     case "${HRXP_SWITCH:-}" in 1) return 0 ;; 0) return 1 ;; esac
-    _d=$(dirname "${1:-}" 2>/dev/null) _l=
+    # engine#3353 (rc1 board run): the shipped launcher is a SYMLINK, /usr/local/bin/1bit -> /opt/1bit-package/1bit/1bit,
+    # so the lib sits under the payload the link POINTS AT (/opt/1bit-package/1bit/hrx/llama/bin/libggml-hrx.so), not
+    # beside the link in /usr/local/bin. Taking dirname of the link made every search below miss, and the row SKIPped
+    # "does not carry GGML_HRX_MODEL_BUFFER_COPY" over a lib that does carry it (grep -ac on the image: 1) - a release
+    # gate declining to measure the mechanism it exists to measure. Resolve the launcher first; if readlink cannot
+    # (no -f support), keep the old path so this cannot turn a SKIP into a hard error.
+    _e=${1:-}
+    _r=$(readlink -f "$_e" 2>/dev/null) || _r=
+    [ -n "$_r" ] && _e=$_r
+    _d=$(dirname "$_e" 2>/dev/null) _l=
     for _cand in "$_d/libggml-hrx.so" "$_d"/libggml-hrx.so.* "$_d/../lib/ggml/libggml-hrx.so" "$_d"/../lib/ggml/libggml-hrx.so.* "$_d"/hrx/llama/bin/libggml-hrx.so; do
         [ -f "$_cand" ] || continue
         if grep -aq 'GGML_HRX_MODEL_BUFFER_COPY' "$_cand" 2>/dev/null; then _l=$_cand; break; fi

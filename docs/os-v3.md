@@ -118,6 +118,37 @@ counts entries before it reports success. The running set is never touched, so t
 that is the rollback. `1bit-update --rollback` flips `set default` back; `1bit-update --status` says which slot is
 running, what each holds, and which entry GRUB boots.
 
+#### In-system updates: `1bit-update --check` and `--latest`
+
+An installed machine can find and install the next release itself, signed:
+
+| | |
+|---|---|
+| `1bit-update --check [--channel stable\|test]` | asks GitHub's release list which release is newest on the channel and says it, with its size and the first lines of its notes. **stable** = the newest full release (default); **test** = pre-releases too (`v2026.49-rc1`). Needs no root; no network or a rate limit is said, exit 0 |
+| `1bit-update --latest [--channel …] [--download-only]` | downloads that release into `/data/updates/<tag>/` and installs it into the other slot, exactly as `1bit-update <image>` does; `--download-only` stops after the verified download |
+| `1bit-update --rollback` | boots the other slot next (both versions stay on the disk) |
+| `/data/1bit/update.conf` | `channel=stable\|test`, `notice=on\|off` |
+
+**What `--latest` checks, in order, before it writes anything to the other slot:**
+1. The release carries `SHA256SUMS` **and** `SHA256SUMS.sig`. An unsigned release is refused.
+2. `SHA256SUMS.sig` is the release key's Ed25519 signature over `SHA256SUMS` (`/usr/lib/1bit/release_sign.py`, the
+   public key baked into the image at `/etc/1bit/release-pub`), and the downloaded image's sha256 is the line that
+   names it. The file is read **once**, so it cannot change between the two checks.
+3. The image's own set verifies against the `SHA256SUMS` inside it, as for any image install.
+4. The release identity **inside the verified image** (`etc/1bit/release-identity`) is the tag that was asked for,
+   **strictly newer** than the running release, and not a release candidate on the stable channel: GitHub's tag name is
+   not signed, so an old signed image re-published under a newer name is refused (`--latest` never downgrades;
+   `1bit-update <image>` and `--rollback` do that on purpose).
+
+A refusal deletes the download and installs nothing. Downloads are HTTPS only and resume; `/data/updates` keeps the
+release just fetched and one previous, and must be a root-only directory. Every run works in its own private directory
+(`mktemp -d`, 0700, under `/run`).
+
+**Console and notice.** On an installed machine the console's item 5 is "Update / roll back 1bit OS": check (and
+install after a confirm), roll back, switch the channel. Once a day `1bit-update-notice` runs `--check` and, when a
+newer release is published, writes one line to `/run/1bit-update-available`; the console's header shows it
+(`update v2026.50: item 5`). It never installs anything; `notice=off` turns it off.
+
 **Updates repeat.** The layer the machine uses is the one the **running** slot holds or links to, so after the first
 update (running `/1bit-alt`, whose link points at `/1bit`) the second one targets `/1bit` — the slot that *holds* the
 layer. That directory is this machine's own state: it is kept as it is and not re-linked. Only a real layer that is

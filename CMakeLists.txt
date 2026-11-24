@@ -616,6 +616,7 @@ add_test(NAME update_check COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_check_tes
 add_test(NAME update_latest COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_latest_test.sh)
 add_test(NAME update_workdir COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_workdir_test.sh)
 add_test(NAME update_identity COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_identity_test.sh)
+add_test(NAME update_notice COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_notice_test.sh)
 # engine#3342 end to end: the real `1bit-update` against a loop-mounted installed disk, then the new release booted as an
 # overlay and what the machine sees checked. Needs root + loop devices + getfattr/setfattr: returns 77 in CI.
 add_test(NAME update_e2e_loop COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_e2e_loop_test.sh)

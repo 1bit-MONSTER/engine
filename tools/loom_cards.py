@@ -57,7 +57,7 @@ SHA64 = re.compile(r"^[0-9a-f]{64}$")
 # and what a port needs. Kept here (not guessed by the build) so each line is a reviewed claim.
 NOTES = {
     "MiniCPM5-1B-1bit": ("llama", "unsloth-Llama-3.2-3B-Instruct-loom",
-                         "llama geometry; the chat block is hand-written (BOS <s> + thinking toggle; without them it decodes garbage). Needs no new code: the private v2 package passes the accuracy gate on 24 prompts (engine#3320), so a published card (engine#3385) and a speed row are what a card entry needs"),
+                         "llama geometry; the chat block is hand-written (BOS <s> + thinking toggle; without them it decodes garbage). Needs no new code: the private v2 package passes the accuracy gate on 24 prompts but fails the speed gate's decode rule (engine#3320: prefill 12.2k vs 6.7k tok/s, TTFT 196 vs 321 ms, but decode 222 vs 240 tok/s at 2k context and a tie at 32 tokens), so a published card (engine#3385) that decodes at least as fast is what a card entry needs"),
     "MiniCPM-V-4.6-1bit": ("minicpmv (qwen3 text + vision tower)", "unsloth-Qwen3-VL-4B-Instruct-loom",
                            "text half = qwen3; needs the MiniCPM-V vision encoder + resampler programs"),
     "LFM2-1.2B-1bit": ("lfm2", "bartowski-LFM3-1.7B-loom",

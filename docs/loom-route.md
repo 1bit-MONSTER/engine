@@ -115,8 +115,9 @@ Rebuild with `tools/loom_cards.py --build` from freshly fetched card locks; CI r
 
 ## Card sources
 
-**Design note for engine#3385: no code implements it, no pin is moved, and the decision at the end is the
-owner's.**
+**Decided (owner, 2026-11-24): cards are public.** A route entry's card is a published Hugging Face
+repository, as every entry's card is today; no private card source is built and no `card_source` field is added.
+The options, costs and open question below are kept as the record of what was weighed against that decision.
 
 A route entry names a card by **name**; the entry says nothing about where the card came from, and no route entry,
 parser, tool or config names a source kind — `card_source` was a name in this note only when it landed (measured

@@ -20,8 +20,8 @@ limitations under the License.
 ## engine#3157 — the NPU-prefill -> Loom-decode KV handover: retired, measured to save nothing
 
 **Status: RETIRED — no hybrid shape is scheduled, and `--device hybrid` keeps decoding on the HRX
-llama-server ([docs/hybrid.md](docs/hybrid.md)). The issue stays open as the design record (`rfc`);
-this entry is the record the docs point at.**
+llama-server ([docs/hybrid.md](docs/hybrid.md)). The issue is closed; this entry is the design
+record, and the docs point at it.**
 
 The design was L4 of the Loom GPU switch: the NPU prefills a prompt and hands its KV cache to Loom's
 decode instead of the HRX llama-server. Two measurements, both recorded in

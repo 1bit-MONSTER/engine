@@ -533,7 +533,89 @@ $(printf '%s\n' "${ids:-<none>}" | head -12)" 22 76 3 \
 }
 
 # 5 The guarded installer the GRUB entry also runs. The menu does not grow a second copy of that logic.
+# ── item 5 on an INSTALLED machine: update / roll back (OS updater U4) ────────────────────────────────────────────
+# The work is 1bit-update's (--check, --latest = a SIGNED download then the other slot, --rollback); this only asks and
+# shows. An install or a rollback needs a real "yes": `yesno` answers yes when dialog is missing (right for showing a
+# key, wrong for replacing the OS), so `confirm` asks for y on a text terminal and is always NO non-interactively.
+UPDATE=${ONEBIT_UPDATE:-/usr/local/bin/1bit-update}
+UPDATE_CONF=${ONEBIT_UPDATE_CONF:-/data/1bit/update.conf}
+confirm() {   # confirm <question> -> 0 only on a person's yes
+    [ "$NONINT" = 1 ] && return 1
+    if dialog_ok; then ui --title " 1bit OS " --defaultno --yesno "$1" 12 72; return; fi
+    printf '\n%s\n  [y/N] ' "$1"; read -r _a || _a=""
+    case $_a in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+pick() {   # pick <title> <tag> <label> ...: the tag a person chose, empty for none
+    _t=$1; shift
+    if dialog_ok; then ui --title " $_t " --menu "" 14 72 6 "$@" || true; return; fi
+    # the list and the prompt to stderr: only the answer is the value of $(pick ...)
+    { printf '\n %s\n' "$_t"; while [ $# -ge 2 ]; do printf '  %s  %s\n' "$1" "$2"; shift 2; done; printf '  choice: '; } >&2
+    read -r _a || _a=""; printf '%s' "$_a"
+}
+update_channel_now() { _c=$(sed -n 's/^channel=//p' "$UPDATE_CONF" 2> /dev/null | tr -d ' \r' | head -1); [ "$_c" = test ] && echo test || echo stable; }
+item5_label() { if installed_mode; then echo "Update / roll back 1bit OS"; else echo "Install 1bit OS to a disk"; fi; }
+update_reboot_offer() {
+    confirm "The new version is ready in the other slot.
+
+Reboot now to run it? (No = it runs at the next reboot; the current version stays as the rollback.)" && reboot
+}
+item_update() {
+    [ -x "$UPDATE" ] || { say "no $UPDATE in this image"; return 1; }
+    ch=$(update_channel_now)
+    if [ "$NONINT" = 1 ]; then
+        "$UPDATE" --check 2>&1 | head -8
+        say "update-checked (channel $ch)"; return 0
+    fi
+    c=$(pick "1bit OS - update (channel: $ch)" \
+        1 "Check for an update (and install it)" \
+        2 "Roll back to the previous version" \
+        3 "Update channel: $ch (switch to $( [ "$ch" = test ] && echo stable || echo test))" \
+        4 "Install 1bit OS onto a DIFFERENT disk")
+    case "$c" in
+    1)
+        t=$(mktemp) || return 1
+        "$UPDATE" --check > "$t" 2>&1
+        show_text "Update check ($ch)" "$t"
+        if grep -q '^an update is available' "$t" && ! grep -q 'carries no SHA256SUMS.sig' "$t"; then
+            to=$(sed -n "s/^$ch: *\([^ ]*\).*/\1/p" "$t" | head -1) sz=$(sed -n 's/^image: *.*, \([0-9]*\) MiB$/\1/p' "$t" | head -1)
+            rm -f "$t"
+            confirm "Install ${to:-the new version} (${sz:-?} MiB download)?
+
+It is downloaded to /data/updates, its signature is checked against the 1bit release key, and it is written to the
+OTHER slot. This version is not touched and stays as the rollback." || return 0
+            "$UPDATE" --latest --channel "$ch" && update_reboot_offer
+        else
+            rm -f "$t"
+        fi ;;
+    2)
+        t=$(mktemp) || return 1
+        "$UPDATE" --status > "$t" 2>&1; show_text "Slots" "$t"; rm -f "$t"
+        confirm "Roll back: boot the OTHER slot's version next?
+
+Both versions stay on the disk; this one becomes the rollback." || return 0
+        "$UPDATE" --rollback && { confirm "Reboot now into the previous version?" && reboot; } ;;
+    3)
+        new=stable; [ "$ch" = stable ] && new=test
+        [ "$new" = test ] && { confirm "Switch to the TEST channel?
+
+Test builds (pre-releases such as v2026.49-rc1) are for trying things out before a release." || return 0; }
+        mkdir -p "$(dirname "$UPDATE_CONF")" &&
+            { grep -v '^channel=' "$UPDATE_CONF" 2> /dev/null; echo "channel=$new"; } > "$UPDATE_CONF.new" &&
+            mv "$UPDATE_CONF.new" "$UPDATE_CONF" && say "update channel: $new" ;;
+    4) item_install_elsewhere ;;
+    *) : ;;
+    esac
+}
+
 item_install() {
+    # an installed machine: item 5 is the updater; installing onto another disk is its last entry
+    if installed_mode && [ -z "${ONEBIT_ITEM5_INSTALL_ONLY:-}" ]; then
+        [ "$NONINT" = 1 ] && { item_update; say "installed: $(boot_disk) (data $(data_line))"; say "install-guard-checked"; return 0; }
+        item_update; return
+    fi
+    item_install_elsewhere
+}
+item_install_elsewhere() {
     if [ ! -x /usr/local/bin/1bit-console-install ]; then
         say "no /usr/local/bin/1bit-console-install in this image"; return 1
     fi
@@ -694,7 +776,7 @@ main_menu() {
                 2 "Quick chat test (GPU and NPU)" \
                 3 "Network (DHCP, static, hostname)" \
                 4 "Models (list, pull, delete)" \
-                5 "Install 1bit OS to a disk" \
+                5 "$(item5_label)" \
                 6 "Start the desktop (JWM) for this session" \
                 7 "Shell (bash, returns here on exit)" \
                 8 "Logs (Lemonade, kernel)" \
@@ -711,6 +793,8 @@ main_menu() {
     done
 }
 
+# sourced by tests/console_update_test.sh with ONEBIT_MENU_LIB=1: the functions above, no menu
+if [ "${ONEBIT_MENU_LIB:-}" = 1 ]; then return 0 2> /dev/null || exit 0; fi
 case "${1:-}" in
 --status)   status_text; connect_text; menu_text; exit 0 ;;
 --run)      [ $# -eq 2 ] || { say "usage: $0 --run <1..9>"; exit 2; }

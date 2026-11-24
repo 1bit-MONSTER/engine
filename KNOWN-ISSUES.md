@@ -17,6 +17,32 @@ limitations under the License.
 
 # Known issues
 
+## engine#3397 — `ssm_conv_prefill_recurrent.q6_K.gathered` intermittently wrong on the Loom route: not reproduced at the pin
+
+**Status: CLOSED 2026-11-24 — closed as not reproducible, not as fixed at source** (the same disposition as engine#370).
+The issue reported the case returning wrong values in 1 of 3 exact-compare runs on the no-add-on (Loom) route. At the
+pin this was re-run -- engine `ad10a171`, llama.cpp `6164e5ba`, gpu-kernels `87bdf514`, the no-add-on build, as root in
+one `box-hold both` ticket:
+
+```
+ssm_conv_prefill_recurrent.q6_K.gathered, case alone, 10 runs in a row: 10/10 rc=0, no value mismatch
+in-suite: PASS in all 3 full device runs (add-on 1, no-add-on 2)  => 13/13 passed
+```
+
+Under this project's three-clean-full-runs rule for a flake, that closes it. The run's summary lines are in the
+issue's thread; the logs are on strixhalo under `/data/dev/cl-hrxtest/runs/dv6164-*`.
+
+**Two invocation traps that made earlier attempts look like a wedged GPU -- they were not the hardware:** device work on
+this box must run **as root** (`/dev/kfd` is `0600 root:root` and there is no logind, so a non-root process gets
+`hsa_init ... RESOURCE_EXHAUSTED`), and the `libhrx`/`libloomc` must come from the staged **package** runtime
+(`pkg/hrx/llama/bin`) rather than an older `hrx-install` prefix, or the backend refuses with
+`INCOMPATIBLE "only systems with SVM are supported"`. A hash check can tell which runtime a staged dir uses.
+
+**Not established:** the jobs-1-vs-4 concurrency experiment the issue describes (the suite defaults to 4 jobs; the runs
+above used the default). If the wrong value reappears, that is the first variable to change.
+
+**Release notes:** no code change. A recurrence should reopen engine#3397 with the log and the build sha.
+
 ## engine#3372 — strixhalo hard reset (reset reason 0x00800800, internal CPU shutdown event): not reproduced in any arm
 
 **Status: CLOSED 2026-11-24 — closed as not reproducible, not as fixed at source** (the same disposition as engine#370).

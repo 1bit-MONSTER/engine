@@ -79,19 +79,26 @@ def _read_key(path, what):
     _die("the %s key %s is neither 32 raw bytes nor 64 hex characters" % (what, path))
 
 
-def _message(sums_path):
+def _read_sums(sums_path):
+    """SHA256SUMS read ONCE, as bytes. Every check after this works on these bytes and never opens the file again:
+    reading it twice (the signature over the first read, the digest from the second) let a file swapped in between
+    pass with the attacker's digest under a genuine signature (a TOCTOU, review of #3442)."""
     try:
         with open(sums_path, "rb") as f:
-            sums = f.read()
+            sums = f.read((1 << 20) + 1)
     except OSError as e:
         _die("cannot read %s: %s" % (sums_path, e.strerror))
     if not sums or len(sums) > 1 << 20:
         _die("%s is %s: a SHA256SUMS is a few lines" % (sums_path, "empty" if not sums else "over 1 MiB"))
-    return DOMAIN + sums, sums
+    return sums
+
+
+def _message(sums):
+    return DOMAIN + sums
 
 
 def sign(sums_path, seed, key_id):
-    msg, _ = _message(sums_path)
+    msg = _message(_read_sums(sums_path))
     if not key_id or any(c.isspace() for c in key_id):
         _die("--key-id must be one word (it names the key in the .sig file)")
     pub = _ed.public_key(seed)
@@ -124,19 +131,23 @@ def _parse_sig(sig_path):
     return {"key": fields.get("key", "?"), "pub": pub, "sig": sig}, None
 
 
-def verify(sums_path, sig_path, pub):
-    """(True, key id) or (False, why)."""
+def verify_bytes(sums, sums_path, sig_path, pub):
+    """(True, key id) or (False, why), for the SHA256SUMS bytes the caller already holds (and will parse)."""
     s, why = _parse_sig(sig_path)
     if s is None:
         return False, why
     if s["pub"] is not None and s["pub"] != pub:
         return False, "%s was signed by key %s (%s...), not by this release key (%s...)" % (
             sig_path, s["key"], s["pub"].hex()[:16], pub.hex()[:16])
-    msg, _ = _message(sums_path)
-    if not _ed.verify(pub, msg, s["sig"]):
+    if not _ed.verify(pub, _message(sums), s["sig"]):
         return False, "the signature in %s does not match %s: the file was changed, or signed by another key" % (
             sig_path, sums_path)
     return True, s["key"]
+
+
+def verify(sums_path, sig_path, pub):
+    """(True, key id) or (False, why)."""
+    return verify_bytes(_read_sums(sums_path), sums_path, sig_path, pub)
 
 
 def _sums_entry(sums, name):
@@ -150,10 +161,11 @@ def _sums_entry(sums, name):
 
 
 def verify_image(image, sums_path, sig_path, pub):
-    ok, why = verify(sums_path, sig_path, pub)
+    # one read: the digest below comes from the very bytes the signature was checked over
+    sums = _read_sums(sums_path)
+    ok, why = verify_bytes(sums, sums_path, sig_path, pub)
     if not ok:
         return False, why
-    _, sums = _message(sums_path)
     want = _sums_entry(sums, os.path.basename(image))
     if want is None:
         return False, "the signed %s has no line for %s" % (sums_path, os.path.basename(image))

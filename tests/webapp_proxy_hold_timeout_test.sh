@@ -47,7 +47,7 @@ command -v python3 > /dev/null && command -v curl > /dev/null || {
 #    hardcoded 900 s that was shorter than the 3600 s window.
 window=$(sed -n 's/.*maxs=\([0-9][0-9]*\).*/\1/p' "$heavy" | head -n 1)
 [ -n "$window" ]; check $? "1bit-heavy carries the hold window (maxs=${window:-?})"
-vals=$(ONEBIT_WEBAPP_UPSTREAM_TIMEOUT= python3 - "$proxy" <<'PY' 2> /dev/null
+vals=$(PYTHONDONTWRITEBYTECODE=1 ONEBIT_WEBAPP_UPSTREAM_TIMEOUT= python3 - "$proxy" <<'PY' 2> /dev/null
 import importlib.util, sys
 from importlib.machinery import SourceFileLoader
 loader = SourceFileLoader("webapp_proxy", sys.argv[1])   # the proxy has no .py suffix

@@ -27,6 +27,8 @@ check() { if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; bad=$((bad 
 py() { python3 -I "$tool" "$@"; }
 
 py --self-test > "$t/self" 2>&1; check $? "self-test ($(tail -1 "$t/self"))"
+python3 -I "$root/tests/release_sign_toctou_check.py" "$root/tools" > "$t/toctou" 2>&1
+check $? "SHA256SUMS read once: a file swapped between reads cannot pass; y >= p refused ($(grep -c '^ok' "$t/toctou") ok)"
 printf '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\n' > "$t/seed.hex"
 python3 -c "import sys; open(sys.argv[1],'wb').write(bytes.fromhex(open(sys.argv[2]).read().strip()))" "$t/seed.raw" "$t/seed.hex"
 py pubkey "$t/seed.raw" > "$t/pub.hex"; python3 -c "import sys; open(sys.argv[1],'wb').write(bytes.fromhex(open(sys.argv[2]).read().strip()))" "$t/pub.raw" "$t/pub.hex"

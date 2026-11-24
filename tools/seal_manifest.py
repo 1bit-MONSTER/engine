@@ -129,6 +129,10 @@ def _decode(data):
     if len(data) != 32:
         raise ValueError("a point is 32 bytes")
     y = int.from_bytes(data, "little") & ((1 << 255) - 1)
+    # RFC 8032 5.1.3: a y at or above p is not an encoding of any point; decoding fails (a non-canonical point
+    # would otherwise give one key or R several encodings)
+    if y >= _P:
+        raise ValueError("a point's y is not below p")
     sign = data[31] >> 7
     x = _x_recover(y, sign)
     return (x, y, 1, x * y % _P)

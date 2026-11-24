@@ -153,11 +153,12 @@ pins, staged unmodified by os/v3/puppy/stage-loom.sh)
   Copyright Advanced Micro Devices, Inc. and the IREE / hrx-system authors
   License: Apache-2.0 WITH LLVM-exception (os/licenses/hrx-loom/LICENSE)
 
-Loom card unsloth-Inkling-2-Mini-loom-r9700 (loom-fun; Copyright (c) 2026 Geramy Loveless; pinned in
-os/v3/puppy/loom-cards.pin; its LICENSE and NOTICE, which credits the MIT projects its program/lib/ files derive from,
-ship with it; the model weights it names are downloaded, not shipped)
-  https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom-r9700
-  License: MIT
+Loom card Inkling-2-Mini-loom (1bit-MONSTER's re-card of loom-fun/unsloth-Inkling-2-Mini-loom r8 4e018e88 by
+Geramy Loveless; pinned in os/v3/puppy/loom-cards.pin; the card's LICENSE and NOTICE ship with it and PROVENANCE.json
+lists the loop-control tensor renames and the mainline binding changes; the model weights and the DSpark drafter it
+names are downloaded, not shipped)
+  https://huggingface.co/1bit-MONSTER/Inkling-2-Mini-loom
+  License: Apache-2.0
 
 Linux kernel
   https://github.com/torvalds/linux

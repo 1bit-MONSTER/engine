@@ -33,7 +33,8 @@ Usage:
   loom_cards.py --build --catalogue server_models.json --cards-meta DIR --hf-list hf-loomfun.json
                 --catalogue-hf catalogue-hf.json [--pins models/pins.json] [-o config/loom-cards.json]
       DIR holds <card>.model.json and <card>.lock (model.json.lock) fetched at each card's pinned commit;
-      hf-list is the HF API listing of author=loom-fun (id, sha, cardData); catalogue-hf has the weights repos'
+      hf-list is the HF API listing of author=loom-fun (id, sha, cardData) plus author=1bit-MONSTER (our re-cards,
+      which name their loom-fun base in PROVENANCE.json); catalogue-hf has the weights repos'
       cardData at our pinned commit. Network fetching is done by the caller (see docs/loom-route.md).
   loom_cards.py --check [--map config/loom-cards.json] [--routes config/loom-routes.json] [--pins models/pins.json]
       Offline: shape, pins, licences, and every `exact` claim re-checked against models/pins.json; every
@@ -210,8 +211,12 @@ def check(doc, pins):
             continue
         if m in ("exact", "same-model"):
             c = e.get("card") or {}
-            if not str(c.get("repo", "")).startswith("loom-fun/"):
-                errs.append(where + ": card.repo must be a loom-fun repo")
+            # A card is loom-fun's, or our own re-card of one (1bit-MONSTER/...-loom): a re-card keeps the base
+            # card's programs and names its base revision in its PROVENANCE.json, and is what mainline-layout weights
+            # need when the upstream card binds the other layout (Inkling-2-Mini). --build must be given that
+            # repository's listing too (author=1bit-MONSTER) or the entry is dropped on the next build.
+            if not str(c.get("repo", "")).startswith(("loom-fun/", "1bit-MONSTER/")):
+                errs.append(where + ": card.repo must be a loom-fun repo or 1bit-MONSTER's re-card of one")
             if not SHA40.match(str(c.get("revision", ""))):
                 errs.append(where + ": card.revision must be a 40-hex commit")
             if not c.get("licence"):

@@ -2556,10 +2556,15 @@
      "oid": "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3",
      "size": 17629760736,
      "template_sha256": "888adccbcc91e7b9a53190dfc58afd2b6d23639021d22e25d3f5de3459cb3be5"
+    },
+    "dspark-Inkling-2-Mini-Q8_0_Old.gguf": {
+     "lfs": true,
+     "oid": "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773",
+     "size": 402278560
     }
    },
-   "pinned": "2026-11-23",
-   "used_for": "the Loom route (loom-fun/unsloth-Inkling-2-Mini-loom-r9700 @ 6213fd3c reads the mainline layout, which unsloth's root name holds since head 8078d149, 23 Nov 16:29Z) and the CPU arbiter (the same bytes under Mainline_Support/)"
+   "pinned": "2026-11-24",
+   "used_for": "the Loom route (card 1bit-MONSTER/Inkling-2-Mini-loom @ afcb64b0 reads the mainline layout, which unsloth's root name holds since head 8078d149) at draft_depth 3 with the model's own DSpark drafter (dspark-Inkling-2-Mini-Q8_0_Old.gguf, 2ec78510; the head also carries the newer mainline-format drafter, which the card does not bind), and the CPU arbiter (the same model bytes under Mainline_Support/)"
   }
  }
 }

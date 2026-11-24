@@ -62,13 +62,13 @@
      "Inkling-2-Mini-UD-Q4_K_XL"
     ]
    },
-   "card": "unsloth-Inkling-2-Mini-loom-r9700",
+   "card": "Inkling-2-Mini-loom",
    "preset": "chat",
    "device": "amdgpu://",
    "args": [
     "--pool_backing=fixed"
    ],
-   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7110281863 (card r9700 6213fd3c: Loom vs the CPU arbiter, thinking on and off counts equal, accuracy near-ties; no drafter); earlier r8 rows https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7106859133. Card loom-fun/unsloth-Inkling-2-Mini-loom-r9700 @ 6213fd3c (MIT) because unsloth's root name now holds the mainline layout; no fallback arm exists (the llama.cpp-HRX port is refused under strict placement)"
+   "gate": "Card 1bit-MONSTER/Inkling-2-Mini-loom @ afcb64b0 (Apache-2.0): loom-fun's r8 programs (base 4e018e88) re-pointed at unsloth's mainline GGUF by renaming 48 loop-control tensors and swapping the global loop_res_query parameters for the 12 per-block blk.N.loop_msg_query tensors (byte-identical weights; see its PROVENANCE.json), binding dspark-Inkling-2-Mini-Q8_0_Old.gguf (2ec78510) at draft_depth 3. Speed A/B measured by the lead on strixhalo, hrx-loom 0.3.0, same session, 26-token prompt, greedy: DSpark card 66.6 tok/s decode vs the r9700 card 41.0, and 15,616-token prefill 2,121 vs 1,044 tok/s (drafting off on both for prefill) - the r9700 card removes speculation and is ~1.6-2x slower. Accuracy gate row on this fork is PENDING (the r8 upstream row is https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7106859133; the r9700 row is https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7110281863); the route must not ship before it is posted. No fallback arm exists (the llama.cpp-HRX port is refused under strict placement)"
   },
   {
    "id": "qwen3-0.6b-q4_k_m",

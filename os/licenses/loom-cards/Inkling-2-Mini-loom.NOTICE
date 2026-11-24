@@ -1,0 +1,15 @@
+Inkling-2-Mini Loom card (1bit-MONSTER/Inkling-2-Mini-loom)
+
+This card is derived from loom-fun/unsloth-Inkling-2-Mini-loom, release r8
+(revision 4e018e88a3aa9826286c71dfe2f6c905a491659b), Apache License 2.0. Its programs were
+generated with the loom-skills workflow (https://github.com/loom-fun/loom-skills) by the loom-fun
+authors (Jeremy Fowers, Daniel Holanda). README.loom-fun-r8.md is their original card text.
+
+Changes by 1bit-MONSTER: binding changes only, so the card reads the mainline-layout GGUF that
+unsloth/Inkling-2-Mini-GGUF ships under its root name since 23 Nov 2026. They are listed in
+PROVENANCE.json ("changes_from_base"), with the sha256 of every file and whether it is
+identical to or modified from r8.
+
+Model weights: Inkling-2-Mini by Thinking Machines Lab, GGUF conversion by Unsloth
+(unsloth/Inkling-2-Mini-GGUF). Weights are not included in this repository; loom-fetch
+downloads them from unsloth by revision and sha256.

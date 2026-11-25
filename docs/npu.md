@@ -2713,6 +2713,7 @@ engine#587 measured the route on it):
 | `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2`, `FastFlowLM/LFM2.5-1.2B-NPU2` | hrx, npu | `LFM2.5-1.2B-NPU2` **served and measured** on the per-op route ("FastFlowLM's own containers" below); `LFM2-1.2B-NPU2` serves too (one paired ticket, same section); `LFM2-2.6B-NPU2` was not run |
 | `gpt-oss` | `FastFlowLM/GPT-OSS-20B-NPU2`, `FastFlowLM/GPT-OSS-Safeguard-20b-NPU2` | hrx | not served |
 | `hy_v3` | `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | hrx | not served; the first table above records this one |
+| `inkling2_loop` | `FastFlowLM/Inkling-2-Mini-NPU2` (`model.q4nx` + `vision_weight.q4nx`) | hrx | not served: no `inkling2_loop` model type or kernels in the route, so a Q4NX directory cannot load; NPU first light for the family is engine#3335 |
 
 Adding `npu` to one of those entries would claim kernels this build does not carry. A family leaves
 this list when `NPU_ARCHS` in `tools/registry_build.py` names its HF class with the model type the
@@ -2755,6 +2756,7 @@ pack declares (a config with no `architectures` declares its `model_type`):
 | `Qwen3ASRForConditionalGeneration` | Confucius4-R2T2 (2026-11-15) | not served: a speech-recognition pack (audio encoder + text decoder), `qwen3vl`, hrx only | engine#1783 |
 | `DFlash2DraftModel` | Qwen3.8-27B-DFlash2 | not served: a speculative drafter, `dflash`, hrx only (the first table above) | this section |
 | `Lfm3ForCausalLM` | LFM3-1.7B | not served: `lfm3`, hrx only (the first table above) | this section |
+| `Inkling2LoopForConditionalGeneration` | Inkling-2-Mini (2026-11-24 pack) | not served: `inkling2_loop`, hrx only; the route has no model type or kernels for the family | engine#3335 |
 
 `FastFlowLM/smolvla-NPU2` is answered by its repo id (`repos` in the same file): it has no config and no `*.q4nx`
 file, so there is no architecture to key on and nothing for the route to load.

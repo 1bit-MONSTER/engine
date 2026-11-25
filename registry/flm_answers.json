@@ -93,6 +93,11 @@
   "Lfm3ForCausalLM": {
    "answer": "not served: `lfm3`, hrx only; no LFM3 model type or kernels in the route",
    "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve"
+  },
+  "Inkling2LoopForConditionalGeneration": {
+   "answer": "not served: `inkling2_loop` is mapped for hrx only, and the route has no inkling2_loop model type or kernels; NPU first light for the family is engine#3335",
+   "doc": "docs/npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve",
+   "issue": 3335
   }
  },
  "repos": {

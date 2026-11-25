@@ -51,6 +51,47 @@ def read_rows(tsv):
     return out
 
 
+def read_manifest(path):
+    """(device, model id) rows of the manifest `os/v3/puppy/catalogue-manifest.py` writes for the stick:
+    `mode=live`, then one `hrx <id>` / `npu <id>` line per shipped catalogue entry."""
+    out = []
+    for line in pathlib.Path(path).expanduser().read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.split("=")[0] == "mode":
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0] in ("hrx", "npu"):
+            out.append((parts[0], parts[1].strip()))
+    return out
+
+
+def rows_from_manifest(manifest_rows, ours):
+    """(rows, unresolved): the shipped catalogue as (device, model FILE) rows.
+
+    A catalogue id names a MODEL, and every verdict this tool makes is about a FILE (the bytes a card binds),
+    so an id is resolved to the files we pin for it. The pin records basenames; an id is either a file stem
+    (`Qwen3-4B-Q4_K_M`) or a repo name (`unsloth/Qwen3-4B-GGUF`), so the last path segment is the key, with a
+    trailing `-gguf` dropped. An id that resolves to nothing is reported as unresolved rather than guessed at:
+    a coverage claim that rests on a name match is the trap this tool exists to avoid.
+    """
+    names = (ours or {}).get("names") or set()
+    rows, unresolved = [], []
+    for device, model_id in manifest_rows:
+        if device != "hrx":
+            continue  # the NPU route is a different map (docs/npu.md); this tool reports HRX rows only
+        key = model_id.split("/")[-1].lower()
+        if key.endswith(".gguf"):
+            rows.append((device, key))
+            continue
+        if key.endswith("-gguf"):
+            key = key[: -len("-gguf")]
+        hits = sorted(n for n in names if n == key + ".gguf" or n.startswith(key + "-"))
+        if not hits:
+            unresolved.append(model_id)
+        rows.extend((device, n) for n in hits)
+    return rows, unresolved
+
+
 def identity(card_dir):
     """(model id, quants of the CHECKPOINT files) from a card's model.json, or (None, set()) when unreadable.
 
@@ -253,7 +294,7 @@ def cards_of(roots):
     return cards
 
 
-def check(tsv, roots, ours=None):
+def check(tsv, roots, ours=None, rows=None):
     """(rc, lines): rc as documented, lines the report. Returned rather than printed so the self-test can assert
     the VERDICT a row got -- COVERED, UNCOVERED, REQUANT are three different answers and two of them share an rc."""
     cards = cards_of(roots)
@@ -262,7 +303,7 @@ def check(tsv, roots, ours=None):
                    "cannot tell, not a pass"]
     lines, bad, unpinned_bytes = [], 0, 0
     compared = unpinned_rows = 0
-    for device, model in read_rows(tsv):
+    for device, model in (rows if rows is not None else read_rows(tsv)):
         if device != "hrx":
             continue
         verdict, detail = classify(model, cards, ours)
@@ -426,12 +467,27 @@ def main():
     ap.add_argument("--pins", default="models/pins.json",
                     help="the pins that record the BYTES we ship (models/pins.json); without it the check still "
                          "reports name+quant coverage and says so")
+    ap.add_argument("--manifest", default=None,
+                    help="a shipped catalogue manifest (os/v3/puppy/catalogue-manifest.py's output: `hrx <id>` "
+                         "lines). Rows come from it instead of --registry, and each id is resolved to the files we "
+                         "pin. This is what makes the map cover the catalogue the stick ships rather than one "
+                         "model per architecture")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
     roots = card_roots(a.cards or ["~/amd-oss/loom-fun/cards", "~/amd-oss/loom-fun/cards-staging"])
-    rc, lines = check(a.registry, roots, pin_bytes(a.pins))
+    ours = pin_bytes(a.pins)
+    rows = None
+    if a.manifest:
+        rows, unresolved = rows_from_manifest(read_manifest(a.manifest), ours)
+        if unresolved:
+            print(f"loom_coverage: {len(unresolved)} shipped id(s) resolve to no pinned file, so no row could be "
+                  f"classified for them: {', '.join(sorted(unresolved)[:5])}"
+                  + (" …" if len(unresolved) > 5 else ""))
+        if not rows:
+            return 2  # nothing resolvable is cannot tell, not a pass
+    rc, lines = check(a.registry, roots, ours, rows)
     for line in lines:
         print(line, file=sys.stderr if rc == 2 else sys.stdout)
     if a.advisory and rc == 1:

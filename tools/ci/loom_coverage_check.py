@@ -38,7 +38,7 @@ import pathlib
 import re
 import sys
 
-QUANTS = re.compile(r"Q\d+_K_[MSL]|Q\d+_\d|IQ\d+_[A-Z]+|BF16|F16|MXFP4|AWQ", re.I)
+QUANTS = re.compile(r"UD[-_]?Q\d+_K_[A-Z]+|Q\d+_K_[A-Z]+|Q\d+_\d|IQ\d+_[A-Z]+|BF16|F16|MXFP4|AWQ", re.I)
 
 
 def read_rows(tsv):
@@ -153,7 +153,9 @@ VENDOR = {"ggml", "org", "bartowski", "unsloth", "lmstudio", "lmstudio-community
 
 
 def _quant_token(t):
-    return bool(re.fullmatch(r"i?q\d+([_-][a-z0-9]+)*|f16|bf16|mxfp4|awq", t))
+    # `xl`/`xs`/`xxs` are the K-quant size suffix of an Unsloth Dynamic tag (Q4_K_XL) and `ud` its prefix:
+    # they qualify the QUANT, so they must not distinguish a card from a row (engine#3156).
+    return bool(re.fullmatch(r"i?q\d+([_-][a-z0-9]+)*|f16|bf16|mxfp4|awq|xl|xs|xxs|ud", t))
 
 
 def _tokens(name):
@@ -183,6 +185,12 @@ def same_model(row_name, card_dir, card_id):
     return row <= card and (card - row) <= (NON_DISTINCTIVE | VENDOR)
 
 
+def canon_quant(q):
+    """One spelling for a quant tag: `UD_Q4_K_XL` from a file name and `UD-Q4_K_XL` from a card must compare
+    equal, and the UD (Unsloth Dynamic) prefix is part of the quant, not a model-name token."""
+    return q.upper().replace("_", "-") if q else q
+
+
 def quant_of(name):
     m = QUANTS.search(name.replace("-", "_"))
     return m.group(0).upper() if m else None
@@ -199,7 +207,7 @@ def classify(row, cards, ours=None):
         hits.append((d, ident, quants, _lock))
     if not hits:
         return "UNCOVERED", "no card names this model"
-    same_quant = [h for h in hits if want_q and want_q in h[2]]
+    same_quant = [h for h in hits if want_q and canon_quant(want_q) in {canon_quant(q) for q in h[2]}]
     if same_quant:
         d, _ident, _quants, lock = same_quant[0]
         # name and quant agree; the question left is whether the card binds BYTES we ship. Compared as a set of

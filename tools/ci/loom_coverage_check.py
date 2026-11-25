@@ -65,6 +65,29 @@ def read_manifest(path):
     return out
 
 
+def _is_quant_spec(rest):
+    """True when `rest` is a quant tag and nothing else: `q4_k_m`, `ud-q4_k_xl`, `mxfp4`.
+
+    The quant is matched first and whatever it leaves behind has to be a size qualifier, so a model that merely
+    starts with the same text (`instruct-2507-q4_k_m`) is not the same model.
+    """
+    m = QUANTS.search(rest)
+    if not m:
+        return False
+    leftover = rest[: m.start()] + rest[m.end() :]
+    return all(t in ("ud", "xl", "xs", "xxs") for t in re.split(r"[-_]", leftover) if t)
+
+
+def _named_by(basename, key):
+    """True when a pinned FILE belongs to catalogue id `key`: the stem is the id, or the id plus a quant spec."""
+    if basename == key + ".gguf":
+        return True
+    if not basename.startswith(key + "-"):
+        return False
+    rest = basename[len(key) + 1 : -len(".gguf")] if basename.endswith(".gguf") else basename[len(key) + 1 :]
+    return _is_quant_spec(rest)
+
+
 def rows_from_manifest(manifest_rows, ours):
     """(rows, unresolved): the shipped catalogue as (device, model FILE) rows.
 
@@ -80,12 +103,15 @@ def rows_from_manifest(manifest_rows, ours):
         if device != "hrx":
             continue  # the NPU route is a different map (docs/npu.md); this tool reports HRX rows only
         key = model_id.split("/")[-1].lower()
+        # A catalogue id carries the distribution's own suffix (`Qwen3-4B-1bit` in the stick's Lemonade ids,
+        # `unsloth/Qwen3-4B-GGUF` in a repo id); neither is part of the model name.
+        for suffix in ("-1bit", "-npu", "-gguf"):
+            if key.endswith(suffix):
+                key = key[: -len(suffix)]
         if key.endswith(".gguf"):
             rows.append((device, key))
             continue
-        if key.endswith("-gguf"):
-            key = key[: -len("-gguf")]
-        hits = sorted(n for n in names if n == key + ".gguf" or n.startswith(key + "-"))
+        hits = sorted(n for n in names if _named_by(n, key))
         if not hits:
             unresolved.append(model_id)
         rows.extend((device, n) for n in hits)

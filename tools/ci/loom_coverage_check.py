@@ -145,7 +145,11 @@ def lock_bytes(card_dir):
 NON_DISTINCTIVE = {"loom", "gguf", "merged"}
 # Publisher/organisation tokens that appear in card directory names (and HF ids) but are not model identity.
 VENDOR = {"ggml", "org", "bartowski", "unsloth", "lmstudio", "lmstudio-community", "model", "ai", "the",
-          "someone", "acme", "liquidai", "qwen", "meta-llama", "google", "microsoft"}
+          "someone", "acme", "liquidai", "qwen", "meta-llama", "google", "microsoft",
+          # our own org's cards (`1bit-MONSTER/<model>-loom`, and the `1bit-<model>` trees the lanes build): without
+          # these, same_model() rejects every card we publish ourselves and the row that matters most reads
+          # UNCOVERED — GLM-4.7-Flash's published card did, with its lock binding our pinned sha256.
+          "1bit", "monster"}
 
 
 def _quant_token(t):

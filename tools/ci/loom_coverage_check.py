@@ -370,6 +370,35 @@ def self_test():
     fails = 0
     total = 0   # engine#3156 review: count the arms instead of a hand-moved literal that drifted 7 -> 11 for 10 arms
 
+    def make_card(root, cards):
+        """Write the card tree `card_roots()` expects: a dir per card holding a model.json that names its
+        checkpoint files and a model.json.lock that binds their sha256. Element layout:
+        (name, model id, checkpoint quants, drafter quants, lock rows); the last two are optional."""
+        for card in cards:
+            cname, ident, quants = card[0], card[1], card[2]
+            extra = card[3] if len(card) > 3 else ()
+            drafter = extra if isinstance(extra, tuple) else ()
+            lock = card[4] if len(card) > 4 else None
+            d = root / cname
+            d.mkdir()
+            # the shape a real card has: the checkpoint is a file path under a variant's service parameters
+            files = [{"path": f"parameter/M-{q}.gguf"} for q in quants]
+            doc = {"model": {"id": ident},
+                   "variants": {"gguf": {"services": {"chat": {"parameters": {"model": {"files": files}}}}}}}
+            # ...and a card may carry a DRAFTER beside the checkpoint, under the SAME service's `draft`
+            # parameter -- which is where the real Qwen3.6-35B-A3B card keeps its Q8_0 DFlash file
+            # (`variants.gguf.services.chat.parameters.draft.files[0].path`). The coverage claim must not read
+            # those, which is the defect this arm exists for (engine#3156 review).
+            if drafter:
+                chat = doc["variants"]["gguf"]["services"]["chat"]
+                chat["parameters"]["draft"] = {"files": [{"path": f"parameter/D-{q}.gguf"} for q in drafter]}
+            (d / "model.json").write_text(json.dumps(doc))
+            # the lock is what binds the BYTES; None means "this card has no lock", which is its own arm
+            if lock is not None:
+                (d / "model.json.lock").write_text(json.dumps(
+                    {"files": [{"origin": f"@checkpoint/M-{q}.gguf", "sha256": sha}
+                               for q, sha in lock]}))
+
     def arm(name, want, rows, cards, expect_rc, pins=None, says=None):
         """Assert the VERDICT, not only the exit code: COVERED (0), UNCOVERED and REQUANT (both 1) are three
         answers and two of them share an rc, so an rc-only arm cannot tell them apart -- which is the one
@@ -383,30 +412,7 @@ def self_test():
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td) / "cards"
             root.mkdir()
-            for card in cards:
-                cname, ident, quants = card[0], card[1], card[2]
-                extra = card[3] if len(card) > 3 else ()
-                drafter = extra if isinstance(extra, tuple) else ()
-                lock = card[4] if len(card) > 4 else None
-                d = root / cname
-                d.mkdir()
-                # the shape a real card has: the checkpoint is a file path under a variant's service parameters
-                files = [{"path": f"parameter/M-{q}.gguf"} for q in quants]
-                doc = {"model": {"id": ident},
-                       "variants": {"gguf": {"services": {"chat": {"parameters": {"model": {"files": files}}}}}}}
-                # ...and a card may carry a DRAFTER beside the checkpoint, under the SAME service's `draft`
-                # parameter -- which is where the real Qwen3.6-35B-A3B card keeps its Q8_0 DFlash file
-                # (`variants.gguf.services.chat.parameters.draft.files[0].path`). The coverage claim must not read
-                # those, which is the defect this arm exists for (engine#3156 review).
-                if drafter:
-                    chat = doc["variants"]["gguf"]["services"]["chat"]
-                    chat["parameters"]["draft"] = {"files": [{"path": f"parameter/D-{q}.gguf"} for q in drafter]}
-                (d / "model.json").write_text(json.dumps(doc))
-                # the lock is what binds the BYTES; None means "this card has no lock", which is its own arm
-                if lock is not None:
-                    (d / "model.json.lock").write_text(json.dumps(
-                        {"files": [{"origin": f"@checkpoint/M-{q}.gguf", "sha256": sha}
-                                   for q, sha in lock]}))
+            make_card(root, cards)
             tsv = pathlib.Path(td) / "models.tsv"
             tsv.write_text("\n".join(f"{dev}\t{m}" for dev, m in rows) + "\n")
             pins_path = pathlib.Path(td) / "pins.json"
@@ -420,6 +426,38 @@ def self_test():
                 ok = any(says in line for line in lines)
             detail = f"verdicts {verdicts}, want {want!r}"
             print(f"  {'ok  ' if ok else 'FAIL'} {name} (rc {rc} want {expect_rc}; {detail})")
+            fails += 0 if ok else 1
+
+    def manifest_arm(name, manifest, pins, want_rows, want_unresolved=(), cards=None, want_verdict=None,
+                     expect_rc=0):
+        """Assert what a MANIFEST resolves to, then (optionally) the verdict those rows earn.
+
+        This is the arm --manifest was missing, and its absence is why the wrong input shape shipped: the shipped
+        catalogue names MODELS (`hrx GLM-4.7-Flash-1bit`) and every verdict this tool makes is about a FILE, so
+        the manifest path's whole job is the id -> file resolution in between. An arm that asserted only the
+        verdict would have passed on a resolution that produced zero rows (there is simply nothing to classify),
+        so these assert the resolved (device, model) rows and the unresolved list, and the verdict only on top.
+        """
+        nonlocal fails, total
+        total += 1
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td) / "cards"
+            root.mkdir()
+            make_card(root, cards or [])
+            mpath = pathlib.Path(td) / "onebit-models.txt"
+            mpath.write_text(manifest)
+            pins_path = pathlib.Path(td) / "pins.json"
+            pins_path.write_text(json.dumps({"pins": pins or {}}))
+            ours = pin_bytes(pins_path)
+            rows, unresolved = rows_from_manifest(read_manifest(mpath), ours)
+            ok = sorted(rows) == sorted(want_rows) and sorted(unresolved) == sorted(want_unresolved)
+            got = f"rows {rows}, unresolved {unresolved}"
+            if ok and want_verdict is not None:
+                rc, lines = check(pathlib.Path(td) / "models.tsv", [root], ours, rows)
+                verdicts = [line.split()[0] for line in lines]
+                ok = rc == expect_rc and want_verdict in verdicts
+                got += f" -> verdicts {verdicts} (rc {rc} want {expect_rc})"
+            print(f"  {'ok  ' if ok else 'FAIL'} {name} ({got})")
             fails += 0 if ok else 1
 
     # a card for the model on the quant we ship, and its lock binds the file our pin records
@@ -477,6 +515,60 @@ def self_test():
     # non-GPU rows are not this map's business
     arm("npu rows are ignored (nothing is reported for them)", "no-verdict-at-all",
         [("npu", "Qwen3-0.6B")], [("unsloth-Qwen3-0.6B-loom", "Qwen/Qwen3-0.6B", ["Q4_K_M"])], 0)
+    # ---- the manifest path (--manifest) ----------------------------------------------------------------
+    # The shipped catalogue names MODELS (`hrx GLM-4.7-Flash-1bit`) while every verdict this tool makes is about
+    # a FILE, so the resolution in between is the only thing that can be wrong invisibly: a resolver that matched
+    # nothing produced an empty map, and an empty map reads exactly like a clean one (#3510). These arms assert
+    # the resolved rows, not just the verdict, because "no rows" is a state a verdict-only arm cannot see.
+    def pins_of(*files, sha=SHA_A):
+        return {"1bit-MONSTER/pins": {"files": {f: {"oid": sha} for f in files}}}
+
+    STICK = "mode=live\n# written by os/v3/puppy/catalogue-manifest.py\nhrx GLM-4.7-Flash-1bit\n"
+    manifest_arm("manifest: the stick's -1bit suffix is not part of the model name", STICK,
+                 pins_of("GLM-4.7-Flash-Q4_K_M.gguf"), [("hrx", "glm-4.7-flash-q4_k_m.gguf")])
+    # ...and the resolution has to feed the verdict path, not merely produce rows
+    manifest_arm("manifest: a resolved id earns a real verdict (COVERED on bytes)", STICK,
+                 pins_of("GLM-4.7-Flash-Q4_K_M.gguf"), [("hrx", "glm-4.7-flash-q4_k_m.gguf")],
+                 cards=[("1bit-GLM-4.7-Flash", "1bit-MONSTER/GLM-4.7-Flash", ["Q4_K_M"], (), [("Q4_K_M", SHA_A)])],
+                 want_verdict="COVERED", expect_rc=0)
+    # same model, same quant, and the card binds a file we do not ship: the manifest path must reach this verdict
+    manifest_arm("manifest: a resolved id can still be DIFFERENT-UPLOAD", STICK,
+                 pins_of("GLM-4.7-Flash-Q4_K_M.gguf"), [("hrx", "glm-4.7-flash-q4_k_m.gguf")],
+                 cards=[("1bit-GLM-4.7-Flash", "1bit-MONSTER/GLM-4.7-Flash", ["Q4_K_M"], (), [("Q4_K_M", "b" * 64)])],
+                 want_verdict="DIFFERENT-UPLOAD", expect_rc=1)
+    # the OTHER half of #3510, isolated from the suffix: `qwen3-4b` is a PREFIX of `qwen3-4b-instruct-2507`, and a
+    # prefix match claims the instruct model's bytes for the base model. The suffix has to be a quant spec, so a
+    # bare id resolves to exactly one file here (the suffix arms above cover the `-1bit` half).
+    manifest_arm("manifest: an id resolves on stem + quant spec, not on prefix", "hrx Qwen3-4B\n",
+                 pins_of("Qwen3-4B-Q4_K_M.gguf", "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"),
+                 [("hrx", "qwen3-4b-q4_k_m.gguf")])
+    manifest_arm("manifest: the instruct model resolves to its own file", "hrx Qwen3-4B-Instruct-2507-1bit\n",
+                 pins_of("Qwen3-4B-Q4_K_M.gguf", "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"),
+                 [("hrx", "qwen3-4b-instruct-2507-q4_k_m.gguf")])
+    # a repo id ends in -GGUF for the same reason: the distribution suffix, not the model name
+    manifest_arm("manifest: a repo-style id ending -gguf resolves", "hrx unsloth/Qwen3-4B-GGUF\n",
+                 pins_of("Qwen3-4B-Q4_K_M.gguf"), [("hrx", "qwen3-4b-q4_k_m.gguf")])
+    # an id we pin nothing for is UNRESOLVED, never a name-matched guess: a coverage claim resting on a name
+    # match is the trap the tool exists to avoid, and a silent skip would report a shipped model as absent
+    manifest_arm("manifest: an id with no pinned file is reported, not guessed", "hrx ZAYA1-8B-1bit\n",
+                 pins_of("Qwen3-4B-Q4_K_M.gguf"), [], want_unresolved=["ZAYA1-8B-1bit"])
+    # the NPU route is a different map (docs/npu.md): skipped here, and not even counted as unresolved
+    manifest_arm("manifest: npu rows are not this map's business", "npu Qwen3-0.6B-1bit\n",
+                 pins_of("Qwen3-0.6B-Q4_K_M.gguf"), [])
+    # one catalogue id can own SEVERAL pinned files, and the map answers per FILE -- this is why a shipped row is
+    # not one verdict, and why the REQUANT lines in the posted map are the mechanism working
+    manifest_arm("manifest: one id owning several pins yields one row per file",
+                 "hrx Qwen3-0.6B\n", pins_of("Qwen3-0.6B-Q4_K_M.gguf", "Qwen3-0.6B-Q8_0.gguf"),
+                 [("hrx", "qwen3-0.6b-q4_k_m.gguf"), ("hrx", "qwen3-0.6b-q8_0.gguf")],
+                 cards=[("unsloth-Qwen3-0.6B-loom", "Qwen/Qwen3-0.6B", ["Q4_K_M"], (), [("Q4_K_M", SHA_A)])],
+                 want_verdict="REQUANT", expect_rc=1)
+    # a manifest line that already names a file is taken as one
+    manifest_arm("manifest: a bare .gguf id is used as the file name", "hrx Qwen3-0.6B-Q4_K_M.gguf\n",
+                 pins_of("Qwen3-0.6B-Q4_K_M.gguf"), [("hrx", "qwen3-0.6b-q4_k_m.gguf")])
+    # parser: mode=, comments, blank lines and junk are not rows (the real file starts with `mode=live`)
+    manifest_arm("manifest: mode=, comments and junk lines are not rows",
+                 "mode=live\n\n# a comment\n  hrx Qwen3-0.6B  \ngarbage\nhrx\nnpu\n",
+                 pins_of("Qwen3-0.6B-Q4_K_M.gguf"), [("hrx", "qwen3-0.6b-q4_k_m.gguf")])
     print(f"loom_coverage_check self-test: {total - fails} ok, {fails} failed")
     return 0 if fails == 0 else 1
 

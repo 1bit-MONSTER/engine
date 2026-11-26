@@ -148,6 +148,17 @@ runner's home into the account that owns them and puts `.local/bin` first on the
 both through `other` (`r-x`), so it can **run** the tools and cannot rewrite them — which is the difference between
 this and the owner's group, and the reason the links are back after the review's first round.
 
+`thermal-run.sh` itself is now **in this repo** (`scripts/thermal-run.sh`), because it was in nobody's: the two
+workflows call it unconditionally, and the box that ran `hrx_build` on 11-26 had no `~/lb` at all, so every job
+died `line 2: /home/bcloud/lb/thermal-run.sh: No such file or directory` (**exit 127**) before configuring
+anything — on four branches, so the check could not gate any of them (engine#3517). The runner's
+`~/lb/thermal-run.sh` should be a copy of (or a link to) that file. Its contract is the one the workflows already
+assume, and the one `scripts/mem-guard.sh --term` depends on: freeze the job at 78 C, thaw at 68 C, kill at 93 C
+with rc 137, and on TERM/INT/HUP kill the whole job and exit **143**. `THERMAL_DISABLE=1` runs ungoverned for a box
+with no readable sensor, and `THERMAL_HI/LO/KILL/TCTL/NICE/POLL` override the defaults. The shipped copy takes the
+process-group form, with a `shortcut:` line naming when to upgrade; the `systemctl --user` scope below is that
+upgrade, and a child that calls `setsid()` escapes the process-group form.
+
 `thermal-run.sh` runs its jobs under `systemctl --user`, so the installer also does
 `loginctl enable-linger <user>`; without a user manager for that account it falls back to a process-group
 `SIGSTOP`, which is the weaker thermal brake the script itself warns about.

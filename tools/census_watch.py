@@ -151,10 +151,10 @@ GH_RELEASES_LIMIT = 20
 # npu/q4nx.h pins that layout behind a chunk table, so a release that mentions any of
 # these is flagged for a human to read before the pinned version moves.
 KERNEL_FORMAT_MARKERS = ("q4nx", "chunk", "layout")
-# A published `model_type` names its modality (`gemma3_text`, `qwen3_5_text`); the registry
-# class does not, so these trailing tokens are dropped before the name is compared.
-MODALITY_TOKENS = frozenset(("text", "vl", "vision", "audio", "image", "video", "it",
-                             "instruct", "chat", "base", "mm", "multimodal"))
+# engine#3513: repo file names that say the repo uses its own code rather than the family's. `model.py` is what
+# Psalms23Wave/alkebulan-luganda-small-v0.1 ships (the census only ever looked for `modeling_*.py`), and a
+# `config.json` next to it is that code's config, not a Transformers one.
+OWN_CODE_FILES = re.compile(r"^(modeling_.*\.py|model\.py|generate\.py)$")
 FLM_ORG_URL = (f"{API}?author={FLM_AUTHOR}&sort=lastModified&direction=-1&limit={FLM_LIMIT}"
                "&expand[]=lastModified&expand[]=tags&expand[]=config&expand[]=siblings")
 # Gated (auto-access) repos answer the listing with no `config`, so their architecture stays
@@ -208,6 +208,8 @@ _OWN_MODELING = re.compile(r"^modeling_[A-Za-z0-9_]+\.py$")
 
 COVERED, UNCOVERED, UNVERIFIABLE, DERIVATIVE = "covered", "uncovered", "unverifiable", "derivative"
 TEST_FIXTURE = "test-fixture"
+# a config that names only its model_type (engine#3513): reported, never an alert
+MODEL_TYPE = "model-type"
 
 
 def hf_get_page(url, tries=4):
@@ -256,6 +258,34 @@ def architectures_of(model):
     cfg = model.get("config") or {}
     archs = cfg.get("architectures") or []
     return archs[0] if archs and isinstance(archs[0], str) else ""
+
+
+def model_type_family(model, archs):
+    """The mapped registry class a config's `model_type` names, or '' (engine#3513).
+
+    `architectures` is the architecture class and stays the authority; this is only a second, weaker key for the repos
+    that publish a config without one. Never an alert: a class-less title of a family the engine serves may still be
+    something the family's code cannot run (QwenMosaic drops attention for Memory Mosaics blocks), so the caller
+    reports it instead of counting it covered. A repo that ships its own model code (OWN_CODE_FILES) is excluded --
+    its own code, not the family's, is what loads it.
+    """
+    cfg = model.get("config") or {}
+    mt = cfg.get("model_type")
+    if not isinstance(mt, str) or not mt:
+        return ""
+    if is_remote_code(model) or any(OWN_CODE_FILES.match((s.get("rfilename") or ""))
+                                    for s in model.get("siblings") or ()):
+        return ""
+    for cls, entry in archs.items():
+        entry = entry or {}
+        if entry.get("backends") and mt in [cls, entry.get("gguf") or "", entry.get("npu_model_type") or ""]:
+            return cls
+    # A published model_type carries its modality (`qwen3_5_text`) while the registry names the
+    # family (`qwen3_5`) or the class, so an exact compare alone never matches those. resolve_family()
+    # already owns that rule for the FLM half; reuse it rather than keeping two. A None or an entry
+    # with no backend is not a family the engine serves, so it stays ''. 
+    cls = resolve_family(mt, archs)
+    return cls if cls and (archs.get(cls) or {}).get("backends") else ""
 
 
 def is_remote_code(model):
@@ -355,26 +385,46 @@ def classify(models, archs, sig, previously_seen=()):
 
     Pure — no network, no disk — so tests/census_watch_test.py can drive it. A model is
     covered when its architecture class is a registry key with at least one backend;
-    uncovered when it is not, which is the alert. A model with no config is unverifiable
-    (gated repos need a token) unless it is a derivative, which is expected and silent.
+    uncovered when it is not, which is the alert. A model with no architecture is unverifiable
+    unless it is a derivative (expected and silent) or its config names a mapped `model_type`
+    (MODEL_TYPE: reported, never an alert, engine#3513).
 
     `previously_seen` suppresses repeat reporting of unverifiable models.
     """
-    out = {COVERED: [], UNCOVERED: [], UNVERIFIABLE: [], DERIVATIVE: [], TEST_FIXTURE: []}
+    out = {COVERED: [], UNCOVERED: [], UNVERIFIABLE: [], DERIVATIVE: [], TEST_FIXTURE: [], MODEL_TYPE: []}
     reasons = {}  # model id -> why it could not be classified
     classes = {}  # uncovered class -> [model ids]
     fixtures = {}  # test-fixture class -> [model ids] (reported, never an alert)
     native = set()  # uncovered classes with at least one model that needs no custom code
+    family_reasons = {}  # model id -> (registry class, model_type) for MODEL_TYPE
+    config_keys = {}  # unverifiable model id -> listing config keys, [] when the repo has no config.json
+    own_code = []  # unverifiable models whose repo ships its own model code
     for m in models:
         mid = m.get("id", "")
         arch = architectures_of(m)
         if not arch:
+            # engine#3513: a config that names only its `model_type` is not a repo without a config. Counting it as
+            # unverifiable filed a real Qwen3.5 derivative (Eureka-COM/QwenMosaic-0.8B, model_type qwen3_5_text) with
+            # the gated/hidden repos, where nobody looks again -- the same class the registry already maps under
+            # Qwen3_5ForCausalLM. The architecture CLASS stays the authority: this is its own bucket, reported and
+            # never an alert, so a variant like that one is still visible.
+            family = model_type_family(m, archs)
+            # a gguf/lora/peft drop keeps the derivative bucket: it is expected and silent, and reporting it
+            # would file every GGUF conversion of a Qwen3.5 as a repo somebody should look at
+            if family and not is_derivative(m):
+                out[MODEL_TYPE].append(mid)
+                family_reasons[mid] = (family, (m.get("config") or {}).get("model_type"))
+                continue
             if is_derivative(m):
                 out[DERIVATIVE].append(mid)
                 continue
             if mid not in previously_seen:
                 out[UNVERIFIABLE].append(mid)
                 reasons[mid] = "no config / no architecture"
+                cfg = m.get("config")
+                config_keys[mid] = sorted(cfg) if isinstance(cfg, dict) else []
+                if any(OWN_CODE_FILES.match(s.get("rfilename") or "") for s in m.get("siblings") or ()):
+                    own_code.append(mid)
             continue
         entry = archs.get(arch)
         if entry and entry.get("backends"):
@@ -391,6 +441,9 @@ def classify(models, archs, sig, previously_seen=()):
     out["classes"] = classes
     out["fixtures"] = fixtures
     out["reasons"] = reasons
+    out["model_type_reasons"] = family_reasons
+    out["config_keys"] = config_keys
+    out["own_code"] = own_code
     # reviewed classes marked report-only (`"watch": "report"`): reported, no alert
     out["reviewed_report"] = sorted(c for c in classes if c in sig and sig[c].get("watch") == "report")
     out["significant"] = sorted(c for c in classes if c in sig and c not in out["reviewed_report"])
@@ -594,6 +647,12 @@ def flm_architecture(record):
 
 def normalize_family(name):
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+# A published `model_type` names its modality (`gemma3_text`, `qwen3_5_text`); the registry
+# class does not, so these trailing tokens are dropped before the name is compared.
+MODALITY_TOKENS = frozenset(("text", "vl", "vision", "audio", "image", "video", "it",
+                             "instruct", "chat", "base", "mm", "multimodal"))
 
 
 def family_stem(name):
@@ -984,6 +1043,7 @@ def report(models, res, previously_seen):
           f"{in_scope} with an architecture, {len(res[COVERED])} mapped, "
           f"{len(res['classes'])} uncovered class(es), "
           f"{len(res[UNVERIFIABLE])} unverifiable (gated/no-config), "
+          f"{len(res.get(MODEL_TYPE, []))} model_type only (reported), "
           f"{len(res[DERIVATIVE])} derivative (no config by design)")
     if not models:
         print(f"census-watch: nothing new since the last run "
@@ -1041,18 +1101,28 @@ def report(models, res, previously_seen):
         except Exception:
             upstream = None
         res["upstream_verdict"] = classify_uncovered(res["classes"], upstream)
-    # say whether a token was already sent: "gated repos need a token" is misleading advice on a
-    # run that sent one and still got no config back
-    hint = " (HF_TOKEN sent, still no config)" if hf_token() else ""
+    for mid in sorted(res.get(MODEL_TYPE, ())):
+        cls, mt = res["model_type_reasons"][mid]
+        print(f"  . MODEL_TYPE {mid}: config names model_type `{mt}` -> registry class {cls} (mapped), "
+              f"no `architectures` key")
+        print("     -> reported, not counted covered: the registry maps the class, and a variant can still carry "
+              "tensor names the family's code does not read (engine#3513)")
     for mid in sorted(res[UNVERIFIABLE]):
-        # engine#2528: this said "retried next run", which is not what happens. remember() records an
-        # unverifiable model in state["seen"] like every other group, and classify() skips anything already
-        # there -- so the row is reported ONCE and then goes quiet. Promising a retry that never comes is how a
-        # daily report teaches its readers to skim: they wait for a resolution, stop seeing the line, and cannot
-        # tell "resolved" from "remembered". Say which one it is, and name the way back in.
-        print(f"  ? UNVERIFIABLE {mid} ({res['reasons'][mid]}) — gated repos need a token{hint}; "
-              f"recorded, not retried automatically (remove it from {DEFAULT_STATE}, or add a token and "
-              f"re-run, to see it again)")
+        # engine#3513: "gated repos need a token" was wrong on all seven rows of the 2026-11-26 issue -- every one of
+        # them answered with the token and still carried no config, and one shipped its own model.py, so the advice
+        # said "add a token" to a reader who had none to add and pointed at nothing.
+        # The listing's `config` is the model-card metadata subset, so its keys say what the repo published, not
+        # what its config.json holds -- name the keys and let the reader judge.
+        cfg = res.get("config_keys", {}).get(mid)
+        why = (f"its config carries no `architectures` key (keys: {', '.join(cfg)})" if cfg else
+               "the listing carries no config for it")
+        if mid in res.get("own_code", ()):
+            why += ", and the repo ships its own model code (model.py / modeling_*.py)"
+        # the old row said "gated repos need a token" whether or not one was sent; say which case this is
+        attribution = (" this run sent a token, so privacy is not the blocker" if hf_token()
+                       else " a token may or may not be the blocker")
+        print(f"  ? UNVERIFIABLE {mid} — no architecture: {why}.{attribution}, recorded, not retried "
+              f"automatically (remove it from {DEFAULT_STATE} to see it again)")
     return 1 if any(c not in quiet for c in res["classes"]) else 0
 
 

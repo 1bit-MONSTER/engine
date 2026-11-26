@@ -148,6 +148,11 @@
    "watch": "report",
    "checked": "2026-11-17"
   },
+  "LlamaForCausalLMEagle4": {
+   "model_type": "llama",
+   "family": "EAGLE-4 speculator (one 8192-wide draft layer over three auxiliary target hidden states), FC-fused attention input and a low-rank candidate head (efficient_lm_head, num_candidates 128, rank 128); first seen ZachWangAMD/Muse-EAGLE4-FP8, an FP8/Quark requant of the gated amd/Muse-Spark-Open-EAGLE4 draft for amd/Muse-Spark-Open (2026-11-26 census). Not an alias of Eagle3 even though it declares model_type llama and 1 layer like the eagle3 block: see docs/arch-gaps.md. Needs the FC-4x projection and the low-rank candidate head in a draft path. Recheck by 2026-12-04: if no pinned backend gains an EAGLE-4 draft path by then, remove the watch field so the next upload alerts and the demand is visible in the census.",
+   "watch": "report"
+  },
   "MolmoAct2ForConditionalGeneration": {
    "model_type": "molmoact2",
    "family": "MolmoAct2, vision-language-action"

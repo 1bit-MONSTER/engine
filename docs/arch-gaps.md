@@ -1454,3 +1454,78 @@ Three are **declined** and carry `"watch": "report"` in `registry/significant.js
 * **Why an alias would be a fabrication**: with no tensor shapes that agree with each other and no code
   anywhere that defines the extra state, a mapping would have to invent the graph. If the uploader later ships
   weights whose shapes agree with a real family, this entry is the place to say so.
+
+## 2026-11-26: `LlamaForCausalLMEagle4` — reviewed, not an alias (engine#3513)
+
+The 2026-11-26 watcher run alerted `!! UNCOVERED LlamaForCausalLMEagle4 (new class)`, one model from one
+uploader: `ZachWangAMD/Muse-EAGLE4-FP8` (created 2026-11-26, 0 downloads, tags `eagle4`, `draft-model`,
+`sglang`, `quark`, `base_model:quantized:amd/Muse-Spark-Open-EAGLE4`). It is the **EAGLE-4 speculative
+drafter** for `amd/Muse-Spark-Open`, the Muse Spark target whose trunk our fork serves as `LLM_ARCH_MUSE_SPARK`.
+
+* **What it is**: `architectures: ["LlamaForCausalLM"]`'s sibling draft — `model_type: llama`,
+  `num_hidden_layers` 1, hidden 8192, 64 heads / 64 KV, head_dim 128, intermediate 16384, vocab and
+  `draft_vocab_size` 202048, `target_hidden_size` 8192, `sliding_attention` with window 4096, rope_theta
+  500000, `fc_norm: true`, `norm_output: true`. The EAGLE-4 machinery is in the config itself:
+  `eagle_config.{[use_aux_hidden_state: true, eagle_aux_hidden_state_layer_ids: [1, 29, 57]]}`,
+  `num_aux_hidden_states: 3`, and `efficient_lm_head_config.{type: "low_rank", rank: 128,
+  num_candidates: 128}`. The weights are an FP8 e4m3 per-tensor Quark quant (`quant_method: "quark"`,
+  `weight_format: "real_quantized"`) of the gated `amd/Muse-Spark-Open-EAGLE4`.
+* **Why an alias is wrong, and why the name is a trap**: `LlamaForCausalLM` + `model_type: llama` + one layer
+  is exactly the shape `conversion/llama.py` reads as an **EAGLE-3** draft (its `draft_vocab_size` and
+  `num_hidden_layers == 1` branch), so a converter registration is *not* the one-line edit
+  `Edge0ForCausalLM` was. The pinned `src/models/eagle3.cpp` fuses the three target layers with
+  `LLM_TENSOR_FC` sized `{n_embd_inp = 3 x n_embd_tgt, n_embd}` — 24576 x 8192 here, **4x the 3 x 8192** a
+  three-layer EAGLE-3 of this width would need (three 8192 ids are three times 8192, not twelve) — and has no
+  low-rank candidate head at all: there is no `efficient_lm_head` in the converter, the runtime, or
+  `gguf-py`. Loading this checkpoint through the eagle3 path would either fail on the FC shape or build a
+  draft that drops the 128-candidate head, which is the silent-substitution failure this page exists for.
+* **Not a pin gap**: checked 2026-11-26 on the pinned `third_party/llama.cpp` `851fa6c8d` — `git grep` over
+  `src/` and `conversion/` for `agle4` returns nothing, the converter's registered draft classes are
+  `Eagle3DraftModel` / `Eagle3LlamaForCausalLM` / `Eagle3Speculator` / `LlamaForCausalLMEagle3` (all ->
+  `EAGLE3`), and `src/llama-arch.cpp` has `LLM_ARCH_EAGLE3` only. Upstream `ggml-org/llama.cpp` master is the
+  same (0 hits for `agle4` in `convert_hf_to_gguf.py`, `conversion/llama.py` and `llama-arch.cpp`; its one
+  eagle line is `LLM_ARCH_EAGLE3`), so bumping the pin changes nothing. Neither tree reads any EAGLE-4 key
+  (`efficient_lm_head_config`, `num_aux_hidden_states`, `fc_norm`, `norm_output`), so
+  `tools/registry_build.py` has nothing to map from and the generated registry has no entry.
+* **What real support requires**: an EAGLE-4 draft path in a pinned backend — the FC-4x feature fusion of the
+  three auxiliary states, the optional `fc_norm` / output norm, the low-rank candidate head (rank 128,
+  `num_candidates` 128) and its token-selection bookkeeping — plus the Muse Spark target beside it (which the
+  fork already has) and reference logits from the HF/AMD harness the repo ships under `repro/`. That is an
+  engine feature, not a registry edit.
+* **Not measurable here as published**: the only upload is an FP8 Quark quant whose 4 GB-scale weights no
+  GGUF/NPU path reads, and its base (`amd/Muse-Spark-Open-EAGLE4`) is gated (the config above was read from
+  the requant, which is public).
+
+Reported, not alerted (`"watch": "report"` in `registry/significant.json`): one uploader, zero downloads,
+and nothing in a pinned backend for it to be mapped to. Remove the `watch` field once a pin bump adds an
+EAGLE-4 draft architecture, and record `mapped_ok` there then; the HF-tag counts are worth watching, because
+`eagle4` is the kind of tag a family standardises on.
+
+## 2026-11-26: the census reported `? UNVERIFIABLE` for repos that were never gated (engine#3513)
+
+Seven rows of the same report filed real repos with the gated ones ("gated repos need a token"). Nothing about
+them was gated: all seven were checked with the read token on 2026-11-26 and every one answered with
+`gated: false, private: false`. What they have in common is a Hub listing whose `config` object — the
+model-card metadata subset, not the file — carries no `architectures`, which is the only key the census read.
+
+* **What each one is**: `Eureka-COM/QwenMosaic-0.8B` is a real Qwen3.5-0.8B derivative whose listing
+  `config` is only `{model_type: qwen3_5_text, tokenizer_config, chat_template_jinja}` while its
+  `config.json` is a full Qwen3.5 config with no `architectures` key; it replaces all six softmax attention
+  layers with Memory Mosaics blocks and ships no q/k/v/o weights, so the family's code would not run it even
+  though the class is mapped. `Eureka-COM/QwenMosaic-27B-delta` is a delta drop (no `config.json`).
+  `Psalms23Wave/alkebulan-luganda-small-v0.1` publishes a config of its own
+  (`{architecture: PieceTransformer, n_layers: 4, d_model: 128, ...}`) next to `model.py` and
+  `generate.py`, so no Transformers key describes it. `Dankpaws/Hy4-flash-DankAttn-v4-h128-w6` is a
+  `.bin`/manifest pack, `prabanta-dev/Inkling-2-Mini-JNS` a single `.jns`, `zjwan461/bonsai2.5-27b-ninfer` a
+  `.ninfer`, `acoyfellow/cf4b-qwen3.5-4b-mlx-4bit` a README.
+* **Not a mapping decision**: none of the seven asks for a registry entry. The class that is mapped
+  (`Qwen3_5ForCausalLM` via `qwen3_5_text`) is reported as `MODEL_TYPE` — mapped in the registry, not counted
+  covered, because a variant can keep the title and drop the tensors (QwenMosaic is exactly that). The rest
+  are not Transformers models at all, and stay unverifiable with a reason that names what the config carried.
+* **What changed**: the row now says what was missing instead of assuming a token
+  (`its config carries no architectures key (keys: ...)`, `the listing carries no config for it`, plus
+  `ships its own model code` for a repo with `model.py` / `generate.py`), and says whether *this* run sent a
+  token. A config whose `model_type` names a mapped family is `MODEL_TYPE`, reported and never an alert.
+
+Nothing here needs a pin bump or an engine change, and no `registry/significant.json` entry was added: the
+report was wrong about the repos, not the engine about the architectures.

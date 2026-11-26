@@ -104,6 +104,31 @@ check("unmapped class is grouped under its class", list(res["classes"]) == ["Nim
 rc, res = rc_of([model("c/three", "EmptyForCausalLM")])
 check("empty backends -> uncovered", rc == 1 and res[cw.UNCOVERED] == ["c/three"])
 
+# 3b. engine#3513: a config that names only its `model_type` is reported, not filed with the gated repos.
+
+def model_type_only(mid, mt, files=("config.json", "model.safetensors")):
+    m = {"id": mid, "config": {"model_type": mt}, "tags": ["text-generation"]}
+    m["siblings"] = [{"rfilename": f} for f in files]
+    return m
+
+rc, res = rc_of([model_type_only("g/qwen35", ARCHS["Qwen3ForCausalLM"]["gguf"])])
+check("model_type naming a mapped family -> reported, not unverifiable, exit 0",
+      rc == 0 and res[cw.MODEL_TYPE] == ["g/qwen35"] and not res[cw.UNVERIFIABLE])
+check("...and it is not counted as covered either (a variant can still drop tensors)",
+      not res[cw.COVERED] and not res[cw.UNCOVERED])
+rc, res = rc_of([model_type_only("g/unknown", "nosuchfamily")])
+check("a model_type no mapped family names -> still unverifiable",
+      rc == 0 and res[cw.UNVERIFIABLE] == ["g/unknown"] and not res[cw.MODEL_TYPE])
+rc, res = rc_of([model_type_only("g/code", ARCHS["Qwen3ForCausalLM"]["gguf"],
+                                files=("config.json", "modeling_qwen_mosaic.py"))])
+check("a model_type repo that ships its own modeling_*.py is not the family's code",
+      not res[cw.MODEL_TYPE] and res[cw.UNVERIFIABLE] == ["g/code"])
+
+rc2, res2 = rc_of([model_type_only("g/gguf", ARCHS["Qwen3ForCausalLM"]["gguf"])
+                   | {"tags": ["gguf", "text-generation"]}])
+check("a gguf-tagged drop is a derivative before it is a model_type",
+      res2[cw.DERIVATIVE] == ["g/gguf"] and not res2[cw.MODEL_TYPE])
+
 # 4. A reviewed not-an-alias class is still the alert, and is labeled as such.
 rc, res = rc_of([model("d/four", "Qwen3_5MVLAAbsorbedForCausalLM")])
 check("significant class -> uncovered, exit 1", rc == 1)
@@ -218,6 +243,36 @@ line = [l for l in buf.getvalue().splitlines() if "UNVERIFIABLE" in l]
 check("unverifiable line says it is recorded, not retried",
       len(line) == 1 and "retried next run" not in line[0]
       and "not retried automatically" in line[0])
+
+# 7b. engine#3513: the row said "gated repos need a token" for repos that answered with a token and were never gated.
+# It now names what the config actually carries so a reader knows what to look at.
+
+def unverifiable_line(rec, token=""):
+    _old = os.environ.pop("HF_TOKEN", None), os.environ.pop("HUGGING_FACE_HUB_TOKEN", None)
+    if token:
+        os.environ["HF_TOKEN"] = token
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cw.report([rec], cw.classify([rec], ARCHS, SIG, ()), ())
+    finally:
+        for var in cw.TOKEN_VARS:
+            os.environ.pop(var, None)
+        for var, val in zip(cw.TOKEN_VARS, _old):
+            if val:
+                os.environ[var] = val
+    return [l for l in buf.getvalue().splitlines() if "UNVERIFIABLE" in l]
+
+_weak = {"id": "k/x", "tags": ["text-generation"], "config": {"model_type": "blob"},
+         "siblings": [{"rfilename": "config.json"}]}
+_l = unverifiable_line(_weak, token="not-a-real-token")
+check("no token-less 'gated' claim when a token was sent",
+      len(_l) == 1 and "gated repos need a token" not in _l[0] and "privacy is not the blocker" in _l[0])
+check("the row names the config keys it saw", "keys: model_type" in _l[0])
+_own = dict(_weak, id="k/own", siblings=[{"rfilename": "config.json"}, {"rfilename": "model.py"}])
+check("the row says the repo ships its own model code", "ships its own model code" in unverifiable_line(_own)[0])
+check("a gguf-tagged drop stays silent",
+      not unverifiable_line(dict(_weak, tags=["gguf", "text-generation"])))
 
 # 8. A mixed batch: the alert fires, and the summary counts each group.
 rc, res = rc_of([
@@ -963,11 +1018,13 @@ os.environ.pop(cw.TOKEN_VARS[0])
 os.environ[cw.TOKEN_VARS[1]] = "hf_second"
 check("HUGGING_FACE_HUB_TOKEN is the fallback",
       cw.request_headers().get("Authorization") == "Bearer hf_second")
-check("the unverifiable line names the token it already sent",
-      "(HF_TOKEN sent, still no config)" in text_of([model("gated/one")])[1])
+# engine#3513: it used to say "(HF_TOKEN sent, still no config)", which told a reader nothing they could act on.
+check("the unverifiable line says a token was sent and privacy is not the blocker",
+      "privacy is not the blocker" in text_of([model("gated/one")])[1])
 os.environ.pop(cw.TOKEN_VARS[1], None)
-check("with no token the line stays the plain advice",
-      "HF_TOKEN sent" not in text_of([model("gated/one")])[1])
+check("with no token the line does not claim one was sent",
+      "a token may or may not be the blocker" in text_of([model("gated/one")])[1]
+      and "privacy is not the blocker" not in text_of([model("gated/one")])[1])
 
 # 18. engine#2812: two credentials, picked by HOST. The HF token must never be sent to
 #     api.github.com, the GitHub token is useless to Hugging Face, and a third-party URL must

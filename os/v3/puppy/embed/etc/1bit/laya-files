@@ -19,7 +19,7 @@
 # sha256 before they are put in place. tests/laya_fetch_test.sh fails when repo/revision drift from config/laya.json.
 # 808 MB; Apache-2.0 (the checkpoint's own licence).
 repo convaiinnovations/laya
-revision fd4f9dbcf4fde222fd43174bdd4c3b08b789e4e1
+revision 246177e5cb70334c9831c0730864a93c836aac8f
 5268d24ad3b77c8151de5dcb0762ba4391619aad9ab0bda33e36fb083cfeae6d 2084 typed-decisions/encoder/config.json
 4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e 842609220 typed-decisions/model.safetensors
 ebf0cd524d92342a6be5e48e9fca3d7c2babfb5a56ccd79d2171ef5d8c7f7be8 847 typed-decisions/rl_agent_config.json

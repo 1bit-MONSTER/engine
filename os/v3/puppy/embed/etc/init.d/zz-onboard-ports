@@ -35,6 +35,17 @@ open_port() {
 }
 open_port 13305   # Lemonade (U3)
 open_port 22      # ssh, the owner's key (U7)
+# OS updater U5b: the LAN update page (tcp/8444), to the private ranges only and only while an update credential is
+# set; without one any rule a previous run added is removed. Idempotent: 1bit-update --web-password(-off) re-runs this.
+for src in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+    if [ -s /etc/1bit/update-web.cred ]; then
+        iptables -C INPUT -p tcp --dport 8444 -s "$src" -j ACCEPT 2> /dev/null ||
+            iptables -I INPUT 1 -p tcp --dport 8444 -s "$src" -j ACCEPT 2> /dev/null ||
+            echo "zz-onboard-ports: could not open tcp/8444 for $src" >&2
+    else
+        while iptables -D INPUT -p tcp --dport 8444 -s "$src" -j ACCEPT 2> /dev/null; do :; done
+    fi
+done
 
 # mDNS (cycle 23; c22 board 4 Nov: avahi logged "1bit-os.local is announced" and a raw mDNS query from ryzen got
 # no answer at all). The reason is in the same rc.firewall this file already had to work around, read out of the

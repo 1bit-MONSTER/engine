@@ -197,6 +197,47 @@ SFS with one added file): the update reports `UPDATED`, the machine comes back o
 the new set's marker file present and the marker written before the update still there; `--rollback` brings it back to
 `psubdir=1bit` with the previous appliance intact and the state unchanged.
 
+#### The update pages (local, and LAN only with a password)
+
+The same check / install / rollback as the console menu, in a browser. Both pages are served by `1bit-webapp-proxy`,
+and each one does nothing but update:
+
+| | where | who may install, roll back, reboot |
+|---|---|---|
+| local | `http://127.0.0.1:8081/` (the chat page's header links it) | a client whose **socket belongs to root** on this box: the desktop session's browser, or `curl` from a root shell |
+| LAN | `https://<this box>:8444/` | whoever signs in as **root** with the update password; the page **exists only while one is set**. From the network it installs the newer **signed** release and reboots, and does **not** roll back |
+
+- **No password, no LAN page.** `sudo 1bit-update --web-password` sets one (asked twice, at least 12 characters; the
+  console menu's update screen has the same switch), and opens tcp/8444 to the private ranges only. `--web-password-off`
+  removes it, and the page and its firewall opening with it. The page's certificate is the box's own (self-signed).
+  **Compare the SHA-256 the browser shows with the one `--web-password` prints BEFORE you sign in:** a warning clicked
+  through on a network someone can intercept hands them the password.
+- **No rollback from the network.** A captured password must not buy a downgrade, so rolling back stays on the console
+  menu and the box's own page. Over the LAN, `--latest` installs only a release that is newer than the running one and
+  signed, with that identity checked inside the verified image.
+- **Each action asks for a typed confirmation**: the offered release, the slot to roll back to, or the word `reboot`. The
+  box checks it against its own fresh `--check` / `--status`, never against what the browser sent.
+- **Which rule stops what.** The root-socket rule stops other local processes. A custom header plus the typed
+  confirmation stop a root daemon that could be made to relay a request. The page's own origin, with a CSP of
+  `default-src 'self'` and no framing, keeps anything served on the chat origin (`:8080`, which also forwards Lemonade's
+  `/api/`) from driving the actions. On the LAN listener the password takes the place of the root-socket rule.
+- **Sign-in limits, counted per source address.** Each attempt is counted before the password is checked, and checks
+  run one at a time, so concurrent connections cannot outrun the limit or tie up the CPU; at most 16 LAN connections are
+  live. An address gets 3 free attempts; after that each failure doubles its wait, from 2 seconds up to 15 minutes
+  (the answer is `429` with `Retry-After`). A successful sign-in clears it, and an hour without a failure forgets it.
+- **Nobody else's failures lock you out.** An address that has signed in successfully is remembered (a root-only file,
+  `/var/lib/1bit/update-web.known`) and answers only to its own backoff. The one shared limit, 20 failures from all
+  addresses in 10 minutes, applies only to addresses that have never signed in, to stop guessing spread over many
+  addresses. If the page is unreachable for any reason, **the console menu's update screen and a root shell on the box
+  (`sudo 1bit-update ...`) always work**: neither goes through the LAN page.
+- One action at a time; its output is shown from a root-only log. The page's status reuses a `--check` for 5 minutes
+  (GitHub allows 60 unauthenticated calls an hour); an install always checks afresh.
+
+**Measured, in a VM** (`tools/update_vm_test.sh`, a throwaway signing key, CA and release list that exist only in its
+work directory): a live boot installs onto a blank NVMe disk, the installed machine refuses a tampered image and a
+genuine one re-published under a newer tag, `--check` sees the newer test release, `--latest` verifies and installs it,
+the machine boots it, `--rollback` and a reboot bring back the previous release. Every row passed on 27 Nov 2026.
+
 #### What `/etc/1bit/release-identity` says, and which of it is checked
 
 The file is written by the builder, printed by the console's header and read by `1bit-release-check`'s identity rows. Its

@@ -30,6 +30,9 @@
 # cannot be used as a general proxy for it (only /api/ and /internal/ are forwarded, and the key is the one this
 # machine minted). Nothing is written: the directory is served read-only, as before.
 import http.client
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -346,9 +349,12 @@ class UpdateHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _origin_ok(self, origin):
+        return origin in UPDATE_ORIGINS
+
     def _update(self):
         origin = self.headers.get("Origin")
-        if origin and origin not in UPDATE_ORIGINS:
+        if origin and not self._origin_ok(origin):
             return self._json(403, {"error": "cross-origin requests may not use the update page"})
         path = self.path.split("?", 1)[0]
         if self.command == "GET" and path == "/1bit/update/status":
@@ -431,6 +437,309 @@ def serve_update():
     return u
 
 
+# ── OS updater U5b: the LAN update page, only once a credential is set on the box ──────────────────────────────────
+# Owner decision via the orchestrator, 27 Nov: a LAN update page only once a credential has been set on the box, with
+# install/rollback behind it; no credential = no LAN page. So a SECOND listener, in this process, exists only while
+# /etc/1bit/update-web.cred does (written by `1bit-update --web-password`, removed by --web-password-off):
+#   * 0.0.0.0:8444, HTTPS only (a self-signed P-256 certificate the init script makes with openssl on first start;
+#     its sha256 fingerprint goes to the console so a person can check what the browser shows);
+#   * it serves update.html and /1bit/update/* and NOTHING else - never /api/, never the chat page, never the key;
+#   * every request, the page and status included, needs HTTP Basic auth against the credential (PBKDF2-SHA256,
+#     compared in constant time); 5 failures from one address in 10 min lock that address for 10 min, 20 from all
+#     addresses lock the listener for 10 min; the password is never logged;
+#   * the POST rules otherwise stay: X-1bit-Update, its own https origin, the typed confirmation, one at a time.
+#   * zz-onboard-ports opens 8444 to the private ranges only, and only while the credential exists.
+LAN_PORT = int(os.environ.get("ONEBIT_WEBAPP_LAN_PORT", "8444")) if not _AS_ROOT else 8444
+CRED = "/etc/1bit/update-web.cred" if _AS_ROOT else os.environ.get("ONEBIT_WEBAPP_CRED", "/etc/1bit/update-web.cred")
+LAN_CERT = "/etc/1bit/update-web.crt" if _AS_ROOT else os.environ.get("ONEBIT_WEBAPP_CERT", "/etc/1bit/update-web.crt")
+LAN_KEY = "/etc/1bit/update-web.key" if _AS_ROOT else os.environ.get("ONEBIT_WEBAPP_KEY", "/etc/1bit/update-web.key")
+PBKDF2_ITERS = 600000
+LAN_PAGES = ("/update.html", "/update.js", "/update.css")
+_fail = {"by_ip": {}, "all": [], "lock": threading.Lock()}
+# Per-address BACKOFF (orchestrator, from cl-hrxtest's review): an address gets FREE_TRIES attempts, then each further
+# failure doubles its wait, from 2 s up to 15 min; a success resets it, an hour without a failure forgets it. The
+# GLOBAL lock (FAIL_ALL failures in FAIL_WINDOW) applies only to addresses that have NEVER signed in here: it stops
+# guessing spread over many addresses, but nobody's failures can lock out an address the owner signed in from
+# (KNOWN, kept across restarts in a root-only file). On the box the console menu and a root shell always work.
+FAIL_WINDOW, FAIL_ALL, FREE_TRIES, BACKOFF_MAX, FORGET = 600.0, 20, 3, 900.0, 3600.0
+KNOWN = "/var/lib/1bit/update-web.known" if _AS_ROOT else os.environ.get("ONEBIT_WEBAPP_KNOWN", "/var/lib/1bit/update-web.known")
+_known = set()
+# reviews cl-pragent / cl-qat / cl-220 / cl-loom: an attempt is RESERVED (counted) before the 600k-round PBKDF2 and
+# released only on success, so N concurrent connections cannot all pass the limit before the first failure lands;
+# one verification runs at a time (0.15 s of one core on strixhalo), and at most LAN_MAX_CONN connections are live
+_verify = threading.BoundedSemaphore(1)
+LAN_MAX_CONN = 16
+_conns = threading.BoundedSemaphore(LAN_MAX_CONN)
+# a TEST hook, inert as root: a file that gets one line per password verification (the test counts them)
+_TEST_CHECKS = "" if _AS_ROOT else os.environ.get("ONEBIT_WEBAPP_TEST_CHECK_LOG", "")
+# a verified Authorization header is remembered for 5 min (by its sha256, in memory only), so the page's polling does
+# not cost a 600k-round PBKDF2 each time; a changed credential file forgets them all
+_ok = {"h": {}, "mtime": None, "lock": threading.Lock()}
+OK_TTL = 300.0 if _AS_ROOT else float(os.environ.get("ONEBIT_WEBAPP_TEST_OK_TTL", "300"))
+
+
+def _ok_cached(h, ip, now):
+    try:
+        m = os.stat(CRED).st_mtime_ns
+    except OSError:
+        m = None
+    # scoped to the client address as well: a captured header replayed from elsewhere is not a cached sign-in
+    k = hashlib.sha256(("%s\n%s" % (ip, h)).encode("utf-8", "surrogateescape")).hexdigest()
+    with _ok["lock"]:
+        if _ok["mtime"] != m:
+            _ok["h"], _ok["mtime"] = {}, m
+        return k, _ok["h"].get(k, 0) > now
+
+
+def _ok_remember(k, now):
+    with _ok["lock"]:
+        _ok["h"][k] = now + OK_TTL
+
+
+def make_cred(password, iters=PBKDF2_ITERS):
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters)
+    return "pbkdf2_sha256$%d$%s$%s" % (iters, salt.hex(), dk.hex())
+
+
+def check_cred(stored, password):
+    try:
+        algo, iters, salt, want = stored.strip().split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), int(iters))
+        return hmac.compare_digest(dk.hex(), want)
+    except (ValueError, TypeError):
+        return False
+
+
+def read_cred():
+    try:
+        with open(CRED) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _load_known():
+    try:
+        with open(KNOWN) as f:
+            _known.update(l.strip() for l in f if l.strip())
+    except OSError:
+        pass
+
+
+def _add_known(ip):
+    with _fail["lock"]:
+        if ip in _known:
+            return
+        _known.add(ip)
+        try:
+            os.makedirs(os.path.dirname(KNOWN), mode=0o700, exist_ok=True)
+            fd = os.open(KNOWN + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write("".join(a + "\n" for a in sorted(_known)))
+            os.rename(KNOWN + ".new", KNOWN)
+        except OSError:
+            pass
+
+
+def _backoff(n):
+    return 0.0 if n <= FREE_TRIES else min(BACKOFF_MAX, 2.0 ** (n - FREE_TRIES))
+
+
+def _reserve(ip, now):
+    """(token, None) with the attempt already counted, or (None, seconds to wait)"""
+    with _fail["lock"]:
+        _fail["all"] = [t for t in _fail["all"] if now - t < FAIL_WINDOW]
+        for k in [k for k, v in _fail["by_ip"].items() if now - v["last"] > FORGET]:
+            del _fail["by_ip"][k]                       # bounded: an hour without a failure forgets an address
+        st = _fail["by_ip"].get(ip, {"n": 0, "next": 0.0, "last": now})
+        if st["n"] >= FREE_TRIES and now < st["next"]:
+            return None, st["next"] - now
+        if ip not in _known and len(_fail["all"]) >= FAIL_ALL:
+            return None, FAIL_WINDOW - (now - _fail["all"][0])
+        st["n"] += 1
+        st["next"], st["last"] = now + _backoff(st["n"]), now
+        _fail["by_ip"][ip] = st
+        _fail["all"].append(now)
+        return now, None
+
+
+def _release(ip, token):
+    """a successful sign-in takes its attempt back and clears the address's backoff"""
+    with _fail["lock"]:
+        if token in _fail["all"]:
+            _fail["all"].remove(token)
+        _fail["by_ip"].pop(ip, None)
+
+
+def verify(stored, pw):
+    with _verify:
+        if _TEST_CHECKS:
+            with open(_TEST_CHECKS, "a") as f:
+                f.write("check\n")
+        return check_cred(stored, pw)
+
+
+class LanHandler(UpdateHandler):
+    """the LAN listener: the update page and its API only, behind the credential"""
+
+    def _is_admin(self):
+        return getattr(self, "_authed", False)
+
+    def _json(self, code, obj):
+        if isinstance(obj, dict) and "rollback_to" in obj:
+            obj = dict(obj, rollback_to="", rollback_where="console")   # the page hides the rollback form here
+        return super()._json(code, obj)
+
+    def _origin_ok(self, origin):
+        host = self.headers.get("Host", "")
+        return bool(host) and origin == "https://" + host
+
+    def _deny(self, code, msg, auth=False, retry=0):
+        body = (msg + "\n").encode()
+        self.send_response(code)
+        if retry:
+            self.send_header("Retry-After", str(retry))
+        if auth:
+            self.send_header("WWW-Authenticate", 'Basic realm="1bit OS update", charset="UTF-8"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth(self):
+        self._authed = False
+        # the address is the SOCKET PEER, never a forwarded header (X-Forwarded-For / X-Real-IP): a client cannot claim
+        # another address to escape its lock. Keep it so if this ever sits behind a reverse proxy.
+        ip, now = self.client_address[0], time.time()
+        stored = read_cred()
+        if not stored:
+            self._deny(503, "no update credential is set on this box (1bit-update --web-password sets one)")
+            return False
+        h = self.headers.get("Authorization", "")
+        key, hit = _ok_cached(h, ip, now) if h else ("", False)
+        if hit:                                         # verified from this address within 5 min: no lock, no PBKDF2
+            self._authed = True
+            return True
+        if not h.startswith("Basic "):
+            self._deny(401, "sign in as root with the update password", auth=True)
+            return False
+        token, wait = _reserve(ip, now)
+        if token is None:
+            self._deny(429, "too many failed sign-ins: try again in %d s (the console menu and a root shell on the box "
+                            "always work)" % max(1, int(wait + 0.999)), retry=max(1, int(wait + 0.999)))
+            return False
+        ok = False
+        try:
+            user, _, pw = base64.b64decode(h[6:], validate=True).decode("utf-8").partition(":")
+            ok = user == "root" and verify(stored, pw)
+        except (ValueError, UnicodeDecodeError):
+            ok = False
+        if not ok:
+            sys.stderr.write("1bit-webapp-proxy: LAN update sign-in failed from %s\n" % ip)
+            self._deny(401, "sign in as root with the update password", auth=True)
+            return False
+        _release(ip, token)
+        _add_known(ip)
+        _ok_remember(key, now)
+        self._authed = True
+        return True
+
+    def do_GET(self):
+        if not self._auth():
+            return
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/1bit/update/"):
+            return self._update()
+        if path in ("/", ""):
+            self.path = "/update.html"
+            path = self.path
+        if path in LAN_PAGES:
+            return SimpleHTTPRequestHandler.do_GET(self)
+        return self._deny(404, "only the update page is served on this address")
+
+    def do_HEAD(self):
+        return self._deny(405, "not on this address")
+
+    def do_POST(self):
+        if not self._auth():
+            return
+        if self.path.split("?", 1)[0] == "/1bit/update/rollback":
+            # reviews cl-hrxtest / cl-220: a password captured after a clicked-through certificate warning must not
+            # buy a DOWNGRADE. From the LAN only the newer SIGNED release installs (--latest's identity check refuses
+            # anything older, #3454) and reboot; rolling back is the console's or the box's own page's
+            return self._json(403, {"error": "rolling back is not offered on the network: use the console menu or "
+                                              "the box's own page (http://127.0.0.1:8081/)"})
+        if self.path.startswith("/1bit/update/"):
+            return self._update()
+        return self._deny(404, "only the update page is served on this address")
+
+    do_PUT = do_DELETE = do_HEAD
+
+
+def serve_lan():
+    """start the LAN listener in a thread when a credential and a certificate exist; returns the server or None"""
+    import ssl
+    if not read_cred():
+        return None
+    _load_known()
+    if not (os.path.isfile(LAN_CERT) and os.path.isfile(LAN_KEY)):
+        print("1bit-webapp-proxy: an update credential is set but %s / %s are missing: no LAN update page"
+              % (LAN_CERT, LAN_KEY), flush=True)
+        return None
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(LAN_CERT, LAN_KEY)
+    class TLSServer(ThreadingHTTPServer):
+        # the handshake runs in each request's own thread, with a deadline - wrapping the LISTENING socket would do
+        # it in the accept loop, where one slow client stalls every other sign-in
+        def finish_request(self, request, client_address):
+            if not _conns.acquire(blocking=False):      # at most LAN_MAX_CONN live connections (handshakes included)
+                return
+            try:
+                request.settimeout(30)
+                try:
+                    tls = ctx.wrap_socket(request, server_side=True)
+                except (OSError, ValueError):
+                    return
+                self.RequestHandlerClass(tls, client_address, self)
+            finally:
+                _conns.release()
+
+        def shutdown_request(self, request):
+            try:
+                request.close()
+            except OSError:
+                pass
+    try:
+        lan = TLSServer(("0.0.0.0", LAN_PORT), LanHandler)
+    except OSError as e:
+        print("1bit-webapp-proxy: the LAN update page could not bind :%d (%s)" % (LAN_PORT, e), flush=True)
+        return None
+    lan.daemon_threads = True
+    threading.Thread(target=lan.serve_forever, daemon=True).start()
+    print("1bit-webapp-proxy: LAN update page on https://0.0.0.0:%d (credential set)" % LAN_PORT, flush=True)
+    return lan
+
+
+def set_password(argv):
+    """--set-update-password: the password from stdin (twice, as two lines), at least 12 characters"""
+    lines = sys.stdin.read().split("\n")
+    if len(lines) < 2 or lines[0] != lines[1]:
+        sys.exit("1bit-webapp-proxy: the two passwords differ")
+    pw = lines[0]
+    if len(pw) < 12:
+        sys.exit("1bit-webapp-proxy: the update password must have at least 12 characters")
+    fd = os.open(CRED + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(make_cred(pw) + "\n")
+    os.chmod(CRED + ".new", 0o600)
+    os.rename(CRED + ".new", CRED)
+    print("1bit-webapp-proxy: update password set (%s)" % CRED)
+
+
 def port_holder(port):
     """Who is listening on 127.0.0.1:<port>, as "pid <pid> (<cmdline>)", from /proc alone (c19/c20 board).
 
@@ -472,6 +781,8 @@ def port_holder(port):
 
 
 def main():
+    if sys.argv[1:2] == ["--set-update-password"]:
+        return set_password(sys.argv[2:])
     if not os.path.isfile(os.path.join(APP, "index.html")):
         sys.exit("1bit-webapp-proxy: no %s/index.html" % APP)
     # Bind, or say who has the port (c19/c20 board: a bare traceback told the next reader nothing). Retried
@@ -498,6 +809,7 @@ def main():
         sys.exit("1bit-webapp-proxy: could not bind 127.0.0.1:%d" % PORT)
     srv.daemon_threads = True
     serve_update()
+    serve_lan()
     print("1bit-webapp-proxy: serving %s on 127.0.0.1:%d, /api/ -> %s:%d%s"
           % (APP, PORT, UPSTREAM[0], UPSTREAM[1],
              "" if api_key() else " (no API key in %s)" % CONF), flush=True)

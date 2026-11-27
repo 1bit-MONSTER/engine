@@ -63,7 +63,9 @@ def paths_at(rev):
 
 def touched_by_branch(base, head, merge_base):
     """Paths the branch itself changed, relative to where it diverged."""
-    result = git("diff", "--name-only", "-z", f"{merge_base}...{head}")
+    # --no-renames: a rename changes both paths. With rename detection (git's default) only the new name is listed,
+    # and the old one then read as "never changed, yet dropped by the merge" (engine#3553).
+    result = git("diff", "--no-renames", "--name-only", "-z", f"{merge_base}...{head}")
     if result.returncode != 0:
         return None
     return {p for p in result.stdout.split("\0") if p}

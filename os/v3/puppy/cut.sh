@@ -263,10 +263,25 @@ PY
         sudo -n unsquashfs -q -n -d "$t" "$src"
         sudo -n bash "$T/scripts/base-modes.sh" "$t" --keep "$here/base-modes-keep" > "$logs/base-modes-$l.log" 2>&1 ||
             die "base-modes failed on $l"
+        # a layer that carries its own account files gets the main SFS's treatment too: the overlay reads the FIRST
+        # lower layer that has a file, and bdrv sits ABOVE the main SFS (lowerdir=/pup_b:/pup_ro2:/pup_f:/pup_z) with
+        # its own passwd/group/shadow, so locking root only in the main SFS (#3552) left the base default in effect
+        if sudo -n test -f "$t/etc/shadow"; then
+            sudo -n sh "$here/lock-root-password.sh" "$t/etc/shadow" || die "could not replace the default root password in $l"
+            say "  $l: root has no usable password in its own etc/shadow"
+        fi
+        if sudo -n test -f "$t/etc/group"; then
+            sudo -n sh "$here/harden-groups.sh" "$t/etc/group" || die "could not harden $l's etc/group"
+        fi
         case $l in zdrv) opts="-comp xz -b 128K" ;; *) opts="-comp zstd -Xcompression-level 19 -b 256K" ;; esac
         # shellcheck disable=SC2086
         sudo -n mksquashfs "$t" "$O/$(basename "$src")" $opts -no-exports -no-xattrs -noappend -quiet > /dev/null
         sudo -n rm -rf "$t"
+    done
+    # every layer of the image that carries an etc/shadow must ship root with no usable password (never printed)
+    for f in "$O"/*.sfs; do
+        rf=$(sudo -n unsquashfs -q -cat "$f" etc/shadow 2> /dev/null | awk -F: '$1 == "root" { print ($2 == "" ? "E" : substr($2, 1, 1)); exit }')   # E: empty = no password at all
+        case $rf in ''|'*'|'!') ;; *) die "$(basename "$f") ships root with a usable password in etc/shadow" ;; esac
     done
     cp "$BASE/vmlinuz" "$BASE/initrd.gz" "$O/"
     sudo -n chown -R "$(id -u):$(id -g)" "$O"

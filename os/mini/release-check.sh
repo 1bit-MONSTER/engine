@@ -1195,6 +1195,18 @@ root_password_verdict() {
     esac
 }
 
+# layers_root_verdict <layers checked> <layers whose root field fails root_password_verdict, space-separated>: the
+# image is a stack (lowerdir=/pup_b:/pup_ro2:/pup_f:/pup_z) and the base's bdrv, ABOVE the main SFS, carries its own
+# etc/shadow, so a lock in the main SFS alone does not take effect. Every squashfs layer that has an etc/shadow must
+# ship root with no usable password. The row passes each layer's field straight into root_password_verdict and
+# never prints it. Pure, so --self-test drives it.
+layers_root_verdict() {
+    _n=${1:-0} _bad=${2:-}
+    [ "$_n" -gt 0 ] || { printf 'SKIP no squashfs layer under the root overlay carries an etc/shadow (not the appliance)'; return 0; }
+    [ -z "$_bad" ] || { printf 'FAIL %s ship(s) root with a usable password in its own etc/shadow (the image'"'"'s layers v2026.47 to v2026.49-rc1 carry the base default): update to a release that locks every layer' "$_bad"; return 0; }
+    printf 'PASS root has no usable password in any of the %s image layer(s) that carry an etc/shadow' "$_n"
+}
+
 # privileged_groups_verdict <group file> <passwd file>: no user but root may be in a group whose members are root in all
 # but name - disk (raw block devices), kmem (kernel memory), shadow (password hashes), root, sudo, wheel - as a listed
 # member or by primary gid. Puppy's base put its desktop user spot (uid 502) in disk and kmem, which undercuts the
@@ -1465,6 +1477,11 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(root_password_verdict '')"
     check FAIL "$(root_password_verdict UNREADABLE)"
     check FAIL "$(root_password_verdict 'abXYZ12345678')"
+    # layers-root-password: every image layer with an etc/shadow
+    check PASS "$(layers_root_verdict 2 '')"
+    check FAIL "$(layers_root_verdict 2 'pup_b')"
+    check FAIL "$(layers_root_verdict 2 'pup_b pup_ro2')"
+    check SKIP "$(layers_root_verdict 0 '')"
     check FAIL "$(privileged_groups_verdict "$_pg/missing" "$_pg/p")"
     rm -rf "$_pg"
     check FAIL "$(node_verdict 1 '' '' '' '')"                                   # 1bit OS without Node.js
@@ -3486,6 +3503,31 @@ else RP=$(root_password_verdict UNREADABLE); fi
 case "$RP" in
     PASS*) pass root-password "${RP#PASS }" ;;
     *)     fail root-password "${RP#FAIL }" ;;
+esac
+# the same, in every squashfs layer of the image (the effective /etc/shadow above can be a save-layer copy that hides
+# them, and a lower layer is what a fresh install or a cleared save layer reads)
+_lrn=0 _lrb=
+_lrl=$(awk '$2 == "/" && $3 == "overlay" { n = split($4, o, ","); for (i = 1; i <= n; i++) if (o[i] ~ /^lowerdir=/) { sub(/^lowerdir=/, "", o[i]); print o[i]; exit } }' /proc/mounts 2> /dev/null)
+_ifs=$IFS; IFS=:
+for _le in $_lrl; do
+    for _lm in "/initrd$_le" "$_le"; do
+        awk -v m="$_lm" '$2 == m && $3 == "squashfs" { f = 1 } END { exit !f }' /proc/mounts 2> /dev/null || continue
+        [ -f "$_lm/etc/shadow" ] || break
+        _lrn=$((_lrn + 1))
+        if [ -r "$_lm/etc/shadow" ]; then
+            case "$(root_password_verdict "$(awk -F: '$1 == "root" { print $2; exit }' "$_lm/etc/shadow")")" in PASS*) ;; *) _lrb="${_lrb:+$_lrb }${_lm##*/}" ;; esac
+        else
+            _lrb="${_lrb:+$_lrb }${_lm##*/}(unreadable)"
+        fi
+        break
+    done
+done
+IFS=$_ifs
+LR=$(layers_root_verdict "$_lrn" "$_lrb")
+case "$LR" in
+    PASS*) pass layers-root-password "${LR#PASS }" ;;
+    SKIP*) skip layers-root-password "${LR#SKIP }" ;;
+    *)     fail layers-root-password "${LR#FAIL }" ;;
 esac
 ND=$(node_verdict "$_nd_pup" "$_nd_v" "$_nd_pv" "$_nd_pre" "$_nd_mnt")
 case "$ND" in

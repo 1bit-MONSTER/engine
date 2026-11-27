@@ -513,6 +513,32 @@ echo "== 3builddistro"; ./3builddistro release </dev/null
 # because the answer to "is sudo in the image" is bdrv (debootstrap base), not the main puppy SFS.
 compgen -G "sandbox3/build/*.sfs" > /dev/null || {
     echo "build: REFUSED: no SFS in sandbox3/build after 3builddistro" >&2; exit 1; }
+# Every SFS that carries its own etc/shadow gets root locked and its etc/group hardened, as the skeleton did: the
+# overlay reads the FIRST lower layer that has a file, and the base's bdrv sits ABOVE the main SFS
+# (lowerdir=/pup_b:/pup_ro2:/pup_f:/pup_z) with its own passwd/group/shadow, so the skeleton's lock alone left the
+# base default in effect. A layer whose root is already locked is left byte-identical; the rest are repacked with
+# their own compressor and block size. Then every SFS is checked; the field is never printed.
+echo "== root password and privileged groups in every layer that carries account files"
+for f in sandbox3/build/*.sfs; do
+    rf=$(unsquashfs -q -cat "$f" etc/shadow 2> /dev/null | awk -F: '$1 == "root" { print ($2 == "" ? "E" : substr($2, 1, 1)); exit }')
+    case $rf in ''|'*'|'!') continue ;; esac
+    comp=$(unsquashfs -s "$f" 2> /dev/null | sed -n 's/^Compression //p' | head -1)
+    bs=$(unsquashfs -s "$f" 2> /dev/null | sed -n 's/^Block size //p' | head -1)
+    [ -n "$comp" ] && [ -n "$bs" ] || { echo "build: REFUSED: cannot read $(basename "$f")'s compression" >&2; exit 1; }
+    lt=/tmp/1bit-layer-$$; rm -rf "$lt"
+    unsquashfs -q -n -d "$lt" "$f" || { echo "build: REFUSED: could not unpack $(basename "$f")" >&2; exit 1; }
+    sh /recipe/lock-root-password.sh "$lt/etc/shadow" || { echo "build: REFUSED: could not lock root in $(basename "$f")" >&2; exit 1; }
+    [ ! -f "$lt/etc/group" ] || sh /recipe/harden-groups.sh "$lt/etc/group" ||
+        { echo "build: REFUSED: could not harden $(basename "$f")'s etc/group" >&2; exit 1; }
+    mksquashfs "$lt" "$f.new" -comp "$comp" -b "$bs" -no-exports -noappend -quiet > /dev/null &&
+        mv -f "$f.new" "$f" || { echo "build: REFUSED: could not repack $(basename "$f")" >&2; exit 1; }
+    rm -rf "$lt"
+    echo "   ok: $(basename "$f"): root has no usable password, privileged groups hold only root"
+done
+for f in sandbox3/build/*.sfs; do
+    rf=$(unsquashfs -q -cat "$f" etc/shadow 2> /dev/null | awk -F: '$1 == "root" { print ($2 == "" ? "E" : substr($2, 1, 1)); exit }')
+    case $rf in ''|'*'|'!') ;; *) echo "build: REFUSED: $(basename "$f") ships root with a usable password" >&2; exit 1 ;; esac
+done
 # the packed initrd has to carry the guard too: patch-init.sh patched the source, this is the archive
 # 3builddistro actually produced, and it is the one mkimage.sh puts on the stick.
 bash /recipe/patch-init.sh --verify sandbox3/build/initrd.gz 2>&1 | sed "s/^/   /" || {

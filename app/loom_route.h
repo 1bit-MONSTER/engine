@@ -336,11 +336,22 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
                    model_dir = (abs_ec ? fs::path(model_path) : model_abs).parent_path();
     std::map<std::string, std::uintmax_t> lock_size;   // origin -> size, from the card's own lock (absent lock: no check)
     std::map<std::string, std::string> lock_sha;        // origin -> sha256, same lock
+    std::map<std::string, std::string> lock_rev;        // origin NAME (e.g. "mxfp8") -> the revision the lock pinned
     {
         std::ifstream lin(card_dir / "model.json.lock", std::ios::binary);
         if (lin) {
             try {
                 const json lk = json::parse(lin);
+                if (lk.contains("origins") && lk["origins"].is_object())   // origin name -> the revision the lock pinned
+                    for (const auto& ov : lk["origins"].items()) {
+                        const json& o = ov.value();
+                        const json* rv = nullptr;
+                        if (o.is_object() && o.contains("resolved") && o["resolved"].is_object() && o["resolved"].contains("revision"))
+                            rv = &o["resolved"]["revision"];
+                        else if (o.is_object() && o.contains("requested") && o["requested"].is_object() && o["requested"].contains("revision"))
+                            rv = &o["requested"]["revision"];
+                        if (rv && rv->is_string()) lock_rev[ov.key()] = rv->get<std::string>();
+                    }
                 if (lk.contains("files") && lk["files"].is_array())
                     for (const auto& f : lk["files"])
                         if (f.is_object() && f.contains("origin") && f["origin"].is_string() && f.contains("size") &&
@@ -503,16 +514,20 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
                     std::string cache = repo;
                     for (std::string::size_type at = cache.find('/'); at != std::string::npos; at = cache.find('/', at + 2))
                         cache.replace(at, 1, "--");
-                    std::vector<fs::path> cands;
-                    std::error_code dec;
-                    for (fs::directory_iterator it(hub / ("models--" + cache) / "snapshots", dec), end; !dec && it != end; it.increment(dec))
-                        if (sized_ok(it->path() / name)) cands.push_back(it->path() / name);
+                    // review (cl-release): size alone is a weak identity (a re-quantised companion keeps its shapes), so the
+                    // lock's OWN revision snapshot is taken on its size; a file in ANY OTHER snapshot (a pull by `main`) only
+                    // when its sha256 equals the lock's - one candidate or several - and never when the lock has no sha256
+                    const fs::path snaps = hub / ("models--" + cache) / "snapshots";
                     fs::path pick;
-                    if (cands.size() == 1) pick = cands[0];
-                    else if (cands.size() > 1) {
-                        const auto sh = lock_sha.find(origin);
-                        for (const auto& c : cands)
-                            if (sh != lock_sha.end() && sha256_of_file(c.string()) == sh->second) { pick = c; break; }
+                    if (const auto rv = lock_rev.find(oname); rv != lock_rev.end() && sized_ok(snaps / rv->second / name))
+                        pick = snaps / rv->second / name;
+                    else if (const auto sh = lock_sha.find(origin); sh != lock_sha.end()) {
+                        std::error_code dec;
+                        for (fs::directory_iterator it(snaps, dec), end; !dec && it != end; it.increment(dec))
+                            if (sized_ok(it->path() / name) && sha256_of_file((it->path() / name).string()) == sh->second) {
+                                pick = it->path() / name;
+                                break;
+                            }
                     }
                     if (!pick.empty()) {
                         std::error_code lec;

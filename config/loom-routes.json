@@ -159,6 +159,24 @@
     "--pool_backing=fixed"
    ],
    "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7115828650 (hrx-loom 0.3.0: ids MATCH thinking off + on; accuracy 37.5 % vs fallback 25.0 % with the reasoning's edge whitespace ignored (#3433), other splits near-ties 0.065-0.397 nats; via serve decode 61.5 -> 103.0 / 59.0 -> 107.9 tok/s (DFlash drafter), prefill 262 -> 1,249 / 2,156 -> 3,295); card huggingface.co/1bit-MONSTER/Qwen3.5-4B-GGUF-loom @ 96c2f2f7 (ours: loom-skills port of loom-fun/unsloth-Qwen3.5-4B-loom@64bf4025 for the unsloth UD-Q4_K_XL, z-lab-derived DFlash drafter, mmproj)"
+  },
+  {
+   "id": "glm-4.7-flash-q4_k_m",
+   "match": {
+    "gguf_sha256": "29837ed2c0fc5f51981adf8ac8083fcf80743c598381f13e9f06cbad0498b174",
+    "gguf_size": 18312339808,
+    "model": [
+     "GLM-4.7-Flash-1bit",
+     "GLM-4.7-Flash-Q4_K_M"
+    ]
+   },
+   "card": "GLM-4.7-Flash-GGUF-loom",
+   "preset": "chat",
+   "device": "amdgpu://",
+   "args": [
+    "--pool_backing=fixed"
+   ],
+   "gate": "https://github.com/1bit-MONSTER/engine/issues/3158#issuecomment-7200450956 (speed, 4 interleaved rounds on the published card, one server at a time: prefill 1,003 -> 2,255 tok/s at 2,380 tokens (2.25x), TTFT 2,372 -> 1,055 ms, decode @2k 56.1 -> 59.7 tok/s (60.5 through 1bit serve), short decode 65.0 -> 71.5) + #3158#issuecomment-7199530041 (accuracy vs the CPU arbiter: loom 87.5 % vs fallback 62.5 %, the one Loom split is the known near-tie; KLD cannot tell, loom-serve returns no log-probs); card huggingface.co/1bit-MONSTER/GLM-4.7-Flash-GGUF-loom @ a76d9b2f (deepseek2/MLA, expanded-MLA prefill engine#3503)"
   }
  ]
 }

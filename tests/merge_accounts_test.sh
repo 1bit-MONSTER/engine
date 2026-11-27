@@ -78,6 +78,14 @@ out=$(M --apply --backup "$t/bk5" 2>&1); rc=$?
 [ $rc = 1 ] && printf '%s' "$out" | grep -q REFUSED && diff -r "$t/before2" "$t/live" > /dev/null && [ ! -e "$t/bk5" ]
 check $? "a file that does not parse is refused (exit 1) and nothing is written"
 mk; python3 -I "$tool" "$t/img" "$t/live" --apply > /dev/null 2>&1; [ $? = 2 ]; check $? "--apply without --backup is a usage error"
+mk; printf 'clash:x:81:81::/home/clash:/bin/sh\n' >> "$t/live/passwd"; printf 'clash:%s:20412:0:99999:7:::\n' "$PERSON" >> "$t/live/shadow"
+out=$(M 2>&1)
+printf '%s' "$out" | grep -q "WARNING: local user clash has uid 81, as the image's messagebus" && ! printf '%s' "$out" | grep -qF -e "$PERSON" -e person
+check $? "a uid collision is reported with name and uid only (from passwd's own reader), never a shadow field"
+mk; printf '%s:x:1:\n%s:x:1:\n' "$DEF" "$DEF" >> "$t/live/shadow"
+out=$(M 2>&1); rc=$?
+[ $rc = 1 ] && printf '%s' "$out" | grep -q "not printable" && ! printf '%s' "$out" | grep -qF -e "$DEF" -e TESTdflt
+check $? "a shadow name column that looks like a hash is never echoed, even in a refusal"
 
 ! grep -Eq '^etc/(passwd|group|shadow|gshadow)([[:space:]]|$)|^etc/\*' "$here/os/v3/puppy/embed/etc/1bit/release-owned"
 check $? "release-owned names no account file (1bit-update's move-out would delete local users)"

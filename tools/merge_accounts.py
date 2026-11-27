@@ -37,6 +37,7 @@ older 1bit-update is merged on its first boot into a release that carries this.
 """
 import hashlib
 import os
+import re
 import sys
 
 # sha256 of root's password field in the base image v2026.47 to v2026.49-rc1 were cut from (the base distribution's
@@ -55,6 +56,29 @@ class Refused(Exception):
     pass
 
 
+# Output is built ONLY from account names (through safe_name) and uids (through read_ids, which reads passwd alone):
+# no value that came out of a shadow or gshadow line other than its name column can reach a print.
+_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}\$?")
+
+
+def safe_name(name):
+    """an account name fit to print, else a placeholder (never the raw text)"""
+    return name if _NAME.fullmatch(name) else "<an account whose name is not printable>"
+
+
+def read_ids(path):
+    """[(name, uid)] of a passwd file, its own reader: nothing but those two columns is ever read into it"""
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8", errors="surrogateescape") as f:
+        for line in f:
+            cols = line.rstrip("\n").split(":")
+            if len(cols) >= 3 and cols[2].isdigit():
+                out.append((safe_name(cols[0]), cols[2]))
+    return out
+
+
 def parse(path, nfields):
     """[(name, fields)] in file order; None when the file does not exist."""
     if not os.path.exists(path):
@@ -71,7 +95,7 @@ def parse(path, nfields):
             if not lo <= len(fields) <= nfields or not fields[0]:
                 raise Refused("%s line %d: not %d colon-separated fields" % (path, n, nfields))
             if fields[0] in seen:
-                raise Refused("%s line %d: %s appears twice" % (path, n, fields[0]))
+                raise Refused("%s line %d: %s appears twice" % (path, n, safe_name(fields[0])))
             seen.add(fields[0])
             out.append((fields[0], fields))
     return out
@@ -98,19 +122,19 @@ def merge(kind, image, saved, image_users, notes):
         s = sv.get(name)
         if s is None or s == f:
             if s is None:
-                notes.append("%s: %s added from the image" % (kind, name))
+                notes.append("%s: %s added from the image" % (kind, safe_name(name)))
             out.append((name, f))
             continue
         if kind == "passwd":
-            notes.append("passwd: %s follows the image" % name)
+            notes.append("passwd: %s follows the image" % safe_name(name))
             out.append((name, f))
         elif kind == "shadow":
             pw = s[1]
             if is_known_default(pw):
-                notes.append("shadow: %s held the base image's DEFAULT password: it takes the image's field" % name)
+                notes.append("shadow: %s held the base image's DEFAULT password: it takes the image's field" % safe_name(name))
                 out.append((name, f))
             elif pw == "" and f[1] != "":
-                notes.append("shadow: %s had NO password: it takes the image's field" % name)
+                notes.append("shadow: %s had NO password: it takes the image's field" % safe_name(name))
                 out.append((name, f))
             elif pw == f[1]:
                 out.append((name, f))
@@ -124,7 +148,7 @@ def merge(kind, image, saved, image_users, notes):
                 g[2] = merge_members(members(f[2]), members(s[2]), image_users)
                 g[3] = merge_members(members(f[3]), members(s[3]), image_users)
             if g != s:
-                notes.append("%s: %s takes the image's line, keeping its local members" % (kind, name))
+                notes.append("%s: %s takes the image's line, keeping its local members" % (kind, safe_name(name)))
             out.append((name, g))
     names = {n for n, _ in image}
     for name, s in saved:
@@ -149,7 +173,7 @@ def plan(image_dir, live_dir):
         got = {n for n, _ in merged}
         lost = ({n for n, _ in live[kind]} | {n for n, _ in img[kind]}) - got
         if lost:
-            raise Refused("%s: the merge would lose %s" % (kind, ", ".join(sorted(lost))))
+            raise Refused("%s: the merge would lose %s" % (kind, ", ".join(safe_name(n) for n in sorted(lost))))
         if kind in ("passwd", "shadow") and "root" not in got:
             raise Refused("%s: no root after the merge" % kind)
         text = "".join(":".join(f) + "\n" for _, f in merged)
@@ -157,12 +181,14 @@ def plan(image_dir, live_dir):
             old = fh.read()
         if text != old:
             result[kind] = (text, old, notes)
-    # uid collisions between a local user and an image account are reported, never renumbered
-    if img["passwd"] and live["passwd"]:
-        uids = {f[2]: n for n, f in img["passwd"]}
-        for n, f in live["passwd"]:
-            if n not in image_users and f[2] in uids:
-                print("merge_accounts: WARNING: local user %s has uid %s, as the image's %s" % (n, f[2], uids[f[2]]))
+    # uid collisions between a local user and an image account are reported, never renumbered; printed from read_ids
+    # (passwd's names and uids only), not from the parsed records the shadow merge uses
+    img_ids = read_ids(os.path.join(image_dir, "passwd"))
+    img_names = {n for n, _ in img_ids}
+    by_uid = {u: n for n, u in img_ids}
+    for n, u in read_ids(os.path.join(live_dir, "passwd")):
+        if n not in img_names and u in by_uid:
+            print("merge_accounts: WARNING: local user %s has uid %s, as the image's %s" % (n, u, by_uid[u]))
     return result
 
 

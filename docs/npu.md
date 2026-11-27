@@ -2624,10 +2624,9 @@ the next request. The streamed reply and the non-streamed one are the same text.
 
 A dense GEMV on this route is bound by the weight bytes it streams, not by its arithmetic, so rc2
 adds Q4_K weights at llama.cpp's 4.5 bits per weight beside the q4_1 Q4NX ones: packs built from the
-HF checkpoint with an importance matrix (`--pure --imatrix`) and repacked losslessly into the DX4k6
-tile order. They serve from their own kernel sets, `2048x6144x16x8-dx4k6` (Qwen3-1.7B) and
+HF checkpoint with an importance matrix (`--pure --imatrix`). They serve from their own kernel sets, `2048x6144x16x8-dx4k6` (Qwen3-1.7B) and
 `2560x9728x32x8-dx4k6` (Qwen3-4B), which ship signed beside the Q4NX ones; the route picks the set
-from the pack's tile bytes and refuses a pack/set mismatch by name. The 4B keeps its Q4NX set beside
+that matches the pack and refuses a pack/set mismatch by name. The 4B keeps its Q4NX set beside
 them; the 1.7B's Q4NX set (`2048x6144x16x8`) has never shipped (engine#3460), so its Q4_K set
 stands alone.
 
@@ -2650,9 +2649,8 @@ itself a near-tie between " specific" and " character". Plain, non-imatrix Q4_K 
 6/8, which is why the packs use an importance matrix. The 8/8 is the dev-set measurement recorded in
 npu-kernels#132; the serve-level run on rc2's signed sets is still listed there as the remaining gate.
 
-A dx4k6 set carries no `layerm`, because the batched GEMV has no DX4k6 variant yet. Concurrent
-requests on these packs therefore get slot interleaving, not batched decode; the Q4NX packs keep their
-4-user batching. That is a missing kernel, not a property of Q4_K.
+Concurrent requests on these packs get slot interleaving, not batched decode; the Q4NX packs keep
+their 4-user batching.
 
 **What a release carries, and what the catalogue offers.** The release check fails any release
 without both signed dx4k6 sets (`os/mini/release-check.sh`, row `npu-dx4k6`); no 1.7B Q4NX set was

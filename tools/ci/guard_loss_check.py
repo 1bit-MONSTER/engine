@@ -85,6 +85,8 @@ def removed_guards(diff_text):
             continue
         if not path or not line.startswith("-") or line.startswith("---"):
             continue
+        if path.endswith(".md"):
+            continue                      # prose (KNOWN-ISSUES.md, READMEs) describes guards; it is not one
         body = line[1:]
         stripped = body.strip()
         if stripped.startswith(("//", "*", "/*")):
@@ -327,6 +329,8 @@ def self_test():
         [k for _p, _b, k in removed_guards("+++ b/scripts/gpu-hold\n-    log \"::warning::x\"\n")], ["warning"])
     chk("the refusal contract is unchanged: guards_removed() still returns only refusals",
         guards_removed("+++ b/s.sh\n-    log \"::warning::x\"\n"), [])
+    chk("a removed Markdown line is prose, not a guard (#3534: a KNOWN-ISSUES.md trim read as 2 lost guards)",
+        removed_guards("+++ b/KNOWN-ISSUES.md\n-  if the box cannot read the sensor, the job must be thawed\n"), [])
     chk("a comment about a warning is not a removed warning",
         removed_guards("+++ b/a.cpp\n-// stderr is not used here\n"), [])
     # a line that BOTH refuses and reports is a refusal: removing it changes what the program does, so

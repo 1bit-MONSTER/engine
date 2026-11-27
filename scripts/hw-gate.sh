@@ -124,6 +124,37 @@ if [ "${GPU_HOLD:-}" != 1 ] && [ "${HW_GATE_GPU_HOLD:-1}" != 0 ] && [ -z "${HW_G
         GPU_HOLD=1 HW_GATE_TOKEN=none exec "$0" "$@"
     fi
 fi
+# The 1bit OS appliance (since 2026-11-22) has no gpu-hold and no ~/GPU-TOKEN protocol: its lanes queue with
+# `box-hold gpu|npu|both <cmd>` (/usr/local/bin/box-hold, a flock on /tmp/box-locks that takes the GPU and the NPU lock
+# for every ticket). The repo's scripts/gpu-hold sits next to this script, so without this the gate would queue on a
+# ~/GPU-TOKEN nobody else on the box reads and run its GPU steps beside the lanes. With box-hold present each GPU step
+# (and each NPU phase) is its own ticket, at most HW_GATE_HOLD_MINUTES (45, the box rule) long, waiting up to
+# HW_GATE_BOX_HOLD_WAIT s (default 10800: lanes hold 45-min tickets and flock is not a FIFO). The step runs with the
+# lock descriptors closed, so only box-hold's own shell holds the lock: a killed step, or a survivor of one, cannot
+# keep the box. HW_GATE_BOX_HOLD=<path> names the helper, =none turns this off; a gate already running inside a box-hold
+# ticket (an ancestor is box-hold) uses that ticket instead of queueing behind itself.
+box_hold_ancestor() {   # the PROGRAM is box-hold (argv[0], or argv[1] under `sh box-hold`), not just a mention of it
+    local pid=$PPID a0 a1
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2> /dev/null; do
+        { IFS= read -r -d '' a0; IFS= read -r -d '' a1; } < "/proc/$pid/cmdline" 2> /dev/null || [ -n "${a0:-}" ] || return 1
+        [ "${a0##*/}" = box-hold ] || [ "${a1##*/}" = box-hold ] && return 0
+        a0="" a1=""
+        pid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2> /dev/null)
+    done
+    return 1
+}
+BOX_HOLD=${HW_GATE_BOX_HOLD:-$(command -v box-hold 2> /dev/null || true)}
+[ "$BOX_HOLD" = none ] && BOX_HOLD=""
+if [ -n "$BOX_HOLD" ] && box_hold_ancestor; then BOX_HOLD=""; BOX_HOLD_OUTER=1; fi
+BOX_HOLD_WAIT_S=${HW_GATE_BOX_HOLD_WAIT:-10800}
+# one box-hold ticket for "$@": <gpu|npu> <label> <minutes> <cmd...>. rc 4 = the lock never came round (box-hold's own
+# code); a step that outlives its ticket ends 124 (timeout's), its children KILLed 30 s after the TERM.
+box_ticket() {
+    local dev=$1 label=$2 minutes=$3; shift 3
+    BOX_HOLD_WAIT=$BOX_HOLD_WAIT_S BOX_HOLD_WHO="$label${GITHUB_RUN_ID:+ run $GITHUB_RUN_ID} pid $$" \
+        "$BOX_HOLD" "$dev" sh -c 'exec 8>&- 9>&-; exec "$@"' box-hold-step timeout -k 30 "$((minutes * 60))" "$@"
+}
+
 # engine#3030: a phase set with NO GPU phase in it does not claim the GPU token. Measured 2026-11-20: `--phases npuserve`
 # waited 858 s for /home/bcloud/GPU-TOKEN behind GPU work and then held the GPU for an NPU-only test, which is both a wait
 # nobody explains and a hold another lane pays for. The predicate is on the NAMES, before any phase runs, so it costs
@@ -146,7 +177,8 @@ for _a in "$@"; do
 done
 # no --phases named: the default set has GPU phases, so the claim stays
 [ "$_seen_phases" = 1 ] || _npu_only=0
-if [ "${GPU_HOLD:-}" != 1 ] && [ "${HW_GATE_GPU_HOLD:-1}" != 0 ] && [ -z "${HW_GATE_TOKEN:-}" ] && [ "$_npu_only" != 1 ]; then
+if [ "${GPU_HOLD:-}" != 1 ] && [ "${HW_GATE_GPU_HOLD:-1}" != 0 ] && [ -z "${HW_GATE_TOKEN:-}" ] && [ "$_npu_only" != 1 ] &&
+   [ -z "$BOX_HOLD" ] && [ -z "${BOX_HOLD_OUTER:-}" ]; then
     hold=$(command -v gpu-hold 2> /dev/null || true)
     if [ -z "$hold" ] && [ -x "$(dirname "$0")/gpu-hold" ]; then hold="$(dirname "$0")/gpu-hold"; fi
     if [ -n "$hold" ]; then
@@ -208,7 +240,8 @@ BUILD_MEM_FLOOR=${HW_GATE_BUILD_MEM_FLOOR:-24}
 BUILD_MEM_WAIT=${HW_GATE_BUILD_MEM_WAIT:-10}
 CODER_URL=${HW_GATE_CODER_URL:-http://127.0.0.1:8090}
 CODER_WAIT=${HW_GATE_CODER_WAIT:-900}
-TOKEN=${HW_GATE_TOKEN:-$HOME/GPU-TOKEN}
+# on the appliance the lock is box-hold's (above), so there is no token file to take
+TOKEN=${HW_GATE_TOKEN:-$([ -n "$BOX_HOLD" ] || [ -n "${BOX_HOLD_OUTER:-}" ] && printf none || printf '%s' "$HOME/GPU-TOKEN")}
 TOKEN_WAIT=${HW_GATE_TOKEN_WAIT:-3600}
 TOOLCHAIN=${ONEBIT_HRX_TOOLCHAIN:-/opt/rocm-therock}
 PRIVATE=${HW_GATE_PRIVATE:-1}
@@ -453,8 +486,14 @@ gpu() {
   export HW_GATE_STAMP=$OUT/.stamp
   rm -f "$HW_GATE_STAMP"
   while :; do
-    "$0" --cool --mem "${GPU_MODEL:--}" "$ROOT/scripts/mem-guard.sh" --term "$MEM_FLOOR" "$THERMAL" "$@"
+    local ticket=()   # on the appliance each GPU step is its own box-hold ticket (see BOX_HOLD)
+    [ -n "$BOX_HOLD" ] && ticket=(box_ticket gpu hw-gate "${HW_GATE_HOLD_MINUTES:-45}")
+    "${ticket[@]}" "$0" --cool --mem "${GPU_MODEL:--}" "$ROOT/scripts/mem-guard.sh" --term "$MEM_FLOOR" "$THERMAL" "$@"
     rc=$?
+    if [ -n "$BOX_HOLD" ] && [ $rc = 4 ]; then
+      result gpu-token SKIP "$BOX_HOLD_WAIT_S" "box-hold: the GPU lock did not come round in ${BOX_HOLD_WAIT_S}s (box-hold printed the holder above)"
+      exit 2
+    fi
     # 76: the memory pre-check said no, and the step holds nothing. The gate still holds the GPU token, though,
     # and the jobs whose memory it is waiting for may be queued behind that token: so the token is given back
     # for the wait and taken again before the next try (review of engine#1936). Under the gpu-hold wrapper the
@@ -921,6 +960,8 @@ if has npu; then
     hold_args=()
     if [ "${HW_GATE_NPU_HOLD:-1}" != 0 ] && [ -n "$NPU_HOLD" ] && ! token_held_by_ancestor "$NPU_TOKEN"; then
         hold_args=("$NPU_HOLD" -l hw-gate-npu -t "${HW_GATE_NPU_HOLD_MINUTES:-20}" -w "$LOCK_WAIT" --)
+    elif [ -n "$BOX_HOLD" ]; then
+        hold_args=(box_ticket npu hw-gate-npu "${HW_GATE_NPU_HOLD_MINUTES:-20}")
     fi
     "${hold_args[@]}" flock -w "$LOCK_WAIT" -E 75 "$LOCK" sh -c "$HW_GATE_NPU_CHECK" > "$log" 2>&1
     rc=$?
@@ -964,6 +1005,8 @@ if has npuserve; then
     hold_args=()
     if [ "${HW_GATE_NPU_HOLD:-1}" != 0 ] && [ -n "$NPU_HOLD" ] && ! token_held_by_ancestor "$NPU_TOKEN"; then
         hold_args=("$NPU_HOLD" -l hw-gate-npuserve -t "${HW_GATE_NPU_HOLD_MINUTES:-20}" -w "$LOCK_WAIT" --)
+    elif [ -n "$BOX_HOLD" ]; then
+        hold_args=(box_ticket npu hw-gate-npuserve "${HW_GATE_NPU_HOLD_MINUTES:-20}")
     fi
     "${hold_args[@]}" flock -w "$LOCK_WAIT" -E 75 "$LOCK" python3 "$smoke" --bin "$HW_GATE_NPU_SERVE_BIN" \
         --model "$HW_GATE_NPU_SERVE_MODEL" --out "$OUT/npuserve" --floor "${HW_GATE_NPU_SERVE_FLOOR:-30}" \

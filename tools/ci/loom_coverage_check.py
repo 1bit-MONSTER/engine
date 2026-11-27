@@ -159,14 +159,16 @@ def pin_bytes(pins_path):
     pins = doc.get("pins") if isinstance(doc, dict) else None
     if not isinstance(pins, dict):
         return None
-    shas, names = set(), set()
+    shas, names, by_name = set(), set(), {}
     for entry in pins.values():
         for fn, meta in ((entry or {}).get("files") or {}).items():
-            names.add(fn.split("/")[-1].lower())
+            base = fn.split("/")[-1].lower()
+            names.add(base)
             sha = (meta or {}).get("oid")
             if isinstance(sha, str) and len(sha) == 64:
                 shas.add(sha.lower())
-    return {"shas": shas, "names": names}
+                by_name.setdefault(base, set()).add(sha.lower())
+    return {"shas": shas, "names": names, "by_name": by_name}
 
 
 CHECKPOINT_KEYS = ("model", "checkpoint")
@@ -267,6 +269,20 @@ def classify(row, cards, ours=None):
     """(verdict, detail) for one shipped model against the card list."""
     stem = re.sub(r"\.gguf$", "", row)
     want_q = quant_of(stem)
+    # Bytes first: a card whose lock binds the sha256 we pin for THIS row's file is a card for it, whatever its
+    # directory is called. The name rule below needs every publisher token in VENDOR, and a corpus from a new
+    # uploader (loom-draft's 401 cards: `openbmb-MiniCPM5-1B-loom` binds our pinned MiniCPM5 bytes) read UNCOVERED
+    # on a word list, not on evidence (engine#3156). The sha is the identity; the name rule stays for the rows we
+    # cannot compare.
+    fn = re.sub(r"\.gguf$", "", row).split("/")[-1].lower() + ".gguf"
+    row_shas = ((ours or {}).get("by_name") or {}).get(fn) or set()
+    if row_shas:
+        for d, _ident, _quants, lock in cards:
+            if lock is None:
+                continue
+            both = checkpoint_shas(d, lock) & row_shas
+            if both:
+                return "COVERED", f"{d.name} ({want_q or 'bytes'}) sha256 {sorted(both)[0][:12]} (bytes match)"
     hits = []
     for d, ident, quants, _lock in cards:
         if not same_model(row, d.name, ident):
@@ -558,10 +574,24 @@ def self_test():
     # one catalogue id can own SEVERAL pinned files, and the map answers per FILE -- this is why a shipped row is
     # not one verdict, and why the REQUANT lines in the posted map are the mechanism working
     manifest_arm("manifest: one id owning several pins yields one row per file",
-                 "hrx Qwen3-0.6B\n", pins_of("Qwen3-0.6B-Q4_K_M.gguf", "Qwen3-0.6B-Q8_0.gguf"),
+                 # two FILES are two sha256s: pins_of() gives every file the same sha, which a real pin never does and
+                 # which the bytes-first rule would rightly read as the card's bytes (engine#3156)
+                 "hrx Qwen3-0.6B\n", {"1bit-MONSTER/pins": {"files": {"Qwen3-0.6B-Q4_K_M.gguf": {"oid": SHA_A},
+                                                                      "Qwen3-0.6B-Q8_0.gguf": {"oid": "c" * 64}}}},
                  [("hrx", "qwen3-0.6b-q4_k_m.gguf"), ("hrx", "qwen3-0.6b-q8_0.gguf")],
                  cards=[("unsloth-Qwen3-0.6B-loom", "Qwen/Qwen3-0.6B", ["Q4_K_M"], (), [("Q4_K_M", SHA_A)])],
                  want_verdict="REQUANT", expect_rc=1)
+    # bytes first (engine#3156, loom-draft): a card from an uploader the VENDOR list does not know still covers the
+    # row when its lock binds the sha256 we pin for that row's file, even under a different file name...
+    arm("bytes: an unknown uploader's card on our pinned bytes is COVERED", "COVERED",
+        [("hrx", "MiniCPM5-1B-Q4_K_M.gguf")],
+        [("openbmb-MiniCPM5-1B-loom", "minicpm5-1b", ["Q4_K_M"], (), [("Q4_K_M", SHA_A)])], 0,
+        pins=pins_of("MiniCPM5-1B-Q4_K_M.gguf"), says="bytes match")
+    # ...and the name rule is unchanged when the bytes differ: the same card on other bytes is not a cover
+    arm("bytes: the same unknown-uploader card on OTHER bytes stays UNCOVERED", "UNCOVERED",
+        [("hrx", "MiniCPM5-1B-Q4_K_M.gguf")],
+        [("openbmb-MiniCPM5-1B-loom", "minicpm5-1b", ["Q4_K_M"], (), [("Q4_K_M", "b" * 64)])], 1,
+        pins=pins_of("MiniCPM5-1B-Q4_K_M.gguf"))
     # a manifest line that already names a file is taken as one
     manifest_arm("manifest: a bare .gguf id is used as the file name", "hrx Qwen3-0.6B-Q4_K_M.gguf\n",
                  pins_of("Qwen3-0.6B-Q4_K_M.gguf"), [("hrx", "qwen3-0.6b-q4_k_m.gguf")])

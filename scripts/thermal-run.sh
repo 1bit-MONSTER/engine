@@ -19,6 +19,9 @@
 #   thaw it (SIGCONT) below  THERMAL_LO  (68 C)
 #   kill it  (SIGKILL)  at or above THERMAL_KILL (93 C), exit 137
 #   on TERM/INT/HUP kill the whole job and exit 143
+#   if the sensor stops reading mid-run, thaw a frozen job and report it (the job runs ungoverned until it reads)
+#
+# It pins no CPU cores: the caller's -j decides how many compilers run.
 #
 # The last rule is why scripts/mem-guard.sh --term names this script: a SIGKILLed thermal-run cannot run
 # its trap, and whatever it started keeps running and keeps the memory (engine#1504). Run the job in its
@@ -64,9 +67,22 @@ if [ "${THERMAL_DISABLE:-0}" = 1 ] || [ -z "$tctl_f" ] || [ -z "$(read_temp)" ];
   exit $rc
 fi
 
+lost=0
 while kill -0 "$job" 2>/dev/null; do
   t=$(read_temp)
-  if [ -n "$t" ]; then
+  if [ -z "$t" ]; then
+    # The sensor stopped answering mid-run. A job frozen at that moment would wait for a reading that never comes,
+    # so thaw it and say so: an ungoverned job is visible in the log, a frozen one just looks hung.
+    if [ "$lost" = 0 ]; then
+      echo "thermal-run: cannot read $tctl_f; running ungoverned until it reads again" >&2
+      lost=1
+    fi
+    if [ "$stopped" = 1 ]; then
+      kill -CONT -- "-$job" 2>/dev/null; stopped=0
+      echo "thermal-run: job thawed because the sensor is unreadable" >&2
+    fi
+  else
+    if [ "$lost" = 1 ]; then echo "thermal-run: $tctl_f reads again (${t} C), governing" >&2; lost=0; fi
     if [ "$t" -ge "$kill_c" ]; then
       echo "thermal-run: ${t} C >= ${kill_c} C, killing the job (engine#1504 holds the queue at 75 C)" >&2
       kill -KILL -- "-$job" 2>/dev/null; wait "$job" 2>/dev/null

@@ -24,7 +24,10 @@ has its own gate ([#3158](https://github.com/1bit-MONSTER/engine/issues/3158)).
 
 ## When it runs
 
-`.github/workflows/hw-gate.yml`, job `hw_gate`, on the self-hosted runner `strixhalo-engine`:
+`.github/workflows/hw-gate.yml`, job `hw_gate`, on the self-hosted runner `strixhalo-bench`
+(`[self-hosted, strixhalo, bench]`, the runner hrx-build.yml uses). It used to ask for the `pr-agent` label of
+`strixhalo-engine`, which has been offline since the box was reinstalled as an appliance, so the job queued and never ran.
+It runs on:
 
 - **A labelled PR.** Add the label `hw-gate` to a PR from this repository. Adding the label starts
   the job, and every later push runs it again.
@@ -33,7 +36,7 @@ has its own gate ([#3158](https://github.com/1bit-MONSTER/engine/issues/3158)).
   40-character** commit SHA — a short SHA is not a ref, and `actions/checkout` fails before the job starts).
   The run posts the commit status `hw-gate` on the commit it checked, so a PR shows the result.
 
-Both runners this page names - `strixhalo-engine` here and `strixhalo-bench` for the bench jobs - are installed and
+The runners this page names - `strixhalo-bench` now, `strixhalo-engine` before - are installed and
 supervised as one recipe: a restart policy, an OOM guard and a dedicated user, so a build that dies cannot take the box's
 other jobs with it. That install, and the 2026-11-08 outage that the missing restart policy turned into four hours, are in
 [ci-runners.md](ci-runners.md).
@@ -68,7 +71,7 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
   `CMakeLists.txt` entry with no changed lines (a mode change or rename), or a crash. Every changed line in **every**
   registration file is read, so a target change in a family file next to an `add_test` in `CMakeLists.txt` builds.
 - **Where.** On the box's bench runner (`strixhalo-bench`, `[self-hosted, strixhalo, bench]`), with TheRock at
-  `/opt/rocm-therock`, under `~/lb/thermal-run.sh`. That is not the gate's pr-agent runner, which a cold build would hold
+  `/opt/rocm-therock`, under the in-tree `scripts/thermal-run.sh` (it pins no cores; the build runs `-j 4`). That is not the gate's pr-agent runner, which a cold build would hold
   while every PR-Agent review queued behind it. It takes no GPU token and no NPU lock. Fork PRs never run it. It costs
   no GitHub Actions minutes. The token is read-only, and the build tree persists in `~/.cache/hrx-build/bench` on the
   box, so a later run rebuilds only what changed.
@@ -220,9 +223,9 @@ Each of those steps:
   ~87 % of its bandwidth (7.40 GB/s against 8.2–8.5 idle; 10.5–10.9 ms → 12.0 ms per launch; 160/160
   byte-exact, zero resets). The lock is what the **NPU phase** takes, below, because an NPU dispatch must
   not overlap another NPU dispatch.
-- **Heat.** It waits for Tctl to drop to 75 C, then runs under `~/lb/thermal-run.sh`, which freezes it at 78 C and kills it at 93 C.
+- **Heat.** It waits for Tctl to drop to 75 C, then runs under the in-tree `scripts/thermal-run.sh` (the workflow sets `HW_GATE_THERMAL`; a by-hand run of the script defaults to `~/lb/thermal-run.sh`), which freezes it at 78 C and kills it at 93 C.
 - **Memory.** It runs under `scripts/mem-guard.sh --term` (stops the step below 12 GB MemAvailable; `--term` because the guard's default SIGKILL ends `thermal-run` but leaves the step it started running, with its memory). Before a step starts, `tools/mem_budget.py` estimates it. A step that would take GTT to 95 GiB or more (the engine#315 fault zone), or past MemAvailable, is refused. The gate then waits for memory to free up and retries every minute, up to ten times (`HW_GATE_MEM_RETRIES`). It gives the GPU token back for each of those waits and takes it again before the next try, because the jobs holding the memory may be queued behind the token. Under the `gpu-hold` wrapper the ticket belongs to the wrapper and stays held.
-- **The PR-Agent model.** coder-llm (Vulkan, :8090) loses its device when long HRX dispatches starve it. The gate runs on `strixhalo-engine`, the runner that also runs the pr-agent jobs, and a runner takes one job at a time, so no review is generating during the gate. Before each step the gate also waits for coder-llm's slots to be idle. Afterwards it reports any new `ring ... timeout` in the kernel log.
+- **The PR-Agent model.** coder-llm (Vulkan, :8090) loses its device when long HRX dispatches starve it. The gate used to run on `strixhalo-engine`, the runner that also ran the pr-agent jobs, so no review generated during the gate; that runner is gone and the gate runs on `strixhalo-bench`. Before each step the gate waits for coder-llm's slots to be idle. Afterwards it reports any new `ring ... timeout` in the kernel log.
 
 The build runs under thermal-run too, and resumes after a thermal kill. Build trees and ccache
 persist under `~/.cache/hw-gate`, so a PR that does not move the pins rebuilds in seconds.

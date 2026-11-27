@@ -515,8 +515,13 @@ def save_state(path, state):
 
 
 def remember(state, res):
-    """Record what was classified, so the next walk moves past it."""
-    for group in (COVERED, UNCOVERED, UNVERIFIABLE, DERIVATIVE):
+    """Record what was classified, so the next walk moves past it.
+
+    Every bucket classify() fills, MODEL_TYPE and TEST_FIXTURE included. A bucket left out here is never in
+    `seen`, so its repos are re-reported every run, take `limit` slots from new models, and a page holding one
+    never reads as all-seen in sweep_newest(), so every run walks to pages_guard.
+    """
+    for group in (COVERED, UNCOVERED, UNVERIFIABLE, DERIVATIVE, TEST_FIXTURE, MODEL_TYPE):
         for mid in res[group]:
             state["seen"][mid] = group
     return state

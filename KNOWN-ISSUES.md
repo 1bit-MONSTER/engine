@@ -47,8 +47,9 @@ above used the default). If the wrong value reappears, that is the first variabl
 
 **Status: CLOSED 2026-11-24 — closed as not reproducible, not as fixed at source** (the same disposition as engine#370).
 The box was reset from firmware with `reset reason 0x00800800` (internal CPU shutdown event) on 2026-11-23 06:29Z while
-a GPU ticket and an NPU ticket were running in separate lanes. The controlled series that followed did not reproduce
-it, and it corrected the premise:
+a GPU-only 27B HRX prefill was running: no NPU job was running at 06:29Z (amdxdna's last line in that boot was
+05:14:05Z, the end of an NPU refusal storm). The controlled series that followed did not reproduce it, and it corrected
+the premise:
 
 | arm | workload (one `box-hold both` ticket each) | result |
 |---|---|---|
@@ -56,8 +57,8 @@ it, and it corrected the premise:
 | **T3** NPU refusal storm then GPU | 75 `aie2_alloc_resource … ret -19` lines (the same count as 05:13Z), then the same 20 prefills | clean |
 | **T4** concurrent GPU + NPU | NPU partition `forward-serve` 64/64 known answers **while** the GPU ran the same 20 prefills | clean; fclk mostly 1.6 GHz |
 
-**The premise was wrong:** the reset did not require overlapping GPU and NPU work — the two were serialised by
-`box-hold` in the reset window. The precaution that came out of it is in `box-hold` itself: every ticket takes **both**
+**The premise was wrong:** the reset did not require overlapping GPU and NPU work — no NPU job was running when it
+happened, and the concurrent arm (T4) did not reproduce it. The precaution that came out of it is in `box-hold` itself: every ticket takes **both**
 locks (GPU and NPU) rather than one, so no two jobs can hold the two devices at once. That rule stays.
 
 **Not established:** the firmware-side meaning of `0x00800800`. That is a vendor question, not an in-tree fix, and
@@ -117,85 +118,21 @@ as the record of what was said then.
 
 ## engine#3221 — deepseek2/MLA Loom ports: the private Loom kernel kit is the home; the public port starter has no MLA path
 
-**Status: RECORDED 2026-11-24 — the port path is decided and documented here. No route entry and no card are
-created by this entry; the card + gate half stays open and the Lead closes #3221.**
+**Status: RECORDED 2026-11-24 — the port path is decided. No route entry and no card are created by this entry; the
+card + gate half stays open and the Lead closes #3221.**
 
-The public Loom port toolchain cannot port a `deepseek2` checkpoint, and that is a property of the tool, not of a
-particular model. Measured 2026-11-24 against `loom-fun/loom-skills` main `e4dd46e1` (its `loom-port-llm` starter):
+The public Loom port starter (`loom-fun/loom-skills` main `e4dd46e1`) cannot port a `deepseek2` checkpoint
+(GLM-4.7-Flash, DeepSeek-Coder-V2-Lite): it has no MLA path and its attention takes head_dim 64, 128 or 256 only;
+`tools/loom_arch_probe.py` (CI row `loom_arch_probe --self-test`) says so from the GGUF header. These ports live in the
+private, out-of-tree Loom kernel kit, which nothing in this tree builds from; the evidence is on #3221.
+(`DeepSeek-R1-Distill-Qwen-1.5B/32B` are `qwen2` and port through the public starter unchanged.)
 
-- `starter/gen_llm.py:84` asserts `D in (64, 128, 256)` ("attention kernels support head_dim 64, 128 or 256"), and
-  GLM-4.7-Flash's `key_length` is 576 (512 `kv_lora_rank` + 64 rope). The generator stops there, before an
-  attention kernel is written; `starter/inspect_gguf.py:368` prints the same warning from the header.
-- The MLA decomposition that would be needed instead is not there: `kv_lora`, `q_lora`, `compressed_kv`,
-  `kv_a_proj` and `deepseek` have **0** matches in `starter/gen_llm.py`, `starter/inspect_gguf.py` and
-  `starter/inspect_safetensors.py`, and `starter/hf_names/` carries `llama`, `quark` and `qwen35` only, so the HF
-  spelling `glm4_moe_lite` has no family map either.
-- The starter also guesses the rope pairing wrong for an unknown architecture: `starter/inspect_gguf.py:75` returns
-  `norm` only for llama/mistral/granite/muse-glimmer and `neox` otherwise, while the pinned llama.cpp maps
-  `LLM_ARCH_DEEPSEEK2` to `LLAMA_ROPE_TYPE_NORM` ("normal RoPE, operating on pairs of consecutive head values",
-  `third_party/llama.cpp/src/llama-model.cpp:3663`).
-
-The in-repo check is `tools/loom_arch_probe.py` (CI row `loom_arch_probe --self-test`): on the pinned GGUF
-(`unsloth/GLM-4.7-Flash-GGUF@0d32489e`, Q4_K_M, sha256 `29837ed2…`) it exits 1, "deepseek2 is NOT in the port
-starter … it would need: MLA: q_lora_rank, kv_lora_rank, …", without a model download or a device.
-
-**The decision: new-architecture Loom ports live in the private, out-of-tree Loom kernel kit (the kit behind the
-private Loom packages, as with ZAYA1-8B, engine#3322), not in the public starter — and that is the permanent home
-until an upstream starter gains the path.** The kit is not part of this repository, nothing here builds from it,
-and no pin for it is recorded in this tree (the same rule that keeps private components out of the pins files).
-What this tree keeps is the pre-port check above, the card map's `none`/`gap` row, and this record.
-
-**Measured evidence that the port works there** (recorded on #3221; not re-run for this entry). Absorbed-MLA
-attention and the MoE half at GLM-4.7-Flash's own shapes and weight formats, against f64 oracles and gguf-py
-dequantisation of the pinned GGUF's own bytes:
-
-- absorbed-MLA attention chain **17/17** at T = 1, 9 and 300 on both gfx1201 (ryzen RX 9070 XT) and gfx1151
-  (strixhalo): every stage ≤ 9e-6 relative, the chained output ≤ 5.3e-6 against the f64 oracle, and the six
-  attention matrices of blocks 1/23/46 from the raw Q8_0/Q4_K bytes **18/18** ≤ 3.6e-6;
-- rope on the 64 rope dims at position 202,751 within ggml's own f32 error after a Cody-Waite range reduction
-  (3.7e-3 / 2.4e-3 / 4.0e-3 on three vectors);
-- MoE: every FFN tensor of blocks 0 and 1 (dense block, shared expert, routed experts Q4_K/Q5_K/Q6_K through the
-  expert gather) **15/15** ≤ 3.1e-6, and one chained MoE step **9/9** on both GPUs (blocks 1/23/46 × 2 seeds;
-  router ids exact, output within 3.0e-6–4.7e-6, including exact ties and the selection-only `exp_probs_b`);
-- a package built from the kit registers `ready` on the pinned loom-serve (hrx-loom 0.3.0, `config/loom.config`
-  `e2c41a72`) on strixhalo — after the terminal-marker fix in item 5 — and answered three known-answer prompts
-  correctly (2026-11-24, recorded on #3221).
-
-The kernels are serial; no speed figure is claimed, and none of this is a route: a route needs a published card and
-a gate row (engine#3158), and a card here is the private-card question (engine#3385).
-
-**Scope, corrected (measured in the #3221 thread against `models/pins.json`):** the affected class in our catalogue
-is `deepseek2` — GLM-4.7-Flash and DeepSeek-Coder-V2-Lite. `DeepSeek-R1-Distill-Qwen-1.5B/32B` are `qwen2` and
-port through the public starter unchanged, so the issue's "whole DeepSeek-R1 class" title overstates it.
-
-**What a future public-starter port would need** (the kit's route restated as the starter's work items):
-
-1. an MLA body in `gen_llm.py`: the low-rank projections (`q_lora_rank` 768, `kv_lora_rank` 512), a 576-wide K
-   (512 latent + 64 rope) and 512-wide V, absorbed attention (k_b folded into the query, per-head v_b) and the
-   1/sqrt(256) scale — the `D in (64, 128, 256)` assert is the first thing that has to move;
-2. a paged KV layout for one 576-value row per token per layer (one KV head): the kit split the row 288/288 across
-   the starter's K/V planes at `POS_BYTES` 576 and wrote its own paged store and attention kernels, because the
-   starter's store and attention take D ≤ 256;
-3. a rope entry for deepseek2 (NORM, theta 1e6 on 64 of 576 dims) plus the range reduction an f32 angle needs at
-   long context;
-4. the MoE half is expected to be config only on the starter's `moe_routed` (64 routed, top-4, one shared expert,
-   one leading dense block, sigmoid gate + selection-only bias + normalised weights ×1.8) but must be verified with
-   the starter's own kernel tests at these shapes — the kit's MoE evidence above is its own kernels';
-5. the chat block: GLM's GGUF template (`tokenizer.chat_template`, sha256 `d63ad536…`) renders
-   `[gMASK]<sop>…<|user|>…<|assistant|></think>` and has no assistant suffix, so `chat_probe.py`'s derived block
-   answers `terminal: ""`; loom-serve 0.3.0 then refuses the card at registration with "tokenizer has no
-   source-declared terminal marker". A terminal has to be supplied (`<|user|>`, the token the model emits to end a
-   turn — the starter's own `stop_restore` comment names it), and the kit's chat block had to add it by hand;
-6. per-tensor quant types: Q4_K_M mixes `ffn_down_exps` Q4_K (24 layers) and Q6_K (22), so a loader derives a
-   tensor's format from the tensor, never from the model (the kit's incident, #3221).
-
-**Docs corrected with this entry:** [docs/hrx.md](docs/hrx.md) ("How a model moves": coverage said a model without
-a card gets programs written with loom-skills/weaver, which is not true for an architecture the starter cannot
-express), [docs/loom-route.md](docs/loom-route.md) (Card map: where a `none` row's port path lives),
-`tools/loom_cards.py`'s NOTE and its build output `config/loom-cards.json` for GLM-4.7-Flash (the row said the
-kernels were "in progress"), and `tools/loom_arch_probe.py` (its docstring, and the verdict line for a decided
-architecture, point here).
-
+Measured there (recorded on #3221, not re-run for this entry), at GLM-4.7-Flash's shapes against f64 oracles:
+absorbed-MLA attention **17/17** on gfx1201 and gfx1151 (every stage ≤ 9e-6 relative); rope at position 202,751 within
+ggml's own f32 error; MoE FFN tensors **15/15** (≤ 3.1e-6) and one chained MoE step **9/9** on both GPUs; a package
+built from the kit registers `ready` on the pinned loom-serve (hrx-loom 0.3.0) on strixhalo and answered three
+known-answer prompts correctly. No speed figure is claimed, and a route still needs a published card and a gate row
+(engine#3158, engine#3385).
 ## engine#823 — Bosgame BeyondMax board: the USB ports need the xHCI keep-awake rule
 
 **Status: MITIGATED — the ports work; the fix is a udev rule, not a driver. Verified on a host with the rule, not yet on

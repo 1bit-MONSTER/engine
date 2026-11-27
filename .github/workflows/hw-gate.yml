@@ -26,12 +26,14 @@
 #   - by hand: Actions -> hw-gate -> Run workflow, with a ref (branch, tag, SHA or pull/N/head).
 # PRs from forks never run here: this is a self-hosted runner on the owner's box.
 #
-# Runner: strixhalo-engine (the only engine runner with the pr-agent label). That is deliberate:
-# the runner runs one job at a time, so no PR-Agent review (Vulkan coder-llm on :8090) generates
-# while the gate's HRX dispatches run (long HRX dispatches starve that model into a ring timeout).
-# The script also waits for coder-llm to be idle before each GPU step and reports any new ring
-# timeout. GPU steps take no ~/npu.lock (engine#682: NPU and GPU run concurrently, engine#673),
-# and run under scripts/mem-guard.sh and ~/lb/thermal-run.sh.
+# Runner: strixhalo-bench ([self-hosted, strixhalo, bench]), the box's live runner, which hrx-build.yml
+# already uses. Before this change the job asked for [self-hosted, strixhalo, pr-agent], a label only
+# strixhalo-engine carried, and that runner went offline for good when the box was reinstalled as an
+# appliance: every hw_gate job queued and was never picked up, so pin-moving PRs merged without the gate
+# executing. The bench runner runs one job at a time, so the gate and an hrx_build never share the GPU.
+# The script still waits for coder-llm to be idle before each GPU step when one answers on :8090, and
+# reports any new ring timeout. GPU steps take no ~/npu.lock (engine#682: NPU and GPU run concurrently,
+# engine#673), and run under scripts/mem-guard.sh and the in-tree scripts/thermal-run.sh (engine#3518).
 name: hw-gate
 
 on:
@@ -101,7 +103,7 @@ jobs:
           fi
 
   hw_gate:
-    runs-on: [self-hosted, strixhalo, pr-agent]
+    runs-on: [self-hosted, strixhalo, bench]
     needs: [pin_moved]
     # `needs.pin_moved.outputs.moved` is empty when `pin_moved` did not run (a `workflow_dispatch`), which is why the dispatch
     # case is checked first and the label/branch routes are kept: the gate can still be asked for on a PR that moves no pin.
@@ -144,6 +146,55 @@ jobs:
             git -C third_party/llama.cpp fetch --unshallow
           fi
           git submodule status -- third_party/llama.cpp third_party/hrx-system
+
+      - name: Prepare the appliance runner (tools, HSA loader path)
+        run: |
+          set -euo pipefail
+          # The bench runner is the appliance box, prepared the way hrx-build.yml prepares it. First the tools
+          # hw-gate.sh and the status steps call (gh: run 45949440667 died `gh: command not found`); the command
+          # checks keep this a no-op on a runner that already has them.
+          missing=()
+          for pair in curl:curl ninja:ninja-build ccache:ccache cmake:cmake git:git gh:gh; do
+            command -v "${pair%%:*}" >/dev/null 2>&1 || missing+=("${pair#*:}")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "installing: ${missing[*]}"
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends "${missing[@]}"
+          fi
+          # HRX dlopens `libhsa-runtime64.so` by its unversioned name, while the ROCm SDK ships only `.so.1`, and the
+          # runtime's own dependencies sit under the SDK's site-packages (engine#3520). Without this every HRX0 step
+          # of the gate reports no device. Same runtime hw-gate.sh picks (the first libhsa-runtime64.so.1 under the
+          # toolchain), staged under the gate's persistent cache, with the inherited loader path kept behind it.
+          toolchain=${ONEBIT_HRX_TOOLCHAIN:-/opt/rocm-therock}
+          libhsa=$(find "$toolchain" -path '*/libhsa-runtime64.so.1' 2>/dev/null | sort) || true   # reported below
+          libhsa=${libhsa%%$'\n'*}
+          if [ -z "$libhsa" ] || [ ! -e "$libhsa" ]; then
+            echo "::error::no libhsa-runtime64.so.1 under $toolchain, so HRX has no runtime to load"
+            exit 1
+          fi
+          shim="${HW_GATE_STORE:-$HOME/.cache/hw-gate}/hsa-shim"
+          mkdir -p "$shim"
+          ln -sfn "$libhsa" "$shim/libhsa-runtime64.so"
+          sdk_root="$(dirname "$(dirname "$libhsa")")"
+          lib_dirs=("$shim" "$(dirname "$libhsa")")
+          for d in "$sdk_root"/lib/python*/site-packages/_rocm_sdk_*/lib \
+                   "$sdk_root"/lib/python*/site-packages/_rocm_sdk_*/lib/rocm_sysdeps/lib; do
+            if [ -d "$d" ]; then lib_dirs+=("$d"); fi   # not `[ -d ] && ...`: set -e exits on a failing AND-list
+          done
+          ld_path="$(IFS=:; echo "${lib_dirs[*]}")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          if LD_LIBRARY_PATH="$ld_path" ldd "$libhsa" | grep -q 'not found'; then
+            echo "::error::the HSA runtime has unresolved dependencies, so every HRX0 step would report no device"
+            LD_LIBRARY_PATH="$ld_path" ldd "$libhsa" | grep 'not found'
+            exit 1
+          fi
+          echo "hw-gate: HSA runtime $libhsa"
+          {
+            echo "IREE_HAL_AMDGPU_LIBHSA_PATH=$libhsa"
+            echo "LD_LIBRARY_PATH=$ld_path"
+            # the in-tree governor (engine#3518), not ~/lb/thermal-run.sh, which the appliance does not have
+            echo "HW_GATE_THERMAL=$GITHUB_WORKSPACE/scripts/thermal-run.sh"
+          } >> "$GITHUB_ENV"
 
       - name: Pending status
         if: github.event_name == 'workflow_dispatch'

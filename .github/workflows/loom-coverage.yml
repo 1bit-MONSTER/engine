@@ -15,8 +15,8 @@
 #
 # engine#3156: the Loom coverage map over every public card source, in CI. The cards are GB downloads, so this reads
 # only each card's model.json + model.json.lock (tools/loom_card_meta.py, a few MB in all) and runs
-# tools/ci/loom_coverage_check.py on that tree. Advisory: the map goes to the job summary and the job never fails on
-# coverage (an uncovered model is a plan item, not a defect of whichever PR runs it). No secrets: public HF API only.
+# tools/ci/loom_coverage_check.py on that tree. Advisory: the map goes to the job summary and an uncovered model never fails the job (it is a plan
+# item, not a defect of whichever PR runs it); a failed fetch or a crash of the checker does. No secrets: public HF API only.
 
 name: loom-coverage
 
@@ -43,6 +43,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Self-tests
         run: |
@@ -50,11 +52,19 @@ jobs:
           python3 tools/ci/loom_coverage_check.py --self-test
 
       - name: Card metadata (loom-fun, loom-draft, 1bit-MONSTER)
-        run: python3 tools/loom_card_meta.py --org loom-fun --org loom-draft --org 1bit-MONSTER --out cards
+        # a failed listing or card fetch fails here: an incomplete tree must not pass as a coverage map
+        run: |
+          set -o pipefail
+          python3 tools/loom_card_meta.py --org loom-fun --org loom-draft --org 1bit-MONSTER --out cards | tee fetch.txt
 
       - name: Coverage map
         run: |
-          set -o pipefail
+          # --advisory maps "a row is uncovered" (1) to 0, so any non-zero exit here is a crash or an empty tree
+          rc=0
           python3 tools/ci/loom_coverage_check.py --cards cards/loom-fun --cards cards/loom-draft \
-            --cards cards/1bit-MONSTER --advisory | tee coverage.txt || true
-          { echo '## Loom coverage (engine#3156)'; echo; echo '```'; cat coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            --cards cards/1bit-MONSTER --advisory > coverage.txt 2>&1 || rc=$?
+          cat coverage.txt
+          { echo '## Loom coverage (engine#3156)'; echo
+            echo 'Public cards only (anonymous listing): a model whose only card is private reads UNCOVERED here.'; echo
+            echo '```'; cat fetch.txt; echo; cat coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc

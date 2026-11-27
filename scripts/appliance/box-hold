@@ -24,6 +24,13 @@
 # ticket may flock. A waiter whose process died (pid gone or reused: the start time differs) is skipped and
 # removed, so a dead waiter cannot block the line. The ticket leaves the queue once the locks are held; the
 # command then runs exactly as before (both locks, .who files, exit 4 when BOX_HOLD_WAIT runs out).
+# 2026-11-27 (orchestrator): a CI PRIORITY CLASS. A ticket asks with BOX_HOLD_PRIORITY=ci, and it is honoured ONLY for
+# real CI: the caller runs under a GitHub Actions runner (GITHUB_ACTIONS=true and a Runner.Worker among its ancestors)
+# or as the runner account (ghrunner). The variable alone, or the account alone, is not enough; a ticket that asks
+# without qualifying queues as a lane, and box-hold says so on stderr and in $D/box-hold.log. CI tickets are served
+# NEXT: after the current holder, ahead of every queued lane ticket; FIFO among CI tickets, lanes FIFO among themselves. CI tickets are named 0-<n>..., lane
+# tickets 1-<n>...; tickets of the previous format (<n>...) sort between the two, so lanes already queued keep their
+# place ahead of new lanes. A CI ticket's command is capped at BOX_HOLD_CI_MAX s (2700, the 45-min ticket rule).
 set -u
 D=${BOX_HOLD_DIR:-/tmp/box-locks}; mkdir -p $D 2>/dev/null; chmod 1777 $D 2>/dev/null; (umask 000; touch $D/box-gpu.lock $D/box-npu.lock $D/box-gpu.who $D/box-npu.who) 2>/dev/null; chmod 666 $D/box-* 2>/dev/null
 dev=${1:?usage: box-hold <gpu|npu|both> <command...>}; shift
@@ -33,36 +40,67 @@ case $dev in gpu|npu|both) dev=both ;; *) echo "box-hold: gpu, npu or both" >&2;
 w=${BOX_HOLD_WAIT:-3600}
 poll=${BOX_HOLD_POLL:-2}
 Q=$D/queue; mkdir -p $Q 2>/dev/null; chmod 1777 $Q 2>/dev/null
-(umask 000; touch $D/box-seq.lock $D/box-seq) 2>/dev/null
+(umask 000; touch $D/box-seq.lock $D/box-seq $D/box-hold.log) 2>/dev/null
 starttime() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20; }
 alive() { _p=${1#*.}; _p=${_p%%.*}; _s=${1##*.}; [ -n "$_s" ] && [ "$(starttime "$_p")" = "$_s" ]; }
 exec 7>>"$D/box-seq.lock" || { echo "box-hold: cannot open $D/box-seq.lock" >&2; exit 3; }
 flock 7; n=$(( $(cat "$D/box-seq" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$D/box-seq" || { echo "box-hold: cannot write $D/box-seq" >&2; exit 3; }; flock -u 7; exec 7>&-
-me=$(printf '%012d' "$n").$$.$(starttime $$)
+under_runner() {   # GITHUB_ACTIONS=true and a Runner.Worker process among this process's ancestors
+    [ "${GITHUB_ACTIONS:-}" = true ] || return 1
+    _a=$PPID
+    while [ -n "$_a" ] && [ "$_a" -gt 1 ] 2>/dev/null; do
+        [ "$(cat "/proc/$_a/comm" 2>/dev/null)" = Runner.Worker ] && return 0
+        _a=$(awk '/^PPid:/ {print $2}' "/proc/$_a/status" 2>/dev/null)
+    done
+    return 1
+}
+cls=1
+if [ "${BOX_HOLD_PRIORITY:-}" = ci ]; then
+    if under_runner || [ "$(id -un 2>/dev/null)" = ghrunner ]; then
+        cls=0
+    else
+        _m="box-hold: BOX_HOLD_PRIORITY=ci ignored for ${BOX_HOLD_WHO:-$(id -un)} (not under a GitHub Actions runner, not the runner account): queued as a lane ticket"
+        echo "$_m" >&2
+        echo "$(date -u +%FT%TZ) $_m" >> "$D/box-hold.log" 2>/dev/null
+    fi
+fi
+me=$cls-$(printf '%012d' "$n").$$.$(starttime $$)
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$Q/$me" 2>/dev/null || { echo "box-hold: cannot write $Q/$me" >&2; exit 3; }
 trap 'rm -f "$Q/$me"' EXIT
 trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
 t0=$(date +%s)
+exec 8>$D/box-gpu.lock || { echo "box-hold: cannot open $D/box-gpu.lock" >&2; exit 3; }
+exec 9>"$D/box-npu.lock" || { echo "box-hold: cannot open $D/box-npu.lock" >&2; exit 3; }   # no 2>/dev/null here: on a bare exec it would silence stderr for the rest of the script
+# The head TRIES the locks (flock -n) and looks at the queue again between tries, instead of blocking in flock: a head
+# blocked in `flock -w` never sees a CI ticket that arrives behind it, so the CI class could not be served next.
 while :; do
     head=""
-    for f in $(ls "$Q" 2>/dev/null | sort); do
+    for f in $(ls "$Q" 2>/dev/null | LC_ALL=C sort); do   # C collation: the class prefix must not be ignored
         if alive "$f"; then head=$f; break; fi
         rm -f "$Q/$f" 2>/dev/null   # a dead waiter's ticket (another user's stays until its owner or root sweeps it; it is skipped either way)
     done
-    [ "$head" = "$me" ] && break
+    if [ "$head" = "$me" ]; then
+        if flock -n 8; then
+            flock -n 9 && break
+            flock -u 8   # the NPU lock is still held: give the GPU lock back and try again with the queue re-read
+        fi
+    fi
     if [ $(( $(date +%s) - t0 )) -ge "$w" ]; then
-        echo "box-hold: still queued after ${w}s (head: $(cat "$Q/$head" 2>/dev/null); gpu held by: $(cat $D/box-gpu.who 2>/dev/null))" >&2
+        if [ "$head" = "$me" ]; then
+            echo "box-hold: gpu busy: $(cat $D/box-gpu.who 2>/dev/null)" >&2
+        else
+            echo "box-hold: still queued after ${w}s (head: $(cat "$Q/$head" 2>/dev/null); gpu held by: $(cat $D/box-gpu.who 2>/dev/null))" >&2
+        fi
         exit 4
     fi
     sleep "$poll"
 done
-left=$(( w - ($(date +%s) - t0) )); [ "$left" -lt 1 ] && left=1
-exec 8>$D/box-gpu.lock; flock -w "$left" 8 || { echo "box-hold: gpu busy: $(cat $D/box-gpu.who 2>/dev/null)" >&2; exit 4; }
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-gpu.who" 2>/dev/null
-left=$(( w - ($(date +%s) - t0) )); [ "$left" -lt 1 ] && left=1
-exec 9>"$D/box-npu.lock" 2>/dev/null || { echo "box-hold: cannot open $D/box-npu.lock" >&2; exit 3; }
-flock -w "$left" 9 || { echo "box-hold: npu still held after ${w}s by: $(cat $D/box-npu.who 2>/dev/null)" >&2; exit 4; }
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-npu.who" 2>/dev/null
 # out of the line: the next waiter is head now and waits on the lock; signals behave as before (no deferred trap)
 rm -f "$Q/$me"; trap - EXIT TERM INT HUP
-"$@"
+if [ "$cls" = 0 ]; then
+    timeout -k 30 "${BOX_HOLD_CI_MAX:-2700}" "$@"   # the CI class jumps the line, so it may not keep it longer than 45 min
+else
+    "$@"
+fi

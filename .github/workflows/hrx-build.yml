@@ -256,11 +256,12 @@ jobs:
           # ratchet's real verdict (113 rows, 0 new) rather than trading it for a 77.
           # The rows use the GPU: since 2026-11-26 /etc/udev/rules.d/99-1bit-kfd-render.rules lets the runner's
           # account open /dev/kfd, so on the appliance they take a `box-hold gpu` ticket like every lane (the
-          # hw-gate pattern, #3538): FIFO wait up to 90 min, at most 45 min held, the lock descriptors closed in
-          # the rows so a leftover process cannot keep the box. Without box-hold (another runner) nothing changes.
+          # hw-gate pattern, #3538), in box-hold's CI class (BOX_HOLD_PRIORITY=ci: served after the holder, ahead of
+          # every queued lane ticket): wait up to 90 min, at most 45 min held, the lock descriptors closed in the rows
+          # so a leftover process cannot keep the box. Without box-hold (another runner) nothing changes.
           ticket=()
           if command -v box-hold > /dev/null 2>&1; then
-            ticket=(env BOX_HOLD_WAIT=5400 "BOX_HOLD_WHO=hrx-build run $GITHUB_RUN_ID" box-hold gpu
+            ticket=(env BOX_HOLD_WAIT=5400 BOX_HOLD_PRIORITY=ci "BOX_HOLD_WHO=hrx-build run $GITHUB_RUN_ID" box-hold gpu
                     sh -c 'exec 8>&- 9>&-; exec "$@"' box-hold-step timeout -k 30 2700)
           fi
           rc=0

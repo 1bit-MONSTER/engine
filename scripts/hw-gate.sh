@@ -151,7 +151,7 @@ BOX_HOLD_WAIT_S=${HW_GATE_BOX_HOLD_WAIT:-10800}
 # code); a step that outlives its ticket ends 124 (timeout's), its children KILLed 30 s after the TERM.
 box_ticket() {
     local dev=$1 label=$2 minutes=$3; shift 3
-    BOX_HOLD_WAIT=$BOX_HOLD_WAIT_S BOX_HOLD_WHO="$label${GITHUB_RUN_ID:+ run $GITHUB_RUN_ID} pid $$" \
+    BOX_HOLD_WAIT=$BOX_HOLD_WAIT_S BOX_HOLD_WHO="$label${GITHUB_RUN_ID:+ run $GITHUB_RUN_ID} pid $$" BOX_HOLD_PRIORITY=${HW_GATE_BOX_HOLD_PRIORITY:-${GITHUB_RUN_ID:+ci}} \
         "$BOX_HOLD" "$dev" sh -c 'exec 8>&- 9>&-; exec "$@"' box-hold-step timeout -k 30 "$((minutes * 60))" "$@"
 }
 

@@ -32,7 +32,7 @@ grep -q 'box-hold gpu' "$snip" && grep -q '^\[ "\$rc" = 0 \]' "$snip" || { echo 
 mkdir -p "$tmp/bh" "$tmp/plain"
 cat > "$tmp/bh/box-hold" <<'STUB'
 #!/bin/bash
-echo "box-hold $1 who=$BOX_HOLD_WHO wait=$BOX_HOLD_WAIT" >> "$STUBLOG"
+echo "box-hold $1 who=$BOX_HOLD_WHO wait=$BOX_HOLD_WAIT prio=${BOX_HOLD_PRIORITY:-}" >> "$STUBLOG"
 [ -n "${STUB_RC:-}" ] && exit "$STUB_RC"
 exec 8> "$STUBDIR/l8" 9> "$STUBDIR/l9"; shift; "$@"
 STUB
@@ -48,7 +48,7 @@ export STUBDIR=$tmp
 
 STUBLOG=$tmp/l1 PATH="$tmp/bh:$PATH" run; rc=$?
 [ "$rc" = 0 ] && grep -q step-ok "$tmp/out" && ok "box-hold present: step passes" || bad "step rc $rc: $(cat "$tmp/out")"
-grep -q "^box-hold gpu who=hrx-build run 77 wait=5400$" "$tmp/l1" && ok "one gpu ticket, labelled, 90-min wait" || bad "ticket: $(cat "$tmp/l1")"
+grep -q "^box-hold gpu who=hrx-build run 77 wait=5400 prio=ci$" "$tmp/l1" && ok "one gpu ticket, labelled, 90-min wait, CI class" || bad "ticket: $(cat "$tmp/l1")"
 grep -q "ctest fork=1 parent=timeout -k 30 2700 ctest" "$tmp/l1" && ok "ctest under timeout 2700 with ONEBIT_FORK_CTEST=1" || bad "ctest: $(grep ctest "$tmp/l1")"
 grep -q "fd [89] open" "$tmp/l1" && bad "lock fd open in the rows" || ok "lock fds closed in the rows"
 

@@ -28,7 +28,12 @@ cleanup() { [ -n "$proxy_pid" ] && kill "$proxy_pid" 2> /dev/null; rm -rf "${t:?
 trap cleanup EXIT
 check() { if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; bad=$((bad + 1)); fi; }
 command -v python3 > /dev/null && command -v curl > /dev/null || { echo "webapp_update_test: needs python3 and curl"; exit 1; }
-[ "$(id -u)" != 0 ] || { echo "SKIP webapp_update_test: run it as a normal user (as root the test hooks are inert by design)"; exit 77; }
+# As root (CI's container) the proxy's test hooks are inert by design, so the test re-runs itself as nobody - the
+# proxy AND the clients must be non-root for "a client that is not root is refused" to mean anything
+if [ "$(id -u)" = 0 ]; then
+    command -v setpriv > /dev/null || { echo "SKIP webapp_update_test: root, and no setpriv to drop to nobody"; exit 77; }
+    exec setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=/tmp PATH="$PATH" sh "$here/tests/webapp_update_test.sh"
+fi
 
 cat > "$t/1bit-update" <<'SH'
 #!/bin/sh

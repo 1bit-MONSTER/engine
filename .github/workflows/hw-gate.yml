@@ -189,6 +189,23 @@ jobs:
             exit 1
           fi
           echo "hw-gate: HSA runtime $libhsa"
+          # The gate's inputs on the appliance (orchestrator 2026-11-27, docs/hw-gate.md "Inputs on the appliance"): the
+          # models and the text under /data/ci/hw-gate/models, the KLD bases under /data/ci/hw-gate/kld, root-owned and
+          # world-readable, so no lane can change what the gate compares against. Without them every model row and kld
+          # SKIPs (run 46014683686: "model missing (input absent)" x8, placement "produced no result row"). The bases
+          # are reached through $STORE/kld, which becomes a link to the read-only store when it is empty or a link.
+          inputs=${HW_GATE_INPUTS:-/data/ci/hw-gate}
+          if [ -d "$inputs/models" ]; then
+            echo "HW_GATE_MODELS=$inputs/models" >> "$GITHUB_ENV"
+            echo "hw-gate: models from $inputs/models"
+          fi
+          if [ -d "$inputs/kld" ]; then
+            store="${HW_GATE_STORE:-$HOME/.cache/hw-gate}"; mkdir -p "$store"
+            if [ -L "$store/kld" ] || { [ -d "$store/kld" ] && [ -z "$(ls -A "$store/kld")" ]; }; then
+              rm -rf "$store/kld" && ln -s "$inputs/kld" "$store/kld"
+            fi
+            echo "hw-gate: KLD bases from $(readlink -f "$store/kld")"
+          fi
           {
             echo "IREE_HAL_AMDGPU_LIBHSA_PATH=$libhsa"
             echo "LD_LIBRARY_PATH=$ld_path"

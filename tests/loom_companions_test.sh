@@ -81,7 +81,8 @@ $out
 EOF2
 check $? "--once fetches it at the PINNED revision into the snapshot, the lock's sha256"
 grep -q "^/org/experts/resolve/$REV/E.safetensors " "$t/req.log"; check $? "  ... from <repo>/resolve/<lock revision>/<file>"
-[ "$(stat -c %a "$dest")" = 644 ] && [ ! -e "$dest.part" ]; check $? "  ... mode 644, no .part left"
+[ "$(stat -c %a "$dest")" = 640 ] && [ "$(stat -c %a "$(dirname "$dest")")" = 750 ] && [ "$(stat -c %a "$t/hf/.1bit-loom-companions.lock")" = 600 ] && [ ! -e "$dest.part" ]
+check $? "  ... private modes (file 0640, its new directory 0750, the lock 0600; nothing for others), no .part left"
 C --status > /dev/null; check $? "status: present (exit 0)"
 : > "$t/req.log"; C --once > /dev/null; [ ! -s "$t/req.log" ]; check $? "a second run downloads nothing"
 

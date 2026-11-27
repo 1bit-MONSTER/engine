@@ -44,6 +44,9 @@ import urllib.request
 PROG = "1bit-loom-companions"
 HF_BASE = os.environ.get("ONEBIT_LOOM_HF_BASE", "https://huggingface.co")   # the test's own server; the sha256 decides
 MARGIN = 2 << 30
+# modes are explicit and private (CodeQL py/overly-permissive-file): the only reader is root (loom-serve, a child of the
+# root lemond), so a companion is 0640, a directory this makes 0750, the lock 0600 - nothing for "others", ever
+FILE_MODE, DIR_MODE, LOCK_MODE = 0o640, 0o750, 0o600
 
 
 def say(msg):
@@ -111,7 +114,7 @@ def sha256_of(path):
 
 def fetch(hf, c):
     t = target(hf, c)
-    os.makedirs(os.path.dirname(t), exist_ok=True)
+    os.makedirs(os.path.dirname(t), mode=DIR_MODE, exist_ok=True)
     part = t + ".part"
     have = os.path.getsize(part) if os.path.exists(part) else 0
     if have > c[5]:
@@ -125,12 +128,14 @@ def fetch(hf, c):
     say("%s: fetching %s from %s@%.8s (%d MiB%s)" % (c[0], c[4], c[2], c[3], c[5] >> 20, ", resuming at %d MiB" % (have >> 20) if have else ""))
     req = urllib.request.Request(url, headers={"User-Agent": "1bit-os", **({"Range": "bytes=%d-" % have} if have else {})})
     try:
-        with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have and r.status == 206 else "wb") as out:
-            while True:
-                b = r.read(1 << 20)
-                if not b:
-                    break
-                out.write(b)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if have and r.status == 206 else os.O_TRUNC)
+            with os.fdopen(os.open(part, flags, FILE_MODE & 0o600), "ab" if flags & os.O_APPEND else "wb") as out:
+                while True:
+                    b = r.read(1 << 20)
+                    if not b:
+                        break
+                    out.write(b)
     except OSError as e:
         say("%s: %s: the download stopped (%s); the next run resumes it" % (c[0], c[4], e))
         return False
@@ -139,14 +144,14 @@ def fetch(hf, c):
         os.unlink(part)
         say("%s: %s: REFUSED, %d B / sha256 not the card lock's (%d B, %.16s...): removed" % (c[0], c[4], size, c[5], c[6]))
         return False
-    os.chmod(part, 0o644)
+    os.chmod(part, FILE_MODE)
     os.rename(part, t)
     say("%s: %s in place (sha256 %.16s..., the card lock's)" % (c[0], c[4], c[6]))
     return True
 
 
 def run_once(cards, hf):
-    with open(os.path.join(hf, ".1bit-loom-companions.lock"), "w") as lk:
+    with os.fdopen(os.open(os.path.join(hf, ".1bit-loom-companions.lock"), os.O_WRONLY | os.O_CREAT, LOCK_MODE), "w") as lk:
         try:
             fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -182,7 +187,7 @@ def main(argv):
             bad += state == "MISSING"
             print("%s %s %s@%.8s/%s: %s" % (c[0], c[1], c[2], c[3], c[4], state))
         return 1 if bad else 0
-    os.makedirs(hf, exist_ok=True)
+    os.makedirs(hf, mode=DIR_MODE, exist_ok=True)
     if mode == "once":
         return 0 if run_once(cards, hf) else 1
     while True:

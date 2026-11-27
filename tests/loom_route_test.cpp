@@ -192,6 +192,35 @@ int main() {
         std::ofstream(dir / "lc" / "parameter" / "d.gguf") << "a real copy";                      // --materialize=copy
         loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(), lwhy);
         check("a real file in parameter/ is never replaced", !fs::is_symlink(fs::symlink_status(dir / "lc" / "parameter" / "d.gguf")));
+
+        // engine#3528: a RELATIVE -m (as the payload README's own `./1bit serve -m model.gguf`) is linked by its absolute
+        // path - the link target used to be written relative to the cards directory, where it dangles
+        fs::create_directories(dir / "lc_rel" / "parameter");
+        std::ofstream(dir / "lc_rel" / "model.json") << R"({"model":{"id":"M2"},"variants":{"gguf":{"services":{"chat":{"parameters":{)"
+            R"("model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"}]}}}}}}})";
+        {
+            const fs::path was = fs::current_path();
+            fs::current_path(dir);
+            std::string rwhy;
+            const int rmade = loom::loom_link_card_parameters((dir / "lc_rel" / "model.json").string(), "snap/m.gguf", rwhy);
+            const fs::path tgt = fs::read_symlink(dir / "lc_rel" / "parameter" / "m.gguf");
+            fs::current_path(was);
+            check("a relative model path is linked by its ABSOLUTE path (engine#3528)",
+                  rmade == 1 && tgt.is_absolute() && tgt == dir / "snap" / "m.gguf" && fs::exists(dir / "lc_rel" / "parameter" / "m.gguf"));
+        }
+        // engine#3528: the defaults when no flag and no environment says (a shell on the appliance has neither)
+        check("cards: --loom-cards wins over everything", loom::default_cards_dir("/x", "/env", true, "/xdg", "/home/u") == "/x");
+        check("cards: ONEBIT_LOOM_CARDS wins over the appliance dir", loom::default_cards_dir("", "/env", true, "/xdg", "/home/u") == "/env");
+        check("cards: the appliance's /data/loom-cards when it exists", loom::default_cards_dir("", nullptr, true, "/xdg", "/home/u") == "/data/loom-cards");
+        check("cards: an empty ONEBIT_LOOM_CARDS is ignored", loom::default_cards_dir("", "", true, nullptr, "/home/u") == "/data/loom-cards");
+        check("cards: elsewhere, XDG then HOME as before",
+              loom::default_cards_dir("", nullptr, false, "/xdg", "/home/u") == "/xdg/1bit/loom-cards" &&
+              loom::default_cards_dir("", nullptr, false, nullptr, "/home/u") == "/home/u/.cache/1bit/loom-cards" &&
+              loom::default_cards_dir("", nullptr, false, nullptr, nullptr).empty());
+        check("loom-serve: flag > ONEBIT_LOOM_SERVE > the payload's beside the binary > PATH",
+              loom::default_loom_serve_path("/f", "/e", "/b") == "/f" && loom::default_loom_serve_path("", "/e", "/b") == "/e" &&
+              loom::default_loom_serve_path("", nullptr, "/opt/1bit-package/loom/loom-serve") == "/opt/1bit-package/loom/loom-serve" &&
+              loom::default_loom_serve_path("", "", "") == "loom-serve");
         // the card's lock names a size per weight file: a sibling of another size (the repo replaced the file under the
         // card's name, as unsloth/Inkling-2-Mini-GGUF is about to do with its DSpark drafter) is refused, not linked
         fs::remove(dir / "lc" / "parameter" / "d.gguf");

@@ -630,6 +630,7 @@ add_test(NAME webapp_proxy_hold_timeout COMMAND sh ${CMAKE_SOURCE_DIR}/tests/web
 set_tests_properties(webapp_proxy_hold_timeout PROPERTIES RESOURCE_LOCK route_ports)
 add_test(NAME laya_fetch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/laya_fetch_test.sh)
 add_test(NAME loom_payload COMMAND sh ${CMAKE_SOURCE_DIR}/tests/loom_payload_test.sh)
+add_test(NAME loom_profile COMMAND sh ${CMAKE_SOURCE_DIR}/tests/loom_profile_test.sh)
 add_test(NAME shutdown_watch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/shutdown_watch_test.sh)
 add_test(NAME update_shadow COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_shadow_test.sh)
 add_test(NAME update_check COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_check_test.sh)

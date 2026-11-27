@@ -1,0 +1,23 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#
+# engine#3528: a login shell finds the Loom route exactly as Lemonade's own serves do. 10lemonade exports these two for
+# lemond only, so `1bit serve -m <model>` from a shell looked for cards in ~/.cache/1bit/loom-cards (absent on the
+# appliance) and took the llama.cpp route for a model that has a Loom route. The same values as 10lemonade: the cards
+# 1bit-loom-cards assembles at boot (with their parameter/ links) and the payload's loom-serve. A value set already wins.
+[ -z "${ONEBIT_LOOM_CARDS:-}" ] && [ -d /data/loom-cards ] && { ONEBIT_LOOM_CARDS=/data/loom-cards; export ONEBIT_LOOM_CARDS; }
+[ -z "${ONEBIT_LOOM_SERVE:-}" ] && [ -x /opt/1bit-package/loom/loom-serve ] && { ONEBIT_LOOM_SERVE=/opt/1bit-package/loom/loom-serve; export ONEBIT_LOOM_SERVE; }
+true

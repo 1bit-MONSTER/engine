@@ -85,7 +85,7 @@ LINE_STYLES = [
       # engine#2027: the `#`-comment baseline for hardcoded /tmp paths, same shape and the same reason --
       # data, `.txt` has no style, and the notice it wants is already at the top of the file.
       "tmp_paths.txt",
-      "21serial-console", "90onboard-limits", "91onboard-npm", "release-owned", "laya-files", "loom-cards.pin", "Dockerfile", "*.Dockerfile",
+      "21serial-console", "90onboard-limits", "91onboard-npm", "92onboard-loom", "release-owned", "laya-files", "loom-cards.pin", "Dockerfile", "*.Dockerfile",
       # cycle 17: Puppy's switch that skips its first-run Quick Setup is an empty marker file whose only content
       # is this notice - Puppy tests for its existence, so a comment is free
       "personal_settings_popup_disabled",

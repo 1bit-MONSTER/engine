@@ -75,8 +75,9 @@ jobs:
     concurrency:
       group: hrx-build-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
-    # a cold build (both pins moved) at -j 4 under thermal-run; an incremental one takes minutes
-    timeout-minutes: 120
+    # a cold build (both pins moved) at -j 4 under thermal-run; an incremental one takes minutes; plus up to 90 min
+    # queued for the device rows' box-hold ticket
+    timeout-minutes: 210
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -191,7 +192,8 @@ jobs:
         # yet: test-hrx-host-resident does not compile (its target compiles ggml-hrx/host-weight-placement.cpp
         # without `ggml/src` on the include path, so `ggml-backend-impl.h` is not found) and is baselined as
         # `Not Run`; test-hrx-ops/-loom (271 cases, 694 s) stay excluded by the script's -E.
-        timeout-minutes: 40
+        # 40 min of build + rows, plus up to 90 min queued for the box-hold ticket
+        timeout-minutes: 130
         run: |
           set -euo pipefail
           fork="$HRX_BUILD/hrx/llama"
@@ -252,8 +254,22 @@ jobs:
           # below -- correctly -- treats a skip in this job as an error. The device-requiring row it was aimed at
           # (test-testing-suite-skip) is excluded by name in fork_ctest_known_fail.sh instead, which keeps the
           # ratchet's real verdict (113 rows, 0 new) rather than trading it for a 77.
-          row=$(ONEBIT_FORK_CTEST=1 ctest --test-dir "$HRX_BUILD" -R '^fork_ctest_known_fail$' --output-on-failure 2>&1) \
-            || { printf '%s\n' "$row"; exit 1; }
+          # The rows use the GPU: since 2026-11-26 /etc/udev/rules.d/99-1bit-kfd-render.rules lets the runner's
+          # account open /dev/kfd, so on the appliance they take a `box-hold gpu` ticket like every lane (the
+          # hw-gate pattern, #3538): FIFO wait up to 90 min, at most 45 min held, the lock descriptors closed in
+          # the rows so a leftover process cannot keep the box. Without box-hold (another runner) nothing changes.
+          ticket=()
+          if command -v box-hold > /dev/null 2>&1; then
+            ticket=(env BOX_HOLD_WAIT=5400 "BOX_HOLD_WHO=hrx-build run $GITHUB_RUN_ID" box-hold gpu
+                    sh -c 'exec 8>&- 9>&-; exec "$@"' box-hold-step timeout -k 30 2700)
+          fi
+          rc=0
+          row=$(ONEBIT_FORK_CTEST=1 "${ticket[@]}" ctest --test-dir "$HRX_BUILD" -R '^fork_ctest_known_fail$' --output-on-failure 2>&1) \
+            || rc=$?
+          if [ "$rc" = 4 ] && [ "${#ticket[@]}" -gt 0 ]; then
+            printf '%s\n' "$row"; echo "::error::box-hold: no GPU ticket within 90 min, the device rows did not run"; exit 1
+          fi
+          [ "$rc" = 0 ] || { printf '%s\n' "$row"; exit 1; }
           printf '%s\n' "$row"
           # ... and a SKIP here is a failure too, because this is the one job whose purpose is to run that row:
           # the tree exists (the build above made it), so there is no legitimate reason to skip -- and ctest

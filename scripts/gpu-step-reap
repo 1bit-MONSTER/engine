@@ -1,0 +1,75 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# gpu-step-reap <seconds> <command...> - run one device step so that NOTHING it started outlives it.
+#
+# Why: CI device steps run inside a box-hold ticket with the lock descriptors closed (#3538), so a leftover process
+# cannot keep the LOCK. But `timeout` signals only the process it started: a step that forks a server (1bit serve ->
+# llama-server, loom-serve, a bench harness) and hangs leaves that grandchild running with /dev/kfd open after the
+# ticket is released. The next ticket may be an NPU job, and a GPU process beside a separate NPU job is the
+# 2026-11-23 06:29Z hard reset (reset reason 0x00800800) that made every ticket take both locks (#3543/#3568 review).
+#
+# How:
+#   - the step runs in a NEW SESSION (setsid) under `timeout -k 30 <seconds>`; the session leader is a small shell
+#     that records the step's exit code, so the caller still gets it;
+#   - afterwards EVERY process still in that session is sent TERM, then KILL after HOLD_REAP_GRACE_S (5). Session
+#     ids survive re-parenting to init, so orphaned grandchildren are found; a process that called setsid itself
+#     is not, which is what the /dev/kfd check below is for;
+#   - finally any process of this uid that still has /dev/kfd open is reported (and, with GPU_STEP_REAP_KFD_KILL=1,
+#     killed). Exit 125 when one survives, so the caller can refuse to release the ticket.
+# Exit: the step's own exit code (124 if timed out), or 125 when a /dev/kfd opener of this uid survives.
+set -u
+t=${1:?usage: gpu-step-reap <seconds> <command...>}; shift
+[ $# -gt 0 ] || { echo "gpu-step-reap: no command" >&2; exit 2; }
+grace=${HOLD_REAP_GRACE_S:-5}
+d=$(mktemp -d) || exit 2
+t0=$(date +%s)
+trap 'rm -rf "$d"' EXIT
+# the leader: records its pid (= the session id), runs the step, records the step's exit code
+setsid sh -c 'echo $$ > "$1/sid"; shift; timeout -k 30 "$@"; echo $? > "'"$d"'/rc"' gpu-step "$d" "$t" "$@" < /dev/null &
+n=0; while [ ! -s "$d/sid" ] && [ $n -lt 100 ]; do sleep 0.05; n=$((n + 1)); done
+sid=$(cat "$d/sid" 2> /dev/null)
+[ -n "$sid" ] || { echo "gpu-step-reap: the step did not start" >&2; wait; exit 2; }
+while kill -0 "$sid" 2> /dev/null; do sleep 0.2; done
+wait 2> /dev/null
+rc=$(cat "$d/rc" 2> /dev/null || echo 1)
+# one code for "the deadline hit", whichever timeout is installed (coreutils: 124; busybox's applet reports the signal)
+case "$rc" in 124|137|143) [ $(( $(date +%s) - t0 )) -ge "$t" ] && rc=124 ;; esac
+in_session() {  # pids whose session (field 6 of /proc/<pid>/stat) is $1
+    for p in /proc/[0-9]*; do
+        s=$(sed 's/.*) //' "$p/stat" 2> /dev/null | cut -d' ' -f4) || continue
+        [ "$s" = "$1" ] && echo "${p#/proc/}"
+    done
+}
+left=$(in_session "$sid")
+if [ -n "$left" ]; then
+    echo "gpu-step-reap: the step left $(echo $left | wc -w) process(es) behind; TERM, then KILL after ${grace}s" >&2
+    kill -TERM $left 2> /dev/null; sleep "$grace"
+    left=$(in_session "$sid"); [ -n "$left" ] && kill -KILL $left 2> /dev/null && sleep 1
+fi
+me=$(id -u); kfd=""
+for p in /proc/[0-9]*; do
+    [ "$(stat -c %u "$p" 2> /dev/null)" = "$me" ] || continue
+    ls -l "$p/fd" 2> /dev/null | grep -q '/dev/kfd' && kfd="$kfd ${p#/proc/}"
+done
+if [ -n "$kfd" ] && [ "${GPU_STEP_REAP_KFD_KILL:-0}" = 1 ]; then kill -KILL $kfd 2> /dev/null; sleep 1; kfd=""
+    for p in /proc/[0-9]*; do [ "$(stat -c %u "$p" 2> /dev/null)" = "$me" ] && ls -l "$p/fd" 2> /dev/null | grep -q '/dev/kfd' && kfd="$kfd ${p#/proc/}"; done
+fi
+if [ -n "$kfd" ]; then
+    echo "gpu-step-reap: /dev/kfd still open by uid $me after the step:$kfd - do NOT release the device ticket" >&2
+    exit 125
+fi
+exit "$rc"

@@ -1058,6 +1058,9 @@ add_test(NAME hw_gate_held_ticket COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate
 # hrx-build's device rows (fork_ctest_known_fail) take a box-hold gpu ticket on the appliance (the runner can open /dev/kfd
 # since 2026-11-26). The step's snippet is extracted from the workflow and run with stub box-hold and ctest. No device.
 add_test(NAME hrx_build_box_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hrx_build_box_hold_test.sh)
+# scripts/gpu-step-reap: a device step leaves nothing behind (an orphaned or TERM-ignoring grandchild is reaped; the
+# exit code and the 124 timeout pass through; another job of the same user is untouched). No device.
+add_test(NAME gpu_step_reap COMMAND sh ${CMAKE_SOURCE_DIR}/tests/gpu_step_reap_test.sh)
 # engine#3079: the NPU link gate configured third_party/llama.cpp -- a tree that defines no npu_rt_shim_test -- so it
 # could never pass and said "the runtime does not link" about a configure that never read the engine. Text-level arms
 # pin the tree, the two targets, and the order that makes "did not run" distinct from "does not link".

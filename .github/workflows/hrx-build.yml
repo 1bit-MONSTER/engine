@@ -262,7 +262,7 @@ jobs:
           ticket=()
           if command -v box-hold > /dev/null 2>&1; then
             ticket=(env BOX_HOLD_WAIT=5400 BOX_HOLD_PRIORITY=ci "BOX_HOLD_WHO=hrx-build run $GITHUB_RUN_ID" box-hold gpu
-                    sh -c 'exec 8>&- 9>&-; exec "$@"' box-hold-step timeout -k 30 2700)
+                    sh -c 'exec 8>&- 9>&-; exec "$@"' box-hold-step "$GITHUB_WORKSPACE/scripts/gpu-step-reap" 2700)
           fi
           rc=0
           row=$(ONEBIT_FORK_CTEST=1 "${ticket[@]}" ctest --test-dir "$HRX_BUILD" -R '^fork_ctest_known_fail$' --output-on-failure 2>&1) \

@@ -1,0 +1,41 @@
+<!doctype html>
+<!--
+  Copyright 2026 bong-water-water-bong
+  SPDX-License-Identifier: Apache-2.0
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+
+  1bit OS - update page (OS updater U5, local). Opened from the chat page's header, served by 1bit-webapp-proxy on
+  its OWN origin, 127.0.0.1:8081 (CSP default-src 'self', no framing): the chat origin :8080 also serves what Lemonade
+  returns under /api/, and nothing served there may drive these actions. It shows 1bit-update --status and --check; install / rollback / reboot are POSTs the proxy
+  serves only to a ROOT client on this box (the desktop session) and only with the typed confirmation: the offered
+  release, the slot to roll back to, or the word reboot. Same browser rules as the chat page: fetch + JSON only
+  (Pale Moon 33 lacks AbortSignal.timeout and friends). A LAN update page exists only once a credential is set on
+  the box (a later step); with no credential there is none.
+-->
+<meta charset="utf-8">
+<title>1bit OS - update</title>
+<link rel="stylesheet" href="/update.css">
+<header><b>1bit OS</b><span>update</span><span style="margin-left:auto"><a href="http://127.0.0.1:8080/">back to chat</a></span></header>
+<main>
+  <section><h3>This box</h3><pre id="status">asking 1bit-update…</pre></section>
+  <section><h3>Available</h3><pre id="check"></pre>
+    <div id="install" hidden>Type <b id="offer"></b> to install it into the other slot:
+      <input id="ci" size="16"> <button id="bi">Install</button></div></section>
+  <section><h3>Roll back</h3>
+    <div id="roll" hidden>Type <b id="slot"></b> to boot the other slot next:
+      <input id="cr" size="12"> <button id="br">Roll back</button></div></section>
+  <section><h3>Reboot</h3>Type <b>reboot</b>: <input id="cb" size="8"> <button id="bb">Reboot</button></section>
+  <p class="why" id="why"></p>
+  <section><h3>Last action</h3><pre id="log">none yet</pre></section>
+</main>
+<script src="/update.js"></script>

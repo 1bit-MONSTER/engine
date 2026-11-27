@@ -106,6 +106,19 @@ jobs:
           # outside the checkout, which actions/checkout cleans: the tree persists across runs
           echo "HRX_BUILD=$HOME/.cache/hrx-build/bench" >> "$GITHUB_ENV"
 
+      - name: Install the python the fork's -py test rows import
+        run: |
+          set -euo pipefail
+          # `test-jinja-py` is bin/test-jinja -py: the C++ test shells out to /usr/bin/python3 and
+          # imports jinja2 + numpy. A runner without them fails that row with ModuleNotFoundError and
+          # the ratchet files it as a NEW failure (run 45867026620), which is a runner gap, not a code
+          # regression. dpkg keeps this idempotent on the persistent tree.
+          if ! dpkg -s python3-jinja2 python3-numpy >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends python3-jinja2 python3-numpy
+          fi
+          python3 -c 'import jinja2, numpy; print("jinja2", jinja2.__version__, "numpy", numpy.__version__)'
+
       - name: Configure with ONEBIT_HRX=ON
         env:
           # the same sha the stamp step records, so the binary's `--version` and the tree's stamp cannot disagree

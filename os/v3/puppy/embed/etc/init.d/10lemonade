@@ -168,6 +168,18 @@ PY
     # both through these two variables. A value set in $CONF wins.
     [ -x /usr/local/bin/1bit-loom-cards ] && /usr/local/bin/1bit-loom-cards /opt/1bit-package/loom-cards \
         "${ONEBIT_LOOM_CARDS:-/data/loom-cards}" "$HF_HOME" >> "$LOG" 2>&1
+    # a card's COMPANION weights (a second Hugging Face repository its lock names, e.g. the native Inkling card's MXFP8
+    # experts) are not in Lemonade's catalogue pull: 1bit-loom-companions fetches them, pinned and sha256-checked, for a
+    # card whose model has been pulled - looking every 5 minutes, so a pull from Lemonade's page is completed soon after.
+    # One watcher: a restart of this script finds the running one in /proc and leaves it.
+    if [ -x /usr/local/bin/1bit-loom-companions ]; then
+        _lcw=
+        for _p in /proc/[0-9]*; do
+            case "$(tr '\0' ' ' < "$_p/cmdline" 2> /dev/null)" in *"/usr/local/bin/1bit-loom-companions --watch "*) _lcw=1; break ;; esac
+        done
+        [ -n "$_lcw" ] || HF_HOME="$HF_HOME" setsid nice -n 10 /usr/local/bin/1bit-loom-companions --watch 300 \
+            /opt/1bit-package/loom-cards "$HF_HOME" >> /var/log/1bit-loom-companions.log 2>&1 < /dev/null &
+    fi
     [ -x /opt/1bit-package/loom/loom-serve ] && export ONEBIT_LOOM_SERVE="${ONEBIT_LOOM_SERVE:-/opt/1bit-package/loom/loom-serve}"
     export ONEBIT_LOOM_CARDS="${ONEBIT_LOOM_CARDS:-/data/loom-cards}"
     export LEMONADE_LAYA_MODEL="${LEMONADE_LAYA_MODEL:-/data/laya}"

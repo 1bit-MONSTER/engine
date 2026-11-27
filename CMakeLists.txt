@@ -625,6 +625,8 @@ add_test(NAME heavy_wrapper COMMAND sh ${CMAKE_SOURCE_DIR}/tests/heavy_wrapper_t
 # was 900 s while 1bit-heavy's default hold window is 3600 s; the test locks the proxy's bound to the window and drives a
 # silent (held) upstream inside the bound and past it. Seconds-long: the shipped 4500 s bound is scaled through the
 # proxy's own ONEBIT_WEBAPP_UPSTREAM_TIMEOUT.
+add_test(NAME loom_companions COMMAND sh ${CMAKE_SOURCE_DIR}/tests/loom_companions_test.sh)
+set_tests_properties(loom_companions PROPERTIES RESOURCE_LOCK route_ports)
 add_test(NAME webapp_proxy_hold_timeout COMMAND sh ${CMAKE_SOURCE_DIR}/tests/webapp_proxy_hold_timeout_test.sh)
 # RESOURCE_LOCK route_ports: the row starts a fake loopback upstream; the census reads the script and
 # requires the lock on anything that binds one (tests/route_port_lock_test.py).

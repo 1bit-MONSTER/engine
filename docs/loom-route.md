@@ -116,9 +116,10 @@ Rebuild with `tools/loom_cards.py --build` from freshly fetched card locks; CI r
 
 ## Card sources
 
-**Decided (owner, 2026-11-24): cards are public.** A route entry's card is a published Hugging Face
-repository, as every entry's card is today; no private card source is built and no `card_source` field is added.
-The options, costs and open question below are kept as the record of what was weighed against that decision.
+**Open (owner, 2026-11-27): the "cards are public" line recorded here on 2026-11-24 was not an owner decision and is
+withdrawn.** The standing rule holds: Loom kernels and programs we write ourselves stay in the private kit and are not
+published as cards. Where a card's source comes from stays an open question for the owner; the options and costs below
+are the record of what is being weighed.
 
 A route entry names a card by **name**; the entry says nothing about where the card came from, and no route entry,
 parser, tool or config names a source kind — `card_source` was a name in this note only when it landed (measured

@@ -45,8 +45,8 @@ PROG = "1bit-loom-companions"
 HF_BASE = os.environ.get("ONEBIT_LOOM_HF_BASE", "https://huggingface.co")   # the test's own server; the sha256 decides
 MARGIN = 2 << 30
 # modes are explicit and private (CodeQL py/overly-permissive-file): the only reader is root (loom-serve, a child of the
-# root lemond), so a companion is 0640, a directory this makes 0750, the lock 0600 - nothing for "others", ever
-FILE_MODE, DIR_MODE, LOCK_MODE = 0o640, 0o750, 0o600
+# root lemond), so a companion is 0600, a directory this makes 0700, the lock 0600 - nothing for group or others
+FILE_MODE, DIR_MODE, LOCK_MODE = 0o600, 0o700, 0o600
 
 
 def say(msg):

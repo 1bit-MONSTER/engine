@@ -154,6 +154,7 @@ rm -f "$disk"; truncate -s 24G "$disk"
 cp "$OVMF_VARS" "$work/vars.fd"
 sshport=2322; while ss -lnt 2> /dev/null | grep -q ":$sshport "; do sshport=$((sshport + 2)); done
 vm_kill() { [ -n "${qpid:-}" ] && kill "$qpid" 2> /dev/null; wait "${qpid:-0}" 2> /dev/null; qpid=; }
+vm_up() { sleep 3; kill -0 "${qpid:-0}" 2> /dev/null || { row FAIL qemu "qemu exited at start: $(tail -2 "$work/qemu.out" | tr '\n' ' ' | cut -c1-160)"; return 1; }; }
 vm() {   # <live|disk>: boot the live stick with the blank disk, or the installed disk alone
     vm_kill; rm -f "$work/ser"
     if [ "$1" = live ]; then
@@ -161,7 +162,8 @@ vm() {   # <live|disk>: boot the live stick with the blank disk, or the installe
         drives=(-drive file="$work/live.img",format=raw,if=none,id=u0 -device qemu-xhci -device usb-storage,drive=u0,bootindex=0
                 -drive file="$disk",format=raw,if=virtio)
     else
-        drives=(-drive file="$disk",format=raw,if=virtio,bootindex=0)
+        # bootindex is a DEVICE property (a -drive with if=virtio cannot take it: qemu refuses to start)
+        drives=(-drive file="$disk",format=raw,if=none,id=d1 -device virtio-blk-pci,drive=d1,bootindex=0)
     fi
     qemu-system-x86_64 -m 4096 -smp 4 -machine q35 -enable-kvm -cpu host -display none -no-reboot \
         -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" -drive if=pflash,format=raw,file="$work/vars.fd" \
@@ -177,7 +179,7 @@ reboot_vm() { S 'sync; reboot' > /dev/null 2>&1; for _ in $(seq 1 60); do kill -
 ident() { S "sed -n 's/^payload=lemonade-onebit-//p' /etc/1bit/release-identity; tr ' ' '\n' < /proc/cmdline | sed -n 's/^psubdir=//p'" | tr '\n' ' '; }
 
 # VM 1: the live stick installs onto the blank disk
-vm live
+vm live; vm_up || exit 2
 o=$(python3 -I "$repo/tools/update_vm_serial.py" "$work/ser" "$work/live.img" "$work" 1800 \
     "1bit-install /dev/vda --yes --no-reboot 2>&1 | tail -4; sync")
 vm_kill; rm -f "$work/live.img"
@@ -194,7 +196,7 @@ umount_data
 UPD="env CURL_CA_BUNDLE=/data/uvt/ca.pem ONEBIT_UPDATE_PUB=/data/uvt/release-pub ONEBIT_UPDATE_VERIFIER=/data/uvt/release_sign.py sh /data/uvt/1bit-update"
 
 # VM 2: the installed base; refusals first, then the real update
-vm disk
+vm disk; vm_up || exit 2
 wait_ssh || { row FAIL boot-installed "no ssh on the installed disk"; exit 2; }
 id0=$(ident); row INFO installed "running $id0"
 case $id0 in "$base_tag "*) ;; *) row FAIL installed "expected $base_tag"; exit 1 ;; esac

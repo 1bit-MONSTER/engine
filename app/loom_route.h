@@ -326,10 +326,11 @@ inline std::string loom_card_model_id(const std::string& card, std::string& why)
 // it, pinned and sha256-checked, within 5 minutes of the model's pull; elsewhere the repository is pulled by hand.
 // Pure: the caller says whether that tool is on this machine.
 inline std::string companion_fix_hint(const std::string& repo, bool fetcher_on_box) {
-    if (fetcher_on_box)
-        return ": this box fetches it (1bit-loom-companions, every 5 minutes once the model is pulled) - "
+    if (repo.empty()) return std::string();       // nothing to name, nothing to say (either branch)
+    if (fetcher_on_box)                           // review cl-pragent: say WHICH companion in both branches
+        return ": " + repo + " is fetched by this box (1bit-loom-companions, every 5 minutes once the model is pulled) - "
                "`1bit-loom-companions --status` says where it is, `--once` fetches it now";
-    return repo.empty() ? std::string() : ": pull " + repo;
+    return ": pull " + repo;
 }
 
 inline int loom_link_card_parameters(const std::string& card_model_json, const std::string& model_path, std::string& why,

@@ -506,6 +506,16 @@ with 32 lane tickets queued, so every PR's device rows would keep timing out. bo
 - **Ticket names:** `0-<n>…` for CI and `1-<n>…` for lanes, sorted with `LC_ALL=C`. Tickets of the previous format
   sort between the two, so lanes already queued keep their place ahead of new lanes.
 
+**A board class for the leaderboard (2026-11-27).** The weekly blog needs cl-lb's boards by Sunday, so box-hold has one
+more class:
+- **Who:** `BOX_HOLD_PRIORITY=board`, honoured **only** when `BOX_HOLD_WHO` is the `cl-lb` label (`cl-lb` or `cl-lb-…`).
+  Another label that asks for it is queued as a lane and reported, the same as an unqualified `ci`.
+- **Order:** after CI and ahead of every lane ticket, FIFO among board tickets. Board tickets are named `0-b-<n>…`, which
+  sorts after CI's `0-<n>…` and before both the previous format and `1-<n>…`.
+- **Quota:** at most 2 board tickets queued at a time (`BOX_HOLD_BOARD_MAX`). A third queues as a lane and is reported.
+  The count and the new ticket are made under the same lock, so two waiters cannot race past it.
+- **Cap:** the same 45-minute limit as CI.
+
 The head of the queue no longer blocks in `flock`; it tries the locks and re-reads the queue between tries. A head
 blocked in `flock -w` never saw a CI ticket that arrived behind it. The same change fixed a defect as old as box-hold:
 `exec 9>lock 2>/dev/null` on a bare `exec` made the `2>/dev/null` permanent, so **every box-hold job's stderr was

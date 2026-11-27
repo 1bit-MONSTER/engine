@@ -27,6 +27,10 @@
 #  10. the command's stderr reaches the caller (a bare `exec 9>lock 2>/dev/null` used to discard every job's stderr)
 #  11. BOX_HOLD_PRIORITY=ci set by hand (no runner) is IGNORED: a lane ticket, and box-hold says so (stderr + box-hold.log)
 #  12. under a Runner.Worker but without GITHUB_ACTIONS=true: still a lane ticket
+#  13. board class (cl-lb label): after CI, ahead of lanes queued earlier
+#  14. board asked for by another label: a lane ticket, reported
+#  15. at most 2 board tickets queued: a third is a lane ticket (reported), served after the lanes ahead of it
+#  16. a board ticket's command has the same 45-min cap (rc 124)
 set -u
 BH=${1:?usage: box_hold_fifo_test.sh <box-hold>}
 T=$(mktemp -d); trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$T"' EXIT
@@ -140,6 +144,37 @@ sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 BOX_HOLD_PRIORITY=ci "$T/Runner.Worker" -c 'sh "$0" "$@"; exit $?' "$BH" gpu sh -c "$(job W 0.2)" 2> /dev/null & sleep 0.3
 wait
 [ "$(tr '\n' ' ' < "$T/order")" = "H L1 W " ] && ok "Runner.Worker without GITHUB_ACTIONS=true: a lane" || bad "worker-only order: $(tr '\n' ' ' < "$T/order")"
+
+# 13. board: after CI, before lanes
+: > "$T/order"
+sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.3
+sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
+BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb-q38 sh "$BH" gpu sh -c "$(job B1 0.2)" & sleep 0.3
+ci gpu sh -c "$(job C1 0.2)" & sleep 0.3
+wait
+[ "$(tr '\n' ' ' < "$T/order")" = "H C1 B1 L1 " ] && ok "board (cl-lb): after CI, ahead of an earlier lane" || bad "board order: $(tr '\n' ' ' < "$T/order")"
+
+# 14. board for another label
+: > "$T/order"
+sh "$BH" gpu sh -c "$(job H 1.2)" & sleep 0.3
+sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
+BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-hf-sweep sh "$BH" gpu sh -c "$(job X 0.2)" 2> "$T/err14" & sleep 0.3
+wait
+[ "$(tr '\n' ' ' < "$T/order")" = "H L1 X " ] && grep -q "for the cl-lb label only" "$T/err14" \
+  && ok "board for another label: a lane ticket, reported" || bad "board by another label: $(tr '\n' ' ' < "$T/order") [$(cat "$T/err14")]"
+
+# 15. the board quota
+: > "$T/order"
+sh "$BH" gpu sh -c "$(job H 1.8)" & sleep 0.3
+sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
+for b in B1 B2 B3; do BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb sh "$BH" gpu sh -c "$(job $b 0.2)" 2>> "$T/err15" & sleep 0.3; done
+wait
+[ "$(tr '\n' ' ' < "$T/order")" = "H B1 B2 L1 B3 " ] && grep -q "already has 2 ticket(s) queued" "$T/err15" \
+  && ok "at most 2 board tickets queued: the third is a lane, reported" || bad "board quota: $(tr '\n' ' ' < "$T/order") [$(cat "$T/err15")]"
+
+# 16. board cap
+s=$(date +%s); BOX_HOLD_CI_MAX=1 BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb sh "$BH" gpu sleep 5; rc=$?; d=$(( $(date +%s) - s ))
+[ "$rc" = 124 ] && [ "$d" -le 3 ] && ok "a board ticket's command is capped (rc 124 after ${d}s)" || bad "board cap: rc $rc after ${d}s"
 
 [ "$fail" = 0 ] && echo "box_hold_fifo: PASS" || echo "box_hold_fifo: FAIL"
 exit "$fail"

@@ -177,12 +177,19 @@ hl_ticket() {  # hl_ticket [--sudo] COMMAND...  (COMMAND words are box-side; ROU
 # EX_TEMPFAIL WITHOUT a report, so Hyperloom records the round as a failed run (client_failed) instead of grading a
 # quality gate on numbers that do not exist -- on 23 Nov a failing report sent a run into ENABLEMENT to "fix" the
 # workload. Call after hl_fetch.
+# The same holds when box-hold itself never ran the command (27 Nov): exit 4 = refused by the per-lane queue cap
+# (#3579) or BOX_HOLD_WAIT ran out in the queue; 5 is reserved for a distinct refusal code. The box script then wrote
+# no status of its own, and grading that round would read a queue refusal as the lever failing its gate.
 hl_exit_if_unreachable() {
-    if [ "$TICKET_RC" = 255 ] && ! grep -qxE 'ok|failed:.*|refused:.*|killed.*' "$RESULT_DIR/box/status" 2>/dev/null; then
-        rm -f "$RESULT_DIR/$RESULT_FILENAME.json"
-        echo "[$LOG_TAG] box $HL_BOX unreachable (ssh rc 255, $HL_SSH_RETRIES retries): no report, exit 75" >&2
-        exit 75
-    fi
+    grep -qxE 'ok|failed:.*|refused:.*|killed.*' "$RESULT_DIR/box/status" 2>/dev/null && return 0
+    case $TICKET_RC in
+        255) why="box $HL_BOX unreachable (ssh rc 255, $HL_SSH_RETRIES retries)" ;;
+        4|5) why="box-hold did not run the ticket (rc $TICKET_RC: $(grep -m1 -E 'box-hold:' "$RESULT_DIR/box/ticket.log" 2>/dev/null | cut -c1-160))" ;;
+        *) return 0 ;;
+    esac
+    rm -f "$RESULT_DIR/$RESULT_FILENAME.json"
+    echo "[$LOG_TAG] $why: no report, exit 75" >&2
+    exit 75
 }
 
 hl_fetch() {  # hl_fetch [tar --exclude patterns...]

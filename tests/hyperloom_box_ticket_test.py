@@ -32,6 +32,7 @@ shims that record they were used, and loom-serve is a fake OpenAI server that st
     and a patched framework checkout each give a failing report naming why; a clean checkout still measures;
   * an unreachable box (ssh exits 255 every time) is retried, then the round exits 75 with NO report -- infrastructure,
     never a graded measurement;
+  * a ticket box-hold never runs (the per-lane queue cap or a queue timeout, exit 4) also exits 75 with NO report;
   * the box's RAM guard stops the SERVER while the gauntlet is still running: MemAvailable (a fake /proc/meminfo,
     HL_MEMINFO) drops under the floor mid-gauntlet and the server's process group is gone within seconds, not after the
     gauntlet's foreground python returns (bash defers a trapped signal until then);
@@ -307,6 +308,16 @@ def main():
         p, rep, rd = round_(dict(env, PATH="%s:%s" % (dbin, env["PATH"]), HL_SSH_RETRY_SEC="0"), td, "unreachable")
         check("an unreachable box: retried, then exit 75 and no report", p.returncode == 75 and rep is None
               and p.stderr.count("retry") == 2 and "unreachable" in p.stderr, "rc=%s rep=%s %s" % (p.returncode, rep, p.stderr[-300:]))
+
+        # box-hold never runs the ticket (27 Nov: the per-lane queue cap, #3579, refuses with exit 4; a BOX_HOLD_WAIT
+        # timeout exits 4 too): unmeasured, exit 75 and no report -- never graded as the lever failing its gate
+        cbin = td / "capbin"
+        cbin.mkdir()
+        write_exe(cbin / "box-hold", '#!/bin/bash\necho "box-hold: lane cap: 3 queued for cl-hyperloom (at most 3 per lane): test refused, not queued" >&2\nexit 4\n')
+        p, rep, rd = round_(dict(env, PATH="%s:%s" % (cbin, env["PATH"])), td, "lanecap")
+        check("a ticket box-hold refuses: exit 75 and no report", p.returncode == 75 and rep is None
+              and "box-hold did not run the ticket (rc 4" in p.stderr and "lane cap" in p.stderr,
+              "rc=%s rep=%s %s" % (p.returncode, rep, p.stderr[-300:]))
 
         # reachable for the ship, lost for the ticket: the ticket's own retry path
         write_exe(dbin / "ssh", '#!/bin/bash\nwhile [ "${1:-}" = -o ]; do shift 2; done\nshift\n'

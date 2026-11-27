@@ -1234,6 +1234,32 @@ layers_root_verdict() {
     printf 'PASS root has no usable password in any of the %s image layer(s) that carry an etc/shadow' "$_n"
 }
 
+# local_system_ids_verdict <SYS_UID_MIN> <SYS_UID_MAX> <SYS_GID_MIN> <SYS_GID_MAX> (from /etc/login.defs; empty = not
+# set): the box's own system accounts (useradd -r) must get ids the image's never use. Unset, SYS_UID_MAX defaults to
+# 999 and useradd -r takes 999 down - the image's own system range (systemd-network 998, pipewire 994, ...), so an
+# image that adds a system account can collide with one the box made and the account merge refuses. The image sets
+# 800-899 (os/v3/puppy/local-system-ids.sh). Pure, so --self-test drives it.
+local_system_ids_verdict() {
+    if [ "${1:-}" = 800 ] && [ "${2:-}" = 899 ] && [ "${3:-}" = 800 ] && [ "${4:-}" = 899 ]; then
+        printf "PASS useradd -r on this box allocates 800-899 (users and groups), a range the image's own system accounts do not use"
+    else
+        printf "FAIL /etc/login.defs SYS_UID_MIN/MAX %s-%s, SYS_GID_MIN/MAX %s-%s (want 800-899): useradd -r takes the image's own range (999 down) - update, or set the four keys to 800/899 in /etc/login.defs" \
+            "${1:-unset}" "${2:-unset}" "${3:-unset}" "${4:-unset}"
+    fi
+}
+
+# local_system_accounts_verdict <"name=id ..." of LOCAL system accounts/groups in the image's range | NOLAYERS>: an
+# account or group the box made itself (not named by any image layer) with an id under 1000 outside 800-899 sits where
+# the image's own system accounts live, so the first image that adds one with that id makes the account merge refuse
+# on every boot (review cl-flm, engine#3569; strixhalo: ghrunner 999). Names and ids only. Pure, so --self-test drives it.
+local_system_accounts_verdict() {
+    case "${1:-}" in
+        NOLAYERS) printf 'SKIP no squashfs image layers under the root overlay (not the appliance)' ;;
+        '')       printf "PASS no local system account or group sits in the image's id range" ;;
+        *)        printf "FAIL local system account(s)/group(s) in the image's id range: %s - an image that adds a system account there makes the account merge refuse: re-create them with useradd -r (now 800-899), or usermod -u / groupmod -g into 800-899 while nothing runs as them" "$1" ;;
+    esac
+}
+
 # privileged_groups_verdict <group file> <passwd file>: no user but root may be in a group whose members are root in all
 # but name - disk (raw block devices), kmem (kernel memory), shadow (password hashes), root, sudo, wheel - as a listed
 # member or by primary gid. Puppy's base put its desktop user spot (uid 502) in disk and kmem, which undercuts the
@@ -1495,6 +1521,13 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(privileged_groups_verdict "$_pg/g2" "$_pg/p")"                    # Puppy's base: spot in disk
     printf 'root:x:0:0::/root:/bin/sh\neve:x:600:15::/home/eve:/bin/sh\n' > "$_pg/p2"
     check FAIL "$(privileged_groups_verdict "$_pg/g" "$_pg/p2")"                    # kmem as a primary group
+    check PASS "$(local_system_ids_verdict 800 899 800 899)"
+    check FAIL "$(local_system_ids_verdict '' '' '' '')"                             # the base: unset (999 down)
+    check FAIL "$(local_system_ids_verdict 101 999 101 999)"
+    check FAIL "$(local_system_ids_verdict 800 899 '' '')"                           # groups not covered
+    check PASS "$(local_system_accounts_verdict '')"
+    check FAIL "$(local_system_accounts_verdict 'ghrunner=999 group:ghrunner=992')"
+    check SKIP "$(local_system_accounts_verdict NOLAYERS)"
     # root-password: the image's default is '*'; the old default's MD5 form, an empty field and an unreadable file FAIL
     check PASS "$(root_password_verdict '*')"
     check PASS "$(root_password_verdict '!')"
@@ -3564,6 +3597,41 @@ PG=$(privileged_groups_verdict /etc/group /etc/passwd)
 case "$PG" in
     PASS*) pass privileged-groups "${PG#PASS }" ;;
     *)     fail privileged-groups "${PG#FAIL }" ;;
+esac
+_sid() { awk -v k="$1" '$1 == k { print $2; exit }' /etc/login.defs 2> /dev/null; }
+LS=$(local_system_ids_verdict "$(_sid SYS_UID_MIN)" "$(_sid SYS_UID_MAX)" "$(_sid SYS_GID_MIN)" "$(_sid SYS_GID_MAX)")
+case "$LS" in
+    PASS*) pass local-system-ids "${LS#PASS }" ;;
+    *)     fail local-system-ids "${LS#FAIL }" ;;
+esac
+# the image's account names: every squashfs layer under the root overlay (as layers-root-password reads them)
+_lsl=$(awk '$2 == "/" && $3 == "overlay" { n = split($4, o, ","); for (i = 1; i <= n; i++) if (o[i] ~ /^lowerdir=/) { sub(/^lowerdir=/, "", o[i]); print o[i]; exit } }' /proc/mounts 2> /dev/null)
+_lsn=/tmp/1bit-img-names.$$; : > "$_lsn"; _lsk=0
+_ifs=$IFS; IFS=:
+for _le in $_lsl; do
+    for _lm in "/initrd$_le" "$_le"; do
+        awk -v m="$_lm" '$2 == m && $3 == "squashfs" { f = 1 } END { exit !f }' /proc/mounts 2> /dev/null || continue
+        _lsk=1
+        for _lf in passwd group; do
+            [ -r "$_lm/etc/$_lf" ] && awk -F: -v k="$_lf" '{ print k ":" $1 }' "$_lm/etc/$_lf" >> "$_lsn"
+        done
+        break
+    done
+done
+IFS=$_ifs
+if [ "$_lsk" = 1 ]; then
+    _lsa=$( { awk -F: '$3 < 1000 && ($3 < 800 || $3 > 899) { print "passwd:" $1 "=" $3 }' /etc/passwd 2> /dev/null
+              awk -F: '$3 < 1000 && ($3 < 800 || $3 > 899) { print "group:" $1 "=" $3 }' /etc/group 2> /dev/null; } |
+            while IFS= read -r _x; do grep -qxF "${_x%=*}" "$_lsn" || printf '%s ' "$(printf '%s' "$_x" | sed 's/^passwd://')"; done)
+    LA=$(local_system_accounts_verdict "${_lsa% }")
+else
+    LA=$(local_system_accounts_verdict NOLAYERS)
+fi
+rm -f "$_lsn"
+case "$LA" in
+    PASS*) pass local-system-accounts "${LA#PASS }" ;;
+    SKIP*) skip local-system-accounts "${LA#SKIP }" ;;
+    *)     fail local-system-accounts "${LA#FAIL }" ;;
 esac
 # root's password FIELD goes straight into the verdict and is never echoed
 if [ -r /etc/shadow ]; then RP=$(root_password_verdict "$(awk -F: '$1 == "root" { print $2; exit }' /etc/shadow)")

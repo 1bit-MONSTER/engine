@@ -110,6 +110,14 @@ per-account (a job cannot use the owner's keys to push, and its `$HOME` writes a
 wanted too, that is `chmod o-rx /home/bcloud` — the owner's call, because it changes the box for every other lane
 as well.
 
+**Its uid and gid.** `ghrunner` was made with `useradd -r` before 1bit OS gave a box's own system accounts their own
+range, so it sits at uid 999 / gid 992 - inside the range the image uses for its own system accounts. An image that
+later adds a system account with one of those ids makes the boot-time account merge refuse (safely, but on every
+boot), and release-check's `local-system-accounts` row names it until then. On an image with the 800-899 range
+(`/etc/login.defs` `SYS_UID_MIN`/`SYS_UID_MAX` 800/899), move it while the runner is idle: stop the service,
+`usermod -u <8xx> ghrunner`, `groupmod -g <8xx> ghrunner`, `chown -R ghrunner:ghrunner /var/lib/ghrunner` (and any
+other path it owns), start the service. A runner set up from scratch gets an id in that range from `useradd -r`.
+
 ### One queue, two accounts
 
 The workflows reach the box's hold state through `$HOME`: `~/GPU-TOKEN`, `~/GPU-QUEUE` (and `npu-hold`, which

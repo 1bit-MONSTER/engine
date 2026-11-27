@@ -210,6 +210,18 @@ PY
     sh "$here/lock-root-password.sh" "$out/shadow" || die "could not replace the default root password"
     chmod 600 "$out/shadow"
     printf 'etc/shadow\t%s\n' "$out/shadow" >> "$M.os"
+    # the base's /etc/login.defs with a range of its own for the BOX's system accounts (useradd -r: 800-899), so they
+    # never take the ids the image's system accounts use (999 down); the range check covers bdrv's accounts as well,
+    # which sit above the main SFS's. Only the main SFS carries login.defs in the base.
+    mkdir -p "$out/ids/main" "$out/ids/bdrv"
+    sudo -n unsquashfs -q -cat "$bsfs" etc/login.defs > "$out/ids/main/login.defs" || die "the base SFS has no etc/login.defs"
+    for f in passwd group; do
+        sudo -n unsquashfs -q -cat "$bsfs" "etc/$f" > "$out/ids/main/$f" 2> /dev/null || rm -f "$out/ids/main/$f"
+        sudo -n unsquashfs -q -cat "$(ls "$BASE"/bdrv_*.sfs | head -1)" "etc/$f" > "$out/ids/bdrv/$f" 2> /dev/null || rm -f "$out/ids/bdrv/$f"
+    done
+    sh "$here/local-system-ids.sh" "$out/ids/main" "$out/ids/bdrv" || die "could not give the box's system accounts their own id range"
+    chmod 644 "$out/ids/main/login.defs"
+    printf 'etc/login.defs\t%s\n' "$out/ids/main/login.defs" >> "$M.os"
     baseid=$(sudo -n unsquashfs -q -cat "$bsfs" etc/1bit/release-identity) || die "the base SFS has no etc/1bit/release-identity"
     hsa=$(echo "$baseid" | grep '^libhsa_sha256=') || die "the base identity names no libhsa_sha256"
     { echo "payload=lemonade-onebit-$tag"; echo "payload_lemond=$plem"; echo "engine_sha256=$esha"
@@ -283,6 +295,11 @@ PY
     for f in "$O"/*.sfs; do
         rf=$(sudo -n unsquashfs -q -cat "$f" etc/shadow 2> /dev/null | awk -F: '$1 == "root" { print ($2 == "" ? "E" : substr($2, 1, 1)); exit }')   # E: empty = no password at all
         case $rf in ''|'*'|'!') ;; *) die "$(basename "$f") ships root with a usable password in etc/shadow" ;; esac
+        if sudo -n unsquashfs -q -cat "$f" etc/login.defs > "$out/ids/check" 2> /dev/null; then
+            grep -Eq '^SYS_UID_MIN[[:space:]]+800$' "$out/ids/check" && grep -Eq '^SYS_UID_MAX[[:space:]]+899$' "$out/ids/check" &&
+                grep -Eq '^SYS_GID_MIN[[:space:]]+800$' "$out/ids/check" && grep -Eq '^SYS_GID_MAX[[:space:]]+899$' "$out/ids/check" ||
+                die "$(basename "$f")'s etc/login.defs has no 800-899 range for the box's own system accounts"
+        fi
     done
     cp "$BASE/vmlinuz" "$BASE/initrd.gz" "$O/"
     sudo -n chown -R "$(id -u):$(id -g)" "$O"

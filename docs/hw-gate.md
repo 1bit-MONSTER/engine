@@ -257,6 +257,43 @@ scripts/hw-gate.sh --phases build,kat,kld --record   # writes kat-*.json, the .k
 
 and commit the changed `tests/golden/hw-gate/` files in the same PR as the pin they belong to.
 
+## Inputs on the appliance
+
+On the 1bit OS appliance, the bench runner reads the gate's inputs from **`/data/ci/hw-gate/`** (orchestrator,
+27 Nov). The tree is `root:root`, with directories 0755 and files 0644, so it is world-readable and no lane can change
+what the gate compares against. The bench runner runs as `bcloud`, the lanes' own account, so "owned by the runner
+account" and "not writable by lanes" cannot both hold there. Root ownership is what keeps the second.
+`hw-gate.yml`'s prepare step wires the tree in:
+- `HW_GATE_MODELS=/data/ci/hw-gate/models`;
+- an empty or linked `$HW_GATE_STORE/kld` becomes a link to `/data/ci/hw-gate/kld`. A `kld` dir that holds files is
+  left alone.
+
+`tests/hw_gate_inputs_test.sh` drives that snippet. Before the tree existed, run 46014683686 SKIPped kld and all 8
+model rows ("input absent"), and `placement` failed with "produced no result row".
+
+Each file was checked against `tests/golden/hw-gate/manifest.json` (size, sha256 of the first 64 MiB, base and text
+sha256) and its full sha256 recorded on the box (`sha256sum`, 2026-11-27):
+
+| file (under `/data/ci/hw-gate/`) | bytes | sha256 | source |
+|---|---|---|---|
+| `models/Qwen3-0.6B-Q4_K_M.gguf` | 396,705,472 | `ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a` | `unsloth/Qwen3-0.6B-GGUF` (`models/pins.json`), copied from the strixhalo backup |
+| `models/Qwen3-4B-IQ4_XS.gguf` | 2,270,752,032 | `82aa8394fd5b43eea0c287c88ae932b22f90e192e1288cff94bc39e2d5a97c01` | `unsloth/Qwen3-4B-GGUF` (its LFS sha256), copied from the strixhalo backup |
+| `models/zaya1-8b-Q4_K_M.gguf` | 5,567,582,048 | `339cac3addcf2b61abdb171a45f29dd11bb986a6741cf9119ae9a615edd44dcc` | `1bit-MONSTER/ZAYA1-8B-GGUF` (`models/pins.json`), copied from the strixhalo backup |
+| `models/qwen38/UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf` | 17,659,407,264 | `2a5f3565f39cf885103da591182c1266da64745737b42b452fd3e675369f1211` | `unsloth/Qwen3.8-27B-GGUF` (`models/pins.json`), copied from ryzen |
+| `models/qwen36/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf` | 17,730,509,792 | `649d7508507b84638732c4f52c24c8b15843c6dca2f3ff793ae07c14a67ebbb3` | `unsloth/Qwen3.6-35B-A3B-GGUF@a483e9e6cbd5`, downloaded and checked against the LFS sha256 |
+| `models/qwen38/wikitext-2-raw/wiki.test.raw` | 1,290,590 | `173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08` | wikitext-2-raw test split, copied from the strixhalo backup |
+| `kld/qwen3-0.6b.kld` | 619,931,604 | `af6eb4309794905f9535be33cddc779e6ad1a749e03ee59fe2b0509fd971bada` | the dev box's `~/.cache/hw-gate/kld` (strixhalo backup) = manifest `base_sha256` |
+| `kld/qwen3-4b-iq4xs.kld` | 619,931,604 | `63062b57e90d482347b72b7c4c9756a6dfd2272c51c074b5b237e47978b7d88e` | same |
+| `kld/qwen3-coder-30b-a3b.kld` | 619,931,604 | `0d90e13f5fe99e22f64ddc50653596597b0860f4aab3d2f010735676d5a05c72` | same |
+| `kld/qwen3.6-35b-a3b.kld` | 1,013,178,324 | `9a4b5a7b29debdaf2a47db9aeb8d1803aec8f14e33cd4cecf1548c05e0f2f2a1` | same |
+| `kld/qwen3.8-27b.kld` | 1,013,178,324 | `8b54bd01647a21134e6d87a799b26ff72a28cf7fc4c89fc59413803085903695` | same |
+| `kld/zaya1-8b.kld` | 1,069,596,564 | `017898e89e8dd15cf66fb4ad91fd05c47026ab80dcdc7f288554b76fdde7bab1` | same |
+
+The gate itself still checks each input against the manifest at run time, so this table records the files' origin;
+the manifest decides what is accepted. Re-recording at a release pin (`--record`) writes the `.kld` files, which needs
+a writable `kld` directory. Do it by hand as root on the box, then copy the new files into this store and update both
+this table and the manifest in the pin's PR.
+
 ## Running it by hand
 
 ```sh

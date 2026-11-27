@@ -485,8 +485,12 @@ with stub jobs.
 
 **CI tickets are served next (2026-11-27).** Measured that day, #3550's `hrx_build` gave up after its 90-minute wait
 with 32 lane tickets queued, so every PR's device rows would keep timing out. box-hold therefore has a priority class:
-- **Who is CI:** a ticket with `BOX_HOLD_PRIORITY=ci`, or one from the `ghrunner` account. `hrx-build.yml`, `hw-gate.sh`
-  under CI (`GITHUB_RUN_ID` set) and the coder-llm window all set it.
+- **Who is CI:** a ticket that asks with `BOX_HOLD_PRIORITY=ci` **and** really comes from CI. That means either it runs
+  under a GitHub Actions runner (`GITHUB_ACTIONS=true` and a `Runner.Worker` among its ancestors), or it runs as the
+  runner account `ghrunner`. The variable alone does not count, and neither does the account alone. A lane that sets
+  the variable by hand is queued as a lane, and box-hold reports that it ignored the request, on stderr and in
+  `/tmp/box-locks/box-hold.log` (orchestrator, 27 Nov). `hrx-build.yml` and `hw-gate.sh` under CI (`GITHUB_RUN_ID` set)
+  ask for it.
 - **Order:** CI tickets are served after the current holder and ahead of every queued lane ticket, FIFO among CI
   tickets. Lanes stay FIFO among themselves.
 - **Cap:** a CI ticket's command runs under `timeout ${BOX_HOLD_CI_MAX:-2700}`, the 45-minute ticket rule, because it

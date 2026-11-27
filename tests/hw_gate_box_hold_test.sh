@@ -84,9 +84,9 @@ grep -q "^box-hold gpu who=hw-gate run 42 pid [0-9]* wait=1234 prio=ci$" "$log" 
 grep -q "fd [89] open" "$log" && bad "lock descriptor open in the step: $(grep 'fd ' "$log")" || ok "lock descriptors closed in the step"
 grep -q "^timeout -k 30 2700 " "$log" && ok "step runs under timeout 2700 s (45 min)" || bad "step parent: $(tail -1 "$log")"
 
-# 4: lock never came round
+# 4: lock never came round -- and, run by hand (no GITHUB_RUN_ID; CI itself sets one), not in the CI class
 log=$tmp/log4; : > "$log"
-STUB_RC=4 STUBLOG=$log BOX_HOLD=$tmp/bin/box-hold BOX_HOLD_WAIT_S=1 bash -c ". '$fn'; box_ticket npu hw-gate-npu 20 true"; rc=$?
+STUB_RC=4 STUBLOG=$log BOX_HOLD=$tmp/bin/box-hold BOX_HOLD_WAIT_S=1 env -u GITHUB_RUN_ID -u HW_GATE_BOX_HOLD_PRIORITY bash -c ". '$fn'; box_ticket npu hw-gate-npu 20 true"; rc=$?
 [ "$rc" = 4 ] && grep -q "^box-hold npu who=hw-gate-npu pid [0-9]* wait=1 prio=$" "$log" && ok "rc 4 (no lock) passes through, npu ticket" || bad "no-lock rc $rc: $(cat "$log")"
 
 # 5: ancestor detection

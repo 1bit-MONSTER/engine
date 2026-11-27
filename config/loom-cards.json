@@ -194,19 +194,9 @@
    "weights_file": "GLM-4.7-Flash-Q4_K_M.gguf",
    "weights_sha256": "29837ed2c0fc5f51981adf8ac8083fcf80743c598381f13e9f06cbad0498b174",
    "weights_licence": "mit",
-   "match": "exact",
+   "match": "none",
    "arch": "deepseek2 (MLA + MoE)",
-   "card": {
-    "repo": "1bit-MONSTER/GLM-4.7-Flash-GGUF-loom",
-    "revision": "a76d9b2f22ee1d996d46e6909065b153d06db164",
-    "licence": "mit",
-    "checkpoint": {
-     "repo": "unsloth/GLM-4.7-Flash-GGUF",
-     "revision": "0d32489ecb9db6d2a4fc93bd27ef01519f95474d",
-     "file": "GLM-4.7-Flash-Q4_K_M.gguf",
-     "sha256": "29837ed2c0fc5f51981adf8ac8083fcf80743c598381f13e9f06cbad0498b174"
-    }
-   }
+   "gap": "deepseek2/MLA: the public port starter has no MLA path (head_dim 576 vs 64/128/256), so the port path is the private Loom kernel kit, whose package registers on loom-serve 0.3.0 after a chat-block terminal-marker fix; no published card and no gate row (engine#3221, KNOWN-ISSUES.md)"
   },
   {
    "id": "Qwen3-4B-Instruct-2507-1bit",

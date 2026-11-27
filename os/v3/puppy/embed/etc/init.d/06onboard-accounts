@@ -1,0 +1,51 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 06onboard-accounts: the save layer's copies of the account files, merged with this image's (before 07onboard-user).
+#
+# An overlay's upper copy wins over the image, and every installed box has one of /etc/passwd, group and shadow
+# (07onboard-user's useradd made it on the first boot). So without this, an image's account changes never reach a box
+# that has been booted once: the base's default root password stays after an update to an image that ships root
+# locked, and a system account the image adds stays invisible. /usr/lib/1bit/merge_accounts.py merges instead of
+# replacing: system accounts take this image's lines (a password a person set is kept; a base default is not), local
+# users and groups are kept, with their memberships. Every boot, so a box updated by an OLDER 1bit-update (which
+# carries no merge) is merged on its first boot into this release; a no-op when the files already agree. The previous
+# copies go to /var/lib/1bit/accounts-backup/<time>/ (root only, the last 5 kept); the outcome to
+# /var/lib/1bit/accounts-merge.status (release-check's account-merge row). Password fields are never printed.
+[ "${1:-start}" = start ] || exit 0
+tool=/usr/lib/1bit/merge_accounts.py
+status=/var/lib/1bit/accounts-merge.status
+[ -r "$tool" ] || exit 0
+# the image's layers, highest priority first: the root overlay's lowerdir (on 1bit OS /pup_b:/pup_ro2:/pup_f:/pup_z,
+# mounted under /initrd), keeping only squashfs mounts - a save layer is never part of the image
+lower=$(awk '$2 == "/" && $3 == "overlay" { n = split($4, o, ","); for (i = 1; i <= n; i++) if (o[i] ~ /^lowerdir=/) { sub(/^lowerdir=/, "", o[i]); print o[i]; exit } }' /proc/mounts)
+set --
+IFS=:
+for e in $lower; do
+    for m in "/initrd$e" "$e"; do
+        if awk -v m="$m" '$2 == m && $3 == "squashfs" { f = 1 } END { exit !f }' /proc/mounts && [ -d "$m/etc" ]; then
+            set -- "$@" --image "$m/etc"; break
+        fi
+    done
+done
+unset IFS
+[ $# -gt 0 ] || { echo "06onboard-accounts: no squashfs layer under the root overlay: nothing to merge against" > /dev/console 2> /dev/null; exit 0; }
+out=$(python3 -I "$tool" "$@" /etc --apply --backup "/var/lib/1bit/accounts-backup/$(date -u +%Y%m%dT%H%M%SZ)" --status "$status" 2>&1)
+rc=$?
+printf '%s\n' "$out" | sed 's/^/06onboard-accounts: /' > /dev/console 2> /dev/null
+printf '%s\n' "$out" | logger -t 06onboard-accounts 2> /dev/null
+[ "$rc" = 0 ] || echo "06onboard-accounts: the merge was REFUSED (above): the account files are as they were; release-check's account-merge row fails until a person resolves it" > /dev/console 2> /dev/null
+exit 0

@@ -544,6 +544,7 @@ add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test
 # OS-UPDATER item 3: the signed SHA256SUMS of a 1bit OS release (tools/release_sign.py), the in-system updater's check
 # the image build takes non-root users out of the root-equivalent groups (spot was in disk + kmem)
 add_test(NAME harden_groups COMMAND sh ${CMAKE_SOURCE_DIR}/tests/harden_groups_test.sh)
+add_test(NAME merge_accounts COMMAND sh ${CMAKE_SOURCE_DIR}/tests/merge_accounts_test.sh)
 add_test(NAME lock_root_password COMMAND sh ${CMAKE_SOURCE_DIR}/tests/lock_root_password_test.sh)
 add_test(NAME release_sign COMMAND sh ${CMAKE_SOURCE_DIR}/tests/release_sign_test.sh)
 set_tests_properties(release_sign PROPERTIES SKIP_RETURN_CODE 77)

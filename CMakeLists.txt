@@ -546,6 +546,7 @@ add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test
 add_test(NAME harden_groups COMMAND sh ${CMAKE_SOURCE_DIR}/tests/harden_groups_test.sh)
 add_test(NAME merge_accounts COMMAND sh ${CMAKE_SOURCE_DIR}/tests/merge_accounts_test.sh)
 add_test(NAME lock_root_password COMMAND sh ${CMAKE_SOURCE_DIR}/tests/lock_root_password_test.sh)
+add_test(NAME local_system_ids COMMAND sh ${CMAKE_SOURCE_DIR}/tests/local_system_ids_test.sh)
 add_test(NAME release_sign COMMAND sh ${CMAKE_SOURCE_DIR}/tests/release_sign_test.sh)
 set_tests_properties(release_sign PROPERTIES SKIP_RETURN_CODE 77)
 # engine#1564: which files the copyright gate looks at -- a staged file is seen, an untracked one is seen (that is why

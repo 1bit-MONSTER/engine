@@ -229,6 +229,12 @@ sh /recipe/lock-root-password.sh "$skeleton/etc/shadow" || {
     echo "build: REFUSED: could not replace the default root password" >&2; exit 1; }
 echo "   ok: root has no usable password (console autologin and ssh keys only)"
 
+# The box's own system accounts (useradd -r) get ids 800-899, a range the image's system accounts never use (they sit
+# at 999 down), so an image that adds a system account later cannot collide with one a box made (engine#3555 review).
+sh /recipe/local-system-ids.sh "$skeleton/etc" || {
+    echo "build: REFUSED: could not give the box's system accounts their own id range" >&2; exit 1; }
+echo "   ok: useradd -r on a box allocates 800-899"
+
 # tty1 login: inittab respawns `plogin`, whose tail is `exec getty -n -l /bin/autologin`. On the
 # 2026-11-02 board boot that chain left no prompt on tty1 while the same image gave one in QEMU, and a
 # console-only machine whose console has nothing to log into is unreachable rather than headless. The entry
@@ -522,23 +528,37 @@ compgen -G "sandbox3/build/*.sfs" > /dev/null || {
 echo "== root password and privileged groups in every layer that carries account files"
 for f in sandbox3/build/*.sfs; do
     rf=$(unsquashfs -q -cat "$f" etc/shadow 2> /dev/null | awk -F: '$1 == "root" { print ($2 == "" ? "E" : substr($2, 1, 1)); exit }')
-    case $rf in ''|'*'|'!') continue ;; esac
+    ids=ok                                          # a login.defs without the box's 800-899 range needs the repack too
+    if unsquashfs -q -cat "$f" etc/login.defs > /tmp/1bit-login.defs 2> /dev/null; then
+        grep -Eq '^SYS_UID_MIN[[:space:]]+800$' /tmp/1bit-login.defs && grep -Eq '^SYS_GID_MAX[[:space:]]+899$' /tmp/1bit-login.defs || ids=fix
+    fi
+    case $rf in ''|'*'|'!') [ "$ids" = ok ] && continue ;; esac
     comp=$(unsquashfs -s "$f" 2> /dev/null | sed -n 's/^Compression //p' | head -1)
     bs=$(unsquashfs -s "$f" 2> /dev/null | sed -n 's/^Block size //p' | head -1)
     [ -n "$comp" ] && [ -n "$bs" ] || { echo "build: REFUSED: cannot read $(basename "$f")'s compression" >&2; exit 1; }
     lt=/tmp/1bit-layer-$$; rm -rf "$lt"
     unsquashfs -q -n -d "$lt" "$f" || { echo "build: REFUSED: could not unpack $(basename "$f")" >&2; exit 1; }
-    sh /recipe/lock-root-password.sh "$lt/etc/shadow" || { echo "build: REFUSED: could not lock root in $(basename "$f")" >&2; exit 1; }
+    [ ! -f "$lt/etc/shadow" ] || sh /recipe/lock-root-password.sh "$lt/etc/shadow" || { echo "build: REFUSED: could not lock root in $(basename "$f")" >&2; exit 1; }
+    # the range check covers every built layer's accounts (the box sees their union)
+    others=$(for o in sandbox3/build/*.sfs; do [ "$o" = "$f" ] || { od=/tmp/1bit-ids-$$-$(basename "$o"); mkdir -p "$od"
+        unsquashfs -q -cat "$o" etc/passwd > "$od/passwd" 2> /dev/null; unsquashfs -q -cat "$o" etc/group > "$od/group" 2> /dev/null; echo "$od"; }; done)
+    # shellcheck disable=SC2086
+    sh /recipe/local-system-ids.sh "$lt/etc" $others || { echo "build: REFUSED: could not give the box's system accounts their own id range in $(basename "$f")" >&2; exit 1; }
+    rm -rf /tmp/1bit-ids-$$-*
     [ ! -f "$lt/etc/group" ] || sh /recipe/harden-groups.sh "$lt/etc/group" ||
         { echo "build: REFUSED: could not harden $(basename "$f")'s etc/group" >&2; exit 1; }
     mksquashfs "$lt" "$f.new" -comp "$comp" -b "$bs" -no-exports -noappend -quiet > /dev/null &&
         mv -f "$f.new" "$f" || { echo "build: REFUSED: could not repack $(basename "$f")" >&2; exit 1; }
     rm -rf "$lt"
-    echo "   ok: $(basename "$f"): root has no usable password, privileged groups hold only root"
+    echo "   ok: $(basename "$f"): root has no usable password, privileged groups hold only root, the box's system accounts get 800-899"
 done
 for f in sandbox3/build/*.sfs; do
     rf=$(unsquashfs -q -cat "$f" etc/shadow 2> /dev/null | awk -F: '$1 == "root" { print ($2 == "" ? "E" : substr($2, 1, 1)); exit }')
     case $rf in ''|'*'|'!') ;; *) echo "build: REFUSED: $(basename "$f") ships root with a usable password" >&2; exit 1 ;; esac
+    if unsquashfs -q -cat "$f" etc/login.defs > /tmp/1bit-login.defs 2> /dev/null; then
+        grep -Eq '^SYS_UID_MIN[[:space:]]+800$' /tmp/1bit-login.defs && grep -Eq '^SYS_GID_MAX[[:space:]]+899$' /tmp/1bit-login.defs || {
+            echo "build: REFUSED: $(basename "$f")'s etc/login.defs has no 800-899 range for the box's system accounts" >&2; exit 1; }
+    fi
 done
 # the packed initrd has to carry the guard too: patch-init.sh patched the source, this is the archive
 # 3builddistro actually produced, and it is the one mkimage.sh puts on the stick.

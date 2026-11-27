@@ -631,6 +631,8 @@ set_tests_properties(loom_companions PROPERTIES RESOURCE_LOCK route_ports)
 add_test(NAME webapp_proxy_hold_timeout COMMAND sh ${CMAKE_SOURCE_DIR}/tests/webapp_proxy_hold_timeout_test.sh)
 add_test(NAME webapp_update COMMAND sh ${CMAKE_SOURCE_DIR}/tests/webapp_update_test.sh)
 set_tests_properties(webapp_update PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK route_ports)
+add_test(NAME webapp_update_lan COMMAND sh ${CMAKE_SOURCE_DIR}/tests/webapp_update_lan_test.sh)
+set_tests_properties(webapp_update_lan PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK route_ports)
 # RESOURCE_LOCK route_ports: the row starts a fake loopback upstream; the census reads the script and
 # requires the lock on anything that binds one (tests/route_port_lock_test.py).
 set_tests_properties(webapp_proxy_hold_timeout PROPERTIES RESOURCE_LOCK route_ports)

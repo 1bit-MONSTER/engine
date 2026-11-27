@@ -574,7 +574,8 @@ item_update() {
         1 "Check for an update (and install it)" \
         2 "Roll back to the previous version" \
         3 "Update channel: $ch (switch to $( [ "$ch" = test ] && echo stable || echo test))" \
-        4 "Install 1bit OS onto a DIFFERENT disk")
+        4 "Install 1bit OS onto a DIFFERENT disk" \
+        5 "LAN update page: $( [ -s /etc/1bit/update-web.cred ] && echo 'ON (turn it off)' || echo 'off (set a password to turn it on)')")
     case "$c" in
     1)
         t=$(mktemp) || return 1
@@ -607,6 +608,23 @@ Test builds (pre-releases such as v2026.49-rc1) are for trying things out before
             { grep -v '^channel=' "$UPDATE_CONF" 2> /dev/null; echo "channel=$new"; } > "$UPDATE_CONF.new" &&
             mv "$UPDATE_CONF.new" "$UPDATE_CONF" && say "update channel: $new" ;;
     4) item_install_elsewhere ;;
+    5)
+        # OS updater U5b: the LAN page exists only while a password is set (owner decision, 27 Nov)
+        if [ -s /etc/1bit/update-web.cred ]; then
+            confirm "Turn the LAN update page off?
+
+The password is removed and https://<this box>:8444/ stops answering. The local page on this box stays." || return 0
+            "$UPDATE" --web-password-off
+        else
+            confirm "Turn on the LAN update page?
+
+You set a password (at least 12 characters). Then https://<this box>:8444/ - from this network only - lets you sign in
+as root with it and check, install, roll back and reboot. The browser warns about the box's own certificate: the
+next screen shows its SHA-256 to compare." || return 0
+            clear
+            "$UPDATE" --web-password
+            printf '\npress Enter to go back to the menu '; read -r _
+        fi ;;
     *) : ;;
     esac
 }

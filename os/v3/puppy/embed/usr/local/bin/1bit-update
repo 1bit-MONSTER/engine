@@ -23,6 +23,9 @@
 #                                           stable = the newest full release, test = the newest including pre-releases
 #                                           such as v2026.49-rc1). Channel default from /data/1bit/update.conf
 #                                           (channel=stable|test). No network or a rate limit is said, exit 0.
+# 1bit-update --web-password                set the LAN update page's password (root; asked twice, at least 12 characters):
+#                                           the page at https://<box>:8444/ exists only while one is set (owner, 27 Nov)
+# 1bit-update --web-password-off            remove it: the LAN update page and its firewall opening go away
 # 1bit-update --latest [--channel ..] [--download-only]   fetch the channel's newest release into /data/updates/<tag>/,
 #                                           verify its SIGNED SHA256SUMS (release key, /etc/1bit/release-pub) and the
 #                                           image's sha256, then install it into the other slot like an image path.
@@ -580,6 +583,8 @@ while [ $# -gt 0 ]; do
         --status) mode=status ;;
         --shadowed) mode=shadowed ;;
         --rollback) mode=rollback ;;
+        --web-password) mode=webpw ;;
+        --web-password-off) mode=webpwoff ;;
         --no-verify) novfy=1 ;;
         /*) src=$1 ;;
         *) usage >&2; exit 1 ;;
@@ -594,6 +599,33 @@ trap 'work_done' EXIT
 if [ "$mode" = check ]; then update_check "$channel"; exit 0; fi
 
 [ "$(id -u)" = 0 ] || die "run as root (it writes the other slot and the ESP)"
+# OS updater U5b: the LAN update page's credential. The page exists only while one is set (owner decision, 27 Nov);
+# setting or removing it re-runs the port policy (tcp/8444, private ranges only) and restarts the page's proxy.
+if [ "$mode" = webpw ] || [ "$mode" = webpwoff ]; then
+    if [ "$mode" = webpw ]; then
+        [ -t 0 ] || die "--web-password asks for the password on a terminal"
+        printf 'LAN update password (at least 12 characters; you sign in as root with it): '
+        stty -echo; IFS= read -r pw1; stty echo; echo
+        printf 'the same again: '
+        stty -echo; IFS= read -r pw2; stty echo; echo
+        printf '%s\n%s\n' "$pw1" "$pw2" | /usr/local/bin/1bit-webapp-proxy --set-update-password || die "the password was not set"
+        unset pw1 pw2
+    else
+        [ -e /etc/1bit/update-web.cred ] || { say "1bit-update: no LAN update password is set: there is no LAN update page"; exit 0; }
+        rm -f /etc/1bit/update-web.cred && say "1bit-update: LAN update password removed"
+    fi
+    sh /etc/init.d/zz-onboard-ports > /dev/null 2>&1 || say "   WARNING: the port policy (zz-onboard-ports) did not re-run"
+    sh /etc/init.d/24onboard-webapp restart > /dev/null 2>&1 || say "   WARNING: the page's proxy did not restart"
+    sleep 2
+    if [ "$mode" = webpw ]; then
+        fp=$(openssl x509 -in /etc/1bit/update-web.crt -noout -fingerprint -sha256 2> /dev/null | sed 's/^.*=//')
+        say "LAN update page: https://<this box>:8444/  (sign in as root; certificate SHA-256 ${fp:-unknown})"
+        say "  the browser warns about the self-signed certificate: compare its SHA-256 with the line above"
+    else
+        say "the LAN update page is gone; the local one (http://127.0.0.1:8081/) stays"
+    fi
+    exit 0
+fi
 [ -d "$DATA" ] && grep -q " $DATA " /proc/mounts 2> /dev/null || die "no $DATA: this is not an installed system"
 [ -e "$DATA/.installed" ] || die "no $DATA/.installed: this is a live stick, not an installed machine (a stick is replaced by writing the next image, it is not updated in place)"
 # --latest: the verified download becomes the image path of an ordinary install (the running slot is never touched)

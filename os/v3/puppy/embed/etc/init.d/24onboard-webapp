@@ -36,6 +36,30 @@ PROXY=/usr/local/bin/1bit-webapp-proxy
     echo "24onboard-webapp: $PROXY is missing, the chat screen is not served" > /dev/ttyS0 2> /dev/null; exit 0; }
 command -v python3 > /dev/null 2>&1 || {
     echo "24onboard-webapp: no python3, the chat screen is not served" > /dev/ttyS0 2> /dev/null; exit 0; }
+# restart (1bit-update --web-password / --web-password-off): stop the running proxy first - by PID, each one's
+# /proc cmdline checked, never by a pattern match - so the next one starts (or no longer starts) the LAN listener
+case "${1:-start}" in
+    stop|restart)
+        for p in /proc/[0-9]*; do
+            c=$(tr '\0' ' ' < "$p/cmdline" 2> /dev/null) || continue
+            case "$c" in *python3*" $PROXY"|*python3*" $PROXY "*) kill "${p#/proc/}" 2> /dev/null ;; esac
+        done
+        [ "$1" = stop ] && exit 0
+        sleep 1 ;;
+esac
+# OS updater U5b: the LAN update page exists only while an update credential is set; it needs a certificate, made
+# here once (self-signed P-256, ten years; the key root-only) and named on the console by its fingerprint, which is
+# what a person compares with the one the browser shows the first time
+CRED=/etc/1bit/update-web.cred CRT=/etc/1bit/update-web.crt KEY=/etc/1bit/update-web.key
+if [ -s "$CRED" ] && { [ ! -s "$CRT" ] || [ ! -s "$KEY" ]; }; then
+    ( umask 077; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 -subj "/CN=1bit-os" \
+        -keyout "$KEY" -out "$CRT" > /dev/null 2>&1 ) && chmod 600 "$KEY" && chmod 644 "$CRT" ||
+        echo "24onboard-webapp: could not make the LAN update page's certificate (openssl)" > /dev/ttyS0 2> /dev/null
+fi
+if [ -s "$CRED" ] && [ -s "$CRT" ]; then
+    fp=$(openssl x509 -in "$CRT" -noout -fingerprint -sha256 2> /dev/null | sed 's/^.*=//')
+    echo "24onboard-webapp: LAN update page https://<this box>:8444/ (sign in as root), certificate SHA-256 $fp" > /dev/ttyS0 2> /dev/null
+fi
 ONEBIT_WEBAPP_PORT=$PORT setsid "$PROXY" > /var/log/1bit-webapp.log 2>&1 < /dev/null &
 echo "24onboard-webapp: serving $APP on 127.0.0.1:$PORT (key injected for /api/)" > /dev/ttyS0 2> /dev/null
 exit 0

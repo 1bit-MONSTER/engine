@@ -15,16 +15,20 @@
 # limitations under the License.
 #
 # coder-llm-window: the PR reviewer's model in on-demand box-hold windows (see /usr/local/bin/coder-llm-window).
-# No systemd on this image: a detached supervisor loop as bcloud is the restart policy (engine#1504: a runner or
-# service that dies must come back). Stop: /etc/init.d/51coder-llm-window stop.
+# No systemd on this image: a detached supervisor loop is the restart policy (engine#1504: a runner or service that dies
+# must come back). Stop: /etc/init.d/51coder-llm-window stop.
+# It runs as ghrunner, the PR-Agent runner's account (orchestrator 2026-11-27): box-hold honours BOX_HOLD_PRIORITY=ci only
+# for real CI - a GitHub Actions job or the runner account - so the reviewer's window is in the CI class only as ghrunner.
+# ghrunner is in `render` for /dev/kfd and renderD* (99-1bit-kfd-render.rules) and owns /data/logs/coder-llm; the demand
+# file is in its own home. A clean environment (env -i), as the runner gets.
 case "${1:-start}" in
   start)
     pgrep -f "coder-llm-window-supervisor" > /dev/null 2>&1 && exit 0
-    su bcloud -s /bin/sh -c 'setsid nohup bash -c "exec -a coder-llm-window-supervisor bash -c \"while :; do /usr/local/bin/coder-llm-window watch; sleep 15; done\"" > /dev/null 2>&1 < /dev/null &'  > /dev/null 2>&1 < /dev/null
+    su ghrunner -s /bin/sh -c 'env -i HOME=/var/lib/ghrunner USER=ghrunner LANG=en_US.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin setsid nohup bash -c "exec -a coder-llm-window-supervisor bash -c \"while :; do /usr/local/bin/coder-llm-window watch; sleep 15; done\"" > /dev/null 2>&1 < /dev/null &'  > /dev/null 2>&1 < /dev/null
     ;;
   stop)
     kill $(pgrep -f "coder-llm-window-supervisor") 2>/dev/null
-    su bcloud -s /bin/sh -c '/usr/local/bin/coder-llm-window stop'
+    su ghrunner -s /bin/sh -c '/usr/local/bin/coder-llm-window stop'
     ;;
 esac
 exit 0

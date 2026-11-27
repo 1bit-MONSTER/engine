@@ -836,6 +836,15 @@ add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_ben
 add_python_test(hyperloom_box_ticket_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_box_ticket_test.py)
 # the screen cache (tools/hyperloom/screen.sh + hl_screen_hit): one ticket screens a lever batch, rounds read it
 add_python_test(hyperloom_screen_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_screen_test.py)
+# Both start the fake loom-serve through box_inkling.sh, which takes the first FREE port from 18400 (probe, then bind):
+# run in parallel (ctest -j in CI) both rounds can probe the same port before either server binds it, and one round's
+# curls then reach the OTHER test's server -- "a model that never registers" read a healthy one and the RAM guard
+# watched the wrong process (main red after 2a43f279, runs 46023617984 / 46024778642). One lock, never concurrent.
+foreach(_hl_t hyperloom_box_ticket_test hyperloom_screen_test)
+    if(TEST ${_hl_t})
+        set_tests_properties(${_hl_t} PROPERTIES RESOURCE_LOCK hyperloom_loom_port)
+    endif()
+endforeach()
 add_python_test(hyperloom_inkling_score_self ${CMAKE_SOURCE_DIR}/tools/hyperloom/inkling-loom/hl_score.py --self-test)
 # engine#L5 (LOOM-GPU-SWITCH): the Loom toolchain pin is three facts that are only true together -- the hrx-system
 # commit, the hrx_loom version that commit declares, and the hrx-loom-library catalog commit the same file names.

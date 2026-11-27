@@ -542,6 +542,15 @@ int main() {
         check("every shipped entry links its #3158 gate record", gated);
     }
 
+    {   // engine#3562 review: the fix a person is told about for a missing companion origin
+        const std::string box = loom::companion_fix_hint("1bit-MONSTER/Inkling-2-Mini-MXFP8-experts", true);
+        check("on 1bit OS (1bit-loom-companions present) the refusal names the box's own fetcher, not a pull",
+              box.find("1bit-loom-companions --status") != std::string::npos && box.find("pull ") == std::string::npos);
+        check("elsewhere it names the repository to pull",
+              loom::companion_fix_hint("org/repo", false) == ": pull org/repo");
+        check("with no repository and no fetcher it adds nothing", loom::companion_fix_hint("", false).empty());
+    }
+
     std::printf("%s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

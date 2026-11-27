@@ -321,6 +321,17 @@ inline std::string loom_card_model_id(const std::string& card, std::string& why)
 // the card's name is about to be replaced, and a catalogue pull takes the repo's head. The route's sha256 match covers
 // the main model only; loom-fetch would check the lock, but the appliance links instead of fetching. Size only (no
 // hashing at serve start): a different layout is a different size.
+// What a person does about a companion origin's missing weights (engine#3562 review): on 1bit OS no command pulls a
+// companion repository - Lemonade's pull fetches only the checkpoint - and 1bit-loom-companions (engine#3561) fetches
+// it, pinned and sha256-checked, within 5 minutes of the model's pull; elsewhere the repository is pulled by hand.
+// Pure: the caller says whether that tool is on this machine.
+inline std::string companion_fix_hint(const std::string& repo, bool fetcher_on_box) {
+    if (fetcher_on_box)
+        return ": this box fetches it (1bit-loom-companions, every 5 minutes once the model is pulled) - "
+               "`1bit-loom-companions --status` says where it is, `--once` fetches it now";
+    return repo.empty() ? std::string() : ": pull " + repo;
+}
+
 inline int loom_link_card_parameters(const std::string& card_model_json, const std::string& model_path, std::string& why,
                                      bool* refused = nullptr) {
     namespace fs = std::filesystem;
@@ -528,7 +539,7 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
                 why += std::string(why.empty() ? "" : "; ") + origin +
                        (want != lock_size.end() ? " (" + std::to_string(want->second) + " B)" : std::string()) +
                        (present ? " has another size than the card's lock" : " is not linked at " + f.string()) +
-                       (repo.empty() ? std::string() : ": pull " + repo);
+                       companion_fix_hint(repo, fs::exists("/usr/local/bin/1bit-loom-companions", fec));
                 if (refused) *refused = true;
             });
         }

@@ -321,6 +321,18 @@ inline std::string loom_card_model_id(const std::string& card, std::string& why)
 // the card's name is about to be replaced, and a catalogue pull takes the repo's head. The route's sha256 match covers
 // the main model only; loom-fetch would check the lock, but the appliance links instead of fetching. Size only (no
 // hashing at serve start): a different layout is a different size.
+// What a person does about a companion origin's missing weights (engine#3562 review): on 1bit OS no command pulls a
+// companion repository - Lemonade's pull fetches only the checkpoint - and 1bit-loom-companions (engine#3561) fetches
+// it, pinned and sha256-checked, within 5 minutes of the model's pull; elsewhere the repository is pulled by hand.
+// Pure: the caller says whether that tool is on this machine.
+inline std::string companion_fix_hint(const std::string& repo, bool fetcher_on_box) {
+    if (repo.empty()) return std::string();       // nothing to name, nothing to say (either branch)
+    if (fetcher_on_box)                           // review cl-pragent: say WHICH companion in both branches
+        return ": " + repo + " is fetched by this box (1bit-loom-companions, every 5 minutes once the model is pulled) - "
+               "`1bit-loom-companions --status` says where it is, `--once` fetches it now";
+    return ": pull " + repo;
+}
+
 inline int loom_link_card_parameters(const std::string& card_model_json, const std::string& model_path, std::string& why,
                                      bool* refused = nullptr) {
     namespace fs = std::filesystem;
@@ -336,11 +348,22 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
                    model_dir = (abs_ec ? fs::path(model_path) : model_abs).parent_path();
     std::map<std::string, std::uintmax_t> lock_size;   // origin -> size, from the card's own lock (absent lock: no check)
     std::map<std::string, std::string> lock_sha;        // origin -> sha256, same lock
+    std::map<std::string, std::string> lock_rev;        // origin NAME (e.g. "mxfp8") -> the revision the lock pinned
     {
         std::ifstream lin(card_dir / "model.json.lock", std::ios::binary);
         if (lin) {
             try {
                 const json lk = json::parse(lin);
+                if (lk.contains("origins") && lk["origins"].is_object())   // origin name -> the revision the lock pinned
+                    for (const auto& ov : lk["origins"].items()) {
+                        const json& o = ov.value();
+                        const json* rv = nullptr;
+                        if (o.is_object() && o.contains("resolved") && o["resolved"].is_object() && o["resolved"].contains("revision"))
+                            rv = &o["resolved"]["revision"];
+                        else if (o.is_object() && o.contains("requested") && o["requested"].is_object() && o["requested"].contains("revision"))
+                            rv = &o["requested"]["revision"];
+                        if (rv && rv->is_string()) lock_rev[ov.key()] = rv->get<std::string>();
+                    }
                 if (lk.contains("files") && lk["files"].is_array())
                     for (const auto& f : lk["files"])
                         if (f.is_object() && f.contains("origin") && f["origin"].is_string() && f.contains("size") &&
@@ -503,16 +526,20 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
                     std::string cache = repo;
                     for (std::string::size_type at = cache.find('/'); at != std::string::npos; at = cache.find('/', at + 2))
                         cache.replace(at, 1, "--");
-                    std::vector<fs::path> cands;
-                    std::error_code dec;
-                    for (fs::directory_iterator it(hub / ("models--" + cache) / "snapshots", dec), end; !dec && it != end; it.increment(dec))
-                        if (sized_ok(it->path() / name)) cands.push_back(it->path() / name);
+                    // review (cl-release): size alone is a weak identity (a re-quantised companion keeps its shapes), so the
+                    // lock's OWN revision snapshot is taken on its size; a file in ANY OTHER snapshot (a pull by `main`) only
+                    // when its sha256 equals the lock's - one candidate or several - and never when the lock has no sha256
+                    const fs::path snaps = hub / ("models--" + cache) / "snapshots";
                     fs::path pick;
-                    if (cands.size() == 1) pick = cands[0];
-                    else if (cands.size() > 1) {
-                        const auto sh = lock_sha.find(origin);
-                        for (const auto& c : cands)
-                            if (sh != lock_sha.end() && sha256_of_file(c.string()) == sh->second) { pick = c; break; }
+                    if (const auto rv = lock_rev.find(oname); rv != lock_rev.end() && sized_ok(snaps / rv->second / name))
+                        pick = snaps / rv->second / name;
+                    else if (const auto sh = lock_sha.find(origin); sh != lock_sha.end()) {
+                        std::error_code dec;
+                        for (fs::directory_iterator it(snaps, dec), end; !dec && it != end; it.increment(dec))
+                            if (sized_ok(it->path() / name) && sha256_of_file((it->path() / name).string()) == sh->second) {
+                                pick = it->path() / name;
+                                break;
+                            }
                     }
                     if (!pick.empty()) {
                         std::error_code lec;
@@ -528,7 +555,7 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
                 why += std::string(why.empty() ? "" : "; ") + origin +
                        (want != lock_size.end() ? " (" + std::to_string(want->second) + " B)" : std::string()) +
                        (present ? " has another size than the card's lock" : " is not linked at " + f.string()) +
-                       (repo.empty() ? std::string() : ": pull " + repo);
+                       companion_fix_hint(repo, fs::exists("/usr/local/bin/1bit-loom-companions", fec));
                 if (refused) *refused = true;
             });
         }

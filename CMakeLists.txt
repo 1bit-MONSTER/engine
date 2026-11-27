@@ -835,6 +835,17 @@ add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_ben
 # round is ONE box-hold ticket on strixhalo over ssh. The end-to-end test stubs ssh/box-hold/sudo and loom-serve, so the lever
 # validation, the ticket wiring, the gauntlet and the fail-closed gate are all exercised without a device.
 add_python_test(hyperloom_box_ticket_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_box_ticket_test.py)
+# the screen cache (tools/hyperloom/screen.sh + hl_screen_hit): one ticket screens a lever batch, rounds read it
+add_python_test(hyperloom_screen_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_screen_test.py)
+# Both start the fake loom-serve through box_inkling.sh, which takes the first FREE port from 18400 (probe, then bind):
+# run in parallel (ctest -j in CI) both rounds can probe the same port before either server binds it, and one round's
+# curls then reach the OTHER test's server -- "a model that never registers" read a healthy one and the RAM guard
+# watched the wrong process (main red after 2a43f279, runs 46023617984 / 46024778642). One lock, never concurrent.
+foreach(_hl_t hyperloom_box_ticket_test hyperloom_screen_test)
+    if(TEST ${_hl_t})
+        set_tests_properties(${_hl_t} PROPERTIES RESOURCE_LOCK hyperloom_loom_port)
+    endif()
+endforeach()
 add_python_test(hyperloom_inkling_score_self ${CMAKE_SOURCE_DIR}/tools/hyperloom/inkling-loom/hl_score.py --self-test)
 # engine#L5 (LOOM-GPU-SWITCH): the Loom toolchain pin is three facts that are only true together -- the hrx-system
 # commit, the hrx_loom version that commit declares, and the hrx-loom-library catalog commit the same file names.
@@ -1038,6 +1049,9 @@ add_test(NAME fetch_private_ssh COMMAND bash ${CMAKE_SOURCE_DIR}/tests/fetch_pri
 # the 1bit OS appliance: GPU steps and NPU phases queue with box-hold (one ticket each, lock fds closed in the step), the
 # repo gpu-hold wrapper is skipped, and a gate already inside a box-hold ticket does not re-queue. Stubs only, no device.
 add_test(NAME hw_gate_box_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_box_hold_test.sh)
+# hw-gate keeps ONE box-hold ticket across consecutive GPU steps while they fit in 45 min (run 46014683686 lost the GPU to a
+# lane between two steps). The held-ticket helpers, extracted from the script, against the real appliance box-hold. No device.
+add_test(NAME hw_gate_held_ticket COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_held_ticket_test.sh)
 # hrx-build's device rows (fork_ctest_known_fail) take a box-hold gpu ticket on the appliance (the runner can open /dev/kfd
 # since 2026-11-26). The step's snippet is extracted from the workflow and run with stub box-hold and ctest. No device.
 add_test(NAME hrx_build_box_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hrx_build_box_hold_test.sh)

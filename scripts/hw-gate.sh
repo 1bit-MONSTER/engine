@@ -149,6 +149,62 @@ if [ -n "$BOX_HOLD" ] && box_hold_ancestor; then BOX_HOLD=""; BOX_HOLD_OUTER=1; 
 BOX_HOLD_WAIT_S=${HW_GATE_BOX_HOLD_WAIT:-10800}
 # one box-hold ticket for "$@": <gpu|npu> <label> <minutes> <cmd...>. rc 4 = the lock never came round (box-hold's own
 # code); a step that outlives its ticket ends 124 (timeout's), its children KILLed 30 s after the TERM.
+# ONE ticket across consecutive GPU steps (orchestrator, 27 Nov). Measured on run 46014683686: in the ~1 s between one
+# step's ticket ending and the next one's being queued, the lane at the head of the queue took the GPU, so every GPU
+# phase could wait out a 45-min lane ticket and the gate ran past its job timeout. Now gpu() holds one ticket while the
+# steps fit: a background `box-hold gpu` whose command is a holder that only waits (it closes the lock descriptors, so
+# only box-hold's own shell holds the lock, and it ends when the gate removes its keep file or the gate is gone). The
+# steps run in the gate, never inside box-hold, so a killed or leftover step holds no lock descriptor. Before each step:
+# if the time already held + this step's estimate + a margin does not fit in the ticket, the ticket is released and a
+# new one taken (at the back of the CI class). Each step runs under `timeout` for the time left on its ticket, so it
+# cannot outlive the lock. The estimate is max(HW_GATE_STEP_EST_S, the longest step this run has measured).
+HELD_PID="" HELD_T0=0 HELD_DIR="" HELD_MAX_STEP=0
+HOLD_S=${HW_GATE_HOLD_SECONDS:-$(( ${HW_GATE_HOLD_MINUTES:-45} * 60 ))}
+HOLD_MARGIN_S=${HW_GATE_HOLD_MARGIN_S:-60}
+hold_release() {
+    [ -n "$HELD_PID" ] || return 0
+    rm -f "$HELD_DIR/keep"
+    wait "$HELD_PID" 2> /dev/null
+    HELD_PID="" HELD_T0=0
+    rm -rf "$HELD_DIR"; HELD_DIR=""
+}
+hold_acquire() {   # -> 0 held, 4 the lock never came round (box-hold's code), other: box-hold could not run
+    local rc
+    HELD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/hw-gate-hold.XXXXXX") || return 3
+    : > "$HELD_DIR/keep"
+    BOX_HOLD_WAIT=$BOX_HOLD_WAIT_S BOX_HOLD_WHO="hw-gate${GITHUB_RUN_ID:+ run $GITHUB_RUN_ID} pid $$" \
+        BOX_HOLD_PRIORITY=${HW_GATE_BOX_HOLD_PRIORITY:-${GITHUB_RUN_ID:+ci}} \
+        "$BOX_HOLD" gpu timeout -k 5 "$HOLD_S" sh -c 'exec 8>&- 9>&-; : > "$1/granted"
+            while [ -e "$1/keep" ] && kill -0 "$2" 2> /dev/null; do sleep 1; done' box-hold-holder "$HELD_DIR" "$$" &
+    HELD_PID=$!
+    while [ ! -e "$HELD_DIR/granted" ]; do
+        if ! kill -0 "$HELD_PID" 2> /dev/null; then
+            wait "$HELD_PID"; rc=$?
+            HELD_PID=""; rm -rf "$HELD_DIR"; HELD_DIR=""
+            return "$rc"
+        fi
+        sleep 1
+    done
+    HELD_T0=$(date +%s)
+    return 0
+}
+# hold_for <estimate s>: make sure a ticket is held with room for a step of that length; sets HOLD_BUDGET to the seconds
+# the step may run (the time left on the ticket minus the margin). Returns hold_acquire's code when no ticket could be
+# taken. Not in $(...): the held ticket's state must stay in this shell, and a subshell would wait on the holder.
+HOLD_BUDGET=0
+hold_for() {
+    local est=$1 left rc
+    [ "$HELD_MAX_STEP" -gt "$est" ] && est=$HELD_MAX_STEP
+    if [ -n "$HELD_PID" ]; then
+        left=$(( HOLD_S - ($(date +%s) - HELD_T0) - HOLD_MARGIN_S ))
+        if [ "$left" -lt "$est" ] || ! kill -0 "$HELD_PID" 2> /dev/null; then hold_release; fi
+    fi
+    if [ -z "$HELD_PID" ]; then
+        hold_acquire; rc=$?
+        [ "$rc" = 0 ] || return "$rc"
+    fi
+    HOLD_BUDGET=$(( HOLD_S - ($(date +%s) - HELD_T0) - HOLD_MARGIN_S ))
+}
 box_ticket() {
     local dev=$1 label=$2 minutes=$3; shift 3
     BOX_HOLD_WAIT=$BOX_HOLD_WAIT_S BOX_HOLD_WHO="$label${GITHUB_RUN_ID:+ run $GITHUB_RUN_ID} pid $$" BOX_HOLD_PRIORITY=${HW_GATE_BOX_HOLD_PRIORITY:-${GITHUB_RUN_ID:+ci}} \
@@ -466,7 +522,7 @@ release_token() {
   fi
   TOKEN_HELD=""
 }
-trap release_token EXIT
+trap 'release_token; hold_release' EXIT
 trap 'exit 143' TERM INT HUP   # so a killed run (timeout, CI cancel) still releases it
 
 # run "$@" on the GPU: hold the GPU token, wait for coder-llm, run it under mem-guard + thermal-run
@@ -486,14 +542,20 @@ gpu() {
   export HW_GATE_STAMP=$OUT/.stamp
   rm -f "$HW_GATE_STAMP"
   while :; do
-    local ticket=()   # on the appliance each GPU step is its own box-hold ticket (see BOX_HOLD)
-    [ -n "$BOX_HOLD" ] && ticket=(box_ticket gpu hw-gate "${HW_GATE_HOLD_MINUTES:-45}")
+    local ticket=() budget s0   # on the appliance the steps share one held box-hold ticket (see hold_for)
+    if [ -n "$BOX_HOLD" ]; then
+      hold_for "${HW_GATE_STEP_EST_S:-600}"; rc=$?; budget=$HOLD_BUDGET
+      if [ $rc = 4 ]; then
+        result gpu-token SKIP "$BOX_HOLD_WAIT_S" "box-hold: the GPU lock did not come round in ${BOX_HOLD_WAIT_S}s (box-hold printed the holder above)"
+        exit 2
+      fi
+      [ $rc = 0 ] || { result gpu-token SKIP 0 "box-hold could not take a ticket (rc $rc)"; exit 2; }
+      ticket=(timeout -k 30 "$budget")
+    fi
+    s0=$(date +%s)
     "${ticket[@]}" "$0" --cool --mem "${GPU_MODEL:--}" "$ROOT/scripts/mem-guard.sh" --term "$MEM_FLOOR" "$THERMAL" "$@"
     rc=$?
-    if [ -n "$BOX_HOLD" ] && [ $rc = 4 ]; then
-      result gpu-token SKIP "$BOX_HOLD_WAIT_S" "box-hold: the GPU lock did not come round in ${BOX_HOLD_WAIT_S}s (box-hold printed the holder above)"
-      exit 2
-    fi
+    [ $(( $(date +%s) - s0 )) -gt "$HELD_MAX_STEP" ] && HELD_MAX_STEP=$(( $(date +%s) - s0 ))
     # 76: the memory pre-check said no, and the step holds nothing. The gate still holds the GPU token, though,
     # and the jobs whose memory it is waiting for may be queued behind that token: so the token is given back
     # for the wait and taken again before the next try (review of engine#1936). Under the gpu-hold wrapper the
@@ -501,6 +563,7 @@ gpu() {
     [ $rc = 76 ] && [ $tries -lt "${HW_GATE_MEM_RETRIES:-10}" ] || break
     tries=$((tries + 1))
     release_token
+    hold_release   # the held ticket too: the memory those jobs need may be behind it
     sleep "${HW_GATE_MEM_RETRY_SLEEP:-60}"
     if ! take_token; then
       result gpu-token SKIP "$TOKEN_WAIT" "$TOKEN held by another job for ${TOKEN_WAIT}s: $(cat "$TOKEN" 2> /dev/null)"
@@ -961,6 +1024,7 @@ if has npu; then
     if [ "${HW_GATE_NPU_HOLD:-1}" != 0 ] && [ -n "$NPU_HOLD" ] && ! token_held_by_ancestor "$NPU_TOKEN"; then
         hold_args=("$NPU_HOLD" -l hw-gate-npu -t "${HW_GATE_NPU_HOLD_MINUTES:-20}" -w "$LOCK_WAIT" --)
     elif [ -n "$BOX_HOLD" ]; then
+        hold_release   # box-hold takes both locks: a GPU ticket still held by this gate would block its own NPU ticket
         hold_args=(box_ticket npu hw-gate-npu "${HW_GATE_NPU_HOLD_MINUTES:-20}")
     fi
     "${hold_args[@]}" flock -w "$LOCK_WAIT" -E 75 "$LOCK" sh -c "$HW_GATE_NPU_CHECK" > "$log" 2>&1
@@ -1006,6 +1070,7 @@ if has npuserve; then
     if [ "${HW_GATE_NPU_HOLD:-1}" != 0 ] && [ -n "$NPU_HOLD" ] && ! token_held_by_ancestor "$NPU_TOKEN"; then
         hold_args=("$NPU_HOLD" -l hw-gate-npuserve -t "${HW_GATE_NPU_HOLD_MINUTES:-20}" -w "$LOCK_WAIT" --)
     elif [ -n "$BOX_HOLD" ]; then
+        hold_release   # box-hold takes both locks: a GPU ticket still held by this gate would block its own NPU ticket
         hold_args=(box_ticket npu hw-gate-npuserve "${HW_GATE_NPU_HOLD_MINUTES:-20}")
     fi
     "${hold_args[@]}" flock -w "$LOCK_WAIT" -E 75 "$LOCK" python3 "$smoke" --bin "$HW_GATE_NPU_SERVE_BIN" \

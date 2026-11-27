@@ -63,9 +63,10 @@ fn=$tmp/fn.sh
 for f in box_hold_ancestor box_ticket; do sed -n "/^$f() {/,/^}/p" "$gate"; done > "$fn"
 grep -q '^box_ticket() {' "$fn" && grep -q '^box_hold_ancestor() {' "$fn" || { echo "FAIL: the helpers are no longer where this test finds them"; exit 1; }
 
-# gpu() routes its one step call through the ticket when box-hold is present (text-level: gpu() needs a build to run)
+# gpu() runs its one step call inside the held ticket when box-hold is present (text-level: gpu() needs a build to run;
+# tests/hw_gate_held_ticket_test.sh drives the held ticket itself)
 body=$(sed -n '/^gpu() {/,/^}/p' "$gate")
-case "$body" in *'ticket=(box_ticket gpu hw-gate'*'"${ticket[@]}" "$0" --cool'*) ok "gpu() runs its step through box_ticket" ;; *) bad "gpu() does not route its step through box_ticket" ;; esac
+case "$body" in *'hold_for "${HW_GATE_STEP_EST_S:-600}"'*'ticket=(timeout -k 30 "$budget")'*'"${ticket[@]}" "$0" --cool'*) ok "gpu() runs its step inside the held box-hold ticket, under the ticket's time left" ;; *) bad "gpu() does not route its step through hold_for" ;; esac
 grep -q 'hold_args=(box_ticket npu hw-gate-npu ' "$gate" && grep -q 'hold_args=(box_ticket npu hw-gate-npuserve ' "$gate" \
   && ok "npu and npuserve phases take a box-hold npu ticket" || bad "an NPU phase has no box-hold ticket"
 

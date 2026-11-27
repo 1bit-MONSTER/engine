@@ -1037,6 +1037,9 @@ add_test(NAME fetch_private_ssh COMMAND bash ${CMAKE_SOURCE_DIR}/tests/fetch_pri
 # the 1bit OS appliance: GPU steps and NPU phases queue with box-hold (one ticket each, lock fds closed in the step), the
 # repo gpu-hold wrapper is skipped, and a gate already inside a box-hold ticket does not re-queue. Stubs only, no device.
 add_test(NAME hw_gate_box_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_box_hold_test.sh)
+# hw-gate keeps ONE box-hold ticket across consecutive GPU steps while they fit in 45 min (run 46014683686 lost the GPU to a
+# lane between two steps). The held-ticket helpers, extracted from the script, against the real appliance box-hold. No device.
+add_test(NAME hw_gate_held_ticket COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_held_ticket_test.sh)
 # hrx-build's device rows (fork_ctest_known_fail) take a box-hold gpu ticket on the appliance (the runner can open /dev/kfd
 # since 2026-11-26). The step's snippet is extracted from the workflow and run with stub box-hold and ctest. No device.
 add_test(NAME hrx_build_box_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hrx_build_box_hold_test.sh)

@@ -43,7 +43,7 @@ case $dev in gpu|npu|both) dev=both ;; *) echo "box-hold: gpu, npu or both" >&2;
 w=${BOX_HOLD_WAIT:-3600}
 poll=${BOX_HOLD_POLL:-2}
 Q=$D/queue; mkdir -p $Q 2>/dev/null; chmod 1777 $Q 2>/dev/null
-(umask 000; touch $D/box-seq.lock $D/box-seq $D/box-hold.log) 2>/dev/null
+(umask 000; touch $D/box-seq.lock $D/box-seq $D/box-hold.log $D/box-last) 2>/dev/null
 starttime() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20; }
 alive() { _p=${1#*.}; _p=${_p%%.*}; _s=${1##*.}; [ -n "$_s" ] && [ "$(starttime "$_p")" = "$_s" ]; }
 under_runner() {   # GITHUB_ACTIONS=true and a Runner.Worker process among this process's ancestors
@@ -121,7 +121,9 @@ if [ "$pfx" = 1- ]; then
     fi
 fi
 me=$pfx$(printf '%012d' "$n").$$.$(starttime $$)
-echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$Q/$me" 2>/dev/null || { echo "box-hold: cannot write $Q/$me" >&2; exit 3; }
+# the second line marks a waiter that knows the alternation rule: only such a lane ticket is preferred after a priority
+# turn (a waiter of an older box-hold copy waits for whatever sorts first, and preferring it would stall the queue)
+printf '%s %s %s\nbox-hold-v3\n' "${BOX_HOLD_WHO:-$(id -un)}" "$(date -u +%FT%TZ)" "$*" > "$Q/$me" 2>/dev/null || { echo "box-hold: cannot write $Q/$me" >&2; exit 3; }
 flock -u 7; exec 7>&-
 trap 'rm -f "$Q/$me"' EXIT
 trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
@@ -131,11 +133,23 @@ exec 9>"$D/box-npu.lock" || { echo "box-hold: cannot open $D/box-npu.lock" >&2; 
 # The head TRIES the locks (flock -n) and looks at the queue again between tries, instead of blocking in flock: a head
 # blocked in `flock -w` never sees a CI ticket that arrives behind it, so the CI class could not be served next.
 while :; do
-    head=""
+    # Alternating classes (2026-11-27 orchestrator, fairness v3): CI and board tickets beat lane tickets, but never twice
+    # in a row while a lane ticket waits - with every PR push queueing a CI or reviewer-window ticket, lanes slipped
+    # backwards (cl-kernel's ticket went from 2nd to 36th). $D/box-last says which class the last granted ticket was:
+    # after a CI/board ticket, the oldest waiting LANE ticket is the head. FIFO within each class is unchanged.
+    first="" lane1=""
     for f in $(ls "$Q" 2>/dev/null | LC_ALL=C sort); do   # C collation: the class prefix must not be ignored
-        if alive "$f"; then head=$f; break; fi
-        rm -f "$Q/$f" 2>/dev/null   # a dead waiter's ticket (another user's stays until its owner or root sweeps it; it is skipped either way)
+        if alive "$f"; then
+            [ -n "$first" ] || first=$f
+            # the oldest lane ticket OF A WAITER THAT KNOWS THIS RULE (marker line): measured 2026-11-27 21:57Z, an older copy's
+            # lane waiter only takes the lock when it sorts first, so preferring it would leave the lock free for nobody
+            case $f in 0-*) ;; *) grep -qx box-hold-v3 "$Q/$f" 2>/dev/null && { lane1=$f; break; } ;; esac
+        else
+            rm -f "$Q/$f" 2>/dev/null   # a dead waiter's ticket (another user's stays until its owner or root sweeps it; it is skipped either way)
+        fi
     done
+    head=$first
+    [ -n "$lane1" ] && [ "$(cat "$D/box-last" 2>/dev/null)" = priority ] && head=$lane1
     if [ "$head" = "$me" ]; then
         if flock -n 8; then
             flock -n 9 && break
@@ -154,6 +168,7 @@ while :; do
 done
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-gpu.who" 2>/dev/null
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-npu.who" 2>/dev/null
+case $me in 0-*) echo priority ;; *) echo lane ;; esac > "$D/box-last" 2>/dev/null   # the class of this turn (alternation)
 # out of the line: the next waiter is head now and waits on the lock; signals behave as before (no deferred trap)
 rm -f "$Q/$me"; trap - EXIT TERM INT HUP
 if [ "$cap" = 1 ]; then

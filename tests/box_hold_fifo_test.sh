@@ -35,6 +35,11 @@
 #  18. a running ticket does not count: the lane's holder + 2 queued -> a 3rd is still queued
 #  19. lanes are separate: another lane, and a dashed lane name from BOX_HOLD_LANES (cl-inkling-npu vs cl-inkling)
 #  20. CI and board tickets are not counted or capped; a label of no cl-/pi- lane is not capped
+#  21. alternation under a stream of CI tickets: lanes waiting + CI tickets queued behind them -> CI, lane, CI, lane...
+#      (lanes progress every other turn; CI never twice in a row while a lane waits); with no lane waiting CI runs back
+#      to back
+#  22. an older copy's lane waiter (its ticket has no box-hold-v3 marker) is NOT preferred after a priority turn: the
+#      next CI ticket runs at once instead of the queue stalling on a waiter that never takes the lock (21:57Z 11-27)
 set -u
 BH=${1:?usage: box_hold_fifo_test.sh <box-hold>}
 T=$(mktemp -d); trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$T"' EXIT
@@ -98,7 +103,7 @@ sh "$BH" gpu sh -c "$(job L2 0.2)" & sleep 0.3
 ci gpu sh -c "$(job C1 0.2)" & sleep 0.3
 ci both sh -c "$(job C2 0.2)" & sleep 0.3
 wait
-[ "$(tr '\n' ' ' < "$T/order")" = "H C1 C2 L1 L2 " ] && ok "CI served next (after the holder, before earlier lanes), FIFO among CI" || bad "CI order: $(tr '\n' ' ' < "$T/order")"
+[ "$(tr '\n' ' ' < "$T/order")" = "H C1 L1 C2 L2 " ] && ok "CI served next after a lane turn, then a lane (alternating), FIFO within each class" || bad "CI order: $(tr '\n' ' ' < "$T/order")"
 [ ! -e "$T/overlap" ] && ok "never two jobs at once with CI in the queue" || bad "overlap seen"
 
 # 7. a dead CI waiter is skipped
@@ -156,7 +161,7 @@ sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb-q38 sh "$BH" gpu sh -c "$(job B1 0.2)" & sleep 0.3
 ci gpu sh -c "$(job C1 0.2)" & sleep 0.3
 wait
-[ "$(tr '\n' ' ' < "$T/order")" = "H C1 B1 L1 " ] && ok "board (cl-lb): after CI, ahead of an earlier lane" || bad "board order: $(tr '\n' ' ' < "$T/order")"
+[ "$(tr '\n' ' ' < "$T/order")" = "H C1 L1 B1 " ] && ok "board (cl-lb): after CI; with alternation the waiting lane goes between them" || bad "board order: $(tr '\n' ' ' < "$T/order")"
 
 # 14. board for another label
 : > "$T/order"
@@ -173,7 +178,7 @@ sh "$BH" gpu sh -c "$(job H 1.8)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 for b in B1 B2 B3; do BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb sh "$BH" gpu sh -c "$(job $b 0.2)" 2>> "$T/err15" & sleep 0.3; done
 wait
-[ "$(tr '\n' ' ' < "$T/order")" = "H B1 B2 L1 B3 " ] && grep -q "already has 2 ticket(s) queued" "$T/err15" \
+[ "$(tr '\n' ' ' < "$T/order")" = "H B1 L1 B2 B3 " ] && grep -q "already has 2 ticket(s) queued" "$T/err15" \
   && ok "at most 2 board tickets queued: the third is a lane, reported" || bad "board quota: $(tr '\n' ' ' < "$T/order") [$(cat "$T/err15")]"
 
 # 16. board cap
@@ -208,6 +213,31 @@ BOX_HOLD_WHO="cl-inkling c" sh "$BH" gpu true 2> "$T/err18"; rc=$?
 [ "$rc" = 0 ] && ! grep -q "lane cap" "$T/err18" && ok "the lane's running ticket does not count: a 3rd queued one is accepted" || bad "running counted: rc $rc [$(cat "$T/err18")]"
 wait
 unset BOX_HOLD_LANES
+
+# 21. alternation: a stream of CI tickets does not starve the lanes
+rm -f "$T/locks/box-last"; : > "$T/order"
+sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.3
+for l in L1 L2 L3; do sh "$BH" gpu sh -c "$(job $l 0.2)" & sleep 0.2; done
+for c in C1 C2 C3 C4; do ci gpu sh -c "$(job $c 0.2)" & sleep 0.2; done
+wait
+[ "$(tr '\n' ' ' < "$T/order")" = "H C1 L1 C2 L2 C3 L3 C4 " ] && ok "a stream of CI tickets: lanes progress every other turn (H C1 L1 C2 L2 C3 L3 C4)" || bad "alternation: $(tr '\n' ' ' < "$T/order")"
+[ ! -e "$T/overlap" ] && ok "  ... never two jobs at once" || bad "overlap seen"
+: > "$T/order"
+sh "$BH" gpu sh -c "$(job H 1)" & sleep 0.3
+for c in C1 C2 C3; do ci gpu sh -c "$(job $c 0.2)" & sleep 0.2; done
+wait
+[ "$(tr '\n' ' ' < "$T/order")" = "H C1 C2 C3 " ] && ok "no lane waiting: CI tickets run back to back" || bad "CI only: $(tr '\n' ' ' < "$T/order")"
+
+# 22. no stall on an older copy's lane waiter
+rm -f "$T/locks/box-last"; : > "$T/order"
+ci gpu sh -c "$(job C0 1)" & sleep 0.3
+sleep 6 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
+echo "cl-old-lane $(date -u +%FT%TZ) x" > "$T/locks/queue/1-$(printf '%012d' 2).$old.$st"   # live, no marker line
+ci gpu sh -c "$(job C1 0.2)" & c1=$!
+s=$(date +%s); wait "$c1"; d=$(( $(date +%s) - s ))
+[ "$(tr '\n' ' ' < "$T/order")" = "C0 C1 " ] && [ "$d" -le 4 ] && ok "an older copy's lane waiter is not preferred: the next CI ticket ran after ${d}s (no stall)" \
+  || bad "stall on an unmarked lane waiter: $(tr '\n' ' ' < "$T/order") after ${d}s"
+kill "$old" 2> /dev/null; wait 2> /dev/null
 
 [ "$fail" = 0 ] && echo "box_hold_fifo: PASS" || echo "box_hold_fifo: FAIL"
 exit "$fail"

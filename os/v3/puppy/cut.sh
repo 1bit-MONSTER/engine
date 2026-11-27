@@ -202,6 +202,13 @@ PY
     sh "$here/harden-groups.sh" "$out/group" || die "could not take the non-root users out of the root-equivalent groups"
     chmod 644 "$out/group"
     printf 'etc/group\t%s\n' "$out/group" >> "$M.os"
+    # the base's /etc/shadow with root's password field '*': the base ships the distribution's default root password,
+    # which is public (su / sudo-with-the-root-password = root for any process). Mode 600 here; the image keeps the
+    # base file's own 0600 root:root (patch-sfs.sh installs a replacement with the target's mode)
+    ( umask 077; sudo -n unsquashfs -q -cat "$bsfs" etc/shadow > "$out/shadow" ) || die "the base SFS has no etc/shadow"
+    sh "$here/lock-root-password.sh" "$out/shadow" || die "could not replace the default root password"
+    chmod 600 "$out/shadow"
+    printf 'etc/shadow\t%s\n' "$out/shadow" >> "$M.os"
     baseid=$(sudo -n unsquashfs -q -cat "$bsfs" etc/1bit/release-identity) || die "the base SFS has no etc/1bit/release-identity"
     hsa=$(echo "$baseid" | grep '^libhsa_sha256=') || die "the base identity names no libhsa_sha256"
     { echo "payload=lemonade-onebit-$tag"; echo "payload_lemond=$plem"; echo "engine_sha256=$esha"

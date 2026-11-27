@@ -1175,6 +1175,26 @@ hold_verdict() {
     esac
 }
 
+# root_password_verdict <root's shadow password field, or the word UNREADABLE>: the image must not ship a usable
+# default root password. The base the cuts are patched from carried the base distribution's public default (an MD5-crypt
+# hash), so su (setuid) or sudo-with-the-root-password made any process root; the image now ships '*' (no password
+# matches; console autologin and key-only ssh keep working). Judges the FORM of the field only and never prints it:
+#   '*' or a '!' prefix  PASS  (no usable password)
+#   a modern hash        PASS  (yescrypt $y$, sha-512 $6$, ...: a password a person set; passwd never writes MD5)
+#   '$1$...' (MD5-crypt) FAIL  (the old images' default form: set your own with passwd, or update)
+#   empty                FAIL  (no password at all: anyone at a login prompt is root)
+# Pure, so --self-test drives it and the row below uses the same code.
+root_password_verdict() {
+    case "${1:-}" in
+        UNREADABLE) printf 'FAIL /etc/shadow could not be read (the release check runs as root)' ;;
+        '')         printf 'FAIL root has NO password at all: anyone at a login prompt is root' ;;
+        '*'*|'!'*)  printf 'PASS root has no usable password (console autologin and ssh keys only)' ;;
+        '$1$'*)     printf 'FAIL root has an MD5-crypt password, the form of the default the images up to v2026.49-rc1 shipped: set your own with passwd, or update' ;;
+        '$'*)       printf 'PASS root has a password a person set (%s hash)' "$(printf '%s' "$1" | cut -d'$' -f2 | cut -c1-4)" ;;
+        *)          printf 'FAIL root has a password field this check does not recognise (a DES hash or a plain value)' ;;
+    esac
+}
+
 # privileged_groups_verdict <group file> <passwd file>: no user but root may be in a group whose members are root in all
 # but name - disk (raw block devices), kmem (kernel memory), shadow (password hashes), root, sudo, wheel - as a listed
 # member or by primary gid. Puppy's base put its desktop user spot (uid 502) in disk and kmem, which undercuts the
@@ -1436,6 +1456,15 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(privileged_groups_verdict "$_pg/g2" "$_pg/p")"                    # Puppy's base: spot in disk
     printf 'root:x:0:0::/root:/bin/sh\neve:x:600:15::/home/eve:/bin/sh\n' > "$_pg/p2"
     check FAIL "$(privileged_groups_verdict "$_pg/g" "$_pg/p2")"                    # kmem as a primary group
+    # root-password: the image's default is '*'; the old default's MD5 form, an empty field and an unreadable file FAIL
+    check PASS "$(root_password_verdict '*')"
+    check PASS "$(root_password_verdict '!')"
+    check PASS "$(root_password_verdict '$y$j9T$abcdefghijkl$mnopqrstuvwxyz0123456789ABCDEFGHIJ')"
+    check PASS "$(root_password_verdict '$6$saltsalt$0123456789')"
+    check FAIL "$(root_password_verdict '$1$saltsalt$0123456789abcdefghij')"
+    check FAIL "$(root_password_verdict '')"
+    check FAIL "$(root_password_verdict UNREADABLE)"
+    check FAIL "$(root_password_verdict 'abXYZ12345678')"
     check FAIL "$(privileged_groups_verdict "$_pg/missing" "$_pg/p")"
     rm -rf "$_pg"
     check FAIL "$(node_verdict 1 '' '' '' '')"                                   # 1bit OS without Node.js
@@ -3450,6 +3479,13 @@ PG=$(privileged_groups_verdict /etc/group /etc/passwd)
 case "$PG" in
     PASS*) pass privileged-groups "${PG#PASS }" ;;
     *)     fail privileged-groups "${PG#FAIL }" ;;
+esac
+# root's password FIELD goes straight into the verdict and is never echoed
+if [ -r /etc/shadow ]; then RP=$(root_password_verdict "$(awk -F: '$1 == "root" { print $2; exit }' /etc/shadow)")
+else RP=$(root_password_verdict UNREADABLE); fi
+case "$RP" in
+    PASS*) pass root-password "${RP#PASS }" ;;
+    *)     fail root-password "${RP#FAIL }" ;;
 esac
 ND=$(node_verdict "$_nd_pup" "$_nd_v" "$_nd_pv" "$_nd_pre" "$_nd_mnt")
 case "$ND" in

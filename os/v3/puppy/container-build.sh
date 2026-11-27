@@ -223,6 +223,12 @@ sh /recipe/harden-groups.sh "$skeleton/etc/group" || {
     echo "build: REFUSED: could not take the non-root users out of the root-equivalent groups" >&2; exit 1; }
 echo "   ok: only root is in disk, kmem, shadow, root, sudo, wheel"
 
+# The base distribution's default root password is public: su (setuid) or sudo with the root password would make any
+# process root. root's field becomes '*' (no password matches; console autologin and key-only ssh keep working).
+sh /recipe/lock-root-password.sh "$skeleton/etc/shadow" || {
+    echo "build: REFUSED: could not replace the default root password" >&2; exit 1; }
+echo "   ok: root has no usable password (console autologin and ssh keys only)"
+
 # tty1 login: inittab respawns `plogin`, whose tail is `exec getty -n -l /bin/autologin`. On the
 # 2026-11-02 board boot that chain left no prompt on tty1 while the same image gave one in QEMU, and a
 # console-only machine whose console has nothing to log into is unreachable rather than headless. The entry

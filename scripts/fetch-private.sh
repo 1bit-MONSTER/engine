@@ -25,6 +25,12 @@
 # access to the private repository; no token is printed or written. Exits non-zero, and the release
 # stops, when the commit cannot be fetched, the checkout is not at the pinned sha, or a required
 # file is missing. A <dest> already at the pin is reused.
+#
+# Read-only deploy keys (orchestrator 2026-11-27): a box whose ~/.ssh/config has `Host github-<repo name>` (for example
+# github-gpu-kernels: HostName github.com, IdentityFile <that repo's deploy key>) fetches over that alias instead, so the
+# hardware gate needs no personal token. The alias is used only when ssh's config actually maps it (`ssh -G` resolves a
+# hostname other than the alias itself). If the ssh fetch fails, the gh-credential https fetch is tried as before.
+# FETCH_PRIVATE_SSH_HOST=<alias> names a different alias; FETCH_PRIVATE_SSH_HOST=none never uses ssh.
 set -euo pipefail
 
 pinfile=${1:?usage: fetch-private.sh <pin file> <dest>}
@@ -38,14 +44,37 @@ me=fetch-private
 [ -n "$require" ] || { echo "$me: no require= in $pinfile" >&2; exit 1; }
 
 git_() { git -C "$dest" -c credential.helper= -c 'credential.helper=!gh auth git-credential' "$@"; }
+# the deploy-key alias for this repo, when ssh's config maps it (see the header); empty otherwise
+ssh_alias() {
+    local a=${FETCH_PRIVATE_SSH_HOST:-github-${repo#*/}} h
+    [ "$a" = none ] && return 0
+    command -v ssh > /dev/null 2>&1 || return 0
+    h=$(ssh -G "$a" 2> /dev/null | awk '$1 == "hostname" { print $2; exit }')
+    [ -n "$h" ] && [ "$h" != "$a" ] && printf '%s' "$a"
+    return 0
+}
 if [ "$(git -C "$dest" rev-parse HEAD 2>/dev/null || true)" != "$sha" ]; then
     rm -rf "$dest"
     mkdir -p "$dest"
     git -C "$dest" init -q
-    git_ remote add origin "https://github.com/$repo.git"
+    alias=$(ssh_alias)
+    if [ -n "$alias" ]; then
+        git -C "$dest" remote add origin "$alias:$repo.git"
+    else
+        git_ remote add origin "https://github.com/$repo.git"
+    fi
     git_ sparse-checkout set --no-cone "/$path/" > /dev/null
-    if ! git_ fetch -q --depth 1 --filter=blob:none origin "$sha"; then
-        echo "$me: cannot fetch $repo $sha (gh logged in with access to it?)" >&2; exit 1
+    fetched=0
+    if [ -n "$alias" ]; then
+        if GIT_SSH_COMMAND="ssh -o BatchMode=yes" git -C "$dest" fetch -q --depth 1 --filter=blob:none origin "$sha"; then
+            fetched=1; echo "$me: fetched $repo over ssh alias $alias (deploy key)" >&2
+        else
+            echo "$me: ssh alias $alias could not fetch $repo $sha; trying https with gh credentials" >&2
+            git -C "$dest" remote set-url origin "https://github.com/$repo.git"
+        fi
+    fi
+    if [ "$fetched" = 0 ] && ! git_ fetch -q --depth 1 --filter=blob:none origin "$sha"; then
+        echo "$me: cannot fetch $repo $sha (${alias:+deploy key on ssh alias $alias, then }gh logged in with access to it?)" >&2; exit 1
     fi
     git_ checkout -q --detach FETCH_HEAD
 fi

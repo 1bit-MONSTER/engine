@@ -1023,6 +1023,9 @@ add_test(NAME hw_gate_phase_rows COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_
 # 858 s behind GPU work and then held the GPU for an NPU-only test. A stub gpu-hold on PATH counts the calls, so this row
 # needs no token, no device and no build.
 add_test(NAME hw_gate_npu_phases COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_npu_phases_test.sh)
+# scripts/fetch-private.sh over a read-only deploy-key ssh alias (Host github-<repo>, orchestrator 2026-11-27), https with
+# gh credentials otherwise, and https when the ssh fetch is refused. A local bare repo, a stub ssh, url.insteadOf: no network.
+add_test(NAME fetch_private_ssh COMMAND bash ${CMAKE_SOURCE_DIR}/tests/fetch_private_ssh_test.sh)
 # the 1bit OS appliance: GPU steps and NPU phases queue with box-hold (one ticket each, lock fds closed in the step), the
 # repo gpu-hold wrapper is skipped, and a gate already inside a box-hold ticket does not re-queue. Stubs only, no device.
 add_test(NAME hw_gate_box_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_box_hold_test.sh)

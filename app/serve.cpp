@@ -1608,17 +1608,21 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
 // unchanged. A model whose file size matches no entry is never read (the size is compared before any hash).
 
 std::string default_loom_serve(const Options& o) {
-    if (!o.loom_serve.empty()) return o.loom_serve;
-    if (const char* e = std::getenv("ONEBIT_LOOM_SERVE"); e && *e) return e;
-    return "loom-serve";
+    // the payload's own loom-serve beside this binary (engine#3528): <exe dir>/../loom/loom-serve
+    std::string beside;
+    std::error_code ec;
+    const fs::path self = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec && !self.empty()) {
+        const fs::path p = self.parent_path().parent_path() / "loom" / "loom-serve";
+        if (fs::is_regular_file(p, ec)) beside = p.string();
+    }
+    return loom::default_loom_serve_path(o.loom_serve, std::getenv("ONEBIT_LOOM_SERVE"), beside);
 }
 
 std::string loom_cards_dir(const Options& o) {
-    if (!o.loom_cards.empty()) return o.loom_cards;
-    if (const char* e = std::getenv("ONEBIT_LOOM_CARDS"); e && *e) return e;
-    if (const char* x = std::getenv("XDG_CACHE_HOME"); x && *x) return (fs::path(x) / "1bit" / "loom-cards").string();
-    if (const char* h = std::getenv("HOME"); h && *h) return (fs::path(h) / ".cache" / "1bit" / "loom-cards").string();
-    return "";
+    std::error_code ec;
+    return loom::default_cards_dir(o.loom_cards, std::getenv("ONEBIT_LOOM_CARDS"), fs::is_directory("/data/loom-cards", ec),
+                                   std::getenv("XDG_CACHE_HOME"), std::getenv("HOME"));
 }
 
 loom::LoomRoutes load_loom_routes(const Options& o) {

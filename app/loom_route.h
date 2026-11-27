@@ -328,7 +328,12 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
     if (!in) { why = "cannot read " + card_model_json; return 0; }
     json j;
     try { j = json::parse(in); } catch (const std::exception& e) { why = card_model_json + " is not JSON: " + e.what(); return 0; }
-    const fs::path card_dir = fs::path(card_model_json).parent_path(), model_dir = fs::path(model_path).parent_path();
+    // engine#3528: the model's directory is made ABSOLUTE first - a relative `-m models/x.gguf` used to write the link
+    // target relative to the cards directory ("-> models/x.gguf"), which dangles there
+    std::error_code abs_ec;
+    const fs::path model_abs = fs::absolute(fs::path(model_path), abs_ec);
+    const fs::path card_dir = fs::path(card_model_json).parent_path(),
+                   model_dir = (abs_ec ? fs::path(model_path) : model_abs).parent_path();
     std::map<std::string, std::uintmax_t> lock_size;   // origin -> size, from the card's own lock (absent lock: no check)
     std::map<std::string, std::string> lock_sha;        // origin -> sha256, same lock
     {
@@ -751,6 +756,30 @@ inline StreamShape loom_stream_shape(const std::string& bytes) {
     }
     // whitespace only so far: nothing has been said yet, so nothing can be decided
     return StreamShape::NeedMore;
+}
+
+// engine#3528: where serve looks when no flag and no environment says. A shell on the 1bit OS appliance has neither
+// (10lemonade exports them for lemond only), so `1bit serve -m <model>` from a shell took the llama.cpp route for a
+// model that has a Loom route. Pure: the caller passes what exists.
+//   cards:  --loom-cards > ONEBIT_LOOM_CARDS > /data/loom-cards when it is a directory (the appliance's, assembled at
+//           boot by 1bit-loom-cards) > $XDG_CACHE_HOME/1bit/loom-cards > $HOME/.cache/1bit/loom-cards > "".
+//           /opt/1bit-package/loom-cards is NOT used: it is the read-only payload copy, without the parameter/ links.
+//   server: --loom-serve > ONEBIT_LOOM_SERVE > <dir of this binary>/../loom/loom-serve when it exists (the payload's
+//           layout: /opt/1bit-package/1bit/1bit and /opt/1bit-package/loom/loom-serve) > "loom-serve" (PATH).
+inline std::string default_cards_dir(const std::string& flag, const char* env, bool data_cards_is_dir, const char* xdg,
+                                     const char* home) {
+    if (!flag.empty()) return flag;
+    if (env && *env) return env;
+    if (data_cards_is_dir) return "/data/loom-cards";
+    if (xdg && *xdg) return (std::filesystem::path(xdg) / "1bit" / "loom-cards").string();
+    if (home && *home) return (std::filesystem::path(home) / ".cache" / "1bit" / "loom-cards").string();
+    return "";
+}
+inline std::string default_loom_serve_path(const std::string& flag, const char* env, const std::string& beside) {
+    if (!flag.empty()) return flag;
+    if (env && *env) return env;
+    if (!beside.empty()) return beside;
+    return "loom-serve";
 }
 
 }  // namespace onebit::loom

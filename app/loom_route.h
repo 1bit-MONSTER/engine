@@ -531,7 +531,14 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
                     // when its sha256 equals the lock's - one candidate or several - and never when the lock has no sha256
                     const fs::path snaps = hub / ("models--" + cache) / "snapshots";
                     fs::path pick;
-                    if (const auto rv = lock_rev.find(oname); rv != lock_rev.end() && sized_ok(snaps / rv->second / name))
+                    // review of #3566 (cl-220): the lock's revision is joined into a path, so it must be ONE path component
+                    // (an HF revision is a commit sha or a ref name): a revision such as "../../x" would link a same-size
+                    // file from outside the HF cache. A revision that is not one component takes the sha256-only path below.
+                    const auto one_component = [](const std::string& r) {
+                        return !r.empty() && r != "." && r != ".." && r.find_first_of(std::string("/\\\0", 3)) == std::string::npos;
+                    };
+                    if (const auto rv = lock_rev.find(oname);
+                        rv != lock_rev.end() && one_component(rv->second) && sized_ok(snaps / rv->second / name))
                         pick = snaps / rv->second / name;
                     else if (const auto sh = lock_sha.find(origin); sh != lock_sha.end()) {
                         std::error_code dec;

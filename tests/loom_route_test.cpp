@@ -358,6 +358,21 @@ int main() {
             loom::loom_link_card_parameters((dir / "lc8" / "model.json").string(), (ckdir / "m.gguf").string(), w14, &r14);
             check("the lock's own revision snapshot is linked on its size (not the newer head)",
                   !r14 && fs::canonical(dir / "lc8" / "parameter" / "x.safetensors") == fs::canonical(mx / "lockrev" / "x.safetensors"));
+            // review of #3566 (cl-220): a lock revision that is not ONE path component never leaves the HF cache: a
+            // same-size file reached by "../../escape" (outside the repo's snapshots) is not linked, the card is refused
+            fs::remove(dir / "lc8" / "parameter" / "x.safetensors");
+            fs::create_directories(hub / "escape");
+            std::ofstream(hub / "escape" / "x.safetensors") << "qrs";   // same size as the lock's, reachable only via ".."
+            std::ofstream(dir / "lc8" / "model.json.lock") << R"({"origins":{"mxfp8":{"requested":{"kind":"hf","repository":"org/mxfp8-experts","revision":"../../escape"},)"
+                R"("resolved":{"revision":"../../escape"}}},"files":[{"origin":"@checkpoint/m.gguf","size":1},)"
+                R"({"origin":"@mxfp8/x.safetensors","size":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]})";
+            fs::remove_all(mx / "lockrev");
+            bool r15 = false;
+            std::string w15;
+            loom::loom_link_card_parameters((dir / "lc8" / "model.json").string(), (ckdir / "m.gguf").string(), w15, &r15);
+            check("a lock revision with \"..\" does not link a same-size file outside the HF cache: the card is refused",
+                  r15 && !fs::exists(dir / "lc8" / "parameter" / "x.safetensors"));
+            fs::remove_all(hub / "escape");
             fs::remove_all(mx);
             fs::remove(dir / "lc8" / "parameter" / "x.safetensors");
             bool r12 = false;

@@ -582,9 +582,12 @@ int main() {
         const std::string box = loom::companion_fix_hint("1bit-MONSTER/Inkling-2-Mini-MXFP8-experts", true);
         check("on 1bit OS (1bit-loom-companions present) the refusal names the box's own fetcher, not a pull",
               box.find("1bit-loom-companions --status") != std::string::npos && box.find("pull ") == std::string::npos);
+        check("...and still names WHICH companion (the repository)",
+              box.find("1bit-MONSTER/Inkling-2-Mini-MXFP8-experts") != std::string::npos);
         check("elsewhere it names the repository to pull",
               loom::companion_fix_hint("org/repo", false) == ": pull org/repo");
-        check("with no repository and no fetcher it adds nothing", loom::companion_fix_hint("", false).empty());
+        check("with no repository it adds nothing, on the box or off it",
+              loom::companion_fix_hint("", false).empty() && loom::companion_fix_hint("", true).empty());
     }
 
     std::printf("%s\n", failures ? "FAIL" : "PASS");

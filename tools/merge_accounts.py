@@ -13,32 +13,48 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""merge_accounts.py <image etc dir> <live etc dir> [--apply --backup DIR] [--known-default-sha256 HEX]...
+"""merge_accounts.py --image DIR [--image DIR]... <live etc dir> [--apply --backup DIR] [--status FILE]
+                    [--known-default-sha256 HEX]...
 
 On 1bit OS the save layer holds its own copy of /etc/passwd, group, shadow and gshadow as soon as an account is added
 (07onboard-user's useradd, a package's useradd, a person's): an overlay's upper copy wins over the image, so
   (a) the image's account changes - the locked root password above all - never reach a box that has a saved copy,
   (b) a new system account the image adds stays invisible behind the saved files,
   (c) and the files cannot simply be moved out of the save layer either: that would delete every local user.
-This merges instead, one file at a time, into what the box should see:
-  * a SYSTEM account or group is one the image's file names: its line comes from the image (new ones appear);
-  * a LOCAL one (only in the saved file) is kept, after the image's, in the saved order;
-  * in shadow, a password a person set on a system account is kept - but a saved field that IS a base image's known
-    default (matched by the sha256 of the field, so the default itself is in no file of this repository), or that is
-    empty, or that equals the image's own, takes the image's field (root: '*', no usable password);
-  * in an image group (group and gshadow), members that are image accounts follow the image, and local users keep
-    the memberships they had (a person's admin user stays in wheel; the image's spot leaves disk, as #3452 meant).
-Password fields are never printed, only the names they belong to. Without --apply it only reports what it would
-change (exit 0). --apply writes each changed file atomically (same directory, the live file's mode and owner) after
-copying the saved originals to --backup (mode 0700). --known-default-sha256 adds a fingerprint (the tests' own). Exit 1, with nothing written, when a file does not parse or the
-result would lose an account or root. Run by 1bit-update after an install (against the new image's files, on the save
-layer's upper/etc) and at every boot by 06onboard-accounts (against the running image), so a box updated by an
-older 1bit-update is merged on its first boot into a release that carries this.
+This merges instead, one file at a time, into what the box should see.
+
+THE IMAGE is a stack of layers: each --image is one layer's etc, highest priority first, in the overlay's mount order
+(on 1bit OS lowerdir=/pup_b:/pup_ro2:/pup_f:/pup_z: the base's bdrv SFS sits ABOVE the main one and carries its own
+passwd/group/shadow). Each file is the first layer's that has it, exactly as the running system reads it.
+
+  * an IMAGE account or group is one the image's file names; a LOCAL one is only in the saved file. Local ones are
+    kept, after the image's, in the saved order; image ones new to the box appear.
+  * passwd: the saved line of an image account is KEPT (a shell or home a person set survives); its uid and gid must
+    be the image's.
+  * shadow: a password a person set is kept - but a saved field that IS a base image's known default (matched by the
+    sha256 of the field, so the default itself is in no file of this repository), or an empty one, takes the image's
+    field (root: '*', no usable password).
+  * group/gshadow: an image group takes the image's line with the members of both; only in the root-equivalent
+    groups (disk kmem shadow root sudo wheel, as os/v3/puppy/harden-groups.sh) do image accounts follow the image -
+    the image's spot leaves disk, while `usermod -aG video spot` and a local user in wheel are kept.
+  * REFUSED (exit 1, nothing written) when a file does not parse; when the result would lose an account or root; when
+    a saved account or group has the image's NAME but another uid/gid (a local `lemonade` 1001 must not be re-owned
+    by an image's `lemonade` 990); or when an account or group the image ADDS takes a uid/gid a local one already
+    has (two names on one id is a privilege crossing). A person decides those; the box keeps its files as they were.
+Password fields are never printed, only names and ids (from passwd/group's own reader). Without --apply it only
+reports. --apply copies the saved originals to --backup (dir 0700, files 0600; the last 5 backups beside it are
+kept) and writes each changed file atomically with its own mode and owner. --status FILE records "ok" or
+"refused: <why>" for release-check's account-merge row. --known-default-sha256 adds a fingerprint (the tests' own).
+Run by 1bit-update after an install (the new slot's SFS layers, on the save layer's upper/etc) and at every boot by
+06onboard-accounts (the running overlay's lower layers), so a box updated by an older 1bit-update is merged on its
+first boot into a release that carries this.
 """
 import hashlib
 import os
 import re
+import shutil
 import sys
+import time
 
 # sha256 of root's password field in the base image v2026.47 to v2026.49-rc1 were cut from (the base distribution's
 # public default, MD5-crypt). A fingerprint of the HASH STRING: it does not reveal the hash, so it cannot be cracked.
@@ -46,18 +62,20 @@ KNOWN_DEFAULT_SHA256 = {
     "c3d7234aee49a2723b63aed242c59fb180d78849cecee971a620fb321c80287f",
 }
 FILES = (("passwd", 7), ("group", 4), ("shadow", 9), ("gshadow", 4))
+PRIVILEGED = {"disk", "kmem", "shadow", "root", "sudo", "wheel"}   # harden-groups.sh's list
+KEEP_BACKUPS = 5
 
 
 def is_known_default(field):
-    return hashlib.sha256(field.encode()).hexdigest() in KNOWN_DEFAULT_SHA256
+    return hashlib.sha256(field.encode("utf-8", "surrogateescape")).hexdigest() in KNOWN_DEFAULT_SHA256
 
 
 class Refused(Exception):
     pass
 
 
-# Output is built ONLY from account names (through safe_name) and uids (through read_ids, which reads passwd alone):
-# no value that came out of a shadow or gshadow line other than its name column can reach a print.
+# Output is built ONLY from account names (through safe_name) and ids (through read_ids, which reads passwd and group
+# alone): no value that came out of a shadow or gshadow line other than its name column can reach a print.
 _NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}\$?")
 
 
@@ -67,21 +85,26 @@ def safe_name(name):
 
 
 def read_ids(path):
-    """[(name, uid)] of a passwd file, its own reader: nothing but those two columns is ever read into it"""
-    out = []
-    if not os.path.exists(path):
+    """{name: (id, gid)} of a passwd file, or {name: (gid, "")} of a group file - its own reader: nothing but the name
+    and id columns is ever read into it, and it refuses any other file"""
+    out = {}
+    if path is None or not os.path.exists(path):
         return out
+    kind = os.path.basename(path)
+    if kind not in ("passwd", "group"):
+        raise ValueError("read_ids reads passwd and group only")
     with open(path, encoding="utf-8", errors="surrogateescape") as f:
         for line in f:
             cols = line.rstrip("\n").split(":")
             if len(cols) >= 3 and cols[2].isdigit():
-                out.append((safe_name(cols[0]), cols[2]))
+                gid = cols[3] if kind == "passwd" and len(cols) > 3 and cols[3].isdigit() else ""
+                out[safe_name(cols[0])] = (cols[2], gid)
     return out
 
 
 def parse(path, nfields):
     """[(name, fields)] in file order; None when the file does not exist."""
-    if not os.path.exists(path):
+    if path is None or not os.path.exists(path):
         return None
     out, seen = [], set()
     with open(path, encoding="utf-8", errors="surrogateescape") as f:
@@ -101,16 +124,40 @@ def parse(path, nfields):
     return out
 
 
+def resolve(layers, kind):
+    """the path of the image's file: the first layer (highest priority) that has it, as the overlay reads it"""
+    for d in layers:
+        p = os.path.join(d, kind)
+        if os.path.lexists(p):
+            return p
+    return None
+
+
+def check_ids(img_path, live_path, what):
+    """refuse a saved account/group that has an image name with another id, and an image addition on a local id"""
+    img, live = read_ids(img_path), read_ids(live_path)
+    for name, ids in live.items():
+        if name in img and img[name] != ids:
+            raise Refused("%s %s is %s on this box but %s in the image: a person decides (the image would re-own it)"
+                          % (what, name, "/".join(i for i in ids if i), "/".join(i for i in img[name] if i)))
+    local_ids = {ids[0]: name for name, ids in live.items() if name not in img}
+    for name, ids in img.items():
+        if name not in live and ids[0] in local_ids:
+            raise Refused("the image adds %s %s with id %s, which the local %s already has: two names on one id "
+                          "(a person decides)" % (what, name, ids[0], local_ids[ids[0]]))
+
+
 def members(s):
     return [m for m in s.split(",") if m]
 
 
-def merge_members(img, saved, image_users):
-    """image members, then the saved members that are local users (not image accounts), without repeats"""
+def merge_members(group, img, saved, image_users):
+    """the image's members, then the saved ones; in a root-equivalent group a saved IMAGE account is dropped"""
     out = list(img)
     for m in saved:
-        if m not in image_users and m not in out:
-            out.append(m)
+        if m in out or (group in PRIVILEGED and m in image_users):
+            continue
+        out.append(m)
     return ",".join(out)
 
 
@@ -126,8 +173,7 @@ def merge(kind, image, saved, image_users, notes):
             out.append((name, f))
             continue
         if kind == "passwd":
-            notes.append("passwd: %s follows the image" % safe_name(name))
-            out.append((name, f))
+            out.append((name, s))   # ids checked equal to the image's: a person's shell/home stay
         elif kind == "shadow":
             pw = s[1]
             if is_known_default(pw):
@@ -136,19 +182,17 @@ def merge(kind, image, saved, image_users, notes):
             elif pw == "" and f[1] != "":
                 notes.append("shadow: %s had NO password: it takes the image's field" % safe_name(name))
                 out.append((name, f))
-            elif pw == f[1]:
-                out.append((name, f))
             else:
-                out.append((name, s))   # a password a person set, with its own dates
+                out.append((name, s))   # a password a person set (or the image's own), with its own dates
         else:   # group: name:pw:gid:members   gshadow: name:pw:admins:members
             g = list(f)
             if kind == "group":
-                g[3] = merge_members(members(f[3]), members(s[3]), image_users)
+                g[3] = merge_members(name, members(f[3]), members(s[3]), image_users)
             else:
-                g[2] = merge_members(members(f[2]), members(s[2]), image_users)
-                g[3] = merge_members(members(f[3]), members(s[3]), image_users)
+                g[2] = merge_members(name, members(f[2]), members(s[2]), image_users)
+                g[3] = merge_members(name, members(f[3]), members(s[3]), image_users)
             if g != s:
-                notes.append("%s: %s takes the image's line, keeping its local members" % (kind, safe_name(name)))
+                notes.append("%s: %s takes the image's line with the members of both" % (kind, safe_name(name)))
             out.append((name, g))
     names = {n for n, _ in image}
     for name, s in saved:
@@ -157,12 +201,16 @@ def merge(kind, image, saved, image_users, notes):
     return out
 
 
-def plan(image_dir, live_dir):
+def plan(layers, live_dir):
     """{file: (merged text, live text, notes)} for the files that exist in both and would change"""
-    img = {k: parse(os.path.join(image_dir, k), n) for k, n in FILES}
+    src = {k: resolve(layers, k) for k, _ in FILES}
+    if src["passwd"] is None:
+        raise Refused("no layer has a passwd: not an image's etc")
+    img = {k: parse(src[k], n) for k, n in FILES}
     live = {k: parse(os.path.join(live_dir, k), n) for k, n in FILES}
-    if img["passwd"] is None:
-        raise Refused("%s has no passwd: not an image's etc" % image_dir)
+    check_ids(src["passwd"], os.path.join(live_dir, "passwd"), "account")
+    if src["group"]:
+        check_ids(src["group"], os.path.join(live_dir, "group"), "group")
     image_users = {n for n, _ in img["passwd"]}
     result = {}
     for kind, _ in FILES:
@@ -181,14 +229,6 @@ def plan(image_dir, live_dir):
             old = fh.read()
         if text != old:
             result[kind] = (text, old, notes)
-    # uid collisions between a local user and an image account are reported, never renumbered; printed from read_ids
-    # (passwd's names and uids only), not from the parsed records the shadow merge uses
-    img_ids = read_ids(os.path.join(image_dir, "passwd"))
-    img_names = {n for n, _ in img_ids}
-    by_uid = {u: n for n, u in img_ids}
-    for n, u in read_ids(os.path.join(live_dir, "passwd")):
-        if n not in img_names and u in by_uid:
-            print("merge_accounts: WARNING: local user %s has uid %s, as the image's %s" % (n, u, by_uid[u]))
     return result
 
 
@@ -210,16 +250,40 @@ def write_atomic(path, text):
         raise
 
 
+def prune_backups(backup):
+    """keep the newest KEEP_BACKUPS directories beside this backup (they hold old shadow copies)"""
+    parent = os.path.dirname(os.path.abspath(backup))
+    dirs = [os.path.join(parent, d) for d in os.listdir(parent)]
+    dirs = sorted((d for d in dirs if os.path.isdir(d) and not os.path.islink(d)), key=os.path.getmtime, reverse=True)
+    for d in dirs[KEEP_BACKUPS:]:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def write_status(path, line):
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), line))
+    except OSError:
+        pass
+
+
 def main(argv):
-    args, apply, backup, i = [], False, None, 0
+    args, layers, apply, backup, status, i = [], [], False, None, None, 0
     while i < len(argv):
         a = argv[i]
         if a == "--apply":
             apply = True
-        elif a in ("--backup", "--known-default-sha256") and i + 1 < len(argv):
+        elif a in ("--backup", "--status", "--image", "--known-default-sha256") and i + 1 < len(argv):
             i += 1
             if a == "--backup":
                 backup = argv[i]
+            elif a == "--status":
+                status = argv[i]
+            elif a == "--image":
+                layers.append(argv[i])
             else:
                 KNOWN_DEFAULT_SHA256.add(argv[i].lower())
         elif a.startswith("--"):
@@ -228,17 +292,21 @@ def main(argv):
         else:
             args.append(a)
         i += 1
-    if len(args) != 2 or (apply and not backup):
+    if len(args) == 2 and not layers:          # the one-layer form: <image etc> <live etc>
+        layers, args = [args[0]], [args[1]]
+    if len(args) != 1 or not layers or (apply and not backup):
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
         return 2
-    image_dir, live_dir = args
+    live_dir = args[0]
     try:
-        changes = plan(image_dir, live_dir)
-    except (Refused, OSError) as e:
+        changes = plan(layers, live_dir)
+    except (Refused, OSError, UnicodeError, ValueError) as e:
         print("merge_accounts: REFUSED, nothing written: %s" % e)
+        write_status(status, "refused: %s" % e)
         return 1
     if not changes:
         print("merge_accounts: the account files already agree with the image (local accounts kept)")
+        write_status(status, "ok: already agree")
         return 0
     for kind in changes:
         for n in changes[kind][2]:
@@ -254,7 +322,9 @@ def main(argv):
             f.write(old)
     for kind, (text, _, _) in changes.items():
         write_atomic(os.path.join(live_dir, kind), text)
+    prune_backups(backup)
     print("merge_accounts: rewrote %s; the previous copies are in %s" % (", ".join(changes), backup))
+    write_status(status, "ok: rewrote %s" % ", ".join(changes))
     return 0
 
 

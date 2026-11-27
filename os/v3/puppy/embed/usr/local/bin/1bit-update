@@ -974,14 +974,22 @@ fi
 # release's 06onboard-accounts runs the same merge at every boot, so this is the same result one reboot earlier.
 if [ -n "$upper" ] && [ -d "$upper/etc" ] && [ -n "$nsfs" ]; then
     at=$(mktemp -d)                                  # 0700: the image's shadow is copied here
-    for f in passwd group shadow gshadow; do
-        unsquashfs -q -cat "$nsfs" "etc/$f" > "$at/$f" 2> /dev/null && [ -s "$at/$f" ] || rm -f "$at/$f"
+    # the new slot's layers in the overlay's mount order (lowerdir=/pup_b:/pup_ro2:/pup_f:/pup_z): bdrv carries its
+    # own passwd/group/shadow ABOVE the main SFS's, so each layer is passed on its own, highest priority first
+    set --; li=0
+    for l in "$DATA/$target"/bdrv_*.sfs "$nsfs" "$DATA/$target"/fdrv_*.sfs "$DATA/$target"/zdrv_*.sfs; do
+        [ -f "$l" ] || continue
+        li=$((li + 1)); mkdir "$at/L$li"
+        for f in passwd group shadow gshadow; do
+            unsquashfs -q -cat "$l" "etc/$f" > "$at/L$li/$f" 2> /dev/null && [ -s "$at/L$li/$f" ] || rm -f "$at/L$li/$f"
+        done
+        set -- "$@" --image "$at/L$li"
     done
     unsquashfs -q -cat "$nsfs" usr/lib/1bit/merge_accounts.py > "$at/merge_accounts.py" 2> /dev/null
-    if [ -s "$at/merge_accounts.py" ] && [ -f "$at/passwd" ]; then
+    if [ -s "$at/merge_accounts.py" ] && ls "$at"/L*/passwd > /dev/null 2>&1; then
         atag=$(unsquashfs -q -cat "$nsfs" etc/1bit/release-identity 2> /dev/null | sed -n 's/^payload=lemonade-onebit-//p' | head -1)
         bdir=$DATA/$save_slot/$savename/1bit-accounts/${atag:-new}-$(date -u +%Y%m%dT%H%M%SZ)
-        python3 -I "$at/merge_accounts.py" "$at" "$upper/etc" --apply --backup "$bdir" 2>&1 | sed 's/^/   accounts: /' | tee -a "$LOG"
+        python3 -I "$at/merge_accounts.py" "$@" "$upper/etc" --apply --backup "$bdir" 2>&1 | sed 's/^/   accounts: /' | tee -a "$LOG"
     else
         say "   accounts: the new release carries no merge_accounts.py: the save layer's account files are left as they are"
     fi

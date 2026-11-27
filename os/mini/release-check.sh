@@ -1132,6 +1132,19 @@ default_passwords_verdict() {
     esac
 }
 
+# account_merge_verdict <the last line of /var/lib/1bit/accounts-merge.status | MISSING>: 06onboard-accounts merges the
+# save layer's account files with the image's at every boot and records the outcome; a REFUSED merge leaves the box on
+# its unmerged files (an update's account fixes, the locked root password among them, do not take effect) until a
+# person resolves it, so it must not pass quietly. The reason holds names and ids only. Pure, so --self-test drives it.
+account_merge_verdict() {
+    case "${1:-MISSING}" in
+        MISSING)       printf 'SKIP no account merge has run (an image without 06onboard-accounts, or not booted yet)' ;;
+        *" ok:"*)      printf 'PASS the last boot merged the account files with the image (%s)' "$(printf '%s' "$1" | sed 's/^[^ ]* ok: //' | cut -c1-80)" ;;
+        *" refused:"*) printf 'FAIL the last boot REFUSED to merge the account files, so the image'"'"'s account changes do not apply: %s' "$(printf '%s' "$1" | sed 's/^[^ ]* refused: //' | cut -c1-200)" ;;
+        *)             printf 'FAIL /var/lib/1bit/accounts-merge.status says neither ok nor refused' ;;
+    esac
+}
+
 # engine#3350 rc1: loom_verdict <gpu 1/0> <state: listed | absent | fetchfail:<why>> <reply> <serve's loom lines> <loom-serve
 # processes> - the Loom route row. A known answer is not enough: `1bit serve` falls back to the llama.cpp route on
 # purpose when a card is missing or a weight beside the model is not the card's (#3394/#3396), and that fallback answers
@@ -1506,6 +1519,11 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(default_passwords_verdict 'root')"
     check FAIL "$(default_passwords_verdict 'root spot')"
     check FAIL "$(default_passwords_verdict UNREADABLE)"
+    check SKIP "$(account_merge_verdict MISSING)"
+    check PASS "$(account_merge_verdict '2026-11-27T12:00:00Z ok: already agree')"
+    check PASS "$(account_merge_verdict '2026-11-27T12:00:00Z ok: rewrote shadow')"
+    check FAIL "$(account_merge_verdict '2026-11-27T12:00:00Z refused: account lemonade is 1001/1001 on this box but 990/990 in the image')"
+    check FAIL "$(account_merge_verdict 'garbage')"
     # OS updater U7: the update rows
     check PASS "$(update_tools_verdict 1 1 0 0db13630603b2e07795b2074f73a6890a68251d30e757da9cbbdc7394c8607b6)"
     check FAIL "$(update_tools_verdict 1 0 0 0db13630603b2e07795b2074f73a6890a68251d30e757da9cbbdc7394c8607b6)"   # no --latest
@@ -2673,6 +2691,9 @@ else
 fi
 unset _dw _dh
 case "$_dv" in PASS*) pass default-passwords "${_dv#PASS }" ;; *) fail default-passwords "${_dv#FAIL }" ;; esac
+_am=MISSING; [ -s /var/lib/1bit/accounts-merge.status ] && _am=$(tail -1 /var/lib/1bit/accounts-merge.status)
+_av=$(account_merge_verdict "$_am")
+case "$_av" in PASS*) pass account-merge "${_av#PASS }" ;; SKIP*) skip account-merge "${_av#SKIP }" ;; *) fail account-merge "${_av#FAIL }" ;; esac
 
 # ── the in-system updater (OS updater U7): its pieces are in the image, and it can ask ──────────────────────────────
 _ut_in=0; [ -e /data/.installed ] && _ut_in=1

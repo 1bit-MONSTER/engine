@@ -320,6 +320,30 @@ with tempfile.TemporaryDirectory() as td:
     rc, res = rc_of([model("h/fifteen", tags=["text-generation"])], seen=set(cw.load_state(path)["seen"]))
     check("a reloaded state quiets the next run's unverifiable", rc == 0 and res[cw.UNVERIFIABLE] == [])
 
+# 10b. A model_type-only repo (engine#3513) and a test fixture are remembered like every other bucket. They were
+#     not: remember() listed four buckets, so those repos were re-reported daily, took `limit` slots, and a page
+#     holding one never counted as all-seen, so the walk ran to pages_guard on every run.
+_, mt_res = rc_of([model_type_only("h/mt", ARCHS["Qwen3ForCausalLM"]["gguf"]),
+                   model("example/fx", "TinyForTesting")])
+check("the fixture classifies into the two buckets remember() used to drop",
+      mt_res[cw.MODEL_TYPE] == ["h/mt"] and mt_res[cw.TEST_FIXTURE] == ["example/fx"])
+mt_state = cw.remember({"last_run": "t", "seen": {}}, mt_res)
+check("remember() records model_type and test-fixture ids",
+      mt_state["seen"] == {"h/mt": cw.MODEL_TYPE, "example/fx": cw.TEST_FIXTURE})
+_mt_urls = []
+
+
+def _mt_fetch(url):
+    _mt_urls.append(url)
+    if len(_mt_urls) == 1:
+        return ([model_type_only("h/mt", ARCHS["Qwen3ForCausalLM"]["gguf"]), model("example/fx", "TinyForTesting")],
+                '<https://huggingface.co/api/models?cursor=PAGE1>; rel="next"')
+    return [model(f"z/{i}") for i in range(100)], ""
+
+
+check("a page of only remembered model_type/fixture ids is the horizon: the walk stops after one page",
+      cw.sweep_newest(10, seen=set(mt_state["seen"]), fetch=_mt_fetch) == [] and len(_mt_urls) == 1)
+
 # 11. The listing walk follows the Link cursor, not `p=`. HF ignores `p=` on a sorted
 #     listing (every page returns the first one), which capped the first live run at 101
 #     models however large --limit was.

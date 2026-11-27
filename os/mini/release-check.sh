@@ -1118,6 +1118,20 @@ update_check_verdict() {
     esac
 }
 
+# default_passwords_verdict <names whose password field is a base image's known default, space-separated | UNREADABLE>:
+# images v2026.47 to v2026.49-rc1 shipped root with the base distribution's public default password, and the save
+# layer's copy of /etc/shadow keeps it over any image that fixes it (every installed box has that copy). The row below
+# matches each field's sha256 against DEFAULT_PW_SHA256 (the fingerprint of the hash STRING, which reveals nothing; the
+# same set as tools/merge_accounts.py), prints names only, never a field. Pure, so --self-test drives it.
+DEFAULT_PW_SHA256="c3d7234aee49a2723b63aed242c59fb180d78849cecee971a620fb321c80287f"
+default_passwords_verdict() {
+    case "${1:-}" in
+        UNREADABLE) printf 'FAIL /etc/shadow could not be read (the release check runs as root)' ;;
+        '')         printf 'PASS no account holds a base image'"'"'s default password' ;;
+        *)          printf 'FAIL %s still hold(s) the base image'"'"'s default password (the save layer keeps it over the image): set your own with passwd, or reboot into a release whose 06onboard-accounts merges it away' "$1" ;;
+    esac
+}
+
 # engine#3350 rc1: loom_verdict <gpu 1/0> <state: listed | absent | fetchfail:<why>> <reply> <serve's loom lines> <loom-serve
 # processes> - the Loom route row. A known answer is not enough: `1bit serve` falls back to the llama.cpp route on
 # purpose when a card is missing or a weight beside the model is not the card's (#3394/#3396), and that fallback answers
@@ -1487,6 +1501,11 @@ if [ "${1:-}" = --self-test ]; then
     check SKIP "$(loom_verdict 0 listed '' '' 0)"
     check SKIP "$(loom_verdict 1 absent '' '' 0)"
     check FAIL "$(loom_verdict 1 'fetchfail:lemonade pull exited 1' '' '' 0)"
+    # default-passwords: names only
+    check PASS "$(default_passwords_verdict '')"
+    check FAIL "$(default_passwords_verdict 'root')"
+    check FAIL "$(default_passwords_verdict 'root spot')"
+    check FAIL "$(default_passwords_verdict UNREADABLE)"
     # OS updater U7: the update rows
     check PASS "$(update_tools_verdict 1 1 0 0db13630603b2e07795b2074f73a6890a68251d30e757da9cbbdc7394c8607b6)"
     check FAIL "$(update_tools_verdict 1 0 0 0db13630603b2e07795b2074f73a6890a68251d30e757da9cbbdc7394c8607b6)"   # no --latest
@@ -2639,6 +2658,21 @@ case "$_lv" in
     SKIP*) skip chat-loom "${_lv#SKIP }" ;;
     *)     fail chat-loom "${_lv#FAIL }" ;;
 esac
+
+# ── no account keeps a base image's default password (the save layer's shadow copy outlives the image's fix) ─────────
+if [ -r /etc/shadow ]; then
+    _dp=
+    while IFS=: read -r _dn _dw _drest; do
+        case "$_dw" in '$'*) ;; *) continue ;; esac
+        _dh=$(printf '%s' "$_dw" | sha256sum | cut -c1-64)
+        for _dk in $DEFAULT_PW_SHA256; do [ "$_dh" = "$_dk" ] && _dp="${_dp:+$_dp }$_dn"; done
+    done < /etc/shadow
+    _dv=$(default_passwords_verdict "$_dp")
+else
+    _dv=$(default_passwords_verdict UNREADABLE)
+fi
+unset _dw _dh
+case "$_dv" in PASS*) pass default-passwords "${_dv#PASS }" ;; *) fail default-passwords "${_dv#FAIL }" ;; esac
 
 # ── the in-system updater (OS updater U7): its pieces are in the image, and it can ask ──────────────────────────────
 _ut_in=0; [ -e /data/.installed ] && _ut_in=1

@@ -171,6 +171,7 @@ usr/sbin/1bit-board os/mini/board.sh
 etc/1bit/base-modes-keep os/v3/puppy/base-modes-keep
 usr/lib/1bit/seal_manifest.py tools/seal_manifest.py
 usr/lib/1bit/release_sign.py tools/release_sign.py
+usr/lib/1bit/merge_accounts.py tools/merge_accounts.py
 EOF
     # generated from the payload, as container-build.sh does: the catalogue list and the identity
     python3 "$here/catalogue-manifest.py" "$P/bin/resources/server_models.json" "$out/onebit-models.txt" ||

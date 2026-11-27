@@ -2564,7 +2564,7 @@
     }
    },
    "pinned": "2026-11-24",
-   "used_for": "the Loom route (card 1bit-MONSTER/Inkling-2-Mini-loom-NVFP4-MXFP8 @ bdaeffb3 reads the mainline layout, which unsloth's root name holds since head 8078d149) at draft_depth 3 with the model's own DSpark drafter (dspark-Inkling-2-Mini-Q8_0_Old.gguf, 2ec78510; the head also carries the newer mainline-format drafter, which the card does not bind), and the CPU arbiter (the same model bytes under Mainline_Support/)"
+   "used_for": "the Loom route (card 1bit-MONSTER/Inkling-2-Mini-NVFP4-MXFP8-loom @ 82bf45eb reads the mainline layout, which unsloth's root name holds since head 8078d149) at draft_depth 3 with the model's own DSpark drafter (dspark-Inkling-2-Mini-Q8_0_Old.gguf, 2ec78510; the head also carries the newer mainline-format drafter, which the card does not bind), and the CPU arbiter (the same model bytes under Mainline_Support/)"
   },
   "1bit-MONSTER/Inkling-2-Mini-MXFP8-experts": {
    "commit": "a9955dddd10125865cbd76a720d9530c6be89ab4",
@@ -2576,7 +2576,7 @@
     }
    },
    "pinned": "2026-11-27",
-   "used_for": "the Loom route's native card (1bit-MONSTER/Inkling-2-Mini-loom-NVFP4-MXFP8 @ bdaeffb3): layers 20-23's 16 routed-expert tensors as Thinking Machines published them (MXFP8), byte-identical to thinkingmachines/Inkling-2-Mini@b85c3cfa; the card binds it beside the unsloth GGUF (origin @mxfp8)"
+   "used_for": "the Loom route's native card (1bit-MONSTER/Inkling-2-Mini-NVFP4-MXFP8-loom @ 82bf45eb): layers 20-23's 16 routed-expert tensors as Thinking Machines published them (MXFP8), byte-identical to thinkingmachines/Inkling-2-Mini@b85c3cfa; the card binds it beside the unsloth GGUF (origin @mxfp8)"
   }
  }
 }

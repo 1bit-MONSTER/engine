@@ -36,7 +36,7 @@ The shipped table holds only models that passed the gate below (each entry's `ga
 | `qwen3-4b-instruct-2507-q4_k_m` | [loom-fun/unsloth-Qwen3-4B-Instruct-2507-loom](https://huggingface.co/loom-fun/unsloth-Qwen3-4B-Instruct-2507-loom) @ `d0df214d` | engine#3158 |
 | `qwen3.5-4b-ud-q4_k_xl` | [1bit-MONSTER/Qwen3.5-4B-GGUF-loom](https://huggingface.co/1bit-MONSTER/Qwen3.5-4B-GGUF-loom) @ `96c2f2f7` | engine#3158 |
 | `qwen3-8b-q4_k_m` | [loom-fun/unsloth-Qwen3-8B-loom](https://huggingface.co/loom-fun/unsloth-Qwen3-8B-loom) @ `35d393f3` | engine#3158 |
-| `inkling-2-mini-ud-q4_k_xl` | `1bit-MONSTER/Inkling-2-Mini-loom-NVFP4-MXFP8` @ `bdaeffb3` (private repo; the 1bit OS payload carries the card) | engine#3158 (issuecomment-7216723223; no fallback arm: Loom vs the CPU arbiter). Our re-card of loom-fun's r8 `4e018e88` for unsloth's mainline GGUF, with layers 20-23's routed experts read as published (MXFP8) on native NVFP4/MXFP8 kernels (engine#3333); Apache-2.0 |
+| `inkling-2-mini-ud-q4_k_xl` | [1bit-MONSTER/Inkling-2-Mini-NVFP4-MXFP8-loom](https://huggingface.co/1bit-MONSTER/Inkling-2-Mini-NVFP4-MXFP8-loom) @ `82bf45eb` | engine#3158 (issuecomment-7216723223; no fallback arm: Loom vs the CPU arbiter). Our re-card of loom-fun's r8 `4e018e88` for unsloth's mainline GGUF, with layers 20-23's routed experts read as published (MXFP8) on native NVFP4/MXFP8 kernels (engine#3333); Apache-2.0 |
 
 An entry takes effect only where its card is installed (below) and `loom-serve` is available (hrx-loom; on PATH,
 or `--loom-serve PATH` / `ONEBIT_LOOM_SERVE`); without the card the entry is skipped, with one line naming why, and

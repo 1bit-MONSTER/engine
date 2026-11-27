@@ -129,13 +129,29 @@ def fetch(hf, c):
     req = urllib.request.Request(url, headers={"User-Agent": "1bit-os", **({"Range": "bytes=%d-" % have} if have else {})})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
-            flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if have and r.status == 206 else os.O_TRUNC)
-            with os.fdopen(os.open(part, flags, FILE_MODE & 0o600), "ab" if flags & os.O_APPEND else "wb") as out:
-                while True:
-                    b = r.read(1 << 20)
+            resume = bool(have) and r.status == 206
+            # BOUNDED by the pinned size (review cl-pragent): a server, mirror or proxy that sends more - or answers a
+            # Range with a whole body and more - must not write past it into /data. A Content-Length that is not the
+            # expected length is refused before a byte is written; a byte beyond it refuses the file.
+            want = c[5] - have if resume else c[5]
+            cl = r.headers.get("Content-Length")
+            if cl is not None and (not cl.isdigit() or int(cl) != want):
+                say("%s: %s: REFUSED, the server announces %s B where %d B are pinned: nothing written" % (c[0], c[4], cl, want))
+                return False
+            flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if resume else os.O_TRUNC)
+            with os.fdopen(os.open(part, flags, FILE_MODE & 0o600), "ab" if resume else "wb") as out:
+                left = want
+                while left > 0:
+                    b = r.read(min(1 << 20, left))
                     if not b:
                         break
                     out.write(b)
+                    left -= len(b)
+                extra = r.read(1) if left == 0 else b""
+            if extra:
+                os.unlink(part)
+                say("%s: %s: REFUSED, the server sent more than the pinned %d B: removed" % (c[0], c[4], c[5]))
+                return False
     except OSError as e:
         say("%s: %s: the download stopped (%s); the next run resumes it" % (c[0], c[4], e))
         return False

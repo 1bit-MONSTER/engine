@@ -59,8 +59,20 @@ class H(SimpleHTTPRequestHandler):
         data = open(p, "rb").read(); start = 0
         r = s.headers.get("Range")
         if r and r.startswith("bytes="): start = int(r[6:].split("-")[0])
+        mode = open(os.path.join(root, "MODE")).read().strip() if os.path.exists(os.path.join(root, "MODE")) else ""
         s.send_response(206 if start else 200)
-        s.send_header("Content-Length", str(len(data) - start)); s.end_headers(); s.wfile.write(data[start:])
+        if mode == "extra":                                 # no length, and 1 MB more than the file
+            s.send_header("Connection", "close"); s.end_headers()
+            try:
+                s.wfile.write(data[start:] + b"x" * 1000000)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        s.send_header("Content-Length", str(len(data) - start + (5 if mode == "biglen" else 0))); s.end_headers()
+        try:
+            s.wfile.write(data[start:] + (b"y" * 5 if mode == "biglen" else b""))
+        except (BrokenPipeError, ConnectionResetError):
+            pass                                            # the client refused before reading: that is the point
 srv = ThreadingHTTPServer(("127.0.0.1", 0), H); open(portfile, "w").write(str(srv.server_address[1])); srv.serve_forever()
 PY
 python3 "$t/hf.py" "$t/www" "$t/port" "$t/req.log" & srv=$!
@@ -102,6 +114,16 @@ out=$(C --once); rc=$?
 [ $rc = 1 ] && [ ! -e "$dest" ] && [ ! -e "$dest.part" ] && printf '%s' "$out" | grep -q "REFUSED"
 check $? "other bytes of the right size are REFUSED (sha256), nothing is left in the cache"
 C --status > /dev/null; [ $? = 1 ]; check $? "  ... and status says MISSING again"
+
+# the download is bounded by the pinned size: a server that sends more cannot write past it into /data
+cp "$t/good" "$t/www/org/experts/resolve/$REV/E.safetensors"; rm -f "$dest" "$dest.part"
+echo biglen > "$t/www/MODE"; out=$(C --once); rc=$?
+[ $rc = 1 ] && [ ! -e "$dest" ] && [ ! -e "$dest.part" ] && printf '%s' "$out" | grep -q "announces $((SIZE + 5)) B"
+check $? "a Content-Length that is not the pinned size is refused before a byte is written"
+echo extra > "$t/www/MODE"; out=$(C --once); rc=$?
+[ $rc = 1 ] && [ ! -e "$dest" ] && [ ! -e "$dest.part" ] && printf '%s' "$out" | grep -q "sent more than the pinned"
+check $? "a server that sends more than the pinned size (no length announced) is refused, and nothing is left"
+rm -f "$t/www/MODE"; C --once > /dev/null; [ "$(sha256sum "$dest" | cut -c1-64)" = "$SHA" ]; check $? "  ... and an honest server then completes it"
 
 # a lock that names a path-like repository or revision is skipped, never followed
 sed -i "s|\"org/experts\"|\"org/../../etc\"|" "$t/payload/Card-loom/model.json.lock"

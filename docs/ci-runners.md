@@ -467,7 +467,7 @@ runner is `/var/lib/ghrunner/.cache/coder-llm/demand`. The watcher works like th
 2. Inside the ticket it checks again. If the demand went stale while it was queued (no touch for 7 minutes), or
    `MemAvailable` is under 40 GB, it starts nothing.
 3. Otherwise it starts `1bit serve --device hrx --port 8090 --alias qwen3-coder --ctx-size 65536` in its own session.
-4. The window closes after 5 minutes without a touch, or at 44 minutes (the box rule is one ticket ≤ 45 min). If the
+4. The window closes after 5 minutes without a touch, or at **20 minutes** (orchestrator, 2026-11-27: its CI-class ticket alternates with lanes, so it is kept short; the box rule is one ticket ≤ 45 min). If the
    demand is still fresh, it re-queues at the back.
 5. Closing TERMs the server's whole session, waits 30 s, KILLs what is left, and then KILLs anything still carrying
    `--port 8090`, so the `llama-server` grandchild cannot outlive the ticket.
@@ -524,6 +524,17 @@ the first word of `BOX_HOLD_WHO` when it starts `cl-` or `pi-`: its first two da
 `cl-lb`), or the longest name it starts with from `/etc/1bit/box-hold-lanes.conf`
 ([source](../scripts/appliance/box-hold-lanes.conf)) for lanes whose own name has a dash (`cl-inkling-npu`). Labels of no
 lane (`coder-llm`, `hw-gate …`) are not capped.
+
+**CI and board tickets alternate with lanes (2026-11-27, fairness v3).** With strict priority, every PR push queued a
+CI or reviewer-window ticket that jumped every lane ticket. cl-kernel's ticket slid from 2nd to 36th. The rule:
+- CI and board tickets still beat lane tickets, but **never twice in a row while a lane ticket waits**.
+- After a CI or board ticket runs, the next turn goes to the **oldest waiting lane ticket**.
+- With no lane waiting, CI tickets run back to back.
+- FIFO within each class is unchanged.
+
+box-hold records the class of each granted ticket in `/tmp/box-locks/box-last` (`priority` or `lane`). With lanes
+waiting and a stream of CI tickets behind them, the order is `C1 L1 C2 L2 C3 L3 C4` (the `box_hold_fifo` stub test).
+The reviewer window is capped at 20 minutes per ticket for the same reason.
 
 The head of the queue no longer blocks in `flock`; it tries the locks and re-reads the queue between tries. A head
 blocked in `flock -w` never saw a CI ticket that arrived behind it. The same change fixed a defect as old as box-hold:

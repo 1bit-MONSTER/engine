@@ -40,6 +40,7 @@
 #      to back
 #  22. an older copy's lane waiter (its ticket has no box-hold-v3 marker) is NOT preferred after a priority turn: the
 #      next CI ticket runs at once instead of the queue stalling on a waiter that never takes the lock (21:57Z 11-27)
+#  23. ... and a younger MARKED lane ticket does not overtake that older unmarked one (lane FIFO across the copies)
 set -u
 BH=${1:?usage: box_hold_fifo_test.sh <box-hold>}
 T=$(mktemp -d); trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$T"' EXIT
@@ -238,6 +239,20 @@ s=$(date +%s); wait "$c1"; d=$(( $(date +%s) - s ))
 [ "$(tr '\n' ' ' < "$T/order")" = "C0 C1 " ] && [ "$d" -le 4 ] && ok "an older copy's lane waiter is not preferred: the next CI ticket ran after ${d}s (no stall)" \
   || bad "stall on an unmarked lane waiter: $(tr '\n' ' ' < "$T/order") after ${d}s"
 kill "$old" 2> /dev/null; wait 2> /dev/null
+
+# 23. lane FIFO across the copies (review cl-release on #3586): a MARKED lane ticket must not overtake an OLDER
+#     unmarked one (a waiter of a pre-v3 copy) after a priority turn; while the old one waits, the turn goes by the class
+#     order (here: CI), and the marked lane runs only once the older lane ticket is gone
+rm -f "$T/locks/box-last"; : > "$T/order"
+ci gpu sh -c "$(job C0 1)" & sleep 0.3
+sleep 3 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
+echo "cl-old-lane $(date -u +%FT%TZ) x" > "$T/locks/queue/1-$(printf '%012d' 3).$old.$st"   # live, no marker, oldest lane
+sh "$BH" gpu sh -c "$(job L2 0.2)" & l2=$!; sleep 0.2                                    # a marked lane, younger
+ci gpu sh -c "$(job C1 0.2)" & sleep 0.2
+ci gpu sh -c "$(job C2 0.2)" &
+wait "$l2"; wait 2> /dev/null
+[ "$(tr '\n' ' ' < "$T/order")" = "C0 C1 C2 L2 " ] && ok "a marked lane ticket does not overtake an older unmarked one (C0 C1 C2 L2: L2 after the old waiter is gone)" \
+  || bad "lane FIFO across copies: $(tr '\n' ' ' < "$T/order") (want C0 C1 C2 L2)"
 
 [ "$fail" = 0 ] && echo "box_hold_fifo: PASS" || echo "box_hold_fifo: FAIL"
 exit "$fail"

@@ -219,6 +219,35 @@ int main() {
                       n5 == 0 && r5 && w5.find("cannot link") != std::string::npos);
             }
             fs::permissions(dir / "lc5" / "parameter", fs::perms::owner_all);
+            // review (cl-flm): a STALE link that cannot be replaced (another model's file, read-only dir) also refuses
+            std::error_code rm_ec;   // as root the first arm did link m.gguf: start the stale case from a known link
+            fs::remove(dir / "lc5" / "parameter" / "m.gguf", rm_ec);
+            fs::create_symlink(dir / "snap" / "d.gguf", dir / "lc5" / "parameter" / "m.gguf");
+            fs::permissions(dir / "lc5" / "parameter", fs::perms::owner_read | fs::perms::owner_exec);
+            bool r6 = false;
+            std::string w6;
+            loom::loom_link_card_parameters((dir / "lc5" / "model.json").string(), (dir / "snap" / "m.gguf").string(), w6, &r6);
+            if (geteuid() == 0) {
+                std::printf("skip (running as root): a stale link that cannot be replaced refuses the card\n");
+            } else {
+                check("a stale link that cannot be replaced refuses the card (not served on the stale target)",
+                      r6 && w6.find("cannot link") != std::string::npos &&
+                      fs::read_symlink(dir / "lc5" / "parameter" / "m.gguf") == dir / "snap" / "d.gguf");
+            }
+            fs::permissions(dir / "lc5" / "parameter", fs::perms::owner_all);
+        }
+        // review (cl-hf): the same refusal, ROOT-PROOF (CI's build container runs as root): `parameter` is a regular file,
+        // so no link can be made under it whoever runs the test
+        {
+            fs::create_directories(dir / "lc6");
+            std::ofstream(dir / "lc6" / "model.json") << R"({"model":{"id":"M6"},"variants":{"gguf":{"services":{"chat":{"parameters":{)"
+                R"("model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"}]}}}}}}})";
+            std::ofstream(dir / "lc6" / "parameter") << "not a directory";
+            bool r7 = false;
+            std::string w7;
+            const int n7 = loom::loom_link_card_parameters((dir / "lc6" / "model.json").string(), (dir / "snap" / "m.gguf").string(), w7, &r7);
+            check("a link whose directory cannot exist refuses the card, also as root (and says why)",
+                  n7 == 0 && r7 && w7.find("cannot link") != std::string::npos);
         }
         // a file the card lists but nothing beside the model provides (an unused variant) does not refuse the card
         {

@@ -125,5 +125,26 @@ ask
 check $? "a stall past the bound answers 502 at the bound (HTTP $code after ${elapsed} s for a 3 s stall, bound 1 s)"
 stop_proxy
 
+# 3. a bad ONEBIT_WEBAPP_UPSTREAM_TIMEOUT falls back to the default with a note, instead of crashing the proxy at start
+#    (int("abc") raised ValueError at import, so the chat page never came up).
+for badval in abc 12.5 -3 0; do
+    out=$(PYTHONDONTWRITEBYTECODE=1 ONEBIT_WEBAPP_UPSTREAM_TIMEOUT=$badval python3 - "$proxy" 2> "$t/import.err" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("webapp_proxy", sys.argv[1])
+spec = importlib.util.spec_from_loader("webapp_proxy", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+print(m.UPSTREAM_TIMEOUT == m.HOLD_WINDOW + m.RESUME_GRACE)
+PY
+)
+    [ "$out" = True ] && grep -q "ONEBIT_WEBAPP_UPSTREAM_TIMEOUT" "$t/import.err"
+    check $? "ONEBIT_WEBAPP_UPSTREAM_TIMEOUT=$badval -> the default bound and a stderr note (got '$out', $(head -c 80 "$t/import.err"))"
+done
+start_proxy abc
+pcode=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$pport/")
+[ "$pcode" = 200 ]; check $? "the proxy started with a bad timeout value serves the page (HTTP $pcode)"
+stop_proxy
+
 echo "webapp_proxy_hold_timeout_test: $([ $bad = 0 ] && echo ok || echo FAIL)"
 [ $bad = 0 ]

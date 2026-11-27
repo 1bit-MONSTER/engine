@@ -49,18 +49,42 @@ HOP = ("connection", "keep-alive", "transfer-encoding", "content-length", "host"
 ALLOWED_ORIGINS = {"http://localhost:%d" % PORT, "http://127.0.0.1:%d" % PORT}
 # engine#3478: a held turn waits inside Lemonade (the hold is taken by 1bit-heavy, POST /api/v1/hold) with NO bytes on
 # the wire until the hold ends, and the page's own fetch has no timeout (embed/opt/1bit/webapp/index.html:232) - so the
-# upstream socket timeout below is the only deadline a held turn has. It was a hardcoded 900 s while 1bit-heavy's
+# upstream socket timeout below is the only deadline a held turn has. It is http.client's timeout, which applies to each
+# blocking socket operation (the connect, each read), not to the request as a whole: it bounds the longest SILENCE on the
+# upstream socket, and a streamed answer that keeps sending bytes can run past it. It was a hardcoded 900 s while 1bit-heavy's
 # default hold window is 3600 s: a hold between 15 and 60 minutes cut the page's turn (a 502 that reads as "Lemonade is
 # not answering") while the hold was healthy. The bound is the hold window plus the resume every request had to allow
 # anyway: when the hold ends the captured models reload before the waiting request runs (measured first loads: 93 s on
 # a stick, 154 s on an installed disk, docs/releases.md), then it prefills and answers. 900 s is that old, previously
-# allowed silence, so a request that used to fit inside one socket timeout still fits after a hold.
+# allowed silence, so a request whose longest silence used to fit inside the socket timeout still fits after a hold.
 HOLD_WINDOW = 3600            # 1bit-heavy's --max-seconds default; tests/webapp_proxy_hold_timeout_test.sh fails if the two differ
-RESUME_GRACE = 900            # the whole-request socket timeout this proxy used to allow: kept for the reload after a hold
+RESUME_GRACE = 900            # the per-read socket timeout this proxy used to allow: kept for the reload after a hold
 # ONEBIT_WEBAPP_UPSTREAM_TIMEOUT scales the bound (the test drives it in seconds; an operator can raise it for a slower
 # box). A hold taken with a --max-seconds above the window can still outlast it, and the page's turn is cut at this
 # bound; os/v3/puppy/README.md states both numbers next to the wrapper.
-UPSTREAM_TIMEOUT = int(os.environ.get("ONEBIT_WEBAPP_UPSTREAM_TIMEOUT") or HOLD_WINDOW + RESUME_GRACE)
+DEFAULT_UPSTREAM_TIMEOUT = HOLD_WINDOW + RESUME_GRACE
+
+
+def upstream_timeout(raw):
+    """The bound from the env value: a positive integer of seconds, else the default with a note on stderr.
+
+    A bad value used to raise ValueError at import, so a typo in the unit's environment stopped the chat page from
+    starting at all. Empty or unset is the default, silently.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_UPSTREAM_TIMEOUT
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = 0
+    if value <= 0:
+        sys.stderr.write("1bit-webapp-proxy: ONEBIT_WEBAPP_UPSTREAM_TIMEOUT=%r is not a positive whole number of "
+                         "seconds; using the default %d s\n" % (raw, DEFAULT_UPSTREAM_TIMEOUT))
+        return DEFAULT_UPSTREAM_TIMEOUT
+    return value
+
+
+UPSTREAM_TIMEOUT = upstream_timeout(os.environ.get("ONEBIT_WEBAPP_UPSTREAM_TIMEOUT"))
 
 
 def api_key():

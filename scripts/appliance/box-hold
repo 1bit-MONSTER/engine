@@ -141,9 +141,13 @@ while :; do
     for f in $(ls "$Q" 2>/dev/null | LC_ALL=C sort); do   # C collation: the class prefix must not be ignored
         if alive "$f"; then
             [ -n "$first" ] || first=$f
-            # the oldest lane ticket OF A WAITER THAT KNOWS THIS RULE (marker line): measured 2026-11-27 21:57Z, an older copy's
-            # lane waiter only takes the lock when it sorts first, so preferring it would leave the lock free for nobody
-            case $f in 0-*) ;; *) grep -qx box-hold-v3 "$Q/$f" 2>/dev/null && { lane1=$f; break; } ;; esac
+            # the OLDEST live lane ticket, and only if its waiter knows this rule (marker line): measured 2026-11-27 21:57Z,
+            # an older copy's lane waiter only takes the lock when it sorts first, so preferring it would leave the lock free
+            # for nobody. When the oldest lane ticket is such an unmarked one, no lane is preferred this turn (class order) -
+            # a YOUNGER marked lane ticket must not jump it (review cl-release on #3586: measured 32 of 32 queued lane
+            # tickets unmarked after the install, so every new lane ticket would have overtaken all of them). Alternation
+            # switches on by itself once the pre-v3 waiters have drained.
+            case $f in 0-*) ;; *) grep -qx box-hold-v3 "$Q/$f" 2>/dev/null && lane1=$f; break ;; esac
         else
             rm -f "$Q/$f" 2>/dev/null   # a dead waiter's ticket (another user's stays until its owner or root sweeps it; it is skipped either way)
         fi

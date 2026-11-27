@@ -420,7 +420,14 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
         fs::create_directories(link.parent_path(), ec);
         fs::remove(link, ec);
         fs::create_symlink(target, link, ec);
-        if (ec) { why = "cannot link " + link.string() + " -> " + target.string() + ": " + ec.message(); continue; }
+        if (ec) {
+            // a link the card needs and cannot get (a non-root shell and a root-owned cards dir, engine#3545 review): the
+            // card is not usable as it stands, so serve takes the llama.cpp route instead of starting Loom on a stale link
+            why += std::string(why.empty() ? "" : "; ") + "cannot link " + link.string() + " -> " + target.string() + ": " +
+                   ec.message();
+            if (refused) *refused = true;
+            continue;
+        }
         ++made;
     }
     return made;

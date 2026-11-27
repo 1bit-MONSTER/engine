@@ -202,6 +202,24 @@ int main() {
         std::string swhy;
         const int sm = loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(),
                                                        swhy, &refused);
+        // a link the card needs but cannot write (a read-only parameter/ dir: a non-root shell vs the appliance's root-owned
+        // /data/loom-cards) refuses the card, so serve takes the llama.cpp route instead of starting Loom on a missing link
+        {
+            fs::create_directories(dir / "lc5" / "parameter");
+            std::ofstream(dir / "lc5" / "model.json") << R"({"model":{"id":"M5"},"variants":{"gguf":{"services":{"chat":{"parameters":{)"
+                R"("model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"}]}}}}}}})";
+            fs::permissions(dir / "lc5" / "parameter", fs::perms::owner_read | fs::perms::owner_exec);
+            bool r5 = false;
+            std::string w5;
+            const int n5 = loom::loom_link_card_parameters((dir / "lc5" / "model.json").string(), (dir / "snap" / "m.gguf").string(), w5, &r5);
+            if (geteuid() == 0) {
+                std::printf("skip (running as root, a read-only dir does not stop root): a link that cannot be written refuses the card\n");
+            } else {
+                check("a link that cannot be written refuses the card (and says why)",
+                      n5 == 0 && r5 && w5.find("cannot link") != std::string::npos);
+            }
+            fs::permissions(dir / "lc5" / "parameter", fs::perms::owner_all);
+        }
         // a file the card lists but nothing beside the model provides (an unused variant) does not refuse the card
         {
             fs::create_directories(dir / "lc2" / "parameter");

@@ -151,9 +151,10 @@ jobs:
         run: |
           set -euo pipefail
           # The bench runner is the appliance box, prepared the way hrx-build.yml prepares it. First the tools
-          # hw-gate.sh calls; the command checks keep this a no-op on a runner that already has them.
+          # hw-gate.sh and the status steps call (gh: run 45949440667 died `gh: command not found`); the command
+          # checks keep this a no-op on a runner that already has them.
           missing=()
-          for pair in curl:curl ninja:ninja-build ccache:ccache cmake:cmake git:git; do
+          for pair in curl:curl ninja:ninja-build ccache:ccache cmake:cmake git:git gh:gh; do
             command -v "${pair%%:*}" >/dev/null 2>&1 || missing+=("${pair#*:}")
           done
           if [ "${#missing[@]}" -gt 0 ]; then

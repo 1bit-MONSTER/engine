@@ -1005,7 +1005,54 @@ def selftest():
     ok(not route_has_token_ids([{"runs": [{"tokens": [{"id": None, "token": "a"}]}]}])
        and route_has_token_ids([{"runs": [{"tokens": [{"id": 7, "token": "a"}]}]}]),
        "route_has_token_ids: our serve's id-less entries are detected, a fork-style entry is not flagged")
+    # --load-route: a saved arm is taken only when it answered the same requests the same way (engine#3482)
+    import os
+    import tempfile
+    from types import SimpleNamespace
+    want = SimpleNamespace(max_tokens=64, top_logprobs=5, thinking="off", with_reasoning=False)
+    saved = {"model": "m", "max_tokens": 64, "top_logprobs": 5, "thinking": "off", "with_reasoning": False,
+             "routes_body": {"loom": "minimal"},
+             "routes": {"loom": [{"prompt": q, "runs": [{"text": "x", "tokens": []}]} for q in PROMPTS]}}
+
+    def refused(rep, label="loom"):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(rep, f)
+        try:
+            return load_route(path, label, want)
+        except ValueError:
+            return None
+        finally:
+            os.unlink(path)
+    got = refused(saved)
+    ok(got is not None and got["body"] == "minimal" and len(got["per_prompt"]) == len(PROMPTS),
+       "load_route: a matching report loads with its body and every prompt")
+    ok(refused(dict(saved, max_tokens=32)) is None and refused(dict(saved, thinking="on")) is None,
+       "load_route: a report made with other tokens or thinking is refused")
+    ok(refused(dict(saved, routes={"loom": saved["routes"]["loom"][:-1]})) is None,
+       "load_route: a report missing a prompt is refused")
+    ok(refused(saved, "cpu") is None, "load_route: a label the report does not have is refused")
     print(f"logprob_agree selftest: {named[0]} ok, {named[1]} failed (KLD arms named; the rest assert)")
+
+
+def load_route(path, label, a):
+    """Route LABEL's answers from an earlier --json report, after checking it asked the same questions the same way:
+    the same PROMPTS (in order) and the same tokens, top-logprobs, thinking and reasoning settings. Anything else would
+    compare answers to different requests."""
+    with open(path) as f:
+        rep = json.load(f)
+    if label not in rep.get("routes", {}):
+        raise ValueError(f"no route {label!r} in {path} (it has {sorted(rep.get('routes', {}))})")
+    for key, want in (("max_tokens", a.max_tokens), ("top_logprobs", a.top_logprobs), ("thinking", a.thinking),
+                      ("with_reasoning", a.with_reasoning)):
+        if rep.get(key) != want:
+            raise ValueError(f"{path} was made with {key}={rep.get(key)!r}, this run uses {want!r}")
+    per_prompt = rep["routes"][label]
+    got = [x.get("prompt") for x in per_prompt]
+    if got != list(PROMPTS[:len(got)]) or len(got) != len(PROMPTS):
+        raise ValueError(f"{path} route {label!r} answered {len(got)} prompts that are not this tool's {len(PROMPTS)}")
+    return {"per_prompt": per_prompt, "body": rep.get("routes_body", {}).get(label, "full"),
+            "model": rep.get("model"), "path": path}
 
 
 def main(argv=None):
@@ -1041,14 +1088,18 @@ def main(argv=None):
                    help="a split counts as a disagreement when the arbiter's log-prob gap from its top token to the route's token there exceeds this, or the route's token is not in its top-N")
     p.add_argument("--timeout", type=float, default=300.0)
     p.add_argument("--json", default=None, help="write the full report here")
+    p.add_argument("--load-route", action="append", default=[], metavar="LABEL=REPORT.json",
+                   help="take route LABEL's answers from an earlier --json report instead of querying a server: lets "
+                        "the arms of a model too large to serve side by side run one after another (engine#3482); "
+                        "the report must have used the same prompts, tokens, top-logprobs, thinking and reasoning")
     p.add_argument("--selftest", action="store_true", help="check the comparison logic and exit")
     a = p.parse_args(argv)
 
     if a.selftest:
         selftest()
         return 0
-    if not a.route:
-        p.error("at least one --route LABEL=URL is required")
+    if not a.route and not a.load_route:
+        p.error("at least one --route LABEL=URL (or --load-route LABEL=REPORT.json) is required")
 
     routes = []
     for spec in a.route:
@@ -1056,12 +1107,27 @@ def main(argv=None):
         if not url:
             p.error(f"--route needs LABEL=URL[:minimal|:full], got {spec!r}")
         routes.append((label, url, mode))
+    loaded = {}
+    for spec in a.load_route:
+        label, _, path = spec.partition("=")
+        if not label or not path:
+            p.error(f"--load-route needs LABEL=REPORT.json, got {spec!r}")
+        try:
+            loaded[label] = load_route(path, label, a)
+        except (OSError, ValueError, KeyError) as e:
+            p.error(f"--load-route {spec}: {e}")
+        routes.append((label, None, loaded[label]["body"]))
+    if len({label for label, _, _ in routes}) != len(routes):
+        p.error("each route label may appear once (live or loaded)")
 
     # /v1/models is the liveness probe, not /v1/health: an idle llama-server reports
     # {"status":"stalled"} on /health (503) and clears it on the next request, so the health
     # route fails an endpoint that is perfectly usable.  503 there is not a hung backend.
     model = a.model
     for label, url, _ in routes:
+        if url is None:            # a loaded route answered earlier; its model id is in its report
+            model = model or loaded[label]["model"]
+            continue
         try:
             models = get(bare(url) + "/v1/models", 10)
         except Exception as e:  # noqa: BLE001
@@ -1086,6 +1152,11 @@ def main(argv=None):
     thinking = a.thinking == "on"
 
     for label, url, mode in routes:
+        if url is None:
+            report["routes_body"][label] = loaded[label]["body"]
+            report["routes"][label] = loaded[label]["per_prompt"]
+            report.setdefault("loaded_routes", {})[label] = loaded[label]["path"]
+            continue
         minimal = (mode or a.body) == "minimal"
         report["routes_body"][label] = "minimal" if minimal else "full"
         per_prompt = []

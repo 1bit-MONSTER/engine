@@ -35,7 +35,7 @@ cat > "$t/1bit-update" <<'SH'
 case "$1" in
     --status) echo "1bit-update: active slot = 1bit (data partition on nvme0n1, ESP /dev/nvme0n1p1)" ;;
     --check)  printf 'running:  v2026.49-rc1\ntest: v2026.49-rc9 (2026-11-27, pre-release)\nan update is available: 1bit-update --latest installs it into the other slot\n' ;;
-    --latest) echo "downloading v2026.49-rc9"; sleep 2; echo "UPDATED: /1bit-alt"; exit 0 ;;
+    --latest) echo "downloading v2026.49-rc9"; echo "env-pub=[${ONEBIT_UPDATE_PUB:-}] env-any=[${ONEBIT_UPDATE_ANY:-}]"; sleep 2; echo "UPDATED: /1bit-alt"; exit 0 ;;
     --rollback) echo "rolled back: next boot is /1bit-alt" ;;
 esac
 SH
@@ -45,7 +45,8 @@ start() {   # [admin uid]
     port=$(free_port)
     ONEBIT_WEBAPP_PORT=$port ONEBIT_WEBAPP_CONF=$t/none ONEBIT_WEBAPP_APP=$here/os/v3/puppy/embed/opt/1bit/webapp \
     ONEBIT_UPDATE_BIN=$t/1bit-update ONEBIT_WEBAPP_UPDATE_LOG=$t/update.log ONEBIT_WEBAPP_TEST_ADMIN_UID=${1:-} \
-    ONEBIT_WEBAPP_TEST_REBOOT="touch $t/rebooted" PYTHONDONTWRITEBYTECODE=1 python3 "$proxy" > "$t/proxy.log" 2>&1 &
+    ONEBIT_WEBAPP_TEST_REBOOT="touch $t/rebooted" ONEBIT_UPDATE_PUB=$t/attacker.pub ONEBIT_UPDATE_ANY=1 \
+    PYTHONDONTWRITEBYTECODE=1 python3 "$proxy" > "$t/proxy.log" 2>&1 &
     proxy_pid=$!
     for _ in $(seq 50); do curl -s -o /dev/null "http://127.0.0.1:$port/" && return 0; sleep 0.1; done
     return 1
@@ -72,6 +73,8 @@ stop
 start "$(id -u)" || { echo "FAIL the proxy did not start"; exit 1; }
 [ "$(U "http://127.0.0.1:$port/1bit/update/status")" = 200 ] && [ "$(j admin)" = True ]; check $? "status says the admin client is admin"
 H='X-1bit-Update: 1'
+[ "$(P "http://127.0.0.1:$port/1bit/update/latest" -d '{"confirm":"v2026.49-rc9"}')" = 403 ] && grep -q "X-1bit-Update" "$t/body" && [ ! -s "$t/update.log" ]
+check $? "even the ADMIN client is refused without X-1bit-Update (the boundary against a root daemon relaying a request)"
 [ "$(P -H "$H" "http://127.0.0.1:$port/1bit/update/latest" -d '{"confirm":"v2026.50"}')" = 400 ] && grep -q "v2026.49-rc9" "$t/body"
 check $? "install with the wrong confirmation is refused (400) and names the offered release"
 [ "$(P -H "$H" "http://127.0.0.1:$port/1bit/update/latest" -d 'not json')" = 400 ]; check $? "a body that is not JSON is refused (400)"
@@ -80,6 +83,7 @@ check $? "install with the wrong confirmation is refused (400) and names the off
 for _ in $(seq 60); do U "http://127.0.0.1:$port/1bit/update/progress" > /dev/null; [ "$(j job running)" = False ] && break; sleep 0.1; done
 [ "$(j job rc)" = 0 ] && [ "$(j job action)" = "install v2026.49-rc9" ] && j log | grep -q "UPDATED: /1bit-alt"
 check $? "progress shows the finished install, its exit 0 and its output"
+j log | grep -qF 'env-pub=[] env-any=[]'; check $? "the proxy's ONEBIT_UPDATE_PUB / ONEBIT_UPDATE_ANY never reach 1bit-update (fixed child environment)"
 [ "$(stat -c %a "$t/update.log")" = 600 ]; check $? "the action log is root-only (0600)"
 [ "$(P -H "$H" "http://127.0.0.1:$port/1bit/update/rollback" -d '{"confirm":"1bit"}')" = 400 ]; check $? "rollback to the wrong slot is refused (400)"
 [ "$(P -H "$H" "http://127.0.0.1:$port/1bit/update/rollback" -d '{"confirm":"1bit-alt"}')" = 202 ]; check $? "rollback to the other slot starts (202)"

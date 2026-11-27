@@ -105,11 +105,18 @@ UPSTREAM_TIMEOUT = upstream_timeout(os.environ.get("ONEBIT_WEBAPP_UPSTREAM_TIMEO
 # which a process cannot forge (the box's desktop browser runs as root; spot, daemons and sandbox users do not) - and
 # it must carry X-1bit-Update: 1 (a cross-site page cannot set that header without a CORS preflight this proxy never
 # answers) and pass the Origin rule above. One action at a time; its output goes to a log the status shows.
-UPDATE_BIN = os.environ.get("ONEBIT_UPDATE_BIN", "/usr/local/bin/1bit-update")
-UPDATE_LOG = os.environ.get("ONEBIT_WEBAPP_UPDATE_LOG", "/var/log/1bit-update-web.log")
-# TEST hooks, inert when this process is root (as it always is on the box): the uid treated as the administrator,
-# and a command that stands in for reboot
+# WHICH RULE STOPS WHAT (review cl-flm): the uid check stops NON-ROOT local processes. It does not stop a ROOT daemon
+# that can be made to relay a request (lemond runs as root and listens on the LAN; a provider/base-URL or "fetch this
+# URL" feature makes requests from a uid-0 socket). Against those, the boundary is X-1bit-Update + the exact JSON
+# confirmation: a relayed request controls neither. Neither of them is redundant; do not drop one for the other.
+# The child gets a FIXED environment (PATH, LANG): 1bit-update reads its trust anchor and verifier overrides
+# (ONEBIT_UPDATE_PUB/_VERIFIER/_ANY/_API_JSON) from the environment, and this proxy's own must never reach it.
 _AS_ROOT = os.geteuid() == 0
+UPDATE_BIN = "/usr/local/bin/1bit-update" if _AS_ROOT else os.environ.get("ONEBIT_UPDATE_BIN", "/usr/local/bin/1bit-update")
+UPDATE_LOG = "/var/log/1bit-update-web.log" if _AS_ROOT else os.environ.get("ONEBIT_WEBAPP_UPDATE_LOG", "/var/log/1bit-update-web.log")
+CHILD_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"}
+# TEST hooks, inert when this process is root (as it always is on the box): the uid treated as the administrator,
+# and a command that stands in for reboot (and, above, the 1bit-update binary and the log path)
 _TEST_ADMIN = os.environ.get("ONEBIT_WEBAPP_TEST_ADMIN_UID", "")
 ADMIN_UID = int(_TEST_ADMIN) if (_TEST_ADMIN.isdigit() and not _AS_ROOT) else 0
 REBOOT_CMD = ["reboot"] if _AS_ROOT or not os.environ.get("ONEBIT_WEBAPP_TEST_REBOOT") else \
@@ -142,7 +149,7 @@ def peer_uid(client, server_port, table="/proc/net/tcp"):
 def run_text(args, timeout=90):
     try:
         r = subprocess.run([UPDATE_BIN] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
-                           stdin=subprocess.DEVNULL)
+                           stdin=subprocess.DEVNULL, env=dict(CHILD_ENV))
         return r.returncode, r.stdout.decode("utf-8", "replace")
     except (OSError, subprocess.TimeoutExpired) as e:
         return 127, "1bit-update did not run: %s" % e
@@ -186,7 +193,8 @@ def start_job(action, argv):
             with os.fdopen(fd, "wb") as log:
                 log.write(("== %s (%s)\n" % (action, time.strftime("%Y-%m-%d %H:%M:%S"))).encode())
                 log.flush()
-                rc = subprocess.call(argv, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+                rc = subprocess.call(argv, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                     env=dict(CHILD_ENV))
         except OSError:
             pass
         with _job_lock:

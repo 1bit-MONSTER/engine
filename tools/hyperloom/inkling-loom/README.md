@@ -123,3 +123,20 @@ nothing (the CLI prints that warning). `--no-kernel` alone keeps EXPLORE and dro
 
 Run the entrypoint by hand once first (`RESULT_DIR=/some/dir bash custom_radeon8060s.sh`) and read
 `inferencex_result.json`.
+
+## Screen cache (box queue 30-40 deep)
+
+One Hyperloom round per ticket takes days per model at today's queue depth. `../screen.sh` measures a batch of lever
+sets (the seed grid: baseline + variants) back to back in ONE `box-hold` ticket with the same allowlisted box side, and
+files each measurement under `SCREEN_DIR/<key>`, key = sha256 over the box side's revision and the sorted lever list
+(`hl_screen_key` in `../box_ticket.sh`). A round started with `--extra-env HL_SCREEN_DIR=<that dir>` whose exact lever
+set was screened within `HL_SCREEN_MAX_AGE` seconds (default 12 h) reads that measurement and is scored as usual;
+every other round (the framework agent's own proposals) runs its own ticket.
+
+```sh
+bash tools/hyperloom/screen.sh inkling-loom ~/hyperloom-ws/screen/qwen38 \
+    "HL_CARD_NAME=qwen38-27b-3e43d41d,HL_RAM_NEED_GB=40,HL_RUNS=3" - HL_DRAFT_DEPTH=4 HL_DRAFT_DEPTH=5 HL_WORKERS=16
+```
+
+COMMON must carry exactly the pins the run's rounds carry (`--extra-env`), or no key matches. A screened
+measurement is a screen, not a KEEP: every KEEP is re-validated A C A C in one ticket against a fresh baseline.

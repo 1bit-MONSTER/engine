@@ -20,7 +20,10 @@ set -u
 here=$(cd "$(dirname "$0")/.." && pwd); R=$here/scripts/gpu-step-reap
 t=$(mktemp -d); trap 'for p in $(pgrep -f "gpu-step-reap-sleeper-$$"); do pkill -KILL -P "$p"; kill -KILL "$p"; done 2> /dev/null; rm -rf "$t"' EXIT
 bad=0; ok() { echo "ok   $*"; }; no() { echo "FAIL $*"; bad=$((bad + 1)); }
-alive() { pgrep -f "gpu-step-reap-sleeper-$$-$1" > /dev/null 2>&1; }
+# Match the SLEEPER ITSELF ("/bin/sh <dir>/gpu-step-reap-sleeper-<pid>-<x> <secs>"), anchored: the helper's own command
+# line also contains the marker (it is in the step it was given), and an unanchored `pgrep -f` saw "alive" before the
+# helper had even set its trap - on a slow CI runner the TERM then hit the default handler (rc 143, no reap line).
+alive() { pgrep -f "^/bin/sh $t/gpu-step-reap-sleeper-$$-$1 " > /dev/null 2>&1; }
 for x in a b c d e; do printf '#!/bin/sh\nsleep "$1"\n:\n' > "$t/gpu-step-reap-sleeper-$$-$x"; chmod +x "$t/gpu-step-reap-sleeper-$$-$x"; done   # named sleepers pgrep can find (a shell + its sleep child)
 
 # 1. the exit code passes through
@@ -48,13 +51,20 @@ HOLD_REAP_GRACE_S=1 sh "$R" 30 true
 alive d && ok "a process outside the step's session is left alone" || no "an unrelated process was killed"
 pkill -KILL -f "gpu-step-reap-sleeper-$$-d"; pkill -KILL -P "$!" 2> /dev/null; sleep 0.2   # the marker shell and its sleep child
 
-# 6. the HELPER is signalled mid-step (a CI cancel): it reaps the step's session before exiting 143 (review cl-release)
-HOLD_REAP_GRACE_S=1 sh "$R" 60 sh -c "$t/gpu-step-reap-sleeper-$$-e 300 & sleep 60" 2> "$t/e6" & hp=$!
-n=0; while ! alive e && [ $n -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
-kill -TERM "$hp"; wait "$hp"; rc=$?
-sleep 0.5
-[ $rc = 143 ] && ! alive e && grep -q "signalled; reaping" "$t/e6" && ok "a signalled helper reaps the step's session, then exits 143" \
-    || no "signalled helper: rc $rc, child alive: $(alive e && echo yes || echo no), stderr: $(cat "$t/e6")"
+# 6. the HELPER is signalled mid-step (a CI cancel): it reaps the step's session before exiting 143 (review cl-release).
+#    `exec` so $! IS the helper (with `VAR=.. cmd 2>f &` some shells' $! is a wrapper subshell, and the TERM would kill
+#    that instead), and a slow runner gets up to 20 s for the step's child to appear before the signal.
+( exec env HOLD_REAP_GRACE_S=1 sh "$R" 60 sh -c "$t/gpu-step-reap-sleeper-$$-e 300 & sleep 60" 2> "$t/e6" ) & hp=$!
+n=0; while ! alive e && [ $n -lt 200 ]; do sleep 0.1; n=$((n + 1)); done
+if ! alive e; then no "signalled helper: setup - the step's child never started within 20 s"
+else
+    sleep 0.3   # the helper is in its wait loop with the trap set
+    kill -TERM "$hp"; wait "$hp"; rc=$?
+    n=0; while alive e && [ $n -lt 100 ]; do sleep 0.1; n=$((n + 1)); done   # the reap's grace is 1 s
+    [ $rc = 143 ] && ! alive e && ! kill -0 "$hp" 2> /dev/null && grep -q "signalled; reaping" "$t/e6" \
+        && ok "a signalled helper reaps the step's session, then exits 143" \
+        || no "signalled helper: rc $rc, child alive: $(alive e && echo yes || echo no), helper alive: $(kill -0 "$hp" 2> /dev/null && echo yes || echo no), stderr: $(cat "$t/e6")"
+fi
 
 echo "gpu_step_reap_test: $([ $bad = 0 ] && echo ok || echo FAIL)"
 [ $bad = 0 ]

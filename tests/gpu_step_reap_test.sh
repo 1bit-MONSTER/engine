@@ -21,7 +21,7 @@ here=$(cd "$(dirname "$0")/.." && pwd); R=$here/scripts/gpu-step-reap
 t=$(mktemp -d); trap 'for p in $(pgrep -f "gpu-step-reap-sleeper-$$"); do pkill -KILL -P "$p"; kill -KILL "$p"; done 2> /dev/null; rm -rf "$t"' EXIT
 bad=0; ok() { echo "ok   $*"; }; no() { echo "FAIL $*"; bad=$((bad + 1)); }
 alive() { pgrep -f "gpu-step-reap-sleeper-$$-$1" > /dev/null 2>&1; }
-for x in a b c d; do printf '#!/bin/sh\nsleep "$1"\n:\n' > "$t/gpu-step-reap-sleeper-$$-$x"; chmod +x "$t/gpu-step-reap-sleeper-$$-$x"; done   # named sleepers pgrep can find (a shell + its sleep child)
+for x in a b c d e; do printf '#!/bin/sh\nsleep "$1"\n:\n' > "$t/gpu-step-reap-sleeper-$$-$x"; chmod +x "$t/gpu-step-reap-sleeper-$$-$x"; done   # named sleepers pgrep can find (a shell + its sleep child)
 
 # 1. the exit code passes through
 HOLD_REAP_GRACE_S=1 sh "$R" 30 sh -c 'exit 7'; [ $? = 7 ] && ok "the step's exit code is returned" || no "exit code not returned"
@@ -47,6 +47,14 @@ $t/gpu-step-reap-sleeper-$$-d 300 > /dev/null 2>&1 < /dev/null &
 HOLD_REAP_GRACE_S=1 sh "$R" 30 true
 alive d && ok "a process outside the step's session is left alone" || no "an unrelated process was killed"
 pkill -KILL -f "gpu-step-reap-sleeper-$$-d"; pkill -KILL -P "$!" 2> /dev/null; sleep 0.2   # the marker shell and its sleep child
+
+# 6. the HELPER is signalled mid-step (a CI cancel): it reaps the step's session before exiting 143 (review cl-release)
+HOLD_REAP_GRACE_S=1 sh "$R" 60 sh -c "$t/gpu-step-reap-sleeper-$$-e 300 & sleep 60" 2> "$t/e6" & hp=$!
+n=0; while ! alive e && [ $n -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+kill -TERM "$hp"; wait "$hp"; rc=$?
+sleep 0.5
+[ $rc = 143 ] && ! alive e && grep -q "signalled; reaping" "$t/e6" && ok "a signalled helper reaps the step's session, then exits 143" \
+    || no "signalled helper: rc $rc, child alive: $(alive e && echo yes || echo no), stderr: $(cat "$t/e6")"
 
 echo "gpu_step_reap_test: $([ $bad = 0 ] && echo ok || echo FAIL)"
 [ $bad = 0 ]

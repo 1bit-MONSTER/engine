@@ -34,7 +34,8 @@
 # (engine#1077; owner 2026-11-06: move it to bench). Same box, so TheRock at /opt/rocm-therock
 # (cmake/hrx.cmake's default without a fetched SDK). The runner runs one job at a time, and the tree
 # is its own (~/.cache/hrx-build/bench), so no two runs share a tree.
-# The build runs under ~/lb/thermal-run.sh (4 cores, paused at 78 C) like every build on the box.
+# The build runs under the in-tree scripts/thermal-run.sh (nice 19, frozen at 78 C, killed at 93 C) with -j 4; the
+# script pins no cores, so -j is the only limit on how many compilers run.
 # A PR whose only trigger change is test registration in CMakeLists.txt (add_test/set_tests_properties lines,
 # comments, blanks) configures with ONEBIT_HRX=ON and skips the compile: such a line creates no target and sets
 # no flag, but it is still evaluated at configure time, including inside if(ONEBIT_HRX) blocks ci.yml never
@@ -74,7 +75,7 @@ jobs:
     concurrency:
       group: hrx-build-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
-    # a cold build (both pins moved) on 4 throttled cores; an incremental one takes minutes
+    # a cold build (both pins moved) at -j 4 under thermal-run; an incremental one takes minutes
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,7 +126,7 @@ jobs:
           ONEBIT_BUILD_ENGINE: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          ~/lb/thermal-run.sh cmake -S . -B "$HRX_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          scripts/thermal-run.sh cmake -S . -B "$HRX_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DONEBIT_HRX=ON -DONEBIT_HRX_BUILD_TESTS=ON
 
@@ -146,7 +147,7 @@ jobs:
         run: |
           set -euo pipefail
           # the guard outside thermal-run: SIGTERM makes thermal-run end its whole scope (ninja and the compilers)
-          scripts/mem-guard.sh --term 12 ~/lb/thermal-run.sh cmake --build "$HRX_BUILD" --target onebit -j 4
+          scripts/mem-guard.sh --term 12 scripts/thermal-run.sh cmake --build "$HRX_BUILD" --target onebit -j 4
           # the build must have produced the HRX backend and the server onebit runs
           ls -l "$HRX_BUILD"/hrx/llama/bin/llama-server
           find "$HRX_BUILD"/hrx/llama -name 'libggml-hrx.so*' -print -quit | grep .
@@ -198,13 +199,18 @@ jobs:
           # without ggml/src on its include path) and an aborted build would take the other 33 binaries with it.
           # The failure is not swallowed: ctest reports that row as `Not Run` and the baseline names it, so the
           # ratchet answers, and a row that stops building while the baseline says it runs is a new failure.
-          scripts/mem-guard.sh --term 12 ~/lb/thermal-run.sh cmake --build "$fork" -j 4 -- -k 0 \
+          scripts/mem-guard.sh --term 12 scripts/thermal-run.sh cmake --build "$fork" -j 4 -- -k 0 \
             || echo "one or more fork test targets did not build; ctest reports them as Not Run"
           # A ctest row inherits no environment from the engine, and HRX dlopens the HSA runtime itself: the
           # distro's libhsa-runtime64 has no `hsa_amd_queue_create`, so every device row reports
           # "test skipped: no device available" and — because the fork registers that as a failing regex — a
           # FAIL, not a skip. Pass the runtime this configure resolved (cmake/hrx.cmake:137, engine#1766).
           libhsa="$(sed -n 's/^ONEBIT_HRX_LIBHSA:FILEPATH=//p' "$HRX_BUILD/CMakeCache.txt")"
+          # An empty value would make every check below pass on nothing (`ldd ""` prints no 'not found'), so refuse it.
+          if [ -z "$libhsa" ] || [ ! -e "$libhsa" ]; then
+            echo "::error::ONEBIT_HRX_LIBHSA in $HRX_BUILD/CMakeCache.txt is '${libhsa}', not an HSA runtime on disk"
+            exit 1
+          fi
           export IREE_HAL_AMDGPU_LIBHSA_PATH="$libhsa"
           echo "fork tests: HSA runtime $IREE_HAL_AMDGPU_LIBHSA_PATH"
           # ... and now that this runner HAS a device (engine#3126), the four lines above are not enough: HRX
@@ -224,7 +230,8 @@ jobs:
                    "$sdk_root"/lib/python*/site-packages/_rocm_sdk_*/lib/rocm_sysdeps/lib; do
             if [ -d "$d" ]; then lib_dirs+=("$d"); fi   # not `[ -d ] && ...`: set -e exits on a failing AND-list
           done
-          export LD_LIBRARY_PATH="$(IFS=:; echo "${lib_dirs[*]}")"
+          # prepend: the runner's own loader path stays behind the SDK's dirs
+          export LD_LIBRARY_PATH="$(IFS=:; echo "${lib_dirs[*]}")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Fail here, with the missing sonames, rather than 20 rows later as 'no device available'.
           if LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ldd "$libhsa" | grep -q 'not found'; then
             echo "::error::the HSA runtime still has unresolved dependencies, so every device row will skip"

@@ -615,6 +615,8 @@ set_tests_properties(grow_data PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(npu_catalogue_filter_self ${CMAKE_SOURCE_DIR}/tools/npu_catalogue_filter.py --self-test)  # engine#3287
 add_test(NAME pstore_harvest COMMAND sh ${CMAKE_SOURCE_DIR}/tests/pstore_harvest_test.sh)
 add_test(NAME thermal_log COMMAND sh ${CMAKE_SOURCE_DIR}/tests/thermal_log_test.sh)
+# scripts/thermal-run.sh: rc passthrough, and a job frozen when the sensor becomes unreadable is thawed and reported.
+add_test(NAME thermal_run COMMAND sh ${CMAKE_SOURCE_DIR}/tests/thermal_run_test.sh)
 add_test(NAME npu_idle_evict COMMAND sh ${CMAKE_SOURCE_DIR}/tests/npu_idle_evict_test.sh)
 add_test(NAME heavy_wrapper COMMAND sh ${CMAKE_SOURCE_DIR}/tests/heavy_wrapper_test.sh)
 # engine#3478: a held turn waits in Lemonade's load path with no bytes on the wire until the hold ends, and the appliance

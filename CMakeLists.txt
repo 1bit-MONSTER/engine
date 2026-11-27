@@ -1026,6 +1026,9 @@ add_test(NAME hw_gate_npu_phases COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_
 # the 1bit OS appliance: GPU steps and NPU phases queue with box-hold (one ticket each, lock fds closed in the step), the
 # repo gpu-hold wrapper is skipped, and a gate already inside a box-hold ticket does not re-queue. Stubs only, no device.
 add_test(NAME hw_gate_box_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_box_hold_test.sh)
+# hrx-build's device rows (fork_ctest_known_fail) take a box-hold gpu ticket on the appliance (the runner can open /dev/kfd
+# since 2026-11-26). The step's snippet is extracted from the workflow and run with stub box-hold and ctest. No device.
+add_test(NAME hrx_build_box_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hrx_build_box_hold_test.sh)
 # engine#3079: the NPU link gate configured third_party/llama.cpp -- a tree that defines no npu_rt_shim_test -- so it
 # could never pass and said "the runtime does not link" about a configure that never read the engine. Text-level arms
 # pin the tree, the two targets, and the order that makes "did not run" distinct from "does not link".

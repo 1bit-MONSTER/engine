@@ -1,0 +1,60 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# engine#3156: the Loom coverage map over every public card source, in CI. The cards are GB downloads, so this reads
+# only each card's model.json + model.json.lock (tools/loom_card_meta.py, a few MB in all) and runs
+# tools/ci/loom_coverage_check.py on that tree. Advisory: the map goes to the job summary and the job never fails on
+# coverage (an uncovered model is a plan item, not a defect of whichever PR runs it). No secrets: public HF API only.
+
+name: loom-coverage
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "config/loom-routes.json"
+      - "config/loom-cards.json"
+      - "models/pins.json"
+      - "registry/check_models.tsv"
+      - "tools/ci/loom_coverage_check.py"
+      - "tools/loom_card_meta.py"
+      - ".github/workflows/loom-coverage.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Self-tests
+        run: |
+          python3 tools/loom_card_meta.py --self-test
+          python3 tools/ci/loom_coverage_check.py --self-test
+
+      - name: Card metadata (loom-fun, loom-draft, 1bit-MONSTER)
+        run: python3 tools/loom_card_meta.py --org loom-fun --org loom-draft --org 1bit-MONSTER --out cards
+
+      - name: Coverage map
+        run: |
+          set -o pipefail
+          python3 tools/ci/loom_coverage_check.py --cards cards/loom-fun --cards cards/loom-draft \
+            --cards cards/1bit-MONSTER --advisory | tee coverage.txt || true
+          { echo '## Loom coverage (engine#3156)'; echo; echo '```'; cat coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

@@ -71,7 +71,7 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
   `CMakeLists.txt` entry with no changed lines (a mode change or rename), or a crash. Every changed line in **every**
   registration file is read, so a target change in a family file next to an `add_test` in `CMakeLists.txt` builds.
 - **Where.** On the box's bench runner (`strixhalo-bench`, `[self-hosted, strixhalo, bench]`), with TheRock at
-  `/opt/rocm-therock`, under `~/lb/thermal-run.sh`. That is not the gate's pr-agent runner, which a cold build would hold
+  `/opt/rocm-therock`, under the in-tree `scripts/thermal-run.sh` (it pins no cores; the build runs `-j 4`). That is not the gate's pr-agent runner, which a cold build would hold
   while every PR-Agent review queued behind it. It takes no GPU token and no NPU lock. Fork PRs never run it. It costs
   no GitHub Actions minutes. The token is read-only, and the build tree persists in `~/.cache/hrx-build/bench` on the
   box, so a later run rebuilds only what changed.

@@ -516,6 +516,15 @@ more class:
   The count and the new ticket are made under the same lock, so two waiters cannot race past it.
 - **Cap:** the same 45-minute limit as CI.
 
+**At most 3 queued tickets per lane (2026-11-27).** cl-inkling once had 19 tickets queued, so box-hold caps each
+lane at `BOX_HOLD_LANE_MAX` (3) **queued** lane tickets. A running ticket has left the queue and does not count, and
+neither do CI and board tickets. A further waiter from the same lane is refused **at once**: it exits 4 with
+`box-hold: lane cap: 3 queued for <lane> …`, writes the same line to `box-hold.log`, and is never queued. The lane is
+the first word of `BOX_HOLD_WHO` when it starts `cl-` or `pi-`: its first two dash tokens (`cl-lb-ink1-A` gives
+`cl-lb`), or the longest name it starts with from `/etc/1bit/box-hold-lanes.conf`
+([source](../scripts/appliance/box-hold-lanes.conf)) for lanes whose own name has a dash (`cl-inkling-npu`). Labels of no
+lane (`coder-llm`, `hw-gate …`) are not capped.
+
 The head of the queue no longer blocks in `flock`; it tries the locks and re-reads the queue between tries. A head
 blocked in `flock -w` never saw a CI ticket that arrived behind it. The same change fixed a defect as old as box-hold:
 `exec 9>lock 2>/dev/null` on a bare `exec` made the `2>/dev/null` permanent, so **every box-hold job's stderr was

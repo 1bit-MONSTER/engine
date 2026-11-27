@@ -85,6 +85,41 @@ if [ "$pfx" = 0-b- ]; then
         pfx=1- cap=0; ignored "the board class already has $_nb ticket(s) queued, the most it takes"
     fi
 fi
+# Lane cap (2026-11-27 orchestrator; cl-inkling had 19 queued): at most BOX_HOLD_LANE_MAX (3) QUEUED lane tickets per
+# lane; running tickets do not count (theirs has left the queue), nor do CI and board tickets. A further waiter from the
+# same lane is refused at once (exit 4). The lane is the label's first word when it starts cl- or pi-: its first two
+# dash tokens (cl-inkling-xyz -> cl-inkling), or the longest name in $BOX_HOLD_LANES (one per line) it starts with, for
+# lanes whose own name has a dash (cl-inkling-npu). Labels of no cl-/pi- lane (coder-llm, hw-gate ...) are not capped.
+LANES=${BOX_HOLD_LANES:-/etc/1bit/box-hold-lanes.conf}
+lane_of() {   # <label> -> the lane, or nothing when the label is not a lane's
+    _w=${1%% *}
+    case "$_w" in cl-?*|pi-?*) ;; *) return 0 ;; esac
+    _best=""
+    if [ -r "$LANES" ]; then
+        while IFS= read -r _l; do
+            case "$_l" in ''|'#'*) continue ;; esac
+            case "$_w" in "$_l"|"$_l"-*) [ "${#_l}" -gt "${#_best}" ] && _best=$_l ;; esac
+        done < "$LANES"
+    fi
+    [ -n "$_best" ] && { printf '%s' "$_best"; return 0; }
+    printf '%s' "$_w" | cut -d- -f1-2
+}
+if [ "$pfx" = 1- ]; then
+    _lane=$(lane_of "${BOX_HOLD_WHO:-}")
+    if [ -n "$_lane" ]; then
+        _nq=0
+        for f in $(ls "$Q" 2>/dev/null | grep -v '^0-'); do
+            alive "$f" || continue
+            [ "$(lane_of "$(head -c 300 "$Q/$f" 2>/dev/null)")" = "$_lane" ] && _nq=$((_nq + 1))
+        done
+        if [ "$_nq" -ge "${BOX_HOLD_LANE_MAX:-3}" ]; then
+            flock -u 7
+            _m="box-hold: lane cap: $_nq queued for $_lane (at most ${BOX_HOLD_LANE_MAX:-3} per lane): ${BOX_HOLD_WHO} refused, not queued"
+            echo "$_m" >&2; echo "$(date -u +%FT%TZ) $_m" >> "$D/box-hold.log" 2>/dev/null
+            exit 4
+        fi
+    fi
+fi
 me=$pfx$(printf '%012d' "$n").$$.$(starttime $$)
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$Q/$me" 2>/dev/null || { echo "box-hold: cannot write $Q/$me" >&2; exit 3; }
 flock -u 7; exec 7>&-

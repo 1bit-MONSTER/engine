@@ -31,6 +31,10 @@
 #  14. board asked for by another label: a lane ticket, reported
 #  15. at most 2 board tickets queued: a third is a lane ticket (reported), served after the lanes ahead of it
 #  16. a board ticket's command has the same 45-min cap (rc 124)
+#  17. lane cap: 3 queued tickets of one lane -> a 4th from that lane is refused AT ONCE (exit 4, "lane cap"), not queued
+#  18. a running ticket does not count: the lane's holder + 2 queued -> a 3rd is still queued
+#  19. lanes are separate: another lane, and a dashed lane name from BOX_HOLD_LANES (cl-inkling-npu vs cl-inkling)
+#  20. CI and board tickets are not counted or capped; a label of no cl-/pi- lane is not capped
 set -u
 BH=${1:?usage: box_hold_fifo_test.sh <box-hold>}
 T=$(mktemp -d); trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$T"' EXIT
@@ -175,6 +179,35 @@ wait
 # 16. board cap
 s=$(date +%s); BOX_HOLD_CI_MAX=1 BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb sh "$BH" gpu sleep 5; rc=$?; d=$(( $(date +%s) - s ))
 [ "$rc" = 124 ] && [ "$d" -le 3 ] && ok "a board ticket's command is capped (rc 124 after ${d}s)" || bad "board cap: rc $rc after ${d}s"
+
+# 17-20: the lane cap
+printf 'cl-inkling-npu\n' > "$T/lanes"; export BOX_HOLD_LANES=$T/lanes
+q() { BOX_HOLD_WHO="$1" sh "$BH" gpu sleep "${2:-0.1}" 2>> "$T/errq" & sleep 0.2; }
+: > "$T/errq"
+sh "$BH" gpu sleep 3 & sleep 0.3
+q "cl-inkling a"; q "cl-inkling b"; q "cl-inkling c"
+s=$(date +%s); BOX_HOLD_WHO="cl-inkling d" sh "$BH" gpu true 2> "$T/err17"; rc=$?; d=$(( $(date +%s) - s ))
+[ "$rc" = 4 ] && [ "$d" -le 1 ] && grep -q "lane cap: 3 queued for cl-inkling" "$T/err17" \
+  && ok "lane cap: the 4th queued ticket of a lane is refused at once (exit 4)" || bad "lane cap: rc $rc after ${d}s [$(cat "$T/err17")]"
+[ -z "$(grep -l 'cl-inkling d' "$T"/locks/queue/* 2> /dev/null)" ] && ok "  ... and it was never queued" || bad "the refused ticket is in the queue"
+BOX_HOLD_WHO="cl-inkling-npu x" sh "$BH" gpu true 2> "$T/err19a" & n1=$!
+BOX_HOLD_WHO="cl-hf y" sh "$BH" gpu true 2> "$T/err19b" & n2=$!
+sleep 0.4
+for f in "$T"/locks/queue/*; do cat "$f"; done 2> /dev/null | grep -q '^cl-inkling-npu x' && grep -q '^cl-hf y' $(ls "$T"/locks/queue/* 2> /dev/null) /dev/null \
+  && ok "other lanes queue normally, incl. a dashed lane name (cl-inkling-npu is not cl-inkling)" || bad "other lanes: [$(cat "$T/err19a" "$T/err19b")]"
+BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb-z sh "$BH" gpu true & sleep 0.3
+for i in 1 2 3 4; do BOX_HOLD_WHO="coder-llm" sh "$BH" gpu true & done; sleep 0.4
+[ "$(grep -l '^coder-llm' "$T"/locks/queue/* 2> /dev/null | wc -l)" = 4 ] && ok "a label of no cl-/pi- lane is not capped (4 queued)" || bad "coder-llm capped: $(grep -l '^coder-llm' "$T"/locks/queue/* 2> /dev/null | wc -l)"
+ls "$T/locks/queue" | grep -q '^0-b-' && ok "a board ticket is not counted or capped" || bad "board ticket missing"
+wait
+# 18. the running ticket does not count
+: > "$T/errq"
+BOX_HOLD_WHO="cl-inkling run" sh "$BH" gpu sleep 2 & sleep 0.3
+q "cl-inkling a"; q "cl-inkling b"
+BOX_HOLD_WHO="cl-inkling c" sh "$BH" gpu true 2> "$T/err18"; rc=$?
+[ "$rc" = 0 ] && ! grep -q "lane cap" "$T/err18" && ok "the lane's running ticket does not count: a 3rd queued one is accepted" || bad "running counted: rc $rc [$(cat "$T/err18")]"
+wait
+unset BOX_HOLD_LANES
 
 [ "$fail" = 0 ] && echo "box_hold_fifo: PASS" || echo "box_hold_fifo: FAIL"
 exit "$fail"

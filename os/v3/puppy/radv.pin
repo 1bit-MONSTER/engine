@@ -24,11 +24,17 @@
 # Only RADV is taken (libvulkan_radeon.so + its ICD file + the package's copyright): NOT lavapipe (libvulkan_lvp.so, a
 # CPU Vulkan driver - offering it would bring the CPU-speed problem back) nor the other vendors' drivers. MIT (Mesa;
 # some files BSD/Khronos/SGI); its libLLVM, libdrm_amdgpu and the Vulkan loader are already in the base.
+# One change to Ubuntu's files (review cl-220): the staged ICD file's library_path is the ABSOLUTE
+# /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so instead of the bare name - neither the cut nor the boot runs ldconfig, so
+# a bare name would rest on an ld.so.cache that does not know the new library.
+# base_mesa: the cut refuses a base whose Mesa is not this build (review cl-buildenv: a woof rebuild or newer BASE would
+# otherwise pair RADV with another libgallium/libLLVM) - re-pin then.
 package  mesa-vulkan-drivers
 version  26.0.8-1ubuntu0.3
-url      http://archive.ubuntu.com/ubuntu/pool/main/m/mesa/mesa-vulkan-drivers_26.0.8-1ubuntu0.3_amd64.deb
+url      https://archive.ubuntu.com/ubuntu/pool/main/m/mesa/mesa-vulkan-drivers_26.0.8-1ubuntu0.3_amd64.deb
 sha256   27db5fa34d50d208b58cc94317b573065329740bb98d0e12b7947b06a9d02a4e
 size     19109714
+base_mesa libgallium-26.0.8-1ubuntu0.3.so
 take     usr/lib/x86_64-linux-gnu/libvulkan_radeon.so
 take     usr/share/vulkan/icd.d/radeon_icd.json
 take     usr/share/doc/mesa-vulkan-drivers/copyright

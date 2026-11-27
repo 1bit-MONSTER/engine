@@ -26,8 +26,9 @@ trap 'rm -rf "${t:?}"' EXIT
 check() { if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; bad=$((bad + 1)); fi; }
 v() { awk -v k="$1" '$1 == k { print $2; exit }' "$pin"; }
 
-printf '%s' "$(v sha256)" | grep -qxE '[0-9a-f]{64}' && [ "$(v size)" -gt 1000000 ] && case "$(v url)" in https://*|http://archive.ubuntu.com/*) true ;; *) false ;; esac
-check $? "the pin names a url on the Ubuntu archive, a 64-hex sha256 and a size"
+printf '%s' "$(v sha256)" | grep -qxE '[0-9a-f]{64}' && [ "$(v size)" -gt 1000000 ] && case "$(v url)" in https://archive.ubuntu.com/*) true ;; *) false ;; esac
+check $? "the pin names an https url on the Ubuntu archive, a 64-hex sha256 and a size"
+[ "$(v base_mesa)" = "libgallium-$(v version).so" ]; check $? "base_mesa names the libgallium of the same Mesa build as the package"
 [ "$(basename "$(v url)")" = "$(v package)_$(v version)_amd64.deb" ]; check $? "the url's file is <package>_<version>_amd64.deb"
 takes=$(awk '$1 == "take" { print $2 }' "$pin" | sort | tr '\n' ' ')
 [ "$takes" = "usr/lib/x86_64-linux-gnu/libvulkan_radeon.so usr/share/doc/mesa-vulkan-drivers/copyright usr/share/vulkan/icd.d/radeon_icd.json " ]
@@ -42,7 +43,8 @@ if [ -f "$c" ] && command -v dpkg-deb > /dev/null; then
     [ "$(cd "$t/real" && find . -type f | sort | tr '\n' ' ')" = "./usr/lib/x86_64-linux-gnu/libvulkan_radeon.so ./usr/share/doc/mesa-vulkan-drivers/copyright ./usr/share/vulkan/icd.d/radeon_icd.json " ] &&
         [ -z "$(find "$t/real" -type f ! -perm 644)" ]
     check $? "  ... exactly the three files, mode 0644"
-    grep -q '"library_path": "libvulkan_radeon.so"' "$t/real/usr/share/vulkan/icd.d/radeon_icd.json"; check $? "  ... the ICD file names libvulkan_radeon.so (Ubuntu's, unmodified)"
+    grep -q '"library_path": "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so"' "$t/real/usr/share/vulkan/icd.d/radeon_icd.json"
+    check $? "  ... the ICD file names the library by its ABSOLUTE path (no ld.so.cache dependence)"
 else
     echo "info the pinned .deb is not cached here: the staging arm did not run (the test never downloads)"
 fi

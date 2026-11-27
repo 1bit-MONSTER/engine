@@ -1260,7 +1260,7 @@ local_system_accounts_verdict() {
     esac
 }
 
-# vulkan_verdict <backend dir present 1/0> <`llama-server --list-devices` output> <1-token run: "ok <what>" | "busy" (the
+# vulkan_verdict <backend dir present 1/0, or 2 = installed but this machine has NO AMD render node> <`llama-server --list-devices` output> <1-token run: "ok <what>" | "busy" (the
 # GPU ticket did not come round) | "none" (no small GGUF staged) | "fail <why>"> <RADV's unresolved libraries, or empty>:
 # Lemonade's llamacpp:vulkan must see the Radeon GPU through Mesa's RADV (os/v3/puppy/radv.pin) - rc1 shipped the Vulkan
 # loader without a driver, so the backend listed as "installed" ran on the CPU (21.5 vs 55.8 tok/s published). The
@@ -1268,6 +1268,7 @@ local_system_accounts_verdict() {
 # (llvmpipe / lavapipe) is a FAIL, and so is a RADV that is present but cannot load. Pure, so --self-test drives it.
 vulkan_verdict() {
     _vi=${1:-0} _vd=${2:-} _vr=${3:-none} _vm=${4:-}
+    [ "$_vi" = 2 ] && { printf 'SKIP no AMD GPU render node on this machine (/sys/class/drm/renderD*/device/vendor 0x1002): a VM or another vendor - nothing for RADV to drive'; return 0; }
     [ "$_vi" = 1 ] || { printf 'SKIP llamacpp:vulkan is not installed on this machine (Lemonade has not fetched it)'; return 0; }
     _vn=$(printf '%s' "$_vd" | grep -m1 -E 'Vulkan[0-9]+:.*RADV' | sed 's/^ *Vulkan[0-9]*: *//' | cut -c1-70)
     if [ -z "$_vn" ]; then
@@ -1566,6 +1567,7 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(vulkan_verdict 1 '  Vulkan0: llvmpipe (LLVM 21.1.8, 256 bits)' none)"   # a CPU Vulkan device
     check FAIL "$(vulkan_verdict 1 "$_vk_ok" 'fail the run used the CPU')"
     check SKIP "$(vulkan_verdict 0 '' none)"
+    check SKIP "$(vulkan_verdict 2 'Available devices:' none)"                     # installed, no AMD node (the QEMU check)
     # root-password: the image's default is '*'; the old default's MD5 form, an empty field and an unreadable file FAIL
     check PASS "$(root_password_verdict '*')"
     check PASS "$(root_password_verdict '!')"
@@ -3675,7 +3677,11 @@ esac
 _vlem=/data/lemonade; [ -d "$_vlem" ] || _vlem=/var/lib/lemonade
 _vb=$_vlem/cache/bin/llamacpp/vulkan
 _vi=0 _vd= _vr=none
-if [ -x "$_vb/llama-server" ]; then
+_vamd=0
+for _vv in /sys/class/drm/renderD*/device/vendor; do [ "$(cat "$_vv" 2> /dev/null)" = 0x1002 ] && _vamd=1; done
+if [ -x "$_vb/llama-server" ] && [ "$_vamd" = 0 ]; then
+    _vi=2                                       # review cl-buildenv: no AMD GPU here (vm-check's QEMU): SKIP, not FAIL
+elif [ -x "$_vb/llama-server" ]; then
     _vi=1
     _vd=$(LD_LIBRARY_PATH=$_vb timeout 60 "$_vb/llama-server" --list-devices 2>&1)
     # present but unloadable (review cl-i679): the libraries the driver needs that the system does not resolve

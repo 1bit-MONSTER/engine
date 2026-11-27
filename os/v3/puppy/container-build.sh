@@ -230,6 +230,9 @@ sh /recipe/lock-root-password.sh "$skeleton/etc/shadow" || {
 echo "   ok: root has no usable password (console autologin and ssh keys only)"
 
 # Mesa's RADV Vulkan driver (os/v3/puppy/radv.pin), so Lemonade's Vulkan backends run on the 8060S and not the CPU
+_bm=$(awk '$1 == "base_mesa" { print $2 }' /recipe/radv.pin)
+[ -e "$skeleton/usr/lib/x86_64-linux-gnu/$_bm" ] || {
+    echo "build: REFUSED: the rootfs's Mesa is not $_bm (radv.pin): RADV must come from the same Mesa build - re-pin it" >&2; exit 1; }
 RADV_CACHE=/tmp/1bit-radv sh /recipe/stage-radv.sh "$skeleton" || {
     echo "build: REFUSED: could not stage Mesa's RADV driver (stage-radv.sh)" >&2; exit 1; }
 echo "   ok: RADV (Mesa $(awk '$1 == "version" { print $2 }' /recipe/radv.pin)) in the rootfs"

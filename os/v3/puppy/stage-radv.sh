@@ -34,7 +34,7 @@ url=$(val url) sha=$(val sha256) size=$(val size)
 if [ -z "$deb" ]; then
     cache=${RADV_CACHE:-$HOME/.cache/1bit-cut/radv}; mkdir -p "$cache"; deb=$cache/$(basename "$url")
     if [ ! -f "$deb" ] || [ "$(sha256sum "$deb" | cut -c1-64)" != "$sha" ]; then
-        curl -fsSL --retry 3 -o "$deb.part" "$url" || { rm -f "$deb.part"; echo "stage-radv.sh: could not download $url" >&2; exit 1; }
+        curl -fsSL --proto =https --proto-redir =https --tlsv1.2 --retry 3 -o "$deb.part" "$url" || { rm -f "$deb.part"; echo "stage-radv.sh: could not download $url" >&2; exit 1; }
         mv -f "$deb.part" "$deb"
     fi
 fi
@@ -46,4 +46,8 @@ for f in $(awk '$1 == "take" { print $2 }' "$pin"); do
     [ -f "$tmp/$f" ] || { echo "stage-radv.sh: the package has no $f" >&2; exit 1; }
     install -D -m 644 "$tmp/$f" "$out/$f"
 done
+# the ICD names the library by its absolute path (see radv.pin): no dependence on an ld.so.cache nobody rebuilds
+icd=$out/usr/share/vulkan/icd.d/radeon_icd.json
+grep -q '"library_path": "libvulkan_radeon.so"' "$icd" || { echo "stage-radv.sh: $icd is not the ICD file this expects" >&2; exit 1; }
+sed -i 's|"library_path": "libvulkan_radeon.so"|"library_path": "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so"|' "$icd"
 echo "stage-radv.sh: RADV $(val version) (sha256 $(printf '%.16s' "$sha")...) staged in $out"

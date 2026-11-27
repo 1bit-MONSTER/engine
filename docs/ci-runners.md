@@ -536,6 +536,12 @@ box-hold records the class of each granted ticket in `/tmp/box-locks/box-last` (
 waiting and a stream of CI tickets behind them, the order is `C1 L1 C2 L2 C3 L3 C4` (the `box_hold_fifo` stub test).
 The reviewer window is capped at 20 minutes per ticket for the same reason.
 
+Only a lane ticket whose waiter knows this rule is preferred. Each new waiter adds a `box-hold-v3` line to its ticket
+file, and alternation prefers only a lane ticket that has it. Measured at the first install, 2026-11-27 21:57Z: a lane
+waiter of an older box-hold copy takes the lock only when it sorts first, so preferring it left the lock free with
+nobody to take it. The stub test's last arm pins that the next CI ticket runs at once instead. Lane tickets queued
+before the change keep plain FIFO until they are queued again.
+
 The head of the queue no longer blocks in `flock`; it tries the locks and re-reads the queue between tries. A head
 blocked in `flock -w` never saw a CI ticket that arrived behind it. The same change fixed a defect as old as box-hold:
 `exec 9>lock 2>/dev/null` on a bare `exec` made the `2>/dev/null` permanent, so **every box-hold job's stderr was

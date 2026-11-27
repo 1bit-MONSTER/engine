@@ -38,6 +38,8 @@
 #  21. alternation under a stream of CI tickets: lanes waiting + CI tickets queued behind them -> CI, lane, CI, lane...
 #      (lanes progress every other turn; CI never twice in a row while a lane waits); with no lane waiting CI runs back
 #      to back
+#  22. an older copy's lane waiter (its ticket has no box-hold-v3 marker) is NOT preferred after a priority turn: the
+#      next CI ticket runs at once instead of the queue stalling on a waiter that never takes the lock (21:57Z 11-27)
 set -u
 BH=${1:?usage: box_hold_fifo_test.sh <box-hold>}
 T=$(mktemp -d); trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$T"' EXIT
@@ -225,6 +227,17 @@ sh "$BH" gpu sh -c "$(job H 1)" & sleep 0.3
 for c in C1 C2 C3; do ci gpu sh -c "$(job $c 0.2)" & sleep 0.2; done
 wait
 [ "$(tr '\n' ' ' < "$T/order")" = "H C1 C2 C3 " ] && ok "no lane waiting: CI tickets run back to back" || bad "CI only: $(tr '\n' ' ' < "$T/order")"
+
+# 22. no stall on an older copy's lane waiter
+rm -f "$T/locks/box-last"; : > "$T/order"
+ci gpu sh -c "$(job C0 1)" & sleep 0.3
+sleep 6 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
+echo "cl-old-lane $(date -u +%FT%TZ) x" > "$T/locks/queue/1-$(printf '%012d' 2).$old.$st"   # live, no marker line
+ci gpu sh -c "$(job C1 0.2)" & c1=$!
+s=$(date +%s); wait "$c1"; d=$(( $(date +%s) - s ))
+[ "$(tr '\n' ' ' < "$T/order")" = "C0 C1 " ] && [ "$d" -le 4 ] && ok "an older copy's lane waiter is not preferred: the next CI ticket ran after ${d}s (no stall)" \
+  || bad "stall on an unmarked lane waiter: $(tr '\n' ' ' < "$T/order") after ${d}s"
+kill "$old" 2> /dev/null; wait 2> /dev/null
 
 [ "$fail" = 0 ] && echo "box_hold_fifo: PASS" || echo "box_hold_fifo: FAIL"
 exit "$fail"

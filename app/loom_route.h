@@ -129,6 +129,15 @@ inline std::string sha256_of_file(const std::string& path) {
 // ---------------------------------------------------------------------------------------------------
 // The table (config/loom-routes.json, compiled in; `serve --loom-routes FILE` replaces it).
 
+// A reasoning effort as Inkling's chat template takes it (Thinking Machines' presets: none 0.0, minimal 0.1, low 0.2,
+// medium 0.7, high 0.9, xhigh 0.99; ggml-org's README adds max = 0.99), or the number itself.
+inline bool loom_effort_ok(const json& v) {
+    static const char* kNames[] = {"none", "minimal", "low", "medium", "high", "xhigh", "max"};
+    if (v.is_string())
+        return std::find(std::begin(kNames), std::end(kNames), v.get<std::string>()) != std::end(kNames);
+    return v.is_number() && v.get<double>() >= 0.0 && v.get<double>() < 1.0;
+}
+
 struct LoomRoute {
     std::string id;                    // a name for logs ("qwen3-0.6b-q4_k_m")
     std::vector<std::string> models;   // match.model: served ids / file names (serve's model id or the file name)
@@ -140,6 +149,7 @@ struct LoomRoute {
     std::vector<std::string> args;     // more loom-serve flags, as written (--memory_bytes=..., ...)
     std::vector<std::string> env;      // NAME=VALUE for loom-serve's environment (a value the user set wins)
     std::string gate;                  // where the gate's result is recorded (an issue link); required
+    json reasoning_effort;             // the effort a request gets when it names none (null: the card's own default)
 };
 
 struct LoomRoutes {
@@ -158,7 +168,8 @@ struct LoomRoutes {
             err = "expected an object with a \"routes\" array";
             return false;
         }
-        static const char* kKeys[] = {"id", "match", "card", "preset", "device", "args", "env", "gate", "why", "measured"};
+        static const char* kKeys[] = {"id", "match", "card", "preset", "device", "args", "env", "gate", "why", "measured",
+                                      "reasoning_effort"};
         static const char* kMatch[] = {"model", "gguf_sha256", "gguf_size"};
         for (size_t i = 0; i < j["routes"].size(); ++i) {
             const json& r = j["routes"][i];
@@ -196,6 +207,14 @@ struct LoomRoutes {
                 !str("preset", out.preset, true) || !str("device", out.device, false))
                 return false;
             if (r.contains("args") && !strings(r["args"], "args", out.args)) return false;
+            if (r.contains("reasoning_effort")) {
+                if (!loom_effort_ok(r["reasoning_effort"])) {
+                    err = at + ": \"reasoning_effort\" must be none, minimal, low, medium, high, xhigh or max, or a "
+                               "number in [0, 1)";
+                    return false;
+                }
+                out.reasoning_effort = r["reasoning_effort"];
+            }
             if (r.contains("env")) {
                 if (!r["env"].is_object()) { err = at + ": \"env\" must be an object of strings"; return false; }
                 for (const auto& [k, v] : r["env"].items()) {
@@ -596,6 +615,21 @@ struct LoomRequest {
     bool stream = false;
     bool client_usage = false;        // the client asked for stream_options.include_usage itself
 };
+
+// The route's default reasoning effort, set on a request that chose none. A client choice in any spelling wins and
+// is left alone: top-level reasoning_effort / enable_thinking / reasoning (OpenAI's object), or reasoning_effort /
+// enable_thinking in chat_template_kwargs. Without a route default the card's own template default applies
+// (Inkling's: high, 0.9). Returns whether it set one.
+inline bool loom_default_effort(json& body, const json& effort) {
+    if (effort.is_null() || !body.is_object()) return false;
+    for (const char* k : {"reasoning_effort", "enable_thinking", "reasoning"})
+        if (body.contains(k)) return false;
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+        for (const char* k : {"reasoning_effort", "enable_thinking"})
+            if (body["chat_template_kwargs"].contains(k)) return false;
+    body["reasoning_effort"] = effort;
+    return true;
+}
 
 inline LoomRequest loom_request(json& body, const std::string& loom_model) {
     LoomRequest r;

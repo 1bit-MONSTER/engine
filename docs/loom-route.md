@@ -81,6 +81,11 @@ loom-fetch huggingface:1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom:chat --m
 - `device`, `args`, `env`: passed to `loom-serve` (`--device=`, as written, and its environment; a
   variable the user set wins).
 - `gate`: required. Where the result that admitted the model is recorded.
+- `reasoning_effort`: optional. The effort a chat request gets when it names none: a preset (`none`, `minimal`,
+  `low`, `medium`, `high`, `xhigh`, `max`) or a number in [0, 1). A client's own choice always wins, in any
+  spelling (`reasoning_effort`, `enable_thinking` or `reasoning` at the top level, or `reasoning_effort` /
+  `enable_thinking` in `chat_template_kwargs`). Without it the card's template default applies (Inkling's is
+  high, 0.9).
 
 `--loom-routes FILE` replaces the built-in table, `--loom-serve PATH` (or `ONEBIT_LOOM_SERVE`) names the
 server binary, and `--no-loom` (or `ONEBIT_NO_LOOM=1`) keeps every model on the llama.cpp route.

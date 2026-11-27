@@ -1181,6 +1181,7 @@ struct Launch {
     std::string slot_dir;    // hybrid: the backend's --slot-save-path, where the handoff files go
     bool loom = false;       // the Loom GPU route: loom-serve, not llama-server (app/loom_route.h)
     std::string loom_model;  // loom: the card's model.id, which every request must name
+    json loom_effort;        // loom: the route's default reasoning_effort (null: the card's)
 };
 
 // A Child for this launch, with the launch's readiness rule: loom-serve answers /v1/status at once and lists the
@@ -1736,6 +1737,7 @@ std::optional<Launch> loom_launch_for(const Options& o, int child_port) {
     l.loom = true;
     l.port = child_port;
     l.loom_model = loom_model;
+    l.loom_effort = r->reasoning_effort;
     l.ready_path = "/v1/status";
     l.argv = {default_loom_serve(o), "--model=" + card, "--device=" + (r->device.empty() ? std::string("amdgpu://") : r->device),
               loom_listen_arg(child_port), "--heartbeat_ms=0"};
@@ -1752,13 +1754,16 @@ std::optional<Launch> loom_launch_for(const Options& o, int child_port) {
     std::fprintf(stderr, "1bit serve: loom route %s: %s%s%s -> loom-serve card %s (model %s; gate %s)%s%s\n", r->id.c_str(),
                  o.model.c_str(), sha.empty() ? "" : " sha256 ", sha.c_str(), card.c_str(), loom_model.c_str(), r->gate.c_str(),
                  ignored.empty() ? "" : "; the card sets these, not applied:", ignored.c_str());
+    if (!r->reasoning_effort.is_null())
+        std::fprintf(stderr, "1bit serve: loom route %s: a request that names no reasoning effort gets %s\n", r->id.c_str(),
+                     r->reasoning_effort.dump().c_str());
     return l;
 }
 
 // One request to loom-serve (POST /v1/chat/completions; the route serves no other generation path). The body is
 // made acceptable to loom-serve and the reply made to read like llama-server's (app/loom_route.h).
 void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& our_id, const std::string& loom_model,
-                  const httplib::Request& req, httplib::Response& res, ProgressWatch* watch) {
+                  const json& effort, const httplib::Request& req, httplib::Response& res, ProgressWatch* watch) {
     json body;
     try {
         body = json::parse(req.body);
@@ -1773,6 +1778,7 @@ void forward_loom(int port, std::shared_ptr<InFlight> held, const std::string& o
         res.set_content(json{{"error", {{"message", lr.error}, {"type", "invalid_request_error"}}}}.dump(), "application/json");
         return;
     }
+    loom::loom_default_effort(body, effort);
     const std::string payload = body.dump();
     const std::string path = req.path;
     if (!lr.stream) {
@@ -3341,7 +3347,7 @@ int serve_child(const Options& given) {
                                               {"type", "not_implemented"}}}}.dump(), "application/json");
                 return;
             }
-            forward_loom(backends[pick].port, held, id, backends[pick].loom_model, q, r, &watch);
+            forward_loom(backends[pick].port, held, id, backends[pick].loom_model, backends[pick].loom_effort, q, r, &watch);
             log_request_line(q.path, backends[pick], r, t_req, "loom", req_stream);
             return;
         }

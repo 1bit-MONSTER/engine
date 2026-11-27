@@ -102,6 +102,42 @@ int main() {
                   t.routes[0].args[0] == "--memory_bytes=1");
     }
 
+    // a route's default reasoning effort: a preset name or a number in [0, 1); set only on a request that chose none
+    {
+        loom::LoomRoutes t;
+        std::string err;
+        auto route = [](const std::string& eff) {
+            return R"({"routes":[{"id":"a","card":"c","gate":"g","preset":"chat","match":{"model":["m"]},"reasoning_effort":)" +
+                   eff + "}]}";
+        };
+        check("no reasoning_effort: the card's own default",
+              t.parse(R"({"routes":[{"id":"a","card":"c","gate":"g","preset":"chat","match":{"model":["m"]}}]})", err) &&
+                  t.routes[0].reasoning_effort.is_null());
+        check("a preset name parses", t.parse(route(R"("medium")"), err) && t.routes[0].reasoning_effort == "medium");
+        check("a number parses", t.parse(route("0.7"), err) && t.routes[0].reasoning_effort == 0.7);
+        check("an unknown name is refused", !t.parse(route(R"("hihg")"), err) && err.find("reasoning_effort") != std::string::npos);
+        check("1.0 is refused (the template takes [0, 1))", !t.parse(route("1.0"), err));
+        check("a negative number is refused", !t.parse(route("-0.1"), err));
+        check("a boolean is refused", !t.parse(route("true"), err));
+
+        const json eff = "medium";
+        json b = {{"messages", json::array()}};
+        check("a request with no effort gets the route's", loom::loom_default_effort(b, eff) && b["reasoning_effort"] == "medium");
+        json n = {{"messages", json::array()}};
+        check("no route default: the request is left alone", !loom::loom_default_effort(n, json()) && !n.contains("reasoning_effort"));
+        for (const json& c : {json{{"reasoning_effort", "high"}}, json{{"enable_thinking", false}},
+                              json{{"reasoning", {{"effort", "low"}}}},
+                              json{{"chat_template_kwargs", {{"reasoning_effort", 0.2}}}},
+                              json{{"chat_template_kwargs", {{"enable_thinking", true}}}}}) {
+            json q = c;
+            q["messages"] = json::array();
+            const json before = q;
+            check("a client's own choice wins: " + c.dump(), !loom::loom_default_effort(q, eff) && q == before);
+        }
+        json k = {{"messages", json::array()}, {"chat_template_kwargs", {{"other", 1}}}};
+        check("other template kwargs do not count as a choice", loom::loom_default_effort(k, eff) && k["reasoning_effort"] == "medium");
+    }
+
     // the match: names, then size, then sha256; the hash is computed only for a file whose size matches
     {
         const fs::path dir = fs::temp_directory_path() / ("loom_route_test_" + std::to_string(::getpid()));

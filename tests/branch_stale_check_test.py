@@ -126,6 +126,20 @@ class BranchStaleCheckTest(unittest.TestCase):
         result = self.run_check(self.main, "HEAD")
         self.assertIn("uncommitted path(s) are NOT included", result.stdout)
 
+    def test_a_renamed_file_is_a_path_the_branch_changed(self):
+        # engine#3553: a branch that renames a file (identical bytes) changes BOTH paths. With git's default rename
+        # detection the merge-base diff lists only the new name, so the old path read as "never changed, yet the merge
+        # would not keep the base's copy" and the check failed a correct branch.
+        git(self.repo, "checkout", "-q", "-b", "renamer", self.main)
+        moved = git(self.repo, "mv", "other.txt", "renamed.txt")
+        self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+        commit(self.repo, "the branch renames a file it does not otherwise edit")
+        head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        result = self.run_check(self.main, head)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("FAIL", result.stdout)
+        self.assertNotIn("other.txt", result.stdout)
+
     def test_an_unreadable_ref_refuses_instead_of_passing(self):
         result = self.run_check(self.main, "no-such-ref")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

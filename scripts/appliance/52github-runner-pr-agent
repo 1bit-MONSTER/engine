@@ -1,0 +1,33 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# github-runner-pr-agent: the self-hosted runner strixhalo-pr-agent (labels pr-agent,issue-agent,strixhalo) for
+# 1bit-MONSTER/engine, as the dedicated no-shell user ghrunner (home /var/lib/ghrunner), started at boot.
+# No systemd here: the supervisor loop is Restart=always (run.sh exits 0 when its listener stops, engine#1504).
+D=/var/lib/ghrunner/actions-runner-pr-agent
+case "${1:-start}" in
+  start)
+    pgrep -f "github-runner-pr-agent-supervisor" > /dev/null 2>&1 && exit 0
+    su ghrunner -s /bin/sh -c "cd $D && setsid nohup bash -c 'exec -a github-runner-pr-agent-supervisor bash -c \"while :; do ./run.sh; sleep 30; done\"' >> $D/runner.log 2>&1 < /dev/null &"  > /dev/null 2>&1 < /dev/null
+    ;;
+  stop)
+    # TERM the listener first (it finishes nothing, but deregisters cleanly), then everything the account runs
+    kill $(pgrep -f "github-runner-pr-agent-supervisor") 2>/dev/null
+    kill -TERM $(pgrep -u ghrunner) 2>/dev/null; sleep 5
+    kill -KILL $(pgrep -u ghrunner) 2>/dev/null
+    ;;
+esac
+exit 0

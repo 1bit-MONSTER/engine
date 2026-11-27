@@ -133,3 +133,10 @@ add_test(NAME gpu_hold_script_id COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold
 # docs/ci-runners.md's exit-code table is a contract (review of engine#2539): every "<script> exits/sets it" in a row
 # must be backed by `exit <rc>` or `rc=<rc>` in that script, and every row must name an emitter.
 add_test(NAME exit_code_table COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tests/exit_code_table_test.py ${CMAKE_SOURCE_DIR})
+
+# CL-PRAGENT 2026-11-27: the PR-Agent model moved to the 1bit OS appliance (no systemd, box-hold instead of gpu-hold).
+# Drives scripts/appliance/coder-llm-window with a fake `1bit serve` (which forks a llama-server grandchild) and a fake
+# box-hold: no demand -> no ticket, demand -> one box-hold gpu ticket, idle and max hold close the window and kill the
+# whole serve chain, stale demand or a low memory floor start no server. No device.
+add_test(NAME coder_llm_window COMMAND bash ${CMAKE_SOURCE_DIR}/tests/coder_llm_window_test.sh
+         ${CMAKE_SOURCE_DIR}/scripts/appliance/coder-llm-window)

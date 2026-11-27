@@ -1,0 +1,30 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# coder-llm-window: the PR reviewer's model in on-demand box-hold windows (see /usr/local/bin/coder-llm-window).
+# No systemd on this image: a detached supervisor loop as bcloud is the restart policy (engine#1504: a runner or
+# service that dies must come back). Stop: /etc/init.d/51coder-llm-window stop.
+case "${1:-start}" in
+  start)
+    pgrep -f "coder-llm-window-supervisor" > /dev/null 2>&1 && exit 0
+    su bcloud -s /bin/sh -c 'setsid nohup bash -c "exec -a coder-llm-window-supervisor bash -c \"while :; do /usr/local/bin/coder-llm-window watch; sleep 15; done\"" > /dev/null 2>&1 < /dev/null &'  > /dev/null 2>&1 < /dev/null
+    ;;
+  stop)
+    kill $(pgrep -f "coder-llm-window-supervisor") 2>/dev/null
+    su bcloud -s /bin/sh -c '/usr/local/bin/coder-llm-window stop'
+    ;;
+esac
+exit 0

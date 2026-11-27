@@ -1,0 +1,100 @@
+#!/bin/bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# coder-llm-window: the PR reviewer's model (Qwen3-Coder-30B-A3B through `1bit serve` on HRX, 127.0.0.1:8090,
+# alias qwen3-coder) in on-demand gpu windows on the 1bit OS appliance (engine#2494 design, box-hold instead of gpu-hold).
+#   watch : loop forever; when the demand file was touched in the last DEMAND_FRESH_S seconds, queue for the device
+#           with `box-hold gpu` and serve inside that one ticket. Started at boot by /etc/init.d/51coder-llm-window.
+#   window: (run by watch, inside box-hold) start the server in its own session, keep it while demand is fresh,
+#           stop it after IDLE_S without a touch or at MAX_HOLD_S (box rule: one ticket <= 45 min; the next window
+#           re-queues at the back), then kill the whole serve chain (1bit serve + llama-server).
+#   stop  : end the current window and the watcher.
+# Log: /data/logs/coder-llm/window.log (+ server.log). RAM: ~18 GB weights + ~6 GB KV (64K ctx f16) ~= 25 GB.
+set -u
+DEMAND=${CODER_LLM_DEMAND:-/var/lib/ghrunner/.cache/coder-llm/demand}
+MODEL=${CODER_LLM_MODEL:-/data/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf}
+PORT=${CODER_LLM_PORT:-8090}
+CTX=${CODER_LLM_CTX:-65536}
+DEMAND_FRESH_S=${DEMAND_FRESH_S:-120}
+IDLE_S=${IDLE_S:-300}
+MAX_HOLD_S=${MAX_HOLD_S:-2640}       # 44 min, under the 45-min ticket rule
+STOP_WAIT_S=${STOP_WAIT_S:-30}
+POLL_S=${POLL_S:-5}; WATCH_S=${WATCH_S:-10}
+MIN_FREE_GB=${MIN_FREE_GB:-40}       # need ~25 GB for the server and >= 16 GB left for the box
+ONEBIT=${ONEBIT_BIN:-/usr/local/bin/1bit}
+BOX_HOLD=${BOX_HOLD:-box-hold}
+LOGD=${CODER_LLM_LOGDIR:-/data/logs/coder-llm}
+RUN=${CODER_LLM_RUNDIR:-/tmp/coder-llm}; mkdir -p "$RUN" "$LOGD"
+LOG=$LOGD/window.log
+log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
+age() { local m; m=$(stat -c %Y "$DEMAND" 2>/dev/null) || { echo 999999; return; }; echo $(( $(date +%s) - m )); }
+avail_gb() { awk '/^MemAvailable:/ {print int($2/1048576)}' /proc/meminfo; }
+
+kill_chain() {   # TERM the server's session, wait, KILL; then anything still on the port
+  local sid=$1 i
+  [ -n "$sid" ] && kill -TERM -- "-$sid" 2>/dev/null
+  for i in $(seq "$STOP_WAIT_S"); do pgrep -s "$sid" > /dev/null 2>&1 || break; sleep 1; done
+  [ -n "$sid" ] && kill -KILL $(pgrep -s "$sid") 2>/dev/null
+  kill -KILL $(pgrep -f -- "--port $PORT( |$)") 2>/dev/null
+  sleep 1
+  if pgrep -f -- "--port $PORT( |$)" > /dev/null; then log "WARN: survivors on :$PORT: $(pgrep -af -- "--port $PORT( |$)" | cut -c1-160)"; fi
+}
+
+window() {
+  local a sid start reason=""
+  a=$(age); [ "$a" -le $(( DEMAND_FRESH_S + IDLE_S )) ] || { log "window: demand went stale while queued (${a}s), not starting"; return 0; }
+  [ "$(avail_gb)" -ge "$MIN_FREE_GB" ] || { log "window: MemAvailable $(avail_gb) GB < $MIN_FREE_GB GB, not starting"; return 0; }
+  echo $$ > "$RUN/window.pid"
+  start=$(date +%s)
+  LLAMA_ARG_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}' \
+    setsid "$ONEBIT" serve -m "$MODEL" --device hrx --host 127.0.0.1 --port "$PORT" \
+      --ctx-size "$CTX" --alias qwen3-coder >> "$LOGD/server.log" 2>&1 < /dev/null &
+  sid=$!; echo "$sid" > "$RUN/server.sid"
+  log "window: open, server session $sid (MemAvailable $(avail_gb) GB)"
+  trap 'reason=signal' TERM INT HUP
+  while [ -z "$reason" ]; do
+    sleep "$POLL_S"
+    kill -0 "$sid" 2>/dev/null || { reason="server exited"; break; }
+    [ "$(age)" -ge "$IDLE_S" ] && reason="idle $(age)s"
+    [ $(( $(date +%s) - start )) -ge "$MAX_HOLD_S" ] && reason="max hold ${MAX_HOLD_S}s"
+  done
+  kill_chain "$sid"
+  rm -f "$RUN/server.sid" "$RUN/window.pid"
+  log "window: closed after $(( $(date +%s) - start ))s ($reason), MemAvailable $(avail_gb) GB"
+}
+
+watch() {
+  exec 7> "$RUN/watch.lock"; flock -n 7 || { echo "coder-llm-window: already watching" >&2; exit 1; }
+  echo $$ > "$RUN/watch.pid"; log "watch: start (demand $DEMAND)"
+  trap 'log "watch: stop"; [ -f "$RUN/window.pid" ] && kill -TERM "$(cat "$RUN/window.pid")" 2>/dev/null; exit 0' TERM INT
+  while :; do
+    if [ "$(age)" -lt "$DEMAND_FRESH_S" ]; then
+      log "watch: demand ($(age)s old), queueing: $(cat /tmp/box-locks/box-gpu.who 2>/dev/null | cut -c1-80)"
+      BOX_HOLD_WAIT=${BOX_HOLD_WAIT:-3600} BOX_HOLD_WHO=coder-llm "$BOX_HOLD" gpu "$0" window 7>&- &
+      wait $! ; rc=$?
+      [ "$rc" = 0 ] || log "watch: box-hold rc $rc"
+      sleep "$WATCH_S"
+    fi
+    sleep "$WATCH_S"
+  done
+}
+
+case "${1:-}" in
+  watch) watch ;;
+  window) window ;;
+  stop) [ -f "$RUN/watch.pid" ] && kill -TERM "$(cat "$RUN/watch.pid")" 2>/dev/null; [ -f "$RUN/window.pid" ] && kill -TERM "$(cat "$RUN/window.pid")" 2>/dev/null; exit 0 ;;
+  *) echo "usage: coder-llm-window watch|window|stop" >&2; exit 2 ;;
+esac

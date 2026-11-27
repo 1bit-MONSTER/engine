@@ -1064,6 +1064,22 @@ fi
 vmqemu
 echo "SKIP U4 board      HRX chat on the 8060S, the NPU through Lemonade, amdgpu/amdxdna binding: board rows"
 echo "SKIP U6 board      an installer writing a firmware entry for a SECOND disk, and booting from it: needs the disk"
+# OS updater U7 part 2: the signed in-system update end to end (install -> refusals -> --latest -> reboot -> rollback ->
+# reboot) in its own VMs, with a THROWAWAY key, CA and release list (tools/update_vm_test.sh). Opt-in: three more VM
+# boots and ~30 GB of scratch; it applies ryzen's memory rule itself (>= 16 GB free, MemoryMax=12G, the heavy lock).
+case $iso in
+*.img)
+    if [ "${UPDATE_VM_TEST:-}" = 1 ]; then
+        "$dir/../../../tools/update_vm_test.sh" "$iso" "$work/update-vm" > "$work/update-vm.log" 2>&1; urc=$?
+        case $urc in
+            0) echo "PASS UPD in-system  $(grep -c '^PASS' "$work/update-vm/rows.txt" 2> /dev/null) rows: install, refusals, --latest, reboot, rollback ($work/update-vm/rows.txt)" ;;
+            3) echo "SKIP UPD in-system  refused to start: $(tail -1 "$work/update-vm.log" | cut -c1-120)" ;;
+            *) echo "FAIL UPD in-system  rc=$urc: $(grep -m1 '^FAIL' "$work/update-vm/rows.txt" 2> /dev/null | cut -c1-140)" ;;
+        esac
+    else
+        echo "SKIP UPD in-system  UPDATE_VM_TEST=1 runs tools/update_vm_test.sh on this image (three more VMs, ~30 GB scratch)"
+    fi ;;
+esac
 echo "== $iso, transcript $work/serial.log"
 [ "$driver_rc" = "0" ] || exit 2
 grep -q '^FAIL' "$work/rows.txt" && exit 1

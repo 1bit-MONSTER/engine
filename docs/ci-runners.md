@@ -441,6 +441,7 @@ and `coder-llm-ticketed` describes the old dev box. On the appliance, the PR rev
 | the window watcher, as the owner's account | `/usr/local/bin/coder-llm-window` ([source](../scripts/appliance/coder-llm-window)), root-owned so a job cannot rewrite it | `/etc/init.d/51coder-llm-window` ([source](../scripts/appliance/51coder-llm-window)) |
 | the model | `/data/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf` (sha256 `2841aa31…2533`) | — |
 | logs | `/data/logs/coder-llm/{window,server}.log`, `<runner>/runner.log` | — |
+| the device lock `box-hold` (FIFO since 2026-11-27) | `/usr/local/bin/box-hold` ([source](../scripts/appliance/box-hold)), locks and queue in `/tmp/box-locks` | — |
 
 **Restart policy without systemd.** Each init script starts a detached supervisor loop (`while :; do …; sleep N; done`),
 which is `Restart=always` by another name. `run.sh` exits 0 when its listener stops (engine #1504), so a script that
@@ -466,10 +467,20 @@ runner is `/var/lib/ghrunner/.cache/coder-llm/demand`. The watcher works like th
 `tests/coder_llm_window_test.sh` (ctest `coder_llm_window`) checks each of these steps with a fake server and a fake
 `box-hold`.
 
-**Why the reviewer waits 50 minutes, not 10.** `box-hold` is a plain `flock`, not a FIFO, and lanes hold tickets of up
-to 45 minutes. Measured on 2026-11-27, the first window waited 05:54 to 06:08Z behind one lane. When that ticket ended,
-another lane's `flock` won the lock. The 10-minute reviewer that was waiting failed with "reviewer unavailable". The
-runner now takes nothing but `pr-agent`/`issue-agent`, so holding it for 50 minutes blocks nobody else.
+**box-hold serves waiters in order (2026-11-27).** Until then `box-hold` was a bare `flock`. Measured on 2026-11-27,
+the first coder-llm window queued at 05:54Z and was still waiting when its 3600 s ran out at 06:54Z: five lane tickets
+that arrived later took the lock first, and every 10-minute reviewer in that hour failed with "reviewer unavailable".
+[`scripts/appliance/box-hold`](../scripts/appliance/box-hold), installed at `/usr/local/bin/box-hold`, keeps the old
+behaviour: both locks for every ticket, `BOX_HOLD_WAIT`, `BOX_HOLD_WHO`, the `.who` files, exit 4 on timeout. On top
+of that it numbers each waiter and puts a ticket for it in `/tmp/box-locks/queue/<n>.<pid>.<start-time>`. Only the
+lowest *live* ticket may take the flock. A ticket whose process is gone, or whose pid now belongs to a different
+process (the start time does not match), is skipped. `tests/box_hold_fifo_test.sh` (ctest `box_hold_fifo`) checks this
+with stub jobs.
+
+The new script was installed by `mv` over the old one, never edited in place, because running tickets read the file
+incrementally (a mid-run edit corrupted a run on 11-24). Waiters that started before the swap keep running the old
+copy, so they still race on the bare flock until they drain. The reviewer still waits 50 minutes because lanes hold
+tickets of up to 45 minutes. The runner takes only `pr-agent`/`issue-agent` jobs, so the long wait blocks nobody.
 
 **Install, start to finish** (as the owner, from ryzen):
 

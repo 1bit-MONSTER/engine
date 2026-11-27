@@ -140,3 +140,8 @@ add_test(NAME exit_code_table COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tests/exit_
 # whole serve chain, stale demand or a low memory floor start no server. No device.
 add_test(NAME coder_llm_window COMMAND bash ${CMAKE_SOURCE_DIR}/tests/coder_llm_window_test.sh
          ${CMAKE_SOURCE_DIR}/scripts/appliance/coder-llm-window)
+
+# scripts/appliance/box-hold (orchestrator-approved 2026-11-27): the appliance's device lock serves waiters IN ORDER (a
+# bare flock let five later tickets overtake the coder-llm window in an hour). Stub jobs on a private BOX_HOLD_DIR:
+# arrival order with no overlap, a SIGKILLed waiter skipped, rc 4 behind a holder and while still queued, rc and .who.
+add_test(NAME box_hold_fifo COMMAND bash ${CMAKE_SOURCE_DIR}/tests/box_hold_fifo_test.sh ${CMAKE_SOURCE_DIR}/scripts/appliance/box-hold)

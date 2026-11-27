@@ -227,7 +227,12 @@ def main():
         (build / "bench-stamp.txt").write_text(f"engine=deadbeef0000\nllama_cpp={at[:12]}\n")
         git(root, "update-index", "--add", "--cacheinfo", f"160000,{at},third_party/llama.cpp")
         git(root, "commit", "-qm", "pin at head")      # WANT == GOT: the submodule matches the pin
-        known = "test-kv-zero"
+        # The exemplar is read from the shipped baseline rather than spelled out: a row that gets fixed on
+        # the bench box leaves the file, and a literal would then look like a NEW failure here --
+        # test-kv-zero did exactly that when the runner gained device access.
+        known = next(line.split()[0]
+                     for line in (REPO / "tools" / "ci" / "ctest_known_fail.txt").read_text().splitlines()
+                     if line.strip() and not line.lstrip().startswith("#"))
         body = ("The following tests FAILED:\n"
                 f"\t 19 - {known} (Subprocess aborted)\n"
                 "Errors while running CTest\n"

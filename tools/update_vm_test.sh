@@ -150,7 +150,7 @@ row INFO server "$U (good / tamper / fake release lists)"
 
 # ── 3. the VMs ─────────────────────────────────────────────────────────────────────────────────────────────────────
 disk=$work/installed.img
-rm -f "$disk"; truncate -s 24G "$disk"
+rm -f "$disk"; truncate -s 48G "$disk"   # sparse; --latest needs room for the download + its decompressed image (run 6: 10 GiB free on a 24G disk, 16 needed)
 cp "$OVMF_VARS" "$work/vars.fd"
 sshport=2322; while ss -lnt 2> /dev/null | grep -q ":$sshport "; do sshport=$((sshport + 2)); done
 vm_kill() { [ -n "${qpid:-}" ] && kill "$qpid" 2> /dev/null; wait "${qpid:-0}" 2> /dev/null; qpid=; }

@@ -57,6 +57,12 @@ PUB=$t/none v "$t/good"; [ $? = 2 ] && grep -q "no release public key" "$t/v.out
 mkdir -p "$t/upd"; for d in v2026.46 v2026.47 v2026.48 v2026.49; do mkdir -p "$t/upd/$d"; touch "$t/upd/$d/x"; sleep 1; done
 ( ONEBIT_UPDATE_LIB=1 ONEBIT_UPDATE_DIR=$t/upd LOG=/dev/null; . "$u"; update_prune v2026.49 ) > /dev/null 2>&1
 [ "$(ls "$t/upd" | tr '\n' ' ')" = "v2026.48 v2026.49 " ]; check $? "update_prune keeps the fetched release and one previous"
+# ... and leaves the CALLER's variables alone: update_latest decompresses "$_d/$_img" right after it, and a prune that
+# looped with `_d` sent that to whichever old download it saw last (tools/update_vm_test.sh, 27 Nov)
+mkdir -p "$t/upd2"; for d in v2026.47 v2026.48 v2026.49; do mkdir -p "$t/upd2/$d"; sleep 1; done
+got=$( ONEBIT_UPDATE_LIB=1 ONEBIT_UPDATE_DIR=$t/upd2 LOG=/dev/null; . "$u"; _d=$t/upd2/v2026.49 _n=7 _keep=k
+       update_prune v2026.49 > /dev/null 2>&1; printf '%s|%s|%s' "$_d" "$_n" "$_keep" )
+[ "$got" = "$t/upd2/v2026.49|7|k" ]; check $? "update_prune does not change the caller's _d/_n/_keep (got ${got##*/})"
 
 echo "update_latest_test: $([ $bad = 0 ] && echo ok || echo FAIL)"
 [ $bad = 0 ]

@@ -14,8 +14,8 @@
 # limitations under the License.
 #
 # PR-Agent (The-PR-Agent/pr-agent, formerly qodo-ai/pr-agent) reviews every pull request with a local model: Qwen3-Coder-30B-A3B
-# (Q4_K_M, about 18 GB resident, thinking off) served by the engine itself (`1bit serve`; it ran on Vulkan, which RFC #213 stage 3 removes: the service moves to HRX) on
-# the Strix Halo box, at 127.0.0.1:8090 (the coder-llm user service). The job runs on that box's self-hosted runner
+# (UD-Q4_K_XL, about 18 GB of weights, thinking off) served by the engine itself (`1bit serve --device hrx`) on the
+# Strix Halo box (the 1bit OS appliance), at 127.0.0.1:8090, in on-demand windows (scripts/appliance/coder-llm-window). The job runs on that box's self-hosted runner
 # (label pr-agent), so no code leaves it and there is no API key. Settings: .pr_agent.toml.
 #
 # Opened/updated PRs get a review. A trusted comment runs a command: /review, /describe (rewrites
@@ -34,8 +34,9 @@ permissions:
   contents: read
 
 jobs:
-  # The model runs only inside a gpu-hold ticket, in on-demand windows (engine#2494, docs/ci-runners.md): this job asks
-  # for a window and waits for it, bounded at 10 min so the single pr-agent runner is not held for long. If the model
+  # The model runs only inside a device ticket, in on-demand windows (engine#2494, docs/ci-runners.md "On the 1bit OS
+  # appliance"): this job asks for a window and waits for it, bounded at 50 min. Lanes hold the box in tickets of up to 45
+  # min (box-hold), so a shorter wait fails whenever one is running; the runner (strixhalo-pr-agent) takes nothing else. If the model
   # never answers, THIS job FAILS with "reviewer unavailable" (a skipped job would count as a pass for a required check,
   # so "no review" must be visible as a red reviewer, never as green), and pr_agent below does not run.
   reviewer:
@@ -53,16 +54,16 @@ jobs:
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
        (startsWith(github.event.comment.body, '/review') || startsWith(github.event.comment.body, '/describe') ||
         startsWith(github.event.comment.body, '/improve') || startsWith(github.event.comment.body, '/ask')))
-    timeout-minutes: 15
+    timeout-minutes: 55
     outputs:
       available: ${{ steps.wait.outputs.available }}
     steps:
-      - name: Wait for the local model (coder-llm, a gpu-hold window)
+      - name: Wait for the local model (coder-llm, a box-hold window)
         id: wait
         run: |
           demand="$HOME/.cache/coder-llm/demand"; mkdir -p "$(dirname "$demand")"
           # a real one-token completion, not just /v1/models: the server answers that before the model is loaded
-          deadline=$(( $(date +%s) + 10 * 60 ))
+          deadline=$(( $(date +%s) + 50 * 60 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
             touch "$demand"
             if curl -sf --max-time 60 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
@@ -72,8 +73,8 @@ jobs:
             sleep 15
           done
           echo "available=false" >> "$GITHUB_OUTPUT"
-          echo "### reviewer unavailable: no GPU window for the local model (coder-llm, :8090) within 10 min; no review was run" >> "$GITHUB_STEP_SUMMARY"
-          echo "::error::reviewer unavailable: the local model (coder-llm, :8090) did not answer within 10 min; no review was run (re-run this job to retry)"
+          echo "### reviewer unavailable: no GPU window for the local model (coder-llm, :8090) within 50 min; no review was run" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::reviewer unavailable: the local model (coder-llm, :8090) did not answer within 50 min; no review was run (re-run this job to retry)"
           exit 1
 
   pr_agent:
@@ -115,7 +116,7 @@ jobs:
             python3 -m venv "$venv"
             "$venv/bin/pip" install -q "pr-agent[github]==$PRA_VERSION"
           fi
-          # keep the gpu-hold window open while this job works: the window closes after 5 idle minutes without demand
+          # keep the box-hold window open while this job works: the window closes after 5 idle minutes without demand
           demand="$HOME/.cache/coder-llm/demand"
           ( while :; do touch "$demand"; sleep 60; done ) & toucher=$!
           trap 'kill $toucher 2> /dev/null' EXIT

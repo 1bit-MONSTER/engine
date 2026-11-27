@@ -17,11 +17,13 @@
 # github-runner-pr-agent: the self-hosted runner strixhalo-pr-agent (labels pr-agent,issue-agent,strixhalo) for
 # 1bit-MONSTER/engine, as the dedicated no-shell user ghrunner (home /var/lib/ghrunner), started at boot.
 # No systemd here: the supervisor loop is Restart=always (run.sh exits 0 when its listener stops, engine#1504).
+# A clean environment: started from a shell, the runner inherited that shell's PATH (the owner's ~/.local/bin, which
+# ghrunner cannot stat: EACCES warnings in every checkout, 2026-11-27).
 D=/var/lib/ghrunner/actions-runner-pr-agent
 case "${1:-start}" in
   start)
     pgrep -f "github-runner-pr-agent-supervisor" > /dev/null 2>&1 && exit 0
-    su ghrunner -s /bin/sh -c "cd $D && setsid nohup bash -c 'exec -a github-runner-pr-agent-supervisor bash -c \"while :; do ./run.sh; sleep 30; done\"' >> $D/runner.log 2>&1 < /dev/null &"  > /dev/null 2>&1 < /dev/null
+    su ghrunner -s /bin/sh -c "cd $D && env -i HOME=/var/lib/ghrunner USER=ghrunner LANG=en_US.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin setsid nohup bash -c 'exec -a github-runner-pr-agent-supervisor bash -c \"while :; do ./run.sh; sleep 30; done\"' >> $D/runner.log 2>&1 < /dev/null &"  > /dev/null 2>&1 < /dev/null
     ;;
   stop)
     # TERM the listener first (it finishes nothing, but deregisters cleanly), then everything the account runs

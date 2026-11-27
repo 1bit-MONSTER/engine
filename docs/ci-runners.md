@@ -467,6 +467,12 @@ runner is `/var/lib/ghrunner/.cache/coder-llm/demand`. The watcher works like th
 `tests/coder_llm_window_test.sh` (ctest `coder_llm_window`) checks each of these steps with a fake server and a fake
 `box-hold`.
 
+**Measured end to end on 2026-11-27.** The window opened at 10:33:17Z with MemAvailable 121 GB, and the model answered a
+one-token completion about 30 s later. While serving, `llama-server` had an RSS of 14.7 GB and MemAvailable was 97 GB.
+Two reviews ran in that one window. #3547's `pr_agent` took 67 s and #3537's took 67 s, and both posted their
+"PR Reviewer Guide". The window closed at 10:41:36Z, after 499 s, 302 s of them idle. After that no `llama-server` was
+left, `:8090` refused connections, and the next lane took the lock in the same second.
+
 **box-hold serves waiters in order (2026-11-27).** Until then `box-hold` was a bare `flock`. Measured on 2026-11-27,
 the first coder-llm window queued at 05:54Z and was still waiting when its 3600 s ran out at 06:54Z: five lane tickets
 that arrived later took the lock first, and every 10-minute reviewer in that hour failed with "reviewer unavailable".

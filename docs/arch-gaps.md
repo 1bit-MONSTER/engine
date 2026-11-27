@@ -1532,7 +1532,7 @@ report was wrong about the repos, not the engine about the architectures.
 
 ## 2026-11-27: `DeymeForCausalLM`, `ADOMForRibbonRetrieval`, `PITForCausalLM`, `SDLLMForMaskedDiffusion` — reviewed, none is an alias (engine#3522)
 
-The 2026-11-27 watcher run alerted four new classes, each from one uploader with 0 downloads. All four were read
+The 2026-11-27 watcher run alerted four new classes, each from one uploader; the alerted repos have 0 downloads. All four were read
 from the public repos (config, file list, and for PIT its shipped `model_code/pit_hf/modeling_pit.py`; for SDLLM the
 `model.safetensors` header), and checked against the pinned `third_party/llama.cpp` `02992d76f` (`git grep -i` over
 `src/`, `conversion/`, `convert_hf_to_gguf.py`, `gguf-py` for `sdllm`, `pit_hf`, `PITForCausalLM`, `deyme`, `adom`,
@@ -1565,8 +1565,9 @@ Its `model.safetensors` holds 121 tensors: `transformer.wte` plus six matrices p
 * Tensor names `transformer.h.N.attn.c_q/c_k/c_v/c_proj`, `mlp.c_fc/c_proj`: GPT-2 names with separate q/k/v, which
   no pinned converter reads.
 
-Supporting it would be a small new graph (weightless-RMS + QK-norm + relu² + YaRN), not a mapping. One uploader,
-0 downloads and no licence on the card, so not worth one today.
+Supporting it would be a small new graph (weightless-RMS + QK-norm + relu² + YaRN), not a mapping. It is one
+uploader's series (codesj: 14 public `PIT-*` repos on 2026-11-27, the most-downloaded at 37; the full census in
+`registry/census.json` counts 48 models of this class) with no licence on the card, so not worth one today.
 
 ### `sdllm` — `vllm-denoisers/SDLLM-MDLM-1.7B-Base`
 

@@ -264,7 +264,7 @@
   },
   "PITForCausalLM": {
    "model_type": "pit_hf",
-   "family": "PIT (codesj, 2026-11-27 census): a modded-nanoGPT-style decoder in the repo's own model_code/pit_hf - 20 layers, n_embd 4096, 32 heads, GPT-2 tokenizer ids (50256), YaRN RoPE, weightless RMSNorm (F.rms_norm with no gamma) before attention and MLP and on q/k (QK-norm), relu^2 MLP (4x, no gate), no biases; the checkpoint has 121 tensors (wte + 6 per layer: no norm weights, no lm_head tensor). Not an alias: no pinned graph has weightless norms plus relu^2 plus QK-norm with this tensor naming (transformer.h.N.attn.c_q/c_k/c_v/c_proj, mlp.c_fc/c_proj); one uploader, 0 downloads, no licence on the card.",
+   "family": "PIT (codesj, 2026-11-27 census): a modded-nanoGPT-style decoder in the repo's own model_code/pit_hf - 20 layers, n_embd 4096, 32 heads, GPT-2 tokenizer ids (50256), YaRN RoPE, weightless RMSNorm (F.rms_norm with no gamma) before attention and MLP and on q/k (QK-norm), relu^2 MLP (4x, no gate), no biases; the checkpoint has 121 tensors (wte + 6 per layer: no norm weights, no lm_head tensor). Not an alias: no pinned graph has weightless norms plus relu^2 plus QK-norm with this tensor naming (transformer.h.N.attn.c_q/c_k/c_v/c_proj, mlp.c_fc/c_proj). One uploader (codesj: 14 public PIT-* repos, the most-downloaded 37; registry/census.json counts 48 models of this class), no licence on the card.",
    "watch": "report"
   },
   "SDLLMForMaskedDiffusion": {

@@ -205,10 +205,14 @@ hold_for() {
     fi
     HOLD_BUDGET=$(( HOLD_S - ($(date +%s) - HELD_T0) - HOLD_MARGIN_S ))
 }
+# Every device step runs through gpu-step-reap: in its own session, under the ticket's time, with every process it
+# started reaped before the ticket ends. `timeout` alone signals only its direct child, so a hung server grandchild
+# kept /dev/kfd open after the lock was released (#3543/#3568 review: GPU + a separate NPU job = the 11-23 reset).
+GPU_STEP_REAP=${GPU_STEP_REAP:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2> /dev/null && pwd)/gpu-step-reap}
 box_ticket() {
     local dev=$1 label=$2 minutes=$3; shift 3
     BOX_HOLD_WAIT=$BOX_HOLD_WAIT_S BOX_HOLD_WHO="$label${GITHUB_RUN_ID:+ run $GITHUB_RUN_ID} pid $$" BOX_HOLD_PRIORITY=${HW_GATE_BOX_HOLD_PRIORITY:-${GITHUB_RUN_ID:+ci}} \
-        "$BOX_HOLD" "$dev" sh -c 'exec 8>&- 9>&-; exec "$@"' box-hold-step timeout -k 30 "$((minutes * 60))" "$@"
+        "$BOX_HOLD" "$dev" sh -c 'exec 8>&- 9>&-; exec "$@"' box-hold-step "$GPU_STEP_REAP" "$((minutes * 60))" "$@"
 }
 
 # engine#3030: a phase set with NO GPU phase in it does not claim the GPU token. Measured 2026-11-20: `--phases npuserve`
@@ -550,7 +554,7 @@ gpu() {
         exit 2
       fi
       [ $rc = 0 ] || { result gpu-token SKIP 0 "box-hold could not take a ticket (rc $rc)"; exit 2; }
-      ticket=(timeout -k 30 "$budget")
+      ticket=("$GPU_STEP_REAP" "$budget")
     fi
     s0=$(date +%s)
     "${ticket[@]}" "$0" --cool --mem "${GPU_MODEL:--}" "$ROOT/scripts/mem-guard.sh" --term "$MEM_FLOOR" "$THERMAL" "$@"

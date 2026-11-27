@@ -43,7 +43,7 @@ echo "ctest fork=${ONEBIT_FORK_CTEST:-} parent=$(ps -o args= -p $PPID)" >> "$STU
 exit "${CTEST_RC:-0}"
 STUB
 chmod +x "$tmp/bh/box-hold" "$tmp/ctest"; cp "$tmp/ctest" "$tmp/bh/"; cp "$tmp/ctest" "$tmp/plain/"
-run() { ( set -euo pipefail; GITHUB_RUN_ID=77 HRX_BUILD=$tmp; . "$snip"; echo "step-ok" ) > "$tmp/out" 2>&1; }
+run() { ( set -euo pipefail; GITHUB_RUN_ID=77 HRX_BUILD=$tmp GITHUB_WORKSPACE=$root; . "$snip"; echo "step-ok" ) > "$tmp/out" 2>&1; }
 export STUBDIR=$tmp
 
 STUBLOG=$tmp/l1 PATH="$tmp/bh:$PATH" run; rc=$?

@@ -60,13 +60,14 @@ n=$(grep -c '^gpu-hold' "$log"); [ "$n" = 1 ] && ok "HW_GATE_BOX_HOLD=none: gpu-
 
 # the helpers, verbatim
 fn=$tmp/fn.sh
+export GPU_STEP_REAP="$(cd "$(dirname "$gate")" && pwd)/gpu-step-reap"   # box_ticket runs its step through it (the extracted functions do not carry the default)
 for f in box_hold_ancestor box_ticket; do sed -n "/^$f() {/,/^}/p" "$gate"; done > "$fn"
 grep -q '^box_ticket() {' "$fn" && grep -q '^box_hold_ancestor() {' "$fn" || { echo "FAIL: the helpers are no longer where this test finds them"; exit 1; }
 
 # gpu() runs its one step call inside the held ticket when box-hold is present (text-level: gpu() needs a build to run;
 # tests/hw_gate_held_ticket_test.sh drives the held ticket itself)
 body=$(sed -n '/^gpu() {/,/^}/p' "$gate")
-case "$body" in *'hold_for "${HW_GATE_STEP_EST_S:-600}"'*'ticket=(timeout -k 30 "$budget")'*'"${ticket[@]}" "$0" --cool'*) ok "gpu() runs its step inside the held box-hold ticket, under the ticket's time left" ;; *) bad "gpu() does not route its step through hold_for" ;; esac
+case "$body" in *'hold_for "${HW_GATE_STEP_EST_S:-600}"'*'ticket=("$GPU_STEP_REAP" "$budget")'*'"${ticket[@]}" "$0" --cool'*) ok "gpu() runs its step inside the held box-hold ticket, under the ticket's time left" ;; *) bad "gpu() does not route its step through hold_for" ;; esac
 grep -q 'hold_args=(box_ticket npu hw-gate-npu ' "$gate" && grep -q 'hold_args=(box_ticket npu hw-gate-npuserve ' "$gate" \
   && ok "npu and npuserve phases take a box-hold npu ticket" || bad "an NPU phase has no box-hold ticket"
 

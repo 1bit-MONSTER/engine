@@ -157,18 +157,25 @@ vm_kill() { [ -n "${qpid:-}" ] && kill "$qpid" 2> /dev/null; wait "${qpid:-0}" 2
 vm_up() { sleep 3; kill -0 "${qpid:-0}" 2> /dev/null || { row FAIL qemu "qemu exited at start: $(tail -2 "$work/qemu.out" | tr '\n' ' ' | cut -c1-160)"; return 1; }; }
 vm() {   # <live|disk>: boot the live stick with the blank disk, or the installed disk alone
     vm_kill; rm -f "$work/ser"
+    # the live boot is read over serial (the installer runs there): wait=on makes qemu hold the guest until the reader
+    # is attached - with nowait, whatever the guest writes before a client connects is DROPPED, grub's menu included
+    # (run 2, 27 Nov: the reader started 3 s late, never saw the menu, and the default entry booted without the serial
+    # shell). The installed-disk boots are driven over ssh and nothing reads their serial line: wait=off.
+    swait=off; [ "$1" = live ] && swait=on
     if [ "$1" = live ]; then
         cp --sparse=always "$base" "$work/live.img" && chmod u+w "$work/live.img"
         drives=(-drive file="$work/live.img",format=raw,if=none,id=u0 -device qemu-xhci -device usb-storage,drive=u0,bootindex=0
-                -drive file="$disk",format=raw,if=virtio)
+                -drive file="$disk",format=raw,if=none,id=d1 -device nvme,drive=d1,serial=uvt-target)
     else
         # bootindex is a DEVICE property (a -drive with if=virtio cannot take it: qemu refuses to start)
-        drives=(-drive file="$disk",format=raw,if=none,id=d1 -device virtio-blk-pci,drive=d1,bootindex=0)
+        # NVMe, like the board: the appliance's init finds its data partition on sd*/nvme* disks, and a virtio-blk disk
+        # (/dev/vda) left it "still waiting for [UUID=...]" for ever (run 3, 27 Nov: serial transcript of the installed boot)
+        drives=(-drive file="$disk",format=raw,if=none,id=d1 -device nvme,drive=d1,serial=uvt-target,bootindex=0)
     fi
     qemu-system-x86_64 -m 4096 -smp 4 -machine q35 -enable-kvm -cpu host -display none -no-reboot \
         -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" -drive if=pflash,format=raw,file="$work/vars.fd" \
         "${drives[@]}" -netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$sshport"-:22 -device virtio-net-pci,netdev=n0 \
-        -serial unix:"$work/ser",server,nowait >> "$work/qemu.out" 2>&1 &
+        -serial unix:"$work/ser",server=on,wait="$swait" >> "$work/qemu.out" 2>&1 &
     qpid=$!
 }
 S() { ssh -p "$sshport" -i "$T/sshkey" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -179,11 +186,12 @@ reboot_vm() { S 'sync; reboot' > /dev/null 2>&1; for _ in $(seq 1 60); do kill -
 ident() { S "sed -n 's/^payload=lemonade-onebit-//p' /etc/1bit/release-identity; tr ' ' '\n' < /proc/cmdline | sed -n 's/^psubdir=//p'" | tr '\n' ' '; }
 
 # VM 1: the live stick installs onto the blank disk
-vm live; vm_up || exit 2
+vm live
+sleep 1; kill -0 "${qpid:-0}" 2> /dev/null || { row FAIL qemu "qemu exited at start: $(tail -2 "$work/qemu.out" | tr '\n' ' ' | cut -c1-160)"; exit 2; }
 o=$(python3 -I "$repo/tools/update_vm_serial.py" "$work/ser" "$work/live.img" "$work" 1800 \
-    "1bit-install /dev/vda --yes --no-reboot 2>&1 | tail -4; sync")
+    "1bit-install /dev/nvme0n1 --yes --no-reboot 2>&1 | tail -4; sync")
 vm_kill; rm -f "$work/live.img"
-case $o in *"RC=0"*) row PASS install "1bit-install /dev/vda: $(printf '%s' "$o" | grep -v '^RC=' | tail -1 | cut -c1-80)" ;;
+case $o in *"RC=0"*) row PASS install "1bit-install /dev/nvme0n1: $(printf '%s' "$o" | grep -v '^RC=' | tail -1 | cut -c1-80)" ;;
     *) row FAIL install "$(printf '%s' "$o" | tail -3 | tr '\n' ' ' | cut -c1-160)"; exit 1 ;; esac
 
 # the installed disk's data partition: the test key, the updater under test, the throwaway trust

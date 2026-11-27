@@ -106,18 +106,23 @@ else:
     print("FAIL no serial root shell", flush=True)
     sys.exit(2)
 buf = b""
-for i in range(30):                                   # the shell must be READING, not just started
-    tok = "UVT-READY-%d" % i
-    s.sendall(("echo %s\n" % tok).encode())
-    if read_until(tok.encode(), 12) is not None:
+# The shell must be READING, not just started. Every token is sent as shell ARITHMETIC ("$((N+1))") and waited for as
+# its RESULT: the tty echoes typed input before any shell reads it, so waiting for the literal text matched that echo
+# (run 4, 27 Nov: "UVT-READY-0" seen in the echo, the installer line sent to a shell that was not reading yet, lost).
+for i in range(30):
+    s.sendall(("echo UVT-READY-$((%d+1))\n" % i).encode())
+    if read_until(("UVT-READY-%d\r\n" % (i + 1)).encode(), 12) is not None:
         break
 else:
     print("FAIL the serial shell never answered", flush=True)
     sys.exit(2)
 buf = b""
-begin, end = "UVT-BEGIN-%d" % os.getpid(), "UVT-END-%d" % os.getpid()
-s.sendall(("echo %s; ( %s ) 2>&1; echo RC=$?; echo %s\n" % (begin, cmd, end)).encode())
-read_until(("%s\r\n" % begin).encode(), 30)
+n = os.getpid()
+begin, end = "UVT-BEGIN-%d" % (n + 1), "UVT-END-%d" % (n + 1)
+s.sendall(("echo UVT-BEGIN-$((%d+1)); ( %s ) 2>&1; echo RC=$?; echo UVT-END-$((%d+1))\n" % (n, cmd, n)).encode())
+if read_until(("%s\r\n" % begin).encode(), 30) is None:
+    print("FAIL the serial shell did not start the command", flush=True)
+    sys.exit(2)
 out = read_until(end.encode(), timeout)
 if out is None:
     print("FAIL the command did not finish within %d s" % timeout, flush=True)

@@ -1725,8 +1725,8 @@ std::optional<Launch> loom_launch_for(const Options& o, int child_port) {
                          o.model.c_str());
         if (!lwhy.empty()) std::fprintf(stderr, "1bit serve: loom route %s: %s\n", r->id.c_str(), lwhy.c_str());
         if (refused) {
-            std::fprintf(stderr, "1bit serve: loom route %s matches %s, but its card is not usable (a weight file beside the "
-                                 "model is not the one the card was built for): serving on the llama.cpp route "
+            std::fprintf(stderr, "1bit serve: loom route %s matches %s, but its card is not usable (a weight link it needs is missing "
+                                 "or wrong; the reason is on the line above): serving on the llama.cpp route "
                                  "(docs/loom-route.md)\n", r->id.c_str(), o.model.c_str());
             return std::nullopt;
         }

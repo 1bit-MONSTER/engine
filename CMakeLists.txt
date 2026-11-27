@@ -835,6 +835,7 @@ add_python_test(loom_pin_check_self ${CMAKE_SOURCE_DIR}/tools/ci/loom_pin_check.
 # and size and are different models. The self-test arms that trap and the cannot-tell; the live check needs the card
 # tree, which is a ~GB download, so it is a lane command and not a CI row.
 add_python_test(loom_coverage_check_self ${CMAKE_SOURCE_DIR}/tools/ci/loom_coverage_check.py --self-test)
+add_python_test(loom_card_meta_self ${CMAKE_SOURCE_DIR}/tools/loom_card_meta.py --self-test)  # engine#3156
 # engine#3196 fix 2: two arms' per-layer residual dumps compared on their own, so a bit-exactness verdict can
 # say whether the BODY or the HEAD differs. Self-test only in CI: the live comparison needs two NPU runs that
 # dumped `layer_<ll>.f32` (`NPU_INFER_DUMP_DIR`), and `scripts/npu-kernel-bitx.sh` calls the tool on the runs it

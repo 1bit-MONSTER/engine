@@ -204,8 +204,33 @@ jobs:
           # distro's libhsa-runtime64 has no `hsa_amd_queue_create`, so every device row reports
           # "test skipped: no device available" and — because the fork registers that as a failing regex — a
           # FAIL, not a skip. Pass the runtime this configure resolved (cmake/hrx.cmake:137, engine#1766).
-          export IREE_HAL_AMDGPU_LIBHSA_PATH="$(sed -n 's/^ONEBIT_HRX_LIBHSA:FILEPATH=//p' "$HRX_BUILD/CMakeCache.txt")"
+          libhsa="$(sed -n 's/^ONEBIT_HRX_LIBHSA:FILEPATH=//p' "$HRX_BUILD/CMakeCache.txt")"
+          export IREE_HAL_AMDGPU_LIBHSA_PATH="$libhsa"
           echo "fork tests: HSA runtime $IREE_HAL_AMDGPU_LIBHSA_PATH"
+          # ... and now that this runner HAS a device (engine#3126), the four lines above are not enough: HRX
+          # dlopens `libhsa-runtime64.so` by its unversioned name (dynamic_library_posix.c:161) while the ROCm
+          # SDK ships only `libhsa-runtime64.so.1`, and the runtime's own dependencies (librocm_sysdeps_elf,
+          # librocprofiler-register, ...) live under the SDK's site-packages. Neither is on a ctest row's loader
+          # path, so 20 rows still printed 'test skipped: no device available' in run 45919794979 and the ratchet
+          # counts that as a failure: `20 row(s) did not run on a device -- this check needs a device, so it
+          # FAILS`. Stage the unversioned name in the build cache (persists, outside the checkout) and put the
+          # SDK's lib dirs behind it.
+          shim="$HRX_BUILD/hsa-shim"
+          mkdir -p "$shim"
+          ln -sfn "$libhsa" "$shim/libhsa-runtime64.so"
+          sdk_root="$(dirname "$(dirname "$libhsa")")"
+          lib_dirs=("$shim" "$(dirname "$libhsa")")
+          for d in "$sdk_root"/lib/python*/site-packages/_rocm_sdk_*/lib \
+                   "$sdk_root"/lib/python*/site-packages/_rocm_sdk_*/lib/rocm_sysdeps/lib; do
+            if [ -d "$d" ]; then lib_dirs+=("$d"); fi   # not `[ -d ] && ...`: set -e exits on a failing AND-list
+          done
+          export LD_LIBRARY_PATH="$(IFS=:; echo "${lib_dirs[*]}")"
+          # Fail here, with the missing sonames, rather than 20 rows later as 'no device available'.
+          if LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ldd "$libhsa" | grep -q 'not found'; then
+            echo "::error::the HSA runtime still has unresolved dependencies, so every device row will skip"
+            LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ldd "$libhsa" | grep 'not found'
+            exit 1
+          fi
           # engine#3000: THE ROW IS OPT-IN AND THIS JOB NEVER OPTED IN. `fork_ctest_known_fail` is registered
           # with SKIP_RETURN_CODE 77 and skips unless ONEBIT_FORK_CTEST=1 (it is opt-in because on a lane box
           # without a fork tree it must not run), so the step above built 33 test binaries and then ran none of

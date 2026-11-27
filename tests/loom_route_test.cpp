@@ -278,6 +278,73 @@ int main() {
             check("a link whose directory cannot exist refuses the card, also as root (and says why)",
                   n7 == 0 && r7 && w7.find("cannot link") != std::string::npos);
         }
+        // engine#3553 review: another named origin's weight (the native Inkling card's `@mxfp8/` experts, pulled from their
+        // own repo) must be in place in the variant that serves this model, or the card is refused naming the repo to pull
+        {
+            fs::create_directories(dir / "lc7" / "parameter");
+            std::ofstream(dir / "lc7" / "model.json") << R"({"model":{"id":"M7"},"origins":{"checkpoint":{"kind":"hf","repository":"u/ck"},)"
+                R"("mxfp8":{"kind":"hf","repository":"org/mxfp8-experts"}},"variants":{)"
+                R"("gguf":{"services":{"chat":{"parameters":{"model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"},)"
+                R"({"path":"parameter/x.safetensors","origin":"@mxfp8/x.safetensors"}]}}}}},)"
+                R"("other":{"services":{"chat":{"parameters":{"model":{"files":[{"path":"parameter/o.gguf","origin":"@checkpoint/o.gguf"},)"
+                R"({"path":"parameter/y.safetensors","origin":"@mxfp8/y.safetensors"}]}}}}}}})";
+            std::ofstream(dir / "lc7" / "model.json.lock") << R"({"files":[{"origin":"@checkpoint/m.gguf","size":1},)"
+                R"({"origin":"@mxfp8/x.safetensors","size":3},{"origin":"@mxfp8/y.safetensors","size":3}]})";
+            bool r8 = false;
+            std::string w8;
+            loom::loom_link_card_parameters((dir / "lc7" / "model.json").string(), (dir / "snap" / "m.gguf").string(), w8, &r8);
+            check("a missing @mxfp8/ weight in the served variant refuses the card and names the origin, size and repo",
+                  r8 && w8.find("@mxfp8/x.safetensors (3 B) is not linked") != std::string::npos &&
+                  w8.find("pull org/mxfp8-experts") != std::string::npos && w8.find("y.safetensors") == std::string::npos);
+            std::ofstream(dir / "snap" / "x.safetensors") << "xyz";
+            fs::create_symlink(dir / "snap" / "x.safetensors", dir / "lc7" / "parameter" / "x.safetensors");
+            bool r9 = false;
+            std::string w9;
+            loom::loom_link_card_parameters((dir / "lc7" / "model.json").string(), (dir / "snap" / "m.gguf").string(), w9, &r9);
+            check("...linked at the lock's size it is served (and the unused variant's absent @mxfp8/ file does not refuse)",
+                  !r9 && w9.empty());
+            fs::remove(dir / "lc7" / "parameter" / "x.safetensors");
+            std::ofstream(dir / "snap" / "x2.safetensors") << "another size";
+            fs::create_symlink(dir / "snap" / "x2.safetensors", dir / "lc7" / "parameter" / "x.safetensors");
+            bool r10 = false;
+            std::string w10;
+            loom::loom_link_card_parameters((dir / "lc7" / "model.json").string(), (dir / "snap" / "m.gguf").string(), w10, &r10);
+            check("...and one of another size than the lock refuses the card",
+                  r10 && w10.find("@mxfp8/x.safetensors (3 B) has another size") != std::string::npos);
+        }
+        // engine#3553 review (cl-hf): the named origin's file is in the HF cache, but in the snapshot of the repo's head (a
+        // pull by `main`), not the lock's revision boot linked: serve finds it there by the lock's size, sha256 breaking a tie
+        {
+            const fs::path hub = dir / "hub";
+            const fs::path ckdir = hub / "models--u--ck" / "snapshots" / "r1";
+            fs::create_directories(ckdir);
+            std::ofstream(ckdir / "m.gguf") << "m";
+            const fs::path mx = hub / "models--org--mxfp8-experts" / "snapshots";
+            fs::create_directories(mx / "head1");
+            fs::create_directories(mx / "head2");
+            std::ofstream(mx / "head1" / "x.safetensors") << "abc";   // same size, other bytes: must lose on sha
+            std::ofstream(mx / "head2" / "x.safetensors") << "xyz";
+            fs::create_directories(dir / "lc8" / "parameter");
+            std::ofstream(dir / "lc8" / "model.json") << R"({"model":{"id":"M8"},"origins":{"checkpoint":{"kind":"hf","repository":"u/ck"},)"
+                R"("mxfp8":{"kind":"hf","repository":"org/mxfp8-experts"}},"variants":{)"
+                R"("gguf":{"services":{"chat":{"parameters":{"model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"},)"
+                R"({"path":"parameter/x.safetensors","origin":"@mxfp8/x.safetensors"}]}}}}}}})";
+            std::ofstream(dir / "lc8" / "model.json.lock") << R"({"files":[{"origin":"@checkpoint/m.gguf","size":1},)"
+                R"({"origin":"@mxfp8/x.safetensors","size":3,"sha256":")" + loom::sha256_of_file((mx / "head2" / "x.safetensors").string()) + R"("}]})";
+            fs::create_symlink(mx / "lockrev" / "x.safetensors", dir / "lc8" / "parameter" / "x.safetensors");   // boot's link: dangling
+            bool r11 = false;
+            std::string w11;
+            loom::loom_link_card_parameters((dir / "lc8" / "model.json").string(), (ckdir / "m.gguf").string(), w11, &r11);
+            check("a named origin's file in another snapshot of its repo is found by the lock's size + sha256 and linked",
+                  !r11 && w11.empty() && fs::canonical(dir / "lc8" / "parameter" / "x.safetensors") == fs::canonical(mx / "head2" / "x.safetensors"));
+            fs::remove_all(mx);
+            fs::remove(dir / "lc8" / "parameter" / "x.safetensors");
+            bool r12 = false;
+            std::string w12;
+            loom::loom_link_card_parameters((dir / "lc8" / "model.json").string(), (ckdir / "m.gguf").string(), w12, &r12);
+            check("...and with no snapshot of that repo the card is refused, naming the repo to pull",
+                  r12 && w12.find("pull org/mxfp8-experts") != std::string::npos);
+        }
         // a file the card lists but nothing beside the model provides (an unused variant) does not refuse the card
         {
             fs::create_directories(dir / "lc2" / "parameter");

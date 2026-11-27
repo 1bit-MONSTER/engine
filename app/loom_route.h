@@ -435,6 +435,104 @@ inline int loom_link_card_parameters(const std::string& card_model_json, const s
         }
         ++made;
     }
+    // engine#3553 review: a card can bind weights from OTHER named origins than the checkpoint (the native Inkling card's
+    // `@mxfp8/` experts, pulled from their own repo). serve does not relink those - boot or the catalogue pull links them -
+    // but a missing one used to go unnoticed: Loom started and loom-serve failed at load, naming no file. In the variant(s)
+    // that serve this model (a `@checkpoint/` file of the served file's name), every other named origin's parameter must
+    // resolve to a regular file of the lock's size; otherwise the card is refused and the reason names the origin, the
+    // size and the repository to pull. Unused variants are not checked (engine#3406), nor is a card no variant of which
+    // names the served file.
+    if (j.contains("variants") && j["variants"].is_object()) {
+        const std::string served = fs::path(model_path).filename().string();
+        auto files_of = [](const json& v, auto&& visit) {
+            std::vector<const json*> st = {&v};
+            while (!st.empty()) {
+                const json* x = st.back();
+                st.pop_back();
+                if (x->is_array()) { for (const auto& e : *x) st.push_back(&e); continue; }
+                if (!x->is_object()) continue;
+                for (const auto& kv : x->items()) st.push_back(&kv.value());
+                if (x->contains("path") && x->contains("origin") && (*x)["path"].is_string() && (*x)["origin"].is_string())
+                    visit((*x)["path"].get<std::string>(), (*x)["origin"].get<std::string>());
+            }
+        };
+        const std::string ck = "@checkpoint/";
+        for (const auto& var : j["variants"].items()) {
+            bool serves = false;
+            files_of(var.value(), [&](const std::string&, const std::string& origin) {
+                if (origin.compare(0, ck.size(), ck) == 0 && fs::path(origin.substr(ck.size())).filename().string() == served)
+                    serves = true;
+            });
+            if (!serves) continue;
+            files_of(var.value(), [&](const std::string& rel, const std::string& origin) {
+                if (origin.empty() || origin[0] != '@' || origin.compare(0, ck.size(), ck) == 0) return;
+                const auto slash = origin.find('/');
+                if (slash == std::string::npos) return;
+                std::error_code fec;
+                const fs::path f = (card_dir / rel).lexically_normal();
+                const auto want = lock_size.find(origin);
+                auto sized_ok = [&](const fs::path& p) {
+                    std::error_code e;
+                    return fs::is_regular_file(p, e) && !e && (want == lock_size.end() || fs::file_size(p, e) == want->second) && !e;
+                };
+                const bool present = fs::is_regular_file(f, fec) && !fec;
+                if (sized_ok(f)) return;
+                std::string repo;
+                const std::string oname = origin.substr(1, slash - 1);
+                if (j.contains("origins") && j["origins"].is_object() && j["origins"].contains(oname) &&
+                    j["origins"][oname].is_object() && j["origins"][oname].contains("repository") &&
+                    j["origins"][oname]["repository"].is_string())
+                    repo = j["origins"][oname]["repository"].get<std::string>();
+                // engine#3553 review (cl-hf): boot links a named origin into the HF cache snapshot of the LOCK's revision, but
+                // a pull by `main` lands in the snapshot of the repo's head (a README edit moves it). When the served model is
+                // in an HF cache (<hub>/models--o--r/snapshots/<rev>/<file>), look for the origin's file in every snapshot of
+                // its repo there: the lock's size picks it, its sha256 breaks a tie; the link is (re)made inside the card,
+                // with the same containment rules as a checkpoint link.
+                const fs::path name = fs::path(origin.substr(slash + 1)).filename(), relp(rel);
+                bool contained = !name.empty() && !relp.is_absolute() && !relp.has_root_name() && !relp.has_root_directory();
+                for (const auto& part : relp) contained = contained && part != "..";
+                if (contained) {
+                    std::error_code cec;
+                    const fs::path base = fs::weakly_canonical(card_dir, cec), parent = fs::weakly_canonical(f.parent_path(), cec);
+                    const fs::path inside = cec ? fs::path() : parent.lexically_relative(base);
+                    contained = !cec && !inside.empty() && *inside.begin() != "..";
+                }
+                const fs::path snap_dir = model_dir.parent_path(), repo_dir = snap_dir.parent_path(), hub = repo_dir.parent_path();
+                if (contained && !repo.empty() && snap_dir.filename() == "snapshots" &&
+                    repo_dir.filename().string().rfind("models--", 0) == 0) {
+                    std::string cache = repo;
+                    for (std::string::size_type at = cache.find('/'); at != std::string::npos; at = cache.find('/', at + 2))
+                        cache.replace(at, 1, "--");
+                    std::vector<fs::path> cands;
+                    std::error_code dec;
+                    for (fs::directory_iterator it(hub / ("models--" + cache) / "snapshots", dec), end; !dec && it != end; it.increment(dec))
+                        if (sized_ok(it->path() / name)) cands.push_back(it->path() / name);
+                    fs::path pick;
+                    if (cands.size() == 1) pick = cands[0];
+                    else if (cands.size() > 1) {
+                        const auto sh = lock_sha.find(origin);
+                        for (const auto& c : cands)
+                            if (sh != lock_sha.end() && sha256_of_file(c.string()) == sh->second) { pick = c; break; }
+                    }
+                    if (!pick.empty()) {
+                        std::error_code lec;
+                        const fs::file_status st = fs::symlink_status(f, lec);
+                        if (!(fs::exists(st) && !fs::is_symlink(st))) {   // a real file in parameter/ is never replaced
+                            fs::create_directories(f.parent_path(), lec);
+                            fs::remove(f, lec);
+                            fs::create_symlink(fs::canonical(pick, lec), f, lec);
+                            if (!lec) { ++made; return; }
+                        }
+                    }
+                }
+                why += std::string(why.empty() ? "" : "; ") + origin +
+                       (want != lock_size.end() ? " (" + std::to_string(want->second) + " B)" : std::string()) +
+                       (present ? " has another size than the card's lock" : " is not linked at " + f.string()) +
+                       (repo.empty() ? std::string() : ": pull " + repo);
+                if (refused) *refused = true;
+            });
+        }
+    }
     return made;
 }
 

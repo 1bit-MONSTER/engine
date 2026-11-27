@@ -1529,3 +1529,60 @@ model-card metadata subset, not the file — carries no `architectures`, which i
 
 Nothing here needs a pin bump or an engine change, and no `registry/significant.json` entry was added: the
 report was wrong about the repos, not the engine about the architectures.
+
+## 2026-11-27: `DeymeForCausalLM`, `ADOMForRibbonRetrieval`, `PITForCausalLM`, `SDLLMForMaskedDiffusion` — reviewed, none is an alias (engine#3522)
+
+The 2026-11-27 watcher run alerted four new classes, each from one uploader; the alerted repos have 0 downloads. All four were read
+from the public repos (config, file list, and for PIT its shipped `model_code/pit_hf/modeling_pit.py`; for SDLLM the
+`model.safetensors` header), and checked against the pinned `third_party/llama.cpp` `02992d76f` (`git grep -i` over
+`src/`, `conversion/`, `convert_hf_to_gguf.py`, `gguf-py` for `sdllm`, `pit_hf`, `PITForCausalLM`, `deyme`, `adom`,
+`MaskedDiffusion`: 0 hits) and upstream `ggml-org/llama.cpp` (GitHub code search for each class name: 0 hits). So no
+pin bump would map any of them, and each is recorded as `"watch": "report"` in `registry/significant.json`.
+
+### `deyme` — `Mon-Deyme/DEYME-Instruct`
+
+A from-scratch French toy decoder: `d_model` 512, 8 layers, 8 heads, vocab 16000, `max_seq_len` 512, fp32, with its
+own `configuration_deyme.py` / `modeling_deyme.py` behind `auto_map`. Remote code with its own config keys and no
+family to map to. Nothing to do unless it grows a family.
+
+### `adom` — `SiaoShiihte/ADOM-4-Beiduofen-2611`
+
+**Not a language model.** The config declares 0 layers, 0 heads and hidden size 0; the artifact is 360,607 one-bit
+parameters "trained" by Gaussian elimination into a hashed ribbon (fnv1a64+splitmix64) over a 322-symbol Huffman
+vocabulary, answered by the repo's own `adom.js`. There is no tensor graph for any backend to run, so there is
+nothing to map now or later; recorded only so the class stops alerting.
+
+### `pit_hf` — `codesj/PIT-4B-2024-YaRN-16K-Replay-20261127`
+
+A modded-nanoGPT-style decoder: 20 layers, `n_embd` 4096, 32 heads, GPT-2 token ids (50256), YaRN RoPE, no biases.
+Its `model.safetensors` holds 121 tensors: `transformer.wte` plus six matrices per layer — no norm weights and no
+`lm_head` tensor. What rules out an alias, read from its `modeling_pit.py`:
+
+* **Weightless norms**: every norm is `F.rms_norm(x, shape)` with no learned gamma — before attention, before the MLP,
+  and on q and k (QK-norm). A llama-family graph would need synthesized all-ones norm weights to load it, and the
+  QK-norm has no slot in the GPT-2 / NeoX graphs that share its naming.
+* **relu²** MLP (`F.relu(c_fc(x)).square()`, 4x, no gate): not GELU (gpt2), not SwiGLU (llama).
+* Tensor names `transformer.h.N.attn.c_q/c_k/c_v/c_proj`, `mlp.c_fc/c_proj`: GPT-2 names with separate q/k/v, which
+  no pinned converter reads.
+
+Supporting it would be a small new graph (weightless-RMS + QK-norm + relu² + YaRN), not a mapping. It is one
+uploader's series (codesj: 14 public `PIT-*` repos on 2026-11-27, the most-downloaded at 37; the full census in
+`registry/census.json` counts 48 models of this class) with no licence on the card, so not worth one today.
+
+### `sdllm` — `vllm-denoisers/SDLLM-MDLM-1.7B-Base`
+
+A vLLM-denoisers conversion of `nvidia/SDLLM-MDLM-1.7B-Base` (CC BY-NC 4.0, non-commercial): a **masked-diffusion**
+LM, 28 layers, hidden 2176, 17 heads, mask id 3, a LLaDA-style decode policy over a 256-token canvas. The repo
+folds the time-conditioning adaLN into its norms and output projections. Its safetensors header (285 tensors) has
+`input_layernorm`/`post_attention_layernorm` **with bias**, a fused `self_attn.qkv_proj`, `mlp.fc1`/`mlp.fc2` with
+bias and no gate, and an `lm_head` with bias.
+
+* **Why not `LLaDAModelLM`**: the pinned `src/models/llada.cpp` builds RMS norms (`LLM_NORM_RMS`) and creates
+  `ffn_gate` as a required tensor (SwiGLU). SDLLM has LayerNorm with bias and a two-matrix MLP, so the graph cannot
+  load it, and `conversion/llada.py` / `conversion/dream.py` read neither its tensor names nor its config.
+* **What real support requires**: a diffusion graph with LayerNorm+bias, a non-gated MLP and a biased head, plus
+  the canvas / sub-block decode loop the llada path already has. That is an engine feature for the day a
+  commercially usable SDLLM checkpoint exists.
+
+Remove a class's `watch` field (so the next upload alerts) if a pinned backend gains a graph for it, and record
+`mapped_ok` then.

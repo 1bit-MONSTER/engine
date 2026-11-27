@@ -91,7 +91,7 @@ def upstream_timeout(raw):
 UPSTREAM_TIMEOUT = upstream_timeout(os.environ.get("ONEBIT_WEBAPP_UPSTREAM_TIMEOUT"))
 
 
-# ── OS updater U5 (local): the update page's API on this loopback listener ─────────────────────────────────────────
+# ── OS updater U5 (local): the update page's API, on its own loopback listener (UPDATE_PORT, below) ─────────────────────────────────────────
 # Owner decision via the orchestrator, 27 Nov: the update page is loopback-only by default; a LAN page only once a
 # credential is set on the box (a later step). This proxy runs as ROOT and serves requests with no Origin, so the
 # loopback rule alone would let any LOCAL process - a non-root daemon, a sandboxed user - make root install, roll the
@@ -121,6 +121,32 @@ _TEST_ADMIN = os.environ.get("ONEBIT_WEBAPP_TEST_ADMIN_UID", "")
 ADMIN_UID = int(_TEST_ADMIN) if (_TEST_ADMIN.isdigit() and not _AS_ROOT) else 0
 REBOOT_CMD = ["reboot"] if _AS_ROOT or not os.environ.get("ONEBIT_WEBAPP_TEST_REBOOT") else \
     os.environ["ONEBIT_WEBAPP_TEST_REBOOT"].split()
+# ITS OWN ORIGIN (reviews cl-pragent, cl-qat): the update API trusts a same-origin script completely (it can send the
+# header without a preflight and read the expected confirmation from status), and 127.0.0.1:8080 also serves whatever
+# Lemonade returns under /api/ and /internal/ - an HTML error page or a future route there would run with the power
+# to make root roll back or reboot. So the update page and its API live on 127.0.0.1:8081, which serves nothing else,
+# with a CSP of default-src 'self' and no framing; :8080 serves neither.
+UPDATE_PORT = 8081 if _AS_ROOT else int(os.environ.get("ONEBIT_WEBAPP_UPDATE_PORT", "8081"))
+UPDATE_ORIGINS = {"http://localhost:%d" % UPDATE_PORT, "http://127.0.0.1:%d" % UPDATE_PORT}
+SECURITY_HEADERS = (("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
+                    ("X-Frame-Options", "DENY"), ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "no-referrer"),
+                    ("Cache-Control", "no-store"))
+# status's --check is cached (it is open to every local process, and GitHub allows 60 unauthenticated calls an hour:
+# a polling loop would starve the box's real checks); an install always runs a fresh one
+CHECK_TTL = 300.0
+_check = {"t": 0.0, "out": "", "lock": threading.Lock()}
+
+
+def cached_check():
+    with _check["lock"]:
+        if time.time() - _check["t"] < CHECK_TTL:
+            return _check["out"]
+    rc, out = run_text(["--check"])
+    with _check["lock"]:
+        _check.update(t=time.time(), out=out)
+    return out
+
+
 _job = {"running": False, "action": "", "rc": None, "started": 0.0}
 _job_lock = threading.Lock()
 
@@ -275,27 +301,63 @@ class Handler(SimpleHTTPRequestHandler):
         finally:
             conn.close()
 
+    def do_GET(self):
+        if self.path.split("?", 1)[0] in ("/update.html", "/update.js", "/update.css") or self.path.startswith("/1bit/update/"):
+            return self.send_error(404, "the update page is on http://127.0.0.1:%d/" % UPDATE_PORT)
+        return self._forward() if self.path.startswith(FORWARD) else super().do_GET()
+
+    def do_HEAD(self):
+        return self._forward() if self.path.startswith(FORWARD) else super().do_HEAD()
+
+    def do_POST(self):
+        return self._forward() if self.path.startswith(FORWARD) else self.send_error(405)
+
+    def do_DELETE(self):
+        return self._forward() if self.path.startswith(FORWARD) else self.send_error(405)
+
+    def do_PUT(self):
+        return self._forward() if self.path.startswith(FORWARD) else self.send_error(405)
+
+
+class UpdateHandler(SimpleHTTPRequestHandler):
+    """127.0.0.1:UPDATE_PORT: the update page and its API, nothing else (its own origin)"""
+    protocol_version = "HTTP/1.1"
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory=APP, **kw)
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s update %s\n" % (self.log_date_time_string(), fmt % args))
+
+    def end_headers(self):
+        for k, v in SECURITY_HEADERS:
+            self.send_header(k, v)
+        super().end_headers()
+
+    def _is_admin(self):
+        """loopback: the client socket's owner is root (see the update section's comment)"""
+        return peer_uid(self.client_address, UPDATE_PORT) == ADMIN_UID
+
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
     def _update(self):
         origin = self.headers.get("Origin")
-        if origin and origin not in ALLOWED_ORIGINS:
+        if origin and origin not in UPDATE_ORIGINS:
             return self._json(403, {"error": "cross-origin requests may not use the update page"})
         path = self.path.split("?", 1)[0]
         if self.command == "GET" and path == "/1bit/update/status":
             rs, st = run_text(["--status"])
-            rc, ck = run_text(["--check"])
+            ck = cached_check()
             with _job_lock:
                 job = dict(_job)
             return self._json(200, {"status": st, "check": ck, "offered": offered_tag(ck), "rollback_to": other_slot(st),
-                                    "job": job, "log": log_tail(), "admin": peer_uid(self.client_address, PORT) == ADMIN_UID})
+                                    "job": job, "log": log_tail(), "admin": self._is_admin()})
         if self.command == "GET" and path == "/1bit/update/progress":
             with _job_lock:
                 job = dict(_job)
@@ -304,7 +366,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(404, {"error": "no such update action"})
         if self.headers.get("X-1bit-Update") != "1":
             return self._json(403, {"error": "missing X-1bit-Update: 1"})
-        if peer_uid(self.client_address, PORT) != ADMIN_UID:
+        if not self._is_admin():
             return self._json(403, {"error": "install, rollback and reboot are for root on this box (the box's own "
                                               "desktop session, or a root shell: curl); this client is not root"})
         try:
@@ -338,23 +400,35 @@ class Handler(SimpleHTTPRequestHandler):
         return self._json(202, {"started": action})
 
     def do_GET(self):
-        if self.path.startswith("/1bit/update/"):
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/1bit/update/"):
             return self._update()
-        return self._forward() if self.path.startswith(FORWARD) else super().do_GET()
-
-    def do_HEAD(self):
-        return self._forward() if self.path.startswith(FORWARD) else super().do_HEAD()
+        if path in ("/", "/update.html", "/update.js", "/update.css"):
+            self.path = "/update.html" if path == "/" else path
+            return super().do_GET()
+        return self._json(404, {"error": "only the update page is served here"})
 
     def do_POST(self):
         if self.path.startswith("/1bit/update/"):
             return self._update()
-        return self._forward() if self.path.startswith(FORWARD) else self.send_error(405)
+        return self._json(404, {"error": "only the update page is served here"})
 
-    def do_DELETE(self):
-        return self._forward() if self.path.startswith(FORWARD) else self.send_error(405)
+    def do_HEAD(self):
+        return self._json(405, {"error": "not here"})
 
-    def do_PUT(self):
-        return self._forward() if self.path.startswith(FORWARD) else self.send_error(405)
+    do_PUT = do_DELETE = do_HEAD
+
+
+def serve_update():
+    try:
+        u = ThreadingHTTPServer(("127.0.0.1", UPDATE_PORT), UpdateHandler)
+    except OSError as e:
+        print("1bit-webapp-proxy: the update page could not bind 127.0.0.1:%d (%s)" % (UPDATE_PORT, e), flush=True)
+        return None
+    u.daemon_threads = True
+    threading.Thread(target=u.serve_forever, daemon=True).start()
+    print("1bit-webapp-proxy: update page on http://127.0.0.1:%d/" % UPDATE_PORT, flush=True)
+    return u
 
 
 def port_holder(port):
@@ -423,6 +497,7 @@ def main():
     if srv is None:
         sys.exit("1bit-webapp-proxy: could not bind 127.0.0.1:%d" % PORT)
     srv.daemon_threads = True
+    serve_update()
     print("1bit-webapp-proxy: serving %s on 127.0.0.1:%d, /api/ -> %s:%d%s"
           % (APP, PORT, UPSTREAM[0], UPSTREAM[1],
              "" if api_key() else " (no API key in %s)" % CONF), flush=True)

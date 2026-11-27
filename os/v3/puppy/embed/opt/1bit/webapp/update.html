@@ -15,7 +15,8 @@
   See the License for the specific language governing permissions and
 
   1bit OS - update page (OS updater U5, local). Opened from the chat page's header, served by 1bit-webapp-proxy on
-  127.0.0.1:8080 only. It shows 1bit-update --status and --check; install / rollback / reboot are POSTs the proxy
+  its OWN origin, 127.0.0.1:8081 (CSP default-src 'self', no framing): the chat origin :8080 also serves what Lemonade
+  returns under /api/, and nothing served there may drive these actions. It shows 1bit-update --status and --check; install / rollback / reboot are POSTs the proxy
   serves only to a ROOT client on this box (the desktop session) and only with the typed confirmation: the offered
   release, the slot to roll back to, or the word reboot. Same browser rules as the chat page: fetch + JSON only
   (Pale Moon 33 lacks AbortSignal.timeout and friends). A LAN update page exists only once a credential is set on
@@ -23,18 +24,8 @@
 -->
 <meta charset="utf-8">
 <title>1bit OS - update</title>
-<style>
-  body { font: 14px/1.4 sans-serif; margin: 0; background: #111; color: #ddd; }
-  header { display: flex; gap: 1em; padding: .6em 1em; background: #222; }
-  header a { color: #9cf; }
-  main { padding: 1em; max-width: 60em; }
-  pre { background: #1a1a1a; padding: .6em; white-space: pre-wrap; border: 1px solid #333; }
-  section { margin-bottom: 1.4em; }
-  input { background: #222; color: #ddd; border: 1px solid #555; padding: .3em; }
-  button { padding: .3em .8em; }
-  .why { color: #e96; }
-</style>
-<header><b>1bit OS</b><span>update</span><span style="margin-left:auto"><a href="/">back to chat</a></span></header>
+<link rel="stylesheet" href="/update.css">
+<header><b>1bit OS</b><span>update</span><span style="margin-left:auto"><a href="http://127.0.0.1:8080/">back to chat</a></span></header>
 <main>
   <section><h3>This box</h3><pre id="status">asking 1bit-update…</pre></section>
   <section><h3>Available</h3><pre id="check"></pre>
@@ -47,36 +38,4 @@
   <p class="why" id="why"></p>
   <section><h3>Last action</h3><pre id="log">none yet</pre></section>
 </main>
-<script>
-function $(id) { return document.getElementById(id); }
-function show(id, text) { $(id).textContent = text; }
-function post(action, confirm) {
-  show('why', '');
-  fetch('/1bit/update/' + action, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-1bit-Update': '1' },
-                                    body: JSON.stringify({ confirm: confirm }) })
-    .then(function (r) { return r.json().then(function (j) { return [r.status, j]; }); })
-    .then(function (a) { if (a[0] !== 202) show('why', a[1].error || ('HTTP ' + a[0])); poll(); })
-    .catch(function (e) { show('why', 'the proxy did not answer: ' + e); });
-}
-function poll() {
-  fetch('/1bit/update/progress').then(function (r) { return r.json(); }).then(function (j) {
-    var job = j.job || {};
-    show('log', (job.action ? job.action + (job.running ? ' - running' : ' - finished, exit ' + job.rc) + '\n\n' : '') + (j.log || ''));
-    if (job.running) setTimeout(poll, 2000);
-  }).catch(function () {});
-}
-function load() {
-  fetch('/1bit/update/status').then(function (r) { return r.json(); }).then(function (j) {
-    show('status', j.status); show('check', j.check);
-    $('install').hidden = !j.offered; show('offer', j.offered || '');
-    $('roll').hidden = !j.rollback_to; show('slot', j.rollback_to || '');
-    if (!j.admin) show('why', 'Install, roll back and reboot need root on this box (its own desktop session, or ' +
-                                'curl from a root shell); this browser is not running as root.');
-    poll();
-  }).catch(function (e) { show('status', 'the proxy did not answer: ' + e); });
-}
-$('bi').onclick = function () { post('latest', $('ci').value.trim()); };
-$('br').onclick = function () { post('rollback', $('cr').value.trim()); };
-$('bb').onclick = function () { post('reboot', $('cb').value.trim()); };
-load();
-</script>
+<script src="/update.js"></script>

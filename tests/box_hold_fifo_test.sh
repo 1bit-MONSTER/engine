@@ -20,6 +20,11 @@
 #   3. BOX_HOLD_WAIT runs out behind a holder -> exit 4, its ticket leaves the queue
 #   4. BOX_HOLD_WAIT runs out while still queued behind another waiter -> exit 4 ("still queued")
 #   5. the command's rc comes back; the .who files name the holder
+#   6. CI class (BOX_HOLD_PRIORITY=ci): served right after the holder, ahead of lanes queued earlier; FIFO among CI
+#   7. a killed CI waiter is skipped: the lanes behind it still run
+#   8. a ticket of the previous name format (lanes queued before the upgrade) is served before new lanes, after CI
+#   9. a CI ticket's command is capped at BOX_HOLD_CI_MAX (rc 124)
+#  10. the command's stderr reaches the caller (a bare `exec 9>lock 2>/dev/null` used to discard every job's stderr)
 set -u
 BH=${1:?usage: box_hold_fifo_test.sh <box-hold>}
 T=$(mktemp -d); trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$T"' EXIT
@@ -68,6 +73,47 @@ wait
 BOX_HOLD_WHO=lane-x sh "$BH" npu sh -c 'exit 5'; rc=$?
 [ "$rc" = 5 ] && ok "command rc passes through" || bad "rc $rc, wanted 5"
 grep -q "^lane-x " "$T/locks/box-gpu.who" && grep -q "^lane-x " "$T/locks/box-npu.who" && ok ".who files name the holder (both locks)" || bad "who: $(cat "$T"/locks/box-*.who)"
+
+# 6. CI jumps the line, FIFO among CI
+: > "$T/order"
+sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.5
+sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
+sh "$BH" gpu sh -c "$(job L2 0.2)" & sleep 0.3
+BOX_HOLD_PRIORITY=ci sh "$BH" gpu sh -c "$(job C1 0.2)" & sleep 0.3
+BOX_HOLD_PRIORITY=ci sh "$BH" both sh -c "$(job C2 0.2)" & sleep 0.3
+wait
+[ "$(tr '\n' ' ' < "$T/order")" = "H C1 C2 L1 L2 " ] && ok "CI served next (after the holder, before earlier lanes), FIFO among CI" || bad "CI order: $(tr '\n' ' ' < "$T/order")"
+[ ! -e "$T/overlap" ] && ok "never two jobs at once with CI in the queue" || bad "overlap seen"
+
+# 7. a dead CI waiter is skipped
+: > "$T/order"
+sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.5
+sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
+BOX_HOLD_PRIORITY=ci sh "$BH" gpu sh -c "$(job C1 0.2)" & c=$!; sleep 0.3
+kill -9 "$c"; wait
+[ "$(tr '\n' ' ' < "$T/order")" = "H L1 " ] && ok "killed CI waiter skipped, the lane behind it runs" || bad "after CI kill: $(tr '\n' ' ' < "$T/order")"
+[ -z "$(ls "$T/locks/queue")" ] && ok "dead CI ticket swept" || bad "queue left: $(ls "$T/locks/queue")"
+
+# 8. previous-format tickets: after CI, before new lanes
+: > "$T/order"
+sh "$BH" gpu sh -c "$(job H 1)" & sleep 0.3
+sleep 2.5 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
+echo "old-lane $(date -u +%FT%TZ) x" > "$T/locks/queue/$(printf '%012d' 1).$old.$st"   # a live waiter of the old script
+sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
+BOX_HOLD_PRIORITY=ci sh "$BH" gpu sh -c "$(job C1 0.2)" & sleep 0.3
+wait
+s0=$(grep -n '^C1$' "$T/order" | cut -d: -f1); s1=$(grep -n '^L1$' "$T/order" | cut -d: -f1)
+[ "$(tr '\n' ' ' < "$T/order")" = "H C1 L1 " ] && ok "CI passes an old-format ticket; the new lane waits until it is gone" || bad "old-format order: $(tr '\n' ' ' < "$T/order")"
+names=$(printf '%s\n' 1-000000000009.1.1 000000000001.1.1 0-000000000010.1.1 | LC_ALL=C sort | cut -c1-2 | tr '\n' ' ')
+[ "$names" = "0- 00 1- " ] && ok "name order: CI < previous format < new lanes" || bad "name order: $names"
+
+# 9. the CI cap
+s=$(date +%s); BOX_HOLD_CI_MAX=1 BOX_HOLD_PRIORITY=ci sh "$BH" gpu sleep 5; rc=$?; d=$(( $(date +%s) - s ))
+[ "$rc" = 124 ] && [ "$d" -le 3 ] && ok "a CI ticket's command is capped (rc 124 after ${d}s)" || bad "CI cap: rc $rc after ${d}s"
+
+# 10. stderr passes through
+sh "$BH" gpu sh -c 'echo to-stderr >&2' 2> "$T/err10"
+grep -qx to-stderr "$T/err10" && ok "the command's stderr reaches the caller" || bad "stderr lost: [$(cat "$T/err10")]"
 
 [ "$fail" = 0 ] && echo "box_hold_fifo: PASS" || echo "box_hold_fifo: FAIL"
 exit "$fail"

@@ -84,7 +84,7 @@ watch() {
   while :; do
     if [ "$(age)" -lt "$DEMAND_FRESH_S" ]; then
       log "watch: demand ($(age)s old), queueing: $(cat /tmp/box-locks/box-gpu.who 2>/dev/null | cut -c1-80)"
-      BOX_HOLD_WAIT=${BOX_HOLD_WAIT:-21600} BOX_HOLD_WHO=coder-llm "$BOX_HOLD" gpu "$0" window 7>&- &
+      BOX_HOLD_WAIT=${BOX_HOLD_WAIT:-21600} BOX_HOLD_WHO=coder-llm BOX_HOLD_PRIORITY=ci "$BOX_HOLD" gpu "$0" window 7>&- &
       wait $! ; rc=$?
       [ "$rc" = 0 ] || log "watch: box-hold rc $rc"
       sleep "$WATCH_S"

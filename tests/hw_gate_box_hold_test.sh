@@ -42,7 +42,7 @@ STUB
 cat > "$tmp/bin/box-hold" <<'STUB'
 #!/bin/bash
 # like the real one: lock descriptors open, then run the command (not exec) and pass its rc
-printf 'box-hold %s who=%s wait=%s\n' "$1" "$BOX_HOLD_WHO" "$BOX_HOLD_WAIT" >> "$STUBLOG"
+printf 'box-hold %s who=%s wait=%s prio=%s\n' "$1" "$BOX_HOLD_WHO" "$BOX_HOLD_WAIT" "${BOX_HOLD_PRIORITY:-}" >> "$STUBLOG"
 [ -n "${STUB_RC:-}" ] && exit "$STUB_RC"
 exec 8> "$STUBDIR/gpu.lock" 9> "$STUBDIR/npu.lock"
 shift; "$@"
@@ -80,14 +80,14 @@ STEP
 chmod +x "$tmp/step"
 STUBLOG=$log BOX_HOLD=$tmp/bin/box-hold BOX_HOLD_WAIT_S=1234 GITHUB_RUN_ID=42 bash -c ". '$fn'; box_ticket gpu hw-gate 45 '$tmp/step'"; rc=$?
 [ "$rc" = 7 ] && ok "step rc passes through the ticket" || bad "ticket rc $rc, wanted 7"
-grep -q "^box-hold gpu who=hw-gate run 42 pid [0-9]* wait=1234$" "$log" && ok "box-hold gpu, labelled, with the wait" || bad "box-hold call: $(grep box-hold "$log")"
+grep -q "^box-hold gpu who=hw-gate run 42 pid [0-9]* wait=1234 prio=ci$" "$log" && ok "box-hold gpu, labelled, with the wait, CI class under CI" || bad "box-hold call: $(grep box-hold "$log")"
 grep -q "fd [89] open" "$log" && bad "lock descriptor open in the step: $(grep 'fd ' "$log")" || ok "lock descriptors closed in the step"
 grep -q "^timeout -k 30 2700 " "$log" && ok "step runs under timeout 2700 s (45 min)" || bad "step parent: $(tail -1 "$log")"
 
 # 4: lock never came round
 log=$tmp/log4; : > "$log"
 STUB_RC=4 STUBLOG=$log BOX_HOLD=$tmp/bin/box-hold BOX_HOLD_WAIT_S=1 bash -c ". '$fn'; box_ticket npu hw-gate-npu 20 true"; rc=$?
-[ "$rc" = 4 ] && grep -q "^box-hold npu who=hw-gate-npu" "$log" && ok "rc 4 (no lock) passes through, npu ticket" || bad "no-lock rc $rc: $(cat "$log")"
+[ "$rc" = 4 ] && grep -q "^box-hold npu who=hw-gate-npu pid [0-9]* wait=1 prio=$" "$log" && ok "rc 4 (no lock) passes through, npu ticket" || bad "no-lock rc $rc: $(cat "$log")"
 
 # 5: ancestor detection
 cat > "$tmp/probe" <<PROBE

@@ -483,6 +483,22 @@ lowest *live* ticket may take the flock. A ticket whose process is gone, or whos
 process (the start time does not match), is skipped. `tests/box_hold_fifo_test.sh` (ctest `box_hold_fifo`) checks this
 with stub jobs.
 
+**CI tickets are served next (2026-11-27).** Measured that day, #3550's `hrx_build` gave up after its 90-minute wait
+with 32 lane tickets queued, so every PR's device rows would keep timing out. box-hold therefore has a priority class:
+- **Who is CI:** a ticket with `BOX_HOLD_PRIORITY=ci`, or one from the `ghrunner` account. `hrx-build.yml`, `hw-gate.sh`
+  under CI (`GITHUB_RUN_ID` set) and the coder-llm window all set it.
+- **Order:** CI tickets are served after the current holder and ahead of every queued lane ticket, FIFO among CI
+  tickets. Lanes stay FIFO among themselves.
+- **Cap:** a CI ticket's command runs under `timeout ${BOX_HOLD_CI_MAX:-2700}`, the 45-minute ticket rule, because it
+  jumps the line.
+- **Ticket names:** `0-<n>…` for CI and `1-<n>…` for lanes, sorted with `LC_ALL=C`. Tickets of the previous format
+  sort between the two, so lanes already queued keep their place ahead of new lanes.
+
+The head of the queue no longer blocks in `flock`; it tries the locks and re-reads the queue between tries. A head
+blocked in `flock -w` never saw a CI ticket that arrived behind it. The same change fixed a defect as old as box-hold:
+`exec 9>lock 2>/dev/null` on a bare `exec` made the `2>/dev/null` permanent, so **every box-hold job's stderr was
+discarded** until 2026-11-27.
+
 The new script was installed by `mv` over the old one, never edited in place, because running tickets read the file
 incrementally (a mid-run edit corrupted a run on 11-24). Waiters that started before the swap keep running the old
 copy, so they still race on the bare flock until they drain. The reviewer still waits 50 minutes because lanes hold

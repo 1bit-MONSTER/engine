@@ -119,9 +119,36 @@ hl_kill_remote() {
         </dev/null >/dev/null 2>&1
 }
 
+# Screen cache (27 Nov, the all-models campaign: the box queue is 30-40 tickets deep, so one Hyperloom round per ticket
+# would take days per model). A SCREEN ticket (tools/hyperloom/screen.sh, run by the operator) measures a batch of lever
+# sets back to back in ONE box-hold with the same allowlisted box side, and files each measurement under
+# $HL_SCREEN_DIR/<key>/ (the fetched output directory, exactly what hl_fetch would bring back). A round whose key is
+# there and younger than HL_SCREEN_MAX_AGE seconds reads that measurement instead of queueing a ticket; any other round
+# runs its own ticket as before. key = sha256 over the box side's revision and the round's sorted lever list, so a
+# changed box script, card name, lever value or repetition count never matches.
+hl_screen_key() {  # hl_screen_key REV LEVER=VALUE...  -> 16 hex characters
+    local rev=$1; shift
+    printf '%s\n' "rev=$rev" $(printf '%s\n' "$@" | LC_ALL=C sort) | sha256sum | cut -c1-16
+}
+
+hl_screen_hit() {  # hl_screen_hit REV: 0 and $RESULT_DIR/box filled when a fresh screened measurement exists
+    [ -n "${HL_SCREEN_DIR:-}" ] || return 1
+    local key d age
+    key=$(hl_screen_key "$1" "${PASS[@]}")
+    d=$HL_SCREEN_DIR/$key
+    [ -f "$d/status" ] && [ -f "$d/screen.json" ] || return 1
+    age=$(( $(date +%s) - $(stat -c %Y "$d/screen.json") ))
+    [ "$age" -le "${HL_SCREEN_MAX_AGE:-43200}" ] || { echo "[$LOG_TAG] screen $key is ${age}s old: measuring again"; return 1; }
+    cp -a "$d/." "$RESULT_DIR/box/" || return 1
+    TICKET_RC=0
+    echo "[$LOG_TAG] screened: levers ${PASS[*]:-(defaults)} measured in screen ticket $(sed -n 's/.*"ticket": *"\([^"]*\)".*/\1/p' "$d/screen.json") (${age}s ago, key $key); no new ticket"
+    return 0
+}
+
 hl_ticket() {  # hl_ticket [--sudo] COMMAND...  (COMMAND words are box-side; ROUT is the ticket's output directory)
     local sudo=
     [ "${1:-}" = --sudo ] && { sudo='sudo -n'; shift; }
+    if hl_screen_hit "${RDIR##*/}"; then SCREENED=1; return 0; fi
     trap 'echo "[$LOG_TAG] stopped: killing ticket $TICKET" >&2; hl_kill_remote; exit 143' TERM INT
     echo "[$LOG_TAG] ticket $TICKET on $HL_BOX (box-hold gpu, held part <= ${HL_TICKET_MIN} min)"
     local attempt=0 sp
@@ -160,6 +187,7 @@ hl_exit_if_unreachable() {
 
 hl_fetch() {  # hl_fetch [tar --exclude patterns...]
     local ex=() p
+    [ -n "${SCREENED:-}" ] && return 0   # hl_screen_hit already filled $RESULT_DIR/box
     for p in "$@"; do ex+=("--exclude=$p"); done
     $HL_SSH "$HL_BOX" "tar -C $ROUT -cf - ${ex[*]} . 2>/dev/null" </dev/null | tar -C "$RESULT_DIR/box" -xf - 2>/dev/null
     [ -f "$RESULT_DIR/box/status" ] || echo "ticket rc=$TICKET_RC, no status from the box (ticket.log)" > "$RESULT_DIR/box/status"

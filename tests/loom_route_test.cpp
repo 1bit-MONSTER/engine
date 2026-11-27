@@ -337,6 +337,27 @@ int main() {
             loom::loom_link_card_parameters((dir / "lc8" / "model.json").string(), (ckdir / "m.gguf").string(), w11, &r11);
             check("a named origin's file in another snapshot of its repo is found by the lock's size + sha256 and linked",
                   !r11 && w11.empty() && fs::canonical(dir / "lc8" / "parameter" / "x.safetensors") == fs::canonical(mx / "head2" / "x.safetensors"));
+            // review (cl-release): ONE same-size file in another snapshot, but other bytes (a re-quantised companion): refused
+            fs::remove_all(mx);
+            fs::remove(dir / "lc8" / "parameter" / "x.safetensors");
+            fs::create_directories(mx / "newhead");
+            std::ofstream(mx / "newhead" / "x.safetensors") << "abc";
+            bool r13 = false;
+            std::string w13;
+            loom::loom_link_card_parameters((dir / "lc8" / "model.json").string(), (ckdir / "m.gguf").string(), w13, &r13);
+            check("a single same-size file of another revision with other bytes is not linked: the card is refused",
+                  r13 && !fs::exists(dir / "lc8" / "parameter" / "x.safetensors"));
+            // the lock's OWN revision snapshot is taken on its size (no hash: the common case costs nothing)
+            std::ofstream(dir / "lc8" / "model.json.lock") << R"({"origins":{"mxfp8":{"requested":{"kind":"hf","repository":"org/mxfp8-experts","revision":"lockrev"},)"
+                R"("resolved":{"revision":"lockrev"}}},"files":[{"origin":"@checkpoint/m.gguf","size":1},)"
+                R"({"origin":"@mxfp8/x.safetensors","size":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]})";
+            fs::create_directories(mx / "lockrev");
+            std::ofstream(mx / "lockrev" / "x.safetensors") << "qrs";
+            bool r14 = false;
+            std::string w14;
+            loom::loom_link_card_parameters((dir / "lc8" / "model.json").string(), (ckdir / "m.gguf").string(), w14, &r14);
+            check("the lock's own revision snapshot is linked on its size (not the newer head)",
+                  !r14 && fs::canonical(dir / "lc8" / "parameter" / "x.safetensors") == fs::canonical(mx / "lockrev" / "x.safetensors"));
             fs::remove_all(mx);
             fs::remove(dir / "lc8" / "parameter" / "x.safetensors");
             bool r12 = false;

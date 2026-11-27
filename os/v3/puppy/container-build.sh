@@ -530,7 +530,7 @@ for f in sandbox3/build/*.sfs; do
     rf=$(unsquashfs -q -cat "$f" etc/shadow 2> /dev/null | awk -F: '$1 == "root" { print ($2 == "" ? "E" : substr($2, 1, 1)); exit }')
     ids=ok                                          # a login.defs without the box's 800-899 range needs the repack too
     if unsquashfs -q -cat "$f" etc/login.defs > /tmp/1bit-login.defs 2> /dev/null; then
-        grep -Eq '^SYS_UID_MIN[[:space:]]+800$' /tmp/1bit-login.defs && grep -Eq '^SYS_GID_MAX[[:space:]]+899$' /tmp/1bit-login.defs || ids=fix
+        grep -Eq '^SYS_UID_MIN[[:space:]]+800$' /tmp/1bit-login.defs && grep -Eq '^SYS_UID_MAX[[:space:]]+899$' /tmp/1bit-login.defs && grep -Eq '^SYS_GID_MIN[[:space:]]+800$' /tmp/1bit-login.defs && grep -Eq '^SYS_GID_MAX[[:space:]]+899$' /tmp/1bit-login.defs || ids=fix
     fi
     case $rf in ''|'*'|'!') [ "$ids" = ok ] && continue ;; esac
     comp=$(unsquashfs -s "$f" 2> /dev/null | sed -n 's/^Compression //p' | head -1)
@@ -556,7 +556,7 @@ for f in sandbox3/build/*.sfs; do
     rf=$(unsquashfs -q -cat "$f" etc/shadow 2> /dev/null | awk -F: '$1 == "root" { print ($2 == "" ? "E" : substr($2, 1, 1)); exit }')
     case $rf in ''|'*'|'!') ;; *) echo "build: REFUSED: $(basename "$f") ships root with a usable password" >&2; exit 1 ;; esac
     if unsquashfs -q -cat "$f" etc/login.defs > /tmp/1bit-login.defs 2> /dev/null; then
-        grep -Eq '^SYS_UID_MIN[[:space:]]+800$' /tmp/1bit-login.defs && grep -Eq '^SYS_GID_MAX[[:space:]]+899$' /tmp/1bit-login.defs || {
+        grep -Eq '^SYS_UID_MIN[[:space:]]+800$' /tmp/1bit-login.defs && grep -Eq '^SYS_UID_MAX[[:space:]]+899$' /tmp/1bit-login.defs && grep -Eq '^SYS_GID_MIN[[:space:]]+800$' /tmp/1bit-login.defs && grep -Eq '^SYS_GID_MAX[[:space:]]+899$' /tmp/1bit-login.defs || {
             echo "build: REFUSED: $(basename "$f")'s etc/login.defs has no 800-899 range for the box's system accounts" >&2; exit 1; }
     fi
 done

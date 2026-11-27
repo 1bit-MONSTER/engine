@@ -48,6 +48,9 @@ check $? "an id in 800-899 in the layer's own passwd is refused, nothing written
 mk; printf 'y::812:\n' >> "$t/bdrv/group"; cp "$t/main/login.defs" "$t/b"
 sh "$s" "$t/main" "$t/bdrv" 2> /dev/null; [ $? = 1 ] && cmp -s "$t/b" "$t/main/login.defs"; check $? "an id in 800-899 in ANOTHER layer's group is refused too"
 mk; rm "$t/main/login.defs"; sh "$s" "$t/main" "$t/bdrv"; [ $? = 0 ] && [ ! -e "$t/main/login.defs" ]; check $? "a dir with no login.defs is left alone"
+mk; sh "$s" "$t/main" "$t/bdrv"; printf 'runner:x:899:899::/var/lib/runner:/bin/false\n' >> "$t/main/passwd"; cp "$t/main/login.defs" "$t/b"
+sh "$s" "$t/main" "$t/bdrv"; [ $? = 0 ] && cmp -s "$t/b" "$t/main/login.defs"
+check $? "on a live /etc already set to 800-899, a box account at 899 is fine: a no-op, not a refusal"
 [ -z "$(ls "$t/main" | grep '\.ids\.')" ]; check $? "no temporary copy is left"
 
 echo "local_system_ids_test: $([ $bad = 0 ] && echo ok || echo FAIL)"

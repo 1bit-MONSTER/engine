@@ -34,6 +34,14 @@ set -eu
 d=${1:?usage: local-system-ids.sh <etc dir> [<etc dir of another layer>...]}
 f=$d/login.defs
 [ -f "$f" ] || exit 0
+# already 800-899 (review cl-lemsync): a no-op, before the range check - so a re-run on a LIVE /etc, after the box's
+# first useradd -r took 899, is the idempotent no-op it should be and not a "range is not free" refusal. The check
+# below is for image layers at cut/build time, where no id in 800-899 may be in use.
+if awk 'BEGIN { want["SYS_UID_MIN"] = 800; want["SYS_UID_MAX"] = 899; want["SYS_GID_MIN"] = 800; want["SYS_GID_MAX"] = 899 }
+        $1 in want && !($1 in seen) { seen[$1] = 1; if ($2 == want[$1]) ok++ }
+        END { exit ok != 4 }' "$f"; then
+    exit 0
+fi
 for e in "$@"; do
     for a in passwd group; do
         [ -f "$e/$a" ] || continue

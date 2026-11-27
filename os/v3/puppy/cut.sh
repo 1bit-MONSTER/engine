@@ -296,7 +296,8 @@ PY
         rf=$(sudo -n unsquashfs -q -cat "$f" etc/shadow 2> /dev/null | awk -F: '$1 == "root" { print ($2 == "" ? "E" : substr($2, 1, 1)); exit }')   # E: empty = no password at all
         case $rf in ''|'*'|'!') ;; *) die "$(basename "$f") ships root with a usable password in etc/shadow" ;; esac
         if sudo -n unsquashfs -q -cat "$f" etc/login.defs > "$out/ids/check" 2> /dev/null; then
-            grep -Eq '^SYS_UID_MIN[[:space:]]+800$' "$out/ids/check" && grep -Eq '^SYS_GID_MAX[[:space:]]+899$' "$out/ids/check" ||
+            grep -Eq '^SYS_UID_MIN[[:space:]]+800$' "$out/ids/check" && grep -Eq '^SYS_UID_MAX[[:space:]]+899$' "$out/ids/check" &&
+                grep -Eq '^SYS_GID_MIN[[:space:]]+800$' "$out/ids/check" && grep -Eq '^SYS_GID_MAX[[:space:]]+899$' "$out/ids/check" ||
                 die "$(basename "$f")'s etc/login.defs has no 800-899 range for the box's own system accounts"
         fi
     done

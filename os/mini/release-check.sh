@@ -1495,11 +1495,11 @@ if [ "${1:-}" = --self-test ]; then
     check PASS "$(hold_verdict 1 200 '{"active":false}' 2 '')"                  # a loaded model is not taken away
     check FAIL "$(hold_verdict 1 200 '{"active":false}' 0 'fail release answered 500')"
     # chat-loom (engine#3350 rc1): the answer alone never passes - the fallback answers 391 too
-    check PASS "$(loom_verdict 1 listed '{"content":"391"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl: Inkling-2-Mini-1bit -> loom-serve card Inkling-2-Mini-loom (model x; gate y)' 1)"
+    check PASS "$(loom_verdict 1 listed '{"content":"391"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl: Inkling-2-Mini-1bit -> loom-serve card Inkling-2-Mini-NVFP4-MXFP8-loom (model x; gate y)' 1)"
     check FAIL "$(loom_verdict 1 listed '{"content":"391"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl matches /m.gguf, but its card is not usable (no model.json): serving on the llama.cpp route (docs/loom-route.md)' 1)"                       # fell back, right answer
     check FAIL "$(loom_verdict 1 listed '{"content":"391"}' '' 0)"                           # no route line at all
-    check FAIL "$(loom_verdict 1 listed '{"content":"391"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl: Inkling-2-Mini-1bit -> loom-serve card Inkling-2-Mini-loom (model x; gate y)' 0)"                       # routed, no loom-serve ran
-    check FAIL "$(loom_verdict 1 listed '{"content":"392"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl: Inkling-2-Mini-1bit -> loom-serve card Inkling-2-Mini-loom (model x; gate y)' 1)"                       # Loom, wrong answer
+    check FAIL "$(loom_verdict 1 listed '{"content":"391"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl: Inkling-2-Mini-1bit -> loom-serve card Inkling-2-Mini-NVFP4-MXFP8-loom (model x; gate y)' 0)"                       # routed, no loom-serve ran
+    check FAIL "$(loom_verdict 1 listed '{"content":"392"}' '1bit serve: loom route inkling-2-mini-ud-q4_k_xl: Inkling-2-Mini-1bit -> loom-serve card Inkling-2-Mini-NVFP4-MXFP8-loom (model x; gate y)' 1)"                       # Loom, wrong answer
     check PASS "$(loom_verdict 1 listed '{"content":"391"}' '1bit serve: Inkling-2-Mini-1bit on loom (/opt/1bit-package/loom/loom-serve)' 1)"                       # the rc1 build's wording
     check SKIP "$(loom_verdict 0 listed '' '' 0)"
     check SKIP "$(loom_verdict 1 absent '' '' 0)"

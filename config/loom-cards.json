@@ -418,8 +418,8 @@
    "match": "exact",
    "arch": "inkling2",
    "card": {
-    "repo": "1bit-MONSTER/Inkling-2-Mini-loom",
-    "revision": "afcb64b0cbf3e3eba1c9eb30cba8871acc9992d5",
+    "repo": "1bit-MONSTER/Inkling-2-Mini-NVFP4-MXFP8-loom",
+    "revision": "82bf45eb830953abed2b4a80841bb9c49241284a",
     "licence": "apache-2.0",
     "checkpoint": {
      "repo": "unsloth/Inkling-2-Mini-GGUF",

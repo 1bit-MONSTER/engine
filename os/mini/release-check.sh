@@ -2667,6 +2667,18 @@ if [ "$_lg" = 1 ]; then
         fi
     fi
 fi
+# a card's companion weights (a second repository its lock pins, e.g. the native Inkling card's MXFP8 experts) are not in
+# Lemonade's pull; fetch them now, before the load, as 10lemonade's watcher would within 5 minutes - and say so when one
+# is still missing, so a load failure names its cause
+_lcm=
+if [ "$_ls" = listed ] && [ -x /usr/local/bin/1bit-loom-companions ]; then
+    # the cache 10lemonade gave Lemonade: $HF_HOME, else /data/lemonade/huggingface (installed), else the live stick's
+    _lhf=${HF_HOME:-}; [ -n "$_lhf" ] || { [ -d /data/lemonade ] && _lhf=/data/lemonade/huggingface || _lhf=/var/lib/lemonade/huggingface; }
+    /usr/local/bin/1bit-loom-companions --once /opt/1bit-package/loom-cards "$_lhf" > /tmp/1bit-loom-comp.$$ 2>&1 || true
+    sed 's/^/info  loom  : /' /tmp/1bit-loom-comp.$$ | head -5
+    /usr/local/bin/1bit-loom-companions --status /opt/1bit-package/loom-cards "$_lhf" > /tmp/1bit-loom-comp.$$ 2>&1 || _lcm=$(grep MISSING /tmp/1bit-loom-comp.$$ | head -2 | tr '\n' ' ')
+    rm -f /tmp/1bit-loom-comp.$$
+fi
 if [ "$_ls" = listed ]; then
     _off=$(wc -c < "$LEMLOG" 2> /dev/null || echo 0)
     # load FIRST, with a long cap: the rc1 board run (24 Nov) took 153 s to load Inkling (45 s hashing the 17.6 GB GGUF
@@ -2688,6 +2700,7 @@ if [ "$_ls" = listed ]; then
     got --header='Content-Type: application/json' --post-data="{\"model_name\":\"$LOOM_MODEL\"}" "$API/api/v1/unload" > /dev/null 2>&1
 fi
 _lv=$(loom_verdict "$_lg" "$_ls" "$_lr" "$_ll" "$_lp")
+case "$_lv" in FAIL*) [ -n "$_lcm" ] && _lv="$_lv (a card companion is MISSING: $_lcm- 1bit-loom-companions --status)" ;; esac
 case "$_lv" in
     PASS*) pass chat-loom "${_lv#PASS }" ;;
     SKIP*) skip chat-loom "${_lv#SKIP }" ;;

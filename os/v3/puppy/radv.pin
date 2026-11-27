@@ -1,0 +1,34 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#
+# radv.pin: Mesa's Radeon Vulkan driver (RADV) for 1bit OS, so the Vulkan backends Lemonade ships (llamacpp:vulkan,
+# whispercpp:vulkan, sd-cpp:vulkan, ...) run on the Radeon 8060S instead of falling back to the CPU (owner, 27 Nov:
+# "make it WORK"; rc1 had the Vulkan loader but no driver: llamacpp:vulkan "installed" and running on the CPU).
+# The package is the one that matches the base's own Mesa build (libgallium-26.0.8-1ubuntu0.3.so in the main SFS), from
+# Ubuntu resolute-updates. Provenance checked 27 Nov: resolute-updates InRelease has a Good signature from the Ubuntu
+# Archive Automatic Signing Key (2018); its main/binary-amd64/Packages.xz sha256 matches InRelease; Packages lists this
+# version with the sha256 below, which the downloaded .deb has. stage-radv.sh refuses any other bytes.
+# Only RADV is taken (libvulkan_radeon.so + its ICD file + the package's copyright): NOT lavapipe (libvulkan_lvp.so, a
+# CPU Vulkan driver - offering it would bring the CPU-speed problem back) nor the other vendors' drivers. MIT (Mesa;
+# some files BSD/Khronos/SGI); its libLLVM, libdrm_amdgpu and the Vulkan loader are already in the base.
+package  mesa-vulkan-drivers
+version  26.0.8-1ubuntu0.3
+url      http://archive.ubuntu.com/ubuntu/pool/main/m/mesa/mesa-vulkan-drivers_26.0.8-1ubuntu0.3_amd64.deb
+sha256   27db5fa34d50d208b58cc94317b573065329740bb98d0e12b7947b06a9d02a4e
+size     19109714
+take     usr/lib/x86_64-linux-gnu/libvulkan_radeon.so
+take     usr/share/vulkan/icd.d/radeon_icd.json
+take     usr/share/doc/mesa-vulkan-drivers/copyright

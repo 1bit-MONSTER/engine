@@ -229,6 +229,11 @@ sh /recipe/lock-root-password.sh "$skeleton/etc/shadow" || {
     echo "build: REFUSED: could not replace the default root password" >&2; exit 1; }
 echo "   ok: root has no usable password (console autologin and ssh keys only)"
 
+# Mesa's RADV Vulkan driver (os/v3/puppy/radv.pin), so Lemonade's Vulkan backends run on the 8060S and not the CPU
+RADV_CACHE=/tmp/1bit-radv sh /recipe/stage-radv.sh "$skeleton" || {
+    echo "build: REFUSED: could not stage Mesa's RADV driver (stage-radv.sh)" >&2; exit 1; }
+echo "   ok: RADV (Mesa $(awk '$1 == "version" { print $2 }' /recipe/radv.pin)) in the rootfs"
+
 # The box's own system accounts (useradd -r) get ids 800-899, a range the image's system accounts never use (they sit
 # at 999 down), so an image that adds a system account later cannot collide with one a box made (engine#3555 review).
 sh /recipe/local-system-ids.sh "$skeleton/etc" || {

@@ -42,6 +42,13 @@ On the image:
 A backend ships only when `os/licenses/<recipe>/SOURCE` says `Ship: yes`; mkimage.sh stops on
 any other backend in `LEMONADE_BACKENDS`.
 
+**1bit OS also carries Mesa's Radeon Vulkan driver (RADV)**, so Lemonade's Vulkan backends run on the GPU: Ubuntu
+resolute-updates' `mesa-vulkan-drivers` 26.0.8-1ubuntu0.3 (the base's own Mesa build), pinned by sha256 in
+`os/v3/puppy/radv.pin` and taken by `stage-radv.sh`: `libvulkan_radeon.so`, its ICD file
+`/usr/share/vulkan/icd.d/radeon_icd.json` and the package's copyright at `/usr/share/doc/mesa-vulkan-drivers/copyright`.
+License MIT (some files BSD, Khronos, SGI). Not lavapipe or the other vendors' drivers. The Vulkan loader
+(`libvulkan1` 1.4.341, Apache-2.0) and `libllvm21` were in the base already.
+
 ## Lemonade's backends
 
 Installed ahead of time by Lemonade's own installer (lemond `/api/v1/install`), from the release

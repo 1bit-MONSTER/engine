@@ -54,6 +54,10 @@ usr/local/bin/node
 usr/local/bin/npm
 usr/local/bin/npx
 usr/local/bin/corepack
+# Mesa's RADV Vulkan driver the release adds (os/v3/puppy/radv.pin)
+usr/lib/x86_64-linux-gnu/libvulkan_radeon.so
+usr/share/vulkan/icd.d/radeon_icd.json
+usr/share/doc/mesa-vulkan-drivers/copyright
 # the base system's boot code the release ships (and, for rc.country and rc.shutdown, patches)
 etc/rc.d/rc.country
 etc/rc.d/rc.shutdown

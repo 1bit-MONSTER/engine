@@ -210,6 +210,11 @@ PY
     sh "$here/lock-root-password.sh" "$out/shadow" || die "could not replace the default root password"
     chmod 600 "$out/shadow"
     printf 'etc/shadow\t%s\n' "$out/shadow" >> "$M.os"
+    # Mesa's RADV Vulkan driver (os/v3/puppy/radv.pin): the base ships the Vulkan loader but no driver, so Lemonade's
+    # Vulkan backends ran on the CPU (owner 27 Nov: make them work on the 8060S). The pinned .deb, sha256-checked; RADV
+    # + its ICD file + copyright only. RADV_DEB=<local .deb> for an offline cut.
+    sh "$here/stage-radv.sh" "$out/radv" ${RADV_DEB:+--deb "$RADV_DEB"} || die "could not stage Mesa's RADV driver"
+    for f in $(awk '$1 == "take" { print $2 }' "$here/radv.pin"); do printf '%s\t%s\n' "$f" "$out/radv/$f" >> "$M.os"; done
     # the base's /etc/login.defs with a range of its own for the BOX's system accounts (useradd -r: 800-899), so they
     # never take the ids the image's system accounts use (999 down); the range check covers bdrv's accounts as well,
     # which sit above the main SFS's. Only the main SFS carries login.defs in the base.

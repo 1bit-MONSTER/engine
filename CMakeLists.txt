@@ -544,6 +544,7 @@ add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test
 # OS-UPDATER item 3: the signed SHA256SUMS of a 1bit OS release (tools/release_sign.py), the in-system updater's check
 # the image build takes non-root users out of the root-equivalent groups (spot was in disk + kmem)
 add_test(NAME harden_groups COMMAND sh ${CMAKE_SOURCE_DIR}/tests/harden_groups_test.sh)
+add_test(NAME lock_root_password COMMAND sh ${CMAKE_SOURCE_DIR}/tests/lock_root_password_test.sh)
 add_test(NAME release_sign COMMAND sh ${CMAKE_SOURCE_DIR}/tests/release_sign_test.sh)
 set_tests_properties(release_sign PROPERTIES SKIP_RETURN_CODE 77)
 # engine#1564: which files the copyright gate looks at -- a staged file is seen, an untracked one is seen (that is why
@@ -630,6 +631,7 @@ add_test(NAME webapp_proxy_hold_timeout COMMAND sh ${CMAKE_SOURCE_DIR}/tests/web
 set_tests_properties(webapp_proxy_hold_timeout PROPERTIES RESOURCE_LOCK route_ports)
 add_test(NAME laya_fetch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/laya_fetch_test.sh)
 add_test(NAME loom_payload COMMAND sh ${CMAKE_SOURCE_DIR}/tests/loom_payload_test.sh)
+add_test(NAME loom_profile COMMAND sh ${CMAKE_SOURCE_DIR}/tests/loom_profile_test.sh)
 add_test(NAME shutdown_watch COMMAND sh ${CMAKE_SOURCE_DIR}/tests/shutdown_watch_test.sh)
 add_test(NAME update_shadow COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_shadow_test.sh)
 add_test(NAME update_check COMMAND sh ${CMAKE_SOURCE_DIR}/tests/update_check_test.sh)
@@ -835,6 +837,7 @@ add_python_test(loom_pin_check_self ${CMAKE_SOURCE_DIR}/tools/ci/loom_pin_check.
 # and size and are different models. The self-test arms that trap and the cannot-tell; the live check needs the card
 # tree, which is a ~GB download, so it is a lane command and not a CI row.
 add_python_test(loom_coverage_check_self ${CMAKE_SOURCE_DIR}/tools/ci/loom_coverage_check.py --self-test)
+add_python_test(loom_card_meta_self ${CMAKE_SOURCE_DIR}/tools/loom_card_meta.py --self-test)  # engine#3156
 # engine#3196 fix 2: two arms' per-layer residual dumps compared on their own, so a bit-exactness verdict can
 # say whether the BODY or the HEAD differs. Self-test only in CI: the live comparison needs two NPU runs that
 # dumped `layer_<ll>.f32` (`NPU_INFER_DUMP_DIR`), and `scripts/npu-kernel-bitx.sh` calls the tool on the runs it
@@ -1024,6 +1027,9 @@ add_test(NAME hw_gate_npu_phases COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_
 # the 1bit OS appliance: GPU steps and NPU phases queue with box-hold (one ticket each, lock fds closed in the step), the
 # repo gpu-hold wrapper is skipped, and a gate already inside a box-hold ticket does not re-queue. Stubs only, no device.
 add_test(NAME hw_gate_box_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_box_hold_test.sh)
+# hrx-build's device rows (fork_ctest_known_fail) take a box-hold gpu ticket on the appliance (the runner can open /dev/kfd
+# since 2026-11-26). The step's snippet is extracted from the workflow and run with stub box-hold and ctest. No device.
+add_test(NAME hrx_build_box_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hrx_build_box_hold_test.sh)
 # engine#3079: the NPU link gate configured third_party/llama.cpp -- a tree that defines no npu_rt_shim_test -- so it
 # could never pass and said "the runtime does not link" about a configure that never read the engine. Text-level arms
 # pin the tree, the two targets, and the order that makes "did not run" distinct from "does not link".

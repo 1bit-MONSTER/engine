@@ -192,6 +192,35 @@ int main() {
         std::ofstream(dir / "lc" / "parameter" / "d.gguf") << "a real copy";                      // --materialize=copy
         loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(), lwhy);
         check("a real file in parameter/ is never replaced", !fs::is_symlink(fs::symlink_status(dir / "lc" / "parameter" / "d.gguf")));
+
+        // engine#3528: a RELATIVE -m (as the payload README's own `./1bit serve -m model.gguf`) is linked by its absolute
+        // path - the link target used to be written relative to the cards directory, where it dangles
+        fs::create_directories(dir / "lc_rel" / "parameter");
+        std::ofstream(dir / "lc_rel" / "model.json") << R"({"model":{"id":"M2"},"variants":{"gguf":{"services":{"chat":{"parameters":{)"
+            R"("model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"}]}}}}}}})";
+        {
+            const fs::path was = fs::current_path();
+            fs::current_path(dir);
+            std::string rwhy;
+            const int rmade = loom::loom_link_card_parameters((dir / "lc_rel" / "model.json").string(), "snap/m.gguf", rwhy);
+            const fs::path tgt = fs::read_symlink(dir / "lc_rel" / "parameter" / "m.gguf");
+            fs::current_path(was);
+            check("a relative model path is linked by its ABSOLUTE path (engine#3528)",
+                  rmade == 1 && tgt.is_absolute() && tgt == dir / "snap" / "m.gguf" && fs::exists(dir / "lc_rel" / "parameter" / "m.gguf"));
+        }
+        // engine#3528: the defaults when no flag and no environment says (a shell on the appliance has neither)
+        check("cards: --loom-cards wins over everything", loom::default_cards_dir("/x", "/env", true, "/xdg", "/home/u") == "/x");
+        check("cards: ONEBIT_LOOM_CARDS wins over the appliance dir", loom::default_cards_dir("", "/env", true, "/xdg", "/home/u") == "/env");
+        check("cards: the appliance's /data/loom-cards when it exists", loom::default_cards_dir("", nullptr, true, "/xdg", "/home/u") == "/data/loom-cards");
+        check("cards: an empty ONEBIT_LOOM_CARDS is ignored", loom::default_cards_dir("", "", true, nullptr, "/home/u") == "/data/loom-cards");
+        check("cards: elsewhere, XDG then HOME as before",
+              loom::default_cards_dir("", nullptr, false, "/xdg", "/home/u") == "/xdg/1bit/loom-cards" &&
+              loom::default_cards_dir("", nullptr, false, nullptr, "/home/u") == "/home/u/.cache/1bit/loom-cards" &&
+              loom::default_cards_dir("", nullptr, false, nullptr, nullptr).empty());
+        check("loom-serve: flag > ONEBIT_LOOM_SERVE > the payload's beside the binary > PATH",
+              loom::default_loom_serve_path("/f", "/e", "/b") == "/f" && loom::default_loom_serve_path("", "/e", "/b") == "/e" &&
+              loom::default_loom_serve_path("", nullptr, "/opt/1bit-package/loom/loom-serve") == "/opt/1bit-package/loom/loom-serve" &&
+              loom::default_loom_serve_path("", "", "") == "loom-serve");
         // the card's lock names a size per weight file: a sibling of another size (the repo replaced the file under the
         // card's name, as unsloth/Inkling-2-Mini-GGUF is about to do with its DSpark drafter) is refused, not linked
         fs::remove(dir / "lc" / "parameter" / "d.gguf");
@@ -202,6 +231,53 @@ int main() {
         std::string swhy;
         const int sm = loom::loom_link_card_parameters((dir / "lc" / "model.json").string(), (dir / "snap" / "m.gguf").string(),
                                                        swhy, &refused);
+        // a link the card needs but cannot write (a read-only parameter/ dir: a non-root shell vs the appliance's root-owned
+        // /data/loom-cards) refuses the card, so serve takes the llama.cpp route instead of starting Loom on a missing link
+        {
+            fs::create_directories(dir / "lc5" / "parameter");
+            std::ofstream(dir / "lc5" / "model.json") << R"({"model":{"id":"M5"},"variants":{"gguf":{"services":{"chat":{"parameters":{)"
+                R"("model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"}]}}}}}}})";
+            fs::permissions(dir / "lc5" / "parameter", fs::perms::owner_read | fs::perms::owner_exec);
+            bool r5 = false;
+            std::string w5;
+            const int n5 = loom::loom_link_card_parameters((dir / "lc5" / "model.json").string(), (dir / "snap" / "m.gguf").string(), w5, &r5);
+            if (geteuid() == 0) {
+                std::printf("skip (running as root, a read-only dir does not stop root): a link that cannot be written refuses the card\n");
+            } else {
+                check("a link that cannot be written refuses the card (and says why)",
+                      n5 == 0 && r5 && w5.find("cannot link") != std::string::npos);
+            }
+            fs::permissions(dir / "lc5" / "parameter", fs::perms::owner_all);
+            // review (cl-flm): a STALE link that cannot be replaced (another model's file, read-only dir) also refuses
+            std::error_code rm_ec;   // as root the first arm did link m.gguf: start the stale case from a known link
+            fs::remove(dir / "lc5" / "parameter" / "m.gguf", rm_ec);
+            fs::create_symlink(dir / "snap" / "d.gguf", dir / "lc5" / "parameter" / "m.gguf");
+            fs::permissions(dir / "lc5" / "parameter", fs::perms::owner_read | fs::perms::owner_exec);
+            bool r6 = false;
+            std::string w6;
+            loom::loom_link_card_parameters((dir / "lc5" / "model.json").string(), (dir / "snap" / "m.gguf").string(), w6, &r6);
+            if (geteuid() == 0) {
+                std::printf("skip (running as root): a stale link that cannot be replaced refuses the card\n");
+            } else {
+                check("a stale link that cannot be replaced refuses the card (not served on the stale target)",
+                      r6 && w6.find("cannot link") != std::string::npos &&
+                      fs::read_symlink(dir / "lc5" / "parameter" / "m.gguf") == dir / "snap" / "d.gguf");
+            }
+            fs::permissions(dir / "lc5" / "parameter", fs::perms::owner_all);
+        }
+        // review (cl-hf): the same refusal, ROOT-PROOF (CI's build container runs as root): `parameter` is a regular file,
+        // so no link can be made under it whoever runs the test
+        {
+            fs::create_directories(dir / "lc6");
+            std::ofstream(dir / "lc6" / "model.json") << R"({"model":{"id":"M6"},"variants":{"gguf":{"services":{"chat":{"parameters":{)"
+                R"("model":{"files":[{"path":"parameter/m.gguf","origin":"@checkpoint/m.gguf"}]}}}}}}})";
+            std::ofstream(dir / "lc6" / "parameter") << "not a directory";
+            bool r7 = false;
+            std::string w7;
+            const int n7 = loom::loom_link_card_parameters((dir / "lc6" / "model.json").string(), (dir / "snap" / "m.gguf").string(), w7, &r7);
+            check("a link whose directory cannot exist refuses the card, also as root (and says why)",
+                  n7 == 0 && r7 && w7.find("cannot link") != std::string::npos);
+        }
         // a file the card lists but nothing beside the model provides (an unused variant) does not refuse the card
         {
             fs::create_directories(dir / "lc2" / "parameter");

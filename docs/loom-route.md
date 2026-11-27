@@ -357,7 +357,7 @@ requests: llama.cpp reuses cached prompt chunks even behind a leading nonce, and
 to 2x (engine#3158, 23 Nov). Loom routes only when it is faster through `1bit serve` (or equal on speed and better on
 accuracy). **Decode counts on its own:** a Loom route that wins prefill and time to first token but
 decodes slower than the fallback is not routed, because chat users feel decode (orchestrator ruling,
-2026-11-23: Qwen3.8-27B UD-Q4_K_XL and ZAYA1-8B). Such a model is re-gated when a Loom card decodes at
+2026-11-23: Qwen3.8-27B UD-Q4_K_XL and ZAYA1-8B; the 27B row was later re-measured with streamed decode, passed with decode 1.10-1.4x the fallback and is routed, engine#3158). Such a model is re-gated when a Loom card decodes at
 least as fast as the fallback.
 
 **No fallback.** When the llama.cpp route cannot serve the model at all (Inkling-2-Mini on rc1, orchestrator

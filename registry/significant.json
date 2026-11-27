@@ -251,6 +251,26 @@
    "model_type": "hy_v4_dfly",
    "family": "Hy4-flash DFly2 speculative drafter, five layers (hidden 3072, 32 heads / 32 KV, head_dim 64, intermediate 9216, vocab 120832 = the target's) with compressed-indexer keys and a confidence head; its own card says it needs the target's token embedding, vocabulary head, hidden state, sparse indices and five MLA caches, and must be started through the target recipe (tencent/Hy4-flash DFly2; first seen voodooquant/Hy4-flash-DFly2-PTQR-INT8-W8A8-GS128, 2026-11-20 census, a vllm draft-model repo). Not an alias of anything the engine serves: the repo carries no embedding head and no output layer of its own -- it borrows both from the Hy4-flash target -- so no architecture mapping can load it, and the pinned converter has no hy_v4_dfly config either. Its own trunk also is not the draft family the pinned backend does run (HYV4FlashForConditionalGeneration is recorded separately, and DFlash2DraftModel is the drafter class llama.cpp already registers).",
    "watch": "report"
+  },
+  "DeymeForCausalLM": {
+   "model_type": "deyme",
+   "family": "Deyme, a tiny from-scratch French decoder (d_model 512, 8 layers, 8 heads, vocab 16000, max_seq_len 512, fp32) with its own configuration_deyme.py / modeling_deyme.py via auto_map; first seen Mon-Deyme/DEYME-Instruct (2026-11-27 census, 2 models, 1 uploader, 0 downloads). Remote code with non-standard config keys (d_model, n_layers, n_heads); no pinned backend or upstream llama.cpp registers it, nothing to alias.",
+   "watch": "report"
+  },
+  "ADOMForRibbonRetrieval": {
+   "model_type": "adom",
+   "family": "ADOM 1-bit 'ribbon retrieval' artifact (SiaoShiihte/ADOM-4-Beiduofen-2611, 2026-11-27 census): 360,607 one-bit parameters solved by Gaussian elimination, 0 layers / 0 heads / hidden 0, a hash table (fnv1a64+splitmix64) with a 322-symbol Huffman vocabulary, run by its own adom.js. Not a neural language model, so there is no graph to map; recorded so the class does not alert again.",
+   "watch": "report"
+  },
+  "PITForCausalLM": {
+   "model_type": "pit_hf",
+   "family": "PIT (codesj, 2026-11-27 census): a modded-nanoGPT-style decoder in the repo's own model_code/pit_hf - 20 layers, n_embd 4096, 32 heads, GPT-2 tokenizer ids (50256), YaRN RoPE, weightless RMSNorm (F.rms_norm with no gamma) before attention and MLP and on q/k (QK-norm), relu^2 MLP (4x, no gate), no biases; the checkpoint has 121 tensors (wte + 6 per layer: no norm weights, no lm_head tensor). Not an alias: no pinned graph has weightless norms plus relu^2 plus QK-norm with this tensor naming (transformer.h.N.attn.c_q/c_k/c_v/c_proj, mlp.c_fc/c_proj). One uploader (codesj: 14 public PIT-* repos, the most-downloaded 37; registry/census.json counts 48 models of this class), no licence on the card.",
+   "watch": "report"
+  },
+  "SDLLMForMaskedDiffusion": {
+   "model_type": "sdllm",
+   "family": "NVIDIA SDLLM-MDLM masked-diffusion LM, first seen as vllm-denoisers/SDLLM-MDLM-1.7B-Base (a vLLM-denoisers conversion of nvidia/SDLLM-MDLM-1.7B-Base, CC BY-NC 4.0; 2026-11-27 census). 28 layers, hidden 2176, 17 heads, LayerNorm with bias (adaLN folded in), fused qkv_proj, fc1/fc2 MLP with bias (no gate), lm_head with bias, mask id 3, LLaDA-style decode policy over a 256-token canvas. Not an alias of LLaDAModelLM / DreamModel: the pinned llada graph needs RMSNorm and a required ffn_gate (SwiGLU), and neither converter reads this checkpoint's names. Real support = a new diffusion graph, not a mapping.",
+   "watch": "report"
   }
  }
 }

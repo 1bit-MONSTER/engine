@@ -274,9 +274,11 @@ def classify(row, cards, ours=None):
     # uploader (loom-draft's 401 cards: `openbmb-MiniCPM5-1B-loom` binds our pinned MiniCPM5 bytes) read UNCOVERED
     # on a word list, not on evidence (engine#3156). The sha is the identity; the name rule stays for the rows we
     # cannot compare.
-    fn = re.sub(r"\.gguf$", "", row).split("/")[-1].lower() + ".gguf"
+    fn = stem.split("/")[-1].lower() + ".gguf"
     row_shas = ((ours or {}).get("by_name") or {}).get(fn) or set()
-    if row_shas:
+    # A registry row is a bare file name: when two pins carry that name with different bytes, the row does not say
+    # which bytes are ours, so a card on either would be a false cover (#3525 review). Then the name rule decides.
+    if len(row_shas) == 1:
         for d, _ident, _quants, lock in cards:
             if lock is None:
                 continue
@@ -587,6 +589,13 @@ def self_test():
         [("hrx", "MiniCPM5-1B-Q4_K_M.gguf")],
         [("openbmb-MiniCPM5-1B-loom", "minicpm5-1b", ["Q4_K_M"], (), [("Q4_K_M", SHA_A)])], 0,
         pins=pins_of("MiniCPM5-1B-Q4_K_M.gguf"), says="bytes match")
+    # ...but only when the row's bytes are unambiguous: two pins with the same file name and different sha256 do not
+    # say which bytes the row ships, so a card on the OTHER pin's bytes must not cover it (#3525 review, cl-flm)
+    arm("bytes: a file name pinned twice with different bytes is not a bytes cover", "UNCOVERED",
+        [("hrx", "MiniCPM5-1B-Q4_K_M.gguf")],
+        [("openbmb-MiniCPM5-1B-loom", "minicpm5-1b", ["Q4_K_M"], (), [("Q4_K_M", "d" * 64)])], 1,
+        pins={"vendor/MiniCPM5-1B-GGUF": {"files": {"MiniCPM5-1B-Q4_K_M.gguf": {"oid": SHA_A}}},
+              "other/MiniCPM5-1B-GGUF": {"files": {"MiniCPM5-1B-Q4_K_M.gguf": {"oid": "d" * 64}}}})
     # ...and the name rule is unchanged when the bytes differ: the same card on other bytes is not a cover
     arm("bytes: the same unknown-uploader card on OTHER bytes stays UNCOVERED", "UNCOVERED",
         [("hrx", "MiniCPM5-1B-Q4_K_M.gguf")],

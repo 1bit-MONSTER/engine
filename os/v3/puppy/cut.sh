@@ -202,6 +202,13 @@ PY
     sh "$here/harden-groups.sh" "$out/group" || die "could not take the non-root users out of the root-equivalent groups"
     chmod 644 "$out/group"
     printf 'etc/group\t%s\n' "$out/group" >> "$M.os"
+    # the base's /etc/shadow with root's password field '*': the base ships the distribution's default root password,
+    # which is public (su / sudo-with-the-root-password = root for any process). Mode 600 here; the image keeps the
+    # base file's own 0600 root:root (patch-sfs.sh installs a replacement with the target's mode)
+    ( umask 077; sudo -n unsquashfs -q -cat "$bsfs" etc/shadow > "$out/shadow" ) || die "the base SFS has no etc/shadow"
+    sh "$here/lock-root-password.sh" "$out/shadow" || die "could not replace the default root password"
+    chmod 600 "$out/shadow"
+    printf 'etc/shadow\t%s\n' "$out/shadow" >> "$M.os"
     baseid=$(sudo -n unsquashfs -q -cat "$bsfs" etc/1bit/release-identity) || die "the base SFS has no etc/1bit/release-identity"
     hsa=$(echo "$baseid" | grep '^libhsa_sha256=') || die "the base identity names no libhsa_sha256"
     { echo "payload=lemonade-onebit-$tag"; echo "payload_lemond=$plem"; echo "engine_sha256=$esha"
@@ -256,10 +263,25 @@ PY
         sudo -n unsquashfs -q -n -d "$t" "$src"
         sudo -n bash "$T/scripts/base-modes.sh" "$t" --keep "$here/base-modes-keep" > "$logs/base-modes-$l.log" 2>&1 ||
             die "base-modes failed on $l"
+        # a layer that carries its own account files gets the main SFS's treatment too: the overlay reads the FIRST
+        # lower layer that has a file, and bdrv sits ABOVE the main SFS (lowerdir=/pup_b:/pup_ro2:/pup_f:/pup_z) with
+        # its own passwd/group/shadow, so locking root only in the main SFS (#3552) left the base default in effect
+        if sudo -n test -f "$t/etc/shadow"; then
+            sudo -n sh "$here/lock-root-password.sh" "$t/etc/shadow" || die "could not replace the default root password in $l"
+            say "  $l: root has no usable password in its own etc/shadow"
+        fi
+        if sudo -n test -f "$t/etc/group"; then
+            sudo -n sh "$here/harden-groups.sh" "$t/etc/group" || die "could not harden $l's etc/group"
+        fi
         case $l in zdrv) opts="-comp xz -b 128K" ;; *) opts="-comp zstd -Xcompression-level 19 -b 256K" ;; esac
         # shellcheck disable=SC2086
         sudo -n mksquashfs "$t" "$O/$(basename "$src")" $opts -no-exports -no-xattrs -noappend -quiet > /dev/null
         sudo -n rm -rf "$t"
+    done
+    # every layer of the image that carries an etc/shadow must ship root with no usable password (never printed)
+    for f in "$O"/*.sfs; do
+        rf=$(sudo -n unsquashfs -q -cat "$f" etc/shadow 2> /dev/null | awk -F: '$1 == "root" { print ($2 == "" ? "E" : substr($2, 1, 1)); exit }')   # E: empty = no password at all
+        case $rf in ''|'*'|'!') ;; *) die "$(basename "$f") ships root with a usable password in etc/shadow" ;; esac
     done
     cp "$BASE/vmlinuz" "$BASE/initrd.gz" "$O/"
     sudo -n chown -R "$(id -u):$(id -g)" "$O"

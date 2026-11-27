@@ -17,13 +17,18 @@ limitations under the License.
 
 # Self-hosted CI runners on the Strix Halo box
 
-Two runners serve this repository, both on Strix Halo, both installed by
-`scripts/install-ci-runner.sh`:
+Two runners serve this repository, both on Strix Halo. Since 2026-11-22 the box is the 1bit OS appliance (Puppy, no
+systemd), so the runners are started by `/etc/init.d` scripts instead of the units below; see
+[On the 1bit OS appliance](#on-the-1bit-os-appliance-2026-11-27) for what runs there now.
 
 | runner | labels | takes |
 |---|---|---|
-| `strixhalo-engine` | `self-hosted,Linux,X64,pr-agent,strixhalo` | `pr-agent`, `issue-agent` |
+| `strixhalo-pr-agent` | `self-hosted,Linux,X64,pr-agent,issue-agent` | `pr-agent`, `issue-agent` |
 | `strixhalo-bench` | `self-hosted,Linux,X64,strixhalo,bench` | `hrx-build` and the bench/gate jobs |
+
+`strixhalo-engine` (`pr-agent,strixhalo`) was the old dev box's runner, and `ryzen-pr-agent` the stop-gap reviewer on
+the desktop from 2026-11-22. The second one is retired: ryzen hard-locked four times between 11-24 and 11-27, three
+of them 1-10 minutes after a review on its 9070 XT.
 
 Everything the GitHub-hosted jobs need comes from `ubuntu-*` runners; these two exist because those jobs need
 *this box* — its GPU, its NPU and the local LLM at `127.0.0.1:8090`.
@@ -422,6 +427,86 @@ TimeoutStopSec=90
 
 `tests/coder_llm_ticketed_test.sh` (ctest `coder_llm_ticketed`) drives the wrapper with the real `scripts/gpu-hold` on a
 private queue and a fake `/slots` server. No device is used.
+
+## On the 1bit OS appliance (2026-11-27)
+
+Since 2026-11-22 the box runs the appliance image: Puppy Linux (`PUPMODE=12`, so writes persist on the NVMe), with
+**no systemd**, no compiler and no `gpu-hold`. The device lock is `/usr/local/bin/box-hold gpu|npu|both <cmd>`, which
+takes **both** the GPU and NPU locks for any ticket. Everything on this page about units, `OOMPolicy`, `fleethold`
+and `coder-llm-ticketed` describes the old dev box. On the appliance, the PR reviewer is set up like this:
+
+| piece | where | started by |
+|---|---|---|
+| runner `strixhalo-pr-agent`, labels `pr-agent,issue-agent` | `/var/lib/ghrunner/actions-runner-pr-agent`, user `ghrunner` (no shell, home `/var/lib/ghrunner`) | `/etc/init.d/52github-runner-pr-agent` ([source](../scripts/appliance/52github-runner-pr-agent)) |
+| the window watcher, as the owner's account | `/usr/local/bin/coder-llm-window` ([source](../scripts/appliance/coder-llm-window)), root-owned so a job cannot rewrite it | `/etc/init.d/51coder-llm-window` ([source](../scripts/appliance/51coder-llm-window)) |
+| the model | `/data/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf` (sha256 `2841aa31…2533`) | — |
+| logs | `/data/logs/coder-llm/{window,server}.log`, `<runner>/runner.log` | — |
+| the device lock `box-hold` (FIFO since 2026-11-27) | `/usr/local/bin/box-hold` ([source](../scripts/appliance/box-hold)), locks and queue in `/tmp/box-locks` | — |
+
+**Restart policy without systemd.** Each init script starts a detached supervisor loop (`while :; do …; sleep N; done`),
+which is `Restart=always` by another name. `run.sh` exits 0 when its listener stops (engine #1504), so a script that
+only starts the runner once at boot leaves it dead after the first crash.
+
+**The labels leave out `strixhalo` on purpose.** `hw-gate.yml`'s `hw_gate` job asks for
+`[self-hosted, strixhalo, pr-agent]`, which was the old `strixhalo-engine` runner. A pr-agent runner with that label
+takes hardware-gate jobs outside `box-hold`. On 2026-11-27 it took a 12-hour-queued one within a second of coming
+online. With `pr-agent,issue-agent` it takes only the jobs it is for.
+
+**The window (engine#2494, on box-hold).** The `reviewer` job touches `$HOME/.cache/coder-llm/demand`, which for this
+runner is `/var/lib/ghrunner/.cache/coder-llm/demand`. The watcher works like this:
+
+1. When the file is less than 120 s old, the watcher queues `BOX_HOLD_WHO=coder-llm box-hold gpu coder-llm-window window`.
+2. Inside the ticket it checks again. If the demand went stale while it was queued (no touch for 7 minutes), or
+   `MemAvailable` is under 40 GB, it starts nothing.
+3. Otherwise it starts `1bit serve --device hrx --port 8090 --alias qwen3-coder --ctx-size 65536` in its own session.
+4. The window closes after 5 minutes without a touch, or at 44 minutes (the box rule is one ticket ≤ 45 min). If the
+   demand is still fresh, it re-queues at the back.
+5. Closing TERMs the server's whole session, waits 30 s, KILLs what is left, and then KILLs anything still carrying
+   `--port 8090`, so the `llama-server` grandchild cannot outlive the ticket.
+
+`tests/coder_llm_window_test.sh` (ctest `coder_llm_window`) checks each of these steps with a fake server and a fake
+`box-hold`.
+
+**Measured end to end on 2026-11-27.** The window opened at 10:33:17Z with MemAvailable 121 GB, and the model answered a
+one-token completion about 30 s later. While serving, `llama-server` had an RSS of 14.7 GB and MemAvailable was 97 GB.
+Two reviews ran in that one window. #3547's `pr_agent` took 67 s and #3537's took 67 s, and both posted their
+"PR Reviewer Guide". The window closed at 10:41:36Z, after 499 s, 302 s of them idle. After that no `llama-server` was
+left, `:8090` refused connections, and the next lane took the lock in the same second.
+
+**box-hold serves waiters in order (2026-11-27).** Until then `box-hold` was a bare `flock`. Measured on 2026-11-27,
+the first coder-llm window queued at 05:54Z and was still waiting when its 3600 s ran out at 06:54Z: five lane tickets
+that arrived later took the lock first, and every 10-minute reviewer in that hour failed with "reviewer unavailable".
+[`scripts/appliance/box-hold`](../scripts/appliance/box-hold), installed at `/usr/local/bin/box-hold`, keeps the old
+behaviour: both locks for every ticket, `BOX_HOLD_WAIT`, `BOX_HOLD_WHO`, the `.who` files, exit 4 on timeout. On top
+of that it numbers each waiter and puts a ticket for it in `/tmp/box-locks/queue/<n>.<pid>.<start-time>`. Only the
+lowest *live* ticket may take the flock. A ticket whose process is gone, or whose pid now belongs to a different
+process (the start time does not match), is skipped. `tests/box_hold_fifo_test.sh` (ctest `box_hold_fifo`) checks this
+with stub jobs.
+
+The new script was installed by `mv` over the old one, never edited in place, because running tickets read the file
+incrementally (a mid-run edit corrupted a run on 11-24). Waiters that started before the swap keep running the old
+copy, so they still race on the bare flock until they drain. The reviewer still waits 50 minutes because lanes hold
+tickets of up to 45 minutes. The runner takes only `pr-agent`/`issue-agent` jobs, so the long wait blocks nobody.
+
+**Install, start to finish** (as the owner, from ryzen):
+
+```bash
+# model: rsync over the LAN, then compare sha256 on both ends
+rsync -a --partial ~/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf strixhalo:/data/models/qwen3-coder-30b-a3b/
+# account + scripts
+ssh strixhalo 'sudo useradd -r -d /var/lib/ghrunner -m -s /bin/false ghrunner && sudo chmod 755 /var/lib/ghrunner'
+scp scripts/appliance/{coder-llm-window,51coder-llm-window,52github-runner-pr-agent} strixhalo:/tmp/
+ssh strixhalo 'sudo install -m 755 /tmp/coder-llm-window /usr/local/bin/ && sudo install -m 755 /tmp/5[12]* /etc/init.d/'
+# runner tree: a copy of the bench runner's release files, owned by ghrunner, then register it (token on stdin, never printed)
+gh api -X POST repos/1bit-MONSTER/engine/actions/runners/registration-token --jq .token | ssh strixhalo \
+  'sudo -u ghrunner env HOME=/var/lib/ghrunner bash -c "cd /var/lib/ghrunner/actions-runner-pr-agent && t=\$(cat) &&
+   ./config.sh --unattended --url https://github.com/1bit-MONSTER/engine --token \"\$t\" --name strixhalo-pr-agent --labels pr-agent,issue-agent"'
+ssh strixhalo 'sudo /etc/init.d/51coder-llm-window start; sudo /etc/init.d/52github-runner-pr-agent start'
+```
+
+BusyBox `pkill` on this image has no `-u`. A `pgrep -f` pattern that names a command also matches the ssh shell that
+runs it (that is how a `kill $(pgrep -f …)` over ssh ends its own session), so the scripts use `kill $(pgrep …)` with
+patterns that only their own processes carry.
 
 ## Exit codes on the GPU and NPU path: one table
 

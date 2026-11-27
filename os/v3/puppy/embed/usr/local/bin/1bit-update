@@ -406,14 +406,17 @@ update_verify() {
 update_get() {
     curl -fsSL --proto =https --proto-redir =https --tlsv1.2 --retry 3 --connect-timeout 20 -C - -o "$2" "$1"
 }
-# update_prune: /data/updates keeps the release just fetched and ONE previous (the rollback's image), nothing older
+# update_prune: /data/updates keeps the release just fetched and ONE previous (the rollback's image), nothing older.
+# Its own variable names: shell functions share one namespace, and this used to loop with `_d` - update_latest's
+# download dir - so after a prune that saw another download, update_latest decompressed "$_d/$_img" from the WRONG
+# directory and every second --latest failed ("zstd: can't stat ...", found by tools/update_vm_test.sh on 27 Nov).
 update_prune() {
-    _keep=$1 _n=0
-    for _d in $(ls -1td "$UPDATE_DIR"/v*/ 2> /dev/null); do
-        _d=${_d%/}
-        [ "${_d##*/}" = "$_keep" ] && continue
-        _n=$((_n + 1)); [ "$_n" -le 1 ] && continue
-        rm -rf "${_d:?}" && say "removed the older download ${_d##*/}"
+    _pk=$1 _pn=0
+    for _pd in $(ls -1td "$UPDATE_DIR"/v*/ 2> /dev/null); do
+        _pd=${_pd%/}
+        [ "${_pd##*/}" = "$_pk" ] && continue
+        _pn=$((_pn + 1)); [ "$_pn" -le 1 ] && continue
+        rm -rf "${_pd:?}" && say "removed the older download ${_pd##*/}"
     done
 }
 update_latest() {   # <channel> <download-only 1/''>: sets src= to the verified .img for the install below, or exits

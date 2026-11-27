@@ -1175,6 +1175,38 @@ hold_verdict() {
     esac
 }
 
+# root_password_verdict <root's shadow password field, or the word UNREADABLE>: the image must not ship a usable
+# default root password. The base the cuts are patched from carried the base distribution's public default (an MD5-crypt
+# hash), so su (setuid) or sudo-with-the-root-password made any process root; the image now ships '*' (no password
+# matches; console autologin and key-only ssh keep working). Judges the FORM of the field only and never prints it:
+#   '*' or a '!' prefix  PASS  (no usable password)
+#   a modern hash        PASS  (yescrypt $y$, sha-512 $6$, ...: a password a person set; passwd never writes MD5)
+#   '$1$...' (MD5-crypt) FAIL  (the old images' default form: set your own with passwd, or update)
+#   empty                FAIL  (no password at all: anyone at a login prompt is root)
+# Pure, so --self-test drives it and the row below uses the same code.
+root_password_verdict() {
+    case "${1:-}" in
+        UNREADABLE) printf 'FAIL /etc/shadow could not be read (the release check runs as root)' ;;
+        '')         printf 'FAIL root has NO password at all: anyone at a login prompt is root' ;;
+        '*'*|'!'*)  printf 'PASS root has no usable password (console autologin and ssh keys only)' ;;
+        '$1$'*)     printf 'FAIL root has an MD5-crypt password, the form of the default the images up to v2026.49-rc1 shipped: set your own with passwd, or update' ;;
+        '$'*)       printf 'PASS root has a password a person set (%s hash)' "$(printf '%s' "$1" | cut -d'$' -f2 | cut -c1-4)" ;;
+        *)          printf 'FAIL root has a password field this check does not recognise (a DES hash or a plain value)' ;;
+    esac
+}
+
+# layers_root_verdict <layers checked> <layers whose root field fails root_password_verdict, space-separated>: the
+# image is a stack (lowerdir=/pup_b:/pup_ro2:/pup_f:/pup_z) and the base's bdrv, ABOVE the main SFS, carries its own
+# etc/shadow, so a lock in the main SFS alone does not take effect. Every squashfs layer that has an etc/shadow must
+# ship root with no usable password. The row passes each layer's field straight into root_password_verdict and
+# never prints it. Pure, so --self-test drives it.
+layers_root_verdict() {
+    _n=${1:-0} _bad=${2:-}
+    [ "$_n" -gt 0 ] || { printf 'SKIP no squashfs layer under the root overlay carries an etc/shadow (not the appliance)'; return 0; }
+    [ -z "$_bad" ] || { printf 'FAIL %s ship(s) root with a usable password in its own etc/shadow (the image'"'"'s layers v2026.47 to v2026.49-rc1 carry the base default): update to a release that locks every layer' "$_bad"; return 0; }
+    printf 'PASS root has no usable password in any of the %s image layer(s) that carry an etc/shadow' "$_n"
+}
+
 # privileged_groups_verdict <group file> <passwd file>: no user but root may be in a group whose members are root in all
 # but name - disk (raw block devices), kmem (kernel memory), shadow (password hashes), root, sudo, wheel - as a listed
 # member or by primary gid. Puppy's base put its desktop user spot (uid 502) in disk and kmem, which undercuts the
@@ -1436,6 +1468,20 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(privileged_groups_verdict "$_pg/g2" "$_pg/p")"                    # Puppy's base: spot in disk
     printf 'root:x:0:0::/root:/bin/sh\neve:x:600:15::/home/eve:/bin/sh\n' > "$_pg/p2"
     check FAIL "$(privileged_groups_verdict "$_pg/g" "$_pg/p2")"                    # kmem as a primary group
+    # root-password: the image's default is '*'; the old default's MD5 form, an empty field and an unreadable file FAIL
+    check PASS "$(root_password_verdict '*')"
+    check PASS "$(root_password_verdict '!')"
+    check PASS "$(root_password_verdict '$y$j9T$abcdefghijkl$mnopqrstuvwxyz0123456789ABCDEFGHIJ')"
+    check PASS "$(root_password_verdict '$6$saltsalt$0123456789')"
+    check FAIL "$(root_password_verdict '$1$saltsalt$0123456789abcdefghij')"
+    check FAIL "$(root_password_verdict '')"
+    check FAIL "$(root_password_verdict UNREADABLE)"
+    check FAIL "$(root_password_verdict 'abXYZ12345678')"
+    # layers-root-password: every image layer with an etc/shadow
+    check PASS "$(layers_root_verdict 2 '')"
+    check FAIL "$(layers_root_verdict 2 'pup_b')"
+    check FAIL "$(layers_root_verdict 2 'pup_b pup_ro2')"
+    check SKIP "$(layers_root_verdict 0 '')"
     check FAIL "$(privileged_groups_verdict "$_pg/missing" "$_pg/p")"
     rm -rf "$_pg"
     check FAIL "$(node_verdict 1 '' '' '' '')"                                   # 1bit OS without Node.js
@@ -3450,6 +3496,38 @@ PG=$(privileged_groups_verdict /etc/group /etc/passwd)
 case "$PG" in
     PASS*) pass privileged-groups "${PG#PASS }" ;;
     *)     fail privileged-groups "${PG#FAIL }" ;;
+esac
+# root's password FIELD goes straight into the verdict and is never echoed
+if [ -r /etc/shadow ]; then RP=$(root_password_verdict "$(awk -F: '$1 == "root" { print $2; exit }' /etc/shadow)")
+else RP=$(root_password_verdict UNREADABLE); fi
+case "$RP" in
+    PASS*) pass root-password "${RP#PASS }" ;;
+    *)     fail root-password "${RP#FAIL }" ;;
+esac
+# the same, in every squashfs layer of the image (the effective /etc/shadow above can be a save-layer copy that hides
+# them, and a lower layer is what a fresh install or a cleared save layer reads)
+_lrn=0 _lrb=
+_lrl=$(awk '$2 == "/" && $3 == "overlay" { n = split($4, o, ","); for (i = 1; i <= n; i++) if (o[i] ~ /^lowerdir=/) { sub(/^lowerdir=/, "", o[i]); print o[i]; exit } }' /proc/mounts 2> /dev/null)
+_ifs=$IFS; IFS=:
+for _le in $_lrl; do
+    for _lm in "/initrd$_le" "$_le"; do
+        awk -v m="$_lm" '$2 == m && $3 == "squashfs" { f = 1 } END { exit !f }' /proc/mounts 2> /dev/null || continue
+        [ -f "$_lm/etc/shadow" ] || break
+        _lrn=$((_lrn + 1))
+        if [ -r "$_lm/etc/shadow" ]; then
+            case "$(root_password_verdict "$(awk -F: '$1 == "root" { print $2; exit }' "$_lm/etc/shadow")")" in PASS*) ;; *) _lrb="${_lrb:+$_lrb }${_lm##*/}" ;; esac
+        else
+            _lrb="${_lrb:+$_lrb }${_lm##*/}(unreadable)"
+        fi
+        break
+    done
+done
+IFS=$_ifs
+LR=$(layers_root_verdict "$_lrn" "$_lrb")
+case "$LR" in
+    PASS*) pass layers-root-password "${LR#PASS }" ;;
+    SKIP*) skip layers-root-password "${LR#SKIP }" ;;
+    *)     fail layers-root-password "${LR#FAIL }" ;;
 esac
 ND=$(node_verdict "$_nd_pup" "$_nd_v" "$_nd_pv" "$_nd_pre" "$_nd_mnt")
 case "$ND" in

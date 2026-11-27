@@ -31,6 +31,9 @@
 # NEXT: after the current holder, ahead of every queued lane ticket; FIFO among CI tickets, lanes FIFO among themselves. CI tickets are named 0-<n>..., lane
 # tickets 1-<n>...; tickets of the previous format (<n>...) sort between the two, so lanes already queued keep their
 # place ahead of new lanes. A CI ticket's command is capped at BOX_HOLD_CI_MAX s (2700, the 45-min ticket rule).
+# 2026-11-27 (orchestrator): a BOARD class for cl-lb's leaderboard tickets (BOX_HOLD_PRIORITY=board, honoured only when
+# BOX_HOLD_WHO is the cl-lb label): served after CI and ahead of every lane ticket, at most BOX_HOLD_BOARD_MAX (2) queued
+# at a time (a third queues as a lane, reported), the same 45-min cap.
 set -u
 D=${BOX_HOLD_DIR:-/tmp/box-locks}; mkdir -p $D 2>/dev/null; chmod 1777 $D 2>/dev/null; (umask 000; touch $D/box-gpu.lock $D/box-npu.lock $D/box-gpu.who $D/box-npu.who) 2>/dev/null; chmod 666 $D/box-* 2>/dev/null
 dev=${1:?usage: box-hold <gpu|npu|both> <command...>}; shift
@@ -43,8 +46,6 @@ Q=$D/queue; mkdir -p $Q 2>/dev/null; chmod 1777 $Q 2>/dev/null
 (umask 000; touch $D/box-seq.lock $D/box-seq $D/box-hold.log) 2>/dev/null
 starttime() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20; }
 alive() { _p=${1#*.}; _p=${_p%%.*}; _s=${1##*.}; [ -n "$_s" ] && [ "$(starttime "$_p")" = "$_s" ]; }
-exec 7>>"$D/box-seq.lock" || { echo "box-hold: cannot open $D/box-seq.lock" >&2; exit 3; }
-flock 7; n=$(( $(cat "$D/box-seq" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$D/box-seq" || { echo "box-hold: cannot write $D/box-seq" >&2; exit 3; }; flock -u 7; exec 7>&-
 under_runner() {   # GITHUB_ACTIONS=true and a Runner.Worker process among this process's ancestors
     [ "${GITHUB_ACTIONS:-}" = true ] || return 1
     _a=$PPID
@@ -54,18 +55,39 @@ under_runner() {   # GITHUB_ACTIONS=true and a Runner.Worker process among this 
     done
     return 1
 }
-cls=1
-if [ "${BOX_HOLD_PRIORITY:-}" = ci ]; then
-    if under_runner || [ "$(id -un 2>/dev/null)" = ghrunner ]; then
-        cls=0
-    else
-        _m="box-hold: BOX_HOLD_PRIORITY=ci ignored for ${BOX_HOLD_WHO:-$(id -un)} (not under a GitHub Actions runner, not the runner account): queued as a lane ticket"
-        echo "$_m" >&2
-        echo "$(date -u +%FT%TZ) $_m" >> "$D/box-hold.log" 2>/dev/null
+ignored() {   # <why>: a priority asked for and not honoured is said on stderr and in box-hold.log
+    _m="box-hold: BOX_HOLD_PRIORITY=${BOX_HOLD_PRIORITY:-} ignored for ${BOX_HOLD_WHO:-$(id -un)} ($1): queued as a lane ticket"
+    echo "$_m" >&2
+    echo "$(date -u +%FT%TZ) $_m" >> "$D/box-hold.log" 2>/dev/null
+}
+# The class: ticket names sort CI (0-<n>) < board (0-b-<n>) < previous format (<n>) < lanes (1-<n>), in C collation.
+pfx=1- cap=0
+case "${BOX_HOLD_PRIORITY:-}" in
+    ci)
+        if under_runner || [ "$(id -un 2>/dev/null)" = ghrunner ]; then pfx=0- cap=1
+        else ignored "not under a GitHub Actions runner, not the runner account"; fi ;;
+    board)   # 2026-11-27 orchestrator: cl-lb's leaderboard tickets only (the weekly blog needs the boards)
+        case "${BOX_HOLD_WHO:-}" in
+            cl-lb|cl-lb[-_\ ]*) pfx=0-b- cap=1 ;;
+            *) ignored "the board class is for the cl-lb label only" ;;
+        esac ;;
+    '') ;;
+    *) ignored "no such class (ci, board)" ;;
+esac
+# number + ticket under one lock, so the board quota (at most BOX_HOLD_BOARD_MAX queued at a time) cannot be raced past
+exec 7>>"$D/box-seq.lock" || { echo "box-hold: cannot open $D/box-seq.lock" >&2; exit 3; }
+flock 7
+n=$(( $(cat "$D/box-seq" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$D/box-seq" || { echo "box-hold: cannot write $D/box-seq" >&2; exit 3; }
+if [ "$pfx" = 0-b- ]; then
+    _nb=0
+    for f in $(ls "$Q" 2>/dev/null | grep '^0-b-'); do alive "$f" && _nb=$((_nb + 1)); done
+    if [ "$_nb" -ge "${BOX_HOLD_BOARD_MAX:-2}" ]; then
+        pfx=1- cap=0; ignored "the board class already has $_nb ticket(s) queued, the most it takes"
     fi
 fi
-me=$cls-$(printf '%012d' "$n").$$.$(starttime $$)
+me=$pfx$(printf '%012d' "$n").$$.$(starttime $$)
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$Q/$me" 2>/dev/null || { echo "box-hold: cannot write $Q/$me" >&2; exit 3; }
+flock -u 7; exec 7>&-
 trap 'rm -f "$Q/$me"' EXIT
 trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
 t0=$(date +%s)
@@ -99,8 +121,8 @@ echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-gpu.who" 2>/de
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-npu.who" 2>/dev/null
 # out of the line: the next waiter is head now and waits on the lock; signals behave as before (no deferred trap)
 rm -f "$Q/$me"; trap - EXIT TERM INT HUP
-if [ "$cls" = 0 ]; then
-    timeout -k 30 "${BOX_HOLD_CI_MAX:-2700}" "$@"   # the CI class jumps the line, so it may not keep it longer than 45 min
+if [ "$cap" = 1 ]; then
+    timeout -k 30 "${BOX_HOLD_CI_MAX:-2700}" "$@"   # the CI and board classes jump the line, so they may not keep it longer than 45 min
 else
     "$@"
 fi

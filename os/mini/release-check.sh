@@ -1309,7 +1309,11 @@ pyxrt_verdict() {
 # plan is not proved; the board run fetches one for chat-loom first). "NOTABLE" = no routes table (an older payload).
 # Pure, for --self-test.
 loom_routes_verdict() {
-    [ -s "${1:-}" ] || { printf 'SKIP the payload carries no Loom route table (config/loom-routes.json)'; return 0; }
+    [ -s "${1:-}" ] || { printf 'SKIP the payload carries no Loom route table and no loom-serve (an older payload)'; return 0; }
+    case "$(head -n 1 "$1")" in
+        "-- noparser") printf 'FAIL no python3 to read the Loom route table: no route was checked'; return 0 ;;
+        "-- notable "*) printf 'FAIL the payload has loom-serve but no Loom route table at %s: no route was checked' "$(head -n 1 "$1" | cut -c12-)"; return 0 ;;
+    esac
     awk '
         { n++; id = $1; card = $2; gguf = $3; plan = $4; for (i = 5; i <= NF; i++) plan = plan " " $i
           if (card != "ok") { nc++; mc = mc (mc == "" ? "" : ", ") id " (" substr(card, 9) ")" }
@@ -1328,7 +1332,10 @@ loom_routes_verdict() {
 # loom_routes_verdict line per route (see there). The row below runs it on the image; --self-test on a fake tree.
 loom_routes_scan() {
     : > "$7"
-    [ -r "$1" ] && command -v python3 > /dev/null 2>&1 || return 0
+    # no table: nothing to check only when there is no Loom server either (an older payload); a payload with loom-serve
+    # and no table, or no python3 to read one, is a FAIL, never a quiet SKIP (rc1's shape; review cl-hrxtest)
+    if [ ! -r "$1" ]; then [ -x "$3" ] && echo "-- notable $1" > "$7"; return 0; fi
+    command -v python3 > /dev/null 2>&1 || { echo "-- noparser" > "$7"; return 0; }
     python3 -I -c 'import json,sys
 for r in json.load(open(sys.argv[1]))["routes"]:
     m = r.get("match", {}); print(r["id"], r["card"], m.get("gguf_size", 0))' "$1" 2> /dev/null |
@@ -1342,7 +1349,12 @@ for r in json.load(open(sys.argv[1]))["routes"]:
         ONEBIT_LOOM_CARDS=$2 ONEBIT_LOOM_SERVE=$3 timeout 600 "$5" serve -m "$_g" --device hrx --print-backend \
             > "$7.out" 2> "$7.err" < /dev/null
         _rc=$?
-        if [ "$_rc" = 5 ] && grep -q -- "loom route $_id: .*-> loom-serve card " "$7.err"; then _p=loom
+        if [ "$_rc" = 5 ] && grep -q -- "loom route $_id: .*-> loom-serve card " "$7.err"; then
+            # the plan is not the load: every weight the card's model.json names is a link under the card (1bit-loom-cards,
+            # repointed by serve at the match) - a dangling one (a companion's MXFP8 experts, an mmproj, a drafter not
+            # pulled) means loom-serve would fail to load it (reviews cl-nvfp4, cl-hf)
+            _dl=$(find -L "$2/$_c" -type l 2> /dev/null | sed "s|^$2/$_c/||" | head -3 | tr '\n' ' ')
+            if [ -n "$_dl" ]; then _p="missing-weights:${_dl% }"; else _p=loom; fi
         elif _w=$(grep -m1 -o "loom route $_id [^:]*, but [^:]*" "$7.err"); then _p="fallback:${_w#*, but }"
         else _p="rc$_rc:$(tail -n 1 "$7.err" | cut -c1-100)"; fi
         printf '%s %s %s %s\n' "$_id" "$_cs" "$_g" "$_p" >> "$7"
@@ -1646,7 +1658,11 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(loom_routes_verdict "$_lrt")"
     printf 'qwen3-4b ok /m/a.gguf rc0:planned llama-server\n' > "$_lrt"             # the card is there, the plan is not loom
     check FAIL "$(loom_routes_verdict "$_lrt")"
-    : > "$_lrt"; check SKIP "$(loom_routes_verdict "$_lrt")"; rm -f "$_lrt"
+    : > "$_lrt"; check SKIP "$(loom_routes_verdict "$_lrt")"
+    echo "-- noparser" > "$_lrt"; check FAIL "$(loom_routes_verdict "$_lrt")"
+    echo "-- notable /opt/1bit-package/1bit/config/loom-routes.json" > "$_lrt"; check FAIL "$(loom_routes_verdict "$_lrt")"
+    printf 'inkling ok /m/i.gguf missing-weights:parameter/experts.safetensors\n' > "$_lrt"   # planned, a companion missing
+    check FAIL "$(loom_routes_verdict "$_lrt")"; rm -f "$_lrt"
     if command -v python3 > /dev/null 2>&1 && command -v truncate > /dev/null 2>&1; then   # the scan, on a fake tree
         _ft=$(mktemp -d 2> /dev/null || echo /tmp/1bit-lrs.$$); mkdir -p "$_ft/cards/CardA" "$_ft/hf/hub/x" "$_ft/bin"
         printf '{"routes":[{"id":"ra","card":"CardA","match":{"gguf_size":4096}},{"id":"rb","card":"CardB","match":{"gguf_size":8192}}]}' > "$_ft/r.json"
@@ -1658,6 +1674,11 @@ if [ "${1:-}" = --self-test ]; then
         check FAIL "$(loom_routes_verdict "$_ft/out" | cut -c1-4)"
         loom_routes_scan "$_ft/r.json" "$_ft/cards" /x "$_ft/hf" "$_ft/bin/1bit" 0 "$_ft/out"   # no GPU: cards only
         check "ra ok - -" "$(sed -n 1p "$_ft/out")"
+        mkdir -p "$_ft/cards/CardA/parameter"; ln -s "$_ft/nowhere.gguf" "$_ft/cards/CardA/parameter/mmproj.gguf"   # dangling
+        loom_routes_scan "$_ft/r.json" "$_ft/cards" /x "$_ft/hf" "$_ft/bin/1bit" 1 "$_ft/out"
+        check "ra ok $_ft/hf/hub/x/a.gguf missing-weights:parameter/mmproj.gguf" "$(sed -n 1p "$_ft/out")"
+        loom_routes_scan "$_ft/none.json" "$_ft/cards" "$_ft/bin/1bit" "$_ft/hf" "$_ft/bin/1bit" 1 "$_ft/out"   # loom-serve, no table
+        check "-- notable" "$(cat "$_ft/out")"
         rm -rf "$_ft"
     fi
     check PASS "$(pyxrt_verdict 1 'ok npu_rt')"

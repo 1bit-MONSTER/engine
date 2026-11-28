@@ -57,6 +57,9 @@ put() {
 
 cp -a "$build/1bit" "$stage/"
 put hrx/llama/bin llama-server llama-bench llama-perplexity
+# pyxrt for 1bit OS (docs/npu-iron-air.md): AMD's mlir-aie / IRON and mlir-air Python host code on the NPU runtime,
+# python/pyxrt.<abi>.so, when the build made it (ONEBIT_NPU with the runtime's sources and pybind11)
+put python
 
 # the sealed NPU kernel sets (scripts/weekly.sh, WEEKLY_NPU_KERNELS): encrypted artifacts, packed
 # beside 1bit in npu/kernels, where it looks for them

@@ -2987,6 +2987,27 @@ if(ONEBIT_NPU)
         target_include_directories(onebit_npu_rt PUBLIC ${CMAKE_SOURCE_DIR}/npu)
         target_compile_definitions(onebit_npu_rt PUBLIC ONEBIT_NPU_RUNTIME_OWN)
         target_link_libraries(onebit_npu_rt PUBLIC Threads::Threads)
+        # pyxrt for 1bit OS (docs/npu-iron-air.md): the Python module AMD's mlir-aie / IRON and mlir-air host code
+        # imports, on the NPU runtime, full-ELF flow only. Built from the runtime's sources when they carry it
+        # (python/pyxrt_npu_rt.cpp) and pybind11 and the build Python's headers are found; packaged as
+        # python/pyxrt.<abi>.so (scripts/package-linux.sh). The build Python must be 1bit OS's (3.14).
+        if(EXISTS "${ONEBIT_NPU_RT_DIR}/python/pyxrt_npu_rt.cpp")
+            find_package(Python3 COMPONENTS Interpreter Development.Module)
+            find_package(pybind11 CONFIG QUIET)
+            if(Python3_Development.Module_FOUND AND pybind11_FOUND)
+                pybind11_add_module(onebit_pyxrt MODULE ${ONEBIT_NPU_RT_DIR}/python/pyxrt_npu_rt.cpp
+                                    ${ONEBIT_NPU_RT_DIR}/npu_rt.cpp)
+                set_target_properties(onebit_pyxrt PROPERTIES OUTPUT_NAME pyxrt
+                                      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python)
+                target_include_directories(onebit_pyxrt SYSTEM PRIVATE ${ONEBIT_NPU_RT_DIR})
+                target_compile_features(onebit_pyxrt PRIVATE cxx_std_20)
+                target_link_libraries(onebit_pyxrt PRIVATE Threads::Threads)
+                message(STATUS "ONEBIT_NPU: pyxrt for ${Python3_EXECUTABLE} (${Python3_VERSION}) -> python/")
+            else()
+                message(WARNING "ONEBIT_NPU: pyxrt NOT built (needs pybind11 and the headers of "
+                                "'${Python3_EXECUTABLE}'); the payload will not carry python/pyxrt")
+            endif()
+        endif()
     endif()
     add_library(onebit_npu_lane STATIC npu/lane.cpp npu/generate.cpp)
     target_link_libraries(onebit_npu_lane PUBLIC onebit_npu onebit_npu_rt)

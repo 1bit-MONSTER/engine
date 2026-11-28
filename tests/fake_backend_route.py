@@ -30,7 +30,7 @@ argv = sys.argv[1:]
 def device():
     if "--device" in argv:
         d = argv[argv.index("--device") + 1]
-        return "hrx" if "HRX" in d else ("cpu" if d.lower() == "none" else d.lower())   # --device none: the cpu plan (engine#3590)
+        return "hrx" if "HRX" in d else d.lower()
     if "-ngl" in argv and argv[argv.index("-ngl") + 1] == "0":
         return "cpu"
     sys.exit("fake_backend_route.py: neither --device nor -ngl 0 in " + " ".join(argv))

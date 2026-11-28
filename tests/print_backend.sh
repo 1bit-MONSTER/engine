@@ -88,12 +88,14 @@ check "--embed needs serve (exit $rc)" '[ "$rc" = 5 ] && [ ! -s "$scratch/out" ]
 # strict placement on HRX (docs/serve.md, "Off-HRX placement: strict by default")
 env_of() { printf '%s' "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['env'].get('$1', '-'))"; }
 
-# engine#3590: --device cpu asks llama.cpp for no GPU device and keeps the HRX runtime from starting (it opened /dev/kfd)
+# engine#3590: an explicit --device cpu keeps the HRX runtime from starting (it opened /dev/kfd); auto is unchanged
 out=$(env -u GGML_HRX_DISABLE "$bin" serve -m "$scratch/small.gguf" --device cpu --llama-server "$here/fake_backend.py" --port 43121 --print-backend 2>"$scratch/err"); rc=$?
-check "cpu plan: --device none and GGML_HRX_DISABLE=1 (exit $rc)" \
-    '[ "$rc" = 0 ] && [ "$(get "d[\"argv\"][d[\"argv\"].index(\"--device\")+1]")" = none ] && [ "$(env_of GGML_HRX_DISABLE)" = 1 ]'
+check "cpu plan: GGML_HRX_DISABLE=1, and the argv names no device (exit $rc)" \
+    '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_DISABLE)" = 1 ] && [ "$(get "\"--device\" in d[\"argv\"]")" = False ]'
 out=$(GGML_HRX_DISABLE=0 "$bin" serve -m "$scratch/small.gguf" --device cpu --llama-server "$here/fake_backend.py" --port 43122 --print-backend 2>"$scratch/err"); rc=$?
 check "cpu plan: a GGML_HRX_DISABLE the caller set wins (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_DISABLE)" = - ]'
+out=$(env -u GGML_HRX_DISABLE "$bin" serve -m "$scratch/small.gguf" --device auto --llama-server "$here/fake_backend.py" --port 43124 --print-backend 2>"$scratch/err"); rc=$?
+check "auto plan: no GGML_HRX_DISABLE (only an explicit --device cpu sets it) (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_DISABLE)" = - ]'
 out=$(env -u GGML_HRX_DISABLE -u GGML_HRX_STRICT -u ONEBIT_STRICT_DEVICE "$bin" serve -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" --port 43123 --print-backend 2>"$scratch/err"); rc=$?
 check "hrx plan: no GGML_HRX_DISABLE (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_DISABLE)" = - ]'
 out=$(env -u GGML_HRX_STRICT -u ONEBIT_STRICT_DEVICE "$bin" serve -m "$scratch/small.gguf" --device hrx \

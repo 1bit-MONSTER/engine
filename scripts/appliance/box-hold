@@ -411,7 +411,11 @@ held_ctx() { case $HELD in all) echo all ;; *) echo $HELD ;; esac; }
 [ -n "$agekey" ] && rm -f "$AGES/$agekey" 2>/dev/null   # granted: this job's original age is used up
 for _c in $(held_ctx); do
     ctx $_c
-    case $me in 0-*) echo priority ;; *) echo lane ;; esac > "$D/box-last$FX" 2>/dev/null   # the class of this turn (alternation)
+    # the class of this turn (alternation). A RELEASE turn is written as "lane": waiters of copies older than the release
+    # class read a 0-r- ticket as CI, and after a "priority" turn they hand the box to the focus lane - a lane ticket then
+    # jumped 8 waiting release tickets (2026-11-28 18:09:31Z, cl-220). After "lane" they wait for the oldest "CI" ticket,
+    # which is the release ticket; this copy serves release tickets first whatever this record says.
+    case $me in 0-r-*) echo lane ;; 0-*) echo priority ;; *) echo lane ;; esac > "$D/box-last$FX" 2>/dev/null
     if [ "$pfx" = 1- ]; then echo "$mylane $$ $(starttime $$)" > "$D/box-running$FX" 2>/dev/null; touch_focus "$mylane"; fi   # the lane run goes on (live record)
 done
 # out of the line: the next waiter is head now and waits on the lock; signals behave as before (no deferred trap)

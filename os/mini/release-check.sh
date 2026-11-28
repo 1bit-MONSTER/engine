@@ -1287,6 +1287,19 @@ vulkan_verdict() {
     esac
 }
 
+# pyxrt_verdict <the payload's python/ dir present 1/0> <`import pyxrt; print(pyxrt.implementation)` output, rc-tagged:
+# "ok <implementation>" | "fail <why>">: the payload's pyxrt (engine#3594: XRT's Python binding on our NPU runtime, so
+# AMD's IRON / mlir-air run on 1bit OS, which has no XRT) must import with the image's own python3 and say it is
+# npu_rt. No device is opened. Pure, so --self-test drives it.
+pyxrt_verdict() {
+    [ "${1:-0}" = 1 ] || { printf 'SKIP the payload carries no python/ (no pyxrt in this build)'; return 0; }
+    case "${2:-}" in
+        "ok npu_rt")  printf 'PASS the payload'"'"'s pyxrt imports with the image'"'"'s python3 and is the npu_rt implementation' ;;
+        ok*)          printf 'FAIL pyxrt imports but is not npu_rt (implementation: %s)' "${2#ok }" ;;
+        *)            printf 'FAIL the payload'"'"'s pyxrt does not import with the image'"'"'s python3: %s' "$(printf '%s' "${2#fail }" | head -1 | cut -c1-120)" ;;
+    esac
+}
+
 # python_venv_verdict <python3 present 1/0> <`python3 -m venv` rc> <the venv's `pip --version` output>: users install
 # Python wheels (AMD's IRON / mlir-air for the NPU, engine#3594) into a venv, and the base shipped venv WITHOUT ensurepip
 # or pip wheels, so `python3 -m venv` failed on a fresh install ("ensurepip is not available"; os/v3/puppy/
@@ -1572,6 +1585,10 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(python_venv_verdict 1 1 '')"                                     # the base as shipped: no ensurepip
     check FAIL "$(python_venv_verdict 1 0 '/tmp/v/bin/python: No module named pip')"
     check SKIP "$(python_venv_verdict 0 1 '')"
+    check PASS "$(pyxrt_verdict 1 'ok npu_rt')"
+    check FAIL "$(pyxrt_verdict 1 'ok xrt')"
+    check FAIL "$(pyxrt_verdict 1 'fail ModuleNotFoundError: No module named pyxrt')"   # a module for another Python
+    check SKIP "$(pyxrt_verdict 0 '')"
     _vk_ok='Available devices:
   Vulkan0: Radeon 8060S Graphics (RADV STRIX_HALO) (123904 MiB, 98941 MiB free)'
     check PASS "$(vulkan_verdict 1 "$_vk_ok" 'ok Vulkan, 1 token')"
@@ -3703,6 +3720,19 @@ case "$PV" in
     PASS*) pass python-venv "${PV#PASS }" ;;
     SKIP*) skip python-venv "${PV#SKIP }" ;;
     *)     fail python-venv "${PV#FAIL }" ;;
+esac
+# ── pyxrt: the payload's NPU-runtime Python binding imports with the image's python3 (no device opened) ────────────
+_pxd=/opt/1bit-package/1bit/python _pxp=0 _pxo=
+if [ -d "$_pxd" ] && command -v python3 > /dev/null 2>&1; then
+    _pxp=1
+    if _pxr=$(PYTHONPATH=$_pxd timeout 30 python3 -c 'import pyxrt; print(pyxrt.implementation)' 2>&1); then _pxo="ok $(printf '%s' "$_pxr" | tail -1)"
+    else _pxo="fail $(printf '%s' "$_pxr" | tail -1)"; fi
+fi
+PX=$(pyxrt_verdict "$_pxp" "$_pxo")
+case "$PX" in
+    PASS*) pass pyxrt "${PX#PASS }" ;;
+    SKIP*) skip pyxrt "${PX#SKIP }" ;;
+    *)     fail pyxrt "${PX#FAIL }" ;;
 esac
 # ── vulkan: Lemonade's llamacpp:vulkan sees the Radeon through RADV, and a 1-token run uses it (not the CPU) ─────────
 _vlem=/data/lemonade; [ -d "$_vlem" ] || _vlem=/var/lib/lemonade

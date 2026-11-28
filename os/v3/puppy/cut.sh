@@ -210,6 +210,17 @@ PY
     sh "$here/lock-root-password.sh" "$out/shadow" || die "could not replace the default root password"
     chmod 600 "$out/shadow"
     printf 'etc/shadow\t%s\n' "$out/shadow" >> "$M.os"
+    # pyxrt (engine#3594: AMD's IRON / mlir-air on our NPU runtime) is ABI-specific: a module the release host built for
+    # another Python than the base's would ship and never import. Refused here, by the interpreter the base's
+    # usr/bin/python3 LINKS to - the one the image (and release-check's pyxrt row) imports with (review cl-nvfp4).
+    for _px in "$P"/1bit/python/pyxrt.*.so; do
+        [ -e "$_px" ] || continue
+        _bpy=$(sudo -n unsquashfs -q -ll "$bsfs" usr/bin/python3 2> /dev/null | sed -n 's|.* squashfs-root/usr/bin/python3 -> \(python3\.[0-9][0-9]*\)$|\1|p' | head -1)
+        [ -n "$_bpy" ] || die "cannot read the base's python3 version (usr/bin/python3 -> python3.X in $bsfs): the pyxrt module cannot be checked"
+        _btag=cpython-$(printf '%s' "${_bpy#python}" | tr -d .)-x86_64-linux-gnu
+        case "$(basename "$_px")" in "pyxrt.$_btag.so") say "  pyxrt: $(basename "$_px") matches the base's $_bpy" ;;
+            *) die "the payload's $(basename "$_px") is not for the base's $_bpy (want pyxrt.$_btag.so): build it with that Python" ;; esac
+    done
     # Mesa's RADV Vulkan driver (os/v3/puppy/radv.pin): the base ships the Vulkan loader but no driver, so Lemonade's
     # Vulkan backends ran on the CPU (owner 27 Nov: make them work on the 8060S). The pinned .deb, sha256-checked; RADV
     # + its ICD file + copyright only. RADV_DEB=<local .deb> for an offline cut.

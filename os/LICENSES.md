@@ -49,6 +49,12 @@ resolute-updates' `mesa-vulkan-drivers` 26.0.8-1ubuntu0.3 (the base's own Mesa b
 License MIT (some files BSD, Khronos, SGI). Not lavapipe or the other vendors' drivers. The Vulkan loader
 (`libvulkan1` 1.4.341, Apache-2.0) and `libllvm21` were in the base already.
 
+**1bit OS also carries what `python3 -m venv` needs to install pip**, so users can install Python wheels (AMD's IRON /
+mlir-air) into a venv: from Ubuntu resolute, pinned by sha256 in `os/v3/puppy/python-venv.pin` and taken by
+`stage-debs.sh`: `ensurepip` from `python3.14-venv` 3.14.4-1ubuntu0.2 (PSF-2.0, the Python stdlib the base already
+carries), the pip 25.1.1 wheel from `python3-pip-whl` (MIT) and the setuptools 78.1.1 wheel from
+`python3-setuptools-whl` (MIT), in `/usr/share/python-wheels/`, with those packages' copyright files.
+
 ## Lemonade's backends
 
 Installed ahead of time by Lemonade's own installer (lemond `/api/v1/install`), from the release

@@ -218,6 +218,15 @@ PY
         die "the base's Mesa is not $_bm (radv.pin): RADV must come from the base's own Mesa build - re-pin it"
     sh "$here/stage-radv.sh" "$out/radv" ${RADV_DEB:+--deb "$RADV_DEB"} || die "could not stage Mesa's RADV driver"
     for f in $(awk '$1 == "take" { print $2 }' "$here/radv.pin"); do printf '%s\t%s\n' "$f" "$out/radv/$f" >> "$M.os"; done
+    # `python3 -m venv` with pip (os/v3/puppy/python-venv.pin): the base has Python 3.14 + venv but no ensurepip and no
+    # pip/setuptools wheels, so a fresh install could not make a venv (AMD's IRON / mlir-air wheels, engine#3594).
+    # The pin's `base` paths must be in the base SFS (another Python = re-pin). DEBS_DIR=<dir of the .debs> offline.
+    for f in $(awk '$1 == "base" { print $2 }' "$here/python-venv.pin"); do
+        sudo -n unsquashfs -q -l "$bsfs" "$f" 2> /dev/null | grep -q "/$f\$" ||
+            die "the base SFS has no $f (python-venv.pin): its ensurepip/wheels would not match - re-pin"
+    done
+    sh "$here/stage-debs.sh" "$here/python-venv.pin" "$out/pyvenv" ${DEBS_DIR:+--deb-dir "$DEBS_DIR"} || die "could not stage python3 venv + pip"
+    for f in $(awk '$1 == "take" { print $3 }' "$here/python-venv.pin"); do printf '%s\t%s\n' "$f" "$out/pyvenv/$f" >> "$M.os"; done
     # the base's /etc/login.defs with a range of its own for the BOX's system accounts (useradd -r: 800-899), so they
     # never take the ids the image's system accounts use (999 down); the range check covers bdrv's accounts as well,
     # which sit above the main SFS's. Only the main SFS carries login.defs in the base.

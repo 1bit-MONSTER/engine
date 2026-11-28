@@ -1287,6 +1287,19 @@ vulkan_verdict() {
     esac
 }
 
+# python_venv_verdict <python3 present 1/0> <`python3 -m venv` rc> <the venv's `pip --version` output>: users install
+# Python wheels (AMD's IRON / mlir-air for the NPU, engine#3594) into a venv, and the base shipped venv WITHOUT ensurepip
+# or pip wheels, so `python3 -m venv` failed on a fresh install ("ensurepip is not available"; os/v3/puppy/
+# python-venv.pin adds them). Offline: ensurepip installs pip from /usr/share/python-wheels. Pure, for --self-test.
+python_venv_verdict() {
+    [ "${1:-0}" = 1 ] || { printf 'SKIP no python3 on this machine'; return 0; }
+    [ "${2:-1}" = 0 ] || { printf 'FAIL python3 -m venv failed (no ensurepip / pip wheels? os/v3/puppy/python-venv.pin)'; return 0; }
+    case "${3:-}" in
+        pip\ *) printf 'PASS python3 -m venv makes a venv with %s' "$(printf '%s' "$3" | cut -d' ' -f1-2)" ;;
+        *)      printf 'FAIL the venv was made but has no working pip (%s)' "$(printf '%s' "${3:-no output}" | head -1 | cut -c1-80)" ;;
+    esac
+}
+
 # privileged_groups_verdict <group file> <passwd file>: no user but root may be in a group whose members are root in all
 # but name - disk (raw block devices), kmem (kernel memory), shadow (password hashes), root, sudo, wheel - as a listed
 # member or by primary gid. Puppy's base put its desktop user spot (uid 502) in disk and kmem, which undercuts the
@@ -1555,6 +1568,10 @@ if [ "${1:-}" = --self-test ]; then
     check PASS "$(local_system_accounts_verdict '')"
     check FAIL "$(local_system_accounts_verdict 'ghrunner=999 group:ghrunner=992')"
     check SKIP "$(local_system_accounts_verdict NOLAYERS)"
+    check PASS "$(python_venv_verdict 1 0 'pip 25.1.1 from /tmp/v/lib/python3.14/site-packages/pip (python 3.14)')"
+    check FAIL "$(python_venv_verdict 1 1 '')"                                     # the base as shipped: no ensurepip
+    check FAIL "$(python_venv_verdict 1 0 '/tmp/v/bin/python: No module named pip')"
+    check SKIP "$(python_venv_verdict 0 1 '')"
     _vk_ok='Available devices:
   Vulkan0: Radeon 8060S Graphics (RADV STRIX_HALO) (123904 MiB, 98941 MiB free)'
     check PASS "$(vulkan_verdict 1 "$_vk_ok" 'ok Vulkan, 1 token')"
@@ -3672,6 +3689,20 @@ case "$LA" in
     PASS*) pass local-system-accounts "${LA#PASS }" ;;
     SKIP*) skip local-system-accounts "${LA#SKIP }" ;;
     *)     fail local-system-accounts "${LA#FAIL }" ;;
+esac
+# ── python3 -m venv makes a venv that has pip (offline: ensurepip from /usr/share/python-wheels) ───────────────────────
+_pvp=0 _pvr=1 _pvo=
+if command -v python3 > /dev/null 2>&1; then
+    _pvp=1; _pvd=$(mktemp -d 2> /dev/null || echo /tmp/1bit-venv-check.$$)
+    timeout 120 python3 -m venv "$_pvd/v" > /dev/null 2>&1; _pvr=$?
+    [ "$_pvr" = 0 ] && _pvo=$(timeout 60 "$_pvd/v/bin/python" -m pip --version 2>&1)
+    rm -rf "$_pvd"
+fi
+PV=$(python_venv_verdict "$_pvp" "$_pvr" "$_pvo")
+case "$PV" in
+    PASS*) pass python-venv "${PV#PASS }" ;;
+    SKIP*) skip python-venv "${PV#SKIP }" ;;
+    *)     fail python-venv "${PV#FAIL }" ;;
 esac
 # ── vulkan: Lemonade's llamacpp:vulkan sees the Radeon through RADV, and a 1-token run uses it (not the CPU) ─────────
 _vlem=/data/lemonade; [ -d "$_vlem" ] || _vlem=/var/lib/lemonade

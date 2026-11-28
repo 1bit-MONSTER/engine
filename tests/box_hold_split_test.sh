@@ -103,7 +103,7 @@ kill "$p1" 2> /dev/null; wait "$p1" 2> /dev/null
 
 # 8. the split waits for older waiters
 reset; touch "$T/split"; mkdir -p "$T/locks/queue"
-sleep 30 & p1=$!; sleep 0.2; s1=$(sed 's/.*) //' "/proc/$p1/stat" | cut -d' ' -f20)
+sleep 30 & p1=$!; s1=""; for _i in $(seq 1 30); do sleep 0.1; s1=$(sed 's/.*) //' "/proc/$p1/stat" 2> /dev/null | cut -d' ' -f20); [ "$(cat /proc/$p1/comm 2> /dev/null)" = sleep ] && [ -n "$s1" ] && break; done   # the stub's start time once it IS sleep (a slow box)
 printf 'cl-old %s x\nbox-hold-v3\nbox-hold-v6\nbox-hold-v7\ndev=gpu\n' "$(date -u +%FT%TZ)" > "$T/locks/queue/1-$(printf '%012d' 999999).$p1.$s1"   # a v7 (pre-7.1) waiter (a stub: it never takes its turn)
 echo "cl-a $(date +%s) $(date +%s)" > "$T/locks/box-focus"   # cl-a has the (one-scheduler) focus, so the stub is not waited for
 out=$(sh "$BH" focus)

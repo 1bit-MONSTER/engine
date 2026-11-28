@@ -159,3 +159,7 @@ add_test(NAME box_hold_split COMMAND bash ${CMAKE_SOURCE_DIR}/tests/box_hold_spl
 # environment's / (2026-11-28: every hw-gate job failed in "Prepare the appliance runner"), and the running check is
 # anchored to this runner's listener (the pr-agent runner's must not stop it). Stub sudo/pgrep, no runner.
 add_test(NAME appliance_runner_init COMMAND bash ${CMAKE_SOURCE_DIR}/tests/appliance_runner_init_test.sh ${CMAKE_SOURCE_DIR}/scripts/appliance/50github-runner)
+
+# box-hold RELEASE class (owner 2026-11-28, v2026.49): after CI, before every lane ticket; honoured only for cl-release-rel*
+# labels or a listed lane's ticket carrying one of its issues (box-hold-release.conf). Stub jobs, no device.
+add_test(NAME box_hold_release COMMAND bash ${CMAKE_SOURCE_DIR}/tests/box_hold_release_test.sh ${CMAKE_SOURCE_DIR}/scripts/appliance/box-hold)

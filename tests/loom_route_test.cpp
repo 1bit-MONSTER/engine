@@ -188,15 +188,15 @@ int main() {
             // a record someone else could have written is not trusted
             const auto now = loom::file_identity(f.string());
             const fs::path nrec = cache / (std::to_string(now->dev) + "-" + std::to_string(now->ino));
-            ::chmod(nrec.c_str(), 0666);
+            ::chmod(nrec.c_str(), 0620);   // group-writable (world-writable is refused the same way: S_IWGRP | S_IWOTH)
             c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
-            check("cache: a group/other-writable record is ignored (hashed)", !c.cached && n == 5);
+            check("cache: a group-writable record is ignored (hashed)", !c.cached && n == 5);
             ::chmod(nrec.c_str(), 0600);
             c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
             check("cache: the rewritten record is a hit", c.cached && n == 5);
-            ::chmod(cache.c_str(), 0777);
+            ::chmod(cache.c_str(), 0720);
             c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
-            check("cache: a group/other-writable directory is ignored and not written",
+            check("cache: a group-writable directory is ignored and not written",
                   !c.cached && n == 6 && !c.note.empty());
             ::chmod(cache.c_str(), 0700);
             // a forged digest in a trusted record is the owner's own doing; a malformed one is ignored

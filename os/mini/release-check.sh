@@ -1260,6 +1260,33 @@ local_system_accounts_verdict() {
     esac
 }
 
+# vulkan_verdict <backend dir present 1/0, or 2 = installed but this machine has NO AMD render node> <`llama-server --list-devices` output> <1-token run: "ok <what>" | "busy" (the
+# GPU ticket did not come round) | "none" (no small GGUF staged) | "fail <why>"> <RADV's unresolved libraries, or empty>:
+# Lemonade's llamacpp:vulkan must see the Radeon GPU through Mesa's RADV (os/v3/puppy/radv.pin) - rc1 shipped the Vulkan
+# loader without a driver, so the backend listed as "installed" ran on the CPU (21.5 vs 55.8 tok/s published). The
+# device is the first line naming RADV (not the ordinal Vulkan0: a second ICD could come first); a CPU Vulkan device
+# (llvmpipe / lavapipe) is a FAIL, and so is a RADV that is present but cannot load. Pure, so --self-test drives it.
+vulkan_verdict() {
+    _vi=${1:-0} _vd=${2:-} _vr=${3:-none} _vm=${4:-}
+    [ "$_vi" = 2 ] && { printf 'SKIP no AMD GPU render node on this machine (/sys/class/drm/renderD*/device/vendor 0x1002): a VM or another vendor - nothing for RADV to drive'; return 0; }
+    [ "$_vi" = 1 ] || { printf 'SKIP llamacpp:vulkan is not installed on this machine (Lemonade has not fetched it)'; return 0; }
+    _vn=$(printf '%s' "$_vd" | grep -m1 -E 'Vulkan[0-9]+:.*RADV' | sed 's/^ *Vulkan[0-9]*: *//' | cut -c1-70)
+    if [ -z "$_vn" ]; then
+        [ -z "$_vm" ] || { printf 'FAIL RADV is present but cannot load (missing: %s): llamacpp:vulkan runs on the CPU' "$_vm"; return 0; }
+        case "$_vd" in
+            *Vulkan[0-9]*:*llvmpipe*|*Vulkan[0-9]*:*lavapipe*) printf 'FAIL llamacpp:vulkan sees only a CPU Vulkan device (%s): it would run at CPU speed' "$(printf '%s' "$_vd" | grep -m1 -E 'Vulkan[0-9]+:' | sed 's/^ *//' | cut -c1-80)" ;;
+            *) printf 'FAIL llamacpp:vulkan sees NO Radeon Vulkan device (no RADV driver?): it runs on the CPU - /usr/share/vulkan/icd.d/radeon_icd.json + libvulkan_radeon.so' ;;
+        esac
+        return 0
+    fi
+    case "$_vr" in
+        ok*)  printf 'PASS llamacpp:vulkan sees %s and ran a token on it (%s)' "$_vn" "${_vr#ok }" ;;
+        busy) printf 'PASS llamacpp:vulkan sees %s (the 1-token run waited for the GPU ticket and did not get it: not run beside another job)' "$_vn" ;;
+        none) printf 'PASS llamacpp:vulkan sees %s (no small GGUF staged for the 1-token run)' "$_vn" ;;
+        *)    printf 'FAIL llamacpp:vulkan sees %s but the 1-token run did not use it: %s' "$_vn" "${_vr#fail }" ;;
+    esac
+}
+
 # privileged_groups_verdict <group file> <passwd file>: no user but root may be in a group whose members are root in all
 # but name - disk (raw block devices), kmem (kernel memory), shadow (password hashes), root, sudo, wheel - as a listed
 # member or by primary gid. Puppy's base put its desktop user spot (uid 502) in disk and kmem, which undercuts the
@@ -1528,6 +1555,19 @@ if [ "${1:-}" = --self-test ]; then
     check PASS "$(local_system_accounts_verdict '')"
     check FAIL "$(local_system_accounts_verdict 'ghrunner=999 group:ghrunner=992')"
     check SKIP "$(local_system_accounts_verdict NOLAYERS)"
+    _vk_ok='Available devices:
+  Vulkan0: Radeon 8060S Graphics (RADV STRIX_HALO) (123904 MiB, 98941 MiB free)'
+    check PASS "$(vulkan_verdict 1 "$_vk_ok" 'ok Vulkan, 1 token')"
+    check PASS "$(vulkan_verdict 1 "$_vk_ok" none)"
+    check FAIL "$(vulkan_verdict 1 'Available devices:' none)"                     # rc1: the loader and no driver
+    check FAIL "$(vulkan_verdict 1 'Available devices:' none 'libLLVM.so.21')"     # RADV present, unloadable
+    check PASS "$(vulkan_verdict 1 "$_vk_ok" busy)"                                # the GPU ticket did not come round
+    check PASS "$(vulkan_verdict 1 '  Vulkan0: llvmpipe (LLVM 21.1.8)
+  Vulkan1: Radeon 8060S Graphics (RADV STRIX_HALO)' none)"                         # RADV is not first: matched by name
+    check FAIL "$(vulkan_verdict 1 '  Vulkan0: llvmpipe (LLVM 21.1.8, 256 bits)' none)"   # a CPU Vulkan device
+    check FAIL "$(vulkan_verdict 1 "$_vk_ok" 'fail the run used the CPU')"
+    check SKIP "$(vulkan_verdict 0 '' none)"
+    check SKIP "$(vulkan_verdict 2 'Available devices:' none)"                     # installed, no AMD node (the QEMU check)
     # root-password: the image's default is '*'; the old default's MD5 form, an empty field and an unreadable file FAIL
     check PASS "$(root_password_verdict '*')"
     check PASS "$(root_password_verdict '!')"
@@ -3632,6 +3672,47 @@ case "$LA" in
     PASS*) pass local-system-accounts "${LA#PASS }" ;;
     SKIP*) skip local-system-accounts "${LA#SKIP }" ;;
     *)     fail local-system-accounts "${LA#FAIL }" ;;
+esac
+# ── vulkan: Lemonade's llamacpp:vulkan sees the Radeon through RADV, and a 1-token run uses it (not the CPU) ─────────
+_vlem=/data/lemonade; [ -d "$_vlem" ] || _vlem=/var/lib/lemonade
+_vb=$_vlem/cache/bin/llamacpp/vulkan
+_vi=0 _vd= _vr=none
+_vamd=0
+for _vv in /sys/class/drm/renderD*/device/vendor; do [ "$(cat "$_vv" 2> /dev/null)" = 0x1002 ] && _vamd=1; done
+if [ -x "$_vb/llama-server" ] && [ "$_vamd" = 0 ]; then
+    _vi=2                                       # review cl-buildenv: no AMD GPU here (vm-check's QEMU): SKIP, not FAIL
+elif [ -x "$_vb/llama-server" ]; then
+    _vi=1
+    _vd=$(LD_LIBRARY_PATH=$_vb timeout 60 "$_vb/llama-server" --list-devices 2>&1)
+    # present but unloadable (review cl-i679): the libraries the driver needs that the system does not resolve
+    _vm=
+    for _vl in /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so; do
+        [ -e "$_vl" ] && _vm=$(ldd "$_vl" 2> /dev/null | awk '/not found/ { printf "%s ", $1 }')
+    done
+    # the 1-token run: the smallest GGUF (<= 4 GB) already in Lemonade's cache (--fetch stages the hrx-placement 4B)
+    _vg=$(find "${HF_HOME:-$_vlem/huggingface}/hub" -name '*.gguf' -size -4G -size +100M 2> /dev/null | while IFS= read -r _x; do
+          printf '%s %s\n' "$(stat -c %s "$_x" 2> /dev/null)" "$_x"; done | sort -n | head -1 | cut -d' ' -f2-)
+    if [ -n "$_vg" ] && [ -x "$_vb/llama-bench" ]; then
+        # GPU work: through box-hold where there is one (review cl-i679: the shared dev box runs this same check), with
+        # a short wait - a busy GPU is said, never shared
+        _vh=0
+        if command -v box-hold > /dev/null 2>&1; then
+            _vh=1
+            _vo=$(BOX_HOLD_WAIT="${ONEBIT_CHECK_VULKAN_WAIT:-600}" BOX_HOLD_WHO="release-check vulkan 1-token" \
+                box-hold gpu env LD_LIBRARY_PATH="$_vb" timeout 300 "$_vb/llama-bench" -m "$_vg" -ngl 99 -p 0 -n 1 -r 1 -o md 2>&1); _vrc=$?
+        else
+            _vo=$(LD_LIBRARY_PATH=$_vb timeout 300 "$_vb/llama-bench" -m "$_vg" -ngl 99 -p 0 -n 1 -r 1 -o md 2>&1); _vrc=$?
+        fi
+        if [ "$_vh" = 1 ] && [ "$_vrc" = 4 ]; then _vr=busy
+        elif printf '%s' "$_vo" | grep -q '| *Vulkan *|'; then _vr="ok Vulkan backend, 1 token on $(basename "$_vg")"
+        else _vr="fail llama-bench did not run on Vulkan: $(printf '%s' "$_vo" | tail -n 2 | tr '\n' ' ' | cut -c1-120)"; fi
+    fi
+fi
+VK=$(vulkan_verdict "$_vi" "$_vd" "$_vr" "${_vm:-}")
+case "$VK" in
+    PASS*) pass vulkan "${VK#PASS }" ;;
+    SKIP*) skip vulkan "${VK#SKIP }" ;;
+    *)     fail vulkan "${VK#FAIL }" ;;
 esac
 # root's password FIELD goes straight into the verdict and is never echoed
 if [ -r /etc/shadow ]; then RP=$(root_password_verdict "$(awk -F: '$1 == "root" { print $2; exit }' /etc/shadow)")

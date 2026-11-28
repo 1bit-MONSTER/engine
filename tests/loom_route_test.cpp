@@ -208,6 +208,20 @@ int main() {
             fs::create_symlink(dir / "cached.gguf", link);
             check("cache: a symlink is never a trusted record", !loom::sha_cache_entry_trusted(link.string(), false));
             // no cache dir = plain hash; an unreadable file = "" and nothing written
+            // a file written while it is hashed: the digest is returned but never cached
+            {
+                const fs::path w = dir / "written.gguf";
+                std::ofstream(w, std::ios::binary) << "abc";
+                auto racing = [&](const std::string& p) {
+                    std::string d = loom::sha256_of_file(p);
+                    std::ofstream(p, std::ios::binary | std::ios::app) << "x";   // a writer appends mid-hash
+                    return d;
+                };
+                c = loom::sha256_of_file_cached(w.string(), cache.string(), racing);
+                const auto wid = loom::file_identity(w.string());
+                const fs::path wrec = cache / (std::to_string(wid->dev) + "-" + std::to_string(wid->ino));
+                check("cache: a file changed during its hash is not cached", !c.cached && !c.note.empty() && !fs::exists(wrec));
+            }
             c = loom::sha256_of_file_cached(f.string(), "", h);
             check("cache: no directory = hash every time", !c.cached && n == 8);
             c = loom::sha256_of_file_cached((dir / "missing.gguf").string(), cache.string(), h);

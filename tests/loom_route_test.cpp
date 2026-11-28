@@ -19,6 +19,9 @@
 #include "loom_route.h"
 #include "loom_routes_default.h"  // generated from config/loom-routes.json (the table serve ships)
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -133,6 +136,135 @@ int main() {
         hashed = 0;
         check("the empty table matches nothing and reads nothing", !loom::match_loom_route(empty, file, {"tiny"}, sha) && hashed == 0);
         check("sha256_of_file streams the file", loom::sha256_of_file(file) == abc_sha);
+
+        // engine#3619: the verified sha256 is cached by (device, inode, size, mtime_ns)
+        {
+            const fs::path cache = dir / "sha-cache";
+            const fs::path f = dir / "cached.gguf";
+            std::ofstream(f, std::ios::binary) << "abc";
+            int n = 0;
+            auto h = [&](const std::string& p) { ++n; return loom::sha256_of_file(p); };
+            loom::CachedSha c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+            check("cache: first load hashes and writes the record", c.sha == abc_sha && !c.cached && n == 1 && c.note.empty());
+            struct stat cst {};
+            check("cache: its directory is created 0700", ::lstat(cache.c_str(), &cst) == 0 && (cst.st_mode & 0777) == 0700);
+            c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+            check("cache: an unchanged file is a hit (no hash)", c.sha == abc_sha && c.cached && n == 1 && c.verified > 0);
+            const auto rec = loom::file_identity(f.string());
+            const fs::path recf = cache / (std::to_string(rec->dev) + "-" + std::to_string(rec->ino));
+            check("cache: the record is 0600", ::lstat(recf.c_str(), &cst) == 0 && (cst.st_mode & 0777) == 0600);
+
+            // mtime: same bytes, same size, same inode, newer mtime -> hashed again
+            struct timespec ts[2] = {{0, UTIME_OMIT}, {rec->mtime_ns / 1000000000 + 10, 123}};
+            ::utimensat(AT_FDCWD, f.c_str(), ts, 0);
+            c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+            check("cache: a touched file (mtime) is hashed again", !c.cached && n == 2 && c.sha == abc_sha);
+            c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+            check("cache: and its new record is then a hit", c.cached && n == 2);
+
+            // content: an in-place rewrite of the SAME size (same inode) with its mtime put back -> hashed again on
+            // ctime (review of #3620: rsync -t --inplace, cp -p onto the file, touch -d). The digest is the new bytes'.
+            {
+                const auto was = loom::file_identity(f.string());
+                { std::fstream w(f, std::ios::binary | std::ios::in | std::ios::out); w.seekp(0); w << "x"; }   // "abc" -> "xbc"
+                struct timespec keep[2] = {{0, UTIME_OMIT}, {was->mtime_ns / 1000000000, was->mtime_ns % 1000000000}};
+                ::utimensat(AT_FDCWD, f.c_str(), keep, 0);
+                const auto now2 = loom::file_identity(f.string());
+                c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+                check("cache: a same-size in-place rewrite with mtime restored is hashed again (ctime)",
+                      now2->ino == was->ino && now2->size == was->size && now2->mtime_ns == was->mtime_ns && !c.cached &&
+                      n == 3 && c.sha == loom::sha256_of_file(f.string()) && c.sha != abc_sha);
+                std::ofstream(f, std::ios::binary | std::ios::trunc) << "abc";   // back to "abc" for the arms below
+                c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+                check("cache: ... and the restored file is hashed once more", !c.cached && n == 4 && c.sha == abc_sha);
+                n = 2;   // the arms below count from here
+            }
+            // a record of format 1 (no ctime) is a miss and is rewritten as format 2
+            {
+                const auto v = loom::file_identity(f.string());
+                const fs::path r1 = cache / (std::to_string(v->dev) + "-" + std::to_string(v->ino));
+                std::ofstream(r1, std::ios::binary | std::ios::trunc) << "1 " << v->size << " " << v->mtime_ns << " " << abc_sha << " 1\n";
+                ::chmod(r1.c_str(), 0600);
+                c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+                std::ifstream back(r1);
+                int ver = 0;
+                back >> ver;
+                check("cache: a format-1 record is a miss, rewritten as format 2", !c.cached && n == 3 && ver == 2);
+                n = 2;
+            }
+            // size: an in-place write that keeps the inode and puts the mtime back -> hashed again on the size
+            const auto before = loom::file_identity(f.string());
+            std::ofstream(f, std::ios::binary | std::ios::app) << "d";
+            struct timespec back[2] = {{0, UTIME_OMIT}, {before->mtime_ns / 1000000000, before->mtime_ns % 1000000000}};
+            ::utimensat(AT_FDCWD, f.c_str(), back, 0);
+            const auto grown = loom::file_identity(f.string());
+            c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+            check("cache: a size change (same inode + mtime) is hashed again",
+                  grown->ino == before->ino && grown->mtime_ns == before->mtime_ns && !c.cached && n == 3 &&
+                  c.sha == "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589");
+
+            // inode: another file renamed over it, same size and mtime as the record -> hashed again
+            const auto cur = loom::file_identity(f.string());
+            const fs::path g = dir / "other.gguf";
+            std::ofstream(g, std::ios::binary) << "abce";
+            struct timespec same[2] = {{0, UTIME_OMIT}, {cur->mtime_ns / 1000000000, cur->mtime_ns % 1000000000}};
+            ::utimensat(AT_FDCWD, g.c_str(), same, 0);
+            fs::rename(g, f);
+            const auto swapped = loom::file_identity(f.string());
+            c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+            check("cache: a file renamed over it (new inode, same size + mtime) is hashed again",
+                  swapped->ino != cur->ino && swapped->size == cur->size && swapped->mtime_ns == cur->mtime_ns && !c.cached &&
+                  n == 4 && c.sha != "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589");
+
+            // a record someone else could have written is not trusted
+            const auto now = loom::file_identity(f.string());
+            const fs::path nrec = cache / (std::to_string(now->dev) + "-" + std::to_string(now->ino));
+            ::chmod(nrec.c_str(), 0620);   // group-writable (world-writable is refused the same way: S_IWGRP | S_IWOTH)
+            c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+            check("cache: a group-writable record is ignored (hashed)", !c.cached && n == 5);
+            ::chmod(nrec.c_str(), 0600);
+            c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+            check("cache: the rewritten record is a hit", c.cached && n == 5);
+            ::chmod(cache.c_str(), 0720);
+            c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+            check("cache: a group-writable directory is ignored and not written",
+                  !c.cached && n == 6 && !c.note.empty());
+            ::chmod(cache.c_str(), 0700);
+            // a forged digest in a trusted record is the owner's own doing; a malformed one is ignored
+            std::ofstream(nrec, std::ios::binary | std::ios::trunc) << "2 " << now->size << " " << now->mtime_ns << " " << now->ctime_ns << " nothex 1\n";
+            c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+            check("cache: a malformed record is ignored (hashed, rewritten)", !c.cached && n == 7 && c.sha.size() == 64);
+            fs::remove(nrec);
+            const fs::path link = cache / "decoy";
+            fs::create_symlink(dir / "cached.gguf", link);
+            check("cache: a symlink is never a trusted record", !loom::sha_cache_entry_trusted(link.string(), false));
+            check("cache: the test's own filesystem has fine timestamps (else the arms above test nothing)",
+                  !loom::coarse_timestamps(f.string()));
+            // no cache dir = plain hash; an unreadable file = "" and nothing written
+            // a file written while it is hashed: the digest is returned but never cached
+            {
+                const fs::path w = dir / "written.gguf";
+                std::ofstream(w, std::ios::binary) << "abc";
+                auto racing = [&](const std::string& p) {
+                    std::string d = loom::sha256_of_file(p);
+                    std::ofstream(p, std::ios::binary | std::ios::app) << "x";   // a writer appends mid-hash
+                    return d;
+                };
+                c = loom::sha256_of_file_cached(w.string(), cache.string(), racing);
+                const auto wid = loom::file_identity(w.string());
+                const fs::path wrec = cache / (std::to_string(wid->dev) + "-" + std::to_string(wid->ino));
+                check("cache: a file changed during its hash is not cached", !c.cached && !c.note.empty() && !fs::exists(wrec));
+            }
+            c = loom::sha256_of_file_cached(f.string(), "", h);
+            check("cache: no directory = hash every time", !c.cached && n == 8);
+            c = loom::sha256_of_file_cached((dir / "missing.gguf").string(), cache.string(), h);
+            check("cache: a missing file = \"\"", c.sha.empty() && !c.cached);
+            check("cache dir: env > XDG_STATE_HOME > HOME; set-but-empty env = off",
+                  loom::default_sha_cache_dir("/c", "/x", "/h") == "/c" && loom::default_sha_cache_dir("", "/x", "/h").empty() &&
+                  loom::default_sha_cache_dir(nullptr, "/x", "/h") == "/x/1bit/loom-route-sha" &&
+                  loom::default_sha_cache_dir(nullptr, nullptr, "/h") == "/h/.local/state/1bit/loom-route-sha" &&
+                  loom::default_sha_cache_dir(nullptr, "", "").empty());
+        }
 
         // the card: a directory means its model.json; model.id is the registered name
         fs::create_directories(dir / "card");

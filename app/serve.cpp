@@ -1699,11 +1699,23 @@ std::optional<Launch> loom_launch_for(const Options& o, int child_port) {
     const loom::LoomRoute* r = loom::match_loom_route(
         table, o.model, names,
         [](const std::string& path) {
+            // engine#3619: a verified digest is cached by (device, inode, size, mtime_ns); app/loom_route.h says when
             const auto t0 = std::chrono::steady_clock::now();
-            std::string h = loom::sha256_of_file(path);
-            std::fprintf(stderr, "1bit serve: loom route: sha256 of %s (size matches an entry) in %.1f s\n", path.c_str(),
-                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-            return h;
+            const loom::CachedSha h = loom::sha256_of_file_cached(
+                path, loom::default_sha_cache_dir(std::getenv("ONEBIT_LOOM_SHA_CACHE"), std::getenv("XDG_STATE_HOME"),
+                                                  std::getenv("HOME")));
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (h.cached) {
+                char when[32] = "?";
+                const time_t t = time_t(h.verified);
+                if (struct tm tm {}; gmtime_r(&t, &tm)) std::strftime(when, sizeof when, "%Y-%m-%dT%H:%M:%SZ", &tm);
+                std::fprintf(stderr, "1bit serve: loom route: sha256 of %s (cached, verified %s) in %.3f s\n", path.c_str(),
+                             when, s);
+            } else {
+                std::fprintf(stderr, "1bit serve: loom route: sha256 of %s (size matches an entry) in %.1f s\n", path.c_str(), s);
+            }
+            if (!h.note.empty()) std::fprintf(stderr, "1bit serve: loom route: %s\n", h.note.c_str());
+            return h.sha;
         },
         &sha);
     if (!r) return std::nullopt;

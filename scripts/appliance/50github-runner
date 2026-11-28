@@ -25,6 +25,8 @@
 # too, so only the user tells them apart.
 # And by process NAME (pgrep -x, /proc/<pid>/comm), not the command line: on this box every lane's ssh commands run as
 # bcloud, and `pgrep -f` matched any shell whose argv merely mentions Runner.Listener (review cl-flm, #3612).
+# comm is cut at 15 characters and "Runner.Listener" is exactly 15: a renamed or wrapped listener (a longer name, or a
+# shell in front of it) would no longer match, and this script would start a second runner (review cl-hyperloom, #3616).
 D=${GITHUB_RUNNER_DIR:-/home/bcloud/actions-runner}
 case "${1:-start}" in
   start)

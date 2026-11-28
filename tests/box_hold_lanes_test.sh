@@ -77,19 +77,26 @@ L cl-b B1 & wait; d=$(( $(date +%s) - s ))
 [ "$(order)" = "A1 B1 " ] && [ "$d" -le 4 ] && ok "with nothing queued for the grace, the focus passes (A1 B1, ${d}s)" || bad "pass on idle: $(order) ${d}s"
 grep -q "focus: cl-a has had nothing queued" "$T/locks/box-hold.log" && ok "  ... and the hand-over is logged" || bad "no hand-over line"
 
-# 5. the budget
-reset; export BOX_HOLD_FOCUS_BUDGET=6
-L cl-a A1 4 & sleep 0.2   # 4 s each against a 6 s budget (whole seconds): A1 ends inside it, A2 past it -> B1, then A3
-L cl-a A2 4 & sleep 0.1; L cl-a A3 0.3 & sleep 0.1; L cl-b B1 0.3 &
-# all three must be QUEUED before the budget runs out: under load (8.8 on the box) a submission took long enough that
-# B1 was not there yet, and the focus went straight back to cl-a
-# wait for B1's OWN ticket (first line "<label> <date> <cmd>"): a ticket leaves queue/ only when its lock is granted, so
-# a count of 3 can be A1 A2 A3 with A1 not granted yet and B1 not queued at all (the race this wait is for)
-_b1=0; for _i in $(seq 1 30); do grep -qs '^cl-b ' "$T"/locks/queue/* && { _b1=1; break; }; sleep 0.1; done
-[ "$_b1" = 1 ] || bad "budget arm SETUP: B1 not queued within 3 s (a slow box, not a scheduling result)"
-wait
-[ "$(order)" = "A1 A2 B1 A3 " ] && ok "after its budget the focus lane goes to the back: A1 A2 B1 A3 (A3 keeps its place in A's order)" || bad "budget: $(order)"
-grep -q "focus: cl-a used its 6s budget" "$T/locks/box-hold.log" && ok "  ... logged" || bad "no budget line"
+# 5. the budget, with no wall-clock race (flaky under CI load twice: #3608, #3611, then #3633's build): A1 waits on a gate
+#    file; once A2, A3 and B1 are all queued, the focus record is written (under its lock) as already past the budget while
+#    A1 still runs (the budget is not enforced during a focus-lane ticket); then the gate opens. When A1 ends the focus
+#    must pass: cl-b runs, then cl-a again, its tickets in their own order.
+reset; export BOX_HOLD_FOCUS_BUDGET=600; rm -f "$T/go"
+BOX_HOLD_WHO=cl-a sh "$BH" gpu sh -c "echo A1 >> $T/order; i=0; while [ ! -e $T/go ] && [ \$i -lt 600 ]; do sleep 0.05; i=\$((i + 1)); done" 2>> "$T/err" &
+for _i in $(seq 1 100); do grep -qx A1 "$T/order" 2> /dev/null && break; sleep 0.1; done      # A1 runs: cl-a has the focus
+# submitted ONE AT A TIME, each queued before the next (concurrent submissions race for their numbers: A3 before A2)
+queued() { [ "$(cat "$T"/locks/queue/* 2> /dev/null | grep -c "^$1 ")" -ge "$2" ]; }
+_q=1
+L cl-a A2 & for _i in $(seq 1 100); do queued cl-a 1 && break; sleep 0.1; done; queued cl-a 1 || _q=0
+L cl-a A3 & for _i in $(seq 1 100); do queued cl-a 2 && break; sleep 0.1; done; queued cl-a 2 || _q=0
+L cl-b B1 & for _i in $(seq 1 100); do queued cl-b 1 && break; sleep 0.1; done; queued cl-b 1 || _q=0
+[ "$_q" = 1 ] || bad "budget arm SETUP: A2, A3, B1 not all queued within 10 s each (a slow box, not a scheduling result)"
+_now=$(date +%s); flock "$T/locks/box-focus.lock" sh -c "echo 'cl-a $((_now - 1000)) $_now' > '$T/locks/box-focus'"   # budget used
+touch "$T/go"; wait
+o=$(order); a2=${o%%A2*}; a3=${o%%A3*}
+[ "${o%% *}" = A1 ] && [ "$(echo "$o" | awk '{ print $2 }')" = B1 ] && [ ${#a2} -lt ${#a3} ] \
+  && ok "after its budget the focus lane goes to the back: $o (B1 before cl-a's next tickets; A2, A3 keep their order)" || bad "budget: $o"
+grep -q "focus: cl-a used its 600s budget" "$T/locks/box-hold.log" && ok "  ... logged" || bad "no budget line"
 unset BOX_HOLD_FOCUS_BUDGET
 
 # 6. CI between the focus lane's tickets

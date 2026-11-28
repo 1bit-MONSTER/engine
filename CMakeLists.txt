@@ -2991,10 +2991,22 @@ if(ONEBIT_NPU)
         # imports, on the NPU runtime, full-ELF flow only. Built from the runtime's sources when they carry it
         # (python/pyxrt_npu_rt.cpp) and pybind11 and the build Python's headers are found; packaged as
         # python/pyxrt.<abi>.so (scripts/package-linux.sh). The build Python must be 1bit OS's (3.14).
-        if(EXISTS "${ONEBIT_NPU_RT_DIR}/python/pyxrt_npu_rt.cpp")
-            find_package(Python3 COMPONENTS Interpreter Development.Module)
-            find_package(pybind11 CONFIG QUIET)
-            if(Python3_Development.Module_FOUND AND pybind11_FOUND)
+        # ONEBIT_PYXRT: AUTO builds it when it can (a WARNING otherwise), ON makes a missing prerequisite a configure
+        # error (the release: scripts/weekly.sh), OFF skips it.
+        set(ONEBIT_PYXRT AUTO CACHE STRING "Build python/pyxrt from the NPU runtime's sources: AUTO, ON or OFF")
+        set_property(CACHE ONEBIT_PYXRT PROPERTY STRINGS AUTO ON OFF)
+        if(NOT ONEBIT_PYXRT STREQUAL "OFF")
+            set(_pyxrt_why "")
+            if(NOT EXISTS "${ONEBIT_NPU_RT_DIR}/python/pyxrt_npu_rt.cpp")
+                set(_pyxrt_why "the runtime at ONEBIT_NPU_RT_DIR carries no python/pyxrt_npu_rt.cpp")
+            else()
+                find_package(Python3 COMPONENTS Interpreter Development.Module)
+                find_package(pybind11 CONFIG QUIET)
+                if(NOT Python3_Development.Module_FOUND OR NOT pybind11_FOUND)
+                    set(_pyxrt_why "needs pybind11 and the headers of '${Python3_EXECUTABLE}'")
+                endif()
+            endif()
+            if(_pyxrt_why STREQUAL "")
                 pybind11_add_module(onebit_pyxrt MODULE ${ONEBIT_NPU_RT_DIR}/python/pyxrt_npu_rt.cpp
                                     ${ONEBIT_NPU_RT_DIR}/npu_rt.cpp)
                 set_target_properties(onebit_pyxrt PROPERTIES OUTPUT_NAME pyxrt
@@ -3003,9 +3015,10 @@ if(ONEBIT_NPU)
                 target_compile_features(onebit_pyxrt PRIVATE cxx_std_20)
                 target_link_libraries(onebit_pyxrt PRIVATE Threads::Threads)
                 message(STATUS "ONEBIT_NPU: pyxrt for ${Python3_EXECUTABLE} (${Python3_VERSION}) -> python/")
+            elseif(ONEBIT_PYXRT STREQUAL "ON")
+                message(FATAL_ERROR "ONEBIT_PYXRT=ON: pyxrt cannot be built: ${_pyxrt_why}")
             else()
-                message(WARNING "ONEBIT_NPU: pyxrt NOT built (needs pybind11 and the headers of "
-                                "'${Python3_EXECUTABLE}'); the payload will not carry python/pyxrt")
+                message(WARNING "ONEBIT_NPU: pyxrt NOT built (${_pyxrt_why}); the payload will not carry python/pyxrt")
             endif()
         endif()
     endif()

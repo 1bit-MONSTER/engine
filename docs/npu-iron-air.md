@@ -24,7 +24,9 @@ Strix / Strix Halo / Krackan) as they are.
 
 It runs **full ELFs only**: one self-contained ELF per design, the form `aiecc --get-full-elf` writes. An xclbin
 cannot be loaded. Every xclbin call (`pyxrt.xclbin`, `pyxrt.kernel`, `device.register_xclbin`,
-`hw_context(device, uuid)`) raises a `RuntimeError` that says so. `pyxrt.implementation` is `"npu_rt"`, which
+`hw_context(device, uuid)`) raises a `RuntimeError` that says so. An xclbin-based script therefore stops at its
+first `pyxrt.xclbin(...)`, with `RuntimeError: pyxrt on 1bit OS runs full ELFs only (the ELF flow); the xclbin
+flow (pyxrt.xclbin) is not supported. Build the design as a full ELF: ...`. Rebuild it as a full ELF (below). `pyxrt.implementation` is `"npu_rt"`, which
 tells this module apart from XRT's.
 
 ## Set up
